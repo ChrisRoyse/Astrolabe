@@ -24,7 +24,7 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory)]
-    [ValidateSet('Stage', 'Inspect', 'Cleanup', 'Abandon')]
+    [ValidateSet('Stage', 'Inspect', 'Cleanup', 'Abandon', 'Quarantine')]
     [string]$Operation,
 
     [string]$SourcePath = '',
@@ -34,6 +34,8 @@ param(
     [string]$TreeSha = '',
     [string]$SessionId = '',
     [string]$AbandonRecordPath = '',
+    [string]$RecoveryRecordPath = '',
+    [string]$LiveStatePath = '',
     [string]$ReasonCode = '',
     [string]$ReasonMessage = ''
 )
@@ -320,9 +322,50 @@ function Assert-FsvLockAbsent {
         'never remove a live lock; for a stale lock, post exact PID-probe evidence to the driving issue before removing it'
 }
 
+function Read-PositivePid {
+    param(
+        [Parameter(Mandatory)]$Object,
+        [Parameter(Mandatory)][string]$Field,
+        [Parameter(Mandatory)][string]$Code,
+        [Parameter(Mandatory)][string]$Description
+    )
+    if (-not $Object.PSObject.Properties[$Field]) {
+        Fail-Astro $Code "$Description has no required $Field" 'preserve the session and investigate its incomplete process provenance'
+    }
+    $parsedPid = 0
+    if (-not [int]::TryParse([string]$Object.$Field, [ref]$parsedPid) -or $parsedPid -le 0) {
+        Fail-Astro $Code "$Description $Field is not a positive PID" 'preserve the session and investigate its incomplete process provenance'
+    }
+    return $parsedPid
+}
+
+function Get-SessionFileInventory {
+    param([Parameter(Mandatory)][string]$Session)
+    $inventory = @()
+    foreach ($entry in @(Get-ChildItem -LiteralPath $Session -Force | Sort-Object Name)) {
+        Assert-NotReparseEntry $entry.FullName "evidence session entry '$($entry.Name)'"
+        if (-not $entry.PSIsContainer -and -not (Test-Path -LiteralPath $entry.FullName -PathType Leaf)) {
+            Fail-Astro 'ASTRO_FSV_QUARANTINE_ENTRY_INVALID' "evidence session entry is not an ordinary file: $($entry.FullName)" 'preserve the session and investigate its filesystem identity'
+        }
+        if ($entry.PSIsContainer) {
+            Fail-Astro 'ASTRO_FSV_QUARANTINE_DIRECTORY_REFUSED' "evidence session contains a nested directory: $($entry.FullName)" 'preserve the session; recovery inventory accepts only ordinary files in the exact session root'
+        }
+        $inventory += [ordered]@{
+            name = $entry.Name
+            path = [IO.Path]::GetFullPath($entry.FullName)
+            bytes = [uint64]$entry.Length
+            sha256 = File-Sha256 $entry.FullName
+            attributes = $entry.Attributes.ToString()
+            read_only = [bool]($entry.Attributes -band [IO.FileAttributes]::ReadOnly)
+        }
+    }
+    return $inventory
+}
+
 $workspace = [IO.Path]::GetFullPath((Split-Path -Parent $PSScriptRoot))
 $evidenceRoot = Join-Path $workspace '.tmp\native-fsv-artifacts'
 $abandonRoot = Join-Path $workspace '.tmp\native-fsv-abandon-records'
+$recoveryRoot = Join-Path $workspace '.tmp\native-fsv-recovery-records'
 $fsvLock = Join-Path (Join-Path $workspace '.tmp') 'astrolabe-fsv.lock'
 $launcherLockPath = Join-Path (Join-Path $workspace '.tmp') 'astrolabe-launcher.lock'
 $gitExe = 'C:\Program Files\Git\bin\git.exe'
@@ -566,7 +609,7 @@ try {
                 }
                 staged_repository = $receipt.repository
                 current_repository = $currentRepository
-                receipt_owner_pids = @($ownerPids)
+                receipt_owner_pids = @($ownerPids | ForEach-Object { [int]$_ })
                 owner_pids_live = @()
                 failure = [ordered]@{
                     code = $ReasonCode
@@ -587,7 +630,7 @@ try {
                 session = $session
                 exists = $true
                 artifact_sha256 = $inspection.sha256
-                receipt_owner_pids = @($ownerPids)
+                receipt_owner_pids = @($ownerPids | ForEach-Object { [int]$_ })
                 owner_pids_live = @()
             }
             $artifactItem = Get-Item -LiteralPath $inspection.artifact_path
@@ -611,6 +654,214 @@ try {
                 before = $before
                 after = [ordered]@{ session = $session; exists = $false }
             } | ConvertTo-Json -Depth 18 -Compress | Write-Output
+        }
+        'Quarantine' {
+            $receiptState = Read-Receipt $ReceiptPath $evidenceRoot
+            $inspection = Inspect-ReceiptArtifact $receiptState $evidenceRoot
+            Assert-FsvLockAbsent $fsvLock
+            if (Test-Path -LiteralPath $launcherLockPath) {
+                Fail-Astro 'ASTRO_FSV_QUARANTINE_LAUNCHER_LOCK' `
+                    "launcher lock exists at $launcherLockPath; terminal-session quarantine is refused during any evidence lease" `
+                    'wait for the launcher owner to finish; use the canonical launcher to reap a dead-owner lock before quarantine'
+            }
+            if ($ReasonCode -notmatch '^[A-Z][A-Z0-9_]{2,95}$') {
+                Fail-Astro 'ASTRO_FSV_QUARANTINE_REASON_INVALID' "ReasonCode is not a structured upper-case code: '$ReasonCode'" `
+                    'pass the exact stable failure code that left the terminal partial session'
+            }
+            if ([string]::IsNullOrWhiteSpace($ReasonMessage)) {
+                Fail-Astro 'ASTRO_FSV_QUARANTINE_REASON_INVALID' 'ReasonMessage is required and may not be blank' `
+                    'describe the exact terminal runner failure that prevented a valid run record'
+            }
+            if ([string]::IsNullOrWhiteSpace($RecoveryRecordPath)) {
+                Fail-Astro 'ASTRO_FSV_QUARANTINE_RECORD_REQUIRED' 'RecoveryRecordPath is required for Quarantine' `
+                    "use a fresh JSON path below $recoveryRoot; the record persists after exact session removal"
+            }
+            $recoveryRecord = Assert-PathWithin $RecoveryRecordPath $recoveryRoot `
+                'ASTRO_FSV_QUARANTINE_RECORD_ESCAPE' 'recovery record path'
+            if (Test-Path -LiteralPath $recoveryRecord) {
+                Fail-Astro 'ASTRO_FSV_QUARANTINE_RECORD_REUSE_REFUSED' "recovery record already exists: $recoveryRecord" `
+                    'use one fresh append-only recovery record path for each terminal partial session'
+            }
+            if ([string]::IsNullOrWhiteSpace($LiveStatePath)) {
+                Fail-Astro 'ASTRO_FSV_QUARANTINE_LIVE_STATE_REQUIRED' 'LiveStatePath is required for Quarantine' `
+                    'pass the exact live-state JSON published by native-fsv-run.ps1 for this session'
+            }
+            $liveStateFile = Assert-PathWithin $LiveStatePath $inspection.session_directory `
+                'ASTRO_FSV_QUARANTINE_LIVE_STATE_ESCAPE' 'live-state path'
+            if (-not (Test-Path -LiteralPath $liveStateFile -PathType Leaf)) {
+                Fail-Astro 'ASTRO_FSV_QUARANTINE_LIVE_STATE_MISSING' "live-state file does not exist: $liveStateFile" `
+                    'pristine never-run sessions use Abandon; preserve any unexplained nonpristine session'
+            }
+            Assert-NotReparseEntry $liveStateFile 'native FSV live-state file'
+            try { $liveState = Get-Content -LiteralPath $liveStateFile -Raw | ConvertFrom-Json }
+            catch {
+                Fail-Astro 'ASTRO_FSV_QUARANTINE_LIVE_STATE_INVALID' "parse live-state '$liveStateFile' failed: $($_.Exception.Message)" `
+                    'preserve the session and investigate its incomplete process provenance'
+            }
+            if ($liveState.schema -ne 'astrolabe.native-fsv-live.v1' -or
+                [int]$liveState.issue -ne [int]$inspection.issue -or
+                [string]$liveState.tree_sha -cne [string]$inspection.tree_sha -or
+                -not [string]::Equals([IO.Path]::GetFullPath([string]$liveState.artifact.path), $inspection.artifact_path, [StringComparison]::OrdinalIgnoreCase) -or
+                [uint64]$liveState.artifact.bytes -ne [uint64]$inspection.bytes -or
+                [string]$liveState.artifact.sha256 -cne [string]$inspection.sha256) {
+                Fail-Astro 'ASTRO_FSV_QUARANTINE_LIVE_STATE_INVALID' `
+                    "live-state '$liveStateFile' is not bound to the staged issue/tree/artifact" `
+                    'preserve the session and investigate the cross-session or incomplete provenance'
+            }
+            $receipt = $receiptState.Receipt
+            $ownerPids = New-Object System.Collections.Generic.List[int]
+            foreach ($owner in @(
+                [ordered]@{ object = $receipt; field = 'launcher_pid'; description = 'artifact receipt' },
+                [ordered]@{ object = $receipt; field = 'promoter_pid'; description = 'artifact receipt' },
+                [ordered]@{ object = $liveState; field = 'launcher_pid'; description = 'runner live state' },
+                [ordered]@{ object = $liveState; field = 'runner_pid'; description = 'runner live state' },
+                [ordered]@{ object = $liveState; field = 'child_pid'; description = 'runner live state' }
+            )) {
+                $ownerPid = Read-PositivePid $owner.object $owner.field `
+                    'ASTRO_FSV_QUARANTINE_OWNER_INVALID' $owner.description
+                if (-not $ownerPids.Contains($ownerPid)) { $ownerPids.Add($ownerPid) }
+            }
+            if ([int]$receipt.launcher_pid -ne [int]$liveState.launcher_pid) {
+                Fail-Astro 'ASTRO_FSV_QUARANTINE_OWNER_MISMATCH' `
+                    "receipt launcher PID $($receipt.launcher_pid) differs from runner live-state launcher PID $($liveState.launcher_pid)" `
+                    'preserve the session and investigate the cross-lease provenance'
+            }
+            $liveOwnerPids = @($ownerPids | Where-Object { $null -ne (Get-Process -Id $_ -ErrorAction SilentlyContinue) })
+            if ($liveOwnerPids.Count -gt 0) {
+                Fail-Astro 'ASTRO_FSV_QUARANTINE_LIVE_OWNER' `
+                    "terminal partial session still names live owner PID(s): $($liveOwnerPids -join ',')" `
+                    'wait for every exact owner to exit naturally; never quarantine a live session'
+            }
+            if ([string]::IsNullOrWhiteSpace($RunRecordPath)) {
+                Fail-Astro 'ASTRO_FSV_QUARANTINE_RUN_RECORD_PATH_REQUIRED' 'RunRecordPath is required for Quarantine' `
+                    'pass the exact run-record path that the failed runner was required to publish'
+            }
+            $expectedRunRecord = Assert-PathWithin $RunRecordPath $inspection.session_directory `
+                'ASTRO_FSV_QUARANTINE_RUN_RECORD_ESCAPE' 'expected run-record path'
+            $runRecordState = 'missing'
+            if (Test-Path -LiteralPath $expectedRunRecord -PathType Leaf) {
+                Assert-NotReparseEntry $expectedRunRecord 'native FSV run record'
+                $runRecordState = 'invalid'
+                try {
+                    $candidateRecord = Get-Content -LiteralPath $expectedRunRecord -Raw | ConvertFrom-Json
+                    if ($candidateRecord.schema -eq 'astrolabe.native-fsv-run.v1' -and
+                        [int]$candidateRecord.issue -eq [int]$inspection.issue -and
+                        [string]::Equals([IO.Path]::GetFullPath([string]$candidateRecord.receipt_path), $receiptState.Path, [StringComparison]::OrdinalIgnoreCase) -and
+                        [string]::Equals([IO.Path]::GetFullPath([string]$candidateRecord.artifact.path), $inspection.artifact_path, [StringComparison]::OrdinalIgnoreCase) -and
+                        [string]$candidateRecord.artifact.sha256 -ceq [string]$inspection.sha256) {
+                        Fail-Astro 'ASTRO_FSV_QUARANTINE_VALID_RUN_RECORD' `
+                            "session has a valid bound run record at $expectedRunRecord" `
+                            'use Cleanup for a completed real run; Quarantine is only for terminal partial state'
+                    }
+                }
+                catch {
+                    if ($_.Exception.Data.Contains('AstroCode')) { throw }
+                }
+            }
+            $session = [IO.Path]::GetFullPath($inspection.session_directory)
+            $inventory = @(Get-SessionFileInventory $session)
+            if ($inventory.Count -lt 4) {
+                Fail-Astro 'ASTRO_FSV_QUARANTINE_NONPARTIAL' `
+                    "session inventory has only $($inventory.Count) files; no terminal partial-run state is proven" `
+                    'use Abandon only for a pristine two-file never-run session; otherwise preserve and investigate the incomplete state'
+            }
+            $inventoryPaths = @($inventory | ForEach-Object { [string]$_.path })
+            foreach ($requiredPath in @($receiptState.Path, $inspection.artifact_path, $liveStateFile)) {
+                if (-not ($inventoryPaths -contains [IO.Path]::GetFullPath($requiredPath))) {
+                    Fail-Astro 'ASTRO_FSV_QUARANTINE_INVENTORY_INVALID' `
+                        "session inventory omitted required path $requiredPath" `
+                        'preserve the session and investigate its filesystem identity'
+                }
+            }
+            $outputInventory = @($inventory | Where-Object {
+                [string]$_.path -cne [string]$receiptState.Path -and
+                [string]$_.path -cne [string]$inspection.artifact_path -and
+                [string]$_.path -cne [string]$liveStateFile -and
+                [string]$_.path -cne [string]$expectedRunRecord
+            })
+            if ($outputInventory.Count -eq 0) {
+                Fail-Astro 'ASTRO_FSV_QUARANTINE_OUTPUT_EVIDENCE_MISSING' `
+                    'terminal partial session contains no child output file beyond receipt/artifact/live state' `
+                    'preserve the session; no real child-output state exists to distinguish it from incomplete staging'
+            }
+            Assert-NotReparseEntry $recoveryRoot 'recovery record root'
+            $recordParent = Split-Path -Parent $recoveryRecord
+            New-Item -ItemType Directory -Path $recordParent -Force | Out-Null
+            Assert-NotReparseEntry $recordParent 'recovery record parent'
+            $currentRepository = Get-RepoState -GitExe $gitExe -Workspace $workspace
+            $record = [ordered]@{
+                schema = 'astrolabe.native-fsv-recovery.v1'
+                verdict = 'quarantined-unverified-run'
+                issue = [int]$inspection.issue
+                recorded_at_utc = [DateTime]::UtcNow.ToString('o')
+                receipt_path = $receiptState.Path
+                session_directory = $session
+                expected_run_record_path = $expectedRunRecord
+                expected_run_record_state = $runRecordState
+                live_state_path = $liveStateFile
+                artifact = [ordered]@{
+                    path = $inspection.artifact_path
+                    bytes = [uint64]$inspection.bytes
+                    sha256 = $inspection.sha256
+                }
+                staged_repository = $receipt.repository
+                current_repository = $currentRepository
+                source_of_truth = [ordered]@{
+                    fsv_lock = $fsvLock
+                    fsv_lock_exists = $false
+                    launcher_lock = $launcherLockPath
+                    launcher_lock_exists = $false
+                    session_files = $inventory
+                }
+                owner_pids = @($ownerPids | ForEach-Object { [int]$_ })
+                owner_pids_live = @()
+                failure = [ordered]@{
+                    code = $ReasonCode
+                    message = $ReasonMessage
+                }
+            }
+            Write-NewDurableUtf8 $recoveryRecord ($record | ConvertTo-Json -Depth 20)
+            $persistedRecord = Get-Content -LiteralPath $recoveryRecord -Raw | ConvertFrom-Json
+            if ($persistedRecord.schema -ne 'astrolabe.native-fsv-recovery.v1' -or
+                $persistedRecord.verdict -ne 'quarantined-unverified-run' -or
+                [string]$persistedRecord.artifact.sha256 -cne [string]$inspection.sha256 -or
+                [string]$persistedRecord.failure.code -cne $ReasonCode -or
+                @($persistedRecord.source_of_truth.session_files).Count -ne $inventory.Count) {
+                Fail-Astro 'ASTRO_FSV_QUARANTINE_RECORD_INVALID' `
+                    "persisted recovery record readback does not bind the terminal session: $recoveryRecord" `
+                    'preserve both session and record and investigate the durable-write mismatch'
+            }
+            $recordHash = File-Sha256 $recoveryRecord
+            $before = [ordered]@{
+                session = $session
+                exists = $true
+                artifact_sha256 = $inspection.sha256
+                file_count = $inventory.Count
+                owner_pids = @($ownerPids | ForEach-Object { [int]$_ })
+                owner_pids_live = @()
+            }
+            foreach ($entry in @(Get-ChildItem -LiteralPath $session -File -Force)) {
+                if ($entry.IsReadOnly) { $entry.IsReadOnly = $false }
+            }
+            Remove-Item -LiteralPath $session -Recurse -Force
+            if (Test-Path -LiteralPath $session) {
+                Fail-Astro 'ASTRO_FSV_QUARANTINE_FAILED' "evidence session remains after quarantine: $session" `
+                    'preserve the external recovery record and inspect open handles before retrying exact cleanup'
+            }
+            foreach ($parent in @((Split-Path -Parent $session), (Split-Path -Parent (Split-Path -Parent $session)))) {
+                if ((Test-Path -LiteralPath $parent -PathType Container) -and
+                    @(Get-ChildItem -LiteralPath $parent -Force).Count -eq 0) {
+                    Remove-Item -LiteralPath $parent -Force
+                }
+            }
+            [ordered]@{
+                operation = 'quarantine'
+                record_path = $recoveryRecord
+                record_sha256 = $recordHash
+                record = $persistedRecord
+                before = $before
+                after = [ordered]@{ session = $session; exists = $false }
+            } | ConvertTo-Json -Depth 22 -Compress | Write-Output
         }
         'Cleanup' {
             $receiptState = Read-Receipt $ReceiptPath $evidenceRoot
@@ -669,8 +920,16 @@ try {
     }
 }
 catch {
-    $code = if ($_.Exception.Data.Contains('AstroCode')) { [string]$_.Exception.Data['AstroCode'] } else { 'ASTRO_FSV_ARTIFACT_INTERNAL' }
-    $remediation = if ($_.Exception.Data.Contains('AstroRemediation')) { [string]$_.Exception.Data['AstroRemediation'] } else { 'preserve the evidence state, inspect the full error, repair the root cause, and retry from a fresh session' }
-    [Console]::Error.WriteLine(([ordered]@{ code = $code; message = $_.Exception.Message; remediation = $remediation } | ConvertTo-Json -Compress))
+    $failure = $_
+    $code = if ($failure.Exception.Data.Contains('AstroCode')) { [string]$failure.Exception.Data['AstroCode'] } else { 'ASTRO_FSV_ARTIFACT_INTERNAL' }
+    $remediation = if ($failure.Exception.Data.Contains('AstroRemediation')) { [string]$failure.Exception.Data['AstroRemediation'] } else { 'preserve the evidence state, inspect the full error, repair the root cause, and retry from a fresh session' }
+    [Console]::Error.WriteLine(([ordered]@{
+        code = $code
+        message = $failure.Exception.Message
+        remediation = $remediation
+        exception_type = $failure.Exception.GetType().FullName
+        script_stack_trace = $failure.ScriptStackTrace
+        invocation = $failure.InvocationInfo.PositionMessage
+    } | ConvertTo-Json -Compress))
     exit 1
 }

@@ -74,6 +74,26 @@ function String-Sha256([AllowEmptyString()][string]$Value) {
     finally { $hasher.Dispose() }
 }
 
+function Observe-ExitedProcessCode([Diagnostics.Process]$Process) {
+    $Process.Refresh()
+    if (-not $Process.HasExited) {
+        Fail-Astro 'ASTRO_FSV_CHILD_STILL_LIVE' "native child PID $($Process.Id) is still live after the runner wait completed" 'preserve the FSV lock and wait for the exact recorded child to exit naturally'
+    }
+    try {
+        return [int]$Process.ExitCode
+    }
+    catch {
+        Fail-Astro 'ASTRO_FSV_CHILD_EXIT_UNREADABLE' "native child PID $($Process.Id) exited, but its exit code could not be read: $($_.Exception.Message)" 'preserve the session and process evidence; repair process-exit observation before rerunning'
+    }
+}
+
+function Failure-Text($Value) {
+    if ($null -eq $Value) { return $null }
+    $text = [string]$Value
+    if ([string]::IsNullOrWhiteSpace($text)) { return $null }
+    return $text
+}
+
 function Write-NewDurableUtf8([string]$Path, [string]$Content) {
     $bytes = [Text.UTF8Encoding]::new($false).GetBytes($Content)
     $stream = [IO.File]::Open($Path, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
@@ -203,6 +223,13 @@ $launcherLockHandle = $null
 $directoryHandle = $null
 $fsvLockOwned = $false
 $child = $null
+$childStartedAtUtc = $null
+$childExitedAtUtc = $null
+$childExitCode = $null
+$childExitObservationError = $null
+$artifact = $null
+$artifactHashBefore = $null
+$receiptFull = $null
 $runRecordWritten = $false
 $runRecordAuthorized = $false
 
@@ -332,6 +359,7 @@ try {
     $argumentLine = (@($arguments | ForEach-Object { ConvertTo-WindowsCommandLineArgument ([string]$_) }) -join ' ')
     $child = Start-Process -FilePath $artifact -ArgumentList $argumentLine -RedirectStandardOutput $StandardOutputPath `
         -RedirectStandardError $StandardErrorPath -WindowStyle Hidden -PassThru
+    $childStartedAtUtc = [DateTime]::UtcNow.ToString('o')
     $ownedLock = Get-Content -LiteralPath $fsvLockPath -Raw | ConvertFrom-Json
     if ([int]$ownedLock.pid -ne $PID -or [string]$ownedLock.artifact_sha256 -cne $artifactHashBefore) {
         Fail-Astro 'ASTRO_FSV_LOCK_IDENTITY_CHANGED' 'FSV lock identity changed before child PID publication' 'preserve state and investigate the competing writer'
@@ -358,12 +386,13 @@ try {
         issue = $Issue
         tree_sha = [string]$receipt.tree_sha
         artifact = [ordered]@{ path = $artifact; bytes = [uint64]$artifactItem.Length; sha256 = $artifactHashBefore }
-        started_at_utc = [DateTime]::UtcNow.ToString('o')
+        started_at_utc = $childStartedAtUtc
     }
     Publish-NewFile $LiveStatePath ($liveState | ConvertTo-Json -Depth 10)
     $child.WaitForExit()
     $child.Refresh()
-    $childExit = $child.ExitCode
+    $childExitedAtUtc = [DateTime]::UtcNow.ToString('o')
+    $childExitCode = Observe-ExitedProcessCode $child
 
     $artifactHashAfter = File-Sha256 $artifact
     $receiptHashAfter = File-Sha256 $receiptFull
@@ -378,14 +407,20 @@ try {
         [uint64](Get-Item -LiteralPath $artifact).Length -eq [uint64]$receipt.artifact.bytes
     $receiptStable = $receiptHashBefore -ceq $receiptHashAfter
     $launcherLeaseStable = $launcherLockHashBefore -ceq $launcherLockHashAfter
-    $verdict = if ($childExit -eq 0 -and $treeStable -and $artifactStable -and $receiptStable -and $launcherLeaseStable) { 'verified' } else { 'failed' }
+    $verdict = if ($childExitCode -eq 0 -and $treeStable -and $artifactStable -and $receiptStable -and $launcherLeaseStable) { 'verified' } else { 'failed' }
     $record = [ordered]@{
         schema = 'astrolabe.native-fsv-run.v1'
         verdict = $verdict
         issue = $Issue
         receipt_path = $receiptFull
         runner = [ordered]@{ pid = $PID; launcher_pid = $launcherPid }
-        process = [ordered]@{ pid = $child.Id; exit_code = $childExit; started_at = $child.StartTime.ToUniversalTime().ToString('o'); exited_at = $child.ExitTime.ToUniversalTime().ToString('o') }
+        process = [ordered]@{
+            pid = $child.Id
+            exit_code = $childExitCode
+            started_at = $childStartedAtUtc
+            exited_at = $childExitedAtUtc
+            timestamp_basis = 'runner-observed-utc'
+        }
         artifact = [ordered]@{ path = $artifact; bytes = [uint64](Get-Item -LiteralPath $artifact).Length; sha256 = $artifactHashAfter; stable = $artifactStable; delete_share_denied_for_run = $true }
         receipt = [ordered]@{ path = $receiptFull; sha256_before = $receiptHashBefore; sha256_after = $receiptHashAfter; stable = $receiptStable }
         launcher_lease = [ordered]@{ path = $launcherLockPath; sha256_before = $launcherLockHashBefore; sha256_after = $launcherLockHashAfter; stable = $launcherLeaseStable }
@@ -397,7 +432,7 @@ try {
     Write-NewDurableUtf8 $RunRecordPath ($record | ConvertTo-Json -Depth 15)
     $runRecordWritten = $true
     $persistedRecord = Get-Content -LiteralPath $RunRecordPath -Raw | ConvertFrom-Json
-    if ([int]$persistedRecord.process.exit_code -ne $childExit -or [string]$persistedRecord.artifact.sha256 -cne $artifactHashAfter) {
+    if ([int]$persistedRecord.process.exit_code -ne $childExitCode -or [string]$persistedRecord.artifact.sha256 -cne $artifactHashAfter) {
         Fail-Astro 'ASTRO_FSV_RUN_READBACK_FAILED' 'persisted run record does not match the observed process/artifact state' 'preserve the session and investigate the failed durable write'
     }
     $record | ConvertTo-Json -Depth 15 -Compress | Write-Output
@@ -405,7 +440,7 @@ try {
     if (-not $artifactStable) { Fail-Astro 'ASTRO_FSV_ARTIFACT_DRIFT' 'staged artifact changed during the native FSV run' 'preserve state, identify the writer, rebuild, and rerun' }
     if (-not $receiptStable) { Fail-Astro 'ASTRO_FSV_RECEIPT_DRIFT' 'artifact receipt changed during the native FSV run' 'preserve state, identify the writer, rebuild, and rerun' }
     if (-not $launcherLeaseStable) { Fail-Astro 'ASTRO_FSV_LAUNCHER_LEASE_DRIFT' 'launcher lock changed during the native FSV run' 'discard the evidence and investigate the lease writer' }
-    if ($childExit -ne 0) { exit 1 }
+    if ($childExitCode -ne 0) { exit 1 }
 }
 catch {
     $failure = $_
@@ -415,6 +450,15 @@ catch {
                 [Console]::Error.WriteLine("NATIVE_FSV[ASTRO_FSV_FAILURE_WAITING_FOR_CHILD]: runner failed after real child PID $($child.Id) started; waiting for that exact process to exit naturally before releasing its immutable artifact lease")
                 $child.WaitForExit()
                 $child.Refresh()
+            }
+            if ($child.HasExited) {
+                if ($null -eq $childExitedAtUtc) {
+                    $childExitedAtUtc = [DateTime]::UtcNow.ToString('o')
+                }
+                if ($null -eq $childExitCode) {
+                    try { $childExitCode = Observe-ExitedProcessCode $child }
+                    catch { $childExitObservationError = $_.Exception.Message }
+                }
             }
         }
         catch {
@@ -434,9 +478,11 @@ catch {
                 receipt_path = $receiptFull
                 process = [ordered]@{
                     pid = $child.Id
-                    exit_code = $child.ExitCode
-                    started_at = $child.StartTime.ToUniversalTime().ToString('o')
-                    exited_at = $child.ExitTime.ToUniversalTime().ToString('o')
+                    exit_code = $childExitCode
+                    exit_code_observation_error = Failure-Text $childExitObservationError
+                    started_at = $childStartedAtUtc
+                    exited_at = $childExitedAtUtc
+                    timestamp_basis = 'runner-observed-utc'
                 }
                 artifact = [ordered]@{
                     path = $artifact
@@ -454,7 +500,14 @@ catch {
                     bytes = if (Test-Path -LiteralPath $StandardErrorPath -PathType Leaf) { [uint64](Get-Item -LiteralPath $StandardErrorPath).Length } else { 0 }
                     sha256 = if (Test-Path -LiteralPath $StandardErrorPath -PathType Leaf) { File-Sha256 $StandardErrorPath } else { $null }
                 }
-                failure = [ordered]@{ code = $code; message = $failure.Exception.Message; remediation = $remediation }
+                failure = [ordered]@{
+                    code = $code
+                    message = $failure.Exception.Message
+                    remediation = $remediation
+                    exception_type = $failure.Exception.GetType().FullName
+                    script_stack_trace = Failure-Text $failure.ScriptStackTrace
+                    invocation = Failure-Text $failure.InvocationInfo.PositionMessage
+                }
             }
             Write-NewDurableUtf8 $RunRecordPath ($failureRecord | ConvertTo-Json -Depth 15)
             $runRecordWritten = $true
