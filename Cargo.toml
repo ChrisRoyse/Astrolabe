@@ -4,16 +4,11 @@ members = ["crates/*"]
 # calyx/ and cbm/ are deliberately EXCLUDED from the root workspace (they carry
 # their own `[workspace]` + profiles; see the profile note below and #286). The
 # Astrolabe crates reach the calyx crates only as path-dependencies, so the
-# calyx crates' *dev-dependencies* (proptest, blake3, …) are pruned from the
-# root resolution graph.
+# calyx crates resolve in their own workspace graph, not the root's.
 #
-# Dual-workspace dev-dep boundary (#298): a targeted `--all-targets` check of a
-# calyx crate CANNOT run from the root workspace — e.g.
-# `cargo check -p calyx-ward --all-targets` fails with `unresolved module or
-# unlinked crate proptest`, because building that crate's test targets needs its
-# dev-deps and those live only in the calyx/ workspace. Run such targeted
-# checks against the owning workspace via `--manifest-path`:
-#     cargo check -p calyx-ward --all-targets --manifest-path calyx/Cargo.toml
+# Dual-workspace boundary (#298): a targeted check of a calyx crate should run
+# against the owning workspace via `--manifest-path`, e.g.
+#     cargo check -p calyx-ward --manifest-path calyx/Cargo.toml
 exclude = [
     "calyx",
     "cbm",
@@ -53,22 +48,22 @@ lto = "thin"
 panic = "abort"
 strip = "symbols"
 
-# ── Dev/test profile: debuginfo tuning (issue #188) ─────────────────────────
+# ── Dev profile: debuginfo tuning (issue #188) ──────────────────────────────
 # Mirrors calyx/Cargo.toml, which is silently ignored here: Cargo reads
 # profiles only from the workspace root being built, and calyx/ is an
 # excluded path-dep tree. Upstream Calyx measured the cargo default (debug = 2,
-# full DWARF) at ~280 MB per dev/test executable and a ~190 GB shared target/;
-# this workspace re-creates target/ from cold every gate run, so full DWARF
+# full DWARF) at ~280 MB per dev executable and a ~190 GB shared target/;
+# this workspace re-creates target/ from cold every FSV build, so full DWARF
 # multiplies the cost of the mandated wipe. `line-tables-only` keeps function
-# names + file:line in panic/test backtraces — everything `cargo test`/`cargo
-# check` gates actually consume — while cutting object size and link time.
+# names + file:line in panic backtraces — everything the `cargo check`/`cargo
+# build` FSV path actually consumes — while cutting object size and link time.
 # Declared knob per standing invariant 4; measured before/after on #188.
 [profile.dev]
 debug = "line-tables-only"
 
-# Dependencies (incl. the 8 calyx path-dep crates) are never stepped into
-# during gate work; dropping their debuginfo is the largest target/-size win
-# with zero loss of first-party debuggability.
+# Dependencies (incl. the calyx path-dep crates) are never stepped into
+# during build/FSV work; dropping their debuginfo is the largest target/-size
+# win with zero loss of first-party debuggability.
 [profile.dev.package."*"]
 debug = false
 
