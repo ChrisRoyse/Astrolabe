@@ -1,6 +1,6 @@
 use super::*;
 
-use std::process::Command;
+use std::process::{Child, Command, Stdio};
 
 use astrolabe_anchors::archaeology::{
     GitArchaeologyConfig, GitLineRange, GitMineMode, mine_git_archaeology,
@@ -181,8 +181,8 @@ pub(crate) struct GitArchaeologyImportReport {
     /// unfiltered `git checkout` of such a path did before the fix.
     pub(crate) historical_paths_windows_invalid: usize,
     /// #515 crash-isolation counter: historical evidence commits whose CBM
-    /// extraction ran in an isolated child process ([`extract_historical_rows_isolated`])
-    /// that died without producing rows — a C-level pipeline fault (abort/access
+    /// extraction ran on the pooled out-of-process worker ([`HistoricalExtractionPool`])
+    /// that died/hung/erred without producing rows — a C-level pipeline fault (abort/access
     /// violation/heap-corruption class) on that commit's checkout. BEFORE #515 this
     /// same fault ran IN-PROCESS and took the whole host `index_repository` down with
     /// it: an empty-stdout `rc=127` silent hard-exit with no structured error (the
@@ -429,6 +429,16 @@ pub(crate) fn run_git_archaeology<C: Clock>(
     sweep_orphan_worktrees(repo, &worktree_home);
 
     let file_scoped = historical_index_file_scoped();
+    // #530 pooled historical-extraction worker: ONE persistent child serves the whole
+    // index_loop over an atomic request/response file handshake, so the #515 per-commit
+    // spawn+init cost (measured ~4.2 s/commit on rtk by wave-25) is paid once per recycle
+    // interval instead of once per commit. The #515 containment contract is preserved —
+    // a worker death/hang/malformed response is a counted, labeled
+    // `historical_commits_crashed` skip on exactly the in-flight commit plus an automatic
+    // respawn for the next, never a host exit. The worker is proactively recycled (killed
+    // + respawned) every [`ARCHAEOLOGY_POOL_RECYCLE_AFTER_DEFAULT`] commits to bound the
+    // cumulative C-heap damage of the #515 fault class to one interval.
+    let mut pool = HistoricalExtractionPool::new()?;
     let index_loop_start = std::time::Instant::now();
     let mut index_calls = 0usize;
     let mut index_ms_total = 0u128;
@@ -450,6 +460,7 @@ pub(crate) fn run_git_archaeology<C: Clock>(
             &corpus_rel,
             file_scoped,
             &implicated_files,
+            &mut pool,
         )?;
         if arch_timing {
             index_calls += 1;
@@ -524,6 +535,10 @@ pub(crate) fn run_git_archaeology<C: Clock>(
             report.anchors_deduplicated += anchored.anchors_deduplicated;
         }
     }
+    // #530: retire the pooled worker and its scratch dir. Idempotent with Drop, but
+    // called explicitly here so the served/spawn telemetry lands inside the pass and any
+    // dir remnant is counted before the report is finalized.
+    report.cleanup_remnants += pool.finish();
     if arch_timing {
         eprintln!(
             "astro.arch.timing phase=index_loop file_scoped={file_scoped} ms={} \
@@ -552,140 +567,510 @@ const ARCHAEOLOGY_EXTRACT_TIMEOUT: Duration = Duration::from_secs(300);
 /// sub-second extraction is not padded, bounded so the wait loop never spins hot.
 const ARCHAEOLOGY_EXTRACT_POLL: Duration = Duration::from_millis(25);
 
-/// Runs one historical commit's CBM extraction in an ISOLATED CHILD PROCESS (#515).
+/// #530 registry-declared recycle interval: the maximum number of commits ONE pooled
+/// extraction worker serves before it is proactively killed and respawned. This is not
+/// a throughput tuning knob but a fail-closed damage bound: the #515 fault class is
+/// CUMULATIVE C-heap corruption, so serving an unbounded number of commits in one
+/// long-lived worker would let that damage accumulate exactly as the pre-#515
+/// in-process loop did. Recycling every N commits caps the cumulative exposure of any
+/// one worker to N commits' worth of extractions while still amortizing the spawn+init
+/// cost over the whole interval (instead of paying it once per commit). Overridable per
+/// run via `ASTRO_ARCHAEOLOGY_POOL_RECYCLE_AFTER` (a decimal count; `0` disables
+/// proactive recycle so one worker serves the whole loop, recycled only on crash). An
+/// unparseable value falls back to this default (never a silent flip).
+const ARCHAEOLOGY_POOL_RECYCLE_AFTER_DEFAULT: u64 = 64;
+
+/// Reads the effective #530 pooled-worker recycle interval: the
+/// [`ARCHAEOLOGY_POOL_RECYCLE_AFTER_DEFAULT`] registry default, overridable per run via
+/// `ASTRO_ARCHAEOLOGY_POOL_RECYCLE_AFTER` so a probe can force frequent recycles on a
+/// small corpus. `0` disables proactive recycle. An unrecognized value falls back to the
+/// default (invariant 3: never a silent flip to some other bound).
+fn archaeology_pool_recycle_after() -> u64 {
+    match std::env::var("ASTRO_ARCHAEOLOGY_POOL_RECYCLE_AFTER") {
+        Ok(value) => value
+            .trim()
+            .parse::<u64>()
+            .unwrap_or(ARCHAEOLOGY_POOL_RECYCLE_AFTER_DEFAULT),
+        Err(_) => ARCHAEOLOGY_POOL_RECYCLE_AFTER_DEFAULT,
+    }
+}
+
+/// Directory-name prefix for a transient git-archaeology extraction POOL dir (#530),
+/// rooted under the short temp base [`archaeology_pool_home`]. The embedded owner PID is
+/// the sweep's concurrency discriminator: [`sweep_orphan_pools`] removes a leftover pool
+/// dir only when its PID is dead, so a concurrent live archaeology pass is never swept
+/// out from under itself.
+const ARCHAEOLOGY_POOL_PREFIX: &str = "astrolabe-archaeology-pool-";
+
+/// Short, collision-safe base directory for archaeology extraction pool dirs (#530),
+/// deliberately OUTSIDE the CBM store dir (mirroring [`archaeology_worktree_home`], #427)
+/// so a deep store never pushes the pool handshake files past the Windows MAX_PATH cap.
+/// One shared temp subdirectory serves all owners; per-pool collision-safety comes from
+/// the `<pid>-<nanos>` nonce, and cross-process safety from PID-gated orphan sweeping
+/// ([`sweep_orphan_pools`]).
+fn archaeology_pool_home() -> PathBuf {
+    std::env::temp_dir().join("astrolabe-archaeology-pools")
+}
+
+/// Categorized read of one pooled-worker response file (#530), so the caller can tell a
+/// clean extraction from a RECOVERABLE Rust-level pipeline error (the worker stays warm)
+/// from a MALFORMED response (the worker is suspect and is recycled).
+enum PoolResponse {
+    /// The worker extracted rows cleanly; it stays warm to serve the next commit.
+    Rows(CbmPipelineRows),
+    /// The worker caught a Rust-level pipeline error (e.g. the scratch db could not be
+    /// opened) and reported it as a structured `{ok:false,error}` response WITHOUT dying.
+    /// The commit yields no rows (counted as a contained fault, exactly as the pre-#530
+    /// nonzero-exit child was) but the worker is still healthy, so it is NOT recycled.
+    RecoverableError(String),
+    /// The response bytes were present but not a well-formed rows/error envelope. The
+    /// worker's output cannot be trusted, so it is recycled defensively.
+    Malformed(String),
+}
+
+/// Interprets one pooled-worker response file's bytes (#530). An `{ok:false,...}`
+/// envelope is a recoverable Rust-level pipeline error the warm worker reported; any
+/// other well-formed body is parsed as rows; a body that is neither is malformed.
+fn interpret_pool_response(bytes: &[u8], project: &str) -> PoolResponse {
+    let value: Value = match serde_json::from_slice(bytes) {
+        Ok(value) => value,
+        Err(error) => return PoolResponse::Malformed(format!("response JSON parse: {error}")),
+    };
+    if value.get("ok").and_then(Value::as_bool) == Some(false) {
+        let error = value
+            .get("error")
+            .and_then(Value::as_str)
+            .unwrap_or("archaeology_extract_error: unspecified pooled extraction error")
+            .to_string();
+        return PoolResponse::RecoverableError(error);
+    }
+    match parse_extract_response(bytes, project) {
+        Ok(rows) => PoolResponse::Rows(rows),
+        Err(detail) => PoolResponse::Malformed(detail),
+    }
+}
+
+/// #530 pooled historical-extraction worker: ONE persistent child process that serves
+/// every evidence commit's CBM extraction serially over an atomic request/response FILE
+/// handshake, replacing the #515 per-commit spawn.
 ///
-/// This is the crash-isolation boundary for the git-archaeology per-commit
-/// historical re-index. The main shadow import already runs CBM out-of-process in a
-/// supervised worker (#405); this path did not, so a C-level pipeline fault (abort /
-/// access violation / heap-corruption class) on one of a large repo's historical
-/// checkouts hard-exited the ENTIRE host `index_repository` — an empty-stdout
-/// `rc=127` silent termination with no structured error (issue #515, reproduced on
-/// rtk-ai/rtk after the live CBM graph was already complete). The parent spawns
-/// `astrolabe cli --archaeology-extract`, which runs the identical `CbmPipeline`
-/// (same `scoped_root`, `database`, mode) and serializes the pipeline rows to
-/// `--response-out`. A child that exits cleanly with a readable rows response yields
-/// [`HistoricalExtract::Rows`]; a child that dies (nonzero exit / killed / no usable
-/// response) is CONTAINED as [`HistoricalExtract::Crashed`] carrying a structured
-/// `{code, exit, reason, phase, remediation, stderr_tail}` detail, so the host
-/// survives and the caller degrades exactly this one commit (labeled, counted).
-fn extract_historical_rows_isolated(
-    scoped_root: &Path,
-    database: &Path,
-    project: &str,
-    commit: &str,
-) -> Result<HistoricalExtract, DynError> {
-    let exe = std::env::current_exe().map_err(|error| -> DynError {
-        format!(
-            "ASTRO_ARCHAEOLOGY_EXTRACT_EXE_UNRESOLVED: could not resolve the running \
-             astrolabe executable to spawn the isolated historical-index child: {error}; \
-             remediation: this is an internal invariant of index_repository — retry the run"
-        )
-        .into()
-    })?;
-    // Scratch IO shares the scratch `.db`'s already-unique nonce and its `\\?\`-safe
-    // store-dir location, so a deep store never trips the sibling files past MAX_PATH.
-    let sidecar = |suffix: &str| -> PathBuf {
-        let mut name = database.as_os_str().to_os_string();
-        name.push(suffix);
-        PathBuf::from(name)
-    };
-    let args_path = sidecar(".extract-args.json");
-    let response_path = sidecar(".extract-rows.json");
-    let stderr_path = sidecar(".extract-stderr.txt");
-    let _ = fs::remove_file(&response_path);
+/// This is the crash-isolation boundary (#515) AND the spawn-cost amortizer (#530). The
+/// main shadow import already runs CBM out-of-process in a supervised worker (#405); the
+/// per-commit historical re-index did not, so a C-level pipeline fault (abort / access
+/// violation / heap-corruption class) on one of a large repo's historical checkouts
+/// hard-exited the ENTIRE host `index_repository` — an empty-stdout `rc=127` silent
+/// termination with no structured error (issue #515, reproduced on rtk-ai/rtk after the
+/// live CBM graph was already complete). #515 contained that by spawning a fresh child
+/// per commit; measured at ~4.2 s/commit spawn+init on rtk (511 commits ≈ 36 min of a
+/// 44-min run), that isolation dominated M-scale runs. #530 pays the spawn+init cost
+/// ONCE per recycle interval instead: the parent writes `request-<seq>.json` (atomic
+/// temp-then-rename), the warm worker reads it, runs the identical `CbmPipeline` (same
+/// `scoped_root`, scratch `database`, Fast mode — so emitted subtree-relative node paths
+/// and thus CxIds are byte-identical to the pre-#530 path), and writes
+/// `response-<seq>.json` (atomic). The #515 containment contract is PRESERVED:
+///   * worker death mid-request (C-level fault) — detected via `try_wait` — is a
+///     [`HistoricalExtract::Crashed`] on exactly the in-flight commit plus an automatic
+///     respawn; the host never dies;
+///   * a worker that does not answer within [`ARCHAEOLOGY_EXTRACT_TIMEOUT`] is killed as
+///     hung and treated the same way;
+///   * a RECOVERABLE Rust-level pipeline error is answered as a structured
+///     `{ok:false,error}` response so the warm worker survives it, while the commit is
+///     still counted as a contained fault (identical accounting to the pre-#530
+///     nonzero-exit child).
+/// The worker is proactively recycled (killed + respawned) every
+/// [`ARCHAEOLOGY_POOL_RECYCLE_AFTER_DEFAULT`] commits to bound the cumulative C-heap
+/// damage of the #515 fault class to one interval.
+struct HistoricalExtractionPool {
+    /// The running astrolabe executable, re-spawned as the serve worker.
+    exe: PathBuf,
+    /// Nonce'd scratch dir holding the handshake files and the worker log.
+    pool_dir: PathBuf,
+    /// Combined stdout+stderr log of the current/last worker (fault-detail source).
+    log_path: PathBuf,
+    /// Proactive recycle interval; `0` disables proactive recycle (crash-only).
+    recycle_after: u64,
+    /// The live worker, or `None` before the first spawn / after a crash or recycle.
+    child: Option<Child>,
+    /// Request/response sequence for the CURRENT worker. Reset to 0 on every spawn so the
+    /// parent and the fresh worker (which starts its own counter at 0) agree on the
+    /// `request-<seq>.json`/`response-<seq>.json` filenames.
+    seq: u64,
+    /// Commits the CURRENT worker has served since spawn; drives proactive recycle.
+    served: u64,
+    /// Total workers spawned across the whole pass (telemetry only).
+    spawns: u64,
+}
 
-    let request = json!({
-        "scoped_root": path_str(scoped_root)?,
-        "database": path_str(database)?,
-        "project": project,
-        "mode": "fast",
-    });
-    fs::write(&args_path, serde_json::to_vec(&request)?)?;
-
-    let stderr_file = fs::File::create(&stderr_path)?;
-    let stdout_file = stderr_file.try_clone()?;
-    let spawn = Command::new(&exe)
-        .args(["cli", "--archaeology-extract", "--args-file"])
-        .arg(&args_path)
-        .arg("--response-out")
-        .arg(&response_path)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::from(stdout_file))
-        .stderr(std::process::Stdio::from(stderr_file))
-        .spawn();
-    let mut child = match spawn {
-        Ok(child) => child,
-        Err(error) => {
-            let _ = fs::remove_file(&args_path);
-            let _ = fs::remove_file(&stderr_path);
-            return Err(format!(
-                "ASTRO_ARCHAEOLOGY_EXTRACT_SPAWN_FAILED: could not spawn the isolated \
-                 historical-index child {}: {error}; remediation: ensure the astrolabe \
-                 binary is present and executable on this host",
-                exe.display()
+impl HistoricalExtractionPool {
+    /// Creates the pool (its nonce'd scratch dir) but does NOT spawn a worker yet — the
+    /// first [`extract`](Self::extract) spawns lazily, so a pass with zero evidence
+    /// commits never pays a spawn. Sweeps dead-PID orphan pool dirs first (#530), the
+    /// same PID-gated discipline the scratch worktrees use (#427).
+    fn new() -> Result<Self, DynError> {
+        let exe = std::env::current_exe().map_err(|error| -> DynError {
+            format!(
+                "ASTRO_ARCHAEOLOGY_POOL_EXE_UNRESOLVED: could not resolve the running astrolabe \
+                 executable to spawn the pooled historical-index worker: {error}; remediation: \
+                 this is an internal invariant of index_repository — retry the run"
             )
-            .into());
-        }
-    };
+            .into()
+        })?;
+        let home = archaeology_pool_home();
+        fs::create_dir_all(&home).map_err(|error| -> DynError {
+            format!(
+                "ASTRO_ARCHAEOLOGY_POOL_HOME_UNUSABLE: could not create the archaeology \
+                 extraction-pool base {}: {error}; remediation: point TMP/TEMP at a writable, \
+                 short directory and re-run index_repository",
+                home.display()
+            )
+            .into()
+        })?;
+        sweep_orphan_pools(&home);
+        let nonce = format!(
+            "{}-{}",
+            std::process::id(),
+            SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos()
+        );
+        let pool_dir = home.join(format!("{ARCHAEOLOGY_POOL_PREFIX}{nonce}"));
+        fs::create_dir_all(&pool_dir).map_err(|error| -> DynError {
+            format!(
+                "ASTRO_ARCHAEOLOGY_POOL_DIR_UNUSABLE: could not create the archaeology \
+                 extraction-pool dir {}: {error}; remediation: point TMP/TEMP at a writable \
+                 directory and re-run index_repository",
+                pool_dir.display()
+            )
+            .into()
+        })?;
+        let log_path = pool_dir.join("worker.log");
+        Ok(Self {
+            exe,
+            pool_dir,
+            log_path,
+            recycle_after: archaeology_pool_recycle_after(),
+            child: None,
+            seq: 0,
+            served: 0,
+            spawns: 0,
+        })
+    }
 
-    let deadline = std::time::Instant::now() + ARCHAEOLOGY_EXTRACT_TIMEOUT;
-    let status = loop {
-        match child.try_wait()? {
-            Some(status) => break Some(status),
-            None => {
-                if std::time::Instant::now() >= deadline {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    break None;
-                }
-                thread::sleep(ARCHAEOLOGY_EXTRACT_POLL);
+    /// Spawns a fresh serve worker, resetting the per-worker sequence/served counters and
+    /// clearing any leftover handshake files so the fresh worker (seq=0) and this parent
+    /// (seq=0) start from an empty dir.
+    fn spawn_worker(&mut self) -> Result<(), DynError> {
+        self.clear_handshake_files();
+        let log = fs::File::create(&self.log_path).map_err(|error| -> DynError {
+            format!(
+                "ASTRO_ARCHAEOLOGY_POOL_LOG_UNUSABLE: could not create the pooled worker log {}: \
+                 {error}; remediation: point TMP/TEMP at a writable directory and re-run",
+                self.log_path.display()
+            )
+            .into()
+        })?;
+        let log_clone = log.try_clone()?;
+        let spawn_start = Instant::now();
+        let child = Command::new(&self.exe)
+            .args(["cli", "--archaeology-extract-serve", "--pool-dir"])
+            .arg(&self.pool_dir)
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(log))
+            .stderr(Stdio::from(log_clone))
+            .spawn()
+            .map_err(|error| -> DynError {
+                format!(
+                    "ASTRO_ARCHAEOLOGY_POOL_SPAWN_FAILED: could not spawn the pooled \
+                     historical-index worker {}: {error}; remediation: ensure the astrolabe \
+                     binary is present and executable on this host",
+                    self.exe.display()
+                )
+                .into()
+            })?;
+        let worker_pid = child.id();
+        self.child = Some(child);
+        self.seq = 0;
+        self.served = 0;
+        self.spawns += 1;
+        eprintln!(
+            "astro.archaeology.pool event=spawn worker_pid={worker_pid} spawns={} \
+             recycle_after={} spawn_ms={}",
+            self.spawns,
+            self.recycle_after,
+            spawn_start.elapsed().as_millis(),
+        );
+        Ok(())
+    }
+
+    /// Ensures a live worker exists, spawning one if the pool has none (first use, or
+    /// after a crash/recycle set `child` to `None`).
+    fn ensure_worker(&mut self) -> Result<(), DynError> {
+        if self.child.is_none() {
+            self.spawn_worker()?;
+        }
+        Ok(())
+    }
+
+    /// Kills the current worker (if any) and forgets it, so the next
+    /// [`ensure_worker`](Self::ensure_worker) spawns a fresh one. Emits recycle telemetry.
+    fn recycle(&mut self, reason: &str) {
+        if let Some(mut child) = self.child.take() {
+            let worker_pid = child.id();
+            let _ = child.kill();
+            let _ = child.wait();
+            eprintln!(
+                "astro.archaeology.pool event=recycle reason={reason} worker_pid={worker_pid} \
+                 served={}",
+                self.served,
+            );
+        }
+    }
+
+    /// Removes any leftover `request-*`/`response-*` handshake files from the pool dir
+    /// (belt-and-suspenders before a spawn; extraction removes them per request).
+    fn clear_handshake_files(&self) {
+        let Ok(entries) = fs::read_dir(&self.pool_dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            if name.starts_with("request-") || name.starts_with("response-") {
+                let _ = fs::remove_file(entry.path());
             }
         }
-    };
+    }
 
-    let outcome = match status {
-        Some(status) if status.success() => match fs::read(&response_path) {
-            Ok(bytes) => match parse_extract_response(&bytes, project) {
-                Ok(rows) => HistoricalExtract::Rows(rows),
-                Err(detail) => HistoricalExtract::Crashed(archaeology_extract_fault_detail(
-                    commit,
-                    status.code(),
-                    &stderr_path,
-                    &format!("child exited cleanly but its rows response was unreadable: {detail}"),
-                )),
-            },
-            Err(error) => HistoricalExtract::Crashed(archaeology_extract_fault_detail(
-                commit,
-                status.code(),
-                &stderr_path,
-                &format!("child exited cleanly but wrote no readable rows response: {error}"),
-            )),
-        },
-        Some(status) => HistoricalExtract::Crashed(archaeology_extract_fault_detail(
-            commit,
-            status.code(),
-            &stderr_path,
-            "the isolated CBM extraction child exited nonzero \
-             (C-level pipeline fault: abort / access violation / heap-corruption class)",
-        )),
-        None => HistoricalExtract::Crashed(archaeology_extract_fault_detail(
-            commit,
-            None,
-            &stderr_path,
-            &format!(
-                "the isolated CBM extraction child did not finish within {}s and was killed as hung",
-                ARCHAEOLOGY_EXTRACT_TIMEOUT.as_secs()
-            ),
-        )),
-    };
+    /// Runs one historical commit's CBM extraction on the pooled worker (#530). Spawns or
+    /// recycles the worker as needed, writes the request atomically, then waits for the
+    /// response file, the worker's death, or the per-extraction timeout — whichever comes
+    /// first. Returns [`HistoricalExtract::Rows`] on a clean extraction, or
+    /// [`HistoricalExtract::Crashed`] (a contained, labeled, counted fault) on a worker
+    /// death / hang / recoverable pipeline error / malformed response, exactly matching
+    /// the pre-#530 per-commit child's accounting. `scoped_root`/`database` are absolute
+    /// scratch paths; the worker resolves them itself.
+    fn extract(
+        &mut self,
+        scoped_root: &Path,
+        database: &Path,
+        project: &str,
+        commit: &str,
+    ) -> Result<HistoricalExtract, DynError> {
+        // Proactive recycle BEFORE the next request bounds cumulative C-heap damage (the
+        // #515 fault class) to `recycle_after` commits per worker.
+        if self.recycle_after != 0 && self.child.is_some() && self.served >= self.recycle_after {
+            self.recycle("interval");
+        }
+        self.ensure_worker()?;
+        let seq = self.seq;
+        let request_path = self.pool_dir.join(format!("request-{seq}.json"));
+        let request_tmp = self.pool_dir.join(format!("request-{seq}.json.tmp"));
+        let response_path = self.pool_dir.join(format!("response-{seq}.json"));
+        // A stale response from a prior seq collision cannot exist (files are removed per
+        // request and on spawn), but remove defensively so `exists()` below is unambiguous.
+        let _ = fs::remove_file(&response_path);
+        let request = json!({
+            "scoped_root": path_str(scoped_root)?,
+            "database": path_str(database)?,
+            "project": project,
+            "mode": "fast",
+        });
+        // Atomic appearance for the worker: write the temp, then rename into place, so the
+        // worker never reads a half-written request.
+        fs::write(&request_tmp, serde_json::to_vec(&request)?)?;
+        fs::rename(&request_tmp, &request_path)?;
 
-    // Best-effort scratch-IO cleanup; the fault detail already captured the stderr
-    // tail above, so deleting the log here loses nothing. The scratch `.db` itself is
-    // removed by the caller's cleanup_archaeology_database.
-    let _ = fs::remove_file(&args_path);
-    let _ = fs::remove_file(&response_path);
-    let _ = fs::remove_file(&stderr_path);
-    Ok(outcome)
+        let deadline = Instant::now() + ARCHAEOLOGY_EXTRACT_TIMEOUT;
+        // `(outcome, worker_survived)`: only a surviving worker advances `seq`/`served`.
+        let (outcome, worker_survived): (HistoricalExtract, bool) = loop {
+            if response_path.exists() {
+                match fs::read(&response_path) {
+                    Ok(bytes) => match interpret_pool_response(&bytes, project) {
+                        PoolResponse::Rows(rows) => break (HistoricalExtract::Rows(rows), true),
+                        PoolResponse::RecoverableError(message) => {
+                            break (
+                                HistoricalExtract::Crashed(archaeology_extract_fault_detail(
+                                    commit,
+                                    None,
+                                    &self.log_path,
+                                    &format!(
+                                        "the pooled worker reported a recoverable pipeline error \
+                                         and stayed warm: {message}"
+                                    ),
+                                )),
+                                true,
+                            );
+                        }
+                        PoolResponse::Malformed(detail) => {
+                            self.recycle("malformed_response");
+                            break (
+                                HistoricalExtract::Crashed(archaeology_extract_fault_detail(
+                                    commit,
+                                    None,
+                                    &self.log_path,
+                                    &format!(
+                                        "the pooled worker wrote a malformed response and was \
+                                         recycled: {detail}"
+                                    ),
+                                )),
+                                false,
+                            );
+                        }
+                    },
+                    Err(error) => {
+                        self.recycle("response_unreadable");
+                        break (
+                            HistoricalExtract::Crashed(archaeology_extract_fault_detail(
+                                commit,
+                                None,
+                                &self.log_path,
+                                &format!(
+                                    "the pooled worker's response file was present but unreadable \
+                                     and the worker was recycled: {error}"
+                                ),
+                            )),
+                            false,
+                        );
+                    }
+                }
+            }
+            match self.child.as_mut().expect("worker ensured above").try_wait() {
+                Ok(Some(status)) => {
+                    // The worker died mid-request: a CONTAINED #515 C-level fault on THIS
+                    // commit. Forget the dead child so the next call respawns; the host lives.
+                    self.child = None;
+                    break (
+                        HistoricalExtract::Crashed(archaeology_extract_fault_detail(
+                            commit,
+                            status.code(),
+                            &self.log_path,
+                            "the pooled CBM extraction worker died mid-request (C-level pipeline \
+                             fault: abort / access violation / heap-corruption class); it will be \
+                             respawned for the next commit",
+                        )),
+                        false,
+                    );
+                }
+                Ok(None) => {
+                    if Instant::now() >= deadline {
+                        self.recycle("hung");
+                        break (
+                            HistoricalExtract::Crashed(archaeology_extract_fault_detail(
+                                commit,
+                                None,
+                                &self.log_path,
+                                &format!(
+                                    "the pooled CBM extraction worker did not answer within {}s \
+                                     and was killed as hung",
+                                    ARCHAEOLOGY_EXTRACT_TIMEOUT.as_secs()
+                                ),
+                            )),
+                            false,
+                        );
+                    }
+                    thread::sleep(ARCHAEOLOGY_EXTRACT_POLL);
+                }
+                Err(error) => {
+                    self.recycle("wait_failed");
+                    break (
+                        HistoricalExtract::Crashed(archaeology_extract_fault_detail(
+                            commit,
+                            None,
+                            &self.log_path,
+                            &format!(
+                                "could not poll the pooled worker's liveness and it was recycled: \
+                                 {error}"
+                            ),
+                        )),
+                        false,
+                    );
+                }
+            }
+        };
+
+        // Remove this request/response pair so the pool dir never grows unbounded across
+        // a long loop (the worker also removes the request it consumed; double-remove is
+        // harmless).
+        let _ = fs::remove_file(&request_path);
+        let _ = fs::remove_file(&response_path);
+        if worker_survived {
+            self.seq += 1;
+            self.served += 1;
+        }
+        Ok(outcome)
+    }
+
+    /// Retires the worker and removes the scratch pool dir; returns the number of scratch
+    /// paths that survived cleanup (labeled remnant count, invariant 3). Idempotent — safe
+    /// to call explicitly at end of loop and again from `Drop`.
+    fn finish(&mut self) -> usize {
+        self.recycle("pool_drop");
+        let mut remnants = 0;
+        if !remove_path_with_retry(&self.pool_dir, |path| fs::remove_dir_all(path)) {
+            remnants += 1;
+            eprintln!(
+                "astro.archaeology.pool event=dir_remnant pool_dir={}",
+                self.pool_dir.display(),
+            );
+        }
+        remnants
+    }
+}
+
+impl Drop for HistoricalExtractionPool {
+    fn drop(&mut self) {
+        // Guarantees the worker is killed and the scratch dir removed even if
+        // `run_git_archaeology` returns early with an error before its explicit `finish()`.
+        let _ = self.finish();
+    }
+}
+
+/// Best-effort PID-gated sweep of archaeology extraction pool dirs left at the shared
+/// temp home by a prior pass that crashed before cleanup (#530). Only dirs whose embedded
+/// owner PID is dead are removed, so a concurrently-running pass — its own live PID
+/// stamped in the name — is never swept out from under itself. Mirrors
+/// [`sweep_orphan_worktrees`]; every outcome is counted telemetry, never a silent skip.
+fn sweep_orphan_pools(home: &Path) {
+    let entries = match fs::read_dir(home) {
+        Ok(entries) => entries,
+        Err(error) => {
+            eprintln!(
+                "astro.archaeology.pool_sweep home={} status=unreadable error={error}",
+                home.display()
+            );
+            return;
+        }
+    };
+    let self_pid = std::process::id();
+    let mut swept = 0usize;
+    let mut skipped_live = 0usize;
+    let mut remnants = 0usize;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        let Some(nonce) = name.strip_prefix(ARCHAEOLOGY_POOL_PREFIX) else {
+            continue;
+        };
+        let Some(pid) = nonce
+            .split('-')
+            .next()
+            .and_then(|field| field.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        if pid == self_pid || process_is_alive(pid) {
+            skipped_live += 1;
+            continue;
+        }
+        if remove_path_with_retry(&entry.path(), |target| fs::remove_dir_all(target)) {
+            swept += 1;
+        } else {
+            remnants += 1;
+        }
+    }
+    eprintln!(
+        "astro.archaeology.pool_sweep home={} swept={swept} skipped_live={skipped_live} \
+         remnants={remnants}",
+        home.display(),
+    );
 }
 
 /// Builds the structured, single-line fault detail for a contained isolated-extraction
@@ -718,49 +1103,133 @@ fn archaeology_extract_fault_detail(
     )
 }
 
-/// Child-process entry (#515) for `astrolabe cli --archaeology-extract`: runs one
-/// historical checkout's CBM extraction in this isolated process and serializes the
-/// pipeline rows to `response_out`. A C-level pipeline fault here dies with THIS child,
-/// never the host — that is the whole point of the isolation boundary. Not a
-/// user-facing tool: it consumes an internal args file (`scoped_root`, `database`,
-/// `project`, `mode`) and writes only the rows JSON response.
-pub(crate) fn run_archaeology_extract_worker(
-    args_json: &str,
-    response_out: &str,
-) -> Result<i32, DynError> {
-    let request: Value = serde_json::from_str(args_json).map_err(|error| -> DynError {
-        format!(
-            "ASTRO_ARCHAEOLOGY_EXTRACT_ARGS_INVALID: the --archaeology-extract args file is not \
-             valid JSON: {error}"
-        )
-        .into()
-    })?;
-    let field = |key: &str| -> Result<&str, DynError> {
-        request[key].as_str().ok_or_else(|| -> DynError {
-            format!(
-                "ASTRO_ARCHAEOLOGY_EXTRACT_ARGS_INVALID: the --archaeology-extract args file is \
-                 missing required string field '{key}'"
-            )
-            .into()
-        })
-    };
-    let scoped_root = field("scoped_root")?;
-    let database = field("database")?;
-    let project = field("project")?;
-    let mode = match request["mode"].as_str() {
+/// Runs one historical checkout's CBM extraction in THIS process and returns the
+/// pipeline rows (#530). Shared body of the pooled serve worker. A C-level pipeline fault
+/// (abort / access violation / heap-corruption class) terminates the process here — that
+/// is the #515 containment boundary the parent pool relies on (it detects the death and
+/// counts the in-flight commit). A RECOVERABLE Rust error (e.g. the scratch db could not
+/// be opened) is returned as `Err` so the serve worker can answer it as a structured
+/// `{ok:false}` response WITHOUT dying. The pipeline (and CBM's SQLite handle) is dropped
+/// before returning so the parent can remove the scratch db, mirroring the pre-#515
+/// in-process ordering.
+fn extract_rows_once(
+    scoped_root: &str,
+    database: &str,
+    project: &str,
+    mode: CbmIndexMode,
+) -> Result<CbmPipelineRows, DynError> {
+    let mut pipeline = CbmPipeline::new(scoped_root, database, mode)?;
+    pipeline.set_project_name(project)?;
+    let rows = pipeline.collect_rows()?;
+    drop(pipeline);
+    Ok(rows)
+}
+
+/// Builds one pooled serve-worker response (#530) for a decoded request `Value`. A clean
+/// extraction yields the `{ok:true, project, nodes, edges}` rows envelope; a request
+/// missing a required field, or a RECOVERABLE Rust-level pipeline error, yields a
+/// structured `{ok:false, error}` envelope so the WARM worker can report it without
+/// dying (the parent then counts that commit as a contained fault, identical accounting
+/// to the pre-#530 nonzero-exit child).
+fn build_serve_response(request: &Value) -> Value {
+    let field = |key: &str| request.get(key).and_then(Value::as_str);
+    let (scoped_root, database, project) =
+        match (field("scoped_root"), field("database"), field("project")) {
+            (Some(scoped_root), Some(database), Some(project)) => (scoped_root, database, project),
+            _ => {
+                return json!({
+                    "ok": false,
+                    "error": "archaeology_extract_error: request missing required string field \
+                              (scoped_root/database/project)",
+                });
+            }
+        };
+    let mode = match request.get("mode").and_then(Value::as_str) {
         Some("full") => CbmIndexMode::Full,
         Some("moderate") => CbmIndexMode::Moderate,
         // Historical re-index is always Fast; anything else (incl. absent) maps to it.
         _ => CbmIndexMode::Fast,
     };
-    let mut pipeline = CbmPipeline::new(scoped_root, database, mode)?;
-    pipeline.set_project_name(project)?;
-    let rows = pipeline.collect_rows()?;
-    // Drop the pipeline (and CBM's SQLite handle) before the parent removes the
-    // scratch db, mirroring the pre-#515 in-process ordering.
-    drop(pipeline);
-    fs::write(response_out, serde_json::to_vec(&serialize_pipeline_rows(&rows))?)?;
-    Ok(0)
+    match extract_rows_once(scoped_root, database, project, mode) {
+        Ok(rows) => {
+            let mut envelope = serialize_pipeline_rows(&rows);
+            if let Value::Object(map) = &mut envelope {
+                map.insert("ok".to_string(), Value::Bool(true));
+            }
+            envelope
+        }
+        Err(error) => json!({
+            "ok": false,
+            "error": format!("archaeology_extract_error: {error}"),
+        }),
+    }
+}
+
+/// Persistent serve-worker entry (#530) for `astrolabe cli --archaeology-extract-serve
+/// --pool-dir <dir>`: processes historical extraction requests serially in THIS one
+/// isolated process over an atomic request/response FILE handshake, so the #515 per-commit
+/// spawn+init cost is paid once per recycle interval instead of once per commit. Not a
+/// user-facing tool.
+///
+/// Protocol (parent = [`HistoricalExtractionPool`]): the parent writes
+/// `request-<seq>.json` (atomic temp-then-rename) for seq = 0, 1, 2, …; this worker polls
+/// for the next `request-<seq>.json`, extracts, and writes `response-<seq>.json` (atomic
+/// temp-then-rename), then removes the consumed request. A `{"stop":true}` request exits
+/// cleanly. A C-level pipeline fault dies with THIS process (the #515 boundary): the
+/// parent detects the death via `try_wait`, counts the in-flight commit, and respawns.
+/// The idle wait is bounded by [`ARCHAEOLOGY_EXTRACT_TIMEOUT`] so a parent that died
+/// without the [`ParentWatchdog`](crate) noticing never spins forever — the worker exits
+/// fail-closed instead.
+pub(crate) fn run_archaeology_extract_serve(pool_dir: &str) -> Result<i32, DynError> {
+    let pool_dir = PathBuf::from(pool_dir);
+    let mut seq: u64 = 0;
+    loop {
+        let request_path = pool_dir.join(format!("request-{seq}.json"));
+        // Wait for the next request, bounded so a dead parent never spins this worker hot
+        // forever (invariant 3: a fail-closed exit, never a silent infinite loop).
+        let idle_deadline = Instant::now() + ARCHAEOLOGY_EXTRACT_TIMEOUT;
+        loop {
+            if request_path.exists() {
+                break;
+            }
+            if Instant::now() >= idle_deadline {
+                // The parent is presumed gone (no request within the idle bound). Exit
+                // cleanly rather than poll indefinitely.
+                return Ok(0);
+            }
+            thread::sleep(ARCHAEOLOGY_EXTRACT_POLL);
+        }
+        let bytes = fs::read(&request_path).map_err(|error| -> DynError {
+            format!(
+                "ASTRO_ARCHAEOLOGY_SERVE_REQUEST_UNREADABLE: could not read pooled request {}: \
+                 {error}",
+                request_path.display()
+            )
+            .into()
+        })?;
+        let request: Value = serde_json::from_slice(&bytes).map_err(|error| -> DynError {
+            format!(
+                "ASTRO_ARCHAEOLOGY_SERVE_REQUEST_INVALID: pooled request {} is not valid JSON: \
+                 {error}",
+                request_path.display()
+            )
+            .into()
+        })?;
+        if request.get("stop").and_then(Value::as_bool) == Some(true) {
+            let _ = fs::remove_file(&request_path);
+            return Ok(0);
+        }
+        let response = build_serve_response(&request);
+        let response_path = pool_dir.join(format!("response-{seq}.json"));
+        let response_tmp = pool_dir.join(format!("response-{seq}.json.tmp"));
+        fs::write(&response_tmp, serde_json::to_vec(&response)?)?;
+        // Atomic appearance for the parent: the parent never reads a half-written response.
+        fs::rename(&response_tmp, &response_path)?;
+        // Drop the consumed request so the dir does not grow unbounded (the parent also
+        // removes it; double-remove is harmless).
+        let _ = fs::remove_file(&request_path);
+        seq += 1;
+    }
 }
 
 /// Serializes [`CbmPipelineRows`] to the isolated-extraction wire JSON. Manual
@@ -906,9 +1375,9 @@ struct HistoricalCommitIndex {
     crashed: Option<String>,
 }
 
-/// Outcome of the isolated historical CBM extraction ([`extract_historical_rows_isolated`]):
-/// either the extracted pipeline rows, or a contained child-process fault carrying the
-/// structured detail (exit code + stderr tail) for the labeled skip.
+/// Outcome of the pooled historical CBM extraction ([`HistoricalExtractionPool::extract`]):
+/// either the extracted pipeline rows, or a contained worker fault carrying the
+/// structured detail (exit code + worker-log tail) for the labeled skip.
 enum HistoricalExtract {
     Rows(CbmPipelineRows),
     Crashed(String),
@@ -924,6 +1393,7 @@ fn index_historical_commit(
     corpus_rel: &str,
     file_scoped: bool,
     implicated_files: &BTreeSet<String>,
+    pool: &mut HistoricalExtractionPool,
 ) -> Result<HistoricalCommitIndex, DynError> {
     let nonce = format!(
         "{}-{}",
@@ -982,23 +1452,26 @@ fn index_historical_commit(
                 edges: Vec::new(),
             }));
         }
-        // #515 crash isolation: run the CBM extraction pipeline in a CHILD PROCESS,
-        // not in-process. Unlike the main shadow import — already crash-isolated in a
-        // supervised out-of-process worker (#405) — this per-commit historical
-        // re-index used to call `CbmPipeline::collect_rows()` on THIS host thread. A
-        // C-level pipeline fault (abort / access violation / heap-corruption class) on
-        // one of a large repo's historical checkouts therefore terminated the ENTIRE
-        // host `index_repository` process: an empty-stdout `rc=127` silent hard-exit
-        // with no structured {code,message,remediation} (issue #515, reproduced on
-        // rtk-ai/rtk deep in this loop after the CBM graph was already complete). The
-        // child runs the exact same `CbmPipeline` (same `scoped_root`, same scratch
-        // `database`, same Fast mode) so the emitted subtree-relative node paths — and
-        // thus the CxIds framed from `rel_file_path` via `canonical_input_bytes` —
-        // are byte-identical to the old in-process path (#418/#439 identity contract).
-        // A fault is now CONTAINED as `HistoricalExtract::Crashed`, the host survives,
-        // and the caller degrades this one commit (labeled, counted) instead of the
-        // whole index dying silently.
-        extract_historical_rows_isolated(&scoped_root, &database, project, commit)
+        // #515 crash isolation + #530 pooling: run the CBM extraction in the POOLED
+        // out-of-process worker, not in-process. Unlike the main shadow import — already
+        // crash-isolated in a supervised out-of-process worker (#405) — this per-commit
+        // historical re-index used to call `CbmPipeline::collect_rows()` on THIS host
+        // thread. A C-level pipeline fault (abort / access violation / heap-corruption
+        // class) on one of a large repo's historical checkouts therefore terminated the
+        // ENTIRE host `index_repository` process: an empty-stdout `rc=127` silent
+        // hard-exit with no structured {code,message,remediation} (issue #515, reproduced
+        // on rtk-ai/rtk deep in this loop after the CBM graph was already complete). #515
+        // first contained that by spawning a fresh child PER commit; #530 replaces the
+        // per-commit spawn with ONE pooled worker that serves every commit serially and
+        // is recycled on crash or every N commits — the spawn+init cost is amortized while
+        // the containment is preserved. The pooled worker runs the exact same
+        // `CbmPipeline` (same `scoped_root`, same scratch `database`, same Fast mode) so
+        // the emitted subtree-relative node paths — and thus the CxIds framed from
+        // `rel_file_path` via `canonical_input_bytes` — are byte-identical to the old
+        // in-process path (#418/#439 identity contract). A fault is CONTAINED as
+        // `HistoricalExtract::Crashed`, the host survives, and the caller degrades this
+        // one commit (labeled, counted) instead of the whole index dying silently.
+        pool.extract(&scoped_root, &database, project, commit)
     })();
     // Ask git to release and remove its worktree registration first; retries below
     // sweep any file/dir it leaves behind under Windows handle latency.

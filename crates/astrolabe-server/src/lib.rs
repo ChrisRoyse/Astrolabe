@@ -360,26 +360,21 @@ fn run_cli(args: &[String]) -> Result<i32, DynError> {
     let progress = strip_flag(&mut args, "--progress");
     let index_worker = strip_flag(&mut args, "--index-worker");
     let response_out = strip_flag_value(&mut args, "--response-out");
-    // #515 internal isolated historical-index extraction worker. Spawned per evidence
-    // commit by `run_git_archaeology` (git_archaeology.rs) so a C-level CBM pipeline
-    // fault on a historical checkout is contained in THIS child process instead of
-    // hard-exiting the host `index_repository` with a silent empty-stdout rc=127. Not
-    // a user-facing tool: it consumes `--args-file` + `--response-out` and writes only
-    // the serialized pipeline rows. Handled before tool-name resolution because it is
-    // not a CBM tool. A ParentWatchdog ties it to the parent so a dead parent never
-    // orphans it.
-    if strip_flag(&mut args, "--archaeology-extract") {
+    // #515/#530 internal pooled historical-index extraction serve worker. Spawned ONCE
+    // per recycle interval by `run_git_archaeology` (git_archaeology.rs) and served every
+    // evidence commit's extraction serially over an atomic request/response file handshake,
+    // so a C-level CBM pipeline fault on a historical checkout is contained in THIS child
+    // process (the host `index_repository` never hard-exits with a silent empty-stdout
+    // rc=127) while the #515 per-commit spawn+init cost is amortized to once per interval.
+    // Not a user-facing tool: it consumes `--pool-dir <dir>` and communicates only via the
+    // handshake files under it. Handled before tool-name resolution because it is not a CBM
+    // tool. A ParentWatchdog ties it to the parent so a dead parent never orphans it.
+    if strip_flag(&mut args, "--archaeology-extract-serve") {
         let _worker_watchdog = ParentWatchdog::start();
-        let args_file = strip_flag_value(&mut args, "--args-file").ok_or_else(|| -> DynError {
-            "ASTRO_ARCHAEOLOGY_EXTRACT_ARGS_MISSING: --archaeology-extract requires --args-file <path>".into()
+        let pool_dir = strip_flag_value(&mut args, "--pool-dir").ok_or_else(|| -> DynError {
+            "ASTRO_ARCHAEOLOGY_EXTRACT_SERVE_POOL_DIR_MISSING: --archaeology-extract-serve requires --pool-dir <path>".into()
         })?;
-        let resp = response_out.clone().ok_or_else(|| -> DynError {
-            "ASTRO_ARCHAEOLOGY_EXTRACT_RESPONSE_MISSING: --archaeology-extract requires --response-out <path>".into()
-        })?;
-        let args_json = fs::read_to_string(&args_file).map_err(|error| -> DynError {
-            format!("ASTRO_ARCHAEOLOGY_EXTRACT_ARGS_UNREADABLE: could not read --archaeology-extract args file {args_file}: {error}").into()
-        })?;
-        return migration::run_archaeology_extract_worker(&args_json, &resp);
+        return migration::run_archaeology_extract_serve(&pool_dir);
     }
     if args.is_empty() {
         return Err("Usage: astrolabe cli [--json] [--progress] <tool_name> [--args-file <path> | (JSON on stdin)] (raw '<json>' argv is no longer supported).\n  --json prints the raw tool result JSON on stdout and exits 1 when the result is isError:true (0 otherwise), so RC-based callers see tool failures (#419).\n  <tool_name> --help prints the tool's arguments and exits without running it (#416).".into());

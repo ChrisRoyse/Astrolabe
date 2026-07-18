@@ -133,10 +133,10 @@ use shadow_import::*;
 
 mod git_archaeology;
 use git_archaeology::*;
-// #515: the isolated historical-index extraction child entry, dispatched from
-// `run_cli` in lib.rs (`astrolabe cli --archaeology-extract`). Explicitly re-exported
-// because the glob `use` above is private to this module.
-pub(crate) use git_archaeology::run_archaeology_extract_worker;
+// #515/#530: the pooled historical-index extraction serve worker entry, dispatched from
+// `run_cli` in lib.rs (`astrolabe cli --archaeology-extract-serve`). Explicitly
+// re-exported because the glob `use` above is private to this module.
+pub(crate) use git_archaeology::run_archaeology_extract_serve;
 
 mod watcher_lane;
 pub(crate) use watcher_lane::run_incremental_watcher_loop;
