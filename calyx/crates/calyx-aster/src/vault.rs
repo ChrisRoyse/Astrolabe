@@ -54,6 +54,7 @@ pub use failpoints::{
     CRASH_FSV_ARMED_IN_PRODUCTION, crash_fsv_guard_decision, guard_against_production_failpoints,
 };
 pub use grant::{AuditEvent, GrantEntry, GrantStore};
+pub use ledger_append::CALYX_ASTER_RAW_LEDGER_COMMIT_BOUNDARY;
 pub use htap::HtapDualRead;
 pub use input_store::{
     CALYX_INPUT_STORE_CORRUPT, CALYX_INPUT_STORE_MISSING, CALYX_INPUT_STORE_TOO_LARGE,

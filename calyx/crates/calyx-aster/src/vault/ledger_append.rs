@@ -123,15 +123,9 @@ where
         actor: ActorId,
     ) -> Result<(calyx_core::Seq, LedgerRef)> {
         let Some(hook) = &self.ledger_hook else {
-            let store = AsterRawLedgerStore { vault: self };
-            let appender = LedgerAppender::open(store, std::sync::Arc::clone(&self.clock))?;
-            let prepared = appender.prepare(kind, subject, payload, actor)?;
-            let ledger_ref = prepared.ledger_ref();
-            rows.push(encode::WriteRow {
-                cf: ColumnFamily::Ledger,
-                key: ledger_key(prepared.seq()),
-                value: prepared.bytes().to_vec(),
-            });
+            let (ledger_row, ledger_ref) =
+                self.raw_prepared_ledger_row(kind, subject, payload, actor)?;
+            rows.push(ledger_row);
             let seq = self.commit_rows_if_current_volatile(expected_seq, rows)?;
             return Ok((seq, ledger_ref));
         };
@@ -187,6 +181,20 @@ where
         })
     }
 
+    /// Appends one no-hook ledger entry inside the caller's already-held durable
+    /// commit lock, as a single crash-consistent group commit.
+    ///
+    /// The row is prepared through [`Self::raw_prepared_ledger_row`] (which never
+    /// mutates the store) and committed by exactly one
+    /// [`Self::commit_rows_locked`] group. `commit_rows_locked` ->
+    /// `commit_prepared_rows` persists the Ledger CF row and derives+writes the
+    /// head anchor (`newest_anchor_from_rows`) inside the same WAL-backed
+    /// boundary, so the ledger row and its external witness share one commit.
+    ///
+    /// This path never reacquires the durable commit lock: the lock is already
+    /// held by [`Self::append_ledger_entry`], and `commit_rows_locked` does not
+    /// take it. A read-only handle fails closed with `CALYX_VAULT_READ_ONLY`
+    /// (via `ensure_writeable`) instead of hanging.
     fn append_ledger_entry_without_hook(
         &self,
         kind: EntryKind,
@@ -194,9 +202,55 @@ where
         payload: Vec<u8>,
         actor: ActorId,
     ) -> Result<LedgerRef> {
+        let (ledger_row, ledger_ref) = self.raw_prepared_ledger_row(kind, subject, payload, actor)?;
+        self.commit_rows_locked(&[ledger_row])?;
+        Ok(ledger_ref)
+    }
+
+    /// Prepares the next append-only ledger row without touching the durable
+    /// commit boundary or the raw store's mutating surface.
+    ///
+    /// This is the single no-hook ledger preparation path. It opens a
+    /// [`LedgerAppender`] over the read-only [`AsterRawLedgerStore`] (tip
+    /// recovery reads `scan`/`head_anchor` only), builds the next chained row
+    /// with [`LedgerAppender::prepare`] (pure — it never calls `put_new`), and
+    /// runs an append-only readback guard so the returned row can be committed
+    /// inside one `commit_rows_locked` group by the caller. No ledger row is ever
+    /// persisted through the appender.
+    ///
+    /// # Errors
+    /// - [`CalyxError::ledger_append_only_violation`] if a row already exists at
+    ///   the prepared sequence (a concurrent writer advanced the ledger tip
+    ///   between tip recovery and this readback); nothing is written.
+    fn raw_prepared_ledger_row(
+        &self,
+        kind: EntryKind,
+        subject: SubjectId,
+        payload: Vec<u8>,
+        actor: ActorId,
+    ) -> Result<(encode::WriteRow, LedgerRef)> {
         let store = AsterRawLedgerStore { vault: self };
-        let mut appender = LedgerAppender::open(store, std::sync::Arc::clone(&self.clock))?;
-        appender.append(kind, subject, payload, actor)
+        let appender = LedgerAppender::open(store, std::sync::Arc::clone(&self.clock))?;
+        let prepared = appender.prepare(kind, subject, payload, actor)?;
+        let seq = prepared.seq();
+        let key = ledger_key(seq);
+        if self
+            .read_cf_at(self.snapshot(), ColumnFamily::Ledger, &key)?
+            .is_some()
+        {
+            return Err(CalyxError::ledger_append_only_violation(format!(
+                "ledger seq {seq} already exists; refusing to overwrite an append-only ledger row"
+            )));
+        }
+        let ledger_ref = prepared.ledger_ref();
+        Ok((
+            encode::WriteRow {
+                cf: ColumnFamily::Ledger,
+                key,
+                value: prepared.bytes().to_vec(),
+            },
+            ledger_ref,
+        ))
     }
 
     fn anchor_with_raw_ledger_entry(
@@ -206,17 +260,11 @@ where
         anchor: Anchor,
         entry: LedgerEntryInput,
     ) -> Result<LedgerRef> {
-        let store = AsterRawLedgerStore { vault: self };
-        let appender = LedgerAppender::open(store, std::sync::Arc::clone(&self.clock))?;
-        let prepared = appender.prepare(entry.kind, entry.subject, entry.payload, entry.actor)?;
-        let ledger_ref = prepared.ledger_ref();
+        let (ledger_row, ledger_ref) =
+            self.raw_prepared_ledger_row(entry.kind, entry.subject, entry.payload, entry.actor)?;
         constellation.provenance = ledger_ref.clone();
         let mut rows = anchor_rows(id, constellation, &anchor)?;
-        rows.push(encode::WriteRow {
-            cf: ColumnFamily::Ledger,
-            key: ledger_key(prepared.seq()),
-            value: prepared.bytes().to_vec(),
-        });
+        rows.push(ledger_row);
         self.commit_rows_locked(&rows)?;
         Ok(ledger_ref)
     }
@@ -271,17 +319,30 @@ where
         payload: Vec<u8>,
         actor: ActorId,
     ) -> Result<LedgerRef> {
-        let store = AsterRawLedgerStore { vault: self };
-        let appender = LedgerAppender::open(store, std::sync::Arc::clone(&self.clock))?;
-        let prepared = appender.prepare(kind, subject, payload, actor)?;
-        let ledger_ref = prepared.ledger_ref();
-        rows.push(encode::WriteRow {
-            cf: ColumnFamily::Ledger,
-            key: ledger_key(prepared.seq()),
-            value: prepared.bytes().to_vec(),
-        });
+        let (ledger_row, ledger_ref) = self.raw_prepared_ledger_row(kind, subject, payload, actor)?;
+        rows.push(ledger_row);
         self.commit_rows_locked(&rows)?;
         Ok(ledger_ref)
+    }
+}
+
+/// Error code returned when the raw ledger adapter's mutating surface is used.
+///
+/// [`AsterRawLedgerStore`] is read-only tip recovery (`scan`/`head_anchor`).
+/// All ledger persistence routes through `prepare` + one `commit_rows_locked`
+/// group so the ledger row and its head anchor share a single durable commit
+/// boundary (`commit_prepared_rows`). This code fires if any caller reaches the
+/// adapter's `put_new`/`put_head_anchor` methods, which would otherwise nest the
+/// durable commit lock or split that boundary.
+pub const CALYX_ASTER_RAW_LEDGER_COMMIT_BOUNDARY: &str = "CALYX_ASTER_RAW_LEDGER_COMMIT_BOUNDARY";
+
+fn raw_ledger_commit_boundary_error(operation: String) -> CalyxError {
+    CalyxError {
+        code: CALYX_ASTER_RAW_LEDGER_COMMIT_BOUNDARY,
+        message: format!(
+            "raw ledger adapter rejected {operation}: the adapter is read-only tip recovery and must never persist ledger state"
+        ),
+        remediation: "route ledger persistence through prepare + one commit_rows_locked group; the raw adapter exposes only scan/head_anchor for tip recovery",
     }
 }
 
@@ -337,20 +398,16 @@ where
         Ok(rows)
     }
 
-    fn put_new(&mut self, seq: u64, bytes: &[u8]) -> Result<()> {
-        let key = ledger_key(seq);
-        if self
-            .vault
-            .read_cf_at(self.vault.snapshot(), ColumnFamily::Ledger, &key)?
-            .is_some()
-        {
-            return Err(CalyxError::ledger_append_only_violation(format!(
-                "ledger seq {seq} already exists"
-            )));
-        }
-        self.vault
-            .write_cf(ColumnFamily::Ledger, key, bytes.to_vec())
-            .map(|_| ())
+    /// Fail-closed: the raw adapter never persists ledger rows.
+    ///
+    /// A durable no-hook append here would call `vault.write_cf`, which
+    /// reacquires `with_durable_commit_lock` on the same non-reentrant file lock
+    /// and self-deadlocks, and would also split the ledger row from its head
+    /// anchor into a second commit boundary. Ledger persistence goes through
+    /// `raw_prepared_ledger_row` + one `commit_rows_locked` group instead
+    /// (issue #560).
+    fn put_new(&mut self, seq: u64, _bytes: &[u8]) -> Result<()> {
+        Err(raw_ledger_commit_boundary_error(format!("put_new(seq={seq})")))
     }
 
     fn head_anchor(&self) -> Result<Option<LedgerHeadAnchor>> {
@@ -365,10 +422,13 @@ where
         Ok(anchor)
     }
 
+    /// Fail-closed: the head anchor is derived from the committed Ledger CF row
+    /// and persisted by `commit_prepared_rows` inside the group-commit boundary,
+    /// never by this adapter (issue #560).
     fn put_head_anchor(&mut self, anchor: &LedgerHeadAnchor) -> Result<()> {
-        if let Some(durable) = &self.vault.durable {
-            crate::ledger_head::write_head_anchor(durable.root(), anchor)?;
-        }
-        Ok(())
+        Err(raw_ledger_commit_boundary_error(format!(
+            "put_head_anchor(height={})",
+            anchor.height
+        )))
     }
 }
