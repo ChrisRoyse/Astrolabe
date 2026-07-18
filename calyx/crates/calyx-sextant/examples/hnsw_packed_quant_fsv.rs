@@ -112,11 +112,11 @@ fn parent_run() -> Result<(), Box<dyn std::error::Error>> {
         QuantConfig::turboquant_structured(new_seed(DIM, TURBOQUANT_SEED), QuantLevel::Bits3p5)?;
     let turbo3p5_geometry_id = turbo3p5_config.geometry_id();
     let turbo2p5_row_bytes = TURBOQUANT_FORMAT_HEADER_BYTES
-        + ((DIM / 2 * 5 + (DIM % 2) * 3).div_ceil(8))
+        + ((DIM / 2 * 3 + (DIM % 2) * 2).div_ceil(8))
         + DIM.div_ceil(8)
         + 4;
     let turbo3p5_row_bytes = TURBOQUANT_FORMAT_HEADER_BYTES
-        + ((DIM / 2 * 7 + (DIM % 2) * 4).div_ceil(8))
+        + ((DIM / 2 * 5 + (DIM % 2) * 3).div_ceil(8))
         + DIM.div_ceil(8)
         + 4;
     let mut artifacts = Vec::new();
@@ -1225,8 +1225,8 @@ fn independent_artifact_read(path: &Path) -> Result<PhysicalReadback, Box<dyn st
             1 => dim as usize + 4,
             2 => (dim as usize).div_ceil(8),
             3 | 4 => {
-                let pair_bits = if kind_tag == 3 { 5 } else { 7 };
-                let odd_bits = if kind_tag == 3 { 3 } else { 4 };
+                let pair_bits = if kind_tag == 3 { 3 } else { 5 };
+                let odd_bits = if kind_tag == 3 { 2 } else { 3 };
                 let scalar_bits = dim as usize / 2 * pair_bits + dim as usize % 2 * odd_bits;
                 let payload_len = TURBOQUANT_FORMAT_HEADER_BYTES
                     + scalar_bits.div_ceil(8)
