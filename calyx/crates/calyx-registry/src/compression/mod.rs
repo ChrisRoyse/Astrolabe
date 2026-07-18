@@ -1,6 +1,7 @@
 mod codec;
 mod index;
 mod lifecycle;
+mod multivector;
 mod recall;
 
 use calyx_assay::{AssayCacheKey, AssayStore, AssaySubject, MiEstimate, TrustTag};
@@ -23,6 +24,13 @@ pub use index::{CompressedSlotHit, CompressedSlotIndex};
 pub use lifecycle::{
     GenerationDeleteReport, append_reseal_compressed_rows, delete_compressed_generation,
     erase_compressed_slot_rows, generation_lifecycle,
+};
+pub use multivector::{
+    CALYX_MULTIVECTOR_CONTEXT_MISMATCH, CALYX_MULTIVECTOR_PACK_INVALID,
+    CALYX_MULTIVECTOR_SHAPE_UNSUPPORTED, MULTIVECTOR_DIGEST_BYTES, MULTIVECTOR_HEADER_BYTES,
+    MULTIVECTOR_PACK_MAGIC, MULTIVECTOR_PACK_VERSION, MultiVectorStorageCodec, PackedColbertBytes,
+    ParsedColbertMatrix, pack_colbert_matrix, packed_maxsim, parse_colbert_matrix,
+    reject_dense_codec_for_multivector, resolve_multivector_storage,
 };
 pub use recall::matryoshka_truncate_renormalize;
 use recall::{recall_at_k, recall_drop, validate_batch};
@@ -492,6 +500,7 @@ pub(crate) fn write_compressed_slot_batch_with_assay_evidence<C: Clock>(
     k: usize,
     mxfp4_evidence: Option<&MxFp4AssayEvidence>,
 ) -> Result<SlotCompressionReport> {
+    reject_dense_codec_for_multivector(slot.shape, lens.quant_default)?;
     let (expected_seq, transition) = validate_full_column_rewrite(vault, slot, lens, rows)?;
     if lens.quant_default == QuantPolicy::MxFp4
         && let Some(evidence) = mxfp4_evidence
@@ -616,6 +625,7 @@ pub(crate) fn compress_streamed_column<C: Clock>(
     queries: &[CompressionQuery],
     k: usize,
 ) -> Result<SlotCompressionReport> {
+    reject_dense_codec_for_multivector(slot.shape, lens.quant_default)?;
     let snapshot = vault.latest_seq();
     let stored = vault.scan_cf_at(snapshot, ColumnFamily::slot(slot.slot_id))?;
     if stored.is_empty() {
@@ -923,6 +933,7 @@ pub fn compress_slot_batch_with_assay_evidence(
     k: usize,
     mxfp4_evidence: Option<&MxFp4AssayEvidence>,
 ) -> Result<SlotCompressionReport> {
+    reject_dense_codec_for_multivector(slot.shape, lens.quant_default)?;
     validate_batch(slot, lens, rows, queries, k)?;
     let initial = encode_rows(slot, lens, rows, lens.quant_default, mxfp4_evidence)?;
     let report = build_report(slot, lens, rows, queries, k, initial, None)?;
