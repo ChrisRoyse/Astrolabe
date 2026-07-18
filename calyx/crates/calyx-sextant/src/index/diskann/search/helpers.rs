@@ -5,7 +5,8 @@ use calyx_core::{CxId, Result};
 
 use super::DiskAnnSearchParams;
 use crate::error::{
-    CALYX_INDEX_DIM_MISMATCH, CALYX_INDEX_INVALID_PARAMS, CALYX_INDEX_IO, sextant_error,
+    CALYX_INDEX_CORRUPT, CALYX_INDEX_DIM_MISMATCH, CALYX_INDEX_INVALID_PARAMS, CALYX_INDEX_IO,
+    sextant_error,
 };
 use crate::index::diskann::graph::DiskAnnVectorRef;
 use crate::index::distance::{l2_sq, unit_l2_cosine_distance};
@@ -77,7 +78,7 @@ pub(super) fn distance_to_node(
     match b {
         DiskAnnVectorRef::F32(values) => Ok(distance(a, values, mode)),
         DiskAnnVectorRef::I8 { codes, norm } => match mode {
-            DiskAnnDistanceMode::UnitL2 => Ok(cosine_i8(a, codes, norm)),
+            DiskAnnDistanceMode::UnitL2 => cosine_i8(a, codes, norm),
             DiskAnnDistanceMode::RawL2 => Err(invalid(
                 "directional i8 graph can only serve the bound unit_l2 metric",
             )),
@@ -85,14 +86,23 @@ pub(super) fn distance_to_node(
     }
 }
 
-fn cosine_i8(a: &[f32], b: &[i8], cached_norm: f32) -> f32 {
+fn cosine_i8(a: &[f32], b: &[i8], cached_norm: f32) -> Result<f32> {
     debug_assert_eq!(a.len(), b.len());
-    let dot = scalar8_dot_signed(a, b);
-    if cached_norm <= 0.0 {
-        1.0
-    } else {
-        (1.0 - (dot / f64::from(cached_norm)) as f32).max(0.0)
+    if !cached_norm.is_finite() || cached_norm <= 0.0 {
+        return Err(sextant_error(
+            CALYX_INDEX_CORRUPT,
+            "diskann directional i8 candidate has an invalid cached norm",
+        ));
     }
+    let dot = scalar8_dot_signed(a, b);
+    let distance = 1.0 - (dot / f64::from(cached_norm)) as f32;
+    if !distance.is_finite() {
+        return Err(sextant_error(
+            CALYX_INDEX_CORRUPT,
+            "diskann directional i8 score is non-finite",
+        ));
+    }
+    Ok(distance.max(0.0))
 }
 
 pub(super) fn sorted(mut hits: Vec<(u32, f32)>) -> Vec<(u32, f32)> {
