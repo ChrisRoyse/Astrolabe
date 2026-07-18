@@ -206,23 +206,34 @@ unless given explicitly.
 
 ### 2.5 `StaticLookupLens` — `runtime/static_lookup.rs`
 
-Token-embedding lookup-and-mean-pool (model2vec / static word vectors). Reads a
-memory-mapped (`memmap2`) matrix file with a 24-byte header:
+Token-embedding lookup-and-mean-pool (model2vec / static word vectors). Reads an
+authenticated memory-mapped (`memmap2`) matrix with a 64-byte aligned header:
 
 ```
-[0..8)   magic  "CXLKUP1\0"
+[0..8)   magic  "CXLKUP2\0"
 [8..12)  rows   u32 LE
 [12..16) dim    u32 LE
 [16]     dtype  1=int8, 2=f16, 3=f32
-[20..24) scale  f32 LE (must be finite, > 0)
+[17..20) zero padding
+[20..24) vocab_size u32 LE (must equal rows)
+[24..32) body_len u64 LE (checked before mmap slicing)
+[32..64) BLAKE3 digest of the exact body
+[64..]   int8: f32 scale[rows] then i8 codes[rows*dim]
+          f16/f32: finite little-endian values[rows*dim]
 ```
 
-`measure` tokenizes (max 512 tokens), skips `[UNK]`/`<unk>`, sums the per-token rows
-(`raw * scale`, with a hand-rolled f16→f32), divides by count, applies norm. Empty or
-all-unknown text → a zero-safe unit vector `[1,0,…]`. Modality fixed **Text**; output
-`Dense(dim)`. `StaticLookupDType`: `Int8 | F16 | F32` (widths 1/2/4). Hash drift vs an
-expected `weights_sha256` → `CALYX_LENS_FROZEN_VIOLATION`; bad header →
-`CALYX_LENS_CONFIG_INVALID`.
+`StaticLookupWriter` derives `rows` from the bound tokenizer and streams one finite
+source row at a time. INT8 uses a canonical symmetric per-row scale and the full
+`[-127,127]` range; partial, corrupt, or duplicate-destination exports are never
+published. `finalize` seals the body, reopens it through the production mmap reader,
+then publishes an immutable artifact. `measure` tokenizes (max 512 tokens), skips
+named unknown tokens, directly accumulates mmap rows with an attested AVX2 backend
+(AVX2+F16C for F16) when supported, divides by count, and applies the declared norm.
+The scalar CPU backend is named in the same runtime attestation when selected. Empty
+or all-unknown text refuses with `CALYX_LENS_EMPTY_PROJECTION`; out-of-range token ids,
+vocabulary/weights drift, noncanonical values, bad digest/length/dtype, and legacy
+`CXLKUP1` refuse with structured remediation. Modality is **Text** and output is
+`Dense(dim)`.
 
 ### 2.6 `MultimodalAdapterLens` — `runtime/adapters/lens.rs` (+ `axis.rs`, `pack.rs`)
 

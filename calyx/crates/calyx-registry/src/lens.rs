@@ -3,19 +3,21 @@ use std::sync::Arc;
 
 use calyx_aster::vault::AsterVault;
 use calyx_core::{
-    Asymmetry, CalyxError, Clock, CxId, Input, Lens, LensId, Result,
-    RuntimeExecutionAttestation, Slot, SlotShape, SlotVector, SparseEntry,
+    Asymmetry, CalyxError, Clock, CxId, Input, Lens, LensId, Result, RuntimeExecutionAttestation,
+    Slot, SlotShape, SlotVector, SparseEntry,
 };
 use serde::{Deserialize, Serialize};
 
 mod contract;
 
-use crate::frozen::FrozenLensContract;
-use crate::ingest_microbatch::{IngestLensOutcome, IngestMicrobatchController, IngestPanelReadout};
-use crate::spec::{LensHealth, LensSpec};
+pub use contract::validate_quant_policy_for_shape;
+
 use crate::compression::{
     self, CompressedSlotIndex, CompressionQuery, MxFp4AssayEvidence, SlotCompressionReport,
 };
+use crate::frozen::FrozenLensContract;
+use crate::ingest_microbatch::{IngestLensOutcome, IngestMicrobatchController, IngestPanelReadout};
+use crate::spec::{LensHealth, LensSpec};
 use contract::ensure_spec_declares_contract;
 
 /// Runtime registry for frozen lens measurement instruments.

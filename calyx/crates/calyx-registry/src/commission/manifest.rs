@@ -304,6 +304,7 @@ pub fn lens_spec_from_manifest_with_license_override(
     let norm_policy = norm_policy(&manifest.norm)?;
     let runtime = runtime_from_manifest(manifest, &artifacts)?;
     let spec = spec_from_manifest_identity(manifest, runtime, output, weights_sha256, norm_policy)?;
+    crate::validate_quant_policy_for_shape(&spec.name, spec.output, spec.quant_default)?;
     let declared = spec.declared_contract();
     let observed = crate::persistence_contracts::derive_runtime_contract_from_spec(&spec)?;
     if declared != observed {

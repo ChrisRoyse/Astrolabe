@@ -152,11 +152,11 @@ fn decode_constellation_base_parts(
         let hash = cursor.array()?;
         if slots
             .insert(
-            slot,
-            SlotVector::Absent {
-                reason: AbsentReason::NotApplicable,
-            },
-        )
+                slot,
+                SlotVector::Absent {
+                    reason: AbsentReason::NotApplicable,
+                },
+            )
             .is_some()
             || slot_hashes.insert(slot, hash).is_some()
         {
@@ -481,9 +481,7 @@ fn read_varint(cursor: &mut Cursor<'_>) -> Result<u32> {
         let byte = cursor.u8()?;
         let chunk = u32::from(byte & 0x7f);
         if shift >= 32 || (shift == 28 && chunk > 0x0f) {
-            return Err(CalyxError::aster_corrupt_shard(
-                "varint exceeds u32 range",
-            ));
+            return Err(CalyxError::aster_corrupt_shard("varint exceeds u32 range"));
         }
         value |= chunk << shift;
         if byte & 0x80 == 0 {

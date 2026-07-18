@@ -256,6 +256,13 @@ impl DurableVault {
 
         let replay = replay_dir(root.join("wal"))?;
         let last_recovered_seq = replay.records.last().map_or(0, |record| record.seq);
+        // A vault does not need a CURRENT manifest before its router SSTs and
+        // WAL are valid latest-state sources. Honor the caller's router mode in
+        // this bootstrap state exactly as the manifested branch above does.
+        // With no manifest the whole WAL is uncheckpointed tail, so both modes
+        // must restore it: latest readers compose that tail over router SSTs,
+        // while historical readers rebuild MVCC from the same committed rows.
+        let router_latest_readback = !options.restore_mvcc_rows;
         let batches = replay
             .records
             .iter()
@@ -275,7 +282,7 @@ impl DurableVault {
             temporal_policy: options.temporal_policy,
             dedup_policy: options.dedup_policy.clone(),
             retention_horizon: options.retention_horizon.clone(),
-            router_latest_readback: false,
+            router_latest_readback,
         })
     }
 

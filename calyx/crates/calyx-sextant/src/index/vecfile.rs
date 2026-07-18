@@ -192,7 +192,10 @@ fn open_verified(
     let row_stride = row_stride_for_dim(dim).ok_or_else(|| {
         sextant_error(
             CALYX_INDEX_CORRUPT,
-            format!("{kind} {} row stride overflows u64 (dim {dim})", path.display()),
+            format!(
+                "{kind} {} row stride overflows u64 (dim {dim})",
+                path.display()
+            ),
         )
     })?;
     let expected_payload = count.checked_mul(row_stride).ok_or_else(|| {
@@ -293,8 +296,7 @@ pub struct FbinVectors {
 
 impl FbinVectors {
     pub fn open(path: &Path) -> Result<Self> {
-        let (mmap, header) =
-            open_verified(path, &VEC_MAGIC, "vecfile", |dim| dim.checked_mul(4))?;
+        let (mmap, header) = open_verified(path, &VEC_MAGIC, "vecfile", |dim| dim.checked_mul(4))?;
         // The f32 region begins at byte 60; mmap base is page-aligned and 60 % 4 == 0,
         // so the region is 4-byte aligned for zero-copy f32 reads.
         if !(mmap.as_ptr() as usize + VEC_HEADER_LEN).is_multiple_of(std::mem::align_of::<f32>()) {
@@ -382,14 +384,11 @@ pub struct I8BinVectors {
 
 impl I8BinVectors {
     pub fn open(path: &Path) -> Result<Self> {
-        let (mmap, header) = open_verified(path, &I8BIN_MAGIC, "i8bin", |dim| {
-            dim.checked_add(4)
-        })?;
+        let (mmap, header) = open_verified(path, &I8BIN_MAGIC, "i8bin", |dim| dim.checked_add(4))?;
         let stride = header.dim + 4;
         for row in 0..header.count {
             let start = VEC_HEADER_LEN + (row as usize) * stride;
-            let scale =
-                f32::from_le_bytes(mmap[start..start + 4].try_into().expect("4B"));
+            let scale = f32::from_le_bytes(mmap[start..start + 4].try_into().expect("4B"));
             if !scale.is_finite() || scale <= 0.0 {
                 return Err(sextant_error(
                     CALYX_INDEX_NONCANONICAL_I8,
@@ -626,10 +625,9 @@ pub struct FbinWriter {
 
 impl FbinWriter {
     pub fn create(path: &Path, dim: usize, count: u64) -> Result<Self> {
-        let inner =
-            VecWriterInner::create(path, &VEC_MAGIC, "vecfile", dim, count, |dim| {
-                dim.checked_mul(4)
-            })?;
+        let inner = VecWriterInner::create(path, &VEC_MAGIC, "vecfile", dim, count, |dim| {
+            dim.checked_mul(4)
+        })?;
         Ok(Self {
             row_bytes: Vec::with_capacity(dim * 4),
             inner,
@@ -827,12 +825,14 @@ impl I32BinMatrix {
                     ),
                 )
             })?;
-        let expect = (I32BIN_HEADER_LEN as u64).checked_add(body).ok_or_else(|| {
-            sextant_error(
-                CALYX_INDEX_CORRUPT,
-                format!("i32bin {} total size overflows u64", path.display()),
-            )
-        })?;
+        let expect = (I32BIN_HEADER_LEN as u64)
+            .checked_add(body)
+            .ok_or_else(|| {
+                sextant_error(
+                    CALYX_INDEX_CORRUPT,
+                    format!("i32bin {} total size overflows u64", path.display()),
+                )
+            })?;
         if len != expect {
             return Err(sextant_error(
                 CALYX_INDEX_CORRUPT,

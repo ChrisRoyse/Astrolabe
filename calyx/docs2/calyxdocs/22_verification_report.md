@@ -121,7 +121,7 @@ and env gates.
 | Vault manifest | (JSON) | `ManifestVersion{major=1, minor=0}` |
 | Lodestar kernel index/artifact | (JSON) | `FORMAT_VERSION = 1` |
 | DiskANN graph | `CLXDA001` | 4 KiB page-aligned |
-| Static-lookup lens matrix | `CXLKUP1` | — |
+| Static-lookup lens matrix | `CXLKUP2` | authenticated 64-byte v2 header; legacy `CXLKUP1` refused |
 | Lead/lag series record | `LLAG1` | 61-byte |
 | Compression report schema | — | `COMPRESSION_REPORT_SCHEMA_VERSION = 1` |
 | Forge seed format | — | `CURRENT_SEED_VERSION = 1` |

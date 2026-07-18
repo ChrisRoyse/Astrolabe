@@ -1,9 +1,7 @@
 use std::fs;
 use std::path::Path;
 
-use calyx_core::{
-    Asymmetry, CalyxError, Input, Lens, LensId, Modality, SlotShape, SlotVector,
-};
+use calyx_core::{Asymmetry, CalyxError, Input, Lens, LensId, Modality, SlotShape, SlotVector};
 use calyx_registry::frozen::sha256_digest;
 use calyx_registry::{
     AlgorithmicLens, ExternalCmdLens, FrozenLensContract, LensDType, LensRuntime, LensSpec,

@@ -4,8 +4,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use calyx_core::{
-    CalyxError, Input, Lens, LensId, Modality, Panel, Result as CalyxResult, Slot,
-    SlotId, SlotKey, SlotShape, SlotState, SlotVector,
+    CalyxError, Input, Lens, LensId, Modality, Panel, Result as CalyxResult, Slot, SlotId, SlotKey,
+    SlotShape, SlotState, SlotVector,
 };
 use calyx_registry::frozen::sha256_digest;
 use calyx_registry::{DeterminismProof, FrozenLensContract, LensDType, NormPolicy};
