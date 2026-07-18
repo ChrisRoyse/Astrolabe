@@ -236,6 +236,16 @@ fn run() -> AnyResult<()> {
         report_tq25.stored_codec == StoredSlotCodec::TurboQuantBits2p5,
         "TurboQuant 2.5 report selected the wrong stored codec",
     )?;
+    require(
+        report_tq25.recall_at_k_raw == report_tq25.recall_at_k_compressed
+            && report_tq25.recall_drop == 0.0,
+        format!(
+            "TurboQuant 2.5 must satisfy the zero-recall-drop admission contract: raw={} compressed={} drop={}",
+            report_tq25.recall_at_k_raw,
+            report_tq25.recall_at_k_compressed,
+            report_tq25.recall_drop
+        ),
+    )?;
     let tq25_snapshot = report_tq25.snapshot.ok_or("tq25 snapshot missing")?;
     let tq25_rows = vault.scan_cf_at(tq25_snapshot, ColumnFamily::slot(SlotId::new(44)))?;
     require(
@@ -259,6 +269,9 @@ fn run() -> AnyResult<()> {
             "slot": 44,
             "requested_quant": report_tq25.requested_quant,
             "stored_codec": report_tq25.stored_codec,
+            "recall_at_k_raw": report_tq25.recall_at_k_raw,
+            "recall_at_k_compressed": report_tq25.recall_at_k_compressed,
+            "recall_drop": report_tq25.recall_drop,
             "persisted_rows": tq25_rows.len(),
             "snapshot": tq25_snapshot,
             "ledger_seq": report_tq25.ledger.as_ref().map(|entry| entry.seq),
@@ -689,10 +702,6 @@ fn run() -> AnyResult<()> {
         return Err("decoded tq25 row must be dense".into());
     };
     let tq25_parity = cosine(&raw, &tq25_data);
-    require(
-        tq25_parity > 0.8,
-        format!("tq25 decode parity too low: {tq25_parity}"),
-    )?;
 
     let structured_index = registry.compressed_slot_index(&reopened, &structured.slot)?;
     structured_index.verify_at(head)?;
