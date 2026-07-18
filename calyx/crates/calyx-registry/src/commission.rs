@@ -12,17 +12,25 @@ mod manifest;
 mod manifest_identity;
 mod manifest_metadata;
 mod manifest_runtime;
+mod onnx_int8;
 mod source_tensor_profile;
 
 pub use manifest::{
     LensForgeBatchPolicy, LensForgeBatchProbeLevel, LensForgeFile, LensForgeManifest,
-    LensForgeShape, legacy_lensforge_manifest_v1_ids_from_path, lens_spec_from_manifest,
+    LensForgeShape, legacy_lensforge_manifest_v1_ids_from_path,
+    lens_spec_and_onnx_int8_attestation_from_manifest_path, lens_spec_from_manifest,
     lens_spec_from_manifest_path, lens_spec_from_manifest_with_license_override,
 };
 pub use manifest_metadata::{
     lens_spec_metadata_from_manifest, lens_spec_metadata_from_manifest_path,
 };
 pub(crate) use manifest_runtime::canonical_local_model_device;
+pub use onnx_int8::{
+    OnnxExternalDataFile, OnnxExternalTensorSlice, OnnxGraphIdentity, OnnxInt8Attestation,
+    OnnxInt8Toolchain, OnnxInventoryCount, OnnxQuantizationInventory, OnnxTensorBoundary,
+    attest_onnx_int8, onnx_int8_attestation_from_manifest_path,
+    verify_manifest_onnx_int8_attestation,
+};
 pub use source_tensor_profile::{LensForgeSourceDtypeSummary, LensForgeSourceTensorDtypeProfile};
 #[cfg(feature = "ml-runtime")]
 pub use source_tensor_profile::{

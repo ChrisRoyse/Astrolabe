@@ -35,6 +35,23 @@ impl ConversionLog {
 }
 
 pub(super) fn run_command(log: &mut ConversionLog, program: &str, args: &[&str]) -> CliResult {
+    run_command_inner(log, program, args, false).map(|_| ())
+}
+
+pub(super) fn run_command_capture(
+    log: &mut ConversionLog,
+    program: &str,
+    args: &[&str],
+) -> CliResult<String> {
+    run_command_inner(log, program, args, true)
+}
+
+fn run_command_inner(
+    log: &mut ConversionLog,
+    program: &str,
+    args: &[&str],
+    require_output: bool,
+) -> CliResult<String> {
     log.event(json!({"event": "command_start", "program": program, "args": args}))?;
     let output = Command::new(program)
         .args(args)
@@ -46,11 +63,22 @@ pub(super) fn run_command(log: &mut ConversionLog, program: &str, args: &[&str])
         "event": "command_finish",
         "program": program,
         "status": output.status.code(),
-        "stdout": stdout,
-        "stderr": stderr,
+        "stdout": &stdout,
+        "stderr": &stderr,
     }))?;
     if output.status.success() {
-        return Ok(());
+        let captured = if stdout.trim().is_empty() {
+            stderr.trim()
+        } else {
+            stdout.trim()
+        };
+        if require_output && captured.is_empty() {
+            return Err(CliError::from(CalyxError::lens_unreachable(format!(
+                "{program} {:?} succeeded but emitted no version/identity output",
+                args
+            ))));
+        }
+        return Ok(captured.to_string());
     }
     let stderr_tail = stderr
         .lines()

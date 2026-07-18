@@ -40,10 +40,15 @@ pub use calyx_core::{Input, Lens};
 pub use commission::{
     CommissionRequest, CommissionedLens, CommissionedLensArtifact, LensForgeBatchPolicy,
     LensForgeBatchProbeLevel, LensForgeFile, LensForgeManifest, LensForgeShape,
-    LensForgeSourceDtypeSummary, LensForgeSourceTensorDtypeProfile, commission_lens,
-    legacy_lensforge_manifest_v1_ids_from_path, lens_spec_from_manifest,
+    LensForgeSourceDtypeSummary, LensForgeSourceTensorDtypeProfile, OnnxExternalDataFile,
+    OnnxExternalTensorSlice, OnnxGraphIdentity, OnnxInt8Attestation, OnnxInt8Toolchain,
+    OnnxInventoryCount, OnnxQuantizationInventory, OnnxTensorBoundary, attest_onnx_int8,
+    commission_lens, legacy_lensforge_manifest_v1_ids_from_path,
+    lens_spec_and_onnx_int8_attestation_from_manifest_path, lens_spec_from_manifest,
     lens_spec_from_manifest_path, lens_spec_from_manifest_with_license_override,
-    lens_spec_metadata_from_manifest, lens_spec_metadata_from_manifest_path, register_commissioned,
+    lens_spec_metadata_from_manifest, lens_spec_metadata_from_manifest_path,
+    onnx_int8_attestation_from_manifest_path, register_commissioned,
+    verify_manifest_onnx_int8_attestation,
 };
 #[cfg(feature = "ml-runtime")]
 pub use commission::{

@@ -10,7 +10,8 @@ use calyx_core::{
 use calyx_registry::{
     CandleLens, FastembedBgem3Lens, FastembedRerankerLens, FastembedSparseLens,
     LensForgeSourceTensorDtypeProfile, LensRuntime, LensSpec, MultimodalAdapterLens,
-    OnnxColbertLens, OnnxLens, StaticLookupLens, TeiHttpLens, lens_spec_from_manifest_path,
+    OnnxColbertLens, OnnxInt8Attestation, OnnxLens, StaticLookupLens, TeiHttpLens,
+    lens_spec_and_onnx_int8_attestation_from_manifest_path,
 };
 #[cfg(windows)]
 use calyx_registry::{OnnxRuntimeAttestation, current_runtime_attestation};
@@ -34,6 +35,8 @@ struct ExplainReport {
     runtime_detail: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     source_tensor_dtype_profile: Option<LensForgeSourceTensorDtypeProfile>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    onnx_int8_attestation: Option<OnnxInt8Attestation>,
     declared_model_dtype: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     local_execution_attestation: Option<LocalExecutionAttestationReport>,
@@ -123,7 +126,8 @@ pub(crate) fn explain(args: &[String]) -> CliResult {
     if repeat == 0 {
         return Err(CliError::usage("--repeat must be > 0"));
     }
-    let spec = lens_spec_from_manifest_path(&manifest)?;
+    let (spec, onnx_int8_attestation) =
+        lens_spec_and_onnx_int8_attestation_from_manifest_path(&manifest)?;
     configure_onnx_explain_audit(&spec.runtime);
     let input = input_bytes(&flags)?;
     let probe = Input::new(spec.modality, input);
@@ -141,6 +145,7 @@ pub(crate) fn explain(args: &[String]) -> CliResult {
         runtime: runtime_name(&spec.runtime).to_string(),
         runtime_detail: measurement.runtime_detail,
         source_tensor_dtype_profile: measurement.source_tensor_dtype_profile,
+        onnx_int8_attestation,
         declared_model_dtype: measurement.declared_model_dtype,
         local_execution_attestation: measurement.local_execution_attestation,
         runtime_execution_attestation: measurement.runtime_execution_attestation,

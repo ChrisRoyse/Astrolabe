@@ -15,6 +15,7 @@ use super::manifest_runtime::{
     canonical_local_model_device, canonical_local_model_dtype, requires_artifact_set,
     validate_local_model_execution,
 };
+use super::onnx_int8::verify_manifest_onnx_int8_attestation;
 use super::source_tensor_profile::validate_manifest_source_tensor_profile;
 
 const CONFIG_INVALID: &str = "CALYX_LENS_CONFIG_INVALID";
@@ -42,6 +43,7 @@ pub fn lens_spec_metadata_from_manifest(
     base_dir: &Path,
 ) -> Result<LensSpec> {
     validate_required(manifest)?;
+    verify_manifest_onnx_int8_attestation(manifest, base_dir)?;
     ensure_license_allowed(
         manifest.license.as_deref(),
         manifest.non_commercial,

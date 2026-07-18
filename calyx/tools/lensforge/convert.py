@@ -34,13 +34,6 @@ except ImportError as exc:  # pragma: no cover - exercised on missing host deps.
 VERSION = 1
 STATIC_LOOKUP_MAGIC = b"CXLKUP1\0"
 STATIC_LOOKUP_DTYPE = {"int8": 1, "f16": 2, "float16": 2, "f32": 3, "float32": 3}
-ONNX_MODEL_CANDIDATES = (
-    "onnx/model_int8.onnx",
-    "model_int8.onnx",
-    "onnx/model_quantized.onnx",
-    "onnx/model.onnx",
-    "model.onnx",
-)
 ONNX_FP32_MODEL_CANDIDATES = ("onnx/model.onnx", "model.onnx")
 COMMON_OPTIONAL_FILES = (
     ("config", "config.json"),
@@ -299,38 +292,13 @@ def convert_model2vec(
 def convert_onnx_int8(
     model: dict[str, Any], output_root: Path, log_path: Path
 ) -> dict[str, Any] | None:
-    name = str(model.get("name") or safe_name(str(model["hf_id"])))
-    out_dir = output_root / safe_name(name) / "onnx-int8"
-    out_dir.mkdir(parents=True, exist_ok=True)
-    if "files" in model:
-        artifacts = copy_local_artifacts(model, out_dir)
-        license_value = model.get("license") or "unknown"
-    else:
-        info = hf_model_info(str(model["hf_id"]))
-        license_value = model.get("license") or hf_license(info) or "unknown"
-        artifacts = download_hf_onnx_artifacts(model, info, out_dir, log_path, "onnx-int8", ONNX_MODEL_CANDIDATES)
-        if artifacts is None:
-            return None
-
-    config_file = role_path(artifacts, "config")
-    dim = int(model.get("dim") or dim_from_config(config_file))
-    manifest = build_manifest(
-        model=model,
-        target_format="onnx-int8",
-        artifacts=artifacts,
-        dim=dim,
-        license_value=license_value,
+    raise RuntimeError(
+        "CALYX_ONNX_INT8_ATTESTATION_REQUIRED: standalone lensforge ONNX INT8 "
+        "download/copy cannot prove a distinct FP32 source graph, quantizer toolchain, "
+        "operator/tensor semantics, or external-data binding; use `calyx lens commission "
+        "--runtime onnx-int8` so the registry-owned structured attestor can fail closed "
+        "before manifest or catalog publication"
     )
-    manifest_path = out_dir / "manifest.json"
-    write_json(manifest_path, manifest)
-    log_event(
-        log_path,
-        "manifest",
-        model,
-        "onnx-int8",
-        {"manifest": str(manifest_path), "weights_sha256": manifest["weights_sha256"]},
-    )
-    return {"name": manifest["name"], "manifest": str(manifest_path)}
 
 
 def convert_onnx_fp32(

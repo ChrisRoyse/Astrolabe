@@ -1,11 +1,13 @@
+use std::collections::BTreeMap;
+use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use calyx_core::{Input, Lens, Modality, QuantPolicy, SlotShape};
 use calyx_registry::{
     DEFAULT_TEI_ENDPOINT, FrozenLensContract, LensForgeManifest, LensForgeShape,
-    LensForgeSourceTensorDtypeProfile, NormPolicy, TeiHttpLens, profile_safetensors_sources,
-    resolve_safetensors_weight_set,
+    LensForgeSourceTensorDtypeProfile, NormPolicy, OnnxInt8Attestation, OnnxInt8Toolchain,
+    TeiHttpLens, attest_onnx_int8, profile_safetensors_sources, resolve_safetensors_weight_set,
 };
 use serde::Serialize;
 use serde_json::json;
@@ -24,7 +26,7 @@ use artifact::{
     Artifact, FileReport, add_optional, artifact, artifact_set_sha256, file_report, find_preferred,
     manifest_files, read_hidden_size, require_named, require_named_fallback,
 };
-use log::{ConversionLog, run_command, write_json_file};
+use log::{ConversionLog, run_command, run_command_capture, write_json_file};
 use options::{CommissionFlags, CommissionRuntime};
 
 use super::catalog::admission::LocalExecutionAttestationReport;
@@ -51,6 +53,8 @@ struct CommissionReport {
     batch_policy: calyx_registry::LensForgeBatchPolicy,
     source_tensor_dtype_profile: Option<LensForgeSourceTensorDtypeProfile>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    onnx_int8_attestation: Option<OnnxInt8Attestation>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     local_execution_attestation: Option<LocalExecutionAttestationReport>,
     #[serde(skip_serializing_if = "Option::is_none")]
     gemm_accumulation_dtype: Option<&'static str>,
@@ -66,6 +70,7 @@ struct CommissionOutput {
     source_hf_id: Option<String>,
     source_tensor_dtype_profile: Option<LensForgeSourceTensorDtypeProfile>,
     expected_local_contract: Option<FrozenLensContract>,
+    onnx_int8_attestation: Option<OnnxInt8Attestation>,
 }
 
 impl CommissionOutput {
@@ -76,6 +81,7 @@ impl CommissionOutput {
             source_hf_id: None,
             source_tensor_dtype_profile: None,
             expected_local_contract: None,
+            onnx_int8_attestation: None,
         }
     }
 
@@ -86,6 +92,7 @@ impl CommissionOutput {
             source_hf_id: None,
             source_tensor_dtype_profile: None,
             expected_local_contract: None,
+            onnx_int8_attestation: None,
         }
     }
 
@@ -96,6 +103,7 @@ impl CommissionOutput {
             source_hf_id: Some(source_hf_id),
             source_tensor_dtype_profile: None,
             expected_local_contract: None,
+            onnx_int8_attestation: None,
         }
     }
 
@@ -110,6 +118,7 @@ impl CommissionOutput {
             source_hf_id: None,
             source_tensor_dtype_profile: None,
             expected_local_contract: Some(expected_local_contract),
+            onnx_int8_attestation: None,
         }
     }
 
@@ -120,6 +129,22 @@ impl CommissionOutput {
         self.source_tensor_dtype_profile = Some(profile);
         self
     }
+
+    fn with_onnx_int8(commissioned: CommissionedOnnxInt8) -> Self {
+        Self {
+            artifacts: commissioned.artifacts,
+            dim_override: None,
+            source_hf_id: None,
+            source_tensor_dtype_profile: None,
+            expected_local_contract: None,
+            onnx_int8_attestation: Some(commissioned.attestation),
+        }
+    }
+}
+
+struct CommissionedOnnxInt8 {
+    artifacts: Vec<Artifact>,
+    attestation: OnnxInt8Attestation,
 }
 
 pub(crate) fn commission(args: &[String]) -> CliResult {
@@ -146,7 +171,7 @@ pub(crate) fn commission(args: &[String]) -> CliResult {
             CommissionOutput::new(candle::commission(&flags, &out, &mut log)?)
         }
         CommissionRuntime::OnnxInt8 => {
-            CommissionOutput::new(commission_onnx_int8(&flags, &out, &mut log)?)
+            CommissionOutput::with_onnx_int8(commission_onnx_int8(&flags, &out, &mut log)?)
         }
         CommissionRuntime::OnnxFp32 => {
             CommissionOutput::new(commission_onnx_fp32(&flags, &out, &mut log)?)
@@ -206,6 +231,7 @@ pub(crate) fn commission(args: &[String]) -> CliResult {
         output.dim_override,
         output.source_hf_id.as_deref(),
         output.source_tensor_dtype_profile.as_ref(),
+        output.onnx_int8_attestation.as_ref(),
         &mut log,
     )?;
     let (max_batch, batch_policy, local_execution_attestation, catalog_admission) =
@@ -256,6 +282,7 @@ pub(crate) fn commission(args: &[String]) -> CliResult {
         max_batch,
         batch_policy,
         source_tensor_dtype_profile: output.source_tensor_dtype_profile,
+        onnx_int8_attestation: output.onnx_int8_attestation,
         local_execution_attestation,
         gemm_accumulation_dtype: local_numeric_dtype,
         output_dtype: local_numeric_dtype,
@@ -294,14 +321,19 @@ fn commission_onnx_int8(
     flags: &CommissionFlags,
     out: &Path,
     log: &mut ConversionLog,
-) -> CliResult<Vec<Artifact>> {
-    let export_dir = export_onnx(flags, out, log)?;
+) -> CliResult<CommissionedOnnxInt8> {
+    let converter = resolve_program("optimum-cli")?;
+    let python = resolve_program("python")?;
+    require_same_python_environment(&converter, &python)?;
+    let converter_program = path_text(&converter)?;
+    let python_program = path_text(&python)?;
+    let export_dir = export_onnx(flags, out, log, converter_program)?;
     let quant_dir = out.join("onnx-int8");
     fs::create_dir_all(&quant_dir)?;
     let target_flag = format!("--{}", flags.quant_target);
     run_command(
         log,
-        "optimum-cli",
+        converter_program,
         &[
             "onnxruntime",
             "quantize",
@@ -312,20 +344,58 @@ fn commission_onnx_int8(
             &target_flag,
         ],
     )?;
-    let model = find_preferred(&quant_dir, &["model_quantized.onnx", "model.onnx"], "onnx")?;
-    // See commission_onnx_fp32: register the external-data weights sidecar so it
-    // is hashed and counted toward VRAM cost, never a silent multi-GB undercount.
-    let model_data = model.with_extension("onnx_data");
+    let source_model = require_named(&export_dir, "model.onnx")?;
+    let model = require_named(&quant_dir, "model_quantized.onnx")?;
+    let toolchain = onnx_int8_toolchain(
+        flags,
+        &converter,
+        converter_program,
+        &python,
+        python_program,
+        log,
+    )?;
+    let attestation = match attest_onnx_int8(out, &source_model, &model, toolchain) {
+        Ok(attestation) => attestation,
+        Err(error) => {
+            let event = json!({
+                "event": "onnx_int8_attestation_failed",
+                "code": error.code,
+                "message": &error.message,
+                "remediation": error.remediation,
+                "source_graph": &source_model,
+                "quantized_graph": &model,
+            });
+            if let Err(log_error) = log.event(event) {
+                return Err(CliError::runtime(format!(
+                    "ONNX INT8 attestation failed with {}: {}; additionally failed to persist the structured failure to {}: {}",
+                    error.code,
+                    error.message,
+                    log.path.display(),
+                    log_error
+                )));
+            }
+            return Err(CliError::from(error));
+        }
+    };
     let tokenizer = require_named_fallback(&quant_dir, &export_dir, "tokenizer.json")?;
     let config = require_named_fallback(&quant_dir, &export_dir, "config.json")?;
     let dim = flags.dim.unwrap_or(read_hidden_size(&config)?);
-    log.event(json!({"event": "onnx_int8_artifacts_ready", "dim": dim}))?;
+    log.event(json!({
+        "event": "onnx_int8_semantics_attested",
+        "dim": dim,
+        "attestation": &attestation,
+    }))?;
     let mut artifacts = vec![
         artifact("model", model)?,
         artifact("tokenizer", tokenizer)?,
         artifact("config", config)?,
     ];
-    add_optional(&mut artifacts, "model_data", model_data)?;
+    for (index, external) in attestation.output.external_data.iter().enumerate() {
+        artifacts.push(artifact(
+            &format!("model_external_data:{index}"),
+            out.join(&external.path),
+        )?);
+    }
     add_optional(
         &mut artifacts,
         "tokenizer_config",
@@ -336,7 +406,10 @@ fn commission_onnx_int8(
         "special_tokens_map",
         export_dir.join("special_tokens_map.json"),
     )?;
-    Ok(artifacts)
+    Ok(CommissionedOnnxInt8 {
+        artifacts,
+        attestation,
+    })
 }
 
 fn commission_onnx_fp32(
@@ -344,7 +417,7 @@ fn commission_onnx_fp32(
     out: &Path,
     log: &mut ConversionLog,
 ) -> CliResult<Vec<Artifact>> {
-    let export_dir = export_onnx(flags, out, log)?;
+    let export_dir = export_onnx(flags, out, log, "optimum-cli")?;
     let model = find_preferred(&export_dir, &["model.onnx"], "onnx")?;
     // Large models export weights to an external-data sidecar (`model.onnx_data`)
     // that the .onnx graph references at load. It must be in the manifest so its
@@ -374,12 +447,17 @@ fn commission_onnx_fp32(
     Ok(artifacts)
 }
 
-fn export_onnx(flags: &CommissionFlags, out: &Path, log: &mut ConversionLog) -> CliResult<PathBuf> {
+fn export_onnx(
+    flags: &CommissionFlags,
+    out: &Path,
+    log: &mut ConversionLog,
+    converter_program: &str,
+) -> CliResult<PathBuf> {
     let export_dir = out.join("onnx-export");
     fs::create_dir_all(&export_dir)?;
     run_command(
         log,
-        "optimum-cli",
+        converter_program,
         &[
             "export",
             "onnx",
@@ -395,6 +473,171 @@ fn export_onnx(flags: &CommissionFlags, out: &Path, log: &mut ConversionLog) -> 
     Ok(export_dir)
 }
 
+fn onnx_int8_toolchain(
+    flags: &CommissionFlags,
+    converter: &Path,
+    converter_program: &str,
+    python: &Path,
+    python_program: &str,
+    log: &mut ConversionLog,
+) -> CliResult<OnnxInt8Toolchain> {
+    let version_script = "import importlib.metadata as m,json,platform; print(json.dumps({'python':platform.python_version(),'optimum':m.version('optimum'),'optimum_onnx':m.version('optimum-onnx'),'onnx':m.version('onnx'),'onnxruntime':m.version('onnxruntime')},sort_keys=True))";
+    let raw_versions = run_command_capture(log, python_program, &["-c", version_script])?;
+    let versions: serde_json::Value = serde_json::from_str(&raw_versions).map_err(|error| {
+        CliError::from(calyx_core::CalyxError {
+            code: "CALYX_ONNX_INT8_TOOLCHAIN_UNATTESTED",
+            message: format!(
+                "parse pinned Python ONNX toolchain version output failed: {error}; output={raw_versions:?}"
+            ),
+            remediation: "activate one Python environment containing optimum, optimum-onnx, onnx, and onnxruntime, then recommission; never infer missing tool versions",
+        })
+    })?;
+    let version = |name: &str| -> CliResult<String> {
+        versions
+            .get(name)
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .map(str::to_string)
+            .ok_or_else(|| {
+                CliError::from(calyx_core::CalyxError {
+                    code: "CALYX_ONNX_INT8_TOOLCHAIN_UNATTESTED",
+                    message: format!(
+                        "pinned Python ONNX toolchain version output has no nonblank {name}: {raw_versions:?}"
+                    ),
+                    remediation: "activate one Python environment containing optimum, optimum-onnx, onnx, and onnxruntime, then recommission; never infer missing tool versions",
+                })
+            })
+    };
+    let converter_identity = artifact("converter_executable", converter.to_path_buf())?;
+    let python_identity = artifact("python_executable", python.to_path_buf())?;
+    let mut frozen_options = BTreeMap::new();
+    frozen_options.insert(
+        "command".to_string(),
+        "optimum-cli onnxruntime quantize".to_string(),
+    );
+    frozen_options.insert("export_task".to_string(), "feature-extraction".to_string());
+    frozen_options.insert("export_library".to_string(), "transformers".to_string());
+    frozen_options.insert(
+        "quantizer_output".to_string(),
+        "onnx-int8/model_quantized.onnx".to_string(),
+    );
+    frozen_options.insert(
+        "source_graph".to_string(),
+        "onnx-export/model.onnx".to_string(),
+    );
+    frozen_options.insert("converter_path".to_string(), converter_program.to_string());
+    frozen_options.insert("python_path".to_string(), python_program.to_string());
+    Ok(OnnxInt8Toolchain {
+        converter: "optimum-cli".to_string(),
+        converter_version: version("optimum")?,
+        optimum_onnx_version: version("optimum_onnx")?,
+        converter_executable_sha256: converter_identity.sha256,
+        python_version: version("python")?,
+        python_executable_sha256: python_identity.sha256,
+        onnx_version: version("onnx")?,
+        onnxruntime_version: version("onnxruntime")?,
+        quant_target: flags.quant_target.clone(),
+        frozen_options,
+    })
+}
+
+fn resolve_program(program: &str) -> CliResult<PathBuf> {
+    let requested = Path::new(program);
+    let mut candidates = Vec::new();
+    if requested.components().count() > 1 {
+        candidates.push(requested.to_path_buf());
+    } else {
+        let path = env::var_os("PATH").ok_or_else(|| {
+            CliError::from(calyx_core::CalyxError::lens_unreachable(
+                "PATH is unavailable while resolving ONNX commissioning tools",
+            ))
+        })?;
+        let extensions = env::var_os("PATHEXT")
+            .map(|value| {
+                value
+                    .to_string_lossy()
+                    .split(';')
+                    .filter(|extension| !extension.trim().is_empty())
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_else(|| vec![".EXE".to_string(), ".CMD".to_string(), ".BAT".to_string()]);
+        for directory in env::split_paths(&path) {
+            candidates.push(directory.join(program));
+            if requested.extension().is_none() {
+                for extension in &extensions {
+                    candidates.push(directory.join(format!("{program}{extension}")));
+                }
+            }
+        }
+    }
+    for candidate in candidates {
+        let Ok(metadata) = fs::symlink_metadata(&candidate) else {
+            continue;
+        };
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            continue;
+        }
+        return fs::canonicalize(&candidate).map_err(CliError::from);
+    }
+    Err(CliError::from(calyx_core::CalyxError::lens_unreachable(
+        format!(
+            "required ONNX commissioning program {program} was not found as a regular file on PATH"
+        ),
+    )))
+}
+
+fn require_same_python_environment(converter: &Path, python: &Path) -> CliResult {
+    let converter_parent = converter.parent().ok_or_else(|| {
+        CliError::runtime(format!(
+            "resolved converter {} has no parent directory",
+            converter.display()
+        ))
+    })?;
+    let python_parent = python.parent().ok_or_else(|| {
+        CliError::runtime(format!(
+            "resolved Python {} has no parent directory",
+            python.display()
+        ))
+    })?;
+    let converter_parent_folded = converter_parent
+        .to_string_lossy()
+        .replace('/', "\\")
+        .to_ascii_lowercase();
+    let python_parent_folded = python_parent
+        .to_string_lossy()
+        .replace('/', "\\")
+        .to_ascii_lowercase();
+    let python_scripts_folded = python_parent
+        .join("Scripts")
+        .to_string_lossy()
+        .replace('/', "\\")
+        .to_ascii_lowercase();
+    if converter_parent_folded != python_parent_folded
+        && converter_parent_folded != python_scripts_folded
+    {
+        return Err(CliError::from(calyx_core::CalyxError {
+            code: "CALYX_ONNX_INT8_TOOLCHAIN_ENVIRONMENT_MISMATCH",
+            message: format!(
+                "optimum-cli {} and python {} resolve to different environments",
+                converter.display(),
+                python.display()
+            ),
+            remediation: "activate exactly one Python environment whose python and optimum-cli executables share the same environment, then recommission",
+        }));
+    }
+    Ok(())
+}
+
+fn path_text(path: &Path) -> CliResult<&str> {
+    path.to_str().ok_or_else(|| {
+        CliError::from(calyx_core::CalyxError::lens_unreachable(format!(
+            "ONNX commissioning executable path {} is not valid UTF-8",
+            path.display()
+        )))
+    })
+}
+
 fn write_manifest(
     flags: &CommissionFlags,
     out: &Path,
@@ -402,6 +645,7 @@ fn write_manifest(
     dim_override: Option<u32>,
     source_hf_id: Option<&str>,
     source_tensor_dtype_profile: Option<&LensForgeSourceTensorDtypeProfile>,
+    onnx_int8_attestation: Option<&OnnxInt8Attestation>,
     log: &mut ConversionLog,
 ) -> CliResult<PathBuf> {
     let model = artifacts
@@ -445,6 +689,7 @@ fn write_manifest(
         shape: Some(LensForgeShape::from_slot_shape(shape)),
         dtype: flags.manifest_dtype().to_string(),
         source_tensor_dtype_profile: source_tensor_dtype_profile.cloned(),
+        onnx_int8_attestation: onnx_int8_attestation.cloned(),
         execution_device: flags.execution_device(),
         weights_sha256: model.sha256.clone(),
         artifact_set_sha256: Some(artifact_set_sha256(artifacts)?),

@@ -18,6 +18,7 @@ use super::manifest_identity::spec_from_manifest_identity;
 use super::manifest_runtime::{
     requires_artifact_set, runtime_from_manifest, validate_local_model_execution,
 };
+use super::onnx_int8::{OnnxInt8Attestation, verify_manifest_onnx_int8_attestation};
 use super::source_tensor_profile::{
     LensForgeSourceTensorDtypeProfile, validate_manifest_source_tensor_profile,
 };
@@ -80,6 +81,8 @@ pub struct LensForgeManifest {
     pub dtype: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_tensor_dtype_profile: Option<LensForgeSourceTensorDtypeProfile>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub onnx_int8_attestation: Option<OnnxInt8Attestation>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub execution_device: Option<String>,
     pub weights_sha256: String,
@@ -168,6 +171,14 @@ impl LensForgeManifest {
 }
 
 pub fn lens_spec_from_manifest_path(path: impl AsRef<Path>) -> Result<LensSpec> {
+    lens_spec_and_onnx_int8_attestation_from_manifest_path(path).map(|(spec, _)| spec)
+}
+
+/// Parses and verifies one manifest snapshot, returning both its lens spec and
+/// the semantic ONNX INT8 attestation carried by that same verified snapshot.
+pub fn lens_spec_and_onnx_int8_attestation_from_manifest_path(
+    path: impl AsRef<Path>,
+) -> Result<(LensSpec, Option<OnnxInt8Attestation>)> {
     let path = path.as_ref();
     let bytes = fs::read(path).map_err(|err| {
         config_invalid(format!(
@@ -182,7 +193,8 @@ pub fn lens_spec_from_manifest_path(path: impl AsRef<Path>) -> Result<LensSpec> 
         ))
     })?;
     let base = path.parent().unwrap_or_else(|| Path::new("."));
-    lens_spec_from_manifest(&manifest, base)
+    let spec = lens_spec_from_manifest(&manifest, base)?;
+    Ok((spec, manifest.onnx_int8_attestation))
 }
 
 /// Reconstructs IDs written by the retired spec-side manifest formulas.
@@ -288,6 +300,7 @@ pub fn lens_spec_from_manifest_with_license_override(
     allow_non_commercial: bool,
 ) -> Result<LensSpec> {
     validate_required(manifest)?;
+    verify_manifest_onnx_int8_attestation(manifest, base_dir)?;
     if manifest.max_batch == Some(0) {
         return Err(config_invalid("lensforge manifest max_batch must be > 0"));
     }

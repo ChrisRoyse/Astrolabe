@@ -4,8 +4,8 @@ use calyx_core::{CalyxError, Input, Modality, RuntimeExecutionAttestation};
 use calyx_forge::PinnedCudaDeviceIdentity;
 use calyx_registry::{
     CandleDevicePolicy, FrozenLensContract, LensForgeBatchPolicy, LensForgeManifest,
-    LensForgeSourceTensorDtypeProfile, LensRuntime, LensSpec, lens_spec_from_manifest,
-    parse_frozen_device_policy,
+    LensForgeSourceTensorDtypeProfile, LensRuntime, LensSpec, OnnxInt8Attestation,
+    lens_spec_from_manifest, parse_frozen_device_policy,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -30,6 +30,7 @@ pub(crate) struct AttestedCatalogAdmission {
     manifest: PathBuf,
     manifest_sha256: String,
     execution_attestation: Option<LocalExecutionAttestationReport>,
+    onnx_int8_attestation: Option<OnnxInt8Attestation>,
 }
 
 /// Commission-time receipt retaining the already loaded and executed runtime
@@ -87,12 +88,14 @@ impl AttestedCatalogAdmission {
         PathBuf,
         String,
         Option<LocalExecutionAttestationReport>,
+        Option<OnnxInt8Attestation>,
     ) {
         (
             self.spec,
             self.manifest,
             self.manifest_sha256,
             self.execution_attestation,
+            self.onnx_int8_attestation,
         )
     }
 }
@@ -194,6 +197,7 @@ impl CatalogAdmissionDraft {
                 manifest: manifest_path.to_path_buf(),
                 manifest_sha256: final_binding.sha256,
                 execution_attestation: report.clone(),
+                onnx_int8_attestation: final_binding.manifest.onnx_int8_attestation,
             },
             report,
         ))
@@ -233,6 +237,7 @@ pub(crate) fn attest_manifest(manifest_path: PathBuf) -> CliResult<AttestedCatal
             manifest: manifest_path,
             manifest_sha256: final_binding.sha256,
             execution_attestation: None,
+            onnx_int8_attestation: final_binding.manifest.onnx_int8_attestation,
         });
     }
 
@@ -274,7 +279,19 @@ pub(crate) fn attest_manifest(manifest_path: PathBuf) -> CliResult<AttestedCatal
         manifest: manifest_path,
         manifest_sha256: final_binding.sha256,
         execution_attestation: Some(execution_report),
+        onnx_int8_attestation: final_binding.manifest.onnx_int8_attestation,
     })
+}
+
+pub(crate) fn reparse_manifest_binding_with_onnx_int8_attestation(
+    path: &Path,
+) -> CliResult<(LensSpec, String, Option<OnnxInt8Attestation>)> {
+    let binding = read_manifest_binding(path)?;
+    Ok((
+        binding.spec,
+        binding.sha256,
+        binding.manifest.onnx_int8_attestation,
+    ))
 }
 
 pub(crate) fn reparse_manifest_binding(path: &Path) -> CliResult<(LensSpec, String)> {

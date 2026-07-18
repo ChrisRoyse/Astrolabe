@@ -740,6 +740,7 @@ dependencies = [
  "half",
  "hf-hub",
  "memmap2",
+ "onnx-rs",
  "ort",
  "safetensors 0.7.0",
  "serde",
@@ -3014,6 +3015,12 @@ dependencies = [
  "cc",
  "pkg-config",
 ]
+
+[[package]]
+name = "onnx-rs"
+version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2646a116e96c9ca9ed8e595464acbbf69139048623e952acfbe1d04d2e097b81"
 
 [[package]]
 name = "opaque-debug"

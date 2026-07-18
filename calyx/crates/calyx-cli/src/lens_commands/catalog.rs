@@ -5,9 +5,9 @@ use std::time::Instant;
 
 use calyx_core::{Input, Lens, LensCost, Placement};
 use calyx_registry::{
-    CandlePrecision, LensHealth, LensRuntime, LensSpec, MultimodalAdapterLens, PlacementBudget,
-    StaticLookupLens, choose_resolved_placement, legacy_lensforge_manifest_v1_ids_from_path,
-    parse_frozen_device_policy,
+    CandlePrecision, LensHealth, LensRuntime, LensSpec, MultimodalAdapterLens, OnnxInt8Attestation,
+    PlacementBudget, StaticLookupLens, choose_resolved_placement,
+    legacy_lensforge_manifest_v1_ids_from_path, parse_frozen_device_policy,
 };
 use serde::{Deserialize, Serialize};
 
@@ -25,7 +25,10 @@ const LENS_IDENTITY_MIGRATION_REQUIRED: &str = "CALYX_LENS_IDENTITY_MIGRATION_RE
 pub(crate) use store::LensCatalogDbReadback;
 
 use admission::{AttestedCatalogAdmission, attest_manifest};
-pub(crate) use admission::{LocalExecutionAttestationReport, reparse_manifest_binding};
+pub(crate) use admission::{
+    LocalExecutionAttestationReport, reparse_manifest_binding,
+    reparse_manifest_binding_with_onnx_int8_attestation,
+};
 use budget::placement_budget_from_catalog;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -64,6 +67,8 @@ pub(crate) struct AddReport {
     pub(crate) manifest: PathBuf,
     pub(crate) cost: LensCost,
     pub(crate) placement: Placement,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) onnx_int8_attestation: Option<OnnxInt8Attestation>,
     pub(crate) count: usize,
 }
 
@@ -79,6 +84,8 @@ struct ListLensEntry {
     #[serde(flatten)]
     entry: LensCatalogEntry,
     health: LensHealth,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    onnx_int8_attestation: Option<OnnxInt8Attestation>,
 }
 
 #[derive(Serialize)]
@@ -202,7 +209,7 @@ fn validate_catalog_migration(catalog: &LensCatalog) -> CliResult<LensCatalog> {
                 remediation: "preserve the legacy catalog bytes, repair the manifest/runtime using the nested structured error, and rerun explicit migration",
             })
         })?;
-        let (spec, manifest, manifest_sha256, execution_attestation) = admission.into_parts();
+        let (spec, manifest, manifest_sha256, execution_attestation, _) = admission.into_parts();
         let collisions = catalog
             .lenses
             .iter()
@@ -242,7 +249,8 @@ pub(crate) fn add_attested_manifest_to_catalog(
     home: Option<&Path>,
     admission: AttestedCatalogAdmission,
 ) -> CliResult<AddReport> {
-    let (spec, manifest, manifest_sha256, execution_attestation) = admission.into_parts();
+    let (spec, manifest, manifest_sha256, execution_attestation, onnx_int8_attestation) =
+        admission.into_parts();
     let catalog_path = catalog_path(home)?;
     let mutation_guard = store::CatalogMutationGuard::acquire(&catalog_path, "lens-add")?;
     let mut catalog = read_catalog(&catalog_path)?;
@@ -270,6 +278,7 @@ pub(crate) fn add_attested_manifest_to_catalog(
                 manifest: existing.manifest.clone(),
                 cost: existing.cost,
                 placement: existing.placement,
+                onnx_int8_attestation,
                 count: catalog.lenses.len(),
             });
         }
@@ -328,6 +337,7 @@ pub(crate) fn add_attested_manifest_to_catalog(
         manifest: entry.manifest,
         cost: entry.cost,
         placement: entry.placement,
+        onnx_int8_attestation,
         count: catalog.lenses.len(),
     })
 }
@@ -613,19 +623,23 @@ fn read_legacy_catalog(path: &Path) -> CliResult<(LensCatalog, store::LegacyCata
 }
 
 fn list_entry(entry: LensCatalogEntry) -> ListLensEntry {
-    let health = health_from_manifest(&entry);
-    ListLensEntry { entry, health }
+    let (health, onnx_int8_attestation) = health_from_manifest(&entry);
+    ListLensEntry {
+        entry,
+        health,
+        onnx_int8_attestation,
+    }
 }
 
-fn health_from_manifest(entry: &LensCatalogEntry) -> LensHealth {
-    match reparse_manifest_binding(&entry.manifest) {
-        Ok((spec, manifest_sha256))
+fn health_from_manifest(entry: &LensCatalogEntry) -> (LensHealth, Option<OnnxInt8Attestation>) {
+    match reparse_manifest_binding_with_onnx_int8_attestation(&entry.manifest) {
+        Ok((spec, manifest_sha256, attestation))
             if spec.lens_id().to_string() == entry.lens_id
                 && manifest_sha256 == entry.manifest_sha256 =>
         {
-            spec.health()
+            (spec.health(), attestation)
         }
-        Ok((_, manifest_sha256)) if manifest_sha256 != entry.manifest_sha256 => {
+        Ok((_, manifest_sha256, _)) if manifest_sha256 != entry.manifest_sha256 => (
             LensHealth::Failing {
                 code: "CALYX_LENS_CATALOG_MANIFEST_DIGEST_MISMATCH".to_string(),
                 reason: format!(
@@ -634,21 +648,28 @@ fn health_from_manifest(entry: &LensCatalogEntry) -> LensHealth {
                     manifest_sha256,
                     entry.manifest.display()
                 ),
-            }
-        }
-        Ok((spec, _)) => LensHealth::Failing {
-            code: LENS_IDENTITY_MIGRATION_REQUIRED.to_string(),
-            reason: format!(
-                "catalog lens_id {} != canonical manifest lens_id {} for {}",
-                entry.lens_id,
-                spec.lens_id(),
-                entry.manifest.display()
-            ),
-        },
-        Err(error) => LensHealth::Failing {
-            code: error.code().to_string(),
-            reason: error.message().to_string(),
-        },
+            },
+            None,
+        ),
+        Ok((spec, _, _)) => (
+            LensHealth::Failing {
+                code: LENS_IDENTITY_MIGRATION_REQUIRED.to_string(),
+                reason: format!(
+                    "catalog lens_id {} != canonical manifest lens_id {} for {}",
+                    entry.lens_id,
+                    spec.lens_id(),
+                    entry.manifest.display()
+                ),
+            },
+            None,
+        ),
+        Err(error) => (
+            LensHealth::Failing {
+                code: error.code().to_string(),
+                reason: error.message().to_string(),
+            },
+            None,
+        ),
     }
 }
 
