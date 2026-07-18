@@ -149,6 +149,16 @@ impl KernelGraph {
     /// algorithms operate on. Nodes are ordered by `CxId`, so the index of a
     /// node — and therefore every downstream artifact ordering — is a pure
     /// function of the identity set, independent of insertion order.
+    ///
+    /// # Determinism contract (#529)
+    /// This ordering is the reason kernel member selection is reproducible under
+    /// parallel CBM extraction. `workers>1` varies only the order in which cbm
+    /// assigns node ids and therefore the order in which nodes/edges are
+    /// *presented* to [`KernelGraph::new`]; because compilation re-sorts by the
+    /// content-addressed `CxId` and every downstream tie-break keys on `CxId`
+    /// (candidate ranking, FVS, recall refine), presentation order can never move
+    /// the member set or its ledgered `members_hash`. No cbm node id is consumed
+    /// anywhere in member selection — do not reintroduce one as a tie-break.
     pub fn compile(&self) -> Result<IndexedGraph> {
         let mut ids: Vec<CxId> = self.nodes.iter().map(|node| node.id).collect();
         ids.sort_unstable();
