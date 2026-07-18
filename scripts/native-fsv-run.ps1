@@ -66,7 +66,7 @@ function File-Sha256([string]$Path) {
     finally { $hasher.Dispose(); $stream.Dispose() }
 }
 
-function String-Sha256([string]$Value) {
+function String-Sha256([AllowEmptyString()][string]$Value) {
     $hasher = [Security.Cryptography.SHA256]::Create()
     try {
         return ([BitConverter]::ToString($hasher.ComputeHash([Text.Encoding]::UTF8.GetBytes($Value))) -replace '-', '').ToLowerInvariant()

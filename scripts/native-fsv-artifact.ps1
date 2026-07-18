@@ -99,7 +99,7 @@ function File-Sha256 {
 }
 
 function String-Sha256 {
-    param([Parameter(Mandatory)][string]$Value)
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$Value)
     $hasher = [Security.Cryptography.SHA256]::Create()
     try {
         return ([BitConverter]::ToString($hasher.ComputeHash([Text.Encoding]::UTF8.GetBytes($Value))) -replace '-', '').ToLowerInvariant()
