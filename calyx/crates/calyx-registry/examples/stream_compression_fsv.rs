@@ -109,9 +109,9 @@ fn run() -> AnyResult<()> {
             bits_per_channel_x2: 16,
         },
     )?;
-    let empty_slot = register(
+    let tq25 = register(
         &mut registry,
-        "w26-empty-column",
+        "w26-stream-tq25",
         44,
         QuantPolicy::TurboQuant {
             bits_per_channel_x2: 5,
@@ -123,6 +123,22 @@ fn run() -> AnyResult<()> {
         45,
         QuantPolicy::TurboQuantHadamard {
             bits_per_channel_x2: 7,
+        },
+    )?;
+    let empty_slot = register(
+        &mut registry,
+        "w26-empty-column",
+        46,
+        QuantPolicy::TurboQuant {
+            bits_per_channel_x2: 5,
+        },
+    )?;
+    let tq6 = register(
+        &mut registry,
+        "w26-tq6-refused",
+        47,
+        QuantPolicy::TurboQuant {
+            bits_per_channel_x2: 6,
         },
     )?;
 
@@ -163,11 +179,11 @@ fn run() -> AnyResult<()> {
     let vault_dir = root.join("vault");
     let vault = open_vault(&vault_dir)?;
 
-    // ---- Stream ingest: every event carries dense slots 41/42/43. ----
+    // ---- Stream ingest: every event carries every non-empty FSV slot. ----
     let ingester = StreamIngester::new(Arc::clone(&vault), BackpressureGuard::new(64, 0));
     for index in 0..ROWS {
         ingester.send(
-            event(index, &[41, 42, 43, 45]),
+            event(index, &[41, 42, 43, 44, 45, 47]),
             EpochSecs(2_000 + index as i64),
         )?;
     }
@@ -181,7 +197,7 @@ fn run() -> AnyResult<()> {
     // #563: no metadata-only quantization format exists after streaming.
     let mut cx_ids = Vec::new();
     for index in 0..ROWS {
-        let input = event(index, &[41, 42, 43]);
+        let input = event(index, &[41, 42, 43, 44, 45, 47]);
         let cx_id = vault.cx_id_for_input(&input.raw_bytes, input.panel_version);
         let constellation = vault.get(cx_id, vault.snapshot())?;
         require(
@@ -205,6 +221,49 @@ fn run() -> AnyResult<()> {
     );
 
     let queries = build_queries(&vault);
+
+    // #574 happy path: the second and only other real TurboQuant operating
+    // point is selected and persisted as TurboQuant 2.5, never another codec.
+    let report_tq25 = registry.compress_streamed_column(&vault, &tq25.slot, &queries, 1)?;
+    require(
+        report_tq25.requested_quant
+            == (QuantPolicy::TurboQuant {
+                bits_per_channel_x2: 5,
+            }),
+        "TurboQuant 2.5 report lost its requested policy identity",
+    )?;
+    require(
+        report_tq25.stored_codec == StoredSlotCodec::TurboQuantBits2p5,
+        "TurboQuant 2.5 report selected the wrong stored codec",
+    )?;
+    let tq25_snapshot = report_tq25.snapshot.ok_or("tq25 snapshot missing")?;
+    let tq25_rows = vault.scan_cf_at(tq25_snapshot, ColumnFamily::slot(SlotId::new(44)))?;
+    require(
+        tq25_rows.len() == ROWS,
+        "TurboQuant 2.5 persisted row count mismatch",
+    )?;
+    for (_, value) in &tq25_rows {
+        require(
+            value.get(2).copied() == Some(2),
+            "TurboQuant 2.5 envelope codec byte must be 2",
+        )?;
+        require(
+            value.get(3).copied() == Some(5),
+            "TurboQuant 2.5 envelope level byte must be 5",
+        )?;
+    }
+    println!(
+        "{}",
+        json!({
+            "event": "turboquant_2p5_committed",
+            "slot": 44,
+            "requested_quant": report_tq25.requested_quant,
+            "stored_codec": report_tq25.stored_codec,
+            "persisted_rows": tq25_rows.len(),
+            "snapshot": tq25_snapshot,
+            "ledger_seq": report_tq25.ledger.as_ref().map(|entry| entry.seq),
+        })
+    );
 
     // ---- #563 happy path: registry-owned generation transition (TurboQuant 3.5). ----
     let seq_before = vault.latest_seq();
@@ -390,8 +449,8 @@ fn run() -> AnyResult<()> {
         ColumnFamily::Compression,
         &compression_manifest_key(SlotId::new(43)),
     )?;
-    let tq16_first_row = vault
-        .scan_cf_at(seq_after_tq16, ColumnFamily::slot(SlotId::new(43)))?
+    let tq16_rows = vault.scan_cf_at(seq_after_tq16, ColumnFamily::slot(SlotId::new(43)))?;
+    let tq16_first_row = tq16_rows
         .first()
         .map(|(_, value)| value.first().copied())
         .ok_or("tq16 column must still hold raw rows")?;
@@ -423,6 +482,63 @@ fn run() -> AnyResult<()> {
             "message": tq16_error.message,
             "seq_before": seq_before_tq16,
             "seq_after": seq_after_tq16,
+            "raw_rows_before": tq16_rows.len(),
+            "raw_rows_after": tq16_rows.len(),
+            "compressed_rows_after": 0,
+            "manifest_written": false,
+        })
+    );
+
+    // #574 refusal: every other numeric TurboQuant operating point also fails
+    // before durable mutation, rather than rounding or substituting a codec.
+    let seq_before_tq6 = vault.latest_seq();
+    let tq6_error = registry
+        .compress_streamed_column(&vault, &tq6.slot, &queries, 1)
+        .expect_err("unsupported TurboQuant-6 must be refused");
+    let seq_after_tq6 = vault.latest_seq();
+    let tq6_manifest = vault.read_cf_at(
+        seq_after_tq6,
+        ColumnFamily::Compression,
+        &compression_manifest_key(SlotId::new(47)),
+    )?;
+    let tq6_rows = vault.scan_cf_at(seq_after_tq6, ColumnFamily::slot(SlotId::new(47)))?;
+    require(
+        seq_before_tq6 == seq_after_tq6,
+        "unsupported TQ6 refusal must not advance the vault seq",
+    )?;
+    require(
+        tq6_manifest.is_none(),
+        "unsupported TQ6 refusal must not write a manifest",
+    )?;
+    require(
+        tq6_rows.len() == ROWS
+            && tq6_rows
+                .iter()
+                .all(|(_, value)| value.first().copied() != Some(COMPRESSED_SLOT_TAG)),
+        "unsupported TQ6 rows must remain raw",
+    )?;
+    require(
+        tq6_error
+            .message
+            .contains("only TurboQuant operating points")
+            && tq6_error.message.contains("5 (2.5 bpc)")
+            && tq6_error.message.contains("7 (3.5 bpc)"),
+        format!(
+            "TQ6 error must name the complete supported set: {}",
+            tq6_error.message
+        ),
+    )?;
+    println!(
+        "{}",
+        json!({
+            "event": "tq6_refused_before_mutation",
+            "code": tq6_error.code,
+            "message": tq6_error.message,
+            "seq_before": seq_before_tq6,
+            "seq_after": seq_after_tq6,
+            "raw_rows_before": tq6_rows.len(),
+            "raw_rows_after": tq6_rows.len(),
+            "compressed_rows_after": 0,
             "manifest_written": false,
         })
     );
@@ -434,9 +550,29 @@ fn run() -> AnyResult<()> {
         .map(|(key, value)| (ColumnFamily::slot_raw(SlotId::new(43)), key, value))
         .collect::<Vec<_>>();
     vault.write_cf_batch(sidecar_writes)?;
+    let seq_before_legacy = vault.latest_seq();
     let legacy_error = registry
         .compress_streamed_column(&vault, &tq16.slot, &queries, 1)
         .expect_err("legacy TQ16 state must be refused");
+    let seq_after_legacy = vault.latest_seq();
+    let legacy_manifest = vault.read_cf_at(
+        seq_after_legacy,
+        ColumnFamily::Compression,
+        &compression_manifest_key(SlotId::new(43)),
+    )?;
+    let legacy_rows = vault.scan_cf_at(seq_after_legacy, ColumnFamily::slot(SlotId::new(43)))?;
+    require(
+        seq_before_legacy == seq_after_legacy,
+        "legacy TQ16 refusal must not advance the vault seq",
+    )?;
+    require(
+        legacy_manifest.is_none()
+            && legacy_rows.len() == ROWS
+            && legacy_rows
+                .iter()
+                .all(|(_, value)| value.first().copied() != Some(COMPRESSED_SLOT_TAG)),
+        "legacy TQ16 refusal must retain raw primary rows and no manifest",
+    )?;
     require(
         legacy_error.message.contains("re-commission")
             && legacy_error.message.contains("ScalarInt8"),
@@ -451,6 +587,12 @@ fn run() -> AnyResult<()> {
             "event": "legacy_tq16_refused",
             "code": legacy_error.code,
             "message": legacy_error.message,
+            "seq_before": seq_before_legacy,
+            "seq_after": seq_after_legacy,
+            "raw_rows_before": legacy_rows.len(),
+            "raw_rows_after": legacy_rows.len(),
+            "compressed_rows_after": 0,
+            "manifest_written": false,
         })
     );
 
@@ -536,6 +678,22 @@ fn run() -> AnyResult<()> {
         format!("int8 decode parity too low: {int8_parity}"),
     )?;
 
+    let tq25_index = registry.compressed_slot_index(&reopened, &tq25.slot)?;
+    tq25_index.verify_at(head)?;
+    let tq25_hits = tq25_index.search_at(&query, 1, head)?;
+    require(tq25_hits[0].cx_id == cx_ids[0], "tq25 top-1 must be row 0")?;
+    let SlotVector::Dense {
+        data: tq25_data, ..
+    } = tq25_index.read_at(cx_ids[0], head)?
+    else {
+        return Err("decoded tq25 row must be dense".into());
+    };
+    let tq25_parity = cosine(&raw, &tq25_data);
+    require(
+        tq25_parity > 0.8,
+        format!("tq25 decode parity too low: {tq25_parity}"),
+    )?;
+
     let structured_index = registry.compressed_slot_index(&reopened, &structured.slot)?;
     structured_index.verify_at(head)?;
     let structured_hits = structured_index.search_at(&query, 1, head)?;
@@ -567,6 +725,9 @@ fn run() -> AnyResult<()> {
             "int8_top1": int8_hits[0].cx_id.to_string(),
             "int8_top1_score": int8_hits[0].score,
             "int8_decode_cosine": int8_parity,
+            "tq25_top1": tq25_hits[0].cx_id.to_string(),
+            "tq25_top1_score": tq25_hits[0].score,
+            "tq25_decode_cosine": tq25_parity,
             "structured_top1": structured_hits[0].cx_id.to_string(),
             "structured_top1_score": structured_hits[0].score,
             "structured_decode_cosine": structured_parity,
@@ -576,6 +737,7 @@ fn run() -> AnyResult<()> {
 
     drop(index);
     drop(int8_index);
+    drop(tq25_index);
     drop(structured_index);
     drop(reopened);
     println!(
