@@ -18,6 +18,7 @@
 #include "graph_buffer/graph_buffer.h"
 #include "discover/discover.h"
 #include "foundation/log.h"
+#include "foundation/str_util.h" /* cbm_json_escape — UTF-8-strict edge-property escaping (#528) */
 #include "foundation/compat.h"
 #include "foundation/compat_fs.h"
 #include "foundation/limits.h"
@@ -352,10 +353,17 @@ static void k8s_link_selectors(cbm_pipeline_ctx_t *ctx, const k8s_record_array_t
                 continue;
             }
             if (k8s_selector_matches(svc, wl)) {
+                /* metadata.name YAML scalars are parser-derived: a non-UTF-8 or
+                 * quote/backslash byte must not reach edges.properties raw, or the
+                 * vault importer refuses the whole repo (#528). */
+                char esc_svc[K8S_LABEL_LEN * 3];
+                char esc_wl[K8S_LABEL_LEN * 3];
+                cbm_json_escape(esc_svc, (int)sizeof(esc_svc), svc->name);
+                cbm_json_escape(esc_wl, (int)sizeof(esc_wl), wl->name);
                 char props[CBM_SZ_256];
                 snprintf(props, sizeof(props),
-                         "{\"kind\":\"selector\",\"service\":\"%s\",\"workload\":\"%s\"}",
-                         svc->name, wl->name);
+                         "{\"kind\":\"selector\",\"service\":\"%s\",\"workload\":\"%s\"}", esc_svc,
+                         esc_wl);
                 cbm_gbuf_insert_edge(ctx->gbuf, svc->node_id, wl->node_id, "INFRA_MAPS", props);
                 edges++;
             }

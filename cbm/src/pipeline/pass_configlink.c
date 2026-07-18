@@ -14,6 +14,7 @@
 #include "foundation/hash_table.h"
 #include "foundation/log.h"
 #include "foundation/compat.h"
+#include "foundation/str_util.h" /* cbm_json_escape — UTF-8-strict edge-property escaping (#528) */
 
 #include <stdint.h>
 #include <stdio.h>
@@ -177,10 +178,15 @@ static int strategy_key_symbols(cbm_gbuf_t *gb) {
             }
 
             if (confidence > 0.0) {
+                /* config key is a parser-derived scalar: escape UTF-8-strict so a
+                 * bad byte can't corrupt the CONFIGURES edges.properties cell and
+                 * make the vault importer refuse the repo (#528). */
+                char esc_key[CBM_SZ_256 * 3];
+                cbm_json_escape(esc_key, (int)sizeof(esc_key), config_entries[ci].name);
                 char props[CBM_SZ_512];
                 snprintf(props, sizeof(props),
                          "{\"strategy\":\"key_symbol\",\"confidence\":%.2f,\"config_key\":\"%s\"}",
-                         confidence, config_entries[ci].name);
+                         confidence, esc_key);
 
                 cbm_gbuf_insert_edge(gb, code_entries[co].node_id, config_entries[ci].node_id,
                                      "CONFIGURES", props);

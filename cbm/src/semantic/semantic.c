@@ -7,6 +7,7 @@
  */
 #include "semantic/semantic.h"
 #include "foundation/constants.h"
+#include "foundation/str_util.h" /* cbm_utf8_sequence_len — invalid-byte token boundary (#532) */
 #include "foundation/hash_table.h"
 #include "foundation/log.h"
 #include "foundation/profile.h"
@@ -168,6 +169,16 @@ static void flush_token(char *buf, int *blen, char **out, int *count, int max_ou
     *blen = 0;
 }
 
+/* Count of invalid-UTF-8 bytes stripped by the tokenizer since the last take.
+ * Tokenization runs across parallel workers (phase2_tokenize), so accumulation
+ * is atomic; the semantic pass drains it once and logs a labeled-degradation
+ * WARN (invariant 3: no silent transformation of evidence). See #532. */
+static _Atomic unsigned long long g_sem_tokenize_stripped_bytes = 0;
+
+unsigned long long cbm_sem_tokenize_stripped_take(void) {
+    return atomic_exchange(&g_sem_tokenize_stripped_bytes, 0ULL);
+}
+
 int cbm_sem_tokenize(const char *name, char **out, int max_out) {
     if (!name || !out || max_out <= 0) {
         return 0;
@@ -177,6 +188,23 @@ int cbm_sem_tokenize(const char *name, char **out, int max_out) {
     int blen = 0;
 
     for (int i = 0; name[i] && count < max_out; i++) {
+        unsigned char uc = (unsigned char)name[i];
+        if (uc >= 0x80) {
+            int seq = cbm_utf8_sequence_len((const unsigned char *)name + i);
+            if (seq > 0) {
+                /* Valid multi-byte UTF-8 char: skip the whole sequence atomically —
+                 * no token bytes, no split. This is the exact prior net behavior for
+                 * valid input, so clean-corpus token_vectors stay byte-identical. */
+                i += seq - SKIP_ONE;
+                continue;
+            }
+            /* Invalid UTF-8 byte: treat as a TOKEN BOUNDARY (split, don't fuse the
+             * surrounding halves into a token that never existed in the source) and
+             * count the stripped byte as labeled degradation (#532). */
+            flush_token(buf, &blen, out, &count, max_out);
+            atomic_fetch_add(&g_sem_tokenize_stripped_bytes, 1ULL);
+            continue;
+        }
         char c = name[i];
         bool split = is_token_delim(c);
         bool camel = is_camel_break(name, i);

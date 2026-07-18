@@ -1534,6 +1534,19 @@ int cbm_pipeline_pass_semantic_edges(cbm_pipeline_ctx_t *ctx) {
     CBM_PROF_END_N("semantic_edges", "2_tokenize_parallel", t_phase2, func_count);
     free(node_ptrs);
 
+    /* Labeled degradation (#532, invariant 3): if the tokenizer treated any
+     * invalid UTF-8 bytes in node metadata as token boundaries, surface the count
+     * — a silent strip would be an unlabeled transformation of evidence. */
+    unsigned long long stripped = cbm_sem_tokenize_stripped_take();
+    if (stripped > 0) {
+        char stripped_buf[CBM_SZ_32];
+        snprintf(stripped_buf, sizeof(stripped_buf), "%llu", stripped);
+        cbm_log_warn("pass.semantic.tokenize_stripped_bytes", "code",
+                     "CBM_SEM_TOKENIZE_INVALID_BYTES", "stripped_bytes", stripped_buf, "message",
+                     "invalid UTF-8 bytes in node metadata were treated as token boundaries and "
+                     "stripped from semantic tokens");
+    }
+
     /* Phase 3: Build corpus (batch add), finalize, export enriched token vectors. */
     cbm_sem_corpus_t *corpus = run_corpus_phase(gbuf, all_tokens, token_counts, func_count);
     if (!corpus) {
