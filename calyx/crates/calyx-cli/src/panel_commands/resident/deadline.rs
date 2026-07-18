@@ -15,10 +15,6 @@ impl<'a> DeadlineStream<'a> {
         Self { stream, deadline }
     }
 
-    pub(super) fn set_deadline(&mut self, deadline: Instant) {
-        self.deadline = deadline;
-    }
-
     fn remaining(&self) -> io::Result<Duration> {
         let remaining = self.deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {

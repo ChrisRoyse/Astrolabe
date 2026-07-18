@@ -43,7 +43,7 @@ pub(super) struct ResidentRequest {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-pub(super) struct ResidentCompletionAttestation {
+pub(crate) struct ResidentCompletionAttestation {
     pub(super) schema: String,
     pub(super) request_id: String,
     pub(super) generation: u64,

@@ -22,10 +22,11 @@ use super::job::{
     ResidentProcessIdentity, recover_recorded_generation, recover_recorded_preassignment_job,
 };
 use super::lifecycle::{
-    LIFECYCLE_SCHEMA_V2, LIFECYCLE_SCHEMA_V4, LifecycleErrorRecord, LifecyclePhase,
-    LifecycleProjection, LifecycleRequestRecord, LifecycleState, LifecycleStore, RequestOutcome,
-    RequestStage,
+    LIFECYCLE_SCHEMA, LIFECYCLE_SCHEMA_V2, LIFECYCLE_SCHEMA_V4, LifecycleErrorRecord,
+    LifecyclePhase, LifecycleProjection, LifecycleRequestRecord, LifecycleState, LifecycleStore,
+    RequestOutcome, RequestStage,
 };
+use super::protocol::COMPLETION_SCHEMA;
 use super::source::{FrozenResidentSource, freeze_source};
 use super::stream::{decode_binary_request, write_stream_frame};
 use super::worker::{WORKER_STOP_FAILED, WorkerProcess, write_worker_auth_line};

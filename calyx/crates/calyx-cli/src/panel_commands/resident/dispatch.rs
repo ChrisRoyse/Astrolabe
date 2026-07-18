@@ -1,4 +1,5 @@
 use super::lifecycle::LifecyclePhase;
+use super::protocol::COMPLETION_SCHEMA;
 use super::server::ResidentService;
 use super::*;
 use ulid::Ulid;
