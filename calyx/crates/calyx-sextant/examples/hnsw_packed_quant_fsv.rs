@@ -44,6 +44,27 @@ const POINTER_HEADER_BYTES: usize = 144;
 const TURBOQUANT_SEED: &[u8] = b"calyx/sextant/hnsw/slot-7/turboquant/fsv-v1";
 const ANNEAL_VAULT_ID: &str = "01J00000000000000000000553";
 const ANNEAL_VAULT_SALT: &[u8] = b"calyx-553-anneal-fsv";
+const ADMISSION_ROWS: usize = 64;
+const ADMISSION_SAMPLES: usize = 64;
+const ADMISSION_MAX_COSINE_ERROR: f64 = 0.02;
+
+#[derive(Clone, Copy)]
+struct CodecMeasurement {
+    recall: f64,
+    latency_ns: u64,
+}
+
+struct AdmissionFixture {
+    f32_artifact: PathBuf,
+    scalar_artifact: PathBuf,
+    f32_expectation: HnswArtifactExpectation,
+    scalar_expectation: HnswArtifactExpectation,
+    queries: Vec<Vec<f32>>,
+    incumbent: CodecMeasurement,
+    candidate: CodecMeasurement,
+    quant_evidence: QuantPromotionEvidence,
+    max_cosine_error: f64,
+}
 
 fn main() {
     let result = match std::env::args().nth(1).as_deref() {
@@ -120,6 +141,8 @@ fn parent_run() -> Result<(), Box<dyn std::error::Error>> {
         + DIM.div_ceil(8)
         + 4;
     let mut artifacts = Vec::new();
+    let mut f32_measurement = None;
+    let mut turbo3p5_measurement = None;
     for (name, config, expected_tag, expected_vector_bytes, expected_geometry) in vec![
         ("f32", QuantConfig::none(), 0_u8, ROWS * DIM * 4, [0_u8; 32]),
         (
@@ -258,6 +281,15 @@ fn parent_run() -> Result<(), Box<dyn std::error::Error>> {
             search_us,
             reload.stdout.trim()
         );
+        let measurement = CodecMeasurement {
+            recall: raw_recall,
+            latency_ns: (search_us * 1_000.0).round() as u64,
+        };
+        if name == "f32" {
+            f32_measurement = Some(measurement);
+        } else if name == "turboquant3p5" {
+            turbo3p5_measurement = Some(measurement);
+        }
         artifacts.push((name, path, physical));
     }
     if artifacts
@@ -267,7 +299,13 @@ fn parent_run() -> Result<(), Box<dyn std::error::Error>> {
         return Err("quantization did not alter persisted physical vector bytes".into());
     }
 
-    anneal_activation_fsv(&run_dir, &artifacts[0].1, &artifacts[4].1, queries)?;
+    anneal_low_recall_refusal_fsv(
+        &run_dir,
+        f32_measurement.ok_or("missing measured F32 result")?,
+        turbo3p5_measurement.ok_or("missing measured TQ3.5 result")?,
+    )?;
+    let admission = build_admission_fixture(&run_dir)?;
+    anneal_activation_fsv(&run_dir, &admission)?;
 
     edge_empty(&run_dir, queries)?;
     edge_limits(&run_dir, rows)?;
@@ -348,12 +386,273 @@ fn child_reload() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+fn anneal_low_recall_refusal_fsv(
+    run_dir: &Path,
+    incumbent: CodecMeasurement,
+    candidate: CodecMeasurement,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let vault_dir = run_dir.join("tq-rejection-vault");
+    let cache_path = run_dir.join("tq-rejection-cache.json");
+    let vault = AsterVault::open(
+        &vault_dir,
+        ANNEAL_VAULT_ID.parse::<VaultId>()?,
+        b"calyx-553-tq-rejection-fsv".to_vec(),
+        VaultOptions::default(),
+    )?;
+    println!(
+        "{{\"event\":\"anneal_low_recall_before\",\"incumbent_recall\":{:.3},\"candidate_recall\":{:.3},\"incumbent_latency_ns\":{},\"candidate_latency_ns\":{},\"cache_exists\":{},\"ledger_rows\":0}}",
+        incumbent.recall,
+        candidate.recall,
+        incumbent.latency_ns,
+        candidate.latency_ns,
+        cache_path.exists()
+    );
+    let cache = AutotuneCache::load(&cache_path)?;
+    let appender = LedgerAppender::open(AsterAnnealLedgerStore::new(&vault), SystemClock)?;
+    let ledger = AnnealLedger::new(
+        appender,
+        ActorId::Service("calyx-553-tq-rejection".to_string()),
+    )?;
+    let bandits = ConfigBanditStore::new(AsterBanditStorage::new(&vault));
+    let health = DegradeRegistry::open(Arc::new(SystemClock), AsterHealthStore::new(&vault))?;
+    let mut tuner = IndexScopeTuner::with_parts(cache, ledger, bandits, health);
+    let (incumbent_config, candidate_config) = anneal_configs();
+    tuner.install_candidates(
+        SLOT,
+        vec![
+            incumbent_config,
+            IndexConfig {
+                quant_bits: 4,
+                ..candidate_config
+            },
+        ],
+    )?;
+    tuner.on_search_for_arm(SLOT, 0, incumbent.latency_ns, incumbent.recall, 0.50)?;
+    let mut won = false;
+    let mut promoted = false;
+    for _ in 0..3 {
+        let decision = tuner.on_search_for_arm_with_quant_evidence(
+            SLOT,
+            1,
+            candidate.latency_ns,
+            candidate.recall,
+            0.50,
+            None,
+        )?;
+        won |= decision.won;
+        promoted |= decision.promoted.is_some();
+    }
+    vault.flush()?;
+    let bandit = persisted_bandit(&vault)?;
+    let ledger_rows = read_anneal_entries(&vault)?.len();
+    if won || promoted || bandit.incumbent_idx != 0 || cache_path.exists() || ledger_rows != 0 {
+        return Err("measured low-recall TurboQuant candidate was not refused cleanly".into());
+    }
+    println!(
+        "{{\"event\":\"anneal_low_recall_after\",\"won\":false,\"promoted\":false,\"persisted_bandit_incumbent\":{},\"cache_exists\":false,\"ledger_rows\":{},\"reason\":\"measured raw recall regression\"}}",
+        bandit.incumbent_idx, ledger_rows
+    );
+    Ok(())
+}
+
+fn build_admission_fixture(run_dir: &Path) -> Result<AdmissionFixture, Box<dyn std::error::Error>> {
+    let rows = admission_rows();
+    let queries = admission_queries();
+    let scale = measured_scale(&rows);
+    let mut f32 = HnswIndex::new(SLOT, DIM as u32, 553).with_quant(QuantConfig::none())?;
+    let mut scalar =
+        HnswIndex::new(SLOT, DIM as u32, 553).with_quant(QuantConfig::scalar8(scale))?;
+    for (ordinal, row) in rows.iter().enumerate() {
+        let vector = SlotVector::Dense {
+            dim: DIM as u32,
+            data: row.clone(),
+        };
+        f32.insert(cx(ordinal), vector.clone(), ordinal as u64 + 1)?;
+        scalar.insert(cx(ordinal), vector, ordinal as u64 + 1)?;
+    }
+    f32.set_base_seq(BASE_SEQ);
+    scalar.set_base_seq(BASE_SEQ);
+    let f32_artifact = run_dir.join("anneal-admission-f32.clxhnsw");
+    let scalar_artifact = run_dir.join("anneal-admission-scalar8.clxhnsw");
+    let f32_receipt = f32.persist_artifact(&f32_artifact)?;
+    let scalar_receipt = scalar.persist_artifact(&scalar_artifact)?;
+    let (incumbent, incumbent_mean_error, incumbent_max_error, incumbent_far) =
+        measure_admission_index(&f32, &rows, &queries)?;
+    let (candidate, candidate_mean_error, candidate_max_error, candidate_far) =
+        measure_admission_index(&scalar, &rows, &queries)?;
+    if incumbent.recall < 0.99
+        || candidate.recall + f64::EPSILON < incumbent.recall
+        || candidate.latency_ns >= incumbent.latency_ns
+        || candidate_max_error > ADMISSION_MAX_COSINE_ERROR
+        || candidate_far > incumbent_far + f64::EPSILON
+    {
+        return Err(format!(
+            "measured Scalar8 admission fixture failed: recall {:.3}->{:.3}, p99 {}->{}, max_error {:.6}, FAR {:.6}->{:.6}",
+            incumbent.recall,
+            candidate.recall,
+            incumbent.latency_ns,
+            candidate.latency_ns,
+            candidate_max_error,
+            incumbent_far,
+            candidate_far
+        )
+        .into());
+    }
+    let f32_physical = independent_artifact_read(&f32_artifact)?;
+    let scalar_physical = independent_artifact_read(&scalar_artifact)?;
+    if f32_physical.digest != f32_receipt.metadata.digest
+        || scalar_physical.digest != scalar_receipt.metadata.digest
+        || f32_physical.row_count != ADMISSION_ROWS as u64
+        || scalar_physical.row_count != ADMISSION_ROWS as u64
+        || scalar_physical.packed_vector_bytes != (ADMISSION_ROWS * (DIM + 8)) as u64
+    {
+        return Err("admission artifacts did not independently reread as measured".into());
+    }
+    println!(
+        "{{\"event\":\"anneal_admission_measurement\",\"corpus\":\"64 deterministic one-hot records with eight strict-mixture queries\",\"rows\":{},\"heldout_queries\":{},\"k\":{},\"f32_recall\":{:.3},\"scalar8_recall\":{:.3},\"f32_p99_ns\":{},\"scalar8_p99_ns\":{},\"f32_mean_cosine_error\":{:.9},\"f32_max_cosine_error\":{:.9},\"scalar8_mean_cosine_error\":{:.9},\"scalar8_max_cosine_error\":{:.9},\"accepted_max_cosine_error\":{:.3},\"f32_far\":{:.6},\"scalar8_far\":{:.6},\"f32_artifact_bytes\":{},\"scalar8_artifact_bytes\":{},\"scalar8_packed_bytes\":{}}}",
+        ADMISSION_ROWS,
+        queries.len(),
+        K,
+        incumbent.recall,
+        candidate.recall,
+        incumbent.latency_ns,
+        candidate.latency_ns,
+        incumbent_mean_error,
+        incumbent_max_error,
+        candidate_mean_error,
+        candidate_max_error,
+        ADMISSION_MAX_COSINE_ERROR,
+        incumbent_far,
+        candidate_far,
+        f32_physical.artifact_bytes,
+        scalar_physical.artifact_bytes,
+        scalar_physical.packed_vector_bytes
+    );
+    Ok(AdmissionFixture {
+        f32_artifact,
+        scalar_artifact,
+        f32_expectation: f32.artifact_expectation(),
+        scalar_expectation: scalar.artifact_expectation(),
+        queries,
+        incumbent,
+        candidate,
+        quant_evidence: QuantPromotionEvidence {
+            cosine_error_before: incumbent_mean_error,
+            cosine_error_after: candidate_mean_error,
+            max_cosine_error: ADMISSION_MAX_COSINE_ERROR,
+            guard_far_before: incumbent_far,
+            guard_far_after: candidate_far,
+        },
+        max_cosine_error: candidate_max_error,
+    })
+}
+
+fn measure_admission_index(
+    index: &HnswIndex,
+    rows: &[Vec<f32>],
+    queries: &[Vec<f32>],
+) -> Result<(CodecMeasurement, f64, f64, f64), Box<dyn std::error::Error>> {
+    let mut overlap_total = 0_usize;
+    let mut errors = Vec::new();
+    for query in queries {
+        let truth = exact_top_k(query, rows, K);
+        let hits = index.search(
+            &SlotVector::Dense {
+                dim: DIM as u32,
+                data: query.clone(),
+            },
+            K,
+            Some(64),
+        )?;
+        let got: Vec<_> = hits.iter().map(|hit| hit.cx_id).collect();
+        overlap_total += overlap(&got, &truth);
+        for (cx_id, score) in index.brute_force(query, rows.len())? {
+            let ordinal = u128::from_be_bytes(*cx_id.as_bytes()) as usize;
+            errors.push((f64::from(score) - f64::from(cosine(query, &rows[ordinal]))).abs());
+        }
+    }
+    for query in queries {
+        let _ = index.search(
+            &SlotVector::Dense {
+                dim: DIM as u32,
+                data: query.clone(),
+            },
+            K,
+            Some(64),
+        )?;
+    }
+    let mut sample_ns = Vec::with_capacity(ADMISSION_SAMPLES);
+    for _ in 0..ADMISSION_SAMPLES {
+        let started = Instant::now();
+        for query in queries {
+            let _ = index.search(
+                &SlotVector::Dense {
+                    dim: DIM as u32,
+                    data: query.clone(),
+                },
+                K,
+                Some(64),
+            )?;
+        }
+        sample_ns.push((started.elapsed().as_nanos() / queries.len() as u128) as u64);
+    }
+    sample_ns.sort_unstable();
+    let p99_index = (sample_ns.len() * 99).div_ceil(100).saturating_sub(1);
+    let p99_ns = sample_ns[p99_index];
+    let mut far_accepts = 0_usize;
+    for (ordinal, row) in rows.iter().enumerate() {
+        let far: Vec<f32> = row.iter().map(|value| -*value).collect();
+        let score = index
+            .brute_force(&far, rows.len())?
+            .into_iter()
+            .find(|(cx_id, _)| *cx_id == cx(ordinal))
+            .ok_or("far-case row disappeared")?
+            .1;
+        far_accepts += usize::from(score >= 0.7);
+    }
+    let mean_error = errors.iter().sum::<f64>() / errors.len() as f64;
+    let max_error = errors.into_iter().fold(0.0_f64, f64::max);
+    Ok((
+        CodecMeasurement {
+            recall: overlap_total as f64 / (queries.len() * K) as f64,
+            latency_ns: p99_ns,
+        },
+        mean_error,
+        max_error,
+        far_accepts as f64 / rows.len() as f64,
+    ))
+}
+
+fn admission_rows() -> Vec<Vec<f32>> {
+    (0..ADMISSION_ROWS)
+        .map(|ordinal| {
+            let mut row = vec![0.0_f32; DIM];
+            row[ordinal] = 1.0;
+            row
+        })
+        .collect()
+}
+
+fn admission_queries() -> Vec<Vec<f32>> {
+    (0..QUERIES)
+        .map(|query_ordinal| {
+            let mut query = vec![0.0_f32; DIM];
+            for rank in 0..ADMISSION_ROWS {
+                let ordinal = (rank + query_ordinal * 7) % ADMISSION_ROWS;
+                query[ordinal] = 1.0 / (rank + 1) as f32;
+            }
+            query
+        })
+        .collect()
+}
+
 fn anneal_activation_fsv(
     run_dir: &Path,
-    f32_artifact: &Path,
-    turbo_artifact: &Path,
-    queries: &[Vec<f32>],
+    fixture: &AdmissionFixture,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let f32_artifact = &fixture.f32_artifact;
+    let candidate_artifact = &fixture.scalar_artifact;
+    let queries = &fixture.queries;
     let pointer_path = run_dir.join("slot-7.active.clxhnpt");
     let cache_path = run_dir.join("anneal-cache").join("autotune.json");
     let unconfigured_cache_path = run_dir.join("unconfigured-autotune.json");
@@ -364,22 +663,8 @@ fn anneal_activation_fsv(
     let (incumbent, candidate) = anneal_configs();
     let incumbent_hash = config_hash(&incumbent)?;
     let candidate_hash = config_hash(&candidate)?;
-    let f32_expectation = HnswArtifactExpectation {
-        slot: SLOT,
-        dim: DIM as u32,
-        quant_kind: QuantKind::None,
-        quant_geometry_id: [0_u8; 32],
-        base_seq: BASE_SEQ,
-    };
-    let turbo_expectation = HnswArtifactExpectation {
-        quant_kind: QuantKind::TurboQuant3p5,
-        quant_geometry_id: QuantConfig::turboquant_structured(
-            new_seed(DIM, TURBOQUANT_SEED),
-            QuantLevel::Bits3p5,
-        )?
-        .geometry_id(),
-        ..f32_expectation
-    };
+    let f32_expectation = fixture.f32_expectation;
+    let candidate_expectation = fixture.scalar_expectation;
 
     let initializer = HnswArtifactActivator::new(&pointer_path, SLOT);
     println!(
@@ -391,7 +676,7 @@ fn anneal_activation_fsv(
         32,
         f32_artifact,
         f32_expectation,
-        QUERIES as u64,
+        queries.len() as u64,
     )?;
     let incumbent_pointer_bytes = std::fs::read(&pointer_path)?;
     let incumbent_physical = independent_pointer_read(&pointer_path)?;
@@ -444,15 +729,21 @@ fn anneal_activation_fsv(
         let health = DegradeRegistry::open(Arc::new(SystemClock), AsterHealthStore::new(&vault))?;
         let mut tuner = IndexScopeTuner::with_parts(cache, ledger, bandits, health);
         tuner.install_candidates(SLOT, vec![incumbent.clone(), candidate.clone()])?;
-        tuner.on_search_for_arm(SLOT, 0, 100_000, 1.0, 0.50)?;
-        for latency in [90_000, 80_000] {
+        tuner.on_search_for_arm(
+            SLOT,
+            0,
+            fixture.incumbent.latency_ns,
+            fixture.incumbent.recall,
+            0.50,
+        )?;
+        for _ in 0..2 {
             let decision = tuner.on_search_for_arm_with_quant_evidence(
                 SLOT,
                 1,
-                latency,
-                1.0,
+                fixture.candidate.latency_ns,
+                fixture.candidate.recall,
                 0.50,
-                Some(quant_evidence()),
+                Some(fixture.quant_evidence.clone()),
             )?;
             if !decision.won || decision.promoted.is_some() {
                 return Err("unconfigured candidate did not remain in hysteresis".into());
@@ -461,10 +752,10 @@ fn anneal_activation_fsv(
         require_error(tuner.on_search_for_arm_with_quant_evidence(
             SLOT,
             1,
-            70_000,
-            1.0,
+            fixture.candidate.latency_ns,
+            fixture.candidate.recall,
             0.50,
-            Some(quant_evidence()),
+            Some(fixture.quant_evidence.clone()),
         ))?
     };
     let after_unconfigured = std::fs::read(&pointer_path)?;
@@ -504,32 +795,38 @@ fn anneal_activation_fsv(
         let mut activator = HnswArtifactActivator::new(&pointer_path, SLOT);
         activator.stage_candidate(
             candidate_hash,
-            4,
-            turbo_artifact,
-            turbo_expectation,
-            QUERIES as u64,
+            8,
+            candidate_artifact,
+            candidate_expectation,
+            queries.len() as u64,
         )?;
         let mut tuner =
             IndexScopeTuner::with_artifact_parts(cache, ledger, bandits, health, activator);
         tuner.install_candidates(SLOT, vec![incumbent.clone(), candidate.clone()])?;
-        tuner.on_search_for_arm(SLOT, 0, 100_000, 1.0, 0.50)?;
-        for latency in [90_000, 80_000] {
+        tuner.on_search_for_arm(
+            SLOT,
+            0,
+            fixture.incumbent.latency_ns,
+            fixture.incumbent.recall,
+            0.50,
+        )?;
+        for _ in 0..2 {
             tuner.on_search_for_arm_with_quant_evidence(
                 SLOT,
                 1,
-                latency,
-                1.0,
+                fixture.candidate.latency_ns,
+                fixture.candidate.recall,
                 0.50,
-                Some(quant_evidence()),
+                Some(fixture.quant_evidence.clone()),
             )?;
         }
         require_error(tuner.on_search_for_arm_with_quant_evidence(
             SLOT,
             1,
-            70_000,
-            1.0,
+            fixture.candidate.latency_ns,
+            fixture.candidate.recall,
             0.50,
-            Some(quant_evidence()),
+            Some(fixture.quant_evidence.clone()),
         ))?
     };
     let after_cache_failure = std::fs::read(&pointer_path)?;
@@ -569,36 +866,42 @@ fn anneal_activation_fsv(
         let mut activator = HnswArtifactActivator::new(&pointer_path, SLOT);
         activator.stage_candidate(
             candidate_hash,
-            4,
-            turbo_artifact,
-            turbo_expectation,
-            QUERIES as u64,
+            8,
+            candidate_artifact,
+            candidate_expectation,
+            queries.len() as u64,
         )?;
         let mut tuner =
             IndexScopeTuner::with_artifact_parts(cache, ledger, bandits, health, activator);
         tuner.install_candidates(SLOT, vec![incumbent.clone(), candidate.clone()])?;
-        tuner.on_search_for_arm(SLOT, 0, 100_000, 1.0, 0.50)?;
-        for latency in [90_000, 80_000] {
+        tuner.on_search_for_arm(
+            SLOT,
+            0,
+            fixture.incumbent.latency_ns,
+            fixture.incumbent.recall,
+            0.50,
+        )?;
+        for _ in 0..2 {
             tuner.on_search_for_arm_with_quant_evidence(
                 SLOT,
                 1,
-                latency,
-                1.0,
+                fixture.candidate.latency_ns,
+                fixture.candidate.recall,
                 0.50,
-                Some(quant_evidence()),
+                Some(fixture.quant_evidence.clone()),
             )?;
         }
         tuner
             .on_search_for_arm_with_quant_evidence(
                 SLOT,
                 1,
-                70_000,
-                1.0,
+                fixture.candidate.latency_ns,
+                fixture.candidate.recall,
                 0.50,
-                Some(quant_evidence()),
+                Some(fixture.quant_evidence.clone()),
             )?
             .promoted
-            .ok_or("measured TurboQuant3p5 candidate did not promote")?
+            .ok_or("measured Scalar8 candidate did not promote")?
     };
     vault.flush()?;
 
@@ -606,10 +909,10 @@ fn anneal_activation_fsv(
     let active_physical = independent_pointer_read(&pointer_path)?;
     let cache_bytes = std::fs::read(&cache_path)?;
     let cache_json: serde_json::Value = serde_json::from_slice(&cache_bytes)?;
-    let cache_has_quant4 = cache_json["entries"].as_array().is_some_and(|entries| {
+    let cache_has_quant8 = cache_json["entries"].as_array().is_some_and(|entries| {
         entries
             .iter()
-            .any(|entry| entry["config"]["extra"]["quant_bits"].as_str() == Some("4"))
+            .any(|entry| entry["config"]["extra"]["quant_bits"].as_str() == Some("8"))
     });
     let bandit = persisted_bandit(&vault)?;
     let anneal_entries = read_anneal_entries(&vault)?;
@@ -621,6 +924,9 @@ fn anneal_activation_fsv(
         .as_ref()
         .ok_or("persisted Anneal promotion activation details missing")?;
     let served_bits = ledger_activation["served_quant_bits"].as_u64();
+    let ledger_artifact_bytes = ledger_activation["candidate_artifact_bytes"].as_u64();
+    let ledger_heldout = ledger_activation["heldout_query_count"].as_u64();
+    let ledger_cosine_after = ledger_activation["cosine_error_after"].as_f64();
     let (active_index, active) = HnswArtifactActivator::new(&pointer_path, SLOT).open_active()?;
     let live_hits = active_index.search(
         &SlotVector::Dense {
@@ -632,23 +938,37 @@ fn anneal_activation_fsv(
     )?;
     if active_pointer_bytes == incumbent_pointer_bytes
         || active_physical.config_hash != candidate_hash
-        || active_physical.quant_bits != 4
-        || active_physical.kind_tag != 4
-        || active_physical.geometry_id != turbo_expectation.quant_geometry_id
+        || active_physical.quant_bits != 8
+        || active_physical.kind_tag != 1
+        || active_physical.geometry_id != [0_u8; 32]
         || active.config_hash != candidate_hash
-        || active.quant_bits != 4
+        || active.quant_bits != 8
         || promotion.served_artifact.is_none()
-        || !cache_has_quant4
+        || !cache_has_quant8
         || bandit.incumbent_idx != 1
         || anneal_entries.len() != 1
         || ledger_entry.action != AnnealLedgerAction::AutotunePromote
-        || served_bits != Some(4)
+        || served_bits != Some(8)
+        || ledger_artifact_bytes != Some(active_physical.artifact_bytes)
+        || ledger_heldout != Some(queries.len() as u64)
+        || ledger_cosine_after != Some(fixture.quant_evidence.cosine_error_after)
+        || promotion.latency_before_ns != fixture.incumbent.latency_ns
+        || promotion.latency_after_ns != fixture.candidate.latency_ns
+        || promotion.recall_before != fixture.incumbent.recall
+        || promotion.recall_after != fixture.candidate.recall
+        || fixture.max_cosine_error > fixture.quant_evidence.max_cosine_error
         || live_hits.len() != K
     {
         return Err("successful Anneal promotion state is incomplete or inconsistent".into());
     }
     println!(
-        "{{\"event\":\"anneal_promotion_after\",\"pointer_quant_bits\":4,\"codec\":\"turboquant3p5\",\"pointer_bytes\":{},\"pointer_digest\":\"{}\",\"artifact_path\":\"{}\",\"artifact_bytes\":{},\"artifact_digest\":\"{}\",\"cache_bytes\":{},\"cache_quant_bits\":4,\"persisted_bandit_incumbent\":{},\"ledger_rows\":{},\"ledger_action\":\"autotune_promote\",\"ledger_served_quant_bits\":{},\"live_search_hits\":{}}}",
+        "{{\"event\":\"anneal_promotion_after\",\"pointer_quant_bits\":8,\"codec\":\"scalar8\",\"measured_recall_before\":{:.3},\"measured_recall_after\":{:.3},\"measured_p99_ns_before\":{},\"measured_p99_ns_after\":{},\"measured_mean_cosine_error_after\":{:.9},\"measured_max_cosine_error_after\":{:.9},\"pointer_bytes\":{},\"pointer_digest\":\"{}\",\"artifact_path\":\"{}\",\"artifact_bytes\":{},\"artifact_digest\":\"{}\",\"cache_bytes\":{},\"cache_quant_bits\":8,\"persisted_bandit_incumbent\":{},\"ledger_rows\":{},\"ledger_action\":\"autotune_promote\",\"ledger_served_quant_bits\":{},\"live_search_hits\":{}}}",
+        fixture.incumbent.recall,
+        fixture.candidate.recall,
+        fixture.incumbent.latency_ns,
+        fixture.candidate.latency_ns,
+        fixture.quant_evidence.cosine_error_after,
+        fixture.max_cosine_error,
         active_physical.pointer_bytes,
         hex(&active_physical.pointer_digest),
         json(&active_physical.artifact_path),
@@ -714,8 +1034,8 @@ fn child_anneal_reload() -> Result<(), Box<dyn std::error::Error>> {
     )?;
     let bandit = persisted_bandit(&vault)?;
     let entries = read_anneal_entries(&vault)?;
-    let vectors = real_corpus_vectors(ROWS + QUERIES)?;
-    let query = &vectors[ROWS];
+    let queries = admission_queries();
+    let query = &queries[0];
     let hits = index.search(
         &SlotVector::Dense {
             dim: DIM as u32,
@@ -725,9 +1045,9 @@ fn child_anneal_reload() -> Result<(), Box<dyn std::error::Error>> {
         Some(64),
     )?;
     if active.config_hash != candidate_hash
-        || active.quant_bits != 4
-        || active.expectation.quant_kind != QuantKind::TurboQuant3p5
-        || cached_config.quant_bits != 4
+        || active.quant_bits != 8
+        || active.expectation.quant_kind != QuantKind::Scalar8
+        || cached_config.quant_bits != 8
         || bandit.incumbent_idx != 1
         || entries.len() != 1
         || entries[0].action != AnnealLedgerAction::AutotunePromote
@@ -843,7 +1163,7 @@ fn anneal_configs() -> (IndexConfig, IndexConfig) {
         quant_bits: 32,
     };
     let candidate = IndexConfig {
-        quant_bits: 4,
+        quant_bits: 8,
         ..incumbent.clone()
     };
     (incumbent, candidate)
@@ -851,16 +1171,6 @@ fn anneal_configs() -> (IndexConfig, IndexConfig) {
 
 fn config_hash(config: &IndexConfig) -> Result<[u8; 32], Box<dyn std::error::Error>> {
     Ok(*blake3::hash(&encode_index_config(config)?).as_bytes())
-}
-
-fn quant_evidence() -> QuantPromotionEvidence {
-    QuantPromotionEvidence {
-        cosine_error_before: 0.0,
-        cosine_error_after: 0.01,
-        max_cosine_error: 0.02,
-        guard_far_before: 0.0,
-        guard_far_after: 0.0,
-    }
 }
 
 fn persisted_bandit(
