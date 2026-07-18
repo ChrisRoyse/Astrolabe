@@ -354,26 +354,47 @@ fn routing_edges(root: &Path, report_path: &Path) -> Result<Value, CalyxError> {
     require_absent(root)?;
     fs::create_dir_all(root).map_err(|error| io_error("create routing edge store", error))?;
     let query = dense_known(0, 0);
+    let centroids = build_known_centroids();
+    let mut expected = centroids
+        .centroids()
+        .iter()
+        .enumerate()
+        .map(|(centroid_id, centroid)| {
+            let distance = centroid
+                .iter()
+                .zip(&query)
+                .map(|(left, right)| {
+                    let delta = left - right;
+                    delta * delta
+                })
+                .sum::<f32>();
+            (centroid_id as u32, distance)
+        })
+        .collect::<Vec<_>>();
+    expected.sort_by(|left, right| {
+        left.1
+            .total_cmp(&right.1)
+            .then_with(|| left.0.cmp(&right.0))
+    });
+    let expected = expected
+        .into_iter()
+        .take(2)
+        .map(|(centroid_id, _)| centroid_id)
+        .collect::<Vec<_>>();
     write_report(
         &root.join("routing-inputs.json"),
         &json!({
             "query": query,
+            "centroids": centroids.centroids(),
             "n_probe": 2,
-            "expected_nearest": 0,
+            "expected_squared_l2_order": expected,
         }),
     )?;
     let before = filesystem_state(root)?;
-    let centroids = build_known_centroids();
     let exact = centroids.nearest_centroids_exact_l2(&query, 2)?;
     let hnsw = centroids.nearest_centroids(&query, 2)?;
     let raw_l2_graph = centroids.nearest_centroids_raw_l2_graph(&query, 2)?;
-    if exact.len() != 2
-        || hnsw.len() != 2
-        || raw_l2_graph.len() != 2
-        || exact.first() != Some(&0)
-        || hnsw.first() != Some(&0)
-        || raw_l2_graph.first() != Some(&0)
-    {
+    if exact != expected || hnsw != expected || raw_l2_graph != expected {
         return Err(driver_error(
             "valid centroid routes differ from the known squared-L2 result",
         ));
@@ -401,6 +422,7 @@ fn routing_edges(root: &Path, report_path: &Path) -> Result<Value, CalyxError> {
         "before": before,
         "after": after,
         "valid": {
+            "expected_squared_l2_order": expected,
             "exact": exact,
             "hnsw": hnsw,
             "raw_l2_graph": raw_l2_graph,
