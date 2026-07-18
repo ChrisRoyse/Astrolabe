@@ -18,7 +18,6 @@ import shutil
 import struct
 import subprocess
 import sys
-import tempfile
 import time
 import urllib.error
 import urllib.request
@@ -27,7 +26,7 @@ from typing import Any, Iterable
 
 try:
     import yaml
-except ImportError as exc:  # pragma: no cover - exercised on missing host deps.
+except ImportError as exc:
     raise SystemExit("PyYAML is required for tools/lensforge/convert.py") from exc
 
 
@@ -75,16 +74,10 @@ ROLE_ORDER = {
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Build Calyx lens artifacts")
-    parser.add_argument("registry", nargs="?", help="registry YAML path")
+    parser.add_argument("registry", help="registry YAML path")
     parser.add_argument("--output-root", help="override output root")
     parser.add_argument("--log", help="JSONL log path")
-    parser.add_argument("--self-test", action="store_true")
     args = parser.parse_args(argv)
-
-    if args.self_test:
-        return self_test()
-    if not args.registry:
-        parser.error("registry YAML is required unless --self-test is set")
 
     registry_path = Path(args.registry)
     config = load_yaml(registry_path)
@@ -794,103 +787,6 @@ def log_event(
     }
     with log_path.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(record, sort_keys=True) + "\n")
-
-
-def self_test() -> int:
-    with tempfile.TemporaryDirectory(prefix="calyx-lensforge-") as tmp:
-        root = Path(tmp)
-        source = root / "source"
-        source.mkdir()
-        (source / "model_int8.onnx").write_bytes(b"tiny-model")
-        (source / "model.onnx").write_bytes(b"tiny-fp32-model")
-        (source / "vision_model_quantized.onnx").write_bytes(b"tiny-vision")
-        (source / "tokenizer.json").write_text('{"tiny": true}\n', encoding="utf-8")
-        (source / "config.json").write_text('{"hidden_size": 3}\n', encoding="utf-8")
-        (source / "preprocessor_config.json").write_text('{"size": {"height": 2, "width": 2}}\n', encoding="utf-8")
-        registry = root / "registry.yaml"
-        output = root / "out"
-        registry.write_text(
-            f"""
-output_root: {yaml_single_quote(output)}
-models:
-  - name: tiny-fixture
-    hf_id: fixture/tiny
-    modality: text
-    formats: [onnx-int8]
-    pooling: mean
-    norm: l2
-    files:
-      - role: model
-        path: {yaml_single_quote(source / "model_int8.onnx")}
-      - role: tokenizer
-        path: {yaml_single_quote(source / "tokenizer.json")}
-      - role: config
-        path: {yaml_single_quote(source / "config.json")}
-  - name: tiny-fp32-fixture
-    hf_id: fixture/tiny-fp32
-    modality: text
-    formats: [onnx-fp32]
-    pooling: mean
-    norm: l2
-    files:
-      - role: model
-        path: {yaml_single_quote(source / "model.onnx")}
-      - role: tokenizer
-        path: {yaml_single_quote(source / "tokenizer.json")}
-      - role: config
-        path: {yaml_single_quote(source / "config.json")}
-  - name: bad-audio
-    hf_id: fixture/audio
-    modality: audio
-    formats: [model2vec]
-  - name: tiny-image-adapter
-    hf_id: fixture/image
-    modality: image
-    formats: [adapter]
-    dim: 768
-    license: mit
-    files:
-      - role: model
-        path: {yaml_single_quote(source / "vision_model_quantized.onnx")}
-      - role: config
-        path: {yaml_single_quote(source / "config.json")}
-      - role: preprocessor
-        path: {yaml_single_quote(source / "preprocessor_config.json")}
-""",
-            encoding="utf-8",
-        )
-        code = main([str(registry)])
-        if code != 0:
-            return code
-        manifest = output / "tiny-fixture" / "onnx-int8" / "manifest.json"
-        data = json.loads(manifest.read_text(encoding="utf-8"))
-        actual = plain_sha256((output / "tiny-fixture" / "onnx-int8" / "model_int8.onnx").read_bytes())
-        if data["weights_sha256"] != actual:
-            print("self-test weights_sha256 mismatch", file=sys.stderr)
-            return 1
-        fp32_manifest = output / "tiny-fp32-fixture" / "onnx-fp32" / "manifest.json"
-        fp32_data = json.loads(fp32_manifest.read_text(encoding="utf-8"))
-        if fp32_data["runtime"] != "onnx" or fp32_data["dtype"] != "f32":
-            print("self-test onnx-fp32 manifest mismatch", file=sys.stderr)
-            return 1
-        adapter_manifest = output / "tiny-image-adapter" / "onnx-int8" / "manifest.json"
-        adapter_data = json.loads(adapter_manifest.read_text(encoding="utf-8"))
-        if adapter_data["runtime"] != "multimodal-adapter" or adapter_data["modality"] != "image":
-            print("self-test adapter manifest mismatch", file=sys.stderr)
-            return 1
-        adapter_roles = {entry["role"] for entry in adapter_data["files"]}
-        if not {"model", "adapter", "helper", "preprocessor"}.issubset(adapter_roles):
-            print("self-test adapter files missing", file=sys.stderr)
-            return 1
-        log_text = (output / "conversion-log.jsonl").read_text(encoding="utf-8")
-        if "unsupported_format_modality" not in log_text:
-            print("self-test missing unsupported modality skip", file=sys.stderr)
-            return 1
-    return 0
-
-
-def yaml_single_quote(path: Path) -> str:
-    return "'" + str(path).replace("'", "''") + "'"
 
 
 if __name__ == "__main__":

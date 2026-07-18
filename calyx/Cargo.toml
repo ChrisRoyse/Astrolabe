@@ -16,7 +16,6 @@ blake3 = "1"
 bincode = { package = "bincode_reloaded", version = "3.1.6", features = ["serde"] }
 ciborium = "0.2"
 crc32fast = "1"
-criterion = "0.5"
 cudarc = { version = "0.19.8", default-features = false }
 cuvs-sys = "26.6.0"
 ed25519-dalek = "2"
@@ -26,7 +25,6 @@ half = "2"
 memmap2 = "0.9"
 nix = { version = "0.30", default-features = false, features = ["fs"] }
 prometheus = { version = "0.14", default-features = false }
-proptest = "1"
 rand = "0.8"
 rand_chacha = "0.3"
 rayon = "1"
@@ -67,12 +65,12 @@ fastembed = { path = "third_party/fastembed-5.16.0" }
 
 # ── Build profiles ───────────────────────────────────────────────────────────
 # Tuned for this workspace's high-churn, multi-agent build cadence. The cargo
-# default (`debug = 2`, full DWARF) made every dev/test executable ~280 MB and
+# default (`debug = 2`, full DWARF) made every dev executable ~280 MB and
 # ballooned the shared target/ dir to ~190 GB within days. `line-tables-only`
-# keeps function names + file:line in panic/test backtraces — everything the
-# gate (`cargo test`, `cargo check`) actually needs — while cutting executable
-# size and link time several-fold. First-party crates keep line tables;
-# dependencies get no debuginfo at all since we never step into them.
+# keeps function names + file:line in panic backtraces — everything the manual
+# FSV build (`cargo check`, `cargo build`) actually needs — while cutting
+# executable size and link time several-fold. First-party crates keep line
+# tables; dependencies get no debuginfo at all since we never step into them.
 #
 # Portable and machine-agnostic: these apply identically wherever the workspace
 # builds, so they live here instead of a machine-local Cargo config. Linker
@@ -81,7 +79,7 @@ fastembed = { path = "third_party/fastembed-5.16.0" }
 debug = "line-tables-only"
 
 # Dependencies are compiled once and never stepped into during this project's
-# test/gate workflow; stripping their debuginfo is the single biggest target/
+# build/FSV workflow; stripping their debuginfo is the single biggest target/
 # size reduction with zero loss of first-party debuggability.
 [profile.dev.package."*"]
 debug = false

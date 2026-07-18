@@ -2097,9 +2097,17 @@ where
     let ms_sim_persist = t_sim_persist.elapsed().as_millis() as u64;
     let ms_similarity = t_similarity.elapsed().as_millis() as u64;
     let t_xterm = std::time::Instant::now();
+    // Abundance accounting is derived from the panel roster that was physically
+    // persisted for this import, never a compiled-in slot count (#522): the
+    // active slot count is the frozen roster of the shadow panel version. A stale
+    // or unknown panel version fails closed here rather than overclaiming a
+    // different panel's pair yield.
+    let active_slot_count = astrolabe_panel::slots_for_version(SHADOW_PANEL_VERSION)?.len();
     let xterm_plan = match delta {
-        Some(delta) => plan_eager_cross_terms_for_symbols(&nodes, &delta.dirty_qualified_names),
-        None => plan_eager_cross_terms(&nodes),
+        Some(delta) => {
+            plan_eager_cross_terms_for_symbols(&nodes, &delta.dirty_qualified_names, active_slot_count)?
+        }
+        None => plan_eager_cross_terms(&nodes, active_slot_count)?,
     };
     let xterm = match delta {
         Some(delta) => {

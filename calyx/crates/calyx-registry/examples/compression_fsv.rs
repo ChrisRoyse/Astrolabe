@@ -39,6 +39,58 @@ const CURRENT_OUTER_V3_PREFIX_BYTES: usize = 137;
 const LEGACY_OUTER_V2_HEADER_BYTES: usize = 85;
 const LEGACY_TQPR_V1_HEADER_BYTES: usize = 88;
 const LEGACY_TQPR_V1_PREFIX_BYTES: usize = 56;
+const LEGACY_WRITER_COMMIT: &str = "f6c8d778e1e73f2adc60e822ec0c2e8693ff0a99";
+const LEGACY_WRITER_SOURCE_BLOBS: &[(&str, &str, &str)] = &[
+    (
+        "calyx/crates/calyx-forge/src/quant/turboquant.rs",
+        "f76b929ae3c6dbe2052b6fcb2cb700912b9e7867",
+        "8a1d11a23147c5b1bbac42dcb89e70d54103c160bbfa26b8e0f7ae95469052f5",
+    ),
+    (
+        "calyx/crates/calyx-forge/src/quant/codebook.rs",
+        "620fce1baaf42f84fd022f9dc1bd2ec2102c1287",
+        "39c7f659c32770dd0643b3134d8aa0de926cadb44292c6c0f81daa87cf5c8806",
+    ),
+    (
+        "calyx/crates/calyx-forge/src/quant/qjl.rs",
+        "8e44eaf557fd0be1299bc054dc9dacfc5b13a557",
+        "951d699a1f4f2333c2011973657dcbbf01d79d5b11b1d7d936b876032c65ea5f",
+    ),
+    (
+        "calyx/crates/calyx-forge/src/quant/rotation.rs",
+        "3c0c504606eb3c1470bdbace6b856444626d5664",
+        "7edba36641b21281dc1ac1898e4c9dff8bdf47a86dc9ed1293d686d1c5262dc0",
+    ),
+    (
+        "calyx/crates/calyx-registry/src/compression/codec.rs",
+        "d137c1b2b19e6dfe4f1ddf079af2456eef0fc869",
+        "bcd347e0e585c2a391b79a0d3bbca3a6c0889273fc4f1eaffaeb896f6041fa7d",
+    ),
+];
+// Pre-#570 legacy-IDENTITY golden (tq25/dim128): a real outer-v2/TQPR-v1 row
+// whose TurboQuant seed derives from the historical v1 (modality-blind) LensId
+// at LEGACY_WRITER_COMMIT. Retained verbatim to pin the identity-version refusal
+// diagnostic; it must never be re-encoded under the current v2 identity.
+const LEGACY_V1_IDENTITY_TQ25_128_SHA256: &str =
+    "25f572987afd1c2606ad9761c72c65d79e098535dfee9150bcc4a78c65b4d18e";
+const LEGACY_V1_IDENTITY_TQ25_128_ROWS: &[(&str, &str)] = &[
+    (
+        "8253d0cbc1b657329879d6e6aa011d24",
+        "100202050000008000000080003f8000009f04ae112afa8d3e85629067e619d9004028d1bf2ebd04e1816c684e4f7da8f200000080d978aacee9c8475de5a9cbcaf0747eb06785c49fc3ecd81a29d67adb9bf9fc9b545150520101000080000000c000000080000000cb3ef13e9f04ae112afa8d3e85629067e619d9004028d1bf2ebd04e1816c684e4f7da8f2f3aa636592c2b2a3986d5700ac90d08f457c0d0ca586cbd04be04660bee14d4b960ba3f50e5837f5289d23168393ccf5afb476e3d024342dd43648084c9db40b8b08910f3c097a77",
+    ),
+    (
+        "90ab579cef31f9b1d2bd6382dcea7512",
+        "100202050000008000000080003f8000009f04ae112afa8d3e85629067e619d9004028d1bf2ebd04e1816c684e4f7da8f200000080370ad31cdfee4693335547be1465db5c04fda047e1558a28adac6a5197aabcb4545150520101000080000000c000000080000000178bf23e9f04ae112afa8d3e85629067e619d9004028d1bf2ebd04e1816c684e4f7da8f2855f1f6df9a02c27fc0d2c9266395800e602e0402a6428bda7658b04aed4c8bd451ac6771e272d96aa904118a5968add048b722f4d936b37da405d267c0bb78dea0725a8b796eed3",
+    ),
+    (
+        "d62233d29935f3a153b49d39cc480b95",
+        "100202050000008000000080003f8000009f04ae112afa8d3e85629067e619d9004028d1bf2ebd04e1816c684e4f7da8f2000000809a77e8ac1647b3dff2ce66be2e3b6bb79acf9604e44469c916b1323ebfe5bd4a545150520101000080000000c000000080000000520efc3e9f04ae112afa8d3e85629067e619d9004028d1bf2ebd04e1816c684e4f7da8f2a7abbca68e2eb30bbba10113f2f13cae53bb0b1b35f33972b98a20627d4c9319ea6f7f289dcf757b030d266816d41854e63bb5d346b32a9de081e3bdf3b72319bf7fd2523dc3cf27",
+    ),
+    (
+        "ea451c0f9b3693c62968f22b8bbcd24f",
+        "100202050000008000000080003f8000009f04ae112afa8d3e85629067e619d9004028d1bf2ebd04e1816c684e4f7da8f2000000803704d1dbb394e6c568e12663c81091a93b93d0b1a0db3701a520fe2103cdbdee545150520101000080000000c0000000800000003e58033f9f04ae112afa8d3e85629067e619d9004028d1bf2ebd04e1816c684e4f7da8f2ec1ed4df2ac6eec66d403078509ebca5ef1923fd327fd04f1a7db763b30afee6a211924a564a94bf447f9b414d97a09b8dd28a00482a544efcc33131f13708d3ad6b564ea5a45835",
+    ),
+];
 const VAULT_SALT: &[u8] = b"issue-551-fsv-vault-salt-v1";
 const VAULT_ID: &str = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
 
@@ -161,6 +213,7 @@ fn run() -> AnyResult<()> {
     legacy_migration_edge(&root, &vault_a, &registry, &happy_slots[0], &corpus)?;
     legacy_migration_edge(&root, &vault_a, &registry, &happy_slots[1], &corpus)?;
     legacy_migration_edge(&root, &vault_a, &registry, &happy_slots[2], &corpus)?;
+    legacy_identity_refusal_edge(&root, &vault_a, &registry, &happy_slots[0], &corpus)?;
     wrong_context_edge(&vault_a, &registry, &happy_slots[0])?;
     current_metadata_edge(&vault_a, &happy_slots[0])?;
     corruption_edge(&root, &vault_a, &registry, &happy_slots[0])?;
@@ -2490,6 +2543,182 @@ fn legacy_refusal_edge(
     Ok(())
 }
 
+fn legacy_identity_refusal_edge(
+    root: &Path,
+    valid_source_directory: &Path,
+    registry: &Registry,
+    registered: &RegisteredSlot,
+    corpus: &Corpus,
+) -> AnyResult<()> {
+    // The pinned legacy-identity golden is the tq25/dim128 geometry only.
+    let raw_dim = match registered.slot.shape {
+        SlotShape::Dense(dim) => dim,
+        _ => return Err(failure("legacy identity edge requires a dense slot").into()),
+    };
+    let stored_dim = stored_dim_for(registry, registered)?;
+    require(
+        registered.bits_per_channel_x2 == 5 && raw_dim == 128 && stored_dim == 128,
+        "legacy identity refusal edge is pinned to the tq25/dim128 geometry",
+    )?;
+
+    let directory = root.join(format!(
+        "legacy-v1-identity-refusal-slot-{}",
+        registered.slot.slot_id.get()
+    ));
+    copy_tree(valid_source_directory, &directory)?;
+    let writer = open_writer(&directory)?;
+    let slot_id = registered.slot.slot_id;
+    let injection_base_seq = writer.latest_seq();
+    let raw = writer.scan_cf_at(injection_base_seq, ColumnFamily::slot_raw(slot_id))?;
+    let manifest_key = compression_manifest_key(slot_id);
+
+    // Decode the pinned pre-#570 legacy-identity primary column and confirm it is
+    // the exact immutable golden (seed derives from the historical v1 identity).
+    let legacy_primary_by_key = LEGACY_V1_IDENTITY_TQ25_128_ROWS
+        .iter()
+        .map(|(key, value)| Ok((decode_hex(key)?, decode_hex(value)?)))
+        .collect::<AnyResult<BTreeMap<_, _>>>()?;
+    require(
+        digest_map(&legacy_primary_by_key) == LEGACY_V1_IDENTITY_TQ25_128_SHA256,
+        "legacy-identity golden digest differs from the pinned pre-#570 source",
+    )?;
+    let persisted_keys = writer
+        .scan_cf_at(injection_base_seq, ColumnFamily::slot(slot_id))?
+        .iter()
+        .map(|(key, _)| key.clone())
+        .collect::<BTreeSet<_>>();
+    require(
+        persisted_keys
+            == legacy_primary_by_key
+                .keys()
+                .cloned()
+                .collect::<BTreeSet<_>>(),
+        "legacy-identity golden keyset differs from the persisted source column",
+    )?;
+    let pinned_first = {
+        let (first_key, first_value) = legacy_primary_by_key
+            .iter()
+            .next()
+            .ok_or_else(|| failure("legacy-identity golden has no rows"))?;
+        parse_legacy_fixture_row(first_key, first_value)?
+    };
+    let legacy_seed_id = hex(&pinned_first.qv.seed_id);
+    let legacy_primary = legacy_primary_by_key.into_iter().collect::<Vec<_>>();
+
+    let injection_seq =
+        reconstruct_legacy_generation(&writer, slot_id, &legacy_primary, &raw, injection_base_seq)?;
+    writer.flush()?;
+    require(
+        writer
+            .read_cf_at(injection_seq, ColumnFamily::Compression, &manifest_key)?
+            .is_none(),
+        "legacy-identity refusal fixture still exposes a generation manifest",
+    )?;
+    require(
+        writer
+            .scan_cf_at(injection_seq, ColumnFamily::slot(slot_id))?
+            .iter()
+            .all(|(_, bytes)| bytes.get(1).copied() == Some(2)),
+        "legacy-identity fixture does not contain only v2 envelopes",
+    )?;
+    drop(writer);
+
+    let writer = open_writer(&directory)?;
+    require(
+        writer.latest_seq() == injection_seq,
+        "reopened legacy-identity fixture lost its injected state",
+    )?;
+    let before = logical_state(&writer, injection_seq, std::slice::from_ref(registered))?;
+    log(json!({
+        "event": "edge_legacy_v1_identity_refusal_before",
+        "seq": injection_seq,
+        "outer_version": 2,
+        "inner_version": 1,
+        "raw_dim": raw_dim,
+        "stored_dim": stored_dim,
+        "persisted_legacy_seed_id": legacy_seed_id,
+        "golden_identity": "pre-570-v1-modality-blind",
+        "historical_writer_commit": LEGACY_WRITER_COMMIT,
+        "historical_writer_sources": LEGACY_WRITER_SOURCE_BLOBS.iter().map(
+            |(path, git_blob, sha256)| json!({
+                "path": path,
+                "git_blob": git_blob,
+                "sha256": sha256,
+            }),
+        ).collect::<Vec<_>>(),
+        "pinned_golden_sha256": LEGACY_V1_IDENTITY_TQ25_128_SHA256,
+        "reconstruction_ingress": "commit_legacy_generation_reconstruction_if_seq",
+        "state": before,
+    }));
+
+    let rows = corpus
+        .rows_by_slot
+        .get(&slot_id)
+        .ok_or_else(|| failure("legacy identity refusal source rows missing"))?;
+    let query = corpus
+        .queries_by_slot
+        .get(&slot_id)
+        .ok_or_else(|| failure("legacy identity refusal query missing"))?;
+    let error = expect_calyx_error(registry.write_compressed_slot_batch(
+        &writer,
+        &registered.slot,
+        rows,
+        std::slice::from_ref(query),
+        1,
+    ))?;
+    require(
+        error.code == "CALYX_LENS_FROZEN_VIOLATION",
+        format!(
+            "legacy-identity refusal used the wrong error code: {} ({})",
+            error.code, error.message
+        ),
+    )?;
+    require(
+        error
+            .message
+            .contains("derives from the pre-#570 (v1, modality-blind) lens identity"),
+        format!(
+            "legacy-identity refusal did not name the identity-version mismatch: {}",
+            error.message
+        ),
+    )?;
+    require(
+        error.message.contains("re-commissioning/re-ingesting"),
+        format!(
+            "legacy-identity refusal did not carry the migration remediation: {}",
+            error.message
+        ),
+    )?;
+    require(
+        error.message.contains(&legacy_seed_id),
+        format!(
+            "legacy-identity refusal did not echo the persisted legacy seed: {}",
+            error.message
+        ),
+    )?;
+    let after_seq = writer.latest_seq();
+    let after = logical_state(&writer, after_seq, std::slice::from_ref(registered))?;
+    require(
+        after_seq == injection_seq,
+        "legacy-identity refusal advanced durable seq",
+    )?;
+    require(
+        before == after,
+        "legacy-identity refusal mutated durable state",
+    )?;
+    log(json!({
+        "event": "edge_legacy_v1_identity_refusal_after",
+        "trigger_error": calyx_error_json(&error),
+        "seq": after_seq,
+        "state": after,
+        "physical": physical_json(&physical_digest(&directory)?),
+        "mutation": false,
+    }));
+    drop(writer);
+    Ok(())
+}
+
+
 fn domain_digest(
     domain: &[u8],
     prefix: &[u8],
@@ -3301,6 +3530,24 @@ fn cx_id_from_key(key: &[u8]) -> AnyResult<CxId> {
         .map_err(|_| failure(format!("slot key has {} bytes, expected 16", key.len())))?;
     Ok(CxId::from_bytes(bytes))
 }
+
+fn decode_hex(value: &str) -> AnyResult<Vec<u8>> {
+    require(
+        value.len() % 2 == 0,
+        format!("hex input has odd length {}", value.len()),
+    )?;
+    (0..value.len())
+        .step_by(2)
+        .map(|offset| {
+            u8::from_str_radix(&value[offset..offset + 2], 16).map_err(|error| {
+                failure(format!(
+                    "invalid hexadecimal byte at character offset {offset}: {error}"
+                ))
+            })
+        })
+        .collect()
+}
+
 
 fn decode_hex_32(value: &str) -> AnyResult<[u8; 32]> {
     require(value.len() == 64, "seed id hex length is not 64")?;

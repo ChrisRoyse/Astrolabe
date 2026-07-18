@@ -284,6 +284,37 @@ impl FrozenLensContract {
             self.norm.fingerprint()
         )
     }
+
+    /// Reconstructs the pre-#570 (legacy v1, modality-blind) [`LensId`] this
+    /// contract would have hashed to before modality was bound into identity.
+    ///
+    /// This exists ONLY so a fail-closed migration/diagnostic path can detect
+    /// that a persisted key or codec seed derives from the historical identity
+    /// and report the identity-version mismatch precisely (rather than as a
+    /// generic content mismatch). It is never used to register, accept, or
+    /// reinterpret a lens under the legacy identity — #570's only migration is
+    /// re-commission/re-ingest under the current v2 identity.
+    pub fn legacy_v1_lens_id(&self) -> LensId {
+        let fingerprint = self.legacy_v1_identity_fingerprint();
+        LensId::from_parts(
+            &self.name,
+            &self.weights_sha256,
+            &self.corpus_hash,
+            fingerprint.as_bytes(),
+        )
+    }
+
+    /// The exact pre-#570 (v1) identity fingerprint string: no version prefix
+    /// and no modality term. Frozen historical constant — reproduced verbatim
+    /// so a legacy id/seed can be recomputed for diagnosis. Must never change.
+    fn legacy_v1_identity_fingerprint(&self) -> String {
+        format!(
+            "dtype={};shape={};norm={}",
+            self.dtype.as_str(),
+            shape_fingerprint(self.shape),
+            self.norm.fingerprint()
+        )
+    }
 }
 
 /// Computes a length-delimited SHA-256 digest for contract fields.
