@@ -1,6 +1,6 @@
 use super::{AsterVault, durable, encode, ledger_hook};
 use crate::cf::ColumnFamily;
-use calyx_core::{CalyxError, Clock, LedgerRef, Result, Seq};
+use calyx_core::{CalyxError, Clock, CxId, LedgerRef, Result, Seq};
 use calyx_ledger::{ActorId, EntryKind, SubjectId};
 
 impl<C> AsterVault<C>
@@ -109,14 +109,29 @@ fn staged_ledger_ref(staged: &[calyx_ledger::StagedLedgerRow]) -> Result<calyx_c
 
 fn attach_ledger_ref_to_rows(rows: &mut [encode::WriteRow], ledger_ref: &LedgerRef) -> Result<()> {
     for row in rows.iter_mut().filter(|row| row.cf == ColumnFamily::Base) {
-        let mut constellation = encode::decode_constellation_base(&row.value)?;
-        constellation.provenance = ledger_ref.clone();
-        row.value = encode::encode_constellation_base(&constellation)?;
+        // Stamp the ledger ref through the lossless BaseRecord so the immutable
+        // per-slot BLAKE3 hashes staged by the caller survive this rewrite
+        // byte-for-byte; a decode -> encode_constellation_base round-trip would
+        // replace them with placeholder-slot hashes.
+        let key_cx_id = base_row_cx_id(&row.key)?;
+        let mut record = encode::BaseRecord::decode_for_key(key_cx_id, &row.value)?;
+        record.set_provenance(ledger_ref.clone());
+        row.value = record.encode()?;
     }
     for row in rows.iter_mut().filter(|row| row.cf == ColumnFamily::Graph) {
         attach_ledger_ref_to_graph_json_row(row, ledger_ref)?;
     }
     Ok(())
+}
+
+fn base_row_cx_id(key: &[u8]) -> Result<CxId> {
+    let bytes: [u8; 16] = key.try_into().map_err(|_| {
+        CalyxError::aster_corrupt_shard(format!(
+            "Base CF key is {} bytes, not a 16-byte CxId",
+            key.len()
+        ))
+    })?;
+    Ok(CxId::from_bytes(bytes))
 }
 
 fn attach_ledger_ref_to_graph_json_row(
