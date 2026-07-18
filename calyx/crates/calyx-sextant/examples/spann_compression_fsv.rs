@@ -24,6 +24,9 @@ fn main() {
         [_, mode, root, report] if mode == "codec-edges" => {
             codec_edges(Path::new(root), Path::new(report))
         }
+        [_, mode, root, report] if mode == "routing-edges" => {
+            routing_edges(Path::new(root), Path::new(report))
+        }
         [_, mode, root, ready, release, report] if mode == "hold-open" => hold_open(
             Path::new(root),
             Path::new(ready),
@@ -31,7 +34,7 @@ fn main() {
             Path::new(report),
         ),
         _ => Err(driver_error(
-            "usage: spann_compression_fsv <build|open|empty|maximum|update|codec-edges> <store-root> <report.json> OR hold-open <store-root> <ready.json> <release.signal> <report.json>",
+            "usage: spann_compression_fsv <build|open|empty|maximum|update|codec-edges|routing-edges> <store-root> <report.json> OR hold-open <store-root> <ready.json> <release.signal> <report.json>",
         )),
     };
     match result {
@@ -342,6 +345,71 @@ fn codec_edges(root: &Path, report_path: &Path) -> Result<Value, CalyxError> {
         "before": before,
         "after": after,
         "outcomes": outcomes,
+    });
+    write_report(report_path, &report)?;
+    Ok(report)
+}
+
+fn routing_edges(root: &Path, report_path: &Path) -> Result<Value, CalyxError> {
+    require_absent(root)?;
+    fs::create_dir_all(root).map_err(|error| io_error("create routing edge store", error))?;
+    let query = dense_known(0, 0);
+    write_report(
+        &root.join("routing-inputs.json"),
+        &json!({
+            "query": query,
+            "n_probe": 2,
+            "expected_nearest": 0,
+        }),
+    )?;
+    let before = filesystem_state(root)?;
+    let centroids = build_known_centroids();
+    let exact = centroids.nearest_centroids_exact_l2(&query, 2)?;
+    let hnsw = centroids.nearest_centroids(&query, 2)?;
+    let raw_l2_graph = centroids.nearest_centroids_raw_l2_graph(&query, 2)?;
+    if exact.len() != 2
+        || hnsw.len() != 2
+        || raw_l2_graph.len() != 2
+        || exact.first() != Some(&0)
+        || hnsw.first() != Some(&0)
+        || raw_l2_graph.first() != Some(&0)
+    {
+        return Err(driver_error(
+            "valid centroid routes differ from the known squared-L2 result",
+        ));
+    }
+    let wrong_dim = centroids
+        .nearest_centroids(&query[..query.len() - 1], 1)
+        .expect_err("wrong-dimension route must fail closed");
+    let zero_probe = centroids
+        .nearest_centroids_exact_l2(&query, 0)
+        .expect_err("zero-probe route must fail closed");
+    let mut non_finite_query = query.clone();
+    non_finite_query[0] = f32::NAN;
+    let non_finite = centroids
+        .nearest_centroids_raw_l2_graph(&non_finite_query, 1)
+        .expect_err("non-finite route must fail closed");
+    let after = filesystem_state(root)?;
+    if before != after {
+        return Err(driver_error(
+            "read-only centroid routing mutated the persisted input state",
+        ));
+    }
+    let report = json!({
+        "status": "ok",
+        "mode": "routing-edges",
+        "before": before,
+        "after": after,
+        "valid": {
+            "exact": exact,
+            "hnsw": hnsw,
+            "raw_l2_graph": raw_l2_graph,
+        },
+        "errors": {
+            "wrong_dim": error_json(&wrong_dim),
+            "zero_probe": error_json(&zero_probe),
+            "non_finite": error_json(&non_finite),
+        },
     });
     write_report(report_path, &report)?;
     Ok(report)
