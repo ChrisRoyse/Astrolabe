@@ -255,6 +255,15 @@ where
         self.clock.now()
     }
 
+    /// Filesystem root of the durable store, or `None` for a volatile vault.
+    ///
+    /// Crate-internal: erase-intent persistence (issue #561) addresses the
+    /// durable intent record under this root. Volatile vaults have no root and
+    /// skip intent persistence — nothing survives a crash there by construction.
+    pub(crate) fn durable_root(&self) -> Option<&Path> {
+        self.durable.as_ref().map(DurableVault::root)
+    }
+
     pub fn dedup_policy(&self) -> &DedupPolicy {
         &self.dedup_policy
     }
