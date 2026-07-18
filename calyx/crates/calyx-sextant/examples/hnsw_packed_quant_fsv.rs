@@ -44,7 +44,7 @@ const POINTER_HEADER_BYTES: usize = 144;
 const TURBOQUANT_SEED: &[u8] = b"calyx/sextant/hnsw/slot-7/turboquant/fsv-v1";
 const ANNEAL_VAULT_ID: &str = "01J00000000000000000000553";
 const ANNEAL_VAULT_SALT: &[u8] = b"calyx-553-anneal-fsv";
-const ADMISSION_ROWS: usize = 64;
+const ADMISSION_ROWS: usize = 32;
 const ADMISSION_SAMPLES: usize = 64;
 const ADMISSION_DIM: usize = HNSW_MAX_DIM as usize;
 const ADMISSION_K: usize = 1;
@@ -511,7 +511,7 @@ fn build_admission_fixture(run_dir: &Path) -> Result<AdmissionFixture, Box<dyn s
         return Err("admission artifacts did not independently reread as measured".into());
     }
     println!(
-        "{{\"event\":\"anneal_admission_measurement\",\"corpus\":\"64 deterministic 4096-D one-hot records with eight strict-mixture queries\",\"rows\":{},\"heldout_queries\":{},\"k\":{},\"f32_recall\":{:.3},\"scalar8_recall\":{:.3},\"f32_p99_ns\":{},\"scalar8_p99_ns\":{},\"f32_mean_cosine_error\":{:.9},\"f32_max_cosine_error\":{:.9},\"scalar8_mean_cosine_error\":{:.9},\"scalar8_max_cosine_error\":{:.9},\"accepted_max_cosine_error\":{:.3},\"f32_far\":{:.6},\"scalar8_far\":{:.6},\"f32_artifact_bytes\":{},\"scalar8_artifact_bytes\":{},\"scalar8_packed_bytes\":{}}}",
+        "{{\"event\":\"anneal_admission_measurement\",\"corpus\":\"32 deterministic 4096-D unit-circle records with eight strict off-row queries\",\"rows\":{},\"heldout_queries\":{},\"k\":{},\"f32_recall\":{:.3},\"scalar8_recall\":{:.3},\"f32_p99_ns\":{},\"scalar8_p99_ns\":{},\"f32_mean_cosine_error\":{:.9},\"f32_max_cosine_error\":{:.9},\"scalar8_mean_cosine_error\":{:.9},\"scalar8_max_cosine_error\":{:.9},\"accepted_max_cosine_error\":{:.3},\"f32_far\":{:.6},\"scalar8_far\":{:.6},\"f32_artifact_bytes\":{},\"scalar8_artifact_bytes\":{},\"scalar8_packed_bytes\":{}}}",
         ADMISSION_ROWS,
         queries.len(),
         ADMISSION_K,
@@ -629,7 +629,10 @@ fn admission_rows() -> Vec<Vec<f32>> {
     (0..ADMISSION_ROWS)
         .map(|ordinal| {
             let mut row = vec![0.0_f32; ADMISSION_DIM];
-            row[ordinal] = 1.0;
+            let angle = std::f32::consts::TAU * ordinal as f32 / ADMISSION_ROWS as f32;
+            let (sin, cos) = angle.sin_cos();
+            row[0] = cos;
+            row[1] = sin;
             row
         })
         .collect()
@@ -639,10 +642,11 @@ fn admission_queries() -> Vec<Vec<f32>> {
     (0..QUERIES)
         .map(|query_ordinal| {
             let mut query = vec![0.0_f32; ADMISSION_DIM];
-            for rank in 0..ADMISSION_ROWS {
-                let ordinal = (rank + query_ordinal * 7) % ADMISSION_ROWS;
-                query[ordinal] = 1.0 / (rank + 1) as f32;
-            }
+            let position = query_ordinal as f32 * (ADMISSION_ROWS / QUERIES) as f32 + 0.20;
+            let angle = std::f32::consts::TAU * position / ADMISSION_ROWS as f32;
+            let (sin, cos) = angle.sin_cos();
+            query[0] = cos;
+            query[1] = sin;
             query
         })
         .collect()
