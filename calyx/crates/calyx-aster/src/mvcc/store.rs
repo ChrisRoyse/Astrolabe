@@ -569,7 +569,26 @@ impl VersionedCfStore {
             .into_iter()
             .map(|(cf, key, value)| (cf, key.into(), value.into()))
             .collect();
-        self.commit_batch_inner(None, rows)
+        self.commit_batch_inner(None, rows, false)
+    }
+
+    /// Applies one write group to the live MVCC memtable WITHOUT the in-commit
+    /// compression-generation guard. Reserved for legacy-generation reconstruction
+    /// (see `AsterVault::commit_legacy_generation_reconstruction_if_seq`), whose
+    /// dedicated ingress fail-closed-validates the legacy shape before any commit
+    /// and whose durably-appended WAL batch this call must mirror into MVCC even
+    /// though the manifested-regime guard would refuse the unmanifested shape.
+    pub(crate) fn commit_batch_unguarded<I, K, V>(&self, rows: I) -> Result<Seq>
+    where
+        I: IntoIterator<Item = (ColumnFamily, K, V)>,
+        K: Into<Vec<u8>>,
+        V: Into<Vec<u8>>,
+    {
+        let rows = rows
+            .into_iter()
+            .map(|(cf, key, value)| (cf, key.into(), value.into()))
+            .collect();
+        self.commit_batch_inner(None, rows, true)
     }
 
     /// Atomically commits one write group only when the current sequence still
@@ -584,13 +603,14 @@ impl VersionedCfStore {
             .into_iter()
             .map(|(cf, key, value)| (cf, key.into(), value.into()))
             .collect();
-        self.commit_batch_inner(Some(expected_seq), rows)
+        self.commit_batch_inner(Some(expected_seq), rows, false)
     }
 
     fn commit_batch_inner(
         &self,
         expected_seq: Option<Seq>,
         rows: Vec<(ColumnFamily, Vec<u8>, Vec<u8>)>,
+        skip_compression_guard: bool,
     ) -> Result<Seq> {
         if rows.is_empty() {
             let current = self.current_seq();
@@ -609,11 +629,13 @@ impl VersionedCfStore {
         {
             return Err(sequence_conflict(expected, current));
         }
-        let borrowed: Vec<CompressionGuardRow<'_>> = rows
-            .iter()
-            .map(|(cf, key, value)| (*cf, key.as_slice(), value.as_slice()))
-            .collect();
-        validate_compression_writes(&table, current, &borrowed)?;
+        if !skip_compression_guard {
+            let borrowed: Vec<CompressionGuardRow<'_>> = rows
+                .iter()
+                .map(|(cf, key, value)| (*cf, key.as_slice(), value.as_slice()))
+                .collect();
+            validate_compression_writes(&table, current, &borrowed)?;
+        }
         if let Some(router) = self.router.write().expect("mvcc router poisoned").as_mut() {
             // Rows written here belong to the seq allocated below (current + 1,
             // exact because all allocations happen under the row write lock

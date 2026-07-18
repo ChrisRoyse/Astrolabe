@@ -41,7 +41,7 @@ where
                 bind.stop("ledger_bind", data_row_count, 0);
                 // Ownership handed straight to the commit path: no full-batch copy
                 // to append the time-index row (#444 lever).
-                let seq = self.commit_rows_locked_owned(rows)?;
+                let seq = self.commit_rows_locked_owned(rows, false)?;
                 ledger_hook::commit_staged(&mut hook, &staged)?;
                 return Ok(seq);
             }
@@ -58,7 +58,7 @@ where
             attach_ledger_ref_to_rows(&mut data_rows, &ledger_ref)?;
             rows.extend(data_rows);
             bind.stop("ledger_bind", data_row_count, 0);
-            let seq = self.commit_rows_locked_owned(rows)?;
+            let seq = self.commit_rows_locked_owned(rows, false)?;
             ledger_hook::commit_staged(hook, &staged)?;
             Ok(seq)
         })

@@ -101,7 +101,74 @@ where
         // owned path is byte-identical — the copy is simply hoisted to the caller
         // boundary, and the hot import path (`write_cf_batch_with_ledger_entry`)
         // that already owns its `Vec` skips it entirely via `_owned` (#444).
-        self.commit_rows_locked_owned(rows.to_vec())
+        self.commit_rows_locked_owned(rows.to_vec(), false)
+    }
+
+    /// Adversarial / historical persisted-state injection for one compressed slot
+    /// column, skipping the compression-generation admission guard. It exists so
+    /// migration tooling and FSV drivers can stage two persisted states that the
+    /// lawful guard deliberately refuses to synthesize through `write_cf_batch*`:
+    ///
+    /// * **legacy reconstruction** — the exact unmanifested, un-lifecycled
+    ///   compressed column a pre-#562 binary wrote and that WAL recovery replays
+    ///   unguarded (tombstone the manifest and its lifecycle records); the
+    ///   `Migrate` transition (`Registry::write_compressed_slot_batch`) is the
+    ///   production surface that upgrades it; and
+    /// * **in-place persisted corruption** — a byte-tampered compressed row in an
+    ///   already-manifested generation, used to prove the index's cryptographic
+    ///   generation-root verification detects on-disk corruption (leave the
+    ///   manifest untouched).
+    ///
+    /// This is NOT a lawful application write path. It is fail-closed by its own
+    /// contract on `rows`, checked BEFORE any commit, so it can never publish a
+    /// manifest or lifecycle record and therefore can never forge a manifested
+    /// generation (that remains the lawful lifecycle guard's exclusive right):
+    ///
+    /// * every row targets exactly one slot;
+    /// * the `Compression` CF carries tombstones ONLY (an existing manifest and/or
+    ///   its append-only lifecycle records may be torn down; a manifest put or a
+    ///   lifecycle-record put is refused);
+    /// * every quantized primary row is a compressed-tagged put, every raw row is a
+    ///   put, and the primary and raw key sets are identical and non-empty;
+    /// * no other column family and no primary/raw tombstone appears.
+    ///
+    /// Durable-only and seq-conditional, mirroring
+    /// [`AsterVault::write_cf_batch_if_seq`]: it observes `expected_seq` under the
+    /// durable commit lock and fails closed on divergence.
+    pub fn commit_generation_injection_if_seq(
+        &self,
+        expected_seq: Seq,
+        rows: impl IntoIterator<Item = (ColumnFamily, Vec<u8>, Vec<u8>)>,
+    ) -> Result<Seq> {
+        let rows = rows
+            .into_iter()
+            .map(|(cf, key, value)| encode::WriteRow { cf, key, value })
+            .collect::<Vec<_>>();
+        validate_generation_injection_shape(&rows)?;
+        if self.durable.is_none() {
+            return Err(CalyxError {
+                code: "CALYX_ASTER_GENERATION_INJECTION_DURABLE_ONLY",
+                message:
+                    "generation-state injection requires a durable vault so the injected on-disk state persists across reopen"
+                        .to_string(),
+                remediation:
+                    "open the target vault as a durable AsterVault before injecting a legacy or corrupted generation fixture",
+            });
+        }
+        self.with_durable_commit_lock(|| {
+            let current_seq = self.latest_seq();
+            if current_seq != expected_seq {
+                return Err(CalyxError {
+                    code: "CALYX_ASTER_SEQUENCE_CONFLICT",
+                    message: format!(
+                        "generation-state injection expected seq {expected_seq}, current seq is {current_seq}; no rows were written"
+                    ),
+                    remediation:
+                        "re-read the current snapshot, rebuild the injection batch, and retry with that exact sequence",
+                });
+            }
+            self.commit_rows_locked_owned(rows.clone(), true)
+        })
     }
 
     pub(crate) fn commit_rows_if_current_volatile(
@@ -150,10 +217,14 @@ where
     /// import write time and every full-batch copy in that path is linear in
     /// rows). Byte-equivalence is structural, not incidental: `commit_prepared_rows`
     /// observes the same slice contents either way.
-    pub(crate) fn commit_rows_locked_owned(&self, mut rows: Vec<encode::WriteRow>) -> Result<Seq> {
+    pub(crate) fn commit_rows_locked_owned(
+        &self,
+        mut rows: Vec<encode::WriteRow>,
+        skip_compression_guard: bool,
+    ) -> Result<Seq> {
         if rows.is_empty() {
             // Empty commit: do not advance the seq or stamp a time-index entry.
-            return self.commit_prepared_rows(&rows);
+            return self.commit_prepared_rows(&rows, skip_compression_guard);
         }
         // Time-travel (PH72 T04): stamp this group-commit with one time-index
         // entry in the SAME batch as the data, so the (millis -> seqno) mapping
@@ -164,7 +235,7 @@ where
         let predicted = self.rows.current_seq().saturating_add(1);
         let (cf, key, value) = crate::timetravel::entry_row(self.clock.now(), predicted);
         rows.push(encode::WriteRow { cf, key, value });
-        let committed = self.commit_prepared_rows(&rows)?;
+        let committed = self.commit_prepared_rows(&rows, skip_compression_guard)?;
         if committed != predicted {
             return Err(CalyxError::aster_corrupt_shard(format!(
                 "time-index seqno prediction {predicted} diverged from committed seq {committed}"
@@ -173,7 +244,11 @@ where
         Ok(committed)
     }
 
-    fn commit_prepared_rows(&self, rows: &[encode::WriteRow]) -> Result<Seq> {
+    fn commit_prepared_rows(
+        &self,
+        rows: &[encode::WriteRow],
+        skip_compression_guard: bool,
+    ) -> Result<Seq> {
         let row_count = rows.len();
         if !rows.is_empty() {
             self.ensure_writeable("commit")?;
@@ -189,14 +264,25 @@ where
         // refused batch never becomes durable and the post-WAL reconciliation
         // arm below can never persist it. Runs under the durable commit lock, so
         // the visible state is stable through the subsequent commit.
-        let compression_admission: Vec<(ColumnFamily, &[u8], &[u8])> = rows
-            .iter()
-            .map(|row| (row.cf, row.key.as_slice(), row.value.as_slice()))
-            .collect();
-        self.rows.validate_batch_admission(&compression_admission)?;
+        //
+        // The one exception is legacy-generation reconstruction (see
+        // [`AsterVault::commit_legacy_generation_reconstruction_if_seq`]): it
+        // synthesizes the exact pre-#562 on-disk shape (compressed primary rows
+        // with a raw sidecar and NO manifest) that a lawful pre-lifecycle binary
+        // wrote and that WAL recovery replays unguarded. That ingress does its own
+        // fail-closed legacy-shape validation before reaching here, so the
+        // manifested-regime admission guard — which by design refuses to
+        // synthesize an unmanifested compressed column — is skipped for it alone.
+        if !skip_compression_guard {
+            let compression_admission: Vec<(ColumnFamily, &[u8], &[u8])> = rows
+                .iter()
+                .map(|row| (row.cf, row.key.as_slice(), row.value.as_slice()))
+                .collect();
+            self.rows.validate_batch_admission(&compression_admission)?;
+        }
         let Some(durable) = &self.durable else {
             let mvcc = crate::commit_timing::start();
-            let seq = self.commit_rows_to_mvcc(rows);
+            let seq = self.commit_rows_to_mvcc(rows, skip_compression_guard);
             mvcc.stop("mvcc_commit_volatile", row_count, 0);
             return seq;
         };
@@ -222,7 +308,7 @@ where
         #[cfg(any(test, feature = "crash-fsv"))]
         crash_fsv_after_wal_append(durable_seq)?;
         let mvcc = crate::commit_timing::start();
-        let mvcc_result = self.commit_rows_to_mvcc(rows);
+        let mvcc_result = self.commit_rows_to_mvcc(rows, skip_compression_guard);
         mvcc.stop("mvcc_commit", row_count, 0);
         let mvcc_seq = match mvcc_result {
             Ok(seq) => seq,
@@ -254,11 +340,19 @@ where
         Ok(mvcc_seq)
     }
 
-    fn commit_rows_to_mvcc(&self, rows: &[encode::WriteRow]) -> Result<Seq> {
-        self.rows.commit_batch(
-            rows.iter()
-                .map(|row| (row.cf, row.key.clone(), row.value.clone())),
-        )
+    fn commit_rows_to_mvcc(
+        &self,
+        rows: &[encode::WriteRow],
+        skip_compression_guard: bool,
+    ) -> Result<Seq> {
+        let batch = rows
+            .iter()
+            .map(|row| (row.cf, row.key.clone(), row.value.clone()));
+        if skip_compression_guard {
+            self.rows.commit_batch_unguarded(batch)
+        } else {
+            self.rows.commit_batch(batch)
+        }
     }
 
     fn restore_committed_rows(&self, seq: Seq, rows: &[encode::WriteRow]) -> Result<()> {
@@ -296,6 +390,130 @@ fn reconciliation_outcome(result: &Result<()>) -> String {
     match result {
         Ok(()) => "ok".to_string(),
         Err(error) => format!("error[{}]: {}", error.code, error.message),
+    }
+}
+
+/// Fail-closed error code for a batch that does not describe a coherent
+/// generation-state injection.
+pub const CALYX_ASTER_GENERATION_INJECTION_INVALID: &str =
+    "CALYX_ASTER_GENERATION_INJECTION_INVALID";
+
+/// Enforces the generation-injection shape contract on a batch BEFORE it is
+/// committed unguarded (see
+/// [`AsterVault::commit_generation_injection_if_seq`]). The contract guarantees
+/// the batch describes exactly one slot's compressed primary column with a
+/// matching raw sidecar, and that it never publishes a manifest or lifecycle
+/// record — so it can only reconstruct a legacy column, corrupt an existing
+/// generation's rows in place, or tear a generation down, never forge a new
+/// manifested generation.
+fn validate_generation_injection_shape(rows: &[encode::WriteRow]) -> Result<()> {
+    use std::collections::BTreeSet;
+
+    use crate::cf::{COMPRESSED_SLOT_VALUE_TAG, SlotFamilyKind, parse_compression_lifecycle_key};
+    use crate::mvcc::is_tombstone_value;
+    use calyx_core::SlotId;
+
+    if rows.is_empty() {
+        return Err(generation_injection_error(
+            "generation-injection batch is empty".to_string(),
+        ));
+    }
+    let mut slot: Option<SlotId> = None;
+    let mut primary_keys: BTreeSet<Vec<u8>> = BTreeSet::new();
+    let mut raw_keys: BTreeSet<Vec<u8>> = BTreeSet::new();
+    let mut bind_slot = |candidate: SlotId| -> Result<()> {
+        match slot {
+            Some(existing) if existing != candidate => Err(generation_injection_error(format!(
+                "generation-injection batch mixes slots {} and {}; reconstruct one slot per batch",
+                existing.get(),
+                candidate.get()
+            ))),
+            _ => {
+                slot = Some(candidate);
+                Ok(())
+            }
+        }
+    };
+    for row in rows {
+        match row.cf {
+            ColumnFamily::Compression => {
+                if row.key.len() == 2 {
+                    bind_slot(SlotId::new(u16::from_be_bytes([row.key[0], row.key[1]])))?;
+                    if !is_tombstone_value(&row.value) {
+                        return Err(generation_injection_error(
+                            "generation injection may only tombstone a compression manifest, never put one; a manifested generation must be published through the lawful lifecycle API".to_string(),
+                        ));
+                    }
+                } else if let Some((slot_id, _prior)) = parse_compression_lifecycle_key(&row.key) {
+                    bind_slot(slot_id)?;
+                    if !is_tombstone_value(&row.value) {
+                        return Err(generation_injection_error(
+                            "generation injection may only tombstone lifecycle records, never put one".to_string(),
+                        ));
+                    }
+                } else {
+                    return Err(generation_injection_error(format!(
+                        "generation-injection compression key must be a manifest or lifecycle key, got {} bytes",
+                        row.key.len()
+                    )));
+                }
+            }
+            ColumnFamily::Slot { slot: slot_id, kind } => {
+                bind_slot(slot_id)?;
+                if is_tombstone_value(&row.value) {
+                    return Err(generation_injection_error(
+                        "generation injection writes a full slot column; slot-row tombstones are refused".to_string(),
+                    ));
+                }
+                match kind {
+                    SlotFamilyKind::Quantized => {
+                        if row.value.first().copied() != Some(COMPRESSED_SLOT_VALUE_TAG) {
+                            return Err(generation_injection_error(
+                                "generation-injection primary rows must be compressed-tagged envelopes".to_string(),
+                            ));
+                        }
+                        if !primary_keys.insert(row.key.clone()) {
+                            return Err(generation_injection_error(
+                                "generation-injection batch has duplicate primary keys".to_string(),
+                            ));
+                        }
+                    }
+                    SlotFamilyKind::Raw => {
+                        if !raw_keys.insert(row.key.clone()) {
+                            return Err(generation_injection_error(
+                                "generation-injection batch has duplicate raw-sidecar keys".to_string(),
+                            ));
+                        }
+                    }
+                }
+            }
+            other => {
+                return Err(generation_injection_error(format!(
+                    "generation-injection batch touches unrelated column family {other:?}; only one slot's compression, primary, and raw rows are permitted"
+                )));
+            }
+        }
+    }
+    if primary_keys.is_empty() {
+        return Err(generation_injection_error(
+            "generation-injection batch has no compressed primary rows".to_string(),
+        ));
+    }
+    if primary_keys != raw_keys {
+        return Err(generation_injection_error(format!(
+            "generation-injection primary ({}) and raw-sidecar ({}) key sets differ; a legacy column pairs every compressed row with its raw source",
+            primary_keys.len(),
+            raw_keys.len()
+        )));
+    }
+    Ok(())
+}
+
+fn generation_injection_error(message: String) -> CalyxError {
+    CalyxError {
+        code: CALYX_ASTER_GENERATION_INJECTION_INVALID,
+        message,
+        remediation: "stage a single slot's compressed primary column, its matching raw sidecar, and tombstones for any existing manifest/lifecycle records — reconstruction never publishes a manifested generation",
     }
 }
 
