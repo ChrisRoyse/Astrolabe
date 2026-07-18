@@ -351,7 +351,7 @@ fn init_cuda_driver_ordinal(
     #[cfg(windows)]
     match dependency_boundary {
         CudaDependencyBoundary::FullModelRuntime => {
-            crate::cuda_runtime::attest_pinned_cuda_dependencies()?;
+            crate::cuda_runtime::attest_pinned_cuda_driver_dependencies()?;
         }
         CudaDependencyBoundary::NativeKernel => {
             let observed =
@@ -447,7 +447,7 @@ pub fn driver_ordinal_for_pci_bus_id(pci_bus_id: &str) -> Result<u32> {
                 ),
             ));
         }
-        crate::cuda_runtime::attest_pinned_cuda_dependencies()?;
+        crate::cuda_runtime::attest_pinned_cuda_driver_dependencies()?;
         Ok(observed)
     }
 
@@ -585,7 +585,7 @@ pub fn attest_cuda_driver_ordinal(
     }
 
     #[cfg(windows)]
-    crate::cuda_runtime::attest_pinned_cuda_dependencies()?;
+    crate::cuda_runtime::attest_pinned_cuda_driver_dependencies()?;
     Ok(())
 }
 

@@ -9,9 +9,10 @@
     remains open for the complete child lifetime, so Windows refuses artifact mutation,
     rename, and directory cleanup while the real process is running.
 
-    Before returning, it independently reads back the artifact hash, output hashes, process
-    exit, and Git tree state into a durable run record. No CPU fallback, output substitution,
-    retry, or mock behavior exists here.
+    Before returning, it independently reads back the artifact hash, output hashes, the
+    retained Windows process handle's kernel exit code (cross-checked against Process.ExitCode),
+    and Git tree state into a durable run record. No CPU fallback, output substitution, retry,
+    or mock behavior exists here.
 
 .NOTES
     Refs #596, #424, #197. Manual FSV tooling; this is not a test or a gate.
@@ -74,16 +75,40 @@ function String-Sha256([AllowEmptyString()][string]$Value) {
     finally { $hasher.Dispose() }
 }
 
-function Observe-ExitedProcessCode([Diagnostics.Process]$Process) {
+function Observe-ExitedProcessCode(
+    [Diagnostics.Process]$Process,
+    [Microsoft.Win32.SafeHandles.SafeProcessHandle]$RetainedHandle
+) {
     $Process.Refresh()
     if (-not $Process.HasExited) {
         Fail-Astro 'ASTRO_FSV_CHILD_STILL_LIVE' "native child PID $($Process.Id) is still live after the runner wait completed" 'preserve the FSV lock and wait for the exact recorded child to exit naturally'
     }
     try {
-        return [int]$Process.ExitCode
+        [uint32]$kernelCode = [AstroFsvAtomicFile]::ReadTerminatedProcessExitCode($RetainedHandle)
     }
     catch {
-        Fail-Astro 'ASTRO_FSV_CHILD_EXIT_UNREADABLE' "native child PID $($Process.Id) exited, but its exit code could not be read: $($_.Exception.Message)" 'preserve the session and process evidence; repair process-exit observation before rerunning'
+        Fail-Astro 'ASTRO_FSV_CHILD_EXIT_UNREADABLE' "kernel32!GetExitCodeProcess failed for retained native child PID $($Process.Id): $($_.Exception.Message)" 'preserve the session and process handle evidence; repair process-exit observation before rerunning'
+    }
+    $componentSignedCode = $null
+    $componentCode = $null
+    $componentError = $null
+    try {
+        $componentSignedCode = [int32]$Process.ExitCode
+        $componentCode = [BitConverter]::ToUInt32(
+            [BitConverter]::GetBytes($componentSignedCode),
+            0
+        )
+    }
+    catch {
+        $componentError = $_.Exception.Message
+    }
+    return [ordered]@{
+        exit_code = $kernelCode
+        primary_source = 'kernel32!GetExitCodeProcess(retained_process_handle)'
+        process_component_exit_code_signed = $componentSignedCode
+        process_component_exit_code = $componentCode
+        process_component_error = Failure-Text $componentError
+        sources_agree = $null -ne $componentCode -and $componentCode -eq $kernelCode
     }
 }
 
@@ -140,6 +165,7 @@ public static class AstroFsvAtomicFile {
     const uint FILE_SHARE_READ = 0x00000001;
     const uint OPEN_EXISTING = 3;
     const uint FILE_FLAG_BACKUP_SEMANTICS = 0x02000000;
+    const uint STILL_ACTIVE = 259;
 
     [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
     static extern bool MoveFileExW(string existingName, string newName, uint flags);
@@ -147,6 +173,9 @@ public static class AstroFsvAtomicFile {
     [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
     static extern SafeFileHandle CreateFileW(string name, uint access, uint share, IntPtr security,
         uint creation, uint flags, IntPtr template);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    static extern bool GetExitCodeProcess(SafeProcessHandle process, out uint exitCode);
 
     public static void PublishNoClobber(string source, string destination) {
         Move(source, destination, MOVEFILE_WRITE_THROUGH);
@@ -167,6 +196,17 @@ public static class AstroFsvAtomicFile {
         if (handle.IsInvalid)
             throw new Win32Exception(Marshal.GetLastWin32Error(), "open evidence directory lease failed");
         return handle;
+    }
+
+    public static uint ReadTerminatedProcessExitCode(SafeProcessHandle process) {
+        if (process == null || process.IsInvalid || process.IsClosed)
+            throw new InvalidOperationException("retained native process handle is invalid or closed");
+        uint exitCode;
+        if (!GetExitCodeProcess(process, out exitCode))
+            throw new Win32Exception(Marshal.GetLastWin32Error(), "GetExitCodeProcess failed");
+        if (exitCode == STILL_ACTIVE)
+            throw new InvalidOperationException("retained native process handle still reports STILL_ACTIVE");
+        return exitCode;
     }
 }
 '@
@@ -226,7 +266,9 @@ $child = $null
 $childStartedAtUtc = $null
 $childExitedAtUtc = $null
 $childExitCode = $null
+$childExitObservation = $null
 $childExitObservationError = $null
+$childProcessHandle = $null
 $artifact = $null
 $artifactHashBefore = $null
 $receiptFull = $null
@@ -359,6 +401,10 @@ try {
     $argumentLine = (@($arguments | ForEach-Object { ConvertTo-WindowsCommandLineArgument ([string]$_) }) -join ' ')
     $child = Start-Process -FilePath $artifact -ArgumentList $argumentLine -RedirectStandardOutput $StandardOutputPath `
         -RedirectStandardError $StandardErrorPath -WindowStyle Hidden -PassThru
+    $childProcessHandle = $child.SafeHandle
+    if ($null -eq $childProcessHandle -or $childProcessHandle.IsInvalid -or $childProcessHandle.IsClosed) {
+        Fail-Astro 'ASTRO_FSV_CHILD_HANDLE_UNAVAILABLE' "native child PID $($child.Id) did not expose a retained process handle" 'preserve the session and repair native process launch before rerunning'
+    }
     $childStartedAtUtc = [DateTime]::UtcNow.ToString('o')
     $ownedLock = Get-Content -LiteralPath $fsvLockPath -Raw | ConvertFrom-Json
     if ([int]$ownedLock.pid -ne $PID -or [string]$ownedLock.artifact_sha256 -cne $artifactHashBefore) {
@@ -392,7 +438,8 @@ try {
     $child.WaitForExit()
     $child.Refresh()
     $childExitedAtUtc = [DateTime]::UtcNow.ToString('o')
-    $childExitCode = Observe-ExitedProcessCode $child
+    $childExitObservation = Observe-ExitedProcessCode $child $childProcessHandle
+    $childExitCode = [uint32]$childExitObservation.exit_code
 
     $artifactHashAfter = File-Sha256 $artifact
     $receiptHashAfter = File-Sha256 $receiptFull
@@ -407,7 +454,12 @@ try {
         [uint64](Get-Item -LiteralPath $artifact).Length -eq [uint64]$receipt.artifact.bytes
     $receiptStable = $receiptHashBefore -ceq $receiptHashAfter
     $launcherLeaseStable = $launcherLockHashBefore -ceq $launcherLockHashAfter
-    $verdict = if ($childExitCode -eq 0 -and $treeStable -and $artifactStable -and $receiptStable -and $launcherLeaseStable) { 'verified' } else { 'failed' }
+    $verdict = if ($childExitCode -eq 0 -and [bool]$childExitObservation.sources_agree -and
+        $treeStable -and $artifactStable -and $receiptStable -and $launcherLeaseStable) {
+        'verified'
+    } else {
+        'failed'
+    }
     $record = [ordered]@{
         schema = 'astrolabe.native-fsv-run.v1'
         verdict = $verdict
@@ -417,6 +469,7 @@ try {
         process = [ordered]@{
             pid = $child.Id
             exit_code = $childExitCode
+            exit_code_observation = $childExitObservation
             started_at = $childStartedAtUtc
             exited_at = $childExitedAtUtc
             timestamp_basis = 'runner-observed-utc'
@@ -432,7 +485,10 @@ try {
     Write-NewDurableUtf8 $RunRecordPath ($record | ConvertTo-Json -Depth 15)
     $runRecordWritten = $true
     $persistedRecord = Get-Content -LiteralPath $RunRecordPath -Raw | ConvertFrom-Json
-    if ([int]$persistedRecord.process.exit_code -ne $childExitCode -or [string]$persistedRecord.artifact.sha256 -cne $artifactHashAfter) {
+    if ([uint64]$persistedRecord.process.exit_code -ne [uint64]$childExitCode -or
+        [string]$persistedRecord.process.exit_code_observation.primary_source -cne [string]$childExitObservation.primary_source -or
+        [bool]$persistedRecord.process.exit_code_observation.sources_agree -ne [bool]$childExitObservation.sources_agree -or
+        [string]$persistedRecord.artifact.sha256 -cne $artifactHashAfter) {
         Fail-Astro 'ASTRO_FSV_RUN_READBACK_FAILED' 'persisted run record does not match the observed process/artifact state' 'preserve the session and investigate the failed durable write'
     }
     $record | ConvertTo-Json -Depth 15 -Compress | Write-Output
@@ -440,6 +496,9 @@ try {
     if (-not $artifactStable) { Fail-Astro 'ASTRO_FSV_ARTIFACT_DRIFT' 'staged artifact changed during the native FSV run' 'preserve state, identify the writer, rebuild, and rerun' }
     if (-not $receiptStable) { Fail-Astro 'ASTRO_FSV_RECEIPT_DRIFT' 'artifact receipt changed during the native FSV run' 'preserve state, identify the writer, rebuild, and rerun' }
     if (-not $launcherLeaseStable) { Fail-Astro 'ASTRO_FSV_LAUNCHER_LEASE_DRIFT' 'launcher lock changed during the native FSV run' 'discard the evidence and investigate the lease writer' }
+    if (-not [bool]$childExitObservation.sources_agree) {
+        Fail-Astro 'ASTRO_FSV_CHILD_EXIT_OBSERVATION_MISMATCH' "kernel32 exit code $childExitCode disagrees with Process.ExitCode $($childExitObservation.process_component_exit_code) for native child PID $($child.Id)" 'preserve the run record and repair process-component exit observation; never infer success from a disagreeing source'
+    }
     if ($childExitCode -ne 0) { exit 1 }
 }
 catch {
@@ -456,7 +515,10 @@ catch {
                     $childExitedAtUtc = [DateTime]::UtcNow.ToString('o')
                 }
                 if ($null -eq $childExitCode) {
-                    try { $childExitCode = Observe-ExitedProcessCode $child }
+                    try {
+                        $childExitObservation = Observe-ExitedProcessCode $child $childProcessHandle
+                        $childExitCode = [uint32]$childExitObservation.exit_code
+                    }
                     catch { $childExitObservationError = $_.Exception.Message }
                 }
             }
@@ -479,6 +541,7 @@ catch {
                 process = [ordered]@{
                     pid = $child.Id
                     exit_code = $childExitCode
+                    exit_code_observation = $childExitObservation
                     exit_code_observation_error = Failure-Text $childExitObservationError
                     started_at = $childStartedAtUtc
                     exited_at = $childExitedAtUtc

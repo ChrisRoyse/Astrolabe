@@ -177,8 +177,26 @@ enum CudaDeviceRequest {
 }
 
 struct PinnedCudaRuntime {
-    attestation: PinnedCudaRuntimeAttestation,
+    state: Mutex<PinnedCudaRuntimeState>,
     _module_handles: ModuleStack,
+}
+
+struct PinnedCudaRuntimeState {
+    attestation: PinnedCudaRuntimeAttestation,
+    phase: PinnedCudaRuntimePhase,
+    failure: Option<ForgeError>,
+    _driver_store_handles: ModuleStack,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PinnedCudaRuntimePhase {
+    DependenciesInitialized,
+    DriverCompanionsAttested,
+}
+
+struct AttestedModuleSet {
+    modules: Vec<PinnedCudaModuleAttestation>,
+    driver_store_handles: ModuleStack,
 }
 
 struct PinnedRuntimeBoundary {
@@ -421,27 +439,91 @@ pub fn initialize_pinned_cuda_runtime_boundary() -> Result<PinnedCudaRuntimeAtte
 }
 
 pub fn initialize_pinned_cuda_dependencies() -> Result<PinnedCudaRuntimeAttestation> {
-    match CUDA_DEPENDENCIES.get_or_init(initialize_cuda_dependencies) {
-        Ok(runtime) => Ok(runtime.attestation.clone()),
-        Err(error) => Err(error.clone()),
-    }
+    cached_cuda_runtime_attestation()
 }
 
 pub fn attest_pinned_cuda_dependencies() -> Result<PinnedCudaRuntimeAttestation> {
+    cached_cuda_runtime_attestation()
+}
+
+fn cached_cuda_runtime_attestation() -> Result<PinnedCudaRuntimeAttestation> {
     let runtime = match CUDA_DEPENDENCIES.get_or_init(initialize_cuda_dependencies) {
         Ok(runtime) => runtime,
         Err(error) => return Err(error.clone()),
     };
+    let state = runtime.state.lock().map_err(|_| {
+        runtime_error(
+            "CALYX_CUDA_RUNTIME_STATE_POISONED",
+            "the process-global pinned CUDA runtime state mutex was poisoned",
+            "terminate the process, preserve its logs, and restart from the pinned CUDA runtime",
+        )
+    })?;
+    if let Some(error) = &state.failure {
+        return Err(error.clone());
+    }
     // Initialization retained every exact loaded module handle and a read-only
-    // file guard that denies write/delete sharing. Those handles make the
-    // cryptographically verified bytes immutable for this process lifetime,
-    // so ordinary execution attestation is a cached receipt read rather than
-    // a multi-gigabyte rehash on every CUDA synchronization boundary.
-    Ok(runtime.attestation.clone())
+    // file guard that denies write/delete sharing. DriverStore companions are
+    // promoted exactly once after the first real Driver API use and retain
+    // both their loaded-module references and file guards in this state.
+    // Ordinary execution attestation is therefore a cached receipt read, not
+    // a multi-gigabyte per-call rehash.
+    Ok(state.attestation.clone())
+}
+
+/// Commits the one legitimate loaded-module transition after the CUDA Driver
+/// has been exercised. The signed DriverStore companions are independently
+/// verified, their exact module references and file guards are retained
+/// process-wide, and every later call is an O(1) receipt read. A failed
+/// promotion is terminal.
+pub fn attest_pinned_cuda_driver_dependencies() -> Result<PinnedCudaRuntimeAttestation> {
+    let runtime = match CUDA_DEPENDENCIES.get_or_init(initialize_cuda_dependencies) {
+        Ok(runtime) => runtime,
+        Err(error) => return Err(error.clone()),
+    };
+    let boundary = match BOUNDARY.get_or_init(initialize_boundary) {
+        Ok(boundary) => boundary,
+        Err(error) => return Err(error.clone()),
+    };
+    let mut state = runtime.state.lock().map_err(|_| {
+        runtime_error(
+            "CALYX_CUDA_RUNTIME_STATE_POISONED",
+            "the process-global pinned CUDA runtime state mutex was poisoned during DriverStore companion promotion",
+            "terminate the process, preserve its logs, and restart from the pinned CUDA runtime",
+        )
+    })?;
+    if let Some(error) = &state.failure {
+        return Err(error.clone());
+    }
+    if state.phase == PinnedCudaRuntimePhase::DriverCompanionsAttested {
+        return Ok(state.attestation.clone());
+    }
+    let attested = match enumerate_process_modules().and_then(|modules| {
+        attest_modules(
+            &boundary.lock,
+            &boundary.root,
+            &boundary.system32,
+            &modules,
+            true,
+            true,
+            true,
+        )
+    }) {
+        Ok(attested) => attested,
+        Err(error) => {
+            state.failure = Some(error.clone());
+            return Err(error);
+        }
+    };
+    state.attestation.modules = attested.modules;
+    state._driver_store_handles = attested.driver_store_handles;
+    state.phase = PinnedCudaRuntimePhase::DriverCompanionsAttested;
+    Ok(state.attestation.clone())
 }
 
 /// Explicitly re-enumerates and re-hashes the complete pinned CUDA module
-/// closure. This is for operator/readiness audits, not an inference hot path.
+/// closure and compares it with the committed phase receipt. This is for
+/// operator/readiness audits, not an inference hot path. Revalidation never
+/// promotes or rewrites state; any difference is terminal for the process.
 pub fn revalidate_pinned_cuda_dependencies() -> Result<PinnedCudaRuntimeAttestation> {
     let runtime = match CUDA_DEPENDENCIES.get_or_init(initialize_cuda_dependencies) {
         Ok(runtime) => runtime,
@@ -451,23 +533,57 @@ pub fn revalidate_pinned_cuda_dependencies() -> Result<PinnedCudaRuntimeAttestat
         Ok(boundary) => boundary,
         Err(error) => return Err(error.clone()),
     };
-    let mut attestation = runtime.attestation.clone();
-    attestation.modules = attest_modules(
-        &boundary.lock,
-        &boundary.root,
-        &boundary.system32,
-        &enumerate_process_modules()?,
-        true,
-        true,
-        true,
-    )?;
-    Ok(attestation)
+    let mut state = runtime.state.lock().map_err(|_| {
+        runtime_error(
+            "CALYX_CUDA_RUNTIME_STATE_POISONED",
+            "the process-global pinned CUDA runtime state mutex was poisoned during explicit deep revalidation",
+            "terminate the process, preserve its logs, and restart from the pinned CUDA runtime",
+        )
+    })?;
+    if let Some(error) = &state.failure {
+        return Err(error.clone());
+    }
+    let require_driver_store_companions =
+        state.phase == PinnedCudaRuntimePhase::DriverCompanionsAttested;
+    let attested = match enumerate_process_modules().and_then(|modules| {
+        attest_modules(
+            &boundary.lock,
+            &boundary.root,
+            &boundary.system32,
+            &modules,
+            true,
+            require_driver_store_companions,
+            true,
+        )
+    }) {
+        Ok(attested) => attested,
+        Err(error) => {
+            state.failure = Some(error.clone());
+            return Err(error);
+        }
+    };
+    if attested.modules != state.attestation.modules {
+        let error = runtime_error(
+            "CALYX_ONNX_RUNTIME_MODULE_STATE_CHANGED",
+            format!(
+                "explicit CUDA module revalidation differs from the committed {:?} receipt",
+                state.phase
+            ),
+            "terminate the process, preserve both module inventories, and repair the pinned CUDA runtime before retrying",
+        );
+        state.failure = Some(error.clone());
+        return Err(error);
+    }
+    Ok(state.attestation.clone())
 }
 
 /// Select one CUDA Runtime-visible device and pin its physical identity process-wide.
 pub fn select_pinned_cuda_device(runtime_ordinal: u32) -> Result<PinnedCudaDeviceAttestation> {
     initialize_pinned_cuda_dependencies()?;
-    select_pinned_cuda_device_request(CudaDeviceRequest::RuntimeOrdinal(runtime_ordinal))
+    let selected =
+        select_pinned_cuda_device_request(CudaDeviceRequest::RuntimeOrdinal(runtime_ordinal))?;
+    attest_pinned_cuda_driver_dependencies()?;
+    Ok(selected)
 }
 
 /// Selects one device for an embedded native CUDA kernel without initializing
@@ -489,7 +605,10 @@ pub fn select_pinned_cuda_device_by_identity(
     identity: PinnedCudaDeviceIdentity,
 ) -> Result<PinnedCudaDeviceAttestation> {
     initialize_pinned_cuda_dependencies()?;
-    select_pinned_cuda_device_request(CudaDeviceRequest::PhysicalIdentity(identity))
+    let selected =
+        select_pinned_cuda_device_request(CudaDeviceRequest::PhysicalIdentity(identity))?;
+    attest_pinned_cuda_driver_dependencies()?;
+    Ok(selected)
 }
 
 pub fn current_pinned_cuda_device() -> Result<Option<PinnedCudaDeviceAttestation>> {
@@ -517,7 +636,7 @@ pub fn attest_pinned_cuda_driver_identity(
 ) -> Result<u32> {
     initialize_pinned_cuda_dependencies()?;
     let observed = attest_pinned_cuda_driver_identity_inner(expected_identity)?;
-    attest_pinned_cuda_dependencies()?;
+    attest_pinned_cuda_driver_dependencies()?;
     Ok(observed)
 }
 
@@ -1214,7 +1333,8 @@ fn initialize_boundary() -> Result<PinnedRuntimeBoundary> {
         false,
         false,
         false,
-    )?;
+    )?
+    .modules;
     let (ort_managed_modules, ort_managed_file_guards) =
         open_locked_ort_managed_modules(&lock, &root)?;
     let attestation = PinnedCudaRuntimeAttestation {
@@ -1282,7 +1402,7 @@ fn initialize_cuda_dependencies() -> Result<PinnedCudaRuntime> {
         handles.push(load_locked_bundle_library(&boundary.root, file)?);
     }
 
-    let modules = attest_modules(
+    let attested = attest_modules(
         &boundary.lock,
         &boundary.root,
         &boundary.system32,
@@ -1292,9 +1412,14 @@ fn initialize_cuda_dependencies() -> Result<PinnedCudaRuntime> {
         false,
     )?;
     let mut attestation = boundary.attestation.clone();
-    attestation.modules = modules;
+    attestation.modules = attested.modules;
     Ok(PinnedCudaRuntime {
-        attestation,
+        state: Mutex::new(PinnedCudaRuntimeState {
+            attestation,
+            phase: PinnedCudaRuntimePhase::DependenciesInitialized,
+            failure: None,
+            _driver_store_handles: attested.driver_store_handles,
+        }),
         _module_handles: handles,
     })
 }
@@ -1956,7 +2081,7 @@ fn attest_modules(
     // real API calls. Dependency preload accepts absence; post-driver-use refreshes do not.
     require_driver_store_companions: bool,
     allow_ort_managed: bool,
-) -> Result<Vec<PinnedCudaModuleAttestation>> {
+) -> Result<AttestedModuleSet> {
     reject_ambient_modules(
         lock,
         root,
@@ -1996,6 +2121,7 @@ fn attest_modules(
         })
         .collect::<Result<BTreeMap<_, _>>>()?;
     let mut out = Vec::with_capacity(expected.len() + companion_names.len());
+    let mut driver_store_handles = ModuleStack::with_capacity(companion_names.len());
     for (name, required) in expected {
         let candidates = loaded.get(&name).ok_or_else(|| {
             runtime_error(
@@ -2132,6 +2258,12 @@ fn attest_modules(
             let verified =
                 verify_locked_driver_store_companion(system32, policy, &canonical, &owner.1)?;
             let trust = verified.attestation().clone();
+            let retained_handle = load_exact_library(
+                &canonical,
+                ModuleFileGuard::System {
+                    _verified: verified,
+                },
+            )?;
             out.push(PinnedCudaModuleAttestation {
                 name: policy.attestation_name.to_ascii_lowercase(),
                 path: canonical,
@@ -2144,10 +2276,14 @@ fn attest_modules(
                 ),
                 system_trust: Some(trust),
             });
+            driver_store_handles.push(retained_handle);
         }
     }
     out.sort_by(|left, right| left.name.cmp(&right.name));
-    Ok(out)
+    Ok(AttestedModuleSet {
+        modules: out,
+        driver_store_handles,
+    })
 }
 
 fn verify_locked_system_module(
