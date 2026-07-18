@@ -17,6 +17,26 @@ $LockFileName = "ort-cuda13.3-windows-x86_64.lock.json"
 $CanonicalWorkspace = "C:\code\Astrolabe"
 $Utf8NoBom = [System.Text.UTF8Encoding]::new($false)
 
+function Fail-Runtime-Missing-Helper {
+    param([Parameter(Mandatory = $true)][string]$HelperPath)
+    throw "CUDA13_RUNTIME[ASTRO_CUDA13_RETIRE_HELPER_MISSING]: {code=ASTRO_CUDA13_RETIRE_HELPER_MISSING; message=`"required helper script is missing: $HelperPath`"; remediation=`"restore the checked-in scripts/ helper from the repository`"}"
+}
+
+# Fail-closed dot-source of the shared launcher-lock semantics and the obsolete-bundle
+# retirer (#559). Both must exist; a missing helper is a named fail-closed boundary, never a
+# silent skip -- retirement is part of provisioning's contract now that lock revisions leak
+# ~1.8 GB roots per revision into the canonical workspace.
+$LauncherLockHelper = Join-Path $PSScriptRoot 'launcher-lock.ps1'
+if (-not (Test-Path -LiteralPath $LauncherLockHelper -PathType Leaf)) {
+    Fail-Runtime-Missing-Helper $LauncherLockHelper
+}
+. $LauncherLockHelper
+$Cuda13RetireHelper = Join-Path $PSScriptRoot 'cuda13-bundle-retire.ps1'
+if (-not (Test-Path -LiteralPath $Cuda13RetireHelper -PathType Leaf)) {
+    Fail-Runtime-Missing-Helper $Cuda13RetireHelper
+}
+. $Cuda13RetireHelper
+
 function Fail-Runtime {
     param(
         [Parameter(Mandatory = $true)][string]$Code,
@@ -914,6 +934,27 @@ function Remove-OwnedStage {
     Remove-Item -LiteralPath $resolvedStage -Recurse -Force
 }
 
+function Invoke-ObsoleteBundleRetirement {
+    # Retire obsolete sibling bundle roots left by prior lock revisions (#559). This runs ONLY
+    # after the active bundle is fully attested by Verify-Bundle, so a retirement fault can
+    # never compromise the active bundle. A fault is a NAMED stderr degradation, never a
+    # provisioning failure: fail-closed for deletion means nothing gets deleted, and the
+    # active bundle's attestation and the launcher's one-line stdout contract are untouched.
+    param(
+        [Parameter(Mandatory = $true)][string]$Toolchains,
+        [Parameter(Mandatory = $true)]$Lock,
+        [Parameter(Mandatory = $true)][string]$LockSha256,
+        [Parameter(Mandatory = $true)][string]$Workspace
+    )
+
+    try {
+        Remove-AstroObsoleteCudaRuntimeRoots -ToolchainsRoot $Toolchains -RootPrefix $Lock.bundle.root_prefix -ActiveDigest $LockSha256 -WorkspaceRoot $Workspace
+    }
+    catch {
+        [Console]::Error.WriteLine("CUDA13_RETIRE[ASTRO_CUDA13_RETIRE_FAULT]: {code=ASTRO_CUDA13_RETIRE_FAULT; message=`"obsolete-bundle retirement raised an unexpected exception: $($_.Exception.Message)`"; remediation=`"inspect .toolchains for orphaned bundle roots and remove obsolete ones manually if safe`"}")
+    }
+}
+
 $workspace = Get-FullPath $WorkspaceRoot
 if (-not [string]::Equals($workspace, $CanonicalWorkspace, [StringComparison]::OrdinalIgnoreCase)) {
     Fail-Runtime "ASTRO_CUDA13_WORKSPACE" "workspace must be the canonical checkout $CanonicalWorkspace, got $workspace" "run from the canonical Astrolabe checkout"
@@ -960,6 +1001,7 @@ $finalRoot = Join-Path $toolchains ($lock.bundle.root_prefix + '-' + $lockSha256
 
 if (Test-Path -LiteralPath $finalRoot) {
     Verify-Bundle $finalRoot $lock $lockSha256
+    Invoke-ObsoleteBundleRetirement $toolchains $lock $lockSha256 $workspace
     Write-Output (Resolve-Path -LiteralPath $finalRoot).ProviderPath
     return
 }
@@ -988,6 +1030,7 @@ try {
         }
     }
     Verify-Bundle $finalRoot $lock $lockSha256
+    Invoke-ObsoleteBundleRetirement $toolchains $lock $lockSha256 $workspace
     Write-Output (Resolve-Path -LiteralPath $finalRoot).ProviderPath
 }
 finally {
