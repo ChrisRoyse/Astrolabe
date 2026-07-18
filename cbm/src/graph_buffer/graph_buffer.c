@@ -29,6 +29,7 @@ enum {
 #include "foundation/hash_table.h"
 #include "foundation/compat.h"
 #include "foundation/str_util.h" /* cbm_utf8_sanitize — #503 dump UTF-8 write contract */
+#include "foundation/compat_fs.h" /* cbm_unlink — #579 fail-closed torn-dump removal */
 #include "foundation/log.h"
 #include "foundation/dyn_array.h"
 #include "foundation/profile.h"
@@ -1473,6 +1474,21 @@ static CBMDumpNode *build_dump_nodes(cbm_gbuf_t *gb, int live_count, int64_t *te
                                      cbm_gbuf_node_t ***src_out) {
     size_t cap = (size_t)(live_count > 0 ? live_count : SKIP_ONE);
     CBMDumpNode *dump_nodes = malloc(cap * sizeof(CBMDumpNode));
+    if (!dump_nodes) {
+        /* #579: the node dump array is sized to the live node count, so it is one
+         * of the first large allocations to fail under real memory pressure. It is
+         * indexed unconditionally in the loop below, so a NULL here would be a hard
+         * access violation. Fail closed with a structured error and let the caller
+         * abort the dump before any writer opens — no torn store is produced. */
+        cbm_log_error("gbuf.dump.node_alloc_failed", "code", "CBM_DUMP_NODE_ALLOC_FAILED",
+                      "operation", "build_dump_nodes", "detail",
+                      "dump node array allocation failed", "message",
+                      "graph dump could not allocate its node row array", "remediation",
+                      "free memory or reduce the indexed repository size, then retry the index");
+        *out_count = 0;
+        *src_out = NULL;
+        return NULL;
+    }
     /* Parallel gbuf-node pointers so a streamed partition can free its heavy
      * properties_json after the rows are persisted. NULL on OOM disables the
      * per-partition free (the dump still succeeds). */
@@ -1535,10 +1551,28 @@ static CBMDumpEdge *build_dump_edges(cbm_gbuf_t *gb, const int64_t *temp_to_fina
         }
     }
 
-    CBMDumpEdge *dump_edges =
-        malloc((size_t)(valid_edges > 0 ? valid_edges : SKIP_ONE) * sizeof(CBMDumpEdge));
-    char **url_paths = calloc((size_t)(valid_edges > 0 ? valid_edges : SKIP_ONE), sizeof(char *));
-    char **local_names = calloc((size_t)(valid_edges > 0 ? valid_edges : SKIP_ONE), sizeof(char *));
+    size_t edge_cap = (size_t)(valid_edges > 0 ? valid_edges : SKIP_ONE);
+    CBMDumpEdge *dump_edges = malloc(edge_cap * sizeof(CBMDumpEdge));
+    char **url_paths = calloc(edge_cap, sizeof(char *));
+    char **local_names = calloc(edge_cap, sizeof(char *));
+    if (!dump_edges || !url_paths || !local_names) {
+        /* #579: these three arrays are sized to the valid-edge count and indexed
+         * unconditionally in the loop below; any NULL would be a hard access
+         * violation. Fail closed with a structured error and signal the caller
+         * (NULL return, *out_count = 0) so the dump aborts instead of crashing. */
+        free(dump_edges);
+        free(url_paths);
+        free(local_names);
+        cbm_log_error("gbuf.dump.edge_alloc_failed", "code", "CBM_DUMP_EDGE_ALLOC_FAILED",
+                      "operation", "build_dump_edges", "detail",
+                      "paired dump edge arrays allocation failed", "message",
+                      "graph dump could not allocate its edge row arrays", "remediation",
+                      "free memory or reduce the indexed repository size, then retry the index");
+        *out_count = 0;
+        *out_url_paths = NULL;
+        *out_local_names = NULL;
+        return NULL;
+    }
     int idx = 0;
 
     for (int i = 0; i < gb->edges.count; i++) {
@@ -1751,6 +1785,14 @@ int cbm_gbuf_dump_to_sqlite(cbm_gbuf_t *gb, const char *path) {
     CBMDumpNode *dump_nodes =
         build_dump_nodes(gb, live_count, temp_to_final, max_temp_id, &node_idx, &src_nodes);
     CBM_PROF_END_N("dump", "2_build_dump_nodes", t_build_nodes, node_idx);
+    if (!dump_nodes) {
+        /* #579: node dump array allocation failed (structured error already logged
+         * in build_dump_nodes). No writer has opened yet, so the store file is
+         * never created; release the transients and fail closed. */
+        free(src_nodes); /* NULL on this path — build_dump_nodes cleared *src_out */
+        free(temp_to_final);
+        return CBM_NOT_FOUND;
+    }
 
     /* Release ALL lookup indexes NOW: nothing between here and finalize reads
      * them (stream-append uses dump_nodes/src_nodes, build_dump_edges uses
@@ -1775,6 +1817,15 @@ int cbm_gbuf_dump_to_sqlite(cbm_gbuf_t *gb, const char *path) {
         dump_edges =
             build_dump_edges(gb, temp_to_final, max_temp_id, &edge_idx, &url_paths, &local_names);
         CBM_PROF_END_N("dump", "3_build_dump_edges", t_build_edges_sink, edge_idx);
+        if (!dump_edges) {
+            /* #579: edge dump arrays allocation failed (structured error already
+             * logged). No file writer has opened on this row-sink path, so nothing
+             * is persisted; release the transients and fail closed. */
+            free_dump_resources(url_paths, local_names, edge_idx, dump_edges, dump_nodes, node_idx,
+                                temp_to_final);
+            free(src_nodes);
+            return CBM_NOT_FOUND;
+        }
         release_and_remap_vectors(gb, temp_to_final, max_temp_id);
 
         int sink_rc = emit_row_sink_nodes(gb, dump_nodes, node_idx);
@@ -1828,16 +1879,30 @@ int cbm_gbuf_dump_to_sqlite(cbm_gbuf_t *gb, const char *path) {
     }
     CBM_PROF_END_N("dump", "2b_stream_append_nodes", t_append, node_idx);
 
+    bool edge_build_failed = false;
     if (rc == 0 && !has_row_sink) {
         CBM_PROF_START(t_build_edges);
         dump_edges =
             build_dump_edges(gb, temp_to_final, max_temp_id, &edge_idx, &url_paths, &local_names);
         CBM_PROF_END_N("dump", "3_build_dump_edges", t_build_edges, edge_idx);
-        release_and_remap_vectors(gb, temp_to_final, max_temp_id);
+        if (!dump_edges) {
+            /* #579: edge dump arrays allocation failed (structured error already
+             * logged) AFTER node rows were streamed into the open writer. Persisting
+             * a node-only graph would be a silent incomplete dump, so mark the dump
+             * failed and remove the store file below — the store must be absent or
+             * complete, never torn. release_and_remap_vectors is skipped since the
+             * dump is aborting. */
+            edge_build_failed = true;
+            rc = CBM_NOT_FOUND;
+        } else {
+            release_and_remap_vectors(gb, temp_to_final, max_temp_id);
+        }
     }
 
     /* Finalize: nodes-table interior + edges/vectors/metadata/indexes/sqlite_master.
-     * Frees w and closes the file; handles a prior append error cleanly. */
+     * Frees w and closes the file; handles a prior append error cleanly. Always
+     * called so the writer handle is released and the file descriptor closed even
+     * on the edge-build-failed path (the resulting file is unlinked below). */
     CBM_PROF_START(t_finalize);
     int frc = cbm_writer_finalize(w, gb->project, gb->root_path, indexed_at, dump_nodes, node_idx,
                                   dump_edges, edge_idx, gb->dump_vectors, gb->dump_vector_count,
@@ -1845,6 +1910,11 @@ int cbm_gbuf_dump_to_sqlite(cbm_gbuf_t *gb, const char *path) {
     CBM_PROF_END_N("dump", "6_write_db_finalize", t_finalize, node_idx + edge_idx);
     if (rc == 0) {
         rc = frc;
+    }
+    if (edge_build_failed) {
+        /* #579: remove the closed-but-incomplete store so no torn/partial DB is
+         * left behind; the dump fails closed with rc = CBM_NOT_FOUND. */
+        (void)cbm_unlink(path);
     }
 
     log_dump_summary(node_idx, edge_idx);
