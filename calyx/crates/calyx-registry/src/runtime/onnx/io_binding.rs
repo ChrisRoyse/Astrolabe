@@ -48,8 +48,11 @@
 
 use std::collections::BTreeSet;
 
-use calyx_core::RuntimeExecutionAttestation;
-use calyx_core::{CalyxError, Result};
+use calyx_core::{
+    CalyxError, OnnxCommittedSessionPlacementEvidence, OnnxCudaExecutionEvidence,
+    OnnxCudaExecutionEvidenceKind, OnnxFirstInferencePlacementEvidence,
+    OnnxRetainedCudaStreamEvidence, Result, RuntimeExecutionAttestation,
+};
 use ort::memory::{AllocationDevice, AllocatorType, MemoryInfo, MemoryType};
 use ort::session::{RunOptions, Session, SessionInputValue, SessionOutputs};
 use ort::value::Tensor;
@@ -639,17 +642,78 @@ impl OnnxRunPlan {
                     remediation: "use a CUDA-capable fp16/fp32 graph whose every frozen operator has a CUDA kernel; never retry this session or graph on CPU",
                 });
             }
+            let profile_total = u64::try_from(profile.total_nodes).map_err(|_| CalyxError {
+                code: "CALYX_ONNX_PROFILE_COUNT_OVERFLOW",
+                message: format!(
+                    "first-forward profile node count {} for {} exceeds u64",
+                    profile.total_nodes, self.label
+                ),
+                remediation: "preserve the profile and repair the provider-profile count conversion before admitting the session",
+            })?;
+            let profile_cuda = u64::try_from(profile.cuda_nodes).map_err(|_| CalyxError {
+                code: "CALYX_ONNX_PROFILE_COUNT_OVERFLOW",
+                message: format!(
+                    "first-forward CUDA node count {} for {} exceeds u64",
+                    profile.cuda_nodes, self.label
+                ),
+                remediation: "preserve the profile and repair the provider-profile count conversion before admitting the session",
+            })?;
+            let profile_cpu = u64::try_from(profile.cpu_nodes).map_err(|_| CalyxError {
+                code: "CALYX_ONNX_PROFILE_COUNT_OVERFLOW",
+                message: format!(
+                    "first-forward CPU node count {} for {} exceeds u64",
+                    profile.cpu_nodes, self.label
+                ),
+                remediation: "preserve the profile and repair the provider-profile count conversion before admitting the session",
+            })?;
+            let profile_path = snapshot.final_path.to_str().ok_or_else(|| CalyxError {
+                code: "CALYX_ONNX_PROFILE_PATH_INVALID",
+                message: format!(
+                    "first-forward profile path for {} is not valid UTF-8: {}",
+                    self.label,
+                    snapshot.final_path.display()
+                ),
+                remediation: "use a canonical UTF-8 Windows temporary path and rebuild the session; never emit lossy execution evidence",
+            })?;
+            let stream = session.bound_stream().ok_or_else(|| CalyxError {
+                code: "CALYX_ONNX_BOUND_STREAM_MISSING",
+                message: format!(
+                    "first-forward CUDA evidence for {} has no retained execution stream",
+                    self.label
+                ),
+                remediation: "construct the CUDA execution provider with an Astrolabe-owned stream and retain it through the first real synchronized inference",
+            })?;
+            let structured = OnnxCudaExecutionEvidence {
+                kind:
+                    OnnxCudaExecutionEvidenceKind::Api24CommittedSessionAndFirstRealInferenceProfile,
+                retained_stream: OnnxRetainedCudaStreamEvidence {
+                    stream_address: format!("{:p}", stream.stream_ptr()),
+                    driver_ordinal: stream.driver_ordinal(),
+                    physical_device: stream.physical_identity().canonical_execution_token(),
+                },
+                committed_session: OnnxCommittedSessionPlacementEvidence {
+                    total_compute_nodes: self.assignment.total_nodes,
+                    cuda_compute_nodes: self.assignment.cuda_nodes,
+                    cpu_compute_nodes: self.assignment.cpu_nodes,
+                    providers: self.assignment.per_provider.clone(),
+                    assigned_operators: self.assignment.per_provider_operators.clone(),
+                },
+                first_inference_profile: OnnxFirstInferencePlacementEvidence {
+                    total_compute_nodes: profile_total,
+                    cuda_compute_nodes: profile_cuda,
+                    cpu_compute_nodes: profile_cpu,
+                    providers: profile.per_provider.clone(),
+                },
+                profile_path: profile_path.to_string(),
+                profile_sha256: trace_sha256,
+            };
             (
                 format!(
                     "api24={};profile={}",
-                    self.assignment.per_provider, profile.per_provider
+                    structured.committed_session.providers,
+                    structured.first_inference_profile.providers
                 ),
-                format!(
-                    "onnx_api24_committed_session+first_real_host_materialized_retained_stream_synchronized_inference_profile;retained_stream={};assigned_operators={};profile_path={};profile_sha256={trace_sha256}",
-                    self.stream_receipt.as_deref().unwrap_or("missing"),
-                    self.assignment.per_provider_operators,
-                    snapshot.final_path.display()
-                ),
+                super::execution_attestation::serialize_cuda_onnx_execution_evidence(&structured)?,
             )
         } else {
             (

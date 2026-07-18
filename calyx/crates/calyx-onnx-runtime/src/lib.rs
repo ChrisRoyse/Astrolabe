@@ -16,7 +16,7 @@ pub use windows::{
     attest_cuda_provider_after_session, authorize_cpu_companion, available_host_memory_bytes,
     create_cuda_execution_stream, current_runtime_attestation, ensure_runtime,
     expected_runtime_contract, initialize_pinned_cuda_runtime_boundary, open_immutable_directory,
-    selected_cuda_device, snapshot_immutable_file,
+    revalidate_runtime_attestation, selected_cuda_device, snapshot_immutable_file,
 };
 
 /// Requested execution policy for the exact pinned ORT environment.

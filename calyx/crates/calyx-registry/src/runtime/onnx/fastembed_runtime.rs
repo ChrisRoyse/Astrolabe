@@ -133,6 +133,7 @@ fn from_files_with_policy(
     let execution = super::fastembed_attestation::FastembedExecutionState::inspect(
         model.as_ref().session(),
         context,
+        super::green_context::retained_stream_evidence(model.bound_stream()),
     )?;
     let contract = FrozenLensContract::new(
         name,

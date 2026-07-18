@@ -12,6 +12,7 @@ pub use calyx_onnx_runtime::{
     OnnxCudaDeviceAttestation, OnnxLoadedModuleAttestation, OnnxRuntimeArtifactAttestation,
     OnnxRuntimeAttestation, OnnxRuntimeContractAttestation, current_runtime_attestation,
     expected_runtime_contract, initialize_pinned_cuda_runtime_boundary,
+    revalidate_runtime_attestation,
 };
 
 pub(super) fn ensure_runtime(policy: OnnxProviderPolicy) -> Result<PathBuf> {

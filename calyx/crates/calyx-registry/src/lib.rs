@@ -36,6 +36,9 @@ pub use backfill::{
     BackfillBatch, BackfillConfig, BackfillPriority, BackfillRequest, BackfillScheduler,
     BackfillWatermark,
 };
+pub use calyx_aster::compression_lifecycle::{
+    CALYX_COMPRESSION_LIFECYCLE_INVALID, GenerationLifecycleRecord, GenerationTransition,
+};
 pub use calyx_core::{Input, Lens};
 pub use commission::{
     CommissionRequest, CommissionedLens, CommissionedLensArtifact, LensForgeBatchPolicy,
@@ -68,9 +71,6 @@ pub use compression::{
     load_mxfp4_assay_evidence, matryoshka_truncate_renormalize, pack_colbert_matrix, packed_maxsim,
     parse_colbert_matrix, persist_mxfp4_assay_evidence, reject_dense_codec_for_multivector,
     resolve_multivector_storage,
-};
-pub use calyx_aster::compression_lifecycle::{
-    CALYX_COMPRESSION_LIFECYCLE_INVALID, GenerationLifecycleRecord, GenerationTransition,
 };
 pub use drift::{DriftDecision, RuntimeGolden};
 pub use explain::{LensExplanation, explain_lens, explain_lens_from_card};
@@ -143,14 +143,16 @@ pub use runtime::external_cmd::ExternalCmdLens;
 #[cfg(feature = "ml-runtime")]
 pub use runtime::onnx::{
     DEFAULT_ANSWERAI_COLBERT_MODEL, FastembedBgem3Lens, FastembedRerankerLens, FastembedSparseLens,
+    ONNX_COLBERT_RUNTIME_ID, ONNX_CUSTOM_RUNTIME_ID, ONNX_FASTEMBED_RUNTIME_ID,
     OnnxColbertFileSpec, OnnxColbertLens, OnnxFileSpec, OnnxLens, OnnxModelFiles,
-    OnnxProviderPolicy, PoolingPolicy,
+    OnnxProviderPolicy, PoolingPolicy, validate_cuda_onnx_execution_attestation,
 };
 #[cfg(all(feature = "ml-runtime", windows))]
 pub use runtime::onnx::{
     OnnxCudaDeviceAttestation, OnnxLoadedModuleAttestation, OnnxRuntimeArtifactAttestation,
     OnnxRuntimeAttestation, OnnxRuntimeContractAttestation, current_runtime_attestation,
     expected_runtime_contract, initialize_pinned_cuda_runtime_boundary,
+    revalidate_runtime_attestation,
 };
 #[cfg(feature = "ml-runtime")]
 pub use runtime::qwen3::{

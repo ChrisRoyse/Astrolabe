@@ -74,10 +74,6 @@ impl ManagedOnnxSession {
             self._green_context.as_ref(),
             self.provider_policy,
             label,
-        )?;
-        super::runtime_bundle::attest_after_model_constructor(
-            self.provider_policy,
-            self._green_context.as_ref(),
         )
     }
 

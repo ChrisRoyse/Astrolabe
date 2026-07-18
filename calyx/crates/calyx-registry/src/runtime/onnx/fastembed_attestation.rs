@@ -4,7 +4,11 @@ use std::path::{Path, PathBuf};
 use std::ptr;
 use std::sync::{Mutex, MutexGuard};
 
-use calyx_core::{CalyxError, Result, RuntimeExecutionAttestation};
+use calyx_core::{
+    CalyxError, OnnxCommittedSessionPlacementEvidence, OnnxCudaExecutionEvidence,
+    OnnxCudaExecutionEvidenceKind, OnnxFirstInferencePlacementEvidence,
+    OnnxRetainedCudaStreamEvidence, Result, RuntimeExecutionAttestation,
+};
 use fastembed::SessionPolicy;
 use ort::session::Session;
 use ort::{AsPointer, Error as OrtError};
@@ -142,14 +146,48 @@ enum ExecutionState {
 pub(super) struct FastembedExecutionState {
     context: FastembedModelContext,
     assignment: GraphAssignment,
+    retained_stream: Option<OnnxRetainedCudaStreamEvidence>,
     state: Mutex<ExecutionState>,
 }
 
 impl FastembedExecutionState {
-    pub(super) fn inspect(session: &Session, context: FastembedModelContext) -> Result<Self> {
+    pub(super) fn inspect(
+        session: &Session,
+        context: FastembedModelContext,
+        retained_stream: Option<OnnxRetainedCudaStreamEvidence>,
+    ) -> Result<Self> {
         let assignment = read_graph_assignment(session)
             .map_err(|error| context.error("api24_graph_assignment_readback", error))?;
         validate_assignment(&context, &assignment)?;
+        match (context.provider_policy, retained_stream.as_ref()) {
+            (OnnxProviderPolicy::CudaFailLoud, Some(stream))
+                if stream.physical_device == context.device => {}
+            (OnnxProviderPolicy::CudaFailLoud, Some(stream)) => {
+                return Err(context.error(
+                    "retained_stream_identity",
+                    format!(
+                        "retained stream physical device {} differs from selected execution device {}",
+                        stream.physical_device, context.device
+                    ),
+                ));
+            }
+            (OnnxProviderPolicy::CudaFailLoud, None) => {
+                return Err(context.error(
+                    "retained_stream_identity",
+                    "CUDA FastEmbed session has no retained Astrolabe-owned stream evidence",
+                ));
+            }
+            (OnnxProviderPolicy::CpuExplicit, Some(stream)) => {
+                return Err(context.error(
+                    "retained_stream_identity",
+                    format!(
+                        "explicit-CPU FastEmbed session unexpectedly retained CUDA stream {}",
+                        stream.stream_address
+                    ),
+                ));
+            }
+            (OnnxProviderPolicy::CpuExplicit, None) => {}
+        }
         eprintln!(
             "CALYX_ONNX_RUNTIME phase=fastembed_api24_graph_assignment label={} model={} path={} weights_sha256={} artifact_bytes={} model_sha256={} tokenizer_sha256={} external_sha256={} provider={} device={} total_nodes={} cuda_nodes={} cpu_nodes={} providers={} assigned_operators={}",
             context.label,
@@ -171,6 +209,7 @@ impl FastembedExecutionState {
         Ok(Self {
             context,
             assignment,
+            retained_stream,
             state: Mutex::new(ExecutionState::Pending),
         })
     }
@@ -316,15 +355,76 @@ impl FastembedExecutionState {
             trace_path.display(),
             trace_sha256
         );
-        let trace_path_display = trace_path.to_string_lossy();
-        Ok(self.assignment_attestation(
-            "onnx_api24_committed_session+first_real_synchronized_inference_profile",
-            format!(
+        let profile_path = trace_path.to_str().ok_or_else(|| {
+            self.context.error(
+                "first_inference_profile_path_validation",
+                format!(
+                    "profile path {} is not valid UTF-8; lossy execution evidence is forbidden",
+                    trace_path.display()
+                ),
+            )
+        })?;
+        let profile_total = u64::try_from(profile.total_nodes).map_err(|_| {
+            self.context.error(
+                "first_inference_profile_validation",
+                format!(
+                    "profile total node count {} exceeds u64",
+                    profile.total_nodes
+                ),
+            )
+        })?;
+        let profile_cuda = u64::try_from(profile.cuda_nodes).map_err(|_| {
+            self.context.error(
+                "first_inference_profile_validation",
+                format!("profile CUDA node count {} exceeds u64", profile.cuda_nodes),
+            )
+        })?;
+        let profile_cpu = u64::try_from(profile.cpu_nodes).map_err(|_| {
+            self.context.error(
+                "first_inference_profile_validation",
+                format!("profile CPU node count {} exceeds u64", profile.cpu_nodes),
+            )
+        })?;
+        let structured = OnnxCudaExecutionEvidence {
+            kind: OnnxCudaExecutionEvidenceKind::Api24CommittedSessionAndFirstRealInferenceProfile,
+            retained_stream: self.retained_stream.clone().ok_or_else(|| {
+                self.context.error(
+                    "first_inference_retained_stream",
+                    "CUDA FastEmbed execution completed without retained stream evidence",
+                )
+            })?,
+            committed_session: OnnxCommittedSessionPlacementEvidence {
+                total_compute_nodes: self.assignment.total_nodes,
+                cuda_compute_nodes: self.assignment.cuda_nodes,
+                cpu_compute_nodes: self.assignment.cpu_nodes,
+                providers: self.assignment.per_provider.clone(),
+                assigned_operators: self.assignment.per_provider_operators.clone(),
+            },
+            first_inference_profile: OnnxFirstInferencePlacementEvidence {
+                total_compute_nodes: profile_total,
+                cuda_compute_nodes: profile_cuda,
+                cpu_compute_nodes: profile_cpu,
+                providers: profile.per_provider.clone(),
+            },
+            profile_path: profile_path.to_string(),
+            profile_sha256: trace_sha256,
+        };
+        Ok(RuntimeExecutionAttestation {
+            runtime: super::execution_attestation::ONNX_FASTEMBED_RUNTIME_ID.to_string(),
+            provider: format!(
                 "api24={};profile={}",
-                self.assignment.per_provider, profile.per_provider
+                structured.committed_session.providers,
+                structured.first_inference_profile.providers
             ),
-            Some((trace_path_display.as_ref(), &trace_sha256)),
-        ))
+            device: self.context.device.clone(),
+            loader_dtype: None,
+            compute_dtype: None,
+            evidence: super::execution_attestation::serialize_cuda_onnx_execution_evidence(
+                &structured,
+            )?,
+            total_compute_nodes: Some(self.assignment.total_nodes),
+            cpu_compute_nodes: Some(self.assignment.cpu_nodes),
+        })
     }
 
     fn snapshot_profile(&self, trace_path: &str) -> Result<(PathBuf, Vec<u8>)> {
@@ -390,7 +490,7 @@ impl FastembedExecutionState {
             .map(|(path, sha256)| format!(";profile_path={path};profile_sha256={sha256}"))
             .unwrap_or_default();
         RuntimeExecutionAttestation {
-            runtime: "onnx-fastembed-5.16.0-owned".to_string(),
+            runtime: super::execution_attestation::ONNX_FASTEMBED_RUNTIME_ID.to_string(),
             provider,
             device: self.context.device.clone(),
             loader_dtype: None,

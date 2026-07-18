@@ -15,8 +15,9 @@ pub use crate::cuda_runtime::{
     PinnedCudaRuntimeAttestation, attest_pinned_cuda_dependencies,
     attest_pinned_cuda_driver_identity, attest_pinned_cuda_driver_identity_for_native_kernel,
     current_pinned_cuda_device, initialize_pinned_cuda_dependencies,
-    initialize_pinned_cuda_runtime_boundary, select_pinned_cuda_device,
-    select_pinned_cuda_device_by_identity, select_pinned_cuda_device_for_native_kernel,
+    initialize_pinned_cuda_runtime_boundary, revalidate_pinned_cuda_dependencies,
+    select_pinned_cuda_device, select_pinned_cuda_device_by_identity,
+    select_pinned_cuda_device_for_native_kernel,
 };
 pub use crate::mxfp4;
 pub use context::{

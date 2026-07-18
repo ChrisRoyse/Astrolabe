@@ -22,6 +22,7 @@ mod cuda_graphs;
 mod cuda_guard;
 mod custom;
 mod dynamic_ort;
+mod execution_attestation;
 pub(crate) mod fastembed_artifacts;
 mod fastembed_attestation;
 mod fastembed_runtime;
@@ -34,12 +35,17 @@ mod special;
 
 pub(in crate::runtime::onnx) use batch_scope::scoped_max_batch;
 pub use colbert::{DEFAULT_ANSWERAI_COLBERT_MODEL, OnnxColbertFileSpec, OnnxColbertLens};
+pub use execution_attestation::{
+    ONNX_COLBERT_RUNTIME_ID, ONNX_CUSTOM_RUNTIME_ID, ONNX_FASTEMBED_RUNTIME_ID,
+    validate_cuda_onnx_execution_attestation,
+};
 pub(crate) use fastembed_runtime::model_from_name as fastembed_dense_model_from_name;
 #[cfg(windows)]
 pub use runtime_bundle::{
     OnnxCudaDeviceAttestation, OnnxLoadedModuleAttestation, OnnxRuntimeArtifactAttestation,
     OnnxRuntimeAttestation, OnnxRuntimeContractAttestation, current_runtime_attestation,
     expected_runtime_contract, initialize_pinned_cuda_runtime_boundary,
+    revalidate_runtime_attestation,
 };
 pub use special::{FastembedBgem3Lens, FastembedRerankerLens, FastembedSparseLens};
 

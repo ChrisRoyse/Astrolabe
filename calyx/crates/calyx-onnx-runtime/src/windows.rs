@@ -241,10 +241,37 @@ pub fn current_runtime_attestation() -> Result<Option<OnnxRuntimeAttestation>> {
     let Some(state) = RUNTIME_STATE.get() else {
         return Ok(None);
     };
-    let mut state = state.lock().map_err(|_| {
+    let state = state.lock().map_err(|_| {
         runtime_error(
             "CALYX_ONNX_RUNTIME_STATE_POISONED",
             "the process-global ONNX runtime state mutex was poisoned while reading attestation",
+            "terminate this process, preserve its logs, and restart from the pinned runtime bundle",
+        )
+    })?;
+    if let Some(error) = &state.core_failure {
+        return Err(error.clone());
+    }
+    if let Some(error) = &state.cuda_failure {
+        return Err(error.clone());
+    }
+    // Initialization/provider promotion retained exact loaded module handles
+    // and read-only file guards that deny write/delete sharing. The receipt is
+    // therefore immutable for this process lifetime; ordinary reads must not
+    // rehash the multi-gigabyte runtime closure.
+    Ok(state.live.as_ref().map(|live| live.receipt.clone()))
+}
+
+/// Explicitly re-enumerates and re-hashes the complete CUDA/ORT module
+/// closure. Operator/readiness workflows may call this deliberately; model
+/// construction and inference completion use the immutable cached receipt.
+pub fn revalidate_runtime_attestation() -> Result<Option<OnnxRuntimeAttestation>> {
+    let Some(state) = RUNTIME_STATE.get() else {
+        return Ok(None);
+    };
+    let mut state = state.lock().map_err(|_| {
+        runtime_error(
+            "CALYX_ONNX_RUNTIME_STATE_POISONED",
+            "the process-global ONNX runtime state mutex was poisoned during explicit deep revalidation",
             "terminate this process, preserve its logs, and restart from the pinned runtime bundle",
         )
     })?;
@@ -262,6 +289,7 @@ pub fn current_runtime_attestation() -> Result<Option<OnnxRuntimeAttestation>> {
         let refresh = refresh_cuda_module_attestation(
             state.live.as_mut().expect("checked above"),
             &sha256_bytes(LOCK_BYTES),
+            true,
             true,
         );
         if let Err(error) = refresh {
@@ -1210,7 +1238,7 @@ fn initialize_cuda(live: &mut LiveRuntime, requested: u32) -> Result<()> {
             "terminate the process, preserve the device receipt, and repair the CUDA Runtime/Driver/NVML identity boundary",
         ));
     }
-    refresh_cuda_module_attestation(live, &lock_sha256, false)?;
+    refresh_cuda_module_attestation(live, &lock_sha256, false, false)?;
     live.receipt.cuda_device = Some(device);
     Ok(())
 }
@@ -1219,9 +1247,14 @@ fn refresh_cuda_module_attestation(
     live: &mut LiveRuntime,
     lock_sha256: &str,
     require_provider: bool,
+    deep_revalidation: bool,
 ) -> Result<()> {
-    let boundary = calyx_forge::cuda_runtime::attest_pinned_cuda_dependencies()
-        .map_err(forge_runtime_boundary_error)?;
+    let boundary = if deep_revalidation {
+        calyx_forge::cuda_runtime::revalidate_pinned_cuda_dependencies()
+    } else {
+        calyx_forge::cuda_runtime::attest_pinned_cuda_dependencies()
+    }
+    .map_err(forge_runtime_boundary_error)?;
     validate_forge_boundary(&boundary, &live.lock, lock_sha256, true, true)?;
     let mut modules = boundary
         .modules
@@ -1280,8 +1313,11 @@ pub fn attest_cuda_provider_after_session() -> Result<()> {
         state.cuda_failure = Some(error.clone());
         return Err(error);
     }
+    if live.receipt.provider_available {
+        return Ok(());
+    }
     let lock_sha256 = sha256_bytes(LOCK_BYTES);
-    if let Err(error) = refresh_cuda_module_attestation(live, &lock_sha256, true) {
+    if let Err(error) = refresh_cuda_module_attestation(live, &lock_sha256, true, false) {
         state.cuda_failure = Some(error.clone());
         return Err(error);
     }

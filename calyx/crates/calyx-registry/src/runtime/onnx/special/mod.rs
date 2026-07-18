@@ -177,6 +177,7 @@ impl FastembedSparseLens {
         let execution = super::fastembed_attestation::FastembedExecutionState::inspect(
             model.as_ref().session(),
             context,
+            super::green_context::retained_stream_evidence(model.bound_stream()),
         )?;
         let (model, bound_stream) = model.into_parts();
         Ok(Self::new(
@@ -368,6 +369,7 @@ impl FastembedBgem3Lens {
         let execution = super::fastembed_attestation::FastembedExecutionState::inspect(
             model.as_ref().session(),
             context,
+            super::green_context::retained_stream_evidence(model.bound_stream()),
         )?;
         let (model, bound_stream) = model.into_parts();
         Ok(Self::new(
@@ -559,6 +561,7 @@ impl FastembedRerankerLens {
         let execution = super::fastembed_attestation::FastembedExecutionState::inspect(
             model.as_ref().session(),
             context,
+            super::green_context::retained_stream_evidence(model.bound_stream()),
         )?;
         let (model, bound_stream) = model.into_parts();
         Ok(Self::new(

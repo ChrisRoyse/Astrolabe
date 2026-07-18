@@ -4,8 +4,9 @@ use calyx_core::{CalyxError, Input, Modality, RuntimeExecutionAttestation};
 use calyx_forge::PinnedCudaDeviceIdentity;
 use calyx_registry::{
     CandleDevicePolicy, FrozenLensContract, LensForgeBatchPolicy, LensForgeManifest,
-    LensForgeSourceTensorDtypeProfile, LensRuntime, LensSpec, OnnxInt8Attestation,
-    lens_spec_from_manifest, parse_frozen_device_policy,
+    LensForgeSourceTensorDtypeProfile, LensRuntime, LensSpec, ONNX_COLBERT_RUNTIME_ID,
+    ONNX_CUSTOM_RUNTIME_ID, ONNX_FASTEMBED_RUNTIME_ID, OnnxInt8Attestation,
+    lens_spec_from_manifest, parse_frozen_device_policy, validate_cuda_onnx_execution_attestation,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -537,8 +538,9 @@ fn validate_attestation(
         | LensRuntime::FastembedQwen3 { device, dtype, .. } => {
             validate_candle_placement(device, dtype, attestation)
         }
-        LensRuntime::Onnx { .. } | LensRuntime::OnnxColbert { .. } => {
-            validate_generic_onnx_cuda(attestation)
+        LensRuntime::Onnx { .. } => validate_generic_onnx_cuda(attestation, ONNX_CUSTOM_RUNTIME_ID),
+        LensRuntime::OnnxColbert { .. } => {
+            validate_generic_onnx_cuda(attestation, ONNX_COLBERT_RUNTIME_ID)
         }
         _ => Ok(()),
     }
@@ -570,34 +572,20 @@ fn validate_onnx_fastembed_placement(
         ));
     }
 
-    let provider = attestation.provider.to_ascii_uppercase();
     match execution {
         "cuda_fail_loud" => {
-            if cpu != 0 || !provider.contains("CUDA") || provider.contains("CPU") {
-                return Err(placement_mismatch(format!(
-                    "CUDA FastEmbed full-forward provider={} placed cpu_nodes={cpu}/{total}",
-                    attestation.provider
-                )));
-            }
-            attestation
-                .device
-                .parse::<PinnedCudaDeviceIdentity>()
-                .map_err(|error| {
-                    placement_mismatch(format!(
-                        "CUDA FastEmbed attestation device {:?} is not a stable PCI+UUID identity: {error}",
-                        attestation.device
-                    ))
-                })?;
+            validate_cuda_onnx_execution_attestation(attestation, ONNX_FASTEMBED_RUNTIME_ID)
+                .map_err(|error| placement_mismatch(error.to_string()))?;
         }
         "cpu_explicit" => {
+            let expected_provider = format!("CPUExecutionProvider:{total}");
             if cpu != total
-                || !provider.contains("CPU")
-                || provider.contains("CUDA")
+                || attestation.provider != expected_provider
                 || attestation.device != "cpu"
             {
                 return Err(placement_mismatch(format!(
-                    "explicit-CPU FastEmbed full-forward provider={} device={} placed cpu_nodes={cpu}/{total}",
-                    attestation.provider, attestation.device
+                    "explicit-CPU FastEmbed full-forward requires provider={expected_provider} device=cpu, observed provider={} device={} cpu_nodes={cpu}/{total}",
+                    attestation.provider, attestation.device,
                 )));
             }
         }
@@ -659,37 +647,12 @@ fn validate_candle_placement(
     Ok(())
 }
 
-fn validate_generic_onnx_cuda(attestation: &RuntimeExecutionAttestation) -> CliResult<()> {
-    let total = attestation.total_compute_nodes.ok_or_else(|| {
-        admission_error(
-            "CALYX_LENS_CATALOG_EXECUTION_ATTESTATION_INVALID",
-            "local ONNX execution attestation omitted total compute-node placement",
-            "enable first-real-inference provider placement tracing before catalog admission",
-        )
-    })?;
-    let cpu = attestation.cpu_compute_nodes.ok_or_else(|| {
-        admission_error(
-            "CALYX_LENS_CATALOG_EXECUTION_ATTESTATION_INVALID",
-            "local ONNX execution attestation omitted CPU compute-node placement",
-            "enable first-real-inference provider placement tracing before catalog admission",
-        )
-    })?;
-    let provider = attestation.provider.to_ascii_uppercase();
-    if total == 0 || cpu != 0 || !provider.contains("CUDA") || provider.contains("CPU") {
-        return Err(placement_mismatch(format!(
-            "local ONNX full-forward provider={} placed cpu_nodes={cpu}/{total}",
-            attestation.provider
-        )));
-    }
-    attestation
-        .device
-        .parse::<PinnedCudaDeviceIdentity>()
-        .map_err(|error| {
-            placement_mismatch(format!(
-                "local ONNX attestation device {:?} is not a stable PCI+UUID identity: {error}",
-                attestation.device
-            ))
-        })?;
+fn validate_generic_onnx_cuda(
+    attestation: &RuntimeExecutionAttestation,
+    expected_runtime: &str,
+) -> CliResult<()> {
+    validate_cuda_onnx_execution_attestation(attestation, expected_runtime)
+        .map_err(|error| placement_mismatch(error.to_string()))?;
     Ok(())
 }
 

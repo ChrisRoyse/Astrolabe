@@ -10,8 +10,10 @@ use calyx_core::{
 use calyx_registry::{
     CandleLens, FastembedBgem3Lens, FastembedRerankerLens, FastembedSparseLens,
     LensForgeSourceTensorDtypeProfile, LensRuntime, LensSpec, MultimodalAdapterLens,
-    OnnxColbertLens, OnnxInt8Attestation, OnnxLens, StaticLookupLens, TeiHttpLens,
+    ONNX_COLBERT_RUNTIME_ID, ONNX_CUSTOM_RUNTIME_ID, ONNX_FASTEMBED_RUNTIME_ID, OnnxColbertLens,
+    OnnxInt8Attestation, OnnxLens, StaticLookupLens, TeiHttpLens,
     lens_spec_and_onnx_int8_attestation_from_manifest_path,
+    validate_cuda_onnx_execution_attestation,
 };
 #[cfg(windows)]
 use calyx_registry::{OnnxRuntimeAttestation, current_runtime_attestation};
@@ -216,40 +218,21 @@ fn require_cuda_onnx_execution_attestation(
             remediation: "use a Calyx-owned ONNX runtime that retains the fail-closed ORT provider profile; FastEmbed wrappers without execution attestation must not be used to claim GPU placement",
         })
     })?;
-    let total_nodes = attestation.total_compute_nodes.filter(|count| *count > 0);
-    let cpu_nodes = attestation.cpu_compute_nodes;
-    if attestation.runtime != runtime_label
-        || attestation.evidence != "onnx_runtime_provider_node_profile"
-    {
-        return Err(CliError::from(CalyxError {
-            code: "CALYX_LENS_EXPLAIN_ONNX_EXECUTION_UNATTESTED",
+    validate_cuda_onnx_execution_attestation(&attestation, runtime_label).map_err(|error| {
+        let code = if error.code == "CALYX_ONNX_EXECUTION_PLACEMENT_MISMATCH" {
+            "CALYX_LENS_EXPLAIN_ONNX_EXECUTION_PLACEMENT"
+        } else {
+            "CALYX_LENS_EXPLAIN_ONNX_EXECUTION_UNATTESTED"
+        };
+        CliError::from(CalyxError {
+            code,
             message: format!(
-                "{runtime_label} returned incomplete ONNX execution evidence: {attestation:?}"
+                "{runtime_label} execution attestation failed the current structured contract ({}): {}",
+                error.code, error.message
             ),
-            remediation: "enable the fail-closed ONNX profiler before session construction and retain its provider, device, total-node, and CPU-node readback after inference",
-        }));
-    }
-    let (Some(total_nodes), Some(cpu_nodes)) = (total_nodes, cpu_nodes) else {
-        return Err(CliError::from(CalyxError {
-            code: "CALYX_LENS_EXPLAIN_ONNX_EXECUTION_UNATTESTED",
-            message: format!(
-                "{runtime_label} returned no positive total-node/CPU-node ONNX profile counts: {attestation:?}"
-            ),
-            remediation: "enable the fail-closed ONNX profiler before session construction and retain its total compute-node and CPU compute-node counts after inference",
-        }));
-    };
-    let provider_is_cuda = attestation.provider.to_ascii_uppercase().contains("CUDA");
-    let device_is_cuda = attestation.device == "cuda" || attestation.device.starts_with("cuda:");
-    if !provider_is_cuda || !device_is_cuda || cpu_nodes != 0 || cpu_nodes > total_nodes {
-        return Err(CliError::from(CalyxError {
-            code: "CALYX_LENS_EXPLAIN_ONNX_EXECUTION_PLACEMENT",
-            message: format!(
-                "{runtime_label} violated CUDA-fail-loud placement: provider={} device={} cpu_compute_nodes={cpu_nodes} total_compute_nodes={total_nodes}",
-                attestation.provider, attestation.device
-            ),
-            remediation: "use a CUDA-compatible fp16/fp32 ONNX graph and the pinned CUDA execution provider; do not accept mixed or CPU node placement",
-        }));
-    }
+            remediation: error.remediation,
+        })
+    })?;
     Ok(attestation)
 }
 
@@ -542,8 +525,17 @@ fn measure_onnx(spec: &LensSpec, probe: &Input, repeat: usize) -> CliResult<Meas
     let lens = OnnxLens::from_lens_spec(spec)?;
     require_runtime_lens_id(spec, &lens)?;
     let vector = measure_repeated(&lens, probe, repeat)?;
+    let expected_runtime = match &spec.runtime {
+        LensRuntime::FastembedDensePlaced { .. } => ONNX_FASTEMBED_RUNTIME_ID,
+        LensRuntime::Onnx { .. } => ONNX_CUSTOM_RUNTIME_ID,
+        _ => {
+            return Err(CliError::from(CalyxError::lens_frozen_violation(
+                "measure_onnx received a non-ONNX/non-FastEmbed-dense runtime",
+            )));
+        }
+    };
     let runtime_execution_attestation =
-        require_cuda_onnx_execution_attestation(&lens, lens.runtime_name())?;
+        require_cuda_onnx_execution_attestation(&lens, expected_runtime)?;
     Ok(Measurement {
         vector,
         source_tensor_dtype_profile: None,
@@ -564,7 +556,7 @@ fn measure_onnx_colbert(spec: &LensSpec, probe: &Input, repeat: usize) -> CliRes
     require_runtime_lens_id(spec, &lens)?;
     let vector = measure_repeated(&lens, probe, repeat)?;
     let runtime_execution_attestation =
-        require_cuda_onnx_execution_attestation(&lens, "onnx-colbert")?;
+        require_cuda_onnx_execution_attestation(&lens, ONNX_COLBERT_RUNTIME_ID)?;
     Ok(Measurement {
         vector,
         source_tensor_dtype_profile: None,
@@ -588,7 +580,7 @@ fn measure_fastembed_sparse(
     require_runtime_lens_id(spec, &lens)?;
     let vector = measure_repeated(&lens, probe, repeat)?;
     let runtime_execution_attestation =
-        require_cuda_onnx_execution_attestation(&lens, "fastembed-sparse")?;
+        require_cuda_onnx_execution_attestation(&lens, ONNX_FASTEMBED_RUNTIME_ID)?;
     Ok(Measurement {
         vector,
         source_tensor_dtype_profile: None,
@@ -612,7 +604,7 @@ fn measure_fastembed_bgem3(
     require_runtime_lens_id(spec, &lens)?;
     let vector = measure_repeated(&lens, probe, repeat)?;
     let runtime_execution_attestation =
-        require_cuda_onnx_execution_attestation(&lens, lens.runtime_name())?;
+        require_cuda_onnx_execution_attestation(&lens, ONNX_FASTEMBED_RUNTIME_ID)?;
     Ok(Measurement {
         vector,
         source_tensor_dtype_profile: None,
@@ -636,7 +628,7 @@ fn measure_fastembed_reranker(
     require_runtime_lens_id(spec, &lens)?;
     let vector = measure_repeated(&lens, probe, repeat)?;
     let runtime_execution_attestation =
-        require_cuda_onnx_execution_attestation(&lens, "fastembed-reranker")?;
+        require_cuda_onnx_execution_attestation(&lens, ONNX_FASTEMBED_RUNTIME_ID)?;
     Ok(Measurement {
         vector,
         source_tensor_dtype_profile: None,

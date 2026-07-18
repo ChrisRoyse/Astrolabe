@@ -58,6 +58,81 @@ pub struct RuntimeExecutionAttestation {
     pub cpu_compute_nodes: Option<u64>,
 }
 
+/// Exact evidence kind for a fail-loud CUDA ONNX session.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum OnnxCudaExecutionEvidenceKind {
+    /// ORT API 24 committed-session placement plus the first real,
+    /// host-materialized, retained-stream-synchronized inference profile.
+    #[serde(
+        rename = "onnx_api24_committed_session+first_real_host_materialized_retained_stream_synchronized_inference_profile"
+    )]
+    Api24CommittedSessionAndFirstRealInferenceProfile,
+}
+
+/// Physical CUDA stream retained by the exact ONNX session.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OnnxRetainedCudaStreamEvidence {
+    /// Native stream address observed from the retained session handle.
+    pub stream_address: String,
+    /// CUDA Driver ordinal bound to the stream.
+    pub driver_ordinal: u32,
+    /// Canonical PCI + GPU-UUID physical-device identity.
+    pub physical_device: String,
+}
+
+/// ORT API-24 placement read directly from one committed session.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OnnxCommittedSessionPlacementEvidence {
+    /// Optimized compute nodes owned by the committed session.
+    pub total_compute_nodes: u64,
+    /// Nodes assigned to CUDAExecutionProvider.
+    pub cuda_compute_nodes: u64,
+    /// Nodes assigned to CPUExecutionProvider.
+    pub cpu_compute_nodes: u64,
+    /// Deterministic provider/count summary.
+    pub providers: String,
+    /// Deterministic provider/operator summary.
+    pub assigned_operators: String,
+}
+
+/// Placement observed in the first real synchronized inference profile.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OnnxFirstInferencePlacementEvidence {
+    /// Profiled compute-node events.
+    pub total_compute_nodes: u64,
+    /// Profiled CUDA compute-node events.
+    pub cuda_compute_nodes: u64,
+    /// Profiled CPU compute-node events.
+    pub cpu_compute_nodes: u64,
+    /// Deterministic provider/count summary.
+    pub providers: String,
+}
+
+/// Structured, versioned CUDA ONNX execution evidence.
+///
+/// This is serialized into [`RuntimeExecutionAttestation::evidence`] as
+/// strict JSON. Consumers deserialize this type instead of matching or
+/// searching an opaque status string.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OnnxCudaExecutionEvidence {
+    /// Versioned evidence discriminator.
+    pub kind: OnnxCudaExecutionEvidenceKind,
+    /// Exact retained CUDA stream and physical device.
+    pub retained_stream: OnnxRetainedCudaStreamEvidence,
+    /// Committed-session API-24 assignment.
+    pub committed_session: OnnxCommittedSessionPlacementEvidence,
+    /// First-real-inference execution profile.
+    pub first_inference_profile: OnnxFirstInferencePlacementEvidence,
+    /// Canonical path returned by ORT profiling and independently snapshotted.
+    pub profile_path: String,
+    /// SHA-256 of the exact snapshotted profile bytes.
+    pub profile_sha256: String,
+}
+
 /// Implemented by Registry lens runtimes as frozen measurement instruments.
 pub trait Lens: Send + Sync {
     /// Stable frozen lens id.

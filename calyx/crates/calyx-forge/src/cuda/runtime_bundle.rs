@@ -432,6 +432,21 @@ pub fn attest_pinned_cuda_dependencies() -> Result<PinnedCudaRuntimeAttestation>
         Ok(runtime) => runtime,
         Err(error) => return Err(error.clone()),
     };
+    // Initialization retained every exact loaded module handle and a read-only
+    // file guard that denies write/delete sharing. Those handles make the
+    // cryptographically verified bytes immutable for this process lifetime,
+    // so ordinary execution attestation is a cached receipt read rather than
+    // a multi-gigabyte rehash on every CUDA synchronization boundary.
+    Ok(runtime.attestation.clone())
+}
+
+/// Explicitly re-enumerates and re-hashes the complete pinned CUDA module
+/// closure. This is for operator/readiness audits, not an inference hot path.
+pub fn revalidate_pinned_cuda_dependencies() -> Result<PinnedCudaRuntimeAttestation> {
+    let runtime = match CUDA_DEPENDENCIES.get_or_init(initialize_cuda_dependencies) {
+        Ok(runtime) => runtime,
+        Err(error) => return Err(error.clone()),
+    };
     let boundary = match BOUNDARY.get_or_init(initialize_boundary) {
         Ok(boundary) => boundary,
         Err(error) => return Err(error.clone()),

@@ -1,4 +1,4 @@
-use calyx_core::{CalyxError, Result};
+use calyx_core::{CalyxError, OnnxRetainedCudaStreamEvidence, Result};
 
 use super::OnnxProviderPolicy;
 #[cfg(feature = "cuda")]
@@ -13,6 +13,24 @@ pub(super) type RetainedCudaStream = std::sync::Mutex<GreenContextHandle>;
 
 pub(super) fn retain_for_model(stream: Option<GreenContextHandle>) -> Option<RetainedCudaStream> {
     stream.map(std::sync::Mutex::new)
+}
+
+#[cfg(feature = "cuda")]
+pub(super) fn retained_stream_evidence(
+    stream: Option<&GreenContextHandle>,
+) -> Option<OnnxRetainedCudaStreamEvidence> {
+    stream.map(|stream| OnnxRetainedCudaStreamEvidence {
+        stream_address: format!("{:p}", stream.stream_ptr()),
+        driver_ordinal: stream.driver_ordinal(),
+        physical_device: stream.physical_identity().canonical_execution_token(),
+    })
+}
+
+#[cfg(not(feature = "cuda"))]
+pub(super) fn retained_stream_evidence(
+    _stream: Option<&GreenContextHandle>,
+) -> Option<OnnxRetainedCudaStreamEvidence> {
+    None
 }
 
 pub(super) fn configured_green_context_sms() -> Result<Option<u32>> {
