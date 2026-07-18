@@ -1703,6 +1703,27 @@ fn scalar_bits(dim: usize, level: QuantLevel) -> Result<usize> {
         .ok_or_else(|| quant_error("scalar_bits", level, "scalar bit count overflow"))
 }
 
+/// Exact canonical TQPR-v2 payload length for a supported level and dimension.
+///
+/// Persistence owners use this instead of duplicating TurboQuant's mixed-width
+/// scalar layout. The returned length includes the fixed TQPR header, scalar
+/// bitstream padding, and the one-bit-per-channel QJL residual plane.
+pub fn turboquant_payload_len(level: QuantLevel, dim: usize) -> Result<usize> {
+    validate_level(level, "payload_layout")?;
+    if dim == 0 || dim > TURBOQUANT_MAX_DIM {
+        return Err(quant_error(
+            "payload_layout",
+            level,
+            format!("dimension {dim} is outside 1..={TURBOQUANT_MAX_DIM}"),
+        ));
+    }
+    let scalar_bytes = scalar_bits(dim, level)?.div_ceil(8);
+    TURBOQUANT_FORMAT_HEADER_BYTES
+        .checked_add(scalar_bytes)
+        .and_then(|value| value.checked_add(dim.div_ceil(8)))
+        .ok_or_else(|| quant_error("payload_layout", level, "payload length overflow"))
+}
+
 fn validate_level(level: QuantLevel, op: &str) -> Result<()> {
     if matches!(level, QuantLevel::Bits2p5 | QuantLevel::Bits3p5) {
         return Ok(());

@@ -12,7 +12,7 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use calyx_core::{CxId, Result, SlotId};
-use calyx_forge::{QuantLevel, QuantizedVec, RotationSeed, SeedId, TURBOQUANT_FORMAT_HEADER_BYTES};
+use calyx_forge::{QuantLevel, QuantizedVec, RotationSeed, SeedId, turboquant_payload_len};
 
 use super::{HNSW_MAX_DIM, HnswIndex, Row};
 use crate::error::{
@@ -793,30 +793,11 @@ fn quant_from_tag(tag: u8) -> Result<QuantKind> {
 }
 
 fn turboquant_payload_bytes(level: QuantLevel, dim: u32) -> Result<usize> {
-    let dim = dim as usize;
-    let (low, high) = match level {
-        QuantLevel::Bits2p5 => (2_usize, 3_usize),
-        QuantLevel::Bits3p5 => (3_usize, 4_usize),
-        _ => {
-            return Err(corrupt(format!(
-                "unsupported TurboQuant artifact level {level}"
-            )));
-        }
-    };
-    let high_count = dim.div_ceil(2);
-    let low_count = dim / 2;
-    let scalar_bits = high_count
-        .checked_mul(high)
-        .and_then(|value| {
-            low_count
-                .checked_mul(low)
-                .and_then(|low_bits| value.checked_add(low_bits))
-        })
-        .ok_or_else(|| corrupt("TurboQuant scalar bit count overflow"))?;
-    TURBOQUANT_FORMAT_HEADER_BYTES
-        .checked_add(scalar_bits.div_ceil(8))
-        .and_then(|value| value.checked_add(dim.div_ceil(8)))
-        .ok_or_else(|| corrupt("TurboQuant payload length overflow"))
+    turboquant_payload_len(level, dim as usize).map_err(|error| {
+        corrupt(format!(
+            "invalid TurboQuant artifact payload layout: {error}"
+        ))
+    })
 }
 
 fn read_all(path: &Path) -> Result<Vec<u8>> {

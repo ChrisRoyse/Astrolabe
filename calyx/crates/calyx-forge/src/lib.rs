@@ -82,7 +82,7 @@ pub use quant::{
     TurboQuantGeometryKind, TurboQuantOwnedCandidate, TurboQuantPreparedQuery, TurboQuantStorage,
     TurboQuantV1MigrationVerifier, TurboQuantValidatedCandidate, apply_inverse_rotation,
     apply_rotation, apply_rotation_batch, binary_prefilter, hamming_dot_estimate, mxfp_payload_len,
-    new_seed, seed_id_hex,
+    new_seed, seed_id_hex, turboquant_payload_len,
 };
 #[cfg(feature = "cuda")]
 pub use vram::CudaStream;

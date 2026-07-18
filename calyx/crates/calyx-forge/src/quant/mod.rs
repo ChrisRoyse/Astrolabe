@@ -27,7 +27,7 @@ pub use rotation::{
 pub use turboquant::{
     TURBOQUANT_FORMAT_HEADER_BYTES, TURBOQUANT_FORMAT_VERSION, TURBOQUANT_MAX_DIM, TurboQuantCodec,
     TurboQuantGeometryKind, TurboQuantOwnedCandidate, TurboQuantPreparedQuery, TurboQuantStorage,
-    TurboQuantV1MigrationVerifier, TurboQuantValidatedCandidate,
+    TurboQuantV1MigrationVerifier, TurboQuantValidatedCandidate, turboquant_payload_len,
 };
 
 pub type SeedId = [u8; 32];
