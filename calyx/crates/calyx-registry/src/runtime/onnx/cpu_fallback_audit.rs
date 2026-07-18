@@ -28,6 +28,27 @@ use serde_json::Value;
 
 pub(super) const CPU_FALLBACK_CODE: &str = "CALYX_ONNX_QUANT_CPU_FALLBACK";
 
+// The crates.io ort-sys 2.0.0-rc.12 binding omitted
+// KernelInfo_GetOperatorSinceVersion from the API-24 OrtApi tail. That moved
+// every later Rust field one pointer before its C ABI slot, so invoking
+// Session_GetEpGraphAssignmentInfo actually invoked CreateEnvWithOptions.
+// These values are independently measured from ONNX Runtime v1.24.3's
+// official C header with native x86_64 offsetof/sizeof. Keep the whole tail
+// pinned: a binding with missing, reordered, or extra fields must not build.
+#[cfg(all(target_os = "windows", target_pointer_width = "64"))]
+const _: () = {
+    assert!(ort::sys::ORT_API_VERSION == 24);
+    assert!(std::mem::size_of::<ort::sys::OrtApi>() == 3_320);
+    assert!(std::mem::offset_of!(ort::sys::OrtApi, TensorTypeAndShape_HasShape) == 3_120);
+    assert!(std::mem::offset_of!(ort::sys::OrtApi, KernelInfo_GetOperatorSinceVersion) == 3_152);
+    assert!(std::mem::offset_of!(ort::sys::OrtApi, GetInteropApi) == 3_160);
+    assert!(std::mem::offset_of!(ort::sys::OrtApi, CreateEnvWithOptions) == 3_248);
+    assert!(std::mem::offset_of!(ort::sys::OrtApi, Session_GetEpGraphAssignmentInfo) == 3_256);
+    assert!(
+        std::mem::offset_of!(ort::sys::OrtApi, GetTensorElementTypeAndShapeDataReference) == 3_312
+    );
+};
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum AuditMode {
     Fail,

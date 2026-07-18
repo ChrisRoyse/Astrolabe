@@ -56,6 +56,10 @@ zstd = "0.13"
 # the release implementation intact while selecting runtime loading so the
 # process can attest one exact CUDA dependency bundle before any GPU call.
 candle-core = { path = "third_party/candle-core-0.10.2" }
+# ort-sys 2.0.0-rc.12 omitted KernelInfo_GetOperatorSinceVersion from
+# OrtApi's API-24 tail, shifting every later function pointer by one slot.
+# Pin the upstream offset repair until a crates.io release contains it.
+ort-sys = { git = "https://github.com/pykeio/ort", rev = "21533c58ee948ce354e20018a779bf3a5811f040" }
 # FastEmbed 5.16 hides every ONNX SessionBuilder. The owned source applies
 # Astrolabe's explicit CUDA-no-CPU-fallback/CPU session policy at all builders
 # and exposes the exact committed Session for API-24 placement attestation.
