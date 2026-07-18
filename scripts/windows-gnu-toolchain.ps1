@@ -2316,11 +2316,25 @@ finally {
     # (restoring the launcher's own process env is not a hazard to the children).
     $deferCleanupForLiveChildren = $false
     $liveAttributedPids = @()
+    $nonProtectingAttributed = @()
+    $attributionProbeFault = $null
     try {
-        $liveAttributedPids = @((Get-AstroLiveAttributedPids -ManifestPath $attributionManifest -SelfPid $PID).LivePids)
+        $attributionProbe = Get-AstroLiveAttributedPids -ManifestPath $attributionManifest -SelfPid $PID
+        $liveAttributedPids = @($attributionProbe.LivePids)
+        $nonProtectingAttributed = @($attributionProbe.NonProtecting)
     }
     catch {
+        $attributionProbeFault = $_.Exception.Message
         $liveAttributedPids = @()
+    }
+    if ($null -ne $attributionProbeFault) {
+        $deferCleanupForLiveChildren = $true
+        [Console]::Error.WriteLine("LAUNCHER_BOUNDARY[ASTRO_LAUNCHER_CLEANUP_DEFERRED_UNEVALUABLE]: {code=ASTRO_LAUNCHER_CLEANUP_DEFERRED_UNEVALUABLE; message=`"the attributed-child liveness probe failed ($attributionProbeFault); child protection state is unevaluable, so ALL exit cleanup is deferred fail-closed (#539)`"; remediation=`"do not remove .tmp or target/ by hand; repair the liveness probe and let the next launcher start reap this run only after the whole process tree is provably dead`"}")
+        Write-Output "CLEANUP[ASTRO_CLEANUP_DEFERRED]: deferred all exit cleanup; attributed-child protection state unevaluable (#539)"
+    }
+    if ($nonProtectingAttributed.Count -gt 0) {
+        $nonProtectingDescription = @($nonProtectingAttributed | ForEach-Object { "pid $($_.Pid) [$($_.ImagePath)] ($($_.Reason))" }) -join '; '
+        Write-Output "CLEANUP[ASTRO_NON_PROTECTING_CHILDREN]: $($nonProtectingAttributed.Count) live attributed child(ren) classified cleanup_protection=not_required and NOT deferring cleanup (#539): $nonProtectingDescription"
     }
     if ($liveAttributedPids.Count -gt 0) {
         $deferCleanupForLiveChildren = $true

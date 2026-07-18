@@ -91,6 +91,85 @@ function Get-AstroAttributionTreePids {
     return [pscustomobject]@{ Readable = $true; OpenPids = @($open | Sort-Object -Unique) }
 }
 
+function Get-AstroCleanupProtectionClass {
+    # #539: every live attributed process protects launcher-owned state by default. The
+    # sole exception is the detached MSVC telemetry uploader, which consumes no build
+    # inputs but can idle indefinitely after its compiler parent exits. It is
+    # non-protecting only when every identity predicate below succeeds. Classification is
+    # read-only and never stops or changes a process; an unreadable predicate protects.
+    param([Parameter(Mandatory)][int]$OwnerPid)
+
+    try {
+        $row = Get-CimInstance -ClassName Win32_Process -Filter "ProcessId = $OwnerPid" -ErrorAction Stop
+        if ($null -eq $row) {
+            return [pscustomobject]@{ Protection = 'not_required'; ImagePath = $null; Reason = 'process exited before classification' }
+        }
+        $imagePath = [string]$row.ExecutablePath
+        if ([string]::IsNullOrWhiteSpace($imagePath)) {
+            return [pscustomobject]@{ Protection = 'unevaluable'; ImagePath = $null; Reason = 'image path unreadable' }
+        }
+        if ([IO.Path]::GetFileName($imagePath) -notlike 'VCTIP.exe') {
+            return [pscustomobject]@{ Protection = 'required'; ImagePath = $imagePath; Reason = 'not the MSVC telemetry uploader' }
+        }
+        if ($imagePath -notmatch '\\VC\\Tools\\MSVC\\[^\\]+\\bin\\Host[^\\]+\\[^\\]+\\VCTIP\.EXE$') {
+            return [pscustomobject]@{ Protection = 'required'; ImagePath = $imagePath; Reason = 'VCTIP name outside an MSVC toolset host-tools directory' }
+        }
+
+        $commandLine = [string]$row.CommandLine
+        if ([string]::IsNullOrWhiteSpace($commandLine)) {
+            return [pscustomobject]@{ Protection = 'unevaluable'; ImagePath = $imagePath; Reason = 'command line unreadable' }
+        }
+        $trimmed = $commandLine.Trim()
+        $bareToken = $null
+        $remainder = $null
+        if ($trimmed.StartsWith('"')) {
+            $closing = $trimmed.IndexOf('"', 1)
+            if ($closing -gt 0) {
+                $bareToken = $trimmed.Substring(1, $closing - 1)
+                $remainder = $trimmed.Substring($closing + 1)
+            }
+        }
+        else {
+            $firstSpace = $trimmed.IndexOf(' ')
+            if ($firstSpace -lt 0) {
+                $bareToken = $trimmed
+                $remainder = ''
+            }
+            else {
+                $bareToken = $trimmed.Substring(0, $firstSpace)
+                $remainder = $trimmed.Substring($firstSpace)
+            }
+        }
+        if ($null -eq $bareToken -or -not [string]::IsNullOrWhiteSpace($remainder)) {
+            return [pscustomobject]@{ Protection = 'required'; ImagePath = $imagePath; Reason = 'VCTIP was invoked with arguments' }
+        }
+        if ([IO.Path]::GetFileName($bareToken.Trim()) -notlike 'VCTIP.exe') {
+            return [pscustomobject]@{ Protection = 'required'; ImagePath = $imagePath; Reason = 'command line does not name VCTIP' }
+        }
+
+        $ambientModulePath = $env:PSModulePath
+        try {
+            $env:PSModulePath = Join-Path $PSHOME 'Modules'
+            $securityManifest = Join-Path $PSHOME 'Modules\Microsoft.PowerShell.Security\Microsoft.PowerShell.Security.psd1'
+            Import-Module -Name $securityManifest -ErrorAction Stop
+            $signature = Get-AuthenticodeSignature -LiteralPath $imagePath -ErrorAction Stop
+        }
+        finally {
+            $env:PSModulePath = $ambientModulePath
+        }
+        if ($signature.Status.ToString() -cne 'Valid' -or $null -eq $signature.SignerCertificate) {
+            return [pscustomobject]@{ Protection = 'required'; ImagePath = $imagePath; Reason = "image signature status $($signature.Status)" }
+        }
+        if ($signature.SignerCertificate.Subject -notmatch 'O=Microsoft Corporation') {
+            return [pscustomobject]@{ Protection = 'required'; ImagePath = $imagePath; Reason = 'image signer is not Microsoft Corporation' }
+        }
+        return [pscustomobject]@{ Protection = 'not_required'; ImagePath = $imagePath; Reason = 'Microsoft-signed no-argument MSVC toolset VCTIP telemetry uploader (#539)' }
+    }
+    catch {
+        return [pscustomobject]@{ Protection = 'unevaluable'; ImagePath = $null; Reason = "classification failed: $($_.Exception.Message)" }
+    }
+}
+
 function Get-AstroLiveAttributedPids {
     # #320 cleanup gate: which recorded attributed tree pids are BOTH still open in the
     # manifest AND alive per the OS, EXCLUDING $SelfPid. A non-empty result means a detached
@@ -99,7 +178,10 @@ function Get-AstroLiveAttributedPids {
     # it. Combining "open interval" with "OS-alive" is precise: the recorder never saw the
     # pid exit AND a process with that pid currently exists -- pid-reuse of a closed interval
     # is excluded by the open-interval filter, an OS-dead open pid is excluded by the probe.
-    # Returns { ManifestReadable = $bool; LivePids = @(int) }.
+    # #539: LivePids contains only cleanup-protecting processes. A live process classified
+    # not_required is reported separately and never stopped. An unevaluable process stays
+    # protecting, so failed classification cannot authorize cleanup.
+    # Returns { ManifestReadable; LivePids; NonProtecting }.
     param(
         [Parameter(Mandatory)][string]$ManifestPath,
         [Parameter(Mandatory)][int]$SelfPid
@@ -107,11 +189,23 @@ function Get-AstroLiveAttributedPids {
 
     $parsed = Get-AstroAttributionTreePids -ManifestPath $ManifestPath
     $live = @()
+    $nonProtecting = @()
     foreach ($candidate in $parsed.OpenPids) {
         if ($candidate -eq $SelfPid) { continue }
-        if (Test-AstroPidAlive -OwnerPid $candidate) { $live += $candidate }
+        if (-not (Test-AstroPidAlive -OwnerPid $candidate)) { continue }
+        $class = Get-AstroCleanupProtectionClass -OwnerPid $candidate
+        if ($class.Protection -eq 'not_required') {
+            $nonProtecting += [pscustomobject]@{ Pid = $candidate; ImagePath = $class.ImagePath; Reason = $class.Reason }
+        }
+        else {
+            $live += $candidate
+        }
     }
-    return [pscustomobject]@{ ManifestReadable = $parsed.Readable; LivePids = @($live | Sort-Object -Unique) }
+    return [pscustomobject]@{
+        ManifestReadable = $parsed.Readable
+        LivePids = @($live | Sort-Object -Unique)
+        NonProtecting = @($nonProtecting | Sort-Object -Property Pid -Unique)
+    }
 }
 
 function Clear-DeadAttributionManifests {
