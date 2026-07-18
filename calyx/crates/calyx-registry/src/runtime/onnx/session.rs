@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use calyx_core::{CalyxError, Result};
 use ort::session::Session;
 
-use super::cpu_fallback_audit::profiling_file_path;
+use super::cpu_fallback_audit::{GRAPH_ASSIGNMENT_CONFIG, profiling_file_path};
 use super::green_context::GreenContextHandle;
 use super::{OnnxProviderPolicy, config_invalid};
 
@@ -235,6 +235,12 @@ pub(super) fn build_session(
         .map_err(|err| config_invalid(format!("ONNX session builder failed: {err}")))?
         .with_intra_threads(1)
         .map_err(|err| config_invalid(format!("ONNX intra-thread config failed: {err}")))?
+        .with_config_entry(GRAPH_ASSIGNMENT_CONFIG, "1")
+        .map_err(|err| {
+            config_invalid(format!(
+                "ONNX graph-assignment recording config failed for {label}: {err}"
+            ))
+        })?
         .with_execution_providers(
             super::fastembed_runtime::execution_providers_for_attested_device(
                 policy,

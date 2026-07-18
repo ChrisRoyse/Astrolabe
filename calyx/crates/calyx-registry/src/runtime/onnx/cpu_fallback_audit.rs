@@ -27,6 +27,7 @@ use ort::{AsPointer, Error as OrtError};
 use serde_json::Value;
 
 pub(super) const CPU_FALLBACK_CODE: &str = "CALYX_ONNX_QUANT_CPU_FALLBACK";
+pub(super) const GRAPH_ASSIGNMENT_CONFIG: &str = "session.record_ep_graph_assignment_info";
 
 // The crates.io ort-sys 2.0.0-rc.12 binding omitted
 // KernelInfo_GetOperatorSinceVersion from the API-24 OrtApi tail. That moved
