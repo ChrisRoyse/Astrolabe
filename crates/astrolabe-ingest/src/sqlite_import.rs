@@ -5323,6 +5323,47 @@ where
     Ok(resolved)
 }
 
+/// Global `qualified_name -> cx_id` resolution across every persisted
+/// `astrolabe:node-map:v2` row, regardless of project, with ambiguity reported
+/// explicitly (#522).
+///
+/// Returns `(resolved, ambiguous)`: `resolved` holds the first-seen `cx_id` for
+/// every qualified name, and `ambiguous` names those carried by more than one
+/// node with differing `cx_id`s. Unlike [`read_node_map_cx_ids`] — which silently
+/// drops ambiguous names for the best-effort anchor binder — this preserves the
+/// ambiguity set so the composite kernel projection can refuse a SIM edge whose
+/// endpoint qualified name resolves to more than one constellation, rather than
+/// binding a similarity edge to a guessed node. Fails closed on a node-map row
+/// carrying the wrong schema.
+pub(crate) fn read_global_qn_cx_ids<C>(
+    vault: &AsterVault<C>,
+) -> IngestResult<(BTreeMap<String, CxId>, BTreeSet<String>)>
+where
+    C: Clock,
+{
+    let snapshot = vault.latest_seq();
+    let mut resolved: BTreeMap<String, CxId> = BTreeMap::new();
+    let mut ambiguous: BTreeSet<String> = BTreeSet::new();
+    for row in read_graph_rows::<C, NodeMapRow>(vault, snapshot, NODE_MAP_PREFIX)? {
+        if row.schema != SCHEMA_NODE_MAP {
+            return Err(IngestError::InvalidInput(format!(
+                "node map row {} has wrong schema {}",
+                row.node_id, row.schema
+            )));
+        }
+        match resolved.get(&row.qualified_name) {
+            Some(existing) if *existing == row.cx_id => {}
+            Some(_) => {
+                ambiguous.insert(row.qualified_name.clone());
+            }
+            None => {
+                resolved.insert(row.qualified_name.clone(), row.cx_id);
+            }
+        }
+    }
+    Ok((resolved, ambiguous))
+}
+
 /// Deliberately perturbs one persisted node-map row's properties in the vault.
 ///
 /// Exists solely for the L2 shadow-parity harness (#19): it proves the parity

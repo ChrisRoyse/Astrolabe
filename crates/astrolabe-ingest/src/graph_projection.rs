@@ -23,6 +23,25 @@ pub const GRAPH_PROJECTION_CSR_PREFIX: &[u8] = b"astrolabe:projection-csr:v1:";
 
 const PROJECTION_REMEDIATION: &str =
     "Rebuild graph projections from Graph CF typed edge rows, then rerun astrolabe verify --deep.";
+
+// --- Persisted SIM_* similarity edge family (#522) ---
+//
+// Version-agnostic base prefix for persisted SIM_* similarity edge rows. The
+// authoritative writer is `astrolabe_weave::sim_rows` (`SimEdgeGraphRow`, wire
+// schema `astrolabe-sim-edge-v1`). `astrolabe-weave` depends on this crate, so
+// the composite kernel projection reads the rows by their stable persisted
+// schema rather than importing weave, which would be a dependency cycle. The
+// scan is version-agnostic and fails closed on any version segment other than
+// `v1`: a future SIM row version must be taught here explicitly, never silently
+// dropped, or the kernel graph would omit a whole similarity source family.
+const SIM_EDGE_ROW_BASE_PREFIX: &[u8] = b"astrolabe:sim-edge:";
+const SIM_EDGE_ROW_V1_PREFIX: &[u8] = b"astrolabe:sim-edge:v1:";
+const SCHEMA_SIM_EDGE_ROW: &str = "astrolabe-sim-edge-v1";
+// Ledger subject prefix of the SIM_* persistence group commit (weave writes
+// `SubjectId::Query("astrolabe-sim-edges:{dump_hash}")`). Every persisted SIM
+// row is attested by the newest such commit; a projection built from SIM rows
+// that carries no matching ledger attestation is refused.
+const SIM_EDGE_LEDGER_SUBJECT_PREFIX: &[u8] = b"astrolabe-sim-edges:";
 const PROJECTION_SCHEMA: &str = "astrolabe-graph-projection-csr-v1";
 const MANIFEST_VERSION: u32 = 1;
 const SEGMENT_MAGIC: &[u8; 8] = b"ASTROCSR";
@@ -279,9 +298,14 @@ pub struct GraphProjectionMaterializeEntry {
 /// Materialization result for one or more projections.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct GraphProjectionMaterializeReport {
-    /// Number of typed source edge rows scanned from Graph CF.
+    /// Number of source edge rows scanned from Graph CF across both families
+    /// (typed structural + persisted SIM_* similarity).
     pub source_edge_rows: usize,
-    /// Fingerprint of all source edge rows scanned from Graph CF.
+    /// Typed CBM structural edge rows scanned from Graph CF.
+    pub source_typed_edge_rows: usize,
+    /// Persisted SIM_* similarity edge rows folded into the composite graph (#522).
+    pub source_sim_edge_rows: usize,
+    /// Fingerprint of all source edge rows (both families) scanned from Graph CF.
     pub source_fingerprint_blake3: [u8; 32],
     /// Deterministic worker count requested by the caller.
     pub workers: usize,
@@ -293,12 +317,55 @@ pub struct GraphProjectionMaterializeReport {
 struct SourceEdges {
     rows: Vec<SourceEdgeRow>,
     fingerprint: [u8; 32],
+    /// Typed CBM structural edge rows scanned from Graph CF.
+    typed_edge_rows: usize,
+    /// Persisted SIM_* similarity edge rows folded into the composite graph.
+    sim_edge_rows: usize,
 }
 
+/// Which persisted Graph CF family a normalized source edge came from (#522).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SourceFamily {
+    /// `astrolabe:edge:v1:` typed CBM structural edge.
+    Typed,
+    /// `astrolabe:sim-edge:v1:` persisted learned/semantic similarity edge.
+    Similarity,
+}
+
+/// A source edge normalized across both persisted families (#522).
+///
+/// Typed structural rows carry a `CxId` src/dst directly; SIM_* rows carry
+/// qualified names resolved to `CxId`s through the persisted node map. Both
+/// contribute their source ledger attestation so the composite CSR edge stays
+/// attributable to a real persisted Ledger CF entry.
 #[derive(Clone, Debug)]
 struct SourceEdgeRow {
-    row: EdgeGraphRow,
+    src: CxId,
+    dst: CxId,
+    etype: u16,
+    weight: f32,
     kind: EdgeKind,
+    ledger_seq: u64,
+    ledger_hash: [u8; 32],
+    props: serde_json::Value,
+    #[allow(dead_code)]
+    family: SourceFamily,
+}
+
+/// Deserialize view of the persisted `astrolabe-sim-edge-v1` wire row.
+///
+/// Mirrors only the fields the composite projection needs from
+/// `astrolabe_weave::sim_rows::SimEdgeGraphRow` (the authoritative writer);
+/// serde ignores the remaining fields. Kept in lock-step with the persisted
+/// schema tag [`SCHEMA_SIM_EDGE_ROW`], validated on read.
+#[derive(Debug, Deserialize)]
+struct SimEdgeSourceRow {
+    schema: String,
+    family: String,
+    source_qn: String,
+    target_qn: String,
+    etype: u16,
+    weight_bits: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -372,6 +439,8 @@ where
     }
     Ok(GraphProjectionMaterializeReport {
         source_edge_rows: source.rows.len(),
+        source_typed_edge_rows: source.typed_edge_rows,
+        source_sim_edge_rows: source.sim_edge_rows,
         source_fingerprint_blake3: source.fingerprint,
         workers: options.workers.max(1),
         projections,
@@ -680,18 +749,27 @@ where
     Ok(rows_verified)
 }
 
+/// Reads the composite source-edge set the graph projections are built from:
+/// typed CBM structural edge rows **and** persisted SIM_* similarity edge rows
+/// (#522). The returned fingerprint frames the raw persisted bytes of **both**
+/// families, so a mutation to either invalidates every persisted CSR — a
+/// similarity edge can never be silently dropped and the structural-only graph
+/// is never a fallback.
 fn read_source_edges<C>(vault: &AsterVault<C>) -> IngestResult<SourceEdges>
 where
     C: Clock,
 {
-    let rows = vault.scan_cf_range_at(
-        vault.latest_seq(),
+    let snapshot = vault.latest_seq();
+    let mut hasher = blake3::Hasher::new();
+
+    // Family 1 — typed CBM structural edge rows (`astrolabe:edge:v1:`).
+    let typed = vault.scan_cf_range_at(
+        snapshot,
         ColumnFamily::Graph,
         &prefix_range(EDGE_ROW_PREFIX),
     )?;
-    let mut hasher = blake3::Hasher::new();
-    let mut out = Vec::with_capacity(rows.len());
-    for (key, value) in rows {
+    let mut out = Vec::with_capacity(typed.len());
+    for (key, value) in typed {
         frame_hash(&mut hasher, &key);
         frame_hash(&mut hasher, &value);
         let row = serde_json::from_slice::<EdgeGraphRow>(&value).map_err(|error| {
@@ -705,11 +783,176 @@ where
                 row.etype
             ))
         })?;
-        out.push(SourceEdgeRow { row, kind });
+        out.push(SourceEdgeRow {
+            src: row.src,
+            dst: row.dst,
+            etype: row.etype,
+            weight: row.weight,
+            kind,
+            ledger_seq: row.provenance.seq,
+            ledger_hash: row.provenance.hash,
+            props: row.props,
+            family: SourceFamily::Typed,
+        });
     }
+    let typed_edge_rows = out.len();
+
+    // Family 2 — persisted SIM_* similarity edge rows (`astrolabe:sim-edge:*`).
+    let sim_edge_rows = read_similarity_source_edges(vault, snapshot, &mut hasher, &mut out)?;
+
     Ok(SourceEdges {
         rows: out,
         fingerprint: *hasher.finalize().as_bytes(),
+        typed_edge_rows,
+        sim_edge_rows,
+    })
+}
+
+/// Scans and normalizes the persisted SIM_* similarity edge family, appending
+/// the resolved edges to `out` and framing every raw persisted row's bytes into
+/// `hasher` (so the shared source fingerprint covers this family). Returns the
+/// number of SIM rows folded in.
+///
+/// Fails closed — never silently drops a similarity source family — on: an
+/// unknown `astrolabe:sim-edge:` version segment, a wrong row schema, a family
+/// whose edge kind is not a similarity edge, a non-finite or out-of-range
+/// weight, a source/target qualified name that is unmapped or ambiguous in the
+/// persisted node map, or SIM rows that exist without their group-commit ledger
+/// attestation.
+fn read_similarity_source_edges<C>(
+    vault: &AsterVault<C>,
+    snapshot: Seq,
+    hasher: &mut blake3::Hasher,
+    out: &mut Vec<SourceEdgeRow>,
+) -> IngestResult<usize>
+where
+    C: Clock,
+{
+    let raw = vault.scan_cf_range_at(
+        snapshot,
+        ColumnFamily::Graph,
+        &prefix_range(SIM_EDGE_ROW_BASE_PREFIX),
+    )?;
+    if raw.is_empty() {
+        return Ok(0);
+    }
+
+    // Resolve endpoints and attest the family only when SIM rows are present.
+    let (resolved, ambiguous) = crate::sqlite_import::read_global_qn_cx_ids(vault)?;
+    let (ledger_seq, ledger_hash) = newest_sim_edge_ledger_attestation(vault, snapshot)?;
+
+    let mut count = 0usize;
+    for (key, value) in raw {
+        frame_hash(hasher, &key);
+        frame_hash(hasher, &value);
+        if !key.starts_with(SIM_EDGE_ROW_V1_PREFIX) {
+            return Err(projection_corrupt(format!(
+                "SIM edge row {} carries an unknown astrolabe:sim-edge version; refusing to \
+                 build a projection that would silently omit a similarity source family",
+                hex_key(&key)
+            )));
+        }
+        let row = serde_json::from_slice::<SimEdgeSourceRow>(&value).map_err(|error| {
+            projection_corrupt(format!("decode SIM edge row {}: {error}", hex_key(&key)))
+        })?;
+        if row.schema != SCHEMA_SIM_EDGE_ROW {
+            return Err(projection_corrupt(format!(
+                "SIM edge row {} carries schema {:?}, expected {SCHEMA_SIM_EDGE_ROW}",
+                hex_key(&key),
+                row.schema
+            )));
+        }
+        let kind = edge_kind_from_code(row.etype).ok_or_else(|| {
+            projection_corrupt(format!(
+                "SIM edge row {} has unknown etype {}",
+                hex_key(&key),
+                row.etype
+            ))
+        })?;
+        if !matches!(kind, EdgeKind::SimilarTo | EdgeKind::SemanticallyRelated) {
+            return Err(projection_corrupt(format!(
+                "SIM edge row {} (family {:?}) carries non-similarity edge kind {:?}",
+                hex_key(&key),
+                row.family,
+                kind
+            )));
+        }
+        let weight = f32::from_bits(row.weight_bits);
+        validate_edge_weight(weight, "SIM edge weight")?;
+        let src = resolve_sim_endpoint(&resolved, &ambiguous, &row.source_qn, &key, "source")?;
+        let dst = resolve_sim_endpoint(&resolved, &ambiguous, &row.target_qn, &key, "target")?;
+        out.push(SourceEdgeRow {
+            src,
+            dst,
+            etype: row.etype,
+            weight,
+            kind,
+            ledger_seq,
+            ledger_hash,
+            props: serde_json::Value::Null,
+            family: SourceFamily::Similarity,
+        });
+        count += 1;
+    }
+    Ok(count)
+}
+
+/// Resolves one SIM edge endpoint qualified name to its `CxId` fail-closed: an
+/// unmapped name or a name ambiguous across projects refuses rather than binding
+/// a similarity edge to a guessed constellation (#522).
+fn resolve_sim_endpoint(
+    resolved: &BTreeMap<String, CxId>,
+    ambiguous: &BTreeSet<String>,
+    qualified_name: &str,
+    key: &[u8],
+    role: &str,
+) -> IngestResult<CxId> {
+    if ambiguous.contains(qualified_name) {
+        return Err(projection_corrupt(format!(
+            "SIM edge row {} {role} qualified name {:?} resolves to more than one constellation; \
+             refusing to bind a similarity edge to a guessed node",
+            hex_key(key),
+            qualified_name
+        )));
+    }
+    resolved.get(qualified_name).copied().ok_or_else(|| {
+        projection_corrupt(format!(
+            "SIM edge row {} {role} qualified name {:?} has no persisted node-map CxId mapping",
+            hex_key(key),
+            qualified_name
+        ))
+    })
+}
+
+/// Recovers the newest SIM_* persistence group-commit ledger attestation
+/// (`SubjectId::Query("astrolabe-sim-edges:*")`) as `(seq, entry_hash)`. Fails
+/// closed when SIM rows exist but no such attestation is present — a SIM row set
+/// that cannot be tied to a real Ledger CF entry is never projected on trust.
+fn newest_sim_edge_ledger_attestation<C>(
+    vault: &AsterVault<C>,
+    snapshot: Seq,
+) -> IngestResult<(u64, [u8; 32])>
+where
+    C: Clock,
+{
+    let mut best: Option<(u64, [u8; 32])> = None;
+    for (_key, value) in vault.scan_cf_at(snapshot, ColumnFamily::Ledger)? {
+        let entry = decode(&value)?;
+        let SubjectId::Query(subject) = &entry.subject else {
+            continue;
+        };
+        if !subject.starts_with(SIM_EDGE_LEDGER_SUBJECT_PREFIX) {
+            continue;
+        }
+        if best.is_none_or(|(seq, _)| entry.seq > seq) {
+            best = Some((entry.seq, entry.entry_hash));
+        }
+    }
+    best.ok_or_else(|| {
+        projection_corrupt(
+            "persisted SIM edge rows exist but no astrolabe-sim-edges ledger attestation was \
+             found; refusing to project unattested similarity edges into the kernel graph",
+        )
     })
 }
 
@@ -855,23 +1098,19 @@ fn build_projection_csr(
     // real attestation with the projection edge without fabricating a reference.
     let mut edges = BTreeMap::<(CxId, CxId, u16), (f32, u64, [u8; 32])>::new();
     for source_edge in &source.rows {
-        let Some(weight) = kind.projected_weight(source_edge.kind, source_edge.row.weight) else {
+        let Some(weight) = kind.projected_weight(source_edge.kind, source_edge.weight) else {
             continue;
         };
         validate_edge_weight(weight, "projection edge weight")?;
-        node_weights.entry(source_edge.row.src).or_insert(1.0);
-        node_weights.entry(source_edge.row.dst).or_insert(1.0);
+        node_weights.entry(source_edge.src).or_insert(1.0);
+        node_weights.entry(source_edge.dst).or_insert(1.0);
         if kind == GraphProjectionKind::KernelGraph {
-            apply_kernel_node_weight(&mut node_weights, &source_edge.row)?;
+            apply_kernel_node_weight(&mut node_weights, source_edge)?;
         }
-        let seq = source_edge.row.provenance.seq;
-        let hash = source_edge.row.provenance.hash;
+        let seq = source_edge.ledger_seq;
+        let hash = source_edge.ledger_hash;
         edges
-            .entry((
-                source_edge.row.src,
-                source_edge.row.dst,
-                source_edge.row.etype,
-            ))
+            .entry((source_edge.src, source_edge.dst, source_edge.etype))
             .and_modify(|current| {
                 current.0 = current.0.max(weight);
                 if (seq, hash) > (current.1, current.2) {
@@ -932,7 +1171,7 @@ fn build_projection_csr(
 
 fn apply_kernel_node_weight(
     node_weights: &mut BTreeMap<CxId, f32>,
-    row: &EdgeGraphRow,
+    row: &SourceEdgeRow,
 ) -> IngestResult<()> {
     if let Some(count) = numeric_prop_any(&row.props, &["src_change_count", "source_change_count"])?
     {

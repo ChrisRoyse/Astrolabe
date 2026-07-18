@@ -221,9 +221,11 @@ pub const DEFAULT_MIN_VECTOR_SQUARED_NORM: f32 = f32::MIN_POSITIVE;
 pub const ASTROLABE_REACTIVE_REGISTRY_CAP: usize = CALYX_REACTIVE_REGISTRY_CAP;
 pub const ASTROLABE_REACTIVE_QUEUE_CAP: usize = CALYX_REACTIVE_QUEUE_CAP;
 pub const ASTROLABE_REACTIVE_AUDIT_CAP: usize = CALYX_REACTIVE_AUDIT_CAP;
-pub const PANEL_SLOT_COUNT_FOR_ABUNDANCE: usize = 22;
-pub const PANEL_CROSS_PAIR_COUNT_FOR_ABUNDANCE: usize =
-    PANEL_SLOT_COUNT_FOR_ABUNDANCE * (PANEL_SLOT_COUNT_FOR_ABUNDANCE - 1) / 2;
+/// Stable failure code when a cross-term plan is asked to account for a panel
+/// roster that cannot host the designed eager pairs, or when a symbol carries a
+/// slot outside the declared roster (#522). The abundance report must describe
+/// the panel that was physically persisted, never a compiled-in constant.
+pub const ASTRO_XTERM_PANEL_ROSTER_INVALID: &str = "ASTRO_XTERM_PANEL_ROSTER_INVALID";
 pub const DETECT_ANOMALIES_SCHEMA: &str = "astrolabe.detect_anomalies.v1";
 pub const ASTRO_ANOMALY_INVALID_KIND: &str = "ASTRO_ANOMALY_INVALID_KIND";
 pub const ASTROLABE_REACTIVE_ACK_TAG: &str = "astrolabe_reactive_ack_v1";
@@ -1267,7 +1269,11 @@ pub struct CrossTermAbundance {
     pub materialized_count: usize,
     pub scalar_count: usize,
     pub absent_count: usize,
-    pub lazy_pair_count: usize,
+    /// Active-slot pairs that carry no production consumer and are therefore
+    /// neither materialized nor evaluated. Never labeled `lazy`: a pair is only
+    /// `lazy` if a real production caller evaluates it on demand, and no such
+    /// caller exists for these (#522).
+    pub unevaluated_pair_count: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -2740,8 +2746,11 @@ pub fn blind_spot_anomaly_inputs(
     Ok(out)
 }
 
-pub fn plan_eager_cross_terms(nodes: &[SimilarityNode]) -> EagerCrossTermPlan {
-    plan_eager_cross_terms_selected(nodes, None)
+pub fn plan_eager_cross_terms(
+    nodes: &[SimilarityNode],
+    active_slot_count: usize,
+) -> calyx_core::Result<EagerCrossTermPlan> {
+    plan_eager_cross_terms_selected(nodes, None, active_slot_count)
 }
 
 /// Plans eager agreements only for the named dirty symbols while retaining the
@@ -2749,14 +2758,75 @@ pub fn plan_eager_cross_terms(nodes: &[SimilarityNode]) -> EagerCrossTermPlan {
 pub fn plan_eager_cross_terms_for_symbols(
     nodes: &[SimilarityNode],
     qualified_names: &BTreeSet<String>,
-) -> EagerCrossTermPlan {
-    plan_eager_cross_terms_selected(nodes, Some(qualified_names))
+    active_slot_count: usize,
+) -> calyx_core::Result<EagerCrossTermPlan> {
+    plan_eager_cross_terms_selected(nodes, Some(qualified_names), active_slot_count)
+}
+
+/// Largest panel slot id referenced by any designed eager agreement pair.
+///
+/// The persisted panel roster must physically host every designed pair, so a
+/// roster whose active slot count does not cover this id cannot describe the
+/// materialized eager cross-terms and is rejected fail-closed (#522).
+fn max_designed_eager_slot() -> u16 {
+    EagerAgreementKind::ALL
+        .into_iter()
+        .flat_map(|kind| {
+            let (left, right) = kind.slots();
+            [left.get(), right.get()]
+        })
+        .max()
+        .expect("EagerAgreementKind::ALL is non-empty")
+}
+
+fn xterm_panel_roster_invalid(message: String) -> calyx_core::CalyxError {
+    calyx_core::CalyxError {
+        code: ASTRO_XTERM_PANEL_ROSTER_INVALID,
+        message,
+        remediation: "Derive the active slot count from the persisted panel roster \
+             (astrolabe_panel::slots_for_version) so abundance describes the panel that \
+             was physically persisted; re-index if the persisted panel version is stale.",
+    }
+}
+
+/// Validates that `active_slot_count` — the number of slots S0..S(N-1) in the
+/// persisted panel roster — can host every designed eager pair and covers every
+/// slot the given symbols physically carry (#522). Slot ids are 0-indexed, so a
+/// roster of `N` slots hosts ids `0..=N-1`.
+fn validate_active_roster(
+    nodes: &[SimilarityNode],
+    active_slot_count: usize,
+) -> calyx_core::Result<()> {
+    let max_designed = max_designed_eager_slot();
+    if active_slot_count == 0 || usize::from(max_designed) >= active_slot_count {
+        return Err(xterm_panel_roster_invalid(format!(
+            "panel roster of {active_slot_count} active slots cannot host the designed eager \
+             pairs (largest designed slot id is S{max_designed}, which requires at least \
+             {} active slots)",
+            usize::from(max_designed) + 1
+        )));
+    }
+    for node in nodes {
+        for slot in node.slots.keys() {
+            if usize::from(slot.get()) >= active_slot_count {
+                return Err(xterm_panel_roster_invalid(format!(
+                    "symbol {:?} carries slot S{} outside the declared {active_slot_count}-slot \
+                     panel roster; the persisted panel version disagrees with the abundance roster",
+                    node.qualified_name,
+                    slot.get()
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn plan_eager_cross_terms_selected(
     nodes: &[SimilarityNode],
     qualified_names: Option<&BTreeSet<String>>,
-) -> EagerCrossTermPlan {
+    active_slot_count: usize,
+) -> calyx_core::Result<EagerCrossTermPlan> {
+    validate_active_roster(nodes, active_slot_count)?;
     let selected_indices = nodes
         .iter()
         .enumerate()
@@ -2817,25 +2887,31 @@ fn plan_eager_cross_terms_selected(
         .count();
     let absent_count = rows.len() - scalar_count;
     let symbol_count = selected_indices.len();
-    EagerCrossTermPlan {
+    // Abundance is derived from the persisted panel roster (N active slots),
+    // never a compiled-in constant: possible pairs per symbol is C(N, 2), and
+    // the raw yield spans the N unary slots, the C(N, 2) pairs, and the symbol
+    // itself (#522). `validate_active_roster` has already proven N hosts the
+    // designed eager pairs, so `possible_pairs >= eager` holds.
+    let n = active_slot_count;
+    let possible_pairs = n * (n - 1) / 2;
+    let eager = EagerAgreementKind::ALL.len();
+    Ok(EagerCrossTermPlan {
         rows,
         agreement_graph,
         abundance: CrossTermAbundance {
             symbol_count,
-            panel_slot_count: PANEL_SLOT_COUNT_FOR_ABUNDANCE,
-            possible_pair_count_per_symbol: PANEL_CROSS_PAIR_COUNT_FOR_ABUNDANCE,
-            raw_yield: symbol_count
-                * (PANEL_SLOT_COUNT_FOR_ABUNDANCE + PANEL_CROSS_PAIR_COUNT_FOR_ABUNDANCE + 1),
-            eager_pair_count_per_symbol: EagerAgreementKind::ALL.len(),
-            materialized_count: symbol_count * EagerAgreementKind::ALL.len(),
+            panel_slot_count: n,
+            possible_pair_count_per_symbol: possible_pairs,
+            raw_yield: symbol_count * (n + possible_pairs + 1),
+            eager_pair_count_per_symbol: eager,
+            materialized_count: symbol_count * eager,
             scalar_count,
             absent_count,
-            lazy_pair_count: symbol_count
-                * (PANEL_CROSS_PAIR_COUNT_FOR_ABUNDANCE - EagerAgreementKind::ALL.len()),
+            unevaluated_pair_count: symbol_count * (possible_pairs - eager),
         },
         neighborhood_sample_cap: sample_cap,
         neighborhood_capped_evaluations,
-    }
+    })
 }
 
 /// Computes one kind's cross-term values for the selected symbols, returning the

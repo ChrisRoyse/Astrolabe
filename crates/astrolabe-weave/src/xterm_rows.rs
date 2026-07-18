@@ -241,7 +241,7 @@ where
             "materialized_count": plan.abundance.materialized_count,
             "scalar_count": plan.abundance.scalar_count,
             "absent_count": plan.abundance.absent_count,
-            "lazy_pair_count": plan.abundance.lazy_pair_count,
+            "unevaluated_pair_count": plan.abundance.unevaluated_pair_count,
         },
         "xterm_dump_hash": xterm_dump_hash,
     }))
