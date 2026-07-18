@@ -89,11 +89,12 @@ fn row_for_metric(
     vectors: &DenseVectorFile,
     idx: u64,
     distance_metric: PartitionDistanceMetric,
-) -> Vec<f32> {
+) -> CliResult<Vec<f32>> {
     match distance_metric {
         PartitionDistanceMetric::UnitL2 => vectors.row_f32(idx),
         PartitionDistanceMetric::RawL2 => vectors.row_f32_raw(idx),
     }
+    .map_err(CliError::Calyx)
 }
 
 fn recall_from_i32bin_ground_truth(
@@ -280,7 +281,7 @@ fn run_search_real(args: &SearchArgs) -> CliResult {
         pruning_epsilon: args.pruning_epsilon,
     };
     for i in 0..n {
-        let q = row_for_metric(&q_vecs, i as u64, distance_metric);
+        let q = row_for_metric(&q_vecs, i as u64, distance_metric)?;
         let started = Instant::now();
         let readback = search
             .search_with_readback_opts(&q, args.k, search_opts)
@@ -322,7 +323,7 @@ fn run_search_real(args: &SearchArgs) -> CliResult {
                     manifest.dim
                 )));
             }
-            let truth = brute_force_topk_vecfile(&corpus, &gt_queries, args.k, distance_metric);
+            let truth = brute_force_topk_vecfile(&corpus, &gt_queries, args.k, distance_metric)?;
             recall_from_truth_sets(&gt_ann, &truth)
         })
     } else {

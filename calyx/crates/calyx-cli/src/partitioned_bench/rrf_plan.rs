@@ -9,12 +9,14 @@ use sha2::{Digest, Sha256};
 
 use crate::error::{CliError, CliResult};
 
-const KEY_PREFIX: &[u8] = b"calyx/partitioned-rrf/plan/v1/";
-const VALUE_MAGIC: &[u8] = b"CRRFPL1\0";
+const KEY_PREFIX: &[u8] = b"calyx/partitioned-rrf/plan/v2/";
+const LEGACY_KEY_PREFIX_V1: &[u8] = b"calyx/partitioned-rrf/plan/v1/";
+const VALUE_MAGIC: &[u8] = b"CRRFPL2\0";
+const LEGACY_VALUE_MAGIC_V1: &[u8] = b"CRRFPL1\0";
 const CF_MEMTABLE_CAP: usize = 8 * 1024 * 1024;
 
 pub(crate) const DEFAULT_ASSOCIATION_KEY: &str = "partitioned_rrf_plan";
-pub(crate) const FORMAT: &str = "calyx-partitioned-rrf-plan-v1";
+pub(crate) const FORMAT: &str = "calyx-partitioned-rrf-plan-v2";
 pub(crate) const MODE: &str = "partitioned_rrf_plan";
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -41,9 +43,17 @@ pub(crate) struct PlanSlot {
     /// verified against the opened file before any build/measurement.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) corpus_payload_blake3: Option<String>,
+    /// Shape- and format-bound canonical corpus identity. Required by
+    /// validation; Option exists only so legacy JSON can decode and be refused
+    /// with a precise remediation instead of a generic parse failure.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) corpus_source_blake3: Option<String>,
     /// Hex blake3 of the sealed queries payload.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) queries_payload_blake3: Option<String>,
+    /// Shape- and format-bound canonical query identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) queries_source_blake3: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -186,7 +196,17 @@ pub(crate) fn read(
 ) -> Result<(PartitionedRrfPlanRecord, PartitionedRrfPlanDbReadback)> {
     let row_key = row_key(association_key)?;
     let router = CfRouter::open(cf_root, CF_MEMTABLE_CAP)?;
-    let value = router.get(ColumnFamily::Graph, &row_key)?.ok_or_else(|| {
+    let value = router.get(ColumnFamily::Graph, &row_key)?;
+    if value.is_none() {
+        let legacy_key = prefixed_row_key(LEGACY_KEY_PREFIX_V1, association_key)?;
+        if router.get(ColumnFamily::Graph, &legacy_key)?.is_some() {
+            return Err(error(
+                "CALYX_FSV_PARTITIONED_RRF_PLAN_DB_LEGACY",
+                "partitioned RRF plan exists only at the v1 Graph CF key without required shape-bound source identities; re-import an authenticated v2 plan",
+            ));
+        }
+    }
+    let value = value.ok_or_else(|| {
         error(
             "CALYX_FSV_PARTITIONED_RRF_PLAN_DB_MISSING",
             "partitioned RRF plan row missing in Graph CF",
@@ -219,19 +239,61 @@ fn validate_unique_slots(plan: &Plan) -> CliResult {
                 slot.slot
             )));
         }
+        validate_identity(
+            slot.slot,
+            "corpus_payload_blake3",
+            slot.corpus_payload_blake3.as_deref(),
+        )?;
+        validate_identity(
+            slot.slot,
+            "corpus_source_blake3",
+            slot.corpus_source_blake3.as_deref(),
+        )?;
+        validate_identity(
+            slot.slot,
+            "queries_payload_blake3",
+            slot.queries_payload_blake3.as_deref(),
+        )?;
+        validate_identity(
+            slot.slot,
+            "queries_source_blake3",
+            slot.queries_source_blake3.as_deref(),
+        )?;
+    }
+    Ok(())
+}
+
+fn validate_identity(slot: u16, field: &str, value: Option<&str>) -> CliResult {
+    let value = value.ok_or_else(|| {
+        CliError::usage(format!(
+            "partitioned-rrf plan slot {slot} is missing required {field}; regenerate the plan and vector files together with the authenticated v2 exporter"
+        ))
+    })?;
+    if value.len() != 64
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(CliError::usage(format!(
+            "partitioned-rrf plan slot {slot} {field} must be exactly 64 lowercase hexadecimal characters"
+        )));
     }
     Ok(())
 }
 
 fn row_key(association_key: &str) -> Result<Vec<u8>> {
+    prefixed_row_key(KEY_PREFIX, association_key)
+}
+
+fn prefixed_row_key(prefix: &[u8], association_key: &str) -> Result<Vec<u8>> {
     if association_key.trim().is_empty() {
         return Err(error(
             "CALYX_FSV_PARTITIONED_RRF_PLAN_DB_INVALID_KEY",
             "partitioned RRF plan association key must be non-empty",
         ));
     }
-    let mut key = Vec::with_capacity(KEY_PREFIX.len() + association_key.len());
-    key.extend_from_slice(KEY_PREFIX);
+    let mut key = Vec::with_capacity(prefix.len() + association_key.len());
+    key.extend_from_slice(prefix);
     key.extend_from_slice(association_key.as_bytes());
     Ok(key)
 }
@@ -272,79 +334,13 @@ fn decode<T: for<'de> Deserialize<'de>>(bytes: &[u8]) -> Result<T> {
 }
 
 fn decode_plan_record(bytes: &[u8]) -> Result<PartitionedRrfPlanRecord> {
-    match decode(bytes) {
-        Ok(record) => Ok(record),
-        Err(_) => decode::<LegacyPartitionedRrfPlanRecord>(bytes).map(Into::into),
+    if bytes.starts_with(LEGACY_VALUE_MAGIC_V1) {
+        return Err(error(
+            "CALYX_FSV_PARTITIONED_RRF_PLAN_DB_LEGACY",
+            "partitioned RRF plan uses legacy CRRFPL1 bytes without required shape-bound vector source identities; re-import an authenticated v2 plan",
+        ));
     }
-}
-
-#[derive(Deserialize)]
-struct LegacyPlan {
-    #[serde(default)]
-    timeline: Option<PathBuf>,
-    slots: Vec<LegacyPlanSlot>,
-}
-
-#[derive(Deserialize)]
-struct LegacyPlanSlot {
-    slot: u16,
-    name: Option<String>,
-    lens_id: Option<String>,
-    weights_sha256: Option<String>,
-    signal_kind: Option<String>,
-    bits_about: Option<f32>,
-    vault: PathBuf,
-    queries: PathBuf,
-    corpus: PathBuf,
-}
-
-#[derive(Deserialize)]
-struct LegacyPartitionedRrfPlanRecord {
-    format: String,
-    mode: String,
-    imported_plan_sha256: String,
-    base_dir: PathBuf,
-    plan: LegacyPlan,
-}
-
-impl From<LegacyPlan> for Plan {
-    fn from(value: LegacyPlan) -> Self {
-        Self {
-            timeline: value.timeline,
-            slots: value.slots.into_iter().map(Into::into).collect(),
-        }
-    }
-}
-
-impl From<LegacyPlanSlot> for PlanSlot {
-    fn from(value: LegacyPlanSlot) -> Self {
-        Self {
-            slot: value.slot,
-            name: value.name,
-            lens_id: value.lens_id,
-            weights_sha256: value.weights_sha256,
-            signal_kind: value.signal_kind,
-            bits_about: value.bits_about,
-            vault: value.vault,
-            queries: value.queries,
-            query_start_row: 0,
-            corpus: value.corpus,
-            corpus_payload_blake3: None,
-            queries_payload_blake3: None,
-        }
-    }
-}
-
-impl From<LegacyPartitionedRrfPlanRecord> for PartitionedRrfPlanRecord {
-    fn from(value: LegacyPartitionedRrfPlanRecord) -> Self {
-        Self {
-            format: value.format,
-            mode: value.mode,
-            imported_plan_sha256: value.imported_plan_sha256,
-            base_dir: value.base_dir,
-            plan: value.plan.into(),
-        }
-    }
+    decode(bytes)
 }
 
 fn readback_report(

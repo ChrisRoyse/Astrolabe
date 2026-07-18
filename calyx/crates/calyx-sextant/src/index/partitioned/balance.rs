@@ -80,32 +80,22 @@ fn split_oversized(
             members,
             source,
             distance_metric,
-        )]);
+        )?]);
     }
     if depth >= MAX_RECLUSTER_DEPTH {
-        return Ok(chunk_centroids_by_cap(
-            members,
-            source,
-            cap,
-            distance_metric,
-        ));
+        return chunk_centroids_by_cap(members, source, cap, distance_metric);
     }
-    let sample = sample_rows(members, source);
+    let sample = sample_rows(members, source)?;
     let k_sub = members.len().div_ceil(cap).max(2).min(sample.len().max(1));
     let sub = build_centroids(&sample, k_sub, seed ^ salt.wrapping_mul(IDX_MIX));
     let mut sub_buckets: Vec<Vec<u64>> = vec![Vec::new(); sub.centroid_count()];
     for &idx in members {
-        let row = source.row(idx);
+        let row = source.row(idx)?;
         sub_buckets[sub.assign(&row)? as usize].push(idx);
     }
     let largest = sub_buckets.iter().map(Vec::len).max().unwrap_or(0);
     if largest >= members.len() {
-        return Ok(chunk_centroids_by_cap(
-            members,
-            source,
-            cap,
-            distance_metric,
-        ));
+        return chunk_centroids_by_cap(members, source, cap, distance_metric);
     }
     let mut out = Vec::new();
     for (sub_idx, bucket) in sub_buckets.into_iter().enumerate() {
@@ -129,7 +119,7 @@ fn split_oversized(
     Ok(out)
 }
 
-fn sample_rows(members: &[u64], source: &dyn VectorSource) -> Vec<(u32, Vec<f32>)> {
+fn sample_rows(members: &[u64], source: &dyn VectorSource) -> Result<Vec<(u32, Vec<f32>)>> {
     let sample_len = members.len().clamp(1, MAX_SPLIT_SAMPLE);
     let stride = members.len().div_ceil(sample_len).max(1);
     members
@@ -137,7 +127,7 @@ fn sample_rows(members: &[u64], source: &dyn VectorSource) -> Vec<(u32, Vec<f32>
         .step_by(stride)
         .take(sample_len)
         .enumerate()
-        .map(|(i, &idx)| (i as u32, source.row(idx)))
+        .map(|(i, &idx)| Ok((i as u32, source.row(idx)?)))
         .collect()
 }
 
@@ -146,7 +136,7 @@ fn chunk_centroids_by_cap(
     source: &dyn VectorSource,
     cap: usize,
     distance_metric: PartitionDistanceMetric,
-) -> Vec<Vec<f32>> {
+) -> Result<Vec<Vec<f32>>> {
     members
         .chunks(cap.max(1))
         .map(|chunk| centroid_for_source_members(chunk, source, distance_metric))
@@ -157,11 +147,11 @@ fn centroid_for_source_members(
     members: &[u64],
     source: &dyn VectorSource,
     distance_metric: PartitionDistanceMetric,
-) -> Vec<f32> {
+) -> Result<Vec<f32>> {
     let dim = source.dim();
     let mut center = vec![0.0; dim];
     for &idx in members {
-        let row = source.row(idx);
+        let row = source.row(idx)?;
         for (c, v) in center.iter_mut().zip(row) {
             *c += v;
         }
@@ -173,5 +163,5 @@ fn centroid_for_source_members(
     if distance_metric == PartitionDistanceMetric::UnitL2 {
         normalize(&mut center);
     }
-    center
+    Ok(center)
 }

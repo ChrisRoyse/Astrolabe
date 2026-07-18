@@ -27,7 +27,9 @@ pub use manifest::{
 pub use metric::PartitionDistanceMetric;
 pub use search::{PartitionedSearch, PartitionedSearchOptions, PartitionedSearchReadback};
 use sources::normalize;
-pub use sources::{FbinSource, I8BinSource, SyntheticSource, VectorSource, gen_row};
+pub use sources::{
+    FbinSource, I8BinSource, SyntheticSource, VectorSource, VectorSourceIdentity, gen_row,
+};
 
 const CENTROID_DIR: &str = "idx/slot_00.sparse";
 const ROOT_GRAPH: &str = "idx/slot_00.ann/graph.cda";
@@ -191,10 +193,20 @@ pub fn build_partitioned_vault_from_source_with_backend_and_metric(
 ) -> Result<PartitionedManifest> {
     let dim = source.dim();
     let n_cx = source.len();
+    let vector_source = source.identity();
     if n_cx == 0 || dim == 0 || p.n_regions == 0 || p.final_assignment_probe == 0 {
         return Err(crate::error::sextant_error(
             crate::error::CALYX_INDEX_INVALID_PARAMS,
             "partitioned vault requires nonzero source len, dim, n_regions, final_assignment_probe",
+        ));
+    }
+    if vector_source.dim != dim || vector_source.count != n_cx {
+        return Err(crate::error::sextant_error(
+            crate::error::CALYX_INDEX_INVALID_PARAMS,
+            format!(
+                "vector source identity shape {}x{} != source API shape {n_cx}x{dim}",
+                vector_source.count, vector_source.dim
+            ),
         ));
     }
     if p.final_assignment_cap == Some(0) {
@@ -233,11 +245,11 @@ pub fn build_partitioned_vault_from_source_with_backend_and_metric(
     let stride = (n_cx / sample as u64).max(1);
     let sample_rows: Vec<(u32, Vec<f32>)> = (0..sample)
         .into_par_iter()
-        .map(|s| {
+        .map(|s| -> Result<(u32, Vec<f32>)> {
             let idx = (s as u64 * stride) % n_cx;
-            (s as u32, source.row(idx))
+            Ok((s as u32, source.row(idx)?))
         })
-        .collect();
+        .collect::<Result<Vec<_>>>()?;
     let centroids = build_centroids(&sample_rows, p.n_regions, p.seed);
     let r = centroids.centroid_count();
 
@@ -348,8 +360,8 @@ pub fn build_partitioned_vault_from_source_with_backend_and_metric(
                 }
                 let rows: Vec<(CxId, Vec<f32>)> = members
                     .iter()
-                    .map(|&idx| (cx(idx), source.row(idx)))
-                    .collect();
+                    .map(|&idx| Ok((cx(idx), source.row(idx)?)))
+                    .collect::<Result<Vec<_>>>()?;
                 let graph_path = root.join(graph_rel(region));
                 build_partitioned_graph(
                     &graph_path,
@@ -390,7 +402,8 @@ pub fn build_partitioned_vault_from_source_with_backend_and_metric(
     )?;
 
     let manifest = PartitionedManifest {
-        format: "calyx-partitioned-vault-v1".to_string(),
+        format: "calyx-partitioned-vault-v2".to_string(),
+        vector_source,
         n_cx,
         dim,
         n_regions: centroids.centroid_count(),

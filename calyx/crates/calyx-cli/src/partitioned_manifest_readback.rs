@@ -36,9 +36,17 @@ pub(crate) fn run(args: &[String]) -> CliResult {
         .map(|closure| closure.replication_factor())
         .unwrap_or(1.0);
     println!(
-        "partitioned_manifest_readback source=calyx_aster_graph_cf vault={} format={} n_cx={} dim={} n_regions={} non_empty_regions={} stored_region_members={} min_region_count={} max_region_count={} m_max={} ef_construction={} distance_metric={} graph_build_backend={} final_assignment_probe={} final_assignment_cap={} final_assignment_max_replication={} replication_factor={:.6} value_bytes={} value_blake3={}",
+        "partitioned_manifest_readback source=calyx_aster_graph_cf vault={} format={} vector_source_kind={} vector_format={} vector_payload_blake3={} vector_source_blake3={} n_cx={} dim={} n_regions={} non_empty_regions={} stored_region_members={} min_region_count={} max_region_count={} m_max={} ef_construction={} distance_metric={} graph_build_backend={} final_assignment_probe={} final_assignment_cap={} final_assignment_max_replication={} replication_factor={:.6} value_bytes={} value_blake3={}",
         vault,
         manifest.format,
+        manifest.vector_source.source_kind,
+        manifest.vector_source.format,
+        manifest
+            .vector_source
+            .payload_blake3
+            .as_deref()
+            .unwrap_or("none"),
+        manifest.vector_source.source_blake3,
         manifest.n_cx,
         manifest.dim,
         manifest.n_regions,

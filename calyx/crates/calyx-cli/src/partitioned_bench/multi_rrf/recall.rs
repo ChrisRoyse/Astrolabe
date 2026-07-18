@@ -9,6 +9,7 @@ use super::slot_truth::SlotTruth;
 use super::slot_truth_db::DbSlotTruth;
 use super::timeline;
 use super::{OpenSlot, fuse, fused_hit_ids, report, row_for_metric, slot_id, to_index_hits};
+use crate::error::{CliError, CliResult};
 use crate::partitioned_bench::brute_force::brute_force_topk_vecfile_ranked;
 
 const DISTANCE_TIE_EPSILON: f32 = 1.0e-6;
@@ -40,7 +41,7 @@ pub(super) struct RecallReadback {
     pub(super) ground_truth_source: Option<Value>,
 }
 
-pub(super) fn readback(req: Request<'_>) -> RecallReadback {
+pub(super) fn readback(req: Request<'_>) -> CliResult<RecallReadback> {
     let mut single_found: BTreeMap<SlotId, usize> = req
         .slots
         .iter()
@@ -53,8 +54,8 @@ pub(super) fn readback(req: Request<'_>) -> RecallReadback {
     let mut exact_fused_rows = Vec::with_capacity(req.truth_n);
     let mut truth_sets = Vec::with_capacity(req.truth_n);
     for query_idx in 0..req.truth_n {
-        let (exact_ids, exact_slot_rows) = exact_truth_for_query(&req, query_idx);
-        let truth = accepted_truth_for_query(&req, query_idx, &exact_ids);
+        let (exact_ids, exact_slot_rows) = exact_truth_for_query(&req, query_idx)?;
+        let truth = accepted_truth_for_query(&req, query_idx, &exact_ids)?;
         if sample_readback.len() < 3 {
             sample_readback.push(sample_row(&req, query_idx, &exact_ids, exact_slot_rows));
         }
@@ -89,7 +90,7 @@ pub(super) fn readback(req: Request<'_>) -> RecallReadback {
         .iter()
         .map(|slot| slot_id(slot.spec.slot))
         .collect::<Vec<_>>();
-    RecallReadback {
+    Ok(RecallReadback {
         fused_recall: Some(fused_recall),
         per_slot_recall: per_slot,
         best_single: best,
@@ -105,27 +106,27 @@ pub(super) fn readback(req: Request<'_>) -> RecallReadback {
         per_query_recall,
         exact_fused_rows,
         ground_truth_source: Some(ground_truth_source(&req)),
-    }
+    })
 }
 
-fn exact_truth_for_query(req: &Request<'_>, query_idx: usize) -> (Vec<u64>, Vec<Value>) {
+fn exact_truth_for_query(req: &Request<'_>, query_idx: usize) -> CliResult<(Vec<u64>, Vec<Value>)> {
     if let Some(precomputed) = req.precomputed_truth {
-        return (
+        return Ok((
             precomputed.row_ids(query_idx).to_vec(),
             Vec::from([json!({"source": "precomputed_fused_rrf_i32bin"})]),
-        );
+        ));
     }
     if let Some(precomputed) = req.db_fused_truth {
-        return (
+        return Ok((
             precomputed.row_ids(query_idx).to_vec(),
             Vec::from([json!({"source": "precomputed_fused_rrf_aster_cf"})]),
-        );
+        ));
     }
     if let Some(slot_truth) = req.slot_truth {
-        return fused_from_slot_truth(req, query_idx, slot_truth);
+        return Ok(fused_from_slot_truth(req, query_idx, slot_truth));
     }
     if let Some(slot_truth) = req.db_slot_truth {
-        return fused_from_db_slot_truth(req, query_idx, slot_truth);
+        return Ok(fused_from_db_slot_truth(req, query_idx, slot_truth));
     }
     let mut exact_per_slot = BTreeMap::new();
     let mut exact_slot_rows = Vec::new();
@@ -134,15 +135,16 @@ fn exact_truth_for_query(req: &Request<'_>, query_idx: usize) -> (Vec<u64>, Vec<
             &slot.queries,
             slot.query_row(query_idx),
             slot.distance_metric,
-        );
+        )?;
         let exact = brute_force_topk_vecfile_ranked(
             &slot.corpus,
             &[query],
             req.truth_depth,
             slot.distance_metric,
-        )
-        .pop()
-        .expect("one query");
+        )?
+        .into_iter()
+        .next()
+        .ok_or_else(|| CliError::runtime("exact vector scan returned no row for one query"))?;
         exact_slot_rows.push(json!({
             "slot": slot.spec.slot,
             "exact_top_k": exact.iter().take(req.k).map(|(id, _)| *id).collect::<Vec<_>>(),
@@ -150,7 +152,7 @@ fn exact_truth_for_query(req: &Request<'_>, query_idx: usize) -> (Vec<u64>, Vec<
         exact_per_slot.insert(slot_id(slot.spec.slot), to_index_hits(exact));
     }
     let exact_fused = fuse(&exact_per_slot, req.k);
-    (fused_hit_ids(&exact_fused, req.k), exact_slot_rows)
+    Ok((fused_hit_ids(&exact_fused, req.k), exact_slot_rows))
 }
 
 fn fused_from_db_slot_truth(
@@ -213,53 +215,53 @@ fn accepted_truth_for_query(
     req: &Request<'_>,
     query_idx: usize,
     exact_ids: &[u64],
-) -> BTreeSet<u64> {
+) -> CliResult<BTreeSet<u64>> {
     let mut accepted = exact_ids.iter().copied().collect::<BTreeSet<_>>();
     if req.slot_truth.is_none() && req.db_slot_truth.is_none() {
-        return accepted;
+        return Ok(accepted);
     }
     let mut candidates = accepted.clone();
     candidates.extend(req.fused_hits[query_idx].iter().copied());
-    let scores = tie_aware_rrf_scores(req, query_idx, &candidates);
+    let scores = tie_aware_rrf_scores(req, query_idx, &candidates)?;
     let cutoff = exact_ids
         .iter()
         .filter_map(|row_id| scores.get(row_id).copied())
         .min_by(f32::total_cmp);
     let Some(cutoff) = cutoff else {
-        return accepted;
+        return Ok(accepted);
     };
     for (row_id, score) in scores {
         if candidates.contains(&row_id) && score + f32::EPSILON >= cutoff {
             accepted.insert(row_id);
         }
     }
-    accepted
+    Ok(accepted)
 }
 
 fn tie_aware_rrf_scores(
     req: &Request<'_>,
     query_idx: usize,
     candidates: &BTreeSet<u64>,
-) -> BTreeMap<u64, f32> {
+) -> CliResult<BTreeMap<u64, f32>> {
     let mut scores = BTreeMap::new();
     for slot in req.slots {
         let slot_id = slot_id(slot.spec.slot);
         let rows = slot_truth_rows(req, slot_id, query_idx);
-        let truth_distances = truth_distances(slot, query_idx, &rows);
+        let truth_distances = truth_distances(slot, query_idx, &rows)?;
         let query = row_for_metric(
             &slot.queries,
             slot.query_row(query_idx),
             slot.distance_metric,
-        );
+        )?;
         for row_id in candidates {
-            let row = row_for_metric(&slot.corpus, *row_id, slot.distance_metric);
+            let row = row_for_metric(&slot.corpus, *row_id, slot.distance_metric)?;
             let candidate_distance = distance(&query, &row, slot.distance_metric);
             if let Some(rank) = strict_or_tied_rank(*row_id, candidate_distance, &truth_distances) {
                 *scores.entry(*row_id).or_insert(0.0) += 1.0 / (rank as f32 + RRF_K);
             }
         }
     }
-    scores
+    Ok(scores)
 }
 
 fn slot_truth_rows(req: &Request<'_>, slot: SlotId, query_idx: usize) -> Vec<u64> {
@@ -272,17 +274,17 @@ fn slot_truth_rows(req: &Request<'_>, slot: SlotId, query_idx: usize) -> Vec<u64
     Vec::new()
 }
 
-fn truth_distances(slot: &OpenSlot, query_idx: usize, rows: &[u64]) -> Vec<(u64, f32)> {
+fn truth_distances(slot: &OpenSlot, query_idx: usize, rows: &[u64]) -> CliResult<Vec<(u64, f32)>> {
     let query = row_for_metric(
         &slot.queries,
         slot.query_row(query_idx),
         slot.distance_metric,
-    );
+    )?;
     rows.iter()
         .copied()
-        .map(|row_id| {
-            let row = row_for_metric(&slot.corpus, row_id, slot.distance_metric);
-            (row_id, distance(&query, &row, slot.distance_metric))
+        .map(|row_id| -> CliResult<(u64, f32)> {
+            let row = row_for_metric(&slot.corpus, row_id, slot.distance_metric)?;
+            Ok((row_id, distance(&query, &row, slot.distance_metric)))
         })
         .collect()
 }

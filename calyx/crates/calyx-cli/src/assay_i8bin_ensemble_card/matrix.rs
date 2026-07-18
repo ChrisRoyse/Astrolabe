@@ -52,7 +52,7 @@ pub(crate) fn read_vectors(
         validate_file(slot, &file, total_rows)?;
         dims.push(file.dim());
         lenses.push(sample_lens(slot, &file, sample)?);
-        signatures.push(row_signatures(&file, &signature_idx));
+        signatures.push(row_signatures(&file, &signature_idx)?);
     }
     let matrix = pair_matrix(&plan.slots, &signatures, nmi_bins)?;
     Ok(VectorReadout {
@@ -97,7 +97,7 @@ fn sample_lens(
 ) -> Result<EnsembleLensInput, String> {
     let mut vectors = Vec::with_capacity(sample.indices.len());
     for idx in &sample.indices {
-        vectors.push(file.row_f32(*idx));
+        vectors.push(file.row_f32(*idx).map_err(calyx_error_detail)?);
     }
     Ok(EnsembleLensInput::new(
         slot.name.clone(),
@@ -106,12 +106,14 @@ fn sample_lens(
     ))
 }
 
-fn row_signatures(file: &DenseVectorFile, indices: &[u64]) -> Vec<f32> {
+fn row_signatures(file: &DenseVectorFile, indices: &[u64]) -> Result<Vec<f32>, String> {
     indices
         .iter()
         .map(|idx| match file {
-            DenseVectorFile::Fbin(file) => mean(file.row(*idx)),
-            DenseVectorFile::I8Bin(file) => i8_normalized_mean(file.row_i8(*idx)),
+            DenseVectorFile::Fbin(file) => Ok(mean(file.row(*idx).map_err(calyx_error_detail)?)),
+            DenseVectorFile::I8Bin(file) => Ok(i8_normalized_mean(
+                file.row_i8(*idx).map_err(calyx_error_detail)?,
+            )),
         })
         .collect()
 }

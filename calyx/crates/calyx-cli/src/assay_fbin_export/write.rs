@@ -246,8 +246,8 @@ fn finish_sinks(
         let sink = sinks.remove(name).expect("sink seeded");
         let corpus_rows_written = sink.corpus_written;
         let query_rows_written = sink.query_written;
-        let corpus_payload_blake3 = hex32(sink.corpus.finalize().map_err(CliError::Calyx)?);
-        let queries_payload_blake3 = hex32(sink.queries.finalize().map_err(CliError::Calyx)?);
+        let corpus_identity = sink.corpus.finalize().map_err(CliError::Calyx)?;
+        let queries_identity = sink.queries.finalize().map_err(CliError::Calyx)?;
         let prefix = lens_prefix(slot, name);
         out.push(LensEvidence {
             slot: u16::try_from(slot).map_err(|_| CliError::usage("slot exceeds u16"))?,
@@ -264,8 +264,10 @@ fn finish_sinks(
             vault_path: display_final(args, &format!("vaults/{prefix}")),
             corpus_rows_written,
             query_rows_written,
-            corpus_payload_blake3,
-            queries_payload_blake3,
+            corpus_payload_blake3: hex32(corpus_identity.payload_blake3),
+            corpus_source_blake3: hex32(corpus_identity.source_blake3),
+            queries_payload_blake3: hex32(queries_identity.payload_blake3),
+            queries_source_blake3: hex32(queries_identity.source_blake3),
         });
     }
     Ok(out)
@@ -293,7 +295,9 @@ fn write_plan(path: &Path, timeline_path: &str, lenses: &[LensEvidence]) -> CliR
                 "queries": lens.queries_path,
                 "corpus": lens.corpus_path,
                 "corpus_payload_blake3": lens.corpus_payload_blake3,
+                "corpus_source_blake3": lens.corpus_source_blake3,
                 "queries_payload_blake3": lens.queries_payload_blake3,
+                "queries_source_blake3": lens.queries_source_blake3,
             })
         })
         .collect::<Vec<_>>();

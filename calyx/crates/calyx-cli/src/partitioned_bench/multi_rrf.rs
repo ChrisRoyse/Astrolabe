@@ -246,7 +246,7 @@ pub(crate) fn run(raw: &[String]) -> CliResult {
                     &slot.queries,
                     slot.query_row(query_idx),
                     slot.distance_metric,
-                );
+                )?;
                 let raw_hits = slot
                     .search
                     .search_with_readback_opts(&query, truth_depth, search_opts)
@@ -284,7 +284,7 @@ pub(crate) fn run(raw: &[String]) -> CliResult {
             db_fused_truth: db_fused_truth.as_ref(),
             slot_truth: slot_truth.as_ref(),
             db_slot_truth: db_slot_truth.as_ref(),
-        })
+        })?
     } else {
         recall::RecallReadback::default()
     };
@@ -436,12 +436,27 @@ fn open_slots(plan: &Plan, base_dir: &Path) -> CliResult<Vec<OpenSlot>> {
                 slot.corpus_payload_blake3.as_deref(),
                 corpus.payload_blake3(),
             )?;
+            verify_plan_source_identity(
+                slot.slot,
+                "corpus",
+                &corpus_path,
+                slot.corpus_source_blake3.as_deref(),
+                corpus.source_blake3(),
+            )?;
+            verify_vault_source_identity(slot.slot, &vault_path, &search, &corpus)?;
             verify_plan_payload_identity(
                 slot.slot,
                 "queries",
                 &queries_path,
                 slot.queries_payload_blake3.as_deref(),
                 queries.payload_blake3(),
+            )?;
+            verify_plan_source_identity(
+                slot.slot,
+                "queries",
+                &queries_path,
+                slot.queries_source_blake3.as_deref(),
+                queries.source_blake3(),
             )?;
             if queries.dim() != search.dim() || corpus.dim() != search.dim() {
                 return Err(CliError::usage(format!(
@@ -463,9 +478,6 @@ fn open_slots(plan: &Plan, base_dir: &Path) -> CliResult<Vec<OpenSlot>> {
         .collect()
 }
 
-/// Binds the plan-declared authenticated source identity to the opened vector
-/// file. A plan that declares a payload digest must match the sealed digest of
-/// the file it names; mismatches are refused before any measurement.
 fn verify_plan_payload_identity(
     slot: u16,
     role: &str,
@@ -473,19 +485,84 @@ fn verify_plan_payload_identity(
     declared_hex: Option<&str>,
     opened: [u8; 32],
 ) -> CliResult {
-    let Some(declared_hex) = declared_hex else {
-        return Ok(());
-    };
+    verify_plan_identity(slot, role, path, "payload", declared_hex, opened)
+}
+
+fn verify_plan_source_identity(
+    slot: u16,
+    role: &str,
+    path: &Path,
+    declared_hex: Option<&str>,
+    opened: [u8; 32],
+) -> CliResult {
+    verify_plan_identity(slot, role, path, "source", declared_hex, opened)
+}
+
+/// Binds both the exact payload and the canonical shape/format identity in the
+/// plan to the independently authenticated file before any measurement.
+fn verify_plan_identity(
+    slot: u16,
+    role: &str,
+    path: &Path,
+    identity_kind: &str,
+    declared_hex: Option<&str>,
+    opened: [u8; 32],
+) -> CliResult {
+    let declared_hex = declared_hex.ok_or_else(|| {
+        CliError::usage(format!(
+            "slot {slot} {role} is missing required {identity_kind} identity for {}; regenerate the plan and vector files together",
+            path.display()
+        ))
+    })?;
     let opened_hex = opened
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect::<String>();
     if declared_hex != opened_hex {
         return Err(CliError::usage(format!(
-            "slot {slot} {role} payload identity mismatch for {}: plan declares blake3 \
+            "slot {slot} {role} {identity_kind} identity mismatch for {}: plan declares blake3 \
              {declared_hex} but the sealed file digest is {opened_hex}; regenerate the plan or \
              the vector files together",
             path.display()
+        )));
+    }
+    Ok(())
+}
+
+fn verify_vault_source_identity(
+    slot: u16,
+    vault_path: &Path,
+    search: &PartitionedSearch,
+    corpus: &DenseVectorFile,
+) -> CliResult {
+    let declared = &search.manifest().vector_source;
+    if declared.source_kind != "authenticated_vector_file" {
+        return Err(CliError::usage(format!(
+            "slot {slot} vault {} was built from source kind {}, not an authenticated vector file; rebuild from the plan corpus",
+            vault_path.display(),
+            declared.source_kind
+        )));
+    }
+    let opened_source = corpus
+        .source_blake3()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let opened_payload = corpus
+        .payload_blake3()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    if declared.source_blake3 != opened_source
+        || declared.payload_blake3.as_deref() != Some(opened_payload.as_str())
+    {
+        return Err(CliError::usage(format!(
+            "slot {slot} vault {} vector source identity does not match corpus: vault source={} payload={} corpus source={} payload={}; rebuild the vault from this exact corpus",
+            vault_path.display(),
+            declared.source_blake3,
+            declared.payload_blake3.as_deref().unwrap_or("missing"),
+            opened_source,
+            opened_payload
         )));
     }
     Ok(())

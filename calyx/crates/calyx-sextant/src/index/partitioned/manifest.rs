@@ -7,10 +7,13 @@ use calyx_aster::cf::{CfRouter, ColumnFamily};
 use calyx_core::Result;
 use serde::{Deserialize, Serialize};
 
+use super::sources::VectorSourceIdentity;
 use super::{DiskAnnBuildBackend, PartitionDistanceMetric};
 
-const MANIFEST_DB_KEY: &[u8] = b"calyx/partitioned-vault/manifest/v1/default";
-const MANIFEST_DB_VALUE_MAGIC: &[u8] = b"CPARTM1\0";
+const MANIFEST_DB_KEY: &[u8] = b"calyx/partitioned-vault/manifest/v2/default";
+const LEGACY_MANIFEST_DB_KEY_V1: &[u8] = b"calyx/partitioned-vault/manifest/v1/default";
+const MANIFEST_DB_VALUE_MAGIC: &[u8] = b"CPARTM2\0";
+const LEGACY_MANIFEST_DB_VALUE_MAGIC_V1: &[u8] = b"CPARTM1\0";
 const CF_MEMTABLE_CAP: usize = 64 * 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -56,6 +59,9 @@ impl ClosureAssignmentStats {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PartitionedManifest {
     pub format: String,
+    /// Authenticated identity of the exact vector source used by every build
+    /// phase. This is persisted in the Graph CF row, not inferred from paths.
+    pub vector_source: VectorSourceIdentity,
     pub n_cx: u64,
     pub dim: usize,
     pub n_regions: usize,
@@ -98,6 +104,80 @@ pub struct PartitionedManifest {
     pub regions: Vec<RegionMeta>,
 }
 
+impl PartitionedManifest {
+    pub fn validate_vector_source(&self) -> Result<()> {
+        if self.format != "calyx-partitioned-vault-v2" {
+            return Err(crate::error::sextant_error(
+                crate::error::CALYX_INDEX_LEGACY_FORMAT,
+                format!(
+                    "partitioned manifest format {} does not bind the authenticated v2 vector source contract",
+                    self.format
+                ),
+            ));
+        }
+        if self.vector_source.dim != self.dim || self.vector_source.count != self.n_cx {
+            return Err(crate::error::sextant_error(
+                crate::error::CALYX_INDEX_MANIFEST_DB_INVALID,
+                format!(
+                    "partitioned manifest vector source shape {}x{} != manifest shape {}x{}",
+                    self.vector_source.count, self.vector_source.dim, self.n_cx, self.dim
+                ),
+            ));
+        }
+        validate_hex(
+            "vector_source.source_blake3",
+            &self.vector_source.source_blake3,
+        )?;
+        match self.vector_source.source_kind.as_str() {
+            "authenticated_vector_file" => {
+                if !matches!(self.vector_source.format.as_str(), "CLXVEC02" | "CLXI8B02") {
+                    return Err(crate::error::sextant_error(
+                        crate::error::CALYX_INDEX_MANIFEST_DB_INVALID,
+                        format!(
+                            "authenticated vector source has unsupported format {}",
+                            self.vector_source.format
+                        ),
+                    ));
+                }
+                let payload = self
+                    .vector_source
+                    .payload_blake3
+                    .as_deref()
+                    .ok_or_else(|| {
+                        crate::error::sextant_error(
+                            crate::error::CALYX_INDEX_MANIFEST_DB_INVALID,
+                            "authenticated vector source is missing payload_blake3",
+                        )
+                    })?;
+                validate_hex("vector_source.payload_blake3", payload)?;
+            }
+            "deterministic_synthetic_diagnostic" => {
+                if self.vector_source.format != "CALYXSYN1"
+                    || self.vector_source.payload_blake3.is_some()
+                {
+                    return Err(crate::error::sextant_error(
+                        crate::error::CALYX_INDEX_MANIFEST_DB_INVALID,
+                        "synthetic diagnostic source must use CALYXSYN1 and must not claim a payload digest",
+                    ));
+                }
+            }
+            other => {
+                return Err(crate::error::sextant_error(
+                    crate::error::CALYX_INDEX_MANIFEST_DB_INVALID,
+                    format!("unknown partitioned vector source kind {other}"),
+                ));
+            }
+        }
+        if self.vector_source.storage_contract.trim().is_empty() {
+            return Err(crate::error::sextant_error(
+                crate::error::CALYX_INDEX_MANIFEST_DB_INVALID,
+                "partitioned vector source storage_contract is empty",
+            ));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct PartitionedManifestDbReadback {
     pub manifest: PartitionedManifest,
@@ -114,13 +194,14 @@ pub(super) fn default_rng_factor() -> f32 {
 }
 
 pub(super) fn write_manifest_db(root: &Path, manifest: &PartitionedManifest) -> Result<()> {
+    manifest.validate_vector_source()?;
     let value = encode_manifest(manifest)?;
     let mut router = CfRouter::open(root, CF_MEMTABLE_CAP)?;
     router.put(ColumnFamily::Graph, MANIFEST_DB_KEY, &value)?;
     router.flush_cf(ColumnFamily::Graph)?;
     drop(router);
 
-    let readback = read_manifest_bytes(root)?.ok_or_else(|| {
+    let readback = read_current_manifest_bytes(root)?.ok_or_else(|| {
         crate::error::sextant_error(
             crate::error::CALYX_INDEX_MANIFEST_DB_MISSING,
             "partitioned manifest Graph CF row missing after write",
@@ -136,7 +217,14 @@ pub(super) fn write_manifest_db(root: &Path, manifest: &PartitionedManifest) -> 
 }
 
 pub(super) fn read_manifest_db(root: &Path) -> Result<PartitionedManifest> {
-    let value = read_manifest_bytes(root)?.ok_or_else(|| {
+    let value = read_current_manifest_bytes(root)?;
+    if value.is_none() && read_manifest_bytes(root, LEGACY_MANIFEST_DB_KEY_V1)?.is_some() {
+        return Err(crate::error::sextant_error(
+            crate::error::CALYX_INDEX_LEGACY_FORMAT,
+            "partitioned vault carries a v1 manifest without authenticated vector source identity",
+        ));
+    }
+    let value = value.ok_or_else(|| {
         crate::error::sextant_error(
             crate::error::CALYX_INDEX_MANIFEST_DB_MISSING,
             "partitioned manifest Graph CF row is missing",
@@ -149,11 +237,19 @@ pub(super) fn manifest_db_exists(root: &Path) -> Result<bool> {
     if !graph_cf_dir(root).is_dir() {
         return Ok(false);
     }
-    Ok(read_manifest_bytes(root)?.is_some())
+    Ok(read_current_manifest_bytes(root)?.is_some()
+        || read_manifest_bytes(root, LEGACY_MANIFEST_DB_KEY_V1)?.is_some())
 }
 
 pub(super) fn read_manifest_db_readback(root: &Path) -> Result<PartitionedManifestDbReadback> {
-    let value = read_manifest_bytes(root)?.ok_or_else(|| {
+    let value = read_current_manifest_bytes(root)?;
+    if value.is_none() && read_manifest_bytes(root, LEGACY_MANIFEST_DB_KEY_V1)?.is_some() {
+        return Err(crate::error::sextant_error(
+            crate::error::CALYX_INDEX_LEGACY_FORMAT,
+            "partitioned vault carries a v1 manifest without authenticated vector source identity",
+        ));
+    }
+    let value = value.ok_or_else(|| {
         crate::error::sextant_error(
             crate::error::CALYX_INDEX_MANIFEST_DB_MISSING,
             "partitioned manifest Graph CF row is missing",
@@ -167,12 +263,16 @@ pub(super) fn read_manifest_db_readback(root: &Path) -> Result<PartitionedManife
     })
 }
 
-fn read_manifest_bytes(root: &Path) -> Result<Option<Vec<u8>>> {
+fn read_current_manifest_bytes(root: &Path) -> Result<Option<Vec<u8>>> {
+    read_manifest_bytes(root, MANIFEST_DB_KEY)
+}
+
+fn read_manifest_bytes(root: &Path, key: &[u8]) -> Result<Option<Vec<u8>>> {
     if !graph_cf_dir(root).is_dir() {
         return Ok(None);
     }
     let router = CfRouter::open(root, CF_MEMTABLE_CAP)?;
-    router.get(ColumnFamily::Graph, MANIFEST_DB_KEY)
+    router.get(ColumnFamily::Graph, key)
 }
 
 fn graph_cf_dir(root: &Path) -> std::path::PathBuf {
@@ -193,6 +293,12 @@ fn encode_manifest(manifest: &PartitionedManifest) -> Result<Vec<u8>> {
 }
 
 fn decode_manifest(value: &[u8]) -> Result<PartitionedManifest> {
+    if value.starts_with(LEGACY_MANIFEST_DB_VALUE_MAGIC_V1) {
+        return Err(crate::error::sextant_error(
+            crate::error::CALYX_INDEX_LEGACY_FORMAT,
+            "partitioned manifest uses CPARTM1 bytes without authenticated vector source identity",
+        ));
+    }
     let payload = value.strip_prefix(MANIFEST_DB_VALUE_MAGIC).ok_or_else(|| {
         crate::error::sextant_error(
             crate::error::CALYX_INDEX_MANIFEST_DB_INVALID,
@@ -212,5 +318,22 @@ fn decode_manifest(value: &[u8]) -> Result<PartitionedManifest> {
             "partitioned manifest DB row has trailing bytes",
         ));
     }
+    manifest.validate_vector_source()?;
     Ok(manifest)
+}
+
+fn validate_hex(field: &str, value: &str) -> Result<()> {
+    if value.len() != 64
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(crate::error::sextant_error(
+            crate::error::CALYX_INDEX_MANIFEST_DB_INVALID,
+            format!(
+                "partitioned manifest {field} must be exactly 64 lowercase hexadecimal characters"
+            ),
+        ));
+    }
+    Ok(())
 }

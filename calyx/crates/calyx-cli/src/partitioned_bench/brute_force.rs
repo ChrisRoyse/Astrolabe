@@ -3,6 +3,8 @@ use std::collections::{BinaryHeap, HashSet};
 use calyx_sextant::index::{DenseVectorFile, PartitionDistanceMetric, gen_row};
 use rayon::prelude::*;
 
+use crate::error::{CliError, CliResult};
+
 const CHUNK: u64 = 200_000;
 
 /// Brute-force the true top-`k` neighbours (by cosine distance) for each query
@@ -14,11 +16,13 @@ pub(super) fn brute_force_topk_vecfile(
     queries: &[Vec<f32>],
     k: usize,
     distance_metric: PartitionDistanceMetric,
-) -> Vec<HashSet<u64>> {
-    brute_force_topk_vecfile_ranked(corpus, queries, k, distance_metric)
-        .into_iter()
-        .map(|row| row.into_iter().map(|(id, _)| id).collect())
-        .collect()
+) -> CliResult<Vec<HashSet<u64>>> {
+    Ok(
+        brute_force_topk_vecfile_ranked(corpus, queries, k, distance_metric)?
+            .into_iter()
+            .map(|row| row.into_iter().map(|(id, _)| id).collect())
+            .collect(),
+    )
 }
 
 /// Brute-force exact ranked top-k rows (by cosine distance) for each real query
@@ -29,7 +33,7 @@ pub(super) fn brute_force_topk_vecfile_ranked(
     queries: &[Vec<f32>],
     k: usize,
     distance_metric: PartitionDistanceMetric,
-) -> Vec<Vec<(u64, f32)>> {
+) -> CliResult<Vec<Vec<(u64, f32)>>> {
     let n_cx = corpus.count();
     let mut heaps: Vec<BinaryHeap<(OrdF32, u64)>> = (0..queries.len())
         .map(|_| BinaryHeap::with_capacity(k + 1))
@@ -40,16 +44,16 @@ pub(super) fn brute_force_topk_vecfile_ranked(
         for (qi, q) in queries.iter().enumerate() {
             let scored: Vec<(OrdF32, u64)> = (start..end)
                 .into_par_iter()
-                .map(|idx| {
-                    let row = row_for_metric(corpus, idx, distance_metric);
-                    (OrdF32(distance(q, &row, distance_metric)), idx)
+                .map(|idx| -> CliResult<(OrdF32, u64)> {
+                    let row = row_for_metric(corpus, idx, distance_metric)?;
+                    Ok((OrdF32(distance(q, &row, distance_metric)), idx))
                 })
-                .collect();
+                .collect::<CliResult<Vec<_>>>()?;
             push_scored(&mut heaps[qi], scored, k);
         }
         start = end;
     }
-    heaps_to_ranked(heaps)
+    Ok(heaps_to_ranked(heaps))
 }
 
 /// Brute-force the true top-`k` neighbours (by L2) for each query over the
@@ -116,11 +120,16 @@ fn distance(left: &[f32], right: &[f32], metric: PartitionDistanceMetric) -> f32
     }
 }
 
-fn row_for_metric(corpus: &DenseVectorFile, idx: u64, metric: PartitionDistanceMetric) -> Vec<f32> {
+fn row_for_metric(
+    corpus: &DenseVectorFile,
+    idx: u64,
+    metric: PartitionDistanceMetric,
+) -> CliResult<Vec<f32>> {
     match metric {
         PartitionDistanceMetric::UnitL2 => corpus.row_f32(idx),
         PartitionDistanceMetric::RawL2 => corpus.row_f32_raw(idx),
     }
+    .map_err(CliError::Calyx)
 }
 
 fn push_scored(heap: &mut BinaryHeap<(OrdF32, u64)>, scored: Vec<(OrdF32, u64)>, k: usize) {

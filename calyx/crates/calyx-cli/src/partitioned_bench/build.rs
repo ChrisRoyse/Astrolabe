@@ -207,6 +207,8 @@ pub(crate) fn run(args: &[String]) -> CliResult {
     let report = json!({
         "trigger": "calyx build-partitioned-vault",
         "vault": args.vault.to_string_lossy(),
+        "format": manifest.format,
+        "vector_source": manifest.vector_source,
         "n_cx": manifest.n_cx,
         "dim": manifest.dim,
         "n_regions": manifest.n_regions,

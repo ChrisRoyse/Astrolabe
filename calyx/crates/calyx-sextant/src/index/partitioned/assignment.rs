@@ -82,7 +82,7 @@ pub(super) fn stream_assign_to_ids_with_routing(
         let mut assigned: Vec<(u64, u32)> = (start..end)
             .into_par_iter()
             .map(|idx| -> Result<(u64, u32)> {
-                let row = source.row(idx);
+                let row = source.row(idx)?;
                 let region = match routing {
                     AssignmentRouting::Exact => centroids.assign(&row)?,
                     AssignmentRouting::UnitCosineHnsw => centroids.assign_unit_cosine_hnsw(&row)?,
@@ -161,7 +161,7 @@ pub(super) fn stream_assign_to_ids_bounded(
         let rayon_assigned: Vec<(u64, Vec<(usize, f32)>)> = (start..end)
             .into_par_iter()
             .map(|idx| -> Result<(u64, Vec<(usize, f32)>)> {
-                let row = source.row(idx);
+                let row = source.row(idx)?;
                 let candidates = match config.routing {
                     AssignmentRouting::Exact => {
                         centroids.nearest_centroids_exact_l2(&row, probe)?

@@ -96,8 +96,12 @@ pub(crate) struct LensEvidence {
     /// Hex blake3 of the sealed corpus payload — the authenticated source
     /// identity bound into downstream build/measurement manifests.
     pub(crate) corpus_payload_blake3: String,
+    /// Canonical corpus identity binding format, shape, count, and payload.
+    pub(crate) corpus_source_blake3: String,
     /// Hex blake3 of the sealed queries payload.
     pub(crate) queries_payload_blake3: String,
+    /// Canonical query identity binding format, shape, count, and payload.
+    pub(crate) queries_source_blake3: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) worker_pid: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]

@@ -343,7 +343,10 @@ fn validate_files(
 fn load_rows(file: &DenseVectorFile, start: usize, rows: usize) -> CliResult<Vec<f32>> {
     let mut out = Vec::with_capacity(rows * file.dim());
     for offset in 0..rows {
-        out.extend(file.row_f32((start + offset) as u64));
+        out.extend(
+            file.row_f32((start + offset) as u64)
+                .map_err(CliError::Calyx)?,
+        );
     }
     Ok(out)
 }

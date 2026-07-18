@@ -5,6 +5,12 @@ use serde::Serialize;
 
 use crate::error::{CliError, CliResult};
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub(crate) struct VectorFileSeal {
+    pub(crate) payload_blake3: String,
+    pub(crate) source_blake3: String,
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
 pub(crate) enum VectorFormat {
     #[serde(rename = "fbin")]
@@ -93,13 +99,20 @@ impl VectorFileSink {
         }
     }
 
-    /// Seals the payload digest into the header and returns it hex-encoded for
-    /// downstream manifest binding.
-    pub(crate) fn finalize(self) -> CliResult<String> {
-        let digest = match self {
+    /// Validates and atomically publishes the vector file, returning both its
+    /// exact payload digest and its shape-bound canonical source identity.
+    pub(crate) fn finalize(self) -> CliResult<VectorFileSeal> {
+        let identity = match self {
             Self::Fbin(writer) => writer.finalize().map_err(CliError::Calyx)?,
             Self::I8Bin(writer) => writer.finalize().map_err(CliError::Calyx)?,
         };
-        Ok(digest.iter().map(|byte| format!("{byte:02x}")).collect())
+        Ok(VectorFileSeal {
+            payload_blake3: hex32(&identity.payload_blake3),
+            source_blake3: hex32(&identity.source_blake3),
+        })
     }
+}
+
+fn hex32(digest: &[u8; 32]) -> String {
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
 }

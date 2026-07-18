@@ -41,7 +41,9 @@ struct FbinSink {
 /// bound into the worker report and the downstream RRF plan manifest.
 struct SinkDigests {
     corpus_payload_blake3: String,
+    corpus_source_blake3: String,
     queries_payload_blake3: String,
+    queries_source_blake3: String,
 }
 
 struct LensStream<'a> {
@@ -394,9 +396,13 @@ fn write_timeline_row(
 /// payload digests into the headers, and returns the digests for manifest
 /// binding.
 fn finish_sink(sink: FbinSink) -> CliResult<SinkDigests> {
+    let corpus = sink.corpus.finalize()?;
+    let queries = sink.queries.finalize()?;
     Ok(SinkDigests {
-        corpus_payload_blake3: sink.corpus.finalize()?,
-        queries_payload_blake3: sink.queries.finalize()?,
+        corpus_payload_blake3: corpus.payload_blake3,
+        corpus_source_blake3: corpus.source_blake3,
+        queries_payload_blake3: queries.payload_blake3,
+        queries_source_blake3: queries.source_blake3,
     })
 }
 
@@ -426,7 +432,9 @@ fn write_plan(
                 query_start_row: 0,
                 corpus: PathBuf::from(&lens.corpus_path),
                 corpus_payload_blake3: Some(lens.corpus_payload_blake3.clone()),
+                corpus_source_blake3: Some(lens.corpus_source_blake3.clone()),
                 queries_payload_blake3: Some(lens.queries_payload_blake3.clone()),
+                queries_source_blake3: Some(lens.queries_source_blake3.clone()),
             })
             .collect(),
     };
@@ -447,7 +455,9 @@ fn write_plan(
                 "queries": lens.queries_path,
                 "corpus": lens.corpus_path,
                 "corpus_payload_blake3": lens.corpus_payload_blake3,
+                "corpus_source_blake3": lens.corpus_source_blake3,
                 "queries_payload_blake3": lens.queries_payload_blake3,
+                "queries_source_blake3": lens.queries_source_blake3,
             })
         })
         .collect::<Vec<_>>();

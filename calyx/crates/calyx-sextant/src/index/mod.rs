@@ -55,7 +55,7 @@ pub use partitioned::{
     DEFAULT_FINAL_ASSIGNMENT_PROBE, FbinSource, I8BinSource, PartitionBuildParams,
     PartitionDistanceMetric, PartitionedManifest, PartitionedManifestDbReadback, PartitionedSearch,
     PartitionedSearchOptions, PartitionedSearchReadback, RegionMeta, SyntheticSource, VectorSource,
-    build_partitioned_vault, build_partitioned_vault_from_source,
+    VectorSourceIdentity, build_partitioned_vault, build_partitioned_vault_from_source,
     build_partitioned_vault_from_source_with_backend,
     build_partitioned_vault_from_source_with_backend_and_metric,
     build_partitioned_vault_with_backend, gen_row, partitioned_manifest_db_exists,
@@ -74,7 +74,8 @@ pub use spann::{
 pub use testutil::{SyntheticVault, build_synthetic_vault, synthetic_dense_rows};
 pub use vecfile::{
     DenseVectorFile, FbinVectors, FbinWriter, I8BIN_MAGIC, I8BinVectors, I8BinWriter, I32BinMatrix,
-    VEC_HEADER_LEN, VEC_MAGIC, VEC_MAGIC_LEGACY_V1,
+    VEC_HEADER_LEN, VEC_MAGIC, VEC_MAGIC_LEGACY_V1, VECTOR_FILE_MAX_DIM, VectorFileFormat,
+    VectorFileIdentity,
 };
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
