@@ -383,6 +383,29 @@ static void build_def_props(char *buf, size_t bufsize, const CBMDefinition *def,
     /* API callees — panel S4 (api_callees guard slot) encoder source (#374). */
     append_json_string(buf, bufsize, &pos, "callees", callees);
 
+    /* #501/#473: byte-exact parse-time source span + exact source bytes. `sb`/`eb`
+     * are the end-exclusive tree-sitter byte offsets of the definition node; the
+     * importer reads `source_snippet` as the real code payload for
+     * `source_snippet_bytes` (dedup census #473) and S18-S20 measurement (#501),
+     * replacing the #413 property-fingerprint proxy. The `source_snippet` append
+     * is atomic (append_json_string): a body too large for the remaining buffer
+     * emits no field and the symbol stays honestly source-absent (falls back to
+     * the fingerprint, labeled) rather than carrying truncated bytes. The byte
+     * offsets are emitted only alongside the exact bytes so a consumer never sees
+     * a span without its verifiable payload. */
+    if (def->source && def->end_byte > def->start_byte) {
+        size_t before = pos;
+        append_json_string(buf, bufsize, &pos, "source_snippet", def->source);
+        if (pos != before) {
+            /* Exact bytes fit; emit the matching byte span as JSON numbers. */
+            int wrote = snprintf(buf + pos, bufsize - pos, ",\"sb\":%u,\"eb\":%u",
+                                 def->start_byte, def->end_byte);
+            if (wrote > 0 && (size_t)wrote < bufsize - pos) {
+                pos += (size_t)wrote;
+            }
+        }
+    }
+
     if (pos < bufsize - SKIP_ONE) {
         buf[pos] = '}';
         buf[pos + SKIP_ONE] = '\0';

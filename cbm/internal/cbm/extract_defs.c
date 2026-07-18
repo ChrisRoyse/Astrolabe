@@ -3139,6 +3139,8 @@ static void extract_func_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec 
     def.file_path = ctx->rel_path;
     def.start_line = ts_node_start_point(node).row + TS_LINE_OFFSET;
     def.end_line = ts_node_end_point(node).row + TS_LINE_OFFSET;
+    def.start_byte = ts_node_start_byte(node);
+    def.end_byte = ts_node_end_byte(node);
     def.lines = (int)(def.end_line - def.start_line + TS_LINE_OFFSET);
     def.is_exported = cbm_is_exported(name, ctx->language);
 
@@ -3319,6 +3321,8 @@ static void push_simple_class_def(CBMExtractCtx *ctx, TSNode node, char *name, c
     def.file_path = ctx->rel_path;
     def.start_line = ts_node_start_point(node).row + TS_LINE_OFFSET;
     def.end_line = ts_node_end_point(node).row + TS_LINE_OFFSET;
+    def.start_byte = ts_node_start_byte(node);
+    def.end_byte = ts_node_end_byte(node);
     def.is_exported = true;
     cbm_defs_push(&ctx->result->defs, a, def);
 }
@@ -3855,6 +3859,8 @@ static void extract_class_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec
     def.file_path = ctx->rel_path;
     def.start_line = ts_node_start_point(node).row + TS_LINE_OFFSET;
     def.end_line = ts_node_end_point(node).row + TS_LINE_OFFSET;
+    def.start_byte = ts_node_start_byte(node);
+    def.end_byte = ts_node_end_byte(node);
     def.lines = (int)(def.end_line - def.start_line + TS_LINE_OFFSET);
     def.is_exported = cbm_is_exported(name, ctx->language);
     def.base_classes = extract_base_classes(a, node, ctx->source, ctx->language);
@@ -3919,6 +3925,8 @@ static void extract_class_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec
                 pdef.return_type = ptype;
                 pdef.start_line = ts_node_start_point(p).row + TS_LINE_OFFSET;
                 pdef.end_line = ts_node_end_point(p).row + TS_LINE_OFFSET;
+                pdef.start_byte = ts_node_start_byte(p);
+                pdef.end_byte = ts_node_end_byte(p);
                 pdef.is_exported = false;
                 cbm_defs_push(&ctx->result->defs, a, pdef);
             }
@@ -4120,6 +4128,8 @@ static void push_method_def(CBMExtractCtx *ctx, TSNode child, TSNode class_node,
     def.parent_class = class_qn;
     def.start_line = ts_node_start_point(child).row + TS_LINE_OFFSET;
     def.end_line = ts_node_end_point(child).row + TS_LINE_OFFSET;
+    def.start_byte = ts_node_start_byte(child);
+    def.end_byte = ts_node_end_byte(child);
     def.lines = (int)(def.end_line - def.start_line + TS_LINE_OFFSET);
     def.is_exported = cbm_is_exported(name, ctx->language);
 
@@ -4340,6 +4350,8 @@ static void extract_rust_impl(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec
         def.parent_class = type_qn;
         def.start_line = ts_node_start_point(child).row + TS_LINE_OFFSET;
         def.end_line = ts_node_end_point(child).row + TS_LINE_OFFSET;
+        def.start_byte = ts_node_start_byte(child);
+        def.end_byte = ts_node_end_byte(child);
         def.is_exported = cbm_is_exported(name, ctx->language);
 
         TSNode params = ts_node_child_by_field_name(child, TS_FIELD("parameters"));
@@ -4402,6 +4414,8 @@ static void extract_elixir_func_def(CBMExtractCtx *ctx, TSNode node, const char 
     def.file_path = ctx->rel_path;
     def.start_line = ts_node_start_point(node).row + TS_LINE_OFFSET;
     def.end_line = ts_node_end_point(node).row + TS_LINE_OFFSET;
+    def.start_byte = ts_node_start_byte(node);
+    def.end_byte = ts_node_end_byte(node);
     def.is_exported = (strcmp(macro, "def") == 0 || strcmp(macro, "defmacro") == 0);
     cbm_defs_push(&ctx->result->defs, a, def);
 }
@@ -4430,6 +4444,8 @@ static TSNode emit_elixir_module_class(CBMExtractCtx *ctx, TSNode cur) {
     def.file_path = ctx->rel_path;
     def.start_line = ts_node_start_point(cur).row + TS_LINE_OFFSET;
     def.end_line = ts_node_end_point(cur).row + TS_LINE_OFFSET;
+    def.start_byte = ts_node_start_byte(cur);
+    def.end_byte = ts_node_end_byte(cur);
     def.is_exported = true;
     cbm_defs_push(&ctx->result->defs, a, def);
     return cbm_find_child_by_kind(cur, "do_block");
@@ -4496,6 +4512,8 @@ static void push_var_def(CBMExtractCtx *ctx, const char *name, TSNode node) {
     def.file_path = ctx->rel_path;
     def.start_line = ts_node_start_point(node).row + TS_LINE_OFFSET;
     def.end_line = ts_node_end_point(node).row + TS_LINE_OFFSET;
+    def.start_byte = ts_node_start_byte(node);
+    def.end_byte = ts_node_end_byte(node);
     def.is_exported = cbm_is_exported(name, ctx->language);
     cbm_defs_push(&ctx->result->defs, a, def);
 }
@@ -4626,6 +4644,8 @@ static void extract_enum_members(CBMExtractCtx *ctx, TSNode node, const char *cl
         mdef.file_path = ctx->rel_path;
         mdef.start_line = ts_node_start_point(member).row + TS_LINE_OFFSET;
         mdef.end_line = ts_node_end_point(member).row + TS_LINE_OFFSET;
+        mdef.start_byte = ts_node_start_byte(member);
+        mdef.end_byte = ts_node_end_byte(member);
         cbm_defs_push(&ctx->result->defs, a, mdef);
     }
 }
@@ -5511,6 +5531,8 @@ static bool extract_schema_field(CBMExtractCtx *ctx, TSNode child, const char *c
     }
     def.start_line = ts_node_start_point(child).row + TS_LINE_OFFSET;
     def.end_line = ts_node_end_point(child).row + TS_LINE_OFFSET;
+    def.start_byte = ts_node_start_byte(child);
+    def.end_byte = ts_node_end_byte(child);
     def.is_exported = cbm_is_exported(name, ctx->language);
     cbm_defs_push(&ctx->result->defs, a, def);
     return true;
@@ -5611,6 +5633,8 @@ static void extract_class_fields(CBMExtractCtx *ctx, TSNode class_node, const ch
         def.return_type = type_text;
         def.start_line = ts_node_start_point(child).row + TS_LINE_OFFSET;
         def.end_line = ts_node_end_point(child).row + TS_LINE_OFFSET;
+        def.start_byte = ts_node_start_byte(child);
+        def.end_byte = ts_node_end_byte(child);
         def.is_exported = cbm_is_exported(name, ctx->language);
 
         cbm_defs_push(&ctx->result->defs, a, def);
@@ -5923,6 +5947,8 @@ static void extract_cfml_function_tag(CBMExtractCtx *ctx, TSNode node) {
     def.file_path = ctx->rel_path;
     def.start_line = ts_node_start_point(node).row + TS_LINE_OFFSET;
     def.end_line = ts_node_end_point(node).row + TS_LINE_OFFSET;
+    def.start_byte = ts_node_start_byte(node);
+    def.end_byte = ts_node_end_byte(node);
     def.lines = (int)(def.end_line - def.start_line + TS_LINE_OFFSET);
     def.is_exported = true;
     cbm_defs_push(&ctx->result->defs, a, def);
@@ -5957,6 +5983,8 @@ static void extract_gotemplate_define(CBMExtractCtx *ctx, TSNode node) {
     def.file_path = ctx->rel_path;
     def.start_line = ts_node_start_point(node).row + TS_LINE_OFFSET;
     def.end_line = ts_node_end_point(node).row + TS_LINE_OFFSET;
+    def.start_byte = ts_node_start_byte(node);
+    def.end_byte = ts_node_end_byte(node);
     def.lines = (int)(def.end_line - def.start_line + TS_LINE_OFFSET);
     def.is_exported = true;
     cbm_defs_push(&ctx->result->defs, a, def);
@@ -6012,6 +6040,8 @@ static void extract_janet_def(CBMExtractCtx *ctx, TSNode node) {
     def.file_path = ctx->rel_path;
     def.start_line = ts_node_start_point(node).row + TS_LINE_OFFSET;
     def.end_line = ts_node_end_point(node).row + TS_LINE_OFFSET;
+    def.start_byte = ts_node_start_byte(node);
+    def.end_byte = ts_node_end_byte(node);
     def.lines = (int)(def.end_line - def.start_line + TS_LINE_OFFSET);
     def.is_exported = true;
     cbm_defs_push(&ctx->result->defs, a, def);
@@ -6047,6 +6077,8 @@ static void extract_c_macro_def(CBMExtractCtx *ctx, TSNode node) {
     def.file_path = ctx->rel_path;
     def.start_line = ts_node_start_point(node).row + TS_LINE_OFFSET;
     def.end_line = ts_node_end_point(node).row + TS_LINE_OFFSET;
+    def.start_byte = ts_node_start_byte(node);
+    def.end_byte = ts_node_end_byte(node);
     def.lines = (int)(def.end_line - def.start_line + TS_LINE_OFFSET);
     def.is_exported = true; // macros have no translation-unit scoping — globally visible
 
@@ -6136,6 +6168,8 @@ static void extract_lisp_def(CBMExtractCtx *ctx, TSNode node) {
     def.file_path = ctx->rel_path;
     def.start_line = ts_node_start_point(node).row + TS_LINE_OFFSET;
     def.end_line = ts_node_end_point(node).row + TS_LINE_OFFSET;
+    def.start_byte = ts_node_start_byte(node);
+    def.end_byte = ts_node_end_byte(node);
     def.lines = (int)(def.end_line - def.start_line + TS_LINE_OFFSET);
     def.is_exported = true;
     cbm_defs_push(&ctx->result->defs, a, def);
@@ -6231,6 +6265,8 @@ static void recover_kotlin_error_classes(CBMExtractCtx *ctx, TSNode err_node) {
         def.file_path = ctx->rel_path;
         def.start_line = ts_node_start_point(name_node).row + TS_LINE_OFFSET;
         def.end_line = ts_node_end_point(err_node).row + TS_LINE_OFFSET;
+        def.start_byte = ts_node_start_byte(name_node);
+        def.end_byte = ts_node_end_byte(err_node);
         def.is_exported = cbm_is_exported(name, ctx->language);
         if (bcount > 0) {
             const char **result = (const char **)cbm_arena_alloc(a, (size_t)(bcount + NULL_TERM) *
@@ -6401,6 +6437,8 @@ void cbm_extract_definitions(CBMExtractCtx *ctx) {
     mod.file_path = ctx->rel_path;
     mod.start_line = FIRST_LINE;
     mod.end_line = ts_node_end_point(ctx->root).row + TS_LINE_OFFSET;
+    mod.start_byte = ts_node_start_byte(ctx->root);
+    mod.end_byte = ts_node_end_byte(ctx->root);
     mod.is_exported = true;
     mod.is_test = ctx->result->is_test_file;
     cbm_defs_push(&ctx->result->defs, a, mod);

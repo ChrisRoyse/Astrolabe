@@ -216,6 +216,17 @@ typedef struct {
     const char *body_tokens; // space-separated raw identifier tokens from body (arena) or NULL
     const char *struct_trigrams; // panel S1 source: newline-delimited "a\tb\tc\tweight"
                                  // normalised AST node-type trigrams (arena) or NULL
+    // #501/#473: byte-exact parse-time source span of the definition node, captured
+    // from tree-sitter (ts_node_start_byte/ts_node_end_byte) while the file buffer is
+    // alive. end_byte is exclusive. `source` is the exact node source BLOB (arena),
+    // sliced source[start_byte..end_byte], NULL when the span is unset/invalid or the
+    // file source was unavailable. These are the real code bytes, NOT a derived proxy;
+    // the row layer persists them so `source_snippet_bytes` carries true content
+    // (dedup census #473) and S18-S20 measure real source spans (#501), never the
+    // #413 property fingerprint.
+    uint32_t start_byte; // inclusive start byte offset (0 when unset)
+    uint32_t end_byte;   // exclusive end byte offset (0 when unset; end<=start => no source)
+    const char *source;  // exact node source bytes (arena) or NULL
 } CBMDefinition;
 
 /* Argument captured from a call expression */
