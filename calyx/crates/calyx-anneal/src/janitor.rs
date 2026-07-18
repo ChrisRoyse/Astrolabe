@@ -4,16 +4,17 @@ mod fs_ops;
 mod types;
 
 pub use types::{
-    CALYX_IO_ERROR, DatasetManifest, GcResult, JanitorConfig, JanitorErrorReadback, JanitorMetrics,
-    JanitorReadback, MAX_JANITOR_BYTES_PER_TICK,
+    CALYX_IO_ERROR, CALYX_JANITOR_ROTATION_ERROR, DatasetManifest, GcResult, JanitorConfig,
+    JanitorErrorReadback, JanitorMetrics, JanitorReadback, MAX_JANITOR_BYTES_PER_TICK,
+    ROTATION_STREAM_CHUNK_BYTES,
 };
 
 use calyx_aster::pressure::DiskPressureGuard;
-use calyx_core::{Clock, Result, Ts};
+use calyx_core::{CalyxError, Clock, Result, Ts};
 use fs_ops::{
-    CleanupKind, age_ms, collect_files, dir_size, duration_ms, ensure_inside_dataset, file_len,
-    hash_path, immediate_dirs, io_error, is_zst, modified_ms, starts_with_canonical, temp_dirs,
-    zst_path,
+    CleanupKind, age_ms, collect_files, decode_digest, dir_size, duration_ms, ensure_inside_dataset,
+    file_len, hash_path, hex, immediate_dirs, io_error, is_rotation_temp, is_zst, modified_ms,
+    rotation_error, source_digest, starts_with_canonical, temp_dirs, verified_publish, zst_path,
 };
 use serde::Serialize;
 use std::env;
@@ -89,12 +90,19 @@ impl Janitor {
             return Ok(result);
         }
         let now = self.clock.now();
+        // Reconcile rotation temp files abandoned by a crash between temp creation
+        // and publication before doing anything else. The source is always intact
+        // in that window, so reclaiming the temp loses nothing.
+        self.reconcile_rotation_temps(&logs, now, &mut result)?;
         for path in collect_files(&logs)? {
             if is_zst(&path) && age_ms(&path, now)? >= duration_ms(self.config.log_ttl) {
                 self.delete_file(&path, CleanupKind::Log, "log_ttl_delete", &mut result)?;
             }
         }
         for path in collect_files(&logs)? {
+            if is_rotation_temp(&path) {
+                continue;
+            }
             if !is_zst(&path) && age_ms(&path, now)? >= duration_ms(self.config.log_rotation_age) {
                 self.compress_log(&path, &mut result)?;
             }
@@ -209,50 +217,168 @@ impl Janitor {
         Ok(result)
     }
 
+    /// Rotate a plaintext log into a verified zstd artifact. The source is deleted
+    /// only after the compressed replacement has been fsynced, independently
+    /// decoded, and proven byte-exact (length + BLAKE3) against the source. Any
+    /// failure leaves the source completely untouched and is recorded both in the
+    /// result readback and as a `log_rotation_error` ledger diagnostic — recording
+    /// an error and returning success is never done.
     fn compress_log(&self, path: &Path, result: &mut GcResult) -> Result<()> {
         let before = file_len(path)?;
+        // Declared input bound: refuse an oversize source with the source untouched.
+        if before > self.config.log_rotation_max_bytes {
+            let error = rotation_error(
+                "prepared",
+                format!(
+                    "source {} is {before} bytes, above the declared {}-byte rotation bound; \
+                     the source was not touched",
+                    path.display(),
+                    self.config.log_rotation_max_bytes
+                ),
+            );
+            return self.refuse_rotation(path, error, result);
+        }
+
         let output = zst_path(path)?;
         if output.exists() {
-            result.record_error(
-                hash_path(path),
-                io_error(format!("{} already exists", output.display())),
-            );
-            return Ok(());
+            // A prior rotation may have published then crashed before deleting the
+            // source, or the destination is a foreign/corrupt file. Prove it decodes
+            // to the current source before deleting anything.
+            return self.reconcile_existing_destination(path, &output, before, result);
         }
-        let input = fs::read(path)
-            .map_err(|error| io_error(format!("read {}: {error}", path.display())))?;
-        let encoded = match zstd::encode_all(input.as_slice(), 0) {
-            Ok(encoded) => encoded,
-            Err(error) => {
-                result.record_error(
-                    hash_path(path),
-                    io_error(format!("compress {}: {error}", path.display())),
-                );
-                return Ok(());
-            }
+
+        let stats = match verified_publish(path, &output, self.config.log_rotation_time_budget) {
+            Ok(stats) => stats,
+            Err(error) => return self.refuse_rotation(path, error, result),
         };
-        if let Err(error) = fs::write(&output, &encoded) {
-            result.record_error(
-                hash_path(&output),
-                io_error(format!("write {}: {error}", output.display())),
+
+        // Concurrent-append guard: re-read the source identity immediately before
+        // deletion so an append that landed during compression cannot be lost.
+        let current = source_digest(path)?;
+        if current.len != stats.src_len || current.hash != stats.src_hash {
+            let _ = fs::remove_file(&output);
+            let error = rotation_error(
+                "published",
+                format!(
+                    "source {} changed during rotation (len {} -> {}, hash {} -> {}); \
+                     deletion refused and the stale artifact was removed",
+                    path.display(),
+                    stats.src_len,
+                    current.len,
+                    hex(&stats.src_hash),
+                    hex(&current.hash)
+                ),
             );
-            return Ok(());
+            return self.refuse_rotation(path, error, result);
         }
+
+        // Proven equal: now — and only now — is deletion of the source safe.
         fs::remove_file(path)
             .map_err(|error| io_error(format!("remove {}: {error}", path.display())))?;
-        let after = file_len(&output).unwrap_or(encoded.len() as u64);
-        let freed = before.saturating_sub(after);
+        self.record_rotation(path, before, stats.compressed_len, result)
+    }
+
+    /// Complete or refuse a rotation whose destination already exists on disk.
+    fn reconcile_existing_destination(
+        &self,
+        source: &Path,
+        output: &Path,
+        before: u64,
+        result: &mut GcResult,
+    ) -> Result<()> {
+        let src = source_digest(source)?;
+        let digest = match decode_digest(output) {
+            Ok(digest) => digest,
+            Err(error) => return self.refuse_rotation(source, error, result),
+        };
+        if digest.len != src.len || digest.hash != src.hash {
+            let error = rotation_error(
+                "published",
+                format!(
+                    "existing destination {} does not decode to source {} \
+                     (destination len {} hash {}, source len {} hash {}); refusing to delete source",
+                    output.display(),
+                    source.display(),
+                    digest.len,
+                    hex(&digest.hash),
+                    src.len,
+                    hex(&src.hash)
+                ),
+            );
+            return self.refuse_rotation(source, error, result);
+        }
+        let after = file_len(output).unwrap_or(0);
+        fs::remove_file(source)
+            .map_err(|error| io_error(format!("remove {}: {error}", source.display())))?;
+        self.record_rotation(source, before, after, result)
+    }
+
+    /// Reclaim rotation temp files older than the rotation time budget: past that
+    /// bound no live rotation can still be writing them, and the source is intact.
+    fn reconcile_rotation_temps(
+        &self,
+        logs: &Path,
+        now: Ts,
+        result: &mut GcResult,
+    ) -> Result<()> {
+        let budget_ms = duration_ms(self.config.log_rotation_time_budget);
+        for path in collect_files(logs)? {
+            if !is_rotation_temp(&path) {
+                continue;
+            }
+            if age_ms(&path, now)? < budget_ms {
+                continue;
+            }
+            match fs::remove_file(&path) {
+                Ok(()) => {
+                    self.ledger_event("log_rotation_temp_reclaimed", &path, 0)?;
+                    result.ledger_events += 1;
+                }
+                Err(error) => result.record_error(
+                    hash_path(&path),
+                    io_error(format!("remove stale rotation temp {}: {error}", path.display())),
+                ),
+            }
+        }
+        Ok(())
+    }
+
+    fn record_rotation(
+        &self,
+        source: &Path,
+        before: u64,
+        compressed_len: u64,
+        result: &mut GcResult,
+    ) -> Result<()> {
+        let freed = before.saturating_sub(compressed_len);
         result.bytes_freed = result.bytes_freed.saturating_add(freed);
         result.log_bytes_freed = result.log_bytes_freed.saturating_add(freed);
         result.logs_compressed += 1;
-        self.ledger_event("log_compressed", path, freed)?;
+        self.ledger_event("log_compressed", source, freed)?;
         result.ledger_events += 1;
+        Ok(())
+    }
+
+    /// Record a fail-closed rotation refusal in both the result readback and the
+    /// ledger, then return `Ok(())` so a single bad log does not abort cleanup of
+    /// the remaining logs. The source is left untouched by every caller.
+    fn refuse_rotation(
+        &self,
+        source: &Path,
+        error: CalyxError,
+        result: &mut GcResult,
+    ) -> Result<()> {
+        self.ledger_rotation_error(source, &error)?;
+        result.record_error(hash_path(source), error);
         Ok(())
     }
 
     fn enforce_log_cap(&self, logs: &Path, result: &mut GcResult) -> Result<()> {
         let mut files = Vec::new();
         for path in collect_files(logs)? {
+            if is_rotation_temp(&path) {
+                continue;
+            }
             files.push((modified_ms(&path)?, file_len(&path)?, path));
         }
         let mut total = files.iter().map(|(_, len, _)| *len).sum::<u64>();
@@ -302,6 +428,38 @@ impl Janitor {
             bytes: u64,
         }
 
+        self.append_ledger_line(&Event {
+            ts: self.clock.now(),
+            action,
+            path_hash: hash_path(path),
+            bytes,
+        })
+    }
+
+    /// Append a structured `log_rotation_error` diagnostic carrying the fail-closed
+    /// error's code and message so refusals are auditable from the ledger alone.
+    fn ledger_rotation_error(&self, path: &Path, error: &CalyxError) -> Result<()> {
+        #[derive(Serialize)]
+        struct Diagnostic<'a> {
+            ts: Ts,
+            action: &'a str,
+            path_hash: String,
+            code: &'a str,
+            message: &'a str,
+            remediation: &'a str,
+        }
+
+        self.append_ledger_line(&Diagnostic {
+            ts: self.clock.now(),
+            action: "log_rotation_error",
+            path_hash: hash_path(path),
+            code: error.code,
+            message: &error.message,
+            remediation: error.remediation,
+        })
+    }
+
+    fn append_ledger_line<T: Serialize>(&self, value: &T) -> Result<()> {
         let ledger = self.ledger_path();
         if let Some(parent) = ledger.parent() {
             fs::create_dir_all(parent)
@@ -312,13 +470,7 @@ impl Janitor {
             .append(true)
             .open(&ledger)
             .map_err(|error| io_error(format!("open {}: {error}", ledger.display())))?;
-        let event = Event {
-            ts: self.clock.now(),
-            action,
-            path_hash: hash_path(path),
-            bytes,
-        };
-        let line = serde_json::to_vec(&event)
+        let line = serde_json::to_vec(value)
             .map_err(|error| io_error(format!("encode janitor ledger event: {error}")))?;
         file.write_all(&line)
             .and_then(|_| file.write_all(b"\n"))
