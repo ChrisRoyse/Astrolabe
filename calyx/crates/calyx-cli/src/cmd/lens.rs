@@ -69,6 +69,11 @@ pub(super) fn build_lens(
     {
         return build_algorithmic_lens(name, kind, shape, modality);
     }
+    // #523: a declaration-only learned Candle/ONNX request would synthesize
+    // device/dtype/pooling/artifact-hash/dimension metadata and register a lens
+    // whose runtime is permanently unreachable. Refuse it before any vault,
+    // panel, registry, or ledger mutation; the verified path is `lens commission`.
+    calyx_registry::reject_declaration_only_learned_lens(&runtime_key)?;
     build_declared_lens(name, runtime, endpoint, weights, shape, modality)
 }
 

@@ -205,8 +205,17 @@ impl Registry {
         let mut outcomes = Vec::with_capacity(lens_ids.len());
         for &lens_id in lens_ids {
             self.lookup(lens_id)?;
+            // Classify by the lens's declared runtime: only a transient remote
+            // transport may degrade to Absent; a required in-process runtime
+            // (GPU Candle/ONNX/Fastembed, static-lookup, algorithmic) propagates
+            // its failure fail-closed instead of silently dropping the lens
+            // (#488). A lens with no recorded spec/runtime defaults to required.
+            let policy = self
+                .lens_spec(lens_id)
+                .map(|spec| crate::LensFailurePolicy::for_runtime(&spec.runtime))
+                .unwrap_or(crate::LensFailurePolicy::RequiredRuntime);
             let outcome: IngestLensOutcome =
-                admission.measure_lens_batch(lens_id, inputs, now_ms, |batch| {
+                admission.measure_lens_batch(lens_id, policy, inputs, now_ms, |batch| {
                     self.measure_batch(lens_id, batch)
                 })?;
             outcomes.push(outcome);

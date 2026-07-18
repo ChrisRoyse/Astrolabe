@@ -5,8 +5,9 @@ use std::sync::Arc;
 
 use calyx_core::{
     AbsentReason, CalyxError, Input, Lens, LensId, Modality, SlotId, SlotShape, SlotVector,
-    content_address,
 };
+#[cfg(feature = "multi-vector")]
+use calyx_core::content_address;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -25,7 +26,6 @@ pub const NOMIC_EMBED_DIM: usize = 768;
 pub const TOKEN_MULTI_DIM: usize = 128;
 const NOMIC_VECTOR_BLOB_LEN: usize = 31_377_416;
 const NOMIC_VECTOR_HEADER_LEN: usize = 8;
-const NOMIC_OOV_NNZ: usize = 8;
 const INT8_SCALE: f32 = 127.0;
 
 /// SHA-256 of `cbm/vendored/nomic/code_vectors.bin`.
@@ -356,20 +356,21 @@ impl StaticEmbeddingTable {
         self.weights_sha
     }
 
-    fn token_vector(&self, token: &str) -> Vec<f32> {
+    /// Returns the frozen static vector for a token, or `None` when the token is
+    /// out of the bound vocabulary. OOV tokens contribute no fabricated semantic
+    /// evidence — the caller skips them and reports Absent when nothing is in
+    /// vocabulary (#489).
+    fn token_vector(&self, token: &str) -> Option<Vec<f32>> {
+        let index = self.token_to_index.get(token).copied()?;
+        let start = index * NOMIC_EMBED_DIM;
         let mut out = vec![0.0; NOMIC_EMBED_DIM];
-        if let Some(index) = self.token_to_index.get(token).copied() {
-            let start = index * NOMIC_EMBED_DIM;
-            for (dst, src) in out
-                .iter_mut()
-                .zip(self.vectors[start..start + NOMIC_EMBED_DIM].iter())
-            {
-                *dst = f32::from(*src) / INT8_SCALE;
-            }
-        } else {
-            fill_oov_sparse(token, &mut out);
+        for (dst, src) in out
+            .iter_mut()
+            .zip(self.vectors[start..start + NOMIC_EMBED_DIM].iter())
+        {
+            *dst = f32::from(*src) / INT8_SCALE;
         }
-        out
+        Some(out)
     }
 
     fn embed_tokens(&self, tokens: &[String]) -> PanelResult<SlotVector> {
@@ -377,14 +378,25 @@ impl StaticEmbeddingTable {
             return Ok(absent());
         }
         let mut data = vec![0.0; NOMIC_EMBED_DIM];
+        let mut in_vocab = 0_usize;
         for token in tokens {
-            if token.trim().is_empty() {
+            let trimmed = token.trim();
+            if trimmed.is_empty() {
                 continue;
             }
-            let token_vec = self.token_vector(token.trim());
+            let Some(token_vec) = self.token_vector(trimmed) else {
+                continue;
+            };
             for (dst, src) in data.iter_mut().zip(token_vec) {
                 *dst += src;
             }
+            in_vocab += 1;
+        }
+        // No fabricated OOV fallback: an input with no in-vocabulary token carries
+        // no semantic evidence for this slot and is reported Absent, never as an
+        // invented unit/pseudo-random vector that would poison similarity (#489).
+        if in_vocab == 0 {
+            return Ok(absent());
         }
         l2_normalize(&mut data)?;
         Ok(SlotVector::Dense {
@@ -407,10 +419,13 @@ impl StaticEmbeddingTable {
         })?;
         let mut projected = Vec::new();
         for token in tokens {
-            if token.trim().is_empty() {
+            let trimmed = token.trim();
+            if trimmed.is_empty() {
                 continue;
             }
-            let token_vec = self.token_vector(token.trim());
+            let Some(token_vec) = self.token_vector(trimmed) else {
+                continue;
+            };
             let mut out = vec![0.0; TOKEN_MULTI_DIM];
             for (dim, value) in token_vec.iter().copied().enumerate() {
                 let dim_bytes = (dim as u32).to_be_bytes();
@@ -621,7 +636,12 @@ pub fn nomic_weights_identity() -> [u8; 32] {
 
 fn nomic_weights_identity_from(blob_sha: &[u8; 32], tokens_sha: &[u8; 32]) -> [u8; 32] {
     let mut hasher = Sha256::new();
-    hasher.update(b"astrolabe.panel.nomic.weights.v1");
+    // v2 (#489): the out-of-vocabulary policy changed from a fabricated
+    // pseudo-random sparse fallback to "OOV contributes nothing; all-OOV/empty
+    // is Absent". That changes S18-S20/S22 measure output for OOV inputs, so the
+    // frozen identity is migrated to a new version rather than silently mutating
+    // the v1 lenses under the same id.
+    hasher.update(b"astrolabe.panel.nomic.weights.v2");
     hasher.update(blob_sha);
     hasher.update(tokens_sha);
     hasher.finalize().into()
@@ -650,22 +670,6 @@ fn validate_blob_layout(blob: &[u8]) -> PanelResult<()> {
     Ok(())
 }
 
-fn fill_oov_sparse(token: &str, out: &mut [f32]) {
-    for i in 0..NOMIC_OOV_NNZ {
-        let idx_bytes = (i as u32).to_be_bytes();
-        let hash = content_address([
-            NOMIC_VECTOR_BLOB_SHA256.as_slice(),
-            token.as_bytes(),
-            idx_bytes.as_slice(),
-        ]);
-        let mut idx = [0_u8; 4];
-        idx.copy_from_slice(&hash[..4]);
-        let pos = u32::from_be_bytes(idx) as usize % NOMIC_EMBED_DIM;
-        let sign = if hash[4] & 1 == 0 { 1.0 } else { -1.0 };
-        out[pos] += sign;
-    }
-}
-
 fn l2_normalize(data: &mut [f32]) -> PanelResult<()> {
     let norm = data
         .iter()
@@ -679,14 +683,14 @@ fn l2_normalize(data: &mut [f32]) -> PanelResult<()> {
         return Err(PanelError::new(
             ASTRO_PANEL_VECTOR_INVALID,
             "embedding vector norm is non-finite",
-            "Use only finite static vectors and deterministic fallback values.",
+            "Use only finite static vectors; the caller reports Absent when no in-vocabulary token contributes.",
         ));
     }
     if norm == 0.0 {
         return Err(PanelError::new(
             ASTRO_PANEL_VECTOR_INVALID,
             "embedding vector has zero norm",
-            "Provide at least one token with a static or OOV fallback vector.",
+            "In-vocabulary tokens summed to a zero vector; callers report all-OOV/empty inputs as Absent before normalization.",
         ));
     }
     for value in data {
