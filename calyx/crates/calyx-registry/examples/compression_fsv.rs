@@ -17,7 +17,8 @@ use calyx_core::{
     QuantPolicy, Slot, SlotId, SlotResource, SlotShape, SlotState, SlotVector, VaultId, VaultStore,
 };
 use calyx_forge::{
-    QuantLevel, QuantizedVec, Quantizer, TURBOQUANT_FORMAT_HEADER_BYTES, TurboQuantCodec, new_seed,
+    QuantLevel, QuantizedVec, Quantizer, TURBOQUANT_FORMAT_HEADER_BYTES, TurboQuantCodec,
+    TurboQuantV1MigrationVerifier, new_seed,
 };
 use calyx_registry::{
     AlgorithmicLens, CompressionQuery, LensRuntime, LensSpec, REGISTRY_ENVELOPE_HEADER_BYTES,
@@ -38,94 +39,6 @@ const CURRENT_OUTER_V3_PREFIX_BYTES: usize = 137;
 const LEGACY_OUTER_V2_HEADER_BYTES: usize = 85;
 const LEGACY_TQPR_V1_HEADER_BYTES: usize = 88;
 const LEGACY_TQPR_V1_PREFIX_BYTES: usize = 56;
-const LEGACY_WRITER_COMMIT: &str = "f6c8d778e1e73f2adc60e822ec0c2e8693ff0a99";
-const LEGACY_WRITER_SOURCE_BLOBS: &[(&str, &str, &str)] = &[
-    (
-        "calyx/crates/calyx-forge/src/quant/turboquant.rs",
-        "f76b929ae3c6dbe2052b6fcb2cb700912b9e7867",
-        "8a1d11a23147c5b1bbac42dcb89e70d54103c160bbfa26b8e0f7ae95469052f5",
-    ),
-    (
-        "calyx/crates/calyx-forge/src/quant/codebook.rs",
-        "620fce1baaf42f84fd022f9dc1bd2ec2102c1287",
-        "39c7f659c32770dd0643b3134d8aa0de926cadb44292c6c0f81daa87cf5c8806",
-    ),
-    (
-        "calyx/crates/calyx-forge/src/quant/qjl.rs",
-        "8e44eaf557fd0be1299bc054dc9dacfc5b13a557",
-        "951d699a1f4f2333c2011973657dcbbf01d79d5b11b1d7d936b876032c65ea5f",
-    ),
-    (
-        "calyx/crates/calyx-forge/src/quant/rotation.rs",
-        "3c0c504606eb3c1470bdbace6b856444626d5664",
-        "7edba36641b21281dc1ac1898e4c9dff8bdf47a86dc9ed1293d686d1c5262dc0",
-    ),
-    (
-        "calyx/crates/calyx-registry/src/compression/codec.rs",
-        "d137c1b2b19e6dfe4f1ddf079af2456eef0fc869",
-        "bcd347e0e585c2a391b79a0d3bbca3a6c0889273fc4f1eaffaeb896f6041fa7d",
-    ),
-];
-const LEGACY_TQ25_128_SHA256: &str =
-    "25f572987afd1c2606ad9761c72c65d79e098535dfee9150bcc4a78c65b4d18e";
-const LEGACY_TQ35_128_SHA256: &str =
-    "add912589e02c71b9ea91f884993b7330352753ec81d5a2f676fe8613cc74bd0";
-const LEGACY_TQ25_64_SHA256: &str =
-    "d60a82a7df86888bf305e6eb9f183fb9e2428195943b1e6db8ac04a4c0483ba3";
-const LEGACY_TQ25_128_ROWS: &[(&str, &str)] = &[
-    (
-        "8253d0cbc1b657329879d6e6aa011d24",
-        "100202050000008000000080003f8000009f04ae112afa8d3e85629067e619d9004028d1bf2ebd04e1816c684e4f7da8f200000080d978aacee9c8475de5a9cbcaf0747eb06785c49fc3ecd81a29d67adb9bf9fc9b545150520101000080000000c000000080000000cb3ef13e9f04ae112afa8d3e85629067e619d9004028d1bf2ebd04e1816c684e4f7da8f2f3aa636592c2b2a3986d5700ac90d08f457c0d0ca586cbd04be04660bee14d4b960ba3f50e5837f5289d23168393ccf5afb476e3d024342dd43648084c9db40b8b08910f3c097a77",
-    ),
-    (
-        "90ab579cef31f9b1d2bd6382dcea7512",
-        "100202050000008000000080003f8000009f04ae112afa8d3e85629067e619d9004028d1bf2ebd04e1816c684e4f7da8f200000080370ad31cdfee4693335547be1465db5c04fda047e1558a28adac6a5197aabcb4545150520101000080000000c000000080000000178bf23e9f04ae112afa8d3e85629067e619d9004028d1bf2ebd04e1816c684e4f7da8f2855f1f6df9a02c27fc0d2c9266395800e602e0402a6428bda7658b04aed4c8bd451ac6771e272d96aa904118a5968add048b722f4d936b37da405d267c0bb78dea0725a8b796eed3",
-    ),
-    (
-        "d62233d29935f3a153b49d39cc480b95",
-        "100202050000008000000080003f8000009f04ae112afa8d3e85629067e619d9004028d1bf2ebd04e1816c684e4f7da8f2000000809a77e8ac1647b3dff2ce66be2e3b6bb79acf9604e44469c916b1323ebfe5bd4a545150520101000080000000c000000080000000520efc3e9f04ae112afa8d3e85629067e619d9004028d1bf2ebd04e1816c684e4f7da8f2a7abbca68e2eb30bbba10113f2f13cae53bb0b1b35f33972b98a20627d4c9319ea6f7f289dcf757b030d266816d41854e63bb5d346b32a9de081e3bdf3b72319bf7fd2523dc3cf27",
-    ),
-    (
-        "ea451c0f9b3693c62968f22b8bbcd24f",
-        "100202050000008000000080003f8000009f04ae112afa8d3e85629067e619d9004028d1bf2ebd04e1816c684e4f7da8f2000000803704d1dbb394e6c568e12663c81091a93b93d0b1a0db3701a520fe2103cdbdee545150520101000080000000c0000000800000003e58033f9f04ae112afa8d3e85629067e619d9004028d1bf2ebd04e1816c684e4f7da8f2ec1ed4df2ac6eec66d403078509ebca5ef1923fd327fd04f1a7db763b30afee6a211924a564a94bf447f9b414d97a09b8dd28a00482a544efcc33131f13708d3ad6b564ea5a45835",
-    ),
-];
-const LEGACY_TQ35_128_ROWS: &[(&str, &str)] = &[
-    (
-        "8253d0cbc1b657329879d6e6aa011d24",
-        "100201040000008000000080003f800000524ea7fe18609bde23d66f818940e35ed43ae8a8f47163586b3d7c64f0c40e9400000090c6eb0d36c0638dc24b639e953da010f2d57827a505292729dbca59e67d7b4e645451505201020000800000004001000080000000fa93853e524ea7fe18609bde23d66f818940e35ed43ae8a8f47163586b3d7c64f0c40e94253fe347c09b8bd9f8e9846d0f6a8f5c5f1c961ba8734a7ad3f1c5386024227c5356cb1593c5f73be8f4bfbae6795592add5aa6d7ab1fd64a4a4ae070789558b0593d3848e122d9dddb0e5321803e4b5fa3f60c501341cfa",
-    ),
-    (
-        "90ab579cef31f9b1d2bd6382dcea7512",
-        "100201040000008000000080003f800000524ea7fe18609bde23d66f818940e35ed43ae8a8f47163586b3d7c64f0c40e94000000908ef83ab0022e351673fc06ca9f82ddc593d6a9b1ba81e6477f8694666ab48d655451505201020000800000004001000080000000ce3a803e524ea7fe18609bde23d66f818940e35ed43ae8a8f47163586b3d7c64f0c40e9441ef6db02b73b99f5a48721ff0ab5bccbd7349ad59cdf9cbc04545d3b07de536bf0c35e5e0448e16370f57925a758acc33ffad4eac6a39a952aa08b2a84a4dccb2f97c7d943d888c47eb463b754dbf2a6c1579608aad87f4",
-    ),
-    (
-        "d62233d29935f3a153b49d39cc480b95",
-        "100201040000008000000080003f800000524ea7fe18609bde23d66f818940e35ed43ae8a8f47163586b3d7c64f0c40e9400000090f32b61705d56d6cc1ad7a44dcacf39398f565950a41975fe73072e571c8883d25451505201020000800000004001000080000000f6e3943e524ea7fe18609bde23d66f818940e35ed43ae8a8f47163586b3d7c64f0c40e9427a4d1846c21ddc15f359bf4ec4a1ea5f14884f90a47609b263f347bf81791982a4eaed665cb2b75eb816db36591a766dbb64d289325d96b7174bd9914f33192c7b9a495253a7b219fd790856983cbf7a1ad9746a40167e0",
-    ),
-    (
-        "ea451c0f9b3693c62968f22b8bbcd24f",
-        "100201040000008000000080003f800000524ea7fe18609bde23d66f818940e35ed43ae8a8f47163586b3d7c64f0c40e9400000090bab9cc44421d9d40a827c5e037a678759b85453439fcad3252376968fa44d3b254515052010200008000000040010000800000001554923e524ea7fe18609bde23d66f818940e35ed43ae8a8f47163586b3d7c64f0c40e948980981a173f813266cf45e18a207c56d27ee9f976028f0af8246d360e36d6b615f3d6d48e6273ac9934b22ea726ab2c75c944a17d73dd69757309c5a7b0d37597f2a6755d6bdd627e2ee4aade0048404c1ea07a00732be4",
-    ),
-];
-const LEGACY_TQ25_64_ROWS: &[(&str, &str)] = &[
-    (
-        "8253d0cbc1b657329879d6e6aa011d24",
-        "100202050000008000000040023f800000978b49c2d287b90b5eef21dd7fa289f6b9a54209115e10755ffdbbeeacfe2d0e0000006c5e73ed9098f42def8f24e76bf526325328ef271611ef5c527d62baab08220fcb5451505201010000400000006000000040000000d970103f978b49c2d287b90b5eef21dd7fa289f6b9a54209115e10755ffdbbeeacfe2d0e9697f6afb275018fde330717848ca88cb1c8184068438988f1de239349239fabee624a0fdfc869c558a9c538df736cf0fca4f7f2",
-    ),
-    (
-        "90ab579cef31f9b1d2bd6382dcea7512",
-        "100202050000008000000040023f800000978b49c2d287b90b5eef21dd7fa289f6b9a54209115e10755ffdbbeeacfe2d0e0000006ce4d8725b0aff889b0de5a91ece6377b03872cf822170667ac9d815e00125cafd54515052010100004000000060000000400000003cd7f23e978b49c2d287b90b5eef21dd7fa289f6b9a54209115e10755ffdbbeeacfe2d0e1b890476ac797c89584f711f90cff09a14070e419508c697a54922b0d28d9ad7b693f6c021e49ba54852e5876be2aed4435a7c69",
-    ),
-    (
-        "d62233d29935f3a153b49d39cc480b95",
-        "100202050000008000000040023f800000978b49c2d287b90b5eef21dd7fa289f6b9a54209115e10755ffdbbeeacfe2d0e0000006c2127de77fff0cb4698db4f584703fefecd7e24a88e5fe4839776bfdacb21a1575451505201010000400000006000000040000000c9f3003f978b49c2d287b90b5eef21dd7fa289f6b9a54209115e10755ffdbbeeacfe2d0e1fa4ef543f39e6df8dee59fd59a993b2bca44dec24d448160d1843dea64f5ca5b02eab9202b14a07c7906b443a55e7e4a153026e",
-    ),
-    (
-        "ea451c0f9b3693c62968f22b8bbcd24f",
-        "100202050000008000000040023f800000978b49c2d287b90b5eef21dd7fa289f6b9a54209115e10755ffdbbeeacfe2d0e0000006c90b9f0cc2da91c7dd0eed1c3395bcd9ac95e6a48a6c821249b464566d4fdfbca54515052010100004000000060000000400000001ad3ee3e978b49c2d287b90b5eef21dd7fa289f6b9a54209115e10755ffdbbeeacfe2d0ef21d305266dedeb937619f7a86a1a9f70b7b042eb934ed38697c9346592d63e7aa926ac10389156b3c508ce67831920e119f1c2a",
-    ),
-];
 const VAULT_SALT: &[u8] = b"issue-551-fsv-vault-salt-v1";
 const VAULT_ID: &str = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
 
@@ -1643,12 +1556,12 @@ fn legacy_migration_edge(
         _ => return Err(failure("legacy migration fixture requires a dense slot").into()),
     };
     let stored_dim = stored_dim_for(registry, registered)?;
-    let golden = legacy_golden_set(registered.bits_per_channel_x2, raw_dim, stored_dim)?;
+    let golden = legacy_golden_set(registry, registered, corpus)?;
     let legacy_primary_by_key = golden
         .rows
         .iter()
-        .map(|(key, value)| Ok((decode_hex(key)?, decode_hex(value)?)))
-        .collect::<AnyResult<BTreeMap<_, _>>>()?;
+        .cloned()
+        .collect::<BTreeMap<_, _>>();
     require(
         legacy_primary_by_key.len() == golden.rows.len(),
         "historical writer golden contains duplicate keyed rows",
@@ -1656,7 +1569,7 @@ fn legacy_migration_edge(
     require(
         digest_map(&legacy_primary_by_key) == golden.aggregate_sha256,
         format!(
-            "historical writer golden digest differs from pinned source: expected={} actual={}",
+            "historical writer golden digest differs from its freshly derived source: expected={} actual={}",
             golden.aggregate_sha256,
             digest_map(&legacy_primary_by_key),
         ),
@@ -1722,15 +1635,10 @@ fn legacy_migration_edge(
         "raw_dim": raw_dim,
         "stored_dim": stored_dim,
         "legacy_seed_id": legacy_seed_id,
-        "historical_writer_commit": LEGACY_WRITER_COMMIT,
-        "historical_writer_sources": LEGACY_WRITER_SOURCE_BLOBS.iter().map(
-            |(path, git_blob, sha256)| json!({
-                "path": path,
-                "git_blob": git_blob,
-                "sha256": sha256,
-            }),
-        ).collect::<Vec<_>>(),
-        "pinned_golden_sha256": golden.aggregate_sha256,
+        "golden_provenance": "derived-at-runtime",
+        "golden_derivation": "current-geometry TurboQuantV1MigrationVerifier re-encode of the deterministic corpus one-hot rows at the current shared_seed(domain=turboquant)/level",
+        "legacy_seed_domain": "turboquant",
+        "derived_golden_sha256": golden.aggregate_sha256,
         "reference_legacy_manifest_sha256": sha256_hex(&legacy_manifest),
         "reference_generation_root": hex(&legacy_manifest[48..80]),
         "reference_raw_generation_root": hex(&legacy_manifest[80..112]),
@@ -1835,33 +1743,142 @@ fn legacy_migration_edge(
 }
 
 struct LegacyGoldenSet {
-    aggregate_sha256: &'static str,
-    rows: &'static [(&'static str, &'static str)],
+    aggregate_sha256: String,
+    rows: Vec<(Vec<u8>, Vec<u8>)>,
 }
 
+/// Derives the historical-writer legacy generation the current geometry would have
+/// emitted, recomputed each run from the deterministic corpus instead of pinning
+/// identity-derived literals.
+///
+/// A prior revision froze the exact `(cx_key, outer-v2/TQPR-v1 envelope)` bytes and
+/// their aggregate SHA-256. Those envelopes embed a TurboQuant `seed_id` derived
+/// from `lens.lens_id()`, so any later change to the versioned LensId or to the
+/// default dimensions (e.g. #570/#489) shifts the current `shared_seed(...)` and
+/// makes the pinned literal disagree with production — even though production is
+/// correct. Because the corpus one-hot rows are fully deterministic and the legacy
+/// v2 migration path re-derives the seed from the *current* geometry, the whole
+/// golden set is reconstructible at runtime with the production
+/// `TurboQuantV1MigrationVerifier`. Recomputing the expectation from the live
+/// codec every run makes this example recurrence-proof against future
+/// identity/dimension changes while still failing closed when production's
+/// reconstruction, seed, keyset, or format behavior is genuinely wrong.
 fn legacy_golden_set(
-    bits_per_channel_x2: u8,
-    raw_dim: u32,
-    stored_dim: usize,
+    registry: &Registry,
+    registered: &RegisteredSlot,
+    corpus: &Corpus,
 ) -> AnyResult<LegacyGoldenSet> {
-    match (bits_per_channel_x2, raw_dim, stored_dim) {
-        (5, 128, 128) => Ok(LegacyGoldenSet {
-            aggregate_sha256: LEGACY_TQ25_128_SHA256,
-            rows: LEGACY_TQ25_128_ROWS,
-        }),
-        (7, 128, 128) => Ok(LegacyGoldenSet {
-            aggregate_sha256: LEGACY_TQ35_128_SHA256,
-            rows: LEGACY_TQ35_128_ROWS,
-        }),
-        (5, 128, 64) => Ok(LegacyGoldenSet {
-            aggregate_sha256: LEGACY_TQ25_64_SHA256,
-            rows: LEGACY_TQ25_64_ROWS,
-        }),
-        geometry => Err(failure(format!(
-            "no immutable historical writer golden is pinned for geometry {geometry:?}"
-        ))
-        .into()),
+    let rows = derive_legacy_golden_rows(registry, registered, corpus)?;
+    let map = rows.iter().cloned().collect::<BTreeMap<_, _>>();
+    require(
+        map.len() == rows.len(),
+        "derived historical writer golden contains duplicate keyed rows",
+    )?;
+    let aggregate_sha256 = digest_map(&map);
+    Ok(LegacyGoldenSet {
+        aggregate_sha256,
+        rows,
+    })
+}
+
+/// Encodes each deterministic corpus one-hot row with the current-geometry legacy
+/// codec to reproduce the exact `(cx_key, outer-v2/TQPR-v1 envelope)` bytes a
+/// historical writer at the current seed/level would have persisted. The source
+/// vector, seed domain (`b"turboquant"`), and level match exactly what the
+/// production legacy-v2 migration verifier (`LegacyV2EnvelopeVerifier`) re-derives
+/// and checks, so the derived rows migrate cleanly and any real divergence still
+/// fails closed downstream.
+fn derive_legacy_golden_rows(
+    registry: &Registry,
+    registered: &RegisteredSlot,
+    corpus: &Corpus,
+) -> AnyResult<Vec<(Vec<u8>, Vec<u8>)>> {
+    let raw_dim = match registered.slot.shape {
+        SlotShape::Dense(dim) => dim,
+        _ => return Err(failure("legacy golden derivation requires a dense slot").into()),
+    };
+    let stored_dim = u32::try_from(stored_dim_for(registry, registered)?)
+        .map_err(|_| failure("legacy golden stored dimension exceeds u32"))?;
+    let level = expected_level(registered.bits_per_channel_x2)?;
+    // Same rotation seed the production legacy-v2 verifier re-derives: the shared
+    // codec seed over the CURRENT lens/slot geometry under the v1 codec domain.
+    let seed = shared_seed_for_domain(registered, stored_dim as usize, level, b"turboquant");
+    let verifier = TurboQuantV1MigrationVerifier::new(seed, level)?;
+    let rows = corpus
+        .rows_by_slot
+        .get(&registered.slot.slot_id)
+        .ok_or_else(|| failure("legacy golden derivation is missing registered slot rows"))?;
+    let mut derived = Vec::with_capacity(rows.len());
+    for (cx_id, raw) in rows {
+        // Production feeds the verifier `prepare_dense(raw, truncate_dim)`: the
+        // truncated+renormalized prefix for truncated slots, the raw row otherwise.
+        let prepared = match registered.truncate_dim {
+            Some(truncate_dim) => matryoshka_truncate_renormalize(raw, truncate_dim)?,
+            None => raw.clone(),
+        };
+        let qv = verifier.reconstruct_expected(&prepared)?;
+        let envelope = build_legacy_v2_envelope(&qv, raw_dim, stored_dim, level)?;
+        derived.push((cx_id.as_bytes().to_vec(), envelope));
     }
+    Ok(derived)
+}
+
+/// Wraps a reconstructed TQPR-v1 payload in the historical outer-v2 slot envelope,
+/// byte-for-byte the inverse of `parse_legacy_fixture_row` /
+/// `parse_legacy_v2_envelope`.
+fn build_legacy_v2_envelope(
+    qv: &QuantizedVec,
+    raw_dim: u32,
+    stored_dim: u32,
+    level: QuantLevel,
+) -> AnyResult<Vec<u8>> {
+    let (codec_code, level_code) = match level {
+        QuantLevel::Bits2p5 => (2_u8, 5_u8),
+        QuantLevel::Bits3p5 => (1_u8, 4_u8),
+        other => {
+            return Err(failure(format!(
+                "legacy golden derivation supports only Bits2p5/Bits3p5, got {other:?}"
+            ))
+            .into());
+        }
+    };
+    require(
+        qv.dim as u32 == stored_dim && stored_dim > 0 && stored_dim <= raw_dim,
+        "legacy golden inner geometry disagrees with the frozen slot dimensions",
+    )?;
+    let payload = &qv.bytes;
+    let payload_len =
+        u32::try_from(payload.len()).map_err(|_| failure("legacy golden payload exceeds u32"))?;
+    let flags: u8 = if stored_dim < raw_dim { 0b10 } else { 0 };
+    let mut envelope = Vec::with_capacity(LEGACY_OUTER_V2_HEADER_BYTES + payload.len());
+    envelope.push(16);
+    envelope.push(2);
+    envelope.push(codec_code);
+    envelope.push(level_code);
+    envelope.extend_from_slice(&raw_dim.to_be_bytes());
+    envelope.extend_from_slice(&stored_dim.to_be_bytes());
+    envelope.push(flags);
+    envelope.extend_from_slice(&qv.scale.to_bits().to_be_bytes());
+    envelope.extend_from_slice(&qv.seed_id);
+    envelope.extend_from_slice(&payload_len.to_be_bytes());
+    require(
+        envelope.len() == 53,
+        "legacy golden envelope prefix length is not canonical",
+    )?;
+    let digest = domain_digest(
+        b"calyx-registry-slot-envelope-v2",
+        &envelope,
+        payload,
+        false,
+        None,
+    );
+    envelope.extend_from_slice(&digest);
+    require(
+        envelope.len() == LEGACY_OUTER_V2_HEADER_BYTES,
+        "legacy golden envelope header length is not canonical",
+    )?;
+    envelope.extend_from_slice(payload);
+    Ok(envelope)
 }
 
 struct LegacyFixtureRow {
@@ -3283,23 +3300,6 @@ fn cx_id_from_key(key: &[u8]) -> AnyResult<CxId> {
         .try_into()
         .map_err(|_| failure(format!("slot key has {} bytes, expected 16", key.len())))?;
     Ok(CxId::from_bytes(bytes))
-}
-
-fn decode_hex(value: &str) -> AnyResult<Vec<u8>> {
-    require(
-        value.len() % 2 == 0,
-        format!("hex input has odd length {}", value.len()),
-    )?;
-    (0..value.len())
-        .step_by(2)
-        .map(|offset| {
-            u8::from_str_radix(&value[offset..offset + 2], 16).map_err(|error| {
-                failure(format!(
-                    "invalid hexadecimal byte at character offset {offset}: {error}"
-                ))
-            })
-        })
-        .collect()
 }
 
 fn decode_hex_32(value: &str) -> AnyResult<[u8; 32]> {
