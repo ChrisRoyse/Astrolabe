@@ -538,16 +538,23 @@ fn publish_synced_file_atomic_impl(source: &Path, target: &Path, replace: bool) 
         FILE_RENAME_FLAG_POSIX_SEMANTICS, FILE_RENAME_FLAG_REPLACE_IF_EXISTS,
     };
 
-    if target.file_name().is_none() {
-        return Err(corrupt(format!(
+    target.file_name().ok_or_else(|| {
+        corrupt(format!(
             "SPANN publication target {} has no file name",
+            target.display()
+        ))
+    })?;
+    if source.parent() != target.parent() {
+        return Err(corrupt(format!(
+            "SPANN atomic publication must remain in one directory: {} -> {}",
+            source.display(),
             target.display()
         )));
     }
-    // `canonicalize` produces a Win32 verbatim (`\\?\`) path. That prefix is
-    // a Win32 parser instruction, not part of the native rename filename, and
-    // FileRenameInfoEx can persist bytes beyond the intended component when it
-    // is embedded in FILE_RENAME_INFO. Supply an ordinary absolute DOS path.
+    // FileRenameInfoEx resolves a simple name against the process working
+    // directory, not the source file's directory. Supply an ordinary absolute
+    // DOS path; never use `canonicalize`, whose verbatim `\\?\` parser prefix
+    // is not part of the desired filename.
     let absolute_target = if target.is_absolute() {
         target.to_path_buf()
     } else {
@@ -563,8 +570,12 @@ fn publish_synced_file_atomic_impl(source: &Path, target: &Path, replace: bool) 
         .len()
         .checked_mul(std::mem::size_of::<u16>())
         .ok_or_else(|| corrupt("SPANN publication target length overflow"))?;
-    let file_name_offset = std::mem::offset_of!(FILE_RENAME_INFO, FileName);
-    let buffer_len = file_name_offset
+    // Microsoft requires the information buffer to cover the complete fixed
+    // structure plus the variable filename. This is deliberately larger than
+    // `offset_of(FileName) + FileNameLength`: FILE_RENAME_INFO contains a
+    // one-element trailing array and x64 tail padding. The zeroed extent also
+    // supplies an explicit UTF-16 terminator, excluded from FileNameLength.
+    let buffer_len = std::mem::size_of::<FILE_RENAME_INFO>()
         .checked_add(file_name_bytes)
         .ok_or_else(|| corrupt("SPANN rename buffer length overflow"))?;
     let buffer_len_u32 = u32::try_from(buffer_len)
@@ -593,6 +604,9 @@ fn publish_synced_file_atomic_impl(source: &Path, target: &Path, replace: bool) 
             std::ptr::addr_of_mut!((*rename_info).FileName).cast::<u16>(),
             target_wide.len(),
         );
+        *std::ptr::addr_of_mut!((*rename_info).FileName)
+            .cast::<u16>()
+            .add(target_wide.len()) = 0;
     }
 
     let source_file = OpenOptions::new()
