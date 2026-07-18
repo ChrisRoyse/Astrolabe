@@ -184,6 +184,13 @@ impl LensSpec {
         self.declared_contract().lens_id()
     }
 
+    /// Pre-#570 (legacy v1, modality-blind) LensId this spec would have hashed
+    /// to. Used only by the fail-closed legacy-migration diagnostic to detect a
+    /// seed/key derived from the historical identity; never a registration path.
+    pub fn legacy_v1_lens_id(&self) -> LensId {
+        self.declared_contract().legacy_v1_lens_id()
+    }
+
     pub fn health(&self) -> LensHealth {
         match &self.runtime {
             LensRuntime::Algorithmic { .. } => LensHealth::Loaded,

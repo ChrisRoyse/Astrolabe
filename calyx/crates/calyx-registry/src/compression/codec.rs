@@ -353,6 +353,34 @@ fn validate_legacy_v2_payload(
     }
     let expected_seed = shared_seed(slot, lens, qv.dim, qv.level, b"turboquant");
     if qv.seed_id != expected_seed.id {
+        // Distinguish an identity-version mismatch from generic corruption. The
+        // TurboQuant rotation seed binds `lens.lens_id()`, which #570 versioned
+        // to a modality-bound v2 identity. A real pre-#570 vault envelope carries
+        // a seed derived from the legacy (v1, modality-blind) LensId, so recompute
+        // that legacy seed: if the persisted seed matches it, this is not a
+        // corrupt row — it is a legacy-identity envelope that must be migrated by
+        // re-commission/re-ingest under the current v2 identity (there is no
+        // silent reinterpretation). Report that precisely instead of a bare
+        // "seed does not match the frozen slot/lens geometry".
+        let legacy_seed = shared_seed_for_lens_id(
+            lens.legacy_v1_lens_id(),
+            slot,
+            qv.dim,
+            qv.level,
+            b"turboquant",
+        );
+        if qv.seed_id == legacy_seed.id {
+            return Err(CalyxError::lens_frozen_violation(format!(
+                "legacy v2 TurboQuant envelope seed derives from the pre-#570 (v1, modality-blind) lens identity, not the current modality-bound v2 identity: \
+                 persisted_seed={} matches legacy_v1_seed for legacy_lens_id={}, but current_v2_lens_id={} derives current_seed={}. \
+                 The frozen LensId now binds modality (#570); legacy identities are refused rather than silently reinterpreted. \
+                 Migrate by re-commissioning/re-ingesting this slot under the current v2 lens identity.",
+                seed_id_hex(&qv.seed_id),
+                lens.legacy_v1_lens_id(),
+                lens.lens_id(),
+                seed_id_hex(&expected_seed.id),
+            )));
+        }
         return Err(invalid(format!(
             "legacy v2 TurboQuant seed does not match the frozen slot/lens geometry: expected={} got={}",
             seed_id_hex(&expected_seed.id),
@@ -1226,11 +1254,21 @@ fn shared_seed(
     level: QuantLevel,
     codec_domain: &[u8],
 ) -> calyx_forge::RotationSeed {
+    shared_seed_for_lens_id(lens.lens_id(), slot, dim, level, codec_domain)
+}
+
+fn shared_seed_for_lens_id(
+    lens_id: calyx_core::LensId,
+    slot: &Slot,
+    dim: usize,
+    level: QuantLevel,
+    codec_domain: &[u8],
+) -> calyx_forge::RotationSeed {
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"calyx-registry-shared-codec-v2");
     hasher.update(&(codec_domain.len() as u64).to_be_bytes());
     hasher.update(codec_domain);
-    hasher.update(lens.lens_id().as_bytes());
+    hasher.update(lens_id.as_bytes());
     hasher.update(&slot.slot_id.get().to_be_bytes());
     hasher.update(&(slot.slot_key.key().len() as u64).to_be_bytes());
     hasher.update(slot.slot_key.key().as_bytes());

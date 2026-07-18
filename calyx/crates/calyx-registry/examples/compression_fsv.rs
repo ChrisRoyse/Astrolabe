@@ -17,7 +17,8 @@ use calyx_core::{
     QuantPolicy, Slot, SlotId, SlotResource, SlotShape, SlotState, SlotVector, VaultId, VaultStore,
 };
 use calyx_forge::{
-    QuantLevel, QuantizedVec, Quantizer, TURBOQUANT_FORMAT_HEADER_BYTES, TurboQuantCodec, new_seed,
+    QuantLevel, QuantizedVec, Quantizer, TURBOQUANT_FORMAT_HEADER_BYTES, TurboQuantCodec,
+    new_seed,
 };
 use calyx_registry::{
     AlgorithmicLens, CompressionQuery, LensRuntime, LensSpec, REGISTRY_ENVELOPE_HEADER_BYTES,
@@ -67,12 +68,72 @@ const LEGACY_WRITER_SOURCE_BLOBS: &[(&str, &str, &str)] = &[
     ),
 ];
 const LEGACY_TQ25_128_SHA256: &str =
-    "25f572987afd1c2606ad9761c72c65d79e098535dfee9150bcc4a78c65b4d18e";
+    "43c7c6558de0e0c6882735f73254173ce9d93884628d6de14f878ded8d96bb91";
 const LEGACY_TQ35_128_SHA256: &str =
-    "add912589e02c71b9ea91f884993b7330352753ec81d5a2f676fe8613cc74bd0";
+    "01c75fef0571d8944b8f1b8c564a3c2ab9d5b4ee71177dbb1b4864ea85ea8dad";
 const LEGACY_TQ25_64_SHA256: &str =
-    "d60a82a7df86888bf305e6eb9f183fb9e2428195943b1e6db8ac04a4c0483ba3";
+    "9ddfe1db42af2e92bd07a8c387b69ca5b78d35726a4ad233f5c5c87110dc70a9";
+// Pre-#570 legacy-IDENTITY golden (tq25/dim128): a real outer-v2/TQPR-v1 row
+// whose TurboQuant seed derives from the historical v1 (modality-blind) LensId
+// at LEGACY_WRITER_COMMIT. Retained verbatim to pin the identity-version refusal
+// diagnostic; it must never be re-encoded under the current v2 identity.
+const LEGACY_V1_IDENTITY_TQ25_128_SHA256: &str =
+    "25f572987afd1c2606ad9761c72c65d79e098535dfee9150bcc4a78c65b4d18e";
 const LEGACY_TQ25_128_ROWS: &[(&str, &str)] = &[
+    (
+        "8253d0cbc1b657329879d6e6aa011d24",
+        "100202050000008000000080003f8000002e02f348293b3110308f09daf33d2a239aacc6cdfcb6143b20fc378475aba01a000000805887d3e58aab4cc920aca348ee992eb5a2f45048b5b8c9bdd14e6c538f3baa8a545150520101000080000000c000000080000000eeed003f2e02f348293b3110308f09daf33d2a239aacc6cdfcb6143b20fc378475aba01a00f3f6554ce6ab7bd2a2bfecac307b969eb279e77e8262bbed4713e5cb743046903def889d47d2d57ad41cc796a9fa711dc9ba6ae56c6d13b8dffedb9f430fb7f0c563f9f45fffcc",
+    ),
+    (
+        "90ab579cef31f9b1d2bd6382dcea7512",
+        "100202050000008000000080003f8000002e02f348293b3110308f09daf33d2a239aacc6cdfcb6143b20fc378475aba01a000000805d8e54935026aa1844dc8c6f8bfad7d28b297e9ad582250496dcb1128e1ef1d9545150520101000080000000c0000000800000003d6ee43e2e02f348293b3110308f09daf33d2a239aacc6cdfcb6143b20fc378475aba01a9c15ed87ab22f99351e360efde36229bdd7a0bbf89e8e3f1de2292ccf7ae97a74e6c2fb23429c2a1a2a3c60c37551657c947b65ad9d1e6f528591781642129751831dc29eecdf5b0",
+    ),
+    (
+        "d62233d29935f3a153b49d39cc480b95",
+        "100202050000008000000080003f8000002e02f348293b3110308f09daf33d2a239aacc6cdfcb6143b20fc378475aba01a0000008056c4f14b688b65dcc83c4d61fb3b292a551ec056a05cb314db555cd8ac77fc9f545150520101000080000000c0000000800000004d6a0e3f2e02f348293b3110308f09daf33d2a239aacc6cdfcb6143b20fc378475aba01a7c1fb5fbf4666c7d98cdc6b384019c7d90e5f023edc1f1b6141408fd1cddf5cf69de6556e85ee5a1346a9bf1ba9334490cdde9853f28e530e3fbd68a9d5a254101bc4ad7504f5a8a",
+    ),
+    (
+        "ea451c0f9b3693c62968f22b8bbcd24f",
+        "100202050000008000000080003f8000002e02f348293b3110308f09daf33d2a239aacc6cdfcb6143b20fc378475aba01a00000080fbe33491e2dd9a1339b55b8285930b89c49c6195cfb37eec1701f1e26ed581f5545150520101000080000000c0000000800000006f23fb3e2e02f348293b3110308f09daf33d2a239aacc6cdfcb6143b20fc378475aba01ac0a5be50b1e545c42744e561044e0b02e9717c9b5588f7142997867239c06461692cb5f113c7725b93dfd1195223b7aaad048686332a30212c5cab2e6904cf97762d55fa640bf567",
+    ),
+];
+const LEGACY_TQ35_128_ROWS: &[(&str, &str)] = &[
+    (
+        "8253d0cbc1b657329879d6e6aa011d24",
+        "100201040000008000000080003f800000b80a7376e0a351780aec41b4a4ccb34009d2f22f00c71de19ba941af2c35ee5600000090f8a2ac1b2ceb5120546d3b423dc7a76df86022d3df93497c75a34b13ca907a0d54515052010200008000000040010000800000009cc1843eb80a7376e0a351780aec41b4a4ccb34009d2f22f00c71de19ba941af2c35ee56cd75aeefe61d169b3b774caa8c92b4b7644325d755024bcfb87a8fa1144f72ce41b55d6047442a6b56fb652965a968765096cb943029261d59899661583474f4b19b62edaa55644df0e18059782119a13cef4bda67b54a54",
+    ),
+    (
+        "90ab579cef31f9b1d2bd6382dcea7512",
+        "100201040000008000000080003f800000b80a7376e0a351780aec41b4a4ccb34009d2f22f00c71de19ba941af2c35ee5600000090a49b115f6af0c76fcf99c4868610cf08c6e1f363108b0df63e69d16b035f54f35451505201020000800000004001000080000000e9548f3eb80a7376e0a351780aec41b4a4ccb34009d2f22f00c71de19ba941af2c35ee563f86e3a1fbac80224c0aa4ef550373b259d3c9b29941c90b8edd239e776926803151a5a7328432c55464728ac584140a38a3694c73d216bb1485c876adf45797442ca4d9ce4a26695481631e5d32f811cad68624867438e7",
+    ),
+    (
+        "d62233d29935f3a153b49d39cc480b95",
+        "100201040000008000000080003f800000b80a7376e0a351780aec41b4a4ccb34009d2f22f00c71de19ba941af2c35ee56000000904a4432155b51c0c15fb3f747cf81402e8c2c9d6cc4d14944a82aec5bc31b8d3354515052010200008000000040010000800000003bf5853eb80a7376e0a351780aec41b4a4ccb34009d2f22f00c71de19ba941af2c35ee562a7cca1000fd480f397856fabc23e27e3bba8fde58643326d76426678b71a4db611636bb4c957758eb523373e9d6244b625a9564604a3644d5cd80a9cc08932ddaae87f239c9b9dc24079af8062fa243bb903d59324dbbc0",
+    ),
+    (
+        "ea451c0f9b3693c62968f22b8bbcd24f",
+        "100201040000008000000080003f800000b80a7376e0a351780aec41b4a4ccb34009d2f22f00c71de19ba941af2c35ee5600000090e8f0d77ff49da5523e5b8173d954a3a20b8b41fe4625af0fee0f81378322ef8b54515052010200008000000040010000800000003d36793eb80a7376e0a351780aec41b4a4ccb34009d2f22f00c71de19ba941af2c35ee560efb9a92b15f4af44d6d1e377faf5f3ae17b42a34ed3f05d61388ce7bf705a774c97787671ccd405d872b645a57a202c52365a6fd5ae2c56bc294ea768da6c4c96ba84752e882ee947a981f5cc8e99a9a5d87fd821d58b3c",
+    ),
+];
+const LEGACY_TQ25_64_ROWS: &[(&str, &str)] = &[
+    (
+        "8253d0cbc1b657329879d6e6aa011d24",
+        "100202050000008000000040023f800000b25643f53ce0c40ec962e50e8a98789ae30f6c16cc2142fd4c4bce1bcaad54dc0000006c2e551a7c790bc9400b68e15d351b7eb4a192358ecec358162a831fceb4314b7c54515052010100004000000060000000400000000178df3eb25643f53ce0c40ec962e50e8a98789ae30f6c16cc2142fd4c4bce1bcaad54dccae05ed0698023f0aa7cfa98bde9b788de14b3d3d8ab02f27aa9ce19e1ab95223264ba8b9a93aa863cff795bd640d85ca92b2994",
+    ),
+    (
+        "90ab579cef31f9b1d2bd6382dcea7512",
+        "100202050000008000000040023f800000b25643f53ce0c40ec962e50e8a98789ae30f6c16cc2142fd4c4bce1bcaad54dc0000006cdb3e574f8e07ef6400acdb68327b3f8004fc9f2a1d3390a9919ae3388fb2c8e454515052010100004000000060000000400000001194d73eb25643f53ce0c40ec962e50e8a98789ae30f6c16cc2142fd4c4bce1bcaad54dc101cf3919b0fc831a4f554aaf7fc2a0192e26147af1117d5f36de58d8360862ac96cab389454ae96759eef899aa5903ff706594c",
+    ),
+    (
+        "d62233d29935f3a153b49d39cc480b95",
+        "100202050000008000000040023f800000b25643f53ce0c40ec962e50e8a98789ae30f6c16cc2142fd4c4bce1bcaad54dc0000006cbd991839d4799affe6a18f9684ae6f211938fa265814a7a1b5d26a389d124fef54515052010100004000000060000000400000006bb0123fb25643f53ce0c40ec962e50e8a98789ae30f6c16cc2142fd4c4bce1bcaad54dc2a80376ade609d97fbb656d4023a89a753c712231614418397590ba2d6cfe9704e1f877a9334b2f4d48a83523f694cb65fdd9c2c",
+    ),
+    (
+        "ea451c0f9b3693c62968f22b8bbcd24f",
+        "100202050000008000000040023f800000b25643f53ce0c40ec962e50e8a98789ae30f6c16cc2142fd4c4bce1bcaad54dc0000006cd277ef0d1fbfd04ec79b614d26fa65376ad3e83eb8caaa21d023ccad7b300e5354515052010100004000000060000000400000009134ed3eb25643f53ce0c40ec962e50e8a98789ae30f6c16cc2142fd4c4bce1bcaad54dc04717e3ed2a15ec2b314c4c473ba3172fdc0e448a15d88c4f4458eb5c428d4da50569c3eba4e81f24e7ba4a8cbb1872185c74bed",
+    ),
+];
+const LEGACY_V1_IDENTITY_TQ25_128_ROWS: &[(&str, &str)] = &[
     (
         "8253d0cbc1b657329879d6e6aa011d24",
         "100202050000008000000080003f8000009f04ae112afa8d3e85629067e619d9004028d1bf2ebd04e1816c684e4f7da8f200000080d978aacee9c8475de5a9cbcaf0747eb06785c49fc3ecd81a29d67adb9bf9fc9b545150520101000080000000c000000080000000cb3ef13e9f04ae112afa8d3e85629067e619d9004028d1bf2ebd04e1816c684e4f7da8f2f3aa636592c2b2a3986d5700ac90d08f457c0d0ca586cbd04be04660bee14d4b960ba3f50e5837f5289d23168393ccf5afb476e3d024342dd43648084c9db40b8b08910f3c097a77",
@@ -88,42 +149,6 @@ const LEGACY_TQ25_128_ROWS: &[(&str, &str)] = &[
     (
         "ea451c0f9b3693c62968f22b8bbcd24f",
         "100202050000008000000080003f8000009f04ae112afa8d3e85629067e619d9004028d1bf2ebd04e1816c684e4f7da8f2000000803704d1dbb394e6c568e12663c81091a93b93d0b1a0db3701a520fe2103cdbdee545150520101000080000000c0000000800000003e58033f9f04ae112afa8d3e85629067e619d9004028d1bf2ebd04e1816c684e4f7da8f2ec1ed4df2ac6eec66d403078509ebca5ef1923fd327fd04f1a7db763b30afee6a211924a564a94bf447f9b414d97a09b8dd28a00482a544efcc33131f13708d3ad6b564ea5a45835",
-    ),
-];
-const LEGACY_TQ35_128_ROWS: &[(&str, &str)] = &[
-    (
-        "8253d0cbc1b657329879d6e6aa011d24",
-        "100201040000008000000080003f800000524ea7fe18609bde23d66f818940e35ed43ae8a8f47163586b3d7c64f0c40e9400000090c6eb0d36c0638dc24b639e953da010f2d57827a505292729dbca59e67d7b4e645451505201020000800000004001000080000000fa93853e524ea7fe18609bde23d66f818940e35ed43ae8a8f47163586b3d7c64f0c40e94253fe347c09b8bd9f8e9846d0f6a8f5c5f1c961ba8734a7ad3f1c5386024227c5356cb1593c5f73be8f4bfbae6795592add5aa6d7ab1fd64a4a4ae070789558b0593d3848e122d9dddb0e5321803e4b5fa3f60c501341cfa",
-    ),
-    (
-        "90ab579cef31f9b1d2bd6382dcea7512",
-        "100201040000008000000080003f800000524ea7fe18609bde23d66f818940e35ed43ae8a8f47163586b3d7c64f0c40e94000000908ef83ab0022e351673fc06ca9f82ddc593d6a9b1ba81e6477f8694666ab48d655451505201020000800000004001000080000000ce3a803e524ea7fe18609bde23d66f818940e35ed43ae8a8f47163586b3d7c64f0c40e9441ef6db02b73b99f5a48721ff0ab5bccbd7349ad59cdf9cbc04545d3b07de536bf0c35e5e0448e16370f57925a758acc33ffad4eac6a39a952aa08b2a84a4dccb2f97c7d943d888c47eb463b754dbf2a6c1579608aad87f4",
-    ),
-    (
-        "d62233d29935f3a153b49d39cc480b95",
-        "100201040000008000000080003f800000524ea7fe18609bde23d66f818940e35ed43ae8a8f47163586b3d7c64f0c40e9400000090f32b61705d56d6cc1ad7a44dcacf39398f565950a41975fe73072e571c8883d25451505201020000800000004001000080000000f6e3943e524ea7fe18609bde23d66f818940e35ed43ae8a8f47163586b3d7c64f0c40e9427a4d1846c21ddc15f359bf4ec4a1ea5f14884f90a47609b263f347bf81791982a4eaed665cb2b75eb816db36591a766dbb64d289325d96b7174bd9914f33192c7b9a495253a7b219fd790856983cbf7a1ad9746a40167e0",
-    ),
-    (
-        "ea451c0f9b3693c62968f22b8bbcd24f",
-        "100201040000008000000080003f800000524ea7fe18609bde23d66f818940e35ed43ae8a8f47163586b3d7c64f0c40e9400000090bab9cc44421d9d40a827c5e037a678759b85453439fcad3252376968fa44d3b254515052010200008000000040010000800000001554923e524ea7fe18609bde23d66f818940e35ed43ae8a8f47163586b3d7c64f0c40e948980981a173f813266cf45e18a207c56d27ee9f976028f0af8246d360e36d6b615f3d6d48e6273ac9934b22ea726ab2c75c944a17d73dd69757309c5a7b0d37597f2a6755d6bdd627e2ee4aade0048404c1ea07a00732be4",
-    ),
-];
-const LEGACY_TQ25_64_ROWS: &[(&str, &str)] = &[
-    (
-        "8253d0cbc1b657329879d6e6aa011d24",
-        "100202050000008000000040023f800000978b49c2d287b90b5eef21dd7fa289f6b9a54209115e10755ffdbbeeacfe2d0e0000006c5e73ed9098f42def8f24e76bf526325328ef271611ef5c527d62baab08220fcb5451505201010000400000006000000040000000d970103f978b49c2d287b90b5eef21dd7fa289f6b9a54209115e10755ffdbbeeacfe2d0e9697f6afb275018fde330717848ca88cb1c8184068438988f1de239349239fabee624a0fdfc869c558a9c538df736cf0fca4f7f2",
-    ),
-    (
-        "90ab579cef31f9b1d2bd6382dcea7512",
-        "100202050000008000000040023f800000978b49c2d287b90b5eef21dd7fa289f6b9a54209115e10755ffdbbeeacfe2d0e0000006ce4d8725b0aff889b0de5a91ece6377b03872cf822170667ac9d815e00125cafd54515052010100004000000060000000400000003cd7f23e978b49c2d287b90b5eef21dd7fa289f6b9a54209115e10755ffdbbeeacfe2d0e1b890476ac797c89584f711f90cff09a14070e419508c697a54922b0d28d9ad7b693f6c021e49ba54852e5876be2aed4435a7c69",
-    ),
-    (
-        "d62233d29935f3a153b49d39cc480b95",
-        "100202050000008000000040023f800000978b49c2d287b90b5eef21dd7fa289f6b9a54209115e10755ffdbbeeacfe2d0e0000006c2127de77fff0cb4698db4f584703fefecd7e24a88e5fe4839776bfdacb21a1575451505201010000400000006000000040000000c9f3003f978b49c2d287b90b5eef21dd7fa289f6b9a54209115e10755ffdbbeeacfe2d0e1fa4ef543f39e6df8dee59fd59a993b2bca44dec24d448160d1843dea64f5ca5b02eab9202b14a07c7906b443a55e7e4a153026e",
-    ),
-    (
-        "ea451c0f9b3693c62968f22b8bbcd24f",
-        "100202050000008000000040023f800000978b49c2d287b90b5eef21dd7fa289f6b9a54209115e10755ffdbbeeacfe2d0e0000006c90b9f0cc2da91c7dd0eed1c3395bcd9ac95e6a48a6c821249b464566d4fdfbca54515052010100004000000060000000400000001ad3ee3e978b49c2d287b90b5eef21dd7fa289f6b9a54209115e10755ffdbbeeacfe2d0ef21d305266dedeb937619f7a86a1a9f70b7b042eb934ed38697c9346592d63e7aa926ac10389156b3c508ce67831920e119f1c2a",
     ),
 ];
 const VAULT_SALT: &[u8] = b"issue-551-fsv-vault-salt-v1";
@@ -248,6 +273,7 @@ fn run() -> AnyResult<()> {
     legacy_migration_edge(&root, &vault_a, &registry, &happy_slots[0], &corpus)?;
     legacy_migration_edge(&root, &vault_a, &registry, &happy_slots[1], &corpus)?;
     legacy_migration_edge(&root, &vault_a, &registry, &happy_slots[2], &corpus)?;
+    legacy_identity_refusal_edge(&root, &vault_a, &registry, &happy_slots[0], &corpus)?;
     wrong_context_edge(&vault_a, &registry, &happy_slots[0])?;
     current_metadata_edge(&vault_a, &happy_slots[0])?;
     corruption_edge(&root, &vault_a, &registry, &happy_slots[0])?;
@@ -259,7 +285,7 @@ fn run() -> AnyResult<()> {
         "event": "fsv_success",
         "happy_rows": corpus.cx_ids.len(),
         "operating_points": [2.5, 3.5],
-        "edge_cases": ["empty_full_column", "recall_same_positive_ray", "compressed_recall_boundary_tie", "legacy_v2_bits2p5_atomic_upgrade", "legacy_v2_bits3p5_atomic_upgrade", "legacy_v2_truncated_atomic_upgrade", "legacy_wrong_seed_rehashed", "legacy_raw_body_mismatch_rehashed", "legacy_swapped_rows", "legacy_paired_primary_raw_swap", "wrong_codec_context", "wrong_slot_asymmetry", "wrong_slot_key_id", "current_wrong_version", "current_wrong_seed", "current_wrong_dimension", "persisted_primary_corruption", "persisted_raw_corruption", "zero_query", "maximum_dimension_4096", "over_limit_dimension_4097"],
+        "edge_cases": ["empty_full_column", "recall_same_positive_ray", "compressed_recall_boundary_tie", "legacy_v2_bits2p5_atomic_upgrade", "legacy_v2_bits3p5_atomic_upgrade", "legacy_v2_truncated_atomic_upgrade", "legacy_wrong_seed_rehashed", "legacy_raw_body_mismatch_rehashed", "legacy_swapped_rows", "legacy_paired_primary_raw_swap", "legacy_v1_identity_seed_refused", "wrong_codec_context", "wrong_slot_asymmetry", "wrong_slot_key_id", "current_wrong_version", "current_wrong_seed", "current_wrong_dimension", "persisted_primary_corruption", "persisted_raw_corruption", "zero_query", "maximum_dimension_4096", "over_limit_dimension_4097"],
         "source_truth_readback": "complete",
         "tree_head": tree_head,
         "tree_state_sha256": tree_state_sha256,
@@ -1722,14 +1748,8 @@ fn legacy_migration_edge(
         "raw_dim": raw_dim,
         "stored_dim": stored_dim,
         "legacy_seed_id": legacy_seed_id,
-        "historical_writer_commit": LEGACY_WRITER_COMMIT,
-        "historical_writer_sources": LEGACY_WRITER_SOURCE_BLOBS.iter().map(
-            |(path, git_blob, sha256)| json!({
-                "path": path,
-                "git_blob": git_blob,
-                "sha256": sha256,
-            }),
-        ).collect::<Vec<_>>(),
+        "golden_identity": "current-v2-modality-bound",
+        "golden_provenance": "TQPR-v1 legacy wire format re-encoded by the in-tree forge legacy encoder (TurboQuantV1MigrationVerifier::reconstruct_expected) over the exact persisted raw vectors, seeded by the current modality-bound v2 lens identity (#570); this is the legacy on-disk FORMAT the Migrate path upgrades, carrying a current-identity seed so the format upgrade proceeds",
         "pinned_golden_sha256": golden.aggregate_sha256,
         "reference_legacy_manifest_sha256": sha256_hex(&legacy_manifest),
         "reference_generation_root": hex(&legacy_manifest[48..80]),
@@ -2207,11 +2227,21 @@ fn shared_seed_for_domain(
     level: QuantLevel,
     codec_domain: &[u8],
 ) -> calyx_forge::RotationSeed {
+    shared_seed_for_lens_id(registered.lens_id, registered, dim, level, codec_domain)
+}
+
+fn shared_seed_for_lens_id(
+    lens_id: calyx_core::LensId,
+    registered: &RegisteredSlot,
+    dim: usize,
+    level: QuantLevel,
+    codec_domain: &[u8],
+) -> calyx_forge::RotationSeed {
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"calyx-registry-shared-codec-v2");
     hasher.update(&(codec_domain.len() as u64).to_be_bytes());
     hasher.update(codec_domain);
-    hasher.update(registered.lens_id.as_bytes());
+    hasher.update(lens_id.as_bytes());
     hasher.update(&registered.slot.slot_id.get().to_be_bytes());
     hasher.update(&(registered.slot.slot_key.key().len() as u64).to_be_bytes());
     hasher.update(registered.slot.slot_key.key().as_bytes());
@@ -2468,6 +2498,190 @@ fn legacy_refusal_edge(
         "state": after,
         "physical": physical_json(&physical_digest(&directory)?),
         "mutation_after_trigger": false,
+    }));
+    drop(writer);
+    Ok(())
+}
+
+/// Pins the identity-version refusal: a REAL pre-#570 legacy-IDENTITY on-disk
+/// generation (outer-v2/TQPR-v1, seed derived from the historical modality-blind
+/// v1 LensId) is staged, then the production Migrate path is driven. #570 binds
+/// modality into the frozen LensId, so the codec seed recomputed under the
+/// current v2 identity no longer matches the persisted seed. The production
+/// diagnostic must NOT misreport this as a generic seed mismatch: it must detect
+/// that the persisted seed matches the legacy v1 identity derivation and refuse
+/// fail-closed with a structured identity-version error naming both identities
+/// and the re-commission/re-ingest migration remediation. No state may mutate.
+fn legacy_identity_refusal_edge(
+    root: &Path,
+    valid_source_directory: &Path,
+    registry: &Registry,
+    registered: &RegisteredSlot,
+    corpus: &Corpus,
+) -> AnyResult<()> {
+    // The pinned legacy-identity golden is the tq25/dim128 geometry only.
+    let raw_dim = match registered.slot.shape {
+        SlotShape::Dense(dim) => dim,
+        _ => return Err(failure("legacy identity edge requires a dense slot").into()),
+    };
+    let stored_dim = stored_dim_for(registry, registered)?;
+    require(
+        registered.bits_per_channel_x2 == 5 && raw_dim == 128 && stored_dim == 128,
+        "legacy identity refusal edge is pinned to the tq25/dim128 geometry",
+    )?;
+
+    let directory = root.join(format!(
+        "legacy-v1-identity-refusal-slot-{}",
+        registered.slot.slot_id.get()
+    ));
+    copy_tree(valid_source_directory, &directory)?;
+    let writer = open_writer(&directory)?;
+    let slot_id = registered.slot.slot_id;
+    let injection_base_seq = writer.latest_seq();
+    let raw = writer.scan_cf_at(injection_base_seq, ColumnFamily::slot_raw(slot_id))?;
+    let manifest_key = compression_manifest_key(slot_id);
+
+    // Decode the pinned pre-#570 legacy-identity primary column and confirm it is
+    // the exact immutable golden (seed derives from the historical v1 identity).
+    let legacy_primary_by_key = LEGACY_V1_IDENTITY_TQ25_128_ROWS
+        .iter()
+        .map(|(key, value)| Ok((decode_hex(key)?, decode_hex(value)?)))
+        .collect::<AnyResult<BTreeMap<_, _>>>()?;
+    require(
+        digest_map(&legacy_primary_by_key) == LEGACY_V1_IDENTITY_TQ25_128_SHA256,
+        "legacy-identity golden digest differs from the pinned pre-#570 source",
+    )?;
+    let persisted_keys = writer
+        .scan_cf_at(injection_base_seq, ColumnFamily::slot(slot_id))?
+        .iter()
+        .map(|(key, _)| key.clone())
+        .collect::<BTreeSet<_>>();
+    require(
+        persisted_keys
+            == legacy_primary_by_key
+                .keys()
+                .cloned()
+                .collect::<BTreeSet<_>>(),
+        "legacy-identity golden keyset differs from the persisted source column",
+    )?;
+    let pinned_first = {
+        let (first_key, first_value) = legacy_primary_by_key
+            .iter()
+            .next()
+            .ok_or_else(|| failure("legacy-identity golden has no rows"))?;
+        parse_legacy_fixture_row(first_key, first_value)?
+    };
+    let legacy_seed_id = hex(&pinned_first.qv.seed_id);
+    let legacy_primary = legacy_primary_by_key.into_iter().collect::<Vec<_>>();
+
+    let injection_seq =
+        reconstruct_legacy_generation(&writer, slot_id, &legacy_primary, &raw, injection_base_seq)?;
+    writer.flush()?;
+    require(
+        writer
+            .read_cf_at(injection_seq, ColumnFamily::Compression, &manifest_key)?
+            .is_none(),
+        "legacy-identity refusal fixture still exposes a generation manifest",
+    )?;
+    require(
+        writer
+            .scan_cf_at(injection_seq, ColumnFamily::slot(slot_id))?
+            .iter()
+            .all(|(_, bytes)| bytes.get(1).copied() == Some(2)),
+        "legacy-identity fixture does not contain only v2 envelopes",
+    )?;
+    drop(writer);
+
+    let writer = open_writer(&directory)?;
+    require(
+        writer.latest_seq() == injection_seq,
+        "reopened legacy-identity fixture lost its injected state",
+    )?;
+    let before = logical_state(&writer, injection_seq, std::slice::from_ref(registered))?;
+    log(json!({
+        "event": "edge_legacy_v1_identity_refusal_before",
+        "seq": injection_seq,
+        "outer_version": 2,
+        "inner_version": 1,
+        "raw_dim": raw_dim,
+        "stored_dim": stored_dim,
+        "persisted_legacy_seed_id": legacy_seed_id,
+        "golden_identity": "pre-570-v1-modality-blind",
+        "historical_writer_commit": LEGACY_WRITER_COMMIT,
+        "historical_writer_sources": LEGACY_WRITER_SOURCE_BLOBS.iter().map(
+            |(path, git_blob, sha256)| json!({
+                "path": path,
+                "git_blob": git_blob,
+                "sha256": sha256,
+            }),
+        ).collect::<Vec<_>>(),
+        "pinned_golden_sha256": LEGACY_V1_IDENTITY_TQ25_128_SHA256,
+        "reconstruction_ingress": "commit_legacy_generation_reconstruction_if_seq",
+        "state": before,
+    }));
+
+    let rows = corpus
+        .rows_by_slot
+        .get(&slot_id)
+        .ok_or_else(|| failure("legacy identity refusal source rows missing"))?;
+    let query = corpus
+        .queries_by_slot
+        .get(&slot_id)
+        .ok_or_else(|| failure("legacy identity refusal query missing"))?;
+    let error = expect_calyx_error(registry.write_compressed_slot_batch(
+        &writer,
+        &registered.slot,
+        rows,
+        std::slice::from_ref(query),
+        1,
+    ))?;
+    require(
+        error.code == "CALYX_LENS_FROZEN_VIOLATION",
+        format!(
+            "legacy-identity refusal used the wrong error code: {} ({})",
+            error.code, error.message
+        ),
+    )?;
+    require(
+        error
+            .message
+            .contains("derives from the pre-#570 (v1, modality-blind) lens identity"),
+        format!(
+            "legacy-identity refusal did not name the identity-version mismatch: {}",
+            error.message
+        ),
+    )?;
+    require(
+        error.message.contains("re-commissioning/re-ingesting"),
+        format!(
+            "legacy-identity refusal did not carry the migration remediation: {}",
+            error.message
+        ),
+    )?;
+    require(
+        error.message.contains(&legacy_seed_id),
+        format!(
+            "legacy-identity refusal did not echo the persisted legacy seed: {}",
+            error.message
+        ),
+    )?;
+    let after_seq = writer.latest_seq();
+    let after = logical_state(&writer, after_seq, std::slice::from_ref(registered))?;
+    require(
+        after_seq == injection_seq,
+        "legacy-identity refusal advanced durable seq",
+    )?;
+    require(
+        before == after,
+        "legacy-identity refusal mutated durable state",
+    )?;
+    log(json!({
+        "event": "edge_legacy_v1_identity_refusal_after",
+        "trigger_error": calyx_error_json(&error),
+        "seq": after_seq,
+        "state": after,
+        "physical": physical_json(&physical_digest(&directory)?),
+        "mutation": false,
     }));
     drop(writer);
     Ok(())
