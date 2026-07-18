@@ -6,11 +6,18 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 pub const CALYX_IO_ERROR: &str = "CALYX_IO_ERROR";
+/// Raised when a verified log rotation refuses to publish or delete because the
+/// compressed replacement could not be independently proven equal to the source.
+pub const CALYX_JANITOR_ROTATION_ERROR: &str = "CALYX_JANITOR_ROTATION_ERROR";
 pub const MAX_JANITOR_BYTES_PER_TICK: u64 = 100 * 1024 * 1024;
 
 const DEFAULT_LOG_ROTATION_AGE: Duration = Duration::from_secs(60 * 60);
 const DEFAULT_LOG_TTL: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 const DEFAULT_TEMP_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+const DEFAULT_LOG_ROTATION_TIME_BUDGET: Duration = Duration::from_secs(300);
+/// Streaming chunk size for rotation compression/verification. Never materialize
+/// the whole source or the whole compressed output in memory.
+pub const ROTATION_STREAM_CHUNK_BYTES: usize = 64 * 1024;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct JanitorConfig {
@@ -21,6 +28,12 @@ pub struct JanitorConfig {
     pub dataset_prune_by_manifest: bool,
     pub log_rotation_age: Duration,
     pub max_bytes_per_tick: u64,
+    /// Upper bound on the source-log size a single rotation may process. A larger
+    /// source is refused with the source left untouched (declared knob, not magic).
+    pub log_rotation_max_bytes: u64,
+    /// Wall-clock budget for one rotation (compress + independent verify). Exceeding
+    /// it aborts before publication with the source left untouched (declared knob).
+    pub log_rotation_time_budget: Duration,
 }
 
 impl Default for JanitorConfig {
@@ -33,6 +46,8 @@ impl Default for JanitorConfig {
             dataset_prune_by_manifest: false,
             log_rotation_age: DEFAULT_LOG_ROTATION_AGE,
             max_bytes_per_tick: MAX_JANITOR_BYTES_PER_TICK,
+            log_rotation_max_bytes: MAX_JANITOR_BYTES_PER_TICK,
+            log_rotation_time_budget: DEFAULT_LOG_ROTATION_TIME_BUDGET,
         }
     }
 }
