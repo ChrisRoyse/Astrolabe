@@ -551,6 +551,11 @@ fn legacy_policy_identity(policy: QuantPolicy) -> Result<(StoredSlotCodec, Quant
         } => Err(invalid(format!(
             "unsupported legacy TurboQuant bits_per_channel_x2 {bits_per_channel_x2}"
         ))),
+        QuantPolicy::TurboQuantHadamard {
+            bits_per_channel_x2,
+        } => Err(invalid(format!(
+            "legacy unmanifested structured-Hadamard TurboQuant state cannot be inferred for bits_per_channel_x2={bits_per_channel_x2}; rewrite it through the versioned compression generation API"
+        ))),
         QuantPolicy::MxFp4 => Ok((StoredSlotCodec::MxFp4, QuantLevel::Bits4Fp)),
         QuantPolicy::Float8 => Ok((StoredSlotCodec::MxFp8, QuantLevel::Bits8Fp)),
         QuantPolicy::Binary => Ok((StoredSlotCodec::Binary, QuantLevel::Bits1)),
@@ -777,6 +782,24 @@ impl CodecContext {
                 let seed = shared_seed(slot, lens, dim, level, b"turboquant-tqpr-v2");
                 Ok(Self::TurboQuant(
                     TurboQuantCodec::shared(seed, level).map_err(forge_error)?,
+                ))
+            }
+            QuantPolicy::TurboQuantHadamard {
+                bits_per_channel_x2,
+            } => {
+                let level = match bits_per_channel_x2 {
+                    7 => QuantLevel::Bits3p5,
+                    5 => QuantLevel::Bits2p5,
+                    other => {
+                        return Err(invalid(format!(
+                            "unsupported structured-Hadamard TurboQuant bits_per_channel_x2 {other}; expected 5 or 7"
+                        )));
+                    }
+                };
+                let seed =
+                    shared_seed(slot, lens, dim, level, b"turboquant-structured-hadamard-v1");
+                Ok(Self::TurboQuant(
+                    TurboQuantCodec::shared_structured(seed, level).map_err(forge_error)?,
                 ))
             }
             QuantPolicy::MxFp4 => {

@@ -5,7 +5,7 @@ use crate::quant::{QuantLevel, RotationSeed};
 use crate::{ForgeError, Result};
 
 const QJL_DOMAIN: &[u8] = b"calyx/turboquant/qjl-gaussian/v1\0";
-const QJL_FACTOR: f64 = 1.253_314_137_315_500_1;
+pub(crate) const QJL_FACTOR: f64 = 1.253_314_137_315_500_1;
 const BIPOLAR_BYTE_LANES: [[f32; 8]; 256] = bipolar_byte_lanes();
 
 #[derive(Clone, Debug, PartialEq)]
@@ -248,7 +248,7 @@ pub(crate) fn read_bit(bytes: &[u8], index: usize) -> bool {
     ((bytes[index / 8] >> (index % 8)) & 1) != 0
 }
 
-fn sign_dot(values: &[f32], bits: &[u8]) -> f64 {
+pub(crate) fn sign_dot(values: &[f32], bits: &[u8]) -> f64 {
     let mut sum = 0.0_f64;
     let mut base = 0usize;
     for byte in bits {

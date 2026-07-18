@@ -16,6 +16,56 @@ pub(crate) struct LloydMaxCodebook {
 }
 
 impl LloydMaxCodebook {
+    /// Frozen, `libm`-independent codebook for structured TurboQuant geometry.
+    ///
+    /// Dimensions below 16 use exact uniform midpoints because a normal
+    /// approximation is poor on very small spheres. Larger dimensions use
+    /// committed nearest-f32 Lloyd-Max centroids for a standard normal,
+    /// scaled by a fixed-iteration IEEE-754 reciprocal-square-root routine.
+    /// No transcendental function participates in geometry regeneration.
+    pub(crate) fn new_stable(dim: usize, bits: usize, level: QuantLevel) -> Result<Self> {
+        if dim == 0 || !(1..=3).contains(&bits) {
+            return Err(codebook_error(
+                level,
+                format!("invalid stable codebook geometry dim={dim} bits={bits}"),
+            ));
+        }
+        let levels = 1_usize << bits;
+        let centroids = if dim == 1 {
+            let half = levels / 2;
+            (0..levels)
+                .map(|index| if index < half { -1.0 } else { 1.0 })
+                .collect::<Vec<_>>()
+        } else if dim < 16 {
+            (0..levels)
+                .map(|index| {
+                    let numerator = (2 * index + 1) as f32 - levels as f32;
+                    numerator / levels as f32
+                })
+                .collect::<Vec<_>>()
+        } else {
+            let scale = stable_inv_sqrt(dim as f32);
+            stable_normal_centroids(bits)
+                .iter()
+                .map(|bits| f32::from_bits(*bits) * scale)
+                .collect::<Vec<_>>()
+        };
+        if centroids.len() != levels
+            || centroids.iter().any(|value| !value.is_finite())
+            || centroids.windows(2).any(|pair| pair[0] > pair[1])
+        {
+            return Err(codebook_error(
+                level,
+                "stable codebook coefficients violated their frozen contract",
+            ));
+        }
+        Ok(Self {
+            dim,
+            bits,
+            centroids,
+        })
+    }
+
     pub(crate) fn new(dim: usize, bits: usize, level: QuantLevel) -> Result<Self> {
         if dim == 0 || !(1..=3).contains(&bits) {
             return Err(codebook_error(
@@ -286,6 +336,40 @@ impl LloydMaxCodebook {
 
     pub(crate) fn centroids(&self) -> &[f32] {
         &self.centroids
+    }
+}
+
+/// Deterministic reciprocal square root used only for frozen geometry setup.
+/// Four fixed Newton steps from the committed seed constant make the result
+/// independent of platform transcendental libraries.
+pub(crate) fn stable_inv_sqrt(value: f32) -> f32 {
+    let half = value * 0.5;
+    let mut estimate = f32::from_bits(0x5f37_5a86_u32.wrapping_sub(value.to_bits() >> 1));
+    for _ in 0..4 {
+        estimate *= 1.5 - half * estimate * estimate;
+    }
+    estimate
+}
+
+fn stable_normal_centroids(bits: usize) -> &'static [u32] {
+    // Nearest-f32 Lloyd-Max centroids for N(0,1), committed as bits.
+    const BITS_1: [u32; 2] = [0xbf4c_422a, 0x3f4c_422a];
+    const BITS_2: [u32; 4] = [0xbfc1_555d, 0xbee7_d2c9, 0x3ee7_d2c9, 0x3fc1_555d];
+    const BITS_3: [u32; 8] = [
+        0xc009_b97a,
+        0xbfac_0538,
+        0xbf41_898f,
+        0xbe7a_f9f9,
+        0x3e7a_f9f9,
+        0x3f41_898f,
+        0x3fac_0538,
+        0x4009_b97a,
+    ];
+    match bits {
+        1 => &BITS_1,
+        2 => &BITS_2,
+        3 => &BITS_3,
+        _ => &[],
     }
 }
 

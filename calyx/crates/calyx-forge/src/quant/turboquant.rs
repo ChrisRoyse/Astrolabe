@@ -3,9 +3,13 @@ use std::fmt;
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use sha2::{Digest, Sha256};
+use wide::f64x4;
 
-use crate::quant::codebook::LloydMaxCodebook;
-use crate::quant::qjl::{GaussianProjection, QjlResidual, bitstream_len, has_nonzero_padding};
+use crate::quant::codebook::{LloydMaxCodebook, stable_inv_sqrt};
+use crate::quant::hadamard::StructuredHadamard;
+use crate::quant::qjl::{
+    GaussianProjection, QJL_FACTOR, QjlResidual, bitstream_len, has_nonzero_padding, sign_dot,
+};
 use crate::quant::rotation::HaarRotation;
 use crate::quant::{QuantLevel, QuantizedVec, Quantizer, RotationSeed, SeedId};
 use crate::{ForgeError, Result};
@@ -23,12 +27,33 @@ const DIGEST_DOMAIN: &[u8] = b"calyx/turboquant/tqpr/payload/v2\0";
 const LEGACY_V1_DIGEST_DOMAIN: &[u8] = b"calyx/turboquant/tqpr/payload/v1\0";
 const LEGACY_V1_FORMAT_VERSION: u8 = 1;
 const GEOMETRY_DOMAIN: &[u8] = b"calyx/turboquant/geometry/v2\0";
+const STRUCTURED_GEOMETRY_DOMAIN: &[u8] = b"calyx/turboquant/geometry/structured-hadamard/v1\0";
+const STRUCTURED_ROTATION_DOMAIN: &[u8] = b"calyx/turboquant/rotation/structured-hadamard/v1\0";
+const STRUCTURED_QJL_DOMAIN: &[u8] = b"calyx/turboquant/qjl/structured-hadamard/v1\0";
 const HEADER_PREFIX_BYTES: usize = 56;
 const DIGEST_OFFSET: usize = HEADER_PREFIX_BYTES;
 const BODY_OFFSET: usize = TURBOQUANT_FORMAT_HEADER_BYTES;
 const BITS2P5_LEVEL_CODE: u8 = 1;
 const BITS3P5_LEVEL_CODE: u8 = 2;
 const REMEDIATION: &str = "Use a canonical TQPR v2 payload, matching current-version geometry, supported level, and finite vector with dimension 1..=4096";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+/// Frozen transform family carried by a TurboQuant geometry identity.
+pub enum TurboQuantGeometryKind {
+    /// The theorem-faithful dense Haar rotation plus dense Gaussian QJL matrix.
+    DenseHaarGaussianV2,
+    /// Bit-exact randomized Hadamard rotation and QJL transform.
+    StructuredHadamardV1,
+}
+
+impl TurboQuantGeometryKind {
+    const fn code(self) -> u8 {
+        match self {
+            Self::DenseHaarGaussianV2 => 1,
+            Self::StructuredHadamardV1 => 2,
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 /// Physical and logical storage accounting for a validated TQPR payload.
@@ -53,10 +78,8 @@ pub struct TurboQuantStorage {
 /// Besides the rotated/projected query, preparation materializes per-coordinate
 /// scalar lookup tables: `scalar_lut[i * lut_stride + code]` holds the exact
 /// `f64` product `rotated[i] * centroid(code)` for the coordinate's codebook,
-/// so the packed candidate scan is pure table lookups with no per-coordinate
-/// centroid fetch, canonicality branch, or multiply. The LUT sum is
-/// bit-identical to the reference per-coordinate walk because the identical
-/// `f64` products are accumulated in the identical order.
+/// so the packed candidate scan is table lookup plus blocked SIMD accumulation
+/// with no per-coordinate centroid fetch, canonicality branch, or multiply.
 pub struct TurboQuantPreparedQuery {
     dim: usize,
     seed_id: SeedId,
@@ -79,6 +102,209 @@ pub struct TurboQuantValidatedCandidate<'a> {
     storage: TurboQuantStorage,
 }
 
+enum RotationGeometry {
+    Dense(HaarRotation),
+    Structured(StructuredHadamard),
+}
+
+impl RotationGeometry {
+    fn apply(&self, values: &mut [f32]) -> Result<()> {
+        match self {
+            Self::Dense(rotation) => rotation.apply(values),
+            Self::Structured(rotation) => rotation.apply(values),
+        }
+    }
+
+    fn apply_inverse(&self, values: &mut [f32]) -> Result<()> {
+        match self {
+            Self::Dense(rotation) => rotation.apply_inverse(values),
+            Self::Structured(rotation) => rotation.apply_inverse(values),
+        }
+    }
+
+    fn seed_id(&self) -> SeedId {
+        match self {
+            Self::Dense(rotation) => rotation.seed_id(),
+            Self::Structured(rotation) => rotation.seed_id(),
+        }
+    }
+
+    fn physical_bytes(&self) -> usize {
+        match self {
+            Self::Dense(rotation) => {
+                let (starts, factors, signs) = rotation.geometry_parts();
+                starts.len() * std::mem::size_of::<usize>()
+                    + factors.len() * std::mem::size_of::<f32>()
+                    + signs.len() * std::mem::size_of::<f32>()
+            }
+            Self::Structured(rotation) => rotation.physical_bytes(),
+        }
+    }
+}
+
+enum ProjectionGeometry {
+    Dense(GaussianProjection),
+    Structured(StructuredHadamard),
+}
+
+impl ProjectionGeometry {
+    fn project(&self, input: &[f32], level: QuantLevel) -> Result<Vec<f32>> {
+        match self {
+            Self::Dense(projection) => projection.project(input),
+            Self::Structured(projection) => {
+                let mut output = input.to_vec();
+                projection.apply(&mut output).map_err(|error| {
+                    quant_error("structured_qjl_project", level, error.to_string())
+                })?;
+                Ok(output)
+            }
+        }
+    }
+
+    fn encode_residual(
+        &self,
+        residual: &[f32],
+        source_norm: f32,
+        level: QuantLevel,
+    ) -> Result<QjlResidual> {
+        match self {
+            Self::Dense(projection) => projection.encode_residual(residual, source_norm),
+            Self::Structured(projection) => {
+                if residual.is_empty() || residual.iter().any(|value| !value.is_finite()) {
+                    return Err(quant_error(
+                        "structured_qjl_encode",
+                        level,
+                        "residual must be non-empty and finite",
+                    ));
+                }
+                if !source_norm.is_finite() || source_norm <= 0.0 {
+                    return Err(quant_error(
+                        "structured_qjl_encode",
+                        level,
+                        "nonzero residuals require a finite positive source norm",
+                    ));
+                }
+                let residual_norm = residual
+                    .iter()
+                    .map(|value| f64::from(*value) * f64::from(*value))
+                    .sum::<f64>()
+                    .sqrt();
+                let gamma_f64 = f64::from(source_norm) * residual_norm;
+                if !gamma_f64.is_finite() || gamma_f64 > f64::from(f32::MAX) {
+                    return Err(quant_error(
+                        "structured_qjl_encode",
+                        level,
+                        "scaled residual norm cannot be represented as finite f32",
+                    ));
+                }
+                let gamma = gamma_f64 as f32;
+                if gamma == 0.0 {
+                    return Ok(QjlResidual {
+                        bits: vec![0; bitstream_len(residual.len())],
+                        gamma: 0.0,
+                    });
+                }
+                let mut projected = residual.to_vec();
+                projection.apply(&mut projected).map_err(|error| {
+                    quant_error("structured_qjl_encode", level, error.to_string())
+                })?;
+                let mut bits = vec![0_u8; bitstream_len(projected.len())];
+                for (index, value) in projected.iter().enumerate() {
+                    if *value >= 0.0 {
+                        bits[index / 8] |= 1 << (index % 8);
+                    }
+                }
+                Ok(QjlResidual { bits, gamma })
+            }
+        }
+    }
+
+    fn correction_parts(
+        &self,
+        projected_query: &[f32],
+        bits: &[u8],
+        gamma: f32,
+        level: QuantLevel,
+    ) -> Result<f64> {
+        match self {
+            Self::Dense(projection) => projection.correction_parts(projected_query, bits, gamma),
+            Self::Structured(_) => {
+                validate_structured_qjl_parts(projected_query.len(), bits, gamma, level)?;
+                let correction = QJL_FACTOR
+                    * f64::from(gamma)
+                    * f64::from(stable_inv_sqrt(projected_query.len() as f32))
+                    * sign_dot(projected_query, bits);
+                if !correction.is_finite() {
+                    return Err(quant_error(
+                        "structured_qjl_score",
+                        level,
+                        "QJL correction is non-finite",
+                    ));
+                }
+                Ok(correction)
+            }
+        }
+    }
+
+    fn inverse_parts(&self, bits: &[u8], gamma: f32, level: QuantLevel) -> Result<Vec<f32>> {
+        match self {
+            Self::Dense(projection) => projection.inverse_parts(bits, gamma),
+            Self::Structured(projection) => {
+                let dim = projection.dim();
+                validate_structured_qjl_parts(dim, bits, gamma, level)?;
+                let mut inverse = (0..dim)
+                    .map(|index| {
+                        if bits[index / 8] & (1 << (index % 8)) == 0 {
+                            -1.0_f32
+                        } else {
+                            1.0_f32
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                projection.apply_inverse(&mut inverse).map_err(|error| {
+                    quant_error("structured_qjl_decode", level, error.to_string())
+                })?;
+                let factor =
+                    (QJL_FACTOR * f64::from(gamma) * f64::from(stable_inv_sqrt(dim as f32))) as f32;
+                for value in &mut inverse {
+                    *value *= factor;
+                }
+                Ok(inverse)
+            }
+        }
+    }
+
+    fn physical_bytes(&self) -> usize {
+        match self {
+            Self::Dense(projection) => projection.values().len() * std::mem::size_of::<f32>(),
+            Self::Structured(projection) => projection.physical_bytes(),
+        }
+    }
+}
+
+fn validate_structured_qjl_parts(
+    dim: usize,
+    bits: &[u8],
+    gamma: f32,
+    level: QuantLevel,
+) -> Result<()> {
+    if bits.len() != bitstream_len(dim) || has_nonzero_padding(bits, dim) {
+        return Err(quant_error(
+            "structured_qjl_validate",
+            level,
+            "QJL signs have the wrong length or non-zero padding",
+        ));
+    }
+    if !gamma.is_finite() || gamma.is_sign_negative() {
+        return Err(quant_error(
+            "structured_qjl_validate",
+            level,
+            "gamma must be finite, non-negative, and canonical +0.0 when zero",
+        ));
+    }
+    Ok(())
+}
+
 impl TurboQuantPreparedQuery {
     /// Prepared query dimension.
     pub fn dim(&self) -> usize {
@@ -99,9 +325,10 @@ impl TurboQuantPreparedQuery {
 pub struct TurboQuantCodec {
     seed: RotationSeed,
     geometry_id: SeedId,
+    geometry_kind: TurboQuantGeometryKind,
     level: QuantLevel,
-    rotation: HaarRotation,
-    projection: GaussianProjection,
+    rotation: RotationGeometry,
+    projection: ProjectionGeometry,
     low_codebook: LloydMaxCodebook,
     high_codebook: LloydMaxCodebook,
 }
@@ -129,6 +356,7 @@ impl fmt::Debug for TurboQuantCodec {
             .field("dim", &self.seed.dim)
             .field("seed_id", &self.seed.id)
             .field("geometry_id", &self.geometry_id)
+            .field("geometry_kind", &self.geometry_kind)
             .finish_non_exhaustive()
     }
 }
@@ -359,7 +587,7 @@ impl TurboQuantV1MigrationVerifier {
 /// holds its `Arc`, so cache memory is bounded by live registered-slot usage —
 /// there is no tuned capacity constant and no unbounded retention. Dead entries
 /// are reaped on every insert.
-static SHARED_GEOMETRY_CACHE: OnceLock<Mutex<HashMap<(SeedId, u8), Weak<TurboQuantCodec>>>> =
+static SHARED_GEOMETRY_CACHE: OnceLock<Mutex<HashMap<(SeedId, u8, u8), Weak<TurboQuantCodec>>>> =
     OnceLock::new();
 
 impl TurboQuantCodec {
@@ -373,25 +601,41 @@ impl TurboQuantCodec {
     /// dimension or level disagrees with the request is a corruption error,
     /// never silently replaced.
     pub fn shared(seed: RotationSeed, level: QuantLevel) -> Result<Arc<Self>> {
-        let key = (seed.id, encode_level(level)?);
+        Self::shared_with_kind(seed, level, TurboQuantGeometryKind::DenseHaarGaussianV2)
+    }
+
+    /// Returns shared bit-exact structured geometry for one registered slot.
+    pub fn shared_structured(seed: RotationSeed, level: QuantLevel) -> Result<Arc<Self>> {
+        Self::shared_with_kind(seed, level, TurboQuantGeometryKind::StructuredHadamardV1)
+    }
+
+    fn shared_with_kind(
+        seed: RotationSeed,
+        level: QuantLevel,
+        geometry_kind: TurboQuantGeometryKind,
+    ) -> Result<Arc<Self>> {
+        let key = (seed.id, encode_level(level)?, geometry_kind.code());
         let cache = SHARED_GEOMETRY_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-        let mut guard = cache.lock().map_err(|_| {
-            quant_error("shared", level, "shared geometry cache lock poisoned")
-        })?;
+        let mut guard = cache
+            .lock()
+            .map_err(|_| quant_error("shared", level, "shared geometry cache lock poisoned"))?;
         if let Some(existing) = guard.get(&key).and_then(Weak::upgrade) {
-            if existing.seed.dim != seed.dim || existing.level != level {
+            if existing.seed.dim != seed.dim
+                || existing.level != level
+                || existing.geometry_kind != geometry_kind
+            {
                 return Err(quant_error(
                     "shared",
                     level,
                     format!(
-                        "shared geometry cache entry disagrees with request: cached dim={} level={}, requested dim={} level={level}",
-                        existing.seed.dim, existing.level, seed.dim
+                        "shared geometry cache entry disagrees with request: cached dim={} level={} kind={:?}, requested dim={} level={level} kind={geometry_kind:?}",
+                        existing.seed.dim, existing.level, existing.geometry_kind, seed.dim
                     ),
                 ));
             }
             return Ok(existing);
         }
-        let codec = Arc::new(Self::new(seed, level)?);
+        let codec = Arc::new(Self::new_with_kind(seed, level, geometry_kind)?);
         guard.retain(|_, weak| weak.strong_count() > 0);
         guard.insert(key, Arc::downgrade(&codec));
         Ok(codec)
@@ -415,6 +659,19 @@ impl TurboQuantCodec {
 
     /// Constructs one reusable lens/slot geometry for the requested level.
     pub fn new(seed: RotationSeed, level: QuantLevel) -> Result<Self> {
+        Self::new_with_kind(seed, level, TurboQuantGeometryKind::DenseHaarGaussianV2)
+    }
+
+    /// Constructs the bit-exact structured Hadamard geometry candidate.
+    pub fn new_structured(seed: RotationSeed, level: QuantLevel) -> Result<Self> {
+        Self::new_with_kind(seed, level, TurboQuantGeometryKind::StructuredHadamardV1)
+    }
+
+    fn new_with_kind(
+        seed: RotationSeed,
+        level: QuantLevel,
+        geometry_kind: TurboQuantGeometryKind,
+    ) -> Result<Self> {
         validate_level(level, "new")?;
         if seed.dim == 0 || seed.dim > TURBOQUANT_MAX_DIM {
             return Err(quant_error(
@@ -428,28 +685,57 @@ impl TurboQuantCodec {
         }
         seed.validate()?;
         let (low_bits, high_bits) = scalar_widths(level)?;
-        let rotation = HaarRotation::new(&seed)?;
+        let (rotation, projection, low_codebook, high_codebook, geometry_id) = match geometry_kind {
+            TurboQuantGeometryKind::DenseHaarGaussianV2 => {
+                let rotation = HaarRotation::new(&seed)?;
+                let projection = GaussianProjection::new(&seed, level)?;
+                let low_codebook = LloydMaxCodebook::new(seed.dim, low_bits, level)?;
+                let high_codebook = LloydMaxCodebook::new(seed.dim, high_bits, level)?;
+                let geometry_id = geometry_id(
+                    &seed,
+                    level,
+                    &rotation,
+                    &projection,
+                    &low_codebook,
+                    &high_codebook,
+                );
+                (
+                    RotationGeometry::Dense(rotation),
+                    ProjectionGeometry::Dense(projection),
+                    low_codebook,
+                    high_codebook,
+                    geometry_id,
+                )
+            }
+            TurboQuantGeometryKind::StructuredHadamardV1 => {
+                let rotation = StructuredHadamard::new(&seed, STRUCTURED_ROTATION_DOMAIN)?;
+                let projection = StructuredHadamard::new(&seed, STRUCTURED_QJL_DOMAIN)?;
+                let low_codebook = LloydMaxCodebook::new_stable(seed.dim, low_bits, level)?;
+                let high_codebook = LloydMaxCodebook::new_stable(seed.dim, high_bits, level)?;
+                let geometry_id = structured_geometry_id(
+                    &seed,
+                    level,
+                    &rotation,
+                    &projection,
+                    &low_codebook,
+                    &high_codebook,
+                );
+                (
+                    RotationGeometry::Structured(rotation),
+                    ProjectionGeometry::Structured(projection),
+                    low_codebook,
+                    high_codebook,
+                    geometry_id,
+                )
+            }
+        };
         if rotation.seed_id() != seed.id {
-            return Err(quant_error(
-                "new",
-                level,
-                "Haar rotation seed identity mismatch",
-            ));
+            return Err(quant_error("new", level, "rotation seed identity mismatch"));
         }
-        let projection = GaussianProjection::new(&seed, level)?;
-        let low_codebook = LloydMaxCodebook::new(seed.dim, low_bits, level)?;
-        let high_codebook = LloydMaxCodebook::new(seed.dim, high_bits, level)?;
-        let geometry_id = geometry_id(
-            &seed,
-            level,
-            &rotation,
-            &projection,
-            &low_codebook,
-            &high_codebook,
-        );
         Ok(Self {
             seed,
             geometry_id,
+            geometry_kind,
             level,
             rotation,
             projection,
@@ -467,6 +753,19 @@ impl TurboQuantCodec {
     /// Canonical identity of every generated f32 geometry coefficient.
     pub fn geometry_id(&self) -> SeedId {
         self.geometry_id
+    }
+
+    /// Frozen transform family represented by [`Self::geometry_id`].
+    pub fn geometry_kind(&self) -> TurboQuantGeometryKind {
+        self.geometry_kind
+    }
+
+    /// Physical heap bytes occupied by rotation, projection, and codebooks.
+    pub fn geometry_physical_bytes(&self) -> usize {
+        self.rotation.physical_bytes()
+            + self.projection.physical_bytes()
+            + (self.low_codebook.centroids().len() + self.high_codebook.centroids().len())
+                * std::mem::size_of::<f32>()
     }
 
     /// Validates storage structure and verifies this codec owns the payload geometry.
@@ -499,7 +798,7 @@ impl TurboQuantCodec {
         validate_raw(query, self.seed.dim, "prepare_query", self.level)?;
         let mut rotated = query.to_vec();
         self.rotation.apply(&mut rotated)?;
-        let projected = self.projection.project(&rotated)?;
+        let projected = self.projection.project(&rotated, self.level)?;
         let lut_stride = 1_usize << self.high_codebook.bits();
         let lut_len = self.seed.dim.checked_mul(lut_stride).ok_or_else(|| {
             quant_error("prepare_query", self.level, "scalar LUT length overflow")
@@ -566,9 +865,12 @@ impl TurboQuantCodec {
             return Ok(0.0);
         }
         let scalar_dot = self.scalar_dot_lut(query, candidate.scalar, "score_prepared")?;
-        let correction =
-            self.projection
-                .correction_parts(&query.projected, candidate.qjl, candidate.gamma)?;
+        let correction = self.projection.correction_parts(
+            &query.projected,
+            candidate.qjl,
+            candidate.gamma,
+            self.level,
+        )?;
         finite_f32(
             f64::from(candidate.scale) * scalar_dot + correction,
             "score_prepared",
@@ -607,9 +909,12 @@ impl TurboQuantCodec {
             return Ok(0.0);
         }
         let scalar_dot = self.scalar_dot(&query.rotated, candidate.scalar, "score_reference")?;
-        let correction =
-            self.projection
-                .correction_parts(&query.projected, candidate.qjl, candidate.gamma)?;
+        let correction = self.projection.correction_parts(
+            &query.projected,
+            candidate.qjl,
+            candidate.gamma,
+            self.level,
+        )?;
         finite_f32(
             f64::from(candidate.scale) * scalar_dot + correction,
             "score_reference",
@@ -617,11 +922,10 @@ impl TurboQuantCodec {
         )
     }
 
-    /// LUT packed scan: sums the pre-multiplied per-coordinate query products
-    /// selected by each packed scalar code. Bit-identical to
-    /// [`Self::dot_estimate_reference`]'s scalar term (same `f64` products,
-    /// same accumulation order); candidate corruption was already refused by
-    /// `validate_candidate`/`ParsedPayload::parse`, outside this loop.
+    /// LUT packed scan: sums pre-multiplied query products selected by packed
+    /// scalar codes. Four code pairs are accumulated per SIMD block; candidate
+    /// corruption was already refused by `validate_candidate` and never
+    /// branches inside this loop.
     fn scalar_dot_lut(
         &self,
         query: &TurboQuantPreparedQuery,
@@ -633,15 +937,33 @@ impl TurboQuantCodec {
         let pair_bits = high_bits + low_bits;
         let stride = query.lut_stride;
         let lut = &query.scalar_lut;
+        let pairs = self.seed.dim.div_ceil(2);
         let mut sum = 0.0_f64;
-        for pair in 0..self.seed.dim.div_ceil(2) {
+        let mut pair = 0_usize;
+        while pair + 4 <= pairs {
+            let mut products = [0.0_f64; 4];
+            for lane in 0..4 {
+                let current_pair = pair + lane;
+                let index = current_pair * 2;
+                let (high_code, low_code) =
+                    read_code_pair_fast(scalar, current_pair * pair_bits, high_bits, low_bits);
+                products[lane] = lut[index * stride + usize::from(high_code)];
+                if index + 1 < self.seed.dim {
+                    products[lane] += lut[(index + 1) * stride + usize::from(low_code)];
+                }
+            }
+            sum += f64x4::from(products).reduce_add();
+            pair += 4;
+        }
+        while pair < pairs {
             let index = pair * 2;
             let (high_code, low_code) =
-                read_code_pair(scalar, pair * pair_bits, high_bits, low_bits);
+                read_code_pair_fast(scalar, pair * pair_bits, high_bits, low_bits);
             sum += lut[index * stride + usize::from(high_code)];
             if index + 1 < self.seed.dim {
                 sum += lut[(index + 1) * stride + usize::from(low_code)];
             }
+            pair += 1;
         }
         if !sum.is_finite() {
             return Err(quant_error(
@@ -786,7 +1108,9 @@ impl TurboQuantCodec {
             })?;
             residual.push(*value - centroid);
         }
-        let qjl = self.projection.encode_residual(&residual, source_norm)?;
+        let qjl = self
+            .projection
+            .encode_residual(&residual, source_norm, self.level)?;
         let bytes = build_payload(
             self.level,
             self.seed.dim,
@@ -855,7 +1179,9 @@ impl Quantizer for TurboQuantCodec {
             return Ok(vec![0.0; self.seed.dim]);
         }
         let mut scalar = self.decode_scalar(parsed.scalar, qv.scale)?;
-        let inverse = self.projection.inverse_parts(parsed.qjl, parsed.gamma)?;
+        let inverse = self
+            .projection
+            .inverse_parts(parsed.qjl, parsed.gamma, self.level)?;
         for (value, correction) in scalar.iter_mut().zip(inverse) {
             *value += correction;
         }
@@ -1220,6 +1546,30 @@ fn geometry_id(
     hasher.finalize().into()
 }
 
+fn structured_geometry_id(
+    seed: &RotationSeed,
+    level: QuantLevel,
+    rotation: &StructuredHadamard,
+    projection: &StructuredHadamard,
+    low_codebook: &LloydMaxCodebook,
+    high_codebook: &LloydMaxCodebook,
+) -> SeedId {
+    let mut hasher = Sha256::new();
+    hasher.update(STRUCTURED_GEOMETRY_DOMAIN);
+    hasher.update([
+        TURBOQUANT_FORMAT_VERSION,
+        TurboQuantGeometryKind::StructuredHadamardV1.code(),
+        encode_level_code(level),
+    ]);
+    hasher.update((seed.dim as u64).to_le_bytes());
+    hasher.update(seed.id);
+    hasher.update(rotation.transform_id());
+    hasher.update(projection.transform_id());
+    hash_f32_slice(&mut hasher, low_codebook.centroids());
+    hash_f32_slice(&mut hasher, high_codebook.centroids());
+    hasher.finalize().into()
+}
+
 fn hash_f32_slice(hasher: &mut Sha256, values: &[f32]) {
     hasher.update((values.len() as u64).to_le_bytes());
     for value in values {
@@ -1340,6 +1690,25 @@ fn read_code_pair(bytes: &[u8], offset: usize, high_width: usize, low_width: usi
         (packed & high_mask) as u8,
         ((packed >> high_width) & low_mask) as u8,
     )
+}
+
+fn read_code_pair_fast(
+    bytes: &[u8],
+    offset: usize,
+    high_width: usize,
+    low_width: usize,
+) -> (u8, u8) {
+    let byte = offset / 8;
+    let shift = offset % 8;
+    let mut word = u16::from(bytes[byte]);
+    if shift + high_width + low_width > 8 {
+        word |= u16::from(bytes[byte + 1]) << 8;
+    }
+    let high_mask = (1_u16 << high_width) - 1;
+    let low_mask = (1_u16 << low_width) - 1;
+    let high = ((word >> shift) & high_mask) as u8;
+    let low = ((word >> (shift + high_width)) & low_mask) as u8;
+    (high, low)
 }
 
 fn read_u16(bytes: &[u8], offset: usize) -> u16 {

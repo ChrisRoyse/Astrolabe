@@ -1,5 +1,6 @@
 pub mod binary;
 mod codebook;
+mod hadamard;
 pub mod int8;
 pub mod mxfp4_codec;
 pub mod qjl;
@@ -25,8 +26,8 @@ pub use rotation::{
 };
 pub use turboquant::{
     TURBOQUANT_FORMAT_HEADER_BYTES, TURBOQUANT_FORMAT_VERSION, TURBOQUANT_MAX_DIM, TurboQuantCodec,
-    TurboQuantPreparedQuery, TurboQuantStorage, TurboQuantV1MigrationVerifier,
-    TurboQuantValidatedCandidate,
+    TurboQuantGeometryKind, TurboQuantPreparedQuery, TurboQuantStorage,
+    TurboQuantV1MigrationVerifier, TurboQuantValidatedCandidate,
 };
 
 pub type SeedId = [u8; 32];

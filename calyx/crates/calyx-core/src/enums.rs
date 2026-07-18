@@ -80,12 +80,20 @@ pub enum QuantPolicy {
     Float8,
     /// Binary storage.
     Binary,
+    /// Bit-exact randomized-Hadamard TurboQuant geometry.
+    ///
+    /// This is a distinct frozen interpretation from the historical dense
+    /// Haar/Gaussian [`QuantPolicy::TurboQuant`] geometry. It uses the same
+    /// TQPR packed row layout, but a different content-addressed geometry and
+    /// is admitted only through measured recall/intelligence gates.
+    TurboQuantHadamard { bits_per_channel_x2: u8 },
 }
 
 impl QuantPolicy {
-    /// Quality-neutral TurboQuant default from PRD 23 section 4.1.
+    /// Structured TurboQuant candidate; the compression recall gate remains
+    /// binding and refuses persistence when this corpus cannot support it.
     pub const fn turboquant_default() -> Self {
-        Self::TurboQuant {
+        Self::TurboQuantHadamard {
             bits_per_channel_x2: 7,
         }
     }

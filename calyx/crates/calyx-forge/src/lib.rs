@@ -79,9 +79,10 @@ pub use quant::{
     MXFP_FORMAT_HEADER_BYTES, MXFP_FORMAT_VERSION, MxFp4Codec, MxFp8Codec, MxFpStorage,
     QjlResidual, QuantLevel, QuantizedVec, Quantizer, RotationSeed, ScalarInt8Codec, SeedId,
     TURBOQUANT_FORMAT_HEADER_BYTES, TURBOQUANT_FORMAT_VERSION, TURBOQUANT_MAX_DIM, TurboQuantCodec,
-    TurboQuantPreparedQuery, TurboQuantStorage, TurboQuantV1MigrationVerifier,
-    TurboQuantValidatedCandidate, apply_inverse_rotation, apply_rotation, apply_rotation_batch,
-    binary_prefilter, hamming_dot_estimate, mxfp_payload_len, new_seed, seed_id_hex,
+    TurboQuantGeometryKind, TurboQuantPreparedQuery, TurboQuantStorage,
+    TurboQuantV1MigrationVerifier, TurboQuantValidatedCandidate, apply_inverse_rotation,
+    apply_rotation, apply_rotation_batch, binary_prefilter, hamming_dot_estimate, mxfp_payload_len,
+    new_seed, seed_id_hex,
 };
 #[cfg(feature = "cuda")]
 pub use vram::CudaStream;
