@@ -40,6 +40,7 @@ pub(crate) fn canonical_fastembed_execution(raw: Option<&str>) -> Result<String>
     }
 }
 
+#[cfg(feature = "ml-runtime")]
 pub(crate) fn validate_frozen_fastembed_execution(raw: &str) -> Result<&str> {
     let canonical = canonical_fastembed_execution(Some(raw))?;
     if canonical != raw {

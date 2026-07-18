@@ -55,14 +55,19 @@ pub use commission::{
     profile_safetensors_source, profile_safetensors_sources, resolve_safetensors_weight_set,
 };
 pub use compression::{
-    CALYX_VECTOR_COMPRESSION_EMPTY, CALYX_VECTOR_COMPRESSION_INVALID, COMPRESSED_SLOT_TAG,
-    COMPRESSED_SLOT_VERSION, COMPRESSION_GENERATION_MARKER, CompressedSlotHit, CompressedSlotIndex,
-    CompressionQuery, GenerationDeleteReport, MxFp4AssayEvidence, REGISTRY_ENVELOPE_HEADER_BYTES,
-    SlotCompressionReport, SlotCompressionRow, StoredSlotCodec, StoredSlotEnvelope,
-    append_reseal_compressed_rows, compress_slot_batch, compress_slot_batch_with_assay_evidence,
-    delete_compressed_generation, erase_compressed_slot_rows, generation_lifecycle,
-    inspect_unbound_stored_slot_envelope, load_mxfp4_assay_evidence,
-    matryoshka_truncate_renormalize, persist_mxfp4_assay_evidence,
+    CALYX_MULTIVECTOR_CONTEXT_MISMATCH, CALYX_MULTIVECTOR_PACK_INVALID,
+    CALYX_MULTIVECTOR_SHAPE_UNSUPPORTED, CALYX_VECTOR_COMPRESSION_EMPTY,
+    CALYX_VECTOR_COMPRESSION_INVALID, COMPRESSED_SLOT_TAG, COMPRESSED_SLOT_VERSION,
+    COMPRESSION_GENERATION_MARKER, CompressedSlotHit, CompressedSlotIndex, CompressionQuery,
+    GenerationDeleteReport, MULTIVECTOR_DIGEST_BYTES, MULTIVECTOR_HEADER_BYTES,
+    MULTIVECTOR_PACK_MAGIC, MULTIVECTOR_PACK_VERSION, MultiVectorStorageCodec, MxFp4AssayEvidence,
+    PackedColbertBytes, ParsedColbertMatrix, REGISTRY_ENVELOPE_HEADER_BYTES, SlotCompressionReport,
+    SlotCompressionRow, StoredSlotCodec, StoredSlotEnvelope, append_reseal_compressed_rows,
+    compress_slot_batch, compress_slot_batch_with_assay_evidence, delete_compressed_generation,
+    erase_compressed_slot_rows, generation_lifecycle, inspect_unbound_stored_slot_envelope,
+    load_mxfp4_assay_evidence, matryoshka_truncate_renormalize, pack_colbert_matrix, packed_maxsim,
+    parse_colbert_matrix, persist_mxfp4_assay_evidence, reject_dense_codec_for_multivector,
+    resolve_multivector_storage,
 };
 pub use calyx_aster::compression_lifecycle::{
     CALYX_COMPRESSION_LIFECYCLE_INVALID, GenerationLifecycleRecord, GenerationTransition,

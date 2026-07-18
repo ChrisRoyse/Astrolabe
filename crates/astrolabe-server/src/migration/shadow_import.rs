@@ -242,10 +242,21 @@ impl SlotRuntime for ShadowSlotRuntime {
 }
 
 fn shadow_embedding_input(input: &PanelInput) -> astrolabe_panel::StaticEmbeddingInput {
+    // #531: S18 (body embedding) must NOT fall back to `source_bytes` when the CBM
+    // `bt` (body-token) property is absent. For bt-absent symbols `source_bytes` is
+    // the #413 property-fingerprint proxy (framed signature + full properties_json,
+    // including derived numerics such as `transitive_loop_depth`) — NOT source code.
+    // Embedding that proxy silently substituted METADATA for a code body and clustered
+    // S18 neighbours by property-JSON shape (invariants 1/3 violation: an unlabeled,
+    // uncounted degradation). We now derive body tokens ONLY from real `bt` evidence;
+    // when it is absent we emit no body tokens, so `encode_static_embedding_slot`
+    // reports S18 as a labeled, counted `SlotVector::Absent` (refusal with deficit)
+    // rather than a metadata-derived vector. Real retained chunk bytes (#501) will,
+    // once present, be the correct exact-source input — never the fingerprint proxy.
     astrolabe_panel::StaticEmbeddingInput {
         body_tokens: property_string(&input.properties, "bt")
             .map(text_tokens)
-            .unwrap_or_else(|| text_tokens(&String::from_utf8_lossy(&input.source_bytes))),
+            .unwrap_or_default(),
         doc_tokens: property_string(&input.properties, "docstring")
             .map(text_tokens)
             .unwrap_or_default(),

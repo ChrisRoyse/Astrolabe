@@ -576,6 +576,21 @@ static void build_def_props(char *buf, size_t bufsize, const CBMDefinition *def,
     append_json_string(buf, bufsize, &pos, "st", def->struct_trigrams);
     append_json_string(buf, bufsize, &pos, "callees", callees);
 
+    /* #501/#473: byte-exact source span + exact source bytes. Keep in sync with
+     * pass_definitions.c::build_def_props (see the rationale there). Atomic append:
+     * an over-large body emits no field and stays honestly source-absent. */
+    if (def->source && def->end_byte > def->start_byte) {
+        size_t before = pos;
+        append_json_string(buf, bufsize, &pos, "source_snippet", def->source);
+        if (pos != before) {
+            int wrote = snprintf(buf + pos, bufsize - pos, ",\"sb\":%u,\"eb\":%u",
+                                 def->start_byte, def->end_byte);
+            if (wrote > 0 && (size_t)wrote < bufsize - pos) {
+                pos += (size_t)wrote;
+            }
+        }
+    }
+
     if (pos < bufsize - SKIP_ONE) {
         buf[pos] = '}';
         buf[pos + SKIP_ONE] = '\0';

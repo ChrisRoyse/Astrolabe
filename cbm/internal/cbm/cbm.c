@@ -1078,6 +1078,27 @@ static CBMFileResult *cbm_extract_file_impl(const char *source, int source_len,
     free(has_self);
     free(has_guarded);
 
+    // #501/#473: capture the byte-exact parse-time source of every definition while
+    // the file buffer is still alive. The per-type extractors recorded each def's
+    // tree-sitter byte span (def.start_byte/def.end_byte, end-exclusive); slice the
+    // exact bytes source[start_byte..end_byte] into the arena. This is the real code
+    // payload the row layer persists so ingest's `source_snippet_bytes` carries true
+    // content instead of the #413 property-fingerprint proxy. Fail closed on an
+    // invalid/unset span (end<=start, or end past the buffer): leave def->source NULL
+    // so the persisted symbol is honestly source-absent rather than carrying wrong
+    // bytes. The span/source are exact node offsets, never line-based reconstruction.
+    for (int di = 0; di < result->defs.count; di++) {
+        CBMDefinition *d = &result->defs.items[di];
+        if (d->source) {
+            continue; // already captured (e.g. a synthetic def set it explicitly)
+        }
+        if (d->end_byte > d->start_byte && source != NULL &&
+            (size_t)d->end_byte <= (size_t)source_len) {
+            uint32_t span_len = d->end_byte - d->start_byte;
+            d->source = cbm_arena_strndup(a, source + d->start_byte, (size_t)span_len);
+        }
+    }
+
     uint64_t t2 = now_ns();
 
     result->imports_count = result->imports.count;
