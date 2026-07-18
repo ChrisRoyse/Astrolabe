@@ -1,3 +1,5 @@
+//! Atomic construction of the complete DiskANN serving generation.
+
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -7,115 +9,94 @@ use super::helpers::{DiskAnnDistanceMode, io};
 use crate::error::{CALYX_INDEX_DIM_MISMATCH, CALYX_INDEX_IO, sextant_error};
 use crate::index::diskann::build::{
     DiskAnnBuildBackend, DiskAnnBuildParams, DiskAnnBuildProgress,
-    build_diskann_graph_raw_l2_with_backend_and_progress,
-    build_diskann_graph_with_backend_and_progress,
+    build_diskann_graph_physical_with_backend_and_progress,
+    build_diskann_graph_raw_l2_physical_with_backend_and_progress, graph_source_hash,
+    normalize_unit_rows,
 };
-use crate::index::distance::l2_normalize;
+use crate::index::diskann::generation::{self, DiskAnnGeneration, StagedComponents};
+use crate::index::diskann::graph::{DiskAnnGraphReader, DiskAnnMetric};
+use crate::index::diskann::pq::{DiskAnnPqBinding, DiskAnnPqBuildParams, DiskAnnPqIndex};
+use crate::index::diskann::raw::DiskAnnRawIndex;
 
-const DISTANCE_MODE_UNIT_L2: &str = "unit_l2";
-const DISTANCE_MODE_RAW_COSINE: &str = "raw_cosine";
-const DISTANCE_MODE_RAW_L2: &str = "raw_l2";
-
-pub(super) fn build_search_graph_with_backend(
+pub(super) fn build_search_generation_with_backend<F>(
     graph_path: &Path,
     rows: &[(u32, Vec<f32>)],
     build_params: DiskAnnBuildParams,
-    raw_sidecar: Option<PathBuf>,
-    write_raw_sidecar: bool,
+    raw_source: Option<PathBuf>,
+    retain_raw: bool,
+    pq_params: Option<DiskAnnPqBuildParams>,
     backend: DiskAnnBuildBackend,
-) -> Result<Option<PathBuf>> {
-    build_search_graph_with_backend_and_progress(
-        graph_path,
-        rows,
-        build_params,
-        raw_sidecar,
-        write_raw_sidecar,
-        backend,
-        |_| Ok(()),
-    )
-}
-
-pub(super) fn build_search_graph_with_backend_and_progress<F>(
-    graph_path: &Path,
-    rows: &[(u32, Vec<f32>)],
-    build_params: DiskAnnBuildParams,
-    raw_sidecar: Option<PathBuf>,
-    write_raw_sidecar: bool,
-    backend: DiskAnnBuildBackend,
+    distance_mode: DiskAnnDistanceMode,
     progress: F,
-) -> Result<Option<PathBuf>>
+) -> Result<DiskAnnGeneration>
 where
     F: FnMut(DiskAnnBuildProgress) -> Result<()>,
 {
-    build_search_graph_with_distance_backend(
-        graph_path,
-        rows,
-        build_params,
-        raw_sidecar,
-        write_raw_sidecar,
-        backend,
-        DiskAnnDistanceMode::UnitL2,
-        progress,
-    )
-}
+    let graph_stage = generation::stage_path(graph_path, "graph");
+    let raw_stage = generation::stage_path(graph_path, "raw");
+    let pq_stage = generation::stage_path(graph_path, "pq");
+    for path in [&graph_stage, &raw_stage, &pq_stage] {
+        remove_stale_stage(path)?;
+    }
 
-pub(super) fn build_search_graph_raw_l2_with_backend(
-    graph_path: &Path,
-    rows: &[(u32, Vec<f32>)],
-    build_params: DiskAnnBuildParams,
-    raw_sidecar: Option<PathBuf>,
-    write_raw_sidecar: bool,
-    backend: DiskAnnBuildBackend,
-) -> Result<Option<PathBuf>> {
-    build_search_graph_with_distance_backend(
+    let result = build_staged_generation(
         graph_path,
         rows,
         build_params,
-        raw_sidecar,
-        write_raw_sidecar,
+        raw_source.as_deref(),
+        retain_raw,
+        pq_params,
         backend,
-        DiskAnnDistanceMode::RawL2,
-        |_| Ok(()),
-    )
+        distance_mode,
+        progress,
+        &graph_stage,
+        &raw_stage,
+        &pq_stage,
+    );
+    for path in [&graph_stage, &raw_stage, &pq_stage] {
+        let _ = fs::remove_file(path);
+        let mut writer_tmp = path.as_os_str().to_owned();
+        writer_tmp.push(".tmp");
+        let _ = fs::remove_file(PathBuf::from(writer_tmp));
+    }
+    result
 }
 
 #[allow(clippy::too_many_arguments)]
-fn build_search_graph_with_distance_backend<F>(
+fn build_staged_generation<F>(
     graph_path: &Path,
     rows: &[(u32, Vec<f32>)],
     build_params: DiskAnnBuildParams,
-    raw_sidecar: Option<PathBuf>,
-    write_raw_sidecar: bool,
+    raw_source: Option<&Path>,
+    retain_raw: bool,
+    pq_params: Option<DiskAnnPqBuildParams>,
     backend: DiskAnnBuildBackend,
     distance_mode: DiskAnnDistanceMode,
     mut progress: F,
-) -> Result<Option<PathBuf>>
+    graph_stage: &Path,
+    raw_stage: &Path,
+    pq_stage: &Path,
+) -> Result<DiskAnnGeneration>
 where
     F: FnMut(DiskAnnBuildProgress) -> Result<()>,
 {
+    let pq_rows = match distance_mode {
+        DiskAnnDistanceMode::UnitL2 => normalize_unit_rows(rows),
+        DiskAnnDistanceMode::RawL2 => rows.to_vec(),
+    };
     match distance_mode {
         DiskAnnDistanceMode::UnitL2 => {
-            let graph_rows = normalized_rows(rows);
-            build_diskann_graph_with_backend_and_progress(
-                graph_path,
-                &graph_rows,
+            build_diskann_graph_physical_with_backend_and_progress(
+                graph_stage,
+                rows,
                 build_params,
                 backend,
                 &mut progress,
             )?;
         }
         DiskAnnDistanceMode::RawL2 => {
-            build_diskann_graph_raw_l2_with_backend_and_progress(
-                graph_path,
-                rows,
-                build_params,
-                backend,
-                &mut progress,
-            )?;
-        }
-        DiskAnnDistanceMode::RawCosine => {
-            build_diskann_graph_with_backend_and_progress(
-                graph_path,
+            build_diskann_graph_raw_l2_physical_with_backend_and_progress(
+                graph_stage,
                 rows,
                 build_params,
                 backend,
@@ -123,92 +104,117 @@ where
             )?;
         }
     }
-    let raw_sidecar = match raw_sidecar {
-        Some(path) => {
-            if write_raw_sidecar {
-                write_raw_sidecar_dir(&path, rows, build_params.dim)?;
-            }
-            Some(path)
-        }
-        None => {
-            if write_raw_sidecar {
-                let path = default_raw_sidecar(graph_path);
-                write_raw_sidecar_dir(&path, rows, build_params.dim)?;
-                Some(path)
-            } else {
-                None
-            }
-        }
-    };
-    write_distance_mode(graph_path, distance_mode)?;
-    Ok(raw_sidecar)
-}
 
-pub(super) fn default_raw_sidecar(graph_path: &Path) -> PathBuf {
-    graph_path.with_extension("raw")
-}
-
-pub(super) fn read_distance_mode(graph_path: &Path) -> Result<DiskAnnDistanceMode> {
-    let path = distance_mode_path(graph_path);
-    if !path.exists() {
-        return Ok(DiskAnnDistanceMode::RawCosine);
-    }
-    let marker = fs::read_to_string(&path).map_err(|e| io("read distance mode", e))?;
-    match marker.trim() {
-        DISTANCE_MODE_UNIT_L2 => Ok(DiskAnnDistanceMode::UnitL2),
-        DISTANCE_MODE_RAW_COSINE => Ok(DiskAnnDistanceMode::RawCosine),
-        DISTANCE_MODE_RAW_L2 => Ok(DiskAnnDistanceMode::RawL2),
-        other => Err(sextant_error(
+    let graph_reader = DiskAnnGraphReader::open_physical(graph_stage)?;
+    let graph_header = *graph_reader.header();
+    drop(graph_reader);
+    if graph_source_hash(&pq_rows, graph_header.metric) != graph_header.source_hash {
+        return Err(sextant_error(
             CALYX_INDEX_IO,
-            format!(
-                "diskann distance mode marker {} has unsupported value {other:?}",
-                path.display()
-            ),
-        )),
+            "DiskANN normalized source hash drifted between graph and PQ construction",
+        ));
     }
-}
+    let graph_hash = generation::component_hash(graph_stage)?;
 
-fn normalized_rows(rows: &[(u32, Vec<f32>)]) -> Vec<(u32, Vec<f32>)> {
-    rows.iter()
-        .map(|(id, vector)| (*id, l2_normalize(vector)))
-        .collect()
-}
-
-fn distance_mode_path(graph_path: &Path) -> PathBuf {
-    graph_path.with_extension("metric")
-}
-
-fn write_distance_mode(graph_path: &Path, mode: DiskAnnDistanceMode) -> Result<()> {
-    let value = match mode {
-        DiskAnnDistanceMode::RawCosine => format!("{DISTANCE_MODE_RAW_COSINE}\n"),
-        DiskAnnDistanceMode::UnitL2 => format!("{DISTANCE_MODE_UNIT_L2}\n"),
-        DiskAnnDistanceMode::RawL2 => format!("{DISTANCE_MODE_RAW_L2}\n"),
+    let raw_rows = match raw_source {
+        Some(path) => Some(read_raw_source(path, rows.len(), build_params.dim)?),
+        None if retain_raw => Some(rows.to_vec()),
+        None => None,
     };
-    let path = distance_mode_path(graph_path);
-    let tmp = path.with_extension("metric.tmp");
-    fs::write(&tmp, value.as_bytes()).map_err(|e| io("write distance mode tmp", e))?;
-    fs::rename(&tmp, &path).map_err(|e| io("publish distance mode", e))
+    if let Some(raw_rows) = &raw_rows {
+        DiskAnnRawIndex::write_staged(
+            raw_stage,
+            raw_rows,
+            graph_header.source_hash,
+            graph_hash,
+            graph_header.metric,
+        )?;
+    }
+
+    let pq = if let Some(params) = pq_params {
+        if graph_header.metric != DiskAnnMetric::UnitL2 {
+            return Err(sextant_error(
+                CALYX_INDEX_IO,
+                "PQ navigation requires the declared UnitL2 graph metric",
+            ));
+        }
+        let binding = DiskAnnPqBinding {
+            source_hash: graph_header.source_hash,
+            graph_hash,
+            metric: graph_header.metric,
+            dim: build_params.dim,
+            node_count: rows.len(),
+        };
+        let pq = DiskAnnPqIndex::build_bound(&pq_rows, params, binding)?;
+        pq.write_staged(pq_stage, graph_header.metric)?;
+        Some(pq)
+    } else {
+        None
+    };
+
+    generation::publish(
+        graph_path,
+        StagedComponents {
+            graph: graph_stage,
+            raw: raw_rows.as_ref().map(|_| raw_stage),
+            pq: pq.as_ref().map(|_| pq_stage),
+            pq_code_bits: pq.as_ref().map_or(0, DiskAnnPqIndex::code_bits),
+        },
+    )
 }
 
-fn write_raw_sidecar_dir(path: &Path, rows: &[(u32, Vec<f32>)], dim: usize) -> Result<()> {
-    let mut tmp = path.as_os_str().to_owned();
-    tmp.push(".tmp");
-    let tmp = PathBuf::from(tmp);
-    let _ = fs::remove_dir_all(&tmp);
-    fs::create_dir_all(&tmp).map_err(|e| io("create raw sidecar tmp", e))?;
-    for (id, vector) in rows {
-        if vector.len() != dim {
+fn read_raw_source(path: &Path, node_count: usize, dim: usize) -> Result<Vec<(u32, Vec<f32>)>> {
+    if !path.is_dir() {
+        return Err(sextant_error(
+            CALYX_INDEX_IO,
+            format!("DiskANN raw source {} is not a directory", path.display()),
+        ));
+    }
+    let expected_bytes = dim
+        .checked_mul(4)
+        .ok_or_else(|| sextant_error(CALYX_INDEX_IO, "DiskANN raw row byte size overflow"))?;
+    let mut rows = Vec::with_capacity(node_count);
+    for id in 0..node_count {
+        let row_path = path.join(id.to_string());
+        let bytes = fs::read(&row_path).map_err(|error| {
+            io(
+                &format!("read required raw source row {}", row_path.display()),
+                error,
+            )
+        })?;
+        if bytes.len() != expected_bytes {
             return Err(sextant_error(
                 CALYX_INDEX_DIM_MISMATCH,
                 format!(
-                    "raw sidecar vector {id} dim {} expected {dim}",
-                    vector.len()
+                    "DiskANN raw source row {} is {} bytes, expected {expected_bytes}",
+                    row_path.display(),
+                    bytes.len()
                 ),
             ));
         }
-        let bytes: Vec<_> = vector.iter().flat_map(|v| v.to_le_bytes()).collect();
-        fs::write(tmp.join(id.to_string()), bytes).map_err(|e| io("write raw sidecar", e))?;
+        let mut vector = Vec::with_capacity(dim);
+        for chunk in bytes.chunks_exact(4) {
+            let value = f32::from_le_bytes(chunk.try_into().expect("4B"));
+            if !value.is_finite() {
+                return Err(sextant_error(
+                    CALYX_INDEX_IO,
+                    format!(
+                        "DiskANN raw source row {} contains non-finite f32",
+                        row_path.display()
+                    ),
+                ));
+            }
+            vector.push(value);
+        }
+        rows.push((id as u32, vector));
     }
-    let _ = fs::remove_dir_all(path);
-    fs::rename(&tmp, path).map_err(|e| io("publish raw sidecar", e))
+    Ok(rows)
+}
+
+fn remove_stale_stage(path: &Path) -> Result<()> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(io("remove stale DiskANN stage", error)),
+    }
 }

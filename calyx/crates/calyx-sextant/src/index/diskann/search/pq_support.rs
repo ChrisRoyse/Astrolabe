@@ -1,12 +1,9 @@
-use std::path::Path;
-
 use calyx_core::Result;
 
 use super::helpers::{distance_to_node, sorted};
 use super::{DiskAnnSearch, DiskAnnSearchParams, SearchBuildSidecars};
 use crate::index::diskann::build::{DiskAnnBuildBackend, DiskAnnBuildParams};
-use crate::index::diskann::pq::{DiskAnnPqBuildParams, DiskAnnPqIndex, default_pq_sidecar};
-use crate::index::distance::l2_normalize;
+use crate::index::diskann::pq::{DiskAnnPqBuildParams, DiskAnnPqIndex};
 use calyx_core::{CxId, SlotId};
 
 #[derive(Clone, Copy, Debug)]
@@ -71,9 +68,7 @@ impl DiskAnnSearch {
         hits: &[(u32, f32)],
         pq_scored: bool,
     ) -> Result<Vec<(u32, f32)>> {
-        if let Some(raw_dir) = &self.raw_sidecar
-            && raw_dir.is_dir()
-        {
+        if self.raw.is_some() {
             return self.rescore_from_raw(query, hits);
         }
         if pq_scored {
@@ -106,24 +101,10 @@ impl DiskAnnSearch {
                 let node = reader.read_node(id)?;
                 Ok((
                     id,
-                    distance_to_node(graph_query, node.vector, self.distance_mode),
+                    distance_to_node(graph_query, node.vector, self.distance_mode)?,
                 ))
             })
             .collect();
         Ok(sorted(rescored?))
     }
-}
-
-pub(super) fn write_pq_sidecar(
-    graph_path: &Path,
-    dense_rows: &[(u32, Vec<f32>)],
-    pq_params: DiskAnnPqBuildParams,
-) -> Result<DiskAnnPqIndex> {
-    let graph_rows: Vec<_> = dense_rows
-        .iter()
-        .map(|(id, vector)| (*id, l2_normalize(vector)))
-        .collect();
-    let pq = DiskAnnPqIndex::build(&graph_rows, pq_params)?;
-    pq.write_atomic(&default_pq_sidecar(graph_path))?;
-    Ok(pq)
 }

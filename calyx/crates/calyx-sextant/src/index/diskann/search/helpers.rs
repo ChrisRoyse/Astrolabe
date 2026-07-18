@@ -1,6 +1,5 @@
 use std::collections::HashMap;
 use std::fs::File;
-use std::path::Path;
 
 use calyx_core::{CxId, Result};
 
@@ -8,12 +7,12 @@ use super::DiskAnnSearchParams;
 use crate::error::{
     CALYX_INDEX_DIM_MISMATCH, CALYX_INDEX_INVALID_PARAMS, CALYX_INDEX_IO, sextant_error,
 };
-use crate::index::diskann::graph::{DiskAnnGraphReader, DiskAnnVectorRef, open_diskann_graph};
-use crate::index::distance::{cosine_distance, l2_sq, unit_l2_cosine_distance};
+use crate::index::diskann::graph::DiskAnnVectorRef;
+use crate::index::distance::{l2_sq, unit_l2_cosine_distance};
+use crate::index::quant_config::scalar8_dot_signed;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum DiskAnnDistanceMode {
-    RawCosine,
     UnitL2,
     RawL2,
 }
@@ -65,7 +64,6 @@ impl DiskAnnSearchParams {
 
 pub(super) fn distance(a: &[f32], b: &[f32], mode: DiskAnnDistanceMode) -> f32 {
     match mode {
-        DiskAnnDistanceMode::RawCosine => cosine_distance(a, b),
         DiskAnnDistanceMode::UnitL2 => unit_l2_cosine_distance(a, b),
         DiskAnnDistanceMode::RawL2 => l2_sq(a, b),
     }
@@ -75,43 +73,26 @@ pub(super) fn distance_to_node(
     a: &[f32],
     b: DiskAnnVectorRef<'_>,
     mode: DiskAnnDistanceMode,
-) -> f32 {
+) -> Result<f32> {
     match b {
-        DiskAnnVectorRef::F32(values) => distance(a, values, mode),
-        DiskAnnVectorRef::I8(values) => match mode {
-            DiskAnnDistanceMode::RawL2 => l2_sq_i8(a, values),
-            DiskAnnDistanceMode::RawCosine | DiskAnnDistanceMode::UnitL2 => cosine_i8(a, values),
+        DiskAnnVectorRef::F32(values) => Ok(distance(a, values, mode)),
+        DiskAnnVectorRef::I8 { codes, norm } => match mode {
+            DiskAnnDistanceMode::UnitL2 => Ok(cosine_i8(a, codes, norm)),
+            DiskAnnDistanceMode::RawL2 => Err(invalid(
+                "directional i8 graph can only serve the bound unit_l2 metric",
+            )),
         },
     }
 }
 
-fn cosine_i8(a: &[f32], b: &[i8]) -> f32 {
-    let len = a.len().min(b.len());
-    let mut dot = 0.0;
-    let mut an = 0.0;
-    let mut bn = 0.0;
-    for i in 0..len {
-        let x = a[i];
-        let y = f32::from(b[i]);
-        dot += x * y;
-        an += x * x;
-        bn += y * y;
-    }
-    if an == 0.0 || bn == 0.0 {
+fn cosine_i8(a: &[f32], b: &[i8], cached_norm: f32) -> f32 {
+    debug_assert_eq!(a.len(), b.len());
+    let dot = scalar8_dot_signed(a, b);
+    if cached_norm <= 0.0 {
         1.0
     } else {
-        (1.0 - dot / (an.sqrt() * bn.sqrt())).max(0.0)
+        (1.0 - (dot / f64::from(cached_norm)) as f32).max(0.0)
     }
-}
-
-fn l2_sq_i8(a: &[f32], b: &[i8]) -> f32 {
-    let len = a.len().min(b.len());
-    let mut sum = 0.0;
-    for i in 0..len {
-        let d = a[i] - f32::from(b[i]);
-        sum += d * d;
-    }
-    sum
 }
 
 pub(super) fn sorted(mut hits: Vec<(u32, f32)>) -> Vec<(u32, f32)> {
@@ -141,10 +122,6 @@ pub(super) fn positions(ids: &[CxId]) -> HashMap<CxId, u32> {
         .enumerate()
         .filter_map(|(idx, cx_id)| u32::try_from(idx).ok().map(|id| (*cx_id, id)))
         .collect()
-}
-
-pub(super) fn open_for_search(path: &Path) -> Result<DiskAnnGraphReader> {
-    open_diskann_graph(path)
 }
 
 pub(super) fn invalid(detail: impl std::fmt::Display) -> calyx_core::CalyxError {

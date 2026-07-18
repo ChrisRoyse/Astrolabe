@@ -2,15 +2,11 @@ use std::path::{Path, PathBuf};
 
 use calyx_core::{CxId, Result, SlotId};
 
-use super::helpers::{dense_rows, invalid, open_for_search, positions};
-use super::pq_support::write_pq_sidecar;
-use super::storage::{
-    build_search_graph_raw_l2_with_backend, build_search_graph_with_backend_and_progress,
-    default_raw_sidecar, read_distance_mode,
-};
-use super::{DiskAnnSearch, DiskAnnSearchParams, SearchBuildSidecars, prefetch_file_for_graph};
+use super::helpers::{DiskAnnDistanceMode, dense_rows, invalid, positions};
+use super::storage::build_search_generation_with_backend;
+use super::{DiskAnnSearch, DiskAnnSearchParams, SearchBuildSidecars};
 use crate::index::diskann::build::{DiskAnnBuildBackend, DiskAnnBuildParams, DiskAnnBuildProgress};
-use crate::index::diskann::pq::{DiskAnnPqIndex, default_pq_sidecar};
+use crate::index::diskann::generation::DiskAnnGeneration;
 
 impl DiskAnnSearch {
     pub fn open(
@@ -21,9 +17,18 @@ impl DiskAnnSearch {
         default_search: DiskAnnSearchParams,
     ) -> Result<Self> {
         let graph_path = graph_path.into();
-        let reader = open_for_search(&graph_path)?;
+        if let Some(path) = raw_sidecar {
+            return Err(invalid(format!(
+                "explicit raw path {} is forbidden when opening an atomic DiskANN generation; the active pointer owns every serving component",
+                path.display()
+            )));
+        }
+        let generation = DiskAnnGeneration::open(&graph_path)?;
+        let reader = crate::index::diskann::graph::DiskAnnGraphReader::open_physical(
+            generation.graph_path(),
+        )?;
         let header = *reader.header();
-        let distance_mode = read_distance_mode(&graph_path)?;
+        drop(reader);
         if ids.len() != header.node_count as usize {
             return Err(invalid(format!(
                 "id map len {} != graph node_count {}",
@@ -31,27 +36,22 @@ impl DiskAnnSearch {
                 header.node_count
             )));
         }
-        let raw_sidecar = raw_sidecar.or_else(|| {
-            let path = default_raw_sidecar(&graph_path);
-            path.is_dir().then_some(path)
-        });
-        let pq = DiskAnnPqIndex::read_if_exists(&default_pq_sidecar(&graph_path))?;
-        let graph_file = prefetch_file_for_graph(&graph_path, &reader)?;
         let build_params = DiskAnnBuildParams {
             dim: header.dim as usize,
             m_max: header.m_max as usize,
             ef_construction: default_search.ef_search.max(header.m_max as usize),
             alpha: 1.2,
         };
-        Ok(Self {
+        let mut search = Self {
             slot,
             dim: header.dim,
             graph_path,
-            raw_sidecar,
-            pq,
-            reader: Some(reader),
-            graph_file,
-            distance_mode,
+            generation: None,
+            raw: None,
+            pq: None,
+            reader: None,
+            graph_file: None,
+            distance_mode: DiskAnnDistanceMode::UnitL2,
             positions: positions(&ids),
             ids,
             build_params,
@@ -59,7 +59,9 @@ impl DiskAnnSearch {
             default_search,
             built_at_seq: 0,
             base_seq: 0,
-        })
+        };
+        search.install_generation(generation)?;
+        Ok(search)
     }
 
     pub fn build(
@@ -174,13 +176,16 @@ impl DiskAnnSearch {
     ) -> Result<Self> {
         let graph_path = graph_path.into();
         let dense_rows = dense_rows(rows, build_params.dim)?;
-        build_search_graph_raw_l2_with_backend(
+        build_search_generation_with_backend(
             &graph_path,
             &dense_rows,
             build_params,
             raw_sidecar,
             false,
+            None,
             backend,
+            DiskAnnDistanceMode::RawL2,
+            |_| Ok(()),
         )?;
         let mut search = Self::open(
             slot,
@@ -230,24 +235,23 @@ impl DiskAnnSearch {
     {
         let graph_path = graph_path.into();
         let dense_rows = dense_rows(rows, build_params.dim)?;
-        let write_raw_sidecar = raw_sidecar.is_none() && sidecars.write_default_raw_sidecar;
-        let raw_sidecar = build_search_graph_with_backend_and_progress(
+        let retain_raw = raw_sidecar.is_some() || sidecars.write_default_raw_sidecar;
+        build_search_generation_with_backend(
             &graph_path,
             &dense_rows,
             build_params,
             raw_sidecar,
-            write_raw_sidecar,
+            retain_raw,
+            sidecars.pq,
             sidecars.backend,
+            DiskAnnDistanceMode::UnitL2,
             progress,
         )?;
-        if let Some(pq_params) = sidecars.pq {
-            write_pq_sidecar(&graph_path, &dense_rows, pq_params)?;
-        }
         let mut search = Self::open(
             slot,
             graph_path,
             rows.iter().map(|(cx_id, _)| *cx_id).collect(),
-            raw_sidecar,
+            None,
             default_search,
         )?;
         search.build_backend = sidecars.backend;
@@ -259,7 +263,8 @@ impl DiskAnnSearch {
             slot,
             dim,
             graph_path: graph_path.into(),
-            raw_sidecar: None,
+            generation: None,
+            raw: None,
             pq: None,
             reader: None,
             graph_file: None,

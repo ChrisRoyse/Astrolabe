@@ -8,26 +8,26 @@ mod storage;
 
 use std::borrow::Cow;
 use std::collections::HashMap;
-use std::fs::{self, File};
+use std::fs::File;
 use std::path::{Path, PathBuf};
 
 use calyx_core::{CxId, Result, SlotId, SlotShape, SlotVector};
 
 use super::build::{DiskAnnBuildBackend, DiskAnnBuildParams};
-use super::graph::DiskAnnGraphReader;
-use super::pq::{DiskAnnPqBuildParams, DiskAnnPqIndex, default_pq_sidecar};
+use super::generation::DiskAnnGeneration;
+use super::graph::{DiskAnnGraphReader, DiskAnnMetric, DiskAnnVectorRef};
+use super::pq::{DiskAnnPqBinding, DiskAnnPqBuildParams, DiskAnnPqIndex};
+use super::raw::DiskAnnRawIndex;
 use crate::error::{CALYX_INDEX_DIM_MISMATCH, CALYX_INDEX_IO, sextant_error};
 use crate::index::distance::{cosine_distance, l2_normalize};
 use crate::index::{IndexSearchHit, IndexStats, SextantIndex, ranked};
 use crate::util::dense;
 
 use helpers::{
-    Candidate, DiskAnnDistanceMode, dense_rows, distance, invalid, io, open_for_search,
-    prefetch_node, sorted,
+    Candidate, DiskAnnDistanceMode, dense_rows, distance, invalid, io, prefetch_node, sorted,
 };
 pub use pq_support::DiskAnnPqSearchBuild;
-use pq_support::write_pq_sidecar;
-use storage::{build_search_graph_with_backend, read_distance_mode};
+use storage::build_search_generation_with_backend;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DiskAnnSearchParams {
@@ -78,7 +78,8 @@ pub struct DiskAnnSearch {
     slot: SlotId,
     dim: u32,
     graph_path: PathBuf,
-    raw_sidecar: Option<PathBuf>,
+    generation: Option<DiskAnnGeneration>,
+    raw: Option<DiskAnnRawIndex>,
     pq: Option<DiskAnnPqIndex>,
     reader: Option<DiskAnnGraphReader>,
     graph_file: Option<File>,
@@ -104,7 +105,6 @@ impl DiskAnnSearch {
 
     fn graph_query<'a>(&self, query: &'a [f32]) -> Cow<'a, [f32]> {
         match self.distance_mode {
-            DiskAnnDistanceMode::RawCosine => Cow::Borrowed(query),
             DiskAnnDistanceMode::UnitL2 => Cow::Owned(l2_normalize(query)),
             DiskAnnDistanceMode::RawL2 => Cow::Borrowed(query),
         }
@@ -124,63 +124,17 @@ impl DiskAnnSearch {
     }
 
     fn rescore_from_raw(&self, query: &[f32], hits: &[(u32, f32)]) -> Result<Vec<(u32, f32)>> {
-        let Some(raw_dir) = &self.raw_sidecar else {
+        let Some(raw) = &self.raw else {
             return Ok(hits.to_vec());
         };
-        if !raw_dir.is_dir() {
-            return Ok(hits.to_vec());
-        }
         let mut rescored = Vec::with_capacity(hits.len());
         for &(id, _) in hits {
-            let raw = self.read_raw_vector(raw_dir, id)?;
-            rescored.push((id, raw_rescore_distance(query, &raw, self.distance_mode)));
+            rescored.push((
+                id,
+                raw_rescore_distance(query, raw.vector(id)?, self.distance_mode),
+            ));
         }
         Ok(sorted(rescored))
-    }
-
-    fn read_raw_vector(&self, raw_dir: &Path, id: u32) -> Result<Vec<f32>> {
-        let Some(path) = self.raw_path(raw_dir, id) else {
-            return Err(sextant_error(
-                CALYX_INDEX_IO,
-                format!("raw sidecar missing for diskann node {id}"),
-            ));
-        };
-        let bytes = fs::read(&path).map_err(|e| io("read raw sidecar", e))?;
-        if bytes.len() != self.dim as usize * 4 {
-            return Err(sextant_error(
-                CALYX_INDEX_IO,
-                format!(
-                    "raw sidecar {} is {} B, expected {} B",
-                    path.display(),
-                    bytes.len(),
-                    self.dim as usize * 4
-                ),
-            ));
-        }
-        let mut out = Vec::with_capacity(self.dim as usize);
-        for chunk in bytes.chunks_exact(4) {
-            let value = f32::from_le_bytes(chunk.try_into().expect("4B"));
-            if !value.is_finite() {
-                return Err(sextant_error(
-                    CALYX_INDEX_IO,
-                    format!("raw sidecar {} has non-finite f32", path.display()),
-                ));
-            }
-            out.push(value);
-        }
-        Ok(out)
-    }
-
-    fn raw_path(&self, raw_dir: &Path, id: u32) -> Option<PathBuf> {
-        let mut names = vec![id.to_string(), format!("{id}.raw"), format!("{id:08}.raw")];
-        if let Some(cx_id) = self.ids.get(id as usize) {
-            names.push(cx_id.to_string());
-            names.push(format!("{cx_id}.raw"));
-        }
-        names
-            .into_iter()
-            .map(|name| raw_dir.join(name))
-            .find(|p| p.is_file())
     }
 
     fn prefetch(
@@ -216,23 +170,93 @@ impl DiskAnnSearch {
             return Ok(Vec::new());
         };
         (0..reader.node_count() as u32)
-            .map(|id| reader.read_node(id).map(|node| node.vector.to_vec()))
+            .map(|id| {
+                let node = reader.read_node(id)?;
+                match node.vector {
+                    DiskAnnVectorRef::F32(values) => Ok(values.to_vec()),
+                    DiskAnnVectorRef::I8 { .. } => Err(sextant_error(
+                        CALYX_INDEX_IO,
+                        "directional DiskANN rebuild requires its exact raw component; lossy i8 reconstruction is forbidden",
+                    )),
+                }
+            })
             .collect()
     }
 
     fn vectors_for_rebuild(&self) -> Result<Vec<Vec<f32>>> {
-        let Some(raw_dir) = &self.raw_sidecar else {
+        let Some(raw) = &self.raw else {
             return self.vectors_from_graph();
         };
-        if !raw_dir.is_dir() {
+        (0..self.ids.len() as u32)
+            .map(|id| raw.vector(id).map(<[f32]>::to_vec))
+            .collect()
+    }
+
+    pub fn generation(&self) -> Option<&DiskAnnGeneration> {
+        self.generation.as_ref()
+    }
+
+    pub fn physical_bytes(&self) -> u64 {
+        self.generation
+            .as_ref()
+            .map_or(0, DiskAnnGeneration::physical_bytes)
+    }
+
+    fn install_generation(&mut self, generation: DiskAnnGeneration) -> Result<()> {
+        let reader = DiskAnnGraphReader::open_physical(generation.graph_path())?;
+        if reader.header().dim != self.dim || reader.header().node_count as usize != self.ids.len()
+        {
             return Err(sextant_error(
-                CALYX_INDEX_IO,
-                format!("raw sidecar {} is not a directory", raw_dir.display()),
+                CALYX_INDEX_DIM_MISMATCH,
+                "rebuilt DiskANN generation shape disagrees with the in-memory identity map",
             ));
         }
-        (0..self.ids.len() as u32)
-            .map(|id| self.read_raw_vector(raw_dir, id))
-            .collect()
+        let raw = generation
+            .raw_path()
+            .map(|path| {
+                DiskAnnRawIndex::read(
+                    path,
+                    generation.source_hash(),
+                    generation.graph_hash(),
+                    generation.metric(),
+                    self.dim as usize,
+                    self.ids.len(),
+                )
+            })
+            .transpose()?;
+        let pq = generation
+            .pq_path()
+            .map(|path| {
+                DiskAnnPqIndex::read_bound(
+                    path,
+                    DiskAnnPqBinding {
+                        source_hash: generation.source_hash(),
+                        graph_hash: generation.graph_hash(),
+                        metric: generation.metric(),
+                        dim: self.dim as usize,
+                        node_count: self.ids.len(),
+                    },
+                    generation.pq_code_bits().ok_or_else(|| {
+                        sextant_error(
+                            CALYX_INDEX_IO,
+                            "PQ path exists without a declared code width",
+                        )
+                    })?,
+                )
+            })
+            .transpose()?;
+        let distance_mode = match generation.metric() {
+            DiskAnnMetric::UnitL2 => DiskAnnDistanceMode::UnitL2,
+            DiskAnnMetric::RawL2 => DiskAnnDistanceMode::RawL2,
+        };
+        let graph_file = prefetch_file_for_graph(generation.graph_path(), &reader)?;
+        self.reader = Some(reader);
+        self.graph_file = graph_file;
+        self.raw = raw;
+        self.pq = pq;
+        self.distance_mode = distance_mode;
+        self.generation = Some(generation);
+        Ok(())
     }
 }
 
@@ -268,25 +292,18 @@ impl SextantIndex for DiskAnnSearch {
         let rows: Vec<_> = self.ids.iter().copied().zip(vectors).collect();
         let dense_rows = dense_rows(&rows, self.dim as usize)?;
         let pq_params = self.pq.as_ref().map(DiskAnnPqIndex::build_params);
-        self.raw_sidecar = build_search_graph_with_backend(
+        let generation = build_search_generation_with_backend(
             &self.graph_path,
             &dense_rows,
             self.build_params,
-            self.raw_sidecar.clone(),
-            true,
+            None,
+            self.raw.is_some(),
+            pq_params,
             self.build_backend,
+            self.distance_mode,
+            |_| Ok(()),
         )?;
-        self.reader = Some(open_for_search(&self.graph_path)?);
-        self.pq = if let Some(pq_params) = pq_params {
-            Some(write_pq_sidecar(&self.graph_path, &dense_rows, pq_params)?)
-        } else {
-            DiskAnnPqIndex::read_if_exists(&default_pq_sidecar(&self.graph_path))?
-        };
-        self.graph_file = prefetch_file_for_graph(
-            &self.graph_path,
-            self.reader.as_ref().expect("reader reopened"),
-        )?;
-        self.distance_mode = read_distance_mode(&self.graph_path)?;
+        self.install_generation(generation)?;
         self.built_at_seq = self.built_at_seq.max(seq);
         self.base_seq = self.base_seq.max(seq);
         Ok(())
@@ -319,40 +336,38 @@ impl SextantIndex for DiskAnnSearch {
         let rows: Vec<_> = self.ids.iter().copied().zip(vectors).collect();
         let dense_rows = dense_rows(&rows, self.dim as usize)?;
         let pq_params = self.pq.as_ref().map(DiskAnnPqIndex::build_params);
-        self.raw_sidecar = build_search_graph_with_backend(
+        let generation = build_search_generation_with_backend(
             &self.graph_path,
             &dense_rows,
             self.build_params,
-            self.raw_sidecar.clone(),
-            true,
+            None,
+            self.raw.is_some(),
+            pq_params,
             self.build_backend,
+            self.distance_mode,
+            |_| Ok(()),
         )?;
-        self.reader = Some(open_for_search(&self.graph_path)?);
-        self.pq = if let Some(pq_params) = pq_params {
-            Some(write_pq_sidecar(&self.graph_path, &dense_rows, pq_params)?)
-        } else {
-            DiskAnnPqIndex::read_if_exists(&default_pq_sidecar(&self.graph_path))?
-        };
-        self.distance_mode = read_distance_mode(&self.graph_path)?;
+        self.install_generation(generation)?;
         Ok(())
     }
 
     fn vector(&self, cx_id: CxId) -> Option<SlotVector> {
         let id = *self.positions.get(&cx_id)?;
-        if let Some(raw_dir) = &self.raw_sidecar
-            && raw_dir.is_dir()
-            && let Ok(vector) = self.read_raw_vector(raw_dir, id)
+        if let Some(raw) = &self.raw
+            && let Ok(vector) = raw.vector(id)
         {
             return Some(SlotVector::Dense {
                 dim: self.dim,
-                data: vector,
+                data: vector.to_vec(),
             });
         }
         let reader = self.reader.as_ref()?;
-        let vector = reader.read_node(id).ok()?.vector.to_vec();
+        let DiskAnnVectorRef::F32(vector) = reader.read_node(id).ok()?.vector else {
+            return None;
+        };
         Some(SlotVector::Dense {
             dim: self.dim,
-            data: vector,
+            data: vector.to_vec(),
         })
     }
 

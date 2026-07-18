@@ -286,9 +286,9 @@ fn score_node(
     if let Some(pq_query) = pq_query {
         return Ok(0.5 * pq_query.distance_l2(id)?);
     }
-    Ok(distance_to_node(
+    distance_to_node(
         graph_query,
         reader.read_node(id)?.vector,
         index.distance_mode,
-    ))
+    )
 }

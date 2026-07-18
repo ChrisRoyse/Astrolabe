@@ -8,8 +8,8 @@
 //! Construction geometry is selected per build metric: unit-L2 builds operate
 //! on normalized copies so graph topology matches search-time cosine distance,
 //! while raw-L2 builds operate on the source coordinates directly. Unit-L2
-//! graphs store compact v3 signed-int8 directional payloads; raw-L2 graphs
-//! store compact v2 f32 payloads. Each pass advances in batches: every point in
+//! graphs store sealed v4 signed-int8 directional payloads with cached norms;
+//! raw-L2 graphs store sealed v4 f32 payloads. Each pass advances in batches: every point in
 //! a batch greedy-searches the *same frozen snapshot* of the graph in parallel
 //! (read-only), then edge updates apply sequentially in batch order — so the
 //! build is both parallel and fully deterministic regardless of thread count.
@@ -23,9 +23,10 @@ use serde::{Deserialize, Serialize};
 mod metric;
 mod vamana;
 
+use super::generation::{self, StagedComponents};
 use super::graph::{
-    DISKANN_F32_FORMAT_VERSION, DISKANN_FORMAT_VERSION, DISKANN_MAX_DIM, DISKANN_MAX_M,
-    DiskAnnGraphWriter, DiskAnnHeader, invalid,
+    DISKANN_FORMAT_VERSION, DISKANN_MAX_DIM, DISKANN_MAX_M, DiskAnnGraphWriter, DiskAnnHeader,
+    DiskAnnMetric, DiskAnnVectorEncoding, invalid,
 };
 
 pub use metric::DiskAnnBuildMetric;
@@ -142,6 +143,32 @@ pub fn build_diskann_graph_with_backend_and_progress<F>(
 where
     F: FnMut(DiskAnnBuildProgress) -> Result<()>,
 {
+    let staged = generation::stage_path(path, "graph");
+    build_diskann_graph_physical_with_backend_and_progress(
+        &staged, vectors, params, backend, progress,
+    )?;
+    generation::publish(
+        path,
+        StagedComponents {
+            graph: &staged,
+            raw: None,
+            pq: None,
+            pq_code_bits: 0,
+        },
+    )?;
+    Ok(())
+}
+
+pub(super) fn build_diskann_graph_physical_with_backend_and_progress<F>(
+    path: &Path,
+    vectors: &[(u32, Vec<f32>)],
+    params: DiskAnnBuildParams,
+    backend: DiskAnnBuildBackend,
+    progress: F,
+) -> Result<()>
+where
+    F: FnMut(DiskAnnBuildProgress) -> Result<()>,
+{
     build_diskann_graph_with_metric_and_progress(
         path,
         vectors,
@@ -162,6 +189,32 @@ pub fn build_diskann_graph_raw_l2_with_backend(
 }
 
 pub fn build_diskann_graph_raw_l2_with_backend_and_progress<F>(
+    path: &Path,
+    vectors: &[(u32, Vec<f32>)],
+    params: DiskAnnBuildParams,
+    backend: DiskAnnBuildBackend,
+    progress: F,
+) -> Result<()>
+where
+    F: FnMut(DiskAnnBuildProgress) -> Result<()>,
+{
+    let staged = generation::stage_path(path, "graph");
+    build_diskann_graph_raw_l2_physical_with_backend_and_progress(
+        &staged, vectors, params, backend, progress,
+    )?;
+    generation::publish(
+        path,
+        StagedComponents {
+            graph: &staged,
+            raw: None,
+            pq: None,
+            pq_code_bits: 0,
+        },
+    )?;
+    Ok(())
+}
+
+pub(super) fn build_diskann_graph_raw_l2_physical_with_backend_and_progress<F>(
     path: &Path,
     vectors: &[(u32, Vec<f32>)],
     params: DiskAnnBuildParams,
@@ -291,15 +344,26 @@ pub(super) fn write_graph_from_adjacency_with_progress<F>(
 where
     F: FnMut(DiskAnnBuildProgress) -> Result<()>,
 {
-    write_graph_from_adjacency_with_format(
+    let normalized = normalize_unit_rows(vectors);
+    write_graph_from_adjacency_with_contract(
         path,
-        vectors,
+        &normalized,
         params,
         entry,
         adjacency,
-        DISKANN_FORMAT_VERSION,
+        DiskAnnMetric::UnitL2,
+        DiskAnnVectorEncoding::DirectionalI8,
+        8,
         progress,
     )
+}
+
+pub(super) fn normalize_unit_rows(vectors: &[(u32, Vec<f32>)]) -> Vec<(u32, Vec<f32>)> {
+    metric::normalize(vectors)
+        .into_iter()
+        .enumerate()
+        .map(|(id, vector)| (id as u32, vector))
+        .collect()
 }
 
 #[cfg(sextant_cuvs)]
@@ -332,24 +396,28 @@ pub(super) fn write_graph_from_adjacency_f32_with_progress<F>(
 where
     F: FnMut(DiskAnnBuildProgress) -> Result<()>,
 {
-    write_graph_from_adjacency_with_format(
+    write_graph_from_adjacency_with_contract(
         path,
         vectors,
         params,
         entry,
         adjacency,
-        DISKANN_F32_FORMAT_VERSION,
+        DiskAnnMetric::RawL2,
+        DiskAnnVectorEncoding::F32,
+        32,
         progress,
     )
 }
 
-fn write_graph_from_adjacency_with_format<F>(
+fn write_graph_from_adjacency_with_contract<F>(
     path: &Path,
     vectors: &[(u32, Vec<f32>)],
     params: DiskAnnBuildParams,
     entry: u32,
     adjacency: &[Vec<u32>],
-    format_version: u32,
+    metric: DiskAnnMetric,
+    vector_encoding: DiskAnnVectorEncoding,
+    code_bits: u8,
     progress: &mut F,
 ) -> Result<()>
 where
@@ -373,12 +441,16 @@ where
     }
     let max_degree = adjacency.iter().map(Vec::len).max().unwrap_or(0);
     let header = DiskAnnHeader {
-        format_version,
+        format_version: DISKANN_FORMAT_VERSION,
         dim: u32::try_from(params.dim).expect("dim <= 8192"),
         m_max: u32::try_from(params.m_max).expect("m_max <= 512"),
         max_degree: u32::try_from(max_degree).expect("<= m_max"),
         entry_point_id: entry,
         node_count: adjacency.len() as u64,
+        metric,
+        vector_encoding,
+        code_bits,
+        source_hash: graph_source_hash(vectors, metric),
     };
     let mut writer = DiskAnnGraphWriter::create(path, header)?;
     progress(DiskAnnBuildProgress::new("diskann_graph_write_start", 0))?;
@@ -397,6 +469,24 @@ where
         "diskann_graph_write_ok",
         vectors.len(),
     ))
+}
+
+pub(super) fn graph_source_hash(vectors: &[(u32, Vec<f32>)], metric: DiskAnnMetric) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"calyx/diskann/graph-source/v1\0");
+    hasher.update(&[metric as u8]);
+    hasher.update(&(vectors.len() as u64).to_le_bytes());
+    let dim = vectors
+        .first()
+        .map_or(0_u32, |(_, vector)| vector.len() as u32);
+    hasher.update(&dim.to_le_bytes());
+    for (id, vector) in vectors {
+        hasher.update(&id.to_le_bytes());
+        for value in vector {
+            hasher.update(&value.to_bits().to_le_bytes());
+        }
+    }
+    *hasher.finalize().as_bytes()
 }
 
 #[cfg(sextant_cuvs)]

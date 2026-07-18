@@ -592,6 +592,14 @@ fn scalar8_dot(values: &[f32], codes: &[u8]) -> f64 {
         .sum()
 }
 
+pub(crate) fn scalar8_dot_signed(values: &[f32], codes: &[i8]) -> f64 {
+    debug_assert_eq!(values.len(), codes.len());
+    // SAFETY: i8/u8 have identical size and alignment; this changes only the
+    // slice's element type so the shared SIMD kernel can sign-extend bytes.
+    let bytes = unsafe { std::slice::from_raw_parts(codes.as_ptr().cast::<u8>(), codes.len()) };
+    scalar8_dot(values, bytes)
+}
+
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 unsafe fn scalar8_dot_avx2(values: &[f32], codes: &[u8]) -> f64 {

@@ -28,10 +28,11 @@ pub use autotune::{
 };
 pub use cuvs_bruteforce::{CuvsBruteForceTopK, cuvs_bruteforce_topk};
 pub use diskann::{
-    ConcatCrossTermDiskAnn, ConcatCrossTermHit, ConcatCrossTermKey, Direction, DirectionalBoost,
-    DiskAnnBuildBackend, DiskAnnBuildParams, DiskAnnBuildProgress, DiskAnnGraphReader,
-    DiskAnnGraphWriter, DiskAnnHeader, DiskAnnNodeRef, DiskAnnPqBuildParams, DiskAnnPqIndex,
-    DiskAnnPqSearchBuild, DiskAnnSearch, DiskAnnSearchParams, DualDiskAnnSearch,
+    ConcatCrossTermDiskAnn, ConcatCrossTermHit, ConcatCrossTermKey, DISKANN_GENERATION_MAGIC,
+    DISKANN_GENERATION_VERSION, Direction, DirectionalBoost, DiskAnnBuildBackend,
+    DiskAnnBuildParams, DiskAnnBuildProgress, DiskAnnGeneration, DiskAnnGraphReader, DiskAnnHeader,
+    DiskAnnMetric, DiskAnnNodeRef, DiskAnnPqBuildParams, DiskAnnPqIndex, DiskAnnPqSearchBuild,
+    DiskAnnRawIndex, DiskAnnSearch, DiskAnnSearchParams, DiskAnnVectorEncoding, DualDiskAnnSearch,
     TokenDiskAnnMaxSim, build_diskann_graph, build_diskann_graph_with_backend,
     build_diskann_graph_with_backend_and_progress, build_dual, build_dual_with_search,
     dual_graph_path, node_block_size, open_diskann_graph, open_dual,

@@ -8,8 +8,10 @@ pub mod concat;
 #[cfg(sextant_cuvs)]
 mod cuvs_cagra;
 pub mod dual;
+mod generation;
 pub mod graph;
 pub mod pq;
+mod raw;
 pub mod search;
 pub mod token;
 mod token_sidecar;
@@ -23,10 +25,12 @@ pub use dual::{
     Direction, DirectionalBoost, DualDiskAnnSearch, build_dual, build_dual_with_search,
     dual_graph_path, open_dual,
 };
+pub use generation::{DISKANN_GENERATION_MAGIC, DISKANN_GENERATION_VERSION, DiskAnnGeneration};
 pub use graph::{
-    DiskAnnGraphReader, DiskAnnGraphWriter, DiskAnnHeader, DiskAnnNodeRef, node_block_size,
-    open_diskann_graph,
+    DiskAnnGraphReader, DiskAnnHeader, DiskAnnMetric, DiskAnnNodeRef, DiskAnnVectorEncoding,
+    node_block_size, open_diskann_graph,
 };
 pub use pq::{DiskAnnPqBuildParams, DiskAnnPqIndex};
+pub use raw::DiskAnnRawIndex;
 pub use search::{DiskAnnPqSearchBuild, DiskAnnSearch, DiskAnnSearchParams};
 pub use token::TokenDiskAnnMaxSim;

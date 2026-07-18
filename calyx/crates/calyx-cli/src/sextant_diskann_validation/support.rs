@@ -17,6 +17,10 @@ pub(super) enum Mode {
     Truncated,
     MissingRaw,
     CorruptPq,
+    MismatchedPq,
+    InvalidCode,
+    InvalidSubspace,
+    NonUnit,
 }
 
 #[derive(Clone, Debug)]
@@ -39,7 +43,6 @@ pub(super) struct Request {
 pub(super) struct Paths {
     pub(super) graph_path: PathBuf,
     pub(super) raw_dir: PathBuf,
-    pub(super) pq_path: PathBuf,
     pub(super) metrics_dir: PathBuf,
 }
 
@@ -48,7 +51,6 @@ impl Paths {
         Self {
             graph_path: root.join("idx/slot_00.ann/graph.cda"),
             raw_dir: root.join("cf/slot_00.raw"),
-            pq_path: root.join("idx/slot_00.ann/graph.pq"),
             metrics_dir: root.join("metrics"),
         }
     }
@@ -74,6 +76,10 @@ impl Request {
             "truncated" => Mode::Truncated,
             "missing-raw" => Mode::MissingRaw,
             "corrupt-pq" => Mode::CorruptPq,
+            "mismatched-pq" => Mode::MismatchedPq,
+            "invalid-code" => Mode::InvalidCode,
+            "invalid-subspace" => Mode::InvalidSubspace,
+            "non-unit" => Mode::NonUnit,
             other => return Err(format!("unknown diskann validation mode: {other}")),
         };
         let nodes = number(args, "--nodes", 1000)?;
@@ -204,12 +210,6 @@ pub(super) fn file_len(path: &Path) -> Option<u64> {
     fs::metadata(path).ok().map(|metadata| metadata.len())
 }
 
-pub(super) fn dir_bytes(path: &Path) -> CliResult<u64> {
-    fs::read_dir(path)?
-        .map(|entry| -> CliResult<u64> { Ok(entry?.metadata()?.len()) })
-        .sum()
-}
-
 pub(super) fn write_json<T: Serialize>(path: &Path, value: &T) -> CliResult {
     let json = serde_json::to_string_pretty(value)
         .map_err(|error| CliError::runtime(format!("serialize {}: {error}", path.display())))?;
@@ -261,6 +261,8 @@ fn pq_params(args: &[String]) -> Result<Option<DiskAnnPqBuildParams>, String> {
         subvectors,
         centroids: optional_number(args, "--pq-centroids")?.unwrap_or(256),
         iterations: optional_number(args, "--pq-iterations")?.unwrap_or(8),
+        code_bits: u8::try_from(optional_number(args, "--pq-code-bits")?.unwrap_or(8))
+            .map_err(|_| "--pq-code-bits exceeds u8".to_string())?,
     }))
 }
 

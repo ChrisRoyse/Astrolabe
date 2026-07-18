@@ -210,12 +210,20 @@ pub(super) fn validate_entry(
         )));
     }
     let mut seen = BTreeSet::new();
-    for id in ids {
-        if !seen.insert(id) {
+    for id in &ids {
+        if !seen.insert(*id) {
             return Err(stale(format!(
                 "persistent slot {slot} id map repeats {id}; rebuild the vault search indexes"
             )));
         }
+    }
+    let expected_dim = entry.require_dim(slot)?;
+    let index = DiskAnnSearch::open(slot, graph, ids, None, search_params(entry.len.max(64)))?;
+    if index.shape() != calyx_core::SlotShape::Dense(expected_dim) {
+        return Err(stale(format!(
+            "persistent slot {slot} opened shape {:?} != manifest dense({expected_dim}); rebuild the vault search indexes",
+            index.shape()
+        )));
     }
     Ok(())
 }
