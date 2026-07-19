@@ -75,6 +75,13 @@ struct LedgerEvidence {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+struct DiskFileEvidence {
+    relative_path: String,
+    value_len: u64,
+    value_sha256: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 struct VaultState {
     seq: u64,
     base: Vec<RowEvidence>,
@@ -108,7 +115,7 @@ impl RefusalCase {
 }
 
 fn main() {
-    if let Err(error) = run() {
+    if let Err(error) = dispatch() {
         println!(
             "{}",
             json!({ "event": "fsv_failure", "error": error.to_string() })
@@ -117,7 +124,20 @@ fn main() {
     }
 }
 
-fn run() -> AnyResult<()> {
+fn dispatch() -> AnyResult<()> {
+    let mut arguments = std::env::args_os().skip(1);
+    match (arguments.next(), arguments.next(), arguments.next()) {
+        (None, None, None) => run_mutating(),
+        (Some(flag), Some(root), None) if flag.to_str() == Some("--read-existing") => {
+            read_existing(&PathBuf::from(root))
+        }
+        _ => Err(
+            "usage: compression_ledger_guard_fsv [--read-existing <absolute-fixture-root>]".into(),
+        ),
+    }
+}
+
+fn run_mutating() -> AnyResult<()> {
     let root = fresh_root()?;
     let vault_dir = root.join("vault");
     let artifact = std::env::current_exe()?;
@@ -209,6 +229,72 @@ fn run() -> AnyResult<()> {
                 "malformed reserved compression subject"
             ],
             "multislot_erase": "global erase tombstone plus one DeleteGeneration Ledger entry per slot"
+        })
+    );
+    Ok(())
+}
+
+fn read_existing(root: &Path) -> AnyResult<()> {
+    require(
+        root.is_absolute(),
+        format!(
+            "existing FSV fixture root must be absolute: {}",
+            root.display()
+        ),
+    )?;
+    require(
+        root.is_dir(),
+        format!("existing FSV fixture root is absent: {}", root.display()),
+    )?;
+    let vault_dir = root.join("vault");
+    require(
+        vault_dir.is_dir(),
+        format!("existing Aster vault is absent: {}", vault_dir.display()),
+    )?;
+    let disk_before = disk_inventory(root)?;
+    let vault = open_vault(&vault_dir)?;
+    let state = read_state(&vault, &vault_dir)?;
+    require_erased_state(&state)?;
+    require(
+        state.seq == 8 && state.ledger.len() == 10 && state.compression.len() == 4,
+        format!(
+            "post-process state cardinality mismatch: seq={} ledger={} compression={}",
+            state.seq,
+            state.ledger.len(),
+            state.compression.len()
+        ),
+    )?;
+    drop(vault);
+
+    let physical = AsterLedgerCfStore::open(&vault_dir)?;
+    let physical_rows = physical.scan()?;
+    let verified = verify_chain(&physical, 0..physical_rows.len() as u64)?;
+    require(
+        matches!(
+            verified,
+            VerifyResult::Intact { count } if count == physical_rows.len() as u64
+        ),
+        format!("post-process physical Ledger chain is not intact: {verified:?}"),
+    )?;
+    drop(physical);
+
+    let disk_after = disk_inventory(root)?;
+    require(
+        disk_after == disk_before,
+        "read-only post-process inspection changed the fixture file inventory",
+    )?;
+    let disk_digest_sha256 = sha256(&serde_json::to_vec(&disk_after)?);
+    println!(
+        "{}",
+        json!({
+            "event": "post_process_readback",
+            "fixture_root": root,
+            "source_of_truth": "separate OS process freshly reopened durable Aster CF rows and physical Ledger view",
+            "state": state,
+            "physical_ledger_verify": format!("{verified:?}"),
+            "disk_files": disk_after,
+            "disk_digest_sha256": disk_digest_sha256,
+            "disk_unchanged_during_read": true,
         })
     );
     Ok(())
@@ -763,6 +849,46 @@ fn fresh_root() -> AnyResult<PathBuf> {
     )?;
     fs::create_dir_all(&root)?;
     Ok(root)
+}
+
+fn disk_inventory(root: &Path) -> AnyResult<Vec<DiskFileEvidence>> {
+    fn visit(root: &Path, directory: &Path, files: &mut Vec<DiskFileEvidence>) -> AnyResult<()> {
+        let mut entries = fs::read_dir(directory)?.collect::<Result<Vec<_>, _>>()?;
+        entries.sort_by_key(std::fs::DirEntry::file_name);
+        for entry in entries {
+            let path = entry.path();
+            let metadata = fs::symlink_metadata(&path)?;
+            require(
+                !metadata.file_type().is_symlink(),
+                format!("FSV fixture contains a symlink: {}", path.display()),
+            )?;
+            if metadata.is_dir() {
+                visit(root, &path, files)?;
+            } else if metadata.is_file() {
+                let relative_path = path
+                    .strip_prefix(root)?
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                let bytes = fs::read(&path)?;
+                files.push(DiskFileEvidence {
+                    relative_path,
+                    value_len: metadata.len(),
+                    value_sha256: sha256(&bytes),
+                });
+            } else {
+                return Err(format!(
+                    "FSV fixture contains a non-file, non-directory entry: {}",
+                    path.display()
+                )
+                .into());
+            }
+        }
+        Ok(())
+    }
+
+    let mut files = Vec::new();
+    visit(root, root, &mut files)?;
+    Ok(files)
 }
 
 fn subject_hex(subject: &SubjectId) -> String {
