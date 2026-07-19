@@ -15,7 +15,7 @@
     or mock behavior exists here.
 
 .NOTES
-    Refs #596, #424, #197. Manual FSV tooling; this is not a test or a gate.
+    Refs #600, #596, #424, #197. Manual FSV tooling; this is not a test or a gate.
 #>
 [CmdletBinding()]
 param(
@@ -252,6 +252,49 @@ function ConvertTo-WindowsCommandLineArgument([string]$Argument) {
     return $builder.ToString()
 }
 
+function ConvertFrom-FlatStringArrayJson([string]$Json) {
+    if ([string]::IsNullOrWhiteSpace($Json)) {
+        Fail-Astro 'ASTRO_FSV_ARGUMENTS_INVALID' 'ArgumentsJson is empty' 'pass a JSON array containing only strings; use [] for zero arguments'
+    }
+
+    # ConvertFrom-Json normally enumerates a top-level JSON array, collapsing []
+    # to $null and a single item to a scalar. Parse through an object envelope so
+    # the array identity and cardinality survive on Windows PowerShell 5.1 and
+    # PowerShell 7. Random property names make injected sibling properties
+    # observable rather than allowing trailing JSON to escape the array contract.
+    $argumentProperty = "arguments_$([Guid]::NewGuid().ToString('N'))"
+    $sentinelProperty = "sentinel_$([Guid]::NewGuid().ToString('N'))"
+    $envelopeJson = '{"' + $argumentProperty + '":' + $Json + ',"' + $sentinelProperty + '":true}'
+    try { $envelope = ConvertFrom-Json -InputObject $envelopeJson }
+    catch {
+        Fail-Astro 'ASTRO_FSV_ARGUMENTS_INVALID' "ArgumentsJson is invalid: $($_.Exception.Message)" 'pass a flat JSON array containing only strings'
+    }
+
+    $properties = @($envelope.PSObject.Properties)
+    $argumentEntry = $envelope.PSObject.Properties[$argumentProperty]
+    $sentinelEntry = $envelope.PSObject.Properties[$sentinelProperty]
+    if ($properties.Count -ne 2 -or $null -eq $argumentEntry -or $null -eq $sentinelEntry -or
+        $sentinelEntry.Value -isnot [bool] -or -not [bool]$sentinelEntry.Value) {
+        Fail-Astro 'ASTRO_FSV_ARGUMENTS_INVALID' 'ArgumentsJson contains data outside its top-level value' 'pass exactly one flat JSON array containing only strings'
+    }
+
+    $rawArguments = $argumentEntry.Value
+    if ($rawArguments -isnot [Array]) {
+        Fail-Astro 'ASTRO_FSV_ARGUMENTS_INVALID' 'ArgumentsJson top-level value is not an array' 'pass a flat JSON array containing only strings; use [] for zero arguments'
+    }
+    $values = [string[]]::new($rawArguments.Count)
+    for ($index = 0; $index -lt $rawArguments.Count; $index++) {
+        if ($rawArguments[$index] -isnot [string]) {
+            Fail-Astro 'ASTRO_FSV_ARGUMENTS_INVALID' "ArgumentsJson item $index is not a string" 'pass a flat JSON array containing only strings'
+        }
+        $values[$index] = [string]$rawArguments[$index]
+    }
+    return [pscustomobject]@{
+        Count = [int]$values.Length
+        Values = $values
+    }
+}
+
 $workspace = [IO.Path]::GetFullPath((Split-Path -Parent $PSScriptRoot))
 $evidenceRoot = Join-Path $workspace '.tmp\native-fsv-artifacts'
 $launcherLockPath = Join-Path (Join-Path $workspace '.tmp') 'astrolabe-launcher.lock'
@@ -274,6 +317,8 @@ $artifactHashBefore = $null
 $receiptFull = $null
 $runRecordWritten = $false
 $runRecordAuthorized = $false
+$arguments = [string[]]::new(0)
+$argumentCount = 0
 
 try {
     if ($Issue -le 0) { Fail-Astro 'ASTRO_FSV_ISSUE_INVALID' 'Issue must be positive' 'pass the driving GitHub issue number' }
@@ -357,17 +402,16 @@ try {
         Fail-Astro 'ASTRO_FSV_ARTIFACT_DRIFT' 'staged artifact hash/length differs from its receipt before launch' 'discard the session, identify the writer, and rebuild'
     }
 
-    try { $parsedArguments = ConvertFrom-Json -InputObject $ArgumentsJson }
-    catch { Fail-Astro 'ASTRO_FSV_ARGUMENTS_INVALID' "ArgumentsJson is invalid: $($_.Exception.Message)" 'pass a JSON array containing only strings' }
-    $arguments = @()
-    if ($null -ne $parsedArguments) {
-        if (($parsedArguments -is [Collections.IEnumerable]) -and ($parsedArguments -isnot [string])) {
-            foreach ($argument in $parsedArguments) { $arguments += $argument }
-        }
-        else { $arguments += $parsedArguments }
+    $argumentVector = ConvertFrom-FlatStringArrayJson $ArgumentsJson
+    $argumentCount = [int]$argumentVector.Count
+    $arguments = [string[]]@($argumentVector.Values)
+    if ($arguments.Length -ne $argumentCount) {
+        Fail-Astro 'ASTRO_FSV_ARGUMENTS_INVALID' 'ArgumentsJson cardinality changed during parsing' 'preserve the invocation and investigate the PowerShell JSON runtime'
     }
-    foreach ($argument in $arguments) {
-        if ($argument -isnot [string]) { Fail-Astro 'ASTRO_FSV_ARGUMENTS_INVALID' 'ArgumentsJson contains a non-string value' 'pass a flat JSON array containing only strings' }
+    $argumentLine = if ($argumentCount -gt 0) {
+        (@($arguments | ForEach-Object { ConvertTo-WindowsCommandLineArgument ([string]$_) }) -join ' ')
+    } else {
+        $null
     }
 
     # FileShare.Read intentionally omits write/delete sharing. Microsoft documents that a
@@ -381,7 +425,9 @@ try {
         pid = $PID
         issue = $Issue
         started = [DateTime]::UtcNow.ToString('o')
-        command = "$artifact $($arguments -join ' ')"
+        command = if ($argumentCount -gt 0) { "$artifact $argumentLine" } else { $artifact }
+        argument_count = $argumentCount
+        arguments = @($arguments)
         tree_sha = [string]$receipt.tree_sha
         artifact_path = $artifact
         artifact_sha256 = $artifactHashBefore
@@ -398,9 +444,17 @@ try {
     }
     $fsvLockOwned = $true
 
-    $argumentLine = (@($arguments | ForEach-Object { ConvertTo-WindowsCommandLineArgument ([string]$_) }) -join ' ')
-    $child = Start-Process -FilePath $artifact -ArgumentList $argumentLine -RedirectStandardOutput $StandardOutputPath `
-        -RedirectStandardError $StandardErrorPath -WindowStyle Hidden -PassThru
+    $startProcessParameters = @{
+        FilePath = $artifact
+        RedirectStandardOutput = $StandardOutputPath
+        RedirectStandardError = $StandardErrorPath
+        WindowStyle = 'Hidden'
+        PassThru = $true
+    }
+    if ($argumentCount -gt 0) {
+        $startProcessParameters.ArgumentList = $argumentLine
+    }
+    $child = Start-Process @startProcessParameters
     $childProcessHandle = $child.SafeHandle
     if ($null -eq $childProcessHandle -or $childProcessHandle.IsInvalid -or $childProcessHandle.IsClosed) {
         Fail-Astro 'ASTRO_FSV_CHILD_HANDLE_UNAVAILABLE' "native child PID $($child.Id) did not expose a retained process handle" 'preserve the session and repair native process launch before rerunning'
@@ -433,6 +487,8 @@ try {
         tree_sha = [string]$receipt.tree_sha
         artifact = [ordered]@{ path = $artifact; bytes = [uint64]$artifactItem.Length; sha256 = $artifactHashBefore }
         started_at_utc = $childStartedAtUtc
+        argument_count = $argumentCount
+        arguments = @($arguments)
     }
     Publish-NewFile $LiveStatePath ($liveState | ConvertTo-Json -Depth 10)
     $child.WaitForExit()
@@ -477,6 +533,7 @@ try {
         artifact = [ordered]@{ path = $artifact; bytes = [uint64](Get-Item -LiteralPath $artifact).Length; sha256 = $artifactHashAfter; stable = $artifactStable; delete_share_denied_for_run = $true }
         receipt = [ordered]@{ path = $receiptFull; sha256_before = $receiptHashBefore; sha256_after = $receiptHashAfter; stable = $receiptStable }
         launcher_lease = [ordered]@{ path = $launcherLockPath; sha256_before = $launcherLockHashBefore; sha256_after = $launcherLockHashAfter; stable = $launcherLeaseStable }
+        argument_count = $argumentCount
         arguments = @($arguments)
         stdout = [ordered]@{ path = $StandardOutputPath; bytes = [uint64](Get-Item -LiteralPath $StandardOutputPath).Length; sha256 = $stdoutHash }
         stderr = [ordered]@{ path = $StandardErrorPath; bytes = [uint64](Get-Item -LiteralPath $StandardErrorPath).Length; sha256 = $stderrHash }
@@ -485,10 +542,23 @@ try {
     Write-NewDurableUtf8 $RunRecordPath ($record | ConvertTo-Json -Depth 15)
     $runRecordWritten = $true
     $persistedRecord = Get-Content -LiteralPath $RunRecordPath -Raw | ConvertFrom-Json
+    $persistedArguments = @($persistedRecord.arguments)
+    $argumentsMatch = [int]$persistedRecord.argument_count -eq $argumentCount -and
+        $persistedArguments.Count -eq $argumentCount
+    if ($argumentsMatch) {
+        for ($index = 0; $index -lt $argumentCount; $index++) {
+            if ($persistedArguments[$index] -isnot [string] -or
+                -not [string]::Equals([string]$persistedArguments[$index], $arguments[$index], [StringComparison]::Ordinal)) {
+                $argumentsMatch = $false
+                break
+            }
+        }
+    }
     if ([uint64]$persistedRecord.process.exit_code -ne [uint64]$childExitCode -or
         [string]$persistedRecord.process.exit_code_observation.primary_source -cne [string]$childExitObservation.primary_source -or
         [bool]$persistedRecord.process.exit_code_observation.sources_agree -ne [bool]$childExitObservation.sources_agree -or
-        [string]$persistedRecord.artifact.sha256 -cne $artifactHashAfter) {
+        [string]$persistedRecord.artifact.sha256 -cne $artifactHashAfter -or
+        -not $argumentsMatch) {
         Fail-Astro 'ASTRO_FSV_RUN_READBACK_FAILED' 'persisted run record does not match the observed process/artifact state' 'preserve the session and investigate the failed durable write'
     }
     $record | ConvertTo-Json -Depth 15 -Compress | Write-Output
@@ -553,6 +623,8 @@ catch {
                     sha256 = $failureArtifactHash
                     stable = $false
                 }
+                argument_count = $argumentCount
+                arguments = @($arguments)
                 stdout = [ordered]@{
                     path = $StandardOutputPath
                     bytes = if (Test-Path -LiteralPath $StandardOutputPath -PathType Leaf) { [uint64](Get-Item -LiteralPath $StandardOutputPath).Length } else { 0 }
