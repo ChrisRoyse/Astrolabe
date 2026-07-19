@@ -16,11 +16,11 @@
     the Job Object closing can reach it. The detached run survives the launching session
     entirely.
 
-    The #197 lock protocol is PRESERVED unchanged: this trampoline does not touch the launcher
-    lock. The detached work (typically scripts/windows-gnu-toolchain.ps1) still writes its own
-    `.tmp/astrolabe-launcher.lock` naming its REAL pwsh PID + driving issue, still exposes that
-    PID for liveness probes by other sessions, and still releases the lock in its own finally.
-    All this trampoline adds is: the launcher pwsh no longer dies when the agent shell dies.
+    The #197/#611 lock protocol is preserved: this trampoline does not touch launcher state.
+    Detached work publishes its strict v2 identity `(pid, owner_process_start_utc_ticks,
+    issue)` plus the frozen-tree fingerprint, retains the immutable manifest handle, and
+    performs exact-owner cleanup. The printed PID is monitoring data only, never reclaim/stop
+    authority without its process-start ticks. This trampoline only changes process ancestry.
 
     Contract (fire-and-forget):
       * Generates a runner .ps1 and a .cmd trampoline (the task action, so schtasks /TR is a

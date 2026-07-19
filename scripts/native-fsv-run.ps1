@@ -32,6 +32,8 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $PSNativeCommandUseErrorActionPreference = $false
 
+. (Join-Path $PSScriptRoot 'launcher-lock.ps1')
+
 function Fail-Astro {
     param([string]$Code, [string]$Message, [string]$Remediation)
     $exception = [InvalidOperationException]::new($Message)
@@ -367,15 +369,15 @@ try {
     $LiveStatePath = [IO.Path]::GetFullPath($LiveStatePath)
     $runRecordAuthorized = $true
 
-    if (-not (Test-Path -LiteralPath $launcherLockPath -PathType Leaf)) {
-        Fail-Astro 'ASTRO_FSV_LAUNCHER_LEASE_REQUIRED' "live launcher lock is absent: $launcherLockPath" 'run native-fsv-run.ps1 as a child of scripts/windows-gnu-toolchain.ps1'
+    $launcherOwner = Read-AstroLauncherLock -LockPath $launcherLockPath
+    $launcherPid = if ($null -ne $launcherOwner.OwnerPid) {
+        [int]$launcherOwner.OwnerPid
+    } else {
+        0
     }
-    try { $launcherLock = Get-Content -LiteralPath $launcherLockPath -Raw | ConvertFrom-Json }
-    catch { Fail-Astro 'ASTRO_FSV_LAUNCHER_LEASE_INVALID' "launcher lock is unreadable: $($_.Exception.Message)" 'preserve state and repair the launcher lock before running evidence' }
-    $launcherPid = 0
-    if (-not [int]::TryParse([string]$launcherLock.pid, [ref]$launcherPid) -or $launcherPid -le 0 -or
-        [int]$launcherLock.issue -ne $Issue -or $null -eq (Get-Process -Id $launcherPid -ErrorAction SilentlyContinue)) {
-        Fail-Astro 'ASTRO_FSV_LAUNCHER_LEASE_INVALID' "launcher lock does not name a live owner for issue #$Issue" 'start the FSV through the native launcher with the same driving issue'
+    if ($launcherOwner.State -ne 'held' -or
+        $launcherOwner.Issue -ne $Issue) {
+        Fail-Astro 'ASTRO_FSV_LAUNCHER_LEASE_INVALID' "launcher protocol does not name the exact live owner process identity for issue #$Issue (state=$($launcherOwner.State), pid=$launcherPid, process_start_utc_ticks=$($launcherOwner.OwnerProcessStartUtcTicks), read_error=$($launcherOwner.ReadError), validation_error=$($launcherOwner.ValidationError))" 'start the FSV through the native launcher with the same driving issue'
     }
     if (-not (Test-DescendantOf $PID $launcherPid)) {
         Fail-Astro 'ASTRO_FSV_RUNNER_NOT_OWNED' "runner PID $PID is not a descendant of launcher PID $launcherPid" 'invoke this runner synchronously from the launcher-owned child process'

@@ -44,6 +44,8 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $PSNativeCommandUseErrorActionPreference = $false
 
+. (Join-Path $PSScriptRoot 'launcher-lock.ps1')
+
 function Fail-Astro {
     param(
         [Parameter(Mandatory)][string]$Code,
@@ -418,22 +420,17 @@ try {
                 Fail-Astro 'ASTRO_FSV_GIT_MISSING' "required native Git executable is absent: $gitExe" `
                     'restore the canonical Git for Windows installation before staging evidence'
             }
-            if (-not (Test-Path -LiteralPath $launcherLockPath -PathType Leaf)) {
-                Fail-Astro 'ASTRO_FSV_LAUNCHER_LEASE_REQUIRED' "live launcher lock is absent: $launcherLockPath" `
-                    'invoke Stage synchronously from the issue-owned native launcher process'
+            $launcherOwner = Read-AstroLauncherLock -LockPath $launcherLockPath
+            $launcherPid = if ($null -ne $launcherOwner.OwnerPid) {
+                [int]$launcherOwner.OwnerPid
+            } else {
+                0
             }
-            try { $launcherLock = Get-Content -LiteralPath $launcherLockPath -Raw | ConvertFrom-Json }
-            catch {
-                Fail-Astro 'ASTRO_FSV_LAUNCHER_LEASE_INVALID' "launcher lock is unreadable: $($_.Exception.Message)" `
-                    'preserve state and repair the launcher lock before staging evidence'
-            }
-            $launcherPid = 0
-            if (-not [int]::TryParse([string]$launcherLock.pid, [ref]$launcherPid) -or
-                $launcherPid -le 0 -or [int]$launcherLock.issue -ne $Issue -or
-                [string]$launcherLock.head_sha -cne $TreeSha -or
-                $null -eq (Get-Process -Id $launcherPid -ErrorAction SilentlyContinue)) {
+            if ($launcherOwner.State -ne 'held' -or
+                $launcherOwner.Issue -ne $Issue -or
+                [string]$launcherOwner.HeadSha -cne $TreeSha) {
                 Fail-Astro 'ASTRO_FSV_LAUNCHER_LEASE_INVALID' `
-                    "launcher lock does not name a live issue #$Issue owner for tree $TreeSha" `
+                    "launcher protocol does not name the exact live issue #$Issue process identity for tree $TreeSha (state=$($launcherOwner.State), pid=$launcherPid, process_start_utc_ticks=$($launcherOwner.OwnerProcessStartUtcTicks), read_error=$($launcherOwner.ReadError), validation_error=$($launcherOwner.ValidationError))" `
                     'start artifact promotion through the native launcher with the same issue and tree'
             }
             if (-not (Test-DescendantOf -CandidatePid $PID -AncestorPid $launcherPid)) {

@@ -48,6 +48,27 @@ function Get-Sha256Hex {
     return [pscustomobject]@{ Hash = $hex }
 }
 
+function Write-NewDurableUtf8File {
+    param(
+        [Parameter(Mandatory)][string]$LiteralPath,
+        [Parameter(Mandatory)][string]$Text
+    )
+    $bytes = [Text.UTF8Encoding]::new($false).GetBytes($Text)
+    $stream = [IO.File]::Open(
+        $LiteralPath,
+        [IO.FileMode]::CreateNew,
+        [IO.FileAccess]::Write,
+        [IO.FileShare]::None
+    )
+    try {
+        $stream.Write($bytes, 0, $bytes.Length)
+        $stream.Flush($true)
+    }
+    finally {
+        $stream.Dispose()
+    }
+}
+
 # #239: launcher-owned exit codes. These are protocol codes, not measurements. The
 # launcher's exit code is ALWAYS the child command's exit code when the child ran and
 # cleanup succeeded; these two codes are reserved for the cases where there is no child
@@ -171,12 +192,78 @@ function Require-Path {
 }
 
 function Remove-LauncherLockFile {
-    param([string]$LockPath)
-    if (Test-Path -LiteralPath $LockPath) {
-        Remove-Item -LiteralPath $LockPath -Force
+    param(
+        [Parameter(Mandatory)][string]$LockPath,
+        [Parameter(Mandatory)][int]$ExpectedPid,
+        [Parameter(Mandatory)][int]$ExpectedIssue,
+        [Parameter(Mandatory)][long]$ExpectedOwnerProcessStartUtcTicks,
+        [Parameter(Mandatory)][string]$ExpectedSha256,
+        [Parameter(Mandatory)]$LeaseHandle
+    )
+    $mutexLease = Enter-AstroLauncherLockMutex $LockPath
+    if (-not $mutexLease.Acquired) {
+        Exit-AstroLauncherLockMutex $mutexLease
+        throw "LAUNCHER_BOUNDARY[ASTRO_LAUNCHER_LOCK_CLEANUP_BUSY]: exact launcher-lock claim/reclaim mutex is owned by another process ($($mutexLease.Name)); refusing cleanup without changing the lock: $LockPath"
     }
-    if (Test-Path -LiteralPath $LockPath) {
-        throw "launcher lock cleanup failed: $LockPath remains"
+    try {
+        $transitions = Get-AstroLauncherLockTransitions $LockPath
+        if ($transitions.State -ne 'clear') {
+            throw "LAUNCHER_BOUNDARY[ASTRO_LAUNCHER_LOCK_CLEANUP_PROTOCOL_CONFLICT]: launcher protocol transition inventory is '$($transitions.State)' ($(@($transitions.Paths) -join '; '); $($transitions.Error)); preserve all state: $LockPath"
+        }
+        if ($null -eq $LeaseHandle.Stream -or -not $LeaseHandle.Stream.CanRead) {
+            throw "LAUNCHER_BOUNDARY[ASTRO_LAUNCHER_LOCK_CLEANUP_HANDLE_INVALID]: immutable launcher-lock lease handle is not live; refusing path-only cleanup: $LockPath"
+        }
+        $handleState = $LeaseHandle.State
+        if ($handleState.OwnerPid -ne $ExpectedPid -or
+            $handleState.Issue -ne $ExpectedIssue -or
+            $handleState.OwnerProcessStartUtcTicks -ne
+                $ExpectedOwnerProcessStartUtcTicks -or
+            $LeaseHandle.Sha256 -cne $ExpectedSha256.ToLowerInvariant()) {
+            throw "LAUNCHER_BOUNDARY[ASTRO_LAUNCHER_LOCK_CLEANUP_OWNER_MISMATCH]: immutable handle does not bind expected pid=$ExpectedPid issue=#$ExpectedIssue ticks=$ExpectedOwnerProcessStartUtcTicks sha256=$($ExpectedSha256.ToLowerInvariant())"
+        }
+        $selfProbe = Get-AstroProcessIdentityProbe $ExpectedPid
+        if ($selfProbe.State -ne 'observed' -or
+            [long]$selfProbe.ProcessStartUtcTicks -ne
+                $ExpectedOwnerProcessStartUtcTicks) {
+            throw "LAUNCHER_BOUNDARY[ASTRO_LAUNCHER_LOCK_CLEANUP_SELF_UNEVALUABLE]: cleanup process identity is not the exact lease owner (probe_state=$($selfProbe.State), observed_ticks=$($selfProbe.ProcessStartUtcTicks), error=$($selfProbe.Error))"
+        }
+
+        # Release the physical no-write/no-delete share only while holding the same
+        # machine-wide protocol mutex used by claim and explicit reclaim.
+        $LeaseHandle.Stream.Dispose()
+        $lock = Read-AstroLauncherLockFile -LockPath $LockPath
+        if ($lock.State -ne 'held' -or
+            $lock.OwnerPid -ne $ExpectedPid -or
+            $lock.Issue -ne $ExpectedIssue -or
+            $lock.OwnerProcessStartUtcTicks -ne
+                $ExpectedOwnerProcessStartUtcTicks -or
+            $lock.Sha256 -cne $ExpectedSha256.ToLowerInvariant()) {
+            throw "LAUNCHER_BOUNDARY[ASTRO_LAUNCHER_LOCK_CLEANUP_OWNER_MISMATCH]: final path readback changed after immutable-handle release (state=$($lock.State), pid=$($lock.OwnerPid), issue=#$($lock.Issue), ticks=$($lock.OwnerProcessStartUtcTicks), sha256=$($lock.Sha256)): $LockPath"
+        }
+        $tombstone = "$LockPath.cleanup.v2.pid-$ExpectedPid.issue-$ExpectedIssue.ticks-$ExpectedOwnerProcessStartUtcTicks.sha256-$($ExpectedSha256.ToLowerInvariant()).$([Guid]::NewGuid().ToString('N'))"
+        Move-AstroFileWriteThroughNoReplace -Source $LockPath -Destination $tombstone
+        if ((Get-AstroPathEntryState $LockPath).State -ne 'absent') {
+            throw "LAUNCHER_BOUNDARY[ASTRO_LAUNCHER_LOCK_CLEANUP_MOVE_FAILED]: active launcher lock remains after exact write-through move: $LockPath"
+        }
+        $tombstoneState = Read-AstroLauncherLockFile $tombstone
+        if ($tombstoneState.Sha256 -cne $ExpectedSha256.ToLowerInvariant() -or
+            $tombstoneState.OwnerPid -ne $ExpectedPid -or
+            $tombstoneState.OwnerProcessStartUtcTicks -ne
+                $ExpectedOwnerProcessStartUtcTicks) {
+            throw "LAUNCHER_BOUNDARY[ASTRO_LAUNCHER_LOCK_CLEANUP_TOMBSTONE_MISMATCH]: cleanup transition readback does not bind the exact lease bytes/owner: $tombstone"
+        }
+        try {
+            [IO.File]::Delete($tombstone)
+        }
+        catch {
+            throw "LAUNCHER_BOUNDARY[ASTRO_LAUNCHER_LOCK_CLEANUP_TOMBSTONE_REMOVE_FAILED]: active lock was safely moved away, but exact tombstone cleanup failed at '$tombstone': $($_.Exception.Message)"
+        }
+        if ((Get-AstroPathEntryState $tombstone).State -ne 'absent') {
+            throw "LAUNCHER_BOUNDARY[ASTRO_LAUNCHER_LOCK_CLEANUP_TOMBSTONE_REMAINS]: active lock was safely moved away, but exact cleanup tombstone remains: $tombstone"
+        }
+    }
+    finally {
+        Exit-AstroLauncherLockMutex $mutexLease
     }
 }
 
@@ -2148,6 +2235,30 @@ $workspaceTempParent = Join-Path $root ".tmp"
 $workspaceTempParentExisted = Test-Path -LiteralPath $workspaceTempParent
 $workspaceTemp = Join-Path $workspaceTempParent "windows-gnu-toolchain-$PID"
 $launcherLock = Join-Path $workspaceTempParent "astrolabe-launcher.lock"
+# Initialise every value referenced by the post-claim try/finally before the atomic claim.
+# Once the active lock is published, the main protected try begins immediately.
+$mingwRoot = Join-Path $toolsRoot $ToolchainDirectoryName
+$mingwBin = Join-Path $mingwRoot "bin"
+$llvmRoot = Join-Path $toolsRoot $LlvmDirectoryName
+$llvmBin = Join-Path $llvmRoot "bin"
+$cppcheckRoot = Join-Path $toolsRoot $CppcheckDirectoryName
+$ripgrepRoot = Join-Path $toolsRoot $RipgrepDirectoryName
+$sccacheRoot = Join-Path $toolsRoot $SccacheDirectoryName
+$sccacheExe = Join-Path $sccacheRoot "sccache.exe"
+$sccacheDir = Join-Path $ExpectedWorkspace ".sccache"
+$gitRoot = $GitInstallRoot
+$gitBin = Join-Path $gitRoot "bin"
+$gitUsrBin = Join-Path $gitRoot "usr\bin"
+$commandExit = $null
+$launcherFault = $null
+$cleanupErrors = @()
+$treeRecorder = $null
+$sccacheDaemonStarted = $false
+$attributionManifest = Join-Path $workspaceTempParent "no-escape-attribution-$PID.json"
+$previousTempEnvironment = @{}
+foreach ($name in @("TEMP", "TMP", "TMPDIR", "GIT_CEILING_DIRECTORIES", "ASTRO_NO_ESCAPE_ATTRIBUTION")) {
+    $previousTempEnvironment[$name] = Get-Item -Path "Env:$name" -ErrorAction SilentlyContinue
+}
 # #534/#566: the complete set of Cargo target directories this launcher owns and must clean
 # (root target + calyx/target). An authoritative CARGO_TARGET_DIR exported under the lock
 # (Set-ToolchainEnvironment) confines every Cargo child to the root target; this list drives
@@ -2158,12 +2269,10 @@ $ownedTargetRoots = @(Get-AstroOwnedCargoTargetRoots -Root $root)
 # environment fails fast without lock churn; the authoritative value is exported later,
 # under the held lock, by Set-ToolchainEnvironment.
 Assert-NoAmbientCargoTargetEscape -OwnedTargetRoot $target
-# #197/#247: the session-lock semantics live in one audited, dot-sourceable place
-# (scripts/launcher-lock.ps1) that has NO capability to stop any process. A live foreign
-# holder is refused (ASTRO_LAUNCHER_LOCK_HELD), a malformed lock fails closed
-# (ASTRO_LAUNCHER_LOCK_UNREADABLE), and only a dead-pid stale lock is removed -- never a
-# by-name process sweep. The helper is tested in isolation by scripts/test-launcher-lock.ps1
-# (fixture locks, never the live workspace).
+# #197/#611: the session-lock semantics live in one audited, dot-sourceable place that has
+# no capability to stop any process. Live, malformed, unevaluable, and stale locks all refuse;
+# stale ownership is removed only by the tracker-bound explicit reclaim command. Claim and
+# reclaim share one crash-released named mutex so check/create/archive operations cannot race.
 . (Join-Path $PSScriptRoot "launcher-lock.ps1")
 # #301: the no-escape attribution manifest lifecycle (dead-PID startup sweep + own-manifest
 # exit removal) lives in one audited, dot-sourceable helper that -- like the lock helper --
@@ -2174,68 +2283,23 @@ Assert-NoAmbientCargoTargetEscape -OwnedTargetRoot $target
 # cleanup). Like the lock/manifest helpers it NEVER stops a process and reaps a dir only when
 # the whole owning process tree is dead.
 . (Join-Path $PSScriptRoot "launcher-temp-guard.ps1")
-Assert-AstroLauncherLockClaimable -LockPath $launcherLock
-# #280: ASTROLABE_CONTIGUOUS_BATCH=1 (the CLAUDE.md contiguous-verification-
-# batch carve-out) keeps target/ warm between consecutive runs of one session,
-# so a present target/ is the expected state there, not a hygiene fault.
-if ((Test-Path -LiteralPath $target) -and ($env:ASTROLABE_CONTIGUOUS_BATCH -ne "1")) {
-    throw "target must be absent before toolchain work: $target"
+# #611: `.tmp` is the protocol directory. Creating an absent empty directory is the only
+# preclaim filesystem write; every target/temp/config/toolchain mutation occurs only after a
+# complete lock has been published, strictly read back, and retained through a no-delete
+# handle. Reparse/alias roots are refused consistently across claim and recovery.
+Assert-AstroLauncherRootCanonical $root
+$workspaceTempParentState = Get-AstroPathEntryState $workspaceTempParent
+if ($workspaceTempParentState.State -eq 'absent') {
+    [IO.Directory]::CreateDirectory($workspaceTempParent) | Out-Null
 }
-if (($env:ASTROLABE_CONTIGUOUS_BATCH -eq "1") -and (Test-Path -LiteralPath $target)) {
-    Write-Output "TARGET[ASTRO_BATCH_WARM]: ASTROLABE_CONTIGUOUS_BATCH=1 -> reusing warm target/ from this session's batch"
+elseif ($workspaceTempParentState.State -ne 'present' -or
+    ($workspaceTempParentState.Attributes -band [IO.FileAttributes]::Directory) -eq 0 -or
+    ($workspaceTempParentState.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+    throw "LAUNCHER_BOUNDARY[ASTRO_LAUNCHER_PROTOCOL_DIRECTORY_INVALID]: .tmp is not an evaluable ordinary directory (state=$($workspaceTempParentState.State), attributes=$($workspaceTempParentState.Attributes), error=$($workspaceTempParentState.Error)): $workspaceTempParent"
 }
-# #534/#566: nested owned Cargo target roots (calyx/target) are reclaimed as dead-owner debris
-# here. The session lock is already claimable (Assert-AstroLauncherLockClaimable passed above
-# => no live foreign owner on this root), so a nested target is a leftover from a dead run and
-# this session -- which now owns the workspace -- reclaims it fail-closed. The canonical root
-# target keeps its existing hard-fail "must be absent" contract (#421) above; nested targets
-# are new to launcher ownership and had no such contract, so they are swept, not fatal. Under
-# the contiguous-batch carve-out an authoritative CARGO_TARGET_DIR keeps every child in the
-# root target, so no nested target appears to reclaim.
-if ($env:ASTROLABE_CONTIGUOUS_BATCH -ne "1") {
-    $rootTargetFull = [IO.Path]::GetFullPath($target)
-    foreach ($ownedTarget in $ownedTargetRoots) {
-        if ([string]::Equals($ownedTarget, $rootTargetFull, [StringComparison]::OrdinalIgnoreCase)) {
-            continue
-        }
-        if (Test-Path -LiteralPath $ownedTarget) {
-            Remove-TreeResilient -Path $ownedTarget
-            if (Test-Path -LiteralPath $ownedTarget) {
-                throw "nested Cargo target must be absent before toolchain work and could not be reclaimed: $ownedTarget"
-            }
-            Write-Output "TARGET[ASTRO_NESTED_TARGET_RECLAIMED]: reclaimed dead-owner nested Cargo target under claimable lock: $ownedTarget (#534/#566)"
-        }
-    }
-}
-if ((Test-Path -LiteralPath $workspaceTempParent) -and -not (Test-Path -LiteralPath $workspaceTempParent -PathType Container)) {
-    throw "workspace temporary parent is not a directory: $workspaceTempParent"
-}
-New-Item -ItemType Directory -Path $workspaceTempParent -Force | Out-Null
-# #301: sweep stale dead-PID attribution manifests left by crashed/killed prior runs
-# before starting this run's recorder. Probes each manifest's embedded PID (Get-Process
-# -Id) and removes ONLY dead-PID ones; a manifest naming a live concurrent session's PID
-# is inviolable (#197), and this run's own (not-yet-written) manifest is skipped.
-$attributionSweep = Clear-DeadAttributionManifests -Directory $workspaceTempParent -SelfPid $PID
-if ($attributionSweep.Removed.Count -gt 0 -or $attributionSweep.Kept.Count -gt 0) {
-    Write-Output "NO_ESCAPE[ASTRO_ATTRIBUTION_SWEEP]: removed $($attributionSweep.Removed.Count) stale dead-PID attribution manifest(s); left $($attributionSweep.Kept.Count) live-PID manifest(s) untouched (#197/#301)"
-}
-# #320: reap per-run TEMP child dirs (.tmp/windows-gnu-toolchain-<pid>) left by prior runs
-# whose owner pwsh died while a detached child kept executing -- those runs' finally blocks
-# deliberately DEFERRED their own cleanup so the live child kept its working tree. This is
-# where that deferred cleanup is finally collected, but ONLY for dirs whose whole process
-# tree is dead: a dir owned by a live concurrent session, or one whose detached child is
-# still alive, is left untouched (#197/#320). Runs after the attribution sweep so a dir's
-# sibling manifest is still on disk to probe its recorded child pids.
-$tempSweep = Clear-DeadLauncherTempDirs -Directory $workspaceTempParent -SelfPid $PID
-if ($tempSweep.Removed.Count -gt 0 -or $tempSweep.Kept.Count -gt 0) {
-    Write-Output "CLEANUP[ASTRO_LAUNCHER_TEMP_SWEEP]: reaped $($tempSweep.Removed.Count) dead-owner TEMP child dir(s); left $($tempSweep.Kept.Count) still-live-owner dir(s) untouched (#197/#320)"
-}
-# #197: atomic lock claim — write the full manifest to a PID-named staging
-# sibling, then move it onto the lock name WITHOUT clobbering. No reader can
-# ever observe a claimed-but-empty or half-written lock (the #186 UNREADABLE
-# race), and a concurrent claim between the boundary check above and this move
-# surfaces as a named fail-closed refusal instead of overwriting a live lock.
-$launcherLockStage = "$launcherLock.$PID.tmp"
+
+# Everything below until the atomic move is read-only preparation. The full manifest bytes
+# and hash are known before the first claim-transition file is created.
 $launcherCommand = ("$Command $CommandArgsJson").Trim()
 if ([string]::IsNullOrWhiteSpace($launcherCommand)) {
     $launcherCommand = if ($Bootstrap) { "bootstrap" } else { "environment-probe" }
@@ -2248,84 +2312,153 @@ $evidenceGitExe = Join-Path (Join-Path $GitInstallRoot "bin") "git.exe"
 Require-Path $evidenceGitExe "native Git for Windows git.exe is required"
 $repoEvidenceBefore = Get-AstroRepoEvidenceState -GitExe $evidenceGitExe -Root $root
 Write-Output "GIT_FREEZE[ASTRO_EVIDENCE_LEASE]: head=$($repoEvidenceBefore.HeadSha) status_sha256=$($repoEvidenceBefore.StatusSha256) diff_sha256=$($repoEvidenceBefore.DiffSha256) recorded in the launcher lock (#424/#519)"
-if ($isCanonicalRoot) {
-    # core.hooksPath is shared repo config, so installing it from the canonical root covers
-    # every registered worktree. Each hook inspects the lock in its own operating tree.
-    # Never silently replace a foreign hook path.
-    $hooksProbe = Invoke-NativeCapture -Exe $evidenceGitExe -Arguments @("-C", $root, "config", "core.hooksPath")
-    $hooksCurrent = (@($hooksProbe.Output) -join "`n").Trim()
-    if ($hooksProbe.ExitCode -eq 0 -and -not [string]::IsNullOrWhiteSpace($hooksCurrent) -and $hooksCurrent -ne "scripts/githooks") {
-        throw "GIT_FREEZE[ASTRO_GIT_FREEZE_HOOKS_CONFLICT]: {code=ASTRO_GIT_FREEZE_HOOKS_CONFLICT; message=`"core.hooksPath is already set to '$hooksCurrent'; the #519 mutation-lease hooks require core.hooksPath=scripts/githooks and will not silently clobber a foreign hook path`"; remediation=`"reconcile the existing hook path with scripts/githooks (move its hooks in, or clear the setting), then rerun the launcher`"}"
-    }
-    if ($hooksCurrent -ne "scripts/githooks") {
-        $hooksSet = Invoke-NativeCapture -Exe $evidenceGitExe -Arguments @("-C", $root, "config", "core.hooksPath", "scripts/githooks")
-        if ($hooksSet.ExitCode -ne 0) {
-            throw "GIT_FREEZE[ASTRO_GIT_FREEZE_HOOKS_UNINSTALLED]: {code=ASTRO_GIT_FREEZE_HOOKS_UNINSTALLED; message=`"could not install core.hooksPath=scripts/githooks (git exit=$($hooksSet.ExitCode): $(@($hooksSet.Output) -join ' | '))`"; remediation=`"repair the repository config write path, then rerun the launcher`"}"
-        }
-        Write-Output "GIT_FREEZE[ASTRO_GIT_FREEZE_HOOKS]: installed core.hooksPath=scripts/githooks (mutation-lease enforcement for canonical and registered worktrees, #519)"
-    }
-}
-[ordered]@{
+$launcherProcess = Get-Process -Id $PID -ErrorAction Stop
+$launcherProcessStartUtcTicks = [long]$launcherProcess.StartTime.ToUniversalTime().Ticks
+$launcherProcessStartedUtc = [DateTime]::new(
+    $launcherProcessStartUtcTicks,
+    [DateTimeKind]::Utc
+).ToString('o')
+$launcherLeaseStartedUtc = [DateTime]::UtcNow
+$launcherLeaseStartUtcTicks = [long]$launcherLeaseStartedUtc.Ticks
+$launcherLockJson = [ordered]@{
+    schema = 'astrolabe.launcher-lock.v2'
     pid = $PID
     issue = $drivingIssue
-    started = (Get-Date).ToString("o")
+    started = $launcherLeaseStartedUtc.ToString('o')
+    lease_start_utc_ticks = $launcherLeaseStartUtcTicks
+    owner_process_start_utc_ticks = $launcherProcessStartUtcTicks
+    owner_process_started_utc = $launcherProcessStartedUtc
     command = $launcherCommand
     head_sha = $repoEvidenceBefore.HeadSha
     status_sha256 = $repoEvidenceBefore.StatusSha256
     diff_sha256 = $repoEvidenceBefore.DiffSha256
-} | ConvertTo-Json -Compress | Set-Content -LiteralPath $launcherLockStage -Encoding UTF8
+} | ConvertTo-Json -Compress
+$launcherLockBytes = [Text.UTF8Encoding]::new($false).GetBytes($launcherLockJson)
+$launcherLockSha256 = Get-AstroByteSha256 $launcherLockBytes
+$launcherLockStage = "$launcherLock.claim.v2.pid-$PID.issue-$drivingIssue.ticks-$launcherProcessStartUtcTicks.sha256-$launcherLockSha256.$([Guid]::NewGuid().ToString('N'))"
+$launcherLockLeaseHandle = $null
+$launcherClaimMutex = Enter-AstroLauncherLockMutex $launcherLock
+if (-not $launcherClaimMutex.Acquired) {
+    Exit-AstroLauncherLockMutex $launcherClaimMutex
+    throw "LAUNCHER_BOUNDARY[ASTRO_LAUNCHER_LOCK_CLAIM_BUSY]: another process owns the machine-wide launcher-lock protocol mutex ($($launcherClaimMutex.Name)); retry after its bounded transition: $launcherLock"
+}
+if ($launcherClaimMutex.WasAbandoned) {
+    Write-Output "LAUNCHER_BOUNDARY[ASTRO_LAUNCHER_LOCK_MUTEX_ABANDONED]: recovered abandoned Global protocol mutex $($launcherClaimMutex.Name); active and transition bytes will be fully classified before claim"
+}
 try {
-    Move-Item -LiteralPath $launcherLockStage -Destination $launcherLock -ErrorAction Stop
+    Assert-AstroLauncherLockClaimable -LockPath $launcherLock
+    Write-NewDurableUtf8File -LiteralPath $launcherLockStage -Text $launcherLockJson
+    $stageReadback = Get-AstroFileSnapshot $launcherLockStage ([IO.FileShare]::Read)
+    if ($stageReadback.Length -ne $launcherLockBytes.Length -or
+        $stageReadback.Sha256 -cne $launcherLockSha256 -or
+        [Convert]::ToBase64String($stageReadback.Bytes) -cne
+            [Convert]::ToBase64String($launcherLockBytes)) {
+        throw "durable claim-transition readback differs from intended manifest bytes: $launcherLockStage"
+    }
+    Move-AstroFileWriteThroughNoReplace -Source $launcherLockStage -Destination $launcherLock
+    $launcherLockLeaseHandle = Open-AstroLauncherLockLease $launcherLock
+    $published = $launcherLockLeaseHandle.State
+    if ($launcherLockLeaseHandle.Length -ne $launcherLockBytes.Length -or
+        $launcherLockLeaseHandle.Sha256 -cne $launcherLockSha256 -or
+        [Convert]::ToBase64String($launcherLockLeaseHandle.Bytes) -cne
+            [Convert]::ToBase64String($launcherLockBytes) -or
+        $published.State -ne 'held' -or
+        $published.OwnerPid -ne $PID -or
+        $published.Issue -ne $drivingIssue -or
+        $published.OwnerProcessStartUtcTicks -ne
+            $launcherProcessStartUtcTicks -or
+        $published.HeadSha -cne $repoEvidenceBefore.HeadSha -or
+        $published.StatusSha256 -cne $repoEvidenceBefore.StatusSha256 -or
+        $published.DiffSha256 -cne $repoEvidenceBefore.DiffSha256) {
+        throw "published launcher lock failed exact byte/owner/fingerprint readback: $launcherLock"
+    }
+    Write-Output "LAUNCHER_LOCK[ASTRO_LAUNCHER_LOCK_PUBLISHED]: path=$launcherLock sha256=$launcherLockSha256 pid=$PID owner_process_start_utc_ticks=$launcherProcessStartUtcTicks issue=#$drivingIssue mutex=$($launcherClaimMutex.Name); immutable no-write/no-delete handle retained"
 }
 catch {
-    Remove-Item -LiteralPath $launcherLockStage -Force -ErrorAction SilentlyContinue
-    throw "LAUNCHER_BOUNDARY[ASTRO_LAUNCHER_LOCK_RACE]: another launcher session claimed this workspace between the lock check and the atomic claim; never stop or clean a live session's run - wait for the lock to release: $launcherLock"
+    if ($null -ne $launcherLockLeaseHandle) {
+        $launcherLockLeaseHandle.Stream.Dispose()
+        $launcherLockLeaseHandle = $null
+    }
+    $transitions = Get-AstroLauncherLockTransitions $launcherLock
+    throw "LAUNCHER_BOUNDARY[ASTRO_LAUNCHER_LOCK_CLAIM_FAILED]: claim failed before any target/temp/config/toolchain mutation; active/transition state was preserved for explicit tracker recovery (transitions=$(@($transitions.Paths) -join '; ')): $($_.Exception.Message)"
+}
+finally {
+    Exit-AstroLauncherLockMutex $launcherClaimMutex
 }
 
-# #226: pinned tools always live in the canonical workspace so worktree sessions
-# reuse one bootstrapped bundle instead of re-downloading per worktree. These are pure path
-# derivations; the mutating installs run below, inside the lock-guarded try/finally.
-$mingwRoot = Join-Path $toolsRoot $ToolchainDirectoryName
-$mingwBin = Join-Path $mingwRoot "bin"
-$llvmRoot = Join-Path $toolsRoot $LlvmDirectoryName
-$llvmBin = Join-Path $llvmRoot "bin"
-$cppcheckRoot = Join-Path $toolsRoot $CppcheckDirectoryName
-$ripgrepRoot = Join-Path $toolsRoot $RipgrepDirectoryName
-$sccacheRoot = Join-Path $toolsRoot $SccacheDirectoryName
-$sccacheExe = Join-Path $sccacheRoot "sccache.exe"
-# #190: workspace-local compiler cache, sibling of .toolchains/.tmp. It survives the
-# target/ wipe (the finally block deletes target/ and the workspace temp, never this).
-# #226: the cache is canonical-workspace-shared so worktree sessions hit the same
-# warm content-addressed cache; sccache's disk cache is safe under concurrency.
-$sccacheDir = Join-Path $ExpectedWorkspace ".sccache"
-$gitRoot = $GitInstallRoot
-$gitBin = Join-Path $gitRoot "bin"
-$gitUsrBin = Join-Path $gitRoot "usr\bin"
-
-# #239: cleanup-tracking state, initialised BEFORE the lock-guarded try so the finally can
-# always reference it even if the very first provisioning step below faults. $commandExit
-# stays $null until the child reports an exit code -- "the child never ran" and "the child
-# exited 0" are different facts and must not collapse.
-$commandExit = $null
-$launcherFault = $null
-$cleanupErrors = @()
-$treeRecorder = $null
-# #588/#589: guards the finally's sccache stat/stop block. Set true only once THIS run begins
-# managing the daemon on this root's port, so an environment-probe (empty $Command) or a fault
-# before that point never makes the finally touch sccache.
-$sccacheDaemonStarted = $false
-$attributionManifest = Join-Path $workspaceTempParent "no-escape-attribution-$PID.json"
-$previousTempEnvironment = @{}
-foreach ($name in @("TEMP", "TMP", "TMPDIR", "GIT_CEILING_DIRECTORIES", "ASTRO_NO_ESCAPE_ATTRIBUTION")) {
-    $previousTempEnvironment[$name] = Get-Item -Path "Env:$name" -ErrorAction SilentlyContinue
-}
-# #588: the session lock is now HELD (claimed atomically above). Everything that MUTATES the
-# toolchains -- CUDA-runtime provisioning, pinned-tool installs, the make alias -- runs from
-# here, under the lock, inside this single try/finally. #589: every post-claim validation
-# (argument JSON parse, Cargo target-dir refusal) also runs here, so no fault after the claim
-# can strand the lock: the finally removes the lock, the per-run TEMP, and every owned Cargo
-# target root on success, child failure, and launcher fault alike.
+# The session lock is now durably published, strictly read back, and physically immutable.
+# Every workspace/config/toolchain mutation is inside this try/finally.
 try {
+    # #280: a warm target is permitted only inside an explicitly owned contiguous batch.
+    if ((Test-Path -LiteralPath $target) -and
+        ($env:ASTROLABE_CONTIGUOUS_BATCH -ne "1")) {
+        throw "target must be absent before toolchain work: $target"
+    }
+    if (($env:ASTROLABE_CONTIGUOUS_BATCH -eq "1") -and
+        (Test-Path -LiteralPath $target)) {
+        Write-Output "TARGET[ASTRO_BATCH_WARM]: ASTROLABE_CONTIGUOUS_BATCH=1 -> reusing warm target/ from this session's batch"
+    }
+    # Nested target reclamation is now owner-attributed: the complete immutable lease exists
+    # before a single directory is removed.
+    if ($env:ASTROLABE_CONTIGUOUS_BATCH -ne "1") {
+        $rootTargetFull = [IO.Path]::GetFullPath($target)
+        foreach ($ownedTarget in $ownedTargetRoots) {
+            if ([string]::Equals(
+                    $ownedTarget,
+                    $rootTargetFull,
+                    [StringComparison]::OrdinalIgnoreCase
+                )) {
+                continue
+            }
+            if (Test-Path -LiteralPath $ownedTarget) {
+                Remove-TreeResilient -Path $ownedTarget
+                if (Test-Path -LiteralPath $ownedTarget) {
+                    throw "nested Cargo target could not be reclaimed under the published lease: $ownedTarget"
+                }
+                Write-Output "TARGET[ASTRO_NESTED_TARGET_RECLAIMED]: reclaimed nested Cargo target under exact launcher ownership: $ownedTarget"
+            }
+        }
+    }
+
+    # These ancillary helpers use conservative PID-occupancy gates, not launcher-lock owner
+    # identity. They run only after the exact v2 launcher lease is held.
+    $attributionSweep = Clear-DeadAttributionManifests `
+        -Directory $workspaceTempParent `
+        -SelfPid $PID
+    if ($attributionSweep.Removed.Count -gt 0 -or
+        $attributionSweep.Kept.Count -gt 0) {
+        Write-Output "NO_ESCAPE[ASTRO_ATTRIBUTION_SWEEP]: removed $($attributionSweep.Removed.Count) absent-PID attribution manifest(s); preserved $($attributionSweep.Kept.Count) occupied/unevaluable PID manifest(s)"
+    }
+    $tempSweep = Clear-DeadLauncherTempDirs `
+        -Directory $workspaceTempParent `
+        -SelfPid $PID
+    if ($tempSweep.Removed.Count -gt 0 -or $tempSweep.Kept.Count -gt 0) {
+        Write-Output "CLEANUP[ASTRO_LAUNCHER_TEMP_SWEEP]: reaped $($tempSweep.Removed.Count) absent-owner TEMP child dir(s); preserved $($tempSweep.Kept.Count) occupied/unevaluable owner dir(s)"
+    }
+
+    if ($isCanonicalRoot) {
+        # core.hooksPath is shared repo config. It may be written only while the canonical
+        # exact lease is already published and immutable.
+        $hooksProbe = Invoke-NativeCapture `
+            -Exe $evidenceGitExe `
+            -Arguments @("-C", $root, "config", "core.hooksPath")
+        $hooksCurrent = (@($hooksProbe.Output) -join "`n").Trim()
+        if ($hooksProbe.ExitCode -eq 0 -and
+            -not [string]::IsNullOrWhiteSpace($hooksCurrent) -and
+            $hooksCurrent -ne "scripts/githooks") {
+            throw "GIT_FREEZE[ASTRO_GIT_FREEZE_HOOKS_CONFLICT]: {code=ASTRO_GIT_FREEZE_HOOKS_CONFLICT; message=`"core.hooksPath is already set to '$hooksCurrent'; expected scripts/githooks`"; remediation=`"reconcile the existing hook path, then rerun`"}"
+        }
+        if ($hooksCurrent -ne "scripts/githooks") {
+            $hooksSet = Invoke-NativeCapture `
+                -Exe $evidenceGitExe `
+                -Arguments @("-C", $root, "config", "core.hooksPath", "scripts/githooks")
+            if ($hooksSet.ExitCode -ne 0) {
+                throw "GIT_FREEZE[ASTRO_GIT_FREEZE_HOOKS_UNINSTALLED]: {code=ASTRO_GIT_FREEZE_HOOKS_UNINSTALLED; message=`"could not install hooks (git exit=$($hooksSet.ExitCode): $(@($hooksSet.Output) -join ' | '))`"; remediation=`"repair repository config write access, then rerun`"}"
+            }
+            Write-Output "GIT_FREEZE[ASTRO_GIT_FREEZE_HOOKS]: installed core.hooksPath=scripts/githooks under the exact launcher lease"
+        }
+    }
+
     # #588: CUDA-runtime provisioning MUTATES the pinned toolchains (it downloads/extracts into
     # .toolchains/.installing-ort-cuda13-* before publishing the immutable content-addressed
     # root), so it runs here, under the held lock -- not before the claim as it once did. A
@@ -2667,10 +2800,25 @@ finally {
         $cleanupErrors += "workspace temporary cleanup failed: $workspaceTemp remains"
     }
     try {
-        Remove-LauncherLockFile -LockPath $launcherLock
+        Remove-LauncherLockFile `
+            -LockPath $launcherLock `
+            -ExpectedPid $PID `
+            -ExpectedIssue $drivingIssue `
+            -ExpectedOwnerProcessStartUtcTicks $launcherProcessStartUtcTicks `
+            -ExpectedSha256 $launcherLockSha256 `
+            -LeaseHandle $launcherLockLeaseHandle
     }
     catch {
         $cleanupErrors += "launcher lock cleanup failed: $($_.Exception.Message)"
+        if ($null -ne $launcherLockLeaseHandle -and
+            $null -ne $launcherLockLeaseHandle.Stream) {
+            try {
+                $launcherLockLeaseHandle.Stream.Dispose()
+            }
+            catch {
+                $cleanupErrors += "immutable launcher-lock handle disposal failed: $($_.Exception.Message)"
+            }
+        }
     }
     if (-not $workspaceTempParentExisted -and (Test-Path -LiteralPath $workspaceTempParent)) {
         try {

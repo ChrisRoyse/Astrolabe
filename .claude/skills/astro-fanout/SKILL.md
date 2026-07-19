@@ -24,7 +24,7 @@ Proven pattern (Wave-1: 17 issues closed, 6 agents, 0 errors; see #65 history). 
 
 ## Orchestrator sequence
 
-1. Preflight — check `.tmp/astrolabe-launcher.lock` and live toolchain processes; never start a wave while another session's live-locked build owns the toolchain.
+1. Preflight — run the authoritative launcher-lock classifier, not a numeric-PID/raw-JSON inference. Only `absent` permits a new claim; `held` is read-only, and stale/PID-reused, unreadable, transition, or unevaluable state requires explicit tracker-bound recovery. Never start a wave while another exact live process identity owns the toolchain.
 2. Partition ready issues by crate; one worker per crate works its issues sequentially.
 3. On completion: octopus-merge the disjoint `sweep/*` branches; run ONE consolidated `cargo check --workspace` + clippy for buildability, then manual FSV of the merged behavior against a real corpus (no tests — owner directive 2026-07-14).
 4. **Server-pending consolidation:** merge all server-pending branches into one local tree, run ONE native build through the launcher from `C:/code/Astrolabe`, then manually exercise the real binary's changed surfaces against a real corpus with persisted readback; on that evidence, publish each branch and close the `Refs` issues. Before any `git reset --hard`, save an insurance patch of applied stash/edits (`git diff <file> > <scratchpad>/x.patch`).

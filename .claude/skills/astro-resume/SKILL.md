@@ -14,7 +14,7 @@ Recent commits:
 !`git log --oneline -8`
 
 Launcher lock:
-!`cat .tmp/astrolabe-launcher.lock 2>/dev/null || echo "(absent)"`
+!`powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File scripts/launcher-lock-status.ps1 -LockPath .tmp/astrolabe-launcher.lock 2>&1; echo "classifier_exit=$?"`
 
 target/:
 !`ls -d target 2>/dev/null || echo "(absent)"`
@@ -32,6 +32,6 @@ In-progress issues:
 
 - Never redo a checked DoD item — verify it (re-run its named FSV) and note the result.
 - Sole-agent repo: a prior `status:in-progress` claim never prevents continuation, **unless** the claim comment is newer than 48h and evidently from another live session.
-- Before any build, check `.tmp/astrolabe-launcher.lock` and live toolchain processes; a live lock or owned toolchain means read-only work.
+- Before any build, use the authoritative classifier. Exact v2 ownership is `(pid, owner_process_start_utc_ticks)`. Only `absent` permits a new claim; `held` means read-only, while stale/PID-reused, unreadable, transition, and unevaluable state require explicit tracker-bound recovery.
 - If the toolchain is occupied, pick non-colliding work: issue analysis, specs, docs, portable Python checks — never a competing build.
 - Then continue via astro-issue.

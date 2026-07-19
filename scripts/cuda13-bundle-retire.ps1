@@ -18,9 +18,9 @@
 
     SAFETY DOCTRINE (all fail-closed -- when in doubt, delete NOTHING):
       * Lock gate. Any launcher session lock (canonical `.tmp` + every registered worktree
-        `.claude\worktrees\*\.tmp`) that names a LIVE pid, or that cannot be read to schema,
-        blocks the entire pass. We never guess and never remove even a stale lock (that is
-        the launcher's Assert-AstroLauncherLockClaimable's job, not the retirer's).
+        `.claude\worktrees\*\.tmp`) blocks the entire pass until it is absent. We never guess
+        and never remove even a stale lock; a crashed launcher may have detached descendants
+        still using the shared toolchain, and #197 requires tracker-evidenced explicit reclaim.
       * Ownership proof. A candidate is retired only when its directory-name digest, its
         `bundle.lock.sha256` leaf content, and its `bundle.receipt.json` (schema of the
         receipt version family, matching lock_sha256) all agree on the same 64-hex digest.
@@ -69,15 +69,15 @@ function Get-AstroLiveCuda13LockBlockers {
         Enumerate launcher session locks that must block bundle retirement.
 
     .DESCRIPTION
-        Returns a blocker record { Path; State; OwnerPid } for every launcher session lock
-        under $WorkspaceRoot whose classified State is 'held' (a LIVE foreign session owns
-        the workspace) OR 'unreadable' (the lock cannot be validated to schema -- fail-closed,
-        never guessed). 'absent' and 'stale' locks are NOT blockers and are not returned.
+        Returns a blocker record for every present launcher protocol state under
+        $WorkspaceRoot. Held, stale/PID-reused, unreadable, unevaluable, and interrupted
+        transition states all block destructive retirement. Only authoritative 'absent'
+        is safe.
 
         Locks inspected: the canonical `<WorkspaceRoot>\.tmp\astrolabe-launcher.lock` and,
         for each direct child of `<WorkspaceRoot>\.claude\worktrees` that exists and is not a
-        reparse point, `<child>\.tmp\astrolabe-launcher.lock`. No recursion; reparse-point
-        worktree directories are skipped (never followed).
+        reparse point, `<child>\.tmp\astrolabe-launcher.lock`. No recursion; a reparse-point
+        or unevaluable worktree entry is itself a blocker and is never followed.
 
         This function is strictly read-only: it never mutates or removes any lock file.
 
@@ -92,23 +92,64 @@ function Get-AstroLiveCuda13LockBlockers {
     $lockPaths += (Join-Path (Join-Path $WorkspaceRoot '.tmp') 'astrolabe-launcher.lock')
 
     $worktreesParent = Join-Path (Join-Path $WorkspaceRoot '.claude') 'worktrees'
-    if (Test-Path -LiteralPath $worktreesParent -PathType Container) {
-        foreach ($child in Get-ChildItem -LiteralPath $worktreesParent -Force -Directory -ErrorAction SilentlyContinue) {
+    $worktreesState = Get-AstroPathEntryState $worktreesParent
+    if ($worktreesState.State -eq 'present' -and
+        ($worktreesState.Attributes -band [IO.FileAttributes]::Directory) -ne 0 -and
+        ($worktreesState.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0) {
+        try {
+            $worktreeChildren = @(
+                Get-ChildItem `
+                    -LiteralPath $worktreesParent `
+                    -Force `
+                    -Directory `
+                    -ErrorAction Stop
+            )
+        }
+        catch {
+            $blockers += [pscustomobject]@{
+                Path = $worktreesParent
+                State = 'unevaluable'
+                OwnerPid = $null
+                Detail = $_.Exception.Message
+            }
+            $worktreeChildren = @()
+        }
+        foreach ($child in $worktreeChildren) {
             if (($child.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
-                # Never follow a reparse-point worktree directory.
+                $blockers += [pscustomobject]@{
+                    Path = $child.FullName
+                    State = 'unevaluable'
+                    OwnerPid = $null
+                    Detail = 'registered worktree root is a reparse point'
+                }
                 continue
             }
             $lockPaths += (Join-Path (Join-Path $child.FullName '.tmp') 'astrolabe-launcher.lock')
         }
     }
+    elseif ($worktreesState.State -ne 'absent') {
+        $blockers += [pscustomobject]@{
+            Path = $worktreesParent
+            State = 'unevaluable'
+            OwnerPid = $null
+            Detail = "worktree-parent state=$($worktreesState.State) attributes=$($worktreesState.Attributes) error=$($worktreesState.Error)"
+        }
+    }
 
     foreach ($lockPath in $lockPaths) {
         $lock = Read-AstroLauncherLock -LockPath $lockPath
-        if ($lock.State -eq 'held' -or $lock.State -eq 'unreadable') {
+        if ($lock.State -ne 'absent') {
             $blockers += [pscustomobject]@{
                 Path     = $lockPath
                 State    = $lock.State
                 OwnerPid = $lock.OwnerPid
+                Detail   = if ($lock.ReadError) {
+                    $lock.ReadError
+                } elseif ($lock.ValidationError) {
+                    $lock.ValidationError
+                } else {
+                    $lock.ProbeError
+                }
             }
         }
     }
@@ -296,7 +337,7 @@ function Remove-AstroObsoleteCudaRuntimeRoots {
         return
     }
 
-    # --- Lock gate (fail-closed: nothing deleted while any lock is live or unreadable) ------
+    # --- Lock gate (fail-closed: every non-absent protocol/root state blocks) ----------------
     $blockers = @(Get-AstroLiveCuda13LockBlockers -WorkspaceRoot $WorkspaceRoot)
     if ($blockers.Count -gt 0) {
         foreach ($blocker in $blockers) {
@@ -304,7 +345,7 @@ function Remove-AstroObsoleteCudaRuntimeRoots {
                 Write-RetireDiag 'ASTRO_CUDA13_RETIRE_BLOCKED_LIVE_LOCK' "state=held pid=$($blocker.OwnerPid) lock=$($blocker.Path)"
             }
             else {
-                Write-RetireDiag 'ASTRO_CUDA13_RETIRE_BLOCKED_UNREADABLE_LOCK' "state=unreadable lock=$($blocker.Path)"
+                Write-RetireDiag 'ASTRO_CUDA13_RETIRE_BLOCKED_LOCK_STATE' "state=$($blocker.State) lock=$($blocker.Path) detail=$($blocker.Detail)"
             }
         }
         Write-RetireDiag 'ASTRO_CUDA13_RETIRE_SUMMARY' "candidates=0 retired=0 skipped_unowned=0 skipped_reparse=0 faults=0 (blocked by launcher lock)"
