@@ -18,18 +18,18 @@
 //!
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{CStr, c_char};
-use std::path::PathBuf;
 use std::ptr;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use calyx_core::{CalyxError, Result};
 use ort::session::Session;
 use ort::{AsPointer, Error as OrtError};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
-use super::placement_contract::CudaPlacementContract;
+use super::placement_contract::OptimizedGraphReceipt;
 
 pub(super) const GRAPH_ASSIGNMENT_CONFIG: &str = "session.record_ep_graph_assignment_info";
+pub(super) const API24_PARTITION_RECEIPT_SCHEMA: &str = "calyx.onnx.api24_partition_receipt.v2";
 
 // The crates.io ort-sys 2.0.0-rc.12 binding omitted
 // KernelInfo_GetOperatorSinceVersion from the API-24 OrtApi tail. That moved
@@ -52,28 +52,14 @@ const _: () = {
     );
 };
 
-/// A unique, writable profiling trace path for a session. ORT appends its own
-/// timestamp and `.json` suffix and returns the final path from `end_profiling`.
-pub(super) fn profiling_file_path(label: &str) -> PathBuf {
-    static SEQ: AtomicU64 = AtomicU64::new(0);
-    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
-    let slug: String = label
-        .chars()
-        .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '_' })
-        .collect();
-    std::env::temp_dir().join(format!(
-        "calyx_onnx_profile_{}_{}_{seq}",
-        std::process::id(),
-        slug
-    ))
-}
-
 /// Exact provider assignment read from one committed ORT session through API
 /// 24. ORT owns every returned subgraph and node for the borrowed session's
-/// lifetime; this receipt copies only provider names, operator names, and
-/// counts.
+/// lifetime. This is a pre-fusion partition receipt: its identities must never
+/// be relabeled as post-fusion optimized-graph identities.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct AssignedNode {
+    pub(super) subgraph_index: u64,
+    pub(super) node_index_in_subgraph: u64,
     pub(super) provider: String,
     pub(super) name: String,
     pub(super) domain: String,
@@ -90,15 +76,25 @@ impl AssignedNode {
     }
 
     pub(super) fn inventory_entry(&self) -> String {
-        format!("{}={}", self.name, self.qualified_operator())
+        format!(
+            "{}:{}:{}={}@{}",
+            self.subgraph_index,
+            self.node_index_in_subgraph,
+            self.name,
+            self.qualified_operator(),
+            self.provider
+        )
     }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct CommittedGraphAssignment {
+    pub(super) schema: &'static str,
+    pub(super) subgraph_count: u64,
     pub(super) total_nodes: u64,
     pub(super) cpu_nodes: u64,
     pub(super) cuda_nodes: u64,
+    pub(super) partition_sha256: String,
     pub(super) per_provider: String,
     pub(super) per_provider_operators: String,
     pub(super) per_provider_nodes: String,
@@ -116,6 +112,208 @@ pub(super) fn read_committed_graph_assignment(
         ),
         remediation: "preserve the exact model and pinned ONNX Runtime logs, repair the committed-session provider assignment readback, and retry in a new process",
     })
+}
+
+pub(super) fn validate_partition_receipt(
+    assignment: &CommittedGraphAssignment,
+    label: &str,
+    require_cuda: bool,
+) -> Result<()> {
+    let inventory_count = u64::try_from(assignment.nodes.len()).map_err(|_| CalyxError {
+        code: "CALYX_ONNX_API24_PARTITION_INVALID",
+        message: format!("API-24 partition inventory for {label} exceeds u64"),
+        remediation: "repair the exact API-24 reader before admitting the session",
+    })?;
+    let counted_cuda = u64::try_from(
+        assignment
+            .nodes
+            .iter()
+            .filter(|node| node.provider == "CUDAExecutionProvider")
+            .count(),
+    )
+    .map_err(|_| partition_invalid(label, "CUDA node count exceeds u64"))?;
+    let counted_cpu = u64::try_from(
+        assignment
+            .nodes
+            .iter()
+            .filter(|node| node.provider == "CPUExecutionProvider")
+            .count(),
+    )
+    .map_err(|_| partition_invalid(label, "CPU node count exceeds u64"))?;
+    if assignment.schema != API24_PARTITION_RECEIPT_SCHEMA
+        || assignment.subgraph_count == 0
+        || assignment.total_nodes == 0
+        || inventory_count != assignment.total_nodes
+    {
+        return Err(partition_invalid(
+            label,
+            format!(
+                "schema={} subgraphs={} total={} inventory={} providers={} assigned_operators={} assigned_nodes={} partition_sha256={}",
+                assignment.schema,
+                assignment.subgraph_count,
+                assignment.total_nodes,
+                inventory_count,
+                assignment.per_provider,
+                assignment.per_provider_operators,
+                assignment.per_provider_nodes,
+                assignment.partition_sha256
+            ),
+        ));
+    }
+    let unknown_nodes = assignment
+        .nodes
+        .iter()
+        .filter(|node| {
+            !matches!(
+                node.provider.as_str(),
+                "CUDAExecutionProvider" | "CPUExecutionProvider"
+            )
+        })
+        .map(AssignedNode::inventory_entry)
+        .collect::<Vec<_>>();
+    if !unknown_nodes.is_empty() {
+        return Err(CalyxError {
+            code: "CALYX_ONNX_PROVIDER_UNKNOWN",
+            message: format!(
+                "API-24 partition receipt for {label} contains unknown provider assignments: {}; providers={} assigned_operators={} partition_sha256={}",
+                unknown_nodes.join(","),
+                assignment.per_provider,
+                assignment.per_provider_operators,
+                assignment.partition_sha256
+            ),
+            remediation: "preserve the exact API-24 node inventory, commission only explicit CPU/CUDA provider placement, and retry in a new process",
+        });
+    }
+    if counted_cuda != assignment.cuda_nodes
+        || counted_cpu != assignment.cpu_nodes
+        || counted_cuda
+            .checked_add(counted_cpu)
+            .is_none_or(|count| count != assignment.total_nodes)
+    {
+        return Err(partition_invalid(
+            label,
+            format!(
+                "reported cuda={} cpu={} but exact inventory re-counted cuda={counted_cuda} cpu={counted_cpu}; total={} providers={} assigned_operators={} assigned_nodes={} partition_sha256={}",
+                assignment.cuda_nodes,
+                assignment.cpu_nodes,
+                assignment.total_nodes,
+                assignment.per_provider,
+                assignment.per_provider_operators,
+                assignment.per_provider_nodes,
+                assignment.partition_sha256
+            ),
+        ));
+    }
+    if require_cuda && assignment.cuda_nodes == 0 {
+        return Err(CalyxError {
+            code: "CALYX_ONNX_CUDA_COMPUTE_MISSING",
+            message: format!(
+                "CUDA-policy API-24 partition for {label} contains no CUDA compute: total={} cuda={} cpu={} providers={} assigned_operators={} assigned_nodes={} partition_sha256={}",
+                assignment.total_nodes,
+                assignment.cuda_nodes,
+                assignment.cpu_nodes,
+                assignment.per_provider,
+                assignment.per_provider_operators,
+                assignment.per_provider_nodes,
+                assignment.partition_sha256
+            ),
+            remediation: "commission a graph with real CUDAExecutionProvider content compute; never relabel an all-CPU graph as CUDA or retry through CPU fallback",
+        });
+    }
+    if !require_cuda && assignment.cpu_nodes != assignment.total_nodes {
+        return Err(CalyxError {
+            code: "CALYX_ONNX_EXPLICIT_CPU_COMPUTE_MISMATCH",
+            message: format!(
+                "explicit-CPU API-24 partition for {label} is not entirely CPU: total={} cuda={} cpu={} providers={} assigned_operators={} assigned_nodes={} partition_sha256={}",
+                assignment.total_nodes,
+                assignment.cuda_nodes,
+                assignment.cpu_nodes,
+                assignment.per_provider,
+                assignment.per_provider_operators,
+                assignment.per_provider_nodes,
+                assignment.partition_sha256
+            ),
+            remediation: "commission an explicit CPU-only session or use the fail-loud CUDA policy; never mix the two execution contracts",
+        });
+    }
+    let mut names = BTreeSet::new();
+    let mut expected_subgraph = 0u64;
+    let mut expected_node = 0u64;
+    for (position, node) in assignment.nodes.iter().enumerate() {
+        if node.subgraph_index != expected_subgraph
+            || node.node_index_in_subgraph != expected_node
+            || node.name.trim().is_empty()
+            || node.name.trim() != node.name
+            || !names.insert(node.name.as_str())
+            || node.operator.trim().is_empty()
+            || node.operator.trim() != node.operator
+            || node.domain.trim() != node.domain
+            || !matches!(
+                node.provider.as_str(),
+                "CUDAExecutionProvider" | "CPUExecutionProvider"
+            )
+        {
+            return Err(partition_invalid(
+                label,
+                format!(
+                    "noncanonical node at observed subgraph={} node={}: expected subgraph={expected_subgraph} node={expected_node}, provider={:?} name={:?} domain={:?} operator={:?}",
+                    node.subgraph_index,
+                    node.node_index_in_subgraph,
+                    node.provider,
+                    node.name,
+                    node.domain,
+                    node.operator
+                ),
+            ));
+        }
+        expected_node = expected_node
+            .checked_add(1)
+            .ok_or_else(|| partition_invalid(label, "node ordinal exceeds u64"))?;
+        let next = position
+            .checked_add(1)
+            .and_then(|position| assignment.nodes.get(position));
+        if next.is_some_and(|next| next.subgraph_index != node.subgraph_index) {
+            expected_subgraph = expected_subgraph
+                .checked_add(1)
+                .ok_or_else(|| partition_invalid(label, "subgraph ordinal exceeds u64"))?;
+            expected_node = 0;
+        }
+    }
+    if expected_subgraph
+        .checked_add(1)
+        .is_none_or(|count| count != assignment.subgraph_count)
+    {
+        return Err(partition_invalid(
+            label,
+            format!(
+                "observed subgraph ordinal terminates at {expected_subgraph}, receipt reports {} subgraphs",
+                assignment.subgraph_count
+            ),
+        ));
+    }
+    let expected_hash = hash_partition_receipt(assignment.subgraph_count, &assignment.nodes)
+        .map_err(|error| partition_invalid(label, error))?;
+    if expected_hash != assignment.partition_sha256 {
+        return Err(partition_invalid(
+            label,
+            format!(
+                "partition SHA-256 mismatch: expected {expected_hash}, observed {}",
+                assignment.partition_sha256
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn partition_invalid(label: &str, reason: impl ToString) -> CalyxError {
+    CalyxError {
+        code: "CALYX_ONNX_API24_PARTITION_INVALID",
+        message: format!(
+            "API-24 partition receipt for {label} is invalid: {}",
+            reason.to_string()
+        ),
+        remediation: "preserve the exact API-24 receipt, repair its canonical pre-fusion partition readback, and retry in a new process",
+    }
 }
 
 fn read_graph_assignment(
@@ -146,7 +344,7 @@ fn read_graph_assignment(
     let mut operators = BTreeMap::<String, BTreeSet<String>>::new();
     let mut assigned_nodes = Vec::new();
     let mut assigned_node_names = BTreeSet::new();
-    for &subgraph in subgraphs {
+    for (subgraph_index, &subgraph) in subgraphs.iter().enumerate() {
         if subgraph.is_null() {
             return Err(OrtError::new(
                 "Session_GetEpGraphAssignmentInfo returned a null subgraph",
@@ -195,7 +393,9 @@ fn read_graph_assignment(
                 )
             }
         };
-        for &node in nodes {
+        let subgraph_index = u64::try_from(subgraph_index)
+            .map_err(|_| OrtError::new("assigned ONNX subgraph index exceeds u64"))?;
+        for (node_index_in_subgraph, &node) in nodes.iter().enumerate() {
             if node.is_null() {
                 return Err(OrtError::new(
                     "EpAssignedSubgraph_GetNodes returned a null node",
@@ -233,6 +433,9 @@ fn read_graph_assignment(
                 .or_default()
                 .insert(qualified_operator);
             assigned_nodes.push(AssignedNode {
+                subgraph_index,
+                node_index_in_subgraph: u64::try_from(node_index_in_subgraph)
+                    .map_err(|_| OrtError::new("assigned ONNX node index exceeds u64"))?,
                 provider: provider.clone(),
                 name,
                 domain,
@@ -240,13 +443,7 @@ fn read_graph_assignment(
             });
         }
     }
-    assigned_nodes.sort_by(|left, right| {
-        left.name
-            .cmp(&right.name)
-            .then_with(|| left.provider.cmp(&right.provider))
-            .then_with(|| left.domain.cmp(&right.domain))
-            .then_with(|| left.operator.cmp(&right.operator))
-    });
+    assigned_nodes.sort_by_key(|node| (node.subgraph_index, node.node_index_in_subgraph));
 
     let checked_sum = |values: Vec<u64>, label: &'static str| {
         values.into_iter().try_fold(0u64, |sum, value| {
@@ -299,15 +496,50 @@ fn read_graph_assignment(
         .map(|(provider, nodes)| format!("{provider}:[{}]", nodes.join(",")))
         .collect::<Vec<_>>()
         .join(";");
+    let subgraph_count = u64::try_from(subgraph_count)
+        .map_err(|_| OrtError::new("assigned ONNX subgraph count exceeds u64"))?;
+    let partition_sha256 = hash_partition_receipt(subgraph_count, &assigned_nodes)?;
     Ok(CommittedGraphAssignment {
+        schema: API24_PARTITION_RECEIPT_SCHEMA,
+        subgraph_count,
         total_nodes,
         cpu_nodes,
         cuda_nodes,
+        partition_sha256,
         per_provider,
         per_provider_operators,
         per_provider_nodes,
         nodes: assigned_nodes,
     })
+}
+
+fn hash_partition_receipt(
+    subgraph_count: u64,
+    nodes: &[AssignedNode],
+) -> std::result::Result<String, OrtError> {
+    let mut hash = Sha256::new();
+    update_length_delimited_hash(&mut hash, API24_PARTITION_RECEIPT_SCHEMA.as_bytes())?;
+    update_length_delimited_hash(&mut hash, &subgraph_count.to_be_bytes())?;
+    for node in nodes {
+        update_length_delimited_hash(&mut hash, &node.subgraph_index.to_be_bytes())?;
+        update_length_delimited_hash(&mut hash, &node.node_index_in_subgraph.to_be_bytes())?;
+        update_length_delimited_hash(&mut hash, node.provider.as_bytes())?;
+        update_length_delimited_hash(&mut hash, node.name.as_bytes())?;
+        update_length_delimited_hash(&mut hash, node.domain.as_bytes())?;
+        update_length_delimited_hash(&mut hash, node.operator.as_bytes())?;
+    }
+    Ok(format!("{:x}", hash.finalize()))
+}
+
+fn update_length_delimited_hash(
+    hash: &mut Sha256,
+    part: &[u8],
+) -> std::result::Result<(), OrtError> {
+    let length = u64::try_from(part.len())
+        .map_err(|_| OrtError::new("API-24 partition receipt hash field exceeds u64 bytes"))?;
+    hash.update(length.to_be_bytes());
+    hash.update(part);
+    Ok(())
 }
 
 fn provider_name_is(provider: &str, expected: &str) -> bool {
@@ -354,6 +586,7 @@ fn status_result(status: ort::sys::OrtStatusPtr) -> std::result::Result<(), OrtE
 pub(super) struct ProfiledNode {
     pub(super) provider: String,
     pub(super) name: String,
+    pub(super) domain: String,
     pub(super) operator: String,
     pub(super) node_index: u64,
     pub(super) output_size: u64,
@@ -387,12 +620,13 @@ pub(super) struct ProfiledGraphExecution {
 }
 
 /// Parse the first real ORT profile without discarding identity, then
-/// reconcile every executed kernel one-to-one with the statically committed
-/// optimized-graph placement contract.
-pub(super) fn reconcile_profile_with_contract(
+/// reconcile every executed kernel one-to-one with the post-fusion optimized
+/// graph. Provider roles are not classified here; the placement classifier
+/// consumes this exact final-graph execution inventory in a separate phase.
+pub(super) fn reconcile_profile_with_optimized_graph(
     label: &str,
     trace_json: &str,
-    contract: &CudaPlacementContract,
+    optimized: &OptimizedGraphReceipt,
 ) -> Result<ProfiledGraphExecution> {
     let value: Value = serde_json::from_str(trace_json).map_err(|error| {
         profile_error(format!(
@@ -400,25 +634,39 @@ pub(super) fn reconcile_profile_with_contract(
         ))
     })?;
     let events = profile_events(&value)?;
-    let expected = contract
-        .cuda_compute_nodes
+    let expected = optimized
+        .nodes
         .iter()
-        .chain(&contract.cpu_metadata_nodes)
         .map(|node| (node.name.as_str(), node))
         .collect::<BTreeMap<_, _>>();
-    let expected_total = usize::try_from(contract.total_graph_nodes()).map_err(|_| {
+    let expected_total = usize::try_from(optimized.total_graph_nodes).map_err(|_| {
         profile_error(format!(
-            "placement contract {} total_graph_nodes={} exceeds usize",
-            contract.contract_sha256,
-            contract.total_graph_nodes()
+            "optimized graph {} total_graph_nodes={} exceeds usize",
+            optimized.optimized_graph_sha256, optimized.total_graph_nodes
         ))
     })?;
     if expected.len() != expected_total {
         return Err(profile_error(format!(
-            "placement contract {} has total_graph_nodes={} but {} unique node identities",
-            contract.contract_sha256,
-            contract.total_graph_nodes(),
+            "optimized graph {} has total_graph_nodes={} but {} unique node identities",
+            optimized.optimized_graph_sha256,
+            optimized.total_graph_nodes,
             expected.len()
+        )));
+    }
+
+    let execute_events = events
+        .iter()
+        .filter(|event| {
+            event.as_object().is_some_and(|event| {
+                event.get("cat").and_then(Value::as_str) == Some("Session")
+                    && event.get("name").and_then(Value::as_str)
+                        == Some("SequentialExecutor::Execute")
+            })
+        })
+        .count();
+    if execute_events != 1 {
+        return Err(profile_error(format!(
+            "first-inference profile for {label} contains {execute_events} SequentialExecutor::Execute events; exactly one real ORT Run is required for one-to-one final-graph placement proof"
         )));
     }
 
@@ -473,15 +721,20 @@ pub(super) fn reconcile_profile_with_contract(
         }
         if !profiled_names.insert(node_name.to_string()) {
             return Err(profile_error(format!(
-                "ONNX first-forward profile executes node {node_name:?} more than once; placement-classifier v1 requires one control-flow-free execution per committed node"
+                "ONNX first-forward profile executes node {node_name:?} more than once; the placement contract requires one control-flow-free execution per final graph node"
             )));
         }
         let operator = required_arg_string(args, "op_name", event_index)?;
         let provider = required_arg_string(args, "provider", event_index)?;
         if !matches!(provider, "CUDAExecutionProvider" | "CPUExecutionProvider") {
-            return Err(profile_error(format!(
-                "ONNX kernel event {event_index} node {node_name:?} uses unknown provider {provider:?}"
-            )));
+            return Err(CalyxError {
+                code: "CALYX_ONNX_PROVIDER_UNKNOWN",
+                message: format!(
+                    "first real profile for {label} has kernel event index={event_index} node={node_name:?} operator={operator:?} on unknown provider={provider:?}; optimized_graph_path={} optimized_graph_sha256={}",
+                    optimized.optimized_graph_path, optimized.optimized_graph_sha256
+                ),
+                remediation: "terminally discard the session, preserve the optimized graph and raw profile, and commission only exact CPUExecutionProvider/CUDAExecutionProvider placement",
+            });
         }
         if matches!(operator, "Memcpy" | "MemcpyFromHost" | "MemcpyToHost") {
             return Err(CalyxError {
@@ -519,61 +772,26 @@ pub(super) fn reconcile_profile_with_contract(
             )));
         }
 
-        let assigned = expected.get(node_name).ok_or_else(|| {
+        let graph_node = expected.get(node_name).ok_or_else(|| {
             profile_error(format!(
-                "ONNX first-forward profile contains uncommitted node {node_name:?} ({operator}) on {provider}"
+                "ONNX first-forward profile contains node {node_name:?} ({operator}) on {provider} that is absent from optimized graph {}",
+                optimized.optimized_graph_sha256
             ))
         })?;
-        if assigned.provider != provider || assigned.operator != operator {
+        if graph_node.operator != operator {
             return Err(CalyxError {
                 code: "CALYX_ONNX_FIRST_FORWARD_PLACEMENT_DRIFT",
                 message: format!(
-                    "profile node {node_name:?} executed {operator} on {provider}, but committed API-24 assignment records {} on {}",
-                    assigned.operator, assigned.provider
+                    "profile node {node_name:?} executed operator {operator} on {provider}, but the post-fusion optimized graph records {}",
+                    graph_node.qualified_operator()
                 ),
-                remediation: "terminally discard the session, preserve assignment/optimized-graph/profile receipts, and repair execution-plan drift before retrying",
+                remediation: "terminally discard the session, preserve optimized-graph/profile bytes, and repair execution-plan drift before retrying",
             });
-        }
-        if provider == "CPUExecutionProvider" {
-            let proof = contract.cpu_metadata_proofs.get(node_name).ok_or_else(|| {
-                profile_error(format!(
-                    "CPU profile node {node_name:?} has no static metadata proof"
-                ))
-            })?;
-            if output_shapes.total_elements == 0
-                || output_shapes.total_elements > proof.max_output_elements
-                || output_shapes.dtypes != proof.output_dtypes
-            {
-                return Err(CalyxError {
-                    code: "CALYX_ONNX_CPU_METADATA_RUNTIME_BOUND_MISMATCH",
-                    message: format!(
-                        "CPU metadata node {node_name:?} runtime outputs elements={} dtypes={} exceed/differ from static max_elements={} dtypes={}",
-                        output_shapes.total_elements,
-                        output_shapes.dtypes,
-                        proof.max_output_elements,
-                        proof.output_dtypes
-                    ),
-                    remediation: "terminally discard the session and repair static metadata dataflow/type bounds before authorizing this graph",
-                });
-            }
-            if output_shapes
-                .dtype_names
-                .iter()
-                .any(|dtype| !is_runtime_metadata_dtype(dtype))
-            {
-                return Err(CalyxError {
-                    code: "CALYX_ONNX_CPU_METADATA_RUNTIME_TYPE_INVALID",
-                    message: format!(
-                        "CPU metadata node {node_name:?} produced non-integral/bool dtype(s) {}",
-                        output_shapes.dtypes
-                    ),
-                    remediation: "move substantive floating/content computation to CUDA and authorize only integral/bool shape metadata on CPU",
-                });
-            }
         }
         nodes.push(ProfiledNode {
             provider: provider.to_string(),
             name: node_name.to_string(),
+            domain: graph_node.domain.clone(),
             operator: operator.to_string(),
             node_index,
             output_size,
@@ -631,19 +849,14 @@ pub(super) fn reconcile_profile_with_contract(
         .ok_or_else(|| {
             profile_error("profile total node count exceeds the u64 evidence contract")
         })?;
-    if total_nodes != contract.total_graph_nodes()
-        || cuda_compute_nodes != contract.cuda_compute_node_count()
-        || cpu_metadata_nodes != contract.cpu_metadata_node_count()
-    {
+    if total_nodes != optimized.total_graph_nodes {
         return Err(CalyxError {
             code: "CALYX_ONNX_FIRST_FORWARD_COUNT_MISMATCH",
             message: format!(
-                "first real profile for {label} reports total={total_nodes} cuda_compute={cuda_compute_nodes} cpu_metadata={cpu_metadata_nodes}, committed contract reports total={} cuda_compute={} cpu_metadata={}",
-                contract.total_graph_nodes(),
-                contract.cuda_compute_node_count(),
-                contract.cpu_metadata_node_count()
+                "first real profile for {label} reports total={total_nodes} cuda_provider={cuda_compute_nodes} cpu_provider={cpu_metadata_nodes}, optimized graph reports total={}",
+                optimized.total_graph_nodes
             ),
-            remediation: "terminally discard the session and repair committed-versus-executed placement reconciliation",
+            remediation: "terminally discard the session and repair optimized-graph/profile reconciliation",
         });
     }
     let per_provider = if cpu_metadata_nodes == 0 {
@@ -672,7 +885,6 @@ struct ProfileTypeShapes {
     total_elements: u64,
     total_bytes: u64,
     dtypes: String,
-    dtype_names: BTreeSet<String>,
 }
 
 fn profile_events(value: &Value) -> Result<&[Value]> {
@@ -821,7 +1033,6 @@ fn parse_profile_type_shapes(
         total_elements,
         total_bytes,
         dtypes,
-        dtype_names,
     })
 }
 
@@ -833,17 +1044,10 @@ fn runtime_dtype_bits(dtype: &str) -> Option<u64> {
         "int32" | "uint32" | "float" => Some(32),
         "int64" | "uint64" | "double" | "complex64" => Some(64),
         "complex128" => Some(128),
-        "Float4E2M1" | "Int4x2" | "UInt4x2" => Some(4),
+        "Float4E2M1x2" | "Int4x2" | "UInt4x2" => Some(4),
         "Int2x4" | "UInt2x4" => Some(2),
         _ => None,
     }
-}
-
-fn is_runtime_metadata_dtype(dtype: &str) -> bool {
-    matches!(
-        dtype,
-        "bool" | "uint8" | "int8" | "uint16" | "int16" | "int32" | "int64" | "uint32" | "uint64"
-    )
 }
 
 fn profile_error(message: impl Into<String>) -> CalyxError {

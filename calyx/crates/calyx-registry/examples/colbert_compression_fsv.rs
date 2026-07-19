@@ -10,6 +10,8 @@
 mod edges;
 #[path = "colbert_compression_fsv/model.rs"]
 mod model;
+#[path = "colbert_compression_fsv/placement.rs"]
+mod placement;
 #[path = "colbert_compression_fsv/state.rs"]
 mod state;
 
@@ -22,6 +24,7 @@ use calyx_registry::{
     MultiVectorCompressionConfig, MultiVectorCompressionQuery, MultiVectorCompressionReport,
     MultiVectorStorageCodec, PackedMaxSimScratch,
 };
+use serde::Serialize;
 use serde_json::json;
 
 use model::{
@@ -42,16 +45,54 @@ enum Mode {
         root: PathBuf,
         search_iterations: u32,
     },
+    Probe {
+        kind: placement::ProbeKind,
+        model: PathBuf,
+        tokenizer: PathBuf,
+        config: PathBuf,
+        input_file: PathBuf,
+        expected_vector_sha256: String,
+        state_root: PathBuf,
+    },
+    ValidateAttestation {
+        kind: placement::ProbeKind,
+        path: PathBuf,
+    },
+}
+
+#[derive(Serialize)]
+struct StructuredOperatorError {
+    code: String,
+    message: String,
+    remediation: String,
+}
+
+fn structured_error(error: &(dyn Error + 'static)) -> StructuredOperatorError {
+    if let Some(error) = error.downcast_ref::<calyx_core::CalyxError>() {
+        StructuredOperatorError {
+            code: error.code.to_string(),
+            message: error.message.clone(),
+            remediation: error.remediation.to_string(),
+        }
+    } else {
+        StructuredOperatorError {
+            code: "CALYX_FSV_OPERATOR_FAILURE".to_string(),
+            message: error.to_string(),
+            remediation: "fix the exact reported argument, filesystem, model, format, or vault failure; no fallback path exists".to_string(),
+        }
+    }
 }
 
 fn main() {
     if let Err(error) = run() {
+        let structured = structured_error(error.as_ref());
         eprintln!(
             "{}",
             json!({
                 "event": "fsv_failure",
-                "error": error.to_string(),
-                "remediation": "fix the exact reported model, format, vault, or argument failure; no fallback path exists",
+                "code": structured.code,
+                "message": structured.message,
+                "remediation": structured.remediation,
             })
         );
         std::process::exit(1);
@@ -80,6 +121,24 @@ fn run() -> AnyResult<()> {
             root,
             search_iterations,
         } => read_fixture(&workspace, &root, search_iterations),
+        Mode::Probe {
+            kind,
+            model,
+            tokenizer,
+            config,
+            input_file,
+            expected_vector_sha256,
+            state_root,
+        } => placement::probe(
+            kind,
+            &model,
+            &tokenizer,
+            &config,
+            &input_file,
+            &expected_vector_sha256,
+            &state_root,
+        ),
+        Mode::ValidateAttestation { kind, path } => placement::validate_saved(kind, &path),
     }
 }
 
@@ -136,6 +195,7 @@ fn write_fixture(
     );
 
     let measured = measure_real_corpus(workspace, &vault, &registered)?;
+    emit_model_measurement_readback("write", root, &registered, &measured)?;
     let max_tokens = u32::try_from(
         *measured
             .token_counts
@@ -319,6 +379,7 @@ fn read_fixture(workspace: &Path, root: &Path, search_iterations: u32) -> AnyRes
     let registered = register_real_colbert(root)?;
     let vault = open_vault(root, false)?;
     let measured = measure_real_corpus(workspace, &vault, &registered)?;
+    emit_model_measurement_readback("read_existing", root, &registered, &measured)?;
     let state = read_state(&vault, &vault_dir, &registered.slot)?;
     require_live_state(&state, measured.rows.len())?;
     let index = registered
@@ -358,6 +419,125 @@ fn read_fixture(workspace: &Path, root: &Path, search_iterations: u32) -> AnyRes
             "mode": "read_existing",
             "state_digest": state.digest_sha256,
             "physical_digest": after_files.digest_sha256,
+        })
+    );
+    Ok(())
+}
+
+fn emit_model_measurement_readback(
+    mode: &str,
+    root: &Path,
+    registered: &Registered,
+    measured: &MeasuredCorpus,
+) -> AnyResult<()> {
+    let total_scalar_count =
+        measured
+            .finiteness_readbacks
+            .iter()
+            .try_fold(0_u64, |total, readback| {
+                require(
+                    readback.scalar_count == readback.finite_scalar_count
+                        && readback.non_finite_scalar_count == 0,
+                    format!(
+                        "real measurement finiteness readback is inconsistent for {}",
+                        readback.source_path
+                    ),
+                )?;
+                let total = total
+                    .checked_add(readback.scalar_count)
+                    .ok_or("aggregate real measurement scalar count overflow")?;
+                Ok::<u64, Box<dyn Error>>(total)
+            })?;
+    require(
+        measured.finiteness_readbacks.len() == 3,
+        format!(
+            "expected three real min/ordinary/max finiteness readbacks, observed {}",
+            measured.finiteness_readbacks.len()
+        ),
+    )?;
+    println!(
+        "{}",
+        json!({
+            "event": "real_vector_finiteness_readback",
+            "issues": [575, 605],
+            "mode": mode,
+            "fixture_root": root,
+            "lens_id": registered.slot.lens_id,
+            "measurement_count": measured.finiteness_readbacks.len(),
+            "total_scalar_count": total_scalar_count,
+            "all_components_finite": true,
+            "measurements": &measured.finiteness_readbacks,
+        })
+    );
+
+    let execution = &measured.cuda_execution_readback;
+    let evidence = &execution.structured_evidence;
+    require(
+        execution.total_compute_nodes > 0
+            && execution.cpu_compute_nodes == 0
+            && evidence.final_graph_placement.cuda_compute_nodes > 0
+            && evidence.final_graph_placement.cpu_metadata_nodes > 0
+            && evidence.final_graph_placement.unclassified_cpu_nodes == 0
+            && evidence.final_graph_placement.inter_provider_memcpy_nodes == 0
+            && evidence.first_inference_profile.total_graph_nodes
+                == evidence.final_graph_placement.total_graph_nodes
+            && evidence.first_inference_profile.cuda_compute_nodes
+                == evidence.final_graph_placement.cuda_compute_nodes
+            && evidence.first_inference_profile.cpu_metadata_nodes
+                == evidence.final_graph_placement.cpu_metadata_nodes
+            && evidence.first_inference_profile.unclassified_cpu_nodes == 0
+            && evidence.first_inference_profile.inter_provider_memcpy_nodes == 0,
+        format!("validated AnswerAI CUDA execution readback is incomplete: {execution:?}"),
+    )?;
+    println!(
+        "{}",
+        json!({
+            "event": "cuda_execution_attestation_readback",
+            "issue": 605,
+            "mode": mode,
+            "fixture_root": root,
+            "lens_id": registered.slot.lens_id,
+            "external_source_of_truth": {
+                "optimized_graph": {
+                    "path": &evidence.optimized_graph_path,
+                    "bytes": evidence.optimized_graph_bytes,
+                    "sha256": &evidence.optimized_graph_sha256,
+                },
+                "first_inference_profile": {
+                    "path": &evidence.profile_path,
+                    "bytes": evidence.profile_bytes,
+                    "sha256": &evidence.profile_sha256,
+                },
+            },
+            "receipt_hashes": {
+                "opset": &evidence.opset_sha256,
+                "api24_partition": &evidence.api24_partition_sha256,
+                "final_graph_placement": &evidence.final_graph_placement_sha256,
+                "cpu_metadata_proof": &evidence.cpu_metadata_proof_sha256,
+                "placement_contract": &evidence.placement_contract_sha256,
+            },
+            "placement_counts": {
+                "api24_partition": {
+                    "total": evidence.api24_partition.total_nodes,
+                    "cuda": evidence.api24_partition.cuda_nodes,
+                    "cpu": evidence.api24_partition.cpu_nodes,
+                },
+                "final_graph": {
+                    "total": evidence.final_graph_placement.total_graph_nodes,
+                    "cuda_compute": evidence.final_graph_placement.cuda_compute_nodes,
+                    "cpu_metadata": evidence.final_graph_placement.cpu_metadata_nodes,
+                    "unclassified_cpu": evidence.final_graph_placement.unclassified_cpu_nodes,
+                    "inter_provider_memcpy": evidence.final_graph_placement.inter_provider_memcpy_nodes,
+                },
+                "first_profile": {
+                    "total": evidence.first_inference_profile.total_graph_nodes,
+                    "cuda_compute": evidence.first_inference_profile.cuda_compute_nodes,
+                    "cpu_metadata": evidence.first_inference_profile.cpu_metadata_nodes,
+                    "unclassified_cpu": evidence.first_inference_profile.unclassified_cpu_nodes,
+                    "inter_provider_memcpy": evidence.first_inference_profile.inter_provider_memcpy_nodes,
+                },
+            },
+            "readback": execution,
         })
     );
     Ok(())
@@ -519,7 +699,35 @@ fn parse_mode(workspace: &Path) -> AnyResult<Mode> {
                 search_iterations: positive_u32(search_iterations, "search-iterations")?,
             })
         }
-        _ => Err("usage: colbert_compression_fsv --write <absolute-root> --max-score-error <finite-f32> --centroids <positive-u32> --kmeans-iterations <positive-u32> --search-iterations <positive-u32> | --read-existing <absolute-root> --search-iterations <positive-u32>".into()),
+        [
+            probe,
+            kind,
+            model,
+            tokenizer,
+            config,
+            input_file,
+            expected_vector_sha256,
+            state_root,
+        ]
+            if probe == "--probe-onnx" =>
+        {
+            Ok(Mode::Probe {
+                kind: placement::ProbeKind::parse(kind)?,
+                model: bounded_existing_file(workspace, Path::new(model), true)?,
+                tokenizer: bounded_existing_file(workspace, Path::new(tokenizer), true)?,
+                config: bounded_existing_file(workspace, Path::new(config), true)?,
+                input_file: bounded_existing_file(workspace, Path::new(input_file), false)?,
+                expected_vector_sha256: canonical_sha256(expected_vector_sha256)?,
+                state_root: bounded_root(workspace, Path::new(state_root))?,
+            })
+        }
+        [validate, probe, path] if validate == "--validate-attestation" => {
+            Ok(Mode::ValidateAttestation {
+                kind: placement::ProbeKind::parse(probe)?,
+                path: bounded_existing_file(workspace, Path::new(path), false)?,
+            })
+        }
+        _ => Err("usage: colbert_compression_fsv --write <absolute-root> --max-score-error <finite-f32> --centroids <positive-u32> --kmeans-iterations <positive-u32> --search-iterations <positive-u32> | --read-existing <absolute-root> --search-iterations <positive-u32> | --probe-onnx <custom-cuda-all|colbert-cuda-all|custom-cuda-metadata|colbert-cuda-metadata|custom-cpu|colbert-cpu> <model> <tokenizer> <config> <input-file> <expected-vector-sha256> <absolute-state-root> | --validate-attestation <custom-cuda-all|colbert-cuda-all|custom-cuda-metadata|colbert-cuda-metadata|custom-cpu|colbert-cpu> <attestation-json>".into()),
     }
 }
 
@@ -535,6 +743,42 @@ fn bounded_root(workspace: &Path, raw: &Path) -> AnyResult<PathBuf> {
         "FSV root must be directly below workspace .tmp",
     )?;
     Ok(parent.join(raw.file_name().ok_or("FSV root has no final component")?))
+}
+
+fn bounded_existing_file(
+    workspace: &Path,
+    raw: &Path,
+    require_scratch: bool,
+) -> AnyResult<PathBuf> {
+    require(raw.is_absolute(), "FSV input file must be absolute")?;
+    let canonical = raw.canonicalize()?;
+    require(canonical.is_file(), "FSV input must be a regular file")?;
+    let workspace = workspace.canonicalize()?;
+    let required_root = if require_scratch {
+        workspace.join(".tmp").canonicalize()?
+    } else {
+        workspace
+    };
+    require(
+        canonical.starts_with(&required_root),
+        if require_scratch {
+            "writable ONNX model artifacts must be below workspace .tmp"
+        } else {
+            "FSV input artifact must be inside the canonical workspace"
+        },
+    )?;
+    Ok(canonical)
+}
+
+fn canonical_sha256(raw: &str) -> AnyResult<String> {
+    require(
+        raw.len() == 64
+            && raw
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+        "expected-vector-sha256 must be 64 canonical lowercase hexadecimal characters",
+    )?;
+    Ok(raw.to_string())
 }
 
 fn positive_u32(raw: &str, label: &str) -> AnyResult<u32> {

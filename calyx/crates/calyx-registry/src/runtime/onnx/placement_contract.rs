@@ -4,14 +4,14 @@
 //! manipulation chains in CPU memory. That is not activation compute fallback,
 //! but provider counts or operator allowlists cannot prove the distinction:
 //! `Gather`, `Slice`, and arithmetic can process either metadata or content.
-//! This module therefore binds API-24 assignment records to the exact optimized
-//! graph and authorizes CPU work only when graph dataflow proves a closed,
-//! bounded, integral/bool metadata subgraph whose values can escape solely
-//! through schema-defined metadata inputs.
+//! This module therefore retains API-24 as an independently hashed pre-fusion
+//! partition receipt, binds the first exact execution profile to the post-fusion
+//! optimized graph, and authorizes CPU work only when graph dataflow proves a
+//! closed, operationally small integral/bool metadata subgraph whose values can
+//! escape solely through schema-defined metadata inputs.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::path::Path;
 
 use calyx_core::{CalyxError, Result};
 use onnx_rs::ast::{
@@ -19,12 +19,22 @@ use onnx_rs::ast::{
 };
 use sha2::{Digest, Sha256};
 
-use super::cpu_fallback_audit::{AssignedNode, CommittedGraphAssignment};
+use super::cpu_fallback_audit::{CommittedGraphAssignment, ProfiledGraphExecution};
 
-pub(super) const CUDA_PLACEMENT_CLASSIFIER_VERSION: &str = "calyx.onnx.cuda_shape_metadata.v1";
+pub(super) const CUDA_PLACEMENT_CLASSIFIER_VERSION: &str = "calyx.onnx.cuda_shape_metadata.v2";
 
 const CUDA_PROVIDER: &str = "CUDAExecutionProvider";
 const CPU_PROVIDER: &str = "CPUExecutionProvider";
+// The classifier is deliberately narrower than ORT. New ONNX opsets can
+// revise operator signatures and type constraints, so CPU placement remains
+// fail-closed until each newer schema is audited against this dataflow proof.
+const MAX_AUDITED_STANDARD_OPSET: i64 = 25;
+// CPU-resident shape work must be operationally small, not merely finite in a
+// u64 proof. These categorical ceilings bound both compute and allocation even
+// for an adversarial integral/bool graph.
+const MAX_CPU_METADATA_NODES: usize = 256;
+const MAX_CPU_METADATA_OUTPUT_ELEMENTS_PER_NODE: u64 = 4_096;
+const MAX_CPU_METADATA_OUTPUT_ELEMENTS_TOTAL: u64 = 65_536;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct CudaPlacementContract {
@@ -34,18 +44,78 @@ pub(super) struct CudaPlacementContract {
     pub(super) optimized_graph_path: String,
     pub(super) optimized_graph_bytes: u64,
     pub(super) optimized_graph_sha256: String,
-    pub(super) assignment_sha256: String,
+    pub(super) api24_partition_sha256: String,
+    pub(super) final_graph_placement_sha256: String,
     pub(super) cpu_metadata_proof_sha256: String,
+    pub(super) profile_sha256: String,
     pub(super) contract_sha256: String,
     pub(super) total_graph_nodes: u64,
     cuda_compute_node_count: u64,
     cpu_metadata_node_count: u64,
-    pub(super) cuda_compute_nodes: Vec<AssignedNode>,
-    pub(super) cpu_metadata_nodes: Vec<AssignedNode>,
+    pub(super) cuda_compute_nodes: Vec<FinalPlacedNode>,
+    pub(super) cpu_metadata_nodes: Vec<FinalPlacedNode>,
     pub(super) cpu_metadata_proofs: BTreeMap<String, CpuMetadataNodeProof>,
     pub(super) cuda_node_inventory: String,
     pub(super) cpu_metadata_node_inventory: String,
     pub(super) cpu_metadata_proof_inventory: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct OptimizedGraphNode {
+    pub(super) name: String,
+    pub(super) domain: String,
+    pub(super) operator: String,
+}
+
+impl OptimizedGraphNode {
+    pub(super) fn qualified_operator(&self) -> String {
+        if self.domain.is_empty() {
+            self.operator.clone()
+        } else {
+            format!("{}::{}", self.domain, self.operator)
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct OptimizedGraphReceipt {
+    pub(super) classifier_version: &'static str,
+    pub(super) opset_inventory: String,
+    pub(super) opset_sha256: String,
+    pub(super) optimized_graph_path: String,
+    pub(super) optimized_graph_bytes: u64,
+    pub(super) optimized_graph_sha256: String,
+    pub(super) final_graph_topology_sha256: String,
+    pub(super) total_graph_nodes: u64,
+    pub(super) nodes: Vec<OptimizedGraphNode>,
+    pub(super) node_inventory: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct FinalPlacedNode {
+    pub(super) provider: String,
+    pub(super) name: String,
+    pub(super) domain: String,
+    pub(super) operator: String,
+}
+
+impl FinalPlacedNode {
+    pub(super) fn qualified_operator(&self) -> String {
+        if self.domain.is_empty() {
+            self.operator.clone()
+        } else {
+            format!("{}::{}", self.domain, self.operator)
+        }
+    }
+
+    pub(super) fn inventory_entry(&self) -> String {
+        format!(
+            "{}={}@{}",
+            self.name,
+            self.qualified_operator(),
+            self.provider
+        )
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -74,51 +144,10 @@ struct MetadataTensor {
     max_elements: u64,
 }
 
-/// Unique path supplied to ORT before commit. ORT writes the final optimized
-/// ONNX graph exactly once; callers snapshot/hash it before publishing the
-/// session.
-pub(super) fn optimized_graph_file_path(label: &str) -> Result<PathBuf> {
-    static SEQ: AtomicU64 = AtomicU64::new(0);
-    let label_hash = format!("{:x}", Sha256::digest(label.as_bytes()));
-    loop {
-        let seq = SEQ
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-                current.checked_add(1)
-            })
-            .map_err(|_| {
-                placement_error(
-                    "CALYX_ONNX_OPTIMIZED_GRAPH_PATH_EXHAUSTED",
-                    "optimized-graph path sequence exhausted u64",
-                    "restart the process and preserve the path-allocation diagnostics",
-                )
-            })?;
-        let directory = std::env::temp_dir().join(format!(
-            "calyx_onnx_optimized_{}_{seq}_{}",
-            std::process::id(),
-            &label_hash[..16]
-        ));
-        match std::fs::create_dir(&directory) {
-            Ok(()) => return Ok(directory.join("optimized.onnx")),
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(error) => {
-                return Err(placement_error(
-                    "CALYX_ONNX_OPTIMIZED_GRAPH_DIRECTORY_CREATE",
-                    format!(
-                        "exclusive optimized-graph directory creation failed at {}: {error}",
-                        directory.display()
-                    ),
-                    "repair the process temporary-directory permissions and retry in a new process",
-                ));
-            }
-        }
-    }
-}
-
-pub(super) fn inspect_cuda_placement(
-    assignment: &CommittedGraphAssignment,
+pub(super) fn inspect_optimized_graph(
     optimized_graph_path: &Path,
     optimized_graph_bytes: &[u8],
-) -> Result<CudaPlacementContract> {
+) -> Result<OptimizedGraphReceipt> {
     if optimized_graph_bytes.is_empty() {
         return Err(placement_error(
             "CALYX_ONNX_OPTIMIZED_GRAPH_EMPTY",
@@ -129,66 +158,6 @@ pub(super) fn inspect_cuda_placement(
             "preserve the failed session and runtime logs, repair optimized-model serialization, and retry in a new process",
         ));
     }
-    if assignment.total_nodes == 0
-        || assignment.nodes.is_empty()
-        || assignment.total_nodes
-            != u64::try_from(assignment.nodes.len()).map_err(|_| {
-                placement_error(
-                    "CALYX_ONNX_GRAPH_ASSIGNMENT_COUNT_MISMATCH",
-                    "API-24 assigned-node inventory exceeds u64",
-                    "repair the exact graph-assignment reader before admitting any CUDA session",
-                )
-            })?
-    {
-        return Err(placement_error(
-            "CALYX_ONNX_GRAPH_ASSIGNMENT_COUNT_MISMATCH",
-            format!(
-                "API-24 assignment count total={} inventory={}",
-                assignment.total_nodes,
-                assignment.nodes.len()
-            ),
-            "preserve the assignment receipt and repair node-level API-24 readback before retrying",
-        ));
-    }
-    let counted_cpu = u64::try_from(
-        assignment
-            .nodes
-            .iter()
-            .filter(|node| node.provider == CPU_PROVIDER)
-            .count(),
-    )
-    .map_err(|_| {
-        placement_error(
-            "CALYX_ONNX_GRAPH_ASSIGNMENT_COUNT_OVERFLOW",
-            "CPU node inventory exceeds u64",
-            "repair the exact API-24 assignment reader before admitting the session",
-        )
-    })?;
-    let counted_cuda = u64::try_from(
-        assignment
-            .nodes
-            .iter()
-            .filter(|node| node.provider == CUDA_PROVIDER)
-            .count(),
-    )
-    .map_err(|_| {
-        placement_error(
-            "CALYX_ONNX_GRAPH_ASSIGNMENT_COUNT_OVERFLOW",
-            "CUDA node inventory exceeds u64",
-            "repair the exact API-24 assignment reader before admitting the session",
-        )
-    })?;
-    if assignment.cpu_nodes != counted_cpu || assignment.cuda_nodes != counted_cuda {
-        return Err(placement_error(
-            "CALYX_ONNX_GRAPH_ASSIGNMENT_COUNT_MISMATCH",
-            format!(
-                "API-24 provider counts report cuda={} cpu={}, exact node inventory reports cuda={counted_cuda} cpu={counted_cpu}",
-                assignment.cuda_nodes, assignment.cpu_nodes
-            ),
-            "preserve the exact API-24 receipt and repair provider-count reconciliation before retrying",
-        ));
-    }
-
     let model = onnx_rs::parse(optimized_graph_bytes).map_err(|error| {
         placement_error(
             "CALYX_ONNX_OPTIMIZED_GRAPH_PARSE",
@@ -210,7 +179,7 @@ pub(super) fn inspect_cuda_placement(
         ));
     }
     let opsets = canonical_opsets(&model)?;
-    let standard_opset = *opsets.get("").ok_or_else(|| {
+    let _standard_opset = *opsets.get("").ok_or_else(|| {
         placement_error(
             "CALYX_ONNX_STANDARD_OPSET_MISSING",
             "optimized ONNX model has no standard-domain opset import",
@@ -266,7 +235,7 @@ pub(super) fn inspect_cuda_placement(
     if nested_graphs {
         return Err(placement_error(
             "CALYX_ONNX_PLACEMENT_CONTROL_FLOW_UNPROVEN",
-            "optimized CUDA graph contains nested/control-flow graph scopes outside placement-classifier v1",
+            "optimized CUDA graph contains nested/control-flow graph scopes outside the current placement classifier",
             "commission a control-flow-free graph, or extend the classifier to prove every scoped branch, loop, assignment, and profile multiplicity before retrying",
         ));
     }
@@ -298,59 +267,6 @@ pub(super) fn inspect_cuda_placement(
         }
     }
 
-    let mut assigned_by_name = BTreeMap::<String, &AssignedNode>::new();
-    for assigned in &assignment.nodes {
-        if assigned.provider != CUDA_PROVIDER && assigned.provider != CPU_PROVIDER {
-            return Err(placement_error(
-                "CALYX_ONNX_UNKNOWN_EXECUTION_PROVIDER",
-                format!(
-                    "node {:?} is assigned to unsupported provider {:?}",
-                    assigned.name, assigned.provider
-                ),
-                "configure exactly CUDAExecutionProvider with ORT's implicit CPU metadata provider; unknown providers are never admitted",
-            ));
-        }
-        if assigned_by_name
-            .insert(assigned.name.clone(), assigned)
-            .is_some()
-        {
-            return Err(placement_error(
-                "CALYX_ONNX_GRAPH_ASSIGNMENT_DUPLICATE_NODE",
-                format!(
-                    "API-24 assignment contains duplicate node name {:?}",
-                    assigned.name
-                ),
-                "normalize the model to globally unique nonblank node names before commissioning",
-            ));
-        }
-        let graph_node = graph_nodes.get(&assigned.name).ok_or_else(|| {
-            placement_error(
-                "CALYX_ONNX_GRAPH_ASSIGNMENT_UNMAPPED_NODE",
-                format!(
-                    "API-24 assigned node {:?} ({}) is absent from optimized graph {}",
-                    assigned.name,
-                    assigned.qualified_operator(),
-                    optimized_graph_path.display()
-                ),
-                "preserve the assignment and optimized bytes, then repair the one-to-one node mapping before retrying",
-            )
-        })?;
-        if graph_node.op_type.as_str() != assigned.operator
-            || !domains_equivalent(graph_node.domain, &assigned.domain)
-        {
-            return Err(placement_error(
-                "CALYX_ONNX_GRAPH_ASSIGNMENT_OPERATOR_DRIFT",
-                format!(
-                    "assigned node {:?} reports {} but optimized graph reports {}",
-                    assigned.name,
-                    assigned.qualified_operator(),
-                    qualified_graph_operator(graph_node)
-                ),
-                "preserve both receipts and repair the assignment-to-optimized-graph mapping before retrying",
-            ));
-        }
-    }
-
     for (name, node) in &graph_nodes {
         if is_memcpy_operator(node.op_type.as_str()) {
             return Err(placement_error(
@@ -362,62 +278,235 @@ pub(super) fn inspect_cuda_placement(
                 "use a graph whose activation/weight compute stays on CUDA; CPU shape metadata must remain host metadata and introduce zero graph-internal Memcpy nodes",
             ));
         }
-        if !assigned_by_name.contains_key(name) {
-            return Err(placement_error(
-                "CALYX_ONNX_OPTIMIZED_GRAPH_UNASSIGNED_NODE",
-                format!(
-                    "optimized graph node {name:?} ({}) has no API-24 provider assignment",
-                    qualified_graph_operator(node)
-                ),
-                "repair assignment recording or normalize the optimized graph so every executable node maps one-to-one before admission",
-            ));
-        }
     }
-    if graph_nodes.len() != assigned_by_name.len() {
-        return Err(placement_error(
-            "CALYX_ONNX_GRAPH_ASSIGNMENT_COUNT_MISMATCH",
+    let mut nodes = graph_nodes
+        .values()
+        .map(|node| OptimizedGraphNode {
+            name: node.name.to_string(),
+            domain: canonical_domain(node.domain).to_string(),
+            operator: node.op_type.as_str().to_string(),
+        })
+        .collect::<Vec<_>>();
+    nodes.sort_by(|left, right| left.name.cmp(&right.name));
+    let node_inventory = nodes
+        .iter()
+        .map(|node| format!("{}={}", node.name, node.qualified_operator()))
+        .collect::<Vec<_>>()
+        .join(",");
+    let mut topology_parts = Vec::new();
+    for node in &nodes {
+        topology_parts.extend([
+            node.name.as_bytes(),
+            node.domain.as_bytes(),
+            node.operator.as_bytes(),
+        ]);
+    }
+    let final_graph_topology_sha256 = hash_length_delimited(&topology_parts)?;
+    let optimized_graph_sha256 = format!("{:x}", Sha256::digest(optimized_graph_bytes));
+    let optimized_graph_path = optimized_graph_path.to_str().ok_or_else(|| {
+        placement_error(
+            "CALYX_ONNX_OPTIMIZED_GRAPH_PATH_INVALID",
             format!(
-                "optimized graph has {} nodes but API-24 assignment has {}",
-                graph_nodes.len(),
-                assigned_by_name.len()
+                "optimized graph path {} is not valid UTF-8",
+                optimized_graph_path.display()
             ),
-            "preserve both inventories and repair their exact one-to-one mapping",
+            "use a canonical UTF-8 durable ONNX evidence directory and retry",
+        )
+    })?;
+    Ok(OptimizedGraphReceipt {
+        classifier_version: CUDA_PLACEMENT_CLASSIFIER_VERSION,
+        opset_inventory,
+        opset_sha256,
+        optimized_graph_path: optimized_graph_path.to_string(),
+        optimized_graph_bytes: u64::try_from(optimized_graph_bytes.len()).map_err(|_| {
+            placement_error(
+                "CALYX_ONNX_OPTIMIZED_GRAPH_SIZE_OVERFLOW",
+                "optimized graph byte length exceeds u64",
+                "commission an optimized graph within the native process address space",
+            )
+        })?,
+        optimized_graph_sha256,
+        final_graph_topology_sha256,
+        total_graph_nodes: u64::try_from(nodes.len()).map_err(|_| {
+            placement_error(
+                "CALYX_ONNX_OPTIMIZED_GRAPH_COUNT_OVERFLOW",
+                "optimized graph node inventory exceeds u64",
+                "commission an optimized graph within the native evidence contract",
+            )
+        })?,
+        nodes,
+        node_inventory,
+    })
+}
+
+/// Builds the authoritative placement contract only after one real,
+/// synchronized ORT run has produced a profile that maps one-to-one to the
+/// post-fusion optimized graph. API-24 remains an independently hashed
+/// pre-fusion partition receipt and is never joined by node name here.
+pub(super) fn classify_profiled_cuda_placement(
+    partition: &CommittedGraphAssignment,
+    optimized: &OptimizedGraphReceipt,
+    optimized_graph_bytes: &[u8],
+    profile: &ProfiledGraphExecution,
+    profile_sha256: &str,
+) -> Result<CudaPlacementContract> {
+    if !canonical_sha256(profile_sha256) || !canonical_sha256(&partition.partition_sha256) {
+        return Err(placement_error(
+            "CALYX_ONNX_PLACEMENT_HASH_INVALID",
+            format!(
+                "placement finalization requires canonical profile/API-24 hashes, observed profile={profile_sha256:?} api24={:?}",
+                partition.partition_sha256
+            ),
+            "preserve the raw receipts and repair exact SHA-256 generation before retrying",
+        ));
+    }
+    let path = Path::new(&optimized.optimized_graph_path);
+    let observed = inspect_optimized_graph(path, optimized_graph_bytes)?;
+    if observed != *optimized {
+        return Err(placement_error(
+            "CALYX_ONNX_OPTIMIZED_GRAPH_DRIFT",
+            format!(
+                "optimized graph changed before placement finalization: retained graph={} topology={}, observed graph={} topology={}",
+                optimized.optimized_graph_sha256,
+                optimized.final_graph_topology_sha256,
+                observed.optimized_graph_sha256,
+                observed.final_graph_topology_sha256
+            ),
+            "terminally discard the session, preserve both graph receipts, and repair evidence immutability before retrying",
+        ));
+    }
+    if profile.total_nodes != optimized.total_graph_nodes
+        || profile.nodes.len() != optimized.nodes.len()
+    {
+        return Err(placement_error(
+            "CALYX_ONNX_FIRST_FORWARD_COUNT_MISMATCH",
+            format!(
+                "profile reports total={} inventory={} but optimized graph reports total={} inventory={}",
+                profile.total_nodes,
+                profile.nodes.len(),
+                optimized.total_graph_nodes,
+                optimized.nodes.len()
+            ),
+            "terminally discard the session and repair final-graph/profile reconciliation",
         ));
     }
 
-    let mut cuda_nodes = Vec::new();
-    let mut cpu_nodes = Vec::new();
-    for node in &assignment.nodes {
-        match node.provider.as_str() {
-            CUDA_PROVIDER => cuda_nodes.push(node.clone()),
-            CPU_PROVIDER => cpu_nodes.push(node.clone()),
-            provider => {
+    let mut placed_nodes = profile
+        .nodes
+        .iter()
+        .map(|profiled| {
+            let graph = optimized
+                .nodes
+                .binary_search_by(|node| node.name.as_str().cmp(profiled.name.as_str()))
+                .ok()
+                .map(|index| &optimized.nodes[index])
+                .ok_or_else(|| {
+                    placement_error(
+                        "CALYX_ONNX_FIRST_FORWARD_NODE_SET_MISMATCH",
+                        format!(
+                            "profile node {:?} is absent from optimized graph {}",
+                            profiled.name, optimized.optimized_graph_sha256
+                        ),
+                        "terminally discard the session and preserve the exact graph/profile bytes",
+                    )
+                })?;
+            if graph.domain != profiled.domain || graph.operator != profiled.operator {
+                return Err(placement_error(
+                    "CALYX_ONNX_FIRST_FORWARD_PLACEMENT_DRIFT",
+                    format!(
+                        "profile node {:?} identity {}::{} differs from optimized graph {}",
+                        profiled.name,
+                        profiled.domain,
+                        profiled.operator,
+                        graph.qualified_operator()
+                    ),
+                    "terminally discard the session and repair final-graph/profile identity handling",
+                ));
+            }
+            if !matches!(
+                profiled.provider.as_str(),
+                CUDA_PROVIDER | CPU_PROVIDER
+            ) {
                 return Err(placement_error(
                     "CALYX_ONNX_UNKNOWN_EXECUTION_PROVIDER",
                     format!(
-                        "node {:?} changed to unsupported provider {provider:?} during categorical partitioning",
-                        node.name
+                        "profile node {:?} uses unsupported provider {:?}",
+                        profiled.name, profiled.provider
                     ),
-                    "preserve the assignment receipt and repair provider-identity handling before retrying",
+                    "configure exactly CUDAExecutionProvider plus ORT's implicit CPU shape-metadata provider",
                 ));
             }
+            Ok(FinalPlacedNode {
+                provider: profiled.provider.clone(),
+                name: profiled.name.clone(),
+                domain: profiled.domain.clone(),
+                operator: profiled.operator.clone(),
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    placed_nodes.sort_by(|left, right| left.name.cmp(&right.name));
+    let mut assigned_by_name = BTreeMap::new();
+    for node in &placed_nodes {
+        if assigned_by_name.insert(node.name.clone(), node).is_some() {
+            return Err(placement_error(
+                "CALYX_ONNX_OPTIMIZED_GRAPH_DUPLICATE_NODE",
+                format!("final profile repeats node {:?}", node.name),
+                "terminally discard the session and preserve the exact graph/profile bytes",
+            ));
         }
     }
+    let mut cuda_nodes = placed_nodes
+        .iter()
+        .filter(|node| node.provider == CUDA_PROVIDER)
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut cpu_nodes = placed_nodes
+        .iter()
+        .filter(|node| node.provider == CPU_PROVIDER)
+        .cloned()
+        .collect::<Vec<_>>();
     if cuda_nodes.is_empty() {
         return Err(placement_error(
             "CALYX_ONNX_CUDA_COMPUTE_MISSING",
             format!(
-                "optimized graph has no node assigned to {CUDA_PROVIDER}; providers={}",
-                assignment.per_provider
+                "post-fusion profile has no node on {CUDA_PROVIDER}; providers={}",
+                profile.per_provider
             ),
-            "select the explicit CPU policy only when CPU execution is intended and separately authorized; a CUDA session must execute real compute on CUDA",
+            "select explicit CPU only through its separately authorized constructor; a CUDA session must execute real final-graph compute on CUDA",
         ));
     }
+
+    let model = onnx_rs::parse(optimized_graph_bytes).map_err(|error| {
+        placement_error(
+            "CALYX_ONNX_OPTIMIZED_GRAPH_PARSE",
+            format!(
+                "reparse durable optimized graph {} during final placement failed: {error}",
+                optimized.optimized_graph_path
+            ),
+            "preserve the exact graph bytes and repair the ONNX parser before retrying",
+        )
+    })?;
+    let opsets = canonical_opsets(&model)?;
+    let standard_opset = *opsets.get("").ok_or_else(|| {
+        placement_error(
+            "CALYX_ONNX_STANDARD_OPSET_MISSING",
+            "optimized ONNX model has no standard-domain opset import",
+            "export a standards-conforming ONNX model",
+        )
+    })?;
+    let graph = model.graph.as_ref().ok_or_else(|| {
+        placement_error(
+            "CALYX_ONNX_OPTIMIZED_GRAPH_MISSING",
+            "durable optimized ONNX model has no main GraphProto",
+            "repair optimized-model serialization and retry",
+        )
+    })?;
     let cpu_metadata_proofs = if cpu_nodes.is_empty() {
         BTreeMap::new()
     } else {
         classify_cpu_metadata(graph, &assigned_by_name, &cpu_nodes, standard_opset)?
     };
+    validate_runtime_cpu_metadata(profile, &cpu_metadata_proofs)?;
 
     cuda_nodes.sort_by(|left, right| left.name.cmp(&right.name));
     cpu_nodes.sort_by(|left, right| left.name.cmp(&right.name));
@@ -433,6 +522,16 @@ pub(super) fn inspect_cuda_placement(
         })
         .collect::<Vec<_>>()
         .join(",");
+    let mut final_placement_parts = Vec::new();
+    for node in &placed_nodes {
+        final_placement_parts.extend([
+            node.provider.as_bytes(),
+            node.name.as_bytes(),
+            node.domain.as_bytes(),
+            node.operator.as_bytes(),
+        ]);
+    }
+    let final_graph_placement_sha256 = hash_length_delimited(&final_placement_parts)?;
     let mut cpu_proof_part_bytes = Vec::new();
     for (name, proof) in &cpu_metadata_proofs {
         cpu_proof_part_bytes.push(name.as_bytes().to_vec());
@@ -444,53 +543,42 @@ pub(super) fn inspect_cuda_placement(
         .map(Vec::as_slice)
         .collect::<Vec<_>>();
     let cpu_metadata_proof_sha256 = hash_length_delimited(&cpu_proof_parts)?;
-    let optimized_sha256 = format!("{:x}", Sha256::digest(optimized_graph_bytes));
-    let mut assignment_parts = Vec::new();
-    for node in &assignment.nodes {
-        assignment_parts.extend([
-            node.provider.as_bytes(),
-            node.name.as_bytes(),
-            node.domain.as_bytes(),
-            node.operator.as_bytes(),
-        ]);
-    }
-    let assignment_sha256 = hash_length_delimited(&assignment_parts)?;
     let contract_sha256 = hash_length_delimited(&[
         CUDA_PLACEMENT_CLASSIFIER_VERSION.as_bytes(),
-        opset_sha256.as_bytes(),
-        optimized_sha256.as_bytes(),
-        assignment_sha256.as_bytes(),
+        optimized.opset_sha256.as_bytes(),
+        optimized.optimized_graph_sha256.as_bytes(),
+        partition.partition_sha256.as_bytes(),
+        final_graph_placement_sha256.as_bytes(),
+        profile_sha256.as_bytes(),
         cpu_metadata_proof_sha256.as_bytes(),
     ])?;
-    let optimized_graph_path = optimized_graph_path.to_str().ok_or_else(|| {
-        placement_error(
-            "CALYX_ONNX_OPTIMIZED_GRAPH_PATH_INVALID",
-            format!(
-                "optimized graph path {} is not valid UTF-8",
-                optimized_graph_path.display()
-            ),
-            "use a canonical UTF-8 Windows temporary directory and retry",
-        )
-    })?;
     Ok(CudaPlacementContract {
         classifier_version: CUDA_PLACEMENT_CLASSIFIER_VERSION,
-        opset_inventory,
-        opset_sha256,
-        optimized_graph_path: optimized_graph_path.to_string(),
-        optimized_graph_bytes: u64::try_from(optimized_graph_bytes.len()).map_err(|_| {
+        opset_inventory: optimized.opset_inventory.clone(),
+        opset_sha256: optimized.opset_sha256.clone(),
+        optimized_graph_path: optimized.optimized_graph_path.clone(),
+        optimized_graph_bytes: optimized.optimized_graph_bytes,
+        optimized_graph_sha256: optimized.optimized_graph_sha256.clone(),
+        api24_partition_sha256: partition.partition_sha256.clone(),
+        final_graph_placement_sha256,
+        cpu_metadata_proof_sha256,
+        profile_sha256: profile_sha256.to_string(),
+        contract_sha256,
+        total_graph_nodes: optimized.total_graph_nodes,
+        cuda_compute_node_count: u64::try_from(cuda_nodes.len()).map_err(|_| {
             placement_error(
-                "CALYX_ONNX_OPTIMIZED_GRAPH_SIZE_OVERFLOW",
-                "optimized graph byte length exceeds u64",
-                "commission an optimized graph within the native process address space",
+                "CALYX_ONNX_FINAL_PLACEMENT_COUNT_OVERFLOW",
+                "final CUDA node inventory exceeds u64",
+                "commission a graph within the native evidence contract",
             )
         })?,
-        optimized_graph_sha256: optimized_sha256,
-        assignment_sha256,
-        cpu_metadata_proof_sha256,
-        contract_sha256,
-        total_graph_nodes: assignment.total_nodes,
-        cuda_compute_node_count: assignment.cuda_nodes,
-        cpu_metadata_node_count: assignment.cpu_nodes,
+        cpu_metadata_node_count: u64::try_from(cpu_nodes.len()).map_err(|_| {
+            placement_error(
+                "CALYX_ONNX_FINAL_PLACEMENT_COUNT_OVERFLOW",
+                "final CPU metadata node inventory exceeds u64",
+                "commission a graph within the native evidence contract",
+            )
+        })?,
         cuda_compute_nodes: cuda_nodes,
         cpu_metadata_nodes: cpu_nodes,
         cpu_metadata_proofs,
@@ -498,6 +586,80 @@ pub(super) fn inspect_cuda_placement(
         cpu_metadata_node_inventory: cpu_inventory,
         cpu_metadata_proof_inventory: cpu_proof_inventory,
     })
+}
+
+fn validate_runtime_cpu_metadata(
+    profile: &ProfiledGraphExecution,
+    proofs: &BTreeMap<String, CpuMetadataNodeProof>,
+) -> Result<()> {
+    let profiled = profile
+        .nodes
+        .iter()
+        .map(|node| (node.name.as_str(), node))
+        .collect::<BTreeMap<_, _>>();
+    for (name, proof) in proofs {
+        let node = profiled.get(name.as_str()).ok_or_else(|| {
+            placement_error(
+                "CALYX_ONNX_CPU_METADATA_PROFILE_MISSING",
+                format!("CPU metadata proof for {name:?} has no first-profile node"),
+                "terminally discard the session and preserve graph/profile bytes",
+            )
+        })?;
+        if node.provider != CPU_PROVIDER
+            || node.output_elements == 0
+            || node.output_elements > proof.max_output_elements
+            || node.output_dtypes != proof.output_dtypes
+        {
+            return Err(placement_error(
+                "CALYX_ONNX_CPU_METADATA_RUNTIME_BOUND_MISMATCH",
+                format!(
+                    "CPU metadata node {name:?} runtime provider={} elements={} dtypes={} differs from static max_elements={} dtypes={}",
+                    node.provider,
+                    node.output_elements,
+                    node.output_dtypes,
+                    proof.max_output_elements,
+                    proof.output_dtypes
+                ),
+                "terminally discard the session and repair static metadata dataflow/type bounds",
+            ));
+        }
+        if !runtime_metadata_dtypes(&node.output_dtypes) {
+            return Err(placement_error(
+                "CALYX_ONNX_CPU_METADATA_RUNTIME_TYPE_INVALID",
+                format!(
+                    "CPU metadata node {name:?} produced non-integral/bool dtype set {}",
+                    node.output_dtypes
+                ),
+                "move substantive floating/content computation to CUDA and authorize only integral/bool shape metadata on CPU",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn runtime_metadata_dtypes(dtypes: &str) -> bool {
+    !dtypes.is_empty()
+        && dtypes.split(',').all(|dtype| {
+            matches!(
+                dtype,
+                "bool"
+                    | "uint8"
+                    | "int8"
+                    | "uint16"
+                    | "int16"
+                    | "int32"
+                    | "int64"
+                    | "uint32"
+                    | "uint64"
+            )
+        })
+}
+
+fn canonical_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 fn collect_graph_nodes<'a>(
@@ -637,10 +799,30 @@ fn reject_external_tensor(tensor: &TensorProto<'_>, location: &str) -> Result<()
 
 fn classify_cpu_metadata(
     graph: &Graph<'_>,
-    assigned_by_name: &BTreeMap<String, &AssignedNode>,
-    cpu_nodes: &[AssignedNode],
+    assigned_by_name: &BTreeMap<String, &FinalPlacedNode>,
+    cpu_nodes: &[FinalPlacedNode],
     standard_opset: i64,
 ) -> Result<BTreeMap<String, CpuMetadataNodeProof>> {
+    if standard_opset > MAX_AUDITED_STANDARD_OPSET {
+        return Err(placement_error(
+            "CALYX_ONNX_CPU_METADATA_OPSET_UNAUDITED",
+            format!(
+                "CPU shape-metadata classification received standard opset {standard_opset}, but classifier {} is audited only through opset {MAX_AUDITED_STANDARD_OPSET}",
+                CUDA_PLACEMENT_CLASSIFIER_VERSION
+            ),
+            "keep substantive execution on CUDA, or extend the classifier from the exact newer ONNX operator schemas and bump its version before admitting CPU metadata",
+        ));
+    }
+    if cpu_nodes.len() > MAX_CPU_METADATA_NODES {
+        return Err(placement_error(
+            "CALYX_ONNX_CPU_METADATA_NODE_BUDGET_EXCEEDED",
+            format!(
+                "optimized graph assigns {} nodes to CPU shape metadata, exceeding the categorical limit {MAX_CPU_METADATA_NODES}",
+                cpu_nodes.len()
+            ),
+            "simplify or constant-fold the shape subgraph; do not relabel a large CPU program as metadata",
+        ));
+    }
     let cpu_names = cpu_nodes
         .iter()
         .map(|node| node.name.as_str())
@@ -703,25 +885,35 @@ fn classify_cpu_metadata(
     let declared_ranks = declared_tensor_ranks(graph)?;
     let mut metadata = initializer_metadata(graph)?;
     let mut authorized = BTreeSet::<String>::new();
+    let mut propagated = BTreeSet::<String>::new();
+
+    if assigned_by_name.len() != graph.node.len()
+        || graph
+            .node
+            .iter()
+            .any(|node| !assigned_by_name.contains_key(node.name))
+    {
+        return Err(placement_error(
+            "CALYX_ONNX_OPTIMIZED_GRAPH_UNASSIGNED_NODE",
+            format!(
+                "final profile maps {} unique nodes but optimized graph contains {}",
+                assigned_by_name.len(),
+                graph.node.len()
+            ),
+            "terminally discard the session and repair final-graph/profile identity reconciliation",
+        ));
+    }
 
     let mut progress = true;
     while progress {
         progress = false;
-        for cpu in cpu_nodes {
-            if authorized.contains(&cpu.name) {
+        for node in &graph.node {
+            if propagated.contains(node.name) {
                 continue;
             }
-            let node = nodes_by_name.get(cpu.name.as_str()).ok_or_else(|| {
-                placement_error(
-                    "CALYX_ONNX_GRAPH_ASSIGNMENT_UNMAPPED_NODE",
-                    format!(
-                        "CPU-assigned node {:?} is absent from the main graph",
-                        cpu.name
-                    ),
-                    "preserve the graph and assignment inventories and repair their mapping",
-                )
-            })?;
-            let Some(outputs) = infer_metadata_outputs(node, &metadata, &declared_ranks)? else {
+            let Some(outputs) =
+                infer_metadata_outputs(node, &metadata, &declared_ranks, standard_opset)?
+            else {
                 continue;
             };
             if outputs.len() != node.output.len() {
@@ -743,7 +935,7 @@ fn classify_cpu_metadata(
                     return Err(placement_error(
                         "CALYX_ONNX_METADATA_TYPE_MISMATCH",
                         format!(
-                            "CPU metadata node {:?} output {name:?} inferred {:?} but optimized graph declares {:?}",
+                            "metadata-semantic node {:?} output {name:?} inferred {:?} but optimized graph declares {:?}",
                             node.name, inferred.dtype, declared
                         ),
                         "preserve the optimized graph and repair type inference before retrying",
@@ -751,7 +943,10 @@ fn classify_cpu_metadata(
                 }
                 metadata.insert(name, inferred);
             }
-            authorized.insert(cpu.name.clone());
+            propagated.insert(node.name.to_string());
+            if assigned_by_name[node.name].provider == CPU_PROVIDER {
+                authorized.insert(node.name.to_string());
+            }
             progress = true;
         }
     }
@@ -780,6 +975,7 @@ fn classify_cpu_metadata(
     }
 
     let mut proofs = BTreeMap::new();
+    let mut total_output_elements = 0u64;
     for cpu in cpu_nodes {
         let node = nodes_by_name[cpu.name.as_str()];
         let mut max_output_elements = 0u64;
@@ -884,6 +1080,34 @@ fn classify_cpu_metadata(
                 }
             }
         }
+        if max_output_elements > MAX_CPU_METADATA_OUTPUT_ELEMENTS_PER_NODE {
+            return Err(placement_error(
+                "CALYX_ONNX_CPU_METADATA_NODE_WORK_BUDGET_EXCEEDED",
+                format!(
+                    "CPU metadata node {:?} has aggregate static output bound {max_output_elements}, exceeding the per-node limit {MAX_CPU_METADATA_OUTPUT_ELEMENTS_PER_NODE}",
+                    node.name
+                ),
+                "simplify or constant-fold the shape subgraph so every CPU metadata node remains categorically small",
+            ));
+        }
+        total_output_elements = total_output_elements
+            .checked_add(max_output_elements)
+            .ok_or_else(|| {
+                placement_error(
+                    "CALYX_ONNX_CPU_METADATA_BOUND_OVERFLOW",
+                    "aggregate CPU metadata output work exceeds u64",
+                    "commission a bounded shape-metadata graph",
+                )
+            })?;
+        if total_output_elements > MAX_CPU_METADATA_OUTPUT_ELEMENTS_TOTAL {
+            return Err(placement_error(
+                "CALYX_ONNX_CPU_METADATA_TOTAL_WORK_BUDGET_EXCEEDED",
+                format!(
+                    "CPU metadata graph aggregate static output bound {total_output_elements} exceeds the categorical limit {MAX_CPU_METADATA_OUTPUT_ELEMENTS_TOTAL}"
+                ),
+                "simplify or constant-fold the shape subgraph; substantive or bulk integral work must not execute on CPU under the metadata contract",
+            ));
+        }
         proofs.insert(
             cpu.name.clone(),
             CpuMetadataNodeProof {
@@ -899,6 +1123,7 @@ fn infer_metadata_outputs(
     node: &Node<'_>,
     metadata: &BTreeMap<&str, MetadataTensor>,
     declared_ranks: &BTreeMap<&str, usize>,
+    standard_opset: i64,
 ) -> Result<Option<Vec<MetadataTensor>>> {
     let standard_domain = node.domain.is_empty() || node.domain == "ai.onnx";
     if !standard_domain {
@@ -906,6 +1131,12 @@ fn infer_metadata_outputs(
     }
     let output_count = node.output.len();
     if output_count == 0 {
+        return Ok(None);
+    }
+    let Some(minimum_opset) = metadata_operator_minimum_opset(&node.op_type) else {
+        return Ok(None);
+    };
+    if standard_opset < minimum_opset || !metadata_signature_matches_opset(node, standard_opset) {
         return Ok(None);
     }
     let checked_repeat = |fact: MetadataTensor| Ok(vec![fact; output_count]);
@@ -1159,9 +1390,143 @@ fn infer_metadata_outputs(
     }
 }
 
+fn metadata_operator_minimum_opset(operator: &OpType<'_>) -> Option<i64> {
+    match operator {
+        OpType::Shape
+        | OpType::Size
+        | OpType::Constant
+        | OpType::Identity
+        | OpType::Transpose
+        | OpType::Flatten
+        | OpType::Squeeze
+        | OpType::Unsqueeze
+        | OpType::Slice
+        | OpType::Gather
+        | OpType::Concat
+        | OpType::Split
+        | OpType::ReduceMax
+        | OpType::ReduceMin
+        | OpType::ReduceSum
+        | OpType::ReduceProd
+        | OpType::Not
+        | OpType::Cast => Some(1),
+        OpType::Reshape => Some(5),
+        OpType::Abs | OpType::Neg => Some(6),
+        OpType::Add
+        | OpType::Sub
+        | OpType::Mul
+        | OpType::Div
+        | OpType::Pow
+        | OpType::Equal
+        | OpType::Greater
+        | OpType::Less
+        | OpType::And
+        | OpType::Or
+        | OpType::Xor => Some(7),
+        OpType::Min | OpType::Max | OpType::Sum => Some(8),
+        OpType::Where => Some(9),
+        OpType::Mod => Some(10),
+        OpType::GatherElements | OpType::GatherND | OpType::BitShift => Some(11),
+        OpType::GreaterOrEqual | OpType::LessOrEqual => Some(12),
+        OpType::CastLike => Some(15),
+        OpType::BitwiseAnd | OpType::BitwiseOr | OpType::BitwiseXor | OpType::BitwiseNot => {
+            Some(18)
+        }
+        _ => None,
+    }
+}
+
+fn metadata_signature_matches_opset(node: &Node<'_>, standard_opset: i64) -> bool {
+    let inputs = node.input.len();
+    match node.op_type {
+        OpType::Shape
+        | OpType::Size
+        | OpType::Identity
+        | OpType::Transpose
+        | OpType::Flatten
+        | OpType::Abs
+        | OpType::Neg
+        | OpType::Not
+        | OpType::BitwiseNot
+        | OpType::Cast => inputs == 1,
+        OpType::Constant => node.input.iter().all(|input| input.is_empty()),
+        OpType::Reshape | OpType::CastLike => inputs == 2,
+        OpType::Squeeze => {
+            if standard_opset >= 13 {
+                (1..=2).contains(&inputs)
+            } else {
+                inputs == 1
+            }
+        }
+        OpType::Unsqueeze => {
+            if standard_opset >= 13 {
+                inputs == 2
+            } else {
+                inputs == 1
+            }
+        }
+        OpType::Slice => {
+            if standard_opset >= 10 {
+                (3..=5).contains(&inputs)
+            } else {
+                inputs == 1
+            }
+        }
+        OpType::Gather | OpType::GatherElements | OpType::GatherND | OpType::BitShift => {
+            inputs == 2
+        }
+        OpType::Concat | OpType::Min | OpType::Max | OpType::Sum => inputs >= 1,
+        OpType::Split => {
+            if standard_opset >= 13 {
+                (1..=2).contains(&inputs)
+            } else {
+                inputs == 1
+            }
+        }
+        OpType::Add
+        | OpType::Sub
+        | OpType::Mul
+        | OpType::Div
+        | OpType::Pow
+        | OpType::Mod
+        | OpType::BitwiseAnd
+        | OpType::BitwiseOr
+        | OpType::BitwiseXor
+        | OpType::Equal
+        | OpType::Greater
+        | OpType::GreaterOrEqual
+        | OpType::Less
+        | OpType::LessOrEqual
+        | OpType::And
+        | OpType::Or
+        | OpType::Xor => inputs == 2,
+        OpType::ReduceSum => {
+            if standard_opset >= 13 {
+                (1..=2).contains(&inputs)
+            } else {
+                inputs == 1
+            }
+        }
+        OpType::ReduceMax | OpType::ReduceMin | OpType::ReduceProd => {
+            if standard_opset >= 18 {
+                (1..=2).contains(&inputs)
+            } else {
+                inputs == 1
+            }
+        }
+        OpType::Where => inputs == 3,
+        _ => false,
+    }
+}
+
 fn initializer_metadata<'a>(graph: &'a Graph<'a>) -> Result<BTreeMap<&'a str, MetadataTensor>> {
     let mut metadata = BTreeMap::new();
     let mut initializer_names = BTreeSet::new();
+    let graph_inputs = graph
+        .input
+        .iter()
+        .map(|input| input.name)
+        .collect::<BTreeSet<_>>();
     for tensor in &graph.initializer {
         if tensor.name().trim().is_empty() || tensor.name().trim() != tensor.name() {
             return Err(placement_error(
@@ -1185,6 +1550,16 @@ fn initializer_metadata<'a>(graph: &'a Graph<'a>) -> Result<BTreeMap<&'a str, Me
         }
         if !is_metadata_dtype(tensor.data_type()) {
             continue;
+        }
+        if graph_inputs.contains(tensor.name()) {
+            return Err(placement_error(
+                "CALYX_ONNX_METADATA_INITIALIZER_OVERRIDABLE",
+                format!(
+                    "integral/bool initializer {:?} is also a graph input and can be overridden by a later Run",
+                    tensor.name()
+                ),
+                "export immutable shape constants as initializer-only values; runtime-overridable metadata cannot enter the static CPU authorization",
+            ));
         }
         let elements = tensor.dims().iter().try_fold(1u64, |product, dimension| {
             let dimension = u64::try_from(*dimension).map_err(|_| {
@@ -1571,8 +1946,9 @@ fn cuda_metadata_input(
         "Pad" if standard_opset >= 11 => input_index == 1,
         "Split" | "Squeeze" | "Unsqueeze" if standard_opset >= 13 => input_index == 1,
         "Trilu" if standard_opset >= 14 => input_index == 1,
-        "ReduceMax" | "ReduceMin" | "ReduceMean" | "ReduceSum" | "ReduceProd" | "ReduceL1"
-        | "ReduceL2" | "ReduceLogSum" | "ReduceLogSumExp" | "ReduceSumSquare"
+        "ReduceSum" if standard_opset >= 13 => input_index == 1,
+        "ReduceMax" | "ReduceMin" | "ReduceMean" | "ReduceProd" | "ReduceL1" | "ReduceL2"
+        | "ReduceLogSum" | "ReduceLogSumExp" | "ReduceSumSquare"
             if standard_opset >= 18 =>
         {
             input_index == 1
@@ -1636,12 +2012,7 @@ fn qualified_graph_operator(node: &Node<'_>) -> String {
     }
 }
 
-fn domains_equivalent(left: &str, right: &str) -> bool {
-    left == right
-        || ((left.is_empty() || left == "ai.onnx") && (right.is_empty() || right == "ai.onnx"))
-}
-
-fn node_inventory(nodes: &[AssignedNode]) -> String {
+fn node_inventory(nodes: &[FinalPlacedNode]) -> String {
     nodes
         .iter()
         .map(|node| node.inventory_entry())

@@ -150,9 +150,10 @@ pub use runtime::external_cmd::ExternalCmdLens;
 #[cfg(feature = "ml-runtime")]
 pub use runtime::onnx::{
     DEFAULT_ANSWERAI_COLBERT_MODEL, FastembedBgem3Lens, FastembedRerankerLens, FastembedSparseLens,
-    ONNX_COLBERT_RUNTIME_ID, ONNX_CUSTOM_RUNTIME_ID, ONNX_FASTEMBED_RUNTIME_ID,
-    OnnxColbertFileSpec, OnnxColbertLens, OnnxFileSpec, OnnxLens, OnnxModelFiles,
-    OnnxProviderPolicy, PoolingPolicy, validate_cuda_onnx_execution_attestation,
+    ONNX_COLBERT_RUNTIME_ID, ONNX_CUSTOM_RUNTIME_ID, ONNX_EXECUTION_EVIDENCE_STORE_DIRECTORY,
+    ONNX_FASTEMBED_RUNTIME_ID, OnnxColbertFileSpec, OnnxColbertLens, OnnxFileSpec, OnnxLens,
+    OnnxModelFiles, OnnxProviderPolicy, PoolingPolicy, validate_cpu_onnx_execution_attestation,
+    validate_cuda_onnx_execution_attestation,
 };
 #[cfg(all(feature = "ml-runtime", windows))]
 pub use runtime::onnx::{

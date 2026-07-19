@@ -44,6 +44,7 @@ pub struct FastembedSparseLens {
     contract: FrozenLensContract,
     files: OnnxModelFiles,
     provider_policy: OnnxProviderPolicy,
+    max_batch: Option<usize>,
     model: Option<Mutex<SparseTextEmbedding>>,
     execution: super::fastembed_attestation::FastembedExecutionState,
     bound_stream: Option<super::green_context::RetainedCudaStream>,
@@ -55,6 +56,7 @@ pub struct FastembedBgem3Lens {
     contract: FrozenLensContract,
     files: OnnxModelFiles,
     provider_policy: OnnxProviderPolicy,
+    max_batch: Option<usize>,
     model: Option<Mutex<Bgem3Embedding>>,
     execution: super::fastembed_attestation::FastembedExecutionState,
     bound_stream: Option<super::green_context::RetainedCudaStream>,
@@ -65,6 +67,7 @@ pub struct FastembedRerankerLens {
     contract: FrozenLensContract,
     files: OnnxModelFiles,
     provider_policy: OnnxProviderPolicy,
+    max_batch: Option<usize>,
     model: Option<Mutex<TextRerank>>,
     execution: super::fastembed_attestation::FastembedExecutionState,
     bound_stream: Option<super::green_context::RetainedCudaStream>,
@@ -105,6 +108,8 @@ impl FastembedSparseLens {
         expected_spec: Option<&LensSpec>,
     ) -> Result<Self> {
         let name = name.into();
+        let max_batch = expected_spec.and_then(|spec| spec.max_batch);
+        super::scoped_max_batch(max_batch)?;
         let info = SparseTextEmbedding::get_model_info(&model_name);
         let label = format!("onnx-fastembed-sparse:{}", info.model_code);
         let artifacts = super::fastembed_artifacts::FrozenFastembedArtifacts::snapshot(
@@ -184,6 +189,7 @@ impl FastembedSparseLens {
             contract,
             files,
             provider_policy,
+            max_batch,
             execution,
             model,
             bound_stream,
@@ -226,6 +232,7 @@ impl FastembedSparseLens {
         contract: FrozenLensContract,
         files: OnnxModelFiles,
         provider_policy: OnnxProviderPolicy,
+        max_batch: Option<usize>,
         execution: super::fastembed_attestation::FastembedExecutionState,
         model: SparseTextEmbedding,
         bound_stream: Option<super::green_context::GreenContextHandle>,
@@ -235,6 +242,7 @@ impl FastembedSparseLens {
             contract,
             files,
             provider_policy,
+            max_batch,
             model: Some(Mutex::new(model)),
             execution,
             bound_stream: super::green_context::retain_for_model(bound_stream),
@@ -292,6 +300,8 @@ impl FastembedBgem3Lens {
         expected_spec: Option<&LensSpec>,
     ) -> Result<Self> {
         let name = name.into();
+        let max_batch = expected_spec.and_then(|spec| spec.max_batch);
+        super::scoped_max_batch(max_batch)?;
         let info = Bgem3Embedding::get_model_info(&model_name);
         let label = format!(
             "onnx-fastembed-bgem3:{}:{}",
@@ -377,6 +387,7 @@ impl FastembedBgem3Lens {
             files,
             provider_policy,
             output,
+            max_batch,
             execution,
             model,
             bound_stream,
@@ -422,6 +433,7 @@ impl FastembedBgem3Lens {
         files: OnnxModelFiles,
         provider_policy: OnnxProviderPolicy,
         output: FastembedBgem3Output,
+        max_batch: Option<usize>,
         execution: super::fastembed_attestation::FastembedExecutionState,
         model: Bgem3Embedding,
         bound_stream: Option<super::green_context::GreenContextHandle>,
@@ -432,6 +444,7 @@ impl FastembedBgem3Lens {
             contract,
             files,
             provider_policy,
+            max_batch,
             model: Some(Mutex::new(model)),
             execution,
             bound_stream: super::green_context::retain_for_model(bound_stream),
@@ -490,6 +503,8 @@ impl FastembedRerankerLens {
         expected_spec: Option<&LensSpec>,
     ) -> Result<Self> {
         let name = name.into();
+        let max_batch = expected_spec.and_then(|spec| spec.max_batch);
+        super::scoped_max_batch(max_batch)?;
         let info = TextRerank::get_model_info(&model_name);
         let label = format!("onnx-fastembed-reranker:{}", info.model_code);
         let artifacts = super::fastembed_artifacts::FrozenFastembedArtifacts::snapshot(
@@ -568,6 +583,7 @@ impl FastembedRerankerLens {
             contract,
             files,
             provider_policy,
+            max_batch,
             execution,
             model,
             bound_stream,
@@ -612,6 +628,7 @@ impl FastembedRerankerLens {
         contract: FrozenLensContract,
         files: OnnxModelFiles,
         provider_policy: OnnxProviderPolicy,
+        max_batch: Option<usize>,
         execution: super::fastembed_attestation::FastembedExecutionState,
         model: TextRerank,
         bound_stream: Option<super::green_context::GreenContextHandle>,
@@ -621,6 +638,7 @@ impl FastembedRerankerLens {
             contract,
             files,
             provider_policy,
+            max_batch,
             model: Some(Mutex::new(model)),
             execution,
             bound_stream: super::green_context::retain_for_model(bound_stream),
@@ -667,8 +685,52 @@ impl Lens for FastembedSparseLens {
         let mut model = lock_model(&self.model, "sparse")
             .map_err(|error| self.execution.fail_terminal("model_lock", error))?;
         self.execution.ensure_usable()?;
+        let max_batch = super::scoped_max_batch(self.max_batch)?;
+        if self.execution.requires_single_run_profile()? {
+            let mut texts = texts.into_iter();
+            let first = texts.next().ok_or_else(|| {
+                self.execution.fail_terminal(
+                    "first_inference_input",
+                    "nonempty sparse FastEmbed measurement lost its first real input",
+                )
+            })?;
+            let first_embeddings = model
+                .embed(vec![first], Some(1))
+                .map_err(|error| self.execution.fail_terminal("inference", error))?;
+            super::green_context::synchronize_retained_stream(
+                self.bound_stream.as_ref(),
+                self.provider_policy,
+                "onnx-fastembed-sparse-first-profiled-run",
+            )
+            .map_err(|error| self.execution.fail_terminal("cuda_synchronize", error))?;
+            let mut vectors = sparse_batch(first_embeddings, sparse_shape_dim(self.shape()), 1)
+                .map_err(|error| self.execution.fail_terminal("output_validation", error))?;
+            self.execution
+                .complete_first_inference(|| model.end_profiling())?;
+
+            let remaining = texts.collect::<Vec<_>>();
+            if !remaining.is_empty() {
+                self.execution.ensure_usable()?;
+                let expected = remaining.len();
+                let embeddings = model
+                    .embed(remaining, max_batch)
+                    .map_err(|error| self.execution.fail_terminal("inference", error))?;
+                super::green_context::synchronize_retained_stream(
+                    self.bound_stream.as_ref(),
+                    self.provider_policy,
+                    "onnx-fastembed-sparse-attested-batch-remainder",
+                )
+                .map_err(|error| self.execution.fail_terminal("cuda_synchronize", error))?;
+                vectors.extend(
+                    sparse_batch(embeddings, sparse_shape_dim(self.shape()), expected).map_err(
+                        |error| self.execution.fail_terminal("output_validation", error),
+                    )?,
+                );
+            }
+            return Ok(vectors);
+        }
         let embeddings = model
-            .embed(texts, None)
+            .embed(texts, max_batch)
             .map_err(|error| self.execution.fail_terminal("inference", error))?;
         super::green_context::synchronize_retained_stream(
             self.bound_stream.as_ref(),
@@ -715,8 +777,69 @@ impl Lens for FastembedBgem3Lens {
         let mut model = lock_model(&self.model, "BGE-M3")
             .map_err(|error| self.execution.fail_terminal("model_lock", error))?;
         self.execution.ensure_usable()?;
+        let max_batch = super::scoped_max_batch(self.max_batch)?;
+        if self.execution.requires_single_run_profile()? {
+            let mut texts = texts.into_iter();
+            let first = texts.next().ok_or_else(|| {
+                self.execution.fail_terminal(
+                    "first_inference_input",
+                    "nonempty BGE-M3 FastEmbed measurement lost its first real input",
+                )
+            })?;
+            let first_output = model
+                .embed(vec![first], Some(1))
+                .map_err(|error| self.execution.fail_terminal("inference", error))?;
+            super::green_context::synchronize_retained_stream(
+                self.bound_stream.as_ref(),
+                self.provider_policy,
+                "onnx-fastembed-bgem3-first-profiled-run",
+            )
+            .map_err(|error| self.execution.fail_terminal("cuda_synchronize", error))?;
+            let mut vectors = match self.output {
+                FastembedBgem3Output::Dense => dense_batch(first_output.dense, BGE_M3_DENSE_DIM, 1),
+                FastembedBgem3Output::Sparse => {
+                    sparse_batch(first_output.sparse, BGE_M3_SPARSE_DIM, 1)
+                }
+                FastembedBgem3Output::Colbert => {
+                    multi_batch(first_output.colbert, BGE_M3_DENSE_DIM, 1)
+                }
+            }
+            .map_err(|error| self.execution.fail_terminal("output_validation", error))?;
+            self.execution
+                .complete_first_inference(|| model.end_profiling())?;
+
+            let remaining = texts.collect::<Vec<_>>();
+            if !remaining.is_empty() {
+                self.execution.ensure_usable()?;
+                let expected = remaining.len();
+                let output = model
+                    .embed(remaining, max_batch)
+                    .map_err(|error| self.execution.fail_terminal("inference", error))?;
+                super::green_context::synchronize_retained_stream(
+                    self.bound_stream.as_ref(),
+                    self.provider_policy,
+                    "onnx-fastembed-bgem3-attested-batch-remainder",
+                )
+                .map_err(|error| self.execution.fail_terminal("cuda_synchronize", error))?;
+                vectors.extend(
+                    match self.output {
+                        FastembedBgem3Output::Dense => {
+                            dense_batch(output.dense, BGE_M3_DENSE_DIM, expected)
+                        }
+                        FastembedBgem3Output::Sparse => {
+                            sparse_batch(output.sparse, BGE_M3_SPARSE_DIM, expected)
+                        }
+                        FastembedBgem3Output::Colbert => {
+                            multi_batch(output.colbert, BGE_M3_DENSE_DIM, expected)
+                        }
+                    }
+                    .map_err(|error| self.execution.fail_terminal("output_validation", error))?,
+                );
+            }
+            return Ok(vectors);
+        }
         let output = model
-            .embed(texts, None)
+            .embed(texts, max_batch)
             .map_err(|error| self.execution.fail_terminal("inference", error))?;
         super::green_context::synchronize_retained_stream(
             self.bound_stream.as_ref(),
@@ -777,6 +900,9 @@ impl Lens for FastembedRerankerLens {
         let mut model = lock_model(&self.model, "reranker")
             .map_err(|error| self.execution.fail_terminal("model_lock", error))?;
         self.execution.ensure_usable()?;
+        super::scoped_max_batch(self.max_batch)?;
+        let requires_single_run_profile = self.execution.requires_single_run_profile()?;
+        let mut index = 0usize;
         for (query, doc) in pairs {
             let results = model
                 .rerank(query, [doc], false, Some(1))
@@ -792,15 +918,37 @@ impl Lens for FastembedRerankerLens {
                 dim: 1,
                 data: vec![score],
             });
+            if requires_single_run_profile && index == 0 {
+                super::green_context::synchronize_retained_stream(
+                    self.bound_stream.as_ref(),
+                    self.provider_policy,
+                    "onnx-fastembed-reranker-first-profiled-run",
+                )
+                .map_err(|error| self.execution.fail_terminal("cuda_synchronize", error))?;
+                self.execution
+                    .complete_first_inference(|| model.end_profiling())?;
+            }
+            index = index.checked_add(1).ok_or_else(|| {
+                self.execution
+                    .fail_terminal("batch_accounting", "reranker input index exceeds usize")
+            })?;
         }
-        super::green_context::synchronize_retained_stream(
-            self.bound_stream.as_ref(),
-            self.provider_policy,
-            "onnx-fastembed-reranker",
-        )
-        .map_err(|error| self.execution.fail_terminal("cuda_synchronize", error))?;
-        self.execution
-            .complete_first_inference(|| model.end_profiling())?;
+        if !requires_single_run_profile || out.len() > 1 {
+            super::green_context::synchronize_retained_stream(
+                self.bound_stream.as_ref(),
+                self.provider_policy,
+                if requires_single_run_profile {
+                    "onnx-fastembed-reranker-attested-batch-remainder"
+                } else {
+                    "onnx-fastembed-reranker"
+                },
+            )
+            .map_err(|error| self.execution.fail_terminal("cuda_synchronize", error))?;
+        }
+        if !requires_single_run_profile {
+            self.execution
+                .complete_first_inference(|| model.end_profiling())?;
+        }
         Ok(out)
     }
 

@@ -22,6 +22,7 @@ mod cuda_graphs;
 mod cuda_guard;
 mod custom;
 mod dynamic_ort;
+mod evidence_artifact;
 mod execution_attestation;
 pub(crate) mod fastembed_artifacts;
 mod fastembed_attestation;
@@ -38,7 +39,7 @@ pub(in crate::runtime::onnx) use batch_scope::scoped_max_batch;
 pub use colbert::{DEFAULT_ANSWERAI_COLBERT_MODEL, OnnxColbertFileSpec, OnnxColbertLens};
 pub use execution_attestation::{
     ONNX_COLBERT_RUNTIME_ID, ONNX_CUSTOM_RUNTIME_ID, ONNX_FASTEMBED_RUNTIME_ID,
-    validate_cuda_onnx_execution_attestation,
+    validate_cpu_onnx_execution_attestation, validate_cuda_onnx_execution_attestation,
 };
 pub(crate) use fastembed_runtime::model_from_name as fastembed_dense_model_from_name;
 #[cfg(windows)]
@@ -49,6 +50,7 @@ pub use runtime_bundle::{
     revalidate_runtime_attestation,
 };
 pub use special::{FastembedBgem3Lens, FastembedRerankerLens, FastembedSparseLens};
+pub const ONNX_EXECUTION_EVIDENCE_STORE_DIRECTORY: &str = evidence_artifact::STORE_DIRECTORY;
 
 pub struct OnnxLens {
     id: LensId,
@@ -487,6 +489,7 @@ impl OnnxLens {
         for input in inputs {
             texts.push(text_from_input(self, input)?.to_string());
         }
+        let batch_size = scoped_max_batch(self.max_batch)?;
         let mut model = model.lock().map_err(|_| {
             execution.fail_terminal(
                 "model_lock",
@@ -494,8 +497,50 @@ impl OnnxLens {
             )
         })?;
         execution.ensure_usable()?;
+        if execution.requires_single_run_profile()? {
+            let mut texts = texts.into_iter();
+            let first = texts.next().ok_or_else(|| {
+                execution.fail_terminal(
+                    "first_inference_input",
+                    "nonempty FastEmbed measurement lost its first real input",
+                )
+            })?;
+            let first_embeddings = model
+                .embed(vec![first], Some(1))
+                .map_err(|err| execution.fail_terminal("inference", err))?;
+            green_context::synchronize_retained_stream(
+                self.bound_stream.as_ref(),
+                self.provider_policy,
+                "onnx-fastembed-dense-first-profiled-run",
+            )
+            .map_err(|error| execution.fail_terminal("cuda_synchronize", error))?;
+            let mut vectors = self
+                .validated_fastembed_dense_batch(first_embeddings, 1)
+                .map_err(|error| execution.fail_terminal("output_validation", error))?;
+            execution.complete_first_inference(|| model.end_profiling())?;
+
+            let remaining = texts.collect::<Vec<_>>();
+            if !remaining.is_empty() {
+                execution.ensure_usable()?;
+                let expected = remaining.len();
+                let embeddings = model
+                    .embed(remaining, batch_size)
+                    .map_err(|err| execution.fail_terminal("inference", err))?;
+                green_context::synchronize_retained_stream(
+                    self.bound_stream.as_ref(),
+                    self.provider_policy,
+                    "onnx-fastembed-dense-attested-batch-remainder",
+                )
+                .map_err(|error| execution.fail_terminal("cuda_synchronize", error))?;
+                vectors.extend(
+                    self.validated_fastembed_dense_batch(embeddings, expected)
+                        .map_err(|error| execution.fail_terminal("output_validation", error))?,
+                );
+            }
+            return Ok(vectors);
+        }
         let embeddings = model
-            .embed(texts, None)
+            .embed(texts, batch_size)
             .map_err(|err| execution.fail_terminal("inference", err))?;
         green_context::synchronize_retained_stream(
             self.bound_stream.as_ref(),
@@ -503,17 +548,25 @@ impl OnnxLens {
             "onnx-fastembed-dense",
         )
         .map_err(|error| execution.fail_terminal("cuda_synchronize", error))?;
-        if embeddings.len() != inputs.len() {
-            return Err(execution.fail_terminal(
-                "output_validation",
-                CalyxError::lens_dim_mismatch(format!(
-                    "ONNX returned {} vectors for {} inputs",
-                    embeddings.len(),
-                    inputs.len()
-                )),
-            ));
+        let vectors = self
+            .validated_fastembed_dense_batch(embeddings, inputs.len())
+            .map_err(|error| execution.fail_terminal("output_validation", error))?;
+        execution.complete_first_inference(|| model.end_profiling())?;
+        Ok(vectors)
+    }
+
+    fn validated_fastembed_dense_batch(
+        &self,
+        embeddings: Vec<Vec<f32>>,
+        expected: usize,
+    ) -> Result<Vec<SlotVector>> {
+        if embeddings.len() != expected {
+            return Err(CalyxError::lens_dim_mismatch(format!(
+                "ONNX returned {} vectors for {expected} inputs",
+                embeddings.len()
+            )));
         }
-        let vectors = embeddings
+        embeddings
             .into_iter()
             .map(|mut data| {
                 if data.len() != self.dim as usize {
@@ -529,10 +582,7 @@ impl OnnxLens {
                     data,
                 })
             })
-            .collect::<Result<Vec<_>>>()
-            .map_err(|error| execution.fail_terminal("output_validation", error))?;
-        execution.complete_first_inference(|| model.end_profiling())?;
-        Ok(vectors)
+            .collect()
     }
 
     fn fastembed_execution(&self) -> &fastembed_attestation::FastembedExecutionState {

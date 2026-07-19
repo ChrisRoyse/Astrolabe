@@ -11,7 +11,7 @@ use std::os::windows::fs::{FileExt, MetadataExt, OpenOptionsExt};
 use std::os::windows::io::AsRawHandle;
 use std::path::{Component, Path, PathBuf};
 use std::ptr;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use calyx_core::{CalyxError, Result};
 use serde::{Deserialize, Serialize};
@@ -19,8 +19,8 @@ use sha2::{Digest, Sha256};
 use windows_sys::Win32::Foundation::{FreeLibrary, GetLastError, HANDLE, HMODULE};
 use windows_sys::Win32::Globalization::{CSTR_EQUAL, CompareStringOrdinal};
 use windows_sys::Win32::Storage::FileSystem::{
-    BY_HANDLE_FILE_INFORMATION, FILE_FLAG_BACKUP_SEMANTICS, FILE_SHARE_READ, FILE_SHARE_WRITE,
-    GetFileInformationByHandle, GetFinalPathNameByHandleW,
+    BY_HANDLE_FILE_INFORMATION, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+    FILE_SHARE_READ, FILE_SHARE_WRITE, GetFileInformationByHandle, GetFinalPathNameByHandleW,
 };
 use windows_sys::Win32::System::LibraryLoader::{
     GetProcAddress, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR, LOAD_LIBRARY_SEARCH_SYSTEM32, LoadLibraryExW,
@@ -149,12 +149,59 @@ pub struct ImmutableFileSnapshot {
     pub bytes: Vec<u8>,
 }
 
+/// Exact regular-file handle retained with read-only sharing so the accepted
+/// artifact cannot be reopened for write or delete during the owning session.
+#[derive(Debug)]
+pub struct RetainedImmutableFile {
+    handle: File,
+    final_path: PathBuf,
+    identity: ImmutableFileIdentity,
+}
+
+impl RetainedImmutableFile {
+    pub fn final_path(&self) -> &Path {
+        &self.final_path
+    }
+
+    pub fn identity(&self) -> ImmutableFileIdentity {
+        self.identity
+    }
+
+    /// Re-read the exact retained handle and prove its path and physical file
+    /// identity still match the initially accepted object.
+    pub fn snapshot(
+        &self,
+        required_root: Option<&ImmutableDirectoryRoot>,
+        maximum_bytes: u64,
+    ) -> Result<ImmutableFileSnapshot> {
+        let snapshot =
+            snapshot_opened_file(&self.handle, &self.final_path, required_root, maximum_bytes)?;
+        if !same_final_path(&snapshot.final_path, &self.final_path)
+            || snapshot.identity != self.identity
+        {
+            return Err(runtime_error(
+                "CALYX_ONNX_ARTIFACT_RETAINED_IDENTITY_DRIFT",
+                format!(
+                    "retained immutable artifact drifted: expected path={} identity={:?}, observed path={} identity={:?}",
+                    self.final_path.display(),
+                    self.identity,
+                    snapshot.final_path.display(),
+                    snapshot.identity
+                ),
+                "terminally discard the owning session, preserve both identities, and repair artifact mutation before retrying",
+            ));
+        }
+        Ok(snapshot)
+    }
+}
+
 /// Open directory identity retained while a frozen artifact set is read.
 #[derive(Debug)]
 pub struct ImmutableDirectoryRoot {
     handle: File,
     final_path: PathBuf,
     identity: ImmutableFileIdentity,
+    _parent: Option<Arc<ImmutableDirectoryRoot>>,
 }
 
 impl ImmutableDirectoryRoot {
@@ -166,7 +213,9 @@ impl ImmutableDirectoryRoot {
         self.identity
     }
 
-    fn attest_unchanged(&self) -> Result<()> {
+    /// Re-reads this retained handle and proves its physical path and file
+    /// identity have not changed.
+    pub fn attest_unchanged(&self) -> Result<()> {
         let observed_path = final_path_from_handle(&self.handle)?;
         let observed_identity = immutable_file_identity(&self.handle)?;
         if !same_final_path(&observed_path, &self.final_path) || observed_identity != self.identity
@@ -437,9 +486,22 @@ pub fn snapshot_immutable_file(
     required_root: Option<&ImmutableDirectoryRoot>,
     maximum_bytes: u64,
 ) -> Result<ImmutableFileSnapshot> {
+    let (retained, snapshot) = retain_immutable_file(path, required_root, maximum_bytes)?;
+    drop(retained);
+    Ok(snapshot)
+}
+
+/// Opens and snapshots one artifact while returning the exact read-only
+/// handle that keeps the accepted file identity non-replaceable.
+pub fn retain_immutable_file(
+    path: &Path,
+    required_root: Option<&ImmutableDirectoryRoot>,
+    maximum_bytes: u64,
+) -> Result<(RetainedImmutableFile, ImmutableFileSnapshot)> {
     let file = OpenOptions::new()
         .read(true)
         .share_mode(FILE_SHARE_READ)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
         .open(path)
         .map_err(|error| {
             runtime_error(
@@ -451,7 +513,22 @@ pub fn snapshot_immutable_file(
                 "restore a readable regular artifact inside its frozen root and retry in a new process",
             )
         })?;
-    let final_path = final_path_from_handle(&file)?;
+    let snapshot = snapshot_opened_file(&file, path, required_root, maximum_bytes)?;
+    let retained = RetainedImmutableFile {
+        final_path: snapshot.final_path.clone(),
+        identity: snapshot.identity,
+        handle: file,
+    };
+    Ok((retained, snapshot))
+}
+
+fn snapshot_opened_file(
+    file: &File,
+    requested_path: &Path,
+    required_root: Option<&ImmutableDirectoryRoot>,
+    maximum_bytes: u64,
+) -> Result<ImmutableFileSnapshot> {
+    let final_path = final_path_from_handle(file)?;
     if let Some(root) = required_root {
         root.attest_unchanged()?;
         if !final_path_is_within(&final_path, root.final_path()) {
@@ -459,7 +536,7 @@ pub fn snapshot_immutable_file(
                 "CALYX_ONNX_ARTIFACT_PATH_ESCAPE",
                 format!(
                     "opened artifact {} resolves to {} outside frozen root {}",
-                    path.display(),
+                    requested_path.display(),
                     final_path.display(),
                     root.final_path().display()
                 ),
@@ -500,7 +577,7 @@ pub fn snapshot_immutable_file(
             "commission an artifact within the measured RAM/VRAM budget or raise the explicit budget before process startup",
         ));
     }
-    let identity = immutable_file_identity(&file)?;
+    let identity = immutable_file_identity(file)?;
     let byte_len = usize::try_from(expected_bytes).map_err(|_| {
         runtime_error(
             "CALYX_ONNX_ARTIFACT_SIZE_OVERFLOW",
@@ -579,8 +656,8 @@ pub fn snapshot_immutable_file(
             "stop concurrent artifact mutation and retry from an immutable model directory",
         ));
     }
-    let final_path_after = final_path_from_handle(&file)?;
-    let identity_after = immutable_file_identity(&file)?;
+    let final_path_after = final_path_from_handle(file)?;
+    let identity_after = immutable_file_identity(file)?;
     let bytes_after = file
         .metadata()
         .map_err(|error| {
@@ -656,7 +733,101 @@ pub fn open_immutable_directory(path: &Path) -> Result<ImmutableDirectoryRoot> {
         handle: directory,
         final_path,
         identity,
+        _parent: None,
     })
+}
+
+/// Opens one exact, existing child directory beneath an already retained
+/// physical parent.
+///
+/// The child name must be one normal path component. The handle opens the
+/// reparse object itself rather than following it and rejects every reparse
+/// point, then proves the resolved name is exactly `parent/name`. Writable
+/// artifact hierarchies use this one component at a time before placing any
+/// state beneath the child.
+pub fn open_immutable_child_directory(
+    parent: &Arc<ImmutableDirectoryRoot>,
+    child_name: &OsStr,
+) -> Result<ImmutableDirectoryRoot> {
+    let child_path = Path::new(child_name);
+    let components = child_path.components().collect::<Vec<_>>();
+    if child_name.is_empty()
+        || !matches!(
+            components.as_slice(),
+            [Component::Normal(normal)] if *normal == child_name
+        )
+    {
+        return Err(runtime_error(
+            "CALYX_ONNX_ARTIFACT_CHILD_NAME_INVALID",
+            format!(
+                "immutable child directory name {:?} is not one normal path component",
+                child_name
+            ),
+            "use one nonempty relative directory component beneath the retained parent",
+        ));
+    }
+    parent.attest_unchanged()?;
+    let expected_path = parent.final_path().join(child_name);
+    let directory = OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(&expected_path)
+        .map_err(|error| {
+            runtime_error(
+                "CALYX_ONNX_ARTIFACT_CHILD_OPEN_FAILED",
+                format!(
+                    "open exact immutable child directory {} failed: {error}",
+                    expected_path.display()
+                ),
+                "restore the exact non-reparse directory beneath its retained parent and retry",
+            )
+        })?;
+    let metadata = directory.metadata().map_err(|error| {
+        runtime_error(
+            "CALYX_ONNX_ARTIFACT_CHILD_METADATA_FAILED",
+            format!(
+                "read exact child directory metadata {} failed: {error}",
+                expected_path.display()
+            ),
+            "restore the exact non-reparse directory beneath its retained parent and retry",
+        )
+    })?;
+    if !metadata.file_type().is_dir()
+        || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT_VALUE != 0
+    {
+        return Err(runtime_error(
+            "CALYX_ONNX_ARTIFACT_CHILD_REPARSE_REFUSED",
+            format!(
+                "artifact child {} is not a regular non-reparse directory",
+                expected_path.display()
+            ),
+            "replace the junction, symlink, or mount point with a regular directory beneath the retained parent",
+        ));
+    }
+    let final_path = final_path_from_handle(&directory)?;
+    if !same_final_path(&final_path, &expected_path) || final_path.file_name() != Some(child_name) {
+        return Err(runtime_error(
+            "CALYX_ONNX_ARTIFACT_DIRECTORY_ESCAPE",
+            format!(
+                "opened child directory {} resolves as {}, not the exact canonical retained-parent child {:?}",
+                expected_path.display(),
+                final_path.display(),
+                child_name
+            ),
+            "remove the junction/reparse or case-aliased component and create the exact canonical child inside the retained parent",
+        ));
+    }
+    let identity = immutable_file_identity(&directory)?;
+    parent.attest_unchanged()?;
+    let child = ImmutableDirectoryRoot {
+        handle: directory,
+        final_path,
+        identity,
+        _parent: Some(Arc::clone(parent)),
+    };
+    child.attest_unchanged()?;
+    Ok(child)
 }
 
 /// Returns live available physical host memory for an artifact snapshot budget.

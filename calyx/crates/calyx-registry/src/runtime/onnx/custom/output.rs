@@ -1,13 +1,14 @@
 use std::path::Path;
 
 use calyx_core::{CalyxError, Result, SlotShape, SlotVector, SparseEntry};
-use ort::value::ValueType;
+use ort::value::{TensorElementType, ValueType};
 
 use super::batch::TokenBatch;
 use super::{config_invalid, validate_config};
 use crate::frozen::NormPolicy;
 use crate::runtime::common::normalize_unit;
 use crate::runtime::onnx::PoolingPolicy;
+use crate::runtime::onnx::io_binding::MaterializedF32Output;
 
 #[derive(Clone, Copy, Debug)]
 pub(super) enum CustomOutput {
@@ -19,6 +20,11 @@ pub(super) enum CustomOutput {
     Sparse {
         dim: u32,
     },
+}
+
+pub(super) struct CustomOutputContract {
+    pub(super) name: String,
+    pub(super) output: CustomOutput,
 }
 
 impl CustomOutput {
@@ -41,14 +47,28 @@ pub(super) fn output_from_session(
     expected_shape: Option<SlotShape>,
     pooling: PoolingPolicy,
     norm_policy: NormPolicy,
-) -> Result<CustomOutput> {
+) -> Result<CustomOutputContract> {
     let metadata = output_metadata(session)?;
+    if !matches!(metadata.rank, 2 | 3) {
+        return Err(CalyxError {
+            code: "CALYX_ONNX_OUTPUT_CONTRACT_RANK_UNSUPPORTED",
+            message: format!(
+                "custom ONNX exact output {:?} has rank {}, but dense execution supports only [batch,dim] or [batch,sequence,dim]",
+                metadata.name, metadata.rank
+            ),
+            remediation: "export a rank-2 or rank-3 Float32 output and recommission the frozen model before constructing a session",
+        });
+    }
     let output = if matches!(expected_shape, Some(SlotShape::Sparse(_))) {
         if metadata.rank != 2 {
-            return Err(CalyxError::lens_dim_mismatch(format!(
-                "custom ONNX sparse output {} rank {} must be [batch, dim]",
-                metadata.name, metadata.rank
-            )));
+            return Err(CalyxError {
+                code: "CALYX_ONNX_OUTPUT_CONTRACT_RANK_UNSUPPORTED",
+                message: format!(
+                    "custom ONNX sparse exact output {:?} has rank {}, expected [batch,dim]",
+                    metadata.name, metadata.rank
+                ),
+                remediation: "export one rank-2 Float32 sparse-logit output and recommission the frozen model",
+            });
         }
         CustomOutput::Sparse { dim: metadata.dim }
     } else {
@@ -66,25 +86,33 @@ pub(super) fn output_from_session(
             "custom ONNX output shape {shape:?} != declared {expected:?}"
         )));
     }
-    Ok(output)
+    Ok(CustomOutputContract {
+        name: metadata.name,
+        output,
+    })
 }
 
 pub(super) fn vectors_from_output(
-    outputs: &ort::session::SessionOutputs<'_>,
+    output_tensor: &MaterializedF32Output,
     batch: &TokenBatch,
     output: CustomOutput,
 ) -> Result<Vec<SlotVector>> {
-    let tensor = output_tensor(outputs)?;
-    let (shape, values) = tensor
-        .try_extract_tensor::<f32>()
-        .map_err(|err| config_invalid(format!("custom ONNX output is not f32 tensor: {err}")))?;
     match output {
         CustomOutput::Dense {
             dim,
             pooling,
             norm_policy,
-        } => dense_output_batch(shape, values, batch, pooling, dim, norm_policy),
-        CustomOutput::Sparse { dim } => sparse_output_batch(shape, values, batch, dim),
+        } => dense_output_batch(
+            &output_tensor.shape,
+            &output_tensor.values,
+            batch,
+            pooling,
+            dim,
+            norm_policy,
+        ),
+        CustomOutput::Sparse { dim } => {
+            sparse_output_batch(&output_tensor.shape, &output_tensor.values, batch, dim)
+        }
     }
 }
 
@@ -211,19 +239,60 @@ struct OutputMetadata {
 }
 
 fn output_metadata(session: &ort::session::Session) -> Result<OutputMetadata> {
-    let output = session
+    let tensor_outputs = session
         .outputs()
         .iter()
-        .find(|out| matches!(out.dtype(), ValueType::Tensor { .. }))
-        .ok_or_else(|| config_invalid("custom ONNX model has no tensor outputs"))?;
-    let ValueType::Tensor { shape, .. } = output.dtype() else {
-        return Err(config_invalid("custom ONNX output is not a tensor"));
+        .filter(|out| matches!(out.dtype(), ValueType::Tensor { .. }))
+        .collect::<Vec<_>>();
+    let [output] = tensor_outputs.as_slice() else {
+        return Err(CalyxError {
+            code: "CALYX_ONNX_OUTPUT_CONTRACT_AMBIGUOUS",
+            message: format!(
+                "custom ONNX model must expose exactly one unambiguous tensor output, observed {} tensor outputs {:?}",
+                tensor_outputs.len(),
+                tensor_outputs
+                    .iter()
+                    .map(|output| output.name())
+                    .collect::<Vec<_>>()
+            ),
+            remediation: "export one exact tensor output; durable explicit multi-output selection is unavailable until issue #610 is implemented, so no preferred-name fallback is permitted",
+        });
     };
+    if output.name().is_empty()
+        || output.name().trim() != output.name()
+        || output.name().chars().any(char::is_control)
+    {
+        return Err(CalyxError {
+            code: "CALYX_ONNX_OUTPUT_CONTRACT_AMBIGUOUS",
+            message: format!(
+                "custom ONNX tensor output name {:?} is not a canonical nonblank control-free identity",
+                output.name()
+            ),
+            remediation: "export one stable output name with no surrounding whitespace or control characters",
+        });
+    }
+    let ValueType::Tensor { ty, shape, .. } = output.dtype() else {
+        unreachable!("tensor_outputs contains only tensor metadata");
+    };
+    if *ty != TensorElementType::Float32 {
+        return Err(CalyxError {
+            code: "CALYX_ONNX_OUTPUT_CONTRACT_DTYPE_MISMATCH",
+            message: format!(
+                "custom ONNX exact output {:?} is {ty}, expected Float32; shape={shape:?}",
+                output.name()
+            ),
+            remediation: "export the frozen authoritative output as Float32 and recommission the model before constructing a session",
+        });
+    }
     let Some(dim) = shape.last().copied().filter(|dim| *dim > 0) else {
-        return Err(config_invalid(format!(
-            "custom ONNX output {} has no static final dimension",
-            output.name()
-        )));
+        return Err(CalyxError {
+            code: "CALYX_ONNX_OUTPUT_CONTRACT_SHAPE_MISMATCH",
+            message: format!(
+                "custom ONNX exact output {:?} has no positive static final dimension; observed shape={shape:?}",
+                output.name()
+            ),
+            remediation: "export an output with a positive frozen embedding dimension and recommission the model",
+        });
     };
     Ok(OutputMetadata {
         name: output.name().to_string(),
@@ -235,25 +304,6 @@ fn output_metadata(session: &ort::session::Session) -> Result<OutputMetadata> {
 
 fn positive_usize(value: i64) -> Option<usize> {
     usize::try_from(value).ok().filter(|value| *value > 0)
-}
-
-fn output_tensor<'a, 'r>(
-    outputs: &'a ort::session::SessionOutputs<'r>,
-) -> Result<&'a ort::value::DynValue> {
-    for name in [
-        "splade_embedding",
-        "sentence_embedding",
-        "last_hidden_state",
-        "pooler_output",
-    ] {
-        if let Some(output) = outputs.get(name) {
-            return Ok(output);
-        }
-    }
-    if outputs.len() == 0 {
-        return Err(config_invalid("custom ONNX model returned no outputs"));
-    }
-    Ok(&outputs[0])
 }
 
 fn pool_tokens(

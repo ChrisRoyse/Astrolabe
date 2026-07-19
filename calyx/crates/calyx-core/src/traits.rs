@@ -61,13 +61,12 @@ pub struct RuntimeExecutionAttestation {
 /// Exact evidence kind for a fail-loud CUDA ONNX session.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum OnnxCudaExecutionEvidenceKind {
-    /// Final optimized-graph classification plus ORT API 24 committed-session
-    /// placement and the first exact real, host-materialized,
-    /// retained-stream-synchronized inference profile.
+    /// Independent pre-fusion API-24 partition receipt plus exact post-fusion
+    /// optimized-graph/profile classification from one real synchronized run.
     #[serde(
-        rename = "onnx_optimized_graph_classified_v1+api24_committed_session+first_exact_real_host_materialized_retained_stream_synchronized_inference_profile"
+        rename = "onnx_api24_partition_receipt_v2+post_fusion_optimized_graph_classified_v2+first_exact_real_host_materialized_retained_stream_synchronized_inference_profile"
     )]
-    OptimizedGraphClassifiedV1Api24AndFirstExactInferenceProfile,
+    Api24PartitionV2FinalGraphClassifiedV2AndFirstExactInferenceProfile,
 }
 
 /// Categorical role proven for one ONNX node.
@@ -80,10 +79,22 @@ pub enum OnnxPlacementNodeRole {
     CpuShapeMetadata,
 }
 
-/// Exact node identity from ORT's committed API-24 assignment.
+/// Exact pre-fusion node identity from one API-24 assigned subgraph.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct OnnxCommittedNodeEvidence {
+pub struct OnnxApi24PartitionNodeEvidence {
+    pub subgraph_index: u64,
+    pub node_index_in_subgraph: u64,
+    pub name: String,
+    pub domain: String,
+    pub operator: String,
+    pub provider: String,
+}
+
+/// Exact post-fusion graph identity and categorical placement proof.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OnnxFinalGraphNodeEvidence {
     pub name: String,
     pub domain: String,
     pub operator: String,
@@ -102,6 +113,7 @@ pub struct OnnxCommittedNodeEvidence {
 #[serde(deny_unknown_fields)]
 pub struct OnnxProfiledNodeEvidence {
     pub name: String,
+    pub domain: String,
     pub operator: String,
     pub provider: String,
     pub role: OnnxPlacementNodeRole,
@@ -123,15 +135,26 @@ pub struct OnnxRetainedCudaStreamEvidence {
     pub physical_device: String,
 }
 
-/// ORT API-24 placement read directly from one committed session.
+/// Independent pre-fusion ORT API-24 partition receipt.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct OnnxCommittedSessionPlacementEvidence {
-    /// Executable nodes in the exact optimized graph.
+pub struct OnnxApi24PartitionReceiptEvidence {
+    pub schema: String,
+    pub subgraph_count: u64,
+    pub total_nodes: u64,
+    pub cuda_nodes: u64,
+    pub cpu_nodes: u64,
+    pub providers: String,
+    pub assigned_operators: String,
+    pub nodes: Vec<OnnxApi24PartitionNodeEvidence>,
+}
+
+/// Authoritative placement of the post-fusion optimized graph.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OnnxFinalGraphPlacementEvidence {
     pub total_graph_nodes: u64,
-    /// Substantive nodes assigned to CUDAExecutionProvider.
     pub cuda_compute_nodes: u64,
-    /// Proven bounded shape-metadata nodes assigned to CPUExecutionProvider.
     pub cpu_metadata_nodes: u64,
     /// CPU nodes not proven to be shape metadata. Always zero when admitted.
     pub unclassified_cpu_nodes: u64,
@@ -141,8 +164,8 @@ pub struct OnnxCommittedSessionPlacementEvidence {
     pub providers: String,
     /// Deterministic provider/operator summary.
     pub assigned_operators: String,
-    /// Exact sorted committed node identities and categorical roles.
-    pub nodes: Vec<OnnxCommittedNodeEvidence>,
+    /// Exact sorted post-fusion node identities and categorical roles.
+    pub nodes: Vec<OnnxFinalGraphNodeEvidence>,
 }
 
 /// Placement observed in the first real synchronized inference profile.
@@ -187,20 +210,28 @@ pub struct OnnxCudaExecutionEvidence {
     pub optimized_graph_path: String,
     /// Exact optimized-graph byte length.
     pub optimized_graph_bytes: u64,
-    /// SHA-256 of the exact optimized GraphProto bytes.
+    /// SHA-256 of the exact serialized optimized ModelProto bytes.
     pub optimized_graph_sha256: String,
-    /// SHA-256 of exact length-delimited API-24 node fields.
-    pub assignment_sha256: String,
+    /// SHA-256 of the independent exact API-24 partition receipt.
+    pub api24_partition_sha256: String,
+    /// SHA-256 of exact post-fusion provider/name/domain/operator fields.
+    pub final_graph_placement_sha256: String,
     /// SHA-256 of exact static CPU metadata proof fields.
     pub cpu_metadata_proof_sha256: String,
-    /// SHA-256 binding classifier, graph, opsets, assignment, and proofs.
+    /// SHA-256 binding classifier, graph, opsets, partition, final placement,
+    /// first profile, and CPU metadata proofs.
     pub placement_contract_sha256: String,
-    /// Committed-session API-24 assignment.
-    pub committed_session: OnnxCommittedSessionPlacementEvidence,
+    /// Independent pre-fusion committed-session partition receipt.
+    pub api24_partition: OnnxApi24PartitionReceiptEvidence,
+    /// Authoritative post-fusion graph placement.
+    pub final_graph_placement: OnnxFinalGraphPlacementEvidence,
     /// First-real-inference execution profile.
     pub first_inference_profile: OnnxFirstInferencePlacementEvidence,
-    /// Canonical path returned by ORT profiling and independently snapshotted.
+    /// Canonical durable content-addressed path of the independently published
+    /// ORT profile bytes.
     pub profile_path: String,
+    /// Exact first-profile byte length.
+    pub profile_bytes: u64,
     /// SHA-256 of the exact snapshotted profile bytes.
     pub profile_sha256: String,
 }

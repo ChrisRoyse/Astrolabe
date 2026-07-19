@@ -5,7 +5,7 @@ use calyx_core::{
     CalyxError, Input, Lens, LensId, Modality, Result, RuntimeExecutionAttestation, SlotShape,
     SlotVector,
 };
-use ort::value::ValueType;
+use ort::value::{TensorElementType, ValueType};
 use serde_json::Value;
 use tokenizers::Tokenizer;
 
@@ -23,6 +23,7 @@ use crate::spec::{LensRuntime, LensSpec, default_recall_delta};
 
 pub const DEFAULT_ANSWERAI_COLBERT_MODEL: &str = "answerdotai/answerai-colbert-small-v1";
 pub(in crate::runtime::onnx) const DEFAULT_COLBERT_ONNX: &str = "onnx/model_fp16.onnx";
+const COLBERT_OUTPUT_NAME: &str = "last_hidden_state";
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct OnnxColbertFileSpec {
@@ -52,6 +53,7 @@ struct OnnxColbertRuntime {
     session: Option<ManagedOnnxSession>,
     run_plan: OnnxRunPlan,
     tokenizer: Tokenizer,
+    output_name: String,
     token_dim: u32,
     max_tokens: usize,
 }
@@ -172,7 +174,7 @@ impl OnnxColbertLens {
             "onnx-colbert",
             session.as_ref(),
         )?;
-        let token_dim = output_token_dim(session.as_ref())?;
+        let (output_name, token_dim) = output_contract(session.as_ref())?;
         let shape = SlotShape::Multi { token_dim };
         if let Some(expected) = spec.expected_shape
             && expected != shape
@@ -195,6 +197,7 @@ impl OnnxColbertLens {
             session: Some(session.into_inner()),
             run_plan,
             tokenizer,
+            output_name,
             token_dim,
             max_tokens,
         };
@@ -373,13 +376,8 @@ impl OnnxColbertRuntime {
             session,
             input_tensors,
             (batch.batch, batch.seq),
-            |outputs| {
-                let output = output_tensor(outputs)?;
-                let (shape, values) = output.try_extract_tensor::<f32>().map_err(|err| {
-                    config_invalid(format!("ONNX ColBERT output is not f32 tensor: {err}"))
-                })?;
-                multi_rows(shape, values, batch, token_dim)
-            },
+            &self.output_name,
+            |output| multi_rows(&output.shape, &output.values, batch, token_dim),
         )?;
         Ok(rows)
     }
@@ -439,14 +437,43 @@ fn validate_config(path: &Path) -> Result<Value> {
     })
 }
 
-fn output_token_dim(session: &ort::session::Session) -> Result<u32> {
-    let output = session
+fn output_contract(session: &ort::session::Session) -> Result<(String, u32)> {
+    let matching_outputs = session
         .outputs()
         .iter()
-        .find(|out| matches!(out.dtype(), ValueType::Tensor { .. }))
-        .ok_or_else(|| config_invalid("ONNX ColBERT model has no tensor outputs"))?;
-    let ValueType::Tensor { shape, .. } = output.dtype() else {
-        return Err(config_invalid("ONNX ColBERT output is not a tensor"));
+        .filter(|output| output.name() == COLBERT_OUTPUT_NAME)
+        .collect::<Vec<_>>();
+    let [output] = matching_outputs.as_slice() else {
+        return Err(CalyxError {
+            code: "CALYX_ONNX_OUTPUT_CONTRACT_MISMATCH",
+            message: format!(
+                "ONNX ColBERT model must expose exactly one {COLBERT_OUTPUT_NAME:?} output, observed {} exact matches; all outputs=[{}]",
+                matching_outputs.len(),
+                session
+                    .outputs()
+                    .iter()
+                    .map(|output| output.name())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            ),
+            remediation: "use the frozen AnswerAI ColBERT export with its exact last_hidden_state output",
+        });
+    };
+    let ValueType::Tensor { ty, shape, .. } = output.dtype() else {
+        return Err(config_invalid(format!(
+            "ONNX ColBERT exact output {COLBERT_OUTPUT_NAME} is not a tensor"
+        )));
+    };
+    if *ty != TensorElementType::Float32 {
+        return Err(config_invalid(format!(
+            "ONNX ColBERT exact output {COLBERT_OUTPUT_NAME} is {ty}, expected Float32"
+        )));
+    }
+    if shape.len() != 3 {
+        return Err(CalyxError::lens_dim_mismatch(format!(
+            "ONNX ColBERT exact output {COLBERT_OUTPUT_NAME} rank {} must be [batch, sequence, token_dim]",
+            shape.len()
+        )));
     };
     let Some(dim) = shape.last().copied().filter(|dim| *dim > 0) else {
         return Err(config_invalid(format!(
@@ -454,24 +481,7 @@ fn output_token_dim(session: &ort::session::Session) -> Result<u32> {
             output.name()
         )));
     };
-    u32::try_from(dim).map_err(|_| CalyxError::lens_dim_mismatch("ColBERT token dim exceeds u32"))
-}
-
-fn output_tensor<'a, 'r>(
-    outputs: &'a ort::session::SessionOutputs<'r>,
-) -> Result<&'a ort::value::DynValue> {
-    for name in [
-        "last_hidden_state",
-        "token_embeddings",
-        "output",
-        "sentence_embedding",
-    ] {
-        if let Some(output) = outputs.get(name) {
-            return Ok(output);
-        }
-    }
-    if outputs.len() == 0 {
-        return Err(config_invalid("ONNX ColBERT model returned no outputs"));
-    }
-    Ok(&outputs[0])
+    let dim = u32::try_from(dim)
+        .map_err(|_| CalyxError::lens_dim_mismatch("ColBERT token dim exceeds u32"))?;
+    Ok((output.name().to_string(), dim))
 }

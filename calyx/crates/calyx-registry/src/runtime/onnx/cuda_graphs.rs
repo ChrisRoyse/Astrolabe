@@ -27,6 +27,7 @@ pub(super) struct CudaGraphRunRequest<'a> {
     pub(super) label: &'a str,
     pub(super) device_id: i32,
     pub(super) shape: (usize, usize),
+    pub(super) output_name: &'a str,
     pub(super) options: Option<&'a RunOptions>,
 }
 
@@ -90,7 +91,14 @@ impl CudaGraphRunConfig {
         let shape = request.shape;
         let is_new = !self.bindings.contains_key(&shape);
         if is_new {
-            let binding = CudaGraphBinding::new(session, label, request.device_id, shape, &inputs)?;
+            let binding = CudaGraphBinding::new(
+                session,
+                label,
+                request.device_id,
+                shape,
+                request.output_name,
+                &inputs,
+            )?;
             self.bindings.insert(shape, binding);
         }
         let binding = self.bindings.get_mut(&shape).ok_or_else(|| CalyxError {
@@ -138,6 +146,7 @@ impl CudaGraphBinding {
         label: &str,
         device_id: i32,
         shape: (usize, usize),
+        output_name: &str,
         inputs: &[(String, Tensor<i64>)],
     ) -> Result<Self> {
         let mut binding = session.create_binding().map_err(|err| {
@@ -198,28 +207,47 @@ impl CudaGraphBinding {
                 "ONNX CUDA graph output allocator failed for {label} device {device_id}: {err}"
             ))
         })?;
-        for output in session.outputs() {
-            let name = output.name();
-            let output_shape = concrete_output_shape(label, name, output.dtype(), shape)?;
-            let output_tensor =
-                Tensor::<f32>::new(&output_allocator, output_shape).map_err(|err| {
-                    config_invalid(format!(
-                        "ONNX CUDA graph output tensor {name} alloc failed for {label}: {err}"
-                    ))
-                })?;
-            binding.bind_output(name, output_tensor).map_err(|err| {
+        let mut exact_outputs = session
+            .outputs()
+            .iter()
+            .filter(|output| output.name() == output_name);
+        let output = exact_outputs.next().ok_or_else(|| CalyxError {
+            code: "CALYX_ONNX_OUTPUT_CONTRACT_MISMATCH",
+            message: format!(
+                "ONNX CUDA graph session {label} has no exact output named {output_name:?}"
+            ),
+            remediation:
+                "discard the session, restore the frozen model output contract, and do not capture the CUDA graph",
+        })?;
+        if exact_outputs.next().is_some() {
+            return Err(CalyxError {
+                code: "CALYX_ONNX_OUTPUT_CONTRACT_MISMATCH",
+                message: format!(
+                    "ONNX CUDA graph session {label} has duplicate outputs named {output_name:?}"
+                ),
+                remediation: "repair the ONNX graph so the frozen output identity is unique before capture",
+            });
+        }
+        let output_shape = concrete_output_shape(label, output_name, output.dtype(), shape)?;
+        let output_tensor = Tensor::<f32>::new(&output_allocator, output_shape).map_err(|err| {
+            config_invalid(format!(
+                "ONNX CUDA graph output tensor {output_name} alloc failed for {label}: {err}"
+            ))
+        })?;
+        binding
+            .bind_output(output_name, output_tensor)
+            .map_err(|err| {
                 config_invalid(format!(
-                    "ONNX CUDA graph bind_output {name} failed for {label}: {err}"
+                    "ONNX CUDA graph bind_output {output_name} failed for {label}: {err}"
                 ))
             })?;
-        }
         eprintln!(
             "CALYX_ONNX_RUNTIME phase=cuda_graph_binding label={} batch={} seq={} inputs={} outputs={}",
             label,
             shape.0,
             shape.1,
             input_tensors.len(),
-            session.outputs().len()
+            1
         );
         Ok(Self {
             binding,
@@ -299,14 +327,20 @@ fn concrete_output_shape(
     run_shape: (usize, usize),
 ) -> Result<Shape> {
     let ValueType::Tensor { ty, shape, .. } = value_type else {
-        return Err(config_invalid(format!(
-            "ONNX CUDA graph output {name} for {label} is not a tensor"
-        )));
+        return Err(CalyxError {
+            code: "CALYX_ONNX_OUTPUT_CONTRACT_DTYPE_MISMATCH",
+            message: format!("ONNX CUDA graph exact output {name:?} for {label} is not a tensor"),
+            remediation: "discard the session, restore the exact frozen Float32 tensor output, and do not capture the CUDA graph",
+        });
     };
     if *ty != TensorElementType::Float32 {
-        return Err(config_invalid(format!(
-            "ONNX CUDA graph output {name} for {label} is {ty}, expected Float32"
-        )));
+        return Err(CalyxError {
+            code: "CALYX_ONNX_OUTPUT_CONTRACT_DTYPE_MISMATCH",
+            message: format!(
+                "ONNX CUDA graph exact output {name:?} for {label} is {ty}, expected Float32; shape={shape:?}"
+            ),
+            remediation: "discard the session, restore the exact frozen Float32 tensor output, and do not capture the CUDA graph",
+        });
     }
     let batch = i64::try_from(run_shape.0)
         .map_err(|_| config_invalid(format!("{label} CUDA graph batch exceeds i64")))?;
@@ -319,9 +353,13 @@ fn concrete_output_shape(
             (true, _) => Ok(*dim),
             (false, 0) => Ok(batch),
             (false, 1) if shape.len() >= 3 => Ok(seq),
-            _ => Err(config_invalid(format!(
-                "ONNX CUDA graph output {name} for {label} has unsupported dynamic shape {shape:?}"
-            ))),
+            _ => Err(CalyxError {
+                code: "CALYX_ONNX_OUTPUT_CONTRACT_SHAPE_MISMATCH",
+                message: format!(
+                    "ONNX CUDA graph exact output {name:?} for {label} has unsupported dynamic shape {shape:?} at dimension {index}"
+                ),
+                remediation: "discard the session and export a frozen output whose only dynamic axes are batch and optional sequence",
+            }),
         })
         .collect::<Result<Vec<_>>>()?;
     Ok(Shape::new(concrete))

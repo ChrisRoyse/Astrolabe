@@ -13,9 +13,10 @@ pub use windows::{
     ImmutableDirectoryRoot, ImmutableFileIdentity, ImmutableFileSnapshot, OnnxCpuAuthorization,
     OnnxCudaDeviceAttestation, OnnxCudaExecutionStream, OnnxLoadedModuleAttestation,
     OnnxRuntimeArtifactAttestation, OnnxRuntimeAttestation, OnnxRuntimeContractAttestation,
-    attest_cuda_provider_after_session, authorize_cpu_companion, available_host_memory_bytes,
-    create_cuda_execution_stream, current_runtime_attestation, ensure_runtime,
-    expected_runtime_contract, initialize_pinned_cuda_runtime_boundary, open_immutable_directory,
+    RetainedImmutableFile, attest_cuda_provider_after_session, authorize_cpu_companion,
+    available_host_memory_bytes, create_cuda_execution_stream, current_runtime_attestation,
+    ensure_runtime, expected_runtime_contract, initialize_pinned_cuda_runtime_boundary,
+    open_immutable_child_directory, open_immutable_directory, retain_immutable_file,
     revalidate_runtime_attestation, selected_cuda_device, snapshot_immutable_file,
 };
 

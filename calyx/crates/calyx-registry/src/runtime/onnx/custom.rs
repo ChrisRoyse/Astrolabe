@@ -30,6 +30,7 @@ pub struct CustomOnnxRuntime {
     session: ManagedOnnxSession,
     run_plan: OnnxRunPlan,
     tokenizer: Tokenizer,
+    output_name: String,
     output: CustomOutput,
     max_tokens: usize,
 }
@@ -185,13 +186,13 @@ pub fn from_files(spec: OnnxFileSpec) -> Result<OnnxLens> {
         "onnx-custom",
         session.as_ref(),
     )?;
-    let output = output_from_session(
+    let output_contract = output_from_session(
         session.as_ref(),
         spec.expected_shape,
         spec.pooling,
         spec.norm_policy,
     )?;
-    let shape = output.shape();
+    let shape = output_contract.output.shape();
     let tokenizer = Tokenizer::from_file(&spec.tokenizer)
         .map_err(|err| config_invalid(format!("load tokenizer failed: {err}")))?;
     let contract = contract_from_facts(ContractFacts {
@@ -211,7 +212,8 @@ pub fn from_files(spec: OnnxFileSpec) -> Result<OnnxLens> {
         session: session.into_inner(),
         run_plan,
         tokenizer,
-        output,
+        output_name: output_contract.name,
+        output: output_contract.output,
         max_tokens,
     };
     Ok(OnnxLens::from_custom_parts(
@@ -237,6 +239,7 @@ impl CustomOnnxRuntime {
             &mut self.session,
             input_tensors,
             (batch.batch, batch.seq),
+            &self.output_name,
             |outputs| vectors_from_output(outputs, batch, output),
         )?;
         Ok(vectors)

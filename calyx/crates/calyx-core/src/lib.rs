@@ -65,9 +65,9 @@ pub use temporal::{
 };
 pub use time::{Clock, FixedClock, Seq, SystemClock, Ts};
 pub use traits::{
-    Estimator, Index, Input, Lens, OnnxCommittedNodeEvidence,
-    OnnxCommittedSessionPlacementEvidence, OnnxCudaExecutionEvidence,
-    OnnxCudaExecutionEvidenceKind, OnnxFirstInferencePlacementEvidence, OnnxPlacementNodeRole,
-    OnnxProfiledNodeEvidence, OnnxRetainedCudaStreamEvidence, RuntimeExecutionAttestation,
-    VaultStore,
+    Estimator, Index, Input, Lens, OnnxApi24PartitionNodeEvidence,
+    OnnxApi24PartitionReceiptEvidence, OnnxCudaExecutionEvidence, OnnxCudaExecutionEvidenceKind,
+    OnnxFinalGraphNodeEvidence, OnnxFinalGraphPlacementEvidence,
+    OnnxFirstInferencePlacementEvidence, OnnxPlacementNodeRole, OnnxProfiledNodeEvidence,
+    OnnxRetainedCudaStreamEvidence, RuntimeExecutionAttestation, VaultStore,
 };

@@ -3,29 +3,28 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
 
 use calyx_core::{
-    CalyxError, OnnxCommittedNodeEvidence, OnnxCommittedSessionPlacementEvidence,
-    OnnxCudaExecutionEvidence, OnnxCudaExecutionEvidenceKind, OnnxFirstInferencePlacementEvidence,
-    OnnxPlacementNodeRole, OnnxProfiledNodeEvidence, OnnxRetainedCudaStreamEvidence, Result,
-    RuntimeExecutionAttestation,
+    CalyxError, OnnxApi24PartitionNodeEvidence, OnnxApi24PartitionReceiptEvidence,
+    OnnxCudaExecutionEvidence, OnnxCudaExecutionEvidenceKind, OnnxFinalGraphNodeEvidence,
+    OnnxFinalGraphPlacementEvidence, OnnxFirstInferencePlacementEvidence, OnnxPlacementNodeRole,
+    OnnxProfiledNodeEvidence, OnnxRetainedCudaStreamEvidence, Result, RuntimeExecutionAttestation,
 };
 use fastembed::SessionPolicy;
 use ort::session::Session;
-use sha2::{Digest, Sha256};
 
 use super::cpu_fallback_audit::{
-    CommittedGraphAssignment, profiling_file_path, read_committed_graph_assignment,
-    reconcile_profile_with_contract,
+    CommittedGraphAssignment, read_committed_graph_assignment,
+    reconcile_profile_with_optimized_graph, validate_partition_receipt,
 };
+use super::evidence_artifact::{DurableOnnxArtifact, OnnxEvidenceTransaction};
 use super::fastembed_artifacts::FrozenFastembedReceipt;
 use super::placement_contract::{
-    CudaPlacementContract, inspect_cuda_placement, optimized_graph_file_path,
+    OptimizedGraphReceipt, classify_profiled_cuda_placement, inspect_optimized_graph,
 };
 use super::{OnnxModelFiles, OnnxProviderPolicy};
 
 const CUDA_REMEDIATION: &str = "verify the process-global pinned CUDA 13 ONNX Runtime identity, its attested selected physical device, and the CUDA kernel roster for every frozen operator; select the explicit CPU constructor only when CUDA is genuinely unavailable before session construction, and never retry a failed CUDA session on CPU";
 const CPU_REMEDIATION: &str = "verify the process-global pinned ONNX Runtime identity and repair the explicitly authorized CPU model/session configuration before retrying";
 const MAX_PROTO_RECURSION: usize = 64;
-const MAX_PROFILE_TRACE_BYTES: u64 = 64 * 1024 * 1024;
 
 #[derive(Debug)]
 pub(super) struct FastembedModelContext {
@@ -40,9 +39,9 @@ pub(super) struct FastembedModelContext {
     provider_policy: OnnxProviderPolicy,
     device: String,
     profile_prefix: Option<PathBuf>,
-    profile_root: Option<calyx_onnx_runtime::ImmutableDirectoryRoot>,
-    optimized_graph_path: Option<PathBuf>,
-    optimized_graph_root: Option<calyx_onnx_runtime::ImmutableDirectoryRoot>,
+    optimized_staging_path: Option<PathBuf>,
+    evidence_transaction: Option<OnnxEvidenceTransaction>,
+    optimized_graph_artifact: Option<DurableOnnxArtifact>,
     frozen_operators: String,
 }
 
@@ -58,37 +57,15 @@ impl FastembedModelContext {
         let device = selected_device
             .map(|device| device.frozen_execution_device())
             .unwrap_or_else(|| "cpu".to_string());
-        let profile_prefix = (provider_policy == OnnxProviderPolicy::CudaFailLoud)
-            .then(|| profiling_file_path(&label));
-        let profile_root = profile_prefix
-            .as_ref()
-            .map(|prefix| {
-                let parent = prefix.parent().ok_or_else(|| {
-                    CalyxError::lens_unreachable(format!(
-                        "FastEmbed profiling prefix {} has no parent directory",
-                        prefix.display()
-                    ))
-                })?;
-                calyx_onnx_runtime::open_immutable_directory(parent)
-            })
+        let evidence_transaction = (provider_policy == OnnxProviderPolicy::CudaFailLoud)
+            .then(|| OnnxEvidenceTransaction::begin(&files.model_file, &label))
             .transpose()?;
-        let optimized_graph_path = if provider_policy == OnnxProviderPolicy::CudaFailLoud {
-            Some(optimized_graph_file_path(&label)?)
-        } else {
-            None
-        };
-        let optimized_graph_root = optimized_graph_path
+        let profile_prefix = evidence_transaction
             .as_ref()
-            .map(|path| {
-                let parent = path.parent().ok_or_else(|| {
-                    CalyxError::lens_unreachable(format!(
-                        "FastEmbed optimized-graph path {} has no parent directory",
-                        path.display()
-                    ))
-                })?;
-                calyx_onnx_runtime::open_immutable_directory(parent)
-            })
-            .transpose()?;
+            .map(|transaction| transaction.profile_prefix().to_path_buf());
+        let optimized_staging_path = evidence_transaction
+            .as_ref()
+            .map(|transaction| transaction.optimized_graph_path().to_path_buf());
         Ok(Self {
             label,
             model_code: model_code.to_string(),
@@ -101,9 +78,9 @@ impl FastembedModelContext {
             provider_policy,
             device,
             profile_prefix,
-            profile_root,
-            optimized_graph_path,
-            optimized_graph_root,
+            optimized_staging_path,
+            evidence_transaction,
+            optimized_graph_artifact: None,
             frozen_operators: receipt.frozen_operators.clone(),
         })
     }
@@ -117,61 +94,40 @@ impl FastembedModelContext {
                         "CUDA FastEmbed context has no profiling prefix",
                     )
                 })?,
-                self.optimized_graph_path.as_ref().cloned().ok_or_else(|| {
-                    self.error(
-                        "session_policy",
-                        "CUDA FastEmbed context has no optimized-graph path",
-                    )
-                })?,
+                self.optimized_staging_path
+                    .as_ref()
+                    .cloned()
+                    .ok_or_else(|| {
+                        self.error(
+                            "session_policy",
+                            "CUDA FastEmbed context has no optimized-graph path",
+                        )
+                    })?,
             )),
             OnnxProviderPolicy::CpuExplicit => Ok(SessionPolicy::explicit_cpu()),
         }
     }
 
     fn snapshot_optimized_graph(&self) -> Result<(PathBuf, Vec<u8>)> {
-        let path = self.optimized_graph_path.as_ref().ok_or_else(|| {
+        let artifact = self.optimized_graph_artifact.as_ref().ok_or_else(|| {
             self.error(
                 "optimized_graph_readback",
-                "CUDA FastEmbed context has no optimized-graph path",
+                "CUDA FastEmbed context has no durable optimized-graph artifact",
             )
         })?;
-        let root = self.optimized_graph_root.as_ref().ok_or_else(|| {
-            self.error(
-                "optimized_graph_readback",
-                "CUDA FastEmbed context has no retained immutable optimized-graph root",
-            )
-        })?;
-        let observed_bytes = std::fs::metadata(path)
-            .map_err(|error| self.error("optimized_graph_metadata", error))?
-            .len();
-        if observed_bytes == 0 {
-            return Err(self.error(
-                "optimized_graph_readback",
-                format!(
-                    "ORT serialized an empty optimized graph at {}",
-                    path.display()
-                ),
-            ));
+        let bytes = artifact
+            .revalidate()
+            .map_err(|error| self.preserve("optimized_graph_readback", error))?;
+        Ok((artifact.final_path.clone(), bytes))
+    }
+
+    fn preserve(&self, stage: &'static str, error: CalyxError) -> CalyxError {
+        let contextual = self.error(stage, &error.message);
+        CalyxError {
+            code: error.code,
+            message: contextual.message,
+            remediation: error.remediation,
         }
-        let snapshot =
-            calyx_onnx_runtime::snapshot_immutable_file(path, Some(root), observed_bytes)
-                .map_err(|error| self.error("optimized_graph_readback", error))?;
-        let snapshot_bytes = u64::try_from(snapshot.bytes.len()).map_err(|_| {
-            self.error(
-                "optimized_graph_readback",
-                "optimized graph byte length exceeds u64",
-            )
-        })?;
-        if snapshot_bytes != observed_bytes {
-            return Err(self.error(
-                "optimized_graph_readback",
-                format!(
-                    "optimized graph length changed during immutable readback: metadata={observed_bytes} snapshot={snapshot_bytes} path={}",
-                    snapshot.final_path.display()
-                ),
-            ));
-        }
-        Ok((snapshot.final_path, snapshot.bytes))
     }
 
     pub(super) fn error(&self, stage: &'static str, reason: impl ToString) -> CalyxError {
@@ -192,9 +148,13 @@ impl FastembedModelContext {
                     .as_ref()
                     .map(|path| path.display().to_string())
                     .unwrap_or_else(|| "none".to_string()),
-                self.optimized_graph_path
+                self.optimized_staging_path
                     .as_ref()
                     .map(|path| path.display().to_string())
+                    .or_else(|| self
+                        .optimized_graph_artifact
+                        .as_ref()
+                        .map(|artifact| artifact.final_path.display().to_string()))
                     .unwrap_or_else(|| "none".to_string()),
                 stage,
                 self.frozen_operators,
@@ -208,11 +168,14 @@ impl FastembedModelContext {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 enum ExecutionState {
-    Pending,
+    Pending(Option<OnnxEvidenceTransaction>),
     Finalizing,
-    Attested(RuntimeExecutionAttestation),
+    Attested {
+        attestation: RuntimeExecutionAttestation,
+        _profile_artifact: Option<DurableOnnxArtifact>,
+    },
     Failed(CalyxError),
 }
 
@@ -220,7 +183,7 @@ enum ExecutionState {
 pub(super) struct FastembedExecutionState {
     context: FastembedModelContext,
     assignment: CommittedGraphAssignment,
-    placement_contract: Option<CudaPlacementContract>,
+    optimized_graph_receipt: Option<OptimizedGraphReceipt>,
     retained_stream: Option<OnnxRetainedCudaStreamEvidence>,
     state: Mutex<ExecutionState>,
 }
@@ -228,18 +191,30 @@ pub(super) struct FastembedExecutionState {
 impl FastembedExecutionState {
     pub(super) fn inspect(
         session: &Session,
-        context: FastembedModelContext,
+        mut context: FastembedModelContext,
         retained_stream: Option<OnnxRetainedCudaStreamEvidence>,
     ) -> Result<Self> {
         let assignment = read_committed_graph_assignment(session, &context.label)
-            .map_err(|error| context.error("api24_graph_assignment_readback", error))?;
-        let placement_contract = match context.provider_policy {
+            .map_err(|error| context.preserve("api24_graph_assignment_readback", error))?;
+        let optimized_graph_receipt = match context.provider_policy {
             OnnxProviderPolicy::CudaFailLoud => {
-                let (path, bytes) = context.snapshot_optimized_graph()?;
-                Some(
-                    inspect_cuda_placement(&assignment, &path, &bytes)
-                        .map_err(|error| context.error("optimized_graph_classification", error))?,
-                )
+                validate_partition_receipt(&assignment, &context.label, true)
+                    .map_err(|error| context.preserve("api24_partition_validation", error))?;
+                let missing_transaction = context.error(
+                    "optimized_graph_publish",
+                    "CUDA FastEmbed context lost its durable evidence transaction",
+                );
+                let transaction = context
+                    .evidence_transaction
+                    .as_mut()
+                    .ok_or(missing_transaction)?;
+                let artifact = transaction
+                    .publish_optimized_graph()
+                    .map_err(|error| context.preserve("optimized_graph_publish", error))?;
+                let receipt = inspect_optimized_graph(&artifact.final_path, &artifact.bytes)
+                    .map_err(|error| context.preserve("optimized_graph_inspection", error))?;
+                context.optimized_graph_artifact = Some(artifact);
+                Some(receipt)
             }
             OnnxProviderPolicy::CpuExplicit => {
                 validate_explicit_cpu_assignment(&context, &assignment)?;
@@ -294,11 +269,11 @@ impl FastembedExecutionState {
             assignment.per_provider_operators,
         );
         Ok(Self {
+            state: Mutex::new(ExecutionState::Pending(context.evidence_transaction.take())),
             context,
             assignment,
-            placement_contract,
+            optimized_graph_receipt,
             retained_stream,
-            state: Mutex::new(ExecutionState::Pending),
         })
     }
 
@@ -336,7 +311,23 @@ impl FastembedExecutionState {
                 "first_inference_profile_state",
                 "profiling finalization is already in progress",
             )),
-            ExecutionState::Pending | ExecutionState::Attested(_) => Ok(()),
+            ExecutionState::Pending(_) | ExecutionState::Attested { .. } => Ok(()),
+        }
+    }
+
+    /// Returns whether the next CUDA inference must be exactly one ORT Run so
+    /// its session-wide profile can be reconciled one-to-one with the final
+    /// optimized graph. Callers hold their model mutex while consulting this
+    /// state, then execute and seal one real item before any batch remainder.
+    pub(super) fn requires_single_run_profile(&self) -> Result<bool> {
+        match &*self.lock_state()? {
+            ExecutionState::Pending(transaction) => Ok(transaction.is_some()),
+            ExecutionState::Attested { .. } => Ok(false),
+            ExecutionState::Failed(error) => Err(error.clone()),
+            ExecutionState::Finalizing => Err(self.context.error(
+                "first_inference_profile_state",
+                "profiling finalization is already in progress",
+            )),
         }
     }
 
@@ -347,9 +338,16 @@ impl FastembedExecutionState {
         end_profiling: impl FnOnce() -> ort::Result<String>,
     ) -> Result<()> {
         let mut state = self.lock_state()?;
-        match &*state {
-            ExecutionState::Attested(_) => return Ok(()),
-            ExecutionState::Failed(error) => return Err(error.clone()),
+        let transaction = match std::mem::replace(&mut *state, ExecutionState::Finalizing) {
+            ExecutionState::Pending(transaction) => transaction,
+            attested @ ExecutionState::Attested { .. } => {
+                *state = attested;
+                return Ok(());
+            }
+            ExecutionState::Failed(error) => {
+                *state = ExecutionState::Failed(error.clone());
+                return Err(error);
+            }
             ExecutionState::Finalizing => {
                 let error = self.context.error(
                     "first_inference_profile_state",
@@ -359,20 +357,36 @@ impl FastembedExecutionState {
                 *state = ExecutionState::Failed(error.clone());
                 return Err(error);
             }
-            ExecutionState::Pending => {}
-        }
-        *state = ExecutionState::Finalizing;
+        };
 
         let result = match self.context.provider_policy {
-            OnnxProviderPolicy::CudaFailLoud => self.cuda_profile_attestation(end_profiling),
-            OnnxProviderPolicy::CpuExplicit => Ok(self.assignment_attestation(
-                "onnx_api24_committed_session_after_first_real_synchronized_inference",
-                self.assignment.per_provider.clone(),
-                None,
-            )),
+            OnnxProviderPolicy::CudaFailLoud => match transaction {
+                Some(transaction) => self.cuda_profile_attestation(transaction, end_profiling),
+                None => Err(self.context.error(
+                    "first_inference_evidence_transaction",
+                    "CUDA FastEmbed session has no pending durable evidence transaction",
+                )),
+            },
+            OnnxProviderPolicy::CpuExplicit => {
+                if transaction.is_some() {
+                    Err(self.context.error(
+                        "first_inference_evidence_transaction",
+                        "explicit-CPU FastEmbed session unexpectedly retained a CUDA evidence transaction",
+                    ))
+                } else {
+                    Ok((
+                        self.assignment_attestation(
+                            "onnx_api24_committed_session_after_first_real_synchronized_inference",
+                            self.assignment.per_provider.clone(),
+                            None,
+                        ),
+                        None,
+                    ))
+                }
+            }
         };
         match result {
-            Ok(attestation) => {
+            Ok((attestation, profile_artifact)) => {
                 eprintln!(
                     "CALYX_ONNX_RUNTIME phase=fastembed_execution_attestation_committed label={} model={} provider={} device={} total_nodes={} cpu_nodes={}",
                     self.context.label,
@@ -382,7 +396,10 @@ impl FastembedExecutionState {
                     attestation.total_compute_nodes.unwrap_or(0),
                     attestation.cpu_compute_nodes.unwrap_or(0)
                 );
-                *state = ExecutionState::Attested(attestation);
+                *state = ExecutionState::Attested {
+                    attestation,
+                    _profile_artifact: profile_artifact,
+                };
                 Ok(())
             }
             Err(error) => {
@@ -395,54 +412,71 @@ impl FastembedExecutionState {
 
     pub(super) fn execution_attestation(&self) -> Result<Option<RuntimeExecutionAttestation>> {
         match &*self.lock_state()? {
-            ExecutionState::Pending | ExecutionState::Finalizing => Ok(None),
-            ExecutionState::Attested(attestation) => Ok(Some(attestation.clone())),
+            ExecutionState::Pending(_) | ExecutionState::Finalizing => Ok(None),
+            ExecutionState::Attested { attestation, .. } => Ok(Some(attestation.clone())),
             ExecutionState::Failed(error) => Err(error.clone()),
         }
     }
 
     fn cuda_profile_attestation(
         &self,
+        mut transaction: OnnxEvidenceTransaction,
         end_profiling: impl FnOnce() -> ort::Result<String>,
-    ) -> Result<RuntimeExecutionAttestation> {
+    ) -> Result<(RuntimeExecutionAttestation, Option<DurableOnnxArtifact>)> {
         let trace_path = end_profiling()
             .map_err(|error| self.context.error("first_inference_end_profiling", error))?;
-        let (trace_path, trace_bytes) = self.snapshot_profile(&trace_path)?;
-        let trace = std::str::from_utf8(&trace_bytes).map_err(|error| {
+        let profile_artifact = transaction
+            .publish_profile(Path::new(&trace_path))
+            .map_err(|error| {
+                self.context
+                    .preserve("first_inference_profile_publish", error)
+            })?;
+        let trace = std::str::from_utf8(&profile_artifact.bytes).map_err(|error| {
             self.context.error(
                 "first_inference_profile_parse",
-                format!("profile {} is not UTF-8: {error}", trace_path.display()),
+                format!(
+                    "profile {} is not UTF-8: {error}",
+                    profile_artifact.final_path.display()
+                ),
             )
         })?;
-        let trace_sha256 = format!("{:x}", Sha256::digest(&trace_bytes));
-        let contract = self.placement_contract.as_ref().ok_or_else(|| {
+        let trace_sha256 = profile_artifact.sha256.clone();
+        let optimized_receipt = self.optimized_graph_receipt.as_ref().ok_or_else(|| {
             self.context.error(
-                "first_inference_placement_contract",
-                "CUDA FastEmbed session has no retained optimized-graph placement contract",
+                "first_inference_optimized_graph_receipt",
+                "CUDA FastEmbed session has no retained optimized-graph receipt",
             )
         })?;
         let (optimized_path, optimized_bytes) = self.context.snapshot_optimized_graph()?;
-        let observed_contract =
-            inspect_cuda_placement(&self.assignment, &optimized_path, &optimized_bytes).map_err(
-                |error| {
-                    self.context
-                        .error("optimized_graph_reclassification", error)
-                },
-            )?;
-        if observed_contract != *contract {
+        let observed_receipt = inspect_optimized_graph(&optimized_path, &optimized_bytes)
+            .map_err(|error| self.context.preserve("optimized_graph_reinspection", error))?;
+        if observed_receipt != *optimized_receipt {
             return Err(self.context.error(
-                "optimized_graph_reclassification",
+                "optimized_graph_reinspection",
                 format!(
-                    "optimized graph placement contract drifted after session publication: committed={} observed={}",
-                    contract.contract_sha256, observed_contract.contract_sha256
+                    "optimized graph drifted after session quarantine: retained={} observed={}",
+                    optimized_receipt.optimized_graph_sha256,
+                    observed_receipt.optimized_graph_sha256
                 ),
             ));
         }
-        let profile = reconcile_profile_with_contract(&self.context.label, trace, contract)
-            .map_err(|error| {
+        let profile =
+            reconcile_profile_with_optimized_graph(&self.context.label, trace, optimized_receipt)
+                .map_err(|error| {
                 self.context
-                    .error("first_inference_profile_reconciliation", error)
+                    .preserve("first_inference_profile_reconciliation", error)
             })?;
+        let contract = classify_profiled_cuda_placement(
+            &self.assignment,
+            optimized_receipt,
+            &optimized_bytes,
+            &profile,
+            &trace_sha256,
+        )
+        .map_err(|error| {
+            self.context
+                .preserve("first_inference_placement_classification", error)
+        })?;
         eprintln!(
             "CALYX_ONNX_RUNTIME phase=fastembed_first_inference_attested label={} model={} provider={} api24_nodes={} cuda_compute_nodes={} cpu_metadata_nodes={} profile_nodes={} placement_contract_sha256={} profile_path={} profile_sha256={}",
             self.context.label,
@@ -453,21 +487,21 @@ impl FastembedExecutionState {
             profile.cpu_metadata_nodes,
             profile.total_nodes,
             contract.contract_sha256,
-            trace_path.display(),
+            profile_artifact.final_path.display(),
             trace_sha256
         );
-        let profile_path = trace_path.to_str().ok_or_else(|| {
+        let profile_path = profile_artifact.final_path.to_str().ok_or_else(|| {
             self.context.error(
                 "first_inference_profile_path_validation",
                 format!(
                     "profile path {} is not valid UTF-8; lossy execution evidence is forbidden",
-                    trace_path.display()
+                    profile_artifact.final_path.display()
                 ),
             )
         })?;
-        let mut committed_nodes = Vec::new();
+        let mut final_nodes = Vec::new();
         for node in &contract.cuda_compute_nodes {
-            committed_nodes.push(OnnxCommittedNodeEvidence {
+            final_nodes.push(OnnxFinalGraphNodeEvidence {
                 name: node.name.clone(),
                 domain: node.domain.clone(),
                 operator: node.operator.clone(),
@@ -490,7 +524,7 @@ impl FastembedExecutionState {
                         ),
                     )
                 })?;
-            committed_nodes.push(OnnxCommittedNodeEvidence {
+            final_nodes.push(OnnxFinalGraphNodeEvidence {
                 name: node.name.clone(),
                 domain: node.domain.clone(),
                 operator: node.operator.clone(),
@@ -500,9 +534,10 @@ impl FastembedExecutionState {
                 output_dtypes: Some(proof.output_dtypes.clone()),
             });
         }
-        committed_nodes.sort_by(|left, right| left.name.cmp(&right.name));
+        final_nodes.sort_by(|left, right| left.name.cmp(&right.name));
+        let final_assigned_operators = final_provider_operator_summary(&final_nodes);
         let structured = OnnxCudaExecutionEvidence {
-            kind: OnnxCudaExecutionEvidenceKind::OptimizedGraphClassifiedV1Api24AndFirstExactInferenceProfile,
+            kind: OnnxCudaExecutionEvidenceKind::Api24PartitionV2FinalGraphClassifiedV2AndFirstExactInferenceProfile,
             retained_stream: self.retained_stream.clone().ok_or_else(|| {
                 self.context.error(
                     "first_inference_retained_stream",
@@ -515,18 +550,41 @@ impl FastembedExecutionState {
             optimized_graph_path: contract.optimized_graph_path.clone(),
             optimized_graph_bytes: contract.optimized_graph_bytes,
             optimized_graph_sha256: contract.optimized_graph_sha256.clone(),
-            assignment_sha256: contract.assignment_sha256.clone(),
+            api24_partition_sha256: contract.api24_partition_sha256.clone(),
+            final_graph_placement_sha256: contract.final_graph_placement_sha256.clone(),
             cpu_metadata_proof_sha256: contract.cpu_metadata_proof_sha256.clone(),
             placement_contract_sha256: contract.contract_sha256.clone(),
-            committed_session: OnnxCommittedSessionPlacementEvidence {
+            api24_partition: OnnxApi24PartitionReceiptEvidence {
+                schema: self.assignment.schema.to_string(),
+                subgraph_count: self.assignment.subgraph_count,
+                total_nodes: self.assignment.total_nodes,
+                cuda_nodes: self.assignment.cuda_nodes,
+                cpu_nodes: self.assignment.cpu_nodes,
+                providers: self.assignment.per_provider.clone(),
+                assigned_operators: self.assignment.per_provider_operators.clone(),
+                nodes: self
+                    .assignment
+                    .nodes
+                    .iter()
+                    .map(|node| OnnxApi24PartitionNodeEvidence {
+                        subgraph_index: node.subgraph_index,
+                        node_index_in_subgraph: node.node_index_in_subgraph,
+                        name: node.name.clone(),
+                        domain: node.domain.clone(),
+                        operator: node.operator.clone(),
+                        provider: node.provider.clone(),
+                    })
+                    .collect(),
+            },
+            final_graph_placement: OnnxFinalGraphPlacementEvidence {
                 total_graph_nodes: contract.total_graph_nodes(),
                 cuda_compute_nodes: contract.cuda_compute_node_count(),
                 cpu_metadata_nodes: contract.cpu_metadata_node_count(),
                 unclassified_cpu_nodes: 0,
                 inter_provider_memcpy_nodes: 0,
-                providers: self.assignment.per_provider.clone(),
-                assigned_operators: self.assignment.per_provider_operators.clone(),
-                nodes: committed_nodes,
+                providers: profile.per_provider.clone(),
+                assigned_operators: final_assigned_operators,
+                nodes: final_nodes,
             },
             first_inference_profile: OnnxFirstInferencePlacementEvidence {
                 total_graph_nodes: profile.total_nodes,
@@ -540,6 +598,7 @@ impl FastembedExecutionState {
                     .iter()
                     .map(|node| OnnxProfiledNodeEvidence {
                         name: node.name.clone(),
+                        domain: node.domain.clone(),
                         operator: node.operator.clone(),
                         provider: node.provider.clone(),
                         role: if node.provider == "CUDAExecutionProvider" {
@@ -555,13 +614,20 @@ impl FastembedExecutionState {
                     .collect(),
             },
             profile_path: profile_path.to_string(),
+            profile_bytes: u64::try_from(profile_artifact.bytes.len()).map_err(|_| {
+                self.context.error(
+                    "first_inference_profile_size",
+                    "durable first-inference profile exceeds the u64 evidence contract",
+                )
+            })?,
             profile_sha256: trace_sha256,
         };
-        Ok(RuntimeExecutionAttestation {
+        let attestation = RuntimeExecutionAttestation {
             runtime: super::execution_attestation::ONNX_FASTEMBED_RUNTIME_ID.to_string(),
             provider: format!(
-                "api24={};profile={};placement_contract={}",
-                structured.committed_session.providers,
+                "partition={};final={};profile={};placement_contract={}",
+                structured.api24_partition.providers,
+                structured.final_graph_placement.providers,
                 structured.first_inference_profile.providers,
                 structured.placement_contract_sha256
             ),
@@ -573,62 +639,8 @@ impl FastembedExecutionState {
             )?,
             total_compute_nodes: Some(contract.cuda_compute_node_count()),
             cpu_compute_nodes: Some(0),
-        })
-    }
-
-    fn snapshot_profile(&self, trace_path: &str) -> Result<(PathBuf, Vec<u8>)> {
-        let prefix = self.context.profile_prefix.as_ref().ok_or_else(|| {
-            self.context.error(
-                "first_inference_profile_readback",
-                "CUDA FastEmbed context has no profiling prefix",
-            )
-        })?;
-        let root = self.context.profile_root.as_ref().ok_or_else(|| {
-            self.context.error(
-                "first_inference_profile_readback",
-                "CUDA FastEmbed context has no retained immutable profiling root",
-            )
-        })?;
-        let snapshot = calyx_onnx_runtime::snapshot_immutable_file(
-            Path::new(trace_path),
-            Some(&root),
-            MAX_PROFILE_TRACE_BYTES,
-        )
-        .map_err(|error| {
-            self.context
-                .error("first_inference_profile_readback", error)
-        })?;
-        let expected_name = prefix
-            .file_name()
-            .and_then(|name| name.to_str())
-            .ok_or_else(|| {
-                self.context.error(
-                    "first_inference_profile_path_validation",
-                    "profiling prefix has no UTF-8 file name",
-                )
-            })?;
-        let observed_name = snapshot
-            .final_path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .ok_or_else(|| {
-                self.context.error(
-                    "first_inference_profile_path_validation",
-                    format!("returned profiling path {trace_path} has no UTF-8 file name"),
-                )
-            })?;
-        if !observed_name.starts_with(expected_name) {
-            return Err(self.context.error(
-                "first_inference_profile_path_validation",
-                format!(
-                    "ORT returned profile path {trace_path}, resolved to {}, outside expected prefix {} under retained root {}",
-                    snapshot.final_path.display(),
-                    prefix.display(),
-                    root.final_path().display()
-                ),
-            ));
-        }
-        Ok((snapshot.final_path, snapshot.bytes))
+        };
+        Ok((attestation, Some(profile_artifact)))
     }
 
     fn assignment_attestation(
@@ -691,10 +703,37 @@ impl FastembedExecutionState {
     }
 }
 
+fn final_provider_operator_summary(nodes: &[OnnxFinalGraphNodeEvidence]) -> String {
+    let mut providers = BTreeMap::<&str, BTreeSet<String>>::new();
+    for node in nodes {
+        let qualified = if node.domain.is_empty() {
+            node.operator.clone()
+        } else {
+            format!("{}::{}", node.domain, node.operator)
+        };
+        providers
+            .entry(node.provider.as_str())
+            .or_default()
+            .insert(qualified);
+    }
+    providers
+        .into_iter()
+        .map(|(provider, operators)| {
+            format!(
+                "{provider}:[{}]",
+                operators.into_iter().collect::<Vec<_>>().join(",")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(";")
+}
+
 fn validate_explicit_cpu_assignment(
     context: &FastembedModelContext,
     assignment: &CommittedGraphAssignment,
 ) -> Result<()> {
+    validate_partition_receipt(assignment, &context.label, false)
+        .map_err(|error| context.preserve("api24_partition_validation", error))?;
     if assignment.total_nodes == 0 {
         return Err(context.error(
             "api24_graph_assignment_validation",
