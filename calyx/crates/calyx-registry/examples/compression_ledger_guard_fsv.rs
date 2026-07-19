@@ -715,7 +715,11 @@ fn dense_vector(index: usize) -> SlotVector {
 }
 
 fn queries(vault: &AsterVault<SystemClock>) -> Vec<CompressionQuery> {
-    let input = event(0);
+    let input = IngestInput::new(
+        b"issue594-independent-recall-query".to_vec(),
+        PANEL_VERSION,
+        Modality::Code,
+    );
     let mut values = vec![0.0; DIM as usize];
     for (index, value) in values.iter_mut().take(ROWS).enumerate() {
         *value = 1.0 / (index + 1) as f32;
