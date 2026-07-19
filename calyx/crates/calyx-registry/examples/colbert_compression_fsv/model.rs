@@ -49,7 +49,7 @@ pub fn register_real_colbert(fixture_root: &Path) -> AnyResult<Registered> {
         "issue575-answerai-colbert",
         DEFAULT_ANSWERAI_COLBERT_MODEL,
         cache,
-        OnnxProviderPolicy::CpuExplicit,
+        OnnxProviderPolicy::CudaFailLoud,
     )?;
     let contract = lens.contract().clone();
     let spec = lens.lens_spec();

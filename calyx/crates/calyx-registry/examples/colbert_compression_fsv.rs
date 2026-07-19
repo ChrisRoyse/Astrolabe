@@ -107,6 +107,8 @@ fn write_fixture(
             "fixture_root": root,
             "source_of_truth": root.join("vault"),
             "real_model": calyx_registry::DEFAULT_ANSWERAI_COLBERT_MODEL,
+            "measurement_provider": "cuda_fail_loud",
+            "packed_scoring_backend": calyx_registry::packed_maxsim_backend(),
             "declared_knobs": {
                 "max_score_error": max_score_error,
                 "centroids": centroids,
