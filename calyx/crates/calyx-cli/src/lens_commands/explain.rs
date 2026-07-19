@@ -68,8 +68,10 @@ struct ExplainReport {
     full_vector: Option<Vec<f32>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     full_sparse: Option<Vec<SparseEntryReport>>,
-    total_ms: f32,
-    ms_per_input: f32,
+    repeat: usize,
+    timing: ExplainTimingReport,
+    total_ms: f64,
+    ms_per_input: f64,
     artifact_bytes: u64,
     artifact_mib: f32,
 }
@@ -98,8 +100,31 @@ struct LocalExecutionAttestationReport {
     evidence_kind: String,
 }
 
+#[derive(Serialize)]
+struct ExplainTimingReport {
+    clock: &'static str,
+    repeat: usize,
+    end_to_end_total_ms: f64,
+    setup_and_attestation_ms: f64,
+    measurement_total_ms: f64,
+    cold_first_measure_ms: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    steady_measurement: Option<SteadyTimingReport>,
+    measurement_samples_ms: Vec<f64>,
+}
+
+#[derive(Serialize)]
+struct SteadyTimingReport {
+    samples: usize,
+    total_ms: f64,
+    mean_ms: f64,
+    min_ms: f64,
+    max_ms: f64,
+}
+
 struct Measurement {
     vector: SlotVector,
+    measure_samples_ms: Vec<f64>,
     source_tensor_dtype_profile: Option<LensForgeSourceTensorDtypeProfile>,
     declared_model_dtype: String,
     local_execution_attestation: Option<LocalExecutionAttestationReport>,
@@ -109,6 +134,11 @@ struct Measurement {
     rows: Option<u32>,
     artifact_bytes: u64,
     runtime_detail: String,
+}
+
+struct RepeatedMeasurement {
+    vector: SlotVector,
+    samples_ms: Vec<f64>,
 }
 
 const UNKNOWN_DTYPE: &str = "unknown";
@@ -137,7 +167,8 @@ pub(crate) fn explain(args: &[String]) -> CliResult {
     let measurement = measure_runtime(&spec, &probe, repeat)?;
     #[cfg(windows)]
     let onnx_runtime_attestation = explain_onnx_runtime_attestation(&spec.runtime)?;
-    let total_ms = started.elapsed().as_secs_f64() as f32 * 1000.0;
+    let total_ms = started.elapsed().as_secs_f64() * 1000.0;
+    let timing = explain_timing(&measurement.measure_samples_ms, total_ms, repeat)?;
     validate_vector_contract(&measurement.vector, spec.output, spec.norm_policy)?;
     let norm = slot_norm(&measurement.vector);
     print_json(&ExplainReport {
@@ -169,8 +200,10 @@ pub(crate) fn explain(args: &[String]) -> CliResult {
         sparse_top: sparse_top(&measurement.vector, 8),
         full_vector: full_vector(&measurement.vector, flags.full_vector)?,
         full_sparse: full_sparse(&measurement.vector, flags.full_vector)?,
+        repeat,
+        timing,
         total_ms,
-        ms_per_input: total_ms / repeat as f32,
+        ms_per_input: total_ms / repeat as f64,
         artifact_bytes: measurement.artifact_bytes,
         artifact_mib: measurement.artifact_bytes as f32 / (1024.0 * 1024.0),
     })
@@ -451,9 +484,10 @@ fn input_bytes(flags: &Flags) -> CliResult<Vec<u8>> {
 fn measure_static_lookup(spec: &LensSpec, probe: &Input, repeat: usize) -> CliResult<Measurement> {
     let lens = StaticLookupLens::from_lens_spec(spec)?;
     require_runtime_lens_id(spec, &lens)?;
-    let vector = measure_repeated(&lens, probe, repeat)?;
+    let repeated = measure_repeated(&lens, probe, repeat)?;
     Ok(Measurement {
-        vector,
+        vector: repeated.vector,
+        measure_samples_ms: repeated.samples_ms,
         source_tensor_dtype_profile: None,
         declared_model_dtype: lens.dtype().as_str().to_string(),
         local_execution_attestation: None,
@@ -477,9 +511,10 @@ fn measure_tei(
 ) -> CliResult<Measurement> {
     let lens = TeiHttpLens::new(&spec.name, endpoint, spec.modality, dim(spec.output));
     require_runtime_lens_id(spec, &lens)?;
-    let vector = measure_repeated(&lens, probe, repeat)?;
+    let repeated = measure_repeated(&lens, probe, repeat)?;
     Ok(Measurement {
-        vector,
+        vector: repeated.vector,
+        measure_samples_ms: repeated.samples_ms,
         source_tensor_dtype_profile: None,
         // TEI does not attest model or execution dtype in LensRuntime; #485 owns that contract.
         declared_model_dtype: UNKNOWN_DTYPE.to_string(),
@@ -496,9 +531,10 @@ fn measure_tei(
 fn measure_candle(spec: &LensSpec, probe: &Input, repeat: usize) -> CliResult<Measurement> {
     let lens = CandleLens::from_lens_spec(spec)?;
     require_runtime_lens_id(spec, &lens)?;
-    let vector = measure_repeated(&lens, probe, repeat)?;
+    let repeated = measure_repeated(&lens, probe, repeat)?;
     Ok(Measurement {
-        vector,
+        vector: repeated.vector,
+        measure_samples_ms: repeated.samples_ms,
         source_tensor_dtype_profile: Some(lens.source_tensor_dtype_profile().clone()),
         declared_model_dtype: match &spec.runtime {
             LensRuntime::CandleLocal { dtype, .. } => dtype.clone(),
@@ -524,7 +560,7 @@ fn measure_candle(spec: &LensSpec, probe: &Input, repeat: usize) -> CliResult<Me
 fn measure_onnx(spec: &LensSpec, probe: &Input, repeat: usize) -> CliResult<Measurement> {
     let lens = OnnxLens::from_lens_spec(spec)?;
     require_runtime_lens_id(spec, &lens)?;
-    let vector = measure_repeated(&lens, probe, repeat)?;
+    let repeated = measure_repeated(&lens, probe, repeat)?;
     let expected_runtime = match &spec.runtime {
         LensRuntime::FastembedDensePlaced { .. } => ONNX_FASTEMBED_RUNTIME_ID,
         LensRuntime::Onnx { .. } => ONNX_CUSTOM_RUNTIME_ID,
@@ -537,7 +573,8 @@ fn measure_onnx(spec: &LensSpec, probe: &Input, repeat: usize) -> CliResult<Meas
     let runtime_execution_attestation =
         require_cuda_onnx_execution_attestation(&lens, expected_runtime)?;
     Ok(Measurement {
-        vector,
+        vector: repeated.vector,
+        measure_samples_ms: repeated.samples_ms,
         source_tensor_dtype_profile: None,
         // ONNX graph and execution dtype are not preserved in LensRuntime; #485 owns that contract.
         declared_model_dtype: UNKNOWN_DTYPE.to_string(),
@@ -554,11 +591,12 @@ fn measure_onnx(spec: &LensSpec, probe: &Input, repeat: usize) -> CliResult<Meas
 fn measure_onnx_colbert(spec: &LensSpec, probe: &Input, repeat: usize) -> CliResult<Measurement> {
     let lens = OnnxColbertLens::from_lens_spec(spec)?;
     require_runtime_lens_id(spec, &lens)?;
-    let vector = measure_repeated(&lens, probe, repeat)?;
+    let repeated = measure_repeated(&lens, probe, repeat)?;
     let runtime_execution_attestation =
         require_cuda_onnx_execution_attestation(&lens, ONNX_COLBERT_RUNTIME_ID)?;
     Ok(Measurement {
-        vector,
+        vector: repeated.vector,
+        measure_samples_ms: repeated.samples_ms,
         source_tensor_dtype_profile: None,
         declared_model_dtype: UNKNOWN_DTYPE.to_string(),
         local_execution_attestation: None,
@@ -578,11 +616,12 @@ fn measure_fastembed_sparse(
 ) -> CliResult<Measurement> {
     let lens = FastembedSparseLens::from_lens_spec(spec)?;
     require_runtime_lens_id(spec, &lens)?;
-    let vector = measure_repeated(&lens, probe, repeat)?;
+    let repeated = measure_repeated(&lens, probe, repeat)?;
     let runtime_execution_attestation =
         require_cuda_onnx_execution_attestation(&lens, ONNX_FASTEMBED_RUNTIME_ID)?;
     Ok(Measurement {
-        vector,
+        vector: repeated.vector,
+        measure_samples_ms: repeated.samples_ms,
         source_tensor_dtype_profile: None,
         declared_model_dtype: UNKNOWN_DTYPE.to_string(),
         local_execution_attestation: None,
@@ -602,11 +641,12 @@ fn measure_fastembed_bgem3(
 ) -> CliResult<Measurement> {
     let lens = FastembedBgem3Lens::from_lens_spec(spec)?;
     require_runtime_lens_id(spec, &lens)?;
-    let vector = measure_repeated(&lens, probe, repeat)?;
+    let repeated = measure_repeated(&lens, probe, repeat)?;
     let runtime_execution_attestation =
         require_cuda_onnx_execution_attestation(&lens, ONNX_FASTEMBED_RUNTIME_ID)?;
     Ok(Measurement {
-        vector,
+        vector: repeated.vector,
+        measure_samples_ms: repeated.samples_ms,
         source_tensor_dtype_profile: None,
         declared_model_dtype: UNKNOWN_DTYPE.to_string(),
         local_execution_attestation: None,
@@ -626,11 +666,12 @@ fn measure_fastembed_reranker(
 ) -> CliResult<Measurement> {
     let lens = FastembedRerankerLens::from_lens_spec(spec)?;
     require_runtime_lens_id(spec, &lens)?;
-    let vector = measure_repeated(&lens, probe, repeat)?;
+    let repeated = measure_repeated(&lens, probe, repeat)?;
     let runtime_execution_attestation =
         require_cuda_onnx_execution_attestation(&lens, ONNX_FASTEMBED_RUNTIME_ID)?;
     Ok(Measurement {
-        vector,
+        vector: repeated.vector,
+        measure_samples_ms: repeated.samples_ms,
         source_tensor_dtype_profile: None,
         declared_model_dtype: UNKNOWN_DTYPE.to_string(),
         local_execution_attestation: None,
@@ -650,9 +691,10 @@ fn measure_fastembed_qwen3(
 ) -> CliResult<Measurement> {
     let lens = calyx_registry::FastembedQwen3Lens::from_lens_spec(spec)?;
     require_runtime_lens_id(spec, &lens)?;
-    let vector = measure_repeated(&lens, probe, repeat)?;
+    let repeated = measure_repeated(&lens, probe, repeat)?;
     Ok(Measurement {
-        vector,
+        vector: repeated.vector,
+        measure_samples_ms: repeated.samples_ms,
         source_tensor_dtype_profile: Some(lens.source_tensor_dtype_profile().clone()),
         declared_model_dtype: match &spec.runtime {
             LensRuntime::FastembedQwen3 { dtype, .. } => dtype.clone(),
@@ -682,13 +724,14 @@ fn measure_fastembed_qwen3(
 fn measure_multimodal(spec: &LensSpec, probe: &Input, repeat: usize) -> CliResult<Measurement> {
     let lens = MultimodalAdapterLens::from_lens_spec(spec)?;
     require_runtime_lens_id(spec, &lens)?;
-    let vector = measure_repeated(&lens, probe, repeat)?;
+    let repeated = measure_repeated(&lens, probe, repeat)?;
     let artifact_bytes = match &spec.runtime {
         LensRuntime::MultimodalAdapter { files, .. } => artifact_files_size(files)?,
         _ => 0,
     };
     Ok(Measurement {
-        vector,
+        vector: repeated.vector,
+        measure_samples_ms: repeated.samples_ms,
         source_tensor_dtype_profile: None,
         declared_model_dtype: UNKNOWN_DTYPE.to_string(),
         local_execution_attestation: None,
@@ -704,12 +747,90 @@ fn measure_multimodal(spec: &LensSpec, probe: &Input, repeat: usize) -> CliResul
     })
 }
 
-fn measure_repeated(lens: &dyn Lens, probe: &Input, repeat: usize) -> CliResult<SlotVector> {
+fn measure_repeated(
+    lens: &dyn Lens,
+    probe: &Input,
+    repeat: usize,
+) -> CliResult<RepeatedMeasurement> {
     let mut last = None;
+    let mut samples_ms = Vec::with_capacity(repeat);
     for _ in 0..repeat {
+        let started = Instant::now();
         last = Some(lens.measure(probe)?);
+        samples_ms.push(started.elapsed().as_secs_f64() * 1000.0);
     }
-    last.ok_or_else(|| CliError::usage("repeat produced no vector"))
+    let vector = last.ok_or_else(|| CliError::usage("repeat produced no vector"))?;
+    Ok(RepeatedMeasurement { vector, samples_ms })
+}
+
+fn explain_timing(
+    measurement_samples_ms: &[f64],
+    end_to_end_total_ms: f64,
+    repeat: usize,
+) -> CliResult<ExplainTimingReport> {
+    const REMEDIATION: &str = "rerun on a host with a working monotonic clock and report the \
+         complete CALYX_LENS_EXPLAIN_TIMING_INVALID envelope";
+
+    let invalid = |message: String| {
+        CliError::from(CalyxError {
+            code: "CALYX_LENS_EXPLAIN_TIMING_INVALID",
+            message,
+            remediation: REMEDIATION,
+        })
+    };
+
+    if repeat == 0 || measurement_samples_ms.len() != repeat {
+        return Err(invalid(format!(
+            "repeat/sample cardinality mismatch: repeat={repeat}, samples={}",
+            measurement_samples_ms.len()
+        )));
+    }
+    if !end_to_end_total_ms.is_finite() || end_to_end_total_ms < 0.0 {
+        return Err(invalid(format!(
+            "end-to-end monotonic duration is invalid: {end_to_end_total_ms}"
+        )));
+    }
+    for (index, sample) in measurement_samples_ms.iter().copied().enumerate() {
+        if !sample.is_finite() || sample < 0.0 {
+            return Err(invalid(format!(
+                "measurement sample {index} is invalid: {sample}"
+            )));
+        }
+    }
+
+    let measurement_total_ms = measurement_samples_ms.iter().sum::<f64>();
+    if !measurement_total_ms.is_finite() || measurement_total_ms > end_to_end_total_ms {
+        return Err(invalid(format!(
+            "nested measurement total {measurement_total_ms} ms exceeds end-to-end total \
+             {end_to_end_total_ms} ms"
+        )));
+    }
+    let steady_measurement = if repeat > 1 {
+        let steady = &measurement_samples_ms[1..];
+        let total_ms = steady.iter().sum::<f64>();
+        let min_ms = steady.iter().copied().fold(f64::INFINITY, f64::min);
+        let max_ms = steady.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        Some(SteadyTimingReport {
+            samples: steady.len(),
+            total_ms,
+            mean_ms: total_ms / steady.len() as f64,
+            min_ms,
+            max_ms,
+        })
+    } else {
+        None
+    };
+
+    Ok(ExplainTimingReport {
+        clock: "std::time::Instant",
+        repeat,
+        end_to_end_total_ms,
+        setup_and_attestation_ms: end_to_end_total_ms - measurement_total_ms,
+        measurement_total_ms,
+        cold_first_measure_ms: measurement_samples_ms[0],
+        steady_measurement,
+        measurement_samples_ms: measurement_samples_ms.to_vec(),
+    })
 }
 
 fn artifact_files_size(files: &[PathBuf]) -> CliResult<u64> {

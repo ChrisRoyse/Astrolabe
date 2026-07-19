@@ -178,7 +178,8 @@ enum CudaDeviceRequest {
 
 struct PinnedCudaRuntime {
     state: Mutex<PinnedCudaRuntimeState>,
-    _module_handles: ModuleStack,
+    system_module_handles: BTreeMap<String, OwnedModule>,
+    _dependency_handles: ModuleStack,
 }
 
 struct PinnedCudaRuntimeState {
@@ -635,7 +636,21 @@ pub fn attest_pinned_cuda_driver_identity(
     expected_identity: PinnedCudaDeviceIdentity,
 ) -> Result<u32> {
     initialize_pinned_cuda_dependencies()?;
-    let observed = attest_pinned_cuda_driver_identity_inner(expected_identity)?;
+    let runtime = match CUDA_DEPENDENCIES.get_or_init(initialize_cuda_dependencies) {
+        Ok(runtime) => runtime,
+        Err(error) => return Err(error.clone()),
+    };
+    let nvcuda = runtime
+        .system_module_handles
+        .get("nvcuda.dll")
+        .ok_or_else(|| {
+            runtime_error(
+                "CALYX_ONNX_RUNTIME_MODULE_NOT_LOADED",
+                "the initialized pinned CUDA runtime retained no nvcuda.dll module handle",
+                BUNDLE_REMEDIATION,
+            )
+        })?;
+    let observed = attest_pinned_cuda_driver_identity_with_module(expected_identity, nvcuda.raw())?;
     attest_pinned_cuda_driver_dependencies()?;
     Ok(observed)
 }
@@ -647,11 +662,17 @@ pub fn attest_pinned_cuda_driver_identity_for_native_kernel(
     expected_identity: PinnedCudaDeviceIdentity,
 ) -> Result<u32> {
     initialize_pinned_cuda_runtime_boundary()?;
-    attest_pinned_cuda_driver_identity_inner(expected_identity)
+    let boundary = match BOUNDARY.get_or_init(initialize_boundary) {
+        Ok(boundary) => boundary,
+        Err(error) => return Err(error.clone()),
+    };
+    let nvcuda_module = load_verified_system_module(boundary, "nvcuda.dll")?;
+    attest_pinned_cuda_driver_identity_with_module(expected_identity, nvcuda_module.raw())
 }
 
-fn attest_pinned_cuda_driver_identity_inner(
+fn attest_pinned_cuda_driver_identity_with_module(
     expected_identity: PinnedCudaDeviceIdentity,
+    nvcuda_module: HMODULE,
 ) -> Result<u32> {
     let selected = current_pinned_cuda_device()?.ok_or_else(|| {
         runtime_error(
@@ -670,12 +691,7 @@ fn attest_pinned_cuda_driver_identity_inner(
             DEVICE_REMEDIATION,
         ));
     }
-    let boundary = match BOUNDARY.get_or_init(initialize_boundary) {
-        Ok(boundary) => boundary,
-        Err(error) => return Err(error.clone()),
-    };
-    let nvcuda_module = load_verified_system_module(boundary, "nvcuda.dll")?;
-    let observed = cuda_driver_ordinal_for_identity(nvcuda_module.raw(), expected_identity)?;
+    let observed = cuda_driver_ordinal_for_identity(nvcuda_module, expected_identity)?;
     if observed != selected.cuda_driver_ordinal {
         return Err(runtime_error(
             "CALYX_CUDA_DRIVER_ORDINAL_MISMATCH",
@@ -1374,7 +1390,7 @@ fn initialize_cuda_dependencies() -> Result<PinnedCudaRuntime> {
         true,
         false,
     )?;
-    let mut handles = ModuleStack::with_capacity(boundary.lock.files.len() + SYSTEM_MODULES.len());
+    let mut system_module_handles = BTreeMap::new();
     for name in SYSTEM_MODULES {
         let verified = verify_locked_system_module(&boundary.lock, &boundary.system32, name)?;
         let path = verified.path().to_path_buf();
@@ -1384,8 +1400,24 @@ fn initialize_cuda_dependencies() -> Result<PinnedCudaRuntime> {
                 _verified: verified,
             },
         )?;
-        handles.push(handle);
+        if system_module_handles
+            .insert(name.to_ascii_lowercase(), handle)
+            .is_some()
+        {
+            return Err(runtime_error(
+                "CALYX_ONNX_RUNTIME_CONTRACT_INVALID",
+                format!("duplicate retained system module handle for {name}"),
+                CONTRACT_REMEDIATION,
+            ));
+        }
     }
+    let mut dependency_handles = ModuleStack::with_capacity(
+        boundary
+            .lock
+            .loaded_module_policy
+            .dependency_preload_order
+            .len(),
+    );
     for bundle_path in &boundary.lock.loaded_module_policy.dependency_preload_order {
         let file = boundary
             .lock
@@ -1399,7 +1431,7 @@ fn initialize_cuda_dependencies() -> Result<PinnedCudaRuntime> {
                     CONTRACT_REMEDIATION,
                 )
             })?;
-        handles.push(load_locked_bundle_library(&boundary.root, file)?);
+        dependency_handles.push(load_locked_bundle_library(&boundary.root, file)?);
     }
 
     let attested = attest_modules(
@@ -1420,7 +1452,8 @@ fn initialize_cuda_dependencies() -> Result<PinnedCudaRuntime> {
             failure: None,
             _driver_store_handles: attested.driver_store_handles,
         }),
-        _module_handles: handles,
+        system_module_handles,
+        _dependency_handles: dependency_handles,
     })
 }
 
