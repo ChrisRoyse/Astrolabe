@@ -55,7 +55,6 @@ pub use failpoints::{
     CRASH_FSV_ARMED_IN_PRODUCTION, crash_fsv_guard_decision, guard_against_production_failpoints,
 };
 pub use grant::{AuditEvent, GrantEntry, GrantStore};
-pub use ledger_append::CALYX_ASTER_RAW_LEDGER_COMMIT_BOUNDARY;
 pub use htap::HtapDualRead;
 pub use input_store::{
     CALYX_INPUT_STORE_CORRUPT, CALYX_INPUT_STORE_MISSING, CALYX_INPUT_STORE_TOO_LARGE,
@@ -66,6 +65,7 @@ pub use key::{CALYX_DECRYPTION_FAILED, CALYX_ENCRYPTION_FAILED, CALYX_VAULT_KEY_
 pub use keyspace::{
     CALYX_VAULT_KEYSPACE_MISMATCH, KeyspaceGuard, VaultWriteLock, VaultWriteLockGuard, vault_prefix,
 };
+pub use ledger_append::CALYX_ASTER_RAW_LEDGER_COMMIT_BOUNDARY;
 pub use quota::{CALYX_QUOTA_EXCEEDED, QuotaConfig, QuotaGuard};
 pub use slot_column::{
     SlotColumnManifest, SlotColumnMaterialization, SlotColumnReadback, SlotColumnRow,

@@ -778,7 +778,12 @@ pub fn refine_kernel_with_recall_support(
         let chosen = uncovered
             .iter()
             .copied()
-            .map(|node| (node, scratch.uncovered_reach(indexed, node, radius, &covered)))
+            .map(|node| {
+                (
+                    node,
+                    scratch.uncovered_reach(indexed, node, radius, &covered),
+                )
+            })
             .max_by(|&(left, left_gain), &(right, right_gain)| {
                 left_gain
                     .cmp(&right_gain)

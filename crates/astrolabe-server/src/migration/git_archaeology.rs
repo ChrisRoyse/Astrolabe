@@ -932,7 +932,12 @@ impl HistoricalExtractionPool {
                     }
                 }
             }
-            match self.child.as_mut().expect("worker ensured above").try_wait() {
+            match self
+                .child
+                .as_mut()
+                .expect("worker ensured above")
+                .try_wait()
+            {
                 Ok(Some(status)) => {
                     // The worker died mid-request: a CONTAINED #515 C-level fault on THIS
                     // commit. Forget the dead child so the next call respawns; the host lives.

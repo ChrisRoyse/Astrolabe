@@ -3,11 +3,11 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+#[cfg(feature = "multi-vector")]
+use calyx_core::content_address;
 use calyx_core::{
     AbsentReason, CalyxError, Input, Lens, LensId, Modality, SlotId, SlotShape, SlotVector,
 };
-#[cfg(feature = "multi-vector")]
-use calyx_core::content_address;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 

@@ -2115,9 +2115,11 @@ where
     // different panel's pair yield.
     let active_slot_count = astrolabe_panel::slots_for_version(SHADOW_PANEL_VERSION)?.len();
     let xterm_plan = match delta {
-        Some(delta) => {
-            plan_eager_cross_terms_for_symbols(&nodes, &delta.dirty_qualified_names, active_slot_count)?
-        }
+        Some(delta) => plan_eager_cross_terms_for_symbols(
+            &nodes,
+            &delta.dirty_qualified_names,
+            active_slot_count,
+        )?,
         None => plan_eager_cross_terms(&nodes, active_slot_count)?,
     };
     let xterm = match delta {

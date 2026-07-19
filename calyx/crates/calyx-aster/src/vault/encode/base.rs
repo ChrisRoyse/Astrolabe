@@ -72,7 +72,10 @@ fn encode_base_with_slot_hashes(
     out.extend_from_slice(&(cx.slots.len() as u16).to_be_bytes());
     for slot in cx.slots.keys() {
         let hash = slot_hashes.get(slot).ok_or_else(|| {
-            base_slot_hash_violation(format!("Base slot {} has no preserved slot hash", slot.get()))
+            base_slot_hash_violation(format!(
+                "Base slot {} has no preserved slot hash",
+                slot.get()
+            ))
         })?;
         out.extend_from_slice(&slot.get().to_be_bytes());
         out.extend_from_slice(hash);
@@ -94,7 +97,10 @@ fn encode_base_with_slot_hashes(
 fn slot_hashes_from_vectors(cx: &Constellation) -> Result<BTreeMap<SlotId, [u8; 32]>> {
     let mut slot_hashes = BTreeMap::new();
     for (slot, vector) in &cx.slots {
-        slot_hashes.insert(*slot, *blake3::hash(&encode_slot_vector(vector)?).as_bytes());
+        slot_hashes.insert(
+            *slot,
+            *blake3::hash(&encode_slot_vector(vector)?).as_bytes(),
+        );
     }
     Ok(slot_hashes)
 }
@@ -356,7 +362,10 @@ fn identity_hash_with_slot_hashes(
     bytes[48..50].copy_from_slice(&0_u16.to_be_bytes());
     for slot in cx.slots.keys() {
         let hash = slot_hashes.get(slot).ok_or_else(|| {
-            base_slot_hash_violation(format!("Base slot {} has no preserved slot hash", slot.get()))
+            base_slot_hash_violation(format!(
+                "Base slot {} has no preserved slot hash",
+                slot.get()
+            ))
         })?;
         bytes.extend_from_slice(&slot.get().to_be_bytes());
         bytes.extend_from_slice(hash);

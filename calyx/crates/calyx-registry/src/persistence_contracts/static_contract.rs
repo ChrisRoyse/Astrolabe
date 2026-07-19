@@ -33,7 +33,9 @@ use crate::identity::{
     external_command_weights_hash, multimodal_adapter_corpus_hash,
 };
 #[cfg(feature = "ml-runtime")]
-use crate::identity::{onnx_colbert_corpus_hash, onnx_custom_corpus_hash, static_lookup_corpus_hash};
+use crate::identity::{
+    onnx_colbert_corpus_hash, onnx_custom_corpus_hash, static_lookup_corpus_hash,
+};
 use crate::runtime::adapters::{MultimodalAxis, load_adapter_config};
 #[cfg(feature = "ml-runtime")]
 use crate::runtime::candle::{CandlePoolingPolicy, CandlePrecision, candle_corpus_hash};

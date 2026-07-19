@@ -25,9 +25,12 @@ fn main() {
         .next()
         .and_then(|value| value.parse().ok())
         .unwrap_or(16_746);
-    let vault_dir = args
-        .next()
-        .unwrap_or_else(|| std::env::temp_dir().join("bench_group_commit").display().to_string());
+    let vault_dir = args.next().unwrap_or_else(|| {
+        std::env::temp_dir()
+            .join("bench_group_commit")
+            .display()
+            .to_string()
+    });
     // Fresh vault each run so the measured commit is a first write, matching a
     // fresh import; determinism across runs is checked by the caller comparing
     // the persisted Base/ledger readback of two runs into two dirs.
@@ -89,6 +92,9 @@ fn main() {
     println!("committed_seq: {seq}");
     println!("group_commit: {elapsed:?}");
     println!("per_row     : {per_row_us:.2} us/row");
-    println!("throughput  : {:.0} rows/s", rows as f64 / elapsed.as_secs_f64());
+    println!(
+        "throughput  : {:.0} rows/s",
+        rows as f64 / elapsed.as_secs_f64()
+    );
     println!("vault_dir   : {vault_dir}");
 }

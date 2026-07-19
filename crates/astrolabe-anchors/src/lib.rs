@@ -827,10 +827,10 @@ where
         vault.scan_cf_at(commit_seq, ColumnFamily::Ledger)?,
     )?
     .ok_or_else(|| CalyxError {
-            code: ASTRO_ANCHOR_LEDGER_MISSING,
-            message: "Ledger CF empty at anchor ingest commit snapshot".to_string(),
-            remediation: "verify vault Ledger CF integrity, then re-run the anchor ingest",
-        })?;
+        code: ASTRO_ANCHOR_LEDGER_MISSING,
+        message: "Ledger CF empty at anchor ingest commit snapshot".to_string(),
+        remediation: "verify vault Ledger CF integrity, then re-run the anchor ingest",
+    })?;
     let key_seq = calyx_aster::ledger_view::parse_aster_ledger_seq(&key)?;
     let entry = decode_ledger(&value)?;
     if entry.seq != key_seq {

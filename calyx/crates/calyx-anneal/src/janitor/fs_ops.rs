@@ -8,8 +8,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const IO_REMEDIATION: &str =
     "inspect janitor filesystem source of truth; preserve files until cleanup is safe";
-const ROTATION_REMEDIATION: &str =
-    "leave the source log in place; inspect the destination path and free disk space, \
+const ROTATION_REMEDIATION: &str = "leave the source log in place; inspect the destination path and free disk space, \
      then let the next janitor tick re-attempt the verified rotation";
 
 /// Monotonic sequence disambiguating rotation temp names within one process.
@@ -268,7 +267,8 @@ impl Write for DigestSink {
 /// Stream a plaintext file through BLAKE3, returning its length and digest without
 /// holding the whole file in memory.
 pub(super) fn source_digest(path: &Path) -> Result<StreamDigest> {
-    let file = File::open(path).map_err(|error| io_error(format!("open {}: {error}", path.display())))?;
+    let file =
+        File::open(path).map_err(|error| io_error(format!("open {}: {error}", path.display())))?;
     let mut reader = BufReader::with_capacity(ROTATION_STREAM_CHUNK_BYTES, file);
     let mut hasher = blake3::Hasher::new();
     let mut len = 0u64;
@@ -375,8 +375,9 @@ pub(super) fn verified_publish(
 }
 
 fn compress_into(source: &Path, temp_file: File, time_budget: Duration) -> Result<RotationStats> {
-    let plain = File::open(source)
-        .map_err(|error| rotation_error("compressed", format!("open {}: {error}", source.display())))?;
+    let plain = File::open(source).map_err(|error| {
+        rotation_error("compressed", format!("open {}: {error}", source.display()))
+    })?;
     // A zero budget yields an immediate deadline (rotation refuses); a huge budget
     // that overflows `Instant` yields no deadline.
     let deadline = Instant::now().checked_add(time_budget);
@@ -388,8 +389,12 @@ fn compress_into(source: &Path, temp_file: File, time_budget: Duration) -> Resul
     };
     let mut encoder = zstd::stream::Encoder::new(temp_file, 0)
         .map_err(|error| rotation_error("compressed", format!("init zstd encoder: {error}")))?;
-    io::copy(&mut reader, &mut encoder)
-        .map_err(|error| rotation_error("compressed", format!("compress {}: {error}", source.display())))?;
+    io::copy(&mut reader, &mut encoder).map_err(|error| {
+        rotation_error(
+            "compressed",
+            format!("compress {}: {error}", source.display()),
+        )
+    })?;
     let temp_file = encoder
         .finish()
         .map_err(|error| rotation_error("compressed", format!("finalize zstd frame: {error}")))?;
@@ -430,7 +435,10 @@ fn unique_temp_path(final_path: &Path) -> Result<PathBuf> {
         .ok_or_else(|| {
             rotation_error(
                 "prepared",
-                format!("destination has no UTF-8 file name: {}", final_path.display()),
+                format!(
+                    "destination has no UTF-8 file name: {}",
+                    final_path.display()
+                ),
             )
         })?;
     let nanos = SystemTime::now()

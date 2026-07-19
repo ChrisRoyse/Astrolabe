@@ -121,7 +121,11 @@ impl EraseRegistry {
     ///
     /// Returns the per-handler failure descriptions when any commit fails, so the
     /// caller can build the fail-closed error with the retained intent path.
-    pub(super) fn commit_all(&self, scope: &EraseScope, vault_id: VaultId) -> std::result::Result<(), Vec<String>> {
+    pub(super) fn commit_all(
+        &self,
+        scope: &EraseScope,
+        vault_id: VaultId,
+    ) -> std::result::Result<(), Vec<String>> {
         let mut failures = Vec::new();
         for handler in &self.handlers {
             if let Err(error) = handler.commit(scope, vault_id) {
@@ -142,7 +146,12 @@ impl EraseRegistry {
 
     /// Aborts the first `prepared` handlers in reverse order, never panicking.
     /// Returns a human-readable outcome per handler for diagnostics.
-    fn abort_prepared(&self, prepared: usize, scope: &EraseScope, vault_id: VaultId) -> Vec<String> {
+    fn abort_prepared(
+        &self,
+        prepared: usize,
+        scope: &EraseScope,
+        vault_id: VaultId,
+    ) -> Vec<String> {
         let mut outcomes = Vec::new();
         for handler in self.handlers.iter().take(prepared).rev() {
             match handler.abort(scope, vault_id) {
@@ -194,7 +203,11 @@ impl EraseHandler for NoopEraseHandler {
     }
 }
 
-fn prepare_failed_error(handler: &str, error: &CalyxError, abort_outcomes: &[String]) -> CalyxError {
+fn prepare_failed_error(
+    handler: &str,
+    error: &CalyxError,
+    abort_outcomes: &[String],
+) -> CalyxError {
     CalyxError {
         code: CALYX_ERASE_HANDLER_PREPARE_FAILED,
         message: format!(

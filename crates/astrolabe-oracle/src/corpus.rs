@@ -1050,10 +1050,10 @@ where
         vault.scan_cf_at(commit_seq, ColumnFamily::Ledger)?,
     )?
     .ok_or_else(|| CalyxError {
-            code: ASTRO_ORACLE_LEDGER_MISSING,
-            message: "Ledger CF empty at oracle corpus commit snapshot".to_string(),
-            remediation: ORACLE_REMEDIATION,
-        })?;
+        code: ASTRO_ORACLE_LEDGER_MISSING,
+        message: "Ledger CF empty at oracle corpus commit snapshot".to_string(),
+        remediation: ORACLE_REMEDIATION,
+    })?;
     let key_seq = parse_aster_ledger_seq(&key)?;
     let entry = decode_ledger(&value)?;
     if entry.seq != key_seq {

@@ -106,29 +106,29 @@ impl FrozenArtifactSnapshot {
     /// writer on Windows) or cannot be read in full.
     pub(crate) fn acquire(path: &Path) -> Result<Self> {
         let handle = open_leased(path)?;
-        let metadata = handle.metadata().map_err(|err| {
-            CalyxError {
-                code: "CALYX_LENS_CONFIG_INVALID",
-                message: format!(
-                    "stat leased frozen artifact {} failed: {err}",
-                    path.display()
-                ),
-                remediation: "ensure the frozen artifact path is a regular readable file",
-            }
+        let metadata = handle.metadata().map_err(|err| CalyxError {
+            code: "CALYX_LENS_CONFIG_INVALID",
+            message: format!(
+                "stat leased frozen artifact {} failed: {err}",
+                path.display()
+            ),
+            remediation: "ensure the frozen artifact path is a regular readable file",
         })?;
         let identity = FrozenArtifactIdentity::from_metadata(&metadata);
         // Read the full file from the already-leased handle. On Windows the
         // deny-write share mode guarantees these bytes cannot change while the
         // handle is open; on every platform the owned buffer is the snapshot.
         let mut bytes = Vec::with_capacity(metadata.len() as usize);
-        (&handle).read_to_end(&mut bytes).map_err(|err| CalyxError {
-            code: "CALYX_LENS_CONFIG_INVALID",
-            message: format!(
-                "read leased frozen artifact {} failed: {err}",
-                path.display()
-            ),
-            remediation: "ensure the frozen artifact path is a regular readable file",
-        })?;
+        (&handle)
+            .read_to_end(&mut bytes)
+            .map_err(|err| CalyxError {
+                code: "CALYX_LENS_CONFIG_INVALID",
+                message: format!(
+                    "read leased frozen artifact {} failed: {err}",
+                    path.display()
+                ),
+                remediation: "ensure the frozen artifact path is a regular readable file",
+            })?;
         let sha256: [u8; 32] = {
             let mut hasher = Sha256::new();
             hasher.update(&bytes);

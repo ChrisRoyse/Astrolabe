@@ -73,7 +73,10 @@ pub(super) fn validate_generation_injection_shape(rows: &[encode::WriteRow]) -> 
                     )));
                 }
             }
-            ColumnFamily::Slot { slot: slot_id, kind } => {
+            ColumnFamily::Slot {
+                slot: slot_id,
+                kind,
+            } => {
                 bind_slot(slot_id)?;
                 if is_tombstone_value(&row.value) {
                     return Err(generation_injection_error(
@@ -96,7 +99,8 @@ pub(super) fn validate_generation_injection_shape(rows: &[encode::WriteRow]) -> 
                     SlotFamilyKind::Raw => {
                         if !raw_keys.insert(row.key.clone()) {
                             return Err(generation_injection_error(
-                                "generation-injection batch has duplicate raw-sidecar keys".to_string(),
+                                "generation-injection batch has duplicate raw-sidecar keys"
+                                    .to_string(),
                             ));
                         }
                     }

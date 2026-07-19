@@ -296,7 +296,8 @@ where
         }
         ingested += 1;
     }
-    let payload = format!("{{\"marker\":\"{STREAM_BATCH_MARKER}\",\"count\":{ingested}}}").into_bytes();
+    let payload =
+        format!("{{\"marker\":\"{STREAM_BATCH_MARKER}\",\"count\":{ingested}}}").into_bytes();
     vault.append_ledger_entry(
         EntryKind::Ingest,
         SubjectId::Query(STREAM_BATCH_MARKER.as_bytes().to_vec()),

@@ -152,7 +152,11 @@ fn happy_path_100() {
         let input = event(i);
         let cx_id = vault.cx_id_for_input(&input.raw_bytes, input.panel_version);
         let stored = vault
-            .read_cf_at(vault.snapshot(), ColumnFamily::slot(SlotId::new(0)), &slot_key(cx_id))
+            .read_cf_at(
+                vault.snapshot(),
+                ColumnFamily::slot(SlotId::new(0)),
+                &slot_key(cx_id),
+            )
             .expect("read slot row")
             .expect("slot row present");
         let expected =

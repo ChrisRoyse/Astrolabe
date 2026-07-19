@@ -7,9 +7,7 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::time::{Duration, Instant};
 
-use calyx_aster::cf::{
-    ColumnFamily, compression_lifecycle_prefix_range, compression_manifest_key,
-};
+use calyx_aster::cf::{ColumnFamily, compression_lifecycle_prefix_range, compression_manifest_key};
 use calyx_aster::mvcc::tombstone_value;
 use calyx_aster::vault::{AsterVault, VaultOptions, encode};
 use calyx_core::{
@@ -1610,11 +1608,7 @@ fn legacy_migration_edge(
     };
     let stored_dim = stored_dim_for(registry, registered)?;
     let golden = legacy_golden_set(registry, registered, corpus)?;
-    let legacy_primary_by_key = golden
-        .rows
-        .iter()
-        .cloned()
-        .collect::<BTreeMap<_, _>>();
+    let legacy_primary_by_key = golden.rows.iter().cloned().collect::<BTreeMap<_, _>>();
     require(
         legacy_primary_by_key.len() == golden.rows.len(),
         "historical writer golden contains duplicate keyed rows",
@@ -2718,7 +2712,6 @@ fn legacy_identity_refusal_edge(
     Ok(())
 }
 
-
 fn domain_digest(
     domain: &[u8],
     prefix: &[u8],
@@ -3547,7 +3540,6 @@ fn decode_hex(value: &str) -> AnyResult<Vec<u8>> {
         })
         .collect()
 }
-
 
 fn decode_hex_32(value: &str) -> AnyResult<[u8; 32]> {
     require(value.len() == 64, "seed id hex length is not 64")?;

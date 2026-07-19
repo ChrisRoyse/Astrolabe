@@ -12,9 +12,10 @@ pub use types::{
 use calyx_aster::pressure::DiskPressureGuard;
 use calyx_core::{CalyxError, Clock, Result, Ts};
 use fs_ops::{
-    CleanupKind, age_ms, collect_files, decode_digest, dir_size, duration_ms, ensure_inside_dataset,
-    file_len, hash_path, hex, immediate_dirs, io_error, is_rotation_temp, is_zst, modified_ms,
-    rotation_error, source_digest, starts_with_canonical, temp_dirs, verified_publish, zst_path,
+    CleanupKind, age_ms, collect_files, decode_digest, dir_size, duration_ms,
+    ensure_inside_dataset, file_len, hash_path, hex, immediate_dirs, io_error, is_rotation_temp,
+    is_zst, modified_ms, rotation_error, source_digest, starts_with_canonical, temp_dirs,
+    verified_publish, zst_path,
 };
 use serde::Serialize;
 use std::env;
@@ -315,12 +316,7 @@ impl Janitor {
 
     /// Reclaim rotation temp files older than the rotation time budget: past that
     /// bound no live rotation can still be writing them, and the source is intact.
-    fn reconcile_rotation_temps(
-        &self,
-        logs: &Path,
-        now: Ts,
-        result: &mut GcResult,
-    ) -> Result<()> {
+    fn reconcile_rotation_temps(&self, logs: &Path, now: Ts, result: &mut GcResult) -> Result<()> {
         let budget_ms = duration_ms(self.config.log_rotation_time_budget);
         for path in collect_files(logs)? {
             if !is_rotation_temp(&path) {
@@ -336,7 +332,10 @@ impl Janitor {
                 }
                 Err(error) => result.record_error(
                     hash_path(&path),
-                    io_error(format!("remove stale rotation temp {}: {error}", path.display())),
+                    io_error(format!(
+                        "remove stale rotation temp {}: {error}",
+                        path.display()
+                    )),
                 ),
             }
         }
