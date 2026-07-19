@@ -11,11 +11,14 @@ use super::handler::{
 use super::intent::{self, EraseIntent};
 use super::ledger;
 use crate::cf::ColumnFamily;
-use crate::compression_lifecycle::CALYX_COMPRESSION_LIFECYCLE_INVALID;
+use crate::compression_lifecycle::{
+    CALYX_COMPRESSION_LIFECYCLE_INVALID, GenerationLifecycleRecord, GenerationTransition,
+    compression_generation_subject,
+};
 use crate::mvcc::tombstone_value;
 use crate::vault::{AsterVault, VaultContext, encode};
-use calyx_core::{CalyxError, Clock, Result};
-use calyx_ledger::EntryKind;
+use calyx_core::{CalyxError, Clock, Result, SlotId};
+use calyx_ledger::{EntryKind, LedgerEntryInput};
 use std::collections::BTreeSet;
 use std::path::Path;
 
@@ -159,10 +162,7 @@ where
         }
         (Some(ts), None) => {
             let shred = *scope == EraseScope::Vault || ts.records_deleted > 0;
-            return Ok(EraseDecision::AlreadyTombstoned {
-                seq: ts.seq,
-                shred,
-            });
+            return Ok(EraseDecision::AlreadyTombstoned { seq: ts.seq, shred });
         }
         (None, Some(_stale)) => {
             // Intent present but no core tombstone: crashed before the Phase C
@@ -328,9 +328,7 @@ where
 {
     let current_seq = vault.latest_seq();
     // A concurrent erase may have already tombstoned this scope.
-    if selection.real_ledger
-        && ledger::existing_tombstone(vault, scope, current_seq)?.is_some()
-    {
+    if selection.real_ledger && ledger::existing_tombstone(vault, scope, current_seq)?.is_some() {
         return Err(sequence_conflict_error(selection.snapshot, current_seq));
     }
     let targets = collect_targets(vault, scope, current_seq)?;
@@ -366,14 +364,44 @@ where
     if selection.real_ledger {
         let tombstone =
             ledger::tombstone_for(vault, scope, selection.records_deleted, vault.clock_now())?;
-        let ledger_ref = vault.commit_rows_with_ledger_entry_locked(
-            commit_rows,
+        let mut delete_records = selection
+            .lifecycle_writes
+            .iter()
+            .map(|(_, _, value)| GenerationLifecycleRecord::parse(value))
+            .collect::<Result<Vec<_>>>()?;
+        delete_records.sort_by_key(|record| record.slot_id);
+        let mut ledger_entries = Vec::with_capacity(delete_records.len() + 1);
+        ledger_entries.push(LedgerEntryInput::new(
             EntryKind::Erase,
             ledger::tombstone_subject(&tombstone),
             tombstone.as_ledger_payload(),
             tombstone.actor.clone(),
-        )?;
-        debug_assert_eq!(ledger_ref.seq, tombstone.seq);
+        ));
+        for record in delete_records {
+            if record.transition != GenerationTransition::DeleteGeneration {
+                return Err(CalyxError {
+                    code: CALYX_COMPRESSION_LIFECYCLE_INVALID,
+                    message: format!(
+                        "vault erase staged non-delete compression transition {} for slot {}",
+                        record.transition.as_str(),
+                        record.slot_id
+                    ),
+                    remediation: "reselect the vault erase so every manifested slot stages exactly one DeleteGeneration lifecycle record",
+                });
+            }
+            ledger_entries.push(LedgerEntryInput::new(
+                EntryKind::Erase,
+                compression_generation_subject(SlotId::new(record.slot_id)),
+                record.ledger_payload()?,
+                tombstone.actor.clone(),
+            ));
+        }
+        let ledger_refs =
+            vault.commit_rows_with_ledger_entries_locked(commit_rows, ledger_entries)?;
+        debug_assert_eq!(
+            ledger_refs.first().map(|ledger_ref| ledger_ref.seq),
+            Some(tombstone.seq)
+        );
     } else {
         // A non-ledger vault never reaches here with lifecycle writes: Phase A
         // fails closed on `CALYX_COMPRESSION_LIFECYCLE_INVALID` first.

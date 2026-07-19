@@ -14,15 +14,38 @@
 //! and so the commit-time guard in [`crate::mvcc`] can parse and validate the
 //! record before a batch is admitted to the WAL.
 
-use calyx_core::{CalyxError, Result, Seq};
+use calyx_core::{CalyxError, Result, Seq, SlotId};
+use calyx_ledger::SubjectId;
 use serde::{Deserialize, Serialize};
 
 /// Structured error code for every fail-closed lifecycle-record refusal.
 pub const CALYX_COMPRESSION_LIFECYCLE_INVALID: &str = "CALYX_COMPRESSION_LIFECYCLE_INVALID";
 
+/// Reserved marker at the front of every compression-generation Ledger subject
+/// and inside every compression-generation Ledger payload.
+///
+/// Subject bytes use `SLOT_COMPRESSION_GENERATION ':' slot_id_be_u16`. Keeping
+/// the codec beside [`GenerationLifecycleRecord`] gives producers and the MVCC
+/// admission guard one canonical slot identity rather than parallel string
+/// construction.
+pub const COMPRESSION_GENERATION_MARKER: &str = "SLOT_COMPRESSION_GENERATION";
+
 /// Schema tag embedded in every encoded lifecycle record, so a foreign or
 /// future-versioned payload is refused rather than silently reinterpreted.
 const LIFECYCLE_SCHEMA: &str = "calyx.compression.generation_lifecycle.v1";
+
+#[derive(Debug, Deserialize)]
+struct CompressionGenerationLedgerPayload {
+    marker: String,
+    transition: GenerationTransition,
+    slot_id: u16,
+    rows: u32,
+    #[serde(default)]
+    generation_root_sha256: Option<String>,
+    #[serde(default)]
+    raw_generation_root_sha256: Option<String>,
+    affected_cx_ids: Vec<String>,
+}
 
 /// The lawful transitions of a compressed slot generation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -118,7 +141,9 @@ impl GenerationLifecycleRecord {
     pub fn encode(&self) -> Result<Vec<u8>> {
         self.validate()?;
         serde_json::to_vec(self).map_err(|error| {
-            lifecycle_error(format!("failed to encode generation lifecycle record: {error}"))
+            lifecycle_error(format!(
+                "failed to encode generation lifecycle record: {error}"
+            ))
         })
     }
 
@@ -126,10 +151,126 @@ impl GenerationLifecycleRecord {
     /// on any malformed payload, unknown field, wrong schema, or broken invariant.
     pub fn parse(bytes: &[u8]) -> Result<Self> {
         let record: Self = serde_json::from_slice(bytes).map_err(|error| {
-            lifecycle_error(format!("failed to parse generation lifecycle record: {error}"))
+            lifecycle_error(format!(
+                "failed to parse generation lifecycle record: {error}"
+            ))
         })?;
         record.validate()?;
         Ok(record)
+    }
+
+    /// Encodes the canonical minimal Ledger payload for this transition.
+    ///
+    /// Registry producers may add codec-specific fields, but these identity and
+    /// geometry fields are mandatory and are validated by the commit guard.
+    pub fn ledger_payload(&self) -> Result<Vec<u8>> {
+        self.validate()?;
+        let mut payload = serde_json::Map::new();
+        payload.insert(
+            "marker".to_string(),
+            serde_json::Value::String(COMPRESSION_GENERATION_MARKER.to_string()),
+        );
+        payload.insert(
+            "transition".to_string(),
+            serde_json::Value::String(self.transition.as_str().to_string()),
+        );
+        payload.insert("slot_id".to_string(), serde_json::json!(self.slot_id));
+        payload.insert("rows".to_string(), serde_json::json!(self.generation_rows));
+        if self.transition.writes_manifest() {
+            payload.insert(
+                "generation_root_sha256".to_string(),
+                serde_json::Value::String(self.generation_root_sha256.clone()),
+            );
+            payload.insert(
+                "raw_generation_root_sha256".to_string(),
+                serde_json::Value::String(self.raw_generation_root_sha256.clone()),
+            );
+        }
+        payload.insert(
+            "affected_cx_ids".to_string(),
+            serde_json::to_value(&self.affected_cx_ids).map_err(|error| {
+                lifecycle_error(format!(
+                    "failed to encode generation Ledger affected_cx_ids: {error}"
+                ))
+            })?,
+        );
+        serde_json::to_vec(&payload).map_err(|error| {
+            lifecycle_error(format!(
+                "failed to encode generation Ledger payload: {error}"
+            ))
+        })
+    }
+
+    /// Verifies that a hash-checked Ledger payload describes this exact
+    /// lifecycle transition. Extra producer-specific fields are allowed, but
+    /// the slot, transition, resulting geometry, roots, and affected identities
+    /// must match byte-for-byte.
+    pub fn validate_ledger_payload(&self, bytes: &[u8]) -> Result<()> {
+        self.validate()?;
+        let payload: CompressionGenerationLedgerPayload =
+            serde_json::from_slice(bytes).map_err(|error| {
+                lifecycle_error(format!(
+                    "failed to parse compression-generation Ledger payload: {error}"
+                ))
+            })?;
+        if payload.marker != COMPRESSION_GENERATION_MARKER {
+            return Err(lifecycle_error(format!(
+                "compression-generation Ledger payload marker {:?} does not match expected {COMPRESSION_GENERATION_MARKER:?}",
+                payload.marker
+            )));
+        }
+        if payload.transition != self.transition {
+            return Err(lifecycle_error(format!(
+                "slot {} Ledger transition {} does not match lifecycle transition {}",
+                self.slot_id,
+                payload.transition.as_str(),
+                self.transition.as_str()
+            )));
+        }
+        if payload.slot_id != self.slot_id {
+            return Err(lifecycle_error(format!(
+                "compression-generation Ledger payload slot {} does not match lifecycle slot {}",
+                payload.slot_id, self.slot_id
+            )));
+        }
+        if payload.rows != self.generation_rows {
+            return Err(lifecycle_error(format!(
+                "slot {} Ledger payload declares {} rows but lifecycle record declares {}",
+                self.slot_id, payload.rows, self.generation_rows
+            )));
+        }
+        if payload.affected_cx_ids != self.affected_cx_ids {
+            return Err(lifecycle_error(format!(
+                "slot {} Ledger affected_cx_ids do not match its lifecycle record",
+                self.slot_id
+            )));
+        }
+        if self.transition.writes_manifest() {
+            if payload.generation_root_sha256.as_deref()
+                != Some(self.generation_root_sha256.as_str())
+            {
+                return Err(lifecycle_error(format!(
+                    "slot {} Ledger generation_root_sha256 does not match its lifecycle record",
+                    self.slot_id
+                )));
+            }
+            if payload.raw_generation_root_sha256.as_deref()
+                != Some(self.raw_generation_root_sha256.as_str())
+            {
+                return Err(lifecycle_error(format!(
+                    "slot {} Ledger raw_generation_root_sha256 does not match its lifecycle record",
+                    self.slot_id
+                )));
+            }
+        } else if payload.generation_root_sha256.is_some()
+            || payload.raw_generation_root_sha256.is_some()
+        {
+            return Err(lifecycle_error(format!(
+                "delete_generation Ledger payload for slot {} must not claim generation roots",
+                self.slot_id
+            )));
+        }
+        Ok(())
     }
 
     fn validate(&self) -> Result<()> {
@@ -148,7 +289,10 @@ impl GenerationLifecycleRecord {
                 )));
             }
             validate_hex_root(&self.generation_root_sha256, "generation_root_sha256")?;
-            validate_hex_root(&self.raw_generation_root_sha256, "raw_generation_root_sha256")?;
+            validate_hex_root(
+                &self.raw_generation_root_sha256,
+                "raw_generation_root_sha256",
+            )?;
         } else {
             if self.generation_rows != 0 {
                 return Err(lifecycle_error(format!(
@@ -170,6 +314,43 @@ impl GenerationLifecycleRecord {
         }
         Ok(())
     }
+}
+
+/// Canonical hash-chained Ledger subject for one compressed slot generation.
+pub fn compression_generation_subject(slot: SlotId) -> SubjectId {
+    let mut subject = Vec::with_capacity(COMPRESSION_GENERATION_MARKER.len() + 3);
+    subject.extend_from_slice(COMPRESSION_GENERATION_MARKER.as_bytes());
+    subject.push(b':');
+    subject.extend_from_slice(&slot.get().to_be_bytes());
+    SubjectId::Query(subject)
+}
+
+/// Parses the reserved compression-generation subject namespace.
+///
+/// Non-compression subjects return `Ok(None)`. Any query subject beginning with
+/// the reserved marker but not matching its exact delimiter and two-byte slot
+/// shape is rejected, so malformed provenance cannot be reclassified as an
+/// unrelated query.
+pub fn compression_generation_slot_from_subject(subject: &SubjectId) -> Result<Option<SlotId>> {
+    let SubjectId::Query(bytes) = subject else {
+        return Ok(None);
+    };
+    let marker = COMPRESSION_GENERATION_MARKER.as_bytes();
+    if !bytes.starts_with(marker) {
+        return Ok(None);
+    }
+    let expected_len = marker.len() + 1 + std::mem::size_of::<u16>();
+    if bytes.len() != expected_len || bytes.get(marker.len()).copied() != Some(b':') {
+        return Err(lifecycle_error(format!(
+            "reserved compression-generation Ledger subject must be {COMPRESSION_GENERATION_MARKER:?} followed by ':' and exactly two big-endian slot bytes; got {} bytes",
+            bytes.len()
+        )));
+    }
+    let offset = marker.len() + 1;
+    Ok(Some(SlotId::new(u16::from_be_bytes([
+        bytes[offset],
+        bytes[offset + 1],
+    ]))))
 }
 
 fn validate_hex_root(value: &str, field: &str) -> Result<()> {

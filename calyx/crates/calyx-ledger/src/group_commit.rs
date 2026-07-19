@@ -7,6 +7,31 @@ use crate::checkpoint::{CheckpointConfig, CheckpointScheduler, OverlayLedgerStor
 use crate::entry::{ActorId, SubjectId};
 use crate::kind::EntryKind;
 
+/// One logical Ledger entry to stage inside a storage transaction.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LedgerEntryInput {
+    pub kind: EntryKind,
+    pub subject: SubjectId,
+    pub payload: Vec<u8>,
+    pub actor: ActorId,
+}
+
+impl LedgerEntryInput {
+    pub const fn new(
+        kind: EntryKind,
+        subject: SubjectId,
+        payload: Vec<u8>,
+        actor: ActorId,
+    ) -> Self {
+        Self {
+            kind,
+            subject,
+            payload,
+            actor,
+        }
+    }
+}
+
 /// Storage batch surface required by the Ledger group-commit hook.
 pub trait LedgerWriteBatch {
     fn put_ledger_row(&mut self, key: Vec<u8>, value: Vec<u8>) -> Result<()>;
@@ -73,6 +98,12 @@ impl StagedLedgerRow {
 
     pub fn ledger_ref(&self) -> LedgerRef {
         self.ledger_ref.clone()
+    }
+
+    /// Whether this row is an automatically generated Merkle checkpoint rather
+    /// than one of the caller's logical entries.
+    pub const fn is_checkpoint(&self) -> bool {
+        self.checkpoint_range_end.is_some()
     }
 }
 
@@ -151,37 +182,77 @@ where
         payload: Vec<u8>,
         actor: ActorId,
     ) -> Result<Vec<StagedLedgerRow>> {
-        let first = self.stage(kind, subject, payload, actor)?;
-        let range_end = first
-            .ledger_ref
-            .seq
-            .checked_add(1)
-            .ok_or_else(|| CalyxError::ledger_chain_broken("ledger sequence exhausted"))?;
-        let mut staged = vec![first];
+        self.stage_many_with_checkpoints([LedgerEntryInput::new(kind, subject, payload, actor)])
+    }
 
-        if let Some(checkpoint) = &self.checkpoint
-            && checkpoint.should_checkpoint(range_end)
-        {
-            let overlay = OverlayLedgerStore::new(
-                self.appender.store(),
-                staged.iter().map(|row| row.prepared.clone()),
-            )?;
-            let predecessor = &staged.last().expect("staged data row").prepared;
-            let prepared = checkpoint.prepare_checkpoint_after(
-                &self.appender,
-                &overlay,
-                predecessor,
-                range_end,
-            )?;
+    /// Stages several caller entries as one contiguous hash-chain segment,
+    /// interleaving any due Merkle checkpoints, without mutating the appender.
+    ///
+    /// The returned rows are ready to join one storage batch. The caller must
+    /// durably commit every row before invoking [`Self::commit_staged`] in
+    /// returned order. Empty logical batches are refused.
+    pub fn stage_many_with_checkpoints(
+        &self,
+        entries: impl IntoIterator<Item = LedgerEntryInput>,
+    ) -> Result<Vec<StagedLedgerRow>> {
+        let entries = entries.into_iter().collect::<Vec<_>>();
+        if entries.is_empty() {
+            return Err(group_commit_failed(
+                "cannot stage an empty logical Ledger entry batch",
+            ));
+        }
+        let mut staged: Vec<StagedLedgerRow> = Vec::new();
+        let mut checkpoint_state = self.checkpoint.clone();
+        for entry in entries {
+            let prepared = match staged.last() {
+                Some(predecessor) => self.appender.prepare_after(
+                    &predecessor.prepared,
+                    entry.kind,
+                    entry.subject,
+                    entry.payload,
+                    entry.actor,
+                )?,
+                None => {
+                    self.appender
+                        .prepare(entry.kind, entry.subject, entry.payload, entry.actor)?
+                }
+            };
+            let range_end = prepared
+                .seq()
+                .checked_add(1)
+                .ok_or_else(|| CalyxError::ledger_chain_broken("ledger sequence exhausted"))?;
             staged.push(StagedLedgerRow {
                 key: ledger_batch_key(prepared.seq()),
                 value: prepared.bytes().to_vec(),
                 ledger_ref: prepared.ledger_ref(),
                 prepared,
-                checkpoint_range_end: Some(range_end),
+                checkpoint_range_end: None,
             });
-        }
 
+            if let Some(checkpoint) = checkpoint_state.as_mut()
+                && checkpoint.should_checkpoint(range_end)
+            {
+                let overlay = OverlayLedgerStore::new(
+                    self.appender.store(),
+                    staged.iter().map(|row| row.prepared.clone()),
+                )?;
+                let predecessor = &staged.last().expect("staged data row").prepared;
+                let prepared = checkpoint.prepare_checkpoint_after(
+                    &self.appender,
+                    &overlay,
+                    predecessor,
+                    range_end,
+                )?;
+                staged.push(StagedLedgerRow {
+                    key: ledger_batch_key(prepared.seq()),
+                    value: prepared.bytes().to_vec(),
+                    ledger_ref: prepared.ledger_ref(),
+                    prepared,
+                    checkpoint_range_end: Some(range_end),
+                });
+                checkpoint.advance_after_checkpoint(range_end)?;
+            }
+        }
         Ok(staged)
     }
 

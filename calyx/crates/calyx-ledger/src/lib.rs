@@ -31,8 +31,8 @@ pub use checkpoint::{
 pub use codec::{decode, decode_header, encode};
 pub use entry::{ActorId, LedgerEntry, SubjectId, compute_entry_hash};
 pub use group_commit::{
-    DefaultLedgerHook, LedgerBatchRow, LedgerWriteBatch, StagedLedgerRow, WriteBatch, WriteOp,
-    ingest_kind_for, ledger_batch_key,
+    DefaultLedgerHook, LedgerBatchRow, LedgerEntryInput, LedgerWriteBatch, StagedLedgerRow,
+    WriteBatch, WriteOp, ingest_kind_for, ledger_batch_key,
 };
 pub use head_anchor::LedgerHeadAnchor;
 pub use kind::EntryKind;

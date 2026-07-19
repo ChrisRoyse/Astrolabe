@@ -8,11 +8,12 @@ use calyx_assay::{AssayCacheKey, AssayStore, AssaySubject, MiEstimate, TrustTag}
 use calyx_aster::cf::{
     COMPRESSED_SLOT_VALUE_TAG, ColumnFamily, base_key, compression_manifest_key, slot_key,
 };
-use calyx_aster::compression_lifecycle::GenerationTransition;
+pub use calyx_aster::compression_lifecycle::COMPRESSION_GENERATION_MARKER;
+use calyx_aster::compression_lifecycle::{GenerationTransition, compression_generation_subject};
 use calyx_aster::vault::{AsterVault, encode};
 use calyx_core::{Clock, CxId, LedgerRef, LensId, QuantPolicy, Result, Seq, Slot, SlotVector};
 use calyx_forge::AssayQuantSafety;
-use calyx_ledger::{ActorId, EntryKind, SubjectId};
+use calyx_ledger::{ActorId, EntryKind};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
@@ -559,23 +560,13 @@ pub(crate) fn write_compressed_slot_batch_with_assay_evidence<C: Clock>(
         expected_seq,
         writes,
         EntryKind::Migrate,
-        SubjectId::Query(compression_generation_subject(slot)),
+        compression_generation_subject(slot.slot_id),
         ledger_payload,
         ActorId::Service("calyx-registry".to_string()),
     )?;
     report.snapshot = Some(snapshot);
     report.ledger = Some(ledger_ref);
     Ok(report)
-}
-
-/// Marker embedded in every compression-generation ledger subject.
-pub const COMPRESSION_GENERATION_MARKER: &str = "SLOT_COMPRESSION_GENERATION";
-
-fn compression_generation_subject(slot: &Slot) -> Vec<u8> {
-    let mut subject = COMPRESSION_GENERATION_MARKER.as_bytes().to_vec();
-    subject.push(b':');
-    subject.extend_from_slice(&slot.slot_id.get().to_be_bytes());
-    subject
 }
 
 fn generation_ledger_payload(
@@ -881,7 +872,9 @@ pub(super) fn validate_row_base_binding<C: Clock>(
         .ok_or_else(|| {
             compression_error(
                 CALYX_VECTOR_COMPRESSION_INVALID,
-                format!("compressed slot source {cx_id} has no Base constellation at seq={snapshot}"),
+                format!(
+                    "compressed slot source {cx_id} has no Base constellation at seq={snapshot}"
+                ),
             )
         })?;
     let base_identity = encode::decode_constellation_base_identity(&base_bytes)?;

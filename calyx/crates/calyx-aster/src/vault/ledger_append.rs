@@ -3,15 +3,9 @@ use crate::cf::{ColumnFamily, anchor_key, base_key, ledger_key};
 use crate::ledger_view::parse_aster_ledger_seq;
 use calyx_core::{Anchor, CalyxError, Clock, CxId, LedgerRef, Result, VaultStore};
 use calyx_ledger::{
-    ActorId, EntryKind, LedgerAppender, LedgerCfStore, LedgerHeadAnchor, LedgerRow, SubjectId,
+    ActorId, EntryKind, LedgerAppender, LedgerCfStore, LedgerEntryInput, LedgerHeadAnchor,
+    LedgerRow, PreparedLedgerEntry, SubjectId,
 };
-
-struct LedgerEntryInput {
-    kind: EntryKind,
-    subject: SubjectId,
-    payload: Vec<u8>,
-    actor: ActorId,
-}
 
 impl<C> AsterVault<C>
 where
@@ -88,18 +82,37 @@ where
         payload: Vec<u8>,
         actor: ActorId,
     ) -> Result<(calyx_core::Seq, LedgerRef)> {
+        let (seq, refs) = self.write_cf_batch_with_ledger_entries_if_seq(
+            expected_seq,
+            rows,
+            [LedgerEntryInput::new(kind, subject, payload, actor)],
+        )?;
+        Ok((seq, require_single_ledger_ref(refs)?))
+    }
+
+    /// Writes a seq-guarded raw CF batch and several ordered provenance Ledger
+    /// entries inside one atomic group commit.
+    ///
+    /// Logical entries form one contiguous hash-chain segment. Any due Merkle
+    /// checkpoints are interleaved automatically, and the returned refs contain
+    /// only the caller's entries in input order. An empty entry set is refused.
+    pub fn write_cf_batch_with_ledger_entries_if_seq(
+        &self,
+        expected_seq: calyx_core::Seq,
+        rows: impl IntoIterator<Item = (ColumnFamily, Vec<u8>, Vec<u8>)>,
+        entries: impl IntoIterator<Item = LedgerEntryInput>,
+    ) -> Result<(calyx_core::Seq, Vec<LedgerRef>)> {
         let rows = rows
             .into_iter()
             .map(|(cf, key, value)| encode::WriteRow { cf, key, value })
             .collect::<Vec<_>>();
+        let entries = entries.into_iter().collect::<Vec<_>>();
+        require_ledger_entries(&entries)?;
         if self.durable.is_none() {
-            return self.write_volatile_batch_with_ledger_entry_if_seq(
+            return self.write_volatile_batch_with_ledger_entries_if_seq(
                 expected_seq,
                 rows,
-                kind,
-                subject,
-                payload,
-                actor,
+                entries,
             );
         }
         self.with_durable_commit_lock(|| {
@@ -107,34 +120,27 @@ where
             if current != expected_seq {
                 return Err(sequence_conflict_error(expected_seq, current));
             }
-            let ledger_ref =
-                self.commit_rows_with_ledger_entry_locked(rows, kind, subject, payload, actor)?;
-            Ok((self.latest_seq(), ledger_ref))
+            let ledger_refs = self.commit_rows_with_ledger_entries_locked(rows, entries)?;
+            Ok((self.latest_seq(), ledger_refs))
         })
     }
 
-    fn write_volatile_batch_with_ledger_entry_if_seq(
+    fn write_volatile_batch_with_ledger_entries_if_seq(
         &self,
         expected_seq: calyx_core::Seq,
         mut rows: Vec<encode::WriteRow>,
-        kind: EntryKind,
-        subject: SubjectId,
-        payload: Vec<u8>,
-        actor: ActorId,
-    ) -> Result<(calyx_core::Seq, LedgerRef)> {
+        entries: Vec<LedgerEntryInput>,
+    ) -> Result<(calyx_core::Seq, Vec<LedgerRef>)> {
         let Some(hook) = &self.ledger_hook else {
-            let (ledger_row, ledger_ref) =
-                self.raw_prepared_ledger_row(kind, subject, payload, actor)?;
-            rows.push(ledger_row);
+            let (ledger_rows, ledger_refs) = self.raw_prepared_ledger_rows(entries)?;
+            rows.extend(ledger_rows);
             let seq = self.commit_rows_if_current_volatile(expected_seq, rows)?;
-            return Ok((seq, ledger_ref));
+            return Ok((seq, ledger_refs));
         };
         let mut guard = ledger_hook::lock_hook(hook)?;
-        let staged = guard.stage_with_checkpoints(kind, subject, payload, actor)?;
-        let ledger_ref = staged
-            .first()
-            .ok_or_else(|| CalyxError::ledger_group_commit_failed("no staged ledger rows"))?
-            .ledger_ref();
+        let entry_count = entries.len();
+        let staged = guard.stage_many_with_checkpoints(entries)?;
+        let ledger_refs = logical_ledger_refs(&staged, entry_count)?;
         rows.extend(staged.iter().map(|row| encode::WriteRow {
             cf: ColumnFamily::Ledger,
             key: row.key().to_vec(),
@@ -144,7 +150,7 @@ where
         for row in &staged {
             guard.commit_staged(row)?;
         }
-        Ok((seq, ledger_ref))
+        Ok((seq, ledger_refs))
     }
 
     /// Appends a provenance Ledger entry through Aster's durable group-commit path.
@@ -202,7 +208,8 @@ where
         payload: Vec<u8>,
         actor: ActorId,
     ) -> Result<LedgerRef> {
-        let (ledger_row, ledger_ref) = self.raw_prepared_ledger_row(kind, subject, payload, actor)?;
+        let (ledger_row, ledger_ref) =
+            self.raw_prepared_ledger_row(kind, subject, payload, actor)?;
         self.commit_rows_locked(&[ledger_row])?;
         Ok(ledger_ref)
     }
@@ -229,28 +236,61 @@ where
         payload: Vec<u8>,
         actor: ActorId,
     ) -> Result<(encode::WriteRow, LedgerRef)> {
+        let (mut rows, refs) =
+            self.raw_prepared_ledger_rows([LedgerEntryInput::new(kind, subject, payload, actor)])?;
+        let row = rows
+            .pop()
+            .ok_or_else(|| CalyxError::ledger_group_commit_failed("no prepared Ledger row"))?;
+        Ok((row, require_single_ledger_ref(refs)?))
+    }
+
+    /// Prepares a contiguous hash-chain segment without mutating either Aster
+    /// or an appender. Used by no-hook atomic batches.
+    fn raw_prepared_ledger_rows(
+        &self,
+        entries: impl IntoIterator<Item = LedgerEntryInput>,
+    ) -> Result<(Vec<encode::WriteRow>, Vec<LedgerRef>)> {
+        let entries = entries.into_iter().collect::<Vec<_>>();
+        require_ledger_entries(&entries)?;
         let store = AsterRawLedgerStore { vault: self };
         let appender = LedgerAppender::open(store, std::sync::Arc::clone(&self.clock))?;
-        let prepared = appender.prepare(kind, subject, payload, actor)?;
-        let seq = prepared.seq();
-        let key = ledger_key(seq);
-        if self
-            .read_cf_at(self.snapshot(), ColumnFamily::Ledger, &key)?
-            .is_some()
-        {
-            return Err(CalyxError::ledger_append_only_violation(format!(
-                "ledger seq {seq} already exists; refusing to overwrite an append-only ledger row"
-            )));
+        let mut prepared_entries: Vec<PreparedLedgerEntry> = Vec::with_capacity(entries.len());
+        for entry in entries {
+            let prepared = match prepared_entries.last() {
+                Some(predecessor) => appender.prepare_after(
+                    predecessor,
+                    entry.kind,
+                    entry.subject,
+                    entry.payload,
+                    entry.actor,
+                )?,
+                None => appender.prepare(entry.kind, entry.subject, entry.payload, entry.actor)?,
+            };
+            let seq = prepared.seq();
+            let key = ledger_key(seq);
+            if self
+                .read_cf_at(self.snapshot(), ColumnFamily::Ledger, &key)?
+                .is_some()
+            {
+                return Err(CalyxError::ledger_append_only_violation(format!(
+                    "ledger seq {seq} already exists; refusing to overwrite an append-only ledger row"
+                )));
+            }
+            prepared_entries.push(prepared);
         }
-        let ledger_ref = prepared.ledger_ref();
-        Ok((
-            encode::WriteRow {
+        let rows = prepared_entries
+            .iter()
+            .map(|prepared| encode::WriteRow {
                 cf: ColumnFamily::Ledger,
-                key,
+                key: ledger_key(prepared.seq()),
                 value: prepared.bytes().to_vec(),
-            },
-            ledger_ref,
-        ))
+            })
+            .collect();
+        let refs = prepared_entries
+            .iter()
+            .map(PreparedLedgerEntry::ledger_ref)
+            .collect();
+        Ok((rows, refs))
     }
 
     fn anchor_with_raw_ledger_entry(
@@ -284,21 +324,33 @@ where
 
     pub(crate) fn commit_rows_with_ledger_entry_locked(
         &self,
-        mut rows: Vec<encode::WriteRow>,
+        rows: Vec<encode::WriteRow>,
         kind: EntryKind,
         subject: SubjectId,
         payload: Vec<u8>,
         actor: ActorId,
     ) -> Result<LedgerRef> {
+        let refs = self.commit_rows_with_ledger_entries_locked(
+            rows,
+            [LedgerEntryInput::new(kind, subject, payload, actor)],
+        )?;
+        require_single_ledger_ref(refs)
+    }
+
+    pub(crate) fn commit_rows_with_ledger_entries_locked(
+        &self,
+        mut rows: Vec<encode::WriteRow>,
+        entries: impl IntoIterator<Item = LedgerEntryInput>,
+    ) -> Result<Vec<LedgerRef>> {
+        let entries = entries.into_iter().collect::<Vec<_>>();
+        require_ledger_entries(&entries)?;
         let Some(hook) = &self.ledger_hook else {
-            return self.commit_rows_with_raw_ledger_entry(rows, kind, subject, payload, actor);
+            return self.commit_rows_with_raw_ledger_entries(rows, entries);
         };
         let mut guard = ledger_hook::lock_hook(hook)?;
-        let staged = guard.stage_with_checkpoints(kind, subject, payload, actor)?;
-        let ledger_ref = staged
-            .first()
-            .ok_or_else(|| CalyxError::ledger_group_commit_failed("no staged ledger rows"))?
-            .ledger_ref();
+        let entry_count = entries.len();
+        let staged = guard.stage_many_with_checkpoints(entries)?;
+        let ledger_refs = logical_ledger_refs(&staged, entry_count)?;
         rows.extend(staged.iter().map(|row| encode::WriteRow {
             cf: ColumnFamily::Ledger,
             key: row.key().to_vec(),
@@ -308,21 +360,18 @@ where
         for row in &staged {
             guard.commit_staged(row)?;
         }
-        Ok(ledger_ref)
+        Ok(ledger_refs)
     }
 
-    fn commit_rows_with_raw_ledger_entry(
+    fn commit_rows_with_raw_ledger_entries(
         &self,
         mut rows: Vec<encode::WriteRow>,
-        kind: EntryKind,
-        subject: SubjectId,
-        payload: Vec<u8>,
-        actor: ActorId,
-    ) -> Result<LedgerRef> {
-        let (ledger_row, ledger_ref) = self.raw_prepared_ledger_row(kind, subject, payload, actor)?;
-        rows.push(ledger_row);
+        entries: Vec<LedgerEntryInput>,
+    ) -> Result<Vec<LedgerRef>> {
+        let (ledger_rows, ledger_refs) = self.raw_prepared_ledger_rows(entries)?;
+        rows.extend(ledger_rows);
         self.commit_rows_locked(&rows)?;
-        Ok(ledger_ref)
+        Ok(ledger_refs)
     }
 }
 
@@ -335,6 +384,43 @@ where
 /// adapter's `put_new`/`put_head_anchor` methods, which would otherwise nest the
 /// durable commit lock or split that boundary.
 pub const CALYX_ASTER_RAW_LEDGER_COMMIT_BOUNDARY: &str = "CALYX_ASTER_RAW_LEDGER_COMMIT_BOUNDARY";
+
+fn require_ledger_entries(entries: &[LedgerEntryInput]) -> Result<()> {
+    if entries.is_empty() {
+        return Err(CalyxError::ledger_group_commit_failed(
+            "atomic Ledger batch requires at least one logical entry",
+        ));
+    }
+    Ok(())
+}
+
+fn logical_ledger_refs(
+    staged: &[calyx_ledger::StagedLedgerRow],
+    expected: usize,
+) -> Result<Vec<LedgerRef>> {
+    let refs = staged
+        .iter()
+        .filter(|row| !row.is_checkpoint())
+        .map(calyx_ledger::StagedLedgerRow::ledger_ref)
+        .collect::<Vec<_>>();
+    if refs.len() != expected {
+        return Err(CalyxError::ledger_group_commit_failed(format!(
+            "staged Ledger batch contains {} logical entries, expected {expected}",
+            refs.len()
+        )));
+    }
+    Ok(refs)
+}
+
+fn require_single_ledger_ref(mut refs: Vec<LedgerRef>) -> Result<LedgerRef> {
+    if refs.len() != 1 {
+        return Err(CalyxError::ledger_group_commit_failed(format!(
+            "single-entry Ledger commit produced {} logical refs",
+            refs.len()
+        )));
+    }
+    Ok(refs.remove(0))
+}
 
 fn raw_ledger_commit_boundary_error(operation: String) -> CalyxError {
     CalyxError {
@@ -407,7 +493,9 @@ where
     /// `raw_prepared_ledger_row` + one `commit_rows_locked` group instead
     /// (issue #560).
     fn put_new(&mut self, seq: u64, _bytes: &[u8]) -> Result<()> {
-        Err(raw_ledger_commit_boundary_error(format!("put_new(seq={seq})")))
+        Err(raw_ledger_commit_boundary_error(format!(
+            "put_new(seq={seq})"
+        )))
     }
 
     fn head_anchor(&self) -> Result<Option<LedgerHeadAnchor>> {

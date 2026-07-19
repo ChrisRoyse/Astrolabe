@@ -8,8 +8,12 @@ use crate::cf::{
     COMPRESSED_SLOT_VALUE_TAG, ColumnFamily, SlotFamilyKind, compression_manifest_key,
     parse_compression_lifecycle_key,
 };
-use crate::compression_lifecycle::{CALYX_COMPRESSION_LIFECYCLE_INVALID, GenerationLifecycleRecord};
+use crate::compression_lifecycle::{
+    CALYX_COMPRESSION_LIFECYCLE_INVALID, COMPRESSION_GENERATION_MARKER, GenerationLifecycleRecord,
+    compression_generation_slot_from_subject,
+};
 use calyx_core::{CalyxError, Result, Seq};
+use calyx_ledger::{LedgerEntry, decode};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// Commit-time state machine enforcing the lawful lifecycle of compressed slot
@@ -19,8 +23,9 @@ use std::collections::{BTreeMap, BTreeSet};
 /// `AppendReseal`/`EraseReseal`) or a manifest tombstone (`DeleteGeneration`) —
 /// must arrive in one seq-guarded batch alongside (a) exactly one append-only
 /// [`GenerationLifecycleRecord`] for the slot whose `prior_seq` equals the
-/// committing sequence, (b) a paired [`ColumnFamily::Ledger`] row, (c) a
-/// transition kind matching the batch shape, and (d)/(e) primary and raw
+/// committing sequence, (b) exactly one hash-valid [`ColumnFamily::Ledger`] row
+/// whose reserved subject and payload identify that same slot and transition,
+/// (c) a transition kind matching the batch shape, and (d)/(e) primary and raw
 /// keysets that reconcile with the declared generation geometry. Isolated
 /// manifest tombstones, isolated slot-row tombstones under a live manifest,
 /// isolated lifecycle records, and orphaning deletes are all fail-closed
@@ -33,11 +38,11 @@ pub(super) fn validate_compression_writes(
     let mut manifest_puts: BTreeSet<u16> = BTreeSet::new();
     let mut manifest_tombstones: BTreeSet<u16> = BTreeSet::new();
     let mut lifecycle_by_slot: BTreeMap<u16, Vec<GenerationLifecycleRecord>> = BTreeMap::new();
-    let mut ledger_in_batch = false;
+    let mut ledger_rows: Vec<(&[u8], &[u8])> = Vec::new();
 
     for &(cf, key, value) in rows {
         match cf {
-            ColumnFamily::Ledger => ledger_in_batch = true,
+            ColumnFamily::Ledger => ledger_rows.push((key, value)),
             ColumnFamily::Compression => {
                 if key.len() == 2 {
                     let slot = u16::from_be_bytes([key[0], key[1]]);
@@ -87,7 +92,45 @@ pub(super) fn validate_compression_writes(
     transition_slots.extend(manifest_tombstones.iter().copied());
     transition_slots.extend(lifecycle_by_slot.keys().copied());
 
-    for slot in transition_slots {
+    // Decode and hash-check Ledger bytes whenever a compression transition is
+    // present, or when a row contains the reserved compression marker. The
+    // latter catches orphaned/malformed reserved subjects without imposing a
+    // decode on unrelated high-throughput ingest batches.
+    let marker = COMPRESSION_GENERATION_MARKER.as_bytes();
+    let transition_in_batch = !transition_slots.is_empty();
+    let mut ledger_by_slot: BTreeMap<u16, Vec<LedgerEntry>> = BTreeMap::new();
+    for (key, value) in ledger_rows {
+        if !transition_in_batch && !value.windows(marker.len()).any(|window| window == marker) {
+            continue;
+        }
+        let entry = decode(value)?;
+        let key_seq = u64::from_be_bytes(key.try_into().map_err(|_| {
+            lifecycle_guard_error(format!(
+                "compression transition Ledger key must be eight-byte big-endian sequence, got {} bytes",
+                key.len()
+            ))
+        })?);
+        if entry.seq != key_seq {
+            return Err(lifecycle_guard_error(format!(
+                "compression transition Ledger key seq {key_seq} does not match encoded seq {}",
+                entry.seq
+            )));
+        }
+        if let Some(slot) = compression_generation_slot_from_subject(&entry.subject)? {
+            ledger_by_slot.entry(slot.get()).or_default().push(entry);
+        }
+    }
+    for (&slot, entries) in &ledger_by_slot {
+        if !manifest_puts.contains(&slot) && !manifest_tombstones.contains(&slot) {
+            return Err(lifecycle_guard_error(format!(
+                "slot {slot} has {} compression-generation Ledger entr{} but no manifest mutation in the same batch",
+                entries.len(),
+                if entries.len() == 1 { "y" } else { "ies" }
+            )));
+        }
+    }
+
+    for slot in transition_slots.iter().copied() {
         let has_put = manifest_puts.contains(&slot);
         let has_tombstone = manifest_tombstones.contains(&slot);
         let records = lifecycle_by_slot
@@ -124,11 +167,14 @@ pub(super) fn validate_compression_writes(
                 record.prior_seq
             )));
         }
-        if !ledger_in_batch {
+        let ledger_entries = ledger_by_slot.get(&slot).map(Vec::as_slice).unwrap_or(&[]);
+        if ledger_entries.len() != 1 {
             return Err(lifecycle_guard_error(format!(
-                "slot {slot} manifest mutation requires a paired ledger entry in the same batch"
+                "slot {slot} manifest mutation requires exactly one slot-matched compression-generation Ledger entry in the same batch, found {}",
+                ledger_entries.len()
             )));
         }
+        record.validate_ledger_payload(&ledger_entries[0].payload)?;
         // (c) The transition kind must match the batch shape.
         if record.transition.writes_manifest() != has_put {
             return Err(lifecycle_guard_error(format!(
@@ -139,8 +185,7 @@ pub(super) fn validate_compression_writes(
         }
 
         let slot_id = calyx_core::SlotId::new(slot);
-        let primary_keys =
-            post_batch_keyset(table, current, ColumnFamily::slot(slot_id), rows);
+        let primary_keys = post_batch_keyset(table, current, ColumnFamily::slot(slot_id), rows);
         let raw_keys = post_batch_keyset(table, current, ColumnFamily::slot_raw(slot_id), rows);
         if has_put {
             // (d) A live generation is a non-empty, coordinated primary+raw column.
@@ -190,9 +235,13 @@ pub(super) fn validate_compression_writes(
         let slot_u16 = slot.get();
         let manifest_mutated =
             manifest_puts.contains(&slot_u16) || manifest_tombstones.contains(&slot_u16);
-        let manifest_exists =
-            visible_value(table, current, ColumnFamily::Compression, &compression_manifest_key(slot))
-                .is_some_and(|bytes| !is_tombstone_value(bytes));
+        let manifest_exists = visible_value(
+            table,
+            current,
+            ColumnFamily::Compression,
+            &compression_manifest_key(slot),
+        )
+        .is_some_and(|bytes| !is_tombstone_value(bytes));
         // (f) A manifested (compressed) slot's rows may only move inside a batch
         // that also mutates the manifest and records the transition.
         if manifest_exists && !manifest_mutated {
@@ -254,7 +303,7 @@ fn lifecycle_guard_error(message: String) -> CalyxError {
     CalyxError {
         code: CALYX_COMPRESSION_LIFECYCLE_INVALID,
         message,
-        remediation: "commit compressed slot generation transitions through the registry lifecycle API: one seq-guarded batch carrying the manifest mutation, the resealed rows, its append-only lifecycle record, and a paired ledger entry",
+        remediation: "commit compressed slot generation transitions through the registry lifecycle API: one seq-guarded batch carrying each manifest mutation, its resealed rows, one append-only lifecycle record, and exactly one canonical slot-matched Ledger entry",
     }
 }
 

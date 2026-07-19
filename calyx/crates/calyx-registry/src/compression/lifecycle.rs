@@ -22,19 +22,21 @@ use calyx_aster::cf::{
     ColumnFamily, compression_lifecycle_key, compression_lifecycle_prefix_range,
     compression_manifest_key, slot_key,
 };
-use calyx_aster::compression_lifecycle::{GenerationLifecycleRecord, GenerationTransition};
+use calyx_aster::compression_lifecycle::{
+    GenerationLifecycleRecord, GenerationTransition, compression_generation_subject,
+};
 use calyx_aster::mvcc::tombstone_value;
 use calyx_aster::vault::{AsterVault, encode};
 use calyx_core::{Clock, CxId, LedgerRef, Result, Seq, Slot, SlotVector};
-use calyx_ledger::{ActorId, EntryKind, SubjectId};
+use calyx_ledger::{ActorId, EntryKind};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use super::{
-    CALYX_VECTOR_COMPRESSION_EMPTY, CALYX_VECTOR_COMPRESSION_INVALID, COMPRESSION_GENERATION_MARKER,
-    CompressedSlotIndex, CompressionQuery, SlotCompressionReport,
-    compress_slot_batch_with_assay_evidence, compression_error, compression_generation_subject,
-    generation_ledger_payload, hex_bytes, parse_compression_manifest, validate_row_base_binding,
+    CALYX_VECTOR_COMPRESSION_EMPTY, CALYX_VECTOR_COMPRESSION_INVALID,
+    COMPRESSION_GENERATION_MARKER, CompressedSlotIndex, CompressionQuery, SlotCompressionReport,
+    compress_slot_batch_with_assay_evidence, compression_error, generation_ledger_payload,
+    hex_bytes, parse_compression_manifest, validate_row_base_binding,
 };
 use crate::spec::LensSpec;
 
@@ -259,7 +261,10 @@ pub fn delete_compressed_generation<C: Clock>(
         0,
         String::new(),
         String::new(),
-        deleted.iter().map(|cx_id| hex_bytes(cx_id.as_bytes())).collect(),
+        deleted
+            .iter()
+            .map(|cx_id| hex_bytes(cx_id.as_bytes()))
+            .collect(),
     )?;
     writes.push((
         ColumnFamily::Compression,
@@ -271,7 +276,7 @@ pub fn delete_compressed_generation<C: Clock>(
         snapshot,
         writes,
         EntryKind::Erase,
-        SubjectId::Query(compression_generation_subject(slot)),
+        compression_generation_subject(slot.slot_id),
         ledger_payload,
         ActorId::Service("calyx-registry".to_string()),
     )?;
@@ -316,7 +321,10 @@ pub(super) fn lifecycle_record_row_from_report(
         manifest.generation_rows,
         hex_bytes(&manifest.generation_root),
         hex_bytes(&manifest.raw_generation_root),
-        affected.iter().map(|cx_id| hex_bytes(cx_id.as_bytes())).collect(),
+        affected
+            .iter()
+            .map(|cx_id| hex_bytes(cx_id.as_bytes()))
+            .collect(),
     )?;
     Ok((
         ColumnFamily::Compression,
@@ -356,7 +364,7 @@ fn commit_reseal<C: Clock>(
         expected_seq,
         writes,
         ledger_kind,
-        SubjectId::Query(compression_generation_subject(slot)),
+        compression_generation_subject(slot.slot_id),
         ledger_payload,
         ActorId::Service("calyx-registry".to_string()),
     )?;
