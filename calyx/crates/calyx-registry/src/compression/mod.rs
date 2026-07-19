@@ -27,11 +27,18 @@ pub use lifecycle::{
     erase_compressed_slot_rows, generation_lifecycle,
 };
 pub use multivector::{
-    CALYX_MULTIVECTOR_CONTEXT_MISMATCH, CALYX_MULTIVECTOR_PACK_INVALID,
-    CALYX_MULTIVECTOR_SHAPE_UNSUPPORTED, MULTIVECTOR_DIGEST_BYTES, MULTIVECTOR_HEADER_BYTES,
-    MULTIVECTOR_PACK_MAGIC, MULTIVECTOR_PACK_VERSION, MultiVectorStorageCodec, PackedColbertBytes,
-    ParsedColbertMatrix, pack_colbert_matrix, packed_maxsim, parse_colbert_matrix,
+    CALYX_MULTIVECTOR_ADMISSION_FAILED, CALYX_MULTIVECTOR_CONTEXT_MISMATCH,
+    CALYX_MULTIVECTOR_PACK_INVALID, CALYX_MULTIVECTOR_SHAPE_UNSUPPORTED,
+    MULTIVECTOR_MANIFEST_MAGIC, MULTIVECTOR_MANIFEST_VERSION, MULTIVECTOR_ROW_HEADER_BYTES,
+    MULTIVECTOR_ROW_MAGIC, MULTIVECTOR_ROW_VERSION, MultiVectorCompressionConfig,
+    MultiVectorCompressionQuery, MultiVectorCompressionReport, MultiVectorCompressionRow,
+    MultiVectorStorageCodec, PackedMaxSimScratch, PackedMultiVectorBytes, PackedMultiVectorHit,
+    PackedMultiVectorIndex, PackedMultiVectorManifest, PackedMultiVectorRow,
+    ParsedPackedMultiVectorRow, append_reseal_packed_multivector_rows,
+    compress_streamed_multivector_column, erase_packed_multivector_rows, packed_maxsim,
+    packed_maxsim_backend, parse_packed_multivector_manifest, parse_packed_multivector_row,
     reject_dense_codec_for_multivector, resolve_multivector_storage,
+    write_packed_multivector_generation,
 };
 pub use recall::matryoshka_truncate_renormalize;
 use recall::{recall_at_k, recall_drop, validate_batch};

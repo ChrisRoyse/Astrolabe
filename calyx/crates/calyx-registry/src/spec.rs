@@ -251,13 +251,16 @@ pub const fn default_quant_default() -> QuantPolicy {
     QuantPolicy::turboquant_default()
 }
 
-/// Shape-aware storage-identity default: dense shapes take the TurboQuant
-/// default; sparse/multi shapes persist exact canonical rows
-/// (`QuantPolicy::None`) because every implemented codec is dense-only.
+/// Shape-aware storage-identity default.
+///
+/// Dense shapes use the measured TurboQuant candidate, sparse shapes remain
+/// exact until a sparse storage contract exists, and multi-vector shapes use
+/// the separately versioned ColBERT residual codec.
 pub const fn default_quant_for_shape(shape: SlotShape) -> QuantPolicy {
     match shape {
         SlotShape::Dense(_) => QuantPolicy::turboquant_default(),
-        SlotShape::Sparse(_) | SlotShape::Multi { .. } => QuantPolicy::None,
+        SlotShape::Sparse(_) => QuantPolicy::None,
+        SlotShape::Multi { .. } => QuantPolicy::ColbertResidual2Bit,
     }
 }
 

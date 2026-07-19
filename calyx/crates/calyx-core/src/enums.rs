@@ -113,6 +113,13 @@ pub enum QuantPolicy {
     /// TQPR packed row layout, but a different content-addressed geometry and
     /// is admitted only through measured recall/intelligence gates.
     TurboQuantHadamard { bits_per_channel_x2: u8 },
+    /// ColBERTv2-compatible centroid codes plus two-bit residuals.
+    ///
+    /// This policy is valid only for [`SlotShape::Multi`] token matrices whose
+    /// token dimension is divisible by four. It has a separately versioned
+    /// manifest, row envelope, codebook, and MaxSim execution path; it is never
+    /// translated into a dense-vector codec.
+    ColbertResidual2Bit,
 }
 
 impl QuantPolicy {

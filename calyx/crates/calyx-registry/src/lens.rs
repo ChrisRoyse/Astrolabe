@@ -14,8 +14,9 @@ mod contract;
 pub use contract::validate_quant_policy_for_shape;
 
 use crate::compression::{
-    self, CompressedSlotIndex, CompressionQuery, GenerationDeleteReport, MxFp4AssayEvidence,
-    SlotCompressionReport,
+    self, CompressedSlotIndex, CompressionQuery, GenerationDeleteReport,
+    MultiVectorCompressionConfig, MultiVectorCompressionQuery, MultiVectorCompressionReport,
+    MultiVectorCompressionRow, MxFp4AssayEvidence, PackedMultiVectorIndex, SlotCompressionReport,
 };
 use crate::frozen::FrozenLensContract;
 use crate::ingest_microbatch::{IngestLensOutcome, IngestMicrobatchController, IngestPanelReadout};
@@ -292,6 +293,71 @@ impl Registry {
         CompressedSlotIndex::open(vault, slot, spec)
     }
 
+    /// Opens one verified residual-packed Multi slot view. Dense/raw sidecars
+    /// are never substituted for its direct packed MaxSim path.
+    pub fn packed_multivector_index<'a, C>(
+        &'a self,
+        vault: &'a AsterVault<C>,
+        slot: &'a Slot,
+    ) -> Result<PackedMultiVectorIndex<'a, C>>
+    where
+        C: Clock,
+    {
+        let spec = self.compression_spec(slot)?;
+        PackedMultiVectorIndex::open(vault, slot, spec)
+    }
+
+    /// Atomically creates or reseals a complete ColBERT residual generation.
+    pub fn write_packed_multivector_generation<C>(
+        &self,
+        vault: &AsterVault<C>,
+        slot: &Slot,
+        rows: &[MultiVectorCompressionRow],
+        queries: &[MultiVectorCompressionQuery],
+        config: MultiVectorCompressionConfig,
+        k: usize,
+    ) -> Result<MultiVectorCompressionReport>
+    where
+        C: Clock,
+    {
+        let spec = self.compression_spec(slot)?;
+        compression::write_packed_multivector_generation(
+            vault, slot, spec, rows, queries, config, k,
+        )
+    }
+
+    /// Adds rows and reseals the complete residual generation/codebook.
+    pub fn append_reseal_packed_multivector_rows<C>(
+        &self,
+        vault: &AsterVault<C>,
+        slot: &Slot,
+        rows: &[MultiVectorCompressionRow],
+        queries: &[MultiVectorCompressionQuery],
+        k: usize,
+    ) -> Result<MultiVectorCompressionReport>
+    where
+        C: Clock,
+    {
+        let spec = self.compression_spec(slot)?;
+        compression::append_reseal_packed_multivector_rows(vault, slot, spec, rows, queries, k)
+    }
+
+    /// Removes a strict subset and reseals the surviving residual generation.
+    pub fn erase_packed_multivector_rows<C>(
+        &self,
+        vault: &AsterVault<C>,
+        slot: &Slot,
+        erase_ids: &[CxId],
+        queries: &[MultiVectorCompressionQuery],
+        k: usize,
+    ) -> Result<MultiVectorCompressionReport>
+    where
+        C: Clock,
+    {
+        let spec = self.compression_spec(slot)?;
+        compression::erase_packed_multivector_rows(vault, slot, spec, erase_ids, queries, k)
+    }
+
     /// Atomically replaces a complete persisted raw slot column with the codec
     /// declared by its registered lens and slot.
     pub fn write_compressed_slot_batch<C>(
@@ -395,6 +461,23 @@ impl Registry {
     {
         let spec = self.compression_spec(slot)?;
         compression::compress_streamed_column(vault, slot, spec, queries, k)
+    }
+
+    /// Compresses the complete exact Multi column written by streaming ingest
+    /// into a separately versioned residual generation.
+    pub fn compress_streamed_multivector_column<C>(
+        &self,
+        vault: &AsterVault<C>,
+        slot: &Slot,
+        queries: &[MultiVectorCompressionQuery],
+        config: MultiVectorCompressionConfig,
+        k: usize,
+    ) -> Result<MultiVectorCompressionReport>
+    where
+        C: Clock,
+    {
+        let spec = self.compression_spec(slot)?;
+        compression::compress_streamed_multivector_column(vault, slot, spec, queries, config, k)
     }
 
     /// Assay-bound variant of [`Self::write_compressed_slot_batch`] for MXFP4.
@@ -592,6 +675,22 @@ impl Registry {
                 slot.slot_key.key(),
                 slot.lens_id,
                 spec.lens_id()
+            )));
+        }
+        if spec.output != slot.shape {
+            return Err(CalyxError::lens_frozen_violation(format!(
+                "compressed slot {} shape {:?} does not match registered LensSpec shape {:?}",
+                slot.slot_key.key(),
+                slot.shape,
+                spec.output
+            )));
+        }
+        if spec.quant_default != slot.quant {
+            return Err(CalyxError::lens_frozen_violation(format!(
+                "compressed slot {} policy {:?} does not match registered LensSpec policy {:?}",
+                slot.slot_key.key(),
+                slot.quant,
+                spec.quant_default
             )));
         }
         Ok(spec)

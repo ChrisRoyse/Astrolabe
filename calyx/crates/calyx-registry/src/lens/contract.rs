@@ -24,8 +24,9 @@ pub(super) fn ensure_spec_declares_contract(
 /// quantization policy its physical shape can actually persist. Dense-only
 /// codecs are refused for sparse/multi shapes here — before any catalog or
 /// registry mutation — instead of being advertised and failing at compression
-/// time. `QuantPolicy::Pq` has no implemented persisted contract and is refused
-/// for every shape at configuration time.
+/// time. Multi-vector residual storage is likewise refused for dense/sparse
+/// shapes. `QuantPolicy::Pq` has no implemented persisted contract and is
+/// refused for every shape at configuration time.
 pub fn validate_quant_policy_for_shape(
     name: &str,
     shape: SlotShape,
@@ -44,20 +45,54 @@ pub fn validate_quant_policy_for_shape(
         });
     }
     match shape {
-        SlotShape::Dense(_) => Ok(()),
-        SlotShape::Sparse(_) | SlotShape::Multi { .. } => match policy {
-            QuantPolicy::None => Ok(()),
-            other => Err(CalyxError {
-                code: "CALYX_LENS_QUANT_POLICY_SHAPE_MISMATCH",
-                message: format!(
-                    "lens {name} declares dense-only quantization policy {other:?} for \
-                     non-dense shape {shape:?}; sparse/multi slots persist exact canonical \
-                     rows (QuantPolicy::None)"
-                ),
-                remediation: "declare QuantPolicy::None for sparse/multi shapes; dense-only \
-                              codecs must be refused before catalog mutation, not at \
-                              compression time",
-            }),
+        SlotShape::Dense(_) => match policy {
+            QuantPolicy::ColbertResidual2Bit => Err(shape_policy_error(
+                name,
+                shape,
+                policy,
+                "ColBERT residual storage is defined only for multi-vector token matrices",
+            )),
+            _ => Ok(()),
         },
+        SlotShape::Sparse(_) => match policy {
+            QuantPolicy::None => Ok(()),
+            other => Err(shape_policy_error(
+                name,
+                shape,
+                other,
+                "sparse storage has no commissioned compression codec and must remain exact",
+            )),
+        },
+        SlotShape::Multi { token_dim } => match policy {
+            QuantPolicy::None => Ok(()),
+            QuantPolicy::ColbertResidual2Bit if token_dim > 0 && token_dim % 4 == 0 => Ok(()),
+            QuantPolicy::ColbertResidual2Bit => Err(shape_policy_error(
+                name,
+                shape,
+                policy,
+                "two-bit residual packing requires a positive token dimension divisible by four",
+            )),
+            other => Err(shape_policy_error(
+                name,
+                shape,
+                other,
+                "multi-vector storage supports only exact rows or the separately versioned two-bit ColBERT residual codec",
+            )),
+        },
+    }
+}
+
+fn shape_policy_error(
+    name: &str,
+    shape: SlotShape,
+    policy: QuantPolicy,
+    reason: &str,
+) -> CalyxError {
+    CalyxError {
+        code: "CALYX_LENS_QUANT_POLICY_SHAPE_MISMATCH",
+        message: format!("lens {name} declares {policy:?} for shape {shape:?}: {reason}"),
+        remediation: "use a dense codec only with SlotShape::Dense, QuantPolicy::None with \
+                      SlotShape::Sparse, and QuantPolicy::ColbertResidual2Bit (or explicit None) \
+                      with a compatible SlotShape::Multi",
     }
 }

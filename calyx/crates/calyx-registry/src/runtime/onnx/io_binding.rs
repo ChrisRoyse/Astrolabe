@@ -50,8 +50,8 @@ use std::collections::BTreeSet;
 
 use calyx_core::{
     CalyxError, OnnxCommittedSessionPlacementEvidence, OnnxCudaExecutionEvidence,
-    OnnxCudaExecutionEvidenceKind, OnnxFirstInferencePlacementEvidence,
-    OnnxRetainedCudaStreamEvidence, Result, RuntimeExecutionAttestation,
+    OnnxCudaExecutionEvidenceKind, OnnxFirstInferencePlacementEvidence, Result,
+    RuntimeExecutionAttestation,
 };
 use ort::memory::{AllocationDevice, AllocatorType, MemoryInfo, MemoryType};
 use ort::session::{RunOptions, Session, SessionInputValue, SessionOutputs};
@@ -675,22 +675,21 @@ impl OnnxRunPlan {
                 ),
                 remediation: "use a canonical UTF-8 Windows temporary path and rebuild the session; never emit lossy execution evidence",
             })?;
-            let stream = session.bound_stream().ok_or_else(|| CalyxError {
-                code: "CALYX_ONNX_BOUND_STREAM_MISSING",
-                message: format!(
-                    "first-forward CUDA evidence for {} has no retained execution stream",
-                    self.label
-                ),
-                remediation: "construct the CUDA execution provider with an Astrolabe-owned stream and retain it through the first real synchronized inference",
-            })?;
+            let retained_stream =
+                super::green_context::retained_stream_evidence(session.bound_stream()).ok_or_else(
+                    || CalyxError {
+                        code: "CALYX_ONNX_BOUND_STREAM_EVIDENCE_MISSING",
+                        message: format!(
+                            "first-forward CUDA evidence for {} has no retained, feature-backed execution-stream evidence",
+                            self.label
+                        ),
+                        remediation: "build calyx-registry with the cuda feature, construct the CUDA execution provider with an Astrolabe-owned stream, and retain it through the first real synchronized inference",
+                    },
+                )?;
             let structured = OnnxCudaExecutionEvidence {
                 kind:
                     OnnxCudaExecutionEvidenceKind::Api24CommittedSessionAndFirstRealInferenceProfile,
-                retained_stream: OnnxRetainedCudaStreamEvidence {
-                    stream_address: format!("{:p}", stream.stream_ptr()),
-                    driver_ordinal: stream.driver_ordinal(),
-                    physical_device: stream.physical_identity().canonical_execution_token(),
-                },
+                retained_stream,
                 committed_session: OnnxCommittedSessionPlacementEvidence {
                     total_compute_nodes: self.assignment.total_nodes,
                     cuda_compute_nodes: self.assignment.cuda_nodes,

@@ -590,6 +590,9 @@ fn legacy_policy_identity(policy: QuantPolicy) -> Result<(StoredSlotCodec, Quant
         QuantPolicy::Pq { m, nbits } => Err(invalid(format!(
             "legacy PQ codec is not implemented for m={m} nbits={nbits}; refusing migration"
         ))),
+        QuantPolicy::ColbertResidual2Bit => Err(invalid(
+            "ColbertResidual2Bit uses the separately versioned Multi generation format and cannot be inferred as a legacy dense envelope",
+        )),
     }
 }
 
@@ -862,6 +865,9 @@ impl CodecContext {
             QuantPolicy::Pq { m, nbits } => Err(invalid(format!(
                 "PQ codec is not implemented for m={m} nbits={nbits}; refusing codec substitution"
             ))),
+            QuantPolicy::ColbertResidual2Bit => Err(invalid(
+                "ColbertResidual2Bit is a Multi-only codec; route it through the packed multi-vector generation API",
+            )),
         }
     }
 

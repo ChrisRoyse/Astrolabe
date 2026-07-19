@@ -671,14 +671,9 @@ fn write_manifest(
         dim
     };
     let shape = manifest_shape(flags.runtime, inferred_dim);
-    // Storage identity is decided by shape at commissioning time: dense shapes
-    // take the TurboQuant default; sparse/multi shapes persist exact canonical
-    // rows (QuantPolicy::None). A dense-only codec is refused before any
-    // catalog mutation rather than advertised and failed at compression time.
-    let quant_default = match shape {
-        SlotShape::Dense(_) => QuantPolicy::turboquant_default(),
-        SlotShape::Sparse(_) | SlotShape::Multi { .. } => QuantPolicy::None,
-    };
+    // Storage identity is decided by shape at commissioning time. A
+    // shape/codec mismatch is refused before any catalog mutation.
+    let quant_default = calyx_registry::spec::default_quant_for_shape(shape);
     calyx_registry::validate_quant_policy_for_shape(&flags.lens_name(), shape, quant_default)
         .map_err(CliError::Calyx)?;
     let manifest = LensForgeManifest {

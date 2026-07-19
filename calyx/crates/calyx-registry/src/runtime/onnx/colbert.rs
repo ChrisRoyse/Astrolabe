@@ -244,7 +244,7 @@ impl OnnxColbertLens {
             max_batch: self.max_batch,
             axis: None,
             asymmetry: calyx_core::Asymmetry::None,
-            quant_default: calyx_core::QuantPolicy::turboquant_default(),
+            quant_default: calyx_core::QuantPolicy::ColbertResidual2Bit,
             truncate_dim: None,
             recall_delta: default_recall_delta(),
             retrieval_only: false,
