@@ -164,7 +164,7 @@ impl FastembedSparseLens {
             user_model,
             InitOptionsUserDefined::new()
                 .with_intra_threads(1)
-                .with_session_policy(context.session_policy())
+                .with_session_policy(context.session_policy()?)
                 .with_execution_providers(execution_providers),
         )
         .map_err(|err| context.error("model_constructor", err))?;
@@ -356,7 +356,7 @@ impl FastembedBgem3Lens {
             user_model,
             InitOptionsUserDefined::new()
                 .with_intra_threads(1)
-                .with_session_policy(context.session_policy())
+                .with_session_policy(context.session_policy()?)
                 .with_execution_providers(execution_providers),
         )
         .map_err(|err| context.error("model_constructor", err))?;
@@ -548,7 +548,7 @@ impl FastembedRerankerLens {
             user_model,
             RerankInitOptionsUserDefined::default()
                 .with_intra_threads(1)
-                .with_session_policy(context.session_policy())
+                .with_session_policy(context.session_policy()?)
                 .with_execution_providers(execution_providers),
         )
         .map_err(|err| context.error("model_constructor", err))?;

@@ -59,8 +59,8 @@ candle-core = { path = "third_party/candle-core-0.10.2" }
 # Pin the upstream offset repair until a crates.io release contains it.
 ort-sys = { git = "https://github.com/pykeio/ort", rev = "21533c58ee948ce354e20018a779bf3a5811f040" }
 # FastEmbed 5.16 hides every ONNX SessionBuilder. The owned source applies
-# Astrolabe's explicit CUDA-no-CPU-fallback/CPU session policy at all builders
-# and exposes the exact committed Session for API-24 placement attestation.
+# Astrolabe's explicit CPU or classified CUDA-placement policy at all builders
+# and exposes the exact committed Session for optimized-graph/API-24/profile attestation.
 fastembed = { path = "third_party/fastembed-5.16.0" }
 
 # ── Build profiles ───────────────────────────────────────────────────────────

@@ -61,12 +61,54 @@ pub struct RuntimeExecutionAttestation {
 /// Exact evidence kind for a fail-loud CUDA ONNX session.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum OnnxCudaExecutionEvidenceKind {
-    /// ORT API 24 committed-session placement plus the first real,
-    /// host-materialized, retained-stream-synchronized inference profile.
+    /// Final optimized-graph classification plus ORT API 24 committed-session
+    /// placement and the first exact real, host-materialized,
+    /// retained-stream-synchronized inference profile.
     #[serde(
-        rename = "onnx_api24_committed_session+first_real_host_materialized_retained_stream_synchronized_inference_profile"
+        rename = "onnx_optimized_graph_classified_v1+api24_committed_session+first_exact_real_host_materialized_retained_stream_synchronized_inference_profile"
     )]
-    Api24CommittedSessionAndFirstRealInferenceProfile,
+    OptimizedGraphClassifiedV1Api24AndFirstExactInferenceProfile,
+}
+
+/// Categorical role proven for one ONNX node.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OnnxPlacementNodeRole {
+    /// Substantive model computation executed by CUDAExecutionProvider.
+    CudaCompute,
+    /// Bounded integral/bool shape metadata executed by CPUExecutionProvider.
+    CpuShapeMetadata,
+}
+
+/// Exact node identity from ORT's committed API-24 assignment.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OnnxCommittedNodeEvidence {
+    pub name: String,
+    pub domain: String,
+    pub operator: String,
+    pub provider: String,
+    pub role: OnnxPlacementNodeRole,
+    /// Static aggregate output bound for an authorized CPU metadata node.
+    /// CUDA compute nodes carry `None`.
+    pub max_output_elements: Option<u64>,
+    /// Canonical sorted output dtype set for an authorized CPU metadata node.
+    /// CUDA compute nodes carry `None`.
+    pub output_dtypes: Option<String>,
+}
+
+/// Exact node identity and output facts from the first real ORT profile.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OnnxProfiledNodeEvidence {
+    pub name: String,
+    pub operator: String,
+    pub provider: String,
+    pub role: OnnxPlacementNodeRole,
+    pub node_index: u64,
+    pub output_size: u64,
+    pub output_elements: u64,
+    pub output_dtypes: String,
 }
 
 /// Physical CUDA stream retained by the exact ONNX session.
@@ -85,30 +127,42 @@ pub struct OnnxRetainedCudaStreamEvidence {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OnnxCommittedSessionPlacementEvidence {
-    /// Optimized compute nodes owned by the committed session.
-    pub total_compute_nodes: u64,
-    /// Nodes assigned to CUDAExecutionProvider.
+    /// Executable nodes in the exact optimized graph.
+    pub total_graph_nodes: u64,
+    /// Substantive nodes assigned to CUDAExecutionProvider.
     pub cuda_compute_nodes: u64,
-    /// Nodes assigned to CPUExecutionProvider.
-    pub cpu_compute_nodes: u64,
+    /// Proven bounded shape-metadata nodes assigned to CPUExecutionProvider.
+    pub cpu_metadata_nodes: u64,
+    /// CPU nodes not proven to be shape metadata. Always zero when admitted.
+    pub unclassified_cpu_nodes: u64,
+    /// Graph-internal provider transfer nodes. Always zero when admitted.
+    pub inter_provider_memcpy_nodes: u64,
     /// Deterministic provider/count summary.
     pub providers: String,
     /// Deterministic provider/operator summary.
     pub assigned_operators: String,
+    /// Exact sorted committed node identities and categorical roles.
+    pub nodes: Vec<OnnxCommittedNodeEvidence>,
 }
 
 /// Placement observed in the first real synchronized inference profile.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OnnxFirstInferencePlacementEvidence {
-    /// Profiled compute-node events.
-    pub total_compute_nodes: u64,
-    /// Profiled CUDA compute-node events.
+    /// Profiled executable-node events.
+    pub total_graph_nodes: u64,
+    /// Profiled substantive CUDA events.
     pub cuda_compute_nodes: u64,
-    /// Profiled CPU compute-node events.
-    pub cpu_compute_nodes: u64,
+    /// Profiled, statically authorized CPU shape-metadata events.
+    pub cpu_metadata_nodes: u64,
+    /// Profiled unclassified CPU events. Always zero when admitted.
+    pub unclassified_cpu_nodes: u64,
+    /// Profiled transfer events. Always zero when admitted.
+    pub inter_provider_memcpy_nodes: u64,
     /// Deterministic provider/count summary.
     pub providers: String,
+    /// Exact sorted first-inference node identities and output facts.
+    pub nodes: Vec<OnnxProfiledNodeEvidence>,
 }
 
 /// Structured, versioned CUDA ONNX execution evidence.
@@ -123,6 +177,24 @@ pub struct OnnxCudaExecutionEvidence {
     pub kind: OnnxCudaExecutionEvidenceKind,
     /// Exact retained CUDA stream and physical device.
     pub retained_stream: OnnxRetainedCudaStreamEvidence,
+    /// Static classifier implementation bound to this receipt.
+    pub classifier_version: String,
+    /// Canonical ONNX domain/opset inventory.
+    pub opset_inventory: String,
+    /// SHA-256 of the length-delimited canonical opset fields.
+    pub opset_sha256: String,
+    /// Canonical immutable optimized-graph path.
+    pub optimized_graph_path: String,
+    /// Exact optimized-graph byte length.
+    pub optimized_graph_bytes: u64,
+    /// SHA-256 of the exact optimized GraphProto bytes.
+    pub optimized_graph_sha256: String,
+    /// SHA-256 of exact length-delimited API-24 node fields.
+    pub assignment_sha256: String,
+    /// SHA-256 of exact static CPU metadata proof fields.
+    pub cpu_metadata_proof_sha256: String,
+    /// SHA-256 binding classifier, graph, opsets, assignment, and proofs.
+    pub placement_contract_sha256: String,
     /// Committed-session API-24 assignment.
     pub committed_session: OnnxCommittedSessionPlacementEvidence,
     /// First-real-inference execution profile.

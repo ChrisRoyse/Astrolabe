@@ -123,7 +123,7 @@ fn from_files_with_policy(
         user_model,
         InitOptionsUserDefined::new()
             .with_intra_threads(1)
-            .with_session_policy(context.session_policy())
+            .with_session_policy(context.session_policy()?)
             .with_execution_providers(execution_providers),
     )
     .map_err(|err| context.error("model_constructor", err))?;

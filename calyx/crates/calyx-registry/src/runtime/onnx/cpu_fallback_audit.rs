@@ -11,9 +11,10 @@
 //!
 //! Generic ONNX and ColBERT sessions inspect ORT's committed graph assignment
 //! through API 24 before they become usable, then parse the profiling trace
-//! after the first real run. CUDA sessions require every committed and executed
-//! compute node to be assigned to CUDA. This is mandatory runtime evidence, not
-//! optional telemetry.
+//! after the first real run. CUDA sessions require every substantive compute
+//! node on CUDA and authorize CPU nodes only through the separate bounded
+//! shape-metadata contract. This is mandatory runtime evidence, not optional
+//! telemetry.
 //!
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{CStr, c_char};
@@ -26,7 +27,8 @@ use ort::session::Session;
 use ort::{AsPointer, Error as OrtError};
 use serde_json::Value;
 
-pub(super) const CPU_FALLBACK_CODE: &str = "CALYX_ONNX_QUANT_CPU_FALLBACK";
+use super::placement_contract::CudaPlacementContract;
+
 pub(super) const GRAPH_ASSIGNMENT_CONFIG: &str = "session.record_ep_graph_assignment_info";
 
 // The crates.io ort-sys 2.0.0-rc.12 binding omitted
@@ -50,19 +52,6 @@ const _: () = {
     );
 };
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum AuditMode {
-    Fail,
-}
-
-impl AuditMode {
-    pub(super) const fn as_str(self) -> &'static str {
-        match self {
-            Self::Fail => "fail",
-        }
-    }
-}
-
 /// A unique, writable profiling trace path for a session. ORT appends its own
 /// timestamp and `.json` suffix and returns the final path from `end_profiling`.
 pub(super) fn profiling_file_path(label: &str) -> PathBuf {
@@ -84,12 +73,36 @@ pub(super) fn profiling_file_path(label: &str) -> PathBuf {
 /// lifetime; this receipt copies only provider names, operator names, and
 /// counts.
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct AssignedNode {
+    pub(super) provider: String,
+    pub(super) name: String,
+    pub(super) domain: String,
+    pub(super) operator: String,
+}
+
+impl AssignedNode {
+    pub(super) fn qualified_operator(&self) -> String {
+        if self.domain.is_empty() {
+            self.operator.clone()
+        } else {
+            format!("{}::{}", self.domain, self.operator)
+        }
+    }
+
+    pub(super) fn inventory_entry(&self) -> String {
+        format!("{}={}", self.name, self.qualified_operator())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct CommittedGraphAssignment {
     pub(super) total_nodes: u64,
     pub(super) cpu_nodes: u64,
     pub(super) cuda_nodes: u64,
     pub(super) per_provider: String,
     pub(super) per_provider_operators: String,
+    pub(super) per_provider_nodes: String,
+    pub(super) nodes: Vec<AssignedNode>,
 }
 
 pub(super) fn read_committed_graph_assignment(
@@ -131,6 +144,8 @@ fn read_graph_assignment(
 
     let mut counts = BTreeMap::<String, u64>::new();
     let mut operators = BTreeMap::<String, BTreeSet<String>>::new();
+    let mut assigned_nodes = Vec::new();
+    let mut assigned_node_names = BTreeSet::new();
     for &subgraph in subgraphs {
         if subgraph.is_null() {
             return Err(OrtError::new(
@@ -186,6 +201,18 @@ fn read_graph_assignment(
                     "EpAssignedSubgraph_GetNodes returned a null node",
                 ));
             }
+            let name =
+                assigned_string(|out| unsafe { (ort::api().EpAssignedNode_GetName)(node, out) })?;
+            if name.trim().is_empty() || name.trim() != name {
+                return Err(OrtError::new(
+                    "EpAssignedNode_GetName returned an empty or noncanonical node name",
+                ));
+            }
+            if !assigned_node_names.insert(name.clone()) {
+                return Err(OrtError::new(format!(
+                    "ONNX graph assignment contains duplicate node name {name:?}"
+                )));
+            }
             let operator = assigned_string(|out| unsafe {
                 (ort::api().EpAssignedNode_GetOperatorType)(node, out)
             })?;
@@ -196,17 +223,30 @@ fn read_graph_assignment(
             }
             let domain =
                 assigned_string(|out| unsafe { (ort::api().EpAssignedNode_GetDomain)(node, out) })?;
-            let operator = if domain.is_empty() {
-                operator
+            let qualified_operator = if domain.is_empty() {
+                operator.clone()
             } else {
                 format!("{domain}::{operator}")
             };
             operators
                 .entry(provider.clone())
                 .or_default()
-                .insert(operator);
+                .insert(qualified_operator);
+            assigned_nodes.push(AssignedNode {
+                provider: provider.clone(),
+                name,
+                domain,
+                operator,
+            });
         }
     }
+    assigned_nodes.sort_by(|left, right| {
+        left.name
+            .cmp(&right.name)
+            .then_with(|| left.provider.cmp(&right.provider))
+            .then_with(|| left.domain.cmp(&right.domain))
+            .then_with(|| left.operator.cmp(&right.operator))
+    });
 
     let checked_sum = |values: Vec<u64>, label: &'static str| {
         values.into_iter().try_fold(0u64, |sum, value| {
@@ -247,12 +287,26 @@ fn read_graph_assignment(
         })
         .collect::<Vec<_>>()
         .join(";");
+    let mut provider_nodes = BTreeMap::<String, Vec<String>>::new();
+    for node in &assigned_nodes {
+        provider_nodes
+            .entry(node.provider.clone())
+            .or_default()
+            .push(node.inventory_entry());
+    }
+    let per_provider_nodes = provider_nodes
+        .into_iter()
+        .map(|(provider, nodes)| format!("{provider}:[{}]", nodes.join(",")))
+        .collect::<Vec<_>>()
+        .join(";");
     Ok(CommittedGraphAssignment {
         total_nodes,
         cpu_nodes,
         cuda_nodes,
         per_provider,
         per_provider_operators,
+        per_provider_nodes,
+        nodes: assigned_nodes,
     })
 }
 
@@ -296,251 +350,506 @@ fn status_result(status: ort::sys::OrtStatusPtr) -> std::result::Result<(), OrtE
     unsafe { OrtError::result_from_status(status) }
 }
 
-/// Compute-node counts keyed by ORT execution-provider name.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub(super) struct ProviderNodeCounts {
-    counts: BTreeMap<String, usize>,
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct ProfiledNode {
+    pub(super) provider: String,
+    pub(super) name: String,
+    pub(super) operator: String,
+    pub(super) node_index: u64,
+    pub(super) output_size: u64,
+    pub(super) output_elements: u64,
+    pub(super) output_dtypes: String,
 }
 
-impl ProviderNodeCounts {
-    fn add(&mut self, provider: &str) {
-        *self.counts.entry(provider.to_string()).or_default() += 1;
-    }
-
-    fn total(&self) -> usize {
-        self.counts.values().copied().sum()
-    }
-
-    fn cpu_nodes(&self) -> usize {
-        self.counts
-            .iter()
-            .filter(|(provider, _)| is_cpu_provider(provider))
-            .map(|(_, count)| *count)
-            .sum()
-    }
-
-    fn cuda_nodes(&self) -> usize {
-        self.counts
-            .iter()
-            .filter(|(provider, _)| provider_name_is(provider, "CUDAExecutionProvider"))
-            .map(|(_, count)| *count)
-            .sum()
-    }
-
-    fn render(&self) -> String {
-        if self.counts.is_empty() {
-            return "none".to_string();
-        }
-        self.counts
-            .iter()
-            .map(|(provider, count)| format!("{provider}:{count}"))
-            .collect::<Vec<_>>()
-            .join(",")
+impl ProfiledNode {
+    pub(super) fn inventory_entry(&self) -> String {
+        format!(
+            "{}={}@{}#{};bytes={};elements={};dtypes={}",
+            self.name,
+            self.operator,
+            self.provider,
+            self.node_index,
+            self.output_size,
+            self.output_elements,
+            self.output_dtypes
+        )
     }
 }
 
-fn is_cpu_provider(provider: &str) -> bool {
-    provider_name_is(provider, "CPUExecutionProvider")
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct ProfiledGraphExecution {
+    pub(super) total_nodes: u64,
+    pub(super) cuda_compute_nodes: u64,
+    pub(super) cpu_metadata_nodes: u64,
+    pub(super) per_provider: String,
+    pub(super) node_inventory: String,
+    pub(super) nodes: Vec<ProfiledNode>,
 }
 
-/// Parse an ORT profiling trace into per-provider compute-node counts.
-///
-/// ORT emits three events per node (`_fence_before`, `_kernel_time`,
-/// `_fence_after`); the `_kernel_time` record is the actual compute and carries
-/// `args.provider`. Mandatory placement evidence counts only those compute
-/// events and rejects malformed or incomplete node records; it never infers
-/// execution from fence or other provider-bearing events.
-pub(super) fn parse_profiling_nodes(trace_json: &str) -> Result<ProviderNodeCounts> {
-    let value: Value = serde_json::from_str(trace_json).map_err(|err| CalyxError {
-        code: "CALYX_ONNX_PROFILE_PARSE",
-        message: format!("ONNX profiling trace is not valid JSON: {err}"),
-        remediation: "preserve the malformed trace and pinned runtime logs, repair mandatory ONNX profiling output, and retry in a new process",
+/// Parse the first real ORT profile without discarding identity, then
+/// reconcile every executed kernel one-to-one with the statically committed
+/// optimized-graph placement contract.
+pub(super) fn reconcile_profile_with_contract(
+    label: &str,
+    trace_json: &str,
+    contract: &CudaPlacementContract,
+) -> Result<ProfiledGraphExecution> {
+    let value: Value = serde_json::from_str(trace_json).map_err(|error| {
+        profile_error(format!(
+            "ONNX profiling trace for {label} is not valid JSON: {error}"
+        ))
     })?;
-    let events = match &value {
-        Value::Array(events) => events.as_slice(),
-        Value::Object(map) => match map.get("traceEvents") {
-            Some(Value::Array(events)) => events.as_slice(),
-            _ => {
-                return Err(CalyxError {
-                    code: "CALYX_ONNX_PROFILE_PARSE",
-                    message: "ONNX profiling trace object has no traceEvents array".to_string(),
-                    remediation: "expected an ORT profiling trace (JSON array or {traceEvents:[...]})",
-                });
-            }
-        },
-        _ => {
-            return Err(CalyxError {
-                code: "CALYX_ONNX_PROFILE_PARSE",
-                message: "ONNX profiling trace is neither an array nor a traceEvents object"
-                    .to_string(),
-                remediation: "expected an ORT profiling trace (JSON array or {traceEvents:[...]})",
-            });
-        }
-    };
+    let events = profile_events(&value)?;
+    let expected = contract
+        .cuda_compute_nodes
+        .iter()
+        .chain(&contract.cpu_metadata_nodes)
+        .map(|node| (node.name.as_str(), node))
+        .collect::<BTreeMap<_, _>>();
+    let expected_total = usize::try_from(contract.total_graph_nodes()).map_err(|_| {
+        profile_error(format!(
+            "placement contract {} total_graph_nodes={} exceeds usize",
+            contract.contract_sha256,
+            contract.total_graph_nodes()
+        ))
+    })?;
+    if expected.len() != expected_total {
+        return Err(profile_error(format!(
+            "placement contract {} has total_graph_nodes={} but {} unique node identities",
+            contract.contract_sha256,
+            contract.total_graph_nodes(),
+            expected.len()
+        )));
+    }
 
-    let mut kernel = ProviderNodeCounts::default();
-    for (index, event) in events.iter().enumerate() {
-        let obj = event.as_object().ok_or_else(|| CalyxError {
-            code: "CALYX_ONNX_PROFILE_PARSE",
-            message: format!("ONNX profiling event {index} is not an object"),
-            remediation: "preserve the malformed trace and pinned runtime logs, repair mandatory ONNX profiling output, and retry in a new process",
+    let mut profiled_names = BTreeSet::new();
+    let mut profiled_indices = BTreeSet::new();
+    let mut nodes = Vec::new();
+    for (event_index, event) in events.iter().enumerate() {
+        let object = event.as_object().ok_or_else(|| {
+            profile_error(format!(
+                "ONNX profiling event {event_index} is not an object"
+            ))
         })?;
-        let category = obj
-            .get("cat")
-            .and_then(Value::as_str)
-            .filter(|category| !category.trim().is_empty())
-            .ok_or_else(|| CalyxError {
-                code: "CALYX_ONNX_PROFILE_PARSE",
-                message: format!(
-                    "ONNX profiling event {index} has no non-empty string category"
-                ),
-                remediation: "preserve the malformed trace and pinned runtime logs, repair mandatory ONNX profiling output, and retry in a new process",
-            })?;
+        let category = required_event_string(object, "cat", event_index, "event")?;
         if category != "Node" {
             continue;
         }
-        let name = obj
-            .get("name")
-            .and_then(Value::as_str)
-            .filter(|name| !name.trim().is_empty())
-            .ok_or_else(|| CalyxError {
-                code: "CALYX_ONNX_PROFILE_PARSE",
-                message: format!(
-                    "ONNX Node profiling event {index} has no non-empty string name"
-                ),
-                remediation: "preserve the malformed trace and pinned runtime logs, repair mandatory ONNX profiling output, and retry in a new process",
-            })?;
-        let args = obj
+        let event_name = required_event_string(object, "name", event_index, "Node event")?;
+        let args = object
             .get("args")
             .and_then(Value::as_object)
-            .ok_or_else(|| CalyxError {
-                code: "CALYX_ONNX_PROFILE_PARSE",
-                message: format!("ONNX Node profiling event {index} has no args object"),
-                remediation: "preserve the malformed trace and pinned runtime logs, repair mandatory ONNX profiling output, and retry in a new process",
+            .ok_or_else(|| {
+                profile_error(format!(
+                    "ONNX Node profiling event {event_index} has no args object"
+                ))
             })?;
-        if name.ends_with("_kernel_time") {
-            let provider = args
-                .get("provider")
-                .and_then(Value::as_str)
-                .filter(|provider| !provider.trim().is_empty())
-                .ok_or_else(|| CalyxError {
-                    code: "CALYX_ONNX_PROFILE_PARSE",
-                    message: format!(
-                        "ONNX kernel-time event {index} has no non-empty args.provider string"
-                    ),
-                    remediation: "preserve the malformed trace and pinned runtime logs, repair mandatory ONNX profiling output, and retry in a new process",
-                })?;
-            kernel.add(provider);
-        } else if name.ends_with("_fence_before") || name.ends_with("_fence_after") {
+        if event_name.ends_with("_fence_before") || event_name.ends_with("_fence_after") {
             if let Some(provider) = args.get("provider")
                 && provider
                     .as_str()
-                    .filter(|provider| !provider.trim().is_empty())
+                    .filter(|provider| {
+                        !provider.is_empty()
+                            && provider.trim() == *provider
+                            && matches!(*provider, "CUDAExecutionProvider" | "CPUExecutionProvider")
+                    })
                     .is_none()
             {
-                return Err(CalyxError {
-                    code: "CALYX_ONNX_PROFILE_PARSE",
-                    message: format!(
-                        "ONNX fence event {index} has a malformed args.provider value"
-                    ),
-                    remediation: "preserve the malformed trace and pinned runtime logs, repair mandatory ONNX profiling output, and retry in a new process",
-                });
+                return Err(profile_error(format!(
+                    "ONNX fence event {event_index} has malformed provider {provider}"
+                )));
             }
-        } else {
+            continue;
+        }
+        let Some(node_name) = event_name.strip_suffix("_kernel_time") else {
+            return Err(profile_error(format!(
+                "ONNX Node profiling event {event_index} has unsupported name {event_name:?}"
+            )));
+        };
+        if node_name.trim().is_empty() || node_name.trim() != node_name {
+            return Err(profile_error(format!(
+                "ONNX kernel event {event_index} has empty or noncanonical node identity {node_name:?}"
+            )));
+        }
+        if !profiled_names.insert(node_name.to_string()) {
+            return Err(profile_error(format!(
+                "ONNX first-forward profile executes node {node_name:?} more than once; placement-classifier v1 requires one control-flow-free execution per committed node"
+            )));
+        }
+        let operator = required_arg_string(args, "op_name", event_index)?;
+        let provider = required_arg_string(args, "provider", event_index)?;
+        if !matches!(provider, "CUDAExecutionProvider" | "CPUExecutionProvider") {
+            return Err(profile_error(format!(
+                "ONNX kernel event {event_index} node {node_name:?} uses unknown provider {provider:?}"
+            )));
+        }
+        if matches!(operator, "Memcpy" | "MemcpyFromHost" | "MemcpyToHost") {
             return Err(CalyxError {
-                code: "CALYX_ONNX_PROFILE_PARSE",
+                code: "CALYX_ONNX_INTER_PROVIDER_MEMCPY",
                 message: format!(
-                    "ONNX Node profiling event {index} has unsupported name {name:?}; expected *_kernel_time or a fence event"
+                    "first real profile for {label} executed forbidden transfer node {node_name:?} ({operator}) on {provider}"
                 ),
-                remediation: "preserve the unknown trace and pinned runtime logs, validate the exact ONNX Runtime profiling schema, and retry only after the placement parser recognizes every compute event",
+                remediation: "use a graph whose substantive compute remains on CUDA and whose CPU shape metadata requires zero graph-internal transfer kernels",
             });
         }
-    }
-    if kernel.total() == 0 {
-        return Err(CalyxError {
-            code: "CALYX_ONNX_PROFILE_EMPTY",
-            message: "ONNX first-forward profiling trace contains no *_kernel_time compute events"
-                .to_string(),
-            remediation: "preserve the incomplete trace and pinned runtime logs, repair mandatory first-forward profiling, and retry in a new process",
+        let node_index = parse_profile_u64(
+            required_arg_string(args, "node_index", event_index)?,
+            "node_index",
+            event_index,
+        )?;
+        if !profiled_indices.insert(node_index) {
+            return Err(profile_error(format!(
+                "ONNX first-forward profile contains duplicate internal node_index {node_index}"
+            )));
+        }
+        let output_size = parse_profile_u64(
+            required_arg_string(args, "output_size", event_index)?,
+            "output_size",
+            event_index,
+        )?;
+        let input_type_shape = required_arg_string(args, "input_type_shape", event_index)?;
+        parse_profile_type_shapes(input_type_shape, event_index, "input_type_shape")?;
+        let output_type_shape = required_arg_string(args, "output_type_shape", event_index)?;
+        let output_shapes =
+            parse_profile_type_shapes(output_type_shape, event_index, "output_type_shape")?;
+        if output_shapes.total_bytes != output_size {
+            return Err(profile_error(format!(
+                "ONNX kernel event {event_index} node {node_name:?} reports output_size={output_size} but output_type_shape accounts for {} bytes",
+                output_shapes.total_bytes
+            )));
+        }
+
+        let assigned = expected.get(node_name).ok_or_else(|| {
+            profile_error(format!(
+                "ONNX first-forward profile contains uncommitted node {node_name:?} ({operator}) on {provider}"
+            ))
+        })?;
+        if assigned.provider != provider || assigned.operator != operator {
+            return Err(CalyxError {
+                code: "CALYX_ONNX_FIRST_FORWARD_PLACEMENT_DRIFT",
+                message: format!(
+                    "profile node {node_name:?} executed {operator} on {provider}, but committed API-24 assignment records {} on {}",
+                    assigned.operator, assigned.provider
+                ),
+                remediation: "terminally discard the session, preserve assignment/optimized-graph/profile receipts, and repair execution-plan drift before retrying",
+            });
+        }
+        if provider == "CPUExecutionProvider" {
+            let proof = contract.cpu_metadata_proofs.get(node_name).ok_or_else(|| {
+                profile_error(format!(
+                    "CPU profile node {node_name:?} has no static metadata proof"
+                ))
+            })?;
+            if output_shapes.total_elements == 0
+                || output_shapes.total_elements > proof.max_output_elements
+                || output_shapes.dtypes != proof.output_dtypes
+            {
+                return Err(CalyxError {
+                    code: "CALYX_ONNX_CPU_METADATA_RUNTIME_BOUND_MISMATCH",
+                    message: format!(
+                        "CPU metadata node {node_name:?} runtime outputs elements={} dtypes={} exceed/differ from static max_elements={} dtypes={}",
+                        output_shapes.total_elements,
+                        output_shapes.dtypes,
+                        proof.max_output_elements,
+                        proof.output_dtypes
+                    ),
+                    remediation: "terminally discard the session and repair static metadata dataflow/type bounds before authorizing this graph",
+                });
+            }
+            if output_shapes
+                .dtype_names
+                .iter()
+                .any(|dtype| !is_runtime_metadata_dtype(dtype))
+            {
+                return Err(CalyxError {
+                    code: "CALYX_ONNX_CPU_METADATA_RUNTIME_TYPE_INVALID",
+                    message: format!(
+                        "CPU metadata node {node_name:?} produced non-integral/bool dtype(s) {}",
+                        output_shapes.dtypes
+                    ),
+                    remediation: "move substantive floating/content computation to CUDA and authorize only integral/bool shape metadata on CPU",
+                });
+            }
+        }
+        nodes.push(ProfiledNode {
+            provider: provider.to_string(),
+            name: node_name.to_string(),
+            operator: operator.to_string(),
+            node_index,
+            output_size,
+            output_elements: output_shapes.total_elements,
+            output_dtypes: output_shapes.dtypes,
         });
     }
-    Ok(kernel)
-}
 
-/// The verdict of a placement audit — the numbers that also go to telemetry.
-#[derive(Clone, Debug, PartialEq)]
-pub(super) struct CpuFallbackAudit {
-    pub(super) total_nodes: usize,
-    pub(super) cpu_nodes: usize,
-    pub(super) cuda_nodes: usize,
-    pub(super) cpu_fraction: f64,
-    pub(super) max_cpu_fraction: f64,
-    pub(super) over_threshold: bool,
-    pub(super) per_provider: String,
-}
-
-pub(super) fn evaluate_placement(
-    counts: &ProviderNodeCounts,
-    gpu_policy: bool,
-    max_cpu_fraction: f64,
-) -> CpuFallbackAudit {
-    let total_nodes = counts.total();
-    let cpu_nodes = counts.cpu_nodes();
-    let cuda_nodes = counts.cuda_nodes();
-    let cpu_fraction = if total_nodes == 0 {
-        0.0
-    } else {
-        cpu_nodes as f64 / total_nodes as f64
-    };
-    // Strictly greater than the budget so an exact-threshold panel passes, and
-    // a session with no measured nodes never trips (nothing to judge).
-    let over_threshold = gpu_policy && total_nodes > 0 && cpu_fraction > max_cpu_fraction;
-    CpuFallbackAudit {
-        total_nodes,
-        cpu_nodes,
-        cuda_nodes,
-        cpu_fraction,
-        max_cpu_fraction,
-        over_threshold,
-        per_provider: counts.render(),
+    if nodes.is_empty() {
+        return Err(profile_error(format!(
+            "ONNX first-forward profile for {label} contains no *_kernel_time events"
+        )));
     }
-}
-
-/// Parse the trace, evaluate placement, emit telemetry, and — in `fail` mode —
-/// refuse a GPU-policy session that is over the CPU-node fraction.
-pub(super) fn audit_from_trace(
-    label: &str,
-    trace_json: &str,
-    gpu_policy: bool,
-    mode: AuditMode,
-    max_cpu_fraction: f64,
-) -> Result<CpuFallbackAudit> {
-    let counts = parse_profiling_nodes(trace_json)?;
-    let audit = evaluate_placement(&counts, gpu_policy, max_cpu_fraction);
-    let verdict = if audit.over_threshold { "over" } else { "ok" };
-    eprintln!(
-        "CALYX_ONNX_RUNTIME phase=cpu_fallback_audit label={label} mode={} gpu_policy={gpu_policy} total_nodes={} cuda_nodes={} cpu_nodes={} cpu_fraction={:.4} max_cpu_fraction={:.4} providers={} verdict={verdict}",
-        mode.as_str(),
-        audit.total_nodes,
-        audit.cuda_nodes,
-        audit.cpu_nodes,
-        audit.cpu_fraction,
-        audit.max_cpu_fraction,
-        audit.per_provider,
-    );
-    if audit.over_threshold {
+    let observed_names = nodes
+        .iter()
+        .map(|node| node.name.as_str())
+        .collect::<BTreeSet<_>>();
+    let expected_names = expected.keys().copied().collect::<BTreeSet<_>>();
+    if observed_names != expected_names {
+        let missing = expected_names
+            .difference(&observed_names)
+            .copied()
+            .collect::<Vec<_>>()
+            .join(",");
+        let unexpected = observed_names
+            .difference(&expected_names)
+            .copied()
+            .collect::<Vec<_>>()
+            .join(",");
         return Err(CalyxError {
-            code: CPU_FALLBACK_CODE,
+            code: "CALYX_ONNX_FIRST_FORWARD_NODE_SET_MISMATCH",
             message: format!(
-                "{label} claims a GPU execution provider but ran {}/{} compute nodes ({:.1}%) on CPU (providers={}), exceeding the mandatory CPU-node fraction {:.4} — int8/quantized ONNX graphs have no CUDA kernels, so QLinearMatMul/QGemm/MatMulInteger fall back to CPU per node with a device<->host copy each way",
-                audit.cpu_nodes,
-                audit.total_nodes,
-                audit.cpu_fraction * 100.0,
-                audit.per_provider,
-                audit.max_cpu_fraction,
+                "first real profile for {label} does not match committed graph: missing=[{missing}] unexpected=[{unexpected}]"
             ),
-            remediation: "use the CUDA-capable fp16/fp32 ONNX variant for a CUDA session; construct a separate explicit-CPU lens only when CPU execution is genuinely intended, and never retry this failed CUDA session on CPU",
+            remediation: "terminally discard the session, preserve all three receipts, and repair assignment/profile identity reconciliation before retrying",
         });
     }
-    Ok(audit)
+    nodes.sort_by(|left, right| left.name.cmp(&right.name));
+    let cuda_compute_nodes = u64::try_from(
+        nodes
+            .iter()
+            .filter(|node| node.provider == "CUDAExecutionProvider")
+            .count(),
+    )
+    .map_err(|_| profile_error("profile CUDA node count exceeds u64"))?;
+    let cpu_metadata_nodes = u64::try_from(
+        nodes
+            .iter()
+            .filter(|node| node.provider == "CPUExecutionProvider")
+            .count(),
+    )
+    .map_err(|_| profile_error("profile CPU metadata node count exceeds u64"))?;
+    let total_nodes = cuda_compute_nodes
+        .checked_add(cpu_metadata_nodes)
+        .ok_or_else(|| {
+            profile_error("profile total node count exceeds the u64 evidence contract")
+        })?;
+    if total_nodes != contract.total_graph_nodes()
+        || cuda_compute_nodes != contract.cuda_compute_node_count()
+        || cpu_metadata_nodes != contract.cpu_metadata_node_count()
+    {
+        return Err(CalyxError {
+            code: "CALYX_ONNX_FIRST_FORWARD_COUNT_MISMATCH",
+            message: format!(
+                "first real profile for {label} reports total={total_nodes} cuda_compute={cuda_compute_nodes} cpu_metadata={cpu_metadata_nodes}, committed contract reports total={} cuda_compute={} cpu_metadata={}",
+                contract.total_graph_nodes(),
+                contract.cuda_compute_node_count(),
+                contract.cpu_metadata_node_count()
+            ),
+            remediation: "terminally discard the session and repair committed-versus-executed placement reconciliation",
+        });
+    }
+    let per_provider = if cpu_metadata_nodes == 0 {
+        format!("CUDAExecutionProvider:{cuda_compute_nodes}")
+    } else {
+        format!(
+            "CPUExecutionProvider:{cpu_metadata_nodes},CUDAExecutionProvider:{cuda_compute_nodes}"
+        )
+    };
+    let node_inventory = nodes
+        .iter()
+        .map(ProfiledNode::inventory_entry)
+        .collect::<Vec<_>>()
+        .join(",");
+    Ok(ProfiledGraphExecution {
+        total_nodes,
+        cuda_compute_nodes,
+        cpu_metadata_nodes,
+        per_provider,
+        node_inventory,
+        nodes,
+    })
+}
+
+struct ProfileTypeShapes {
+    total_elements: u64,
+    total_bytes: u64,
+    dtypes: String,
+    dtype_names: BTreeSet<String>,
+}
+
+fn profile_events(value: &Value) -> Result<&[Value]> {
+    match value {
+        Value::Array(events) => Ok(events),
+        Value::Object(map) => match map.get("traceEvents") {
+            Some(Value::Array(events)) => Ok(events),
+            _ => Err(profile_error(
+                "ONNX profiling trace object has no traceEvents array",
+            )),
+        },
+        _ => Err(profile_error(
+            "ONNX profiling trace is neither an array nor a traceEvents object",
+        )),
+    }
+}
+
+fn required_event_string<'a>(
+    object: &'a serde_json::Map<String, Value>,
+    key: &str,
+    event_index: usize,
+    context: &str,
+) -> Result<&'a str> {
+    object
+        .get(key)
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty() && value.trim() == *value)
+        .ok_or_else(|| {
+            profile_error(format!(
+                "ONNX {context} {event_index} has no canonical string {key}"
+            ))
+        })
+}
+
+fn required_arg_string<'a>(
+    args: &'a serde_json::Map<String, Value>,
+    key: &str,
+    event_index: usize,
+) -> Result<&'a str> {
+    args.get(key)
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty() && value.trim() == *value)
+        .ok_or_else(|| {
+            profile_error(format!(
+                "ONNX kernel event {event_index} has no canonical args.{key} string"
+            ))
+        })
+}
+
+fn parse_profile_u64(raw: &str, field: &str, event_index: usize) -> Result<u64> {
+    if raw.is_empty()
+        || !raw.bytes().all(|byte| byte.is_ascii_digit())
+        || (raw.len() > 1 && raw.starts_with('0'))
+    {
+        return Err(profile_error(format!(
+            "ONNX kernel event {event_index} args.{field} is not canonical unsigned decimal: {raw:?}"
+        )));
+    }
+    raw.parse::<u64>().map_err(|error| {
+        profile_error(format!(
+            "ONNX kernel event {event_index} args.{field} exceeds u64: {raw:?}: {error}"
+        ))
+    })
+}
+
+fn parse_profile_type_shapes(
+    raw: &str,
+    event_index: usize,
+    field: &str,
+) -> Result<ProfileTypeShapes> {
+    let value: Value = serde_json::from_str(raw).map_err(|error| {
+        profile_error(format!(
+            "ONNX kernel event {event_index} args.{field} is not valid nested JSON: {error}"
+        ))
+    })?;
+    let tensors = value.as_array().ok_or_else(|| {
+        profile_error(format!(
+            "ONNX kernel event {event_index} args.{field} is not an array"
+        ))
+    })?;
+    let mut total_elements = 0u64;
+    let mut total_bytes = 0u64;
+    let mut dtype_names = BTreeSet::new();
+    for (tensor_index, tensor) in tensors.iter().enumerate() {
+        let object = tensor.as_object().filter(|object| object.len() == 1).ok_or_else(|| {
+            profile_error(format!(
+                "ONNX kernel event {event_index} args.{field}[{tensor_index}] is not a one-entry dtype/shape object"
+            ))
+        })?;
+        let (dtype, dimensions) = object.iter().next().ok_or_else(|| {
+            profile_error(format!(
+                "ONNX kernel event {event_index} args.{field}[{tensor_index}] is empty"
+            ))
+        })?;
+        if dtype.trim() != dtype || dtype.is_empty() {
+            return Err(profile_error(format!(
+                "ONNX kernel event {event_index} args.{field}[{tensor_index}] has noncanonical dtype {dtype:?}"
+            )));
+        }
+        let bits_per_element = runtime_dtype_bits(dtype).ok_or_else(|| {
+            profile_error(format!(
+                "ONNX kernel event {event_index} args.{field}[{tensor_index}] has unsupported runtime dtype {dtype:?}"
+            ))
+        })?;
+        let dimensions = dimensions.as_array().ok_or_else(|| {
+            profile_error(format!(
+                "ONNX kernel event {event_index} args.{field}[{tensor_index}] shape is not an array"
+            ))
+        })?;
+        let elements = dimensions.iter().try_fold(1u64, |elements, dimension| {
+            let dimension = dimension.as_u64().ok_or_else(|| {
+                profile_error(format!(
+                    "ONNX kernel event {event_index} args.{field}[{tensor_index}] has a non-u64 runtime dimension {dimension}"
+                ))
+            })?;
+            elements.checked_mul(dimension).ok_or_else(|| {
+                profile_error(format!(
+                    "ONNX kernel event {event_index} args.{field}[{tensor_index}] element count exceeds u64"
+                ))
+            })
+        })?;
+        let tensor_bits = elements.checked_mul(bits_per_element).ok_or_else(|| {
+            profile_error(format!(
+                "ONNX kernel event {event_index} args.{field}[{tensor_index}] byte size exceeds u64"
+            ))
+        })?;
+        let tensor_bytes = tensor_bits.checked_add(7).ok_or_else(|| {
+            profile_error(format!(
+                "ONNX kernel event {event_index} args.{field}[{tensor_index}] packed byte size exceeds u64"
+            ))
+        })? / 8;
+        total_elements = total_elements.checked_add(elements).ok_or_else(|| {
+            profile_error(format!(
+                "ONNX kernel event {event_index} args.{field} element count exceeds u64"
+            ))
+        })?;
+        total_bytes = total_bytes.checked_add(tensor_bytes).ok_or_else(|| {
+            profile_error(format!(
+                "ONNX kernel event {event_index} args.{field} byte size exceeds u64"
+            ))
+        })?;
+        dtype_names.insert(dtype.clone());
+    }
+    let dtypes = dtype_names.iter().cloned().collect::<Vec<_>>().join(",");
+    Ok(ProfileTypeShapes {
+        total_elements,
+        total_bytes,
+        dtypes,
+        dtype_names,
+    })
+}
+
+fn runtime_dtype_bits(dtype: &str) -> Option<u64> {
+    match dtype {
+        "bool" | "int8" | "uint8" | "Float8E4M3FN" | "Float8E4M3FNUZ" | "Float8E5M2"
+        | "Float8E5M2FNUZ" | "Float8E8M0" => Some(8),
+        "int16" | "uint16" | "float16" | "bfloat16" => Some(16),
+        "int32" | "uint32" | "float" => Some(32),
+        "int64" | "uint64" | "double" | "complex64" => Some(64),
+        "complex128" => Some(128),
+        "Float4E2M1" | "Int4x2" | "UInt4x2" => Some(4),
+        "Int2x4" | "UInt2x4" => Some(2),
+        _ => None,
+    }
+}
+
+fn is_runtime_metadata_dtype(dtype: &str) -> bool {
+    matches!(
+        dtype,
+        "bool" | "uint8" | "int8" | "uint16" | "int16" | "int32" | "int64" | "uint32" | "uint64"
+    )
+}
+
+fn profile_error(message: impl Into<String>) -> CalyxError {
+    CalyxError {
+        code: "CALYX_ONNX_PROFILE_PARSE",
+        message: message.into(),
+        remediation: "preserve the malformed trace, optimized graph, and API-24 assignment; repair exact first-forward profiling before retrying in a new process",
+    }
 }

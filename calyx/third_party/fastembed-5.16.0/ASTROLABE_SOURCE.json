@@ -9,7 +9,7 @@
   "license": "Apache-2.0",
   "hash_algorithm": "sha256-domain-u64le-path-u64le-content-v1",
   "attested_file_count": 42,
-  "attested_source_tree_sha256": "625bb7060b66499f9910dfa6c00d9861f4188aea9b2fdb3353a5b1def9fbc1e1",
+  "attested_source_tree_sha256": "c190aa740d17948968565caf37ebbf6d3c7cd88e663f9f22af47b9c284db2808",
   "files": [
     {
       "path": ".cargo_vcs_info.json",
@@ -28,8 +28,8 @@
     },
     {
       "path": "README.md",
-      "bytes": 16316,
-      "sha256": "9b476129ef2d9b5389f81bf3f0c0a6dd4b1f863ed853283cc941042e415cbedd"
+      "bytes": 16576,
+      "sha256": "19ea3ec515b60b928ff0f3c9d059d125489b9c525fe54b28e407aef47b8d49f0"
     },
     {
       "path": "build.rs",
@@ -78,8 +78,8 @@
     },
     {
       "path": "src/init.rs",
-      "bytes": 12774,
-      "sha256": "abb5613816b6757ee4d4158d41dd7eded779addf412159e975f9ccadab76da90"
+      "bytes": 14712,
+      "sha256": "595431e43f017e962156b7b8bfbf38ff2628090593a63d71407b2304cdb71eac"
     },
     {
       "path": "src/lib.rs",
@@ -226,7 +226,7 @@
     "expose the ORT alternative-backend feature for Astrolabe's sole process-global API commit and remove per-crate dynamic loading",
     "require and validate an explicit per-session CPU or fail-closed CUDA policy before every ONNX SessionBuilder",
     "force every validated CPU and CUDA execution-provider dispatch to fail session registration on provider errors",
-    "disable implicit CPU EP fallback and record graph assignment for every CUDA-policy session",
+    "record the exact optimized graph and first profile for every CUDA-policy session so Calyx can classify CPU shape metadata separately from substantive CUDA compute",
     "commit caller-snapshotted graph, external-data, and tokenizer buffers in memory for dense, sparse, BGE-M3, and reranker sessions while preserving model-specific behavior",
     "validate exact tokenizer bytes and all required tokenizer metadata before any dense, sparse, BGE-M3, or reranker ONNX session is committed",
     "document the mandatory provider-policy pair in every public ONNX construction example",

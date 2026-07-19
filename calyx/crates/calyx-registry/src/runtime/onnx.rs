@@ -28,6 +28,7 @@ mod fastembed_attestation;
 mod fastembed_runtime;
 mod green_context;
 mod io_binding;
+mod placement_contract;
 #[cfg(windows)]
 mod runtime_bundle;
 mod session;
@@ -77,7 +78,7 @@ impl OnnxProviderPolicy {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::CudaFailLoud => {
-                "cuda,error_on_failure,no_cpu_fallback,cudnn_conv_algo=HEURISTIC,cudnn_workspace_cap=32MiB"
+                "cuda,error_on_failure,no_content_compute_fallback,classified_cpu_shape_metadata,zero_inter_ep_memcpy,cudnn_conv_algo=HEURISTIC,cudnn_workspace_cap=32MiB"
             }
             Self::CpuExplicit => "cpu_explicit,no_cuda",
         }

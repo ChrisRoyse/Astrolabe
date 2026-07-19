@@ -28,9 +28,10 @@
 //!   green-context user stream with an SM slice of at least `n` SMs and balanced
 //!   work queues. Invalid values, CPU-policy sessions, unsupported builds, or
 //!   `CALYX_ONNX_CUDA_GRAPHS=1` fail closed.
-//! - `CALYX_ONNX_DISABLE_CPU_EP_FALLBACK=1` — set the ORT session config that
-//!   refuses node-level CPU placement at build time for CPU-explicit sessions.
-//!   CUDA policy sessions always set it.
+//! - `CALYX_ONNX_DISABLE_CPU_EP_FALLBACK=1` — set the ORT session config only
+//!   for CPU-explicit sessions. CUDA sessions reject this switch because ORT
+//!   applies it to intentional host shape metadata as well as compute; CUDA
+//!   content fallback is instead refused by the exact placement contract.
 //!
 //! Device-arena controls (#1143 — BFC arena growth across dynamic shapes):
 //! - `CALYX_ONNX_GPU_MEM_LIMIT_MIB` — hard cap (MiB) on the CUDA BFC arena;
@@ -43,15 +44,17 @@
 //!   keeps real workloads far below it, so reaching it means a caller
 //!   regressed into unbounded shape diversity.
 //! Provider placement is not configurable telemetry. Every committed session
-//! is inspected through ORT API 24, and every CUDA session must prove the same
-//! all-CUDA placement in the profile of its first real synchronized forward.
+//! is inspected through ORT API 24 and the final optimized graph. CUDA sessions
+//! must prove all substantive compute on CUDA, only classified bounded shape
+//! metadata on CPU, zero inter-provider transfer nodes, and the same exact
+//! identities in the first real synchronized-forward profile.
 
 use std::collections::BTreeSet;
 
 use calyx_core::{
-    CalyxError, OnnxCommittedSessionPlacementEvidence, OnnxCudaExecutionEvidence,
-    OnnxCudaExecutionEvidenceKind, OnnxFirstInferencePlacementEvidence, Result,
-    RuntimeExecutionAttestation,
+    CalyxError, OnnxCommittedNodeEvidence, OnnxCommittedSessionPlacementEvidence,
+    OnnxCudaExecutionEvidence, OnnxCudaExecutionEvidenceKind, OnnxFirstInferencePlacementEvidence,
+    OnnxPlacementNodeRole, OnnxProfiledNodeEvidence, Result, RuntimeExecutionAttestation,
 };
 use ort::memory::{AllocationDevice, AllocatorType, MemoryInfo, MemoryType};
 use ort::session::{RunOptions, Session, SessionInputValue, SessionOutputs};
@@ -62,13 +65,12 @@ use super::arena::{
     ARENA_SHRINKAGE_RUN_KEY, ArenaShrinkPolicy, MAX_DISTINCT_SHAPES_ENV, configured_arena_shrink,
     configured_gpu_mem_limit, configured_max_distinct_shapes,
 };
-use super::cpu_fallback_audit::{
-    AuditMode, CommittedGraphAssignment, audit_from_trace, read_committed_graph_assignment,
-};
+use super::cpu_fallback_audit::{CommittedGraphAssignment, reconcile_profile_with_contract};
 use super::cuda_graphs::{CUDA_GRAPHS_ENV, CudaGraphRunConfig, CudaGraphRunRequest};
+use super::placement_contract::CudaPlacementContract;
 use super::session::{
     IO_BINDING_ENV, ManagedOnnxSession, REQUIRE_STATIC_BINDING_ENV, configured_cuda_graphs,
-    cpu_ep_fallback_disabled, env_flag,
+    cpu_ep_fallback_session_config_enabled, env_flag,
 };
 use super::{OnnxProviderPolicy, config_invalid};
 
@@ -84,6 +86,7 @@ pub(super) struct OnnxRunPlan {
     execution_device: String,
     stream_receipt: Option<String>,
     assignment: CommittedGraphAssignment,
+    placement_contract: Option<CudaPlacementContract>,
     execution_state: ExecutionState,
     require_static: bool,
     cuda_graphs: CudaGraphRunConfig,
@@ -105,6 +108,7 @@ fn validate_committed_assignment(
     label: &str,
     execution_device: &str,
     assignment: &CommittedGraphAssignment,
+    placement_contract: Option<&CudaPlacementContract>,
 ) -> Result<()> {
     if assignment.total_nodes == 0 {
         return Err(CalyxError {
@@ -118,14 +122,26 @@ fn validate_committed_assignment(
     }
     let valid = match policy {
         OnnxProviderPolicy::CudaFailLoud => {
+            let Some(contract) = placement_contract else {
+                return Err(CalyxError {
+                    code: "CALYX_ONNX_PLACEMENT_CONTRACT_MISSING",
+                    message: format!(
+                        "committed CUDA ONNX session {label} has no classified optimized-graph contract"
+                    ),
+                    remediation: "discard the session and rebuild it through the quarantined CUDA constructor",
+                });
+            };
             execution_device != "cpu"
-                && assignment.cpu_nodes == 0
-                && assignment.cuda_nodes == assignment.total_nodes
+                && contract.total_graph_nodes() == assignment.total_nodes
+                && contract.cuda_compute_node_count() == assignment.cuda_nodes
+                && contract.cpu_metadata_node_count() == assignment.cpu_nodes
+                && contract.cuda_compute_node_count() > 0
         }
         OnnxProviderPolicy::CpuExplicit => {
             execution_device == "cpu"
                 && assignment.cpu_nodes == assignment.total_nodes
                 && assignment.cuda_nodes == 0
+                && placement_contract.is_none()
         }
     };
     if valid {
@@ -134,17 +150,20 @@ fn validate_committed_assignment(
     Err(CalyxError {
         code: "CALYX_ONNX_GRAPH_ASSIGNMENT_MISMATCH",
         message: format!(
-            "committed ONNX session {label} policy={} device={execution_device} requires exclusive provider assignment, observed total={} cuda={} cpu={} providers={} assigned_operators={}",
+            "committed ONNX session {label} policy={} device={execution_device} violates its categorical provider contract, observed total={} cuda={} cpu={} providers={} assigned_operators={} placement_contract={}",
             policy.as_str(),
             assignment.total_nodes,
             assignment.cuda_nodes,
             assignment.cpu_nodes,
             assignment.per_provider,
-            assignment.per_provider_operators
+            assignment.per_provider_operators,
+            placement_contract
+                .map(|contract| contract.contract_sha256.as_str())
+                .unwrap_or("none")
         ),
         remediation: match policy {
             OnnxProviderPolicy::CudaFailLoud => {
-                "use a CUDA-capable fp16/fp32 graph whose every frozen operator has a CUDA kernel; never enable CPU fallback or retry this graph on CPU"
+                "use a graph whose substantive compute is entirely CUDA and whose CPU nodes are statically proven bounded shape metadata with zero transfer nodes; never retry failed CUDA construction on CPU"
             }
             OnnxProviderPolicy::CpuExplicit => {
                 "repair the explicitly authorized CPU session so every committed node is assigned only to CPU before retrying"
@@ -266,8 +285,15 @@ impl OnnxRunPlan {
                 });
             }
         }
-        let assignment = read_committed_graph_assignment(session.as_ref(), &label)?;
-        validate_committed_assignment(policy, &label, &execution_device, &assignment)?;
+        let assignment = session.committed_assignment().clone();
+        let placement_contract = session.placement_contract().cloned();
+        validate_committed_assignment(
+            policy,
+            &label,
+            &execution_device,
+            &assignment,
+            placement_contract.as_ref(),
+        )?;
         let (allocator, cpu_fallback) = if gpu_policy {
             (
                 if cuda_graphs {
@@ -277,28 +303,43 @@ impl OnnxRunPlan {
                 } else {
                     "ort_default_device_arena"
                 },
-                "disabled_by_session_config",
+                "no_content_compute_fallback_classified_cpu_shape_metadata",
             )
         } else {
             ("host", "cpu_explicit_policy")
         };
         eprintln!(
-            "CALYX_ONNX_RUNTIME phase=session_ready label={label} runtime={runtime} provider={} device_id={device_id} physical_device={execution_device} retained_stream={} io_binding={io_binding} io_binding_env_off={binding_env_off} allocator={allocator} cpu_fallback={cpu_fallback} require_static_binding={require_static} cuda_graphs={cuda_graphs} green_context_sms={} disable_cpu_ep_fallback={} arena_extend=same_as_requested gpu_mem_limit_mib={} arena_shrink={} max_distinct_shapes={max_distinct_shapes} placement_contract=api24_mandatory total_nodes={} cuda_nodes={} cpu_nodes={} assigned_providers={} assigned_operators={}",
+            "CALYX_ONNX_RUNTIME phase=session_ready label={label} runtime={runtime} provider={} device_id={device_id} physical_device={execution_device} retained_stream={} io_binding={io_binding} io_binding_env_off={binding_env_off} allocator={allocator} cpu_fallback={cpu_fallback} require_static_binding={require_static} cuda_graphs={cuda_graphs} green_context_sms={} disable_cpu_ep_fallback={} arena_extend=same_as_requested gpu_mem_limit_mib={} arena_shrink={} max_distinct_shapes={max_distinct_shapes} placement_contract={} classifier={} total_graph_nodes={} cuda_compute_nodes={} cpu_metadata_nodes={} assigned_providers={} assigned_operators={} assigned_nodes={}",
             policy.as_str(),
             stream_receipt.as_deref().unwrap_or("none"),
             green_context_sms
                 .map(|count| count.to_string())
                 .unwrap_or_else(|| "off".to_string()),
-            cpu_ep_fallback_disabled(policy),
+            cpu_ep_fallback_session_config_enabled(policy),
             mem_limit
                 .map(|bytes| (bytes / (1024 * 1024)).to_string())
                 .unwrap_or_else(|| "none".to_string()),
             arena_shrink.as_str(),
+            placement_contract
+                .as_ref()
+                .map(|contract| contract.contract_sha256.as_str())
+                .unwrap_or("explicit_cpu"),
+            placement_contract
+                .as_ref()
+                .map(|contract| contract.classifier_version)
+                .unwrap_or("explicit_cpu"),
             assignment.total_nodes,
-            assignment.cuda_nodes,
-            assignment.cpu_nodes,
+            placement_contract
+                .as_ref()
+                .map(CudaPlacementContract::cuda_compute_node_count)
+                .unwrap_or(0),
+            placement_contract
+                .as_ref()
+                .map(CudaPlacementContract::cpu_metadata_node_count)
+                .unwrap_or(assignment.cpu_nodes),
             assignment.per_provider,
-            assignment.per_provider_operators
+            assignment.per_provider_operators,
+            assignment.per_provider_nodes
         );
         Ok(Self {
             label,
@@ -309,6 +350,7 @@ impl OnnxRunPlan {
             execution_device,
             stream_receipt,
             assignment,
+            placement_contract,
             execution_state: ExecutionState::Pending,
             require_static,
             cuda_graphs: CudaGraphRunConfig::new(cuda_graphs),
@@ -612,6 +654,24 @@ impl OnnxRunPlan {
         }
 
         let (provider, evidence) = if self.gpu_policy {
+            let contract = self.placement_contract.as_ref().ok_or_else(|| CalyxError {
+                code: "CALYX_ONNX_PLACEMENT_CONTRACT_MISSING",
+                message: format!(
+                    "first-forward CUDA attestation for {} has no retained static placement contract",
+                    self.label
+                ),
+                remediation: "discard the session and rebuild it through the quarantined optimized-graph constructor",
+            })?;
+            if session.placement_contract() != Some(contract) {
+                return Err(CalyxError {
+                    code: "CALYX_ONNX_PLACEMENT_CONTRACT_DRIFT",
+                    message: format!(
+                        "run plan {} contract {} differs from its executing session",
+                        self.label, contract.contract_sha256
+                    ),
+                    remediation: "terminally discard the session and rebuild the run plan from the exact committed session",
+                });
+            }
             let snapshot = session.finish_profile_snapshot(&self.label)?;
             let trace = std::str::from_utf8(&snapshot.bytes).map_err(|error| CalyxError {
                 code: "CALYX_ONNX_PROFILE_PARSE",
@@ -623,49 +683,8 @@ impl OnnxRunPlan {
                 remediation: "preserve the malformed profile and pinned runtime logs, repair ONNX profiling output, and retry in a new process",
             })?;
             let trace_sha256 = format!("{:x}", Sha256::digest(&snapshot.bytes));
-            let profile = audit_from_trace(&self.label, trace, true, AuditMode::Fail, 0.0)?;
-            if profile.total_nodes == 0
-                || profile.cpu_nodes != 0
-                || profile.cuda_nodes != profile.total_nodes
-            {
-                return Err(CalyxError {
-                    code: "CALYX_ONNX_FIRST_FORWARD_PLACEMENT_MISMATCH",
-                    message: format!(
-                        "first real synchronized forward for {} expected every compute node on CUDA, observed cuda={}/{} cpu={} providers={} profile={}",
-                        self.label,
-                        profile.cuda_nodes,
-                        profile.total_nodes,
-                        profile.cpu_nodes,
-                        profile.per_provider,
-                        snapshot.final_path.display()
-                    ),
-                    remediation: "use a CUDA-capable fp16/fp32 graph whose every frozen operator has a CUDA kernel; never retry this session or graph on CPU",
-                });
-            }
-            let profile_total = u64::try_from(profile.total_nodes).map_err(|_| CalyxError {
-                code: "CALYX_ONNX_PROFILE_COUNT_OVERFLOW",
-                message: format!(
-                    "first-forward profile node count {} for {} exceeds u64",
-                    profile.total_nodes, self.label
-                ),
-                remediation: "preserve the profile and repair the provider-profile count conversion before admitting the session",
-            })?;
-            let profile_cuda = u64::try_from(profile.cuda_nodes).map_err(|_| CalyxError {
-                code: "CALYX_ONNX_PROFILE_COUNT_OVERFLOW",
-                message: format!(
-                    "first-forward CUDA node count {} for {} exceeds u64",
-                    profile.cuda_nodes, self.label
-                ),
-                remediation: "preserve the profile and repair the provider-profile count conversion before admitting the session",
-            })?;
-            let profile_cpu = u64::try_from(profile.cpu_nodes).map_err(|_| CalyxError {
-                code: "CALYX_ONNX_PROFILE_COUNT_OVERFLOW",
-                message: format!(
-                    "first-forward CPU node count {} for {} exceeds u64",
-                    profile.cpu_nodes, self.label
-                ),
-                remediation: "preserve the profile and repair the provider-profile count conversion before admitting the session",
-            })?;
+            session.revalidate_optimized_graph(&self.label)?;
+            let profile = reconcile_profile_with_contract(&self.label, trace, contract)?;
             let profile_path = snapshot.final_path.to_str().ok_or_else(|| CalyxError {
                 code: "CALYX_ONNX_PROFILE_PATH_INVALID",
                 message: format!(
@@ -686,31 +705,99 @@ impl OnnxRunPlan {
                         remediation: "build calyx-registry with the cuda feature, construct the CUDA execution provider with an Astrolabe-owned stream, and retain it through the first real synchronized inference",
                     },
                 )?;
+            let mut committed_nodes = Vec::new();
+            for node in &contract.cuda_compute_nodes {
+                committed_nodes.push(OnnxCommittedNodeEvidence {
+                    name: node.name.clone(),
+                    domain: node.domain.clone(),
+                    operator: node.operator.clone(),
+                    provider: node.provider.clone(),
+                    role: OnnxPlacementNodeRole::CudaCompute,
+                    max_output_elements: None,
+                    output_dtypes: None,
+                });
+            }
+            for node in &contract.cpu_metadata_nodes {
+                let proof =
+                    contract
+                        .cpu_metadata_proofs
+                        .get(&node.name)
+                        .ok_or_else(|| CalyxError {
+                            code: "CALYX_ONNX_CPU_METADATA_PROOF_MISSING",
+                            message: format!(
+                                "placement contract {} authorizes CPU node {:?} without a retained static proof",
+                                contract.contract_sha256, node.name
+                            ),
+                            remediation: "terminally discard the session and repair optimized-graph classification before emitting execution evidence",
+                        })?;
+                committed_nodes.push(OnnxCommittedNodeEvidence {
+                    name: node.name.clone(),
+                    domain: node.domain.clone(),
+                    operator: node.operator.clone(),
+                    provider: node.provider.clone(),
+                    role: OnnxPlacementNodeRole::CpuShapeMetadata,
+                    max_output_elements: Some(proof.max_output_elements),
+                    output_dtypes: Some(proof.output_dtypes.clone()),
+                });
+            }
+            committed_nodes.sort_by(|left, right| left.name.cmp(&right.name));
             let structured = OnnxCudaExecutionEvidence {
-                kind:
-                    OnnxCudaExecutionEvidenceKind::Api24CommittedSessionAndFirstRealInferenceProfile,
+                kind: OnnxCudaExecutionEvidenceKind::OptimizedGraphClassifiedV1Api24AndFirstExactInferenceProfile,
                 retained_stream,
+                classifier_version: contract.classifier_version.to_string(),
+                opset_inventory: contract.opset_inventory.clone(),
+                opset_sha256: contract.opset_sha256.clone(),
+                optimized_graph_path: contract.optimized_graph_path.clone(),
+                optimized_graph_bytes: contract.optimized_graph_bytes,
+                optimized_graph_sha256: contract.optimized_graph_sha256.clone(),
+                assignment_sha256: contract.assignment_sha256.clone(),
+                cpu_metadata_proof_sha256: contract.cpu_metadata_proof_sha256.clone(),
+                placement_contract_sha256: contract.contract_sha256.clone(),
                 committed_session: OnnxCommittedSessionPlacementEvidence {
-                    total_compute_nodes: self.assignment.total_nodes,
-                    cuda_compute_nodes: self.assignment.cuda_nodes,
-                    cpu_compute_nodes: self.assignment.cpu_nodes,
+                    total_graph_nodes: contract.total_graph_nodes(),
+                    cuda_compute_nodes: contract.cuda_compute_node_count(),
+                    cpu_metadata_nodes: contract.cpu_metadata_node_count(),
+                    unclassified_cpu_nodes: 0,
+                    inter_provider_memcpy_nodes: 0,
                     providers: self.assignment.per_provider.clone(),
                     assigned_operators: self.assignment.per_provider_operators.clone(),
+                    nodes: committed_nodes,
                 },
                 first_inference_profile: OnnxFirstInferencePlacementEvidence {
-                    total_compute_nodes: profile_total,
-                    cuda_compute_nodes: profile_cuda,
-                    cpu_compute_nodes: profile_cpu,
+                    total_graph_nodes: profile.total_nodes,
+                    cuda_compute_nodes: profile.cuda_compute_nodes,
+                    cpu_metadata_nodes: profile.cpu_metadata_nodes,
+                    unclassified_cpu_nodes: 0,
+                    inter_provider_memcpy_nodes: 0,
                     providers: profile.per_provider.clone(),
+                    nodes: profile
+                        .nodes
+                        .iter()
+                        .map(|node| OnnxProfiledNodeEvidence {
+                            name: node.name.clone(),
+                            operator: node.operator.clone(),
+                            provider: node.provider.clone(),
+                            role: if node.provider == "CUDAExecutionProvider" {
+                                OnnxPlacementNodeRole::CudaCompute
+                            } else {
+                                OnnxPlacementNodeRole::CpuShapeMetadata
+                            },
+                            node_index: node.node_index,
+                            output_size: node.output_size,
+                            output_elements: node.output_elements,
+                            output_dtypes: node.output_dtypes.clone(),
+                        })
+                        .collect(),
                 },
                 profile_path: profile_path.to_string(),
                 profile_sha256: trace_sha256,
             };
             (
                 format!(
-                    "api24={};profile={}",
+                    "api24={};profile={};placement_contract={}",
                     structured.committed_session.providers,
-                    structured.first_inference_profile.providers
+                    structured.first_inference_profile.providers,
+                    structured.placement_contract_sha256
                 ),
                 super::execution_attestation::serialize_cuda_onnx_execution_evidence(&structured)?,
             )
@@ -723,6 +810,12 @@ impl OnnxRunPlan {
                 ),
             )
         };
+        let (substantive_compute_nodes, cpu_compute_nodes) =
+            if let Some(contract) = &self.placement_contract {
+                (contract.cuda_compute_node_count(), 0)
+            } else {
+                (self.assignment.total_nodes, self.assignment.cpu_nodes)
+            };
         Ok(RuntimeExecutionAttestation {
             runtime: self.runtime.to_string(),
             provider,
@@ -730,8 +823,8 @@ impl OnnxRunPlan {
             loader_dtype: None,
             compute_dtype: None,
             evidence,
-            total_compute_nodes: Some(self.assignment.total_nodes),
-            cpu_compute_nodes: Some(self.assignment.cpu_nodes),
+            total_compute_nodes: Some(substantive_compute_nodes),
+            cpu_compute_nodes: Some(cpu_compute_nodes),
         })
     }
 

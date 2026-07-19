@@ -121,9 +121,12 @@ Every ONNX-backed constructor in Astrolabe's owned FastEmbed build requires an e
 intentionally carry an unspecified policy and fail before ONNX Runtime can select an implicit
 CPU fallback. The examples below use an explicit CPU provider. For CUDA, pass exactly one
 `ort::ep::CUDA` provider and use
-`SessionPolicy::cuda_no_cpu_fallback("path/to/graph-assignment-profile.json")`; the profile path
-must be non-empty and every graph node must remain off CPU. Every validated provider dispatch is
-registered with `error_on_failure`, including explicit CPU sessions.
+`SessionPolicy::cuda_attested_placement("path/to/first-inference-profile.json",
+"path/to/optimized.onnx")`; both paths must be distinct absolute paths. The caller must bind exact
+API-24 assignment to that optimized graph, authorize CPU nodes only as bounded integral/bool shape
+metadata, reject every transfer/unclassified node, and reconcile the first real profile one-to-one
+before publishing an execution receipt. Every validated provider dispatch is registered with
+`error_on_failure`, including explicit CPU sessions.
 
 The text, sparse, BGE-M3, and reranker `try_new_from_user_defined` constructors commit the supplied
 ONNX buffer directly. Split ONNX models add every distinct external-data buffer with

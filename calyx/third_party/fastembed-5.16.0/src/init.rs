@@ -8,18 +8,21 @@ const GRAPH_ASSIGNMENT_CONFIG: &str = "session.record_ep_graph_assignment_info";
 
 /// Applied ONNX Runtime session policy.
 ///
-/// CUDA sessions are fail-closed: every graph node must be assigned outside
-/// the implicit CPU execution provider, and the first real inference is
-/// recorded so the caller can independently attest per-node placement.
+/// CUDA sessions are fail-closed: the final optimized graph and the first real
+/// inference are both retained so the caller can independently prove that
+/// every CUDA node is substantive compute and every CPU node is bounded shape
+/// metadata.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionPolicy {
     /// No execution policy was selected. Session construction refuses this state.
     Unspecified,
     /// Require one explicit CPU execution provider.
     ExplicitCpu,
-    /// Require complete non-CPU graph placement and record provider assignment.
-    CudaNoCpuFallback {
+    /// Record the final graph and first inference for categorical placement
+    /// attestation. This does not authorize CPU execution by itself.
+    CudaAttestedPlacement {
         graph_assignment_profile_path: PathBuf,
+        optimized_graph_path: PathBuf,
     },
 }
 
@@ -28,9 +31,13 @@ impl SessionPolicy {
         Self::ExplicitCpu
     }
 
-    pub fn cuda_no_cpu_fallback(graph_assignment_profile_path: impl Into<PathBuf>) -> Self {
-        Self::CudaNoCpuFallback {
+    pub fn cuda_attested_placement(
+        graph_assignment_profile_path: impl Into<PathBuf>,
+        optimized_graph_path: impl Into<PathBuf>,
+    ) -> Self {
+        Self::CudaAttestedPlacement {
             graph_assignment_profile_path: graph_assignment_profile_path.into(),
+            optimized_graph_path: optimized_graph_path.into(),
         }
     }
 
@@ -47,8 +54,9 @@ impl SessionPolicy {
                 require_exact_provider::<ort::ep::CPU>(execution_providers, "CPU")?;
                 Ok(ValidatedSessionPolicy::ExplicitCpu)
             }
-            Self::CudaNoCpuFallback {
+            Self::CudaAttestedPlacement {
                 graph_assignment_profile_path,
+                optimized_graph_path,
             } => {
                 require_exact_provider::<ort::ep::CUDA>(execution_providers, "CUDA")?;
                 if graph_assignment_profile_path.as_os_str().is_empty() {
@@ -57,8 +65,36 @@ impl SessionPolicy {
                         "CUDA graph-assignment profile path is empty",
                     ));
                 }
-                Ok(ValidatedSessionPolicy::CudaNoCpuFallback {
+                if optimized_graph_path.as_os_str().is_empty() {
+                    return Err(policy_failure(
+                        "OPTIMIZED_GRAPH_PATH_EMPTY",
+                        "CUDA optimized-graph path is empty",
+                    ));
+                }
+                if !graph_assignment_profile_path.is_absolute()
+                    || !optimized_graph_path.is_absolute()
+                {
+                    return Err(policy_failure(
+                        "ATTESTATION_PATH_NOT_ABSOLUTE",
+                        format!(
+                            "CUDA attestation paths must be absolute: profile={} optimized_graph={}",
+                            graph_assignment_profile_path.display(),
+                            optimized_graph_path.display()
+                        ),
+                    ));
+                }
+                if graph_assignment_profile_path == optimized_graph_path {
+                    return Err(policy_failure(
+                        "ATTESTATION_PATH_COLLISION",
+                        format!(
+                            "profiling and optimized-graph paths resolve to the same path {}",
+                            optimized_graph_path.display()
+                        ),
+                    ));
+                }
+                Ok(ValidatedSessionPolicy::CudaAttestedPlacement {
                     graph_assignment_profile_path: graph_assignment_profile_path.clone(),
+                    optimized_graph_path: optimized_graph_path.clone(),
                 })
             }
         }
@@ -86,8 +122,9 @@ impl Default for SessionPolicy {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ValidatedSessionPolicy {
     ExplicitCpu,
-    CudaNoCpuFallback {
+    CudaAttestedPlacement {
         graph_assignment_profile_path: PathBuf,
+        optimized_graph_path: PathBuf,
     },
 }
 
@@ -95,18 +132,21 @@ impl ValidatedSessionPolicy {
     pub(crate) const fn label(&self) -> &'static str {
         match self {
             Self::ExplicitCpu => "cpu:explicit,graph_assignment",
-            Self::CudaNoCpuFallback { .. } => "cuda:no_cpu_fallback,graph_assignment_profile",
+            Self::CudaAttestedPlacement { .. } => {
+                "cuda:classified_cpu_metadata,optimized_graph,graph_assignment_profile"
+            }
         }
     }
 
     pub(crate) fn apply_to(&self, builder: SessionBuilder) -> anyhow::Result<SessionBuilder> {
         let result = match self {
             Self::ExplicitCpu => builder.with_config_entry(GRAPH_ASSIGNMENT_CONFIG, "1"),
-            Self::CudaNoCpuFallback {
+            Self::CudaAttestedPlacement {
                 graph_assignment_profile_path,
+                optimized_graph_path,
             } => builder
-                .with_disable_cpu_fallback()
-                .and_then(|builder| builder.with_config_entry(GRAPH_ASSIGNMENT_CONFIG, "1"))
+                .with_config_entry(GRAPH_ASSIGNMENT_CONFIG, "1")
+                .and_then(|builder| builder.with_optimized_model_path(optimized_graph_path))
                 .and_then(|builder| builder.with_profiling(graph_assignment_profile_path)),
         };
         result.map_err(|error| {
@@ -144,7 +184,7 @@ fn require_exact_provider<E: ort::ep::ExecutionProvider>(
 
 fn policy_failure(code: &'static str, detail: impl std::fmt::Display) -> anyhow::Error {
     anyhow::Error::msg(format!(
-        "FASTEMBED_SESSION_POLICY[{code}] detail={detail}; remediation=select SessionPolicy::explicit_cpu with exactly one CPU execution provider, or SessionPolicy::cuda_no_cpu_fallback with exactly one CUDA execution provider and a non-empty profile path"
+        "FASTEMBED_SESSION_POLICY[{code}] detail={detail}; remediation=select SessionPolicy::explicit_cpu with exactly one CPU execution provider, or SessionPolicy::cuda_attested_placement with exactly one CUDA execution provider plus distinct absolute profile and optimized-graph paths; the caller must classify the committed graph before publishing the session"
     ))
 }
 
