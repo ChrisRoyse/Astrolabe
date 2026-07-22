@@ -833,11 +833,11 @@ bool cbm_mcp_get_bool_arg(const char *args_json, const char *key) {
  * ══════════════════════════════════════════════════════════════════ */
 
 struct cbm_mcp_server {
-    cbm_store_t *store;             /* currently open project store (or NULL) */
-    bool owns_store;                /* true if we opened the store */
-    char *current_project;          /* which project store is open for (heap) */
-    time_t store_last_used;         /* last time resolve_store was called for a named project */
-    bool store_integrity_failed;    /* last named resolution preserved a corrupt family */
+    cbm_store_t *store;     /* currently open project store (or NULL) */
+    bool owns_store;        /* true if we opened the store */
+    char *current_project;  /* which project store is open for (heap) */
+    time_t store_last_used; /* last time resolve_store was called for a named project */
+    cbm_store_verify_result_t store_verify; /* last named source-preserving verification */
     char store_error_project[CBM_SZ_256];
     char store_error_db_path[CBM_SZ_1K];
     char store_error_wal_path[CBM_SZ_1K];
@@ -1023,7 +1023,10 @@ static cbm_store_t *resolve_store_fallback_scan(const char *project);
  * Caches the connection — reopens only when project changes.
  * Tracks last-access time so the event loop can evict idle stores. */
 static cbm_store_t *resolve_store(cbm_mcp_server_t *srv, const char *project) {
-    srv->store_integrity_failed = false;
+    memset(&srv->store_verify, 0, sizeof(srv->store_verify));
+    srv->store_verify.status = CBM_STORE_VERIFY_OK;
+    srv->store_verify.family_guard_release_complete = true;
+    srv->store_verify.scratch_cleanup_complete = true;
     srv->store_error_project[0] = '\0';
     srv->store_error_db_path[0] = '\0';
     srv->store_error_wal_path[0] = '\0';
@@ -1046,36 +1049,43 @@ static cbm_store_t *resolve_store(cbm_mcp_server_t *srv, const char *project) {
         srv->store = NULL;
     }
 
-    /* Open project's .db file — query-only open (no SQLITE_OPEN_CREATE) to
-     * prevent ghost .db file creation for unknown/unindexed projects. */
+    /* Freeze and inspect a verified derivative before SQLite is allowed to open
+     * the source.  Read-only WAL access may rewrite the source -shm wal-index;
+     * a corrupt family must instead be rejected with every source byte exact. */
     char path[CBM_SZ_1K];
     project_db_path(project, path, sizeof(path));
-    srv->store = cbm_store_open_path_query(path);
-    if (srv->store) {
-        /* Query resolution is read-only.  A failed integrity check preserves the
-         * complete SQLite family in place.  In WAL mode the WAL is persistent
-         * database state; renaming only the main file or deleting its journals can
-         * destroy the only recoverable copy (#627).  Recovery/archive is therefore
-         * an explicit operator transaction, never an automatic lookup side effect. */
-        if (!cbm_store_check_integrity(srv->store)) {
-            cbm_store_close(srv->store);
-            srv->store = NULL;
-            srv->owns_store = false;
-            srv->store_integrity_failed = true;
-            snprintf(srv->store_error_project, sizeof(srv->store_error_project), "%s", project);
-            snprintf(srv->store_error_db_path, sizeof(srv->store_error_db_path), "%s", path);
-            snprintf(srv->store_error_wal_path, sizeof(srv->store_error_wal_path), "%s-wal",
-                     path);
-            snprintf(srv->store_error_shm_path, sizeof(srv->store_error_shm_path), "%s-shm",
-                     path);
-            cbm_log_error("store.integrity_failed", "code", "CBM_STORE_INTEGRITY_FAILED",
-                          "project", project, "db_path", srv->store_error_db_path,
-                          "wal_path", srv->store_error_wal_path, "shm_path",
-                          srv->store_error_shm_path, "action",
-                          "preserved complete SQLite family in place; explicit recovery required");
-            return NULL;
-        }
+    cbm_store_verify_status_t verify_status =
+        cbm_store_open_path_query_verified(path, &srv->store, &srv->store_verify);
+    if (verify_status == CBM_STORE_VERIFY_INTEGRITY_FAILED ||
+        verify_status == CBM_STORE_VERIFY_IO_FAILED) {
+        srv->owns_store = false;
+        snprintf(srv->store_error_project, sizeof(srv->store_error_project), "%s", project);
+        snprintf(srv->store_error_db_path, sizeof(srv->store_error_db_path), "%s", path);
+        snprintf(srv->store_error_wal_path, sizeof(srv->store_error_wal_path), "%s-wal", path);
+        snprintf(srv->store_error_shm_path, sizeof(srv->store_error_shm_path), "%s-shm", path);
+        char native_error[CBM_SZ_32];
+        char sqlite_error[CBM_SZ_32];
+        snprintf(native_error, sizeof(native_error), "%lu",
+                 (unsigned long)srv->store_verify.native_error);
+        snprintf(sqlite_error, sizeof(sqlite_error), "%d", srv->store_verify.sqlite_error);
+        cbm_log_error(
+            verify_status == CBM_STORE_VERIFY_INTEGRITY_FAILED ? "store.integrity_failed"
+                                                               : "store.verification_failed",
+            "code",
+            verify_status == CBM_STORE_VERIFY_INTEGRITY_FAILED ? "CBM_STORE_INTEGRITY_FAILED"
+                                                               : "CBM_STORE_VERIFICATION_FAILED",
+            "project", project, "db_path", srv->store_error_db_path, "wal_path",
+            srv->store_error_wal_path, "shm_path", srv->store_error_shm_path, "operation",
+            srv->store_verify.operation, "native_error", native_error, "sqlite_error", sqlite_error,
+            "detail", srv->store_verify.detail, "action",
+            "source family preserved; explicit remediation required");
+        return NULL;
+    }
 
+    /* A genuinely absent source proceeds to the drifted-filename scan without
+     * creating a ghost .db file.  VERIFY_OK already published the source query
+     * connection while its verified DB/WAL guards were still live. */
+    if (srv->store) {
         /* Verify the project actually exists in this database.
          * A .db file may exist but be empty (e.g., after delete_project on
          * Linux where unlink defers actual removal). Opening an empty/deleted
@@ -1251,24 +1261,38 @@ static char *build_integrity_failed_error(const cbm_mcp_server_t *srv) {
     yyjson_mut_obj_add_str(doc, root, "code", "CBM_STORE_INTEGRITY_FAILED");
     yyjson_mut_obj_add_str(doc, root, "message",
                            "SQLite integrity verification failed; the complete database family "
-                           "was preserved in place and no lookup mutation was attempted");
+                           "was preserved in place and no source-family mutation was attempted");
     yyjson_mut_obj_add_str(doc, root, "remediation",
                            "preserve the database, WAL, and SHM together; use an explicit "
                            "operator-controlled recovery/archive transaction, verify its bytes, "
                            "then re-index into a fresh store");
     yyjson_mut_obj_add_str(doc, root, "project", srv->store_error_project);
-    yyjson_mut_obj_add_str(doc, root, "failed_operation", "PRAGMA integrity_check");
-    yyjson_mut_obj_add_str(doc, root, "native_error", "not_applicable");
+    yyjson_mut_obj_add_str(doc, root, "failed_operation", srv->store_verify.operation);
+    yyjson_mut_obj_add_int(doc, root, "native_error", (int64_t)srv->store_verify.native_error);
+    yyjson_mut_obj_add_int(doc, root, "sqlite_error", srv->store_verify.sqlite_error);
+    yyjson_mut_obj_add_str(doc, root, "detail", srv->store_verify.detail);
     yyjson_mut_obj_add_str(doc, root, "db_path", srv->store_error_db_path);
     yyjson_mut_obj_add_str(doc, root, "wal_path", srv->store_error_wal_path);
     yyjson_mut_obj_add_str(doc, root, "shm_path", srv->store_error_shm_path);
-    yyjson_mut_obj_add_bool(doc, root, "db_present",
-                            cbm_path_exists(srv->store_error_db_path));
-    yyjson_mut_obj_add_bool(doc, root, "wal_present",
-                            cbm_path_exists(srv->store_error_wal_path));
-    yyjson_mut_obj_add_bool(doc, root, "shm_present",
-                            cbm_path_exists(srv->store_error_shm_path));
+    yyjson_mut_obj_add_bool(doc, root, "db_present", cbm_path_exists(srv->store_error_db_path));
+    yyjson_mut_obj_add_bool(doc, root, "wal_present", cbm_path_exists(srv->store_error_wal_path));
+    yyjson_mut_obj_add_bool(doc, root, "shm_present", cbm_path_exists(srv->store_error_shm_path));
     yyjson_mut_obj_add_bool(doc, root, "family_preserved_in_place", true);
+    yyjson_mut_obj_add_bool(doc, root, "family_frozen_during_verification",
+                            srv->store_verify.family_frozen);
+    yyjson_mut_obj_add_bool(doc, root, "family_guard_release_complete",
+                            srv->store_verify.family_guard_release_complete);
+    yyjson_mut_obj_add_bool(doc, root, "scratch_created", srv->store_verify.scratch_created);
+    yyjson_mut_obj_add_str(doc, root, "scratch_path", srv->store_verify.scratch_path);
+    yyjson_mut_obj_add_bool(doc, root, "scratch_cleanup_complete",
+                            srv->store_verify.scratch_cleanup_complete);
+    if (!srv->store_verify.scratch_cleanup_complete ||
+        !srv->store_verify.family_guard_release_complete) {
+        yyjson_mut_obj_add_str(doc, root, "cleanup_failed_operation",
+                               srv->store_verify.cleanup_operation);
+        yyjson_mut_obj_add_int(doc, root, "cleanup_native_error",
+                               (int64_t)srv->store_verify.cleanup_native_error);
+    }
     yyjson_mut_obj_add_bool(doc, root, "mutation_attempted", false);
 
     char *json = yyjson_mut_write(doc, 0, NULL);
@@ -1284,10 +1308,73 @@ static char *build_integrity_failed_error(const cbm_mcp_server_t *srv) {
     return json;
 }
 
+static char *build_store_verification_failed_error(const cbm_mcp_server_t *srv) {
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    if (!doc) {
+        return heap_strdup(
+            "{\"code\":\"CBM_STORE_VERIFICATION_FAILED\","
+            "\"message\":\"SQLite source-preserving verification failed closed\","
+            "\"remediation\":\"resolve the reported filesystem or SQLite failure, preserve "
+            "the complete database family, then retry\"}");
+    }
+
+    yyjson_mut_val *root = yyjson_mut_obj(doc);
+    yyjson_mut_doc_set_root(doc, root);
+    yyjson_mut_obj_add_str(doc, root, "code", "CBM_STORE_VERIFICATION_FAILED");
+    yyjson_mut_obj_add_str(doc, root, "message",
+                           "SQLite source-preserving verification failed closed; the source "
+                           "database was not opened for query");
+    yyjson_mut_obj_add_str(doc, root, "remediation",
+                           "preserve the database, WAL, and SHM together; resolve the exact "
+                           "reported operation/native or SQLite error, then retry");
+    yyjson_mut_obj_add_str(doc, root, "project", srv->store_error_project);
+    yyjson_mut_obj_add_str(doc, root, "failed_operation", srv->store_verify.operation);
+    yyjson_mut_obj_add_int(doc, root, "native_error", (int64_t)srv->store_verify.native_error);
+    yyjson_mut_obj_add_int(doc, root, "sqlite_error", srv->store_verify.sqlite_error);
+    yyjson_mut_obj_add_str(doc, root, "detail", srv->store_verify.detail);
+    yyjson_mut_obj_add_str(doc, root, "db_path", srv->store_error_db_path);
+    yyjson_mut_obj_add_str(doc, root, "wal_path", srv->store_error_wal_path);
+    yyjson_mut_obj_add_str(doc, root, "shm_path", srv->store_error_shm_path);
+    yyjson_mut_obj_add_bool(doc, root, "db_present", srv->store_verify.db_present);
+    yyjson_mut_obj_add_bool(doc, root, "wal_present", srv->store_verify.wal_present);
+    yyjson_mut_obj_add_bool(doc, root, "shm_present", srv->store_verify.shm_present);
+    yyjson_mut_obj_add_bool(doc, root, "family_frozen_during_verification",
+                            srv->store_verify.family_frozen);
+    yyjson_mut_obj_add_bool(doc, root, "family_guard_release_complete",
+                            srv->store_verify.family_guard_release_complete);
+    yyjson_mut_obj_add_bool(doc, root, "scratch_created", srv->store_verify.scratch_created);
+    yyjson_mut_obj_add_str(doc, root, "scratch_path", srv->store_verify.scratch_path);
+    yyjson_mut_obj_add_bool(doc, root, "scratch_cleanup_complete",
+                            srv->store_verify.scratch_cleanup_complete);
+    if (!srv->store_verify.scratch_cleanup_complete ||
+        !srv->store_verify.family_guard_release_complete) {
+        yyjson_mut_obj_add_str(doc, root, "cleanup_failed_operation",
+                               srv->store_verify.cleanup_operation);
+        yyjson_mut_obj_add_int(doc, root, "cleanup_native_error",
+                               (int64_t)srv->store_verify.cleanup_native_error);
+    }
+    yyjson_mut_obj_add_bool(doc, root, "source_mutation_attempted", false);
+
+    char *json = yyjson_mut_write(doc, 0, NULL);
+    yyjson_mut_doc_free(doc);
+    if (!json) {
+        return heap_strdup(
+            "{\"code\":\"CBM_STORE_VERIFICATION_FAILED\","
+            "\"message\":\"SQLite source-preserving verification failed closed\","
+            "\"remediation\":\"resolve the reported filesystem or SQLite failure, preserve "
+            "the complete database family, then retry\"}");
+    }
+    return json;
+}
+
 static char *build_no_store_error(cbm_mcp_server_t *srv, const char *project) {
-    if (srv && srv->store_integrity_failed && project &&
-        strcmp(srv->store_error_project, project) == 0) {
-        return build_integrity_failed_error(srv);
+    if (srv && project && strcmp(srv->store_error_project, project) == 0) {
+        if (srv->store_verify.status == CBM_STORE_VERIFY_INTEGRITY_FAILED) {
+            return build_integrity_failed_error(srv);
+        }
+        if (srv->store_verify.status == CBM_STORE_VERIFY_IO_FAILED) {
+            return build_store_verification_failed_error(srv);
+        }
     }
     return project ? build_project_list_error("project not found or not indexed")
                    : build_missing_project_error();

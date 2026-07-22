@@ -66,8 +66,13 @@ enum {
 #include "foundation/compat.h"
 #include "foundation/compat_fs.h" /* cbm_unlink / cbm_rename_replace — #415 long-path-safe dump swap */
 #include "foundation/log.h"
+#include "foundation/sha256.h"
 #include "foundation/compat_regex.h"
 #include "foundation/str_util.h"
+
+#ifdef _WIN32
+#include "foundation/win_utf8.h"
+#endif
 
 #define XXH_INLINE_ALL
 #include "xxhash/xxhash.h"
@@ -920,13 +925,50 @@ static bool build_immutable_uri(const char *path, char *out, size_t out_sz) {
     return true;
 }
 
-cbm_store_t *cbm_store_open_path_query(const char *db_path) {
+static void store_query_open_error(int *out_sqlite_error, char *detail, size_t detail_size,
+                                   sqlite3 *db, int rc) {
+    int effective_error = db ? sqlite3_extended_errcode(db) : rc;
+    if (effective_error == SQLITE_OK && rc != SQLITE_OK) {
+        effective_error = rc;
+    }
+    if (out_sqlite_error) {
+        *out_sqlite_error = effective_error;
+    }
+    if (detail && detail_size > 0) {
+        snprintf(detail, detail_size, "%s",
+                 db && sqlite3_extended_errcode(db) != SQLITE_OK ? sqlite3_errmsg(db)
+                                                                 : sqlite3_errstr(effective_error));
+    }
+}
+
+static cbm_store_t *store_open_path_query_internal(const char *db_path,
+                                                   bool allow_immutable_fallback,
+                                                   int *out_sqlite_error, char *detail,
+                                                   size_t detail_size) {
+    if (out_sqlite_error) {
+        *out_sqlite_error = SQLITE_OK;
+    }
+    if (detail && detail_size > 0) {
+        detail[0] = '\0';
+    }
     if (!db_path) {
+        if (out_sqlite_error) {
+            *out_sqlite_error = SQLITE_MISUSE;
+        }
+        if (detail && detail_size > 0) {
+            snprintf(detail, detail_size, "database path is null");
+        }
         return NULL;
     }
 
     cbm_store_t *s = calloc(CBM_ALLOC_ONE, sizeof(cbm_store_t));
     if (!s) {
+        if (out_sqlite_error) {
+            *out_sqlite_error = SQLITE_NOMEM;
+        }
+        if (detail && detail_size > 0) {
+            snprintf(detail, detail_size, "%s", sqlite3_errstr(SQLITE_NOMEM));
+        }
         return NULL;
     }
 
@@ -946,16 +988,24 @@ cbm_store_t *cbm_store_open_path_query(const char *db_path) {
     int rc = sqlite3_open_v2(db_path, &s->db, SQLITE_OPEN_READONLY, NULL);
     if (rc == SQLITE_OK) {
         /* Force first DB access so a read-only-FS WAL failure surfaces now. */
-        if (sqlite3_exec(s->db, "SELECT 1 FROM sqlite_master LIMIT 1;", NULL, NULL, NULL) !=
-            SQLITE_OK) {
+        int probe_rc =
+            sqlite3_exec(s->db, "SELECT 1 FROM sqlite_master LIMIT 1;", NULL, NULL, NULL);
+        if (probe_rc != SQLITE_OK) {
+            store_query_open_error(out_sqlite_error, detail, detail_size, s->db, probe_rc);
             sqlite3_close(s->db);
             s->db = NULL;
-            rc = SQLITE_CANTOPEN; /* trigger immutable fallback */
+            rc = probe_rc;
         }
+    } else {
+        store_query_open_error(out_sqlite_error, detail, detail_size, s->db, rc);
     }
     if (rc != SQLITE_OK) {
         sqlite3_close(s->db); /* no-op if already NULL */
         s->db = NULL;
+        if (!allow_immutable_fallback) {
+            free(s);
+            return NULL;
+        }
         /* A genuinely missing DB must return NULL without creating anything —
          * only retry with the immutable URI when the file exists but could not
          * be opened (the read-only-filesystem case). This also keeps the
@@ -972,6 +1022,7 @@ cbm_store_t *cbm_store_open_path_query(const char *db_path) {
         rc = sqlite3_open_v2(uri, &s->db, SQLITE_OPEN_READONLY | SQLITE_OPEN_URI, NULL);
         if (rc != SQLITE_OK) {
             /* sqlite3_open_v2 allocates a handle even on failure — must close it. */
+            store_query_open_error(out_sqlite_error, detail, detail_size, s->db, rc);
             sqlite3_close(s->db);
             free(s);
             return NULL;
@@ -979,6 +1030,12 @@ cbm_store_t *cbm_store_open_path_query(const char *db_path) {
     }
 
     s->db_path = heap_strdup(db_path);
+    if (!s->db_path) {
+        store_query_open_error(out_sqlite_error, detail, detail_size, s->db, SQLITE_NOMEM);
+        sqlite3_close(s->db);
+        free(s);
+        return NULL;
+    }
 
     /* Security: block ATTACH/DETACH to prevent file creation via SQL injection. */
     sqlite3_set_authorizer(s->db, store_authorizer, NULL);
@@ -994,6 +1051,8 @@ cbm_store_t *cbm_store_open_path_query(const char *db_path) {
                             NULL, sqlite_camel_split, NULL, NULL);
 
     if (configure_pragmas(s, false, true) != CBM_STORE_OK) {
+        store_query_open_error(out_sqlite_error, detail, detail_size, s->db,
+                               sqlite3_extended_errcode(s->db));
         sqlite3_close(s->db);
         safe_str_free(&s->db_path);
         free(s);
@@ -1001,6 +1060,10 @@ cbm_store_t *cbm_store_open_path_query(const char *db_path) {
     }
 
     return s;
+}
+
+cbm_store_t *cbm_store_open_path_query(const char *db_path) {
+    return store_open_path_query_internal(db_path, true, NULL, NULL, 0);
 }
 
 /* ── Integrity check ───────────────────────────────────────────── */
@@ -1055,6 +1118,634 @@ bool cbm_store_check_integrity(cbm_store_t *s) {
     }
 
     return ok;
+}
+
+static void store_verify_result_init(cbm_store_verify_result_t *result) {
+    memset(result, 0, sizeof(*result));
+    result->status = CBM_STORE_VERIFY_IO_FAILED;
+    result->family_guard_release_complete = true;
+    result->scratch_cleanup_complete = true;
+    result->sqlite_error = SQLITE_OK;
+}
+
+static void store_verify_set_error(cbm_store_verify_result_t *result,
+                                   cbm_store_verify_status_t status, const char *operation,
+                                   uint32_t native_error, int sqlite_error, const char *detail) {
+    result->status = status;
+    result->native_error = native_error;
+    result->sqlite_error = sqlite_error;
+    snprintf(result->operation, sizeof(result->operation), "%s", operation ? operation : "unknown");
+    snprintf(result->detail, sizeof(result->detail), "%s", detail ? detail : "unspecified");
+}
+
+#ifdef _WIN32
+
+typedef struct {
+    HANDLE db;
+    HANDLE wal;
+    HANDLE shm;
+} store_frozen_family_t;
+
+static void store_frozen_family_init(store_frozen_family_t *family) {
+    family->db = INVALID_HANDLE_VALUE;
+    family->wal = INVALID_HANDLE_VALUE;
+    family->shm = INVALID_HANDLE_VALUE;
+}
+
+static DWORD store_frozen_family_close(store_frozen_family_t *family) {
+    DWORD first_error = ERROR_SUCCESS;
+    if (family->shm != INVALID_HANDLE_VALUE) {
+        if (!CloseHandle(family->shm) && first_error == ERROR_SUCCESS) {
+            first_error = GetLastError();
+        }
+        family->shm = INVALID_HANDLE_VALUE;
+    }
+    if (family->wal != INVALID_HANDLE_VALUE) {
+        if (!CloseHandle(family->wal) && first_error == ERROR_SUCCESS) {
+            first_error = GetLastError();
+        }
+        family->wal = INVALID_HANDLE_VALUE;
+    }
+    if (family->db != INVALID_HANDLE_VALUE) {
+        if (!CloseHandle(family->db) && first_error == ERROR_SUCCESS) {
+            first_error = GetLastError();
+        }
+        family->db = INVALID_HANDLE_VALUE;
+    }
+    return first_error;
+}
+
+static char *store_member_path(const char *db_path, const char *suffix) {
+    size_t db_len = strlen(db_path);
+    size_t suffix_len = strlen(suffix);
+    if (db_len > SIZE_MAX - suffix_len - 1) {
+        return NULL;
+    }
+    char *path = malloc(db_len + suffix_len + 1);
+    if (!path) {
+        return NULL;
+    }
+    memcpy(path, db_path, db_len);
+    memcpy(path + db_len, suffix, suffix_len + 1);
+    return path;
+}
+
+static bool store_source_missing_error(DWORD error) {
+    return error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND;
+}
+
+static HANDLE store_freeze_member(const char *path, bool required, bool *present,
+                                  cbm_store_verify_result_t *result, const char *operation) {
+    *present = false;
+    wchar_t *wide_path = cbm_utf8_to_wide_path(path);
+    if (!wide_path) {
+        store_verify_set_error(result, CBM_STORE_VERIFY_IO_FAILED, operation,
+                               ERROR_NO_UNICODE_TRANSLATION, SQLITE_OK,
+                               "UTF-8 path could not be converted to a Windows path");
+        return INVALID_HANDLE_VALUE;
+    }
+
+    /* FILE_SHARE_READ deliberately omits write/delete sharing.  Windows rejects
+     * this open when a writer or writable mapping already exists and rejects any
+     * new writer/deleter while the returned handle remains live. */
+    HANDLE handle = CreateFileW(
+        wide_path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN | FILE_FLAG_OPEN_REPARSE_POINT, NULL);
+    DWORD error = handle == INVALID_HANDLE_VALUE ? GetLastError() : ERROR_SUCCESS;
+    free(wide_path);
+    if (handle == INVALID_HANDLE_VALUE) {
+        if (!required && store_source_missing_error(error)) {
+            return INVALID_HANDLE_VALUE;
+        }
+        store_verify_set_error(result,
+                               required && store_source_missing_error(error)
+                                   ? CBM_STORE_VERIFY_SOURCE_MISSING
+                                   : CBM_STORE_VERIFY_IO_FAILED,
+                               operation, error, SQLITE_OK,
+                               store_source_missing_error(error)
+                                   ? "source database member is absent"
+                                   : "source database member could not be frozen read-only");
+        return INVALID_HANDLE_VALUE;
+    }
+
+    BY_HANDLE_FILE_INFORMATION info;
+    if (!GetFileInformationByHandle(handle, &info)) {
+        error = GetLastError();
+        CloseHandle(handle);
+        store_verify_set_error(result, CBM_STORE_VERIFY_IO_FAILED, operation, error, SQLITE_OK,
+                               "source database member identity could not be read");
+        return INVALID_HANDLE_VALUE;
+    }
+    if ((info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0 ||
+        (info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0) {
+        CloseHandle(handle);
+        store_verify_set_error(result, CBM_STORE_VERIFY_IO_FAILED, operation, ERROR_INVALID_DATA,
+                               SQLITE_OK, "source database member is a directory or reparse point");
+        return INVALID_HANDLE_VALUE;
+    }
+
+    *present = true;
+    return handle;
+}
+
+static bool store_hash_handle(HANDLE handle, uint8_t digest[CBM_SHA256_DIGEST_LEN],
+                              uint64_t *byte_count, DWORD *native_error) {
+    LARGE_INTEGER zero;
+    zero.QuadPart = 0;
+    if (!SetFilePointerEx(handle, zero, NULL, FILE_BEGIN)) {
+        *native_error = GetLastError();
+        return false;
+    }
+
+    enum { STORE_COPY_BUFFER_SIZE = 64 * 1024 };
+    uint8_t buffer[STORE_COPY_BUFFER_SIZE];
+    cbm_sha256_ctx hash;
+    cbm_sha256_init(&hash);
+    *byte_count = 0;
+    for (;;) {
+        DWORD read_count = 0;
+        if (!ReadFile(handle, buffer, (DWORD)sizeof(buffer), &read_count, NULL)) {
+            *native_error = GetLastError();
+            return false;
+        }
+        if (read_count == 0) {
+            break;
+        }
+        cbm_sha256_update(&hash, buffer, read_count);
+        *byte_count += read_count;
+    }
+    cbm_sha256_final(&hash, digest);
+    return true;
+}
+
+static bool store_copy_frozen_member(HANDLE source, const char *destination,
+                                     cbm_store_verify_result_t *result, const char *operation) {
+    wchar_t *wide_destination = cbm_utf8_to_wide_path(destination);
+    if (!wide_destination) {
+        store_verify_set_error(result, CBM_STORE_VERIFY_IO_FAILED, operation,
+                               ERROR_NO_UNICODE_TRANSLATION, SQLITE_OK,
+                               "snapshot path could not be converted to a Windows path");
+        return false;
+    }
+
+    HANDLE output = CreateFileW(wide_destination, GENERIC_READ | GENERIC_WRITE, 0, NULL, CREATE_NEW,
+                                FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_SEQUENTIAL_SCAN, NULL);
+    if (output == INVALID_HANDLE_VALUE) {
+        DWORD error = GetLastError();
+        free(wide_destination);
+        store_verify_set_error(result, CBM_STORE_VERIFY_IO_FAILED, operation, error, SQLITE_OK,
+                               "exclusive snapshot destination could not be created");
+        return false;
+    }
+
+    LARGE_INTEGER zero;
+    zero.QuadPart = 0;
+    bool ok = true;
+    DWORD error = ERROR_SUCCESS;
+    cbm_sha256_ctx source_hash;
+    cbm_sha256_init(&source_hash);
+    uint64_t source_bytes = 0;
+    if (!SetFilePointerEx(source, zero, NULL, FILE_BEGIN)) {
+        error = GetLastError();
+        ok = false;
+    }
+
+    enum { STORE_COPY_BUFFER_SIZE = 64 * 1024 };
+    uint8_t buffer[STORE_COPY_BUFFER_SIZE];
+    while (ok) {
+        DWORD read_count = 0;
+        if (!ReadFile(source, buffer, (DWORD)sizeof(buffer), &read_count, NULL)) {
+            error = GetLastError();
+            ok = false;
+            break;
+        }
+        if (read_count == 0) {
+            break;
+        }
+        DWORD offset = 0;
+        while (offset < read_count) {
+            DWORD written = 0;
+            if (!WriteFile(output, buffer + offset, read_count - offset, &written, NULL) ||
+                written == 0) {
+                error = GetLastError();
+                if (error == ERROR_SUCCESS) {
+                    error = ERROR_WRITE_FAULT;
+                }
+                ok = false;
+                break;
+            }
+            offset += written;
+        }
+        if (ok) {
+            cbm_sha256_update(&source_hash, buffer, read_count);
+            source_bytes += read_count;
+        }
+    }
+    if (ok && !FlushFileBuffers(output)) {
+        error = GetLastError();
+        ok = false;
+    }
+    if (!CloseHandle(output) && ok) {
+        error = GetLastError();
+        ok = false;
+    }
+    if (!ok) {
+        free(wide_destination);
+        store_verify_set_error(result, CBM_STORE_VERIFY_IO_FAILED, operation, error, SQLITE_OK,
+                               "snapshot copy or durable flush failed");
+        return false;
+    }
+
+    uint8_t source_digest[CBM_SHA256_DIGEST_LEN];
+    cbm_sha256_final(&source_hash, source_digest);
+    HANDLE readback =
+        CreateFileW(wide_destination, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING,
+                    FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, NULL);
+    free(wide_destination);
+    if (readback == INVALID_HANDLE_VALUE) {
+        store_verify_set_error(result, CBM_STORE_VERIFY_IO_FAILED, operation, GetLastError(),
+                               SQLITE_OK, "snapshot readback could not be opened");
+        return false;
+    }
+
+    uint8_t readback_digest[CBM_SHA256_DIGEST_LEN];
+    uint64_t readback_bytes = 0;
+    ok = store_hash_handle(readback, readback_digest, &readback_bytes, &error);
+    if (!CloseHandle(readback) && ok) {
+        error = GetLastError();
+        ok = false;
+    }
+    if (!ok) {
+        store_verify_set_error(result, CBM_STORE_VERIFY_IO_FAILED, operation, error, SQLITE_OK,
+                               "snapshot readback could not be hashed");
+        return false;
+    }
+    if (source_bytes != readback_bytes ||
+        memcmp(source_digest, readback_digest, sizeof(source_digest)) != 0) {
+        store_verify_set_error(result, CBM_STORE_VERIFY_IO_FAILED, operation, ERROR_CRC, SQLITE_OK,
+                               "snapshot bytes or SHA-256 differ from the frozen source member");
+        return false;
+    }
+    return true;
+}
+
+static bool store_create_scratch_directory(cbm_store_verify_result_t *result) {
+    wchar_t temp_wide[CBM_STORE_VERIFY_PATH_MAX];
+    DWORD temp_len = GetTempPathW((DWORD)(sizeof(temp_wide) / sizeof(temp_wide[0])), temp_wide);
+    if (temp_len == 0 || temp_len >= sizeof(temp_wide) / sizeof(temp_wide[0])) {
+        DWORD error = temp_len == 0 ? GetLastError() : ERROR_BUFFER_OVERFLOW;
+        store_verify_set_error(result, CBM_STORE_VERIFY_IO_FAILED, "snapshot.temp_path",
+                               error, SQLITE_OK,
+                               "Windows temporary directory could not be resolved exactly");
+        return false;
+    }
+    char *temp_utf8 = cbm_wide_to_utf8(temp_wide);
+    if (!temp_utf8) {
+        store_verify_set_error(result, CBM_STORE_VERIFY_IO_FAILED, "snapshot.temp_path",
+                               ERROR_NO_UNICODE_TRANSLATION, SQLITE_OK,
+                               "Windows temporary directory is not valid UTF-8");
+        return false;
+    }
+
+    uint8_t nonce[16];
+    char nonce_hex[sizeof(nonce) * 2 + 1];
+    static const char HEX[] = "0123456789abcdef";
+    sqlite3_randomness((int)sizeof(nonce), nonce);
+    for (size_t i = 0; i < sizeof(nonce); i++) {
+        nonce_hex[i * 2] = HEX[(nonce[i] >> 4) & 0xF];
+        nonce_hex[i * 2 + 1] = HEX[nonce[i] & 0xF];
+    }
+    nonce_hex[sizeof(nonce) * 2] = '\0';
+
+    size_t temp_size = strlen(temp_utf8);
+    const char *separator =
+        temp_size > 0 && (temp_utf8[temp_size - 1] == '/' || temp_utf8[temp_size - 1] == '\\')
+            ? ""
+            : "/";
+    int wrote =
+        snprintf(result->scratch_path, sizeof(result->scratch_path), "%s%scbm-integrity-%lu-%s",
+                 temp_utf8, separator, (unsigned long)GetCurrentProcessId(), nonce_hex);
+    free(temp_utf8);
+    if (wrote < 0 || (size_t)wrote >= sizeof(result->scratch_path)) {
+        store_verify_set_error(result, CBM_STORE_VERIFY_IO_FAILED, "snapshot.temp_path",
+                               ERROR_BUFFER_OVERFLOW, SQLITE_OK,
+                               "snapshot directory path exceeds the verified path capacity");
+        return false;
+    }
+
+    wchar_t *scratch_wide = cbm_utf8_to_wide_path(result->scratch_path);
+    if (!scratch_wide) {
+        store_verify_set_error(result, CBM_STORE_VERIFY_IO_FAILED, "snapshot.create_directory",
+                               ERROR_NO_UNICODE_TRANSLATION, SQLITE_OK,
+                               "snapshot directory path could not be widened");
+        return false;
+    }
+    if (!CreateDirectoryW(scratch_wide, NULL)) {
+        DWORD error = GetLastError();
+        free(scratch_wide);
+        store_verify_set_error(result, CBM_STORE_VERIFY_IO_FAILED, "snapshot.create_directory",
+                               error, SQLITE_OK,
+                               "unique snapshot directory could not be created atomically");
+        return false;
+    }
+    result->scratch_created = true;
+    result->scratch_cleanup_complete = false;
+    DWORD attributes = GetFileAttributesW(scratch_wide);
+    DWORD attribute_error = attributes == INVALID_FILE_ATTRIBUTES ? GetLastError() : ERROR_SUCCESS;
+    free(scratch_wide);
+    if (attributes == INVALID_FILE_ATTRIBUTES || (attributes & FILE_ATTRIBUTE_DIRECTORY) == 0 ||
+        (attributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0) {
+        store_verify_set_error(
+            result, CBM_STORE_VERIFY_IO_FAILED, "snapshot.verify_directory",
+            attributes == INVALID_FILE_ATTRIBUTES ? attribute_error : ERROR_INVALID_DATA, SQLITE_OK,
+            "created snapshot path is absent, non-directory, or a reparse point");
+        return false;
+    }
+    return true;
+}
+
+static bool store_cleanup_file(const char *path, cbm_store_verify_result_t *result,
+                               const char *operation) {
+    wchar_t *wide_path = cbm_utf8_to_wide_path(path);
+    if (!wide_path) {
+        if (result->cleanup_operation[0] == '\0') {
+            result->cleanup_native_error = ERROR_NO_UNICODE_TRANSLATION;
+            snprintf(result->cleanup_operation, sizeof(result->cleanup_operation), "%s", operation);
+        }
+        return false;
+    }
+    BOOL removed = DeleteFileW(wide_path);
+    DWORD error = removed ? ERROR_SUCCESS : GetLastError();
+    free(wide_path);
+    if (!removed && error != ERROR_FILE_NOT_FOUND && error != ERROR_PATH_NOT_FOUND) {
+        if (result->cleanup_operation[0] == '\0') {
+            result->cleanup_native_error = error;
+            snprintf(result->cleanup_operation, sizeof(result->cleanup_operation), "%s", operation);
+        }
+        return false;
+    }
+    return true;
+}
+
+static bool store_cleanup_scratch(cbm_store_verify_result_t *result, const char *snapshot_db) {
+    if (!result->scratch_created) {
+        result->scratch_cleanup_complete = true;
+        return true;
+    }
+
+    char derived_snapshot_db[CBM_STORE_VERIFY_PATH_MAX];
+    if (!snapshot_db || snapshot_db[0] == '\0') {
+        int wrote = snprintf(derived_snapshot_db, sizeof(derived_snapshot_db), "%s/snapshot.db",
+                             result->scratch_path);
+        if (wrote < 0 || (size_t)wrote >= sizeof(derived_snapshot_db)) {
+            result->cleanup_native_error = ERROR_BUFFER_OVERFLOW;
+            snprintf(result->cleanup_operation, sizeof(result->cleanup_operation), "%s",
+                     "snapshot.cleanup_build_path");
+            result->scratch_cleanup_complete = false;
+            return false;
+        }
+        snapshot_db = derived_snapshot_db;
+    }
+
+    static const char *const SUFFIXES[] = {"-shm", "-wal", "-journal", ""};
+    static const char *const OPERATIONS[] = {"snapshot.cleanup_shm", "snapshot.cleanup_wal",
+                                             "snapshot.cleanup_journal", "snapshot.cleanup_db"};
+    bool ok = true;
+    for (size_t i = 0; i < sizeof(SUFFIXES) / sizeof(SUFFIXES[0]); i++) {
+        char *path = store_member_path(snapshot_db, SUFFIXES[i]);
+        if (!path) {
+            if (result->cleanup_operation[0] == '\0') {
+                result->cleanup_native_error = ERROR_NOT_ENOUGH_MEMORY;
+                snprintf(result->cleanup_operation, sizeof(result->cleanup_operation), "%s",
+                         OPERATIONS[i]);
+            }
+            ok = false;
+            continue;
+        }
+        if (!store_cleanup_file(path, result, OPERATIONS[i])) {
+            ok = false;
+        }
+        free(path);
+    }
+
+    wchar_t *scratch_wide = cbm_utf8_to_wide_path(result->scratch_path);
+    if (!scratch_wide) {
+        if (result->cleanup_operation[0] == '\0') {
+            result->cleanup_native_error = ERROR_NO_UNICODE_TRANSLATION;
+            snprintf(result->cleanup_operation, sizeof(result->cleanup_operation), "%s",
+                     "snapshot.cleanup_directory");
+        }
+        ok = false;
+    } else {
+        if (!RemoveDirectoryW(scratch_wide)) {
+            if (result->cleanup_operation[0] == '\0') {
+                result->cleanup_native_error = GetLastError();
+                snprintf(result->cleanup_operation, sizeof(result->cleanup_operation), "%s",
+                         "snapshot.cleanup_directory");
+            }
+            ok = false;
+        }
+        free(scratch_wide);
+    }
+    result->scratch_cleanup_complete = ok;
+    return ok;
+}
+
+static bool store_sqlite_corruption_code(int sqlite_error) {
+    int primary = sqlite_error & 0xFF;
+    return primary == SQLITE_CORRUPT || primary == SQLITE_NOTADB || primary == SQLITE_FORMAT ||
+           primary == SQLITE_SCHEMA;
+}
+
+#endif /* _WIN32 */
+
+cbm_store_verify_status_t cbm_store_open_path_query_verified(const char *db_path,
+                                                             cbm_store_t **out_store,
+                                                             cbm_store_verify_result_t *result) {
+    cbm_store_verify_result_t local_result;
+    if (out_store) {
+        *out_store = NULL;
+    }
+    if (!result) {
+        result = &local_result;
+    }
+    store_verify_result_init(result);
+    if (!out_store) {
+        store_verify_set_error(result, CBM_STORE_VERIFY_IO_FAILED, "source.validate_output",
+                               ERROR_INVALID_PARAMETER, SQLITE_MISUSE,
+                               "verified store output pointer is required");
+        return result->status;
+    }
+    if (!db_path || db_path[0] == '\0') {
+        store_verify_set_error(result, CBM_STORE_VERIFY_IO_FAILED, "source.validate_path",
+                               ERROR_INVALID_PARAMETER, SQLITE_MISUSE,
+                               "database path is null or empty");
+        return result->status;
+    }
+
+#ifndef _WIN32
+    store_verify_set_error(result, CBM_STORE_VERIFY_IO_FAILED, "source.freeze_family", 0,
+                           SQLITE_MISUSE,
+                           "source-preserving integrity verification requires native Windows");
+    return result->status;
+#else
+    store_frozen_family_t family;
+    store_frozen_family_init(&family);
+    char *wal_path = store_member_path(db_path, "-wal");
+    char *shm_path = store_member_path(db_path, "-shm");
+    char snapshot_db[CBM_STORE_VERIFY_PATH_MAX] = "";
+    cbm_store_t *snapshot_store = NULL;
+    if (!wal_path || !shm_path) {
+        store_verify_set_error(result, CBM_STORE_VERIFY_IO_FAILED, "source.build_family_paths",
+                               ERROR_NOT_ENOUGH_MEMORY, SQLITE_NOMEM,
+                               "database family paths could not be allocated");
+        goto cleanup;
+    }
+
+    family.db = store_freeze_member(db_path, true, &result->db_present, result, "source.freeze_db");
+    if (family.db == INVALID_HANDLE_VALUE) {
+        goto cleanup;
+    }
+    family.wal =
+        store_freeze_member(wal_path, false, &result->wal_present, result, "source.freeze_wal");
+    if (family.wal == INVALID_HANDLE_VALUE && result->status == CBM_STORE_VERIFY_IO_FAILED &&
+        result->operation[0] != '\0') {
+        goto cleanup;
+    }
+    family.shm =
+        store_freeze_member(shm_path, false, &result->shm_present, result, "source.freeze_shm");
+    if (family.shm == INVALID_HANDLE_VALUE && result->status == CBM_STORE_VERIFY_IO_FAILED &&
+        result->operation[0] != '\0') {
+        goto cleanup;
+    }
+    result->family_frozen = true;
+
+    if (!store_create_scratch_directory(result)) {
+        goto cleanup;
+    }
+    int path_wrote =
+        snprintf(snapshot_db, sizeof(snapshot_db), "%s/snapshot.db", result->scratch_path);
+    if (path_wrote < 0 || (size_t)path_wrote >= sizeof(snapshot_db)) {
+        store_verify_set_error(result, CBM_STORE_VERIFY_IO_FAILED, "snapshot.build_db_path",
+                               ERROR_BUFFER_OVERFLOW, SQLITE_OK,
+                               "snapshot database path exceeds the verified path capacity");
+        goto cleanup;
+    }
+    if (!store_copy_frozen_member(family.db, snapshot_db, result, "snapshot.copy_db")) {
+        goto cleanup;
+    }
+    if (result->wal_present) {
+        char *snapshot_wal = store_member_path(snapshot_db, "-wal");
+        if (!snapshot_wal) {
+            store_verify_set_error(result, CBM_STORE_VERIFY_IO_FAILED, "snapshot.build_wal_path",
+                                   ERROR_NOT_ENOUGH_MEMORY, SQLITE_NOMEM,
+                                   "snapshot WAL path could not be allocated");
+            goto cleanup;
+        }
+        bool copied =
+            store_copy_frozen_member(family.wal, snapshot_wal, result, "snapshot.copy_wal");
+        free(snapshot_wal);
+        if (!copied) {
+            goto cleanup;
+        }
+    }
+
+    int sqlite_error = SQLITE_OK;
+    char sqlite_detail[CBM_STORE_VERIFY_DETAIL_MAX] = "";
+    snapshot_store = store_open_path_query_internal(snapshot_db, false, &sqlite_error,
+                                                    sqlite_detail, sizeof(sqlite_detail));
+    if (!snapshot_store) {
+        store_verify_set_error(
+            result,
+            store_sqlite_corruption_code(sqlite_error) ? CBM_STORE_VERIFY_INTEGRITY_FAILED
+                                                       : CBM_STORE_VERIFY_IO_FAILED,
+            "snapshot.sqlite_open", ERROR_SUCCESS, sqlite_error,
+            sqlite_detail[0] ? sqlite_detail : "snapshot SQLite open or first read failed");
+        goto cleanup;
+    }
+    if (!cbm_store_check_integrity(snapshot_store)) {
+        sqlite_error = sqlite3_extended_errcode(snapshot_store->db);
+        store_verify_set_error(result, CBM_STORE_VERIFY_INTEGRITY_FAILED,
+                               "snapshot.application_integrity_check", ERROR_SUCCESS, sqlite_error,
+                               sqlite_error == SQLITE_OK
+                                   ? "snapshot violates the project-store integrity contract"
+                                   : sqlite3_errmsg(snapshot_store->db));
+        goto cleanup;
+    }
+    result->status = CBM_STORE_VERIFY_OK;
+    result->native_error = ERROR_SUCCESS;
+    result->sqlite_error = SQLITE_OK;
+    snprintf(result->operation, sizeof(result->operation), "%s",
+             "snapshot.application_integrity_check");
+    snprintf(result->detail, sizeof(result->detail), "%s",
+             "snapshot passed the project-store integrity contract");
+
+cleanup:
+    if (snapshot_store) {
+        cbm_store_close(snapshot_store);
+    }
+    bool cleanup_ok = store_cleanup_scratch(result, snapshot_db);
+    if (!cleanup_ok && result->status == CBM_STORE_VERIFY_OK) {
+        store_verify_set_error(result, CBM_STORE_VERIFY_IO_FAILED,
+                               result->cleanup_operation[0] ? result->cleanup_operation
+                                                            : "snapshot.cleanup",
+                               result->cleanup_native_error, SQLITE_OK,
+                               "verified snapshot could not be removed completely");
+    }
+    if (result->status == CBM_STORE_VERIFY_OK) {
+        /* Releasing only the SHM guard permits the verified read connection to
+         * rebuild/use the mutable wal-index.  DB and WAL remain write/delete
+         * denied until SQLite has completed its first source read, closing the
+         * verification-to-use race. */
+        if (family.shm != INVALID_HANDLE_VALUE) {
+            if (!CloseHandle(family.shm)) {
+                result->family_guard_release_complete = false;
+                store_verify_set_error(result, CBM_STORE_VERIFY_IO_FAILED,
+                                       "source.release_shm_guard", GetLastError(), SQLITE_OK,
+                                       "source SHM freeze handle could not be released");
+            } else {
+                family.shm = INVALID_HANDLE_VALUE;
+            }
+        }
+        if (result->status == CBM_STORE_VERIFY_OK) {
+            int source_sqlite_error = SQLITE_OK;
+            char source_sqlite_detail[CBM_STORE_VERIFY_DETAIL_MAX] = "";
+            cbm_store_t *opened =
+                store_open_path_query_internal(db_path, false, &source_sqlite_error,
+                                               source_sqlite_detail, sizeof(source_sqlite_detail));
+            if (!opened) {
+                store_verify_set_error(
+                    result, CBM_STORE_VERIFY_IO_FAILED, "source.sqlite_open_after_verify",
+                    ERROR_SUCCESS, source_sqlite_error,
+                    source_sqlite_detail[0]
+                        ? source_sqlite_detail
+                        : "verified source could not be opened before releasing DB/WAL guards");
+            } else {
+                *out_store = opened;
+            }
+        }
+    }
+    DWORD release_error = store_frozen_family_close(&family);
+    if (release_error != ERROR_SUCCESS) {
+        result->family_guard_release_complete = false;
+        if (result->status == CBM_STORE_VERIFY_OK) {
+            if (*out_store) {
+                cbm_store_close(*out_store);
+                *out_store = NULL;
+            }
+            store_verify_set_error(result, CBM_STORE_VERIFY_IO_FAILED,
+                                   "source.release_family_guards", release_error, SQLITE_OK,
+                                   "source DB/WAL freeze handles could not be released exactly");
+        } else if (result->cleanup_operation[0] == '\0') {
+            result->cleanup_native_error = release_error;
+            snprintf(result->cleanup_operation, sizeof(result->cleanup_operation), "%s",
+                     "source.release_family_guards");
+        }
+    }
+    free(wal_path);
+    free(shm_path);
+    return result->status;
+#endif
 }
 
 cbm_store_t *cbm_store_open(const char *project) {

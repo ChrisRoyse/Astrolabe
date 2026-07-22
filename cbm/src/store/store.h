@@ -18,6 +18,40 @@
 
 typedef struct cbm_store cbm_store_t;
 
+/* Result of a source-preserving integrity verification.  The verifier freezes
+ * the complete source DB/WAL/SHM family before inspecting a separate snapshot,
+ * so SQLite never opens a source family that is about to be rejected. */
+typedef enum {
+    CBM_STORE_VERIFY_OK = 0,
+    CBM_STORE_VERIFY_SOURCE_MISSING = 1,
+    CBM_STORE_VERIFY_INTEGRITY_FAILED = 2,
+    CBM_STORE_VERIFY_IO_FAILED = 3,
+} cbm_store_verify_status_t;
+
+enum {
+    CBM_STORE_VERIFY_OPERATION_MAX = 64,
+    CBM_STORE_VERIFY_DETAIL_MAX = 512,
+    CBM_STORE_VERIFY_PATH_MAX = 4096,
+};
+
+typedef struct {
+    cbm_store_verify_status_t status;
+    uint32_t native_error;
+    int sqlite_error;
+    bool db_present;
+    bool wal_present;
+    bool shm_present;
+    bool family_frozen;
+    bool family_guard_release_complete;
+    bool scratch_created;
+    bool scratch_cleanup_complete;
+    uint32_t cleanup_native_error;
+    char operation[CBM_STORE_VERIFY_OPERATION_MAX];
+    char cleanup_operation[CBM_STORE_VERIFY_OPERATION_MAX];
+    char detail[CBM_STORE_VERIFY_DETAIL_MAX];
+    char scratch_path[CBM_STORE_VERIFY_PATH_MAX];
+} cbm_store_verify_result_t;
+
 /* ── Result codes ───────────────────────────────────────────────── */
 
 #define CBM_STORE_OK 0
@@ -213,6 +247,23 @@ cbm_store_t *cbm_store_open_path(const char *db_path);
  * work on a read-only file / filesystem. Returns NULL if the file does not
  * exist — never creates a new .db file. */
 cbm_store_t *cbm_store_open_path_query(const char *db_path);
+
+/* Verify and open an existing database without allowing a change between the
+ * verification snapshot and the returned query connection.  On Windows the
+ * source DB/WAL/SHM members are held with
+ * read-only, no-write/no-delete-share handles while a byte- and SHA-256-checked
+ * DB+WAL snapshot is inspected.  WAL-index SHM is intentionally rebuilt in the
+ * scratch directory because it is a mutable cache, not database content.  After
+ * the snapshot passes, the SHM guard is released and the source query connection
+ * is opened while the DB/WAL guards still exclude writers; only then are those
+ * guards released.  `out_store` is set only on VERIFY_OK.
+ *
+ * Returns one cbm_store_verify_status_t value and fills `result` with the exact
+ * failed operation and native/SQLite diagnostics.  Every non-OK status is
+ * fail-closed. */
+cbm_store_verify_status_t cbm_store_open_path_query_verified(const char *db_path,
+                                                             cbm_store_t **out_store,
+                                                             cbm_store_verify_result_t *result);
 
 /* On-disk path of a file-backed store, or NULL for an in-memory (:memory:)
  * store. The returned pointer is owned by the store. */
