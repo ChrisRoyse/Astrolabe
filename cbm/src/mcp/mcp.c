@@ -738,24 +738,14 @@ static char *canonicalize_repo_path_if_exists(char *repo_path) {
     if (!repo_path) {
         return NULL;
     }
-    bool root_syntax = true;
-    for (const char *p = repo_path; *p; p++) {
-        if (*p != '/' && *p != '\\' && *p != ':') {
-            root_syntax = false;
-            break;
-        }
-    }
-    if (root_syntax) {
-        return repo_path;
-    }
-
     /* #432: canonicalize via the long-path-safe wrapper. The old ANSI
      * `_access(...,0) + _fullpath` pair was MAX_PATH-bound, so a repo path deeper
      * than 260 chars failed to canonicalize (false not-found / _fullpath NULL) and
      * was indexed under its raw un-normalized form. cbm_canonicalize_existing_path
      * resolves through GetFullPathNameW + cbm_path_exists ("\\?\"-widened); it
-     * returns a heap string (free()) or NULL when the path is absent/unresolvable,
-     * in which case we keep repo_path unchanged (no ANSI fallback). */
+     * returns a heap string (free()) or NULL when the path is absent/unresolvable.
+     * Absence is terminal: indexing or project lookup must never continue under a
+     * raw path whose filesystem identity was not established. */
     char *canonical = cbm_canonicalize_existing_path(repo_path);
     if (canonical) {
         cbm_normalize_path_sep(canonical);
@@ -763,7 +753,11 @@ static char *canonicalize_repo_path_if_exists(char *repo_path) {
         return canonical;
     }
 
-    return repo_path;
+    cbm_log_error("repo_path.canonicalize_failed", "code", "CBM_REPO_PATH_UNRESOLVABLE",
+                  "path", repo_path, "remediation",
+                  "pass an existing readable repository path and retry", NULL);
+    free(repo_path);
+    return NULL;
 }
 
 static char *normalize_project_arg(char *project) {
@@ -772,6 +766,9 @@ static char *normalize_project_arg(char *project) {
     }
 
     project = canonicalize_repo_path_if_exists(project);
+    if (!project) {
+        return NULL;
+    }
     char *normalized = cbm_project_name_from_path(project);
     if (normalized) {
         free(project);
@@ -4256,6 +4253,14 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
     }
 
     repo_path = canonicalize_repo_path_if_exists(repo_path);
+    if (!repo_path) {
+        free(mode_str);
+        free(name_override);
+        return cbm_mcp_text_result(
+            "CBM_REPO_PATH_UNRESOLVABLE: repo_path does not resolve to an existing readable "
+            "filesystem object; pass an existing repository path",
+            true);
+    }
 
     /* Optional workspace boundary: when CBM_ALLOWED_ROOT is set (agentic /
      * multi-tenant deployments where repo_path may be influenced by an

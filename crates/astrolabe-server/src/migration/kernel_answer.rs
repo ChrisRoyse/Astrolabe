@@ -127,11 +127,9 @@ pub(crate) fn handle_get_kernel(args_json: &str) -> Result<String, DynError> {
     // importance scatter. Both read back the same persisted kernel-context
     // metadata and fail closed when the scope summaries are unavailable.
     if mode == "gaps" || mode == "quadrant" {
-        // #365: prefer the persisted KernelArtifact — the real kernel_score × churn
-        // ranking, exact hop boundary, and per-member groundedness permille — read
-        // back from the vault Kernel CF. Only when no artifact is persisted (a scope
-        // that never built a kernel) do we fall back to the labeled degraded
-        // scope-summary surface below.
+        // #365/#540: the persisted KernelArtifact is the sole source of truth for
+        // gap/quadrant reads. A missing or unreadable artifact is a state failure,
+        // never permission to substitute a degraded scope summary.
         match read_project_kernel_artifact(&cache_dir, &project) {
             Ok(Some(artifact)) => {
                 return if mode == "gaps" {
@@ -140,30 +138,31 @@ pub(crate) fn handle_get_kernel(args_json: &str) -> Result<String, DynError> {
                     tool_json_result(artifact_quadrant_value(&project, &artifact))
                 };
             }
-            Ok(None) => {}    // fall through to the labeled scope-summary fallback
-            Err(_error) => {} // artifact read failed: labeled fallback below
-        }
-
-        let members = match gap_members_from_kernel_context(&kernel_context) {
-            Ok(members) => members,
-            Err(reason) => {
+            Ok(None) => {
                 return tool_json_error_result(json!({
                     "schema": "astrolabe.get_kernel.v1",
                     "status": "refused",
                     "mode": mode,
                     "code": ASTRO_GET_KERNEL_UNAVAILABLE,
-                    "message": reason,
-                    "remediation": "rerun index_repository with calyx=\"shadow\" so the kernel scope summaries are persisted before requesting get_kernel",
+                    "message": format!("project {project:?} has no persisted Kernel artifact"),
+                    "remediation": "build the real artifact with get_kernel mode=\"build\", then retry",
                     "trust": "provisional",
                     "freshness": "not_evaluated",
                 }));
             }
-        };
-        return if mode == "gaps" {
-            tool_json_result(gap_report_value(&project, &members))
-        } else {
-            tool_json_result(quadrant_value(&project, &members))
-        };
+            Err(error) => {
+                return tool_json_error_result(json!({
+                    "schema": "astrolabe.get_kernel.v1",
+                    "status": "refused",
+                    "mode": mode,
+                    "code": ASTRO_GET_KERNEL_UNAVAILABLE,
+                    "message": format!("persisted Kernel artifact read failed for project {project:?}: {error}"),
+                    "remediation": "repair or rebuild the persisted Kernel artifact; no scope-summary substitute is served",
+                    "trust": "provisional",
+                    "freshness": "not_evaluated",
+                }));
+            }
+        }
     }
 
     let summaries = match kernel_context_scope_summaries(&kernel_context) {

@@ -787,12 +787,9 @@ struct NodeMapRow {
     series_id: SeriesId,
     file_path: String,
     commit: String,
-    #[serde(default)]
-    name: Option<String>,
-    #[serde(default)]
-    start_line: Option<i64>,
-    #[serde(default)]
-    end_line: Option<i64>,
+    name: String,
+    start_line: i64,
+    end_line: i64,
     source_present: bool,
     source_bytes: Vec<u8>,
     source_sha256: String,
@@ -815,10 +812,8 @@ struct StructuralNodeRow {
     name: String,
     file_path: String,
     commit: String,
-    #[serde(default)]
-    start_line: Option<i64>,
-    #[serde(default)]
-    end_line: Option<i64>,
+    start_line: i64,
+    end_line: i64,
     source_present: bool,
     source_bytes: Vec<u8>,
     source_sha256: String,
@@ -4224,9 +4219,9 @@ fn node_map_graph_row(
         series_id: prepared.identity.series_id,
         file_path: prepared.symbol.rel_file_path.clone(),
         commit: options.commit.clone(),
-        name: Some(prepared.name.clone()),
-        start_line: Some(i64::from(prepared.symbol.start_line)),
-        end_line: Some(i64::from(prepared.symbol.end_line)),
+        name: prepared.name.clone(),
+        start_line: i64::from(prepared.symbol.start_line),
+        end_line: i64::from(prepared.symbol.end_line),
         source_present,
         source_bytes,
         source_sha256,
@@ -4257,8 +4252,8 @@ fn structural_graph_row(
         name: node.name.clone(),
         file_path: node.symbol.rel_file_path.clone(),
         commit: options.commit.clone(),
-        start_line: Some(i64::from(node.symbol.start_line)),
-        end_line: Some(i64::from(node.symbol.end_line)),
+        start_line: i64::from(node.symbol.start_line),
+        end_line: i64::from(node.symbol.end_line),
         source_present,
         source_bytes,
         source_sha256,
@@ -5163,11 +5158,7 @@ where
                 row.node_id, row.cx_id
             )));
         }
-        let needs_base_decode = panel_version.is_none()
-            || row.name.is_none()
-            || row.file_path.is_empty()
-            || row.start_line.is_none()
-            || row.end_line.is_none();
+        let needs_base_decode = panel_version.is_none();
         let decoded = if needs_base_decode {
             // The value is only materialized for the rows that actually decode it;
             // the scanned key set already proved existence for the rest (#370).
@@ -5186,51 +5177,18 @@ where
         if let Some(decoded) = &decoded {
             panel_version.get_or_insert(decoded.panel_version);
         }
-        let name = row
-            .name
-            .or_else(|| {
-                decoded
-                    .as_ref()
-                    .and_then(|decoded| decoded.metadata_value("name").map(ToOwned::to_owned))
-            })
-            .unwrap_or_else(|| local_name_from_qn(&row.qualified_name));
-        let file_path = if row.file_path.is_empty() {
-            decoded
-                .as_ref()
-                .and_then(|decoded| decoded.metadata_value("file_path"))
-                .unwrap_or_default()
-                .to_string()
-        } else {
-            row.file_path
-        };
-        let start_line = row
-            .start_line
-            .or_else(|| {
-                decoded
-                    .as_ref()
-                    .and_then(|decoded| scalar_i64(decoded, "start_line"))
-            })
-            .unwrap_or(0);
-        let end_line = row
-            .end_line
-            .or_else(|| {
-                decoded
-                    .as_ref()
-                    .and_then(|decoded| scalar_i64(decoded, "end_line"))
-            })
-            .unwrap_or(0);
         let properties_json = row.properties_json.unwrap_or_else(|| "{}".to_string());
         ensure_json_object_text(&properties_json, "node properties")?;
         nodes.push(CbmGraphNode {
             source_node_id: row.node_id,
             project: row.project,
             label: row.label,
-            name,
+            name: row.name,
             atom_id: row.atom_id,
             qualified_name: row.qualified_name,
-            file_path,
-            start_line,
-            end_line,
+            file_path: row.file_path,
+            start_line: row.start_line,
+            end_line: row.end_line,
             source_present: row.source_present,
             source_bytes: row.source_bytes,
             source_sha256: row.source_sha256,
@@ -5263,8 +5221,8 @@ where
             atom_id: row.atom_id,
             qualified_name: row.qualified_name,
             file_path: row.file_path,
-            start_line: row.start_line.unwrap_or(0),
-            end_line: row.end_line.unwrap_or(0),
+            start_line: row.start_line,
+            end_line: row.end_line,
             source_present: row.source_present,
             source_bytes: row.source_bytes,
             source_sha256: row.source_sha256,
@@ -5727,23 +5685,6 @@ fn filter_schema_project<T>(
         out.push(row);
     }
     Ok(out)
-}
-
-fn local_name_from_qn(qualified_name: &str) -> String {
-    qualified_name
-        .rsplit_once('.')
-        .map_or(qualified_name, |(_, name)| name)
-        .to_string()
-}
-
-fn scalar_i64(decoded: &Constellation, key: &str) -> Option<i64> {
-    decoded.scalars.get(key).and_then(|value| {
-        if value.is_finite() && value.fract() == 0.0 {
-            Some(*value as i64)
-        } else {
-            None
-        }
-    })
 }
 
 fn ensure_json_object_text(value: &str, label: &str) -> IngestResult<()> {
