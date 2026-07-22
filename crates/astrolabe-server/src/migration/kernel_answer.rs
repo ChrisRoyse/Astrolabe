@@ -316,8 +316,8 @@ fn get_kernel_build_response_json(project: &str, summary: &Value) -> Value {
 
 /// Reads the persisted whole-repo `KernelArtifact` for a project back out of the
 /// vault Kernel CF (#365), read-only and independent of the index-time write path.
-/// `Ok(None)` when no kernel artifact was persisted for the project (a labeled
-/// fallback, not an error).
+/// `Ok(None)` when no kernel artifact was persisted for the project; callers
+/// surface that absence explicitly and never substitute another representation.
 pub(crate) fn read_project_kernel_artifact(
     cache_dir: &Path,
     project: &str,
@@ -611,10 +611,10 @@ pub(crate) fn build_kernel_answer_inputs(
         return Ok(None);
     };
 
-    // Per-node provenance references and the ledger head, joined from the persisted
-    // provenance store. Best-effort: an unavailable store leaves nodes
-    // unprovenanced (the engine refuses to serve them, never fabricates a ref).
-    let (node_provenance, ledger) = kernel_answer_provenance(cache_dir, project, &artifact);
+    // Per-node provenance references and the ledger head are required persisted
+    // inputs. Store read failure is terminal; a zero-ledger substitute would make
+    // the eventual refusal indistinguishable from genuine ungrounded state.
+    let (node_provenance, ledger) = kernel_answer_provenance(cache_dir, project, &artifact)?;
 
     let member_by_id: BTreeMap<CxId, &astrolabe_kernel::KernelMember> = artifact
         .members
@@ -669,18 +669,16 @@ pub(crate) fn build_kernel_answer_inputs(
 /// Joins per-`CxId` provenance references and the serving-vault ledger head out of
 /// the persisted provenance store. A node's provenance reference is its latest
 /// lineage event's ledger pointer rendered `seq:chain_hash`; only symbol keys that
-/// parse as a `CxId` are joined (the enriched-index case). Returns an empty map and
-/// a zero-anchored ledger head (content-addressed by the artifact members-hash)
-/// when the store is unavailable — never a fabricated reference.
+/// parse as a `CxId` are joined (the enriched-index case). The provenance store is
+/// part of the answer source of truth, so an unavailable/corrupt store is returned
+/// to the caller as an error.
 fn kernel_answer_provenance(
     cache_dir: &Path,
     project: &str,
-    artifact: &astrolabe_kernel::KernelArtifact,
-) -> (BTreeMap<CxId, String>, LedgerPointer) {
+    _artifact: &astrolabe_kernel::KernelArtifact,
+) -> Result<(BTreeMap<CxId, String>, LedgerPointer), DynError> {
     let mut map = BTreeMap::new();
-    let Ok(store) = provenance_store_for_project(cache_dir, project) else {
-        return (map, LedgerPointer::new(0, artifact.members_hash.clone()));
-    };
+    let store = provenance_store_for_project(cache_dir, project)?;
     for (symbol_id, lineage) in &store.symbols {
         let Ok(cx) = symbol_id.parse::<CxId>() else {
             continue;
@@ -692,7 +690,7 @@ fn kernel_answer_provenance(
             );
         }
     }
-    (map, store.ledger_head)
+    Ok((map, store.ledger_head))
 }
 
 /// Serves a kernel answer over the persisted substrate and, on a served answer,

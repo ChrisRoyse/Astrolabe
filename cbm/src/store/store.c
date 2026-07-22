@@ -465,7 +465,9 @@ static int init_schema(cbm_store_t *s) {
      * not a copy of the source text — required for camelCase tokenization
      * because we feed it `cbm_camel_split(name)` at insert time but want
      * queries to match against the split tokens, not the original.
-     * Fails silently if FTS5 is not compiled in (SQLITE_ENABLE_FTS5). */
+     * FTS is part of the persisted query contract. A missing FTS5 runtime or
+     * malformed virtual-table definition is a store-open failure, never a
+     * permission to publish a graph that cannot serve its advertised search. */
     {
         char *fts_err = NULL;
         int fts_rc = sqlite3_exec(s->db,
@@ -475,7 +477,17 @@ static int init_schema(cbm_store_t *s) {
                                   "  tokenize='unicode61 remove_diacritics 2'"
                                   ");",
                                   NULL, NULL, &fts_err);
-        if (fts_rc != SQLITE_OK && fts_err) {
+        if (fts_rc != SQLITE_OK) {
+            cbm_log_error("store.fts_schema_failed", "code", "CBM_FTS_SCHEMA_FAILED",
+                          "sqlite_error", fts_err ? fts_err : sqlite3_errmsg(s->db),
+                          "remediation",
+                          "restore the required SQLite FTS5 runtime and rebuild the store", NULL);
+            if (fts_err) {
+                sqlite3_free(fts_err);
+            }
+            return CBM_STORE_ERR;
+        }
+        if (fts_err) {
             sqlite3_free(fts_err);
         }
     }

@@ -3101,24 +3101,27 @@ where
         &mut encode_skip,
         &mut project_digests,
     )?;
-    // Node-map rows. A digest-reused symbol's persisted node-map row is provably unchanged
-    // (its file's content matched, so every derived row matches; volatile fields are reverted
-    // anyway), so skip re-encoding it and preserve its key. Fail open: if the persisted row is
-    // somehow absent, fall back to encoding it (the reconcile path then writes it).
-    let to_encode = constellations
-        .iter()
-        .filter(|prepared| {
-            if digest_reuse.contains_key(&prepared.node_id)
-                && let Ok(key) = node_map_reuse_key(prepared, &mut project_digests)
-                && existing_graph.contains_key(&key)
-            {
-                encode_skip.node_map_rows_preserved += 1;
-                preserved_keys.insert(key);
-                return false;
+    // Node-map rows. A digest-reused symbol must already have the exact persisted
+    // row implied by that digest. Absence is vault corruption or an invalid reuse
+    // classification; synthesizing a replacement would hide the broken state.
+    let mut to_encode = Vec::new();
+    for prepared in &constellations {
+        if digest_reuse.contains_key(&prepared.node_id) {
+            let key = node_map_reuse_key(prepared, &mut project_digests)?;
+            if !existing_graph.contains_key(&key) {
+                return Err(IngestError::InvalidInput(format!(
+                    "ASTRO_DIGEST_REUSE_NODE_MAP_MISSING: digest-reused node {} atom {} has no persisted node-map row {}; remediation: preserve the vault and rebuild the project from source",
+                    prepared.node_id,
+                    prepared.atom_id,
+                    hex_lower(&key)
+                )));
             }
-            true
-        })
-        .collect::<Vec<_>>();
+            encode_skip.node_map_rows_preserved += 1;
+            preserved_keys.insert(key);
+            continue;
+        }
+        to_encode.push(prepared);
+    }
     encode_skip.node_map_rows_encoded = to_encode.len();
     let node_map_rows = parallel_map(to_encode, options.workers, |prepared| {
         node_map_graph_row(options, prepared)
@@ -5502,7 +5505,7 @@ pub struct InjectedNodeFault {
 
 /// Resolves outcome subjects to current constellation ids from the node map.
 ///
-/// Reads every `astrolabe:node-map:v2` row of `project` from the vault Graph CF
+/// Reads every `astrolabe:node-map:v3` row of `project` from the vault Graph CF
 /// and returns a `qualified_name -> cx_id` map, so the `anchor_outcome` tool can
 /// bind an outcome subject id (a symbol / test-case qualified name) to the
 /// constellation id to anchor. A qualified name carried by more than one node
@@ -5546,13 +5549,13 @@ where
 }
 
 /// Global `qualified_name -> cx_id` resolution across every persisted
-/// `astrolabe:node-map:v2` row, regardless of project, with ambiguity reported
+/// `astrolabe:node-map:v3` row, regardless of project, with ambiguity reported
 /// explicitly (#522).
 ///
 /// Returns `(resolved, ambiguous)`: `resolved` holds the first-seen `cx_id` for
 /// every qualified name, and `ambiguous` names those carried by more than one
-/// node with differing `cx_id`s. Unlike [`read_node_map_cx_ids`] — which silently
-/// drops ambiguous names for the best-effort anchor binder — this preserves the
+/// node with differing `cx_id`s. Unlike [`read_node_map_cx_ids`] — which excludes
+/// ambiguous names so its callers refuse unresolved subjects — this preserves the
 /// ambiguity set so the composite kernel projection can refuse a SIM edge whose
 /// endpoint qualified name resolves to more than one constellation, rather than
 /// binding a similarity edge to a guessed node. Fails closed on a node-map row
