@@ -1,10 +1,10 @@
 use super::*;
 
 use astrolabe_kernel::{
-    COVERAGE_QUADRANT_SCHEMA, CoverageImportanceQuadrant, GROUNDING_GAP_SCHEMA, GapQuadrant,
-    GroundingGapReport, KernelArtifact, QuadrantConfig, classify_quadrant,
-    coverage_importance_quadrant, coverage_importance_quadrant_artifact_bytes,
-    grounding_gap_report, grounding_gap_report_artifact_bytes,
+    COVERAGE_QUADRANT_SCHEMA, CoverageImportanceQuadrant, GROUNDING_GAP_SCHEMA, GroundingGapReport,
+    KernelArtifact, QuadrantConfig, coverage_importance_quadrant,
+    coverage_importance_quadrant_artifact_bytes, grounding_gap_report,
+    grounding_gap_report_artifact_bytes,
 };
 
 /// Serves the ranked grounding-gap report from the persisted `KernelArtifact`
@@ -137,8 +137,8 @@ pub(crate) fn artifact_quadrant_value(project: &str, artifact: &KernelArtifact) 
 // (the single tool exposing modes read|gaps|quadrant|build). This module owns the
 // grounding-gap (#39) member extraction, the ranked gap report, and the
 // coverage-vs-importance quadrant that the `gaps`/`quadrant` modes serve; the
-// handler calls `gap_members_from_kernel_context`, `gap_report_value`, and
-// `quadrant_value` below.
+// the architecture-aspect handler calls `gap_members_from_kernel_context` and
+// `gap_report_value` below. Kernel tool modes read only a persisted KernelArtifact.
 
 /// One kernel member read back from the persisted kernel-context scope summaries.
 #[derive(Debug, Clone)]
@@ -267,96 +267,4 @@ pub(crate) fn gap_report_value(project: &str, members: &[GapMember]) -> Value {
             "gap=!scope_summary.member.grounded",
         ],
     })
-}
-
-/// The coverage-vs-importance quadrant envelope. Importance is the persisted
-/// kernel weight normalized to permille against the scope maximum; coverage is
-/// the persisted grounded flag (grounded → full density, gap → zero). Every
-/// member is classified with the kernel crate's registry-knob split.
-pub(crate) fn quadrant_value(project: &str, members: &[GapMember]) -> Value {
-    let config = QuadrantConfig::with_registry_defaults();
-    let max_weight = members
-        .iter()
-        .map(|member| member.kernel_weight)
-        .max()
-        .unwrap_or(0);
-
-    let mut points: Vec<(GapQuadrant, u64, &GapMember)> = members
-        .iter()
-        .map(|member| {
-            let importance_permille = if max_weight == 0 {
-                0
-            } else {
-                member
-                    .kernel_weight
-                    .saturating_mul(1000)
-                    .checked_div(max_weight)
-                    .unwrap_or(0)
-            };
-            let density_permille = if member.grounded { 1000 } else { 0 };
-            let quadrant = classify_quadrant(importance_permille, density_permille, &config);
-            (quadrant, importance_permille, member)
-        })
-        .collect();
-    points.sort_by(|left, right| {
-        quadrant_ordinal(left.0)
-            .cmp(&quadrant_ordinal(right.0))
-            .then_with(|| right.1.cmp(&left.1))
-            .then_with(|| left.2.symbol_id.cmp(&right.2.symbol_id))
-    });
-
-    let count_in = |target: GapQuadrant| {
-        points
-            .iter()
-            .filter(|(quadrant, _, _)| *quadrant == target)
-            .count()
-    };
-    let point_rows: Vec<Value> = points
-        .iter()
-        .map(|(quadrant, importance_permille, member)| {
-            json!({
-                "scope_id": member.scope_id,
-                "symbol_id": member.symbol_id,
-                "qualified_name": member.qualified_name,
-                "kernel_weight": member.kernel_weight,
-                "importance_permille": importance_permille,
-                "anchor_density_permille": if member.grounded { 1000 } else { 0 },
-                "grounded": member.grounded,
-                "quadrant": quadrant.as_str(),
-            })
-        })
-        .collect();
-
-    json!({
-        "schema": COVERAGE_QUADRANT_SCHEMA,
-        "project": project,
-        "mode": "quadrant",
-        "status": "served",
-        "importance_threshold_permille": config.importance_threshold_permille,
-        "anchor_density_threshold_permille": config.anchor_density_threshold_permille,
-        "member_count": members.len(),
-        "critical_unverified_count": count_in(GapQuadrant::CriticalUnverified),
-        "critical_covered_count": count_in(GapQuadrant::CriticalCovered),
-        "peripheral_unverified_count": count_in(GapQuadrant::PeripheralUnverified),
-        "peripheral_covered_count": count_in(GapQuadrant::PeripheralCovered),
-        "points": point_rows,
-        "degraded": true,
-        "remediation": "importance is the persisted kernel_weight normalized to permille; the anchor-density axis is binary (grounded flag) because the per-member groundedness permille lives in the persisted kernel artifact, not this metadata surface",
-        "trust": "provisional",
-        "freshness": "fresh",
-        "provenance": [
-            format!("kernel_context.scope_summaries:project={project}"),
-            "metadata:kernel_context_json",
-            "classify_quadrant:astrolabe_kernel::gaps",
-        ],
-    })
-}
-
-fn quadrant_ordinal(quadrant: GapQuadrant) -> u8 {
-    match quadrant {
-        GapQuadrant::CriticalUnverified => 0,
-        GapQuadrant::CriticalCovered => 1,
-        GapQuadrant::PeripheralUnverified => 2,
-        GapQuadrant::PeripheralCovered => 3,
-    }
 }
