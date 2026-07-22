@@ -44,6 +44,14 @@ function Fail-AstroArchive {
     $exception = [InvalidOperationException]::new($Message)
     $exception.Data['AstroCode'] = $Code
     $exception.Data['AstroRemediation'] = $Remediation
+    [Console]::Error.WriteLine((
+        [ordered]@{
+            schema = 'astrolabe.launcher-pair-archive-error.v1'
+            code = $Code
+            message = $Message
+            remediation = $Remediation
+        } | ConvertTo-Json -Compress
+    ))
     throw $exception
 }
 
@@ -315,6 +323,15 @@ try {
 
     $manifestProbe = Get-AstroAttributionManifestProbe $manifestFull
     $tempInventory = Get-AstroReservedLauncherTempEntries $protocol
+    $manifestProbeSha256 = if ($null -ne $manifestProbe.Snapshot) {
+        [string]$manifestProbe.Snapshot.Sha256
+    } else { '<unavailable>' }
+    $manifestOwnerState = if ($null -ne $manifestProbe.OwnerProbe) {
+        [string]$manifestProbe.OwnerProbe.State
+    } else { '<unavailable>' }
+    $manifestJobState = if ($null -ne $manifestProbe.JobObjectProbe) {
+        [string]$manifestProbe.JobObjectProbe.State
+    } else { '<unavailable>' }
     if (-not $manifestProbe.Valid -or
         $manifestProbe.Snapshot.Sha256 -cne $ExpectedManifestSha256 -or
         $manifestProbe.Parsed.LauncherPid -ne $expectedPidValue -or
@@ -323,7 +340,7 @@ try {
         $manifestProbe.OwnerProbe.State -cne 'absent' -or
         $manifestProbe.JobObjectProbe.State -cne 'absent') {
         Fail-AstroArchive 'ASTRO_LAUNCHER_ARCHIVE_MANIFEST_STATE_MISMATCH' `
-            "valid=$($manifestProbe.Valid); error=$($manifestProbe.Error); sha=$($manifestProbe.Snapshot.Sha256); owner=$($manifestProbe.OwnerProbe.State); job=$($manifestProbe.JobObjectProbe.State)" `
+            "state=$($manifestProbe.State); valid=$($manifestProbe.Valid); error=$($manifestProbe.Error); sha=$manifestProbeSha256; owner=$manifestOwnerState; job=$manifestJobState" `
             'preserve all state and post evidence only for the current strict physical pair'
     }
     $matchingTemps = @($tempInventory.Records | Where-Object {
