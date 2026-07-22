@@ -74,16 +74,32 @@ static bool is_reference_node(TSNode node, CBMLanguage lang) {
     }
 }
 
-// Check if a reference node is a definition name (the "name" field of its parent).
-static bool is_definition_name(TSNode node) {
+static bool same_source_span(TSNode left, TSNode right) {
+    return !ts_node_is_null(left) && ts_node_start_byte(left) == ts_node_start_byte(right) &&
+           ts_node_end_byte(left) == ts_node_end_byte(right);
+}
+
+// Check whether a reference node is the binding owned by its direct parent.
+//
+// Tree-sitter grammars do not use one universal field for bindings. Languages
+// such as JavaScript expose a declaration through `name`, while the C and C++
+// grammars put function, parameter, pointer, and variable bindings in a
+// `declarator` chain. Only compare the direct field's exact source span: walking
+// upward through a whole function declarator would incorrectly classify
+// references in default arguments as declarations.
+static bool is_definition_binding(TSNode node) {
     TSNode parent = ts_node_parent(node);
     if (ts_node_is_null(parent)) {
         return false;
     }
+
     TSNode name_field = ts_node_child_by_field_name(parent, TS_FIELD("name"));
-    return !ts_node_is_null(name_field) &&
-           ts_node_start_byte(name_field) == ts_node_start_byte(node) &&
-           ts_node_end_byte(name_field) == ts_node_end_byte(node);
+    if (same_source_span(name_field, node)) {
+        return true;
+    }
+
+    TSNode declarator_field = ts_node_child_by_field_name(parent, TS_FIELD("declarator"));
+    return same_source_span(declarator_field, node);
 }
 
 // Try to emit a usage for a reference node. Returns early if the node should be skipped.
@@ -94,7 +110,7 @@ static void try_emit_usage(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *s
     if (is_inside_call(node, spec) || is_inside_import(node, spec)) {
         return;
     }
-    if (is_definition_name(node)) {
+    if (is_definition_binding(node)) {
         return;
     }
     char *name = cbm_node_text(ctx->arena, node, ctx->source);
@@ -150,15 +166,8 @@ void handle_usages(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec, Wal
         return;
     }
 
-    // Skip if it's a definition name (left side of assignment, function name)
-    TSNode parent = ts_node_parent(node);
-    if (!ts_node_is_null(parent)) {
-        TSNode name_field = ts_node_child_by_field_name(parent, TS_FIELD("name"));
-        if (!ts_node_is_null(name_field) &&
-            ts_node_start_byte(name_field) == ts_node_start_byte(node) &&
-            ts_node_end_byte(name_field) == ts_node_end_byte(node)) {
-            return;
-        }
+    if (is_definition_binding(node)) {
+        return;
     }
 
     char *name = cbm_node_text(ctx->arena, node, ctx->source);

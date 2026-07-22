@@ -1025,6 +1025,47 @@ bool cbm_gbuf_resolution_failed(const cbm_gbuf_t *gb) {
     return gb && atomic_load(&gb->resolution_failed);
 }
 
+static void log_qn_resolution_ambiguity(const cbm_gbuf_t *gb, const char *qn) {
+    int candidate_count = 0;
+    for (int i = 0; i < gb->nodes.count; i++) {
+        const cbm_gbuf_node_t *candidate = gb->nodes.items[i];
+        if (node_is_live(gb, candidate) && candidate->qualified_name &&
+            strcmp(candidate->qualified_name, qn) == 0) {
+            candidate_count++;
+        }
+    }
+
+    char count_buf[CBM_SZ_32];
+    snprintf(count_buf, sizeof(count_buf), "%d", candidate_count);
+    cbm_log_error("gbuf.qn_resolution_ambiguous", "code", "CBM_NODE_QN_AMBIGUOUS",
+                  "qualified_name", qn, "candidate_count", count_buf, "message",
+                  "qualified name resolves to multiple stable source atoms", "remediation",
+                  "resolve by atom_id, exact signature, or source location before persistence");
+
+    int ordinal = 0;
+    for (int i = 0; i < gb->nodes.count; i++) {
+        const cbm_gbuf_node_t *candidate = gb->nodes.items[i];
+        if (!node_is_live(gb, candidate) || !candidate->qualified_name ||
+            strcmp(candidate->qualified_name, qn) != 0) {
+            continue;
+        }
+
+        char ordinal_buf[CBM_SZ_32];
+        char start_line_buf[CBM_SZ_32];
+        char end_line_buf[CBM_SZ_32];
+        snprintf(ordinal_buf, sizeof(ordinal_buf), "%d", ++ordinal);
+        snprintf(start_line_buf, sizeof(start_line_buf), "%d", candidate->start_line);
+        snprintf(end_line_buf, sizeof(end_line_buf), "%d", candidate->end_line);
+        cbm_log_error("gbuf.qn_resolution_candidate", "code", "CBM_NODE_QN_CANDIDATE",
+                      "qualified_name", qn, "candidate_ordinal", ordinal_buf, "atom_id",
+                      candidate->atom_id ? candidate->atom_id : "", "label",
+                      candidate->label ? candidate->label : "", "file_path",
+                      candidate->file_path ? candidate->file_path : "", "start_line",
+                      start_line_buf, "end_line", end_line_buf, "source_sha256",
+                      candidate->source_sha256 ? candidate->source_sha256 : "");
+    }
+}
+
 const cbm_gbuf_node_t *cbm_gbuf_find_by_qn(const cbm_gbuf_t *gb, const char *qn) {
     if (!gb || !qn) {
         return NULL;
@@ -1032,10 +1073,7 @@ const cbm_gbuf_node_t *cbm_gbuf_find_by_qn(const cbm_gbuf_t *gb, const char *qn)
     void *node = cbm_ht_get(gb->node_by_qn, qn);
     if (node == AMBIGUOUS_QN) {
         atomic_store(&((cbm_gbuf_t *)gb)->resolution_failed, true);
-        cbm_log_error("gbuf.qn_resolution_ambiguous", "code", "CBM_NODE_QN_AMBIGUOUS",
-                      "qualified_name", qn, "message",
-                      "qualified name resolves to multiple stable source atoms", "remediation",
-                      "resolve by atom_id, exact signature, or source location before persistence");
+        log_qn_resolution_ambiguity(gb, qn);
         return NULL;
     }
     return node;
