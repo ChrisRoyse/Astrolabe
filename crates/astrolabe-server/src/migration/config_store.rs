@@ -33,8 +33,19 @@ pub(crate) fn read_config_u64(
     project: &str,
     key: &str,
 ) -> Result<Option<u64>, DynError> {
-    Ok(read_config_value(cache_dir, &metadata_key(project, key))?
-        .and_then(|value| value.parse::<u64>().ok()))
+    let storage_key = metadata_key(project, key);
+    let Some(value) = read_config_value(cache_dir, &storage_key)? else {
+        return Ok(None);
+    };
+    value.parse::<u64>().map(Some).map_err(|error| {
+        format!(
+            "ASTRO_CONFIG_U64_CORRUPT: persisted config value for key {storage_key:?} is \
+             {value:?}, not an unsigned 64-bit integer: {error}. Remediation: repair or remove \
+             the exact corrupt config row before retrying; Astrolabe will not substitute a \
+             default for persisted invalid state."
+        )
+        .into()
+    })
 }
 
 pub(crate) fn persist_dial(project: &str, dial: MigrationDial) -> Result<(), DynError> {
@@ -78,14 +89,24 @@ pub(crate) fn read_dial_at(cache_dir: &Path, project: &str) -> Result<MigrationD
 }
 
 pub(crate) fn read_config_value(cache_dir: &Path, key: &str) -> Result<Option<String>, DynError> {
-    let conn = open_config(cache_dir)?;
-    Ok(conn
-        .query_row(
-            "SELECT value FROM config WHERE key = ?",
-            params![key],
-            |row| row.get(0),
+    let Some(conn) = open_config_read_only_if_present(cache_dir)? else {
+        return Ok(None);
+    };
+    conn.query_row(
+        "SELECT value FROM config WHERE key = ?",
+        params![key],
+        |row| row.get(0),
+    )
+    .optional()
+    .map_err(|error| {
+        format!(
+            "ASTRO_CONFIG_DB_READ_FAILED: read-only query for config key {key:?} in \
+                 {path} failed: {error}. Remediation: inspect the config table and SQLite \
+                 integrity; repair the persisted store before retrying.",
+            path = cache_dir.join("_config.db").display(),
         )
-        .optional()?)
+        .into()
+    })
 }
 
 /// Reads every `(key, value)` config row whose key starts with `prefix`, ordered
@@ -99,20 +120,49 @@ pub(crate) fn scan_config_prefix(
     cache_dir: &Path,
     prefix: &str,
 ) -> Result<Vec<(String, String)>, DynError> {
-    let conn = open_config(cache_dir)?;
+    let Some(conn) = open_config_read_only_if_present(cache_dir)? else {
+        return Ok(Vec::new());
+    };
     let escaped = prefix
         .replace('\\', "\\\\")
         .replace('%', "\\%")
         .replace('_', "\\_");
     let pattern = format!("{escaped}%");
-    let mut stmt =
-        conn.prepare("SELECT key, value FROM config WHERE key LIKE ? ESCAPE '\\' ORDER BY key")?;
-    let rows = stmt.query_map(params![pattern], |row| {
-        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-    })?;
+    let mut stmt = conn
+        .prepare("SELECT key, value FROM config WHERE key LIKE ? ESCAPE '\\' ORDER BY key")
+        .map_err(|error| -> DynError {
+            format!(
+                "ASTRO_CONFIG_DB_SCAN_FAILED: preparing read-only config prefix scan \
+                 {prefix:?} in {path} failed: {error}. Remediation: inspect the config table \
+                 schema and SQLite integrity; repair the persisted store before retrying.",
+                path = cache_dir.join("_config.db").display(),
+            )
+            .into()
+        })?;
+    let rows = stmt
+        .query_map(params![pattern], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(|error| -> DynError {
+            format!(
+                "ASTRO_CONFIG_DB_SCAN_FAILED: executing read-only config prefix scan \
+                 {prefix:?} in {path} failed: {error}. Remediation: inspect the config rows and \
+                 SQLite integrity; repair the persisted store before retrying.",
+                path = cache_dir.join("_config.db").display(),
+            )
+            .into()
+        })?;
     let mut out = Vec::new();
     for row in rows {
-        out.push(row?);
+        out.push(row.map_err(|error| -> DynError {
+            format!(
+                "ASTRO_CONFIG_DB_SCAN_FAILED: decoding a row from read-only config prefix scan \
+                 {prefix:?} in {path} failed: {error}. Remediation: inspect the config row types \
+                 and SQLite integrity; repair the persisted store before retrying.",
+                path = cache_dir.join("_config.db").display(),
+            )
+            .into()
+        })?);
     }
     Ok(out)
 }
@@ -140,6 +190,104 @@ pub(crate) fn delete_config_value(cache_dir: &Path, key: &str) -> Result<(), Dyn
 /// resilience timeout under cross-process access (multiple agent MCP processes
 /// on one repo, #76), not a result-determining threshold.
 pub(crate) const CONFIG_DB_BUSY_TIMEOUT_MS: u64 = 5_000;
+
+/// Opens an existing config store for reads without creating any durable config state.
+///
+/// Absence is a legitimate unconfigured state and is returned without creating the cache
+/// directory, database, journal, or schema. A present file is opened with SQLite's explicit
+/// read-only/no-create flag, so every query caller shares the same fail-closed boundary and can
+/// never initialize or repair storage as a side effect of observing it.
+fn open_config_read_only_if_present(cache_dir: &Path) -> Result<Option<Connection>, DynError> {
+    let db_path = cache_dir.join("_config.db");
+    match fs::symlink_metadata(&db_path) {
+        Ok(metadata) if !metadata.file_type().is_file() => {
+            return Err(format!(
+                "ASTRO_CONFIG_DB_NOT_FILE: config store path {path} exists but is not a regular \
+                 non-reparse file. Remediation: restore a valid SQLite config database at that \
+                 exact path before retrying.",
+                path = db_path.display(),
+            )
+            .into());
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            for suffix in ["-wal", "-shm", "-journal"] {
+                let mut sidecar_path = db_path.as_os_str().to_os_string();
+                sidecar_path.push(suffix);
+                let sidecar_path = PathBuf::from(sidecar_path);
+                match fs::symlink_metadata(&sidecar_path) {
+                    Ok(_) => {
+                        return Err(format!(
+                            "ASTRO_CONFIG_DB_ORPHAN_SIDECAR: config store {main} is absent but \
+                             SQLite sidecar {sidecar} exists. Remediation: preserve and inspect \
+                             the orphaned database family, then restore or remove it as one \
+                             coherent unit; Astrolabe will not treat partial persisted state as \
+                             an unconfigured store.",
+                            main = db_path.display(),
+                            sidecar = sidecar_path.display(),
+                        )
+                        .into());
+                    }
+                    Err(sidecar_error) if sidecar_error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(sidecar_error) => {
+                        return Err(format!(
+                            "ASTRO_CONFIG_DB_METADATA_FAILED: could not inspect possible SQLite \
+                             sidecar {sidecar} while config store {main} was absent: \
+                             {sidecar_error}. Remediation: restore access to the cache path and \
+                             retry; Astrolabe did not create or modify the store.",
+                            main = db_path.display(),
+                            sidecar = sidecar_path.display(),
+                        )
+                        .into());
+                    }
+                }
+            }
+            return Ok(None);
+        }
+        Err(error) => {
+            return Err(format!(
+                "ASTRO_CONFIG_DB_METADATA_FAILED: could not inspect config store {path} before \
+                 a read-only open: {error}. Remediation: restore access to the cache path and \
+                 retry; Astrolabe did not create or modify the store.",
+                path = db_path.display(),
+            )
+            .into());
+        }
+    }
+
+    let open_path = astrolabe_domain::winpath::sqlite_open_path(&db_path).map_err(|error| {
+        format!(
+            "ASTRO_CONFIG_DB_READ_PATH_INVALID: normalizing existing config store path {path} \
+             for a read-only SQLite open failed: {error}. Remediation: move the cache to a valid \
+             native Windows path before retrying.",
+            path = db_path.display(),
+        )
+    })?;
+    let flags = OpenFlags::SQLITE_OPEN_READ_ONLY
+        | OpenFlags::SQLITE_OPEN_NO_MUTEX
+        | OpenFlags::SQLITE_OPEN_PRIVATE_CACHE;
+    let conn = Connection::open_with_flags(&open_path, flags).map_err(|error| -> DynError {
+        format!(
+            "ASTRO_CONFIG_DB_READ_OPEN_FAILED: explicit read-only/no-create open of existing \
+             config store {path} failed: {error}. Remediation: inspect file permissions, active \
+             SQLite locks/WAL sidecars, and database integrity before retrying; Astrolabe will \
+             not fall back to a writable open.",
+            path = db_path.display(),
+        )
+        .into()
+    })?;
+    conn.busy_timeout(std::time::Duration::from_millis(CONFIG_DB_BUSY_TIMEOUT_MS))
+        .map_err(|error| -> DynError {
+            format!(
+                "ASTRO_CONFIG_DB_READ_SETUP_FAILED: applying the bounded busy timeout to \
+                 read-only config store {path} failed: {error}. Remediation: inspect the SQLite \
+                 connection and persisted store before retrying.",
+                path = db_path.display(),
+            )
+            .into()
+        })?;
+    Ok(Some(conn))
+}
 
 pub(crate) fn open_config(cache_dir: &Path) -> Result<Connection, DynError> {
     fs::create_dir_all(cache_dir)?;

@@ -71,7 +71,7 @@ use calyx_aster::ledger_view::parse_aster_ledger_seq;
 use calyx_aster::vault::{AsterVault, VaultOptions};
 use calyx_core::{Clock, LedgerRef, SlotId, SlotVector, VaultId, VaultStore};
 use calyx_ledger::{ActorId, SubjectId, decode as decode_ledger};
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 
