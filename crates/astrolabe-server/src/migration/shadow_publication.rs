@@ -299,27 +299,77 @@ impl ShadowPublication {
             sqlite_snapshot(&live_config, &self.stage_cache.join("_config.db"))?;
         }
         let live_source = sqlite_path(&self.live_cache, &self.project);
-        if live_source.exists() {
-            sqlite_snapshot(&live_source, &sqlite_path(&self.stage_cache, &self.project))?;
-        }
         let live_lowered = lowered_sqlite_path(&self.live_cache, &self.project);
-        if live_lowered.exists() {
-            sqlite_snapshot(
-                &live_lowered,
-                &lowered_sqlite_path(&self.stage_cache, &self.project),
-            )?;
-        }
         let live_vault = vault_dir(&self.live_cache, &self.project);
-        if live_vault.exists() {
-            let vault = AsterVault::new_durable(
-                &live_vault,
-                VaultId::from_str(SHADOW_VAULT_ID)?,
-                vault_salt(&self.project).into_bytes(),
-                VaultOptions::default(),
-            )?;
-            vault.copy_durable_snapshot_to(&vault_dir(&self.stage_cache, &self.project))?;
-        }
-        Ok(())
+        with_lowered_sqlite_lock(&self.live_cache, &self.project, || {
+            if live_source.exists() {
+                sqlite_snapshot(&live_source, &sqlite_path(&self.stage_cache, &self.project))?;
+            }
+
+            match (live_lowered.exists(), live_vault.exists()) {
+                (false, false) => Ok(()),
+                (true, true) => {
+                    let staged_lowered = lowered_sqlite_path(&self.stage_cache, &self.project);
+                    exact_quiescent_sqlite_snapshot(
+                        &live_lowered,
+                        &staged_lowered,
+                        "lowered SQLite",
+                    )?;
+
+                    let staged_vault_dir = vault_dir(&self.stage_cache, &self.project);
+                    let salt = vault_salt(&self.project);
+                    let vault = AsterVault::new_durable(
+                        &live_vault,
+                        VaultId::from_str(SHADOW_VAULT_ID)?,
+                        salt.clone().into_bytes(),
+                        VaultOptions::default(),
+                    )?;
+                    vault.copy_durable_snapshot_to(&staged_vault_dir)?;
+                    drop(vault);
+
+                    let staged_vault = open_shadow_vault_read_only(
+                        &staged_vault_dir,
+                        SHADOW_VAULT_ID,
+                        &salt,
+                        Vec::new(),
+                    )?;
+                    let verification = verify_lowered_artifact(
+                        &staged_vault,
+                        &staged_lowered,
+                        &self.project,
+                    )
+                    .map_err(|error| {
+                        format!(
+                            "ASTRO_SHADOW_PUBLICATION_SEED_LOWERED_UNVERIFIED: staged lowered artifact and vault manifest do not verify for project {:?}: {error}. Remediation: do not publish this generation; inspect the live lowered artifact, vault lowering manifest, and ledger chain, then rebuild them from source",
+                            self.project
+                        )
+                    })?;
+                    let configured_hash = read_config_value(
+                        &self.stage_cache,
+                        &metadata_key(&self.project, "lowered_artifact_sha256"),
+                    )?
+                    .ok_or_else(|| {
+                        format!(
+                            "ASTRO_SHADOW_PUBLICATION_SEED_LOWERED_HASH_MISSING: live project {:?} has a lowered artifact and vault manifest but no persisted lowered_artifact_sha256. Remediation: do not publish mixed-generation state; rebuild the project from source",
+                            self.project
+                        )
+                    })?;
+                    if verification.artifact_sha256 != configured_hash {
+                        return Err(format!(
+                            "ASTRO_SHADOW_PUBLICATION_SEED_LOWERED_HASH_MISMATCH: exact staged lowered artifact hashes to {} but the staged config commits to {configured_hash} for project {:?}. Remediation: do not publish mixed-generation state; inspect the live config transaction and rebuild the project from source",
+                            verification.artifact_sha256, self.project
+                        )
+                        .into());
+                    }
+                    Ok(())
+                }
+                (lowered_present, vault_present) => Err(format!(
+                    "ASTRO_SHADOW_PUBLICATION_SEED_INCOMPLETE: project {:?} has asymmetric live derived state (lowered_present={lowered_present}, vault_present={vault_present}). Remediation: do not synthesize or reuse a partial generation; inspect the prior publication transaction and rebuild the project from source",
+                    self.project
+                )
+                .into()),
+            }
+        })
     }
 
     fn stage_inventory(&self) -> Result<Value, DynError> {
@@ -445,6 +495,96 @@ fn sqlite_snapshot(source: &Path, destination: &Path) -> Result<(), DynError> {
     }
     destination_conn.execute_batch("PRAGMA journal_mode=DELETE;")?;
     drop(destination_conn);
+    Ok(())
+}
+
+/// Copies a quiescent SQLite artifact without changing any byte that its
+/// external manifest commits to. The caller must hold the artifact's writer
+/// lock for this entire operation.
+fn exact_quiescent_sqlite_snapshot(
+    source: &Path,
+    destination: &Path,
+    kind: &str,
+) -> Result<(), DynError> {
+    for suffix in ["-wal", "-shm", "-journal"] {
+        let sidecar = PathBuf::from(format!("{}{suffix}", source.display()));
+        if sidecar.exists() {
+            return Err(format!(
+                "ASTRO_SHADOW_EXACT_SNAPSHOT_SIDECAR: {kind} at {} has live SQLite sidecar {}; exact single-file identity is not safe to copy. Remediation: stop the writer, complete SQLite recovery/checkpointing, and retry only after every sidecar is absent",
+                source.display(),
+                sidecar.display()
+            )
+            .into());
+        }
+    }
+    if let Some(parent) = destination.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let source_bytes_before = fs::metadata(source)?.len();
+    let source_hash_before = sha256_file_hex(source)?;
+    let copied = (|| -> Result<(), DynError> {
+        let mut input = OpenOptions::new().read(true).open(source)?;
+        let mut output = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(destination)?;
+        let copied = std::io::copy(&mut input, &mut output)?;
+        output.sync_all()?;
+        if copied != source_bytes_before {
+            return Err(format!(
+                "copied {copied} bytes but the retained source length was {source_bytes_before}"
+            )
+            .into());
+        }
+        Ok(())
+    })();
+    if let Err(error) = copied {
+        let cleanup = match fs::remove_file(destination) {
+            Ok(()) => "partial destination removed".to_string(),
+            Err(remove_error) if remove_error.kind() == std::io::ErrorKind::NotFound => {
+                "no partial destination existed".to_string()
+            }
+            Err(remove_error) => format!("partial destination cleanup failed: {remove_error}"),
+        };
+        return Err(format!(
+            "ASTRO_SHADOW_EXACT_SNAPSHOT_IO: could not copy {kind} from {} to {}: {error}; {cleanup}. Remediation: inspect the named filesystem error and retry only after source stability and destination cleanup are proven",
+            source.display(),
+            destination.display()
+        )
+        .into());
+    }
+
+    let source_bytes_after = fs::metadata(source)?.len();
+    let destination_bytes = fs::metadata(destination)?.len();
+    let source_hash_after = sha256_file_hex(source)?;
+    let destination_hash = sha256_file_hex(destination)?;
+    if source_bytes_before != source_bytes_after
+        || source_bytes_before != destination_bytes
+        || source_hash_before != source_hash_after
+        || source_hash_before != destination_hash
+    {
+        let cleanup = match fs::remove_file(destination) {
+            Ok(()) => "drifted destination removed".to_string(),
+            Err(remove_error) => format!("drifted destination cleanup failed: {remove_error}"),
+        };
+        return Err(format!(
+            "ASTRO_SHADOW_EXACT_SNAPSHOT_DRIFT: {kind} changed or copied non-identically (source_bytes_before={source_bytes_before}, source_bytes_after={source_bytes_after}, destination_bytes={destination_bytes}, source_hash_before={source_hash_before}, source_hash_after={source_hash_after}, destination_hash={destination_hash}); {cleanup}. Remediation: identify the writer that bypassed the project lowered lock or the storage fault before retrying"
+        )
+        .into());
+    }
+
+    let destination_path = astrolabe_domain::winpath::sqlite_open_path(destination)?;
+    let destination_conn =
+        Connection::open_with_flags(destination_path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let integrity: String =
+        destination_conn.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
+    if integrity != "ok" {
+        return Err(format!(
+            "ASTRO_SHADOW_EXACT_SNAPSHOT_CORRUPT: exact {kind} snapshot at {} returned integrity_check={integrity:?}. Remediation: do not publish it; inspect the source artifact and storage device, then rebuild from source",
+            destination.display()
+        )
+        .into());
+    }
     Ok(())
 }
 

@@ -44,7 +44,7 @@ use astrolabe_lower::{
     ASTRO_TEAM_ARTIFACT_VAULT_BYTES, GRAPH_DB_ZST_NAME, LowerSqliteOptions, TEAM_ARTIFACT_SCHEMA,
     TeamArtifactExportOptions, TeamArtifactExportReport, TeamArtifactImportOptions,
     TeamArtifactImportReport, VAULT_EXPORT_ZST_NAME, export_team_artifact, import_team_artifact,
-    lower_cbm_sqlite,
+    lower_cbm_sqlite, verify_lowered_artifact,
 };
 use astrolabe_panel::{DEFAULT_PANEL_VERSION, PanelInput, PanelResult, PanelSlotSpec, SlotRuntime};
 use astrolabe_provenance::{
