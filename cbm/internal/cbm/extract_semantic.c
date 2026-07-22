@@ -97,7 +97,9 @@ static void extract_throws_clause(CBMExtractCtx *ctx, TSNode node, const CBMLang
             strcmp(ck, "scoped_type_identifier") == 0) {
             char *exc = cbm_node_text(ctx->arena, child, ctx->source);
             if (exc && exc[0]) {
-                CBMThrow thr = {.exception_name = exc, .enclosing_func_qn = func_qn};
+                CBMThrow thr = {.exception_name = exc,
+                                .enclosing_func_qn = func_qn,
+                                .start_line = (int)ts_node_start_point(child).row + 1};
                 cbm_throws_push(&ctx->result->throws, ctx->arena, thr);
             }
         }
@@ -114,6 +116,7 @@ static void process_throw_node(CBMExtractCtx *ctx, TSNode node, const CBMLangSpe
             CBMThrow thr;
             thr.exception_name = exc_name;
             thr.enclosing_func_qn = cbm_enclosing_func_qn_cached(ctx, node);
+            thr.start_line = (int)ts_node_start_point(node).row + 1;
             cbm_throws_push(&ctx->result->throws, ctx->arena, thr);
         }
     }
@@ -256,6 +259,7 @@ static void try_emit_assignment_write(CBMExtractCtx *ctx, TSNode node, const cha
         rw.var_name = name;
         rw.is_write = true;
         rw.enclosing_func_qn = func_qn;
+        rw.start_line = (int)ts_node_start_point(node).row + 1;
         cbm_rw_push(&ctx->result->rw, ctx->arena, rw);
     }
 }
@@ -311,6 +315,7 @@ void handle_throws(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec, Wal
             CBMThrow thr;
             thr.exception_name = exc_name;
             thr.enclosing_func_qn = state->enclosing_func_qn;
+            thr.start_line = (int)ts_node_start_point(node).row + 1;
             cbm_throws_push(&ctx->result->throws, ctx->arena, thr);
         }
     }
@@ -333,6 +338,7 @@ void handle_readwrites(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec,
                 rw.var_name = name;
                 rw.is_write = true;
                 rw.enclosing_func_qn = state->enclosing_func_qn;
+                rw.start_line = (int)ts_node_start_point(node).row + 1;
                 cbm_rw_push(&ctx->result->rw, ctx->arena, rw);
             }
         }

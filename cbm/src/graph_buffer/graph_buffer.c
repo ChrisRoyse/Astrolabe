@@ -28,14 +28,15 @@ enum {
 #include "sqlite_writer.h"
 #include "foundation/hash_table.h"
 #include "foundation/compat.h"
-#include "foundation/str_util.h" /* cbm_utf8_sanitize — #503 dump UTF-8 write contract */
 #include "foundation/compat_fs.h" /* cbm_unlink — #579 fail-closed torn-dump removal */
 #include "foundation/log.h"
 #include "foundation/dyn_array.h"
 #include "foundation/profile.h"
 #include "foundation/mem.h"
+#include "foundation/sha256.h"
 #include <sqlite3.h>
 
+#include <limits.h>
 #include <stdatomic.h>
 #include <stdint.h> // int64_t
 #include <stdio.h>
@@ -47,6 +48,141 @@ static inline void *intptr_to_ptr(intptr_t v) {
     void *p;
     memcpy(&p, &v, sizeof(p));
     return p;
+}
+
+#define AMBIGUOUS_QN intptr_to_ptr(1)
+
+static void hash_frame(cbm_sha256_ctx *ctx, const void *data, size_t len) {
+    uint8_t n[8];
+    uint64_t value = (uint64_t)len;
+    for (int i = 0; i < 8; i++) {
+        n[i] = (uint8_t)(value >> (i * 8));
+    }
+    cbm_sha256_update(ctx, n, sizeof(n));
+    if (len > 0) {
+        cbm_sha256_update(ctx, data, len);
+    }
+}
+
+static void hash_u64(cbm_sha256_ctx *ctx, uint64_t value) {
+    uint8_t bytes[8];
+    for (int i = 0; i < 8; i++) {
+        bytes[i] = (uint8_t)(value >> (i * 8));
+    }
+    cbm_sha256_update(ctx, bytes, sizeof(bytes));
+}
+
+static char *sha256_hex_alloc(const uint8_t *bytes, size_t len) {
+    cbm_sha256_ctx ctx;
+    uint8_t digest[CBM_SHA256_DIGEST_LEN];
+    char *hex = malloc(CBM_SHA256_HEX_LEN + 1);
+    if (!hex) {
+        return NULL;
+    }
+    cbm_sha256_init(&ctx);
+    if (len > 0) {
+        cbm_sha256_update(&ctx, bytes, len);
+    }
+    cbm_sha256_final(&ctx, digest);
+    static const char digits[] = "0123456789abcdef";
+    for (size_t i = 0; i < sizeof(digest); i++) {
+        hex[i * 2] = digits[digest[i] >> 4];
+        hex[i * 2 + 1] = digits[digest[i] & 15];
+    }
+    hex[CBM_SHA256_HEX_LEN] = '\0';
+    return hex;
+}
+
+static char *make_atom_id(const char *project, const char *label, const char *name,
+                          const char *qualified_name, const char *file_path, int start_line,
+                          int end_line, bool source_present, const uint8_t *source_bytes,
+                          size_t source_len, uint64_t start_byte, uint64_t end_byte) {
+    cbm_sha256_ctx ctx;
+    uint8_t digest[CBM_SHA256_DIGEST_LEN];
+    char *hex = malloc(CBM_SHA256_HEX_LEN + 1);
+    if (!hex) {
+        return NULL;
+    }
+    cbm_sha256_init(&ctx);
+    const char *parts[] = {"astrolabe.cbm.atom.v2", project ? project : "", label ? label : "",
+                           name ? name : "", qualified_name ? qualified_name : "",
+                           file_path ? file_path : ""};
+    for (size_t i = 0; i < sizeof(parts) / sizeof(parts[0]); i++) {
+        hash_frame(&ctx, parts[i], strlen(parts[i]));
+    }
+    const uint8_t present = source_present ? 1 : 0;
+    hash_frame(&ctx, &present, sizeof(present));
+    hash_frame(&ctx, source_bytes, source_len);
+    hash_u64(&ctx, (uint64_t)(int64_t)start_line);
+    hash_u64(&ctx, (uint64_t)(int64_t)end_line);
+    hash_u64(&ctx, start_byte);
+    hash_u64(&ctx, end_byte);
+    cbm_sha256_final(&ctx, digest);
+    static const char digits[] = "0123456789abcdef";
+    for (size_t i = 0; i < sizeof(digest); i++) {
+        hex[i * 2] = digits[digest[i] >> 4];
+        hex[i * 2 + 1] = digits[digest[i] & 15];
+    }
+    hex[CBM_SHA256_HEX_LEN] = '\0';
+    return hex;
+}
+
+static bool valid_properties_object(const char *properties_json) {
+    const char *json = properties_json ? properties_json : "{}";
+    yyjson_doc *doc = yyjson_read(json, strlen(json), 0);
+    if (!doc) {
+        return false;
+    }
+    bool valid = yyjson_is_obj(yyjson_doc_get_root(doc));
+    yyjson_doc_free(doc);
+    return valid;
+}
+
+static bool valid_utf8_text(const char *text) {
+    if (!text) {
+        return true;
+    }
+    const unsigned char *p = (const unsigned char *)text;
+    size_t remaining = strlen(text);
+    while (remaining > 0) {
+        if (*p <= 0x7f) {
+            p++;
+            remaining--;
+        } else if (remaining >= 2 && *p >= 0xc2 && *p <= 0xdf &&
+                   (p[1] & 0xc0) == 0x80) {
+            p += 2;
+            remaining -= 2;
+        } else if (remaining >= 3 && *p == 0xe0 && p[1] >= 0xa0 && p[1] <= 0xbf &&
+                   (p[2] & 0xc0) == 0x80) {
+            p += 3;
+            remaining -= 3;
+        } else if (remaining >= 3 &&
+                   ((*p >= 0xe1 && *p <= 0xec) || (*p >= 0xee && *p <= 0xef)) &&
+                   (p[1] & 0xc0) == 0x80 && (p[2] & 0xc0) == 0x80) {
+            p += 3;
+            remaining -= 3;
+        } else if (remaining >= 3 && *p == 0xed && p[1] >= 0x80 && p[1] <= 0x9f &&
+                   (p[2] & 0xc0) == 0x80) {
+            p += 3;
+            remaining -= 3;
+        } else if (remaining >= 4 && *p == 0xf0 && p[1] >= 0x90 && p[1] <= 0xbf &&
+                   (p[2] & 0xc0) == 0x80 && (p[3] & 0xc0) == 0x80) {
+            p += 4;
+            remaining -= 4;
+        } else if (remaining >= 4 && *p >= 0xf1 && *p <= 0xf3 &&
+                   (p[1] & 0xc0) == 0x80 &&
+                   (p[2] & 0xc0) == 0x80 && (p[3] & 0xc0) == 0x80) {
+            p += 4;
+            remaining -= 4;
+        } else if (remaining >= 4 && *p == 0xf4 && p[1] >= 0x80 && p[1] <= 0x8f &&
+                   (p[2] & 0xc0) == 0x80 && (p[3] & 0xc0) == 0x80) {
+            p += 4;
+            remaining -= 4;
+        } else {
+            return false;
+        }
+    }
+    return true;
 }
 
 /* ── Internal types ──────────────────────────────────────────────── */
@@ -74,8 +210,11 @@ struct cbm_gbuf {
      * pointer array reallocs (only the pointer array moves, not the nodes). */
     CBM_DYN_ARRAY(cbm_gbuf_node_t *) nodes;
 
-    /* Primary index: QN → cbm_gbuf_node_t* */
+    /* Stable atom identity is primary. QN is a non-unique lookup key: its
+     * value is either the sole node or the ambiguity sentinel. */
+    CBMHashTable *node_by_atom;
     CBMHashTable *node_by_qn;
+    _Atomic bool resolution_failed;
     /* Primary index: "id" string → cbm_gbuf_node_t* */
     /* Dense id → node array (ids are sequential from alloc_next_id, shared
      * with edges → holes where edges took ids). Replaces a hash table keyed
@@ -257,7 +396,10 @@ static void free_key_only(const char *key, void *value, void *ud) {
  * (pool-owned) — NOT freed here; the pool frees them once in cbm_gbuf_free. */
 static void free_node_strings(cbm_gbuf_node_t *n) {
     free(n->name);
+    free(n->atom_id);
     free(n->qualified_name);
+    free(n->source_bytes);
+    free(n->source_sha256);
     free(n->properties_json);
 }
 
@@ -342,7 +484,13 @@ static void cascade_delete_edges(cbm_gbuf_t *gb, CBMHashTable *deleted_set) {
 
 /* Register a node in primary (QN, ID) and secondary (label, name) indexes. */
 static void register_node_in_indexes(cbm_gbuf_t *gb, cbm_gbuf_node_t *node) {
-    cbm_ht_set(gb->node_by_qn, node->qualified_name, node);
+    cbm_ht_set(gb->node_by_atom, node->atom_id, node);
+    void *by_qn = cbm_ht_get(gb->node_by_qn, node->qualified_name);
+    if (!by_qn) {
+        cbm_ht_set(gb->node_by_qn, node->qualified_name, node);
+    } else if (by_qn != node) {
+        cbm_ht_set(gb->node_by_qn, node->qualified_name, AMBIGUOUS_QN);
+    }
 
     if (node->id >= gb->by_id_cap) {
         int64_t nc = gb->by_id_cap > 0 ? gb->by_id_cap : CBM_SZ_1K;
@@ -367,6 +515,24 @@ static void register_node_in_indexes(cbm_gbuf_t *gb, cbm_gbuf_node_t *node) {
     node_ptr_array_t *by_name =
         get_or_create_node_array(gb->nodes_by_name, node->name ? node->name : "");
     cbm_da_push(by_name, (const cbm_gbuf_node_t *)node);
+}
+
+static bool node_is_live(const cbm_gbuf_t *gb, const cbm_gbuf_node_t *node) {
+    return gb && node && node->atom_id && cbm_ht_get(gb->node_by_atom, node->atom_id) == node;
+}
+
+static void rebuild_qn_index(cbm_gbuf_t *gb) {
+    cbm_ht_free(gb->node_by_qn);
+    gb->node_by_qn = cbm_ht_create(CBM_SZ_256);
+    for (int i = 0; i < gb->nodes.count; i++) {
+        cbm_gbuf_node_t *node = gb->nodes.items[i];
+        if (!node_is_live(gb, node) || !node->qualified_name) {
+            continue;
+        }
+        void *existing = cbm_ht_get(gb->node_by_qn, node->qualified_name);
+        cbm_ht_set(gb->node_by_qn, node->qualified_name,
+                   existing && existing != node ? AMBIGUOUS_QN : node);
+    }
 }
 
 /* Push an edge pointer into a dynamic array (wraps macro to reduce CC contribution). */
@@ -413,6 +579,8 @@ static void rebuild_edge_secondary_indexes(cbm_gbuf_t *gb) {
 
 /* Release all lookup hash tables (used by dump after building arrays). */
 static void release_gbuf_indexes(cbm_gbuf_t *gb) {
+    cbm_ht_free(gb->node_by_atom);
+    gb->node_by_atom = NULL;
     cbm_ht_free(gb->node_by_qn);
     gb->node_by_qn = NULL;
     free(gb->by_id);
@@ -441,6 +609,13 @@ static void release_gbuf_indexes(cbm_gbuf_t *gb) {
 /* ── Lifecycle ──────────────────────────────────────────────────── */
 
 cbm_gbuf_t *cbm_gbuf_new(const char *project, const char *root_path) {
+    if (!project || !project[0] || !valid_utf8_text(project) || !valid_utf8_text(root_path)) {
+        cbm_log_error("gbuf.create_refused", "code", "CBM_GRAPH_IDENTITY_TEXT_INVALID",
+                      "project", project ? project : "", "message",
+                      "project or root identity is empty or not valid UTF-8", "remediation",
+                      "supply a non-empty UTF-8 project name and UTF-8 root path");
+        return NULL;
+    }
     cbm_gbuf_t *gb = calloc(CBM_ALLOC_ONE, sizeof(cbm_gbuf_t));
     if (!gb) {
         return NULL;
@@ -451,6 +626,7 @@ cbm_gbuf_t *cbm_gbuf_new(const char *project, const char *root_path) {
     gb->next_id = SKIP_ONE;
     gb->shared_ids = NULL;
 
+    gb->node_by_atom = cbm_ht_create(CBM_SZ_256);
     gb->node_by_qn = cbm_ht_create(CBM_SZ_256);
     gb->by_id = NULL;
     gb->by_id_cap = 0;
@@ -463,6 +639,17 @@ cbm_gbuf_t *cbm_gbuf_new(const char *project, const char *root_path) {
     gb->edges_by_type = cbm_ht_create(CBM_SZ_32);
 
     gb->intern_pool = cbm_ht_create(CBM_SZ_1K);
+
+    if (!gb->project || !gb->root_path || !gb->node_by_atom || !gb->node_by_qn ||
+        !gb->nodes_by_label || !gb->nodes_by_name || !gb->edge_by_key ||
+        !gb->edges_by_source_type || !gb->edges_by_target_type || !gb->edges_by_type ||
+        !gb->intern_pool) {
+        cbm_log_error("gbuf.create_failed", "code", "CBM_GRAPH_ALLOC_FAILED", "project",
+                      project, "message", "graph-buffer state could not be fully allocated",
+                      "remediation", "free memory or reduce repository size, then retry");
+        cbm_gbuf_free(gb);
+        return NULL;
+    }
 
     return gb;
 }
@@ -498,6 +685,9 @@ void cbm_gbuf_free(cbm_gbuf_t *gb) {
     cbm_da_free(&gb->edges);
 
     /* Free hash tables — may be NULL if already released by dump_to_sqlite */
+    if (gb->node_by_atom) {
+        cbm_ht_free(gb->node_by_atom);
+    }
     if (gb->node_by_qn) {
         cbm_ht_free(gb->node_by_qn);
     }
@@ -586,14 +776,14 @@ int cbm_gbuf_store_vector(cbm_gbuf_t *gb, int64_t node_id, const uint8_t *vector
     return 0;
 }
 
-/* Defined with the dump-array builders below; declared here so the token-vector
- * store (a source-derived semantic token, read as a String by the importer) is
- * sanitized to valid UTF-8 at its single population point (#503). */
-static char *gbuf_utf8_dup(const char *s);
-
 int cbm_gbuf_store_token_vector(cbm_gbuf_t *gb, const char *token, const uint8_t *vector,
                                 int vector_len, float idf) {
-    if (!gb || !token || !vector || vector_len <= 0) {
+    if (!gb || !token || !valid_utf8_text(token) || !vector || vector_len <= 0) {
+        cbm_log_error("gbuf.token_vector_refused", "code", "CBM_TOKEN_VECTOR_INPUT_INVALID",
+                      "message",
+                      "token vectors require valid UTF-8 text, non-empty vector bytes, and a "
+                      "live graph buffer",
+                      NULL);
         return GB_ERR;
     }
     enum { TV_INIT_CAP = 256, TV_GROW = 2 };
@@ -610,18 +800,24 @@ int cbm_gbuf_store_token_vector(cbm_gbuf_t *gb, const char *token, const uint8_t
     }
     uint8_t *vec_copy = malloc((size_t)vector_len);
     if (!vec_copy) {
+        cbm_log_error("gbuf.token_vector_alloc_failed", "code", "CBM_TOKEN_VECTOR_ALLOC_FAILED",
+                      "field", "vector", NULL);
         return GB_ERR;
     }
     memcpy(vec_copy, vector, (size_t)vector_len);
+    char *token_copy = heap_strdup(token);
+    if (!token_copy) {
+        free(vec_copy);
+        cbm_log_error("gbuf.token_vector_alloc_failed", "code", "CBM_TOKEN_VECTOR_ALLOC_FAILED",
+                      "field", "token", NULL);
+        return GB_ERR;
+    }
 
     int idx = gb->dump_token_vec_count;
     gb->dump_token_vecs[idx] = (CBMDumpTokenVec){
         .id = idx + SKIP_ONE, /* 1-based sequential ID */
         .project = gb->project,
-        /* #503: token is a source-derived semantic-corpus term the importer reads
-         * as a String; sanitize to valid UTF-8 (free-compatible with the prior
-         * strdup — both malloc'd, freed with free() in the token-vec cleanup). */
-        .token = gbuf_utf8_dup(token),
+        .token = token_copy,
         .vector = vec_copy,
         .vector_len = vector_len,
         .idf = idf,
@@ -651,137 +847,234 @@ void cbm_gbuf_set_next_id(cbm_gbuf_t *gb, int64_t next_id) {
 
 /* ── Node operations ─────────────────────────────────────────────── */
 
-int64_t cbm_gbuf_upsert_node(cbm_gbuf_t *gb, const char *label, const char *name,
-                             const char *qualified_name, const char *file_path, int start_line,
-                             int end_line, const char *properties_json) {
-    if (!gb || !qualified_name) {
+static bool same_atom_payload(const cbm_gbuf_node_t *node, const char *label, const char *name,
+                              const char *qualified_name, const char *file_path, int start_line,
+                              int end_line, bool source_present, const uint8_t *source_bytes,
+                              size_t source_len, uint64_t start_byte, uint64_t end_byte) {
+    return node && strcmp(node->label ? node->label : "", label ? label : "") == 0 &&
+           strcmp(node->name ? node->name : "", name ? name : "") == 0 &&
+           strcmp(node->qualified_name ? node->qualified_name : "",
+                  qualified_name ? qualified_name : "") == 0 &&
+           strcmp(node->file_path ? node->file_path : "", file_path ? file_path : "") == 0 &&
+           node->start_line == start_line && node->end_line == end_line &&
+           node->source_present == source_present && node->source_len == source_len &&
+           node->start_byte == start_byte && node->end_byte == end_byte &&
+           (source_len == 0 || memcmp(node->source_bytes, source_bytes, source_len) == 0);
+}
+
+static int64_t upsert_node_internal(cbm_gbuf_t *gb, const char *label, const char *name,
+                                    const char *qualified_name, const char *file_path,
+                                    int start_line, int end_line, bool source_present,
+                                    const uint8_t *source_bytes, size_t source_len,
+                                    uint64_t start_byte, uint64_t end_byte,
+                                    const char *properties_json) {
+    const char *json = properties_json ? properties_json : "{}";
+    if (!gb || !label || !label[0] || !name || !qualified_name || !qualified_name[0] ||
+        (source_present && source_len > 0 && !source_bytes) || end_byte < start_byte ||
+        (source_present && end_byte - start_byte != source_len) ||
+        (!source_present && (source_len != 0 || start_byte != 0 || end_byte != 0)) ||
+        !valid_utf8_text(label) || !valid_utf8_text(name) || !valid_utf8_text(qualified_name) ||
+        !valid_utf8_text(file_path) ||
+        !valid_properties_object(json)) {
+        if (gb) {
+            atomic_store(&gb->resolution_failed, true);
+        }
+        cbm_log_error("gbuf.node_refused", "code", "CBM_NODE_CANONICAL_INPUT_INVALID",
+                      "qualified_name", qualified_name ? qualified_name : "", "message",
+                      "node identity text, source span, or properties JSON is malformed",
+                      "remediation",
+                      "supply valid UTF-8 identity text, object JSON, and byte-exact end-exclusive source spans");
         return 0;
     }
 
-    /* Check if node already exists */
-    cbm_gbuf_node_t *existing = cbm_ht_get(gb->node_by_qn, qualified_name);
+    char *atom_id = make_atom_id(gb->project, label, name, qualified_name, file_path, start_line,
+                                 end_line, source_present, source_bytes, source_len, start_byte,
+                                 end_byte);
+    if (!atom_id) {
+        atomic_store(&gb->resolution_failed, true);
+        cbm_log_error("gbuf.node_alloc_failed", "code", "CBM_NODE_ATOM_ALLOC_FAILED", "message",
+                      "stable source atom allocation failed", "remediation",
+                      "free memory or reduce the indexed repository size, then retry");
+        return 0;
+    }
+
+    /* Exact source identity is the only upsert key. A matching atom may receive
+     * derived-property enrichment, but immutable identity/source fields never mutate. */
+    cbm_gbuf_node_t *existing = cbm_ht_get(gb->node_by_atom, atom_id);
     if (existing) {
-        /* Don't let a per-file "Module" def touch a structural directory node
-         * ("Project" root or "Folder"). In a directory-based-module language
-         * (Go/Java) a file's module_qn equals its directory QN: a root file →
-         * the project name (== the "Project" node's QN); a file in pkg/ →
-         * proj.pkg (== the "pkg/" Folder node's QN). Its always-emitted Module
-         * def collides here; the directory node is the package/module container
-         * and must keep its structural label AND its own name/file_path/range.
-         * Updating those in place set the shared node's file_path to whichever
-         * same-package file happened to be processed LAST (worker-order
-         * dependent) — the nondeterministic file attribution behind #787 — and
-         * left the Folder node exposed to delete-nodes-by-file on incremental
-         * reindex of that file. Skip the update entirely. (Both the sequential
-         * upsert and the parallel local-gbuf merge route through this function.) */
-        if (existing->label && label && strcmp(label, "Module") == 0 &&
-            (strcmp(existing->label, "Project") == 0 || strcmp(existing->label, "Folder") == 0)) {
-            return existing->id;
+        bool equal = same_atom_payload(existing, label, name, qualified_name, file_path, start_line,
+                                       end_line, source_present, source_bytes, source_len, start_byte,
+                                       end_byte);
+        free(atom_id);
+        if (!equal) {
+            atomic_store(&gb->resolution_failed, true);
+            cbm_log_error("gbuf.atom_collision", "code", "CBM_NODE_ATOM_COLLISION",
+                          "qualified_name", qualified_name, "message",
+                          "one stable atom resolved to unequal canonical payloads", "remediation",
+                          "preserve this store and report the colliding canonical inputs");
+            return 0;
         }
-        /* Same-QN arrival: distinct source entities can share a QN (C: a
-         * struct, a function and a macro with one name), and the same entity
-         * can be re-upserted with fresh content. The old code let the LAST
-         * arrival overwrite — under parallel extraction the merge order
-         * varies run to run, so WHICH entity survived flickered (xfs:
-         * Function-node count 4998 vs 5015 across two runs) and every
-         * order-sensitive consumer downstream inherited it. Pick the
-         * survivor by a canonical CONTENT rule instead, a pure function of
-         * the two candidates: smallest file_path, then LARGEST start_line,
-         * then largest name/label (a mixed-direction composite is still a
-         * total order, so the pick is commutative and scheduling-free).
-         * Line-descending within a file keeps the classic upsert contract —
-         * a later definition in the same file (macro redefinition, refresh
-         * of the same entity with new content) replaces the earlier one,
-         * deterministically, because intra-file arrival order is fixed. A
-         * full tie is the same entity re-upserted → refresh in place.
-         * Kind-disambiguated QNs (the real cure) remain a follow-up. */
-        int c = strcmp(file_path ? file_path : "", existing->file_path ? existing->file_path : "");
-        if (c == 0) {
-            c = existing->start_line - start_line;
+        char *new_props = heap_strdup(json);
+        if (!new_props) {
+            atomic_store(&gb->resolution_failed, true);
+            cbm_log_error("gbuf.node_alloc_failed", "code", "CBM_NODE_PROPERTIES_ALLOC_FAILED",
+                          "qualified_name", qualified_name, "message",
+                          "same-atom property enrichment allocation failed", "remediation",
+                          "free memory or reduce the indexed repository size, then retry");
+            return 0;
         }
-        if (c == 0) {
-            c = strcmp(existing->name ? existing->name : "", name ? name : "");
-        }
-        if (c == 0) {
-            c = strcmp(existing->label ? existing->label : "", label ? label : "");
-        }
-        if (c > 0) {
-            return existing->id; /* existing entity is the canonical winner */
-        }
-        /* Update in-place. name/properties are strdup'd BEFORE freeing old ones
-         * (callers may pass existing->name as an argument). label/file_path are
-         * interned: gb_intern returns a stable pool pointer (idempotent even when
-         * label == existing->label), so the old value is replaced, never freed.
-         * When the surviving label/name changes, keep the secondary indexes
-         * consistent (the old code left the node listed under its ORIGINAL
-         * label/name — cbm_gbuf_find_by_label/name then missed or mis-listed it,
-         * which is how the flickering Function set reached the semantic pass). */
-        char *new_name = heap_strdup(name);
-        char *new_props = properties_json ? heap_strdup(properties_json) : NULL;
-        const char *new_label_interned = gb_intern(gb, label);
-        bool label_changed = !existing->label || !new_label_interned ||
-                             strcmp(existing->label, new_label_interned) != 0;
-        bool name_changed = !existing->name || !new_name || strcmp(existing->name, new_name) != 0;
-        if (label_changed) {
-            remove_node_from_ptr_array(
-                cbm_ht_get(gb->nodes_by_label, existing->label ? existing->label : ""),
-                existing->id);
-        }
-        if (name_changed) {
-            remove_node_from_ptr_array(
-                cbm_ht_get(gb->nodes_by_name, existing->name ? existing->name : ""), existing->id);
-        }
-        existing->label = (char *)new_label_interned;
-        free(existing->name);
-        existing->name = new_name;
-        existing->file_path = (char *)gb_intern(gb, file_path);
-        existing->start_line = start_line;
-        existing->end_line = end_line;
-        if (new_props) {
-            free(existing->properties_json);
-            existing->properties_json = new_props;
-        }
-        if (label_changed) {
-            node_ptr_array_t *by_label = get_or_create_node_array(
-                gb->nodes_by_label, existing->label ? existing->label : "");
-            cbm_da_push(by_label, (const cbm_gbuf_node_t *)existing);
-        }
-        if (name_changed) {
-            node_ptr_array_t *by_name =
-                get_or_create_node_array(gb->nodes_by_name, existing->name ? existing->name : "");
-            cbm_da_push(by_name, (const cbm_gbuf_node_t *)existing);
-        }
+        free(existing->properties_json);
+        existing->properties_json = new_props;
         return existing->id;
     }
 
-    /* Heap-allocate a new node (pointer stays stable across array growth) */
     cbm_gbuf_node_t *node = calloc(CBM_ALLOC_ONE, sizeof(cbm_gbuf_node_t));
     if (!node) {
+        free(atom_id);
+        atomic_store(&gb->resolution_failed, true);
+        cbm_log_error("gbuf.node_alloc_failed", "code", "CBM_NODE_ALLOC_FAILED", "message",
+                      "graph node allocation failed", "remediation",
+                      "free memory or reduce the indexed repository size, then retry");
         return 0;
     }
 
-    int64_t id = alloc_next_id(gb);
-    node->id = id;
     node->label = (char *)gb_intern(gb, label);
     node->name = heap_strdup(name);
+    node->atom_id = atom_id;
     node->qualified_name = heap_strdup(qualified_name);
     node->file_path = (char *)gb_intern(gb, file_path);
     node->start_line = start_line;
     node->end_line = end_line;
-    node->properties_json = heap_strdup(properties_json);
+    node->source_present = source_present;
+    node->source_len = source_len;
+    node->start_byte = start_byte;
+    node->end_byte = end_byte;
+    node->properties_json = heap_strdup(json);
+    if (source_present) {
+        node->source_sha256 = sha256_hex_alloc(source_bytes, source_len);
+        if (source_len > 0) {
+            node->source_bytes = malloc(source_len);
+            if (node->source_bytes) {
+                memcpy(node->source_bytes, source_bytes, source_len);
+            }
+        }
+    }
+    if (!node->label || !node->name || !node->qualified_name || !node->file_path ||
+        !node->properties_json || (source_present && !node->source_sha256) ||
+        (source_len > 0 && !node->source_bytes)) {
+        free_node_strings(node);
+        free(node);
+        atomic_store(&gb->resolution_failed, true);
+        cbm_log_error("gbuf.node_alloc_failed", "code", "CBM_NODE_FIELDS_ALLOC_FAILED",
+                      "qualified_name", qualified_name, "message",
+                      "one or more graph-node fields could not be retained", "remediation",
+                      "free memory or reduce the indexed repository size, then retry");
+        return 0;
+    }
 
-    /* Store pointer in array and register in all indexes */
+    node->id = alloc_next_id(gb);
     cbm_da_push(&gb->nodes, node);
     register_node_in_indexes(gb, node);
+    return node->id;
+}
 
-    return id;
+int64_t cbm_gbuf_upsert_node(cbm_gbuf_t *gb, const char *label, const char *name,
+                             const char *qualified_name, const char *file_path, int start_line,
+                             int end_line, const char *properties_json) {
+    return upsert_node_internal(gb, label, name, qualified_name, file_path, start_line, end_line,
+                                false, NULL, 0, 0, 0, properties_json);
+}
+
+int64_t cbm_gbuf_upsert_source_node(cbm_gbuf_t *gb, const char *label, const char *name,
+                                    const char *qualified_name, const char *file_path,
+                                    int start_line, int end_line, const uint8_t *source_bytes,
+                                    size_t source_len, uint64_t start_byte, uint64_t end_byte,
+                                    const char *properties_json) {
+    return upsert_node_internal(gb, label, name, qualified_name, file_path, start_line, end_line,
+                                true, source_bytes, source_len, start_byte, end_byte,
+                                properties_json);
+}
+
+const cbm_gbuf_node_t *cbm_gbuf_find_source_node(
+    const cbm_gbuf_t *gb, const char *label, const char *name, const char *qualified_name,
+    const char *file_path, int start_line, int end_line, const uint8_t *source_bytes,
+    size_t source_len, uint64_t start_byte, uint64_t end_byte) {
+    if (!gb || !label || !name || !qualified_name || (source_len > 0 && !source_bytes) ||
+        end_byte < start_byte || end_byte - start_byte != source_len) {
+        return NULL;
+    }
+    char *atom_id = make_atom_id(gb->project, label, name, qualified_name, file_path, start_line,
+                                 end_line, true, source_bytes, source_len, start_byte, end_byte);
+    if (!atom_id) {
+        atomic_store(&((cbm_gbuf_t *)gb)->resolution_failed, true);
+        return NULL;
+    }
+    const cbm_gbuf_node_t *node = cbm_ht_get(gb->node_by_atom, atom_id);
+    free(atom_id);
+    return node;
+}
+
+const cbm_gbuf_node_t *cbm_gbuf_find_by_atom_id(const cbm_gbuf_t *gb, const char *atom_id) {
+    if (!gb || !atom_id || !atom_id[0]) {
+        return NULL;
+    }
+    return cbm_ht_get(gb->node_by_atom, atom_id);
+}
+
+bool cbm_gbuf_resolution_failed(const cbm_gbuf_t *gb) {
+    return gb && atomic_load(&gb->resolution_failed);
 }
 
 const cbm_gbuf_node_t *cbm_gbuf_find_by_qn(const cbm_gbuf_t *gb, const char *qn) {
     if (!gb || !qn) {
         return NULL;
     }
-    return cbm_ht_get(gb->node_by_qn, qn);
+    void *node = cbm_ht_get(gb->node_by_qn, qn);
+    if (node == AMBIGUOUS_QN) {
+        atomic_store(&((cbm_gbuf_t *)gb)->resolution_failed, true);
+        cbm_log_error("gbuf.qn_resolution_ambiguous", "code", "CBM_NODE_QN_AMBIGUOUS",
+                      "qualified_name", qn, "message",
+                      "qualified name resolves to multiple stable source atoms", "remediation",
+                      "resolve by atom_id, exact signature, or source location before persistence");
+        return NULL;
+    }
+    return node;
+}
+
+const cbm_gbuf_node_t *cbm_gbuf_find_by_qn_location(const cbm_gbuf_t *gb, const char *qn,
+                                                    const char *file_path, int line) {
+    if (!gb || !qn || !file_path || line <= 0) {
+        return NULL;
+    }
+
+    const cbm_gbuf_node_t *match = NULL;
+    int match_count = 0;
+    for (int i = 0; i < gb->nodes.count; i++) {
+        const cbm_gbuf_node_t *node = gb->nodes.items[i];
+        if (!node_is_live(gb, node) || !node->qualified_name || !node->file_path ||
+            strcmp(node->qualified_name, qn) != 0 || strcmp(node->file_path, file_path) != 0 ||
+            node->start_line <= 0 || node->end_line < node->start_line ||
+            line < node->start_line || line > node->end_line) {
+            continue;
+        }
+        match = node;
+        match_count++;
+    }
+
+    if (match_count > 1) {
+        char line_buf[CBM_SZ_32];
+        char count_buf[CBM_SZ_32];
+        snprintf(line_buf, sizeof(line_buf), "%d", line);
+        snprintf(count_buf, sizeof(count_buf), "%d", match_count);
+        atomic_store(&((cbm_gbuf_t *)gb)->resolution_failed, true);
+        cbm_log_error("gbuf.location_resolution_ambiguous", "code",
+                      "CBM_NODE_LOCATION_AMBIGUOUS", "qualified_name", qn, "file_path",
+                      file_path, "line", line_buf, "candidate_count", count_buf, "message",
+                      "source location resolves to multiple stable atoms", "remediation",
+                      "resolve by atom_id or an exact byte span before persistence");
+        return NULL;
+    }
+    return match;
 }
 
 const cbm_gbuf_node_t *cbm_gbuf_find_by_id(const cbm_gbuf_t *gb, int64_t id) {
@@ -824,8 +1117,7 @@ int cbm_gbuf_find_by_name(const cbm_gbuf_t *gb, const char *name, const cbm_gbuf
 }
 
 int cbm_gbuf_node_count(const cbm_gbuf_t *gb) {
-    /* Use QN hash table count since it's authoritative (handles deletes) */
-    return gb ? (int)cbm_ht_count(gb->node_by_qn) : 0;
+    return gb ? (int)cbm_ht_count(gb->node_by_atom) : 0;
 }
 
 int cbm_gbuf_delete_by_label(cbm_gbuf_t *gb, const char *label) {
@@ -848,7 +1140,7 @@ int cbm_gbuf_delete_by_label(cbm_gbuf_t *gb, const char *label) {
         cbm_ht_set(deleted_set, strdup(id_buf), intptr_to_ptr(SKIP_ONE));
 
         /* Remove from primary indexes */
-        cbm_ht_delete(gb->node_by_qn, n->qualified_name);
+        cbm_ht_delete(gb->node_by_atom, n->atom_id);
         if (n->id >= 0 && n->id < gb->by_id_cap) {
             gb->by_id[n->id] = NULL;
         }
@@ -856,6 +1148,7 @@ int cbm_gbuf_delete_by_label(cbm_gbuf_t *gb, const char *label) {
 
     /* Clear the label array */
     cbm_da_clear(arr);
+    rebuild_qn_index(gb);
 
     /* Cascade-delete edges referencing deleted nodes */
     cascade_delete_edges(gb, deleted_set);
@@ -881,7 +1174,7 @@ int cbm_gbuf_delete_by_file(cbm_gbuf_t *gb, const char *file_path) {
         if (!n->file_path || strcmp(n->file_path, file_path) != 0) {
             continue;
         }
-        if (!n->qualified_name || !cbm_ht_get(gb->node_by_qn, n->qualified_name)) {
+        if (!node_is_live(gb, n)) {
             continue;
         }
 
@@ -894,7 +1187,7 @@ int cbm_gbuf_delete_by_file(cbm_gbuf_t *gb, const char *file_path) {
         remove_node_from_ptr_array(cbm_ht_get(gb->nodes_by_name, n->name), n->id);
 
         /* Remove from primary indexes */
-        cbm_ht_delete(gb->node_by_qn, n->qualified_name);
+        cbm_ht_delete(gb->node_by_atom, n->atom_id);
         if (n->id >= 0 && n->id < gb->by_id_cap) {
             gb->by_id[n->id] = NULL;
         }
@@ -910,6 +1203,7 @@ int cbm_gbuf_delete_by_file(cbm_gbuf_t *gb, const char *file_path) {
         cbm_ht_free(deleted_set);
         return 0;
     }
+    rebuild_qn_index(gb);
 
     /* Cascade-delete edges referencing deleted nodes */
     cascade_delete_edges(gb, deleted_set);
@@ -965,7 +1259,8 @@ int cbm_gbuf_load_from_db(cbm_gbuf_t *gb, const char *db_path, const char *proje
     /* Load all nodes */
     if (sqlite3_prepare_v2(
             db,
-            "SELECT id, label, name, qualified_name, file_path, start_line, end_line, properties "
+            "SELECT id, label, name, qualified_name, file_path, start_line, end_line, properties, "
+            "atom_id, source_present, source_bytes, source_sha256, start_byte, end_byte "
             "FROM nodes WHERE project = ? ORDER BY id",
             CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
         free(old_to_new);
@@ -983,8 +1278,35 @@ int cbm_gbuf_load_from_db(cbm_gbuf_t *gb, const char *db_path, const char *proje
         int sl = sqlite3_column_int(stmt, GB_COL_5);
         int el = sqlite3_column_int(stmt, GB_COL_6);
         const char *props = (const char *)sqlite3_column_text(stmt, GB_COL_7);
+        const char *expected_atom = (const char *)sqlite3_column_text(stmt, 8);
+        bool source_present = sqlite3_column_int(stmt, 9) != 0;
+        const uint8_t *source_bytes = sqlite3_column_blob(stmt, 10);
+        int source_len = sqlite3_column_bytes(stmt, 10);
+        const char *expected_source_sha = (const char *)sqlite3_column_text(stmt, 11);
+        uint64_t start_byte = (uint64_t)sqlite3_column_int64(stmt, 12);
+        uint64_t end_byte = (uint64_t)sqlite3_column_int64(stmt, 13);
+        static const uint8_t empty_source = 0;
 
-        int64_t new_id = cbm_gbuf_upsert_node(gb, label, name, qn, fp, sl, el, props);
+        int64_t new_id =
+            source_present
+                ? cbm_gbuf_upsert_source_node(gb, label, name, qn, fp, sl, el,
+                                              source_bytes ? source_bytes : &empty_source,
+                                              (size_t)source_len, start_byte, end_byte, props)
+                : cbm_gbuf_upsert_node(gb, label, name, qn, fp, sl, el, props);
+        const cbm_gbuf_node_t *loaded = cbm_gbuf_find_by_id(gb, new_id);
+        if (!loaded || !loaded->atom_id || !expected_atom ||
+            strcmp(loaded->atom_id, expected_atom) != 0 ||
+            strcmp(loaded->source_sha256 ? loaded->source_sha256 : "",
+                   expected_source_sha ? expected_source_sha : "") != 0) {
+            cbm_log_error("gbuf.load_atom_mismatch", "code", "CBM_NODE_ATOM_ID_MISMATCH",
+                          "qualified_name", qn ? qn : "", "message",
+                          "persisted atom_id does not match immutable source facts",
+                          "remediation", "rebuild the SQLite store from the exact source bytes");
+            sqlite3_finalize(stmt);
+            free(old_to_new);
+            cbm_store_close(store);
+            return CBM_NOT_FOUND;
+        }
         if (new_id > 0 && old_id <= max_old_id) {
             old_to_new[old_id] = new_id;
         }
@@ -1027,7 +1349,7 @@ void cbm_gbuf_foreach_node(const cbm_gbuf_t *gb, cbm_gbuf_node_visitor_fn fn, vo
     }
     for (int i = 0; i < gb->nodes.count; i++) {
         const cbm_gbuf_node_t *n = gb->nodes.items[i];
-        if (n->qualified_name && cbm_ht_get(gb->node_by_qn, n->qualified_name)) {
+        if (node_is_live(gb, n)) {
             fn(n, userdata);
         }
     }
@@ -1202,85 +1524,31 @@ static void free_remap_entry(const char *key, void *val, void *ud) {
     free(val);
 }
 
-/* Handle QN collision: update dst node fields (src wins), record remap if IDs differ.
- * label/file_path are re-interned into dst's pool (sn's pointers belong to src). */
+/* Handle an exact-atom duplicate. Identity-bearing fields are immutable; only
+ * derived properties may be refreshed, and unequal payloads poison persistence. */
 static void merge_update_existing(cbm_gbuf_t *dst, cbm_gbuf_node_t *existing,
                                   const cbm_gbuf_node_t *sn, CBMHashTable **remap) {
-    /* Same guard as cbm_gbuf_upsert_node: a per-file "Module" def coming from a
-     * worker-local gbuf must not touch the structural directory node ("Project"
-     * root or "Folder") that shares its QN in a directory-based-module language
-     * (Java/Go). pass_structure seeds Folder/Project nodes on the MAIN gbuf
-     * before the parallel extract, so every worker's always-emitted Module def
-     * for that package collides here; unconditional "src wins" relabelled the
-     * directory node to Module and set its file_path to whichever worker merged
-     * LAST — the nondeterministic USAGE-source misattribution of #787. Keep the
-     * structural node intact; the ID remap below still redirects the worker's
-     * edges onto the canonical node. */
-    bool module_on_container =
-        existing->label && sn->label && strcmp(sn->label, "Module") == 0 &&
-        (strcmp(existing->label, "Project") == 0 || strcmp(existing->label, "Folder") == 0);
-    if (!module_on_container) {
-        /* Canonical collision winner (determinism) — mirrors
-         * cbm_gbuf_upsert_node exactly. Distinct source entities can share a
-         * QN (C: struct/function/macro with one name); unconditional "src
-         * wins" made the survivor depend on worker merge order, flickering
-         * the node set (and every downstream consumer) run to run. Winner =
-         * smallest file_path, then LARGEST start_line, then largest
-         * name/label — one total order, commutative, scheduling-free; a full
-         * tie is the same entity → refresh from src. */
-        int c = strcmp(sn->file_path ? sn->file_path : "",
-                       existing->file_path ? existing->file_path : "");
-        if (c == 0) {
-            c = existing->start_line - sn->start_line;
-        }
-        if (c == 0) {
-            c = strcmp(existing->name ? existing->name : "", sn->name ? sn->name : "");
-        }
-        if (c == 0) {
-            c = strcmp(existing->label ? existing->label : "", sn->label ? sn->label : "");
-        }
-        bool sn_wins = c <= 0;
-        if (sn_wins) {
-            /* Keep the secondary indexes consistent when the surviving
-             * label/name changes (the old code left the node listed under its
-             * original label/name, so find_by_label/name mis-listed it). */
-            const char *new_label = gb_intern(dst, sn->label);
-            bool label_changed =
-                !existing->label || !new_label || strcmp(existing->label, new_label) != 0;
-            bool name_changed =
-                !existing->name || !sn->name || strcmp(existing->name, sn->name) != 0;
-            if (label_changed) {
-                remove_node_from_ptr_array(
-                    cbm_ht_get(dst->nodes_by_label, existing->label ? existing->label : ""),
-                    existing->id);
-            }
-            if (name_changed) {
-                remove_node_from_ptr_array(
-                    cbm_ht_get(dst->nodes_by_name, existing->name ? existing->name : ""),
-                    existing->id);
-            }
-            existing->label = (char *)new_label;
-            free(existing->name);
-            existing->name = heap_strdup(sn->name);
-            existing->file_path = (char *)gb_intern(dst, sn->file_path);
-            existing->start_line = sn->start_line;
-            existing->end_line = sn->end_line;
-            if (sn->properties_json) {
-                free(existing->properties_json);
-                existing->properties_json = heap_strdup(sn->properties_json);
-            }
-            if (label_changed) {
-                node_ptr_array_t *by_label = get_or_create_node_array(
-                    dst->nodes_by_label, existing->label ? existing->label : "");
-                cbm_da_push(by_label, (const cbm_gbuf_node_t *)existing);
-            }
-            if (name_changed) {
-                node_ptr_array_t *by_name = get_or_create_node_array(
-                    dst->nodes_by_name, existing->name ? existing->name : "");
-                cbm_da_push(by_name, (const cbm_gbuf_node_t *)existing);
-            }
-        }
+    if (!same_atom_payload(existing, sn->label, sn->name, sn->qualified_name, sn->file_path,
+                           sn->start_line, sn->end_line, sn->source_present, sn->source_bytes,
+                           sn->source_len, sn->start_byte, sn->end_byte)) {
+        atomic_store(&dst->resolution_failed, true);
+        cbm_log_error("gbuf.atom_collision", "code", "CBM_NODE_ATOM_COLLISION",
+                      "qualified_name", sn->qualified_name ? sn->qualified_name : "", "message",
+                      "worker atom resolved to unequal canonical payloads", "remediation",
+                      "preserve the inputs and report the colliding canonical frames");
+        return;
     }
+    char *new_props = heap_strdup(sn->properties_json ? sn->properties_json : "{}");
+    if (!new_props) {
+        atomic_store(&dst->resolution_failed, true);
+        cbm_log_error("gbuf.node_alloc_failed", "code", "CBM_NODE_PROPERTIES_ALLOC_FAILED",
+                      "qualified_name", sn->qualified_name ? sn->qualified_name : "", "message",
+                      "worker property merge allocation failed", "remediation",
+                      "free memory or reduce the indexed repository size, then retry");
+        return;
+    }
+    free(existing->properties_json);
+    existing->properties_json = new_props;
 
     if (sn->id != existing->id) {
         if (!*remap) {
@@ -1289,8 +1557,18 @@ static void merge_update_existing(cbm_gbuf_t *dst, cbm_gbuf_node_t *existing,
         char key[CBM_SZ_32];
         make_id_key(key, sizeof(key), sn->id);
         int64_t *val = malloc(sizeof(int64_t));
+        char *owned_key = strdup(key);
+        if (!*remap || !val || !owned_key) {
+            free(val);
+            free(owned_key);
+            atomic_store(&dst->resolution_failed, true);
+            cbm_log_error("gbuf.merge_alloc_failed", "code", "CBM_NODE_REMAP_ALLOC_FAILED",
+                          "message", "worker node-id remap allocation failed", "remediation",
+                          "free memory or reduce the indexed repository size, then retry");
+            return;
+        }
         *val = existing->id;
-        cbm_ht_set(*remap, strdup(key), val);
+        cbm_ht_set(*remap, owned_key, val);
     }
 }
 
@@ -1304,11 +1582,36 @@ static void merge_copy_new_node(cbm_gbuf_t *dst, const cbm_gbuf_node_t *sn) {
     node->id = sn->id;
     node->label = (char *)gb_intern(dst, sn->label);
     node->name = heap_strdup(sn->name);
+    node->atom_id = heap_strdup(sn->atom_id);
     node->qualified_name = heap_strdup(sn->qualified_name);
     node->file_path = (char *)gb_intern(dst, sn->file_path);
     node->start_line = sn->start_line;
     node->end_line = sn->end_line;
+    node->source_present = sn->source_present;
+    node->source_len = sn->source_len;
+    node->start_byte = sn->start_byte;
+    node->end_byte = sn->end_byte;
+    node->source_sha256 = heap_strdup(sn->source_sha256);
+    if (sn->source_len > 0) {
+        node->source_bytes = malloc(sn->source_len);
+        if (node->source_bytes) {
+            memcpy(node->source_bytes, sn->source_bytes, sn->source_len);
+        }
+    }
     node->properties_json = heap_strdup(sn->properties_json);
+
+    if (!node->label || !node->name || !node->atom_id || !node->qualified_name ||
+        !node->file_path || !node->properties_json ||
+        (node->source_present && !node->source_sha256) ||
+        (node->source_len > 0 && !node->source_bytes)) {
+        free_node_strings(node);
+        free(node);
+        atomic_store(&dst->resolution_failed, true);
+        cbm_log_error("gbuf.merge_alloc_failed", "code", "CBM_NODE_COPY_ALLOC_FAILED", "message",
+                      "worker node copy allocation failed", "remediation",
+                      "free memory or reduce the indexed repository size, then retry");
+        return;
+    }
 
     cbm_da_push(&dst->nodes, node);
     register_node_in_indexes(dst, node);
@@ -1349,6 +1652,13 @@ int cbm_gbuf_merge(cbm_gbuf_t *dst, cbm_gbuf_t *src) {
     if (!dst || !src) {
         return CBM_NOT_FOUND;
     }
+    if (atomic_load(&src->resolution_failed)) {
+        atomic_store(&dst->resolution_failed, true);
+        cbm_log_error("gbuf.merge_refused", "code", "CBM_SOURCE_WORKER_FAILED", "message",
+                      "a worker graph contains a canonical identity or source retention failure",
+                      "remediation", "inspect the earlier structured worker error and retry only after fixing its cause");
+        return CBM_NOT_FOUND;
+    }
     if (src->nodes.count == 0 && src->edges.count == 0) {
         return 0;
     }
@@ -1364,11 +1674,11 @@ int cbm_gbuf_merge(cbm_gbuf_t *dst, cbm_gbuf_t *src) {
         }
 
         /* Skip nodes deleted from QN index */
-        if (!cbm_ht_get(src->node_by_qn, sn->qualified_name)) {
+        if (!node_is_live(src, sn)) {
             continue;
         }
 
-        cbm_gbuf_node_t *existing = cbm_ht_get(dst->node_by_qn, sn->qualified_name);
+        cbm_gbuf_node_t *existing = cbm_ht_get(dst->node_by_atom, sn->atom_id);
         if (existing) {
             merge_update_existing(dst, existing, sn, &remap);
         } else {
@@ -1384,7 +1694,7 @@ int cbm_gbuf_merge(cbm_gbuf_t *dst, cbm_gbuf_t *src) {
         cbm_ht_free(remap);
     }
 
-    return 0;
+    return atomic_load(&dst->resolution_failed) ? CBM_NOT_FOUND : 0;
 }
 
 /* ── Dump / Flush ────────────────────────────────────────────────── */
@@ -1415,6 +1725,75 @@ static char *extract_prop_string(const char *props, const char *key_quoted, cons
     return out;
 }
 
+const cbm_gbuf_node_t *cbm_gbuf_find_successor_node(
+    const cbm_gbuf_t *gb, const char *qualified_name, const char *file_path, const char *label,
+    const char *name, const char *previous_properties_json) {
+    if (!gb || !qualified_name || !file_path || !label || !name || !previous_properties_json) {
+        return NULL;
+    }
+
+    char *previous_signature =
+        extract_prop_string(previous_properties_json, "\"signature\"", "signature");
+    const cbm_gbuf_node_t *only_basic = NULL;
+    const cbm_gbuf_node_t *only_signature = NULL;
+    int basic_count = 0;
+    int signature_count = 0;
+
+    for (int i = 0; i < gb->nodes.count; i++) {
+        const cbm_gbuf_node_t *node = gb->nodes.items[i];
+        if (!node_is_live(gb, node) || strcmp(node->qualified_name, qualified_name) != 0 ||
+            strcmp(node->file_path, file_path) != 0 || strcmp(node->label, label) != 0 ||
+            strcmp(node->name, name) != 0) {
+            continue;
+        }
+        only_basic = node;
+        basic_count++;
+        if (previous_signature) {
+            char *candidate_signature =
+                extract_prop_string(node->properties_json, "\"signature\"", "signature");
+            bool matches = candidate_signature &&
+                           strcmp(candidate_signature, previous_signature) == 0;
+            free(candidate_signature);
+            if (matches) {
+                only_signature = node;
+                signature_count++;
+            }
+        }
+    }
+
+    if (basic_count == 0) {
+        free(previous_signature);
+        return NULL; /* The old entity was deleted or renamed. */
+    }
+    if (previous_signature && signature_count == 1) {
+        free(previous_signature);
+        return only_signature;
+    }
+    if (!previous_signature && basic_count == 1) {
+        return only_basic;
+    }
+
+    bool ambiguous = signature_count > 1 || (!previous_signature && basic_count > 1);
+    char basic_buf[CBM_SZ_32];
+    char signature_buf[CBM_SZ_32];
+    snprintf(basic_buf, sizeof(basic_buf), "%d", basic_count);
+    snprintf(signature_buf, sizeof(signature_buf), "%d", signature_count);
+    atomic_store(&((cbm_gbuf_t *)gb)->resolution_failed, true);
+    cbm_log_error("gbuf.successor_resolution_failed", "code",
+                  ambiguous ? "CBM_NODE_SUCCESSOR_AMBIGUOUS"
+                            : "CBM_NODE_SUCCESSOR_SIGNATURE_CHANGED",
+                  "qualified_name", qualified_name, "file_path", file_path, "label", label,
+                  "name", name, "candidate_count", basic_buf, "signature_matches",
+                  signature_buf, "message",
+                  ambiguous
+                      ? "incremental successor locator resolves to multiple stable atoms"
+                      : "existing incremental successor candidates do not preserve the prior signature",
+                  "remediation",
+                  "run a clean re-index so every dependent source reference is re-resolved");
+    free(previous_signature);
+    return NULL;
+}
+
 static char *extract_url_path(const char *props) {
     return extract_prop_string(props, "\"url_path\"", "url_path");
 }
@@ -1437,36 +1816,10 @@ static int cmp_dump_vectors_by_id(const void *a, const void *b) {
     return (da > db) - (da < db);
 }
 
-/* #503: return a heap copy of `s` with every non-UTF-8 byte replaced by U+FFFD so
- * the dumped nodes-table text columns (name/qualified_name/file_path) are always
- * valid UTF-8 — the same write contract cbm_json_escape gives JSON properties
- * (#493), and the one the Rust vault importer's fail-closed rusqlite String
- * columns depend on (a single invalid byte otherwise makes it refuse the whole
- * repository). Sanitizing HERE, once, before the table record, every node index
- * (idx_nodes_name/idx_nodes_file/qn), the FTS backfill, and the row-sink all read
- * the field, keeps table and index byte-identical so the dumped DB's
- * integrity_check still holds. The bulk-dump SQLite page writer (sqlite_writer.c)
- * builds records as raw byte payloads and never passes through cbm_store_upsert_node,
- * so this is the enforcement point for that path. Returns an owned empty string for
- * NULL; every consumer already tolerates a NULL field, so an OOM returning NULL only
- * degrades that one field to empty. */
-static char *gbuf_utf8_dup(const char *s) {
-    if (!s) {
-        char *empty = malloc(1);
-        if (empty) {
-            empty[0] = '\0';
-        }
-        return empty;
-    }
-    size_t len = strlen(s);
-    /* U+FFFD encodes as three bytes — the largest expansion of any single byte. */
-    size_t cap = len * 3 + 1;
-    char *out = malloc(cap);
-    if (!out) {
-        return NULL;
-    }
-    cbm_utf8_sanitize(out, (int)cap, s);
-    return out;
+static int cmp_nodes_by_atom_id(const void *a, const void *b) {
+    const cbm_gbuf_node_t *left = *(const cbm_gbuf_node_t *const *)a;
+    const cbm_gbuf_node_t *right = *(const cbm_gbuf_node_t *const *)b;
+    return strcmp(left->atom_id, right->atom_id);
 }
 
 static CBMDumpNode *build_dump_nodes(cbm_gbuf_t *gb, int live_count, int64_t *temp_to_final,
@@ -1489,46 +1842,93 @@ static CBMDumpNode *build_dump_nodes(cbm_gbuf_t *gb, int live_count, int64_t *te
         *src_out = NULL;
         return NULL;
     }
-    /* Parallel gbuf-node pointers so a streamed partition can free its heavy
-     * properties_json after the rows are persisted. NULL on OOM disables the
-     * per-partition free (the dump still succeeds). */
+    /* The exact atom order is the persistent ID order. It must not inherit
+     * parallel extraction/merge scheduling. This array also lets streamed
+     * partitions release their source properties after persistence. */
     cbm_gbuf_node_t **src = malloc(cap * sizeof(cbm_gbuf_node_t *));
-    int idx = 0;
+    if (!src) {
+        free(dump_nodes);
+        cbm_log_error("gbuf.dump.node_order_alloc_failed", "code",
+                      "CBM_DUMP_NODE_ORDER_ALLOC_FAILED", "operation", "build_dump_nodes",
+                      "message", "graph dump could not allocate its deterministic atom order",
+                      "remediation", "free memory or reduce repository size, then retry");
+        *out_count = 0;
+        *src_out = NULL;
+        return NULL;
+    }
 
+    int idx = 0;
     for (int i = 0; i < gb->nodes.count; i++) {
         cbm_gbuf_node_t *n = gb->nodes.items[i];
-        if (!n->qualified_name || !cbm_ht_get(gb->node_by_qn, n->qualified_name)) {
-            continue;
+        if (node_is_live(gb, n)) {
+            src[idx++] = n;
         }
+    }
+    qsort(src, (size_t)idx, sizeof(cbm_gbuf_node_t *), cmp_nodes_by_atom_id);
 
-        int64_t final_id = idx + SKIP_ONE; /* 1-based sequential */
+    for (int row = 0; row < idx; row++) {
+        if (src[row]->source_len > INT_MAX) {
+            cbm_log_error("gbuf.dump.source_too_large", "code", "CBM_SOURCE_BLOB_TOO_LARGE",
+                          "qualified_name", src[row]->qualified_name, "message",
+                          "one exact source payload exceeds the SQLite writer ABI", "remediation",
+                          "reject files above INT_MAX bytes before extraction");
+            free(src);
+            free(dump_nodes);
+            atomic_store(&gb->resolution_failed, true);
+            *out_count = 0;
+            *src_out = NULL;
+            return NULL;
+        }
+    }
+
+    for (int row = 0; row < idx; row++) {
+        cbm_gbuf_node_t *n = src[row];
+        int64_t final_id = row + SKIP_ONE; /* 1-based sequential */
         if (n->id < max_temp_id) {
             temp_to_final[n->id] = final_id;
         }
 
         const char *fp = n->file_path ? n->file_path : "";
         const char *props = n->properties_json ? n->properties_json : "{}";
-        /* #503: name/qualified_name/file_path are raw parser-derived buffers that
-         * the bulk SQLite page writer binds without cbm_json_escape; sanitize them
-         * to valid UTF-8 in owned copies (freed in free_dump_resources) so the
-         * dumped nodes table cannot make the Rust importer refuse the repo. label
-         * and project are cbm-internal constants / caller-supplied ASCII, and
-         * properties are already UTF-8-safe via cbm_json_escape (#493). */
-        dump_nodes[idx] = (CBMDumpNode){
+        /* Identity text was validated before atom hashing. Dump exact copies:
+         * changing even one byte here would sever atom_id from its canonical input. */
+        dump_nodes[row] = (CBMDumpNode){
             .id = final_id,
             .project = gb->project,
             .label = n->label,
-            .name = gbuf_utf8_dup(n->name),
-            .qualified_name = gbuf_utf8_dup(n->qualified_name),
-            .file_path = gbuf_utf8_dup(fp),
+            .name = heap_strdup(n->name ? n->name : ""),
+            .atom_id = n->atom_id,
+            .qualified_name = heap_strdup(n->qualified_name ? n->qualified_name : ""),
+            .file_path = heap_strdup(fp),
             .start_line = n->start_line,
             .end_line = n->end_line,
+            .source_present = n->source_present ? 1 : 0,
+            .source_bytes = n->source_bytes,
+            .source_len = n->source_len,
+            .source_sha256 = n->source_sha256 ? n->source_sha256 : "",
+            .start_byte = n->start_byte,
+            .end_byte = n->end_byte,
             .properties = props,
         };
-        if (src) {
-            src[idx] = n;
+        if (!dump_nodes[row].name || !dump_nodes[row].qualified_name ||
+            !dump_nodes[row].file_path) {
+            cbm_log_error("gbuf.dump.identity_copy_failed", "code",
+                          "CBM_DUMP_IDENTITY_COPY_ALLOC_FAILED", "qualified_name",
+                          n->qualified_name ? n->qualified_name : "", "message",
+                          "exact identity text could not be copied into the dump row",
+                          "remediation", "free memory or reduce repository size, then retry");
+            for (int completed = 0; completed <= row; completed++) {
+                free((void *)dump_nodes[completed].name);
+                free((void *)dump_nodes[completed].qualified_name);
+                free((void *)dump_nodes[completed].file_path);
+            }
+            free(src);
+            free(dump_nodes);
+            atomic_store(&gb->resolution_failed, true);
+            *out_count = 0;
+            *src_out = NULL;
+            return NULL;
         }
-        idx++;
     }
 
     *out_count = idx;
@@ -1698,10 +2098,17 @@ static int emit_row_sink_nodes(cbm_gbuf_t *gb, const CBMDumpNode *nodes, int nod
             .project = n->project,
             .label = n->label,
             .name = n->name,
+            .atom_id = n->atom_id,
             .qualified_name = n->qualified_name,
             .file_path = n->file_path ? n->file_path : "",
             .start_line = n->start_line,
             .end_line = n->end_line,
+            .source_present = n->source_present,
+            .source_bytes = n->source_bytes,
+            .source_len = n->source_len,
+            .source_sha256 = n->source_sha256 ? n->source_sha256 : "",
+            .start_byte = n->start_byte,
+            .end_byte = n->end_byte,
             .properties_json = n->properties ? n->properties : "{}",
         };
         if (gb->row_node_sink(&row, gb->row_sink_ctx) != 0) {
@@ -1740,7 +2147,7 @@ static int count_live_nodes(cbm_gbuf_t *gb) {
     int count = 0;
     for (int i = 0; i < gb->nodes.count; i++) {
         cbm_gbuf_node_t *n = gb->nodes.items[i];
-        if (n->qualified_name && cbm_ht_get(gb->node_by_qn, n->qualified_name)) {
+        if (node_is_live(gb, n)) {
             count++;
         }
     }
@@ -1766,6 +2173,12 @@ static void release_and_remap_vectors(cbm_gbuf_t *gb, const int64_t *temp_to_fin
 
 int cbm_gbuf_dump_to_sqlite(cbm_gbuf_t *gb, const char *path) {
     if (!gb || !path) {
+        return CBM_NOT_FOUND;
+    }
+    if (atomic_load(&gb->resolution_failed)) {
+        cbm_log_error("gbuf.dump_refused", "code", "CBM_GRAPH_RESOLUTION_FAILED", "message",
+                      "an earlier canonical identity or reference-resolution operation failed; no store or row-sink mutation was attempted",
+                      "remediation", "inspect the preceding structured graph-buffer error");
         return CBM_NOT_FOUND;
     }
 
@@ -1928,6 +2341,12 @@ int cbm_gbuf_flush_to_store(cbm_gbuf_t *gb, cbm_store_t *store) {
     if (!gb || !store) {
         return CBM_NOT_FOUND;
     }
+    if (atomic_load(&gb->resolution_failed)) {
+        cbm_log_error("gbuf.flush_refused", "code", "CBM_GRAPH_RESOLUTION_FAILED", "message",
+                      "an earlier canonical identity or reference-resolution operation failed; no store mutation was attempted",
+                      "remediation", "inspect the preceding structured graph-buffer error");
+        return CBM_NOT_FOUND;
+    }
 
     /* Upsert project */
     cbm_store_upsert_project(store, gb->project, gb->root_path);
@@ -1951,7 +2370,7 @@ int cbm_gbuf_flush_to_store(cbm_gbuf_t *gb, cbm_store_t *store) {
         cbm_gbuf_node_t *n = gb->nodes.items[i];
 
         /* Skip if deleted from QN index */
-        if (!n->qualified_name || !cbm_ht_get(gb->node_by_qn, n->qualified_name)) {
+        if (!node_is_live(gb, n)) {
             continue;
         }
 
@@ -1959,10 +2378,17 @@ int cbm_gbuf_flush_to_store(cbm_gbuf_t *gb, cbm_store_t *store) {
             .project = gb->project,
             .label = n->label,
             .name = n->name,
+            .atom_id = n->atom_id,
             .qualified_name = n->qualified_name,
             .file_path = n->file_path,
             .start_line = n->start_line,
             .end_line = n->end_line,
+            .source_present = n->source_present,
+            .source_bytes = n->source_bytes,
+            .source_len = n->source_len,
+            .source_sha256 = n->source_sha256,
+            .start_byte = n->start_byte,
+            .end_byte = n->end_byte,
             .properties_json = n->properties_json,
         };
         int64_t real_id = cbm_store_upsert_node(store, &sn);
@@ -2002,6 +2428,12 @@ int cbm_gbuf_merge_into_store(cbm_gbuf_t *gb, cbm_store_t *store) {
     if (!gb || !store) {
         return CBM_NOT_FOUND;
     }
+    if (atomic_load(&gb->resolution_failed)) {
+        cbm_log_error("gbuf.merge_refused", "code", "CBM_GRAPH_RESOLUTION_FAILED", "message",
+                      "an earlier canonical identity or reference-resolution operation failed; no store mutation was attempted",
+                      "remediation", "inspect the preceding structured graph-buffer error");
+        return CBM_NOT_FOUND;
+    }
 
     /* Begin bulk mode — no project wipe */
     cbm_store_begin(store);
@@ -2013,7 +2445,7 @@ int cbm_gbuf_merge_into_store(cbm_gbuf_t *gb, cbm_store_t *store) {
     for (int i = 0; i < gb->nodes.count; i++) {
         cbm_gbuf_node_t *n = gb->nodes.items[i];
 
-        if (!n->qualified_name || !cbm_ht_get(gb->node_by_qn, n->qualified_name)) {
+        if (!node_is_live(gb, n)) {
             continue;
         }
 
@@ -2021,6 +2453,7 @@ int cbm_gbuf_merge_into_store(cbm_gbuf_t *gb, cbm_store_t *store) {
             .project = gb->project,
             .label = n->label,
             .name = n->name,
+            .atom_id = n->atom_id,
             .qualified_name = n->qualified_name,
             .file_path = n->file_path,
             .start_line = n->start_line,

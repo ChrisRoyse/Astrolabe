@@ -227,6 +227,7 @@ typedef struct {
     uint32_t start_byte; // inclusive start byte offset (0 when unset)
     uint32_t end_byte;   // exclusive end byte offset (0 when unset; end<=start => no source)
     const char *source;  // exact node source bytes (arena) or NULL
+    uint32_t source_len; // authoritative byte length; never derive with strlen
 } CBMDefinition;
 
 /* Argument captured from a call expression */
@@ -262,16 +263,19 @@ typedef struct {
 typedef struct {
     const char *ref_name;          // referenced identifier
     const char *enclosing_func_qn; // QN of enclosing function (or module QN)
+    int start_line;                // 1-based source line for stable-atom attribution
 } CBMUsage;
 
 typedef struct {
     const char *exception_name;    // exception class/type name
     const char *enclosing_func_qn; // QN of enclosing function
+    int start_line;                // 1-based source line for stable-atom attribution
 } CBMThrow;
 
 typedef struct {
     const char *var_name;          // variable name
     const char *enclosing_func_qn; // QN of enclosing function
+    int start_line;                // 1-based source line for stable-atom attribution
     bool is_write;                 // true = write, false = read
 } CBMReadWrite;
 
@@ -283,6 +287,7 @@ typedef struct {
 typedef struct {
     const char *env_key;           // environment variable key
     const char *enclosing_func_qn; // QN of enclosing function
+    int start_line;                // 1-based source line for stable-atom attribution
 } CBMEnvAccess;
 
 typedef struct {
@@ -329,6 +334,7 @@ typedef struct {
     const char *channel_name;      // literal channel name (e.g. "user.created")
     const char *transport;         // "socketio", "event_emitter", ...
     const char *enclosing_func_qn; // QN of the function containing the emit/on call
+    int start_line;                // 1-based source line for stable-atom attribution
     CBMChannelDirection direction;
 } CBMChannel;
 

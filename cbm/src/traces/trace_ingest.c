@@ -8,6 +8,7 @@
 #include "foundation/constants.h"
 #include "foundation/str_util.h"
 #include "foundation/log.h"
+#include "foundation/sha256.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -35,6 +36,39 @@ static const char *const TI_CALLER_EDGE_TYPES[] = {
     "HTTP_CALLS",       "ASYNC_CALLS",        "CROSS_HTTP_CALLS", "CROSS_ASYNC_CALLS",
     "CROSS_GRPC_CALLS", "CROSS_GRAPHQL_CALLS", "CROSS_TRPC_CALLS", "CROSS_CHANNEL",
 };
+
+/* Runtime graph entities have semantic, not source-span, identity.  Their
+ * canonical qualified name is deliberately stable while mutable observation
+ * properties change, so frame the immutable producer facts and keep atom
+ * ownership explicit at this write boundary. */
+static void trace_hash_frame(cbm_sha256_ctx *ctx, const char *value) {
+    const char *text = value ? value : "";
+    uint64_t len = (uint64_t)strlen(text);
+    uint8_t frame_len[8];
+    for (int i = 0; i < 8; i++) {
+        frame_len[i] = (uint8_t)(len >> (i * 8));
+    }
+    cbm_sha256_update(ctx, frame_len, sizeof(frame_len));
+    cbm_sha256_update(ctx, text, (size_t)len);
+}
+
+static void trace_node_atom_id(const char *project, const char *label, const char *qualified_name,
+                               char out[CBM_SHA256_HEX_LEN + 1]) {
+    cbm_sha256_ctx ctx;
+    uint8_t digest[CBM_SHA256_DIGEST_LEN];
+    static const char digits[] = "0123456789abcdef";
+    cbm_sha256_init(&ctx);
+    trace_hash_frame(&ctx, "astrolabe.cbm.runtime-atom.v1");
+    trace_hash_frame(&ctx, project);
+    trace_hash_frame(&ctx, label);
+    trace_hash_frame(&ctx, qualified_name);
+    cbm_sha256_final(&ctx, digest);
+    for (size_t i = 0; i < sizeof(digest); i++) {
+        out[i * 2] = digits[digest[i] >> 4];
+        out[i * 2 + 1] = digits[digest[i] & 15];
+    }
+    out[CBM_SHA256_HEX_LEN] = '\0';
+}
 
 /* ── aggregation ─────────────────────────────────────────────────── */
 
@@ -274,10 +308,13 @@ static int write_runtime_anchor(cbm_store_t *store, const char *project, const c
              esc_svc, esc_path, (long long)count, (long long)error_count, error_rate,
              (long long)p99_ns, incident ? "true" : "false", saturated ? "true" : "false");
 
+    char anchor_atom[CBM_SHA256_HEX_LEN + 1];
+    trace_node_atom_id(project, "RuntimeAnchor", anchor_qn, anchor_atom);
     cbm_node_t anchor = {
         .project = project,
         .label = "RuntimeAnchor",
         .name = route->name ? route->name : "",
+        .atom_id = anchor_atom,
         .qualified_name = anchor_qn,
         .file_path = "",
         .start_line = 0,
@@ -333,10 +370,13 @@ static int write_incident(cbm_store_t *store, const char *project, const char *r
              "\"trigger\":\"5xx_spike\",\"provenance\":\"runtime_trace\"}",
              severity, error_rate, (long long)error_count, (long long)count);
 
+    char incident_atom[CBM_SHA256_HEX_LEN + 1];
+    trace_node_atom_id(project, "Incident", incident_qn, incident_atom);
     cbm_node_t incident = {
         .project = project,
         .label = "Incident",
         .name = route->name ? route->name : "incident",
+        .atom_id = incident_atom,
         .qualified_name = incident_qn,
         .file_path = "",
         .start_line = 0,
@@ -347,8 +387,9 @@ static int write_incident(cbm_store_t *store, const char *project, const char *r
     if (incident_id <= 0) {
         return 0;
     }
-    /* Upsert-by-QN re-activates a previously resolved node (flapping): the props
-     * above carry status "active" and overwrite any prior resolved record. */
+    /* Upsert-by-stable runtime atom re-activates a previously resolved node
+     * (flapping): the props above carry status "active" and overwrite the same
+     * semantic incident record. */
     char edge_props[CBM_SZ_128];
     snprintf(edge_props, sizeof(edge_props),
              "{\"label\":\"incident\",\"severity\":\"%s\",\"resolved\":false}", severity);
@@ -395,10 +436,13 @@ static int resolve_incident(cbm_store_t *store, const char *project, const char 
              "\"provenance\":\"runtime_trace\"}",
              severity, error_rate, (long long)error_count, (long long)count);
 
+    char incident_atom[CBM_SHA256_HEX_LEN + 1];
+    trace_node_atom_id(project, "Incident", incident_qn, incident_atom);
     cbm_node_t incident = {
         .project = project,
         .label = "Incident",
         .name = route->name ? route->name : "incident",
+        .atom_id = incident_atom,
         .qualified_name = incident_qn,
         .file_path = "",
         .start_line = 0,
@@ -588,10 +632,13 @@ int cbm_trace_ingest_records(cbm_store_t *store, const char *project,
                  "{\"kind\":\"trace_batch\",\"fingerprint\":\"%016llx\",\"groups\":%d,"
                  "\"provenance\":\"runtime_trace\"}",
                  (unsigned long long)fp, gs.n);
+        char batch_atom[CBM_SHA256_HEX_LEN + 1];
+        trace_node_atom_id(project, "TraceBatch", batch_qn, batch_atom);
         cbm_node_t bnode = {
             .project = project,
             .label = "TraceBatch",
             .name = "trace_batch",
+            .atom_id = batch_atom,
             .qualified_name = batch_qn,
             .file_path = "",
             .properties_json = bprops,

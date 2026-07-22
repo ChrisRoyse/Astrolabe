@@ -247,11 +247,10 @@ static int64_t create_svc_route_node(cbm_pipeline_ctx_t *ctx, const char *url, c
      * from the HTTP_CALLS edge's url_path property, which was written through
      * cbm_json_escape (#493) and therefore already carries U+FFFD in place of any
      * bad byte. If this path kept the raw byte in the QN, the two Route nodes
-     * would differ in the graph buffer yet collapse to one qualified_name once
-     * the #503 dump sanitizer runs — a duplicate that violates
-     * UNIQUE(project, qualified_name) and blocks the whole repo. Sanitizing the
-     * URL to the identical UTF-8-safe form here makes both paths upsert one QN,
-     * so the graph buffer dedups them into a single Route node before the dump. */
+     * would differ in the graph buffer and acquire different source atoms after
+     * the #503 dump sanitizer changes one persistence value. Sanitizing the URL
+     * to the identical UTF-8-safe form here makes both paths produce the same
+     * immutable facts and atom before the dump. */
     char sane_url[CBM_SZ_512];
     cbm_utf8_sanitize(sane_url, sizeof(sane_url), url ? url : "");
     char route_qn[CBM_ROUTE_QN_SIZE];
@@ -415,10 +414,12 @@ static void emit_classified_edge(cbm_pipeline_ctx_t *ctx, const CBMCall *call,
 
 /* Find source node for a call: enclosing function or file node. */
 static const cbm_gbuf_node_t *calls_find_source(cbm_pipeline_ctx_t *ctx, const char *rel,
-                                                const char *enclosing_qn) {
+                                                const char *enclosing_qn, int call_line) {
     const cbm_gbuf_node_t *src = NULL;
     if (enclosing_qn) {
-        src = cbm_gbuf_find_by_qn(ctx->gbuf, enclosing_qn);
+        src = call_line > 0
+                  ? cbm_gbuf_find_by_qn_location(ctx->gbuf, enclosing_qn, rel, call_line)
+                  : cbm_gbuf_find_by_qn(ctx->gbuf, enclosing_qn);
         /* A class-level call in a directory-module language carries the
          * DIRECTORY module QN, which hits the shared Folder/Project node —
          * attribute to this file's File node instead (#787). */
@@ -439,7 +440,8 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call,
                                const CBMResolvedCallArray *lsp_calls, const char *rel,
                                const char *module_qn, const char **imp_keys, const char **imp_vals,
                                int imp_count, CBMLanguage lang) {
-    const cbm_gbuf_node_t *source_node = calls_find_source(ctx, rel, call->enclosing_func_qn);
+    const cbm_gbuf_node_t *source_node =
+        calls_find_source(ctx, rel, call->enclosing_func_qn, call->start_line);
     if (!source_node) {
         return 0;
     }
@@ -723,7 +725,8 @@ static int scan_depends_in_sig(cbm_pipeline_ctx_t *ctx, const cbm_regex_t *re, c
         func_ref[ref_len] = '\0';
         cbm_resolution_t res = cbm_registry_resolve(ctx->registry, func_ref, module_qn, ik, iv, ic);
         if (res.qualified_name && res.qualified_name[0] != '\0') {
-            const cbm_gbuf_node_t *sn = cbm_gbuf_find_by_qn(ctx->gbuf, def->qualified_name);
+            const cbm_gbuf_node_t *sn =
+                cbm_pipeline_find_definition_node(ctx->gbuf, def, "");
             const cbm_gbuf_node_t *tn = cbm_gbuf_find_by_qn(ctx->gbuf, res.qualified_name);
             if (sn && tn && sn->id != tn->id) {
                 cbm_gbuf_insert_edge(ctx->gbuf, sn->id, tn->id, "CALLS",

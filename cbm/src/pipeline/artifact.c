@@ -680,9 +680,12 @@ int cbm_artifact_import(const char *repo_path, const char *cache_db_path) {
 
     /* Check schema version compatibility */
     int version = read_metadata_version(repo_path);
-    if (version < 0 || version > CBM_ARTIFACT_SCHEMA_VERSION) {
-        cbm_log_info("artifact.import", "skip", "schema_version_mismatch", "artifact_ver",
-                     itoa_buf(version), "current_ver", itoa_buf(CBM_ARTIFACT_SCHEMA_VERSION));
+    if (version != CBM_ARTIFACT_SCHEMA_VERSION) {
+        cbm_log_error("artifact.import", "code", "CBM_ARTIFACT_SCHEMA_MISMATCH",
+                      "artifact_ver", itoa_buf(version), "current_ver",
+                      itoa_buf(CBM_ARTIFACT_SCHEMA_VERSION), "message",
+                      "artifact canonical identity schema is not exactly compatible",
+                      "remediation", "re-index the source code and export a fresh artifact");
         return CBM_NOT_FOUND;
     }
 
@@ -817,7 +820,7 @@ bool cbm_artifact_exists(const char *repo_path) {
 
     /* Check schema version is compatible */
     int version = read_metadata_version(repo_path);
-    return version >= 0 && version <= CBM_ARTIFACT_SCHEMA_VERSION;
+    return version == CBM_ARTIFACT_SCHEMA_VERSION;
 }
 
 /* ── Commit hash extraction ──────────────────────────────────────── */

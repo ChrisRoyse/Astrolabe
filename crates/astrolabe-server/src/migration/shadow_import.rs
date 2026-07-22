@@ -2405,10 +2405,16 @@ pub(crate) fn read_shadow_pipeline_rows(
                 project: node.project,
                 label: node.label,
                 name: node.name,
+                atom_id: node.atom_id,
                 qualified_name: node.qualified_name,
                 file_path: node.file_path,
                 start_line: node.start_line,
                 end_line: node.end_line,
+                source_present: node.source_present,
+                source_bytes: node.source_bytes,
+                source_sha256: node.source_sha256,
+                start_byte: node.start_byte,
+                end_byte: node.end_byte,
                 properties_json: node.properties_json,
             })
             .collect(),
@@ -2579,10 +2585,16 @@ pub(crate) fn pipeline_rows_to_graph_snapshot(rows: CbmPipelineRows) -> CbmGraph
             project: node.project,
             label: node.label,
             name: node.name,
+            atom_id: node.atom_id,
             qualified_name: node.qualified_name,
             file_path: node.file_path,
             start_line: node.start_line,
             end_line: node.end_line,
+            source_present: node.source_present,
+            source_bytes: node.source_bytes,
+            source_sha256: node.source_sha256,
+            start_byte: node.start_byte,
+            end_byte: node.end_byte,
             properties_json: node.properties_json,
             node_vector: None,
             cx_id: None,
@@ -2619,7 +2631,7 @@ pub(crate) fn pipeline_rows_to_graph_snapshot(rows: CbmPipelineRows) -> CbmGraph
 
 pub(crate) fn row_sink_fingerprint(rows: &CbmPipelineRows) -> [u8; 32] {
     let mut hasher = Sha256::new();
-    hasher.update(b"astrolabe-cbm-row-sink-v1\0");
+    hasher.update(b"astrolabe-cbm-row-sink-v2\0");
     hash_str(&mut hasher, &rows.project);
 
     let mut nodes = rows.nodes.iter().collect::<Vec<_>>();
@@ -2630,10 +2642,17 @@ pub(crate) fn row_sink_fingerprint(rows: &CbmPipelineRows) -> [u8; 32] {
         hash_str(&mut hasher, &node.project);
         hash_str(&mut hasher, &node.label);
         hash_str(&mut hasher, &node.name);
+        hash_str(&mut hasher, &node.atom_id);
         hash_str(&mut hasher, &node.qualified_name);
         hash_str(&mut hasher, &node.file_path);
         hash_i64(&mut hasher, node.start_line);
         hash_i64(&mut hasher, node.end_line);
+        hasher.update([u8::from(node.source_present)]);
+        hash_u64(&mut hasher, node.source_bytes.len() as u64);
+        hasher.update(&node.source_bytes);
+        hash_str(&mut hasher, &node.source_sha256);
+        hash_u64(&mut hasher, node.start_byte);
+        hash_u64(&mut hasher, node.end_byte);
         hash_str(&mut hasher, &node.properties_json);
     }
 

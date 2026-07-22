@@ -326,17 +326,25 @@ try {
             "valid=$($manifestProbe.Valid); error=$($manifestProbe.Error); sha=$($manifestProbe.Snapshot.Sha256); owner=$($manifestProbe.OwnerProbe.State); job=$($manifestProbe.JobObjectProbe.State)" `
             'preserve all state and post evidence only for the current strict physical pair'
     }
-    if ($tempInventory.Records.Count -ne 1 -or
-        -not $tempInventory.Records[0].Valid -or
+    $matchingTemps = @($tempInventory.Records | Where-Object {
+            [string]::Equals(
+                $_.Path,
+                $tempFull,
+                [StringComparison]::OrdinalIgnoreCase
+            )
+        })
+    if (@($tempInventory.Records | Where-Object { -not $_.Valid }).Count -ne 0 -or
+        $matchingTemps.Count -ne 1 -or
+        -not $matchingTemps[0].Valid -or
         -not [string]::Equals(
-            $tempInventory.Records[0].Path,
+            $matchingTemps[0].Path,
             $tempFull,
             [StringComparison]::OrdinalIgnoreCase
         ) -or
-        $tempInventory.Records[0].FileId -cne $ExpectedTempFileId) {
+        $matchingTemps[0].FileId -cne $ExpectedTempFileId) {
         Fail-AstroArchive 'ASTRO_LAUNCHER_ARCHIVE_TEMP_STATE_MISMATCH' `
             "records=$($tempInventory.Records.Count); paths=$(@($tempInventory.Paths) -join '; ')" `
-            'preserve every TEMP entry and re-establish one exact complete-pair inventory'
+            'preserve every TEMP entry; the selected pair must have one exact valid TEMP even when other complete pairs are queued'
     }
 
     $trackerFirst = Read-AstroTrackerEvidence `
@@ -363,7 +371,7 @@ try {
 
     $protocolLease = Open-AstroLauncherPinnedDirectoryLease $protocol
     $tempLease = Open-AstroLauncherTempArchiveLease `
-        -Record $tempInventory.Records[0] `
+        -Record $matchingTemps[0] `
         -Evidence $manifestProbe `
         -DirectoryLease $protocolLease
     $manifestLease = Open-AstroAttributionArchiveLease `
@@ -402,14 +410,38 @@ try {
     $directTemp = Get-AstroPathEntryState $tempFull
     $terminalAttribution = Get-AstroAttributionInventory $protocol
     $terminalTemps = Get-AstroReservedLauncherTempEntries $protocol
+    $remainingPairsValid = $terminalAttribution.Stable -and
+        @($terminalAttribution.Errors).Count -eq 0 -and
+        @($terminalAttribution.RefreshTransactions).Count -eq 0 -and
+        @($terminalAttribution.Records).Count -eq
+            @($terminalTemps.Records).Count -and
+        @($terminalAttribution.Records | Where-Object {
+                -not $_.Valid -or $_.Kind -cne 'manifest' -or
+                $_.Parsed.SchemaVersion -ne 3 -or
+                $_.OwnerProbe.State -cnotin @('absent', 'pid-reused') -or
+                $_.JobObjectProbe.State -cne 'absent'
+            }).Count -eq 0 -and
+        @($terminalTemps.Records | Where-Object { -not $_.Valid }).Count -eq 0
+    if ($remainingPairsValid) {
+        foreach ($remainingManifest in @($terminalAttribution.Records)) {
+            if (@($terminalTemps.Records | Where-Object {
+                        [string]::Equals(
+                            $_.Path,
+                            $remainingManifest.ExpectedTempPath,
+                            [StringComparison]::OrdinalIgnoreCase
+                        )
+                    }).Count -ne 1) {
+                $remainingPairsValid = $false
+                break
+            }
+        }
+    }
     if ($directManifest.State -ne 'absent' -or
         $directTemp.State -ne 'absent' -or
-        $terminalAttribution.Paths.Count -ne 0 -or
-        $terminalAttribution.Errors.Count -ne 0 -or
-        $terminalTemps.Paths.Count -ne 0) {
+        -not $remainingPairsValid) {
         Fail-AstroArchive 'ASTRO_LAUNCHER_ARCHIVE_TERMINAL_PROTOCOL_INVALID' `
             "manifest=$($directManifest.State); temp=$($directTemp.State); attribution_paths=$(@($terminalAttribution.Paths) -join '; '); attribution_errors=$(@($terminalAttribution.Errors) -join '; '); temp_paths=$(@($terminalTemps.Paths) -join '; ')" `
-            'preserve the complete archive and investigate direct protocol namespace drift'
+            'preserve the complete archive; the selected pair must be absent and every queued remainder must still be one strict dead-owner/Job-absent complete pair'
     }
     [pscustomobject]@{
         schema = 'astrolabe.launcher-pair-archive-result.v1'
@@ -438,6 +470,7 @@ try {
         target_state = $targetState.State
         active_lock_state = $active.State
         transition_state = $transitions.State
+        remaining_complete_pairs = @($terminalAttribution.Records).Count
     } | ConvertTo-Json -Depth 8 -Compress
 }
 finally {

@@ -50,8 +50,8 @@ pub struct AtomFrames {
     pub language: String,
     /// Content key: `blake3(frame(label) ‖ frame(language) ‖ frame(snippet))`.
     pub content_key: [u8; 32],
-    /// True when the atom carries no snippet bytes (e.g. `File` nodes). Such
-    /// atoms have no content to be equivalent on: they are counted explicitly
+    /// True when the atom intentionally carries no source bytes (for example a
+    /// structural-only node). Such atoms have no content to be equivalent on: they are counted explicitly
     /// and excluded from equivalence classes — otherwise every snippetless
     /// atom fleet-wide collapses into one degenerate "duplicate" class (found
     /// live on the pilot census: one 134-occurrence 10-repo `File` class).
@@ -67,7 +67,9 @@ fn take_frame<'a>(bytes: &'a [u8], cursor: &mut usize, what: &str) -> Result<&'a
     if bytes.len() < *cursor + 8 {
         return Err(invalid(format!("truncated length prefix for {what}")));
     }
-    let len = u64::from_be_bytes(bytes[*cursor..*cursor + 8].try_into().unwrap()) as usize;
+    let encoded_len = u64::from_be_bytes(bytes[*cursor..*cursor + 8].try_into().unwrap());
+    let len = usize::try_from(encoded_len)
+        .map_err(|_| invalid(format!("frame {what} length {encoded_len} exceeds usize")))?;
     *cursor += 8;
     if bytes.len() < *cursor + len {
         return Err(invalid(format!(
@@ -92,23 +94,52 @@ fn frame_of(bytes: &[u8]) -> Vec<u8> {
 /// snippet, signature, start/end line) and derives the content-only key.
 pub fn parse_atom_frames(bytes: &[u8]) -> Result<AtomFrames, CalyxError> {
     let mut cursor = 0_usize;
-    let _tag = take_frame(bytes, &mut cursor, "tag")?;
+    let tag = take_frame(bytes, &mut cursor, "tag")?;
     let project = take_frame(bytes, &mut cursor, "project")?;
     let qualified_name = take_frame(bytes, &mut cursor, "qualified_name")?;
     let label = take_frame(bytes, &mut cursor, "label")?;
     let rel_file_path = take_frame(bytes, &mut cursor, "rel_file_path")?;
     let language = take_frame(bytes, &mut cursor, "language")?;
     let snippet = take_frame(bytes, &mut cursor, "source_snippet_bytes")?;
+    let _signature = take_frame(bytes, &mut cursor, "signature")?;
+    let start_line = take_frame(bytes, &mut cursor, "start_line")?;
+    let end_line = take_frame(bytes, &mut cursor, "end_line")?;
+    let invalid = |detail: String| CalyxError {
+        code: ASTRO_FLEET_DEDUP_FRAME_INVALID,
+        message: format!("canonical input frames did not parse: {detail}"),
+        remediation: "the stored input is not a canonical symbol record; audit the vault input store",
+    };
+    if tag != astrolabe_domain::SYMBOL_CANONICAL_TAG.as_bytes() {
+        return Err(invalid("canonical symbol tag is unsupported".to_string()));
+    }
+    if start_line.len() != 4 || end_line.len() != 4 {
+        return Err(invalid(format!(
+            "line frames must each contain four bytes, got {} and {}",
+            start_line.len(),
+            end_line.len()
+        )));
+    }
+    if cursor != bytes.len() {
+        return Err(invalid(format!(
+            "{} trailing bytes remain after the canonical end_line frame",
+            bytes.len() - cursor
+        )));
+    }
+    let utf8 = |frame: &[u8], what: &str| {
+        std::str::from_utf8(frame)
+            .map(str::to_owned)
+            .map_err(|error| invalid(format!("{what} is not UTF-8: {error}")))
+    };
     let mut keyed = Vec::with_capacity(24 + label.len() + language.len() + snippet.len());
     keyed.extend_from_slice(&frame_of(label));
     keyed.extend_from_slice(&frame_of(language));
     keyed.extend_from_slice(&frame_of(snippet));
     Ok(AtomFrames {
-        project: String::from_utf8_lossy(project).into_owned(),
-        qualified_name: String::from_utf8_lossy(qualified_name).into_owned(),
-        label: String::from_utf8_lossy(label).into_owned(),
-        rel_file_path: String::from_utf8_lossy(rel_file_path).into_owned(),
-        language: String::from_utf8_lossy(language).into_owned(),
+        project: utf8(project, "project")?,
+        qualified_name: utf8(qualified_name, "qualified_name")?,
+        label: utf8(label, "label")?,
+        rel_file_path: utf8(rel_file_path, "rel_file_path")?,
+        language: utf8(language, "language")?,
         content_key: *blake3::hash(&keyed).as_bytes(),
         snippet_empty: snippet.is_empty(),
     })
@@ -164,15 +195,11 @@ pub fn census_artifact(per_project: &[(String, Vec<AtomFrames>)]) -> Value {
     }
     let mut classes: BTreeMap<[u8; 32], Class> = BTreeMap::new();
     let mut snippetless_total = 0_u64;
-    // libcbm emits no raw source property, so stored "snippets" are the #413
-    // body-derived property fingerprints — a valid content proxy for
-    // body-bearing symbols, but for `File` atoms the fingerprint is just
-    // name+extension (content-free): every `mod.rs` fleet-wide would collapse
-    // into one fake class (found live: a 134-occurrence 10-repo class).
-    // File atoms are therefore excluded from content equivalence, explicitly
-    // counted, never silently classed. True byte-content dedup needs CBM to
-    // retain raw snippets — tracked as its own issue.
-    let content_free = |atom: &AtomFrames| atom.snippet_empty || atom.label == "File";
+    // Exact source bytes now flow from libcbm into every source-bearing canonical
+    // atom, including File nodes. Structural nodes intentionally have no source;
+    // they are counted explicitly and excluded instead of being collapsed into
+    // one degenerate empty-content class.
+    let content_free = |atom: &AtomFrames| atom.snippet_empty;
     for (project, atoms) in per_project {
         for atom in atoms {
             if content_free(atom) {
@@ -231,9 +258,9 @@ pub fn census_artifact(per_project: &[(String, Vec<AtomFrames>)]) -> Value {
             .collect::<String>()
     };
     json!({
-        "artifact": "fleet-dedup-census/v1",
+        "artifact": "fleet-dedup-census/v2",
         "policy": "linked-not-skipped: per-repo constellations untouched; classes weight fleet composition (#456)",
-        "join_key": "blake3(frame(label)+frame(language)+frame(source_snippet_bytes)) — content-only (design correction on #455); snippet bytes are the #413 body-derived property fingerprint (libcbm retains no raw source), a content PROXY: File-label atoms are excluded as content-free, and fingerprints embedding project-qualified callee names undercount cross-repo equality (bounded on #455)",
+        "join_key": "blake3(frame(label)+frame(language)+frame(source_snippet_bytes)) — byte-exact content-only source identity (design correction on #455); only explicitly source-absent structural atoms are excluded",
         "atoms_total": atoms_total,
         "content_free_atoms_excluded": snippetless_total,
         "distinct_contents": distinct,

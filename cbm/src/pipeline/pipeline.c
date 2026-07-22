@@ -449,6 +449,48 @@ static void create_folder_chain(cbm_pipeline_t *p, const char *dir, CBMHashTable
     free(walk);
 }
 
+uint8_t *cbm_pipeline_read_file_identity_bytes(const cbm_file_info_t *file, size_t *out_len) {
+    *out_len = 0;
+    if (!file || !file->path || file->size < 0 || (uint64_t)file->size > SIZE_MAX - 1) {
+        cbm_log_error("structure.file_source_refused", "code", "CBM_FILE_SOURCE_SIZE_INVALID",
+                      "path", file && file->path ? file->path : "", "message",
+                      "discovery supplied an invalid exact-source size", "remediation",
+                      "re-run discovery after repairing the file metadata");
+        return NULL;
+    }
+    size_t expected = (size_t)file->size;
+    FILE *stream = cbm_fopen(file->path, "rb");
+    if (!stream) {
+        cbm_log_error("structure.file_source_refused", "code", "CBM_FILE_SOURCE_OPEN_FAILED",
+                      "path", file->path, "message", "exact source file could not be opened",
+                      "remediation", "restore read access and retry the index");
+        return NULL;
+    }
+    uint8_t *bytes = malloc(expected + 1);
+    if (!bytes) {
+        (void)fclose(stream);
+        cbm_log_error("structure.file_source_refused", "code", "CBM_FILE_SOURCE_ALLOC_FAILED",
+                      "path", file->path, "message", "exact file source allocation failed",
+                      "remediation", "free memory or reduce repository size, then retry");
+        return NULL;
+    }
+    size_t actual = expected > 0 ? fread(bytes, 1, expected, stream) : 0;
+    int extra = fgetc(stream);
+    bool failed = actual != expected || extra != EOF || ferror(stream) != 0;
+    (void)fclose(stream);
+    if (failed) {
+        free(bytes);
+        cbm_log_error("structure.file_source_refused", "code", "CBM_FILE_SOURCE_CHANGED",
+                      "path", file->path, "message",
+                      "file bytes changed or became unreadable after discovery", "remediation",
+                      "stop concurrent writers and retry from a stable checkout");
+        return NULL;
+    }
+    bytes[expected] = 0;
+    *out_len = expected;
+    return bytes;
+}
+
 static int pass_structure(cbm_pipeline_t *p, const cbm_file_info_t *files, int file_count) {
     cbm_log_info("pass.start", "pass", "structure", "files", itoa_buf(file_count));
 
@@ -492,7 +534,24 @@ static int pass_structure(cbm_pipeline_t *p, const cbm_file_info_t *files, int f
 
         const char *qualified_name = file_qn;
         const char *file_path = rel;
-        cbm_gbuf_upsert_node(p->gbuf, "File", basename, qualified_name, file_path, 0, 0, props);
+        size_t source_len = 0;
+        uint8_t *source_bytes = cbm_pipeline_read_file_identity_bytes(&files[i], &source_len);
+        if (!source_bytes) {
+            free(file_qn);
+            cbm_ht_foreach(seen_dirs, free_seen_dir_key, NULL);
+            cbm_ht_free(seen_dirs);
+            return CBM_NOT_FOUND;
+        }
+        int64_t file_id = cbm_gbuf_upsert_source_node(
+            p->gbuf, "File", basename, qualified_name, file_path, 0, 0, source_bytes, source_len,
+            0, (uint64_t)source_len, props);
+        free(source_bytes);
+        if (file_id <= 0) {
+            free(file_qn);
+            cbm_ht_foreach(seen_dirs, free_seen_dir_key, NULL);
+            cbm_ht_free(seen_dirs);
+            return CBM_NOT_FOUND;
+        }
 
         /* CONTAINS_FILE edge: parent dir -> file */
         char *dir = strdup(rel);
@@ -1311,7 +1370,9 @@ static int run_extraction_phase(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
     struct timespec t;
     cbm_clock_gettime(CLOCK_MONOTONIC, &t);
     CBM_PROF_START(t_struct);
-    pass_structure(p, files, file_count);
+    if (pass_structure(p, files, file_count) != 0) {
+        return CBM_NOT_FOUND;
+    }
     CBM_PROF_END_N("pipeline", "pass_structure", t_struct, file_count);
     cbm_log_info("pass.timing", "pass", "structure", "elapsed_ms", itoa_buf((int)elapsed_ms(t)));
     if (check_cancel(p)) {

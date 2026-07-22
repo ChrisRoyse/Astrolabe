@@ -1047,10 +1047,16 @@ pub struct CbmPipelineNodeRow {
     pub project: String,
     pub label: String,
     pub name: String,
+    pub atom_id: String,
     pub qualified_name: String,
     pub file_path: String,
     pub start_line: i64,
     pub end_line: i64,
+    pub source_present: bool,
+    pub source_bytes: Vec<u8>,
+    pub source_sha256: String,
+    pub start_byte: u64,
+    pub end_byte: u64,
     pub properties_json: String,
 }
 
@@ -1117,11 +1123,40 @@ impl PipelineRowSinkState {
 
     fn push_node(&mut self, row: &cbm_sys::cbm_gbuf_row_node_t) -> Result<(), BridgeError> {
         self.ensure_callback_thread()?;
+        if row.source_present != 0 && row.source_present != 1 {
+            return Err(envelope(
+                "ASTRO_CBM_ROW_SOURCE_FLAG",
+                format!(
+                    "CBM row-sink node {} has invalid source_present {}",
+                    row.id, row.source_present
+                ),
+                "Fix libcbm to emit source_present as exactly zero or one.",
+            ));
+        }
+        let source_present = row.source_present == 1;
+        if row.source_len > 0 && row.source_bytes.is_null() {
+            return Err(envelope(
+                "ASTRO_CBM_ROW_SOURCE_POINTER",
+                format!(
+                    "CBM row-sink node {} has {} source bytes but a null pointer",
+                    row.id, row.source_len
+                ),
+                "Preserve the source allocation through the complete callback duration.",
+            ));
+        }
+        let source_bytes = if row.source_len == 0 {
+            Vec::new()
+        } else {
+            // SAFETY: the row-sink ABI guarantees this borrowed allocation remains
+            // live for the callback; the null/length relation was checked above.
+            unsafe { std::slice::from_raw_parts(row.source_bytes, row.source_len) }.to_vec()
+        };
         self.nodes.push(CbmPipelineNodeRow {
             id: row.id,
             project: required_borrowed_c_string(row.project, "row_sink.node.project")?,
             label: required_borrowed_c_string(row.label, "row_sink.node.label")?,
             name: required_borrowed_c_string(row.name, "row_sink.node.name")?,
+            atom_id: required_borrowed_c_string(row.atom_id, "row_sink.node.atom_id")?,
             qualified_name: required_borrowed_c_string(
                 row.qualified_name,
                 "row_sink.node.qualified_name",
@@ -1129,6 +1164,14 @@ impl PipelineRowSinkState {
             file_path: required_borrowed_c_string(row.file_path, "row_sink.node.file_path")?,
             start_line: i64::from(row.start_line),
             end_line: i64::from(row.end_line),
+            source_present,
+            source_bytes,
+            source_sha256: required_borrowed_c_string(
+                row.source_sha256,
+                "row_sink.node.source_sha256",
+            )?,
+            start_byte: row.start_byte,
+            end_byte: row.end_byte,
             properties_json: required_borrowed_c_string(
                 row.properties_json,
                 "row_sink.node.properties_json",

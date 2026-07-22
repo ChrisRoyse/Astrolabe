@@ -309,6 +309,20 @@ fn validate_stream_node(
             ),
         ));
     }
+    if node.atom_id.len() != 64
+        || !node
+            .atom_id
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(stream_row_refused(
+            accepted,
+            format!(
+                "row-sink node {} has a noncanonical stable atom_id",
+                node.source_node_id
+            ),
+        ));
+    }
     let properties = serde_json::from_str::<Value>(&node.properties_json).map_err(|error| {
         stream_row_refused(
             accepted,

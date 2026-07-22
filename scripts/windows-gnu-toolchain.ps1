@@ -4030,7 +4030,12 @@ try {
         Write-Output "NO_ESCAPE[ASTRO_ATTRIBUTION_SWEEP]: exact dead-generation TEMP pairs=$(@($tempSweep.Removed).Count), manifests=$(@($tempSweep.RemovedManifests).Count), stages=$(@($tempSweep.RemovedStages).Count), tombstones=$(@($tempSweep.RemovedTombstones).Count); current exact generation preserved"
     }
     catch {
-        $cleanupErrors += "startup exact attribution/TEMP classification or cleanup failed: $($_.Exception.Message)"
+        # A dead, complete pair is intentionally tracker-archived rather than swept.
+        # Its presence is a run-precondition failure, not evidence that this exact
+        # launcher's Job membership or cleanup authority is unsafe.  Keeping it out
+        # of cleanupErrors lets the already-published exact owner remove target/ and
+        # archive its own state in finally; otherwise target presence and pair
+        # archival form an unrecoverable cycle (#620).
         throw
     }
     # #280: a warm target is permitted only inside an explicitly owned contiguous batch.

@@ -102,6 +102,7 @@ static void try_emit_usage(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *s
         CBMUsage usage;
         usage.ref_name = name;
         usage.enclosing_func_qn = cbm_enclosing_func_qn_cached(ctx, node);
+        usage.start_line = (int)ts_node_start_point(node).row + 1;
         cbm_usages_push(&ctx->result->usages, ctx->arena, usage);
     }
 }
@@ -165,6 +166,7 @@ void handle_usages(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec, Wal
         CBMUsage usage;
         usage.ref_name = name;
         usage.enclosing_func_qn = state->enclosing_func_qn;
+        usage.start_line = (int)ts_node_start_point(node).row + 1;
         cbm_usages_push(&ctx->result->usages, ctx->arena, usage);
     }
 }

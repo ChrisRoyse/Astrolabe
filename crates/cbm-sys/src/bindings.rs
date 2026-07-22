@@ -450,6 +450,10 @@ pub struct CBMDefinition {
     pub structural_profile: *const ::std::os::raw::c_char,
     pub body_tokens: *const ::std::os::raw::c_char,
     pub struct_trigrams: *const ::std::os::raw::c_char,
+    pub start_byte: u32,
+    pub end_byte: u32,
+    pub source: *const ::std::os::raw::c_char,
+    pub source_len: u32,
 }
 impl Default for CBMDefinition {
     fn default() -> Self {
@@ -520,6 +524,7 @@ impl Default for CBMImport {
 pub struct CBMUsage {
     pub ref_name: *const ::std::os::raw::c_char,
     pub enclosing_func_qn: *const ::std::os::raw::c_char,
+    pub start_line: ::std::os::raw::c_int,
 }
 impl Default for CBMUsage {
     fn default() -> Self {
@@ -535,6 +540,7 @@ impl Default for CBMUsage {
 pub struct CBMThrow {
     pub exception_name: *const ::std::os::raw::c_char,
     pub enclosing_func_qn: *const ::std::os::raw::c_char,
+    pub start_line: ::std::os::raw::c_int,
 }
 impl Default for CBMThrow {
     fn default() -> Self {
@@ -550,6 +556,7 @@ impl Default for CBMThrow {
 pub struct CBMReadWrite {
     pub var_name: *const ::std::os::raw::c_char,
     pub enclosing_func_qn: *const ::std::os::raw::c_char,
+    pub start_line: ::std::os::raw::c_int,
     pub is_write: bool,
 }
 impl Default for CBMReadWrite {
@@ -581,6 +588,7 @@ impl Default for CBMTypeRef {
 pub struct CBMEnvAccess {
     pub env_key: *const ::std::os::raw::c_char,
     pub enclosing_func_qn: *const ::std::os::raw::c_char,
+    pub start_line: ::std::os::raw::c_int,
 }
 impl Default for CBMEnvAccess {
     fn default() -> Self {
@@ -652,6 +660,7 @@ pub struct CBMChannel {
     pub channel_name: *const ::std::os::raw::c_char,
     pub transport: *const ::std::os::raw::c_char,
     pub enclosing_func_qn: *const ::std::os::raw::c_char,
+    pub start_line: ::std::os::raw::c_int,
     pub direction: CBMChannelDirection,
 }
 impl Default for CBMChannel {
@@ -1543,10 +1552,17 @@ pub struct cbm_gbuf_row_node_t {
     pub project: *const ::std::os::raw::c_char,
     pub label: *const ::std::os::raw::c_char,
     pub name: *const ::std::os::raw::c_char,
+    pub atom_id: *const ::std::os::raw::c_char,
     pub qualified_name: *const ::std::os::raw::c_char,
     pub file_path: *const ::std::os::raw::c_char,
     pub start_line: ::std::os::raw::c_int,
     pub end_line: ::std::os::raw::c_int,
+    pub source_present: ::std::os::raw::c_int,
+    pub source_bytes: *const u8,
+    pub source_len: usize,
+    pub source_sha256: *const ::std::os::raw::c_char,
+    pub start_byte: u64,
+    pub end_byte: u64,
     pub properties_json: *const ::std::os::raw::c_char,
 }
 impl Default for cbm_gbuf_row_node_t {
@@ -2094,10 +2110,17 @@ pub struct cbm_node_t {
     pub project: *const ::std::os::raw::c_char,
     pub label: *const ::std::os::raw::c_char,
     pub name: *const ::std::os::raw::c_char,
+    pub atom_id: *const ::std::os::raw::c_char,
     pub qualified_name: *const ::std::os::raw::c_char,
     pub file_path: *const ::std::os::raw::c_char,
     pub start_line: ::std::os::raw::c_int,
     pub end_line: ::std::os::raw::c_int,
+    pub source_present: bool,
+    pub source_bytes: *const u8,
+    pub source_len: usize,
+    pub source_sha256: *const ::std::os::raw::c_char,
+    pub start_byte: u64,
+    pub end_byte: u64,
     pub properties_json: *const ::std::os::raw::c_char,
 }
 impl Default for cbm_node_t {

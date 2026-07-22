@@ -98,9 +98,9 @@ enum {
     INTERIOR_TABLE_FLAG = 0x05,
     INTERIOR_INDEX_FLAG = 0x02,
     NEWLINE_BYTE = 0x0A,
-    NODE_SORT_THREADS = 4,
+    NODE_SORT_THREADS = 5,
     EDGE_SORT_THREADS = 7,
-    TOTAL_SORT_THREADS = 11,
+    TOTAL_SORT_THREADS = 12,
     ERR_SORT_FAILED = -4,
     ERR_WRITE_FAILED = -3,
     ERR_MASTER_OVERFLOW = -2,
@@ -113,6 +113,7 @@ enum {
     NSORT_NAME = 1,
     NSORT_FILE = 2,
     NSORT_QN = 3,
+    NSORT_ATOM = 4,
     ESORT_TARGET = 1,
     ESORT_TYPE = 2,
     ESORT_PROJ_TGT_TYPE = 3,
@@ -167,6 +168,7 @@ enum {
 #define HDR_OFF_AUTOVAC_TOP 52
 #define HDR_OFF_TEXT_ENCODING 56
 #define HDR_OFF_USER_VERSION 60
+#define CBM_SCHEMA_USER_VERSION 3
 #define HDR_OFF_INCR_VACUUM 64
 #define HDR_OFF_APP_ID 68
 #define HDR_OFF_VERSION_VALID 92
@@ -387,7 +389,7 @@ static void rec_add_text(RecordBuilder *r, const char *s) {
 }
 
 static void rec_add_blob(RecordBuilder *r, const uint8_t *data, int len) {
-    int64_t st = len > 0 ? ((int64_t)len * BLOB_SERIAL_MUL) + BLOB_SERIAL_BASE : 0;
+    int64_t st = ((int64_t)len * BLOB_SERIAL_MUL) + BLOB_SERIAL_BASE;
     uint8_t vbuf[VARINT_MAX_BYTES];
     int vlen = put_varint(vbuf, st);
     dynbuf_append(&r->header, vbuf, vlen);
@@ -732,6 +734,16 @@ static uint8_t *build_node_record(const CBMDumpNode *n, int *out_len) {
     rec_add_int(&r, n->start_line);
     rec_add_int(&r, n->end_line);
     rec_add_text(&r, n->properties ? n->properties : "{}");
+    rec_add_text(&r, n->atom_id);
+    rec_add_int(&r, n->source_present ? 1 : 0);
+    if (n->source_present) {
+        rec_add_blob(&r, n->source_bytes, (int)n->source_len);
+    } else {
+        rec_add_null(&r);
+    }
+    rec_add_text(&r, n->source_sha256 ? n->source_sha256 : "");
+    rec_add_int(&r, (int64_t)n->start_byte);
+    rec_add_int(&r, (int64_t)n->end_byte);
 
     uint8_t *data = rec_finalize(&r, out_len);
     rec_free(&r);
@@ -1420,6 +1432,13 @@ static int cmp_node_by_qn(const void *a, const void *b) {
     return cmp_i64(g_sort_nodes[ia].id, g_sort_nodes[ib].id);
 }
 
+static int cmp_node_by_atom(const void *a, const void *b) {
+    int ia = *(const int *)a;
+    int ib = *(const int *)b;
+    int c = strcmp(safe_str(g_sort_nodes[ia].atom_id), safe_str(g_sort_nodes[ib].atom_id));
+    return c ? c : cmp_i64(g_sort_nodes[ia].id, g_sort_nodes[ib].id);
+}
+
 // --- Edge index comparators ---
 
 // idx_edges_source: (source_id, type) + rowid
@@ -1659,6 +1678,9 @@ static const char *ncol_file(const CBMDumpNode *n) {
 static const char *ncol_qn(const CBMDumpNode *n) {
     return n->qualified_name;
 }
+static const char *ncol_atom(const CBMDumpNode *n) {
+    return n->atom_id;
+}
 
 /* Build a 2-text node index from a pre-sorted permutation. Returns root page or 0. */
 static uint32_t build_node_index_sorted(FILE *fp, uint32_t *next_page, CBMDumpNode *nodes,
@@ -1831,7 +1853,7 @@ static void write_sqlite_file_header(uint8_t *page1, uint32_t total_pages) {
     put_u32(page1 + HDR_OFF_DEFAULT_CACHE, 0);
     put_u32(page1 + HDR_OFF_AUTOVAC_TOP, 0);
     put_u32(page1 + HDR_OFF_TEXT_ENCODING, SKIP_ONE);
-    put_u32(page1 + HDR_OFF_USER_VERSION, 0);
+    put_u32(page1 + HDR_OFF_USER_VERSION, CBM_SCHEMA_USER_VERSION);
     put_u32(page1 + HDR_OFF_INCR_VACUUM, 0);
     put_u32(page1 + HDR_OFF_APP_ID, 0);
     put_u32(page1 + HDR_OFF_VERSION_VALID, SKIP_ONE);
@@ -1913,7 +1935,7 @@ static void pad_file_to_page_boundary(FILE *fp, uint32_t next_page) {
 /* Build all 4 node index B-trees. Returns 0 on success, ERR_SORT_FAILED on failure. */
 static int build_node_indexes(FILE *fp, uint32_t *next_page, CBMDumpNode *nodes, int node_count,
                               SortJob *nsorts, uint32_t *label_root, uint32_t *name_root,
-                              uint32_t *file_root, uint32_t *qn_root) {
+                              uint32_t *file_root, uint32_t *qn_root, uint32_t *atom_root) {
     *label_root =
         build_node_index_sorted(fp, next_page, nodes, node_count, nsorts[0].perm, ncol_label);
     *name_root = build_node_index_sorted(fp, next_page, nodes, node_count, nsorts[NSORT_NAME].perm,
@@ -1922,7 +1944,10 @@ static int build_node_indexes(FILE *fp, uint32_t *next_page, CBMDumpNode *nodes,
                                          ncol_file);
     *qn_root =
         build_node_index_sorted(fp, next_page, nodes, node_count, nsorts[NSORT_QN].perm, ncol_qn);
-    if (node_count > 0 && (!*label_root || !*name_root || !*file_root || !*qn_root)) {
+    *atom_root = build_node_index_sorted(fp, next_page, nodes, node_count,
+                                         nsorts[NSORT_ATOM].perm, ncol_atom);
+    if (node_count > 0 &&
+        (!*label_root || !*name_root || !*file_root || !*qn_root || !*atom_root)) {
         return ERR_SORT_FAILED;
     }
     return 0;
@@ -2033,6 +2058,7 @@ static int write_db_after_nodes(write_db_ctx_t *w, uint32_t nodes_root) {
         {node_count, cmp_node_by_name, NULL},
         {node_count, cmp_node_by_file, NULL},
         {node_count, cmp_node_by_qn, NULL},
+        {node_count, cmp_node_by_atom, NULL},
     };
     SortJob esorts[] = {
         {edge_count, cmp_edge_by_source_type, NULL},
@@ -2053,9 +2079,11 @@ static int write_db_after_nodes(write_db_ctx_t *w, uint32_t nodes_root) {
     uint32_t idx_nodes_label_root;
     uint32_t idx_nodes_name_root;
     uint32_t idx_nodes_file_root;
+    uint32_t idx_nodes_qn_root;
     uint32_t autoindex_nodes_root;
     int nrc = build_node_indexes(fp, &next_page, nodes, node_count, nsorts, &idx_nodes_label_root,
-                                 &idx_nodes_name_root, &idx_nodes_file_root, &autoindex_nodes_root);
+                                 &idx_nodes_name_root, &idx_nodes_file_root, &idx_nodes_qn_root,
+                                 &autoindex_nodes_root);
     CBM_PROF_END_N("write_db", "4_node_indexes_seq", t_node_idx, node_count * NODE_SORT_THREADS);
     if (nrc != 0) {
         (void)fclose(fp);
@@ -2133,7 +2161,13 @@ static int write_db_after_nodes(write_db_ctx_t *w, uint32_t nodes_root) {
          "NULL REFERENCES projects(name) ON DELETE CASCADE,\n\t\tlabel TEXT NOT NULL,\n\t\tname "
          "TEXT NOT NULL,\n\t\tqualified_name TEXT NOT NULL,\n\t\tfile_path TEXT DEFAULT "
          "'',\n\t\tstart_line INTEGER DEFAULT 0,\n\t\tend_line INTEGER DEFAULT 0,\n\t\tproperties "
-         "TEXT DEFAULT '{}',\n\t\tUNIQUE(project, qualified_name)\n\t)"},
+         "TEXT DEFAULT '{}',\n\t\tatom_id TEXT NOT NULL,\n\t\tsource_present INTEGER NOT NULL "
+         "CHECK(source_present IN (0,1)),\n\t\tsource_bytes BLOB,\n\t\tsource_sha256 TEXT NOT NULL "
+         "DEFAULT '',\n\t\tstart_byte INTEGER NOT NULL DEFAULT 0,\n\t\tend_byte INTEGER NOT NULL "
+         "DEFAULT 0,\n\t\tCHECK((source_present = 0 AND source_bytes IS NULL AND source_sha256 = '' "
+         "AND start_byte = 0 AND end_byte = 0) OR (source_present = 1 AND source_bytes IS NOT NULL "
+         "AND length(source_sha256) = 64 AND end_byte >= start_byte AND length(source_bytes) = "
+         "end_byte - start_byte)),\n\t\tUNIQUE(project, atom_id)\n\t)"},
         {"index", "sqlite_autoindex_nodes_1", "nodes", autoindex_nodes_root, NULL},
         {"index", "idx_nodes_label", "nodes", idx_nodes_label_root,
          "CREATE INDEX idx_nodes_label ON nodes(project, label)"},
@@ -2141,6 +2175,8 @@ static int write_db_after_nodes(write_db_ctx_t *w, uint32_t nodes_root) {
          "CREATE INDEX idx_nodes_name ON nodes(project, name)"},
         {"index", "idx_nodes_file", "nodes", idx_nodes_file_root,
          "CREATE INDEX idx_nodes_file ON nodes(project, file_path)"},
+        {"index", "idx_nodes_qn", "nodes", idx_nodes_qn_root,
+         "CREATE INDEX idx_nodes_qn ON nodes(project, qualified_name)"},
         // local_name_gen + widened UNIQUE (#768): must stay semantically
         // identical to init_schema in src/store/store.c, and the hand-built
         // sqlite_autoindex_edges_1 (cmp_edge_by_src_tgt_type +

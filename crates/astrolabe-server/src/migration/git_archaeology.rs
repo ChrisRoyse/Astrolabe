@@ -1250,10 +1250,16 @@ fn serialize_pipeline_rows(rows: &CbmPipelineRows) -> Value {
             "project": n.project,
             "label": n.label,
             "name": n.name,
+            "atom_id": n.atom_id,
             "qualified_name": n.qualified_name,
             "file_path": n.file_path,
             "start_line": n.start_line,
             "end_line": n.end_line,
+            "source_present": n.source_present,
+            "source_bytes": n.source_bytes,
+            "source_sha256": n.source_sha256,
+            "start_byte": n.start_byte,
+            "end_byte": n.end_byte,
             "properties_json": n.properties_json,
         })).collect::<Vec<_>>(),
         "edges": rows.edges.iter().map(|e| json!({
@@ -1307,15 +1313,44 @@ fn parse_extract_node(value: &Value) -> Result<CbmPipelineNodeRow, String> {
             .as_i64()
             .ok_or_else(|| format!("node row missing integer field '{key}'"))
     };
+    let u64_field = |key: &str| -> Result<u64, String> {
+        value[key]
+            .as_u64()
+            .ok_or_else(|| format!("node row missing unsigned integer field '{key}'"))
+    };
+    let bool_field = |key: &str| -> Result<bool, String> {
+        value[key]
+            .as_bool()
+            .ok_or_else(|| format!("node row missing boolean field '{key}'"))
+    };
+    let source_bytes = value["source_bytes"]
+        .as_array()
+        .ok_or_else(|| "node row missing byte-array field 'source_bytes'".to_string())?
+        .iter()
+        .enumerate()
+        .map(|(index, byte)| {
+            let value = byte
+                .as_u64()
+                .ok_or_else(|| format!("node source_bytes[{index}] is not an unsigned integer"))?;
+            u8::try_from(value)
+                .map_err(|_| format!("node source_bytes[{index}] value {value} exceeds one byte"))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
     Ok(CbmPipelineNodeRow {
         id: i64_field("id")?,
         project: str_field("project")?,
         label: str_field("label")?,
         name: str_field("name")?,
+        atom_id: str_field("atom_id")?,
         qualified_name: str_field("qualified_name")?,
         file_path: str_field("file_path")?,
         start_line: i64_field("start_line")?,
         end_line: i64_field("end_line")?,
+        source_present: bool_field("source_present")?,
+        source_bytes,
+        source_sha256: str_field("source_sha256")?,
+        start_byte: u64_field("start_byte")?,
+        end_byte: u64_field("end_byte")?,
         properties_json: str_field("properties_json")?,
     })
 }

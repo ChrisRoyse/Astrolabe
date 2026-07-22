@@ -2238,6 +2238,14 @@ function Get-AstroReclaimAttributionProbe {
     $exactManifestObserved = $false
     $exactManifestLeaseStartUtcTicks = $null
     $exactLeaseCandidates = [Collections.Generic.HashSet[long]]::new()
+    $unrelatedManifestByKey =
+        [Collections.Generic.Dictionary[string, object]]::new(
+            [StringComparer]::Ordinal
+        )
+    $unrelatedTempByKey =
+        [Collections.Generic.Dictionary[string, object]]::new(
+            [StringComparer]::Ordinal
+        )
     foreach ($transaction in @($sharedInventory.RefreshTransactions)) {
         if (-not $transaction.Valid) {
             Fail-Astro 'ASTRO_LAUNCHER_LOCK_RECLAIM_ATTRIBUTION_REFRESH_INVALID' `
@@ -2455,9 +2463,51 @@ function Get-AstroReclaimAttributionProbe {
                     'preserve every protocol entry; exact-live and unevaluable attribution owners are never reclaimable'
             }
             if (-not $isNameExact) {
-                Fail-Astro 'ASTRO_LAUNCHER_LOCK_RECLAIM_OWNER_ATTRIBUTION_AMBIGUOUS' `
-                    "$ProbeName found reserved attribution evidence for a non-exact launcher generation: $path" `
-                    'preserve every entry; one launcher recovery never mutates or ignores unrelated subordinate state'
+                if ($entryKind -cne 'manifest' -or -not $parsed.Valid -or
+                    $parsed.SchemaVersion -ne 3) {
+                    Fail-Astro 'ASTRO_LAUNCHER_LOCK_RECLAIM_OWNER_ATTRIBUTION_AMBIGUOUS' `
+                        "$ProbeName found non-exact attribution state that is not one strict final v3 manifest: $path" `
+                        'preserve every entry; only independently complete dead-owner pairs may coexist with an exact reclaim'
+                }
+                $unrelatedExpectedJob = Get-AstroLauncherTreeJobObjectName `
+                    -RootIdentity $RootIdentity `
+                    -LauncherPid $parsed.LauncherPid `
+                    -LauncherProcessStartUtcTicks `
+                        $parsed.LauncherProcessStartUtcTicks `
+                    -LauncherLeaseStartUtcTicks `
+                        $parsed.LauncherLeaseStartUtcTicks `
+                    -LauncherLockSha256 $parsed.LauncherLockSha256
+                if ([string]$parsed.JobObjectName -cne
+                    [string]$unrelatedExpectedJob) {
+                    Fail-Astro 'ASTRO_LAUNCHER_LOCK_RECLAIM_ATTRIBUTION_JOB_BINDING_INVALID' `
+                        "$ProbeName unrelated final manifest has an invalid deterministic Job binding: $path" `
+                        'preserve every entry; unrelated state is ignored only after full strict identity validation'
+                }
+                $unrelatedJobProbe = Get-AstroLauncherJobObjectProbe `
+                    -Name $parsed.JobObjectName
+                if ($unrelatedJobProbe.State -cne 'absent') {
+                    Fail-Astro 'ASTRO_LAUNCHER_LOCK_RECLAIM_ATTRIBUTED_CHILD_LIVE' `
+                        "$ProbeName unrelated final manifest Job is not absent (state=$($unrelatedJobProbe.State), pids=$(@($unrelatedJobProbe.ProcessIds) -join ','), error=$($unrelatedJobProbe.Error)): $path" `
+                        'preserve every entry; unrelated live or unevaluable generations are inviolable'
+                }
+                $unrelatedKey = '{0}|{1}|{2}' -f
+                    $parsed.LauncherPid,
+                    $parsed.LauncherProcessStartUtcTicks,
+                    $parsed.LauncherLockSha256
+                if ($unrelatedManifestByKey.ContainsKey($unrelatedKey)) {
+                    Fail-Astro 'ASTRO_LAUNCHER_LOCK_RECLAIM_OWNER_ATTRIBUTION_AMBIGUOUS' `
+                        "$ProbeName found duplicate unrelated final manifests for $unrelatedKey" `
+                        'preserve every entry; each unrelated generation must be one complete pair'
+                }
+                $unrelatedManifestByKey.Add($unrelatedKey, [ordered]@{
+                    path = $path
+                    file_identity = $before.FileIdentity
+                    bytes = $before.Length
+                    sha256 = $before.Sha256
+                    owner_state = $ownerProbe.State
+                    job_state = $unrelatedJobProbe.State
+                })
+                continue
             }
             $malformedStage = -not $parsed.Valid -and $entryKind -ceq 'stage'
             if (-not $parsed.Valid -and
@@ -2672,9 +2722,20 @@ function Get-AstroReclaimAttributionProbe {
                 [long]$ExpectedOwnerProcessStartUtcTicks -and
             $temp.Name.LauncherLockSha256 -ceq $ExpectedLauncherLockSha256
         if (-not $isExactTemp) {
-            Fail-Astro 'ASTRO_LAUNCHER_LOCK_RECLAIM_TEMP_AMBIGUOUS' `
-                "$ProbeName found a reserved launcher TEMP for a non-exact generation: $($temp.Path)" `
-                'preserve all state; one recovery never mutates or ignores unrelated subordinate state'
+            $unrelatedKey = '{0}|{1}|{2}' -f
+                $temp.Name.LauncherPid,
+                $temp.Name.LauncherProcessStartUtcTicks,
+                $temp.Name.LauncherLockSha256
+            if ($unrelatedTempByKey.ContainsKey($unrelatedKey)) {
+                Fail-Astro 'ASTRO_LAUNCHER_LOCK_RECLAIM_TEMP_AMBIGUOUS' `
+                    "$ProbeName found duplicate unrelated TEMP roots for $unrelatedKey" `
+                    'preserve every entry; each unrelated generation must be one complete pair'
+            }
+            $unrelatedTempByKey.Add($unrelatedKey, [ordered]@{
+                path = $temp.Path
+                file_identity = $temp.FileId
+            })
+            continue
         }
         $tempRecords.Add([ordered]@{
             kind = $temp.Kind
@@ -2696,6 +2757,18 @@ function Get-AstroReclaimAttributionProbe {
         Fail-Astro 'ASTRO_LAUNCHER_LOCK_RECLAIM_TEMP_AMBIGUOUS' `
             "$ProbeName found more than one exact launcher TEMP" `
             'preserve every entry; the exact v2 TEMP identity must be unique'
+    }
+    if ($unrelatedManifestByKey.Count -ne $unrelatedTempByKey.Count) {
+        Fail-Astro 'ASTRO_LAUNCHER_LOCK_RECLAIM_OWNER_ATTRIBUTION_AMBIGUOUS' `
+            "$ProbeName unrelated complete-pair cardinality differs (manifests=$($unrelatedManifestByKey.Count), temps=$($unrelatedTempByKey.Count))" `
+            'preserve every entry; an unrelated generation may coexist only as one strict final manifest plus one exact TEMP root'
+    }
+    foreach ($unrelatedKey in $unrelatedManifestByKey.Keys) {
+        if (-not $unrelatedTempByKey.ContainsKey($unrelatedKey)) {
+            Fail-Astro 'ASTRO_LAUNCHER_LOCK_RECLAIM_OWNER_ATTRIBUTION_AMBIGUOUS' `
+                "$ProbeName unrelated final manifest lacks its exact TEMP root: $unrelatedKey" `
+                'preserve every entry; partial unrelated generations require their own explicit recovery'
+        }
     }
 
     $finalLikeCount = @($rawAttributionRecords | Where-Object {
@@ -2873,6 +2946,16 @@ function Get-AstroReclaimAttributionProbe {
         manifests = [object[]]@($manifestRecords)
         refresh_transactions = [object[]]@($refreshTransactionRecords)
         temps = [object[]]@($tempRecords)
+        unrelated_complete_pairs = [object[]]@(
+            $unrelatedManifestByKey.Keys | Sort-Object | ForEach-Object {
+                [ordered]@{
+                    identity = $_
+                    manifest = $unrelatedManifestByKey[$_]
+                    temp = $unrelatedTempByKey[$_]
+                    action = 'preserved'
+                }
+            }
+        )
     }
     $stableBytes = [Text.UTF8Encoding]::new($false).GetBytes(
         ($stable | ConvertTo-Json -Depth 16 -Compress)
@@ -2891,6 +2974,7 @@ function Get-AstroReclaimAttributionProbe {
         manifests = [object[]]@($manifestRecords)
         refresh_transactions = [object[]]@($refreshTransactionRecords)
         temps = [object[]]@($tempRecords)
+        unrelated_complete_pairs = $stable.unrelated_complete_pairs
         stable_fingerprint_sha256 = Get-AstroByteSha256 $stableBytes
         observed_at_utc = [DateTime]::UtcNow.ToString('o')
     }

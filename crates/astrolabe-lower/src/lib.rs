@@ -43,8 +43,8 @@ pub use team_artifact::{
 pub const CRATE_NAME: &str = env!("CARGO_PKG_NAME");
 pub const ASTRO_LOWER_ACTOR: &str = "astrolabe-lower";
 pub const ASTRO_LOWERED_SQLITE_MANIFEST_PREFIX: &[u8] = b"astrolabe:lowered-sqlite:v1:";
-pub const ASTRO_LOWERED_SQLITE_SCHEMA: &str = "astrolabe-lowered-sqlite-v1";
-pub const ASTRO_META_SCHEMA: &str = "astrolabe-astro-meta-v1";
+pub const ASTRO_LOWERED_SQLITE_SCHEMA: &str = "astrolabe-lowered-sqlite-v2";
+pub const ASTRO_META_SCHEMA: &str = "astrolabe-astro-meta-v2";
 pub const DEFAULT_LOWERED_AT: &str = "1970-01-01T00:00:00Z";
 
 /// SQLITE_BUSY retry window for the throwaway lowered-artifact db (#76). Since the
@@ -677,10 +677,16 @@ struct LoweredNode {
     project: String,
     label: String,
     name: String,
+    atom_id: String,
     qualified_name: String,
     file_path: String,
     start_line: i64,
     end_line: i64,
+    source_present: bool,
+    source_bytes: Vec<u8>,
+    source_sha256: String,
+    start_byte: i64,
+    end_byte: i64,
     properties_json: String,
     node_vector: Option<Vec<u8>>,
 }
@@ -700,15 +706,15 @@ impl LoweredRows {
         snapshot: CbmGraphSnapshot,
         similarity_edges: Vec<PersistedSimilarityEdgeRow>,
     ) -> LowerResult<Self> {
-        let mut seen_qn = BTreeSet::new();
+        let mut seen_atom = BTreeSet::new();
         let mut id_by_source = BTreeMap::new();
-        let mut id_by_qn = BTreeMap::new();
+        let mut id_by_qn: BTreeMap<String, Option<i64>> = BTreeMap::new();
         let mut nodes = Vec::with_capacity(snapshot.nodes.len());
         for (index, node) in snapshot.nodes.into_iter().enumerate() {
-            if !seen_qn.insert((node.project.clone(), node.qualified_name.clone())) {
+            if !seen_atom.insert((node.project.clone(), node.atom_id.clone())) {
                 return Err(LowerError::InvalidInput(format!(
-                    "duplicate node qualified_name {} in project {}",
-                    node.qualified_name, node.project
+                    "duplicate stable node atom_id {} in project {}",
+                    node.atom_id, node.project
                 )));
             }
             let id = i64::try_from(index + 1).map_err(|_| {
@@ -720,8 +726,11 @@ impl LoweredRows {
                     node.source_node_id
                 )));
             }
-            id_by_qn.insert(node.qualified_name.clone(), id);
-            nodes.push(lower_node(id, node));
+            id_by_qn
+                .entry(node.qualified_name.clone())
+                .and_modify(|resolved| *resolved = None)
+                .or_insert(Some(id));
+            nodes.push(lower_node(id, node)?);
         }
 
         let mut edges = Vec::new();
@@ -742,18 +751,8 @@ impl LoweredRows {
         }
         for persisted in similarity_edges {
             let row = persisted.row;
-            let source_id = id_by_qn.get(&row.source_qn).copied().ok_or_else(|| {
-                LowerError::InvalidInput(format!(
-                    "persisted {} similarity edge points to missing source {:?}",
-                    row.family, row.source_qn
-                ))
-            })?;
-            let target_id = id_by_qn.get(&row.target_qn).copied().ok_or_else(|| {
-                LowerError::InvalidInput(format!(
-                    "persisted {} similarity edge points to missing target {:?}",
-                    row.family, row.target_qn
-                ))
-            })?;
+            let source_id = resolve_unique_qn(&id_by_qn, &row.source_qn, &row.family, "source")?;
+            let target_id = resolve_unique_qn(&id_by_qn, &row.target_qn, &row.family, "target")?;
             let id = i64::try_from(edges.len() + 1).map_err(|_| {
                 LowerError::InvalidInput("too many edges to assign SQLite ids".to_string())
             })?;
@@ -781,19 +780,75 @@ impl LoweredRows {
     }
 }
 
-fn lower_node(id: i64, node: CbmGraphNode) -> LoweredNode {
-    LoweredNode {
+fn resolve_unique_qn(
+    id_by_qn: &BTreeMap<String, Option<i64>>,
+    qualified_name: &str,
+    family: &str,
+    endpoint: &str,
+) -> LowerResult<i64> {
+    match id_by_qn.get(qualified_name) {
+        Some(Some(id)) => Ok(*id),
+        Some(None) => Err(LowerError::InvalidInput(format!(
+            "ASTRO_LOWER_QN_AMBIGUOUS: persisted {family} similarity edge {endpoint} {qualified_name:?} resolves to multiple stable atoms; persist and resolve an atom_id before lowering"
+        ))),
+        None => Err(LowerError::InvalidInput(format!(
+            "persisted {family} similarity edge points to missing {endpoint} {qualified_name:?}"
+        ))),
+    }
+}
+
+fn lower_node(id: i64, node: CbmGraphNode) -> LowerResult<LoweredNode> {
+    let start_byte = i64::try_from(node.start_byte).map_err(|_| {
+        LowerError::InvalidInput(format!(
+            "node atom {} start_byte {} exceeds SQLite INTEGER range",
+            node.atom_id, node.start_byte
+        ))
+    })?;
+    let end_byte = i64::try_from(node.end_byte).map_err(|_| {
+        LowerError::InvalidInput(format!(
+            "node atom {} end_byte {} exceeds SQLite INTEGER range",
+            node.atom_id, node.end_byte
+        ))
+    })?;
+    if node.source_present {
+        let actual_sha256 = hex_lower(&Sha256::digest(&node.source_bytes));
+        if node.end_byte < node.start_byte
+            || node.end_byte - node.start_byte != node.source_bytes.len() as u64
+            || node.source_sha256 != actual_sha256
+        {
+            return Err(LowerError::InvalidInput(format!(
+                "node atom {} exact source bytes/hash/span are inconsistent",
+                node.atom_id
+            )));
+        }
+    } else if !node.source_bytes.is_empty()
+        || !node.source_sha256.is_empty()
+        || node.start_byte != 0
+        || node.end_byte != 0
+    {
+        return Err(LowerError::InvalidInput(format!(
+            "source-absent node atom {} carries exact-source metadata",
+            node.atom_id
+        )));
+    }
+    Ok(LoweredNode {
         id,
         project: node.project,
         label: node.label,
         name: node.name,
+        atom_id: node.atom_id,
         qualified_name: node.qualified_name,
         file_path: node.file_path,
         start_line: node.start_line,
         end_line: node.end_line,
+        source_present: node.source_present,
+        source_bytes: node.source_bytes,
+        source_sha256: node.source_sha256,
+        start_byte,
+        end_byte,
         properties_json: node.properties_json,
         node_vector: node.node_vector,
-    }
+    })
 }
 
 fn lower_edge(id: i64, edge: CbmGraphEdge, source_id: i64, target_id: i64) -> LoweredEdge {
@@ -909,9 +964,10 @@ fn sidecar_path(path: &Path, suffix: &str) -> PathBuf {
 
 fn create_cbm_schema(connection: &Connection) -> LowerResult<()> {
     connection.execute_batch(
-        "CREATE TABLE projects (\n\t\tname TEXT PRIMARY KEY,\n\t\tindexed_at TEXT NOT NULL,\n\t\troot_path TEXT NOT NULL\n\t);\
+        "PRAGMA user_version = 3;\
+         CREATE TABLE projects (\n\t\tname TEXT PRIMARY KEY,\n\t\tindexed_at TEXT NOT NULL,\n\t\troot_path TEXT NOT NULL\n\t);\
          CREATE TABLE file_hashes (\n\t\tproject TEXT NOT NULL REFERENCES projects(name) ON DELETE CASCADE,\n\t\trel_path TEXT NOT NULL,\n\t\tsha256 TEXT NOT NULL,\n\t\tmtime_ns INTEGER NOT NULL DEFAULT 0,\n\t\tsize INTEGER NOT NULL DEFAULT 0,\n\t\tPRIMARY KEY (project, rel_path)\n\t);\
-         CREATE TABLE nodes (\n\t\tid INTEGER PRIMARY KEY AUTOINCREMENT,\n\t\tproject TEXT NOT NULL REFERENCES projects(name) ON DELETE CASCADE,\n\t\tlabel TEXT NOT NULL,\n\t\tname TEXT NOT NULL,\n\t\tqualified_name TEXT NOT NULL,\n\t\tfile_path TEXT DEFAULT '',\n\t\tstart_line INTEGER DEFAULT 0,\n\t\tend_line INTEGER DEFAULT 0,\n\t\tproperties TEXT DEFAULT '{}',\n\t\tUNIQUE(project, qualified_name)\n\t);\
+         CREATE TABLE nodes (\n\t\tid INTEGER PRIMARY KEY AUTOINCREMENT,\n\t\tproject TEXT NOT NULL REFERENCES projects(name) ON DELETE CASCADE,\n\t\tlabel TEXT NOT NULL,\n\t\tname TEXT NOT NULL,\n\t\tatom_id TEXT NOT NULL,\n\t\tqualified_name TEXT NOT NULL,\n\t\tfile_path TEXT DEFAULT '',\n\t\tstart_line INTEGER DEFAULT 0,\n\t\tend_line INTEGER DEFAULT 0,\n\t\tproperties TEXT DEFAULT '{}',\n\t\tsource_present INTEGER NOT NULL CHECK(source_present IN (0,1)),\n\t\tsource_bytes BLOB,\n\t\tsource_sha256 TEXT NOT NULL DEFAULT '',\n\t\tstart_byte INTEGER NOT NULL DEFAULT 0,\n\t\tend_byte INTEGER NOT NULL DEFAULT 0,\n\t\tCHECK((source_present = 0 AND source_bytes IS NULL AND source_sha256 = '' AND start_byte = 0 AND end_byte = 0) OR (source_present = 1 AND source_bytes IS NOT NULL AND length(source_sha256) = 64 AND end_byte >= start_byte AND length(source_bytes) = end_byte - start_byte)),\n\t\tUNIQUE(project, atom_id)\n\t);\
          CREATE TABLE edges (\n\t\tid INTEGER PRIMARY KEY AUTOINCREMENT,\n\t\tproject TEXT NOT NULL REFERENCES projects(name) ON DELETE CASCADE,\n\t\tsource_id INTEGER NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,\n\t\ttarget_id INTEGER NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,\n\t\ttype TEXT NOT NULL,\n\t\tproperties TEXT DEFAULT '{}',\n\t\turl_path_gen TEXT GENERATED ALWAYS AS (json_extract(properties,'$.url_path')),\n\t\tlocal_name_gen TEXT GENERATED ALWAYS AS (CASE WHEN type='IMPORTS' THEN coalesce(json_extract(properties,'$.local_name'),'') ELSE '' END),\n\t\tUNIQUE(source_id, target_id, type, local_name_gen)\n\t);\
          CREATE TABLE project_summaries (\n\t\t\tproject TEXT PRIMARY KEY,\n\t\t\tsummary TEXT NOT NULL,\n\t\t\tsource_hash TEXT NOT NULL,\n\t\t\tcreated_at TEXT NOT NULL,\n\t\t\tupdated_at TEXT NOT NULL\n\t\t);\
          CREATE TABLE node_vectors (\n\t\tnode_id INTEGER PRIMARY KEY,\n\t\tproject TEXT NOT NULL,\n\t\tvector BLOB NOT NULL\n\t);\
@@ -924,6 +980,7 @@ fn create_cbm_schema(connection: &Connection) -> LowerResult<()> {
            panel_version INTEGER,\
            lowered_at TEXT NOT NULL\
          );\
+         CREATE INDEX idx_nodes_qn ON nodes(project, qualified_name);\
          CREATE INDEX idx_nodes_label ON nodes(project, label);\
          CREATE INDEX idx_nodes_name ON nodes(project, name);\
          CREATE INDEX idx_nodes_file ON nodes(project, file_path);\
@@ -996,8 +1053,8 @@ fn insert_file_hashes(tx: &Transaction<'_>, rows: &LoweredRows) -> LowerResult<(
 
 fn insert_nodes(tx: &Transaction<'_>, rows: &LoweredRows) -> LowerResult<()> {
     let mut node_statement = tx.prepare(
-        "INSERT INTO nodes(id, project, label, name, qualified_name, file_path, start_line, end_line, properties)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        "INSERT INTO nodes(id, project, label, name, atom_id, qualified_name, file_path, start_line, end_line, properties, source_present, source_bytes, source_sha256, start_byte, end_byte)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
     )?;
     let mut vector_statement =
         tx.prepare("INSERT INTO node_vectors(node_id, project, vector) VALUES (?1, ?2, ?3)")?;
@@ -1006,16 +1063,23 @@ fn insert_nodes(tx: &Transaction<'_>, rows: &LoweredRows) -> LowerResult<()> {
          VALUES (?1, ?2, ?3, ?4, ?5)",
     )?;
     for node in &rows.nodes {
+        let source_value = node.source_present.then_some(node.source_bytes.as_slice());
         node_statement.execute(params![
             node.id,
             node.project,
             node.label,
             node.name,
+            node.atom_id,
             node.qualified_name,
             node.file_path,
             node.start_line,
             node.end_line,
             node.properties_json,
+            i64::from(node.source_present),
+            source_value,
+            node.source_sha256,
+            node.start_byte,
+            node.end_byte,
         ])?;
         if let Some(vector) = &node.node_vector {
             vector_statement.execute(params![node.id, node.project, vector])?;
@@ -1254,7 +1318,7 @@ fn lowered_manifest_key(project: &str, vault_fingerprint_sha256: &str) -> Vec<u8
 
 fn snapshot_fingerprint(snapshot: &CbmGraphSnapshot, source_ledger_head_hash: &str) -> String {
     let mut hasher = Sha256::new();
-    update_str(&mut hasher, "astrolabe-cbm-snapshot-v1");
+    update_str(&mut hasher, "astrolabe-cbm-snapshot-v2");
     update_str(&mut hasher, &snapshot.project);
     update_str(&mut hasher, source_ledger_head_hash);
     update_opt_u32(&mut hasher, snapshot.panel_version);
@@ -1268,10 +1332,16 @@ fn snapshot_fingerprint(snapshot: &CbmGraphSnapshot, source_ledger_head_hash: &s
         update_str(&mut hasher, &node.project);
         update_str(&mut hasher, &node.label);
         update_str(&mut hasher, &node.name);
+        update_str(&mut hasher, &node.atom_id);
         update_str(&mut hasher, &node.qualified_name);
         update_str(&mut hasher, &node.file_path);
         update_i64(&mut hasher, node.start_line);
         update_i64(&mut hasher, node.end_line);
+        hasher.update([u8::from(node.source_present)]);
+        update_bytes(&mut hasher, &node.source_bytes);
+        update_str(&mut hasher, &node.source_sha256);
+        hasher.update(node.start_byte.to_be_bytes());
+        hasher.update(node.end_byte.to_be_bytes());
         update_str(&mut hasher, &node.properties_json);
         update_bytes_opt(&mut hasher, node.node_vector.as_deref());
     }

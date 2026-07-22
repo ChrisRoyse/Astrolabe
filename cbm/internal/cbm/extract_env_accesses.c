@@ -159,6 +159,7 @@ static void walk_env_accesses(CBMExtractCtx *ctx, TSNode root, const CBMLangSpec
             CBMEnvAccess ea;
             ea.env_key = env_key;
             ea.enclosing_func_qn = cbm_enclosing_func_qn_cached(ctx, node);
+            ea.start_line = (int)ts_node_start_point(node).row + 1;
             cbm_envaccess_push(&ctx->result->env_accesses, ctx->arena, ea);
             continue; // don't push children (avoid double-counting)
         }
@@ -206,6 +207,7 @@ void handle_env_accesses(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spe
         CBMEnvAccess ea;
         ea.env_key = env_key;
         ea.enclosing_func_qn = state->enclosing_func_qn;
+        ea.start_line = (int)ts_node_start_point(node).row + 1;
         cbm_envaccess_push(&ctx->result->env_accesses, ctx->arena, ea);
     }
 }

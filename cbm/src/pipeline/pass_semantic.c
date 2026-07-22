@@ -439,7 +439,7 @@ static void sem_process_def_edges(cbm_pipeline_ctx_t *ctx, const CBMDefinition *
     if (!def->qualified_name) {
         return;
     }
-    const cbm_gbuf_node_t *node = cbm_gbuf_find_by_qn(ctx->gbuf, def->qualified_name);
+    const cbm_gbuf_node_t *node = cbm_pipeline_find_definition_node(ctx->gbuf, def, "");
     if (!node) {
         return;
     }

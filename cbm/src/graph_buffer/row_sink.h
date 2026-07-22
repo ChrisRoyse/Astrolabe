@@ -4,6 +4,7 @@
 #ifndef CBM_GRAPH_BUFFER_ROW_SINK_H
 #define CBM_GRAPH_BUFFER_ROW_SINK_H
 
+#include <stddef.h>
 #include <stdint.h>
 
 /* Dump-row sink structs. These rows are borrowed and valid only for the
@@ -13,10 +14,17 @@ typedef struct {
     const char *project;
     const char *label;
     const char *name;
+    const char *atom_id;
     const char *qualified_name;
     const char *file_path;
     int start_line;
     int end_line;
+    int source_present;
+    const uint8_t *source_bytes;
+    size_t source_len;
+    const char *source_sha256;
+    uint64_t start_byte;
+    uint64_t end_byte;
     const char *properties_json;
 } cbm_gbuf_row_node_t;
 

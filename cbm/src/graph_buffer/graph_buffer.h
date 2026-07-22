@@ -10,6 +10,7 @@
 #define CBM_GRAPH_BUFFER_H
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <stdatomic.h>
 
@@ -28,10 +29,17 @@ typedef struct {
     int64_t id;           /* temp ID (sequential from 1) */
     char *label;          /* heap-owned */
     char *name;           /* heap-owned */
+    char *atom_id;        /* heap-owned stable source-atom SHA-256 */
     char *qualified_name; /* heap-owned */
     char *file_path;      /* heap-owned */
     int start_line;
     int end_line;
+    bool source_present;    /* distinguishes no source from an exact empty source */
+    uint8_t *source_bytes;  /* heap-owned byte-exact source when source_present */
+    size_t source_len;
+    char *source_sha256;    /* heap-owned lowercase SHA-256 when source_present */
+    uint64_t start_byte;    /* end-exclusive byte span within the indexed file */
+    uint64_t end_byte;
     char *properties_json; /* heap-owned JSON string, "{}" default */
 } cbm_gbuf_node_t;
 
@@ -59,7 +67,7 @@ cbm_gbuf_t *cbm_gbuf_new_shared_ids(const char *project, const char *root_path,
 void cbm_gbuf_free(cbm_gbuf_t *gb);
 
 /* Merge all nodes and edges from src into dst.
- * Nodes are merged by QN: on collision, src wins (updates dst node fields).
+ * Nodes are merged only by stable source atom. Qualified names are non-unique.
  * New nodes are inserted with their original IDs (from shared ID source).
  * Edges are remapped for any QN-colliding nodes, then inserted with dedup.
  * After merge, src can be safely freed (all data is copied).
@@ -68,15 +76,53 @@ int cbm_gbuf_merge(cbm_gbuf_t *dst, cbm_gbuf_t *src);
 
 /* ── Node operations ─────────────────────────────────────────────── */
 
-/* Upsert a node by qualified name. Returns the temp ID.
+/* Upsert a structural node without an attached source payload. Returns the temp ID.
  * All string fields are copied (buffer owns the copies).
  * Returns 0 on error. */
 int64_t cbm_gbuf_upsert_node(cbm_gbuf_t *gb, const char *label, const char *name,
                              const char *qualified_name, const char *file_path, int start_line,
                              int end_line, const char *properties_json);
 
-/* Find a node by qualified name. Returns NULL if not found. */
+/* Upsert a source-backed node. source_bytes/source_len and the end-exclusive byte
+ * span are identity-bearing and cross the row-sink/SQLite boundary unchanged.
+ * source_bytes may be NULL only when source_len is zero (an exact empty source).
+ * Returns 0 and poisons persistence on malformed input or allocation failure. */
+int64_t cbm_gbuf_upsert_source_node(cbm_gbuf_t *gb, const char *label, const char *name,
+                                    const char *qualified_name, const char *file_path,
+                                    int start_line, int end_line, const uint8_t *source_bytes,
+                                    size_t source_len, uint64_t start_byte, uint64_t end_byte,
+                                    const char *properties_json);
+
+/* Resolve a source-backed node by the complete canonical identity frame. */
+const cbm_gbuf_node_t *cbm_gbuf_find_source_node(
+    const cbm_gbuf_t *gb, const char *label, const char *name, const char *qualified_name,
+    const char *file_path, int start_line, int end_line, const uint8_t *source_bytes,
+    size_t source_len, uint64_t start_byte, uint64_t end_byte);
+
+/* Resolve an already-known stable atom without consulting its display QN. */
+const cbm_gbuf_node_t *cbm_gbuf_find_by_atom_id(const cbm_gbuf_t *gb, const char *atom_id);
+
+/* Find a node by qualified name. Returns NULL if not found and poisons
+ * persistence when the qualified name maps to multiple stable atoms. */
 const cbm_gbuf_node_t *cbm_gbuf_find_by_qn(const cbm_gbuf_t *gb, const char *qn);
+
+/* Resolve a qualified name at an exact source location. The path and 1-based
+ * line are both required. Exactly one live atom whose inclusive line range
+ * contains the location is returned; multiple matches poison persistence and
+ * emit a structured error rather than selecting an arbitrary atom. */
+const cbm_gbuf_node_t *cbm_gbuf_find_by_qn_location(const cbm_gbuf_t *gb, const char *qn,
+                                                    const char *file_path, int line);
+
+/* Match the successor of a changed atom for incremental edge re-resolution.
+ * The semantic locator is exact (QN/path/label/name plus the prior signature
+ * property when present). A deleted locator returns NULL; an existing but
+ * signature-incompatible or ambiguous locator poisons persistence. */
+const cbm_gbuf_node_t *cbm_gbuf_find_successor_node(
+    const cbm_gbuf_t *gb, const char *qualified_name, const char *file_path, const char *label,
+    const char *name, const char *previous_properties_json);
+
+/* True after any canonical identity or reference-resolution failure. */
+bool cbm_gbuf_resolution_failed(const cbm_gbuf_t *gb);
 
 /* Find a node by temp ID. Returns NULL if not found. */
 const cbm_gbuf_node_t *cbm_gbuf_find_by_id(const cbm_gbuf_t *gb, int64_t id);

@@ -31,10 +31,17 @@ typedef struct {
     const char *project;
     const char *label;          /* Function, Class, Method, Module, File, ... */
     const char *name;           /* short name */
+    const char *atom_id;        /* stable source-atom SHA-256 */
     const char *qualified_name; /* full dotted path */
     const char *file_path;      /* relative file path */
     int start_line;
     int end_line;
+    bool source_present;
+    const uint8_t *source_bytes;
+    size_t source_len;
+    const char *source_sha256;
+    uint64_t start_byte;
+    uint64_t end_byte;
     const char *properties_json; /* JSON string, NULL → "{}" */
 } cbm_node_t;
 
@@ -295,7 +302,7 @@ int cbm_store_find_node_by_id(cbm_store_t *s, int64_t id, cbm_node_t *out);
 /* Find node by project + qualified_name. */
 int cbm_store_find_node_by_qn(cbm_store_t *s, const char *project, const char *qn, cbm_node_t *out);
 
-/* Find node by qualified_name only (no project filter — QNs are globally unique). */
+/* Find node by qualified_name only. Fails if more than one atom matches. */
 int cbm_store_find_node_by_qn_any(cbm_store_t *s, const char *qn, cbm_node_t *out);
 
 /* Find nodes by name (exact match). Returns allocated array, caller frees. */

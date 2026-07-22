@@ -72,9 +72,9 @@ pub(crate) const EDGE_ROW_PREFIX: &[u8] = b"astrolabe:edge:v1:";
 /// incoming per-file digest against this row to short-circuit unchanged files before the
 /// O(corpus) per-symbol conversion, so a one-symbol delta reconciles only its file.
 const FILE_DIGEST_ROW_PREFIX: &[u8] = b"astrolabe:file-digest:v1:";
-const SCHEMA_NODE_MAP: &str = "astrolabe-node-map-v2";
+const SCHEMA_NODE_MAP: &str = "astrolabe-node-map-v3";
 const SCHEMA_SYMBOL_METADATA: &str = "astrolabe-sqlite-symbol-v2";
-const SCHEMA_STRUCTURAL_NODE: &str = "astrolabe-structural-node-v1";
+const SCHEMA_STRUCTURAL_NODE: &str = "astrolabe-structural-node-v2";
 const SCHEMA_PROJECT_ROW: &str = "astrolabe-cbm-project-v1";
 const SCHEMA_FILE_HASH_ROW: &str = "astrolabe-file-hash-v1";
 const SCHEMA_PROJECT_SUMMARY_ROW: &str = "astrolabe-project-summary-v1";
@@ -91,8 +91,9 @@ const SCHEMA_FILE_DIGEST_ROW: &str = "astrolabe-file-digest-v1";
 // (An edge's properties, e.g. resolution strategy/candidates, can change when a THIRD file
 // changes; folding edges into the source file's digest makes such a change invalidate the
 // digest instead of being wrongly preserved.) v1 manifests mismatch and fail open into one
-// labeled full reconcile.
-const FILE_DIGEST_DOMAIN: &str = "astrolabe-file-digest-v2";
+// labeled full reconcile. v3 folds the stable atom and byte-exact source
+// contract, so an exact body/span change can never reuse a v2 identity.
+const FILE_DIGEST_DOMAIN: &str = "astrolabe-file-digest-v3";
 const SCHEMA_LEDGER: &str = "astrolabe-sqlite-ingest-ledger-v1";
 /// Ledger payload schema for admitting historical symbol versions without
 /// mutating the live graph projection.
@@ -109,6 +110,7 @@ const ASTROLABE_INGEST_ACTOR: &str = "astrolabe-ingest";
 /// (check-cross-process-vault.py). Mirrors LOWERED_DB_BUSY_TIMEOUT_MS
 /// (astrolabe-lower) and CONFIG_DB_BUSY_TIMEOUT_MS (astrolabe-server).
 const CBM_SOURCE_DB_BUSY_TIMEOUT_MS: u64 = 5_000;
+const CBM_SQLITE_SCHEMA_VERSION: i64 = 3;
 
 /// Import configuration for a CBM SQLite dump.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -529,10 +531,16 @@ struct RawNodeRow {
     project: String,
     label: String,
     name: String,
+    atom_id: String,
     qualified_name: String,
     file_path: String,
     start_line: i64,
     end_line: i64,
+    source_present: bool,
+    source_bytes: Vec<u8>,
+    source_sha256: String,
+    start_byte: u64,
+    end_byte: u64,
     properties: Value,
     properties_json: String,
     node_vector: Option<Vec<u8>>,
@@ -703,6 +711,7 @@ impl EncodeSkipReport {
 #[derive(Debug, Clone)]
 struct ExtractedNode {
     id: i64,
+    atom_id: String,
     label: SymbolLabel,
     name: String,
     symbol: SymbolRecord,
@@ -715,6 +724,7 @@ struct ExtractedNode {
 #[derive(Debug, Clone)]
 struct PreparedConstellation {
     node_id: i64,
+    atom_id: String,
     name: String,
     properties_json: String,
     node_vector: Option<Vec<u8>>,
@@ -726,6 +736,7 @@ struct PreparedConstellation {
 #[derive(Debug, Clone)]
 struct PreparedLiveSymbol {
     node_id: i64,
+    atom_id: String,
     name: String,
     properties_json: String,
     node_vector: Option<Vec<u8>>,
@@ -769,6 +780,7 @@ struct NodeMapRow {
     series_id_schema: String,
     project: String,
     node_id: i64,
+    atom_id: String,
     qualified_name: String,
     label: String,
     cx_id: CxId,
@@ -781,6 +793,11 @@ struct NodeMapRow {
     start_line: Option<i64>,
     #[serde(default)]
     end_line: Option<i64>,
+    source_present: bool,
+    source_bytes: Vec<u8>,
+    source_sha256: String,
+    start_byte: u64,
+    end_byte: u64,
     #[serde(default)]
     properties_json: Option<String>,
     #[serde(default)]
@@ -792,6 +809,7 @@ struct StructuralNodeRow {
     schema: String,
     project: String,
     node_id: i64,
+    atom_id: String,
     qualified_name: String,
     label: String,
     name: String,
@@ -801,6 +819,11 @@ struct StructuralNodeRow {
     start_line: Option<i64>,
     #[serde(default)]
     end_line: Option<i64>,
+    source_present: bool,
+    source_bytes: Vec<u8>,
+    source_sha256: String,
+    start_byte: u64,
+    end_byte: u64,
     #[serde(default)]
     properties_json: Option<String>,
     #[serde(default)]
@@ -893,10 +916,16 @@ pub struct CbmGraphNode {
     pub project: String,
     pub label: String,
     pub name: String,
+    pub atom_id: String,
     pub qualified_name: String,
     pub file_path: String,
     pub start_line: i64,
     pub end_line: i64,
+    pub source_present: bool,
+    pub source_bytes: Vec<u8>,
+    pub source_sha256: String,
+    pub start_byte: u64,
+    pub end_byte: u64,
     pub properties_json: String,
     pub node_vector: Option<Vec<u8>>,
     pub cx_id: Option<CxId>,
@@ -1021,7 +1050,49 @@ fn open_cbm_source_connection(sqlite_path: &Path) -> IngestResult<Connection> {
             CBM_SOURCE_DB_BUSY_TIMEOUT_MS,
         ))
         .map_err(|error| invalid_sqlite(format!("set SQLite busy timeout: {error}")))?;
+    validate_cbm_source_schema(&connection)?;
     Ok(connection)
+}
+
+fn validate_cbm_source_schema(connection: &Connection) -> IngestResult<()> {
+    let user_version: i64 = connection
+        .query_row("PRAGMA user_version;", [], |row| row.get(0))
+        .map_err(|error| invalid_sqlite(format!("read CBM SQLite user_version: {error}")))?;
+    if user_version != CBM_SQLITE_SCHEMA_VERSION {
+        return Err(invalid_sqlite(format!(
+            "CBM_ATOM_SCHEMA_REBUILD_REQUIRED: SQLite user_version is {user_version}, expected {CBM_SQLITE_SCHEMA_VERSION}; rebuild the collapsed legacy store from source"
+        )));
+    }
+
+    let mut indexes = connection
+        .prepare("SELECT name FROM pragma_index_list('nodes') WHERE \"unique\"=1 ORDER BY name")
+        .map_err(|error| invalid_sqlite(format!("inspect nodes identity indexes: {error}")))?;
+    let names = indexes
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(|error| invalid_sqlite(format!("query nodes identity indexes: {error}")))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| invalid_sqlite(format!("read nodes identity index: {error}")))?;
+    let mut atom_unique = false;
+    let mut collapsed_qn_unique = false;
+    for name in names {
+        let mut columns = connection
+            .prepare("SELECT name FROM pragma_index_info(?1) ORDER BY seqno")
+            .map_err(|error| invalid_sqlite(format!("inspect nodes index {name:?}: {error}")))?;
+        let columns = columns
+            .query_map([&name], |row| row.get::<_, String>(0))
+            .map_err(|error| invalid_sqlite(format!("query nodes index {name:?}: {error}")))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| invalid_sqlite(format!("read nodes index {name:?}: {error}")))?;
+        atom_unique |= columns.len() == 2 && columns[0] == "project" && columns[1] == "atom_id";
+        collapsed_qn_unique |=
+            columns.len() == 2 && columns[0] == "project" && columns[1] == "qualified_name";
+    }
+    if !atom_unique || collapsed_qn_unique {
+        return Err(invalid_sqlite(
+            "CBM_ATOM_SCHEMA_REBUILD_REQUIRED: nodes must enforce UNIQUE(project, atom_id) and qualified_name must be non-unique; rebuild from source",
+        ));
+    }
+    Ok(())
 }
 
 fn import_raw_cbm_rows_to_vault<C, R>(
@@ -1660,7 +1731,8 @@ fn write_cbm_graph_snapshot_sqlite(snapshot: &CbmGraphSnapshot, path: &Path) -> 
         .map_err(|error| invalid_sqlite(format!("create row-sink SQLite: {error}")))?;
     connection
         .execute_batch(
-            "CREATE TABLE projects (
+            "PRAGMA user_version = 3;
+             CREATE TABLE projects (
                name TEXT PRIMARY KEY,
                indexed_at TEXT NOT NULL,
                root_path TEXT NOT NULL
@@ -1683,8 +1755,19 @@ fn write_cbm_graph_snapshot_sqlite(snapshot: &CbmGraphSnapshot, path: &Path) -> 
                start_line INTEGER DEFAULT 0,
                end_line INTEGER DEFAULT 0,
                properties TEXT DEFAULT '{}',
-               UNIQUE(project, qualified_name)
+               atom_id TEXT NOT NULL,
+               source_present INTEGER NOT NULL CHECK(source_present IN (0,1)),
+               source_bytes BLOB,
+               source_sha256 TEXT NOT NULL DEFAULT '',
+               start_byte INTEGER NOT NULL DEFAULT 0,
+               end_byte INTEGER NOT NULL DEFAULT 0,
+               CHECK((source_present = 0 AND source_bytes IS NULL AND source_sha256 = '' AND
+                 start_byte = 0 AND end_byte = 0) OR (source_present = 1 AND source_bytes IS NOT NULL
+                 AND length(source_sha256) = 64 AND end_byte >= start_byte AND
+                 length(source_bytes) = end_byte - start_byte)),
+               UNIQUE(project, atom_id)
              );
+             CREATE INDEX idx_nodes_qn ON nodes(project, qualified_name);
              CREATE TABLE edges (
                id INTEGER PRIMARY KEY,
                project TEXT NOT NULL,
@@ -1764,9 +1847,22 @@ fn write_cbm_graph_snapshot_sqlite(snapshot: &CbmGraphSnapshot, path: &Path) -> 
     }
     for node in &snapshot.nodes {
         ensure_json_object_text(&node.properties_json, "row-sink node properties")?;
+        let source_value = node.source_present.then_some(node.source_bytes.as_slice());
+        let start_byte = i64::try_from(node.start_byte).map_err(|_| {
+            invalid_sqlite(format!(
+                "row-sink node atom {} start_byte {} exceeds SQLite INTEGER range",
+                node.atom_id, node.start_byte
+            ))
+        })?;
+        let end_byte = i64::try_from(node.end_byte).map_err(|_| {
+            invalid_sqlite(format!(
+                "row-sink node atom {} end_byte {} exceeds SQLite INTEGER range",
+                node.atom_id, node.end_byte
+            ))
+        })?;
         connection.execute(
-            "INSERT INTO nodes(id, project, label, name, qualified_name, file_path, start_line, end_line, properties)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            "INSERT INTO nodes(id, project, label, name, qualified_name, file_path, start_line, end_line, properties, atom_id, source_present, source_bytes, source_sha256, start_byte, end_byte)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
             params![
                 node.source_node_id,
                 node.project,
@@ -1777,6 +1873,12 @@ fn write_cbm_graph_snapshot_sqlite(snapshot: &CbmGraphSnapshot, path: &Path) -> 
                 node.start_line,
                 node.end_line,
                 node.properties_json,
+                node.atom_id,
+                i64::from(node.source_present),
+                source_value,
+                node.source_sha256,
+                start_byte,
+                end_byte,
             ],
         )
         .map_err(|error| invalid_sqlite(format!("insert row-sink node: {error}")))?;
@@ -1992,10 +2094,16 @@ fn snapshot_node_rows(
             project: node.project.clone(),
             label: node.label.clone(),
             name: node.name.clone(),
+            atom_id: node.atom_id.clone(),
             qualified_name: node.qualified_name.clone(),
             file_path: node.file_path.clone(),
             start_line: node.start_line,
             end_line: node.end_line,
+            source_present: node.source_present,
+            source_bytes: node.source_bytes.clone(),
+            source_sha256: node.source_sha256.clone(),
+            start_byte: node.start_byte,
+            end_byte: node.end_byte,
             properties,
             properties_json: node.properties_json.clone(),
             node_vector: node.node_vector.clone(),
@@ -2338,7 +2446,8 @@ fn read_nodes(connection: &Connection, project: &str) -> IngestResult<Vec<RawNod
         .prepare(
             "SELECT id, project, label, name, qualified_name, \
              COALESCE(file_path, ''), COALESCE(start_line, 0), \
-             COALESCE(end_line, 0), COALESCE(properties, '{}') \
+             COALESCE(end_line, 0), COALESCE(properties, '{}'), atom_id, \
+             source_present, source_bytes, source_sha256, start_byte, end_byte \
              FROM nodes WHERE project = ?1 ORDER BY id",
         )
         .map_err(|error| invalid_sqlite(format!("prepare nodes query: {error}")))?;
@@ -2354,6 +2463,12 @@ fn read_nodes(connection: &Connection, project: &str) -> IngestResult<Vec<RawNod
                 row.get::<_, i64>(6)?,
                 row.get::<_, i64>(7)?,
                 row.get::<_, String>(8)?,
+                row.get::<_, String>(9)?,
+                row.get::<_, i64>(10)?,
+                row.get::<_, Option<Vec<u8>>>(11)?,
+                row.get::<_, String>(12)?,
+                row.get::<_, i64>(13)?,
+                row.get::<_, i64>(14)?,
             ))
         })
         .map_err(|error| invalid_sqlite(format!("query nodes: {error}")))?;
@@ -2370,6 +2485,12 @@ fn read_nodes(connection: &Connection, project: &str) -> IngestResult<Vec<RawNod
             start_line,
             end_line,
             properties_json,
+            atom_id,
+            source_present,
+            source_bytes,
+            source_sha256,
+            start_byte,
+            end_byte,
         ) = row.map_err(|error| {
             invalid_sqlite(format!(
                 "read nodes row: {error}; a non-UTF-8 text column violates the \
@@ -2378,6 +2499,62 @@ fn read_nodes(connection: &Connection, project: &str) -> IngestResult<Vec<RawNod
                  current binary"
             ))
         })?;
+        if atom_id.len() != 64
+            || !atom_id
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err(invalid_sqlite(format!(
+                "node {id} atom_id is not one canonical 64-digit hexadecimal source identity; rebuild this collapsed legacy store"
+            )));
+        }
+        if source_present != 0 && source_present != 1 {
+            return Err(invalid_sqlite(format!(
+                "node {id} source_present must be exactly zero or one, got {source_present}"
+            )));
+        }
+        if start_byte < 0 || end_byte < 0 {
+            return Err(invalid_sqlite(format!(
+                "node {id} has a negative exact-source byte span {start_byte}..{end_byte}"
+            )));
+        }
+        let source_present = source_present == 1;
+        let start_byte = u64::try_from(start_byte)
+            .map_err(|_| invalid_sqlite(format!("node {id} start_byte is out of range")))?;
+        let end_byte = u64::try_from(end_byte)
+            .map_err(|_| invalid_sqlite(format!("node {id} end_byte is out of range")))?;
+        let source_bytes = match (source_present, source_bytes) {
+            (true, Some(bytes)) => bytes,
+            (true, None) => {
+                return Err(invalid_sqlite(format!(
+                    "node {id} declares exact source but source_bytes is NULL"
+                )));
+            }
+            (false, None) => Vec::new(),
+            (false, Some(_)) => {
+                return Err(invalid_sqlite(format!(
+                    "node {id} has source bytes while source_present is zero"
+                )));
+            }
+        };
+        if source_present {
+            if end_byte < start_byte || end_byte - start_byte != source_bytes.len() as u64 {
+                return Err(invalid_sqlite(format!(
+                    "node {id} source length {} does not equal its exact span {start_byte}..{end_byte}",
+                    source_bytes.len()
+                )));
+            }
+            let actual_sha256 = hex_lower(&sha256_digest(&source_bytes));
+            if source_sha256 != actual_sha256 {
+                return Err(invalid_sqlite(format!(
+                    "node {id} source_sha256 mismatch: stored {source_sha256}, actual {actual_sha256}"
+                )));
+            }
+        } else if !source_sha256.is_empty() || start_byte != 0 || end_byte != 0 {
+            return Err(invalid_sqlite(format!(
+                "node {id} has source metadata while source_present is zero"
+            )));
+        }
         let properties = serde_json::from_str::<Value>(&properties_json).map_err(|error| {
             invalid_sqlite(format!("node {id} properties JSON is invalid: {error}"))
         })?;
@@ -2391,10 +2568,16 @@ fn read_nodes(connection: &Connection, project: &str) -> IngestResult<Vec<RawNod
             project,
             label,
             name,
+            atom_id,
             qualified_name,
             file_path,
             start_line,
             end_line,
+            source_present,
+            source_bytes,
+            source_sha256,
+            start_byte,
+            end_byte,
             properties,
             properties_json,
             node_vector: vectors.get(&id).cloned(),
@@ -2508,10 +2691,16 @@ pub struct CbmSqlitePipelineNode {
     pub project: String,
     pub label: String,
     pub name: String,
+    pub atom_id: String,
     pub qualified_name: String,
     pub file_path: String,
     pub start_line: i64,
     pub end_line: i64,
+    pub source_present: bool,
+    pub source_bytes: Vec<u8>,
+    pub source_sha256: String,
+    pub start_byte: u64,
+    pub end_byte: u64,
     pub properties_json: String,
 }
 
@@ -2575,10 +2764,16 @@ pub fn read_cbm_sqlite_pipeline_rows(
             project: node.project,
             label: node.label,
             name: node.name,
+            atom_id: node.atom_id,
             qualified_name: node.qualified_name,
             file_path: node.file_path,
             start_line: node.start_line,
             end_line: node.end_line,
+            source_present: node.source_present,
+            source_bytes: node.source_bytes,
+            source_sha256: node.source_sha256,
+            start_byte: node.start_byte,
+            end_byte: node.end_byte,
             properties_json: node.properties_json,
         })
         .collect();
@@ -2775,23 +2970,6 @@ fn read_token_vectors(
     Ok(out)
 }
 
-/// Deterministic content bytes for a symbol whose substrate (libcbm) emits no raw
-/// source snippet (#413). Frames the signature and the exact extracted-property bytes so
-/// the canonical identity bytes (and thus CxId) vary with every body-derived attribute
-/// the panel measures -- `properties_json` is libcbm's per-definition attribute set
-/// (`st`, `bt`, `fp`, `sp`, `callees`, complexity, docstring, type surface, ...), which
-/// is deterministic for a given body and produced identically on the live and historical
-/// extract paths by the one linked libcbm archive. The length-prefixed frame keeps the
-/// signature and property bytes from bleeding into each other so no two distinct
-/// (signature, properties) pairs can alias.
-fn symbol_content_fingerprint(properties_json: &str, signature: &str) -> Vec<u8> {
-    let mut out = Vec::with_capacity(signature.len() + properties_json.len() + 8);
-    out.extend_from_slice(&(signature.len() as u64).to_be_bytes());
-    out.extend_from_slice(signature.as_bytes());
-    out.extend_from_slice(properties_json.as_bytes());
-    out
-}
-
 fn extract_nodes(raw_nodes: Vec<RawNodeRow>) -> IngestResult<Vec<ExtractedNode>> {
     let mut out = Vec::with_capacity(raw_nodes.len());
     for raw in raw_nodes {
@@ -2804,28 +2982,14 @@ fn extract_nodes(raw_nodes: Vec<RawNodeRow>) -> IngestResult<Vec<ExtractedNode>>
         let signature = string_property(&raw.properties, &["signature", "definition"])
             .unwrap_or(raw.name.as_str())
             .to_string();
-        // #413: content-address identity on the exact symbol content. libcbm emits no
-        // raw `source`/`body`/`snippet` property, so when one is absent we must NOT fall
-        // back to the body-independent `signature` alone: two historically distinct
-        // bodies of the same symbol (identical file/line-span/signature) would then
-        // collide on one CxId while their panel slots -- encoded from the body-derived
-        // libcbm properties (`st`, `bt`, `fp`, `sp`, `callees`, complexity, ...) --
-        // diverge, tripping the immutable-Base readback mismatch
-        // (ASTRO_INGEST_READBACK_MISMATCH: preexisting historical slot N differs) during
-        // historical admission. Folding the full extracted property set into the
-        // canonical content bytes makes CxId a complete content address over exactly the
-        // inputs that determine the constellation: equal CxId => equal properties =>
-        // equal slot inputs => equal slots, so an unchanged body legitimately reuses one
-        // immutable row and any body change mints a distinct version. Applied uniformly
-        // to the live and historical extract paths (both route through this function),
-        // so the same body always derives the same CxId across HEAD and every commit.
-        let source_snippet = match string_property(
-            &raw.properties,
-            &["source_snippet", "source", "body", "snippet"],
-        ) {
-            Some(source) => source.as_bytes().to_vec(),
-            None => symbol_content_fingerprint(&raw.properties_json, &signature),
-        };
+        // #501/#473: canonical content is the byte-exact source column read from the
+        // persisted CBM store. Missing source stays explicitly absent (empty canonical
+        // source for structural/synthetic nodes); it is never replaced by a signature,
+        // properties fingerprint, lossy text decode, or another proxy.
+        let source_snippet = raw.source_bytes.clone();
+        let expected_source_blake3 = raw
+            .source_present
+            .then(|| *blake3::hash(&source_snippet).as_bytes());
 
         let mut symbol = SymbolRecord::new(
             raw.project,
@@ -2838,7 +3002,7 @@ fn extract_nodes(raw_nodes: Vec<RawNodeRow>) -> IngestResult<Vec<ExtractedNode>>
             start_line,
             end_line,
         );
-        symbol.expected_source_snippet_blake3 = source_hash(&raw.properties, raw.id)?;
+        symbol.expected_source_snippet_blake3 = expected_source_blake3;
         symbol.scalars = scalar_properties(&raw.properties)?;
         symbol
             .scalars
@@ -2846,12 +3010,19 @@ fn extract_nodes(raw_nodes: Vec<RawNodeRow>) -> IngestResult<Vec<ExtractedNode>>
         symbol
             .scalars
             .insert("end_line".to_string(), f64::from(end_line));
+        symbol
+            .scalars
+            .insert("start_byte".to_string(), raw.start_byte as f64);
+        symbol
+            .scalars
+            .insert("end_byte".to_string(), raw.end_byte as f64);
         symbol.anchors = anchor_evidence(&raw.properties, raw.id)?;
 
         let node_vector_sha256 = raw.node_vector.as_ref().map(|bytes| sha256_digest(bytes));
         let node_vector_bytes = raw.node_vector.as_ref().map(Vec::len);
         out.push(ExtractedNode {
             id: raw.id,
+            atom_id: raw.atom_id,
             label,
             name: raw.name,
             symbol,
@@ -3130,8 +3301,9 @@ fn graph_semantic_json(bytes: &[u8]) -> IngestResult<Value> {
 /// (#345, edge fold #372).
 ///
 /// Folds every raw field that determines a symbol's content-addressed identity or its
-/// persisted graph/base/slot rows — id, project, label, name, qualified name, file path,
-/// line span, properties JSON, and node vector — plus, for every edge whose SOURCE node
+/// persisted graph/base/slot rows — id, project, label, name, stable atom, qualified name,
+/// file path, line span, byte-exact source contract, properties JSON, and node vector —
+/// plus, for every edge whose SOURCE node
 /// lives in this file, the edge's raw fields (id, endpoints, type, properties JSON,
 /// local_name_gen). Everything is length-prefixed so no field boundary is ambiguous,
 /// together with the digest domain and panel version. Node and edge order is normalized by
@@ -3161,10 +3333,16 @@ fn file_content_digest(
         section(&mut hasher, node.project.as_bytes());
         section(&mut hasher, node.label.as_bytes());
         section(&mut hasher, node.name.as_bytes());
+        section(&mut hasher, node.atom_id.as_bytes());
         section(&mut hasher, node.qualified_name.as_bytes());
         section(&mut hasher, node.file_path.as_bytes());
         section(&mut hasher, &node.start_line.to_be_bytes());
         section(&mut hasher, &node.end_line.to_be_bytes());
+        section(&mut hasher, &[u8::from(node.source_present)]);
+        section(&mut hasher, &node.source_bytes);
+        section(&mut hasher, node.source_sha256.as_bytes());
+        section(&mut hasher, &node.start_byte.to_be_bytes());
+        section(&mut hasher, &node.end_byte.to_be_bytes());
         section(&mut hasher, node.properties_json.as_bytes());
         match &node.node_vector {
             Some(bytes) => {
@@ -3692,6 +3870,7 @@ where
     if let Some((cx_id, series_id)) = digest_reuse.get(&node.id).copied() {
         return Ok(PreparedLiveSymbol {
             node_id: node.id,
+            atom_id: node.atom_id,
             name: node.name,
             properties_json: node.properties_json,
             node_vector: node.node_vector,
@@ -3716,6 +3895,7 @@ where
     if reused {
         return Ok(PreparedLiveSymbol {
             node_id: node.id,
+            atom_id: node.atom_id,
             name: node.name,
             properties_json: node.properties_json,
             node_vector: node.node_vector,
@@ -3727,6 +3907,7 @@ where
     let prepared = prepare_constellation(vault, runtime, options, driver, node, retention)?;
     Ok(PreparedLiveSymbol {
         node_id: prepared.node_id,
+        atom_id: prepared.atom_id,
         name: prepared.name,
         properties_json: prepared.properties_json,
         node_vector: prepared.node_vector,
@@ -3934,6 +4115,7 @@ where
     constellation.validate_schema()?;
     Ok(PreparedConstellation {
         node_id: node.id,
+        atom_id: node.atom_id,
         name: node.name,
         properties_json,
         node_vector: node.node_vector,
@@ -4028,11 +4210,14 @@ fn node_map_graph_row(
     options: &SqliteImportOptions,
     prepared: &PreparedLiveSymbol,
 ) -> IngestResult<(Vec<u8>, Vec<u8>)> {
+    let (source_present, source_bytes, source_sha256, start_byte, end_byte) =
+        symbol_exact_source_contract(&prepared.symbol)?;
     let row = NodeMapRow {
         schema: SCHEMA_NODE_MAP.to_string(),
         series_id_schema: SERIES_ID_TAG.to_string(),
         project: prepared.symbol.project.clone(),
         node_id: prepared.node_id,
+        atom_id: prepared.atom_id.clone(),
         qualified_name: prepared.symbol.qualified_name.clone(),
         label: prepared.symbol.label.clone(),
         cx_id: prepared.identity.cx_id,
@@ -4042,6 +4227,11 @@ fn node_map_graph_row(
         name: Some(prepared.name.clone()),
         start_line: Some(i64::from(prepared.symbol.start_line)),
         end_line: Some(i64::from(prepared.symbol.end_line)),
+        source_present,
+        source_bytes,
+        source_sha256,
+        start_byte,
+        end_byte,
         properties_json: Some(prepared.properties_json.clone()),
         node_vector: prepared.node_vector.clone(),
     };
@@ -4055,10 +4245,13 @@ fn structural_graph_row(
     options: &SqliteImportOptions,
     node: &ExtractedNode,
 ) -> IngestResult<(Vec<u8>, Vec<u8>)> {
+    let (source_present, source_bytes, source_sha256, start_byte, end_byte) =
+        symbol_exact_source_contract(&node.symbol)?;
     let row = StructuralNodeRow {
         schema: SCHEMA_STRUCTURAL_NODE.to_string(),
         project: node.symbol.project.clone(),
         node_id: node.id,
+        atom_id: node.atom_id.clone(),
         qualified_name: node.symbol.qualified_name.clone(),
         label: node.symbol.label.clone(),
         name: node.name.clone(),
@@ -4066,6 +4259,11 @@ fn structural_graph_row(
         commit: options.commit.clone(),
         start_line: Some(i64::from(node.symbol.start_line)),
         end_line: Some(i64::from(node.symbol.end_line)),
+        source_present,
+        source_bytes,
+        source_sha256,
+        start_byte,
+        end_byte,
         properties_json: Some(node.properties_json.clone()),
         node_vector: node.node_vector.clone(),
     };
@@ -4073,6 +4271,55 @@ fn structural_graph_row(
         graph_key(STRUCTURAL_NODE_PREFIX, &node.symbol.project, node.id)?,
         serde_json::to_vec(&row)?,
     ))
+}
+
+fn symbol_exact_source_contract(
+    symbol: &SymbolRecord,
+) -> IngestResult<(bool, Vec<u8>, String, u64, u64)> {
+    let scalar_u64 = |name: &str| -> IngestResult<u64> {
+        let value = symbol.scalars.get(name).copied().ok_or_else(|| {
+            IngestError::InvalidInput(format!(
+                "symbol {} is missing required {name} exact-source scalar",
+                symbol.qualified_name
+            ))
+        })?;
+        if !value.is_finite() || value < 0.0 || value.fract() != 0.0 || value > u64::MAX as f64 {
+            return Err(IngestError::InvalidInput(format!(
+                "symbol {} has invalid {name} exact-source scalar {value}",
+                symbol.qualified_name
+            )));
+        }
+        Ok(value as u64)
+    };
+    let source_present = symbol.expected_source_snippet_blake3.is_some();
+    let start_byte = scalar_u64("start_byte")?;
+    let end_byte = scalar_u64("end_byte")?;
+    if source_present {
+        if end_byte < start_byte
+            || end_byte - start_byte != symbol.source_snippet_bytes.len() as u64
+        {
+            return Err(IngestError::InvalidInput(format!(
+                "symbol {} exact source length {} disagrees with span {start_byte}..{end_byte}",
+                symbol.qualified_name,
+                symbol.source_snippet_bytes.len()
+            )));
+        }
+        Ok((
+            true,
+            symbol.source_snippet_bytes.clone(),
+            hex_lower(&sha256_digest(&symbol.source_snippet_bytes)),
+            start_byte,
+            end_byte,
+        ))
+    } else {
+        if !symbol.source_snippet_bytes.is_empty() || start_byte != 0 || end_byte != 0 {
+            return Err(IngestError::InvalidInput(format!(
+                "symbol {} carries source bytes or a span without source presence",
+                symbol.qualified_name
+            )));
+        }
+        Ok((false, Vec::new(), String::new(), 0, 0))
+    }
 }
 
 fn append_import_fingerprint(
@@ -4979,10 +5226,16 @@ where
             project: row.project,
             label: row.label,
             name,
+            atom_id: row.atom_id,
             qualified_name: row.qualified_name,
             file_path,
             start_line,
             end_line,
+            source_present: row.source_present,
+            source_bytes: row.source_bytes,
+            source_sha256: row.source_sha256,
+            start_byte: row.start_byte,
+            end_byte: row.end_byte,
             properties_json,
             node_vector: row.node_vector,
             cx_id: Some(row.cx_id),
@@ -5007,10 +5260,16 @@ where
             project: row.project,
             label: row.label,
             name: row.name,
+            atom_id: row.atom_id,
             qualified_name: row.qualified_name,
             file_path: row.file_path,
             start_line: row.start_line.unwrap_or(0),
             end_line: row.end_line.unwrap_or(0),
+            source_present: row.source_present,
+            source_bytes: row.source_bytes,
+            source_sha256: row.source_sha256,
+            start_byte: row.start_byte,
+            end_byte: row.end_byte,
             properties_json,
             node_vector: row.node_vector,
             cx_id: None,
@@ -5821,22 +6080,6 @@ fn scalar_string_key(key: &str) -> Option<&str> {
         .filter(|name| !name.is_empty())
 }
 
-fn source_hash(properties: &Value, node_id: i64) -> IngestResult<Option<[u8; 32]>> {
-    let Some(raw) = string_property(
-        properties,
-        &[
-            "source_snippet_blake3",
-            "source_hash_blake3",
-            "snippet_blake3",
-        ],
-    ) else {
-        return Ok(None);
-    };
-    parse_hex_32(raw)
-        .map(Some)
-        .map_err(|message| invalid_sqlite(format!("node {node_id} source hash invalid: {message}")))
-}
-
 fn anchor_evidence(properties: &Value, node_id: i64) -> IngestResult<Vec<AnchorEvidence>> {
     let Some(values) = properties.get("anchors").and_then(Value::as_array) else {
         return Ok(Vec::new());
@@ -5922,28 +6165,6 @@ fn modality_for_label(label: SymbolLabel) -> Modality {
         | SymbolLabel::EnvVar => Modality::Structured,
         SymbolLabel::Project | SymbolLabel::Branch | SymbolLabel::Folder => Modality::Structured,
         _ => Modality::Code,
-    }
-}
-
-fn parse_hex_32(value: &str) -> Result<[u8; 32], String> {
-    if value.len() != 64 {
-        return Err(format!("expected 64 hex characters, got {}", value.len()));
-    }
-    let mut out = [0_u8; 32];
-    for (index, chunk) in value.as_bytes().chunks_exact(2).enumerate() {
-        let hi = hex_value(chunk[0]).ok_or_else(|| format!("invalid hex at {}", index * 2))?;
-        let lo = hex_value(chunk[1]).ok_or_else(|| format!("invalid hex at {}", index * 2 + 1))?;
-        out[index] = (hi << 4) | lo;
-    }
-    Ok(out)
-}
-
-fn hex_value(value: u8) -> Option<u8> {
-    match value {
-        b'0'..=b'9' => Some(value - b'0'),
-        b'a'..=b'f' => Some(value - b'a' + 10),
-        b'A'..=b'F' => Some(value - b'A' + 10),
-        _ => None,
     }
 }
 

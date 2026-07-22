@@ -383,29 +383,6 @@ static void build_def_props(char *buf, size_t bufsize, const CBMDefinition *def,
     /* API callees — panel S4 (api_callees guard slot) encoder source (#374). */
     append_json_string(buf, bufsize, &pos, "callees", callees);
 
-    /* #501/#473: byte-exact parse-time source span + exact source bytes. `sb`/`eb`
-     * are the end-exclusive tree-sitter byte offsets of the definition node; the
-     * importer reads `source_snippet` as the real code payload for
-     * `source_snippet_bytes` (dedup census #473) and S18-S20 measurement (#501),
-     * replacing the #413 property-fingerprint proxy. The `source_snippet` append
-     * is atomic (append_json_string): a body too large for the remaining buffer
-     * emits no field and the symbol stays honestly source-absent (falls back to
-     * the fingerprint, labeled) rather than carrying truncated bytes. The byte
-     * offsets are emitted only alongside the exact bytes so a consumer never sees
-     * a span without its verifiable payload. */
-    if (def->source && def->end_byte > def->start_byte) {
-        size_t before = pos;
-        append_json_string(buf, bufsize, &pos, "source_snippet", def->source);
-        if (pos != before) {
-            /* Exact bytes fit; emit the matching byte span as JSON numbers. */
-            int wrote = snprintf(buf + pos, bufsize - pos, ",\"sb\":%u,\"eb\":%u",
-                                 def->start_byte, def->end_byte);
-            if (wrote > 0 && (size_t)wrote < bufsize - pos) {
-                pos += (size_t)wrote;
-            }
-        }
-    }
-
     if (pos < bufsize - SKIP_ONE) {
         buf[pos] = '}';
         buf[pos + SKIP_ONE] = '\0';
@@ -416,13 +393,14 @@ static void build_def_props(char *buf, size_t bufsize, const CBMDefinition *def,
  * pipeline_internal.h for the contract. Deduplicates by callee name and counts
  * occurrences; the emitted order is dedup-insertion order (the S4 encoder hashes
  * terms into a sparse sum, so order does not affect the resulting vector). */
-int cbm_pipeline_build_def_callees(const CBMCallArray *calls, const char *def_qn, char *buf,
-                                   int bufsize) {
+int cbm_pipeline_build_def_callees(const CBMCallArray *calls, const char *def_qn,
+                                   int def_start_line, int def_end_line, char *buf, int bufsize) {
     if (!buf || bufsize < 1) {
         return 0;
     }
     buf[0] = '\0';
-    if (!calls || !calls->items || calls->count <= 0 || !def_qn || !def_qn[0]) {
+    if (!calls || !calls->items || calls->count <= 0 || !def_qn || !def_qn[0] ||
+        def_start_line <= 0 || def_end_line < def_start_line) {
         return 0;
     }
     enum { CBM_DEF_CALLEE_MAX = 512 };
@@ -434,7 +412,8 @@ int cbm_pipeline_build_def_callees(const CBMCallArray *calls, const char *def_qn
         if (!call->callee_name || !call->callee_name[0]) {
             continue;
         }
-        if (!call->enclosing_func_qn || strcmp(call->enclosing_func_qn, def_qn) != 0) {
+        if (!call->enclosing_func_qn || strcmp(call->enclosing_func_qn, def_qn) != 0 ||
+            call->start_line < def_start_line || call->start_line > def_end_line) {
             continue;
         }
         int found = -1;
@@ -469,6 +448,19 @@ int cbm_pipeline_build_def_callees(const CBMCallArray *calls, const char *def_qn
     return pos;
 }
 
+const cbm_gbuf_node_t *cbm_pipeline_find_definition_node(const cbm_gbuf_t *gbuf,
+                                                         const CBMDefinition *def,
+                                                         const char *fallback_rel_path) {
+    if (!gbuf || !def || !def->name || !def->qualified_name || !def->source) {
+        return NULL;
+    }
+    return cbm_gbuf_find_source_node(
+        gbuf, def->label ? def->label : "Function", def->name, def->qualified_name,
+        def->file_path ? def->file_path : fallback_rel_path, (int)def->start_line,
+        (int)def->end_line, (const uint8_t *)def->source, (size_t)def->source_len,
+        def->start_byte, def->end_byte);
+}
+
 /* Process one definition: create node, register, DEFINES + DEFINES_METHOD edges. */
 static void process_def(cbm_pipeline_ctx_t *ctx, const CBMCallArray *calls,
                         const CBMDefinition *def, const char *rel) {
@@ -481,11 +473,14 @@ static void process_def(cbm_pipeline_ctx_t *ctx, const CBMCallArray *calls,
      * unmeasured for that slot rather than truncated (#374). */
     char props[CBM_SZ_32K];
     char callees[CBM_SZ_8K];
-    cbm_pipeline_build_def_callees(calls, def->qualified_name, callees, (int)sizeof(callees));
+    cbm_pipeline_build_def_callees(calls, def->qualified_name, (int)def->start_line,
+                                   (int)def->end_line, callees, (int)sizeof(callees));
     build_def_props(props, sizeof(props), def, callees);
-    int64_t node_id = cbm_gbuf_upsert_node(
+    int64_t node_id = cbm_gbuf_upsert_source_node(
         ctx->gbuf, def->label ? def->label : "Function", def->name, def->qualified_name,
-        def->file_path ? def->file_path : rel, (int)def->start_line, (int)def->end_line, props);
+        def->file_path ? def->file_path : rel, (int)def->start_line, (int)def->end_line,
+        (const uint8_t *)def->source, (size_t)def->source_len, def->start_byte, def->end_byte,
+        props);
     /* Register callable symbols + every type-like container (Class/Struct/
      * Interface/Enum/Type/Trait). Type-like defs must be in the registry so
      * `class Foo : IBar` (INHERITS), `impl Trait for S` (IMPLEMENTS), and method/
@@ -507,7 +502,9 @@ static void process_def(cbm_pipeline_ctx_t *ctx, const CBMCallArray *calls,
     }
     free(file_qn);
     if (def->parent_class && def->label && strcmp(def->label, "Method") == 0) {
-        const cbm_gbuf_node_t *parent = cbm_gbuf_find_by_qn(ctx->gbuf, def->parent_class);
+        const cbm_gbuf_node_t *parent = cbm_gbuf_find_by_qn_location(
+            ctx->gbuf, def->parent_class, def->file_path ? def->file_path : rel,
+            (int)def->start_line);
         if (parent && node_id > 0) {
             cbm_gbuf_insert_edge(ctx->gbuf, parent->id, node_id, "DEFINES_METHOD", "{}");
         }
@@ -521,7 +518,10 @@ static const cbm_gbuf_node_t *find_channel_source(cbm_pipeline_ctx_t *ctx, const
                                                   const char *rel) {
     const cbm_gbuf_node_t *node = NULL;
     if (ch->enclosing_func_qn && ch->enclosing_func_qn[0]) {
-        node = cbm_gbuf_find_by_qn(ctx->gbuf, ch->enclosing_func_qn);
+        node = ch->start_line > 0
+                   ? cbm_gbuf_find_by_qn_location(ctx->gbuf, ch->enclosing_func_qn, rel,
+                                                  ch->start_line)
+                   : cbm_gbuf_find_by_qn(ctx->gbuf, ch->enclosing_func_qn);
     }
     if (!node) {
         char *file_qn = cbm_pipeline_fqn_compute(ctx->project_name, rel, "__file__");
@@ -589,7 +589,10 @@ static int create_env_configures_for_file(cbm_pipeline_ctx_t *ctx, const CBMFile
         }
         const cbm_gbuf_node_t *src = NULL;
         if (ea->enclosing_func_qn && ea->enclosing_func_qn[0]) {
-            src = cbm_gbuf_find_by_qn(ctx->gbuf, ea->enclosing_func_qn);
+            src = ea->start_line > 0
+                      ? cbm_gbuf_find_by_qn_location(ctx->gbuf, ea->enclosing_func_qn, rel,
+                                                     ea->start_line)
+                      : cbm_gbuf_find_by_qn(ctx->gbuf, ea->enclosing_func_qn);
         }
         if (!src) {
             if (!file_qn) {

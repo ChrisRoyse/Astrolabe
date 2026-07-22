@@ -150,7 +150,6 @@ int cbm_tokenize_decorator(const char *dec, char **out, int max_out) {
 /* Per-node tokenization state */
 typedef struct {
     int64_t node_id;
-    char *qualified_name;
     char **words;
     int word_count;
 } tagged_node_t;
@@ -280,7 +279,6 @@ static int cmp_str(const void *a, const void *b) {
 /* Free tagged_node_t array. */
 static void free_tagged_nodes(tagged_node_t *nodes, int count) {
     for (int n = 0; n < count; n++) {
-        free(nodes[n].qualified_name);
         for (int w = 0; w < nodes[n].word_count; w++) {
             free(nodes[n].words[w]);
         }
@@ -321,7 +319,6 @@ static int collect_decorated_nodes(cbm_gbuf_t *gbuf, tagged_node_t **out_nodes,
             }
             tagged_node_t *tn = &nodes[node_count++];
             tn->node_id = found[i]->id;
-            tn->qualified_name = strdup(found[i]->qualified_name);
             tn->words = words;
             tn->word_count = wc;
             for (int w = 0; w < wc; w++) {
@@ -352,7 +349,7 @@ static int apply_decorator_tags(cbm_gbuf_t *gbuf, tagged_node_t *nodes, int node
         }
         qsort(tag_words, tag_count, sizeof(char *), cmp_str);
 
-        const cbm_gbuf_node_t *gn = cbm_gbuf_find_by_qn(gbuf, nodes[n].qualified_name);
+        const cbm_gbuf_node_t *gn = cbm_gbuf_find_by_id(gbuf, nodes[n].node_id);
         if (!gn) {
             continue;
         }
@@ -360,10 +357,19 @@ static int apply_decorator_tags(cbm_gbuf_t *gbuf, tagged_node_t *nodes, int node
         const char *props = gn->properties_json ? gn->properties_json : "{}";
         char *new_props = inject_decorator_tags(props, tag_words, tag_count);
         if (new_props) {
-            cbm_gbuf_upsert_node(gbuf, gn->label, gn->name, gn->qualified_name, gn->file_path,
-                                 gn->start_line, gn->end_line, new_props);
+            int64_t updated =
+                gn->source_present
+                    ? cbm_gbuf_upsert_source_node(
+                          gbuf, gn->label, gn->name, gn->qualified_name, gn->file_path,
+                          gn->start_line, gn->end_line, gn->source_bytes, gn->source_len,
+                          gn->start_byte, gn->end_byte, new_props)
+                    : cbm_gbuf_upsert_node(gbuf, gn->label, gn->name, gn->qualified_name,
+                                           gn->file_path, gn->start_line, gn->end_line,
+                                           new_props);
             free(new_props);
-            tagged++;
+            if (updated > 0) {
+                tagged++;
+            }
         }
     }
     return tagged;

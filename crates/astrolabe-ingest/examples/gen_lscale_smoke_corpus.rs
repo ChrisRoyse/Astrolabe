@@ -47,6 +47,7 @@ struct NodeRow {
     id: i64,
     label: &'static str,
     name: String,
+    atom_id: String,
     qualified_name: String,
     file_path: String,
     start_line: i64,
@@ -72,6 +73,7 @@ fn build_rows(node_count: usize, seed: u64) -> (Vec<NodeRow>, Vec<EdgeRow>) {
             id: (index + 1) as i64,
             label: "Folder",
             name: format!("pkg{index}"),
+            atom_id: String::new(),
             qualified_name: format!("{PROJECT}.pkg{index}"),
             file_path: format!("src/pkg{index}"),
             start_line: 0,
@@ -119,6 +121,7 @@ fn build_rows(node_count: usize, seed: u64) -> (Vec<NodeRow>, Vec<EdgeRow>) {
             id,
             label,
             name: name.clone(),
+            atom_id: String::new(),
             qualified_name: format!("{PROJECT}.pkg{folder}.{name}"),
             file_path: format!("src/pkg{folder}/mod_{:02}.py", index % 17),
             start_line,
@@ -157,6 +160,27 @@ fn build_rows(node_count: usize, seed: u64) -> (Vec<NodeRow>, Vec<EdgeRow>) {
             });
         }
     }
+    for node in &mut nodes {
+        let mut atom = Sha256::new();
+        atom.update(b"astrolabe.cbm.atom.v1");
+        for value in [
+            PROJECT.as_bytes(),
+            node.label.as_bytes(),
+            node.qualified_name.as_bytes(),
+            node.file_path.as_bytes(),
+            node.properties.as_bytes(),
+        ] {
+            atom.update((value.len() as u64).to_le_bytes());
+            atom.update(value);
+        }
+        atom.update(node.start_line.to_le_bytes());
+        atom.update(node.end_line.to_le_bytes());
+        node.atom_id = atom
+            .finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+    }
     (nodes, edges)
 }
 
@@ -166,6 +190,8 @@ fn content_sha256(nodes: &[NodeRow], edges: &[EdgeRow]) -> String {
     for node in nodes {
         hasher.update(node.id.to_le_bytes());
         hasher.update(node.label.as_bytes());
+        hasher.update([0]);
+        hasher.update(node.atom_id.as_bytes());
         hasher.update([0]);
         hasher.update(node.qualified_name.as_bytes());
         hasher.update([0]);
@@ -223,7 +249,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     fs::remove_file(&out).ok();
     let mut connection = Connection::open(&out)?;
     connection.execute_batch(
-        "CREATE TABLE projects (
+        "PRAGMA user_version = 3;
+         CREATE TABLE projects (
              name TEXT PRIMARY KEY,
              indexed_at TEXT NOT NULL,
              root_path TEXT NOT NULL
@@ -233,13 +260,24 @@ fn main() -> Result<(), Box<dyn Error>> {
              project TEXT NOT NULL,
              label TEXT NOT NULL,
              name TEXT NOT NULL,
+             atom_id TEXT NOT NULL,
              qualified_name TEXT NOT NULL,
              file_path TEXT DEFAULT '',
              start_line INTEGER DEFAULT 0,
              end_line INTEGER DEFAULT 0,
              properties TEXT DEFAULT '{}',
-             UNIQUE(project, qualified_name)
+             source_present INTEGER NOT NULL CHECK(source_present IN (0,1)),
+             source_bytes BLOB,
+             source_sha256 TEXT NOT NULL DEFAULT '',
+             start_byte INTEGER NOT NULL DEFAULT 0,
+             end_byte INTEGER NOT NULL DEFAULT 0,
+             CHECK((source_present = 0 AND source_bytes IS NULL AND source_sha256 = ''
+               AND start_byte = 0 AND end_byte = 0) OR (source_present = 1
+               AND source_bytes IS NOT NULL AND length(source_sha256) = 64
+               AND end_byte >= start_byte AND length(source_bytes) = end_byte - start_byte)),
+             UNIQUE(project, atom_id)
          );
+         CREATE INDEX idx_nodes_qn ON nodes(project, qualified_name);
          CREATE TABLE edges (
              id INTEGER PRIMARY KEY AUTOINCREMENT,
              project TEXT NOT NULL,
@@ -265,13 +303,14 @@ fn main() -> Result<(), Box<dyn Error>> {
     )?;
     for node in &nodes {
         tx.execute(
-            "INSERT INTO nodes(id, project, label, name, qualified_name, file_path, start_line, end_line, properties)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            "INSERT INTO nodes(id, project, label, name, atom_id, qualified_name, file_path, start_line, end_line, properties, source_present, source_bytes, source_sha256, start_byte, end_byte)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 0, NULL, '', 0, 0)",
             params![
                 node.id,
                 PROJECT,
                 node.label,
                 node.name,
+                node.atom_id,
                 node.qualified_name,
                 node.file_path,
                 node.start_line,

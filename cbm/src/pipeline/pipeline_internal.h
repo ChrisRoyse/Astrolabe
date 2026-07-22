@@ -518,16 +518,23 @@ int cbm_parallel_resolve(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, 
  * Re-targets these edges to Route nodes for cross-service traversal. */
 void cbm_pipeline_create_route_nodes(cbm_gbuf_t *gb);
 
-/* Aggregate the callee names of the calls attributed to `def_qn` (matched by
- * enclosing_func_qn equality — the SAME attribution the guard per-snippet
- * reparse applies) into a newline-delimited "name\tcount" list that seeds the
+/* Aggregate the callee names of the calls attributed to one exact definition
+ * (matched by enclosing_func_qn and source-line containment — the SAME
+ * attribution the guard per-snippet reparse applies) into a newline-delimited
+ * "name\tcount" list that seeds the
  * panel S4 (api_callees) encoder. Counts are deduplicated so the index-time S4
  * vector matches a guard reparse of the same body. Writes a NUL-terminated
  * string into buf (empty when the def makes no attributed call) and returns the
  * number of bytes written. Shared by the sequential and parallel definition
  * passes; defined in pass_definitions.c. */
-int cbm_pipeline_build_def_callees(const CBMCallArray *calls, const char *def_qn, char *buf,
-                                   int bufsize);
+int cbm_pipeline_build_def_callees(const CBMCallArray *calls, const char *def_qn,
+                                   int def_start_line, int def_end_line, char *buf, int bufsize);
+
+/* Resolve one extracted definition by its complete source-backed atom, never by
+ * its non-unique display qualified name. */
+const cbm_gbuf_node_t *cbm_pipeline_find_definition_node(const cbm_gbuf_t *gbuf,
+                                                         const CBMDefinition *def,
+                                                         const char *fallback_rel_path);
 
 /* Append a ,"args":[{"i":0,"e":"<expr>","v":"<value>"},...] field onto an edge's
  * JSON props (buffer content with NO trailing '}'; caller closes the object).
@@ -541,6 +548,10 @@ size_t cbm_pipeline_append_args_json(char *buf, size_t bufsize, size_t pos, cons
 
 int cbm_pipeline_pass_definitions(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files,
                                   int file_count);
+
+/* Read exactly the discovery-observed file bytes. The caller owns the returned
+ * allocation. A concurrent size/content transition is a structured hard failure. */
+uint8_t *cbm_pipeline_read_file_identity_bytes(const cbm_file_info_t *file, size_t *out_len);
 
 int cbm_pipeline_pass_k8s(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, int file_count);
 

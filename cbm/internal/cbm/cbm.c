@@ -1090,12 +1090,16 @@ static CBMFileResult *cbm_extract_file_impl(const char *source, int source_len,
     for (int di = 0; di < result->defs.count; di++) {
         CBMDefinition *d = &result->defs.items[di];
         if (d->source) {
+            if (d->source_len == 0 && d->end_byte > d->start_byte) {
+                d->source_len = d->end_byte - d->start_byte;
+            }
             continue; // already captured (e.g. a synthetic def set it explicitly)
         }
         if (d->end_byte > d->start_byte && source != NULL &&
             (size_t)d->end_byte <= (size_t)source_len) {
             uint32_t span_len = d->end_byte - d->start_byte;
             d->source = cbm_arena_strndup(a, source + d->start_byte, (size_t)span_len);
+            d->source_len = span_len;
         }
     }
 
