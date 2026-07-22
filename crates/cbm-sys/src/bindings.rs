@@ -2103,6 +2103,44 @@ unsafe extern "C" {
 unsafe extern "C" {
     pub fn cbm_confidence_band(score: f64) -> *const ::std::os::raw::c_char;
 }
+pub const cbm_store_verify_status_t_CBM_STORE_VERIFY_OK: cbm_store_verify_status_t = 0;
+pub const cbm_store_verify_status_t_CBM_STORE_VERIFY_SOURCE_MISSING: cbm_store_verify_status_t = 1;
+pub const cbm_store_verify_status_t_CBM_STORE_VERIFY_INTEGRITY_FAILED: cbm_store_verify_status_t =
+    2;
+pub const cbm_store_verify_status_t_CBM_STORE_VERIFY_IO_FAILED: cbm_store_verify_status_t = 3;
+pub type cbm_store_verify_status_t = ::std::os::raw::c_int;
+pub const CBM_STORE_VERIFY_OPERATION_MAX: _bindgen_ty_1 = 64;
+pub const CBM_STORE_VERIFY_DETAIL_MAX: _bindgen_ty_1 = 512;
+pub const CBM_STORE_VERIFY_PATH_MAX: _bindgen_ty_1 = 4096;
+pub type _bindgen_ty_1 = ::std::os::raw::c_int;
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct cbm_store_verify_result_t {
+    pub status: cbm_store_verify_status_t,
+    pub native_error: u32,
+    pub sqlite_error: ::std::os::raw::c_int,
+    pub db_present: bool,
+    pub wal_present: bool,
+    pub shm_present: bool,
+    pub family_frozen: bool,
+    pub family_guard_release_complete: bool,
+    pub scratch_created: bool,
+    pub scratch_cleanup_complete: bool,
+    pub cleanup_native_error: u32,
+    pub operation: [::std::os::raw::c_char; 64usize],
+    pub cleanup_operation: [::std::os::raw::c_char; 64usize],
+    pub detail: [::std::os::raw::c_char; 512usize],
+    pub scratch_path: [::std::os::raw::c_char; 4096usize],
+}
+impl Default for cbm_store_verify_result_t {
+    fn default() -> Self {
+        let mut s = ::std::mem::MaybeUninit::<Self>::uninit();
+        unsafe {
+            ::std::ptr::write_bytes(s.as_mut_ptr(), 0, 1);
+            s.assume_init()
+        }
+    }
+}
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct cbm_node_t {
@@ -2447,6 +2485,13 @@ unsafe extern "C" {
 }
 unsafe extern "C" {
     pub fn cbm_store_open_path_query(db_path: *const ::std::os::raw::c_char) -> *mut cbm_store_t;
+}
+unsafe extern "C" {
+    pub fn cbm_store_open_path_query_verified(
+        db_path: *const ::std::os::raw::c_char,
+        out_store: *mut *mut cbm_store_t,
+        result: *mut cbm_store_verify_result_t,
+    ) -> cbm_store_verify_status_t;
 }
 unsafe extern "C" {
     pub fn cbm_store_db_path(s: *const cbm_store_t) -> *const ::std::os::raw::c_char;
