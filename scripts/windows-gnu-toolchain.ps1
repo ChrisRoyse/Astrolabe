@@ -1798,35 +1798,16 @@ function Set-WorkspaceTempEnvironment {
     else {
         $env:GIT_CEILING_DIRECTORIES = $tempCeiling
     }
-    # NOTE (#194/#232): a launcher-level CBM_CACHE_DIR redirect was tried here to keep
-    # codebase-memory-mcp project registrations out of the operator's global store,
-    # but it splits the vendored C tests' write path from their read path — those
-    # tests index via cbm_mcp_server_new(NULL) (which honours CBM_CACHE_DIR) yet open
-    # the db at a HARDCODED $HOME/.cache/codebase-memory-mcp/<project>.db (e.g.
-    # tests/test_edge_types_probe.c:104, test_integration.c), so a redirect empties
-    # the store they assert on and regresses ~808 CBM C tests. Do NOT set CBM_CACHE_DIR
-    # globally here: it would also reach git, cargo and sccache children that have no
-    # business being repointed.
-    #
-    # The store leak is fixed where the store is decided instead. scripts/ci-cbm-test.sh
-    # redirects HOME/USERPROFILE (the one input BOTH halves read: cbm_get_home_dir()
-    # in src/foundation/platform.c) to a run-scoped store under target/ for the CBM
-    # phase only, so the library and the vendored tests move together; the Rust
-    # row-sink test cleans up through a fail-closed Drop guard; and
-    # scripts/check-cbm-cache-hermeticity.py re-reads the operator's real store before
-    # and after the phase and fails closed on a single added registration.
+    # Preserve the caller's CBM_CACHE_DIR/HOME/USERPROFILE exactly. The launcher owns
+    # compiler/build state; it must not silently relocate product data for arbitrary
+    # child commands. Real product FSV supplies an explicit store at the product edge.
 }
 
-# #278: causal attribution source for the no-escape gate. The gate protects roots
-# the operator SHARES with the OS and -- on this machine -- with other Calyx/CBM
-# checkouts and concurrent codebase-memory-mcp MCP servers. Classifying a delta as
-# "ours" by NAME PATTERN (calyx*, cbm*) false-positives there. Instead the launcher
-# records THIS run's process tree so the gate attributes a shared-root delta only to
-# a process that was actually part of our run. A Windows Job Object receives a
-# JOB_OBJECT_MSG_NEW_PROCESS completion for EVERY descendant at creation time (no
-# poll-miss), so short-lived `cargo test` binaries -- whose scratch-dir names embed
-# std::process::id() -- are captured. If this recorder cannot start, the gate fails
-# CLOSED (ASTRO_NO_ESCAPE_NO_ATTRIBUTION) rather than reverting to name matching.
+# #611/#617: exact launcher process-generation attribution. A Windows Job Object
+# receives JOB_OBJECT_MSG_NEW_PROCESS/EXIT_PROCESS for every descendant and remains
+# the kernel source of truth across owner death. The persisted interval history is
+# diagnostic provenance; cleanup authority is the exact owner identity plus the exact
+# named Job membership, never a PID-only poll or a deleted verification registry.
 $AstroTreeRecorderSource = @'
 using System;
 using System.ComponentModel;
@@ -1981,12 +1962,12 @@ public class AstroTreeRecorder {
     // #278 attempts 6+7: pid alone is ambiguous under PID REUSE, and first-seen
     // alone still false-attributes DEAD instances (attempt 7: four foreign-sweep
     // pids collided with startup children of ours first seen at 14:2x and long
-    // dead when the foreign dirs appeared at 14:34+). Record each pid's INSTANCE
+    // dead when later state appeared. Record each pid's INSTANCE
     // LIFETIME intervals [first_seen, last_seen] -- the port delivers both
     // NEW_PROCESS and (ABNORMAL_)EXIT_PROCESS -- a list per pid, because the OS
     // can recycle a pid WITHIN our own tree. last = OPEN(-1) means the instance
-    // had not exited when the manifest was written (serialized as null; the gate
-    // treats it as an open window -- never 'assume dead').
+    // had not exited when the manifest was written (serialized as null; recovery
+    // treats it as open provenance and still consults the exact kernel Job).
     readonly Dictionary<int, List<long[]>> pidIntervals = new Dictionary<int, List<long[]>>();
     readonly object gate = new object();
     string manifestPath;
@@ -2001,23 +1982,6 @@ public class AstroTreeRecorder {
     long lastTimestampNs;
     byte[] lastManifestBytes;
     string lastManifestFileIdentity;
-    // #279: CAUSAL OWNED-PATH PROBE for the ATTRIBUTED (CBM store) roots. Store files
-    // (_config.db, project DBs) carry no pid in their name, so pid-token attribution
-    // cannot see an our-tree store write. The probe enumerates the protected store
-    // roots and, via the Restart Manager, asks WHICH process currently holds each
-    // file open; a file held by a tree pid is one our run touched -> owned_paths. The
-    // gate reddens on an owned_paths store delta (the #246 backstop). COVERAGE WINDOW
-    // (disclosed honestly, per #279): this is a periodic open-HANDLE probe, so a store
-    // write that opens-and-closes between probe passes is not caught here -- that leak
-    // is caught by the per-phase check-cbm-cache-hermeticity.py HOME-redirect bracket,
-    // the authoritative #246 guard; this run-wide probe is a defence-in-depth layer
-    // under it, catching long-held handles (an MCP server our tree spawned). FAIL
-    // CLOSED: if the probe mechanism cannot run, the worker faults and the launcher
-    // preserves its lock/manifest/owned state. Failure never serializes as an empty set.
-    string[] storeRoots;
-    readonly HashSet<string> ownedPaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-    long lastProbeNs;
-
     static readonly long UnixEpochTicks = new DateTime(
         1970, 1, 1, 0, 0, 0, DateTimeKind.Utc
     ).Ticks;
@@ -2062,8 +2026,7 @@ public class AstroTreeRecorder {
         long launcherProcessStartUtcTicks,
         string launcherLockSha256,
         long launcherLeaseStartUtcTicks,
-        string jobObjectName,
-        string[] storeRoots
+        string jobObjectName
     ) {
         if (launcherPid <= 0) throw new ArgumentOutOfRangeException("launcherPid");
         if (launcherProcessStartUtcTicks <= 0 || launcherProcessStartUtcTicks > DateTime.MaxValue.Ticks)
@@ -2093,7 +2056,6 @@ public class AstroTreeRecorder {
         r.launcherLockSha256 = launcherLockSha256;
         r.launcherLeaseStartUtcTicks = launcherLeaseStartUtcTicks;
         r.jobObjectName = jobObjectName;
-        r.storeRoots = storeRoots == null ? new string[0] : (string[])storeRoots.Clone();
         long minimumClockNs = Math.Max(
             UtcTicksToUnixNs(launcherProcessStartUtcTicks),
             UtcTicksToUnixNs(launcherLeaseStartUtcTicks)
@@ -2223,103 +2185,6 @@ public class AstroTreeRecorder {
         }
     }
 
-    // ---- #279: Restart Manager owned-store-path probe -----------------------------
-    const int CCH_RM_SESSION_KEY = 32;
-    const int RM_MAX_APP_NAME = 256;    // CCH_RM_MAX_APP_NAME + 1
-    const int RM_MAX_SVC_NAME = 64;     // CCH_RM_MAX_SVC_NAME + 1
-    const int STORE_FILE_CAP = 4096;
-
-    [DllImport("rstrtmgr.dll", CharSet = CharSet.Unicode)]
-    static extern int RmStartSession(out uint pSessionHandle, int dwSessionFlags, StringBuilder strSessionKey);
-    [DllImport("rstrtmgr.dll", CharSet = CharSet.Unicode)]
-    static extern int RmRegisterResources(uint pSessionHandle, uint nFiles, string[] rgsFilenames,
-        uint nApplications, IntPtr rgApplications, uint nServices, string[] rgsServiceNames);
-    [DllImport("rstrtmgr.dll")]
-    static extern int RmGetList(uint dwSessionHandle, out uint pnProcInfoNeeded, ref uint pnProcInfo,
-        [In, Out] RM_PROCESS_INFO[] rgAffectedApps, ref uint lpdwRebootReasons);
-    [DllImport("rstrtmgr.dll")]
-    static extern int RmEndSession(uint pSessionHandle);
-
-    [StructLayout(LayoutKind.Sequential)]
-    struct RM_UNIQUE_PROCESS { public int dwProcessId; public System.Runtime.InteropServices.ComTypes.FILETIME ProcessStartTime; }
-
-    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
-    struct RM_PROCESS_INFO {
-        public RM_UNIQUE_PROCESS Process;
-        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = RM_MAX_APP_NAME)] public string strAppName;
-        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = RM_MAX_SVC_NAME)] public string strServiceShortName;
-        public int ApplicationType;
-        public uint AppStatus;
-        public uint TSSessionId;
-        [MarshalAs(UnmanagedType.Bool)] public bool bRestartable;
-    }
-
-    // Which protected store files are CURRENTLY held open by a process in `treePids`.
-    // Static + explicit args so it is FSV-testable in isolation (scripts/test-attribution-owned-probe.ps1
-    // holds a fixture store file open in a known pid and asserts the probe attributes it).
-    // Throws only when the RM mechanism itself is unavailable (RmStartSession fails) --
-    // that propagates to the caller as the fail-closed 'probe could not run' signal.
-    public static List<string> ProbeOwnedStorePaths(int[] treePids, string[] roots) {
-        List<string> owned = new List<string>();
-        if (roots == null) return owned;
-        HashSet<int> pids = new HashSet<int>();
-        if (treePids != null) foreach (int p in treePids) pids.Add(p);
-        foreach (string root in roots) {
-            if (string.IsNullOrEmpty(root) || !Directory.Exists(root)) continue;
-            string[] files;
-            files = Directory.GetFiles(root, "*", SearchOption.AllDirectories);
-            if (files.Length > STORE_FILE_CAP)
-                throw new InvalidOperationException("owned-path probe file cap exceeded at " + root + ": " + files.Length);
-            for (int i = 0; i < files.Length; i++) {
-                if (FileHeldByTreePid(files[i], pids)) owned.Add(files[i]);
-            }
-        }
-        return owned;
-    }
-
-    static bool FileHeldByTreePid(string file, HashSet<int> pids) {
-        uint session;
-        StringBuilder key = new StringBuilder(CCH_RM_SESSION_KEY + 1);
-        int rc = RmStartSession(out session, 0, key);
-        if (rc != 0) throw new Exception("RmStartSession failed " + rc);  // RM mechanism unavailable
-        try {
-            string[] resources = new string[] { file };
-            rc = RmRegisterResources(session, 1, resources, 0, IntPtr.Zero, 0, null);
-            if (rc != 0) throw new Win32Exception(rc, "RmRegisterResources failed for " + file);
-            uint needed = 0, count = 0, reason = 0;
-            rc = RmGetList(session, out needed, ref count, null, ref reason);
-            if (rc == 0 || needed == 0) return false;  // no holders
-            if (rc != ERROR_MORE_DATA) throw new Win32Exception(rc, "RmGetList sizing failed for " + file);
-            count = needed;
-            RM_PROCESS_INFO[] infos = new RM_PROCESS_INFO[count];
-            rc = RmGetList(session, out needed, ref count, infos, ref reason);
-            if (rc != 0) throw new Win32Exception(rc, "RmGetList read failed for " + file);
-            for (int i = 0; i < count; i++) {
-                if (pids.Contains(infos[i].Process.dwProcessId)) return true;
-            }
-            return false;
-        } finally {
-            int endRc = RmEndSession(session);
-            if (endRc != 0)
-                throw new Win32Exception(endRc, "RmEndSession failed for " + file);
-        }
-    }
-
-    // One probe pass over the store roots, unioned into the accumulated owned set.
-    // A mechanism failure is fatal to the worker and is surfaced at the next barrier.
-    void RunOwnedProbe() {
-        if (storeRoots == null || storeRoots.Length == 0) return;
-        int[] pids;
-        lock (gate) {
-            pids = new int[pidIntervals.Count];
-            pidIntervals.Keys.CopyTo(pids, 0);
-        }
-        List<string> found = ProbeOwnedStorePaths(pids, storeRoots);
-        lock (gate) {
-            foreach (string p in found) { if (ownedPaths.Add(p)) dirty = true; }
-        }
-    }
-
     void Loop() {
         workerReady.Set();
         try {
@@ -2339,13 +2204,6 @@ public class AstroTreeRecorder {
                     if (waitError != WAIT_TIMEOUT)
                         throw new Win32Exception(waitError, "Job Object completion-port wait failed");
                 }
-                // #279: throttled owned-path probe (~every 3s), decoupled from the manifest
-                // flush cadence -- an RM sweep of the store roots is heavier than a rewrite,
-                // and long-held handles do not need sub-second sampling.
-                long probeTick = NowUnixNs();
-                bool doProbe;
-                lock (gate) { doProbe = (probeTick - lastProbeNs > 3000000000L); }
-                if (doProbe) { lock (gate) { lastProbeNs = NowUnixNs(); } RunOwnedProbe(); }
                 // Throttled persistence: thousands of short-lived children generate
                 // ~2 messages each; run one typed destination-CAS refresh at most once a second.
                 long tick = NowUnixNs();
@@ -2972,7 +2830,6 @@ public class AstroTreeRecorder {
     void Flush() {
         List<KeyValuePair<int, List<long[]>>> snap = new List<KeyValuePair<int, List<long[]>>>();
         long flushNs;
-        List<string> ownedSnap = new List<string>();
         byte[] previousBytes;
         string previousIdentity;
         lock (gate) {
@@ -2981,7 +2838,6 @@ public class AstroTreeRecorder {
                 foreach (long[] span in entry.Value) copy.Add(new long[] { span[0], span[1] });
                 snap.Add(new KeyValuePair<int, List<long[]>>(entry.Key, copy));
             }
-            foreach (string p in ownedPaths) ownedSnap.Add(p);
             flushNs = NowUnixNs();
             previousBytes = lastManifestBytes == null
                 ? null
@@ -2992,7 +2848,6 @@ public class AstroTreeRecorder {
             KeyValuePair<int, List<long[]>> left,
             KeyValuePair<int, List<long[]>> right
         ) { return left.Key.CompareTo(right.Key); });
-        ownedSnap.Sort(StringComparer.Ordinal);
         StringBuilder sb = new StringBuilder();
         sb.Append("{\"schema\":\"astrolabe.no_escape_attribution.v2\",\"launcher_pid\":");
         AppendInt(sb, launcherPid);
@@ -3006,12 +2861,9 @@ public class AstroTreeRecorder {
         AppendJsonString(sb, jobObjectName);
         sb.Append(",\"run_started_unix_ns\":");
         AppendLong(sb, runStartedNs);
-        // #278 attempt 8b: THROTTLE-RACE guard. This manifest is rewritten at most
-        // once a second while the run is live, and the no-escape gate reads it
-        // MID-SESSION (before the final Stop() flush). written_at stamps THIS flush
-        // so the gate can tell that a shared-root delta postdates the manifest --
-        // meaning the recorder had not yet observed the writing process -- and fail
-        // toward RED (ASTRO_NO_ESCAPE_STALE_MANIFEST) instead of silently 'foreign'.
+        // written_at stamps this exact durable generation. Recovery validates its
+        // temporal relation to the lease and PID intervals; it never infers a newer
+        // process-tree state from an older manifest generation.
         sb.Append(",\"written_at\":");
         AppendLong(sb, flushNs);
         sb.Append(",\"tree_pids\":[");
@@ -3034,17 +2886,10 @@ public class AstroTreeRecorder {
             }
             sb.Append(']');
         }
-        // Probe failures are fatal to the worker and therefore preserve the full launcher
-        // lease. A published v2 manifest consequently contains only a real observed list;
-        // it never converts an unevaluable probe into an empty result.
-        sb.Append("},\"owned_paths\":");
-        sb.Append('[');
-        for (int i = 0; i < ownedSnap.Count; i++) {
-            if (i > 0) sb.Append(',');
-            AppendJsonString(sb, ownedSnap[i]);
-        }
-        sb.Append(']');
-        sb.Append('}');
+        // #621: owned_paths belonged to the retired no-escape gate's Restart Manager
+        // store scan. Preserve the strict v2 field and canonical shape, but publish the
+        // honest empty set; exact Job membership is the production cleanup authority.
+        sb.Append("},\"owned_paths\":[]}");
         byte[] intended = new UTF8Encoding(false, true).GetBytes(sb.ToString());
         string publishedIdentity = PublishManifestBytes(
             intended,
@@ -3068,12 +2913,6 @@ public class AstroTreeRecorder {
         if (thread == null || !thread.Join(TimeSpan.FromSeconds(30)))
             throw new TimeoutException("tree-attribution worker did not terminate at the stop barrier");
         ThrowIfWorkerFaulted();
-        // #279: one last owned-path probe before the final flush. Our tree processes
-        // are mostly dead by now (RM finds nothing on them), so this teardown pass
-        // rarely adds paths -- the accumulation across the throttled in-run passes is
-        // what catches live store handles. An unavailable RM probe is a stop failure,
-        // preserving every launcher-owned byte rather than publishing an empty result.
-        RunOwnedProbe();
         // Final atomic publication happens only after every completion queued before the
         // sentinel was drained by the single worker. Anything still in the kernel job is
         // independently queried by cleanup/reclaim and remains an open interval.
@@ -3148,8 +2987,7 @@ function Start-AstroTreeAttribution {
         [Parameter(Mandatory)][long]$LauncherProcessStartUtcTicks,
         [Parameter(Mandatory)][string]$LauncherLockSha256,
         [Parameter(Mandatory)][long]$LauncherLeaseStartUtcTicks,
-        [Parameter(Mandatory)][string]$JobObjectName,
-        [string[]]$StoreRoots = @()
+        [Parameter(Mandatory)][string]$JobObjectName
     )
     if (-not ([System.Management.Automation.PSTypeName]'AstroTreeRecorder').Type) {
         Add-Type -TypeDefinition $AstroTreeRecorderSource -Language CSharp -ErrorAction Stop
@@ -3160,8 +2998,7 @@ function Start-AstroTreeAttribution {
         $LauncherProcessStartUtcTicks,
         $LauncherLockSha256,
         $LauncherLeaseStartUtcTicks,
-        $JobObjectName,
-        $StoreRoots
+        $JobObjectName
     )
     try {
         $intended = $recorder.GetLastManifestBytes()
@@ -3185,56 +3022,6 @@ function Start-AstroTreeAttribution {
         }
         throw
     }
-}
-
-# #279: the protected CBM-store roots the owned-path probe scans, read from the SAME
-# registry the gate polices (scripts/no-escape-roots.json, mode=attributed) so the two
-# never drift. The launcher never redirects its OWN $HOME (only child sandboxes do), so
-# ${REAL_HOME}/${REAL_LOCALAPPDATA} resolved here from the launcher's real profile match
-# the env-independent roots the gate resolves via SHGetKnownFolderPath. Registry absence,
-# malformed structure, or an unresolved variable is fatal: it must never become a silent
-# empty attribution surface.
-function Get-AstroAttributedStoreRoots {
-    param([Parameter(Mandatory)][string]$RegistryPath)
-    $roots = @()
-    if (-not (Test-Path -LiteralPath $RegistryPath -PathType Leaf)) {
-        throw "NO_ESCAPE[ASTRO_ATTRIBUTION_REGISTRY_MISSING]: required attribution-root registry is absent: $RegistryPath"
-    }
-    $registry = Get-Content -LiteralPath $RegistryPath -Raw -ErrorAction Stop |
-        ConvertFrom-Json -ErrorAction Stop
-    if ($null -eq $registry -or
-        -not $registry.PSObject.Properties['roots'] -or
-        $null -eq $registry.roots) {
-        throw "NO_ESCAPE[ASTRO_ATTRIBUTION_REGISTRY_INVALID]: registry has no roots collection: $RegistryPath"
-    }
-    $realHome = [Environment]::GetFolderPath('UserProfile')
-    if ([string]::IsNullOrWhiteSpace($realHome)) {
-        throw 'NO_ESCAPE[ASTRO_ATTRIBUTION_PROFILE_UNEVALUABLE]: native Windows user profile path is empty'
-    }
-    $vars = @{
-        'REAL_HOME'         = $realHome
-        'REAL_LOCALAPPDATA' = (Join-Path $realHome 'AppData\Local')
-        'REAL_CACHE'        = (Join-Path $realHome '.cache')
-    }
-    foreach ($entry in @($registry.roots)) {
-        if ($null -eq $entry -or
-            -not $entry.PSObject.Properties['mode'] -or
-            -not $entry.PSObject.Properties['path'] -or
-            $entry.mode -isnot [string] -or
-            $entry.path -isnot [string]) {
-            throw "NO_ESCAPE[ASTRO_ATTRIBUTION_REGISTRY_INVALID]: every root entry must carry string mode/path fields: $RegistryPath"
-        }
-        if ($entry.mode -ne 'attributed') { continue }
-        $expanded = [string]$entry.path
-        foreach ($name in $vars.Keys) {
-            $expanded = $expanded.Replace('${' + $name + '}', $vars[$name])
-        }
-        if ($expanded -match '\$\{') {
-            throw "NO_ESCAPE[ASTRO_ATTRIBUTION_ROOT_UNRESOLVED]: attributed root contains an unresolved variable after expansion: $($entry.path)"
-        }
-        $roots += [IO.Path]::GetFullPath(($expanded -replace '/', '\'))
-    }
-    return @($roots | Sort-Object -Unique)
 }
 
 function Resolve-PinnedLld {
@@ -3607,10 +3394,6 @@ $launcherLockClaim = Join-Path $workspaceTempParent $launcherLockClaimLeaf
 $launcherLockLeaseHandle = $null
 $launcherPreclaimScratchLease = $null
 $claimTransitionPublished = $false
-$attributedStoreRoots = [string[]]@(
-    Get-AstroAttributedStoreRoots `
-        -RegistryPath (Join-Path $PSScriptRoot "no-escape-roots.json")
-)
 $launcherClaimMutex = Enter-AstroLauncherLockMutex $launcherLock
 if (-not $launcherClaimMutex.Acquired) {
     Exit-AstroLauncherLockMutex $launcherClaimMutex
@@ -3698,8 +3481,7 @@ try {
         -LauncherProcessStartUtcTicks $launcherProcessStartUtcTicks `
         -LauncherLockSha256 $launcherLockSha256 `
         -LauncherLeaseStartUtcTicks $launcherLeaseStartUtcTicks `
-        -JobObjectName $launcherTreeJobObjectName `
-        -StoreRoots $attributedStoreRoots
+        -JobObjectName $launcherTreeJobObjectName
 
     $workspaceTempState = Get-AstroPathEntryState $workspaceTemp
     if ($workspaceTempState.State -cne 'absent') {
@@ -3980,7 +3762,7 @@ finally {
 try {
     $env:ASTRO_NO_ESCAPE_ATTRIBUTION = $attributionManifest
     Write-Output "NO_ESCAPE[ASTRO_ATTRIBUTION_RECORDING]: strict v2 process tree -> $attributionManifest; job=$launcherTreeJobObjectName"
-    Write-Output "NO_ESCAPE[ASTRO_OWNED_PATH_PROBE]: owned-path probe over $($attributedStoreRoots.Count) attributed store root(s): $($attributedStoreRoots -join '; ')"
+    Write-Output 'NO_ESCAPE[ASTRO_RETIRED_GATE_STORE_SCAN_ABSENT]: owned_paths is the canonical empty v2 set; no retired gate registry or operator-store Restart Manager scan is part of the production launcher (#621)'
     # Active publication already proved the exact TEMP/manifest pair under the claim mutex.
     # Re-read the TEMP here; never create or repair subordinate protocol state after active.
     $workspaceTempState = Get-AstroPathEntryState $workspaceTemp
