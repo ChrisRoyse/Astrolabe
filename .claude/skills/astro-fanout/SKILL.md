@@ -29,7 +29,7 @@ Proven pattern (Wave-1: 17 issues closed, 6 agents, 0 errors; see #65 history). 
 3. On completion: octopus-merge the disjoint `sweep/*` branches; run ONE consolidated `cargo check --workspace` + clippy for buildability, then manual FSV of the merged behavior against a real corpus (no tests — owner directive 2026-07-14).
 4. **Server-pending consolidation:** merge all server-pending branches into one local tree, run ONE native build through the launcher from `C:/code/Astrolabe`, then manually exercise the real binary's changed surfaces against a real corpus with persisted readback; on that evidence, publish each branch and close the `Refs` issues. Before any `git reset --hard`, save an insurance patch of applied stash/edits (`git diff <file> > <scratchpad>/x.patch`).
 5. Close each issue with evidence (astro-issue §7); file every `new_problems` entry (astro-new-issue); post a wave summary with telemetry kind `fanout` (`wave`, `agents`, `results{}`).
-6. Cleanup: prune worktrees and `sweep/*` branches, delete `target/`, verify absent.
+6. Cleanup: prune worktrees and `sweep/*` branches. Let each exact live launcher owner remove its own `target/`, then independently verify absence; never manually delete a target protected by non-absent or unevaluable protocol state.
 
 ## Sizing
 

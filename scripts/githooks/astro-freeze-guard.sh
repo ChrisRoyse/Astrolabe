@@ -1,8 +1,8 @@
 # #519/#424: shared mutation-lease guard for the ASTROLABE git hooks.
 #
-# The strict authoritative v2 launcher manifest is an enforceable repository MUTATION LEASE.
-# While its exact process identity is live,
-# Git mutations must fail closed before mutating this checkout.
+# The strict authoritative v2 launcher protocol is an enforceable repository MUTATION LEASE.
+# Every non-absent or unevaluable state blocks Git mutations before they touch this checkout;
+# only authoritative absence permits mutation.
 # Read-only operations do not reach these hooks; every registered worktree has its own lock.
 # This guard never stops a process and never removes a lock.
 
@@ -41,7 +41,11 @@ astro_freeze_guard() {
             return 1
             ;;
         24)
-            echo "GIT_FREEZE[ASTRO_GIT_MUTATION_LEASE_TRANSITION]: {code=ASTRO_GIT_MUTATION_LEASE_TRANSITION; message=\"$hook_name: interrupted launcher claim/cleanup state exists; classifier=$probe_out\"; remediation=\"preserve the transition and use the tracker-evidenced explicit archive path\"}" >&2
+            echo "GIT_FREEZE[ASTRO_GIT_MUTATION_LEASE_TRANSITION]: {code=ASTRO_GIT_MUTATION_LEASE_TRANSITION; message=\"$hook_name: interrupted launcher claim/cleanup/reclaim state exists; classifier=$probe_out\"; remediation=\"preserve the transition and use the tracker-evidenced explicit archive path\"}" >&2
+            return 1
+            ;;
+        25)
+            echo "GIT_FREEZE[ASTRO_GIT_MUTATION_LEASE_STALE]: {code=ASTRO_GIT_MUTATION_LEASE_STALE; message=\"$hook_name: stale/PID-reused launcher state remains and may still protect attributed descendants; classifier=$probe_out\"; remediation=\"preserve the checkout and use tracker-evidenced explicit reclaim only after the full attributed process tree is absent\"}" >&2
             return 1
             ;;
         *)

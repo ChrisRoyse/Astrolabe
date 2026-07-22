@@ -6,12 +6,13 @@
     Exposes the authoritative launcher-lock parser to non-PowerShell callers such as Git for
     Windows hooks. It never creates, removes, or changes a file and never stops a process.
 
-    Exit 0: absent or stale exact owner (classification only; stale never authorizes claim/removal)
+    Exit 0: authoritative protocol absence
     Exit 20: exact owner held/live
     Exit 21: lock schema unreadable
     Exit 22: owner process identity unevaluable
-    Exit 24: interrupted claim/cleanup transition present
     Exit 23: classifier fault
+    Exit 24: interrupted claim/cleanup/reclaim transition present
+    Exit 25: stale/dead/PID-reused exact owner (classification only; never authorization)
 
 .NOTES
     Refs #611, #519, #197. Runtime helper; this is not a test or gate.
@@ -31,7 +32,7 @@ try {
     $state | ConvertTo-Json -Depth 5 -Compress | Write-Output
     switch ($state.State) {
         'absent' { exit 0 }
-        'stale' { exit 0 }
+        'stale' { exit 25 }
         'held' { exit 20 }
         'unreadable' { exit 21 }
         'unevaluable' { exit 22 }

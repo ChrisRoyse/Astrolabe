@@ -10,7 +10,7 @@ A handoff exists so a zero-context successor can continue without re-deriving an
 ## 1. Hygiene before writing
 
 - Classify `.tmp/astrolabe-launcher.lock` through `scripts\launcher-lock-status.ps1`. Exact ownership is `(pid, owner_process_start_utc_ticks)`, never numeric PID alone. Only `absent` permits a new claim; `held` is read-only, and stale/PID-reused, unreadable, transition, or unevaluable state requires tracker-bound recovery.
-- If `target/` exists and an exact retained handle/process identity proves this session owns it, delete it and verify absent. Otherwise leave it and record the classifier state/conflict.
+- Never delete `target/` manually. Normal cleanup belongs to the exact live launcher owner while it retains the protocol lease. If `target/` remains after that owner exits, preserve it, record the authoritative classifier/attribution state, complete any required tracker-bound reclaim, and clean only under a fresh exact launcher lease.
 - `git status --short` — know every uncommitted/untracked path. Remove stray temp files this session created; keep repo-controlled outputs out of the index.
 - List stray worktrees/branches this session created (`git worktree list`, `git branch --list 'sweep/*'`) — remove finished ones or name them in the handoff.
 

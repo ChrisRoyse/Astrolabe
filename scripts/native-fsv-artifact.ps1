@@ -447,8 +447,8 @@ try {
                 Fail-Astro 'ASTRO_FSV_TREE_DIRTY' "tracked checkout is not clean at artifact promotion: $tracked" `
                     'commit the implementation and rebuild from a clean frozen tree'
             }
-            if ([string]$launcherLock.status_sha256 -cne [string]$repoState.status_sha256 -or
-                [string]$launcherLock.diff_sha256 -cne [string]$repoState.diff_sha256) {
+            if ([string]$launcherOwner.StatusSha256 -cne [string]$repoState.status_sha256 -or
+                [string]$launcherOwner.DiffSha256 -cne [string]$repoState.diff_sha256) {
                 Fail-Astro 'ASTRO_FSV_LAUNCHER_TREE_DRIFT' `
                     'repository status/diff fingerprints differ from the launcher acquisition state' `
                     'discard this build, restore the frozen checkout, and rebuild from a fresh launcher lease'
@@ -525,10 +525,11 @@ try {
             $receiptState = Read-Receipt $ReceiptPath $evidenceRoot
             $inspection = Inspect-ReceiptArtifact $receiptState $evidenceRoot
             Assert-FsvLockAbsent $fsvLock
-            if (Test-Path -LiteralPath $launcherLockPath) {
+            $launcherProtocolState = Read-AstroLauncherLock -LockPath $launcherLockPath
+            if ($launcherProtocolState.State -ne 'absent') {
                 Fail-Astro 'ASTRO_FSV_ABANDON_LAUNCHER_LOCK' `
-                    "launcher lock exists at $launcherLockPath; never-run session abandonment is refused during any evidence lease" `
-                    'wait for the launcher owner to finish and independently prove every receipt owner PID dead'
+                    "launcher protocol state is '$($launcherProtocolState.State)' at $launcherLockPath; never-run session abandonment requires authoritative absence (transitions=$(@($launcherProtocolState.TransitionPaths) -join '; '), read_error=$($launcherProtocolState.ReadError), validation_error=$($launcherProtocolState.ValidationError))" `
+                    'wait for a live owner to finish, or use the tracker-bound explicit reclaim command for stale/unreadable/transition state; then independently prove every receipt owner dead'
             }
             if ($ReasonCode -notmatch '^[A-Z][A-Z0-9_]{2,95}$') {
                 Fail-Astro 'ASTRO_FSV_ABANDON_REASON_INVALID' "ReasonCode is not a structured upper-case code: '$ReasonCode'" `
@@ -656,10 +657,11 @@ try {
             $receiptState = Read-Receipt $ReceiptPath $evidenceRoot
             $inspection = Inspect-ReceiptArtifact $receiptState $evidenceRoot
             Assert-FsvLockAbsent $fsvLock
-            if (Test-Path -LiteralPath $launcherLockPath) {
+            $launcherProtocolState = Read-AstroLauncherLock -LockPath $launcherLockPath
+            if ($launcherProtocolState.State -ne 'absent') {
                 Fail-Astro 'ASTRO_FSV_QUARANTINE_LAUNCHER_LOCK' `
-                    "launcher lock exists at $launcherLockPath; terminal-session quarantine is refused during any evidence lease" `
-                    'wait for the launcher owner to finish; use the canonical launcher to reap a dead-owner lock before quarantine'
+                    "launcher protocol state is '$($launcherProtocolState.State)' at $launcherLockPath; terminal-session quarantine requires authoritative absence (transitions=$(@($launcherProtocolState.TransitionPaths) -join '; '), read_error=$($launcherProtocolState.ReadError), validation_error=$($launcherProtocolState.ValidationError))" `
+                    'wait for a live owner to finish, or archive stale/unreadable/transition state through scripts\reclaim-launcher-lock.ps1 with exact tracker evidence before quarantine'
             }
             if ($ReasonCode -notmatch '^[A-Z][A-Z0-9_]{2,95}$') {
                 Fail-Astro 'ASTRO_FSV_QUARANTINE_REASON_INVALID' "ReasonCode is not a structured upper-case code: '$ReasonCode'" `
@@ -808,6 +810,7 @@ try {
                     fsv_lock_exists = $false
                     launcher_lock = $launcherLockPath
                     launcher_lock_exists = $false
+                    launcher_protocol_state = $launcherProtocolState.State
                     session_files = $inventory
                 }
                 owner_pids = @($ownerPids | ForEach-Object { [int]$_ })

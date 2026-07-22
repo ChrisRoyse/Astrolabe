@@ -390,9 +390,9 @@ try {
     if ($null -eq $receipt.repository -or
         [string]$receipt.repository.status_sha256 -cne [string]$beforeRepo.status_sha256 -or
         [string]$receipt.repository.diff_sha256 -cne [string]$beforeRepo.diff_sha256 -or
-        [string]$launcherLock.head_sha -cne [string]$beforeRepo.head_sha -or
-        [string]$launcherLock.status_sha256 -cne [string]$beforeRepo.status_sha256 -or
-        [string]$launcherLock.diff_sha256 -cne [string]$beforeRepo.diff_sha256) {
+        [string]$launcherOwner.HeadSha -cne [string]$beforeRepo.head_sha -or
+        [string]$launcherOwner.StatusSha256 -cne [string]$beforeRepo.status_sha256 -or
+        [string]$launcherOwner.DiffSha256 -cne [string]$beforeRepo.diff_sha256) {
         Fail-Astro 'ASTRO_FSV_REPOSITORY_IDENTITY_MISMATCH' 'receipt, live launcher lock, and current repository fingerprints do not identify the same frozen state' 'discard the artifact and rebuild under a fresh immutable launcher lease'
     }
     $artifactHashBefore = File-Sha256 $artifact
