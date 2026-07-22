@@ -837,6 +837,11 @@ struct cbm_mcp_server {
     bool owns_store;                /* true if we opened the store */
     char *current_project;          /* which project store is open for (heap) */
     time_t store_last_used;         /* last time resolve_store was called for a named project */
+    bool store_integrity_failed;    /* last named resolution preserved a corrupt family */
+    char store_error_project[CBM_SZ_256];
+    char store_error_db_path[CBM_SZ_1K];
+    char store_error_wal_path[CBM_SZ_1K];
+    char store_error_shm_path[CBM_SZ_1K];
     char update_notice[CBM_SZ_256]; /* one-shot update notice, cleared after first injection */
     bool update_checked;            /* true after background check has been launched */
     cbm_thread_t update_tid;        /* background update check thread */
@@ -1018,6 +1023,12 @@ static cbm_store_t *resolve_store_fallback_scan(const char *project);
  * Caches the connection — reopens only when project changes.
  * Tracks last-access time so the event loop can evict idle stores. */
 static cbm_store_t *resolve_store(cbm_mcp_server_t *srv, const char *project) {
+    srv->store_integrity_failed = false;
+    srv->store_error_project[0] = '\0';
+    srv->store_error_db_path[0] = '\0';
+    srv->store_error_wal_path[0] = '\0';
+    srv->store_error_shm_path[0] = '\0';
+
     if (!project) {
         return NULL; /* project is required — no implicit fallback */
     }
@@ -1041,28 +1052,27 @@ static cbm_store_t *resolve_store(cbm_mcp_server_t *srv, const char *project) {
     project_db_path(project, path, sizeof(path));
     srv->store = cbm_store_open_path_query(path);
     if (srv->store) {
-        /* Check DB integrity — back up (never silently delete) a corrupt DB */
+        /* Query resolution is read-only.  A failed integrity check preserves the
+         * complete SQLite family in place.  In WAL mode the WAL is persistent
+         * database state; renaming only the main file or deleting its journals can
+         * destroy the only recoverable copy (#627).  Recovery/archive is therefore
+         * an explicit operator transaction, never an automatic lookup side effect. */
         if (!cbm_store_check_integrity(srv->store)) {
-            cbm_log_error("store.auto_clean", "project", project, "path", path, "action",
-                          "backing up corrupt db to .corrupt — re-index required");
             cbm_store_close(srv->store);
             srv->store = NULL;
-            /* #557 (data loss): rename the corrupt DB to a .corrupt backup instead
-             * of unlinking it, so the user's graph is recoverable / reportable.
-             * Re-index rebuilds a fresh DB at `path`. WAL/SHM are transient. */
-            char bak_path[MCP_FIELD_SIZE];
-            snprintf(bak_path, sizeof(bak_path), "%s.corrupt", path);
-            /* #415: cbm_rename_replace is long-path safe (deep store) and replaces an
-             * existing .corrupt backup atomically (MOVEFILE_REPLACE_EXISTING). */
-            if (cbm_rename_replace(path, bak_path) != 0) {
-                cbm_unlink(path); /* rename failed (e.g. cross-device) — fall back to delete */
-            }
-            char wal_path[MCP_FIELD_SIZE];
-            char shm_path[MCP_FIELD_SIZE];
-            snprintf(wal_path, sizeof(wal_path), "%s-wal", path);
-            snprintf(shm_path, sizeof(shm_path), "%s-shm", path);
-            cbm_unlink(wal_path);
-            cbm_unlink(shm_path);
+            srv->owns_store = false;
+            srv->store_integrity_failed = true;
+            snprintf(srv->store_error_project, sizeof(srv->store_error_project), "%s", project);
+            snprintf(srv->store_error_db_path, sizeof(srv->store_error_db_path), "%s", path);
+            snprintf(srv->store_error_wal_path, sizeof(srv->store_error_wal_path), "%s-wal",
+                     path);
+            snprintf(srv->store_error_shm_path, sizeof(srv->store_error_shm_path), "%s-shm",
+                     path);
+            cbm_log_error("store.integrity_failed", "code", "CBM_STORE_INTEGRITY_FAILED",
+                          "project", project, "db_path", srv->store_error_db_path,
+                          "wal_path", srv->store_error_wal_path, "shm_path",
+                          srv->store_error_shm_path, "action",
+                          "preserved complete SQLite family in place; explicit recovery required");
             return NULL;
         }
 
@@ -1225,7 +1235,60 @@ static char *build_missing_project_error(void) {
 /* Pick the right no-store error: a NULL project means the argument was missing
  * (clearer message); a non-NULL project that didn't resolve means it's
  * unknown/unindexed (list the available ones). */
-static char *build_no_store_error(const char *project) {
+static char *build_integrity_failed_error(const cbm_mcp_server_t *srv) {
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    if (!doc) {
+        return heap_strdup(
+            "{\"code\":\"CBM_STORE_INTEGRITY_FAILED\","
+            "\"message\":\"SQLite integrity verification failed; the complete database family "
+            "was preserved in place\","
+            "\"remediation\":\"preserve the database, WAL, and SHM together; perform explicit "
+            "recovery or archive them before re-indexing\"}");
+    }
+
+    yyjson_mut_val *root = yyjson_mut_obj(doc);
+    yyjson_mut_doc_set_root(doc, root);
+    yyjson_mut_obj_add_str(doc, root, "code", "CBM_STORE_INTEGRITY_FAILED");
+    yyjson_mut_obj_add_str(doc, root, "message",
+                           "SQLite integrity verification failed; the complete database family "
+                           "was preserved in place and no lookup mutation was attempted");
+    yyjson_mut_obj_add_str(doc, root, "remediation",
+                           "preserve the database, WAL, and SHM together; use an explicit "
+                           "operator-controlled recovery/archive transaction, verify its bytes, "
+                           "then re-index into a fresh store");
+    yyjson_mut_obj_add_str(doc, root, "project", srv->store_error_project);
+    yyjson_mut_obj_add_str(doc, root, "failed_operation", "PRAGMA integrity_check");
+    yyjson_mut_obj_add_str(doc, root, "native_error", "not_applicable");
+    yyjson_mut_obj_add_str(doc, root, "db_path", srv->store_error_db_path);
+    yyjson_mut_obj_add_str(doc, root, "wal_path", srv->store_error_wal_path);
+    yyjson_mut_obj_add_str(doc, root, "shm_path", srv->store_error_shm_path);
+    yyjson_mut_obj_add_bool(doc, root, "db_present",
+                            cbm_path_exists(srv->store_error_db_path));
+    yyjson_mut_obj_add_bool(doc, root, "wal_present",
+                            cbm_path_exists(srv->store_error_wal_path));
+    yyjson_mut_obj_add_bool(doc, root, "shm_present",
+                            cbm_path_exists(srv->store_error_shm_path));
+    yyjson_mut_obj_add_bool(doc, root, "family_preserved_in_place", true);
+    yyjson_mut_obj_add_bool(doc, root, "mutation_attempted", false);
+
+    char *json = yyjson_mut_write(doc, 0, NULL);
+    yyjson_mut_doc_free(doc);
+    if (!json) {
+        return heap_strdup(
+            "{\"code\":\"CBM_STORE_INTEGRITY_FAILED\","
+            "\"message\":\"SQLite integrity verification failed; the complete database family "
+            "was preserved in place\","
+            "\"remediation\":\"preserve the database, WAL, and SHM together; perform explicit "
+            "recovery or archive them before re-indexing\"}");
+    }
+    return json;
+}
+
+static char *build_no_store_error(cbm_mcp_server_t *srv, const char *project) {
+    if (srv && srv->store_integrity_failed && project &&
+        strcmp(srv->store_error_project, project) == 0) {
+        return build_integrity_failed_error(srv);
+    }
     return project ? build_project_list_error("project not found or not indexed")
                    : build_missing_project_error();
 }
@@ -1234,7 +1297,7 @@ static char *build_no_store_error(const char *project) {
 #define REQUIRE_STORE(store, project)                     \
     do {                                                  \
         if (!(store)) {                                   \
-            char *_err = build_no_store_error(project);   \
+            char *_err = build_no_store_error(srv, project); \
             char *_res = cbm_mcp_text_result(_err, true); \
             free(_err);                                   \
             free(project);                                \
@@ -5906,7 +5969,7 @@ static char *handle_detect_changes(cbm_mcp_server_t *srv, const char *args) {
 
     char *root_path = get_project_root(srv, project);
     if (!root_path) {
-        char *err = build_no_store_error(project);
+        char *err = build_no_store_error(srv, project);
         char *res = cbm_mcp_text_result(err, true);
         free(err);
         free(project);
@@ -6127,7 +6190,7 @@ static char *handle_manage_adr(cbm_mcp_server_t *srv, const char *args) {
      * the UI are visible to each other (#256). */
     cbm_store_t *resolved = resolve_store(srv, project);
     if (!resolved) {
-        char *err = build_no_store_error(project);
+        char *err = build_no_store_error(srv, project);
         char *res = cbm_mcp_text_result(err, true);
         free(err);
         free(project);
@@ -6149,7 +6212,7 @@ static char *handle_manage_adr(cbm_mcp_server_t *srv, const char *args) {
     if (resolved_db_path) {
         owned_rw = cbm_store_open_path(resolved_db_path);
         if (!owned_rw) {
-            char *err = build_no_store_error(project);
+            char *err = build_no_store_error(srv, project);
             char *res = cbm_mcp_text_result(err, true);
             free(err);
             free(project);
@@ -6268,7 +6331,7 @@ static char *handle_ingest_traces(cbm_mcp_server_t *srv, const char *args) {
 
     cbm_store_t *resolved = resolve_store(srv, project);
     if (!resolved) {
-        char *err = build_no_store_error(project);
+        char *err = build_no_store_error(srv, project);
         char *res = cbm_mcp_text_result(err, true);
         free(err);
         free(project);
@@ -6282,7 +6345,7 @@ static char *handle_ingest_traces(cbm_mcp_server_t *srv, const char *args) {
     if (resolved_db_path) {
         owned_rw = cbm_store_open_path(resolved_db_path);
         if (!owned_rw) {
-            char *err = build_no_store_error(project);
+            char *err = build_no_store_error(srv, project);
             char *res = cbm_mcp_text_result(err, true);
             free(err);
             free(project);

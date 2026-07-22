@@ -220,7 +220,9 @@ const char *cbm_store_db_path(const cbm_store_t *s);
 
 /* Check database integrity. Returns true if the DB passes basic sanity checks
  * (projects table has correct types, no corruption indicators).
- * Returns false if corruption is detected — caller should delete and re-index. */
+ * Returns false if corruption is detected. Callers must preserve the complete
+ * database/journal family and fail closed; recovery and re-indexing are explicit
+ * operator-controlled transactions, never an automatic delete side effect. */
 bool cbm_store_check_integrity(cbm_store_t *s);
 
 /* Open database for a named project in the default cache dir. */
