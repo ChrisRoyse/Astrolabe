@@ -3806,6 +3806,60 @@ function Convert-AstroLinkedAttributionOwnerProbeNode {
     }
 }
 
+function Convert-AstroStrictJsonNodeToCanonicalValue {
+    param(
+        [Parameter(Mandatory)]$Node,
+        [Parameter(Mandatory)][string]$JsonPath
+    )
+
+    switch ([string]$Node.Kind) {
+        'null' { return $null }
+        'boolean' { return [bool]$Node.Value }
+        'string' { return [string]$Node.Value }
+        'integer' {
+            $signed = 0L
+            if ([long]::TryParse(
+                    [string]$Node.Raw,
+                    [Globalization.NumberStyles]::AllowLeadingSign,
+                    [Globalization.CultureInfo]::InvariantCulture,
+                    [ref]$signed
+                )) {
+                return $signed
+            }
+            $unsigned = [uint64]0
+            if ([uint64]::TryParse(
+                    [string]$Node.Raw,
+                    [Globalization.NumberStyles]::None,
+                    [Globalization.CultureInfo]::InvariantCulture,
+                    [ref]$unsigned
+                )) {
+                return $unsigned
+            }
+            throw "$JsonPath integer is outside the canonical 64-bit range"
+        }
+        'array' {
+            $values = [Collections.Generic.List[object]]::new()
+            for ($index = 0; $index -lt @($Node.Items).Count; $index++) {
+                $values.Add((Convert-AstroStrictJsonNodeToCanonicalValue `
+                    $Node.Items[$index] "$JsonPath[$index]"))
+            }
+            Write-Output -NoEnumerate ([object[]]@($values))
+            return
+        }
+        'object' {
+            $value = [ordered]@{}
+            foreach ($name in [string[]]@($Node.Names)) {
+                $value[$name] = Convert-AstroStrictJsonNodeToCanonicalValue `
+                    $Node.Properties[$name] "$JsonPath.$name"
+            }
+            return $value
+        }
+        default {
+            throw "$JsonPath contains unsupported canonical JSON kind '$($Node.Kind)'"
+        }
+    }
+}
+
 function Convert-AstroLinkedAttributionProbeNode {
     param(
         [Parameter(Mandatory)]$Node,
@@ -3825,6 +3879,7 @@ function Convert-AstroLinkedAttributionProbeNode {
         'manifests',
         'refresh_transactions',
         'temps',
+        'unrelated_complete_pairs',
         'stable_fingerprint_sha256',
         'observed_at_utc'
     ) $JsonPath
@@ -4544,6 +4599,136 @@ function Convert-AstroLinkedAttributionProbeNode {
                 "$JsonPath.temps[].launcher_lock_sha256" -Nonblank
         })
     }
+    $unrelatedNode = $Node.Properties['unrelated_complete_pairs']
+    if ($unrelatedNode.Kind -cne 'array') {
+        throw "$JsonPath.unrelated_complete_pairs must be an array"
+    }
+    $unrelatedBindings = [Collections.Generic.List[object]]::new()
+    $unrelatedKeys = [Collections.Generic.HashSet[string]]::new(
+        [StringComparer]::Ordinal
+    )
+    $previousUnrelatedKey = $null
+    foreach ($pair in @($unrelatedNode.Items)) {
+        $pairPath = "$JsonPath.unrelated_complete_pairs[]"
+        Assert-AstroStrictObjectShape $pair @(
+            'identity', 'manifest', 'temp', 'action'
+        ) $pairPath
+        $identity = Get-AstroStrictStringValue `
+            $pair.Properties['identity'] "$pairPath.identity" -Nonblank
+        $identityMatch = [Regex]::Match(
+            $identity,
+            '^(?<pid>[1-9][0-9]*)\|(?<ticks>[1-9][0-9]*)\|(?<sha>[0-9a-f]{64})$',
+            [Text.RegularExpressions.RegexOptions]::CultureInvariant
+        )
+        $unrelatedPid = 0
+        $unrelatedTicks = 0L
+        if (-not $identityMatch.Success -or
+            -not [int]::TryParse(
+                $identityMatch.Groups['pid'].Value,
+                [Globalization.NumberStyles]::None,
+                [Globalization.CultureInfo]::InvariantCulture,
+                [ref]$unrelatedPid
+            ) -or $unrelatedPid -le 0 -or
+            -not [long]::TryParse(
+                $identityMatch.Groups['ticks'].Value,
+                [Globalization.NumberStyles]::None,
+                [Globalization.CultureInfo]::InvariantCulture,
+                [ref]$unrelatedTicks
+            ) -or $unrelatedTicks -le 0 -or
+            $unrelatedTicks -gt [DateTime]::MaxValue.Ticks) {
+            throw "$pairPath.identity is not a canonical launcher generation identity"
+        }
+        if (-not $unrelatedKeys.Add($identity)) {
+            throw "$JsonPath repeats unrelated complete-pair identity '$identity'"
+        }
+        if ($null -ne $previousUnrelatedKey -and
+            [string]::CompareOrdinal($previousUnrelatedKey, $identity) -ge 0) {
+            throw "$JsonPath.unrelated_complete_pairs is not in canonical identity order"
+        }
+        $previousUnrelatedKey = $identity
+        $unrelatedSha = $identityMatch.Groups['sha'].Value
+
+        $manifest = $pair.Properties['manifest']
+        Assert-AstroStrictObjectShape $manifest @(
+            'path',
+            'file_identity',
+            'bytes',
+            'sha256',
+            'owner_state',
+            'job_state'
+        ) "$pairPath.manifest"
+        $manifestPathText = Get-AstroStrictStringValue `
+            $manifest.Properties['path'] "$pairPath.manifest.path" -Nonblank
+        $manifestPath = [IO.Path]::GetFullPath($manifestPathText)
+        $manifestName = ConvertFrom-AstroAttributionManifestName $manifestPath
+        if ($manifestPathText -cne $manifestPath -or
+            -not $manifestName.Valid -or
+            $manifestName.SchemaVersion -ne 3 -or
+            $manifestName.LauncherPid -ne $unrelatedPid -or
+            $manifestName.LauncherProcessStartUtcTicks -ne $unrelatedTicks -or
+            $manifestName.LauncherLockSha256 -cne $unrelatedSha) {
+            throw "$pairPath.manifest.path does not bind the exact v3 generation identity"
+        }
+        $manifestFileIdentity = Get-AstroStrictStringValue `
+            $manifest.Properties['file_identity'] `
+            "$pairPath.manifest.file_identity" -Nonblank
+        $manifestBytes = [uint64](ConvertFrom-AstroJsonUnsignedNode `
+            $manifest.Properties['bytes'] "$pairPath.manifest.bytes" `
+            ([uint64]$script:AstroLauncherProtocolSnapshotMaxBytes) -Positive)
+        $manifestSha = Get-AstroStrictStringValue `
+            $manifest.Properties['sha256'] "$pairPath.manifest.sha256" -Nonblank
+        $ownerState = Get-AstroStrictStringValue `
+            $manifest.Properties['owner_state'] `
+            "$pairPath.manifest.owner_state" -Nonblank
+        $jobState = Get-AstroStrictStringValue `
+            $manifest.Properties['job_state'] `
+            "$pairPath.manifest.job_state" -Nonblank
+        if ($manifestFileIdentity -cnotmatch '^[0-9a-f]{16}:[0-9a-f]{32}$' -or
+            $manifestSha -cnotmatch '^[0-9a-f]{64}$' -or
+            $ownerState -cnotin @('absent', 'pid-reused') -or
+            $jobState -cne 'absent') {
+            throw "$pairPath.manifest does not prove an exact dead-owner/Job-absent file binding"
+        }
+
+        $temp = $pair.Properties['temp']
+        Assert-AstroStrictObjectShape $temp @(
+            'path', 'file_identity'
+        ) "$pairPath.temp"
+        $tempPathText = Get-AstroStrictStringValue `
+            $temp.Properties['path'] "$pairPath.temp.path" -Nonblank
+        $tempPath = [IO.Path]::GetFullPath($tempPathText)
+        $tempName = ConvertFrom-AstroLauncherTempName $tempPath
+        $tempFileIdentity = Get-AstroStrictStringValue `
+            $temp.Properties['file_identity'] `
+            "$pairPath.temp.file_identity" -Nonblank
+        if ($tempPathText -cne $tempPath -or -not $tempName.Valid -or
+            $tempName.LauncherPid -ne $unrelatedPid -or
+            $tempName.LauncherProcessStartUtcTicks -ne $unrelatedTicks -or
+            $tempName.LauncherLockSha256 -cne $unrelatedSha -or
+            $tempFileIdentity -cnotmatch '^[0-9a-f]{16}:[0-9a-f]{32}$') {
+            throw "$pairPath.temp does not bind the exact generation TEMP identity"
+        }
+        $action = Get-AstroStrictStringValue `
+            $pair.Properties['action'] "$pairPath.action" -Nonblank
+        if ($action -cne 'preserved') {
+            throw "$pairPath.action must be exactly 'preserved'"
+        }
+        $unrelatedBindings.Add([pscustomobject]@{
+            Identity = $identity
+            LauncherPid = $unrelatedPid
+            LauncherProcessStartUtcTicks = $unrelatedTicks
+            LauncherLockSha256 = $unrelatedSha
+            ManifestPath = $manifestPath
+            ManifestFileIdentity = $manifestFileIdentity
+            ManifestBytes = $manifestBytes
+            ManifestSha256 = $manifestSha
+            OwnerState = $ownerState
+            JobState = $jobState
+            TempPath = $tempPath
+            TempFileIdentity = $tempFileIdentity
+            Action = $action
+        })
+    }
     $finalCount = @($manifestBindings | Where-Object ExactExpectedLauncher).Count
     foreach ($refreshBinding in @($refreshBindings)) {
         $logicalMatches = @($manifestBindings | Where-Object {
@@ -4591,6 +4776,32 @@ function Convert-AstroLinkedAttributionProbeNode {
             throw "$JsonPath complete pair does not bind one exact canonical TEMP identity"
         }
     }
+    $stable = [ordered]@{}
+    foreach ($field in @(
+            'state',
+            'policy',
+            'subordinate_state',
+            'exact_manifest_observed',
+            'exact_manifest_lease_start_utc_ticks',
+            'exact_launcher_lease_start_utc_ticks',
+            'exact_job_object_name',
+            'exact_job_object_probe',
+            'manifests',
+            'refresh_transactions',
+            'temps',
+            'unrelated_complete_pairs'
+        )) {
+        $stable[$field] = Convert-AstroStrictJsonNodeToCanonicalValue `
+            $Node.Properties[$field] "$JsonPath.$field"
+    }
+    $computedFingerprint = Get-AstroByteSha256(
+        [Text.UTF8Encoding]::new($false).GetBytes(
+            ($stable | ConvertTo-Json -Depth 16 -Compress)
+        )
+    )
+    if ($computedFingerprint -cne $fingerprint) {
+        throw "$JsonPath.stable_fingerprint_sha256 does not bind the canonical durable attribution state"
+    }
     return [pscustomobject]@{
         Policy = $policy
         SubordinateState = $subordinateState
@@ -4606,6 +4817,8 @@ function Convert-AstroLinkedAttributionProbeNode {
         RefreshTransactions = [object[]]@($refreshBindings)
         TempCount = @($tempsNode.Items).Count
         Temps = [object[]]@($tempBindings)
+        UnrelatedCompletePairCount = @($unrelatedNode.Items).Count
+        UnrelatedCompletePairs = [object[]]@($unrelatedBindings)
     }
 }
 
