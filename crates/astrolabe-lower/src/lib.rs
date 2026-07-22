@@ -18,7 +18,7 @@ use astrolabe_ingest::{
 };
 use astrolabe_weave::{
     PersistedSimilarityEdgeRow, SCHEMA_SIM_EDGE_ROW, SIM_EDGE_ROW_PREFIX, SimEdgeGraphRow,
-    read_similarity_edge_rows,
+    read_similarity_edge_rows, sim_edge_graph_key,
 };
 use calyx_aster::cf::{ColumnFamily, prefix_range};
 use calyx_aster::vault::AsterVault;
@@ -708,7 +708,7 @@ impl LoweredRows {
     ) -> LowerResult<Self> {
         let mut seen_atom = BTreeSet::new();
         let mut id_by_source = BTreeMap::new();
-        let mut id_by_qn: BTreeMap<String, Option<i64>> = BTreeMap::new();
+        let mut id_by_atom = BTreeMap::new();
         let mut nodes = Vec::with_capacity(snapshot.nodes.len());
         for (index, node) in snapshot.nodes.into_iter().enumerate() {
             if !seen_atom.insert((node.project.clone(), node.atom_id.clone())) {
@@ -726,10 +726,12 @@ impl LoweredRows {
                     node.source_node_id
                 )));
             }
-            id_by_qn
-                .entry(node.qualified_name.clone())
-                .and_modify(|resolved| *resolved = None)
-                .or_insert(Some(id));
+            if id_by_atom.insert(node.atom_id.clone(), id).is_some() {
+                return Err(LowerError::InvalidInput(format!(
+                    "duplicate stable atom identity {} while lowering",
+                    node.atom_id
+                )));
+            }
             nodes.push(lower_node(id, node)?);
         }
 
@@ -751,8 +753,8 @@ impl LoweredRows {
         }
         for persisted in similarity_edges {
             let row = persisted.row;
-            let source_id = resolve_unique_qn(&id_by_qn, &row.source_qn, &row.family, "source")?;
-            let target_id = resolve_unique_qn(&id_by_qn, &row.target_qn, &row.family, "target")?;
+            let source_id = resolve_atom_id(&id_by_atom, &row.source_id, &row.family, "source")?;
+            let target_id = resolve_atom_id(&id_by_atom, &row.target_id, &row.family, "target")?;
             let id = i64::try_from(edges.len() + 1).map_err(|_| {
                 LowerError::InvalidInput("too many edges to assign SQLite ids".to_string())
             })?;
@@ -780,21 +782,17 @@ impl LoweredRows {
     }
 }
 
-fn resolve_unique_qn(
-    id_by_qn: &BTreeMap<String, Option<i64>>,
-    qualified_name: &str,
+fn resolve_atom_id(
+    id_by_atom: &BTreeMap<String, i64>,
+    atom_id: &str,
     family: &str,
     endpoint: &str,
 ) -> LowerResult<i64> {
-    match id_by_qn.get(qualified_name) {
-        Some(Some(id)) => Ok(*id),
-        Some(None) => Err(LowerError::InvalidInput(format!(
-            "ASTRO_LOWER_QN_AMBIGUOUS: persisted {family} similarity edge {endpoint} {qualified_name:?} resolves to multiple stable atoms; persist and resolve an atom_id before lowering"
-        ))),
-        None => Err(LowerError::InvalidInput(format!(
-            "persisted {family} similarity edge points to missing {endpoint} {qualified_name:?}"
-        ))),
-    }
+    id_by_atom.get(atom_id).copied().ok_or_else(|| {
+        LowerError::InvalidInput(format!(
+            "persisted {family} similarity edge points to missing {endpoint} stable atom id {atom_id:?}"
+        ))
+    })
 }
 
 fn lower_node(id: i64, node: CbmGraphNode) -> LowerResult<LoweredNode> {
@@ -1207,6 +1205,15 @@ where
                 "persisted SIM_* row {} names unknown similarity family {:?}",
                 hex_lower(&key),
                 row.family
+            )));
+        }
+        let family = row
+            .similarity_family()
+            .expect("similarity family checked above");
+        if key != sim_edge_graph_key(family, &row.source_id, &row.target_id) {
+            return Err(LowerError::InvalidInput(format!(
+                "persisted SIM_* row {} key does not match stable endpoint ids",
+                hex_lower(&key)
             )));
         }
         rows.push(PersistedSimilarityEdgeRow { key, row });

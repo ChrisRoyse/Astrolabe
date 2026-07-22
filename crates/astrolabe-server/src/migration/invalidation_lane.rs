@@ -6,7 +6,7 @@ use calyx_ledger::EntryKind;
 // defined in astrolabe-weave rather than duplicating the literal.
 const INVALIDATION_SCHEMA: &str = astrolabe_weave::ASSAY_DELTA_INVALIDATION_COTENANT_SCHEMA;
 const INVALIDATION_ACTOR: &str = "astrolabe-shadow-invalidation";
-const INVALIDATION_PREFIX: &[u8] = b"astrolabe:shadow:invalidation:v1\0";
+const INVALIDATION_PREFIX: &[u8] = b"astrolabe:shadow:invalidation:v2\0";
 
 #[derive(Debug, Clone)]
 struct KernelDirtyScc {
@@ -57,14 +57,14 @@ where
         .nodes
         .iter()
         .filter(|node| !node.structural)
-        .map(|node| node.qualified_name.clone())
+        .map(|node| node.atom_id.clone())
         .collect::<BTreeSet<_>>();
     let dirty_symbols = match delta {
-        Some(delta) => delta.dirty_qualified_names.clone(),
+        Some(delta) => delta.dirty_symbol_ids.clone(),
         None => live_symbols.clone(),
     };
     let removed_symbols = delta
-        .map(|delta| delta.removed_qualified_names.clone())
+        .map(|delta| delta.removed_symbol_ids.clone())
         .unwrap_or_default();
     let affected_symbols = dirty_symbols
         .union(&removed_symbols)
@@ -86,11 +86,22 @@ where
     let t_guard_reads = std::time::Instant::now();
     let mut rows = Vec::new();
 
-    for qualified_name in &affected_symbols {
-        let value = assay_dirty_value(project, qualified_name, snapshot_seq);
+    let qualified_names = snapshot
+        .nodes
+        .iter()
+        .filter(|node| !node.structural)
+        .map(|node| (node.atom_id.as_str(), node.qualified_name.as_str()))
+        .collect::<BTreeMap<_, _>>();
+    for symbol_id in &affected_symbols {
+        let value = assay_dirty_value(
+            project,
+            symbol_id,
+            qualified_names.get(symbol_id.as_str()).copied(),
+            snapshot_seq,
+        );
         rows.push((
             ColumnFamily::Assay,
-            assay_invalidation_key(project, qualified_name),
+            assay_invalidation_key(project, symbol_id),
             value,
         ));
     }
@@ -102,12 +113,18 @@ where
             value,
         ));
     }
-    for qualified_name in &affected_symbols {
-        let previous = read_guard_drift_count(vault, snapshot_seq, project, qualified_name)?;
-        let value = guard_drift_value(project, qualified_name, previous, snapshot_seq);
+    for symbol_id in &affected_symbols {
+        let previous = read_guard_drift_count(vault, snapshot_seq, project, symbol_id)?;
+        let value = guard_drift_value(
+            project,
+            symbol_id,
+            qualified_names.get(symbol_id.as_str()).copied(),
+            previous,
+            snapshot_seq,
+        );
         rows.push((
             ColumnFamily::Guard,
-            guard_invalidation_key(project, qualified_name),
+            guard_invalidation_key(project, symbol_id),
             value,
         ));
     }
@@ -171,8 +188,8 @@ where
         "snapshot_seq_before": snapshot_seq,
         "commit_seq": commit_seq,
         "ledger_rows_added": ledger_rows_after.saturating_sub(ledger_rows_before),
-        "dirty_symbols": dirty_symbols.iter().cloned().collect::<Vec<_>>(),
-        "removed_symbols": removed_symbols.iter().cloned().collect::<Vec<_>>(),
+        "dirty_symbol_ids": dirty_symbols.iter().cloned().collect::<Vec<_>>(),
+        "removed_symbol_ids": removed_symbols.iter().cloned().collect::<Vec<_>>(),
         "affected_symbol_count": affected_symbols.len(),
         "assay": {
             "status": "dirty",
@@ -223,9 +240,9 @@ pub(crate) fn invalidation_prefix(project: &str, family: &str) -> Vec<u8> {
     key
 }
 
-fn assay_invalidation_key(project: &str, qualified_name: &str) -> Vec<u8> {
+fn assay_invalidation_key(project: &str, symbol_id: &str) -> Vec<u8> {
     let mut key = invalidation_prefix(project, "assay");
-    key.extend_from_slice(qualified_name.as_bytes());
+    key.extend_from_slice(symbol_id.as_bytes());
     key
 }
 
@@ -235,27 +252,33 @@ fn kernel_invalidation_key(project: &str, scc_id: &str) -> Vec<u8> {
     key
 }
 
-fn guard_invalidation_key(project: &str, qualified_name: &str) -> Vec<u8> {
+fn guard_invalidation_key(project: &str, symbol_id: &str) -> Vec<u8> {
     let mut key = invalidation_prefix(project, "guard");
-    key.extend_from_slice(qualified_name.as_bytes());
+    key.extend_from_slice(symbol_id.as_bytes());
     key
 }
 
-fn assay_stratum(project: &str, qualified_name: &str) -> String {
+fn assay_stratum(project: &str, symbol_id: &str) -> String {
     // The invalidation lane runs inside the shadow import pipeline, so its stratum
     // label must name the roster version the symbols were actually measured under
     // (SHADOW_PANEL_VERSION), not a stale v1 literal (#336).
-    format!("panel_v{SHADOW_PANEL_VERSION}:project:{project}:symbol:{qualified_name}")
+    format!("panel_v{SHADOW_PANEL_VERSION}:project:{project}:symbol:{symbol_id}")
 }
 
-fn assay_dirty_value(project: &str, qualified_name: &str, snapshot_seq: u64) -> Vec<u8> {
+fn assay_dirty_value(
+    project: &str,
+    symbol_id: &str,
+    qualified_name: Option<&str>,
+    snapshot_seq: u64,
+) -> Vec<u8> {
     serde_json::to_vec(&json!({
         "schema": INVALIDATION_SCHEMA,
         "kind": "assay_stratum_dirty",
         "project": project,
         "panel_version": SHADOW_PANEL_VERSION,
+        "symbol_id": symbol_id,
         "qualified_name": qualified_name,
-        "stratum": assay_stratum(project, qualified_name),
+        "stratum": assay_stratum(project, symbol_id),
         "dirty": true,
         "dirty_since_seq": snapshot_seq,
         "reason": "symbol delta changed the panel/slot inputs consumed by assay caches",
@@ -282,7 +305,8 @@ fn kernel_dirty_value(project: &str, scc: &KernelDirtyScc, snapshot_seq: u64) ->
 
 fn guard_drift_value(
     project: &str,
-    qualified_name: &str,
+    symbol_id: &str,
+    qualified_name: Option<&str>,
     previous_count: u64,
     snapshot_seq: u64,
 ) -> Vec<u8> {
@@ -290,6 +314,7 @@ fn guard_drift_value(
         "schema": INVALIDATION_SCHEMA,
         "kind": "guard_drift_counter",
         "project": project,
+        "symbol_id": symbol_id,
         "qualified_name": qualified_name,
         "previous_count": previous_count,
         "drift_count": previous_count.saturating_add(1),
@@ -303,7 +328,7 @@ fn read_guard_drift_count<C>(
     vault: &AsterVault<C>,
     snapshot: u64,
     project: &str,
-    qualified_name: &str,
+    symbol_id: &str,
 ) -> Result<u64, DynError>
 where
     C: Clock,
@@ -311,7 +336,7 @@ where
     let Some(bytes) = vault.read_cf_at(
         snapshot,
         ColumnFamily::Guard,
-        &guard_invalidation_key(project, qualified_name),
+        &guard_invalidation_key(project, symbol_id),
     )?
     else {
         return Ok(0);
@@ -375,33 +400,33 @@ fn kernel_dirty_sccs(
     // (~1s at 50k nodes / 500k edges). Components are traversal-order-invariant
     // sets, member lists are sorted before hashing, and the final list is
     // sorted by id, so the output is byte-identical to the map-based shape.
-    let mut id_to_qn = BTreeMap::<i64, &str>::new();
+    let mut id_to_atom = BTreeMap::<i64, &str>::new();
     for node in snapshot.nodes.iter().filter(|node| !node.structural) {
-        id_to_qn.insert(node.source_node_id, node.qualified_name.as_str());
+        id_to_atom.insert(node.source_node_id, node.atom_id.as_str());
     }
-    // Deterministic node indexing by qualified name (BTreeSet iteration order).
-    let qns = id_to_qn.values().copied().collect::<BTreeSet<_>>();
-    let qn_list = qns.iter().copied().collect::<Vec<_>>();
-    let qn_index = qn_list
+    // Deterministic node indexing by stable atom id (BTreeSet iteration order).
+    let atoms = id_to_atom.values().copied().collect::<BTreeSet<_>>();
+    let atom_list = atoms.iter().copied().collect::<Vec<_>>();
+    let atom_index = atom_list
         .iter()
         .enumerate()
-        .map(|(index, qn)| (*qn, index))
+        .map(|(index, atom)| (*atom, index))
         .collect::<BTreeMap<_, _>>();
-    let node_count = qn_list.len();
+    let node_count = atom_list.len();
     let mut adjacency = vec![Vec::<u32>::new(); node_count];
     let mut reverse = vec![Vec::<u32>::new(); node_count];
     for edge in &snapshot.edges {
         let (Some(source), Some(target)) = (
-            id_to_qn.get(&edge.source_node_id),
-            id_to_qn.get(&edge.target_node_id),
+            id_to_atom.get(&edge.source_node_id),
+            id_to_atom.get(&edge.target_node_id),
         ) else {
             continue;
         };
         if source == target {
             continue;
         }
-        let source = qn_index[source];
-        let target = qn_index[target];
+        let source = atom_index[source];
+        let target = atom_index[target];
         adjacency[source].push(target as u32);
         reverse[target].push(source as u32);
     }
@@ -437,7 +462,7 @@ fn kernel_dirty_sccs(
 
     let live_dirty_indices = dirty_symbols
         .iter()
-        .filter_map(|symbol| qn_index.get(symbol.as_str()).map(|index| *index as u32))
+        .filter_map(|symbol| atom_index.get(symbol.as_str()).map(|index| *index as u32))
         .collect::<BTreeSet<u32>>();
     let mut assigned = vec![false; node_count];
     let mut sccs = Vec::<KernelDirtyScc>::new();
@@ -461,14 +486,14 @@ fn kernel_dirty_sccs(
         let dirty_members = component
             .iter()
             .filter(|index| live_dirty_indices.contains(*index))
-            .map(|index| qn_list[*index as usize].to_string())
+            .map(|index| atom_list[*index as usize].to_string())
             .collect::<Vec<_>>();
         if dirty_members.is_empty() {
             continue;
         }
         let members = component
             .iter()
-            .map(|index| qn_list[*index as usize].to_string())
+            .map(|index| atom_list[*index as usize].to_string())
             .collect::<Vec<_>>();
         let id = dirty_scc_id(&members, &[]);
         sccs.push(KernelDirtyScc {
@@ -480,7 +505,7 @@ fn kernel_dirty_sccs(
     }
 
     for removed in removed_symbols {
-        if let Some(index) = qn_index.get(removed.as_str())
+        if let Some(index) = atom_index.get(removed.as_str())
             && live_dirty_indices.contains(&(*index as u32))
         {
             continue;
@@ -499,7 +524,7 @@ fn kernel_dirty_sccs(
 
 fn dirty_scc_id(members: &[String], removed_members: &[String]) -> String {
     let mut hasher = Sha256::new();
-    hasher.update(b"kernel-dirty-scc-v1");
+    hasher.update(b"kernel-dirty-scc-v2");
     for member in members {
         hasher.update([0]);
         hasher.update(member.as_bytes());

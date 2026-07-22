@@ -13,6 +13,56 @@ pub(crate) fn kernel_artifact_scope_id(project: &str) -> String {
     format!("repo:{project}")
 }
 
+fn stable_identity_by_cx<C>(
+    vault: &AsterVault<C>,
+    project: &str,
+) -> Result<BTreeMap<String, (String, String)>, DynError>
+where
+    C: Clock,
+{
+    let snapshot = astrolabe_ingest::read_cbm_graph_snapshot(vault, project)?;
+    let mut identity_by_cx = BTreeMap::new();
+    let mut seen_atoms = BTreeSet::new();
+    for node in snapshot.nodes {
+        let Some(cx_id) = node.cx_id else {
+            continue;
+        };
+        if node.atom_id.trim().is_empty() {
+            return Err(format!(
+                "ASTRO_KERNEL_IDENTITY_MISSING: CxId {cx_id} has no stable source atom (qualified_name={:?})",
+                node.qualified_name
+            )
+            .into());
+        }
+        if !seen_atoms.insert(node.atom_id.clone()) {
+            return Err(format!(
+                "ASTRO_KERNEL_IDENTITY_DUPLICATE_ATOM: stable source atom {} maps to multiple CxIds",
+                node.atom_id
+            )
+            .into());
+        }
+        if identity_by_cx
+            .insert(
+                cx_id.to_string(),
+                (node.atom_id.clone(), node.qualified_name.clone()),
+            )
+            .is_some()
+        {
+            return Err(format!(
+                "ASTRO_KERNEL_IDENTITY_DUPLICATE_CX: CxId {cx_id} maps to multiple source atoms"
+            )
+            .into());
+        }
+    }
+    if identity_by_cx.is_empty() {
+        return Err(format!(
+            "ASTRO_KERNEL_IDENTITY_EMPTY: project {project:?} has no CxId-to-atom identity rows"
+        )
+        .into());
+    }
+    Ok(identity_by_cx)
+}
+
 /// Index-time hook (#365): persists the real `KernelArtifact` for the freshly
 /// imported project into the vault Kernel CF via `build_and_persist_kernel`, using
 /// the promotion-aware per-symbol anchor trust map (#352) as the groundedness
@@ -121,21 +171,17 @@ where
 {
     let scope_id = kernel_artifact_scope_id(project);
     let extra_seeds = label_anchor_seeds(vault);
-    // #394: the persisted propagated-label rows are keyed by durable CxId hex
-    // (the seed producer stores `cx_id.to_string()`), but the `propagated_label`
-    // search filter matches search_graph hits by qualified_name/name. Resolve the
-    // CxId→qualified_name relation from the persisted node map (the same readback
-    // #400 uses for kernel scope members) so the served labels carry the
-    // qualified_name the filter can actually match. Fail-open to an empty map
-    // (each label then falls back to its CxId hex — never a fuzzy guess).
-    let qn_by_cx_hex = astrolabe_ingest::read_node_map_cx_ids(vault, project)
-        .map(|by_qn| {
-            by_qn
-                .into_iter()
-                .map(|(qualified_name, cx_id)| (cx_id.to_string(), qualified_name))
-                .collect::<BTreeMap<String, String>>()
-        })
-        .unwrap_or_default();
+    // Persisted propagation rows key on CxId. Resolve each one through the
+    // current graph snapshot to the stable source atom used by search; qualified
+    // name remains display metadata and may legitimately be shared.
+    let identity_by_cx_hex = match stable_identity_by_cx(vault, project) {
+        Ok(identity) => identity,
+        Err(error) => {
+            return label_propagation_unavailable_json(&format!(
+                "graph identity snapshot unreadable before label propagation: {error}"
+            ));
+        }
+    };
     match astrolabe_ingest::derive_and_propagate_index_time_labels(
         vault,
         &scope_id,
@@ -145,7 +191,7 @@ where
         astrolabe_ingest::LABEL_SEED_ACTOR,
     ) {
         Ok(report) => match astrolabe_ingest::read_propagated_label_rows(vault) {
-            Ok(rows) => persisted_label_propagation_json(&report, &rows, &qn_by_cx_hex),
+            Ok(rows) => persisted_label_propagation_json(&report, &rows, &identity_by_cx_hex),
             Err(error) => label_propagation_unavailable_json(&format!(
                 "propagated label rows unreadable after propagation: {error}"
             )),
@@ -200,28 +246,35 @@ where
 /// `propagated_label` search filter ([`propagated_label_symbol_ids`]) consumes it
 /// unchanged.
 ///
-/// #394: each row's durable `symbol_id` is a CxId hex, but the search filter
-/// matches hits by qualified_name/name. `qn_by_cx_hex` (CxId hex → qualified_name,
-/// resolved from the persisted node map) supplies the served `qualified_name` the
-/// filter matches on; an unresolved CxId falls back to its hex (the filter then
-/// simply matches nothing for that label — honest, never fuzzy).
+/// Each row's persisted `symbol_id` is a CxId hex. The served `symbol_id` is the
+/// corresponding stable source atom; `qualified_name` is non-unique metadata.
 fn persisted_label_propagation_json(
     report: &astrolabe_ingest::IndexTimeLabelReport,
     rows: &[astrolabe_ingest::PersistedPropagatedLabel],
-    qn_by_cx_hex: &BTreeMap<String, String>,
+    identity_by_cx_hex: &BTreeMap<String, (String, String)>,
 ) -> Value {
     let propagation = &report.propagation;
+    if let Some(missing) = rows
+        .iter()
+        .find(|persisted| !identity_by_cx_hex.contains_key(&persisted.row.symbol_id))
+    {
+        return label_propagation_unavailable_json(&format!(
+            "propagated label CxId {} has no live stable source-atom identity",
+            missing.row.symbol_id
+        ));
+    }
     let status = if rows.is_empty() { "empty" } else { "built" };
     let labels = rows
         .iter()
         .map(|persisted| {
             let row = &persisted.row;
-            let qualified_name = qn_by_cx_hex
+            let (symbol_id, qualified_name) = identity_by_cx_hex
                 .get(&row.symbol_id)
                 .cloned()
-                .unwrap_or_else(|| row.symbol_id.clone());
+                .expect("all propagated label identities checked above");
             json!({
-                "symbol_id": row.symbol_id,
+                "symbol_id": symbol_id,
+                "cx_id": row.symbol_id,
                 "qualified_name": qualified_name,
                 "label": row.label,
                 "confidence_millipoints": row.confidence_millipoints,
@@ -344,38 +397,34 @@ where
             "persisted kernel artifact carries no members; scope is empty",
         );
     }
-    // Resolve each member CxId to its real qualified name from the persisted node
-    // map; ambiguous/absent names fall back to the durable CxId hex (never guessed).
-    let qn_by_cx = astrolabe_ingest::read_node_map_cx_ids(vault, project)
-        .map(|by_qn| {
-            by_qn
-                .into_iter()
-                .map(|(qualified_name, cx_id)| (cx_id, qualified_name))
-                .collect::<BTreeMap<_, _>>()
-        })
-        .unwrap_or_default();
-    let members = artifact
-        .members
-        .iter()
-        .map(|member| {
-            let symbol_id = member.id.to_string();
-            let qualified_name = qn_by_cx
-                .get(&member.id)
-                .cloned()
-                .unwrap_or_else(|| symbol_id.clone());
-            let provenance = format!(
-                "kernel-artifact:scope={};member={symbol_id};members_hash={}",
-                artifact.scope_id, artifact.members_hash
-            );
-            ScopeSummaryMember::new(
-                symbol_id,
-                qualified_name,
-                member.score_permille,
-                member.grounded,
-                provenance,
-            )
-        })
-        .collect::<Vec<_>>();
+    let identity_by_cx = match stable_identity_by_cx(vault, project) {
+        Ok(identity) => identity,
+        Err(error) => {
+            return scope_summaries_unavailable_json(&format!(
+                "persisted kernel identity snapshot unreadable: {error}"
+            ));
+        }
+    };
+    let mut members = Vec::with_capacity(artifact.members.len());
+    for member in &artifact.members {
+        let cx_id = member.id.to_string();
+        let Some((symbol_id, qualified_name)) = identity_by_cx.get(&cx_id).cloned() else {
+            return scope_summaries_unavailable_json(&format!(
+                "persisted kernel member {cx_id} has no stable source-atom identity; rebuild the project kernel"
+            ));
+        };
+        let provenance = format!(
+            "kernel-artifact:scope={};member={symbol_id};cx_id={cx_id};members_hash={}",
+            artifact.scope_id, artifact.members_hash
+        );
+        members.push(ScopeSummaryMember::new(
+            symbol_id,
+            qualified_name,
+            member.score_permille,
+            member.grounded,
+            provenance,
+        ));
+    }
     let recall = Some(ScopeRecallMeasurement {
         recalled: artifact.recall.recalled,
         total: artifact.recall.total,
@@ -499,7 +548,7 @@ pub(crate) fn label_seed_inputs_from_rows(
                     .map(ToOwned::to_owned)
                     .unwrap_or_else(|| format!("row_sink:{}:{}#label_seed", node.project, node.id));
                 seeds.push(LabelSeed::new(
-                    node.qualified_name.clone(),
+                    node.atom_id.clone(),
                     label.to_string(),
                     confidence,
                     provenance,
@@ -511,7 +560,7 @@ pub(crate) fn label_seed_inputs_from_rows(
                 let symbol_id = value
                     .get("symbol_id")
                     .and_then(Value::as_str)
-                    .unwrap_or(&node.qualified_name);
+                    .unwrap_or(&node.atom_id);
                 let provenance = value
                     .get("provenance_ref")
                     .and_then(Value::as_str)
@@ -528,17 +577,17 @@ pub(crate) fn label_seed_inputs_from_rows(
 }
 
 pub(crate) fn label_graph_edges_from_rows(rows: &CbmPipelineRows) -> Vec<LabelGraphEdge> {
-    let node_names = rows
+    let node_ids = rows
         .nodes
         .iter()
-        .filter(|node| !node.qualified_name.trim().is_empty())
-        .map(|node| (node.id, node.qualified_name.clone()))
+        .filter(|node| !node.atom_id.trim().is_empty())
+        .map(|node| (node.id, node.atom_id.clone()))
         .collect::<BTreeMap<_, _>>();
     rows.edges
         .iter()
         .filter_map(|edge| {
-            let left = node_names.get(&edge.source_id)?;
-            let right = node_names.get(&edge.target_id)?;
+            let left = node_ids.get(&edge.source_id)?;
+            let right = node_ids.get(&edge.target_id)?;
             Some(LabelGraphEdge::new(
                 left.clone(),
                 right.clone(),
@@ -669,7 +718,7 @@ pub(crate) fn scope_summary_inputs_from_rows(
 
         for scope in scopes {
             let member = ScopeSummaryMember::new(
-                node.qualified_name.clone(),
+                node.atom_id.clone(),
                 node.qualified_name.clone(),
                 bridge_node_kernel_weight(&properties, &scope),
                 grounded,
@@ -881,9 +930,8 @@ pub(crate) fn kernel_context_unavailable_json(reason: &str) -> Value {
 /// unavailable so the search filter never silently degrades into an unfiltered or
 /// spuriously empty result. Same exact-match semantics as the kernel's
 /// [`astrolabe_kernel::filter_symbols_by_propagated_label`]. The returned key is
-/// the served `qualified_name` (node-map-resolved) when present — the identity the
-/// search_graph hits carry — falling back to the durable `symbol_id`/CxId hex
-/// (#394).
+/// the served stable source-atom `symbol_id`; qualified name is display metadata
+/// and is never used as an identity key.
 pub(crate) fn propagated_label_symbol_ids(
     kernel_context: &Value,
     label: &str,
@@ -907,24 +955,13 @@ pub(crate) fn propagated_label_symbol_ids(
     let mut ids = BTreeSet::new();
     if let Some(labels) = propagation.get("labels").and_then(Value::as_array) {
         for entry in labels {
-            // #394: match on the served `qualified_name` (resolved from the node
-            // map) so the CxId-hex-keyed persisted labels line up with the
-            // search_graph hits (which carry qualified_name/name), falling back to
-            // the durable `symbol_id` for the row-sink block that has no
-            // qualified_name field. Never a substring/fuzzy match.
+            // Exact stable source-atom identity; never a qualified-name guess.
             if entry.get("label").and_then(Value::as_str) == Some(label)
                 && let Some(candidate) = entry
-                    .get("qualified_name")
+                    .get("symbol_id")
                     .and_then(Value::as_str)
                     .map(str::trim)
                     .filter(|candidate| !candidate.is_empty())
-                    .or_else(|| {
-                        entry
-                            .get("symbol_id")
-                            .and_then(Value::as_str)
-                            .map(str::trim)
-                            .filter(|symbol_id| !symbol_id.is_empty())
-                    })
             {
                 ids.insert(candidate.to_string());
             }
@@ -949,7 +986,7 @@ pub(crate) fn filter_search_graph_result_by_label(
         .get_mut("structuredContent")
         .and_then(Value::as_object_mut)
     {
-        let (input_count, matched_count) = retain_labeled_results(structured, labeled_symbols);
+        let (input_count, matched_count) = retain_labeled_results(structured, labeled_symbols)?;
         structured.insert(
             "astrolabe_propagated_label_filter".to_string(),
             search_graph_filter_meta_json(label, input_count, matched_count),
@@ -961,11 +998,24 @@ pub(crate) fn filter_search_graph_result_by_label(
         .and_then(Value::as_array_mut)
         .and_then(|items| items.first_mut())
         .and_then(|item| item.get_mut("text"))
-        && let Some(raw_text) = text.as_str()
-        && let Ok(mut text_value) = serde_json::from_str::<Value>(raw_text)
-        && let Some(text_obj) = text_value.as_object_mut()
     {
-        let (input_count, matched_count) = retain_labeled_results(text_obj, labeled_symbols);
+        let raw_text = text.as_str().ok_or_else(|| -> DynError {
+            "ASTRO_SEARCH_LABEL_FILTER_TEXT_TYPE: content[0].text is not a string"
+                .to_string()
+                .into()
+        })?;
+        let mut text_value = serde_json::from_str::<Value>(raw_text).map_err(|error| -> DynError {
+            format!(
+                "ASTRO_SEARCH_LABEL_FILTER_TEXT_JSON: content[0].text is not valid search JSON: {error}"
+            )
+            .into()
+        })?;
+        let text_obj = text_value.as_object_mut().ok_or_else(|| -> DynError {
+            "ASTRO_SEARCH_LABEL_FILTER_TEXT_OBJECT: content[0].text search JSON is not an object"
+                .to_string()
+                .into()
+        })?;
+        let (input_count, matched_count) = retain_labeled_results(text_obj, labeled_symbols)?;
         text_obj.insert(
             "astrolabe_propagated_label_filter".to_string(),
             search_graph_filter_meta_json(label, input_count, matched_count),
@@ -982,21 +1032,34 @@ pub(crate) fn filter_search_graph_result_by_label(
 fn retain_labeled_results(
     obj: &mut Map<String, Value>,
     labeled_symbols: &BTreeSet<String>,
-) -> (usize, usize) {
-    let Some(results) = obj.get_mut("results").and_then(Value::as_array_mut) else {
-        return (0, 0);
-    };
-    let input_count = results.len();
-    results.retain(|hit| {
-        let candidate = hit
-            .get("qualified_name")
-            .and_then(Value::as_str)
-            .filter(|name| !name.is_empty())
-            .or_else(|| hit.get("name").and_then(Value::as_str))
-            .unwrap_or_default();
-        labeled_symbols.contains(candidate)
-    });
-    let matched_count = results.len();
+) -> Result<(usize, usize), DynError> {
+    let mut input_count = 0;
+    let mut matched_count = 0;
+    for result_field in ["results", "semantic_results"] {
+        let Some(results) = obj.get_mut(result_field).and_then(Value::as_array_mut) else {
+            continue;
+        };
+        input_count += results.len();
+        let mut retained = Vec::with_capacity(results.len());
+        for (index, hit) in std::mem::take(results).into_iter().enumerate() {
+            let candidate = hit
+                .get("atom_id")
+                .or_else(|| hit.get("symbol_id"))
+                .and_then(Value::as_str)
+                .filter(|identity| !identity.is_empty())
+                .ok_or_else(|| -> DynError {
+                    format!(
+                        "ASTRO_SEARCH_LABEL_FILTER_IDENTITY: {result_field}[{index}] has no stable atom_id"
+                    )
+                    .into()
+                })?;
+            if labeled_symbols.contains(candidate) {
+                retained.push(hit);
+            }
+        }
+        matched_count += retained.len();
+        *results = retained;
+    }
     for key in ["result_count", "count", "total_results", "returned"] {
         if let Some(existing) = obj.get_mut(key)
             && existing.as_u64() == Some(input_count as u64)
@@ -1004,7 +1067,7 @@ fn retain_labeled_results(
             *existing = json!(matched_count);
         }
     }
-    (input_count, matched_count)
+    Ok((input_count, matched_count))
 }
 
 fn search_graph_filter_meta_json(label: &str, input_count: usize, matched_count: usize) -> Value {

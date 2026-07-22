@@ -106,14 +106,17 @@ pub const ASTRO_SEARCH_STRUCTURAL_SLOT_ABSENT: &str = "ASTRO_SEARCH_STRUCTURAL_S
 /// Fail-closed: no structural slots were requested for the anchored query.
 pub const ASTRO_SEARCH_STRUCTURAL_NO_SLOTS: &str = "ASTRO_SEARCH_STRUCTURAL_NO_SLOTS";
 
-/// One corpus symbol read from the vault: its unique id (qualified name), the
+/// One corpus symbol read from the vault: its stable source-atom id, non-unique
+/// qualified-name metadata, the
 /// identifier text for the S7 lexical slot, the legacy CBM label (kept for the
 /// parity harness's label-boost accounting), and every dense per-slot vector the
 /// panel runtime persisted for it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CorpusSymbol {
-    /// Unique symbol id — the CBM qualified name.
+    /// Unique symbol id — the stable CBM source atom id.
     pub symbol_id: String,
+    /// Non-unique display/search qualified name.
+    pub qualified_name: String,
     /// Identifier text fed to the S7 BM25 tokenizer.
     pub name: String,
     /// Legacy CBM label (Function/Method/Class/Route/…), for parity accounting.
@@ -308,7 +311,8 @@ where
             }
         }
         symbols.push(CorpusSymbol {
-            symbol_id: node.qualified_name,
+            symbol_id: node.atom_id,
+            qualified_name: node.qualified_name,
             name: node.name,
             label: node.label,
             vectors,

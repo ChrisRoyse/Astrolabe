@@ -24,7 +24,7 @@ calyx-aster.workspace = true
 calyx-assay.workspace = true
 calyx-core.workspace = true
 calyx-ledger.workspace = true
-rusqlite = { version = "0.40.1", features = ["bundled"] }
+rusqlite = { version = "0.40.1", features = ["backup", "bundled"] }
 serde_json = "1"
 sha2 = "0.10"
 tracing = "0.1"

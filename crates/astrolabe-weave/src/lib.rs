@@ -236,7 +236,7 @@ pub const ASSAY_ANOMALY_PAYLOAD_SCHEMA: &str = "astrolabe.assay_anomalies.v1";
 /// so those rows are skipped (counted) instead of decoded as assay rows —
 /// while a genuinely corrupt assay shard still fails closed. This const is the
 /// single source of truth: the writer (`invalidation_lane.rs`) references it.
-pub const ASSAY_DELTA_INVALIDATION_COTENANT_SCHEMA: &str = "astrolabe.delta_invalidation.v1";
+pub const ASSAY_DELTA_INVALIDATION_COTENANT_SCHEMA: &str = "astrolabe.delta_invalidation.v2";
 pub const REACTIVE_NEW_REGION_SCORE_POLICY: &str = "policy:reactive_new_region_binary_score:v1";
 
 pub const SLOT_COMPLEXITY: SlotId = SlotId::new(2);
@@ -784,13 +784,17 @@ impl Default for SimilarityPlannerConfig {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct SimilarityNode {
+    /// Stable source-atom identity. This is the planner/persistence key; qualified
+    /// names are deliberately non-unique display metadata.
+    pub symbol_id: String,
     pub qualified_name: String,
     pub slots: BTreeMap<SlotId, SlotVector>,
 }
 
 impl SimilarityNode {
-    pub fn new(qualified_name: impl Into<String>) -> Self {
+    pub fn new(symbol_id: impl Into<String>, qualified_name: impl Into<String>) -> Self {
         Self {
+            symbol_id: symbol_id.into(),
             qualified_name: qualified_name.into(),
             slots: BTreeMap::new(),
         }
@@ -818,6 +822,8 @@ impl SimilarityMetric {
 #[derive(Debug, Clone, PartialEq)]
 pub struct SimilarityEdge {
     pub family: SimilarityFamily,
+    pub source_id: String,
+    pub target_id: String,
     pub source_qn: String,
     pub target_qn: String,
     pub slot: SlotId,
@@ -832,6 +838,8 @@ impl SimilarityEdge {
         BTreeMap::from([
             ("family".to_string(), self.family.wire_name().to_string()),
             ("metric".to_string(), self.metric.as_str().to_string()),
+            ("source_atom_id".to_string(), self.source_id.clone()),
+            ("target_atom_id".to_string(), self.target_id.clone()),
             ("slot_id".to_string(), self.slot.get().to_string()),
             ("score".to_string(), format_score(self.weight)),
             ("threshold".to_string(), format_score(self.threshold)),
@@ -866,6 +874,7 @@ pub struct SimilaritySkipReport {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SimilarityVectorSkip {
     pub family: SimilarityFamily,
+    pub symbol_id: String,
     pub qualified_name: String,
     pub reason: SimilarityVectorSkipReason,
 }
@@ -905,11 +914,14 @@ pub struct SimilarityPairCounts {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum SimilarityPlanError {
+    EmptySymbolId {
+        node_index: usize,
+    },
     EmptyQualifiedName {
         node_index: usize,
     },
-    DuplicateQualifiedName {
-        qualified_name: String,
+    DuplicateSymbolId {
+        symbol_id: String,
     },
     InvalidPerNodeCap {
         value: usize,
@@ -938,16 +950,22 @@ pub enum SimilarityPlanError {
 impl fmt::Display for SimilarityPlanError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::EmptySymbolId { node_index } => {
+                write!(
+                    f,
+                    "similarity node {node_index} has an empty stable symbol id"
+                )
+            }
             Self::EmptyQualifiedName { node_index } => {
                 write!(
                     f,
                     "similarity node {node_index} has an empty qualified name"
                 )
             }
-            Self::DuplicateQualifiedName { qualified_name } => {
+            Self::DuplicateSymbolId { symbol_id } => {
                 write!(
                     f,
-                    "duplicate similarity node qualified name {qualified_name:?}"
+                    "duplicate similarity node stable symbol id {symbol_id:?}"
                 )
             }
             Self::InvalidPerNodeCap { value } => {
@@ -1087,9 +1105,9 @@ pub fn expand_similarity_dirty_region(
     for _ in 0..2 {
         let frontier = region.clone();
         for edge in persisted {
-            if frontier.contains(&edge.row.source_qn) || frontier.contains(&edge.row.target_qn) {
-                region.insert(edge.row.source_qn.clone());
-                region.insert(edge.row.target_qn.clone());
+            if frontier.contains(&edge.row.source_id) || frontier.contains(&edge.row.target_id) {
+                region.insert(edge.row.source_id.clone());
+                region.insert(edge.row.target_id.clone());
             }
         }
     }
@@ -1105,14 +1123,14 @@ pub fn expand_similarity_dirty_region(
         let vectors = collect_family_vectors(nodes, family, &mut skips);
         for source in vectors
             .iter()
-            .filter(|vector| changed.contains(&vector.qualified_name))
+            .filter(|vector| changed.contains(&vector.symbol_id))
         {
             let mut candidates = vectors
                 .iter()
-                .filter(|target| target.qualified_name != source.qualified_name)
+                .filter(|target| target.symbol_id != source.symbol_id)
                 .filter_map(|target| {
                     cosine(&source.vector, &target.vector)
-                        .map(|score| (score, target.qualified_name.as_str()))
+                        .map(|score| (score, target.symbol_id.as_str()))
                 })
                 .collect::<Vec<_>>();
             candidates.sort_by(|left, right| {
@@ -1122,7 +1140,7 @@ pub fn expand_similarity_dirty_region(
                 candidates
                     .into_iter()
                     .take(candidate_cap)
-                    .map(|(_, qualified_name)| qualified_name.to_string()),
+                    .map(|(_, symbol_id)| symbol_id.to_string()),
             );
         }
     }
@@ -1217,6 +1235,7 @@ pub struct EagerCrossTermPlan {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct EagerCrossTermRow {
+    pub symbol_id: String,
     pub qualified_name: String,
     pub kind: EagerAgreementKind,
     pub left_slot: SlotId,
@@ -1544,11 +1563,12 @@ pub fn anomaly_substrate_row_from_eager_cross_term(
     let agreement_millipoints = agreement_to_millipoints(*value);
     Some(AnomalySubstrateRow::new(
         kind,
-        row.qualified_name.clone(),
+        row.symbol_id.clone(),
         1_000_u64.saturating_sub(agreement_millipoints),
         format!(
-            "{} agreement={} millipoints",
+            "{} symbol={:?} agreement={} millipoints",
             row.kind.wire_name(),
+            row.qualified_name,
             agreement_millipoints
         ),
         [substrate_provenance_ref.into()],
@@ -2245,6 +2265,8 @@ impl Default for BlindSpotConfig {
 /// confidence exceeds the neighbor lens's agreement across that same cluster.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BlindSpotScore {
+    /// Stable source-atom identity of the scored symbol.
+    pub symbol_id: String,
     /// The scored symbol's qualified name.
     pub qualified_name: String,
     /// Mean confident-lens cosine over the top-`k` neighbors, in millipoints.
@@ -2261,6 +2283,8 @@ pub struct BlindSpotScore {
 /// A symbol excluded from scoring, with the labeled reason (no silent drops).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BlindSpotSkip {
+    /// Stable source-atom identity of the skipped symbol.
+    pub symbol_id: String,
     /// The skipped symbol's qualified name.
     pub qualified_name: String,
     /// Why it could not be scored.
@@ -2443,13 +2467,13 @@ pub fn blind_spot_sweep(
     let confident_vectors = collect_family_vectors(nodes, pair.confident, &mut confident_skips);
     let mut neighbor_skips = SimilaritySkipReport::default();
     let neighbor_vectors = collect_family_vectors(nodes, pair.neighbor, &mut neighbor_skips);
-    let neighbor_by_name: BTreeMap<&str, &NormalizedVector> = neighbor_vectors
+    let neighbor_by_id: BTreeMap<&str, &NormalizedVector> = neighbor_vectors
         .iter()
-        .map(|indexed| (indexed.qualified_name.as_str(), &indexed.vector))
+        .map(|indexed| (indexed.symbol_id.as_str(), &indexed.vector))
         .collect();
     let confident_present: BTreeSet<&str> = confident_vectors
         .iter()
-        .map(|indexed| indexed.qualified_name.as_str())
+        .map(|indexed| indexed.symbol_id.as_str())
         .collect();
 
     let mut scores = Vec::new();
@@ -2459,8 +2483,9 @@ pub fn blind_spot_sweep(
     // Any symbol with a neighbor-lens vector but no confident-lens vector cannot
     // be scored — record it so no symbol is silently dropped.
     for indexed in &neighbor_vectors {
-        if !confident_present.contains(indexed.qualified_name.as_str()) {
+        if !confident_present.contains(indexed.symbol_id.as_str()) {
             skipped.push(BlindSpotSkip {
+                symbol_id: indexed.symbol_id.clone(),
                 qualified_name: indexed.qualified_name.clone(),
                 reason: BlindSpotSkipReason::MissingConfidentLens,
             });
@@ -2470,8 +2495,9 @@ pub fn blind_spot_sweep(
     for source in &confident_vectors {
         // The source's own neighbor-lens vector is required to measure its
         // agreement with the cluster.
-        let Some(source_neighbor_vec) = neighbor_by_name.get(source.qualified_name.as_str()) else {
+        let Some(source_neighbor_vec) = neighbor_by_id.get(source.symbol_id.as_str()) else {
             skipped.push(BlindSpotSkip {
+                symbol_id: source.symbol_id.clone(),
                 qualified_name: source.qualified_name.clone(),
                 reason: BlindSpotSkipReason::MissingNeighborLens,
             });
@@ -2481,10 +2507,10 @@ pub fn blind_spot_sweep(
         // Rank every other confident-lens symbol by confident-lens cosine.
         let mut candidates: Vec<(f32, &str)> = confident_vectors
             .iter()
-            .filter(|target| target.qualified_name != source.qualified_name)
+            .filter(|target| target.symbol_id != source.symbol_id)
             .filter_map(|target| {
                 cosine(&source.vector, &target.vector)
-                    .map(|score| (score, target.qualified_name.as_str()))
+                    .map(|score| (score, target.symbol_id.as_str()))
             })
             .collect();
         candidates
@@ -2493,6 +2519,7 @@ pub fn blind_spot_sweep(
 
         if candidates.is_empty() {
             skipped.push(BlindSpotSkip {
+                symbol_id: source.symbol_id.clone(),
                 qualified_name: source.qualified_name.clone(),
                 reason: BlindSpotSkipReason::NoConfidentNeighbors,
             });
@@ -2504,8 +2531,8 @@ pub fn blind_spot_sweep(
 
         // Measure the neighbor lens's agreement across the SAME cluster members.
         let mut neighbor_scores: Vec<f32> = Vec::new();
-        for (_, neighbor_qn) in &candidates {
-            let Some(neighbor_vec) = neighbor_by_name.get(neighbor_qn) else {
+        for (_, neighbor_id) in &candidates {
+            let Some(neighbor_vec) = neighbor_by_id.get(neighbor_id) else {
                 continue;
             };
             if let Some(score) = cosine(source_neighbor_vec, neighbor_vec) {
@@ -2514,6 +2541,7 @@ pub fn blind_spot_sweep(
         }
         if neighbor_scores.len() < config.min_neighbors {
             skipped.push(BlindSpotSkip {
+                symbol_id: source.symbol_id.clone(),
                 qualified_name: source.qualified_name.clone(),
                 reason: BlindSpotSkipReason::InsufficientNeighborhood {
                     comparable: neighbor_scores.len(),
@@ -2529,6 +2557,7 @@ pub fn blind_spot_sweep(
         let gap_millipoints = agreement_to_millipoints(gap);
 
         scores.push(BlindSpotScore {
+            symbol_id: source.symbol_id.clone(),
             qualified_name: source.qualified_name.clone(),
             confident_sim_millipoints,
             neighbor_mean_millipoints,
@@ -2538,10 +2567,11 @@ pub fn blind_spot_sweep(
 
         substrates.push(AnomalySubstrateRow::new(
             AnomalyKind::BlindSpot,
-            source.qualified_name.clone(),
+            source.symbol_id.clone(),
             gap_millipoints,
             format!(
-                "blind_spot {pair_key}: {} confidence {confident_sim_millipoints} vs {} agreement {neighbor_mean_millipoints} (gap {gap_millipoints})",
+                "blind_spot {pair_key} symbol={:?}: {} confidence {confident_sim_millipoints} vs {} agreement {neighbor_mean_millipoints} (gap {gap_millipoints})",
+                source.qualified_name,
                 pair.confident.wire_name(),
                 pair.neighbor.wire_name()
             ),
@@ -2558,9 +2588,9 @@ pub fn blind_spot_sweep(
         ).with_pair_key(pair_key.clone()));
     }
 
-    scores.sort_by(|left, right| left.qualified_name.cmp(&right.qualified_name));
+    scores.sort_by(|left, right| left.symbol_id.cmp(&right.symbol_id));
     substrates.sort_by(anomaly_substrate_order);
-    skipped.sort_by(|left, right| left.qualified_name.cmp(&right.qualified_name));
+    skipped.sort_by(|left, right| left.symbol_id.cmp(&right.symbol_id));
     let n_eff = scores.len() as u64;
 
     // Measure the per-pair severity thresholds from this corpus's own gap
@@ -2757,10 +2787,10 @@ pub fn plan_eager_cross_terms(
 /// full corpus as neighborhood context.
 pub fn plan_eager_cross_terms_for_symbols(
     nodes: &[SimilarityNode],
-    qualified_names: &BTreeSet<String>,
+    symbol_ids: &BTreeSet<String>,
     active_slot_count: usize,
 ) -> calyx_core::Result<EagerCrossTermPlan> {
-    plan_eager_cross_terms_selected(nodes, Some(qualified_names), active_slot_count)
+    plan_eager_cross_terms_selected(nodes, Some(symbol_ids), active_slot_count)
 }
 
 /// Largest panel slot id referenced by any designed eager agreement pair.
@@ -2823,16 +2853,14 @@ fn validate_active_roster(
 
 fn plan_eager_cross_terms_selected(
     nodes: &[SimilarityNode],
-    qualified_names: Option<&BTreeSet<String>>,
+    symbol_ids: Option<&BTreeSet<String>>,
     active_slot_count: usize,
 ) -> calyx_core::Result<EagerCrossTermPlan> {
     validate_active_roster(nodes, active_slot_count)?;
     let selected_indices = nodes
         .iter()
         .enumerate()
-        .filter(|(_, node)| {
-            qualified_names.is_none_or(|names| names.contains(&node.qualified_name))
-        })
+        .filter(|(_, node)| symbol_ids.is_none_or(|ids| ids.contains(&node.symbol_id)))
         .map(|(index, _)| index)
         .collect::<Vec<_>>();
     let mut rows = Vec::with_capacity(selected_indices.len() * EagerAgreementKind::ALL.len());
@@ -2869,6 +2897,7 @@ fn plan_eager_cross_terms_selected(
         for (&node_index, value) in selected_indices.iter().zip(values) {
             let node = &nodes[node_index];
             rows.push(EagerCrossTermRow {
+                symbol_id: node.symbol_id.clone(),
                 qualified_name: node.qualified_name.clone(),
                 kind,
                 left_slot,
@@ -2978,7 +3007,7 @@ fn cross_term_values(
                     };
                     neighborhood_cross_term_value(
                         node_index,
-                        &nodes[node_index].qualified_name,
+                        &nodes[node_index].symbol_id,
                         kind,
                         &operands,
                         group,
@@ -3209,8 +3238,8 @@ fn cross_term_absent_reason(
 }
 
 fn cross_term_row_order(left: &EagerCrossTermRow, right: &EagerCrossTermRow) -> Ordering {
-    left.qualified_name
-        .cmp(&right.qualified_name)
+    left.symbol_id
+        .cmp(&right.symbol_id)
         .then_with(|| left.kind.cmp(&right.kind))
 }
 
@@ -3269,14 +3298,17 @@ fn validate_plan_request(
         }
     }
 
-    let mut seen = BTreeSet::new();
+    let mut seen_ids = BTreeSet::new();
     for (node_index, node) in nodes.iter().enumerate() {
+        if node.symbol_id.trim().is_empty() {
+            return Err(SimilarityPlanError::EmptySymbolId { node_index });
+        }
         if node.qualified_name.trim().is_empty() {
             return Err(SimilarityPlanError::EmptyQualifiedName { node_index });
         }
-        if !seen.insert(node.qualified_name.clone()) {
-            return Err(SimilarityPlanError::DuplicateQualifiedName {
-                qualified_name: node.qualified_name.clone(),
+        if !seen_ids.insert(node.symbol_id.clone()) {
+            return Err(SimilarityPlanError::DuplicateSymbolId {
+                symbol_id: node.symbol_id.clone(),
             });
         }
     }
@@ -3335,6 +3367,7 @@ fn collect_family_vectors(
         let Some(vector) = node.slots.get(&slot) else {
             skips.vector_skips.push(SimilarityVectorSkip {
                 family,
+                symbol_id: node.symbol_id.clone(),
                 qualified_name: node.qualified_name.clone(),
                 reason: SimilarityVectorSkipReason::MissingSlot,
             });
@@ -3342,17 +3375,19 @@ fn collect_family_vectors(
         };
         match normalized_vector(vector) {
             Ok(vector) => out.push(IndexedVector {
+                symbol_id: node.symbol_id.clone(),
                 qualified_name: node.qualified_name.clone(),
                 vector,
             }),
             Err(reason) => skips.vector_skips.push(SimilarityVectorSkip {
                 family,
+                symbol_id: node.symbol_id.clone(),
                 qualified_name: node.qualified_name.clone(),
                 reason,
             }),
         }
     }
-    out.sort_by(|left, right| left.qualified_name.cmp(&right.qualified_name));
+    out.sort_by(|left, right| left.symbol_id.cmp(&right.symbol_id));
     out
 }
 
@@ -3543,6 +3578,8 @@ fn plan_source_range(
         for candidate in top.into_vec() {
             admitted.push(SimilarityEdge {
                 family,
+                source_id: left.symbol_id.clone(),
+                target_id: candidate.target_id,
                 source_qn: left.qualified_name.clone(),
                 target_qn: candidate.target_qn,
                 slot: family.slot(),
@@ -3581,6 +3618,7 @@ fn consider_target(
     }
     let candidate = AdmissionCandidate {
         weight: score,
+        target_id: right.symbol_id.clone(),
         target_qn: right.qualified_name.clone(),
     };
     if top.len() < per_node_cap {
@@ -3612,6 +3650,7 @@ fn consider_target(
 #[derive(Debug)]
 struct AdmissionCandidate {
     weight: f32,
+    target_id: String,
     target_qn: String,
 }
 
@@ -3634,7 +3673,7 @@ impl Ord for AdmissionCandidate {
         other
             .weight
             .total_cmp(&self.weight)
-            .then_with(|| self.target_qn.cmp(&other.target_qn))
+            .then_with(|| self.target_id.cmp(&other.target_id))
     }
 }
 
@@ -3642,12 +3681,13 @@ fn stable_edge_order(left: &SimilarityEdge, right: &SimilarityEdge) -> Ordering 
     left.family
         .sort_index()
         .cmp(&right.family.sort_index())
-        .then_with(|| left.source_qn.cmp(&right.source_qn))
-        .then_with(|| left.target_qn.cmp(&right.target_qn))
+        .then_with(|| left.source_id.cmp(&right.source_id))
+        .then_with(|| left.target_id.cmp(&right.target_id))
 }
 
 #[derive(Debug, Clone)]
 pub(crate) struct IndexedVector {
+    pub(crate) symbol_id: String,
     pub(crate) qualified_name: String,
     pub(crate) vector: NormalizedVector,
 }
@@ -3759,7 +3799,7 @@ fn format_score(value: f32) -> String {
 /// ledger content hashing.
 ///
 /// Edges are emitted in [`stable_edge_order`] as one tab-separated line each:
-/// family wire name, source and target qualified names, slot, graph edge kind,
+/// family wire name, stable source/target ids, display qualified names, slot, graph edge kind,
 /// metric, and the exact IEEE-754 bit patterns (hex) of weight and threshold —
 /// so two dumps are byte-identical exactly when the planned edge sets are
 /// bit-identical.
@@ -3769,6 +3809,10 @@ pub fn similarity_edge_dump_bytes(edges: &[SimilarityEdge]) -> Vec<u8> {
     let mut out = String::new();
     for edge in sorted {
         out.push_str(edge.family.wire_name());
+        out.push('\t');
+        out.push_str(&edge.source_id);
+        out.push('\t');
+        out.push_str(&edge.target_id);
         out.push('\t');
         out.push_str(&edge.source_qn);
         out.push('\t');

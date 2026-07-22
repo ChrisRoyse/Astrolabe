@@ -91,7 +91,7 @@ pub struct PersistedAgreementEdge {
 
 /// Persists the six designed eager agreement cross-terms for a plan.
 ///
-/// `cx_ids` maps each planned qualified name to its constellation id; a plan
+/// `cx_ids` maps each planned stable source-atom id to its constellation id; a plan
 /// row without a mapping refuses fail-closed (`ASTRO_XTERM_CX_ID_MISSING`) —
 /// persistence never silently drops a symbol. Scalar rows reconcile against
 /// the owned key set (all six designed kinds for every mapped CxId): rows are
@@ -145,17 +145,17 @@ where
     let mut symbols = BTreeSet::<&str>::new();
 
     for row in &plan.rows {
-        let Some(&cx_id) = cx_ids.get(&row.qualified_name) else {
+        let Some(&cx_id) = cx_ids.get(&row.symbol_id) else {
             return Err(CalyxError {
                 code: ASTRO_XTERM_CX_ID_MISSING,
                 message: format!(
-                    "no CxId mapping for planned symbol {:?}",
-                    row.qualified_name
+                    "no CxId mapping for planned stable symbol {:?} ({:?})",
+                    row.symbol_id, row.qualified_name
                 ),
-                remediation: "pass a cx_ids map covering every planned qualified name",
+                remediation: "pass a cx_ids map covering every planned stable source-atom id",
             });
         };
-        symbols.insert(row.qualified_name.as_str());
+        symbols.insert(row.symbol_id.as_str());
         let key = eager_xterm_key(cx_id, row.kind);
         owned_keys.insert(key.clone());
         match &row.value {
@@ -165,7 +165,7 @@ where
                     return Err(xterm_corrupt(format!(
                         "plan holds duplicate {} row for {:?}",
                         row.kind.wire_name(),
-                        row.qualified_name
+                        row.symbol_id
                     )));
                 }
             }
@@ -517,7 +517,7 @@ pub fn lazy_agreement(
 
 /// Canonical byte dump of a plan's persisted scalar rows (for the ledger
 /// content hash and determinism probes). One line per scalar row in plan
-/// order: kind, qualified name, cx id, slots, and the exact IEEE-754 bit
+/// order: kind, stable symbol id, display qualified name, cx id, slots, and the exact IEEE-754 bit
 /// pattern of the scalar.
 pub fn eager_xterm_dump_bytes(
     plan: &EagerCrossTermPlan,
@@ -528,17 +528,19 @@ pub fn eager_xterm_dump_bytes(
         let CrossTermValue::Scalar(value) = &row.value else {
             continue;
         };
-        let Some(cx_id) = cx_ids.get(&row.qualified_name) else {
+        let Some(cx_id) = cx_ids.get(&row.symbol_id) else {
             return Err(CalyxError {
                 code: ASTRO_XTERM_CX_ID_MISSING,
                 message: format!(
-                    "no CxId mapping for planned symbol {:?}",
-                    row.qualified_name
+                    "no CxId mapping for planned stable symbol {:?} ({:?})",
+                    row.symbol_id, row.qualified_name
                 ),
-                remediation: "pass a cx_ids map covering every planned qualified name",
+                remediation: "pass a cx_ids map covering every planned stable source-atom id",
             });
         };
         out.push_str(row.kind.wire_name());
+        out.push('\t');
+        out.push_str(&row.symbol_id);
         out.push('\t');
         out.push_str(&row.qualified_name);
         out.push('\t');

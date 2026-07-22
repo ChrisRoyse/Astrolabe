@@ -42,7 +42,7 @@ use astrolabe_weave::search_production::{
 use super::*;
 
 /// Astrolabe fused-search surface schema (the `structuredContent.schema` value).
-pub(crate) const SEARCH_FUSION_SURFACE_SCHEMA: &str = "astrolabe.search_fusion.v1";
+pub(crate) const SEARCH_FUSION_SURFACE_SCHEMA: &str = "astrolabe.search_fusion.v2";
 /// Registry version for the surface knobs declared below.
 pub(crate) const SEARCH_FUSION_SURFACE_KNOB_REGISTRY_VERSION: &str =
     "astro.server.search_fusion_surface_knobs.v1";
@@ -66,6 +66,8 @@ pub(crate) const ASTRO_SEARCH_FUSION_PROJECT: &str = "ASTRO_SEARCH_FUSION_PROJEC
 pub(crate) const ASTRO_SEARCH_FUSION_SHADOW: &str = "ASTRO_SEARCH_FUSION_SHADOW";
 /// Fail-closed: the shadow vault directory for the project is missing.
 pub(crate) const ASTRO_SEARCH_FUSION_VAULT_MISSING: &str = "ASTRO_SEARCH_FUSION_VAULT_MISSING";
+/// Fail-closed: a stable search identity cannot be resolved to current graph metadata.
+pub(crate) const ASTRO_SEARCH_FUSION_IDENTITY: &str = "ASTRO_SEARCH_FUSION_IDENTITY";
 /// Fail-closed: an argument had the wrong JSON type.
 pub(crate) const ASTRO_SEARCH_FUSION_ARG: &str = "ASTRO_SEARCH_FUSION_ARG";
 /// Fail-closed: an explicit `fusion_override` named a slot the corpus cannot
@@ -85,9 +87,6 @@ pub(crate) enum ManifestStatus {
     RebuiltAbsent,
     /// The persisted manifest was stale (vault advanced); rebuilt and persisted.
     RebuiltStale,
-    /// The persisted manifest was unreadable/corrupt; rebuilt from the vault
-    /// (the source of truth) and persisted over it.
-    RebuiltRecovered,
 }
 
 impl ManifestStatus {
@@ -96,14 +95,13 @@ impl ManifestStatus {
             Self::LoadedFresh => "loaded_fresh",
             Self::RebuiltAbsent => "rebuilt_absent",
             Self::RebuiltStale => "rebuilt_stale",
-            Self::RebuiltRecovered => "rebuilt_recovered",
         }
     }
 }
 
 /// The per-project persisted manifest path under the CBM cache dir.
 pub(crate) fn manifest_cache_path(cache_dir: &Path, project: &str) -> PathBuf {
-    cache_dir.join(format!("{project}.astrolabe-search-index.v1.json"))
+    cache_dir.join(format!("{project}.astrolabe-search-index.v2.json"))
 }
 
 /// Renders a weave [`SearchError`] as a coded MCP tool error result.
@@ -222,6 +220,52 @@ pub(crate) fn run_fused_search_graph(args: &Map<String, Value>) -> Result<String
         label_ids.as_ref(),
     );
 
+    let identity_snapshot = match astrolabe_ingest::read_cbm_graph_snapshot(&vault, &project) {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            return coded_error(
+                ASTRO_SEARCH_FUSION_IDENTITY,
+                format!("cannot read current search identity snapshot: {error}"),
+                "Re-index the project and verify the shadow graph snapshot before serving fused search.",
+            );
+        }
+    };
+    let mut identity_by_atom = BTreeMap::new();
+    for node in identity_snapshot
+        .nodes
+        .into_iter()
+        .filter(|node| !node.structural)
+    {
+        if let Some(existing) = identity_by_atom.insert(
+            node.atom_id.clone(),
+            (node.qualified_name.clone(), node.name.clone()),
+        ) {
+            return coded_error(
+                ASTRO_SEARCH_FUSION_IDENTITY,
+                format!(
+                    "stable atom id {:?} has duplicate search metadata {:?} and {:?}",
+                    node.atom_id,
+                    existing,
+                    (node.qualified_name, node.name)
+                ),
+                "Rebuild the project store from source; stable atom ids must be unique.",
+            );
+        }
+    }
+    if let Some(missing) = results
+        .iter()
+        .find(|result| !identity_by_atom.contains_key(&result.symbol_id))
+    {
+        return coded_error(
+            ASTRO_SEARCH_FUSION_IDENTITY,
+            format!(
+                "search result stable atom id {:?} is absent from the current graph snapshot",
+                missing.symbol_id
+            ),
+            "Rebuild the search manifest from the current shadow vault before serving results.",
+        );
+    }
+
     let value = fused_result_json(
         &project,
         &query,
@@ -230,6 +274,7 @@ pub(crate) fn run_fused_search_graph(args: &Map<String, Value>) -> Result<String
         current_seq,
         &outcome.plan_summary,
         &results,
+        &identity_by_atom,
         filter_meta,
     );
     tool_json_result(value)
@@ -252,13 +297,7 @@ where
                 let manifest = rebuild_manifest(vault, project, manifest_path)?;
                 return Ok((manifest, ManifestStatus::RebuiltStale));
             }
-            Err(_corrupt) => {
-                // Unreadable/corrupt persisted manifest: the vault is the source of
-                // truth, so regenerate over it. Labeled (RebuiltRecovered), not
-                // silent.
-                let manifest = rebuild_manifest(vault, project, manifest_path)?;
-                return Ok((manifest, ManifestStatus::RebuiltRecovered));
-            }
+            Err(corrupt) => return Err(corrupt),
         }
     }
     let manifest = rebuild_manifest(vault, project, manifest_path)?;
@@ -543,6 +582,7 @@ fn fused_result_json(
     current_seq: u64,
     plan_summary: &PlanSummary,
     results: &[FusedResult],
+    identity_by_atom: &BTreeMap<String, (String, String)>,
     filter_meta: Option<Value>,
 ) -> Value {
     let content_hash = manifest
@@ -552,9 +592,13 @@ fn fused_result_json(
     let result_json: Vec<Value> = results
         .iter()
         .map(|result| {
+            let (qualified_name, name) = identity_by_atom
+                .get(&result.symbol_id)
+                .expect("result identities checked before rendering");
             json!({
-                "qualified_name": result.symbol_id,
-                "name": result.symbol_id,
+                "symbol_id": result.symbol_id,
+                "qualified_name": qualified_name,
+                "name": name,
                 "rrf_score_micros": result.rrf_score_micros,
                 "final_score_micros": result.final_score_micros,
                 "contributions": result

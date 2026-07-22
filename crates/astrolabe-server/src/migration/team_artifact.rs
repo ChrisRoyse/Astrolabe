@@ -230,9 +230,8 @@ pub(crate) fn handle_team_artifact_import(
 /// The team-artifact export gate over a [`ShadowRefreshStatus`] (#222).
 ///
 /// Returns `Some(coded refusal message)` for every status that is not a provably current
-/// shadow import, and `None` only for [`ShadowRefreshStatus::Current`] /
-/// [`ShadowRefreshStatus::Refreshed`] — the two states in which the vault demonstrably
-/// matches the live CBM source.
+/// shadow import, and `None` only for [`ShadowRefreshStatus::Current`] — the state in
+/// which the vault demonstrably matches the live CBM source.
 ///
 /// [`ShadowRefreshStatus::StaleReindexRequired`] is the #222 state: the read path found
 /// genuine drift (or an unusable watermark domain, #223) and deliberately preserved the
@@ -241,10 +240,7 @@ pub(crate) fn handle_team_artifact_import(
 /// source, so it refuses and names the reindex that reconciles it.
 pub(crate) fn team_artifact_export_refusal(status: ShadowRefreshStatus) -> Option<String> {
     match status {
-        ShadowRefreshStatus::Current | ShadowRefreshStatus::Refreshed => None,
-        ShadowRefreshStatus::Busy => Some(format!(
-            "{ASTRO_TEAM_ARTIFACT_BUSY}: shadow import is owned by another process; remediation: retry export after index_status reports shadow_import.status=current"
-        )),
+        ShadowRefreshStatus::Current => None,
         ShadowRefreshStatus::StaleReindexRequired => Some(format!(
             "{ASTRO_TEAM_ARTIFACT_STALE_REINDEX_REQUIRED}: the CBM source changed since the last shadow import, and index_status refused to reconcile it because the only refresh available to the read path has no CBM tool runner and would overwrite the provenance, security screen, skill tree, bridge, kernel context, and anomaly surfaces with \"unavailable\"; those surfaces are preserved. Exporting now would ship a team artifact whose vault no longer matches its CBM source; remediation: rerun index_repository with calyx=\"shadow\" for this project, then retry the export"
         )),

@@ -100,7 +100,7 @@ pub struct KernelMemberIndex {
     /// The frozen HNSW manifest over the member subcorpus — `Some` iff
     /// `index_kind == EmbeddingBackedHnsw`.
     pub manifest: Option<SlotIndexManifest>,
-    /// Resolved member symbol ids (qualified names), ascending.
+    /// Resolved stable source-atom ids, ascending.
     pub member_symbol_ids: Vec<String>,
     /// Members that carried a persisted S18 vector and are in the index.
     pub indexed_member_count: usize,
@@ -129,7 +129,7 @@ pub struct KernelRecallMeasurement {
 /// Builds an embedding-backed kernel-member index over S18 for the kernel
 /// manifest's member set, content-addressed by `members_hash`.
 ///
-/// Resolves each member `CxId` to its live qualified name via the graph snapshot
+/// Resolves each member `CxId` to its stable source-atom id via the graph snapshot
 /// (fail-closed [`ASTRO_KERNEL_INDEX_MEMBER_ABSENT`] if a member is not a live
 /// symbol), reads the persisted S18 vectors for exactly those members, and
 /// freezes an HNSW manifest over the member subcorpus. When no member carries a
@@ -153,7 +153,7 @@ where
         ));
     }
 
-    // Resolve member CxIds -> live qualified names via the graph snapshot.
+    // Resolve member CxIds -> stable source-atom ids via the graph snapshot.
     let snapshot = read_cbm_graph_snapshot(vault, project).map_err(|error| {
         SearchError::new(
             ASTRO_KERNEL_INDEX_VAULT,
@@ -162,15 +162,15 @@ where
              snapshot before building the kernel-member index.",
         )
     })?;
-    let cx_to_name: BTreeMap<CxId, String> = snapshot
+    let cx_to_atom: BTreeMap<CxId, String> = snapshot
         .nodes
         .iter()
-        .filter_map(|node| node.cx_id.map(|cx| (cx, node.qualified_name.clone())))
+        .filter_map(|node| node.cx_id.map(|cx| (cx, node.atom_id.clone())))
         .collect();
 
-    let mut member_names = BTreeSet::new();
+    let mut member_ids = BTreeSet::new();
     for cx in member_cx_ids {
-        let Some(name) = cx_to_name.get(cx) else {
+        let Some(symbol_id) = cx_to_atom.get(cx) else {
             return Err(SearchError::new(
                 ASTRO_KERNEL_INDEX_MEMBER_ABSENT,
                 format!(
@@ -181,7 +181,7 @@ where
                  rebuild the kernel-member index.",
             ));
         };
-        member_names.insert(name.clone());
+        member_ids.insert(symbol_id.clone());
     }
 
     // Read the persisted S18 corpus and restrict it to the members.
@@ -191,7 +191,7 @@ where
     let mut member_symbols = Vec::new();
     let mut present_names = BTreeSet::new();
     for symbol in report.symbols {
-        if !member_names.contains(&symbol.symbol_id) {
+        if !member_ids.contains(&symbol.symbol_id) {
             continue;
         }
         present_names.insert(symbol.symbol_id.clone());
@@ -200,7 +200,7 @@ where
         }
     }
     let indexed_names: BTreeSet<&String> = member_symbols.iter().map(|s| &s.symbol_id).collect();
-    let mut missing_vector_members: Vec<String> = member_names
+    let mut missing_vector_members: Vec<String> = member_ids
         .iter()
         .filter(|name| !indexed_names.contains(name))
         .cloned()
@@ -211,7 +211,7 @@ where
     missing_vector_members.sort();
     missing_vector_members.dedup();
 
-    let member_symbol_ids: Vec<String> = member_names.iter().cloned().collect();
+    let member_symbol_ids: Vec<String> = member_ids.iter().cloned().collect();
 
     if member_symbols.is_empty() {
         return Ok(KernelMemberIndex {

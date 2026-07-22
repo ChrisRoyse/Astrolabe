@@ -438,34 +438,24 @@ pub(crate) fn handle_index_repository(
             }
         }
     }
-    // #405: run the CBM index pass OUT OF PROCESS (supervised worker, no FFI row
-    // sink — a callback cannot cross the process boundary), so a hard pass abort
-    // (segfault/abort-class) is contained in the child and can NEVER leave a
-    // partially-written vault. On a clean exit the row-sink-equivalent import
-    // candidate is rebuilt from the child's persisted `<project>.db` (the SQLite
-    // `nodes`/`edges` tables and the old row-sink stream are two serializations of
-    // the identical in-memory dump arrays, so the derived surfaces are byte-
-    // identical). Vault writes begin only after this fully-clean pass.
-    let (result, project, row_sink) =
-        match run_shadow_index_pass(runner, &sanitized_args, project.as_deref(), &skills)? {
-            ShadowIndexPassOutcome::Completed {
-                raw_result,
-                project,
-                candidate,
-            } => (raw_result, project, candidate),
-            ShadowIndexPassOutcome::Failed { error_result } => {
-                // Fail closed. The pass ran out of process and returned no graph, so
-                // the vault was never touched (no partial manifests/surfaces). A
-                // contained hard abort surfaces as ASTRO_SHADOW_INDEX_PASS_CRASHED
-                // with the worker exit code / log tail; a graceful libcbm error is
-                // returned verbatim, exactly as before.
-                return shadow_index_pass_error_result(&error_result);
-            }
-        };
-    persist_dial(&project, dial)?;
     if dial == MigrationDial::Off {
+        let result = runner.handle_tool_raw("index_repository", &sanitized_args)?;
+        if let Some(project) = project
+            .or_else(|| project_from_tool_result(&result))
+            .filter(|project| !project.trim().is_empty())
+        {
+            persist_dial(&project, dial)?;
+        }
         return Ok(result);
     }
+    let project = project
+        .or_else(|| {
+            repo_path.as_deref().and_then(|path| {
+                path.to_str()
+                    .and_then(|path| astrolabe_bridge::cbm_project_name_from_path(path).ok())
+            })
+        })
+        .ok_or("ASTRO_SHADOW_PROJECT_UNRESOLVED: shadow indexing requires a resolvable project name or repo_path; remediation: pass a valid repo_path")?;
     let search_scale_settings =
         match search_scale_settings_for_import(&project, search_scale_override) {
             Ok(settings) => settings,
@@ -474,21 +464,63 @@ pub(crate) fn handle_index_repository(
 
     let cache_dir = astrolabe_bridge::cbm_cache_dir()?;
     let Some(_shadow_import_lock) = try_shadow_import_lock(&cache_dir, &project)? else {
-        return augment_tool_result(&result, shadow_import_busy_summary_at(&cache_dir, &project));
+        return tool_error_result(format!(
+            "ASTRO_SHADOW_IMPORT_BUSY: a shadow publication for project {project:?} is already active at {}; remediation: retry after that exact owner completes",
+            shadow_import_lock_path(&cache_dir, &project).display()
+        ));
     };
-    let outcome = match import_shadow_vault_with_archaeology(
-        &project,
-        Some(row_sink),
-        &search_scale_settings,
-        repo_path.as_deref(),
-    ) {
+    let publication = ShadowPublication::begin(&cache_dir, &project)?;
+    let staged_args = match shadow_worker_args(&sanitized_args, publication.stage_cache()) {
+        Ok(args) => args,
+        Err(error) => return Err(publication.abort("worker argument binding", error)),
+    };
+    let staged = (|| -> Result<(String, ShadowImportOutcome), DynError> {
+        let (result, resolved_project, row_sink) = match run_shadow_index_pass(
+            runner,
+            &staged_args,
+            Some(&project),
+            &skills,
+            publication.stage_cache(),
+        )? {
+            ShadowIndexPassOutcome::Completed {
+                raw_result,
+                project,
+                candidate,
+            } => (raw_result, project, candidate),
+            ShadowIndexPassOutcome::Failed { error_result } => {
+                return Err(format!(
+                    "ASTRO_SHADOW_INDEX_PASS_FAILED: {}",
+                    shadow_index_pass_error_result(&error_result)?
+                )
+                .into());
+            }
+        };
+        if resolved_project != project {
+            return Err(format!(
+                "ASTRO_SHADOW_PROJECT_MISMATCH: staged index resolved project {resolved_project:?}, expected {project:?}; remediation: pass one canonical repo_path/project identity and retry"
+            )
+            .into());
+        }
+        publication.checkpoint_stage_source()?;
+        let outcome = import_shadow_vault_with_archaeology_at(
+            publication.stage_cache(),
+            &project,
+            row_sink,
+            &search_scale_settings,
+            repo_path.as_deref(),
+        )?;
+        Ok((result, outcome))
+    })();
+    let (result, outcome) = match staged {
+        Ok(staged) => staged,
+        Err(error) => {
+            return tool_error_result(publication.abort("staged build", error).to_string());
+        }
+    };
+    let outcome = match publication.publish(outcome, dial, &sanitized_args) {
         Ok(outcome) => outcome,
-        Err(error) => return tool_error_result(format!("shadow import failed: {error}")),
+        Err(error) => return tool_error_result(error.to_string()),
     };
-    persist_shadow_outcome(&project, &outcome)?;
-    // #244: record the exact CBM index args so a later runner-driven refresh can
-    // replay the pipeline and reconcile genuine staleness with real surfaces.
-    persist_shadow_index_args(&cache_dir, &project, &sanitized_args)?;
     augment_tool_result(
         &result,
         json!({
@@ -497,6 +529,33 @@ pub(crate) fn handle_index_repository(
             "grounding_summary": grounding_summary(&outcome),
         }),
     )
+}
+
+fn shadow_worker_args(args_json: &str, stage_cache: &Path) -> Result<String, DynError> {
+    let mut value: Value = serde_json::from_str(args_json)?;
+    let object = value.as_object_mut().ok_or_else(|| -> DynError {
+        "ASTRO_SHADOW_INDEX_ARGS_OBJECT_REQUIRED: sanitized index arguments must remain a JSON object"
+            .into()
+    })?;
+    if object.contains_key(crate::ASTRO_INDEX_WORKER_CACHE_DIR_ARG) {
+        return Err(format!(
+            "ASTRO_SHADOW_PRIVATE_ARG_COLLISION: caller supplied reserved argument {:?}; remediation: remove that private transport field",
+            crate::ASTRO_INDEX_WORKER_CACHE_DIR_ARG
+        )
+        .into());
+    }
+    let stage = stage_cache.to_str().ok_or_else(|| -> DynError {
+        format!(
+            "ASTRO_SHADOW_STAGE_PATH_NOT_UTF8: transaction cache path is not UTF-8: {}",
+            stage_cache.display()
+        )
+        .into()
+    })?;
+    object.insert(
+        crate::ASTRO_INDEX_WORKER_CACHE_DIR_ARG.to_string(),
+        Value::String(stage.to_string()),
+    );
+    Ok(serde_json::to_string(&value)?)
 }
 
 pub(crate) fn handle_index_status(
@@ -520,28 +579,7 @@ pub(crate) fn handle_index_status(
     if tool_result_is_error(&result)? {
         return Ok(result);
     }
-    // #244: reconcile with the runner so genuine staleness is *repaired* (real
-    // row-sink-derived surfaces regenerated from current source) rather than merely
-    // refused. The #222 guard remains the fail-closed floor inside this call when
-    // reconciliation cannot run.
-    let refresh_status = match reconcile_shadow_import_current(runner, &project) {
-        Ok(status) => status,
-        Err(error) => {
-            return tool_error_result(format!("shadow import recovery failed: {error}"));
-        }
-    };
-    let mut summary = shadow_status_summary(&project)?;
-    if refresh_status == ShadowRefreshStatus::Busy
-        && let Some(summary_obj) = summary.as_object_mut()
-    {
-        let cache_dir = astrolabe_bridge::cbm_cache_dir()?;
-        merge_object(
-            summary_obj,
-            shadow_import_busy_summary_at(&cache_dir, &project)
-                .as_object()
-                .expect("busy summary object"),
-        );
-    }
+    let summary = shadow_status_summary(&project)?;
     augment_tool_result(&result, summary)
 }
 

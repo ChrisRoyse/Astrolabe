@@ -299,6 +299,10 @@ int cbm_store_upsert_node_batch(cbm_store_t *s, const cbm_node_t *nodes, int cou
 /* Find node by primary key. Returns CBM_STORE_OK or CBM_STORE_NOT_FOUND. */
 int cbm_store_find_node_by_id(cbm_store_t *s, int64_t id, cbm_node_t *out);
 
+/* Find node by stable project-scoped source atom identity. */
+int cbm_store_find_node_by_atom_id(cbm_store_t *s, const char *project, const char *atom_id,
+                                   cbm_node_t *out);
+
 /* Find node by project + qualified_name. */
 int cbm_store_find_node_by_qn(cbm_store_t *s, const char *project, const char *qn, cbm_node_t *out);
 
@@ -677,6 +681,7 @@ void cbm_store_free_file_hashes(cbm_file_hash_t *hashes, int count);
 /* Result from vector similarity search. */
 typedef struct {
     int64_t node_id;
+    char *atom_id;
     char *name;
     char *qualified_name;
     char *file_path;

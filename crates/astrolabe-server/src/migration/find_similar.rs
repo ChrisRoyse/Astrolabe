@@ -36,7 +36,7 @@ use astrolabe_weave::search_production::{
 use super::*;
 
 /// Surface schema tag for the `find_similar` response envelope.
-pub(crate) const FIND_SIMILAR_SURFACE_SCHEMA: &str = "astrolabe.find_similar.v1";
+pub(crate) const FIND_SIMILAR_SURFACE_SCHEMA: &str = "astrolabe.find_similar.v2";
 /// Registry version for the find_similar surface knobs declared below.
 pub(crate) const FIND_SIMILAR_KNOB_REGISTRY_VERSION: &str =
     "astro.server.find_similar_surface_knobs.v1";
@@ -54,6 +54,8 @@ pub(crate) const FIND_SIMILAR_INDEX_SEED: u64 = 0xF1D5_1A1B_5EED_0043;
 pub(crate) const ASTRO_FIND_SIMILAR_PROJECT: &str = "ASTRO_FIND_SIMILAR_PROJECT";
 /// Fail-closed: the request carried no anchor `symbol`.
 pub(crate) const ASTRO_FIND_SIMILAR_ANCHOR: &str = "ASTRO_FIND_SIMILAR_ANCHOR";
+/// Fail-closed: a qualified-name anchor resolves to multiple stable atoms.
+pub(crate) const ASTRO_FIND_SIMILAR_ANCHOR_AMBIGUOUS: &str = "ASTRO_FIND_SIMILAR_ANCHOR_AMBIGUOUS";
 /// Fail-closed: the project is not shadow-indexed, so no vault/manifest exists.
 pub(crate) const ASTRO_FIND_SIMILAR_SHADOW: &str = "ASTRO_FIND_SIMILAR_SHADOW";
 /// Fail-closed: the shadow vault directory for the project is missing.
@@ -205,12 +207,64 @@ pub(crate) fn handle_find_similar(args_json: &str) -> Result<String, DynError> {
         Err(error) => return fs_search_error(&error),
     };
     let base_seq = report.base_seq;
+    let mut identity_by_atom = BTreeMap::new();
+    for symbol in &report.symbols {
+        if identity_by_atom
+            .insert(
+                symbol.symbol_id.clone(),
+                (symbol.qualified_name.clone(), symbol.name.clone()),
+            )
+            .is_some()
+        {
+            return fs_coded_error(
+                ASTRO_FIND_SIMILAR_ANCHOR,
+                format!(
+                    "duplicate stable atom id {:?} in search corpus",
+                    symbol.symbol_id
+                ),
+                "Rebuild the project store from source; stable atom ids must be unique.",
+            );
+        }
+    }
+    let anchor_id = if identity_by_atom.contains_key(&anchor) {
+        anchor.clone()
+    } else {
+        let candidates = report
+            .symbols
+            .iter()
+            .filter(|symbol| symbol.qualified_name == anchor)
+            .map(|symbol| symbol.symbol_id.clone())
+            .collect::<Vec<_>>();
+        match candidates.as_slice() {
+            [only] => only.clone(),
+            [] => {
+                return fs_coded_error(
+                    ASTRO_FIND_SIMILAR_ANCHOR,
+                    format!(
+                        "anchor {anchor:?} is neither a stable atom id nor a live qualified name"
+                    ),
+                    "Pass a stable atom id from search/index output, or an unambiguous live qualified name.",
+                );
+            }
+            _ => {
+                return fs_coded_error(
+                    ASTRO_FIND_SIMILAR_ANCHOR_AMBIGUOUS,
+                    format!(
+                        "qualified-name anchor {anchor:?} resolves to {} stable atoms: {}",
+                        candidates.len(),
+                        candidates.join(", ")
+                    ),
+                    "Pass the exact stable atom id for the intended overload or same-name definition.",
+                );
+            }
+        }
+    };
 
     match mode.as_str() {
         "structural" => serve_structural(
             &index_set,
             &project,
-            &anchor,
+            &anchor_id,
             &STRUCTURAL_QUERY_SLOTS,
             k,
             ef,
@@ -218,11 +272,12 @@ pub(crate) fn handle_find_similar(args_json: &str) -> Result<String, DynError> {
             base_seq,
             current_seq,
             &mode,
+            &identity_by_atom,
         ),
         "api" => serve_structural(
             &index_set,
             &project,
-            &anchor,
+            &anchor_id,
             &[SLOT_API_CALLEES],
             k,
             ef,
@@ -230,28 +285,31 @@ pub(crate) fn handle_find_similar(args_json: &str) -> Result<String, DynError> {
             base_seq,
             current_seq,
             &mode,
+            &identity_by_atom,
         ),
         "semantic" => serve_semantic(
             &index_set,
             &project,
-            &anchor,
+            &anchor_id,
             k,
             ef,
             &caps,
             base_seq,
             current_seq,
             &mode,
+            &identity_by_atom,
         ),
         "clone" | "agree" | "disagree" => serve_clone_taxonomy(
             &index_set,
             &project,
-            &anchor,
+            &anchor_id,
             k,
             ef,
             &caps,
             base_seq,
             current_seq,
             &mode,
+            &identity_by_atom,
         ),
         other => fs_coded_error(
             ASTRO_FIND_SIMILAR_MODE,
@@ -276,6 +334,7 @@ fn serve_structural(
     base_seq: u64,
     current_seq: u64,
     mode: &str,
+    identity_by_atom: &BTreeMap<String, (String, String)>,
 ) -> Result<String, DynError> {
     let result = match structural_more_like_this(index_set, anchor, slots, k, ef, caps) {
         Ok(result) => result,
@@ -287,11 +346,12 @@ fn serve_structural(
         "project": project,
         "mode": mode,
         "anchor_symbol": result.anchor_symbol_id,
+        "anchor_qualified_name": identity_by_atom.get(&result.anchor_symbol_id).map(|identity| &identity.0),
         "anchored_slots": slot_ids_json(&result.anchored_slots),
         "k": k,
         "ef": ef,
         "neighbor_count": result.neighbors.len(),
-        "neighbors": neighbors_json(&result.neighbors),
+        "neighbors": neighbors_json(&result.neighbors, identity_by_atom),
         "trust": "grounded",
         "freshness": freshness_label(base_seq, current_seq),
         "provenance": provenance_label(mode, base_seq, &result.anchored_slots),
@@ -310,6 +370,7 @@ fn serve_semantic(
     base_seq: u64,
     current_seq: u64,
     mode: &str,
+    identity_by_atom: &BTreeMap<String, (String, String)>,
 ) -> Result<String, DynError> {
     let result =
         match semantic_more_like_this(index_set, anchor, &SEMANTIC_QUERY_SLOTS, k, ef, caps) {
@@ -322,11 +383,12 @@ fn serve_semantic(
         "project": project,
         "mode": mode,
         "anchor_symbol": result.anchor_symbol_id,
+        "anchor_qualified_name": identity_by_atom.get(&result.anchor_symbol_id).map(|identity| &identity.0),
         "anchored_slots": slot_ids_json(&result.anchored_slots),
         "k": k,
         "ef": ef,
         "neighbor_count": result.neighbors.len(),
-        "neighbors": neighbors_json(&result.neighbors),
+        "neighbors": neighbors_json(&result.neighbors, identity_by_atom),
         "trust": "grounded",
         "freshness": freshness_label(base_seq, current_seq),
         "provenance": provenance_label(mode, base_seq, &result.anchored_slots),
@@ -349,6 +411,7 @@ fn serve_clone_taxonomy(
     base_seq: u64,
     current_seq: u64,
     mode: &str,
+    identity_by_atom: &BTreeMap<String, (String, String)>,
 ) -> Result<String, DynError> {
     let structural =
         match structural_more_like_this(index_set, anchor, &STRUCTURAL_QUERY_SLOTS, k, ef, caps) {
@@ -386,8 +449,13 @@ fn serve_clone_taxonomy(
     let candidates_json: Vec<Value> = filtered
         .iter()
         .map(|candidate| {
+            let identity = identity_by_atom
+                .get(&candidate.symbol_id)
+                .expect("taxonomy candidates originate in the current corpus");
             json!({
                 "symbol_id": candidate.symbol_id,
+                "qualified_name": identity.0,
+                "name": identity.1,
                 "class": candidate.class.as_str(),
                 "structural_rank": candidate.structural_rank,
                 "semantic_rank": candidate.semantic_rank,
@@ -406,6 +474,7 @@ fn serve_clone_taxonomy(
         "project": project,
         "mode": mode,
         "anchor_symbol": anchor,
+        "anchor_qualified_name": identity_by_atom.get(anchor).map(|identity| &identity.0),
         "taxonomy": {
             "structural_only": "copy_paste",
             "semantic_only": "reimplementation",
@@ -426,13 +495,20 @@ fn serve_clone_taxonomy(
     tool_json_result(value)
 }
 
-fn neighbors_json(neighbors: &[FusedResult]) -> Vec<Value> {
+fn neighbors_json(
+    neighbors: &[FusedResult],
+    identity_by_atom: &BTreeMap<String, (String, String)>,
+) -> Vec<Value> {
     neighbors
         .iter()
         .map(|result| {
+            let identity = identity_by_atom
+                .get(&result.symbol_id)
+                .expect("neighbors originate in the current corpus");
             json!({
-                "qualified_name": result.symbol_id,
-                "name": result.symbol_id,
+                "symbol_id": result.symbol_id,
+                "qualified_name": identity.0,
+                "name": identity.1,
                 "rrf_score_micros": result.rrf_score_micros,
                 "final_score_micros": result.final_score_micros,
                 "contributions": result

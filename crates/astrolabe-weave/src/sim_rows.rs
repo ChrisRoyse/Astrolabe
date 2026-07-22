@@ -1,7 +1,7 @@
 //! Graph CF persistence for planned SIM_* similarity edges.
 //!
 //! Derived similarity edges are regenerable, so persistence is a full,
-//! idempotent reconciliation of the `astrolabe:sim-edge:v1:` prefix: rows for
+//! idempotent reconciliation of the `astrolabe:sim-edge:v2:` prefix: rows for
 //! planned edges are written (or left untouched when byte-identical), stale
 //! rows are tombstoned, and the whole batch lands in one atomic group commit
 //! paired with a Ledger entry whose payload carries the blake3 hash of the
@@ -27,11 +27,12 @@ use crate::{
 };
 
 /// Graph CF key prefix for persisted SIM_* similarity edge rows.
-pub const SIM_EDGE_ROW_PREFIX: &[u8] = b"astrolabe:sim-edge:v1:";
+pub const SIM_EDGE_ROW_PREFIX: &[u8] = b"astrolabe:sim-edge:v2:";
+const LEGACY_SIM_EDGE_ROW_PREFIX: &[u8] = b"astrolabe:sim-edge:v1:";
 /// Row schema tag for persisted SIM_* similarity edge rows.
-pub const SCHEMA_SIM_EDGE_ROW: &str = "astrolabe-sim-edge-v1";
+pub const SCHEMA_SIM_EDGE_ROW: &str = "astrolabe-sim-edge-v2";
 /// Ledger payload schema for a SIM_* persistence group commit.
-pub const SIM_EDGE_LEDGER_SCHEMA: &str = "astrolabe.sim_edges.v1";
+pub const SIM_EDGE_LEDGER_SCHEMA: &str = "astrolabe.sim_edges.v2";
 /// Stable failure code for corrupt or inconsistent persisted SIM_* rows.
 pub const ASTRO_SIM_EDGE_ROW_CORRUPT: &str = "ASTRO_SIM_EDGE_ROW_CORRUPT";
 /// Stable failure code when the paired ledger entry cannot be recovered.
@@ -53,9 +54,13 @@ pub struct SimEdgeGraphRow {
     pub schema: String,
     /// Family wire name (`SIM_STRUCT`, `SIM_SEMANTIC`, `SIM_API`, `SIM_PROFILE`).
     pub family: String,
-    /// Owning (lexicographically smaller) qualified name.
+    /// Owning (lexicographically smaller) stable source-atom identity.
+    pub source_id: String,
+    /// Target stable source-atom identity.
+    pub target_id: String,
+    /// Non-unique source display/search metadata.
     pub source_qn: String,
-    /// Target qualified name.
+    /// Non-unique target display/search metadata.
     pub target_qn: String,
     /// Source panel slot the family scores on.
     pub slot: u16,
@@ -91,6 +96,8 @@ impl SimEdgeGraphRow {
         Self {
             schema: SCHEMA_SIM_EDGE_ROW.to_string(),
             family: edge.family.wire_name().to_string(),
+            source_id: edge.source_id.clone(),
+            target_id: edge.target_id.clone(),
             source_qn: edge.source_qn.clone(),
             target_qn: edge.target_qn.clone(),
             slot: edge.slot.get(),
@@ -151,16 +158,16 @@ impl PartialEq for PhaseTimings {
 impl Eq for PhaseTimings {}
 
 /// Builds the canonical Graph CF key for one SIM_* edge.
-pub fn sim_edge_graph_key(family: SimilarityFamily, source_qn: &str, target_qn: &str) -> Vec<u8> {
+pub fn sim_edge_graph_key(family: SimilarityFamily, source_id: &str, target_id: &str) -> Vec<u8> {
     let mut key = Vec::with_capacity(
-        SIM_EDGE_ROW_PREFIX.len() + 1 + 4 + source_qn.len() + 4 + target_qn.len(),
+        SIM_EDGE_ROW_PREFIX.len() + 1 + 4 + source_id.len() + 4 + target_id.len(),
     );
     key.extend_from_slice(SIM_EDGE_ROW_PREFIX);
     key.push(family.sort_index());
-    key.extend_from_slice(&(source_qn.len() as u32).to_be_bytes());
-    key.extend_from_slice(source_qn.as_bytes());
-    key.extend_from_slice(&(target_qn.len() as u32).to_be_bytes());
-    key.extend_from_slice(target_qn.as_bytes());
+    key.extend_from_slice(&(source_id.len() as u32).to_be_bytes());
+    key.extend_from_slice(source_id.as_bytes());
+    key.extend_from_slice(&(target_id.len() as u32).to_be_bytes());
+    key.extend_from_slice(target_id.as_bytes());
     key
 }
 
@@ -181,13 +188,13 @@ where
     persist_similarity_edges_owned(vault, plan, None, actor.into())
 }
 
-/// Reconciles only the named dirty-region source ownership plus rows touching
-/// removed qualified names. Clean-clean SIM rows remain byte-identical.
+/// Reconciles only the stable-id dirty-region source ownership plus rows touching
+/// removed stable ids. Clean-clean SIM rows remain byte-identical.
 pub fn persist_similarity_edges_delta<C>(
     vault: &AsterVault<C>,
     plan: &SimilarityPlan,
     owned_sources: &BTreeSet<String>,
-    removed_qualified_names: &BTreeSet<String>,
+    removed_symbol_ids: &BTreeSet<String>,
     actor: impl Into<String>,
 ) -> calyx_core::Result<SimilarityPersistReport>
 where
@@ -196,7 +203,7 @@ where
     persist_similarity_edges_owned(
         vault,
         plan,
-        Some((owned_sources, removed_qualified_names)),
+        Some((owned_sources, removed_symbol_ids)),
         actor.into(),
     )
 }
@@ -210,6 +217,7 @@ fn persist_similarity_edges_owned<C>(
 where
     C: Clock,
 {
+    refuse_legacy_similarity_rows(vault)?;
     let mut timing_ms: Vec<(&'static str, u64)> = Vec::new();
     let mut phase_start = std::time::Instant::now();
     let dump = similarity_edge_dump_bytes(&plan.edges);
@@ -218,15 +226,15 @@ where
     let mut new_rows = BTreeMap::<Vec<u8>, Vec<u8>>::new();
     let mut family_counts = BTreeMap::<&'static str, usize>::new();
     for edge in &plan.edges {
-        let key = sim_edge_graph_key(edge.family, &edge.source_qn, &edge.target_qn);
+        let key = sim_edge_graph_key(edge.family, &edge.source_id, &edge.target_id);
         let value = serde_json::to_vec(&SimEdgeGraphRow::from_edge(edge))
             .map_err(|error| sim_edge_corrupt(format!("encode SIM_* row: {error}")))?;
         if new_rows.insert(key, value).is_some() {
             return Err(sim_edge_corrupt(format!(
                 "similarity plan holds duplicate edge {} {} -> {}",
                 edge.family.wire_name(),
-                edge.source_qn,
-                edge.target_qn
+                edge.source_id,
+                edge.target_id
             )));
         }
         *family_counts.entry(edge.family.wire_name()).or_default() += 1;
@@ -250,9 +258,9 @@ where
         for (key, value) in existing {
             let row = serde_json::from_slice::<SimEdgeGraphRow>(&value)
                 .map_err(|error| sim_edge_corrupt(format!("decode owned SIM_* row: {error}")))?;
-            if owned_sources.contains(&row.source_qn)
-                || removed.contains(&row.source_qn)
-                || removed.contains(&row.target_qn)
+            if owned_sources.contains(&row.source_id)
+                || removed.contains(&row.source_id)
+                || removed.contains(&row.target_id)
             {
                 owned_existing.insert(key, value);
             }
@@ -357,6 +365,7 @@ pub fn read_similarity_edge_rows<C>(
 where
     C: Clock,
 {
+    refuse_legacy_similarity_rows(vault)?;
     let snapshot = vault.snapshot();
     let mut rows = Vec::new();
     for (key, value) in vault.scan_cf_range_at(
@@ -394,7 +403,13 @@ where
                 family
             )));
         }
-        if key != sim_edge_graph_key(family, &row.source_qn, &row.target_qn) {
+        if row.source_id.trim().is_empty() || row.target_id.trim().is_empty() {
+            return Err(sim_edge_corrupt(format!(
+                "SIM_* row {} carries an empty stable endpoint identity",
+                hex_lower_bytes(&key)
+            )));
+        }
+        if key != sim_edge_graph_key(family, &row.source_id, &row.target_id) {
             return Err(sim_edge_corrupt(format!(
                 "SIM_* row key {} does not match its decoded fields",
                 hex_lower_bytes(&key)
@@ -403,6 +418,29 @@ where
         rows.push(PersistedSimilarityEdgeRow { key, row });
     }
     Ok(rows)
+}
+
+fn refuse_legacy_similarity_rows<C>(vault: &AsterVault<C>) -> calyx_core::Result<()>
+where
+    C: Clock,
+{
+    let snapshot = vault.snapshot();
+    let legacy = vault.scan_cf_range_at(
+        snapshot,
+        ColumnFamily::Graph,
+        &prefix_range(LEGACY_SIM_EDGE_ROW_PREFIX),
+    )?;
+    if legacy.is_empty() {
+        return Ok(());
+    }
+    Err(CalyxError {
+        code: ASTRO_SIM_EDGE_ROW_CORRUPT,
+        message: format!(
+            "vault contains {} legacy qualified-name-keyed SIM edge rows",
+            legacy.len()
+        ),
+        remediation: "rebuild the shadow vault from the current CBM atom schema; legacy SIM rows cannot represent same-qualified-name definitions",
+    })
 }
 
 /// Recovers the ledger reference for the group commit that produced

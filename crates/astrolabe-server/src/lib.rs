@@ -25,6 +25,7 @@ mod hook_augment;
 use hook_augment::*;
 
 pub const CRATE_NAME: &str = env!("CARGO_PKG_NAME");
+pub(crate) const ASTRO_INDEX_WORKER_CACHE_DIR_ARG: &str = "_astrolabe_worker_cache_dir";
 
 type DynError = Box<dyn Error + Send + Sync + 'static>;
 
@@ -402,6 +403,11 @@ fn run_cli(args: &[String]) -> Result<i32, DynError> {
     }
 
     let args_json = resolve_cli_args(&args)?;
+    let args_json = if index_worker {
+        configure_index_worker_cache(&args_json)?
+    } else {
+        args_json
+    };
     if progress {
         eprintln!("astrolabe cli progress: start tool={tool_name}");
     }
@@ -453,6 +459,38 @@ fn run_cli(args: &[String]) -> Result<i32, DynError> {
         eprintln!("astrolabe cli progress: done tool={tool_name} exit={code}");
     }
     Ok(code)
+}
+
+/// Applies the supervisor-supplied cache directory inside the isolated worker
+/// process, then strips the private transport field before libcbm sees the tool
+/// arguments. The parent process never changes its global resolver, so other
+/// MCP runners cannot accidentally resolve the transaction-owned stage.
+fn configure_index_worker_cache(args_json: &str) -> Result<String, DynError> {
+    let mut value: serde_json::Value = serde_json::from_str(args_json)?;
+    let object = value.as_object_mut().ok_or_else(|| -> DynError {
+        "ASTRO_INDEX_WORKER_ARGS_OBJECT_REQUIRED: supervised index arguments must be a JSON object"
+            .into()
+    })?;
+    let Some(cache_dir) = object.remove(ASTRO_INDEX_WORKER_CACHE_DIR_ARG) else {
+        // Non-shadow supervisors (HTTP/session auto-index) use the inherited
+        // resolver and do not carry Astrolabe's private stage binding.
+        return Ok(args_json.to_string());
+    };
+    let cache_dir = cache_dir.as_str().ok_or_else(|| -> DynError {
+        "ASTRO_INDEX_WORKER_CACHE_DIR_INVALID: supervised shadow worker cache directory must be a UTF-8 string"
+            .into()
+    })?;
+    let requested = Path::new(cache_dir);
+    let resolved = astrolabe_bridge::set_cbm_cache_dir(requested)?;
+    if resolved != requested {
+        return Err(format!(
+            "ASTRO_INDEX_WORKER_CACHE_DIR_READBACK: worker resolved {} after transaction cache {} was requested",
+            resolved.display(),
+            requested.display()
+        )
+        .into());
+    }
+    Ok(serde_json::to_string(&value)?)
 }
 
 /// Print per-tool `--help` for `astrolabe cli <tool> --help` (#416) and return 0

@@ -2542,6 +2542,14 @@ unsafe extern "C" {
     ) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {
+    pub fn cbm_store_find_node_by_atom_id(
+        s: *mut cbm_store_t,
+        project: *const ::std::os::raw::c_char,
+        atom_id: *const ::std::os::raw::c_char,
+        out: *mut cbm_node_t,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
     pub fn cbm_store_find_node_by_qn(
         s: *mut cbm_store_t,
         project: *const ::std::os::raw::c_char,
@@ -3248,6 +3256,7 @@ unsafe extern "C" {
 #[derive(Debug, Copy, Clone)]
 pub struct cbm_vector_result_t {
     pub node_id: i64,
+    pub atom_id: *mut ::std::os::raw::c_char,
     pub name: *mut ::std::os::raw::c_char,
     pub qualified_name: *mut ::std::os::raw::c_char,
     pub file_path: *mut ::std::os::raw::c_char,

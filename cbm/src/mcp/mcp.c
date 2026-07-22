@@ -421,12 +421,13 @@ static const tool_def_t TOOLS[] = {
 
     {"get_code_snippet", "Get code snippet",
      "Read source code for a function/class/symbol. IMPORTANT: First call search_graph to find the "
-     "exact qualified_name, then pass it here. This is a read tool, not a search tool. Accepts "
-     "full qualified_name (exact match) or short function name (returns suggestions if ambiguous).",
-     "{\"type\":\"object\",\"properties\":{\"qualified_name\":{\"type\":\"string\",\"description\":"
-     "\"Full qualified_name from search_graph, or short function name\"},\"project\":{"
+     "stable atom_id and pass it here. This is a read tool, not a search tool. A qualified_name "
+     "lookup remains available only when it resolves to exactly one source atom.",
+     "{\"type\":\"object\",\"properties\":{\"atom_id\":{\"type\":\"string\",\"description\":"
+     "\"Stable source atom_id from search_graph (preferred)\"},\"qualified_name\":{"
+     "\"type\":\"string\",\"description\":\"Qualified name only when unique\"},\"project\":{"
      "\"type\":\"string\"},\"include_neighbors\":{"
-     "\"type\":\"boolean\",\"default\":false}},\"required\":[\"qualified_name\",\"project\"]}"},
+     "\"type\":\"boolean\",\"default\":false}},\"required\":[\"project\"]}"},
 
     {"get_graph_schema", "Get graph schema",
      "Get the schema of the knowledge graph (node labels, edge types)",
@@ -1752,13 +1753,14 @@ enum {
     BM25_QUERY_BUF = 1024,
     BM25_DEFAULT_LIMIT = 100,
     BM25_COL_ID = 0,
-    BM25_COL_LABEL = 1,
-    BM25_COL_NAME = 2,
-    BM25_COL_QN = 3,
-    BM25_COL_FILE = 4,
-    BM25_COL_START = 5,
-    BM25_COL_END = 6,
-    BM25_COL_RANK = 7,
+    BM25_COL_ATOM_ID = 1,
+    BM25_COL_LABEL = 2,
+    BM25_COL_NAME = 3,
+    BM25_COL_QN = 4,
+    BM25_COL_FILE = 5,
+    BM25_COL_START = 6,
+    BM25_COL_END = 7,
+    BM25_COL_RANK = 8,
     BM25_BIND_QUERY = 1,
     BM25_BIND_PROJECT = 2,
     BM25_BIND_LIMIT = 3,
@@ -1875,7 +1877,8 @@ static char *bm25_search(cbm_store_t *store, const char *project, const char *qu
      * from the FTS5 index, then join/filter/boost only those rows.  bm25() returns a
      * NEGATIVE score (lower = more relevant). */
     const char *sql =
-        "SELECT n.id, n.label, n.name, n.qualified_name, n.file_path, n.start_line, n.end_line, "
+        "SELECT n.id, n.atom_id, n.label, n.name, n.qualified_name, n.file_path, "
+        "       n.start_line, n.end_line, "
         "       (fts.base_rank "
         "        - CASE WHEN n.label IN ('Function','Method') THEN 10.0 "
         "               WHEN n.label = 'Route' THEN 8.0 "
@@ -1954,6 +1957,8 @@ static char *bm25_search(cbm_store_t *store, const char *project, const char *qu
     int emitted = 0;
     while (sqlite3_step(stmt) == SQLITE_ROW) {
         yyjson_mut_val *item = yyjson_mut_obj(doc);
+        yyjson_mut_obj_add_strcpy(doc, item, "atom_id",
+                                  (const char *)sqlite3_column_text(stmt, BM25_COL_ATOM_ID));
         yyjson_mut_obj_add_strcpy(doc, item, "name",
                                   (const char *)sqlite3_column_text(stmt, BM25_COL_NAME));
         yyjson_mut_obj_add_strcpy(doc, item, "qualified_name",
@@ -2002,6 +2007,8 @@ static void emit_search_results(yyjson_mut_doc *doc, yyjson_mut_val *root,
     for (int i = 0; i < out->count; i++) {
         cbm_search_result_t *sr = &out->results[i];
         yyjson_mut_val *item = yyjson_mut_obj(doc);
+        yyjson_mut_obj_add_str(doc, item, "atom_id",
+                               sr->node.atom_id ? sr->node.atom_id : "");
         yyjson_mut_obj_add_str(doc, item, "name", sr->node.name ? sr->node.name : "");
         yyjson_mut_obj_add_str(doc, item, "qualified_name",
                                sr->node.qualified_name ? sr->node.qualified_name : "");
@@ -2050,6 +2057,7 @@ static void emit_semantic_results(yyjson_mut_doc *doc, yyjson_mut_val *root,
     yyjson_mut_val *sem_results = yyjson_mut_arr(doc);
     for (int v = 0; v < vcount; v++) {
         yyjson_mut_val *vitem = yyjson_mut_obj(doc);
+        yyjson_mut_obj_add_strcpy(doc, vitem, "atom_id", vresults[v].atom_id);
         yyjson_mut_obj_add_strcpy(doc, vitem, "name", vresults[v].name);
         yyjson_mut_obj_add_strcpy(doc, vitem, "qualified_name", vresults[v].qualified_name);
         yyjson_mut_obj_add_strcpy(doc, vitem, "label", vresults[v].label);
@@ -4408,6 +4416,7 @@ static void copy_node(const cbm_node_t *src, cbm_node_t *dst) {
     dst->project = heap_strdup(src->project);
     dst->label = heap_strdup(src->label);
     dst->name = heap_strdup(src->name);
+    dst->atom_id = heap_strdup(src->atom_id);
     dst->qualified_name = heap_strdup(src->qualified_name);
     dst->file_path = heap_strdup(src->file_path);
     dst->start_line = src->start_line;
@@ -4433,6 +4442,7 @@ static char *snippet_suggestions(const char *input, cbm_node_t *nodes, int count
     yyjson_mut_val *arr = yyjson_mut_arr(doc);
     for (int i = 0; i < count; i++) {
         yyjson_mut_val *s = yyjson_mut_obj(doc);
+        yyjson_mut_obj_add_str(doc, s, "atom_id", nodes[i].atom_id ? nodes[i].atom_id : "");
         yyjson_mut_obj_add_str(doc, s, "qualified_name",
                                nodes[i].qualified_name ? nodes[i].qualified_name : "");
         yyjson_mut_obj_add_str(doc, s, "name", nodes[i].name ? nodes[i].name : "");
@@ -4661,6 +4671,7 @@ static char *build_snippet_response(cbm_mcp_server_t *srv, cbm_node_t *node,
     yyjson_mut_val *root_obj = yyjson_mut_obj(doc);
     yyjson_mut_doc_set_root(doc, root_obj);
 
+    yyjson_mut_obj_add_str(doc, root_obj, "atom_id", node->atom_id ? node->atom_id : "");
     yyjson_mut_obj_add_str(doc, root_obj, "name", node->name ? node->name : "");
     yyjson_mut_obj_add_str(doc, root_obj, "qualified_name",
                            node->qualified_name ? node->qualified_name : "");
@@ -4720,6 +4731,8 @@ static char *build_snippet_response(cbm_mcp_server_t *srv, cbm_node_t *node,
         yyjson_mut_val *arr = yyjson_mut_arr(doc);
         for (int i = 0; i < alt_count; i++) {
             yyjson_mut_val *a = yyjson_mut_obj(doc);
+            yyjson_mut_obj_add_str(doc, a, "atom_id",
+                                   alternatives[i].atom_id ? alternatives[i].atom_id : "");
             yyjson_mut_obj_add_str(doc, a, "qualified_name",
                                    alternatives[i].qualified_name ? alternatives[i].qualified_name
                                                                   : "");
@@ -4751,13 +4764,18 @@ static char *build_snippet_response(cbm_mcp_server_t *srv, cbm_node_t *node,
 }
 
 static char *handle_get_code_snippet(cbm_mcp_server_t *srv, const char *args) {
+    char *atom_id = cbm_mcp_get_string_arg(args, "atom_id");
     char *qn = cbm_mcp_get_string_arg(args, "qualified_name");
     char *project = get_project_arg(args);
     bool include_neighbors = cbm_mcp_get_bool_arg(args, "include_neighbors");
 
-    if (!qn) {
+    if ((!atom_id && !qn) || (atom_id && qn)) {
+        free(atom_id);
+        free(qn);
         free(project);
-        return cbm_mcp_text_result("qualified_name is required", true);
+        return cbm_mcp_text_result(
+            "exactly one of atom_id or qualified_name is required; prefer atom_id from search_graph",
+            true);
     }
 
     cbm_store_t *store = resolve_store(srv, project);
@@ -4765,6 +4783,7 @@ static char *handle_get_code_snippet(cbm_mcp_server_t *srv, const char *args) {
         char *_err = build_project_list_error("project not found or not indexed");
         char *_res = cbm_mcp_text_result(_err, true);
         free(_err);
+        free(atom_id);
         free(qn);
         free(project);
         return _res;
@@ -4772,6 +4791,7 @@ static char *handle_get_code_snippet(cbm_mcp_server_t *srv, const char *args) {
 
     char *not_indexed = verify_project_indexed(store, project);
     if (not_indexed) {
+        free(atom_id);
         free(qn);
         free(project);
         return not_indexed;
@@ -4780,22 +4800,60 @@ static char *handle_get_code_snippet(cbm_mcp_server_t *srv, const char *args) {
     /* Default to current project (same as all other tools) */
     const char *effective_project = project ? project : srv->current_project;
 
-    /* Tier 1: Exact QN match */
     cbm_node_t node = {0};
+    if (atom_id) {
+        int atom_rc = cbm_store_find_node_by_atom_id(store, effective_project, atom_id, &node);
+        if (atom_rc == CBM_STORE_OK) {
+            char *result = build_snippet_response(srv, &node, NULL, include_neighbors, NULL, 0);
+            free_node_contents(&node);
+            free(atom_id);
+            free(project);
+            return result;
+        }
+        char message[CBM_SZ_512];
+        snprintf(message, sizeof(message),
+                 atom_rc == CBM_STORE_NOT_FOUND
+                     ? "atom_id not found in project: %s"
+                     : "atom_id lookup failed; require a canonical 64-character lowercase SHA-256 identity: %s",
+                 atom_id);
+        free(atom_id);
+        free(project);
+        return cbm_mcp_text_result(message, true);
+    }
+
+    /* Qualified names are display metadata and may resolve only when unique. */
     int rc = cbm_store_find_node_by_qn(store, effective_project, qn, &node);
     if (rc == CBM_STORE_OK) {
         char *result = build_snippet_response(srv, &node, NULL, include_neighbors, NULL, 0);
         free_node_contents(&node);
+        free(atom_id);
         free(qn);
         free(project);
         return result;
+    }
+    if (rc == CBM_STORE_ERR) {
+        char message[CBM_SZ_512];
+        snprintf(message, sizeof(message),
+                 "qualified_name lookup is ambiguous or failed for \"%s\"; use search_graph and pass an exact atom_id",
+                 qn);
+        free(qn);
+        free(project);
+        return cbm_mcp_text_result(message, true);
     }
 
     /* Tier 2: Suffix match — handles partial QNs ("main.HandleRequest")
      * and short names ("ProcessOrder") via LIKE '%.X'. */
     cbm_node_t *suffix_nodes = NULL;
     int suffix_count = 0;
-    cbm_store_find_nodes_by_qn_suffix(store, effective_project, qn, &suffix_nodes, &suffix_count);
+    int suffix_rc =
+        cbm_store_find_nodes_by_qn_suffix(store, effective_project, qn, &suffix_nodes, &suffix_count);
+    if (suffix_rc != CBM_STORE_OK) {
+        char message[CBM_SZ_512];
+        snprintf(message, sizeof(message), "qualified_name suffix lookup failed for \"%s\"", qn);
+        free(qn);
+        free(project);
+        return cbm_mcp_text_result(message, true);
+    }
 
     if (suffix_count == SKIP_ONE) {
         copy_node(&suffix_nodes[0], &node);
@@ -4837,7 +4895,7 @@ static char *handle_get_code_snippet(cbm_mcp_server_t *srv, const char *args) {
     /* Nothing found — guide the caller toward search_graph */
     return cbm_mcp_text_result(
         "symbol not found. Use search_graph(name_pattern=\"...\") first to discover "
-        "the exact qualified_name, then pass it to get_code_snippet.",
+        "the exact atom_id, then pass it to get_code_snippet.",
         true);
 }
 

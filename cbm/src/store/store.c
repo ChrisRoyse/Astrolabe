@@ -156,6 +156,7 @@ struct cbm_store {
     /* Prepared statements (lazily initialized, cached for lifetime) */
     sqlite3_stmt *stmt_upsert_node;
     sqlite3_stmt *stmt_find_node_by_id;
+    sqlite3_stmt *stmt_find_node_by_atom_id;
     sqlite3_stmt *stmt_find_node_by_qn;
     sqlite3_stmt *stmt_find_node_by_qn_any; /* QN lookup without project filter */
     sqlite3_stmt *stmt_find_nodes_by_name;
@@ -1093,6 +1094,7 @@ void cbm_store_close(cbm_store_t *s) {
     /* Finalize all cached statements */
     finalize_stmt(&s->stmt_upsert_node);
     finalize_stmt(&s->stmt_find_node_by_id);
+    finalize_stmt(&s->stmt_find_node_by_atom_id);
     finalize_stmt(&s->stmt_find_node_by_qn);
     finalize_stmt(&s->stmt_find_node_by_qn_any);
     finalize_stmt(&s->stmt_find_nodes_by_name);
@@ -1521,6 +1523,28 @@ int cbm_store_find_node_by_id(cbm_store_t *s, int64_t id, cbm_node_t *out) {
         return scan_node(s, stmt, out);
     }
     return CBM_STORE_NOT_FOUND;
+}
+
+int cbm_store_find_node_by_atom_id(cbm_store_t *s, const char *project, const char *atom_id,
+                                   cbm_node_t *out) {
+    if (!s || !s->db || !project || !atom_id || !is_canonical_atom_id(atom_id)) {
+        return CBM_STORE_ERR;
+    }
+    sqlite3_stmt *stmt =
+        prepare_cached(s, &s->stmt_find_node_by_atom_id,
+                       "SELECT " ST_NODE_SELECT_COLUMNS " FROM nodes "
+                       "WHERE project = ?1 AND atom_id = ?2;");
+    if (!stmt) {
+        return CBM_STORE_ERR;
+    }
+
+    bind_text(stmt, SKIP_ONE, project);
+    bind_text(stmt, ST_COL_2, atom_id);
+    int rc = sqlite3_step(stmt);
+    if (rc == SQLITE_ROW) {
+        return scan_node(s, stmt, out);
+    }
+    return rc == SQLITE_DONE ? CBM_STORE_NOT_FOUND : CBM_STORE_ERR;
 }
 
 int cbm_store_find_node_by_qn(cbm_store_t *s, const char *project, const char *qn,
@@ -6476,6 +6500,7 @@ void cbm_store_free_vector_results(cbm_vector_result_t *results, int count) {
         return;
     }
     for (int i = 0; i < count; i++) {
+        free(results[i].atom_id);
         free(results[i].name);
         free(results[i].qualified_name);
         free(results[i].file_path);
@@ -6630,16 +6655,18 @@ static cbm_vector_result_t *vs_append_result(cbm_vector_result_t *results, int *
     }
     int idx = (*count)++;
     results[idx].node_id = sqlite3_column_int64(stmt, 0);
-    const char *name = (const char *)sqlite3_column_text(stmt, SKIP_ONE);
-    const char *qn = (const char *)sqlite3_column_text(stmt, ST_COL_2);
-    const char *fp = (const char *)sqlite3_column_text(stmt, ST_COL_3);
-    const char *label = (const char *)sqlite3_column_text(stmt, ST_COL_4);
+    const char *atom_id = (const char *)sqlite3_column_text(stmt, SKIP_ONE);
+    const char *name = (const char *)sqlite3_column_text(stmt, ST_COL_2);
+    const char *qn = (const char *)sqlite3_column_text(stmt, ST_COL_3);
+    const char *fp = (const char *)sqlite3_column_text(stmt, ST_COL_4);
+    const char *label = (const char *)sqlite3_column_text(stmt, ST_COL_5);
+    results[idx].atom_id = atom_id ? strdup(atom_id) : strdup("");
     results[idx].name = name ? strdup(name) : strdup("");
     results[idx].qualified_name = qn ? strdup(qn) : strdup("");
     results[idx].file_path = fp ? strdup(fp) : strdup("");
     results[idx].label = label ? strdup(label) : strdup("");
-    const int8_t *node_vec = (const int8_t *)sqlite3_column_blob(stmt, ST_COL_6);
-    int node_vec_len = sqlite3_column_bytes(stmt, ST_COL_6);
+    const int8_t *node_vec = (const int8_t *)sqlite3_column_blob(stmt, ST_COL_7);
+    int node_vec_len = sqlite3_column_bytes(stmt, ST_COL_7);
     results[idx].score = vs_min_cosine_score(node_vec, node_vec_len, kw_vecs, actual_kw);
     return results;
 }
@@ -6662,7 +6689,7 @@ int cbm_store_vector_search(cbm_store_t *s, const char *project, const char **ke
     /* Scan all node vectors, compute per-keyword cosine, take min.
      * We use the FIRST keyword as the SQL sort (for top-K pre-filter),
      * then re-score with min across all keywords in the append helper. */
-    const char *sql = "SELECT n.id, n.name, n.qualified_name, n.file_path, n.label,"
+    const char *sql = "SELECT n.id, n.atom_id, n.name, n.qualified_name, n.file_path, n.label,"
                       "       cbm_cosine_i8(v.vector, ?1) as score, v.vector"
                       " FROM node_vectors v"
                       " INNER JOIN nodes n ON n.id = v.node_id"
@@ -6733,6 +6760,7 @@ int cbm_store_vector_search(cbm_store_t *s, const char *project, const char **ke
     int final_limit = limit > 0 ? limit : CBM_SZ_16;
     if (count > final_limit) {
         for (int i = final_limit; i < count; i++) {
+            free(results[i].atom_id);
             free(results[i].name);
             free(results[i].qualified_name);
             free(results[i].file_path);

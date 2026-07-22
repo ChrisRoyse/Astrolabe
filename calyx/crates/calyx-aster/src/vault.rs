@@ -11,6 +11,7 @@ pub mod context;
 mod cursor;
 mod dedup_commit;
 mod durable;
+mod durable_snapshot;
 pub mod encode;
 mod failpoints;
 mod gc_bridge;

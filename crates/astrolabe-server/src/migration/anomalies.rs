@@ -332,7 +332,8 @@ pub(crate) fn reconstruct_similarity_nodes<C: Clock>(
         let Some(cx_id) = node.cx_id else {
             continue;
         };
-        let mut similarity_node = SimilarityNode::new(node.qualified_name.clone());
+        let mut similarity_node =
+            SimilarityNode::new(node.atom_id.clone(), node.qualified_name.clone());
         for slot in slots {
             if let Some(bytes) = slot_rows
                 .get(slot)

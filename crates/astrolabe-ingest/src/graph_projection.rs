@@ -28,15 +28,15 @@ const PROJECTION_REMEDIATION: &str =
 //
 // Version-agnostic base prefix for persisted SIM_* similarity edge rows. The
 // authoritative writer is `astrolabe_weave::sim_rows` (`SimEdgeGraphRow`, wire
-// schema `astrolabe-sim-edge-v1`). `astrolabe-weave` depends on this crate, so
+// schema `astrolabe-sim-edge-v2`). `astrolabe-weave` depends on this crate, so
 // the composite kernel projection reads the rows by their stable persisted
 // schema rather than importing weave, which would be a dependency cycle. The
 // scan is version-agnostic and fails closed on any version segment other than
-// `v1`: a future SIM row version must be taught here explicitly, never silently
+// `v2`: a future SIM row version must be taught here explicitly, never silently
 // dropped, or the kernel graph would omit a whole similarity source family.
 const SIM_EDGE_ROW_BASE_PREFIX: &[u8] = b"astrolabe:sim-edge:";
-const SIM_EDGE_ROW_V1_PREFIX: &[u8] = b"astrolabe:sim-edge:v1:";
-const SCHEMA_SIM_EDGE_ROW: &str = "astrolabe-sim-edge-v1";
+const SIM_EDGE_ROW_V2_PREFIX: &[u8] = b"astrolabe:sim-edge:v2:";
+const SCHEMA_SIM_EDGE_ROW: &str = "astrolabe-sim-edge-v2";
 // Ledger subject prefix of the SIM_* persistence group commit (weave writes
 // `SubjectId::Query("astrolabe-sim-edges:{dump_hash}")`). Every persisted SIM
 // row is attested by the newest such commit; a projection built from SIM rows
@@ -328,14 +328,14 @@ struct SourceEdges {
 enum SourceFamily {
     /// `astrolabe:edge:v1:` typed CBM structural edge.
     Typed,
-    /// `astrolabe:sim-edge:v1:` persisted learned/semantic similarity edge.
+    /// `astrolabe:sim-edge:v2:` persisted learned/semantic similarity edge.
     Similarity,
 }
 
 /// A source edge normalized across both persisted families (#522).
 ///
 /// Typed structural rows carry a `CxId` src/dst directly; SIM_* rows carry
-/// qualified names resolved to `CxId`s through the persisted node map. Both
+/// stable source-atom ids resolved to `CxId`s through the persisted node map. Both
 /// contribute their source ledger attestation so the composite CSR edge stays
 /// attributable to a real persisted Ledger CF entry.
 #[derive(Clone, Debug)]
@@ -352,7 +352,7 @@ struct SourceEdgeRow {
     family: SourceFamily,
 }
 
-/// Deserialize view of the persisted `astrolabe-sim-edge-v1` wire row.
+/// Deserialize view of the persisted `astrolabe-sim-edge-v2` wire row.
 ///
 /// Mirrors only the fields the composite projection needs from
 /// `astrolabe_weave::sim_rows::SimEdgeGraphRow` (the authoritative writer);
@@ -362,8 +362,8 @@ struct SourceEdgeRow {
 struct SimEdgeSourceRow {
     schema: String,
     family: String,
-    source_qn: String,
-    target_qn: String,
+    source_id: String,
+    target_id: String,
     etype: u16,
     weight_bits: u32,
 }
@@ -816,7 +816,7 @@ where
 /// Fails closed — never silently drops a similarity source family — on: an
 /// unknown `astrolabe:sim-edge:` version segment, a wrong row schema, a family
 /// whose edge kind is not a similarity edge, a non-finite or out-of-range
-/// weight, a source/target qualified name that is unmapped or ambiguous in the
+/// weight, a source/target stable atom id that is unmapped in the
 /// persisted node map, or SIM rows that exist without their group-commit ledger
 /// attestation.
 fn read_similarity_source_edges<C>(
@@ -838,14 +838,14 @@ where
     }
 
     // Resolve endpoints and attest the family only when SIM rows are present.
-    let (resolved, ambiguous) = crate::sqlite_import::read_global_qn_cx_ids(vault)?;
+    let resolved = crate::sqlite_import::read_global_atom_cx_ids(vault)?;
     let (ledger_seq, ledger_hash) = newest_sim_edge_ledger_attestation(vault, snapshot)?;
 
     let mut count = 0usize;
     for (key, value) in raw {
         frame_hash(hasher, &key);
         frame_hash(hasher, &value);
-        if !key.starts_with(SIM_EDGE_ROW_V1_PREFIX) {
+        if !key.starts_with(SIM_EDGE_ROW_V2_PREFIX) {
             return Err(projection_corrupt(format!(
                 "SIM edge row {} carries an unknown astrolabe:sim-edge version; refusing to \
                  build a projection that would silently omit a similarity source family",
@@ -879,8 +879,8 @@ where
         }
         let weight = f32::from_bits(row.weight_bits);
         validate_edge_weight(weight, "SIM edge weight")?;
-        let src = resolve_sim_endpoint(&resolved, &ambiguous, &row.source_qn, &key, "source")?;
-        let dst = resolve_sim_endpoint(&resolved, &ambiguous, &row.target_qn, &key, "target")?;
+        let src = resolve_sim_endpoint(&resolved, &row.source_id, &key, "source")?;
+        let dst = resolve_sim_endpoint(&resolved, &row.target_id, &key, "target")?;
         out.push(SourceEdgeRow {
             src,
             dst,
@@ -897,29 +897,18 @@ where
     Ok(count)
 }
 
-/// Resolves one SIM edge endpoint qualified name to its `CxId` fail-closed: an
-/// unmapped name or a name ambiguous across projects refuses rather than binding
-/// a similarity edge to a guessed constellation (#522).
+/// Resolves one SIM edge stable source-atom id to its `CxId` fail-closed.
 fn resolve_sim_endpoint(
     resolved: &BTreeMap<String, CxId>,
-    ambiguous: &BTreeSet<String>,
-    qualified_name: &str,
+    symbol_id: &str,
     key: &[u8],
     role: &str,
 ) -> IngestResult<CxId> {
-    if ambiguous.contains(qualified_name) {
-        return Err(projection_corrupt(format!(
-            "SIM edge row {} {role} qualified name {:?} resolves to more than one constellation; \
-             refusing to bind a similarity edge to a guessed node",
-            hex_key(key),
-            qualified_name
-        )));
-    }
-    resolved.get(qualified_name).copied().ok_or_else(|| {
+    resolved.get(symbol_id).copied().ok_or_else(|| {
         projection_corrupt(format!(
-            "SIM edge row {} {role} qualified name {:?} has no persisted node-map CxId mapping",
+            "SIM edge row {} {role} stable atom id {:?} has no persisted node-map CxId mapping",
             hex_key(key),
-            qualified_name
+            symbol_id
         ))
     })
 }

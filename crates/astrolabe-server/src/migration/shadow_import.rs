@@ -28,14 +28,10 @@ pub(crate) const GIT_SOURCE_FINGERPRINT_KEY: &str = "git_source_fingerprint";
 /// Metadata key holding the absolute repo path whose git source fingerprint was recorded,
 /// so the read-path freshness gate can recompute it against the live tree (#347).
 pub(crate) const GIT_SOURCE_REPO_PATH_KEY: &str = "git_source_repo_path";
-/// The row-sink direct import failed and there is no CBM SQLite artifact to fall back to
-/// (the sqlite path is intentionally absent). Falling back would only mask the real
-/// row-sink error behind a misleading "cannot open SQLite" error, so the direct-import
-/// error is surfaced verbatim and fail-closed (#23).
+/// The required row-stream import failed. No alternate representation is
+/// accepted: it would hide the failed source and could publish incomplete
+/// kernel/provenance state.
 pub(crate) const ASTRO_SHADOW_ROW_SINK_IMPORT_FAILED: &str = "ASTRO_SHADOW_ROW_SINK_IMPORT_FAILED";
-/// The row-sink direct import failed AND the CBM SQLite fallback import also failed. Both
-/// underlying errors are chained verbatim so neither cause is masked (#23).
-pub(crate) const ASTRO_SHADOW_IMPORT_BOTH_FAILED: &str = "ASTRO_SHADOW_IMPORT_BOTH_FAILED";
 /// The out-of-process shadow index pass did not complete cleanly (#405): a hard
 /// C-level abort (segfault/abort-class), a hang, a non-fault kill, or a spawn
 /// failure. The CBM pipeline pass runs in a supervised worker subprocess precisely
@@ -44,8 +40,7 @@ pub(crate) const ASTRO_SHADOW_IMPORT_BOTH_FAILED: &str = "ASTRO_SHADOW_IMPORT_BO
 /// contained failure; the vault is left fully intact (no partial manifests/surfaces).
 pub(crate) const ASTRO_SHADOW_INDEX_PASS_CRASHED: &str = "ASTRO_SHADOW_INDEX_PASS_CRASHED";
 pub(crate) const SHADOW_INDEX_PASS_CRASHED_REMEDIATION: &str = "the CBM index pass did not complete cleanly in its isolated worker subprocess; the fault was contained and the shadow vault was left untouched (not partially committed). Inspect the worker exit code / log tail carried in this error to find the offending input, then rerun index_repository with calyx=\"shadow\"";
-pub(crate) const SHADOW_ROW_SINK_IMPORT_FAILED_REMEDIATION: &str = "the CBM row-sink snapshot could not be imported directly and no CBM SQLite artifact exists to recover from; fix the row-sink rows (the chained error names the exact offending row/field) and rerun index_repository with calyx=\"shadow\"";
-pub(crate) const SHADOW_IMPORT_BOTH_FAILED_REMEDIATION: &str = "both the CBM row-sink direct import and the CBM SQLite fallback import failed; the chained errors name each root cause — resolve the row-sink error first (it is the primary source), then rerun index_repository with calyx=\"shadow\"";
+pub(crate) const SHADOW_ROW_SINK_IMPORT_FAILED_REMEDIATION: &str = "fix the exact malformed or missing row-stream field named by the chained error, then rerun index_repository with calyx=\"shadow\"; Astrolabe never substitutes SQLite-only or unavailable derived surfaces";
 pub(crate) const SHADOW_SOURCE_MISSING_REMEDIATION: &str = "run index_repository with calyx=\"shadow\" to build the CBM SQLite source and shadow vault before reading shadow freshness";
 pub(crate) const SHADOW_FINGERPRINT_MISSING_REMEDIATION: &str = "no shadow import watermark is recorded; run index_repository with calyx=\"shadow\" so the vault_fingerprint content watermark is persisted";
 /// #222: `index_status` deliberately no longer promises a background refresh here. The
@@ -55,24 +50,6 @@ pub(crate) const SHADOW_FINGERPRINT_MISSING_REMEDIATION: &str = "no shadow impor
 pub(crate) const SHADOW_LOWERED_MISSING_REMEDIATION: &str = "the lowered artifact is absent; rerun index_repository with calyx=\"shadow\" to rebuild it from current source";
 pub(crate) const SHADOW_VERIFY_NOT_INTACT_REMEDIATION: &str = "the vault ledger chain does not verify intact; quarantine the vault and rerun index_repository with calyx=\"shadow\" to rebuild from current source";
 pub(crate) const SHADOW_STALE_REMEDIATION: &str = "the CBM SQLite changed since the last shadow import; rerun index_repository with calyx=\"shadow\" so the vault, the lowered artifact, and the row-sink-derived surfaces (provenance, security screen, skill tree, bridges, kernel context, anomalies) are all rebuilt from current source. index_status will not reconcile this for you: it has no CBM tool runner and would have to overwrite those surfaces with \"unavailable\"";
-
-/// The config keys holding the row-sink-derived surfaces of a shadow import.
-///
-/// Every one of these is produced only by an import that carries a
-/// [`RowSinkImportCandidate::Available`] snapshot — i.e. one driven by a live
-/// `CbmToolRunner`. The `None` branch of [`import_shadow_vault_report`] replaces all of
-/// them with `*_unavailable_json(..)`, and [`persist_shadow_outcome_at`] then writes that
-/// over whatever was there. A freshness-triggered refresh has no runner, so if any of
-/// these keys already holds a value, refreshing would destroy last-known-good state
-/// (#222). [`has_persisted_derived_surfaces`] is the guard that makes that impossible.
-pub(crate) const SHADOW_DERIVED_SURFACE_KEYS: [&str; 6] = [
-    "provenance_json",
-    "security_screen_json",
-    "skill_tree_json",
-    "bridge_reports_json",
-    "kernel_context_json",
-    "anomaly_report_json",
-];
 
 #[derive(Debug, Clone)]
 pub(crate) struct ShadowImportOutcome {
@@ -172,9 +149,36 @@ pub(crate) struct ShadowSlotRuntime;
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct WeaveDelta {
-    pub(crate) dirty_qualified_names: BTreeSet<String>,
-    pub(crate) removed_qualified_names: BTreeSet<String>,
+    pub(crate) dirty_symbol_ids: BTreeSet<String>,
+    pub(crate) removed_symbol_ids: BTreeSet<String>,
     pub(crate) removed_cx_ids: BTreeSet<calyx_core::CxId>,
+}
+
+fn snapshot_cx_by_atom(
+    snapshot: &CbmGraphSnapshot,
+    phase: &str,
+) -> Result<BTreeMap<String, calyx_core::CxId>, DynError> {
+    let mut by_atom = BTreeMap::new();
+    for node in &snapshot.nodes {
+        let Some(cx_id) = node.cx_id else {
+            continue;
+        };
+        if node.atom_id.trim().is_empty() {
+            return Err(format!(
+                "{phase} graph snapshot node {} ({:?}) has an empty stable atom id",
+                node.source_node_id, node.qualified_name
+            )
+            .into());
+        }
+        if let Some(existing) = by_atom.insert(node.atom_id.clone(), cx_id) {
+            return Err(format!(
+                "{phase} graph snapshot contains duplicate stable atom id {:?}: CxIds {} and {}",
+                node.atom_id, existing, cx_id
+            )
+            .into());
+        }
+    }
+    Ok(by_atom)
 }
 
 #[derive(Debug, Clone)]
@@ -206,21 +210,9 @@ static SHADOW_EMBEDDING_TABLE: OnceLock<PanelResult<astrolabe_panel::StaticEmbed
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub(crate) enum ShadowRefreshStatus {
     Current,
-    Refreshed,
-    Busy,
-    /// The shadow import is provably not current, and the read-path refresh cannot
-    /// reconcile it without destroying state (#222).
-    ///
-    /// [`ensure_shadow_import_current`] has no `CbmToolRunner`, so the only import it can
-    /// run passes `row_sink = None`; that import persists `*_unavailable_json(..)` over
-    /// every row-sink-derived surface. When such surfaces already exist, refreshing would
-    /// silently downgrade good provenance / security-screen / skill-tree / bridge /
-    /// kernel-context / anomaly state to "unavailable" — a silent fallback that destroys
-    /// good data (standing invariants #2 and #3). Instead the refresh **persists nothing**
-    /// and returns this status: the last-known-good surfaces are preserved, `index_status`
-    /// reports `shadow_import.status = "stale_reindex_required"` with a coded remediation,
-    /// and `team_artifact export` refuses. An explicit `index_repository` with
-    /// `calyx="shadow"` — which does have a runner — is the reconciliation path.
+    /// The persisted generation is stale or unverifiable. Read paths never
+    /// mutate it or substitute reduced surfaces; only an explicit, staged
+    /// `index_repository(calyx="shadow")` can publish a replacement.
     StaleReindexRequired,
 }
 
@@ -844,8 +836,6 @@ where
 pub(crate) fn shadow_refresh_status_str(status: ShadowRefreshStatus) -> &'static str {
     match status {
         ShadowRefreshStatus::Current => "current",
-        ShadowRefreshStatus::Refreshed => "refreshed",
-        ShadowRefreshStatus::Busy => "busy",
         ShadowRefreshStatus::StaleReindexRequired => "stale_reindex_required",
     }
 }
@@ -1130,23 +1120,6 @@ fn watermark_domain_mismatch_verdict(
     }
 }
 
-/// True when any row-sink-derived surface is already persisted for `project` (#222).
-///
-/// This is the guard that makes the destructive runner-less refresh impossible: it answers
-/// "is there last-known-good derived state here that a `row_sink = None` re-import would
-/// overwrite with `unavailable`?". See [`SHADOW_DERIVED_SURFACE_KEYS`].
-pub(crate) fn has_persisted_derived_surfaces(
-    cache_dir: &Path,
-    project: &str,
-) -> Result<bool, DynError> {
-    for key in SHADOW_DERIVED_SURFACE_KEYS {
-        if read_config_value(cache_dir, &metadata_key(project, key))?.is_some() {
-            return Ok(true);
-        }
-    }
-    Ok(false)
-}
-
 pub(crate) fn ensure_shadow_import_current(project: &str) -> Result<ShadowRefreshStatus, DynError> {
     let cache_dir = astrolabe_bridge::cbm_cache_dir()?;
     ensure_shadow_import_current_at(&cache_dir, project)
@@ -1154,30 +1127,9 @@ pub(crate) fn ensure_shadow_import_current(project: &str) -> Result<ShadowRefres
 
 /// [`ensure_shadow_import_current`] against an explicit CBM cache dir.
 ///
-/// `cache_dir` must be the process CBM cache dir (`astrolabe_bridge::cbm_cache_dir`): the
-/// recovery-import branch below calls [`import_shadow_vault`], which resolves that dir
-/// itself. The parameter exists so the refusal paths — which persist nothing and never
-/// reach that branch — are directly testable against an isolated fixture root.
-///
-/// # Reconciliation policy (#222)
-///
-/// The refresh this function can run has **no `CbmToolRunner`**, so it must pass
-/// `row_sink = None` to [`import_shadow_vault`]. The `None` branch of
-/// [`import_shadow_vault_report`] fills every row-sink-derived surface with
-/// `*_unavailable_json(..)`, and [`persist_shadow_outcome`] writes those over whatever is
-/// stored. Refreshing on top of good surfaces therefore *destroys* them: a caller who made
-/// a genuine out-of-band source change and then merely called `index_status` used to find
-/// `get_provenance`, `detect_anomalies`, and the security screen all silently downgraded to
-/// "unavailable", with no reindex ever requested.
-///
-/// So the refresh runs **only when there is nothing to destroy** — i.e. when no derived
-/// surface has ever been persisted for this project. In every other not-current state it
-/// persists nothing and returns [`ShadowRefreshStatus::StaleReindexRequired`], preserving
-/// the last-known-good surfaces and pushing the caller to an explicit
-/// `index_repository(calyx="shadow")`, which does have a runner and can rebuild them.
-///
-/// (Threading a `CbmToolRunner` into this path is the eventual true-reconciliation design;
-/// it is deliberately out of scope here.)
+/// This is a pure freshness gate. It never performs a runner-less re-import:
+/// missing, stale, or unverifiable state is a refusal, and only the explicit
+/// failure-atomic index path may replace it.
 pub(crate) fn ensure_shadow_import_current_at(
     cache_dir: &Path,
     project: &str,
@@ -1186,13 +1138,10 @@ pub(crate) fn ensure_shadow_import_current_at(
         // Live source fingerprint matches the persisted watermark, in the same digest
         // domain: nothing to refresh.
         ShadowContentVerdict::Fresh => return Ok(ShadowRefreshStatus::Current),
-        // No CBM source present, so no re-import is possible. This is not a freshness
-        // claim — the status summary labels this state unverified/fail-closed; the
-        // refresh trigger simply has no source to act on.
         ShadowContentVerdict::Unverifiable {
             source_missing: true,
             ..
-        } => return Ok(ShadowRefreshStatus::Current),
+        } => return Ok(ShadowRefreshStatus::StaleReindexRequired),
         // Genuine staleness (#222), an out-of-band git source change (#347), an unusable
         // watermark domain (#223), or a missing/broken derived artifact while the source
         // is live. All need reconciliation against current source — but only an import
@@ -1203,32 +1152,13 @@ pub(crate) fn ensure_shadow_import_current_at(
         | ShadowContentVerdict::Unverifiable {
             source_missing: false,
             ..
-        } => {
-            if has_persisted_derived_surfaces(cache_dir, project)? {
-                return Ok(ShadowRefreshStatus::StaleReindexRequired);
-            }
-        }
+        } => return Ok(ShadowRefreshStatus::StaleReindexRequired),
     }
-
-    // No derived surface has ever been persisted for this project, so the runner-less
-    // recovery import has no good state to overwrite: reconcile the vault and lowered
-    // artifact from source. The surfaces it writes are honestly labeled "unavailable"
-    // with a reason, and a later index_repository run replaces them with real ones.
-    let Some(_shadow_import_lock) = try_shadow_import_lock(cache_dir, project)? else {
-        return Ok(ShadowRefreshStatus::Busy);
-    };
-    let search_scale_settings = search_scale_settings_for_import(project, None)?;
-    let outcome = import_shadow_vault(project, None, &search_scale_settings)?;
-    persist_shadow_outcome(project, &outcome)?;
-    Ok(ShadowRefreshStatus::Refreshed)
 }
 
 /// #244: metadata key holding the exact calyx-stripped CBM `index_repository` args
-/// last used for this project, so a freshness-triggered refresh can replay the CBM
-/// pipeline verbatim through a runner and regenerate real row-sink-derived surfaces.
-/// A shadow index without a filesystem path in its args (project resolved from the
-/// tool result) records nothing here, and reconciliation then falls back to the
-/// #222 fail-closed floor rather than guessing a path.
+/// last used for this project. It is committed with the published generation so
+/// operators can reproduce the exact source invocation; read paths never replay it.
 pub(crate) const SHADOW_INDEX_ARGS_KEY: &str = "index_args_json";
 pub(crate) const GIT_ARCHAEOLOGY_HEAD_KEY: &str = "git_archaeology_head";
 
@@ -1249,144 +1179,6 @@ pub(crate) const GIT_ARCHAEOLOGY_PATH_CONVENTION_KEY: &str = "git_archaeology_pa
 /// mixed-convention incremental).
 pub(crate) const GIT_ARCHAEOLOGY_PATH_CONVENTION: &str = "subtree_relative_v1";
 
-/// Persists the calyx-stripped `index_repository` args so a later runner-driven
-/// refresh can replay them for true reconciliation (#244).
-pub(crate) fn persist_shadow_index_args(
-    cache_dir: &Path,
-    project: &str,
-    sanitized_index_args: &str,
-) -> Result<(), DynError> {
-    write_config_value(
-        cache_dir,
-        &metadata_key(project, SHADOW_INDEX_ARGS_KEY),
-        sanitized_index_args,
-    )
-}
-
-/// [`ensure_shadow_import_current`] with a `CbmToolRunner`, so genuine staleness is
-/// *repaired* instead of merely refused (#244).
-///
-/// # Reconciliation policy (#244, superseding #222's runner-less deferral)
-///
-/// [`ensure_shadow_import_current`] has no runner, so it can never rebuild the
-/// row-sink-derived surfaces and must fail closed to avoid clobbering them (#222).
-/// This path *does* have a runner: on genuine staleness it replays the persisted
-/// CBM index args through it, captures the row sink, and re-imports with a real
-/// [`RowSinkImportCandidate::Available`] — regenerating provenance, security screen,
-/// skill tree, bridges, kernel context, and anomalies from current source and
-/// returning [`ShadowRefreshStatus::Refreshed`].
-///
-/// The #222 guard remains the fail-closed floor. Reconciliation persists a real
-/// import **only** when the runner produces an `Available` candidate; if there are
-/// no persisted index args to replay, or the runner cannot produce an `Available`
-/// candidate (the pipeline errored or captured no rows), it defers to
-/// [`ensure_shadow_import_current_at`], which preserves last-known-good surfaces
-/// and returns [`ShadowRefreshStatus::StaleReindexRequired`] rather than
-/// overwriting them with "unavailable".
-pub(crate) fn reconcile_shadow_import_current(
-    runner: &CbmToolRunner,
-    project: &str,
-) -> Result<ShadowRefreshStatus, DynError> {
-    let cache_dir = astrolabe_bridge::cbm_cache_dir()?;
-    reconcile_shadow_import_current_at(runner, &cache_dir, project)
-}
-
-/// [`reconcile_shadow_import_current`] against an explicit CBM cache dir.
-///
-/// `cache_dir` is used for the freshness evaluation and the persisted index-args
-/// lookup; the actual re-import resolves the process cache dir itself (via
-/// [`import_shadow_vault`]), exactly as [`ensure_shadow_import_current_at`] does.
-pub(crate) fn reconcile_shadow_import_current_at(
-    runner: &CbmToolRunner,
-    cache_dir: &Path,
-    project: &str,
-) -> Result<ShadowRefreshStatus, DynError> {
-    match evaluate_shadow_content_freshness(cache_dir, project)? {
-        // Live source fingerprint matches the persisted watermark: nothing to do.
-        ShadowContentVerdict::Fresh => return Ok(ShadowRefreshStatus::Current),
-        // No CBM source present, so no re-import is possible; the refresh trigger
-        // has nothing to act on. Not a freshness claim.
-        ShadowContentVerdict::Unverifiable {
-            source_missing: true,
-            ..
-        } => return Ok(ShadowRefreshStatus::Current),
-        // Genuine staleness, an out-of-band git source change (#347), an unusable
-        // watermark domain, or a missing/broken derived artifact while the source is
-        // live: all need reconciliation.
-        ShadowContentVerdict::Stale { .. }
-        | ShadowContentVerdict::SourceOutOfBand { .. }
-        | ShadowContentVerdict::WatermarkDomainMismatch { .. }
-        | ShadowContentVerdict::Unverifiable {
-            source_missing: false,
-            ..
-        } => {}
-    }
-
-    // True reconciliation requires the CBM index args to replay. Without them we
-    // cannot reconstruct the source path, so we fall back to the #222 fail-closed
-    // floor rather than guessing.
-    let Some(index_args) =
-        read_config_value(cache_dir, &metadata_key(project, SHADOW_INDEX_ARGS_KEY))?
-    else {
-        return ensure_shadow_import_current_at(cache_dir, project);
-    };
-
-    // Replay the CBM pipeline verbatim, OUT OF PROCESS (#405), and rebuild the
-    // row-sink-equivalent candidate from the child's persisted `<project>.db`. A
-    // hard pass abort during staleness repair is therefore contained in the child
-    // and cannot leave a partial vault. The lock is taken only for the
-    // import+persist below (like index_repository), never around the pipeline run.
-    //
-    // Persist a real import ONLY for a genuine Available candidate. A contained
-    // crash, a spawn failure, an empty/Unavailable candidate, or any infrastructure
-    // error yields no Available candidate, so we fall back to the #222 fail-closed
-    // floor — preserving last-known-good surfaces and returning
-    // StaleReindexRequired rather than clobbering them with "unavailable".
-    let skills = SkillDiscoveryConfig::default();
-    let row_sink = match run_shadow_index_pass(runner, &index_args, Some(project), &skills) {
-        Ok(ShadowIndexPassOutcome::Completed {
-            candidate: available @ RowSinkImportCandidate::Available(_),
-            ..
-        }) => available,
-        _ => return ensure_shadow_import_current_at(cache_dir, project),
-    };
-
-    let Some(_shadow_import_lock) = try_shadow_import_lock(cache_dir, project)? else {
-        return Ok(ShadowRefreshStatus::Busy);
-    };
-    let search_scale_settings = search_scale_settings_for_import(project, None)?;
-    // Resolve the source repo path from the replayed index args (#347): passing it to
-    // the repo-aware import both mines archaeology Since the previous head and refreshes
-    // the git-source watermark, so a subsequent freshness check sees the reconciled tree
-    // as current instead of permanently out-of-band.
-    let repo = repo_path_from_index_args(&index_args);
-    let outcome = import_shadow_vault_with_archaeology(
-        project,
-        Some(row_sink),
-        &search_scale_settings,
-        repo.as_deref(),
-    )?;
-    persist_shadow_outcome(project, &outcome)?;
-    Ok(ShadowRefreshStatus::Refreshed)
-}
-
-/// Extracts the source repo path from persisted CBM `index_repository` args (#347),
-/// mirroring `handle_index_repository`'s `repo_path`/`name` resolution. Returns `None`
-/// when the args carry no filesystem path (project resolved from the tool result), in
-/// which case the reconcile import proceeds without archaeology / git-source refresh.
-pub(crate) fn repo_path_from_index_args(index_args: &str) -> Option<PathBuf> {
-    let value = serde_json::from_str::<Value>(index_args).ok()?;
-    let object = value.as_object()?;
-    for key in ["repo_path", "name"] {
-        if let Some(path) = object.get(key).and_then(Value::as_str)
-            && !path.trim().is_empty()
-        {
-            return Some(PathBuf::from(path));
-        }
-    }
-    None
-}
-
 pub(crate) fn try_shadow_import_lock(
     cache_dir: &Path,
     project: &str,
@@ -1399,20 +1191,6 @@ pub(crate) fn try_shadow_import_lock(
             path: lock_path,
         }),
     )
-}
-
-pub(crate) fn shadow_import_busy_summary_at(cache_dir: &Path, project: &str) -> Value {
-    json!({
-        "calyx": "shadow",
-        "shadow_import": {
-            "status": "busy",
-            "freshness": "stale_ok",
-            "trust": "provisional",
-            "owner": "another-process",
-            "lock_path": shadow_import_lock_path(cache_dir, project),
-            "remediation": "retry after the active Astrolabe shadow import completes; legacy SQLite results remain served by codebase-memory-mcp",
-        }
-    })
 }
 
 pub(crate) fn shadow_import_current_summary(verdict: &ShadowContentVerdict) -> Value {
@@ -1515,34 +1293,10 @@ pub(crate) fn shadow_import_current_summary(verdict: &ShadowContentVerdict) -> V
     }
 }
 
-pub(crate) fn import_shadow_vault(
-    project: &str,
-    row_sink: Option<RowSinkImportCandidate>,
-    search_scale_settings: &SearchScaleSettings,
-) -> Result<ShadowImportOutcome, DynError> {
-    import_shadow_vault_with_archaeology(project, row_sink, search_scale_settings, None)
-}
-
-pub(crate) fn import_shadow_vault_with_archaeology(
-    project: &str,
-    row_sink: Option<RowSinkImportCandidate>,
-    search_scale_settings: &SearchScaleSettings,
-    repo: Option<&Path>,
-) -> Result<ShadowImportOutcome, DynError> {
-    let cache_dir = astrolabe_bridge::cbm_cache_dir()?;
-    import_shadow_vault_with_archaeology_at(
-        &cache_dir,
-        project,
-        row_sink,
-        search_scale_settings,
-        repo,
-    )
-}
-
 pub(crate) fn import_shadow_vault_with_archaeology_at(
     cache_dir: &Path,
     project: &str,
-    row_sink: Option<RowSinkImportCandidate>,
+    row_sink: RowSinkImportCandidate,
     search_scale_settings: &SearchScaleSettings,
     repo: Option<&Path>,
 ) -> Result<ShadowImportOutcome, DynError> {
@@ -1620,12 +1374,8 @@ pub(crate) fn import_shadow_vault_with_archaeology_at(
     // project has no prior constellation to diff, so the before-map is legitimately empty
     // (the delta below is already `None` for an empty map). Only that exact refusal is
     // absorbed; every other read error still fails closed (#335).
-    let before_cx_by_qn = match astrolabe_ingest::read_cbm_graph_snapshot(&vault, project) {
-        Ok(snapshot) => snapshot
-            .nodes
-            .into_iter()
-            .filter_map(|node| node.cx_id.map(|cx_id| (node.qualified_name, cx_id)))
-            .collect::<BTreeMap<_, _>>(),
+    let before_cx_by_atom = match astrolabe_ingest::read_cbm_graph_snapshot(&vault, project) {
+        Ok(snapshot) => snapshot_cx_by_atom(&snapshot, "pre-import")?,
         Err(err) if err.code() == Some(astrolabe_ingest::ASTRO_MISSING_CBM_PROJECT_ROW) => {
             BTreeMap::new()
         }
@@ -1715,30 +1465,26 @@ pub(crate) fn import_shadow_vault_with_archaeology_at(
     // tripled the largest fixed cost of the delta path at M scale.
     let after_snapshot = astrolabe_ingest::read_cbm_graph_snapshot(&vault, project)?;
     shadow_phase!("after_snapshot_read");
-    let after_cx_by_qn = after_snapshot
-        .nodes
-        .iter()
-        .filter_map(|node| node.cx_id.map(|cx_id| (node.qualified_name.clone(), cx_id)))
-        .collect::<BTreeMap<_, _>>();
+    let after_cx_by_atom = snapshot_cx_by_atom(&after_snapshot, "post-import")?;
     let new_cx_ids = report
         .new_cx_id_values
         .iter()
         .copied()
         .collect::<BTreeSet<_>>();
-    let delta = (!before_cx_by_qn.is_empty()).then(|| WeaveDelta {
-        dirty_qualified_names: after_cx_by_qn
+    let delta = (!before_cx_by_atom.is_empty()).then(|| WeaveDelta {
+        dirty_symbol_ids: after_cx_by_atom
             .iter()
             .filter(|(_, cx_id)| new_cx_ids.contains(cx_id))
-            .map(|(qualified_name, _)| qualified_name.clone())
+            .map(|(atom_id, _)| atom_id.clone())
             .collect(),
-        removed_qualified_names: before_cx_by_qn
+        removed_symbol_ids: before_cx_by_atom
             .iter()
-            .filter(|(qualified_name, cx_id)| after_cx_by_qn.get(*qualified_name) != Some(*cx_id))
-            .map(|(qualified_name, _)| qualified_name.clone())
+            .filter(|(atom_id, cx_id)| after_cx_by_atom.get(*atom_id) != Some(*cx_id))
+            .map(|(atom_id, _)| atom_id.clone())
             .collect(),
-        removed_cx_ids: before_cx_by_qn
+        removed_cx_ids: before_cx_by_atom
             .iter()
-            .filter(|(qualified_name, cx_id)| after_cx_by_qn.get(*qualified_name) != Some(*cx_id))
+            .filter(|(atom_id, cx_id)| after_cx_by_atom.get(*atom_id) != Some(*cx_id))
             .map(|(_, cx_id)| *cx_id)
             .collect(),
     });
@@ -2005,7 +1751,8 @@ where
                                 node.qualified_name
                             )
                         })?;
-                        let mut similarity_node = SimilarityNode::new(node.qualified_name.clone());
+                        let mut similarity_node =
+                            SimilarityNode::new(node.atom_id.clone(), node.qualified_name.clone());
                         for slot in slots {
                             let Some(bytes) = slot_rows_by_slot
                                 .get(slot)
@@ -2048,12 +1795,12 @@ where
         missing_slot_rows += chunk.missing;
         for (similarity_node, cx_id) in chunk.nodes {
             if cx_ids
-                .insert(similarity_node.qualified_name.clone(), cx_id)
+                .insert(similarity_node.symbol_id.clone(), cx_id)
                 .is_some()
             {
                 return Err(format!(
-                    "duplicate live qualified name {:?} while planning weave",
-                    similarity_node.qualified_name
+                    "duplicate live stable atom id {:?} ({:?}) while planning weave",
+                    similarity_node.symbol_id, similarity_node.qualified_name
                 )
                 .into());
             }
@@ -2071,15 +1818,15 @@ where
             let t_read_rows = std::time::Instant::now();
             let persisted = read_similarity_edge_rows(vault)?;
             ms_sim_read_rows = t_read_rows.elapsed().as_millis() as u64;
-            let mut changed = delta.dirty_qualified_names.clone();
-            changed.extend(delta.removed_qualified_names.iter().cloned());
+            let mut changed = delta.dirty_symbol_ids.clone();
+            changed.extend(delta.removed_symbol_ids.iter().cloned());
             let t_expand = std::time::Instant::now();
             let region =
                 expand_similarity_dirty_region(&nodes, &changed, &persisted, &similarity_config);
             ms_sim_expand = t_expand.elapsed().as_millis() as u64;
             let region_nodes = nodes
                 .iter()
-                .filter(|node| region.contains(&node.qualified_name))
+                .filter(|node| region.contains(&node.symbol_id))
                 .cloned()
                 .collect::<Vec<_>>();
             (
@@ -2100,7 +1847,7 @@ where
             vault,
             &similarity_plan,
             region,
-            &delta.removed_qualified_names,
+            &delta.removed_symbol_ids,
             "astrolabe-shadow-weave",
         )?,
         _ => persist_similarity_edges(vault, &similarity_plan, "astrolabe-shadow-weave")?,
@@ -2115,19 +1862,17 @@ where
     // different panel's pair yield.
     let active_slot_count = astrolabe_panel::slots_for_version(SHADOW_PANEL_VERSION)?.len();
     let xterm_plan = match delta {
-        Some(delta) => plan_eager_cross_terms_for_symbols(
-            &nodes,
-            &delta.dirty_qualified_names,
-            active_slot_count,
-        )?,
+        Some(delta) => {
+            plan_eager_cross_terms_for_symbols(&nodes, &delta.dirty_symbol_ids, active_slot_count)?
+        }
         None => plan_eager_cross_terms(&nodes, active_slot_count)?,
     };
     let xterm = match delta {
         Some(delta) => {
             let dirty_cx_ids = cx_ids
                 .iter()
-                .filter(|(qualified_name, _)| delta.dirty_qualified_names.contains(*qualified_name))
-                .map(|(qualified_name, cx_id)| (qualified_name.clone(), *cx_id))
+                .filter(|(symbol_id, _)| delta.dirty_symbol_ids.contains(*symbol_id))
+                .map(|(symbol_id, cx_id)| (symbol_id.clone(), *cx_id))
                 .collect::<BTreeMap<_, _>>();
             persist_eager_cross_terms_delta(
                 vault,
@@ -2215,26 +1960,22 @@ pub(crate) fn import_shadow_vault_report<C, R>(
     vault: &AsterVault<C>,
     runtime: &R,
     options: &SqliteImportOptions,
-    row_sink: Option<RowSinkImportCandidate>,
+    row_sink: RowSinkImportCandidate,
 ) -> Result<ShadowVaultImport, DynError>
 where
     C: Clock,
     R: SlotRuntime + Sync,
 {
     match row_sink {
-        Some(RowSinkImportCandidate::Available(snapshot)) => {
+        RowSinkImportCandidate::Available(snapshot) => {
             // #59 dial flip: the streaming FFI row-sink writer is now the PRIMARY
             // single-parse persistence path for the shadow import. The materialized
             // row-sink snapshot is streamed row-by-row through
             // `import_cbm_row_stream_to_vault` (registry-bounded drain/backpressure
             // window) instead of being handed to the whole-snapshot direct writer.
-            // Both paths persist byte-identical CFs (one ledger-paired batch), proven
-            // by `astrolabe-ingest`'s raw-CF parity suite and the shadow-level parity
-            // test below; routing the primary write through the streaming writer makes
-            // the single-parse pipeline the shipped path rather than a capability held
-            // behind the dial. The #23 fail-closed error chaining (labeled
-            // `sqlite_fallback` recovery only when a real CBM SQLite artifact exists,
-            // otherwise the row-sink error is surfaced verbatim) is preserved verbatim.
+            // This is the only shipped import representation. Any stream failure
+            // is returned with its original cause; no SQLite-only substitute can
+            // publish incomplete derived surfaces.
             let RowSinkSnapshot {
                 snapshot: graph_snapshot,
                 source_fingerprint_sha256,
@@ -2245,7 +1986,7 @@ where
                 anomalies,
                 provenance,
             } = *snapshot;
-            match import_cbm_row_stream_to_vault(
+            let report = import_cbm_row_stream_to_vault(
                 source_fingerprint_sha256,
                 snapshot_into_row_stream(graph_snapshot),
                 &RowSinkStreamParams::from_registry(),
@@ -2254,81 +1995,20 @@ where
                 options,
             )
             .map(|stream_report| stream_report.import)
-            {
-                Ok(report) => Ok(ShadowVaultImport {
-                    report,
-                    source: "row_sink_direct".to_string(),
-                    fallback_reason: None,
-                    security_screen,
-                    skill_tree,
-                    bridges,
-                    kernel_context,
-                    anomalies,
-                    provenance,
-                }),
-                Err(row_sink_error) => {
-                    // Fail-closed error chaining (#23): the row-sink direct import is the
-                    // primary source of truth. The SQLite fallback is a *recovery* path
-                    // that only exists when a real CBM SQLite artifact is present (the
-                    // production caller guarantees this — `import_shadow_vault_with_archaeology`
-                    // refuses when the sqlite source is missing). If the sqlite path is
-                    // intentionally absent, attempting the fallback would open a missing
-                    // file and return a misleading "cannot open SQLite" error that *masks*
-                    // the real row-sink cause. So skip the fallback entirely and surface the
-                    // row-sink error verbatim, fail-closed.
-                    if !sqlite_path.exists() {
-                        return Err(astrolabe_domain::DomainError::new(
-                            ASTRO_SHADOW_ROW_SINK_IMPORT_FAILED,
-                            format!(
-                                "{ASTRO_SHADOW_ROW_SINK_IMPORT_FAILED}: row-sink direct import failed and no CBM SQLite artifact exists at {} to recover from. Row-sink error: {row_sink_error}",
-                                sqlite_path.display()
-                            ),
-                            SHADOW_ROW_SINK_IMPORT_FAILED_REMEDIATION,
-                        )
-                        .into());
-                    }
-                    // A real sqlite artifact is present: attempt recovery. On success this is
-                    // a *labeled* degradation (`fallback_reason` carries the row-sink error
-                    // verbatim). On failure, chain BOTH errors so neither cause is masked.
-                    let reason = format!("row-sink direct import failed: {row_sink_error}");
-                    match import_sqlite_to_vault(sqlite_path, vault, runtime, options) {
-                        Ok(report) => Ok(ShadowVaultImport {
-                            report,
-                            source: "sqlite_fallback".to_string(),
-                            fallback_reason: Some(reason),
-                            security_screen,
-                            skill_tree,
-                            bridges,
-                            kernel_context,
-                            anomalies,
-                            provenance,
-                        }),
-                        Err(fallback_error) => Err(astrolabe_domain::DomainError::new(
-                            ASTRO_SHADOW_IMPORT_BOTH_FAILED,
-                            format!(
-                                "{ASTRO_SHADOW_IMPORT_BOTH_FAILED}: row-sink direct import failed AND CBM SQLite fallback import from {} failed. Row-sink error: {row_sink_error}. SQLite fallback error: {fallback_error}",
-                                sqlite_path.display()
-                            ),
-                            SHADOW_IMPORT_BOTH_FAILED_REMEDIATION,
-                        )
-                        .into()),
-                    }
-                }
-            }
-        }
-        Some(RowSinkImportCandidate::Unavailable(reason)) => {
-            let report = import_sqlite_to_vault(sqlite_path, vault, runtime, options)?;
-            let security_screen =
-                security_screen_unavailable(security_screen_subject(&options.project), &reason);
-            let skill_tree = skill_tree_unavailable_json(&reason);
-            let bridges = bridges_unavailable_json(&reason);
-            let kernel_context = kernel_context_unavailable_json(&reason);
-            let anomalies = anomaly_report_unavailable_json(&reason);
-            let provenance = provenance_unavailable_json(&reason);
+            .map_err(|row_sink_error| {
+                astrolabe_domain::DomainError::new(
+                    ASTRO_SHADOW_ROW_SINK_IMPORT_FAILED,
+                    format!(
+                        "{ASTRO_SHADOW_ROW_SINK_IMPORT_FAILED}: required row-stream import failed for CBM source {}: {row_sink_error}",
+                        sqlite_path.display()
+                    ),
+                    SHADOW_ROW_SINK_IMPORT_FAILED_REMEDIATION,
+                )
+            })?;
             Ok(ShadowVaultImport {
                 report,
-                source: "sqlite_fallback".to_string(),
-                fallback_reason: Some(reason),
+                source: "row_sink_direct".to_string(),
+                fallback_reason: None,
                 security_screen,
                 skill_tree,
                 bridges,
@@ -2337,24 +2017,16 @@ where
                 provenance,
             })
         }
-        None => {
-            let report = import_sqlite_to_vault(sqlite_path, vault, runtime, options)?;
-            let reason = "row-sink snapshot not available for recovery import";
-            Ok(ShadowVaultImport {
-                report,
-                source: "sqlite_fallback".to_string(),
-                fallback_reason: Some(reason.to_string()),
-                security_screen: security_screen_unavailable(
-                    security_screen_subject(&options.project),
-                    reason,
+        RowSinkImportCandidate::Unavailable(reason) => Err(
+            astrolabe_domain::DomainError::new(
+                ASTRO_SHADOW_ROW_SINK_IMPORT_FAILED,
+                format!(
+                    "{ASTRO_SHADOW_ROW_SINK_IMPORT_FAILED}: required row-stream snapshot is unavailable: {reason}"
                 ),
-                skill_tree: skill_tree_unavailable_json(reason),
-                bridges: bridges_unavailable_json(reason),
-                kernel_context: kernel_context_unavailable_json(reason),
-                anomalies: anomaly_report_unavailable_json(reason),
-                provenance: provenance_unavailable_json(reason),
-            })
-        }
+                SHADOW_ROW_SINK_IMPORT_FAILED_REMEDIATION,
+            )
+            .into(),
+        ),
     }
 }
 
@@ -2451,6 +2123,7 @@ pub(crate) fn run_shadow_index_pass(
     sanitized_args: &str,
     project_hint: Option<&str>,
     skills: &SkillDiscoveryConfig,
+    cache_dir: &Path,
 ) -> Result<ShadowIndexPassOutcome, DynError> {
     let raw_result = runner.handle_index_repository_supervised(sanitized_args)?;
     if tool_result_is_error(&raw_result)? {
@@ -2462,8 +2135,7 @@ pub(crate) fn run_shadow_index_pass(
         .map(ToOwned::to_owned)
         .or_else(|| project_from_tool_result(&raw_result))
         .ok_or("shadow index pass completed without a resolvable project name")?;
-    let cache_dir = astrolabe_bridge::cbm_cache_dir()?;
-    let sqlite_path = sqlite_path(&cache_dir, &project);
+    let sqlite_path = sqlite_path(cache_dir, &project);
     if !sqlite_path.exists() {
         return Err(format!(
             "shadow index pass completed but its CBM SQLite {} is missing; cannot rebuild the graph row stream",
@@ -3016,18 +2688,17 @@ pub(crate) fn stores_summary(
     Value::Object(stores)
 }
 
-pub(crate) fn persist_shadow_outcome(
-    project: &str,
-    outcome: &ShadowImportOutcome,
-) -> Result<(), DynError> {
-    let cache_dir = astrolabe_bridge::cbm_cache_dir()?;
-    persist_shadow_outcome_at(&cache_dir, project, outcome)
-}
-
-pub(crate) fn persist_shadow_outcome_at(
+/// Persists a fully validated shadow generation's metadata as one SQLite
+/// transaction. When `publication` is present, the migration dial and exact
+/// replay arguments commit in the same transaction as every vault/kernel row;
+/// readers can therefore never observe a new dial beside old outcome metadata.
+pub(crate) fn persist_shadow_publication_at(
     cache_dir: &Path,
     project: &str,
     outcome: &ShadowImportOutcome,
+    dial: MigrationDial,
+    sanitized_index_args: &str,
+    staged_config_rows: &[(String, String)],
 ) -> Result<(), DynError> {
     let mut conn = open_config(cache_dir)?;
     let security_screen_json = serde_json::to_string(&outcome.security_screen)?;
@@ -3049,6 +2720,12 @@ pub(crate) fn persist_shadow_outcome_at(
     // mix of new and old metadata that a reader would serve as fresh/verified
     // (e.g. a new vault_fingerprint beside a stale kernel_context_json) — #95.
     let tx = conn.transaction()?;
+    for (key, value) in staged_config_rows {
+        tx.execute(
+            "INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)",
+            params![key, value],
+        )?;
+    }
     for (key, value) in [
         ("vault_dir", outcome.vault_dir.display().to_string()),
         ("vault_id", outcome.vault_id.clone()),
@@ -3159,6 +2836,17 @@ pub(crate) fn persist_shadow_outcome_at(
         params![
             metadata_key(project, GIT_SOURCE_REPO_PATH_KEY),
             outcome.git_source_repo_path.clone().unwrap_or_default()
+        ],
+    )?;
+    tx.execute(
+        "INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)",
+        params![dial_key(project), dial.as_str()],
+    )?;
+    tx.execute(
+        "INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)",
+        params![
+            metadata_key(project, SHADOW_INDEX_ARGS_KEY),
+            sanitized_index_args
         ],
     )?;
     tx.commit()?;
