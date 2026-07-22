@@ -22,6 +22,7 @@ if (-not ('AstroLauncherLockNative' -as [type])) {
     Add-Type -TypeDefinition @'
 using System;
 using System.ComponentModel;
+using System.Globalization;
 using System.Runtime.InteropServices;
 using System.Text;
 using Microsoft.Win32.SafeHandles;
@@ -108,7 +109,7 @@ public static class AstroLauncherLockNative
 
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
-    public static extern bool MoveFileExW(
+    private static extern bool MoveFileExWNative(
         string existingFileName,
         string newFileName,
         uint flags
@@ -182,7 +183,7 @@ public static class AstroLauncherLockNative
     private static SafeFileHandle OpenDirectory(string path)
     {
         SafeFileHandle handle = CreateFileW(
-            path,
+            GetExtendedLengthPath(path),
             FILE_READ_ATTRIBUTES,
             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
             IntPtr.Zero,
@@ -197,6 +198,33 @@ public static class AstroLauncherLockNative
             throw new Win32Exception(error, "could not open directory identity: " + path);
         }
         return handle;
+    }
+
+    private static string GetExtendedLengthPath(string path)
+    {
+        string full = System.IO.Path.GetFullPath(path);
+        if (full.StartsWith("\\\\?\\", StringComparison.Ordinal))
+        {
+            return full;
+        }
+        if (full.StartsWith("\\\\", StringComparison.Ordinal))
+        {
+            return "\\\\?\\UNC\\" + full.Substring(2);
+        }
+        return "\\\\?\\" + full;
+    }
+
+    public static bool MoveFileExW(
+        string existingFileName,
+        string newFileName,
+        uint flags
+    )
+    {
+        return MoveFileExWNative(
+            GetExtendedLengthPath(existingFileName),
+            GetExtendedLengthPath(newFileName),
+            flags
+        );
     }
 
     public static string GetDirectoryIdentity(string path)
@@ -273,7 +301,7 @@ public static class AstroLauncherLockNative
     public static SafeFileHandle OpenExactRenameSource(string path)
     {
         SafeFileHandle handle = CreateFileW(
-            path,
+            GetExtendedLengthPath(path),
             GENERIC_READ | GENERIC_WRITE | DELETE_ACCESS,
             FILE_SHARE_READ,
             IntPtr.Zero,
@@ -325,7 +353,7 @@ public static class AstroLauncherLockNative
     )
     {
         SafeFileHandle handle = CreateFileW(
-            path,
+            GetExtendedLengthPath(path),
             GENERIC_READ,
             shareMode,
             IntPtr.Zero,
@@ -384,7 +412,7 @@ public static class AstroLauncherLockNative
     public static SafeFileHandle OpenExactClassifierReadFile(string path)
     {
         SafeFileHandle handle = CreateFileW(
-            path,
+            GetExtendedLengthPath(path),
             GENERIC_READ,
             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
             IntPtr.Zero,
@@ -431,7 +459,7 @@ public static class AstroLauncherLockNative
     public static SafeFileHandle OpenExactRenameDirectory(string path)
     {
         SafeFileHandle handle = CreateFileW(
-            path,
+            GetExtendedLengthPath(path),
             FILE_READ_ATTRIBUTES | FILE_TRAVERSE,
             FILE_SHARE_READ | FILE_SHARE_WRITE,
             IntPtr.Zero,
@@ -730,7 +758,15 @@ public static class AstroLauncherLockNative
         string destinationPath = destinationDirectoryPath.EndsWith("\\", StringComparison.Ordinal)
             ? destinationDirectoryPath + destinationLeaf
             : destinationDirectoryPath + "\\" + destinationLeaf;
-        byte[] nameBytes = Encoding.Unicode.GetBytes(destinationPath);
+        string extendedDestinationPath = destinationPath.StartsWith(
+            "\\\\?\\",
+            StringComparison.Ordinal
+        ) ? destinationPath : (
+            destinationPath.StartsWith("\\\\", StringComparison.Ordinal)
+                ? "\\\\?\\UNC\\" + destinationPath.Substring(2)
+                : "\\\\?\\" + destinationPath
+        );
+        byte[] nameBytes = Encoding.Unicode.GetBytes(extendedDestinationPath);
         int rootOffset = IntPtr.Size == 8 ? 8 : 4;
         int lengthOffset = rootOffset + IntPtr.Size;
         int nameOffset = lengthOffset + 4;
@@ -756,9 +792,11 @@ public static class AstroLauncherLockNative
                     (uint)alignedSize
                 ))
             {
+                int nativeError = Marshal.GetLastWin32Error();
                 throw new Win32Exception(
-                    Marshal.GetLastWin32Error(),
-                    "exact handle-bound no-replace rename failed"
+                    nativeError,
+                    "exact handle-bound no-replace rename failed; native_error=" +
+                    nativeError.ToString(CultureInfo.InvariantCulture)
                 );
             }
         }

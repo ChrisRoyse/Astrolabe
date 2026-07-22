@@ -364,6 +364,20 @@ public static class AstroLauncherTempNative
         return Path.GetFullPath(path).TrimEnd('\\', '/');
     }
 
+    private static string GetExtendedLengthPath(string path)
+    {
+        string full = Path.GetFullPath(path);
+        if (full.StartsWith("\\\\?\\", StringComparison.Ordinal))
+        {
+            return full;
+        }
+        if (full.StartsWith("\\\\", StringComparison.Ordinal))
+        {
+            return "\\\\?\\UNC\\" + full.Substring(2);
+        }
+        return "\\\\?\\" + full;
+    }
+
     private static string GetFinalPath(SafeFileHandle handle)
     {
         StringBuilder buffer = new StringBuilder(32768);
@@ -391,7 +405,7 @@ public static class AstroLauncherTempNative
     )
     {
         SafeFileHandle handle = CreateFileW(
-            path,
+            GetExtendedLengthPath(path),
             desiredAccess,
             shareMode,
             IntPtr.Zero,
@@ -517,7 +531,7 @@ public static class AstroLauncherTempNative
     {
         string full = Path.GetFullPath(path);
         SafeFileHandle handle = CreateFileW(
-            full,
+            GetExtendedLengthPath(full),
             GENERIC_READ | DELETE_ACCESS,
             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
             IntPtr.Zero,
@@ -673,7 +687,7 @@ public static class AstroLauncherTempNative
             );
         }
         string destination = Path.GetFullPath(destinationPath);
-        uint attributes = GetFileAttributesW(destination);
+        uint attributes = GetFileAttributesW(GetExtendedLengthPath(destination));
         if (attributes != INVALID_FILE_ATTRIBUTES)
         {
             throw new IOException(
@@ -691,7 +705,11 @@ public static class AstroLauncherTempNative
         // CreateHardLinkW is atomic and has no replace-existing mode. Return
         // immediately after the kernel reports success; the caller records the
         // typed transition before performing any fallible readback.
-        if (!CreateHardLinkW(destination, sourceFinal, IntPtr.Zero))
+        if (!CreateHardLinkW(
+            GetExtendedLengthPath(destination),
+            GetExtendedLengthPath(sourceFinal),
+            IntPtr.Zero
+        ))
         {
             throw new Win32Exception(
                 Marshal.GetLastWin32Error(),
@@ -1829,7 +1847,7 @@ public static class AstroLauncherTempNative
 
     private static void RequirePathAbsent(string path)
     {
-        uint attributes = GetFileAttributesW(path);
+        uint attributes = GetFileAttributesW(GetExtendedLengthPath(path));
         if (attributes != INVALID_FILE_ATTRIBUTES)
         {
             throw new IOException("path remained present after exact disposition: " + path);
@@ -2001,7 +2019,15 @@ public static class AstroLauncherTempNative
         }
         string parent = GetFinalPath(destinationDirectory);
         string destination = Path.Combine(parent, destinationLeaf);
-        byte[] nameBytes = Encoding.Unicode.GetBytes(destination);
+        string extendedDestination = destination.StartsWith(
+            "\\\\?\\",
+            StringComparison.Ordinal
+        ) ? destination : (
+            destination.StartsWith("\\\\", StringComparison.Ordinal)
+                ? "\\\\?\\UNC\\" + destination.Substring(2)
+                : "\\\\?\\" + destination
+        );
+        byte[] nameBytes = Encoding.Unicode.GetBytes(extendedDestination);
         int rootOffset = IntPtr.Size == 8 ? 8 : 4;
         int lengthOffset = rootOffset + IntPtr.Size;
         int nameOffset = lengthOffset + 4;
@@ -2028,9 +2054,11 @@ public static class AstroLauncherTempNative
                 (uint)alignedSize
             ))
             {
+                int nativeError = Marshal.GetLastWin32Error();
                 throw new Win32Exception(
-                    Marshal.GetLastWin32Error(),
-                    "exact handle-bound TEMP no-replace rename failed"
+                    nativeError,
+                    "exact handle-bound TEMP no-replace rename failed; native_error=" +
+                    nativeError.ToString(CultureInfo.InvariantCulture)
                 );
             }
         }

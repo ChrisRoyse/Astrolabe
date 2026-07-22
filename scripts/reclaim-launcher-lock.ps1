@@ -2201,7 +2201,7 @@ function Get-AstroReclaimAttributionProbe {
         [Parameter(Mandatory)][string]$RecoveryTransactionId,
         [Parameter(Mandatory)][bool]$AllowMalformedExactStageQuarantine,
         [Parameter(Mandatory)]
-        [ValidateSet('transition-bound-v2', 'prior-marker-record', 'post-cleanup')]
+        [ValidateSet('transition-bound-v2', 'transition-bound-v3', 'prior-marker-record', 'post-cleanup')]
         [string]$Policy
     )
 
@@ -2209,7 +2209,9 @@ function Get-AstroReclaimAttributionProbe {
     [string[]]$entries = @(Get-AstroReservedAttributionPaths `
         $temporary `
         $ProbeName)
-    $sharedInventory = Get-AstroAttributionInventory $temporary
+    $sharedInventory = Get-AstroAttributionInventory `
+        $temporary `
+        -AllowMalformedRenameSuffixQuarantine:$AllowMalformedExactStageQuarantine
     if (-not $sharedInventory.Stable -or @($sharedInventory.Errors).Count -gt 0) {
         Fail-Astro 'ASTRO_LAUNCHER_LOCK_RECLAIM_ATTRIBUTION_UNEVALUABLE' `
             "$ProbeName strict typed attribution inventory is invalid: $(@($sharedInventory.Errors) -join '; ')" `
@@ -2258,6 +2260,12 @@ function Get-AstroReclaimAttributionProbe {
                 "$ProbeName typed refresh transaction is not exact dead-or-reused/Job-absent (owner=$($transaction.OwnerProbe.State), job=$($transaction.JobObjectProbe.State), pids=$(@($transaction.JobObjectProbe.ProcessIds) -join ','), error=$($transaction.JobObjectProbe.Error)): $($transaction.Key)" `
                 'preserve every artifact; exact-live, observed Job, and unevaluable state are inviolable'
         }
+        if ($transaction.Parsed.ManifestSchemaVersion -ne 3 -and
+            $Policy -cne 'prior-marker-record') {
+            Fail-Astro 'ASTRO_LAUNCHER_LOCK_RECLAIM_JOB_CONTRACT_UNTRUSTWORTHY' `
+                "$ProbeName refresh transaction uses diagnostic-only attribution v$($transaction.Parsed.ManifestSchemaVersion): $($transaction.Key)" `
+                'preserve all v2 state; only a strictly linked authorization published before this contract advance may resume, while every fresh recovery requires v3 KILL_ON_JOB_CLOSE'
+        }
         if ($null -ne $ExpectedLauncherLeaseStartUtcTicks -and
             $transaction.Parsed.LauncherLeaseStartUtcTicks -ne
                 [long]$ExpectedLauncherLeaseStartUtcTicks) {
@@ -2298,6 +2306,8 @@ function Get-AstroReclaimAttributionProbe {
             key = $transaction.Key
             state = $transaction.State
             phase = $transaction.Phase
+            rename_suffix_quarantine =
+                [bool]$transaction.RecoverableRenameSuffix
             nonce = $transaction.Parsed.Nonce
             envelope_path = $transaction.EnvelopePath
             envelope_file_identity = $transaction.EnvelopeSnapshot.FileId
@@ -2336,6 +2346,10 @@ function Get-AstroReclaimAttributionProbe {
             launcher_lock_sha256 = $transaction.Parsed.LauncherLockSha256
             launcher_lease_start_utc_ticks =
                 $transaction.Parsed.LauncherLeaseStartUtcTicks
+            schema_version = $transaction.Parsed.ManifestSchemaVersion
+            job_limit_flags = if ($null -ne $transaction.LogicalFinalParsed) {
+                $transaction.LogicalFinalParsed.JobLimitFlags
+            } else { 0 }
             job_object_name = $transaction.Parsed.JobObjectName
             owner_generation_probe = [ordered]@{
                 state = $ownerProbe.State
@@ -2455,6 +2469,12 @@ function Get-AstroReclaimAttributionProbe {
             }
             $jobProbe = $null
             if ($parsed.Valid) {
+                if ($parsed.SchemaVersion -ne 3 -and
+                    $Policy -cne 'prior-marker-record') {
+                    Fail-Astro 'ASTRO_LAUNCHER_LOCK_RECLAIM_JOB_CONTRACT_UNTRUSTWORTHY' `
+                        "$ProbeName attribution '$path' uses diagnostic-only schema v$($parsed.SchemaVersion) with flags=$($parsed.JobLimitFlags)" `
+                        'preserve all v2 state; named Job absence after owner death is not descendant-absence proof without v3 KILL_ON_JOB_CLOSE'
+                }
                 [void]$exactLeaseCandidates.Add(
                     [long]$parsed.LauncherLeaseStartUtcTicks
                 )
@@ -2760,6 +2780,12 @@ function Get-AstroReclaimAttributionProbe {
             launcher_lease_start_utc_ticks = if ($null -ne $parsed) {
                 $parsed.LauncherLeaseStartUtcTicks
             } else { $effectiveLeaseTicks }
+            schema_version = if ($null -ne $parsed) {
+                $parsed.SchemaVersion
+            } else { $null }
+            job_limit_flags = if ($null -ne $parsed) {
+                $parsed.JobLimitFlags
+            } else { $null }
             job_object_name = if ($null -ne $parsed) {
                 $parsed.JobObjectName
             } else { $exactJobObjectName }
@@ -3017,6 +3043,8 @@ function ConvertTo-AstroSubordinateCleanupPlan {
                 'file_identity',
                 'bytes',
                 'sha256',
+                'schema_version',
+                'job_limit_flags',
                 'expected_temp_path',
                 'valid',
                 'cleanup_action',
@@ -3051,6 +3079,12 @@ function ConvertTo-AstroSubordinateCleanupPlan {
             sha256 = if ($linkedShape) {
                 [string]$entry.Sha256
             } else { [string]$entry['sha256'] }
+            schema_version = if ($linkedShape) {
+                $entry.SchemaVersion
+            } else { $entry['schema_version'] }
+            job_limit_flags = if ($linkedShape) {
+                $entry.JobLimitFlags
+            } else { $entry['job_limit_flags'] }
             expected_temp_path = if ($linkedShape) {
                 [string]$entry.ExpectedTempPath
             } else { [string]$entry['expected_temp_path'] }
@@ -3082,6 +3116,14 @@ function ConvertTo-AstroSubordinateCleanupPlan {
             Assert-AstroRecoveryArtifactLeaf `
                 $normalized.quarantine_archive_path `
                 -MaxLength 160
+        }
+        if ([bool]$normalized.valid -and
+            $null -ne $normalized.schema_version -and
+            ([int]$normalized.schema_version -ne 3 -or
+                [uint32]$normalized.job_limit_flags -ne 8192)) {
+            Fail-Astro 'ASTRO_LAUNCHER_LOCK_RECLAIM_JOB_CONTRACT_UNTRUSTWORTHY' `
+                "subordinate cleanup manifest is not v3 KILL_ON_JOB_CLOSE: $($normalized.path)" `
+                'preserve the transaction; current recovery authority must bind schema_version=3 and job_limit_flags=8192'
         }
         $records.Add($normalized)
     }
@@ -3208,6 +3250,8 @@ function Assert-AstroSubordinateProbeMatchesPlan {
             $record.bytes -ne $expected.bytes -or
             $record.sha256 -cne $expected.sha256 -or
             $record.valid -ne $expected.valid -or
+            $record.schema_version -ne $expected.schema_version -or
+            $record.job_limit_flags -ne $expected.job_limit_flags -or
             $record.cleanup_action -cne $expected.cleanup_action -or
             -not [string]::Equals(
                 $record.expected_temp_path,
@@ -3709,6 +3753,7 @@ function Convert-AstroLinkedAttributionProbeNode {
         $Node.Properties['policy'] "$JsonPath.policy" -Nonblank
     if ($policy -cnotin @(
             'transition-bound-v2',
+            'transition-bound-v3',
             'prior-marker-record',
             'post-cleanup'
         )) {
@@ -3763,7 +3808,13 @@ function Convert-AstroLinkedAttributionProbeNode {
     }
     $manifestBindings = [Collections.Generic.List[object]]::new()
     foreach ($manifest in [object[]]@($manifestsNode.Items)) {
-        Assert-AstroStrictObjectShape $manifest @(
+        $hasSchemaVersion = $manifest.Properties.ContainsKey('schema_version')
+        $hasJobLimitFlags = $manifest.Properties.ContainsKey('job_limit_flags')
+        if ($hasSchemaVersion -ne $hasJobLimitFlags) {
+            throw "$JsonPath manifest job-contract fields must be both present or both absent"
+        }
+        $manifestFields = [Collections.Generic.List[string]]::new()
+        foreach ($field in @(
             'kind',
             'path',
             'file_identity',
@@ -3774,7 +3825,13 @@ function Convert-AstroLinkedAttributionProbeNode {
             'launcher_pid',
             'launcher_process_start_utc_ticks',
             'launcher_lock_sha256',
-            'launcher_lease_start_utc_ticks',
+            'launcher_lease_start_utc_ticks'
+        )) { $manifestFields.Add($field) }
+        if ($hasSchemaVersion) {
+            $manifestFields.Add('schema_version')
+            $manifestFields.Add('job_limit_flags')
+        }
+        foreach ($field in @(
             'job_object_name',
             'expected_temp_path',
             'exact_expected_launcher',
@@ -3789,7 +3846,11 @@ function Convert-AstroLinkedAttributionProbeNode {
             'owned_paths',
             'owner_generation_probe',
             'job_object_probe'
-        ) "$JsonPath.manifests[]"
+        )) { $manifestFields.Add($field) }
+        Assert-AstroStrictObjectShape `
+            $manifest `
+            ([string[]]@($manifestFields)) `
+            "$JsonPath.manifests[]"
         $entryKind = Get-AstroStrictStringValue `
             $manifest.Properties['kind'] `
             "$JsonPath.manifests[].kind" `
@@ -3854,6 +3915,27 @@ function Convert-AstroLinkedAttributionProbeNode {
             -Positive)
         if ($launcherLeaseTicks -lt $launcherTicks) {
             throw "$JsonPath manifest lease ticks precede launcher process ticks"
+        }
+        $schemaVersion = if ($hasSchemaVersion -and
+            $manifest.Properties['schema_version'].Kind -cne 'null') {
+            [int](ConvertFrom-AstroJsonUnsignedNode `
+                $manifest.Properties['schema_version'] `
+                "$JsonPath.manifests[].schema_version" 3 -Positive)
+        } else { $null }
+        $jobLimitFlags = if ($hasJobLimitFlags -and
+            $manifest.Properties['job_limit_flags'].Kind -cne 'null') {
+            [uint32](ConvertFrom-AstroJsonUnsignedNode `
+                $manifest.Properties['job_limit_flags'] `
+                "$JsonPath.manifests[].job_limit_flags" `
+                ([uint64][uint32]::MaxValue) -Positive)
+        } else { $null }
+        if ($entryValid -and $hasSchemaVersion -and
+            ($schemaVersion -ne 3 -or $jobLimitFlags -ne 8192)) {
+            throw "$JsonPath valid current attribution record must bind schema_version=3 and job_limit_flags=8192"
+        }
+        if (-not $entryValid -and $hasSchemaVersion -and
+            ($null -ne $schemaVersion -or $null -ne $jobLimitFlags)) {
+            throw "$JsonPath malformed attribution stage must carry null job-contract fields"
         }
         $manifestExact = Get-AstroStrictBooleanValue `
             $manifest.Properties['exact_expected_launcher'] `
@@ -3925,6 +4007,8 @@ function Convert-AstroLinkedAttributionProbeNode {
             LauncherProcessStartUtcTicks = $launcherTicks
             LauncherLockSha256 = $launcherLockSha
             LauncherLeaseStartUtcTicks = $launcherLeaseTicks
+            SchemaVersion = $schemaVersion
+            JobLimitFlags = $jobLimitFlags
             JobObjectName = $jobObjectName
             ExpectedTempPath = $expectedTempPath
             ExactExpectedLauncher = $manifestExact
@@ -3945,10 +4029,19 @@ function Convert-AstroLinkedAttributionProbeNode {
         [StringComparer]::Ordinal
     )
     foreach ($refresh in [object[]]@($refreshNode.Items)) {
-        Assert-AstroStrictObjectShape $refresh @(
+        $hasRefreshSchemaVersion =
+            $refresh.Properties.ContainsKey('schema_version')
+        $hasRefreshJobLimitFlags =
+            $refresh.Properties.ContainsKey('job_limit_flags')
+        if ($hasRefreshSchemaVersion -ne $hasRefreshJobLimitFlags) {
+            throw "$JsonPath refresh job-contract fields must be both present or both absent"
+        }
+        $refreshFields = [Collections.Generic.List[string]]::new()
+        foreach ($field in @(
             'key',
             'state',
             'phase',
+            'rename_suffix_quarantine',
             'nonce',
             'envelope_path',
             'envelope_file_identity',
@@ -3971,11 +4064,21 @@ function Convert-AstroLinkedAttributionProbeNode {
             'launcher_pid',
             'launcher_process_start_utc_ticks',
             'launcher_lock_sha256',
-            'launcher_lease_start_utc_ticks',
+            'launcher_lease_start_utc_ticks'
+        )) { $refreshFields.Add($field) }
+        if ($hasRefreshSchemaVersion) {
+            $refreshFields.Add('schema_version')
+            $refreshFields.Add('job_limit_flags')
+        }
+        foreach ($field in @(
             'job_object_name',
             'owner_generation_probe',
             'job_object_probe'
-        ) "$JsonPath.refresh_transactions[]"
+        )) { $refreshFields.Add($field) }
+        Assert-AstroStrictObjectShape `
+            $refresh `
+            ([string[]]@($refreshFields)) `
+            "$JsonPath.refresh_transactions[]"
         $refreshPath = "$JsonPath.refresh_transactions[]"
         $key = Get-AstroStrictStringValue `
             $refresh.Properties['key'] "$refreshPath.key" -Nonblank
@@ -3986,6 +4089,9 @@ function Convert-AstroLinkedAttributionProbeNode {
             $refresh.Properties['state'] "$refreshPath.state" -Nonblank
         $phase = Get-AstroStrictStringValue `
             $refresh.Properties['phase'] "$refreshPath.phase" -Nonblank
+        $renameSuffixQuarantine = Get-AstroStrictBooleanValue `
+            $refresh.Properties['rename_suffix_quarantine'] `
+            "$refreshPath.rename_suffix_quarantine"
         $nonce = Get-AstroStrictStringValue `
             $refresh.Properties['nonce'] "$refreshPath.nonce" -Nonblank
         $refreshLauncherPid = [int](ConvertFrom-AstroJsonUnsignedNode `
@@ -4002,6 +4108,22 @@ function Convert-AstroLinkedAttributionProbeNode {
             $refresh.Properties['launcher_lease_start_utc_ticks'] `
             "$refreshPath.launcher_lease_start_utc_ticks" `
             ([uint64][DateTime]::MaxValue.Ticks) -Positive)
+        $refreshSchemaVersion = if ($hasRefreshSchemaVersion) {
+            [int](ConvertFrom-AstroJsonUnsignedNode `
+                $refresh.Properties['schema_version'] `
+                "$refreshPath.schema_version" 3 -Positive)
+        } else { 2 }
+        $refreshJobLimitFlags = if ($hasRefreshJobLimitFlags) {
+            [uint32](ConvertFrom-AstroJsonUnsignedNode `
+                $refresh.Properties['job_limit_flags'] `
+                "$refreshPath.job_limit_flags" `
+                ([uint64][uint32]::MaxValue) -Positive)
+        } else { [uint32]0 }
+        if ($hasRefreshSchemaVersion -and
+            ($refreshSchemaVersion -ne 3 -or
+                $refreshJobLimitFlags -ne 8192)) {
+            throw "$refreshPath current job contract must be schema_version=3 and job_limit_flags=8192"
+        }
         $jobName = Get-AstroStrictStringValue `
             $refresh.Properties['job_object_name'] `
             "$refreshPath.job_object_name" -Nonblank
@@ -4018,8 +4140,33 @@ function Convert-AstroLinkedAttributionProbeNode {
             "$refreshPath.envelope_path" -Nonblank
         $envelopePath = [IO.Path]::GetFullPath($envelopePathText)
         $envelopeName = ConvertFrom-AstroAttributionRefreshName $envelopePath
+        if (-not $envelopeName.Valid -and $renameSuffixQuarantine) {
+            $actualLeaf = [IO.Path]::GetFileName($envelopePath)
+            $candidateLeaf = if ($actualLeaf.Length -gt 1) {
+                $actualLeaf.Substring(0, $actualLeaf.Length - 1)
+            } else { '' }
+            $candidatePath = if ([string]::IsNullOrEmpty($candidateLeaf)) {
+                ''
+            } else {
+                Join-Path ([IO.Path]::GetDirectoryName($envelopePath)) `
+                    $candidateLeaf
+            }
+            $candidateName = if ([string]::IsNullOrEmpty($candidatePath)) {
+                $null
+            } else {
+                ConvertFrom-AstroAttributionRefreshName $candidatePath
+            }
+            if ($null -ne $candidateName -and $candidateName.Valid -and
+                $candidateName.Phase -ceq 'old-disposition-set' -and
+                $actualLeaf -ceq ($candidateName.Leaf +
+                    $actualLeaf[$actualLeaf.Length - 1])) {
+                $envelopeName = $candidateName
+            }
+        }
         if ($envelopePathText -cne $envelopePath -or
             -not $envelopeName.Valid -or
+            ($renameSuffixQuarantine -and
+                $envelopeName.Phase -cne 'old-disposition-set') -or
             $envelopeName.Phase -cne $phase -or
             $envelopeName.LauncherPid -ne $refreshLauncherPid -or
             $envelopeName.LauncherProcessStartUtcTicks -ne $ticks -or
@@ -4057,9 +4204,13 @@ function Convert-AstroLinkedAttributionProbeNode {
             $refresh.Properties['final_path'] `
             "$refreshPath.final_path" -Nonblank
         $finalPath = [IO.Path]::GetFullPath($finalPathText)
+        $finalManifestName = ConvertFrom-AstroAttributionManifestName $finalPath
         $expectedFinalLeaf = Get-AstroAttributionManifestLeaf `
-            $refreshLauncherPid $ticks $lockSha
+            $refreshLauncherPid $ticks $lockSha `
+            -SchemaVersion $refreshSchemaVersion
         if ($finalPathText -cne $finalPath -or
+            -not $finalManifestName.Valid -or
+            $finalManifestName.SchemaVersion -ne $refreshSchemaVersion -or
             [IO.Path]::GetFileName($finalPath) -cne $expectedFinalLeaf -or
             -not [string]::Equals(
                 [IO.Path]::GetDirectoryName($finalPath),
@@ -4202,6 +4353,7 @@ function Convert-AstroLinkedAttributionProbeNode {
             Key = $key
             State = $state
             Phase = $phase
+            RenameSuffixQuarantine = $renameSuffixQuarantine
             Nonce = $nonce
             EnvelopePath = $envelopePath
             EnvelopeFileIdentity = $envelopeId
@@ -4225,6 +4377,8 @@ function Convert-AstroLinkedAttributionProbeNode {
             LauncherProcessStartUtcTicks = $ticks
             LauncherLockSha256 = $lockSha
             LauncherLeaseStartUtcTicks = $leaseTicks
+            SchemaVersion = $refreshSchemaVersion
+            JobLimitFlags = $refreshJobLimitFlags
             JobObjectName = $jobName
             OwnerProbe = $ownerBinding
             JobObjectProbe = $jobBinding
@@ -5749,9 +5903,18 @@ try {
             $expectedPriorAttributionPolicy = switch (
                 $linkedAuthorizationBinding.ProtocolState
             ) {
-                'active' { 'transition-bound-v2'; break }
-                'cleanup' { 'transition-bound-v2'; break }
-                'claim' { 'transition-bound-v2'; break }
+                'active' {
+                    $linkedAuthorizationBinding.AttributionProbe.Policy
+                    break
+                }
+                'cleanup' {
+                    $linkedAuthorizationBinding.AttributionProbe.Policy
+                    break
+                }
+                'claim' {
+                    $linkedAuthorizationBinding.AttributionProbe.Policy
+                    break
+                }
                 default {
                     Fail-Astro 'ASTRO_LAUNCHER_LOCK_RECLAIM_MARKER_RECORD_MISMATCH' `
                         "linked authorization has unsupported protocol state '$($linkedAuthorizationBinding.ProtocolState)'" `
@@ -6415,17 +6578,17 @@ try {
         'prior-marker-record'
     }
     elseif (-not $LegacyPidOnly -and $isActive) {
-        'transition-bound-v2'
+        'transition-bound-v3'
     }
     elseif (-not $LegacyPidOnly -and $isTransition -and
         $transitionState.Valid -and
         $transitionState.Phase -ceq 'cleanup') {
-        'transition-bound-v2'
+        'transition-bound-v3'
     }
     elseif (-not $LegacyPidOnly -and $isTransition -and
         $transitionState.Valid -and
         $transitionState.Phase -ceq 'claim') {
-        'transition-bound-v2'
+        'transition-bound-v3'
     }
     else {
         Fail-Astro 'ASTRO_LAUNCHER_LOCK_RECLAIM_ATTRIBUTION_POLICY_UNTRUSTWORTHY' `
@@ -6455,10 +6618,15 @@ try {
         $malformedExactStages = @($firstAttributionProbe.manifests | Where-Object {
                 -not [bool]$_.valid -and $_.kind -ceq 'stage'
             })
-        if ($malformedExactStages.Count -ne 1) {
+        $malformedRenameTransactions = @(
+            $firstAttributionProbe.refresh_transactions |
+                Where-Object { [bool]$_.rename_suffix_quarantine }
+        )
+        if (($malformedExactStages.Count +
+                $malformedRenameTransactions.Count) -ne 1) {
             Fail-Astro 'ASTRO_LAUNCHER_LOCK_RECLAIM_QUARANTINE_NOT_REQUIRED' `
-                "QuarantineUnreadable on a valid schema-v2 source requires exactly one malformed exact attribution stage; observed $($malformedExactStages.Count)" `
-                'use normal v2 reclaim when no malformed exact stage exists; preserve multiple or otherwise ambiguous malformed states for investigation'
+                "QuarantineUnreadable on a valid schema-v2 source requires exactly one malformed exact attribution stage or one strictly cross-bound one-code-unit refresh rename; observed stages=$($malformedExactStages.Count), refresh_renames=$($malformedRenameTransactions.Count)" `
+                'use normal v2 reclaim when no malformed subordinate exists; preserve multiple or otherwise ambiguous malformed states for investigation'
         }
     }
     $subordinateCleanupPlan = if ($recognizedReclaimMarker) {
@@ -6750,7 +6918,8 @@ try {
             -ExpectedLauncherPid $expectedPidValue `
             -ExpectedLauncherProcessStartUtcTicks $expectedTicksValue `
             -ExpectedLauncherLockSha256 $launcherGenerationLockSha256 `
-            -ExpectedTransactions $refreshRecordsBefore
+            -ExpectedTransactions $refreshRecordsBefore `
+            -AllowMalformedRenameSuffixQuarantine:([bool]$QuarantineUnreadable)
         [string[]]$expectedRefreshKeys = @(
             $refreshRecordsBefore | ForEach-Object { [string]$_.key }
         )

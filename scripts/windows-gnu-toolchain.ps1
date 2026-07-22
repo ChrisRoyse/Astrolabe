@@ -12,7 +12,12 @@ param(
     # points the resolver at a sandbox bin (never a real build path) for the missing-binary
     # edge test; empty means the canonical pinned .toolchains bin.
     [switch]$ProbeLld,
-    [string]$LlvmBinOverride = ""
+    [string]$LlvmBinOverride = "",
+    # #625: mutating launcher work always runs in a dedicated native PowerShell
+    # process. This private handshake prevents direct invocation of the internal
+    # process mode; the public invocation creates and waits for that process below.
+    [Parameter(DontShow = $true)]
+    [string]$InternalDedicatedToken = ""
 )
 
 Set-StrictMode -Version Latest
@@ -382,8 +387,10 @@ function Complete-LauncherLockCleanupTransaction {
         [Parameter(Mandatory)]$Transaction,
         [Parameter(Mandatory)][string[]]$OwnedTargetRoots,
         [Parameter(Mandatory)][string]$WorkspaceTemp,
-        [Parameter(Mandatory)][string]$WorkspaceTempCleanupPath,
+        [Parameter(Mandatory)][string]$WorkspaceTempArchivePath,
         [Parameter(Mandatory)][string]$AttributionManifest,
+        [Parameter(Mandatory)][string]$AttributionManifestArchivePath,
+        [Parameter(Mandatory)][string]$ArchiveCompletionPath,
         [Parameter(Mandatory)][string]$JobObjectName,
         [Parameter(Mandatory)][int]$ExpectedPid
     )
@@ -397,12 +404,21 @@ function Complete-LauncherLockCleanupTransaction {
         }
         foreach ($ownedPath in @($OwnedTargetRoots) + @(
                 $WorkspaceTemp,
-                $WorkspaceTempCleanupPath,
                 $AttributionManifest
             )) {
             $state = Get-AstroPathEntryState $ownedPath
             if ($state.State -ne 'absent') {
                 throw "owned subordinate is not independently absent (state=$($state.State), error=$($state.Error)): $ownedPath"
+            }
+        }
+        foreach ($archivePath in @(
+                $WorkspaceTempArchivePath,
+                $AttributionManifestArchivePath,
+                $ArchiveCompletionPath
+            )) {
+            $state = Get-AstroPathEntryState $archivePath
+            if ($state.State -ne 'present') {
+                throw "append-only archive evidence is not independently present (state=$($state.State), error=$($state.Error)): $archivePath"
             }
         }
         $jobProbe = Get-AstroLauncherJobObjectProbe -Name $JobObjectName
@@ -1880,6 +1896,7 @@ public class AstroTreeRecorder {
     const uint JOB_OBJECT_MSG_NEW_PROCESS = 6;
     const uint JOB_OBJECT_MSG_EXIT_PROCESS = 7;
     const uint JOB_OBJECT_MSG_ABNORMAL_EXIT_PROCESS = 8;
+    const uint JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000;
     const uint STOP_SENTINEL = 0xFFFFFFFF;
     const int ERROR_ALREADY_EXISTS = 183;
     const int ERROR_MORE_DATA = 234;
@@ -1958,7 +1975,6 @@ public class AstroTreeRecorder {
     readonly ManualResetEventSlim workerReady = new ManualResetEventSlim(false);
     Exception workerFault;
     bool workerStopped;
-    bool closed;
     // #278 attempts 6+7: pid alone is ambiguous under PID REUSE, and first-seen
     // alone still false-attributes DEAD instances (attempt 7: four foreign-sweep
     // pids collided with startup children of ours first seen at 14:2x and long
@@ -2015,7 +2031,7 @@ public class AstroTreeRecorder {
     }
 
     static string ExpectedManifestLeaf(int pid, long processTicks, string lockSha) {
-        return "no-escape-attribution-v2.pid-" + pid.ToString(CultureInfo.InvariantCulture) +
+        return "no-escape-attribution-v3.pid-" + pid.ToString(CultureInfo.InvariantCulture) +
             ".ticks-" + processTicks.ToString(CultureInfo.InvariantCulture) +
             ".lock-sha256-" + lockSha + ".json";
     }
@@ -2062,6 +2078,7 @@ public class AstroTreeRecorder {
         );
         r.lastTimestampNs = checked(minimumClockNs - 100L);
         r.runStartedNs = r.NowUnixNs();
+        bool selfAssignedToKillOnCloseJob = false;
         try {
             r.job = CreateJobObjectW(IntPtr.Zero, jobObjectName);
             int createError = Marshal.GetLastWin32Error();
@@ -2070,9 +2087,12 @@ public class AstroTreeRecorder {
             if (createError == ERROR_ALREADY_EXISTS)
                 throw new IOException("exact-session Job Object name already exists: " + jobObjectName);
 
-            // Explicitly publish zero limit flags. In particular, neither BREAKAWAY_OK nor
-            // SILENT_BREAKAWAY_OK is present, so descendants cannot leave the causal job.
+            // #617: v2 proved that a named Job can become unopenable after its last owner
+            // handle closes while associated descendants remain alive. KILL_ON_JOB_CLOSE is
+            // the kernel guarantee that makes dead-owner + absent exact name authoritative.
+            // No breakaway flag is present, so descendants also cannot leave the causal job.
             JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits = new JOBOBJECT_EXTENDED_LIMIT_INFORMATION();
+            limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
             IntPtr limitBuffer = Marshal.AllocHGlobal(Marshal.SizeOf(limits));
             try {
                 Marshal.StructureToPtr(limits, limitBuffer, false);
@@ -2081,7 +2101,30 @@ public class AstroTreeRecorder {
                     JobObjectExtendedLimitInformation,
                     limitBuffer,
                     (uint)Marshal.SizeOf(limits)
-                )) throw new Win32Exception(Marshal.GetLastWin32Error(), "could not enforce non-breakaway Job Object limits");
+                )) throw new Win32Exception(Marshal.GetLastWin32Error(), "could not enforce kill-on-close non-breakaway Job Object limits");
+                JOBOBJECT_EXTENDED_LIMIT_INFORMATION observed =
+                    (JOBOBJECT_EXTENDED_LIMIT_INFORMATION)Marshal.PtrToStructure(
+                        limitBuffer,
+                        typeof(JOBOBJECT_EXTENDED_LIMIT_INFORMATION)
+                    );
+                uint returnedLength;
+                if (!QueryInformationJobObject(
+                    r.job,
+                    JobObjectExtendedLimitInformation,
+                    limitBuffer,
+                    (uint)Marshal.SizeOf(limits),
+                    out returnedLength
+                )) throw new Win32Exception(Marshal.GetLastWin32Error(), "could not read back kill-on-close Job Object limits");
+                observed = (JOBOBJECT_EXTENDED_LIMIT_INFORMATION)Marshal.PtrToStructure(
+                    limitBuffer,
+                    typeof(JOBOBJECT_EXTENDED_LIMIT_INFORMATION)
+                );
+                if (observed.BasicLimitInformation.LimitFlags !=
+                    JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE)
+                    throw new InvalidDataException(
+                        "Job Object limit readback differs from exact KILL_ON_JOB_CLOSE contract: " +
+                        observed.BasicLimitInformation.LimitFlags.ToString(CultureInfo.InvariantCulture)
+                    );
             } finally {
                 Marshal.FreeHGlobal(limitBuffer);
             }
@@ -2107,6 +2150,7 @@ public class AstroTreeRecorder {
 
             if (!AssignProcessToJobObject(r.job, GetCurrentProcess()))
                 throw new Win32Exception(Marshal.GetLastWin32Error(), "could not assign launcher to exact-session Job Object");
+            selfAssignedToKillOnCloseJob = true;
             lock (r.gate) {
                 List<long[]> spans = new List<long[]>();
                 spans.Add(new long[] { r.runStartedNs, OPEN });
@@ -2136,8 +2180,12 @@ public class AstroTreeRecorder {
             }
             if (r.port != IntPtr.Zero && !CloseHandle(r.port))
                 faults.Add(new Win32Exception(Marshal.GetLastWin32Error(), "could not close completion port after recorder startup failure"));
-            if (r.job != IntPtr.Zero && !CloseHandle(r.job))
-                faults.Add(new Win32Exception(Marshal.GetLastWin32Error(), "could not close Job Object after recorder startup failure"));
+            if (!selfAssignedToKillOnCloseJob && r.job != IntPtr.Zero &&
+                !CloseHandle(r.job))
+                faults.Add(new Win32Exception(Marshal.GetLastWin32Error(), "could not close unassigned Job Object after recorder startup failure"));
+            // #625: after the launcher is associated, the Job handle is intentionally
+            // process-lifetime-owned even when later startup fails. Closing it here
+            // would kill the launcher before PowerShell could persist the real fault.
             // A reserved manifest may already have become visible. Never path-delete it
             // from an error path: preserve the complete bytes for explicit inspection.
             if (faults.Count == 1) throw;
@@ -2343,12 +2391,34 @@ public class AstroTreeRecorder {
             );
     }
 
+    static string GetExtendedLengthPath(string path) {
+        string full = Path.GetFullPath(path);
+        if (full.StartsWith("\\\\?\\", StringComparison.Ordinal)) return full;
+        if (full.StartsWith("\\\\", StringComparison.Ordinal))
+            return "\\\\?\\UNC\\" + full.Substring(2);
+        return "\\\\?\\" + full;
+    }
+
     static void RenameHandleNoReplace(SafeFileHandle source, string destination) {
-        byte[] nameBytes = Encoding.Unicode.GetBytes(Path.GetFullPath(destination));
+        // SetFileInformationByHandle is a Unicode Win32 API, but an ordinary DOS
+        // absolute path still hits MAX_PATH. Always use the canonical extended-
+        // length form; the U+0000 terminator remains outside FileNameLength.
+        byte[] nameBytes = Encoding.Unicode.GetBytes(
+            GetExtendedLengthPath(destination)
+        );
         int rootOffset = IntPtr.Size == 8 ? 8 : 4;
         int lengthOffset = rootOffset + IntPtr.Size;
         int nameOffset = lengthOffset + 4;
-        int bufferSize = checked(nameOffset + nameBytes.Length);
+        // FILE_RENAME_INFO is variable-length, but the native structure carries
+        // WCHAR FileName[1] and the Windows API consumes an aligned information
+        // buffer.  Keep one explicit zero UTF-16 code unit after FileName and pass
+        // pointer-size-aligned storage, matching the hardened shared rename helpers.
+        // The former exact-length allocation produced a real trailing U+7FFE leaf
+        // corruption under #624.
+        int rawSize = checked(nameOffset + nameBytes.Length + 2);
+        int bufferSize = checked(
+            ((rawSize + IntPtr.Size - 1) / IntPtr.Size) * IntPtr.Size
+        );
         IntPtr buffer = Marshal.AllocHGlobal(bufferSize);
         try {
             for (int i = 0; i < bufferSize; i++) Marshal.WriteByte(buffer, i, 0);
@@ -2356,11 +2426,14 @@ public class AstroTreeRecorder {
             Marshal.WriteIntPtr(buffer, rootOffset, IntPtr.Zero);
             Marshal.WriteInt32(buffer, lengthOffset, nameBytes.Length);
             Marshal.Copy(nameBytes, 0, IntPtr.Add(buffer, nameOffset), nameBytes.Length);
-            if (!SetFileInformationByHandle(source, FileRenameInfo, buffer, (uint)bufferSize))
+            if (!SetFileInformationByHandle(source, FileRenameInfo, buffer, (uint)bufferSize)) {
+                int nativeError = Marshal.GetLastWin32Error();
                 throw new Win32Exception(
-                    Marshal.GetLastWin32Error(),
-                    "exact-handle no-replace attribution namespace transition failed"
+                    nativeError,
+                    "exact-handle no-replace attribution namespace transition failed; native_error=" +
+                    nativeError.ToString(CultureInfo.InvariantCulture)
                 );
+            }
         } finally {
             Marshal.FreeHGlobal(buffer);
         }
@@ -2390,7 +2463,7 @@ public class AstroTreeRecorder {
     }
 
     static void RequirePathAbsent(string path, string description) {
-        uint attributes = GetFileAttributesW(Path.GetFullPath(path));
+        uint attributes = GetFileAttributesW(GetExtendedLengthPath(path));
         if (attributes != INVALID_FILE_ATTRIBUTES)
             throw new IOException(description + " remains present: " + path);
         int error = Marshal.GetLastWin32Error();
@@ -2416,7 +2489,7 @@ public class AstroTreeRecorder {
 
     static FileStream CreateExactDeleteOnCloseScratch(string path) {
         SafeFileHandle handle = CreateFileW(
-            Path.GetFullPath(path),
+            GetExtendedLengthPath(path),
             GENERIC_READ | GENERIC_WRITE | DELETE_ACCESS,
             FILE_SHARE_READ | FILE_SHARE_DELETE,
             IntPtr.Zero,
@@ -2449,7 +2522,7 @@ public class AstroTreeRecorder {
         string description
     ) {
         SafeFileHandle handle = CreateFileW(
-            Path.GetFullPath(path),
+            GetExtendedLengthPath(path),
             desiredAccess,
             shareMode,
             IntPtr.Zero,
@@ -2516,8 +2589,8 @@ public class AstroTreeRecorder {
         if (!BytesEqual(scratchBytes, intended))
             throw new InvalidDataException(description + " scratch bytes changed before publication");
         if (!CreateHardLinkW(
-                Path.GetFullPath(destination),
-                Path.GetFullPath(scratchPath),
+                GetExtendedLengthPath(destination),
+                GetExtendedLengthPath(scratchPath),
                 IntPtr.Zero
             )) {
             throw new Win32Exception(
@@ -2849,7 +2922,7 @@ public class AstroTreeRecorder {
             KeyValuePair<int, List<long[]>> right
         ) { return left.Key.CompareTo(right.Key); });
         StringBuilder sb = new StringBuilder();
-        sb.Append("{\"schema\":\"astrolabe.no_escape_attribution.v2\",\"launcher_pid\":");
+        sb.Append("{\"schema\":\"astrolabe.no_escape_attribution.v3\",\"launcher_pid\":");
         AppendInt(sb, launcherPid);
         sb.Append(",\"launcher_process_start_utc_ticks\":");
         AppendLong(sb, launcherProcessStartUtcTicks);
@@ -2859,6 +2932,8 @@ public class AstroTreeRecorder {
         AppendLong(sb, launcherLeaseStartUtcTicks);
         sb.Append(",\"job_object_name\":");
         AppendJsonString(sb, jobObjectName);
+        sb.Append(",\"job_limit_flags\":");
+        AppendLong(sb, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE);
         sb.Append(",\"run_started_unix_ns\":");
         AppendLong(sb, runStartedNs);
         // written_at stamps this exact durable generation. Recovery validates its
@@ -2887,7 +2962,7 @@ public class AstroTreeRecorder {
             sb.Append(']');
         }
         // #621: owned_paths belonged to the retired no-escape gate's Restart Manager
-        // store scan. Preserve the strict v2 field and canonical shape, but publish the
+        // store scan. Preserve the strict versioned field and canonical shape, but publish the
         // honest empty set; exact Job membership is the production cleanup authority.
         sb.Append("},\"owned_paths\":[]}");
         byte[] intended = new UTF8Encoding(false, true).GetBytes(sb.ToString());
@@ -2905,7 +2980,6 @@ public class AstroTreeRecorder {
     }
 
     public void Stop() {
-        if (closed) throw new ObjectDisposedException("AstroTreeRecorder");
         if (workerStopped) return;
         ThrowIfWorkerFaulted();
         if (!PostQueuedCompletionStatus(port, STOP_SENTINEL, UIntPtr.Zero, IntPtr.Zero))
@@ -2928,7 +3002,6 @@ public class AstroTreeRecorder {
     }
 
     public int[] GetActiveProcessIds() {
-        if (closed) throw new ObjectDisposedException("AstroTreeRecorder");
         int capacity = 64;
         while (capacity <= MAX_JOB_PROCESS_IDS) {
             int size = checked(8 + capacity * IntPtr.Size);
@@ -2963,20 +3036,11 @@ public class AstroTreeRecorder {
         throw new InvalidDataException("Job Object process membership exceeds the fail-closed cap of " + MAX_JOB_PROCESS_IDS);
     }
 
-    public void Close() {
-        if (closed) return;
-        if (!workerStopped)
-            throw new InvalidOperationException("tree-attribution worker must stop successfully before its kernel handles can close");
-        List<Exception> faults = new List<Exception>();
-        if (port != IntPtr.Zero && !CloseHandle(port))
-            faults.Add(new Win32Exception(Marshal.GetLastWin32Error(), "could not close tree-attribution completion port"));
-        port = IntPtr.Zero;
-        if (job != IntPtr.Zero && !CloseHandle(job))
-            faults.Add(new Win32Exception(Marshal.GetLastWin32Error(), "could not close exact-session Job Object"));
-        job = IntPtr.Zero;
-        closed = faults.Count == 0;
-        if (faults.Count > 0) throw new AggregateException("tree-attribution kernel-handle cleanup failed", faults);
-    }
+    // #625: there is deliberately no in-process Job-handle close operation.
+    // KILL_ON_JOB_CLOSE includes the dedicated launcher itself, so closing the last
+    // handle here would terminate the cleanup authority. The raw Job and completion-
+    // port handles remain owned by the dedicated native PowerShell process until its
+    // process-object teardown, after all protocol cleanup and exit-code publication.
 }
 '@
 
@@ -3013,12 +3077,9 @@ function Start-AstroTreeAttribution {
         return $recorder
     }
     catch {
-        try {
-            $recorder.Stop()
-            $recorder.Close()
-        }
+        try { $recorder.Stop() }
         catch {
-            throw "initial attribution readback failed and recorder shutdown also failed: $($_.Exception.Message)"
+            throw "initial attribution readback failed and recorder stop also failed: $($_.Exception.Message)"
         }
         throw
     }
@@ -3247,6 +3308,147 @@ if (-not ($isCanonicalRoot -or $isWorktreeRoot)) {
 if ($isWorktreeRoot -and $Bootstrap) {
     throw "LAUNCHER_BOUNDARY[ASTRO_BOOTSTRAP_CANONICAL_ONLY]: -Bootstrap installs pinned tools and must run from $ExpectedWorkspace, not worktree $root"
 }
+
+# #625: KILL_ON_JOB_CLOSE is authoritative only if its last handle follows a real
+# process-lifetime boundary. The Job contains its owner, so a caller process that will
+# continue after this script returns must never be that owner, and the owner must never
+# explicitly close the Job while cleanup is still running. Every public mutating
+# invocation therefore re-execs this script in one dedicated native PowerShell process.
+# The private mode binds the child to its exact live parent generation and a one-use
+# token inherited through that child's environment; fabricated/direct private-mode
+# invocation fails before .tmp, target, toolchain, or lock state is touched.
+$dedicatedEnvironmentNames = @(
+    'ASTRO_LAUNCHER_WRAPPER_TOKEN',
+    'ASTRO_LAUNCHER_WRAPPER_PID',
+    'ASTRO_LAUNCHER_WRAPPER_TICKS'
+)
+if ([string]::IsNullOrEmpty($InternalDedicatedToken)) {
+    $wrapperProcess = [Diagnostics.Process]::GetCurrentProcess()
+    $wrapperTicks = $wrapperProcess.StartTime.ToUniversalTime().Ticks
+    $wrapperToken = [Guid]::NewGuid().ToString('N')
+    $encodeArgument = {
+        param([AllowNull()][string]$Value)
+        return [Convert]::ToBase64String(
+            [Text.Encoding]::UTF8.GetBytes([string]$Value)
+        )
+    }
+    $scriptPathBase64 = & $encodeArgument $PSCommandPath
+    $commandBase64 = & $encodeArgument $Command
+    $commandArgsBase64 = & $encodeArgument $CommandArgsJson
+    $issueBase64 = & $encodeArgument $Issue
+    $tokenBase64 = & $encodeArgument $wrapperToken
+    $bootstrapLiteral = if ($Bootstrap) { '$true' } else { '$false' }
+    $dedicatedCommand = @"
+`$decode = {
+    param([string]`$Value)
+    [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String(`$Value))
+}
+`$dedicatedScript = & `$decode '$scriptPathBase64'
+`$dedicatedParameters = @{
+    Bootstrap = $bootstrapLiteral
+    Command = & `$decode '$commandBase64'
+    CommandArgsJson = & `$decode '$commandArgsBase64'
+    Issue = & `$decode '$issueBase64'
+    InternalDedicatedToken = & `$decode '$tokenBase64'
+}
+& `$dedicatedScript @dedicatedParameters
+`$dedicatedExit = if (`$null -eq `$LASTEXITCODE) { 0 } else { [int]`$LASTEXITCODE }
+exit `$dedicatedExit
+"@
+    $encodedDedicatedCommand = [Convert]::ToBase64String(
+        [Text.Encoding]::Unicode.GetBytes($dedicatedCommand)
+    )
+    $hostExecutable = $wrapperProcess.MainModule.FileName
+    if ([string]::IsNullOrWhiteSpace($hostExecutable) -or
+        -not (Test-Path -LiteralPath $hostExecutable -PathType Leaf)) {
+        throw "LAUNCHER_BOUNDARY[ASTRO_LAUNCHER_DEDICATED_HOST_UNEVALUABLE]: {code=ASTRO_LAUNCHER_DEDICATED_HOST_UNEVALUABLE; message=`"the current native PowerShell executable path is unavailable: '$hostExecutable'`"; remediation=`"invoke the launcher from a native powershell.exe or pwsh.exe process with an ordinary executable image`"}"
+    }
+    $startInfo = [Diagnostics.ProcessStartInfo]::new()
+    $startInfo.FileName = $hostExecutable
+    $startInfo.Arguments = "-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand $encodedDedicatedCommand"
+    $startInfo.WorkingDirectory = $root
+    $startInfo.UseShellExecute = $false
+    $startInfo.EnvironmentVariables['ASTRO_LAUNCHER_WRAPPER_TOKEN'] =
+        $wrapperToken
+    $startInfo.EnvironmentVariables['ASTRO_LAUNCHER_WRAPPER_PID'] =
+        $PID.ToString([Globalization.CultureInfo]::InvariantCulture)
+    $startInfo.EnvironmentVariables['ASTRO_LAUNCHER_WRAPPER_TICKS'] =
+        $wrapperTicks.ToString([Globalization.CultureInfo]::InvariantCulture)
+    $dedicatedProcess = [Diagnostics.Process]::new()
+    $dedicatedProcess.StartInfo = $startInfo
+    try {
+        if (-not $dedicatedProcess.Start()) {
+            throw 'native process creation returned false'
+        }
+        $dedicatedPid = $dedicatedProcess.Id
+        $dedicatedTicks =
+            $dedicatedProcess.StartTime.ToUniversalTime().Ticks
+        Write-Output "LAUNCHER_BOUNDARY[ASTRO_LAUNCHER_DEDICATED_STARTED]: pid=$dedicatedPid; owner_process_start_utc_ticks=$dedicatedTicks; wrapper_pid=$PID; wrapper_process_start_utc_ticks=$wrapperTicks"
+        $dedicatedProcess.WaitForExit()
+        $dedicatedExit = [int]$dedicatedProcess.ExitCode
+    }
+    catch {
+        throw "LAUNCHER_BOUNDARY[ASTRO_LAUNCHER_DEDICATED_START_FAILED]: {code=ASTRO_LAUNCHER_DEDICATED_START_FAILED; message=`"the dedicated native launcher process could not be executed/read back: $($_.Exception.Message)`"; remediation=`"preserve all existing protocol state, repair native PowerShell process creation, and retry the public launcher invocation`"}"
+    }
+    finally {
+        $dedicatedProcess.Dispose()
+        $wrapperProcess.Dispose()
+    }
+    Write-Output "LAUNCHER_BOUNDARY[ASTRO_LAUNCHER_DEDICATED_TERMINAL]: pid=$dedicatedPid; owner_process_start_utc_ticks=$dedicatedTicks; process_state=absent; exit_code=$dedicatedExit"
+    exit $dedicatedExit
+}
+
+if ($InternalDedicatedToken -cnotmatch '^[0-9a-f]{32}$' -or
+    $env:ASTRO_LAUNCHER_WRAPPER_TOKEN -cne $InternalDedicatedToken) {
+    throw "LAUNCHER_BOUNDARY[ASTRO_LAUNCHER_DEDICATED_HANDSHAKE_INVALID]: {code=ASTRO_LAUNCHER_DEDICATED_HANDSHAKE_INVALID; message=`"the private dedicated-launcher token is absent, malformed, or does not match the inherited child environment`"; remediation=`"invoke the public launcher without InternalDedicatedToken; it creates the exact dedicated process automatically`"}"
+}
+$wrapperPid = 0
+$wrapperStartTicks = 0L
+if (-not [int]::TryParse(
+        $env:ASTRO_LAUNCHER_WRAPPER_PID,
+        [Globalization.NumberStyles]::None,
+        [Globalization.CultureInfo]::InvariantCulture,
+        [ref]$wrapperPid
+    ) -or $wrapperPid -le 0 -or
+    -not [long]::TryParse(
+        $env:ASTRO_LAUNCHER_WRAPPER_TICKS,
+        [Globalization.NumberStyles]::None,
+        [Globalization.CultureInfo]::InvariantCulture,
+        [ref]$wrapperStartTicks
+    ) -or $wrapperStartTicks -le 0 -or
+    $wrapperStartTicks -gt [DateTime]::MaxValue.Ticks) {
+    throw "LAUNCHER_BOUNDARY[ASTRO_LAUNCHER_DEDICATED_PARENT_INVALID]: {code=ASTRO_LAUNCHER_DEDICATED_PARENT_INVALID; message=`"the inherited wrapper process identity is not canonical`"; remediation=`"invoke only the public launcher boundary and investigate altered child environment state`"}"
+}
+$currentProcessRows = @(
+    Get-CimInstance -ClassName Win32_Process -Filter "ProcessId = $PID" `
+        -ErrorAction Stop
+)
+$wrapperIdentity = try {
+    [Diagnostics.Process]::GetProcessById($wrapperPid)
+}
+catch {
+    $null
+}
+try {
+    if ($currentProcessRows.Count -ne 1 -or
+        [int]$currentProcessRows[0].ParentProcessId -ne $wrapperPid -or
+        $null -eq $wrapperIdentity -or
+        $wrapperIdentity.StartTime.ToUniversalTime().Ticks -ne
+            $wrapperStartTicks) {
+        throw "parent_pid=$(@($currentProcessRows.ParentProcessId) -join ','); expected_pid=$wrapperPid; expected_ticks=$wrapperStartTicks; observed_ticks=$(if ($null -ne $wrapperIdentity) { $wrapperIdentity.StartTime.ToUniversalTime().Ticks } else { '<absent>' })"
+    }
+}
+catch {
+    throw "LAUNCHER_BOUNDARY[ASTRO_LAUNCHER_DEDICATED_PARENT_MISMATCH]: {code=ASTRO_LAUNCHER_DEDICATED_PARENT_MISMATCH; message=`"the private launcher is not the exact child of its bound live wrapper generation: $($_.Exception.Message)`"; remediation=`"preserve all protocol state and retry through one public launcher invocation`"}"
+}
+finally {
+    if ($null -ne $wrapperIdentity) { $wrapperIdentity.Dispose() }
+}
+foreach ($environmentName in $dedicatedEnvironmentNames) {
+    Remove-Item -Path "Env:$environmentName" -ErrorAction SilentlyContinue
+}
+Write-Output "LAUNCHER_BOUNDARY[ASTRO_LAUNCHER_DEDICATED_VERIFIED]: pid=$PID; wrapper_pid=$wrapperPid; wrapper_process_start_utc_ticks=$wrapperStartTicks; token_consumed=true"
+
 if ($isWorktreeRoot) {
     Write-Output "LAUNCHER_WORKTREE[ASTRO_WORKTREE_ROOT]: root=$root; pinned tools and sccache shared from $ExpectedWorkspace; target/, .tmp/, and session lock stay worktree-local"
 }
@@ -3323,6 +3525,9 @@ Assert-NoAmbientCargoTargetEscape -OwnedTargetRoot $target
 # cleanup). Like the lock/manifest helpers it NEVER stops a process and reaps a dir only when
 # the whole owning process tree is dead.
 . (Join-Path $PSScriptRoot "launcher-temp-guard.ps1")
+# #620: recursive TEMP disposition cannot atomically exclude every metadata writer.
+# The only production lifecycle is a durable append-only pair archive transaction.
+. (Join-Path $PSScriptRoot "launcher-state-archive.ps1")
 # #611: `.tmp` is the protocol directory. Creating an absent `.tmp` is the only write before
 # the typed claim transition. The exact empty session TEMP is then created and verified while
 # that transition is visible; active publication occurs only after the strict manifest/TEMP/
@@ -3383,7 +3588,7 @@ $workspaceTemp = Join-Path $workspaceTempParent (
     "windows-gnu-toolchain-v2.pid-$PID.ticks-$launcherProcessStartUtcTicks.lock-sha256-$launcherLockSha256"
 )
 $attributionManifest = Join-Path $workspaceTempParent (
-    "no-escape-attribution-v2.pid-$PID.ticks-$launcherProcessStartUtcTicks.lock-sha256-$launcherLockSha256.json"
+    "no-escape-attribution-v3.pid-$PID.ticks-$launcherProcessStartUtcTicks.lock-sha256-$launcherLockSha256.json"
 )
 $claimNonce = [Guid]::NewGuid().ToString('N')
 $launcherLockScratch = Join-Path $workspaceTempParent (
@@ -3536,6 +3741,9 @@ try {
             $launcherLockSha256 -or
         $claimManifestProbe.Parsed.JobObjectName -cne
             $launcherTreeJobObjectName -or
+        $claimManifestProbe.Parsed.SchemaVersion -ne 3 -or
+        -not $claimManifestProbe.Parsed.KillOnJobCloseBound -or
+        $claimManifestProbe.Parsed.JobLimitFlags -ne 8192 -or
         -not [string]::Equals(
             $claimManifestProbe.ExpectedTempPath,
             [IO.Path]::GetFullPath($workspaceTemp),
@@ -3633,6 +3841,9 @@ try {
         $activeJobState -cne 'observed' -or
         $activeJobPids.Count -ne 1 -or
         $activeJobPids[0] -ne $PID -or
+        $activeManifestProbe.Parsed.SchemaVersion -ne 3 -or
+        -not $activeManifestProbe.Parsed.KillOnJobCloseBound -or
+        $activeManifestProbe.Parsed.JobLimitFlags -ne 8192 -or
         $activeManifestProbe.Snapshot.Length -ne
             [uint64]$claimManifestExpectedBytes.LongLength -or
         [Convert]::ToBase64String($activeManifestProbe.Snapshot.Bytes) -cne
@@ -3697,12 +3908,8 @@ catch {
         catch {
             $claimCleanupErrors += "tree-attribution recorder stop failed after claim failure: $($_.Exception.Message)"
         }
-        if ($treeRecorderStopped) {
-            try { $treeRecorder.Close() }
-            catch {
-                $claimCleanupErrors += "tree-attribution recorder handle close failed after claim failure: $($_.Exception.Message)"
-            }
-        }
+        # #625: retain the KILL_ON_JOB_CLOSE handle until this dedicated owner
+        # process exits. Closing it here would terminate the cleanup authority.
     }
 
     if ($null -ne $workspaceTempLease -and
@@ -3761,7 +3968,7 @@ finally {
 # Every workspace/config/toolchain mutation is inside this try/finally.
 try {
     $env:ASTRO_NO_ESCAPE_ATTRIBUTION = $attributionManifest
-    Write-Output "NO_ESCAPE[ASTRO_ATTRIBUTION_RECORDING]: strict v2 process tree -> $attributionManifest; job=$launcherTreeJobObjectName"
+    Write-Output "NO_ESCAPE[ASTRO_ATTRIBUTION_RECORDING]: strict v3 kill-on-close process tree -> $attributionManifest; job=$launcherTreeJobObjectName; job_limit_flags=8192"
     Write-Output 'NO_ESCAPE[ASTRO_RETIRED_GATE_STORE_SCAN_ABSENT]: owned_paths is the canonical empty v2 set; no retired gate registry or operator-store Restart Manager scan is part of the production launcher (#621)'
     # Active publication already proved the exact TEMP/manifest pair under the claim mutex.
     # Re-read the TEMP here; never create or repair subordinate protocol state after active.
@@ -4039,34 +4246,81 @@ try {
     if ($newSccacheJobPids.Count -eq 0) {
         throw "LAUNCHER_BOUNDARY[ASTRO_SCCACHE_JOB_ATTRIBUTION_MISSING]: sccache answered on the exact root port, but no causally new process remained in Job Object $launcherTreeJobObjectName"
     }
+    $pinnedSccachePath = [IO.Path]::GetFullPath($sccacheExe)
+    $pinnedConhostPath = [IO.Path]::GetFullPath((Join-Path `
+        ([Environment]::GetFolderPath([Environment+SpecialFolder]::System)) `
+        'conhost.exe'
+    ))
+    $causalMembers = [Collections.Generic.List[object]]::new()
     foreach ($sccachePid in $newSccacheJobPids) {
         $identity = Get-AstroProcessIdentityProbe $sccachePid
         if ($identity.State -ne 'observed') {
             throw "LAUNCHER_BOUNDARY[ASTRO_SCCACHE_JOB_IDENTITY_UNEVALUABLE]: Job Object member PID $sccachePid could not be bound to an exact process generation (state=$($identity.State), error=$($identity.Error))"
         }
-        $processRow = Get-CimInstance `
-            -ClassName Win32_Process `
-            -Filter "ProcessId = $sccachePid" `
-            -ErrorAction Stop
-        if ($null -eq $processRow -or
-            [string]::IsNullOrWhiteSpace([string]$processRow.ExecutablePath) -or
-            -not [string]::Equals(
-                [IO.Path]::GetFullPath([string]$processRow.ExecutablePath),
-                [IO.Path]::GetFullPath($sccacheExe),
-                [StringComparison]::OrdinalIgnoreCase
+        $processRows = @(
+            Get-CimInstance `
+                -ClassName Win32_Process `
+                -Filter "ProcessId = $sccachePid" `
+                -ErrorAction Stop
+        )
+        if ($processRows.Count -ne 1 -or
+            [string]::IsNullOrWhiteSpace(
+                [string]$processRows[0].ExecutablePath
             )) {
-            throw "LAUNCHER_BOUNDARY[ASTRO_SCCACHE_JOB_IDENTITY_MISMATCH]: causally new Job Object PID $sccachePid is not the pinned sccache executable '$sccacheExe' (observed='$($processRow.ExecutablePath)')"
+            throw "LAUNCHER_BOUNDARY[ASTRO_SCCACHE_JOB_IDENTITY_UNEVALUABLE]: Job Object member PID $sccachePid did not yield exactly one process row with an executable path"
         }
-        $sccacheOwnedJobMembers += [pscustomobject]@{
+        $imagePath = [IO.Path]::GetFullPath(
+            [string]$processRows[0].ExecutablePath
+        )
+        $role = if ([string]::Equals(
+                $imagePath,
+                $pinnedSccachePath,
+                [StringComparison]::OrdinalIgnoreCase
+            )) { 'server' } elseif ([string]::Equals(
+                $imagePath,
+                $pinnedConhostPath,
+                [StringComparison]::OrdinalIgnoreCase
+            )) { 'console-host' } else { 'unexpected' }
+        if ($role -ceq 'unexpected') {
+            throw "LAUNCHER_BOUNDARY[ASTRO_SCCACHE_JOB_IDENTITY_MISMATCH]: causally new Job Object PID $sccachePid is neither the pinned sccache executable '$pinnedSccachePath' nor the exact Windows console host '$pinnedConhostPath' (observed='$imagePath')"
+        }
+        $causalMembers.Add([pscustomobject]@{
             Pid = [int]$sccachePid
             ProcessStartUtcTicks = [long]$identity.ProcessStartUtcTicks
-            ImagePath = [IO.Path]::GetFullPath([string]$processRow.ExecutablePath)
-        }
+            ImagePath = $imagePath
+            ParentPid = [int]$processRows[0].ParentProcessId
+            Role = $role
+        })
     }
+    $serverMembers = @($causalMembers | Where-Object { $_.Role -ceq 'server' })
+    $consoleMembers = @(
+        $causalMembers | Where-Object { $_.Role -ceq 'console-host' }
+    )
+    if ($serverMembers.Count -ne 1 -or $consoleMembers.Count -gt 1) {
+        throw "LAUNCHER_BOUNDARY[ASTRO_SCCACHE_JOB_TOPOLOGY_INVALID]: startup must produce exactly one pinned sccache server and at most one exact conhost companion (servers=$($serverMembers.Count), console_hosts=$($consoleMembers.Count), members=$($newSccacheJobPids -join ','))"
+    }
+    if ($consoleMembers.Count -eq 1 -and
+        ($consoleMembers[0].ParentPid -ne $serverMembers[0].Pid -or
+            $consoleMembers[0].ProcessStartUtcTicks -lt
+                $serverMembers[0].ProcessStartUtcTicks)) {
+        throw "LAUNCHER_BOUNDARY[ASTRO_SCCACHE_JOB_TOPOLOGY_INVALID]: conhost PID $($consoleMembers[0].Pid) is not the exact creation-time-ordered child of sccache PID $($serverMembers[0].Pid) (parent=$($consoleMembers[0].ParentPid), conhost_ticks=$($consoleMembers[0].ProcessStartUtcTicks), server_ticks=$($serverMembers[0].ProcessStartUtcTicks))"
+    }
+    $listeners = @(
+        Get-NetTCPConnection `
+            -State Listen `
+            -LocalAddress '127.0.0.1' `
+            -LocalPort $sccacheServerPort `
+            -ErrorAction Stop
+    )
+    if ($listeners.Count -ne 1 -or
+        [int]$listeners[0].OwningProcess -ne $serverMembers[0].Pid) {
+        throw "LAUNCHER_BOUNDARY[ASTRO_SCCACHE_LISTENER_IDENTITY_MISMATCH]: exact 127.0.0.1:$sccacheServerPort listener does not belong uniquely to captured sccache PID $($serverMembers[0].Pid) (count=$($listeners.Count), owners=$(@($listeners.OwningProcess) -join ','))"
+    }
+    $sccacheOwnedJobMembers = @($causalMembers)
     $sccacheMemberDescription = @(
         $sccacheOwnedJobMembers |
             ForEach-Object {
-                "pid=$($_.Pid),ticks=$($_.ProcessStartUtcTicks)"
+                "role=$($_.Role),pid=$($_.Pid),ticks=$($_.ProcessStartUtcTicks),parent=$($_.ParentPid)"
             }
     ) -join '; '
     Write-Output "SCCACHE[ASTRO_CACHE_JOB_BOUND]: exact infrastructure process generation(s): $sccacheMemberDescription"
@@ -4122,7 +4376,7 @@ finally {
     $preStopJobPids = @()
     try {
         if ($null -eq $treeRecorder) {
-            throw 'strict v2 tree recorder is absent after active lock publication'
+            throw 'strict v3 kill-on-close tree recorder is absent after active lock publication'
         }
         $preStopJobPids = @($treeRecorder.GetActiveProcessIds())
         if (-not ($preStopJobPids -contains $PID)) {
@@ -4142,6 +4396,21 @@ finally {
                 [long]$identity.ProcessStartUtcTicks -ne
                     [long]$infrastructure[0].ProcessStartUtcTicks) {
                 throw "sccache Job Object member PID $jobPid no longer binds its captured process generation (state=$($identity.State), expected_ticks=$($infrastructure[0].ProcessStartUtcTicks), observed_ticks=$($identity.ProcessStartUtcTicks), error=$($identity.Error))"
+            }
+            $rows = @(Get-CimInstance `
+                -ClassName Win32_Process `
+                -Filter "ProcessId = $jobPid" `
+                -ErrorAction Stop)
+            if ($rows.Count -ne 1 -or
+                [string]::IsNullOrWhiteSpace([string]$rows[0].ExecutablePath) -or
+                -not [string]::Equals(
+                    [IO.Path]::GetFullPath([string]$rows[0].ExecutablePath),
+                    [string]$infrastructure[0].ImagePath,
+                    [StringComparison]::OrdinalIgnoreCase
+                ) -or
+                [int]$rows[0].ParentProcessId -ne
+                    [int]$infrastructure[0].ParentPid) {
+                throw "captured sccache infrastructure PID $jobPid changed exact image/parent topology before shutdown"
             }
         }
     }
@@ -4168,6 +4437,43 @@ finally {
             $sccacheStop = Invoke-NativeCapture -Exe $sccacheExe -Arguments @("--stop-server")
             if ($sccacheStop.ExitCode -ne 0) {
                 $cleanupErrors += "exact session sccache stop failed with exit $($sccacheStop.ExitCode): $($sccacheStop.Output -join ' | ')"
+            }
+            else {
+                $shutdownDeadline = [DateTime]::UtcNow.AddSeconds(10)
+                do {
+                    $sameGenerationLive = @(
+                        $sccacheOwnedJobMembers | Where-Object {
+                            $probe = Get-AstroProcessIdentityProbe $_.Pid
+                            $probe.State -eq 'observed' -and
+                                [long]$probe.ProcessStartUtcTicks -eq
+                                    [long]$_.ProcessStartUtcTicks
+                        }
+                    )
+                    if ($sameGenerationLive.Count -eq 0) { break }
+                    Start-Sleep -Milliseconds 50
+                } while ([DateTime]::UtcNow -lt $shutdownDeadline)
+                if ($sameGenerationLive.Count -ne 0) {
+                    $liveDescriptions = @(
+                        $sameGenerationLive | ForEach-Object {
+                            '{0}:{1}:{2}' -f @(
+                                $_.Role,
+                                $_.Pid,
+                                $_.ProcessStartUtcTicks
+                            )
+                        }
+                    )
+                    $cleanupErrors += "exact sccache infrastructure generation(s) remained live after graceful --stop-server: $($liveDescriptions -join ', ')"
+                }
+                $remainingListeners = @(
+                    Get-NetTCPConnection `
+                        -State Listen `
+                        -LocalAddress '127.0.0.1' `
+                        -LocalPort $sccacheServerPort `
+                        -ErrorAction SilentlyContinue
+                )
+                if ($remainingListeners.Count -ne 0) {
+                    $cleanupErrors += "127.0.0.1:$sccacheServerPort still has listener owner(s) after graceful sccache stop: $(@($remainingListeners.OwningProcess) -join ',')"
+                }
             }
         }
         catch {
@@ -4224,13 +4530,9 @@ finally {
             $deferCleanupForLiveChildren = $true
             $cleanupErrors += "tree-attribution stop/readback failed: $($_.Exception.Message)"
         }
-        if ($treeRecorderStopped) {
-            try { $treeRecorder.Close() }
-            catch {
-                $deferCleanupForLiveChildren = $true
-                $cleanupErrors += "tree-attribution kernel-handle close failed: $($_.Exception.Message)"
-            }
-        }
+        # #625: the exact Job and completion-port handles stay open through every
+        # target/TEMP/manifest/lock operation. Native process teardown closes them
+        # only after the dedicated launcher has published its terminal exit state.
     }
     else {
         $deferCleanupForLiveChildren = $true
@@ -4238,14 +4540,19 @@ finally {
     }
 
     $launcherLockRemoved = $false
-    $attributionManifestRemoved = $false
-    $workspaceTempRemoved = $false
-    $workspaceTempCleanupPath = $null
+    $attributionManifestArchived = $false
+    $workspaceTempArchived = $false
+    $workspaceTempArchivePath = $null
+    $attributionManifestArchivePath = $null
+    $launcherArchiveCompletionPath = $null
+    $manifestArchiveLease = $null
+    $launcherStateArchiveTransaction = $null
     $launcherLockCleanupTransaction = $null
     if (-not $deferCleanupForLiveChildren -and $cleanupErrors.Count -eq 0) {
         try {
-            # Recorder Stop/readback/Close completed above. Before the first destructive
-            # target/TEMP operation, independently require exact kernel membership {PID}.
+            # Recorder Stop/readback completed above while its Job handle remains retained.
+            # Before the first destructive target/TEMP operation, independently require
+            # exact kernel membership {PID}.
             $preCleanupJobProbe = Get-AstroLauncherJobObjectProbe `
                 -Name $launcherTreeJobObjectName
             $preCleanupJobPids = @(
@@ -4284,9 +4591,10 @@ finally {
 
     if ($null -ne $launcherLockCleanupTransaction) {
         try {
-            # The visible cleanup transition and Global mutex are retained before this first
-            # destructive operation. Stop at the first failure and preserve all remaining
-            # subordinate state plus the exact transition for authorized recovery.
+            # The visible cleanup transition and Global mutex are retained before
+            # target cleanup and the append-only TEMP/manifest archive transaction.
+            # Stop at the first failure and preserve every source/archive byte plus
+            # the exact transition for authorized recovery.
             foreach ($ownedTarget in $ownedTargetRoots) {
                 $targetState = Get-AstroPathEntryState $ownedTarget
                 if ($targetState.State -eq 'present') {
@@ -4307,93 +4615,94 @@ finally {
                 $workspaceTempLease.Handle.IsClosed) {
                 throw 'producer no longer retains the exact live TEMP root handle'
             }
-            $tempCapture = Initialize-AstroLiveLauncherTempCleanupSnapshot `
-                -Lease $workspaceTempLease `
-                -CleanupTransaction $launcherLockCleanupTransaction `
-                -ExpectedPid $PID `
-                -ExpectedOwnerProcessStartUtcTicks `
-                    $launcherProcessStartUtcTicks `
-                -JobObjectName $launcherTreeJobObjectName
-            $tempRename = Move-AstroLauncherTempLeaseToCleanupTombstone `
-                -Lease $workspaceTempLease `
-                -DestinationDirectoryLease $launcherProtocolDirectoryLease
-            $workspaceTempCleanupPath = $tempRename.DestinationPath
-            $originalAfterRename = Get-AstroPathEntryState $workspaceTemp
-            if ($originalAfterRename.State -ne 'absent') {
-                throw "original TEMP basename is not absent after exact handle-bound cleanup rename (state=$($originalAfterRename.State), error=$($originalAfterRename.Error)): $workspaceTemp"
-            }
-            $tempDisposition = Start-AstroLiveLauncherTempExactDisposition `
-                -Lease $workspaceTempLease `
-                -CleanupTransaction $launcherLockCleanupTransaction `
-                -ExpectedPid $PID `
-                -ExpectedOwnerProcessStartUtcTicks `
-                    $launcherProcessStartUtcTicks `
-                -JobObjectName $launcherTreeJobObjectName
-            Close-AstroLauncherTempMutationLease $workspaceTempLease
-            foreach ($tempTerminalPath in @(
-                    $workspaceTemp,
-                    $workspaceTempCleanupPath
-                )) {
-                $tempTerminal = Get-AstroPathEntryState $tempTerminalPath
-                if ($tempTerminal.State -ne 'absent') {
-                    throw "workspace TEMP terminal path is not absent after closing its delete-pending exact handle (state=$($tempTerminal.State), error=$($tempTerminal.Error)): $tempTerminalPath"
-                }
-            }
-            Write-Output "NO_ESCAPE[ASTRO_TEMP_CLEANUP_READBACK]: source=$workspaceTemp; cleanup=$workspaceTempCleanupPath; file_id=$($tempDisposition.RootFileId); initial_entries=$($tempDisposition.InitialEntryCount); inventory_sha256=$($tempDisposition.InitialInventorySha256); empty_inventory_sha256=$($tempDisposition.EmptyInventorySha256); disposition_set=$($tempDisposition.DispositionSet); original_terminal=absent; cleanup_terminal=absent; owner=$($tempDisposition.OwnerProbe.State); job=$($tempDisposition.JobObjectProbe.State); job_pids=$(@($tempDisposition.JobObjectProbe.ProcessIds) -join ','); cleanup_transition=$($launcherLockCleanupTransaction.CleanupPath)"
-            $workspaceTempRemoved = $true
-
             if ($null -eq $finalManifestExpectedBytes) {
                 throw 'producer did not supply exact final manifest bytes'
             }
-            foreach ($tempTerminalPath in @(
-                    $workspaceTemp,
-                    $workspaceTempCleanupPath
-                )) {
-                $preManifestTempState = Get-AstroPathEntryState $tempTerminalPath
-                if ($preManifestTempState.State -ne 'absent') {
-                    throw "TEMP source/tombstone was recreated before manifest disposition (state=$($preManifestTempState.State), error=$($preManifestTempState.Error)): $tempTerminalPath"
+            $manifestProbe = Get-AstroAttributionManifestProbe `
+                -ManifestPath $attributionManifest
+            $manifestArchiveLease = Open-AstroAttributionArchiveLease `
+                -ManifestProbe $manifestProbe `
+                -AuthorityMode live-owner `
+                -ExpectedBytes $finalManifestExpectedBytes
+            $launcherStateArchiveTransaction =
+                Start-AstroLauncherStateArchiveTransaction `
+                    -ProtocolDirectory $workspaceTempParent `
+                    -ProtocolDirectoryLease $launcherProtocolDirectoryLease `
+                    -TempLease $workspaceTempLease `
+                    -ManifestLease $manifestArchiveLease `
+                    -AuthorityMode live-owner `
+                    -DrivingIssue $drivingIssue
+            $tempArchive = Move-AstroLauncherStateArchiveTemp `
+                -Transaction $launcherStateArchiveTransaction
+            $workspaceTempArchivePath = $tempArchive.DestinationPath
+            $manifestArchive = Move-AstroLauncherStateArchiveManifest `
+                -Transaction $launcherStateArchiveTransaction
+            $attributionManifestArchivePath =
+                $manifestArchive.DestinationPath
+            $archiveCompletion =
+                Complete-AstroLauncherStateArchiveTransaction `
+                    -Transaction $launcherStateArchiveTransaction
+            $launcherArchiveCompletionPath = $archiveCompletion.CompletionPath
+
+            foreach ($sourcePath in @($workspaceTemp, $attributionManifest)) {
+                $sourceState = Get-AstroPathEntryState $sourcePath
+                if ($sourceState.State -ne 'absent') {
+                    throw "launcher archive source is not independently absent (state=$($sourceState.State), error=$($sourceState.Error)): $sourcePath"
                 }
             }
-            $manifestCleanup = Remove-AstroAttributionManifest `
-                -Path $attributionManifest `
-                -ExpectedBytes $finalManifestExpectedBytes
-            if ($manifestCleanup.State -cne 'absent' -or
-                -not $manifestCleanup.DispositionSet -or
-                $manifestCleanup.TerminalPathState -cne 'absent') {
-                throw "shared own-manifest cleanup returned incomplete terminal state (state=$($manifestCleanup.State), disposition_set=$($manifestCleanup.DispositionSet), terminal=$($manifestCleanup.TerminalPathState))"
+            foreach ($archivePath in @(
+                    $workspaceTempArchivePath,
+                    $attributionManifestArchivePath,
+                    $launcherArchiveCompletionPath
+                )) {
+                $archiveState = Get-AstroPathEntryState $archivePath
+                if ($archiveState.State -ne 'present') {
+                    throw "launcher archive destination is not independently present (state=$($archiveState.State), error=$($archiveState.Error)): $archivePath"
+                }
             }
-            $manifestTerminal = Get-AstroPathEntryState $attributionManifest
-            if ($manifestTerminal.State -ne 'absent') {
-                throw "attribution manifest is not independently absent after exact cleanup (state=$($manifestTerminal.State), error=$($manifestTerminal.Error)): $attributionManifest"
-            }
-            Write-Output "NO_ESCAPE[ASTRO_ATTRIBUTION_CLEANUP_READBACK]: state=$($manifestCleanup.State); path=$($manifestCleanup.Path); file_id=$($manifestCleanup.FileId); length=$($manifestCleanup.Length); sha256=$($manifestCleanup.Sha256); expected_sha256=$($manifestCleanup.ExpectedSha256); disposition_set=$($manifestCleanup.DispositionSet); terminal=$($manifestCleanup.TerminalPathState); cleanup_transition=$($launcherLockCleanupTransaction.CleanupPath)"
-            $attributionManifestRemoved = $true
+            Write-Output "LAUNCHER_ARCHIVE[ASTRO_LAUNCHER_STATE_ARCHIVE_READBACK]: transaction=$($archiveCompletion.TransactionId); transaction_path=$($archiveCompletion.TransactionPath); authorization_sha256=$($archiveCompletion.AuthorizationSha256); completion_sha256=$($archiveCompletion.CompletionSha256); temp_source=absent; temp_archive=$($archiveCompletion.TempArchivePath); temp_file_id=$($archiveCompletion.TempRootFileId); temp_inventory_state=$($archiveCompletion.TempInventoryState); temp_inventory_error=$($archiveCompletion.TempInventoryError); temp_entries=$($archiveCompletion.TempEntryCount); temp_inventory_sha256=$($archiveCompletion.TempInventorySha256); manifest_source=absent; manifest_archive=$($archiveCompletion.ManifestArchivePath); manifest_file_id=$($archiveCompletion.ManifestFileId); manifest_bytes=$($archiveCompletion.ManifestLength); manifest_sha256=$($archiveCompletion.ManifestSha256); cleanup_transition=$($launcherLockCleanupTransaction.CleanupPath)"
+            $workspaceTempArchived = $true
+            $attributionManifestArchived = $true
         }
         catch {
             $cleanupErrors += "subordinate cleanup under retained transition failed: $($_.Exception.Message)"
         }
         finally {
-            # On every failure, release only the retained handle. Without root
-            # disposition this preserves the original/tombstone for the dead-pair
-            # reclaimer; with disposition it permits the exact root to disappear.
-            # The cleanup transition and manifest remain visible until the terminal
-            # source+tombstone absence checks above have all succeeded.
-            if ($null -ne $workspaceTempLease -and
-                $null -ne $workspaceTempLease.Handle -and
-                -not $workspaceTempLease.Handle.IsClosed) {
-                try { Close-AstroLauncherTempMutationLease $workspaceTempLease }
+            # Releasing retained handles never deletes archive or source bytes.
+            # An interrupted transaction remains classification-visible through
+            # its authorization record and the cleanup transition.
+            if ($null -ne $launcherStateArchiveTransaction) {
+                try {
+                    Close-AstroLauncherStateArchiveTransaction `
+                        $launcherStateArchiveTransaction
+                }
                 catch {
-                    $cleanupErrors += "retained live TEMP handle release failed while preserving transaction state: $($_.Exception.Message)"
+                    $cleanupErrors += "launcher state archive handle release failed while preserving transaction state: $($_.Exception.Message)"
                 }
             }
-            if (-not $workspaceTempRemoved) {
-                $preservedOriginal = Get-AstroPathEntryState $workspaceTemp
-                $preservedCleanup = if ($null -ne $workspaceTempCleanupPath) {
-                    Get-AstroPathEntryState $workspaceTempCleanupPath
-                } else {
-                    $null
+            else {
+                if ($null -ne $manifestArchiveLease -and
+                    $null -ne $manifestArchiveLease.Handle -and
+                    -not $manifestArchiveLease.Handle.IsClosed) {
+                    try { $manifestArchiveLease.Handle.Dispose() }
+                    catch {
+                        $cleanupErrors += "manifest archive lease release failed while preserving source: $($_.Exception.Message)"
+                    }
                 }
-                Write-Output "NO_ESCAPE[ASTRO_TEMP_CLEANUP_PRESERVED]: source=$workspaceTemp; source_state=$($preservedOriginal.State); cleanup=$workspaceTempCleanupPath; cleanup_state=$(if ($null -ne $preservedCleanup) { $preservedCleanup.State } else { '<not-published>' }); file_id=$($workspaceTempLease.RootFileId); disposition_set=$($workspaceTempLease.DispositionSet); cleanup_transition=$($launcherLockCleanupTransaction.CleanupPath)"
+                if ($null -ne $workspaceTempLease -and
+                    $null -ne $workspaceTempLease.Handle -and
+                    -not $workspaceTempLease.Handle.IsClosed) {
+                    try { Close-AstroLauncherTempMutationLease $workspaceTempLease }
+                    catch {
+                        $cleanupErrors += "retained live TEMP handle release failed while preserving source: $($_.Exception.Message)"
+                    }
+                }
+            }
+            if (-not $workspaceTempArchived -or
+                -not $attributionManifestArchived) {
+                $tempSource = Get-AstroPathEntryState $workspaceTemp
+                $manifestSource = Get-AstroPathEntryState $attributionManifest
+                Write-Output "LAUNCHER_ARCHIVE[ASTRO_LAUNCHER_STATE_ARCHIVE_PRESERVED]: transaction=$(if ($null -ne $launcherStateArchiveTransaction) { $launcherStateArchiveTransaction.TransactionPath } else { '<not-published>' }); temp_source=$($tempSource.State); temp_archive=$workspaceTempArchivePath; manifest_source=$($manifestSource.State); manifest_archive=$attributionManifestArchivePath; cleanup_transition=$($launcherLockCleanupTransaction.CleanupPath)"
             }
         }
 
@@ -4403,8 +4712,11 @@ finally {
                     -Transaction $launcherLockCleanupTransaction `
                     -OwnedTargetRoots $ownedTargetRoots `
                     -WorkspaceTemp $workspaceTemp `
-                    -WorkspaceTempCleanupPath $workspaceTempCleanupPath `
+                    -WorkspaceTempArchivePath $workspaceTempArchivePath `
                     -AttributionManifest $attributionManifest `
+                    -AttributionManifestArchivePath `
+                        $attributionManifestArchivePath `
+                    -ArchiveCompletionPath $launcherArchiveCompletionPath `
                     -JobObjectName $launcherTreeJobObjectName `
                     -ExpectedPid $PID
                 if ($protocolCleanup.State -cne 'absent' -or
@@ -4463,18 +4775,6 @@ finally {
             $cleanupErrors += "pinned protocol-directory handle disposal failed: $($_.Exception.Message)"
         }
     }
-    if ($launcherLockRemoved -and
-        $attributionManifestRemoved -and
-        $workspaceTempRemoved -and
-        $cleanupErrors.Count -eq 0 -and
-        -not $workspaceTempParentExisted -and
-        (Test-Path -LiteralPath $workspaceTempParent)) {
-        try { Remove-Item -LiteralPath $workspaceTempParent -Force -ErrorAction Stop }
-        catch {
-            $cleanupErrors += "workspace temporary parent cleanup failed: $($_.Exception.Message)"
-        }
-    }
-
     if ($deferCleanupForLiveChildren) {
         [Console]::Error.WriteLine("LAUNCHER_BOUNDARY[ASTRO_LAUNCHER_CLEANUP_DEFERRED]: exact-session child/job/manifest state is live or unevaluable; target, TEMP, active lock or cleanup transition, and attribution manifest are preserved for tracker-bound recovery")
     }
@@ -4498,11 +4798,11 @@ finally {
     if (-not $deferCleanupForLiveChildren -and
         $cleanupErrors.Count -eq 0 -and
         $launcherLockRemoved -and
-        $attributionManifestRemoved -and
-        $workspaceTempRemoved) {
+        $attributionManifestArchived -and
+        $workspaceTempArchived) {
         Write-Output "CLEANUP[ASTRO_TARGET]: absent: $(($ownedTargetRoots | Sort-Object) -join '; ')"
-        Write-Output "CLEANUP[ASTRO_WORKSPACE_TEMP]: $workspaceTemp is absent"
-        Write-Output "CLEANUP[ASTRO_LAUNCHER_PROTOCOL]: active lock, every transition, and exact attribution manifest are absent"
+        Write-Output "CLEANUP[ASTRO_WORKSPACE_TEMP_ARCHIVE]: source=$workspaceTemp is absent; archive=$workspaceTempArchivePath is present"
+        Write-Output "CLEANUP[ASTRO_LAUNCHER_PROTOCOL]: active lock, every transition, and direct attribution manifest are absent; append-only archive transaction remains at $($launcherStateArchiveTransaction.TransactionPath)"
     }
 }
 
