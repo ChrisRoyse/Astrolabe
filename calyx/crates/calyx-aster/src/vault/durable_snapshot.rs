@@ -33,7 +33,7 @@ where
         }
         self.authorize_external_copy(destination)?;
         self.with_durable_commit_lock(|| {
-            if let Err(copy_error) = copy_tree_verified(source.root(), destination) {
+            if let Err(copy_error) = copy_tree_verified(source.root(), source.root(), destination) {
                 let cleanup = fs::remove_dir_all(destination);
                 return Err(match cleanup {
                     Ok(()) => copy_error,
@@ -52,7 +52,7 @@ where
     }
 }
 
-fn copy_tree_verified(source: &Path, destination: &Path) -> Result<()> {
+fn copy_tree_verified(root: &Path, source: &Path, destination: &Path) -> Result<()> {
     fs::create_dir(destination)
         .map_err(|error| snapshot_io("create destination directory", destination, error))?;
     let mut entries = fs::read_dir(source)
@@ -63,6 +63,18 @@ fn copy_tree_verified(source: &Path, destination: &Path) -> Result<()> {
     for entry in entries {
         let source_path = entry.path();
         let destination_path = destination.join(entry.file_name());
+        let relative = source_path
+            .strip_prefix(root)
+            .map_err(|error| snapshot_path("derive vault-relative path", &source_path, error))?;
+        // These two files coordinate writers; they are not durable vault data.
+        // The snapshot already holds durable.commit.lock, so reading that file
+        // would conflict with our own Windows byte-range lock. A destination
+        // vault creates fresh coordination files when it opens.
+        if relative == Path::new("locks").join("durable.commit.lock")
+            || relative == Path::new("wal").join(".append.lock")
+        {
+            continue;
+        }
         let file_type = entry
             .file_type()
             .map_err(|error| snapshot_io("read source file type", &source_path, error))?;
@@ -77,7 +89,7 @@ fn copy_tree_verified(source: &Path, destination: &Path) -> Result<()> {
             });
         }
         if file_type.is_dir() {
-            copy_tree_verified(&source_path, &destination_path)?;
+            copy_tree_verified(root, &source_path, &destination_path)?;
         } else if file_type.is_file() {
             copy_file_verified(&source_path, &destination_path)?;
         } else {
@@ -156,5 +168,13 @@ fn snapshot_io(action: &str, path: &Path, error: std::io::Error) -> CalyxError {
         code: "CALYX_DURABLE_SNAPSHOT_IO",
         message: format!("{action} {}: {error}", path.display()),
         remediation: "verify the source and transaction-owned destination are writable ordinary files on healthy storage, then retry",
+    }
+}
+
+fn snapshot_path(action: &str, path: &Path, error: std::path::StripPrefixError) -> CalyxError {
+    CalyxError {
+        code: "CALYX_DURABLE_SNAPSHOT_PATH",
+        message: format!("{action} {}: {error}", path.display()),
+        remediation: "preserve the incomplete transaction and inspect the vault root/path boundary before retrying",
     }
 }
