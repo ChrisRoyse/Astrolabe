@@ -4431,13 +4431,17 @@ static char *snippet_suggestions(const char *input, cbm_node_t *nodes, int count
     yyjson_mut_doc_set_root(doc, root);
 
     yyjson_mut_obj_add_str(doc, root, "status", "ambiguous");
+    yyjson_mut_obj_add_str(doc, root, "code", "CBM_NODE_QN_AMBIGUOUS");
 
     char msg[CBM_SZ_512];
     snprintf(msg, sizeof(msg),
-             "%d matches for \"%s\". Pick a qualified_name from suggestions below, "
-             "or use search_graph(name_pattern=\"...\") to narrow results.",
+             "%d stable source atoms match \"%s\". Qualified names are non-unique; "
+             "pick an atom_id from the candidates below.",
              count, input);
     yyjson_mut_obj_add_str(doc, root, "message", msg);
+    yyjson_mut_obj_add_str(
+        doc, root, "remediation",
+        "call search_graph if necessary, select the intended stable atom_id, and retry get_code_snippet with atom_id instead of qualified_name");
 
     yyjson_mut_val *arr = yyjson_mut_arr(doc);
     for (int i = 0; i < count; i++) {
@@ -4455,7 +4459,7 @@ static char *snippet_suggestions(const char *input, cbm_node_t *nodes, int count
     char *json = yy_doc_to_str(doc);
     yyjson_mut_doc_free(doc);
 
-    char *result = cbm_mcp_text_result(json, false);
+    char *result = cbm_mcp_text_result(json, true);
     free(json);
     return result;
 }
@@ -4832,9 +4836,21 @@ static char *handle_get_code_snippet(cbm_mcp_server_t *srv, const char *args) {
         return result;
     }
     if (rc == CBM_STORE_ERR) {
+        cbm_node_t *candidates = NULL;
+        int candidate_count = 0;
+        int candidate_rc = cbm_store_find_nodes_by_qn_suffix(store, effective_project, qn,
+                                                              &candidates, &candidate_count);
+        if (candidate_rc == CBM_STORE_OK && candidate_count > 1) {
+            char *result = snippet_suggestions(qn, candidates, candidate_count);
+            cbm_store_free_nodes(candidates, candidate_count);
+            free(qn);
+            free(project);
+            return result;
+        }
+        cbm_store_free_nodes(candidates, candidate_count);
         char message[CBM_SZ_512];
         snprintf(message, sizeof(message),
-                 "qualified_name lookup is ambiguous or failed for \"%s\"; use search_graph and pass an exact atom_id",
+                 "qualified_name lookup failed for \"%s\" while enumerating stable atom candidates; inspect store logs and rebuild the project if the identity index is invalid",
                  qn);
         free(qn);
         free(project);
