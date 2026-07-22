@@ -305,6 +305,9 @@ $gitExe = 'C:\Program Files\Git\bin\git.exe'
 $artifactHandle = $null
 $receiptHandle = $null
 $launcherLockHandle = $null
+$launcherLockSnapshotBefore = $null
+$launcherJobName = $null
+$launcherJobProbeBefore = $null
 $directoryHandle = $null
 $fsvLockOwned = $false
 $child = $null
@@ -382,6 +385,28 @@ try {
     if (-not (Test-DescendantOf $PID $launcherPid)) {
         Fail-Astro 'ASTRO_FSV_RUNNER_NOT_OWNED' "runner PID $PID is not a descendant of launcher PID $launcherPid" 'invoke this runner synchronously from the launcher-owned child process'
     }
+    try {
+        $launcherRootIdentity =
+            [AstroLauncherLockNative]::GetDirectoryIdentity($workspace)
+        $launcherJobName = Get-AstroLauncherTreeJobObjectName `
+            -RootIdentity $launcherRootIdentity `
+            -LauncherPid $launcherPid `
+            -LauncherProcessStartUtcTicks ([long]$launcherOwner.OwnerProcessStartUtcTicks) `
+            -LauncherLeaseStartUtcTicks ([long]$launcherOwner.LeaseStartUtcTicks) `
+            -LauncherLockSha256 ([string]$launcherOwner.Sha256)
+        $launcherJobProbeBefore =
+            Get-AstroLauncherJobObjectProbe -Name $launcherJobName
+    }
+    catch {
+        Fail-Astro 'ASTRO_FSV_LAUNCHER_JOB_UNEVALUABLE' "could not derive and query the exact launcher Job Object: $($_.Exception.Message)" 'preserve the staged session and repair exact launcher Job attribution before running an artifact'
+    }
+    $launcherJobMembersBefore =
+        [int[]]@($launcherJobProbeBefore.ProcessIds | Sort-Object -Unique)
+    if ($launcherJobProbeBefore.State -cne 'observed' -or
+        $launcherJobMembersBefore -notcontains $launcherPid -or
+        $launcherJobMembersBefore -notcontains $PID) {
+        Fail-Astro 'ASTRO_FSV_LAUNCHER_JOB_MISMATCH' "exact launcher Job does not contain both launcher PID $launcherPid and runner PID $PID (name=$launcherJobName, state=$($launcherJobProbeBefore.State), members=$($launcherJobMembersBefore -join ','), error=$($launcherJobProbeBefore.Error))" 'invoke the runner only as a non-breakaway descendant of the exact live launcher owner'
+    }
 
     $beforeRepo = Get-RepoState $gitExe $workspace
     if ($beforeRepo.head_sha -cne ([string]$receipt.tree_sha).ToLowerInvariant()) {
@@ -397,7 +422,29 @@ try {
     }
     $artifactHashBefore = File-Sha256 $artifact
     $receiptHashBefore = File-Sha256 $receiptFull
-    $launcherLockHashBefore = File-Sha256 $launcherLockPath
+    try {
+        # The launcher's authoritative handle has GENERIC_READ|GENERIC_WRITE|DELETE
+        # access while sharing only reads. This read-only classifier handle must
+        # therefore share read/write/delete to admit that already-open authority.
+        # The launcher's original FILE_SHARE_READ still denies every new writer,
+        # rename, and delete opener for the complete runner lifetime.
+        $launcherLockHandle =
+            [AstroLauncherLockNative]::OpenExactClassifierReadFile($launcherLockPath)
+        $launcherLockSnapshotBefore = Get-AstroExactRetainedFileSnapshot `
+            -Handle $launcherLockHandle `
+            -ExpectedPath $launcherLockPath
+        $launcherLockLinksBefore =
+            [AstroLauncherLockNative]::GetNumberOfLinks($launcherLockHandle)
+    }
+    catch {
+        Fail-Astro 'ASTRO_FSV_LAUNCHER_LEASE_RETAIN_FAILED' "could not retain a read-only exact snapshot of the live launcher lease: $($_.Exception.Message)" 'preserve the staged session and repair the live-lock share/identity contract before running an artifact'
+    }
+    if ($launcherLockLinksBefore -ne 1 -or
+        $launcherLockSnapshotBefore.Sha256 -cne [string]$launcherOwner.Sha256 -or
+        $launcherLockSnapshotBefore.Length -ne [uint64]$launcherOwner.Length) {
+        Fail-Astro 'ASTRO_FSV_LAUNCHER_LEASE_MISMATCH' "retained live launcher-lock identity differs from its authoritative classifier snapshot (links=$launcherLockLinksBefore, retained_sha256=$($launcherLockSnapshotBefore.Sha256), classified_sha256=$($launcherOwner.Sha256))" 'preserve all state and investigate launcher-lock replacement, aliasing, or byte drift'
+    }
+    $launcherLockHashBefore = [string]$launcherLockSnapshotBefore.Sha256
     $artifactItem = Get-Item -LiteralPath $artifact
     if ($artifactHashBefore -cne ([string]$receipt.artifact.sha256).ToLowerInvariant() -or
         [uint64]$artifactItem.Length -ne [uint64]$receipt.artifact.bytes) {
@@ -421,7 +468,6 @@ try {
     $directoryHandle = [AstroFsvAtomicFile]::OpenDirectoryWithoutDeleteShare($sessionDirectory)
     $artifactHandle = [IO.File]::Open($artifact, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
     $receiptHandle = [IO.File]::Open($receiptFull, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
-    $launcherLockHandle = [IO.File]::Open($launcherLockPath, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
     $lockStage = "$fsvLockPath.$PID.tmp"
     $lockManifest = [ordered]@{
         pid = $PID
@@ -434,6 +480,10 @@ try {
         artifact_path = $artifact
         artifact_sha256 = $artifactHashBefore
         launcher_pid = $launcherPid
+        launcher_job = [ordered]@{
+            name = $launcherJobName
+            members = @($launcherJobMembersBefore)
+        }
         owner_pids = @($launcherPid, $PID)
         child_pid = $null
         phase = 'claimed'
@@ -484,6 +534,10 @@ try {
         schema = 'astrolabe.native-fsv-live.v1'
         runner_pid = $PID
         launcher_pid = $launcherPid
+        launcher_job = [ordered]@{
+            name = $launcherJobName
+            members_before = @($launcherJobMembersBefore)
+        }
         child_pid = $child.Id
         issue = $Issue
         tree_sha = [string]$receipt.tree_sha
@@ -501,7 +555,17 @@ try {
 
     $artifactHashAfter = File-Sha256 $artifact
     $receiptHashAfter = File-Sha256 $receiptFull
-    $launcherLockHashAfter = File-Sha256 $launcherLockPath
+    $launcherLockSnapshotAfter = Get-AstroExactRetainedFileSnapshot `
+        -Handle $launcherLockHandle `
+        -ExpectedPath $launcherLockPath
+    $launcherLockLinksAfter =
+        [AstroLauncherLockNative]::GetNumberOfLinks($launcherLockHandle)
+    $launcherLockHashAfter = [string]$launcherLockSnapshotAfter.Sha256
+    $launcherOwnerAfter = Read-AstroLauncherLock -LockPath $launcherLockPath
+    $launcherJobProbeAfter =
+        Get-AstroLauncherJobObjectProbe -Name $launcherJobName
+    $launcherJobMembersAfter =
+        [int[]]@($launcherJobProbeAfter.ProcessIds | Sort-Object -Unique)
     $afterRepo = Get-RepoState $gitExe $workspace
     $stdoutHash = File-Sha256 $StandardOutputPath
     $stderrHash = File-Sha256 $StandardErrorPath
@@ -511,7 +575,23 @@ try {
     $artifactStable = $artifactHashBefore -ceq $artifactHashAfter -and
         [uint64](Get-Item -LiteralPath $artifact).Length -eq [uint64]$receipt.artifact.bytes
     $receiptStable = $receiptHashBefore -ceq $receiptHashAfter
-    $launcherLeaseStable = $launcherLockHashBefore -ceq $launcherLockHashAfter
+    $launcherJobStable = $launcherJobProbeAfter.State -ceq 'observed' -and
+        $launcherJobMembersAfter -contains $launcherPid -and
+        $launcherJobMembersAfter -contains $PID
+    $launcherLeaseStable =
+        $launcherLockLinksAfter -eq 1 -and
+        $launcherLockSnapshotBefore.FileId -ceq $launcherLockSnapshotAfter.FileId -and
+        $launcherLockSnapshotBefore.Length -eq $launcherLockSnapshotAfter.Length -and
+        $launcherLockHashBefore -ceq $launcherLockHashAfter -and
+        [Convert]::ToBase64String($launcherLockSnapshotBefore.Bytes) -ceq
+            [Convert]::ToBase64String($launcherLockSnapshotAfter.Bytes) -and
+        $launcherOwnerAfter.State -ceq 'held' -and
+        $launcherOwnerAfter.Issue -eq $Issue -and
+        $launcherOwnerAfter.OwnerPid -eq $launcherPid -and
+        $launcherOwnerAfter.OwnerProcessStartUtcTicks -eq
+            $launcherOwner.OwnerProcessStartUtcTicks -and
+        $launcherOwnerAfter.Sha256 -ceq $launcherLockHashBefore -and
+        $launcherJobStable
     $verdict = if ($childExitCode -eq 0 -and [bool]$childExitObservation.sources_agree -and
         $treeStable -and $artifactStable -and $receiptStable -and $launcherLeaseStable) {
         'verified'
@@ -534,7 +614,27 @@ try {
         }
         artifact = [ordered]@{ path = $artifact; bytes = [uint64](Get-Item -LiteralPath $artifact).Length; sha256 = $artifactHashAfter; stable = $artifactStable; delete_share_denied_for_run = $true }
         receipt = [ordered]@{ path = $receiptFull; sha256_before = $receiptHashBefore; sha256_after = $receiptHashAfter; stable = $receiptStable }
-        launcher_lease = [ordered]@{ path = $launcherLockPath; sha256_before = $launcherLockHashBefore; sha256_after = $launcherLockHashAfter; stable = $launcherLeaseStable }
+        launcher_lease = [ordered]@{
+            path = $launcherLockPath
+            file_id_before = $launcherLockSnapshotBefore.FileId
+            file_id_after = $launcherLockSnapshotAfter.FileId
+            sha256_before = $launcherLockHashBefore
+            sha256_after = $launcherLockHashAfter
+            links_before = $launcherLockLinksBefore
+            links_after = $launcherLockLinksAfter
+            owner_pid = $launcherPid
+            owner_process_start_utc_ticks = $launcherOwner.OwnerProcessStartUtcTicks
+            lease_start_utc_ticks = $launcherOwner.LeaseStartUtcTicks
+            job = [ordered]@{
+                name = $launcherJobName
+                state_before = $launcherJobProbeBefore.State
+                members_before = @($launcherJobMembersBefore)
+                state_after = $launcherJobProbeAfter.State
+                members_after = @($launcherJobMembersAfter)
+                stable = $launcherJobStable
+            }
+            stable = $launcherLeaseStable
+        }
         argument_count = $argumentCount
         arguments = @($arguments)
         stdout = [ordered]@{ path = $StandardOutputPath; bytes = [uint64](Get-Item -LiteralPath $StandardOutputPath).Length; sha256 = $stdoutHash }
