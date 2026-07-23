@@ -1977,6 +1977,26 @@ pub struct cbm_gbuf {
 }
 pub type cbm_gbuf_t = cbm_gbuf;
 pub type cbm_pipeline_t = cbm_pipeline;
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct cbm_pipeline_error_t {
+    pub code: *const ::std::os::raw::c_char,
+    pub operation: *const ::std::os::raw::c_char,
+    pub phase: *const ::std::os::raw::c_char,
+    pub path: *const ::std::os::raw::c_char,
+    pub message: *const ::std::os::raw::c_char,
+    pub remediation: *const ::std::os::raw::c_char,
+    pub requested: usize,
+}
+impl Default for cbm_pipeline_error_t {
+    fn default() -> Self {
+        let mut s = ::std::mem::MaybeUninit::<Self>::uninit();
+        unsafe {
+            ::std::ptr::write_bytes(s.as_mut_ptr(), 0, 1);
+            s.assume_init()
+        }
+    }
+}
 pub const CBM_PIPELINE_EMPTY_SOURCE_CORPUS: _bindgen_ty_2 = -2001;
 pub type _bindgen_ty_2 = ::std::os::raw::c_int;
 unsafe extern "C" {
@@ -2029,6 +2049,12 @@ unsafe extern "C" {
         nodes: *mut ::std::os::raw::c_int,
         edges: *mut ::std::os::raw::c_int,
     );
+}
+unsafe extern "C" {
+    pub fn cbm_pipeline_get_fatal_error(
+        p: *const cbm_pipeline_t,
+        out: *mut cbm_pipeline_error_t,
+    ) -> bool;
 }
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
