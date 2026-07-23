@@ -8091,6 +8091,76 @@ void cbm_adr_sections_free(cbm_adr_sections_t *s) {
     memset(s, 0, sizeof(*s));
 }
 
+/* Bounded backoff budget for a transient ADR write fault (#1793). Two MCP
+ * sessions can each hold a read-write handle to the same project DB, and a
+ * Windows AV/Search-indexer scan briefly opens the DB/WAL/SHM family — both
+ * surface on the write step as SQLITE_BUSY/LOCKED/IOERR/PROTOCOL even though
+ * busy_timeout already absorbs plain lock waits. These clear on a short retry.
+ * Worst case ≈ 20+40+80+160+320 ms across the 5 retries. */
+enum {
+    ADR_WRITE_MAX_RETRIES = 5,
+    ADR_WRITE_BACKOFF_BASE_US = 20000,
+    ADR_WRITE_BACKOFF_MAX_US = 400000,
+};
+
+/* True for SQLite write faults worth a bounded retry: a peer writer's lock or a
+ * transient filesystem sharing violation. A persistent fault of the same class
+ * simply exhausts the budget and is then returned verbatim, so retries never
+ * hide a real, durable failure. */
+static bool adr_write_rc_is_transient(int rc) {
+    switch (rc & 0xFF) {
+    case SQLITE_BUSY:
+    case SQLITE_LOCKED:
+    case SQLITE_IOERR:
+    case SQLITE_PROTOCOL:
+        return true;
+    default:
+        return false;
+    }
+}
+
+/* Step the ADR upsert with bounded, explicitly-logged retry on transient write
+ * faults (#1793). On terminal failure the store error buffer carries the exact
+ * SQLite message so the MCP layer can surface structured diagnostics; no retry
+ * is silent. */
+static int adr_store_step_with_retry(cbm_store_t *s, sqlite3_stmt *stmt, const char *project) {
+    int rc = SQLITE_OK;
+    for (int attempt = 0; attempt <= ADR_WRITE_MAX_RETRIES; attempt++) {
+        rc = sqlite3_step(stmt);
+        if (rc == SQLITE_DONE) {
+            return rc;
+        }
+        if (!adr_write_rc_is_transient(rc) || attempt == ADR_WRITE_MAX_RETRIES) {
+            break;
+        }
+        int extended = sqlite3_extended_errcode(s->db);
+        int backoff_us = ADR_WRITE_BACKOFF_BASE_US << attempt;
+        if (backoff_us > ADR_WRITE_BACKOFF_MAX_US) {
+            backoff_us = ADR_WRITE_BACKOFF_MAX_US;
+        }
+        char attempt_buf[CBM_SZ_32];
+        char rc_buf[CBM_SZ_32];
+        char ext_buf[CBM_SZ_32];
+        char backoff_buf[CBM_SZ_32];
+        snprintf(attempt_buf, sizeof(attempt_buf), "%d", attempt + 1);
+        snprintf(rc_buf, sizeof(rc_buf), "%d", rc);
+        snprintf(ext_buf, sizeof(ext_buf), "%d", extended);
+        snprintf(backoff_buf, sizeof(backoff_buf), "%d", backoff_us / 1000);
+        cbm_log_warn("store.adr_store.retry", "code", "CBM_STORE_ADR_WRITE_TRANSIENT", "project",
+                     project ? project : "", "db_path", s->db_path ? s->db_path : "(embedded)",
+                     "attempt", attempt_buf, "max_retries", "5", "sqlite_error", rc_buf,
+                     "sqlite_extended_error", ext_buf, "backoff_ms", backoff_buf, "detail",
+                     sqlite3_errmsg(s->db), "remediation",
+                     "transient lock or sharing violation on the ADR write; retrying after backoff");
+        sqlite3_reset(stmt);
+        cbm_usleep((unsigned long)backoff_us);
+    }
+    if (rc != SQLITE_DONE) {
+        store_set_error_sqlite(s, "adr_store step");
+    }
+    return rc;
+}
+
 int cbm_store_adr_store(cbm_store_t *s, const char *project, const char *content) {
     char now[CBM_SZ_32];
     iso_now(now, sizeof(now));
@@ -8102,7 +8172,7 @@ int cbm_store_adr_store(cbm_store_t *s, const char *project, const char *content
         "updated_at=excluded.updated_at";
     sqlite3_stmt *stmt = NULL;
     if (sqlite3_prepare_v2(s->db, sql, CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
-        store_set_error_sqlite(s, "adr_store");
+        store_set_error_sqlite(s, "adr_store prepare");
         return CBM_STORE_ERR;
     }
     /* #503: project and summary content are caller-supplied text; sanitize to
@@ -8111,7 +8181,7 @@ int cbm_store_adr_store(cbm_store_t *s, const char *project, const char *content
     bind_text_utf8(stmt, ST_COL_2, content);
     bind_text(stmt, ST_COL_3, now);
     bind_text(stmt, ST_COL_4, now);
-    int rc = sqlite3_step(stmt);
+    int rc = adr_store_step_with_retry(s, stmt, project);
     sqlite3_finalize(stmt);
     return (rc == SQLITE_DONE) ? CBM_STORE_OK : CBM_STORE_ERR;
 }

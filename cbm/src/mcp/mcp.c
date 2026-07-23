@@ -7266,6 +7266,97 @@ static char *adr_read_legacy_file(const char *root_path) {
     "then draft and store. Sections: PURPOSE, STACK, ARCHITECTURE, "               \
     "PATTERNS, TRADEOFFS, PHILOSOPHY."
 
+/* #1793: ADR writes must never fail opaquely. Every write/open failure carries
+ * the physical DB path, the DB/WAL/SHM presence, the SQLite error code and
+ * message, the failing stage, and a concrete remediation hint — so an
+ * intermittent Windows write fault is diagnosable from the response alone. */
+static void adr_add_family_presence(yyjson_mut_doc *doc, yyjson_mut_val *root,
+                                    const char *db_path) {
+    if (!db_path) {
+        return;
+    }
+    char wal_path[CBM_SZ_4K];
+    char shm_path[CBM_SZ_4K];
+    snprintf(wal_path, sizeof(wal_path), "%s-wal", db_path);
+    snprintf(shm_path, sizeof(shm_path), "%s-shm", db_path);
+    yyjson_mut_obj_add_strcpy(doc, root, "wal_path", wal_path);
+    yyjson_mut_obj_add_strcpy(doc, root, "shm_path", shm_path);
+    yyjson_mut_obj_add_bool(doc, root, "wal_present", cbm_path_exists(wal_path));
+    yyjson_mut_obj_add_bool(doc, root, "shm_present", cbm_path_exists(shm_path));
+}
+
+/* Populate the manage_adr result object with a structured write-error diagnostic
+ * (the store's error buffer/code were set by cbm_store_adr_store after its
+ * bounded transient retries were exhausted). */
+static void adr_fill_write_error(yyjson_mut_doc *doc, yyjson_mut_val *root, cbm_store_t *store,
+                                 const char *project) {
+    const char *db_path = cbm_store_db_path(store);
+    int sqlite_err = cbm_store_error_code(store);
+    const char *detail = cbm_store_error(store);
+
+    yyjson_mut_obj_add_str(doc, root, "status", "write_error");
+    yyjson_mut_obj_add_str(doc, root, "code", "CBM_STORE_ADR_WRITE_FAILED");
+    yyjson_mut_obj_add_str(
+        doc, root, "message",
+        "the ADR upsert into project_summaries failed after bounded transient-fault retries");
+    yyjson_mut_obj_add_str(doc, root, "stage", "sqlite.step.write");
+    yyjson_mut_obj_add_strcpy(doc, root, "project", project ? project : "");
+    yyjson_mut_obj_add_strcpy(doc, root, "db_path",
+                              db_path ? db_path : "(embedded/in-memory store)");
+    yyjson_mut_obj_add_int(doc, root, "sqlite_error", sqlite_err);
+    yyjson_mut_obj_add_strcpy(doc, root, "sqlite_detail", detail ? detail : "");
+    if (db_path) {
+        yyjson_mut_obj_add_bool(doc, root, "db_present", cbm_path_exists(db_path));
+        adr_add_family_presence(doc, root, db_path);
+    }
+    yyjson_mut_obj_add_str(
+        doc, root, "remediation",
+        "another MCP session or the UI may hold a write lock on this project DB, or a Windows "
+        "AV/Search-indexer scan briefly locked the DB/WAL/SHM family. Ensure a single writer, "
+        "exclude the codebase-memory cache directory from real-time AV/indexing, then retry; if "
+        "the SQLite error persists, preserve the DB/WAL/SHM family together and inspect them.");
+}
+
+/* Build a standalone structured error for the case where the dedicated
+ * read-write handle to a resolved (existing) project DB could not be opened. */
+static char *build_adr_open_error(const char *db_path) {
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    if (!doc) {
+        return heap_strdup("{\"status\":\"write_error\",\"code\":\"CBM_STORE_ADR_OPEN_FAILED\","
+                           "\"message\":\"could not open a read-write handle to the project "
+                           "database\",\"remediation\":\"resolve the reported filesystem/SQLite "
+                           "failure and retry\"}");
+    }
+    yyjson_mut_val *root = yyjson_mut_obj(doc);
+    yyjson_mut_doc_set_root(doc, root);
+    yyjson_mut_obj_add_str(doc, root, "status", "write_error");
+    yyjson_mut_obj_add_str(doc, root, "code", "CBM_STORE_ADR_OPEN_FAILED");
+    yyjson_mut_obj_add_str(
+        doc, root, "message",
+        "could not open a dedicated read-write handle to the project database for the ADR write");
+    yyjson_mut_obj_add_str(doc, root, "stage", "sqlite.open_rw");
+    yyjson_mut_obj_add_strcpy(doc, root, "db_path", db_path ? db_path : "");
+    if (db_path) {
+        yyjson_mut_obj_add_bool(doc, root, "db_present", cbm_path_exists(db_path));
+        adr_add_family_presence(doc, root, db_path);
+    }
+    yyjson_mut_obj_add_str(
+        doc, root, "remediation",
+        "the database file exists (project resolved) but a read-write open failed — likely a "
+        "sharing violation from AV/indexing or another process holding it exclusively, a "
+        "read-only file/volume, or a corrupt WAL/SHM. Free the writer, clear the read-only "
+        "attribute, or preserve and inspect the DB/WAL/SHM family, then retry.");
+    char *json = yy_doc_to_str(doc);
+    yyjson_mut_doc_free(doc);
+    if (!json) {
+        return heap_strdup("{\"status\":\"write_error\",\"code\":\"CBM_STORE_ADR_OPEN_FAILED\","
+                           "\"message\":\"could not open a read-write handle to the project "
+                           "database\",\"remediation\":\"resolve the reported filesystem/SQLite "
+                           "failure and retry\"}");
+    }
+    return json;
+}
+
 static char *handle_manage_adr(cbm_mcp_server_t *srv, const char *args) {
     char *project = get_project_arg(args);
     char *mode_str = cbm_mcp_get_string_arg(args, "mode");
@@ -7302,7 +7393,7 @@ static char *handle_manage_adr(cbm_mcp_server_t *srv, const char *args) {
     if (resolved_db_path) {
         owned_rw = cbm_store_open_path(resolved_db_path);
         if (!owned_rw) {
-            char *err = build_no_store_error(srv, project);
+            char *err = build_adr_open_error(resolved_db_path);
             char *res = cbm_mcp_text_result(err, true);
             free(err);
             free(project);
@@ -7340,7 +7431,7 @@ static char *handle_manage_adr(cbm_mcp_server_t *srv, const char *args) {
         if (cbm_store_adr_store(store, project, content) == CBM_STORE_OK) {
             yyjson_mut_obj_add_str(doc, root_obj, "status", "updated");
         } else {
-            yyjson_mut_obj_add_str(doc, root_obj, "status", "write_error");
+            adr_fill_write_error(doc, root_obj, store, project);
             is_error = true;
         }
     } else if (strcmp(mode_str, "sections") == 0) {
