@@ -30,6 +30,7 @@ override CXX := $(CXX) $(ARCHFLAGS)
 #   internal/cbm/vendored/ts_runtime/include — tree-sitter API
 CBM_DIR = internal/cbm
 TS_INCLUDE = $(CBM_DIR)/vendored/ts_runtime/include
+ASTROLABE_PATCH_DIR ?= ../patches/cbm
 # Vendored tree-sitter src/ contains unicode/ headers (umachine.h, utf.h, utf8.h).
 # This ensures we use our vendored copies instead of requiring system libicu-dev.
 TS_SRC = $(CBM_DIR)/vendored/ts_runtime/src
@@ -96,7 +97,8 @@ CXXFLAGS_COMMON = -std=c++14 -Wall -Wextra -Werror \
 # CBM_BIND_TS_ALLOCATOR=1: bind the tree-sitter runtime to mimalloc (#424). Only
 # the prod build uses mimalloc (MI_OVERRIDE=1); the test build is CRT+ASan, where
 # binding would create an alloc/free mismatch, so the guard is prod-only.
-CFLAGS_PROD = $(CFLAGS_COMMON) -O2 -DCBM_BIND_TS_ALLOCATOR=1 $(CFLAGS_EXTRA)
+CFLAGS_PROD = $(CFLAGS_COMMON) -O2 -DCBM_BIND_TS_ALLOCATOR=1 -DASTRO_SPAWN \
+              -I$(ASTROLABE_PATCH_DIR) $(CFLAGS_EXTRA)
 CXXFLAGS_PROD = $(CXXFLAGS_COMMON) -O2
 
 # Windows needs ws2_32 (Winsock), psapi (GetProcessMemoryInfo), shell32
@@ -365,6 +367,11 @@ UNIXCODER_OBJ = $(BUILD_DIR)/unixcoder_blob.o
 $(UNIXCODER_OBJ): $(UNIXCODER_BLOB_SRC) vendored/nomic/code_vectors.bin | $(BUILD_DIR)
 	$(CC) -c -o $@ $<
 
+# Astrolabe-owned, shell-free process spawn used by every production Git query.
+ASTRO_SPAWN_OBJ = $(BUILD_DIR)/prod_astro_spawn.o
+$(ASTRO_SPAWN_OBJ): $(ASTROLABE_PATCH_DIR)/astro_spawn.c $(ASTROLABE_PATCH_DIR)/astro_spawn.h | $(BUILD_DIR)
+	$(CC) $(CFLAGS_PROD) -c -o $@ $<
+
 # ── Production binary ────────────────────────────────────────────
 
 # Grammar/TS/LSP objects for production (compiled with relaxed warnings, -O2)
@@ -397,7 +404,7 @@ ZSTD_OBJ_PROD = $(BUILD_DIR)/prod_zstd.o
 $(BUILD_DIR)/prod_zstd.o: $(CBM_DIR)/vendored/zstd/zstd.c | $(BUILD_DIR)
 	$(CC) -std=c11 -D_DEFAULT_SOURCE -O2 -w -I$(CBM_DIR)/vendored/zstd -c -o $@ $<
 
-OBJS_VENDORED_PROD = $(MIMALLOC_OBJ_PROD) $(SQLITE3_OBJ_PROD) $(TRE_OBJ_PROD) $(GRAMMAR_OBJS_PROD) $(TS_RUNTIME_OBJ_PROD) $(LSP_OBJ_PROD) $(PP_OBJ_PROD) $(LZ4_OBJ_PROD) $(ZSTD_OBJ_PROD) $(UNIXCODER_OBJ)
+OBJS_VENDORED_PROD = $(MIMALLOC_OBJ_PROD) $(SQLITE3_OBJ_PROD) $(TRE_OBJ_PROD) $(GRAMMAR_OBJS_PROD) $(TS_RUNTIME_OBJ_PROD) $(LSP_OBJ_PROD) $(PP_OBJ_PROD) $(LZ4_OBJ_PROD) $(ZSTD_OBJ_PROD) $(UNIXCODER_OBJ) $(ASTRO_SPAWN_OBJ)
 
 MAIN_SRC = src/main.c
 

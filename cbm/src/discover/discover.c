@@ -15,6 +15,7 @@
 #include "foundation/compat_fs.h"
 #include "foundation/log.h"
 #include "foundation/platform.h"
+#include "astro_spawn.h"
 #ifdef _WIN32
 #include "foundation/win_utf8.h"
 #endif
@@ -204,19 +205,6 @@ static bool str_contains(const char *s, const char *sub) {
 
 /* ── Git global excludes resolution ───────────────────────────── */
 
-enum { GIT_TILDE_PREFIX_LEN = 2 }; /* "~/". */
-
-static bool ascii_ieq(const char *a, const char *b) {
-    while (*a && *b) {
-        if (tolower((unsigned char)*a) != tolower((unsigned char)*b)) {
-            return false;
-        }
-        a++;
-        b++;
-    }
-    return *a == '\0' && *b == '\0';
-}
-
 static char *trim_ws(char *s) {
     while (*s && isspace((unsigned char)*s)) {
         s++;
@@ -229,40 +217,12 @@ static char *trim_ws(char *s) {
     return s;
 }
 
-static void strip_inline_comment(char *s) {
-    bool in_quote = false;
-    char quote = '\0';
-    for (char *p = s; *p; p++) {
-        if ((*p == '"' || *p == '\'') && (p == s || p[-1] != '\\')) {
-            if (!in_quote) {
-                in_quote = true;
-                quote = *p;
-            } else if (*p == quote) {
-                in_quote = false;
-            }
-            continue;
-        }
-        if (!in_quote && (*p == '#' || *p == ';') && (p == s || isspace((unsigned char)p[-1]))) {
-            *p = '\0';
-            return;
-        }
-    }
-}
-
-static char *strip_matching_quotes(char *s) {
-    size_t len = strlen(s);
-    if (len >= CBM_QUOTE_PAIR && ((s[0] == '"' && s[len - SKIP_ONE] == '"') ||
-                                  (s[0] == '\'' && s[len - SKIP_ONE] == '\''))) {
-        s[len - SKIP_ONE] = '\0';
-        return s + SKIP_ONE;
-    }
-    return s;
-}
-
 static bool has_trailing_sep(const char *path) {
     size_t len = strlen(path);
     return len > 0 && (path[len - SKIP_ONE] == '/' || path[len - SKIP_ONE] == '\\');
 }
+
+static bool discover_path_is_absolute(const char *path);
 
 static void path_join(char *out, size_t out_sz, const char *base, const char *rel) {
     if (!out || out_sz == 0) {
@@ -278,87 +238,6 @@ static void path_join(char *out, size_t out_sz, const char *base, const char *re
         snprintf(out, out_sz, "%s/%s", base, rel);
     }
     cbm_normalize_path_sep(out);
-}
-
-static bool expand_git_path(const char *path, char *out, size_t out_sz) {
-    if (!path || !path[0] || !out || out_sz == 0) {
-        return false;
-    }
-    char normalized[CBM_SZ_4K];
-    snprintf(normalized, sizeof(normalized), "%s", path);
-    cbm_normalize_path_sep(normalized);
-
-    if (normalized[0] != '~') {
-        snprintf(out, out_sz, "%s", normalized);
-        cbm_normalize_path_sep(out);
-        return out[0] != '\0';
-    }
-
-    if (normalized[1] != '\0' && normalized[1] != '/') {
-        return false; /* ~user expansion is intentionally not supported. */
-    }
-
-    const char *home = cbm_get_home_dir();
-    if (!home || home[0] == '\0') {
-        return false;
-    }
-    if (normalized[1] == '\0') {
-        snprintf(out, out_sz, "%s", home);
-        cbm_normalize_path_sep(out);
-    } else {
-        path_join(out, out_sz, home, normalized + GIT_TILDE_PREFIX_LEN);
-    }
-    return out[0] != '\0';
-}
-
-static bool read_core_excludes_file(const char *config_path, char *out, size_t out_sz) {
-    FILE *f = cbm_fopen(config_path, "r");
-    if (!f) {
-        return false;
-    }
-
-    bool in_core = false;
-    bool found = false;
-    char line[CBM_SZ_4K];
-    while (fgets(line, sizeof(line), f)) {
-        char *s = trim_ws(line);
-        if (s[0] == '\0' || s[0] == '#' || s[0] == ';') {
-            continue;
-        }
-
-        if (s[0] == '[') {
-            char *end = strchr(s, ']');
-            if (!end) {
-                in_core = false;
-                continue;
-            }
-            *end = '\0';
-            in_core = ascii_ieq(trim_ws(s + SKIP_ONE), "core");
-            continue;
-        }
-
-        if (!in_core) {
-            continue;
-        }
-
-        char *eq = strchr(s, '=');
-        if (!eq) {
-            continue;
-        }
-        *eq = '\0';
-        char *key = trim_ws(s);
-        char *value = trim_ws(eq + SKIP_ONE);
-        strip_inline_comment(value);
-        value = strip_matching_quotes(trim_ws(value));
-
-        if (ascii_ieq(key, "excludesfile") && value[0] != '\0' &&
-            expand_git_path(value, out, out_sz)) {
-            found = true;
-        }
-    }
-
-    fclose(f);
-    return found;
 }
 
 static bool resolve_xdg_git_config_dir(char *out, size_t out_sz) {
@@ -377,28 +256,121 @@ static bool resolve_xdg_git_config_dir(char *out, size_t out_sz) {
     return out[0] != '\0';
 }
 
-static bool resolve_global_excludes_path(char *out, size_t out_sz) {
-    char config_path[CBM_SZ_4K];
+typedef enum {
+    GLOBAL_EXCLUDES_RESOLUTION_FAILED = -1,
+    GLOBAL_EXCLUDES_DEFAULT = 0,
+    GLOBAL_EXCLUDES_EXPLICIT = 1,
+} global_excludes_resolution_t;
 
-    const char *home = cbm_get_home_dir();
-    if (home && home[0] != '\0') {
-        path_join(config_path, sizeof(config_path), home, ".gitconfig");
-        if (read_core_excludes_file(config_path, out, out_sz)) {
-            return true;
-        }
+static void log_global_excludes_resolution_failed(const char *code, const char *operation,
+                                                  const char *repo_path, const char *detail,
+                                                  const char *native_error) {
+    cbm_log_error("discover.failed", "code", code, "operation", operation, "path", repo_path,
+                  "detail", detail ? detail : "", "native_error",
+                  native_error ? native_error : "", "message",
+                  "the complete Git global exclusion policy could not be resolved",
+                  "remediation",
+                  "restore Git configuration and the Git executable, then retry indexing");
+}
+
+static bool write_resolved_git_path(const char *repo_path, const char *path, char *out,
+                                    size_t out_sz) {
+    if (!repo_path || !repo_path[0] || !path || !path[0] || !out || out_sz == 0) {
+        return false;
     }
 
+    int written;
+    if (discover_path_is_absolute(path)) {
+        written = snprintf(out, out_sz, "%s", path);
+    } else if (has_trailing_sep(repo_path)) {
+        written = snprintf(out, out_sz, "%s%s", repo_path, path);
+    } else {
+        written = snprintf(out, out_sz, "%s/%s", repo_path, path);
+    }
+    if (written < 0 || (size_t)written >= out_sz) {
+        out[0] = '\0';
+        return false;
+    }
+    cbm_normalize_path_sep(out);
+    return true;
+}
+
+static global_excludes_resolution_t resolve_default_global_excludes_path(
+    const char *repo_path, char *out, size_t out_sz) {
     char xdg_config[CBM_SZ_4K];
-    if (resolve_xdg_git_config_dir(xdg_config, sizeof(xdg_config))) {
-        path_join(config_path, sizeof(config_path), xdg_config, "git/config");
-        if (read_core_excludes_file(config_path, out, out_sz)) {
-            return true;
+    if (!resolve_xdg_git_config_dir(xdg_config, sizeof(xdg_config)) ||
+        !write_resolved_git_path(xdg_config, "git/ignore", out, out_sz)) {
+        log_global_excludes_resolution_failed(
+            "CBM_DISCOVER_GLOBAL_EXCLUDE_DEFAULT_UNRESOLVED", "resolve_default_global_exclude",
+            repo_path, "XDG_CONFIG_HOME and the user home directory did not yield a safe path",
+            "");
+        return GLOBAL_EXCLUDES_RESOLUTION_FAILED;
+    }
+    return GLOBAL_EXCLUDES_DEFAULT;
+}
+
+static global_excludes_resolution_t resolve_global_excludes_path(const char *repo_path, char *out,
+                                                                  size_t out_sz) {
+    /*
+     * Git configuration is a precedence-ordered language, not an INI file:
+     * system/global/local/worktree scopes, include/includeIf, environment-provided
+     * config, and path interpolation all affect the effective value. Ask Git's
+     * own parser through the shell-free spawn boundary instead of maintaining a
+     * partial second implementation here.
+     */
+    const char *argv[] = {"git", "-C", repo_path, "config", "--path", "--get",
+                          "core.excludesFile", NULL};
+    char *data = NULL;
+    size_t data_len = 0;
+    cbm_spawn_error_t spawn_error;
+    int spawn_rc = cbm_spawn_capture(argv, &data, &data_len, &spawn_error);
+    if (spawn_rc != 0) {
+        /*
+         * `git config --get` returns 1, with no output, when the key has no
+         * effective value. That is not a failed read: Git then uses the optional
+         * XDG default. Every other exit/spawn/read outcome is a real loss of
+         * policy information and must cancel discovery.
+         */
+        if (spawn_error.code == CBM_SPAWN_E_EXIT && spawn_error.exit_code == 1 &&
+            data_len == 0) {
+            free(data);
+            return resolve_default_global_excludes_path(repo_path, out, out_sz);
         }
-        path_join(out, out_sz, xdg_config, "git/ignore");
-        return out[0] != '\0';
+
+        char native_error[32];
+        char detail[128];
+        snprintf(native_error, sizeof(native_error), "%lu", spawn_error.os_error);
+        snprintf(detail, sizeof(detail), "%s (exit=%d)", spawn_error.code_name,
+                 spawn_error.exit_code);
+        log_global_excludes_resolution_failed("CBM_DISCOVER_GIT_CONFIG_RESOLVE_FAILED",
+                                              "resolve_core_excludes_file", repo_path, detail,
+                                              native_error);
+        free(data);
+        return GLOBAL_EXCLUDES_RESOLUTION_FAILED;
     }
 
-    return false;
+    while (data_len > 0 && (data[data_len - SKIP_ONE] == '\n' ||
+                            data[data_len - SKIP_ONE] == '\r')) {
+        data[--data_len] = '\0';
+    }
+    if (data_len == 0 || memchr(data, '\0', data_len) != NULL ||
+        memchr(data, '\n', data_len) != NULL || memchr(data, '\r', data_len) != NULL) {
+        log_global_excludes_resolution_failed(
+            "CBM_DISCOVER_GIT_CONFIG_OUTPUT_INVALID", "decode_core_excludes_file", repo_path,
+            "git config returned an empty, multiline, or embedded-NUL path", "");
+        free(data);
+        return GLOBAL_EXCLUDES_RESOLUTION_FAILED;
+    }
+    if (!write_resolved_git_path(repo_path, data, out, out_sz)) {
+        log_global_excludes_resolution_failed(
+            "CBM_DISCOVER_GLOBAL_EXCLUDE_PATH_INVALID", "resolve_core_excludes_file_path",
+            repo_path, "the resolved core.excludesFile path is empty or exceeds the path limit",
+            "");
+        free(data);
+        return GLOBAL_EXCLUDES_RESOLUTION_FAILED;
+    }
+    free(data);
+    return GLOBAL_EXCLUDES_EXPLICIT;
 }
 
 /* ── Public filter functions ─────────────────────── */
@@ -1102,10 +1074,16 @@ static bool load_ignore_policy(const char *path, bool optional, const char *code
     if (cbm_gitignore_load_checked(path, optional, out) == 0) {
         return true;
     }
-    char native_error[32];
-    snprintf(native_error, sizeof(native_error), "%lu", (unsigned long)errno);
-    cbm_log_error("discover.failed", "code", code, "operation", operation, "path", path,
-                  "native_error", native_error, "message",
+    /* The loader reports failures through errno (a C library error code), NOT a
+     * Win32 native error. Log it under distinct `errno`/`errno_name` keys: the
+     * former "native_error" key made a reader interpret e.g. errno=EIO(5) as the
+     * Win32 code 5 = ERROR_ACCESS_DENIED, which is a different, misleading
+     * failure. */
+    int saved_errno = errno;
+    char errno_num[32];
+    snprintf(errno_num, sizeof(errno_num), "%d", saved_errno);
+    cbm_log_error("discover.failed", "code", code, "operation", operation, "path", path, "errno",
+                  errno_num, "errno_name", strerror(saved_errno), "message",
                   "the complete ignore policy could not be read", "remediation",
                   "restore the ignore input and retry indexing");
     return false;
@@ -1236,13 +1214,11 @@ int cbm_discover_ex(const char *repo_path, const cbm_discover_opts_t *opts, cbm_
      * worktrees are excluded only via .git/info/exclude (e.g. Sandcastle). */
     cbm_gitignore_t *gitignore = NULL;
     char gi_path[CBM_SZ_4K];
-    struct stat gi_stat;
     /* Resolve the git common dir, transparently following a worktree gitlink so the
      * .git/info/exclude and core.excludesfile sources are honoured inside linked
      * worktrees too (where .git is a file pointing at the shared dir, not a directory). */
     char git_common_dir[CBM_SZ_4K];
     bool is_git_repo = resolve_git_common_dir(repo_path, git_common_dir, sizeof(git_common_dir));
-    bool has_git_config = false;
     /* Always honour the .gitignore at the indexed-directory root, even when the
      * directory is not a git repo root (e.g. indexing a sub-package directly).
      * Fixes issue #510: a root .gitignore was silently ignored without .git/. */
@@ -1252,9 +1228,6 @@ int cbm_discover_ex(const char *repo_path, const cbm_discover_opts_t *opts, cbm_
         return CBM_NOT_FOUND;
     }
     if (is_git_repo) {
-        path_join(gi_path, sizeof(gi_path), git_common_dir, "config");
-        has_git_config = wide_stat(gi_path, &gi_stat) == 0 && S_ISREG(gi_stat.st_mode);
-
         char exc_path[CBM_SZ_4K];
         path_join(exc_path, sizeof(exc_path), git_common_dir, "info/exclude");
         cbm_gitignore_t *git_exclude = NULL;
@@ -1283,8 +1256,15 @@ int cbm_discover_ex(const char *repo_path, const cbm_discover_opts_t *opts, cbm_
     }
 
     cbm_gitignore_t *global_gi = NULL;
-    if (has_git_config && resolve_global_excludes_path(gi_path, sizeof(gi_path))) {
-        if (!load_ignore_policy(gi_path, false, "CBM_DISCOVER_GLOBAL_EXCLUDE_READ_FAILED",
+    if (is_git_repo) {
+        global_excludes_resolution_t global_resolution =
+            resolve_global_excludes_path(repo_path, gi_path, sizeof(gi_path));
+        if (global_resolution == GLOBAL_EXCLUDES_RESOLUTION_FAILED) {
+            cbm_gitignore_free(gitignore);
+            return CBM_NOT_FOUND;
+        }
+        bool optional = global_resolution == GLOBAL_EXCLUDES_DEFAULT;
+        if (!load_ignore_policy(gi_path, optional, "CBM_DISCOVER_GLOBAL_EXCLUDE_READ_FAILED",
                                 "read_global_exclude", &global_gi)) {
             cbm_gitignore_free(gitignore);
             return CBM_NOT_FOUND;
