@@ -713,10 +713,10 @@ void cbm_pxc_run_one(CBMLanguage lang, CBMFileResult *r, const char *source, int
     }
 
     if (!pxc_append_results(&r->arena, &r->resolved_calls, &out)) {
-        r->has_error = true;
-        r->error_msg = cbm_arena_strdup(
-            &r->arena, "[CBM_LSP_RESULT_APPEND_FAILED] resolved-call results could not be "
-                       "retained; remediation: free memory or reduce repository size, then retry");
+        cbm_file_result_set_error(
+            r, "CBM_LSP_RESULT_APPEND_FAILED", "pxc_append_results", "cross_file_lsp",
+            (size_t)out.count, "resolved-call results could not be retained",
+            "free memory or reduce repository size, then retry the complete corpus");
     }
     cbm_arena_destroy(&scratch);
 }
@@ -736,10 +736,10 @@ void cbm_pxc_run_one_ts(CBMFileResult *r, const char *source, int source_len, co
                          def_count, imp_names, imp_qns, imp_count, r->cached_tree, &out);
 
     if (!pxc_append_results(&r->arena, &r->resolved_calls, &out)) {
-        r->has_error = true;
-        r->error_msg = cbm_arena_strdup(
-            &r->arena, "[CBM_LSP_RESULT_APPEND_FAILED] resolved-call results could not be "
-                       "retained; remediation: free memory or reduce repository size, then retry");
+        cbm_file_result_set_error(
+            r, "CBM_LSP_RESULT_APPEND_FAILED", "pxc_append_results", "cross_file_lsp",
+            (size_t)out.count, "resolved-call results could not be retained",
+            "free memory or reduce repository size, then retry the complete corpus");
     }
     cbm_arena_destroy(&scratch);
 }

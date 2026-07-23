@@ -956,6 +956,25 @@ impl Default for CBMChannelArray {
 }
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
+pub struct CBMExtractionError {
+    pub code: *const ::std::os::raw::c_char,
+    pub operation: *const ::std::os::raw::c_char,
+    pub phase: *const ::std::os::raw::c_char,
+    pub message: *const ::std::os::raw::c_char,
+    pub remediation: *const ::std::os::raw::c_char,
+    pub requested: usize,
+}
+impl Default for CBMExtractionError {
+    fn default() -> Self {
+        let mut s = ::std::mem::MaybeUninit::<Self>::uninit();
+        unsafe {
+            ::std::ptr::write_bytes(s.as_mut_ptr(), 0, 1);
+            s.assume_init()
+        }
+    }
+}
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
 pub struct CBMFileResult {
     pub arena: CBMArena,
     pub defs: CBMDefArray,
@@ -980,6 +999,7 @@ pub struct CBMFileResult {
     pub macros: *mut *const ::std::os::raw::c_char,
     pub has_error: bool,
     pub error_msg: *const ::std::os::raw::c_char,
+    pub error: CBMExtractionError,
     pub is_test_file: bool,
     pub imports_count: ::std::os::raw::c_int,
     pub cached_tree: *mut TSTree,
@@ -1091,6 +1111,17 @@ unsafe extern "C" {
         extra_defines: *mut *const ::std::os::raw::c_char,
         include_paths: *mut *const ::std::os::raw::c_char,
     ) -> *mut CBMFileResult;
+}
+unsafe extern "C" {
+    pub fn cbm_file_result_set_error(
+        result: *mut CBMFileResult,
+        code: *const ::std::os::raw::c_char,
+        operation: *const ::std::os::raw::c_char,
+        phase: *const ::std::os::raw::c_char,
+        requested: usize,
+        message: *const ::std::os::raw::c_char,
+        remediation: *const ::std::os::raw::c_char,
+    );
 }
 unsafe extern "C" {
     pub fn cbm_free_result(result: *mut CBMFileResult);

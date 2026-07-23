@@ -5705,21 +5705,40 @@ typedef struct {
  * pre-2026-03 Windows 1 MB main thread) on the definitions pass, and its
  * `top < 4096` push guards SILENTLY DROPPED every top-level definition past
  * 4096. Use a growable heap stack instead: a tiny initial footprint that doubles
- * on demand, bounded by a generous, env-configurable ceiling that WARNs (once)
- * rather than dropping — so a file with thousands of top-level defs is fully
- * extracted, and a pathological one degrades to a warned, bounded skip instead
- * of an OOM or a stack overflow. */
+ * on demand, bounded by a generous, env-configurable ceiling that fails the
+ * complete file with an exact structured diagnostic rather than dropping — so
+ * a file with thousands of top-level defs is fully extracted, and a
+ * pathological one cannot publish a partial graph. */
 typedef struct {
     walk_defs_frame_t *data;
     int top;
     int cap;
     const char *path; // for the WARN when the ceiling is hit (may be NULL)
     bool failed;
+    const char *error_code;
+    const char *error_operation;
+    const char *error_message;
+    const char *error_remediation;
+    size_t error_requested;
 } wd_stack_t;
+
+static void wd_fail(wd_stack_t *s, const char *code, const char *operation, size_t requested,
+                    const char *message, const char *remediation) {
+    if (!s || s->failed) {
+        return;
+    }
+    s->failed = true;
+    s->error_code = code;
+    s->error_operation = operation;
+    s->error_requested = requested;
+    s->error_message = message;
+    s->error_remediation = remediation;
+}
 
 // Generous safety ceiling (frames), env-overridable via CBM_WALK_DEFS_MAX.
 // Realistic files never approach this; it only bounds a pathological/adversarial
-// file so extraction degrades to a warned skip rather than unbounded memory.
+// file so extraction refuses before publication rather than consuming
+// unbounded memory.
 static int wd_stack_max(void) {
     const char *e = getenv("CBM_WALK_DEFS_MAX");
     if (e) {
@@ -5739,7 +5758,9 @@ static bool wd_push(wd_stack_t *s, TSNode node, const char *enclosing_qn) {
         int ncap = 256;
         if (s->cap > 0) {
             if (s->cap > INT32_MAX / 2) {
-                s->failed = true;
+                wd_fail(s, "CBM_WALK_DEFS_CAP_OVERFLOW", "walk_defs_grow", (size_t)s->cap,
+                        "definition traversal capacity would overflow",
+                        "split the generated source file and retry");
                 cbm_log_error("extract.walk_defs_failed", "code", "CBM_WALK_DEFS_CAP_OVERFLOW",
                               "path", s->path ? s->path : "", "message",
                               "definition traversal capacity would overflow", "remediation",
@@ -5757,7 +5778,10 @@ static bool wd_push(wd_stack_t *s, TSNode node, const char *enclosing_qn) {
                           "definition traversal exceeded its declared frame limit", "remediation",
                           "split the generated source file or raise CBM_WALK_DEFS_MAX deliberately "
                           "and retry");
-            s->failed = true;
+            wd_fail(s, "CBM_WALK_DEFS_CAP_EXCEEDED", "walk_defs_grow", (size_t)ncap,
+                    "definition traversal exceeded its declared frame limit",
+                    "split the generated source file or raise CBM_WALK_DEFS_MAX deliberately and "
+                    "retry");
             return false;
         }
         walk_defs_frame_t *nd = realloc(s->data, (size_t)ncap * sizeof(*nd));
@@ -5767,7 +5791,10 @@ static bool wd_push(wd_stack_t *s, TSNode node, const char *enclosing_qn) {
                           "definition traversal frame allocation failed", "remediation",
                           "free memory or reduce the source file, then retry; partial definitions "
                           "were discarded");
-            s->failed = true;
+            wd_fail(s, "CBM_WALK_DEFS_ALLOCATION_FAILED", "walk_defs_grow",
+                    (size_t)ncap * sizeof(*nd), "definition traversal frame allocation failed",
+                    "free memory or reduce the source file, then retry; partial definitions were "
+                    "discarded");
             return false;
         }
         s->data = nd;
@@ -5802,7 +5829,9 @@ static TSNode *wd_collect_children(wd_stack_t *s, TSNode node, uint32_t cc) {
                       s->path ? s->path : "", "message",
                       "syntax node child count exceeds addressable traversal capacity",
                       "remediation", "split the generated source file and retry");
-        s->failed = true;
+        wd_fail(s, "CBM_WALK_DEFS_CHILD_OVERFLOW", "walk_defs_collect_children", (size_t)cc,
+                "syntax node child count exceeds addressable traversal capacity",
+                "split the generated source file and retry");
         return NULL;
     }
     TSNode *buf = (TSNode *)malloc((size_t)cc * sizeof(TSNode));
@@ -5812,7 +5841,10 @@ static TSNode *wd_collect_children(wd_stack_t *s, TSNode node, uint32_t cc) {
             s->path ? s->path : "", "message", "wide-node child collection allocation failed",
             "remediation",
             "free memory or reduce the source file, then retry; no quadratic fallback was used");
-        s->failed = true;
+        wd_fail(s, "CBM_WALK_DEFS_ALLOCATION_FAILED", "walk_defs_collect_children",
+                (size_t)cc * sizeof(TSNode), "wide-node child collection allocation failed",
+                "free memory or reduce the source file, then retry; no quadratic fallback was "
+                "used");
         return NULL;
     }
     TSTreeCursor cur = ts_tree_cursor_new(node);
@@ -5830,7 +5862,9 @@ static TSNode *wd_collect_children(wd_stack_t *s, TSNode node, uint32_t cc) {
             s->path ? s->path : "", "message",
             "tree-sitter cursor child count disagreed with the syntax node", "remediation",
             "reproduce with the exact source and grammar; do not accept partial extraction");
-        s->failed = true;
+        wd_fail(s, "CBM_WALK_DEFS_CURSOR_MISMATCH", "tree_sitter_cursor", 0,
+                "tree-sitter cursor child count disagreed with the syntax node",
+                "reproduce with the exact source and grammar; do not accept partial extraction");
         return NULL;
     }
     return buf;
@@ -6510,9 +6544,16 @@ static void walk_defs(CBMExtractCtx *ctx, TSNode root, const CBMLangSpec *spec, 
     }
     free(s.data);
     if (s.failed) {
-        ctx->result->has_error = true;
-        ctx->result->error_msg = cbm_arena_strdup(
-            ctx->arena, "definition traversal failed; no partial extraction may be persisted");
+        cbm_file_result_set_error(
+            ctx->result, s.error_code ? s.error_code : "CBM_WALK_DEFS_FAILED",
+            s.error_operation ? s.error_operation : "walk_defs", "definitions",
+            s.error_requested,
+            s.error_message
+                ? s.error_message
+                : "definition traversal failed; no partial extraction may be persisted",
+            s.error_remediation
+                ? s.error_remediation
+                : "inspect the exact traversal failure, fix the cause, then retry the corpus");
     }
 }
 

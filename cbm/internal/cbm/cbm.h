@@ -438,6 +438,21 @@ typedef struct {
     int cap;
 } CBMChannelArray;
 
+/* Exact first failure from authoritative per-file extraction.
+ *
+ * Every pointer is borrowed from a static string or the result arena and is
+ * valid until cbm_free_result(). `requested` is the failed allocation/limit
+ * quantity when one exists, otherwise zero. The structured fields are the
+ * contract; error_msg below remains only for older consumers. */
+typedef struct {
+    const char *code;
+    const char *operation;
+    const char *phase;
+    const char *message;
+    const char *remediation;
+    size_t requested;
+} CBMExtractionError;
+
 // Full extraction result for one file.
 typedef struct {
     CBMArena arena; // owns all string memory
@@ -466,6 +481,7 @@ typedef struct {
 
     bool has_error;
     const char *error_msg;
+    CBMExtractionError error;
     bool is_test_file;
     int imports_count;
     TSTree *cached_tree;     // retained parse tree (caller frees via cbm_free_tree)
@@ -559,6 +575,12 @@ CBMFileResult *cbm_extract_file(const char *source, int source_len, CBMLanguage 
                                 const char **extra_defines, // NULL-terminated, or NULL
                                 const char **include_paths  // NULL-terminated, or NULL
 );
+
+/* Set the first authoritative failure on a file result. Later failures do not
+ * overwrite it, so callers receive one deterministic causal diagnostic. */
+void cbm_file_result_set_error(CBMFileResult *result, const char *code, const char *operation,
+                               const char *phase, size_t requested, const char *message,
+                               const char *remediation);
 
 // Free all memory associated with a result.
 void cbm_free_result(CBMFileResult *result);

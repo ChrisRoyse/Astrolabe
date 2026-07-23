@@ -12,7 +12,22 @@
  */
 #include "foundation/constants.h"
 
-enum { CBM_DIR_PERMS = 0755, PL_RING = 4, PL_RING_MASK = 3, PL_SEQ_PASSES = 6, PL_WAL_BUF = 1040 };
+enum {
+    CBM_DIR_PERMS = 0755,
+    PL_RING = 4,
+    PL_RING_MASK = 3,
+    PL_SEQ_PASSES = 6,
+    PL_WAL_BUF = 1040,
+    PL_ERROR_CODE = 128,
+    PL_ERROR_OPERATION = 160,
+    PL_ERROR_PHASE = 64,
+    /* Windows permits a 32,767-code-unit path. Four UTF-8 bytes per code
+     * unit plus NUL retains the exact relative path without allocating on the
+     * failure path. */
+    PL_ERROR_PATH = 131072,
+    PL_ERROR_MESSAGE = 512,
+    PL_ERROR_REMEDIATION = 512
+};
 #include "pipeline/pipeline.h"
 #include "pipeline/artifact.h"
 #include "pipeline/pipeline_internal.h"
@@ -165,13 +180,23 @@ struct cbm_pipeline {
     char **excluded_dirs;
     int excluded_count;
 
-    /* Per-file indexing failures (skipped files) surfaced via MCP/CLI/logfile
-     * (Stage 2 / Track B). A skip is the expected handled outcome of a bad or
-     * oversized file — the run still succeeds ("indexed"). Owned by the
+    /* Per-file indexing failures surfaced through the terminal structured
+     * response (Stage 2 / Track B). Any entry blocks publication. Owned by the
      * pipeline; freed in cbm_pipeline_free. */
     cbm_file_error_t *file_errors;
     int file_errors_count;
     int file_errors_cap;
+
+    /* Exact first fatal diagnostic. Fixed storage guarantees the reporting
+     * path remains available even when allocation itself is the failure. */
+    bool fatal_error_present;
+    char fatal_error_code[PL_ERROR_CODE];
+    char fatal_error_operation[PL_ERROR_OPERATION];
+    char fatal_error_phase[PL_ERROR_PHASE];
+    char fatal_error_path[PL_ERROR_PATH];
+    char fatal_error_message[PL_ERROR_MESSAGE];
+    char fatal_error_remediation[PL_ERROR_REMEDIATION];
+    size_t fatal_error_requested;
 
     /* User-defined extension overrides (loaded once per run) */
     cbm_userconfig_t *userconfig;
@@ -411,7 +436,8 @@ void cbm_pipeline_add_file_error(cbm_pipeline_t *p, const char *path, const char
         cbm_file_error_t *grown =
             (cbm_file_error_t *)realloc(p->file_errors, (size_t)ncap * sizeof(*grown));
         if (!grown) {
-            /* Never abort indexing just to record a skip — drop this record. */
+            /* The extraction barrier independently rejects every missing
+             * non-empty result, even if this diagnostic inventory cannot grow. */
             return;
         }
         p->file_errors = grown;
@@ -440,6 +466,166 @@ void cbm_pipeline_get_committed_counts(const cbm_pipeline_t *p, int *nodes, int 
     if (edges) {
         *edges = p ? p->committed_edges : -1;
     }
+}
+
+bool cbm_pipeline_get_fatal_error(const cbm_pipeline_t *p, cbm_pipeline_error_t *out) {
+    if (out) {
+        memset(out, 0, sizeof(*out));
+    }
+    if (!p || !out || !p->fatal_error_present) {
+        return false;
+    }
+    out->code = p->fatal_error_code;
+    out->operation = p->fatal_error_operation;
+    out->phase = p->fatal_error_phase;
+    out->path = p->fatal_error_path;
+    out->message = p->fatal_error_message;
+    out->remediation = p->fatal_error_remediation;
+    out->requested = p->fatal_error_requested;
+    return true;
+}
+
+static void cbm_pipeline_record_fatal_error(cbm_pipeline_t *p, const char *code,
+                                            const char *operation, const char *phase,
+                                            const char *path, size_t requested,
+                                            const char *message, const char *remediation) {
+    if (!p || p->fatal_error_present) {
+        return;
+    }
+    p->fatal_error_present = true;
+    (void)snprintf(p->fatal_error_code, sizeof(p->fatal_error_code), "%s",
+                   code ? code : "CBM_PIPELINE_FAILED");
+    (void)snprintf(p->fatal_error_operation, sizeof(p->fatal_error_operation), "%s",
+                   operation ? operation : "pipeline");
+    (void)snprintf(p->fatal_error_phase, sizeof(p->fatal_error_phase), "%s",
+                   phase ? phase : "pipeline");
+    (void)snprintf(p->fatal_error_path, sizeof(p->fatal_error_path), "%s", path ? path : "");
+    (void)snprintf(p->fatal_error_message, sizeof(p->fatal_error_message), "%s",
+                   message ? message : "the authoritative ingestion pipeline failed");
+    (void)snprintf(p->fatal_error_remediation, sizeof(p->fatal_error_remediation), "%s",
+                   remediation ? remediation
+                               : "inspect the exact code and operation, fix the cause, then retry");
+    p->fatal_error_requested = requested;
+
+    char requested_text[32];
+    (void)snprintf(requested_text, sizeof(requested_text), "%zu", requested);
+    cbm_log_error("pipeline.fatal_error", "code", p->fatal_error_code, "operation",
+                  p->fatal_error_operation, "phase", p->fatal_error_phase, "path",
+                  p->fatal_error_path, "requested", requested_text, "message",
+                  p->fatal_error_message, "remediation", p->fatal_error_remediation);
+}
+
+static const char *cbm_pipeline_code_from_legacy_reason(const char *reason) {
+    if (!reason || reason[0] != '[') {
+        return NULL;
+    }
+    static _Thread_local char code[PL_ERROR_CODE];
+    const char *end = strchr(reason + 1, ']');
+    if (!end) {
+        return NULL;
+    }
+    size_t len = (size_t)(end - (reason + 1));
+    if (len == 0 || len >= sizeof(code)) {
+        return NULL;
+    }
+    memcpy(code, reason + 1, len);
+    code[len] = '\0';
+    return code;
+}
+
+int cbm_pipeline_reject_file_failures(cbm_pipeline_t *p, const cbm_file_info_t *files,
+                                      int file_count, CBMFileResult *const *results,
+                                      const char *phase) {
+    if (!p || !files || file_count < 0) {
+        cbm_pipeline_record_fatal_error(
+            p, "CBM_PIPELINE_EXTRACTION_BARRIER_INVALID", "reject_file_failures",
+            phase ? phase : "extract", "", (size_t)(file_count < 0 ? 0 : file_count),
+            "the extraction barrier received invalid result metadata",
+            "repair the pipeline result-cache contract before retrying");
+        return CBM_NOT_FOUND;
+    }
+    if (file_count > 0 && !results) {
+        cbm_pipeline_record_fatal_error(
+            p, "CBM_EXTRACTION_CACHE_ALLOC_FAILED", "allocate_result_cache",
+            phase ? phase : "extract", "", (size_t)file_count * sizeof(*results),
+            "the authoritative per-file result cache could not be allocated",
+            "free memory or reduce concurrent repository workload, then retry the complete corpus");
+        return CBM_NOT_FOUND;
+    }
+
+    /* Results and read failures are evaluated together in deterministic
+     * discovery order, never worker-finish or failure-kind order. */
+    for (int i = 0; i < file_count; i++) {
+        const char *rel_path = files[i].rel_path;
+        if (!rel_path || !rel_path[0] || files[i].size < 0) {
+            cbm_pipeline_record_fatal_error(
+                p, "CBM_EXTRACTION_FILE_METADATA_INVALID", "validate_discovered_source",
+                phase ? phase : "extract", rel_path ? rel_path : "", 0,
+                "a discovered source file has invalid path or size metadata",
+                "repair source capture/discovery metadata before retrying the corpus");
+            return CBM_NOT_FOUND;
+        }
+        const CBMFileResult *result = results[i];
+        if (result && result->has_error) {
+            const CBMExtractionError *error = &result->error;
+            cbm_pipeline_record_fatal_error(
+                p,
+                error->code ? error->code
+                            : cbm_pipeline_code_from_legacy_reason(result->error_msg),
+                error->operation ? error->operation : "cbm_extract_file",
+                error->phase ? error->phase : phase, rel_path, error->requested,
+                error->message ? error->message
+                               : (result->error_msg ? result->error_msg
+                                                    : "authoritative extraction failed"),
+                error->remediation
+                    ? error->remediation
+                    : "inspect the exact extraction failure, fix the cause, then retry the complete "
+                      "corpus");
+            return CBM_NOT_FOUND;
+        }
+        if (result && cbm_arena_failed(&result->arena)) {
+            cbm_pipeline_record_fatal_error(
+                p, cbm_arena_failure_code(&result->arena),
+                cbm_arena_failure_operation(&result->arena), phase ? phase : "extract",
+                rel_path, cbm_arena_failure_bytes(&result->arena),
+                "an authoritative per-file arena entered a failed state; no partial extraction may "
+                "be persisted",
+                "inspect the exact arena code, operation, and requested quantity, fix the cause, "
+                "then retry the complete corpus");
+            return CBM_NOT_FOUND;
+        }
+        for (int j = 0; j < p->file_errors_count; j++) {
+            const cbm_file_error_t *error = &p->file_errors[j];
+            if (!error->path || strcmp(error->path, rel_path) != 0) {
+                continue;
+            }
+            const char *code = cbm_pipeline_code_from_legacy_reason(error->reason);
+            if (!code) {
+                code = error->phase && strcmp(error->phase, "oversized") == 0
+                           ? "CBM_SOURCE_FILE_LIMIT_EXCEEDED"
+                       : error->phase && strcmp(error->phase, "read") == 0
+                           ? "CBM_SOURCE_READ_FAILED"
+                           : "CBM_EXTRACTION_RESULT_MISSING";
+            }
+            cbm_pipeline_record_fatal_error(
+                p, code, error->phase ? error->phase : "extract",
+                phase ? phase : "extract", rel_path, (size_t)files[i].size,
+                error->reason ? error->reason : "a discovered source file was not extracted",
+                "repair the source/read/extraction failure, then retry the complete corpus; partial "
+                "publication is forbidden");
+            return CBM_NOT_FOUND;
+        }
+        if (!result && files[i].size > 0) {
+            cbm_pipeline_record_fatal_error(
+                p, "CBM_EXTRACTION_RESULT_MISSING", "extract_discovered_source",
+                phase ? phase : "extract", rel_path, (size_t)files[i].size,
+                "a non-empty discovered source file produced no authoritative extraction result",
+                "inspect source read and extraction diagnostics, fix the cause, then retry the "
+                "complete corpus");
+            return CBM_NOT_FOUND;
+        }
+    }
+    return 0;
 }
 
 void cbm_pipeline_set_committed_counts(cbm_pipeline_t *p, int nodes, int edges) {
@@ -1116,8 +1302,19 @@ static int run_sequential_pipeline(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
     for (int si = 0; si < PL_SEQ_PASSES && rc == 0; si++) {
         cbm_clock_gettime(CLOCK_MONOTONIC, t);
         int pr = seq_passes[si].fn(ctx, files, file_count);
+        if (pr == 0 && ctx->result_cache) {
+            pr = cbm_pipeline_reject_file_failures(p, files, file_count, ctx->result_cache,
+                                                   seq_passes[si].name);
+        }
         if (pr != 0 && !seq_passes[si].ignore_err) {
             rc = pr;
+        } else if (pr != 0) {
+            /* An authoritative result failure is never a best-effort pass
+             * outcome even when the pass itself permits ordinary misses. */
+            cbm_pipeline_error_t fatal = {0};
+            if (cbm_pipeline_get_fatal_error(p, &fatal)) {
+                rc = pr;
+            }
         }
         cbm_log_info("pass.timing", "pass", seq_passes[si].name, "elapsed_ms",
                      itoa_buf((int)elapsed_ms(*t)));
@@ -1164,13 +1361,19 @@ static int run_parallel_pipeline(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
     CBMFileResult **cache = (CBMFileResult **)calloc(file_count, sizeof(CBMFileResult *));
     if (!cache) {
         cbm_log_error("pipeline.err", "phase", "cache_alloc");
-        return CBM_NOT_FOUND;
+        return cbm_pipeline_reject_file_failures(p, files, file_count, NULL,
+                                                 "parallel_cache");
     }
     cbm_clock_gettime(CLOCK_MONOTONIC, t);
     int rc = cbm_parallel_extract(ctx, files, file_count, cache, &shared_ids, worker_count);
     cbm_log_info("pass.timing", "pass", "parallel_extract", "elapsed_ms",
                  itoa_buf((int)elapsed_ms(*t)));
     if (rc != 0 || check_cancel(p)) {
+        for (int i = 0; i < file_count; i++) {
+            if (cache[i]) {
+                cbm_free_result(cache[i]);
+            }
+        }
         free(cache);
         return rc != 0 ? rc : CBM_NOT_FOUND;
     }
@@ -1262,6 +1465,9 @@ static int run_parallel_pipeline(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
     cbm_clock_gettime(CLOCK_MONOTONIC, t);
     rc = cbm_parallel_resolve(ctx, files, file_count, cache, &shared_ids, worker_count, all_defs,
                               def_count, def_modules, module_def_index, &cross_registries);
+    if (rc == 0) {
+        rc = cbm_pipeline_reject_file_failures(p, files, file_count, cache, "parallel_resolve");
+    }
     cbm_log_info("pass.timing", "pass", "parallel_resolve", "elapsed_ms",
                  itoa_buf((int)elapsed_ms(*t)));
     log_phase_mem("parallel_resolve");

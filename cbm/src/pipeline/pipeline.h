@@ -16,6 +16,7 @@
 #define CBM_PIPELINE_H
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 
 #include "graph_buffer/row_sink.h"
@@ -27,6 +28,16 @@ typedef struct cbm_gbuf cbm_gbuf_t;
 /* ── Opaque handle ──────────────────────────────────────────────── */
 
 typedef struct cbm_pipeline cbm_pipeline_t;
+
+typedef struct {
+    const char *code;
+    const char *operation;
+    const char *phase;
+    const char *path;
+    const char *message;
+    const char *remediation;
+    size_t requested;
+} cbm_pipeline_error_t;
 
 /* Distinct terminal result for a repository with no non-auxiliary source
  * files. Callers must surface this as a structured refusal; it is never a
@@ -94,15 +105,20 @@ void cbm_pipeline_get_excluded(const cbm_pipeline_t *p, char ***out, int *count)
  * Nodes are the #334 plausibility-gate axis; edges are informational only. */
 void cbm_pipeline_get_committed_counts(const cbm_pipeline_t *p, int *nodes, int *edges);
 
+/* Read the exact first fatal pipeline diagnostic. Returns false and zeroes
+ * `out` when no fatal diagnostic has been recorded. Every pointer is borrowed
+ * from the pipeline and remains valid until cbm_pipeline_free(). */
+bool cbm_pipeline_get_fatal_error(const cbm_pipeline_t *p, cbm_pipeline_error_t *out);
+
 /* ── Per-file indexing failures (Stage 2 / Track B) ─────────────── */
 
-/* One source file that was skipped during indexing. All strings are owned by
- * the pipeline (copied on record, freed in cbm_pipeline_free). A skip is the
- * expected, handled outcome of a bad/oversized file — indexing continues and
- * the run still reports status "indexed"; these are surfaced (not errors that
- * fail the run) via MCP `skipped[]` / the CLI / a per-run logfile. */
+/* One discovered source file that failed before authoritative extraction
+ * completed. All strings are owned by the pipeline (copied on record, freed in
+ * cbm_pipeline_free). These records feed the extraction barrier: any entry is
+ * terminal and prevents publication of a partial graph. Benign zero-byte files
+ * do not produce an entry. */
 typedef struct {
-    char *path;   /* repo-relative path of the skipped file */
+    char *path;   /* repo-relative path of the failed discovered file */
     char *reason; /* human-readable cause (e.g. "oversized (712 MB > 512 MB)",
                    * "parse timeout", "read failed") */
     char *phase;  /* "read" | "extract" | "oversized". "cross_lsp" is a RESERVED
@@ -111,7 +127,7 @@ typedef struct {
                    * best-effort/void with no genuine per-file failure). */
 } cbm_file_error_t;
 
-/* Record a skipped file. path/reason/phase are copied. NULL-safe on p.
+/* Record a discovered-file failure. path/reason/phase are copied. NULL-safe on p.
  *
  * NOT thread-safe: call it from the sequential extraction pass, or from the
  * parallel merge step (never from inside a parallel worker — workers collect

@@ -265,8 +265,8 @@ static char *read_file(const char *path, int *out_len, long *out_size,
     return buf;
 }
 
-/* ── Per-worker skip list (Stage 2 / Track B) ───────────────────────
- * Each extract worker appends read/extract/oversized skips into its OWN list
+/* ── Per-worker failure list (Stage 2 / Track B) ────────────────────
+ * Each extract worker appends read/extract/oversized failures into its OWN list
  * (no lock on the hot path); the lists are merged into the pipeline's
  * cbm_file_error_t array in the existing sequential merge loop. */
 typedef struct {
@@ -298,7 +298,9 @@ static void pp_err_add(pp_err_list_t *list, const char *path, const char *reason
         cbm_file_error_t *grown =
             (cbm_file_error_t *)realloc(list->items, (size_t)ncap * sizeof(*grown));
         if (!grown) {
-            return; /* drop on OOM — never fail extraction to record a skip */
+            /* The barrier also rejects every missing non-empty result, so an
+             * inventory-allocation failure cannot turn extraction into success. */
+            return;
         }
         list->items = grown;
         list->cap = ncap;
@@ -896,8 +898,8 @@ static void extract_worker(int worker_id, void *ctx_ptr) {
         if (!source) {
             ws->errors++;
             if (rst == CBM_READ_OVERSIZED) {
-                /* Never a silent drop: record the oversized skip + a throttled
-                 * WARN so the file surfaces in the response/logfile. */
+                /* Never a silent drop: record the oversized terminal failure
+                 * and emit a throttled diagnostic with its sizes. */
                 long cap = cbm_max_file_bytes();
                 char reason[96];
                 snprintf(reason, sizeof(reason), "oversized (%lld MB > %lld MB)",
@@ -940,10 +942,9 @@ static void extract_worker(int worker_id, void *ctx_ptr) {
         }
         log_extract_done(sort_pos, file_elapsed_ms, result->defs.count, fi->rel_path);
 
-        /* Consume the previously-ignored has_error flag: a parse timeout / parse
-         * failure / unsupported-grammar result carries no defs but must still be
-         * reported (phase "extract", reason = the extractor's message). The empty
-         * result flows through unchanged below (the defs loop is a no-op). */
+        /* Preserve the extractor's exact first failure in the per-worker
+         * inventory. Workers finish and join; the extraction barrier rejects
+         * the complete corpus before registry construction or publication. */
         if (result->has_error) {
             pp_err_add(errs, fi->rel_path, result->error_msg ? result->error_msg : "extract failed",
                        "extract");
@@ -1174,9 +1175,9 @@ int cbm_parallel_extract_ex(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *file
     }
     CBM_PROF_END_N("parallel_extract", "4_merge_gbufs_seq", t_merge, total_nodes);
 
-    /* Merge per-worker skip lists into the pipeline (SEQUENTIAL — no lock).
+    /* Merge per-worker failure lists into the pipeline (SEQUENTIAL — no lock).
      * Runs unconditionally (not gated on local_gbuf) so a worker whose files all
-     * failed still surfaces its skips. */
+     * failed still surfaces its diagnostics. */
     if (err_lists) {
         for (int i = 0; i < worker_count; i++) {
             for (int j = 0; j < err_lists[i].count; j++) {
@@ -1190,6 +1191,14 @@ int cbm_parallel_extract_ex(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *file
             free(err_lists[i].items);
         }
         free(err_lists);
+    }
+
+    int extraction_rc = cbm_pipeline_reject_file_failures(
+        ctx->pipeline, files, file_count, result_cache, "parallel_extract");
+    if (extraction_rc != 0) {
+        cbm_aligned_free(workers);
+        free(sorted);
+        return extraction_rc;
     }
 
     int pkgmap_rc = build_captured_pkgmap(ctx);

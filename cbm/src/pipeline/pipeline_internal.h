@@ -116,6 +116,12 @@ typedef struct {
     bool seq_cross_arena_live;
 } cbm_pipeline_ctx_t;
 
+/* Fail-closed barrier over authoritative per-file results. Scans in discovery
+ * order so the same corpus always reports the same first causal failure. */
+int cbm_pipeline_reject_file_failures(cbm_pipeline_t *pipeline,
+                                      const cbm_file_info_t *files, int file_count,
+                                      CBMFileResult *const *results, const char *phase);
+
 static inline int cbm_pipeline_relpath_is_excluded(const char *rel_path, char *const *excluded_dirs,
                                                    int excluded_count) {
     if (!rel_path || rel_path[0] == '\0' || !excluded_dirs || excluded_count <= 0) {

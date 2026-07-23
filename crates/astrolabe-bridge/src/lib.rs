@@ -1700,15 +1700,41 @@ impl ExtractedFile {
                 _not_send_or_sync: PhantomData,
             };
             if extracted.raw().has_error {
+                let raw = extracted.raw();
+                let code = extracted
+                    .optional_string(raw.error.code)?
+                    .filter(|value| !value.is_empty())
+                    .unwrap_or_else(|| "ASTRO_CBM_EXTRACT_ERROR".to_string());
+                let operation = extracted
+                    .optional_string(raw.error.operation)?
+                    .filter(|value| !value.is_empty())
+                    .unwrap_or_else(|| "cbm_extract_file".to_string());
+                let phase = extracted
+                    .optional_string(raw.error.phase)?
+                    .filter(|value| !value.is_empty())
+                    .unwrap_or_else(|| "extract".to_string());
                 let message = extracted
-                    .optional_string(extracted.raw().error_msg)?
+                    .optional_string(raw.error.message)?
+                    .or(extracted.optional_string(raw.error_msg)?)
                     .unwrap_or_else(|| {
                         "CBM extraction failed without an error message".to_string()
                     });
+                let remediation = extracted
+                    .optional_string(raw.error.remediation)?
+                    .filter(|value| !value.is_empty())
+                    .unwrap_or_else(|| {
+                        "Inspect the exact extraction failure, fix the cause, then retry the "
+                            .to_string()
+                            + "complete corpus; partial extraction is forbidden."
+                    });
+                let path = extracted._rel_path.to_string_lossy();
                 Err(envelope(
-                    "ASTRO_CBM_EXTRACT_ERROR",
-                    message,
-                    "Surface the file as skipped and continue indexing the remaining batch.",
+                    code,
+                    format!(
+                        "{message}; operation={operation}; phase={phase}; path={path}; requested={}",
+                        raw.error.requested
+                    ),
+                    remediation,
                 ))
             } else {
                 Ok(extracted)

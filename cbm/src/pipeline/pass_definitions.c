@@ -698,6 +698,10 @@ int cbm_pipeline_pass_definitions(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
         local_cache = (CBMFileResult **)calloc((size_t)file_count, sizeof(CBMFileResult *));
         owns_local_cache = (local_cache != NULL);
     }
+    if (file_count > 0 && !local_cache) {
+        return cbm_pipeline_reject_file_failures(ctx->pipeline, files, file_count, NULL,
+                                                 "sequential_cache");
+    }
 
     /* Phase 1: extract every file and create def-derived nodes (Modules,
      * Functions, ...) so any file's IMPORTS can resolve against the
@@ -719,8 +723,8 @@ int cbm_pipeline_pass_definitions(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
         if (!source) {
             errors++;
             if (rst == CBM_READ_OVERSIZED) {
-                /* Never a silent drop: record the oversized skip + WARN so the
-                 * file surfaces in the response/logfile with its sizes. */
+                /* Never a silent drop: record the oversized terminal failure
+                 * with its declared and observed sizes. */
                 long cap = cbm_max_file_bytes();
                 char reason[96];
                 snprintf(reason, sizeof(reason), "oversized (%lld MB > %lld MB)",
@@ -749,10 +753,9 @@ int cbm_pipeline_pass_definitions(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
             cbm_pipeline_add_file_error(ctx->pipeline, rel, "extract failed", "extract");
             continue;
         }
-        /* Consume the previously-ignored has_error flag: a parse timeout /
-         * parse failure / unsupported-grammar result carries no defs but must
-         * still be reported (phase "extract", reason = the extractor's message).
-         * The empty result flows through unchanged (the defs loop is a no-op). */
+        /* Preserve the extractor's exact first failure in the pipeline's
+         * diagnostic inventory. The extraction barrier below rejects the whole
+         * corpus before later passes or publication. */
         if (result->has_error) {
             cbm_pipeline_add_file_error(ctx->pipeline, rel,
                                         result->error_msg ? result->error_msg : "extract failed",
@@ -782,6 +785,23 @@ int cbm_pipeline_pass_definitions(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
             create_env_configures_for_file(ctx, result, rel);
             cbm_free_result(result);
         }
+    }
+
+    /* Authoritative extraction is an all-files barrier. A result carrying
+     * has_error (or a discovered file that could not be read/extracted) makes
+     * the whole pass fail before imports, later passes, or publication can see
+     * a partial graph. */
+    int extraction_rc =
+        cbm_pipeline_reject_file_failures(ctx->pipeline, files, file_count, local_cache,
+                                          "sequential_extract");
+    if (extraction_rc != 0) {
+        if (owns_local_cache) {
+            for (int i = 0; i < file_count; i++) {
+                cbm_free_result(local_cache[i]);
+            }
+            free(local_cache);
+        }
+        return extraction_rc;
     }
 
     /* Phase 2: now that all extraction results are cached and Module

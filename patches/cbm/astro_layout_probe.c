@@ -16,6 +16,7 @@ CBM_API int cbm_abi_layout_size(const char *type_name, size_t *size_out, size_t 
         }                                    \
     } while (0)
 
+    ASTRO_LAYOUT_SIZE_CASE(CBMExtractionError);
     ASTRO_LAYOUT_SIZE_CASE(CBMFileResult);
     ASTRO_LAYOUT_SIZE_CASE(cbm_gbuf_row_node_t);
     ASTRO_LAYOUT_SIZE_CASE(cbm_gbuf_row_edge_t);
@@ -42,6 +43,13 @@ CBM_API int cbm_abi_layout_offset(const char *type_name, const char *field_name,
         }                                                                       \
     } while (0)
 
+    ASTRO_LAYOUT_OFFSET_CASE(CBMExtractionError, code);
+    ASTRO_LAYOUT_OFFSET_CASE(CBMExtractionError, operation);
+    ASTRO_LAYOUT_OFFSET_CASE(CBMExtractionError, phase);
+    ASTRO_LAYOUT_OFFSET_CASE(CBMExtractionError, message);
+    ASTRO_LAYOUT_OFFSET_CASE(CBMExtractionError, remediation);
+    ASTRO_LAYOUT_OFFSET_CASE(CBMExtractionError, requested);
+
     ASTRO_LAYOUT_OFFSET_CASE(CBMFileResult, arena);
     ASTRO_LAYOUT_OFFSET_CASE(CBMFileResult, defs);
     ASTRO_LAYOUT_OFFSET_CASE(CBMFileResult, calls);
@@ -65,6 +73,7 @@ CBM_API int cbm_abi_layout_offset(const char *type_name, const char *field_name,
     ASTRO_LAYOUT_OFFSET_CASE(CBMFileResult, macros);
     ASTRO_LAYOUT_OFFSET_CASE(CBMFileResult, has_error);
     ASTRO_LAYOUT_OFFSET_CASE(CBMFileResult, error_msg);
+    ASTRO_LAYOUT_OFFSET_CASE(CBMFileResult, error);
     ASTRO_LAYOUT_OFFSET_CASE(CBMFileResult, is_test_file);
     ASTRO_LAYOUT_OFFSET_CASE(CBMFileResult, imports_count);
     ASTRO_LAYOUT_OFFSET_CASE(CBMFileResult, cached_tree);

@@ -4519,6 +4519,10 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
     } else if (rc == CBM_PIPELINE_EMPTY_SOURCE_CORPUS) {
         yyjson_mut_obj_add_str(doc, root, "status", "error");
         yyjson_mut_obj_add_str(doc, root, "code", "CBM_PIPELINE_EMPTY_SOURCE_CORPUS");
+        yyjson_mut_obj_add_str(doc, root, "operation", "discover_source_files");
+        yyjson_mut_obj_add_str(doc, root, "phase", "discovery");
+        yyjson_mut_obj_add_str(doc, root, "path", repo_path);
+        yyjson_mut_obj_add_uint(doc, root, "requested", 0);
         yyjson_mut_obj_add_str(
             doc, root, "message",
             "index_repository refused because discovery produced zero non-auxiliary source files");
@@ -4528,10 +4532,26 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
             "ignore configuration before retrying");
         yyjson_mut_obj_add_bool(doc, root, "sqlite_publication_started", false);
     } else {
+        cbm_pipeline_error_t fatal = {0};
+        bool has_fatal = cbm_pipeline_get_fatal_error(p, &fatal);
         yyjson_mut_obj_add_str(doc, root, "status", "error");
-        yyjson_mut_obj_add_str(doc, root, "hint",
-                               "Pipeline failed. Check repo_path exists and contains source files. "
-                               "Try mode='fast' for a quicker diagnostic run.");
+        yyjson_mut_obj_add_str(doc, root, "code",
+                               has_fatal ? fatal.code : "CBM_PIPELINE_FAILED");
+        yyjson_mut_obj_add_str(doc, root, "operation",
+                               has_fatal ? fatal.operation : "cbm_pipeline_run");
+        yyjson_mut_obj_add_str(doc, root, "phase", has_fatal ? fatal.phase : "pipeline");
+        yyjson_mut_obj_add_str(doc, root, "path", has_fatal ? fatal.path : repo_path);
+        yyjson_mut_obj_add_uint(doc, root, "requested", has_fatal ? fatal.requested : 0);
+        yyjson_mut_obj_add_str(
+            doc, root, "message",
+            has_fatal ? fatal.message : "the authoritative indexing pipeline failed");
+        yyjson_mut_obj_add_str(
+            doc, root, "remediation",
+            has_fatal
+                ? fatal.remediation
+                : "inspect the preceding structured diagnostics, fix the exact failure, then retry "
+                  "the complete corpus");
+        yyjson_mut_obj_add_bool(doc, root, "sqlite_publication_started", false);
     }
 
     bool response_is_error = rc != 0 || postcondition_error != NULL;

@@ -624,24 +624,10 @@ static CBMFileResult *cbm_extract_file_impl(const char *source, int source_len,
                                             const char *rel_path, int64_t timeout_micros,
                                             const char **extra_defines, const char **include_paths);
 
-static bool cbm_extract_arena_ok(CBMFileResult *result, const char *phase, const char *rel_path) {
-    CBMArena *a = result ? &result->arena : NULL;
-    if (!a || !cbm_arena_failed(a)) {
-        return true;
+static void cbm_file_result_discard_atoms(CBMFileResult *result) {
+    if (!result) {
+        return;
     }
-    char requested[32];
-    snprintf(requested, sizeof(requested), "%zu", cbm_arena_failure_bytes(a));
-    cbm_log_error("extract.allocation_failed", "code", cbm_arena_failure_code(a), "component",
-                  "parser_extraction", "operation", cbm_arena_failure_operation(a), "phase",
-                  phase ? phase : "unknown", "file", rel_path ? rel_path : "<input>",
-                  "requested_bytes", requested, "message",
-                  "authoritative extraction allocation failed; partial atoms discarded",
-                  "remediation", "free memory or reduce repository size, then retry");
-    result->has_error = true;
-    result->error_msg =
-        "[CBM_EXTRACTION_ALLOCATION_FAILED] authoritative parser extraction allocation failed; "
-        "partial atoms were discarded; remediation: inspect the structured allocation error, "
-        "free memory or reduce repository size, then retry";
     result->defs.count = 0;
     result->calls.count = 0;
     result->imports.count = 0;
@@ -657,6 +643,101 @@ static bool cbm_extract_arena_ok(CBMFileResult *result, const char *phase, const
     result->infra_bindings.count = 0;
     result->channels.count = 0;
     result->imports_count = 0;
+    result->exports = NULL;
+    result->constants = NULL;
+    result->global_vars = NULL;
+    result->macros = NULL;
+    result->module_qn = NULL;
+    result->namespace_name = NULL;
+    result->source = NULL;
+    result->source_len = 0;
+}
+
+void cbm_file_result_set_error(CBMFileResult *result, const char *code, const char *operation,
+                               const char *phase, size_t requested, const char *message,
+                               const char *remediation) {
+    if (!result || result->has_error) {
+        return;
+    }
+    result->has_error = true;
+    result->error.code = code ? code : "CBM_EXTRACTION_FAILED";
+    result->error.operation = operation ? operation : "extract";
+    result->error.phase = phase ? phase : "extract";
+    result->error.message =
+        message ? message : "authoritative parser extraction failed; partial atoms were discarded";
+    result->error.remediation =
+        remediation ? remediation
+                    : "inspect the structured extraction code and operation, fix the cause, then "
+                      "retry the complete corpus";
+    result->error.requested = requested;
+    result->error_msg = result->error.message;
+    cbm_file_result_discard_atoms(result);
+}
+
+static bool cbm_extract_code_is_resource_failure(const char *code) {
+    return code &&
+           (strstr(code, "ALLOC") != NULL || strstr(code, "CAPACITY") != NULL ||
+            strstr(code, "OVERFLOW") != NULL || strstr(code, "LIMIT_EXCEEDED") != NULL);
+}
+
+static const char *cbm_extract_failure_message(const char *code) {
+    if (code && strcmp(code, "CBM_RUST_MACRO_NO_MATCH") == 0) {
+        return "a Rust macro_rules invocation matched no declared rule; no partial extraction may "
+               "be persisted";
+    }
+    if (code && strstr(code, "UNSUPPORTED") != NULL) {
+        return "the authoritative parser encountered an unsupported source construct; no partial "
+               "extraction may be persisted";
+    }
+    if (code && strstr(code, "ALLOC") != NULL) {
+        return "authoritative parser extraction could not allocate required memory; no partial "
+               "extraction may be persisted";
+    }
+    if (cbm_extract_code_is_resource_failure(code)) {
+        return "authoritative parser extraction exhausted a declared resource boundary; no partial "
+               "extraction may be persisted";
+    }
+    return "authoritative parser extraction failed; no partial extraction may be persisted";
+}
+
+static const char *cbm_extract_failure_remediation(const char *code) {
+    if (code && strcmp(code, "CBM_RUST_MACRO_NO_MATCH") == 0) {
+        return "correct the macro invocation or its macro_rules patterns, then retry the complete "
+               "corpus";
+    }
+    if (code && strstr(code, "UNSUPPORTED") != NULL) {
+        return "extend the authoritative extractor for this construct, then retry; do not accept a "
+               "partial graph";
+    }
+    if (code && strstr(code, "ALLOC") != NULL) {
+        return "inspect the requested quantity, free memory or reduce concurrent extraction "
+               "workload, then retry the complete corpus";
+    }
+    if (cbm_extract_code_is_resource_failure(code)) {
+        return "inspect the requested quantity and operation, raise the declared limit deliberately "
+               "or reduce resource demand, then retry";
+    }
+    return "inspect the exact code and operation, fix the source or extractor, then retry the "
+           "complete corpus";
+}
+
+static bool cbm_extract_arena_ok(CBMFileResult *result, const char *phase, const char *rel_path) {
+    CBMArena *a = result ? &result->arena : NULL;
+    if (!a || !cbm_arena_failed(a)) {
+        return true;
+    }
+    const char *code = cbm_arena_failure_code(a);
+    const char *operation = cbm_arena_failure_operation(a);
+    size_t failure_bytes = cbm_arena_failure_bytes(a);
+    char requested[32];
+    snprintf(requested, sizeof(requested), "%zu", failure_bytes);
+    const char *message = cbm_extract_failure_message(code);
+    const char *remediation = cbm_extract_failure_remediation(code);
+    cbm_log_error("extract.failed", "code", code, "component", "parser_extraction", "operation",
+                  operation, "phase", phase ? phase : "unknown", "file",
+                  rel_path ? rel_path : "<input>", "requested", requested, "message", message,
+                  "remediation", remediation);
+    cbm_file_result_set_error(result, code, operation, phase, failure_bytes, message, remediation);
     return false;
 }
 
@@ -688,15 +769,16 @@ static CBMFileResult *cbm_extract_file_impl(const char *source, int source_len,
     // Get language spec
     const CBMLangSpec *spec = cbm_lang_spec(language);
     if (!spec) {
-        result->has_error = true;
-        result->error_msg = cbm_arena_strdup(a, "unsupported language");
+        cbm_file_result_set_error(
+            result, "CBM_LANGUAGE_UNSUPPORTED", "cbm_lang_spec", "language", 0,
+            "the requested source language has no authoritative extraction specification",
+            "register a complete language specification before retrying the corpus");
         return result;
     }
 
     // Get tree-sitter language
     const TSLanguage *ts_lang = cbm_ts_language(language);
     if (!ts_lang) {
-        result->has_error = true;
         // #283 grammar-subset build: distinguish a grammar STUBBED OUT of this
         // build from a language with genuinely no grammar. In a full build every
         // real tree_sitter_*() factory returns a non-NULL pointer, so a non-NULL
@@ -706,14 +788,16 @@ static CBMFileResult *cbm_extract_file_impl(const char *source, int source_len,
         // never a silent parse miss. This branch is dormant (never taken) in a
         // full build, so default behavior is unchanged.
         if (spec->ts_factory != NULL) {
-            result->error_msg = cbm_arena_strdup(
-                a, "[CBM_GRAMMAR_STUBBED] tree-sitter grammar for this language was "
-                   "stubbed out of the current libcbm build by the grammar-subset knob "
-                   "(CBM_GRAMMAR_SET=core); remediation: rebuild libcbm with "
-                   "CBM_GRAMMAR_SET=full, or add the language to CBM_GRAMMAR_CORE_LANGS "
-                   "in patches/cbm/Makefile.cbm, to index files of this language");
+            cbm_file_result_set_error(
+                result, "CBM_GRAMMAR_STUBBED", "cbm_ts_language", "grammar", 0,
+                "the tree-sitter grammar for this language is absent from the current libcbm build",
+                "rebuild libcbm with CBM_GRAMMAR_SET=full or add the language to "
+                "CBM_GRAMMAR_CORE_LANGS, then retry");
         } else {
-            result->error_msg = cbm_arena_strdup(a, "no tree-sitter grammar");
+            cbm_file_result_set_error(
+                result, "CBM_GRAMMAR_UNAVAILABLE", "cbm_ts_language", "grammar", 0,
+                "the requested language has no tree-sitter grammar",
+                "install and register an authoritative grammar before retrying");
         }
         return result;
     }
@@ -721,8 +805,10 @@ static CBMFileResult *cbm_extract_file_impl(const char *source, int source_len,
     // Get thread-local parser (reused across files on same thread)
     TSParser *parser = get_thread_parser(ts_lang, language);
     if (!parser) {
-        result->has_error = true;
-        result->error_msg = cbm_arena_strdup(a, "parser alloc failed");
+        cbm_file_result_set_error(
+            result, "CBM_PARSER_ALLOC_FAILED", "get_thread_parser", "parse", 0,
+            "the authoritative tree-sitter parser could not be allocated",
+            "free memory or reduce concurrent extraction workers, then retry");
         return result;
     }
 
@@ -752,9 +838,16 @@ static CBMFileResult *cbm_extract_file_impl(const char *source, int source_len,
     uint64_t t1 = now_ns();
 
     if (!tree) {
-        result->has_error = true;
-        result->error_msg =
-            cbm_arena_strdup(a, timeout_micros > 0 ? "parse timeout" : "parse failed");
+        cbm_file_result_set_error(
+            result, timeout_micros > 0 ? "CBM_PARSE_TIMEOUT" : "CBM_PARSE_FAILED",
+            "ts_parser_parse_with_options", "parse",
+            timeout_micros > 0 ? (size_t)timeout_micros : 0,
+            timeout_micros > 0 ? "the authoritative parse exceeded its declared time budget"
+                               : "the authoritative tree-sitter parse failed",
+            timeout_micros > 0
+                ? "inspect parser complexity and raise the declared timeout deliberately or reduce "
+                  "the source unit, then retry"
+                : "inspect the exact source and grammar, repair the parser failure, then retry");
         return result;
     }
 
@@ -787,6 +880,9 @@ static CBMFileResult *cbm_extract_file_impl(const char *source, int source_len,
     // Run extractors: defs + imports use separate walks (unique recursion patterns),
     // then a single unified cursor walk handles the remaining 7 extractors.
     cbm_extract_definitions(&ctx);
+    if (result->has_error) {
+        goto extraction_failed;
+    }
     if (!cbm_extract_arena_ok(result, "definitions", rel_path)) {
         goto extraction_failed;
     }
