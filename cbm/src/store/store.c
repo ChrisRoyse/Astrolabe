@@ -10,6 +10,7 @@
 
 #include <stdint.h>
 #include "foundation/constants.h"
+#include "foundation/schema_version.h"
 
 #include <math.h>
 
@@ -52,7 +53,6 @@ enum {
     ST_METHOD_PROP_LEN = 8,
     ST_PATH_PROP_LEN = 6,
     ST_HANDLER_PROP_LEN = 9,
-    CBM_STORE_SCHEMA_VERSION = 4,
 };
 
 #define SLEN(s) (sizeof(s) - 1)
@@ -380,7 +380,7 @@ static int init_schema(cbm_store_t *s) {
      * application schema at version 0 is therefore refused below. */
     int initial_user_version = 0;
     if (read_user_version(s, &initial_user_version) != CBM_STORE_OK ||
-        (initial_user_version != 0 && initial_user_version != CBM_STORE_SCHEMA_VERSION)) {
+        (initial_user_version != 0 && initial_user_version != CBM_GRAPH_SCHEMA_VERSION)) {
         cbm_log_error("store.schema_version_refused", "code", "CBM_SCHEMA_VERSION_UNSUPPORTED",
                       "message",
                       "SQLite user_version is not the exact stable-atom/file-path schema",
@@ -562,12 +562,22 @@ static int init_schema(cbm_store_t *s) {
             sqlite3_free(fts_err);
         }
     }
-    if (exec_sql(s, "PRAGMA user_version = 4;") != CBM_STORE_OK) {
+    char schema_stamp[CBM_SZ_64];
+    int schema_stamp_len = snprintf(schema_stamp, sizeof(schema_stamp),
+                                    "PRAGMA user_version = %d;", CBM_GRAPH_SCHEMA_VERSION);
+    if (schema_stamp_len < 0 || (size_t)schema_stamp_len >= sizeof(schema_stamp)) {
+        cbm_log_error("store.schema_version_stamp_failed", "code",
+                      "CBM_SCHEMA_VERSION_FORMAT_FAILED", "message",
+                      "the graph schema version could not be formatted exactly", "remediation",
+                      "inspect the native formatter and rebuild the complete artifact");
+        return CBM_STORE_ERR;
+    }
+    if (exec_sql(s, schema_stamp) != CBM_STORE_OK) {
         return CBM_STORE_ERR;
     }
     int final_user_version = 0;
     if (read_user_version(s, &final_user_version) != CBM_STORE_OK ||
-        final_user_version != CBM_STORE_SCHEMA_VERSION) {
+        final_user_version != CBM_GRAPH_SCHEMA_VERSION) {
         cbm_log_error("store.schema_version_readback_failed", "code",
                       "CBM_SCHEMA_VERSION_READBACK_FAILED", "message",
                       "SQLite did not persist the stable-atom/file-path schema version",
@@ -1308,13 +1318,13 @@ static store_integrity_status_t store_check_integrity_detailed(cbm_store_t *s,
     }
     rc = sqlite3_step(stmt);
     int user_version = rc == SQLITE_ROW ? sqlite3_column_int(stmt, 0) : -1;
-    if (rc != SQLITE_ROW || user_version != CBM_STORE_SCHEMA_VERSION) {
+    if (rc != SQLITE_ROW || user_version != CBM_GRAPH_SCHEMA_VERSION) {
         if (rc != SQLITE_ROW) {
             store_integrity_set_sqlite_failure(result, "application.user_version.step", s->db, rc);
         } else {
             char detail[ST_BUF_64];
             snprintf(detail, sizeof(detail), "user_version=%d expected=%d", user_version,
-                     CBM_STORE_SCHEMA_VERSION);
+                     CBM_GRAPH_SCHEMA_VERSION);
             store_integrity_set_failure(result, STORE_INTEGRITY_FAILED, "application.user_version",
                                         SQLITE_OK, detail);
         }

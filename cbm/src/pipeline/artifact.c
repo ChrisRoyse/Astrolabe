@@ -5,6 +5,7 @@
  * Import: decompress → write to cache → open (auto-creates indexes) → integrity check
  */
 #include "foundation/constants.h"
+#include "foundation/schema_version.h"
 
 enum {
     ART_DIR_PERMS = 0755,
@@ -407,7 +408,7 @@ static int write_metadata(const char *repo_path, const char *project_name, int n
     yyjson_mut_val *root = yyjson_mut_obj(doc);
     yyjson_mut_doc_set_root(doc, root);
 
-    yyjson_mut_obj_add_int(doc, root, "schema_version", CBM_ARTIFACT_SCHEMA_VERSION);
+    yyjson_mut_obj_add_int(doc, root, "schema_version", CBM_GRAPH_SCHEMA_VERSION);
     yyjson_mut_obj_add_str(doc, root, "commit", commit);
     yyjson_mut_obj_add_str(doc, root, "indexed_at", ts);
     yyjson_mut_obj_add_str(doc, root, "project", project_name);
@@ -680,10 +681,10 @@ int cbm_artifact_import(const char *repo_path, const char *cache_db_path) {
 
     /* Check schema version compatibility */
     int version = read_metadata_version(repo_path);
-    if (version != CBM_ARTIFACT_SCHEMA_VERSION) {
+    if (version != CBM_GRAPH_SCHEMA_VERSION) {
         cbm_log_error("artifact.import", "code", "CBM_ARTIFACT_SCHEMA_MISMATCH",
                       "artifact_ver", itoa_buf(version), "current_ver",
-                      itoa_buf(CBM_ARTIFACT_SCHEMA_VERSION), "message",
+                      itoa_buf(CBM_GRAPH_SCHEMA_VERSION), "message",
                       "artifact canonical identity schema is not exactly compatible",
                       "remediation", "re-index the source code and export a fresh artifact");
         return CBM_NOT_FOUND;
@@ -820,7 +821,7 @@ bool cbm_artifact_exists(const char *repo_path) {
 
     /* Check schema version is compatible */
     int version = read_metadata_version(repo_path);
-    return version == CBM_ARTIFACT_SCHEMA_VERSION;
+    return version == CBM_GRAPH_SCHEMA_VERSION;
 }
 
 /* ── Commit hash extraction ──────────────────────────────────────── */

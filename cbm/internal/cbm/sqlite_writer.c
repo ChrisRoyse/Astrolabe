@@ -20,6 +20,7 @@
 #include "foundation/compat_thread.h"
 #include "foundation/log.h"
 #include "foundation/profile.h"
+#include "foundation/schema_version.h"
 #include "foundation/sha256.h"
 #include "foundation/win_utf8.h"
 
@@ -174,7 +175,6 @@ enum {
 #define HDR_OFF_AUTOVAC_TOP 52
 #define HDR_OFF_TEXT_ENCODING 56
 #define HDR_OFF_USER_VERSION 60
-#define CBM_SCHEMA_USER_VERSION 3
 #define HDR_OFF_INCR_VACUUM 64
 #define HDR_OFF_APP_ID 68
 #define HDR_OFF_VERSION_VALID 92
@@ -2307,7 +2307,7 @@ static void write_sqlite_file_header(uint8_t *page1, uint32_t total_pages) {
     put_u32(page1 + HDR_OFF_DEFAULT_CACHE, 0);
     put_u32(page1 + HDR_OFF_AUTOVAC_TOP, 0);
     put_u32(page1 + HDR_OFF_TEXT_ENCODING, SKIP_ONE);
-    put_u32(page1 + HDR_OFF_USER_VERSION, CBM_SCHEMA_USER_VERSION);
+    put_u32(page1 + HDR_OFF_USER_VERSION, CBM_GRAPH_SCHEMA_VERSION);
     put_u32(page1 + HDR_OFF_INCR_VACUUM, 0);
     put_u32(page1 + HDR_OFF_APP_ID, 0);
     put_u32(page1 + HDR_OFF_VERSION_VALID, SKIP_ONE);

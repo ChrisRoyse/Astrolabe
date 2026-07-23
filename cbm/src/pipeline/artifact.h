@@ -11,17 +11,6 @@
 
 #include <stdbool.h>
 
-/* Schema version — increment when DB schema or canonical identity changes.
- * Import requires an exact version: older artifacts cannot prove the current
- * stable-atom/source contract and newer artifacts are not understood.
- * v4: exact-path File QNs; same-stem polyglot files cannot collapse onto one
- *     extensionless module alias.
- * v3: stable atom identity, non-unique QNs, and byte-exact source payloads.
- * v2: edges uniqueness widened to (source_id, target_id, type,
- *     local_name_gen) so sibling named imports coexist (#768) — old
- *     binaries cannot upsert against the widened constraint. */
-#define CBM_ARTIFACT_SCHEMA_VERSION 4
-
 #define CBM_ARTIFACT_FILENAME "graph.db.zst"
 #define CBM_ARTIFACT_META "artifact.json"
 #define CBM_ARTIFACT_DIR ".codebase-memory"
