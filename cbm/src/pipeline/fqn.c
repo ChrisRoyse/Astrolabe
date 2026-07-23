@@ -7,6 +7,7 @@
 #include "pipeline/pipeline.h"
 #include "foundation/compat_fs.h"
 #include "foundation/constants.h"
+#include "foundation/log.h"
 #include "foundation/platform.h"
 #include "foundation/sha256.h"
 
@@ -42,6 +43,18 @@
  * name (the corpus directory end — the human-meaningful part), plus one '-'
  * separator, plus the hash, sums to exactly FQN_MAX_NAME_LEN. */
 #define FQN_NAME_TAIL_LEN (FQN_MAX_NAME_LEN - 1 - FQN_HASH_HEX_LEN)
+
+/* File nodes are containers, not language modules. Their QN must therefore
+ * retain the complete normalized relative path rather than the extensionless
+ * module spelling used by symbols/imports. Domain-separate the path digest in
+ * the visible QN so File aliases cannot collide merely because two languages
+ * share a stem (foo.rs / foo.ts), or because dots and directory separators
+ * flatten to the same display spelling (a.b/c.rs / a/b.c.rs).
+ *
+ * The exact path remains separately stored in file_path and participates in
+ * the stable atom_id. This digest is only the deterministic, injective-in-
+ * practice File lookup alias needed by graph passes. */
+#define FQN_FILE_DOMAIN ".__file_path_sha256__."
 
 /* ── Internal helpers ─────────────────────────────────────────────── */
 
@@ -126,9 +139,75 @@ static void strip_init_or_index(const char **segments, size_t *seg_count, const 
 
 /* ── Public API ──────────────────────────────────────────────────── */
 
+char *cbm_pipeline_fqn_file(const char *project, const char *rel_path) {
+    if (!project || project[0] == '\0' || !rel_path || rel_path[0] == '\0') {
+        cbm_log_error("fqn.file_identity_failed", "code", "CBM_FILE_QN_INPUT_INVALID",
+                      "project", project ? project : "<null>", "path",
+                      rel_path ? rel_path : "<null>", "message",
+                      "file identity requires a non-empty project and relative path",
+                      "remediation",
+                      "pass the canonical project name and discovered repository-relative path");
+        return NULL;
+    }
+
+    char *normalized = strdup(rel_path);
+    if (!normalized) {
+        cbm_log_error("fqn.file_identity_failed", "code", "CBM_FILE_QN_ALLOC_FAILED",
+                      "operation", "normalize_path", "path", rel_path, "message",
+                      "file path allocation failed", "remediation",
+                      "free memory and retry the complete index operation");
+        return NULL;
+    }
+    cbm_normalize_path_sep(normalized);
+
+    char digest[CBM_SHA256_HEX_LEN + 1];
+    cbm_sha256_hex(normalized, strlen(normalized), digest);
+    free(normalized);
+
+    size_t project_len = strlen(project);
+    size_t domain_len = strlen(FQN_FILE_DOMAIN);
+    if (project_len > SIZE_MAX - domain_len ||
+        project_len + domain_len > SIZE_MAX - CBM_SHA256_HEX_LEN) {
+        cbm_log_error("fqn.file_identity_failed", "code", "CBM_FILE_QN_SIZE_OVERFLOW",
+                      "project", project, "path", rel_path, "message",
+                      "file qualified-name length overflowed size_t", "remediation",
+                      "use a valid bounded project name and repository-relative path");
+        return NULL;
+    }
+    size_t result_len = project_len + domain_len + CBM_SHA256_HEX_LEN;
+    if (result_len == SIZE_MAX) {
+        cbm_log_error("fqn.file_identity_failed", "code", "CBM_FILE_QN_SIZE_OVERFLOW",
+                      "project", project, "path", rel_path, "message",
+                      "file qualified-name terminator overflowed size_t", "remediation",
+                      "use a valid bounded project name and repository-relative path");
+        return NULL;
+    }
+    char *result = malloc(result_len + 1);
+    if (!result) {
+        cbm_log_error("fqn.file_identity_failed", "code", "CBM_FILE_QN_ALLOC_FAILED",
+                      "operation", "qualified_name", "path", rel_path, "message",
+                      "file qualified-name allocation failed", "remediation",
+                      "free memory and retry the complete index operation");
+        return NULL;
+    }
+    int written = snprintf(result, result_len + 1, "%s%s%s", project, FQN_FILE_DOMAIN, digest);
+    if (written < 0 || (size_t)written != result_len) {
+        cbm_log_error("fqn.file_identity_failed", "code", "CBM_FILE_QN_FORMAT_FAILED",
+                      "project", project, "path", rel_path, "message",
+                      "file qualified-name formatting was not byte-exact", "remediation",
+                      "inspect the runtime formatter and rebuild the native artifact");
+        free(result);
+        return NULL;
+    }
+    return result;
+}
+
 char *cbm_pipeline_fqn_compute(const char *project, const char *rel_path, const char *name) {
     if (!project) {
         return strdup("");
+    }
+    if (name && strcmp(name, "__file__") == 0) {
+        return cbm_pipeline_fqn_file(project, rel_path);
     }
 
     char *path = strdup(rel_path ? rel_path : "");

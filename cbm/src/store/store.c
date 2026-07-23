@@ -52,7 +52,7 @@ enum {
     ST_METHOD_PROP_LEN = 8,
     ST_PATH_PROP_LEN = 6,
     ST_HANDLER_PROP_LEN = 9,
-    CBM_STORE_SCHEMA_VERSION = 3,
+    CBM_STORE_SCHEMA_VERSION = 4,
 };
 
 #define SLEN(s) (sizeof(s) - 1)
@@ -373,22 +373,59 @@ static int validate_node_identity_index(cbm_store_t *s) {
 }
 
 static int init_schema(cbm_store_t *s) {
-    /* user_version == 0 is accepted because that is a FRESH, just-created store
-     * (SQLITE_OPEN_CREATE stamps 0 by default): this writable open path builds
-     * the schema and stamps 3 below. It is NOT an in-place migration of a
-     * populated legacy v0 store — no data migration exists, by design. A
-     * populated pre-3 store is rejected on the read path by the integrity gate
-     * (store_check_integrity_detailed requires user_version == 3 exactly) and on
-     * a writable reopen by the exact-source / local_name_gen column probes below.
-     * The only sanctioned path for a legacy store is a fresh re-index. So this
-     * branch is reachable (every new project) and required — do not remove it. */
+    /* user_version == 0 is accepted only for a physically empty, just-created
+     * store (SQLITE_OPEN_CREATE stamps 0 by default). It is never an in-place
+     * migration: v4 changes the canonical File-QN contract, and old rows cannot
+     * be safely restamped without a complete source re-index. Any existing
+     * application schema at version 0 is therefore refused below. */
     int initial_user_version = 0;
     if (read_user_version(s, &initial_user_version) != CBM_STORE_OK ||
         (initial_user_version != 0 && initial_user_version != CBM_STORE_SCHEMA_VERSION)) {
         cbm_log_error("store.schema_version_refused", "code", "CBM_SCHEMA_VERSION_UNSUPPORTED",
-                      "message", "SQLite user_version is not the exact stable-atom schema",
+                      "message",
+                      "SQLite user_version is not the exact stable-atom/file-path schema",
                       "remediation", "rebuild from source with this Astrolabe version");
         return CBM_STORE_ERR;
+    }
+    if (initial_user_version == 0) {
+        sqlite3_stmt *objects = NULL;
+        int prepare_rc = sqlite3_prepare_v2(
+            s->db,
+            "SELECT count(*) FROM sqlite_schema "
+            "WHERE name NOT LIKE 'sqlite_%' AND type IN ('table','index','view','trigger');",
+            CBM_NOT_FOUND, &objects, NULL);
+        if (prepare_rc != SQLITE_OK) {
+            cbm_log_error("store.schema_freshness_probe_failed", "code",
+                          "CBM_SCHEMA_FRESHNESS_UNREADABLE", "sqlite_error",
+                          sqlite3_errmsg(s->db), "message",
+                          "the version-0 store could not be proven physically empty", "remediation",
+                          "repair or remove the unreadable cache and rebuild from source");
+            return CBM_STORE_ERR;
+        }
+        int step_rc = sqlite3_step(objects);
+        int object_count = step_rc == SQLITE_ROW ? sqlite3_column_int(objects, 0) : -1;
+        int second_step_rc = step_rc == SQLITE_ROW ? sqlite3_step(objects) : step_rc;
+        int finalize_rc = sqlite3_finalize(objects);
+        if (step_rc != SQLITE_ROW || second_step_rc != SQLITE_DONE || finalize_rc != SQLITE_OK) {
+            cbm_log_error("store.schema_freshness_probe_failed", "code",
+                          "CBM_SCHEMA_FRESHNESS_UNREADABLE", "sqlite_error",
+                          sqlite3_errmsg(s->db), "message",
+                          "the version-0 schema inventory could not be read exactly", "remediation",
+                          "repair or remove the unreadable cache and rebuild from source");
+            return CBM_STORE_ERR;
+        }
+        if (object_count != 0) {
+            char count_buf[CBM_SZ_32];
+            snprintf(count_buf, sizeof(count_buf), "%d", object_count);
+            cbm_log_error("store.schema_unversioned_refused", "code",
+                          "CBM_SCHEMA_VERSION_UNSTAMPED", "application_object_count", count_buf,
+                          "message",
+                          "a version-0 database already contains application schema objects",
+                          "remediation",
+                          "remove the unversioned cache and rebuild it from source; in-place "
+                          "identity migration is unsupported");
+            return CBM_STORE_ERR;
+        }
     }
     const char *ddl =
         "CREATE TABLE IF NOT EXISTS projects ("
@@ -525,7 +562,7 @@ static int init_schema(cbm_store_t *s) {
             sqlite3_free(fts_err);
         }
     }
-    if (exec_sql(s, "PRAGMA user_version = 3;") != CBM_STORE_OK) {
+    if (exec_sql(s, "PRAGMA user_version = 4;") != CBM_STORE_OK) {
         return CBM_STORE_ERR;
     }
     int final_user_version = 0;
@@ -533,7 +570,8 @@ static int init_schema(cbm_store_t *s) {
         final_user_version != CBM_STORE_SCHEMA_VERSION) {
         cbm_log_error("store.schema_version_readback_failed", "code",
                       "CBM_SCHEMA_VERSION_READBACK_FAILED", "message",
-                      "SQLite did not persist the stable-atom schema version", "remediation",
+                      "SQLite did not persist the stable-atom/file-path schema version",
+                      "remediation",
                       "repair the store path or filesystem and rebuild from source");
         return CBM_STORE_ERR;
     }

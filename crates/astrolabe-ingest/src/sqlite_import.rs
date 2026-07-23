@@ -110,7 +110,7 @@ const ASTROLABE_INGEST_ACTOR: &str = "astrolabe-ingest";
 /// (check-cross-process-vault.py). Mirrors LOWERED_DB_BUSY_TIMEOUT_MS
 /// (astrolabe-lower) and CONFIG_DB_BUSY_TIMEOUT_MS (astrolabe-server).
 const CBM_SOURCE_DB_BUSY_TIMEOUT_MS: u64 = 5_000;
-const CBM_SQLITE_SCHEMA_VERSION: i64 = 3;
+const CBM_SQLITE_SCHEMA_VERSION: i64 = 4;
 
 /// Import configuration for a CBM SQLite dump.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1055,7 +1055,7 @@ fn validate_cbm_source_schema(connection: &Connection) -> IngestResult<()> {
         .map_err(|error| invalid_sqlite(format!("read CBM SQLite user_version: {error}")))?;
     if user_version != CBM_SQLITE_SCHEMA_VERSION {
         return Err(invalid_sqlite(format!(
-            "CBM_ATOM_SCHEMA_REBUILD_REQUIRED: SQLite user_version is {user_version}, expected {CBM_SQLITE_SCHEMA_VERSION}; rebuild the collapsed legacy store from source"
+            "CBM_ATOM_SCHEMA_REBUILD_REQUIRED: SQLite user_version is {user_version}, expected {CBM_SQLITE_SCHEMA_VERSION}; rebuild the legacy identity store from source"
         )));
     }
 
@@ -1726,7 +1726,7 @@ fn write_cbm_graph_snapshot_sqlite(snapshot: &CbmGraphSnapshot, path: &Path) -> 
         .map_err(|error| invalid_sqlite(format!("create row-sink SQLite: {error}")))?;
     connection
         .execute_batch(
-            "PRAGMA user_version = 3;
+            "PRAGMA user_version = 4;
              CREATE TABLE projects (
                name TEXT PRIMARY KEY,
                indexed_at TEXT NOT NULL,

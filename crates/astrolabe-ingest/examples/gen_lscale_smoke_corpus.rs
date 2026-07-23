@@ -249,7 +249,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     fs::remove_file(&out).ok();
     let mut connection = Connection::open(&out)?;
     connection.execute_batch(
-        "PRAGMA user_version = 3;
+        "PRAGMA user_version = 4;
          CREATE TABLE projects (
              name TEXT PRIMARY KEY,
              indexed_at TEXT NOT NULL,
