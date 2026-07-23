@@ -275,6 +275,14 @@ static int gitignore_parse_checked(const char *content, cbm_gitignore_t **out) {
         /* Find end of line */
         const char *eol = strchr(line, '\n');
         size_t line_len = eol ? (size_t)(eol - line) : strlen(line);
+        /* CRLF tolerance: a file opened in binary mode (required so the
+         * ftell-size vs fread-count completeness check in the loader is not
+         * defeated by Windows text-mode CRLF->LF translation) keeps the
+         * '\r' before every '\n'. Strip it here so patterns never carry a
+         * trailing carriage return, which would silently break every match. */
+        if (line_len > 0 && line[line_len - 1] == '\r') {
+            line_len--;
+        }
         if (line_len > INT_MAX) {
             cbm_gitignore_free(gi);
             errno = EOVERFLOW;
@@ -313,7 +321,14 @@ int cbm_gitignore_load_checked(const char *path, bool optional, cbm_gitignore_t 
     }
     *out = NULL;
 
-    FILE *f = cbm_fopen(path, "r");
+    /* Binary mode is mandatory: this reader validates completeness by comparing
+     * the ftell(SEEK_END) byte size against the fread byte count. Windows text
+     * mode ("r") translates CRLF->LF, so fread returns FEWER bytes than the
+     * on-disk size and the completeness check below fails closed with errno=EIO
+     * on any file that has CRLF endings (e.g. a .gitignore saved on Windows) --
+     * a deterministic index_repository failure. The parser strips a trailing
+     * '\r' per line, so binary mode does not leave carriage returns in patterns. */
+    FILE *f = cbm_fopen(path, "rb");
     if (!f) {
         if (optional && (errno == ENOENT || errno == ENOTDIR)) {
             return 0;
