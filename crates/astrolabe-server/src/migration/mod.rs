@@ -16,8 +16,9 @@ use astrolabe_guard::{
     dependency_ood_screen_unavailable, screen_prompt_injection_inputs,
 };
 use astrolabe_ingest::{
-    CbmGraphEdge, CbmGraphNode, CbmGraphSnapshot, RowSinkStreamParams, SqliteImportOptions,
-    import_cbm_row_stream_to_vault, snapshot_into_row_stream, verify_chain,
+    CBM_FILE_HASH_ROW_SCHEMA, CbmFileHashRow, CbmGraphEdge, CbmGraphNode, CbmGraphSnapshot,
+    RowSinkStreamParams, SqliteImportOptions, import_cbm_row_stream_to_vault,
+    snapshot_into_row_stream, verify_chain,
 };
 use astrolabe_kernel::{
     BRIDGE_SCHEMA, BridgeKernelSymbol, BridgeReport, BridgeScopeKernel,

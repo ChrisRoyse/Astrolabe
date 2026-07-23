@@ -785,8 +785,8 @@ static void run_postpasses(cbm_pipeline_ctx_t *ctx, cbm_file_info_t *changed_fil
 /* Build the complete replacement beside the live DB, finalize all mandatory
  * state, then atomically swap it into place. The prior source of truth remains
  * byte-for-byte untouched on any pre-swap failure. */
-static int dump_and_persist(cbm_gbuf_t *gbuf, const char *db_path, const char *project,
-                            cbm_file_info_t *files, int file_count,
+static int dump_and_persist(cbm_pipeline_t *pipeline, cbm_gbuf_t *gbuf, const char *db_path,
+                            const char *project, cbm_file_info_t *files, int file_count,
                             const cbm_file_hash_t *mode_skipped, int mode_skipped_count,
                             const char *repo_path) {
     struct timespec t;
@@ -816,6 +816,7 @@ static int dump_and_persist(cbm_gbuf_t *gbuf, const char *db_path, const char *p
         goto cleanup;
     }
 
+    cbm_pipeline_attach_row_sink(pipeline, gbuf);
     int dump_rc = cbm_gbuf_dump_to_sqlite(gbuf, stage);
     cbm_log_info("incremental.dump", "rc", itoa_buf(dump_rc), "elapsed_ms",
                  itoa_buf((int)elapsed_ms(t)));
@@ -833,6 +834,15 @@ static int dump_and_persist(cbm_gbuf_t *gbuf, const char *db_path, const char *p
 
     int final_rc =
         persist_hashes(hash_store, project, files, file_count, mode_skipped, mode_skipped_count);
+    for (int i = 0; final_rc == 0 && i < file_count; i++) {
+        final_rc = cbm_pipeline_emit_file_hash(pipeline, project, files[i].rel_path,
+                                               files[i].sha256, files[i].mtime_ns, files[i].size);
+    }
+    for (int i = 0; final_rc == 0 && i < mode_skipped_count; i++) {
+        final_rc = cbm_pipeline_emit_file_hash(pipeline, project, mode_skipped[i].rel_path,
+                                               mode_skipped[i].sha256, mode_skipped[i].mtime_ns,
+                                               mode_skipped[i].size);
+    }
     if (final_rc == 0 &&
         cbm_store_exec(hash_store, "INSERT INTO nodes_fts(nodes_fts) VALUES('delete-all');") !=
             CBM_STORE_OK) {
@@ -852,6 +862,10 @@ static int dump_and_persist(cbm_gbuf_t *gbuf, const char *db_path, const char *p
     }
     if (final_rc == 0 && !cbm_store_check_integrity(hash_store)) {
         final_rc = CBM_NOT_FOUND;
+    }
+    if (final_rc == 0) {
+        final_rc = cbm_pipeline_complete_row_sink(pipeline,
+                                                  (size_t)file_count + (size_t)mode_skipped_count);
     }
     cbm_store_close(hash_store);
 
@@ -1003,10 +1017,13 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
                  itoa_buf(n_unchanged), "deleted", itoa_buf(deleted_count), "mode_skipped",
                  itoa_buf(mode_skipped_count));
 
-    /* Fast path: nothing changed → skip. The on-disk DB is left untouched,
-     * which means existing hash rows (including for any mode-skipped files
-     * that were already preserved by an earlier run) remain intact. */
-    if (n_changed == 0 && deleted_count == 0) {
+    /* Fast path: without a snapshot consumer, leave the complete on-disk DB
+     * untouched. A registered v1 sink is different: success means a complete
+     * node/edge/file-hash stream plus manifest, never an empty "noop" stream.
+     * That route loads and atomically re-materializes the existing graph below
+     * without re-parsing source files. */
+    bool snapshot_noop = n_changed == 0 && deleted_count == 0;
+    if (snapshot_noop && !cbm_pipeline_row_sink_active(p)) {
         cbm_log_info("incremental.noop", "reason", "no_changes");
         free(is_changed);
         free(deleted);
@@ -1069,6 +1086,25 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
     }
 
     cbm_store_close(store);
+
+    if (snapshot_noop) {
+        cbm_log_info("incremental.noop", "reason", "complete_snapshot_sink");
+        cbm_pipeline_set_committed_counts(p, cbm_gbuf_node_count(existing),
+                                          cbm_gbuf_edge_count(existing));
+        int persist_rc =
+            dump_and_persist(p, existing, db_path, project, files, file_count, mode_skipped,
+                             mode_skipped_count, cbm_pipeline_repo_path(p));
+        cbm_gbuf_free(existing);
+        free(changed_files);
+        free(deleted);
+        free_mode_skipped(mode_skipped, mode_skipped_count);
+        if (persist_rc != 0) {
+            return CBM_NOT_FOUND;
+        }
+        cbm_log_info("incremental.done", "route", "noop_snapshot", "elapsed_ms",
+                     itoa_buf((int)elapsed_ms(t0)));
+        return 0;
+    }
 
     /* Snapshot inbound cross-file edges into changed files BEFORE purging, so
      * the cascade delete doesn't permanently drop edges whose source lives in
@@ -1268,8 +1304,8 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
      * covers incremental reindexes, not just full ones. */
     cbm_pipeline_set_committed_counts(p, cbm_gbuf_node_count(existing),
                                       cbm_gbuf_edge_count(existing));
-    int persist_rc = dump_and_persist(existing, db_path, project, files, file_count, mode_skipped,
-                                      mode_skipped_count, cbm_pipeline_repo_path(p));
+    int persist_rc = dump_and_persist(p, existing, db_path, project, files, file_count,
+                                      mode_skipped, mode_skipped_count, cbm_pipeline_repo_path(p));
     free_mode_skipped(mode_skipped, mode_skipped_count);
     cbm_gbuf_free(existing);
 

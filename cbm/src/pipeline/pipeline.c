@@ -35,6 +35,7 @@ enum { CBM_DIR_PERMS = 0755, PL_RING = 4, PL_RING_MASK = 3, PL_SEQ_PASSES = 6, P
 #include "foundation/profile.h"
 #include "foundation/mem.h"
 #include "foundation/sha256.h"
+#include "foundation/schema_version.h"
 
 #include <stdint.h>
 #include <errno.h>
@@ -150,9 +151,9 @@ struct cbm_pipeline {
     cbm_index_mode_t mode;
     atomic_int cancelled;
     bool persistence; /* write .codebase-memory/graph.db.zst after indexing */
-    cbm_gbuf_row_node_sink_fn row_node_sink;
-    cbm_gbuf_row_edge_sink_fn row_edge_sink;
-    void *row_sink_ctx;
+    cbm_pipeline_row_sink_v1_t row_sink;
+    bool row_sink_active;
+    bool row_sink_completed;
 
     /* Indexing state (set during run) */
     cbm_gbuf_t *gbuf;
@@ -256,17 +257,45 @@ void cbm_pipeline_set_persistence(cbm_pipeline_t *p, bool enabled) {
     }
 }
 
-void cbm_pipeline_set_sink(cbm_pipeline_t *p, cbm_gbuf_row_node_sink_fn node_cb,
-                           cbm_gbuf_row_edge_sink_fn edge_cb, void *ctx) {
+int cbm_pipeline_set_sink(cbm_pipeline_t *p, const cbm_pipeline_row_sink_v1_t *sink) {
     if (!p) {
-        return;
+        cbm_log_error("pipeline.row_sink_refused", "code", "CBM_PIPELINE_ROW_SINK_PIPELINE_NULL",
+                      "message", "a row sink cannot be installed on a NULL pipeline", "remediation",
+                      "create the pipeline successfully before installing a sink");
+        return CBM_NOT_FOUND;
     }
-    p->row_node_sink = node_cb;
-    p->row_edge_sink = edge_cb;
-    p->row_sink_ctx = ctx;
+    if (!sink) {
+        memset(&p->row_sink, 0, sizeof(p->row_sink));
+        p->row_sink_active = false;
+        p->row_sink_completed = false;
+        if (p->gbuf) {
+            cbm_gbuf_set_row_sink(p->gbuf, NULL, NULL, NULL);
+        }
+        return 0;
+    }
+    if (sink->abi_version != CBM_PIPELINE_ROW_SINK_ABI_V1 ||
+        sink->struct_size != sizeof(cbm_pipeline_row_sink_v1_t)) {
+        cbm_log_error("pipeline.row_sink_refused", "code", "CBM_PIPELINE_ROW_SINK_ABI_UNSUPPORTED",
+                      "message", "the row-sink ABI version or descriptor size is unsupported",
+                      "remediation",
+                      "construct the exact frozen cbm_pipeline_row_sink_v1_t descriptor");
+        return CBM_NOT_FOUND;
+    }
+    if (!sink->node || !sink->edge || !sink->file_hash || !sink->complete || !sink->ctx) {
+        cbm_log_error(
+            "pipeline.row_sink_refused", "code", "CBM_PIPELINE_ROW_SINK_INCOMPLETE", "message",
+            "a complete snapshot sink requires node, edge, file-hash, completion, and "
+            "context fields",
+            "remediation", "install every v1 callback together or pass NULL to disable the sink");
+        return CBM_NOT_FOUND;
+    }
+    p->row_sink = *sink;
+    p->row_sink_active = true;
+    p->row_sink_completed = false;
     if (p->gbuf) {
-        cbm_gbuf_set_row_sink(p->gbuf, node_cb, edge_cb, ctx);
+        cbm_gbuf_set_row_sink(p->gbuf, sink->node, sink->edge, sink->ctx);
     }
+    return 0;
 }
 
 bool cbm_pipeline_set_project_name(cbm_pipeline_t *p, const char *name) {
@@ -418,6 +447,82 @@ void cbm_pipeline_set_committed_counts(cbm_pipeline_t *p, int nodes, int edges) 
         p->committed_nodes = nodes;
         p->committed_edges = edges;
     }
+}
+
+bool cbm_pipeline_row_sink_active(const cbm_pipeline_t *p) {
+    return p && p->row_sink_active;
+}
+
+void cbm_pipeline_attach_row_sink(cbm_pipeline_t *p, cbm_gbuf_t *gbuf) {
+    if (!gbuf) {
+        return;
+    }
+    if (p && p->row_sink_active) {
+        cbm_gbuf_set_row_sink(gbuf, p->row_sink.node, p->row_sink.edge, p->row_sink.ctx);
+    } else {
+        cbm_gbuf_set_row_sink(gbuf, NULL, NULL, NULL);
+    }
+}
+
+int cbm_pipeline_emit_file_hash(cbm_pipeline_t *p, const char *project, const char *rel_path,
+                                const char *sha256, int64_t mtime_ns, int64_t size) {
+    if (!p || !p->row_sink_active) {
+        return 0;
+    }
+    if (!project || !project[0] || !rel_path || !rel_path[0] || !sha256 ||
+        strlen(sha256) != CBM_SHA256_HEX_LEN) {
+        cbm_log_error("pipeline.row_sink_refused", "code",
+                      "CBM_PIPELINE_ROW_SINK_FILE_HASH_INVALID", "rel_path",
+                      rel_path ? rel_path : "", "message",
+                      "a persisted file-hash row is incomplete or malformed", "remediation",
+                      "repair source-snapshot identity capture before publishing rows");
+        return CBM_NOT_FOUND;
+    }
+    cbm_pipeline_row_file_hash_t row = {
+        .project = project,
+        .rel_path = rel_path,
+        .sha256 = sha256,
+        .mtime_ns = mtime_ns,
+        .size = size,
+    };
+    if (p->row_sink.file_hash(&row, p->row_sink.ctx) != 0) {
+        cbm_log_error("pipeline.row_sink_refused", "code",
+                      "CBM_PIPELINE_ROW_SINK_FILE_HASH_CALLBACK_FAILED", "rel_path", rel_path,
+                      "message", "the consumer refused a persisted file-hash row", "remediation",
+                      "inspect the consumer's structured callback error and retry");
+        return CBM_NOT_FOUND;
+    }
+    return 0;
+}
+
+int cbm_pipeline_complete_row_sink(cbm_pipeline_t *p, size_t file_hash_count) {
+    if (!p || !p->row_sink_active) {
+        return 0;
+    }
+    if (p->row_sink_completed || p->committed_nodes < 0 || p->committed_edges < 0) {
+        cbm_log_error(
+            "pipeline.row_sink_refused", "code", "CBM_PIPELINE_ROW_SINK_COMPLETION_INVALID",
+            "message", "the snapshot completion manifest is duplicate or lacks committed counts",
+            "remediation", "emit exactly one manifest after all graph and file-hash rows");
+        return CBM_NOT_FOUND;
+    }
+    cbm_pipeline_row_manifest_t manifest = {
+        .project = p->project_name,
+        .node_count = (size_t)p->committed_nodes,
+        .edge_count = (size_t)p->committed_edges,
+        .file_hash_count = file_hash_count,
+        .graph_schema_version = CBM_GRAPH_SCHEMA_VERSION,
+    };
+    if (p->row_sink.complete(&manifest, p->row_sink.ctx) != 0) {
+        cbm_log_error("pipeline.row_sink_refused", "code",
+                      "CBM_PIPELINE_ROW_SINK_COMPLETION_CALLBACK_FAILED", "message",
+                      "the consumer refused the completed snapshot manifest", "remediation",
+                      "compare observed rows to the declared counts and repair the producer or "
+                      "consumer contract");
+        return CBM_NOT_FOUND;
+    }
+    p->row_sink_completed = true;
+    return 0;
 }
 
 static int effective_worker_count(bool initial) {
@@ -1466,6 +1571,11 @@ static int dump_and_persist_hashes(cbm_pipeline_t *p, const cbm_file_info_t *fil
                               p->project_name);
                 final_rc = CBM_NOT_FOUND;
             }
+            for (int i = 0; final_rc == 0 && i < file_count; i++) {
+                final_rc = cbm_pipeline_emit_file_hash(p, fhashes[i].project, fhashes[i].rel_path,
+                                                       fhashes[i].sha256, fhashes[i].mtime_ns,
+                                                       fhashes[i].size);
+            }
             free(fhashes);
         }
         CBM_PROF_END_N("persist", "4_file_hashes", t_fh, file_count);
@@ -1500,6 +1610,9 @@ static int dump_and_persist_hashes(cbm_pipeline_t *p, const cbm_file_info_t *fil
         }
         if (final_rc == 0 && !cbm_store_check_integrity(hash_store)) {
             final_rc = CBM_NOT_FOUND;
+        }
+        if (final_rc == 0) {
+            final_rc = cbm_pipeline_complete_row_sink(p, (size_t)file_count);
         }
         cbm_store_close(hash_store);
         cbm_log_info("pass.timing", "pass", "persist_hashes", "files", itoa_buf(file_count));
@@ -1727,6 +1840,7 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
     if (!p) {
         return CBM_NOT_FOUND;
     }
+    p->row_sink_completed = false;
 
     CBM_PROF_START(t_pipeline_total);
     struct timespec t0;
@@ -1842,7 +1956,7 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
 
     /* Phase 2: Create graph buffer and registry */
     p->gbuf = cbm_gbuf_new(p->project_name, p->repo_path);
-    cbm_gbuf_set_row_sink(p->gbuf, p->row_node_sink, p->row_edge_sink, p->row_sink_ctx);
+    cbm_pipeline_attach_row_sink(p, p->gbuf);
     p->registry = cbm_registry_new();
 
     /* Phase 2b: Load build-tool path aliases (tsconfig/jsconfig today). NULL

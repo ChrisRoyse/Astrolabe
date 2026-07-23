@@ -9,7 +9,8 @@ use astrolabe_anchors::{
     OutcomeAnchorRequest, OutcomeKind, OutcomeSubject, ingest_outcome_anchors,
 };
 use astrolabe_bridge::{
-    CbmIndexMode, CbmPipeline, CbmPipelineEdgeRow, CbmPipelineNodeRow, CbmPipelineRows,
+    CbmIndexMode, CbmPipeline, CbmPipelineEdgeRow, CbmPipelineFileHashRow, CbmPipelineNodeRow,
+    CbmPipelineRowManifest, CbmPipelineRows,
 };
 // #502: share the clone farm's #480 Windows-invalid-path classifier so the historical
 // checkout and the farm never disagree on what NTFS can hold.
@@ -1272,6 +1273,20 @@ fn serialize_pipeline_rows(rows: &CbmPipelineRows) -> Value {
             "url_path_gen": e.url_path_gen,
             "local_name_gen": e.local_name_gen,
         })).collect::<Vec<_>>(),
+        "file_hashes": rows.file_hashes.iter().map(|f| json!({
+            "project": f.project,
+            "rel_path": f.rel_path,
+            "sha256": f.sha256,
+            "mtime_ns": f.mtime_ns,
+            "size": f.size,
+        })).collect::<Vec<_>>(),
+        "manifest": rows.manifest.as_ref().map(|m| json!({
+            "project": m.project,
+            "node_count": m.node_count,
+            "edge_count": m.edge_count,
+            "file_hash_count": m.file_hash_count,
+            "graph_schema_version": m.graph_schema_version,
+        })),
     })
 }
 
@@ -1282,6 +1297,15 @@ fn serialize_pipeline_rows(rows: &CbmPipelineRows) -> Value {
 fn parse_extract_response(bytes: &[u8], project: &str) -> Result<CbmPipelineRows, String> {
     let value: Value =
         serde_json::from_slice(bytes).map_err(|error| format!("response JSON parse: {error}"))?;
+    let response_project = value["project"]
+        .as_str()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "response missing non-empty 'project' string".to_string())?;
+    if response_project != project {
+        return Err(format!(
+            "response project {response_project:?} does not match requested project {project:?}"
+        ));
+    }
     let nodes = value["nodes"]
         .as_array()
         .ok_or_else(|| "response missing 'nodes' array".to_string())?
@@ -1294,11 +1318,91 @@ fn parse_extract_response(bytes: &[u8], project: &str) -> Result<CbmPipelineRows
         .iter()
         .map(parse_extract_edge)
         .collect::<Result<Vec<_>, String>>()?;
-    Ok(CbmPipelineRows {
-        project: value["project"].as_str().unwrap_or(project).to_string(),
+    let file_hashes = value["file_hashes"]
+        .as_array()
+        .ok_or_else(|| "response missing 'file_hashes' array".to_string())?
+        .iter()
+        .map(parse_extract_file_hash)
+        .collect::<Result<Vec<_>, String>>()?;
+    let manifest = value
+        .get("manifest")
+        .filter(|manifest| !manifest.is_null())
+        .map(parse_extract_manifest)
+        .transpose()?
+        .ok_or_else(|| "response missing mandatory completion manifest".to_string())?;
+    let rows = CbmPipelineRows {
+        project: response_project.to_string(),
         nodes,
         edges,
-    })
+        file_hashes,
+        manifest: Some(manifest),
+    };
+    validate_extract_pipeline_rows(&rows, project)?;
+    Ok(rows)
+}
+
+fn validate_extract_pipeline_rows(rows: &CbmPipelineRows, project: &str) -> Result<(), String> {
+    let manifest = rows
+        .manifest
+        .as_ref()
+        .ok_or_else(|| "response missing mandatory completion manifest".to_string())?;
+    if manifest.project != project
+        || manifest.node_count != rows.nodes.len()
+        || manifest.edge_count != rows.edges.len()
+        || manifest.file_hash_count != rows.file_hashes.len()
+        || manifest.graph_schema_version != astrolabe_ingest::CBM_SQLITE_SCHEMA_VERSION as u32
+    {
+        return Err(format!(
+            "response completion manifest does not match observed snapshot: \
+             project={:?}/{project:?}, nodes={}/{}, edges={}/{}, file_hashes={}/{}, schema={}/{}",
+            manifest.project,
+            manifest.node_count,
+            rows.nodes.len(),
+            manifest.edge_count,
+            rows.edges.len(),
+            manifest.file_hash_count,
+            rows.file_hashes.len(),
+            manifest.graph_schema_version,
+            astrolabe_ingest::CBM_SQLITE_SCHEMA_VERSION as u32,
+        ));
+    }
+    if let Some(row_project) = rows
+        .nodes
+        .iter()
+        .map(|row| row.project.as_str())
+        .chain(rows.edges.iter().map(|row| row.project.as_str()))
+        .chain(rows.file_hashes.iter().map(|row| row.project.as_str()))
+        .find(|row_project| *row_project != project)
+    {
+        return Err(format!(
+            "response contains row for project {row_project:?}, not {project:?}"
+        ));
+    }
+
+    let mut file_paths = BTreeSet::new();
+    for file_hash in &rows.file_hashes {
+        if file_hash.rel_path.is_empty()
+            || file_hash.rel_path.contains('\\')
+            || file_hash.size < 0
+            || file_hash.sha256.len() != 64
+            || !file_hash
+                .sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err(format!(
+                "response file-hash row for {:?} is noncanonical",
+                file_hash.rel_path
+            ));
+        }
+        if !file_paths.insert(file_hash.rel_path.as_str()) {
+            return Err(format!(
+                "response repeats file-hash path {:?}",
+                file_hash.rel_path
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn parse_extract_node(value: &Value) -> Result<CbmPipelineNodeRow, String> {
@@ -1376,6 +1480,52 @@ fn parse_extract_edge(value: &Value) -> Result<CbmPipelineEdgeRow, String> {
         properties_json: str_field("properties_json")?,
         url_path_gen: str_field("url_path_gen")?,
         local_name_gen: str_field("local_name_gen")?,
+    })
+}
+
+fn parse_extract_file_hash(value: &Value) -> Result<CbmPipelineFileHashRow, String> {
+    let str_field = |key: &str| -> Result<String, String> {
+        value[key]
+            .as_str()
+            .map(str::to_string)
+            .ok_or_else(|| format!("file-hash row missing string field '{key}'"))
+    };
+    let i64_field = |key: &str| -> Result<i64, String> {
+        value[key]
+            .as_i64()
+            .ok_or_else(|| format!("file-hash row missing integer field '{key}'"))
+    };
+    Ok(CbmPipelineFileHashRow {
+        project: str_field("project")?,
+        rel_path: str_field("rel_path")?,
+        sha256: str_field("sha256")?,
+        mtime_ns: i64_field("mtime_ns")?,
+        size: i64_field("size")?,
+    })
+}
+
+fn parse_extract_manifest(value: &Value) -> Result<CbmPipelineRowManifest, String> {
+    let usize_field = |key: &str| -> Result<usize, String> {
+        let raw = value[key]
+            .as_u64()
+            .ok_or_else(|| format!("manifest missing unsigned integer field '{key}'"))?;
+        usize::try_from(raw).map_err(|_| format!("manifest field '{key}' exceeds usize"))
+    };
+    let graph_schema_version = value["graph_schema_version"]
+        .as_u64()
+        .ok_or_else(|| "manifest missing unsigned integer field 'graph_schema_version'".to_string())
+        .and_then(|raw| {
+            u32::try_from(raw).map_err(|_| "manifest graph_schema_version exceeds u32".to_string())
+        })?;
+    Ok(CbmPipelineRowManifest {
+        project: value["project"]
+            .as_str()
+            .map(str::to_string)
+            .ok_or_else(|| "manifest missing string field 'project'".to_string())?,
+        node_count: usize_field("node_count")?,
+        edge_count: usize_field("edge_count")?,
+        file_hash_count: usize_field("file_hash_count")?,
+        graph_schema_version,
     })
 }
 
@@ -1490,6 +1640,8 @@ fn index_historical_commit(
                 project: project.to_string(),
                 nodes: Vec::new(),
                 edges: Vec::new(),
+                file_hashes: Vec::new(),
+                manifest: None,
             }));
         }
         // #515 crash isolation + #530 pooling: run the CBM extraction in the POOLED
@@ -1546,6 +1698,8 @@ fn index_historical_commit(
                 project: project.to_string(),
                 nodes: Vec::new(),
                 edges: Vec::new(),
+                file_hashes: Vec::new(),
+                manifest: None,
             },
             cleanup_remnants,
             windows_invalid_excluded,
@@ -1960,6 +2114,8 @@ fn select_implicated_rows(mut rows: CbmPipelineRows, evidence: &[Evidence]) -> C
     rows.nodes.sort_by_key(|node| node.id);
     rows.nodes.dedup_by(|left, right| left.id == right.id);
     rows.edges.clear();
+    rows.file_hashes.clear();
+    rows.manifest = None;
     rows
 }
 

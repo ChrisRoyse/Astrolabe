@@ -1,11 +1,18 @@
 /*
- * row_sink.h - Borrowed dump-row callback contract for graph-buffer and pipeline sinks.
+ * row_sink.h - Borrowed dump-row callback contracts.
+ *
+ * The graph-buffer callbacks are the low-level node/edge dump hooks. The
+ * pipeline v1 descriptor is the complete source-snapshot contract consumed by
+ * embedders: every registered callback is mandatory and the final manifest is
+ * emitted exactly once only after all rows have been accepted.
  */
 #ifndef CBM_GRAPH_BUFFER_ROW_SINK_H
 #define CBM_GRAPH_BUFFER_ROW_SINK_H
 
 #include <stddef.h>
 #include <stdint.h>
+
+#include "foundation/schema_version.h"
 
 /* Dump-row sink structs. These rows are borrowed and valid only for the
  * callback duration. IDs are final SQLite IDs, not temporary graph-buffer IDs. */
@@ -39,8 +46,46 @@ typedef struct {
     const char *local_name_gen;
 } cbm_gbuf_row_edge_t;
 
-/* Return 0 to continue. Any non-zero return aborts the dump with -1. */
+typedef struct {
+    const char *project;
+    const char *rel_path;
+    const char *sha256;
+    int64_t mtime_ns;
+    int64_t size;
+} cbm_pipeline_row_file_hash_t;
+
+typedef struct {
+    const char *project;
+    size_t node_count;
+    size_t edge_count;
+    size_t file_hash_count;
+    uint32_t graph_schema_version;
+} cbm_pipeline_row_manifest_t;
+
+/* Return 0 to continue. Any non-zero return aborts the publication. */
 typedef int (*cbm_gbuf_row_node_sink_fn)(const cbm_gbuf_row_node_t *node, void *ctx);
 typedef int (*cbm_gbuf_row_edge_sink_fn)(const cbm_gbuf_row_edge_t *edge, void *ctx);
+typedef int (*cbm_pipeline_row_file_hash_sink_fn)(const cbm_pipeline_row_file_hash_t *file_hash,
+                                                  void *ctx);
+typedef int (*cbm_pipeline_row_complete_sink_fn)(const cbm_pipeline_row_manifest_t *manifest,
+                                                 void *ctx);
+
+/*
+ * Frozen pipeline snapshot ABI v1. Do not append fields: publish a v2
+ * descriptor for any incompatible extension. A non-NULL descriptor is accepted
+ * only when abi_version/struct_size match exactly and every callback/context is
+ * non-NULL. The pipeline copies the descriptor; callback rows remain borrowed
+ * for the duration of each call.
+ */
+#define CBM_PIPELINE_ROW_SINK_ABI_V1 1U
+typedef struct {
+    uint32_t abi_version;
+    size_t struct_size;
+    cbm_gbuf_row_node_sink_fn node;
+    cbm_gbuf_row_edge_sink_fn edge;
+    cbm_pipeline_row_file_hash_sink_fn file_hash;
+    cbm_pipeline_row_complete_sink_fn complete;
+    void *ctx;
+} cbm_pipeline_row_sink_v1_t;
 
 #endif /* CBM_GRAPH_BUFFER_ROW_SINK_H */

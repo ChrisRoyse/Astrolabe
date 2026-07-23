@@ -76,7 +76,7 @@ const SCHEMA_NODE_MAP: &str = "astrolabe-node-map-v3";
 const SCHEMA_SYMBOL_METADATA: &str = "astrolabe-sqlite-symbol-v2";
 const SCHEMA_STRUCTURAL_NODE: &str = "astrolabe-structural-node-v2";
 const SCHEMA_PROJECT_ROW: &str = "astrolabe-cbm-project-v1";
-const SCHEMA_FILE_HASH_ROW: &str = "astrolabe-file-hash-v1";
+pub const CBM_FILE_HASH_ROW_SCHEMA: &str = "astrolabe-file-hash-v1";
 const SCHEMA_PROJECT_SUMMARY_ROW: &str = "astrolabe-project-summary-v1";
 const SCHEMA_TOKEN_VECTOR_ROW: &str = "astrolabe-token-vector-v1";
 const SCHEMA_CBM_EDGE_ROW: &str = "astrolabe-cbm-edge-v1";
@@ -110,7 +110,7 @@ const ASTROLABE_INGEST_ACTOR: &str = "astrolabe-ingest";
 /// (check-cross-process-vault.py). Mirrors LOWERED_DB_BUSY_TIMEOUT_MS
 /// (astrolabe-lower) and CONFIG_DB_BUSY_TIMEOUT_MS (astrolabe-server).
 const CBM_SOURCE_DB_BUSY_TIMEOUT_MS: u64 = 5_000;
-const CBM_SQLITE_SCHEMA_VERSION: i64 = 4;
+pub const CBM_SQLITE_SCHEMA_VERSION: i64 = 4;
 
 /// Import configuration for a CBM SQLite dump.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1996,7 +1996,7 @@ fn snapshot_metadata_rows(
     for file_hash in &snapshot.file_hashes {
         validate_snapshot_schema(
             &file_hash.schema,
-            SCHEMA_FILE_HASH_ROW,
+            CBM_FILE_HASH_ROW_SCHEMA,
             "row-sink file hash metadata",
         )?;
         if file_hash.project == options.project {
@@ -2719,6 +2719,16 @@ pub struct CbmSqlitePipelineEdge {
     pub local_name_gen: String,
 }
 
+/// An exact CBM `file_hashes` row read from the persisted source snapshot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CbmSqlitePipelineFileHash {
+    pub project: String,
+    pub rel_path: String,
+    pub sha256: String,
+    pub mtime_ns: i64,
+    pub size: i64,
+}
+
 /// The full CBM pipeline row stream for one project, read back from its persisted
 /// CBM SQLite (`<project>.db`) — the out-of-process equivalent of the in-process
 /// FFI row sink (#405).
@@ -2727,6 +2737,8 @@ pub struct CbmSqlitePipelineRows {
     pub project: String,
     pub nodes: Vec<CbmSqlitePipelineNode>,
     pub edges: Vec<CbmSqlitePipelineEdge>,
+    pub file_hashes: Vec<CbmSqlitePipelineFileHash>,
+    pub graph_schema_version: u32,
 }
 
 /// Reads the CBM pipeline row stream for `project` back from a persisted CBM SQLite
@@ -2752,6 +2764,7 @@ pub fn read_cbm_sqlite_pipeline_rows(
     let connection = open_cbm_source_connection(sqlite_path)?;
     let raw_nodes = read_nodes(&connection, project)?;
     let raw_edges = read_edges(&connection, project)?;
+    let raw_file_hashes = read_file_hashes(&connection, project)?;
     let nodes = raw_nodes
         .into_iter()
         .map(|node| CbmSqlitePipelineNode {
@@ -2797,10 +2810,22 @@ pub fn read_cbm_sqlite_pipeline_rows(
             }
         })
         .collect();
+    let file_hashes = raw_file_hashes
+        .into_iter()
+        .map(|file_hash| CbmSqlitePipelineFileHash {
+            project: file_hash.project,
+            rel_path: file_hash.rel_path,
+            sha256: file_hash.sha256,
+            mtime_ns: file_hash.mtime_ns,
+            size: file_hash.size,
+        })
+        .collect();
     Ok(CbmSqlitePipelineRows {
         project: project.to_string(),
         nodes,
         edges,
+        file_hashes,
+        graph_schema_version: CBM_SQLITE_SCHEMA_VERSION as u32,
     })
 }
 
@@ -3580,7 +3605,7 @@ fn metadata_graph_rows(
             continue;
         }
         let row = CbmFileHashRow {
-            schema: SCHEMA_FILE_HASH_ROW.to_string(),
+            schema: CBM_FILE_HASH_ROW_SCHEMA.to_string(),
             project: file_hash.project,
             rel_path: file_hash.rel_path,
             sha256: file_hash.sha256,
@@ -5339,7 +5364,7 @@ where
     let mut file_hashes = filter_schema_project(
         read_graph_rows(vault, snapshot, FILE_HASH_ROW_PREFIX)?,
         project,
-        |row: &CbmFileHashRow| (&row.schema, SCHEMA_FILE_HASH_ROW, &row.project),
+        |row: &CbmFileHashRow| (&row.schema, CBM_FILE_HASH_ROW_SCHEMA, &row.project),
     )?;
     file_hashes.sort_by(|left, right| left.rel_path.cmp(&right.rel_path));
 

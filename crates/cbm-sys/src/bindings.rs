@@ -4,6 +4,7 @@ pub const CBM_ARENA_MAX_BLOCKS: u32 = 256;
 pub const CBM_ARENA_DEFAULT_BLOCK_SIZE: u32 = 65536;
 pub const CBM_MAX_CALL_ARGS: u32 = 8;
 pub const CBM_MAX_STRING_CONSTANTS: u32 = 256;
+pub const CBM_PIPELINE_ROW_SINK_ABI_V1: u32 = 1;
 pub const CBM_ASTRO_LOWERED_DB_SUFFIX: &[u8; 22] = b".astrolabe-lowered.db\0";
 pub const CBM_ASTRO_ARCHAEOLOGY_DB_PREFIX: &[u8; 24] = b".astrolabe-archaeology-\0";
 pub const CBM_STORE_OK: u32 = 0;
@@ -1599,6 +1600,8 @@ unsafe extern "C" {
         buf_size: ::std::os::raw::c_int,
     ) -> ::std::os::raw::c_int;
 }
+pub const CBM_GRAPH_SCHEMA_VERSION: _bindgen_ty_1 = 4;
+pub type _bindgen_ty_1 = ::std::os::raw::c_int;
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct cbm_gbuf_row_node_t {
@@ -1649,6 +1652,42 @@ impl Default for cbm_gbuf_row_edge_t {
         }
     }
 }
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct cbm_pipeline_row_file_hash_t {
+    pub project: *const ::std::os::raw::c_char,
+    pub rel_path: *const ::std::os::raw::c_char,
+    pub sha256: *const ::std::os::raw::c_char,
+    pub mtime_ns: i64,
+    pub size: i64,
+}
+impl Default for cbm_pipeline_row_file_hash_t {
+    fn default() -> Self {
+        let mut s = ::std::mem::MaybeUninit::<Self>::uninit();
+        unsafe {
+            ::std::ptr::write_bytes(s.as_mut_ptr(), 0, 1);
+            s.assume_init()
+        }
+    }
+}
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct cbm_pipeline_row_manifest_t {
+    pub project: *const ::std::os::raw::c_char,
+    pub node_count: usize,
+    pub edge_count: usize,
+    pub file_hash_count: usize,
+    pub graph_schema_version: u32,
+}
+impl Default for cbm_pipeline_row_manifest_t {
+    fn default() -> Self {
+        let mut s = ::std::mem::MaybeUninit::<Self>::uninit();
+        unsafe {
+            ::std::ptr::write_bytes(s.as_mut_ptr(), 0, 1);
+            s.assume_init()
+        }
+    }
+}
 pub type cbm_gbuf_row_node_sink_fn = ::std::option::Option<
     unsafe extern "C" fn(
         node: *const cbm_gbuf_row_node_t,
@@ -1661,6 +1700,38 @@ pub type cbm_gbuf_row_edge_sink_fn = ::std::option::Option<
         ctx: *mut ::std::os::raw::c_void,
     ) -> ::std::os::raw::c_int,
 >;
+pub type cbm_pipeline_row_file_hash_sink_fn = ::std::option::Option<
+    unsafe extern "C" fn(
+        file_hash: *const cbm_pipeline_row_file_hash_t,
+        ctx: *mut ::std::os::raw::c_void,
+    ) -> ::std::os::raw::c_int,
+>;
+pub type cbm_pipeline_row_complete_sink_fn = ::std::option::Option<
+    unsafe extern "C" fn(
+        manifest: *const cbm_pipeline_row_manifest_t,
+        ctx: *mut ::std::os::raw::c_void,
+    ) -> ::std::os::raw::c_int,
+>;
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct cbm_pipeline_row_sink_v1_t {
+    pub abi_version: u32,
+    pub struct_size: usize,
+    pub node: cbm_gbuf_row_node_sink_fn,
+    pub edge: cbm_gbuf_row_edge_sink_fn,
+    pub file_hash: cbm_pipeline_row_file_hash_sink_fn,
+    pub complete: cbm_pipeline_row_complete_sink_fn,
+    pub ctx: *mut ::std::os::raw::c_void,
+}
+impl Default for cbm_pipeline_row_sink_v1_t {
+    fn default() -> Self {
+        let mut s = ::std::mem::MaybeUninit::<Self>::uninit();
+        unsafe {
+            ::std::ptr::write_bytes(s.as_mut_ptr(), 0, 1);
+            s.assume_init()
+        }
+    }
+}
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct cbm_store {
@@ -1811,10 +1882,8 @@ unsafe extern "C" {
 unsafe extern "C" {
     pub fn cbm_mcp_server_set_row_sink(
         srv: *mut cbm_mcp_server_t,
-        node_cb: cbm_gbuf_row_node_sink_fn,
-        edge_cb: cbm_gbuf_row_edge_sink_fn,
-        ctx: *mut ::std::os::raw::c_void,
-    );
+        sink: *const cbm_pipeline_row_sink_v1_t,
+    ) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {
     pub fn cbm_mcp_server_handle(
@@ -1890,10 +1959,8 @@ unsafe extern "C" {
 unsafe extern "C" {
     pub fn cbm_pipeline_set_sink(
         p: *mut cbm_pipeline_t,
-        node_cb: cbm_gbuf_row_node_sink_fn,
-        edge_cb: cbm_gbuf_row_edge_sink_fn,
-        ctx: *mut ::std::os::raw::c_void,
-    );
+        sink: *const cbm_pipeline_row_sink_v1_t,
+    ) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {
     pub fn cbm_pipeline_free(p: *mut cbm_pipeline_t);
@@ -2178,10 +2245,10 @@ pub const cbm_store_verify_status_t_CBM_STORE_VERIFY_INTEGRITY_FAILED: cbm_store
     2;
 pub const cbm_store_verify_status_t_CBM_STORE_VERIFY_IO_FAILED: cbm_store_verify_status_t = 3;
 pub type cbm_store_verify_status_t = ::std::os::raw::c_int;
-pub const CBM_STORE_VERIFY_OPERATION_MAX: _bindgen_ty_1 = 64;
-pub const CBM_STORE_VERIFY_DETAIL_MAX: _bindgen_ty_1 = 512;
-pub const CBM_STORE_VERIFY_PATH_MAX: _bindgen_ty_1 = 4096;
-pub type _bindgen_ty_1 = ::std::os::raw::c_int;
+pub const CBM_STORE_VERIFY_OPERATION_MAX: _bindgen_ty_2 = 64;
+pub const CBM_STORE_VERIFY_DETAIL_MAX: _bindgen_ty_2 = 512;
+pub const CBM_STORE_VERIFY_PATH_MAX: _bindgen_ty_2 = 4096;
+pub type _bindgen_ty_2 = ::std::os::raw::c_int;
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct cbm_store_verify_result_t {

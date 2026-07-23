@@ -2056,9 +2056,10 @@ pub(crate) enum ShadowIndexPassOutcome {
 /// Reads the CBM SQLite (`<project>.db`) written by the out-of-process index pass
 /// back into the row-sink-equivalent [`CbmPipelineRows`] (#405).
 ///
-/// The SQLite `nodes`/`edges` tables and the in-process row-sink stream are two
-/// serializations of the identical in-memory dump arrays (same final ids), so this
-/// readback reproduces the row stream the sink would have delivered — see
+/// The SQLite `nodes`/`edges`/`file_hashes` tables and the in-process row-sink stream
+/// are two serializations of the identical committed snapshot (same final ids and
+/// exact captured file facts), so this readback reproduces the row stream the sink
+/// would have delivered — see
 /// [`astrolabe_ingest::read_cbm_sqlite_pipeline_rows`]. Feeding the result through
 /// the same [`row_sink_import_candidate_from_rows_with_skills`] keeps every derived
 /// shadow surface byte-identical to the old in-process path.
@@ -2067,43 +2068,67 @@ pub(crate) fn read_shadow_pipeline_rows(
     project: &str,
 ) -> Result<CbmPipelineRows, DynError> {
     let rows = astrolabe_ingest::read_cbm_sqlite_pipeline_rows(sqlite_path, project)?;
+    let project = rows.project;
+    let graph_schema_version = rows.graph_schema_version;
+    let nodes = rows
+        .nodes
+        .into_iter()
+        .map(|node| astrolabe_bridge::CbmPipelineNodeRow {
+            id: node.id,
+            project: node.project,
+            label: node.label,
+            name: node.name,
+            atom_id: node.atom_id,
+            qualified_name: node.qualified_name,
+            file_path: node.file_path,
+            start_line: node.start_line,
+            end_line: node.end_line,
+            source_present: node.source_present,
+            source_bytes: node.source_bytes,
+            source_sha256: node.source_sha256,
+            start_byte: node.start_byte,
+            end_byte: node.end_byte,
+            properties_json: node.properties_json,
+        })
+        .collect::<Vec<_>>();
+    let edges = rows
+        .edges
+        .into_iter()
+        .map(|edge| astrolabe_bridge::CbmPipelineEdgeRow {
+            id: edge.id,
+            project: edge.project,
+            source_id: edge.source_id,
+            target_id: edge.target_id,
+            edge_type: edge.edge_type,
+            properties_json: edge.properties_json,
+            url_path_gen: edge.url_path_gen,
+            local_name_gen: edge.local_name_gen,
+        })
+        .collect::<Vec<_>>();
+    let file_hashes = rows
+        .file_hashes
+        .into_iter()
+        .map(|file_hash| astrolabe_bridge::CbmPipelineFileHashRow {
+            project: file_hash.project,
+            rel_path: file_hash.rel_path,
+            sha256: file_hash.sha256,
+            mtime_ns: file_hash.mtime_ns,
+            size: file_hash.size,
+        })
+        .collect::<Vec<_>>();
+    let manifest = astrolabe_bridge::CbmPipelineRowManifest {
+        project: project.clone(),
+        node_count: nodes.len(),
+        edge_count: edges.len(),
+        file_hash_count: file_hashes.len(),
+        graph_schema_version,
+    };
     Ok(CbmPipelineRows {
-        project: rows.project,
-        nodes: rows
-            .nodes
-            .into_iter()
-            .map(|node| astrolabe_bridge::CbmPipelineNodeRow {
-                id: node.id,
-                project: node.project,
-                label: node.label,
-                name: node.name,
-                atom_id: node.atom_id,
-                qualified_name: node.qualified_name,
-                file_path: node.file_path,
-                start_line: node.start_line,
-                end_line: node.end_line,
-                source_present: node.source_present,
-                source_bytes: node.source_bytes,
-                source_sha256: node.source_sha256,
-                start_byte: node.start_byte,
-                end_byte: node.end_byte,
-                properties_json: node.properties_json,
-            })
-            .collect(),
-        edges: rows
-            .edges
-            .into_iter()
-            .map(|edge| astrolabe_bridge::CbmPipelineEdgeRow {
-                id: edge.id,
-                project: edge.project,
-                source_id: edge.source_id,
-                target_id: edge.target_id,
-                edge_type: edge.edge_type,
-                properties_json: edge.properties_json,
-                url_path_gen: edge.url_path_gen,
-                local_name_gen: edge.local_name_gen,
-            })
-            .collect(),
+        project,
+        nodes,
+        edges,
+        file_hashes,
+        manifest: Some(manifest),
     })
 }
 
@@ -2228,6 +2253,32 @@ pub(crate) fn row_sink_import_candidate_from_rows_with_skills(
             "single-run row sink produced zero nodes and zero edges".to_string(),
         );
     }
+    let Some(manifest) = rows.manifest.as_ref() else {
+        return RowSinkImportCandidate::Unavailable(
+            "single-run row sink produced no completion manifest".to_string(),
+        );
+    };
+    if manifest.project != rows.project
+        || manifest.node_count != rows.nodes.len()
+        || manifest.edge_count != rows.edges.len()
+        || manifest.file_hash_count != rows.file_hashes.len()
+        || manifest.graph_schema_version != astrolabe_ingest::CBM_SQLITE_SCHEMA_VERSION as u32
+    {
+        return RowSinkImportCandidate::Unavailable(format!(
+            "single-run row sink completion mismatch: \
+             project={:?}/{:?}, nodes={}/{}, edges={}/{}, file_hashes={}/{}, schema={}/{}",
+            manifest.project,
+            rows.project,
+            manifest.node_count,
+            rows.nodes.len(),
+            manifest.edge_count,
+            rows.edges.len(),
+            manifest.file_hash_count,
+            rows.file_hashes.len(),
+            manifest.graph_schema_version,
+            astrolabe_ingest::CBM_SQLITE_SCHEMA_VERSION,
+        ));
+    }
     let source_fingerprint_sha256 = row_sink_fingerprint(&rows);
     let security_screen = security_screen_from_row_sink_rows(&rows);
     let skill_tree = skill_tree_from_row_sink_rows_with_config(&rows, skills);
@@ -2289,13 +2340,27 @@ pub(crate) fn pipeline_rows_to_graph_snapshot(rows: CbmPipelineRows) -> CbmGraph
             properties_json: edge.properties_json,
         })
         .collect();
+    let file_hashes = rows
+        .file_hashes
+        .into_iter()
+        .map(|file_hash| CbmFileHashRow {
+            schema: CBM_FILE_HASH_ROW_SCHEMA.to_string(),
+            project: file_hash.project,
+            rel_path: file_hash.rel_path,
+            sha256: file_hash.sha256,
+            mtime_ns: file_hash.mtime_ns,
+            size: file_hash.size,
+            commit: String::new(),
+            sqlite_fingerprint_sha256: String::new(),
+        })
+        .collect();
     CbmGraphSnapshot {
         project,
         panel_version: Some(SHADOW_PANEL_VERSION),
         projects: Vec::new(),
         nodes,
         edges,
-        file_hashes: Vec::new(),
+        file_hashes,
         project_summaries: Vec::new(),
         token_vectors: Vec::new(),
     }
@@ -2303,7 +2368,7 @@ pub(crate) fn pipeline_rows_to_graph_snapshot(rows: CbmPipelineRows) -> CbmGraph
 
 pub(crate) fn row_sink_fingerprint(rows: &CbmPipelineRows) -> [u8; 32] {
     let mut hasher = Sha256::new();
-    hasher.update(b"astrolabe-cbm-row-sink-v2\0");
+    hasher.update(b"astrolabe-cbm-row-sink-v3\0");
     hash_str(&mut hasher, &rows.project);
 
     let mut nodes = rows.nodes.iter().collect::<Vec<_>>();
@@ -2347,6 +2412,29 @@ pub(crate) fn row_sink_fingerprint(rows: &CbmPipelineRows) -> [u8; 32] {
         hash_str(&mut hasher, &edge.properties_json);
         hash_str(&mut hasher, &edge.url_path_gen);
         hash_str(&mut hasher, &edge.local_name_gen);
+    }
+
+    let mut file_hashes = rows.file_hashes.iter().collect::<Vec<_>>();
+    file_hashes.sort_by(|left, right| left.rel_path.cmp(&right.rel_path));
+    hash_u64(&mut hasher, file_hashes.len() as u64);
+    for file_hash in file_hashes {
+        hash_str(&mut hasher, &file_hash.project);
+        hash_str(&mut hasher, &file_hash.rel_path);
+        hash_str(&mut hasher, &file_hash.sha256);
+        hash_i64(&mut hasher, file_hash.mtime_ns);
+        hash_i64(&mut hasher, file_hash.size);
+    }
+
+    match &rows.manifest {
+        Some(manifest) => {
+            hasher.update([1]);
+            hash_str(&mut hasher, &manifest.project);
+            hash_u64(&mut hasher, manifest.node_count as u64);
+            hash_u64(&mut hasher, manifest.edge_count as u64);
+            hash_u64(&mut hasher, manifest.file_hash_count as u64);
+            hasher.update(manifest.graph_schema_version.to_le_bytes());
+        }
+        None => hasher.update([0]),
     }
 
     hasher.finalize().into()

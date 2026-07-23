@@ -81,9 +81,10 @@ pub use registry::{
 pub use sqlite_import::{
     ASTRO_EDGE_DANGLING, ASTRO_INGEST_READBACK_MISMATCH, ASTRO_INGEST_SQLITE_INVALID,
     ASTRO_LEGACY_CBM_EDGE_ROWS, ASTRO_MISSING_CBM_PROJECT_ROW, ASTRO_QUANTIZATION_GATE_INVALID,
-    CbmFileHashRow, CbmGraphEdge, CbmGraphNode, CbmGraphSnapshot, CbmProjectRow,
-    CbmProjectSummaryRow, CbmRawEdgeRow, CbmSqlitePipelineEdge, CbmSqlitePipelineNode,
-    CbmSqlitePipelineRows, CbmTokenVectorRow, CxGraphErasureReport, EdgeSkipCounters,
+    CBM_FILE_HASH_ROW_SCHEMA, CBM_SQLITE_SCHEMA_VERSION, CbmFileHashRow, CbmGraphEdge,
+    CbmGraphNode, CbmGraphSnapshot, CbmProjectRow, CbmProjectSummaryRow, CbmRawEdgeRow,
+    CbmSqlitePipelineEdge, CbmSqlitePipelineFileHash, CbmSqlitePipelineNode, CbmSqlitePipelineRows,
+    CbmTokenVectorRow, CxGraphErasureReport, EdgeSkipCounters,
     HISTORICAL_SYMBOL_INGEST_LEDGER_SCHEMA, HistoricalSymbolAdmissionReport,
     HistoricalSymbolLocation, InjectedNodeFault, QuantizationGateConfig,
     QuantizationGateMeasurement, QuantizationGatePolicyReport, QuantizationSlotDecision,

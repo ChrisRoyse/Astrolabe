@@ -1084,10 +1084,30 @@ pub struct CbmPipelineEdgeRow {
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
+pub struct CbmPipelineFileHashRow {
+    pub project: String,
+    pub rel_path: String,
+    pub sha256: String,
+    pub mtime_ns: i64,
+    pub size: i64,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct CbmPipelineRowManifest {
+    pub project: String,
+    pub node_count: usize,
+    pub edge_count: usize,
+    pub file_hash_count: usize,
+    pub graph_schema_version: u32,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
 pub struct CbmPipelineRows {
     pub project: String,
     pub nodes: Vec<CbmPipelineNodeRow>,
     pub edges: Vec<CbmPipelineEdgeRow>,
+    pub file_hashes: Vec<CbmPipelineFileHashRow>,
+    pub manifest: Option<CbmPipelineRowManifest>,
 }
 
 /// Result of a single `index_repository` run with the pipeline row sink attached.
@@ -1108,6 +1128,8 @@ struct PipelineRowSinkState {
     owner: ThreadId,
     nodes: Vec<CbmPipelineNodeRow>,
     edges: Vec<CbmPipelineEdgeRow>,
+    file_hashes: Vec<CbmPipelineFileHashRow>,
+    manifest: Option<CbmPipelineRowManifest>,
     error: Option<BridgeError>,
 }
 
@@ -1117,6 +1139,8 @@ impl PipelineRowSinkState {
             owner: thread::current().id(),
             nodes: Vec::new(),
             edges: Vec::new(),
+            file_hashes: Vec::new(),
+            manifest: None,
             error: None,
         }
     }
@@ -1215,6 +1239,127 @@ impl PipelineRowSinkState {
         Ok(())
     }
 
+    fn push_file_hash(
+        &mut self,
+        row: &cbm_sys::cbm_pipeline_row_file_hash_t,
+    ) -> Result<(), BridgeError> {
+        self.ensure_callback_thread()?;
+        let project = required_borrowed_c_string(row.project, "row_sink.file_hash.project")?;
+        let rel_path = required_borrowed_c_string(row.rel_path, "row_sink.file_hash.rel_path")?;
+        let sha256 = required_borrowed_c_string(row.sha256, "row_sink.file_hash.sha256")?;
+        if rel_path.is_empty() || rel_path.contains('\\') {
+            return Err(envelope(
+                "ASTRO_CBM_ROW_SINK_FILE_PATH",
+                format!("CBM row-sink file hash has a noncanonical path {rel_path:?}"),
+                "Emit one non-empty, forward-slash-normalized repository-relative path.",
+            ));
+        }
+        if sha256.len() != 64
+            || !sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err(envelope(
+                "ASTRO_CBM_ROW_SINK_FILE_DIGEST",
+                format!("CBM row-sink file hash for {rel_path:?} is not lowercase SHA-256"),
+                "Publish the exact 64-character lowercase SHA-256 captured from source bytes.",
+            ));
+        }
+        if row.size < 0 {
+            return Err(envelope(
+                "ASTRO_CBM_ROW_SINK_FILE_STAT",
+                format!(
+                    "CBM row-sink file hash for {rel_path:?} has negative size {}",
+                    row.size
+                ),
+                "Publish the non-negative size stored in the source SQLite row; modification time remains a signed Unix timestamp.",
+            ));
+        }
+        self.file_hashes.push(CbmPipelineFileHashRow {
+            project,
+            rel_path,
+            sha256,
+            mtime_ns: row.mtime_ns,
+            size: row.size,
+        });
+        Ok(())
+    }
+
+    fn complete(&mut self, row: &cbm_sys::cbm_pipeline_row_manifest_t) -> Result<(), BridgeError> {
+        self.ensure_callback_thread()?;
+        if self.manifest.is_some() {
+            return Err(envelope(
+                "ASTRO_CBM_ROW_SINK_MANIFEST_DUPLICATE",
+                "CBM row-sink emitted more than one completion manifest",
+                "Emit exactly one completion manifest after every snapshot row.",
+            ));
+        }
+        let project = required_borrowed_c_string(row.project, "row_sink.manifest.project")?;
+        let expected_schema = cbm_sys::CBM_GRAPH_SCHEMA_VERSION as u32;
+        if row.graph_schema_version != expected_schema {
+            return Err(envelope(
+                "ASTRO_CBM_ROW_SINK_SCHEMA",
+                format!(
+                    "CBM row-sink manifest schema {} does not match supported schema {expected_schema}",
+                    row.graph_schema_version
+                ),
+                "Rebuild both sides from the same graph-schema contract; no version fallback is supported.",
+            ));
+        }
+        if row.node_count != self.nodes.len()
+            || row.edge_count != self.edges.len()
+            || row.file_hash_count != self.file_hashes.len()
+        {
+            return Err(envelope(
+                "ASTRO_CBM_ROW_SINK_COUNT_MISMATCH",
+                format!(
+                    "CBM row-sink manifest declared nodes={}, edges={}, file_hashes={} but callbacks delivered nodes={}, edges={}, file_hashes={}",
+                    row.node_count,
+                    row.edge_count,
+                    row.file_hash_count,
+                    self.nodes.len(),
+                    self.edges.len(),
+                    self.file_hashes.len()
+                ),
+                "Repair the producer so every committed source row is emitted exactly once before completion.",
+            ));
+        }
+        if self.nodes.iter().any(|node| node.project != project)
+            || self.edges.iter().any(|edge| edge.project != project)
+            || self
+                .file_hashes
+                .iter()
+                .any(|file_hash| file_hash.project != project)
+        {
+            return Err(envelope(
+                "ASTRO_CBM_ROW_SINK_PROJECT_MISMATCH",
+                format!("CBM row-sink rows do not all belong to manifest project {project:?}"),
+                "Publish one project-scoped snapshot per completed sink invocation.",
+            ));
+        }
+        let mut paths = self
+            .file_hashes
+            .iter()
+            .map(|file_hash| file_hash.rel_path.as_str())
+            .collect::<Vec<_>>();
+        paths.sort_unstable();
+        if paths.windows(2).any(|pair| pair[0] == pair[1]) {
+            return Err(envelope(
+                "ASTRO_CBM_ROW_SINK_FILE_DUPLICATE",
+                "CBM row-sink emitted duplicate file-hash paths",
+                "Publish exactly one final file-hash row per repository-relative path.",
+            ));
+        }
+        self.manifest = Some(CbmPipelineRowManifest {
+            project,
+            node_count: row.node_count,
+            edge_count: row.edge_count,
+            file_hash_count: row.file_hash_count,
+            graph_schema_version: row.graph_schema_version,
+        });
+        Ok(())
+    }
+
     fn finish_callback(&mut self, result: std::thread::Result<Result<(), BridgeError>>) -> c_int {
         match result {
             Ok(Ok(())) => CALLBACK_OK,
@@ -1278,17 +1423,19 @@ impl CbmPipeline {
     pub fn collect_rows(&mut self) -> Result<CbmPipelineRows, BridgeError> {
         self.ensure_owner_thread()?;
         let mut sink = PipelineRowSinkState::new();
+        let descriptor = pipeline_row_sink_descriptor(&mut sink);
         // SAFETY: self owns the pipeline pointer. `sink` remains live until
         // cbm_pipeline_run returns, and the sink is cleared immediately after.
         let rc = unsafe {
-            cbm_sys::cbm_pipeline_set_sink(
+            map_cbm_status(cbm_sys::cbm_pipeline_set_sink(
                 self.ptr.as_ptr(),
-                Some(pipeline_node_sink),
-                Some(pipeline_edge_sink),
-                (&mut sink as *mut PipelineRowSinkState).cast::<c_void>(),
-            );
+                &descriptor,
+            ))?;
             let rc = cbm_sys::cbm_pipeline_run(self.ptr.as_ptr());
-            cbm_sys::cbm_pipeline_set_sink(self.ptr.as_ptr(), None, None, ptr::null_mut());
+            map_cbm_status(cbm_sys::cbm_pipeline_set_sink(
+                self.ptr.as_ptr(),
+                ptr::null(),
+            ))?;
             rc
         };
 
@@ -1298,15 +1445,8 @@ impl CbmPipeline {
             }
             map_cbm_status(rc)?;
         }
-        if let Some(error) = sink.error {
-            return Err(error);
-        }
         let project = self.project_name()?;
-        Ok(CbmPipelineRows {
-            project,
-            nodes: sink.nodes,
-            edges: sink.edges,
-        })
+        finish_pipeline_rows(sink, project)
     }
 
     pub fn run_to_sqlite(&mut self) -> Result<(), BridgeError> {
@@ -1314,7 +1454,10 @@ impl CbmPipeline {
         // SAFETY: self owns the pipeline pointer. Clearing the sink first makes
         // this the baseline no-row-sink path for benchmark and compatibility use.
         let rc = unsafe {
-            cbm_sys::cbm_pipeline_set_sink(self.ptr.as_ptr(), None, None, ptr::null_mut());
+            map_cbm_status(cbm_sys::cbm_pipeline_set_sink(
+                self.ptr.as_ptr(),
+                ptr::null(),
+            ))?;
             cbm_sys::cbm_pipeline_run(self.ptr.as_ptr())
         };
         map_cbm_status(rc)
@@ -1406,6 +1549,93 @@ unsafe extern "C" fn pipeline_edge_sink(
         state.push_edge(edge)
     }));
     state.finish_callback(result)
+}
+
+unsafe extern "C" fn pipeline_file_hash_sink(
+    file_hash: *const cbm_sys::cbm_pipeline_row_file_hash_t,
+    ctx: *mut c_void,
+) -> c_int {
+    let Some(state) = (unsafe { (ctx as *mut PipelineRowSinkState).as_mut() }) else {
+        return CALLBACK_ERROR;
+    };
+    let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
+        let file_hash = unsafe { file_hash.as_ref() }.ok_or_else(|| {
+            envelope(
+                "ASTRO_CBM_ROW_SINK_NULL_FILE_HASH",
+                "CBM row-sink file-hash callback received NULL",
+                "Treat this as FFI contract drift; callbacks require a borrowed row pointer.",
+            )
+        })?;
+        state.push_file_hash(file_hash)
+    }));
+    state.finish_callback(result)
+}
+
+unsafe extern "C" fn pipeline_complete_sink(
+    manifest: *const cbm_sys::cbm_pipeline_row_manifest_t,
+    ctx: *mut c_void,
+) -> c_int {
+    let Some(state) = (unsafe { (ctx as *mut PipelineRowSinkState).as_mut() }) else {
+        return CALLBACK_ERROR;
+    };
+    let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
+        let manifest = unsafe { manifest.as_ref() }.ok_or_else(|| {
+            envelope(
+                "ASTRO_CBM_ROW_SINK_NULL_MANIFEST",
+                "CBM row-sink completion callback received NULL",
+                "Treat this as FFI contract drift; completion requires a borrowed manifest pointer.",
+            )
+        })?;
+        state.complete(manifest)
+    }));
+    state.finish_callback(result)
+}
+
+fn pipeline_row_sink_descriptor(
+    state: &mut PipelineRowSinkState,
+) -> cbm_sys::cbm_pipeline_row_sink_v1_t {
+    cbm_sys::cbm_pipeline_row_sink_v1_t {
+        abi_version: cbm_sys::CBM_PIPELINE_ROW_SINK_ABI_V1,
+        struct_size: std::mem::size_of::<cbm_sys::cbm_pipeline_row_sink_v1_t>(),
+        node: Some(pipeline_node_sink),
+        edge: Some(pipeline_edge_sink),
+        file_hash: Some(pipeline_file_hash_sink),
+        complete: Some(pipeline_complete_sink),
+        ctx: (state as *mut PipelineRowSinkState).cast::<c_void>(),
+    }
+}
+
+fn finish_pipeline_rows(
+    sink: PipelineRowSinkState,
+    project: String,
+) -> Result<CbmPipelineRows, BridgeError> {
+    if let Some(error) = sink.error {
+        return Err(error);
+    }
+    let manifest = sink.manifest.ok_or_else(|| {
+        envelope(
+            "ASTRO_CBM_ROW_SINK_INCOMPLETE",
+            "CBM pipeline returned without a completion manifest",
+            "Repair the native pipeline route so every successful full, incremental, and no-op snapshot emits completion.",
+        )
+    })?;
+    if manifest.project != project {
+        return Err(envelope(
+            "ASTRO_CBM_ROW_SINK_PROJECT_MISMATCH",
+            format!(
+                "CBM tool reported project {project:?}, but the completed row snapshot belongs to {:?}",
+                manifest.project
+            ),
+            "Publish and import one identically named project snapshot.",
+        ));
+    }
+    Ok(CbmPipelineRows {
+        project,
+        nodes: sink.nodes,
+        edges: sink.edges,
+        file_hashes: sink.file_hashes,
+        manifest: Some(manifest),
+    })
 }
 
 pub struct ExtractedFile {
@@ -2303,42 +2533,45 @@ impl CbmToolRunner {
         let tool_name = CString::new("index_repository")?;
         let args_json = CString::new(args_json)?;
         let mut sink = PipelineRowSinkState::new();
+        let descriptor = pipeline_row_sink_descriptor(&mut sink);
 
         // SAFETY: server pointer is owned by self and thread-affine. `sink`
         // lives until cbm_mcp_handle_tool returns and is cleared immediately.
         let raw_result = unsafe {
-            cbm_sys::cbm_mcp_server_set_row_sink(
+            map_cbm_status(cbm_sys::cbm_mcp_server_set_row_sink(
                 self.ptr.as_ptr(),
-                Some(pipeline_node_sink),
-                Some(pipeline_edge_sink),
-                (&mut sink as *mut PipelineRowSinkState).cast::<c_void>(),
-            );
+                &descriptor,
+            ))?;
             let ptr = cbm_sys::cbm_mcp_handle_tool(
                 self.ptr.as_ptr(),
                 tool_name.as_ptr(),
                 args_json.as_ptr(),
             );
-            cbm_sys::cbm_mcp_server_set_row_sink(self.ptr.as_ptr(), None, None, ptr::null_mut());
+            map_cbm_status(cbm_sys::cbm_mcp_server_set_row_sink(
+                self.ptr.as_ptr(),
+                ptr::null(),
+            ))?;
             take_c_string(ptr)
         };
         let raw_json = raw_result?;
         // #123: the index already ran to completion here — a row-sink failure is
         // returned ALONGSIDE the raw result rather than discarding it, so the
         // caller never has to rerun the whole index to recover the tool result.
-        let rows = match sink.error {
-            Some(error) => Err(error),
-            None => {
-                let project = project_from_tool_result(&raw_json)
-                    .or_else(|| sink.nodes.first().map(|node| node.project.clone()))
-                    .or_else(|| sink.edges.first().map(|edge| edge.project.clone()))
-                    .unwrap_or_default();
-                Ok(CbmPipelineRows {
-                    project,
-                    nodes: sink.nodes,
-                    edges: sink.edges,
-                })
-            }
-        };
+        let project = project_from_tool_result(&raw_json)
+            .or_else(|| {
+                sink.manifest
+                    .as_ref()
+                    .map(|manifest| manifest.project.clone())
+            })
+            .or_else(|| sink.nodes.first().map(|node| node.project.clone()))
+            .or_else(|| sink.edges.first().map(|edge| edge.project.clone()))
+            .or_else(|| {
+                sink.file_hashes
+                    .first()
+                    .map(|file_hash| file_hash.project.clone())
+            })
+            .unwrap_or_default();
+        let rows = finish_pipeline_rows(sink, project);
         Ok(CbmIndexRepositoryRows { raw_json, rows })
     }
 

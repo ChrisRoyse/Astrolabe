@@ -46,8 +46,8 @@ use serde_json::Value;
 
 use crate::registry::{IngestError, IngestResult};
 use crate::sqlite_import::{
-    CbmGraphEdge, CbmGraphNode, CbmGraphSnapshot, SqliteImportOptions, SqliteImportReport,
-    import_cbm_graph_snapshot_to_vault_direct,
+    CBM_FILE_HASH_ROW_SCHEMA, CbmFileHashRow, CbmGraphEdge, CbmGraphNode, CbmGraphSnapshot,
+    SqliteImportOptions, SqliteImportReport, import_cbm_graph_snapshot_to_vault_direct,
 };
 
 /// Refusal code: the requested drain-batch size is outside the declared knob bounds.
@@ -59,9 +59,9 @@ pub const ASTRO_ROW_SINK_STREAM_ROW_REFUSED: &str = "ASTRO_ROW_SINK_STREAM_ROW_R
 const BATCH_REMEDIATION: &str = "Set the row-sink stream drain-batch size inside the declared knob bounds, or use RowSinkStreamParams::from_registry() for the registry default.";
 const ROW_REMEDIATION: &str = "Fix or drop the malformed CBM row-sink row at its source; the streaming importer refuses the whole stream and persists nothing until every streamed row is well-formed.";
 
-/// One item of the CBM row-sink stream: a node row or an edge row.
+/// One item of the complete CBM row-sink stream.
 ///
-/// This mirrors the two row kinds the CBM pipeline row sink emits. The stream is a
+/// This mirrors the row kinds the CBM pipeline v1 snapshot sink emits. The stream is a
 /// sequence of `IngestResult<RowSinkStreamRow>` so an individual row-sink failure
 /// is carried per the #123 independent-failure contract.
 #[derive(Debug, Clone, PartialEq)]
@@ -70,6 +70,8 @@ pub enum RowSinkStreamRow {
     Node(CbmGraphNode),
     /// A CBM edge row.
     Edge(CbmGraphEdge),
+    /// An exact persisted CBM file-hash row.
+    FileHash(CbmFileHashRow),
 }
 
 /// Registry-bounded parameters for the streaming row-sink importer.
@@ -128,6 +130,8 @@ pub struct RowSinkStreamReport {
     pub stream_nodes: usize,
     /// Number of edge rows accepted from the stream.
     pub stream_edges: usize,
+    /// Number of exact file-hash rows accepted from the stream.
+    pub stream_file_hashes: usize,
     /// Number of drain/backpressure batches the stream was validated in.
     pub drain_batches: usize,
     /// The registry-bounded drain-batch size used for this import.
@@ -162,6 +166,7 @@ where
     let drain_start = std::time::Instant::now();
     let mut nodes: Vec<CbmGraphNode> = Vec::new();
     let mut edges: Vec<CbmGraphEdge> = Vec::new();
+    let mut file_hashes: Vec<CbmFileHashRow> = Vec::new();
     let mut drain_batches: usize = 0;
     let mut rows_in_batch: u64 = 0;
 
@@ -172,6 +177,7 @@ where
         let accepted = StreamCounts {
             nodes: nodes.len(),
             edges: edges.len(),
+            file_hashes: file_hashes.len(),
         };
         // A stream-level Err honours the #123 independent-failure contract: the
         // sink failed for this row, so the whole import fails closed.
@@ -190,6 +196,10 @@ where
                 validate_stream_edge(project, &edge, accepted)?;
                 edges.push(edge);
             }
+            RowSinkStreamRow::FileHash(file_hash) => {
+                validate_stream_file_hash(project, &file_hash, accepted)?;
+                file_hashes.push(file_hash);
+            }
         }
         rows_in_batch += 1;
         if rows_in_batch >= batch {
@@ -203,6 +213,7 @@ where
 
     let stream_nodes = nodes.len();
     let stream_edges = edges.len();
+    let stream_file_hashes = file_hashes.len();
 
     let snapshot = CbmGraphSnapshot {
         project: options.project.clone(),
@@ -210,7 +221,7 @@ where
         projects: Vec::new(),
         nodes,
         edges,
-        file_hashes: Vec::new(),
+        file_hashes,
         project_summaries: Vec::new(),
         token_vectors: Vec::new(),
     };
@@ -234,6 +245,7 @@ where
         import,
         stream_nodes,
         stream_edges,
+        stream_file_hashes,
         drain_batches,
         drain_batch_rows: batch,
     })
@@ -242,7 +254,8 @@ where
 /// Lazily adapts a materialized [`CbmGraphSnapshot`] into the
 /// [`RowSinkStreamRow`] sequence [`import_cbm_row_stream_to_vault`] consumes.
 ///
-/// Nodes are yielded first (in stored order), then edges. Every item is `Ok`
+/// Nodes are yielded first (in stored order), then edges and exact file hashes.
+/// Every item is `Ok`
 /// because a snapshot handed to this adapter has already cleared FFI row-sink
 /// validation — the per-item [`IngestResult`] failure channel is reserved for a
 /// live producer whose sink can fail mid-stream (the #123 contract). The adapter
@@ -256,9 +269,8 @@ where
 /// kernel-context / anomaly / provenance surfaces) and the streaming vault
 /// writer: the same materialized rows are streamed row-by-row into the single
 /// ledger-paired write instead of being handed over as one snapshot argument.
-/// The `projects` / `file_hashes` / `project_summaries` / `token_vectors` fields
-/// are always empty on a row-sink snapshot, so streaming only nodes and edges
-/// preserves byte-for-byte parity with the direct snapshot writer.
+/// Project/summary/token-vector rows remain outside the frozen v1 contract
+/// (#698); file hashes are mandatory and are streamed without reconstruction.
 ///
 /// [`pipeline_rows_to_graph_snapshot`]: crate::sqlite_import::CbmGraphSnapshot
 pub fn snapshot_into_row_stream(
@@ -274,25 +286,91 @@ pub fn snapshot_into_row_stream(
                 .into_iter()
                 .map(|edge| Ok(RowSinkStreamRow::Edge(edge))),
         )
+        .chain(
+            snapshot
+                .file_hashes
+                .into_iter()
+                .map(|file_hash| Ok(RowSinkStreamRow::FileHash(file_hash))),
+        )
 }
 
 #[derive(Debug, Clone, Copy)]
 struct StreamCounts {
     nodes: usize,
     edges: usize,
+    file_hashes: usize,
 }
 
 fn stream_row_refused(accepted: StreamCounts, detail: String) -> IngestError {
     IngestError::refused(
         ASTRO_ROW_SINK_STREAM_ROW_REFUSED,
         format!(
-            "{detail} (refused after accepting {} well-formed rows: {} nodes, {} edges; nothing persisted)",
-            accepted.nodes + accepted.edges,
+            "{detail} (refused after accepting {} well-formed rows: {} nodes, {} edges, {} file hashes; nothing persisted)",
+            accepted.nodes + accepted.edges + accepted.file_hashes,
             accepted.nodes,
-            accepted.edges
+            accepted.edges,
+            accepted.file_hashes
         ),
         ROW_REMEDIATION,
     )
+}
+
+fn validate_stream_file_hash(
+    project: &str,
+    file_hash: &CbmFileHashRow,
+    accepted: StreamCounts,
+) -> IngestResult<()> {
+    if file_hash.schema != CBM_FILE_HASH_ROW_SCHEMA {
+        return Err(stream_row_refused(
+            accepted,
+            format!(
+                "row-sink file hash {:?} has unsupported schema {:?}",
+                file_hash.rel_path, file_hash.schema
+            ),
+        ));
+    }
+    if file_hash.project != project {
+        return Err(stream_row_refused(
+            accepted,
+            format!(
+                "row-sink file hash {:?} belongs to project {:?}, not {:?}",
+                file_hash.rel_path, file_hash.project, project
+            ),
+        ));
+    }
+    if file_hash.rel_path.is_empty() || file_hash.rel_path.contains('\\') {
+        return Err(stream_row_refused(
+            accepted,
+            format!(
+                "row-sink file hash has noncanonical relative path {:?}",
+                file_hash.rel_path
+            ),
+        ));
+    }
+    if file_hash.sha256.len() != 64
+        || !file_hash
+            .sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(stream_row_refused(
+            accepted,
+            format!(
+                "row-sink file hash {:?} has noncanonical SHA-256",
+                file_hash.rel_path
+            ),
+        ));
+    }
+    if file_hash.size < 0 {
+        return Err(stream_row_refused(
+            accepted,
+            format!(
+                "row-sink file hash {:?} has negative size",
+                file_hash.rel_path
+            ),
+        ));
+    }
+    Ok(())
 }
 
 fn validate_stream_node(

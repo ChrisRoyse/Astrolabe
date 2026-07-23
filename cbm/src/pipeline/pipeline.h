@@ -51,10 +51,11 @@ cbm_pipeline_t *cbm_pipeline_new(const char *repo_path, const char *db_path, cbm
  * When enabled, the pipeline writes a compressed artifact after indexing. */
 void cbm_pipeline_set_persistence(cbm_pipeline_t *p, bool enabled);
 
-/* Install dump-row sink callbacks for the full pipeline. NULL callbacks keep
- * the normal SQLite dump behavior and emit no sink rows. */
-void cbm_pipeline_set_sink(cbm_pipeline_t *p, cbm_gbuf_row_node_sink_fn node_cb,
-                           cbm_gbuf_row_edge_sink_fn edge_cb, void *ctx);
+/* Install the complete v1 source-snapshot sink. NULL restores the normal
+ * no-sink path. A non-NULL descriptor is copied and accepted only when its
+ * frozen ABI/version/mandatory callbacks validate exactly. Returns 0 on
+ * success, -1 on refusal. */
+int cbm_pipeline_set_sink(cbm_pipeline_t *p, const cbm_pipeline_row_sink_v1_t *sink);
 
 /* Free a pipeline and all its internal state. NULL-safe. */
 void cbm_pipeline_free(cbm_pipeline_t *p);

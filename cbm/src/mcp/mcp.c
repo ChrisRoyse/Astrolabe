@@ -864,9 +864,8 @@ struct cbm_mcp_server {
 
     /* Optional row-sink callbacks for embedders that consume index_repository
      * rows directly while preserving the normal MCP result and SQLite output. */
-    cbm_gbuf_row_node_sink_fn row_node_sink;
-    cbm_gbuf_row_edge_sink_fn row_edge_sink;
-    void *row_sink_ctx;
+    cbm_pipeline_row_sink_v1_t row_sink;
+    bool row_sink_active;
 };
 
 cbm_mcp_server_t *cbm_mcp_server_new(const char *store_path) {
@@ -912,17 +911,35 @@ void cbm_mcp_server_set_config(cbm_mcp_server_t *srv, struct cbm_config *cfg) {
     }
 }
 
-void cbm_mcp_server_set_row_sink(cbm_mcp_server_t *srv, cbm_gbuf_row_node_sink_fn node_cb,
-                                 cbm_gbuf_row_edge_sink_fn edge_cb, void *ctx) {
+int cbm_mcp_server_set_row_sink(cbm_mcp_server_t *srv, const cbm_pipeline_row_sink_v1_t *sink) {
     if (!srv) {
-        return;
+        cbm_log_error("mcp.row_sink_refused", "code", "CBM_MCP_ROW_SINK_SERVER_NULL", "message",
+                      "a row sink cannot be installed on a NULL server", "remediation",
+                      "create the MCP server successfully before installing a sink");
+        return CBM_NOT_FOUND;
     }
-    srv->row_node_sink = node_cb;
-    srv->row_edge_sink = edge_cb;
-    srv->row_sink_ctx = ctx;
+    if (sink && (sink->abi_version != CBM_PIPELINE_ROW_SINK_ABI_V1 ||
+                 sink->struct_size != sizeof(cbm_pipeline_row_sink_v1_t) || !sink->node ||
+                 !sink->edge || !sink->file_hash || !sink->complete || !sink->ctx)) {
+        cbm_log_error("mcp.row_sink_refused", "code", "CBM_MCP_ROW_SINK_INVALID", "message",
+                      "the MCP server requires one complete frozen v1 sink descriptor",
+                      "remediation",
+                      "provide every v1 callback/context or pass NULL to disable the sink");
+        return CBM_NOT_FOUND;
+    }
+    if (sink) {
+        srv->row_sink = *sink;
+        srv->row_sink_active = true;
+    } else {
+        memset(&srv->row_sink, 0, sizeof(srv->row_sink));
+        srv->row_sink_active = false;
+    }
     if (srv->active_pipeline) {
-        cbm_pipeline_set_sink(srv->active_pipeline, node_cb, edge_cb, ctx);
+        if (cbm_pipeline_set_sink(srv->active_pipeline, sink) != 0) {
+            return CBM_NOT_FOUND;
+        }
     }
+    return 0;
 }
 
 void cbm_mcp_server_free(cbm_mcp_server_t *srv) {
@@ -940,7 +957,8 @@ void cbm_mcp_server_free(cbm_mcp_server_t *srv) {
     }
     free(srv->current_project);
     free(srv->active_request_id_str);
-    srv->row_sink_ctx = NULL;
+    memset(&srv->row_sink, 0, sizeof(srv->row_sink));
+    srv->row_sink_active = false;
     free(srv);
 }
 
@@ -4342,7 +4360,7 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
      * watcher/auto-index path indexes with srv==NULL (index_run_supervised) and a
      * plain server carries no sink, so both keep their supervised worker for crash
      * isolation and RSS reclamation (#832/#845). */
-    bool row_sink_registered = srv && (srv->row_node_sink || srv->row_edge_sink);
+    bool row_sink_registered = srv && srv->row_sink_active;
     if (row_sink_registered) {
         cbm_log_info("index.supervisor.inprocess", "reason", "row_sink_registered", "tradeoff",
                      "crash_isolation_forgone_to_deliver_row_stream");
@@ -4415,7 +4433,15 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
         free(repo_path);
         return cbm_mcp_text_result("failed to create pipeline", true);
     }
-    cbm_pipeline_set_sink(p, srv->row_node_sink, srv->row_edge_sink, srv->row_sink_ctx);
+    if (cbm_pipeline_set_sink(p, srv->row_sink_active ? &srv->row_sink : NULL) != 0) {
+        cbm_pipeline_free(p);
+        free(name_override);
+        free(repo_path);
+        return cbm_mcp_text_result(
+            "CBM_ROW_SINK_INSTALL_FAILED: the complete row-sink descriptor was refused; inspect "
+            "the structured native diagnostic and retry",
+            true);
+    }
     if (name_override && name_override[0] && !cbm_pipeline_set_project_name(p, name_override)) {
         cbm_pipeline_free(p);
         free(name_override);

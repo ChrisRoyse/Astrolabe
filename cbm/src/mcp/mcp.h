@@ -133,10 +133,10 @@ void cbm_mcp_server_set_watcher(cbm_mcp_server_t *srv, struct cbm_watcher *w);
 /* Set external config store reference (for auto_index setting). Not owned. */
 void cbm_mcp_server_set_config(cbm_mcp_server_t *srv, struct cbm_config *cfg);
 
-/* Install row-sink callbacks for index_repository pipelines created by this
- * server. Passing NULL callbacks restores the default no-sink behavior. */
-void cbm_mcp_server_set_row_sink(cbm_mcp_server_t *srv, cbm_gbuf_row_node_sink_fn node_cb,
-                                 cbm_gbuf_row_edge_sink_fn edge_cb, void *ctx);
+/* Install the complete v1 source-snapshot sink for index_repository pipelines.
+ * The descriptor is copied. Passing NULL restores the no-sink path. Returns 0
+ * on success, -1 when the server or descriptor is invalid. */
+int cbm_mcp_server_set_row_sink(cbm_mcp_server_t *srv, const cbm_pipeline_row_sink_v1_t *sink);
 
 /* Run the MCP server event loop on the given streams (typically stdin/stdout).
  * Blocks until EOF on input. Returns 0 on success, -1 on error. */
