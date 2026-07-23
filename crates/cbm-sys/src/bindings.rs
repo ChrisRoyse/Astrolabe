@@ -5,7 +5,6 @@ pub const CBM_ARENA_DEFAULT_BLOCK_SIZE: u32 = 65536;
 pub const CBM_MAX_CALL_ARGS: u32 = 8;
 pub const CBM_MAX_STRING_CONSTANTS: u32 = 256;
 pub const CBM_PIPELINE_ROW_SINK_ABI_V1: u32 = 1;
-pub const CBM_PIPELINE_EMPTY_SOURCE_CORPUS: i32 = -2001;
 pub const CBM_ASTRO_LOWERED_DB_SUFFIX: &[u8; 22] = b".astrolabe-lowered.db\0";
 pub const CBM_ASTRO_ARCHAEOLOGY_DB_PREFIX: &[u8; 24] = b".astrolabe-archaeology-\0";
 pub const CBM_STORE_OK: u32 = 0;
@@ -1947,6 +1946,8 @@ pub struct cbm_gbuf {
 }
 pub type cbm_gbuf_t = cbm_gbuf;
 pub type cbm_pipeline_t = cbm_pipeline;
+pub const CBM_PIPELINE_EMPTY_SOURCE_CORPUS: _bindgen_ty_2 = -2001;
+pub type _bindgen_ty_2 = ::std::os::raw::c_int;
 unsafe extern "C" {
     pub fn cbm_pipeline_new(
         repo_path: *const ::std::os::raw::c_char,
@@ -2246,10 +2247,10 @@ pub const cbm_store_verify_status_t_CBM_STORE_VERIFY_INTEGRITY_FAILED: cbm_store
     2;
 pub const cbm_store_verify_status_t_CBM_STORE_VERIFY_IO_FAILED: cbm_store_verify_status_t = 3;
 pub type cbm_store_verify_status_t = ::std::os::raw::c_int;
-pub const CBM_STORE_VERIFY_OPERATION_MAX: _bindgen_ty_2 = 64;
-pub const CBM_STORE_VERIFY_DETAIL_MAX: _bindgen_ty_2 = 512;
-pub const CBM_STORE_VERIFY_PATH_MAX: _bindgen_ty_2 = 4096;
-pub type _bindgen_ty_2 = ::std::os::raw::c_int;
+pub const CBM_STORE_VERIFY_OPERATION_MAX: _bindgen_ty_3 = 64;
+pub const CBM_STORE_VERIFY_DETAIL_MAX: _bindgen_ty_3 = 512;
+pub const CBM_STORE_VERIFY_PATH_MAX: _bindgen_ty_3 = 4096;
+pub type _bindgen_ty_3 = ::std::os::raw::c_int;
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct cbm_store_verify_result_t {
