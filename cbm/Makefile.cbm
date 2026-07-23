@@ -241,7 +241,8 @@ PIPELINE_SRCS = \
     src/pipeline/pass_complexity.c \
     src/pipeline/pass_cross_repo.c \
     src/pipeline/artifact.c \
-    src/pipeline/pass_pkgmap.c
+    src/pipeline/pass_pkgmap.c \
+    src/pipeline/source_snapshot.c
 
 # SimHash / MinHash module
 SIMHASH_SRCS = src/simhash/minhash.c
@@ -379,7 +380,7 @@ $(BUILD_DIR)/prod_ts_runtime.o: $(CBM_DIR)/ts_runtime.c | $(BUILD_DIR)
 	$(CC) $(GRAMMAR_CFLAGS) -c -o $@ $<
 
 $(BUILD_DIR)/prod_lsp_all.o: $(LSP_UNITY_DEPS) | $(BUILD_DIR)
-	$(CC) $(GRAMMAR_CFLAGS) -c -o $@ $<
+	$(CC) $(GRAMMAR_CFLAGS) -Isrc -c -o $@ $<
 
 $(BUILD_DIR)/prod_preprocessor.o: $(CBM_DIR)/preprocessor.cpp | $(BUILD_DIR)
 	$(CXX) $(CXXFLAGS_PROD) -w -I$(CBM_DIR)/vendored -c -o $@ $<
