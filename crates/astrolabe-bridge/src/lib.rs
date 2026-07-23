@@ -936,6 +936,12 @@ impl Language {
 pub fn map_cbm_status(status: i32) -> Result<(), BridgeError> {
     match status {
         0 => Ok(()),
+        cbm_sys::CBM_PIPELINE_EMPTY_SOURCE_CORPUS => Err(envelope(
+            "ASTRO_CBM_PIPELINE_EMPTY_SOURCE_CORPUS",
+            "CBM refused to index a repository with zero non-auxiliary source files",
+            "Add at least one supported readable source file or correct discovery, mode, and \
+             ignore configuration before retrying.",
+        )),
         -1 => Err(envelope(
             "ASTRO_CBM_STATUS_ERR",
             "CBM returned CBM_STORE_ERR",

@@ -28,6 +28,11 @@ typedef struct cbm_gbuf cbm_gbuf_t;
 
 typedef struct cbm_pipeline cbm_pipeline_t;
 
+/* Distinct terminal result for a repository with no non-auxiliary source
+ * files. Callers must surface this as a structured refusal; it is never a
+ * successful structural-only index. */
+enum { CBM_PIPELINE_EMPTY_SOURCE_CORPUS = -2001 };
+
 /* ── Index mode ─────────────────────────────────────────────────── */
 
 #ifndef CBM_INDEX_MODE_T_DEFINED
@@ -60,8 +65,10 @@ int cbm_pipeline_set_sink(cbm_pipeline_t *p, const cbm_pipeline_row_sink_v1_t *s
 /* Free a pipeline and all its internal state. NULL-safe. */
 void cbm_pipeline_free(cbm_pipeline_t *p);
 
-/* Run the full indexing pipeline. Returns 0 on success, -1 on error.
- * Discovers files, extracts, resolves, and dumps to SQLite. */
+/* Run the full indexing pipeline. Returns 0 on success, -1 on a general error,
+ * or CBM_PIPELINE_EMPTY_SOURCE_CORPUS before publication when discovery finds
+ * no non-auxiliary source file. Discovers files, extracts, resolves, and dumps
+ * to SQLite. */
 int cbm_pipeline_run(cbm_pipeline_t *p);
 
 /* Request cancellation of a running pipeline (thread-safe). */

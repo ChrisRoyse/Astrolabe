@@ -1920,21 +1920,31 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
             source_count++;
         }
     }
-    if (source_count > 0) {
-        source_files = malloc((size_t)source_count * sizeof(*source_files));
-        if (!source_files) {
-            cbm_log_error("pipeline.err", "code", "CBM_PIPELINE_SOURCE_VIEW_ALLOC_FAILED", "phase",
-                          "source_snapshot", "message",
-                          "the complete source-only snapshot view could not be allocated",
-                          "remediation", "free memory or reduce repository size, then retry");
-            rc = CBM_NOT_FOUND;
-            goto cleanup;
-        }
-        int source_index = 0;
-        for (int i = 0; i < file_count; i++) {
-            if (!files[i].auxiliary) {
-                source_files[source_index++] = files[i];
-            }
+    if (source_count == 0) {
+        cbm_log_error("pipeline.err", "phase", "source_snapshot", "code",
+                      "CBM_PIPELINE_EMPTY_SOURCE_CORPUS", "repo_path", p->repo_path,
+                      "discovered_files", itoa_buf(file_count), "message",
+                      "repository discovery produced no non-auxiliary source files; refusing a "
+                      "structural-only index",
+                      "remediation",
+                      "add a supported readable source file or correct discovery, mode, and ignore "
+                      "configuration before retrying");
+        rc = CBM_PIPELINE_EMPTY_SOURCE_CORPUS;
+        goto cleanup;
+    }
+    source_files = malloc((size_t)source_count * sizeof(*source_files));
+    if (!source_files) {
+        cbm_log_error("pipeline.err", "code", "CBM_PIPELINE_SOURCE_VIEW_ALLOC_FAILED", "phase",
+                      "source_snapshot", "message",
+                      "the complete source-only snapshot view could not be allocated",
+                      "remediation", "free memory or reduce repository size, then retry");
+        rc = CBM_NOT_FOUND;
+        goto cleanup;
+    }
+    int source_index = 0;
+    for (int i = 0; i < file_count; i++) {
+        if (!files[i].auxiliary) {
+            source_files[source_index++] = files[i];
         }
     }
     CBM_PROF_END_N("pipeline", "1b_source_snapshot", t_snapshot, file_count);

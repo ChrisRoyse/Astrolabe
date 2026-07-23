@@ -5,6 +5,7 @@ pub const CBM_ARENA_DEFAULT_BLOCK_SIZE: u32 = 65536;
 pub const CBM_MAX_CALL_ARGS: u32 = 8;
 pub const CBM_MAX_STRING_CONSTANTS: u32 = 256;
 pub const CBM_PIPELINE_ROW_SINK_ABI_V1: u32 = 1;
+pub const CBM_PIPELINE_EMPTY_SOURCE_CORPUS: i32 = -2001;
 pub const CBM_ASTRO_LOWERED_DB_SUFFIX: &[u8; 22] = b".astrolabe-lowered.db\0";
 pub const CBM_ASTRO_ARCHAEOLOGY_DB_PREFIX: &[u8; 24] = b".astrolabe-archaeology-\0";
 pub const CBM_STORE_OK: u32 = 0;

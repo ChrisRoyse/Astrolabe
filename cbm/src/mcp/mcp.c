@@ -4516,6 +4516,17 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
         if (!postcondition_error) {
             yyjson_mut_obj_add_str(doc, root, "status", "indexed");
         }
+    } else if (rc == CBM_PIPELINE_EMPTY_SOURCE_CORPUS) {
+        yyjson_mut_obj_add_str(doc, root, "status", "error");
+        yyjson_mut_obj_add_str(doc, root, "code", "CBM_PIPELINE_EMPTY_SOURCE_CORPUS");
+        yyjson_mut_obj_add_str(
+            doc, root, "message",
+            "index_repository refused because discovery produced zero non-auxiliary source files");
+        yyjson_mut_obj_add_str(
+            doc, root, "remediation",
+            "add at least one supported readable source file or correct discovery, mode, and "
+            "ignore configuration before retrying");
+        yyjson_mut_obj_add_bool(doc, root, "sqlite_publication_started", false);
     } else {
         yyjson_mut_obj_add_str(doc, root, "status", "error");
         yyjson_mut_obj_add_str(doc, root, "hint",

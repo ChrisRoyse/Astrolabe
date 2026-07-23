@@ -2253,6 +2253,13 @@ pub(crate) fn row_sink_import_candidate_from_rows_with_skills(
             "single-run row sink produced zero nodes and zero edges".to_string(),
         );
     }
+    if rows.file_hashes.is_empty() {
+        return RowSinkImportCandidate::Unavailable(
+            "single-run row sink produced zero exact source file identities; refusing a \
+             structural-only Calyx generation"
+                .to_string(),
+        );
+    }
     let Some(manifest) = rows.manifest.as_ref() else {
         return RowSinkImportCandidate::Unavailable(
             "single-run row sink produced no completion manifest".to_string(),
