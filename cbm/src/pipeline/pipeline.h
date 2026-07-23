@@ -134,15 +134,10 @@ void cbm_pipeline_unlock(void);
 
 /* Compute a symbol/module qualified name: project.dir.parts.name.
  * Strips extension, converts / to ., drops __init__ and index. The reserved
- * name "__file__" delegates to cbm_pipeline_fqn_file() so legacy callers
- * cannot accidentally collapse exact file paths into module aliases.
+ * name "__file__" delegates to the centralized exact-path File contract so
+ * callers cannot accidentally collapse file paths into module aliases.
  * Caller must free() the returned string. */
 char *cbm_pipeline_fqn_compute(const char *project, const char *rel_path, const char *name);
-
-/* File-container QN: a domain-separated SHA-256 over the complete normalized
- * relative path. Unlike a module QN, this retains extension and path-boundary
- * distinctions. The exact readable path remains on the File node. */
-char *cbm_pipeline_fqn_file(const char *project, const char *rel_path);
 
 /* Module QN: project.dir.parts (no name). Caller must free(). */
 char *cbm_pipeline_fqn_module(const char *project, const char *rel_path);

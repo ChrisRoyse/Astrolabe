@@ -139,7 +139,7 @@ static void strip_init_or_index(const char **segments, size_t *seg_count, const 
 
 /* ── Public API ──────────────────────────────────────────────────── */
 
-char *cbm_pipeline_fqn_file(const char *project, const char *rel_path) {
+static char *compute_file_fqn(const char *project, const char *rel_path) {
     if (!project || project[0] == '\0' || !rel_path || rel_path[0] == '\0') {
         cbm_log_error("fqn.file_identity_failed", "code", "CBM_FILE_QN_INPUT_INVALID",
                       "project", project ? project : "<null>", "path",
@@ -207,7 +207,7 @@ char *cbm_pipeline_fqn_compute(const char *project, const char *rel_path, const 
         return strdup("");
     }
     if (name && strcmp(name, "__file__") == 0) {
-        return cbm_pipeline_fqn_file(project, rel_path);
+        return compute_file_fqn(project, rel_path);
     }
 
     char *path = strdup(rel_path ? rel_path : "");
