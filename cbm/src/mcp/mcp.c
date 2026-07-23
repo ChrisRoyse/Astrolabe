@@ -7318,7 +7318,10 @@ static void adr_fill_write_error(yyjson_mut_doc *doc, yyjson_mut_val *root, cbm_
 }
 
 /* Build a standalone structured error for the case where the dedicated
- * read-write handle to a resolved (existing) project DB could not be opened. */
+ * read-write handle to a resolved (existing) project DB could not be opened.
+ * The open already honors the store's 10s busy_timeout internally, so a lock
+ * held that long is genuinely stuck, not a quick transient — the caller returns
+ * this structured diagnostic rather than spinning further retries. */
 static char *build_adr_open_error(const char *db_path) {
     yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
     if (!doc) {
@@ -7342,7 +7345,7 @@ static char *build_adr_open_error(const char *db_path) {
     }
     yyjson_mut_obj_add_str(
         doc, root, "remediation",
-        "the database file exists (project resolved) but a read-write open failed — likely a "
+        "the database file exists (project resolved) but a read-write open failed -- likely a "
         "sharing violation from AV/indexing or another process holding it exclusively, a "
         "read-only file/volume, or a corrupt WAL/SHM. Free the writer, clear the read-only "
         "attribute, or preserve and inspect the DB/WAL/SHM family, then retry.");

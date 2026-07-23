@@ -8091,26 +8091,28 @@ void cbm_adr_sections_free(cbm_adr_sections_t *s) {
     memset(s, 0, sizeof(*s));
 }
 
-/* Bounded backoff budget for a transient ADR write fault (#1793). Two MCP
- * sessions can each hold a read-write handle to the same project DB, and a
- * Windows AV/Search-indexer scan briefly opens the DB/WAL/SHM family — both
- * surface on the write step as SQLITE_BUSY/LOCKED/IOERR/PROTOCOL even though
- * busy_timeout already absorbs plain lock waits. These clear on a short retry.
- * Worst case ≈ 20+40+80+160+320 ms across the 5 retries. */
+/* Bounded backoff budget for a transient ADR write fault (#1793). A Windows
+ * AV/Search-indexer scan briefly opens the DB/WAL/SHM family, and concurrent
+ * WAL writers can race the wal-index protocol; both surface on the write step
+ * as SQLITE_IOERR / SQLITE_PROTOCOL, which the connection's busy_timeout does
+ * NOT cover. These clear on a short retry. Worst case ≈ 20+40+80+160+320 ms
+ * across the 5 retries. */
 enum {
     ADR_WRITE_MAX_RETRIES = 5,
     ADR_WRITE_BACKOFF_BASE_US = 20000,
     ADR_WRITE_BACKOFF_MAX_US = 400000,
 };
 
-/* True for SQLite write faults worth a bounded retry: a peer writer's lock or a
- * transient filesystem sharing violation. A persistent fault of the same class
- * simply exhausts the budget and is then returned verbatim, so retries never
- * hide a real, durable failure. */
+/* True for SQLite write faults worth a bounded retry HERE: a transient
+ * filesystem sharing violation (IOERR) or a WAL-index protocol race (PROTOCOL).
+ * SQLITE_BUSY / SQLITE_LOCKED are deliberately EXCLUDED — the connection's
+ * PRAGMA busy_timeout=10000 already runs a 10 s busy handler for those, so a
+ * BUSY that still escapes has held for 10 s (genuinely stuck, not transient);
+ * re-stepping would only stack another 10 s wait. A persistent IOERR/PROTOCOL
+ * simply exhausts the budget and is returned verbatim, so retries never hide a
+ * real, durable failure. */
 static bool adr_write_rc_is_transient(int rc) {
     switch (rc & 0xFF) {
-    case SQLITE_BUSY:
-    case SQLITE_LOCKED:
     case SQLITE_IOERR:
     case SQLITE_PROTOCOL:
         return true;
@@ -8151,7 +8153,8 @@ static int adr_store_step_with_retry(cbm_store_t *s, sqlite3_stmt *stmt, const c
                      "attempt", attempt_buf, "max_retries", "5", "sqlite_error", rc_buf,
                      "sqlite_extended_error", ext_buf, "backoff_ms", backoff_buf, "detail",
                      sqlite3_errmsg(s->db), "remediation",
-                     "transient lock or sharing violation on the ADR write; retrying after backoff");
+                     "transient sharing violation or WAL-index protocol race on the ADR write; "
+                     "retrying after backoff");
         sqlite3_reset(stmt);
         cbm_usleep((unsigned long)backoff_us);
     }
