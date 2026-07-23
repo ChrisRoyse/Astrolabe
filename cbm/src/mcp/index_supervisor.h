@@ -45,18 +45,8 @@ void cbm_index_supervisor_mark_host(void);
 
 /* True when handle_index_repository should wrap the run in a supervised child:
  * this process called cbm_index_supervisor_mark_host() (i.e. it IS the real
- * binary, not an embedder), is not itself a worker, AND the kill switch
- * (CBM_INDEX_SUPERVISOR=0) is not set. */
+ * binary, not an embedder) and is not itself a worker. */
 bool cbm_index_supervisor_should_wrap(void);
-
-/* TEST HOOK (#845): process-wide count of worker-spawn attempts, incremented on
- * entry to cbm_index_spawn_worker. Embedder tests assert the count is unchanged
- * across an index_repository call to prove indexing ran IN-PROCESS. */
-int cbm_index_supervisor_spawn_count(void);
-
-/* Test hook: single-threaded spawn count — must stay ZERO (production
- * recovery is parallel-only; no sequential runs). */
-int cbm_index_supervisor_spawn_st_count(void);
 
 typedef struct {
     cbm_proc_outcome_t outcome; /* how the worker ended */
@@ -67,43 +57,17 @@ typedef struct {
                                  * on a non-CLEAN outcome (caller frees); else NULL. Present in
                                  * every build for a single struct layout; only the
                                  * ASTRO_WORKER_DIAG supervisor fills it. */
+    char *log_path;             /* persisted worker log on non-CLEAN outcome (caller frees) */
 } cbm_index_worker_result_t;
 
 /* Spawn `<self> cli --index-worker index_repository <args_json> --response-out <tmp>`,
  * supervise it (quiet-timeout for hangs), reap, and classify. On a clean exit,
  * result->response holds the worker's response string (read from the temp file).
  * Returns 0 if a worker was spawned and reaped (result filled), or -1 if the
- * child could not be spawned (caller degrades to in-process).
- *
- * Probe knobs for the skip-and-continue recovery re-run (Stage 3c) are passed to
- * the child as inherited env vars around the spawn (set before, unset after —
- * safe because spawns are sequential):
- *   - single_thread   → CBM_INDEX_SINGLE_THREAD=1: the pipeline uses exactly one
- *                       worker, so a per-file marker pins the EXACT crasher.
- *   - marker_file      → CBM_INDEX_MARKER_FILE: the worker writes the rel_path of
- *                       the file it is about to process here before touching it.
- *   - quarantine_file  → CBM_INDEX_QUARANTINE_FILE: newline-delimited rel_paths to
- *                       skip and report as phase="crash".
- * Any of the three may be false/NULL to leave that knob unset (the normal first
- * attempt passes single_thread=false, marker_file=NULL, quarantine_file=NULL). */
-int cbm_index_spawn_worker(const char *args_json, bool single_thread, const char *marker_file,
-                           const char *quarantine_file, cbm_index_worker_result_t *result);
+ * child could not be spawned. Callers must fail closed; there is no in-process
+ * retry or corpus-changing recovery path. */
+int cbm_index_spawn_worker(const char *args_json, cbm_index_worker_result_t *result);
 
 void cbm_index_worker_result_free(cbm_index_worker_result_t *result);
-
-#ifdef ASTRO_ENV_STORE
-#include <stddef.h> /* size_t */
-/* #252: propagate an active in-process FFI store override
- * (cbm_astro_set_cache_dir) into the environment a spawned index worker inherits,
- * and restore it afterwards. The override is process-local and is not visible to
- * the child, which resolves its own store fresh; without propagation the child
- * would leak its DB/scratch into $HOME/.cache when the host has redirected the
- * store. Compiled only into libcbm (ASTRO_ENV_STORE); exposed here so the env
- * round-trip is directly verifiable through the same cbm_safe_getenv accessor the
- * child inherits. See the definitions in index_supervisor.c for the return
- * contract (1 = propagated/pop required, 0 = no override, -1 = fail-closed). */
-int cbm_index_worker_store_env_push(char *prior_out, size_t prior_cap, int *had_prior);
-void cbm_index_worker_store_env_pop(int pushed, int had_prior, const char *prior);
-#endif /* ASTRO_ENV_STORE */
 
 #endif /* CBM_INDEX_SUPERVISOR_H */

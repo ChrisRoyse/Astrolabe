@@ -34,20 +34,19 @@ CBMLanguage cbm_language_for_extension(const char *ext);
  * Returns "Unknown" for CBM_LANG_COUNT or out-of-range values. */
 const char *cbm_language_name(CBMLanguage lang);
 
-/* Disambiguate .m files by reading first 4KB of content.
- * Returns CBM_LANG_OBJC, CBM_LANG_MAGMA, or CBM_LANG_MATLAB.
- * On read failure, defaults to CBM_LANG_MATLAB. */
-CBMLanguage cbm_disambiguate_m(const char *path);
+/* Disambiguate .m files by reading the first 4KB completely. Read failures
+ * are terminal; ambiguity is classified as MATLAB only after a successful read. */
+int cbm_disambiguate_m_checked(const char *path, CBMLanguage *out);
 
 /* ── Gitignore pattern matching ──────────────────────────────────── */
 
 typedef struct cbm_gitignore cbm_gitignore_t;
 
-/* Parse gitignore patterns from a file. Returns NULL on error (file not found, etc.).
- * Caller must call cbm_gitignore_free(). */
-cbm_gitignore_t *cbm_gitignore_load(const char *path);
+/* Load gitignore patterns with complete-or-error semantics. A missing path is
+ * accepted only when optional is true. Caller owns *out on success. */
+int cbm_gitignore_load_checked(const char *path, bool optional, cbm_gitignore_t **out);
 
-/* Parse gitignore patterns from a string (for testing).
+/* Parse gitignore patterns from a string.
  * Caller must call cbm_gitignore_free(). */
 cbm_gitignore_t *cbm_gitignore_parse(const char *content);
 
@@ -99,11 +98,24 @@ bool cbm_matches_fast_pattern(const char *filename, cbm_index_mode_t mode);
 /* ── File discovery ──────────────────────────────────────────────── */
 
 typedef struct {
-    char *path;           /* absolute path (heap-allocated) */
+    char *path;           /* immutable snapshot path after capture (heap-allocated) */
+    char *live_path;      /* original absolute path; never used by extraction passes */
     char *rel_path;       /* relative to repo root (heap-allocated) */
     CBMLanguage language; /* detected language */
-    int64_t size;         /* file size in bytes */
+    int64_t size;         /* exact captured byte count */
+    int64_t mtime_ns;     /* handle-bound source mtime captured with the bytes */
+    char sha256[65];      /* lowercase SHA-256 of the exact captured bytes */
+    uint64_t source_volume_serial;
+    uint8_t source_file_id[16];
+    int64_t source_change_time_100ns;
+    bool auxiliary;            /* interpretation input with no registered source language */
+    bool interpretation_input; /* changes can affect resolution beyond this file */
 } cbm_file_info_t;
+
+/* True for files that affect source interpretation even when they are not
+ * themselves code atoms (package manifests, alias config, ignore/config
+ * policy, and environment manifests). */
+bool cbm_is_auxiliary_input_name(const char *filename);
 
 typedef struct {
     cbm_index_mode_t mode;   /* CBM_MODE_FULL or CBM_MODE_FAST */

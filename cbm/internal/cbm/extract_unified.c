@@ -592,7 +592,9 @@ static void handle_string_refs(CBMExtractCtx *ctx, TSNode node, const WalkState 
         .enclosing_func_qn = state->enclosing_func_qn ? state->enclosing_func_qn : ctx->module_qn,
         .kind = (CBMStringRefKind)kind_val,
     };
-    cbm_stringref_push(&ctx->result->string_refs, ctx->arena, ref);
+    if (!cbm_stringref_push(&ctx->result->string_refs, ctx->arena, ref)) {
+        return;
+    }
 }
 
 // --- YAML nested field extraction (D2) ---
@@ -633,7 +635,9 @@ static void emit_yaml_leaf_value(CBMExtractCtx *ctx, TSNode val, const char *pat
         .key_path = path,
         .kind = (CBMStringRefKind)kind_val,
     };
-    cbm_stringref_push(&ctx->result->string_refs, ctx->arena, ref);
+    if (!cbm_stringref_push(&ctx->result->string_refs, ctx->arena, ref)) {
+        return;
+    }
 }
 
 typedef struct {
@@ -803,7 +807,9 @@ static void emit_infra_bindings(CBMExtractCtx *ctx, const char **sources, const 
                 .target_url = targets[ti],
                 .broker = infer_broker(ctx->rel_path, source_keys[si]),
             };
-            cbm_infrabinding_push(&ctx->result->infra_bindings, ctx->arena, ib);
+            if (!cbm_infrabinding_push(&ctx->result->infra_bindings, ctx->arena, ib)) {
+                return;
+            }
         }
     }
 }
@@ -1032,7 +1038,9 @@ static void scan_hcl_block_for_bindings(CBMExtractCtx *ctx, TSNode block) {
                     .target_url = targets[ti],
                     .broker = sched_broker ? sched_broker : "cloud_scheduler",
                 };
-                cbm_infrabinding_push(&ctx->result->infra_bindings, ctx->arena, ib);
+                if (!cbm_infrabinding_push(&ctx->result->infra_bindings, ctx->arena, ib)) {
+                    return;
+                }
             }
             return;
         }

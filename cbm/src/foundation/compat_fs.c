@@ -31,37 +31,62 @@
 struct cbm_dir {
     HANDLE find_handle;
     WIN32_FIND_DATAW find_data;
-    wchar_t wide_pattern[CBM_PATH_MAX];
     cbm_dirent_t entry;
     bool first;
     bool done;
+    DWORD error;
 };
 
+static _Thread_local unsigned long g_cbm_fs_last_error;
+
+unsigned long cbm_fs_last_error(void) {
+    return g_cbm_fs_last_error;
+}
+
+unsigned long cbm_dir_error(const cbm_dir_t *d) {
+    return d ? (unsigned long)d->error : (unsigned long)ERROR_INVALID_PARAMETER;
+}
+
 cbm_dir_t *cbm_opendir(const char *path) {
+    g_cbm_fs_last_error = ERROR_SUCCESS;
     if (!path) {
+        g_cbm_fs_last_error = ERROR_INVALID_PARAMETER;
         return NULL;
     }
     /* #383: extended-length widen so directories deeper than MAX_PATH (260) are
      * enumerable (FindFirstFileW below) instead of silently skipped by the walk. */
     wchar_t *wpath = cbm_utf8_to_wide_path(path);
     if (!wpath) {
+        g_cbm_fs_last_error = GetLastError();
+        if (g_cbm_fs_last_error == ERROR_SUCCESS) {
+            g_cbm_fs_last_error = ERROR_NOT_ENOUGH_MEMORY;
+        }
         return NULL;
     }
 
     size_t wlen = wcslen(wpath);
-    if (wlen == 0 || wlen + 2 >= CBM_PATH_MAX) {
+    if (wlen == 0 || wlen > (SIZE_MAX / sizeof(wchar_t)) - 3) {
         free(wpath);
+        g_cbm_fs_last_error = ERROR_FILENAME_EXCED_RANGE;
         return NULL;
     }
 
     cbm_dir_t *d = (cbm_dir_t *)calloc(CBM_ALLOC_ONE, sizeof(cbm_dir_t));
     if (!d) {
         free(wpath);
+        g_cbm_fs_last_error = ERROR_NOT_ENOUGH_MEMORY;
         return NULL;
     }
 
-    wmemcpy(d->wide_pattern, wpath, wlen + 1);
-    wchar_t *p = d->wide_pattern + wlen - SKIP_ONE;
+    wchar_t *wide_pattern = malloc((wlen + 3) * sizeof(wchar_t));
+    if (!wide_pattern) {
+        free(wpath);
+        free(d);
+        g_cbm_fs_last_error = ERROR_NOT_ENOUGH_MEMORY;
+        return NULL;
+    }
+    wmemcpy(wide_pattern, wpath, wlen + 1);
+    wchar_t *p = wide_pattern + wlen - SKIP_ONE;
     if (*p != L'\\' && *p != L'/') {
         ++p;
         *p++ = L'\\';
@@ -72,8 +97,10 @@ cbm_dir_t *cbm_opendir(const char *path) {
     *p = L'\0';
     free(wpath);
 
-    d->find_handle = FindFirstFileW(d->wide_pattern, &d->find_data);
+    d->find_handle = FindFirstFileW(wide_pattern, &d->find_data);
+    free(wide_pattern);
     if (d->find_handle == INVALID_HANDLE_VALUE) {
+        g_cbm_fs_last_error = GetLastError();
         free(d);
         return NULL;
     }
@@ -89,6 +116,10 @@ cbm_dirent_t *cbm_readdir(cbm_dir_t *d) {
     if (!d->first) {
         if (!FindNextFileW(d->find_handle, &d->find_data)) {
             d->done = true;
+            d->error = GetLastError();
+            if (d->error == ERROR_NO_MORE_FILES) {
+                d->error = ERROR_SUCCESS;
+            }
             return NULL;
         }
     }
@@ -99,6 +130,10 @@ cbm_dirent_t *cbm_readdir(cbm_dir_t *d) {
             (d->find_data.cFileName[1] == L'.' && d->find_data.cFileName[2] == L'\0'))) {
         if (!FindNextFileW(d->find_handle, &d->find_data)) {
             d->done = true;
+            d->error = GetLastError();
+            if (d->error == ERROR_NO_MORE_FILES) {
+                d->error = ERROR_SUCCESS;
+            }
             return NULL;
         }
     }
@@ -106,11 +141,18 @@ cbm_dirent_t *cbm_readdir(cbm_dir_t *d) {
     char *u8 = cbm_wide_to_utf8(d->find_data.cFileName);
     if (!u8) {
         d->done = true;
+        d->error = GetLastError();
+        if (d->error == ERROR_SUCCESS) {
+            d->error = ERROR_NO_UNICODE_TRANSLATION;
+        }
         return NULL;
     }
     size_t nlen = strlen(u8);
     if (nlen >= CBM_DIRENT_NAME_MAX) {
-        nlen = CBM_DIRENT_NAME_MAX - SKIP_ONE;
+        free(u8);
+        d->done = true;
+        d->error = ERROR_FILENAME_EXCED_RANGE;
+        return NULL;
     }
     memcpy(d->entry.name, u8, nlen);
     d->entry.name[nlen] = '\0';
@@ -412,10 +454,6 @@ bool cbm_mkdir_p(const char *path, int mode) {
         return false;
     }
 
-    if (_wmkdir(wpath) == 0) {
-        free(wpath);
-        return true;
-    }
     size_t wlen = wcslen(wpath);
     wchar_t *tmp = (wchar_t *)malloc((wlen + 1) * sizeof(wchar_t));
     if (!tmp) {
@@ -423,14 +461,52 @@ bool cbm_mkdir_p(const char *path, int mode) {
         return false;
     }
     wmemcpy(tmp, wpath, wlen + 1);
-    for (wchar_t *p = tmp + SKIP_ONE; *p; p++) {
+    wchar_t *start = tmp;
+    if (wlen >= 8 && wcsncmp(tmp, L"\\\\?\\UNC\\", 8) == 0) {
+        start = tmp + 8;
+        for (int separators = 0; *start && separators < 2; start++) {
+            if (*start == L'\\' || *start == L'/') {
+                separators++;
+            }
+        }
+    } else if (wlen >= 7 && wcsncmp(tmp, L"\\\\?\\", 4) == 0 && tmp[5] == L':' &&
+               (tmp[6] == L'\\' || tmp[6] == L'/')) {
+        start = tmp + 7;
+    } else if (wlen >= 3 && tmp[1] == L':' && (tmp[2] == L'\\' || tmp[2] == L'/')) {
+        start = tmp + 3;
+    } else if (wlen > 0 && (tmp[0] == L'\\' || tmp[0] == L'/')) {
+        start = tmp + 1;
+    }
+    bool ok = true;
+    for (wchar_t *p = start; *p; p++) {
         if (*p == L'/' || *p == L'\\') {
+            wchar_t separator = *p;
             *p = L'\0';
-            _wmkdir(tmp);
-            *p = L'\\';
+            int mkdir_rc = _wmkdir(tmp);
+            if (mkdir_rc != 0) {
+                if (errno != EEXIST) {
+                    ok = false;
+                } else {
+                    DWORD attributes = GetFileAttributesW(tmp);
+                    ok = attributes != INVALID_FILE_ATTRIBUTES &&
+                         (attributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+                }
+            }
+            *p = separator;
+            if (!ok) {
+                break;
+            }
         }
     }
-    bool ok = _wmkdir(tmp) == 0 || GetLastError() == ERROR_ALREADY_EXISTS;
+    if (ok && _wmkdir(tmp) != 0) {
+        if (errno != EEXIST) {
+            ok = false;
+        } else {
+            DWORD attributes = GetFileAttributesW(tmp);
+            ok = attributes != INVALID_FILE_ATTRIBUTES &&
+                 (attributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+        }
+    }
     free(tmp);
     free(wpath);
     return ok;
@@ -763,18 +839,33 @@ int cbm_exec_no_shell(const char *const *argv) {
 struct cbm_dir {
     DIR *dir;
     cbm_dirent_t entry;
+    int error;
 };
 
+static _Thread_local unsigned long g_cbm_fs_last_error;
+
+unsigned long cbm_fs_last_error(void) {
+    return g_cbm_fs_last_error;
+}
+
+unsigned long cbm_dir_error(const cbm_dir_t *d) {
+    return d ? (unsigned long)d->error : (unsigned long)EINVAL;
+}
+
 cbm_dir_t *cbm_opendir(const char *path) {
+    g_cbm_fs_last_error = 0;
     if (!path) {
+        g_cbm_fs_last_error = EINVAL;
         return NULL;
     }
     DIR *dir = opendir(path);
     if (!dir) {
+        g_cbm_fs_last_error = (unsigned long)errno;
         return NULL;
     }
     cbm_dir_t *d = (cbm_dir_t *)calloc(CBM_ALLOC_ONE, sizeof(cbm_dir_t));
     if (!d) {
+        g_cbm_fs_last_error = ENOMEM;
         closedir(dir);
         return NULL;
     }
@@ -787,6 +878,7 @@ cbm_dirent_t *cbm_readdir(cbm_dir_t *d) {
         return NULL;
     }
     struct dirent *de;
+    errno = 0;
     while ((de = readdir(d->dir)) != NULL) {
         /* Skip "." and ".." */
         if (de->d_name[0] == '.' &&
@@ -796,7 +888,8 @@ cbm_dirent_t *cbm_readdir(cbm_dir_t *d) {
         }
         size_t nlen = strlen(de->d_name);
         if (nlen >= CBM_DIRENT_NAME_MAX) {
-            nlen = CBM_DIRENT_NAME_MAX - SKIP_ONE;
+            d->error = ENAMETOOLONG;
+            return NULL;
         }
         memcpy(d->entry.name, de->d_name, nlen);
         d->entry.name[nlen] = '\0';
@@ -804,6 +897,7 @@ cbm_dirent_t *cbm_readdir(cbm_dir_t *d) {
         d->entry.d_type = de->d_type;
         return &d->entry;
     }
+    d->error = errno;
     return NULL;
 }
 

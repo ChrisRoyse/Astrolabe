@@ -44,72 +44,29 @@
  * conservative: we emit only when the decorator text matches one of
  * the curated tokens — anything else is left alone. */
 typedef struct {
-    const char* match;     /* substring to find in the decorator text */
-    const char* edges[6];  /* synthesized callee QNs (NULL-terminated) */
+    const char *match;    /* substring to find in the decorator text */
+    const char *edges[6]; /* synthesized callee QNs (NULL-terminated) */
 } RustAttrSynth;
 
 static const RustAttrSynth ATTR_SYNTH[] = {
-    {"tokio::main", {
-        "tokio.runtime.Runtime.new",
-        "tokio.runtime.Runtime.block_on",
-        NULL
-    }},
-    {"tokio::test", {
-        "tokio.runtime.Runtime.new",
-        "tokio.runtime.Runtime.block_on",
-        NULL
-    }},
-    {"async_std::main", {
-        "async_std.task.block_on",
-        NULL
-    }},
-    {"actix_web::main", {
-        "actix_web.rt.System.new",
-        "actix_web.rt.System.block_on",
-        NULL
-    }},
-    {"actix_rt::main", {
-        "actix_rt.System.new",
-        "actix_rt.System.block_on",
-        NULL
-    }},
-    {"rocket::main", {
-        "rocket.async_main",
-        NULL
-    }},
-    {"rocket::launch", {
-        "rocket.launch",
-        NULL
-    }},
-    {"tracing::instrument", {
-        "tracing.span.Span.enter",
-        NULL
-    }},
-    {"async_trait", {
-        /* The macro wraps each method's return in
-         * `Pin<Box<dyn Future<Output = R> + Send>>` — no method-name
-         * synthesis needed, just record the boxed-future bridging
-         * call so analyses see the async-trait shape. */
-        "alloc.boxed.Box.new",
-        "core.pin.Pin.new",
-        NULL
-    }},
-    {"wasm_bindgen", {
-        "wasm_bindgen.JsValue.from",
-        NULL
-    }},
-    {"napi", {
-        "napi.Env.create",
-        NULL
-    }},
-    {"pyo3::pyfunction", {
-        "pyo3.Python.with_gil",
-        NULL
-    }},
-    {"pyo3::pymethods", {
-        "pyo3.Python.with_gil",
-        NULL
-    }},
+    {"tokio::main", {"tokio.runtime.Runtime.new", "tokio.runtime.Runtime.block_on", NULL}},
+    {"tokio::test", {"tokio.runtime.Runtime.new", "tokio.runtime.Runtime.block_on", NULL}},
+    {"async_std::main", {"async_std.task.block_on", NULL}},
+    {"actix_web::main", {"actix_web.rt.System.new", "actix_web.rt.System.block_on", NULL}},
+    {"actix_rt::main", {"actix_rt.System.new", "actix_rt.System.block_on", NULL}},
+    {"rocket::main", {"rocket.async_main", NULL}},
+    {"rocket::launch", {"rocket.launch", NULL}},
+    {"tracing::instrument", {"tracing.span.Span.enter", NULL}},
+    {"async_trait",
+     {/* The macro wraps each method's return in
+       * `Pin<Box<dyn Future<Output = R> + Send>>` — no method-name
+       * synthesis needed, just record the boxed-future bridging
+       * call so analyses see the async-trait shape. */
+      "alloc.boxed.Box.new", "core.pin.Pin.new", NULL}},
+    {"wasm_bindgen", {"wasm_bindgen.JsValue.from", NULL}},
+    {"napi", {"napi.Env.create", NULL}},
+    {"pyo3::pyfunction", {"pyo3.Python.with_gil", NULL}},
+    {"pyo3::pymethods", {"pyo3.Python.with_gil", NULL}},
 };
 
 #define ATTR_SYNTH_COUNT (int)(sizeof(ATTR_SYNTH) / sizeof(ATTR_SYNTH[0]))
@@ -119,16 +76,19 @@ static const RustAttrSynth ATTR_SYNTH[] = {
  * QN to the wrapper functions the macro would have injected. The
  * edges are best-effort and tagged `lsp_proc_macro` so consumers can
  * distinguish them from direct calls. */
-void cbm_rust_synth_proc_macro_edges(CBMArena* arena, CBMFileResult* result) {
-    if (!arena || !result) return;
+void cbm_rust_synth_proc_macro_edges(CBMArena *arena, CBMFileResult *result) {
+    if (!arena || !result)
+        return;
     for (int i = 0; i < result->defs.count; i++) {
-        CBMDefinition* d = &result->defs.items[i];
-        if (!d->decorators || !d->qualified_name) continue;
+        CBMDefinition *d = &result->defs.items[i];
+        if (!d->decorators || !d->qualified_name)
+            continue;
         for (int di = 0; d->decorators[di]; di++) {
-            const char* dec = d->decorators[di];
+            const char *dec = d->decorators[di];
             for (int t = 0; t < ATTR_SYNTH_COUNT; t++) {
-                const RustAttrSynth* s = &ATTR_SYNTH[t];
-                if (!strstr(dec, s->match)) continue;
+                const RustAttrSynth *s = &ATTR_SYNTH[t];
+                if (!strstr(dec, s->match))
+                    continue;
                 /* Emit one resolved call per edge. */
                 for (int e = 0; s->edges[e]; e++) {
                     CBMResolvedCall rc;
@@ -136,8 +96,10 @@ void cbm_rust_synth_proc_macro_edges(CBMArena* arena, CBMFileResult* result) {
                     rc.caller_qn = d->qualified_name;
                     rc.callee_qn = cbm_arena_strdup(arena, s->edges[e]);
                     rc.strategy = "lsp_proc_macro";
-                    rc.confidence = 0.78f;  /* high-but-not-direct */
-                    cbm_resolvedcall_push(&result->resolved_calls, arena, rc);
+                    rc.confidence = 0.78f; /* high-but-not-direct */
+                    if (!cbm_resolvedcall_push(&result->resolved_calls, arena, rc)) {
+                        return;
+                    }
                 }
             }
         }

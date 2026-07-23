@@ -84,6 +84,8 @@ static void py_builtins_inject_defs(CBMFileResult *result, CBMArena *arena) {
         def.file_path = "<python-builtins>";
         def.start_line = 1;
         def.end_line = 1;
-        cbm_defs_push(&result->defs, arena, def);
+        if (!cbm_defs_push(&result->defs, arena, def)) {
+            return;
+        }
     }
 }

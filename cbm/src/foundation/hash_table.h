@@ -27,8 +27,11 @@ CBMHashTable *cbm_ht_create(uint32_t initial_capacity);
 /* Free the hash table (does NOT free keys or values). */
 void cbm_ht_free(CBMHashTable *ht);
 
-/* Insert or update. Returns previous value (NULL if new key). */
-void *cbm_ht_set(CBMHashTable *ht, const char *key, void *value);
+/* Insert or update, failing closed when the table cannot allocate/rehash.
+ * `previous_out`, when non-NULL, is set independently from the success result:
+ * NULL means this was a new key, while a false return means no insertion was
+ * committed. Keys and values remain caller-owned on failure. */
+bool cbm_ht_set_checked(CBMHashTable *ht, const char *key, void *value, void **previous_out);
 
 /* Lookup. Returns NULL if not found. */
 void *cbm_ht_get(const CBMHashTable *ht, const char *key);

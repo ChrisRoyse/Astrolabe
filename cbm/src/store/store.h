@@ -289,6 +289,9 @@ struct sqlite3 *cbm_store_get_db(cbm_store_t *s);
 /* Get the last error message (static string, valid until next call). */
 const char *cbm_store_error(cbm_store_t *s);
 
+/* Get SQLite's exact extended result code for the last operation. */
+int cbm_store_error_code(cbm_store_t *s);
+
 /* ── Transaction ────────────────────────────────────────────────── */
 
 /* Begin a transaction. Returns CBM_STORE_OK on success. */
@@ -317,16 +320,15 @@ int cbm_store_create_indexes(cbm_store_t *s);
 
 /* ── WAL / Checkpoint ───────────────────────────────────────────── */
 
-/* Force WAL checkpoint + PRAGMA optimize. */
+/* Require a complete WAL TRUNCATE checkpoint, then PRAGMA optimize.
+ * Active readers/checkpoint owners and all SQLite failures are hard errors. */
 int cbm_store_checkpoint(cbm_store_t *s);
 
 /* Resolve the mmap_size pragma value applied to on-disk stores from the
  * CBM_SQLITE_MMAP_SIZE environment variable. Defaults to 67108864 (64 MB)
- * when the variable is unset, malformed, or partially numeric. Negative
- * values clamp to 0 (which disables mmap and reverts to read()/pread()
- * I/O — recoverable SQLITE_IOERR instead of SIGBUS when concurrent
- * processes truncate the DB file under live mappings). Exposed for
- * testability. */
+ * only when the variable is absent. Returns -1 for empty, malformed,
+ * partially numeric, negative, or overflowed values so store open can fail
+ * closed instead of applying a different memory policy. */
 int64_t cbm_store_resolve_mmap_size(void);
 
 /* ── Dump / Restore ─────────────────────────────────────────────── */

@@ -1260,7 +1260,9 @@ static void emit_resolved_reason(PHPLSPContext *ctx, const char *callee_qn, cons
     rc.strategy = strategy;
     rc.confidence = confidence;
     rc.reason = reason;
-    cbm_resolvedcall_push(ctx->resolved_calls, ctx->arena, rc);
+    if (!cbm_resolvedcall_push(ctx->resolved_calls, ctx->arena, rc)) {
+        return;
+    }
 }
 
 static void emit_resolved(PHPLSPContext *ctx, const char *callee_qn, const char *strategy,
@@ -1277,7 +1279,9 @@ static void emit_unresolved(PHPLSPContext *ctx, const char *expr_text, const cha
     rc.strategy = "lsp_unresolved";
     rc.confidence = 0.0f;
     rc.reason = reason;
-    cbm_resolvedcall_push(ctx->resolved_calls, ctx->arena, rc);
+    if (!cbm_resolvedcall_push(ctx->resolved_calls, ctx->arena, rc)) {
+        return;
+    }
 }
 
 /* ── statement-level scope binding ──────────────────────────────── */

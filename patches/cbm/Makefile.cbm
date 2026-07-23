@@ -79,7 +79,7 @@ IS_GCC := $(if $(filter gcc,$(CC_FAMILY)),yes,no)
 # -Wno-alloc-size-larger-than were REMOVED. They masked genuine latent C defects
 # in the owned CBM sources (unchecked alloc-size in ui/layout3d.c compute_call_depth
 # and pipeline/pass_definitions.c; non-NUL-terminating strncpy in watcher/watcher.c
-# and pipeline/pass_envscan.c). Those sites are now root-cause-fixed unconditionally
+# and the former pipeline/pass_envscan.c). The live sites are root-cause-fixed unconditionally
 # (strnlen+memcpy+explicit NUL; fail-closed range guards), so the diagnostics stay
 # ON as -Werror across every artifact — libcbm.a, the production binaries, and the
 # test-runner — and any future truncation / oversized-allocation defect fails the
@@ -272,6 +272,7 @@ PIPELINE_SRCS = \
     src/pipeline/fqn.c \
     src/pipeline/path_alias.c \
     src/pipeline/registry.c \
+    src/pipeline/source_snapshot.c \
     src/pipeline/pipeline.c \
     src/pipeline/pipeline_incremental.c \
     src/pipeline/worker_pool.c \
@@ -288,7 +289,6 @@ PIPELINE_SRCS = \
     src/pipeline/pass_configlink.c \
     src/pipeline/pass_route_nodes.c \
     src/pipeline/pass_enrichment.c \
-    src/pipeline/pass_envscan.c \
     src/pipeline/pass_compile_commands.c \
     src/pipeline/pass_infrascan.c \
     src/pipeline/pass_k8s.c \
@@ -395,8 +395,7 @@ EXISTING_C_SRCS = $(EXTRACTION_SRCS) $(LSP_SRCS) $(TS_RUNTIME_SRC) \
 #
 # #273: the former ASTRO_UI_WERROR macro is gone. Its #229 -Werror root-cause
 # fixes (src/ui/layout3d.c and src/pipeline/pass_definitions.c unchecked
-# allocation-size guards; the strncpy -> strnlen+memcpy+NUL fixes in
-# src/watcher/watcher.c and src/pipeline/pass_envscan.c) are now UNCONDITIONAL in
+# allocation-size guards) are now UNCONDITIONAL in
 # the CBM sources, so they ship identically in libcbm.a, the production binaries,
 # and the test-runner — no per-artifact macro gates them, and the blanket
 # -Wno-stringop-truncation / -Wno-alloc-size-larger-than that used to mask them on

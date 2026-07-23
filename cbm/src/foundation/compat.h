@@ -105,18 +105,29 @@ static inline struct tm *cbm_gmtime_r(const time_t *timep, struct tm *result) {
 
 /* ── mkdtemp (Windows lacks it) ──────────────────────────────── */
 #ifdef _WIN32
-/* Translates /tmp/ to %TEMP%\ and copies result back to tmpl.
- * Callers MUST use char buf[CBM_SZ_256] or larger. */
-char *cbm_mkdtemp(char *tmpl);
+/* Atomically replaces a trailing XXXXXX and creates the path. `capacity`
+ * includes the terminator and prevents the Windows implementation from
+ * writing past the caller's buffer. */
+char *cbm_mkdtemp(char *tmpl, size_t capacity);
 #else
-#define cbm_mkdtemp mkdtemp
+static inline char *cbm_mkdtemp(char *tmpl, size_t capacity) {
+    (void)capacity;
+    return mkdtemp(tmpl);
+}
 #endif
 
 /* ── mkstemp (Windows lacks it) ──────────────────────────────── */
 #ifdef _WIN32
-int cbm_mkstemp(char *tmpl);
+int cbm_mkstemp(char *tmpl, size_t capacity);
+#define cbm_fdopen _fdopen
+#define cbm_close_fd _close
 #else
-#define cbm_mkstemp mkstemp
+static inline int cbm_mkstemp(char *tmpl, size_t capacity) {
+    (void)capacity;
+    return mkstemp(tmpl);
+}
+#define cbm_fdopen fdopen
+#define cbm_close_fd close
 #endif
 
 /* ── setenv / unsetenv (Windows lacks them) ──────────────────── */

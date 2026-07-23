@@ -2,6 +2,8 @@ mod build_support;
 
 use std::env;
 use std::fs;
+use std::fs::OpenOptions;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -114,6 +116,7 @@ fn main() {
         println!("cargo:rerun-if-env-changed={var}");
     }
     println!("cargo:rerun-if-env-changed=ASTROLABE_UPDATE_BINDINGS");
+    println!("cargo:rerun-if-env-changed=ASTROLABE_BINDINGS_CANDIDATE");
     println!("cargo:rerun-if-env-changed=LIBCLANG_PATH");
     if env::var_os("CBM_SYS_ASAN").is_some() {
         println!("cargo:rustc-cfg=cbm_sys_asan");
@@ -146,14 +149,46 @@ fn main() {
 fn run_make(cbm_root: &Path, patched_makefile: &Path, build_dir: &Path, config_stamp: &Path) {
     let make = env::var("MAKE").unwrap_or_else(|_| "make".to_string());
     let mut command = Command::new(&make);
-    // Build libcbm's 150+ translation units in parallel. `NUM_JOBS` is set by
-    // Cargo to the parallelism it chose for this build (a provided measurement,
-    // not a magic constant); mirroring it keeps the C compile within Cargo's job
-    // budget instead of serializing every object. Falls back to 1 if unset.
-    let make_jobs = env::var("NUM_JOBS").unwrap_or_else(|_| "1".to_string());
+    // Cargo's build-script contract grants this process one implicit job slot.
+    // Nested GNU Make may use additional slots only through Cargo's shared
+    // jobserver. Passing historical NUM_JOBS as an independent `make -jN`
+    // multiplies concurrency when Cargo runs multiple cbm-sys feature builds.
+    // Cargo explicitly documents CARGO_MAKEFLAGS -> MAKEFLAGS as the supported
+    // GNU Make bridge. On our native Windows GNU toolchain the authorization is
+    // a named semaphore; reject a present but unusable contract instead of
+    // allowing Make to degrade to an independently parallel invocation.
+    match env::var("CARGO_MAKEFLAGS") {
+        Ok(flags) => {
+            let has_jobserver = flags
+                .split_ascii_whitespace()
+                .any(|flag| flag.starts_with("--jobserver-auth=") && flag.len() > 17);
+            if flags.trim().is_empty() || !has_jobserver {
+                panic!(
+                    "CBM_BUILD_JOBSERVER_INVALID[ASTRO_CBM_BUILD_JOBSERVER_INVALID]: \
+                     CARGO_MAKEFLAGS is present but contains no non-empty --jobserver-auth value; \
+                     refusing independent nested-build concurrency. remediation: invoke Cargo \
+                     through the native launcher so Cargo can publish its Windows jobserver"
+                );
+            }
+            command.env("MAKEFLAGS", flags);
+        }
+        Err(env::VarError::NotPresent) => {
+            // With no Cargo jobserver, preserve the build script's one implicit
+            // slot. Remove any unrelated ambient Make policy rather than
+            // inheriting uncoordinated or unlimited parallelism.
+            command.env_remove("MAKEFLAGS");
+        }
+        Err(env::VarError::NotUnicode(_)) => {
+            panic!(
+                "CBM_BUILD_JOBSERVER_INVALID[ASTRO_CBM_BUILD_JOBSERVER_INVALID]: \
+                 CARGO_MAKEFLAGS is not valid Unicode; refusing an unevaluable nested-build \
+                 concurrency contract. remediation: clear the malformed environment value and \
+                 invoke Cargo through the native launcher"
+            );
+        }
+    }
     command
         .current_dir(cbm_root)
-        .arg(format!("-j{make_jobs}"))
         .arg("-f")
         .arg(make_path(patched_makefile))
         .arg(format!("BUILD_DIR={}", make_path(build_dir)))
@@ -276,22 +311,87 @@ fn verify_bindings(manifest_dir: &Path, generated: &str) {
     let bindings_path = manifest_dir.join("src/bindings.rs");
 
     if env::var_os("ASTROLABE_UPDATE_BINDINGS").is_some() {
-        fs::write(&bindings_path, &generated).expect("failed to update committed cbm bindings");
-        return;
+        panic!(
+            "ASTROLABE_UPDATE_BINDINGS is unsafe: a native build runs inside a frozen launcher \
+             lease and may not mutate tracked source. Set ASTROLABE_BINDINGS_CANDIDATE to one \
+             fresh absolute path below the workspace .tmp directory, inspect that candidate \
+             after launcher cleanup, then promote it outside the lease."
+        );
+    }
+
+    if let Some(candidate) = env::var_os("ASTROLABE_BINDINGS_CANDIDATE") {
+        let candidate = PathBuf::from(candidate);
+        if !candidate.is_absolute() {
+            panic!("ASTROLABE_BINDINGS_CANDIDATE must be an absolute path");
+        }
+        let workspace = manifest_dir
+            .parent()
+            .and_then(Path::parent)
+            .expect("cbm-sys manifest must remain two levels below the workspace");
+        let tmp = fs::canonicalize(workspace.join(".tmp"))
+            .expect("workspace .tmp must exist before generating a bindings candidate");
+        let parent = candidate
+            .parent()
+            .and_then(|path| fs::canonicalize(path).ok())
+            .expect("bindings candidate parent must already exist and be readable");
+        if parent != tmp && !parent.starts_with(&tmp) {
+            panic!("ASTROLABE_BINDINGS_CANDIDATE must resolve below the workspace .tmp directory");
+        }
+        let candidate_bytes = generated.as_bytes().to_vec();
+        let mut output = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+            .unwrap_or_else(|err| {
+                panic!(
+                    "failed to create fresh bindings candidate {}: {err}",
+                    candidate.display()
+                )
+            });
+        output
+            .write_all(&candidate_bytes)
+            .and_then(|()| output.sync_all())
+            .unwrap_or_else(|err| {
+                panic!(
+                    "failed to durably write bindings candidate {}: {err}",
+                    candidate.display()
+                )
+            });
+        drop(output);
+        let readback = fs::read(&candidate).unwrap_or_else(|err| {
+            panic!(
+                "failed to read back bindings candidate {}: {err}",
+                candidate.display()
+            )
+        });
+        if readback != candidate_bytes {
+            panic!(
+                "bindings candidate readback differs from generated bytes: {}",
+                candidate.display()
+            );
+        }
+        println!(
+            "cargo:warning=durable cbm bindings candidate written to {} ({} bytes)",
+            candidate.display(),
+            candidate_bytes.len()
+        );
     }
 
     let committed = fs::read_to_string(&bindings_path).unwrap_or_else(|err| {
         panic!(
             "failed to read committed bindings at {}: {err}. Run \
-             `ASTROLABE_UPDATE_BINDINGS=1 cargo build -p cbm-sys` to create them.",
+             a native launcher build with ASTROLABE_BINDINGS_CANDIDATE set to one fresh \
+             absolute path below workspace .tmp, then inspect and promote that candidate \
+             after the launcher lease ends.",
             bindings_path.display()
         )
     });
     if normalize_bindings(&committed) != normalize_bindings(&generated) {
         panic!(
-            "cbm-sys bindings are stale. Run \
-             `ASTROLABE_UPDATE_BINDINGS=1 cargo build -p cbm-sys`, review \
-             crates/cbm-sys/src/bindings.rs, and commit the result."
+            "cbm-sys bindings are stale. Run a native launcher build with \
+             ASTROLABE_BINDINGS_CANDIDATE set to one fresh absolute path below workspace .tmp, \
+             inspect and promote that candidate after the launcher lease ends, then rerun this \
+             ordinary build."
         );
     }
 }

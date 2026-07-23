@@ -149,15 +149,20 @@ char *cbm_pipeline_fqn_module_dir(const char *project, const char *rel_path, boo
 /* Folder QN: project.dir.parts. Caller must free(). */
 char *cbm_pipeline_fqn_folder(const char *project, const char *rel_dir);
 
-/* Resolve an import specifier that uses a relative path (./foo, ../bar, .foo,
- * or an unqualified local name like "foo.h") against the importing file's
- * path.  Returns a malloc'd normalized relative path without extension
- * (e.g. "src/api/helpers") suitable for passing to cbm_pipeline_fqn_module,
- * or NULL if the specifier is not a relative path (bare module names like
- * "lodash", "django", "github.com/foo/bar" return NULL — the caller should
- * treat those as external/unresolvable). Handles ".", "..", and leading
- * dot-only segments used by Python relative imports. */
-char *cbm_pipeline_resolve_relative_import(const char *source_rel, const char *module_path);
+typedef enum {
+    CBM_RELATIVE_IMPORT_ERROR = -1,
+    CBM_RELATIVE_IMPORT_NOT_RELATIVE = 0,
+    CBM_RELATIVE_IMPORT_RESOLVED = 1,
+    CBM_RELATIVE_IMPORT_INVALID = 2,
+} cbm_relative_import_status_t;
+
+/* Resolve a relative import (./foo, ../bar, .foo) against its importing file.
+ * On RESOLVED, `out` owns a complete normalized path without extension. The
+ * status distinguishes a bare module, a path that escapes the repository root,
+ * and representation/allocation failure so callers cannot reinterpret failure
+ * as an ordinary unresolved import. */
+int cbm_pipeline_resolve_relative_import_checked(const char *source_rel, const char *module_path,
+                                                 char **out);
 
 /* Derive project name from an absolute path.
  * Replaces / and : with -, collapses --, trims leading -.
@@ -180,8 +185,9 @@ cbm_registry_t *cbm_registry_new(void);
 void cbm_registry_free(cbm_registry_t *r);
 
 /* Register a function/method/class. All strings are copied. */
-void cbm_registry_add(cbm_registry_t *r, const char *name, const char *qualified_name,
+bool cbm_registry_add(cbm_registry_t *r, const char *name, const char *qualified_name,
                       const char *label);
+bool cbm_registry_failed(const cbm_registry_t *r);
 
 /* Resolve a callee name using prioritized strategies.
  * import_map: NULL-terminated array of {local_name, resolved_qn} pairs, or NULL.
@@ -213,6 +219,7 @@ void cbm_registry_import_map_cache_end(void);
  * same names ("Get", "Add", "New", etc) appear hundreds of times. */
 void cbm_registry_resolve_cache_begin(int estimated_capacity);
 void cbm_registry_resolve_cache_end(void);
+bool cbm_registry_cache_failed(void);
 
 /* Check if a qualified name exists in the registry. */
 bool cbm_registry_exists(const cbm_registry_t *r, const char *qn);

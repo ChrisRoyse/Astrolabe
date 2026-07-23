@@ -457,8 +457,8 @@ const cbm_gbuf_node_t *cbm_pipeline_find_definition_node(const cbm_gbuf_t *gbuf,
     return cbm_gbuf_find_source_node(
         gbuf, def->label ? def->label : "Function", def->name, def->qualified_name,
         def->file_path ? def->file_path : fallback_rel_path, (int)def->start_line,
-        (int)def->end_line, (const uint8_t *)def->source, (size_t)def->source_len,
-        def->start_byte, def->end_byte);
+        (int)def->end_line, (const uint8_t *)def->source, (size_t)def->source_len, def->start_byte,
+        def->end_byte);
 }
 
 /* Process one definition: create node, register, DEFINES + DEFINES_METHOD edges. */
@@ -493,7 +493,7 @@ static void process_def(cbm_pipeline_ctx_t *ctx, const CBMCallArray *calls,
         (strcmp(def->label, "Function") == 0 || strcmp(def->label, "Method") == 0 ||
          cbm_label_is_type_like(def->label) || strcmp(def->label, "Variable") == 0 ||
          strcmp(def->label, "Field") == 0)) {
-        cbm_registry_add(ctx->registry, def->name, def->qualified_name, def->label);
+        (void)cbm_registry_add(ctx->registry, def->name, def->qualified_name, def->label);
     }
     char *file_qn = cbm_pipeline_fqn_compute(ctx->project_name, rel, "__file__");
     const cbm_gbuf_node_t *file_node = cbm_gbuf_find_by_qn(ctx->gbuf, file_qn);
@@ -518,10 +518,9 @@ static const cbm_gbuf_node_t *find_channel_source(cbm_pipeline_ctx_t *ctx, const
                                                   const char *rel) {
     const cbm_gbuf_node_t *node = NULL;
     if (ch->enclosing_func_qn && ch->enclosing_func_qn[0]) {
-        node = ch->start_line > 0
-                   ? cbm_gbuf_find_by_qn_location(ctx->gbuf, ch->enclosing_func_qn, rel,
-                                                  ch->start_line)
-                   : cbm_gbuf_find_by_qn(ctx->gbuf, ch->enclosing_func_qn);
+        node = ch->start_line > 0 ? cbm_gbuf_find_by_qn_location(ctx->gbuf, ch->enclosing_func_qn,
+                                                                 rel, ch->start_line)
+                                  : cbm_gbuf_find_by_qn(ctx->gbuf, ch->enclosing_func_qn);
     }
     if (!node) {
         char *file_qn = cbm_pipeline_fqn_compute(ctx->project_name, rel, "__file__");
@@ -589,10 +588,9 @@ static int create_env_configures_for_file(cbm_pipeline_ctx_t *ctx, const CBMFile
         }
         const cbm_gbuf_node_t *src = NULL;
         if (ea->enclosing_func_qn && ea->enclosing_func_qn[0]) {
-            src = ea->start_line > 0
-                      ? cbm_gbuf_find_by_qn_location(ctx->gbuf, ea->enclosing_func_qn, rel,
-                                                     ea->start_line)
-                      : cbm_gbuf_find_by_qn(ctx->gbuf, ea->enclosing_func_qn);
+            src = ea->start_line > 0 ? cbm_gbuf_find_by_qn_location(
+                                           ctx->gbuf, ea->enclosing_func_qn, rel, ea->start_line)
+                                     : cbm_gbuf_find_by_qn(ctx->gbuf, ea->enclosing_func_qn);
         }
         if (!src) {
             if (!file_qn) {
@@ -708,26 +706,6 @@ int cbm_pipeline_pass_definitions(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
         const char *rel = files[i].rel_path;
         CBMLanguage lang = files[i].language;
 
-        /* Crash-quarantine skip (Stage 3c): the supervisor's single-threaded
-         * recovery re-run always lands on THIS sequential path (worker_count
-         * forced to 1). This first sequential pass REPORTS a crasher as a
-         * phase="crash" skip (surfacing it in skipped[]) and continues; later
-         * sequential passes (calls/usages/semantic) re-extract on a cache miss
-         * but hit the hard guard inside cbm_extract_file, so they no-op without
-         * re-crashing and without duplicating the skip. No-op unless
-         * CBM_INDEX_QUARANTINE_FILE is set. */
-        if (cbm_index_is_quarantined(rel)) {
-            const char *phase = cbm_index_quarantine_phase(rel);
-            if (!phase) {
-                phase = "crash";
-            }
-            const char *reason =
-                (strcmp(phase, "hang") == 0) ? "quarantined after hang" : "quarantined after crash";
-            cbm_pipeline_add_file_error(ctx->pipeline, rel, reason, phase);
-            errors++;
-            continue;
-        }
-
         /* Read source file */
         int source_len = 0;
         long file_size = 0;
@@ -810,14 +788,35 @@ int cbm_pipeline_pass_definitions(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
          * (C# `using`, Java/Kotlin `import`, PHP `use`) resolve to the file
          * that declares the namespace. */
         const char **rels = (const char **)calloc((size_t)file_count, sizeof(char *));
-        if (rels) {
-            for (int i = 0; i < file_count; i++) {
-                rels[i] = files[i].rel_path;
+        if (!rels && file_count > 0) {
+            cbm_log_error("definitions.namespace_failed", "code", "CBM_NAMESPACE_RELS_ALLOC_FAILED",
+                          "component", "definitions.namespace_map", "operation", "rels_alloc",
+                          "key", "", "message", "namespace input list could not be allocated",
+                          "remediation", "free memory or reduce repository size, then retry");
+            if (owns_local_cache) {
+                for (int i = 0; i < file_count; i++) {
+                    cbm_free_result(local_cache[i]);
+                }
+                free(local_cache);
             }
+            return CBM_NOT_FOUND;
         }
-        CBMHashTable *namespace_map =
-            cbm_pipeline_namespace_map_build(ctx->project_name, local_cache, rels, file_count);
+        for (int i = 0; i < file_count; i++) {
+            rels[i] = files[i].rel_path;
+        }
+        CBMHashTable *namespace_map = NULL;
+        int namespace_rc = cbm_pipeline_namespace_map_build(ctx->project_name, local_cache, rels,
+                                                            file_count, &namespace_map);
         free(rels);
+        if (namespace_rc != 0) {
+            if (owns_local_cache) {
+                for (int i = 0; i < file_count; i++) {
+                    cbm_free_result(local_cache[i]);
+                }
+                free(local_cache);
+            }
+            return namespace_rc;
+        }
         for (int i = 0; i < file_count; i++) {
             if (cbm_pipeline_check_cancel(ctx)) {
                 break;
@@ -845,5 +844,5 @@ int cbm_pipeline_pass_definitions(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
     cbm_log_info("pass.done", "pass", "definitions", "defs", itoa_log(total_defs), "calls",
                  itoa_log(total_calls), "imports", itoa_log(total_imports), "errors",
                  itoa_log(errors));
-    return 0;
+    return cbm_registry_failed(ctx->registry) ? CBM_NOT_FOUND : 0;
 }

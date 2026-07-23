@@ -877,7 +877,7 @@ CBMLanguage cbm_language_for_filename(const char *filename) {
     /* DotEnv variant filenames (".env.local", ".env.production", …): the
      * filename starts with ".env." but its last "extension" (e.g. ".local")
      * is not a real language extension.  Match the dotenv convention used by
-     * pass_envscan/pass_infrascan (".env" exact, ".env." prefix, "*.env"
+     * pass_infrascan (".env" exact, ".env." prefix, "*.env"
      * suffix) so file-index routing agrees with direct extraction. */
     if (strncmp(filename, ".env.", SLEN(".env.")) == 0) {
         return CBM_LANG_DOTENV;
@@ -994,35 +994,46 @@ static bool has_matlab_line_markers(const char *buf) {
     return false;
 }
 
-CBMLanguage cbm_disambiguate_m(const char *path) {
-    if (!path) {
-        return CBM_LANG_MATLAB;
+int cbm_disambiguate_m_checked(const char *path, CBMLanguage *out) {
+    if (!path || !out) {
+        return CBM_NOT_FOUND;
     }
 
-    FILE *f = cbm_fopen(path, "r");
+    FILE *f = cbm_fopen(path, "rb");
     if (!f) {
-        return CBM_LANG_MATLAB;
+        return CBM_NOT_FOUND;
     }
 
     /* Read first 4KB */
     char buf[CBM_SZ_4K + SKIP_ONE];
     size_t n = fread(buf, SKIP_ONE, CBM_SZ_4K, f);
+    bool complete = ferror(f) == 0;
+    if (fclose(f) != 0) {
+        complete = false;
+    }
+    if (!complete) {
+        return CBM_NOT_FOUND;
+    }
     buf[n] = '\0';
-    (void)fclose(f);
 
     if (has_objc_markers(buf)) {
-        return CBM_LANG_OBJC;
+        *out = CBM_LANG_OBJC;
+        return 0;
     }
     if (has_magma_end_markers(buf)) {
-        return CBM_LANG_MAGMA;
+        *out = CBM_LANG_MAGMA;
+        return 0;
     }
     if ((str_contains(buf, "intrinsic ") || str_contains(buf, "procedure ")) &&
         has_magma_callable_pattern(buf)) {
-        return CBM_LANG_MAGMA;
+        *out = CBM_LANG_MAGMA;
+        return 0;
     }
     if (has_matlab_line_markers(buf)) {
-        return CBM_LANG_MATLAB;
+        *out = CBM_LANG_MATLAB;
+        return 0;
     }
 
-    return CBM_LANG_MATLAB;
+    *out = CBM_LANG_MATLAB;
+    return 0;
 }

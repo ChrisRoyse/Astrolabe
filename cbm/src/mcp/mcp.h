@@ -157,10 +157,10 @@ char *cbm_mcp_handle_tool(cbm_mcp_server_t *srv, const char *tool_name, const ch
  * crash/hang-isolating runner used by handle_index_repository), so the child
  * returns 100% of its RSS to the OS on exit instead of ratcheting the long-lived
  * parent. Builds {"repo_path": root_path} internally. Returns the worker's
- * response string (caller frees) on success, or NULL to signal the caller must
- * degrade to the in-process path (kill switch set, spawn failure, or the process
- * is not a supervisor host). This is the shared entry the watcher re-index
- * (main.c) and the session auto-index (mcp.c) route through. */
+ * response string (caller frees), including a fail-closed isError response when
+ * the worker cannot complete. NULL means argument/serialization allocation
+ * failed and never authorizes an in-process retry. This is the shared entry the
+ * watcher re-index and session auto-index route through. */
 char *cbm_mcp_index_run_supervised_path(const char *root_path);
 
 /* Run a full index of args_json's repo_path in a supervised worker SUBPROCESS,

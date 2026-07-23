@@ -42,10 +42,10 @@
 typedef struct {
     char *project_name;
     char *root_path;
-    char last_head[CBM_SZ_64]; /* git HEAD hash */
+    char last_head[CBM_SZ_64];                    /* git HEAD hash */
     char worktree_sha256[CBM_SHA256_HEX_LEN + 1]; /* last successfully indexed porcelain state */
-    bool is_git;               /* false → skip polling */
-    bool baseline_done;        /* true after first poll */
+    bool is_git;                                  /* false → skip polling */
+    bool baseline_done;                           /* true after first poll */
     int missing_root_count;    /* consecutive polls where root was missing (ENOENT/ENOTDIR) */
     uint64_t first_missing_ms; /* cbm_now_ms() of the streak's first miss (0 = no streak) */
     int file_count;            /* approximate, for interval calc */
@@ -222,14 +222,13 @@ static int git_head(const char *root_path, char *out, size_t out_size) {
  * boolean "dirty" probe, this distinguishes successive edits while the tree
  * remains dirty and prevents the watcher from reindexing the same dirty bytes
  * forever. The porcelain stream is stable and includes submodule dirtiness. */
-static bool git_worktree_fingerprint(const char *root_path,
-                                     char out[CBM_SHA256_HEX_LEN + 1]) {
+static bool git_worktree_fingerprint(const char *root_path, char out[CBM_SHA256_HEX_LEN + 1]) {
     cbm_sha256_ctx hash;
     cbm_sha256_init(&hash);
 #ifdef ASTRO_SPAWN
-    const char *const argv[] = {
-        "git",         "--no-optional-locks",      "-C", root_path, "status",
-        "--porcelain=v1", "-z", "--untracked-files=normal", NULL};
+    const char *const argv[] = {"git",    "--no-optional-locks", "-C", root_path,
+                                "status", "--porcelain=v1",      "-z", "--untracked-files=normal",
+                                NULL};
     char *data = NULL;
     size_t len = 0;
     cbm_spawn_error_t err;
@@ -575,21 +574,24 @@ void cbm_watcher_watch(cbm_watcher_t *w, const char *project_name, const char *r
         return;
     }
 
-    /* Remove old entry first (key points to state's project_name) */
     cbm_mutex_lock(&w->projects_lock);
-    project_state_t *old = cbm_ht_get(w->projects, project_name);
-    if (old) {
-        cbm_ht_delete(w->projects, project_name);
-        state_free(old);
-    }
-
     project_state_t *s = state_new(project_name, root_path);
     if (!s) {
         cbm_mutex_unlock(&w->projects_lock);
         cbm_log_warn("watcher.watch.oom", "project", project_name, "path", root_path);
         return;
     }
-    cbm_ht_set(w->projects, s->project_name, s);
+    void *previous = NULL;
+    if (!cbm_ht_set_checked(w->projects, s->project_name, s, &previous)) {
+        state_free(s);
+        cbm_mutex_unlock(&w->projects_lock);
+        cbm_log_error("watcher.watch.insert_failed", "code", "CBM_HASH_INSERT_FAILED", "component",
+                      "watcher.projects", "operation", "watch.replace", "key", project_name,
+                      "message", "watch registration could not be committed", "remediation",
+                      "free memory and retry; the prior watch remains active");
+        return;
+    }
+    state_free(previous);
     cbm_mutex_unlock(&w->projects_lock);
     cbm_log_info("watcher.watch", "project", project_name, "path", root_path);
 }

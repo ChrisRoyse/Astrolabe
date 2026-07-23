@@ -49,6 +49,7 @@ enum {
 #include "foundation/mem.h"
 #include "foundation/diagnostics.h"
 #include "foundation/platform.h"
+#include "foundation/dyn_array.h"
 #include "foundation/compat.h"
 #include "foundation/compat_fs.h"
 #include "foundation/compat_thread.h"
@@ -56,7 +57,6 @@ enum {
 #include "foundation/limits.h"
 #include "mcp/index_supervisor.h"
 #include "foundation/str_util.h"
-#include "foundation/dump_verify.h"
 #include "foundation/compat_regex.h"
 #include "pipeline/artifact.h"
 #include "traces/otlp_decode.h"
@@ -73,6 +73,7 @@ enum {
 #include <fcntl.h>
 #endif
 #include <yyjson/yyjson.h>
+#include <limits.h>
 #include <stdint.h> // int64_t
 #include <stdio.h>
 #include <stdlib.h>
@@ -754,9 +755,9 @@ static char *canonicalize_repo_path_if_exists(char *repo_path) {
         return canonical;
     }
 
-    cbm_log_error("repo_path.canonicalize_failed", "code", "CBM_REPO_PATH_UNRESOLVABLE",
-                  "path", repo_path, "remediation",
-                  "pass an existing readable repository path and retry", NULL);
+    cbm_log_error("repo_path.canonicalize_failed", "code", "CBM_REPO_PATH_UNRESOLVABLE", "path",
+                  repo_path, "remediation", "pass an existing readable repository path and retry",
+                  NULL);
     free(repo_path);
     return NULL;
 }
@@ -839,9 +840,9 @@ struct cbm_mcp_server {
     time_t store_last_used; /* last time resolve_store was called for a named project */
     cbm_store_verify_result_t store_verify; /* last named source-preserving verification */
     char store_error_project[CBM_SZ_256];
-    char store_error_db_path[CBM_SZ_1K];
-    char store_error_wal_path[CBM_SZ_1K];
-    char store_error_shm_path[CBM_SZ_1K];
+    char store_error_db_path[CBM_STORE_VERIFY_PATH_MAX];
+    char store_error_wal_path[CBM_STORE_VERIFY_PATH_MAX];
+    char store_error_shm_path[CBM_STORE_VERIFY_PATH_MAX];
     char update_notice[CBM_SZ_256]; /* one-shot update notice, cleared after first injection */
     bool update_checked;            /* true after background check has been launched */
     cbm_thread_t update_tid;        /* background update check thread */
@@ -1003,26 +1004,13 @@ static const char *project_db_path(const char *project, char *buf, size_t bufsz)
 
 /* ── Store resolution ──────────────────────────────────────────── */
 
-/* Read the sole INTERNAL project name from a .db file at full_path.
- * Opens the file query-mode (no create) and succeeds ONLY when the db holds
- * exactly one project row with a non-empty name — this filters ghost/empty
- * /corrupt dbs (0-byte file, missing `projects` table, or >1 row). On success
- * the internal name is copied into name_out; if out_store is non-NULL the open
- * handle is transferred to the caller (who must cbm_store_close it). On failure
- * the store is always closed. Defined after is_project_db_file below. */
-static bool db_internal_project_name(const char *full_path, char *name_out, size_t name_sz,
-                                     cbm_store_t **out_store);
+typedef enum {
+    DB_PROJECT_INSPECT_OK = 0,
+    DB_PROJECT_INSPECT_GHOST,
+    DB_PROJECT_INSPECT_FAILED,
+} db_project_inspect_status_t;
 
-/* #704 fallback: scan the cache dir for the db whose sole internal project name
- * equals `project`, returning an open store handle (caller owns it) or NULL.
- * Used only when <project>.db is absent or its internal name differs from the
- * passed name (drifted filename). Defined after is_project_db_file below. */
-static cbm_store_t *resolve_store_fallback_scan(const char *project);
-
-/* Open the right project's .db file for query tools.
- * Caches the connection — reopens only when project changes.
- * Tracks last-access time so the event loop can evict idle stores. */
-static cbm_store_t *resolve_store(cbm_mcp_server_t *srv, const char *project) {
+static void reset_store_error_state(cbm_mcp_server_t *srv) {
     memset(&srv->store_verify, 0, sizeof(srv->store_verify));
     srv->store_verify.status = CBM_STORE_VERIFY_OK;
     srv->store_verify.family_guard_release_complete = true;
@@ -1031,6 +1019,82 @@ static cbm_store_t *resolve_store(cbm_mcp_server_t *srv, const char *project) {
     srv->store_error_db_path[0] = '\0';
     srv->store_error_wal_path[0] = '\0';
     srv->store_error_shm_path[0] = '\0';
+}
+
+static void record_store_error_state(cbm_mcp_server_t *srv, const char *project,
+                                     const char *db_path,
+                                     const cbm_store_verify_result_t *verification) {
+    srv->store_verify = *verification;
+    snprintf(srv->store_error_project, sizeof(srv->store_error_project), "%s",
+             project ? project : "");
+    snprintf(srv->store_error_db_path, sizeof(srv->store_error_db_path), "%s",
+             db_path ? db_path : "");
+    snprintf(srv->store_error_wal_path, sizeof(srv->store_error_wal_path), "%s-wal",
+             db_path ? db_path : "");
+    snprintf(srv->store_error_shm_path, sizeof(srv->store_error_shm_path), "%s-shm",
+             db_path ? db_path : "");
+
+    char native_error[CBM_SZ_32];
+    char sqlite_error[CBM_SZ_32];
+    snprintf(native_error, sizeof(native_error), "%lu",
+             (unsigned long)srv->store_verify.native_error);
+    snprintf(sqlite_error, sizeof(sqlite_error), "%d", srv->store_verify.sqlite_error);
+    cbm_log_error(srv->store_verify.status == CBM_STORE_VERIFY_INTEGRITY_FAILED
+                      ? "store.integrity_failed"
+                      : "store.verification_failed",
+                  "code",
+                  srv->store_verify.status == CBM_STORE_VERIFY_INTEGRITY_FAILED
+                      ? "CBM_STORE_INTEGRITY_FAILED"
+                      : "CBM_STORE_VERIFICATION_FAILED",
+                  "project", project ? project : "", "db_path", srv->store_error_db_path,
+                  "wal_path", srv->store_error_wal_path, "shm_path", srv->store_error_shm_path,
+                  "operation", srv->store_verify.operation, "native_error", native_error,
+                  "sqlite_error", sqlite_error, "detail", srv->store_verify.detail, "action",
+                  "source family preserved; explicit remediation required");
+}
+
+static void record_store_query_failure(cbm_mcp_server_t *srv, const char *project,
+                                       const char *db_path, cbm_store_t *store,
+                                       cbm_store_verify_status_t status, const char *operation,
+                                       const char *detail) {
+    cbm_store_verify_result_t failure;
+    memset(&failure, 0, sizeof(failure));
+    failure.status = status;
+    failure.sqlite_error = store ? cbm_store_error_code(store) : SQLITE_ERROR;
+    failure.db_present = db_path && cbm_path_exists(db_path);
+    failure.family_guard_release_complete = true;
+    failure.scratch_cleanup_complete = true;
+    snprintf(failure.operation, sizeof(failure.operation), "%s", operation);
+    snprintf(failure.detail, sizeof(failure.detail), "%s",
+             detail && detail[0] ? detail
+                                 : (store ? cbm_store_error(store) : "SQLite query failed"));
+    record_store_error_state(srv, project, db_path, &failure);
+}
+
+/* Read the sole INTERNAL project name from a .db file at full_path.
+ * Opens the file query-mode (no create) and succeeds ONLY when the db holds
+ * exactly one project row with a non-empty name — this filters ghost/empty
+ * /corrupt dbs (0-byte file, missing `projects` table, or >1 row). On success
+ * the internal name is copied into name_out; if out_store is non-NULL the open
+ * handle is transferred to the caller (who must cbm_store_close it). On failure
+ * the store is always closed. Defined after is_project_db_file below. */
+static db_project_inspect_status_t db_internal_project_name(cbm_mcp_server_t *srv,
+                                                            const char *error_project,
+                                                            const char *full_path, char *name_out,
+                                                            size_t name_sz,
+                                                            cbm_store_t **out_store);
+
+/* #704 fallback: scan the cache dir for the db whose sole internal project name
+ * equals `project`, returning an open store handle (caller owns it) or NULL.
+ * Used only when <project>.db is absent or its internal name differs from the
+ * passed name (drifted filename). Defined after is_project_db_file below. */
+static cbm_store_t *resolve_store_fallback_scan(cbm_mcp_server_t *srv, const char *project);
+
+/* Open the right project's .db file for query tools.
+ * Caches the connection — reopens only when project changes.
+ * Tracks last-access time so the event loop can evict idle stores. */
+static cbm_store_t *resolve_store(cbm_mcp_server_t *srv, const char *project) {
+    reset_store_error_state(srv);
 
     if (!project) {
         return NULL; /* project is required — no implicit fallback */
@@ -1054,31 +1118,13 @@ static cbm_store_t *resolve_store(cbm_mcp_server_t *srv, const char *project) {
      * a corrupt family must instead be rejected with every source byte exact. */
     char path[CBM_SZ_1K];
     project_db_path(project, path, sizeof(path));
+    cbm_store_verify_result_t verification;
     cbm_store_verify_status_t verify_status =
-        cbm_store_open_path_query_verified(path, &srv->store, &srv->store_verify);
+        cbm_store_open_path_query_verified(path, &srv->store, &verification);
     if (verify_status == CBM_STORE_VERIFY_INTEGRITY_FAILED ||
         verify_status == CBM_STORE_VERIFY_IO_FAILED) {
         srv->owns_store = false;
-        snprintf(srv->store_error_project, sizeof(srv->store_error_project), "%s", project);
-        snprintf(srv->store_error_db_path, sizeof(srv->store_error_db_path), "%s", path);
-        snprintf(srv->store_error_wal_path, sizeof(srv->store_error_wal_path), "%s-wal", path);
-        snprintf(srv->store_error_shm_path, sizeof(srv->store_error_shm_path), "%s-shm", path);
-        char native_error[CBM_SZ_32];
-        char sqlite_error[CBM_SZ_32];
-        snprintf(native_error, sizeof(native_error), "%lu",
-                 (unsigned long)srv->store_verify.native_error);
-        snprintf(sqlite_error, sizeof(sqlite_error), "%d", srv->store_verify.sqlite_error);
-        cbm_log_error(
-            verify_status == CBM_STORE_VERIFY_INTEGRITY_FAILED ? "store.integrity_failed"
-                                                               : "store.verification_failed",
-            "code",
-            verify_status == CBM_STORE_VERIFY_INTEGRITY_FAILED ? "CBM_STORE_INTEGRITY_FAILED"
-                                                               : "CBM_STORE_VERIFICATION_FAILED",
-            "project", project, "db_path", srv->store_error_db_path, "wal_path",
-            srv->store_error_wal_path, "shm_path", srv->store_error_shm_path, "operation",
-            srv->store_verify.operation, "native_error", native_error, "sqlite_error", sqlite_error,
-            "detail", srv->store_verify.detail, "action",
-            "source family preserved; explicit remediation required");
+        record_store_error_state(srv, project, path, &verification);
         return NULL;
     }
 
@@ -1091,7 +1137,8 @@ static cbm_store_t *resolve_store(cbm_mcp_server_t *srv, const char *project) {
          * Linux where unlink defers actual removal). Opening an empty/deleted
          * store without closing it leaks the SQLite connection. */
         cbm_project_t proj_verify = {0};
-        if (cbm_store_get_project(srv->store, project, &proj_verify) == CBM_STORE_OK) {
+        int project_rc = cbm_store_get_project(srv->store, project, &proj_verify);
+        if (project_rc == CBM_STORE_OK) {
             cbm_project_free_fields(&proj_verify);
             srv->owns_store = true;
             free(srv->current_project);
@@ -1101,6 +1148,13 @@ static cbm_store_t *resolve_store(cbm_mcp_server_t *srv, const char *project) {
         /* #704: <project>.db exists but its INTERNAL project name differs from
          * the passed name (a copied/renamed db, or a legacy '.'-vs-'-' username
          * twin). Close it and fall through to the cache-dir scan below. */
+        if (project_rc != CBM_STORE_NOT_FOUND) {
+            record_store_query_failure(srv, project, path, srv->store, CBM_STORE_VERIFY_IO_FAILED,
+                                       "source.query_project_row", cbm_store_error(srv->store));
+            cbm_store_close(srv->store);
+            srv->store = NULL;
+            return NULL;
+        }
         cbm_store_close(srv->store);
         srv->store = NULL;
     }
@@ -1111,7 +1165,7 @@ static cbm_store_t *resolve_store(cbm_mcp_server_t *srv, const char *project) {
      * cache dir for the db whose sole internal project name equals `project` and
      * adopt it. Runs ONLY on the fallback — the common fast path is unchanged.
      * No match → NULL (a genuine typo stays not-found). */
-    cbm_store_t *scanned = resolve_store_fallback_scan(project);
+    cbm_store_t *scanned = resolve_store_fallback_scan(srv, project);
     if (scanned) {
         srv->store = scanned;
         srv->owns_store = true;
@@ -1130,12 +1184,19 @@ static void free_node_contents(cbm_node_t *n);
 
 /* Scan cache dir for .db files, writing comma-separated quoted names into out.
  * Returns the number of projects found. */
-static int collect_db_project_names(const char *dir_path, char *out, size_t out_sz) {
+static int collect_db_project_names(cbm_mcp_server_t *srv, const char *dir_path, char *out,
+                                    size_t out_sz) {
     int count = 0;
     int offset = 0;
     cbm_dir_t *d = cbm_opendir(dir_path);
     if (!d) {
-        return 0;
+        if (!cbm_path_exists(dir_path)) {
+            return 0;
+        }
+        record_store_query_failure(srv, "", dir_path, NULL, CBM_STORE_VERIFY_IO_FAILED,
+                                   "discovery.open_cache_directory",
+                                   "the project cache directory could not be enumerated");
+        return CBM_NOT_FOUND;
     }
     cbm_dirent_t *entry;
     while ((entry = cbm_readdir(d)) != NULL) {
@@ -1150,7 +1211,13 @@ static int collect_db_project_names(const char *dir_path, char *out, size_t out_
         char full_path[CBM_SZ_2K];
         snprintf(full_path, sizeof(full_path), "%s/%s", dir_path, n);
         char iname[CBM_SZ_1K];
-        if (!db_internal_project_name(full_path, iname, sizeof(iname), NULL)) {
+        db_project_inspect_status_t inspect =
+            db_internal_project_name(srv, "", full_path, iname, sizeof(iname), NULL);
+        if (inspect == DB_PROJECT_INSPECT_FAILED) {
+            cbm_closedir(d);
+            return CBM_NOT_FOUND;
+        }
+        if (inspect == DB_PROJECT_INSPECT_GHOST) {
             continue;
         }
         /* Element-boundary write: only emit this name if the WHOLE element —
@@ -1208,12 +1275,24 @@ static void add_git_context_json(yyjson_mut_doc *doc, yyjson_mut_val *obj, const
 }
 
 /* Build a helpful error listing available projects. Caller must free() result. */
-static char *build_project_list_error(const char *reason) {
+static char *build_integrity_failed_error(const cbm_mcp_server_t *srv);
+static char *build_store_verification_failed_error(const cbm_mcp_server_t *srv);
+
+static char *build_recorded_store_error(const cbm_mcp_server_t *srv) {
+    return srv->store_verify.status == CBM_STORE_VERIFY_INTEGRITY_FAILED
+               ? build_integrity_failed_error(srv)
+               : build_store_verification_failed_error(srv);
+}
+
+static char *build_project_list_error(cbm_mcp_server_t *srv, const char *reason) {
     char dir_path[CBM_SZ_1K];
     cache_dir(dir_path, sizeof(dir_path));
 
     char projects[CBM_SZ_4K] = "";
-    int count = collect_db_project_names(dir_path, projects, sizeof(projects));
+    int count = collect_db_project_names(srv, dir_path, projects, sizeof(projects));
+    if (count < 0) {
+        return build_recorded_store_error(srv);
+    }
 
     enum { ERR_BUF_SZ = 5120 };
     char buf[ERR_BUF_SZ];
@@ -1376,20 +1455,20 @@ static char *build_no_store_error(cbm_mcp_server_t *srv, const char *project) {
             return build_store_verification_failed_error(srv);
         }
     }
-    return project ? build_project_list_error("project not found or not indexed")
+    return project ? build_project_list_error(srv, "project not found or not indexed")
                    : build_missing_project_error();
 }
 
 /* Bail with the right error when no store is available. */
-#define REQUIRE_STORE(store, project)                     \
-    do {                                                  \
-        if (!(store)) {                                   \
+#define REQUIRE_STORE(store, project)                        \
+    do {                                                     \
+        if (!(store)) {                                      \
             char *_err = build_no_store_error(srv, project); \
-            char *_res = cbm_mcp_text_result(_err, true); \
-            free(_err);                                   \
-            free(project);                                \
-            return _res;                                  \
-        }                                                 \
+            char *_res = cbm_mcp_text_result(_err, true);    \
+            free(_err);                                      \
+            free(project);                                   \
+            return _res;                                     \
+        }                                                    \
     } while (0)
 
 static bool project_has_adr(cbm_store_t *store, const char *project, const char *root_path) {
@@ -1491,22 +1570,47 @@ static bool is_project_db_file(const char *name, size_t len) {
 }
 
 /* db_internal_project_name — see forward declaration above resolve_store. */
-static bool db_internal_project_name(const char *full_path, char *name_out, size_t name_sz,
-                                     cbm_store_t **out_store) {
+static db_project_inspect_status_t db_internal_project_name(cbm_mcp_server_t *srv,
+                                                            const char *error_project,
+                                                            const char *full_path, char *name_out,
+                                                            size_t name_sz,
+                                                            cbm_store_t **out_store) {
     if (out_store) {
         *out_store = NULL;
     }
-    cbm_store_t *st = cbm_store_open_path_query(full_path);
-    if (!st) {
-        return false; /* nonexistent / unreadable */
+    /* A zero-byte file is a recognizable abandoned ghost, not a SQLite
+     * database and not evidence of corruption in persisted database bytes. */
+    if (cbm_file_size(full_path) == 0) {
+        return DB_PROJECT_INSPECT_GHOST;
+    }
+
+    cbm_store_t *st = NULL;
+    cbm_store_verify_result_t verification;
+    cbm_store_verify_status_t verify_status =
+        cbm_store_open_path_query_verified(full_path, &st, &verification);
+    if (verify_status == CBM_STORE_VERIFY_SOURCE_MISSING) {
+        return DB_PROJECT_INSPECT_GHOST;
+    }
+    if (verify_status != CBM_STORE_VERIFY_OK || !st) {
+        record_store_error_state(srv, error_project, full_path, &verification);
+        return DB_PROJECT_INSPECT_FAILED;
     }
     cbm_project_t *projs = NULL;
     int n = 0;
     bool ok = false;
-    if (cbm_store_list_projects(st, &projs, &n) == CBM_STORE_OK && n == 1 && projs[0].name &&
-        projs[0].name[0]) {
+    int list_rc = cbm_store_list_projects(st, &projs, &n);
+    if (list_rc == CBM_STORE_OK && n == 1 && projs[0].name && projs[0].name[0]) {
         snprintf(name_out, name_sz, "%s", projs[0].name);
         ok = true;
+    } else {
+        record_store_query_failure(
+            srv, error_project, full_path, st,
+            list_rc == CBM_STORE_OK ? CBM_STORE_VERIFY_INTEGRITY_FAILED
+                                    : CBM_STORE_VERIFY_IO_FAILED,
+            "source.query_internal_project",
+            list_rc == CBM_STORE_OK
+                ? "verified project store did not yield exactly one non-empty project name"
+                : cbm_store_error(st));
     }
     cbm_store_free_projects(projs, n);
     if (ok && out_store) {
@@ -1514,15 +1618,20 @@ static bool db_internal_project_name(const char *full_path, char *name_out, size
     } else {
         cbm_store_close(st);
     }
-    return ok;
+    return ok ? DB_PROJECT_INSPECT_OK : DB_PROJECT_INSPECT_FAILED;
 }
 
 /* resolve_store_fallback_scan — see forward declaration above resolve_store. */
-static cbm_store_t *resolve_store_fallback_scan(const char *project) {
+static cbm_store_t *resolve_store_fallback_scan(cbm_mcp_server_t *srv, const char *project) {
     char dir_path[CBM_SZ_1K];
     cache_dir(dir_path, sizeof(dir_path));
     cbm_dir_t *d = cbm_opendir(dir_path);
     if (!d) {
+        if (cbm_path_exists(dir_path)) {
+            record_store_query_failure(srv, project, dir_path, NULL, CBM_STORE_VERIFY_IO_FAILED,
+                                       "discovery.open_cache_directory",
+                                       "the project cache directory could not be enumerated");
+        }
         return NULL;
     }
     cbm_store_t *found = NULL;
@@ -1537,7 +1646,12 @@ static cbm_store_t *resolve_store_fallback_scan(const char *project) {
         snprintf(full_path, sizeof(full_path), "%s/%s", dir_path, n);
         char iname[CBM_SZ_1K];
         cbm_store_t *st = NULL;
-        if (db_internal_project_name(full_path, iname, sizeof(iname), &st)) {
+        db_project_inspect_status_t inspect =
+            db_internal_project_name(srv, project, full_path, iname, sizeof(iname), &st);
+        if (inspect == DB_PROJECT_INSPECT_FAILED) {
+            break;
+        }
+        if (inspect == DB_PROJECT_INSPECT_OK) {
             if (strcmp(iname, project) == 0) {
                 found = st; /* adopt — caller takes ownership */
                 break;
@@ -1551,8 +1665,11 @@ static cbm_store_t *resolve_store_fallback_scan(const char *project) {
 
 /* Open a .db file briefly, collect node/edge counts and root_path,
  * then append a JSON entry to arr. */
-static void build_project_json_entry(yyjson_mut_doc *doc, yyjson_mut_val *arr, const char *dir_path,
-                                     const char *name, size_t name_len, int64_t size_bytes) {
+static db_project_inspect_status_t build_project_json_entry(cbm_mcp_server_t *srv,
+                                                            yyjson_mut_doc *doc,
+                                                            yyjson_mut_val *arr,
+                                                            const char *dir_path, const char *name,
+                                                            size_t name_len, int64_t size_bytes) {
     (void)name_len;
 
     char full_path[CBM_SZ_2K];
@@ -1565,20 +1682,28 @@ static void build_project_json_entry(yyjson_mut_doc *doc, yyjson_mut_val *arr, c
      * they don't appear as resolvable projects. */
     char project_name[CBM_SZ_1K];
     cbm_store_t *pstore = NULL;
-    if (!db_internal_project_name(full_path, project_name, sizeof(project_name), &pstore)) {
-        return; /* ghost / unreadable — not a resolvable project */
+    db_project_inspect_status_t inspect =
+        db_internal_project_name(srv, "", full_path, project_name, sizeof(project_name), &pstore);
+    if (inspect != DB_PROJECT_INSPECT_OK) {
+        return inspect;
     }
 
     int nodes = cbm_store_count_nodes(pstore, project_name);
     int edges = cbm_store_count_edges(pstore, project_name);
     char root_path_buf[CBM_SZ_1K] = "";
     cbm_project_t proj = {0};
-    if (cbm_store_get_project(pstore, project_name, &proj) == CBM_STORE_OK) {
-        if (proj.root_path) {
-            snprintf(root_path_buf, sizeof(root_path_buf), "%s", proj.root_path);
-        }
+    int project_rc = cbm_store_get_project(pstore, project_name, &proj);
+    if (nodes < 0 || edges < 0 || project_rc != CBM_STORE_OK) {
+        record_store_query_failure(srv, "", full_path, pstore, CBM_STORE_VERIFY_IO_FAILED,
+                                   "source.query_project_details", cbm_store_error(pstore));
         cbm_project_free_fields(&proj);
+        cbm_store_close(pstore);
+        return DB_PROJECT_INSPECT_FAILED;
     }
+    if (proj.root_path) {
+        snprintf(root_path_buf, sizeof(root_path_buf), "%s", proj.root_path);
+    }
+    cbm_project_free_fields(&proj);
     cbm_store_close(pstore);
 
     yyjson_mut_val *p = yyjson_mut_obj(doc);
@@ -1589,13 +1714,14 @@ static void build_project_json_entry(yyjson_mut_doc *doc, yyjson_mut_val *arr, c
     yyjson_mut_obj_add_int(doc, p, "edges", edges);
     yyjson_mut_obj_add_int(doc, p, "size_bytes", size_bytes);
     yyjson_mut_arr_add_val(arr, p);
+    return DB_PROJECT_INSPECT_OK;
 }
 
 /* list_projects: scan cache directory for .db files.
  * Each project is a single .db file — no central registry needed. */
 static char *handle_list_projects(cbm_mcp_server_t *srv, const char *args) {
-    (void)srv;
     (void)args;
+    reset_store_error_state(srv);
 
     char dir_path[CBM_SZ_1K];
     cache_dir(dir_path, sizeof(dir_path));
@@ -1607,18 +1733,19 @@ static char *handle_list_projects(cbm_mcp_server_t *srv, const char *args) {
     yyjson_mut_doc_set_root(doc, root);
     yyjson_mut_val *arr = yyjson_mut_arr(doc);
 
-    if (!d) {
-        char msg[CBM_SZ_1K];
-        snprintf(msg, sizeof(msg),
-                 "{\"error\":\"cannot read cache directory: %s\",\"hint\":"
-                 "\"Check directory permissions or run index_repository first.\"}",
-                 dir_path);
+    if (!d && cbm_path_exists(dir_path)) {
+        record_store_query_failure(srv, "", dir_path, NULL, CBM_STORE_VERIFY_IO_FAILED,
+                                   "discovery.open_cache_directory",
+                                   "the project cache directory could not be enumerated");
         yyjson_mut_doc_free(doc);
-        return cbm_mcp_text_result(msg, true);
+        char *error = build_recorded_store_error(srv);
+        char *result = cbm_mcp_text_result(error, true);
+        free(error);
+        return result;
     }
 
     cbm_dirent_t *entry;
-    while ((entry = cbm_readdir(d)) != NULL) {
+    while (d && (entry = cbm_readdir(d)) != NULL) {
         const char *name = entry->name;
         size_t len = strlen(name);
         if (!is_project_db_file(name, len)) {
@@ -1628,9 +1755,26 @@ static char *handle_list_projects(cbm_mcp_server_t *srv, const char *args) {
         snprintf(full_path, sizeof(full_path), "%s/%s", dir_path, name);
         int64_t size_bytes = cbm_file_size(full_path);
         if (size_bytes < 0) {
-            continue;
+            record_store_query_failure(srv, "", full_path, NULL, CBM_STORE_VERIFY_IO_FAILED,
+                                       "discovery.read_candidate_size",
+                                       "a project-store candidate could not be stated");
+            cbm_closedir(d);
+            yyjson_mut_doc_free(doc);
+            char *error = build_recorded_store_error(srv);
+            char *result = cbm_mcp_text_result(error, true);
+            free(error);
+            return result;
         }
-        build_project_json_entry(doc, arr, dir_path, name, len, size_bytes);
+        db_project_inspect_status_t inspect =
+            build_project_json_entry(srv, doc, arr, dir_path, name, len, size_bytes);
+        if (inspect == DB_PROJECT_INSPECT_FAILED) {
+            cbm_closedir(d);
+            yyjson_mut_doc_free(doc);
+            char *error = build_recorded_store_error(srv);
+            char *result = cbm_mcp_text_result(error, true);
+            free(error);
+            return result;
+        }
     }
     cbm_closedir(d);
 
@@ -1658,10 +1802,20 @@ static char *handle_list_projects(cbm_mcp_server_t *srv, const char *args) {
  * nodes (e.g., an empty or half-initialised project).
  * Callers that receive a non-NULL return value must free(project) themselves
  * before returning the error string. */
-static char *verify_project_indexed(cbm_store_t *store, const char *project) {
+static char *verify_project_indexed(cbm_mcp_server_t *srv, cbm_store_t *store,
+                                    const char *project) {
     cbm_project_t proj_check = {0};
-    if (cbm_store_get_project(store, project, &proj_check) != CBM_STORE_OK) {
-        char *err = build_project_list_error("project not indexed — run index_repository first");
+    int project_rc = cbm_store_get_project(store, project, &proj_check);
+    if (project_rc != CBM_STORE_OK) {
+        char *err = NULL;
+        if (project_rc == CBM_STORE_NOT_FOUND) {
+            err = build_project_list_error(srv, "project not indexed — run index_repository first");
+        } else {
+            record_store_query_failure(srv, project, cbm_store_db_path(store), store,
+                                       CBM_STORE_VERIFY_IO_FAILED, "source.query_project_row",
+                                       cbm_store_error(store));
+            err = build_recorded_store_error(srv);
+        }
         char *res = cbm_mcp_text_result(err, true);
         free(err);
         return res;
@@ -1675,7 +1829,7 @@ static char *handle_get_graph_schema(cbm_mcp_server_t *srv, const char *args) {
     cbm_store_t *store = resolve_store(srv, project);
     REQUIRE_STORE(store, project);
 
-    char *not_indexed = verify_project_indexed(store, project);
+    char *not_indexed = verify_project_indexed(srv, store, project);
     if (not_indexed) {
         free(project);
         return not_indexed;
@@ -2157,8 +2311,7 @@ static void emit_search_results(yyjson_mut_doc *doc, yyjson_mut_val *root,
     for (int i = 0; i < out->count; i++) {
         cbm_search_result_t *sr = &out->results[i];
         yyjson_mut_val *item = yyjson_mut_obj(doc);
-        yyjson_mut_obj_add_str(doc, item, "atom_id",
-                               sr->node.atom_id ? sr->node.atom_id : "");
+        yyjson_mut_obj_add_str(doc, item, "atom_id", sr->node.atom_id ? sr->node.atom_id : "");
         yyjson_mut_obj_add_str(doc, item, "name", sr->node.name ? sr->node.name : "");
         yyjson_mut_obj_add_str(doc, item, "qualified_name",
                                sr->node.qualified_name ? sr->node.qualified_name : "");
@@ -2254,7 +2407,7 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
     cbm_store_t *store = resolve_store(srv, project);
     REQUIRE_STORE(store, project);
 
-    char *not_indexed = verify_project_indexed(store, project);
+    char *not_indexed = verify_project_indexed(srv, store, project);
     if (not_indexed) {
         free(project);
         return not_indexed;
@@ -2404,7 +2557,7 @@ static char *handle_query_graph(cbm_mcp_server_t *srv, const char *args) {
         return cbm_mcp_text_result("query is required", true);
     }
     if (!store) {
-        char *_err = build_project_list_error("project not found or not indexed");
+        char *_err = build_no_store_error(srv, project);
         char *_res = cbm_mcp_text_result(_err, true);
         free(_err);
         free(project);
@@ -2412,7 +2565,7 @@ static char *handle_query_graph(cbm_mcp_server_t *srv, const char *args) {
         return _res;
     }
 
-    char *not_indexed = verify_project_indexed(store, project);
+    char *not_indexed = verify_project_indexed(srv, store, project);
     if (not_indexed) {
         free(project);
         free(query);
@@ -2675,7 +2828,7 @@ static char *handle_get_architecture(cbm_mcp_server_t *srv, const char *args) {
     cbm_store_t *store = resolve_store(srv, project);
     REQUIRE_STORE(store, project);
 
-    char *not_indexed = verify_project_indexed(store, project);
+    char *not_indexed = verify_project_indexed(srv, store, project);
     if (not_indexed) {
         free(project);
         free(scope_path);
@@ -3248,15 +3401,19 @@ static int pick_resolved_node(const cbm_node_t *nodes, int count, bool *ambiguou
  * nodes and silently truncated by tracing only one (#546). visited hops are
  * deduped by node id; edges are concatenated. Ownership of all heap fields
  * transfers into *out, freed by cbm_store_traverse_free. */
-static void bfs_union_same_name(cbm_store_t *store, const cbm_node_t *nodes, int node_count,
-                                const char *direction, const char **edge_types, int edge_type_count,
-                                int depth, cbm_traverse_result_t *out) {
+static int bfs_union_same_name(cbm_store_t *store, const cbm_node_t *nodes, int node_count,
+                               const char *direction, const char **edge_types, int edge_type_count,
+                               int depth, cbm_traverse_result_t *out) {
     memset(out, 0, sizeof(*out));
     int vcap = 0, ecap = 0;
     for (int k = 0; k < node_count; k++) {
         cbm_traverse_result_t tr = {0};
-        cbm_store_bfs(store, nodes[k].id, direction, edge_types, edge_type_count, depth,
-                      MCP_BFS_LIMIT, &tr);
+        if (cbm_store_bfs(store, nodes[k].id, direction, edge_types, edge_type_count, depth,
+                          MCP_BFS_LIMIT, &tr) != CBM_STORE_OK) {
+            cbm_store_traverse_free(&tr);
+            cbm_store_traverse_free(out);
+            return CBM_STORE_ERR;
+        }
         for (int i = 0; i < tr.visited_count; i++) {
             bool dup = false;
             for (int j = 0; j < out->visited_count; j++) {
@@ -3268,23 +3425,36 @@ static void bfs_union_same_name(cbm_store_t *store, const cbm_node_t *nodes, int
             if (dup) {
                 continue;
             }
-            if (out->visited_count >= vcap) {
-                vcap = vcap ? vcap * 2 : 8;
-                out->visited = safe_realloc(out->visited, vcap * sizeof(cbm_node_hop_t));
+            if (!cbm_da_ensure_capacity((void **)&out->visited, &vcap, out->visited_count + 1,
+                                        sizeof(*out->visited))) {
+                cbm_store_traverse_free(&tr);
+                cbm_store_traverse_free(out);
+                cbm_log_error(
+                    "mcp.trace_union", "code", "CBM_TRACE_ALLOCATION_FAILED", "message",
+                    "trace visited-node allocation failed", "remediation",
+                    "free memory or narrow the trace, then retry; no partial trace was returned");
+                return CBM_STORE_ERR;
             }
             out->visited[out->visited_count++] = tr.visited[i];
             memset(&tr.visited[i], 0, sizeof(tr.visited[i])); /* ownership moved */
         }
         for (int i = 0; i < tr.edge_count; i++) {
-            if (out->edge_count >= ecap) {
-                ecap = ecap ? ecap * 2 : 8;
-                out->edges = safe_realloc(out->edges, ecap * sizeof(cbm_edge_info_t));
+            if (!cbm_da_ensure_capacity((void **)&out->edges, &ecap, out->edge_count + 1,
+                                        sizeof(*out->edges))) {
+                cbm_store_traverse_free(&tr);
+                cbm_store_traverse_free(out);
+                cbm_log_error(
+                    "mcp.trace_union", "code", "CBM_TRACE_ALLOCATION_FAILED", "message",
+                    "trace edge allocation failed", "remediation",
+                    "free memory or narrow the trace, then retry; no partial trace was returned");
+                return CBM_STORE_ERR;
             }
             out->edges[out->edge_count++] = tr.edges[i];
             memset(&tr.edges[i], 0, sizeof(tr.edges[i])); /* ownership moved */
         }
         cbm_store_traverse_free(&tr); /* frees only the un-moved (root + dup) fields */
     }
+    return CBM_STORE_OK;
 }
 
 /* Clamp a client-supplied traversal depth to the MCP ceiling (cbm_mcp_max_depth),
@@ -3323,7 +3493,7 @@ static char *handle_trace_call_path(cbm_mcp_server_t *srv, const char *args) {
         return cbm_mcp_text_result("function_name is required", true);
     }
     if (!store) {
-        char *_err = build_project_list_error("project not found or not indexed");
+        char *_err = build_no_store_error(srv, project);
         char *_res = cbm_mcp_text_result(_err, true);
         free(_err);
         free(func_name);
@@ -3334,7 +3504,7 @@ static char *handle_trace_call_path(cbm_mcp_server_t *srv, const char *args) {
         return _res;
     }
 
-    char *not_indexed = verify_project_indexed(store, project);
+    char *not_indexed = verify_project_indexed(srv, store, project);
     if (not_indexed) {
         free(func_name);
         free(project);
@@ -3433,16 +3603,20 @@ static char *handle_trace_call_path(cbm_mcp_server_t *srv, const char *args) {
     (void)sel; /* union across all same-name nodes — see bfs_union_same_name (#546) */
 
     if (do_outbound) {
-        bfs_union_same_name(store, nodes, node_count, "outbound", edge_types, edge_type_count,
-                            depth, &tr_out);
+        if (bfs_union_same_name(store, nodes, node_count, "outbound", edge_types, edge_type_count,
+                                depth, &tr_out) != CBM_STORE_OK) {
+            goto trace_failed;
+        }
         yyjson_mut_obj_add_val(
             doc, root, "callees",
             bfs_to_json_array(doc, &tr_out, risk_labels, include_tests, data_flow));
     }
 
     if (do_inbound) {
-        bfs_union_same_name(store, nodes, node_count, "inbound", edge_types, edge_type_count, depth,
-                            &tr_in);
+        if (bfs_union_same_name(store, nodes, node_count, "inbound", edge_types, edge_type_count,
+                                depth, &tr_in) != CBM_STORE_OK) {
+            goto trace_failed;
+        }
         yyjson_mut_obj_add_val(
             doc, root, "callers",
             bfs_to_json_array(doc, &tr_in, risk_labels, include_tests, data_flow));
@@ -3473,6 +3647,25 @@ static char *handle_trace_call_path(cbm_mcp_server_t *srv, const char *args) {
     char *result = cbm_mcp_text_result(json, false);
     free(json);
     return result;
+
+trace_failed:
+    cbm_store_traverse_free(&tr_out);
+    cbm_store_traverse_free(&tr_in);
+    yyjson_mut_doc_free(doc);
+    cbm_store_free_nodes(nodes, node_count);
+    free(func_name);
+    free(project);
+    free(direction);
+    free(mode);
+    free(param_name);
+    if (et_doc_keep) {
+        yyjson_doc_free(et_doc_keep);
+    }
+    return cbm_mcp_text_result(
+        "{\"code\":\"CBM_TRACE_FAILED\",\"message\":\"trace traversal failed before a complete "
+        "result was assembled\",\"remediation\":\"inspect the CBM store error log, repair the "
+        "recorded storage or allocation failure, and retry\"}",
+        true);
 }
 
 /* ── Helper: free heap fields of a stack-allocated node ────────── */
@@ -3490,40 +3683,89 @@ static void free_node_contents(cbm_node_t *n) {
 /* ── Helper: read lines [start, end] from a file ─────────────── */
 
 static char *read_file_lines(const char *path, int start, int end) {
-    FILE *fp = cbm_fopen(path, "r");
+    FILE *fp = cbm_fopen(path, "rb");
     if (!fp) {
         return NULL;
     }
 
     size_t cap = CBM_SZ_4K;
     char *buf = malloc(cap);
+    if (!buf) {
+        fclose(fp);
+        errno = ENOMEM;
+        return NULL;
+    }
     size_t len = 0;
     buf[0] = '\0';
 
-    char line[CBM_SZ_2K];
-    int lineno = 0;
-    while (fgets(line, sizeof(line), fp)) {
-        lineno++;
-        if (lineno < start) {
-            continue;
-        }
-        if (lineno > end) {
+    int lineno = SKIP_ONE;
+    bool failed = false;
+    for (;;) {
+        int ch = fgetc(fp);
+        if (ch == EOF) {
+            if (ferror(fp)) {
+                failed = true;
+            }
             break;
         }
-        size_t ll = strlen(line);
-        while (len + ll + SKIP_ONE > cap) {
-            cap *= PAIR_LEN;
-            buf = safe_realloc(buf, cap);
+        if (ch == '\0') {
+            errno = EILSEQ;
+            failed = true;
+            break;
         }
-        memcpy(buf + len, line, ll);
-        len += ll;
-        buf[len] = '\0';
+        if (lineno >= start && lineno <= end) {
+            if (len + MCP_SEPARATOR > cap) {
+                size_t next = cap * PAIR_LEN;
+                if (next <= cap) {
+                    errno = ENOMEM;
+                    failed = true;
+                    break;
+                }
+                char *grown = realloc(buf, next);
+                if (!grown) {
+                    errno = ENOMEM;
+                    failed = true;
+                    break;
+                }
+                buf = grown;
+                cap = next;
+            }
+            buf[len++] = (char)ch;
+            buf[len] = '\0';
+        }
+        if (ch == '\n') {
+            if (lineno == end) {
+                break;
+            }
+            if (lineno == INT_MAX) {
+                errno = EOVERFLOW;
+                failed = true;
+                break;
+            }
+            lineno++;
+        }
     }
 
-    (void)fclose(fp);
-    if (len == 0) {
+    if (fclose(fp) != 0) {
+        failed = true;
+    }
+    if (failed || len == 0) {
         free(buf);
         return NULL;
+    }
+    const unsigned char *cursor = (const unsigned char *)buf;
+    while (*cursor) {
+        if (*cursor <= 0x7f) {
+            cursor++;
+            continue;
+        }
+        int sequence_len = cbm_utf8_sequence_len(cursor);
+        if (sequence_len <= 0) {
+            free(buf);
+            errno = EILSEQ;
+            return NULL;
+        }
+        cursor += sequence_len;
     }
     return buf;
 }
@@ -3539,7 +3781,13 @@ static char *get_project_root(cbm_mcp_server_t *srv, const char *project) {
         return NULL;
     }
     cbm_project_t proj = {0};
-    if (cbm_store_get_project(store, project, &proj) != CBM_STORE_OK) {
+    int project_rc = cbm_store_get_project(store, project, &proj);
+    if (project_rc != CBM_STORE_OK) {
+        if (project_rc != CBM_STORE_NOT_FOUND) {
+            record_store_query_failure(srv, project, cbm_store_db_path(store), store,
+                                       CBM_STORE_VERIFY_IO_FAILED, "source.query_project_root",
+                                       cbm_store_error(store));
+        }
         return NULL;
     }
     char *root = heap_strdup(proj.root_path);
@@ -3728,14 +3976,44 @@ static bool write_skip_logfile(const char *project, const cbm_file_error_t *errs
     return true;
 }
 
-/* Build the success portion of the index_repository response.
- * Returns true when status should be "degraded" (#334 plausibility gate). */
-static bool build_index_success_response(cbm_mcp_server_t *srv, yyjson_mut_doc *doc,
-                                         yyjson_mut_val *root, const char *project_name,
-                                         const char *repo_path, bool persistence, cbm_pipeline_t *p,
-                                         char **excluded_dirs, int excluded_count,
-                                         const cbm_file_error_t *file_errors, int file_error_count,
-                                         const char *logfile) {
+static char *build_index_state_mismatch_error(const char *project_name, int expected_nodes,
+                                              int expected_edges, int persisted_nodes,
+                                              int persisted_edges) {
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    if (!doc) {
+        return heap_strdup(
+            "{\"code\":\"CBM_INDEX_PERSISTED_STATE_MISMATCH\",\"message\":\"persisted graph "
+            "counts differ from the completed in-memory graph\",\"remediation\":\"preserve the "
+            "database family and inspect the persistence transaction\"}");
+    }
+    yyjson_mut_val *root = yyjson_mut_obj(doc);
+    yyjson_mut_doc_set_root(doc, root);
+    yyjson_mut_obj_add_str(doc, root, "code", "CBM_INDEX_PERSISTED_STATE_MISMATCH");
+    yyjson_mut_obj_add_str(doc, root, "message",
+                           "index_repository completed extraction but persisted graph readback did "
+                           "not exactly match the committed in-memory state");
+    yyjson_mut_obj_add_str(doc, root, "remediation",
+                           "preserve the database, WAL, and SHM together; inspect the persistence "
+                           "transaction and retry only after resolving the mismatch");
+    yyjson_mut_obj_add_str(doc, root, "project", project_name);
+    yyjson_mut_obj_add_int(doc, root, "expected_nodes", expected_nodes);
+    yyjson_mut_obj_add_int(doc, root, "expected_edges", expected_edges);
+    yyjson_mut_obj_add_int(doc, root, "persisted_nodes", persisted_nodes);
+    yyjson_mut_obj_add_int(doc, root, "persisted_edges", persisted_edges);
+    yyjson_mut_obj_add_bool(doc, root, "source_family_preserved", true);
+    char *json = yyjson_mut_write(doc, 0, NULL);
+    yyjson_mut_doc_free(doc);
+    return json ? json : heap_strdup("{\"code\":\"CBM_INDEX_PERSISTED_STATE_MISMATCH\"}");
+}
+
+/* Build the success portion only after the persisted source of truth has been
+ * verified and independently read back. Returns a structured error on failure. */
+static char *build_index_success_response(cbm_mcp_server_t *srv, yyjson_mut_doc *doc,
+                                          yyjson_mut_val *root, const char *project_name,
+                                          const char *repo_path, bool persistence,
+                                          cbm_pipeline_t *p, char **excluded_dirs,
+                                          int excluded_count, const cbm_file_error_t *file_errors,
+                                          int file_error_count, const char *logfile) {
     add_excluded_summary(doc, root, excluded_dirs, excluded_count);
     add_skipped_summary(doc, root, file_errors, file_error_count, logfile);
 
@@ -3743,67 +4021,34 @@ static bool build_index_success_response(cbm_mcp_server_t *srv, yyjson_mut_doc *
     int exp_edges = -1;
     cbm_pipeline_get_committed_counts(p, &exp_nodes, &exp_edges);
 
-    const double ratio = cbm_dump_verify_min_ratio();
-    const int min_floor = CBM_DUMP_VERIFY_MIN_FLOOR;
-
     cbm_store_t *store = resolve_store(srv, project_name);
-    int nodes = 0;
-    int edges = 0;
-    bool degraded = false;
-
     if (!store) {
-        degraded = true;
-    } else {
-        nodes = cbm_store_count_nodes(store, project_name);
-        edges = cbm_store_count_edges(store, project_name);
-        if (nodes < 0) {
-            degraded = true;
-            nodes = 0;
-            edges = edges >= 0 ? edges : 0;
-        } else if (cbm_dump_verify_is_degraded(exp_nodes, nodes, ratio, min_floor)) {
-            (void)cbm_store_checkpoint(store);
-            int nodes2 = cbm_store_count_nodes(store, project_name);
-            int edges2 = cbm_store_count_edges(store, project_name);
-            if (nodes2 >= 0) {
-                nodes = nodes2;
-            }
-            if (edges2 >= 0) {
-                edges = edges2;
-            }
-            degraded = cbm_dump_verify_is_degraded(exp_nodes, nodes, ratio, min_floor);
-        }
+        return build_no_store_error(srv, project_name);
+    }
+    int nodes = cbm_store_count_nodes(store, project_name);
+    int edges = cbm_store_count_edges(store, project_name);
+    if (nodes < 0 || edges < 0) {
+        record_store_query_failure(srv, project_name, cbm_store_db_path(store), store,
+                                   CBM_STORE_VERIFY_IO_FAILED, "source.query_persisted_counts",
+                                   cbm_store_error(store));
+        return build_recorded_store_error(srv);
+    }
+    if (exp_nodes < 0 || exp_edges < 0 || nodes != exp_nodes || edges != exp_edges) {
+        cbm_log_error("dump.verify_failed", "code", "CBM_INDEX_PERSISTED_STATE_MISMATCH", "project",
+                      project_name, "message",
+                      "persisted node/edge counts differ from the completed in-memory graph",
+                      "remediation", "preserve the database family and inspect persistence");
+        return build_index_state_mismatch_error(project_name, exp_nodes, exp_edges, nodes, edges);
     }
 
     yyjson_mut_obj_add_int(doc, root, "nodes", nodes);
     yyjson_mut_obj_add_int(doc, root, "edges", edges);
-    if (exp_nodes >= 0) {
-        yyjson_mut_obj_add_int(doc, root, "expected_nodes", exp_nodes);
-        yyjson_mut_obj_add_int(doc, root, "expected_edges", exp_edges);
-    }
-
-    if (degraded) {
-        if (!store) {
-            yyjson_mut_obj_add_str(doc, root, "hint",
-                                   "Index database failed integrity check and was removed. "
-                                   "Re-run index_repository(repo_path=...) to rebuild.");
-            cbm_log_warn("dump.verify", "reason", "store_missing", "expected_nodes",
-                         exp_nodes >= 0 ? "set" : "unknown");
-        } else {
-            char exp_buf[MCP_FIELD_SIZE];
-            char got_buf[MCP_FIELD_SIZE];
-            snprintf(exp_buf, sizeof(exp_buf), "%d", exp_nodes);
-            snprintf(got_buf, sizeof(got_buf), "%d", nodes);
-            yyjson_mut_obj_add_str(
-                doc, root, "hint",
-                "Persisted far fewer nodes than indexed — likely durability loss from a "
-                "hard-killed sibling process. Re-run index_repository(repo_path=...) to rebuild.");
-            cbm_log_warn("dump.verify", "expected_nodes", exp_buf, "persisted_nodes", got_buf);
-        }
-    }
+    yyjson_mut_obj_add_int(doc, root, "expected_nodes", exp_nodes);
+    yyjson_mut_obj_add_int(doc, root, "expected_edges", exp_edges);
 
     bool adr_exists = project_has_adr(store, project_name, repo_path);
     yyjson_mut_obj_add_bool(doc, root, "adr_present", adr_exists);
-    if (!adr_exists && !degraded) {
+    if (!adr_exists) {
         yyjson_mut_obj_add_str(
             doc, root, "adr_hint",
             "Project indexed. Consider creating an Architecture Decision Record: "
@@ -3819,7 +4064,7 @@ static bool build_index_success_response(cbm_mcp_server_t *srv, yyjson_mut_doc *
                                "Commit this file to share the index with teammates.");
     }
 
-    return degraded;
+    return NULL;
 }
 
 /* Build the response for a worker that crashed/hung/failed without producing a
@@ -3834,7 +4079,7 @@ enum { CBM_WORKER_RESPONSE_TAIL_MAX = 2048 };
 
 static char *build_worker_failure_response(const char *args, cbm_proc_outcome_t outcome,
                                            int exit_code, const char *worker_response,
-                                           const char *worker_log) {
+                                           const char *worker_log, const char *worker_log_path) {
 #else
 static char *build_worker_failure_response(const char *args, cbm_proc_outcome_t outcome) {
 #endif
@@ -3844,13 +4089,19 @@ static char *build_worker_failure_response(const char *args, cbm_proc_outcome_t 
     yyjson_mut_doc_set_root(doc, root);
     yyjson_mut_obj_add_str(doc, root, "status", "error");
     yyjson_mut_obj_add_str(doc, root, "outcome", cbm_proc_outcome_str(outcome));
+    const char *code = outcome == CBM_PROC_HANG    ? "CBM_INDEX_WORKER_HUNG"
+                       : outcome == CBM_PROC_CRASH ? "CBM_INDEX_WORKER_CRASHED"
+                                                   : "CBM_INDEX_WORKER_FAILED";
+    yyjson_mut_obj_add_str(doc, root, "code", code);
     yyjson_mut_obj_add_str(
-        doc, root, "hint",
+        doc, root, "message",
         outcome == CBM_PROC_HANG
-            ? "Indexing worker timed out (a file made no progress). The worker was "
-              "terminated and the server survived. Re-run to retry."
-            : "Indexing worker crashed on a file. The crash was contained (the server "
-              "survived). Re-run to retry; a future release isolates the culprit file.");
+            ? "the isolated index worker stopped making measurable progress"
+            : "the isolated index worker terminated before a complete graph was committed");
+    yyjson_mut_obj_add_str(
+        doc, root, "remediation",
+        "inspect the worker exit code, response tail, persisted log, and source path; fix the "
+        "reported root cause before submitting the repository again");
 #ifdef ASTRO_WORKER_DIAG
     /* #282: carry the worker's own evidence so a contained failure is
      * attributable from this artifact alone. */
@@ -3866,6 +4117,9 @@ static char *build_worker_failure_response(const char *args, cbm_proc_outcome_t 
         /* #282 (attempt 15): the worker's own log tail — panic/abort text —
          * already bounded by the supervisor (CBM_WORKER_LOG_TAIL_MAX). */
         yyjson_mut_obj_add_strcpy(doc, root, "worker_log_tail", worker_log);
+    }
+    if (worker_log_path && worker_log_path[0]) {
+        yyjson_mut_obj_add_strcpy(doc, root, "worker_log_path", worker_log_path);
     }
 #endif
     if (repo_path) {
@@ -3896,123 +4150,6 @@ static void supervisor_invalidate_store(cbm_mcp_server_t *srv) {
     srv->current_project = NULL;
 }
 
-/* Resolve a per-supervisor-run temp path <cache_dir>/logs/.supervisor-<pid><suffix>
- * (falls back to the CWD if the cache dir is unresolvable). Used for the crash-
- * attribution marker and the quarantine list during the recovery re-run. */
-static void supervisor_tmp_path(char *out, size_t out_sz, const char *suffix) {
-    const char *cdir = cbm_resolve_cache_dir();
-    if (cdir && cdir[0]) {
-        char logdir[CBM_SZ_1K];
-        snprintf(logdir, sizeof(logdir), "%s/logs", cdir);
-        cbm_mkdir_p(logdir, 0755);
-        snprintf(out, out_sz, "%s/.supervisor-%d%s", logdir, (int)getpid(), suffix);
-    } else {
-        snprintf(out, out_sz, ".supervisor-%d%s", (int)getpid(), suffix);
-    }
-}
-
-/* Parse the worker's marker JOURNAL ("S <rel>" / "D <rel>" lines, one event
- * per line — see cbm_index_mark_start/done) into the crash/hang SUSPECT set:
- * files whose last event is an S with no closing D, i.e. the in-flight set
- * at kill time. Recovery runs are PARALLEL, so there are up to worker_count
- * suspects; a torn final line (no trailing newline) is discarded by design.
- * Returns a malloc'd array of malloc'd rel paths, OLDEST OPEN S FIRST (for a
- * hang, the oldest still-open file IS the stuck one). Caller frees via
- * supervisor_free_suspects. */
-static char **supervisor_read_suspects(const char *path, int *out_n) {
-    *out_n = 0;
-    FILE *f = cbm_fopen(path, "rb");
-    if (!f) {
-        return NULL;
-    }
-    char **open_paths = NULL; /* open (S-without-D) files in first-S order */
-    int open_n = 0;
-    int open_cap = 0;
-    char line[CBM_SZ_1K];
-    while (fgets(line, sizeof(line), f)) {
-        size_t len = strlen(line);
-        if (len == 0 || line[len - 1] != '\n') {
-            break; /* torn final line — discard and stop */
-        }
-        line[--len] = '\0';
-        if (len > 0 && line[len - 1] == '\r') {
-            line[--len] = '\0';
-        }
-        if (len < 3 || (line[0] != 'S' && line[0] != 'D') || line[1] != ' ') {
-            continue;
-        }
-        const char *rel = line + 2;
-        if (line[0] == 'S') {
-            bool already = false;
-            for (int i = 0; i < open_n && !already; i++) {
-                already = strcmp(open_paths[i], rel) == 0;
-            }
-            if (already) {
-                continue;
-            }
-            if (open_n == open_cap) {
-                int ncap = open_cap ? open_cap * 2 : 16;
-                char **np = (char **)realloc(open_paths, (size_t)ncap * sizeof(char *));
-                if (!np) {
-                    break;
-                }
-                open_paths = np;
-                open_cap = ncap;
-            }
-            open_paths[open_n++] = cbm_strdup(rel);
-        } else {
-            for (int i = 0; i < open_n; i++) {
-                if (strcmp(open_paths[i], rel) == 0) {
-                    free(open_paths[i]);
-                    memmove(&open_paths[i], &open_paths[i + 1],
-                            (size_t)(open_n - i - 1) * sizeof(char *));
-                    open_n--;
-                    break;
-                }
-            }
-        }
-    }
-    (void)fclose(f);
-    if (open_n == 0) {
-        free(open_paths);
-        return NULL;
-    }
-    *out_n = open_n;
-    return open_paths;
-}
-
-static void supervisor_free_suspects(char **s, int n) {
-    if (!s) {
-        return;
-    }
-    for (int i = 0; i < n; i++) {
-        free(s[i]);
-    }
-    free(s);
-}
-
-static bool supervisor_suspect_contains(char **s, int n, const char *rel) {
-    for (int i = 0; i < n; i++) {
-        if (s[i] && strcmp(s[i], rel) == 0) {
-            return true;
-        }
-    }
-    return false;
-}
-
-/* Append one quarantine entry "rel\tphase\n" (phase = "crash"|"hang") to the
- * quarantine list. The worker's loader parses this back and reports the skip's
- * phase in skipped[]; a bare "rel" line is still tolerated there (defaults crash). */
-static bool supervisor_append_quarantine(const char *path, const char *rel, const char *phase) {
-    FILE *f = cbm_fopen(path, "ab");
-    if (!f) {
-        return false;
-    }
-    (void)fprintf(f, "%s\t%s\n", rel, phase);
-    (void)fclose(f);
-    return true;
-}
-
 /* #405: fail-closed structured result for the strict (shadow) supervised index
  * path when the pipeline pass could NOT be run with out-of-process isolation — a
  * spawn failure, an unavailable supervisor, or a clean-but-empty worker exit.
@@ -4027,7 +4164,15 @@ static char *build_strict_supervised_error(const char *args, const char *outcome
     yyjson_mut_doc_set_root(doc, root);
     yyjson_mut_obj_add_str(doc, root, "status", "error");
     yyjson_mut_obj_add_str(doc, root, "outcome", outcome);
+    yyjson_mut_obj_add_str(doc, root, "code",
+                           strcmp(outcome, "response_missing") == 0
+                               ? "CBM_INDEX_WORKER_RESPONSE_MISSING"
+                               : "CBM_INDEX_SUPERVISOR_UNAVAILABLE");
     yyjson_mut_obj_add_strcpy(doc, root, "message", message);
+    yyjson_mut_obj_add_str(
+        doc, root, "remediation",
+        "restore isolated worker execution and inspect process-creation diagnostics; do not "
+        "rerun in-process or accept a partial graph");
     if (repo_path) {
         yyjson_mut_obj_add_strcpy(doc, root, "repo_path", repo_path);
     }
@@ -4038,264 +4183,52 @@ static char *build_strict_supervised_error(const char *args, const char *outcome
     free(json);
     return result;
 }
-
-/* Run index_repository in a supervised worker subprocess with skip-and-continue
- * (Stage 3c). Returns the response string (caller frees):
- *   - the worker's own response on a clean first run (the common path);
- *   - after a crash/hang, the response from a clean single-threaded RECOVERY run
- *     that quarantines the culprit file(s) — status="indexed" with them listed in
- *     skipped[] as phase="crash"/"hang", and the good files indexed;
- *   - a best-effort PARTIAL index (one final quarantine-only run) if the recovery
- *     loop cannot converge but at least one file was quarantined;
- *   - a contained-failure response only if even that cannot produce a clean run.
- * When `strict` is false, returns NULL if the worker could not be spawned at all,
- * so the caller degrades to the in-process path (the watcher/auto-index contract).
- * When `strict` is true (the #405 shadow full-index path), NEVER returns NULL and
- * NEVER degrades: a spawn failure or a clean-but-empty exit is returned as a
- * fail-closed structured error result so the caller refuses before touching the
- * vault. A contained crash/hang still returns build_worker_failure_response in
- * both modes. */
-static char *index_run_supervised_ex(cbm_mcp_server_t *srv, const char *args, bool strict) {
+/* Run index_repository exactly once in an isolated worker. A process or
+ * response failure is a terminal structured refusal; the supervisor never
+ * retries with a changed corpus and never degrades to in-process execution. */
+static char *index_run_supervised(cbm_mcp_server_t *srv, const char *args) {
     supervisor_invalidate_store(srv);
 
-    /* First attempt: normal parallel run. */
     cbm_index_worker_result_t wr;
-    int rc = cbm_index_spawn_worker(args, false, NULL, NULL, &wr);
-
+    int rc = cbm_index_spawn_worker(args, &wr);
     if (rc != 0 || wr.outcome == CBM_PROC_SPAWN_FAILED) {
         cbm_index_worker_result_free(&wr);
         supervisor_invalidate_store(srv);
-        if (strict) {
-            /* #405: the shadow index pass REQUIRES out-of-process isolation. A
-             * spawn failure is a hard error, not a license to silently lose crash
-             * isolation by degrading in-process. */
-            return build_strict_supervised_error(
-                args, "spawn_failed",
-                "the index worker subprocess could not be spawned, so the shadow "
-                "index pass could not run with out-of-process crash isolation");
-        }
-        return NULL; /* degrade to in-process */
+        return build_strict_supervised_error(
+            args, "spawn_failed",
+            "the isolated index worker could not be spawned; no index transaction ran");
     }
-    if (wr.outcome == CBM_PROC_CLEAN) {
-        /* Clean exit → transfer the worker's response (the common path). If the
-         * worker exited clean but wrote no response (a degenerate case, e.g. a
-         * self binary that does not act as an index worker), resp is NULL and the
-         * caller degrades to the in-process path — a clean run never needs the
-         * crash-recovery loop. */
-        char *resp = wr.response; /* transfer ownership to caller (may be NULL) */
+
+    if (wr.outcome == CBM_PROC_CLEAN && wr.response) {
+        char *response = wr.response;
         wr.response = NULL;
         cbm_index_worker_result_free(&wr);
         supervisor_invalidate_store(srv);
-        if (strict && !resp) {
-            /* #405: a clean exit with no index result is not a usable shadow pass;
-             * fail closed rather than degrade in-process. */
-            return build_strict_supervised_error(
-                args, "exit_nonzero",
-                "the index worker exited cleanly but wrote no index_repository "
-                "response, so the shadow index pass produced no usable result");
-        }
-        return resp;
+        return response;
     }
 
-    /* Crash / hang / nonzero exit → skip-and-continue recovery. Re-run the
-     * worker PARALLEL (there are no sequential production runs) with the
-     * per-file marker JOURNAL armed; after each failed run the journal's
-     * open-S set is the in-flight SUSPECT set. A file is quarantined only
-     * when it appears in the suspect sets of TWO CONSECUTIVE failed runs
-     * (intersection — a stale or merely unlucky in-flight file rotates out),
-     * and only ONE file per round: the OLDEST open S in the intersection
-     * (for a hang the oldest still-open file IS the stuck one; for a crash
-     * it is the longest-running suspect — the best single deterministic
-     * pick). A clean run then indexes the good files and reports the
-     * quarantined ones as phase="crash"/"hang" skips via the ordinary
-     * Stage-2 skip plumbing. The old design re-ran SINGLE-THREADED to keep
-     * one exact marker; at scale that fell into the sequential crawl, went
-     * quiet, was killed as a hang mid-pass, and the stale marker got FOUR
-     * innocent ms-typescript fixtures quarantined one 15-minute retry at a
-     * time. */
-    cbm_proc_outcome_t last_outcome = wr.outcome;
+    supervisor_invalidate_store(srv);
 #ifdef ASTRO_WORKER_DIAG
-    int last_exit_code = wr.exit_code;
-    char *last_response = wr.response; /* #282: keep the worker's evidence */
-    wr.response = NULL;
-    char *last_log = wr.log_tail; /* #282: keep the worker's panic/log text */
-    wr.log_tail = NULL;
+    char *failure = NULL;
+    if (wr.outcome == CBM_PROC_CLEAN) {
+        failure = build_strict_supervised_error(args, "response_missing",
+                                                "the isolated index worker exited cleanly without "
+                                                "a complete index_repository response");
+    } else {
+        failure = build_worker_failure_response(args, wr.outcome, wr.exit_code, wr.response,
+                                                wr.log_tail, wr.log_path);
+    }
+#else
+    char *failure =
+        wr.outcome == CBM_PROC_CLEAN
+            ? build_strict_supervised_error(args, "response_missing",
+                                            "the isolated index worker exited cleanly without a "
+                                            "complete index_repository response")
+            : build_worker_failure_response(args, wr.outcome);
 #endif
     cbm_index_worker_result_free(&wr);
-
-    char marker_path[CBM_SZ_1K];
-    char quarantine_path[CBM_SZ_1K];
-    supervisor_tmp_path(marker_path, sizeof(marker_path), ".marker");
-    supervisor_tmp_path(quarantine_path, sizeof(quarantine_path), ".quarantine");
-    (void)cbm_unlink(marker_path);
-    /* Start the quarantine list empty (truncate any stale file). */
-    FILE *qinit = cbm_fopen(quarantine_path, "wb");
-    if (qinit) {
-        (void)fclose(qinit);
-    }
-
-    int cap = 100;
-    const char *cap_env = getenv("CBM_INDEX_MAX_RESTARTS");
-    if (cap_env && cap_env[0]) {
-        int v = atoi(cap_env);
-        if (v > 0) {
-            cap = v;
-        }
-    }
-
-    char *resp = NULL;
-    int quarantined = 0;         /* files pinned + added to the quarantine list so far */
-    char **prev_suspects = NULL; /* previous failed round's in-flight set */
-    int prev_n = 0;
-    for (int i = 0; i < cap; i++) {
-        cbm_index_worker_result_t wr2;
-        int rc2 = cbm_index_spawn_worker(args, /*single_thread=*/false, marker_path,
-                                         quarantine_path, &wr2);
-        if (rc2 != 0) {
-            last_outcome = wr2.outcome;
-#ifdef ASTRO_WORKER_DIAG
-            last_exit_code = wr2.exit_code;
-            free(last_response);
-            last_response = wr2.response; /* #282 */
-            wr2.response = NULL;
-            free(last_log);
-            last_log = wr2.log_tail; /* #282 */
-            wr2.log_tail = NULL;
-#endif
-            cbm_index_worker_result_free(&wr2);
-            break; /* spawn failed mid-recovery — give up */
-        }
-        if (wr2.outcome == CBM_PROC_CLEAN && wr2.response) {
-            resp = wr2.response; /* transfer ownership to caller */
-            wr2.response = NULL;
-            cbm_index_worker_result_free(&wr2);
-            break; /* good files indexed; quarantined files reported as crash/hang */
-        }
-        if (wr2.outcome == CBM_PROC_CRASH || wr2.outcome == CBM_PROC_HANG) {
-            last_outcome = wr2.outcome;
-#ifdef ASTRO_WORKER_DIAG
-            last_exit_code = wr2.exit_code;
-            free(last_response);
-            last_response = wr2.response; /* #282 */
-            wr2.response = NULL;
-            free(last_log);
-            last_log = wr2.log_tail; /* #282 */
-            wr2.log_tail = NULL;
-#endif
-            cbm_index_worker_result_free(&wr2);
-            /* crash vs hang: the phase this file is quarantined under and
-             * reported as in skipped[]. A fault signal → "crash"; a
-             * no-progress kill → "hang". */
-            const char *phase = (last_outcome == CBM_PROC_HANG) ? "hang" : "crash";
-            int sus_n = 0;
-            char **suspects = supervisor_read_suspects(marker_path, &sus_n);
-            (void)cbm_unlink(marker_path); /* fresh journal for the next re-run */
-            if (!suspects || sus_n == 0) {
-                supervisor_free_suspects(suspects, sus_n);
-                cbm_log_warn("index.supervisor.unattributable", "action", "give_up");
-                break;
-            }
-            if (prev_suspects) {
-                /* Two-consecutive-strikes: quarantine the OLDEST open S that
-                 * was also in flight in the previous failed round. */
-                const char *pick = NULL;
-                for (int k = 0; k < sus_n && !pick; k++) {
-                    if (supervisor_suspect_contains(prev_suspects, prev_n, suspects[k])) {
-                        pick = suspects[k];
-                    }
-                }
-                if (!pick) {
-                    /* Disjoint consecutive in-flight sets: the failure is not
-                     * attributable to a recurring file (systemic) — stop
-                     * rather than quarantine an innocent. */
-                    supervisor_free_suspects(suspects, sus_n);
-                    cbm_log_warn("index.supervisor.unattributable", "action", "give_up");
-                    break;
-                }
-                if (!supervisor_append_quarantine(quarantine_path, pick, phase)) {
-                    cbm_log_warn("index.supervisor.quarantine_write_fail", "path", pick);
-                    supervisor_free_suspects(suspects, sus_n);
-                    break;
-                }
-                quarantined++;
-                char attempt_buf[MCP_FIELD_SIZE];
-                snprintf(attempt_buf, sizeof(attempt_buf), "%d", i + 1);
-                cbm_log_warn("index.file_quarantined", "path", pick, "outcome", phase, "attempt",
-                             attempt_buf);
-            }
-            supervisor_free_suspects(prev_suspects, prev_n);
-            prev_suspects = suspects;
-            prev_n = sus_n;
-            continue;
-        }
-        /* SPAWN_FAILED / nonzero exit / non-fault kill → not a crash we can
-         * attribute; stop and report a contained failure. */
-        last_outcome = wr2.outcome;
-#ifdef ASTRO_WORKER_DIAG
-        last_exit_code = wr2.exit_code;
-        free(last_response);
-        last_response = wr2.response; /* #282 */
-        wr2.response = NULL;
-        free(last_log);
-        last_log = wr2.log_tail; /* #282 */
-        wr2.log_tail = NULL;
-#endif
-        cbm_index_worker_result_free(&wr2);
-        break;
-    }
-    supervisor_free_suspects(prev_suspects, prev_n);
-
-    (void)cbm_unlink(marker_path); /* marker no longer needed */
-
-    /* Terminal best-effort-partial: the loop exited WITHOUT a clean run (cap
-     * exhausted, or an unattributable failure) but at least one file was already
-     * quarantined. Try ONE final PARALLEL spawn with the accumulated quarantine
-     * and NO marker — every known-bad file short-circuits, so a clean run yields
-     * a PARTIAL index (all good files indexed, all known crashers/hangs reported
-     * as skips) rather than a hard failure. Bounded by the same quiet-timeout,
-     * so it cannot itself hang. Rare given monotonic progress. */
-    if (!resp && quarantined > 0) {
-        cbm_index_worker_result_t wrp;
-        int rcp =
-            cbm_index_spawn_worker(args, /*single_thread=*/false, NULL, quarantine_path, &wrp);
-        if (rcp == 0 && wrp.outcome == CBM_PROC_CLEAN && wrp.response) {
-            resp = wrp.response; /* transfer ownership to caller */
-            wrp.response = NULL;
-            char qn[MCP_FIELD_SIZE];
-            snprintf(qn, sizeof(qn), "%d", quarantined);
-            cbm_log_error("index.supervisor.partial", "quarantined", qn, "outcome",
-                          cbm_proc_outcome_str(last_outcome));
-        }
-        cbm_index_worker_result_free(&wrp);
-    }
-
-    (void)cbm_unlink(quarantine_path);
-    supervisor_invalidate_store(srv);
-
-    if (resp) {
-#ifdef ASTRO_WORKER_DIAG
-        free(last_response);
-        free(last_log);
-#endif
-        return resp;
-    }
-#ifdef ASTRO_WORKER_DIAG
-    char *failure =
-        build_worker_failure_response(args, last_outcome, last_exit_code, last_response, last_log);
-    free(last_response);
-    free(last_log);
     return failure;
-#else
-    return build_worker_failure_response(args, last_outcome);
-#endif
 }
-
-/* Non-strict supervised runner: the watcher/auto-index contract that degrades to
- * the in-process path (returns NULL) when the worker cannot be spawned. */
-static char *index_run_supervised(cbm_mcp_server_t *srv, const char *args) {
-    return index_run_supervised_ex(srv, args, /*strict=*/false);
-}
-
 /* Public entry (see mcp.h): the shadow full-index path (#405) runs the CBM
  * pipeline OUT OF PROCESS and FAILS CLOSED rather than degrading to in-process,
  * so a hard pass abort is contained in the child and the caller refuses before it
@@ -4312,34 +4245,55 @@ char *cbm_mcp_index_repository_supervised_strict(cbm_mcp_server_t *srv, const ch
     }
     free(early_repo_path);
     if (!cbm_index_supervisor_should_wrap()) {
-        /* The shadow path REQUIRES out-of-process isolation. If the supervisor is
-         * unavailable (embedder host not marked, the CBM_INDEX_SUPERVISOR=0 kill
-         * switch, or this process is already the worker), fail closed rather than
-         * silently indexing in-process and forgoing crash isolation. */
+        /* The shadow path requires out-of-process isolation. Embedders and an
+         * already-active worker cannot start another supervisor. */
         return build_strict_supervised_error(
             args, "spawn_failed",
-            "the index supervisor is unavailable (host not marked, kill switch set, "
-            "or already running as an index worker), so the shadow index pass cannot "
+            "the index supervisor is unavailable (host not marked or already running "
+            "as an index worker), so the shadow index pass cannot "
             "run with out-of-process crash isolation");
     }
-    return index_run_supervised_ex(srv, args, /*strict=*/true);
+    return index_run_supervised(srv, args);
 }
 
 /* Build a minimal {"repo_path": "<root>"} args object (path safely escaped) and
  * run it through index_run_supervised. Shared by the session auto-index (srv
  * present → its cached store is invalidated) and the watcher re-index (srv NULL).
- * Returns the worker's response string (caller frees) or NULL to degrade. */
+ * Returns the worker's response string (caller frees). NULL is an allocation
+ * failure and is never permission to run a different indexing path. */
 static char *index_run_supervised_path(cbm_mcp_server_t *srv, const char *root_path) {
     if (!root_path || !root_path[0]) {
+        cbm_log_error("index.supervisor.args_failed", "code", "CBM_INDEX_REPO_PATH_REQUIRED",
+                      "message", "supervised indexing requires a non-empty repository path",
+                      "remediation", "supply the exact readable repository root");
         return NULL;
     }
     yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    if (!doc) {
+        cbm_log_error("index.supervisor.args_failed", "code",
+                      "CBM_INDEX_SUPERVISOR_ARGS_ALLOC_FAILED", "message",
+                      "the supervised index argument document could not be allocated",
+                      "remediation", "free memory and retry without changing the corpus");
+        return NULL;
+    }
     yyjson_mut_val *root = yyjson_mut_obj(doc);
+    if (!root) {
+        yyjson_mut_doc_free(doc);
+        cbm_log_error("index.supervisor.args_failed", "code",
+                      "CBM_INDEX_SUPERVISOR_ARGS_ALLOC_FAILED", "message",
+                      "the supervised index argument object could not be allocated", "remediation",
+                      "free memory and retry without changing the corpus");
+        return NULL;
+    }
     yyjson_mut_doc_set_root(doc, root);
     yyjson_mut_obj_add_strcpy(doc, root, "repo_path", root_path);
     char *args = yy_doc_to_str(doc);
     yyjson_mut_doc_free(doc);
     if (!args) {
+        cbm_log_error("index.supervisor.args_failed", "code",
+                      "CBM_INDEX_SUPERVISOR_ARGS_SERIALIZE_FAILED", "message",
+                      "the supervised index arguments could not be serialized", "remediation",
+                      "free memory and retry without changing the corpus");
         return NULL;
     }
     char *resp = index_run_supervised(srv, args);
@@ -4356,9 +4310,9 @@ char *cbm_mcp_index_run_supervised_path(const char *root_path) {
 bool cbm_path_within_root(const char *root_path, const char *abs_path); /* defined below */
 
 static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
-    /* Supervisor gate: run the index in a crash/hang-isolating worker subprocess
-     * unless this process IS the worker or the kill switch (CBM_INDEX_SUPERVISOR=0)
-     * is set. On spawn failure, fall through to the in-process path (degrade). */
+    /* Supervisor gate: a real host runs the index once in an isolated worker.
+     * Spawn/process/response failure is terminal; it never authorizes an
+     * in-process retry or a changed corpus. */
 #ifdef ASTRO_WORKER_DIAG
     /* #282: validate arguments BEFORE supervision. Spawning a worker for
      * trivially-invalid args converts a clean validation error into an
@@ -4390,13 +4344,16 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
      * isolation and RSS reclamation (#832/#845). */
     bool row_sink_registered = srv && (srv->row_node_sink || srv->row_edge_sink);
     if (row_sink_registered) {
-        cbm_log_info("index.supervisor.inprocess", "reason", "row_sink_registered",
-                     "tradeoff", "crash_isolation_forgone_to_deliver_row_stream");
+        cbm_log_info("index.supervisor.inprocess", "reason", "row_sink_registered", "tradeoff",
+                     "crash_isolation_forgone_to_deliver_row_stream");
     } else if (cbm_index_supervisor_should_wrap()) {
         char *supervised = index_run_supervised(srv, args);
         if (supervised) {
             return supervised;
         }
+        return build_strict_supervised_error(args, "response_missing",
+                                             "the isolated index supervisor produced no response "
+                                             "and no in-process retry is allowed");
     }
 
     char *repo_path = cbm_mcp_get_string_arg(args, "repo_path");
@@ -4519,6 +4476,7 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
 
     yyjson_mut_obj_add_str(doc, root, "project", project_name);
 
+    char *postcondition_error = NULL;
     if (rc == 0) {
         /* Write the per-run logfile ONLY when there were skips (no logfile on a
          * clean run). The FULL list goes to the file; the JSON caps at 50. */
@@ -4526,10 +4484,12 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
         logfile_path[0] = '\0';
         bool has_logfile = write_skip_logfile(project_name, file_errors, file_error_count,
                                               logfile_path, sizeof(logfile_path));
-        bool degraded = build_index_success_response(
+        postcondition_error = build_index_success_response(
             srv, doc, root, project_name, repo_path, persistence, p, excluded_dirs, excluded_count,
             file_errors, file_error_count, has_logfile ? logfile_path : NULL);
-        yyjson_mut_obj_add_str(doc, root, "status", degraded ? "degraded" : "indexed");
+        if (!postcondition_error) {
+            yyjson_mut_obj_add_str(doc, root, "status", "indexed");
+        }
     } else {
         yyjson_mut_obj_add_str(doc, root, "status", "error");
         yyjson_mut_obj_add_str(doc, root, "hint",
@@ -4537,14 +4497,15 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
                                "Try mode='fast' for a quicker diagnostic run.");
     }
 
-    char *json = yy_doc_to_str(doc);
+    bool response_is_error = rc != 0 || postcondition_error != NULL;
+    char *json = postcondition_error ? postcondition_error : yy_doc_to_str(doc);
     yyjson_mut_doc_free(doc);
     /* Free the pipeline only after the response doc copied the excluded list.
      * Supervised worker: skip the deep free — the process exits right after
      * handing over the response (main.c fast-exits), and piecemeal-freeing a
      * multi-GB graph before process death costs minutes on kernel-scale repos;
-     * the OS reclaims it wholesale at exit. In-process paths (tests, kill
-     * switch, degrade) still free normally. */
+     * the OS reclaims it wholesale at exit. In-process paths still free
+     * normally. */
     if (cbm_index_worker_active()) {
         cbm_log_info("index.worker.fast_exit", "skip", "pipeline_free");
     } else {
@@ -4553,7 +4514,7 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
     free(project_name);
     free(repo_path);
 
-    char *result = cbm_mcp_text_result(json, rc != 0);
+    char *result = cbm_mcp_text_result(json, response_is_error);
     free(json);
     return result;
 }
@@ -4589,9 +4550,9 @@ static char *snippet_suggestions(const char *input, cbm_node_t *nodes, int count
              "pick an atom_id from the candidates below.",
              count, input);
     yyjson_mut_obj_add_str(doc, root, "message", msg);
-    yyjson_mut_obj_add_str(
-        doc, root, "remediation",
-        "call search_graph if necessary, select the intended stable atom_id, and retry get_code_snippet with atom_id instead of qualified_name");
+    yyjson_mut_obj_add_str(doc, root, "remediation",
+                           "call search_graph if necessary, select the intended stable atom_id, "
+                           "and retry get_code_snippet with atom_id instead of qualified_name");
 
     yyjson_mut_val *arr = yyjson_mut_arr(doc);
     for (int i = 0; i < count; i++) {
@@ -4689,7 +4650,8 @@ bool cbm_path_within_root(const char *root_path, const char *abs_path) {
         size_t root_len = strlen(real_root);
         /* Ignore a trailing separator on the resolved root (e.g. a volume root
          * "\\?\C:\") so the boundary test below is well-defined. */
-        while (root_len > 0 && (real_root[root_len - 1] == '\\' || real_root[root_len - 1] == '/')) {
+        while (root_len > 0 &&
+               (real_root[root_len - 1] == '\\' || real_root[root_len - 1] == '/')) {
             root_len--;
         }
         if (root_len > 0 &&
@@ -4927,14 +4889,14 @@ static char *handle_get_code_snippet(cbm_mcp_server_t *srv, const char *args) {
         free(atom_id);
         free(qn);
         free(project);
-        return cbm_mcp_text_result(
-            "exactly one of atom_id or qualified_name is required; prefer atom_id from search_graph",
-            true);
+        return cbm_mcp_text_result("exactly one of atom_id or qualified_name is required; prefer "
+                                   "atom_id from search_graph",
+                                   true);
     }
 
     cbm_store_t *store = resolve_store(srv, project);
     if (!store) {
-        char *_err = build_project_list_error("project not found or not indexed");
+        char *_err = build_no_store_error(srv, project);
         char *_res = cbm_mcp_text_result(_err, true);
         free(_err);
         free(atom_id);
@@ -4943,7 +4905,7 @@ static char *handle_get_code_snippet(cbm_mcp_server_t *srv, const char *args) {
         return _res;
     }
 
-    char *not_indexed = verify_project_indexed(store, project);
+    char *not_indexed = verify_project_indexed(srv, store, project);
     if (not_indexed) {
         free(atom_id);
         free(qn);
@@ -4966,9 +4928,9 @@ static char *handle_get_code_snippet(cbm_mcp_server_t *srv, const char *args) {
         }
         char message[CBM_SZ_512];
         snprintf(message, sizeof(message),
-                 atom_rc == CBM_STORE_NOT_FOUND
-                     ? "atom_id not found in project: %s"
-                     : "atom_id lookup failed; require a canonical 64-character lowercase SHA-256 identity: %s",
+                 atom_rc == CBM_STORE_NOT_FOUND ? "atom_id not found in project: %s"
+                                                : "atom_id lookup failed; require a canonical "
+                                                  "64-character lowercase SHA-256 identity: %s",
                  atom_id);
         free(atom_id);
         free(project);
@@ -4989,7 +4951,7 @@ static char *handle_get_code_snippet(cbm_mcp_server_t *srv, const char *args) {
         cbm_node_t *candidates = NULL;
         int candidate_count = 0;
         int candidate_rc = cbm_store_find_nodes_by_qn_suffix(store, effective_project, qn,
-                                                              &candidates, &candidate_count);
+                                                             &candidates, &candidate_count);
         if (candidate_rc == CBM_STORE_OK && candidate_count > 1) {
             char *result = snippet_suggestions(qn, candidates, candidate_count);
             cbm_store_free_nodes(candidates, candidate_count);
@@ -4999,9 +4961,11 @@ static char *handle_get_code_snippet(cbm_mcp_server_t *srv, const char *args) {
         }
         cbm_store_free_nodes(candidates, candidate_count);
         char message[CBM_SZ_512];
-        snprintf(message, sizeof(message),
-                 "qualified_name lookup failed for \"%s\" while enumerating stable atom candidates; inspect store logs and rebuild the project if the identity index is invalid",
-                 qn);
+        snprintf(
+            message, sizeof(message),
+            "qualified_name lookup failed for \"%s\" while enumerating stable atom candidates; "
+            "inspect store logs and rebuild the project if the identity index is invalid",
+            qn);
         free(qn);
         free(project);
         return cbm_mcp_text_result(message, true);
@@ -5011,8 +4975,8 @@ static char *handle_get_code_snippet(cbm_mcp_server_t *srv, const char *args) {
      * and short names ("ProcessOrder") via LIKE '%.X'. */
     cbm_node_t *suffix_nodes = NULL;
     int suffix_count = 0;
-    int suffix_rc =
-        cbm_store_find_nodes_by_qn_suffix(store, effective_project, qn, &suffix_nodes, &suffix_count);
+    int suffix_rc = cbm_store_find_nodes_by_qn_suffix(store, effective_project, qn, &suffix_nodes,
+                                                      &suffix_count);
     if (suffix_rc != CBM_STORE_OK) {
         char message[CBM_SZ_512];
         snprintf(message, sizeof(message), "qualified_name suffix lookup failed for \"%s\"", qn);
@@ -5067,38 +5031,71 @@ static char *handle_get_code_snippet(cbm_mcp_server_t *srv, const char *args) {
 
 /* ── search_code v2: graph-augmented code search ─────────────── */
 
-/* Strip non-ASCII bytes to guarantee valid UTF-8 JSON output */
-enum { ASCII_MAX = 127 };
-static void sanitize_ascii(char *s) {
-    for (unsigned char *p = (unsigned char *)s; *p; p++) {
-        if (*p > ASCII_MAX) {
-            *p = '?';
-        }
-    }
-}
-
 /* Intermediate grep match */
 typedef struct {
-    char file[CBM_SZ_512];
+    char *file;
     int line;
-    char content[CBM_SZ_1K];
+    char *content;
 } grep_match_t;
 
 /* Deduped result: one per containing graph node */
 typedef struct {
     int64_t node_id; /* 0 = raw match (no containing node) */
-    char node_name[CBM_SZ_256];
-    char qualified_name[CBM_SZ_512];
-    char label[CBM_SZ_64];
-    char file[CBM_SZ_512];
+    char *node_name;
+    char *qualified_name;
+    char *label;
+    char *file;
     int start_line;
     int end_line;
     int in_degree;
     int out_degree;
     int score;
-    int match_lines[CBM_SZ_64];
+    int *match_lines;
     int match_count;
+    int match_cap;
 } search_result_t;
+
+typedef struct {
+    char operation[CBM_SZ_64];
+    char detail[CBM_SZ_512];
+} search_response_error_t;
+
+static char *search_operation_error_result(const char *code, const char *message,
+                                           const char *remediation,
+                                           const search_response_error_t *error) {
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    if (!doc) {
+        return cbm_mcp_text_result(
+            "{\"code\":\"CBM_SEARCH_SERIALIZATION_FAILED\",\"message\":\"error response "
+            "allocation failed\",\"remediation\":\"free memory and retry\"}",
+            true);
+    }
+    yyjson_mut_val *root = yyjson_mut_obj(doc);
+    if (!root) {
+        yyjson_mut_doc_free(doc);
+        return cbm_mcp_text_result(
+            "{\"code\":\"CBM_SEARCH_SERIALIZATION_FAILED\",\"message\":\"error response "
+            "allocation failed\",\"remediation\":\"free memory and retry\"}",
+            true);
+    }
+    yyjson_mut_doc_set_root(doc, root);
+    yyjson_mut_obj_add_str(doc, root, "code", code);
+    yyjson_mut_obj_add_str(doc, root, "message", message);
+    yyjson_mut_obj_add_str(doc, root, "remediation", remediation);
+    yyjson_mut_obj_add_str(doc, root, "failed_operation", error->operation);
+    yyjson_mut_obj_add_str(doc, root, "detail", error->detail);
+    char *json = yyjson_mut_write(doc, 0, NULL);
+    yyjson_mut_doc_free(doc);
+    if (!json) {
+        return cbm_mcp_text_result(
+            "{\"code\":\"CBM_SEARCH_SERIALIZATION_FAILED\",\"message\":\"error response "
+            "serialization failed\",\"remediation\":\"free memory and retry\"}",
+            true);
+    }
+    char *result = cbm_mcp_text_result(json, true);
+    free(json);
+    return result;
+}
 
 /* Score a result for ranking: project source first, vendored last, tests lowest */
 enum { SCORE_FUNC = 10, SCORE_ROUTE = 15, SCORE_VENDORED = -50, SCORE_TEST = -5 };
@@ -5129,172 +5126,211 @@ static int search_result_cmp(const void *a, const void *b) {
     return rb->score - ra->score; /* descending */
 }
 
-/* Build the grep/search command string based on scoped vs recursive mode.
- * On Windows, uses PowerShell Select-String with tab-delimited output.
- * On POSIX, uses grep with colon-delimited output. */
-static void build_grep_cmd(char *cmd, size_t cmd_sz, bool use_regex, bool scoped,
-                           const char *file_pattern, const char *tmpfile, const char *filelist,
-                           const char *root_path) {
+/* Build a search command over the exact persisted indexed-file set.  There is
+ * deliberately no recursive-filesystem mode: inability to materialize this
+ * scope is an error, never permission to search a different corpus. */
+static char *build_grep_cmd(bool use_regex, const char *file_pattern, const char *tmpfile,
+                            const char *filelist) {
 #ifdef _WIN32
     const char *sm = use_regex ? "" : " -SimpleMatch";
-    if (scoped) {
-        if (file_pattern) {
-            snprintf(
-                cmd, cmd_sz,
-                "powershell -Command \"$pat = Get-Content '%s'; "
-                "Get-Content '%s' | ForEach-Object { Select-String -LiteralPath $_ -Pattern $pat%s "
-                "-ErrorAction SilentlyContinue }"
-                " | Where-Object { $_.Path -like '*%s' }"
-                " | ForEach-Object { $_.Path + [char]9 + $_.LineNumber + [char]9 + $_.Line }\"",
-                tmpfile, filelist, sm, file_pattern);
-        } else {
-            snprintf(
-                cmd, cmd_sz,
-                "powershell -Command \"$pat = Get-Content '%s'; "
-                "Get-Content '%s' | ForEach-Object { Select-String -LiteralPath $_ -Pattern $pat%s "
-                "-ErrorAction SilentlyContinue }"
-                " | ForEach-Object { $_.Path + [char]9 + $_.LineNumber + [char]9 + $_.Line }\"",
-                tmpfile, filelist, sm);
-        }
+    const char *with_filter =
+        "powershell -NoProfile -NonInteractive -Command \"$ErrorActionPreference = 'Stop'; "
+        "$utf8 = [Text.UTF8Encoding]::new($false, $true); "
+        "$pat = [IO.File]::ReadAllText('%s', $utf8); "
+        "Get-Content -LiteralPath '%s' -Encoding UTF8 | ForEach-Object { "
+        "Select-String -LiteralPath $_ -Pattern $pat%s -ErrorAction Stop } "
+        "| Where-Object { $_.Path -like '*%s' } "
+        "| ForEach-Object { [ordered]@{path=$_.Path;line=[int64]$_.LineNumber;content=$_.Line} "
+        "| ConvertTo-Json -Compress }\"";
+    const char *without_filter =
+        "powershell -NoProfile -NonInteractive -Command \"$ErrorActionPreference = 'Stop'; "
+        "$utf8 = [Text.UTF8Encoding]::new($false, $true); "
+        "$pat = [IO.File]::ReadAllText('%s', $utf8); "
+        "Get-Content -LiteralPath '%s' -Encoding UTF8 | ForEach-Object { "
+        "Select-String -LiteralPath $_ -Pattern $pat%s -ErrorAction Stop } "
+        "| ForEach-Object { [ordered]@{path=$_.Path;line=[int64]$_.LineNumber;content=$_.Line} "
+        "| ConvertTo-Json -Compress }\"";
+    const char *format = file_pattern ? with_filter : without_filter;
+    size_t needed = strlen(format) + strlen(tmpfile) + strlen(filelist) + strlen(sm) +
+                    (file_pattern ? strlen(file_pattern) : 0) + MCP_SEPARATOR;
+    char *cmd = malloc(needed);
+    if (!cmd) {
+        return NULL;
+    }
+    if (file_pattern) {
+        snprintf(cmd, needed, format, tmpfile, filelist, sm, file_pattern);
     } else {
-        if (file_pattern) {
-            snprintf(
-                cmd, cmd_sz,
-                "powershell -Command \"Get-ChildItem -Recurse -Path '%s\\*' -Include '%s' -File "
-                "-ErrorAction SilentlyContinue"
-                " | Select-String -Pattern (Get-Content '%s')%s -ErrorAction SilentlyContinue"
-                " | ForEach-Object { $_.Path + [char]9 + $_.LineNumber + [char]9 + $_.Line }\"",
-                root_path, file_pattern, tmpfile, sm);
-        } else {
-            snprintf(
-                cmd, cmd_sz,
-                "powershell -Command \"Get-ChildItem -Recurse -Path '%s\\*' -File -ErrorAction "
-                "SilentlyContinue"
-                " | Select-String -Pattern (Get-Content '%s')%s -ErrorAction SilentlyContinue"
-                " | ForEach-Object { $_.Path + [char]9 + $_.LineNumber + [char]9 + $_.Line }\"",
-                root_path, tmpfile, sm);
-        }
+        snprintf(cmd, needed, format, tmpfile, filelist, sm);
     }
 #else
     const char *flag = use_regex ? "-E" : "-F";
-    if (scoped) {
-        if (file_pattern) {
-            /* -0: read NUL-separated paths from the filelist so paths containing
-             * spaces stay one argument (issue #687). Pairs with the NUL separator
-             * written by write_scoped_filelist. */
-            snprintf(cmd, cmd_sz, "xargs -0 grep -Hn %s --include='%s' -f '%s' < '%s' 2>/dev/null",
-                     flag, file_pattern, tmpfile, filelist);
-        } else {
-            snprintf(cmd, cmd_sz, "xargs -0 grep -Hn %s -f '%s' < '%s' 2>/dev/null", flag, tmpfile,
-                     filelist);
-        }
+    size_t needed = strlen(tmpfile) + strlen(filelist) + strlen(flag) +
+                    (file_pattern ? strlen(file_pattern) : 0) + CBM_SZ_256;
+    char *cmd = malloc(needed);
+    if (!cmd) {
+        return NULL;
+    }
+    if (file_pattern) {
+        /* -0: read NUL-separated paths from the filelist so paths containing
+         * spaces stay one argument (issue #687). Pairs with the NUL separator
+         * written by write_scoped_filelist. */
+        snprintf(cmd, needed, "xargs -0 grep -Hn %s --include='%s' -f '%s' < '%s'", flag,
+                 file_pattern, tmpfile, filelist);
     } else {
-        if (file_pattern) {
-            snprintf(cmd, cmd_sz, "grep -rn %s --include='%s' -f '%s' '%s' 2>/dev/null", flag,
-                     file_pattern, tmpfile, root_path);
-        } else {
-            snprintf(cmd, cmd_sz, "grep -rn %s -f '%s' '%s' 2>/dev/null", flag, tmpfile, root_path);
-        }
+        snprintf(cmd, needed, "xargs -0 grep -Hn %s -f '%s' < '%s'", flag, tmpfile, filelist);
     }
 #endif
+    return cmd;
 }
 
 /* Build deduplicated file list from search results + raw matches. */
 static yyjson_mut_val *build_dedup_files_array(yyjson_mut_doc *doc, search_result_t *sr,
-                                               int output_count, grep_match_t *raw, int raw_count) {
+                                               int output_count, grep_match_t **raw,
+                                               int raw_count) {
     yyjson_mut_val *files_arr = yyjson_mut_arr(doc);
-    char *seen_files[CBM_SZ_512];
-    int seen_count = 0;
     for (int fi = 0; fi < output_count; fi++) {
         bool dup = false;
-        for (int j = 0; j < seen_count; j++) {
-            if (strcmp(seen_files[j], sr[fi].file) == 0) {
-                dup = true;
-                break;
-            }
-        }
-        if (!dup && seen_count < CBM_SZ_512) {
-            seen_files[seen_count++] = sr[fi].file;
-            yyjson_mut_arr_add_str(doc, files_arr, sr[fi].file);
-        }
-    }
-    for (int fi = 0; fi < raw_count && seen_count < CBM_SZ_512; fi++) {
-        bool dup = false;
-        for (int j = 0; j < seen_count; j++) {
-            if (strcmp(seen_files[j], raw[fi].file) == 0) {
+        for (int j = 0; j < fi; j++) {
+            if (strcmp(sr[j].file, sr[fi].file) == 0) {
                 dup = true;
                 break;
             }
         }
         if (!dup) {
-            seen_files[seen_count++] = raw[fi].file;
-            yyjson_mut_arr_add_str(doc, files_arr, raw[fi].file);
+            yyjson_mut_arr_add_str(doc, files_arr, sr[fi].file);
+        }
+    }
+    for (int fi = 0; fi < raw_count; fi++) {
+        bool dup = false;
+        for (int j = 0; j < output_count; j++) {
+            if (strcmp(sr[j].file, raw[fi]->file) == 0) {
+                dup = true;
+                break;
+            }
+        }
+        for (int j = 0; !dup && j < fi; j++) {
+            if (strcmp(raw[j]->file, raw[fi]->file) == 0) {
+                dup = true;
+            }
+        }
+        if (!dup) {
+            yyjson_mut_arr_add_str(doc, files_arr, raw[fi]->file);
         }
     }
     return files_arr;
 }
 
 /* Attach source or context lines to a search result JSON item. */
-static void attach_result_source(yyjson_mut_doc *doc, yyjson_mut_val *item, search_result_t *r,
-                                 int mode, int context_lines, const char *root_path) {
+static bool attach_result_source(yyjson_mut_doc *doc, yyjson_mut_val *item, search_result_t *r,
+                                 int mode, int context_lines, const char *root_path,
+                                 search_response_error_t *error) {
     enum { MODE_FULL = 1 };
     if (r->start_line <= 0 || r->end_line <= 0) {
-        return;
+        return true;
     }
-    char abs_path[CBM_SZ_1K];
-    snprintf(abs_path, sizeof(abs_path), "%s/%s", root_path, r->file);
+    if (mode != MODE_FULL && context_lines <= 0) {
+        return true;
+    }
+    size_t root_len = strlen(root_path);
+    size_t file_len = strlen(r->file);
+    if (root_len > SIZE_MAX - file_len - MCP_SEPARATOR) {
+        snprintf(error->operation, sizeof(error->operation), "%s", "response.build_source_path");
+        snprintf(error->detail, sizeof(error->detail), "%s",
+                 "source path exceeds addressable memory");
+        return false;
+    }
+    size_t abs_len = root_len + file_len + MCP_SEPARATOR;
+    char *abs_path = malloc(abs_len);
+    if (!abs_path) {
+        snprintf(error->operation, sizeof(error->operation), "%s", "response.allocate_source_path");
+        snprintf(error->detail, sizeof(error->detail), "source-path allocation failed at %zu bytes",
+                 abs_len);
+        return false;
+    }
+    snprintf(abs_path, abs_len, "%s/%s", root_path, r->file);
 
     /* Containment: a search result whose indexed path resolves outside the
      * project root (a `..` segment, or a symlink/junction that discovery
      * followed) must not be read back into the response. Same guard the
      * snippet path already uses. */
     if (!cbm_path_within_root(root_path, abs_path)) {
-        return;
+        snprintf(error->operation, sizeof(error->operation), "%s", "response.validate_source_path");
+        snprintf(error->detail, sizeof(error->detail),
+                 "indexed source path resolves outside the project root: %.400s", r->file);
+        free(abs_path);
+        return false;
     }
 
     if (mode == MODE_FULL) {
         char *source = read_file_lines(abs_path, r->start_line, r->end_line);
-        if (source) {
-            sanitize_ascii(source);
-            yyjson_mut_obj_add_strcpy(doc, item, "source", source);
-            free(source);
+        if (!source) {
+            snprintf(error->operation, sizeof(error->operation), "%s", "response.read_source");
+            snprintf(error->detail, sizeof(error->detail), "source readback failed for %.360s: %s",
+                     abs_path, strerror(errno));
+            free(abs_path);
+            return false;
         }
+        yyjson_mut_obj_add_strcpy(doc, item, "source", source);
+        free(source);
     } else if (context_lines > 0 && r->match_count > 0) {
         int ctx_start = r->match_lines[0] - context_lines;
+        if (r->match_lines[r->match_count - SKIP_ONE] > INT_MAX - context_lines) {
+            snprintf(error->operation, sizeof(error->operation), "%s",
+                     "response.compute_context_range");
+            snprintf(error->detail, sizeof(error->detail), "%s",
+                     "context range exceeds the representable line-number range");
+            free(abs_path);
+            return false;
+        }
         int ctx_end = r->match_lines[r->match_count - SKIP_ONE] + context_lines;
         if (ctx_start < SKIP_ONE) {
             ctx_start = SKIP_ONE;
         }
         char *ctx = read_file_lines(abs_path, ctx_start, ctx_end);
-        if (ctx) {
-            sanitize_ascii(ctx);
-            yyjson_mut_obj_add_strcpy(doc, item, "context", ctx);
-            yyjson_mut_obj_add_int(doc, item, "context_start", ctx_start);
-            free(ctx);
+        if (!ctx) {
+            snprintf(error->operation, sizeof(error->operation), "%s", "response.read_context");
+            snprintf(error->detail, sizeof(error->detail), "context readback failed for %.360s: %s",
+                     abs_path, strerror(errno));
+            free(abs_path);
+            return false;
         }
+        yyjson_mut_obj_add_strcpy(doc, item, "context", ctx);
+        yyjson_mut_obj_add_int(doc, item, "context_start", ctx_start);
+        free(ctx);
     }
+    free(abs_path);
+    return true;
 }
 
 /* Build directory distribution object from search results (top-level dir → count). */
 static yyjson_mut_val *build_dir_distribution(yyjson_mut_doc *doc, search_result_t *sr,
                                               int sr_count) {
     yyjson_mut_val *dirs = yyjson_mut_obj(doc);
-    char dir_names[CBM_SZ_64][CBM_SZ_128];
-    int dir_counts[CBM_SZ_64];
+    if (!dirs) {
+        return NULL;
+    }
+    char **dir_names = sr_count > 0 ? calloc((size_t)sr_count, sizeof(char *)) : NULL;
+    int *dir_counts = sr_count > 0 ? calloc((size_t)sr_count, sizeof(int)) : NULL;
+    if (sr_count > 0 && (!dir_names || !dir_counts)) {
+        free(dir_names);
+        free(dir_counts);
+        return NULL;
+    }
     int dir_n = 0;
     for (int di = 0; di < sr_count; di++) {
-        char top[CBM_SZ_128] = "";
         const char *slash = strchr(sr[di].file, '/');
-        if (slash) {
-            size_t dlen = (size_t)(slash - sr[di].file + SKIP_ONE);
-            if (dlen >= sizeof(top)) {
-                dlen = sizeof(top) - SKIP_ONE;
+        size_t dlen = slash ? (size_t)(slash - sr[di].file + SKIP_ONE) : strlen(sr[di].file);
+        char *top = malloc(dlen + SKIP_ONE);
+        if (!top) {
+            for (int d = 0; d < dir_n; d++) {
+                free(dir_names[d]);
             }
-            memcpy(top, sr[di].file, dlen);
-            top[dlen] = '\0';
-        } else {
-            snprintf(top, sizeof(top), "%s", sr[di].file);
+            free(dir_names);
+            free(dir_counts);
+            return NULL;
         }
+        memcpy(top, sr[di].file, dlen);
+        top[dlen] = '\0';
         int found = CBM_NOT_FOUND;
         for (int d = 0; d < dir_n; d++) {
             if (strcmp(dir_names[d], top) == 0) {
@@ -5304,8 +5340,9 @@ static yyjson_mut_val *build_dir_distribution(yyjson_mut_doc *doc, search_result
         }
         if (found >= 0) {
             dir_counts[found]++;
-        } else if (dir_n < CBM_SZ_64) {
-            snprintf(dir_names[dir_n], sizeof(dir_names[0]), "%s", top);
+            free(top);
+        } else {
+            dir_names[dir_n] = top;
             dir_counts[dir_n] = SKIP_ONE;
             dir_n++;
         }
@@ -5314,26 +5351,56 @@ static yyjson_mut_val *build_dir_distribution(yyjson_mut_doc *doc, search_result
         yyjson_mut_val *key = yyjson_mut_strcpy(doc, dir_names[d]);
         yyjson_mut_val *val = yyjson_mut_int(doc, dir_counts[d]);
         yyjson_mut_obj_add(dirs, key, val);
+        free(dir_names[d]);
     }
+    free(dir_names);
+    free(dir_counts);
     return dirs;
 }
 
 /* Phase 4: assemble JSON output from search results */
-static char *assemble_search_output(search_result_t *sr, int sr_count, grep_match_t *raw,
+static char *assemble_search_output(search_result_t *sr, int sr_count, grep_match_t **raw,
                                     int raw_count, int gm_count, int limit, int mode,
                                     int context_lines, const char *root_path,
                                     bool warn_literal_pipe, uint64_t elapsed_ms) {
     enum { MODE_COMPACT = 0, MODE_FULL = 1, MODE_FILES = 2, SEARCH_SLOW_MS = 5000 };
 
     yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    if (!doc) {
+        return cbm_mcp_text_result(
+            "{\"code\":\"CBM_SEARCH_SERIALIZATION_FAILED\",\"message\":\"search response "
+            "document allocation failed\",\"remediation\":\"free memory and retry the exact "
+            "search\"}",
+            true);
+    }
     yyjson_mut_val *root_obj = yyjson_mut_obj(doc);
+    if (!root_obj) {
+        yyjson_mut_doc_free(doc);
+        return cbm_mcp_text_result(
+            "{\"code\":\"CBM_SEARCH_SERIALIZATION_FAILED\",\"message\":\"search response "
+            "root allocation failed\",\"remediation\":\"free memory and retry the exact "
+            "search\"}",
+            true);
+    }
     yyjson_mut_doc_set_root(doc, root_obj);
 
     int output_count = sr_count < limit ? sr_count : limit;
+    search_response_error_t response_error = {0};
 
     if (mode == MODE_FILES) {
-        yyjson_mut_obj_add_val(doc, root_obj, "files",
-                               build_dedup_files_array(doc, sr, output_count, raw, raw_count));
+        yyjson_mut_val *files = build_dedup_files_array(doc, sr, output_count, raw, raw_count);
+        if (!files) {
+            yyjson_mut_doc_free(doc);
+            search_response_error_t allocation_error = {0};
+            snprintf(allocation_error.operation, sizeof(allocation_error.operation), "%s",
+                     "response.build_file_list");
+            snprintf(allocation_error.detail, sizeof(allocation_error.detail), "%s",
+                     "file-list response allocation failed");
+            return search_operation_error_result(
+                "CBM_SEARCH_SERIALIZATION_FAILED", "search response allocation failed",
+                "free memory and retry the exact search", &allocation_error);
+        }
+        yyjson_mut_obj_add_val(doc, root_obj, "files", files);
     } else {
         yyjson_mut_val *results_arr = yyjson_mut_arr(doc);
         for (int ri = 0; ri < output_count; ri++) {
@@ -5354,7 +5421,15 @@ static char *assemble_search_output(search_result_t *sr, int sr_count, grep_matc
                 yyjson_mut_arr_add_int(doc, ml, r->match_lines[j]);
             }
             yyjson_mut_obj_add_val(doc, item, "match_lines", ml);
-            attach_result_source(doc, item, r, mode, context_lines, root_path);
+            if (!attach_result_source(doc, item, r, mode, context_lines, root_path,
+                                      &response_error)) {
+                yyjson_mut_doc_free(doc);
+                return search_operation_error_result(
+                    "CBM_SEARCH_SOURCE_READBACK_FAILED",
+                    "search response could not read the exact indexed source bytes",
+                    "restore the indexed source revision or re-index it, then retry",
+                    &response_error);
+            }
             yyjson_mut_arr_add_val(results_arr, item);
         }
         yyjson_mut_obj_add_val(doc, root_obj, "results", results_arr);
@@ -5364,15 +5439,28 @@ static char *assemble_search_output(search_result_t *sr, int sr_count, grep_matc
         int raw_output = raw_count < MAX_RAW ? raw_count : MAX_RAW;
         for (int ri = 0; ri < raw_output; ri++) {
             yyjson_mut_val *item = yyjson_mut_obj(doc);
-            yyjson_mut_obj_add_str(doc, item, "file", raw[ri].file);
-            yyjson_mut_obj_add_int(doc, item, "line", raw[ri].line);
-            yyjson_mut_obj_add_str(doc, item, "content", raw[ri].content);
+            yyjson_mut_obj_add_str(doc, item, "file", raw[ri]->file);
+            yyjson_mut_obj_add_int(doc, item, "line", raw[ri]->line);
+            yyjson_mut_obj_add_str(doc, item, "content", raw[ri]->content);
             yyjson_mut_arr_add_val(raw_arr, item);
         }
         yyjson_mut_obj_add_val(doc, root_obj, "raw_matches", raw_arr);
+        yyjson_mut_obj_add_bool(doc, root_obj, "raw_matches_truncated", raw_output < raw_count);
     }
 
-    yyjson_mut_obj_add_val(doc, root_obj, "directories", build_dir_distribution(doc, sr, sr_count));
+    yyjson_mut_val *directories = build_dir_distribution(doc, sr, sr_count);
+    if (!directories) {
+        yyjson_mut_doc_free(doc);
+        search_response_error_t allocation_error = {0};
+        snprintf(allocation_error.operation, sizeof(allocation_error.operation), "%s",
+                 "response.build_directory_distribution");
+        snprintf(allocation_error.detail, sizeof(allocation_error.detail), "%s",
+                 "directory-distribution allocation failed");
+        return search_operation_error_result(
+            "CBM_SEARCH_SERIALIZATION_FAILED", "search response allocation failed",
+            "free memory and retry the exact search", &allocation_error);
+    }
+    yyjson_mut_obj_add_val(doc, root_obj, "directories", directories);
 
     /* Summary stats */
     yyjson_mut_obj_add_int(doc, root_obj, "total_grep_matches", gm_count);
@@ -5409,10 +5497,15 @@ static char *assemble_search_output(search_result_t *sr, int sr_count, grep_matc
     }
 
     char *json = yy_doc_to_str(doc);
-    if (json) {
-        sanitize_ascii(json);
-    }
     yyjson_mut_doc_free(doc);
+
+    if (!json) {
+        return cbm_mcp_text_result(
+            "{\"code\":\"CBM_SEARCH_SERIALIZATION_FAILED\",\"message\":\"search response "
+            "serialization failed\",\"remediation\":\"free memory and retry the exact "
+            "search\"}",
+            true);
+    }
 
     char *result = cbm_mcp_text_result(json, false);
     free(json);
@@ -5423,7 +5516,7 @@ static char *assemble_search_output(search_result_t *sr, int sr_count, grep_matc
  * and return a dynamically-allocated grep_match_t array. */
 /* Strip root path prefix from a file path. */
 static const char *strip_root_prefix(const char *path, const char *root, size_t root_len) {
-    if (strncmp(path, root, root_len) != 0) {
+    if (strncmp(path, root, root_len) != 0 || (path[root_len] != '\0' && path[root_len] != '/')) {
         return path;
     }
     const char *p = path + root_len;
@@ -5433,61 +5526,299 @@ static const char *strip_root_prefix(const char *path, const char *root, size_t 
     return p;
 }
 
+typedef enum {
+    SEARCH_COLLECT_OK = 0,
+    SEARCH_COLLECT_IO_FAILED,
+    SEARCH_COLLECT_MALFORMED,
+    SEARCH_COLLECT_OOM,
+} search_collect_status_t;
+
+typedef struct {
+    search_collect_status_t status;
+    char operation[CBM_SZ_64];
+    char detail[CBM_SZ_512];
+} search_collect_result_t;
+
+static void free_grep_matches(grep_match_t *matches, int count) {
+    if (!matches) {
+        return;
+    }
+    for (int i = 0; i < count; i++) {
+        free(matches[i].file);
+        free(matches[i].content);
+    }
+    free(matches);
+}
+
+/* Read one complete subprocess record without a fixed line buffer.  Returns 1
+ * for a record, 0 for clean EOF, and -1 for an explicit I/O/allocation/format
+ * failure recorded in result. */
+static int read_search_record(FILE *fp, char **buffer, size_t *capacity, size_t *length,
+                              search_collect_result_t *result) {
+    *length = 0;
+    for (;;) {
+        int ch = fgetc(fp);
+        if (ch == EOF) {
+            if (ferror(fp)) {
+                result->status = SEARCH_COLLECT_IO_FAILED;
+                snprintf(result->operation, sizeof(result->operation), "%s",
+                         "search.read_process_output");
+                snprintf(result->detail, sizeof(result->detail), "output read failed: %s",
+                         strerror(errno));
+                return CBM_NOT_FOUND;
+            }
+            if (*length == 0) {
+                return 0;
+            }
+            break;
+        }
+        if (ch == '\0') {
+            result->status = SEARCH_COLLECT_MALFORMED;
+            snprintf(result->operation, sizeof(result->operation), "%s",
+                     "search.parse_process_output");
+            snprintf(result->detail, sizeof(result->detail), "%s",
+                     "search output contained an embedded NUL byte");
+            return CBM_NOT_FOUND;
+        }
+        if (ch == '\n') {
+            break;
+        }
+        if (*length + MCP_SEPARATOR > *capacity) {
+            size_t next = *capacity ? *capacity * PAIR_LEN : CBM_SZ_4K;
+            if (next <= *capacity || next > SIZE_MAX - SKIP_ONE) {
+                result->status = SEARCH_COLLECT_OOM;
+                snprintf(result->operation, sizeof(result->operation), "%s",
+                         "search.grow_process_record");
+                snprintf(result->detail, sizeof(result->detail), "%s",
+                         "search output record exceeds addressable memory");
+                return CBM_NOT_FOUND;
+            }
+            char *grown = realloc(*buffer, next);
+            if (!grown) {
+                result->status = SEARCH_COLLECT_OOM;
+                snprintf(result->operation, sizeof(result->operation), "%s",
+                         "search.grow_process_record");
+                snprintf(result->detail, sizeof(result->detail),
+                         "record allocation failed at %zu bytes", next);
+                return CBM_NOT_FOUND;
+            }
+            *buffer = grown;
+            *capacity = next;
+        }
+        (*buffer)[(*length)++] = (char)ch;
+    }
+    if (*length > 0 && (*buffer)[*length - SKIP_ONE] == '\r') {
+        (*length)--;
+    }
+    (*buffer)[*length] = '\0';
+    return SKIP_ONE;
+}
+
+static int grep_match_file_cmp(const void *left, const void *right) {
+    const grep_match_t *a = left;
+    const grep_match_t *b = right;
+    return strcmp(a->file, b->file);
+}
+
 static grep_match_t *collect_grep_matches(FILE *fp, const char *root_path, size_t root_len,
                                           bool has_path_filter, cbm_regex_t *path_regex,
-                                          int grep_limit, int *out_count) {
-    int gm_cap = CBM_SZ_64;
-    int gm_count = 0;
-    grep_match_t *gm = malloc(gm_cap * sizeof(grep_match_t));
-    char line[CBM_SZ_2K];
+                                          int *out_count, search_collect_result_t *result) {
+    memset(result, 0, sizeof(*result));
+    *out_count = 0;
+    grep_match_t *matches = NULL;
+    int count = 0;
+    int capacity = 0;
+    char *record = NULL;
+    size_t record_capacity = 0;
+    size_t record_length = 0;
 
-    while (fgets(line, sizeof(line), fp) && gm_count < grep_limit) {
-        size_t len = strlen(line);
-        while (len > 0 && (line[len - SKIP_ONE] == '\n' || line[len - SKIP_ONE] == '\r')) {
-            line[--len] = '\0';
+    for (;;) {
+        int read_rc = read_search_record(fp, &record, &record_capacity, &record_length, result);
+        if (read_rc == 0) {
+            break;
         }
-        if (len == 0) {
-            continue;
+        if (read_rc < 0) {
+            free(record);
+            free_grep_matches(matches, count);
+            return NULL;
+        }
+        if (record_length == 0) {
+            result->status = SEARCH_COLLECT_MALFORMED;
+            snprintf(result->operation, sizeof(result->operation), "%s",
+                     "search.parse_process_output");
+            snprintf(result->detail, sizeof(result->detail),
+                     "empty JSON record at output record %d", count + SKIP_ONE);
+            free(record);
+            free_grep_matches(matches, count);
+            return NULL;
         }
 
-        /* PowerShell output uses tab as delimiter (paths may contain colons
-         * on Windows, e.g. C:\dir\file). Unix grep uses colon. */
 #ifdef _WIN32
-        char sep = '\t';
+        yyjson_doc *doc = yyjson_read(record, record_length, 0);
+        yyjson_val *root = doc ? yyjson_doc_get_root(doc) : NULL;
+        yyjson_val *path_value = root ? yyjson_obj_get(root, "path") : NULL;
+        yyjson_val *line_value = root ? yyjson_obj_get(root, "line") : NULL;
+        yyjson_val *content_value = root ? yyjson_obj_get(root, "content") : NULL;
+        if (!root || !yyjson_is_obj(root) || !path_value || !yyjson_is_str(path_value) ||
+            !line_value || !yyjson_is_int(line_value) || !content_value ||
+            !yyjson_is_str(content_value)) {
+            result->status = SEARCH_COLLECT_MALFORMED;
+            snprintf(result->operation, sizeof(result->operation), "%s",
+                     "search.parse_process_output");
+            snprintf(result->detail, sizeof(result->detail),
+                     "invalid JSON schema at output record %d", count + SKIP_ONE);
+            if (doc) {
+                yyjson_doc_free(doc);
+            }
+            free(record);
+            free_grep_matches(matches, count);
+            return NULL;
+        }
+        int64_t line_number = yyjson_get_sint(line_value);
+        if (line_number <= 0 || line_number > INT_MAX) {
+            result->status = SEARCH_COLLECT_MALFORMED;
+            snprintf(result->operation, sizeof(result->operation), "%s",
+                     "search.parse_process_output");
+            snprintf(result->detail, sizeof(result->detail),
+                     "line number out of range at output record %d", count + SKIP_ONE);
+            yyjson_doc_free(doc);
+            free(record);
+            free_grep_matches(matches, count);
+            return NULL;
+        }
+        char *path = heap_strdup(yyjson_get_str(path_value));
+        char *content = heap_strdup(yyjson_get_str(content_value));
+        yyjson_doc_free(doc);
 #else
-        char sep = ':';
+        char *sep1 = strchr(record, ':');
+        char *sep2 = sep1 ? strchr(sep1 + SKIP_ONE, ':') : NULL;
+        char *endptr = NULL;
+        long parsed_line = 0;
+        if (sep1 && sep2) {
+            *sep1 = '\0';
+            *sep2 = '\0';
+            errno = 0;
+            parsed_line = strtol(sep1 + SKIP_ONE, &endptr, CBM_DECIMAL_BASE);
+        }
+        if (!sep1 || !sep2 || errno != 0 || !endptr || *endptr != '\0' || parsed_line <= 0 ||
+            parsed_line > INT_MAX) {
+            result->status = SEARCH_COLLECT_MALFORMED;
+            snprintf(result->operation, sizeof(result->operation), "%s",
+                     "search.parse_process_output");
+            snprintf(result->detail, sizeof(result->detail), "invalid grep record %d",
+                     count + SKIP_ONE);
+            free(record);
+            free_grep_matches(matches, count);
+            return NULL;
+        }
+        int64_t line_number = parsed_line;
+        char *path = heap_strdup(record);
+        char *content = heap_strdup(sep2 + SKIP_ONE);
 #endif
-        char *sep1 = strchr(line, (unsigned char)sep);
-        if (!sep1) {
-            continue;
+        if (!path || !content) {
+            free(path);
+            free(content);
+            result->status = SEARCH_COLLECT_OOM;
+            snprintf(result->operation, sizeof(result->operation), "%s",
+                     "search.copy_process_record");
+            snprintf(result->detail, sizeof(result->detail),
+                     "record allocation failed at output record %d", count + SKIP_ONE);
+            free(record);
+            free_grep_matches(matches, count);
+            return NULL;
         }
-        char *sep2 = strchr(sep1 + SKIP_ONE, (unsigned char)sep);
-        if (!sep2) {
-            continue;
-        }
-        *sep1 = '\0';
-        *sep2 = '\0';
-
 #ifdef _WIN32
-        cbm_normalize_path_sep(line);
+        cbm_normalize_path_sep(path);
 #endif
-        const char *path = line;
-        const char *file = strip_root_prefix(path, root_path, root_len);
-
-        if (has_path_filter && cbm_regexec(path_regex, file, 0, NULL, 0) != CBM_REG_OK) {
-            continue;
+        const char *relative = strip_root_prefix(path, root_path, root_len);
+        if (relative == path || !cbm_path_within_root(root_path, path)) {
+            result->status = SEARCH_COLLECT_MALFORMED;
+            snprintf(result->operation, sizeof(result->operation), "%s",
+                     "search.validate_process_path");
+            snprintf(result->detail, sizeof(result->detail),
+                     "search output path is outside the indexed project root: %.400s", path);
+            free(path);
+            free(content);
+            free(record);
+            free_grep_matches(matches, count);
+            return NULL;
         }
-
-        safe_grow(gm, gm_count, gm_cap, PAIR_LEN);
-        snprintf(gm[gm_count].file, sizeof(gm[0].file), "%s", file);
-        gm[gm_count].line = (int)strtol(sep1 + SKIP_ONE, NULL, CBM_DECIMAL_BASE);
-        snprintf(gm[gm_count].content, sizeof(gm[0].content), "%s", sep2 + SKIP_ONE);
-        sanitize_ascii(gm[gm_count].content);
-        gm_count++;
+        if (has_path_filter && cbm_regexec(path_regex, relative, 0, NULL, 0) != CBM_REG_OK) {
+            result->status = SEARCH_COLLECT_MALFORMED;
+            snprintf(result->operation, sizeof(result->operation), "%s",
+                     "search.validate_process_scope");
+            snprintf(result->detail, sizeof(result->detail),
+                     "search process returned a path excluded by path_filter: %.400s", relative);
+            free(path);
+            free(content);
+            free(record);
+            free_grep_matches(matches, count);
+            return NULL;
+        }
+        char *relative_copy = heap_strdup(relative);
+        free(path);
+        if (!relative_copy) {
+            free(content);
+            result->status = SEARCH_COLLECT_OOM;
+            snprintf(result->operation, sizeof(result->operation), "%s",
+                     "search.copy_relative_path");
+            snprintf(result->detail, sizeof(result->detail), "%s",
+                     "relative-path allocation failed");
+            free(record);
+            free_grep_matches(matches, count);
+            return NULL;
+        }
+        if (count == INT_MAX) {
+            free(relative_copy);
+            free(content);
+            result->status = SEARCH_COLLECT_OOM;
+            snprintf(result->operation, sizeof(result->operation), "%s", "search.count_matches");
+            snprintf(result->detail, sizeof(result->detail), "%s",
+                     "match count exceeds the representable API range");
+            free(record);
+            free_grep_matches(matches, count);
+            return NULL;
+        }
+        if (count >= capacity) {
+            int next = capacity ? capacity * PAIR_LEN : CBM_SZ_64;
+            if (next <= capacity || (size_t)next > SIZE_MAX / sizeof(*matches)) {
+                free(relative_copy);
+                free(content);
+                result->status = SEARCH_COLLECT_OOM;
+                snprintf(result->operation, sizeof(result->operation), "%s",
+                         "search.grow_match_set");
+                snprintf(result->detail, sizeof(result->detail), "%s",
+                         "match-set size exceeds addressable memory");
+                free(record);
+                free_grep_matches(matches, count);
+                return NULL;
+            }
+            grep_match_t *grown = realloc(matches, (size_t)next * sizeof(*matches));
+            if (!grown) {
+                free(relative_copy);
+                free(content);
+                result->status = SEARCH_COLLECT_OOM;
+                snprintf(result->operation, sizeof(result->operation), "%s",
+                         "search.grow_match_set");
+                snprintf(result->detail, sizeof(result->detail),
+                         "match-set allocation failed at %d records", next);
+                free(record);
+                free_grep_matches(matches, count);
+                return NULL;
+            }
+            matches = grown;
+            capacity = next;
+        }
+        matches[count].file = relative_copy;
+        matches[count].line = (int)line_number;
+        matches[count].content = content;
+        count++;
     }
 
-    *out_count = gm_count;
-    return gm;
+    free(record);
+    result->status = SEARCH_COLLECT_OK;
+    *out_count = count;
+    return matches;
 }
 
 /* Find the tightest node containing a line in a file. Returns index or -1. */
@@ -5507,51 +5838,108 @@ static int find_tightest_node(cbm_node_t *nodes, int count, int line) {
 }
 
 /* Add a grep hit to the search result set (merge into existing or create new). */
-static void add_to_search_results(search_result_t **sr, int *sr_count, int *sr_cap, cbm_node_t *n,
+static bool add_search_match_line(search_result_t *result, int line) {
+    if (result->match_count >= result->match_cap) {
+        int next = result->match_cap ? result->match_cap * PAIR_LEN : 8;
+        if (next <= result->match_cap || (size_t)next > SIZE_MAX / sizeof(int)) {
+            return false;
+        }
+        int *grown = realloc(result->match_lines, (size_t)next * sizeof(int));
+        if (!grown) {
+            return false;
+        }
+        result->match_lines = grown;
+        result->match_cap = next;
+    }
+    result->match_lines[result->match_count++] = line;
+    return true;
+}
+
+static bool add_to_search_results(search_result_t **sr, int *sr_count, int *sr_cap, cbm_node_t *n,
                                   int line) {
     for (int j = 0; j < *sr_count; j++) {
         if ((*sr)[j].node_id == n->id) {
-            if ((*sr)[j].match_count < CBM_SZ_64) {
-                (*sr)[j].match_lines[(*sr)[j].match_count++] = line;
-            }
-            return;
+            return add_search_match_line(&(*sr)[j], line);
         }
     }
     if (*sr_count >= *sr_cap) {
-        *sr_cap *= PAIR_LEN;
-        *sr = safe_realloc(*sr, *sr_cap * sizeof(search_result_t));
-        memset(&(*sr)[*sr_count], 0, (*sr_cap - *sr_count) * sizeof(search_result_t));
+        int next = *sr_cap ? *sr_cap * PAIR_LEN : CBM_SZ_32;
+        if (next <= *sr_cap || (size_t)next > SIZE_MAX / sizeof(search_result_t)) {
+            return false;
+        }
+        search_result_t *grown = realloc(*sr, (size_t)next * sizeof(search_result_t));
+        if (!grown) {
+            return false;
+        }
+        memset(grown + *sr_cap, 0, (size_t)(next - *sr_cap) * sizeof(search_result_t));
+        *sr = grown;
+        *sr_cap = next;
     }
     search_result_t *r = &(*sr)[*sr_count];
     r->node_id = n->id;
-    snprintf(r->node_name, sizeof(r->node_name), "%s", n->name ? n->name : "");
-    snprintf(r->qualified_name, sizeof(r->qualified_name), "%s",
-             n->qualified_name ? n->qualified_name : "");
-    snprintf(r->label, sizeof(r->label), "%s", n->label ? n->label : "");
-    snprintf(r->file, sizeof(r->file), "%s", n->file_path ? n->file_path : "");
+    r->node_name = heap_strdup(n->name ? n->name : "");
+    r->qualified_name = heap_strdup(n->qualified_name ? n->qualified_name : "");
+    r->label = heap_strdup(n->label ? n->label : "");
+    r->file = heap_strdup(n->file_path ? n->file_path : "");
+    if (!r->node_name || !r->qualified_name || !r->label || !r->file) {
+        free(r->node_name);
+        free(r->qualified_name);
+        free(r->label);
+        free(r->file);
+        memset(r, 0, sizeof(*r));
+        return false;
+    }
     r->start_line = n->start_line;
     r->end_line = n->end_line;
-    r->match_lines[0] = line;
-    r->match_count = SKIP_ONE;
+    if (!add_search_match_line(r, line)) {
+        free(r->node_name);
+        free(r->qualified_name);
+        free(r->label);
+        free(r->file);
+        memset(r, 0, sizeof(*r));
+        return false;
+    }
     (*sr_count)++;
+    return true;
 }
 
 /* Match a single grep hit to the tightest containing node, then add to sr or raw. */
-static void classify_grep_hit(grep_match_t *hit, cbm_node_t *file_nodes, int file_node_count,
-                              search_result_t **sr, int *sr_count, int *sr_cap, grep_match_t **raw,
+static bool classify_grep_hit(grep_match_t *hit, cbm_node_t *file_nodes, int file_node_count,
+                              search_result_t **sr, int *sr_count, int *sr_cap, grep_match_t ***raw,
                               int *raw_count, int *raw_cap) {
     int best = find_tightest_node(file_nodes, file_node_count, hit->line);
     if (best >= 0) {
-        add_to_search_results(sr, sr_count, sr_cap, &file_nodes[best], hit->line);
+        return add_to_search_results(sr, sr_count, sr_cap, &file_nodes[best], hit->line);
     } else {
         if (*raw_count >= *raw_cap) {
-            *raw_cap = (*raw_cap == 0) ? CBM_SZ_32 : *raw_cap * PAIR_LEN;
-            *raw = safe_realloc(*raw, *raw_cap * sizeof(grep_match_t));
+            int next = (*raw_cap == 0) ? CBM_SZ_32 : *raw_cap * PAIR_LEN;
+            if (next <= *raw_cap || (size_t)next > SIZE_MAX / sizeof(grep_match_t *)) {
+                return false;
+            }
+            grep_match_t **grown = realloc(*raw, (size_t)next * sizeof(grep_match_t *));
+            if (!grown) {
+                return false;
+            }
+            *raw = grown;
+            *raw_cap = next;
         }
-        if (*raw) {
-            (*raw)[(*raw_count)++] = *hit;
-        }
+        (*raw)[(*raw_count)++] = hit;
+        return true;
     }
+}
+
+static void free_search_results(search_result_t *results, int count) {
+    if (!results) {
+        return;
+    }
+    for (int i = 0; i < count; i++) {
+        free(results[i].node_name);
+        free(results[i].qualified_name);
+        free(results[i].label);
+        free(results[i].file);
+        free(results[i].match_lines);
+    }
+    free(results);
 }
 
 /* Free a file_nodes array returned from cbm_store_find_nodes_by_file. */
@@ -5568,10 +5956,20 @@ static void free_file_nodes(cbm_node_t *nodes, int count) {
 }
 
 /* Classify all grep matches file-by-file into search results and raw hits. */
-static void classify_all_grep_hits(grep_match_t *gm, int gm_count, cbm_store_t *store,
-                                   const char *project, search_result_t **sr, int *sr_count,
-                                   int *sr_cap, grep_match_t **raw, int *raw_count, int *raw_cap) {
-    qsort(gm, gm_count, sizeof(grep_match_t), (int (*)(const void *, const void *))strcmp);
+static int classify_all_grep_hits(cbm_mcp_server_t *srv, grep_match_t *gm, int gm_count,
+                                  cbm_store_t *store, const char *project, search_result_t **sr,
+                                  int *sr_count, int *sr_cap, grep_match_t ***raw, int *raw_count,
+                                  int *raw_cap, search_collect_result_t *result) {
+    if (!store) {
+        result->status = SEARCH_COLLECT_IO_FAILED;
+        snprintf(result->operation, sizeof(result->operation), "%s", "enrichment.resolve_store");
+        snprintf(result->detail, sizeof(result->detail), "%s",
+                 "the verified project store is unavailable during enrichment");
+        return CBM_STORE_ERR;
+    }
+    if (gm_count > SKIP_ONE) {
+        qsort(gm, (size_t)gm_count, sizeof(grep_match_t), grep_match_file_cmp);
+    }
     int i = 0;
     while (i < gm_count) {
         const char *cur_file = gm[i].file;
@@ -5581,18 +5979,121 @@ static void classify_all_grep_hits(grep_match_t *gm, int gm_count, cbm_store_t *
         }
         cbm_node_t *file_nodes = NULL;
         int file_node_count = 0;
-        if (store) {
+        int query_rc =
             cbm_store_find_nodes_by_file(store, project, cur_file, &file_nodes, &file_node_count);
+        if (query_rc != CBM_STORE_OK) {
+            record_store_query_failure(
+                srv, project, cbm_store_db_path(store), store, CBM_STORE_VERIFY_IO_FAILED,
+                "source.query_nodes_for_search_file", cbm_store_error(store));
+            result->status = SEARCH_COLLECT_IO_FAILED;
+            snprintf(result->operation, sizeof(result->operation), "%s",
+                     "enrichment.query_file_nodes");
+            snprintf(result->detail, sizeof(result->detail),
+                     "file-node query failed for %.400s: %.80s", cur_file, cbm_store_error(store));
+            free_file_nodes(file_nodes, file_node_count);
+            return query_rc;
         }
         for (int mi = file_start; mi < i; mi++) {
-            classify_grep_hit(&gm[mi], file_nodes, file_node_count, sr, sr_count, sr_cap, raw,
-                              raw_count, raw_cap);
+            if (!classify_grep_hit(&gm[mi], file_nodes, file_node_count, sr, sr_count, sr_cap, raw,
+                                   raw_count, raw_cap)) {
+                result->status = SEARCH_COLLECT_OOM;
+                snprintf(result->operation, sizeof(result->operation), "%s",
+                         "enrichment.allocate_results");
+                snprintf(result->detail, sizeof(result->detail),
+                         "result allocation failed while classifying %.400s:%d", cur_file,
+                         gm[mi].line);
+                free_file_nodes(file_nodes, file_node_count);
+                return CBM_STORE_ERR;
+            }
         }
         free_file_nodes(file_nodes, file_node_count);
     }
+    return CBM_STORE_OK;
 }
 
-/* Write indexed file list for scoped grep. Returns true if scoped.
+typedef enum {
+    SEARCH_SCOPE_OK = 0,
+    SEARCH_SCOPE_STORE_FAILED,
+    SEARCH_SCOPE_EMPTY,
+    SEARCH_SCOPE_INVALID_PATH,
+    SEARCH_SCOPE_INVALID_SOURCE,
+    SEARCH_SCOPE_IO_FAILED,
+} search_scope_status_t;
+
+typedef struct {
+    search_scope_status_t status;
+    char operation[CBM_SZ_64];
+    char detail[CBM_SZ_512];
+} search_scope_result_t;
+
+static bool validate_utf8_source_file(const char *path, search_scope_result_t *result) {
+    FILE *fp = cbm_fopen(path, "rb");
+    if (!fp) {
+        result->status = SEARCH_SCOPE_IO_FAILED;
+        snprintf(result->operation, sizeof(result->operation), "%s", "scope.open_source");
+        snprintf(result->detail, sizeof(result->detail), "source open failed for %.360s: %s", path,
+                 strerror(errno));
+        return false;
+    }
+    uint64_t offset = 0;
+    bool valid = true;
+    for (;;) {
+        int first = fgetc(fp);
+        if (first == EOF) {
+            if (ferror(fp)) {
+                result->status = SEARCH_SCOPE_IO_FAILED;
+                snprintf(result->operation, sizeof(result->operation), "%s", "scope.read_source");
+                snprintf(result->detail, sizeof(result->detail),
+                         "source read failed for %.360s at byte %llu: %s", path,
+                         (unsigned long long)offset, strerror(errno));
+                valid = false;
+            }
+            break;
+        }
+        unsigned char sequence[5] = {(unsigned char)first, 0, 0, 0, 0};
+        if (sequence[0] == 0) {
+            result->status = SEARCH_SCOPE_INVALID_SOURCE;
+            snprintf(result->operation, sizeof(result->operation), "%s", "scope.validate_utf8");
+            snprintf(result->detail, sizeof(result->detail),
+                     "source contains an embedded NUL at byte %llu: %.360s",
+                     (unsigned long long)offset, path);
+            valid = false;
+            break;
+        }
+        int expected = sequence[0] <= 0x7f   ? 1
+                       : sequence[0] <= 0xdf ? 2
+                       : sequence[0] <= 0xef ? 3
+                                             : 4;
+        for (int i = SKIP_ONE; i < expected; i++) {
+            int next = fgetc(fp);
+            if (next == EOF) {
+                valid = false;
+                break;
+            }
+            sequence[i] = (unsigned char)next;
+        }
+        if (!valid || cbm_utf8_sequence_len(sequence) != expected) {
+            result->status = SEARCH_SCOPE_INVALID_SOURCE;
+            snprintf(result->operation, sizeof(result->operation), "%s", "scope.validate_utf8");
+            snprintf(result->detail, sizeof(result->detail),
+                     "source is not valid UTF-8 at byte %llu: %.360s", (unsigned long long)offset,
+                     path);
+            valid = false;
+            break;
+        }
+        offset += (uint64_t)expected;
+    }
+    if (fclose(fp) != 0 && valid) {
+        result->status = SEARCH_SCOPE_IO_FAILED;
+        snprintf(result->operation, sizeof(result->operation), "%s", "scope.close_source");
+        snprintf(result->detail, sizeof(result->detail), "source close failed for %.360s: %s", path,
+                 strerror(errno));
+        valid = false;
+    }
+    return valid;
+}
+
+/* Write the exact indexed file list for scoped grep.
  * When a path_filter is provided, apply it here — before grep — so large
  * indexed projects do not scan files only for collect_grep_matches to discard
  * them later. The predicate is IDENTICAL to the post-grep filter: the same
@@ -5601,82 +6102,251 @@ static void classify_all_grep_hits(grep_match_t *gm, int gm_count, cbm_store_t *
  * hits would be dropped anyway — results-preserving by construction.
  * *out_written receives the number of records written (0 = the filter
  * excluded every indexed file). */
-static bool write_scoped_filelist(cbm_mcp_server_t *srv, const char *project, const char *root_path,
-                                  const char *filelist, bool has_path_filter,
-                                  cbm_regex_t *path_regex, int *out_written) {
+static search_scope_status_t write_scoped_filelist(cbm_mcp_server_t *srv, const char *project,
+                                                   const char *root_path, const char *filelist,
+                                                   bool has_path_filter, cbm_regex_t *path_regex,
+                                                   int *out_written,
+                                                   search_scope_result_t *result) {
+    memset(result, 0, sizeof(*result));
     *out_written = 0;
     cbm_store_t *pre_store = resolve_store(srv, project);
     if (!pre_store) {
-        return false;
+        result->status = SEARCH_SCOPE_STORE_FAILED;
+        snprintf(result->operation, sizeof(result->operation), "%s", "scope.resolve_store");
+        snprintf(result->detail, sizeof(result->detail), "%s",
+                 "the verified project store could not be resolved");
+        return result->status;
     }
     char **indexed_files = NULL;
     int indexed_count = 0;
-    if (cbm_store_list_files(pre_store, project, &indexed_files, &indexed_count) != CBM_STORE_OK ||
-        indexed_count == 0) {
-        return false;
+    if (cbm_store_list_files(pre_store, project, &indexed_files, &indexed_count) != CBM_STORE_OK) {
+        record_store_query_failure(srv, project, cbm_store_db_path(pre_store), pre_store,
+                                   CBM_STORE_VERIFY_IO_FAILED, "source.query_indexed_files",
+                                   cbm_store_error(pre_store));
+        result->status = SEARCH_SCOPE_STORE_FAILED;
+        snprintf(result->operation, sizeof(result->operation), "%s", "scope.query_indexed_files");
+        snprintf(result->detail, sizeof(result->detail), "%s", cbm_store_error(pre_store));
+        return result->status;
     }
-    FILE *fl = fopen(filelist, "wb");
-    bool ok = false;
-    int written = 0;
-    if (fl) {
+    if (indexed_count == 0) {
+        free(indexed_files);
+        result->status = SEARCH_SCOPE_EMPTY;
+        snprintf(result->operation, sizeof(result->operation), "%s", "scope.query_indexed_files");
+        snprintf(result->detail, sizeof(result->detail), "%s",
+                 "the persisted graph contains no indexed source paths");
+        return result->status;
+    }
+    FILE *fl = cbm_fopen(filelist, "wb");
+    if (!fl) {
         for (int fi = 0; fi < indexed_count; fi++) {
-            /* A source path never legitimately contains a newline or carriage
-             * return. Those bytes are exactly the record separator on the
-             * Windows filelist (and would split naive line readers elsewhere),
-             * so a crafted indexed path with an embedded newline could inject
-             * an extra entry into the scan set. Skip such paths entirely. */
-            if (strpbrk(indexed_files[fi], "\r\n") != NULL) {
+            free(indexed_files[fi]);
+        }
+        free(indexed_files);
+        result->status = SEARCH_SCOPE_IO_FAILED;
+        snprintf(result->operation, sizeof(result->operation), "%s", "scope.open_filelist");
+        snprintf(result->detail, sizeof(result->detail), "filelist open failed: %s",
+                 strerror(errno));
+        return result->status;
+    }
+
+    bool write_ok = true;
+    int written = 0;
+    for (int fi = 0; fi < indexed_count; fi++) {
+        /* A source path never legitimately contains a newline or carriage
+         * return. Those bytes are the filelist record separator, so rejecting
+         * the complete operation is the only non-lossy response. */
+        if (strpbrk(indexed_files[fi], "\r\n") != NULL) {
+            result->status = SEARCH_SCOPE_INVALID_PATH;
+            snprintf(result->operation, sizeof(result->operation), "%s", "scope.validate_path");
+            snprintf(result->detail, sizeof(result->detail),
+                     "indexed path contains a forbidden record separator: %s", indexed_files[fi]);
+            write_ok = false;
+            break;
+        }
+        if (has_path_filter && path_regex) {
+#ifdef _WIN32
+            cbm_normalize_path_sep(indexed_files[fi]);
+#endif
+            if (cbm_regexec(path_regex, indexed_files[fi], 0, NULL, 0) != CBM_REG_OK) {
                 continue;
             }
-            if (has_path_filter && path_regex) {
-#ifdef _WIN32
-                cbm_normalize_path_sep(indexed_files[fi]);
-#endif
-                if (cbm_regexec(path_regex, indexed_files[fi], 0, NULL, 0) != CBM_REG_OK) {
-                    continue;
-                }
-            }
-            /* Write "<root>/<file>" piece-by-piece (no fixed-size buffer, so an
-             * arbitrarily long absolute path cannot overflow). Forward slash join
-             * so xargs doesn't treat Windows backslashes as escapes; binary mode
-             * (wb) prevents CRLF translation. Record separator differs by platform:
-             *   - Unix: NUL, consumed by `xargs -0` — handles spaces in paths (a
-             *     newline separator would split plain xargs on the space).
-             *   - Windows: newline, consumed by PowerShell `Get-Content |
-             *     Select-String -LiteralPath` (NUL bytes break Get-Content). */
-            (void)fwrite(root_path, 1, strlen(root_path), fl);
-            (void)fputc('/', fl);
-            (void)fwrite(indexed_files[fi], 1, strlen(indexed_files[fi]), fl);
-#ifdef _WIN32
-            (void)fputc('\n', fl);
-#else
-            (void)fputc('\0', fl);
-#endif
-            written++;
         }
-        (void)fclose(fl);
-        ok = true;
+        size_t root_len = strlen(root_path);
+        size_t path_len = strlen(indexed_files[fi]);
+        if (root_len > SIZE_MAX - path_len - MCP_SEPARATOR) {
+            result->status = SEARCH_SCOPE_IO_FAILED;
+            snprintf(result->operation, sizeof(result->operation), "%s", "scope.build_source_path");
+            snprintf(result->detail, sizeof(result->detail), "%s",
+                     "source path exceeds addressable memory");
+            write_ok = false;
+            break;
+        }
+        size_t absolute_len = root_len + path_len + MCP_SEPARATOR;
+        char *absolute_path = malloc(absolute_len);
+        if (!absolute_path) {
+            result->status = SEARCH_SCOPE_IO_FAILED;
+            snprintf(result->operation, sizeof(result->operation), "%s",
+                     "scope.allocate_source_path");
+            snprintf(result->detail, sizeof(result->detail),
+                     "source-path allocation failed at %zu bytes", absolute_len);
+            write_ok = false;
+            break;
+        }
+        snprintf(absolute_path, absolute_len, "%s/%s", root_path, indexed_files[fi]);
+        if (!cbm_path_within_root(root_path, absolute_path)) {
+            result->status = SEARCH_SCOPE_INVALID_PATH;
+            snprintf(result->operation, sizeof(result->operation), "%s",
+                     "scope.validate_source_path");
+            snprintf(result->detail, sizeof(result->detail),
+                     "indexed source path resolves outside the project root: %.400s",
+                     indexed_files[fi]);
+            free(absolute_path);
+            write_ok = false;
+            break;
+        }
+        if (!validate_utf8_source_file(absolute_path, result)) {
+            free(absolute_path);
+            write_ok = false;
+            break;
+        }
+        free(absolute_path);
+        write_ok = fwrite(root_path, 1, root_len, fl) == root_len && fputc('/', fl) != EOF &&
+                   fwrite(indexed_files[fi], 1, path_len, fl) == path_len;
+#ifdef _WIN32
+        write_ok = write_ok && fputc('\n', fl) != EOF;
+#else
+        write_ok = write_ok && fputc('\0', fl) != EOF;
+#endif
+        if (!write_ok) {
+            result->status = SEARCH_SCOPE_IO_FAILED;
+            snprintf(result->operation, sizeof(result->operation), "%s", "scope.write_filelist");
+            snprintf(result->detail, sizeof(result->detail), "filelist write failed: %s",
+                     strerror(errno));
+            break;
+        }
+        written++;
+    }
+    if (fclose(fl) != 0 && write_ok) {
+        write_ok = false;
+        result->status = SEARCH_SCOPE_IO_FAILED;
+        snprintf(result->operation, sizeof(result->operation), "%s", "scope.close_filelist");
+        snprintf(result->detail, sizeof(result->detail), "filelist close failed: %s",
+                 strerror(errno));
     }
     for (int fi = 0; fi < indexed_count; fi++) {
         free(indexed_files[fi]);
     }
     free(indexed_files);
+    if (!write_ok) {
+        cbm_unlink(filelist);
+        return result->status;
+    }
     *out_written = written;
-    return ok;
+    result->status = SEARCH_SCOPE_OK;
+    return result->status;
 }
 
-/* Parse search mode string (0=compact, 1=full, 2=files). */
-static int parse_search_mode(const char *mode_str) {
-    if (!mode_str) {
-        return 0;
+static char *build_search_scope_error(const char *code, const search_scope_result_t *scope) {
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    if (!doc) {
+        return heap_strdup(
+            "{\"code\":\"CBM_SEARCH_SCOPE_FAILED\",\"message\":\"indexed search scope could not "
+            "be materialized\",\"remediation\":\"repair the indexed project state and retry\"}");
     }
-    if (strcmp(mode_str, "full") == 0) {
-        return SKIP_ONE;
+    yyjson_mut_val *root = yyjson_mut_obj(doc);
+    yyjson_mut_doc_set_root(doc, root);
+    yyjson_mut_obj_add_str(doc, root, "code", code);
+    yyjson_mut_obj_add_str(doc, root, "message",
+                           "search_code could not materialize the exact persisted indexed-file "
+                           "scope and refused to search a different corpus");
+    yyjson_mut_obj_add_str(doc, root, "remediation",
+                           "repair or re-index the project, resolve the reported scope operation, "
+                           "then retry");
+    yyjson_mut_obj_add_str(doc, root, "failed_operation", scope->operation);
+    yyjson_mut_obj_add_str(doc, root, "detail", scope->detail);
+    yyjson_mut_obj_add_bool(doc, root, "recursive_fallback_attempted", false);
+    char *json = yyjson_mut_write(doc, 0, NULL);
+    yyjson_mut_doc_free(doc);
+    return json ? json : heap_strdup("{\"code\":\"CBM_SEARCH_SCOPE_FAILED\"}");
+}
+
+typedef enum {
+    SEARCH_MODE_COMPACT = 0,
+    SEARCH_MODE_FULL = 1,
+    SEARCH_MODE_FILES = 2,
+} search_mode_t;
+
+static bool parse_search_control_args(const char *args, int *mode, int *limit, int *context,
+                                      search_response_error_t *error) {
+    *mode = SEARCH_MODE_COMPACT;
+    *limit = MCP_DEFAULT_LIMIT;
+    *context = 0;
+    yyjson_doc *doc = yyjson_read(args, strlen(args), 0);
+    yyjson_val *root = doc ? yyjson_doc_get_root(doc) : NULL;
+    if (!root || !yyjson_is_obj(root)) {
+        snprintf(error->operation, sizeof(error->operation), "%s", "arguments.parse");
+        snprintf(error->detail, sizeof(error->detail), "%s",
+                 "search_code arguments are not a valid JSON object");
+        if (doc) {
+            yyjson_doc_free(doc);
+        }
+        return false;
     }
-    if (strcmp(mode_str, "files") == 0) {
-        return MCP_RETURN_2;
+    yyjson_val *mode_value = yyjson_obj_get(root, "mode");
+    if (mode_value) {
+        if (!yyjson_is_str(mode_value)) {
+            snprintf(error->operation, sizeof(error->operation), "%s", "arguments.mode");
+            snprintf(error->detail, sizeof(error->detail), "%s",
+                     "mode must be one of compact, full, or files");
+            yyjson_doc_free(doc);
+            return false;
+        }
+        const char *value = yyjson_get_str(mode_value);
+        if (strcmp(value, "compact") == 0) {
+            *mode = SEARCH_MODE_COMPACT;
+        } else if (strcmp(value, "full") == 0) {
+            *mode = SEARCH_MODE_FULL;
+        } else if (strcmp(value, "files") == 0) {
+            *mode = SEARCH_MODE_FILES;
+        } else {
+            snprintf(error->operation, sizeof(error->operation), "%s", "arguments.mode");
+            snprintf(error->detail, sizeof(error->detail), "unsupported search mode: %.400s",
+                     value);
+            yyjson_doc_free(doc);
+            return false;
+        }
     }
-    return 0;
+    const char *names[] = {"limit", "context"};
+    int *outputs[] = {limit, context};
+    const int minimums[] = {SKIP_ONE, 0};
+    for (int i = 0; i < MCP_RETURN_2; i++) {
+        yyjson_val *value = yyjson_obj_get(root, names[i]);
+        if (!value) {
+            continue;
+        }
+        bool in_range = false;
+        uint64_t parsed = 0;
+        if (yyjson_is_uint(value)) {
+            parsed = yyjson_get_uint(value);
+            in_range = parsed <= MCP_MAX_ROWS && parsed >= (uint64_t)minimums[i];
+        } else if (yyjson_is_int(value)) {
+            int64_t signed_value = yyjson_get_sint(value);
+            in_range = signed_value >= minimums[i] && signed_value <= MCP_MAX_ROWS;
+            if (in_range) {
+                parsed = (uint64_t)signed_value;
+            }
+        }
+        if (!in_range) {
+            snprintf(error->operation, sizeof(error->operation), "arguments.%s", names[i]);
+            snprintf(error->detail, sizeof(error->detail), "%s must be an integer in [%d,%d]",
+                     names[i], minimums[i], MCP_MAX_ROWS);
+            yyjson_doc_free(doc);
+            return false;
+        }
+        *outputs[i] = (int)parsed;
+    }
+    yyjson_doc_free(doc);
+    return true;
 }
 
 /* Validate shell-safe arguments for search. */
@@ -5722,24 +6392,80 @@ static bool validate_search_args(const char *root_path, const char *file_pattern
     return true;
 }
 
-/* Write pattern to a temp file for grep -f. Returns true on success. */
-static bool write_pattern_file(char *tmpfile, int tmpfile_sz, const char *pattern) {
-    snprintf(tmpfile, tmpfile_sz, "%s/cbm_search_%d.pat", cbm_tmpdir(), (int)getpid());
-    FILE *tf = fopen(tmpfile, "w");
-    if (!tf) {
-        return false;
+/* Write the exact pattern bytes consumed by the search process. */
+static search_scope_status_t write_pattern_file(char *tmpfile, int tmpfile_sz, const char *pattern,
+                                                search_scope_result_t *result) {
+    memset(result, 0, sizeof(*result));
+    int path_len = snprintf(tmpfile, (size_t)tmpfile_sz, "%s/cbm_search_XXXXXX", cbm_tmpdir());
+    if (path_len < 0 || path_len >= tmpfile_sz) {
+        result->status = SEARCH_SCOPE_IO_FAILED;
+        snprintf(result->operation, sizeof(result->operation), "%s", "pattern.build_path");
+        snprintf(result->detail, sizeof(result->detail), "%s",
+                 "pattern temp path exceeds the representable path buffer");
+        return result->status;
     }
-    (void)fprintf(tf, "%s\n", pattern);
-    (void)fclose(tf);
-    return true;
+    int temp_fd = cbm_mkstemp(tmpfile, (size_t)tmpfile_sz);
+    if (temp_fd < 0) {
+        result->status = SEARCH_SCOPE_IO_FAILED;
+        snprintf(result->operation, sizeof(result->operation), "%s", "pattern.create_exclusive");
+        snprintf(result->detail, sizeof(result->detail),
+                 "exclusive pattern-file creation failed: %s", strerror(errno));
+        return result->status;
+    }
+    FILE *tf = cbm_fdopen(temp_fd, "wb");
+    if (!tf) {
+        int fdopen_errno = errno;
+        (void)cbm_close_fd(temp_fd);
+        (void)cbm_unlink(tmpfile);
+        result->status = SEARCH_SCOPE_IO_FAILED;
+        snprintf(result->operation, sizeof(result->operation), "%s", "pattern.open");
+        snprintf(result->detail, sizeof(result->detail), "pattern-file open failed: %s",
+                 strerror(fdopen_errno));
+        return result->status;
+    }
+    size_t pattern_len = strlen(pattern);
+    bool ok = fwrite(pattern, 1, pattern_len, tf) == pattern_len;
+    if (!ok) {
+        result->status = SEARCH_SCOPE_IO_FAILED;
+        snprintf(result->operation, sizeof(result->operation), "%s", "pattern.write");
+        snprintf(result->detail, sizeof(result->detail), "pattern-file write failed: %s",
+                 strerror(errno));
+    } else if (fflush(tf) != 0) {
+        ok = false;
+        result->status = SEARCH_SCOPE_IO_FAILED;
+        snprintf(result->operation, sizeof(result->operation), "%s", "pattern.flush");
+        snprintf(result->detail, sizeof(result->detail), "pattern-file flush failed: %s",
+                 strerror(errno));
+    }
+    if (fclose(tf) != 0 && ok) {
+        ok = false;
+        result->status = SEARCH_SCOPE_IO_FAILED;
+        snprintf(result->operation, sizeof(result->operation), "%s", "pattern.close");
+        snprintf(result->detail, sizeof(result->detail), "pattern-file close failed: %s",
+                 strerror(errno));
+    }
+    if (!ok) {
+        cbm_unlink(tmpfile);
+        return result->status;
+    }
+    result->status = SEARCH_SCOPE_OK;
+    return result->status;
 }
 
-/* Compile a path filter regex. Returns true if compiled successfully. */
-static bool compile_path_filter(const char *filter, cbm_regex_t *re) {
-    if (!filter || !filter[0]) {
-        return false;
+typedef enum {
+    PATH_FILTER_ABSENT = 0,
+    PATH_FILTER_VALID,
+    PATH_FILTER_INVALID,
+} path_filter_status_t;
+
+static path_filter_status_t compile_path_filter(const char *filter, cbm_regex_t *re,
+                                                int *regex_error) {
+    *regex_error = CBM_REG_OK;
+    if (!filter) {
+        return PATH_FILTER_ABSENT;
     }
-    return cbm_regcomp(re, filter, CBM_REG_EXTENDED | CBM_REG_NOSUB) == CBM_REG_OK;
+    *regex_error = cbm_regcomp(re, filter, CBM_REG_EXTENDED | CBM_REG_NOSUB);
+    return *regex_error == CBM_REG_OK ? PATH_FILTER_VALID : PATH_FILTER_INVALID;
 }
 
 static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
@@ -5747,34 +6473,81 @@ static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
     char *project = get_project_arg(args);
     char *file_pattern = cbm_mcp_get_string_arg(args, "file_pattern");
     char *path_filter = cbm_mcp_get_string_arg(args, "path_filter");
-    char *mode_str = cbm_mcp_get_string_arg(args, "mode");
-    int limit = cbm_mcp_get_int_arg(args, "limit", MCP_DEFAULT_LIMIT);
-    int context_lines = cbm_mcp_get_int_arg(args, "context", 0);
+    int mode = SEARCH_MODE_COMPACT;
+    int limit = MCP_DEFAULT_LIMIT;
+    int context_lines = 0;
     bool use_regex = cbm_mcp_get_bool_arg(args, "regex");
     uint64_t search_t0 = cbm_now_ms();
     /* In literal (non-regex) mode a '|' is matched as a byte, not alternation —
      * a common silent 0-match trap; flagged in the result warnings (#282). */
     bool pat_has_pipe = pattern && strchr(pattern, '|') != NULL;
 
-    int mode = parse_search_mode(mode_str);
-    free(mode_str);
-
-    cbm_regex_t path_regex;
-    bool has_path_filter = compile_path_filter(path_filter, &path_regex);
-    free(path_filter);
-    path_filter = NULL;
+    search_response_error_t argument_error = {0};
+    if (!parse_search_control_args(args, &mode, &limit, &context_lines, &argument_error)) {
+        free(pattern);
+        free(project);
+        free(file_pattern);
+        free(path_filter);
+        return search_operation_error_result(
+            "CBM_SEARCH_ARGUMENT_INVALID", "search_code arguments are invalid",
+            "correct the reported argument without changing the intended corpus and retry",
+            &argument_error);
+    }
 
     if (!pattern) {
         free(project);
         free(file_pattern);
+        free(path_filter);
         return cbm_mcp_text_result("pattern is required", true);
     }
+
+    if (strpbrk(pattern, "\r\n") != NULL) {
+        search_scope_result_t invalid_pattern = {0};
+        snprintf(invalid_pattern.operation, sizeof(invalid_pattern.operation), "%s",
+                 "pattern.validate");
+        snprintf(invalid_pattern.detail, sizeof(invalid_pattern.detail), "%s",
+                 "pattern contains a line separator; search_code accepts one line pattern");
+        char *error = build_search_scope_error("CBM_SEARCH_PATTERN_INVALID", &invalid_pattern);
+        char *result = cbm_mcp_text_result(error, true);
+        free(error);
+        free(pattern);
+        free(project);
+        free(file_pattern);
+        free(path_filter);
+        return result;
+    }
+
+    cbm_regex_t path_regex;
+    int path_regex_error = CBM_REG_OK;
+    path_filter_status_t path_filter_status =
+        compile_path_filter(path_filter, &path_regex, &path_regex_error);
+    bool has_path_filter = path_filter_status == PATH_FILTER_VALID;
+    if (path_filter_status == PATH_FILTER_INVALID) {
+        search_scope_result_t invalid_filter = {0};
+        snprintf(invalid_filter.operation, sizeof(invalid_filter.operation), "%s",
+                 "path_filter.compile");
+        snprintf(invalid_filter.detail, sizeof(invalid_filter.detail),
+                 "path_filter regex compilation failed with code %d", path_regex_error);
+        char *error = build_search_scope_error("CBM_SEARCH_PATH_FILTER_INVALID", &invalid_filter);
+        char *result = cbm_mcp_text_result(error, true);
+        free(error);
+        free(pattern);
+        free(project);
+        free(file_pattern);
+        free(path_filter);
+        return result;
+    }
+    free(path_filter);
+    path_filter = NULL;
 
     /* Project is required */
     if (!project) {
         free(pattern);
         free(file_pattern);
-        char *_err = build_project_list_error("project is required");
+        if (has_path_filter) {
+            cbm_regfree(&path_regex);
+        }
+        char *_err = build_missing_project_error();
         char *_res = cbm_mcp_text_result(_err, true);
         free(_err);
         return _res;
@@ -5782,12 +6555,15 @@ static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
 
     char *root_path = get_project_root(srv, project);
     if (!root_path) {
+        char *_err = build_no_store_error(srv, project);
+        char *_res = cbm_mcp_text_result(_err, true);
+        free(_err);
+        if (has_path_filter) {
+            cbm_regfree(&path_regex);
+        }
         free(pattern);
         free(project);
         free(file_pattern);
-        char *_err = build_project_list_error("project not found or not indexed");
-        char *_res = cbm_mcp_text_result(_err, true);
-        free(_err);
         return _res;
     }
 
@@ -5829,102 +6605,247 @@ static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
      * This avoids requiring the exact phrase as a contiguous substring. */
     if (!use_regex && strchr(pattern, ' ')) {
         size_t plen = strlen(pattern);
-        /* Worst case: every char is a space → ".*" between each char */
-        char *regex_pat = malloc(plen * 3 + 1);
-        if (regex_pat) {
-            char *dst = regex_pat;
-            const char *src = pattern;
-            bool in_space = false;
-            while (*src) {
-                if (*src == ' ' || *src == '\t') {
-                    if (!in_space) {
-                        *dst++ = '.';
-                        *dst++ = '*';
-                        in_space = true;
-                    }
-                } else {
-                    /* Escape regex metacharacters from user input */
-                    if (strchr("\\^$.|?*+()[]{}", *src)) {
-                        *dst++ = '\\';
-                    }
-                    *dst++ = *src;
-                    in_space = false;
-                }
-                src++;
-            }
-            *dst = '\0';
-            free(pattern);
-            pattern = regex_pat;
-            use_regex = true;
-        }
-    }
-
-    /* ── Phase 1: Grep scan ──────────────────────────────────── */
-    char tmpfile[CBM_SZ_256];
-    if (!write_pattern_file(tmpfile, sizeof(tmpfile), pattern)) {
-        char errmsg[CBM_SZ_256];
-        snprintf(errmsg, sizeof(errmsg), "search failed: cannot create temp file (%s)",
-                 strerror(errno));
-        free(root_path);
-        free(pattern);
-        free(project);
-        free(file_pattern);
-        return cbm_mcp_text_result(errmsg, true);
-    }
-
-    /* No grep-level match limit — let grep find all matches, then dedup and
-     * cap in our code. The -m flag caused results from large vendored files
-     * to exhaust the quota before reaching project source files. */
-    enum { GREP_MAX_MATCHES = 500 };
-    int grep_limit = GREP_MAX_MATCHES;
-
-    /* Scope grep to indexed files only — avoids scanning vendored/generated code.
-     * Query the graph for distinct file paths, write them to a temp file,
-     * then use xargs to pass them to grep. Falls back to recursive grep if
-     * no indexed files found (project not fully indexed). */
-    char filelist[CBM_SZ_256];
-    snprintf(filelist, sizeof(filelist), "%s.files", tmpfile);
-    bool scoped = false;
-    int scoped_written = 0;
-
-    scoped = write_scoped_filelist(srv, project, root_path, filelist, has_path_filter,
-                                   has_path_filter ? &path_regex : NULL, &scoped_written);
-
-    /* Collect grep matches into array */
-    int gm_count = 0;
-    grep_match_t *gm = NULL;
-    if (scoped && scoped_written == 0) {
-        /* The path_filter excluded every indexed file — nothing to scan.
-         * Skip the grep subprocess: xargs on an empty filelist is
-         * platform-dependent (GNU execs grep once with no operands, BSD
-         * skips), and the post-grep filter would drop every hit anyway. */
-        gm = malloc(sizeof(grep_match_t)); /* empty set; freed below */
-        cbm_unlink(tmpfile);
-        cbm_unlink(filelist);
-    } else {
-        char cmd[CBM_SZ_4K];
-        build_grep_cmd(cmd, sizeof(cmd), use_regex, scoped, file_pattern, tmpfile, filelist,
-                       root_path);
-
-        FILE *fp = cbm_popen(cmd, "r");
-        if (!fp) {
-            cbm_unlink(tmpfile);
-            if (scoped) {
-                cbm_unlink(filelist);
+        if (plen > (SIZE_MAX - SKIP_ONE) / 3) {
+            if (has_path_filter) {
+                cbm_regfree(&path_regex);
             }
             free(root_path);
             free(pattern);
             free(project);
             free(file_pattern);
-            return cbm_mcp_text_result("search failed", true);
+            search_scope_result_t transform_failure = {0};
+            snprintf(transform_failure.operation, sizeof(transform_failure.operation), "%s",
+                     "pattern.transform_multiword");
+            snprintf(transform_failure.detail, sizeof(transform_failure.detail), "%s",
+                     "multi-word pattern exceeds addressable memory");
+            char *error = build_search_scope_error("CBM_SEARCH_PATTERN_ALLOCATION_FAILED",
+                                                   &transform_failure);
+            char *result = cbm_mcp_text_result(error, true);
+            free(error);
+            return result;
+        }
+        /* Worst case: every char is a space → ".*" between each char */
+        char *regex_pat = malloc(plen * 3 + 1);
+        if (!regex_pat) {
+            if (has_path_filter) {
+                cbm_regfree(&path_regex);
+            }
+            free(root_path);
+            free(pattern);
+            free(project);
+            free(file_pattern);
+            search_scope_result_t transform_failure = {0};
+            snprintf(transform_failure.operation, sizeof(transform_failure.operation), "%s",
+                     "pattern.transform_multiword");
+            snprintf(transform_failure.detail, sizeof(transform_failure.detail),
+                     "multi-word pattern allocation failed at %zu bytes", plen * 3 + SKIP_ONE);
+            char *error = build_search_scope_error("CBM_SEARCH_PATTERN_ALLOCATION_FAILED",
+                                                   &transform_failure);
+            char *result = cbm_mcp_text_result(error, true);
+            free(error);
+            return result;
+        }
+        char *dst = regex_pat;
+        const char *src = pattern;
+        bool in_space = false;
+        while (*src) {
+            if (*src == ' ' || *src == '\t') {
+                if (!in_space) {
+                    *dst++ = '.';
+                    *dst++ = '*';
+                    in_space = true;
+                }
+            } else {
+                /* Escape regex metacharacters from user input */
+                if (strchr("\\^$.|?*+()[]{}", *src)) {
+                    *dst++ = '\\';
+                }
+                *dst++ = *src;
+                in_space = false;
+            }
+            src++;
+        }
+        *dst = '\0';
+        free(pattern);
+        pattern = regex_pat;
+        use_regex = true;
+    }
+
+    /* ── Phase 1: Grep scan ──────────────────────────────────── */
+    char tmpfile[CBM_SZ_4K];
+    search_scope_result_t pattern_file_result;
+    if (write_pattern_file(tmpfile, sizeof(tmpfile), pattern, &pattern_file_result) !=
+        SEARCH_SCOPE_OK) {
+        char *error =
+            build_search_scope_error("CBM_SEARCH_PATTERN_FILE_FAILED", &pattern_file_result);
+        char *result = cbm_mcp_text_result(error, true);
+        free(error);
+        if (has_path_filter) {
+            cbm_regfree(&path_regex);
+        }
+        free(root_path);
+        free(pattern);
+        free(project);
+        free(file_pattern);
+        return result;
+    }
+
+    /* Scope search to the exact persisted indexed-file set.  Failure to
+     * materialize that set fails closed; recursive filesystem search would be
+     * a different corpus and is never an allowed substitute. */
+    char filelist[CBM_SZ_4K];
+    int filelist_len = snprintf(filelist, sizeof(filelist), "%s.files", tmpfile);
+    if (filelist_len < 0 || (size_t)filelist_len >= sizeof(filelist)) {
+        cbm_unlink(tmpfile);
+        if (has_path_filter) {
+            cbm_regfree(&path_regex);
+        }
+        free(root_path);
+        free(pattern);
+        free(project);
+        free(file_pattern);
+        search_scope_result_t path_failure = {0};
+        snprintf(path_failure.operation, sizeof(path_failure.operation), "%s",
+                 "scope.build_filelist_path");
+        snprintf(path_failure.detail, sizeof(path_failure.detail), "%s",
+                 "indexed file-list path exceeds the representable path buffer");
+        char *error = build_search_scope_error("CBM_SEARCH_SCOPE_IO_FAILED", &path_failure);
+        char *result = cbm_mcp_text_result(error, true);
+        free(error);
+        return result;
+    }
+    int scoped_written = 0;
+    search_scope_result_t scope;
+    search_scope_status_t scope_status =
+        write_scoped_filelist(srv, project, root_path, filelist, has_path_filter,
+                              has_path_filter ? &path_regex : NULL, &scoped_written, &scope);
+    if (scope_status != SEARCH_SCOPE_OK) {
+        cbm_unlink(tmpfile);
+        if (has_path_filter) {
+            cbm_regfree(&path_regex);
+        }
+        free(root_path);
+        free(pattern);
+        free(file_pattern);
+        char *error = NULL;
+        if (scope_status == SEARCH_SCOPE_STORE_FAILED) {
+            error = build_no_store_error(srv, project);
+        } else {
+            const char *code =
+                scope_status == SEARCH_SCOPE_EMPTY            ? "CBM_SEARCH_INDEX_EMPTY"
+                : scope_status == SEARCH_SCOPE_INVALID_PATH   ? "CBM_SEARCH_INDEXED_PATH_INVALID"
+                : scope_status == SEARCH_SCOPE_INVALID_SOURCE ? "CBM_SEARCH_SOURCE_ENCODING_INVALID"
+                                                              : "CBM_SEARCH_SCOPE_IO_FAILED";
+            error = build_search_scope_error(code, &scope);
+        }
+        free(project);
+        char *result = cbm_mcp_text_result(error, true);
+        free(error);
+        return result;
+    }
+
+    /* Collect grep matches into array */
+    int gm_count = 0;
+    grep_match_t *gm = NULL;
+    if (scoped_written == 0) {
+        /* The path_filter excluded every indexed file — nothing to scan.
+         * Skip the grep subprocess: xargs on an empty filelist is
+         * platform-dependent (GNU execs grep once with no operands, BSD
+         * skips), and the post-grep filter would drop every hit anyway. */
+        cbm_unlink(tmpfile);
+        cbm_unlink(filelist);
+    } else {
+        char *cmd = build_grep_cmd(use_regex, file_pattern, tmpfile, filelist);
+        if (!cmd) {
+            cbm_unlink(tmpfile);
+            cbm_unlink(filelist);
+            if (has_path_filter) {
+                cbm_regfree(&path_regex);
+            }
+            free(root_path);
+            free(pattern);
+            free(project);
+            free(file_pattern);
+            search_scope_result_t command_failure = {0};
+            snprintf(command_failure.operation, sizeof(command_failure.operation), "%s",
+                     "scope.build_search_command");
+            snprintf(command_failure.detail, sizeof(command_failure.detail), "%s",
+                     "search command allocation failed");
+            char *error =
+                build_search_scope_error("CBM_SEARCH_ALLOCATION_FAILED", &command_failure);
+            char *result = cbm_mcp_text_result(error, true);
+            free(error);
+            return result;
         }
 
-        gm = collect_grep_matches(fp, root_path, strlen(root_path), has_path_filter, &path_regex,
-                                  grep_limit, &gm_count);
-        cbm_pclose(fp);
-        cbm_unlink(tmpfile);
-        if (scoped) {
+        FILE *fp = cbm_popen(cmd, "r");
+        free(cmd);
+        if (!fp) {
+            cbm_unlink(tmpfile);
             cbm_unlink(filelist);
+            free(root_path);
+            free(pattern);
+            free(project);
+            free(file_pattern);
+            search_scope_result_t process_failure = {0};
+            snprintf(process_failure.operation, sizeof(process_failure.operation), "%s",
+                     "scope.start_search_process");
+            snprintf(process_failure.detail, sizeof(process_failure.detail),
+                     "search process start failed: %s", strerror(errno));
+            char *error = build_search_scope_error("CBM_SEARCH_PROCESS_FAILED", &process_failure);
+            char *result = cbm_mcp_text_result(error, true);
+            free(error);
+            return result;
+        }
+
+        search_collect_result_t collect_result;
+        gm = collect_grep_matches(fp, root_path, strlen(root_path), has_path_filter, &path_regex,
+                                  &gm_count, &collect_result);
+        int search_rc = cbm_pclose(fp);
+        cbm_unlink(tmpfile);
+        cbm_unlink(filelist);
+        if (collect_result.status != SEARCH_COLLECT_OK) {
+            if (has_path_filter) {
+                cbm_regfree(&path_regex);
+            }
+            free(root_path);
+            free(pattern);
+            free(project);
+            free(file_pattern);
+            search_scope_result_t collect_failure = {0};
+            snprintf(collect_failure.operation, sizeof(collect_failure.operation), "%s",
+                     collect_result.operation);
+            snprintf(collect_failure.detail, sizeof(collect_failure.detail), "%s",
+                     collect_result.detail);
+            const char *code = collect_result.status == SEARCH_COLLECT_OOM
+                                   ? "CBM_SEARCH_ALLOCATION_FAILED"
+                               : collect_result.status == SEARCH_COLLECT_MALFORMED
+                                   ? "CBM_SEARCH_OUTPUT_INVALID"
+                                   : "CBM_SEARCH_PROCESS_IO_FAILED";
+            char *error = build_search_scope_error(code, &collect_failure);
+            char *result = cbm_mcp_text_result(error, true);
+            free(error);
+            return result;
+        }
+        if (search_rc != 0) {
+            if (has_path_filter) {
+                cbm_regfree(&path_regex);
+            }
+            free_grep_matches(gm, gm_count);
+            free(root_path);
+            free(pattern);
+            free(project);
+            free(file_pattern);
+            search_scope_result_t process_failure = {0};
+            process_failure.status = SEARCH_SCOPE_IO_FAILED;
+            snprintf(process_failure.operation, sizeof(process_failure.operation), "%s",
+                     "scope.execute_search");
+            snprintf(process_failure.detail, sizeof(process_failure.detail),
+                     "indexed-file search process exited with code %d", search_rc);
+            char *error = build_search_scope_error("CBM_SEARCH_PROCESS_FAILED", &process_failure);
+            char *result = cbm_mcp_text_result(error, true);
+            free(error);
+            return result;
         }
     }
 
@@ -5933,35 +6854,117 @@ static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
      * Then: one SQL query per unique file for nodes, one batch query for all degrees. */
 
     cbm_store_t *store = resolve_store(srv, project);
+    if (!store) {
+        if (has_path_filter) {
+            cbm_regfree(&path_regex);
+        }
+        free_grep_matches(gm, gm_count);
+        free(root_path);
+        free(pattern);
+        free(file_pattern);
+        char *error = build_no_store_error(srv, project);
+        free(project);
+        char *result = cbm_mcp_text_result(error, true);
+        free(error);
+        return result;
+    }
 
-    int sr_cap = CBM_SZ_32;
+    int sr_cap = 0;
     int sr_count = 0;
-    search_result_t *sr = calloc(sr_cap, sizeof(search_result_t));
+    search_result_t *sr = NULL;
 
-    int raw_cap = CBM_SZ_32;
+    int raw_cap = 0;
     int raw_count = 0;
-    grep_match_t *raw = malloc(raw_cap * sizeof(grep_match_t));
+    grep_match_t **raw = NULL;
 
-    /* Sort matches by file path for contiguous per-file processing */
-    qsort(gm, gm_count, sizeof(grep_match_t), (int (*)(const void *, const void *))strcmp);
-
-    classify_all_grep_hits(gm, gm_count, store, project, &sr, &sr_count, &sr_cap, &raw, &raw_count,
-                           &raw_cap);
+    search_collect_result_t enrichment_result = {0};
+    if (classify_all_grep_hits(srv, gm, gm_count, store, project, &sr, &sr_count, &sr_cap, &raw,
+                               &raw_count, &raw_cap, &enrichment_result) != CBM_STORE_OK) {
+        if (has_path_filter) {
+            cbm_regfree(&path_regex);
+        }
+        free(raw);
+        free_search_results(sr, sr_count);
+        free_grep_matches(gm, gm_count);
+        free(root_path);
+        free(pattern);
+        free(file_pattern);
+        char *error =
+            enrichment_result.status == SEARCH_COLLECT_OOM ? NULL : build_recorded_store_error(srv);
+        if (!error) {
+            search_scope_result_t allocation_failure = {0};
+            snprintf(allocation_failure.operation, sizeof(allocation_failure.operation), "%s",
+                     enrichment_result.operation);
+            snprintf(allocation_failure.detail, sizeof(allocation_failure.detail), "%s",
+                     enrichment_result.detail);
+            error = build_search_scope_error("CBM_SEARCH_ALLOCATION_FAILED", &allocation_failure);
+        }
+        free(project);
+        char *result = cbm_mcp_text_result(error, true);
+        free(error);
+        return result;
+    }
 
     /* Phase 3: batch degree query — ONE query for all results instead of 2×N */
-    if (store && sr_count > 0) {
-        int64_t *ids = malloc(sr_count * sizeof(int64_t));
-        int *in_degs = malloc(sr_count * sizeof(int));
-        int *out_degs = malloc(sr_count * sizeof(int));
+    if (sr_count > 0) {
+        int64_t *ids = malloc((size_t)sr_count * sizeof(int64_t));
+        int *in_degs = malloc((size_t)sr_count * sizeof(int));
+        int *out_degs = malloc((size_t)sr_count * sizeof(int));
+        if (!ids || !in_degs || !out_degs) {
+            free(ids);
+            free(in_degs);
+            free(out_degs);
+            if (has_path_filter) {
+                cbm_regfree(&path_regex);
+            }
+            free(raw);
+            free_search_results(sr, sr_count);
+            free_grep_matches(gm, gm_count);
+            free(root_path);
+            free(pattern);
+            free(project);
+            free(file_pattern);
+            search_scope_result_t allocation_failure = {0};
+            snprintf(allocation_failure.operation, sizeof(allocation_failure.operation), "%s",
+                     "enrichment.allocate_degree_batch");
+            snprintf(allocation_failure.detail, sizeof(allocation_failure.detail),
+                     "degree-array allocation failed for %d results", sr_count);
+            char *error =
+                build_search_scope_error("CBM_SEARCH_ALLOCATION_FAILED", &allocation_failure);
+            char *result = cbm_mcp_text_result(error, true);
+            free(error);
+            return result;
+        }
         for (int j = 0; j < sr_count; j++) {
             ids[j] = sr[j].node_id;
         }
-        if (cbm_store_batch_count_degrees(store, ids, sr_count, "CALLS", in_degs, out_degs) ==
-            CBM_STORE_OK) {
-            for (int j = 0; j < sr_count; j++) {
-                sr[j].in_degree = in_degs[j];
-                sr[j].out_degree = out_degs[j];
+        int degree_rc =
+            cbm_store_batch_count_degrees(store, ids, sr_count, "CALLS", in_degs, out_degs);
+        if (degree_rc != CBM_STORE_OK) {
+            record_store_query_failure(
+                srv, project, cbm_store_db_path(store), store, CBM_STORE_VERIFY_IO_FAILED,
+                "source.query_search_result_degrees", cbm_store_error(store));
+            free(ids);
+            free(in_degs);
+            free(out_degs);
+            if (has_path_filter) {
+                cbm_regfree(&path_regex);
             }
+            free(raw);
+            free_search_results(sr, sr_count);
+            free_grep_matches(gm, gm_count);
+            free(root_path);
+            free(pattern);
+            free(file_pattern);
+            char *error = build_recorded_store_error(srv);
+            free(project);
+            char *result = cbm_mcp_text_result(error, true);
+            free(error);
+            return result;
+        }
+        for (int j = 0; j < sr_count; j++) {
+            sr[j].in_degree = in_degs[j];
+            sr[j].out_degree = out_degs[j];
         }
         free(ids);
         free(in_degs);
@@ -5981,8 +6984,8 @@ static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
     char *result =
         assemble_search_output(sr, sr_count, raw, raw_count, gm_count, limit, mode, context_lines,
                                root_path, pat_has_pipe && !use_regex, cbm_now_ms() - search_t0);
-    free(gm);
-    free(sr);
+    free_grep_matches(gm, gm_count);
+    free_search_results(sr, sr_count);
     free(raw);
     free(root_path);
     free(pattern);
@@ -6681,15 +7684,30 @@ static void *autoindex_thread(void *arg) {
 
     cbm_log_info("autoindex.start", "project", srv->session_project, "path", srv->session_root);
 
-    /* #832: prefer the supervised worker subprocess. Indexing the whole session in
+    /* #832: use the supervised worker subprocess. Indexing the whole session in
      * this long-lived server thread ratchets RSS (mimalloc v3 does not reclaim the
      * pages worker threads abandon at exit); running it in a child that exits hands
-     * 100% of that memory back to the OS every cycle. Degrade to the in-process
-     * pipeline below when the supervisor is off (kill switch) or the spawn fails. */
+     * 100% of that memory back to the OS every cycle. A supervisor failure is
+     * terminal and never authorizes an in-process retry. */
     if (cbm_index_supervisor_should_wrap()) {
         char *resp = index_run_supervised_path(srv, srv->session_root);
         if (resp) {
+            yyjson_doc *response_doc = yyjson_read(resp, strlen(resp), 0);
+            yyjson_val *response_root = response_doc ? yyjson_doc_get_root(response_doc) : NULL;
+            yyjson_val *is_error = response_root ? yyjson_obj_get(response_root, "isError") : NULL;
+            bool succeeded = is_error && yyjson_is_bool(is_error) && !yyjson_get_bool(is_error);
+            if (response_doc) {
+                yyjson_doc_free(response_doc);
+            }
             free(resp);
+            if (!succeeded) {
+                cbm_log_error("autoindex.err", "code", "CBM_AUTOINDEX_SUPERVISED_FAILED", "project",
+                              srv->session_project, "message",
+                              "the isolated auto-index did not return a successful MCP result",
+                              "remediation",
+                              "inspect the supervised worker diagnostics before retrying");
+                return NULL;
+            }
             cbm_log_info("autoindex.done", "project", srv->session_project, "mode", "supervised");
             /* Register with watcher for ongoing change detection — gated on
              * auto_watch (#849), same as the in-process branch below. A bare
@@ -6698,7 +7716,11 @@ static void *autoindex_thread(void *arg) {
             register_watcher_if_enabled(srv);
             return NULL;
         }
-        /* resp == NULL → spawn-failure degrade → fall through to in-process. */
+        cbm_log_error("autoindex.err", "code", "CBM_AUTOINDEX_SUPERVISOR_NO_RESPONSE", "project",
+                      srv->session_project, "message",
+                      "the isolated auto-index supervisor produced no response", "remediation",
+                      "inspect the supervisor argument/process diagnostics before retrying");
+        return NULL;
     }
 
     cbm_pipeline_t *p = cbm_pipeline_new(srv->session_root, NULL, CBM_MODE_FULL);

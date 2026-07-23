@@ -122,7 +122,7 @@ void cbm_sem_random_index(const char *token, cbm_sem_vec_t *out);
 /* Eagerly initialize the pretrained token lookup map.
  * Call this BEFORE dispatching parallel work that invokes cbm_sem_random_index,
  * so the lazy init races are avoided entirely on the hot path. */
-void cbm_sem_ensure_ready(void);
+bool cbm_sem_ensure_ready(void);
 
 /* Normalize a vector to unit length in-place. */
 void cbm_sem_normalize(cbm_sem_vec_t *v);
@@ -185,7 +185,7 @@ int cbm_sem_corpus_add_docs_batch(cbm_sem_corpus_t *corpus, char **all_tokens,
                                   const int *token_counts, int doc_count, int max_tokens_per_doc);
 
 /* Finalize: compute IDF, build enriched token vectors via co-occurrence. */
-void cbm_sem_corpus_finalize(cbm_sem_corpus_t *corpus);
+bool cbm_sem_corpus_finalize(cbm_sem_corpus_t *corpus);
 
 /* Get IDF weight for a token. Returns 0.0 for unknown tokens. */
 float cbm_sem_corpus_idf(const cbm_sem_corpus_t *corpus, const char *token);

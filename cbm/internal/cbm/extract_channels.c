@@ -243,7 +243,9 @@ static void push_channel(CBMExtractCtx *ctx, const char *channel_name, const cha
         .start_line = (int)ts_node_start_point(call).row + 1,
         .direction = direction,
     };
-    cbm_channels_push(&ctx->result->channels, ctx->arena, ch);
+    if (!cbm_channels_push(&ctx->result->channels, ctx->arena, ch)) {
+        return;
+    }
 }
 
 /* ══════════════════════════════════════════════════════════════════

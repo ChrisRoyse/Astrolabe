@@ -6,8 +6,8 @@
  *            (falls back to ~/.config/codebase-memory-mcp/config.json)
  *   Project: {repo_root}/.codebase-memory.json
  *
- * Project config wins over global. Unknown language values warn and are
- * skipped (fail-open). Missing files are silently ignored.
+ * Project config wins over global. Missing files are optional; present invalid
+ * or unreadable files fail the load.
  *
  * Format:
  *   {"extra_extensions": {".blade.php": "php", ".mjs": "javascript"}}
@@ -18,6 +18,7 @@
 #define CBM_USERCONFIG_H
 
 #include "cbm.h" /* CBMLanguage */
+#include <stdbool.h>
 
 /* ── Types ──────────────────────────────────────────────────────── */
 
@@ -40,7 +41,8 @@ typedef struct {
  * cbm_userconfig_free). Returns NULL only on allocation failure.
  * Missing config files are silently ignored.
  */
-cbm_userconfig_t *cbm_userconfig_load(const char *repo_path);
+int cbm_userconfig_load_checked(const char *repo_path, cbm_userconfig_t **out);
+bool cbm_userconfig_equal(const cbm_userconfig_t *left, const cbm_userconfig_t *right);
 
 /*
  * Look up a file extension in the user config.

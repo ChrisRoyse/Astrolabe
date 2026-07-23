@@ -66,6 +66,7 @@ typedef struct {
     cbm_pkg_entry_t *items;
     int count;
     int cap;
+    bool failed;
 } cbm_pkg_entries_t;
 
 void cbm_pkg_entries_init(cbm_pkg_entries_t *e);
@@ -74,8 +75,11 @@ void cbm_pkg_entries_free(cbm_pkg_entries_t *e);
 /* Shared context passed to each pass function.
  * Derived from cbm_pipeline_t fields during run. */
 typedef struct {
-    const char *project_name; /* borrowed from pipeline */
-    const char *repo_path;    /* borrowed from pipeline */
+    const char *project_name;         /* borrowed from pipeline */
+    const char *repo_path;            /* borrowed from pipeline */
+    const char *source_root;          /* immutable snapshot root for every source-derived read */
+    const cbm_file_info_t *all_files; /* complete captured source + interpretation inputs */
+    int all_file_count;
     cbm_gbuf_t *gbuf;         /* owned by pipeline */
     cbm_registry_t *registry; /* owned by pipeline */
     atomic_int *cancelled;    /* pointer to pipeline's cancelled flag */
@@ -164,9 +168,8 @@ const cbm_gbuf_node_t *cbm_pipeline_resolve_import_node(const cbm_pipeline_ctx_t
  * Each result that declared a namespace/package contributes one entry keyed by
  * the namespace string (e.g. "App.Utils", "com.example").  Returns NULL when no
  * results declared a namespace.  Caller frees via cbm_pipeline_namespace_map_free. */
-CBMHashTable *cbm_pipeline_namespace_map_build(const char *project_name,
-                                               CBMFileResult *const *results,
-                                               const char *const *rels, int count);
+int cbm_pipeline_namespace_map_build(const char *project_name, CBMFileResult *const *results,
+                                     const char *const *rels, int count, CBMHashTable **out_map);
 void cbm_pipeline_namespace_map_free(CBMHashTable *map);
 
 /* Parse a manifest file and collect pkg entries. Returns true if basename matched. */
@@ -178,13 +181,8 @@ CBMHashTable *cbm_pkgmap_build(cbm_pkg_entries_t *worker_entries, int worker_cou
                                const char *project_name);
 
 /* Build pkgmap by reading manifest files from the files array (sequential path). */
-int cbm_pkgmap_scan_repo(const char *repo_path, cbm_pkg_entries_t *entries, char **excluded_dirs,
-                         int excluded_count);
-CBMHashTable *cbm_pkgmap_build_from_repo(const char *repo_path, const cbm_file_info_t *files,
-                                         int file_count, const char *project_name,
-                                         char **excluded_dirs, int excluded_count);
-CBMHashTable *cbm_pkgmap_build_from_files(const cbm_file_info_t *files, int file_count,
-                                          const char *project_name);
+int cbm_pkgmap_build_from_files_checked(const cbm_file_info_t *files, int file_count,
+                                        const char *project_name, CBMHashTable **out);
 
 /* Free pkgmap and all owned strings. */
 void cbm_pkgmap_free(CBMHashTable *pkgmap);
@@ -613,26 +611,6 @@ int cbm_pipeline_pass_semantic_edges(cbm_pipeline_ctx_t *ctx);
  * cycles (recursive). Runs on the graph buffer before the dump. */
 void cbm_pipeline_pass_complexity(cbm_pipeline_ctx_t *ctx);
 
-/* ── Env URL scanner (pass_envscan.c) ────────────────────────────── */
-
-typedef struct {
-    char key[CBM_SZ_128];
-    char value[CBM_SZ_512];
-    char file_path[CBM_SZ_256];
-} cbm_env_binding_t;
-
-/* Scan a project directory for environment variable assignments with URL values.
- * Walks the filesystem, scans Dockerfiles, shell scripts, .env, YAML, TOML,
- * Terraform, and .properties files. Filters out secrets.
- * Returns number of bindings written to out (up to max_out).
- * NOTE: this walker currently has no production callers — it is exercised
- * only by tests. The _excluded variant honors discovery exclusions for
- * consistency with the pkgmap/path-alias walks (#792); the plain variant
- * scans unexcluded (NULL exclusion list). */
-int cbm_scan_project_env_urls(const char *root_path, cbm_env_binding_t *out, int max_out);
-int cbm_scan_project_env_urls_excluded(const char *root_path, cbm_env_binding_t *out, int max_out,
-                                       char **excluded_dirs, int excluded_count);
-
 /* ── Incremental pipeline (pipeline_incremental.c) ───────────────── */
 
 /* Run incremental re-index on an existing disk DB.
@@ -641,8 +619,11 @@ int cbm_scan_project_env_urls_excluded(const char *root_path, cbm_env_binding_t 
 int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_file_info_t *files,
                                  int file_count);
 
+enum { CBM_INCREMENTAL_REBUILD_REQUIRED = 2 };
+
 /* Pipeline accessors for incremental use */
 const char *cbm_pipeline_repo_path(const cbm_pipeline_t *p);
+const char *cbm_pipeline_source_root(const cbm_pipeline_t *p);
 atomic_int *cbm_pipeline_cancelled_ptr(cbm_pipeline_t *p);
 /* Record committed graph size (#334 gate axis) from the incremental path,
  * which cannot see the opaque cbm_pipeline struct. Call before the dump. */

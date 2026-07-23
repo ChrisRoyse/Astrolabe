@@ -306,7 +306,6 @@ extern char **environ;
 #define CBM_ENVIRON environ
 #endif
 
-#ifdef ASTRO_ENV_STORE
 /* Copy an environment value into the caller's buffer, refusing to truncate.
  *
  * #241: the vendored implementation discarded snprintf's return value, so a value
@@ -321,42 +320,44 @@ static const char *cbm_astro_copy_env_value(const char *name, const char *value,
     int written = snprintf(buf, buf_sz, "%s", value);
     if (written < 0 || (size_t)written >= buf_sz) {
         buf[0] = '\0';
+#ifdef ASTRO_ENV_STORE
         cbm_astro_env_record_truncation(name, strlen(value), buf_sz);
+#else
+        (void)name;
+#endif
         return NULL;
     }
     return buf;
 }
 
-#endif
-const char *cbm_safe_getenv(const char *name, char *buf, size_t buf_sz, const char *fallback) {
-#ifdef ASTRO_ENV_STORE
+int cbm_read_env(const char *name, char *buf, size_t buf_sz) {
     if (!name || !buf || buf_sz == 0) {
-        return NULL;
+        return -1;
     }
-#endif
     char **env = CBM_ENVIRON;
     if (env) {
         size_t nlen = strlen(name);
         for (; *env; env++) {
             if (strncmp(*env, name, nlen) == 0 && (*env)[nlen] == '=') {
-#ifdef ASTRO_ENV_STORE
-                return cbm_astro_copy_env_value(name, *env + nlen + SKIP_ONE, buf, buf_sz);
-#else
-                snprintf(buf, buf_sz, "%s", *env + nlen + SKIP_ONE);
-                return buf;
-#endif
+                return cbm_astro_copy_env_value(name, *env + nlen + SKIP_ONE, buf, buf_sz) ? 1 : -1;
             }
         }
     }
-    if (fallback) {
-#ifdef ASTRO_ENV_STORE
-        return cbm_astro_copy_env_value(name, fallback, buf, buf_sz);
-#else
-        snprintf(buf, buf_sz, "%s", fallback);
-        return buf;
-#endif
-    }
     buf[0] = '\0';
+    return 0;
+}
+
+const char *cbm_safe_getenv(const char *name, char *buf, size_t buf_sz, const char *fallback) {
+    int status = cbm_read_env(name, buf, buf_sz);
+    if (status > 0) {
+        return buf;
+    }
+    if (status < 0) {
+        return NULL;
+    }
+    if (fallback) {
+        return cbm_astro_copy_env_value(name, fallback, buf, buf_sz);
+    }
     return NULL;
 }
 

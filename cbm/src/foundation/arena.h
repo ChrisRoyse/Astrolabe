@@ -11,6 +11,7 @@
 #ifndef CBM_ARENA_H
 #define CBM_ARENA_H
 
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdarg.h>
 
@@ -24,6 +25,10 @@ typedef struct {
     size_t block_size;  /* current block capacity */
     size_t used;        /* bytes used in current block */
     size_t total_alloc; /* cumulative bytes allocated (for stats) */
+    bool failed;        /* sticky: no failed allocation may be forgotten */
+    const char *failure_code;
+    const char *failure_operation;
+    size_t failure_bytes;
 } CBMArena;
 
 /* Initialize arena with default block size. */
@@ -34,6 +39,14 @@ void cbm_arena_init_sized(CBMArena *a, size_t block_size);
 
 /* Allocate n bytes (8-byte aligned). Returns NULL on OOM. */
 void *cbm_arena_alloc(CBMArena *a, size_t n);
+
+/* Record/refine a sticky allocation failure. Strings must have static lifetime. */
+void cbm_arena_mark_failed(CBMArena *a, const char *code, const char *operation,
+                           size_t requested_bytes);
+bool cbm_arena_failed(const CBMArena *a);
+const char *cbm_arena_failure_code(const CBMArena *a);
+const char *cbm_arena_failure_operation(const CBMArena *a);
+size_t cbm_arena_failure_bytes(const CBMArena *a);
 
 /* Allocate n bytes, zero-initialized. */
 void *cbm_arena_calloc(CBMArena *a, size_t n);

@@ -13,8 +13,11 @@
 
 /* ── Directory iteration ──────────────────────────────────────── */
 
-/* Max filename length (MAX_PATH on Windows, NAME_MAX on POSIX). */
-#define CBM_DIRENT_NAME_MAX 260
+/* A Windows filename component may occupy up to 255 UTF-16 code units and
+ * therefore substantially more than 260 bytes after UTF-8 conversion.  Keep
+ * the complete component: truncating it aliases two different filesystem
+ * objects and makes a repository walk silently incomplete. */
+#define CBM_DIRENT_NAME_MAX 4096
 
 typedef struct cbm_dir cbm_dir_t;
 
@@ -30,6 +33,12 @@ cbm_dir_t *cbm_opendir(const char *path);
 /* Read next entry. Returns NULL when done. The returned pointer is
  * valid until the next cbm_readdir call on the same handle. */
 cbm_dirent_t *cbm_readdir(cbm_dir_t *d);
+
+/* Return the native error from the most recent directory operation.  Zero
+ * means clean end-of-directory.  cbm_opendir() failures are reported through
+ * cbm_fs_last_error(); cbm_readdir() failures through cbm_dir_error(). */
+unsigned long cbm_fs_last_error(void);
+unsigned long cbm_dir_error(const cbm_dir_t *d);
 
 /* Close directory handle. */
 void cbm_closedir(cbm_dir_t *d);

@@ -118,7 +118,9 @@ static void add_type_ref(CBMExtractCtx *ctx, const char *type_name, const char *
     CBMTypeRef tr;
     tr.type_name = type_name;
     tr.enclosing_func_qn = func_qn;
-    cbm_typerefs_push(&ctx->result->type_refs, ctx->arena, tr);
+    if (!cbm_typerefs_push(&ctx->result->type_refs, ctx->arena, tr)) {
+        return;
+    }
 }
 
 // Extract parameter types from a parameters/formal_parameters node.

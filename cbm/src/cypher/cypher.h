@@ -140,6 +140,7 @@ typedef struct {
     int count;
     int capacity;
     char *error; /* NULL if no error */
+    bool allocation_failed;
 } cbm_lex_result_t;
 
 /* Tokenize a Cypher query string. Caller must call cbm_lex_free(). */

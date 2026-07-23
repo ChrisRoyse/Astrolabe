@@ -2383,8 +2383,7 @@ static const CBMRegisteredFunc *rust_resolve_trait_method(RustLSPContext *ctx,
         *out_impl_count = impls;
     if (impls == 1)
         return unique;
-    const CBMRegisteredFunc *tm =
-        rust_lookup_method_in_trait(ctx, receiver_type_qn, method_name);
+    const CBMRegisteredFunc *tm = rust_lookup_method_in_trait(ctx, receiver_type_qn, method_name);
     if (nm_active && !tm && impls == 0) {
         cbm_negmemo_insert(&ctx->neg_memo, ctx->arena, nm_key);
     }
@@ -3494,7 +3493,9 @@ static void rust_inject_syn_call(RustLSPContext *ctx, const char *callee_qn) {
     CBMCall call = {0};
     call.callee_name = cbm_arena_strdup(ctx->arena, short_name);
     call.enclosing_func_qn = ctx->enclosing_func_qn;
-    cbm_calls_push(ctx->syn_calls, ctx->arena, call);
+    if (!cbm_calls_push(ctx->syn_calls, ctx->arena, call)) {
+        return;
+    }
 }
 
 static void rust_emit_resolved_call(RustLSPContext *ctx, const char *callee_qn,
@@ -3508,7 +3509,9 @@ static void rust_emit_resolved_call(RustLSPContext *ctx, const char *callee_qn,
         .confidence = confidence,
         .reason = NULL,
     };
-    cbm_resolvedcall_push(ctx->resolved_calls, ctx->arena, rc);
+    if (!cbm_resolvedcall_push(ctx->resolved_calls, ctx->arena, rc)) {
+        return;
+    }
     if (ctx->inject_syn_calls > 0) {
         rust_inject_syn_call(ctx, callee_qn);
     }
@@ -3525,7 +3528,9 @@ static void rust_emit_unresolved_call(RustLSPContext *ctx, const char *expr_text
         .confidence = 0.0f,
         .reason = reason,
     };
-    cbm_resolvedcall_push(ctx->resolved_calls, ctx->arena, rc);
+    if (!cbm_resolvedcall_push(ctx->resolved_calls, ctx->arena, rc)) {
+        return;
+    }
 }
 
 /* Entry hook: classify a call_expression and emit the best edge we can. */
@@ -5351,9 +5356,8 @@ extern const TSLanguage *tree_sitter_rust(void);
  * `module_qn` is ONLY the fallback used to qualify a def's return type when that def
  * carries no def_module_qn; pass NULL for the shared build (all_defs always carry
  * def_module_qn — verified: 0 NULL across the C + Rust kernel corpora). */
-static void rust_populate_cross_registry(CBMTypeRegistry *reg, CBMArena *arena,
-                                         CBMRustLSPDef *defs, int def_count,
-                                         const char *module_qn) {
+static void rust_populate_cross_registry(CBMTypeRegistry *reg, CBMArena *arena, CBMRustLSPDef *defs,
+                                         int def_count, const char *module_qn) {
     cbm_registry_init(reg, arena);
     cbm_rust_stdlib_register(reg, arena);
 

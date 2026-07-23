@@ -157,15 +157,41 @@ pub fn query_store_search_schema_counts(
     let sort_by = CString::new("name").expect("static sort key has no NUL byte");
 
     unsafe {
-        let store = cbm_store_open_path_query(db_path.as_ptr());
-        if store.is_null() {
-            return Err("CBM store open returned NULL".to_string());
+        let mut verification = cbm_store_verify_result_t::default();
+        let mut store = ptr::null_mut();
+        let status =
+            cbm_store_open_path_query_verified(db_path.as_ptr(), &mut store, &mut verification);
+        if status != cbm_store_verify_status_t_CBM_STORE_VERIFY_OK || store.is_null() {
+            if !store.is_null() {
+                cbm_store_close(store);
+            }
+            let code = if status == cbm_store_verify_status_t_CBM_STORE_VERIFY_INTEGRITY_FAILED {
+                "CBM_STORE_INTEGRITY_FAILED"
+            } else if status == cbm_store_verify_status_t_CBM_STORE_VERIFY_SOURCE_MISSING {
+                "CBM_STORE_SOURCE_MISSING"
+            } else {
+                "CBM_STORE_VERIFICATION_FAILED"
+            };
+            return Err(format!(
+                "code={code} status={status} operation={} native_error={} sqlite_error={} detail={} remediation=preserve the database, WAL, and SHM together; resolve the reported failure, then retry",
+                c_char_array(&verification.operation),
+                verification.native_error,
+                verification.sqlite_error,
+                c_char_array(&verification.detail),
+            ));
         }
 
         let result = query_open_store_search_schema_counts(store, &project, &label, &sort_by);
         cbm_store_close(store);
         result
     }
+}
+
+fn c_char_array<const N: usize>(value: &[std::os::raw::c_char; N]) -> String {
+    // The C verifier always NUL-terminates these fixed-capacity diagnostics.
+    unsafe { CStr::from_ptr(value.as_ptr()) }
+        .to_string_lossy()
+        .into_owned()
 }
 
 unsafe fn query_open_store_search_schema_counts(

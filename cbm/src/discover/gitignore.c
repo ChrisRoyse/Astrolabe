@@ -18,6 +18,9 @@ enum { GI_INIT_CAP = 16, GI_CHAR_IDX1 = 1, GI_CHAR_IDX2 = 2, GI_SKIP3 = 3 };
 #include "discover/discover.h"
 
 #include <ctype.h>
+#include <errno.h>
+#include <limits.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -173,14 +176,14 @@ static bool glob_match(const char *pat, const char *str) { // NOLINT(misc-no-rec
 
 /* ── Pattern parsing ─────────────────────────────────────────────── */
 
-static void gi_add_pattern(cbm_gitignore_t *gi, const char *line, int len) {
+static bool gi_add_pattern(cbm_gitignore_t *gi, const char *line, int len) {
     /* Trim trailing whitespace */
     while (len > 0 && (line[len - SKIP_ONE] == ' ' || line[len - SKIP_ONE] == '\t' ||
                        line[len - SKIP_ONE] == '\r')) {
         len--;
     }
     if (len == 0) {
-        return;
+        return true;
     }
 
     gi_pattern_t p = {0};
@@ -194,7 +197,7 @@ static void gi_add_pattern(cbm_gitignore_t *gi, const char *line, int len) {
     }
 
     if (len == 0) {
-        return;
+        return true;
     }
 
     /* Check for trailing / (directory-only) */
@@ -204,7 +207,7 @@ static void gi_add_pattern(cbm_gitignore_t *gi, const char *line, int len) {
     }
 
     if (len == 0) {
-        return;
+        return true;
     }
 
     /* Check for leading / (rooted) */
@@ -215,7 +218,7 @@ static void gi_add_pattern(cbm_gitignore_t *gi, const char *line, int len) {
     }
 
     if (len == 0) {
-        return;
+        return true;
     }
 
     /* Check if pattern contains / anywhere (makes it rooted) */
@@ -231,7 +234,7 @@ static void gi_add_pattern(cbm_gitignore_t *gi, const char *line, int len) {
     /* Copy pattern */
     p.pattern = malloc(len + SKIP_ONE);
     if (!p.pattern) {
-        return;
+        return false;
     }
     memcpy(p.pattern, start, len);
     p.pattern[len] = '\0';
@@ -242,36 +245,50 @@ static void gi_add_pattern(cbm_gitignore_t *gi, const char *line, int len) {
         gi_pattern_t *new_patterns = realloc(gi->patterns, new_cap * sizeof(gi_pattern_t));
         if (!new_patterns) {
             free(p.pattern);
-            return;
+            return false;
         }
         gi->patterns = new_patterns;
         gi->capacity = new_cap;
     }
 
     gi->patterns[gi->count++] = p;
+    return true;
 }
 
 /* ── Public API ──────────────────────────────────────────────────── */
 
-cbm_gitignore_t *cbm_gitignore_parse(const char *content) {
-    if (!content) {
-        return NULL;
+static int gitignore_parse_checked(const char *content, cbm_gitignore_t **out) {
+    if (!content || !out) {
+        errno = EINVAL;
+        return CBM_NOT_FOUND;
     }
+    *out = NULL;
 
     cbm_gitignore_t *gi = calloc(CBM_ALLOC_ONE, sizeof(cbm_gitignore_t));
     if (!gi) {
-        return NULL;
+        errno = ENOMEM;
+        return CBM_NOT_FOUND;
     }
 
     const char *line = content;
     while (*line) {
         /* Find end of line */
         const char *eol = strchr(line, '\n');
-        int len = eol ? (int)(eol - line) : (int)strlen(line);
+        size_t line_len = eol ? (size_t)(eol - line) : strlen(line);
+        if (line_len > INT_MAX) {
+            cbm_gitignore_free(gi);
+            errno = EOVERFLOW;
+            return CBM_NOT_FOUND;
+        }
+        int len = (int)line_len;
 
         /* Skip comments and blank lines */
         if (len > 0 && line[0] != '#') {
-            gi_add_pattern(gi, line, len);
+            if (!gi_add_pattern(gi, line, len)) {
+                cbm_gitignore_free(gi);
+                errno = ENOMEM;
+                return CBM_NOT_FOUND;
+            }
         }
 
         if (!eol) {
@@ -280,42 +297,68 @@ cbm_gitignore_t *cbm_gitignore_parse(const char *content) {
         line = eol + SKIP_ONE;
     }
 
-    return gi;
+    *out = gi;
+    return 0;
 }
 
-cbm_gitignore_t *cbm_gitignore_load(const char *path) {
-    if (!path) {
-        return NULL;
+cbm_gitignore_t *cbm_gitignore_parse(const char *content) {
+    cbm_gitignore_t *gi = NULL;
+    return gitignore_parse_checked(content, &gi) == 0 ? gi : NULL;
+}
+
+int cbm_gitignore_load_checked(const char *path, bool optional, cbm_gitignore_t **out) {
+    if (!path || !out) {
+        errno = EINVAL;
+        return CBM_NOT_FOUND;
     }
+    *out = NULL;
 
     FILE *f = cbm_fopen(path, "r");
     if (!f) {
-        return NULL;
+        if (optional && (errno == ENOENT || errno == ENOTDIR)) {
+            return 0;
+        }
+        return CBM_NOT_FOUND;
     }
 
     /* Read entire file */
-    (void)fseek(f, 0, SEEK_END);
-    long size = ftell(f);
-    (void)fseek(f, 0, SEEK_SET);
-
-    if (size <= 0) {
+    if (fseek(f, 0, SEEK_END) != 0) {
         (void)fclose(f);
-        return cbm_gitignore_parse("");
+        return CBM_NOT_FOUND;
+    }
+    long size = ftell(f);
+    if (size < 0 || fseek(f, 0, SEEK_SET) != 0) {
+        (void)fclose(f);
+        return CBM_NOT_FOUND;
+    }
+    if ((uintmax_t)size > SIZE_MAX - SKIP_ONE) {
+        (void)fclose(f);
+        errno = EOVERFLOW;
+        return CBM_NOT_FOUND;
     }
 
-    char *buf = malloc(size + SKIP_ONE);
+    char *buf = malloc((size_t)size + SKIP_ONE);
     if (!buf) {
         (void)fclose(f);
-        return NULL;
+        errno = ENOMEM;
+        return CBM_NOT_FOUND;
     }
 
-    size_t n = fread(buf, SKIP_ONE, size, f);
+    size_t n = fread(buf, SKIP_ONE, (size_t)size, f);
+    bool complete = n == (size_t)size && ferror(f) == 0;
+    if (fclose(f) != 0) {
+        complete = false;
+    }
+    if (!complete) {
+        free(buf);
+        errno = EIO;
+        return CBM_NOT_FOUND;
+    }
     buf[n] = '\0';
-    (void)fclose(f);
 
-    cbm_gitignore_t *gi = cbm_gitignore_parse(buf);
+    int rc = gitignore_parse_checked(buf, out);
     free(buf);
-    return gi;
+    return rc;
 }
 
 /* Match a non-rooted pattern against basename and path suffixes. */

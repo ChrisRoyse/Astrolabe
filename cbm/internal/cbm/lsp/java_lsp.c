@@ -1793,7 +1793,9 @@ static void java_emit_resolved_orig(JavaLSPContext *ctx, const char *callee_qn, 
     // pipeline join can match the textual call site even though the resolved
     // callee_qn's short name differs. NULL/unread for normal resolved calls.
     rc.reason = orig;
-    cbm_resolvedcall_push(ctx->resolved_calls, ctx->arena, rc);
+    if (!cbm_resolvedcall_push(ctx->resolved_calls, ctx->arena, rc)) {
+        return;
+    }
 }
 
 static void java_emit_resolved(JavaLSPContext *ctx, const char *callee_qn, const char *strategy,
@@ -1810,7 +1812,9 @@ static void java_emit_unresolved(JavaLSPContext *ctx, const char *expr_text, con
     rc.strategy = "lsp_unresolved";
     rc.confidence = 0.0f;
     rc.reason = reason;
-    cbm_resolvedcall_push(ctx->resolved_calls, ctx->arena, rc);
+    if (!cbm_resolvedcall_push(ctx->resolved_calls, ctx->arena, rc)) {
+        return;
+    }
 }
 
 /* Find a sole concrete in-project implementer of interface `iface_qn` that

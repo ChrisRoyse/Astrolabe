@@ -424,14 +424,24 @@ float cbm_sem_cosine(const cbm_sem_vec_t *a, const cbm_sem_vec_t *b) {
 /* Pretrained token lookup table — built lazily on first use. */
 static CBMHashTable *g_pretrained_map = NULL;
 static _Atomic int g_pretrained_ready = 0;
+static _Atomic bool g_pretrained_failed = false;
 static cbm_mutex_t g_pretrained_mtx;
 static _Atomic int g_pretrained_mtx_init = 0;
 
 /* Thread-safe lazy init of the pretrained token lookup map.
  * Uses double-checked locking: fast path reads an atomic flag. */
-static void ensure_pretrained_map(void) {
+static void pretrained_entry_free(const char *key, void *value, void *userdata) {
+    (void)userdata;
+    free((void *)key);
+    free(value);
+}
+
+static bool ensure_pretrained_map(void) {
     if (atomic_load_explicit(&g_pretrained_ready, memory_order_acquire)) {
-        return;
+        return true;
+    }
+    if (atomic_load_explicit(&g_pretrained_failed, memory_order_acquire)) {
+        return false;
     }
     /* First-time init of the mutex itself (also needs to be thread-safe) */
     int expected = MTX_STATE_UNINIT;
@@ -449,22 +459,49 @@ static void ensure_pretrained_map(void) {
     }
     cbm_mutex_lock(&g_pretrained_mtx);
     if (!atomic_load_explicit(&g_pretrained_ready, memory_order_acquire)) {
-        g_pretrained_map = cbm_ht_create(PRETRAINED_TOKEN_COUNT);
+        CBMHashTable *map = cbm_ht_create(PRETRAINED_TOKEN_COUNT);
+        if (!map) {
+            atomic_store_explicit(&g_pretrained_failed, true, memory_order_release);
+            cbm_log_error("semantic.pretrained_failed", "code", "CBM_PRETRAINED_MAP_ALLOC_FAILED",
+                          "component", "semantic.pretrained_map", "operation", "create", "key", "",
+                          "message", "pretrained token map could not be allocated", "remediation",
+                          "free memory or reduce repository size, then retry");
+            cbm_mutex_unlock(&g_pretrained_mtx);
+            return false;
+        }
         char idx_buf[CBM_SZ_16];
         for (int i = 0; i < PRETRAINED_TOKEN_COUNT; i++) {
             const char *tok = PRETRAINED_TOKENS[i];
             if (tok && tok[0]) {
                 snprintf(idx_buf, sizeof(idx_buf), "%d", i);
-                cbm_ht_set(g_pretrained_map, strdup(tok), strdup(idx_buf));
+                char *owned_token = strdup(tok);
+                char *owned_index = strdup(idx_buf);
+                if (!owned_token || !owned_index ||
+                    !cbm_ht_set_checked(map, owned_token, owned_index, NULL)) {
+                    free(owned_token);
+                    free(owned_index);
+                    cbm_ht_foreach(map, pretrained_entry_free, NULL);
+                    cbm_ht_free(map);
+                    atomic_store_explicit(&g_pretrained_failed, true, memory_order_release);
+                    cbm_log_error(
+                        "semantic.pretrained_failed", "code", "CBM_PRETRAINED_MAP_INSERT_FAILED",
+                        "component", "semantic.pretrained_map", "operation", "insert", "key", tok,
+                        "message", "pretrained token map could not retain an entry", "remediation",
+                        "free memory or reduce repository size, then retry");
+                    cbm_mutex_unlock(&g_pretrained_mtx);
+                    return false;
+                }
             }
         }
+        g_pretrained_map = map;
         atomic_store_explicit(&g_pretrained_ready, MAP_READY, memory_order_release);
     }
     cbm_mutex_unlock(&g_pretrained_mtx);
+    return true;
 }
 
-void cbm_sem_ensure_ready(void) {
-    ensure_pretrained_map();
+bool cbm_sem_ensure_ready(void) {
+    return ensure_pretrained_map();
 }
 
 void cbm_sem_random_index(const char *token, cbm_sem_vec_t *out) {
@@ -474,7 +511,9 @@ void cbm_sem_random_index(const char *token, cbm_sem_vec_t *out) {
     }
 
     /* Try pretrained nomic-embed-code vector first (768d, distilled from 7B). */
-    ensure_pretrained_map();
+    if (!ensure_pretrained_map()) {
+        return;
+    }
     const char *idx_str = cbm_ht_get(g_pretrained_map, token);
     if (idx_str) {
         char *end = NULL;
@@ -727,8 +766,7 @@ static int corpus_get_or_add(cbm_sem_corpus_t *c, const char *token) {
         return CBM_NOT_FOUND;
     }
 
-    (void)cbm_ht_set(c->token_map, map_key, map_value);
-    if (cbm_ht_get(c->token_map, token) != map_value) {
+    if (!cbm_ht_set_checked(c->token_map, map_key, map_value, NULL)) {
         free(entry_token);
         free(map_key);
         free(map_value);
@@ -952,8 +990,7 @@ static void batch_resolve_worker(int worker_id, void *ctx_ptr) {
                 int *grown = realloc(seen, (size_t)count * sizeof(int));
                 if (!grown) {
                     corpus_log_error("semantic.corpus.oom", CBM_SEM_CORPUS_ALLOC_FAILED,
-                                     "batch_resolve_seen", "seen-set scratch growth failed",
-                                     count);
+                                     "batch_resolve_seen", "seen-set scratch growth failed", count);
                     atomic_store_explicit(&bc->failed, SKIP_ONE, memory_order_release);
                     break;
                 }
@@ -1027,8 +1064,7 @@ int cbm_sem_corpus_add_docs_batch(cbm_sem_corpus_t *corpus, char **all_tokens,
         if (count < 0 || count > max_tokens_per_doc) {
             corpus_rollback_entries(corpus, base_entry_count);
             corpus_log_error("semantic.corpus.invalid_input", CBM_SEM_CORPUS_INVALID_INPUT,
-                             "add_docs_batch", "document token count outside batch layout",
-                             count);
+                             "add_docs_batch", "document token count outside batch layout", count);
             return CBM_NOT_FOUND;
         }
         char **tokens = &all_tokens[(ptrdiff_t)d * max_tokens_per_doc];
@@ -1640,52 +1676,42 @@ static void finalize_pass1(finalize_params_t *p) {
 }
 
 /* Sub-phases 4+5: quantize pass1 to int8, run RRI pass 2, blend + normalize. */
-static void finalize_pass2(finalize_params_t *p) {
-    int8_t *pass1_q = malloc((size_t)p->corpus->entry_count * CBM_SEM_DIM * sizeof(int8_t));
-    if (pass1_q) {
-        pass1_quant_ctx_t qc = {
-            .entries = p->corpus->entries,
-            .pass1_q = pass1_q,
-            .entry_count = p->corpus->entry_count,
-        };
-        atomic_init(&qc.next_idx, 0);
-        cbm_parallel_for(p->worker_count, pass1_quantize_worker, &qc, p->opts);
+static void finalize_pass2(finalize_params_t *p, int8_t *pass1_q, cbm_sem_vec_t *pass1) {
+    pass1_quant_ctx_t qc = {
+        .entries = p->corpus->entries,
+        .pass1_q = pass1_q,
+        .entry_count = p->corpus->entry_count,
+    };
+    atomic_init(&qc.next_idx, 0);
+    cbm_parallel_for(p->worker_count, pass1_quantize_worker, &qc, p->opts);
+
+    for (int i = 0; i < p->corpus->entry_count; i++) {
+        pass1[i] = p->corpus->entries[i].enriched_vec;
     }
 
-    cbm_sem_vec_t *pass1 = malloc((size_t)p->corpus->entry_count * sizeof(cbm_sem_vec_t));
-    if (pass1) {
-        for (int i = 0; i < p->corpus->entry_count; i++) {
-            pass1[i] = p->corpus->entries[i].enriched_vec;
-        }
-    }
+    cooccur_int8_ctx_t cc = {
+        .entries = p->corpus->entries,
+        .pass1_q = pass1_q,
+        .doc_token_ids = p->corpus->doc_token_ids,
+        .doc_token_counts = p->corpus->doc_token_counts,
+        .rev = p->rev,
+        .doc_count = p->corpus->doc_count,
+        .entry_count = p->corpus->entry_count,
+        .num_chunks = p->num_chunks,
+        .chunk_size = p->chunk_size,
+        .tile_size = p->tile_size,
+    };
+    atomic_init(&cc.next_chunk, 0);
+    cbm_parallel_for(p->worker_count, cooccur_worker_int8, &cc, p->opts);
 
-    if (pass1_q) {
-        cooccur_int8_ctx_t cc = {
-            .entries = p->corpus->entries,
-            .pass1_q = pass1_q,
-            .doc_token_ids = p->corpus->doc_token_ids,
-            .doc_token_counts = p->corpus->doc_token_counts,
-            .rev = p->rev,
-            .doc_count = p->corpus->doc_count,
-            .entry_count = p->corpus->entry_count,
-            .num_chunks = p->num_chunks,
-            .chunk_size = p->chunk_size,
-            .tile_size = p->tile_size,
-        };
-        atomic_init(&cc.next_chunk, 0);
-        cbm_parallel_for(p->worker_count, cooccur_worker_int8, &cc, p->opts);
-    }
-
-    if (pass1) {
-        blend_ctx_t bc = {
-            .entries = p->corpus->entries,
-            .pass1 = pass1,
-            .entry_count = p->corpus->entry_count,
-        };
-        atomic_init(&bc.next_idx, 0);
-        cbm_parallel_for(p->worker_count, blend_worker, &bc, p->opts);
-        free(pass1);
-    }
+    blend_ctx_t bc = {
+        .entries = p->corpus->entries,
+        .pass1 = pass1,
+        .entry_count = p->corpus->entry_count,
+    };
+    atomic_init(&bc.next_idx, 0);
+    cbm_parallel_for(p->worker_count, blend_worker, &bc, p->opts);
+    free(pass1);
     free(pass1_q);
 
     norm_ctx_t nc = {.entries = p->corpus->entries, .entry_count = p->corpus->entry_count};
@@ -1693,13 +1719,20 @@ static void finalize_pass2(finalize_params_t *p) {
     cbm_parallel_for(p->worker_count, normalize_worker, &nc, p->opts);
 }
 
-void cbm_sem_corpus_finalize(cbm_sem_corpus_t *corpus) {
+bool cbm_sem_corpus_finalize(cbm_sem_corpus_t *corpus) {
     if (!corpus || corpus->finalized) {
-        return;
+        return corpus && corpus->finalized;
     }
 
     /* Eager init before parallel dispatch to avoid lazy-init races */
-    ensure_pretrained_map();
+    if (!ensure_pretrained_map()) {
+        return false;
+    }
+
+    if (corpus->entry_count == 0) {
+        corpus->finalized = true;
+        return true;
+    }
 
     int worker_count = cbm_default_worker_count(false);
     cbm_parallel_for_opts_t opts = {.max_workers = worker_count, .force_pthreads = false};
@@ -1716,15 +1749,48 @@ void cbm_sem_corpus_finalize(cbm_sem_corpus_t *corpus) {
 
     reverse_index_t *rev = build_reverse_index(corpus);
     if (!rev) {
-        corpus->finalized = true;
-        return;
+        corpus_log_error("semantic.corpus.oom", CBM_SEM_CORPUS_ALLOC_FAILED,
+                         "finalize_reverse_index", "reverse-index allocation failed",
+                         corpus->entry_count);
+        return false;
     }
-    cbm_sem_src_entry_t *src_entries =
-        calloc((size_t)corpus->entry_count, sizeof(cbm_sem_src_entry_t));
+    size_t src_entries_bytes = 0;
+    if (!corpus_array_bytes(corpus->entry_count, sizeof(cbm_sem_src_entry_t), &src_entries_bytes)) {
+        free_reverse_index(rev);
+        corpus_log_error("semantic.corpus.capacity_overflow", CBM_SEM_CORPUS_CAPACITY_OVERFLOW,
+                         "finalize_sources", "source-vector allocation size overflow",
+                         corpus->entry_count);
+        return false;
+    }
+    cbm_sem_src_entry_t *src_entries = calloc(SKIP_ONE, src_entries_bytes);
     if (!src_entries) {
         free_reverse_index(rev);
-        corpus->finalized = true;
-        return;
+        corpus_log_error("semantic.corpus.oom", CBM_SEM_CORPUS_ALLOC_FAILED, "finalize_sources",
+                         "source-vector allocation failed", corpus->entry_count);
+        return false;
+    }
+    size_t pass1_q_bytes = 0;
+    size_t pass1_bytes = 0;
+    if (!corpus_array_bytes(corpus->entry_count, CBM_SEM_DIM * sizeof(int8_t), &pass1_q_bytes) ||
+        !corpus_array_bytes(corpus->entry_count, sizeof(cbm_sem_vec_t), &pass1_bytes)) {
+        free(src_entries);
+        free_reverse_index(rev);
+        corpus_log_error("semantic.corpus.capacity_overflow", CBM_SEM_CORPUS_CAPACITY_OVERFLOW,
+                         "finalize_pass2", "pass-two allocation size overflow",
+                         corpus->entry_count);
+        return false;
+    }
+    int8_t *pass1_q = malloc(pass1_q_bytes);
+    cbm_sem_vec_t *pass1 = malloc(pass1_bytes);
+    if (!pass1_q || !pass1) {
+        free(pass1_q);
+        free(pass1);
+        free(src_entries);
+        free_reverse_index(rev);
+        corpus_log_error("semantic.corpus.oom", CBM_SEM_CORPUS_ALLOC_FAILED, "finalize_pass2",
+                         "pass-two quantized or blend-vector allocation failed",
+                         corpus->entry_count);
+        return false;
     }
 
     finalize_params_t params = {
@@ -1739,11 +1805,12 @@ void cbm_sem_corpus_finalize(cbm_sem_corpus_t *corpus) {
     };
     finalize_build_sources(&params);
     finalize_pass1(&params);
-    finalize_pass2(&params);
+    finalize_pass2(&params, pass1_q, pass1);
 
     free(src_entries);
     free_reverse_index(rev);
     corpus->finalized = true;
+    return true;
 }
 
 /* Parse a decimal index string via strtol, returning CBM_NOT_FOUND on parse

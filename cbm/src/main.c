@@ -156,6 +156,8 @@ static void *http_thread(void *arg) {
 
 /* ── Index callback for watcher ─────────────────────────────────── */
 
+static int cli_mcp_result_exit_code(const char *result);
+
 static int watcher_index_fn(const char *project_name, const char *root_path, void *user_data) {
     (void)user_data;
 
@@ -176,18 +178,22 @@ static int watcher_index_fn(const char *project_name, const char *root_path, voi
     /* #832: route the re-index through the supervised worker subprocess so this
      * long-lived server process hands its RSS back to the OS on every cycle
      * instead of ratcheting (mimalloc v3 does not reclaim pages that worker
-     * threads abandon at exit). The child writes the DB; the parent only needs the
-     * return code. The pipeline lock (already held) still serialises re-indexes.
-     * Degrade to the in-process pipeline when the supervisor is off (kill switch)
-     * or the spawn fails. */
+     * threads abandon at exit). The child writes the DB; the parent reads the
+     * actual MCP result. The pipeline lock still serialises re-indexes. */
     if (cbm_index_supervisor_should_wrap()) {
         char *resp = cbm_mcp_index_run_supervised_path(root_path);
         if (resp) {
+            int result_rc = cli_mcp_result_exit_code(resp);
             free(resp);
             cbm_pipeline_unlock();
-            return 0;
+            return result_rc == 0 ? 0 : CBM_NOT_FOUND;
         }
-        /* resp == NULL → spawn-failure degrade → fall through to in-process. */
+        cbm_log_error("watcher.reindex_failed", "code", "CBM_WATCHER_SUPERVISOR_NO_RESPONSE",
+                      "project", project_name, "message",
+                      "the isolated watcher index produced no response", "remediation",
+                      "inspect supervisor process diagnostics before retrying");
+        cbm_pipeline_unlock();
+        return CBM_NOT_FOUND;
     }
 
     cbm_pipeline_t *p = cbm_pipeline_new(root_path, NULL, CBM_MODE_FULL);
@@ -204,8 +210,8 @@ static int watcher_index_fn(const char *project_name, const char *root_path, voi
 
 /* ── CLI mode ───────────────────────────────────────────────────── */
 
-#define CLI_USAGE                                                             \
-    "Usage: codebase-memory-mcp cli [--progress] [--json] <tool_name> "       \
+#define CLI_USAGE                                                              \
+    "Usage: codebase-memory-mcp cli [--progress] [--json] <tool_name> "        \
     "[--args-file <path> | (JSON on stdin)]\n"                                 \
     "  --json prints the raw tool result JSON on stdout and exits 1 when the " \
     "result is isError:true (0 otherwise), so RC-based callers see tool "      \
@@ -216,20 +222,19 @@ static int watcher_index_fn(const char *project_name, const char *root_path, voi
  *
  * Single source of truth for the CLI exit code, shared by BOTH the pretty
  * (cli_print_mcp_result) and the raw `--json` paths so the two never diverge
- * — the whole point of #425 / #419. Unparseable results count as success (0),
- * matching the astrolabe host's `mcp_result_exit_code`
- * (crates/astrolabe-server/src/lib.rs, #419) and this file's pretty path, so
- * the standalone and host CLI surfaces expose one identical exit-code contract.
- * (A tool that ran produces a well-formed MCP envelope; an unparseable string
- * is not a tool-reported error and is treated as the host treats it.) */
+ * — the whole point of #425 / #419. An absent/malformed envelope fails closed:
+ * a worker response that cannot prove isError:false is not successful. */
 static int cli_mcp_result_exit_code(const char *result) {
+    if (!result) {
+        return SKIP_ONE;
+    }
     yyjson_doc *doc = yyjson_read(result, strlen(result), 0);
     if (!doc) {
-        return 0;
+        return SKIP_ONE;
     }
     yyjson_val *root = yyjson_doc_get_root(doc);
     yyjson_val *err_val = yyjson_obj_get(root, "isError");
-    bool is_error = err_val && yyjson_get_bool(err_val);
+    bool is_error = !err_val || !yyjson_is_bool(err_val) || yyjson_get_bool(err_val);
     yyjson_doc_free(doc);
     return is_error ? SKIP_ONE : 0;
 }

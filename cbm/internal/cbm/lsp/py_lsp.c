@@ -403,7 +403,9 @@ static void py_emit_resolved_call_reason(PyLSPContext *ctx, const char *callee_q
     rc.strategy = strategy;
     rc.confidence = confidence;
     rc.reason = reason ? cbm_arena_strdup(ctx->arena, reason) : NULL;
-    cbm_resolvedcall_push(ctx->resolved_calls, ctx->arena, rc);
+    if (!cbm_resolvedcall_push(ctx->resolved_calls, ctx->arena, rc)) {
+        return;
+    }
 }
 
 static void py_emit_resolved_call(PyLSPContext *ctx, const char *callee_qn, const char *strategy,
@@ -2047,8 +2049,8 @@ static void py_emit_call_for(PyLSPContext *ctx, TSNode call_node) {
                     // Skip if mod is already rooted under the project to avoid
                     // "<root>.<root>.mod".
                     if (!(strncmp(mod, ctx->module_qn, root_len) == 0 && mod[root_len] == '.')) {
-                        char *qual_mod = (char *)cbm_arena_alloc(ctx->arena, root_len + 1 +
-                                                                                strlen(mod) + 1);
+                        char *qual_mod =
+                            (char *)cbm_arena_alloc(ctx->arena, root_len + 1 + strlen(mod) + 1);
                         if (qual_mod) {
                             memcpy(qual_mod, ctx->module_qn, root_len);
                             qual_mod[root_len] = '.';
@@ -2475,7 +2477,9 @@ static void py_emit_dunder_call(PyLSPContext *ctx, const CBMType *recv, const ch
             memset(&call, 0, sizeof(call));
             call.callee_name = cbm_arena_strdup(ctx->arena, dunder);
             call.enclosing_func_qn = ctx->enclosing_func_qn;
-            cbm_calls_push(ctx->syn_calls, ctx->arena, call);
+            if (!cbm_calls_push(ctx->syn_calls, ctx->arena, call)) {
+                return;
+            }
         }
     }
 }
@@ -3293,10 +3297,8 @@ static void py_process_function(PyLSPContext *ctx, TSNode func_node, const char 
     // For methods, bind `self`/`cls` AFTER param walk so the receiver type
     // wins over the unannotated `self` / `cls` parameter declaration.
     if (ctx->enclosing_class_qn) {
-        py_scope_bind(ctx, "self",
-                       cbm_type_named(ctx->arena, ctx->enclosing_class_qn));
-        py_scope_bind(ctx, "cls",
-                       cbm_type_named(ctx->arena, ctx->enclosing_class_qn));
+        py_scope_bind(ctx, "self", cbm_type_named(ctx->arena, ctx->enclosing_class_qn));
+        py_scope_bind(ctx, "cls", cbm_type_named(ctx->arena, ctx->enclosing_class_qn));
     }
 
     TSNode body = ts_node_child_by_field_name(func_node, "body", 4);

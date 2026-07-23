@@ -65,20 +65,29 @@ void cbm_ht_free(CBMHashTable *ht) {
     free(ht);
 }
 
-void *cbm_ht_set(CBMHashTable *ht, const char *key, void *value) {
-    if (!ht || !key)
-        return NULL;
-    /* Capture previous value (if any) before overwriting.
-     * Verstable's _insert overwrites silently and returns an iterator
-     * to the (now updated) entry — we have to peek first to surface
-     * the prior value to the caller (back-compat with our API). */
+bool cbm_ht_set_checked(CBMHashTable *ht, const char *key, void *value, void **previous_out) {
+    if (previous_out) {
+        *previous_out = NULL;
+    }
+    if (!ht || !key) {
+        return false;
+    }
+
+    /* Capture replacement state independently from insertion success. */
     void *prev = NULL;
     cbm_vt_itr itr = cbm_vt_get(&ht->vt, key);
     if (!cbm_vt_is_end(itr)) {
         prev = itr.data->val;
     }
-    (void)cbm_vt_insert(&ht->vt, key, value);
-    return prev;
+
+    cbm_vt_itr inserted = cbm_vt_insert(&ht->vt, key, value);
+    if (cbm_vt_is_end(inserted)) {
+        return false;
+    }
+    if (previous_out) {
+        *previous_out = prev;
+    }
+    return true;
 }
 
 void *cbm_ht_get(const CBMHashTable *ht, const char *key) {

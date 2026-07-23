@@ -28,6 +28,7 @@ enum { REG_MAX_CANDIDATES = 256 };
 #include "foundation/compat.h" /* CBM_TLS */
 #include "foundation/hash_table.h"
 #include "foundation/dyn_array.h"
+#include "foundation/log.h"
 #include "foundation/platform.h"
 
 #include <math.h>
@@ -85,6 +86,7 @@ struct cbm_registry {
 
     /* byName: simpleName → qn_array_t* (heap-owned) */
     CBMHashTable *by_name;
+    bool failed;
 };
 
 /* ── Helpers ─────────────────────────────────────────────────────── */
@@ -189,6 +191,7 @@ static const char *best_by_import_distance(const char **candidates, int count,
  * file exit. Thread-local so each worker has its own cache without
  * contention. */
 static CBM_TLS CBMHashTable *_reach_cache = NULL;
+static CBM_TLS bool _registry_cache_failed = false;
 
 /* Sentinels stored as values in the cache. NULL means "not cached".
  * We need two distinct non-NULL pointers to encode true/false. */
@@ -202,6 +205,7 @@ static void reach_cache_free_key(const char *key, void *val, void *ud) {
 }
 
 void cbm_registry_reach_cache_begin(int estimated_capacity) {
+    _registry_cache_failed = false;
     if (_reach_cache) {
         /* Defensive: caller forgot to call _end. Clear and reuse. */
         cbm_ht_foreach(_reach_cache, reach_cache_free_key, NULL);
@@ -211,6 +215,13 @@ void cbm_registry_reach_cache_begin(int estimated_capacity) {
     if (estimated_capacity < 16)
         estimated_capacity = 16;
     _reach_cache = cbm_ht_create((uint32_t)estimated_capacity);
+    if (!_reach_cache) {
+        _registry_cache_failed = true;
+        cbm_log_error("registry.cache_failed", "code", "CBM_REACH_CACHE_ALLOC_FAILED", "component",
+                      "registry.reach_cache", "operation", "create", "key", "", "message",
+                      "import-reachability cache could not be allocated", "remediation",
+                      "free memory or reduce repository size, then retry");
+    }
 }
 
 void cbm_registry_reach_cache_end(void) {
@@ -241,11 +252,27 @@ void cbm_registry_import_map_cache_begin(const char **keys, const char **vals, i
     if (!keys || !vals || count <= 0)
         return;
     _import_map_cache = cbm_ht_create((uint32_t)count * 2u + 8u);
-    if (!_import_map_cache)
+    if (!_import_map_cache) {
+        _registry_cache_failed = true;
+        cbm_log_error("registry.cache_failed", "code", "CBM_IMPORT_CACHE_ALLOC_FAILED", "component",
+                      "registry.import_map_cache", "operation", "create", "key", "", "message",
+                      "import-map cache could not be allocated", "remediation",
+                      "free memory or reduce repository size, then retry");
         return;
+    }
     for (int i = 0; i < count; i++) {
         if (keys[i] && vals[i]) {
-            cbm_ht_set(_import_map_cache, keys[i], (void *)(uintptr_t)vals[i]);
+            if (!cbm_ht_set_checked(_import_map_cache, keys[i], (void *)(uintptr_t)vals[i], NULL)) {
+                _registry_cache_failed = true;
+                cbm_log_error("registry.cache_failed", "code", "CBM_IMPORT_CACHE_INSERT_FAILED",
+                              "component", "registry.import_map_cache", "operation", "insert",
+                              "key", keys[i], "message",
+                              "import-map cache could not retain an entry", "remediation",
+                              "free memory or reduce repository size, then retry");
+                cbm_ht_free(_import_map_cache);
+                _import_map_cache = NULL;
+                return;
+            }
         }
     }
 }
@@ -294,6 +321,13 @@ void cbm_registry_resolve_cache_begin(int estimated_capacity) {
     if (estimated_capacity < 32)
         estimated_capacity = 32;
     _resolve_cache = cbm_ht_create((uint32_t)estimated_capacity);
+    if (!_resolve_cache) {
+        _registry_cache_failed = true;
+        cbm_log_error("registry.cache_failed", "code", "CBM_RESOLVE_CACHE_ALLOC_FAILED",
+                      "component", "registry.resolve_cache", "operation", "create", "key", "",
+                      "message", "resolution cache could not be allocated", "remediation",
+                      "free memory or reduce repository size, then retry");
+    }
 }
 
 void cbm_registry_resolve_cache_end(void) {
@@ -341,8 +375,15 @@ static bool is_import_reachable(const char *candidate_qn, const char **import_va
 
     if (_reach_cache) {
         char *kdup = strdup(candidate_qn);
-        if (kdup) {
-            cbm_ht_set(_reach_cache, kdup, reachable ? REACH_CACHE_TRUE : REACH_CACHE_FALSE);
+        if (!kdup || !cbm_ht_set_checked(_reach_cache, kdup,
+                                         reachable ? REACH_CACHE_TRUE : REACH_CACHE_FALSE, NULL)) {
+            free(kdup);
+            _registry_cache_failed = true;
+            cbm_log_error("registry.cache_failed", "code", "CBM_REACH_CACHE_INSERT_FAILED",
+                          "component", "registry.reach_cache", "operation", "insert", "key",
+                          candidate_qn, "message",
+                          "import-reachability cache could not retain an entry", "remediation",
+                          "free memory or reduce repository size, then retry");
         }
     }
     return reachable;
@@ -464,6 +505,12 @@ cbm_registry_t *cbm_registry_new(void) {
     }
     r->exact = cbm_ht_create(CBM_SZ_1K);
     r->by_name = cbm_ht_create(CBM_SZ_512);
+    if (!r->exact || !r->by_name) {
+        cbm_ht_free(r->exact);
+        cbm_ht_free(r->by_name);
+        free(r);
+        return NULL;
+    }
     return r;
 }
 
@@ -501,16 +548,16 @@ void cbm_registry_free(cbm_registry_t *r) {
 
 /* ── Registration ────────────────────────────────────────────────── */
 
-void cbm_registry_add(cbm_registry_t *r, const char *name, const char *qualified_name,
+bool cbm_registry_add(cbm_registry_t *r, const char *name, const char *qualified_name,
                       const char *label) {
     (void)name;
     if (!r || !qualified_name || !label) {
-        return;
+        return false;
     }
 
     /* Check for duplicate */
     if (cbm_ht_get(r->exact, qualified_name)) {
-        return;
+        return true;
     }
 
     /* Intern the label (bounded set; linear scan is fine at this size). */
@@ -523,28 +570,85 @@ void cbm_registry_add(cbm_registry_t *r, const char *name, const char *qualified
     }
     if (!interned && r->label_pool_n < (int)(sizeof(r->label_pool) / sizeof(r->label_pool[0]))) {
         r->label_pool[r->label_pool_n] = strdup(label);
+        if (!r->label_pool[r->label_pool_n]) {
+            r->failed = true;
+            cbm_log_error("registry.insert_failed", "code", "CBM_REGISTRY_LABEL_ALLOC_FAILED",
+                          "component", "registry.label_pool", "operation", "label_copy", "key",
+                          label, "message", "registry label could not be retained", "remediation",
+                          "free memory or reduce repository size, then retry");
+            return false;
+        }
         interned = r->label_pool[r->label_pool_n];
         r->label_pool_n++;
     }
     if (!interned) {
-        return; /* pool exhausted (cannot happen with sane label sets) */
+        r->failed = true;
+        cbm_log_error("registry.insert_failed", "code", "CBM_REGISTRY_LABEL_CAPACITY_EXHAUSTED",
+                      "component", "registry.label_pool", "operation", "intern", "key", label,
+                      "message", "registry label pool capacity was exhausted", "remediation",
+                      "increase the measured label capacity and retry");
+        return false;
     }
 
     /* Store in exact map: QN → interned label. The key is the registry's ONE
      * owned copy of the QN; by_name below borrows it (same lifetime) instead
      * of a second strdup — this pair of copies was ~280 MB on the kernel. */
-    cbm_ht_set(r->exact, strdup(qualified_name), (void *)interned);
+    char *owned_exact_key = strdup(qualified_name);
+    if (!owned_exact_key ||
+        !cbm_ht_set_checked(r->exact, owned_exact_key, (void *)interned, NULL)) {
+        free(owned_exact_key);
+        r->failed = true;
+        cbm_log_error("registry.insert_failed", "code", "CBM_REGISTRY_EXACT_INSERT_FAILED",
+                      "component", "registry.exact", "operation", "insert", "key", qualified_name,
+                      "message", "exact symbol registry could not retain an entry", "remediation",
+                      "free memory or reduce repository size, then retry");
+        return false;
+    }
     const char *owned_qn = cbm_ht_get_key(r->exact, qualified_name);
 
     /* Index by simple name.
      * No array dedup needed: exact-map check above guarantees uniqueness. */
     const char *simple = simple_name(qualified_name);
     qn_array_t *arr = cbm_ht_get(r->by_name, simple);
+    bool new_arr = false;
+    char *owned_simple = NULL;
     if (!arr) {
         arr = calloc(CBM_ALLOC_ONE, sizeof(qn_array_t));
-        cbm_ht_set(r->by_name, strdup(simple), arr);
+        owned_simple = strdup(simple);
+        if (!arr || !owned_simple || !cbm_ht_set_checked(r->by_name, owned_simple, arr, NULL)) {
+            free(arr);
+            free(owned_simple);
+            cbm_ht_delete(r->exact, qualified_name);
+            free((void *)owned_qn);
+            r->failed = true;
+            cbm_log_error("registry.insert_failed", "code", "CBM_REGISTRY_NAME_INSERT_FAILED",
+                          "component", "registry.by_name", "operation", "insert", "key", simple,
+                          "message", "name registry could not retain an entry", "remediation",
+                          "free memory or reduce repository size, then retry");
+            return false;
+        }
+        new_arr = true;
     }
-    cbm_da_push(arr, (char *)owned_qn);
+    if (!cbm_da_push_checked(arr, (char *)owned_qn)) {
+        if (new_arr) {
+            cbm_ht_delete(r->by_name, simple);
+            free(owned_simple);
+            free(arr);
+        }
+        cbm_ht_delete(r->exact, qualified_name);
+        free((void *)owned_qn);
+        r->failed = true;
+        cbm_log_error("registry.insert_failed", "code", "CBM_REGISTRY_NAME_APPEND_FAILED",
+                      "component", "registry.by_name", "operation", "append", "key", simple,
+                      "message", "name registry array could not retain an entry", "remediation",
+                      "free memory or reduce repository size, then retry");
+        return false;
+    }
+    return true;
+}
+
+bool cbm_registry_failed(const cbm_registry_t *r) {
+    return !r || r->failed;
 }
 
 /* ── Lookup ──────────────────────────────────────────────────────── */
@@ -874,14 +978,28 @@ cbm_resolution_t cbm_registry_resolve(const cbm_registry_t *r, const char *calle
         if (e) {
             e->res = res;
             char *kdup = strdup(callee_name);
-            if (kdup) {
-                cbm_ht_set(_resolve_cache, kdup, e);
-            } else {
+            if (!kdup || !cbm_ht_set_checked(_resolve_cache, kdup, e, NULL)) {
+                free(kdup);
                 free(e);
+                _registry_cache_failed = true;
+                cbm_log_error("registry.cache_failed", "code", "CBM_RESOLVE_CACHE_INSERT_FAILED",
+                              "component", "registry.resolve_cache", "operation", "insert", "key",
+                              callee_name, "message", "resolution cache could not retain an entry",
+                              "remediation", "free memory or reduce repository size, then retry");
             }
+        } else {
+            _registry_cache_failed = true;
+            cbm_log_error("registry.cache_failed", "code", "CBM_RESOLVE_CACHE_ENTRY_ALLOC_FAILED",
+                          "component", "registry.resolve_cache", "operation", "entry_alloc", "key",
+                          callee_name, "message", "resolution cache entry could not be allocated",
+                          "remediation", "free memory or reduce repository size, then retry");
         }
     }
     return res;
+}
+
+bool cbm_registry_cache_failed(void) {
+    return _registry_cache_failed;
 }
 
 /* ── Fuzzy Resolve ──────────────────────────────────────────────── */
@@ -973,16 +1091,21 @@ struct few_ctx {
     const char **results;
     int count;
     int cap;
+    bool failed;
 };
 
 static void few_scan(const char *key, void *value, void *ud) {
     (void)value;
     struct few_ctx *ctx = ud;
+    if (ctx->failed) {
+        return;
+    }
     size_t klen = strlen(key);
     if (klen >= ctx->target_len && strcmp(key + klen - ctx->target_len, ctx->target) == 0) {
-        if (ctx->count >= ctx->cap) {
-            ctx->cap = ctx->cap ? ctx->cap * PAIR_LEN : REG_INIT_CAP;
-            ctx->results = safe_realloc(ctx->results, (size_t)ctx->cap * sizeof(char *));
+        if (!cbm_da_ensure_capacity((void **)&ctx->results, &ctx->cap, ctx->count + 1,
+                                    sizeof(*ctx->results))) {
+            ctx->failed = true;
+            return;
         }
         ctx->results[ctx->count++] = key;
     }
@@ -998,14 +1121,34 @@ int cbm_registry_find_ending_with(const cbm_registry_t *r, const char *suffix, c
 
     /* Build ".suffix" target */
     size_t slen = strlen(suffix);
+    if (slen > SIZE_MAX - REG_SUFFIX_ALLOC) {
+        cbm_log_error("registry.find_ending_with", "code", "CBM_REGISTRY_ALLOCATION_OVERFLOW",
+                      "message", "suffix target allocation would overflow", "remediation",
+                      "supply a shorter suffix");
+        return CBM_NOT_FOUND;
+    }
     char *target = malloc(slen + REG_SUFFIX_ALLOC);
+    if (!target) {
+        cbm_log_error("registry.find_ending_with", "code", "CBM_REGISTRY_ALLOCATION_FAILED",
+                      "message", "suffix target allocation failed", "remediation",
+                      "free memory or reduce repository size, then retry");
+        return CBM_NOT_FOUND;
+    }
     target[0] = '.';
     memcpy(target + SKIP_ONE, suffix, slen + SKIP_ONE);
 
-    struct few_ctx ctx = {target, slen + SKIP_ONE, NULL, 0, 0};
+    struct few_ctx ctx = {target, slen + SKIP_ONE, NULL, 0, 0, false};
     cbm_ht_foreach(r->exact, few_scan, &ctx);
 
     free(target);
+    if (ctx.failed) {
+        free(ctx.results);
+        cbm_log_error(
+            "registry.find_ending_with", "code", "CBM_REGISTRY_ALLOCATION_FAILED", "message",
+            "suffix result allocation failed", "remediation",
+            "free memory or reduce repository size, then retry; no partial result was returned");
+        return CBM_NOT_FOUND;
+    }
     *out = ctx.results;
     return ctx.count;
 }

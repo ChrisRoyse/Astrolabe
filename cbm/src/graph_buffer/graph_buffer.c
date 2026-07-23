@@ -104,8 +104,11 @@ static char *make_atom_id(const char *project, const char *label, const char *na
         return NULL;
     }
     cbm_sha256_init(&ctx);
-    const char *parts[] = {"astrolabe.cbm.atom.v2", project ? project : "", label ? label : "",
-                           name ? name : "", qualified_name ? qualified_name : "",
+    const char *parts[] = {"astrolabe.cbm.atom.v2",
+                           project ? project : "",
+                           label ? label : "",
+                           name ? name : "",
+                           qualified_name ? qualified_name : "",
                            file_path ? file_path : ""};
     for (size_t i = 0; i < sizeof(parts) / sizeof(parts[0]); i++) {
         hash_frame(&ctx, parts[i], strlen(parts[i]));
@@ -148,16 +151,14 @@ static bool valid_utf8_text(const char *text) {
         if (*p <= 0x7f) {
             p++;
             remaining--;
-        } else if (remaining >= 2 && *p >= 0xc2 && *p <= 0xdf &&
-                   (p[1] & 0xc0) == 0x80) {
+        } else if (remaining >= 2 && *p >= 0xc2 && *p <= 0xdf && (p[1] & 0xc0) == 0x80) {
             p += 2;
             remaining -= 2;
         } else if (remaining >= 3 && *p == 0xe0 && p[1] >= 0xa0 && p[1] <= 0xbf &&
                    (p[2] & 0xc0) == 0x80) {
             p += 3;
             remaining -= 3;
-        } else if (remaining >= 3 &&
-                   ((*p >= 0xe1 && *p <= 0xec) || (*p >= 0xee && *p <= 0xef)) &&
+        } else if (remaining >= 3 && ((*p >= 0xe1 && *p <= 0xec) || (*p >= 0xee && *p <= 0xef)) &&
                    (p[1] & 0xc0) == 0x80 && (p[2] & 0xc0) == 0x80) {
             p += 3;
             remaining -= 3;
@@ -169,8 +170,7 @@ static bool valid_utf8_text(const char *text) {
                    (p[2] & 0xc0) == 0x80 && (p[3] & 0xc0) == 0x80) {
             p += 4;
             remaining -= 4;
-        } else if (remaining >= 4 && *p >= 0xf1 && *p <= 0xf3 &&
-                   (p[1] & 0xc0) == 0x80 &&
+        } else if (remaining >= 4 && *p >= 0xf1 && *p <= 0xf3 && (p[1] & 0xc0) == 0x80 &&
                    (p[2] & 0xc0) == 0x80 && (p[3] & 0xc0) == 0x80) {
             p += 4;
             remaining -= 4;
@@ -265,6 +265,26 @@ struct cbm_gbuf {
 
 /* ── Helpers ─────────────────────────────────────────────────────── */
 
+static void gbuf_index_failure(cbm_gbuf_t *gb, const char *operation, const char *key) {
+    if (gb) {
+        atomic_store(&gb->resolution_failed, true);
+    }
+    cbm_log_error("gbuf.index_insert_failed", "code", "CBM_GRAPH_INDEX_INSERT_FAILED", "component",
+                  "graph_buffer", "operation", operation ? operation : "", "key", key ? key : "",
+                  "message", "authoritative graph index insertion or growth failed", "remediation",
+                  "free memory or reduce the indexed repository size, then retry; the store was "
+                  "not committed");
+}
+
+static bool gbuf_ht_set(cbm_gbuf_t *gb, CBMHashTable *ht, const char *key, void *value,
+                        void **previous_out, const char *operation) {
+    if (cbm_ht_set_checked(ht, key, value, previous_out)) {
+        return true;
+    }
+    gbuf_index_failure(gb, operation, key);
+    return false;
+}
+
 static char *heap_strdup(const char *s) {
     return s ? strdup(s) : strdup("{}");
 }
@@ -280,8 +300,13 @@ static const char *gb_intern(cbm_gbuf_t *gb, const char *s) {
         return found;
     }
     char *copy = strdup(key);
-    if (copy) {
-        cbm_ht_set(gb->intern_pool, copy, copy); /* key == value == owned copy */
+    if (!copy) {
+        gbuf_index_failure(gb, "intern.copy", key);
+        return NULL;
+    }
+    if (!gbuf_ht_set(gb, gb->intern_pool, copy, copy, NULL, "intern.insert")) {
+        free(copy);
+        return NULL;
     }
     return copy;
 }
@@ -344,21 +369,45 @@ static void make_src_type_key(char *buf, size_t bufsz, int64_t src, const char *
 }
 
 /* Get or create a node_ptr_array_t in a hash table */
-static node_ptr_array_t *get_or_create_node_array(CBMHashTable *ht, const char *key) {
+static node_ptr_array_t *get_or_create_node_array(cbm_gbuf_t *gb, CBMHashTable *ht, const char *key,
+                                                  const char *operation) {
     node_ptr_array_t *arr = cbm_ht_get(ht, key);
     if (!arr) {
         arr = calloc(CBM_ALLOC_ONE, sizeof(node_ptr_array_t));
-        cbm_ht_set(ht, strdup(key), arr);
+        char *owned_key = strdup(key);
+        if (!arr || !owned_key) {
+            free(arr);
+            free(owned_key);
+            gbuf_index_failure(gb, operation, key);
+            return NULL;
+        }
+        if (!gbuf_ht_set(gb, ht, owned_key, arr, NULL, operation)) {
+            free(owned_key);
+            free(arr);
+            return NULL;
+        }
     }
     return arr;
 }
 
 /* Get or create an edge_ptr_array_t in a hash table */
-static edge_ptr_array_t *get_or_create_edge_array(CBMHashTable *ht, const char *key) {
+static edge_ptr_array_t *get_or_create_edge_array(cbm_gbuf_t *gb, CBMHashTable *ht, const char *key,
+                                                  const char *operation) {
     edge_ptr_array_t *arr = cbm_ht_get(ht, key);
     if (!arr) {
         arr = calloc(CBM_ALLOC_ONE, sizeof(edge_ptr_array_t));
-        cbm_ht_set(ht, strdup(key), arr);
+        char *owned_key = strdup(key);
+        if (!arr || !owned_key) {
+            free(arr);
+            free(owned_key);
+            gbuf_index_failure(gb, operation, key);
+            return NULL;
+        }
+        if (!gbuf_ht_set(gb, ht, owned_key, arr, NULL, operation)) {
+            free(owned_key);
+            free(arr);
+            return NULL;
+        }
     }
     return arr;
 }
@@ -483,13 +532,21 @@ static void cascade_delete_edges(cbm_gbuf_t *gb, CBMHashTable *deleted_set) {
 }
 
 /* Register a node in primary (QN, ID) and secondary (label, name) indexes. */
-static void register_node_in_indexes(cbm_gbuf_t *gb, cbm_gbuf_node_t *node) {
-    cbm_ht_set(gb->node_by_atom, node->atom_id, node);
+static bool register_node_in_indexes(cbm_gbuf_t *gb, cbm_gbuf_node_t *node) {
+    if (!gbuf_ht_set(gb, gb->node_by_atom, node->atom_id, node, NULL, "node_by_atom.insert")) {
+        return false;
+    }
     void *by_qn = cbm_ht_get(gb->node_by_qn, node->qualified_name);
     if (!by_qn) {
-        cbm_ht_set(gb->node_by_qn, node->qualified_name, node);
+        if (!gbuf_ht_set(gb, gb->node_by_qn, node->qualified_name, node, NULL,
+                         "node_by_qn.insert")) {
+            return false;
+        }
     } else if (by_qn != node) {
-        cbm_ht_set(gb->node_by_qn, node->qualified_name, AMBIGUOUS_QN);
+        if (!gbuf_ht_set(gb, gb->node_by_qn, node->qualified_name, AMBIGUOUS_QN, NULL,
+                         "node_by_qn.mark_ambiguous")) {
+            return false;
+        }
     }
 
     if (node->id >= gb->by_id_cap) {
@@ -498,23 +555,32 @@ static void register_node_in_indexes(cbm_gbuf_t *gb, cbm_gbuf_node_t *node) {
             nc *= 2;
         }
         cbm_gbuf_node_t **grown = realloc(gb->by_id, (size_t)nc * sizeof(*grown));
-        if (grown) {
-            memset(grown + gb->by_id_cap, 0, (size_t)(nc - gb->by_id_cap) * sizeof(*grown));
-            gb->by_id = grown;
-            gb->by_id_cap = nc;
+        if (!grown) {
+            gbuf_index_failure(gb, "node_by_id.grow", node->atom_id);
+            return false;
         }
+        memset(grown + gb->by_id_cap, 0, (size_t)(nc - gb->by_id_cap) * sizeof(*grown));
+        gb->by_id = grown;
+        gb->by_id_cap = nc;
     }
     if (node->id >= 0 && node->id < gb->by_id_cap) {
         gb->by_id[node->id] = node;
     }
 
-    node_ptr_array_t *by_label =
-        get_or_create_node_array(gb->nodes_by_label, node->label ? node->label : "");
-    cbm_da_push(by_label, (const cbm_gbuf_node_t *)node);
+    node_ptr_array_t *by_label = get_or_create_node_array(
+        gb, gb->nodes_by_label, node->label ? node->label : "", "nodes_by_label.insert");
+    if (!by_label || !cbm_da_push_checked(by_label, (const cbm_gbuf_node_t *)node)) {
+        gbuf_index_failure(gb, "nodes_by_label.append", node->label);
+        return false;
+    }
 
-    node_ptr_array_t *by_name =
-        get_or_create_node_array(gb->nodes_by_name, node->name ? node->name : "");
-    cbm_da_push(by_name, (const cbm_gbuf_node_t *)node);
+    node_ptr_array_t *by_name = get_or_create_node_array(
+        gb, gb->nodes_by_name, node->name ? node->name : "", "nodes_by_name.insert");
+    if (!by_name || !cbm_da_push_checked(by_name, (const cbm_gbuf_node_t *)node)) {
+        gbuf_index_failure(gb, "nodes_by_name.append", node->name);
+        return false;
+    }
+    return true;
 }
 
 static bool node_is_live(const cbm_gbuf_t *gb, const cbm_gbuf_node_t *node) {
@@ -524,39 +590,57 @@ static bool node_is_live(const cbm_gbuf_t *gb, const cbm_gbuf_node_t *node) {
 static void rebuild_qn_index(cbm_gbuf_t *gb) {
     cbm_ht_free(gb->node_by_qn);
     gb->node_by_qn = cbm_ht_create(CBM_SZ_256);
+    if (!gb->node_by_qn) {
+        gbuf_index_failure(gb, "node_by_qn.create", "");
+        return;
+    }
     for (int i = 0; i < gb->nodes.count; i++) {
         cbm_gbuf_node_t *node = gb->nodes.items[i];
         if (!node_is_live(gb, node) || !node->qualified_name) {
             continue;
         }
         void *existing = cbm_ht_get(gb->node_by_qn, node->qualified_name);
-        cbm_ht_set(gb->node_by_qn, node->qualified_name,
-                   existing && existing != node ? AMBIGUOUS_QN : node);
+        if (!gbuf_ht_set(gb, gb->node_by_qn, node->qualified_name,
+                         existing && existing != node ? AMBIGUOUS_QN : node, NULL,
+                         "node_by_qn.rebuild")) {
+            return;
+        }
     }
 }
 
 /* Push an edge pointer into a dynamic array (wraps macro to reduce CC contribution). */
-static void edge_array_push(edge_ptr_array_t *arr, const cbm_gbuf_edge_t *edge) {
-    cbm_da_push(arr, edge);
+static bool edge_array_push(edge_ptr_array_t *arr, const cbm_gbuf_edge_t *edge) {
+    return cbm_da_push_checked(arr, edge);
 }
 
 /* Index an edge by one key into a hash table bucket. */
-static void index_edge_by_key(CBMHashTable *ht, const char *key, cbm_gbuf_edge_t *edge) {
-    edge_ptr_array_t *arr = get_or_create_edge_array(ht, key);
-    edge_array_push(arr, (const cbm_gbuf_edge_t *)edge);
+static bool index_edge_by_key(cbm_gbuf_t *gb, CBMHashTable *ht, const char *key,
+                              cbm_gbuf_edge_t *edge, const char *operation) {
+    edge_ptr_array_t *arr = get_or_create_edge_array(gb, ht, key, operation);
+    if (!arr || !edge_array_push(arr, (const cbm_gbuf_edge_t *)edge)) {
+        gbuf_index_failure(gb, operation, key);
+        return false;
+    }
+    return true;
 }
 
 /* Register an edge in secondary indexes (source_type, target_type, type). */
-static void register_edge_in_indexes(cbm_gbuf_t *gb, cbm_gbuf_edge_t *edge) {
+static bool register_edge_in_indexes(cbm_gbuf_t *gb, cbm_gbuf_edge_t *edge) {
     char key[EDGE_KEY_BUF];
 
     make_src_type_key(key, sizeof(key), edge->source_id, edge->type);
-    index_edge_by_key(gb->edges_by_source_type, key, edge);
+    if (!index_edge_by_key(gb, gb->edges_by_source_type, key, edge,
+                           "edges_by_source_type.append")) {
+        return false;
+    }
 
     make_src_type_key(key, sizeof(key), edge->target_id, edge->type);
-    index_edge_by_key(gb->edges_by_target_type, key, edge);
+    if (!index_edge_by_key(gb, gb->edges_by_target_type, key, edge,
+                           "edges_by_target_type.append")) {
+        return false;
+    }
 
-    index_edge_by_key(gb->edges_by_type, edge->type, edge);
+    return index_edge_by_key(gb, gb->edges_by_type, edge->type, edge, "edges_by_type.append");
 }
 
 /* Rebuild edge secondary indexes from scratch (after bulk deletion). */
@@ -571,9 +655,15 @@ static void rebuild_edge_secondary_indexes(cbm_gbuf_t *gb) {
     gb->edges_by_source_type = cbm_ht_create(CBM_SZ_256);
     gb->edges_by_target_type = cbm_ht_create(CBM_SZ_256);
     gb->edges_by_type = cbm_ht_create(CBM_SZ_32);
+    if (!gb->edges_by_source_type || !gb->edges_by_target_type || !gb->edges_by_type) {
+        gbuf_index_failure(gb, "edge_secondary_indexes.create", "");
+        return;
+    }
 
     for (int i = 0; i < gb->edges.count; i++) {
-        register_edge_in_indexes(gb, gb->edges.items[i]);
+        if (!register_edge_in_indexes(gb, gb->edges.items[i])) {
+            return;
+        }
     }
 }
 
@@ -610,8 +700,8 @@ static void release_gbuf_indexes(cbm_gbuf_t *gb) {
 
 cbm_gbuf_t *cbm_gbuf_new(const char *project, const char *root_path) {
     if (!project || !project[0] || !valid_utf8_text(project) || !valid_utf8_text(root_path)) {
-        cbm_log_error("gbuf.create_refused", "code", "CBM_GRAPH_IDENTITY_TEXT_INVALID",
-                      "project", project ? project : "", "message",
+        cbm_log_error("gbuf.create_refused", "code", "CBM_GRAPH_IDENTITY_TEXT_INVALID", "project",
+                      project ? project : "", "message",
                       "project or root identity is empty or not valid UTF-8", "remediation",
                       "supply a non-empty UTF-8 project name and UTF-8 root path");
         return NULL;
@@ -644,9 +734,9 @@ cbm_gbuf_t *cbm_gbuf_new(const char *project, const char *root_path) {
         !gb->nodes_by_label || !gb->nodes_by_name || !gb->edge_by_key ||
         !gb->edges_by_source_type || !gb->edges_by_target_type || !gb->edges_by_type ||
         !gb->intern_pool) {
-        cbm_log_error("gbuf.create_failed", "code", "CBM_GRAPH_ALLOC_FAILED", "project",
-                      project, "message", "graph-buffer state could not be fully allocated",
-                      "remediation", "free memory or reduce repository size, then retry");
+        cbm_log_error("gbuf.create_failed", "code", "CBM_GRAPH_ALLOC_FAILED", "project", project,
+                      "message", "graph-buffer state could not be fully allocated", "remediation",
+                      "free memory or reduce repository size, then retry");
         cbm_gbuf_free(gb);
         return NULL;
     }
@@ -874,8 +964,7 @@ static int64_t upsert_node_internal(cbm_gbuf_t *gb, const char *label, const cha
         (source_present && end_byte - start_byte != source_len) ||
         (!source_present && (source_len != 0 || start_byte != 0 || end_byte != 0)) ||
         !valid_utf8_text(label) || !valid_utf8_text(name) || !valid_utf8_text(qualified_name) ||
-        !valid_utf8_text(file_path) ||
-        !valid_properties_object(json)) {
+        !valid_utf8_text(file_path) || !valid_properties_object(json)) {
         if (gb) {
             atomic_store(&gb->resolution_failed, true);
         }
@@ -883,13 +972,14 @@ static int64_t upsert_node_internal(cbm_gbuf_t *gb, const char *label, const cha
                       "qualified_name", qualified_name ? qualified_name : "", "message",
                       "node identity text, source span, or properties JSON is malformed",
                       "remediation",
-                      "supply valid UTF-8 identity text, object JSON, and byte-exact end-exclusive source spans");
+                      "supply valid UTF-8 identity text, object JSON, and byte-exact end-exclusive "
+                      "source spans");
         return 0;
     }
 
-    char *atom_id = make_atom_id(gb->project, label, name, qualified_name, file_path, start_line,
-                                 end_line, source_present, source_bytes, source_len, start_byte,
-                                 end_byte);
+    char *atom_id =
+        make_atom_id(gb->project, label, name, qualified_name, file_path, start_line, end_line,
+                     source_present, source_bytes, source_len, start_byte, end_byte);
     if (!atom_id) {
         atomic_store(&gb->resolution_failed, true);
         cbm_log_error("gbuf.node_alloc_failed", "code", "CBM_NODE_ATOM_ALLOC_FAILED", "message",
@@ -903,8 +993,8 @@ static int64_t upsert_node_internal(cbm_gbuf_t *gb, const char *label, const cha
     cbm_gbuf_node_t *existing = cbm_ht_get(gb->node_by_atom, atom_id);
     if (existing) {
         bool equal = same_atom_payload(existing, label, name, qualified_name, file_path, start_line,
-                                       end_line, source_present, source_bytes, source_len, start_byte,
-                                       end_byte);
+                                       end_line, source_present, source_bytes, source_len,
+                                       start_byte, end_byte);
         free(atom_id);
         if (!equal) {
             atomic_store(&gb->resolution_failed, true);
@@ -973,8 +1063,15 @@ static int64_t upsert_node_internal(cbm_gbuf_t *gb, const char *label, const cha
     }
 
     node->id = alloc_next_id(gb);
-    cbm_da_push(&gb->nodes, node);
-    register_node_in_indexes(gb, node);
+    if (!cbm_da_push_checked(&gb->nodes, node)) {
+        free_node_strings(node);
+        free(node);
+        gbuf_index_failure(gb, "nodes.append", qualified_name);
+        return 0;
+    }
+    if (!register_node_in_indexes(gb, node)) {
+        return 0;
+    }
     return node->id;
 }
 
@@ -995,10 +1092,12 @@ int64_t cbm_gbuf_upsert_source_node(cbm_gbuf_t *gb, const char *label, const cha
                                 properties_json);
 }
 
-const cbm_gbuf_node_t *cbm_gbuf_find_source_node(
-    const cbm_gbuf_t *gb, const char *label, const char *name, const char *qualified_name,
-    const char *file_path, int start_line, int end_line, const uint8_t *source_bytes,
-    size_t source_len, uint64_t start_byte, uint64_t end_byte) {
+const cbm_gbuf_node_t *cbm_gbuf_find_source_node(const cbm_gbuf_t *gb, const char *label,
+                                                 const char *name, const char *qualified_name,
+                                                 const char *file_path, int start_line,
+                                                 int end_line, const uint8_t *source_bytes,
+                                                 size_t source_len, uint64_t start_byte,
+                                                 uint64_t end_byte) {
     if (!gb || !label || !name || !qualified_name || (source_len > 0 && !source_bytes) ||
         end_byte < start_byte || end_byte - start_byte != source_len) {
         return NULL;
@@ -1037,8 +1136,8 @@ static void log_qn_resolution_ambiguity(const cbm_gbuf_t *gb, const char *qn) {
 
     char count_buf[CBM_SZ_32];
     snprintf(count_buf, sizeof(count_buf), "%d", candidate_count);
-    cbm_log_error("gbuf.qn_resolution_ambiguous", "code", "CBM_NODE_QN_AMBIGUOUS",
-                  "qualified_name", qn, "candidate_count", count_buf, "message",
+    cbm_log_error("gbuf.qn_resolution_ambiguous", "code", "CBM_NODE_QN_AMBIGUOUS", "qualified_name",
+                  qn, "candidate_count", count_buf, "message",
                   "qualified name resolves to multiple stable source atoms", "remediation",
                   "resolve by atom_id, exact signature, or source location before persistence");
 
@@ -1091,8 +1190,8 @@ const cbm_gbuf_node_t *cbm_gbuf_find_by_qn_location(const cbm_gbuf_t *gb, const 
         const cbm_gbuf_node_t *node = gb->nodes.items[i];
         if (!node_is_live(gb, node) || !node->qualified_name || !node->file_path ||
             strcmp(node->qualified_name, qn) != 0 || strcmp(node->file_path, file_path) != 0 ||
-            node->start_line <= 0 || node->end_line < node->start_line ||
-            line < node->start_line || line > node->end_line) {
+            node->start_line <= 0 || node->end_line < node->start_line || line < node->start_line ||
+            line > node->end_line) {
             continue;
         }
         match = node;
@@ -1105,9 +1204,9 @@ const cbm_gbuf_node_t *cbm_gbuf_find_by_qn_location(const cbm_gbuf_t *gb, const 
         snprintf(line_buf, sizeof(line_buf), "%d", line);
         snprintf(count_buf, sizeof(count_buf), "%d", match_count);
         atomic_store(&((cbm_gbuf_t *)gb)->resolution_failed, true);
-        cbm_log_error("gbuf.location_resolution_ambiguous", "code",
-                      "CBM_NODE_LOCATION_AMBIGUOUS", "qualified_name", qn, "file_path",
-                      file_path, "line", line_buf, "candidate_count", count_buf, "message",
+        cbm_log_error("gbuf.location_resolution_ambiguous", "code", "CBM_NODE_LOCATION_AMBIGUOUS",
+                      "qualified_name", qn, "file_path", file_path, "line", line_buf,
+                      "candidate_count", count_buf, "message",
                       "source location resolves to multiple stable atoms", "remediation",
                       "resolve by atom_id or an exact byte span before persistence");
         return NULL;
@@ -1170,12 +1269,23 @@ int cbm_gbuf_delete_by_label(cbm_gbuf_t *gb, const char *label) {
 
     /* Build hash set of deleted node IDs for O(1) lookup */
     CBMHashTable *deleted_set = cbm_ht_create(arr->count);
+    if (!deleted_set) {
+        gbuf_index_failure(gb, "delete_by_label.set_create", label);
+        return CBM_NOT_FOUND;
+    }
     for (int i = 0; i < arr->count; i++) {
         const cbm_gbuf_node_t *n = arr->items[i];
 
         char id_buf[CBM_SZ_32];
         make_id_key(id_buf, sizeof(id_buf), n->id);
-        cbm_ht_set(deleted_set, strdup(id_buf), intptr_to_ptr(SKIP_ONE));
+        char *owned_id = strdup(id_buf);
+        if (!owned_id || !gbuf_ht_set(gb, deleted_set, owned_id, intptr_to_ptr(SKIP_ONE), NULL,
+                                      "delete_by_label.id_set_insert")) {
+            free(owned_id);
+            cbm_ht_foreach(deleted_set, free_key_only, NULL);
+            cbm_ht_free(deleted_set);
+            return CBM_NOT_FOUND;
+        }
 
         /* Remove from primary indexes */
         cbm_ht_delete(gb->node_by_atom, n->atom_id);
@@ -1203,6 +1313,10 @@ int cbm_gbuf_delete_by_file(cbm_gbuf_t *gb, const char *file_path) {
 
     /* Collect IDs of nodes in this file */
     CBMHashTable *deleted_set = cbm_ht_create(CBM_SZ_64);
+    if (!deleted_set) {
+        gbuf_index_failure(gb, "delete_by_file.set_create", file_path);
+        return CBM_NOT_FOUND;
+    }
     int deleted_count = 0;
     int scanned = 0;
 
@@ -1218,7 +1332,14 @@ int cbm_gbuf_delete_by_file(cbm_gbuf_t *gb, const char *file_path) {
 
         char id_buf[CBM_SZ_32];
         make_id_key(id_buf, sizeof(id_buf), n->id);
-        cbm_ht_set(deleted_set, strdup(id_buf), intptr_to_ptr(SKIP_ONE));
+        char *owned_id = strdup(id_buf);
+        if (!owned_id || !gbuf_ht_set(gb, deleted_set, owned_id, intptr_to_ptr(SKIP_ONE), NULL,
+                                      "delete_by_file.id_set_insert")) {
+            free(owned_id);
+            cbm_ht_foreach(deleted_set, free_key_only, NULL);
+            cbm_ht_free(deleted_set);
+            return CBM_NOT_FOUND;
+        }
 
         /* Remove from secondary indexes */
         remove_node_from_ptr_array(cbm_ht_get(gb->nodes_by_label, n->label), n->id);
@@ -1338,8 +1459,8 @@ int cbm_gbuf_load_from_db(cbm_gbuf_t *gb, const char *db_path, const char *proje
                    expected_source_sha ? expected_source_sha : "") != 0) {
             cbm_log_error("gbuf.load_atom_mismatch", "code", "CBM_NODE_ATOM_ID_MISMATCH",
                           "qualified_name", qn ? qn : "", "message",
-                          "persisted atom_id does not match immutable source facts",
-                          "remediation", "rebuild the SQLite store from the exact source bytes");
+                          "persisted atom_id does not match immutable source facts", "remediation",
+                          "rebuild the SQLite store from the exact source bytes");
             sqlite3_finalize(stmt);
             free(old_to_new);
             cbm_store_close(store);
@@ -1446,15 +1567,33 @@ int64_t cbm_gbuf_insert_edge(cbm_gbuf_t *gb, int64_t source_id, int64_t target_i
     edge->target_id = target_id;
     edge->type = (char *)gb_intern(gb, type);
     edge->properties_json = heap_strdup(properties_json);
+    if (!edge->type || !edge->properties_json) {
+        free_edge_strings(edge);
+        free(edge);
+        gbuf_index_failure(gb, "edge.fields.copy", key);
+        return 0;
+    }
 
     /* Store pointer in array */
-    cbm_da_push(&gb->edges, edge);
+    if (!cbm_da_push_checked(&gb->edges, edge)) {
+        free_edge_strings(edge);
+        free(edge);
+        gbuf_index_failure(gb, "edges.append", key);
+        return 0;
+    }
 
     /* Dedup index */
-    cbm_ht_set(gb->edge_by_key, strdup(key), edge);
+    char *owned_key = strdup(key);
+    if (!owned_key ||
+        !gbuf_ht_set(gb, gb->edge_by_key, owned_key, edge, NULL, "edge_by_key.insert")) {
+        free(owned_key);
+        return 0;
+    }
 
     /* Secondary indexes */
-    register_edge_in_indexes(gb, edge);
+    if (!register_edge_in_indexes(gb, edge)) {
+        return 0;
+    }
 
     return id;
 }
@@ -1570,8 +1709,8 @@ static void merge_update_existing(cbm_gbuf_t *dst, cbm_gbuf_node_t *existing,
                            sn->start_line, sn->end_line, sn->source_present, sn->source_bytes,
                            sn->source_len, sn->start_byte, sn->end_byte)) {
         atomic_store(&dst->resolution_failed, true);
-        cbm_log_error("gbuf.atom_collision", "code", "CBM_NODE_ATOM_COLLISION",
-                      "qualified_name", sn->qualified_name ? sn->qualified_name : "", "message",
+        cbm_log_error("gbuf.atom_collision", "code", "CBM_NODE_ATOM_COLLISION", "qualified_name",
+                      sn->qualified_name ? sn->qualified_name : "", "message",
                       "worker atom resolved to unequal canonical payloads", "remediation",
                       "preserve the inputs and report the colliding canonical frames");
         return;
@@ -1606,7 +1745,10 @@ static void merge_update_existing(cbm_gbuf_t *dst, cbm_gbuf_node_t *existing,
             return;
         }
         *val = existing->id;
-        cbm_ht_set(*remap, owned_key, val);
+        if (!gbuf_ht_set(dst, *remap, owned_key, val, NULL, "node_id_remap.insert")) {
+            free(owned_key);
+            free(val);
+        }
     }
 }
 
@@ -1651,8 +1793,15 @@ static void merge_copy_new_node(cbm_gbuf_t *dst, const cbm_gbuf_node_t *sn) {
         return;
     }
 
-    cbm_da_push(&dst->nodes, node);
-    register_node_in_indexes(dst, node);
+    if (!cbm_da_push_checked(&dst->nodes, node)) {
+        free_node_strings(node);
+        free(node);
+        gbuf_index_failure(dst, "merge.nodes.append", sn->qualified_name);
+        return;
+    }
+    if (!register_node_in_indexes(dst, node)) {
+        return;
+    }
 
     if (node->id >= dst->next_id) {
         dst->next_id = node->id + SKIP_ONE;
@@ -1692,9 +1841,11 @@ int cbm_gbuf_merge(cbm_gbuf_t *dst, cbm_gbuf_t *src) {
     }
     if (atomic_load(&src->resolution_failed)) {
         atomic_store(&dst->resolution_failed, true);
-        cbm_log_error("gbuf.merge_refused", "code", "CBM_SOURCE_WORKER_FAILED", "message",
-                      "a worker graph contains a canonical identity or source retention failure",
-                      "remediation", "inspect the earlier structured worker error and retry only after fixing its cause");
+        cbm_log_error(
+            "gbuf.merge_refused", "code", "CBM_SOURCE_WORKER_FAILED", "message",
+            "a worker graph contains a canonical identity or source retention failure",
+            "remediation",
+            "inspect the earlier structured worker error and retry only after fixing its cause");
         return CBM_NOT_FOUND;
     }
     if (src->nodes.count == 0 && src->edges.count == 0) {
@@ -1763,9 +1914,11 @@ static char *extract_prop_string(const char *props, const char *key_quoted, cons
     return out;
 }
 
-const cbm_gbuf_node_t *cbm_gbuf_find_successor_node(
-    const cbm_gbuf_t *gb, const char *qualified_name, const char *file_path, const char *label,
-    const char *name, const char *previous_properties_json) {
+const cbm_gbuf_node_t *cbm_gbuf_find_successor_node(const cbm_gbuf_t *gb,
+                                                    const char *qualified_name,
+                                                    const char *file_path, const char *label,
+                                                    const char *name,
+                                                    const char *previous_properties_json) {
     if (!gb || !qualified_name || !file_path || !label || !name || !previous_properties_json) {
         return NULL;
     }
@@ -1789,8 +1942,8 @@ const cbm_gbuf_node_t *cbm_gbuf_find_successor_node(
         if (previous_signature) {
             char *candidate_signature =
                 extract_prop_string(node->properties_json, "\"signature\"", "signature");
-            bool matches = candidate_signature &&
-                           strcmp(candidate_signature, previous_signature) == 0;
+            bool matches =
+                candidate_signature && strcmp(candidate_signature, previous_signature) == 0;
             free(candidate_signature);
             if (matches) {
                 only_signature = node;
@@ -1817,17 +1970,14 @@ const cbm_gbuf_node_t *cbm_gbuf_find_successor_node(
     snprintf(basic_buf, sizeof(basic_buf), "%d", basic_count);
     snprintf(signature_buf, sizeof(signature_buf), "%d", signature_count);
     atomic_store(&((cbm_gbuf_t *)gb)->resolution_failed, true);
-    cbm_log_error("gbuf.successor_resolution_failed", "code",
-                  ambiguous ? "CBM_NODE_SUCCESSOR_AMBIGUOUS"
-                            : "CBM_NODE_SUCCESSOR_SIGNATURE_CHANGED",
-                  "qualified_name", qualified_name, "file_path", file_path, "label", label,
-                  "name", name, "candidate_count", basic_buf, "signature_matches",
-                  signature_buf, "message",
-                  ambiguous
-                      ? "incremental successor locator resolves to multiple stable atoms"
-                      : "existing incremental successor candidates do not preserve the prior signature",
-                  "remediation",
-                  "run a clean re-index so every dependent source reference is re-resolved");
+    cbm_log_error(
+        "gbuf.successor_resolution_failed", "code",
+        ambiguous ? "CBM_NODE_SUCCESSOR_AMBIGUOUS" : "CBM_NODE_SUCCESSOR_SIGNATURE_CHANGED",
+        "qualified_name", qualified_name, "file_path", file_path, "label", label, "name", name,
+        "candidate_count", basic_buf, "signature_matches", signature_buf, "message",
+        ambiguous ? "incremental successor locator resolves to multiple stable atoms"
+                  : "existing incremental successor candidates do not preserve the prior signature",
+        "remediation", "run a clean re-index so every dependent source reference is re-resolved");
     free(previous_signature);
     return NULL;
 }
@@ -2215,7 +2365,8 @@ int cbm_gbuf_dump_to_sqlite(cbm_gbuf_t *gb, const char *path) {
     }
     if (atomic_load(&gb->resolution_failed)) {
         cbm_log_error("gbuf.dump_refused", "code", "CBM_GRAPH_RESOLUTION_FAILED", "message",
-                      "an earlier canonical identity or reference-resolution operation failed; no store or row-sink mutation was attempted",
+                      "an earlier canonical identity or reference-resolution operation failed; no "
+                      "store or row-sink mutation was attempted",
                       "remediation", "inspect the preceding structured graph-buffer error");
         return CBM_NOT_FOUND;
     }
@@ -2381,7 +2532,8 @@ int cbm_gbuf_flush_to_store(cbm_gbuf_t *gb, cbm_store_t *store) {
     }
     if (atomic_load(&gb->resolution_failed)) {
         cbm_log_error("gbuf.flush_refused", "code", "CBM_GRAPH_RESOLUTION_FAILED", "message",
-                      "an earlier canonical identity or reference-resolution operation failed; no store mutation was attempted",
+                      "an earlier canonical identity or reference-resolution operation failed; no "
+                      "store mutation was attempted",
                       "remediation", "inspect the preceding structured graph-buffer error");
         return CBM_NOT_FOUND;
     }
@@ -2468,7 +2620,8 @@ int cbm_gbuf_merge_into_store(cbm_gbuf_t *gb, cbm_store_t *store) {
     }
     if (atomic_load(&gb->resolution_failed)) {
         cbm_log_error("gbuf.merge_refused", "code", "CBM_GRAPH_RESOLUTION_FAILED", "message",
-                      "an earlier canonical identity or reference-resolution operation failed; no store mutation was attempted",
+                      "an earlier canonical identity or reference-resolution operation failed; no "
+                      "store mutation was attempted",
                       "remediation", "inspect the preceding structured graph-buffer error");
         return CBM_NOT_FOUND;
     }

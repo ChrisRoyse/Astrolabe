@@ -1,3 +1,9 @@
+#ifdef _WIN32
+#ifndef _CRT_RAND_S
+#define _CRT_RAND_S
+#endif
+#endif
+
 /*
  * compat.c — Implementations for Windows-only shims.
  *
@@ -12,6 +18,7 @@
 #ifdef _WIN32
 #include <io.h>
 #include <fcntl.h>
+#include <errno.h>
 #include <sys/stat.h>
 #endif
 
@@ -54,60 +61,100 @@ char *cbm_strcasestr(const char *haystack, const char *needle) {
 
 #ifdef _WIN32
 #include <direct.h>
-char *cbm_mkdtemp(char *tmpl) {
-    /* Build path in static buffer, then copy back to caller.
-     * Callers must provide buffers >= CBM_SZ_256 bytes (all test code does). */
-    static char buf[CBM_SZ_512];
-    if (strncmp(tmpl, "/tmp/", 5) == 0) {
-        const char *tmp = getenv("TEMP");
-        if (!tmp)
-            tmp = getenv("TMP");
-        if (!tmp)
-            tmp = ".";
-        snprintf(buf, sizeof(buf), "%s\\%s", tmp, tmpl + 5);
-    } else {
-        snprintf(buf, sizeof(buf), "%s", tmpl);
+static int cbm_replace_temp_suffix(char *tmpl, size_t capacity, const char *original) {
+    static const char ALPHABET[] = "0123456789abcdefghijklmnopqrstuvwxyz";
+    size_t len = strlen(original);
+    if (len < 6 || capacity <= len || strcmp(original + len - 6, "XXXXXX") != 0) {
+        errno = EINVAL;
+        return -1;
     }
-    if (!_mktemp(buf))
+    memcpy(tmpl, original, len + 1);
+    for (size_t i = len - 6; i < len; i++) {
+        unsigned int random_value = 0;
+        if (rand_s(&random_value) != 0) {
+            errno = EIO;
+            return -1;
+        }
+        tmpl[i] = ALPHABET[random_value % (sizeof(ALPHABET) - 1)];
+    }
+    return 0;
+}
+
+char *cbm_mkdtemp(char *tmpl, size_t capacity) {
+    if (!tmpl || capacity == 0) {
+        errno = EINVAL;
         return NULL;
-    if (_mkdir(buf) != 0)
+    }
+    size_t len = strnlen(tmpl, capacity);
+    if (len == capacity) {
+        errno = ENAMETOOLONG;
         return NULL;
-    /* Normalize to forward slashes. Callers embed this path in JSON repo_path
-     * (where "\t"/"\a" are invalid escapes → index fails) and pass it to git -C.
-     * Windows file APIs accept forward slashes, so the created dir is unaffected. */
-    for (char *p = buf; *p; p++) {
-        if (*p == '\\') {
-            *p = '/';
+    }
+    char *original = malloc(len + 1);
+    if (!original) {
+        errno = ENOMEM;
+        return NULL;
+    }
+    memcpy(original, tmpl, len + 1);
+    for (int attempt = 0; attempt < 128; attempt++) {
+        if (cbm_replace_temp_suffix(tmpl, capacity, original) != 0) {
+            free(original);
+            return NULL;
+        }
+        if (_mkdir(tmpl) == 0) {
+            free(original);
+            return tmpl;
+        }
+        if (errno != EEXIST) {
+            free(original);
+            return NULL;
         }
     }
-    /* Copy result back — callers now use char[CBM_SZ_256]+ buffers */
-    strcpy(tmpl, buf);
-    return tmpl;
+    memcpy(tmpl, original, len + 1);
+    free(original);
+    errno = EEXIST;
+    return NULL;
 }
 #endif
 
 /* ── mkstemp (Windows lacks it) ───────────────────────────────── */
 
 #ifdef _WIN32
-int cbm_mkstemp(char *tmpl) {
-    /* Rewrite /tmp/ to %TEMP%\ like cbm_mkdtemp */
-    static char buf[CBM_SZ_512];
-    if (strncmp(tmpl, "/tmp/", 5) == 0) {
-        const char *tmp = getenv("TEMP");
-        if (!tmp)
-            tmp = getenv("TMP");
-        if (!tmp)
-            tmp = ".";
-        snprintf(buf, sizeof(buf), "%s\\%s", tmp, tmpl + 5);
-    } else {
-        snprintf(buf, sizeof(buf), "%s", tmpl);
-    }
-    if (!_mktemp(buf))
+int cbm_mkstemp(char *tmpl, size_t capacity) {
+    if (!tmpl || capacity == 0) {
+        errno = EINVAL;
         return CBM_NOT_FOUND;
-    int fd = _open(buf, _O_CREAT | _O_RDWR | _O_BINARY, _S_IREAD | _S_IWRITE);
-    if (fd >= 0)
-        strcpy(tmpl, buf);
-    return fd;
+    }
+    size_t len = strnlen(tmpl, capacity);
+    if (len == capacity) {
+        errno = ENAMETOOLONG;
+        return CBM_NOT_FOUND;
+    }
+    char *original = malloc(len + 1);
+    if (!original) {
+        errno = ENOMEM;
+        return CBM_NOT_FOUND;
+    }
+    memcpy(original, tmpl, len + 1);
+    for (int attempt = 0; attempt < 128; attempt++) {
+        if (cbm_replace_temp_suffix(tmpl, capacity, original) != 0) {
+            free(original);
+            return CBM_NOT_FOUND;
+        }
+        int fd = _open(tmpl, _O_CREAT | _O_EXCL | _O_RDWR | _O_BINARY, _S_IREAD | _S_IWRITE);
+        if (fd >= 0) {
+            free(original);
+            return fd;
+        }
+        if (errno != EEXIST) {
+            free(original);
+            return CBM_NOT_FOUND;
+        }
+    }
+    memcpy(tmpl, original, len + 1);
+    free(original);
+    errno = EEXIST;
+    return CBM_NOT_FOUND;
 }
 #endif
 

@@ -155,7 +155,9 @@ static void ts_emit_resolved_call(TSLSPContext *ctx, const char *callee_qn, cons
     rc.strategy = strategy ? strategy : "lsp_ts";
     rc.confidence = confidence;
     rc.reason = NULL;
-    cbm_resolvedcall_push(ctx->resolved_calls, ctx->arena, rc);
+    if (!cbm_resolvedcall_push(ctx->resolved_calls, ctx->arena, rc)) {
+        return;
+    }
 }
 
 static void ts_emit_unresolved_call(TSLSPContext *ctx, const char *expr_text, const char *reason) {
@@ -167,7 +169,9 @@ static void ts_emit_unresolved_call(TSLSPContext *ctx, const char *expr_text, co
     rc.strategy = "lsp_unresolved";
     rc.confidence = 0.0f;
     rc.reason = reason;
-    cbm_resolvedcall_push(ctx->resolved_calls, ctx->arena, rc);
+    if (!cbm_resolvedcall_push(ctx->resolved_calls, ctx->arena, rc)) {
+        return;
+    }
 }
 
 // Parse a textual TS type into a CBMType. Pragmatic v1: handle the common cases

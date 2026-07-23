@@ -3,8 +3,8 @@
  *
  * Usage:
  *   CBM_DYN_ARRAY(int) nums = {0};    // zero-init
- *   cbm_da_push(&nums, 42);
- *   cbm_da_push(&nums, 99);
+ *   if (!cbm_da_push_checked(&nums, 42)) return false;
+ *   if (!cbm_da_push_checked(&nums, 99)) return false;
  *   for (int i = 0; i < nums.count; i++)
  *       printf("%d\n", nums.items[i]);
  *   cbm_da_free(&nums);
@@ -18,6 +18,8 @@
 #ifndef CBM_DYN_ARRAY_H
 #define CBM_DYN_ARRAY_H
 
+#include <stdbool.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -29,27 +31,46 @@
         int cap;         \
     }
 
-/* Push an element. Grows by 2x when full. */
-#define cbm_da_push(da, item)                                                           \
-    do {                                                                                \
-        if ((da)->count >= (da)->cap) {                                                 \
-            int _new_cap = (da)->cap ? (da)->cap * 2 : 8;                               \
-            void *_new = realloc((da)->items, (size_t)_new_cap * sizeof(*(da)->items)); \
-            if (!_new)                                                                  \
-                break;                                                                  \
-            (da)->items = _new;                                                         \
-            (da)->cap = _new_cap;                                                       \
-        }                                                                               \
-        (da)->items[(da)->count++] = (item);                                            \
-    } while (0)
+static inline bool cbm_da_ensure_capacity(void **items, int *capacity, int required,
+                                          size_t item_size) {
+    if (!items || !capacity || *capacity < 0 || required < 0 || item_size == 0 ||
+        (*capacity > 0 && !*items)) {
+        return false;
+    }
+    if (required <= *capacity) {
+        return true;
+    }
 
-/* Push an element with a pointer return (for in-place init). */
-#define cbm_da_push_ptr(da)                                                                        \
-    (((da)->count >= (da)->cap                                                                     \
-          ? ((void)((da)->cap = (da)->cap ? (da)->cap * 2 : 8),                                    \
-             (void)((da)->items = realloc((da)->items, (size_t)(da)->cap * sizeof(*(da)->items)))) \
-          : (void)0),                                                                              \
-     &(da)->items[(da)->count++])
+    size_t grown_capacity = *capacity > 0 ? (size_t)*capacity : 8U;
+    while (grown_capacity < (size_t)required) {
+        if (grown_capacity > (size_t)INT32_MAX / 2U) {
+            grown_capacity = (size_t)required;
+            break;
+        }
+        grown_capacity *= 2U;
+    }
+    if (grown_capacity > (size_t)INT32_MAX || grown_capacity > SIZE_MAX / item_size) {
+        return false;
+    }
+
+    void *grown = realloc(*items, grown_capacity * item_size);
+    if (!grown) {
+        return false;
+    }
+    *items = grown;
+    *capacity = (int)grown_capacity;
+    return true;
+}
+
+/* Fallible operations are expressions returning bool. The array is byte-for-byte
+ * unchanged when allocation or capacity arithmetic fails. */
+#define cbm_da_push_checked(da, item)                                                        \
+    ((da)->count < 0 || (da)->cap < 0 || (da)->count > (da)->cap || (da)->count == INT32_MAX \
+         ? false                                                                             \
+         : (cbm_da_ensure_capacity((void **)&(da)->items, &(da)->cap, (da)->count + 1,       \
+                                   sizeof(*(da)->items))                                     \
+                ? ((da)->items[(da)->count++] = (item), true)                                \
+                : false))
 
 /* Pop last element. Returns the element. Undefined if empty. */
 #define cbm_da_pop(da) ((da)->items[--(da)->count])
@@ -69,28 +90,9 @@
         (da)->cap = 0;      \
     } while (0)
 
-/* Reserve capacity (grow if needed, never shrink). */
-#define cbm_da_reserve(da, n)                                                      \
-    do {                                                                           \
-        if ((n) > (da)->cap) {                                                     \
-            void *_new = realloc((da)->items, (size_t)(n) * sizeof(*(da)->items)); \
-            if (_new) {                                                            \
-                (da)->items = _new;                                                \
-                (da)->cap = (n);                                                   \
-            }                                                                      \
-        }                                                                          \
-    } while (0)
-
-/* Insert at index, shifting elements right. */
-#define cbm_da_insert(da, idx, item)                                           \
-    do {                                                                       \
-        cbm_da_push(da, item); /* ensure space */                              \
-        if ((idx) < (da)->count - 1) {                                         \
-            memmove(&(da)->items[(idx) + 1], &(da)->items[(idx)],              \
-                    (size_t)((da)->count - 1 - (idx)) * sizeof(*(da)->items)); \
-            (da)->items[(idx)] = (item);                                       \
-        }                                                                      \
-    } while (0)
+/* Reserve capacity (grow if needed, never shrink), with explicit status. */
+#define cbm_da_reserve_checked(da, n) \
+    cbm_da_ensure_capacity((void **)&(da)->items, &(da)->cap, (n), sizeof(*(da)->items))
 
 /* Remove at index, shifting elements left. */
 #define cbm_da_remove(da, idx)                                                 \

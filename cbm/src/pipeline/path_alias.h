@@ -20,13 +20,13 @@
  * Lookup is two-step:
  *   1. cbm_path_alias_find_for_file picks the nearest ancestor scope for
  *      a given source file (longest matching dir_prefix wins).
- *   2. cbm_path_alias_resolve runs the chosen scope's alias map against
- *      the import path, returning a heap-allocated repo-relative target
- *      (or NULL if no alias matches).
+ *   2. cbm_path_alias_resolve_all returns every configured target in declared
+ *      order so callers can select the first target that exists in the graph.
  */
 
 #include <stdbool.h>
 #include <stddef.h>
+#include "discover/discover.h"
 
 /* Single alias entry: prefix-pattern → target-pattern, optionally with a
  * single '*' wildcard. The pattern is split at the wildcard so resolution
@@ -38,6 +38,7 @@ typedef struct {
     char *target_prefix; /* portion before '*' in the value (e.g. "src/")  */
     char *target_suffix; /* portion after  '*' in the value (usually "")   */
     bool has_wildcard;   /* true when the alias pattern contained '*'      */
+    int priority;        /* configured target order for equal alias patterns */
 } cbm_path_alias_t;
 
 /* Alias map for a single config source (one tsconfig.json, one webpack
@@ -66,17 +67,12 @@ typedef struct {
     int count;
 } cbm_path_alias_collection_t;
 
-/* Walk repo_path for known build-config files and build a collection of
- * scoped alias maps. Currently picks up tsconfig.json and jsconfig.json;
- * additional loaders register here. Returns NULL when no usable configs
- * are found (also NULL on out-of-memory). Caller frees with
- * cbm_path_alias_collection_free. */
-cbm_path_alias_collection_t *cbm_load_path_aliases(const char *repo_path);
-cbm_path_alias_collection_t *cbm_load_path_aliases_excluded(const char *repo_path,
-                                                            char **excluded_dirs,
-                                                            int excluded_count);
+/* Build scoped alias maps from the immutable captured inventory. Success with
+ * *out == NULL means no applicable configuration; failures are explicit. */
+int cbm_load_path_aliases_from_files(const cbm_file_info_t *files, int file_count,
+                                     cbm_path_alias_collection_t **out);
 
-/* Free a collection produced by cbm_load_path_aliases. NULL-safe. */
+/* Free a collection produced by cbm_load_path_aliases_from_files. NULL-safe. */
 void cbm_path_alias_collection_free(cbm_path_alias_collection_t *coll);
 
 /* Pick the nearest ancestor scope for a file path that is relative to the
@@ -85,11 +81,10 @@ void cbm_path_alias_collection_free(cbm_path_alias_collection_t *coll);
 const cbm_path_alias_map_t *cbm_path_alias_find_for_file(const cbm_path_alias_collection_t *coll,
                                                          const char *rel_path);
 
-/* Resolve module_path against map. Returns a heap-allocated repo-relative
- * path (caller frees), or NULL when no alias entry matches and no
- * baseUrl fallback applies. Common JS/TS extensions (.ts, .tsx, .js,
- * .jsx) are stripped from the resolved path so the existing module-FQN
- * pipeline can consume it. */
-char *cbm_path_alias_resolve(const cbm_path_alias_map_t *map, const char *module_path);
+/* Resolve every configured target for module_path in declared order. Success
+ * with count zero means no alias/baseUrl match. Caller frees each target and
+ * the array. */
+int cbm_path_alias_resolve_all(const cbm_path_alias_map_t *map, const char *module_path,
+                               char ***out_targets, int *out_count);
 
 #endif /* CBM_PATH_ALIAS_H */

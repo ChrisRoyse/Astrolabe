@@ -19,6 +19,7 @@ enum { GH_RING = 4, GH_RING_MASK = 3, GH_INIT_CAP = 16, GH_MIN_COMMITS = 3, GH_M
 #include "pipeline/pipeline_internal.h"
 #include "graph_buffer/graph_buffer.h"
 #include "foundation/hash_table.h"
+#include "foundation/dyn_array.h"
 #include "foundation/log.h"
 #include "foundation/platform.h"
 #ifdef ASTRO_SPAWN
@@ -95,12 +96,16 @@ typedef struct {
     long long timestamp; /* unix epoch of this commit; 0 when unknown */
 } commit_t;
 
-static void commit_add_file(commit_t *c, const char *file) {
-    if (c->count >= c->cap) {
-        c->cap = c->cap ? c->cap * PAIR_LEN : GH_INIT_CAP;
-        c->files = safe_realloc(c->files, c->cap * sizeof(char *));
+static bool commit_add_file(commit_t *c, const char *file) {
+    if (!cbm_da_ensure_capacity((void **)&c->files, &c->cap, c->count + 1, sizeof(*c->files))) {
+        return false;
     }
-    c->files[c->count++] = strdup(file);
+    char *copy = strdup(file);
+    if (!copy) {
+        return false;
+    }
+    c->files[c->count++] = copy;
+    return true;
 }
 
 static void commit_free(commit_t *c) {
@@ -174,8 +179,8 @@ static int parse_git_log(const char *repo_path, commit_t **out, int *out_count) 
         return CBM_NOT_FOUND;
     }
 
-    int cap = CBM_SZ_64;
-    commit_t *commits = malloc(cap * sizeof(commit_t));
+    int cap = 0;
+    commit_t *commits = NULL;
     int count = 0;
     commit_t current = {0};
 
@@ -209,9 +214,8 @@ static int parse_git_log(const char *repo_path, commit_t **out, int *out_count) 
 
         if (strncmp(line, "COMMIT:", SLEN("COMMIT:")) == 0) {
             if (current.count > 0) {
-                if (count >= cap) {
-                    cap *= PAIR_LEN;
-                    commits = safe_realloc(commits, cap * sizeof(commit_t));
+                if (!cbm_da_ensure_capacity((void **)&commits, &cap, count + 1, sizeof(*commits))) {
+                    goto allocation_failed;
                 }
                 commits[count++] = current;
                 memset(&current, 0, sizeof(current));
@@ -226,13 +230,14 @@ static int parse_git_log(const char *repo_path, commit_t **out, int *out_count) 
         }
 
         if (cbm_is_trackable_file(line)) {
-            commit_add_file(&current, line);
+            if (!commit_add_file(&current, line)) {
+                goto allocation_failed;
+            }
         }
     }
     if (current.count > 0) {
-        if (count >= cap) {
-            cap *= PAIR_LEN;
-            commits = safe_realloc(commits, cap * sizeof(commit_t));
+        if (!cbm_da_ensure_capacity((void **)&commits, &cap, count + 1, sizeof(*commits))) {
+            goto allocation_failed;
         }
         commits[count++] = current;
     } else {
@@ -247,6 +252,24 @@ static int parse_git_log(const char *repo_path, commit_t **out, int *out_count) 
     *out = commits;
     *out_count = count;
     return 0;
+
+allocation_failed:
+    commit_free(&current);
+    for (int i = 0; i < count; i++) {
+        commit_free(&commits[i]);
+    }
+    free(commits);
+#ifdef ASTRO_SPAWN
+    free(data);
+#else
+    cbm_pclose(fp);
+#endif
+    cbm_log_error(
+        "githistory.parse_failed", "code", "CBM_GIT_HISTORY_ALLOCATION_FAILED", "component",
+        "githistory.parse", "operation", "grow", "key", repo_path, "message",
+        "git history allocation failed", "remediation",
+        "free memory or reduce history size, then retry; no partial history was returned");
+    return CBM_NOT_FOUND;
 }
 
 /* Callback to free hash table entries. */
@@ -324,6 +347,13 @@ int cbm_compute_change_coupling(const cbm_commit_files_t *commits, int commit_co
      * pair, so the resulting edge can carry last_co_change. The pair_counts
      * table consumes its key on insert; pair_timestamps gets its own copy. */
     CBMHashTable *pair_timestamps = cbm_ht_create(CBM_SZ_2K);
+    if (!file_counts || !pair_counts || !pair_timestamps) {
+        cbm_log_error("githistory.coupling_failed", "code", "CBM_GIT_MAP_ALLOC_FAILED", "component",
+                      "githistory.coupling_maps", "operation", "create", "key", "", "message",
+                      "change-coupling maps could not be allocated", "remediation",
+                      "free memory or reduce history size, then retry");
+        goto fail;
+    }
 
     for (int c = 0; c < commit_count; c++) {
         if (commits[c].count > GH_MAX_FILES) {
@@ -336,8 +366,29 @@ int cbm_compute_change_coupling(const cbm_commit_files_t *commits, int commit_co
                 (*val)++;
             } else {
                 int *nv = malloc(sizeof(int));
+                char *owned_file = strdup(commits[c].files[i]);
+                if (!nv || !owned_file) {
+                    free(nv);
+                    free(owned_file);
+                    cbm_log_error("githistory.coupling_failed", "code",
+                                  "CBM_GIT_FILE_COUNT_ALLOC_FAILED", "component",
+                                  "githistory.file_counts", "operation", "entry_alloc", "key",
+                                  commits[c].files[i], "message",
+                                  "file change-count entry could not be allocated", "remediation",
+                                  "free memory or reduce history size, then retry");
+                    goto fail;
+                }
                 *nv = SKIP_ONE;
-                cbm_ht_set(file_counts, strdup(commits[c].files[i]), nv);
+                if (!cbm_ht_set_checked(file_counts, owned_file, nv, NULL)) {
+                    cbm_log_error(
+                        "githistory.coupling_failed", "code", "CBM_GIT_FILE_COUNT_INSERT_FAILED",
+                        "component", "githistory.file_counts", "operation", "insert", "key",
+                        owned_file, "message", "file change-count map could not retain an entry",
+                        "remediation", "free memory or reduce history size, then retry");
+                    free(owned_file);
+                    free(nv);
+                    goto fail;
+                }
             }
         }
 
@@ -352,8 +403,24 @@ int cbm_compute_change_coupling(const cbm_commit_files_t *commits, int commit_co
                 }
                 size_t la = strlen(a);
                 size_t lb = strlen(b);
+                if (la > SIZE_MAX - lb - 2) {
+                    cbm_log_error("githistory.coupling_failed", "code",
+                                  "CBM_GIT_PAIR_KEY_TOO_LARGE", "component",
+                                  "githistory.pair_counts", "operation", "key_length", "key", a,
+                                  "message", "change-coupling key length overflowed", "remediation",
+                                  "reduce path lengths and retry");
+                    goto fail;
+                }
                 size_t pk_len = la + SKIP_ONE + lb + SKIP_ONE;
                 char *pk = malloc(pk_len);
+                if (!pk) {
+                    cbm_log_error("githistory.coupling_failed", "code",
+                                  "CBM_GIT_PAIR_KEY_ALLOC_FAILED", "component",
+                                  "githistory.pair_counts", "operation", "key_alloc", "key", a,
+                                  "message", "change-coupling key could not be allocated",
+                                  "remediation", "free memory or reduce history size, then retry");
+                    goto fail;
+                }
                 memcpy(pk, a, la);
                 pk[la] = '\x01';
                 memcpy(pk + la + SKIP_ONE, b, lb + SKIP_ONE);
@@ -372,11 +439,45 @@ int cbm_compute_change_coupling(const cbm_commit_files_t *commits, int commit_co
                     /* pair_counts takes ownership of pk; pair_timestamps
                      * needs its own copy. */
                     char *pk2 = malloc(pk_len);
-                    memcpy(pk2, pk, pk_len);
-                    cbm_ht_set(pair_counts, pk, nv);
                     long long *nts = malloc(sizeof(long long));
+                    if (!nv || !pk2 || !nts) {
+                        free(pk);
+                        free(nv);
+                        free(pk2);
+                        free(nts);
+                        cbm_log_error(
+                            "githistory.coupling_failed", "code", "CBM_GIT_PAIR_ENTRY_ALLOC_FAILED",
+                            "component", "githistory.pair_counts", "operation", "entry_alloc",
+                            "key", a, "message", "change-coupling entry could not be allocated",
+                            "remediation", "free memory or reduce history size, then retry");
+                        goto fail;
+                    }
+                    memcpy(pk2, pk, pk_len);
                     *nts = commits[c].timestamp;
-                    cbm_ht_set(pair_timestamps, pk2, nts);
+                    if (!cbm_ht_set_checked(pair_counts, pk, nv, NULL)) {
+                        cbm_log_error("githistory.coupling_failed", "code",
+                                      "CBM_GIT_PAIR_COUNT_INSERT_FAILED", "component",
+                                      "githistory.pair_counts", "operation", "insert", "key", pk,
+                                      "message", "change-coupling map could not retain an entry",
+                                      "remediation",
+                                      "free memory or reduce history size, then retry");
+                        free(pk);
+                        free(nv);
+                        free(pk2);
+                        free(nts);
+                        goto fail;
+                    }
+                    if (!cbm_ht_set_checked(pair_timestamps, pk2, nts, NULL)) {
+                        cbm_log_error(
+                            "githistory.coupling_failed", "code", "CBM_GIT_PAIR_TIME_INSERT_FAILED",
+                            "component", "githistory.pair_timestamps", "operation", "insert", "key",
+                            pk2, "message",
+                            "change-coupling timestamp map could not retain an entry",
+                            "remediation", "free memory or reduce history size, then retry");
+                        free(pk2);
+                        free(nts);
+                        goto fail;
+                    }
                 }
             }
         }
@@ -399,6 +500,21 @@ int cbm_compute_change_coupling(const cbm_commit_files_t *commits, int commit_co
     cbm_ht_free(file_counts);
 
     return cctx.out_count;
+
+fail:
+    if (pair_counts) {
+        cbm_ht_foreach(pair_counts, free_counter, NULL);
+        cbm_ht_free(pair_counts);
+    }
+    if (pair_timestamps) {
+        cbm_ht_foreach(pair_timestamps, free_counter, NULL);
+        cbm_ht_free(pair_timestamps);
+    }
+    if (file_counts) {
+        cbm_ht_foreach(file_counts, free_counter, NULL);
+        cbm_ht_free(file_counts);
+    }
+    return CBM_NOT_FOUND;
 }
 
 /* ── Split pass: compute (I/O-bound) + apply (gbuf writes) ───────── */
@@ -419,7 +535,11 @@ int cbm_pipeline_githistory_compute(const char *repo_path, cbm_githistory_result
     commit_t *commits = NULL;
     int commit_count = 0;
     int rc = parse_git_log(repo_path, &commits, &commit_count);
-    if (rc != 0 || commit_count == 0) {
+    if (rc != 0) {
+        free(commits);
+        return CBM_NOT_FOUND;
+    }
+    if (commit_count == 0) {
         free(commits);
         return 0;
     }
@@ -433,7 +553,11 @@ int cbm_pipeline_githistory_compute(const char *repo_path, cbm_githistory_result
             commit_free(&commits[c]);
         }
         free(commits);
-        return 0;
+        cbm_log_error("githistory.compute_failed", "code", "CBM_GIT_COMMIT_VIEW_ALLOC_FAILED",
+                      "component", "githistory.compute", "operation", "commit_view_alloc", "key",
+                      repo_path, "message", "commit history view could not be allocated",
+                      "remediation", "free memory or reduce history size, then retry");
+        return CBM_NOT_FOUND;
     }
     for (int c = 0; c < commit_count; c++) {
         cf[c].files = commits[c].files;
@@ -442,16 +566,64 @@ int cbm_pipeline_githistory_compute(const char *repo_path, cbm_githistory_result
     }
 
     cbm_change_coupling_t *couplings = malloc(MAX_COUPLINGS * sizeof(cbm_change_coupling_t));
+    if (!couplings) {
+        cbm_log_error("githistory.compute_failed", "code", "CBM_GIT_COUPLING_ALLOC_FAILED",
+                      "component", "githistory.compute", "operation", "coupling_alloc", "key",
+                      repo_path, "message", "change-coupling output could not be allocated",
+                      "remediation", "free memory or reduce history size, then retry");
+        free(cf);
+        for (int c = 0; c < commit_count; c++) {
+            commit_free(&commits[c]);
+        }
+        free(commits);
+        return CBM_NOT_FOUND;
+    }
     int coupling_count = cbm_compute_change_coupling(cf, commit_count, couplings, MAX_COUPLINGS);
+    if (coupling_count < 0) {
+        free(couplings);
+        free(cf);
+        for (int c = 0; c < commit_count; c++) {
+            commit_free(&commits[c]);
+        }
+        free(commits);
+        return CBM_NOT_FOUND;
+    }
 
     /* Per-file temporal aggregation: change_count + last_modified.
      * Single hash-table pass over the same commit set used for coupling so
-     * we don't re-scan history. NULL on OOM is fine — the caller still
-     * gets the couplings. */
+     * we don't re-scan history. This is one authoritative result: allocation
+     * failure cancels it rather than returning a partial coupling-only view. */
     cbm_file_temporal_t *ft_arr = malloc(MAX_FILE_TEMPORAL * sizeof(cbm_file_temporal_t));
-    if (ft_arr) {
+    if (!ft_arr) {
+        cbm_log_error("githistory.compute_failed", "code", "CBM_GIT_TEMPORAL_ALLOC_FAILED",
+                      "component", "githistory.file_temporal", "operation", "output_alloc", "key",
+                      repo_path, "message", "file temporal output could not be allocated",
+                      "remediation", "free memory or reduce history size, then retry");
+        free(couplings);
+        free(cf);
+        for (int c = 0; c < commit_count; c++) {
+            commit_free(&commits[c]);
+        }
+        free(commits);
+        return CBM_NOT_FOUND;
+    }
+    {
         int ft_count = 0;
         CBMHashTable *file_idx = cbm_ht_create(CBM_SZ_1K);
+        if (!file_idx) {
+            cbm_log_error("githistory.compute_failed", "code", "CBM_GIT_FILE_INDEX_ALLOC_FAILED",
+                          "component", "githistory.file_temporal", "operation", "index_create",
+                          "key", repo_path, "message", "file temporal index could not be allocated",
+                          "remediation", "free memory or reduce history size, then retry");
+            free(ft_arr);
+            free(couplings);
+            free(cf);
+            for (int c = 0; c < commit_count; c++) {
+                commit_free(&commits[c]);
+            }
+            free(commits);
+            return CBM_NOT_FOUND;
+        }
         for (int c = 0; c < commit_count; c++) {
             if (cf[c].count > GH_MAX_FILES) {
                 continue;
@@ -471,8 +643,47 @@ int cbm_pipeline_githistory_compute(const char *repo_path, cbm_githistory_result
                     ft_arr[new_idx].change_count = 1;
                     ft_arr[new_idx].last_modified = cf[c].timestamp;
                     int *nidx = malloc(sizeof(int));
+                    char *owned_fp = strdup(fp);
+                    if (!nidx || !owned_fp) {
+                        free(nidx);
+                        free(owned_fp);
+                        cbm_log_error(
+                            "githistory.compute_failed", "code",
+                            "CBM_GIT_FILE_INDEX_ENTRY_ALLOC_FAILED", "component",
+                            "githistory.file_temporal", "operation", "entry_alloc", "key", fp,
+                            "message", "file temporal index entry could not be allocated",
+                            "remediation", "free memory or reduce history size, then retry");
+                        cbm_ht_foreach(file_idx, free_counter, NULL);
+                        cbm_ht_free(file_idx);
+                        free(ft_arr);
+                        free(couplings);
+                        free(cf);
+                        for (int ci = 0; ci < commit_count; ci++) {
+                            commit_free(&commits[ci]);
+                        }
+                        free(commits);
+                        return CBM_NOT_FOUND;
+                    }
                     *nidx = new_idx;
-                    cbm_ht_set(file_idx, strdup(fp), nidx);
+                    if (!cbm_ht_set_checked(file_idx, owned_fp, nidx, NULL)) {
+                        cbm_log_error(
+                            "githistory.compute_failed", "code", "CBM_GIT_FILE_INDEX_INSERT_FAILED",
+                            "component", "githistory.file_temporal", "operation", "insert", "key",
+                            owned_fp, "message", "file temporal index could not retain an entry",
+                            "remediation", "free memory or reduce history size, then retry");
+                        free(owned_fp);
+                        free(nidx);
+                        cbm_ht_foreach(file_idx, free_counter, NULL);
+                        cbm_ht_free(file_idx);
+                        free(ft_arr);
+                        free(couplings);
+                        free(cf);
+                        for (int ci = 0; ci < commit_count; ci++) {
+                            commit_free(&commits[ci]);
+                        }
+                        free(commits);
+                        return CBM_NOT_FOUND;
+                    }
                 }
             }
         }
@@ -547,10 +758,10 @@ int cbm_pipeline_githistory_apply(cbm_pipeline_ctx_t *ctx, const cbm_githistory_
                  ft->last_modified, ft->change_count);
 
         if (node->source_present) {
-            cbm_gbuf_upsert_source_node(
-                ctx->gbuf, node->label, node->name, node->qualified_name, node->file_path,
-                node->start_line, node->end_line, node->source_bytes, node->source_len,
-                node->start_byte, node->end_byte, props);
+            cbm_gbuf_upsert_source_node(ctx->gbuf, node->label, node->name, node->qualified_name,
+                                        node->file_path, node->start_line, node->end_line,
+                                        node->source_bytes, node->source_len, node->start_byte,
+                                        node->end_byte, props);
         } else {
             cbm_gbuf_upsert_node(ctx->gbuf, node->label, node->name, node->qualified_name,
                                  node->file_path, node->start_line, node->end_line, props);
@@ -566,7 +777,9 @@ int cbm_pipeline_pass_githistory(cbm_pipeline_ctx_t *ctx) {
     cbm_log_info("pass.start", "pass", "githistory");
 
     cbm_githistory_result_t result = {0};
-    cbm_pipeline_githistory_compute(ctx->repo_path, &result);
+    if (cbm_pipeline_githistory_compute(ctx->repo_path, &result) != 0) {
+        return CBM_NOT_FOUND;
+    }
 
     int edge_count = 0;
     if (result.count > 0 || result.file_temporal_count > 0) {

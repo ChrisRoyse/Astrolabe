@@ -66,6 +66,8 @@ static void kt_builtins_inject_defs(CBMFileResult *result, CBMArena *arena) {
         def.file_path = "<kotlin-builtins>";
         def.start_line = 1;
         def.end_line = 1;
-        cbm_defs_push(&result->defs, arena, def);
+        if (!cbm_defs_push(&result->defs, arena, def)) {
+            return;
+        }
     }
 }

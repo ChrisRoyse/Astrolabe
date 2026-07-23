@@ -97,7 +97,9 @@ static void emit_kustomize_sequence(CBMExtractCtx *ctx, TSNode seq_node, const c
                 .local_name = cbm_arena_strdup(a, key_name),
                 .module_path = cbm_arena_strdup(a, scalar),
             };
-            cbm_imports_push(&ctx->result->imports, a, imp);
+            if (!cbm_imports_push(&ctx->result->imports, a, imp)) {
+                return;
+            }
         }
     }
 }
@@ -183,7 +185,9 @@ static void emit_kustomize_kind_def(CBMExtractCtx *ctx, TSNode mapping) {
         def.file_path = ctx->rel_path;
         def.start_line = ts_node_start_point(mapping).row + TS_LINE_OFFSET;
         def.end_line = ts_node_end_point(mapping).row + TS_LINE_OFFSET;
-        cbm_defs_push(&ctx->result->defs, a, def);
+        if (!cbm_defs_push(&ctx->result->defs, a, def)) {
+            return;
+        }
         return;
     }
 }
@@ -341,7 +345,9 @@ static void extract_k8s_manifest(CBMExtractCtx *ctx) {
         def.file_path = ctx->rel_path;
         def.start_line = ts_node_start_point(mapping).row + TS_LINE_OFFSET;
         def.end_line = ts_node_end_point(mapping).row + TS_LINE_OFFSET;
-        cbm_defs_push(&ctx->result->defs, a, def);
+        if (!cbm_defs_push(&ctx->result->defs, a, def)) {
+            return;
+        }
 
         break; // Only the first document per file
     }

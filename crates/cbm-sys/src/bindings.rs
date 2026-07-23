@@ -19,6 +19,10 @@ pub struct CBMArena {
     pub block_size: usize,
     pub used: usize,
     pub total_alloc: usize,
+    pub failed: bool,
+    pub failure_code: *const ::std::os::raw::c_char,
+    pub failure_operation: *const ::std::os::raw::c_char,
+    pub failure_bytes: usize,
 }
 impl Default for CBMArena {
     fn default() -> Self {
@@ -34,6 +38,26 @@ unsafe extern "C" {
 }
 unsafe extern "C" {
     pub fn cbm_arena_alloc(a: *mut CBMArena, n: usize) -> *mut ::std::os::raw::c_void;
+}
+unsafe extern "C" {
+    pub fn cbm_arena_mark_failed(
+        a: *mut CBMArena,
+        code: *const ::std::os::raw::c_char,
+        operation: *const ::std::os::raw::c_char,
+        requested_bytes: usize,
+    );
+}
+unsafe extern "C" {
+    pub fn cbm_arena_failed(a: *const CBMArena) -> bool;
+}
+unsafe extern "C" {
+    pub fn cbm_arena_failure_code(a: *const CBMArena) -> *const ::std::os::raw::c_char;
+}
+unsafe extern "C" {
+    pub fn cbm_arena_failure_operation(a: *const CBMArena) -> *const ::std::os::raw::c_char;
+}
+unsafe extern "C" {
+    pub fn cbm_arena_failure_bytes(a: *const CBMArena) -> usize;
 }
 unsafe extern "C" {
     pub fn cbm_arena_strdup(
@@ -1053,20 +1077,6 @@ unsafe extern "C" {
     pub fn cbm_init() -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {
-    pub fn cbm_index_is_quarantined(rel_path: *const ::std::os::raw::c_char) -> bool;
-}
-unsafe extern "C" {
-    pub fn cbm_index_quarantine_phase(
-        rel_path: *const ::std::os::raw::c_char,
-    ) -> *const ::std::os::raw::c_char;
-}
-unsafe extern "C" {
-    pub fn cbm_index_mark_start(rel_path: *const ::std::os::raw::c_char);
-}
-unsafe extern "C" {
-    pub fn cbm_index_mark_done(rel_path: *const ::std::os::raw::c_char);
-}
-unsafe extern "C" {
     pub fn cbm_extract_file(
         source: *const ::std::os::raw::c_char,
         source_len: ::std::os::raw::c_int,
@@ -1134,54 +1144,70 @@ unsafe extern "C" {
     pub fn cbm_macro_extraction_enabled() -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {
-    pub fn cbm_defs_push(arr: *mut CBMDefArray, a: *mut CBMArena, def: CBMDefinition);
+    pub fn cbm_defs_push(arr: *mut CBMDefArray, a: *mut CBMArena, def: CBMDefinition) -> bool;
 }
 unsafe extern "C" {
-    pub fn cbm_calls_push(arr: *mut CBMCallArray, a: *mut CBMArena, call: CBMCall);
+    pub fn cbm_calls_push(arr: *mut CBMCallArray, a: *mut CBMArena, call: CBMCall) -> bool;
 }
 unsafe extern "C" {
-    pub fn cbm_imports_push(arr: *mut CBMImportArray, a: *mut CBMArena, imp: CBMImport);
+    pub fn cbm_imports_push(arr: *mut CBMImportArray, a: *mut CBMArena, imp: CBMImport) -> bool;
 }
 unsafe extern "C" {
-    pub fn cbm_usages_push(arr: *mut CBMUsageArray, a: *mut CBMArena, usage: CBMUsage);
+    pub fn cbm_usages_push(arr: *mut CBMUsageArray, a: *mut CBMArena, usage: CBMUsage) -> bool;
 }
 unsafe extern "C" {
-    pub fn cbm_throws_push(arr: *mut CBMThrowArray, a: *mut CBMArena, thr: CBMThrow);
+    pub fn cbm_throws_push(arr: *mut CBMThrowArray, a: *mut CBMArena, thr: CBMThrow) -> bool;
 }
 unsafe extern "C" {
-    pub fn cbm_rw_push(arr: *mut CBMRWArray, a: *mut CBMArena, rw: CBMReadWrite);
+    pub fn cbm_rw_push(arr: *mut CBMRWArray, a: *mut CBMArena, rw: CBMReadWrite) -> bool;
 }
 unsafe extern "C" {
-    pub fn cbm_typerefs_push(arr: *mut CBMTypeRefArray, a: *mut CBMArena, tr: CBMTypeRef);
+    pub fn cbm_typerefs_push(arr: *mut CBMTypeRefArray, a: *mut CBMArena, tr: CBMTypeRef) -> bool;
 }
 unsafe extern "C" {
-    pub fn cbm_envaccess_push(arr: *mut CBMEnvAccessArray, a: *mut CBMArena, ea: CBMEnvAccess);
+    pub fn cbm_envaccess_push(
+        arr: *mut CBMEnvAccessArray,
+        a: *mut CBMArena,
+        ea: CBMEnvAccess,
+    ) -> bool;
 }
 unsafe extern "C" {
-    pub fn cbm_typeassign_push(arr: *mut CBMTypeAssignArray, a: *mut CBMArena, ta: CBMTypeAssign);
+    pub fn cbm_typeassign_push(
+        arr: *mut CBMTypeAssignArray,
+        a: *mut CBMArena,
+        ta: CBMTypeAssign,
+    ) -> bool;
 }
 unsafe extern "C" {
-    pub fn cbm_stringref_push(arr: *mut CBMStringRefArray, a: *mut CBMArena, sr: CBMStringRef);
+    pub fn cbm_stringref_push(
+        arr: *mut CBMStringRefArray,
+        a: *mut CBMArena,
+        sr: CBMStringRef,
+    ) -> bool;
 }
 unsafe extern "C" {
     pub fn cbm_infrabinding_push(
         arr: *mut CBMInfraBindingArray,
         a: *mut CBMArena,
         ib: CBMInfraBinding,
-    );
+    ) -> bool;
 }
 unsafe extern "C" {
-    pub fn cbm_impltrait_push(arr: *mut CBMImplTraitArray, a: *mut CBMArena, it: CBMImplTrait);
+    pub fn cbm_impltrait_push(
+        arr: *mut CBMImplTraitArray,
+        a: *mut CBMArena,
+        it: CBMImplTrait,
+    ) -> bool;
 }
 unsafe extern "C" {
     pub fn cbm_resolvedcall_push(
         arr: *mut CBMResolvedCallArray,
         a: *mut CBMArena,
         rc: CBMResolvedCall,
-    );
+    ) -> bool;
 }
 unsafe extern "C" {
-    pub fn cbm_channels_push(arr: *mut CBMChannelArray, a: *mut CBMArena, ch: CBMChannel);
+    pub fn cbm_channels_push(arr: *mut CBMChannelArray, a: *mut CBMArena, ch: CBMChannel) -> bool;
 }
 unsafe extern "C" {
     pub fn cbm_extract_definitions(ctx: *mut CBMExtractCtx);
@@ -1226,7 +1252,10 @@ unsafe extern "C" {
     pub fn cbm_language_name(lang: CBMLanguage) -> *const ::std::os::raw::c_char;
 }
 unsafe extern "C" {
-    pub fn cbm_disambiguate_m(path: *const ::std::os::raw::c_char) -> CBMLanguage;
+    pub fn cbm_disambiguate_m_checked(
+        path: *const ::std::os::raw::c_char,
+        out: *mut CBMLanguage,
+    ) -> ::std::os::raw::c_int;
 }
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
@@ -1235,7 +1264,11 @@ pub struct cbm_gitignore {
 }
 pub type cbm_gitignore_t = cbm_gitignore;
 unsafe extern "C" {
-    pub fn cbm_gitignore_load(path: *const ::std::os::raw::c_char) -> *mut cbm_gitignore_t;
+    pub fn cbm_gitignore_load_checked(
+        path: *const ::std::os::raw::c_char,
+        optional: bool,
+        out: *mut *mut cbm_gitignore_t,
+    ) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {
     pub fn cbm_gitignore_parse(content: *const ::std::os::raw::c_char) -> *mut cbm_gitignore_t;
@@ -1285,9 +1318,17 @@ unsafe extern "C" {
 #[derive(Debug, Copy, Clone)]
 pub struct cbm_file_info_t {
     pub path: *mut ::std::os::raw::c_char,
+    pub live_path: *mut ::std::os::raw::c_char,
     pub rel_path: *mut ::std::os::raw::c_char,
     pub language: CBMLanguage,
     pub size: i64,
+    pub mtime_ns: i64,
+    pub sha256: [::std::os::raw::c_char; 65usize],
+    pub source_volume_serial: u64,
+    pub source_file_id: [u8; 16usize],
+    pub source_change_time_100ns: i64,
+    pub auxiliary: bool,
+    pub interpretation_input: bool,
 }
 impl Default for cbm_file_info_t {
     fn default() -> Self {
@@ -1297,6 +1338,9 @@ impl Default for cbm_file_info_t {
             s.assume_init()
         }
     }
+}
+unsafe extern "C" {
+    pub fn cbm_is_auxiliary_input_name(filename: *const ::std::os::raw::c_char) -> bool;
 }
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
@@ -1471,6 +1515,13 @@ unsafe extern "C" {
         buf_sz: usize,
         fallback: *const ::std::os::raw::c_char,
     ) -> *const ::std::os::raw::c_char;
+}
+unsafe extern "C" {
+    pub fn cbm_read_env(
+        name: *const ::std::os::raw::c_char,
+        buf: *mut ::std::os::raw::c_char,
+        buf_sz: usize,
+    ) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {
     pub fn cbm_get_home_dir() -> *const ::std::os::raw::c_char;
@@ -1942,11 +1993,20 @@ unsafe extern "C" {
         rel_dir: *const ::std::os::raw::c_char,
     ) -> *mut ::std::os::raw::c_char;
 }
+pub const cbm_relative_import_status_t_CBM_RELATIVE_IMPORT_ERROR: cbm_relative_import_status_t = -1;
+pub const cbm_relative_import_status_t_CBM_RELATIVE_IMPORT_NOT_RELATIVE:
+    cbm_relative_import_status_t = 0;
+pub const cbm_relative_import_status_t_CBM_RELATIVE_IMPORT_RESOLVED: cbm_relative_import_status_t =
+    1;
+pub const cbm_relative_import_status_t_CBM_RELATIVE_IMPORT_INVALID: cbm_relative_import_status_t =
+    2;
+pub type cbm_relative_import_status_t = ::std::os::raw::c_int;
 unsafe extern "C" {
-    pub fn cbm_pipeline_resolve_relative_import(
+    pub fn cbm_pipeline_resolve_relative_import_checked(
         source_rel: *const ::std::os::raw::c_char,
         module_path: *const ::std::os::raw::c_char,
-    ) -> *mut ::std::os::raw::c_char;
+        out: *mut *mut ::std::os::raw::c_char,
+    ) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {
     pub fn cbm_project_name_from_path(
@@ -1988,7 +2048,10 @@ unsafe extern "C" {
         name: *const ::std::os::raw::c_char,
         qualified_name: *const ::std::os::raw::c_char,
         label: *const ::std::os::raw::c_char,
-    );
+    ) -> bool;
+}
+unsafe extern "C" {
+    pub fn cbm_registry_failed(r: *const cbm_registry_t) -> bool;
 }
 unsafe extern "C" {
     pub fn cbm_registry_resolve(
@@ -2021,6 +2084,9 @@ unsafe extern "C" {
 }
 unsafe extern "C" {
     pub fn cbm_registry_resolve_cache_end();
+}
+unsafe extern "C" {
+    pub fn cbm_registry_cache_failed() -> bool;
 }
 unsafe extern "C" {
     pub fn cbm_registry_exists(r: *const cbm_registry_t, qn: *const ::std::os::raw::c_char)
@@ -2507,6 +2573,9 @@ unsafe extern "C" {
 }
 unsafe extern "C" {
     pub fn cbm_store_error(s: *mut cbm_store_t) -> *const ::std::os::raw::c_char;
+}
+unsafe extern "C" {
+    pub fn cbm_store_error_code(s: *mut cbm_store_t) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {
     pub fn cbm_store_begin(s: *mut cbm_store_t) -> ::std::os::raw::c_int;

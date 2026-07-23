@@ -213,7 +213,7 @@ typedef struct {
     bool is_test;
     bool is_entry_point;
     const char *structural_profile; // AST structural profile (arena-allocated) or NULL
-    const char *body_tokens; // space-separated raw identifier tokens from body (arena) or NULL
+    const char *body_tokens;     // space-separated raw identifier tokens from body (arena) or NULL
     const char *struct_trigrams; // panel S1 source: newline-delimited "a\tb\tc\tweight"
                                  // normalised AST node-type trigrams (arena) or NULL
     // #501/#473: byte-exact parse-time source span of the definition node, captured
@@ -546,29 +546,6 @@ int cbm_alloc_bindings_active(void);
 // Initialize the library. Call once at startup. Returns 0 on success.
 int cbm_init(void);
 
-// True when rel_path is in the crash-quarantine set — the newline-delimited list
-// of files (CBM_INDEX_QUARANTINE_FILE) the crash supervisor pinned as crashers
-// during its single-threaded recovery re-run. Loaded once, lazily; read-only
-// after load. cbm_extract_file short-circuits such files to an empty result so no
-// pass can crash on them; the pipeline extract loops call this to also REPORT the
-// skip as phase="crash". Always false (cheap no-op) when the env var is unset.
-bool cbm_index_is_quarantined(const char *rel_path);
-
-// Phase a quarantined file was pinned under: "crash" (a fault signal) or "hang"
-// (killed for making no progress). Returns NULL when rel_path is not quarantined.
-// Drives the same lazy once-load as cbm_index_is_quarantined. Used by the pipeline
-// extract loops to report the skip's phase in skipped[] (falls back to "crash").
-const char *cbm_index_quarantine_phase(const char *rel_path);
-
-// Crash-supervisor marker journal (parallel-safe): appends "S <rel_path>" /
-// "D <rel_path>" to CBM_INDEX_MARKER_FILE. Files with an S but no D form the
-// parent's crash/hang suspect set. No-ops when the env var is unset.
-// cbm_extract_file journals its own start/done; long-running per-file phases
-// (cross-LSP resolve) call these around their per-file work so a hang there
-// is attributed to the RIGHT file instead of a stale extraction marker.
-void cbm_index_mark_start(const char *rel_path);
-void cbm_index_mark_done(const char *rel_path);
-
 // Extract all data from one file. Caller must call cbm_free_result().
 // source must remain valid for the duration of the call.
 // timeout_micros: per-file parse timeout in microseconds (0 = no timeout).
@@ -619,20 +596,22 @@ int cbm_macro_extraction_enabled(void);
 // --- Internal helpers used by extractors ---
 
 // Growable array push functions (arena-allocated, no individual free needed).
-void cbm_defs_push(CBMDefArray *arr, CBMArena *a, CBMDefinition def);
-void cbm_calls_push(CBMCallArray *arr, CBMArena *a, CBMCall call);
-void cbm_imports_push(CBMImportArray *arr, CBMArena *a, CBMImport imp);
-void cbm_usages_push(CBMUsageArray *arr, CBMArena *a, CBMUsage usage);
-void cbm_throws_push(CBMThrowArray *arr, CBMArena *a, CBMThrow thr);
-void cbm_rw_push(CBMRWArray *arr, CBMArena *a, CBMReadWrite rw);
-void cbm_typerefs_push(CBMTypeRefArray *arr, CBMArena *a, CBMTypeRef tr);
-void cbm_envaccess_push(CBMEnvAccessArray *arr, CBMArena *a, CBMEnvAccess ea);
-void cbm_typeassign_push(CBMTypeAssignArray *arr, CBMArena *a, CBMTypeAssign ta);
-void cbm_stringref_push(CBMStringRefArray *arr, CBMArena *a, CBMStringRef sr);
-void cbm_infrabinding_push(CBMInfraBindingArray *arr, CBMArena *a, CBMInfraBinding ib);
-void cbm_impltrait_push(CBMImplTraitArray *arr, CBMArena *a, CBMImplTrait it);
-void cbm_resolvedcall_push(CBMResolvedCallArray *arr, CBMArena *a, CBMResolvedCall rc);
-void cbm_channels_push(CBMChannelArray *arr, CBMArena *a, CBMChannel ch);
+// False is a sticky transaction failure recorded on the arena; extraction
+// boundaries must reject the whole result rather than persist partial atoms.
+bool cbm_defs_push(CBMDefArray *arr, CBMArena *a, CBMDefinition def);
+bool cbm_calls_push(CBMCallArray *arr, CBMArena *a, CBMCall call);
+bool cbm_imports_push(CBMImportArray *arr, CBMArena *a, CBMImport imp);
+bool cbm_usages_push(CBMUsageArray *arr, CBMArena *a, CBMUsage usage);
+bool cbm_throws_push(CBMThrowArray *arr, CBMArena *a, CBMThrow thr);
+bool cbm_rw_push(CBMRWArray *arr, CBMArena *a, CBMReadWrite rw);
+bool cbm_typerefs_push(CBMTypeRefArray *arr, CBMArena *a, CBMTypeRef tr);
+bool cbm_envaccess_push(CBMEnvAccessArray *arr, CBMArena *a, CBMEnvAccess ea);
+bool cbm_typeassign_push(CBMTypeAssignArray *arr, CBMArena *a, CBMTypeAssign ta);
+bool cbm_stringref_push(CBMStringRefArray *arr, CBMArena *a, CBMStringRef sr);
+bool cbm_infrabinding_push(CBMInfraBindingArray *arr, CBMArena *a, CBMInfraBinding ib);
+bool cbm_impltrait_push(CBMImplTraitArray *arr, CBMArena *a, CBMImplTrait it);
+bool cbm_resolvedcall_push(CBMResolvedCallArray *arr, CBMArena *a, CBMResolvedCall rc);
+bool cbm_channels_push(CBMChannelArray *arr, CBMArena *a, CBMChannel ch);
 
 // --- Sub-extractor entry points ---
 

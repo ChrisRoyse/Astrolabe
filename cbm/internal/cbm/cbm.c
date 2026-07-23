@@ -14,9 +14,8 @@
 #include "lsp/rust_lsp.h"
 #include "preprocessor.h"
 #include "foundation/compat.h"
-#include "foundation/compat_fs.h"  // cbm_fopen — crash-supervisor per-file marker write
-#include "foundation/hash_table.h" // CBMHashTable — crash-supervisor quarantine set
-#include "foundation/log.h"        // cbm_log_warn — explicit preprocessor diagnostics
+#include "foundation/compat_fs.h" // cbm_fopen — crash-supervisor per-file marker write
+#include "foundation/log.h"       // cbm_log_warn — explicit preprocessor diagnostics
 #include "tree_sitter/api.h" // TSParser, TSNode, TSTree, TSInput, TSLanguage, TSPoint, TSParseOptions, TSParseState
 #include "foundation/constants.h"
 #include "mimalloc.h" // mi_malloc/mi_calloc/mi_realloc/mi_free/mi_usable_size — bind 3rd-party allocators (#424)
@@ -24,6 +23,7 @@
 #include "sqlite3.h" // sqlite3_mem_methods, sqlite3_config, SQLITE_CONFIG_MALLOC — bind sqlite to mimalloc
 #endif
 #include <stdint.h> // uint32_t, uint64_t, int64_t
+#include <limits.h>
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
@@ -103,89 +103,139 @@ void cbm_reset_profile(void) {
 
 // --- Growable array push functions ---
 
-#define GROW_ARRAY(arr, arena)                                                                   \
-    do {                                                                                         \
-        if ((arr)->count >= (arr)->cap) {                                                        \
-            int new_cap = (arr)->cap == 0 ? CBM_SZ_32 : (arr)->cap * PAIR_LEN;                   \
-            void *new_items = cbm_arena_alloc((arena), (size_t)new_cap * sizeof(*(arr)->items)); \
-            if (!new_items)                                                                      \
-                return;                                                                          \
-            if ((arr)->items && (arr)->count > 0) {                                              \
-                memcpy(new_items, (arr)->items, (size_t)(arr)->count * sizeof(*(arr)->items));   \
-            }                                                                                    \
-            (arr)->items = new_items;                                                            \
-            (arr)->cap = new_cap;                                                                \
-        }                                                                                        \
-    } while (0)
+static bool grow_array_checked(void **items, int *count, int *cap, size_t item_size, CBMArena *a,
+                               const char *operation) {
+    if (!items || !count || !cap || !a || item_size == 0 || *count < 0 || *cap < 0 ||
+        *count > *cap || (*cap > 0 && !*items)) {
+        cbm_arena_mark_failed(a, "CBM_EXTRACTION_ARRAY_INVARIANT", operation, item_size);
+        return false;
+    }
+    if (*count < *cap) {
+        return true;
+    }
+    if (*cap > INT_MAX / PAIR_LEN) {
+        cbm_arena_mark_failed(a, "CBM_EXTRACTION_ARRAY_CAPACITY_OVERFLOW", operation, item_size);
+        return false;
+    }
+    int new_cap = *cap == 0 ? CBM_SZ_32 : *cap * PAIR_LEN;
+    if ((size_t)new_cap > SIZE_MAX / item_size) {
+        cbm_arena_mark_failed(a, "CBM_EXTRACTION_ARRAY_CAPACITY_OVERFLOW", operation, item_size);
+        return false;
+    }
+    size_t new_bytes = (size_t)new_cap * item_size;
+    void *new_items = cbm_arena_alloc(a, new_bytes);
+    if (!new_items) {
+        cbm_arena_mark_failed(a, "CBM_EXTRACTION_ARRAY_GROW_FAILED", operation, new_bytes);
+        return false;
+    }
+    if (*items && *count > 0) {
+        memcpy(new_items, *items, (size_t)*count * item_size);
+    }
+    *items = new_items;
+    *cap = new_cap;
+    return true;
+}
 
-void cbm_defs_push(CBMDefArray *arr, CBMArena *a, CBMDefinition def) {
-    GROW_ARRAY(arr, a);
+#define GROW_ARRAY_CHECKED(arr, arena, operation)                                                 \
+    grow_array_checked((void **)&(arr)->items, &(arr)->count, &(arr)->cap, sizeof(*(arr)->items), \
+                       (arena), (operation))
+
+bool cbm_defs_push(CBMDefArray *arr, CBMArena *a, CBMDefinition def) {
+    if (!arr || !GROW_ARRAY_CHECKED(arr, a, "definitions.push"))
+        return false;
     arr->items[arr->count++] = def;
+    return true;
 }
 
-void cbm_calls_push(CBMCallArray *arr, CBMArena *a, CBMCall call) {
-    GROW_ARRAY(arr, a);
+bool cbm_calls_push(CBMCallArray *arr, CBMArena *a, CBMCall call) {
+    if (!arr || !GROW_ARRAY_CHECKED(arr, a, "calls.push"))
+        return false;
     arr->items[arr->count++] = call;
+    return true;
 }
 
-void cbm_imports_push(CBMImportArray *arr, CBMArena *a, CBMImport imp) {
-    GROW_ARRAY(arr, a);
+bool cbm_imports_push(CBMImportArray *arr, CBMArena *a, CBMImport imp) {
+    if (!arr || !GROW_ARRAY_CHECKED(arr, a, "imports.push"))
+        return false;
     arr->items[arr->count++] = imp;
+    return true;
 }
 
-void cbm_usages_push(CBMUsageArray *arr, CBMArena *a, CBMUsage usage) {
-    GROW_ARRAY(arr, a);
+bool cbm_usages_push(CBMUsageArray *arr, CBMArena *a, CBMUsage usage) {
+    if (!arr || !GROW_ARRAY_CHECKED(arr, a, "usages.push"))
+        return false;
     arr->items[arr->count++] = usage;
+    return true;
 }
 
-void cbm_throws_push(CBMThrowArray *arr, CBMArena *a, CBMThrow thr) {
-    GROW_ARRAY(arr, a);
+bool cbm_throws_push(CBMThrowArray *arr, CBMArena *a, CBMThrow thr) {
+    if (!arr || !GROW_ARRAY_CHECKED(arr, a, "throws.push"))
+        return false;
     arr->items[arr->count++] = thr;
+    return true;
 }
 
-void cbm_rw_push(CBMRWArray *arr, CBMArena *a, CBMReadWrite rw) {
-    GROW_ARRAY(arr, a);
+bool cbm_rw_push(CBMRWArray *arr, CBMArena *a, CBMReadWrite rw) {
+    if (!arr || !GROW_ARRAY_CHECKED(arr, a, "read_write.push"))
+        return false;
     arr->items[arr->count++] = rw;
+    return true;
 }
 
-void cbm_typerefs_push(CBMTypeRefArray *arr, CBMArena *a, CBMTypeRef tr) {
-    GROW_ARRAY(arr, a);
+bool cbm_typerefs_push(CBMTypeRefArray *arr, CBMArena *a, CBMTypeRef tr) {
+    if (!arr || !GROW_ARRAY_CHECKED(arr, a, "type_refs.push"))
+        return false;
     arr->items[arr->count++] = tr;
+    return true;
 }
 
-void cbm_envaccess_push(CBMEnvAccessArray *arr, CBMArena *a, CBMEnvAccess ea) {
-    GROW_ARRAY(arr, a);
+bool cbm_envaccess_push(CBMEnvAccessArray *arr, CBMArena *a, CBMEnvAccess ea) {
+    if (!arr || !GROW_ARRAY_CHECKED(arr, a, "env_accesses.push"))
+        return false;
     arr->items[arr->count++] = ea;
+    return true;
 }
 
-void cbm_typeassign_push(CBMTypeAssignArray *arr, CBMArena *a, CBMTypeAssign ta) {
-    GROW_ARRAY(arr, a);
+bool cbm_typeassign_push(CBMTypeAssignArray *arr, CBMArena *a, CBMTypeAssign ta) {
+    if (!arr || !GROW_ARRAY_CHECKED(arr, a, "type_assignments.push"))
+        return false;
     arr->items[arr->count++] = ta;
+    return true;
 }
 
-void cbm_stringref_push(CBMStringRefArray *arr, CBMArena *a, CBMStringRef sr) {
-    GROW_ARRAY(arr, a);
+bool cbm_stringref_push(CBMStringRefArray *arr, CBMArena *a, CBMStringRef sr) {
+    if (!arr || !GROW_ARRAY_CHECKED(arr, a, "string_refs.push"))
+        return false;
     arr->items[arr->count++] = sr;
+    return true;
 }
 
-void cbm_infrabinding_push(CBMInfraBindingArray *arr, CBMArena *a, CBMInfraBinding ib) {
-    GROW_ARRAY(arr, a);
+bool cbm_infrabinding_push(CBMInfraBindingArray *arr, CBMArena *a, CBMInfraBinding ib) {
+    if (!arr || !GROW_ARRAY_CHECKED(arr, a, "infra_bindings.push"))
+        return false;
     arr->items[arr->count++] = ib;
+    return true;
 }
 
-void cbm_impltrait_push(CBMImplTraitArray *arr, CBMArena *a, CBMImplTrait it) {
-    GROW_ARRAY(arr, a);
+bool cbm_impltrait_push(CBMImplTraitArray *arr, CBMArena *a, CBMImplTrait it) {
+    if (!arr || !GROW_ARRAY_CHECKED(arr, a, "impl_traits.push"))
+        return false;
     arr->items[arr->count++] = it;
+    return true;
 }
 
-void cbm_resolvedcall_push(CBMResolvedCallArray *arr, CBMArena *a, CBMResolvedCall rc) {
-    GROW_ARRAY(arr, a);
+bool cbm_resolvedcall_push(CBMResolvedCallArray *arr, CBMArena *a, CBMResolvedCall rc) {
+    if (!arr || !GROW_ARRAY_CHECKED(arr, a, "resolved_calls.push"))
+        return false;
     arr->items[arr->count++] = rc;
+    return true;
 }
 
-void cbm_channels_push(CBMChannelArray *arr, CBMArena *a, CBMChannel ch) {
-    GROW_ARRAY(arr, a);
+bool cbm_channels_push(CBMChannelArray *arr, CBMArena *a, CBMChannel ch) {
+    if (!arr || !GROW_ARRAY_CHECKED(arr, a, "channels.push"))
+        return false;
     arr->items[arr->count++] = ch;
+    return true;
 }
 
 // --- String input reader (for parse_with_options) ---
@@ -545,178 +595,52 @@ static int count_params_from_signature(const char *sig) {
 
 // --- Main extraction function ---
 
-/* Test-only deterministic fault injection for the crash/hang supervisor tests.
- * Gated entirely behind env vars that are never set in production; a matching
- * rel_path either aborts (a fault signal the supervisor classifies as a crash)
- * or spins forever (an external-scanner infinite loop the quiet-timeout kills).
- * This gives an honest guard — green iff the supervisor actually contains a real
- * fault — instead of a fixture that may stop faulting once a root cause is fixed. */
-/* Crash-supervisor per-file marker JOURNAL (Stage 3c skip-and-continue,
- * parallel-safe). Recovery re-runs are PARALLEL (there are no sequential
- * production runs), so a single overwrite-style marker would race across
- * workers and — worse — go stale during non-extract phases, blaming
- * whatever file was extracted LAST (that mis-quarantined four innocent
- * ms-typescript fixtures, one 15-minute retry at a time). Instead every
- * worker APPENDS one short line per event: "S <rel_path>" when it STARTS
- * work on a file, "D <rel_path>" when it finishes it. A single short
- * append of one line is atomic in practice on every target platform, and
- * the parent discards a torn final line by design. The parent's suspect
- * set after a crash/hang = files with an S but no D — exactly the
- * in-flight set; a file is only quarantined after appearing in the
- * suspect set of TWO CONSECUTIVE failed runs, so a stale or merely
- * unlucky in-flight file is never quarantined alone. The env var is set
- * solely by the supervisor during recovery — a no-op on normal runs. */
-static void cbm_index_mark(const char *rel_path, char event) {
-    const char *mf = getenv("CBM_INDEX_MARKER_FILE");
-    if (!mf || !mf[0] || !rel_path || !rel_path[0]) {
-        return;
-    }
-    FILE *f = cbm_fopen(mf, "ab");
-    if (f) {
-        (void)fprintf(f, "%c %s\n", event, rel_path);
-        (void)fclose(f);
-    }
-}
-
-void cbm_index_mark_start(const char *rel_path) {
-    cbm_index_mark(rel_path, 'S');
-}
-
-void cbm_index_mark_done(const char *rel_path) {
-    cbm_index_mark(rel_path, 'D');
-}
-
-/* ── Crash-quarantine set (Stage 3c skip-and-continue) ──────────────────────
- * After a crash the supervisor re-runs the worker single-threaded, passing
- * CBM_INDEX_QUARANTINE_FILE — a newline-delimited list of repo-relative paths
- * that already crashed the indexer and MUST NOT be extracted again. Owned here,
- * next to the other env-driven extract hooks (marker + fault injector), so the
- * single hard guard lives at the one choke point every pass funnels through
- * (cbm_extract_file): whether a pass re-extracts from disk on a cache miss
- * (sequential pass_calls/usages/semantic) or extracts fresh, a quarantined file
- * short-circuits to an empty result and never reaches the parser/crash. The
- * pipeline extract loops separately REPORT the skip as phase="crash" via
- * cbm_index_is_quarantined() so the crasher surfaces in the response skipped[].
- * Loaded once, lazily; read-only after load (safe for the parallel workers,
- * though recovery runs single-threaded). Unset env ⇒ empty set ⇒ cheap no-op. */
-static CBMHashTable *g_quarantine_set = NULL;
-enum { CBM_QSET_UNINIT = 0, CBM_QSET_INITING = 1, CBM_QSET_INITED = 2 };
-static atomic_int g_quarantine_state = CBM_QSET_UNINIT;
-
-static void cbm_quarantine_load(void) {
-    const char *qf = getenv("CBM_INDEX_QUARANTINE_FILE");
-    if (!qf || !qf[0]) {
-        return; /* normal path: empty set */
-    }
-    FILE *f = cbm_fopen(qf, "rb");
-    if (!f) {
-        return;
-    }
-    CBMHashTable *set = cbm_ht_create(16);
-    if (!set) {
-        (void)fclose(f);
-        return;
-    }
-    char line[2048];
-    while (fgets(line, sizeof(line), f)) {
-        size_t len = strlen(line);
-        while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r')) {
-            line[--len] = '\0';
-        }
-        if (len == 0) {
-            continue;
-        }
-        /* Line format: "path\tphase" where phase is "crash" or "hang". A bare
-         * "path" line (no tab) is tolerated and defaults to phase "crash" for
-         * backward compatibility with older quarantine files. */
-        char *tab = strchr(line, '\t');
-        const char *phase = "crash";
-        if (tab) {
-            *tab = '\0';
-            if (tab[1]) {
-                phase = tab + 1;
-            }
-        }
-        if (line[0] == '\0') {
-            continue; /* empty path (line began with a tab) — skip */
-        }
-        /* The table borrows the key + value pointers, so dup both. Intentionally
-         * never freed: the set lives for the whole (short-lived worker) process.
-         * The value stores the phase so cbm_index_quarantine_phase() can report
-         * "crash" vs "hang"; membership (cbm_index_is_quarantined) is value != NULL. */
-        char *key = cbm_strdup(line);
-        char *pval = cbm_strdup(phase);
-        if (key && pval) {
-            cbm_ht_set(set, key, (void *)pval);
-        }
-    }
-    (void)fclose(f);
-    g_quarantine_set = set;
-}
-
-bool cbm_index_is_quarantined(const char *rel_path) {
-    if (!rel_path || !rel_path[0]) {
-        return false;
-    }
-    int state = atomic_load(&g_quarantine_state);
-    if (state != CBM_QSET_INITED) {
-        /* First caller wins the CAS and loads; racers spin until INITED.
-         * Same once-init pattern as cbm_ui_log_init (http_server.c). */
-        state = CBM_QSET_UNINIT;
-        if (atomic_compare_exchange_strong(&g_quarantine_state, &state, CBM_QSET_INITING)) {
-            cbm_quarantine_load();
-            atomic_store(&g_quarantine_state, CBM_QSET_INITED);
-        } else {
-            while (atomic_load(&g_quarantine_state) != CBM_QSET_INITED) {
-                cbm_usleep(1000); /* 1ms */
-            }
-        }
-    }
-    return g_quarantine_set && cbm_ht_has(g_quarantine_set, rel_path);
-}
-
-const char *cbm_index_quarantine_phase(const char *rel_path) {
-    /* cbm_index_is_quarantined drives the lazy once-load and returns true only
-     * when the set is loaded and holds rel_path — so on true, g_quarantine_set is
-     * non-NULL and the stored value is the phase string ("crash"/"hang"). */
-    if (!cbm_index_is_quarantined(rel_path)) {
-        return NULL;
-    }
-    return (const char *)cbm_ht_get(g_quarantine_set, rel_path);
-}
-
-static void cbm_test_fault_inject(const char *rel_path) {
-    if (!rel_path || !rel_path[0]) {
-        return;
-    }
-    const char *crash_on = getenv("CBM_TEST_CRASH_ON");
-    if (crash_on && crash_on[0] && strstr(rel_path, crash_on)) {
-        abort(); /* SIGABRT → WIFSIGNALED → classified as a crash */
-    }
-    const char *hang_on = getenv("CBM_TEST_HANG_ON");
-    if (hang_on && hang_on[0] && strstr(rel_path, hang_on)) {
-        for (;;) {
-            /* Busy-spin: the supervisor's quiet-timeout kills + reports us. */
-        }
-    }
-}
-
 static CBMFileResult *cbm_extract_file_impl(const char *source, int source_len,
                                             CBMLanguage language, const char *project,
                                             const char *rel_path, int64_t timeout_micros,
                                             const char **extra_defines, const char **include_paths);
 
-/* Public entry: run the extraction and journal completion. The DONE mark on
- * every ordinary return (including error/timeout results) tells the crash
- * supervisor this file did NOT kill the worker — only a file whose S has no
- * D is a crash/hang suspect. */
+static bool cbm_extract_arena_ok(CBMFileResult *result, const char *phase, const char *rel_path) {
+    CBMArena *a = result ? &result->arena : NULL;
+    if (!a || !cbm_arena_failed(a)) {
+        return true;
+    }
+    char requested[32];
+    snprintf(requested, sizeof(requested), "%zu", cbm_arena_failure_bytes(a));
+    cbm_log_error("extract.allocation_failed", "code", cbm_arena_failure_code(a), "component",
+                  "parser_extraction", "operation", cbm_arena_failure_operation(a), "phase",
+                  phase ? phase : "unknown", "file", rel_path ? rel_path : "<input>",
+                  "requested_bytes", requested, "message",
+                  "authoritative extraction allocation failed; partial atoms discarded",
+                  "remediation", "free memory or reduce repository size, then retry");
+    result->has_error = true;
+    result->error_msg =
+        "[CBM_EXTRACTION_ALLOCATION_FAILED] authoritative parser extraction allocation failed; "
+        "partial atoms were discarded; remediation: inspect the structured allocation error, "
+        "free memory or reduce repository size, then retry";
+    result->defs.count = 0;
+    result->calls.count = 0;
+    result->imports.count = 0;
+    result->usages.count = 0;
+    result->throws.count = 0;
+    result->rw.count = 0;
+    result->type_refs.count = 0;
+    result->env_accesses.count = 0;
+    result->type_assigns.count = 0;
+    result->impl_traits.count = 0;
+    result->resolved_calls.count = 0;
+    result->string_refs.count = 0;
+    result->infra_bindings.count = 0;
+    result->channels.count = 0;
+    result->imports_count = 0;
+    return false;
+}
+
 CBMFileResult *cbm_extract_file(const char *source, int source_len, CBMLanguage language,
                                 const char *project, const char *rel_path, int64_t timeout_micros,
                                 const char **extra_defines, const char **include_paths) {
-    CBMFileResult *r = cbm_extract_file_impl(source, source_len, language, project, rel_path,
-                                             timeout_micros, extra_defines, include_paths);
-    cbm_index_mark_done(rel_path);
-    return r;
+    return cbm_extract_file_impl(source, source_len, language, project, rel_path, timeout_micros,
+                                 extra_defines, include_paths);
 }
 
 static CBMFileResult *cbm_extract_file_impl(const char *source, int source_len,
@@ -733,20 +657,9 @@ static CBMFileResult *cbm_extract_file_impl(const char *source, int source_len,
 
     cbm_arena_init(&result->arena);
     CBMArena *a = &result->arena;
-
-    /* Crash-quarantine hard guard (Stage 3c): a file the supervisor pinned as a
-     * crasher must NEVER be parsed again. Return a clean empty result BEFORE the
-     * marker write and fault injector so no pass (including sequential re-extract
-     * passes that miss the result cache) can crash on it. The pipeline extract
-     * loops separately record it as a phase="crash" skip. Checked before the
-     * marker so quarantined files never overwrite it — the marker keeps pointing
-     * at the real (non-quarantined) file being processed when a crash hits. */
-    if (cbm_index_is_quarantined(rel_path)) {
+    if (!cbm_extract_arena_ok(result, "arena_init", rel_path)) {
         return result;
     }
-
-    cbm_index_mark_start(rel_path);
-    cbm_test_fault_inject(rel_path);
 
     // Get language spec
     const CBMLangSpec *spec = cbm_lang_spec(language);
@@ -830,6 +743,9 @@ static CBMFileResult *cbm_extract_file_impl(const char *source, int source_len,
     // languages are unchanged.
     result->module_qn = cbm_fqn_module_source_lang(a, project, rel_path, language);
     result->is_test_file = cbm_is_test_file(rel_path, language);
+    if (!cbm_extract_arena_ok(result, "module_identity", rel_path)) {
+        goto extraction_failed;
+    }
 
     // Build extraction context
     CBMExtractCtx ctx = {
@@ -847,15 +763,30 @@ static CBMFileResult *cbm_extract_file_impl(const char *source, int source_len,
     // Run extractors: defs + imports use separate walks (unique recursion patterns),
     // then a single unified cursor walk handles the remaining 7 extractors.
     cbm_extract_definitions(&ctx);
+    if (!cbm_extract_arena_ok(result, "definitions", rel_path)) {
+        goto extraction_failed;
+    }
     cbm_extract_imports(&ctx);
+    if (!cbm_extract_arena_ok(result, "imports", rel_path)) {
+        goto extraction_failed;
+    }
     cbm_extract_unified(&ctx);
+    if (!cbm_extract_arena_ok(result, "unified_atoms", rel_path)) {
+        goto extraction_failed;
+    }
 
     // Channel detection (Socket.IO / EventEmitter) — JS/TS only.
     cbm_extract_channels(&ctx);
+    if (!cbm_extract_arena_ok(result, "channels", rel_path)) {
+        goto extraction_failed;
+    }
 
     // K8s / Kustomize semantic pass (additional structured extraction for YAML-based infra files).
     if (ctx.language == CBM_LANG_KUSTOMIZE || ctx.language == CBM_LANG_K8S) {
         cbm_extract_k8s(&ctx);
+        if (!cbm_extract_arena_ok(result, "kubernetes_atoms", rel_path)) {
+            goto extraction_failed;
+        }
     }
 
     // LSP type-aware call/usage resolution (per-file). Runs in every mode;
@@ -906,6 +837,9 @@ static CBMFileResult *cbm_extract_file_impl(const char *source, int source_len,
     if (language == CBM_LANG_RUST) {
         cbm_run_rust_lsp(a, result, source, source_len, root);
     }
+    if (!cbm_extract_arena_ok(result, "per_file_lsp", rel_path)) {
+        goto extraction_failed;
+    }
     atomic_fetch_add(&total_lsp_ns, now_ns() - lsp_start);
 
     // Calls extracted so far all carry ORIGINAL-source line numbers; the C/C++
@@ -923,9 +857,8 @@ static CBMFileResult *cbm_extract_file_impl(const char *source, int source_len,
         char *expanded = cbm_preprocess(source, source_len, rel_path, extra_defines, include_paths,
                                         language != CBM_LANG_C, &pp_status, &pp_diagnostic);
         if (pp_status == CBM_PREPROCESS_FAILED) {
-            cbm_log_warn("preprocessor.failed", "reason",
-                         pp_diagnostic ? pp_diagnostic : "unknown", "file",
-                         rel_path ? rel_path : "<input>");
+            cbm_log_warn("preprocessor.failed", "reason", pp_diagnostic ? pp_diagnostic : "unknown",
+                         "file", rel_path ? rel_path : "<input>");
         }
         if (expanded) {
             int expanded_len = (int)strlen(expanded);
@@ -981,6 +914,9 @@ static CBMFileResult *cbm_extract_file_impl(const char *source, int source_len,
         }
         cbm_preprocess_diagnostic_free(pp_diagnostic);
         atomic_fetch_add(&total_preprocess_ns, now_ns() - pp_start);
+        if (!cbm_extract_arena_ok(result, "preprocessor_atoms", rel_path)) {
+            goto extraction_failed;
+        }
     }
 
     // Bottleneck call-context metrics. Each call is attributed to the INNERMOST
@@ -1102,6 +1038,9 @@ static CBMFileResult *cbm_extract_file_impl(const char *source, int source_len,
             d->source_len = span_len;
         }
     }
+    if (!cbm_extract_arena_ok(result, "source_capture", rel_path)) {
+        goto extraction_failed;
+    }
 
     uint64_t t2 = now_ns();
 
@@ -1115,6 +1054,11 @@ static CBMFileResult *cbm_extract_file_impl(const char *source, int source_len,
     // Retain tree for cross-file LSP reuse (caller frees via cbm_free_tree)
     result->cached_tree = tree;
     result->cached_lang = language;
+    return result;
+
+extraction_failed:
+    ts_tree_delete(tree);
+    result->cached_tree = NULL;
     return result;
 }
 

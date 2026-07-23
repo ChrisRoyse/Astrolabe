@@ -11,6 +11,8 @@
 #ifndef CBM_SERVICE_PATTERNS_H
 #define CBM_SERVICE_PATTERNS_H
 
+#include <stdbool.h>
+
 /* Edge type returned by pattern match. */
 typedef enum {
     CBM_SVC_NONE = 0,      /* Not a service pattern — use normal CALLS */
@@ -39,8 +41,9 @@ cbm_svc_kind_t cbm_service_pattern_match(const char *resolved_qn);
  * the call edges in a project (e.g. "fmt.Errorf"), so caching turns
  * a linear pattern-list scan into one hash lookup. Call _begin once
  * per worker thread before the resolve loop and _end at the end. */
-void cbm_service_pattern_cache_begin(void);
+bool cbm_service_pattern_cache_begin(void);
 void cbm_service_pattern_cache_end(void);
+bool cbm_service_pattern_cache_failed(void);
 
 /* Get the HTTP method from the callee name suffix (e.g., ".get" → "GET").
  * Returns NULL if method cannot be inferred. */

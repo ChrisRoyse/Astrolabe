@@ -602,6 +602,7 @@ typedef struct {
     int *token_counts;                 /* output: token count per function */
     int func_count;
     _Atomic int next_idx;
+    _Atomic bool failed;
     /* Per-worker token intern pools (key==value==the one owned strdup):
      * identical tokens ("xfs", "error", ...) recur across hundreds of
      * thousands of functions; per-func strdups made all_tokens hold every
@@ -611,7 +612,7 @@ typedef struct {
 
 static void tokenize_worker(int worker_id, void *ctx_ptr) {
     tokenize_ctx_t *tc = ctx_ptr;
-    while (true) {
+    while (!atomic_load_explicit(&tc->failed, memory_order_acquire)) {
         int f = atomic_fetch_add_explicit(&tc->next_idx, SKIP_ONE, memory_order_relaxed);
         if (f >= tc->func_count) {
             break;
@@ -633,7 +634,21 @@ static void tokenize_worker(int worker_id, void *ctx_ptr) {
                     free(dst[t]);
                     dst[t] = canon;
                 } else {
-                    cbm_ht_set(pool, dst[t], dst[t]); /* key borrows the value */
+                    if (!cbm_ht_set_checked(pool, dst[t], dst[t], NULL)) {
+                        cbm_log_error(
+                            "pass.semantic.tokenize_failed", "code",
+                            "CBM_SEM_TOKEN_POOL_INSERT_FAILED", "component", "semantic.token_pool",
+                            "operation", "insert", "key", dst[t], "message",
+                            "semantic token intern pool could not retain an entry", "remediation",
+                            "free memory or reduce the indexed corpus size, then retry");
+                        for (int remaining = t; remaining < count; remaining++) {
+                            free(dst[remaining]);
+                            dst[remaining] = NULL;
+                        }
+                        tc->token_counts[f] = 0;
+                        atomic_store_explicit(&tc->failed, true, memory_order_release);
+                        return;
+                    }
                 }
             }
         }
@@ -1236,7 +1251,7 @@ static void phase1b_decode_and_build(cbm_sem_func_t *funcs, const cbm_gbuf_node_
 
 /* Phase 2: tokenize each function's metadata in parallel, filling
  * all_tokens[] and token_counts[].  Caller allocates the arrays. */
-static void phase2_tokenize(const cbm_gbuf_node_t **node_ptrs, cbm_gbuf_t *gbuf, char **all_tokens,
+static bool phase2_tokenize(const cbm_gbuf_node_t **node_ptrs, cbm_gbuf_t *gbuf, char **all_tokens,
                             int *token_counts, int func_count, int worker_count,
                             CBMHashTable **pools) {
     tokenize_ctx_t tc = {
@@ -1248,8 +1263,10 @@ static void phase2_tokenize(const cbm_gbuf_node_t **node_ptrs, cbm_gbuf_t *gbuf,
         .pools = pools,
     };
     atomic_init(&tc.next_idx, 0);
+    atomic_init(&tc.failed, false);
     cbm_parallel_for_opts_t opts = {.max_workers = worker_count, .force_pthreads = false};
     cbm_parallel_for(worker_count, tokenize_worker, &tc, opts);
+    return !atomic_load_explicit(&tc.failed, memory_order_acquire);
 }
 
 /* Phase 4a: build per-function TF-IDF + RI vectors in parallel, producing
@@ -1353,7 +1370,7 @@ static void free_lsh_buckets(sem_bucket_t **band_buckets) {
  * enriched token vectors to the graph buffer.  Returns the new corpus, which
  * the caller must cbm_sem_corpus_free() later. */
 static cbm_sem_corpus_t *run_corpus_phase(cbm_gbuf_t *gbuf, char **all_tokens, int *token_counts,
-                                           int func_count) {
+                                          int func_count) {
     CBM_PROF_START(t_phase3a);
     cbm_sem_corpus_t *corpus = cbm_sem_corpus_new();
     if (!corpus) {
@@ -1365,16 +1382,21 @@ static cbm_sem_corpus_t *run_corpus_phase(cbm_gbuf_t *gbuf, char **all_tokens, i
     if (cbm_sem_corpus_add_docs_batch(corpus, all_tokens, token_counts, func_count,
                                       CBM_SEM_MAX_TOKENS) != 0) {
         cbm_sem_corpus_free(corpus);
-        cbm_log_error("pass.semantic.corpus_failed", "code", "CBM_SEM_CORPUS_ADD_FAILED",
-                      "message", "semantic corpus batch add failed before commit",
-                      "remediation",
+        cbm_log_error("pass.semantic.corpus_failed", "code", "CBM_SEM_CORPUS_ADD_FAILED", "message",
+                      "semantic corpus batch add failed before commit", "remediation",
                       "free memory or reduce the indexed corpus size, then retry");
         return NULL;
     }
     CBM_PROF_END_N("semantic_edges", "3a_corpus_batch", t_phase3a, func_count);
 
     CBM_PROF_START(t_phase3b);
-    cbm_sem_corpus_finalize(corpus);
+    if (!cbm_sem_corpus_finalize(corpus)) {
+        cbm_log_error("pass.semantic.corpus_failed", "code", "CBM_SEM_CORPUS_FINALIZE_FAILED",
+                      "message", "semantic corpus finalization could not retain complete state",
+                      "remediation", "inspect the preceding structured error and retry");
+        cbm_sem_corpus_free(corpus);
+        return NULL;
+    }
     CBM_PROF_END_N("semantic_edges", "3b_corpus_finalize_seq", t_phase3b,
                    cbm_sem_corpus_token_count(corpus));
 
@@ -1463,17 +1485,22 @@ int cbm_pipeline_pass_semantic_edges(cbm_pipeline_ctx_t *ctx) {
          * phase against a partial scan — abort the pass with a structured error
          * so run_predump_passes (rc < 0 gate) stops the index before the database
          * dump and no incomplete semantic graph is persisted. */
-        cbm_log_error("pass.semantic.scan_failed", "code", "CBM_SEM_SCAN_FAILED", "message",
-                      "semantic edge scan phase failed to build its function arrays", "remediation",
-                      "inspect the preceding CBM_SEM_SCAN_ALLOC_FAILED error, free memory or reduce "
-                      "the indexed corpus size, then retry");
+        cbm_log_error(
+            "pass.semantic.scan_failed", "code", "CBM_SEM_SCAN_FAILED", "message",
+            "semantic edge scan phase failed to build its function arrays", "remediation",
+            "inspect the preceding CBM_SEM_SCAN_ALLOC_FAILED error, free memory or reduce "
+            "the indexed corpus size, then retry");
         CBM_PROF_END_N("semantic_edges", "1a_scan_seq", t_phase1a, 0);
         return CBM_NOT_FOUND;
     }
     CBM_PROF_END_N("semantic_edges", "1a_scan_seq", t_phase1a, func_count);
 
     /* Phase 1b: Decode minhash + profile + build api/type/deco vectors (PARALLEL). */
-    cbm_sem_ensure_ready();
+    if (!cbm_sem_ensure_ready()) {
+        free(funcs);
+        free(node_ptrs);
+        return CBM_NOT_FOUND;
+    }
     CBM_PROF_START(t_phase1b);
     phase1b_decode_and_build(funcs, node_ptrs, gbuf, func_count, cbm_default_worker_count(false));
     CBM_PROF_END_N("semantic_edges", "1b_decode_build_parallel", t_phase1b, func_count);
@@ -1529,10 +1556,16 @@ int cbm_pipeline_pass_semantic_edges(cbm_pipeline_ctx_t *ctx) {
             return CBM_NOT_FOUND;
         }
     }
-    phase2_tokenize(node_ptrs, gbuf, all_tokens, token_counts, func_count, worker_count,
-                    token_pools);
+    bool tokenized = phase2_tokenize(node_ptrs, gbuf, all_tokens, token_counts, func_count,
+                                     worker_count, token_pools);
     CBM_PROF_END_N("semantic_edges", "2_tokenize_parallel", t_phase2, func_count);
     free(node_ptrs);
+    if (!tokenized) {
+        free_funcs_and_tokens(funcs, func_count, all_tokens, token_counts, token_pools,
+                              worker_count);
+        free(token_counts);
+        return CBM_NOT_FOUND;
+    }
 
     /* Labeled degradation (#532, invariant 3): if the tokenizer treated any
      * invalid UTF-8 bytes in node metadata as token boundaries, surface the count

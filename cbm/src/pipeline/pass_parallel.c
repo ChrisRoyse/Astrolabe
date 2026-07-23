@@ -746,8 +746,6 @@ typedef struct {
     _Atomic int *cancelled;
     _Atomic int next_file_idx;
 
-    cbm_pkg_entries_t *pkg_entries; /* per-worker manifest arrays (separate allocation) */
-
     bool retain_sources;              /* copy source into result->arena for cross-file LSP */
     size_t retain_total_budget_bytes; /* project-wide retention cap (peak-RSS bound) */
     size_t retain_per_file_max_bytes; /* per-file retention cap */
@@ -890,26 +888,6 @@ static void extract_worker(int worker_id, void *ctx_ptr) {
         const cbm_file_info_t *fi = &ec->files[file_idx];
         pp_err_list_t *errs = ec->err_lists ? &ec->err_lists[worker_id] : NULL;
 
-        /* Crash-quarantine skip (Stage 3c): a file the supervisor pinned as a
-         * crasher must never be extracted again. Record it as a phase="crash"
-         * skip in this worker's list (merged into the pipeline's file-error list
-         * later, surfacing in skipped[]) and move on — the good files still
-         * index and status stays "indexed". No-op unless the supervisor set
-         * CBM_INDEX_QUARANTINE_FILE. Covers the parallel path; the supervisor's
-         * single-threaded recovery run instead takes the sequential path
-         * (pass_definitions.c), and cbm_extract_file's hard guard backstops both. */
-        if (cbm_index_is_quarantined(fi->rel_path)) {
-            const char *phase = cbm_index_quarantine_phase(fi->rel_path);
-            if (!phase) {
-                phase = "crash";
-            }
-            const char *reason =
-                (strcmp(phase, "hang") == 0) ? "quarantined after hang" : "quarantined after crash";
-            pp_err_add(errs, fi->rel_path, reason, phase);
-            ws->errors++;
-            continue;
-        }
-
         /* Read + extract */
         int source_len = 0;
         long file_size = 0;
@@ -984,13 +962,6 @@ static void extract_worker(int worker_id, void *ctx_ptr) {
          * This makes slab reset safe: tree-sitter's internal nodes (in slab)
          * are released before the slab is bulk-reclaimed. */
         cbm_free_tree(result);
-
-        /* Detect and parse manifest files for package map */
-        {
-            const char *bn = strrchr(fi->rel_path, '/');
-            cbm_pkgmap_try_parse(bn ? bn + SKIP_ONE : fi->rel_path, fi->rel_path, source,
-                                 source_len, &ec->pkg_entries[worker_id]);
-        }
 
         /* Retain source bytes in result->arena so the fused cross-file LSP
          * step in resolve_worker can re-parse without re-reading from disk.
@@ -1068,21 +1039,14 @@ static void extract_worker(int worker_id, void *ctx_ptr) {
     cbm_kind_in_set_free_cache(); /* free this worker thread's node-type bitset cache */
 }
 
-static void merge_pkg_entries(cbm_pipeline_ctx_t *ctx, cbm_pkg_entries_t *pkg_entries,
-                              int worker_count) {
-    if (!pkg_entries) {
-        return;
+static int build_captured_pkgmap(cbm_pipeline_ctx_t *ctx) {
+    CBMHashTable *captured_pkgmap = NULL;
+    if (cbm_pkgmap_build_from_files_checked(ctx->all_files, ctx->all_file_count, ctx->project_name,
+                                            &captured_pkgmap) != 0) {
+        return CBM_NOT_FOUND;
     }
-    /* Supplement with a repo-wide filesystem walk so manifests filtered
-     * by the main discoverer (package.json, composer.json — in
-     * IGNORED_JSON_FILES) still feed pkgmap. Append into worker 0's
-     * array so the existing merge below sees them. */
-    cbm_pkgmap_scan_repo(ctx->repo_path, &pkg_entries[0], ctx->excluded_dirs, ctx->excluded_count);
-    cbm_pipeline_set_pkgmap(cbm_pkgmap_build(pkg_entries, worker_count, ctx->project_name));
-    for (int i = 0; i < worker_count; i++) {
-        cbm_pkg_entries_free(&pkg_entries[i]);
-    }
-    free(pkg_entries);
+    cbm_pipeline_set_pkgmap(captured_pkgmap);
+    return 0;
 }
 
 static void log_extract_mem_stats(int worker_count) {
@@ -1153,17 +1117,14 @@ int cbm_parallel_extract_ex(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *file
     }
     memset(workers, 0, (size_t)worker_count * sizeof(extract_worker_state_t));
 
-    /* Per-worker manifest entry arrays (separate from cache-line-aligned worker state) */
-    cbm_pkg_entries_t *pkg_entries = calloc((size_t)worker_count, sizeof(cbm_pkg_entries_t));
-    if (!pkg_entries) {
+    /* Per-worker skip lists (separate allocation; merged into the pipeline in the
+     * sequential merge loop below). */
+    pp_err_list_t *err_lists = calloc((size_t)worker_count, sizeof(pp_err_list_t));
+    if (!err_lists) {
         cbm_aligned_free(workers);
         free(sorted);
         return CBM_NOT_FOUND;
     }
-
-    /* Per-worker skip lists (separate allocation; merged into the pipeline in the
-     * sequential merge loop below). */
-    pp_err_list_t *err_lists = calloc((size_t)worker_count, sizeof(pp_err_list_t));
 
     extract_ctx_t ec = {
         .files = files,
@@ -1176,7 +1137,6 @@ int cbm_parallel_extract_ex(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *file
         .result_cache = result_cache,
         .shared_ids = shared_ids,
         .cancelled = ctx->cancelled,
-        .pkg_entries = pkg_entries,
         .err_lists = err_lists,
         .retain_sources = resolved_opts.retain_sources,
         .retain_total_budget_bytes = resolved_opts.retain_total_budget_bytes,
@@ -1227,10 +1187,14 @@ int cbm_parallel_extract_ex(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *file
         free(err_lists);
     }
 
-    merge_pkg_entries(ctx, pkg_entries, worker_count);
+    int pkgmap_rc = build_captured_pkgmap(ctx);
 
     cbm_aligned_free(workers);
     free(sorted);
+
+    if (pkgmap_rc != 0) {
+        return CBM_NOT_FOUND;
+    }
 
     if (atomic_load(ctx->cancelled)) {
         return CBM_NOT_FOUND;
@@ -1267,8 +1231,9 @@ static int register_and_link_def(cbm_pipeline_ctx_t *ctx, const CBMDefinition *d
     if (strcmp(def->label, "Function") == 0 || strcmp(def->label, "Method") == 0 ||
         cbm_label_is_type_like(def->label) || strcmp(def->label, "Variable") == 0 ||
         strcmp(def->label, "Field") == 0) {
-        cbm_registry_add(ctx->registry, def->name, def->qualified_name, def->label);
-        (*reg_entries)++;
+        if (cbm_registry_add(ctx->registry, def->name, def->qualified_name, def->label)) {
+            (*reg_entries)++;
+        }
     }
     char *file_qn = cbm_pipeline_fqn_compute(ctx->project_name, rel, "__file__");
     const cbm_gbuf_node_t *file_node = cbm_gbuf_find_by_qn(ctx->gbuf, file_qn);
@@ -1324,10 +1289,9 @@ static const cbm_gbuf_node_t *find_channel_src(cbm_pipeline_ctx_t *ctx, const CB
                                                const char *rel) {
     const cbm_gbuf_node_t *node = NULL;
     if (ch->enclosing_func_qn && ch->enclosing_func_qn[0]) {
-        node = ch->start_line > 0
-                   ? cbm_gbuf_find_by_qn_location(ctx->gbuf, ch->enclosing_func_qn, rel,
-                                                  ch->start_line)
-                   : cbm_gbuf_find_by_qn(ctx->gbuf, ch->enclosing_func_qn);
+        node = ch->start_line > 0 ? cbm_gbuf_find_by_qn_location(ctx->gbuf, ch->enclosing_func_qn,
+                                                                 rel, ch->start_line)
+                                  : cbm_gbuf_find_by_qn(ctx->gbuf, ch->enclosing_func_qn);
     }
     if (!node) {
         char *file_qn = cbm_pipeline_fqn_compute(ctx->project_name, rel, "__file__");
@@ -1378,14 +1342,23 @@ int cbm_build_registry_from_cache(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
      * Java/Kotlin `import`, PHP `use`). Built from the full result cache so
      * every declaring file is visible regardless of loop order. */
     const char **rels = (const char **)calloc((size_t)file_count, sizeof(char *));
-    if (rels) {
-        for (int i = 0; i < file_count; i++) {
-            rels[i] = files[i].rel_path;
-        }
+    if (!rels && file_count > 0) {
+        cbm_log_error("parallel.registry_failed", "code", "CBM_NAMESPACE_RELS_ALLOC_FAILED",
+                      "component", "parallel.namespace_map", "operation", "rels_alloc", "key", "",
+                      "message", "namespace input list could not be allocated", "remediation",
+                      "free memory or reduce repository size, then retry");
+        return CBM_NOT_FOUND;
     }
-    CBMHashTable *namespace_map =
-        cbm_pipeline_namespace_map_build(ctx->project_name, result_cache, rels, file_count);
+    for (int i = 0; i < file_count; i++) {
+        rels[i] = files[i].rel_path;
+    }
+    CBMHashTable *namespace_map = NULL;
+    int namespace_rc = cbm_pipeline_namespace_map_build(ctx->project_name, result_cache, rels,
+                                                        file_count, &namespace_map);
     free(rels);
+    if (namespace_rc != 0) {
+        return namespace_rc;
+    }
 
     for (int i = 0; i < file_count; i++) {
         if (cbm_pipeline_check_cancel(ctx)) {
@@ -1403,6 +1376,10 @@ int cbm_build_registry_from_cache(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
         /* Register callable symbols + DEFINES/DEFINES_METHOD edges */
         for (int d = 0; d < result->defs.count; d++) {
             defines_edges += register_and_link_def(ctx, &result->defs.items[d], rel, &reg_entries);
+            if (cbm_registry_failed(ctx->registry)) {
+                cbm_pipeline_namespace_map_free(namespace_map);
+                return CBM_NOT_FOUND;
+            }
         }
 
         imports_edges += create_imports_edges(ctx, result, rel, namespace_map);
@@ -2207,6 +2184,26 @@ static void lsp_idx_free_key(const char *key, void *value, void *ud) {
     free((char *)key);
 }
 
+static char *lsp_idx_key_alloc(const char *caller_qn, const char *callee_leaf) {
+    if (!caller_qn || !callee_leaf) {
+        return NULL;
+    }
+    size_t caller_len = strlen(caller_qn);
+    size_t leaf_len = strlen(callee_leaf);
+    if (caller_len > SIZE_MAX - leaf_len - 2) {
+        return NULL;
+    }
+    size_t len = caller_len + leaf_len + 2;
+    char *key = malloc(len);
+    if (!key) {
+        return NULL;
+    }
+    memcpy(key, caller_qn, caller_len);
+    key[caller_len] = '|';
+    memcpy(key + caller_len + 1, callee_leaf, leaf_len + 1);
+    return key;
+}
+
 /* Resolve calls for one file and emit CALLS/HTTP_CALLS/ASYNC_CALLS edges. */
 static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CBMFileResult *result,
                                const char *rel, const char *module_qn, const char **imp_keys,
@@ -2223,31 +2220,65 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
     CBMHashTable *lsp_idx = NULL;
     if (result->calls.count > 0 && result->resolved_calls.count > 0) {
         lsp_idx = cbm_ht_create((uint32_t)result->resolved_calls.count * 2u + 16u);
-        if (lsp_idx) {
-            for (int i = 0; i < result->resolved_calls.count; i++) {
-                CBMResolvedCall *rc_e = &result->resolved_calls.items[i];
-                if (!rc_e->caller_qn || !rc_e->callee_qn ||
-                    rc_e->confidence < CBM_LSP_CONFIDENCE_FLOOR) {
-                    continue;
+        if (!lsp_idx) {
+            cbm_log_error("parallel.resolve_failed", "code", "CBM_LSP_INDEX_ALLOC_FAILED",
+                          "component", "parallel.lsp_idx", "operation", "create", "key", rel,
+                          "message", "per-file resolved-call index could not be allocated",
+                          "remediation", "free memory or reduce repository size, then retry");
+            ws->errors++;
+            return;
+        }
+        for (int i = 0; i < result->resolved_calls.count; i++) {
+            CBMResolvedCall *rc_e = &result->resolved_calls.items[i];
+            if (!rc_e->caller_qn || !rc_e->callee_qn ||
+                rc_e->confidence < CBM_LSP_CONFIDENCE_FLOOR) {
+                continue;
+            }
+            const char *short_name = strrchr(rc_e->callee_qn, '.');
+            short_name = short_name ? short_name + 1 : rc_e->callee_qn;
+            char *key = lsp_idx_key_alloc(rc_e->caller_qn, short_name);
+            if (!key) {
+                cbm_log_error("parallel.resolve_failed", "code", "CBM_LSP_INDEX_KEY_ALLOC_FAILED",
+                              "component", "parallel.lsp_idx", "operation", "key", "key",
+                              rc_e->caller_qn, "message",
+                              "resolved-call index key could not be allocated", "remediation",
+                              "free memory or reduce repository size, then retry");
+                cbm_ht_foreach(lsp_idx, lsp_idx_free_key, NULL);
+                cbm_ht_free(lsp_idx);
+                ws->errors++;
+                return;
+            }
+            CBMResolvedCall *existing = (CBMResolvedCall *)cbm_ht_get(lsp_idx, key);
+            if (!existing) {
+                if (!cbm_ht_set_checked(lsp_idx, key, rc_e, NULL)) {
+                    cbm_log_error("parallel.resolve_failed", "code", "CBM_LSP_INDEX_INSERT_FAILED",
+                                  "component", "parallel.lsp_idx", "operation", "insert", "key",
+                                  key, "message", "resolved-call index could not retain an entry",
+                                  "remediation",
+                                  "free memory or reduce repository size, then retry");
+                    free(key);
+                    cbm_ht_foreach(lsp_idx, lsp_idx_free_key, NULL);
+                    cbm_ht_free(lsp_idx);
+                    ws->errors++;
+                    return;
                 }
-                const char *short_name = strrchr(rc_e->callee_qn, '.');
-                short_name = short_name ? short_name + 1 : rc_e->callee_qn;
-                char key[1024];
-                int kn = snprintf(key, sizeof(key), "%s|%s", rc_e->caller_qn, short_name);
-                if (kn <= 0 || kn >= (int)sizeof(key))
-                    continue;
-                CBMResolvedCall *existing = (CBMResolvedCall *)cbm_ht_get(lsp_idx, key);
-                if (!existing) {
-                    /* New entry — strdup so the key outlives the loop body. */
-                    char *kdup = strdup(key);
-                    if (kdup)
-                        cbm_ht_set(lsp_idx, kdup, rc_e);
-                } else if (rc_e->confidence > existing->confidence) {
-                    /* Update value; reuse stored key pointer to avoid leak. */
-                    const char *skey = cbm_ht_get_key(lsp_idx, key);
-                    if (skey)
-                        cbm_ht_set(lsp_idx, skey, rc_e);
+            } else if (rc_e->confidence > existing->confidence) {
+                /* Update value; reuse stored key pointer to avoid leak. */
+                const char *skey = cbm_ht_get_key(lsp_idx, key);
+                free(key);
+                if (!skey || !cbm_ht_set_checked(lsp_idx, skey, rc_e, NULL)) {
+                    cbm_log_error("parallel.resolve_failed", "code", "CBM_LSP_INDEX_UPDATE_FAILED",
+                                  "component", "parallel.lsp_idx", "operation", "update", "key",
+                                  skey ? skey : "", "message",
+                                  "resolved-call index could not update an entry", "remediation",
+                                  "free memory or reduce repository size, then retry");
+                    cbm_ht_foreach(lsp_idx, lsp_idx_free_key, NULL);
+                    cbm_ht_free(lsp_idx);
+                    ws->errors++;
+                    return;
                 }
+            } else {
+                free(key);
             }
         }
     }
@@ -2278,19 +2309,21 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
         _rc_t0 = extract_now_ns();
         if (lsp_idx && call->enclosing_func_qn) {
             const char *call_leaf = cbm_pipeline_call_callee_leaf(call->callee_name);
-            char key[1024];
-            int kn = call_leaf
-                         ? snprintf(key, sizeof(key), "%s|%s", call->enclosing_func_qn, call_leaf)
-                         : -1;
-            if (kn > 0 && kn < (int)sizeof(key)) {
-                lsp = (const CBMResolvedCall *)cbm_ht_get(lsp_idx, key);
+            if (call_leaf) {
+                char *lookup_key = lsp_idx_key_alloc(call->enclosing_func_qn, call_leaf);
+                if (!lookup_key) {
+                    cbm_log_error("parallel.resolve_failed", "code",
+                                  "CBM_LSP_INDEX_KEY_ALLOC_FAILED", "component", "parallel.lsp_idx",
+                                  "operation", "lookup_key", "key", call->enclosing_func_qn,
+                                  "message", "resolved-call lookup key could not be allocated",
+                                  "remediation",
+                                  "free memory or reduce repository size, then retry");
+                    ws->errors++;
+                    break;
+                }
+                lsp = (const CBMResolvedCall *)cbm_ht_get(lsp_idx, lookup_key);
+                free(lookup_key);
             }
-        }
-        if (!lsp) {
-            /* Fallback to the linear scan for edge cases the index may
-             * miss (e.g. callee_name that wasn't the registered short
-             * name). Keeps semantics identical. */
-            lsp = cbm_pipeline_find_lsp_resolution(&result->resolved_calls, call, allow_tail);
         }
         atomic_fetch_add_explicit(&rc->time_ns_rc_lsp_lookup, extract_now_ns() - _rc_t0,
                                   memory_order_relaxed);
@@ -2445,9 +2478,8 @@ static void resolve_file_usages(resolve_ctx_t *rc, resolve_worker_state_t *ws,
         if (!usage->ref_name) {
             continue;
         }
-        const cbm_gbuf_node_t *src =
-            find_source_node(rc->main_gbuf, rc->project_name, rel, usage->enclosing_func_qn,
-                             usage->start_line);
+        const cbm_gbuf_node_t *src = find_source_node(rc->main_gbuf, rc->project_name, rel,
+                                                      usage->enclosing_func_qn, usage->start_line);
         if (!src) {
             continue;
         }
@@ -2478,9 +2510,8 @@ static void resolve_file_throws(resolve_ctx_t *rc, resolve_worker_state_t *ws,
         if (!thr->exception_name || !thr->enclosing_func_qn) {
             continue;
         }
-        const cbm_gbuf_node_t *src =
-            find_source_node(rc->main_gbuf, rc->project_name, rel, thr->enclosing_func_qn,
-                             thr->start_line);
+        const cbm_gbuf_node_t *src = find_source_node(rc->main_gbuf, rc->project_name, rel,
+                                                      thr->enclosing_func_qn, thr->start_line);
         if (!src) {
             continue;
         }
@@ -2507,9 +2538,8 @@ static void resolve_file_rw(resolve_ctx_t *rc, resolve_worker_state_t *ws, CBMFi
         if (!rw->var_name) {
             continue;
         }
-        const cbm_gbuf_node_t *src =
-            find_source_node(rc->main_gbuf, rc->project_name, rel, rw->enclosing_func_qn,
-                             rw->start_line);
+        const cbm_gbuf_node_t *src = find_source_node(rc->main_gbuf, rc->project_name, rel,
+                                                      rw->enclosing_func_qn, rw->start_line);
         if (!src) {
             continue;
         }
@@ -2618,8 +2648,7 @@ static void resolve_file_semantic(resolve_ctx_t *rc, resolve_worker_state_t *ws,
         if (!def->qualified_name) {
             continue;
         }
-        const cbm_gbuf_node_t *node =
-            cbm_pipeline_find_definition_node(rc->main_gbuf, def, "");
+        const cbm_gbuf_node_t *node = cbm_pipeline_find_definition_node(rc->main_gbuf, def, "");
         if (!node) {
             continue;
         }
@@ -2696,7 +2725,10 @@ static void resolve_worker(int worker_id, void *ctx_ptr) {
      * cbm_service_pattern_match's 6 × 30 × strstr scan into one hash
      * lookup after the first miss for each QN. Scoped to the worker's
      * lifetime in the parallel_resolve phase. */
-    cbm_service_pattern_cache_begin();
+    if (!cbm_service_pattern_cache_begin()) {
+        ws->errors++;
+        return;
+    }
 
     while (SKIP_ONE) {
         int file_idx =
@@ -2793,6 +2825,14 @@ static void resolve_worker(int worker_id, void *ctx_ptr) {
          * strategy chain, repeats are O(1). On K8s this targets the
          * 98.7% hot spot in resolve_file_calls (881 of 893s CPU). */
         cbm_registry_resolve_cache_begin(result->calls.count + result->usages.count + 64);
+        if (cbm_registry_cache_failed()) {
+            ws->errors++;
+            cbm_registry_reach_cache_end();
+            cbm_registry_import_map_cache_end();
+            cbm_registry_resolve_cache_end();
+            free_import_map(imp_keys, imp_vals, imp_count);
+            continue;
+        }
 
         char *module_qn =
             cbm_pipeline_fqn_module_dir(rc->project_name, rel, pp_module_is_dir(lang));
@@ -2833,15 +2873,11 @@ static void resolve_worker(int worker_id, void *ctx_ptr) {
                 /* Shared per-file dispatch (pass_lsp_cross.c): module-def
                  * filter → shared prebuilt registry (overlay pattern) →
                  * filtered per-file fallback. The SAME helper drives the
-                 * sequential pass — one path, one semantics. Journal the
-                 * file around the resolve so a hang HERE is attributed to
-                 * this file, not to a stale extraction marker. */
-                cbm_index_mark_start(rel);
+                 * sequential pass — one path, one semantics. */
                 cbm_pxc_dispatch_file(lang, result, lsp_source, lsp_source_len, rel, def_module,
                                       rc->cross_registries, rc->module_def_index, rc->all_defs,
                                       rc->def_count, imp_keys, imp_vals, imp_count,
                                       pp_rust_shared_registry_get, rc);
-                cbm_index_mark_done(rel);
                 /* Free the on-demand re-read (no-op when source was retained). */
                 free_source(lsp_source_owned);
                 /* Contract: cbm_slab_reclaim() requires the thread parser to be
@@ -2905,6 +2941,13 @@ static void resolve_worker(int worker_id, void *ctx_ptr) {
         resolve_file_semantic(rc, ws, result, module_qn, imp_keys, imp_vals, imp_count);
         atomic_fetch_add_explicit(&rc->time_ns_semantic, extract_now_ns() - _ph_t0,
                                   memory_order_relaxed);
+
+        if (cbm_registry_cache_failed()) {
+            ws->errors++;
+        }
+        if (cbm_service_pattern_cache_failed()) {
+            ws->errors++;
+        }
 
         cbm_registry_reach_cache_end();
         cbm_registry_import_map_cache_end();

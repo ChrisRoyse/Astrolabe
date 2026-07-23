@@ -3,8 +3,8 @@
 #include "helpers.h"
 #include "lang_specs.h"
 #include "foundation/constants.h"
-#include "foundation/platform.h" // safe_realloc (frees old on failure)
-#include "foundation/log.h"      // cbm_log_warn
+#include "foundation/platform.h"
+#include "foundation/log.h" // cbm_log_warn
 #include "extract_node_stack.h"
 #include "simhash/minhash.h"
 #include "semantic/ast_profile.h"
@@ -3265,7 +3265,9 @@ static void extract_func_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec 
         def.is_entry_point = true;
     }
 
-    cbm_defs_push(&ctx->result->defs, a, def);
+    if (!cbm_defs_push(&ctx->result->defs, a, def)) {
+        return;
+    }
 }
 
 // --- Class definition extraction ---
@@ -3324,7 +3326,9 @@ static void push_simple_class_def(CBMExtractCtx *ctx, TSNode node, char *name, c
     def.start_byte = ts_node_start_byte(node);
     def.end_byte = ts_node_end_byte(node);
     def.is_exported = true;
-    cbm_defs_push(&ctx->result->defs, a, def);
+    if (!cbm_defs_push(&ctx->result->defs, a, def)) {
+        return;
+    }
 }
 
 // Find TOML table key name from children.
@@ -3867,7 +3871,9 @@ static void extract_class_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec
     def.decorators = extract_decorators(a, node, ctx->source, ctx->language, spec);
     def.docstring = extract_docstring(a, node, ctx->source, ctx->language);
 
-    cbm_defs_push(&ctx->result->defs, a, def);
+    if (!cbm_defs_push(&ctx->result->defs, a, def)) {
+        return;
+    }
 
     if (strcmp(label, "Enum") == 0) {
         extract_enum_members(ctx, node, class_qn);
@@ -3928,7 +3934,9 @@ static void extract_class_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec
                 pdef.start_byte = ts_node_start_byte(p);
                 pdef.end_byte = ts_node_end_byte(p);
                 pdef.is_exported = false;
-                cbm_defs_push(&ctx->result->defs, a, pdef);
+                if (!cbm_defs_push(&ctx->result->defs, a, pdef)) {
+                    return;
+                }
             }
         }
     }
@@ -4172,7 +4180,9 @@ static void push_method_def(CBMExtractCtx *ctx, TSNode child, TSNode class_node,
     // MinHash fingerprint
     compute_fingerprint(ctx, &def, child);
 
-    cbm_defs_push(&ctx->result->defs, a, def);
+    if (!cbm_defs_push(&ctx->result->defs, a, def)) {
+        return;
+    }
 }
 
 // Extract methods from an ObjC implementation_definition node.
@@ -4307,7 +4317,9 @@ static void extract_rust_impl(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec
             CBMImplTrait it;
             it.trait_name = trait_name;
             it.struct_name = type_name;
-            cbm_impltrait_push(&ctx->result->impl_traits, a, it);
+            if (!cbm_impltrait_push(&ctx->result->impl_traits, a, it)) {
+                return;
+            }
         }
     }
 
@@ -4367,7 +4379,9 @@ static void extract_rust_impl(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec
         // MinHash fingerprint
         compute_fingerprint(ctx, &def, child);
 
-        cbm_defs_push(&ctx->result->defs, a, def);
+        if (!cbm_defs_push(&ctx->result->defs, a, def)) {
+            return;
+        }
     }
 }
 
@@ -4417,7 +4431,9 @@ static void extract_elixir_func_def(CBMExtractCtx *ctx, TSNode node, const char 
     def.start_byte = ts_node_start_byte(node);
     def.end_byte = ts_node_end_byte(node);
     def.is_exported = (strcmp(macro, "def") == 0 || strcmp(macro, "defmacro") == 0);
-    cbm_defs_push(&ctx->result->defs, a, def);
+    if (!cbm_defs_push(&ctx->result->defs, a, def)) {
+        return;
+    }
 }
 
 // Emit Class definition for an Elixir defmodule node. Returns do_block or null.
@@ -4447,7 +4463,9 @@ static TSNode emit_elixir_module_class(CBMExtractCtx *ctx, TSNode cur) {
     def.start_byte = ts_node_start_byte(cur);
     def.end_byte = ts_node_end_byte(cur);
     def.is_exported = true;
-    cbm_defs_push(&ctx->result->defs, a, def);
+    if (!cbm_defs_push(&ctx->result->defs, a, def)) {
+        return null_node;
+    }
     return cbm_find_child_by_kind(cur, "do_block");
 }
 
@@ -4515,7 +4533,9 @@ static void push_var_def(CBMExtractCtx *ctx, const char *name, TSNode node) {
     def.start_byte = ts_node_start_byte(node);
     def.end_byte = ts_node_end_byte(node);
     def.is_exported = cbm_is_exported(name, ctx->language);
-    cbm_defs_push(&ctx->result->defs, a, def);
+    if (!cbm_defs_push(&ctx->result->defs, a, def)) {
+        return;
+    }
 }
 
 // Helper: extract name from a declarator chain (C/C++/ObjC)
@@ -4646,7 +4666,9 @@ static void extract_enum_members(CBMExtractCtx *ctx, TSNode node, const char *cl
         mdef.end_line = ts_node_end_point(member).row + TS_LINE_OFFSET;
         mdef.start_byte = ts_node_start_byte(member);
         mdef.end_byte = ts_node_end_byte(member);
-        cbm_defs_push(&ctx->result->defs, a, mdef);
+        if (!cbm_defs_push(&ctx->result->defs, a, mdef)) {
+            return;
+        }
     }
 }
 
@@ -5534,7 +5556,9 @@ static bool extract_schema_field(CBMExtractCtx *ctx, TSNode child, const char *c
     def.start_byte = ts_node_start_byte(child);
     def.end_byte = ts_node_end_byte(child);
     def.is_exported = cbm_is_exported(name, ctx->language);
-    cbm_defs_push(&ctx->result->defs, a, def);
+    if (!cbm_defs_push(&ctx->result->defs, a, def)) {
+        return false;
+    }
     return true;
 }
 
@@ -5564,7 +5588,11 @@ static void extract_class_fields(CBMExtractCtx *ctx, TSNode class_node, const ch
         /* Schema/grammar languages (GraphQL/Prisma/Smali) carry the field name on
          * a plain child rather than a C-style declarator/type field; handle them
          * up front so the generic "type"-field path below doesn't skip them. */
-        if (extract_schema_field(ctx, child, class_qn)) {
+        bool schema_field_handled = extract_schema_field(ctx, child, class_qn);
+        if (cbm_arena_failed(ctx->arena)) {
+            return;
+        }
+        if (schema_field_handled) {
             continue;
         }
 
@@ -5637,7 +5665,9 @@ static void extract_class_fields(CBMExtractCtx *ctx, TSNode class_node, const ch
         def.end_byte = ts_node_end_byte(child);
         def.is_exported = cbm_is_exported(name, ctx->language);
 
-        cbm_defs_push(&ctx->result->defs, a, def);
+        if (!cbm_defs_push(&ctx->result->defs, a, def)) {
+            return;
+        }
     }
 }
 
@@ -5684,7 +5714,7 @@ typedef struct {
     int top;
     int cap;
     const char *path; // for the WARN when the ceiling is hit (may be NULL)
-    bool warned;
+    bool failed;
 } wd_stack_t;
 
 // Generous safety ceiling (frames), env-overridable via CBM_WALK_DEFS_MAX.
@@ -5701,33 +5731,50 @@ static int wd_stack_max(void) {
     return 8 * 1024 * 1024; // 8M frames (~320 MB) default
 }
 
-static void wd_push(wd_stack_t *s, TSNode node, const char *enclosing_qn) {
+static bool wd_push(wd_stack_t *s, TSNode node, const char *enclosing_qn) {
+    if (s->failed) {
+        return false;
+    }
     if (s->top >= s->cap) {
-        int ncap = s->cap ? s->cap * 2 : 256;
-        if (ncap > wd_stack_max()) {
-            if (!s->warned) {
-                char lim[24];
-                snprintf(lim, sizeof(lim), "%d", wd_stack_max());
-                cbm_log_warn("extract.walk_defs_capped", "limit", lim, "path",
-                             s->path ? s->path : "");
-                s->warned = true;
+        int ncap = 256;
+        if (s->cap > 0) {
+            if (s->cap > INT32_MAX / 2) {
+                s->failed = true;
+                cbm_log_error("extract.walk_defs_failed", "code", "CBM_WALK_DEFS_CAP_OVERFLOW",
+                              "path", s->path ? s->path : "", "message",
+                              "definition traversal capacity would overflow", "remediation",
+                              "split the generated source file and retry");
+                return false;
             }
-            return; // bounded: stop growing (warned, not silent)
+            ncap = s->cap * 2;
         }
-        walk_defs_frame_t *nd = safe_realloc(s->data, (size_t)ncap * sizeof(walk_defs_frame_t));
+        int limit = wd_stack_max();
+        if (ncap > limit || (size_t)ncap > SIZE_MAX / sizeof(walk_defs_frame_t)) {
+            char lim[24];
+            snprintf(lim, sizeof(lim), "%d", limit);
+            cbm_log_error("extract.walk_defs_failed", "code", "CBM_WALK_DEFS_CAP_EXCEEDED", "limit",
+                          lim, "path", s->path ? s->path : "", "message",
+                          "definition traversal exceeded its declared frame limit", "remediation",
+                          "split the generated source file or raise CBM_WALK_DEFS_MAX deliberately "
+                          "and retry");
+            s->failed = true;
+            return false;
+        }
+        walk_defs_frame_t *nd = realloc(s->data, (size_t)ncap * sizeof(*nd));
         if (!nd) {
-            /* OOM — safe_realloc already freed the old buffer. Bail cleanly: drop
-             * pending frames so the walk_defs loop drains and exits without a NULL
-             * deref; extraction keeps whatever was already emitted. */
-            s->data = NULL;
-            s->cap = 0;
-            s->top = 0;
-            return;
+            cbm_log_error("extract.walk_defs_failed", "code", "CBM_WALK_DEFS_ALLOCATION_FAILED",
+                          "path", s->path ? s->path : "", "message",
+                          "definition traversal frame allocation failed", "remediation",
+                          "free memory or reduce the source file, then retry; partial definitions "
+                          "were discarded");
+            s->failed = true;
+            return false;
         }
         s->data = nd;
         s->cap = ncap;
     }
     s->data[s->top++] = (walk_defs_frame_t){node, enclosing_qn};
+    return true;
 }
 
 /* Push all children of `node` in REVERSE order (so they pop in source order)
@@ -5743,15 +5790,29 @@ static void wd_push(wd_stack_t *s, TSNode node, const char *enclosing_qn) {
 enum { WD_CURSOR_MIN_CHILDREN = 64 };
 
 /* Collect all `cc` children of `node` linearly via a TSTreeCursor into a
- * malloc'd array (caller frees). Returns NULL for small nodes and on OOM —
- * the caller then uses indexed ts_node_child access, which is fine (and
- * cheaper) at small child counts and merely quadratic-but-correct on OOM. */
-static TSNode *wd_collect_children(TSNode node, uint32_t cc) {
+ * malloc'd array (caller frees). Returns NULL for small nodes. Allocation or
+ * cursor failure marks the traversal failed; there is no quadratic/partial
+ * fallback for a wide node. */
+static TSNode *wd_collect_children(wd_stack_t *s, TSNode node, uint32_t cc) {
     if (cc < WD_CURSOR_MIN_CHILDREN) {
+        return NULL;
+    }
+    if (cc > INT32_MAX) {
+        cbm_log_error("extract.walk_defs_failed", "code", "CBM_WALK_DEFS_CHILD_OVERFLOW", "path",
+                      s->path ? s->path : "", "message",
+                      "syntax node child count exceeds addressable traversal capacity",
+                      "remediation", "split the generated source file and retry");
+        s->failed = true;
         return NULL;
     }
     TSNode *buf = (TSNode *)malloc((size_t)cc * sizeof(TSNode));
     if (!buf) {
+        cbm_log_error(
+            "extract.walk_defs_failed", "code", "CBM_WALK_DEFS_ALLOCATION_FAILED", "path",
+            s->path ? s->path : "", "message", "wide-node child collection allocation failed",
+            "remediation",
+            "free memory or reduce the source file, then retry; no quadratic fallback was used");
+        s->failed = true;
         return NULL;
     }
     TSTreeCursor cur = ts_tree_cursor_new(node);
@@ -5763,8 +5824,13 @@ static TSNode *wd_collect_children(TSNode node, uint32_t cc) {
     }
     ts_tree_cursor_delete(&cur);
     if (got != cc) {
-        /* Defensive: cursor and child_count disagree — fall back to indexed. */
         free(buf);
+        cbm_log_error(
+            "extract.walk_defs_failed", "code", "CBM_WALK_DEFS_CURSOR_MISMATCH", "path",
+            s->path ? s->path : "", "message",
+            "tree-sitter cursor child count disagreed with the syntax node", "remediation",
+            "reproduce with the exact source and grammar; do not accept partial extraction");
+        s->failed = true;
         return NULL;
     }
     return buf;
@@ -5775,9 +5841,14 @@ static void wd_push_children_reverse(wd_stack_t *s, TSNode node, const char *enc
     if (cc == 0) {
         return;
     }
-    TSNode *kids = wd_collect_children(node, cc);
+    TSNode *kids = wd_collect_children(s, node, cc);
+    if (s->failed) {
+        return;
+    }
     for (int i = (int)cc - SKIP_CHAR; i >= 0; i--) {
-        wd_push(s, kids ? kids[i] : ts_node_child(node, (uint32_t)i), enclosing_qn);
+        if (!wd_push(s, kids ? kids[i] : ts_node_child(node, (uint32_t)i), enclosing_qn)) {
+            break;
+        }
     }
     free(kids);
 }
@@ -5794,11 +5865,17 @@ static void push_nested_class_nodes(TSNode body, const CBMLangSpec *spec, wd_sta
         TSNode cur = ts_nstack_pop(&nc_stack);
         uint32_t nc = ts_node_child_count(cur);
         /* Linear child access for wide class bodies (see wd_collect_children). */
-        TSNode *kids = wd_collect_children(cur, nc);
+        TSNode *kids = wd_collect_children(s, cur, nc);
+        if (s->failed) {
+            return;
+        }
         for (int i = (int)nc - SKIP_CHAR; i >= 0; i--) {
             TSNode child = kids ? kids[i] : ts_node_child(cur, (uint32_t)i);
             if (cbm_kind_in_set(child, spec->class_node_types)) {
-                wd_push(s, child, enclosing_qn);
+                if (!wd_push(s, child, enclosing_qn)) {
+                    free(kids);
+                    return;
+                }
             } else {
                 const char *ck = ts_node_type(child);
                 if (strcmp(ck, "field_declaration") == 0 ||
@@ -5887,7 +5964,9 @@ static void push_class_body_children(TSNode node, const CBMLangSpec *spec, wd_st
     }
     // No body found — push all children directly
     for (int ci = (int)nc - SKIP_CHAR; ci >= 0; ci--) {
-        wd_push(s, ts_node_child(node, (uint32_t)ci), new_enclosing);
+        if (!wd_push(s, ts_node_child(node, (uint32_t)ci), new_enclosing)) {
+            return;
+        }
     }
 }
 
@@ -5951,7 +6030,9 @@ static void extract_cfml_function_tag(CBMExtractCtx *ctx, TSNode node) {
     def.end_byte = ts_node_end_byte(node);
     def.lines = (int)(def.end_line - def.start_line + TS_LINE_OFFSET);
     def.is_exported = true;
-    cbm_defs_push(&ctx->result->defs, a, def);
+    if (!cbm_defs_push(&ctx->result->defs, a, def)) {
+        return;
+    }
 }
 
 // Helm / Go template named-template definition: {{ define "chart.fullname" }} ...
@@ -5987,7 +6068,9 @@ static void extract_gotemplate_define(CBMExtractCtx *ctx, TSNode node) {
     def.end_byte = ts_node_end_byte(node);
     def.lines = (int)(def.end_line - def.start_line + TS_LINE_OFFSET);
     def.is_exported = true;
-    cbm_defs_push(&ctx->result->defs, a, def);
+    if (!cbm_defs_push(&ctx->result->defs, a, def)) {
+        return;
+    }
 }
 
 // Janet (janet-simple S-expression grammar): definitions are generic `par_tup_lit`
@@ -6044,7 +6127,9 @@ static void extract_janet_def(CBMExtractCtx *ctx, TSNode node) {
     def.end_byte = ts_node_end_byte(node);
     def.lines = (int)(def.end_line - def.start_line + TS_LINE_OFFSET);
     def.is_exported = true;
-    cbm_defs_push(&ctx->result->defs, a, def);
+    if (!cbm_defs_push(&ctx->result->defs, a, def)) {
+        return;
+    }
 }
 
 // Languages that use the C preprocessor and therefore have #define macros.
@@ -6087,7 +6172,9 @@ static void extract_c_macro_def(CBMExtractCtx *ctx, TSNode node) {
         def.signature = cbm_node_text(a, params, ctx->source);
     }
 
-    cbm_defs_push(&ctx->result->defs, a, def);
+    if (!cbm_defs_push(&ctx->result->defs, a, def)) {
+        return;
+    }
 }
 
 // Clojure/Racket/Scheme: definitions are macro forms inside a generic `list`
@@ -6172,7 +6259,9 @@ static void extract_lisp_def(CBMExtractCtx *ctx, TSNode node) {
     def.end_byte = ts_node_end_byte(node);
     def.lines = (int)(def.end_line - def.start_line + TS_LINE_OFFSET);
     def.is_exported = true;
-    cbm_defs_push(&ctx->result->defs, a, def);
+    if (!cbm_defs_push(&ctx->result->defs, a, def)) {
+        return;
+    }
 }
 
 /* Kotlin ERROR-node class recovery.
@@ -6279,7 +6368,9 @@ static void recover_kotlin_error_classes(CBMExtractCtx *ctx, TSNode err_node) {
                 def.base_classes = result;
             }
         }
-        cbm_defs_push(&ctx->result->defs, a, def);
+        if (!cbm_defs_push(&ctx->result->defs, a, def)) {
+            return;
+        }
     }
 }
 
@@ -6289,7 +6380,7 @@ static void walk_defs(CBMExtractCtx *ctx, TSNode root, const CBMLangSpec *spec, 
     s.path = ctx->rel_path;
     wd_push(&s, root, ctx->enclosing_class_qn);
 
-    while (s.top > 0) {
+    while (s.top > 0 && !s.failed) {
         walk_defs_frame_t frame = s.data[--s.top];
         TSNode node = frame.node;
         ctx->enclosing_class_qn = frame.enclosing_class_qn;
@@ -6418,6 +6509,11 @@ static void walk_defs(CBMExtractCtx *ctx, TSNode root, const CBMLangSpec *spec, 
         wd_push_children_reverse(&s, node, frame.enclosing_class_qn);
     }
     free(s.data);
+    if (s.failed) {
+        ctx->result->has_error = true;
+        ctx->result->error_msg = cbm_arena_strdup(
+            ctx->arena, "definition traversal failed; no partial extraction may be persisted");
+    }
 }
 
 void cbm_extract_definitions(CBMExtractCtx *ctx) {
@@ -6441,7 +6537,9 @@ void cbm_extract_definitions(CBMExtractCtx *ctx) {
     mod.end_byte = ts_node_end_byte(ctx->root);
     mod.is_exported = true;
     mod.is_test = ctx->result->is_test_file;
-    cbm_defs_push(&ctx->result->defs, a, mod);
+    if (!cbm_defs_push(&ctx->result->defs, a, mod)) {
+        return;
+    }
 
     // Walk AST for function/class definitions
     walk_defs(ctx, ctx->root, spec, 0);

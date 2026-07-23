@@ -17,6 +17,39 @@ enum { ARENA_ALIGN = 7, ARENA_GROW_OK = 1 };
 #include <string.h>
 #include <stdarg.h>
 #include <stdio.h>
+#include <stdint.h>
+
+#define CBM_ARENA_ALLOC_FAILED "CBM_ARENA_ALLOC_FAILED"
+#define CBM_ARENA_CAPACITY_OVERFLOW "CBM_ARENA_CAPACITY_OVERFLOW"
+
+void cbm_arena_mark_failed(CBMArena *a, const char *code, const char *operation,
+                           size_t requested_bytes) {
+    if (!a) {
+        return;
+    }
+    if (!a->failed || (a->failure_operation && strncmp(a->failure_operation, "arena_", 6) == 0)) {
+        a->failure_code = code;
+        a->failure_operation = operation;
+        a->failure_bytes = requested_bytes;
+    }
+    a->failed = true;
+}
+
+bool cbm_arena_failed(const CBMArena *a) {
+    return a && a->failed;
+}
+
+const char *cbm_arena_failure_code(const CBMArena *a) {
+    return a && a->failure_code ? a->failure_code : CBM_ARENA_ALLOC_FAILED;
+}
+
+const char *cbm_arena_failure_operation(const CBMArena *a) {
+    return a && a->failure_operation ? a->failure_operation : "arena_alloc";
+}
+
+size_t cbm_arena_failure_bytes(const CBMArena *a) {
+    return a ? a->failure_bytes : 0;
+}
 
 void cbm_arena_init(CBMArena *a) {
     cbm_arena_init_sized(a, CBM_ARENA_DEFAULT_BLOCK_SIZE);
@@ -32,19 +65,28 @@ void cbm_arena_init_sized(CBMArena *a, size_t block_size) {
     if (a->blocks[0]) {
         a->block_sizes[0] = block_size;
         a->nblocks = SKIP_ONE;
+    } else {
+        cbm_arena_mark_failed(a, CBM_ARENA_ALLOC_FAILED, "arena_init", block_size);
     }
 }
 
 static int arena_grow(CBMArena *a, size_t min_size) {
     if (a->nblocks >= CBM_ARENA_MAX_BLOCKS) {
+        cbm_arena_mark_failed(a, CBM_ARENA_ALLOC_FAILED, "arena_block_limit", min_size);
         return 0;
     }
-    size_t new_size = a->block_size * PAIR_LEN;
+    size_t new_size = a->block_size;
     if (new_size < min_size) {
         new_size = min_size;
+    } else if (new_size <= SIZE_MAX / PAIR_LEN) {
+        new_size *= PAIR_LEN;
+    } else {
+        cbm_arena_mark_failed(a, CBM_ARENA_CAPACITY_OVERFLOW, "arena_grow", min_size);
+        return 0;
     }
     char *block = (char *)malloc(new_size);
     if (!block) {
+        cbm_arena_mark_failed(a, CBM_ARENA_ALLOC_FAILED, "arena_grow", new_size);
         return 0;
     }
     a->blocks[a->nblocks] = block;
@@ -60,14 +102,23 @@ void *cbm_arena_alloc(CBMArena *a, size_t n) {
         return NULL;
     }
     /* 8-byte alignment */
-    n = (n + ARENA_ALIGN) & ~(size_t)ARENA_ALIGN;
-    if (a->nblocks == 0) {
+    if (n > SIZE_MAX - ARENA_ALIGN) {
+        cbm_arena_mark_failed(a, CBM_ARENA_CAPACITY_OVERFLOW, "arena_alloc", n);
         return NULL;
     }
-    if (a->used + n > a->block_size) {
+    n = (n + ARENA_ALIGN) & ~(size_t)ARENA_ALIGN;
+    if (a->nblocks == 0) {
+        cbm_arena_mark_failed(a, CBM_ARENA_ALLOC_FAILED, "arena_alloc", n);
+        return NULL;
+    }
+    if (a->used > a->block_size || n > a->block_size - a->used) {
         if (!arena_grow(a, n)) {
             return NULL;
         }
+    }
+    if (a->total_alloc > SIZE_MAX - n) {
+        cbm_arena_mark_failed(a, CBM_ARENA_CAPACITY_OVERFLOW, "arena_total", n);
+        return NULL;
     }
     char *ptr = a->blocks[a->nblocks - SKIP_ONE] + a->used;
     a->used += n;
@@ -97,6 +148,10 @@ char *cbm_arena_strdup(CBMArena *a, const char *s) {
 
 char *cbm_arena_strndup(CBMArena *a, const char *s, size_t len) {
     if (!s) {
+        return NULL;
+    }
+    if (len == SIZE_MAX) {
+        cbm_arena_mark_failed(a, CBM_ARENA_CAPACITY_OVERFLOW, "arena_strndup", len);
         return NULL;
     }
     char *dst = (char *)cbm_arena_alloc(a, len + SKIP_ONE);
@@ -139,6 +194,10 @@ void cbm_arena_reset(CBMArena *a) {
     }
     a->used = 0;
     a->total_alloc = 0;
+    a->failed = false;
+    a->failure_code = NULL;
+    a->failure_operation = NULL;
+    a->failure_bytes = 0;
     /* Reset block_size to match surviving block — prevents overflow if
      * block_size grew during previous allocations (e.g., CBM_SZ_128 → CBM_SZ_256). */
     if (a->nblocks == SKIP_ONE) {

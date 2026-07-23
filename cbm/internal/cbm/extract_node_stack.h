@@ -14,6 +14,8 @@
 
 #include "arena.h"
 #include "tree_sitter/api.h"
+#include <limits.h>
+#include <stdint.h>
 #include <string.h> /* memcpy */
 
 typedef struct {
@@ -23,19 +25,42 @@ typedef struct {
 } TSNodeStack;
 
 /* Initialize a stack with the given initial capacity, arena-allocated. */
-static inline void ts_nstack_init(TSNodeStack *s, CBMArena *arena, int initial_cap) {
+static inline bool ts_nstack_init(TSNodeStack *s, CBMArena *arena, int initial_cap) {
+    if (!s || !arena || initial_cap <= 0 || (size_t)initial_cap > SIZE_MAX / sizeof(TSNode)) {
+        cbm_arena_mark_failed(arena, "CBM_AST_STACK_CAPACITY_INVALID", "ast_stack_init",
+                              initial_cap > 0 ? (size_t)initial_cap : 0);
+        if (s) {
+            memset(s, 0, sizeof(*s));
+        }
+        return false;
+    }
     s->items = (TSNode *)cbm_arena_alloc(arena, (size_t)initial_cap * sizeof(TSNode));
     s->count = 0;
     s->cap = s->items ? initial_cap : 0;
+    return s->items != NULL;
 }
 
 /* Push a node onto the stack, growing 2x if needed. */
-static inline void ts_nstack_push(TSNodeStack *s, CBMArena *arena, TSNode node) {
+static inline bool ts_nstack_push(TSNodeStack *s, CBMArena *arena, TSNode node) {
+    if (!s || !arena || cbm_arena_failed(arena)) {
+        return false;
+    }
     if (s->count >= s->cap) {
+        if (s->cap > INT_MAX / 2) {
+            cbm_arena_mark_failed(arena, "CBM_AST_STACK_CAPACITY_OVERFLOW", "ast_stack_grow",
+                                  (size_t)s->cap);
+            return false;
+        }
         int new_cap = s->cap ? s->cap * 2 : 512;
+        if ((size_t)new_cap > SIZE_MAX / sizeof(TSNode)) {
+            cbm_arena_mark_failed(arena, "CBM_AST_STACK_CAPACITY_OVERFLOW", "ast_stack_grow",
+                                  (size_t)new_cap);
+            return false;
+        }
         TSNode *new_items = (TSNode *)cbm_arena_alloc(arena, (size_t)new_cap * sizeof(TSNode));
-        if (!new_items)
-            return; /* OOM: best-effort, stop growing */
+        if (!new_items) {
+            return false;
+        }
         if (s->items && s->count > 0) {
             memcpy(new_items, s->items, (size_t)s->count * sizeof(TSNode));
         }
@@ -44,6 +69,7 @@ static inline void ts_nstack_push(TSNodeStack *s, CBMArena *arena, TSNode node) 
         s->cap = new_cap;
     }
     s->items[s->count++] = node;
+    return true;
 }
 
 /* Pop a node from the stack. Caller must check s->count > 0. */
@@ -63,12 +89,16 @@ static inline TSNode ts_nstack_pop(TSNodeStack *s) {
  * files). This helper enumerates children in a single O(N) cursor pass, then
  * reverses the just-pushed segment so pop order is identical to the old idiom.
  */
-static inline void ts_nstack_push_children(TSNodeStack *s, CBMArena *arena, TSNode node) {
+static inline bool ts_nstack_push_children(TSNodeStack *s, CBMArena *arena, TSNode node) {
     int base = s->count;
+    bool ok = true;
     TSTreeCursor cursor = ts_tree_cursor_new(node);
     if (ts_tree_cursor_goto_first_child(&cursor)) {
         do {
-            ts_nstack_push(s, arena, ts_tree_cursor_current_node(&cursor));
+            if (!ts_nstack_push(s, arena, ts_tree_cursor_current_node(&cursor))) {
+                ok = false;
+                break;
+            }
         } while (ts_tree_cursor_goto_next_sibling(&cursor));
     }
     ts_tree_cursor_delete(&cursor);
@@ -81,6 +111,7 @@ static inline void ts_nstack_push_children(TSNodeStack *s, CBMArena *arena, TSNo
         lo++;
         hi--;
     }
+    return ok;
 }
 
 #endif /* CBM_EXTRACT_NODE_STACK_H */

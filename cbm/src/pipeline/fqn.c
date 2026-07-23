@@ -21,10 +21,6 @@
 #include <io.h>
 #endif
 
-/* Maximum path segments in a FQN (CBM_SZ_256 slots total, -2 for project + name) */
-#define FQN_MAX_PATH_SEGS 254
-#define FQN_MAX_DIR_SEGS 255
-
 /* Max bytes for a derived project name. The name becomes a single filename
  * component: the C side writes "<cache>/<name>.db" (+ sidecars ".db-wal" /
  * ".db.corrupt"), and the Rust host writes "<name>.astrolabe-lowered.db" (21
@@ -50,13 +46,17 @@
 /* ── Internal helpers ─────────────────────────────────────────────── */
 
 /* Build a dot-joined string from segments. Returns heap-allocated string. */
-static char *join_segments(const char **segments, int count) {
+static char *join_segments(const char **segments, size_t count) {
     if (count == 0) {
         return strdup("");
     }
     size_t total = 0;
-    for (int i = 0; i < count; i++) {
-        total += strlen(segments[i]);
+    for (size_t i = 0; i < count; i++) {
+        size_t segment_len = strlen(segments[i]);
+        if (total > SIZE_MAX - segment_len || (i > 0 && total + segment_len == SIZE_MAX)) {
+            return NULL;
+        }
+        total += segment_len;
         if (i > 0) {
             total++; /* dot separator */
         }
@@ -66,7 +66,7 @@ static char *join_segments(const char **segments, int count) {
         return NULL;
     }
     char *p = result;
-    for (int i = 0; i < count; i++) {
+    for (size_t i = 0; i < count; i++) {
         if (i > 0) {
             *p++ = '.';
         }
@@ -88,14 +88,14 @@ static void strip_file_extension(char *path) {
     }
 }
 
-/* Tokenize path by '/' into segments array. Returns number of segments added. */
-static int tokenize_path(char *path, const char **segments, int max_segs) {
-    int count = 0;
+/* Tokenize path by '/' into a caller-sized segments array. */
+static size_t tokenize_path(char *path, const char **segments) {
+    size_t count = 0;
     if (path[0] == '\0') {
         return 0;
     }
     char *tok = path;
-    while (tok && *tok && count < max_segs) {
+    while (tok && *tok) {
         char *slash = strchr(tok, '/');
         if (slash) {
             *slash = '\0';
@@ -111,7 +111,7 @@ static int tokenize_path(char *path, const char **segments, int max_segs) {
 /* Strip __init__ (Python) / index (JS/TS) from the last segment when a
  * symbol name is provided. Keeps it when no name is given to avoid QN
  * collision with Folder nodes for the same directory. */
-static void strip_init_or_index(const char **segments, int *seg_count, const char *name) {
+static void strip_init_or_index(const char **segments, size_t *seg_count, const char *name) {
     if (*seg_count <= SKIP_ONE) {
         return;
     }
@@ -132,13 +132,34 @@ char *cbm_pipeline_fqn_compute(const char *project, const char *rel_path, const 
     }
 
     char *path = strdup(rel_path ? rel_path : "");
+    if (!path) {
+        return NULL;
+    }
     cbm_normalize_path_sep(path);
     strip_file_extension(path);
 
-    const char *segments[CBM_SZ_256];
-    int seg_count = 0;
+    size_t segment_capacity = PAIR_LEN + SKIP_ONE;
+    for (const char *p = path; *p; p++) {
+        if (*p == '/') {
+            if (segment_capacity == SIZE_MAX) {
+                free(path);
+                return NULL;
+            }
+            segment_capacity++;
+        }
+    }
+    if (segment_capacity > SIZE_MAX / sizeof(char *)) {
+        free(path);
+        return NULL;
+    }
+    const char **segments = malloc(segment_capacity * sizeof(char *));
+    if (!segments) {
+        free(path);
+        return NULL;
+    }
+    size_t seg_count = 0;
     segments[seg_count++] = project;
-    seg_count += tokenize_path(path, segments + seg_count, FQN_MAX_PATH_SEGS);
+    seg_count += tokenize_path(path, segments + seg_count);
 
     strip_init_or_index(segments, &seg_count, name);
 
@@ -147,6 +168,7 @@ char *cbm_pipeline_fqn_compute(const char *project, const char *rel_path, const 
     }
 
     char *result = join_segments(segments, seg_count);
+    free(segments);
     free(path);
     return result;
 }
@@ -170,7 +192,10 @@ char *cbm_pipeline_fqn_module_dir(const char *project, const char *rel_path, boo
      * normalizes too); look for the rightmost '/' or '\\'. */
     const char *last_fwd = strrchr(src, '/');
     const char *last_bwd = strrchr(src, '\\');
-    const char *last_sep = last_fwd > last_bwd ? last_fwd : last_bwd;
+    const char *last_sep = last_fwd;
+    if (!last_sep || (last_bwd && last_bwd > last_sep)) {
+        last_sep = last_bwd;
+    }
     if (!last_sep) {
         /* Root file: empty directory → module is just the project. */
         return cbm_pipeline_fqn_folder(project, "");
@@ -188,7 +213,6 @@ char *cbm_pipeline_fqn_module_dir(const char *project, const char *rel_path, boo
 }
 
 enum {
-    FQN_PATH_BUF = 1024,
     FQN_SEP_LEN = 1, /* one byte for the '/' separator */
     FQN_NUL_LEN = 1, /* one byte for the terminating NUL */
     FQN_DOTDOT_LEN = 2,
@@ -203,7 +227,12 @@ enum {
  * returns false if the buffer would overflow. */
 static bool path_append_segment(char *buf, size_t buf_size, const char *seg, size_t seg_len) {
     size_t cur = strlen(buf);
-    size_t need = cur + (cur > 0 ? FQN_SEP_LEN : 0) + seg_len + FQN_NUL_LEN;
+    size_t separator = cur > 0 ? FQN_SEP_LEN : 0;
+    if (cur > SIZE_MAX - separator || cur + separator > SIZE_MAX - seg_len ||
+        cur + separator + seg_len == SIZE_MAX) {
+        return false;
+    }
+    size_t need = cur + separator + seg_len + FQN_NUL_LEN;
     if (need > buf_size) {
         return false;
     }
@@ -216,19 +245,23 @@ static bool path_append_segment(char *buf, size_t buf_size, const char *seg, siz
 }
 
 /* Pop the last segment from a mutable slash-separated path. */
-static void path_pop_segment(char *buf) {
+static bool path_pop_segment(char *buf) {
+    if (!buf[0]) {
+        return false;
+    }
     char *last = strrchr(buf, '/');
     if (last) {
         *last = '\0';
     } else {
         buf[0] = '\0';
     }
+    return true;
 }
 
 /* Seed `buf` with the source file's directory (strip the basename) and
  * normalize backslashes. */
-static void seed_source_dir(char *buf, size_t buf_size, const char *source_rel) {
-    snprintf(buf, buf_size, "%s", source_rel ? source_rel : "");
+static void seed_source_dir(char *buf, const char *source_rel) {
+    strcpy(buf, source_rel ? source_rel : "");
     for (char *p = buf; *p; p++) {
         if (*p == '\\') {
             *p = '/';
@@ -260,15 +293,17 @@ static int classify_relative_import(const char *module_path) {
 }
 
 /* Python relative import: ".foo", "..bar.baz" → resolve against source dir. */
-static char *resolve_python_relative(char *buf, size_t buf_size, const char *module_path) {
+static int resolve_python_relative(char *buf, size_t buf_size, const char *module_path) {
     const char *p = module_path;
-    int dot_count = 0;
+    size_t dot_count = 0;
     while (*p == '.') {
         dot_count++;
         p++;
     }
-    for (int i = FQN_MIN_PY_DOTS; i < dot_count; i++) {
-        path_pop_segment(buf);
+    for (size_t i = FQN_MIN_PY_DOTS; i < dot_count; i++) {
+        if (!path_pop_segment(buf)) {
+            return CBM_RELATIVE_IMPORT_INVALID;
+        }
     }
     while (*p) {
         const char *seg_start = p;
@@ -277,21 +312,25 @@ static char *resolve_python_relative(char *buf, size_t buf_size, const char *mod
         }
         size_t seg_len = (size_t)(p - seg_start);
         if (seg_len > 0 && !path_append_segment(buf, buf_size, seg_start, seg_len)) {
-            return NULL;
+            return CBM_RELATIVE_IMPORT_ERROR;
         }
         if (*p == '.') {
             p++;
         }
     }
-    return strdup(buf);
+    return CBM_RELATIVE_IMPORT_RESOLVED;
 }
 
 /* Strip a trailing file extension from a segment (e.g. "helpers.ts" → "helpers").
  * Returns the new segment length. */
 static size_t strip_ext(const char *seg_start, size_t seg_len) {
+    if (seg_len == 0) {
+        return 0;
+    }
     const char *seg_end = seg_start + seg_len;
     const char *dot = NULL;
-    for (const char *d = seg_end - FQN_SEP_LEN; d >= seg_start; d--) {
+    for (const char *d = seg_end; d > seg_start;) {
+        d--;
         if (*d == '.') {
             dot = d;
             break;
@@ -304,7 +343,7 @@ static size_t strip_ext(const char *seg_start, size_t seg_len) {
 }
 
 /* JS/TS relative import: "./foo", "../bar/baz" → resolve against source dir. */
-static char *resolve_js_relative(char *buf, size_t buf_size, const char *module_path) {
+static int resolve_js_relative(char *buf, size_t buf_size, const char *module_path) {
     const char *p = module_path;
     while (*p) {
         while (*p == '/') {
@@ -322,30 +361,54 @@ static char *resolve_js_relative(char *buf, size_t buf_size, const char *module_
             continue;
         }
         if (seg_len == FQN_DOTDOT_LEN && seg_start[0] == '.' && seg_start[FQN_SEP_LEN] == '.') {
-            path_pop_segment(buf);
+            if (!path_pop_segment(buf)) {
+                return CBM_RELATIVE_IMPORT_INVALID;
+            }
             continue;
         }
         if (*p == '\0') {
             seg_len = strip_ext(seg_start, seg_len);
         }
         if (seg_len > 0 && !path_append_segment(buf, buf_size, seg_start, seg_len)) {
-            return NULL;
+            return CBM_RELATIVE_IMPORT_ERROR;
         }
     }
-    return strdup(buf);
+    return CBM_RELATIVE_IMPORT_RESOLVED;
 }
 
-char *cbm_pipeline_resolve_relative_import(const char *source_rel, const char *module_path) {
+int cbm_pipeline_resolve_relative_import_checked(const char *source_rel, const char *module_path,
+                                                 char **out) {
+    if (!out) {
+        return CBM_RELATIVE_IMPORT_ERROR;
+    }
+    *out = NULL;
     int kind = classify_relative_import(module_path);
     if (kind == FQN_REL_KIND_NONE) {
-        return NULL;
+        return CBM_RELATIVE_IMPORT_NOT_RELATIVE;
     }
-    char buf[FQN_PATH_BUF];
-    seed_source_dir(buf, sizeof(buf), source_rel);
+    size_t source_len = strlen(source_rel ? source_rel : "");
+    size_t module_len = strlen(module_path);
+    if (source_len > SIZE_MAX - module_len || source_len + module_len > SIZE_MAX - PAIR_LEN) {
+        return CBM_RELATIVE_IMPORT_ERROR;
+    }
+    size_t buf_size = source_len + module_len + PAIR_LEN;
+    char *buf = malloc(buf_size);
+    if (!buf) {
+        return CBM_RELATIVE_IMPORT_ERROR;
+    }
+    seed_source_dir(buf, source_rel);
+    int status;
     if (kind == FQN_REL_KIND_PYTHON) {
-        return resolve_python_relative(buf, sizeof(buf), module_path);
+        status = resolve_python_relative(buf, buf_size, module_path);
+    } else {
+        status = resolve_js_relative(buf, buf_size, module_path);
     }
-    return resolve_js_relative(buf, sizeof(buf), module_path);
+    if (status == CBM_RELATIVE_IMPORT_RESOLVED) {
+        *out = buf;
+    } else {
+        free(buf);
+    }
+    return status;
 }
 
 char *cbm_pipeline_fqn_folder(const char *project, const char *rel_dir) {
@@ -355,15 +418,36 @@ char *cbm_pipeline_fqn_folder(const char *project, const char *rel_dir) {
 
     /* Work on mutable copy */
     char *dir = strdup(rel_dir ? rel_dir : "");
+    if (!dir) {
+        return NULL;
+    }
     cbm_normalize_path_sep(dir);
 
-    const char *segments[CBM_SZ_256];
-    int seg_count = 0;
+    size_t segment_capacity = PAIR_LEN;
+    for (const char *p = dir; *p; p++) {
+        if (*p == '/') {
+            if (segment_capacity == SIZE_MAX) {
+                free(dir);
+                return NULL;
+            }
+            segment_capacity++;
+        }
+    }
+    if (segment_capacity > SIZE_MAX / sizeof(char *)) {
+        free(dir);
+        return NULL;
+    }
+    const char **segments = malloc(segment_capacity * sizeof(char *));
+    if (!segments) {
+        free(dir);
+        return NULL;
+    }
+    size_t seg_count = 0;
     segments[seg_count++] = project;
 
     if (dir[0] != '\0') {
         char *tok = dir;
-        while (tok && *tok && seg_count < FQN_MAX_DIR_SEGS) {
+        while (tok && *tok) {
             char *slash = strchr(tok, '/');
             if (slash) {
                 *slash = '\0';
@@ -376,6 +460,7 @@ char *cbm_pipeline_fqn_folder(const char *project, const char *rel_dir) {
     }
 
     char *result = join_segments(segments, seg_count);
+    free(segments);
     free(dir);
     return result;
 }

@@ -3502,7 +3502,9 @@ static void c_emit_resolved_call_orig(CLSPContext *ctx, const char *callee_qn, c
     // is otherwise NULL for resolved calls and is never read for them by the
     // pipeline consumers, so this overload is side-effect-free.
     rc.reason = orig;
-    cbm_resolvedcall_push(ctx->resolved_calls, ctx->arena, rc);
+    if (!cbm_resolvedcall_push(ctx->resolved_calls, ctx->arena, rc)) {
+        return;
+    }
 }
 
 static void c_emit_resolved_call(CLSPContext *ctx, const char *callee_qn, const char *strategy,
@@ -3519,7 +3521,9 @@ static void c_emit_unresolved_call(CLSPContext *ctx, const char *expr_text, cons
     rc.strategy = "lsp_unresolved";
     rc.confidence = 0.0f;
     rc.reason = reason;
-    cbm_resolvedcall_push(ctx->resolved_calls, ctx->arena, rc);
+    if (!cbm_resolvedcall_push(ctx->resolved_calls, ctx->arena, rc)) {
+        return;
+    }
 }
 
 // ============================================================================

@@ -48,8 +48,8 @@ bool cbm_pxc_has_cross_lsp(CBMLanguage lang);
  * returned CBMLSPDef[] are borrowed from cache[i]->arena and from
  * def_modules[i] — caller must keep both alive while the array is in
  * use. Returns the malloc'd array (free() it) and writes the entry
- * count to *out_count. Returns NULL on alloc failure or when no defs
- * exist. */
+ * count to *out_count. Returns NULL with *out_count == 0 when no defs
+ * exist, or NULL with *out_count == -1 after logging an allocation failure. */
 CBMLSPDef *cbm_pxc_collect_all_defs(CBMFileResult **cache, const cbm_file_info_t *files,
                                     int file_count, const char *project_name, char **def_modules,
                                     int *out_count);

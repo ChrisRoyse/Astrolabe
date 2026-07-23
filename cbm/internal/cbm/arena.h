@@ -1,6 +1,7 @@
 #ifndef CBM_ARENA_H
 #define CBM_ARENA_H
 
+#include <stdbool.h>
 #include <stddef.h>
 
 // CBMArena is a simple bump allocator that allocates from fixed-size blocks.
@@ -17,6 +18,10 @@ typedef struct {
     size_t block_size;
     size_t used;        // bytes used in current block
     size_t total_alloc; // cumulative bytes allocated (for stats)
+    bool failed;        // sticky: no failed allocation may be forgotten
+    const char *failure_code;
+    const char *failure_operation;
+    size_t failure_bytes;
 } CBMArena;
 
 // Initialize an arena with the default block size.
@@ -25,6 +30,14 @@ void cbm_arena_init(CBMArena *a);
 // Allocate n bytes from the arena. Returns NULL on OOM or block exhaustion.
 // All returned pointers are 8-byte aligned.
 void *cbm_arena_alloc(CBMArena *a, size_t n);
+
+// Record/refine a sticky allocation failure. Strings must have static lifetime.
+void cbm_arena_mark_failed(CBMArena *a, const char *code, const char *operation,
+                           size_t requested_bytes);
+bool cbm_arena_failed(const CBMArena *a);
+const char *cbm_arena_failure_code(const CBMArena *a);
+const char *cbm_arena_failure_operation(const CBMArena *a);
+size_t cbm_arena_failure_bytes(const CBMArena *a);
 
 // Duplicate a string into arena memory. Returns arena-owned copy.
 char *cbm_arena_strdup(CBMArena *a, const char *s);

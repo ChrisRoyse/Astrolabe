@@ -1619,7 +1619,9 @@ static void extract_jsx_component_ref(CBMExtractCtx *ctx, TSNode node, const cha
         CBMCall call = {0};
         call.callee_name = name;
         call.enclosing_func_qn = enclosing_func_qn;
-        cbm_calls_push(&ctx->result->calls, ctx->arena, call);
+        if (!cbm_calls_push(&ctx->result->calls, ctx->arena, call)) {
+            return;
+        }
     }
 }
 
@@ -1687,7 +1689,9 @@ static void extract_kotlin_operator_call(CBMExtractCtx *ctx, TSNode node, const 
     call.callee_name = op_method;
     call.enclosing_func_qn = enclosing_func_qn;
     call.start_line = (int)ts_node_start_point(node).row + TS_LINE_OFFSET;
-    cbm_calls_push(&ctx->result->calls, ctx->arena, call);
+    if (!cbm_calls_push(&ctx->result->calls, ctx->arena, call)) {
+        return;
+    }
 }
 
 // Kotlin convention-desugared calls that the call walk never sees as
@@ -1701,7 +1705,9 @@ static void kt_push_implicit_call(CBMExtractCtx *ctx, TSNode node, const char *c
     call.callee_name = callee;
     call.enclosing_func_qn = enclosing_func_qn;
     call.start_line = (int)ts_node_start_point(node).row + TS_LINE_OFFSET;
-    cbm_calls_push(&ctx->result->calls, ctx->arena, call);
+    if (!cbm_calls_push(&ctx->result->calls, ctx->arena, call)) {
+        return;
+    }
 }
 
 // C++ overloaded binary operator `a + b`: the operator method (`operator+`) is
@@ -1733,7 +1739,9 @@ static void extract_cpp_operator_call(CBMExtractCtx *ctx, TSNode node, const cha
             call.callee_name = cbm_arena_sprintf(ctx->arena, "operator%s", op);
             call.enclosing_func_qn = enclosing_func_qn;
             call.start_line = (int)ts_node_start_point(node).row + TS_LINE_OFFSET;
-            cbm_calls_push(&ctx->result->calls, ctx->arena, call);
+            if (!cbm_calls_push(&ctx->result->calls, ctx->arena, call)) {
+                return;
+            }
         }
         break;
     }
@@ -1802,7 +1810,9 @@ static void extract_cpp_implicit_calls(CBMExtractCtx *ctx, TSNode node, const ch
         call.callee_name = callee;
         call.enclosing_func_qn = enclosing_func_qn;
         call.start_line = (int)ts_node_start_point(node).row + TS_LINE_OFFSET;
-        cbm_calls_push(&ctx->result->calls, ctx->arena, call);
+        if (!cbm_calls_push(&ctx->result->calls, ctx->arena, call)) {
+            return;
+        }
     }
 }
 
@@ -1863,7 +1873,9 @@ static void extract_java_method_reference(CBMExtractCtx *ctx, TSNode node, const
     call.callee_name = mname;
     call.enclosing_func_qn = enclosing_func_qn;
     call.start_line = (int)ts_node_start_point(node).row + TS_LINE_OFFSET;
-    cbm_calls_push(&ctx->result->calls, ctx->arena, call);
+    if (!cbm_calls_push(&ctx->result->calls, ctx->arena, call)) {
+        return;
+    }
 }
 
 void handle_calls(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec, WalkState *state) {
@@ -1925,7 +1937,9 @@ void handle_calls(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec, Walk
                 extract_call_args(ctx, args, &call);
             }
 
-            cbm_calls_push(&ctx->result->calls, ctx->arena, call);
+            if (!cbm_calls_push(&ctx->result->calls, ctx->arena, call)) {
+                return;
+            }
 
             const char **dispatch_suffixes = cbm_string_dispatch_suffixes(ctx->language);
             if (dispatch_suffixes && !ts_node_is_null(args)) {
@@ -1940,7 +1954,9 @@ void handle_calls(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec, Walk
                             CBMCall xcall = {0};
                             xcall.callee_name = cbm_arena_sprintf(ctx->arena, "%s.%s", cls, mth);
                             xcall.enclosing_func_qn = call.enclosing_func_qn;
-                            cbm_calls_push(&ctx->result->calls, ctx->arena, xcall);
+                            if (!cbm_calls_push(&ctx->result->calls, ctx->arena, xcall)) {
+                                return;
+                            }
                         }
                         break;
                     }

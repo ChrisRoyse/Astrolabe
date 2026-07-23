@@ -106,7 +106,9 @@ static void try_emit_type_assign(CBMExtractCtx *ctx, TSNode var_node, TSNode rhs
         ta.var_name = var_name;
         ta.type_name = type_name;
         ta.enclosing_func_qn = func_qn;
-        cbm_typeassign_push(&ctx->result->type_assigns, ctx->arena, ta);
+        if (!cbm_typeassign_push(&ctx->result->type_assigns, ctx->arena, ta)) {
+            return;
+        }
     }
 }
 

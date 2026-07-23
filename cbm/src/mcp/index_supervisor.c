@@ -9,6 +9,7 @@
 #include "foundation/platform.h" /* cbm_resolve_cache_dir */
 #include "foundation/profile.h"  /* cbm_profile_active (keep worker log under CBM_PROFILE) */
 #include "ui/http_server.h"      /* cbm_http_server_resolve_binary_path */
+#include <yyjson/yyjson.h>
 
 #ifdef ASTRO_ENV_STORE
 /* #252: the in-process FFI store override (cbm_astro_set_cache_dir) that
@@ -55,25 +56,6 @@ const char *cbm_index_worker_response_out(void) {
     return g_worker_response_out[0] ? g_worker_response_out : NULL;
 }
 
-/* Test hook (#845): counts spawn ATTEMPTS (entry to cbm_index_spawn_worker),
- * including ones that fail to resolve the self binary — an embedder must never
- * even try to spawn. */
-static int g_spawn_count = 0;
-
-int cbm_index_supervisor_spawn_count(void) {
-    return g_spawn_count;
-}
-
-/* Test hook: counts SINGLE-THREADED spawns. Production recovery is parallel-
- * only (there are no sequential production runs); this must stay ZERO on
- * every supervised path — any nonzero count means a recovery/probe regressed
- * to the sequential crawl that ground an 81k-file TS corpus for hours. */
-static int g_spawn_st_count = 0;
-
-int cbm_index_supervisor_spawn_st_count(void) {
-    return g_spawn_st_count;
-}
-
 /* #845: opt-in host mark — see the header. Set once from the real binary's
  * main(); embedders never set it, so should_wrap() stays false for them. */
 static bool g_host_marked = false;
@@ -89,10 +71,6 @@ bool cbm_index_supervisor_should_wrap(void) {
     if (g_worker_active) {
         return false; /* I am the worker — run in-process, never re-supervise */
     }
-    const char *sv = getenv("CBM_INDEX_SUPERVISOR");
-    if (sv && strcmp(sv, "0") == 0) {
-        return false; /* kill switch → in-process */
-    }
     return true;
 }
 
@@ -101,17 +79,9 @@ bool cbm_index_supervisor_should_wrap(void) {
  * completed log line the worker tails (per-batch parallel.extract.progress every
  * 10 files, plus each pass boundary) resets it — NOT a total-time cap, so a large
  * repo that keeps making progress is never falsely killed. Default: 15 min (a
- * genuinely stuck file emits nothing, so this fires only on a real hang). The
- * CBM_INDEX_WORKER_TIMEOUT_S override (seconds → ms) tightens it for tests. */
+ * genuinely stuck file emits nothing, so this fires only on a real hang). */
 static int worker_quiet_timeout_ms(void) {
     enum { DEFAULT_QUIET_TIMEOUT_MS = 900000 }; /* 15 min with no progress */
-    const char *e = getenv("CBM_INDEX_WORKER_TIMEOUT_S");
-    if (e && e[0]) {
-        long s = atol(e);
-        if (s > 0) {
-            return (int)(s * 1000);
-        }
-    }
     return DEFAULT_QUIET_TIMEOUT_MS;
 }
 
@@ -199,108 +169,90 @@ static char *slurp_file(const char *path) {
     return buf;
 }
 
-/* Resolve a per-run temp path <cache_dir>/logs/.worker-<pid><suffix>. */
-static void worker_tmp_path(char *out, size_t out_sz, int pid, const char *suffix) {
+/* Atomically create one request-owned workspace. A host PID is not a request
+ * identity: the MCP server can supervise concurrent indexing calls. */
+static int worker_tmp_dir(char *out, size_t out_sz, int pid) {
     const char *cdir = cbm_resolve_cache_dir();
     if (cdir && cdir[0]) {
         char dir[900];
-        snprintf(dir, sizeof(dir), "%s/logs", cdir);
-        cbm_mkdir_p(dir, 0755);
-        snprintf(out, out_sz, "%s/.worker-%d%s", dir, pid, suffix);
+        int dir_len = snprintf(dir, sizeof(dir), "%s/logs", cdir);
+        if (dir_len < 0 || (size_t)dir_len >= sizeof(dir) || !cbm_mkdir_p(dir, 0755)) {
+            return -1;
+        }
+        int path_len = snprintf(out, out_sz, "%s/.worker-%d-XXXXXX", dir, pid);
+        if (path_len < 0 || (size_t)path_len >= out_sz) {
+            return -1;
+        }
     } else {
-        snprintf(out, out_sz, ".worker-%d%s", pid, suffix);
+        int path_len = snprintf(out, out_sz, ".worker-%d-XXXXXX", pid);
+        if (path_len < 0 || (size_t)path_len >= out_sz) {
+            return -1;
+        }
     }
+    return cbm_mkdtemp(out, out_sz) ? 0 : -1;
 }
 
 #ifdef ASTRO_ENV_STORE
-/* #252: propagate any active in-process FFI store override
- * (cbm_astro_set_cache_dir) into the environment a spawned index worker will
- * inherit. The override is process-local and is NOT visible to the child, which
- * resolves its own store fresh (cbm_resolve_cache_dir consults CBM_CACHE_DIR
- * after the in-process override — and the child has no in-process override).
- * Without this the child would fall through to $HOME and leak its DB/scratch
- * into $HOME/.cache whenever the host has redirected the store.
- *
- * Extracted from cbm_index_spawn_worker so the round-trip is directly verifiable:
- * the value it writes is the real CRT `environ` state the child inherits,
- * readable through cbm_safe_getenv — the exact accessor libcbm's resolver uses.
- * The parent's own resolution is unperturbed: cbm_resolve_cache_dir consults the
- * higher-precedence in-process override first, so this transient CBM_CACHE_DIR
- * write is invisible to the parent and is restored by the matching pop.
- *
- * Return  1: override active → CBM_CACHE_DIR set to it; caller MUST pop.
- *         0: no override active → environment untouched; nothing to pop.
- *        -1: override active but the env write failed → FAIL CLOSED (a labeled
- *            fault is recorded); the caller must refuse to spawn, because the
- *            worker would resolve a DIFFERENT store than the host configured.
- * On a return of 1, *had_prior / prior_out capture any pre-existing CBM_CACHE_DIR
- * so the matching pop restores it exactly (never a persistent global mutation). */
-int cbm_index_worker_store_env_push(char *prior_out, size_t prior_cap, int *had_prior) {
-    if (had_prior) {
-        *had_prior = 0;
-    }
-    if (prior_out && prior_cap) {
-        prior_out[0] = '\0';
-    }
+/* Bind the process-local store override into this request's private transport.
+ * The Rust worker applies and reads it back before stripping it from the public
+ * tool arguments. No process-global environment mutation is involved. */
+static char *worker_args_bind_store(const char *args_json) {
     const char *store_override = cbm_astro_cache_dir_override();
-    if (!store_override) {
-        return 0; /* production default today: no override, nothing to propagate */
+    if (!store_override || !store_override[0]) {
+        return cbm_strdup(args_json);
     }
-    /* Capture any pre-existing CBM_CACHE_DIR before we overwrite it: cbm_setenv
-     * (_putenv_s/setenv) below may invalidate the pointer getenv would return. */
-    char probe[CBM_ASTRO_STORE_PATH_CAP] = {0};
-    const char *prior = cbm_safe_getenv("CBM_CACHE_DIR", probe, sizeof(probe), NULL);
-    if (prior && prior[0]) {
-        if (prior_out && prior_cap) {
-            snprintf(prior_out, prior_cap, "%s", prior);
+    yyjson_doc *doc = yyjson_read(args_json, strlen(args_json), 0);
+    yyjson_val *root = doc ? yyjson_doc_get_root(doc) : NULL;
+    if (!root || !yyjson_is_obj(root)) {
+        if (doc) {
+            yyjson_doc_free(doc);
         }
-        if (had_prior) {
-            *had_prior = 1;
+        cbm_log_error("index.supervisor.args_bind", "code", "CBM_INDEX_WORKER_ARGS_INVALID",
+                      "message", "worker arguments are not a JSON object", "remediation",
+                      "submit a valid index_repository JSON object");
+        return NULL;
+    }
+    static const char PRIVATE_CACHE_ARG[] = "_astrolabe_worker_cache_dir";
+    yyjson_val *existing = yyjson_obj_get(root, PRIVATE_CACHE_ARG);
+    if (existing) {
+        bool valid = yyjson_is_str(existing) && yyjson_get_str(existing)[0];
+        char *copy = valid ? cbm_strdup(args_json) : NULL;
+        yyjson_doc_free(doc);
+        if (!copy) {
+            cbm_log_error("index.supervisor.args_bind", "code",
+                          "CBM_INDEX_WORKER_CACHE_BINDING_INVALID", "message",
+                          "reserved worker cache binding is not a non-empty string", "remediation",
+                          "remove the reserved field and retry through the Astrolabe host");
         }
+        return copy;
     }
-    if (cbm_setenv("CBM_CACHE_DIR", store_override, 1) != 0) {
-        /* Fail closed: do not spawn a worker that would resolve a DIFFERENT store
-         * than the one the host configured. The caller degrades in-process, where
-         * the resolver honors the in-process override directly. */
-        cbm_astro_env_record_fault(
-            "CBM_E_WORKER_STORE_PROPAGATION", "CBM_CACHE_DIR",
-            "failed to propagate the configured CBM store override to the index-worker "
-            "subprocess environment; refusing to spawn a worker that would resolve a "
-            "different store (its DB/scratch would leak into the default $HOME/.cache)",
-            "Ensure the process environment is writable (setenv/_putenv_s must succeed), "
-            "or index in-process without a spawned worker; the in-process path honors the "
-            "cbm_astro_set_cache_dir override directly.");
-        return -1;
+    yyjson_mut_doc *mutable_doc = yyjson_mut_doc_new(NULL);
+    yyjson_mut_val *mutable_root = mutable_doc ? yyjson_val_mut_copy(mutable_doc, root) : NULL;
+    yyjson_doc_free(doc);
+    if (!mutable_doc || !mutable_root) {
+        if (mutable_doc) {
+            yyjson_mut_doc_free(mutable_doc);
+        }
+        return NULL;
     }
-    return 1;
-}
-
-/* Reverse cbm_index_worker_store_env_push: restore CBM_CACHE_DIR to exactly the
- * state found before the spawn. `pushed` is that function's return; a value other
- * than 1 means nothing was propagated and this is a no-op. */
-void cbm_index_worker_store_env_pop(int pushed, int had_prior, const char *prior) {
-    if (pushed != 1) {
-        return; /* no override was propagated → nothing to restore */
+    yyjson_mut_doc_set_root(mutable_doc, mutable_root);
+    if (!yyjson_mut_obj_add_strcpy(mutable_doc, mutable_root, PRIVATE_CACHE_ARG, store_override)) {
+        yyjson_mut_doc_free(mutable_doc);
+        return NULL;
     }
-    if (had_prior && prior) {
-        cbm_setenv("CBM_CACHE_DIR", prior, 1);
-    } else {
-        cbm_unsetenv("CBM_CACHE_DIR");
-    }
+    char *bound = yyjson_mut_write(mutable_doc, 0, NULL);
+    yyjson_mut_doc_free(mutable_doc);
+    return bound;
 }
 #endif /* ASTRO_ENV_STORE */
 
-int cbm_index_spawn_worker(const char *args_json, bool single_thread, const char *marker_file,
-                           const char *quarantine_file, cbm_index_worker_result_t *result) {
-    g_spawn_count++; /* test hook (#845) — see cbm_index_supervisor_spawn_count */
-    if (single_thread) {
-        g_spawn_st_count++; /* test hook — must stay 0: recovery is parallel-only */
-    }
+int cbm_index_spawn_worker(const char *args_json, cbm_index_worker_result_t *result) {
     result->outcome = CBM_PROC_SPAWN_FAILED;
     result->exit_code = -1;
     result->term_signal = 0;
     result->response = NULL;
     result->log_tail = NULL;
+    result->log_path = NULL;
 
     char self[1024] = {0};
     if (!cbm_http_server_resolve_binary_path(NULL, self, sizeof(self)) || !self[0]) {
@@ -309,13 +261,30 @@ int cbm_index_spawn_worker(const char *args_json, bool single_thread, const char
     }
 
     int pid = (int)cbm_getpid();
-    char resp_path[1024];
-    char log_path[1024];
-    char args_path[1024];
-    worker_tmp_path(resp_path, sizeof(resp_path), pid, ".response");
-    worker_tmp_path(log_path, sizeof(log_path), pid, ".log");
-    worker_tmp_path(args_path, sizeof(args_path), pid, ".args.json");
-    (void)cbm_unlink(resp_path); /* clear any stale file */
+    char workspace[1024];
+    if (worker_tmp_dir(workspace, sizeof(workspace), pid) != 0) {
+        cbm_log_error("index.supervisor.workspace", "code",
+                      "CBM_INDEX_WORKER_WORKSPACE_CREATE_FAILED", "message",
+                      "could not atomically create a request-owned worker workspace", "remediation",
+                      "inspect the configured store logs directory permissions and retry");
+        return -1;
+    }
+    char resp_path[1200];
+    char log_path[1200];
+    char args_path[1200];
+    int resp_len = snprintf(resp_path, sizeof(resp_path), "%s/response.json", workspace);
+    int log_len = snprintf(log_path, sizeof(log_path), "%s/worker.log", workspace);
+    int args_len = snprintf(args_path, sizeof(args_path), "%s/args.json", workspace);
+    if (resp_len < 0 || (size_t)resp_len >= sizeof(resp_path) || log_len < 0 ||
+        (size_t)log_len >= sizeof(log_path) || args_len < 0 ||
+        (size_t)args_len >= sizeof(args_path)) {
+        (void)cbm_rmdir(workspace);
+        cbm_log_error("index.supervisor.workspace", "code",
+                      "CBM_INDEX_WORKER_WORKSPACE_PATH_FAILED", "message",
+                      "worker artifact path exceeds the representable path buffer", "remediation",
+                      "shorten the configured cache directory and retry");
+        return -1;
+    }
 
     /* Hand the tool JSON to the worker via --args-file, the public CLI argument
      * contract. A raw-JSON argv token is REFUSED fail-closed by the Rust host
@@ -323,10 +292,20 @@ int cbm_index_spawn_worker(const char *args_json, bool single_thread, const char
      * every supervised worker exit 1 before indexing anything (#405 FSV). The
      * file lives beside the response/log worker tmp files and is removed at the
      * same cleanup points. */
-    if (write_file_all(args_path, args_json) != 0) {
+    char *worker_args = NULL;
+#ifdef ASTRO_ENV_STORE
+    worker_args = worker_args_bind_store(args_json);
+#else
+    worker_args = cbm_strdup(args_json);
+#endif
+    if (!worker_args || write_file_all(args_path, worker_args) != 0) {
+        free(worker_args);
+        (void)cbm_unlink(args_path);
+        (void)cbm_rmdir(workspace);
         cbm_log_warn("index.supervisor.args_write_failed", "path", args_path);
         return -1;
     }
+    free(worker_args);
 
     /* No --progress: the worker's DEFAULT structured logging already provides the
      * no-progress heartbeat (INFO parallel.extract.progress every 10 files + each
@@ -348,35 +327,6 @@ int cbm_index_spawn_worker(const char *args_json, bool single_thread, const char
     argv[n++] = resp_path;
     argv[n] = NULL;
 
-#ifdef ASTRO_ENV_STORE
-    /* #252: propagate an active in-process FFI store override into the worker's
-     * inherited environment (see cbm_index_worker_store_env_push above). Fail
-     * closed on a propagation failure rather than spawning a worker that would
-     * resolve a different store and leak its DB/scratch into $HOME/.cache. */
-    int had_prior_cache_dir = 0;
-    char prior_cache_dir[CBM_ASTRO_STORE_PATH_CAP] = {0};
-    int store_pushed = cbm_index_worker_store_env_push(prior_cache_dir, sizeof(prior_cache_dir),
-                                                       &had_prior_cache_dir);
-    if (store_pushed < 0) {
-        cbm_log_warn("index.supervisor.store_propagation_failed", "action", "degrade_in_process");
-        return -1;
-    }
-#endif
-
-    /* Recovery-run probe knobs → inherited env for the child. Spawns are
-     * sequential, so mutating the parent's environment around a single spawn is
-     * safe. Set only the requested knobs; unset them all again after reaping so
-     * a later attempt (or the caller) starts from a clean environment. */
-    if (single_thread) {
-        cbm_setenv("CBM_INDEX_SINGLE_THREAD", "1", 1);
-    }
-    if (marker_file && marker_file[0]) {
-        cbm_setenv("CBM_INDEX_MARKER_FILE", marker_file, 1);
-    }
-    if (quarantine_file && quarantine_file[0]) {
-        cbm_setenv("CBM_INDEX_QUARANTINE_FILE", quarantine_file, 1);
-    }
-
     cbm_proc_opts_t opts = {0};
     opts.bin = self;
     opts.argv = argv;
@@ -390,27 +340,14 @@ int cbm_index_spawn_worker(const char *args_json, bool single_thread, const char
     cbm_proc_result_t r;
     int run_rc = cbm_subprocess_run(&opts, &r);
 
-    if (single_thread) {
-        cbm_unsetenv("CBM_INDEX_SINGLE_THREAD");
-    }
-    if (marker_file && marker_file[0]) {
-        cbm_unsetenv("CBM_INDEX_MARKER_FILE");
-    }
-    if (quarantine_file && quarantine_file[0]) {
-        cbm_unsetenv("CBM_INDEX_QUARANTINE_FILE");
-    }
-#ifdef ASTRO_ENV_STORE
-    /* #252: restore the parent's CBM_CACHE_DIR exactly as found — the propagation
-     * above is scoped strictly to this one spawn window (never a persistent global
-     * mutation). */
-    cbm_index_worker_store_env_pop(store_pushed, had_prior_cache_dir, prior_cache_dir);
-#endif
-
     if (run_rc != 0) {
         (void)cbm_unlink(resp_path);
         (void)cbm_unlink(args_path);
         (void)cbm_unlink(log_path); /* empty/partial log from a failed spawn — nothing to keep */
-        cbm_log_warn("index.supervisor.spawn_failed", "action", "degrade_in_process");
+        (void)cbm_rmdir(workspace);
+        cbm_log_error("index.supervisor.spawn_failed", "code", "CBM_INDEX_WORKER_SPAWN_FAILED",
+                      "message", "the isolated index worker could not be started", "remediation",
+                      "inspect process-creation and worker-log diagnostics before retrying");
         return -1;
     }
 
@@ -460,9 +397,11 @@ int cbm_index_spawn_worker(const char *args_json, bool single_thread, const char
      * success made profiling clean runs impossible. Keep it and say where it is. */
     if (r.outcome == CBM_PROC_CLEAN && !cbm_profile_active) {
         (void)cbm_unlink(log_path);
+        (void)cbm_rmdir(workspace);
     } else if (r.outcome == CBM_PROC_CLEAN) {
         cbm_log_info("index.supervisor.profile_log", "log", log_path);
     } else {
+        result->log_path = cbm_strdup(log_path);
         cbm_log_warn("index.supervisor.worker_failed", "outcome", cbm_proc_outcome_str(r.outcome),
                      "exit_code", exit_buf, "log", log_path);
     }
@@ -475,5 +414,7 @@ void cbm_index_worker_result_free(cbm_index_worker_result_t *result) {
         result->response = NULL;
         free(result->log_tail);
         result->log_tail = NULL;
+        free(result->log_path);
+        result->log_path = NULL;
     }
 }

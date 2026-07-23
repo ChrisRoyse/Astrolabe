@@ -30,6 +30,8 @@
 #include "foundation/log.h"
 #include "foundation/compat_fs.h"
 
+#include <limits.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -272,8 +274,17 @@ CBMLSPDef *cbm_pxc_collect_all_defs(CBMFileResult **cache, const cbm_file_info_t
                                     int *out_count) {
     int total = 0;
     for (int i = 0; i < file_count; i++) {
-        if (cache[i])
+        if (cache[i]) {
+            if (cache[i]->defs.count < 0 || total > INT_MAX - cache[i]->defs.count) {
+                cbm_log_error("lsp_cross.defs_failed", "code", "CBM_LSP_DEF_COUNT_OVERFLOW",
+                              "component", "lsp_cross.definitions", "operation", "count", "message",
+                              "definition count exceeds the supported integer range", "remediation",
+                              "split the repository into smaller indexing scopes");
+                *out_count = -1;
+                return NULL;
+            }
             total += cache[i]->defs.count;
+        }
     }
     if (total == 0) {
         *out_count = 0;
@@ -281,7 +292,11 @@ CBMLSPDef *cbm_pxc_collect_all_defs(CBMFileResult **cache, const cbm_file_info_t
     }
     CBMLSPDef *defs = (CBMLSPDef *)calloc((size_t)total, sizeof(CBMLSPDef));
     if (!defs) {
-        *out_count = 0;
+        cbm_log_error("lsp_cross.defs_failed", "code", "CBM_LSP_DEFS_ALLOC_FAILED", "component",
+                      "lsp_cross.definitions", "operation", "allocate_entries", "message",
+                      "cross-LSP could not allocate every definition", "remediation",
+                      "free memory or reduce repository size, then retry");
+        *out_count = -1;
         return NULL;
     }
     int idx = 0;
@@ -291,6 +306,16 @@ CBMLSPDef *cbm_pxc_collect_all_defs(CBMFileResult **cache, const cbm_file_info_t
         if (!def_modules[fi]) {
             def_modules[fi] = cbm_pipeline_fqn_module_dir(project_name, files[fi].rel_path,
                                                           pxc_module_is_dir(files[fi].language));
+            if (!def_modules[fi]) {
+                cbm_log_error("lsp_cross.defs_failed", "code", "CBM_LSP_MODULE_FQN_ALLOC_FAILED",
+                              "component", "lsp_cross.definitions", "operation", "module_fqn",
+                              "file", files[fi].rel_path ? files[fi].rel_path : "<unknown>",
+                              "message", "cross-LSP could not retain a module identity",
+                              "remediation", "free memory or reduce repository size, then retry");
+                free(defs);
+                *out_count = -1;
+                return NULL;
+            }
         }
         const char *namespace_name = cache[fi]->namespace_name;
         if ((!namespace_name || !namespace_name[0]) && files[fi].rel_path) {
@@ -305,11 +330,28 @@ CBMLSPDef *cbm_pxc_collect_all_defs(CBMFileResult **cache, const cbm_file_info_t
                                   namespace_name, files[fi].language, &defs[idx]) == 0) {
                 idx++;
             }
+            if (cbm_arena_failed(&cache[fi]->arena)) {
+                char requested[32];
+                snprintf(requested, sizeof(requested), "%zu",
+                         cbm_arena_failure_bytes(&cache[fi]->arena));
+                cbm_log_error(
+                    "lsp_cross.defs_failed", "code", cbm_arena_failure_code(&cache[fi]->arena),
+                    "component", "lsp_cross.definitions", "operation",
+                    cbm_arena_failure_operation(&cache[fi]->arena), "file",
+                    files[fi].rel_path ? files[fi].rel_path : "<unknown>", "requested_bytes",
+                    requested, "message", "cross-LSP definition conversion allocation failed",
+                    "remediation", "free memory or reduce repository size, then retry");
+                free(defs);
+                *out_count = -1;
+                return NULL;
+            }
         }
     }
     *out_count = idx;
     return defs;
 }
+
+static void pxc_free_import_map(const char **keys, const char **vals, int count);
 
 /* Build per-file import map (local_name -> resolved module QN) from gbuf
  * IMPORTS edges. Mirrors build_import_map() in pass_parallel.c. Returns 0
@@ -323,8 +365,14 @@ static int pxc_build_import_map(const cbm_gbuf_t *gbuf, const char *project_name
     *out_count = 0;
 
     char *file_qn = cbm_pipeline_fqn_compute(project_name, rel_path, "__file__");
-    if (!file_qn)
-        return 0;
+    if (!file_qn) {
+        cbm_log_error("lsp_cross.import_map_failed", "code", "CBM_IMPORT_MAP_FQN_ALLOC_FAILED",
+                      "component", "lsp_cross.import_map", "operation", "file_fqn", "file",
+                      rel_path ? rel_path : "<unknown>", "message",
+                      "import map could not allocate its file identity", "remediation",
+                      "free memory or reduce repository size, then retry");
+        return -1;
+    }
     const cbm_gbuf_node_t *file_node = cbm_gbuf_find_by_qn(gbuf, file_qn);
     free(file_qn);
     if (!file_node)
@@ -334,7 +382,15 @@ static int pxc_build_import_map(const cbm_gbuf_t *gbuf, const char *project_name
     int edge_count = 0;
     int rc =
         cbm_gbuf_find_edges_by_source_type(gbuf, file_node->id, "IMPORTS", &edges, &edge_count);
-    if (rc != 0 || edge_count == 0)
+    if (rc != 0) {
+        cbm_log_error("lsp_cross.import_map_failed", "code", "CBM_IMPORT_MAP_QUERY_FAILED",
+                      "component", "lsp_cross.import_map", "operation", "query_edges", "file",
+                      rel_path ? rel_path : "<unknown>", "message",
+                      "import map could not query every IMPORTS edge", "remediation",
+                      "inspect the graph-buffer diagnostic and retry");
+        return -1;
+    }
+    if (edge_count == 0)
         return 0;
 
     const char **keys = (const char **)calloc((size_t)edge_count, sizeof(const char *));
@@ -342,7 +398,12 @@ static int pxc_build_import_map(const cbm_gbuf_t *gbuf, const char *project_name
     if (!keys || !vals) {
         free(keys);
         free(vals);
-        return 0;
+        cbm_log_error("lsp_cross.import_map_failed", "code", "CBM_IMPORT_MAP_ALLOC_FAILED",
+                      "component", "lsp_cross.import_map", "operation", "allocate_entries", "file",
+                      rel_path ? rel_path : "<unknown>", "message",
+                      "import map could not allocate every IMPORTS entry", "remediation",
+                      "free memory or reduce repository size, then retry");
+        return -1;
     }
     int count = 0;
     for (int i = 0; i < edge_count; i++) {
@@ -358,9 +419,25 @@ static int pxc_build_import_map(const cbm_gbuf_t *gbuf, const char *project_name
         if (!end || end <= start)
             continue;
         size_t n = (size_t)(end - start);
+        if (n == SIZE_MAX) {
+            pxc_free_import_map(keys, vals, count);
+            cbm_log_error("lsp_cross.import_map_failed", "code", "CBM_IMPORT_NAME_OVERFLOW",
+                          "component", "lsp_cross.import_map", "operation", "copy_local_name",
+                          "file", rel_path ? rel_path : "<unknown>", "message",
+                          "import local-name length exceeds the addressable allocation size",
+                          "remediation", "inspect the malformed IMPORTS edge and retry");
+            return -1;
+        }
         char *local = (char *)malloc(n + 1);
-        if (!local)
-            continue;
+        if (!local) {
+            pxc_free_import_map(keys, vals, count);
+            cbm_log_error("lsp_cross.import_map_failed", "code", "CBM_IMPORT_NAME_ALLOC_FAILED",
+                          "component", "lsp_cross.import_map", "operation", "copy_local_name",
+                          "file", rel_path ? rel_path : "<unknown>", "message",
+                          "import map could not retain an import local name", "remediation",
+                          "free memory or reduce repository size, then retry");
+            return -1;
+        }
         memcpy(local, start, n);
         local[n] = '\0';
         keys[count] = local;
@@ -432,21 +509,36 @@ bool cbm_pxc_has_cross_lsp(CBMLanguage lang) {
  * resolved very many cross-calls turned the whole append into O(n^2) and could
  * peg a core for minutes (observed: an index hung in pxc_append_results/strcmp).
  * The key strings live in a scratch arena that is destroyed after the table. */
-static void pxc_append_results(CBMArena *dst_arena, CBMResolvedCallArray *dst_calls,
+static bool pxc_append_results(CBMArena *dst_arena, CBMResolvedCallArray *dst_calls,
                                const CBMResolvedCallArray *src_out) {
     if (!dst_calls || !src_out)
-        return;
+        return false;
 
     CBMArena keys;
     cbm_arena_init(&keys);
     CBMHashTable *seen = cbm_ht_create((uint32_t)(dst_calls->count + src_out->count + 1));
+    if (!seen) {
+        cbm_log_error("lsp_cross.append_failed", "code", "CBM_LSP_DEDUP_ALLOC_FAILED", "component",
+                      "lsp_cross.resolved_call_dedup", "operation", "create", "key", "", "message",
+                      "resolved-call dedup index could not be allocated", "remediation",
+                      "free memory or reduce repository size, then retry");
+        cbm_arena_destroy(&keys);
+        return false;
+    }
 
     for (int i = 0; i < dst_calls->count; i++) {
         const CBMResolvedCall *rc = &dst_calls->items[i];
         if (rc->caller_qn && rc->callee_qn) {
             char *k = cbm_arena_sprintf(&keys, "%s\x1f%s", rc->caller_qn, rc->callee_qn);
-            if (k) {
-                cbm_ht_set(seen, k, (void *)1);
+            if (!k || !cbm_ht_set_checked(seen, k, (void *)1, NULL)) {
+                cbm_log_error("lsp_cross.append_failed", "code", "CBM_LSP_DEDUP_INSERT_FAILED",
+                              "component", "lsp_cross.resolved_call_dedup", "operation", "seed",
+                              "key", k ? k : "", "message",
+                              "resolved-call dedup index could not retain an entry", "remediation",
+                              "free memory or reduce repository size, then retry");
+                cbm_ht_free(seen);
+                cbm_arena_destroy(&keys);
+                return false;
             }
         }
     }
@@ -456,10 +548,26 @@ static void pxc_append_results(CBMArena *dst_arena, CBMResolvedCallArray *dst_ca
         if (!src->caller_qn || !src->callee_qn)
             continue;
         char *k = cbm_arena_sprintf(&keys, "%s\x1f%s", src->caller_qn, src->callee_qn);
+        if (!k) {
+            cbm_log_error("lsp_cross.append_failed", "code", "CBM_LSP_DEDUP_KEY_ALLOC_FAILED",
+                          "component", "lsp_cross.resolved_call_dedup", "operation", "key", "key",
+                          src->caller_qn, "message", "resolved-call key could not be allocated",
+                          "remediation", "free memory or reduce repository size, then retry");
+            cbm_ht_free(seen);
+            cbm_arena_destroy(&keys);
+            return false;
+        }
         if (k && cbm_ht_has(seen, k))
             continue;
-        if (k) {
-            cbm_ht_set(seen, k, (void *)1);
+        if (!cbm_ht_set_checked(seen, k, (void *)1, NULL)) {
+            cbm_log_error("lsp_cross.append_failed", "code", "CBM_LSP_DEDUP_INSERT_FAILED",
+                          "component", "lsp_cross.resolved_call_dedup", "operation", "insert",
+                          "key", k, "message",
+                          "resolved-call dedup index could not retain an entry", "remediation",
+                          "free memory or reduce repository size, then retry");
+            cbm_ht_free(seen);
+            cbm_arena_destroy(&keys);
+            return false;
         }
         CBMResolvedCall dst;
         memset(&dst, 0, sizeof(dst));
@@ -468,11 +576,22 @@ static void pxc_append_results(CBMArena *dst_arena, CBMResolvedCallArray *dst_ca
         dst.strategy = src->strategy ? cbm_arena_strdup(dst_arena, src->strategy) : NULL;
         dst.confidence = src->confidence;
         dst.reason = src->reason ? cbm_arena_strdup(dst_arena, src->reason) : NULL;
-        cbm_resolvedcall_push(dst_calls, dst_arena, dst);
+        if (!dst.caller_qn || !dst.callee_qn || (src->strategy && !dst.strategy) ||
+            (src->reason && !dst.reason) || !cbm_resolvedcall_push(dst_calls, dst_arena, dst)) {
+            cbm_log_error("lsp_cross.append_failed", "code", cbm_arena_failure_code(dst_arena),
+                          "component", "lsp_cross.resolved_calls", "operation",
+                          cbm_arena_failure_operation(dst_arena), "key", src->caller_qn, "message",
+                          "resolved-call clone allocation failed", "remediation",
+                          "free memory or reduce repository size, then retry");
+            cbm_ht_free(seen);
+            cbm_arena_destroy(&keys);
+            return false;
+        }
     }
 
     cbm_ht_free(seen);
     cbm_arena_destroy(&keys);
+    return true;
 }
 
 /* ── Rust workspace manifest (Cargo.toml) for cross-CRATE resolution ──
@@ -593,7 +712,12 @@ void cbm_pxc_run_one(CBMLanguage lang, CBMFileResult *r, const char *source, int
         break;
     }
 
-    pxc_append_results(&r->arena, &r->resolved_calls, &out);
+    if (!pxc_append_results(&r->arena, &r->resolved_calls, &out)) {
+        r->has_error = true;
+        r->error_msg = cbm_arena_strdup(
+            &r->arena, "[CBM_LSP_RESULT_APPEND_FAILED] resolved-call results could not be "
+                       "retained; remediation: free memory or reduce repository size, then retry");
+    }
     cbm_arena_destroy(&scratch);
 }
 
@@ -611,7 +735,12 @@ void cbm_pxc_run_one_ts(CBMFileResult *r, const char *source, int source_len, co
     cbm_run_ts_lsp_cross(&scratch, source, source_len, module_qn, js_mode, jsx_mode, dts_mode, defs,
                          def_count, imp_names, imp_qns, imp_count, r->cached_tree, &out);
 
-    pxc_append_results(&r->arena, &r->resolved_calls, &out);
+    if (!pxc_append_results(&r->arena, &r->resolved_calls, &out)) {
+        r->has_error = true;
+        r->error_msg = cbm_arena_strdup(
+            &r->arena, "[CBM_LSP_RESULT_APPEND_FAILED] resolved-call results could not be "
+                       "retained; remediation: free memory or reduce repository size, then retry");
+    }
     cbm_arena_destroy(&scratch);
 }
 
@@ -764,10 +893,10 @@ void cbm_pxc_dispatch_file(CBMLanguage lang, CBMFileResult *result, const char *
 
 static bool pxc_build_rust_manifest(const cbm_pipeline_ctx_t *ctx, CBMArena *marena,
                                     CBMCargoManifest *out_m) {
-    if (!ctx || !ctx->repo_path || !marena || !out_m)
+    if (!ctx || !ctx->source_root || !marena || !out_m)
         return false;
     char path[1024];
-    int n = snprintf(path, sizeof(path), "%s/Cargo.toml", ctx->repo_path);
+    int n = snprintf(path, sizeof(path), "%s/Cargo.toml", ctx->source_root);
     if (n <= 0 || (size_t)n >= sizeof(path))
         return false;
     int toml_len = 0;
@@ -789,6 +918,11 @@ int cbm_pipeline_pass_lsp_cross(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *
 
     cbm_log_info("pass.start", "pass", "lsp_cross", "files", itoa_buf(file_count));
 
+    int status = 0;
+    char **def_modules = NULL;
+    CBMLSPDef *all_defs = NULL;
+    CBMModuleDefIndex *module_def_index = NULL;
+
     /* Build the Rust workspace manifest once (only when the project has at
      * least one Rust file, to avoid an unconditional Cargo.toml read).
      * The manifest's strings live in `cargo_arena`; the resolver borrows
@@ -806,20 +940,39 @@ int cbm_pipeline_pass_lsp_cross(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *
     if (have_rust) {
         cbm_arena_init(&cargo_arena);
         have_manifest = pxc_build_rust_manifest(ctx, &cargo_arena, &cargo_manifest);
+        if (cbm_arena_failed(&cargo_arena)) {
+            char requested[32];
+            snprintf(requested, sizeof(requested), "%zu", cbm_arena_failure_bytes(&cargo_arena));
+            cbm_log_error("pass.err", "code", cbm_arena_failure_code(&cargo_arena), "pass",
+                          "lsp_cross", "component", "lsp_cross.cargo_manifest", "operation",
+                          cbm_arena_failure_operation(&cargo_arena), "requested_bytes", requested,
+                          "message", "cross-LSP Cargo manifest allocation failed", "remediation",
+                          "free memory or reduce repository size, then retry");
+            status = -1;
+            goto cleanup;
+        }
         cbm_pxc_set_rust_manifest(have_manifest ? &cargo_manifest : NULL);
     }
 
     /* Per-file module QN cache so we don't recompute it once per def + once
      * per call. cbm_pipeline_fqn_module mallocs; freed at end. */
-    char **def_modules = (char **)calloc((size_t)file_count, sizeof(char *));
+    def_modules = (char **)calloc((size_t)file_count, sizeof(char *));
     if (!def_modules) {
-        cbm_log_error("pass.err", "pass", "lsp_cross", "phase", "alloc");
-        return 0;
+        cbm_log_error("pass.err", "code", "CBM_LSP_MODULE_CACHE_ALLOC_FAILED", "pass", "lsp_cross",
+                      "component", "lsp_cross.module_cache", "operation", "allocate_entries",
+                      "message", "cross-LSP module cache allocation failed", "remediation",
+                      "free memory or reduce repository size, then retry");
+        status = -1;
+        goto cleanup;
     }
 
     int def_count = 0;
-    CBMLSPDef *all_defs = cbm_pxc_collect_all_defs(cache, files, file_count, ctx->project_name,
-                                                   def_modules, &def_count);
+    all_defs = cbm_pxc_collect_all_defs(cache, files, file_count, ctx->project_name, def_modules,
+                                        &def_count);
+    if (def_count < 0) {
+        status = -1;
+        goto cleanup;
+    }
 
     /* Shared prepare (mirrors run_parallel_pipeline): inverted module-def
      * index + per-language shared registries, built ONCE for the whole pass.
@@ -831,8 +984,11 @@ int cbm_pipeline_pass_lsp_cross(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *
      * strings that the later calls pass still reads, so the arena must
      * outlive this pass (run_sequential_pipeline destroys it after all
      * passes; freeing here was a pass_calls use-after-free). */
-    CBMModuleDefIndex *module_def_index =
-        all_defs ? cbm_pxc_build_module_def_index(all_defs, def_count) : NULL;
+    module_def_index = all_defs ? cbm_pxc_build_module_def_index(all_defs, def_count) : NULL;
+    if (all_defs && def_count > 0 && !module_def_index) {
+        status = -1;
+        goto cleanup;
+    }
     CBMCrossLspRegistries cross_registries = {0};
     if (all_defs) {
         CBMArena *xa = &ctx->seq_cross_arena;
@@ -845,6 +1001,17 @@ int cbm_pipeline_pass_lsp_cross(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *
         cross_registries.c = cbm_c_build_cross_registry(xa, all_defs, def_count);
         cross_registries.cs = cbm_cs_build_cross_registry(xa, all_defs, def_count);
         cross_registries.ts = cbm_ts_build_cross_registry(xa, all_defs, def_count);
+        if (cbm_arena_failed(xa)) {
+            char requested[32];
+            snprintf(requested, sizeof(requested), "%zu", cbm_arena_failure_bytes(xa));
+            cbm_log_error("pass.err", "code", cbm_arena_failure_code(xa), "pass", "lsp_cross",
+                          "component", "lsp_cross.shared_registries", "operation",
+                          cbm_arena_failure_operation(xa), "requested_bytes", requested, "message",
+                          "cross-LSP shared registry allocation failed", "remediation",
+                          "free memory or reduce repository size, then retry");
+            status = -1;
+            goto cleanup;
+        }
     }
 
     int processed = 0;
@@ -872,22 +1039,47 @@ int cbm_pipeline_pass_lsp_cross(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *
         if (!def_modules[i]) {
             def_modules[i] = cbm_pipeline_fqn_module_dir(ctx->project_name, files[i].rel_path,
                                                          pxc_module_is_dir(files[i].language));
+            if (!def_modules[i]) {
+                cbm_log_error("pass.err", "code", "CBM_LSP_MODULE_FQN_ALLOC_FAILED", "pass",
+                              "lsp_cross", "component", "lsp_cross.module_cache", "operation",
+                              "module_fqn", "file",
+                              files[i].rel_path ? files[i].rel_path : "<unknown>", "message",
+                              "cross-LSP could not retain a module identity", "remediation",
+                              "free memory or reduce repository size, then retry");
+                free(source);
+                status = -1;
+                goto cleanup;
+            }
         }
 
         const char **imp_keys = NULL;
         const char **imp_vals = NULL;
         int imp_count = 0;
-        pxc_build_import_map(ctx->gbuf, ctx->project_name, files[i].rel_path, &imp_keys, &imp_vals,
-                             &imp_count);
+        if (pxc_build_import_map(ctx->gbuf, ctx->project_name, files[i].rel_path, &imp_keys,
+                                 &imp_vals, &imp_count) != 0) {
+            free(source);
+            status = -1;
+            goto cleanup;
+        }
 
-        /* Journal around the resolve: a hang here must be attributed to THIS
-         * file, not to a stale extraction marker (the innocent-quarantine
-         * failure mode). */
-        cbm_index_mark_start(files[i].rel_path);
         cbm_pxc_dispatch_file(lang, cache[i], source, source_len, files[i].rel_path, def_modules[i],
                               &cross_registries, module_def_index, all_defs, def_count, imp_keys,
                               imp_vals, imp_count, NULL, NULL);
-        cbm_index_mark_done(files[i].rel_path);
+        if (cbm_arena_failed(&cache[i]->arena)) {
+            char requested[32];
+            snprintf(requested, sizeof(requested), "%zu",
+                     cbm_arena_failure_bytes(&cache[i]->arena));
+            cbm_log_error("pass.err", "code", cbm_arena_failure_code(&cache[i]->arena), "pass",
+                          "lsp_cross", "component", "lsp_cross.file_resolution", "operation",
+                          cbm_arena_failure_operation(&cache[i]->arena), "file",
+                          files[i].rel_path ? files[i].rel_path : "<unknown>", "requested_bytes",
+                          requested, "message", "cross-LSP file resolution allocation failed",
+                          "remediation", "free memory or reduce repository size, then retry");
+            pxc_free_import_map(imp_keys, imp_vals, imp_count);
+            free(source);
+            status = -1;
+            goto cleanup;
+        }
         per_lang_calls++;
         processed++;
 
@@ -895,10 +1087,13 @@ int cbm_pipeline_pass_lsp_cross(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *
         free(source);
     }
 
+cleanup:
     cbm_pxc_free_module_def_index(module_def_index);
     free(all_defs);
-    for (int i = 0; i < file_count; i++)
-        free(def_modules[i]);
+    if (def_modules) {
+        for (int i = 0; i < file_count; i++)
+            free(def_modules[i]);
+    }
     free(def_modules);
 
     /* Drop the borrowed manifest pointer before its arena dies, so a later
@@ -909,11 +1104,13 @@ int cbm_pipeline_pass_lsp_cross(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *
     }
     (void)have_manifest;
 
-    cbm_log_info("pass.done", "pass", "lsp_cross", "files_processed", itoa_buf(processed),
-                 "files_skipped_no_lsp", itoa_buf(skipped_no_lsp), "files_skipped_no_source",
-                 itoa_buf(skipped_no_source), "defs_total", itoa_buf(def_count), "lsp_calls",
-                 itoa_buf(per_lang_calls));
-    return 0;
+    if (status == 0) {
+        cbm_log_info("pass.done", "pass", "lsp_cross", "files_processed", itoa_buf(processed),
+                     "files_skipped_no_lsp", itoa_buf(skipped_no_lsp), "files_skipped_no_source",
+                     itoa_buf(skipped_no_source), "defs_total", itoa_buf(def_count), "lsp_calls",
+                     itoa_buf(per_lang_calls));
+    }
+    return status;
 }
 
 /* ── Per-module def index (gopls "package summary" pattern) ──── */
@@ -958,24 +1155,39 @@ static pxc_module_entry_t *pxc_module_entry_get_or_create(CBMHashTable *ht, cons
         free(e);
         return NULL;
     }
-    cbm_ht_set(ht, key, e);
+    if (!cbm_ht_set_checked(ht, key, e, NULL)) {
+        cbm_log_error("lsp_cross.module_index_failed", "code", "CBM_MODULE_DEF_INDEX_INSERT_FAILED",
+                      "component", "lsp_cross.module_def_index", "operation", "insert", "key", key,
+                      "message", "module definition index could not retain an entry", "remediation",
+                      "free memory or reduce repository size, then retry");
+        free(e->indices);
+        free(e);
+        return NULL;
+    }
     return e;
 }
 
-static void pxc_module_entry_add_index(pxc_module_entry_t *e, int index) {
-    if (!e) {
-        return;
+static bool pxc_module_entry_add_index(pxc_module_entry_t *e, int index) {
+    if (!e || e->count < 0 || e->cap <= 0 || e->count > e->cap) {
+        return false;
     }
     if (e->count >= e->cap) {
+        if (e->cap > INT_MAX / 2) {
+            return false;
+        }
         int new_cap = e->cap * 2;
+        if ((size_t)new_cap > SIZE_MAX / sizeof(*e->indices)) {
+            return false;
+        }
         int *new_indices = (int *)realloc(e->indices, (size_t)new_cap * sizeof(*new_indices));
         if (!new_indices) {
-            return;
+            return false;
         }
         e->indices = new_indices;
         e->cap = new_cap;
     }
     e->indices[e->count++] = index;
+    return true;
 }
 
 static bool pxc_is_jvm_lang(CBMLanguage lang);
@@ -1031,6 +1243,10 @@ CBMModuleDefIndex *cbm_pxc_build_module_def_index(CBMLSPDef *all_defs, int def_c
     CBMHashTable *ht = cbm_ht_create(64);
     CBMHashTable *namespace_ht = cbm_ht_create(64);
     if (!ht || !namespace_ht) {
+        cbm_log_error("lsp_cross.module_index_failed", "code", "CBM_MODULE_DEF_INDEX_CREATE_FAILED",
+                      "component", "lsp_cross.module_def_index", "operation", "create", "key", "",
+                      "message", "module definition index allocation failed", "remediation",
+                      "free memory or reduce repository size, then retry");
         cbm_ht_free(ht);
         cbm_ht_free(namespace_ht);
         return NULL;
@@ -1040,14 +1256,24 @@ CBMModuleDefIndex *cbm_pxc_build_module_def_index(CBMLSPDef *all_defs, int def_c
      * JVM mixed roots (`src/main/java` + `src/main/kotlin`) share the
      * declared package, not the path-derived module prefix. */
     for (int i = 0; i < def_count; i++) {
-        pxc_module_entry_add_index(pxc_module_entry_get_or_create(ht, all_defs[i].def_module_qn),
-                                   i);
-        pxc_module_entry_add_index(
-            pxc_module_entry_get_or_create(namespace_ht, all_defs[i].namespace_name), i);
+        if (all_defs[i].def_module_qn && all_defs[i].def_module_qn[0] &&
+            !pxc_module_entry_add_index(
+                pxc_module_entry_get_or_create(ht, all_defs[i].def_module_qn), i)) {
+            goto fail;
+        }
+        if (all_defs[i].namespace_name && all_defs[i].namespace_name[0] &&
+            !pxc_module_entry_add_index(
+                pxc_module_entry_get_or_create(namespace_ht, all_defs[i].namespace_name), i)) {
+            goto fail;
+        }
     }
 
     CBMModuleDefIndex *idx = (CBMModuleDefIndex *)calloc(1, sizeof(*idx));
     if (!idx) {
+        cbm_log_error("lsp_cross.module_index_failed", "code", "CBM_MODULE_DEF_INDEX_ALLOC_FAILED",
+                      "component", "lsp_cross.module_def_index", "operation", "allocate_result",
+                      "key", "", "message", "module definition index result allocation failed",
+                      "remediation", "free memory or reduce repository size, then retry");
         cbm_ht_foreach(ht, pxc_module_entry_free_cb, NULL);
         cbm_ht_free(ht);
         cbm_ht_foreach(namespace_ht, pxc_module_entry_free_cb, NULL);
@@ -1058,6 +1284,17 @@ CBMModuleDefIndex *cbm_pxc_build_module_def_index(CBMLSPDef *all_defs, int def_c
     idx->namespace_ht = namespace_ht;
     idx->def_count = def_count;
     return idx;
+
+fail:
+    cbm_log_error("lsp_cross.module_index_failed", "code", "CBM_MODULE_DEF_INDEX_GROW_FAILED",
+                  "component", "lsp_cross.module_def_index", "operation", "append", "key", "",
+                  "message", "module definition index could not retain every definition",
+                  "remediation", "free memory or reduce repository size, then retry");
+    cbm_ht_foreach(ht, pxc_module_entry_free_cb, NULL);
+    cbm_ht_free(ht);
+    cbm_ht_foreach(namespace_ht, pxc_module_entry_free_cb, NULL);
+    cbm_ht_free(namespace_ht);
+    return NULL;
 }
 
 void cbm_pxc_free_module_def_index(CBMModuleDefIndex *idx) {

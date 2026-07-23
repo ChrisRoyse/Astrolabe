@@ -11,6 +11,7 @@
  *   2. Method suffix → determines HTTP method (get→GET, post→POST)
  */
 #include "service_patterns.h"
+#include "foundation/log.h"
 
 #include <stdbool.h>
 #include <stddef.h>
@@ -750,6 +751,7 @@ bool cbm_service_pattern_is_http_route_literal(const char *literal, const char *
 #include "foundation/compat.h"
 
 static CBM_TLS CBMHashTable *_svc_cache = NULL;
+static CBM_TLS bool _svc_cache_failed = false;
 /* Encode the enum + 1 in the pointer so 0/NULL means "miss". */
 static inline void *svc_enum_to_ptr(cbm_svc_kind_t k) {
     return (void *)(uintptr_t)((unsigned)k + 1u);
@@ -764,10 +766,20 @@ static void svc_cache_free_key(const char *key, void *val, void *ud) {
     free((char *)key);
 }
 
-void cbm_service_pattern_cache_begin(void) {
+bool cbm_service_pattern_cache_begin(void) {
+    _svc_cache_failed = false;
     if (_svc_cache)
-        return; /* idempotent */
+        return true; /* idempotent */
     _svc_cache = cbm_ht_create(8192);
+    if (!_svc_cache) {
+        _svc_cache_failed = true;
+        cbm_log_error("service_pattern.cache_failed", "code", "CBM_SERVICE_CACHE_ALLOC_FAILED",
+                      "component", "service_pattern.cache", "operation", "create", "key", "",
+                      "message", "service-pattern cache could not be allocated", "remediation",
+                      "free memory or reduce repository size, then retry");
+        return false;
+    }
+    return true;
 }
 
 void cbm_service_pattern_cache_end(void) {
@@ -816,10 +828,20 @@ cbm_svc_kind_t cbm_service_pattern_match(const char *resolved_qn) {
 
     if (_svc_cache) {
         char *kdup = strdup(resolved_qn);
-        if (kdup)
-            cbm_ht_set(_svc_cache, kdup, svc_enum_to_ptr(result));
+        if (!kdup || !cbm_ht_set_checked(_svc_cache, kdup, svc_enum_to_ptr(result), NULL)) {
+            free(kdup);
+            _svc_cache_failed = true;
+            cbm_log_error("service_pattern.cache_failed", "code", "CBM_SERVICE_CACHE_INSERT_FAILED",
+                          "component", "service_pattern.cache", "operation", "insert", "key",
+                          resolved_qn, "message", "service-pattern cache could not retain an entry",
+                          "remediation", "free memory or reduce repository size, then retry");
+        }
     }
     return result;
+}
+
+bool cbm_service_pattern_cache_failed(void) {
+    return _svc_cache_failed;
 }
 
 const char *cbm_service_pattern_http_method(const char *callee_name) {

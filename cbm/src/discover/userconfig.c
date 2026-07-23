@@ -6,8 +6,8 @@
  *            (falls back to ~/.config/codebase-memory-mcp/config.json)
  *   Project: {repo_root}/.codebase-memory.json
  *
- * Project config wins over global. Unknown language values warn and are
- * skipped (fail-open). Missing files are silently ignored.
+ * Project config wins over global. Missing files are optional; present
+ * invalid/unreadable inputs fail closed.
  */
 #include "discover/userconfig.h"
 #include "cbm.h" /* CBMLanguage, CBM_LANG_* */
@@ -15,12 +15,13 @@
 #include "foundation/platform.h" /* cbm_safe_getenv */
 #include "foundation/compat_fs.h"
 
-enum { MAX_CONFIG_SIZE = 65536 };
 #include "foundation/log.h"
 
 #include <yyjson/yyjson.h>
 
 #include <ctype.h>
+#include <errno.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -168,8 +169,10 @@ static CBMLanguage lang_from_string(const char *s) {
 static int parse_extra_extensions(yyjson_val *root, cbm_userext_t **entries, int *count,
                                   const char *source_label) {
     if (!yyjson_is_obj(root)) {
-        cbm_log_warn("userconfig.bad_root", "file", source_label);
-        return 0;
+        cbm_log_error("userconfig.failed", "code", "CBM_USERCONFIG_ROOT_INVALID", "path",
+                      source_label, "message", "the configuration root is not a JSON object",
+                      "remediation", "provide a JSON object and retry indexing");
+        return CBM_NOT_FOUND;
     }
 
     yyjson_val *extra = yyjson_obj_get(root, "extra_extensions");
@@ -177,10 +180,13 @@ static int parse_extra_extensions(yyjson_val *root, cbm_userext_t **entries, int
         return 0; /* key absent — fine */
     }
     if (!yyjson_is_obj(extra)) {
-        cbm_log_warn("userconfig.bad_extra_extensions", "file", source_label);
-        return 0;
+        cbm_log_error("userconfig.failed", "code", "CBM_USERCONFIG_EXTENSIONS_INVALID", "path",
+                      source_label, "message", "extra_extensions is not a JSON object",
+                      "remediation", "map extension keys to language names and retry indexing");
+        return CBM_NOT_FOUND;
     }
 
+    int source_start = *count;
     yyjson_obj_iter iter;
     yyjson_obj_iter_init(extra, &iter);
     yyjson_val *key;
@@ -191,23 +197,52 @@ static int parse_extra_extensions(yyjson_val *root, cbm_userext_t **entries, int
         const char *lang_str = yyjson_get_str(val);
 
         if (!ext_str || !lang_str) {
-            cbm_log_warn("userconfig.skip_non_string", "file", source_label);
-            continue;
+            cbm_log_error("userconfig.failed", "code", "CBM_USERCONFIG_ENTRY_INVALID", "path",
+                          source_label, "message",
+                          "an extension mapping does not contain string key and value data",
+                          "remediation", "map each extension string to a language string");
+            return CBM_NOT_FOUND;
         }
 
         /* Extension must start with '.' */
-        if (ext_str[0] != '.') {
-            cbm_log_warn("userconfig.skip_bad_ext", "file", source_label, "ext", ext_str);
-            continue;
+        size_t ext_len = strlen(ext_str);
+        bool ext_valid = ext_len > SKIP_ONE && ext_str[0] == '.';
+        for (size_t i = SKIP_ONE; ext_valid && i < ext_len; i++) {
+            if (ext_str[i] == '/' || ext_str[i] == '\\' || isspace((unsigned char)ext_str[i])) {
+                ext_valid = false;
+            }
+        }
+        if (!ext_valid) {
+            cbm_log_error("userconfig.failed", "code", "CBM_USERCONFIG_EXTENSION_INVALID", "path",
+                          source_label, "extension", ext_str, "message",
+                          "a configured extension is not a valid explicit suffix", "remediation",
+                          "correct the extension key and retry indexing");
+            return CBM_NOT_FOUND;
         }
 
         CBMLanguage lang = lang_from_string(lang_str);
         if (lang == CBM_LANG_COUNT) {
-            cbm_log_warn("userconfig.unknown_lang", "file", source_label, "lang", lang_str);
-            continue; /* fail-open: skip unknown languages */
+            cbm_log_error("userconfig.failed", "code", "CBM_USERCONFIG_LANGUAGE_UNKNOWN", "path",
+                          source_label, "language", lang_str, "message",
+                          "a configured extension names an unsupported language", "remediation",
+                          "use a registered language name and retry indexing");
+            return CBM_NOT_FOUND;
+        }
+
+        for (int i = source_start; i < *count; i++) {
+            if (strcmp((*entries)[i].ext, ext_str) == 0) {
+                cbm_log_error("userconfig.failed", "code", "CBM_USERCONFIG_EXTENSION_DUPLICATE",
+                              "path", source_label, "extension", ext_str, "message",
+                              "the configuration defines one extension more than once",
+                              "remediation", "retain exactly one mapping for the extension");
+                return CBM_NOT_FOUND;
+            }
         }
 
         /* Grow the array */
+        if (*count == INT_MAX) {
+            return CBM_NOT_FOUND;
+        }
         cbm_userext_t *tmp = realloc(*entries, (size_t)(*count + SKIP_ONE) * sizeof(cbm_userext_t));
         if (!tmp) {
             return CBM_NOT_FOUND;
@@ -228,31 +263,42 @@ static int parse_extra_extensions(yyjson_val *root, cbm_userext_t **entries, int
 
 /*
  * Read a JSON file and parse extra_extensions from it.
- * Silently ignores missing files. Logs warnings for corrupt JSON.
- * Returns 0 on success (or absent file), -1 on alloc failure.
+ * Missing files are optional. Present files are complete-or-error.
  */
 static int load_config_file(const char *path, cbm_userext_t **entries, int *count) {
     FILE *f = cbm_fopen(path, "rb");
     if (!f) {
-        return 0; /* file absent — silently ignore */
+        if (errno == ENOENT || errno == ENOTDIR) {
+            return 0;
+        }
+        cbm_log_error("userconfig.failed", "code", "CBM_USERCONFIG_OPEN_FAILED", "path", path,
+                      "message", "a present configuration file could not be opened", "remediation",
+                      "restore file access and retry indexing");
+        return CBM_NOT_FOUND;
     }
 
     if (fseek(f, 0, SEEK_END) != 0) {
         (void)fclose(f);
-        return 0;
+        cbm_log_error("userconfig.failed", "code", "CBM_USERCONFIG_SEEK_FAILED", "path", path,
+                      "message", "the configuration length could not be measured", "remediation",
+                      "stabilize the file and retry indexing");
+        return CBM_NOT_FOUND;
     }
     long len = ftell(f);
     if (fseek(f, 0, SEEK_SET) != 0) {
         (void)fclose(f);
-        return 0;
+        cbm_log_error("userconfig.failed", "code", "CBM_USERCONFIG_SEEK_FAILED", "path", path,
+                      "message", "the configuration stream could not be rewound", "remediation",
+                      "stabilize the file and retry indexing");
+        return CBM_NOT_FOUND;
     }
 
-    if (len <= 0 || len > MAX_CONFIG_SIZE) {
+    if (len <= 0) {
         (void)fclose(f);
-        if (len > MAX_CONFIG_SIZE) {
-            cbm_log_warn("userconfig.file_too_large", "path", path);
-        }
-        return 0;
+        cbm_log_error("userconfig.failed", "code", "CBM_USERCONFIG_SIZE_INVALID", "path", path,
+                      "message", "the configuration is empty", "remediation",
+                      "provide a non-empty JSON configuration");
+        return CBM_NOT_FOUND;
     }
 
     char *buf = malloc((size_t)len + SKIP_ONE);
@@ -262,9 +308,16 @@ static int load_config_file(const char *path, cbm_userext_t **entries, int *coun
     }
 
     size_t nread = fread(buf, SKIP_ONE, (size_t)len, f);
-    (void)fclose(f);
-    if (nread > (size_t)len) {
-        nread = (size_t)len;
+    bool read_ok = nread == (size_t)len && ferror(f) == 0;
+    if (fclose(f) != 0) {
+        read_ok = false;
+    }
+    if (!read_ok) {
+        free(buf);
+        cbm_log_error("userconfig.failed", "code", "CBM_USERCONFIG_READ_FAILED", "path", path,
+                      "message", "the complete configuration bytes could not be read",
+                      "remediation", "stabilize the file and retry indexing");
+        return CBM_NOT_FOUND;
     }
     buf[nread] = '\0';
 
@@ -272,8 +325,10 @@ static int load_config_file(const char *path, cbm_userext_t **entries, int *coun
     free(buf);
 
     if (!doc) {
-        cbm_log_warn("userconfig.corrupt_json", "path", path);
-        return 0; /* corrupt JSON — silently ignore (fail-open) */
+        cbm_log_error("userconfig.failed", "code", "CBM_USERCONFIG_JSON_INVALID", "path", path,
+                      "message", "the configuration is not valid JSON", "remediation",
+                      "correct the JSON and retry indexing");
+        return CBM_NOT_FOUND;
     }
 
     yyjson_val *root = yyjson_doc_get_root(doc);
@@ -284,21 +339,36 @@ static int load_config_file(const char *path, cbm_userext_t **entries, int *coun
 
 /* ── Public API ──────────────────────────────────────────────────── */
 
-cbm_userconfig_t *cbm_userconfig_load(const char *repo_path) {
+int cbm_userconfig_load_checked(const char *repo_path, cbm_userconfig_t **out) {
+    if (!out) {
+        return CBM_NOT_FOUND;
+    }
+    *out = NULL;
     cbm_userconfig_t *cfg = calloc(CBM_ALLOC_ONE, sizeof(cbm_userconfig_t));
     if (!cfg) {
-        return NULL;
+        return CBM_NOT_FOUND;
     }
 
     cbm_userext_t *entries = NULL;
     int count = 0;
 
     /* ── Step 1: Load global config ── */
-    enum { PATH_BUF_SZ = 1280 };
     const char *cfg_base = cbm_app_config_dir();
-    const char *cfg_fallback = cfg_base ? cfg_base : "/tmp";
-    char global_path[PATH_BUF_SZ];
-    snprintf(global_path, sizeof(global_path), "%s/codebase-memory-mcp/config.json", cfg_fallback);
+    if (!cfg_base) {
+        free(cfg);
+        cbm_log_error("userconfig.failed", "code", "CBM_USERCONFIG_BASE_UNAVAILABLE", "message",
+                      "the application configuration root could not be resolved", "remediation",
+                      "restore the native user configuration environment and retry");
+        return CBM_NOT_FOUND;
+    }
+    const char global_suffix[] = "/codebase-memory-mcp/config.json";
+    size_t global_size = strlen(cfg_base) + sizeof(global_suffix);
+    char *global_path = malloc(global_size);
+    if (!global_path) {
+        free(cfg);
+        return CBM_NOT_FOUND;
+    }
+    snprintf(global_path, global_size, "%s%s", cfg_base, global_suffix);
 
     if (load_config_file(global_path, &entries, &count) != 0) {
         for (int i = 0; i < count; i++) {
@@ -306,15 +376,27 @@ cbm_userconfig_t *cbm_userconfig_load(const char *repo_path) {
         }
         free(entries);
         free(cfg);
-        return NULL;
+        free(global_path);
+        return CBM_NOT_FOUND;
     }
+    free(global_path);
 
     int global_count = count; /* entries[0..global_count) are from global */
 
     /* ── Step 2: Load project config ── */
     if (repo_path && repo_path[0]) {
-        char project_path[PATH_BUF_SZ];
-        snprintf(project_path, sizeof(project_path), "%s/.codebase-memory.json", repo_path);
+        const char project_suffix[] = "/.codebase-memory.json";
+        size_t project_size = strlen(repo_path) + sizeof(project_suffix);
+        char *project_path = malloc(project_size);
+        if (!project_path) {
+            for (int i = 0; i < count; i++) {
+                free(entries[i].ext);
+            }
+            free(entries);
+            free(cfg);
+            return CBM_NOT_FOUND;
+        }
+        snprintf(project_path, project_size, "%s%s", repo_path, project_suffix);
 
         if (load_config_file(project_path, &entries, &count) != 0) {
             /* Free already-allocated entries */
@@ -323,8 +405,10 @@ cbm_userconfig_t *cbm_userconfig_load(const char *repo_path) {
             }
             free(entries);
             free(cfg);
-            return NULL;
+            free(project_path);
+            return CBM_NOT_FOUND;
         }
+        free(project_path);
     }
 
     /*
@@ -361,7 +445,31 @@ cbm_userconfig_t *cbm_userconfig_load(const char *repo_path) {
 
     cfg->entries = entries;
     cfg->count = count;
-    return cfg;
+    *out = cfg;
+    return 0;
+}
+
+bool cbm_userconfig_equal(const cbm_userconfig_t *left, const cbm_userconfig_t *right) {
+    if (left == right) {
+        return true;
+    }
+    if (!left || !right || left->count != right->count) {
+        return false;
+    }
+    for (int i = 0; i < left->count; i++) {
+        bool found = false;
+        for (int j = 0; j < right->count; j++) {
+            if (strcmp(left->entries[i].ext, right->entries[j].ext) == 0 &&
+                left->entries[i].lang == right->entries[j].lang) {
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            return false;
+        }
+    }
+    return true;
 }
 
 CBMLanguage cbm_userconfig_lookup(const cbm_userconfig_t *cfg, const char *ext) {

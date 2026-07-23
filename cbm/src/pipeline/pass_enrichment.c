@@ -14,6 +14,7 @@ enum { ENRICH_ATTR_SKIP = 2, ENRICH_MAX_CAMEL = 16 };
 #include "graph_buffer/graph_buffer.h"
 #include "foundation/log.h"
 #include "foundation/hash_table.h"
+#include "foundation/dyn_array.h"
 #include "foundation/platform.h"
 #include "foundation/compat.h"
 #include "yyjson/yyjson.h"
@@ -212,13 +213,45 @@ static int extract_decorator_words(const char *json, char ***out_words) {
     char *all_words[CBM_SZ_256];
     int total = 0;
     CBMHashTable *seen = cbm_ht_create(CBM_SZ_32);
+    if (!seen) {
+        for (int i = 0; decorators[i]; i++) {
+            free(decorators[i]);
+        }
+        free(decorators);
+        cbm_log_error("decorator_tags.index_failed", "code", "CBM_DECORATOR_SEEN_ALLOC_FAILED",
+                      "component", "decorator_tags.seen", "operation", "create", "key", "",
+                      "message", "decorator token set could not be allocated", "remediation",
+                      "free memory or reduce repository size, then retry");
+        *out_words = NULL;
+        return CBM_NOT_FOUND;
+    }
 
     for (int i = 0; decorators[i]; i++) {
         char *tokens[CBM_SZ_32];
         int tc = cbm_tokenize_decorator(decorators[i], tokens, CBM_SZ_32);
         for (int j = 0; j < tc; j++) {
             if (!cbm_ht_get(seen, tokens[j]) && total < CBM_SZ_256) {
-                cbm_ht_set(seen, tokens[j], intptr_to_ptr(SKIP_ONE));
+                if (!cbm_ht_set_checked(seen, tokens[j], intptr_to_ptr(SKIP_ONE), NULL)) {
+                    cbm_log_error(
+                        "decorator_tags.index_failed", "code", "CBM_DECORATOR_SEEN_INSERT_FAILED",
+                        "component", "decorator_tags.seen", "operation", "insert", "key", tokens[j],
+                        "message", "decorator token set could not retain an entry", "remediation",
+                        "free memory or reduce repository size, then retry");
+                    for (int k = j; k < tc; k++) {
+                        free(tokens[k]);
+                    }
+                    for (int k = 0; k < total; k++) {
+                        free(all_words[k]);
+                    }
+                    free(decorators[i]);
+                    for (int k = i + 1; decorators[k]; k++) {
+                        free(decorators[k]);
+                    }
+                    free(decorators);
+                    cbm_ht_free(seen);
+                    *out_words = NULL;
+                    return CBM_NOT_FOUND;
+                }
                 all_words[total++] = tokens[j];
             } else {
                 free(tokens[j]);
@@ -235,6 +268,16 @@ static int extract_decorator_words(const char *json, char ***out_words) {
     }
 
     *out_words = malloc(sizeof(char *) * total);
+    if (!*out_words) {
+        for (int i = 0; i < total; i++) {
+            free(all_words[i]);
+        }
+        cbm_log_error("decorator_tags.index_failed", "code", "CBM_DECORATOR_WORDS_ALLOC_FAILED",
+                      "component", "decorator_tags.words", "operation", "output_alloc", "key", "",
+                      "message", "decorator word output could not be allocated", "remediation",
+                      "free memory or reduce repository size, then retry");
+        return CBM_NOT_FOUND;
+    }
     memcpy(*out_words, all_words, sizeof(char *) * total);
     return total;
 }
@@ -310,12 +353,28 @@ static int collect_decorated_nodes(cbm_gbuf_t *gbuf, tagged_node_t **out_nodes,
         for (int i = 0; i < fc; i++) {
             char **words = NULL;
             int wc = extract_decorator_words(found[i]->properties_json, &words);
+            if (wc < 0) {
+                free_tagged_nodes(nodes, node_count);
+                *out_nodes = NULL;
+                return CBM_NOT_FOUND;
+            }
             if (wc <= 0) {
                 continue;
             }
-            if (node_count >= node_cap) {
-                node_cap = node_cap ? node_cap * PAIR_LEN : CBM_SZ_64;
-                nodes = safe_realloc(nodes, sizeof(tagged_node_t) * node_cap);
+            if (!cbm_da_ensure_capacity((void **)&nodes, &node_cap, node_count + 1,
+                                        sizeof(*nodes))) {
+                cbm_log_error("decorator_tags.collect", "code",
+                              "CBM_DECORATOR_NODE_ALLOCATION_FAILED", "message",
+                              "decorated-node result allocation failed", "remediation",
+                              "free memory or reduce repository size, then retry; no partial tags "
+                              "were applied");
+                for (int w = 0; w < wc; w++) {
+                    free(words[w]);
+                }
+                free(words);
+                free_tagged_nodes(nodes, node_count);
+                *out_nodes = NULL;
+                return CBM_NOT_FOUND;
             }
             tagged_node_t *tn = &nodes[node_count++];
             tn->node_id = found[i]->id;
@@ -323,7 +382,17 @@ static int collect_decorated_nodes(cbm_gbuf_t *gbuf, tagged_node_t **out_nodes,
             tn->word_count = wc;
             for (int w = 0; w < wc; w++) {
                 intptr_t cnt = (intptr_t)cbm_ht_get(word_counts, words[w]);
-                cbm_ht_set(word_counts, words[w], intptr_to_ptr(cnt + SKIP_ONE));
+                if (!cbm_ht_set_checked(word_counts, words[w], intptr_to_ptr(cnt + SKIP_ONE),
+                                        NULL)) {
+                    cbm_log_error(
+                        "decorator_tags.index_failed", "code", "CBM_DECORATOR_COUNT_INSERT_FAILED",
+                        "component", "decorator_tags.word_counts", "operation", "insert", "key",
+                        words[w], "message", "decorator count map could not retain an entry",
+                        "remediation", "free memory or reduce repository size, then retry");
+                    free_tagged_nodes(nodes, node_count);
+                    *out_nodes = NULL;
+                    return CBM_NOT_FOUND;
+                }
             }
         }
     }
@@ -359,13 +428,12 @@ static int apply_decorator_tags(cbm_gbuf_t *gbuf, tagged_node_t *nodes, int node
         if (new_props) {
             int64_t updated =
                 gn->source_present
-                    ? cbm_gbuf_upsert_source_node(
-                          gbuf, gn->label, gn->name, gn->qualified_name, gn->file_path,
-                          gn->start_line, gn->end_line, gn->source_bytes, gn->source_len,
-                          gn->start_byte, gn->end_byte, new_props)
+                    ? cbm_gbuf_upsert_source_node(gbuf, gn->label, gn->name, gn->qualified_name,
+                                                  gn->file_path, gn->start_line, gn->end_line,
+                                                  gn->source_bytes, gn->source_len, gn->start_byte,
+                                                  gn->end_byte, new_props)
                     : cbm_gbuf_upsert_node(gbuf, gn->label, gn->name, gn->qualified_name,
-                                           gn->file_path, gn->start_line, gn->end_line,
-                                           new_props);
+                                           gn->file_path, gn->start_line, gn->end_line, new_props);
             free(new_props);
             if (updated > 0) {
                 tagged++;
@@ -381,8 +449,19 @@ int cbm_pipeline_pass_decorator_tags(cbm_gbuf_t *gbuf, const char *project) {
     }
 
     CBMHashTable *word_counts = cbm_ht_create(CBM_SZ_128);
+    if (!word_counts) {
+        cbm_log_error("decorator_tags.index_failed", "code", "CBM_DECORATOR_COUNT_ALLOC_FAILED",
+                      "component", "decorator_tags.word_counts", "operation", "create", "key", "",
+                      "message", "decorator count map could not be allocated", "remediation",
+                      "free memory or reduce repository size, then retry");
+        return CBM_NOT_FOUND;
+    }
     tagged_node_t *nodes = NULL;
     int node_count = collect_decorated_nodes(gbuf, &nodes, word_counts);
+    if (node_count < 0) {
+        cbm_ht_free(word_counts);
+        return CBM_NOT_FOUND;
+    }
     if (node_count == 0) {
         cbm_ht_free(word_counts);
         free(nodes);
@@ -391,13 +470,33 @@ int cbm_pipeline_pass_decorator_tags(cbm_gbuf_t *gbuf, const char *project) {
 
     /* Phase 2: Determine candidates (words on 2+ nodes) */
     CBMHashTable *candidates = cbm_ht_create(CBM_SZ_64);
+    if (!candidates) {
+        cbm_log_error("decorator_tags.index_failed", "code", "CBM_DECORATOR_CANDIDATE_ALLOC_FAILED",
+                      "component", "decorator_tags.candidates", "operation", "create", "key", "",
+                      "message", "decorator candidate map could not be allocated", "remediation",
+                      "free memory or reduce repository size, then retry");
+        free_tagged_nodes(nodes, node_count);
+        cbm_ht_free(word_counts);
+        return CBM_NOT_FOUND;
+    }
     int candidate_count = 0;
     for (int n = 0; n < node_count; n++) {
         for (int w = 0; w < nodes[n].word_count; w++) {
             const char *word = nodes[n].words[w];
             intptr_t cnt = (intptr_t)cbm_ht_get(word_counts, word);
             if (cnt >= PAIR_LEN && !cbm_ht_get(candidates, word)) {
-                cbm_ht_set(candidates, word, intptr_to_ptr(SKIP_ONE));
+                if (!cbm_ht_set_checked(candidates, word, intptr_to_ptr(SKIP_ONE), NULL)) {
+                    cbm_log_error("decorator_tags.index_failed", "code",
+                                  "CBM_DECORATOR_CANDIDATE_INSERT_FAILED", "component",
+                                  "decorator_tags.candidates", "operation", "insert", "key", word,
+                                  "message", "decorator candidate map could not retain an entry",
+                                  "remediation",
+                                  "free memory or reduce repository size, then retry");
+                    free_tagged_nodes(nodes, node_count);
+                    cbm_ht_free(word_counts);
+                    cbm_ht_free(candidates);
+                    return CBM_NOT_FOUND;
+                }
                 candidate_count++;
             }
         }
