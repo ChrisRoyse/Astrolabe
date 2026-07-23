@@ -373,6 +373,15 @@ static int validate_node_identity_index(cbm_store_t *s) {
 }
 
 static int init_schema(cbm_store_t *s) {
+    /* user_version == 0 is accepted because that is a FRESH, just-created store
+     * (SQLITE_OPEN_CREATE stamps 0 by default): this writable open path builds
+     * the schema and stamps 3 below. It is NOT an in-place migration of a
+     * populated legacy v0 store — no data migration exists, by design. A
+     * populated pre-3 store is rejected on the read path by the integrity gate
+     * (store_check_integrity_detailed requires user_version == 3 exactly) and on
+     * a writable reopen by the exact-source / local_name_gen column probes below.
+     * The only sanctioned path for a legacy store is a fresh re-index. So this
+     * branch is reachable (every new project) and required — do not remove it. */
     int initial_user_version = 0;
     if (read_user_version(s, &initial_user_version) != CBM_STORE_OK ||
         (initial_user_version != 0 && initial_user_version != CBM_STORE_SCHEMA_VERSION)) {
