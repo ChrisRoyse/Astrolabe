@@ -25,7 +25,10 @@ if (-not (Get-Command Get-AstroLauncherTreeJobObjectName -ErrorAction SilentlyCo
     throw 'attribution lifecycle requires the exact launcher-lock v2 native helpers'
 }
 
-$script:AstroAttributionManifestMaxBytes = 65536
+# The v3 manifest is cumulative process-lifetime provenance. Its byte length is
+# measured from the real Job history; the only parser bound is PowerShell/.NET's
+# addressable byte-array limit used by the exact retained-file snapshot primitive.
+$script:AstroAttributionManifestMaxBytes = [int]::MaxValue
 $script:AstroAttributionManifestReservedPrefix = 'no-escape-attribution-'
 $script:AstroAttributionManifestPattern = 'no-escape-attribution-*'
 $script:AstroAttributionManifestPidRegex =

@@ -6,6 +6,13 @@ param(
     # #317: positive driving GitHub issue recorded in every launcher lock.
     # String input permits a stable fail-closed refusal for malformed values.
     [string]$Issue = "",
+    # #651: explicit tracker-bound cleanup handoff for a target tree preserved by
+    # a prior dead launcher generation after that generation's lease was archived.
+    [switch]$RecoverPreservedTarget,
+    [string]$TrackerCommentUrl = "",
+    [string]$ExpectedTargetInventorySha256 = "",
+    [string]$ExpectedTargetEntryCount = "",
+    [string]$PriorRecoveryTransactionId = "",
     # #303: read-only diagnostic. Resolve the pinned ld.lld and print its path + version,
     # then exit. Runs before the lock/workspace/toolchain-env machinery so it can prove the
     # linker-resolution guard in isolation (FSV) without a full native build. -LlvmBinOverride
@@ -51,6 +58,56 @@ function Get-Sha256Hex {
     }
     finally { $sha.Dispose() }
     return [pscustomobject]@{ Hash = $hex }
+}
+
+function Get-AstroPreservedTargetInventory {
+    param([Parameter(Mandatory)][string]$LiteralPath)
+
+    $root = [IO.Path]::GetFullPath($LiteralPath).TrimEnd('\', '/')
+    $rootInfo = Get-Item -LiteralPath $root -Force -ErrorAction Stop
+    if (-not $rootInfo.PSIsContainer -or
+        ($rootInfo.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw "preserved target root is not one ordinary non-reparse directory: $root"
+    }
+    $items = @(Get-ChildItem -LiteralPath $root -Force -Recurse -ErrorAction Stop)
+    [string[]]$paths = @($items | ForEach-Object { [IO.Path]::GetFullPath($_.FullName) })
+    [Array]::Sort($paths, [StringComparer]::Ordinal)
+    $lines = [Collections.Generic.List[string]]::new()
+    foreach ($path in $paths) {
+        $prefix = $root + [IO.Path]::DirectorySeparatorChar
+        if (-not $path.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase)) {
+            throw "preserved target inventory escaped its exact root: $path"
+        }
+        $entry = Get-Item -LiteralPath $path -Force -ErrorAction Stop
+        if (($entry.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+            throw "preserved target inventory contains an unsupported reparse entry: $path"
+        }
+        $relative = $path.Substring($prefix.Length).Replace('\', '/')
+        $relativeBase64 = [Convert]::ToBase64String(
+            [Text.UTF8Encoding]::new($false, $true).GetBytes($relative)
+        )
+        if ($entry.PSIsContainer) {
+            $lines.Add("D`t$relativeBase64")
+        }
+        elseif (($entry.Attributes -band [IO.FileAttributes]::Directory) -eq 0) {
+            $fileHash = (Get-Sha256Hex -LiteralPath $path).Hash.ToLowerInvariant()
+            $lines.Add("F`t$relativeBase64`t$($entry.Length)`t$fileHash")
+        }
+        else {
+            throw "preserved target inventory contains an unsupported entry type: $path"
+        }
+    }
+    $bytes = [Text.UTF8Encoding]::new($false, $true).GetBytes($lines -join "`n")
+    $sha = [Security.Cryptography.SHA256]::Create()
+    try {
+        $inventoryHash = ([BitConverter]::ToString($sha.ComputeHash($bytes)) -replace '-', '').ToLowerInvariant()
+    }
+    finally { $sha.Dispose() }
+    return [pscustomobject]@{
+        Path = $root
+        EntryCount = $lines.Count
+        InventorySha256 = $inventoryHash
+    }
 }
 
 function Write-NewDurableUtf8File {
@@ -385,7 +442,7 @@ function Stop-LauncherLockCleanupTransaction {
 function Complete-LauncherLockCleanupTransaction {
     param(
         [Parameter(Mandatory)]$Transaction,
-        [Parameter(Mandatory)][string[]]$OwnedTargetRoots,
+        [Parameter(Mandatory)][AllowEmptyCollection()][string[]]$OwnedTargetRoots,
         [Parameter(Mandatory)][string]$WorkspaceTemp,
         [Parameter(Mandatory)][string]$WorkspaceTempArchivePath,
         [Parameter(Mandatory)][string]$AttributionManifest,
@@ -1903,7 +1960,10 @@ public class AstroTreeRecorder {
     const int WAIT_TIMEOUT = 258;
     const int ERROR_FILE_NOT_FOUND = 2;
     const int ERROR_PATH_NOT_FOUND = 3;
-    const int MAX_MANIFEST_BYTES = 65536;
+    // The manifest is cumulative process-lifetime provenance. Its size is determined
+    // by the observed Job history, not by a policy threshold. The only format bound is
+    // the CLR byte-array addressability required by exact in-memory CAS/readback.
+    const long MAX_IN_MEMORY_FILE_BYTES = Int32.MaxValue;
     const int MAX_JOB_PROCESS_IDS = 65536;
     const long OPEN = -1L;
     const uint GENERIC_READ = 0x80000000;
@@ -2267,7 +2327,34 @@ public class AstroTreeRecorder {
     void ThrowIfWorkerFaulted() {
         Exception fault;
         lock (gate) { fault = workerFault; }
-        if (fault != null) throw new InvalidOperationException("tree-attribution worker failed", fault);
+        if (fault != null)
+            throw new InvalidOperationException(
+                "tree-attribution worker failed: " + DescribeExceptionChain(fault),
+                fault
+            );
+    }
+
+    static string DescribeExceptionChain(Exception fault) {
+        StringBuilder detail = new StringBuilder();
+        int depth = 0;
+        for (Exception current = fault; current != null; current = current.InnerException) {
+            if (depth > 0) detail.Append(" <- ");
+            detail.Append("depth=").Append(depth.ToString(CultureInfo.InvariantCulture));
+            detail.Append(" type=").Append(current.GetType().FullName);
+            detail.Append(" hresult=0x").Append(
+                current.HResult.ToString("x8", CultureInfo.InvariantCulture)
+            );
+            Win32Exception native = current as Win32Exception;
+            if (native != null) {
+                detail.Append(" native_error=").Append(
+                    native.NativeErrorCode.ToString(CultureInfo.InvariantCulture)
+                );
+            }
+            detail.Append(" message=");
+            AppendJsonString(detail, current.Message ?? String.Empty);
+            depth++;
+        }
+        return detail.ToString();
     }
 
     static void AppendJsonString(StringBuilder sb, string value) {
@@ -2472,8 +2559,12 @@ public class AstroTreeRecorder {
     }
 
     static byte[] ReadAllExact(FileStream stream) {
-        if (stream.Length < 0 || stream.Length > MAX_MANIFEST_BYTES)
-            throw new InvalidDataException("attribution manifest length is outside the strict byte limit: " + stream.Length);
+        if (stream.Length < 0 || stream.Length > MAX_IN_MEMORY_FILE_BYTES)
+            throw new InvalidDataException(
+                "attribution protocol file length exceeds CLR byte-array addressability 0.." +
+                MAX_IN_MEMORY_FILE_BYTES.ToString(CultureInfo.InvariantCulture) +
+                ": " + stream.Length.ToString(CultureInfo.InvariantCulture)
+            );
         byte[] result = new byte[(int)stream.Length];
         stream.Position = 0;
         int offset = 0;
@@ -2689,8 +2780,8 @@ public class AstroTreeRecorder {
         AppendJsonString(sb, Path.GetFullPath(dispositionProofPath));
         sb.Append('}');
         byte[] bytes = new UTF8Encoding(false, true).GetBytes(sb.ToString());
-        if (bytes.Length == 0 || bytes.Length > MAX_MANIFEST_BYTES)
-            throw new InvalidDataException("refresh envelope length is outside 1.." + MAX_MANIFEST_BYTES + ": " + bytes.Length);
+        if (bytes.Length == 0)
+            throw new InvalidDataException("refresh envelope must not be empty");
         return bytes;
     }
 
@@ -2721,8 +2812,8 @@ public class AstroTreeRecorder {
     }
 
     string PublishManifestBytes(byte[] intended, byte[] expectedPrevious, string expectedPreviousIdentity) {
-        if (intended == null || intended.Length == 0 || intended.Length > MAX_MANIFEST_BYTES)
-            throw new InvalidDataException("serialized attribution manifest length is outside 1.." + MAX_MANIFEST_BYTES + ": " + (intended == null ? -1 : intended.Length));
+        if (intended == null || intended.Length == 0)
+            throw new InvalidDataException("serialized attribution manifest must not be empty");
         string directory = Path.GetDirectoryName(manifestPath);
         string nonce = Guid.NewGuid().ToString("N");
         string scratchPath = Path.Combine(
@@ -3308,6 +3399,29 @@ if (-not ($isCanonicalRoot -or $isWorktreeRoot)) {
 if ($isWorktreeRoot -and $Bootstrap) {
     throw "LAUNCHER_BOUNDARY[ASTRO_BOOTSTRAP_CANONICAL_ONLY]: -Bootstrap installs pinned tools and must run from $ExpectedWorkspace, not worktree $root"
 }
+if ($RecoverPreservedTarget) {
+    $expectedRecoveryEntryCount = 0
+    if (-not $isCanonicalRoot -or $Bootstrap -or
+        -not [string]::IsNullOrWhiteSpace($Command) -or
+        $CommandArgsJson -cne '[]' -or
+        $ExpectedTargetInventorySha256 -cnotmatch '^[0-9a-f]{64}$' -or
+        -not [int]::TryParse(
+            $ExpectedTargetEntryCount,
+            [Globalization.NumberStyles]::None,
+            [Globalization.CultureInfo]::InvariantCulture,
+            [ref]$expectedRecoveryEntryCount
+        ) -or $expectedRecoveryEntryCount -le 0 -or
+        $PriorRecoveryTransactionId -cnotmatch '^[0-9a-f]{32}$' -or
+        $TrackerCommentUrl -cnotmatch "^https://github\.com/ChrisRoyse/Astrolabe/issues/$drivingIssue#issuecomment-[1-9][0-9]*$") {
+        throw "TARGET_RECOVERY[ASTRO_PRESERVED_TARGET_ARGUMENT_INVALID]: {code=ASTRO_PRESERVED_TARGET_ARGUMENT_INVALID; message=`"preserved-target recovery requires the canonical root, no child command/bootstrap, exact lowercase inventory/transaction hashes, a positive entry count, and a tracker URL for the driving issue`"; remediation=`"post the exact inventory evidence on the driving issue and pass only the documented recovery parameters`"}"
+    }
+}
+elseif (-not [string]::IsNullOrEmpty($TrackerCommentUrl) -or
+    -not [string]::IsNullOrEmpty($ExpectedTargetInventorySha256) -or
+    -not [string]::IsNullOrEmpty($ExpectedTargetEntryCount) -or
+    -not [string]::IsNullOrEmpty($PriorRecoveryTransactionId)) {
+    throw "TARGET_RECOVERY[ASTRO_PRESERVED_TARGET_ARGUMENT_UNBOUND]: recovery-only arguments require -RecoverPreservedTarget"
+}
 
 # #625: KILL_ON_JOB_CLOSE is authoritative only if its last handle follows a real
 # process-lifetime boundary. The Job contains its owner, so a caller process that will
@@ -3336,8 +3450,13 @@ if ([string]::IsNullOrEmpty($InternalDedicatedToken)) {
     $commandBase64 = & $encodeArgument $Command
     $commandArgsBase64 = & $encodeArgument $CommandArgsJson
     $issueBase64 = & $encodeArgument $Issue
+    $trackerCommentUrlBase64 = & $encodeArgument $TrackerCommentUrl
+    $expectedTargetInventoryBase64 = & $encodeArgument $ExpectedTargetInventorySha256
+    $expectedTargetEntryCountBase64 = & $encodeArgument $ExpectedTargetEntryCount
+    $priorRecoveryTransactionBase64 = & $encodeArgument $PriorRecoveryTransactionId
     $tokenBase64 = & $encodeArgument $wrapperToken
     $bootstrapLiteral = if ($Bootstrap) { '$true' } else { '$false' }
+    $recoverPreservedTargetLiteral = if ($RecoverPreservedTarget) { '$true' } else { '$false' }
     $dedicatedCommand = @"
 `$decode = {
     param([string]`$Value)
@@ -3349,6 +3468,11 @@ if ([string]::IsNullOrEmpty($InternalDedicatedToken)) {
     Command = & `$decode '$commandBase64'
     CommandArgsJson = & `$decode '$commandArgsBase64'
     Issue = & `$decode '$issueBase64'
+    RecoverPreservedTarget = $recoverPreservedTargetLiteral
+    TrackerCommentUrl = & `$decode '$trackerCommentUrlBase64'
+    ExpectedTargetInventorySha256 = & `$decode '$expectedTargetInventoryBase64'
+    ExpectedTargetEntryCount = & `$decode '$expectedTargetEntryCountBase64'
+    PriorRecoveryTransactionId = & `$decode '$priorRecoveryTransactionBase64'
     InternalDedicatedToken = & `$decode '$tokenBase64'
 }
 & `$dedicatedScript @dedicatedParameters
@@ -3548,7 +3672,13 @@ elseif ($workspaceTempParentState.State -ne 'present' -or
 # and hash are known before the first claim-transition file is created.
 $launcherCommand = ("$Command $CommandArgsJson").Trim()
 if ([string]::IsNullOrWhiteSpace($launcherCommand)) {
-    $launcherCommand = if ($Bootstrap) { "bootstrap" } else { "environment-probe" }
+    $launcherCommand = if ($Bootstrap) {
+        "bootstrap"
+    }
+    elseif ($RecoverPreservedTarget) {
+        "recover-preserved-target transaction=$PriorRecoveryTransactionId inventory=$ExpectedTargetInventorySha256 entries=$expectedRecoveryEntryCount"
+    }
+    else { "environment-probe" }
 }
 # #424/#519: the launcher lock is also the repository EVIDENCE LEASE. Record the exact
 # tree the coming build is attributable to (HEAD + content-level dirty-state fingerprint)
@@ -3966,6 +4096,8 @@ finally {
 
 # The session lock is now durably published, strictly read back, and physically immutable.
 # Every workspace/config/toolchain mutation is inside this try/finally.
+$preservedTargetCleanupAuthorized = -not $RecoverPreservedTarget
+$preservedTargetRecoveryFinalizationPath = $null
 try {
     $env:ASTRO_NO_ESCAPE_ATTRIBUTION = $attributionManifest
     Write-Output "NO_ESCAPE[ASTRO_ATTRIBUTION_RECORDING]: strict v3 kill-on-close process tree -> $attributionManifest; job=$launcherTreeJobObjectName; job_limit_flags=8192"
@@ -4021,10 +4153,21 @@ try {
             Write-Output "NO_ESCAPE[ASTRO_ATTRIBUTION_SWEEP_REFRESH]: key=$($refreshDecision.Key); initial=$($refreshDecision.InitialState); action=$($refreshDecision.Action); owner=$($refreshDecision.OwnerState); job=$($refreshDecision.JobState)"
         }
         Write-Output "NO_ESCAPE[ASTRO_ATTRIBUTION_SWEEP_READBACK]: state=$($attributionSweep.State); removed=$(@($attributionSweep.Removed) -join ';'); eligible_pairs=$(@($attributionSweep.EligiblePairs).Count); eligible_stages=$(@($attributionSweep.EligibleStages).Count); refresh_transactions=$(@($attributionSweep.Inventory.RefreshTransactions).Count); kept=$(@($attributionSweep.Kept) -join ';'); skipped=$(@($attributionSweep.Skipped) -join ';')"
+        $eligiblePairCount = @($attributionSweep.EligiblePairs).Count
+        $eligiblePairsBlockStartup =
+            -not $RecoverPreservedTarget -and $eligiblePairCount -gt 0
+        if ($RecoverPreservedTarget -and $eligiblePairCount -gt 0) {
+            # The explicit pair archiver requires target/ absent, while the target
+            # handoff can start only after the dead owner's lock was archived.  A
+            # recovery owner therefore observes but never mutates already-proven
+            # dead complete pairs, finalizes/deletes only the hash-bound target,
+            # and leaves those pairs for the tracker-bound archiver afterward.
+            Write-Output "TARGET_RECOVERY[ASTRO_PRESERVED_DEAD_PAIRS_OBSERVED]: eligible_pairs=$eligiblePairCount; pairs=$(@($attributionSweep.EligiblePairs) -join ';'); action=preserve-until-target-absent"
+        }
         if ($attributionSweep.State -ceq 'unevaluable' -or
             @($attributionSweep.Errors).Count -gt 0 -or
             @($attributionSweep.EligibleStages).Count -gt 0 -or
-            @($attributionSweep.EligiblePairs).Count -gt 0) {
+            $eligiblePairsBlockStartup) {
             throw "post-pair attribution inventory is not stable/complete (state=$($attributionSweep.State), errors=$(@($attributionSweep.Errors) -join '; '), eligible_stages=$(@($attributionSweep.EligibleStages).Count), eligible_pairs=$(@($attributionSweep.EligiblePairs).Count))"
         }
         Write-Output "NO_ESCAPE[ASTRO_ATTRIBUTION_SWEEP]: exact dead-generation TEMP pairs=$(@($tempSweep.Removed).Count), manifests=$(@($tempSweep.RemovedManifests).Count), stages=$(@($tempSweep.RemovedStages).Count), tombstones=$(@($tempSweep.RemovedTombstones).Count); current exact generation preserved"
@@ -4038,6 +4181,267 @@ try {
         # archival form an unrecoverable cycle (#620).
         throw
     }
+    # #651: a stale-owner reclaim may correctly archive the only prior lease while
+    # preserving target/. A fresh ordinary launcher cannot infer ownership from those
+    # bytes. This explicit mode binds the exact tree to a pre-existing tracker comment,
+    # publishes durable authorization under the new exact live lease, deletes only an
+    # unchanged handle-bound inventory, and reads back terminal absence + completion.
+    if ($RecoverPreservedTarget) {
+        $targetState = Get-AstroPathEntryState $target
+        if ($targetState.State -cne 'present' -or
+            ($targetState.Attributes -band [IO.FileAttributes]::Directory) -eq 0 -or
+            ($targetState.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+            throw "TARGET_RECOVERY[ASTRO_PRESERVED_TARGET_STATE_INVALID]: expected one ordinary preserved target directory (state=$($targetState.State), attributes=$($targetState.Attributes), error=$($targetState.Error)): $target"
+        }
+
+        $commentIdText = $TrackerCommentUrl.Substring($TrackerCommentUrl.LastIndexOf('-') + 1)
+        $commentId = 0L
+        if (-not [long]::TryParse(
+                $commentIdText,
+                [Globalization.NumberStyles]::None,
+                [Globalization.CultureInfo]::InvariantCulture,
+                [ref]$commentId
+            ) -or $commentId -le 0) {
+            throw "TARGET_RECOVERY[ASTRO_PRESERVED_TARGET_TRACKER_INVALID]: tracker comment id is not a positive integer: $TrackerCommentUrl"
+        }
+        $markerJson = [ordered]@{
+            schema = 'astrolabe.preserved-target-recovery.request.v1'
+            issue = $drivingIssue
+            path = [IO.Path]::GetFullPath($target)
+            inventory_sha256 = $ExpectedTargetInventorySha256
+            entry_count = $expectedRecoveryEntryCount
+            prior_recovery_transaction_id = $PriorRecoveryTransactionId
+        } | ConvertTo-Json -Compress
+        $expectedMarker = "ASTROLABE_TARGET_RECOVERY $markerJson"
+        $ghCommand = Get-Command gh.exe -ErrorAction Stop
+
+        $readTrackerComment = {
+            $capture = Invoke-NativeCapture `
+                -Exe $ghCommand.Source `
+                -Arguments @('api', "repos/ChrisRoyse/Astrolabe/issues/comments/$commentId")
+            if ($capture.ExitCode -ne 0) {
+                throw "gh api failed while reading tracker comment (exit=$($capture.ExitCode)): $(@($capture.Output) -join ' ')"
+            }
+            $comment = (@($capture.Output) -join "`n") | ConvertFrom-Json -ErrorAction Stop
+            if ([long]$comment.id -ne $commentId -or
+                [string]$comment.html_url -cne $TrackerCommentUrl) {
+                throw 'tracker API response does not bind the requested comment id/URL'
+            }
+            $matchingLines = @(
+                ([string]$comment.body -split "`r?`n") |
+                    Where-Object { $_ -ceq $expectedMarker }
+            )
+            if ($matchingLines.Count -ne 1) {
+                throw 'tracker comment does not contain exactly one canonical preserved-target request marker'
+            }
+            $bodyBytes = [Text.UTF8Encoding]::new($false, $true).GetBytes([string]$comment.body)
+            $bodySha = [Security.Cryptography.SHA256]::Create()
+            try {
+                $bodyHash = ([BitConverter]::ToString($bodySha.ComputeHash($bodyBytes)) -replace '-', '').ToLowerInvariant()
+            }
+            finally { $bodySha.Dispose() }
+            return [pscustomobject]@{
+                Id = [long]$comment.id
+                Url = [string]$comment.html_url
+                UpdatedAt = [string]$comment.updated_at
+                BodySha256 = $bodyHash
+            }
+        }
+
+        $targetHandle = $null
+        try {
+            $portableBefore = Get-AstroPreservedTargetInventory -LiteralPath $target
+            if ($portableBefore.InventorySha256 -cne $ExpectedTargetInventorySha256 -or
+                $portableBefore.EntryCount -ne $expectedRecoveryEntryCount) {
+                throw "preserved target portable inventory does not match tracker authority (expected=$ExpectedTargetInventorySha256/$expectedRecoveryEntryCount, observed=$($portableBefore.InventorySha256)/$($portableBefore.EntryCount))"
+            }
+            $trackerFirst = & $readTrackerComment
+            $portableSecond = Get-AstroPreservedTargetInventory -LiteralPath $target
+            if ($portableSecond.InventorySha256 -cne $portableBefore.InventorySha256 -or
+                $portableSecond.EntryCount -ne $portableBefore.EntryCount) {
+                throw 'preserved target changed between the first tracker-bound portable inventory reads'
+            }
+
+            $recoveryDirectory = Join-Path $workspaceTempParent 'preserved-target-recovery'
+            if (-not (Test-Path -LiteralPath $recoveryDirectory)) {
+                [IO.Directory]::CreateDirectory($recoveryDirectory) | Out-Null
+            }
+            $recoveryDirectoryState = Get-AstroPathEntryState $recoveryDirectory
+            if ($recoveryDirectoryState.State -cne 'present' -or
+                ($recoveryDirectoryState.Attributes -band [IO.FileAttributes]::Directory) -eq 0 -or
+                ($recoveryDirectoryState.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+                throw "preserved-target recovery record directory is not an ordinary directory: $recoveryDirectory"
+            }
+            $recoveryTransactionId = [Guid]::NewGuid().ToString('N')
+            $authorizationPath = Join-Path $recoveryDirectory "$recoveryTransactionId.authorization.json"
+            $finalizationPath = Join-Path $recoveryDirectory "$recoveryTransactionId.finalization.json"
+            $completionPath = Join-Path $recoveryDirectory "$recoveryTransactionId.completion.json"
+            $authorization = [ordered]@{
+                schema = 'astrolabe.preserved-target-recovery.authorization.v1'
+                phase = 'tracker-and-portable-inventory-authorized'
+                transaction_id = $recoveryTransactionId
+                recorded_at_utc = [DateTime]::UtcNow.ToString('o')
+                prior_recovery_transaction_id = $PriorRecoveryTransactionId
+                tracker = [ordered]@{
+                    url = $trackerFirst.Url
+                    comment_id = $trackerFirst.Id
+                    updated_at = $trackerFirst.UpdatedAt
+                    body_sha256 = $trackerFirst.BodySha256
+                    marker = $expectedMarker
+                }
+                owner = [ordered]@{
+                    pid = $PID
+                    owner_process_start_utc_ticks = $launcherProcessStartUtcTicks
+                    issue = $drivingIssue
+                    launcher_lock_sha256 = $launcherLockSha256
+                    head_sha = $repoEvidenceBefore.HeadSha
+                    status_sha256 = $repoEvidenceBefore.StatusSha256
+                    diff_sha256 = $repoEvidenceBefore.DiffSha256
+                }
+                target = [ordered]@{
+                    path = $portableBefore.Path
+                    portable_inventory_sha256 = $portableBefore.InventorySha256
+                    entry_count = $portableBefore.EntryCount
+                }
+            }
+            $authorizationText = $authorization | ConvertTo-Json -Compress -Depth 8
+            Write-NewDurableUtf8File -LiteralPath $authorizationPath -Text $authorizationText
+            $authorizationReadback = [IO.File]::ReadAllText(
+                $authorizationPath,
+                [Text.UTF8Encoding]::new($false, $true)
+            )
+            if ($authorizationReadback -cne $authorizationText) {
+                throw 'durable preserved-target authorization readback differs from written bytes'
+            }
+            $authorizationHash = (Get-Sha256Hex -LiteralPath $authorizationPath).Hash.ToLowerInvariant()
+
+            $targetHandle = [AstroLauncherTempNative]::OpenExactLiveDirectoryLease(
+                [IO.Path]::GetFullPath($target)
+            )
+            $targetLease = [pscustomobject]@{
+                Path = [IO.Path]::GetFullPath($target)
+                Handle = $targetHandle
+            }
+            $exactBefore = Get-AstroLauncherTempTreeSnapshot $targetLease
+            $exactSecond = Get-AstroLauncherTempTreeSnapshot $targetLease
+            Assert-AstroLauncherTempSnapshotsEqual $exactBefore $exactSecond
+            if (-not [string]::Equals(
+                    $exactBefore.RootFinalPath,
+                    [IO.Path]::GetFullPath($target),
+                    [StringComparison]::OrdinalIgnoreCase
+                )) {
+                throw "exact preserved-target handle resolved outside the canonical target: $($exactBefore.RootFinalPath)"
+            }
+            $trackerSecond = & $readTrackerComment
+            if ($trackerSecond.UpdatedAt -cne $trackerFirst.UpdatedAt -or
+                $trackerSecond.BodySha256 -cne $trackerFirst.BodySha256) {
+                throw 'tracker comment changed after preserved-target authorization publication'
+            }
+
+            $finalization = [ordered]@{
+                schema = 'astrolabe.preserved-target-recovery.finalization.v1'
+                phase = 'exact-inventory-finalized-before-delete'
+                transaction_id = $recoveryTransactionId
+                recorded_at_utc = [DateTime]::UtcNow.ToString('o')
+                authorization = [ordered]@{
+                    path = $authorizationPath
+                    sha256 = $authorizationHash
+                }
+                tracker = [ordered]@{
+                    url = $trackerSecond.Url
+                    comment_id = $trackerSecond.Id
+                    updated_at = $trackerSecond.UpdatedAt
+                    body_sha256 = $trackerSecond.BodySha256
+                }
+                owner = [ordered]@{
+                    pid = $PID
+                    owner_process_start_utc_ticks = $launcherProcessStartUtcTicks
+                    launcher_lock_sha256 = $launcherLockSha256
+                }
+                target = [ordered]@{
+                    path = $portableBefore.Path
+                    root_file_id = $exactBefore.RootFileId
+                    exact_inventory_sha256 = $exactBefore.InventorySha256
+                    portable_inventory_sha256 = $portableBefore.InventorySha256
+                    entry_count = $portableBefore.EntryCount
+                }
+            }
+            $finalizationText = $finalization | ConvertTo-Json -Compress -Depth 8
+            Write-NewDurableUtf8File -LiteralPath $finalizationPath -Text $finalizationText
+            $finalizationReadback = [IO.File]::ReadAllText(
+                $finalizationPath,
+                [Text.UTF8Encoding]::new($false, $true)
+            )
+            if ($finalizationReadback -cne $finalizationText) {
+                throw 'durable preserved-target finalization readback differs from written bytes'
+            }
+            $finalizationHash = (Get-Sha256Hex -LiteralPath $finalizationPath).Hash.ToLowerInvariant()
+            $preservedTargetRecoveryFinalizationPath = $finalizationPath
+            $preservedTargetCleanupAuthorized = $true
+
+            [AstroLauncherTempNative]::DeleteExactTreeContents(
+                $targetHandle,
+                [string[]]$exactBefore.Entries
+            )
+            $emptyTarget = Get-AstroLauncherTempTreeSnapshot $targetLease
+            if ($emptyTarget.RootFileId -cne $exactBefore.RootFileId -or
+                $emptyTarget.EntryCount -ne 0) {
+                throw 'preserved target root changed identity or remained nonempty after exact content deletion'
+            }
+            [AstroLauncherTempNative]::MarkExactDirectoryDeletePending(
+                $targetHandle,
+                $emptyTarget.RootState
+            )
+            $targetHandle.Dispose()
+            $targetHandle = $null
+            $targetTerminal = Get-AstroPathEntryState $target
+            if ($targetTerminal.State -cne 'absent') {
+                throw "preserved target is not absent after exact disposition (state=$($targetTerminal.State), error=$($targetTerminal.Error))"
+            }
+
+            $completion = [ordered]@{
+                schema = 'astrolabe.preserved-target-recovery.completion.v1'
+                phase = 'complete-target-absent'
+                transaction_id = $recoveryTransactionId
+                completed_at_utc = [DateTime]::UtcNow.ToString('o')
+                authorization = [ordered]@{
+                    path = $authorizationPath
+                    sha256 = $authorizationHash
+                }
+                finalization = [ordered]@{
+                    path = $finalizationPath
+                    sha256 = $finalizationHash
+                }
+                target = [ordered]@{
+                    path = [IO.Path]::GetFullPath($target)
+                    state = $targetTerminal.State
+                    prior_root_file_id = $exactBefore.RootFileId
+                    prior_exact_inventory_sha256 = $exactBefore.InventorySha256
+                    prior_portable_inventory_sha256 = $portableBefore.InventorySha256
+                    prior_entry_count = $portableBefore.EntryCount
+                    empty_exact_inventory_sha256 = $emptyTarget.InventorySha256
+                }
+            }
+            $completionText = $completion | ConvertTo-Json -Compress -Depth 8
+            Write-NewDurableUtf8File -LiteralPath $completionPath -Text $completionText
+            $completionReadback = [IO.File]::ReadAllText(
+                $completionPath,
+                [Text.UTF8Encoding]::new($false, $true)
+            )
+            if ($completionReadback -cne $completionText -or
+                (Get-AstroPathEntryState $target).State -cne 'absent') {
+                throw 'preserved-target completion or terminal absence failed independent readback'
+            }
+            $completionHash = (Get-Sha256Hex -LiteralPath $completionPath).Hash.ToLowerInvariant()
+            Write-Output "TARGET_RECOVERY[ASTRO_PRESERVED_TARGET_COMPLETE]: transaction=$recoveryTransactionId; target=$target; entries=$($portableBefore.EntryCount); portable_inventory_sha256=$($portableBefore.InventorySha256); exact_inventory_sha256=$($exactBefore.InventorySha256); authorization=$authorizationPath; authorization_sha256=$authorizationHash; finalization=$finalizationPath; finalization_sha256=$finalizationHash; completion=$completionPath; completion_sha256=$completionHash; terminal=absent"
+        }
+        finally {
+            if ($null -ne $targetHandle) {
+                $targetHandle.Dispose()
+            }
+        }
+    }
+
     # #280: a warm target is permitted only inside an explicitly owned contiguous batch.
     if ((Test-Path -LiteralPath $target) -and
         ($env:ASTROLABE_CONTIGUOUS_BATCH -ne "1")) {
@@ -4553,6 +4957,25 @@ finally {
     $manifestArchiveLease = $null
     $launcherStateArchiveTransaction = $null
     $launcherLockCleanupTransaction = $null
+    $cleanupTargetRoots = if ($preservedTargetCleanupAuthorized) {
+        [string[]]@($ownedTargetRoots)
+    }
+    else {
+        $canonicalTarget = [IO.Path]::GetFullPath($target)
+        [string[]]@(
+            $ownedTargetRoots | Where-Object {
+                -not [string]::Equals(
+                    [IO.Path]::GetFullPath($_),
+                    $canonicalTarget,
+                    [StringComparison]::OrdinalIgnoreCase
+                )
+            }
+        )
+    }
+    if ($RecoverPreservedTarget -and -not $preservedTargetCleanupAuthorized) {
+        $targetPreservedState = Get-AstroPathEntryState $target
+        Write-Output "TARGET_RECOVERY[ASTRO_PRESERVED_TARGET_UNAUTHORIZED_PRESERVED]: target=$target; state=$($targetPreservedState.State); finalization=$(if ($null -eq $preservedTargetRecoveryFinalizationPath) { '<absent>' } else { $preservedTargetRecoveryFinalizationPath }); generic cleanup is not authorized to mutate the preserved target"
+    }
     if (-not $deferCleanupForLiveChildren -and $cleanupErrors.Count -eq 0) {
         try {
             # Recorder Stop/readback completed above while its Job handle remains retained.
@@ -4600,7 +5023,7 @@ finally {
             # target cleanup and the append-only TEMP/manifest archive transaction.
             # Stop at the first failure and preserve every source/archive byte plus
             # the exact transition for authorized recovery.
-            foreach ($ownedTarget in $ownedTargetRoots) {
+            foreach ($ownedTarget in $cleanupTargetRoots) {
                 $targetState = Get-AstroPathEntryState $ownedTarget
                 if ($targetState.State -eq 'present') {
                     # #421: depth-independent, not MAX_PATH-bound.
@@ -4715,7 +5138,7 @@ finally {
             try {
                 $protocolCleanup = Complete-LauncherLockCleanupTransaction `
                     -Transaction $launcherLockCleanupTransaction `
-                    -OwnedTargetRoots $ownedTargetRoots `
+                    -OwnedTargetRoots $cleanupTargetRoots `
                     -WorkspaceTemp $workspaceTemp `
                     -WorkspaceTempArchivePath $workspaceTempArchivePath `
                     -AttributionManifest $attributionManifest `
@@ -4805,7 +5228,12 @@ finally {
         $launcherLockRemoved -and
         $attributionManifestArchived -and
         $workspaceTempArchived) {
-        Write-Output "CLEANUP[ASTRO_TARGET]: absent: $(($ownedTargetRoots | Sort-Object) -join '; ')"
+        if ($preservedTargetCleanupAuthorized) {
+            Write-Output "CLEANUP[ASTRO_TARGET]: absent: $(($ownedTargetRoots | Sort-Object) -join '; ')"
+        }
+        else {
+            Write-Output "CLEANUP[ASTRO_TARGET]: preserved without authorization: $target"
+        }
         Write-Output "CLEANUP[ASTRO_WORKSPACE_TEMP_ARCHIVE]: source=$workspaceTemp is absent; archive=$workspaceTempArchivePath is present"
         Write-Output "CLEANUP[ASTRO_LAUNCHER_PROTOCOL]: active lock, every transition, and direct attribution manifest are absent; append-only archive transaction remains at $($launcherStateArchiveTransaction.TransactionPath)"
     }

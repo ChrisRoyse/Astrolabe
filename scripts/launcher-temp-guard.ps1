@@ -59,6 +59,7 @@ public static class AstroLauncherTempNative
     private const uint OPEN_EXISTING = 3;
     private const uint CREATE_NEW = 1;
     private const uint FILE_ATTRIBUTE_NORMAL = 0x00000080;
+    private const uint FILE_ATTRIBUTE_ARCHIVE = 0x00000020;
     private const uint FILE_FLAG_BACKUP_SEMANTICS = 0x02000000;
     private const uint FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000;
     private const uint FILE_FLAG_DELETE_ON_CLOSE = 0x04000000;
@@ -77,6 +78,7 @@ public static class AstroLauncherTempNative
     private const int ERROR_FILE_NOT_FOUND = 2;
     private const int ERROR_PATH_NOT_FOUND = 3;
     private const int ERROR_NO_MORE_FILES = 18;
+    private const int ERROR_HANDLE_EOF = 38;
     private const int MAX_TREE_DEPTH = 1024;
     private const uint BACKUP_DATA = 0x00000001;
     private const uint BACKUP_EA_DATA = 0x00000002;
@@ -118,6 +120,14 @@ public static class AstroLauncherTempNative
         public uint FileAttributes;
     }
 
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    private struct WIN32_FIND_STREAM_DATA
+    {
+        public long StreamSize;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 296)]
+        public string StreamName;
+    }
+
     private sealed class ExactBackupState
     {
         public string Canonical;
@@ -134,6 +144,7 @@ public static class AstroLauncherTempNative
         public string FileId;
         public string ExactBackupState;
         public string ShortNameToken;
+        public uint LinkCount;
         public string ExactRecord;
         public int Depth;
     }
@@ -222,6 +233,25 @@ public static class AstroLauncherTempNative
         IntPtr lastAccessTime,
         IntPtr lastWriteTime
     );
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern IntPtr FindFirstStreamW(
+        string fileName,
+        int informationLevel,
+        out WIN32_FIND_STREAM_DATA findStreamData,
+        uint flags
+    );
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool FindNextStreamW(
+        IntPtr findStream,
+        out WIN32_FIND_STREAM_DATA findStreamData
+    );
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool FindClose(IntPtr findFile);
 
     private static void RequireDisk(SafeFileHandle handle, string description)
     {
@@ -943,6 +973,84 @@ public static class AstroLauncherTempNative
         }
     }
 
+    private static string ValidateDataStreamInventory(
+        SafeFileHandle handle,
+        bool isDirectory,
+        ulong expectedFileSize,
+        string description
+    )
+    {
+        string path = GetExtendedLengthPath(GetFinalPath(handle));
+        WIN32_FIND_STREAM_DATA stream;
+        IntPtr find = FindFirstStreamW(path, 0, out stream, 0);
+        if (find == new IntPtr(-1))
+        {
+            int error = Marshal.GetLastWin32Error();
+            if (isDirectory && error == ERROR_HANDLE_EOF)
+            {
+                return "find-streams:none-directory";
+            }
+            throw new Win32Exception(
+                error,
+                "TEMP_DATA_STREAM_ENUMERATION_FAILED: " + description
+            );
+        }
+        List<string> streams = new List<string>();
+        try
+        {
+            while (true)
+            {
+                streams.Add(stream.StreamName + ":" +
+                    stream.StreamSize.ToString(CultureInfo.InvariantCulture));
+                WIN32_FIND_STREAM_DATA next;
+                if (!FindNextStreamW(find, out next))
+                {
+                    int error = Marshal.GetLastWin32Error();
+                    if (error != ERROR_HANDLE_EOF)
+                    {
+                        throw new Win32Exception(
+                            error,
+                            "TEMP_DATA_STREAM_ENUMERATION_FAILED: " + description
+                        );
+                    }
+                    break;
+                }
+                stream = next;
+            }
+        }
+        finally
+        {
+            if (!FindClose(find))
+            {
+                throw new Win32Exception(
+                    Marshal.GetLastWin32Error(),
+                    "TEMP_DATA_STREAM_ENUMERATION_CLOSE_FAILED: " + description
+                );
+            }
+        }
+        if (isDirectory)
+        {
+            throw new InvalidOperationException(
+                "TEMP_BACKUP_STATE_DIRECTORY_DATA_STREAM: " + description +
+                " streams=" + String.Join(";", streams.ToArray())
+            );
+        }
+        if (streams.Count != 1 ||
+            !String.Equals(
+                streams[0],
+                "::$DATA:" + expectedFileSize.ToString(CultureInfo.InvariantCulture),
+                StringComparison.Ordinal
+            ))
+        {
+            throw new InvalidOperationException(
+                "TEMP_BACKUP_STATE_DATA_STREAM_SET: " + description +
+                " expected exactly ::$DATA:" + expectedFileSize +
+                "; observed=" + String.Join(";", streams.ToArray())
+            );
+        }
+        return "find-streams:" + streams[0];
+    }
+
     private static ExactBackupState CaptureBackupStateOnce(
         SafeFileHandle handle,
         bool isDirectory,
@@ -960,13 +1068,21 @@ public static class AstroLauncherTempNative
                 "TEMP_BACKUP_STATE_TYPE_CHANGED: " + description
             );
         }
-        if (!isDirectory && before.NumberOfLinks != 1)
+        if (!isDirectory && before.NumberOfLinks == 0)
         {
             throw new InvalidOperationException(
                 "TEMP_BACKUP_STATE_LINK_COUNT: " + description +
-                " must have exactly one link; observed " + before.NumberOfLinks
+                " must have at least one live link"
             );
         }
+        // Ordinary Cargo output legitimately contains hard-linked files.  Link
+        // count is therefore an observed stability property, not a corruption
+        // condition.  CaptureExactTreeEntries enumerates every namespace path
+        // independently, records the shared FILE_ID for linked names, and makes
+        // a second whole-tree comparison immediately before deletion.  Keeping
+        // NumberOfLinks out of the canonical per-path record is intentional:
+        // deleting one already-verified name necessarily changes the count seen
+        // through the next name without changing that name's bytes or identity.
         RequireSupportedAttributes(before.FileAttributes, description);
         FILE_BASIC_INFO basicBefore = ReadBasicInfo(handle, description);
         RequireSupportedAttributes(basicBefore.FileAttributes, description);
@@ -1153,13 +1269,24 @@ public static class AstroLauncherTempNative
 
         try
         {
-            int expectedDataStreams = isDirectory ? 0 : 1;
-            if (dataStreams != expectedDataStreams)
+            ulong fileSize = ((ulong)before.FileSizeHigh << 32) |
+                (ulong)before.FileSizeLow;
+            string dataStreamInventory = ValidateDataStreamInventory(
+                handle,
+                isDirectory,
+                fileSize,
+                description
+            );
+            bool validDataStreamCount = isDirectory
+                ? dataStreams == 0
+                : (fileSize == 0
+                    ? (dataStreams == 0 || dataStreams == 1)
+                    : dataStreams == 1);
+            if (!validDataStreamCount)
             {
                 throw new InvalidDataException(
                     "TEMP_BACKUP_STATE_DEFAULT_DATA_COUNT: " + description +
-                    " observed " + dataStreams + ", expected " +
-                    expectedDataStreams
+                    " observed " + dataStreams + ", file_size=" + fileSize
                 );
             }
             if (securityStreams != 1)
@@ -1184,10 +1311,10 @@ public static class AstroLauncherTempNative
                 );
             }
             BY_HANDLE_FILE_INFORMATION after = ReadInformation(handle, description);
-            ulong fileSize = ((ulong)before.FileSizeHigh << 32) |
-                (ulong)before.FileSizeLow;
             if (!isDirectory &&
-                (dataStreamSize < 0 || (ulong)dataStreamSize != fileSize))
+                ((dataStreams == 0 && fileSize != 0) ||
+                 (dataStreams == 1 &&
+                  (dataStreamSize < 0 || (ulong)dataStreamSize != fileSize))))
             {
                 throw new InvalidDataException(
                     "TEMP_BACKUP_STATE_DEFAULT_DATA_SIZE: " + description +
@@ -1214,7 +1341,10 @@ public static class AstroLauncherTempNative
             string securitySha256 = HexDigest(securityHasher);
             string streamInventory = String.Join(";", inventory.ToArray());
             string canonical = basicAfterCanonical + "," + backupSha256 + "," +
-                securitySha256 + "," + streamInventory;
+                securitySha256 + "," + dataStreamInventory + "," +
+                (dataStreams == 0
+                    ? "backup-default-data:omitted-zero-length"
+                    : "backup-default-data:present") + "," + streamInventory;
             return new ExactBackupState
             {
                 Canonical = canonical,
@@ -1319,11 +1449,10 @@ public static class AstroLauncherTempNative
                 finalPath
             );
         }
-        if (!isDirectory && information.NumberOfLinks != 1)
+        if (!isDirectory && information.NumberOfLinks == 0)
         {
             throw new InvalidOperationException(
-                "TEMP file must have exactly one filesystem link; observed " +
-                information.NumberOfLinks + ": " + finalPath
+                "TEMP file has no live filesystem link: " + finalPath
             );
         }
         ulong size = ((ulong)information.FileSizeHigh << 32) |
@@ -1345,7 +1474,8 @@ public static class AstroLauncherTempNative
             GetIdentity(handle) + "|" +
             Convert.ToBase64String(
                 new UTF8Encoding(false, true).GetBytes(exactBackupState)
-            ) + "|" + shortNameToken;
+            ) + "|" + shortNameToken + "|" +
+            information.NumberOfLinks.ToString(CultureInfo.InvariantCulture);
     }
 
     private static ExactDirectoryEntry[] EnumerateExactDirectoryEntries(
@@ -1740,7 +1870,7 @@ public static class AstroLauncherTempNative
     private static ExpectedEntry ParseExpectedEntry(string record)
     {
         string[] parts = record.Split(new char[] { '|' });
-        if (parts.Length != 5 || (parts[0] != "D" && parts[0] != "F"))
+        if (parts.Length != 6 || (parts[0] != "D" && parts[0] != "F"))
         {
             throw new InvalidOperationException("TEMP tree snapshot record is malformed");
         }
@@ -1805,6 +1935,18 @@ public static class AstroLauncherTempNative
                 );
             }
         }
+        uint linkCount;
+        if (!UInt32.TryParse(
+                parts[5],
+                NumberStyles.None,
+                CultureInfo.InvariantCulture,
+                out linkCount
+            ) || linkCount == 0)
+        {
+            throw new InvalidOperationException(
+                "TEMP tree snapshot link count is invalid"
+            );
+        }
         return new ExpectedEntry
         {
             IsDirectory = parts[0] == "D",
@@ -1812,9 +1954,82 @@ public static class AstroLauncherTempNative
             FileId = parts[2],
             ExactBackupState = exactBackupState,
             ShortNameToken = shortNameToken,
+            LinkCount = linkCount,
             ExactRecord = record,
             Depth = components.Length
         };
+    }
+
+    private static string CanonicalDirectoryStableState(string canonical)
+    {
+        // Removing an already-authorized child can advance every directory time
+        // and set FILE_ATTRIBUTE_ARCHIVE.  Those are namespace side effects of
+        // this exact transaction, not evidence that the retained FILE_ID changed.
+        // All other attributes plus every BackupRead security/EA/object/stream
+        // byte must remain exact.  Compare that stable projection instead of
+        // mistaking our own descendant deletion for external mutation.
+        if (String.IsNullOrEmpty(canonical))
+        {
+            throw new InvalidDataException(
+                "TEMP directory backup-state token is empty"
+            );
+        }
+        int first = canonical.IndexOf(',');
+        int second = first < 0 ? -1 : canonical.IndexOf(',', first + 1);
+        int third = second < 0 ? -1 : canonical.IndexOf(',', second + 1);
+        int fourth = third < 0 ? -1 : canonical.IndexOf(',', third + 1);
+        int fifth = fourth < 0 ? -1 : canonical.IndexOf(',', fourth + 1);
+        if (first <= 0 || second <= first + 1 || third <= second + 1 ||
+            fourth <= third + 1 || fifth <= fourth + 1)
+        {
+            throw new InvalidDataException(
+                "TEMP directory backup-state token is malformed"
+            );
+        }
+        uint attributes;
+        string attributesText = canonical.Substring(
+            fourth + 1,
+            fifth - fourth - 1
+        );
+        if (!UInt32.TryParse(
+                attributesText,
+                NumberStyles.None,
+                CultureInfo.InvariantCulture,
+                out attributes
+            ))
+        {
+            throw new InvalidDataException(
+                "TEMP directory backup-state attributes are malformed"
+            );
+        }
+        uint stableAttributes = attributes & ~FILE_ATTRIBUTE_ARCHIVE;
+        return stableAttributes.ToString(CultureInfo.InvariantCulture) + "," +
+            canonical.Substring(fifth + 1);
+    }
+
+    private static string CanonicalFileAfterAuthorizedUnlinkState(string canonical)
+    {
+        // Removing one already-authorized hard-link name advances the shared
+        // NTFS object's ChangeTime.  Creation/access/write times, attributes,
+        // bytes, security, EA/object metadata, and stream inventory must remain
+        // exact through every remaining name.
+        if (String.IsNullOrEmpty(canonical))
+        {
+            throw new InvalidDataException("TEMP file backup-state token is empty");
+        }
+        int first = canonical.IndexOf(',');
+        int second = first < 0 ? -1 : canonical.IndexOf(',', first + 1);
+        int third = second < 0 ? -1 : canonical.IndexOf(',', second + 1);
+        int fourth = third < 0 ? -1 : canonical.IndexOf(',', third + 1);
+        int fifth = fourth < 0 ? -1 : canonical.IndexOf(',', fourth + 1);
+        if (first <= 0 || second <= first + 1 || third <= second + 1 ||
+            fourth <= third + 1 || fifth <= fourth + 1)
+        {
+            throw new InvalidDataException(
+                "TEMP file backup-state token is malformed"
+            );
+        }
+        return canonical.Substring(0, third + 1) + canonical.Substring(fourth + 1);
     }
 
     private static void SetDisposition(
@@ -1879,6 +2094,8 @@ public static class AstroLauncherTempNative
 
         List<ExpectedEntry> parsed = new List<ExpectedEntry>();
         HashSet<string> paths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        Dictionary<string, uint> fileNamesById =
+            new Dictionary<string, uint>(StringComparer.Ordinal);
         foreach (string record in expectedEntries)
         {
             ExpectedEntry entry = ParseExpectedEntry(record);
@@ -1890,6 +2107,23 @@ public static class AstroLauncherTempNative
                 );
             }
             parsed.Add(entry);
+            if (!entry.IsDirectory)
+            {
+                uint names;
+                fileNamesById.TryGetValue(entry.FileId, out names);
+                fileNamesById[entry.FileId] = checked(names + 1);
+            }
+        }
+        foreach (ExpectedEntry entry in parsed)
+        {
+            if (!entry.IsDirectory && entry.LinkCount != fileNamesById[entry.FileId])
+            {
+                throw new InvalidOperationException(
+                    "TEMP hard-link set escapes the exact authorized tree: file_id=" +
+                    entry.FileId + " observed_links=" + entry.LinkCount +
+                    " names_in_tree=" + fileNamesById[entry.FileId]
+                );
+            }
         }
         parsed.Sort(delegate(ExpectedEntry left, ExpectedEntry right)
         {
@@ -1901,6 +2135,8 @@ public static class AstroLauncherTempNative
             return StringComparer.Ordinal.Compare(right.RelativePath, left.RelativePath);
         });
 
+        Dictionary<string, uint> removedLinksById =
+            new Dictionary<string, uint>(StringComparer.Ordinal);
         foreach (ExpectedEntry expected in parsed)
         {
             string path = Path.GetFullPath(Path.Combine(rootPath, expected.RelativePath));
@@ -1940,6 +2176,20 @@ public static class AstroLauncherTempNative
                     handle,
                     "exact TEMP deletion entry after backup-state digest"
                 );
+                uint removedLinks = 0;
+                if (!expected.IsDirectory)
+                {
+                    removedLinksById.TryGetValue(expected.FileId, out removedLinks);
+                    uint expectedLinks = checked(expected.LinkCount - removedLinks);
+                    if (information.NumberOfLinks != expectedLinks)
+                    {
+                        throw new InvalidOperationException(
+                            "TEMP hard-link count changed outside authorized deletion: " + path +
+                            " expected=" + expectedLinks +
+                            " observed=" + information.NumberOfLinks
+                        );
+                    }
+                }
                 string currentRecord = BuildRecord(
                     rootPath,
                     path,
@@ -1956,11 +2206,49 @@ public static class AstroLauncherTempNative
                         path
                     );
                 }
-                if (!String.Equals(
-                    currentRecord,
-                    expected.ExactRecord,
-                    StringComparison.Ordinal
-                ))
+                bool exactStateMatches;
+                if (expected.IsDirectory)
+                {
+                    ExactDirectoryEntry[] children = EnumerateExactDirectoryEntries(
+                        handle,
+                        "exact empty TEMP deletion directory " + path
+                    );
+                    if (children.Length != 0)
+                    {
+                        throw new InvalidOperationException(
+                            "TEMP directory received or retained children before exact deletion: " +
+                            path
+                        );
+                    }
+                    exactStateMatches = String.Equals(
+                        CanonicalDirectoryStableState(backupBefore.Canonical),
+                        CanonicalDirectoryStableState(expected.ExactBackupState),
+                        StringComparison.Ordinal
+                    ) && String.Equals(
+                        GetExactShortNameToken(path),
+                        expected.ShortNameToken,
+                        StringComparison.Ordinal
+                    );
+                }
+                else
+                {
+                    exactStateMatches = removedLinks == 0
+                        ? String.Equals(
+                            currentRecord,
+                            expected.ExactRecord,
+                            StringComparison.Ordinal
+                        )
+                        : String.Equals(
+                            CanonicalFileAfterAuthorizedUnlinkState(backupBefore.Canonical),
+                            CanonicalFileAfterAuthorizedUnlinkState(expected.ExactBackupState),
+                            StringComparison.Ordinal
+                        ) && String.Equals(
+                            GetExactShortNameToken(path),
+                            expected.ShortNameToken,
+                            StringComparison.Ordinal
+                        );
+                }
+                if (!exactStateMatches)
                 {
                     throw new InvalidOperationException(
                         "TEMP entry backup/basic/security state changed before exact deletion: " +
@@ -1974,6 +2262,12 @@ public static class AstroLauncherTempNative
                 SetDisposition(handle, path);
             }
             RequirePathAbsent(path);
+            if (!expected.IsDirectory)
+            {
+                uint removed;
+                removedLinksById.TryGetValue(expected.FileId, out removed);
+                removedLinksById[expected.FileId] = checked(removed + 1);
+            }
         }
 
         string[] remaining = CaptureExactTreeEntries(root);
@@ -2081,14 +2375,13 @@ public static class AstroLauncherTempNative
                 "exact TEMP root cannot enter delete-pending while nonempty"
             );
         }
-        ExactBackupState before = CaptureBackupState(
-            root,
-            true,
-            "exact TEMP root before disposition"
-        );
-        string beforeToken = Convert.ToBase64String(
-            new UTF8Encoding(false, true).GetBytes(before.Canonical)
-        );
+        // The retained producer/mutation handle deliberately carries DELETE but
+        // not FILE_WRITE_ATTRIBUTES.  CaptureExactRootState opens the dedicated
+        // backup observer with the minimum metadata rights, binds it back to this
+        // retained FILE_ID/path, and returns the same canonical token used by the
+        // preceding snapshot.  Calling CaptureBackupState on the retained handle
+        // made valid cleanup fail when SetFileTime correctly rejected its rights.
+        string beforeToken = CaptureExactRootState(root);
         if (!String.Equals(beforeToken, expectedRootState, StringComparison.Ordinal))
         {
             throw new InvalidOperationException(
