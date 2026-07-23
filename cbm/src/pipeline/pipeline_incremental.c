@@ -1024,7 +1024,25 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
      * without re-parsing source files. */
     bool snapshot_noop = n_changed == 0 && deleted_count == 0;
     if (snapshot_noop && !cbm_pipeline_row_sink_active(p)) {
-        cbm_log_info("incremental.noop", "reason", "no_changes");
+        int committed_nodes = cbm_store_count_nodes(store, project);
+        int committed_edges = cbm_store_count_edges(store, project);
+        if (committed_nodes < 0 || committed_edges < 0) {
+            cbm_log_error(
+                "incremental.noop_failed", "code", "CBM_INCREMENTAL_NOOP_COUNTS_READ_FAILED",
+                "project", project, "store_error", cbm_store_error(store), "message",
+                "the unchanged persisted graph could not be counted for the completed result",
+                "remediation",
+                "preserve the database family, inspect the structured store error, and retry");
+            free(is_changed);
+            free(deleted);
+            free_mode_skipped(mode_skipped, mode_skipped_count);
+            cbm_store_free_file_hashes(stored, stored_count);
+            cbm_store_close(store);
+            return CBM_NOT_FOUND;
+        }
+        cbm_pipeline_set_committed_counts(p, committed_nodes, committed_edges);
+        cbm_log_info("incremental.noop", "reason", "no_changes", "nodes", itoa_buf(committed_nodes),
+                     "edges", itoa_buf(committed_edges));
         free(is_changed);
         free(deleted);
         free_mode_skipped(mode_skipped, mode_skipped_count);
