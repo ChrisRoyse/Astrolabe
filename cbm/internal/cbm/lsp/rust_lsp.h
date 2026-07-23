@@ -107,10 +107,21 @@ typedef struct {
     struct RustMacroRule **macro_rules_arr;
     int macro_rules_count;
 
-    /* Recursion guard for macro expansion. Real macro_rules! can be
-     * recursive; we cap at 8 nested expansions to keep the walker
-     * bounded. */
+    /* Explicit per-file bounds for macro processing.  The expansion depth
+     * is an Astrolabe semantic-analysis budget (not rustc's crate
+     * `recursion_limit`).  Work covers tokenisation, rule matching,
+     * fragment validation, substitution, and synthetic parsing.  Matcher
+     * depth bounds recursive matcher structure independently of expansion
+     * recursion.  Exhaustion is a sticky file failure, never a partial
+     * expansion. */
     int macro_expand_depth;
+    int macro_expand_depth_limit;
+    int macro_work_count;
+    int macro_work_limit;
+    int macro_match_depth;
+    int macro_match_depth_limit;
+    uint32_t macro_origin_byte;
+    bool macro_origin_valid;
 
     /* Pathological-input guard: counts the number of call-resolution
      * + type-evaluation steps spent on the current file. When the
@@ -119,6 +130,10 @@ typedef struct {
      * Mirrors the cap added to `c_lsp.c` since the worktree branched
      * (RUST_LSP_FOLLOWUP §B.2). */
     int eval_step_count;
+    int eval_step_limit;
+    int lookup_depth_limit;
+    int walk_depth;
+    int walk_depth_limit;
 
     /* Cargo.toml manifest, when the caller has parsed one and routed
      * it through. The resolver consults `dep_count`/`member_count` so
@@ -175,16 +190,10 @@ typedef struct {
     /* CBM_LSP_DEBUG=1 in env enables verbose stderr trace. */
     bool debug;
 
-    /* Per-ROOT-invocation macro-expansion memo. Kernel macro_rules are often
-     * self-recursive (define_sizes! re-invokes itself with @internal/@impls
-     * args) and the expansion fallback ("no pattern matched — still expand the
-     * first rule") makes that recursion non-convergent: with an unbounded
-     * BREADTH under the depth-8 guard, 2-44 source invocations exploded into
-     * ~200k expansions (each a full tree-sitter parse) ≈ 63 s per file.
-     * Within one expansion chain an identical (macro, substituted body) is
-     * walked once — identical text implies an identical walk, and recursive
-     * re-invocations have no distinct source site to attribute. Reset at each
-     * top-level invocation so distinct source sites keep their attribution. */
+    /* Per-root-invocation macro-expansion cycle detector.  Re-observing the
+     * same (macro, substituted body) in one expansion chain is a structured
+     * non-convergent-recursion failure.  It must never silently suppress an
+     * expansion. */
     CBMNegMemo macro_memo;
 } RustLSPContext;
 

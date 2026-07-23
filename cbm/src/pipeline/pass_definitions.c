@@ -670,7 +670,12 @@ int cbm_pipeline_pass_definitions(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
     }
 
     /* Ensure extraction library is initialized */
-    cbm_init();
+    if (cbm_init() != 0) {
+        cbm_log_error("pass.definitions.init_failed", "code", "CBM_ALLOCATOR_INIT_FAILED",
+                      "message", "the extraction allocator contract could not be initialized",
+                      "remediation", "inspect allocator.bind_failed and restart the process");
+        return CBM_NOT_FOUND;
+    }
 
     /* Defensive: a prior pipeline run may have left a thread-local parser whose
      * lexer holds pointers into a slab that has since been reclaimed. Drop it

@@ -11,6 +11,11 @@
 
 /* ── Thread ───────────────────────────────────────────────────── */
 
+#define CBM_THREAD_ERROR_NONE 0
+#define CBM_THREAD_ERROR_ERRNO 1
+#define CBM_THREAD_ERROR_WIN32 2
+#define CBM_THREAD_ERROR_PTHREAD 3
+
 #ifdef _WIN32
 
 #ifndef WIN32_LEAN_AND_MEAN
@@ -20,6 +25,8 @@
 
 typedef struct {
     HANDLE handle;
+    int error_domain;
+    unsigned long error_code;
 } cbm_thread_t;
 
 #else /* POSIX */
@@ -28,12 +35,15 @@ typedef struct {
 
 typedef struct {
     pthread_t handle;
+    int error_domain;
+    unsigned long error_code;
 } cbm_thread_t;
 
 #endif
 
-/* Create a thread with the given stack size (0 = OS default).
- * fn receives arg. Returns 0 on success. */
+/* Create a thread with the given stack size (0 = project default).
+ * fn receives arg. Returns 0 on success. On failure, error_domain/error_code
+ * retain the exact errno, Win32, or pthread diagnostic. */
 int cbm_thread_create(cbm_thread_t *t, size_t stack_size, void *(*fn)(void *), void *arg);
 
 /* Wait for thread to finish. Returns 0 on success. */

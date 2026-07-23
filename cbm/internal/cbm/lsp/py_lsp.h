@@ -97,6 +97,10 @@ typedef struct {
     int eval_depth;                  // evaluator recursion depth (PY_LSP_MAX_EVAL_DEPTH)
     int eval_steps;                  // per-file work budget used (PY_EVAL_MAX_STEPS_PER_FILE)
     uint32_t eval_truncations;       // depth/budget cutoff count — gates memo inserts
+    int eval_depth_limit;
+    int eval_step_limit;
+    int lookup_depth_limit;
+    int walk_depth_limit;
 
     // Per-file instance-field OVERLAY. When the Tier-2 registry is shared + sealed
     // (registry->read_only), `self.x = ...` / PEP-526 field discoveries made during

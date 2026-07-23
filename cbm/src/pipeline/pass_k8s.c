@@ -633,7 +633,12 @@ static void handle_dep_manifest(cbm_pipeline_ctx_t *ctx, const char *rel_path, c
 int cbm_pipeline_pass_k8s(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, int file_count) {
     cbm_log_info("pass.start", "pass", "k8s", "files", itoa_k8s(file_count));
 
-    cbm_init();
+    if (cbm_init() != 0) {
+        cbm_log_error("pass.k8s.init_failed", "code", "CBM_ALLOCATOR_INIT_FAILED", "message",
+                      "the extraction allocator contract could not be initialized", "remediation",
+                      "inspect allocator.bind_failed and restart the process");
+        return CBM_NOT_FOUND;
+    }
 
     int kustomize_count = 0;
     int manifest_count = 0;

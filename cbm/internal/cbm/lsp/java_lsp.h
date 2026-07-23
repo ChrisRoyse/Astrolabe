@@ -86,7 +86,11 @@ typedef struct {
     /* Recursion guards. */
     int eval_depth;
     int statement_depth;
+    int eval_depth_limit;
+    int statement_depth_limit;
+    int lookup_depth_limit;
     int walk_depth; /* java_resolve_calls_in_node self-recursion (AST nesting) */
+    int walk_depth_limit;
 
     /* Debug mode (CBM_LSP_DEBUG env). */
     bool debug;

@@ -611,6 +611,11 @@ int cbm_pipeline_pass_semantic_edges(cbm_pipeline_ctx_t *ctx);
  * cycles (recursive). Runs on the graph buffer before the dump. */
 void cbm_pipeline_pass_complexity(cbm_pipeline_ctx_t *ctx);
 
+/* Build a process/request-unique staging identity beside a live database.
+ * The caller owns *out_path. The direct writer still opens it with CREATE_NEW,
+ * so an identity collision is a hard failure rather than an overwrite. */
+int cbm_pipeline_unique_stage_path(const char *db_path, const char *kind, char **out_path);
+
 /* ── Incremental pipeline (pipeline_incremental.c) ───────────────── */
 
 /* Run incremental re-index on an existing disk DB.

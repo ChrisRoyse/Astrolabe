@@ -1,4 +1,5 @@
 #include "c_lsp.h"
+#include "semantic_array.h"
 #include "lsp_node_iter.h"
 #include "../helpers.h"
 #include <string.h>
@@ -30,6 +31,11 @@ const CBMType *c_eval_expr_type(CLSPContext *ctx, TSNode node);
 // External tree-sitter language functions (defined in grammar_*.c)
 extern const TSLanguage *tree_sitter_c(void);
 extern const TSLanguage *tree_sitter_cpp(void);
+
+enum {
+    C_LSP_DEFAULT_EVAL_DEPTH_LIMIT = 256,
+    C_LSP_DEFAULT_EVAL_STEP_LIMIT = 10000,
+};
 
 // --- Smart pointer names for deref ---
 // Checks suffix: "std.shared_ptr", "test.main.std.shared_ptr" both match
@@ -68,6 +74,18 @@ void c_lsp_init(CLSPContext *ctx, CBMArena *arena, const char *source, int sourc
     ctx->cpp_mode = cpp_mode;
     ctx->resolved_calls = out;
     ctx->current_scope = cbm_scope_push(arena, NULL);
+    if (!cbm_lsp_read_positive_limit(arena, "CBM_LSP_MAX_EVAL_DEPTH",
+                                     C_LSP_DEFAULT_EVAL_DEPTH_LIMIT, "c_lsp_eval_depth_config",
+                                     &ctx->eval_depth_limit) ||
+        !cbm_lsp_read_positive_limit(arena, "CBM_LSP_MAX_EVAL_STEPS", C_LSP_DEFAULT_EVAL_STEP_LIMIT,
+                                     "c_lsp_eval_steps_config", &ctx->eval_step_limit) ||
+        !cbm_lsp_read_positive_limit(arena, "CBM_LSP_MAX_LOOKUP_DEPTH",
+                                     CBM_LSP_DEFAULT_LOOKUP_DEPTH, "c_lsp_lookup_depth_config",
+                                     &ctx->lookup_depth_limit) ||
+        !cbm_lsp_read_positive_limit(arena, "CBM_LSP_MAX_WALK_DEPTH", CBM_LSP_DEFAULT_WALK_DEPTH,
+                                     "c_lsp_walk_depth_config", &ctx->walk_depth_limit)) {
+        return;
+    }
 
     const char *debug_env = getenv("CBM_LSP_DEBUG");
     ctx->debug = (debug_env && debug_env[0]);
@@ -202,12 +220,19 @@ static const char *c_extract_dll_resolve_name(CLSPContext *ctx, TSNode expr, boo
     // Unwrap cast expressions to find inner call
     TSNode inner = expr;
     const char *ik = ts_node_type(inner);
-    for (int unwrap_depth = 0; unwrap_depth < 8; unwrap_depth++) {
+    int unwrap_depth = 0;
+    for (;;) {
         // Standard cast nodes: (Type)expr, static_cast<T>(expr) etc.
         if (strcmp(ik, "cast_expression") == 0 || strcmp(ik, "static_cast_expression") == 0 ||
             strcmp(ik, "reinterpret_cast_expression") == 0 ||
             strcmp(ik, "dynamic_cast_expression") == 0 ||
             strcmp(ik, "const_cast_expression") == 0) {
+            if (unwrap_depth >= ctx->lookup_depth_limit) {
+                cbm_arena_mark_failed(ctx->arena, "CBM_LSP_ANALYSIS_LIMIT_EXCEEDED",
+                                      "c_lsp_dynamic_resolver_cast_depth",
+                                      (size_t)ctx->lookup_depth_limit);
+                return NULL;
+            }
             *out_has_cast = true;
             uint32_t nc = ts_node_named_child_count(inner);
             if (nc == 0)
@@ -216,6 +241,7 @@ static const char *c_extract_dll_resolve_name(CLSPContext *ctx, TSNode expr, boo
             if (ts_node_is_null(inner))
                 return NULL;
             ik = ts_node_type(inner);
+            unwrap_depth++;
             continue;
         }
         // C++ named casts may parse as call_expression with template_function:
@@ -235,6 +261,12 @@ static const char *c_extract_dll_resolve_name(CLSPContext *ctx, TSNode expr, boo
                 if (fname &&
                     (strcmp(fname, "static_cast") == 0 || strcmp(fname, "reinterpret_cast") == 0 ||
                      strcmp(fname, "dynamic_cast") == 0 || strcmp(fname, "const_cast") == 0)) {
+                    if (unwrap_depth >= ctx->lookup_depth_limit) {
+                        cbm_arena_mark_failed(ctx->arena, "CBM_LSP_ANALYSIS_LIMIT_EXCEEDED",
+                                              "c_lsp_dynamic_resolver_cast_depth",
+                                              (size_t)ctx->lookup_depth_limit);
+                        return NULL;
+                    }
                     *out_has_cast = true;
                     TSNode cargs = ts_node_child_by_field_name(inner, "arguments", 9);
                     if (!ts_node_is_null(cargs) && ts_node_named_child_count(cargs) > 0) {
@@ -242,6 +274,7 @@ static const char *c_extract_dll_resolve_name(CLSPContext *ctx, TSNode expr, boo
                         if (ts_node_is_null(inner))
                             return NULL;
                         ik = ts_node_type(inner);
+                        unwrap_depth++;
                         continue;
                     }
                     return NULL;
@@ -331,10 +364,20 @@ static void c_resolve_pending_template_calls(CLSPContext *ctx, const CBMRegister
 
     // Build type param → concrete type mapping from call-site arguments
     const char **tpn = callee->type_param_names;
-    const CBMType *param_map[8] = {0};
     int tpn_count = 0;
-    while (tpn[tpn_count] && tpn_count < 8)
+    while (tpn[tpn_count])
         tpn_count++;
+    const CBMType **param_map = NULL;
+    size_t param_map_capacity = 0;
+    if (tpn_count > 0 &&
+        !cbm_lsp_semantic_array_reserve(ctx->arena, (void **)&param_map, 0, &param_map_capacity,
+                                        sizeof(*param_map), (size_t)tpn_count,
+                                        "c_lsp_template_parameter_map")) {
+        return;
+    }
+    if (param_map) {
+        memset(param_map, 0, (size_t)tpn_count * sizeof(*param_map));
+    }
 
     // Match call arg types against function param types to deduce type params.
     // The call site may contain more arguments than the parsed function signature
@@ -449,7 +492,7 @@ static void c_parse_template_params(CLSPContext *ctx, TSNode template_decl) {
         return;
 
     int idx = 0;
-    for (uint32_t i = 0; i < nc && idx < 16; i++) {
+    for (uint32_t i = 0; i < nc; i++) {
         TSNode param = ts_node_named_child(params, i);
         if (ts_node_is_null(param))
             continue;
@@ -715,11 +758,16 @@ static const char *c_adl_resolve(CLSPContext *ctx, const char *name, TSNode call
     if (nc == 0)
         return NULL;
 
-    // Collect unique namespace QNs from argument types (max 8 to bound work)
-    const char *namespaces[8];
+    // Collect every unique namespace QN from argument types.
+    const char **namespaces = NULL;
+    size_t namespace_capacity = 0;
+    if (!cbm_lsp_semantic_array_reserve(ctx->arena, (void **)&namespaces, 0, &namespace_capacity,
+                                        sizeof(*namespaces), (size_t)nc, "c_lsp_adl_namespaces")) {
+        return NULL;
+    }
     int ns_count = 0;
 
-    for (uint32_t i = 0; i < nc && ns_count < 8; i++) {
+    for (uint32_t i = 0; i < nc; i++) {
         TSNode arg = ts_node_named_child(args, i);
         if (ts_node_is_null(arg))
             continue;
@@ -841,7 +889,8 @@ static const CBMType *c_resolve_name_to_type(CLSPContext *ctx, const char *name)
     {
         const CBMType *scoped = cbm_scope_lookup(ctx->current_scope, name);
         if (scoped && scoped->kind == CBM_TYPE_ALIAS) {
-            const CBMType *resolved = cbm_type_resolve_alias(scoped);
+            const CBMType *resolved = cbm_type_resolve_alias(
+                ctx->arena, scoped, ctx->lookup_depth_limit, "c_lsp_scoped_alias_depth");
             if (resolved && !cbm_type_is_unknown(resolved))
                 return resolved;
         }
@@ -921,6 +970,38 @@ static const CBMType *c_resolve_name_to_type(CLSPContext *ctx, const char *name)
 // c_parse_type_node: AST type node -> CBMType
 // ============================================================================
 
+static const CBMType **c_parse_template_arg_nodes(CLSPContext *ctx, TSNode args_node,
+                                                  int *out_count, const char *operation) {
+    *out_count = 0;
+    if (ts_node_is_null(args_node)) {
+        return NULL;
+    }
+    uint32_t child_count = ts_node_named_child_count(args_node);
+    const CBMType **args = NULL;
+    size_t capacity = 0;
+    if (!cbm_lsp_semantic_array_reserve(ctx->arena, (void **)&args, 0, &capacity, sizeof(*args),
+                                        (size_t)child_count + 1, operation)) {
+        return NULL;
+    }
+    for (uint32_t i = 0; i < child_count; i++) {
+        TSNode arg = ts_node_named_child(args_node, i);
+        if (ts_node_is_null(arg)) {
+            continue;
+        }
+        if (strcmp(ts_node_type(arg), "type_descriptor") == 0 &&
+            ts_node_named_child_count(arg) > 0) {
+            arg = ts_node_named_child(arg, 0);
+        }
+        args[*out_count] = c_parse_type_node(ctx, arg);
+        (*out_count)++;
+        if (cbm_arena_failed(ctx->arena)) {
+            return NULL;
+        }
+    }
+    args[*out_count] = NULL;
+    return args;
+}
+
 const CBMType *c_parse_type_node(CLSPContext *ctx, TSNode node) {
     if (ts_node_is_null(node))
         return cbm_type_unknown();
@@ -993,28 +1074,11 @@ const CBMType *c_parse_type_node(CLSPContext *ctx, TSNode node) {
                     template_qn = mod_qn;
             }
 
-            // Parse template arguments
-            const CBMType *targs[16] = {
-                NULL}; /* zero-fill: cbm_type_substitute requires NULL-terminated args
-                          (uninitialized tail bound T to stack garbage -> corrupt type graph,
-                          bitcoin serialize.h) */
             int targ_count = 0;
-            if (!ts_node_is_null(tmpl_args)) {
-                uint32_t nc = ts_node_named_child_count(tmpl_args);
-                for (uint32_t i = 0; i < nc && targ_count < 15; i++) {
-                    TSNode arg = ts_node_named_child(tmpl_args, i);
-                    if (ts_node_is_null(arg))
-                        continue;
-                    const char *ak = ts_node_type(arg);
-                    if (strcmp(ak, "type_descriptor") == 0) {
-                        if (ts_node_named_child_count(arg) > 0)
-                            targs[targ_count++] =
-                                c_parse_type_node(ctx, ts_node_named_child(arg, 0));
-                    } else {
-                        targs[targ_count++] = c_parse_type_node(ctx, arg);
-                    }
-                }
-            }
+            const CBMType **targs = c_parse_template_arg_nodes(
+                ctx, tmpl_args, &targ_count, "c_lsp_qualified_template_arguments");
+            if (cbm_arena_failed(ctx->arena))
+                return cbm_type_unknown();
 
             if (targ_count > 0)
                 return cbm_type_template(ctx->arena, template_qn, targs, targ_count);
@@ -1098,28 +1162,11 @@ const CBMType *c_parse_type_node(CLSPContext *ctx, TSNode node) {
                 template_qn = std_qn;
         }
 
-        // Parse template arguments
-        const CBMType *targs[16] = {
-            NULL}; /* zero-fill: cbm_type_substitute requires NULL-terminated args (uninitialized
-                      tail bound T to stack garbage -> corrupt type graph, bitcoin serialize.h) */
         int targ_count = 0;
-        if (!ts_node_is_null(args_node)) {
-            uint32_t nc = ts_node_named_child_count(args_node);
-            for (uint32_t i = 0; i < nc && targ_count < 15; i++) {
-                TSNode arg = ts_node_named_child(args_node, i);
-                if (ts_node_is_null(arg))
-                    continue;
-                const char *ak = ts_node_type(arg);
-                if (strcmp(ak, "type_descriptor") == 0) {
-                    // type_descriptor wraps a type node
-                    if (ts_node_named_child_count(arg) > 0) {
-                        targs[targ_count++] = c_parse_type_node(ctx, ts_node_named_child(arg, 0));
-                    }
-                } else {
-                    targs[targ_count++] = c_parse_type_node(ctx, arg);
-                }
-            }
-        }
+        const CBMType **targs =
+            c_parse_template_arg_nodes(ctx, args_node, &targ_count, "c_lsp_template_arguments");
+        if (cbm_arena_failed(ctx->arena))
+            return cbm_type_unknown();
 
         if (targ_count > 0) {
             return cbm_type_template(ctx->arena, template_qn, targs, targ_count);
@@ -1366,22 +1413,20 @@ static const char *type_to_qn(const CBMType *t) {
 
 static const CBMType *c_eval_expr_type_inner(CLSPContext *ctx, TSNode node);
 
-#define C_EVAL_DEPTH_LIMIT 256
-#define C_EVAL_MAX_STEPS_PER_FILE 10000
-
 const CBMType *c_eval_expr_type(CLSPContext *ctx, TSNode node) {
-    if (ts_node_is_null(node))
+    if (!ctx || cbm_arena_failed(ctx->arena) || ts_node_is_null(node))
         return cbm_type_unknown();
-    /* Expression type evaluation is best-effort. Some recovery-mode C++ ASTs
-     * can repeatedly drive member/type lookup without increasing recursion
-     * depth. Keep a generous per-file work budget so pathological expressions
-     * degrade to unknown instead of hanging repository indexing. */
-    if (ctx->eval_depth > C_EVAL_DEPTH_LIMIT || ctx->eval_steps++ > C_EVAL_MAX_STEPS_PER_FILE) {
-        if (ctx->debug && ctx->eval_steps == C_EVAL_MAX_STEPS_PER_FILE + 2) {
-            fprintf(stderr, "  [clsp] expression eval step budget exhausted; returning unknown\n");
-        }
+    if (ctx->eval_depth >= ctx->eval_depth_limit) {
+        cbm_arena_mark_failed(ctx->arena, "CBM_LSP_ANALYSIS_LIMIT_EXCEEDED",
+                              "c_lsp_expression_depth", (size_t)ctx->eval_depth_limit);
         return cbm_type_unknown();
     }
+    if (ctx->eval_steps >= ctx->eval_step_limit) {
+        cbm_arena_mark_failed(ctx->arena, "CBM_LSP_ANALYSIS_LIMIT_EXCEEDED",
+                              "c_lsp_expression_steps", (size_t)ctx->eval_step_limit);
+        return cbm_type_unknown();
+    }
+    ctx->eval_steps++;
     ctx->eval_depth++;
     const CBMType *result = c_eval_expr_type_inner(ctx, node);
     ctx->eval_depth--;
@@ -1599,25 +1644,11 @@ static const CBMType *c_eval_expr_type_inner(CLSPContext *ctx, TSNode node) {
                 f->signature->kind == CBM_TYPE_FUNC && f->signature->data.func.return_types &&
                 f->signature->data.func.return_types[0]) {
                 const CBMType *base_ret = f->signature->data.func.return_types[0];
-                const CBMType *targs[16] = {
-                    NULL}; /* zero-fill: cbm_type_substitute requires NULL-terminated args
-                              (uninitialized tail bound T to stack garbage -> corrupt type graph,
-                              bitcoin serialize.h) */
                 int targ_count = 0;
-                uint32_t tnc = ts_node_named_child_count(qi_tmpl_args);
-                for (uint32_t ti = 0; ti < tnc && targ_count < 15; ti++) {
-                    TSNode targ = ts_node_named_child(qi_tmpl_args, ti);
-                    if (ts_node_is_null(targ))
-                        continue;
-                    const char *tak = ts_node_type(targ);
-                    if (strcmp(tak, "type_descriptor") == 0) {
-                        if (ts_node_named_child_count(targ) > 0)
-                            targs[targ_count++] =
-                                c_parse_type_node(ctx, ts_node_named_child(targ, 0));
-                    } else {
-                        targs[targ_count++] = c_parse_type_node(ctx, targ);
-                    }
-                }
+                const CBMType **targs = c_parse_template_arg_nodes(ctx, qi_tmpl_args, &targ_count,
+                                                                   "c_lsp_call_template_arguments");
+                if (cbm_arena_failed(ctx->arena))
+                    return cbm_type_unknown();
                 if (targ_count > 0) {
                     const char **tpn = f->type_param_names;
                     if (tpn) {
@@ -1759,25 +1790,11 @@ static const CBMType *c_eval_expr_type_inner(CLSPContext *ctx, TSNode node) {
             return f->signature;
 
         // Parse explicit template arguments from <...>
-        const CBMType *targs[16] = {
-            NULL}; /* zero-fill: cbm_type_substitute requires NULL-terminated args (uninitialized
-                      tail bound T to stack garbage -> corrupt type graph, bitcoin serialize.h) */
         int targ_count = 0;
-        if (!ts_node_is_null(args_node)) {
-            uint32_t nc = ts_node_named_child_count(args_node);
-            for (uint32_t i = 0; i < nc && targ_count < 15; i++) {
-                TSNode arg = ts_node_named_child(args_node, i);
-                if (ts_node_is_null(arg))
-                    continue;
-                const char *ak = ts_node_type(arg);
-                if (strcmp(ak, "type_descriptor") == 0) {
-                    if (ts_node_named_child_count(arg) > 0)
-                        targs[targ_count++] = c_parse_type_node(ctx, ts_node_named_child(arg, 0));
-                } else {
-                    targs[targ_count++] = c_parse_type_node(ctx, arg);
-                }
-            }
-        }
+        const CBMType **targs = c_parse_template_arg_nodes(ctx, args_node, &targ_count,
+                                                           "c_lsp_explicit_template_arguments");
+        if (cbm_arena_failed(ctx->arena))
+            return cbm_type_unknown();
 
         // Substitute explicit template args into return type
         if (targ_count > 0) {
@@ -1965,8 +1982,16 @@ static const CBMType *c_eval_expr_type_inner(CLSPContext *ctx, TSNode node) {
                         int tp_count = 0;
                         while (rf->type_param_names[tp_count])
                             tp_count++;
-                        if (tp_count > 0 && tp_count <= 8) {
-                            const CBMType *deduced[8] = {NULL};
+                        if (tp_count > 0) {
+                            const CBMType **deduced = NULL;
+                            size_t deduced_capacity = 0;
+                            if (!cbm_lsp_semantic_array_reserve(
+                                    ctx->arena, (void **)&deduced, 0, &deduced_capacity,
+                                    sizeof(*deduced), (size_t)tp_count,
+                                    "c_lsp_deduced_template_arguments")) {
+                                return cbm_type_unknown();
+                            }
+                            memset(deduced, 0, (size_t)tp_count * sizeof(*deduced));
                             TSNode call_args = ts_node_child_by_field_name(node, "arguments", 9);
                             int pi = 0;
                             if (!ts_node_is_null(call_args)) {
@@ -2557,34 +2582,45 @@ static bool c_neg_memo_contains(const CLSPContext *ctx, uint64_t h) {
 }
 
 static void c_neg_memo_insert(CLSPContext *ctx, uint64_t h) {
-    // Lazy alloc / grow-by-rehash at 70% load. On OOM, silently disable the memo
-    // (correctness is unaffected — the full cascade still runs).
+    // Lazy alloc / grow-by-rehash at 70% load. Allocation failure is sticky:
+    // continuing would violate the fail-closed per-file analysis contract and
+    // a full table would otherwise make the linear probe non-terminating.
     if (ctx->neg_memo == NULL) {
         uint64_t *nm = (uint64_t *)calloc(1024, sizeof(uint64_t));
-        if (!nm)
+        if (!nm) {
+            cbm_arena_mark_failed(ctx->arena, "CBM_LSP_ALLOCATION_FAILED",
+                                  "c_lsp_negative_memo_allocate", 1024 * sizeof(uint64_t));
             return;
+        }
         ctx->neg_memo = nm;
         ctx->neg_memo_cap = 1024;
         ctx->neg_memo_count = 0;
-    } else if ((ctx->neg_memo_count + 1) * 10 >= ctx->neg_memo_cap * 7) {
+    } else if ((uint64_t)(ctx->neg_memo_count + 1) * 10u >= (uint64_t)ctx->neg_memo_cap * 7u) {
+        if (ctx->neg_memo_cap > INT_MAX / 2) {
+            cbm_arena_mark_failed(ctx->arena, "CBM_LSP_ANALYSIS_LIMIT_EXCEEDED",
+                                  "c_lsp_negative_memo_capacity", SIZE_MAX);
+            return;
+        }
         int new_cap = ctx->neg_memo_cap * 2;
         uint64_t *nm = (uint64_t *)calloc((size_t)new_cap, sizeof(uint64_t));
-        if (nm) {
-            uint64_t nmask = (uint64_t)new_cap - 1;
-            for (int j = 0; j < ctx->neg_memo_cap; j++) {
-                uint64_t v = ctx->neg_memo[j];
-                if (v == 0)
-                    continue;
-                uint64_t k = v & nmask;
-                while (nm[k] != 0)
-                    k = (k + 1) & nmask;
-                nm[k] = v;
-            }
-            free(ctx->neg_memo);
-            ctx->neg_memo = nm;
-            ctx->neg_memo_cap = new_cap;
+        if (!nm) {
+            cbm_arena_mark_failed(ctx->arena, "CBM_LSP_ALLOCATION_FAILED",
+                                  "c_lsp_negative_memo_grow", (size_t)new_cap * sizeof(uint64_t));
+            return;
         }
-        // if calloc failed: keep the existing table (load may exceed 70%, still correct)
+        uint64_t nmask = (uint64_t)new_cap - 1;
+        for (int j = 0; j < ctx->neg_memo_cap; j++) {
+            uint64_t v = ctx->neg_memo[j];
+            if (v == 0)
+                continue;
+            uint64_t k = v & nmask;
+            while (nm[k] != 0)
+                k = (k + 1) & nmask;
+            nm[k] = v;
+        }
+        free(ctx->neg_memo);
+        ctx->neg_memo = nm;
+        ctx->neg_memo_cap = new_cap;
     }
     uint64_t mask = (uint64_t)ctx->neg_memo_cap - 1;
     for (uint64_t i = h & mask;; i = (i + 1) & mask) {
@@ -2610,8 +2646,11 @@ static const CBMRegisteredFunc *c_lookup_member_depth(CLSPContext *ctx, const ch
                                                       const char *member_name, int depth) {
     if (!type_qn || !member_name)
         return NULL;
-    if (depth > CBM_LSP_MAX_LOOKUP_DEPTH)
+    if (depth >= ctx->lookup_depth_limit) {
+        cbm_arena_mark_failed(ctx->arena, "CBM_LSP_ANALYSIS_LIMIT_EXCEEDED",
+                              "c_lsp_member_lookup_depth", (size_t)ctx->lookup_depth_limit);
         return NULL;
+    }
 
     // Direct method lookup. Runs FIRST, before consulting the memo, so a real
     // direct-resolvable member (incl. a hash-collision victim, or one registered
@@ -2652,7 +2691,8 @@ static const CBMRegisteredFunc *c_lookup_member_depth(CLSPContext *ctx, const ch
     {
         const CBMType *scoped = cbm_scope_lookup(ctx->current_scope, type_qn);
         if (scoped && scoped->kind == CBM_TYPE_ALIAS) {
-            const CBMType *underlying = cbm_type_resolve_alias(scoped);
+            const CBMType *underlying = cbm_type_resolve_alias(
+                ctx->arena, scoped, ctx->lookup_depth_limit, "c_lsp_member_alias_depth");
             if (underlying && !cbm_type_is_unknown(underlying)) {
                 const char *alias_target_qn = type_to_qn(underlying);
                 if (alias_target_qn) {
@@ -2772,8 +2812,13 @@ static bool c_base_declares_member(CLSPContext *ctx, const char *type_qn, const 
 // Field type lookup
 static const CBMType *c_lookup_field_type(CLSPContext *ctx, const char *type_qn,
                                           const char *field_name, int depth) {
-    if (!type_qn || !field_name || depth > 5)
+    if (!type_qn || !field_name)
         return NULL;
+    if (depth >= ctx->lookup_depth_limit) {
+        cbm_arena_mark_failed(ctx->arena, "CBM_LSP_ANALYSIS_LIMIT_EXCEEDED",
+                              "c_lsp_field_lookup_depth", (size_t)ctx->lookup_depth_limit);
+        return NULL;
+    }
 
     const CBMRegisteredType *rt = cbm_registry_lookup_type(ctx->registry, type_qn);
     if (!rt && ctx->module_qn) {
@@ -3532,16 +3577,18 @@ static void c_emit_unresolved_call(CLSPContext *ctx, const char *expr_text, cons
 
 static void c_resolve_calls_in_node_inner(CLSPContext *ctx, TSNode node);
 
-#define C_LSP_MAX_WALK_DEPTH 512
-
-/* Depth-guarded entry: the AST walk recurses per nesting level and crashed
- * with a stack overflow on deeply nested real-world C++ (bitcoin, SIGSEGV in
- * cbm_type_substitute under hundreds of recursive c_resolve_calls_in_node
- * frames via c_adl_resolve). Past the cap the subtree is skipped — its calls
- * stay unresolved, which is graceful degradation, not a crash. */
+/* Depth-guarded entry. The bound prevents native-stack failure; reaching it is
+ * an explicit extraction failure because skipping the subtree would persist an
+ * incomplete call graph as if analysis were complete. */
 static void c_resolve_calls_in_node(CLSPContext *ctx, TSNode node) {
-    if (ctx->walk_depth >= C_LSP_MAX_WALK_DEPTH)
+    if (!ctx || cbm_arena_failed(ctx->arena)) {
         return;
+    }
+    if (ctx->walk_depth >= ctx->walk_depth_limit) {
+        cbm_arena_mark_failed(ctx->arena, "CBM_LSP_ANALYSIS_LIMIT_EXCEEDED", "c_lsp_ast_walk_depth",
+                              (size_t)ctx->walk_depth_limit);
+        return;
+    }
     ctx->walk_depth++;
     c_resolve_calls_in_node_inner(ctx, node);
     ctx->walk_depth--;
@@ -4314,20 +4361,35 @@ static void c_process_function(CLSPContext *ctx, TSNode func_node) {
 
     // Navigate declarator to find name and parameters
     TSNode cur = decl;
-    for (int depth = 0; depth < 10 && !ts_node_is_null(cur); depth++) {
+    int declarator_depth = 0;
+    while (!ts_node_is_null(cur)) {
         const char *dk = ts_node_type(cur);
 
         if (strcmp(dk, "function_declarator") == 0) {
+            if (declarator_depth >= ctx->lookup_depth_limit) {
+                cbm_arena_mark_failed(ctx->arena, "CBM_LSP_ANALYSIS_LIMIT_EXCEEDED",
+                                      "c_lsp_function_declarator_depth",
+                                      (size_t)ctx->lookup_depth_limit);
+                return;
+            }
             TSNode fdecl = ts_node_child_by_field_name(cur, "declarator", 10);
             params_node = ts_node_child_by_field_name(cur, "parameters", 10);
             cur = fdecl;
+            declarator_depth++;
             continue;
         }
         if (strcmp(dk, "pointer_declarator") == 0 || strcmp(dk, "reference_declarator") == 0) {
+            if (declarator_depth >= ctx->lookup_depth_limit) {
+                cbm_arena_mark_failed(ctx->arena, "CBM_LSP_ANALYSIS_LIMIT_EXCEEDED",
+                                      "c_lsp_function_declarator_depth",
+                                      (size_t)ctx->lookup_depth_limit);
+                return;
+            }
             if (ts_node_named_child_count(cur) > 0)
                 cur = ts_node_named_child(cur, ts_node_named_child_count(cur) - 1);
             else
                 break;
+            declarator_depth++;
             continue;
         }
         if (strcmp(dk, "qualified_identifier") == 0 || strcmp(dk, "scoped_identifier") == 0) {
@@ -4828,7 +4890,8 @@ static void c_process_class(CLSPContext *ctx, TSNode class_node) {
                     // function_declarator
                     TSNode cur = decl;
                     const CBMType *actual_ret = ret_type;
-                    for (int depth = 0; depth < 5 && !ts_node_is_null(cur); depth++) {
+                    int declarator_depth = 0;
+                    while (!ts_node_is_null(cur)) {
                         const char *dk = ts_node_type(cur);
                         if (strcmp(dk, "function_declarator") == 0) {
                             // Found method declaration — extract name
@@ -4906,13 +4969,27 @@ static void c_process_class(CLSPContext *ctx, TSNode class_node) {
                             cbm_registry_add_func((CBMTypeRegistry *)ctx->registry, rf);
                             break;
                         } else if (strcmp(dk, "reference_declarator") == 0) {
+                            if (declarator_depth >= ctx->lookup_depth_limit) {
+                                cbm_arena_mark_failed(ctx->arena, "CBM_LSP_ANALYSIS_LIMIT_EXCEEDED",
+                                                      "c_lsp_method_declarator_depth",
+                                                      (size_t)ctx->lookup_depth_limit);
+                                break;
+                            }
                             actual_ret = cbm_type_reference(ctx->arena, actual_ret);
                             cur = ts_node_named_child_count(cur) > 0 ? ts_node_named_child(cur, 0)
                                                                      : (TSNode){0};
+                            declarator_depth++;
                         } else if (strcmp(dk, "pointer_declarator") == 0) {
+                            if (declarator_depth >= ctx->lookup_depth_limit) {
+                                cbm_arena_mark_failed(ctx->arena, "CBM_LSP_ANALYSIS_LIMIT_EXCEEDED",
+                                                      "c_lsp_method_declarator_depth",
+                                                      (size_t)ctx->lookup_depth_limit);
+                                break;
+                            }
                             actual_ret = cbm_type_pointer(ctx->arena, actual_ret);
                             cur = ts_node_named_child_count(cur) > 0 ? ts_node_named_child(cur, 0)
                                                                      : (TSNode){0};
+                            declarator_depth++;
                         } else {
                             break;
                         }
@@ -5086,7 +5163,8 @@ static const CBMType *c_parse_return_type_text(CBMArena *a, const char *text,
             char *args_text = cbm_arena_strndup(a, args_start, args_len);
 
             // Split by comma at nesting depth 0
-            const CBMType *arg_types[16];
+            const CBMType **arg_types = NULL;
+            size_t arg_capacity = 0;
             int arg_count = 0;
             int depth = 0;
             const char *arg_begin = args_text;
@@ -5096,18 +5174,22 @@ static const CBMType *c_parse_return_type_text(CBMArena *a, const char *text,
                 else if (*p == '>')
                     depth--;
                 if ((*p == ',' && depth == 0) || *p == '\0') {
-                    if (arg_count < 16) {
-                        size_t alen = (size_t)(p - arg_begin);
-                        char *arg = cbm_arena_strndup(a, arg_begin, alen);
-                        // Trim whitespace
-                        while (*arg == ' ')
-                            arg++;
-                        size_t al = strlen(arg);
-                        while (al > 0 && arg[al - 1] == ' ')
-                            arg[--al] = '\0';
-                        if (arg[0]) {
-                            arg_types[arg_count++] = c_parse_return_type_text(a, arg, module_qn);
+                    size_t alen = (size_t)(p - arg_begin);
+                    char *arg = cbm_arena_strndup(a, arg_begin, alen);
+                    // Trim whitespace
+                    while (*arg == ' ')
+                        arg++;
+                    size_t al = strlen(arg);
+                    while (al > 0 && arg[al - 1] == ' ')
+                        arg[--al] = '\0';
+                    if (arg[0]) {
+                        if (!cbm_lsp_semantic_array_reserve(
+                                a, (void **)&arg_types, (size_t)arg_count, &arg_capacity,
+                                sizeof(*arg_types), (size_t)arg_count + 1,
+                                "c_lsp_return_template_arguments")) {
+                            return cbm_type_unknown();
                         }
+                        arg_types[arg_count++] = c_parse_return_type_text(a, arg, module_qn);
                     }
                     if (*p == '\0')
                         break;
@@ -5335,9 +5417,16 @@ static void c_register_lsp_defs(CBMArena *arena, CBMTypeRegistry *reg, const cha
             if (d->embedded_types) {
                 // Parse "|"-separated list
                 const char *src = d->embedded_types;
-                const char *embeds[32];
+                const char **embeds = NULL;
+                size_t embed_capacity = 0;
                 int embed_count = 0;
-                while (*src && embed_count < 31) {
+                while (*src) {
+                    if (!cbm_lsp_semantic_array_reserve(arena, (void **)&embeds,
+                                                        (size_t)embed_count, &embed_capacity,
+                                                        sizeof(*embeds), (size_t)embed_count + 2,
+                                                        "c_lsp_cross_embedded_types")) {
+                        return;
+                    }
                     const char *sep = strchr(src, '|');
                     if (sep) {
                         embeds[embed_count++] = cbm_arena_strndup(arena, src, sep - src);
@@ -5348,27 +5437,33 @@ static void c_register_lsp_defs(CBMArena *arena, CBMTypeRegistry *reg, const cha
                     }
                 }
                 if (embed_count > 0) {
-                    const char **arr = (const char **)cbm_arena_alloc(
-                        arena, (embed_count + 1) * sizeof(const char *));
-                    for (int j = 0; j < embed_count; j++)
-                        arr[j] = embeds[j];
-                    arr[embed_count] = NULL;
-                    rt.embedded_types = arr;
+                    embeds[embed_count] = NULL;
+                    rt.embedded_types = embeds;
                 }
             }
 
             // Field defs
             if (d->field_defs) {
                 const char *fsrc = d->field_defs;
-                const char *fnames[64];
-                const CBMType *ftypes[64];
+                const char **fnames = NULL;
+                const CBMType **ftypes = NULL;
+                size_t fname_capacity = 0;
+                size_t ftype_capacity = 0;
                 int fcount = 0;
-                while (*fsrc && fcount < 63) {
+                while (*fsrc) {
                     const char *sep = strchr(fsrc, '|');
                     const char *end = sep ? sep : fsrc + strlen(fsrc);
                     char *pair = cbm_arena_strndup(arena, fsrc, end - fsrc);
                     char *colon = strchr(pair, ':');
                     if (colon) {
+                        if (!cbm_lsp_semantic_array_reserve(
+                                arena, (void **)&fnames, (size_t)fcount, &fname_capacity,
+                                sizeof(*fnames), (size_t)fcount + 2, "c_lsp_cross_field_names") ||
+                            !cbm_lsp_semantic_array_reserve(
+                                arena, (void **)&ftypes, (size_t)fcount, &ftype_capacity,
+                                sizeof(*ftypes), (size_t)fcount + 2, "c_lsp_cross_field_types")) {
+                            return;
+                        }
                         *colon = '\0';
                         fnames[fcount] = pair;
                         ftypes[fcount] = c_parse_return_type_text(
@@ -5380,18 +5475,10 @@ static void c_register_lsp_defs(CBMArena *arena, CBMTypeRegistry *reg, const cha
                     fsrc = sep + 1;
                 }
                 if (fcount > 0) {
-                    const char **fnarr =
-                        (const char **)cbm_arena_alloc(arena, (fcount + 1) * sizeof(const char *));
-                    const CBMType **ftarr = (const CBMType **)cbm_arena_alloc(
-                        arena, (fcount + 1) * sizeof(const CBMType *));
-                    for (int j = 0; j < fcount; j++) {
-                        fnarr[j] = fnames[j];
-                        ftarr[j] = ftypes[j];
-                    }
-                    fnarr[fcount] = NULL;
-                    ftarr[fcount] = NULL;
-                    rt.field_names = fnarr;
-                    rt.field_types = ftarr;
+                    fnames[fcount] = NULL;
+                    ftypes[fcount] = NULL;
+                    rt.field_names = fnames;
+                    rt.field_types = ftypes;
                 }
             }
 
@@ -5411,9 +5498,15 @@ static void c_register_lsp_defs(CBMArena *arena, CBMTypeRegistry *reg, const cha
             if (d->return_types) {
                 // Parse "|"-separated
                 const char *rsrc = d->return_types;
-                const CBMType *rets[16];
+                const CBMType **rets = NULL;
+                size_t return_capacity = 0;
                 int rcount = 0;
-                while (*rsrc && rcount < 15) {
+                while (*rsrc) {
+                    if (!cbm_lsp_semantic_array_reserve(
+                            arena, (void **)&rets, (size_t)rcount, &return_capacity, sizeof(*rets),
+                            (size_t)rcount + 2, "c_lsp_cross_return_types")) {
+                        return;
+                    }
                     const char *sep = strchr(rsrc, '|');
                     const char *end = sep ? sep : rsrc + strlen(rsrc);
                     char *rt_text = cbm_arena_strndup(arena, rsrc, end - rsrc);
@@ -5423,12 +5516,8 @@ static void c_register_lsp_defs(CBMArena *arena, CBMTypeRegistry *reg, const cha
                     rsrc = sep + 1;
                 }
                 if (rcount > 0) {
-                    const CBMType **rarr = (const CBMType **)cbm_arena_alloc(
-                        arena, (rcount + 1) * sizeof(const CBMType *));
-                    for (int j = 0; j < rcount; j++)
-                        rarr[j] = rets[j];
-                    rarr[rcount] = NULL;
-                    rf.signature = cbm_type_func(arena, NULL, NULL, rarr);
+                    rets[rcount] = NULL;
+                    rf.signature = cbm_type_func(arena, NULL, NULL, rets);
                 }
             }
             if (!rf.signature)

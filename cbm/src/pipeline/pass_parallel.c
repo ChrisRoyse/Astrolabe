@@ -1089,7 +1089,12 @@ int cbm_parallel_extract_ex(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *file
 
     /* Sub-phase: Ensure extraction library is initialized */
     CBM_PROF_START(t_init);
-    cbm_init();
+    if (cbm_init() != 0) {
+        cbm_log_error("parallel.init_failed", "code", "CBM_ALLOCATOR_INIT_FAILED", "message",
+                      "the extraction allocator contract could not be initialized", "remediation",
+                      "inspect allocator.bind_failed and restart the process");
+        return CBM_NOT_FOUND;
+    }
 
     /* Slab allocator for tree-sitter (thread-safe via TLS). */
     cbm_slab_install();

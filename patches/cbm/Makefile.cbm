@@ -423,6 +423,7 @@ endif
 # a full build, so those compiles are byte-identical to prior behavior.
 GRAMMAR_CFLAGS = -std=c11 -D_DEFAULT_SOURCE -O2 -w -I$(CBM_DIR) -I$(TS_INCLUDE) -I$(TS_SRC) \
                  $(GRAMMAR_SUBSET_DEFS)
+LSP_CFLAGS = $(GRAMMAR_CFLAGS) -Isrc
 
 # ── Targets ──────────────────────────────────────────────────────
 
@@ -482,7 +483,7 @@ $(BUILD_DIR)/prod_ts_runtime.o: $(CBM_DIR)/ts_runtime.c | $(BUILD_DIR)
 	$(CC) $(GRAMMAR_CFLAGS) -c -o $@ $<
 
 $(BUILD_DIR)/prod_lsp_all.o: $(LSP_UNITY_DEPS) | $(BUILD_DIR)
-	$(CC) $(GRAMMAR_CFLAGS) -c -o $@ $<
+	$(CC) $(LSP_CFLAGS) -c -o $@ $<
 
 $(BUILD_DIR)/prod_preprocessor.o: $(CBM_DIR)/preprocessor.cpp | $(BUILD_DIR)
 	$(CXX) $(CXXFLAGS_PROD) -w -I$(CBM_DIR)/vendored -c -o $@ $<
@@ -566,18 +567,21 @@ LIBCBM_DEPFLAGS = -MMD -MP
 LIBCBM_CFLAGS = $(CFLAGS_PROD) -fvisibility=hidden -DCBM_BUILDING_LIB=1
 LIBCBM_CXXFLAGS = $(CXXFLAGS_PROD) -fvisibility=hidden -DCBM_BUILDING_LIB=1
 LIBCBM_GRAMMAR_CFLAGS = $(GRAMMAR_CFLAGS) -fvisibility=hidden -DCBM_BUILDING_LIB=1
+LIBCBM_LSP_CFLAGS = $(LSP_CFLAGS) -fvisibility=hidden -DCBM_BUILDING_LIB=1
 LIBCBM_SQLITE3_CFLAGS = $(SQLITE3_CFLAGS) -fvisibility=hidden -DCBM_BUILDING_LIB=1
 LIBCBM_MIMALLOC_CFLAGS = $(MIMALLOC_CFLAGS) -fvisibility=hidden -DCBM_BUILDING_LIB=1
 ifeq ($(LIBCBM_ASAN),1)
 LIBCBM_CFLAGS = $(CFLAGS_COMMON) -g -O1 $(CFLAGS_EXTRA) -fvisibility=hidden -DCBM_BUILDING_LIB=1
 LIBCBM_CXXFLAGS = $(CXXFLAGS_COMMON) -g -O1 $(CXXFLAGS_EXTRA) -fvisibility=hidden -DCBM_BUILDING_LIB=1
 LIBCBM_GRAMMAR_CFLAGS = $(GRAMMAR_CFLAGS) -g -O1 $(CFLAGS_EXTRA) -fvisibility=hidden -DCBM_BUILDING_LIB=1
+LIBCBM_LSP_CFLAGS = $(LSP_CFLAGS) -g -O1 $(CFLAGS_EXTRA) -fvisibility=hidden -DCBM_BUILDING_LIB=1
 LIBCBM_SQLITE3_CFLAGS = $(SQLITE3_CFLAGS) $(CFLAGS_EXTRA) -fvisibility=hidden -DCBM_BUILDING_LIB=1
 LIBCBM_MIMALLOC_CFLAGS = $(MIMALLOC_CFLAGS_TEST) $(CFLAGS_EXTRA) -fvisibility=hidden -DCBM_BUILDING_LIB=1
 endif
 LIBCBM_CFLAGS += $(LIBCBM_DEPFLAGS)
 LIBCBM_CXXFLAGS += $(LIBCBM_DEPFLAGS)
 LIBCBM_GRAMMAR_CFLAGS += $(LIBCBM_DEPFLAGS)
+LIBCBM_LSP_CFLAGS += $(LIBCBM_DEPFLAGS)
 LIBCBM_SQLITE3_CFLAGS += $(LIBCBM_DEPFLAGS)
 LIBCBM_MIMALLOC_CFLAGS += $(LIBCBM_DEPFLAGS)
 
@@ -659,7 +663,7 @@ $(LIBCBM_DIR)/$(CBM_DIR)/ts_runtime.o: $(CBM_DIR)/ts_runtime.c | $(BUILD_DIR)
 
 $(LIBCBM_DIR)/$(CBM_DIR)/lsp_all.o: $(LSP_UNITY_DEPS) | $(BUILD_DIR)
 	mkdir -p $(dir $@)
-	$(CC) $(LIBCBM_GRAMMAR_CFLAGS) -c -o $@ $<
+	$(CC) $(LIBCBM_LSP_CFLAGS) -c -o $@ $<
 
 $(LIBCBM_DIR)/$(CBM_DIR)/preprocessor.o: $(CBM_DIR)/preprocessor.cpp | $(BUILD_DIR)
 	mkdir -p $(dir $@)

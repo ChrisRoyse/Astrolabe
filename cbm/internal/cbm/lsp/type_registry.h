@@ -170,15 +170,6 @@ const CBMRegisteredFunc *cbm_registry_lookup_func(const CBMTypeRegistry *reg,
 const CBMRegisteredFunc *cbm_registry_lookup_symbol(const CBMTypeRegistry *reg,
                                                     const char *package_qn, const char *name);
 
-// Resolve type alias chain: follow alias_of until concrete type found (max 16 levels).
-const CBMRegisteredType *cbm_registry_resolve_alias(const CBMTypeRegistry *reg,
-                                                    const char *type_qn);
-
-// Look up a method by receiver type QN + method name, following alias chains.
-const CBMRegisteredFunc *cbm_registry_lookup_method_aliased(const CBMTypeRegistry *reg,
-                                                            const char *receiver_qn,
-                                                            const char *method_name);
-
 // Look up a method by receiver type + name, preferring the overload with matching arg count.
 // Falls back to any match if no exact arg count match found.
 const CBMRegisteredFunc *cbm_registry_lookup_method_by_args(const CBMTypeRegistry *reg,

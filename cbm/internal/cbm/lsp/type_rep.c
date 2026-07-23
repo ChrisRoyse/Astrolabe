@@ -740,13 +740,17 @@ bool cbm_type_protocol_satisfied_by(const CBMType *proto, const CBMType *candida
     return false;
 }
 
-const CBMType *cbm_type_resolve_alias(const CBMType *t) {
-    for (int i = 0; i < 16 && t; i++) {
-        if (t->kind != CBM_TYPE_ALIAS)
+const CBMType *cbm_type_resolve_alias(CBMArena *arena, const CBMType *t, int depth_limit,
+                                      const char *operation) {
+    int depth = 0;
+    while (t && t->kind == CBM_TYPE_ALIAS && t->data.alias.underlying) {
+        if (depth >= depth_limit) {
+            cbm_arena_mark_failed(arena, "CBM_LSP_ANALYSIS_LIMIT_EXCEEDED", operation,
+                                  (size_t)depth_limit);
             return t;
-        if (!t->data.alias.underlying)
-            return t;
+        }
         t = t->data.alias.underlying;
+        depth++;
     }
     return t;
 }

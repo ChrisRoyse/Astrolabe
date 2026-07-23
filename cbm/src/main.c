@@ -800,27 +800,35 @@ static void setup_signal_handlers(void) {
  * "repo_path is required" (#423/#20). Rebuild argv from the wide command line
  * (GetCommandLineW → CommandLineToArgvW) and convert each element to UTF-8 so the rest
  * of the program receives the same UTF-8 bytes it gets on POSIX. Returns a
- * NULL-terminated argv and sets *out_argc, or NULL on any failure (caller then keeps
- * the original narrow argv). The returned block lives for the whole process (argv must
- * stay valid until exit), so it is intentionally never freed. */
-static char **cbm_win_utf8_argv(int *out_argc) {
+ * NULL-terminated argv and sets *out_argc, or NULL with the exact failed operation and
+ * Win32 error. The returned block lives for the whole process (argv must stay valid
+ * until exit), so it is intentionally never freed. */
+static char **cbm_win_utf8_argv(int *out_argc, const char **out_operation, DWORD *out_error) {
+    *out_operation = "CommandLineToArgvW";
+    *out_error = ERROR_SUCCESS;
     int wargc = 0;
     LPWSTR *wargv = CommandLineToArgvW(GetCommandLineW(), &wargc);
     if (!wargv) {
+        *out_error = GetLastError();
         return NULL;
     }
     if (wargc <= 0) {
         LocalFree(wargv);
+        *out_error = ERROR_INVALID_DATA;
         return NULL;
     }
+    *out_operation = "allocate_utf8_argv";
     char **u8argv = (char **)calloc((size_t)wargc + 1, sizeof(char *));
     if (!u8argv) {
         LocalFree(wargv);
+        *out_error = ERROR_NOT_ENOUGH_MEMORY;
         return NULL;
     }
     for (int i = 0; i < wargc; i++) {
+        *out_operation = "WideCharToMultiByte";
         u8argv[i] = cbm_wide_to_utf8(wargv[i]);
         if (!u8argv[i]) {
+            *out_error = GetLastError();
             for (int j = 0; j < i; j++) {
                 free(u8argv[j]);
             }
@@ -831,6 +839,8 @@ static char **cbm_win_utf8_argv(int *out_argc) {
     }
     LocalFree(wargv);
     *out_argc = wargc;
+    *out_operation = NULL;
+    *out_error = ERROR_SUCCESS;
     return u8argv; /* NULL-terminated (calloc'd wargc+1) */
 }
 #endif /* _WIN32 */
@@ -842,19 +852,31 @@ int main(int argc, char **argv) {
      * before the first sqlite3_open* (cbm_mcp_server_new → cbm_store_open_memory
      * below opens sqlite early), else sqlite3_config returns SQLITE_MISUSE and
      * the bind is silently ignored. No-op in the test build. */
-    cbm_alloc_init();
+    int allocator_rc = cbm_alloc_init();
+    if (allocator_rc != 0) {
+        return EXIT_FAILURE;
+    }
 #ifdef _WIN32
-    /* Replace the ANSI-code-page argv the CRT handed us with a UTF-8 argv rebuilt from
-     * the wide command line, so non-ASCII CLI arguments survive (#423/#20). Falls back
-     * to the original argv if the wide rebuild fails. Done after cbm_alloc_init (which
-     * must stay the very first statement) but before argv is first read below. */
+    /* The wide command line is the sole Windows argv source. Continuing with the CRT
+     * ANSI argv after a conversion failure changes repository/config path bytes and
+     * therefore the indexed corpus. */
     {
         int win_argc = 0;
-        char **win_argv = cbm_win_utf8_argv(&win_argc);
-        if (win_argv) {
-            argc = win_argc;
-            argv = win_argv;
+        const char *win_operation = NULL;
+        DWORD win_error = ERROR_SUCCESS;
+        char **win_argv = cbm_win_utf8_argv(&win_argc, &win_operation, &win_error);
+        if (!win_argv) {
+            char error_buf[CBM_SZ_32];
+            snprintf(error_buf, sizeof(error_buf), "%lu", (unsigned long)win_error);
+            cbm_log_error(
+                "startup.argv_failed", "code", "CBM_WINDOWS_ARGV_UTF8_FAILED", "operation",
+                win_operation ? win_operation : "windows_argv", "win32_error", error_buf, "message",
+                "the Unicode Windows command line could not be reconstructed as exact UTF-8",
+                "remediation", "resolve the reported Win32 or memory error and restart");
+            return EXIT_FAILURE;
         }
+        argc = win_argc;
+        argv = win_argv;
     }
 #endif
     /* #845: mark this process as the REAL binary so the index supervisor may

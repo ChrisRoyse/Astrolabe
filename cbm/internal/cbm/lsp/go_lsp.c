@@ -1,4 +1,5 @@
 #include "go_lsp.h"
+#include "semantic_array.h"
 #include "lsp_node_iter.h"
 #include "../helpers.h"
 #include <string.h>
@@ -8,16 +9,18 @@
 // Forward declarations
 static void resolve_calls_in_node_inner(GoLSPContext *ctx, TSNode node);
 
-/* Depth-guarded entry for the AST call-resolution walk. The walk recurses once
- * per nesting level; a deeply-nested or cyclic file can overflow the native
- * stack (SIGSEGV) and take down the whole index. Past the cap the subtree is
- * skipped — its calls stay unresolved, which is graceful degradation, not a
- * crash. The cap is CBM_LSP_MAX_WALK_DEPTH, env-overridable via the same name.
- * The walk_depth-- runs after the inner returns, so early returns in the body
- * never leak the counter. */
+/* Depth-guarded AST call-resolution walk. Reaching the bound is an explicit
+ * extraction failure; silently skipping the subtree would publish a partial
+ * call graph as complete. */
 static void resolve_calls_in_node(GoLSPContext *ctx, TSNode node) {
-    if (ctx->walk_depth >= cbm_lsp_max_walk_depth())
+    if (!ctx || cbm_arena_failed(ctx->arena)) {
         return;
+    }
+    if (ctx->walk_depth >= ctx->walk_depth_limit) {
+        cbm_arena_mark_failed(ctx->arena, "CBM_LSP_ANALYSIS_LIMIT_EXCEEDED",
+                              "go_lsp_ast_walk_depth", (size_t)ctx->walk_depth_limit);
+        return;
+    }
     ctx->walk_depth++;
     resolve_calls_in_node_inner(ctx, node);
     ctx->walk_depth--;
@@ -41,6 +44,13 @@ void go_lsp_init(GoLSPContext *ctx, CBMArena *arena, const char *source, int sou
     ctx->registry = registry;
     ctx->package_qn = package_qn;
     ctx->resolved_calls = out;
+    if (!cbm_lsp_read_positive_limit(arena, "CBM_LSP_MAX_LOOKUP_DEPTH",
+                                     CBM_LSP_DEFAULT_LOOKUP_DEPTH, "go_lsp_lookup_depth_config",
+                                     &ctx->lookup_depth_limit) ||
+        !cbm_lsp_read_positive_limit(arena, "CBM_LSP_MAX_WALK_DEPTH", CBM_LSP_DEFAULT_WALK_DEPTH,
+                                     "go_lsp_walk_depth_config", &ctx->walk_depth_limit)) {
+        return;
+    }
     ctx->current_scope = cbm_scope_push(arena, NULL); // root scope
 
     {
@@ -249,13 +259,19 @@ const CBMType *go_parse_type_node(GoLSPContext *ctx, TSNode node) {
 
     // parameter_list used as result type (multi-return)
     if (strcmp(kind, "parameter_list") == 0) {
-        int count = 0;
-        const CBMType *elems[16];
+        size_t count = 0;
+        size_t capacity = 0;
+        const CBMType **elems = NULL;
         uint32_t nc = ts_node_child_count(node);
-        for (uint32_t i = 0; i < nc && count < 16; i++) {
+        for (uint32_t i = 0; i < nc; i++) {
             TSNode child = ts_node_child(node, i);
             if (ts_node_is_null(child) || !ts_node_is_named(child))
                 continue;
+            if (!cbm_lsp_semantic_array_reserve(ctx->arena, (void **)&elems, count, &capacity,
+                                                sizeof(*elems), count + 1,
+                                                "go multi-return type collection")) {
+                return cbm_type_unknown();
+            }
             const char *ck = ts_node_type(child);
             if (strcmp(ck, "parameter_declaration") == 0) {
                 TSNode tn = ts_node_child_by_field_name(child, "type", 4);
@@ -269,7 +285,7 @@ const CBMType *go_parse_type_node(GoLSPContext *ctx, TSNode node) {
         if (count == 1)
             return elems[0];
         if (count > 1)
-            return cbm_type_tuple(ctx->arena, elems, count);
+            return cbm_type_tuple(ctx->arena, elems, (int)count);
     }
 
     return cbm_type_unknown();
@@ -490,13 +506,20 @@ const CBMType *go_eval_expr_type(GoLSPContext *ctx, TSNode node) {
 
                 if (rfunc && rfunc->type_param_names) {
                     // Parse type arguments from AST
-                    const CBMType *type_args[16];
-                    int targ_count = 0;
+                    const CBMType **type_args = NULL;
+                    size_t targ_count = 0;
+                    size_t targ_capacity = 0;
                     uint32_t ta_nc = ts_node_child_count(targs_node);
-                    for (uint32_t ti = 0; ti < ta_nc && targ_count < 15; ti++) {
+                    for (uint32_t ti = 0; ti < ta_nc; ti++) {
                         TSNode targ = ts_node_child(targs_node, ti);
                         if (ts_node_is_null(targ) || !ts_node_is_named(targ))
                             continue;
+                        if (!cbm_lsp_semantic_array_reserve(ctx->arena, (void **)&type_args,
+                                                            targ_count, &targ_capacity,
+                                                            sizeof(*type_args), targ_count + 1,
+                                                            "go explicit generic type arguments")) {
+                            return cbm_type_unknown();
+                        }
                         type_args[targ_count++] = go_parse_type_node(ctx, targ);
                     }
 
@@ -505,12 +528,14 @@ const CBMType *go_eval_expr_type(GoLSPContext *ctx, TSNode node) {
                     while (rfunc->type_param_names[param_count])
                         param_count++;
 
-                    if (targ_count > 0 && targ_count == param_count) {
-                        const CBMType **targ_arr = (const CBMType **)cbm_arena_alloc(
-                            ctx->arena, (targ_count + 1) * sizeof(const CBMType *));
-                        for (int ti = 0; ti < targ_count; ti++)
-                            targ_arr[ti] = type_args[ti];
-                        targ_arr[targ_count] = NULL;
+                    if (targ_count > 0 && targ_count == (size_t)param_count) {
+                        if (!cbm_lsp_semantic_array_reserve(
+                                ctx->arena, (void **)&type_args, targ_count, &targ_capacity,
+                                sizeof(*type_args), targ_count + 1,
+                                "go explicit generic type argument sentinel")) {
+                            return cbm_type_unknown();
+                        }
+                        type_args[targ_count] = NULL;
 
                         // Substitute type params in return type(s)
                         int ret_count = 0;
@@ -520,7 +545,7 @@ const CBMType *go_eval_expr_type(GoLSPContext *ctx, TSNode node) {
                         if (ret_count == 1) {
                             return cbm_type_substitute(ctx->arena,
                                                        func_type->data.func.return_types[0],
-                                                       rfunc->type_param_names, targ_arr);
+                                                       rfunc->type_param_names, type_args);
                         }
                         // Multi-return: substitute all
                         const CBMType **new_rets = (const CBMType **)cbm_arena_alloc(
@@ -528,7 +553,7 @@ const CBMType *go_eval_expr_type(GoLSPContext *ctx, TSNode node) {
                         for (int ri = 0; ri < ret_count; ri++) {
                             new_rets[ri] = cbm_type_substitute(
                                 ctx->arena, func_type->data.func.return_types[ri],
-                                rfunc->type_param_names, targ_arr);
+                                rfunc->type_param_names, type_args);
                         }
                         new_rets[ret_count] = NULL;
                         return cbm_type_tuple(ctx->arena, new_rets, ret_count);
@@ -590,9 +615,17 @@ const CBMType *go_eval_expr_type(GoLSPContext *ctx, TSNode node) {
                         }
                     }
 
-                    if (has_type_param && tpc > 0 && tpc <= 16) {
+                    if (has_type_param && tpc > 0) {
                         // Evaluate argument types and unify
-                        const CBMType *inferred[16] = {0};
+                        const CBMType **inferred = NULL;
+                        size_t inferred_capacity = 0;
+                        if (!cbm_lsp_semantic_array_reserve(ctx->arena, (void **)&inferred, 0,
+                                                            &inferred_capacity, sizeof(*inferred),
+                                                            (size_t)tpc + 1,
+                                                            "go inferred generic type arguments")) {
+                            return cbm_type_unknown();
+                        }
+                        memset(inferred, 0, ((size_t)tpc + 1) * sizeof(*inferred));
 
                         if (!ts_node_is_null(args_node)) {
                             uint32_t argc = ts_node_named_child_count(args_node);
@@ -837,47 +870,67 @@ const CBMType *go_eval_expr_type(GoLSPContext *ctx, TSNode node) {
         }
 
         // Build full FUNC type with param/return types from AST
-        const CBMType *pt_arr[16];
-        int pt_count = 0;
+        const CBMType **pt_arr = NULL;
+        size_t pt_count = 0;
+        size_t pt_capacity = 0;
         TSNode params2 = ts_node_child_by_field_name(node, "parameters", 10);
         if (!ts_node_is_null(params2)) {
             uint32_t nc2 = ts_node_child_count(params2);
-            for (uint32_t i = 0; i < nc2 && pt_count < 15; i++) {
+            for (uint32_t i = 0; i < nc2; i++) {
                 TSNode p = ts_node_child(params2, i);
                 if (ts_node_is_null(p) || !ts_node_is_named(p))
                     continue;
                 if (strcmp(ts_node_type(p), "parameter_declaration") != 0)
                     continue;
                 TSNode pt = ts_node_child_by_field_name(p, "type", 4);
-                if (!ts_node_is_null(pt))
+                if (!ts_node_is_null(pt)) {
+                    if (!cbm_lsp_semantic_array_reserve(ctx->arena, (void **)&pt_arr, pt_count,
+                                                        &pt_capacity, sizeof(*pt_arr), pt_count + 2,
+                                                        "go function literal parameter types")) {
+                        return cbm_type_unknown();
+                    }
                     pt_arr[pt_count++] = go_parse_type_node(ctx, pt);
+                }
             }
         }
-        pt_arr[pt_count] = NULL;
+        if (pt_arr)
+            pt_arr[pt_count] = NULL;
 
-        const CBMType *rt_arr[16];
-        int rt_count = 0;
+        const CBMType **rt_arr = NULL;
+        size_t rt_count = 0;
+        size_t rt_capacity = 0;
         TSNode result = ts_node_child_by_field_name(node, "result", 6);
         if (!ts_node_is_null(result)) {
             if (strcmp(ts_node_type(result), "parameter_list") == 0) {
                 uint32_t rnc = ts_node_child_count(result);
-                for (uint32_t i = 0; i < rnc && rt_count < 15; i++) {
+                for (uint32_t i = 0; i < rnc; i++) {
                     TSNode rc = ts_node_child(result, i);
                     if (ts_node_is_null(rc) || !ts_node_is_named(rc))
                         continue;
                     TSNode rt = ts_node_child_by_field_name(rc, "type", 4);
                     if (ts_node_is_null(rt))
                         rt = rc;
+                    if (!cbm_lsp_semantic_array_reserve(ctx->arena, (void **)&rt_arr, rt_count,
+                                                        &rt_capacity, sizeof(*rt_arr), rt_count + 2,
+                                                        "go function literal return types")) {
+                        return cbm_type_unknown();
+                    }
                     rt_arr[rt_count++] = go_parse_type_node(ctx, rt);
                 }
             } else {
+                if (!cbm_lsp_semantic_array_reserve(ctx->arena, (void **)&rt_arr, 0, &rt_capacity,
+                                                    sizeof(*rt_arr), 2,
+                                                    "go function literal return type")) {
+                    return cbm_type_unknown();
+                }
                 rt_arr[rt_count++] = go_parse_type_node(ctx, result);
             }
         }
-        rt_arr[rt_count] = NULL;
+        if (rt_arr)
+            rt_arr[rt_count] = NULL;
 
-        return cbm_type_func(ctx->arena, NULL, pt_count > 0 ? (const CBMType **)pt_arr : NULL,
-                             rt_count > 0 ? (const CBMType **)rt_arr : NULL);
+        return cbm_type_func(ctx->arena, NULL, pt_count > 0 ? pt_arr : NULL,
+                             rt_count > 0 ? rt_arr : NULL);
     }
 
     return cbm_type_unknown();
@@ -929,8 +982,13 @@ const CBMType *go_eval_builtin_call(GoLSPContext *ctx, const char *name, TSNode 
 
 static const CBMType *go_lookup_field(GoLSPContext *ctx, const char *type_qn,
                                       const char *field_name, int depth) {
-    if (!type_qn || !field_name || depth > 5)
+    if (!type_qn || !field_name)
         return NULL;
+    if (depth >= ctx->lookup_depth_limit) {
+        cbm_arena_mark_failed(ctx->arena, "CBM_LSP_ANALYSIS_LIMIT_EXCEEDED",
+                              "go_lsp_field_lookup_depth", (size_t)ctx->lookup_depth_limit);
+        return NULL;
+    }
 
     const CBMRegisteredType *rt = cbm_registry_lookup_type(ctx->registry, type_qn);
     if (!rt)
@@ -970,8 +1028,11 @@ static const CBMRegisteredFunc *go_lookup_field_or_method_depth(GoLSPContext *ct
                                                                 int depth) {
     if (!type_qn || !member_name)
         return NULL;
-    if (depth > CBM_LSP_MAX_LOOKUP_DEPTH)
+    if (depth >= ctx->lookup_depth_limit) {
+        cbm_arena_mark_failed(ctx->arena, "CBM_LSP_ANALYSIS_LIMIT_EXCEEDED",
+                              "go_lsp_member_lookup_depth", (size_t)ctx->lookup_depth_limit);
         return NULL;
+    }
 
     // Direct method lookup
     const CBMRegisteredFunc *f = cbm_registry_lookup_method(ctx->registry, type_qn, member_name);
@@ -2061,10 +2122,11 @@ void cbm_run_go_lsp(CBMArena *arena, CBMFileResult *result, const char *source, 
 
                 // Interface type: extract method names for satisfaction checking
                 if (strcmp(ts_node_type(type_node), "interface_type") == 0) {
-                    const char *iface_methods[64];
-                    int iface_method_count = 0;
+                    const char **iface_methods = NULL;
+                    size_t iface_method_count = 0;
+                    size_t iface_method_capacity = 0;
                     uint32_t inl_nc = ts_node_named_child_count(type_node);
-                    for (uint32_t k = 0; k < inl_nc && iface_method_count < 63; k++) {
+                    for (uint32_t k = 0; k < inl_nc; k++) {
                         TSNode child = ts_node_named_child(type_node, k);
                         if (ts_node_is_null(child))
                             continue;
@@ -2075,23 +2137,24 @@ void cbm_run_go_lsp(CBMArena *arena, CBMFileResult *result, const char *source, 
                             if (!ts_node_is_null(mname)) {
                                 char *mn = cbm_node_text(arena, mname, source);
                                 if (mn && mn[0]) {
+                                    if (!cbm_lsp_semantic_array_reserve(
+                                            arena, (void **)&iface_methods, iface_method_count,
+                                            &iface_method_capacity, sizeof(*iface_methods),
+                                            iface_method_count + 2, "go interface method names")) {
+                                        return;
+                                    }
                                     iface_methods[iface_method_count++] = mn;
                                 }
                             }
                         }
                     }
                     if (iface_method_count > 0) {
+                        iface_methods[iface_method_count] = NULL;
                         for (int ti = 0; ti < reg.type_count; ti++) {
                             if (!reg.types[ti].qualified_name ||
                                 strcmp(reg.types[ti].qualified_name, type_qn) != 0)
                                 continue;
-                            const char **names = (const char **)cbm_arena_alloc(
-                                arena, (iface_method_count + 1) * sizeof(const char *));
-                            for (int mi = 0; mi < iface_method_count; mi++) {
-                                names[mi] = iface_methods[mi];
-                            }
-                            names[iface_method_count] = NULL;
-                            reg.types[ti].method_names = names;
+                            reg.types[ti].method_names = iface_methods;
                             break;
                         }
                     }
@@ -2112,11 +2175,14 @@ void cbm_run_go_lsp(CBMArena *arena, CBMFileResult *result, const char *source, 
                     continue;
 
                 // Scan field_declarations for embeds and named fields
-                const char *embeds[16];
-                int embed_count = 0;
-                const char *fld_names[64];
-                const CBMType *fld_types[64];
-                int fld_count = 0;
+                const char **embeds = NULL;
+                size_t embed_count = 0;
+                size_t embed_capacity = 0;
+                const char **fld_names = NULL;
+                const CBMType **fld_types = NULL;
+                size_t fld_count = 0;
+                size_t fld_name_capacity = 0;
+                size_t fld_type_capacity = 0;
 
                 // Create a temporary LSP context for parsing field types
                 GoLSPContext tmp_ctx;
@@ -2140,21 +2206,31 @@ void cbm_run_go_lsp(CBMArena *arena, CBMFileResult *result, const char *source, 
 
                     if (ts_node_is_null(fname) && !ts_node_is_null(ftype)) {
                         // Embedded field: has type but no name
-                        if (embed_count < 15) {
-                            char *embed_text = cbm_node_text(arena, ftype, source);
-                            if (embed_text && embed_text[0]) {
-                                const char *et = embed_text;
-                                while (*et == '*')
-                                    et++;
-                                embeds[embed_count++] =
-                                    cbm_arena_sprintf(arena, "%s.%s", module_qn, et);
+                        char *embed_text = cbm_node_text(arena, ftype, source);
+                        if (embed_text && embed_text[0]) {
+                            const char *et = embed_text;
+                            while (*et == '*')
+                                et++;
+                            if (!cbm_lsp_semantic_array_reserve(
+                                    arena, (void **)&embeds, embed_count, &embed_capacity,
+                                    sizeof(*embeds), embed_count + 2, "go embedded field types")) {
+                                return;
                             }
+                            embeds[embed_count++] =
+                                cbm_arena_sprintf(arena, "%s.%s", module_qn, et);
                         }
-                    } else if (!ts_node_is_null(fname) && !ts_node_is_null(ftype) &&
-                               fld_count < 63) {
+                    } else if (!ts_node_is_null(fname) && !ts_node_is_null(ftype)) {
                         // Named field: name + type
                         char *fn = cbm_node_text(arena, fname, source);
                         if (fn && fn[0]) {
+                            if (!cbm_lsp_semantic_array_reserve(
+                                    arena, (void **)&fld_names, fld_count, &fld_name_capacity,
+                                    sizeof(*fld_names), fld_count + 2, "go struct field names") ||
+                                !cbm_lsp_semantic_array_reserve(
+                                    arena, (void **)&fld_types, fld_count, &fld_type_capacity,
+                                    sizeof(*fld_types), fld_count + 2, "go struct field types")) {
+                                return;
+                            }
                             fld_names[fld_count] = fn;
                             fld_types[fld_count] = go_parse_type_node(&tmp_ctx, ftype);
                             fld_count++;
@@ -2169,26 +2245,14 @@ void cbm_run_go_lsp(CBMArena *arena, CBMFileResult *result, const char *source, 
                         continue;
 
                     if (embed_count > 0) {
-                        const char **arr = (const char **)cbm_arena_alloc(
-                            arena, (embed_count + 1) * sizeof(const char *));
-                        for (int ei = 0; ei < embed_count; ei++)
-                            arr[ei] = embeds[ei];
-                        arr[embed_count] = NULL;
-                        reg.types[ti].embedded_types = arr;
+                        embeds[embed_count] = NULL;
+                        reg.types[ti].embedded_types = embeds;
                     }
                     if (fld_count > 0) {
-                        const char **names = (const char **)cbm_arena_alloc(
-                            arena, (fld_count + 1) * sizeof(const char *));
-                        const CBMType **types = (const CBMType **)cbm_arena_alloc(
-                            arena, (fld_count + 1) * sizeof(const CBMType *));
-                        for (int fi = 0; fi < fld_count; fi++) {
-                            names[fi] = fld_names[fi];
-                            types[fi] = fld_types[fi];
-                        }
-                        names[fld_count] = NULL;
-                        types[fld_count] = NULL;
-                        reg.types[ti].field_names = names;
-                        reg.types[ti].field_types = types;
+                        fld_names[fld_count] = NULL;
+                        fld_types[fld_count] = NULL;
+                        reg.types[ti].field_names = fld_names;
+                        reg.types[ti].field_types = fld_types;
                     }
                     break;
                 }
@@ -2473,48 +2537,68 @@ static const CBMType *parse_type_node_with_params(CBMArena *arena, TSNode node, 
         TSNode params_node = ts_node_child_by_field_name(node, "parameters", 10);
         TSNode result_node = ts_node_child_by_field_name(node, "result", 6);
 
-        const CBMType *param_types_arr[16];
-        int pc = 0;
+        const CBMType **param_types_arr = NULL;
+        size_t param_capacity = 0;
+        size_t pc = 0;
         if (!ts_node_is_null(params_node)) {
             uint32_t pnc = ts_node_child_count(params_node);
-            for (uint32_t i = 0; i < pnc && pc < 15; i++) {
+            for (uint32_t i = 0; i < pnc; i++) {
                 TSNode child = ts_node_child(params_node, i);
                 if (ts_node_is_null(child) || !ts_node_is_named(child))
                     continue;
                 if (strcmp(ts_node_type(child), "parameter_declaration") == 0) {
                     TSNode pt = ts_node_child_by_field_name(child, "type", 4);
-                    if (!ts_node_is_null(pt))
+                    if (!ts_node_is_null(pt)) {
+                        if (!cbm_lsp_semantic_array_reserve(
+                                arena, (void **)&param_types_arr, pc, &param_capacity,
+                                sizeof(*param_types_arr), pc + 2, "go function parameter types")) {
+                            return cbm_type_unknown();
+                        }
                         param_types_arr[pc++] = parse_type_node_with_params(
                             arena, pt, source, module_qn, type_param_names);
+                    }
                 }
             }
         }
-        param_types_arr[pc] = NULL;
+        if (param_types_arr)
+            param_types_arr[pc] = NULL;
 
-        const CBMType *ret_types_arr[16];
-        int rc = 0;
+        const CBMType **ret_types_arr = NULL;
+        size_t return_capacity = 0;
+        size_t rc = 0;
         if (!ts_node_is_null(result_node)) {
             if (strcmp(ts_node_type(result_node), "parameter_list") == 0) {
                 uint32_t rnc = ts_node_child_count(result_node);
-                for (uint32_t i = 0; i < rnc && rc < 15; i++) {
+                for (uint32_t i = 0; i < rnc; i++) {
                     TSNode child = ts_node_child(result_node, i);
                     if (ts_node_is_null(child) || !ts_node_is_named(child))
                         continue;
                     TSNode rt = ts_node_child_by_field_name(child, "type", 4);
                     if (ts_node_is_null(rt))
                         rt = child;
+                    if (!cbm_lsp_semantic_array_reserve(arena, (void **)&ret_types_arr, rc,
+                                                        &return_capacity, sizeof(*ret_types_arr),
+                                                        rc + 2, "go function return types")) {
+                        return cbm_type_unknown();
+                    }
                     ret_types_arr[rc++] =
                         parse_type_node_with_params(arena, rt, source, module_qn, type_param_names);
                 }
             } else {
+                if (!cbm_lsp_semantic_array_reserve(arena, (void **)&ret_types_arr, 0,
+                                                    &return_capacity, sizeof(*ret_types_arr), 2,
+                                                    "go function return type")) {
+                    return cbm_type_unknown();
+                }
                 ret_types_arr[rc++] = parse_type_node_with_params(arena, result_node, source,
                                                                   module_qn, type_param_names);
             }
         }
-        ret_types_arr[rc] = NULL;
+        if (ret_types_arr)
+            ret_types_arr[rc] = NULL;
 
-        const CBMType **pt = pc > 0 ? (const CBMType **)param_types_arr : NULL;
-        const CBMType **rt = rc > 0 ? (const CBMType **)ret_types_arr : NULL;
+        const CBMType **pt = pc > 0 ? param_types_arr : NULL;
+        const CBMType **rt = rc > 0 ? ret_types_arr : NULL;
         return cbm_type_func(arena, NULL, pt, rt);
     }
 
@@ -2570,10 +2654,11 @@ static void extract_type_params_from_ast(CBMArena *arena, CBMTypeRegistry *reg, 
             continue;
 
         // Extract type param names from type_parameter_declaration children
-        const char *params[16];
-        int param_count = 0;
+        const char **params = NULL;
+        size_t param_count = 0;
+        size_t param_capacity = 0;
         uint32_t tp_nc = ts_node_child_count(tp_list);
-        for (uint32_t j = 0; j < tp_nc && param_count < 15; j++) {
+        for (uint32_t j = 0; j < tp_nc; j++) {
             TSNode child = ts_node_child(tp_list, j);
             if (ts_node_is_null(child) || !ts_node_is_named(child))
                 continue;
@@ -2595,6 +2680,11 @@ static void extract_type_params_from_ast(CBMArena *arena, CBMTypeRegistry *reg, 
             if (!ts_node_is_null(pname)) {
                 char *pn = cbm_node_text(arena, pname, source);
                 if (pn && pn[0]) {
+                    if (!cbm_lsp_semantic_array_reserve(
+                            arena, (void **)&params, param_count, &param_capacity, sizeof(*params),
+                            param_count + 2, "go generic function type parameter names")) {
+                        return;
+                    }
                     params[param_count++] = cbm_arena_strdup(arena, pn);
                 }
             }
@@ -2602,12 +2692,7 @@ static void extract_type_params_from_ast(CBMArena *arena, CBMTypeRegistry *reg, 
         if (param_count == 0)
             continue;
         params[param_count] = NULL;
-
-        // Build arena-allocated type_param_names array
-        const char **tp_names =
-            (const char **)cbm_arena_alloc(arena, (param_count + 1) * sizeof(const char *));
-        for (int j = 0; j <= param_count; j++)
-            tp_names[j] = params[j];
+        const char **tp_names = params;
 
         // Find the matching registered function and set type_param_names
         const char *func_qn = cbm_arena_sprintf(arena, "%s.%s", module_qn, func_name);
@@ -2899,11 +2984,14 @@ void cbm_run_go_lsp_cross(CBMArena *arena, const char *source, int source_len,
                 if (ts_node_is_null(field_list))
                     continue;
 
-                const char *embeds[16];
-                int embed_count = 0;
-                const char *fld_names[64];
-                const CBMType *fld_types[64];
-                int fld_count = 0;
+                const char **embeds = NULL;
+                size_t embed_count = 0;
+                size_t embed_capacity = 0;
+                const char **fld_names = NULL;
+                const CBMType **fld_types = NULL;
+                size_t fld_count = 0;
+                size_t fld_name_capacity = 0;
+                size_t fld_type_capacity = 0;
 
                 GoLSPContext tmp_ctx;
                 memset(&tmp_ctx, 0, sizeof(tmp_ctx));
@@ -2926,20 +3014,30 @@ void cbm_run_go_lsp_cross(CBMArena *arena, const char *source, int source_len,
                     TSNode fname = ts_node_child_by_field_name(field, "name", 4);
                     TSNode ftype = ts_node_child_by_field_name(field, "type", 4);
                     if (ts_node_is_null(fname) && !ts_node_is_null(ftype)) {
-                        if (embed_count < 15) {
-                            char *embed_text = cbm_node_text(arena, ftype, source);
-                            if (embed_text && embed_text[0]) {
-                                const char *et = embed_text;
-                                while (*et == '*')
-                                    et++;
-                                embeds[embed_count++] =
-                                    cbm_arena_sprintf(arena, "%s.%s", module_qn, et);
+                        char *embed_text = cbm_node_text(arena, ftype, source);
+                        if (embed_text && embed_text[0]) {
+                            const char *et = embed_text;
+                            while (*et == '*')
+                                et++;
+                            if (!cbm_lsp_semantic_array_reserve(
+                                    arena, (void **)&embeds, embed_count, &embed_capacity,
+                                    sizeof(*embeds), embed_count + 2, "go embedded field types")) {
+                                return;
                             }
+                            embeds[embed_count++] =
+                                cbm_arena_sprintf(arena, "%s.%s", module_qn, et);
                         }
-                    } else if (!ts_node_is_null(fname) && !ts_node_is_null(ftype) &&
-                               fld_count < 63) {
+                    } else if (!ts_node_is_null(fname) && !ts_node_is_null(ftype)) {
                         char *fn = cbm_node_text(arena, fname, source);
                         if (fn && fn[0]) {
+                            if (!cbm_lsp_semantic_array_reserve(
+                                    arena, (void **)&fld_names, fld_count, &fld_name_capacity,
+                                    sizeof(*fld_names), fld_count + 2, "go struct field names") ||
+                                !cbm_lsp_semantic_array_reserve(
+                                    arena, (void **)&fld_types, fld_count, &fld_type_capacity,
+                                    sizeof(*fld_types), fld_count + 2, "go struct field types")) {
+                                return;
+                            }
                             fld_names[fld_count] = fn;
                             fld_types[fld_count] = go_parse_type_node(&tmp_ctx, ftype);
                             fld_count++;
@@ -2953,26 +3051,14 @@ void cbm_run_go_lsp_cross(CBMArena *arena, const char *source, int source_len,
                         continue;
 
                     if (embed_count > 0) {
-                        const char **arr = (const char **)cbm_arena_alloc(
-                            arena, (embed_count + 1) * sizeof(const char *));
-                        for (int ei = 0; ei < embed_count; ei++)
-                            arr[ei] = embeds[ei];
-                        arr[embed_count] = NULL;
-                        reg.types[ti].embedded_types = arr;
+                        embeds[embed_count] = NULL;
+                        reg.types[ti].embedded_types = embeds;
                     }
                     if (fld_count > 0) {
-                        const char **names = (const char **)cbm_arena_alloc(
-                            arena, (fld_count + 1) * sizeof(const char *));
-                        const CBMType **types = (const CBMType **)cbm_arena_alloc(
-                            arena, (fld_count + 1) * sizeof(const CBMType *));
-                        for (int fi = 0; fi < fld_count; fi++) {
-                            names[fi] = fld_names[fi];
-                            types[fi] = fld_types[fi];
-                        }
-                        names[fld_count] = NULL;
-                        types[fld_count] = NULL;
-                        reg.types[ti].field_names = names;
-                        reg.types[ti].field_types = types;
+                        fld_names[fld_count] = NULL;
+                        fld_types[fld_count] = NULL;
+                        reg.types[ti].field_names = fld_names;
+                        reg.types[ti].field_types = fld_types;
                     }
                     break;
                 }
@@ -3194,19 +3280,18 @@ int cbm_go_fast_resolve_qualified_calls(CBMFileResult *result, CBMTypeRegistry *
             const char *dot = strchr(uc->callee_qn, '.');
             if (dot) {
                 size_t prefix_len = (size_t)(dot - uc->callee_qn);
-                if (prefix_len > 0 && prefix_len < 256) {
-                    char prefix[256];
-                    memcpy(prefix, uc->callee_qn, prefix_len);
-                    prefix[prefix_len] = '\0';
+                if (prefix_len > 0) {
+                    const char *prefix = cbm_arena_strndup(reg->arena, uc->callee_qn, prefix_len);
+                    if (!prefix)
+                        return newly_resolved;
                     const char *suffix = dot + 1;
                     for (int j = 0; j < import_count; j++) {
                         if (import_names[j] && import_qns[j] &&
                             strcmp(prefix, import_names[j]) == 0) {
-                            char fq[1024];
-                            int n = snprintf(fq, sizeof(fq), "%s.%s", import_qns[j], suffix);
-                            if (n > 0 && n < (int)sizeof(fq)) {
+                            const char *fq =
+                                cbm_arena_sprintf(reg->arena, "%s.%s", import_qns[j], suffix);
+                            if (fq)
                                 f = cbm_registry_lookup_func(reg, fq);
-                            }
                             break;
                         }
                     }

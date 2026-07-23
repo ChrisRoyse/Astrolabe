@@ -77,7 +77,10 @@ pub fn run_from_env() -> i32 {
         } else {
             LevelFilter::INFO
         });
-        astrolabe_bridge::route_cbm_logs_to_tracing();
+        if let Err(error) = astrolabe_bridge::route_cbm_logs_to_tracing() {
+            eprintln!("astrolabe: startup failed: {error}");
+            return 1;
+        }
     }
     let binary_path = env::current_exe()
         .ok()

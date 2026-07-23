@@ -44,6 +44,7 @@ enum { CBM_DIR_PERMS = 0755, PL_RING = 4, PL_RING_MASK = 3, PL_SEQ_PASSES = 6, P
 #include <stdatomic.h>
 #include <sys/stat.h>
 #include <time.h>
+#include <windows.h>
 
 enum { PL_ROUTE_FULL = CBM_INCREMENTAL_REBUILD_REQUIRED };
 
@@ -73,6 +74,68 @@ void cbm_pipeline_lock(void) {
 
 void cbm_pipeline_unlock(void) {
     atomic_store(&g_pipeline_busy, 0);
+}
+
+int cbm_pipeline_unique_stage_path(const char *db_path, const char *kind, char **out_path) {
+    if (!db_path || !kind || !out_path || db_path[0] == '\0' || kind[0] == '\0') {
+        cbm_log_error("pipeline.stage_identity_failed", "code",
+                      "CBM_PIPELINE_STAGE_IDENTITY_INVALID", "message",
+                      "the live database or stage kind is empty", "remediation",
+                      "supply the exact live database path and a non-empty transaction kind");
+        return CBM_NOT_FOUND;
+    }
+    *out_path = NULL;
+    LARGE_INTEGER counter;
+    if (!QueryPerformanceCounter(&counter)) {
+        char native_error[32];
+        (void)snprintf(native_error, sizeof(native_error), "%lu", (unsigned long)GetLastError());
+        cbm_log_error("pipeline.stage_identity_failed", "code", "CBM_PIPELINE_STAGE_CLOCK_FAILED",
+                      "native_error_kind", "win32", "native_error", native_error, "message",
+                      "a unique staging identity could not be derived", "remediation",
+                      "resolve the reported Windows timing failure and retry indexing");
+        return CBM_NOT_FOUND;
+    }
+    static volatile LONG sequence;
+    LONG generation = InterlockedIncrement(&sequence);
+    if (generation <= 0) {
+        cbm_log_error("pipeline.stage_identity_failed", "code",
+                      "CBM_PIPELINE_STAGE_SEQUENCE_EXHAUSTED", "message",
+                      "the process-local staging sequence exhausted its positive range",
+                      "remediation", "restart the indexing worker and retry");
+        return CBM_NOT_FOUND;
+    }
+
+    size_t db_len = strlen(db_path);
+    size_t kind_len = strlen(kind);
+    const size_t suffix_capacity = 96;
+    if (db_len > SIZE_MAX - kind_len || db_len + kind_len > SIZE_MAX - suffix_capacity) {
+        cbm_log_error("pipeline.stage_identity_failed", "code", "CBM_PIPELINE_STAGE_PATH_OVERFLOW",
+                      "message", "the unique staging path exceeds addressable memory",
+                      "remediation", "shorten the configured store path and retry indexing");
+        return CBM_NOT_FOUND;
+    }
+    size_t capacity = db_len + kind_len + suffix_capacity;
+    char *path = (char *)malloc(capacity);
+    if (!path) {
+        cbm_log_error("pipeline.stage_identity_failed", "code",
+                      "CBM_PIPELINE_STAGE_PATH_ALLOC_FAILED", "message",
+                      "the unique staging path could not be allocated", "remediation",
+                      "free memory or shorten the configured store path, then retry indexing");
+        return CBM_NOT_FOUND;
+    }
+    int written = snprintf(path, capacity, "%s.%s-stage-%lu-%016llx-%ld", db_path, kind,
+                           (unsigned long)GetCurrentProcessId(),
+                           (unsigned long long)counter.QuadPart, (long)generation);
+    if (written <= 0 || (size_t)written >= capacity || cbm_path_exists(path)) {
+        cbm_log_error("pipeline.stage_identity_failed", "code",
+                      "CBM_PIPELINE_STAGE_IDENTITY_COLLISION", "path", path, "message",
+                      "the generated staging identity is not absent", "remediation",
+                      "preserve the colliding path and retry with a new indexing request");
+        free(path);
+        return CBM_NOT_FOUND;
+    }
+    *out_path = path;
+    return 0;
 }
 
 /* ── Internal state ──────────────────────────────────────────────── */
@@ -1291,30 +1354,34 @@ static int dump_and_persist_hashes(cbm_pipeline_t *p, const cbm_file_info_t *fil
         }
     }
     free(db_dir);
-    const char stage_suffix[] = ".full-stage";
-    size_t db_len = strlen(db_path);
-    if (db_len > SIZE_MAX - sizeof(stage_suffix)) {
+    char *stage = NULL;
+    if (cbm_pipeline_unique_stage_path(db_path, "full", &stage) != 0) {
         free(db_path);
         return CBM_NOT_FOUND;
     }
-    char *stage = malloc(db_len + sizeof(stage_suffix));
-    char *stage_wal = malloc(db_len + sizeof(stage_suffix) + 4);
-    char *stage_shm = malloc(db_len + sizeof(stage_suffix) + 4);
-    if (!stage || !stage_wal || !stage_shm) {
+    size_t db_len = strlen(db_path);
+    size_t stage_len = strlen(stage);
+    if (stage_len > SIZE_MAX - 5) {
         free(stage);
+        free(db_path);
+        return CBM_NOT_FOUND;
+    }
+    char *stage_wal = malloc(stage_len + 5);
+    char *stage_shm = malloc(stage_len + 5);
+    if (!stage_wal || !stage_shm) {
         free(stage_wal);
         free(stage_shm);
+        free(stage);
         free(db_path);
         return CBM_NOT_FOUND;
     }
-    snprintf(stage, db_len + sizeof(stage_suffix), "%s%s", db_path, stage_suffix);
-    snprintf(stage_wal, db_len + sizeof(stage_suffix) + 4, "%s-wal", stage);
-    snprintf(stage_shm, db_len + sizeof(stage_suffix) + 4, "%s-shm", stage);
-    if (remove_optional_pipeline_file(stage, "CBM_PIPELINE_STALE_STAGE_REMOVE_FAILED") != 0 ||
-        remove_optional_pipeline_file(stage_wal, "CBM_PIPELINE_STALE_STAGE_WAL_REMOVE_FAILED") !=
-            0 ||
-        remove_optional_pipeline_file(stage_shm, "CBM_PIPELINE_STALE_STAGE_SHM_REMOVE_FAILED") !=
-            0) {
+    snprintf(stage_wal, stage_len + 5, "%s-wal", stage);
+    snprintf(stage_shm, stage_len + 5, "%s-shm", stage);
+    if (cbm_path_exists(stage_wal) || cbm_path_exists(stage_shm)) {
+        cbm_log_error("pipeline.persist_failed", "code", "CBM_PIPELINE_STAGE_SIDECAR_COLLISION",
+                      "path", stage, "message",
+                      "a generated transaction-owned stage sidecar already exists", "remediation",
+                      "preserve the colliding files and retry with a new indexing request");
         free(stage);
         free(stage_wal);
         free(stage_shm);
@@ -1431,6 +1498,9 @@ static int dump_and_persist_hashes(cbm_pipeline_t *p, const cbm_file_info_t *fil
              cbm_store_exec(hash_store, "PRAGMA journal_mode=DELETE;") != CBM_STORE_OK)) {
             final_rc = CBM_NOT_FOUND;
         }
+        if (final_rc == 0 && !cbm_store_check_integrity(hash_store)) {
+            final_rc = CBM_NOT_FOUND;
+        }
         cbm_store_close(hash_store);
         cbm_log_info("pass.timing", "pass", "persist_hashes", "files", itoa_buf(file_count));
     }
@@ -1453,6 +1523,14 @@ static int dump_and_persist_hashes(cbm_pipeline_t *p, const cbm_file_info_t *fil
         return CBM_NOT_FOUND;
     }
 
+    if (db_len > SIZE_MAX - 5) {
+        (void)remove_optional_pipeline_file(stage, "CBM_PIPELINE_FAILED_STAGE_REMOVE_FAILED");
+        free(stage);
+        free(stage_wal);
+        free(stage_shm);
+        free(db_path);
+        return CBM_NOT_FOUND;
+    }
     size_t sidecar_size = db_len + 5;
     char *live_wal = malloc(sidecar_size);
     char *live_shm = malloc(sidecar_size);
@@ -1483,10 +1561,12 @@ static int dump_and_persist_hashes(cbm_pipeline_t *p, const cbm_file_info_t *fil
         return CBM_NOT_FOUND;
     }
     if (cbm_rename_replace(stage, db_path) != 0) {
+        char native_error[32];
+        (void)snprintf(native_error, sizeof(native_error), "%lu", cbm_fs_last_error());
         cbm_log_error("pipeline.persist_failed", "code", "CBM_PIPELINE_ATOMIC_SWAP_FAILED", "path",
-                      db_path, "message",
-                      "the complete staged store could not replace the live store", "remediation",
-                      "close readers holding the store and retry");
+                      db_path, "native_error_kind", "win32", "native_error", native_error,
+                      "message", "the complete staged store could not replace the live store",
+                      "remediation", "close readers holding the store and retry");
         (void)remove_optional_pipeline_file(stage, "CBM_PIPELINE_FAILED_STAGE_REMOVE_FAILED");
         free(live_wal);
         free(live_shm);

@@ -40,6 +40,7 @@
  */
 
 #include "cs_lsp.h"
+#include "semantic_array.h"
 #include "lsp_node_iter.h"
 #include "../helpers.h"
 #include <ctype.h>
@@ -47,16 +48,20 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define CS_EVAL_MAX_DEPTH 64
 #define CS_USING_INITIAL_CAP 16
 #define CS_NAMESPACE_INITIAL_CAP 8
-#define CS_LSP_PARENT_WALK_MAX 32
+
+enum {
+    CS_DEFAULT_EVAL_DEPTH_LIMIT = 64,
+    CS_DEFAULT_LOOKUP_DEPTH_LIMIT = 32,
+};
 
 extern const TSLanguage *tree_sitter_c_sharp(void);
 
 /* ── forward decls ──────────────────────────────────────────────── */
 
 static void cs_resolve_calls_in_node(CSLSPContext *ctx, TSNode node);
+static void cs_resolve_calls_in_node_inner(CSLSPContext *ctx, TSNode node);
 static void cs_process_function_like(CSLSPContext *ctx, TSNode node);
 static void cs_process_type_decl(CSLSPContext *ctx, TSNode node);
 static const CBMType *cs_eval_invocation_type(CSLSPContext *ctx, TSNode call);
@@ -241,6 +246,15 @@ void cs_lsp_init(CSLSPContext *ctx, CBMArena *arena, const char *source, int sou
     ctx->module_qn = module_qn;
     ctx->resolved_calls = out;
     ctx->current_scope = cbm_scope_push(arena, NULL);
+    if (!cbm_lsp_read_positive_limit(arena, "CBM_LSP_MAX_EVAL_DEPTH", CS_DEFAULT_EVAL_DEPTH_LIMIT,
+                                     "cs_lsp_eval_depth_config", &ctx->eval_depth_limit) ||
+        !cbm_lsp_read_positive_limit(arena, "CBM_LSP_MAX_LOOKUP_DEPTH",
+                                     CS_DEFAULT_LOOKUP_DEPTH_LIMIT, "cs_lsp_lookup_depth_config",
+                                     &ctx->lookup_depth_limit) ||
+        !cbm_lsp_read_positive_limit(arena, "CBM_LSP_MAX_WALK_DEPTH", CBM_LSP_DEFAULT_WALK_DEPTH,
+                                     "cs_lsp_walk_depth_config", &ctx->walk_depth_limit)) {
+        return;
+    }
 
     /* Implicit `using System;` — C# always brings in System. We pretend
      * Program.cs has it explicitly so primitive aliases and System.Console
@@ -510,6 +524,46 @@ const char *cs_resolve_type_name(CSLSPContext *ctx, const char *raw) {
     return bare;
 }
 
+static const CBMRegisteredFunc *cs_lookup_parent_method(CSLSPContext *ctx, const char *type_qn,
+                                                        const char *method_name,
+                                                        const char **visited, int *visited_count,
+                                                        int visited_cap, int depth) {
+    if (depth >= ctx->lookup_depth_limit) {
+        cbm_arena_mark_failed(ctx->arena, "CBM_LSP_ANALYSIS_LIMIT_EXCEEDED",
+                              "cs_lsp_parent_lookup_depth", (size_t)ctx->lookup_depth_limit);
+        return NULL;
+    }
+    for (int i = 0; i < *visited_count; i++) {
+        if (strcmp(visited[i], type_qn) == 0) {
+            return NULL;
+        }
+    }
+    if (*visited_count >= visited_cap) {
+        cbm_arena_mark_failed(ctx->arena, "CBM_LSP_ANALYSIS_LIMIT_EXCEEDED",
+                              "cs_lsp_parent_lookup_cardinality", (size_t)visited_cap);
+        return NULL;
+    }
+    visited[(*visited_count)++] = type_qn;
+
+    const CBMRegisteredFunc *found =
+        cbm_registry_lookup_method(ctx->registry, type_qn, method_name);
+    if (found) {
+        return found;
+    }
+    const CBMRegisteredType *type = cs_lookup_type_qn(ctx, type_qn);
+    if (!type || !type->embedded_types) {
+        return NULL;
+    }
+    for (int i = 0; type->embedded_types[i]; i++) {
+        found = cs_lookup_parent_method(ctx, type->embedded_types[i], method_name, visited,
+                                        visited_count, visited_cap, depth + 1);
+        if (found || cbm_arena_failed(ctx->arena)) {
+            return found;
+        }
+    }
+    return NULL;
+}
+
 /* Look up a method on a type, walking inheritance chain. */
 const CBMRegisteredFunc *cs_lookup_method(CSLSPContext *ctx, const char *type_qn,
                                           const char *method_name) {
@@ -525,42 +579,33 @@ const CBMRegisteredFunc *cs_lookup_method(CSLSPContext *ctx, const char *type_qn
     if (!t)
         return NULL;
 
-    const char *visited[CS_LSP_PARENT_WALK_MAX];
-    int visited_count = 0;
-    const char *frontier[CS_LSP_PARENT_WALK_MAX];
-    int frontier_count = 0;
-
-    if (t->embedded_types) {
-        for (int i = 0; t->embedded_types[i] && frontier_count < CS_LSP_PARENT_WALK_MAX; i++) {
-            frontier[frontier_count++] = t->embedded_types[i];
+    int visited_cap = ctx->registry ? ctx->registry->type_count : 0;
+    if (ctx->registry && ctx->registry->fallback) {
+        if (ctx->registry->fallback->type_count > INT_MAX - visited_cap) {
+            cbm_arena_mark_failed(ctx->arena, "CBM_LSP_ANALYSIS_LIMIT_EXCEEDED",
+                                  "cs_lsp_parent_lookup_cardinality", SIZE_MAX);
+            return NULL;
         }
+        visited_cap += ctx->registry->fallback->type_count;
     }
-
-    /* Always try System.Object as the universal root. */
-    while (frontier_count > 0 && visited_count < CS_LSP_PARENT_WALK_MAX) {
-        const char *parent = frontier[--frontier_count];
-        bool seen = false;
-        for (int v = 0; v < visited_count; v++) {
-            if (strcmp(visited[v], parent) == 0) {
-                seen = true;
-                break;
-            }
-        }
-        if (seen)
-            continue;
-        visited[visited_count++] = parent;
-
-        f = cbm_registry_lookup_method(ctx->registry, parent, method_name);
-        if (f)
-            return f;
-
-        const CBMRegisteredType *next = cs_lookup_type_qn(ctx, parent);
-        if (!next)
-            continue;
-        if (next->embedded_types) {
-            for (int i = 0; next->embedded_types[i] && frontier_count < CS_LSP_PARENT_WALK_MAX;
-                 i++) {
-                frontier[frontier_count++] = next->embedded_types[i];
+    if (visited_cap == INT_MAX) {
+        cbm_arena_mark_failed(ctx->arena, "CBM_LSP_ANALYSIS_LIMIT_EXCEEDED",
+                              "cs_lsp_parent_lookup_cardinality", SIZE_MAX);
+        return NULL;
+    }
+    visited_cap++;
+    const char **visited =
+        (const char **)cbm_arena_alloc(ctx->arena, (size_t)visited_cap * sizeof(*visited));
+    if (!visited) {
+        return NULL;
+    }
+    int visited_count = 0;
+    if (t->embedded_types) {
+        for (int i = 0; t->embedded_types[i]; i++) {
+            f = cs_lookup_parent_method(ctx, t->embedded_types[i], method_name, visited,
+                                        &visited_count, visited_cap, 0);
+            if (f || cbm_arena_failed(ctx->arena)) {
+                return f;
             }
         }
     }
@@ -823,7 +868,12 @@ static const CBMType *cs_unwrap_nullable(const CBMType *t) {
 }
 
 const CBMType *cs_eval_expr_type(CSLSPContext *ctx, TSNode node) {
-    if (ts_node_is_null(node) || ctx->eval_depth >= CS_EVAL_MAX_DEPTH) {
+    if (ts_node_is_null(node)) {
+        return cbm_type_unknown();
+    }
+    if (ctx->eval_depth >= ctx->eval_depth_limit) {
+        cbm_arena_mark_failed(ctx->arena, "CBM_LSP_ANALYSIS_LIMIT_EXCEEDED",
+                              "cs_lsp_expression_depth", (size_t)ctx->eval_depth_limit);
         return cbm_type_unknown();
     }
     ctx->eval_depth++;
@@ -1831,6 +1881,20 @@ static void cs_resolve_object_creation(CSLSPContext *ctx, TSNode call) {
 }
 
 static void cs_resolve_calls_in_node(CSLSPContext *ctx, TSNode node) {
+    if (!ctx || cbm_arena_failed(ctx->arena)) {
+        return;
+    }
+    if (ctx->walk_depth >= ctx->walk_depth_limit) {
+        cbm_arena_mark_failed(ctx->arena, "CBM_LSP_ANALYSIS_LIMIT_EXCEEDED",
+                              "cs_lsp_ast_walk_depth", (size_t)ctx->walk_depth_limit);
+        return;
+    }
+    ctx->walk_depth++;
+    cs_resolve_calls_in_node_inner(ctx, node);
+    ctx->walk_depth--;
+}
+
+static void cs_resolve_calls_in_node_inner(CSLSPContext *ctx, TSNode node) {
     if (ts_node_is_null(node))
         return;
     const char *kind = ts_node_type(node);
@@ -2282,8 +2346,13 @@ static void cs_process_type_decl(CSLSPContext *ctx, TSNode node) {
 static void cs_collect_imports(CSLSPContext *ctx, TSNode root) {
     /* Walk the entire tree once at top — using directives can appear at file
      * scope or inside namespace blocks. */
-    TSNode stack[256];
-    int top = 0;
+    TSNode *stack = NULL;
+    size_t top = 0;
+    size_t stack_capacity = 0;
+    if (!cbm_lsp_semantic_array_reserve(ctx->arena, (void **)&stack, 0, &stack_capacity,
+                                        sizeof(*stack), 1, "csharp using traversal")) {
+        return;
+    }
     stack[top++] = root;
     while (top > 0) {
         TSNode n = stack[--top];
@@ -2383,7 +2452,7 @@ static void cs_collect_imports(CSLSPContext *ctx, TSNode root) {
          * (using directives can't appear there), but namespace bodies may
          * contain more usings. */
         uint32_t cnc = ts_node_child_count(n);
-        for (uint32_t i = 0; i < cnc && top < 256; i++) {
+        for (uint32_t i = 0; i < cnc; i++) {
             TSNode c = ts_node_child(n, i);
             if (ts_node_is_null(c))
                 continue;
@@ -2391,6 +2460,11 @@ static void cs_collect_imports(CSLSPContext *ctx, TSNode root) {
             if (strcmp(ck, "method_declaration") == 0 ||
                 strcmp(ck, "constructor_declaration") == 0 || strcmp(ck, "block") == 0) {
                 continue;
+            }
+            if (!cbm_lsp_semantic_array_reserve(ctx->arena, (void **)&stack, top, &stack_capacity,
+                                                sizeof(*stack), top + 1,
+                                                "csharp using traversal")) {
+                return;
             }
             stack[top++] = c;
         }
@@ -2704,8 +2778,13 @@ static void cs_collect_class_fields(CSLSPContext *ctx, CBMTypeRegistry *reg, TSN
     /* Walk the AST and collect field/property/event declarations into tab.
      * We need the namespace + using context to resolve types, so this runs
      * after cs_collect_imports. */
-    TSNode stack[512];
-    int top = 0;
+    TSNode *stack = NULL;
+    size_t top = 0;
+    size_t stack_capacity = 0;
+    if (!cbm_lsp_semantic_array_reserve(ctx->arena, (void **)&stack, 0, &stack_capacity,
+                                        sizeof(*stack), 1, "csharp class field traversal")) {
+        return;
+    }
     stack[top++] = root;
     /* Maintain enclosing class for each decl we visit. We simply re-derive it
      * via parent_chain inspection (limited to direct class parent). */
@@ -2813,7 +2892,7 @@ static void cs_collect_class_fields(CSLSPContext *ctx, CBMTypeRegistry *reg, TSN
         }
 
         uint32_t cnc = ts_node_child_count(n);
-        for (uint32_t i = 0; i < cnc && top + 1 < 512; i++) {
+        for (uint32_t i = 0; i < cnc; i++) {
             TSNode c = ts_node_child(n, i);
             if (ts_node_is_null(c))
                 continue;
@@ -2825,6 +2904,11 @@ static void cs_collect_class_fields(CSLSPContext *ctx, CBMTypeRegistry *reg, TSN
                 strcmp(ck, "operator_declaration") == 0 || strcmp(ck, "indexer_declaration") == 0 ||
                 strcmp(ck, "block") == 0) {
                 continue;
+            }
+            if (!cbm_lsp_semantic_array_reserve(ctx->arena, (void **)&stack, top, &stack_capacity,
+                                                sizeof(*stack), top + 1,
+                                                "csharp class field traversal")) {
+                return;
             }
             stack[top++] = c;
         }
@@ -2881,8 +2965,13 @@ static void cs_method_rt_add(CBMArena *arena, cs_method_rt_table_t *tab, const c
  * and recording (parent_class_qn + "." + method_name → return type). */
 static void cs_collect_method_return_types(CSLSPContext *ctx, TSNode root,
                                            cs_method_rt_table_t *tab) {
-    TSNode stack[512];
-    int top = 0;
+    TSNode *stack = NULL;
+    size_t top = 0;
+    size_t stack_capacity = 0;
+    if (!cbm_lsp_semantic_array_reserve(ctx->arena, (void **)&stack, 0, &stack_capacity,
+                                        sizeof(*stack), 1, "csharp method return traversal")) {
+        return;
+    }
     stack[top++] = root;
     while (top > 0) {
         TSNode n = stack[--top];
@@ -2912,10 +3001,16 @@ static void cs_collect_method_return_types(CSLSPContext *ctx, TSNode root,
             }
             if (!cls_short) {
                 uint32_t cnc = ts_node_child_count(n);
-                for (uint32_t i = 0; i < cnc && top + 1 < 512; i++) {
+                for (uint32_t i = 0; i < cnc; i++) {
                     TSNode c = ts_node_child(n, i);
-                    if (!ts_node_is_null(c))
+                    if (!ts_node_is_null(c)) {
+                        if (!cbm_lsp_semantic_array_reserve(
+                                ctx->arena, (void **)&stack, top, &stack_capacity, sizeof(*stack),
+                                top + 1, "csharp method return traversal")) {
+                            return;
+                        }
                         stack[top++] = c;
+                    }
                 }
                 continue;
             }
@@ -2972,13 +3067,18 @@ static void cs_collect_method_return_types(CSLSPContext *ctx, TSNode root,
 
         /* Push children unless we're inside a method body. */
         uint32_t cnc = ts_node_child_count(n);
-        for (uint32_t i = 0; i < cnc && top + 1 < 512; i++) {
+        for (uint32_t i = 0; i < cnc; i++) {
             TSNode c = ts_node_child(n, i);
             if (ts_node_is_null(c))
                 continue;
             const char *ck = ts_node_type(c);
             if (strcmp(ck, "block") == 0 || strcmp(ck, "arrow_expression_clause") == 0) {
                 continue;
+            }
+            if (!cbm_lsp_semantic_array_reserve(ctx->arena, (void **)&stack, top, &stack_capacity,
+                                                sizeof(*stack), top + 1,
+                                                "csharp method return traversal")) {
+                return;
             }
             stack[top++] = c;
         }

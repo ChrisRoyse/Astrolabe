@@ -32,6 +32,7 @@
  */
 
 #include "java_lsp.h"
+#include "semantic_array.h"
 #include "../helpers.h"
 
 #include <ctype.h>
@@ -40,12 +41,13 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define JAVA_LSP_MAX_EVAL_DEPTH 32
-#define JAVA_LSP_MAX_STMT_DEPTH 256
-#define JAVA_LSP_MAX_WALK_DEPTH 512
-#define JAVA_LSP_MAX_INHERIT_HOPS 32
-#define JAVA_LSP_MAX_OVERLOADS 64
 #define JAVA_LSP_BUF 1024
+
+enum {
+    JAVA_LSP_DEFAULT_EVAL_DEPTH_LIMIT = 32,
+    JAVA_LSP_DEFAULT_STATEMENT_DEPTH_LIMIT = 256,
+    JAVA_LSP_DEFAULT_LOOKUP_DEPTH_LIMIT = 32,
+};
 
 /* Forward declarations ─────────────────────────────────────────────── */
 
@@ -282,6 +284,19 @@ void java_lsp_init(JavaLSPContext *ctx, CBMArena *arena, const char *source, int
     ctx->package_name = package_name ? package_name : "";
     ctx->module_qn = module_qn ? module_qn : "";
     ctx->resolved_calls = out;
+    if (!cbm_lsp_read_positive_limit(arena, "CBM_LSP_MAX_EVAL_DEPTH",
+                                     JAVA_LSP_DEFAULT_EVAL_DEPTH_LIMIT,
+                                     "java_lsp_eval_depth_config", &ctx->eval_depth_limit) ||
+        !cbm_lsp_read_positive_limit(
+            arena, "CBM_LSP_MAX_STATEMENT_DEPTH", JAVA_LSP_DEFAULT_STATEMENT_DEPTH_LIMIT,
+            "java_lsp_statement_depth_config", &ctx->statement_depth_limit) ||
+        !cbm_lsp_read_positive_limit(arena, "CBM_LSP_MAX_LOOKUP_DEPTH",
+                                     JAVA_LSP_DEFAULT_LOOKUP_DEPTH_LIMIT,
+                                     "java_lsp_lookup_depth_config", &ctx->lookup_depth_limit) ||
+        !cbm_lsp_read_positive_limit(arena, "CBM_LSP_MAX_WALK_DEPTH", CBM_LSP_DEFAULT_WALK_DEPTH,
+                                     "java_lsp_walk_depth_config", &ctx->walk_depth_limit)) {
+        return;
+    }
     ctx->current_scope = cbm_scope_push(arena, NULL);
 
     const char *dbg = getenv("CBM_LSP_DEBUG");
@@ -407,23 +422,30 @@ const CBMType *java_parse_type_node(JavaLSPContext *ctx, TSNode node) {
         if (!base_qn)
             return base;
         /* Collect every type argument (K, V, R, ...). */
-        int arg_count = 0;
-        const CBMType *arg_buf[16];
+        size_t arg_count = 0;
+        size_t arg_capacity = 0;
+        const CBMType **args = NULL;
         if (!ts_node_is_null(targs) && strcmp(ts_node_type(targs), "type_arguments") == 0) {
             uint32_t tn = ts_node_named_child_count(targs);
-            for (uint32_t ti = 0; ti < tn && arg_count < 16; ti++) {
-                arg_buf[arg_count++] = java_parse_type_node(ctx, ts_node_named_child(targs, ti));
+            for (uint32_t ti = 0; ti < tn; ti++) {
+                if (!cbm_lsp_semantic_array_reserve(ctx->arena, (void **)&args, arg_count,
+                                                    &arg_capacity, sizeof(*args), arg_count + 2,
+                                                    "java generic type arguments")) {
+                    return cbm_type_unknown();
+                }
+                args[arg_count++] = java_parse_type_node(ctx, ts_node_named_child(targs, ti));
             }
         }
         if (arg_count == 0) {
-            arg_buf[arg_count++] = cbm_type_unknown();
+            if (!cbm_lsp_semantic_array_reserve(ctx->arena, (void **)&args, 0, &arg_capacity,
+                                                sizeof(*args), 2,
+                                                "java generic unknown type argument")) {
+                return cbm_type_unknown();
+            }
+            args[arg_count++] = cbm_type_unknown();
         }
-        const CBMType **args =
-            (const CBMType **)cbm_arena_alloc(ctx->arena, (size_t)(arg_count + 1) * sizeof(*args));
-        for (int i = 0; i < arg_count; i++)
-            args[i] = arg_buf[i];
         args[arg_count] = NULL;
-        return cbm_type_template(ctx->arena, base_qn, args, arg_count);
+        return cbm_type_template(ctx->arena, base_qn, args, (int)arg_count);
     }
 
     /* array_type — T[] (modeled as slice for our purposes). */
@@ -585,8 +607,11 @@ const char *java_resolve_type_name(JavaLSPContext *ctx, const char *name) {
 const CBMType *java_eval_expr_type(JavaLSPContext *ctx, TSNode node) {
     if (ts_node_is_null(node))
         return cbm_type_unknown();
-    if (ctx->eval_depth >= JAVA_LSP_MAX_EVAL_DEPTH)
+    if (ctx->eval_depth >= ctx->eval_depth_limit) {
+        cbm_arena_mark_failed(ctx->arena, "CBM_LSP_ANALYSIS_LIMIT_EXCEEDED",
+                              "java_lsp_expression_depth", (size_t)ctx->eval_depth_limit);
         return cbm_type_unknown();
+    }
     ctx->eval_depth++;
     const CBMType *result = cbm_type_unknown();
     const char *kind = ts_node_type(node);
@@ -895,30 +920,88 @@ static const CBMType *eval_field_access(JavaLSPContext *ctx, TSNode node) {
     return cbm_type_unknown();
 }
 
-/* Lookup a field's type on a class, walking the parent chain. */
-const CBMType *java_lookup_field_type(JavaLSPContext *ctx, const char *class_qn,
-                                      const char *field_name) {
-    if (!class_qn || !field_name)
+static int java_lookup_visited_capacity(const JavaLSPContext *ctx) {
+    int cap = ctx->registry->type_count;
+    if (ctx->registry->fallback) {
+        if (ctx->registry->fallback->type_count > INT_MAX - cap) {
+            return 0;
+        }
+        cap += ctx->registry->fallback->type_count;
+    }
+    return cap < INT_MAX ? cap + 1 : 0;
+}
+
+static bool java_lookup_enter(JavaLSPContext *ctx, const char *type_qn, const char **visited,
+                              int *visited_count, int visited_cap, int depth,
+                              const char *operation) {
+    if (depth >= ctx->lookup_depth_limit) {
+        cbm_arena_mark_failed(ctx->arena, "CBM_LSP_ANALYSIS_LIMIT_EXCEEDED", operation,
+                              (size_t)ctx->lookup_depth_limit);
+        return false;
+    }
+    for (int i = 0; i < *visited_count; i++) {
+        if (strcmp(visited[i], type_qn) == 0) {
+            return false;
+        }
+    }
+    if (*visited_count >= visited_cap) {
+        cbm_arena_mark_failed(ctx->arena, "CBM_LSP_ANALYSIS_LIMIT_EXCEEDED", operation,
+                              (size_t)visited_cap);
+        return false;
+    }
+    visited[(*visited_count)++] = type_qn;
+    return true;
+}
+
+static const CBMType *java_lookup_field_depth(JavaLSPContext *ctx, const char *class_qn,
+                                              const char *field_name, const char **visited,
+                                              int *visited_count, int visited_cap, int depth) {
+    if (!java_lookup_enter(ctx, class_qn, visited, visited_count, visited_cap, depth,
+                           "java_lsp_field_lookup_depth")) {
         return cbm_type_unknown();
-    const char *cur = class_qn;
-    for (int hops = 0; hops < JAVA_LSP_MAX_INHERIT_HOPS && cur; hops++) {
-        const CBMRegisteredType *rt = cbm_registry_lookup_type(ctx->registry, cur);
-        if (!rt)
-            break;
-        if (rt->field_names && rt->field_types) {
-            for (int i = 0; rt->field_names[i]; i++) {
-                if (strcmp(rt->field_names[i], field_name) == 0) {
-                    return rt->field_types[i];
-                }
+    }
+    const CBMRegisteredType *type = cbm_registry_lookup_type(ctx->registry, class_qn);
+    if (!type) {
+        return cbm_type_unknown();
+    }
+    if (type->field_names && type->field_types) {
+        for (int i = 0; type->field_names[i]; i++) {
+            if (strcmp(type->field_names[i], field_name) == 0) {
+                return type->field_types[i];
             }
         }
-        if (rt->embedded_types && rt->embedded_types[0]) {
-            cur = rt->embedded_types[0];
-        } else {
-            cur = NULL;
+    }
+    if (type->embedded_types) {
+        for (int i = 0; type->embedded_types[i]; i++) {
+            const CBMType *found =
+                java_lookup_field_depth(ctx, type->embedded_types[i], field_name, visited,
+                                        visited_count, visited_cap, depth + 1);
+            if (!cbm_type_is_unknown(found) || cbm_arena_failed(ctx->arena)) {
+                return found;
+            }
         }
     }
     return cbm_type_unknown();
+}
+
+/* Lookup a field's type across the complete class/interface parent graph. */
+const CBMType *java_lookup_field_type(JavaLSPContext *ctx, const char *class_qn,
+                                      const char *field_name) {
+    if (!ctx || !class_qn || !field_name || !ctx->registry) {
+        return cbm_type_unknown();
+    }
+    int cap = java_lookup_visited_capacity(ctx);
+    if (cap <= 0) {
+        cbm_arena_mark_failed(ctx->arena, "CBM_LSP_ANALYSIS_LIMIT_EXCEEDED",
+                              "java_lsp_field_lookup_cardinality", SIZE_MAX);
+        return cbm_type_unknown();
+    }
+    const char **visited =
+        (const char **)cbm_arena_alloc(ctx->arena, (size_t)cap * sizeof(*visited));
+    int visited_count = 0;
+    return visited
+               ? java_lookup_field_depth(ctx, class_qn, field_name, visited, &visited_count, cap, 0)
+               : cbm_type_unknown();
 }
 
 /* Resolve `recv.member` for non-method member access. */
@@ -941,32 +1024,58 @@ static const CBMType *resolve_member_type(JavaLSPContext *ctx, const CBMType *re
 
 /* ── Method lookup ────────────────────────────────────────────────── */
 
-const CBMRegisteredFunc *java_lookup_method(JavaLSPContext *ctx, const char *class_qn,
-                                            const char *method_name, int arg_count) {
-    if (!class_qn || !method_name)
+static const CBMRegisteredFunc *java_lookup_method_depth(JavaLSPContext *ctx, const char *class_qn,
+                                                         const char *method_name, int arg_count,
+                                                         const char **visited, int *visited_count,
+                                                         int visited_cap, int depth,
+                                                         const CBMRegisteredFunc **fallback) {
+    if (!java_lookup_enter(ctx, class_qn, visited, visited_count, visited_cap, depth,
+                           "java_lsp_method_lookup_depth")) {
         return NULL;
-    const char *cur = class_qn;
-    const CBMRegisteredFunc *fallback = NULL;
-    for (int hops = 0; hops < JAVA_LSP_MAX_INHERIT_HOPS && cur; hops++) {
-        /* Try arg-count-aware lookup first. */
-        const CBMRegisteredFunc *m =
-            cbm_registry_lookup_method_by_args(ctx->registry, cur, method_name, arg_count);
-        if (m)
-            return m;
-        /* Otherwise capture any name match as fallback. */
-        if (!fallback) {
-            fallback = cbm_registry_lookup_method(ctx->registry, cur, method_name);
-        }
-        const CBMRegisteredType *rt = cbm_registry_lookup_type(ctx->registry, cur);
-        if (!rt)
-            break;
-        if (rt->embedded_types && rt->embedded_types[0]) {
-            cur = rt->embedded_types[0];
-        } else {
-            cur = NULL;
+    }
+    const CBMRegisteredFunc *found =
+        cbm_registry_lookup_method_by_args(ctx->registry, class_qn, method_name, arg_count);
+    if (found) {
+        return found;
+    }
+    if (!*fallback) {
+        *fallback = cbm_registry_lookup_method(ctx->registry, class_qn, method_name);
+    }
+    const CBMRegisteredType *type = cbm_registry_lookup_type(ctx->registry, class_qn);
+    if (type && type->embedded_types) {
+        for (int i = 0; type->embedded_types[i]; i++) {
+            found =
+                java_lookup_method_depth(ctx, type->embedded_types[i], method_name, arg_count,
+                                         visited, visited_count, visited_cap, depth + 1, fallback);
+            if (found || cbm_arena_failed(ctx->arena)) {
+                return found;
+            }
         }
     }
-    return fallback;
+    return NULL;
+}
+
+const CBMRegisteredFunc *java_lookup_method(JavaLSPContext *ctx, const char *class_qn,
+                                            const char *method_name, int arg_count) {
+    if (!ctx || !class_qn || !method_name || !ctx->registry) {
+        return NULL;
+    }
+    int cap = java_lookup_visited_capacity(ctx);
+    if (cap <= 0) {
+        cbm_arena_mark_failed(ctx->arena, "CBM_LSP_ANALYSIS_LIMIT_EXCEEDED",
+                              "java_lsp_method_lookup_cardinality", SIZE_MAX);
+        return NULL;
+    }
+    const char **visited =
+        (const char **)cbm_arena_alloc(ctx->arena, (size_t)cap * sizeof(*visited));
+    if (!visited) {
+        return NULL;
+    }
+    int visited_count = 0;
+    const CBMRegisteredFunc *fallback = NULL;
+    const CBMRegisteredFunc *found = java_lookup_method_depth(
+        ctx, class_qn, method_name, arg_count, visited, &visited_count, cap, 0, &fallback);
+    return found ? found : fallback;
 }
 
 /* ── Method-invocation evaluation ─────────────────────────────────── */
@@ -1324,8 +1433,13 @@ static const CBMType *eval_method_reference(JavaLSPContext *ctx, TSNode node) {
 /* ── Statement processing — bind into scope ───────────────────────── */
 
 void java_process_statement(JavaLSPContext *ctx, TSNode node) {
-    if (ts_node_is_null(node) || ctx->statement_depth >= JAVA_LSP_MAX_STMT_DEPTH)
+    if (ts_node_is_null(node))
         return;
+    if (ctx->statement_depth >= ctx->statement_depth_limit) {
+        cbm_arena_mark_failed(ctx->arena, "CBM_LSP_ANALYSIS_LIMIT_EXCEEDED",
+                              "java_lsp_statement_depth", (size_t)ctx->statement_depth_limit);
+        return;
+    }
     ctx->statement_depth++;
     const char *kind = ts_node_type(node);
 
@@ -1817,6 +1931,34 @@ static void java_emit_unresolved(JavaLSPContext *ctx, const char *expr_text, con
     }
 }
 
+static bool java_type_reaches_ancestor(JavaLSPContext *ctx, const char *type_qn,
+                                       const char *ancestor_qn, const char *ancestor_bare,
+                                       const char **visited, int *visited_count, int visited_cap,
+                                       int depth) {
+    if (!java_lookup_enter(ctx, type_qn, visited, visited_count, visited_cap, depth,
+                           "java_lsp_implementer_lookup_depth")) {
+        return false;
+    }
+    const char *dot = strrchr(type_qn, '.');
+    const char *bare = dot ? dot + 1 : type_qn;
+    if (strcmp(type_qn, ancestor_qn) == 0 || strcmp(bare, ancestor_bare) == 0) {
+        return true;
+    }
+    const CBMRegisteredType *type = cbm_registry_lookup_type(ctx->registry, type_qn);
+    if (type && type->embedded_types) {
+        for (int i = 0; type->embedded_types[i]; i++) {
+            if (java_type_reaches_ancestor(ctx, type->embedded_types[i], ancestor_qn, ancestor_bare,
+                                           visited, visited_count, visited_cap, depth + 1)) {
+                return true;
+            }
+            if (cbm_arena_failed(ctx->arena)) {
+                return false;
+            }
+        }
+    }
+    return false;
+}
+
 /* Find a sole concrete in-project implementer of interface `iface_qn` that
  * declares method `mname`. Returns the implementer's QN when exactly ONE
  * exists (else NULL), and sets *out_count to the number found (capped at 2,
@@ -1830,6 +1972,19 @@ static const char *java_find_sole_impl(JavaLSPContext *ctx, const char *iface_qn
     int distinct = 0;         /* distinct impl classes (capped at 2) */
     const char *iface_dot = strrchr(iface_qn, '.');
     const char *iface_bare = iface_dot ? iface_dot + 1 : iface_qn;
+    int visited_cap = java_lookup_visited_capacity(ctx);
+    if (visited_cap <= 0) {
+        cbm_arena_mark_failed(ctx->arena, "CBM_LSP_ANALYSIS_LIMIT_EXCEEDED",
+                              "java_lsp_implementer_lookup_cardinality", SIZE_MAX);
+        *out_count = 0;
+        return NULL;
+    }
+    const char **visited =
+        (const char **)cbm_arena_alloc(ctx->arena, (size_t)visited_cap * sizeof(*visited));
+    if (!visited) {
+        *out_count = 0;
+        return NULL;
+    }
     for (int ti = 0; ti < ctx->registry->type_count && distinct < 2; ti++) {
         const CBMRegisteredType *cand = &ctx->registry->types[ti];
         if (cand->is_interface || !cand->qualified_name || cand->alias_of)
@@ -1849,30 +2004,15 @@ static const char *java_find_sole_impl(JavaLSPContext *ctx, const char *iface_qn
         }
         if (!has)
             continue;
-        /* Subtype check: walk cand's supertype chain, matching iface by FULL
-         * QN or BARE name. The registry holds duplicate type entries whose
-         * `embedded_types` list a supertype sometimes by short name ("Shape")
-         * and sometimes by full QN ("proj.Shape"); a full-QN-only comparison
-         * silently misses the short-name form, so compare both. */
-        const char *cur = cand->qualified_name;
-        bool subtype = false;
-        for (int hops = 0; hops < JAVA_LSP_MAX_INHERIT_HOPS && cur && !subtype; hops++) {
-            const CBMRegisteredType *ct = cbm_registry_lookup_type(ctx->registry, cur);
-            if (!ct || !ct->embedded_types)
-                break;
-            const char *next = NULL;
-            for (int pi = 0; ct->embedded_types[pi]; pi++) {
-                const char *e = ct->embedded_types[pi];
-                const char *edot = strrchr(e, '.');
-                const char *ebare = edot ? edot + 1 : e;
-                if (strcmp(e, iface_qn) == 0 || strcmp(ebare, iface_bare) == 0) {
-                    subtype = true;
-                    break;
-                }
-                if (!next)
-                    next = e; /* first supertype → continue the walk upward */
-            }
-            cur = next;
+        /* Walk every superclass/interface branch. Registry entries may use a
+         * full or bare parent QN, so ancestor comparison accepts either while
+         * the visited set breaks malformed cycles. */
+        int visited_count = 0;
+        bool subtype = java_type_reaches_ancestor(ctx, cand->qualified_name, iface_qn, iface_bare,
+                                                  visited, &visited_count, visited_cap, 0);
+        if (cbm_arena_failed(ctx->arena)) {
+            *out_count = 0;
+            return NULL;
         }
         if (!subtype)
             continue;
@@ -2349,14 +2489,15 @@ static const CBMType *propagate_template(CBMArena *a, const char *recv_qn, const
  * types (with generic substitution from the receiver's template args), then
  * resolve calls inside the lambda body against the freshly-bound scope.
  *
- * Returns a bitmask of arg indices that were handled here so the generic
- * walker can skip them. */
-static uint32_t bind_lambda_args(JavaLSPContext *ctx, TSNode call_node,
-                                 const CBMRegisteredFunc *resolved, const CBMType *recv_type) {
-    uint32_t handled_mask = 0;
+ * Marks every handled argument in the caller-owned array so there is no
+ * argument-cardinality limit in the generic walker. */
+static bool bind_lambda_args(JavaLSPContext *ctx, TSNode call_node,
+                             const CBMRegisteredFunc *resolved, const CBMType *recv_type,
+                             bool *handled, size_t handled_count) {
+    bool any_handled = false;
     TSNode args_node = ts_node_child_by_field_name(call_node, "arguments", 9);
     if (ts_node_is_null(args_node))
-        return handled_mask;
+        return false;
     const CBMType *const *param_types = NULL;
     if (resolved && resolved->signature && resolved->signature->kind == CBM_TYPE_FUNC) {
         param_types = resolved->signature->data.func.param_types;
@@ -2394,7 +2535,7 @@ static uint32_t bind_lambda_args(JavaLSPContext *ctx, TSNode call_node,
     char *mname = ts_node_is_null(mname_node) ? NULL : java_node_text(ctx, mname_node);
 
     uint32_t n = ts_node_named_child_count(args_node);
-    for (uint32_t i = 0; i < n && i < 32; i++) {
+    for (uint32_t i = 0; i < n; i++) {
         TSNode arg = ts_node_named_child(args_node, i);
         const char *kind = ts_node_type(arg);
         if (strcmp(kind, "lambda_expression") != 0)
@@ -2453,7 +2594,9 @@ static uint32_t bind_lambda_args(JavaLSPContext *ctx, TSNode call_node,
                     }
                     java_resolve_calls_in_node(ctx, body_node);
                     ctx->current_scope = saved;
-                    handled_mask |= ((uint32_t)1u << i);
+                    if ((size_t)i < handled_count)
+                        handled[i] = true;
+                    any_handled = true;
                 }
                 continue;
             }
@@ -2490,9 +2633,20 @@ static uint32_t bind_lambda_args(JavaLSPContext *ctx, TSNode call_node,
          * For Map<K,V>-like receivers the right substitution depends on
          * the SAM context (forEach uses (K,V)) — we handle the few common
          * cases below. */
-        const CBMType *resolved_fi_targs[8] = {0};
+        const CBMType **resolved_fi_targs = NULL;
+        size_t resolved_capacity = 0;
+        size_t required_resolved = (size_t)fi_targ_count + 1;
+        if (required_resolved < 3)
+            required_resolved = 3;
+        if (!cbm_lsp_semantic_array_reserve(ctx->arena, (void **)&resolved_fi_targs, 0,
+                                            &resolved_capacity, sizeof(*resolved_fi_targs),
+                                            required_resolved,
+                                            "java functional interface type arguments")) {
+            return false;
+        }
+        memset(resolved_fi_targs, 0, required_resolved * sizeof(*resolved_fi_targs));
         int resolved_count = fi_targ_count;
-        for (int j = 0; j < fi_targ_count && j < 8; j++) {
+        for (int j = 0; j < fi_targ_count; j++) {
             resolved_fi_targs[j] = fi_targs[j];
         }
         /* When the FI was passed without explicit targs, fall back to the
@@ -2567,9 +2721,11 @@ static uint32_t bind_lambda_args(JavaLSPContext *ctx, TSNode call_node,
         java_resolve_calls_in_node(ctx, body_node);
 
         ctx->current_scope = saved;
-        handled_mask |= ((uint32_t)1u << i);
+        if ((size_t)i < handled_count)
+            handled[i] = true;
+        any_handled = true;
     }
-    return handled_mask;
+    return any_handled;
 }
 
 /* Resolve a method reference (Class::method or instance::method) to a
@@ -2716,23 +2872,26 @@ static void resolve_method_reference(JavaLSPContext *ctx, TSNode mref,
 }
 
 /* Resolve any method-reference args of a method call. */
-static uint32_t bind_method_ref_args(JavaLSPContext *ctx, TSNode call_node,
-                                     const CBMRegisteredFunc *resolved, const CBMType *recv_type) {
-    uint32_t handled = 0;
+static bool bind_method_ref_args(JavaLSPContext *ctx, TSNode call_node,
+                                 const CBMRegisteredFunc *resolved, const CBMType *recv_type,
+                                 bool *handled, size_t handled_count) {
+    bool any_handled = false;
     if (!resolved)
-        return handled;
+        return false;
     TSNode args_node = ts_node_child_by_field_name(call_node, "arguments", 9);
     if (ts_node_is_null(args_node))
-        return handled;
+        return false;
     uint32_t n = ts_node_named_child_count(args_node);
-    for (uint32_t i = 0; i < n && i < 32; i++) {
+    for (uint32_t i = 0; i < n; i++) {
         TSNode arg = ts_node_named_child(args_node, i);
         if (strcmp(ts_node_type(arg), "method_reference") != 0)
             continue;
         resolve_method_reference(ctx, arg, resolved, (int)i, recv_type);
-        handled |= ((uint32_t)1u << i);
+        if ((size_t)i < handled_count)
+            handled[i] = true;
+        any_handled = true;
     }
-    return handled;
+    return any_handled;
 }
 
 /* Lookup the method that a method_invocation node resolves to. Returns
@@ -2799,13 +2958,15 @@ static const CBMRegisteredFunc *lookup_method_for_call(JavaLSPContext *ctx, TSNo
  * children with proper scope handling. */
 static void java_resolve_calls_in_node_inner(JavaLSPContext *ctx, TSNode node);
 
-/* Depth-guarded entry: the AST walk recurses per nesting level and crashed
- * with a stack overflow on pathologically nested real-world sources
- * (elasticsearch, SIGSEGV in bind_lambda_args under hundreds of recursive
- * java_resolve_calls_in_node frames). Past the cap the subtree is skipped —
- * its calls stay unresolved, which is graceful degradation, not a crash. */
+/* Depth-guarded entry. Reaching the bound is an explicit extraction failure;
+ * silently skipping the subtree would publish a partial call graph as complete. */
 static void java_resolve_calls_in_node(JavaLSPContext *ctx, TSNode node) {
-    if (ctx->walk_depth >= JAVA_LSP_MAX_WALK_DEPTH) {
+    if (!ctx || cbm_arena_failed(ctx->arena)) {
+        return;
+    }
+    if (ctx->walk_depth >= ctx->walk_depth_limit) {
+        cbm_arena_mark_failed(ctx->arena, "CBM_LSP_ANALYSIS_LIMIT_EXCEEDED",
+                              "java_lsp_ast_walk_depth", (size_t)ctx->walk_depth_limit);
         return;
     }
     ctx->walk_depth++;
@@ -2837,14 +2998,27 @@ static void java_resolve_calls_in_node_inner(JavaLSPContext *ctx, TSNode node) {
         const CBMType *recv_type = NULL;
         const CBMRegisteredFunc *outer = lookup_method_for_call(ctx, node, &recv_type);
         if (outer) {
-            uint32_t lambda_handled = bind_lambda_args(ctx, node, outer, recv_type);
-            uint32_t mref_handled = bind_method_ref_args(ctx, node, outer, recv_type);
-            uint32_t handled = lambda_handled | mref_handled;
-            if (handled) {
+            TSNode args_node = ts_node_child_by_field_name(node, "arguments", 9);
+            size_t handled_count =
+                ts_node_is_null(args_node) ? 0 : (size_t)ts_node_named_child_count(args_node);
+            bool *handled = NULL;
+            size_t handled_capacity = 0;
+            if (handled_count > 0) {
+                if (!cbm_lsp_semantic_array_reserve(
+                        ctx->arena, (void **)&handled, 0, &handled_capacity, sizeof(*handled),
+                        handled_count, "java handled functional arguments")) {
+                    return;
+                }
+                memset(handled, 0, handled_count * sizeof(*handled));
+            }
+            bool any_handled =
+                bind_lambda_args(ctx, node, outer, recv_type, handled, handled_count);
+            any_handled |=
+                bind_method_ref_args(ctx, node, outer, recv_type, handled, handled_count);
+            if (any_handled) {
                 /* Walk only non-handled children of the method_invocation;
                  * the handled lambda/method-ref args were walked above with
                  * the SAM-bound scope. */
-                TSNode args_node = ts_node_child_by_field_name(node, "arguments", 9);
                 /* Walk receiver expression. */
                 TSNode obj = ts_node_child_by_field_name(node, "object", 6);
                 if (!ts_node_is_null(obj))
@@ -2852,7 +3026,7 @@ static void java_resolve_calls_in_node_inner(JavaLSPContext *ctx, TSNode node) {
                 if (!ts_node_is_null(args_node)) {
                     uint32_t n = ts_node_named_child_count(args_node);
                     for (uint32_t i = 0; i < n; i++) {
-                        if (handled & ((uint32_t)1u << i))
+                        if ((size_t)i < handled_count && handled[i])
                             continue;
                         TSNode c = ts_node_named_child(args_node, i);
                         java_resolve_calls_in_node(ctx, c);
@@ -2936,8 +3110,9 @@ static const char **split_generic_args(CBMArena *a, const char *inside, int *out
     *out_count = 0;
     if (!inside || !inside[0])
         return NULL;
-    const char *args[16];
-    int count = 0;
+    const char **args = NULL;
+    size_t count = 0;
+    size_t capacity = 0;
     int depth = 0;
     const char *seg_start = inside;
     for (const char *p = inside; *p; p++) {
@@ -2952,7 +3127,12 @@ static const char **split_generic_args(CBMArena *a, const char *inside, int *out
             const char *seg_end = p;
             while (seg_end > seg_start && (seg_end[-1] == ' ' || seg_end[-1] == '\t'))
                 seg_end--;
-            if (count < 16 && seg_end > seg_start) {
+            if (seg_end > seg_start) {
+                if (!cbm_lsp_semantic_array_reserve(a, (void **)&args, count, &capacity,
+                                                    sizeof(*args), count + 2,
+                                                    "java textual generic arguments")) {
+                    return NULL;
+                }
                 args[count++] = cbm_arena_strndup(a, seg_start, (size_t)(seg_end - seg_start));
             }
             seg_start = p + 1;
@@ -2964,17 +3144,18 @@ static const char **split_generic_args(CBMArena *a, const char *inside, int *out
     const char *seg_end = inside + strlen(inside);
     while (seg_end > seg_start && (seg_end[-1] == ' ' || seg_end[-1] == '\t'))
         seg_end--;
-    if (count < 16 && seg_end > seg_start) {
+    if (seg_end > seg_start) {
+        if (!cbm_lsp_semantic_array_reserve(a, (void **)&args, count, &capacity, sizeof(*args),
+                                            count + 2, "java textual generic arguments")) {
+            return NULL;
+        }
         args[count++] = cbm_arena_strndup(a, seg_start, (size_t)(seg_end - seg_start));
     }
     if (count == 0)
         return NULL;
-    const char **result = (const char **)cbm_arena_alloc(a, (size_t)(count + 1) * sizeof(*result));
-    for (int i = 0; i < count; i++)
-        result[i] = args[i];
-    result[count] = NULL;
-    *out_count = count;
-    return result;
+    args[count] = NULL;
+    *out_count = (int)count;
+    return args;
 }
 
 /* Parse a type-text into a CBMType, with full inner-class qualification.

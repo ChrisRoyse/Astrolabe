@@ -529,10 +529,11 @@ typedef struct {
 // override (#424). MUST be called as the very first statement of main(), before
 // any sqlite3_open*/sqlite3_initialize (SQLITE_CONFIG_MALLOC returns
 // SQLITE_MISUSE once sqlite has initialized).
-// Idempotent (static guard); intended for single-threaded startup. cbm_init()
-// also calls it so non-main entry points (pipeline passes) still get the binds.
-// In the test build (no CBM_BIND_TS_ALLOCATOR) this is a no-op.
-void cbm_alloc_init(void);
+// Idempotent only after confirmed success. Returns SQLITE_OK/0 on success and
+// the exact SQLite status when the binding is rejected. cbm_init() also calls
+// it so non-main entry points fail closed. In builds without
+// CBM_BIND_TS_ALLOCATOR this is a successful no-op.
+int cbm_alloc_init(void);
 
 // Init-order probe (#5). Returns non-zero once cbm_alloc_init() has bound the
 // tree-sitter/sqlite allocators to mimalloc in a build that enables the binding
@@ -542,6 +543,10 @@ void cbm_alloc_init(void);
 // deterministic evidence of allocator initialization ordering rather than
 // inferring it from heap-accounting deltas.
 int cbm_alloc_bindings_active(void);
+
+// Exact retained result of the first failed allocator-binding attempt, or 0
+// before any failure. A failed late initialization is terminal for the process.
+int cbm_alloc_last_error(void);
 
 // Initialize the library. Call once at startup. Returns 0 on success.
 int cbm_init(void);

@@ -18,6 +18,7 @@
  */
 
 #include "php_lsp.h"
+#include "semantic_array.h"
 #include "lsp_node_iter.h"
 #include "../helpers.h"
 #include <ctype.h>
@@ -26,24 +27,30 @@
 #include <string.h>
 #include <unistd.h>
 
-#define PHP_EVAL_MAX_DEPTH 32
 #define PHP_USE_INITIAL_CAP 16
+
+enum {
+    PHP_DEFAULT_EVAL_DEPTH_LIMIT = 32,
+    PHP_DEFAULT_LOOKUP_DEPTH_LIMIT = 32,
+};
 
 extern const TSLanguage *tree_sitter_php_only(void);
 
 /* Forward decls */
 static void php_resolve_calls_in_node_inner(PHPLSPContext *ctx, TSNode node);
 
-/* Depth-guarded entry for the AST call-resolution walk. The walk recurses once
- * per nesting level; a deeply-nested or cyclic file can overflow the native
- * stack (SIGSEGV) and take down the whole index. Past the cap the subtree is
- * skipped — its calls stay unresolved, which is graceful degradation, not a
- * crash. The cap is CBM_LSP_MAX_WALK_DEPTH, env-overridable via the same name.
- * The walk_depth-- runs after the inner returns, so early returns in the body
- * never leak the counter. */
+/* Depth-guarded AST call-resolution walk. Reaching the bound is an explicit
+ * extraction failure; silently skipping the subtree would publish a partial
+ * call graph as complete. */
 static void php_resolve_calls_in_node(PHPLSPContext *ctx, TSNode node) {
-    if (ctx->walk_depth >= cbm_lsp_max_walk_depth())
+    if (!ctx || cbm_arena_failed(ctx->arena)) {
         return;
+    }
+    if (ctx->walk_depth >= ctx->walk_depth_limit) {
+        cbm_arena_mark_failed(ctx->arena, "CBM_LSP_ANALYSIS_LIMIT_EXCEEDED",
+                              "php_lsp_ast_walk_depth", (size_t)ctx->walk_depth_limit);
+        return;
+    }
     ctx->walk_depth++;
     php_resolve_calls_in_node_inner(ctx, node);
     ctx->walk_depth--;
@@ -147,6 +154,15 @@ void php_lsp_init(PHPLSPContext *ctx, CBMArena *arena, const char *source, int s
     ctx->module_qn = module_qn;
     ctx->current_namespace_qn = "";
     ctx->resolved_calls = out;
+    if (!cbm_lsp_read_positive_limit(arena, "CBM_LSP_MAX_EVAL_DEPTH", PHP_DEFAULT_EVAL_DEPTH_LIMIT,
+                                     "php_lsp_eval_depth_config", &ctx->eval_depth_limit) ||
+        !cbm_lsp_read_positive_limit(arena, "CBM_LSP_MAX_LOOKUP_DEPTH",
+                                     PHP_DEFAULT_LOOKUP_DEPTH_LIMIT, "php_lsp_lookup_depth_config",
+                                     &ctx->lookup_depth_limit) ||
+        !cbm_lsp_read_positive_limit(arena, "CBM_LSP_MAX_WALK_DEPTH", CBM_LSP_DEFAULT_WALK_DEPTH,
+                                     "php_lsp_walk_depth_config", &ctx->walk_depth_limit)) {
+        return;
+    }
     ctx->current_scope = cbm_scope_push(arena, NULL);
 
     const char *dbg = getenv("CBM_LSP_DEBUG");
@@ -332,10 +348,29 @@ static const CBMRegisteredType *lookup_type_with_project(PHPLSPContext *ctx, con
 
 /* ── method lookup with parent walk ─────────────────────────────── */
 
-const CBMRegisteredFunc *php_lookup_method(PHPLSPContext *ctx, const char *class_qn,
-                                           const char *method_name) {
-    if (!class_qn || !method_name)
+static const CBMRegisteredFunc *php_lookup_method_depth(PHPLSPContext *ctx, const char *class_qn,
+                                                        const char *method_name,
+                                                        const char **visited, int *visited_count,
+                                                        int visited_cap, int depth) {
+    if (!class_qn || !method_name) {
         return NULL;
+    }
+    if (depth >= ctx->lookup_depth_limit) {
+        cbm_arena_mark_failed(ctx->arena, "CBM_LSP_ANALYSIS_LIMIT_EXCEEDED",
+                              "php_lsp_method_lookup_depth", (size_t)ctx->lookup_depth_limit);
+        return NULL;
+    }
+    for (int i = 0; i < *visited_count; i++) {
+        if (strcmp(visited[i], class_qn) == 0) {
+            return NULL;
+        }
+    }
+    if (*visited_count >= visited_cap) {
+        cbm_arena_mark_failed(ctx->arena, "CBM_LSP_ANALYSIS_LIMIT_EXCEEDED",
+                              "php_lsp_method_lookup_cardinality", (size_t)visited_cap);
+        return NULL;
+    }
+    visited[(*visited_count)++] = class_qn;
 
     /* Direct lookup by the registry's receiver_qn -> method_name index. */
     const CBMRegisteredFunc *f = cbm_registry_lookup_method(ctx->registry, class_qn, method_name);
@@ -354,67 +389,59 @@ const CBMRegisteredFunc *php_lookup_method(PHPLSPContext *ctx, const char *class
         if (f)
             return f;
     }
-
-    /* Walk the full ancestor chain. PHP only allows single inheritance for
-     * `extends`, but a class may also pick up methods from `implements` /
-     * traits, both of which are recorded in embedded_types. We iterate
-     * across all entries and recurse into each branch with cycle-detection.
-     *
-     * Cap depth at 16 across all visited types to bound runtime. */
-    const char *visited[32];
-    int visited_count = 0;
-    const char *frontier[32];
-    int frontier_count = 0;
-    if (t->embedded_types) {
-        for (int i = 0; t->embedded_types[i] && frontier_count < 32; i++) {
-            frontier[frontier_count++] = t->embedded_types[i];
-        }
-    }
-    while (frontier_count > 0 && visited_count < 32) {
-        const char *parent = frontier[--frontier_count];
-        bool seen = false;
-        for (int v = 0; v < visited_count; v++) {
-            if (strcmp(visited[v], parent) == 0) {
-                seen = true;
-                break;
-            }
-        }
-        if (seen)
-            continue;
-        visited[visited_count++] = parent;
-
-        f = cbm_registry_lookup_method(ctx->registry, parent, method_name);
-        if (f)
-            return f;
-
-        const CBMRegisteredType *next = cbm_registry_lookup_type(ctx->registry, parent);
-        if (!next)
-            next = lookup_type_with_project(ctx, parent);
-        if (!next)
-            continue;
-
-        if (strcmp(next->qualified_name, parent) != 0) {
-            f = cbm_registry_lookup_method(ctx->registry, next->qualified_name, method_name);
-            if (f)
-                return f;
-        }
-        if (next->method_qns && next->method_names) {
-            for (int i = 0; next->method_names[i]; i++) {
-                if (strcmp(next->method_names[i], method_name) == 0) {
-                    const CBMRegisteredFunc *cand =
-                        cbm_registry_lookup_func(ctx->registry, next->method_qns[i]);
-                    if (cand)
-                        return cand;
+    if (t->method_qns && t->method_names) {
+        for (int i = 0; t->method_names[i]; i++) {
+            if (strcmp(t->method_names[i], method_name) == 0) {
+                const CBMRegisteredFunc *candidate =
+                    cbm_registry_lookup_func(ctx->registry, t->method_qns[i]);
+                if (candidate) {
+                    return candidate;
                 }
             }
         }
-        if (next->embedded_types) {
-            for (int i = 0; next->embedded_types[i] && frontier_count < 32; i++) {
-                frontier[frontier_count++] = next->embedded_types[i];
+    }
+
+    /* Walk the full ancestor graph. PHP only allows single class inheritance,
+     * but interfaces and traits add branches; the shared visited set breaks
+     * cycles without dropping nodes at a fixed-width frontier. */
+    if (t->embedded_types) {
+        for (int i = 0; t->embedded_types[i]; i++) {
+            f = php_lookup_method_depth(ctx, t->embedded_types[i], method_name, visited,
+                                        visited_count, visited_cap, depth + 1);
+            if (f || cbm_arena_failed(ctx->arena)) {
+                return f;
             }
         }
     }
     return NULL;
+}
+
+const CBMRegisteredFunc *php_lookup_method(PHPLSPContext *ctx, const char *class_qn,
+                                           const char *method_name) {
+    if (!ctx || !class_qn || !method_name || !ctx->registry) {
+        return NULL;
+    }
+    int cap = ctx->registry->type_count;
+    if (ctx->registry->fallback) {
+        if (ctx->registry->fallback->type_count > INT_MAX - cap) {
+            cbm_arena_mark_failed(ctx->arena, "CBM_LSP_ANALYSIS_LIMIT_EXCEEDED",
+                                  "php_lsp_method_lookup_cardinality", SIZE_MAX);
+            return NULL;
+        }
+        cap += ctx->registry->fallback->type_count;
+    }
+    if (cap == INT_MAX) {
+        cbm_arena_mark_failed(ctx->arena, "CBM_LSP_ANALYSIS_LIMIT_EXCEEDED",
+                              "php_lsp_method_lookup_cardinality", SIZE_MAX);
+        return NULL;
+    }
+    cap++;
+    const char **visited =
+        (const char **)cbm_arena_alloc(ctx->arena, (size_t)cap * sizeof(*visited));
+    int visited_count = 0;
+    return visited ? php_lookup_method_depth(ctx, class_qn, method_name, visited, &visited_count,
+                                             cap, 0)
+                   : NULL;
 }
 
 /* Detect a __call / __callStatic on a class chain. */
@@ -844,7 +871,12 @@ static char *fetch_leading_phpdoc(PHPLSPContext *ctx, TSNode node) {
  *   - clone_expression:                            type of operand.
  */
 const CBMType *php_eval_expr_type(PHPLSPContext *ctx, TSNode node) {
-    if (ts_node_is_null(node) || ctx->eval_depth >= PHP_EVAL_MAX_DEPTH) {
+    if (ts_node_is_null(node)) {
+        return cbm_type_unknown();
+    }
+    if (ctx->eval_depth >= ctx->eval_depth_limit) {
+        cbm_arena_mark_failed(ctx->arena, "CBM_LSP_ANALYSIS_LIMIT_EXCEEDED",
+                              "php_lsp_expression_depth", (size_t)ctx->eval_depth_limit);
         return cbm_type_unknown();
     }
     ctx->eval_depth++;
@@ -1330,9 +1362,9 @@ static void process_foreach(PHPLSPContext *ctx, TSNode node) {
      */
     TSNode iterable;
     memset(&iterable, 0, sizeof(iterable));
-    TSNode loop_vars[4];
-    int loop_var_count = 0;
-    memset(loop_vars, 0, sizeof(loop_vars));
+    TSNode *loop_vars = NULL;
+    size_t loop_var_count = 0;
+    size_t loop_var_capacity = 0;
 
     /* tree-sitter-php emits foreach_statement children in source order:
      *   <iterable expression> ... `as` ... <loop var(s)> ... <body>
@@ -1359,7 +1391,12 @@ static void process_foreach(PHPLSPContext *ctx, TSNode node) {
         }
         if (ts_node_is_null(iterable)) {
             iterable = c;
-        } else if (strcmp(k, "variable_name") == 0 && loop_var_count < 4) {
+        } else if (strcmp(k, "variable_name") == 0) {
+            if (!cbm_lsp_semantic_array_reserve(ctx->arena, (void **)&loop_vars, loop_var_count,
+                                                &loop_var_capacity, sizeof(*loop_vars),
+                                                loop_var_count + 1, "php foreach variables")) {
+                return;
+            }
             loop_vars[loop_var_count++] = c;
         } else if (strcmp(k, "pair") == 0) {
             /* `$k => $v` — extract both variable_names; the second is the
@@ -1368,7 +1405,12 @@ static void process_foreach(PHPLSPContext *ctx, TSNode node) {
             for (uint32_t j = 0; j < pnc; j++) {
                 TSNode pc = ts_node_child(c, j);
                 if (!ts_node_is_null(pc) && ts_node_is_named(pc) &&
-                    strcmp(ts_node_type(pc), "variable_name") == 0 && loop_var_count < 4) {
+                    strcmp(ts_node_type(pc), "variable_name") == 0) {
+                    if (!cbm_lsp_semantic_array_reserve(
+                            ctx->arena, (void **)&loop_vars, loop_var_count, &loop_var_capacity,
+                            sizeof(*loop_vars), loop_var_count + 1, "php foreach pair variables")) {
+                        return;
+                    }
                     loop_vars[loop_var_count++] = pc;
                 }
             }
@@ -1404,7 +1446,7 @@ static void process_foreach(PHPLSPContext *ctx, TSNode node) {
     /* Bind the loop variable(s). PHP allows `foreach ($xs as $k => $v)` with
      * two: $k is the key, $v is the element. We bind elem_type to the LAST
      * variable_name (the value); earlier ones get UNKNOWN as approximation. */
-    for (int i = 0; i < loop_var_count; i++) {
+    for (size_t i = 0; i < loop_var_count; i++) {
         char *t = php_node_text(ctx, loop_vars[i]);
         if (!t)
             continue;
@@ -1674,32 +1716,32 @@ static const char *is_func_to_builtin(const char *name) {
 
 /* Parse a narrowing predicate. On success fill out and return true.
  *
- * For multi-conjunction (`P1 && P2`), we accumulate ALL narrowings into
- * the *last out slot, but the caller-side pattern in process_if_statement
- * only takes a single php_narrowing_t. To support full conjunction we
- * additionally call parse_narrowing_collect which writes into a small
- * array. parse_narrowing itself returns the FIRST narrowing it finds. */
-static int parse_narrowing_collect(PHPLSPContext *ctx, TSNode cond, php_narrowing_t *out,
-                                   int max_out);
+ * For multi-conjunction (`P1 && P2`), parse_narrowing_collect grows a
+ * complete arena-owned list. parse_narrowing itself returns the first
+ * narrowing it finds. */
+static bool parse_narrowing_collect(PHPLSPContext *ctx, TSNode cond, php_narrowing_t **out,
+                                    size_t *count, size_t *capacity);
 
 static bool parse_narrowing(PHPLSPContext *ctx, TSNode cond, php_narrowing_t *out) {
-    php_narrowing_t buf[1] = {{0}};
-    int n = parse_narrowing_collect(ctx, cond, buf, 1);
-    if (n > 0) {
-        *out = buf[0];
+    php_narrowing_t *items = NULL;
+    size_t count = 0;
+    size_t capacity = 0;
+    if (!parse_narrowing_collect(ctx, cond, &items, &count, &capacity))
+        return false;
+    if (count > 0) {
+        *out = items[0];
         return true;
     }
     return false;
 }
 
-/* Recursive collector: adds narrowings from the predicate tree into out[]
- * up to max_out. Returns the number filled. */
+/* Recursive collector: adds all narrowings from the predicate tree into out[]. */
 static int parse_narrowing_one(PHPLSPContext *ctx, TSNode cond, php_narrowing_t *out);
 
-static int parse_narrowing_collect(PHPLSPContext *ctx, TSNode cond, php_narrowing_t *out,
-                                   int max_out) {
-    if (ts_node_is_null(cond) || max_out <= 0)
-        return 0;
+static bool parse_narrowing_collect(PHPLSPContext *ctx, TSNode cond, php_narrowing_t **out,
+                                    size_t *count, size_t *capacity) {
+    if (ts_node_is_null(cond))
+        return true;
     const char *kind = ts_node_type(cond);
 
     /* Parenthesized: unwrap. */
@@ -1708,10 +1750,10 @@ static int parse_narrowing_collect(PHPLSPContext *ctx, TSNode cond, php_narrowin
         for (uint32_t i = 0; i < nc; i++) {
             TSNode c = ts_node_child(cond, i);
             if (!ts_node_is_null(c) && ts_node_is_named(c)) {
-                return parse_narrowing_collect(ctx, c, out, max_out);
+                return parse_narrowing_collect(ctx, c, out, count, capacity);
             }
         }
-        return 0;
+        return true;
     }
 
     /* Conjunction `A && B` (or `A and B`) → recurse into both sides. */
@@ -1721,19 +1763,22 @@ static int parse_narrowing_collect(PHPLSPContext *ctx, TSNode cond, php_narrowin
         if (opt && (strcmp(opt, "&&") == 0 || strcmp(opt, "and") == 0)) {
             TSNode left = ts_node_child_by_field_name(cond, "left", 4);
             TSNode right = ts_node_child_by_field_name(cond, "right", 5);
-            int got = parse_narrowing_collect(ctx, left, out, max_out);
-            got += parse_narrowing_collect(ctx, right, out + got, max_out - got);
-            return got;
+            return parse_narrowing_collect(ctx, left, out, count, capacity) &&
+                   parse_narrowing_collect(ctx, right, out, count, capacity);
         }
     }
 
     /* Single-predicate path. */
     php_narrowing_t one = {0};
     if (parse_narrowing_one(ctx, cond, &one)) {
-        out[0] = one;
-        return 1;
+        if (!cbm_lsp_semantic_array_reserve(ctx->arena, (void **)out, *count, capacity,
+                                            sizeof(**out), *count + 1,
+                                            "php conjunctive type narrowings")) {
+            return false;
+        }
+        (*out)[(*count)++] = one;
     }
-    return 0;
+    return true;
 }
 
 static int parse_narrowing_one(PHPLSPContext *ctx, TSNode cond, php_narrowing_t *out) {
@@ -1922,7 +1967,7 @@ static void apply_assert_narrowing(PHPLSPContext *ctx, TSNode call) {
 /* Walk a body subtree under a narrowed scope (with up to N bindings), then
  * restore. */
 static void walk_with_narrowings(PHPLSPContext *ctx, TSNode body, const php_narrowing_t *nws,
-                                 int nw_count) {
+                                 size_t nw_count) {
     if (ts_node_is_null(body))
         return;
     if (!nws || nw_count <= 0) {
@@ -1931,7 +1976,7 @@ static void walk_with_narrowings(PHPLSPContext *ctx, TSNode body, const php_narr
     }
     CBMScope *saved = ctx->current_scope;
     ctx->current_scope = cbm_scope_push(ctx->arena, ctx->current_scope);
-    for (int i = 0; i < nw_count; i++) {
+    for (size_t i = 0; i < nw_count; i++) {
         if (nws[i].var_name && nws[i].type) {
             cbm_scope_bind(ctx->current_scope, nws[i].var_name, nws[i].type);
         }
@@ -2031,8 +2076,13 @@ static void process_if_statement(PHPLSPContext *ctx, TSNode node) {
     }
     /* Collect all conjunctive narrowings: `$x instanceof Foo && is_int($y)`
      * narrows BOTH $x and $y in the if-body. */
-    php_narrowing_t nws[8] = {{0}};
-    int nw_count = ts_node_is_null(cond) ? 0 : parse_narrowing_collect(ctx, cond, nws, 8);
+    php_narrowing_t *nws = NULL;
+    size_t nw_count = 0;
+    size_t nw_capacity = 0;
+    if (!ts_node_is_null(cond) &&
+        !parse_narrowing_collect(ctx, cond, &nws, &nw_count, &nw_capacity)) {
+        return;
+    }
     bool has_nw = nw_count > 0;
 
     /* Detect negative narrowing: condition is `!P` and P is a narrowing
@@ -2988,13 +3038,15 @@ static void extract_promoted_param(PHPLSPContext *ctx, TSNode param, php_class_f
 static void extract_ctor_assignments(PHPLSPContext *ctx, TSNode ctor_method,
                                      php_class_fields_t *out) {
     TSNode params = ts_node_child_by_field_name(ctor_method, "parameters", 10);
-    /* Build a small param-name -> type map for this constructor. */
-    const char *names[32];
-    const CBMType *types[32];
-    int pc = 0;
+    /* Build a complete param-name -> type map for this constructor. */
+    const char **names = NULL;
+    const CBMType **types = NULL;
+    size_t pc = 0;
+    size_t name_capacity = 0;
+    size_t type_capacity = 0;
     if (!ts_node_is_null(params)) {
         uint32_t nc = ts_node_child_count(params);
-        for (uint32_t i = 0; i < nc && pc < 32; i++) {
+        for (uint32_t i = 0; i < nc; i++) {
             TSNode p = ts_node_child(params, i);
             if (ts_node_is_null(p) || !ts_node_is_named(p))
                 continue;
@@ -3025,6 +3077,14 @@ static void extract_ctor_assignments(PHPLSPContext *ctx, TSNode ctor_method,
             char *vt = php_node_text(ctx, name_node);
             if (!vt)
                 continue;
+            if (!cbm_lsp_semantic_array_reserve(ctx->arena, (void **)&names, pc, &name_capacity,
+                                                sizeof(*names), pc + 1,
+                                                "php constructor parameter names") ||
+                !cbm_lsp_semantic_array_reserve(ctx->arena, (void **)&types, pc, &type_capacity,
+                                                sizeof(*types), pc + 1,
+                                                "php constructor parameter types")) {
+                return;
+            }
             names[pc] = cbm_arena_strdup(ctx->arena, (vt[0] == '$') ? vt + 1 : vt);
             types[pc] = ptype;
             pc++;
@@ -3038,8 +3098,14 @@ static void extract_ctor_assignments(PHPLSPContext *ctx, TSNode ctor_method,
     if (ts_node_is_null(body))
         return;
     /* Iterative DFS. */
-    TSNode stack[64];
-    int top = 0;
+    TSNode *stack = NULL;
+    size_t top = 0;
+    size_t stack_capacity = 0;
+    if (!cbm_lsp_semantic_array_reserve(ctx->arena, (void **)&stack, 0, &stack_capacity,
+                                        sizeof(*stack), 1,
+                                        "php constructor assignment traversal")) {
+        return;
+    }
     stack[top++] = body;
     while (top > 0) {
         TSNode n = stack[--top];
@@ -3061,7 +3127,7 @@ static void extract_ctor_assignments(PHPLSPContext *ctx, TSNode ctor_method,
                     char *rt = php_node_text(ctx, rhs);
                     if (ot && fn && rt && (ot[0] == '$') && strcmp(ot + 1, "this") == 0) {
                         const char *rname = (rt[0] == '$') ? rt + 1 : rt;
-                        for (int i = 0; i < pc; i++) {
+                        for (size_t i = 0; i < pc; i++) {
                             if (strcmp(names[i], rname) == 0) {
                                 add_field(out, ctx->arena, fn, types[i]);
                                 break;
@@ -3072,10 +3138,16 @@ static void extract_ctor_assignments(PHPLSPContext *ctx, TSNode ctor_method,
             }
         }
         uint32_t cnt = ts_node_child_count(n);
-        for (uint32_t i = 0; i < cnt && top < 64; i++) {
+        for (uint32_t i = 0; i < cnt; i++) {
             TSNode c = ts_node_child(n, i);
-            if (!ts_node_is_null(c))
+            if (!ts_node_is_null(c)) {
+                if (!cbm_lsp_semantic_array_reserve(ctx->arena, (void **)&stack, top,
+                                                    &stack_capacity, sizeof(*stack), top + 1,
+                                                    "php constructor assignment traversal")) {
+                    return;
+                }
                 stack[top++] = c;
+            }
         }
     }
 }
@@ -3097,8 +3169,9 @@ static void extract_ctor_assignments(PHPLSPContext *ctx, TSNode ctor_method,
 static const char **parse_phpdoc_template_params(PHPLSPContext *ctx, const char *docstring) {
     if (!docstring)
         return NULL;
-    const char *names[16];
-    int n = 0;
+    const char **names = NULL;
+    size_t n = 0;
+    size_t capacity = 0;
     const char *p = docstring;
     while ((p = strstr(p, "@template")) != NULL) {
         p += 9;
@@ -3130,19 +3203,17 @@ static const char **parse_phpdoc_template_params(PHPLSPContext *ctx, const char 
             p++;
         if (p == name_start)
             continue;
-        if (n < 16) {
-            names[n++] = cbm_arena_strndup(ctx->arena, name_start, (size_t)(p - name_start));
+        if (!cbm_lsp_semantic_array_reserve(ctx->arena, (void **)&names, n, &capacity,
+                                            sizeof(*names), n + 2,
+                                            "phpdoc template parameter names")) {
+            return NULL;
         }
+        names[n++] = cbm_arena_strndup(ctx->arena, name_start, (size_t)(p - name_start));
     }
     if (n == 0)
         return NULL;
-    const char **out = (const char **)cbm_arena_alloc(ctx->arena, (size_t)(n + 1) * sizeof(*out));
-    if (!out)
-        return NULL;
-    for (int i = 0; i < n; i++)
-        out[i] = names[i];
-    out[n] = NULL;
-    return out;
+    names[n] = NULL;
+    return names;
 }
 
 /* Substitute the type parameters in `t` according to a parallel
@@ -3512,11 +3583,12 @@ static void flatten_trait_into_class(PHPLSPContext *ctx, CBMTypeRegistry *reg, c
 static void process_trait_use(PHPLSPContext *ctx, CBMTypeRegistry *reg, const char *class_qn,
                               TSNode use_decl) {
     /* Collect the named traits and any `as` alias clauses. */
-    const char *trait_qns[16];
-    int trait_count = 0;
+    const char **trait_qns = NULL;
+    size_t trait_count = 0;
+    size_t trait_capacity = 0;
 
     uint32_t nc = ts_node_child_count(use_decl);
-    for (uint32_t i = 0; i < nc && trait_count < 16; i++) {
+    for (uint32_t i = 0; i < nc; i++) {
         TSNode c = ts_node_child(use_decl, i);
         if (ts_node_is_null(c) || !ts_node_is_named(c))
             continue;
@@ -3525,14 +3597,20 @@ static void process_trait_use(PHPLSPContext *ctx, CBMTypeRegistry *reg, const ch
             char *tn = php_node_text(ctx, c);
             if (tn) {
                 const char *resolved = php_resolve_class_name(ctx, tn);
-                if (resolved)
+                if (resolved) {
+                    if (!cbm_lsp_semantic_array_reserve(
+                            ctx->arena, (void **)&trait_qns, trait_count, &trait_capacity,
+                            sizeof(*trait_qns), trait_count + 1, "php trait use types")) {
+                        return;
+                    }
                     trait_qns[trait_count++] = resolved;
+                }
             }
         }
     }
 
     /* First, do the default flatten for all traits. */
-    for (int i = 0; i < trait_count; i++) {
+    for (size_t i = 0; i < trait_count; i++) {
         flatten_trait_into_class(ctx, reg, class_qn, trait_qns[i], NULL, NULL);
     }
 
@@ -3630,10 +3708,11 @@ static void process_class_for_fields(PHPLSPContext *ctx, CBMTypeRegistry *reg, T
      * raw form (with backslashes) that doesn't round-trip cleanly.
      * Doing this AST extraction here keeps the LSP self-sufficient. */
     {
-        const char *parent_qns[16];
-        int parent_count = 0;
+        const char **parent_qns = NULL;
+        size_t parent_count = 0;
+        size_t parent_capacity = 0;
         uint32_t cnc = ts_node_child_count(class_node);
-        for (uint32_t i = 0; i < cnc && parent_count < 16; i++) {
+        for (uint32_t i = 0; i < cnc; i++) {
             TSNode c = ts_node_child(class_node, i);
             if (ts_node_is_null(c) || !ts_node_is_named(c))
                 continue;
@@ -3642,7 +3721,7 @@ static void process_class_for_fields(PHPLSPContext *ctx, CBMTypeRegistry *reg, T
                 continue;
             }
             uint32_t bnc = ts_node_child_count(c);
-            for (uint32_t j = 0; j < bnc && parent_count < 16; j++) {
+            for (uint32_t j = 0; j < bnc; j++) {
                 TSNode bc = ts_node_child(c, j);
                 if (ts_node_is_null(bc) || !ts_node_is_named(bc))
                     continue;
@@ -3655,6 +3734,11 @@ static void process_class_for_fields(PHPLSPContext *ctx, CBMTypeRegistry *reg, T
                 const char *resolved = php_resolve_class_name(ctx, t);
                 if (!resolved)
                     continue;
+                if (!cbm_lsp_semantic_array_reserve(
+                        ctx->arena, (void **)&parent_qns, parent_count, &parent_capacity,
+                        sizeof(*parent_qns), parent_count + 1, "php parent and interface types")) {
+                    return;
+                }
                 parent_qns[parent_count++] = resolved;
             }
         }
@@ -3669,7 +3753,7 @@ static void process_class_for_fields(PHPLSPContext *ctx, CBMTypeRegistry *reg, T
                         existing++;
                 }
                 int total = existing;
-                for (int p = 0; p < parent_count; p++) {
+                for (size_t p = 0; p < parent_count; p++) {
                     bool seen = false;
                     for (int e = 0; e < existing; e++) {
                         if (strcmp(reg->types[t].embedded_types[e], parent_qns[p]) == 0) {
@@ -3689,7 +3773,7 @@ static void process_class_for_fields(PHPLSPContext *ctx, CBMTypeRegistry *reg, T
                 int wi = 0;
                 for (int e = 0; e < existing; e++)
                     expanded[wi++] = reg->types[t].embedded_types[e];
-                for (int p = 0; p < parent_count; p++) {
+                for (size_t p = 0; p < parent_count; p++) {
                     bool seen = false;
                     for (int e = 0; e < existing; e++) {
                         if (strcmp(reg->types[t].embedded_types[e], parent_qns[p]) == 0) {
@@ -3905,8 +3989,13 @@ static void php_lsp_collect_class_fields(PHPLSPContext *ctx, CBMTypeRegistry *re
      * trait's signatures already patched).
      */
     for (int pass = 0; pass < 2; pass++) {
-        TSNode stack[256];
-        int top = 0;
+        TSNode *stack = NULL;
+        size_t top = 0;
+        size_t stack_capacity = 0;
+        if (!cbm_lsp_semantic_array_reserve(ctx->arena, (void **)&stack, 0, &stack_capacity,
+                                            sizeof(*stack), 1, "php class field traversal")) {
+            return;
+        }
         stack[top++] = root;
         while (top > 0) {
             TSNode n = stack[--top];
@@ -3921,10 +4010,16 @@ static void php_lsp_collect_class_fields(PHPLSPContext *ctx, CBMTypeRegistry *re
                 process_class_for_fields(ctx, reg, n, tab);
             }
             uint32_t nc = ts_node_child_count(n);
-            for (uint32_t i = 0; i < nc && top < 256; i++) {
+            for (uint32_t i = 0; i < nc; i++) {
                 TSNode c = ts_node_child(n, i);
-                if (!ts_node_is_null(c) && ts_node_is_named(c))
+                if (!ts_node_is_null(c) && ts_node_is_named(c)) {
+                    if (!cbm_lsp_semantic_array_reserve(ctx->arena, (void **)&stack, top,
+                                                        &stack_capacity, sizeof(*stack), top + 1,
+                                                        "php class field traversal")) {
+                        return;
+                    }
                     stack[top++] = c;
+                }
             }
         }
     }

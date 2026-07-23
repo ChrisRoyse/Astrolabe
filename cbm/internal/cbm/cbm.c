@@ -24,6 +24,7 @@
 #endif
 #include <stdint.h> // uint32_t, uint64_t, int64_t
 #include <limits.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
@@ -344,16 +345,16 @@ static void cbm_sqlite_memshutdown(void *appdata) {
  * Single-threaded startup; a plain int is fine. Always 0 in the test build
  * (CBM_BIND_TS_ALLOCATOR undefined) because the binding is a no-op there. */
 static int cbm_alloc_bound = 0;
+static int cbm_alloc_error = 0;
 
-void cbm_alloc_init(void) {
+int cbm_alloc_init(void) {
 #if defined(CBM_BIND_TS_ALLOCATOR) && CBM_BIND_TS_ALLOCATOR
     if (cbm_alloc_bound) {
-        return;
+        return SQLITE_OK;
     }
-    cbm_alloc_bound = 1;
-
-    /* tree-sitter runtime (was previously bound in cbm_init; consolidated here). */
-    ts_set_allocator(mi_malloc, mi_calloc, mi_realloc, mi_free);
+    if (cbm_alloc_error != SQLITE_OK) {
+        return cbm_alloc_error;
+    }
 
     /* sqlite3. SQLITE_CONFIG_MALLOC MUST run before sqlite3_initialize / the
      * first sqlite3_open* — otherwise sqlite3_config returns SQLITE_MISUSE
@@ -370,9 +371,25 @@ void cbm_alloc_init(void) {
         NULL,                   /* pAppData */
     };
     int sqlite_rc = sqlite3_config(SQLITE_CONFIG_MALLOC, &cbm_sqlite_mem);
-    assert(sqlite_rc == SQLITE_OK && "SQLITE_CONFIG_MALLOC must run before sqlite3_initialize");
-    (void)sqlite_rc;
+    if (sqlite_rc != SQLITE_OK) {
+        cbm_alloc_error = sqlite_rc;
+        char sqlite_rc_buf[32];
+        snprintf(sqlite_rc_buf, sizeof(sqlite_rc_buf), "%d", sqlite_rc);
+        cbm_log_error(
+            "allocator.bind_failed", "code", "CBM_SQLITE_ALLOCATOR_BIND_FAILED", "operation",
+            "sqlite3_config(SQLITE_CONFIG_MALLOC)", "sqlite_error", sqlite_rc_buf, "message",
+            "SQLite rejected the process allocator before CBM initialization", "remediation",
+            "ensure cbm_alloc_init is the first SQLite-related process call and restart");
+        return sqlite_rc;
+    }
+
+    /* SQLite accepted its allocator. Tree-sitter has a void setter and cannot
+     * reject this complete function table, so publish success only after both
+     * bindings have been installed. */
+    ts_set_allocator(mi_malloc, mi_calloc, mi_realloc, mi_free);
+    cbm_alloc_bound = 1;
 #endif /* CBM_BIND_TS_ALLOCATOR */
+    return 0;
 }
 
 int cbm_alloc_bindings_active(void) {
@@ -384,6 +401,10 @@ int cbm_alloc_bindings_active(void) {
     return cbm_alloc_bound;
 }
 
+int cbm_alloc_last_error(void) {
+    return cbm_alloc_error;
+}
+
 // --- Init/Shutdown ---
 
 static int cbm_initialized = 0;
@@ -392,6 +413,10 @@ int cbm_init(void) {
     if (cbm_initialized) {
         return 0;
     }
+    int allocator_rc = cbm_alloc_init();
+    if (allocator_rc != 0) {
+        return allocator_rc;
+    }
     enum { CBM_INIT_DONE = 1 };
     cbm_initialized = CBM_INIT_DONE;
     /* Defense-in-depth allocator binds (idempotent). main() calls cbm_alloc_init
@@ -399,7 +424,6 @@ int cbm_init(void) {
      * For sqlite the SQLITE_CONFIG_MALLOC bind only takes effect if it runs
      * before sqlite initializes — main() guarantees that ordering; here it is a
      * best-effort idempotent re-assert for paths that never hit main(). */
-    cbm_alloc_init();
     return 0;
 }
 

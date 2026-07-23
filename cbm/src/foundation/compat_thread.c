@@ -7,6 +7,7 @@
 #include "foundation/constants.h"
 #include "foundation/compat_thread.h"
 
+#include <errno.h>
 #include <pthread.h>
 #include <stdlib.h>
 
@@ -34,17 +35,25 @@ static DWORD WINAPI win_thread_wrapper(LPVOID lpParam) {
 }
 
 int cbm_thread_create(cbm_thread_t *t, size_t stack_size, void *(*fn)(void *), void *arg) {
+    t->handle = NULL;
+    t->error_domain = CBM_THREAD_ERROR_NONE;
+    t->error_code = 0;
     if (stack_size == 0) {
         stack_size = CBM_DEFAULT_STACK_SIZE;
     }
     win_thread_arg_t *a = (win_thread_arg_t *)malloc(sizeof(win_thread_arg_t));
     if (!a) {
+        t->error_domain = CBM_THREAD_ERROR_ERRNO;
+        t->error_code = (unsigned long)(errno ? errno : ENOMEM);
         return CBM_NOT_FOUND;
     }
     a->fn = fn;
     a->arg = arg;
     t->handle = CreateThread(NULL, stack_size, win_thread_wrapper, a, 0, NULL);
     if (!t->handle) {
+        DWORD error = GetLastError();
+        t->error_domain = CBM_THREAD_ERROR_WIN32;
+        t->error_code = (unsigned long)(error ? error : ERROR_NOT_ENOUGH_MEMORY);
         free(a);
         return CBM_NOT_FOUND;
     }
@@ -52,17 +61,37 @@ int cbm_thread_create(cbm_thread_t *t, size_t stack_size, void *(*fn)(void *), v
 }
 
 int cbm_thread_join(cbm_thread_t *t) {
-    if (WaitForSingleObject(t->handle, INFINITE) != WAIT_OBJECT_0) {
+    t->error_domain = CBM_THREAD_ERROR_NONE;
+    t->error_code = 0;
+    DWORD wait_result = WaitForSingleObject(t->handle, INFINITE);
+    if (wait_result != WAIT_OBJECT_0) {
+        DWORD error = GetLastError();
+        t->error_domain = CBM_THREAD_ERROR_WIN32;
+        t->error_code = (unsigned long)(error ? error : ERROR_GEN_FAILURE);
         return CBM_NOT_FOUND;
     }
-    CloseHandle(t->handle);
+    if (!CloseHandle(t->handle)) {
+        DWORD error = GetLastError();
+        t->error_domain = CBM_THREAD_ERROR_WIN32;
+        t->error_code = (unsigned long)(error ? error : ERROR_INVALID_HANDLE);
+        t->handle = NULL;
+        return CBM_NOT_FOUND;
+    }
     t->handle = NULL;
     return 0;
 }
 
 int cbm_thread_detach(cbm_thread_t *t) {
+    t->error_domain = CBM_THREAD_ERROR_NONE;
+    t->error_code = 0;
     if (t->handle) {
-        CloseHandle(t->handle);
+        if (!CloseHandle(t->handle)) {
+            DWORD error = GetLastError();
+            t->error_domain = CBM_THREAD_ERROR_WIN32;
+            t->error_code = (unsigned long)(error ? error : ERROR_INVALID_HANDLE);
+            t->handle = NULL;
+            return CBM_NOT_FOUND;
+        }
         t->handle = NULL;
     }
     return 0;
@@ -71,29 +100,59 @@ int cbm_thread_detach(cbm_thread_t *t) {
 #else /* POSIX */
 
 int cbm_thread_create(cbm_thread_t *t, size_t stack_size, void *(*fn)(void *), void *arg) {
+    memset(&t->handle, 0, sizeof(t->handle));
+    t->error_domain = CBM_THREAD_ERROR_NONE;
+    t->error_code = 0;
     if (stack_size == 0) {
         stack_size = CBM_DEFAULT_STACK_SIZE;
     }
     pthread_attr_t attr;
-    pthread_attr_init(&attr);
-    pthread_attr_setstacksize(&attr, stack_size);
-    int rc = pthread_create(&t->handle, &attr, fn, arg);
+    int rc = pthread_attr_init(&attr);
+    if (rc != 0) {
+        t->error_domain = CBM_THREAD_ERROR_PTHREAD;
+        t->error_code = (unsigned long)rc;
+        return rc;
+    }
+    rc = pthread_attr_setstacksize(&attr, stack_size);
+    if (rc != 0) {
+        (void)pthread_attr_destroy(&attr);
+        t->error_domain = CBM_THREAD_ERROR_PTHREAD;
+        t->error_code = (unsigned long)rc;
+        return rc;
+    }
+    rc = pthread_create(&t->handle, &attr, fn, arg);
     pthread_attr_destroy(&attr);
+    if (rc != 0) {
+        t->error_domain = CBM_THREAD_ERROR_PTHREAD;
+        t->error_code = (unsigned long)rc;
+    }
     return rc;
 }
 
 int cbm_thread_join(cbm_thread_t *t) {
+    t->error_domain = CBM_THREAD_ERROR_NONE;
+    t->error_code = 0;
     int rc = pthread_join(t->handle, NULL);
     if (rc == 0) {
         memset(&t->handle, 0, sizeof(t->handle));
+    }
+    if (rc != 0) {
+        t->error_domain = CBM_THREAD_ERROR_PTHREAD;
+        t->error_code = (unsigned long)rc;
     }
     return rc;
 }
 
 int cbm_thread_detach(cbm_thread_t *t) {
+    t->error_domain = CBM_THREAD_ERROR_NONE;
+    t->error_code = 0;
     int rc = pthread_detach(t->handle);
     if (rc == 0) {
         memset(&t->handle, 0, sizeof(t->handle));
+    }
+    if (rc != 0) {
+        t->error_domain = CBM_THREAD_ERROR_PTHREAD;
+        t->error_code = (unsigned long)rc;
     }
     return rc;
 }

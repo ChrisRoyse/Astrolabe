@@ -681,11 +681,14 @@ int cbm_rename_replace(const char *old_path, const char *new_path) {
     wchar_t *wold = cbm_utf8_to_wide_path(old_path);
     wchar_t *wnew = cbm_utf8_to_wide_path(new_path);
     if (!wold || !wnew) {
+        DWORD error = GetLastError();
+        g_cbm_fs_last_error = (unsigned long)(error ? error : ERROR_NO_UNICODE_TRANSLATION);
         free(wold);
         free(wnew);
         return CBM_NOT_FOUND;
     }
     BOOL ok = MoveFileExW(wold, wnew, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
+    g_cbm_fs_last_error = ok ? ERROR_SUCCESS : GetLastError();
     free(wold);
     free(wnew);
     return ok ? 0 : CBM_NOT_FOUND;

@@ -37,6 +37,7 @@ enum {
 #include <sqlite3.h>
 
 #include <limits.h>
+#include <errno.h>
 #include <stdatomic.h>
 #include <stdint.h> // int64_t
 #include <stdio.h>
@@ -2481,7 +2482,6 @@ int cbm_gbuf_dump_to_sqlite(cbm_gbuf_t *gb, const char *path) {
     }
     CBM_PROF_END_N("dump", "2b_stream_append_nodes", t_append, node_idx);
 
-    bool edge_build_failed = false;
     if (rc == 0 && !has_row_sink) {
         CBM_PROF_START(t_build_edges);
         dump_edges =
@@ -2494,7 +2494,6 @@ int cbm_gbuf_dump_to_sqlite(cbm_gbuf_t *gb, const char *path) {
              * failed and remove the store file below — the store must be absent or
              * complete, never torn. release_and_remap_vectors is skipped since the
              * dump is aborting. */
-            edge_build_failed = true;
             rc = CBM_NOT_FOUND;
         } else {
             release_and_remap_vectors(gb, temp_to_final, max_temp_id);
@@ -2513,10 +2512,20 @@ int cbm_gbuf_dump_to_sqlite(cbm_gbuf_t *gb, const char *path) {
     if (rc == 0) {
         rc = frc;
     }
-    if (edge_build_failed) {
-        /* #579: remove the closed-but-incomplete store so no torn/partial DB is
-         * left behind; the dump fails closed with rc = CBM_NOT_FOUND. */
-        (void)cbm_unlink(path);
+    if (rc != 0) {
+        /* #579/#676: every writer failure leaves the requested staging path
+         * absent. A partially written direct-page file is never a readable or
+         * publishable database, regardless of which phase failed. */
+        errno = 0;
+        if (cbm_unlink(path) != 0 && errno != ENOENT) {
+            char native_error[32];
+            (void)snprintf(native_error, sizeof(native_error), "%d", errno ? errno : EIO);
+            cbm_log_error("gbuf.dump_cleanup_failed", "code", "CBM_DUMP_PARTIAL_REMOVE_FAILED",
+                          "path", path, "native_error_kind", "errno", "native_error", native_error,
+                          "message", "the failed direct-writer staging file could not be removed",
+                          "remediation",
+                          "preserve the path, resolve the reported filesystem failure, and retry");
+        }
     }
 
     log_dump_summary(node_idx, edge_idx);

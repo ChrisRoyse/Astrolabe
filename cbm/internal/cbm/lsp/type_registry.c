@@ -487,62 +487,16 @@ const CBMRegisteredFunc *cbm_registry_lookup_func(const CBMTypeRegistry *reg,
     return r;
 }
 
-const CBMRegisteredType *cbm_registry_resolve_alias(const CBMTypeRegistry *reg,
-                                                    const char *type_qn) {
-    if (!reg || !type_qn)
-        return NULL;
-    const CBMRegisteredType *rt = cbm_registry_lookup_type(reg, type_qn);
-    for (int i = 0; i < 16 && rt && rt->alias_of; i++) {
-        const CBMRegisteredType *next = cbm_registry_lookup_type(reg, rt->alias_of);
-        if (!next)
-            return rt;
-        rt = next;
-    }
-    return rt;
-}
-
-const CBMRegisteredFunc *cbm_registry_lookup_method_aliased(const CBMTypeRegistry *reg,
-                                                            const char *receiver_qn,
-                                                            const char *method_name) {
-    if (!reg || !receiver_qn || !method_name)
-        return NULL;
-
-    // Direct lookup first
-    const CBMRegisteredFunc *f = cbm_registry_lookup_method(reg, receiver_qn, method_name);
-    if (f)
-        return f;
-
-    // Follow alias chain
-    const CBMRegisteredType *rt = cbm_registry_lookup_type(reg, receiver_qn);
-    for (int i = 0; i < 16 && rt && rt->alias_of; i++) {
-        f = cbm_registry_lookup_method(reg, rt->alias_of, method_name);
-        if (f)
-            return f;
-        rt = cbm_registry_lookup_type(reg, rt->alias_of);
-    }
-    return NULL;
-}
-
 const CBMRegisteredFunc *cbm_registry_lookup_symbol(const CBMTypeRegistry *reg,
                                                     const char *package_qn, const char *name) {
     if (!reg || !package_qn || !name)
         return NULL;
 
-    // Build expected QN: package_qn.name
-    size_t pkg_len = strlen(package_qn);
-    size_t name_len = strlen(name);
-    size_t total_len = pkg_len + 1 + name_len;
-
-    char buf[512];
-    if (total_len >= sizeof(buf))
+    // Build expected QN: package_qn.name in the registry's checked arena.
+    const char *qualified_name = cbm_arena_sprintf(reg->arena, "%s.%s", package_qn, name);
+    if (!qualified_name)
         return NULL;
-
-    memcpy(buf, package_qn, pkg_len);
-    buf[pkg_len] = '.';
-    memcpy(buf + pkg_len + 1, name, name_len);
-    buf[total_len] = '\0';
-
-    return cbm_registry_lookup_func(reg, buf);
+    return cbm_registry_lookup_func(reg, qualified_name);
 }
 
 // Count parameters in a FUNC signature.
@@ -819,16 +773,9 @@ const CBMRegisteredFunc *cbm_registry_lookup_symbol_by_types(const CBMTypeRegist
     if (!arg_types)
         return cbm_registry_lookup_symbol_by_args(reg, package_qn, name, arg_count);
 
-    size_t pkg_len = strlen(package_qn);
-    size_t name_len = strlen(name);
-    size_t total_len = pkg_len + 1 + name_len;
-    char buf[512];
-    if (total_len >= sizeof(buf))
+    const char *qualified_name = cbm_arena_sprintf(reg->arena, "%s.%s", package_qn, name);
+    if (!qualified_name)
         return NULL;
-    memcpy(buf, package_qn, pkg_len);
-    buf[pkg_len] = '.';
-    memcpy(buf + pkg_len + 1, name, name_len);
-    buf[total_len] = '\0';
 
     const CBMRegisteredFunc *best = NULL;
     int best_score = 0;
@@ -839,7 +786,7 @@ const CBMRegisteredFunc *cbm_registry_lookup_symbol_by_types(const CBMTypeRegist
     // same overload set as the linear scan, in O(overloads) not O(func_count).
     if (reg->func_qn_buckets && reg->func_qn_bucket_count > 0) {
         int best_pi = -1, first_pi = -1;
-        uint64_t h = fnv1a(buf);
+        uint64_t h = fnv1a(qualified_name);
         int slot = (int)(h & (uint64_t)(reg->func_qn_bucket_count - 1));
         for (int idx = reg->func_qn_buckets[slot]; idx >= 0;
              idx = reg->func_qn_entries[idx].next_index) {
@@ -847,7 +794,7 @@ const CBMRegisteredFunc *cbm_registry_lookup_symbol_by_types(const CBMTypeRegist
                 continue;
             int pi = reg->func_qn_entries[idx].payload_index;
             const CBMRegisteredFunc *f = &reg->funcs[pi];
-            if (!f->qualified_name || strcmp(f->qualified_name, buf) != 0)
+            if (!f->qualified_name || strcmp(f->qualified_name, qualified_name) != 0)
                 continue;
             if (first_pi < 0 || pi < first_pi)
                 first_pi = pi;
@@ -869,7 +816,7 @@ const CBMRegisteredFunc *cbm_registry_lookup_symbol_by_types(const CBMTypeRegist
 
     for (int i = 0; i < reg->func_count; i++) {
         const CBMRegisteredFunc *f = &reg->funcs[i];
-        if (strcmp(f->qualified_name, buf) == 0) {
+        if (strcmp(f->qualified_name, qualified_name) == 0) {
             if (!first_match)
                 first_match = f;
             int s = score_overload_match(f, arg_types, arg_count);
@@ -893,16 +840,9 @@ const CBMRegisteredFunc *cbm_registry_lookup_symbol_by_args(const CBMTypeRegistr
     if (!reg || !package_qn || !name)
         return NULL;
 
-    size_t pkg_len = strlen(package_qn);
-    size_t name_len = strlen(name);
-    size_t total_len = pkg_len + 1 + name_len;
-    char buf[512];
-    if (total_len >= sizeof(buf))
+    const char *qualified_name = cbm_arena_sprintf(reg->arena, "%s.%s", package_qn, name);
+    if (!qualified_name)
         return NULL;
-    memcpy(buf, package_qn, pkg_len);
-    buf[pkg_len] = '.';
-    memcpy(buf + pkg_len + 1, name, name_len);
-    buf[total_len] = '\0';
 
     const CBMRegisteredFunc *first_match = NULL;
     const CBMRegisteredFunc *range_match = NULL;
@@ -911,7 +851,7 @@ const CBMRegisteredFunc *cbm_registry_lookup_symbol_by_args(const CBMTypeRegistr
     // cbm_registry_lookup_symbol_by_types). O(overloads) not O(func_count).
     if (reg->func_qn_buckets && reg->func_qn_bucket_count > 0) {
         int exact_pi = -1, range_pi = -1, first_pi = -1;
-        uint64_t h = fnv1a(buf);
+        uint64_t h = fnv1a(qualified_name);
         int slot = (int)(h & (uint64_t)(reg->func_qn_bucket_count - 1));
         for (int idx = reg->func_qn_buckets[slot]; idx >= 0;
              idx = reg->func_qn_entries[idx].next_index) {
@@ -919,7 +859,7 @@ const CBMRegisteredFunc *cbm_registry_lookup_symbol_by_args(const CBMTypeRegistr
                 continue;
             int pi = reg->func_qn_entries[idx].payload_index;
             const CBMRegisteredFunc *f = &reg->funcs[pi];
-            if (!f->qualified_name || strcmp(f->qualified_name, buf) != 0)
+            if (!f->qualified_name || strcmp(f->qualified_name, qualified_name) != 0)
                 continue;
             if (first_pi < 0 || pi < first_pi)
                 first_pi = pi;
@@ -946,7 +886,7 @@ const CBMRegisteredFunc *cbm_registry_lookup_symbol_by_args(const CBMTypeRegistr
 
     for (int i = 0; i < reg->func_count; i++) {
         const CBMRegisteredFunc *f = &reg->funcs[i];
-        if (strcmp(f->qualified_name, buf) == 0) {
+        if (strcmp(f->qualified_name, qualified_name) == 0) {
             if (!first_match)
                 first_match = f;
             int pc = count_func_params(f);

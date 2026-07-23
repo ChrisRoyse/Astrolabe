@@ -88,19 +88,51 @@ pub fn mimalloc_version() -> i32 {
     unsafe { cbm_mimalloc_version() }
 }
 
-pub fn assert_mimalloc_version_matches_vendored() {
-    assert_eq!(
-        mimalloc_version(),
-        vendored_mimalloc_version(),
-        "Rust and C halves must use the vendored mimalloc version"
-    );
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CbmAllocatorInitError {
+    pub code: &'static str,
+    pub message: String,
+    pub remediation: &'static str,
+    pub sqlite_error: Option<i32>,
 }
 
-pub fn initialize_allocator_bindings_first() {
-    unsafe {
-        cbm_alloc_init();
+impl std::fmt::Display for CbmAllocatorInitError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "{}: {} (remediation: {})",
+            self.code, self.message, self.remediation
+        )
     }
-    assert_mimalloc_version_matches_vendored();
+}
+
+impl std::error::Error for CbmAllocatorInitError {}
+
+pub fn initialize_allocator_bindings_first() -> Result<(), CbmAllocatorInitError> {
+    let status = unsafe { cbm_alloc_init() };
+    if status != 0 {
+        return Err(CbmAllocatorInitError {
+            code: "CBM_SQLITE_ALLOCATOR_BIND_FAILED",
+            message: format!(
+                "libcbm rejected allocator initialization with SQLite status {status}"
+            ),
+            remediation: "initialize libcbm before every other SQLite or tree-sitter call, then restart the process",
+            sqlite_error: Some(status),
+        });
+    }
+    let observed = mimalloc_version();
+    let expected = vendored_mimalloc_version();
+    if observed != expected {
+        return Err(CbmAllocatorInitError {
+            code: "CBM_MIMALLOC_VERSION_MISMATCH",
+            message: format!(
+                "the linked C allocator version {observed} does not match the Rust allocator version {expected}"
+            ),
+            remediation: "rebuild both Rust and libcbm with the repository-pinned native Windows GNU toolchain",
+            sqlite_error: None,
+        });
+    }
+    Ok(())
 }
 
 /// Reads back libcbm's allocator-binding flag (#5).
@@ -144,7 +176,7 @@ pub fn query_store_search_schema_counts(
     project: &str,
     label: &str,
 ) -> Result<CbmStoreQuerySchemaCounts, String> {
-    initialize_allocator_bindings_first();
+    initialize_allocator_bindings_first().map_err(|error| error.to_string())?;
     let db_path = CString::new(
         db_path
             .to_str()

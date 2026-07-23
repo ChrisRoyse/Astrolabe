@@ -94,7 +94,7 @@ pub(crate) fn default_search_scale_settings(source: &str) -> Result<SearchScaleS
         index_backend: SearchIndexBackend::InMemoryHnsw,
         funnel_activation_records: DEFAULT_FUNNEL_ACTIVATION_RECORDS,
         estimated_index_rss_bytes: 0,
-        master_budget_bytes: u64::try_from(astrolabe_bridge::cbm_memory_budget_bytes())?,
+        master_budget_bytes: u64::try_from(astrolabe_bridge::cbm_memory_budget_bytes()?)?,
         source: source.to_string(),
     })
 }

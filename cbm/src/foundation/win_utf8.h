@@ -95,15 +95,23 @@ static inline wchar_t *cbm_utf8_to_wide_path(const char *utf8) {
 
 static inline char *cbm_wide_to_utf8(const wchar_t *wide) {
     if (!wide) {
+        SetLastError(ERROR_INVALID_PARAMETER);
         return NULL;
     }
-    int len = WideCharToMultiByte(CP_UTF8, 0, wide, -1, NULL, 0, NULL, NULL);
+    int len = WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, wide, -1, NULL, 0, NULL, NULL);
     if (len <= 0) {
         return NULL;
     }
     char *u8 = (char *)malloc((size_t)len);
-    if (u8) {
-        WideCharToMultiByte(CP_UTF8, 0, wide, -1, u8, len, NULL, NULL);
+    if (!u8) {
+        SetLastError(ERROR_NOT_ENOUGH_MEMORY);
+        return NULL;
+    }
+    if (WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, wide, -1, u8, len, NULL, NULL) != len) {
+        DWORD error = GetLastError();
+        free(u8);
+        SetLastError(error != ERROR_SUCCESS ? error : ERROR_NO_UNICODE_TRANSLATION);
+        return NULL;
     }
     return u8;
 }

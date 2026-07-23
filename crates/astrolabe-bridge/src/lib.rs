@@ -14,6 +14,11 @@ use std::thread::{self, ThreadId};
 
 pub const CRATE_NAME: &str = env!("CARGO_PKG_NAME");
 
+fn initialize_cbm_allocator() -> Result<(), BridgeError> {
+    cbm_sys::initialize_allocator_bindings_first()
+        .map_err(|error| envelope(error.code, error.message, error.remediation))
+}
+
 /// The C-side reserved store-dir sidecar suffix, re-exported from the
 /// bindgen-surfaced libcbm macro (`CBM_ASTRO_LOWERED_DB_SUFFIX` in
 /// `cbm/src/mcp/mcp.h`). The value is a NUL-terminated byte array
@@ -64,7 +69,9 @@ const CBM_STORE_PATH_CAPACITY: usize = 1024;
 /// bare `NULL` — historically consumed as if it could not happen — into a labeled
 /// refusal on the Rust side.
 fn drain_cbm_env_fault() -> Option<BridgeError> {
-    cbm_sys::initialize_allocator_bindings_first();
+    if let Err(error) = initialize_cbm_allocator() {
+        return Some(error);
+    }
     // SAFETY: the fault accessors return either NULL or a pointer into
     // process-lifetime static storage owned by libcbm; the strings are copied out
     // before the record is cleared.
@@ -92,7 +99,9 @@ fn drain_cbm_env_fault() -> Option<BridgeError> {
 /// from. A truncation fault against, say, `PATH` is real but must not condemn the
 /// cache-directory resolution, which never reads `PATH`.
 fn drain_cbm_store_fault() -> Option<BridgeError> {
-    cbm_sys::initialize_allocator_bindings_first();
+    if let Err(error) = initialize_cbm_allocator() {
+        return Some(error);
+    }
     const STORE_VARS: [&CStr; 3] = [c"CBM_CACHE_DIR", c"HOME", c"USERPROFILE"];
     // SAFETY: cbm_astro_env_faulted_for reads the process-global fault record and
     // compares against the passed NUL-terminated name; no borrowed state escapes.
@@ -141,7 +150,7 @@ pub fn set_cbm_cache_dir(path: &std::path::Path) -> Result<PathBuf, BridgeError>
     // the process happens to have, and an over-long one cannot be represented.
     validate_cbm_store_env(Some(raw), None, None)?;
 
-    cbm_sys::initialize_allocator_bindings_first();
+    initialize_cbm_allocator()?;
     let c_path = CString::new(raw)?;
     // SAFETY: cbm_astro_set_cache_dir copies the path into process-global storage
     // owned by libcbm; the CString outlives the call.
@@ -176,10 +185,11 @@ pub fn set_cbm_cache_dir(path: &std::path::Path) -> Result<PathBuf, BridgeError>
 }
 
 /// Drop any explicit store override, restoring `CBM_CACHE_DIR`/`$HOME` precedence.
-pub fn clear_cbm_cache_dir() {
-    cbm_sys::initialize_allocator_bindings_first();
+pub fn clear_cbm_cache_dir() -> Result<(), BridgeError> {
+    initialize_cbm_allocator()?;
     // SAFETY: process-global reset of libcbm's override buffer; no borrowed inputs.
     unsafe { cbm_sys::cbm_astro_clear_cache_dir() };
+    Ok(())
 }
 
 /// Fail-closed validation of the environment that decides where the CBM project
@@ -265,7 +275,7 @@ pub fn cbm_cache_dir() -> Result<PathBuf, BridgeError> {
         std::env::var("USERPROFILE").ok().as_deref(),
     )?;
 
-    cbm_sys::initialize_allocator_bindings_first();
+    initialize_cbm_allocator()?;
     let ptr = unsafe { cbm_sys::cbm_resolve_cache_dir() };
     if ptr.is_null() {
         // #241: the C half publishes a {code, message, remediation} envelope naming
@@ -315,20 +325,20 @@ pub fn cbm_cache_dir() -> Result<PathBuf, BridgeError> {
     Ok(resolved)
 }
 
-pub fn cbm_memory_budget_bytes() -> usize {
-    cbm_sys::initialize_allocator_bindings_first();
+pub fn cbm_memory_budget_bytes() -> Result<usize, BridgeError> {
+    initialize_cbm_allocator()?;
     // SAFETY: these CBM functions are process-global budget initializers/readers
     // with no borrowed inputs. cbm_mem_init is idempotent.
     unsafe {
         let info = cbm_sys::cbm_system_info();
         let ram_fraction = cbm_sys::cbm_mem_ram_fraction_for_total(info.total_ram);
         cbm_sys::cbm_mem_init(ram_fraction);
-        cbm_sys::cbm_mem_budget()
+        Ok(cbm_sys::cbm_mem_budget())
     }
 }
 
 pub fn cbm_project_name_from_path(path: &str) -> Result<String, BridgeError> {
-    cbm_sys::initialize_allocator_bindings_first();
+    initialize_cbm_allocator()?;
     let path = CString::new(path)?;
     let ptr = unsafe { cbm_sys::cbm_project_name_from_path(path.as_ptr()) };
     unsafe { take_c_string(ptr) }
@@ -385,7 +395,7 @@ pub fn process_is_alive(_pid: u32) -> bool {
 }
 
 pub fn cbm_print_tool_help(prog: &str, tool_name: &str) -> Result<bool, BridgeError> {
-    cbm_sys::initialize_allocator_bindings_first();
+    initialize_cbm_allocator()?;
     let prog = CString::new(prog)?;
     let tool_name = CString::new(tool_name)?;
     // SAFETY: both CStrings outlive the call; the C function only reads the two
@@ -397,8 +407,8 @@ pub fn cbm_print_tool_help(prog: &str, tool_name: &str) -> Result<bool, BridgeEr
     Ok(rc == 0)
 }
 
-pub fn route_cbm_logs_to_tracing() {
-    cbm_sys::initialize_allocator_bindings_first();
+pub fn route_cbm_logs_to_tracing() -> Result<(), BridgeError> {
+    initialize_cbm_allocator()?;
     // SAFETY: the callback is a static extern function and remains valid for
     // the process lifetime. CBM stores only the function pointer.
     unsafe {
@@ -408,6 +418,7 @@ pub fn route_cbm_logs_to_tracing() {
             cbm_sys::CBMLogSinkMode_CBM_LOG_SINK_REPLACE,
         );
     }
+    Ok(())
 }
 
 /// How libcbm's own logging is initialized for this host process (#392).
@@ -443,7 +454,7 @@ pub fn initialize_cbm_host_process_cli(binary_path: Option<&str>) -> Result<(), 
 }
 
 pub fn run_cbm_installer_command(command: &str, args: &[String]) -> Result<i32, BridgeError> {
-    cbm_sys::initialize_allocator_bindings_first();
+    initialize_cbm_allocator()?;
     let argc = c_int::try_from(args.len()).map_err(|_| {
         envelope(
             "ASTRO_CBM_INSTALLER_ARGC",
@@ -478,7 +489,7 @@ pub fn run_cbm_installer_command(command: &str, args: &[String]) -> Result<i32, 
 }
 
 pub fn cbm_install_plan_json(home: &str, binary_path: &str) -> Result<String, BridgeError> {
-    cbm_sys::initialize_allocator_bindings_first();
+    initialize_cbm_allocator()?;
     let home = CString::new(home)?;
     let binary_path = CString::new(binary_path)?;
     unsafe {
@@ -500,7 +511,7 @@ fn initialize_cbm_host_process_with_log_mode(
         std::env::var("HOME").ok().as_deref(),
         std::env::var("USERPROFILE").ok().as_deref(),
     )?;
-    cbm_sys::initialize_allocator_bindings_first();
+    initialize_cbm_allocator()?;
     let binary_path = binary_path.map(CString::new).transpose()?;
 
     // SAFETY: all called CBM startup functions are process-global initializers
@@ -551,7 +562,7 @@ pub struct CbmIndexWorkerRole {
 
 impl CbmIndexWorkerRole {
     pub fn activate(response_out: Option<&str>) -> Result<Self, BridgeError> {
-        cbm_sys::initialize_allocator_bindings_first();
+        initialize_cbm_allocator()?;
         let response_out = response_out.map(CString::new).transpose()?;
         // SAFETY: CBM copies response_out into process-global worker state.
         unsafe {
@@ -1239,7 +1250,7 @@ pub struct CbmPipeline {
 
 impl CbmPipeline {
     pub fn new(repo_path: &str, db_path: &str, mode: CbmIndexMode) -> Result<Self, BridgeError> {
-        cbm_sys::initialize_allocator_bindings_first();
+        initialize_cbm_allocator()?;
         let repo_path = CString::new(repo_path)?;
         let db_path = CString::new(db_path)?;
         // SAFETY: cbm_init is idempotent in libcbm. The repo/db strings outlive
@@ -1413,7 +1424,7 @@ impl ExtractedFile {
         rel_path: &str,
         timeout_micros: i64,
     ) -> Result<Self, BridgeError> {
-        cbm_sys::initialize_allocator_bindings_first();
+        initialize_cbm_allocator()?;
         let source_len = c_int::try_from(source.len()).map_err(|_| {
             envelope(
                 "ASTRO_CBM_SOURCE_TOO_LARGE",
@@ -1899,7 +1910,7 @@ struct CbmStore {
 
 impl CbmStore {
     fn open_memory() -> Result<Self, BridgeError> {
-        cbm_sys::initialize_allocator_bindings_first();
+        initialize_cbm_allocator()?;
         // SAFETY: cbm_store_open_memory takes no borrowed inputs and returns
         // an owned store handle or NULL on allocation/open failure.
         let ptr = unsafe { cbm_sys::cbm_store_open_memory() };
@@ -2240,7 +2251,7 @@ impl CbmToolRunner {
     }
 
     fn from_store_path_ptr(store_path: *const c_char) -> Result<Self, BridgeError> {
-        cbm_sys::initialize_allocator_bindings_first();
+        initialize_cbm_allocator()?;
         // SAFETY: store_path is either NULL (CBM default store path) or a live
         // C string for the duration of the call.
         let ptr = unsafe { cbm_sys::cbm_mcp_server_new(store_path) };

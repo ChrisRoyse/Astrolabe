@@ -56,10 +56,18 @@ typedef struct {
 
     // Recursion guard for ts_eval_expr_type (mirrors c_lsp).
     int eval_depth;
+    int eval_depth_limit;
+    int relater_depth_limit;
+    int infer_depth_limit;
+    int infer_binding_limit;
     // Recursion guard for lookup_member_type: cyclic type graphs (mutually
     // recursive unions/wrappers across registered types) otherwise recurse
     // without bound — stack overflow on real repos.
     int member_depth;
+    int method_depth;
+    int member_depth_limit;
+    int walk_depth;
+    int walk_depth_limit;
 } TSLSPContext;
 
 // --- Initialization ---

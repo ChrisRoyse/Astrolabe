@@ -35,6 +35,7 @@
  */
 
 #include "kotlin_lsp.h"
+#include "semantic_array.h"
 #include "../helpers.h"
 #include <ctype.h>
 #include <stdarg.h>
@@ -46,8 +47,22 @@
  * Amalgamation-included (see lsp_all.c); mirror of py_builtins.c. */
 #include "kotlin_builtins.c"
 
-#define KT_EVAL_MAX_DEPTH 32
 #define KT_IMPORT_INITIAL_CAP 16
+
+enum {
+    KT_DEFAULT_EVAL_DEPTH_LIMIT = 32,
+    KT_DEFAULT_LOOKUP_DEPTH_LIMIT = 32,
+};
+
+struct CBMKotlinSmartCast {
+    const char *name;
+    const CBMType *type;
+    const CBMType *prior_type;
+    CBMScope *scope;
+    CBMVarBinding *symbol_binding;
+    CBMVarBinding *cast_binding;
+    struct CBMKotlinSmartCast *previous;
+};
 
 #define KT_CONF_CONSTRUCTOR 0.95f
 #define KT_CONF_METHOD 0.90f
@@ -64,16 +79,18 @@
 
 static void kt_resolve_calls_in_node_inner(KotlinLSPContext *ctx, TSNode node);
 
-/* Depth-guarded entry for the AST call-resolution walk. The walk recurses once
- * per nesting level; a deeply-nested or cyclic file can overflow the native
- * stack (SIGSEGV) and take down the whole index. Past the cap the subtree is
- * skipped — its calls stay unresolved, which is graceful degradation, not a
- * crash. The cap is CBM_LSP_MAX_WALK_DEPTH, env-overridable via the same name.
- * The walk_depth-- runs after the inner returns, so early returns in the body
- * never leak the counter. */
+/* Depth-guarded AST call-resolution walk. Reaching the bound is an explicit
+ * extraction failure; silently skipping the subtree would publish a partial
+ * call graph as complete. */
 static void kt_resolve_calls_in_node(KotlinLSPContext *ctx, TSNode node) {
-    if (ctx->walk_depth >= cbm_lsp_max_walk_depth())
+    if (!ctx || cbm_arena_failed(ctx->arena)) {
         return;
+    }
+    if (ctx->walk_depth >= ctx->walk_depth_limit) {
+        cbm_arena_mark_failed(ctx->arena, "CBM_LSP_ANALYSIS_LIMIT_EXCEEDED",
+                              "kotlin_lsp_ast_walk_depth", (size_t)ctx->walk_depth_limit);
+        return;
+    }
     ctx->walk_depth++;
     kt_resolve_calls_in_node_inner(ctx, node);
     ctx->walk_depth--;
@@ -102,6 +119,9 @@ static bool kt_node_kind_in(TSNode n, const char *const *kinds);
 static const char *kt_resolve_in_default_imports(KotlinLSPContext *ctx, const char *name,
                                                  CBMKotlinUseKind kind);
 static const CBMType *kt_try_smart_cast(KotlinLSPContext *ctx, TSNode call_or_nav);
+static bool kt_apply_condition_smart_casts(KotlinLSPContext *ctx, TSNode condition, bool truth,
+                                           int depth);
+static void kt_resolve_condition_calls(KotlinLSPContext *ctx, TSNode condition, int depth);
 
 /* ── helpers ──────────────────────────────────────────────────────── */
 
@@ -190,9 +210,18 @@ static TSNode kt_field_named(TSNode parent, const char *field) {
     return ts_node_child_by_field_name(parent, field, (uint32_t)strlen(field));
 }
 
-/* Find the first descendant matching kind, depth-first, capped at max_depth. */
-static TSNode kt_find_descendant_kind(TSNode node, const char *kind, int max_depth) {
-    if (ts_node_is_null(node) || max_depth <= 0) {
+/* Find the first descendant matching kind without silently shortening the AST. */
+static TSNode kt_find_descendant_kind(KotlinLSPContext *ctx, TSNode node, const char *kind,
+                                      int depth) {
+    if (ts_node_is_null(node)) {
+        TSNode null_node;
+        memset(&null_node, 0, sizeof(null_node));
+        return null_node;
+    }
+    if (depth >= ctx->lookup_depth_limit) {
+        cbm_arena_mark_failed(ctx->arena, "CBM_LSP_ANALYSIS_LIMIT_EXCEEDED",
+                              "kotlin_lsp_descendant_search_depth",
+                              (size_t)ctx->lookup_depth_limit);
         TSNode null_node;
         memset(&null_node, 0, sizeof(null_node));
         return null_node;
@@ -202,7 +231,7 @@ static TSNode kt_find_descendant_kind(TSNode node, const char *kind, int max_dep
     }
     uint32_t nc = ts_node_child_count(node);
     for (uint32_t i = 0; i < nc; i++) {
-        TSNode found = kt_find_descendant_kind(ts_node_child(node, i), kind, max_depth - 1);
+        TSNode found = kt_find_descendant_kind(ctx, ts_node_child(node, i), kind, depth + 1);
         if (!ts_node_is_null(found)) {
             return found;
         }
@@ -459,6 +488,15 @@ void kotlin_lsp_init(KotlinLSPContext *ctx, CBMArena *arena, const char *source,
     ctx->project_name = project_name ? cbm_arena_strdup(arena, project_name) : "";
     ctx->rel_path = rel_path ? cbm_arena_strdup(arena, rel_path) : "";
     ctx->resolved_calls = out;
+    if (!cbm_lsp_read_positive_limit(arena, "CBM_LSP_MAX_EVAL_DEPTH", KT_DEFAULT_EVAL_DEPTH_LIMIT,
+                                     "kotlin_lsp_eval_depth_config", &ctx->eval_depth_limit) ||
+        !cbm_lsp_read_positive_limit(arena, "CBM_LSP_MAX_LOOKUP_DEPTH",
+                                     KT_DEFAULT_LOOKUP_DEPTH_LIMIT,
+                                     "kotlin_lsp_lookup_depth_config", &ctx->lookup_depth_limit) ||
+        !cbm_lsp_read_positive_limit(arena, "CBM_LSP_MAX_WALK_DEPTH", CBM_LSP_DEFAULT_WALK_DEPTH,
+                                     "kotlin_lsp_walk_depth_config", &ctx->walk_depth_limit)) {
+        return;
+    }
     ctx->import_cap = KT_IMPORT_INITIAL_CAP;
     ctx->import_locals =
         (const char **)cbm_arena_alloc(arena, sizeof(const char *) * (size_t)ctx->import_cap);
@@ -819,80 +857,136 @@ static const CBMType *kt_stdlib_method_return_type(KotlinLSPContext *ctx, const 
     return cbm_type_unknown();
 }
 
-/* Iterative method lookup with a single depth bound on the combined
- * alias-then-super-chain walk. We never recurse — a class's alias chain
- * is followed first (capped at 16 hops to break self-referential cycles
- * that arise when a typealias resolves to a name that the registry maps
- * back to the same type), then the super chain is walked breadth-first
- * with a small visited set to break diamond inheritance. */
+static int kt_lookup_visited_capacity(const KotlinLSPContext *ctx) {
+    int cap = ctx->registry->type_count;
+    if (ctx->registry->fallback) {
+        if (ctx->registry->fallback->type_count > INT_MAX - cap) {
+            return 0;
+        }
+        cap += ctx->registry->fallback->type_count;
+    }
+    return cap < INT_MAX ? cap + 1 : 0;
+}
+
+static bool kt_lookup_enter(KotlinLSPContext *ctx, const char *type_qn, const char **visited,
+                            int *visited_count, int visited_cap, int depth, const char *operation) {
+    if (depth >= ctx->lookup_depth_limit) {
+        cbm_arena_mark_failed(ctx->arena, "CBM_LSP_ANALYSIS_LIMIT_EXCEEDED", operation,
+                              (size_t)ctx->lookup_depth_limit);
+        return false;
+    }
+    for (int i = 0; i < *visited_count; i++) {
+        if (strcmp(visited[i], type_qn) == 0) {
+            return false;
+        }
+    }
+    if (*visited_count >= visited_cap) {
+        cbm_arena_mark_failed(ctx->arena, "CBM_LSP_ANALYSIS_LIMIT_EXCEEDED", operation,
+                              (size_t)visited_cap);
+        return false;
+    }
+    visited[(*visited_count)++] = type_qn;
+    return true;
+}
+
+static const CBMRegisteredFunc *kt_lookup_method_depth(KotlinLSPContext *ctx, const char *class_qn,
+                                                       const char *method_name,
+                                                       const char **visited, int *visited_count,
+                                                       int visited_cap, int depth) {
+    if (!kt_lookup_enter(ctx, class_qn, visited, visited_count, visited_cap, depth,
+                         "kotlin_lsp_method_lookup_depth")) {
+        return NULL;
+    }
+    const CBMRegisteredFunc *found =
+        cbm_registry_lookup_method(ctx->registry, class_qn, method_name);
+    if (found) {
+        return found;
+    }
+    const CBMRegisteredType *type = cbm_registry_lookup_type(ctx->registry, class_qn);
+    if (!type) {
+        return NULL;
+    }
+    if (type->method_names) {
+        for (int i = 0; type->method_names[i]; i++) {
+            if (strcmp(type->method_names[i], method_name) == 0) {
+                return kt_synth_method(ctx, class_qn, method_name);
+            }
+        }
+    }
+    if (type->alias_of) {
+        found = kt_lookup_method_depth(ctx, type->alias_of, method_name, visited, visited_count,
+                                       visited_cap, depth + 1);
+        if (found || cbm_arena_failed(ctx->arena)) {
+            return found;
+        }
+    }
+    if (type->embedded_types) {
+        for (int i = 0; type->embedded_types[i]; i++) {
+            found = kt_lookup_method_depth(ctx, type->embedded_types[i], method_name, visited,
+                                           visited_count, visited_cap, depth + 1);
+            if (found || cbm_arena_failed(ctx->arena)) {
+                return found;
+            }
+        }
+    }
+    return NULL;
+}
+
 const CBMRegisteredFunc *kotlin_lookup_method(KotlinLSPContext *ctx, const char *class_qn,
                                               const char *method_name) {
     if (!ctx || !class_qn || !method_name || !ctx->registry) {
         return NULL;
     }
+    int cap = kt_lookup_visited_capacity(ctx);
+    if (cap <= 0) {
+        cbm_arena_mark_failed(ctx->arena, "CBM_LSP_ANALYSIS_LIMIT_EXCEEDED",
+                              "kotlin_lsp_method_lookup_cardinality", SIZE_MAX);
+        return NULL;
+    }
+    const char **visited =
+        (const char **)cbm_arena_alloc(ctx->arena, (size_t)cap * sizeof(*visited));
+    int visited_count = 0;
+    return visited
+               ? kt_lookup_method_depth(ctx, class_qn, method_name, visited, &visited_count, cap, 0)
+               : NULL;
+}
 
-    /* Walk the alias chain iteratively, then the super chain, all using
-     * a single visited-set so we cannot loop. */
-    enum { VISIT_CAP = 32 };
-    const char *visited[VISIT_CAP];
-    int visited_n = 0;
-
-    const char *queue[VISIT_CAP];
-    int qhead = 0;
-    int qtail = 0;
-    queue[qtail++] = class_qn;
-
-    while (qhead < qtail) {
-        const char *cur_qn = queue[qhead++];
-        if (!cur_qn) {
-            continue;
-        }
-        bool seen = false;
-        for (int v = 0; v < visited_n; v++) {
-            if (strcmp(visited[v], cur_qn) == 0) {
-                seen = true;
-                break;
-            }
-        }
-        if (seen) {
-            continue;
-        }
-        if (visited_n < VISIT_CAP) {
-            visited[visited_n++] = cur_qn;
-        }
-
-        /* Direct func registry hit (also follows alias chain internally
-         * via cbm_registry_lookup_method_aliased). */
-        const CBMRegisteredFunc *rf =
-            cbm_registry_lookup_method_aliased(ctx->registry, cur_qn, method_name);
-        if (rf) {
-            return rf;
-        }
-
-        /* method_names fallback */
-        const CBMRegisteredType *rt = cbm_registry_lookup_type(ctx->registry, cur_qn);
-        if (rt && rt->method_names) {
-            for (int i = 0; rt->method_names[i]; i++) {
-                if (strcmp(rt->method_names[i], method_name) == 0) {
-                    return kt_synth_method(ctx, cur_qn, method_name);
-                }
-            }
-        }
-        if (!rt) {
-            continue;
-        }
-        /* Enqueue alias target */
-        if (rt->alias_of && qtail < VISIT_CAP) {
-            queue[qtail++] = rt->alias_of;
-        }
-        /* Enqueue super-chain */
-        if (rt->embedded_types) {
-            for (int i = 0; rt->embedded_types[i] && qtail < VISIT_CAP; i++) {
-                queue[qtail++] = rt->embedded_types[i];
+static const CBMType *kt_lookup_property_depth(KotlinLSPContext *ctx, const char *class_qn,
+                                               const char *prop_name, const char **visited,
+                                               int *visited_count, int visited_cap, int depth) {
+    if (!kt_lookup_enter(ctx, class_qn, visited, visited_count, visited_cap, depth,
+                         "kotlin_lsp_property_lookup_depth")) {
+        return cbm_type_unknown();
+    }
+    const CBMRegisteredType *type = cbm_registry_lookup_type(ctx->registry, class_qn);
+    if (!type) {
+        return cbm_type_unknown();
+    }
+    if (type->field_names && type->field_types) {
+        for (int i = 0; type->field_names[i]; i++) {
+            if (strcmp(type->field_names[i], prop_name) == 0) {
+                return type->field_types[i];
             }
         }
     }
-    return NULL;
+    if (type->alias_of) {
+        const CBMType *found = kt_lookup_property_depth(ctx, type->alias_of, prop_name, visited,
+                                                        visited_count, visited_cap, depth + 1);
+        if (!cbm_type_is_unknown(found) || cbm_arena_failed(ctx->arena)) {
+            return found;
+        }
+    }
+    if (type->embedded_types) {
+        for (int i = 0; type->embedded_types[i]; i++) {
+            const CBMType *found =
+                kt_lookup_property_depth(ctx, type->embedded_types[i], prop_name, visited,
+                                         visited_count, visited_cap, depth + 1);
+            if (!cbm_type_is_unknown(found) || cbm_arena_failed(ctx->arena)) {
+                return found;
+            }
+        }
+    }
+    return cbm_type_unknown();
 }
 
 const CBMType *kotlin_lookup_property_type(KotlinLSPContext *ctx, const char *class_qn,
@@ -900,26 +994,18 @@ const CBMType *kotlin_lookup_property_type(KotlinLSPContext *ctx, const char *cl
     if (!ctx || !class_qn || !prop_name || !ctx->registry) {
         return cbm_type_unknown();
     }
-    const CBMRegisteredType *rt = cbm_registry_lookup_type(ctx->registry, class_qn);
-    if (!rt) {
+    int cap = kt_lookup_visited_capacity(ctx);
+    if (cap <= 0) {
+        cbm_arena_mark_failed(ctx->arena, "CBM_LSP_ANALYSIS_LIMIT_EXCEEDED",
+                              "kotlin_lsp_property_lookup_cardinality", SIZE_MAX);
         return cbm_type_unknown();
     }
-    if (rt->field_names && rt->field_types) {
-        for (int i = 0; rt->field_names[i]; i++) {
-            if (strcmp(rt->field_names[i], prop_name) == 0) {
-                return rt->field_types[i];
-            }
-        }
-    }
-    if (rt->embedded_types) {
-        for (int i = 0; rt->embedded_types[i]; i++) {
-            const CBMType *t = kotlin_lookup_property_type(ctx, rt->embedded_types[i], prop_name);
-            if (!cbm_type_is_unknown(t)) {
-                return t;
-            }
-        }
-    }
-    return cbm_type_unknown();
+    const char **visited =
+        (const char **)cbm_arena_alloc(ctx->arena, (size_t)cap * sizeof(*visited));
+    int visited_count = 0;
+    return visited
+               ? kt_lookup_property_depth(ctx, class_qn, prop_name, visited, &visited_count, cap, 0)
+               : cbm_type_unknown();
 }
 
 /* ── package and import parsing ───────────────────────────────────── */
@@ -1000,16 +1086,12 @@ static void kt_parse_import_directive(KotlinLSPContext *ctx, TSNode imp) {
             while (*p == ' ' || *p == '\t') {
                 p++;
             }
-            char *al = (char *)cbm_arena_alloc(ctx->arena, 128);
-            if (al) {
-                int ai = 0;
-                while (*p && (isalnum((unsigned char)*p) || *p == '_') && ai < 127) {
-                    al[ai++] = *p++;
-                }
-                al[ai] = '\0';
-                if (ai > 0) {
-                    alias = al;
-                }
+            const char *alias_start = p;
+            while (*p && (isalnum((unsigned char)*p) || *p == '_')) {
+                p++;
+            }
+            if (p > alias_start) {
+                alias = cbm_arena_strndup(ctx->arena, alias_start, (size_t)(p - alias_start));
             }
         }
     }
@@ -1066,9 +1148,9 @@ static void kt_collect_top_level_decls(KotlinLSPContext *ctx, TSNode root) {
             CBMRegisteredType rt = {0};
             rt.qualified_name = kt_join_dot(ctx->arena, ctx->package_qn, n);
             rt.short_name = n;
-            /* Capture the underlying type and stamp alias_of so that
-             * cbm_registry_resolve_alias / lookup_method_aliased follow
-             * the chain to e.g. kotlin.Int's methods. */
+            /* Capture the underlying type and stamp alias_of so guarded
+             * per-language alias/method lookup follows the chain to, for
+             * example, kotlin.Int's methods. */
             TSNode rhs = kt_field_named(c, "type");
             if (ts_node_is_null(rhs)) {
                 /* Find first type-shaped named child after the name */
@@ -1141,18 +1223,19 @@ static void kt_process_class_decl(KotlinLSPContext *ctx, TSNode node) {
     TSNode delegation = kt_child_kind(node, "delegation_specifiers");
     {
         TSNode dcontainer = ts_node_is_null(delegation) ? node : delegation;
-        const char *parents[16];
-        int parent_count = 0;
+        const char **parents = NULL;
+        size_t parent_count = 0;
+        size_t parent_capacity = 0;
         uint32_t dnc = ts_node_named_child_count(dcontainer);
-        for (uint32_t di = 0; di < dnc && parent_count < 15; di++) {
+        for (uint32_t di = 0; di < dnc; di++) {
             TSNode dc = ts_node_named_child(dcontainer, di);
             if (kt_node_is(dc, "delegation_specifier")) {
                 /* Find user_type or constructor_invocation */
-                TSNode ut = kt_find_descendant_kind(dc, "user_type", 4);
+                TSNode ut = kt_find_descendant_kind(ctx, dc, "user_type", 0);
                 if (ts_node_is_null(ut)) {
-                    ut = kt_find_descendant_kind(dc, "constructor_invocation", 4);
+                    ut = kt_find_descendant_kind(ctx, dc, "constructor_invocation", 0);
                     if (!ts_node_is_null(ut)) {
-                        ut = kt_find_descendant_kind(ut, "user_type", 3);
+                        ut = kt_find_descendant_kind(ctx, ut, "user_type", 0);
                     }
                 }
                 if (!ts_node_is_null(ut)) {
@@ -1165,6 +1248,12 @@ static void kt_process_class_decl(KotlinLSPContext *ctx, TSNode node) {
                         }
                         const char *resolved = kotlin_resolve_class_name(ctx, name_text);
                         if (resolved) {
+                            if (!cbm_lsp_semantic_array_reserve(ctx->arena, (void **)&parents,
+                                                                parent_count, &parent_capacity,
+                                                                sizeof(*parents), parent_count + 2,
+                                                                "kotlin class parent types")) {
+                                return;
+                            }
                             parents[parent_count++] = resolved;
                         }
                     }
@@ -1172,15 +1261,8 @@ static void kt_process_class_decl(KotlinLSPContext *ctx, TSNode node) {
             }
         }
         if (parent_count > 0) {
-            const char **embedded = (const char **)cbm_arena_alloc(
-                ctx->arena, sizeof(const char *) * (size_t)(parent_count + 1));
-            if (embedded) {
-                for (int p = 0; p < parent_count; p++) {
-                    embedded[p] = parents[p];
-                }
-                embedded[parent_count] = NULL;
-                rt.embedded_types = embedded;
-            }
+            parents[parent_count] = NULL;
+            rt.embedded_types = parents;
         }
     }
 
@@ -1229,20 +1311,22 @@ static void kt_process_class_decl(KotlinLSPContext *ctx, TSNode node) {
      * constructor val/var parameters. Source 2: class-body val/var
      * `property_declaration` nodes (e.g. `private val data = ...`). Both
      * become accessible via `name`-based scope lookup inside any method. */
-    const char *fnames[64];
-    const CBMType *ftypes[64];
-    int field_count = 0;
+    const char **fnames = NULL;
+    const CBMType **ftypes = NULL;
+    size_t field_count = 0;
+    size_t field_name_capacity = 0;
+    size_t field_type_capacity = 0;
 
     TSNode pc = kt_child_kind(node, "primary_constructor");
     if (!ts_node_is_null(pc)) {
         /* Older grammars wrap params in a `class_parameters` node; newer
          * tree-sitter-kotlin places `class_parameter` directly under the
          * primary_constructor. */
-        TSNode params = kt_find_descendant_kind(pc, "class_parameters", 3);
+        TSNode params = kt_find_descendant_kind(ctx, pc, "class_parameters", 0);
         TSNode pcontainer = ts_node_is_null(params) ? pc : params;
         {
             uint32_t pnc = ts_node_named_child_count(pcontainer);
-            for (uint32_t pi = 0; pi < pnc && field_count < 63; pi++) {
+            for (uint32_t pi = 0; pi < pnc; pi++) {
                 TSNode p = ts_node_named_child(pcontainer, pi);
                 if (!kt_node_is(p, "class_parameter")) {
                     continue;
@@ -1276,6 +1360,14 @@ static void kt_process_class_decl(KotlinLSPContext *ctx, TSNode node) {
                 const CBMType *ft = ts_node_is_null(type_node)
                                         ? cbm_type_unknown()
                                         : kotlin_parse_type_node(ctx, type_node);
+                if (!cbm_lsp_semantic_array_reserve(ctx->arena, (void **)&fnames, field_count,
+                                                    &field_name_capacity, sizeof(*fnames),
+                                                    field_count + 2, "kotlin class field names") ||
+                    !cbm_lsp_semantic_array_reserve(ctx->arena, (void **)&ftypes, field_count,
+                                                    &field_type_capacity, sizeof(*ftypes),
+                                                    field_count + 2, "kotlin class field types")) {
+                    return;
+                }
                 fnames[field_count] = fname;
                 ftypes[field_count] = ft;
                 field_count++;
@@ -1287,7 +1379,7 @@ static void kt_process_class_decl(KotlinLSPContext *ctx, TSNode node) {
     TSNode body_for_props = kt_child_kind(node, "class_body");
     if (!ts_node_is_null(body_for_props)) {
         uint32_t bnc = ts_node_named_child_count(body_for_props);
-        for (uint32_t i = 0; i < bnc && field_count < 63; i++) {
+        for (uint32_t i = 0; i < bnc; i++) {
             TSNode m = ts_node_named_child(body_for_props, i);
             if (!kt_node_is(m, "property_declaration")) {
                 continue;
@@ -1333,6 +1425,14 @@ static void kt_process_class_decl(KotlinLSPContext *ctx, TSNode node) {
                     }
                 }
             }
+            if (!cbm_lsp_semantic_array_reserve(ctx->arena, (void **)&fnames, field_count,
+                                                &field_name_capacity, sizeof(*fnames),
+                                                field_count + 2, "kotlin class field names") ||
+                !cbm_lsp_semantic_array_reserve(ctx->arena, (void **)&ftypes, field_count,
+                                                &field_type_capacity, sizeof(*ftypes),
+                                                field_count + 2, "kotlin class field types")) {
+                return;
+            }
             fnames[field_count] = pname;
             ftypes[field_count] = pt;
             field_count++;
@@ -1340,20 +1440,10 @@ static void kt_process_class_decl(KotlinLSPContext *ctx, TSNode node) {
     }
 
     if (field_count > 0) {
-        const char **fn = (const char **)cbm_arena_alloc(ctx->arena, sizeof(const char *) *
-                                                                         (size_t)(field_count + 1));
-        const CBMType **ft = (const CBMType **)cbm_arena_alloc(
-            ctx->arena, sizeof(const CBMType *) * (size_t)(field_count + 1));
-        if (fn && ft) {
-            for (int i = 0; i < field_count; i++) {
-                fn[i] = fnames[i];
-                ft[i] = ftypes[i];
-            }
-            fn[field_count] = NULL;
-            ft[field_count] = NULL;
-            rt.field_names = fn;
-            rt.field_types = ft;
-        }
+        fnames[field_count] = NULL;
+        ftypes[field_count] = NULL;
+        rt.field_names = fnames;
+        rt.field_types = ftypes;
     }
 
     cbm_registry_add_type((CBMTypeRegistry *)ctx->registry, rt);
@@ -1404,15 +1494,16 @@ static void kt_process_object_decl(KotlinLSPContext *ctx, TSNode node, bool is_c
     TSNode delegation = kt_child_kind(node, "delegation_specifiers");
     {
         TSNode dcontainer = ts_node_is_null(delegation) ? node : delegation;
-        const char *parents[16];
-        int parent_count = 0;
+        const char **parents = NULL;
+        size_t parent_count = 0;
+        size_t parent_capacity = 0;
         uint32_t dnc = ts_node_named_child_count(dcontainer);
-        for (uint32_t di = 0; di < dnc && parent_count < 15; di++) {
+        for (uint32_t di = 0; di < dnc; di++) {
             TSNode dc = ts_node_named_child(dcontainer, di);
             if (!kt_node_is(dc, "delegation_specifier")) {
                 continue;
             }
-            TSNode ut = kt_find_descendant_kind(dc, "user_type", 4);
+            TSNode ut = kt_find_descendant_kind(ctx, dc, "user_type", 0);
             if (!ts_node_is_null(ut)) {
                 char *t = kt_node_text(ctx, ut);
                 if (t) {
@@ -1422,21 +1513,19 @@ static void kt_process_object_decl(KotlinLSPContext *ctx, TSNode node, bool is_c
                     }
                     const char *resolved = kotlin_resolve_class_name(ctx, t);
                     if (resolved) {
+                        if (!cbm_lsp_semantic_array_reserve(
+                                ctx->arena, (void **)&parents, parent_count, &parent_capacity,
+                                sizeof(*parents), parent_count + 2, "kotlin object parent types")) {
+                            return;
+                        }
                         parents[parent_count++] = resolved;
                     }
                 }
             }
         }
         if (parent_count > 0) {
-            const char **embedded = (const char **)cbm_arena_alloc(
-                ctx->arena, sizeof(const char *) * (size_t)(parent_count + 1));
-            if (embedded) {
-                for (int p = 0; p < parent_count; p++) {
-                    embedded[p] = parents[p];
-                }
-                embedded[parent_count] = NULL;
-                rt.embedded_types = embedded;
-            }
+            parents[parent_count] = NULL;
+            rt.embedded_types = parents;
         }
     }
 
@@ -1516,7 +1605,7 @@ static void kt_register_class_members(KotlinLSPContext *ctx, const char *class_q
                         }
                         TSNode ft = kt_node_is(tn, "function_type")
                                         ? tn
-                                        : kt_find_descendant_kind(tn, "function_type", 3);
+                                        : kt_find_descendant_kind(ctx, tn, "function_type", 0);
                         if (ts_node_is_null(ft)) {
                             continue;
                         }
@@ -1828,7 +1917,9 @@ const CBMType *kotlin_eval_expr_type(KotlinLSPContext *ctx, TSNode node) {
     if (ts_node_is_null(node) || !ctx) {
         return cbm_type_unknown();
     }
-    if (ctx->eval_depth >= KT_EVAL_MAX_DEPTH) {
+    if (ctx->eval_depth >= ctx->eval_depth_limit) {
+        cbm_arena_mark_failed(ctx->arena, "CBM_LSP_ANALYSIS_LIMIT_EXCEEDED",
+                              "kotlin_lsp_expression_depth", (size_t)ctx->eval_depth_limit);
         return cbm_type_unknown();
     }
     ctx->eval_depth++;
@@ -2192,7 +2283,7 @@ const CBMType *kotlin_eval_expr_type(KotlinLSPContext *ctx, TSNode node) {
         /* Anonymous object — closest thing is the inferred parent type */
         TSNode delegation = kt_child_kind(node, "delegation_specifiers");
         if (!ts_node_is_null(delegation)) {
-            TSNode ut = kt_find_descendant_kind(delegation, "user_type", 5);
+            TSNode ut = kt_find_descendant_kind(ctx, delegation, "user_type", 0);
             if (!ts_node_is_null(ut)) {
                 result = kt_eval_user_type(ctx, ut);
                 goto out;
@@ -2437,7 +2528,10 @@ static const CBMType *kt_eval_navigation_expression_type(KotlinLSPContext *ctx, 
         return cbm_type_unknown();
     }
 
-    const CBMType *recv_type = kotlin_eval_expr_type(ctx, receiver_node);
+    const CBMType *recv_type = kt_try_smart_cast(ctx, node);
+    if (!recv_type) {
+        recv_type = kotlin_eval_expr_type(ctx, receiver_node);
+    }
     recv_type = kt_unwrap_nullable(recv_type);
     const char *recv_qn = kt_type_qn_of(recv_type);
 
@@ -2459,8 +2553,7 @@ static const CBMType *kt_eval_navigation_expression_type(KotlinLSPContext *ctx, 
             if (is_member) {
                 /* A member call on an `object`/`companion object` singleton is a
                  * static dispatch; on a regular class instance it is a method. */
-                const CBMRegisteredType *recv_rt =
-                    cbm_registry_lookup_type(ctx->registry, recv_qn);
+                const CBMRegisteredType *recv_rt = cbm_registry_lookup_type(ctx->registry, recv_qn);
                 strat = (recv_rt && recv_rt->is_object) ? "lsp_kt_static" : "lsp_kt_method";
             }
             /* A call through the lambda implicit parameter `it` (e.g. inside
@@ -2611,8 +2704,7 @@ static void kt_bind_property_to_scope(KotlinLSPContext *ctx, TSNode prop) {
                     continue;
                 }
                 if (iqn) {
-                    char comp[16];
-                    snprintf(comp, sizeof(comp), "component%u", i + 1);
+                    const char *comp = cbm_arena_sprintf(ctx->arena, "component%u", i + 1);
                     const CBMRegisteredFunc *rf = kotlin_lookup_method(ctx, iqn, comp);
                     if (rf && rf->qualified_name) {
                         kt_emit_resolved(ctx, rf->qualified_name, "lsp_kt_destructure",
@@ -2712,41 +2804,285 @@ static void kt_bind_property_to_scope(KotlinLSPContext *ctx, TSNode prop) {
     cbm_scope_bind(ctx->current_scope, cbm_arena_strdup(ctx->arena, name), t);
 }
 
-/* Smart-cast inside `if (x is Foo)`. Detects pattern in stmt and binds
- * narrowed type into a child scope on the then-branch. */
-static void kt_apply_smart_cast(KotlinLSPContext *ctx, TSNode condition_expr, bool then_branch) {
-    if (ts_node_is_null(condition_expr) || !then_branch) {
-        return;
+static void kt_smart_cast_fail(KotlinLSPContext *ctx, const char *operation) {
+    cbm_arena_mark_failed(ctx->arena, "CBM_KOTLIN_SMART_CAST_UNREPRESENTABLE", operation, 0);
+}
+
+static bool kt_same_narrow_type(const CBMType *left, const CBMType *right) {
+    if (left == right) {
+        return true;
     }
-    /* is_expression (older) or check_expression (newer grammar): <expr> 'is'
-     * <type>. Only `is`/`!is` narrows the type — skip `in` membership. */
-    bool is_check = kt_node_is(condition_expr, "is_expression");
-    if (!is_check && kt_node_is(condition_expr, "check_expression")) {
-        char *ctext = kt_node_text(ctx, condition_expr);
-        if (ctext &&
-            (cbm_memmem(ctext, strlen(ctext), " is ", 4) != NULL || strstr(ctext, "!is") != NULL)) {
-            is_check = true;
+    const char *left_qn = kt_type_qn_of(left);
+    const char *right_qn = kt_type_qn_of(right);
+    return left_qn && right_qn && strcmp(left_qn, right_qn) == 0;
+}
+
+static CBMVarBinding *kt_scope_local_binding(CBMScope *scope, const char *name) {
+    if (!scope || !name) {
+        return NULL;
+    }
+    for (CBMScopeChunk *chunk = scope->chunks; chunk; chunk = chunk->next) {
+        for (int i = 0; i < chunk->used; i++) {
+            if (chunk->bindings[i].name && strcmp(chunk->bindings[i].name, name) == 0) {
+                return &chunk->bindings[i];
+            }
         }
     }
-    if (!is_check) {
-        return;
+    return NULL;
+}
+
+static CBMVarBinding *kt_scope_nearest_binding(CBMScope *scope, const char *name,
+                                               CBMScope **owner) {
+    for (CBMScope *candidate = scope; candidate; candidate = candidate->parent) {
+        CBMVarBinding *binding = kt_scope_local_binding(candidate, name);
+        if (binding) {
+            if (owner) {
+                *owner = candidate;
+            }
+            return binding;
+        }
     }
-    TSNode lhs = ts_node_named_child(condition_expr, 0);
-    TSNode rhs = ts_node_named_child(condition_expr, ts_node_named_child_count(condition_expr) - 1);
-    if (ts_node_is_null(lhs) || ts_node_is_null(rhs)) {
-        return;
+    if (owner) {
+        *owner = NULL;
     }
+    return NULL;
+}
+
+static bool kt_bind_smart_cast(KotlinLSPContext *ctx, const char *name, const CBMType *type) {
+    if (!ctx || !name || !type || cbm_type_is_unknown(type) || !ctx->current_scope) {
+        kt_smart_cast_fail(ctx, "kotlin_smart_cast_bind_missing_state");
+        return false;
+    }
+    CBMVarBinding *prior_binding = kt_scope_nearest_binding(ctx->current_scope, name, NULL);
+    if (!prior_binding || cbm_type_is_unknown(prior_binding->type)) {
+        kt_smart_cast_fail(ctx, "kotlin_smart_cast_unbound_sink");
+        return false;
+    }
+    const CBMType *prior = prior_binding->type;
+    CBMVarBinding *symbol_binding = prior_binding;
+    for (CBMKotlinSmartCast *active = ctx->smart_casts; active; active = active->previous) {
+        if (strcmp(active->name, name) != 0) {
+            continue;
+        }
+        if (prior_binding != active->cast_binding || prior_binding->type != active->type) {
+            continue;
+        }
+        symbol_binding = active->symbol_binding;
+        if (kt_same_narrow_type(active->type, type)) {
+            return true;
+        }
+        kt_smart_cast_fail(ctx, "kotlin_smart_cast_intersection_type");
+        return false;
+    }
+
+    CBMKotlinSmartCast *cast = (CBMKotlinSmartCast *)cbm_arena_alloc(ctx->arena, sizeof(*cast));
+    const char *owned_name = cbm_arena_strdup(ctx->arena, name);
+    if (!cast || !owned_name) {
+        return false;
+    }
+    cast->name = owned_name;
+    cast->type = type;
+    cast->prior_type = prior;
+    cast->scope = ctx->current_scope;
+    cast->symbol_binding = symbol_binding;
+    cast->cast_binding = NULL;
+    cast->previous = ctx->smart_casts;
+    cbm_scope_bind(ctx->current_scope, owned_name, type);
+    cast->cast_binding = kt_scope_local_binding(ctx->current_scope, name);
+    if (cbm_arena_failed(ctx->arena) || !cast->cast_binding || cast->cast_binding->type != type) {
+        kt_smart_cast_fail(ctx, "kotlin_smart_cast_bind_readback");
+        return false;
+    }
+    ctx->smart_casts = cast;
+    return true;
+}
+
+/* Returns 1 for `is`, -1 for `!is`, and 0 when the node is not a type test.
+ * The current grammar represents `!is` as two direct operator tokens. */
+static int kt_type_test_operator(TSNode node) {
+    bool negated = false;
+    uint32_t child_count = ts_node_child_count(node);
+    for (uint32_t i = 0; i < child_count; i++) {
+        const char *kind = ts_node_type(ts_node_child(node, i));
+        if (strcmp(kind, "!") == 0) {
+            negated = true;
+        } else if (strcmp(kind, "is") == 0) {
+            return negated ? -1 : 1;
+        }
+    }
+    return 0;
+}
+
+static TSNode kt_unwrap_flow_condition(TSNode condition) {
+    while (!ts_node_is_null(condition) &&
+           (kt_node_is(condition, "expression") || kt_node_is(condition, "primary_expression") ||
+            kt_node_is(condition, "parenthesized_expression"))) {
+        if (ts_node_named_child_count(condition) != 1) {
+            break;
+        }
+        condition = ts_node_named_child(condition, 0);
+    }
+    return condition;
+}
+
+static bool kt_prefix_is_logical_not(TSNode node) {
+    if (!kt_node_is(node, "prefix_expression")) {
+        return false;
+    }
+    uint32_t child_count = ts_node_child_count(node);
+    for (uint32_t i = 0; i < child_count; i++) {
+        if (strcmp(ts_node_type(ts_node_child(node, i)), "!") == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool kt_apply_type_test_smart_cast(KotlinLSPContext *ctx, TSNode condition, bool truth) {
+    int op = kt_type_test_operator(condition);
+    if (op == 0) {
+        if (kt_node_is(condition, "is_expression") || kt_node_is(condition, "type_test")) {
+            kt_smart_cast_fail(ctx, "kotlin_smart_cast_operator_shape");
+            return false;
+        }
+        return true;
+    }
+    bool proves_positive_type = (op > 0 && truth) || (op < 0 && !truth);
+    if (!proves_positive_type) {
+        return true;
+    }
+
+    uint32_t named_count = ts_node_named_child_count(condition);
+    if (named_count < 2) {
+        kt_smart_cast_fail(ctx, "kotlin_smart_cast_type_test_shape");
+        return false;
+    }
+    TSNode lhs = ts_node_named_child(condition, 0);
+    TSNode rhs = ts_node_named_child(condition, named_count - 1);
     if (!(kt_node_is(lhs, "identifier") || kt_node_is(lhs, "simple_identifier"))) {
-        return;
+        /* A transient expression such as `factory() is T` has no reusable
+         * stable sink, so no flow binding is required for its branch. */
+        return true;
     }
     char *name = kt_node_text(ctx, lhs);
-    if (!name) {
+    const CBMType *type = kotlin_parse_type_node(ctx, rhs);
+    if (!name || cbm_type_is_unknown(type)) {
+        kt_smart_cast_fail(ctx, "kotlin_smart_cast_type_resolution");
+        return false;
+    }
+    return kt_bind_smart_cast(ctx, name, type);
+}
+
+static bool kt_apply_condition_smart_casts(KotlinLSPContext *ctx, TSNode condition, bool truth,
+                                           int depth) {
+    if (ts_node_is_null(condition) || cbm_arena_failed(ctx->arena)) {
+        return !cbm_arena_failed(ctx->arena);
+    }
+    if (depth >= ctx->lookup_depth_limit) {
+        cbm_arena_mark_failed(ctx->arena, "CBM_LSP_ANALYSIS_LIMIT_EXCEEDED",
+                              "kotlin_smart_cast_condition_depth", (size_t)ctx->lookup_depth_limit);
+        return false;
+    }
+    condition = kt_unwrap_flow_condition(condition);
+    const char *kind = ts_node_type(condition);
+
+    if (strcmp(kind, "conjunction_expression") == 0 ||
+        strcmp(kind, "disjunction_expression") == 0) {
+        bool both_known = (strcmp(kind, "conjunction_expression") == 0 && truth) ||
+                          (strcmp(kind, "disjunction_expression") == 0 && !truth);
+        if (!both_known) {
+            return true;
+        }
+        uint32_t named_count = ts_node_named_child_count(condition);
+        if (named_count < 2) {
+            kt_smart_cast_fail(ctx, "kotlin_smart_cast_boolean_shape");
+            return false;
+        }
+        TSNode left = ts_node_named_child(condition, 0);
+        TSNode right = ts_node_named_child(condition, named_count - 1);
+        return kt_apply_condition_smart_casts(ctx, left, truth, depth + 1) &&
+               kt_apply_condition_smart_casts(ctx, right, truth, depth + 1);
+    }
+    if (kt_prefix_is_logical_not(condition)) {
+        uint32_t named_count = ts_node_named_child_count(condition);
+        if (named_count == 0) {
+            kt_smart_cast_fail(ctx, "kotlin_smart_cast_negation_shape");
+            return false;
+        }
+        return kt_apply_condition_smart_casts(ctx, ts_node_named_child(condition, named_count - 1),
+                                              !truth, depth + 1);
+    }
+    if (strcmp(kind, "check_expression") == 0 || strcmp(kind, "is_expression") == 0) {
+        return kt_apply_type_test_smart_cast(ctx, condition, truth);
+    }
+    return true;
+}
+
+/* Resolve short-circuit operands under the facts that must hold for the RHS
+ * to execute: left=true for `&&`, left=false for `||`. */
+static void kt_resolve_condition_calls(KotlinLSPContext *ctx, TSNode condition, int depth) {
+    if (ts_node_is_null(condition) || cbm_arena_failed(ctx->arena)) {
         return;
     }
-    const CBMType *t = kotlin_parse_type_node(ctx, rhs);
-    if (!cbm_type_is_unknown(t)) {
-        cbm_scope_bind(ctx->current_scope, cbm_arena_strdup(ctx->arena, name), t);
+    if (depth >= ctx->lookup_depth_limit) {
+        cbm_arena_mark_failed(ctx->arena, "CBM_LSP_ANALYSIS_LIMIT_EXCEEDED",
+                              "kotlin_condition_resolution_depth", (size_t)ctx->lookup_depth_limit);
+        return;
     }
+    condition = kt_unwrap_flow_condition(condition);
+    const char *kind = ts_node_type(condition);
+    if (strcmp(kind, "conjunction_expression") != 0 &&
+        strcmp(kind, "disjunction_expression") != 0) {
+        kt_resolve_calls_in_node(ctx, condition);
+        return;
+    }
+    uint32_t named_count = ts_node_named_child_count(condition);
+    if (named_count < 2) {
+        kt_smart_cast_fail(ctx, "kotlin_condition_boolean_shape");
+        return;
+    }
+    TSNode left = ts_node_named_child(condition, 0);
+    TSNode right = ts_node_named_child(condition, named_count - 1);
+    kt_resolve_condition_calls(ctx, left, depth + 1);
+
+    CBMScope *parent_scope = ctx->current_scope;
+    CBMKotlinSmartCast *saved_casts = ctx->smart_casts;
+    CBMScope *right_scope = cbm_scope_push(ctx->arena, parent_scope);
+    if (right_scope == parent_scope) {
+        return;
+    }
+    ctx->current_scope = right_scope;
+    bool left_truth = strcmp(kind, "conjunction_expression") == 0;
+    if (kt_apply_condition_smart_casts(ctx, left, left_truth, depth + 1)) {
+        kt_resolve_condition_calls(ctx, right, depth + 1);
+    }
+    ctx->smart_casts = saved_casts;
+    ctx->current_scope = parent_scope;
+}
+
+static void kt_process_flow_branch(KotlinLSPContext *ctx, TSNode body, TSNode condition,
+                                   bool truth) {
+    if (ts_node_is_null(body) || cbm_arena_failed(ctx->arena)) {
+        return;
+    }
+    CBMScope *parent_scope = ctx->current_scope;
+    CBMKotlinSmartCast *saved_casts = ctx->smart_casts;
+    CBMScope *branch_scope = cbm_scope_push(ctx->arena, parent_scope);
+    if (branch_scope == parent_scope) {
+        return;
+    }
+    ctx->current_scope = branch_scope;
+    if (kt_apply_condition_smart_casts(ctx, condition, truth, 0)) {
+        if (kt_node_is(body, "block") || kt_node_is(body, "control_structure_body") ||
+            kt_node_is(body, "statements")) {
+            kt_process_block_stmts(ctx, body);
+        } else {
+            kt_resolve_calls_in_node(ctx, body);
+            kotlin_eval_expr_type(ctx, body);
+        }
+    }
+    ctx->smart_casts = saved_casts;
+    ctx->current_scope = parent_scope;
 }
 
 static void kt_process_if_expression(KotlinLSPContext *ctx, TSNode node) {
@@ -2754,101 +3090,142 @@ static void kt_process_if_expression(KotlinLSPContext *ctx, TSNode node) {
     if (ts_node_is_null(cond)) {
         cond = kt_child_kind(node, "condition");
     }
-    if (ts_node_is_null(cond)) {
-        /* parenthesized condition fallback */
+    if (ts_node_is_null(cond) && ts_node_named_child_count(node) > 0) {
         cond = ts_node_named_child(node, 0);
     }
 
-    TSNode then_b = kt_field_named(node, "then");
-    if (ts_node_is_null(then_b)) {
-        /* Find the first non-condition block/expression */
-        uint32_t nc = ts_node_named_child_count(node);
-        for (uint32_t i = 1; i < nc; i++) {
-            TSNode c = ts_node_named_child(node, i);
-            const char *k = ts_node_type(c);
-            if (strcmp(k, "block") == 0 || strcmp(k, "control_structure_body") == 0 ||
-                strstr(k, "expression")) {
-                then_b = c;
-                break;
-            }
-        }
+    TSNode consequence = kt_field_named(node, "consequence");
+    if (ts_node_is_null(consequence)) {
+        consequence = kt_field_named(node, "then");
+    }
+    TSNode alternative = kt_field_named(node, "alternative");
+    if (ts_node_is_null(alternative)) {
+        alternative = kt_field_named(node, "else");
+    }
+    uint32_t named_count = ts_node_named_child_count(node);
+    if (ts_node_is_null(consequence) && named_count > 1) {
+        consequence = ts_node_named_child(node, 1);
+    }
+    if (ts_node_is_null(alternative) && named_count > 2) {
+        alternative = ts_node_named_child(node, 2);
     }
 
-    if (!ts_node_is_null(then_b)) {
-        ctx->current_scope = cbm_scope_push(ctx->arena, ctx->current_scope);
-        if (!ts_node_is_null(cond)) {
-            kt_apply_smart_cast(ctx, cond, true);
-        }
-        if (kt_node_is(then_b, "block") || kt_node_is(then_b, "control_structure_body")) {
-            kt_process_block_stmts(ctx, then_b);
-        } else {
-            kt_resolve_calls_in_node(ctx, then_b);
-            kotlin_eval_expr_type(ctx, then_b);
-        }
-        ctx->current_scope = cbm_scope_pop(ctx->current_scope);
+    kt_resolve_condition_calls(ctx, cond, 0);
+    kt_process_flow_branch(ctx, consequence, cond, true);
+    kt_process_flow_branch(ctx, alternative, cond, false);
+}
+
+static bool kt_apply_when_type_test(KotlinLSPContext *ctx, TSNode when_condition,
+                                    const char *subject_name) {
+    if (!subject_name) {
+        return true;
     }
-    /* Resolve calls inside the condition itself */
-    if (!ts_node_is_null(cond)) {
-        kt_resolve_calls_in_node(ctx, cond);
+    TSNode type_test = kt_find_descendant_kind(ctx, when_condition, "type_test", 0);
+    if (ts_node_is_null(type_test)) {
+        return true;
     }
+    int op = kt_type_test_operator(type_test);
+    if (op == 0) {
+        kt_smart_cast_fail(ctx, "kotlin_when_smart_cast_operator_shape");
+        return false;
+    }
+    if (op < 0) {
+        return true;
+    }
+    uint32_t named_count = ts_node_named_child_count(type_test);
+    if (named_count == 0) {
+        kt_smart_cast_fail(ctx, "kotlin_when_smart_cast_type_shape");
+        return false;
+    }
+    TSNode type_node = ts_node_named_child(type_test, named_count - 1);
+    const CBMType *type = kotlin_parse_type_node(ctx, type_node);
+    if (cbm_type_is_unknown(type)) {
+        kt_smart_cast_fail(ctx, "kotlin_when_smart_cast_type_resolution");
+        return false;
+    }
+    return kt_bind_smart_cast(ctx, subject_name, type);
 }
 
 static void kt_process_when_expression(KotlinLSPContext *ctx, TSNode node) {
-    /* when (subject) { entries } — bind subject type as `it`-like? Actually
-     * Kotlin's `when (x) { is Foo -> ... }` creates smart-cast on x. */
+    CBMScope *outer_scope = ctx->current_scope;
+    CBMScope *when_scope = cbm_scope_push(ctx->arena, outer_scope);
+    if (when_scope == outer_scope) {
+        return;
+    }
+    ctx->current_scope = when_scope;
+
     TSNode subject = kt_child_kind(node, "when_subject");
     char *subject_name = NULL;
-    const CBMType *subject_type = NULL;
     if (!ts_node_is_null(subject)) {
-        /* when_subject: '(' expression ')' or '(' val name = expr ')' */
-        TSNode inner = ts_node_named_child(subject, 0);
-        if (!ts_node_is_null(inner)) {
-            subject_type = kotlin_eval_expr_type(ctx, inner);
-            if (kt_node_is(inner, "identifier") || kt_node_is(inner, "simple_identifier")) {
-                subject_name = kt_node_text(ctx, inner);
-            }
+        uint32_t subject_count = ts_node_named_child_count(subject);
+        TSNode subject_expr;
+        memset(&subject_expr, 0, sizeof(subject_expr));
+        if (subject_count > 0) {
+            subject_expr = ts_node_named_child(subject, subject_count - 1);
         }
+        TSNode subject_decl = kt_child_kind(subject, "variable_declaration");
+        if (!ts_node_is_null(subject_decl)) {
+            TSNode id = kt_name_child(subject_decl);
+            if (ts_node_is_null(id)) {
+                id = kt_child_kind_named(subject_decl, "simple_identifier");
+            }
+            subject_name = kt_node_text(ctx, id);
+            const CBMType *subject_type = kotlin_eval_expr_type(ctx, subject_expr);
+            if (subject_name && !cbm_type_is_unknown(subject_type)) {
+                cbm_scope_bind(ctx->current_scope, cbm_arena_strdup(ctx->arena, subject_name),
+                               subject_type);
+            }
+        } else if (kt_node_is(subject_expr, "identifier") ||
+                   kt_node_is(subject_expr, "simple_identifier")) {
+            subject_name = kt_node_text(ctx, subject_expr);
+        }
+        kt_resolve_calls_in_node(ctx, subject_expr);
     }
-    uint32_t nc = ts_node_named_child_count(node);
-    for (uint32_t i = 0; i < nc; i++) {
-        TSNode c = ts_node_named_child(node, i);
-        if (!kt_node_is(c, "when_entry")) {
+
+    uint32_t child_count = ts_node_named_child_count(node);
+    for (uint32_t i = 0; i < child_count && !cbm_arena_failed(ctx->arena); i++) {
+        TSNode entry = ts_node_named_child(node, i);
+        if (!kt_node_is(entry, "when_entry")) {
             continue;
         }
-        ctx->current_scope = cbm_scope_push(ctx->arena, ctx->current_scope);
-        /* Look for `is Type` conditions */
-        uint32_t en = ts_node_named_child_count(c);
-        for (uint32_t e = 0; e < en; e++) {
-            TSNode ec = ts_node_named_child(c, e);
-            if (kt_node_is(ec, "_when_condition") || kt_node_is(ec, "when_condition") ||
-                kt_node_is(ec, "type_test")) {
-                /* Find a 'type' node and apply smart-cast on subject_name */
-                TSNode tt = kt_find_descendant_kind(ec, "type", 3);
-                if (ts_node_is_null(tt)) {
-                    tt = kt_find_descendant_kind(ec, "user_type", 3);
-                }
-                if (!ts_node_is_null(tt) && subject_name) {
-                    const CBMType *narrow = kotlin_parse_type_node(ctx, tt);
-                    if (!cbm_type_is_unknown(narrow)) {
-                        cbm_scope_bind(ctx->current_scope,
-                                       cbm_arena_strdup(ctx->arena, subject_name), narrow);
-                    }
-                }
+        CBMKotlinSmartCast *saved_casts = ctx->smart_casts;
+        CBMScope *entry_scope = cbm_scope_push(ctx->arena, when_scope);
+        if (entry_scope == when_scope) {
+            break;
+        }
+        ctx->current_scope = entry_scope;
+
+        uint32_t entry_count = ts_node_named_child_count(entry);
+        uint32_t condition_count = 0;
+        TSNode sole_condition;
+        memset(&sole_condition, 0, sizeof(sole_condition));
+        for (uint32_t e = 0; e < entry_count; e++) {
+            TSNode candidate = ts_node_named_child(entry, e);
+            if (kt_node_is(candidate, "when_condition") ||
+                kt_node_is(candidate, "_when_condition") || kt_node_is(candidate, "type_test")) {
+                condition_count++;
+                sole_condition = candidate;
+                kt_resolve_calls_in_node(ctx, candidate);
             }
         }
-        /* Process entry body */
-        if (en > 0) {
-            TSNode body = ts_node_named_child(c, en - 1);
-            if (kt_node_is(body, "block")) {
+        bool ready = true;
+        if (condition_count == 1) {
+            ready = kt_apply_when_type_test(ctx, sole_condition, subject_name);
+        }
+        if (ready && entry_count > 0) {
+            TSNode body = ts_node_named_child(entry, entry_count - 1);
+            if (kt_node_is(body, "block") || kt_node_is(body, "control_structure_body") ||
+                kt_node_is(body, "statements")) {
                 kt_process_block_stmts(ctx, body);
             } else {
                 kt_resolve_calls_in_node(ctx, body);
                 kotlin_eval_expr_type(ctx, body);
             }
         }
-        ctx->current_scope = cbm_scope_pop(ctx->current_scope);
+        ctx->smart_casts = saved_casts;
+        ctx->current_scope = when_scope;
     }
-    (void)subject_type;
+    ctx->current_scope = outer_scope;
 }
 
 static void kt_process_for_statement(KotlinLSPContext *ctx, TSNode node) {
@@ -3065,6 +3442,50 @@ static void kt_process_call_with_lambda(KotlinLSPContext *ctx, TSNode call_node)
     kt_process_lambda(ctx, lambda, recv_t);
 }
 
+static void kt_invalidate_assigned_smart_cast(KotlinLSPContext *ctx, TSNode assignment) {
+    if (!ctx->smart_casts || ts_node_named_child_count(assignment) == 0) {
+        return;
+    }
+    TSNode lhs = ts_node_named_child(assignment, 0);
+    while (!ts_node_is_null(lhs) && ts_node_named_child_count(lhs) == 1 &&
+           (kt_node_is(lhs, "directly_assignable_expression") ||
+            kt_node_is(lhs, "parenthesized_expression"))) {
+        lhs = ts_node_named_child(lhs, 0);
+    }
+    if (!(kt_node_is(lhs, "identifier") || kt_node_is(lhs, "simple_identifier"))) {
+        return;
+    }
+    char *name = kt_node_text(ctx, lhs);
+    CBMVarBinding *visible = kt_scope_nearest_binding(ctx->current_scope, name, NULL);
+    if (!name || !visible) {
+        return;
+    }
+
+    CBMVarBinding *symbol_binding = NULL;
+    for (CBMKotlinSmartCast *cast = ctx->smart_casts; cast; cast = cast->previous) {
+        if (strcmp(cast->name, name) == 0 && cast->cast_binding == visible &&
+            visible->type == cast->type) {
+            symbol_binding = cast->symbol_binding;
+            break;
+        }
+    }
+    if (!symbol_binding) {
+        return;
+    }
+
+    const CBMType *declared_type = symbol_binding->type;
+    for (CBMKotlinSmartCast *cast = ctx->smart_casts; cast; cast = cast->previous) {
+        if (cast->symbol_binding == symbol_binding) {
+            declared_type = cast->prior_type;
+        }
+    }
+    for (CBMKotlinSmartCast *cast = ctx->smart_casts; cast; cast = cast->previous) {
+        if (cast->symbol_binding == symbol_binding && cast->cast_binding) {
+            cast->cast_binding->type = declared_type;
+        }
+    }
+}
+
 static void kt_process_statement(KotlinLSPContext *ctx, TSNode stmt) {
     if (ts_node_is_null(stmt)) {
         return;
@@ -3073,7 +3494,7 @@ static void kt_process_statement(KotlinLSPContext *ctx, TSNode stmt) {
     /* Newer tree-sitter-kotlin wraps a body's statements in a `statements`
      * node (where older grammars used `block`/bare children). Unwrap either so
      * each real statement is bound + resolved in order. */
-    if (strcmp(kind, "statements") == 0 || strcmp(kind, "block") == 0) {
+    if (strcmp(kind, "statements") == 0) {
         kt_process_block_stmts(ctx, stmt);
         return;
     }
@@ -3179,6 +3600,7 @@ static void kt_process_statement(KotlinLSPContext *ctx, TSNode stmt) {
     }
     if (strcmp(kind, "assignment") == 0) {
         kt_resolve_calls_in_node(ctx, stmt);
+        kt_invalidate_assigned_smart_cast(ctx, stmt);
         return;
     }
     /* Fallthrough: treat as expression — eval to populate scope, recurse for calls */
@@ -3574,9 +3996,35 @@ void kotlin_lsp_process_file(KotlinLSPContext *ctx, TSNode root) {
 }
 
 static const CBMType *kt_try_smart_cast(KotlinLSPContext *ctx, TSNode call_or_nav) {
-    /* Currently a stub — smart-cast is applied during if/when traversal. */
-    (void)ctx;
-    (void)call_or_nav;
+    if (!ctx || !ctx->smart_casts || ts_node_is_null(call_or_nav)) {
+        return NULL;
+    }
+    TSNode navigation = call_or_nav;
+    if (kt_node_is(navigation, "call_expression")) {
+        if (ts_node_named_child_count(navigation) == 0) {
+            return NULL;
+        }
+        navigation = ts_node_named_child(navigation, 0);
+    }
+    if (!kt_node_is(navigation, "navigation_expression") ||
+        ts_node_named_child_count(navigation) == 0) {
+        return NULL;
+    }
+    TSNode receiver = ts_node_named_child(navigation, 0);
+    if (!(kt_node_is(receiver, "identifier") || kt_node_is(receiver, "simple_identifier"))) {
+        return NULL;
+    }
+    char *name = kt_node_text(ctx, receiver);
+    CBMVarBinding *visible = kt_scope_nearest_binding(ctx->current_scope, name, NULL);
+    if (!name || !visible) {
+        return NULL;
+    }
+    for (CBMKotlinSmartCast *cast = ctx->smart_casts; cast; cast = cast->previous) {
+        if (strcmp(cast->name, name) == 0 && cast->cast_binding == visible &&
+            visible->type == cast->type) {
+            return cast->type;
+        }
+    }
     return NULL;
 }
 
@@ -3584,6 +4032,54 @@ static const CBMType *kt_try_smart_cast(KotlinLSPContext *ctx, TSNode call_or_na
 
 /* Tree-sitter handle for re-parsing repaired sources. */
 extern const TSLanguage *tree_sitter_kotlin(void);
+
+typedef struct {
+    int offset;
+    const char *text;
+    int text_len;
+} kt_fix_t;
+
+typedef struct {
+    int start;
+    int end;
+} kt_cut_range_t;
+
+static int kt_compare_fix_offset(const void *left, const void *right) {
+    const kt_fix_t *a = (const kt_fix_t *)left;
+    const kt_fix_t *b = (const kt_fix_t *)right;
+    return (a->offset > b->offset) - (a->offset < b->offset);
+}
+
+static int kt_compare_cut_start(const void *left, const void *right) {
+    const kt_cut_range_t *a = (const kt_cut_range_t *)left;
+    const kt_cut_range_t *b = (const kt_cut_range_t *)right;
+    return (a->start > b->start) - (a->start < b->start);
+}
+
+static void *kt_grow_repair_array(CBMArena *arena, const void *old_items, int item_count,
+                                  int *capacity, size_t item_size, const char *operation) {
+    if (item_count < *capacity) {
+        return (void *)old_items;
+    }
+    if (*capacity > INT_MAX / 2) {
+        cbm_arena_mark_failed(arena, "CBM_LSP_ANALYSIS_LIMIT_EXCEEDED", operation, SIZE_MAX);
+        return NULL;
+    }
+    int next_capacity = *capacity == 0 ? 64 : *capacity * 2;
+    if ((size_t)next_capacity > SIZE_MAX / item_size) {
+        cbm_arena_mark_failed(arena, "CBM_LSP_ANALYSIS_LIMIT_EXCEEDED", operation, SIZE_MAX);
+        return NULL;
+    }
+    void *next = cbm_arena_alloc(arena, (size_t)next_capacity * item_size);
+    if (!next) {
+        return NULL;
+    }
+    if (old_items && item_count > 0) {
+        memcpy(next, old_items, (size_t)item_count * item_size);
+    }
+    *capacity = next_capacity;
+    return next;
+}
 
 /* Detect bodyless interface methods (`fun foo()` without `: ReturnType`
  * and without `{ … }`) inside `interface X { … }` bodies — the vendored
@@ -3618,16 +4114,9 @@ static char *kt_repair_bodyless_interface_methods(CBMArena *arena, const char *s
      * Each fix has an offset (insert BEFORE this src index) and an
      * insertion string. The insertion strings are static const so they
      * don't need to be arena-copied. */
-    enum {
-        MAX_FIXES = 64,
-    };
-    typedef struct {
-        int offset;
-        const char *text;
-        int text_len;
-    } kt_fix_t;
-    kt_fix_t fixes[MAX_FIXES];
+    kt_fix_t *fixes = NULL;
     int fix_count = 0;
+    int fix_capacity = 0;
     static const char insert_unit[] = ": Unit";
     static const int insert_unit_len = (int)(sizeof(insert_unit) - 1);
     static const char insert_parens[] = "()";
@@ -3635,10 +4124,11 @@ static char *kt_repair_bodyless_interface_methods(CBMArena *arena, const char *s
 
     const char *p = src;
     const char *end = src + src_len;
-    int iface_depth = 0;    /* nesting of `interface ... { ... }` blocks */
-    int brace_depth = 0;    /* total braces (so we can subtract on '}') */
-    int iface_brace_at[16]; /* brace_depth at which each interface opened */
+    int iface_depth = 0;        /* nesting of `interface ... { ... }` blocks */
+    int brace_depth = 0;        /* total braces (so we can subtract on '}') */
+    int *iface_brace_at = NULL; /* brace_depth at which each interface opened */
     int iface_stack_n = 0;
+    int iface_stack_capacity = 0;
 
     while (p < end) {
         char c = *p;
@@ -3688,9 +4178,14 @@ static char *kt_repair_bodyless_interface_methods(CBMArena *arena, const char *s
                 q++;
             }
             if (q < end && *q == '{') {
-                if (iface_stack_n < 16) {
-                    iface_brace_at[iface_stack_n++] = brace_depth;
+                int *grown = (int *)kt_grow_repair_array(
+                    arena, iface_brace_at, iface_stack_n, &iface_stack_capacity,
+                    sizeof(*iface_brace_at), "kotlin_lsp_interface_repair_stack");
+                if (!grown) {
+                    return NULL;
                 }
+                iface_brace_at = grown;
+                iface_brace_at[iface_stack_n++] = brace_depth;
                 iface_depth++;
                 brace_depth++;
                 p = q + 1;
@@ -3773,12 +4268,17 @@ static char *kt_repair_bodyless_interface_methods(CBMArena *arena, const char *s
                 continue;
             }
             /* Bodyless / no return type — insert `: Unit` after the ')'. */
-            if (fix_count < MAX_FIXES) {
-                fixes[fix_count].offset = paren_close + 1;
-                fixes[fix_count].text = insert_unit;
-                fixes[fix_count].text_len = insert_unit_len;
-                fix_count++;
+            kt_fix_t *grown =
+                (kt_fix_t *)kt_grow_repair_array(arena, fixes, fix_count, &fix_capacity,
+                                                 sizeof(*fixes), "kotlin_lsp_source_repair_fixes");
+            if (!grown) {
+                return NULL;
             }
+            fixes = grown;
+            fixes[fix_count].offset = paren_close + 1;
+            fixes[fix_count].text = insert_unit;
+            fixes[fix_count].text_len = insert_unit_len;
+            fix_count++;
             p = r;
             continue;
         }
@@ -3791,13 +4291,9 @@ static char *kt_repair_bodyless_interface_methods(CBMArena *arena, const char *s
      * `<Type>.` prefix preserves parseability while losing only the
      * receiver-binding hint (which we recover separately via
      * decorator_qns at registration time). */
-    typedef struct {
-        int start; /* inclusive */
-        int end;   /* exclusive */
-    } cut_range_t;
-    enum { MAX_CUTS = 64 };
-    cut_range_t cuts[MAX_CUTS];
+    kt_cut_range_t *cuts = NULL;
     int cut_count = 0;
+    int cut_capacity = 0;
     {
         const char *p2 = src;
         const char *end2 = src + src_len;
@@ -3862,11 +4358,16 @@ static char *kt_repair_bodyless_interface_methods(CBMArena *arena, const char *s
                 }
                 /* Cut range: from id_start to (p2+1), removing the
                  * "<Name>." prefix and leaving "()". */
-                if (cut_count < MAX_CUTS) {
-                    cuts[cut_count].start = (int)(id_start - src);
-                    cuts[cut_count].end = (int)(p2 + 1 - src);
-                    cut_count++;
+                kt_cut_range_t *grown = (kt_cut_range_t *)kt_grow_repair_array(
+                    arena, cuts, cut_count, &cut_capacity, sizeof(*cuts),
+                    "kotlin_lsp_source_repair_cuts");
+                if (!grown) {
+                    return NULL;
                 }
+                cuts = grown;
+                cuts[cut_count].start = (int)(id_start - src);
+                cuts[cut_count].end = (int)(p2 + 1 - src);
+                cut_count++;
                 p2 += 3;
                 continue;
             }
@@ -3971,12 +4472,17 @@ static char *kt_repair_bodyless_interface_methods(CBMArena *arena, const char *s
                     continue;
                 }
                 /* Insert `()` right before `{` (which is at position q). */
-                if (fix_count < MAX_FIXES) {
-                    fixes[fix_count].offset = (int)(q - src);
-                    fixes[fix_count].text = insert_parens;
-                    fixes[fix_count].text_len = insert_parens_len;
-                    fix_count++;
+                kt_fix_t *grown = (kt_fix_t *)kt_grow_repair_array(
+                    arena, fixes, fix_count, &fix_capacity, sizeof(*fixes),
+                    "kotlin_lsp_source_repair_fixes");
+                if (!grown) {
+                    return NULL;
                 }
+                fixes = grown;
+                fixes[fix_count].offset = (int)(q - src);
+                fixes[fix_count].text = insert_parens;
+                fixes[fix_count].text_len = insert_parens_len;
+                fix_count++;
                 p3 = q;
                 continue;
             }
@@ -3988,35 +4494,26 @@ static char *kt_repair_bodyless_interface_methods(CBMArena *arena, const char *s
         return NULL;
     }
 
-    /* Sort cuts by start offset (small N — bubble sort is fine). */
-    for (int i = 0; i < cut_count - 1; i++) {
-        for (int j = i + 1; j < cut_count; j++) {
-            if (cuts[j].start < cuts[i].start) {
-                cut_range_t tmp = cuts[i];
-                cuts[i] = cuts[j];
-                cuts[j] = tmp;
-            }
-        }
+    if (cut_count > 1) {
+        qsort(cuts, (size_t)cut_count, sizeof(*cuts), kt_compare_cut_start);
     }
-
-    /* Sort fixes by offset (different passes may interleave). */
-    for (int i = 0; i < fix_count - 1; i++) {
-        for (int j = i + 1; j < fix_count; j++) {
-            if (fixes[j].offset < fixes[i].offset) {
-                kt_fix_t tmp = fixes[i];
-                fixes[i] = fixes[j];
-                fixes[j] = tmp;
-            }
-        }
+    if (fix_count > 1) {
+        qsort(fixes, (size_t)fix_count, sizeof(*fixes), kt_compare_fix_offset);
     }
 
     /* Build patched source. Cuts remove a [start, end) range. */
-    int new_len = src_len;
+    int64_t new_len = src_len;
     for (int i = 0; i < fix_count; i++) {
         new_len += fixes[i].text_len;
     }
     for (int i = 0; i < cut_count; i++) {
         new_len -= (cuts[i].end - cuts[i].start);
+    }
+    if (new_len < 0 || new_len > INT_MAX) {
+        cbm_arena_mark_failed(arena, "CBM_LSP_ANALYSIS_LIMIT_EXCEEDED",
+                              "kotlin_lsp_repaired_source_size",
+                              new_len < 0 ? SIZE_MAX : (size_t)new_len);
+        return NULL;
     }
     char *out = (char *)cbm_arena_alloc(arena, (size_t)new_len + 1);
     if (!out) {

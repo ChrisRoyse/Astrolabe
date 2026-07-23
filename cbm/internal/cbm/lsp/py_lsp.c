@@ -23,10 +23,10 @@
  * only from py_lsp.c, never compiled standalone. */
 #include "py_builtins.c"
 
-/* Guards for py_eval_expr_type — mirrors c_eval_expr_type's guard design
- * (C_EVAL_DEPTH_LIMIT / C_EVAL_MAX_STEPS_PER_FILE in c_lsp.c). */
-#define PY_LSP_MAX_EVAL_DEPTH 256
-#define PY_EVAL_MAX_STEPS_PER_FILE 10000
+enum {
+    PY_LSP_DEFAULT_EVAL_DEPTH_LIMIT = 256,
+    PY_LSP_DEFAULT_EVAL_STEP_LIMIT = 10000,
+};
 
 // Forward decls
 static void py_resolve_calls_in_inner(PyLSPContext *ctx, TSNode node);
@@ -34,13 +34,19 @@ static void py_resolve_calls_in_inner(PyLSPContext *ctx, TSNode node);
 /* Depth-guarded entry for the AST call-resolution walk. The walk recurses once
  * per nesting level; a deeply-nested or cyclic file can overflow the native
  * stack (SIGSEGV) and take down the whole index. Past the cap the subtree is
- * skipped — its calls stay unresolved, which is graceful degradation, not a
- * crash. The cap is CBM_LSP_MAX_WALK_DEPTH, env-overridable via the same name.
+ * rejected as incomplete — its calls must never be silently omitted. The cap
+ * is CBM_LSP_MAX_WALK_DEPTH, env-overridable via the same name.
  * The walk_depth-- runs after the inner returns, so early returns in the body
  * never leak the counter. */
 static void py_resolve_calls_in(PyLSPContext *ctx, TSNode node) {
-    if (ctx->walk_depth >= cbm_lsp_max_walk_depth())
+    if (!ctx || cbm_arena_failed(ctx->arena)) {
         return;
+    }
+    if (ctx->walk_depth >= ctx->walk_depth_limit) {
+        cbm_arena_mark_failed(ctx->arena, "CBM_LSP_ANALYSIS_LIMIT_EXCEEDED",
+                              "py_lsp_ast_walk_depth", (size_t)ctx->walk_depth_limit);
+        return;
+    }
     ctx->walk_depth++;
     py_resolve_calls_in_inner(ctx, node);
     ctx->walk_depth--;
@@ -103,6 +109,19 @@ void py_lsp_init(PyLSPContext *ctx, CBMArena *arena, const char *source, int sou
     ctx->module_qn = module_qn;
     ctx->resolved_calls = out;
     ctx->current_scope = cbm_scope_push(arena, NULL);
+    if (!cbm_lsp_read_positive_limit(arena, "CBM_LSP_MAX_EVAL_DEPTH",
+                                     PY_LSP_DEFAULT_EVAL_DEPTH_LIMIT, "py_lsp_eval_depth_config",
+                                     &ctx->eval_depth_limit) ||
+        !cbm_lsp_read_positive_limit(arena, "CBM_LSP_MAX_EVAL_STEPS",
+                                     PY_LSP_DEFAULT_EVAL_STEP_LIMIT, "py_lsp_eval_steps_config",
+                                     &ctx->eval_step_limit) ||
+        !cbm_lsp_read_positive_limit(arena, "CBM_LSP_MAX_LOOKUP_DEPTH",
+                                     CBM_LSP_DEFAULT_LOOKUP_DEPTH, "py_lsp_lookup_depth_config",
+                                     &ctx->lookup_depth_limit) ||
+        !cbm_lsp_read_positive_limit(arena, "CBM_LSP_MAX_WALK_DEPTH", CBM_LSP_DEFAULT_WALK_DEPTH,
+                                     "py_lsp_walk_depth_config", &ctx->walk_depth_limit)) {
+        return;
+    }
     const char *dbg = getenv("CBM_LSP_DEBUG");
     ctx->debug = dbg && dbg[0] && dbg[0] != '0';
 }
@@ -419,8 +438,11 @@ static const CBMRegisteredFunc *py_lookup_attribute_depth(PyLSPContext *ctx, con
                                                           const char *member_name, int depth) {
     if (!ctx || !type_qn || !member_name)
         return NULL;
-    if (depth > CBM_LSP_MAX_LOOKUP_DEPTH)
+    if (depth >= ctx->lookup_depth_limit) {
+        cbm_arena_mark_failed(ctx->arena, "CBM_LSP_ANALYSIS_LIMIT_EXCEEDED",
+                              "py_lsp_attribute_lookup_depth", (size_t)ctx->lookup_depth_limit);
         return NULL;
+    }
 
     const CBMRegisteredFunc *f = cbm_registry_lookup_method(ctx->registry, type_qn, member_name);
     if (f)
@@ -500,8 +522,11 @@ static const CBMType *py_lookup_field_depth(PyLSPContext *ctx, const char *type_
                                             const char *field_name, int depth) {
     if (!ctx || !ctx->registry || !type_qn || !field_name)
         return NULL;
-    if (depth > CBM_LSP_MAX_LOOKUP_DEPTH)
+    if (depth >= ctx->lookup_depth_limit) {
+        cbm_arena_mark_failed(ctx->arena, "CBM_LSP_ANALYSIS_LIMIT_EXCEEDED",
+                              "py_lsp_field_lookup_depth", (size_t)ctx->lookup_depth_limit);
         return NULL;
+    }
 
     const CBMRegisteredType *rt = cbm_registry_lookup_type(ctx->registry, type_qn);
     if (!rt)
@@ -914,7 +939,8 @@ static const CBMType *py_eval_expr_type_uncached(PyLSPContext *ctx, TSNode node)
             return cbm_type_unknown();
         const CBMType *obj_type = py_eval_expr_type(ctx, obj);
         if (obj_type)
-            obj_type = cbm_type_resolve_alias(obj_type);
+            obj_type = cbm_type_resolve_alias(ctx->arena, obj_type, ctx->lookup_depth_limit,
+                                              "py_lsp_object_alias_depth");
         char *attr_name = py_node_text(ctx, attr);
         if (!attr_name || !obj_type)
             return cbm_type_unknown();
@@ -1524,15 +1550,18 @@ static void py_type_cache_insert(PyLSPContext *ctx, const void *id, const CBMTyp
 /* Memoizing, depth- and budget-guarded wrapper — the function every call
  * site in this file goes through. */
 static const CBMType *py_eval_expr_type(PyLSPContext *ctx, TSNode node) {
-    if (!ctx || ts_node_is_null(node))
+    if (!ctx || cbm_arena_failed(ctx->arena) || ts_node_is_null(node))
         return cbm_type_unknown();
 
-    /* Depth cap (issue #720): the evaluator recurses once per expression
+    /* The evaluator recurses once per expression
      * nesting level, so a pathologically deep expression (tens of
-     * thousands of parens) overflowed the native stack. Same limit as
-     * C_EVAL_DEPTH_LIMIT. Past the cap: unknown, and NEVER cached. */
-    if (ctx->eval_depth >= PY_LSP_MAX_EVAL_DEPTH) {
+     * thousands of parens) can overflow the native stack. Reaching the
+     * configured per-file limit is sticky failure, and the sentinel unknown
+     * result is never allowed to publish or enter the cache. */
+    if (ctx->eval_depth >= ctx->eval_depth_limit) {
         ctx->eval_truncations++;
+        cbm_arena_mark_failed(ctx->arena, "CBM_LSP_ANALYSIS_LIMIT_EXCEEDED",
+                              "py_lsp_expression_depth", (size_t)ctx->eval_depth_limit);
         return cbm_type_unknown();
     }
 
@@ -1540,17 +1569,16 @@ static const CBMType *py_eval_expr_type(PyLSPContext *ctx, TSNode node) {
     if (cached)
         return cached;
 
-    /* Per-file work budget (mirrors C_EVAL_MAX_STEPS_PER_FILE): expression
-     * type evaluation is best-effort, so pathological files degrade to
-     * unknown instead of stalling repository indexing. Only real
-     * evaluations consume budget — cache hits above are O(1). */
-    if (ctx->eval_steps++ > PY_EVAL_MAX_STEPS_PER_FILE) {
+    /* Per-file work budget. Exhaustion fails the file rather than publishing
+     * unknown as complete. Only real evaluations consume budget; cache hits
+     * above are O(1). */
+    if (ctx->eval_steps >= ctx->eval_step_limit) {
         ctx->eval_truncations++;
-        if (ctx->debug && ctx->eval_steps == PY_EVAL_MAX_STEPS_PER_FILE + 2) {
-            fprintf(stderr, "  [pylsp] expression eval step budget exhausted; returning unknown\n");
-        }
+        cbm_arena_mark_failed(ctx->arena, "CBM_LSP_ANALYSIS_LIMIT_EXCEEDED",
+                              "py_lsp_expression_steps", (size_t)ctx->eval_step_limit);
         return cbm_type_unknown();
     }
+    ctx->eval_steps++;
 
     uint32_t trunc_before = ctx->eval_truncations;
     ctx->eval_depth++;

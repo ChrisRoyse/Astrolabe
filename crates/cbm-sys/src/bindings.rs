@@ -1068,10 +1068,13 @@ impl Default for CBMExtractCtx {
     }
 }
 unsafe extern "C" {
-    pub fn cbm_alloc_init();
+    pub fn cbm_alloc_init() -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {
     pub fn cbm_alloc_bindings_active() -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn cbm_alloc_last_error() -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {
     pub fn cbm_init() -> ::std::os::raw::c_int;

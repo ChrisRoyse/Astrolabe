@@ -33,6 +33,7 @@
  */
 
 #include "rust_rustdoc.h"
+#include "semantic_array.h"
 #include "type_rep.h"
 #include "../../../vendored/yyjson/yyjson.h"
 #include <string.h>
@@ -40,36 +41,55 @@
 
 /* Concatenate a path array (yyjson_val of strings) into a single
  * dotted QN string, optionally prefixed by `crate_qn`. */
-static const char* join_path(CBMArena* arena, yyjson_val* path_arr,
-    const char* crate_qn) {
-    if (!path_arr || !yyjson_is_arr(path_arr)) return NULL;
-    char buf[1024];
-    int off = 0;
-    if (crate_qn && crate_qn[0]) {
-        off = snprintf(buf, sizeof(buf), "%s", crate_qn);
+static const char *join_path(CBMArena *arena, yyjson_val *path_arr, const char *crate_qn) {
+    if (!path_arr || !yyjson_is_arr(path_arr))
+        return NULL;
+    char *buf = NULL;
+    size_t capacity = 0;
+    size_t off = 0;
+    size_t crate_len = crate_qn && crate_qn[0] ? strlen(crate_qn) : 0;
+    if (crate_len > 0) {
+        if (!cbm_lsp_semantic_array_reserve(arena, (void **)&buf, 0, &capacity, sizeof(*buf),
+                                            crate_len + 1, "rustdoc qualified path")) {
+            return NULL;
+        }
+        memcpy(buf, crate_qn, crate_len);
+        off = crate_len;
     }
-    yyjson_val* part;
+    yyjson_val *part;
     yyjson_arr_iter it;
     yyjson_arr_iter_init(path_arr, &it);
     bool first = true;
     while ((part = yyjson_arr_iter_next(&it))) {
-        const char* s = yyjson_get_str(part);
-        if (!s) continue;
+        const char *s = yyjson_get_str(part);
+        if (!s)
+            continue;
         /* Skip the crate's own root segment if we already prefixed. */
         if (first && crate_qn && crate_qn[0] && strcmp(s, crate_qn) == 0) {
             first = false;
             continue;
         }
-        if (off > 0 && off < (int)sizeof(buf) - 1) {
-            buf[off++] = '.';
+        size_t part_len = strlen(s);
+        size_t separator = off > 0 ? 1 : 0;
+        if (part_len > SIZE_MAX - off - separator - 1) {
+            cbm_arena_mark_failed(arena, "CBM_LSP_SEMANTIC_CARDINALITY_OVERFLOW",
+                                  "rustdoc qualified path", part_len);
+            return NULL;
         }
-        int n = snprintf(buf + off, sizeof(buf) - off, "%s", s);
-        if (n < 0) break;
-        off += n;
-        if (off >= (int)sizeof(buf) - 1) break;
+        if (!cbm_lsp_semantic_array_reserve(arena, (void **)&buf, off, &capacity, sizeof(*buf),
+                                            off + separator + part_len + 1,
+                                            "rustdoc qualified path")) {
+            return NULL;
+        }
+        if (separator)
+            buf[off++] = '.';
+        memcpy(buf + off, s, part_len);
+        off += part_len;
         first = false;
     }
-    if (off <= 0) return NULL;
+    if (off <= 0)
+        return NULL;
+    buf[off] = '\0';
     return cbm_arena_strndup(arena, buf, (size_t)off);
 }
 
@@ -83,89 +103,102 @@ static const char* join_path(CBMArena* arena, yyjson_val* path_arr,
  *   - { "tuple": [<T>...] }       → TUPLE or BUILTIN("()") if empty
  *   - everything else             → UNKNOWN
  */
-static const CBMType* parse_rustdoc_type(yyjson_val* t, CBMArena* arena,
-    const char* crate_qn) {
-    if (!t || !yyjson_is_obj(t)) return cbm_type_unknown();
+static const CBMType *parse_rustdoc_type(yyjson_val *t, CBMArena *arena, const char *crate_qn) {
+    if (!t || !yyjson_is_obj(t))
+        return cbm_type_unknown();
 
-    yyjson_val* prim = yyjson_obj_get(t, "primitive");
+    yyjson_val *prim = yyjson_obj_get(t, "primitive");
     if (prim && yyjson_is_str(prim)) {
         return cbm_type_builtin(arena, yyjson_get_str(prim));
     }
-    yyjson_val* resolved = yyjson_obj_get(t, "resolved_path");
+    yyjson_val *resolved = yyjson_obj_get(t, "resolved_path");
     if (resolved && yyjson_is_obj(resolved)) {
-        const char* qn = NULL;
-        yyjson_val* name = yyjson_obj_get(resolved, "name");
-        yyjson_val* args = yyjson_obj_get(resolved, "args");
+        const char *qn = NULL;
+        yyjson_val *name = yyjson_obj_get(resolved, "name");
+        yyjson_val *args = yyjson_obj_get(resolved, "args");
         if (name && yyjson_is_str(name)) {
             qn = cbm_arena_strdup(arena, yyjson_get_str(name));
         }
-        if (!qn) return cbm_type_unknown();
+        if (!qn)
+            return cbm_type_unknown();
         /* If `args.angle_bracketed.args` is non-empty, build TEMPLATE. */
         if (args && yyjson_is_obj(args)) {
-            yyjson_val* angle = yyjson_obj_get(args, "angle_bracketed");
+            yyjson_val *angle = yyjson_obj_get(args, "angle_bracketed");
             if (angle && yyjson_is_obj(angle)) {
-                yyjson_val* arr = yyjson_obj_get(angle, "args");
+                yyjson_val *arr = yyjson_obj_get(angle, "args");
                 if (arr && yyjson_is_arr(arr) && yyjson_arr_size(arr) > 0) {
-                    const CBMType* targs[8];
-                    int ti = 0;
-                    yyjson_val* item;
+                    const CBMType **targs = NULL;
+                    size_t ti = 0;
+                    size_t capacity = 0;
+                    yyjson_val *item;
                     yyjson_arr_iter it;
                     yyjson_arr_iter_init(arr, &it);
-                    while ((item = yyjson_arr_iter_next(&it)) && ti < 8) {
-                        yyjson_val* inner_t = yyjson_obj_get(item, "type");
+                    while ((item = yyjson_arr_iter_next(&it))) {
+                        yyjson_val *inner_t = yyjson_obj_get(item, "type");
                         if (inner_t) {
+                            if (!cbm_lsp_semantic_array_reserve(arena, (void **)&targs, ti,
+                                                                &capacity, sizeof(*targs), ti + 1,
+                                                                "rustdoc generic type arguments")) {
+                                return cbm_type_unknown();
+                            }
                             targs[ti++] = parse_rustdoc_type(inner_t, arena, crate_qn);
                         }
                     }
                     if (ti > 0) {
-                        return cbm_type_template(arena, qn, targs, ti);
+                        return cbm_type_template(arena, qn, targs, (int)ti);
                     }
                 }
             }
         }
         return cbm_type_named(arena, qn);
     }
-    yyjson_val* borrowed = yyjson_obj_get(t, "borrowed_ref");
+    yyjson_val *borrowed = yyjson_obj_get(t, "borrowed_ref");
     if (borrowed && yyjson_is_obj(borrowed)) {
-        yyjson_val* inner_t = yyjson_obj_get(borrowed, "type");
-        return cbm_type_reference(arena,
-            parse_rustdoc_type(inner_t, arena, crate_qn));
+        yyjson_val *inner_t = yyjson_obj_get(borrowed, "type");
+        return cbm_type_reference(arena, parse_rustdoc_type(inner_t, arena, crate_qn));
     }
-    yyjson_val* slice = yyjson_obj_get(t, "slice");
+    yyjson_val *slice = yyjson_obj_get(t, "slice");
     if (slice) {
-        return cbm_type_slice(arena,
-            parse_rustdoc_type(slice, arena, crate_qn));
+        return cbm_type_slice(arena, parse_rustdoc_type(slice, arena, crate_qn));
     }
-    yyjson_val* array = yyjson_obj_get(t, "array");
+    yyjson_val *array = yyjson_obj_get(t, "array");
     if (array && yyjson_is_obj(array)) {
-        yyjson_val* elem_t = yyjson_obj_get(array, "type");
-        return cbm_type_slice(arena,
-            parse_rustdoc_type(elem_t, arena, crate_qn));
+        yyjson_val *elem_t = yyjson_obj_get(array, "type");
+        return cbm_type_slice(arena, parse_rustdoc_type(elem_t, arena, crate_qn));
     }
-    yyjson_val* tuple = yyjson_obj_get(t, "tuple");
+    yyjson_val *tuple = yyjson_obj_get(t, "tuple");
     if (tuple && yyjson_is_arr(tuple)) {
         size_t n = yyjson_arr_size(tuple);
-        if (n == 0) return cbm_type_builtin(arena, "()");
-        const CBMType* elems[8];
-        int ei = 0;
-        yyjson_val* item;
+        if (n == 0)
+            return cbm_type_builtin(arena, "()");
+        const CBMType **elems = NULL;
+        size_t ei = 0;
+        size_t capacity = 0;
+        yyjson_val *item;
         yyjson_arr_iter it;
         yyjson_arr_iter_init(tuple, &it);
-        while ((item = yyjson_arr_iter_next(&it)) && ei < 8) {
+        while ((item = yyjson_arr_iter_next(&it))) {
+            if (!cbm_lsp_semantic_array_reserve(arena, (void **)&elems, ei, &capacity,
+                                                sizeof(*elems), ei + 1,
+                                                "rustdoc tuple type elements")) {
+                return cbm_type_unknown();
+            }
             elems[ei++] = parse_rustdoc_type(item, arena, crate_qn);
         }
-        if (ei == 1) return elems[0];
-        return cbm_type_tuple(arena, elems, ei);
+        if (ei == 1)
+            return elems[0];
+        return cbm_type_tuple(arena, elems, (int)ei);
     }
     return cbm_type_unknown();
 }
 
 /* Register a function item: figure out the receiver QN (if any), the
  * short name, and the return type. */
-static bool register_function(CBMTypeRegistry* reg, CBMArena* arena,
-    const char* short_name, const char* full_qn, const char* receiver,
-    yyjson_val* function_obj, const char* crate_qn) {
-    if (!short_name || !full_qn) return false;
+static bool register_function(CBMTypeRegistry *reg, CBMArena *arena, const char *short_name,
+                              const char *full_qn, const char *receiver, yyjson_val *function_obj,
+                              const char *crate_qn) {
+    if (!short_name || !full_qn)
+        return false;
     CBMRegisteredFunc rf;
     memset(&rf, 0, sizeof(rf));
     rf.qualified_name = full_qn;
@@ -175,18 +208,17 @@ static bool register_function(CBMTypeRegistry* reg, CBMArena* arena,
 
     /* Return type — rustdoc's `function.decl.output` may be omitted
      * (implicit unit). */
-    const CBMType* ret = cbm_type_builtin(arena, "()");
+    const CBMType *ret = cbm_type_builtin(arena, "()");
     if (function_obj && yyjson_is_obj(function_obj)) {
-        yyjson_val* decl = yyjson_obj_get(function_obj, "decl");
+        yyjson_val *decl = yyjson_obj_get(function_obj, "decl");
         if (decl && yyjson_is_obj(decl)) {
-            yyjson_val* out = yyjson_obj_get(decl, "output");
+            yyjson_val *out = yyjson_obj_get(decl, "output");
             if (out && !yyjson_is_null(out)) {
                 ret = parse_rustdoc_type(out, arena, crate_qn);
             }
         }
     }
-    const CBMType** ra = (const CBMType**)cbm_arena_alloc(arena,
-        2 * sizeof(const CBMType*));
+    const CBMType **ra = (const CBMType **)cbm_arena_alloc(arena, 2 * sizeof(const CBMType *));
     ra[0] = ret;
     ra[1] = NULL;
     rf.signature = cbm_type_func(arena, NULL, NULL, ra);
@@ -194,42 +226,54 @@ static bool register_function(CBMTypeRegistry* reg, CBMArena* arena,
     return true;
 }
 
-int cbm_rust_rustdoc_ingest(CBMTypeRegistry* reg, CBMArena* arena,
-    const char* json, int json_len, const char* crate_qn) {
-    if (!reg || !arena || !json) return 0;
-    yyjson_doc* doc = yyjson_read(json, (size_t)(json_len > 0 ? json_len : strlen(json)), 0);
-    if (!doc) return 0;
-    yyjson_val* root = yyjson_doc_get_root(doc);
-    if (!yyjson_is_obj(root)) { yyjson_doc_free(doc); return 0; }
+int cbm_rust_rustdoc_ingest(CBMTypeRegistry *reg, CBMArena *arena, const char *json, int json_len,
+                            const char *crate_qn) {
+    if (!reg || !arena || !json)
+        return 0;
+    yyjson_doc *doc = yyjson_read(json, (size_t)(json_len > 0 ? json_len : strlen(json)), 0);
+    if (!doc)
+        return 0;
+    yyjson_val *root = yyjson_doc_get_root(doc);
+    if (!yyjson_is_obj(root)) {
+        yyjson_doc_free(doc);
+        return 0;
+    }
 
-    yyjson_val* index = yyjson_obj_get(root, "index");
-    yyjson_val* paths = yyjson_obj_get(root, "paths");
-    if (!index || !paths) { yyjson_doc_free(doc); return 0; }
+    yyjson_val *index = yyjson_obj_get(root, "index");
+    yyjson_val *paths = yyjson_obj_get(root, "paths");
+    if (!index || !paths) {
+        yyjson_doc_free(doc);
+        return 0;
+    }
 
     int count = 0;
     yyjson_obj_iter it;
     yyjson_obj_iter_init(index, &it);
-    yyjson_val* key;
+    yyjson_val *key;
     while ((key = yyjson_obj_iter_next(&it))) {
-        const char* item_id = yyjson_get_str(key);
-        if (!item_id) continue;
-        yyjson_val* item = yyjson_obj_iter_get_val(key);
-        if (!item || !yyjson_is_obj(item)) continue;
+        const char *item_id = yyjson_get_str(key);
+        if (!item_id)
+            continue;
+        yyjson_val *item = yyjson_obj_iter_get_val(key);
+        if (!item || !yyjson_is_obj(item))
+            continue;
 
-        yyjson_val* name = yyjson_obj_get(item, "name");
-        const char* short_name = yyjson_get_str(name);
-        if (!short_name) continue;
+        yyjson_val *name = yyjson_obj_get(item, "name");
+        const char *short_name = yyjson_get_str(name);
+        if (!short_name)
+            continue;
 
-        yyjson_val* inner = yyjson_obj_get(item, "inner");
-        if (!inner || !yyjson_is_obj(inner)) continue;
+        yyjson_val *inner = yyjson_obj_get(item, "inner");
+        if (!inner || !yyjson_is_obj(inner))
+            continue;
 
         /* Look up the fully-qualified path. */
-        yyjson_val* path_entry = yyjson_obj_get(paths, item_id);
-        const char* qn = NULL;
-        const char* kind = NULL;
+        yyjson_val *path_entry = yyjson_obj_get(paths, item_id);
+        const char *qn = NULL;
+        const char *kind = NULL;
         if (path_entry && yyjson_is_obj(path_entry)) {
             qn = join_path(arena, yyjson_obj_get(path_entry, "path"), crate_qn);
-            yyjson_val* k = yyjson_obj_get(path_entry, "kind");
+            yyjson_val *k = yyjson_obj_get(path_entry, "kind");
             kind = yyjson_get_str(k);
         }
         if (!qn) {
@@ -238,8 +282,7 @@ int cbm_rust_rustdoc_ingest(CBMTypeRegistry* reg, CBMArena* arena,
         }
 
         /* Dispatch on the rustdoc kind. */
-        if (kind && (strcmp(kind, "struct") == 0 ||
-                     strcmp(kind, "enum") == 0 ||
+        if (kind && (strcmp(kind, "struct") == 0 || strcmp(kind, "enum") == 0 ||
                      strcmp(kind, "union") == 0)) {
             CBMRegisteredType rt;
             memset(&rt, 0, sizeof(rt));
@@ -256,9 +299,9 @@ int cbm_rust_rustdoc_ingest(CBMTypeRegistry* reg, CBMArena* arena,
             cbm_registry_add_type(reg, rt);
             count++;
         } else if (kind && strcmp(kind, "function") == 0) {
-            yyjson_val* fn = yyjson_obj_get(inner, "function");
-            if (register_function(reg, arena, cbm_arena_strdup(arena, short_name),
-                                  qn, NULL, fn, crate_qn)) {
+            yyjson_val *fn = yyjson_obj_get(inner, "function");
+            if (register_function(reg, arena, cbm_arena_strdup(arena, short_name), qn, NULL, fn,
+                                  crate_qn)) {
                 count++;
             }
         }

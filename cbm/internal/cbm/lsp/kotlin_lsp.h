@@ -65,6 +65,8 @@ typedef enum {
     CBM_KT_USE_WILDCARD, /* import a.b.* — local_name is a.b prefix */
 } CBMKotlinUseKind;
 
+typedef struct CBMKotlinSmartCast CBMKotlinSmartCast;
+
 /* KotlinLSPContext — per-file state for Kotlin call resolution. */
 typedef struct KotlinLSPContext {
     CBMArena *arena;
@@ -100,6 +102,10 @@ typedef struct KotlinLSPContext {
     const CBMType *this_type;
     const CBMType *super_type;
 
+    /* Proven flow-sensitive receiver types. Each entry is owned by the exact
+     * lexical branch scope that established it and is restored on branch exit. */
+    CBMKotlinSmartCast *smart_casts;
+
     /* `it` lambda parameter type, when inside a single-arg lambda.
      * Saved/restored across nested lambdas. */
     const CBMType *it_type;
@@ -109,11 +115,13 @@ typedef struct KotlinLSPContext {
 
     /* Recursion guard for kotlin_eval_expr_type. */
     int eval_depth;
+    int eval_depth_limit;
+    int lookup_depth_limit;
 
-    /* AST-walk recursion depth for kt_resolve_calls_in_node (guards stack
-     * overflow on deeply-nested/cyclic files; see cbm_lsp_max_walk_depth).
-     * Zero via memset. */
+    /* AST-walk recursion state for kt_resolve_calls_in_node. The per-file
+     * limit is parsed strictly during initialization; reaching it fails. */
     int walk_depth;
+    int walk_depth_limit;
 
     /* Debug mode (CBM_LSP_DEBUG env). */
     bool debug;

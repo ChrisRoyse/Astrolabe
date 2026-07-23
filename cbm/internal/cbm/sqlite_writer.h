@@ -58,10 +58,15 @@ typedef struct {
 
 // --- Public API ---
 
-// Write a complete SQLite .db file from sorted in-memory data.
+// Write a complete SQLite .db staging file from sorted in-memory data.
 // Constructs B-tree pages directly — no SQL parser, no INSERTs.
-// Returns 0 on success, non-zero on error.
-// vectors/vector_count and token_vecs/token_vec_count may be NULL/0.
+// `path` must be a transaction-owned absent identity; opening uses CREATE_NEW,
+// never truncation. Success means every write, flush, Win32 durable sync, and
+// close completed. On any failure the partial path is removed and a structured
+// diagnostic carries the first exact native error.
+// Returns 0 on success, non-zero on error. Every count must be non-negative;
+// every positive count requires a non-NULL array. vectors/vector_count and
+// token_vecs/token_vec_count may be NULL/0.
 int cbm_write_db(const char *path, const char *project, const char *root_path,
                  const char *indexed_at, CBMDumpNode *nodes, int node_count, CBMDumpEdge *edges,
                  int edge_count, CBMDumpVector *vectors, int vector_count,
@@ -77,7 +82,7 @@ int cbm_write_db(const char *path, const char *project, const char *root_path,
 // one-shot wrapper over this API (open -> append all nodes -> finalize) and
 // produces byte-identical output.
 //
-// Usage: w = cbm_writer_open(path);
+// Usage: w = cbm_writer_open(transaction_owned_absent_path);
 //        cbm_writer_append_nodes(w, batch, n) x N  (ascending, contiguous ids);
 //        cbm_writer_finalize(w, ...);   // consumes + frees w, closes the file.
 typedef struct cbm_db_writer cbm_db_writer_t;
@@ -86,13 +91,18 @@ cbm_db_writer_t *cbm_writer_open(const char *path);
 
 // Append a batch of node records. Heavy `properties` are consumed here, so the
 // caller may free them after this returns. Node ids must be ascending and
-// contiguous across the whole sequence of append calls. Returns 0 on success.
+// contiguous from one across the whole sequence of append calls. A negative
+// count or positive-count NULL array fails the staging transaction. Returns 0
+// on success.
 int cbm_writer_append_nodes(cbm_db_writer_t *w, const CBMDumpNode *nodes, int count);
 
 // Finalize: build the nodes-table interior, write edges/vectors/token_vectors,
 // metadata, all indexes, and sqlite_master + header. The node/edge/vector arrays
 // supply the (light) columns the index builders sort on; node `properties` are
-// NOT read here (already written during append). Frees w and closes the file.
+// NOT read here (already written during append). The node count and every
+// index-relevant node identity field must exactly match the append transcript;
+// every other count/array pair obeys the same non-negative/non-NULL contract.
+// Frees w and closes the file.
 int cbm_writer_finalize(cbm_db_writer_t *w, const char *project, const char *root_path,
                         const char *indexed_at, CBMDumpNode *nodes, int node_count,
                         CBMDumpEdge *edges, int edge_count, CBMDumpVector *vectors,

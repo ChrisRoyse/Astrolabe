@@ -11,7 +11,7 @@
  */
 #include "foundation/constants.h"
 
-enum { INCR_RING_BUF = 4, INCR_RING_MASK = 3, INCR_TS_BUF = 24, INCR_WAL_BUF = 1040 };
+enum { INCR_RING_BUF = 4, INCR_RING_MASK = 3, INCR_TS_BUF = 24 };
 #include "pipeline/pipeline.h"
 #include "pipeline/artifact.h"
 #include <stdio.h>
@@ -69,6 +69,34 @@ static int remove_optional_file(const char *path, const char *code) {
                   "a transaction-owned or stale SQLite file could not be removed", "remediation",
                   "close the process holding this file and retry");
     return CBM_NOT_FOUND;
+}
+
+static int allocate_sidecar_paths(const char *base, char **wal, char **shm) {
+    *wal = NULL;
+    *shm = NULL;
+    size_t base_len = strlen(base);
+    if (base_len > SIZE_MAX - 5) {
+        cbm_log_error("incremental.dump_failed", "code", "CBM_INCREMENTAL_SIDECAR_PATH_OVERFLOW",
+                      "message", "a SQLite sidecar path exceeds addressable memory", "remediation",
+                      "shorten the configured store path and retry indexing");
+        return CBM_NOT_FOUND;
+    }
+    *wal = (char *)malloc(base_len + 5);
+    *shm = (char *)malloc(base_len + 5);
+    if (!*wal || !*shm) {
+        free(*wal);
+        free(*shm);
+        *wal = NULL;
+        *shm = NULL;
+        cbm_log_error("incremental.dump_failed", "code", "CBM_INCREMENTAL_SIDECAR_ALLOC_FAILED",
+                      "message", "the complete SQLite sidecar identities could not be allocated",
+                      "remediation",
+                      "free memory or shorten the configured store path, then retry");
+        return CBM_NOT_FOUND;
+    }
+    snprintf(*wal, base_len + 5, "%s-wal", base);
+    snprintf(*shm, base_len + 5, "%s-shm", base);
+    return 0;
 }
 
 /* ── File classification ─────────────────────────────────────────── */
@@ -764,32 +792,35 @@ static int dump_and_persist(cbm_gbuf_t *gbuf, const char *db_path, const char *p
     struct timespec t;
     cbm_clock_gettime(CLOCK_MONOTONIC, &t);
 
-    char stage[INCR_WAL_BUF];
-    char wal[INCR_WAL_BUF];
-    char shm[INCR_WAL_BUF];
-    int stage_len = snprintf(stage, sizeof(stage), "%s.incremental-stage", db_path);
-    if (stage_len <= 0 || (size_t)stage_len >= sizeof(stage)) {
-        cbm_log_error("incremental.dump_failed", "code", "CBM_INCREMENTAL_STAGE_PATH_TOO_LONG",
-                      "message", "the staged database path exceeds the supported path buffer",
-                      "remediation", "shorten the repository storage path and retry");
+    char *stage = NULL;
+    char *stage_wal = NULL;
+    char *stage_shm = NULL;
+    char *live_wal = NULL;
+    char *live_shm = NULL;
+    int result = CBM_NOT_FOUND;
+    if (cbm_pipeline_unique_stage_path(db_path, "incremental", &stage) != 0 ||
+        allocate_sidecar_paths(stage, &stage_wal, &stage_shm) != 0 ||
+        allocate_sidecar_paths(db_path, &live_wal, &live_shm) != 0) {
+        free(stage);
+        free(stage_wal);
+        free(stage_shm);
+        free(live_wal);
+        free(live_shm);
         return CBM_NOT_FOUND;
     }
-    snprintf(wal, sizeof(wal), "%s-wal", stage);
-    snprintf(shm, sizeof(shm), "%s-shm", stage);
-    if (remove_optional_file(stage, "CBM_INCREMENTAL_STALE_STAGE_REMOVE_FAILED") != 0 ||
-        remove_optional_file(wal, "CBM_INCREMENTAL_STALE_STAGE_WAL_REMOVE_FAILED") != 0 ||
-        remove_optional_file(shm, "CBM_INCREMENTAL_STALE_STAGE_SHM_REMOVE_FAILED") != 0) {
-        return CBM_NOT_FOUND;
+    if (cbm_path_exists(stage_wal) || cbm_path_exists(stage_shm)) {
+        cbm_log_error("incremental.dump_failed", "code", "CBM_INCREMENTAL_STAGE_SIDECAR_COLLISION",
+                      "path", stage, "message",
+                      "a generated transaction-owned stage sidecar already exists", "remediation",
+                      "preserve the colliding files and retry with a new indexing request");
+        goto cleanup;
     }
 
     int dump_rc = cbm_gbuf_dump_to_sqlite(gbuf, stage);
     cbm_log_info("incremental.dump", "rc", itoa_buf(dump_rc), "elapsed_ms",
                  itoa_buf((int)elapsed_ms(t)));
     if (dump_rc != 0) {
-        cbm_unlink(stage);
-        cbm_unlink(wal);
-        cbm_unlink(shm);
-        return CBM_NOT_FOUND;
+        goto cleanup;
     }
 
     cbm_store_t *hash_store = cbm_store_open_path(stage);
@@ -797,10 +828,7 @@ static int dump_and_persist(cbm_gbuf_t *gbuf, const char *db_path, const char *p
         cbm_log_error("incremental.dump_failed", "code", "CBM_INCREMENTAL_STAGE_OPEN_FAILED",
                       "message", "the completed staged database could not be reopened",
                       "remediation", "inspect the SQLite open error and retry");
-        cbm_unlink(stage);
-        cbm_unlink(wal);
-        cbm_unlink(shm);
-        return CBM_NOT_FOUND;
+        goto cleanup;
     }
 
     int final_rc =
@@ -822,41 +850,43 @@ static int dump_and_persist(cbm_gbuf_t *gbuf, const char *db_path, const char *p
          cbm_store_exec(hash_store, "PRAGMA journal_mode=DELETE;") != CBM_STORE_OK)) {
         final_rc = CBM_NOT_FOUND;
     }
+    if (final_rc == 0 && !cbm_store_check_integrity(hash_store)) {
+        final_rc = CBM_NOT_FOUND;
+    }
     cbm_store_close(hash_store);
 
     if (final_rc != 0) {
         cbm_log_error("incremental.dump_failed", "code", "CBM_INCREMENTAL_STAGE_FINALIZE_FAILED",
                       "message", "hash, FTS, or WAL finalization failed in the staged database",
                       "remediation", "inspect the SQLite store error and retry");
-        cbm_unlink(stage);
-        cbm_unlink(wal);
-        cbm_unlink(shm);
-        return CBM_NOT_FOUND;
+        goto cleanup;
     }
 
-    if (cbm_path_exists(wal) || cbm_path_exists(shm)) {
+    if (cbm_path_exists(stage_wal) || cbm_path_exists(stage_shm)) {
         cbm_log_error("incremental.dump_failed", "code", "CBM_INCREMENTAL_STAGE_WAL_NOT_FINALIZED",
                       "message",
                       "the closed staged database still has a WAL or shared-memory sidecar",
                       "remediation", "inspect SQLite checkpoint errors and retry");
-        remove_optional_file(stage, "CBM_INCREMENTAL_FAILED_STAGE_REMOVE_FAILED");
-        return CBM_NOT_FOUND;
+        goto cleanup;
     }
 
-    snprintf(wal, sizeof(wal), "%s-wal", db_path);
-    snprintf(shm, sizeof(shm), "%s-shm", db_path);
-    if (remove_optional_file(wal, "CBM_INCREMENTAL_LIVE_WAL_REMOVE_FAILED") != 0 ||
-        remove_optional_file(shm, "CBM_INCREMENTAL_LIVE_SHM_REMOVE_FAILED") != 0) {
-        remove_optional_file(stage, "CBM_INCREMENTAL_FAILED_STAGE_REMOVE_FAILED");
-        return CBM_NOT_FOUND;
+    if (cbm_path_exists(live_wal) || cbm_path_exists(live_shm)) {
+        cbm_log_error("incremental.dump_failed", "code", "CBM_INCREMENTAL_LIVE_WAL_PRESENT", "path",
+                      db_path, "message",
+                      "the live store acquired a WAL or shared-memory sidecar before swap",
+                      "remediation", "close concurrent readers or writers and retry indexing");
+        goto cleanup;
     }
     if (cbm_rename_replace(stage, db_path) != 0) {
+        char native_error[32];
+        (void)snprintf(native_error, sizeof(native_error), "%lu", cbm_fs_last_error());
         cbm_log_error("incremental.dump_failed", "code", "CBM_INCREMENTAL_ATOMIC_SWAP_FAILED",
-                      "message", "the complete staged database could not replace the prior store",
+                      "native_error_kind", "win32", "native_error", native_error, "message",
+                      "the complete staged database could not replace the prior store",
                       "remediation", "close readers holding the store and retry");
-        cbm_unlink(stage);
-        return CBM_NOT_FOUND;
+        goto cleanup;
     }
+    result = 0;
 
     /* Auto-update artifact if one already exists (persistence was enabled previously) */
     if (repo_path && cbm_artifact_exists(repo_path)) {
@@ -865,10 +895,22 @@ static int dump_and_persist(cbm_gbuf_t *gbuf, const char *db_path, const char *p
                           "CBM_INCREMENTAL_ARTIFACT_EXPORT_FAILED", "message",
                           "the updated store could not be exported to the configured artifact",
                           "remediation", "inspect the artifact error and retry a clean export");
-            return CBM_NOT_FOUND;
+            result = CBM_NOT_FOUND;
         }
     }
-    return 0;
+
+cleanup:
+    if (result != 0) {
+        (void)remove_optional_file(stage, "CBM_INCREMENTAL_FAILED_STAGE_REMOVE_FAILED");
+        (void)remove_optional_file(stage_wal, "CBM_INCREMENTAL_FAILED_STAGE_WAL_REMOVE_FAILED");
+        (void)remove_optional_file(stage_shm, "CBM_INCREMENTAL_FAILED_STAGE_SHM_REMOVE_FAILED");
+    }
+    free(stage);
+    free(stage_wal);
+    free(stage_shm);
+    free(live_wal);
+    free(live_shm);
+    return result;
 }
 
 /* ── Incremental pipeline entry point ────────────────────────────── */
