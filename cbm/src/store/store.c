@@ -37,7 +37,6 @@ enum {
     ST_INIT_CAP_8 = 8,
     ST_INIT_CAP_16 = 16,
     ST_SQL_BUF = 8192,
-    ST_MAX_ROW_CHECK = 5,
     ST_QN_MAX_DOTS = 5,
     ST_QN_MIN_DOTS = 3,
     ST_IN_CLAUSE_MARGIN = 4,
@@ -1068,56 +1067,375 @@ cbm_store_t *cbm_store_open_path_query(const char *db_path) {
 
 /* ── Integrity check ───────────────────────────────────────────── */
 
-bool cbm_store_check_integrity(cbm_store_t *s) {
-    if (!s || !s->db) {
+typedef enum {
+    STORE_INTEGRITY_OK = 0,
+    STORE_INTEGRITY_FAILED,
+    STORE_INTEGRITY_IO_FAILED,
+} store_integrity_status_t;
+
+typedef struct {
+    store_integrity_status_t status;
+    char operation[CBM_STORE_VERIFY_OPERATION_MAX];
+    int sqlite_error;
+    char detail[CBM_STORE_VERIFY_DETAIL_MAX];
+} store_integrity_result_t;
+
+static void store_integrity_result_init(store_integrity_result_t *result) {
+    memset(result, 0, sizeof(*result));
+    result->status = STORE_INTEGRITY_IO_FAILED;
+}
+
+static store_integrity_status_t store_integrity_sqlite_failure_status(int sqlite_error) {
+    switch (sqlite_error & 0xFF) {
+    case SQLITE_NOMEM:
+    case SQLITE_IOERR:
+    case SQLITE_FULL:
+    case SQLITE_CANTOPEN:
+    case SQLITE_BUSY:
+    case SQLITE_LOCKED:
+        return STORE_INTEGRITY_IO_FAILED;
+    default:
+        return STORE_INTEGRITY_FAILED;
+    }
+}
+
+static void store_integrity_set_failure(store_integrity_result_t *result,
+                                        store_integrity_status_t status, const char *operation,
+                                        int sqlite_error, const char *detail) {
+    result->status = status;
+    result->sqlite_error = sqlite_error;
+    snprintf(result->operation, sizeof(result->operation), "%s", operation ? operation : "");
+    snprintf(result->detail, sizeof(result->detail), "%s", detail ? detail : "");
+}
+
+static void store_integrity_set_sqlite_failure(store_integrity_result_t *result,
+                                               const char *operation, sqlite3 *db, int rc) {
+    int sqlite_error = db ? sqlite3_extended_errcode(db) : rc;
+    if (sqlite_error == SQLITE_OK) {
+        sqlite_error = rc;
+    }
+    const char *message = db ? sqlite3_errmsg(db) : sqlite3_errstr(sqlite_error);
+    store_integrity_set_failure(result, store_integrity_sqlite_failure_status(sqlite_error),
+                                operation, sqlite_error,
+                                message ? message : "SQLite returned no diagnostic");
+}
+
+static bool store_root_path_is_absolute(const unsigned char *path, int bytes) {
+    if (!path || bytes <= 0) {
         return false;
     }
+    if (path[0] == '/') {
+        return true;
+    }
+    if (bytes >= 2 && path[0] == '\\' && path[1] == '\\') {
+        return true;
+    }
+    return bytes >= 3 &&
+           ((path[0] >= 'A' && path[0] <= 'Z') || (path[0] >= 'a' && path[0] <= 'z')) &&
+           path[1] == ':' && (path[2] == '/' || path[2] == '\\');
+}
 
-    /* Each project gets its own .db file, so the projects table should have
-     * exactly 1 row. More than 5 rows is definitely corrupt (allows some slack
-     * for edge cases). Also check that root_path looks like a real path. */
+static bool store_integrity_prepare_probe(sqlite3 *db, const char *operation, const char *sql,
+                                          store_integrity_result_t *result) {
     sqlite3_stmt *stmt = NULL;
-    int rc =
-        sqlite3_prepare_v2(s->db, "SELECT count(*) FROM projects;", CBM_NOT_FOUND, &stmt, NULL);
+    int rc = sqlite3_prepare_v2(db, sql, CBM_NOT_FOUND, &stmt, NULL);
     if (rc != SQLITE_OK) {
-        return false;
-    }
-
-    bool ok = true;
-    if (sqlite3_step(stmt) == SQLITE_ROW) {
-        int row_count = sqlite3_column_int(stmt, 0);
-        if (row_count > ST_MAX_ROW_CHECK) {
-            (void)fprintf(stderr, "ERROR store.corrupt table=projects rows=%d (expected 1)\n",
-                          row_count);
-            ok = false;
-        }
-    }
-    sqlite3_finalize(stmt);
-
-    if (ok) {
-        /* Check that root_path in projects table starts with '/' or a drive
-         * letter. Corrupt DBs often have numeric strings like "826" in
-         * root_path. Drive letters may be upper- OR lower-case on Windows
-         * (e.g. "c:/repo", "y:/share") — rejecting lowercase here flagged
-         * valid Windows paths as corrupt and deleted the DB (#227/#367). */
-        rc = sqlite3_prepare_v2(s->db,
-                                "SELECT root_path FROM projects WHERE root_path != '' "
-                                "AND NOT (substr(root_path, 1, 1) = '/' "
-                                "OR (substr(root_path, 1, 1) BETWEEN 'A' AND 'Z') "
-                                "OR (substr(root_path, 1, 1) BETWEEN 'a' AND 'z')) LIMIT 1;",
-                                CBM_NOT_FOUND, &stmt, NULL);
-        if (rc == SQLITE_OK) {
-            if (sqlite3_step(stmt) == SQLITE_ROW) {
-                const char *bad_path = (const char *)sqlite3_column_text(stmt, 0);
-                (void)fprintf(stderr, "ERROR store.corrupt table=projects bad_root_path=%s\n",
-                              bad_path ? bad_path : "(null)");
-                ok = false;
-            }
+        store_integrity_set_sqlite_failure(result, operation, db, rc);
+        if (stmt) {
             sqlite3_finalize(stmt);
         }
+        return false;
+    }
+    rc = sqlite3_step(stmt);
+    if (rc != SQLITE_DONE) {
+        store_integrity_set_sqlite_failure(result, operation, db, rc);
+        sqlite3_finalize(stmt);
+        return false;
+    }
+    rc = sqlite3_finalize(stmt);
+    if (rc != SQLITE_OK) {
+        store_integrity_set_sqlite_failure(result, operation, db, rc);
+        return false;
+    }
+    return true;
+}
+
+static store_integrity_status_t store_check_integrity_detailed(cbm_store_t *s,
+                                                               store_integrity_result_t *result) {
+    store_integrity_result_init(result);
+    if (!s || !s->db) {
+        store_integrity_set_failure(result, STORE_INTEGRITY_IO_FAILED, "connection", SQLITE_MISUSE,
+                                    "store connection is absent");
+        return result->status;
     }
 
-    return ok;
+    sqlite3_stmt *stmt = NULL;
+    int rc =
+        sqlite3_prepare_v2(s->db, "PRAGMA main.integrity_check(1);", CBM_NOT_FOUND, &stmt, NULL);
+    if (rc != SQLITE_OK) {
+        store_integrity_set_sqlite_failure(result, "sqlite.integrity_check.prepare", s->db, rc);
+        if (stmt) {
+            sqlite3_finalize(stmt);
+        }
+        return result->status;
+    }
+    rc = sqlite3_step(stmt);
+    if (rc != SQLITE_ROW) {
+        store_integrity_set_sqlite_failure(result, "sqlite.integrity_check.step", s->db, rc);
+        sqlite3_finalize(stmt);
+        return result->status;
+    }
+    const unsigned char *integrity_text = sqlite3_column_text(stmt, 0);
+    int integrity_bytes = sqlite3_column_bytes(stmt, 0);
+    if (!integrity_text || integrity_bytes != 2 || memcmp(integrity_text, "ok", 2) != 0) {
+        if (!integrity_text) {
+            store_integrity_set_failure(result, STORE_INTEGRITY_FAILED, "sqlite.integrity_check",
+                                        SQLITE_OK, "PRAGMA integrity_check(1) returned NULL");
+        } else if ((size_t)integrity_bytes >= sizeof(result->detail) - SLEN("integrity_check: ")) {
+            char overflow[ST_BUF_64];
+            snprintf(overflow, sizeof(overflow),
+                     "integrity_check diagnostic exceeds capacity: bytes=%d", integrity_bytes);
+            store_integrity_set_failure(result, STORE_INTEGRITY_IO_FAILED,
+                                        "sqlite.integrity_check.diagnostic", SQLITE_TOOBIG,
+                                        overflow);
+        } else {
+            snprintf(result->detail, sizeof(result->detail), "integrity_check: %.*s",
+                     integrity_bytes, (const char *)integrity_text);
+            result->status = STORE_INTEGRITY_FAILED;
+            result->sqlite_error = SQLITE_OK;
+            snprintf(result->operation, sizeof(result->operation), "%s", "sqlite.integrity_check");
+        }
+        sqlite3_finalize(stmt);
+        return result->status;
+    }
+    rc = sqlite3_step(stmt);
+    if (rc != SQLITE_DONE) {
+        if (rc == SQLITE_ROW) {
+            store_integrity_set_failure(result, STORE_INTEGRITY_FAILED,
+                                        "sqlite.integrity_check.cardinality", SQLITE_OK,
+                                        "PRAGMA integrity_check returned extra rows after ok");
+        } else {
+            store_integrity_set_sqlite_failure(result, "sqlite.integrity_check.finish", s->db, rc);
+        }
+        sqlite3_finalize(stmt);
+        return result->status;
+    }
+    rc = sqlite3_finalize(stmt);
+    stmt = NULL;
+    if (rc != SQLITE_OK) {
+        store_integrity_set_sqlite_failure(result, "sqlite.integrity_check.finalize", s->db, rc);
+        return result->status;
+    }
+
+    rc = sqlite3_prepare_v2(s->db, "PRAGMA main.foreign_key_check;", CBM_NOT_FOUND, &stmt, NULL);
+    if (rc != SQLITE_OK) {
+        store_integrity_set_sqlite_failure(result, "sqlite.foreign_key_check.prepare", s->db, rc);
+        if (stmt) {
+            sqlite3_finalize(stmt);
+        }
+        return result->status;
+    }
+    rc = sqlite3_step(stmt);
+    if (rc == SQLITE_ROW) {
+        const char *table = (const char *)sqlite3_column_text(stmt, 0);
+        const char *parent = (const char *)sqlite3_column_text(stmt, 2);
+        sqlite3_int64 rowid =
+            sqlite3_column_type(stmt, 1) == SQLITE_NULL ? -1 : sqlite3_column_int64(stmt, 1);
+        int fk_index = sqlite3_column_int(stmt, 3);
+        char detail[CBM_STORE_VERIFY_DETAIL_MAX];
+        snprintf(detail, sizeof(detail),
+                 "foreign_key_check: table=%s rowid=%lld parent=%s fk_index=%d",
+                 table ? table : "(null)", (long long)rowid, parent ? parent : "(null)", fk_index);
+        store_integrity_set_failure(result, STORE_INTEGRITY_FAILED, "sqlite.foreign_key_check",
+                                    SQLITE_OK, detail);
+        sqlite3_finalize(stmt);
+        return result->status;
+    }
+    if (rc != SQLITE_DONE) {
+        store_integrity_set_sqlite_failure(result, "sqlite.foreign_key_check.step", s->db, rc);
+        sqlite3_finalize(stmt);
+        return result->status;
+    }
+    rc = sqlite3_finalize(stmt);
+    stmt = NULL;
+    if (rc != SQLITE_OK) {
+        store_integrity_set_sqlite_failure(result, "sqlite.foreign_key_check.finalize", s->db, rc);
+        return result->status;
+    }
+
+    rc = sqlite3_prepare_v2(s->db, "PRAGMA main.user_version;", CBM_NOT_FOUND, &stmt, NULL);
+    if (rc != SQLITE_OK) {
+        store_integrity_set_sqlite_failure(result, "application.user_version.prepare", s->db, rc);
+        if (stmt) {
+            sqlite3_finalize(stmt);
+        }
+        return result->status;
+    }
+    rc = sqlite3_step(stmt);
+    int user_version = rc == SQLITE_ROW ? sqlite3_column_int(stmt, 0) : -1;
+    if (rc != SQLITE_ROW || user_version != CBM_STORE_SCHEMA_VERSION) {
+        if (rc != SQLITE_ROW) {
+            store_integrity_set_sqlite_failure(result, "application.user_version.step", s->db, rc);
+        } else {
+            char detail[ST_BUF_64];
+            snprintf(detail, sizeof(detail), "user_version=%d expected=%d", user_version,
+                     CBM_STORE_SCHEMA_VERSION);
+            store_integrity_set_failure(result, STORE_INTEGRITY_FAILED, "application.user_version",
+                                        SQLITE_OK, detail);
+        }
+        sqlite3_finalize(stmt);
+        return result->status;
+    }
+    rc = sqlite3_step(stmt);
+    if (rc != SQLITE_DONE) {
+        store_integrity_set_failure(result, STORE_INTEGRITY_FAILED,
+                                    "application.user_version.cardinality", SQLITE_OK,
+                                    "PRAGMA user_version did not return exactly one row");
+        sqlite3_finalize(stmt);
+        return result->status;
+    }
+    rc = sqlite3_finalize(stmt);
+    stmt = NULL;
+    if (rc != SQLITE_OK) {
+        store_integrity_set_sqlite_failure(result, "application.user_version.finalize", s->db, rc);
+        return result->status;
+    }
+
+    static const struct {
+        const char *operation;
+        const char *sql;
+    } SCHEMA_PROBES[] = {
+        {"application.schema.projects",
+         "SELECT name, indexed_at, root_path FROM projects LIMIT 0;"},
+        {"application.schema.file_hashes",
+         "SELECT project, rel_path, sha256, mtime_ns, size FROM file_hashes LIMIT 0;"},
+        {"application.schema.nodes", "SELECT " ST_NODE_SELECT_COLUMNS " FROM nodes LIMIT 0;"},
+        {"application.schema.edges",
+         "SELECT id, project, source_id, target_id, type, properties, url_path_gen, "
+         "local_name_gen FROM edges LIMIT 0;"},
+        {"application.schema.project_summaries",
+         "SELECT project, summary, source_hash, created_at, updated_at "
+         "FROM project_summaries LIMIT 0;"},
+        {"application.schema.nodes_fts",
+         "SELECT rowid, name, qualified_name, label, file_path FROM nodes_fts LIMIT 0;"},
+    };
+    for (size_t i = 0; i < sizeof(SCHEMA_PROBES) / sizeof(SCHEMA_PROBES[0]); i++) {
+        if (!store_integrity_prepare_probe(s->db, SCHEMA_PROBES[i].operation, SCHEMA_PROBES[i].sql,
+                                           result)) {
+            return result->status;
+        }
+    }
+
+    rc = sqlite3_prepare_v2(s->db, "SELECT count(*) FROM projects;", CBM_NOT_FOUND, &stmt, NULL);
+    if (rc != SQLITE_OK) {
+        store_integrity_set_sqlite_failure(result, "application.project_count.prepare", s->db, rc);
+        if (stmt) {
+            sqlite3_finalize(stmt);
+        }
+        return result->status;
+    }
+    rc = sqlite3_step(stmt);
+    sqlite3_int64 project_count = rc == SQLITE_ROW ? sqlite3_column_int64(stmt, 0) : -1;
+    if (rc != SQLITE_ROW || project_count != 1) {
+        if (rc != SQLITE_ROW) {
+            store_integrity_set_sqlite_failure(result, "application.project_count.step", s->db, rc);
+        } else {
+            char detail[ST_BUF_64];
+            snprintf(detail, sizeof(detail), "projects rows=%lld expected=1",
+                     (long long)project_count);
+            store_integrity_set_failure(result, STORE_INTEGRITY_FAILED, "application.project_count",
+                                        SQLITE_OK, detail);
+        }
+        sqlite3_finalize(stmt);
+        return result->status;
+    }
+    rc = sqlite3_step(stmt);
+    if (rc != SQLITE_DONE) {
+        store_integrity_set_failure(result, STORE_INTEGRITY_FAILED,
+                                    "application.project_count.cardinality", SQLITE_OK,
+                                    "project count query did not return exactly one row");
+        sqlite3_finalize(stmt);
+        return result->status;
+    }
+    rc = sqlite3_finalize(stmt);
+    stmt = NULL;
+    if (rc != SQLITE_OK) {
+        store_integrity_set_sqlite_failure(result, "application.project_count.finalize", s->db, rc);
+        return result->status;
+    }
+
+    rc = sqlite3_prepare_v2(s->db, "SELECT name, indexed_at, root_path FROM projects;",
+                            CBM_NOT_FOUND, &stmt, NULL);
+    if (rc != SQLITE_OK) {
+        store_integrity_set_sqlite_failure(result, "application.project_row.prepare", s->db, rc);
+        if (stmt) {
+            sqlite3_finalize(stmt);
+        }
+        return result->status;
+    }
+    rc = sqlite3_step(stmt);
+    if (rc != SQLITE_ROW) {
+        store_integrity_set_sqlite_failure(result, "application.project_row.step", s->db, rc);
+        sqlite3_finalize(stmt);
+        return result->status;
+    }
+    const unsigned char *name = sqlite3_column_text(stmt, 0);
+    const unsigned char *indexed_at = sqlite3_column_text(stmt, 1);
+    const unsigned char *root_path = sqlite3_column_text(stmt, 2);
+    int name_bytes = sqlite3_column_bytes(stmt, 0);
+    int indexed_at_bytes = sqlite3_column_bytes(stmt, 1);
+    int root_path_bytes = sqlite3_column_bytes(stmt, 2);
+    const char *row_violation = NULL;
+    if (sqlite3_column_type(stmt, 0) != SQLITE_TEXT || name_bytes <= 0 || !name ||
+        !cbm_validate_project_name((const char *)name)) {
+        row_violation = "project name must be non-empty valid UTF-8 project-name text";
+    } else if (sqlite3_column_type(stmt, 1) != SQLITE_TEXT || indexed_at_bytes <= 0 ||
+               !indexed_at) {
+        row_violation = "indexed_at must be non-empty text";
+    } else if (sqlite3_column_type(stmt, 2) != SQLITE_TEXT ||
+               !store_root_path_is_absolute(root_path, root_path_bytes)) {
+        row_violation = "root_path must be a non-empty absolute POSIX, drive, or UNC path";
+    }
+    if (row_violation) {
+        store_integrity_set_failure(result, STORE_INTEGRITY_FAILED, "application.project_row",
+                                    SQLITE_OK, row_violation);
+        sqlite3_finalize(stmt);
+        return result->status;
+    }
+    rc = sqlite3_step(stmt);
+    if (rc != SQLITE_DONE) {
+        store_integrity_set_failure(result, STORE_INTEGRITY_FAILED,
+                                    "application.project_row.cardinality", SQLITE_OK,
+                                    "sole-project query returned more than one row");
+        sqlite3_finalize(stmt);
+        return result->status;
+    }
+    rc = sqlite3_finalize(stmt);
+    if (rc != SQLITE_OK) {
+        store_integrity_set_sqlite_failure(result, "application.project_row.finalize", s->db, rc);
+        return result->status;
+    }
+
+    result->status = STORE_INTEGRITY_OK;
+    result->sqlite_error = SQLITE_OK;
+    snprintf(result->operation, sizeof(result->operation), "%s", "application.project_row");
+    snprintf(result->detail, sizeof(result->detail), "%s",
+             "SQLite integrity, foreign keys, schema version, query schema, and sole-project "
+             "invariants passed");
+    return result->status;
+}
+
+bool cbm_store_check_integrity(cbm_store_t *s) {
+    store_integrity_result_t result;
+    if (store_check_integrity_detailed(s, &result) == STORE_INTEGRITY_OK) {
+        return true;
+    }
+    char sqlite_error[ST_BUF_16];
+    snprintf(sqlite_error, sizeof(sqlite_error), "%d", result.sqlite_error);
+    cbm_log_error("store.integrity_refused", "code", "CBM_STORE_INTEGRITY_FAILED", "operation",
+                  result.operation, "sqlite_error", sqlite_error, "detail", result.detail,
+                  "remediation", "preserve the complete SQLite family and rebuild it from source");
+    return false;
 }
 
 static void store_verify_result_init(cbm_store_verify_result_t *result) {
@@ -1663,20 +1981,32 @@ cbm_store_verify_status_t cbm_store_open_path_query_verified(const char *db_path
             sqlite_detail[0] ? sqlite_detail : "snapshot SQLite open or first read failed");
         goto cleanup;
     }
-    if (!cbm_store_check_integrity(snapshot_store)) {
-        sqlite_error = sqlite3_extended_errcode(snapshot_store->db);
-        store_verify_set_error(result, CBM_STORE_VERIFY_INTEGRITY_FAILED,
-                               "snapshot.application_integrity_check", ERROR_SUCCESS, sqlite_error,
-                               sqlite_error == SQLITE_OK
-                                   ? "snapshot violates the project-store integrity contract"
-                                   : sqlite3_errmsg(snapshot_store->db));
+    store_integrity_result_t integrity_result;
+    store_integrity_status_t integrity_status =
+        store_check_integrity_detailed(snapshot_store, &integrity_result);
+    if (integrity_status != STORE_INTEGRITY_OK) {
+        char operation[CBM_STORE_VERIFY_OPERATION_MAX];
+        int operation_wrote =
+            snprintf(operation, sizeof(operation), "snapshot.%s", integrity_result.operation);
+        if (operation_wrote < 0 || (size_t)operation_wrote >= sizeof(operation)) {
+            store_verify_set_error(result, CBM_STORE_VERIFY_IO_FAILED,
+                                   "snapshot.integrity_operation_overflow", ERROR_BUFFER_OVERFLOW,
+                                   SQLITE_TOOBIG,
+                                   "integrity diagnostic operation exceeds verified capacity");
+            goto cleanup;
+        }
+        store_verify_set_error(
+            result,
+            integrity_status == STORE_INTEGRITY_IO_FAILED ? CBM_STORE_VERIFY_IO_FAILED
+                                                          : CBM_STORE_VERIFY_INTEGRITY_FAILED,
+            operation, ERROR_SUCCESS, integrity_result.sqlite_error, integrity_result.detail);
         goto cleanup;
     }
     result->status = CBM_STORE_VERIFY_OK;
     result->native_error = ERROR_SUCCESS;
     result->sqlite_error = SQLITE_OK;
     snprintf(result->operation, sizeof(result->operation), "%s",
-             "snapshot.application_integrity_check");
+             "snapshot.application.project_row");
     snprintf(result->detail, sizeof(result->detail), "%s",
              "snapshot passed the project-store integrity contract");
 

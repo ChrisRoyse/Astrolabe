@@ -269,8 +269,9 @@ cbm_store_verify_status_t cbm_store_open_path_query_verified(const char *db_path
  * store. The returned pointer is owned by the store. */
 const char *cbm_store_db_path(const cbm_store_t *s);
 
-/* Check database integrity. Returns true if the DB passes basic sanity checks
- * (projects table has correct types, no corruption indicators).
+/* Check database integrity. Returns true only when SQLite's full integrity and
+ * foreign-key checks pass, the exact query schema/version is present, and the
+ * file contains exactly one valid project row with an absolute root path.
  * Returns false if corruption is detected. Callers must preserve the complete
  * database/journal family and fail closed; recovery and re-indexing are explicit
  * operator-controlled transactions, never an automatic delete side effect. */
