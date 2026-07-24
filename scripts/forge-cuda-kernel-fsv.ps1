@@ -54,6 +54,8 @@ $ExpectedCuobjdumpSha256 =
 $ExpectedNvdisasmSha256 =
     '02a69a49da9803afebebb93e045aa99f8243c7eca54faf2a59959be2d12915b0'
 
+. (Join-Path $PSScriptRoot 'launcher-lock.ps1')
+
 function Assert-Astro {
     param(
         [Parameter(Mandatory)][bool]$Condition,
@@ -69,6 +71,154 @@ function Get-AstroSha256 {
     param([Parameter(Mandatory)][string]$Path)
 
     return (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()
+}
+
+function ConvertTo-AstroStrictDisplayWindowsFilePath {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][string]$Description
+    )
+
+    $containsControl = $false
+    foreach ($character in $Path.ToCharArray()) {
+        if ([char]::IsControl($character)) {
+            $containsControl = $true
+            break
+        }
+    }
+    Assert-Astro (
+        -not [string]::IsNullOrWhiteSpace($Path) -and
+        -not $Path.Contains('/') -and
+        -not $containsControl
+    ) 'CALYX_FORGE_CUDA_FSV_WINDOWS_PATH_INVALID' `
+        "$Description is empty or contains a forbidden separator/control byte: '$Path'"
+
+    if ($Path.StartsWith(
+            '\\?\UNC\',
+            [StringComparison]::OrdinalIgnoreCase
+        )) {
+        $display = '\\' + $Path.Substring(8)
+    }
+    elseif ($Path.StartsWith(
+            '\\?\',
+            [StringComparison]::OrdinalIgnoreCase
+        )) {
+        $display = $Path.Substring(4)
+    }
+    else {
+        $display = $Path
+    }
+    Assert-Astro (
+        -not $display.StartsWith(
+            '\\.\',
+            [StringComparison]::OrdinalIgnoreCase
+        ) -and
+        -not $display.StartsWith(
+            '\\?\',
+            [StringComparison]::OrdinalIgnoreCase
+        ) -and
+        -not $display.EndsWith(
+            '\',
+            [StringComparison]::Ordinal
+        )
+    ) 'CALYX_FORGE_CUDA_FSV_WINDOWS_NAMESPACE_INVALID' `
+        "$Description uses an unsupported device namespace or trailing separator: '$Path'"
+
+    $driveAbsolute = $display -match '^[A-Za-z]:\\.+$'
+    $uncAbsolute = $display -match '^\\\\[^\\]+\\[^\\]+\\.+$'
+    Assert-Astro ($driveAbsolute -or $uncAbsolute) `
+        'CALYX_FORGE_CUDA_FSV_WINDOWS_PATH_NOT_ABSOLUTE' `
+        "$Description is not an absolute DOS-or-UNC file path: '$Path'"
+    $tail = if ($driveAbsolute) {
+        $display.Substring(3)
+    }
+    else {
+        $display.Substring(2)
+    }
+    $components = $tail.Split([char]'\')
+    Assert-Astro (
+        $components.Count -gt 0 -and
+        @($components | Where-Object {
+                [string]::IsNullOrEmpty($_) -or
+                $_ -ceq '.' -or
+                $_ -ceq '..'
+            }).Count -eq 0
+    ) 'CALYX_FORGE_CUDA_FSV_WINDOWS_PATH_COMPONENT_INVALID' `
+        "$Description contains an empty/dot path component: '$Path'"
+    $full = [IO.Path]::GetFullPath($display)
+    Assert-Astro (
+        [string]::Equals(
+            $full,
+            $display,
+            [StringComparison]::OrdinalIgnoreCase
+        )
+    ) 'CALYX_FORGE_CUDA_FSV_WINDOWS_PATH_LEXICAL_DRIFT' `
+        "$Description changes under GetFullPath ('$display' -> '$full')"
+    return $full
+}
+
+function Get-AstroExactWindowsFileBinding {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][string]$Description
+    )
+
+    $display = ConvertTo-AstroStrictDisplayWindowsFilePath `
+        -Path $Path `
+        -Description $Description
+    $handle = $null
+    try {
+        $handle =
+            [AstroLauncherLockNative]::OpenExactProtectedReadFile($display)
+        $finalPath = ConvertFrom-AstroNativeFinalPath (
+            [AstroLauncherLockNative]::GetFileFinalPath($handle)
+        )
+        $finalPath = [IO.Path]::GetFullPath($finalPath)
+        $fileId =
+            [AstroLauncherLockNative]::GetFileIdentity($handle)
+        $sha256 =
+            [AstroLauncherLockNative]::ComputeExactFileSha256($handle)
+        Assert-Astro (
+            [string]::Equals(
+                $display,
+                $finalPath,
+                [StringComparison]::OrdinalIgnoreCase
+            )
+        ) 'CALYX_FORGE_CUDA_FSV_WINDOWS_PATH_RESOLUTION_DRIFT' `
+            "$Description resolves to '$finalPath', not '$display'"
+        $evidence = [pscustomobject][ordered]@{
+            raw_path = $Path
+            display_path = $display
+            final_path = $finalPath
+            file_id = $fileId
+            sha256 = $sha256
+        }
+        $retainedHandle = $handle
+        $handle = $null
+        return [pscustomobject][ordered]@{
+            evidence = $evidence
+            handle = $retainedHandle
+        }
+    }
+    catch {
+        if ($_.Exception.Message.StartsWith(
+                'CALYX_FORGE_CUDA_FSV_',
+                [StringComparison]::Ordinal
+            )) {
+            throw
+        }
+        throw (
+            'CALYX_FORGE_CUDA_FSV_WINDOWS_FILE_BINDING_FAILED: ' +
+            "$Description '$Path' could not be bound through one retained " +
+            "ordinary-file handle ($($_.Exception.GetType().FullName): " +
+            "$($_.Exception.Message))"
+        )
+    }
+    finally {
+        if ($null -ne $handle) {
+            $handle.Dispose()
+        }
+    }
 }
 
 function Read-AstroNvidiaCsv {
@@ -464,6 +614,14 @@ $gpuProcesses = Read-AstroNvidiaCsv `
 $expectedPid = [uint32]$runRecord.process.identity.pid
 $expectedArtifactPath =
     [IO.Path]::GetFullPath([string]$runRecord.artifact.path)
+$expectedArtifactBinding = Get-AstroExactWindowsFileBinding `
+    -Path $expectedArtifactPath `
+    -Description 'run-record artifact'
+Assert-Astro (
+    $expectedArtifactBinding.evidence.sha256 -ceq
+        [string]$runRecord.artifact.sha256
+) 'CALYX_FORGE_CUDA_FSV_ARTIFACT_BINDING_INVALID' `
+    'run-record artifact handle/hash binding differs from the run record'
 $gpuProcessMatches = [Collections.Generic.List[object]]::new()
 foreach ($row in @($gpuProcesses.rows)) {
     [uint32]$observedPid = 0
@@ -489,8 +647,11 @@ foreach ($row in @($gpuProcesses.rows)) {
         )
     ) {
         try {
-            $observedArtifactPath =
-                [IO.Path]::GetFullPath([string]$row.process_name)
+            $observedArtifactBinding = Get-AstroExactWindowsFileBinding `
+                -Path ([string]$row.process_name) `
+                -Description (
+                    "matching NVIDIA process row $($row.source_line) executable"
+                )
         }
         catch {
             throw (
@@ -500,22 +661,81 @@ foreach ($row in @($gpuProcesses.rows)) {
                 $_.Exception.Message
             )
         }
-        if ([string]::Equals(
-                $observedArtifactPath,
-                $expectedArtifactPath,
+        if (
+            [string]$observedArtifactBinding.evidence.file_id -ceq
+                [string]$expectedArtifactBinding.evidence.file_id -and
+            [string]$observedArtifactBinding.evidence.sha256 -ceq
+                [string]$expectedArtifactBinding.evidence.sha256 -and
+            [string]::Equals(
+                [string]$observedArtifactBinding.evidence.final_path,
+                [string]$expectedArtifactBinding.evidence.final_path,
                 [StringComparison]::OrdinalIgnoreCase
-            )) {
-            [void]$gpuProcessMatches.Add($row)
+            )
+        ) {
+            [void]$gpuProcessMatches.Add([pscustomobject][ordered]@{
+                    row = $row
+                    binding = $observedArtifactBinding.evidence
+                    handle = $observedArtifactBinding.handle
+                })
+        }
+        else {
+            $observedArtifactBinding.handle.Dispose()
         }
     }
 }
 Assert-Astro ($gpuProcessMatches.Count -eq 1) `
     'CALYX_FORGE_CUDA_FSV_NVIDIA_PROCESS_MATCH_INVALID' `
     "expected exactly one PID/path/UUID-bound GPU process row, observed $($gpuProcessMatches.Count)"
+$selectedProcess = $gpuProcessMatches[0]
+$producerBindingPath =
+    Join-Path $payload 'nvidia-smi-process-binding.json'
+$producerBinding =
+    Get-Content -LiteralPath $producerBindingPath -Raw |
+        ConvertFrom-Json
+$producerExpectedDisplay = ConvertTo-AstroStrictDisplayWindowsFilePath `
+    -Path ([string]$producerBinding.expected.canonical_path) `
+    -Description 'producer expected canonical executable'
+$producerObservedDisplay = ConvertTo-AstroStrictDisplayWindowsFilePath `
+    -Path ([string]$producerBinding.observed.canonical_path) `
+    -Description 'producer observed canonical executable'
+Assert-Astro (
+    $producerBinding.schema -ceq
+        'calyx.forge.cuda-kernel-process-binding.v1' -and
+    [uint32]$producerBinding.pid -eq $expectedPid -and
+    [string]$producerBinding.gpu_uuid -ceq $ExpectedDeviceUuid -and
+    [uint64]$producerBinding.source_line -eq
+        [uint64]$selectedProcess.row.source_line -and
+    [string]$producerBinding.observed.raw_path -ceq
+        [string]$selectedProcess.row.process_name -and
+    [bool]$producerBinding.canonical_paths_equal -and
+    [uint64]$producerBinding.artifact.bytes -eq
+        [uint64]$runRecord.artifact.bytes -and
+    [string]$producerBinding.artifact.sha256 -ceq
+        [string]$runRecord.artifact.sha256 -and
+    [string]::Equals(
+        $producerExpectedDisplay,
+        [string]$expectedArtifactBinding.evidence.final_path,
+        [StringComparison]::OrdinalIgnoreCase
+    ) -and
+    [string]::Equals(
+        $producerObservedDisplay,
+        [string]$selectedProcess.binding.final_path,
+        [StringComparison]::OrdinalIgnoreCase
+    )
+) 'CALYX_FORGE_CUDA_FSV_PRODUCER_PROCESS_BINDING_INVALID' `
+    'producer raw/canonical executable binding differs from independent handle/FILE_ID/hash readback'
 $gpuReadback = [ordered]@{
-    schema = 'calyx.forge.cuda-kernel-nvidia-readback.v1'
+    schema = 'calyx.forge.cuda-kernel-nvidia-readback.v2'
     selected_gpu = $gpuIdentityMatches[0]
-    selected_process = $gpuProcessMatches[0]
+    selected_process = $selectedProcess.row
+    path_binding = [ordered]@{
+        expected = $expectedArtifactBinding.evidence
+        observed = $selectedProcess.binding
+        same_final_path = $true
+        same_file_id = $true
+        same_sha256 = $true
+    }
+    producer_binding = $producerBinding
     gpu_source = [ordered]@{
         path = $gpuIdentity.path
         bytes = $gpuIdentity.bytes
@@ -548,7 +768,13 @@ $analysisDirectory = Join-Path $payload 'binary-analysis'
 [IO.Directory]::CreateDirectory($analysisDirectory) | Out-Null
 $gpuReadbackPath = Join-Path $analysisDirectory 'nvidia-readback.json'
 $gpuReadbackJson = $gpuReadback | ConvertTo-Json -Depth 8
-Write-AstroReadbackText $gpuReadbackPath $gpuReadbackJson
+try {
+    Write-AstroReadbackText $gpuReadbackPath $gpuReadbackJson
+}
+finally {
+    $selectedProcess.handle.Dispose()
+    $expectedArtifactBinding.handle.Dispose()
+}
 $cuobjdump = Join-Path $env:CUDA_PATH 'bin\cuobjdump.exe'
 $nvdisasm = Join-Path $env:CUDA_PATH 'bin\nvdisasm.exe'
 Assert-Astro (

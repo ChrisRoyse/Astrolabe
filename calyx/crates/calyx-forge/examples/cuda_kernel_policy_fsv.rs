@@ -88,7 +88,7 @@ mod enabled {
             &serde_json::to_value(&loaded_modules)?,
         )?;
         let gpu_identity = capture_gpu_identity_state(&ctx, &output_dir)?;
-        let gpu_processes = capture_gpu_process_state(&ctx, &output_dir)?;
+        let (gpu_processes, gpu_process_binding) = capture_gpu_process_state(&ctx, &output_dir)?;
         let edges = exercise_edges(&backend, &output_dir)?;
 
         #[cfg(feature = "cuda-policy-measurement")]
@@ -132,6 +132,7 @@ mod enabled {
                 "mxfp8_output": "mxfp8-output.f32le",
                 "gpu_identity": "nvidia-smi-gpu.csv",
                 "gpu_processes": "nvidia-smi-compute-apps.csv",
+                "gpu_process_binding": "nvidia-smi-process-binding.json",
                 "evidence_inventory": "evidence-inventory.json",
             },
             "distance": distance,
@@ -140,6 +141,7 @@ mod enabled {
             "loaded_modules": loaded_modules,
             "gpu_identity": gpu_identity,
             "gpu_processes": gpu_processes,
+            "gpu_process_binding": gpu_process_binding,
             "edges": edges,
             "measurement": measurement,
             "evidence_inventory": evidence_inventory,
@@ -499,7 +501,10 @@ mod enabled {
         Ok(stdout)
     }
 
-    fn capture_gpu_process_state(ctx: &CudaContext, output_dir: &Path) -> AnyResult<String> {
+    fn capture_gpu_process_state(
+        ctx: &CudaContext,
+        output_dir: &Path,
+    ) -> AnyResult<(String, Value)> {
         let output = Command::new("nvidia-smi.exe")
             .args([
                 "--query-compute-apps=pid,process_name,gpu_uuid,used_gpu_memory",
@@ -514,17 +519,24 @@ mod enabled {
             ),
         )?;
         let stdout = String::from_utf8(output.stdout)?;
+        write_and_verify(
+            &output_dir.join("nvidia-smi-compute-apps.csv"),
+            stdout.as_bytes(),
+        )?;
         let expected_pid = std::process::id();
-        let expected_executable = std::env::current_exe()?;
-        let expected_executable = expected_executable.to_str().ok_or_else(|| {
+        let expected_executable_path = std::env::current_exe()?;
+        let expected_executable = expected_executable_path.to_str().ok_or_else(|| {
             format!(
                 "current FSV executable path is not Unicode: {}",
-                expected_executable.display()
+                expected_executable_path.display()
             )
         })?;
+        let expected_canonical =
+            canonical_existing_windows_file_path(expected_executable, "current FSV executable")?;
         let expected_uuid = ctx.physical_identity().canonical_uuid();
         let rows = parse_nvidia_csv_rows(&stdout, 4, "compute process")?;
         let mut matching_rows = 0usize;
+        let mut selected_binding = None;
         for (line_number, fields) in &rows {
             let pid = fields[0].parse::<u32>().map_err(|error| {
                 format!(
@@ -541,24 +553,150 @@ mod enabled {
                     "nvidia-smi compute-process row {line_number} has an invalid physical schema"
                 ),
             )?;
-            if pid == expected_pid
-                && fields[1].eq_ignore_ascii_case(expected_executable)
-                && fields[2].eq_ignore_ascii_case(&expected_uuid)
-            {
-                matching_rows += 1;
+            if pid == expected_pid && fields[2].eq_ignore_ascii_case(&expected_uuid) {
+                let observed_canonical = canonical_existing_windows_file_path(
+                    &fields[1],
+                    &format!("nvidia-smi compute-process row {line_number} executable"),
+                )?;
+                if observed_canonical == expected_canonical {
+                    matching_rows += 1;
+                    selected_binding = Some(json!({
+                        "schema": "calyx.forge.cuda-kernel-process-binding.v1",
+                        "pid": expected_pid,
+                        "gpu_uuid": expected_uuid,
+                        "source_line": line_number,
+                        "expected": {
+                            "raw_path": expected_executable,
+                            "canonical_path": expected_canonical,
+                        },
+                        "observed": {
+                            "raw_path": fields[1],
+                            "canonical_path": observed_canonical,
+                        },
+                        "canonical_paths_equal": true,
+                    }));
+                }
             }
         }
         require(
             matching_rows == 1,
             &format!(
-                "nvidia-smi reported {matching_rows} exact live FSV process rows; expected one pid={expected_pid} executable={expected_executable} gpu_uuid={expected_uuid}"
+                "nvidia-smi reported {matching_rows} exact live FSV process rows; expected one pid={expected_pid} raw_executable={expected_executable} canonical_executable={expected_canonical} gpu_uuid={expected_uuid}"
             ),
         )?;
-        write_and_verify(
-            &output_dir.join("nvidia-smi-compute-apps.csv"),
-            stdout.as_bytes(),
+        let mut binding = selected_binding.ok_or("matched process row has no path binding")?;
+        let executable_bytes = fs::read(&expected_canonical)?;
+        binding["artifact"] = json!({
+            "bytes": executable_bytes.len(),
+            "sha256": sha256_hex(&executable_bytes),
+        });
+        write_json(
+            &output_dir.join("nvidia-smi-process-binding.json"),
+            &binding,
         )?;
-        Ok(stdout)
+        Ok((stdout, binding))
+    }
+
+    fn canonical_existing_windows_file_path(raw: &str, description: &str) -> AnyResult<String> {
+        require(
+            valid_absolute_windows_file_path(raw),
+            &format!(
+                "{description} is not one strict absolute ordinary/extended DOS-or-UNC file path: {raw}"
+            ),
+        )?;
+        let canonical = fs::canonicalize(raw).map_err(|error| {
+            format!(
+                "canonicalize {description} '{raw}' through the Windows file API failed: {error}"
+            )
+        })?;
+        require(
+            canonical.is_file(),
+            &format!(
+                "{description} canonical path is not an existing file: {}",
+                canonical.display()
+            ),
+        )?;
+        let canonical = canonical.to_str().ok_or_else(|| {
+            format!(
+                "{description} canonical path is not Unicode: {}",
+                canonical.display()
+            )
+        })?;
+        require(
+            valid_canonical_windows_file_path(canonical),
+            &format!(
+                "{description} canonical path is not an extended-length DOS-or-UNC file path: {canonical}"
+            ),
+        )?;
+        Ok(canonical.to_owned())
+    }
+
+    fn valid_absolute_windows_file_path(raw: &str) -> bool {
+        if raw.is_empty()
+            || raw.contains('/')
+            || raw
+                .chars()
+                .any(|character| character == '\0' || character.is_control())
+        {
+            return false;
+        }
+        let display = if let Some(tail) = strip_prefix_ignore_ascii_case(raw, r"\\?\UNC\") {
+            format!(r"\\{tail}")
+        } else if let Some(tail) = strip_prefix_ignore_ascii_case(raw, r"\\?\") {
+            if !valid_drive_absolute_path(tail) {
+                return false;
+            }
+            tail.to_owned()
+        } else {
+            raw.to_owned()
+        };
+        if display.starts_with(r"\\.\") || display.starts_with(r"\\?\") || display.ends_with('\\') {
+            return false;
+        }
+        valid_drive_absolute_path(&display) || valid_unc_absolute_path(&display)
+    }
+
+    fn valid_canonical_windows_file_path(path: &str) -> bool {
+        if let Some(tail) = strip_prefix_ignore_ascii_case(path, r"\\?\UNC\") {
+            return valid_unc_absolute_path(&format!(r"\\{tail}"));
+        }
+        strip_prefix_ignore_ascii_case(path, r"\\?\").is_some_and(valid_drive_absolute_path)
+    }
+
+    fn strip_prefix_ignore_ascii_case<'a>(value: &'a str, prefix: &str) -> Option<&'a str> {
+        value
+            .get(..prefix.len())
+            .filter(|candidate| candidate.eq_ignore_ascii_case(prefix))
+            .map(|_| &value[prefix.len()..])
+    }
+
+    fn valid_drive_absolute_path(path: &str) -> bool {
+        let bytes = path.as_bytes();
+        bytes.len() > 3
+            && bytes[0].is_ascii_alphabetic()
+            && bytes[1] == b':'
+            && bytes[2] == b'\\'
+            && valid_windows_components(&path[3..])
+    }
+
+    fn valid_unc_absolute_path(path: &str) -> bool {
+        let Some(tail) = path.strip_prefix(r"\\") else {
+            return false;
+        };
+        let components = tail.split('\\').collect::<Vec<_>>();
+        components.len() >= 3
+            && components[0] != "."
+            && components[0] != "?"
+            && components
+                .iter()
+                .all(|component| !component.is_empty() && *component != "." && *component != "..")
+    }
+
+    fn valid_windows_components(tail: &str) -> bool {
+        !tail.is_empty()
+            && tail
+                .split('\\')
+                .all(|component| !component.is_empty() && component != "." && component != "..")
     }
 
     fn parse_nvidia_csv_rows(
