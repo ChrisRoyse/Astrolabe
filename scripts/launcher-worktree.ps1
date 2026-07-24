@@ -367,25 +367,28 @@ function Assert-AstroNoWorktreeProcessReferences {
         if ([int]$row.ProcessId -eq $PID) {
             continue
         }
-        $referencesPath =
+        $executablePath = [string]$row.ExecutablePath
+        $commandLine = [string]$row.CommandLine
+        $referencesPath = [bool](
             (
                 -not [string]::IsNullOrWhiteSpace(
-                    [string]$row.ExecutablePath
+                    $executablePath
                 ) -and
-                [string]$row.ExecutablePath.StartsWith(
+                $executablePath.StartsWith(
                     $Path,
                     [StringComparison]::OrdinalIgnoreCase
                 )
             ) -or
             (
                 -not [string]::IsNullOrWhiteSpace(
-                    [string]$row.CommandLine
+                    $commandLine
                 ) -and
-                [string]$row.CommandLine.IndexOf(
+                $commandLine.IndexOf(
                     $Path,
                     [StringComparison]::OrdinalIgnoreCase
                 ) -ge 0
             )
+        )
         if (-not $referencesPath) {
             continue
         }
@@ -395,8 +398,8 @@ function Assert-AstroNoWorktreeProcessReferences {
                 creation_date = [string]$row.CreationDate
                 exact_probe_state = $probe.State
                 process_start_utc_ticks = $probe.ProcessStartUtcTicks
-                executable_path = [string]$row.ExecutablePath
-                command_line = [string]$row.CommandLine
+                executable_path = $executablePath
+                command_line = $commandLine
             })
     }
     if ($references.Count -ne 0) {
