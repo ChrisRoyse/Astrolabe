@@ -1,11 +1,18 @@
 #!/bin/sh
-# #519/#424: authoritative backstop. A nonzero exit in Git's prepared reference
-# transaction state aborts before any ref is committed. Scope is HEAD and local branches;
+# #519/#424: authoritative ref-only backstop. Git 2.54 exposes `preparing` before
+# it acquires ref locks, while `prepared` remains the last-chance state on older/current
+# implementations. Refuse in either pre-commit phase. Scope is HEAD and local branches;
 # remote-tracking updates do not mutate the evidence tree and remain allowed.
 
 state="$1"
 updates=$(cat)
-[ "$state" = "prepared" ] || exit 0
+case "$state" in
+    preparing|prepared)
+        ;;
+    *)
+        exit 0
+        ;;
+esac
 
 mutating=0
 while IFS=' ' read -r old_value new_value refname; do

@@ -677,6 +677,395 @@ function Get-AstroRepoEvidenceState {
     return [pscustomobject]@{ HeadSha = $headSha; StatusSha256 = $statusSha; DiffSha256 = $diffSha }
 }
 
+function Get-AstroGitPath {
+    param(
+        [Parameter(Mandatory)][string]$GitExe,
+        [Parameter(Mandatory)][string]$Root,
+        [Parameter(Mandatory)][string]$GitPath
+    )
+
+    $capture = Invoke-NativeCapture `
+        -Exe $GitExe `
+        -Arguments @(
+            "-C",
+            $Root,
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-path",
+            $GitPath
+        )
+    $value = (@($capture.Output) -join "`n").Trim()
+    if ($capture.ExitCode -ne 0 -or
+        [string]::IsNullOrWhiteSpace($value) -or
+        -not [IO.Path]::IsPathRooted($value)) {
+        throw "GIT_FREEZE[ASTRO_GIT_PATH_UNREADABLE]: {code=ASTRO_GIT_PATH_UNREADABLE; message=`"git could not resolve absolute path '$GitPath' for evidence root '$Root' (exit=$($capture.ExitCode), output=$value)`"; remediation=`"repair the registered worktree metadata before acquiring a native evidence lease`"}"
+    }
+    return [IO.Path]::GetFullPath($value)
+}
+
+function Get-AstroGitFrozenSourcePaths {
+    # Git pathnames are arbitrary byte sequences except NUL and slash. Native PowerShell's
+    # line-oriented command adapter cannot represent a newline-bearing pathname without
+    # ambiguity, so read the authoritative `-z` stream as bytes and decode strict UTF-8.
+    param(
+        [Parameter(Mandatory)][string]$GitExe,
+        [Parameter(Mandatory)][string]$Root
+    )
+
+    $rootArgument = [IO.Path]::GetFullPath($Root).TrimEnd('\', '/')
+    if ($rootArgument.Contains('"')) {
+        throw "GIT_FREEZE[ASTRO_GIT_SOURCE_LIST_UNREADABLE]: {code=ASTRO_GIT_SOURCE_LIST_UNREADABLE; message=`"workspace path contains a quote and cannot be passed to the exact native Git pathname reader: $rootArgument`"; remediation=`"use the canonical checkout or a registered worktree whose absolute path contains no quote`"}"
+    }
+    $start = [Diagnostics.ProcessStartInfo]::new()
+    $start.FileName = $GitExe
+    $start.Arguments = "-C `"$rootArgument`" -c core.quotepath=false ls-files -z --cached --others --exclude-standard"
+    $start.UseShellExecute = $false
+    $start.CreateNoWindow = $true
+    $start.RedirectStandardOutput = $true
+    $start.RedirectStandardError = $true
+    $process = [Diagnostics.Process]::new()
+    $process.StartInfo = $start
+    $stdout = [IO.MemoryStream]::new()
+    try {
+        if (-not $process.Start()) {
+            throw 'native Git process did not start'
+        }
+        $stderrTask = $process.StandardError.ReadToEndAsync()
+        $process.StandardOutput.BaseStream.CopyTo($stdout)
+        $process.WaitForExit()
+        $stderr = $stderrTask.GetAwaiter().GetResult()
+        if ($process.ExitCode -ne 0) {
+            throw "native Git exited $($process.ExitCode): $stderr"
+        }
+        $bytes = $stdout.ToArray()
+    }
+    catch {
+        throw "GIT_FREEZE[ASTRO_GIT_SOURCE_LIST_UNREADABLE]: {code=ASTRO_GIT_SOURCE_LIST_UNREADABLE; message=`"could not read the exact NUL-delimited tracked/untracked source set: $($_.Exception.Message)`"; remediation=`"repair Git worktree/index readability before acquiring evidence`"}"
+    }
+    finally {
+        $stdout.Dispose()
+        $process.Dispose()
+    }
+
+    if ($bytes.Length -eq 0) {
+        return @()
+    }
+    if ($bytes[$bytes.Length - 1] -ne 0) {
+        throw "GIT_FREEZE[ASTRO_GIT_SOURCE_LIST_INVALID]: {code=ASTRO_GIT_SOURCE_LIST_INVALID; message=`"git ls-files -z did not terminate its nonempty pathname stream with NUL`"; remediation=`"repair or replace the native Git executable before acquiring evidence`"}"
+    }
+    try {
+        $text = [Text.UTF8Encoding]::new($false, $true).GetString($bytes)
+    }
+    catch {
+        throw "GIT_FREEZE[ASTRO_GIT_SOURCE_LIST_INVALID]: {code=ASTRO_GIT_SOURCE_LIST_INVALID; message=`"git emitted a pathname that is not strict UTF-8: $($_.Exception.Message)`"; remediation=`"rename the unsupported path explicitly before acquiring native Windows evidence`"}"
+    }
+    $parts = @($text.Split([char]0))
+    if ($parts.Count -eq 0 -or $parts[$parts.Count - 1] -cne '') {
+        throw "GIT_FREEZE[ASTRO_GIT_SOURCE_LIST_INVALID]: {code=ASTRO_GIT_SOURCE_LIST_INVALID; message=`"the exact Git pathname stream has an invalid terminal record`"; remediation=`"repair the repository index before acquiring evidence`"}"
+    }
+    if ($parts.Count -eq 1) {
+        return @()
+    }
+    return @($parts[0..($parts.Count - 2)])
+}
+
+function New-AstroGitMutationFreezeLease {
+    # #519: Git's own lockfile protocol creates <gitdir>/index.lock with O_EXCL before
+    # index-backed porcelain may update either the index or worktree. Hold that exact name
+    # with DELETE_ON_CLOSE for the dedicated launcher's process lifetime. A normal or abrupt
+    # owner exit therefore removes it in-kernel; while live, commit/merge/checkout/reset/add/
+    # restore fail before their first index/worktree write even when hooks are overridden.
+    #
+    # Retained FILE_SHARE_READ-only handles over the complete tracked + visible-untracked
+    # source set independently deny write/delete/rename of every existing evidence byte.
+    # The source set is re-fingerprinted after every handle is acquired, closing the
+    # enumeration/open race. The reference-transaction hook remains the ref-only backstop.
+    param(
+        [Parameter(Mandatory)][string]$GitExe,
+        [Parameter(Mandatory)][string]$Root,
+        [Parameter(Mandatory)][int]$Issue,
+        [Parameter(Mandatory)][long]$OwnerProcessStartUtcTicks,
+        [Parameter(Mandatory)][string]$LauncherLockPath,
+        [Parameter(Mandatory)][string]$LauncherLockSha256,
+        [Parameter(Mandatory)]$EvidenceBefore
+    )
+
+    $handles = [Collections.Generic.List[IO.FileStream]]::new()
+    $handleRecords = [Collections.Generic.List[object]]::new()
+    $indexInterlock = $null
+    $indexInterlockPath = Get-AstroGitPath `
+        -GitExe $GitExe `
+        -Root $Root `
+        -GitPath 'index.lock'
+    $indexParent = [IO.Path]::GetDirectoryName($indexInterlockPath)
+    $indexParentState = Get-AstroPathEntryState $indexParent
+    if ($indexParentState.State -cne 'present' -or
+        ($indexParentState.Attributes -band [IO.FileAttributes]::Directory) -eq 0 -or
+        ($indexParentState.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw "GIT_FREEZE[ASTRO_GIT_INDEX_INTERLOCK_PARENT_INVALID]: {code=ASTRO_GIT_INDEX_INTERLOCK_PARENT_INVALID; message=`"Git index-lock parent is not one ordinary directory (state=$($indexParentState.State), attributes=$($indexParentState.Attributes), error=$($indexParentState.Error)): $indexParent`"; remediation=`"repair the registered worktree Git directory before acquiring evidence`"}"
+    }
+
+    $interlockJson = [ordered]@{
+        schema = 'astrolabe.git-index-interlock.v1'
+        pid = $PID
+        issue = $Issue
+        owner_process_start_utc_ticks = $OwnerProcessStartUtcTicks
+        launcher_lock_path = [IO.Path]::GetFullPath($LauncherLockPath)
+        launcher_lock_sha256 = $LauncherLockSha256
+        head_sha = $EvidenceBefore.HeadSha
+        status_sha256 = $EvidenceBefore.StatusSha256
+        diff_sha256 = $EvidenceBefore.DiffSha256
+        created_utc = [DateTime]::UtcNow.ToString('o')
+    } | ConvertTo-Json -Compress
+    $interlockBytes = [Text.UTF8Encoding]::new($false).GetBytes($interlockJson)
+    $interlockHash = Get-AstroByteSha256 $interlockBytes
+
+    try {
+        $options = [IO.FileOptions]::DeleteOnClose -bor
+            [IO.FileOptions]::WriteThrough
+        try {
+            $indexInterlock = [IO.FileStream]::new(
+                $indexInterlockPath,
+                [IO.FileMode]::CreateNew,
+                [IO.FileAccess]::ReadWrite,
+                [IO.FileShare]::Read,
+                4096,
+                $options
+            )
+        }
+        catch {
+            $existing = Get-AstroPathEntryState $indexInterlockPath
+            throw "GIT_FREEZE[ASTRO_GIT_INDEX_INTERLOCK_HELD]: {code=ASTRO_GIT_INDEX_INTERLOCK_HELD; message=`"could not exclusively create the Git pre-write interlock (state=$($existing.State), attributes=$($existing.Attributes), error=$($existing.Error)): $indexInterlockPath; native=$($_.Exception.Message)`"; remediation=`"wait for the real Git writer to finish, or inspect and recover its index.lock through Git's documented lockfile lifecycle before retrying`"}"
+        }
+        $indexInterlock.Write(
+            $interlockBytes,
+            0,
+            $interlockBytes.Length
+        )
+        $indexInterlock.Flush($true)
+        $indexInterlock.Position = 0
+        $observed = [byte[]]::new($interlockBytes.Length)
+        $offset = 0
+        while ($offset -lt $observed.Length) {
+            $read = $indexInterlock.Read(
+                $observed,
+                $offset,
+                $observed.Length - $offset
+            )
+            if ($read -le 0) {
+                throw "Git index interlock ended after $offset of $($observed.Length) bytes"
+            }
+            $offset += $read
+        }
+        if ([Convert]::ToBase64String($observed) -cne
+            [Convert]::ToBase64String($interlockBytes)) {
+            throw 'Git index interlock bytes differ after durable handle readback'
+        }
+        $indexFileId = [AstroLauncherLockNative]::GetFileIdentity(
+            $indexInterlock.SafeFileHandle
+        )
+
+        $relativePaths = @(
+            Get-AstroGitFrozenSourcePaths -GitExe $GitExe -Root $Root
+        )
+        $rootPrefix = [IO.Path]::GetFullPath($Root).TrimEnd('\', '/') + '\'
+        $normalizedRelativePaths = [Collections.Generic.List[string]]::new()
+        foreach ($relativePath in $relativePaths) {
+            if ([string]::IsNullOrWhiteSpace($relativePath) -or
+                [IO.Path]::IsPathRooted($relativePath)) {
+                throw "Git emitted an empty/absolute evidence path: '$relativePath'"
+            }
+            $fullPath = [IO.Path]::GetFullPath(
+                (Join-Path $Root $relativePath)
+            )
+            if (-not $fullPath.StartsWith(
+                    $rootPrefix,
+                    [StringComparison]::OrdinalIgnoreCase
+                )) {
+                throw "Git evidence path escapes the operating worktree: $relativePath -> $fullPath"
+            }
+            $state = Get-AstroPathEntryState $fullPath
+            if ($state.State -cne 'present' -or
+                ($state.Attributes -band [IO.FileAttributes]::Directory) -ne 0 -or
+                ($state.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+                throw "evidence source is not one present ordinary non-reparse file (state=$($state.State), attributes=$($state.Attributes), error=$($state.Error)): $fullPath"
+            }
+            try {
+                $handle = [IO.FileStream]::new(
+                    $fullPath,
+                    [IO.FileMode]::Open,
+                    [IO.FileAccess]::Read,
+                    [IO.FileShare]::Read,
+                    4096,
+                    [IO.FileOptions]::SequentialScan
+                )
+            }
+            catch {
+                throw "could not retain deny-write/delete evidence handle '$fullPath': $($_.Exception.Message)"
+            }
+            $handles.Add($handle)
+            $handleRecords.Add([pscustomobject]@{
+                    Path = $fullPath
+                    Handle = $handle
+                    FileId = [AstroLauncherLockNative]::GetFileIdentity(
+                        $handle.SafeFileHandle
+                    )
+                    Length = [uint64]$handle.Length
+                })
+            $normalizedRelativePaths.Add(
+                $relativePath.Replace('\', '/')
+            )
+        }
+
+        $metadataPaths = [Collections.Generic.List[string]]::new()
+        foreach ($gitPath in @('index', 'HEAD', 'packed-refs')) {
+            $metadataPath = Get-AstroGitPath `
+                -GitExe $GitExe `
+                -Root $Root `
+                -GitPath $gitPath
+            $metadataState = Get-AstroPathEntryState $metadataPath
+            if ($metadataState.State -ceq 'absent' -and
+                $gitPath -ceq 'packed-refs') {
+                continue
+            }
+            if ($metadataState.State -cne 'present' -or
+                ($metadataState.Attributes -band [IO.FileAttributes]::Directory) -ne 0 -or
+                ($metadataState.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+                throw "Git metadata '$gitPath' is not one present ordinary file (state=$($metadataState.State), attributes=$($metadataState.Attributes), error=$($metadataState.Error)): $metadataPath"
+            }
+            $metadataPaths.Add($metadataPath)
+        }
+        $symbolic = Invoke-NativeCapture `
+            -Exe $GitExe `
+            -Arguments @("-C", $Root, "symbolic-ref", "-q", "HEAD")
+        if ($symbolic.ExitCode -eq 0) {
+            $refName = (@($symbolic.Output) -join "`n").Trim()
+            if ($refName -notmatch '^refs/heads/[^\x00-\x1f]+$') {
+                throw "symbolic HEAD returned a noncanonical local ref: $refName"
+            }
+            $refPath = Get-AstroGitPath `
+                -GitExe $GitExe `
+                -Root $Root `
+                -GitPath $refName
+            if ((Get-AstroPathEntryState $refPath).State -ceq 'present') {
+                $metadataPaths.Add($refPath)
+            }
+        }
+        elseif ($symbolic.ExitCode -ne 1) {
+            throw "git symbolic-ref -q HEAD failed unexpectedly (exit=$($symbolic.ExitCode)): $(@($symbolic.Output) -join ' | ')"
+        }
+
+        foreach ($metadataPath in @($metadataPaths | Select-Object -Unique)) {
+            try {
+                $handle = [IO.FileStream]::new(
+                    $metadataPath,
+                    [IO.FileMode]::Open,
+                    [IO.FileAccess]::Read,
+                    [IO.FileShare]::Read,
+                    4096,
+                    [IO.FileOptions]::SequentialScan
+                )
+            }
+            catch {
+                throw "could not retain deny-write/delete Git-metadata handle '$metadataPath': $($_.Exception.Message)"
+            }
+            $handles.Add($handle)
+            $handleRecords.Add([pscustomobject]@{
+                    Path = $metadataPath
+                    Handle = $handle
+                    FileId = [AstroLauncherLockNative]::GetFileIdentity(
+                        $handle.SafeFileHandle
+                    )
+                    Length = [uint64]$handle.Length
+                })
+        }
+
+        $evidenceAfter = Get-AstroRepoEvidenceState `
+            -GitExe $GitExe `
+            -Root $Root
+        if ($evidenceAfter.HeadSha -cne $EvidenceBefore.HeadSha -or
+            $evidenceAfter.StatusSha256 -cne $EvidenceBefore.StatusSha256 -or
+            $evidenceAfter.DiffSha256 -cne $EvidenceBefore.DiffSha256) {
+            throw "repository changed while the index/source freeze was being acquired: head $($EvidenceBefore.HeadSha) -> $($evidenceAfter.HeadSha), status $($EvidenceBefore.StatusSha256) -> $($evidenceAfter.StatusSha256), diff $($EvidenceBefore.DiffSha256) -> $($evidenceAfter.DiffSha256)"
+        }
+        $pathSetText = (@($normalizedRelativePaths) -join "`0") + "`0"
+        $pathSetSha256 = Get-AstroByteSha256 (
+            [Text.UTF8Encoding]::new($false).GetBytes($pathSetText)
+        )
+        return [pscustomobject]@{
+            IndexInterlock = $indexInterlock
+            IndexInterlockPath = $indexInterlockPath
+            IndexInterlockFileId = $indexFileId
+            IndexInterlockSha256 = $interlockHash
+            IndexInterlockBytes = $interlockBytes
+            Handles = $handles
+            HandleRecords = $handleRecords
+            SourcePathCount = $normalizedRelativePaths.Count
+            MetadataPathCount = $metadataPaths.Count
+            PathSetSha256 = $pathSetSha256
+        }
+    }
+    catch {
+        $failure = $_
+        foreach ($handle in $handles) {
+            try { $handle.Dispose() } catch {}
+        }
+        if ($null -ne $indexInterlock) {
+            try { $indexInterlock.Dispose() } catch {}
+        }
+        $terminal = Get-AstroPathEntryState $indexInterlockPath
+        $suffix = if ($terminal.State -ceq 'absent') {
+            ''
+        }
+        else {
+            "; index_interlock_terminal_state=$($terminal.State); error=$($terminal.Error)"
+        }
+        throw "GIT_FREEZE[ASTRO_GIT_MUTATION_FREEZE_FAILED]: {code=ASTRO_GIT_MUTATION_FREEZE_FAILED; message=`"could not acquire the complete Git index/source mutation freeze: $($failure.Exception.Message)$suffix`"; remediation=`"preserve any non-absent Git lock, repair the named path/reader conflict, and retry from an unchanged checkout`"}"
+    }
+}
+
+function Assert-AstroGitMutationFreezeLease {
+    param([Parameter(Mandatory)]$Lease)
+
+    if ($null -eq $Lease.IndexInterlock -or
+        $Lease.IndexInterlock.SafeFileHandle.IsClosed) {
+        throw 'process-lifetime Git index interlock handle is closed'
+    }
+    $interlockFileId = [AstroLauncherLockNative]::GetFileIdentity(
+        $Lease.IndexInterlock.SafeFileHandle
+    )
+    if ($interlockFileId -cne $Lease.IndexInterlockFileId) {
+        throw "Git index interlock FILE_ID changed (expected=$($Lease.IndexInterlockFileId), observed=$interlockFileId)"
+    }
+    foreach ($record in $Lease.HandleRecords) {
+        $handle = $record.Handle
+        if ($null -eq $handle -or $handle.SafeFileHandle.IsClosed -or
+            -not [string]::Equals(
+                $handle.Name,
+                $record.Path,
+                [StringComparison]::OrdinalIgnoreCase
+            )) {
+            throw "frozen evidence handle is absent or changed: $($record.Path)"
+        }
+        $fileId = [AstroLauncherLockNative]::GetFileIdentity(
+            $handle.SafeFileHandle
+        )
+        if ($fileId -cne $record.FileId -or
+            [uint64]$handle.Length -ne [uint64]$record.Length) {
+            throw "frozen evidence handle identity/length changed: $($record.Path)"
+        }
+    }
+    return [pscustomobject]@{
+        IndexInterlockPath = $Lease.IndexInterlockPath
+        IndexInterlockFileId = $interlockFileId
+        IndexInterlockSha256 = $Lease.IndexInterlockSha256
+        SourcePathCount = $Lease.SourcePathCount
+        MetadataPathCount = $Lease.MetadataPathCount
+        PathSetSha256 = $Lease.PathSetSha256
+        HandleCount = $Lease.Handles.Count
+    }
+}
+
 function Assert-NoAmbientCargoTargetEscape {
     # #534/#566: the launcher exports an authoritative CARGO_TARGET_DIR (= $OwnedTargetRoot) so
     # every Cargo child is confined to the owned, cleaned root. An ambient CARGO_TARGET_DIR or
@@ -3621,6 +4010,7 @@ $sccacheDaemonStarted = $false
 $attributionManifest = $null
 $launcherProtocolDirectoryLease = $null
 $workspaceTempLease = $null
+$gitMutationFreezeLease = $null
 $previousTempEnvironment = @{}
 foreach ($name in @("TEMP", "TMP", "TMPDIR", "GIT_CEILING_DIRECTORIES", "ASTRO_NO_ESCAPE_ATTRIBUTION")) {
     $previousTempEnvironment[$name] = Get-Item -Path "Env:$name" -ErrorAction SilentlyContinue
@@ -4102,6 +4492,17 @@ try {
     $env:ASTRO_NO_ESCAPE_ATTRIBUTION = $attributionManifest
     Write-Output "NO_ESCAPE[ASTRO_ATTRIBUTION_RECORDING]: strict v3 kill-on-close process tree -> $attributionManifest; job=$launcherTreeJobObjectName; job_limit_flags=8192"
     Write-Output 'NO_ESCAPE[ASTRO_RETIRED_GATE_STORE_SCAN_ABSENT]: owned_paths is the canonical empty v2 set; no retired gate registry or operator-store Restart Manager scan is part of the production launcher (#621)'
+    $gitMutationFreezeLease = New-AstroGitMutationFreezeLease `
+        -GitExe $evidenceGitExe `
+        -Root $root `
+        -Issue $drivingIssue `
+        -OwnerProcessStartUtcTicks $launcherProcessStartUtcTicks `
+        -LauncherLockPath $launcherLock `
+        -LauncherLockSha256 $launcherLockSha256 `
+        -EvidenceBefore $repoEvidenceBefore
+    $gitFreezeReadback = Assert-AstroGitMutationFreezeLease `
+        $gitMutationFreezeLease
+    Write-Output "GIT_FREEZE[ASTRO_GIT_MUTATION_FREEZE_HELD]: index_lock=$($gitFreezeReadback.IndexInterlockPath); index_file_id=$($gitFreezeReadback.IndexInterlockFileId); index_sha256=$($gitFreezeReadback.IndexInterlockSha256); source_paths=$($gitFreezeReadback.SourcePathCount); metadata_paths=$($gitFreezeReadback.MetadataPathCount); handles=$($gitFreezeReadback.HandleCount); path_set_sha256=$($gitFreezeReadback.PathSetSha256); ownership=dedicated-process-lifetime-delete-on-close"
     # Active publication already proved the exact TEMP/manifest pair under the claim mutex.
     # Re-read the TEMP here; never create or repair subordinate protocol state after active.
     $workspaceTempState = Get-AstroPathEntryState $workspaceTemp
@@ -4762,6 +5163,17 @@ finally {
     # #424/#519: re-fingerprint the evidence tree before cleanup. A mismatch becomes a
     # cleanup error, preserving a red child and converting a green child to exit 71.
     try {
+        if ($null -eq $gitMutationFreezeLease) {
+            throw 'complete Git index/source mutation freeze was never acquired'
+        }
+        $gitFreezeTerminal = Assert-AstroGitMutationFreezeLease `
+            $gitMutationFreezeLease
+        Write-Output "GIT_FREEZE[ASTRO_GIT_MUTATION_FREEZE_STABLE]: index_file_id=$($gitFreezeTerminal.IndexInterlockFileId); source_paths=$($gitFreezeTerminal.SourcePathCount); metadata_paths=$($gitFreezeTerminal.MetadataPathCount); handles=$($gitFreezeTerminal.HandleCount); path_set_sha256=$($gitFreezeTerminal.PathSetSha256)"
+    }
+    catch {
+        $cleanupErrors += "GIT_FREEZE[ASTRO_GIT_MUTATION_FREEZE_UNVERIFIED]: {code=ASTRO_GIT_MUTATION_FREEZE_UNVERIFIED; message=`"the process-lifetime Git index/source freeze could not be re-verified: $($_.Exception.Message)`"; remediation=`"treat this run as non-evidence, preserve protocol state, and repair the exact handle/interlock fault before rebuilding`"}"
+    }
+    try {
         $repoEvidenceAfter = Get-AstroRepoEvidenceState -GitExe $evidenceGitExe -Root $root
         if ($repoEvidenceAfter.HeadSha -cne $repoEvidenceBefore.HeadSha -or
             $repoEvidenceAfter.StatusSha256 -cne $repoEvidenceBefore.StatusSha256 -or
@@ -5236,6 +5648,7 @@ finally {
         }
         Write-Output "CLEANUP[ASTRO_WORKSPACE_TEMP_ARCHIVE]: source=$workspaceTemp is absent; archive=$workspaceTempArchivePath is present"
         Write-Output "CLEANUP[ASTRO_LAUNCHER_PROTOCOL]: active lock, every transition, and direct attribution manifest are absent; append-only archive transaction remains at $($launcherStateArchiveTransaction.TransactionPath)"
+        Write-Output "GIT_FREEZE[ASTRO_GIT_MUTATION_FREEZE_PROCESS_LIFETIME]: index/source handles remain retained through dedicated owner exit; DELETE_ON_CLOSE removes the exact Git index interlock in-kernel"
     }
 }
 
