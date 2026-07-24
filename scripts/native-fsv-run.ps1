@@ -1362,19 +1362,65 @@ try {
         Fail-Astro 'ASTRO_FSV_ARTIFACT_MISSING' "staged artifact is absent: $artifact" 'stage a fresh native artifact'
     }
     Assert-NotReparseEntry $artifact 'staged native artifact'
+    $pristineEntries = @(
+        Get-AstroDirectoryEntriesLongPath $sessionDirectory
+    )
+    $expectedPristinePaths = @(
+        [IO.Path]::GetFullPath($receiptFull),
+        [IO.Path]::GetFullPath($artifact)
+    )
+    $pristinePaths = @(
+        $pristineEntries | ForEach-Object {
+            if ($_.PSIsContainer -or
+                ($_.Attributes -band
+                    [IO.FileAttributes]::ReparsePoint) -ne 0) {
+                Fail-Astro 'ASTRO_FSV_SESSION_NONPRISTINE' `
+                    "staged session contains a directory or reparse entry before its one allowed run: $($_.FullName)" `
+                    'preserve the session and use its exact completed, abandoned, or quarantine lifecycle'
+            }
+            [IO.Path]::GetFullPath($_.FullName)
+        }
+    )
+    if ($pristinePaths.Count -ne $expectedPristinePaths.Count -or
+        @($expectedPristinePaths | Where-Object {
+                $expected = $_
+                -not @($pristinePaths | Where-Object {
+                        [string]::Equals(
+                            $_,
+                            $expected,
+                            [StringComparison]::OrdinalIgnoreCase
+                        )
+                    }).Count
+            }).Count -ne 0) {
+        Fail-Astro 'ASTRO_FSV_SESSION_NONPRISTINE' `
+            "staged session is not the exact two-file pre-run state (entries=$($pristinePaths -join '; '))" `
+            'each staged session permits exactly one run; stage a fresh session for another invocation'
+    }
+    $claimedPaths = [Collections.Generic.HashSet[string]]::new(
+        [StringComparer]::OrdinalIgnoreCase
+    )
+    [void]$claimedPaths.Add([IO.Path]::GetFullPath($receiptFull))
+    [void]$claimedPaths.Add([IO.Path]::GetFullPath($artifact))
     foreach ($pair in @(
         @($StandardOutputPath, 'stdout'), @($StandardErrorPath, 'stderr'),
         @($RunRecordPath, 'run record'), @($LiveStatePath, 'live state')
     )) {
         $resolved = Assert-PathWithin ([string]$pair[0]) $sessionDirectory 'ASTRO_FSV_OUTPUT_ESCAPE' ([string]$pair[1])
+        if (-not $claimedPaths.Add($resolved)) {
+            Fail-Astro 'ASTRO_FSV_OUTPUT_COLLISION' `
+                "$($pair[1]) path collides with another immutable session path: $resolved" `
+                'use four distinct fresh output paths inside the staged session'
+        }
         if (Test-AstroPathLongPath -LiteralPath $resolved) {
             Fail-Astro 'ASTRO_FSV_OUTPUT_REUSE_REFUSED' "$($pair[1]) already exists: $resolved" 'use fresh output paths; FSV state is append-only and never overwritten'
         }
+        switch ([string]$pair[1]) {
+            'stdout' { $StandardOutputPath = $resolved }
+            'stderr' { $StandardErrorPath = $resolved }
+            'run record' { $RunRecordPath = $resolved }
+            'live state' { $LiveStatePath = $resolved }
+        }
     }
-    $StandardOutputPath = [IO.Path]::GetFullPath($StandardOutputPath)
-    $StandardErrorPath = [IO.Path]::GetFullPath($StandardErrorPath)
-    $RunRecordPath = [IO.Path]::GetFullPath($RunRecordPath)
-    $LiveStatePath = [IO.Path]::GetFullPath($LiveStatePath)
     $runRecordAuthorized = $true
 
     $launcherOwner = Read-AstroLauncherLock -LockPath $launcherLockPath
