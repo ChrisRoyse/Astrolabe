@@ -1400,13 +1400,46 @@ int cbm_gbuf_delete_by_file(cbm_gbuf_t *gb, const char *file_path) {
     return deleted_count;
 }
 
+static void log_load_store_verification_failure(const char *db_path, const char *project,
+                                                cbm_store_verify_status_t status,
+                                                const cbm_store_verify_result_t *verification) {
+    const char *code = "CBM_GRAPH_STORE_VERIFICATION_FAILED";
+    if (status == CBM_STORE_VERIFY_SOURCE_MISSING) {
+        code = "CBM_GRAPH_STORE_SOURCE_MISSING";
+    } else if (status == CBM_STORE_VERIFY_INTEGRITY_FAILED) {
+        code = "CBM_GRAPH_STORE_INTEGRITY_FAILED";
+    }
+    char status_buf[CBM_SZ_16];
+    char native_error_buf[CBM_SZ_32];
+    char sqlite_error_buf[CBM_SZ_32];
+    snprintf(status_buf, sizeof(status_buf), "%d", (int)status);
+    snprintf(native_error_buf, sizeof(native_error_buf), "%lu",
+             (unsigned long)verification->native_error);
+    snprintf(sqlite_error_buf, sizeof(sqlite_error_buf), "%d", verification->sqlite_error);
+    cbm_log_error(
+        "gbuf.load_store_refused", "code", code, "project", project ? project : "", "db_path",
+        db_path ? db_path : "", "verification_status", status_buf, "operation",
+        verification->operation, "native_error", native_error_buf, "sqlite_error", sqlite_error_buf,
+        "detail", verification->detail, "message",
+        "the source graph store could not be verified for an immutable read", "remediation",
+        "preserve the database, WAL, and SHM together; repair the exact reported source-family "
+        "failure, then retry");
+}
+
 int cbm_gbuf_load_from_db(cbm_gbuf_t *gb, const char *db_path, const char *project) {
     if (!gb || !db_path || !project) {
         return CBM_NOT_FOUND;
     }
 
-    cbm_store_t *store = cbm_store_open_path(db_path);
-    if (!store) {
+    cbm_store_t *store = NULL;
+    cbm_store_verify_result_t verification;
+    cbm_store_verify_status_t verify_status =
+        cbm_store_open_path_query_verified(db_path, &store, &verification);
+    if (verify_status != CBM_STORE_VERIFY_OK || !store) {
+        if (store) {
+            cbm_store_close(store);
+        }
+        log_load_store_verification_failure(db_path, project, verify_status, &verification);
         return CBM_NOT_FOUND;
     }
 

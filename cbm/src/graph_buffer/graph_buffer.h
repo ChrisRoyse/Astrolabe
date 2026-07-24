@@ -155,8 +155,9 @@ int cbm_gbuf_delete_by_label(cbm_gbuf_t *gb, const char *label);
  * Used by incremental indexing to remove stale nodes before re-extraction. */
 int cbm_gbuf_delete_by_file(cbm_gbuf_t *gb, const char *file_path);
 
-/* Bulk-load all nodes and edges for a project from an existing SQLite DB
- * into this graph buffer. Returns 0 on success. */
+/* Bulk-load all nodes and edges for a project from a source-preserving verified
+ * read-only SQLite connection into this graph buffer. The source DB/WAL/SHM
+ * family is never opened through a writer or mutated. Returns 0 on success. */
 int cbm_gbuf_load_from_db(cbm_gbuf_t *gb, const char *db_path, const char *project);
 
 /* Iterate all live nodes (not deleted from QN index). */
