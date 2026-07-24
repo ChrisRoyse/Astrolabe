@@ -7,6 +7,10 @@ param(
     [switch]$Bootstrap,
     [string]$Command,
     [string]$CommandArgsJson = "[]",
+    # #615: explicit multi-command batches run inside one dedicated launcher
+    # process/lease. Each entry is a nonempty JSON string array whose first
+    # element is the command and remaining elements are its arguments.
+    [string]$BatchCommandsJson = "",
     # #317: positive driving GitHub issue recorded in every launcher lock.
     # String input permits a stable fail-closed refusal for malformed values.
     [string]$Issue = "",
@@ -132,6 +136,183 @@ function Write-NewDurableUtf8File {
     }
     finally {
         $stream.Dispose()
+    }
+}
+
+function Get-AstroUtf8Sha256 {
+    param([Parameter(Mandatory)][string]$Value)
+
+    $bytes = [Text.UTF8Encoding]::new($false, $true).GetBytes($Value)
+    $sha = [Security.Cryptography.SHA256]::Create()
+    try {
+        return ([BitConverter]::ToString(
+                $sha.ComputeHash($bytes)
+            ) -replace '-', '').ToLowerInvariant()
+    }
+    finally {
+        $sha.Dispose()
+    }
+}
+
+function ConvertFrom-AstroCommandPlan {
+    param(
+        [AllowEmptyString()][string]$SingleCommand,
+        [Parameter(Mandatory)][string]$SingleArgsJson,
+        [AllowEmptyString()][string]$BatchJson
+    )
+
+    if (-not [string]::IsNullOrWhiteSpace($BatchJson)) {
+        if (-not [string]::IsNullOrWhiteSpace($SingleCommand) -or
+            $SingleArgsJson -cne '[]') {
+            throw "LAUNCHER_BATCH[ASTRO_BATCH_ARGUMENT_CONFLICT]: {code=ASTRO_BATCH_ARGUMENT_CONFLICT; message=`"BatchCommandsJson is mutually exclusive with Command and CommandArgsJson`"; remediation=`"pass either one single command or one explicit nested-array batch`"}"
+        }
+        try {
+            # Wrap the root so Windows PowerShell 5.1 and PowerShell 7 preserve
+            # even a one-entry outer JSON array instead of pipeline-unrolling it.
+            $parsedBatchEnvelope = ConvertFrom-Json `
+                -InputObject ('{"value":' + $BatchJson + '}')
+            $batchEnvelopeProperties =
+                @($parsedBatchEnvelope.PSObject.Properties.Name)
+            if ($batchEnvelopeProperties.Count -ne 1 -or
+                $batchEnvelopeProperties[0] -cne 'value') {
+                throw 'JSON text escaped the single-value batch envelope'
+            }
+            $parsedBatch = $parsedBatchEnvelope.value
+        }
+        catch {
+            throw "LAUNCHER_BATCH[ASTRO_BATCH_JSON_INVALID]: {code=ASTRO_BATCH_JSON_INVALID; message=`"BatchCommandsJson is not valid JSON: $($_.Exception.Message)`"; remediation=`"pass a JSON array containing at least two nonempty command string arrays`"}"
+        }
+        if ($parsedBatch -isnot [System.Collections.IEnumerable] -or
+            $parsedBatch -is [string]) {
+            throw "LAUNCHER_BATCH[ASTRO_BATCH_SHAPE_INVALID]: {code=ASTRO_BATCH_SHAPE_INVALID; message=`"BatchCommandsJson root must be an array`"; remediation=`"pass a nested JSON string-array batch`"}"
+        }
+        $rawEntries = @($parsedBatch)
+        if ($rawEntries.Count -lt 2) {
+            throw "LAUNCHER_BATCH[ASTRO_BATCH_CARDINALITY_INVALID]: {code=ASTRO_BATCH_CARDINALITY_INVALID; message=`"an explicit batch must contain at least two commands; observed $($rawEntries.Count)`"; remediation=`"use Command/CommandArgsJson for one command or supply at least two batch entries`"}"
+        }
+        $plan = [Collections.Generic.List[object]]::new()
+        for ($index = 0; $index -lt $rawEntries.Count; $index++) {
+            $entry = $rawEntries[$index]
+            if ($entry -isnot [System.Collections.IEnumerable] -or
+                $entry -is [string]) {
+                throw "LAUNCHER_BATCH[ASTRO_BATCH_ENTRY_INVALID]: {code=ASTRO_BATCH_ENTRY_INVALID; message=`"batch entry $index is not a JSON string array`"; remediation=`"represent every command as [command,arg1,...]`"}"
+            }
+            $values = @($entry)
+            if ($values.Count -eq 0) {
+                throw "LAUNCHER_BATCH[ASTRO_BATCH_ENTRY_EMPTY]: {code=ASTRO_BATCH_ENTRY_EMPTY; message=`"batch entry $index is empty`"; remediation=`"supply a nonblank command as the first element`"}"
+            }
+            foreach ($value in $values) {
+                if ($value -isnot [string]) {
+                    throw "LAUNCHER_BATCH[ASTRO_BATCH_ENTRY_NONSTRING]: {code=ASTRO_BATCH_ENTRY_NONSTRING; message=`"batch entry $index contains a non-string value`"; remediation=`"use only JSON strings for commands and arguments`"}"
+                }
+            }
+            if ([string]::IsNullOrWhiteSpace([string]$values[0])) {
+                throw "LAUNCHER_BATCH[ASTRO_BATCH_COMMAND_BLANK]: {code=ASTRO_BATCH_COMMAND_BLANK; message=`"batch entry $index has a blank command`"; remediation=`"supply an executable command name`"}"
+            }
+            $arguments = if ($values.Count -gt 1) {
+                [string[]]$values[1..($values.Count - 1)]
+            }
+            else {
+                [string[]]@()
+            }
+            $plan.Add([pscustomobject]@{
+                    Index = $index
+                    Command = [string]$values[0]
+                    Args = $arguments
+                })
+        }
+        return @($plan)
+    }
+
+    if ([string]::IsNullOrWhiteSpace($SingleCommand)) {
+        if ($SingleArgsJson -cne '[]') {
+            throw "LAUNCHER_BOUNDARY[ASTRO_COMMAND_ARGUMENT_UNBOUND]: {code=ASTRO_COMMAND_ARGUMENT_UNBOUND; message=`"CommandArgsJson was supplied without Command`"; remediation=`"supply Command or reset CommandArgsJson to []`"}"
+        }
+        return @()
+    }
+
+    try {
+        $parsedCommandArgsEnvelope = ConvertFrom-Json `
+            -InputObject ('{"value":' + $SingleArgsJson + '}')
+        $argsEnvelopeProperties =
+            @($parsedCommandArgsEnvelope.PSObject.Properties.Name)
+        if ($argsEnvelopeProperties.Count -ne 1 -or
+            $argsEnvelopeProperties[0] -cne 'value') {
+            throw 'JSON text escaped the single-value argument envelope'
+        }
+        $parsedCommandArgs = $parsedCommandArgsEnvelope.value
+    }
+    catch {
+        throw "LAUNCHER_BOUNDARY[ASTRO_COMMAND_JSON_INVALID]: {code=ASTRO_COMMAND_JSON_INVALID; message=`"CommandArgsJson is not valid JSON: $($_.Exception.Message)`"; remediation=`"pass one JSON string array`"}"
+    }
+    if ($parsedCommandArgs -isnot [System.Collections.IEnumerable] -or
+        $parsedCommandArgs -is [string]) {
+        throw "LAUNCHER_BOUNDARY[ASTRO_COMMAND_ARGUMENT_SHAPE_INVALID]: {code=ASTRO_COMMAND_ARGUMENT_SHAPE_INVALID; message=`"CommandArgsJson root must be a JSON string array`"; remediation=`"pass [] for no arguments or one JSON array of string arguments`"}"
+    }
+    $commandArgs = @()
+    foreach ($argument in $parsedCommandArgs) {
+        $commandArgs += $argument
+    }
+    foreach ($argument in $commandArgs) {
+        if ($argument -isnot [string]) {
+            throw "LAUNCHER_BOUNDARY[ASTRO_COMMAND_ARGUMENT_NONSTRING]: {code=ASTRO_COMMAND_ARGUMENT_NONSTRING; message=`"CommandArgsJson must contain only strings`"; remediation=`"pass one JSON string array`"}"
+        }
+    }
+    return @([pscustomobject]@{
+            Index = 0
+            Command = $SingleCommand
+            Args = [string[]]$commandArgs
+        })
+}
+
+function New-AstroOwnedTargetLease {
+    param([Parameter(Mandatory)][string]$Path)
+
+    $full = [IO.Path]::GetFullPath($Path).TrimEnd('\', '/')
+    $parent = [IO.Path]::GetDirectoryName($full)
+    $parentState = Get-AstroPathEntryState $parent
+    if ($parentState.State -cne 'present' -or
+        ($parentState.Attributes -band [IO.FileAttributes]::Directory) -eq 0 -or
+        ($parentState.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw "TARGET[ASTRO_TARGET_PARENT_INVALID]: {code=ASTRO_TARGET_PARENT_INVALID; message=`"target parent is not one ordinary directory (state=$($parentState.State); attributes=$($parentState.Attributes); error=$($parentState.Error)): $parent`"; remediation=`"repair the canonical workspace path and retry`"}"
+    }
+    $state = Get-AstroPathEntryState $full
+    if ($state.State -cne 'absent') {
+        throw "TARGET[ASTRO_TARGET_PREEXISTING_UNOWNED]: {code=ASTRO_TARGET_PREEXISTING_UNOWNED; message=`"target path is not absent before exact creation (state=$($state.State); attributes=$($state.Attributes); error=$($state.Error)): $full`"; remediation=`"preserve it and use only the tracker-bound preserved-target recovery protocol`"}"
+    }
+
+    [AstroLauncherLockNative]::CreateDirectoryNoReplace($full)
+    $handle = $null
+    try {
+        $handle = [AstroLauncherTempNative]::OpenExactLiveDirectoryLease($full)
+        $lease = [pscustomobject]@{
+            Authority = 'live-owner-retained-target-v1'
+            Path = $full
+            Handle = $handle
+            RootFileId =
+                [AstroLauncherTempNative]::GetExactDirectoryIdentity($handle)
+            CreationSnapshot = $null
+            CleanupSnapshot = $null
+            Disposed = $false
+        }
+        $creation = Get-AstroLauncherTempTreeSnapshot $lease
+        if ($creation.RootFileId -cne $lease.RootFileId -or
+            -not [string]::Equals(
+                $creation.RootFinalPath,
+                $full,
+                [StringComparison]::OrdinalIgnoreCase
+            ) -or
+            $creation.EntryCount -ne 0) {
+            throw "new target root failed exact empty FILE_ID/path readback: $full"
+        }
+        $lease.CreationSnapshot = $creation
+        return $lease
+    }
+    catch {
+        if ($null -ne $handle -and -not $handle.IsClosed) {
+            $handle.Dispose()
+        }
+        throw
     }
 }
 
@@ -1352,88 +1533,6 @@ function Invoke-NativeCapture {
     return [pscustomobject]@{
         ExitCode = $exitCode
         Output = @($output | ForEach-Object { "$_" })
-    }
-}
-
-function Remove-TreeResilient {
-    <#
-      #421: depth-independent recursive directory removal that is NOT MAX_PATH-bound.
-
-      The launcher's exit cleanup previously used `Remove-Item -LiteralPath <dir>
-      -Recurse -Force`. Under Windows PowerShell 5.1 (the documented host — see the
-      Get-SccacheServerPort note — running on .NET Framework 4.8) that provider call
-      is MAX_PATH (260-char) bound: a single path deeper than 260 bytes inside
-      target/ — exactly what deep-store FSV fixtures create — makes it throw
-      PathTooLongException. target/ then survives, the launcher exits
-      $LauncherCleanupFailedExitCode (71, ASTRO_LAUNCHER_CLEANUP_FAILED), and the
-      NEXT run refuses fail-closed at the "target must be absent" preflight (#421,
-      observed live twice in wave-17; recovery needed a manual \\?\ python rmtree).
-
-      robocopy is long-path aware WITHOUT a \\?\ prefix — it calls the *W path APIs
-      internally — and mirroring an EMPTY source over the target with /MIR purges
-      every descendant regardless of nesting depth, leaving only the now-empty top
-      directory (a short path Remove-Item deletes trivially). This is Microsoft's own
-      recommended path-too-long deletion technique. The alternatives the #421 recon
-      named are both unreliable on this host: `Remove-Item \\?\...` (the WinPS 5.1
-      provider mangles the \\?\ prefix) and .NET `[IO.Directory]::Delete(recursive)`
-      (its .NET Framework 4.8 recursive enumerator is not dependably long-path-safe
-      even under a \\?\ root). robocopy is depth-independent by construction.
-
-      Bounded retries (/R:1 /W:1) so a genuinely LOCKED file cannot hang the launcher.
-      This function does NOT decide success: the caller re-tests `Test-Path` after it
-      returns and appends to $cleanupErrors (-> fail-closed ASTRO_LAUNCHER_CLEANUP_FAILED)
-      if anything survived. The "target must be absent" preflight is untouched — only
-      the deleter is made depth-independent, exactly per the #421 scope.
-    #>
-    param([Parameter(Mandatory)][string]$Path)
-
-    if (-not (Test-Path -LiteralPath $Path)) {
-        return
-    }
-
-    # Scratch empty dir as a SIBLING of $Path (same volume, never nested inside the
-    # tree being purged). It must not live under $env:TEMP: the launcher repoints
-    # TEMP into $workspaceTemp, which is itself one of the trees this cleans, so a
-    # scratch dir there would be deleted out from under the robocopy source.
-    $parent = Split-Path -Parent $Path
-    if ([string]::IsNullOrEmpty($parent)) {
-        $parent = "."
-    }
-    $emptyDir = Join-Path $parent (".astro-rmtree-" + [Guid]::NewGuid().ToString("N"))
-    if (Test-Path -LiteralPath $emptyDir) {
-        throw "robocopy cleanup scratch unexpectedly already exists: $emptyDir"
-    }
-    [IO.Directory]::CreateDirectory($emptyDir) | Out-Null
-    $emptyState = Get-Item -LiteralPath $emptyDir -Force -ErrorAction Stop
-    if (-not $emptyState.PSIsContainer -or
-        ($emptyState.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
-        throw "robocopy cleanup scratch is not one ordinary directory: $emptyDir"
-    }
-    try {
-        $robocopy = Join-Path $env:SystemRoot "System32\robocopy.exe"
-        if (-not (Test-Path -LiteralPath $robocopy -PathType Leaf)) {
-            $robocopy = "robocopy.exe"
-        }
-        # /MIR mirror empty->target purges all descendants (files AND dirs) at any
-        # depth. robocopy exit codes 0-7 are success bit-flags (>=8 = a real failure);
-        # either way the caller's Test-Path is the authoritative fail-closed check, so
-        # the code is captured as data (never thrown) and not used to decide success.
-        $null = Invoke-NativeCapture -Exe $robocopy -Arguments @(
-            $emptyDir, $Path, "/MIR", "/R:1", "/W:1",
-            "/NFL", "/NDL", "/NJH", "/NJS", "/NP", "/NC", "/NS"
-        )
-        if (Test-Path -LiteralPath $Path) {
-            # Only the now-empty top directory remains — a short path.
-            Remove-Item -LiteralPath $Path -Recurse -Force -ErrorAction Stop
-        }
-    }
-    finally {
-        if (Test-Path -LiteralPath $emptyDir) {
-            Remove-Item -LiteralPath $emptyDir -Recurse -Force -ErrorAction Stop
-        }
-        if (Test-Path -LiteralPath $emptyDir) {
-            throw "robocopy cleanup scratch remains after explicit deletion: $emptyDir"
-        }
     }
 }
 
@@ -4433,11 +4532,25 @@ if ($isWorktreeRoot) {
         )
     }
 }
+$legacyBatchEnvironment =
+    Get-Item -Path 'Env:ASTROLABE_CONTIGUOUS_BATCH' -ErrorAction SilentlyContinue
+if ($null -ne $legacyBatchEnvironment) {
+    throw "LAUNCHER_BATCH[ASTRO_LEGACY_BATCH_ENVIRONMENT_REFUSED]: {code=ASTRO_LEGACY_BATCH_ENVIRONMENT_REFUSED; message=`"ambient ASTROLABE_CONTIGUOUS_BATCH is unsupported and cannot confer target ownership (value='$($legacyBatchEnvironment.Value)')`"; remediation=`"remove the variable and use BatchCommandsJson so every command runs inside one exact launcher lease`"}"
+}
+$commandPlan = @(
+    ConvertFrom-AstroCommandPlan `
+        -SingleCommand $Command `
+        -SingleArgsJson $CommandArgsJson `
+        -BatchJson $BatchCommandsJson
+)
+$isExplicitBatch = -not [string]::IsNullOrWhiteSpace($BatchCommandsJson)
+if ($Bootstrap -and $commandPlan.Count -ne 0) {
+    throw "LAUNCHER_BATCH[ASTRO_BOOTSTRAP_COMMAND_CONFLICT]: {code=ASTRO_BOOTSTRAP_COMMAND_CONFLICT; message=`"Bootstrap cannot be combined with child commands or a batch`"; remediation=`"run bootstrap separately, then invoke the command batch`"}"
+}
 if ($RecoverPreservedTarget) {
     $expectedRecoveryEntryCount = 0
     if (-not $isCanonicalRoot -or $Bootstrap -or
-        -not [string]::IsNullOrWhiteSpace($Command) -or
-        $CommandArgsJson -cne '[]' -or
+        $commandPlan.Count -ne 0 -or
         $ExpectedTargetInventorySha256 -cnotmatch '^[0-9a-f]{64}$' -or
         -not [int]::TryParse(
             $ExpectedTargetEntryCount,
@@ -4484,6 +4597,7 @@ if ([string]::IsNullOrEmpty($InternalDedicatedToken)) {
     $workspaceRootBase64 = & $encodeArgument $WorkspaceRoot
     $commandBase64 = & $encodeArgument $Command
     $commandArgsBase64 = & $encodeArgument $CommandArgsJson
+    $batchCommandsBase64 = & $encodeArgument $BatchCommandsJson
     $issueBase64 = & $encodeArgument $Issue
     $trackerCommentUrlBase64 = & $encodeArgument $TrackerCommentUrl
     $expectedTargetInventoryBase64 = & $encodeArgument $ExpectedTargetInventorySha256
@@ -4503,6 +4617,7 @@ if ([string]::IsNullOrEmpty($InternalDedicatedToken)) {
     Bootstrap = $bootstrapLiteral
     Command = & `$decode '$commandBase64'
     CommandArgsJson = & `$decode '$commandArgsBase64'
+    BatchCommandsJson = & `$decode '$batchCommandsBase64'
     Issue = & `$decode '$issueBase64'
     RecoverPreservedTarget = $recoverPreservedTargetLiteral
     TrackerCommentUrl = & `$decode '$trackerCommentUrlBase64'
@@ -4659,6 +4774,12 @@ $launcherProtocolDirectoryLease = $null
 $workspaceTempLease = $null
 $gitMutationFreezeLease = $null
 $script:cudaToolkitViewLease = $null
+$ownedTargetLeases = [Collections.Generic.List[object]]::new()
+$targetOwnershipId = $null
+$targetOwnershipManifestPath = $null
+$targetOwnershipManifestSha256 = $null
+$targetCleanupFinalizationPath = $null
+$targetCleanupCompletionPath = $null
 $previousTempEnvironment = @{}
 foreach ($name in @("TEMP", "TMP", "TMPDIR", "GIT_CEILING_DIRECTORIES", "ASTRO_NO_ESCAPE_ATTRIBUTION")) {
     $previousTempEnvironment[$name] = Get-Item -Path "Env:$name" -ErrorAction SilentlyContinue
@@ -4709,15 +4830,21 @@ elseif ($workspaceTempParentState.State -ne 'present' -or
 
 # Everything below until the atomic move is read-only preparation. The full manifest bytes
 # and hash are known before the first claim-transition file is created.
-$launcherCommand = ("$Command $CommandArgsJson").Trim()
-if ([string]::IsNullOrWhiteSpace($launcherCommand)) {
-    $launcherCommand = if ($Bootstrap) {
-        "bootstrap"
-    }
-    elseif ($RecoverPreservedTarget) {
-        "recover-preserved-target transaction=$PriorRecoveryTransactionId inventory=$ExpectedTargetInventorySha256 entries=$expectedRecoveryEntryCount"
-    }
-    else { "environment-probe" }
+$launcherCommand = if ($isExplicitBatch) {
+    $batchSha256 = Get-AstroUtf8Sha256 $BatchCommandsJson
+    "batch-v1 count=$($commandPlan.Count) sha256=$batchSha256"
+}
+elseif ($commandPlan.Count -eq 1) {
+    ("$($commandPlan[0].Command) $CommandArgsJson").Trim()
+}
+elseif ($Bootstrap) {
+    "bootstrap"
+}
+elseif ($RecoverPreservedTarget) {
+    "recover-preserved-target transaction=$PriorRecoveryTransactionId inventory=$ExpectedTargetInventorySha256 entries=$expectedRecoveryEntryCount"
+}
+else {
+    "environment-probe"
 }
 # #424/#519: the launcher lock is also the repository EVIDENCE LEASE. Record the exact
 # tree the coming build is attributable to (HEAD + content-level dirty-state fingerprint)
@@ -5485,7 +5612,6 @@ try {
             }
             $finalizationHash = (Get-Sha256Hex -LiteralPath $finalizationPath).Hash.ToLowerInvariant()
             $preservedTargetRecoveryFinalizationPath = $finalizationPath
-            $preservedTargetCleanupAuthorized = $true
 
             [AstroLauncherTempNative]::DeleteExactTreeContents(
                 $targetHandle,
@@ -5541,6 +5667,11 @@ try {
                 throw 'preserved-target completion or terminal absence failed independent readback'
             }
             $completionHash = (Get-Sha256Hex -LiteralPath $completionPath).Hash.ToLowerInvariant()
+            # Generic finally cleanup receives authority over the canonical name
+            # only after exact disposition, durable completion, and an independent
+            # absence readback all succeeded. A mid-delete or mid-publication fault
+            # therefore preserves the remaining target instead of path-deleting it.
+            $preservedTargetCleanupAuthorized = $true
             Write-Output "TARGET_RECOVERY[ASTRO_PRESERVED_TARGET_COMPLETE]: transaction=$recoveryTransactionId; target=$target; entries=$($portableBefore.EntryCount); portable_inventory_sha256=$($portableBefore.InventorySha256); exact_inventory_sha256=$($exactBefore.InventorySha256); authorization=$authorizationPath; authorization_sha256=$authorizationHash; finalization=$finalizationPath; finalization_sha256=$finalizationHash; completion=$completionPath; completion_sha256=$completionHash; terminal=absent"
         }
         finally {
@@ -5550,35 +5681,108 @@ try {
         }
     }
 
-    # #280: a warm target is permitted only inside an explicitly owned contiguous batch.
-    if ((Test-Path -LiteralPath $target) -and
-        ($env:ASTROLABE_CONTIGUOUS_BATCH -ne "1")) {
-        throw "target must be absent before toolchain work: $target"
+    foreach ($step in $commandPlan) {
+        Assert-AllowedBashCommand `
+            -Command ([string]$step.Command) `
+            -GitRoot $gitRoot
+        Assert-NoCargoTargetDirOverride `
+            -CommandArgs ([string[]]$step.Args)
     }
-    if (($env:ASTROLABE_CONTIGUOUS_BATCH -eq "1") -and
-        (Test-Path -LiteralPath $target)) {
-        Write-Output "TARGET[ASTRO_BATCH_WARM]: ASTROLABE_CONTIGUOUS_BATCH=1 -> reusing warm target/ from this session's batch"
-    }
-    # Nested target reclamation is now owner-attributed: the complete immutable lease exists
-    # before a single directory is removed.
-    if ($env:ASTROLABE_CONTIGUOUS_BATCH -ne "1") {
-        $rootTargetFull = [IO.Path]::GetFullPath($target)
-        foreach ($ownedTarget in $ownedTargetRoots) {
-            if ([string]::Equals(
-                    $ownedTarget,
-                    $rootTargetFull,
-                    [StringComparison]::OrdinalIgnoreCase
-                )) {
-                continue
-            }
-            if (Test-Path -LiteralPath $ownedTarget) {
-                Remove-TreeResilient -Path $ownedTarget
-                if (Test-Path -LiteralPath $ownedTarget) {
-                    throw "nested Cargo target could not be reclaimed under the published lease: $ownedTarget"
-                }
-                Write-Output "TARGET[ASTRO_NESTED_TARGET_RECLAIMED]: reclaimed nested Cargo target under exact launcher ownership: $ownedTarget"
-            }
+
+    # #615: no path can be adopted or reclaimed from ambient state. The complete
+    # target set is classified after the v3 lease is live; every ordinary command
+    # starts from absence, then the launcher itself creates the one authoritative
+    # Cargo root and retains its no-delete-share handle through exact cleanup.
+    $rootTargetFull = [IO.Path]::GetFullPath($target)
+    foreach ($ownedTarget in $ownedTargetRoots) {
+        if ($RecoverPreservedTarget -and
+            [string]::Equals(
+                [IO.Path]::GetFullPath($ownedTarget),
+                $rootTargetFull,
+                [StringComparison]::OrdinalIgnoreCase
+            )) {
+            continue
         }
+        $targetPreflight = Get-AstroPathEntryState $ownedTarget
+        if ($targetPreflight.State -cne 'absent') {
+            throw "TARGET[ASTRO_TARGET_PREEXISTING_UNOWNED]: {code=ASTRO_TARGET_PREEXISTING_UNOWNED; message=`"owned target path is not absent before child work (state=$($targetPreflight.State); attributes=$($targetPreflight.Attributes); error=$($targetPreflight.Error)): $ownedTarget`"; remediation=`"preserve the path and use only the tracker-bound preserved-target recovery protocol; never set an environment variable to adopt it`"}"
+        }
+    }
+    if (-not $RecoverPreservedTarget -and $commandPlan.Count -gt 0) {
+        $targetOwnershipId = [Guid]::NewGuid().ToString('N')
+        $targetLease = New-AstroOwnedTargetLease -Path $target
+        $ownedTargetLeases.Add($targetLease)
+        $planRecords = @(
+            foreach ($step in $commandPlan) {
+                $stepArgsJson = ConvertTo-Json `
+                    -InputObject ([object[]]@($step.Args)) `
+                    -Compress
+                [ordered]@{
+                    index = [int]$step.Index
+                    command = [string]$step.Command
+                    argument_count = @($step.Args).Count
+                    arguments_sha256 = Get-AstroUtf8Sha256 $stepArgsJson
+                }
+            }
+        )
+        $planSnapshotJson = $planRecords | ConvertTo-Json -Compress -Depth 5
+        $targetOwnership = [ordered]@{
+            schema = 'astrolabe.launcher-target-ownership.v1'
+            ownership_id = $targetOwnershipId
+            published_at_utc = [DateTime]::UtcNow.ToString('o')
+            owner = [ordered]@{
+                pid = $PID
+                owner_process_start_utc_ticks =
+                    $launcherProcessStartUtcTicks
+                issue = $drivingIssue
+                launcher_lock_path = $launcherLock
+                launcher_lock_sha256 = $launcherLockSha256
+                job_object_name = $launcherTreeJobObjectName
+            }
+            command_plan = [ordered]@{
+                kind = if ($isExplicitBatch) {
+                    'explicit-single-lease-batch'
+                }
+                else {
+                    'single-command'
+                }
+                count = $commandPlan.Count
+                plan_sha256 = Get-AstroUtf8Sha256 $planSnapshotJson
+                steps = $planRecords
+            }
+            roots = @(
+                [ordered]@{
+                    path = $targetLease.Path
+                    root_file_id = $targetLease.RootFileId
+                    initial_final_path =
+                        $targetLease.CreationSnapshot.RootFinalPath
+                    initial_root_state =
+                        $targetLease.CreationSnapshot.RootState
+                    initial_inventory_sha256 =
+                        $targetLease.CreationSnapshot.InventorySha256
+                    initial_entry_count =
+                        $targetLease.CreationSnapshot.EntryCount
+                }
+            )
+        }
+        $targetOwnershipText =
+            $targetOwnership | ConvertTo-Json -Compress -Depth 10
+        $targetOwnershipManifestPath =
+            Join-Path $workspaceTemp 'target-ownership.manifest.v1.json'
+        Write-NewDurableUtf8File `
+            -LiteralPath $targetOwnershipManifestPath `
+            -Text $targetOwnershipText
+        $targetOwnershipReadback = [IO.File]::ReadAllText(
+            $targetOwnershipManifestPath,
+            [Text.UTF8Encoding]::new($false, $true)
+        )
+        if ($targetOwnershipReadback -cne $targetOwnershipText) {
+            throw 'target ownership manifest readback differs from durable bytes'
+        }
+        $targetOwnershipManifestSha256 = (
+            Get-Sha256Hex -LiteralPath $targetOwnershipManifestPath
+        ).Hash.ToLowerInvariant()
+        Write-Output "TARGET[ASTRO_TARGET_OWNERSHIP_HELD]: ownership=$targetOwnershipId; path=$($targetLease.Path); file_id=$($targetLease.RootFileId); owner=($PID,$launcherProcessStartUtcTicks,#$drivingIssue); lock_sha256=$launcherLockSha256; command_kind=$($targetOwnership.command_plan.kind); commands=$($commandPlan.Count); manifest=$targetOwnershipManifestPath; manifest_sha256=$targetOwnershipManifestSha256; delete_share=denied"
     }
 
     # Preserved manifests/TEMP roots from prior generations are tracker-bound recovery
@@ -5632,8 +5836,6 @@ try {
 
     Require-Path (Join-Path $gitBin "bash.exe") "native Git for Windows Bash is required"
     Require-Path (Join-Path $gitUsrBin "sh.exe") "native Git for Windows shell is required"
-    Assert-AllowedBashCommand -Command $Command -GitRoot $gitRoot
-
     if ($Bootstrap) {
         Install-PinnedToolchain -ToolsRoot $toolsRoot -MingwRoot $mingwRoot
     }
@@ -5685,42 +5887,14 @@ try {
         Write-Output "LLD[ASTRO_PINNED_LLD]: lld-enabled build detected in RUSTFLAGS; verified gcc resolves $pinnedLld (LLD $ExpectedLldVersion); pinned collect2 ld.lld search via -B$lldPrefix ahead of PATH"
     }
 
-    if ([string]::IsNullOrWhiteSpace($Command)) {
+    if ($commandPlan.Count -eq 0) {
         # Environment-probe mode: the toolchain env is set up and reported ready, no child runs.
         # The finally still removes the lock and the (unused) per-run TEMP; $sccacheDaemonStarted
         # stays false, so no sccache daemon is touched.
-        Write-Output 'Ready. Example: .\scripts\windows-gnu-toolchain.ps1 -Issue <driving-issue> -Command cargo -CommandArgsJson ''["test","-p","cbm-sys","--lib"]'''
+        Write-Output 'Ready. Single command: .\scripts\windows-gnu-toolchain.ps1 -Issue <driving-issue> -Command cargo -CommandArgsJson ''["build","--workspace"]''. Explicit one-lease batch: add -BatchCommandsJson ''[["cargo","check","--workspace"],["cargo","build","--workspace"]]'' instead of Command/CommandArgsJson.'
         $commandExit = 0
     }
     else {
-        # Windows PowerShell 5.1's ConvertFrom-Json emits a JSON array as ONE object instead of
-        # enumerating it, so `@(ConvertFrom-Json '["a","b"]')` yields an array-of-one-array there
-        # while PowerShell 7 unrolls it into two strings. Under 5.1 -- the host CLAUDE.md documents
-        # for `powershell -ExecutionPolicy Bypass -File scripts\windows-gnu-toolchain.ps1` -- that
-        # made every multi-argument invocation (including CLAUDE.md's own
-        # '["test","-p","cbm-sys","--lib"]' example) fail the string check below. Normalise both
-        # hosts to a flat argument list before validating. #589: this parse runs under the held
-        # lock's finally, so a malformed CommandArgsJson exits nonzero AND removes the lock/TEMP.
-        $parsedCommandArgs = ConvertFrom-Json -InputObject $CommandArgsJson
-        $commandArgs = @()
-        if ($null -ne $parsedCommandArgs) {
-            if (($parsedCommandArgs -is [System.Collections.IEnumerable]) -and ($parsedCommandArgs -isnot [string])) {
-                foreach ($argument in $parsedCommandArgs) {
-                    $commandArgs += $argument
-                }
-            }
-            else {
-                $commandArgs += $parsedCommandArgs
-            }
-        }
-        foreach ($argument in $commandArgs) {
-            if ($argument -isnot [string]) {
-                throw "CommandArgsJson must contain only strings"
-            }
-        }
-        # #534/#566: a child --target-dir outranks the launcher's authoritative CARGO_TARGET_DIR,
-        # so it is refused (never overridden) before the child runs, under the lock's finally.
-        Assert-NoCargoTargetDirOverride -CommandArgs $commandArgs
     Set-WorkspaceTempEnvironment -WorkspaceTemp $workspaceTemp
     Set-CudaMsvcRuntimeLinkEnvironment -LlvmBin $llvmBin -WorkspaceTemp $workspaceTemp
     # #190: ensure the sccache server is up and zero its counters so --show-stats in
@@ -5853,7 +6027,9 @@ try {
     ) -join '; '
     Write-Output "SCCACHE[ASTRO_CACHE_JOB_BOUND]: exact infrastructure process generation(s): $sccacheMemberDescription"
     Write-Output "SCCACHE[ASTRO_CACHE_ENABLED]: dir=$sccacheDir; size=$SccacheCacheSize; wrapper=$sccacheExe; CARGO_INCREMENTAL=0; SCCACHE_SERVER_PORT=$sccacheServerPort; SCCACHE_IDLE_TIMEOUT=$SccacheIdleTimeout"
-    # #239: the child's exit code is the ONLY thing that decides this launcher's exit code.
+    # #239/#615: each child's exit code is data. An explicit batch runs in ordinal
+    # order inside this one owner/lock/Job/target lease and stops at the first red
+    # command; no later step is silently attempted against a failed predecessor.
     # $ErrorActionPreference drops to 'Continue' for the call because Windows PowerShell 5.1
     # turns a native command's stderr into a TERMINATING ErrorRecord under 'Stop' — a child
     # that merely writes a warning to stderr would otherwise be reported as a launcher fault
@@ -5861,14 +6037,34 @@ try {
     $previousErrorActionPreference = $ErrorActionPreference
     $ErrorActionPreference = "Continue"
     try {
-        & $Command @commandArgs
-        # Capture immediately, before any cleanup command can overwrite $LASTEXITCODE.
-        $commandExit = if ($null -ne $LASTEXITCODE) { [int]$LASTEXITCODE } else { 0 }
+        foreach ($step in $commandPlan) {
+            $stepCommand = [string]$step.Command
+            [string[]]$stepArgs = @($step.Args)
+            $stepArgsJson = ConvertTo-Json `
+                -InputObject ([object[]]$stepArgs) `
+                -Compress
+            $stepArgsSha256 = Get-AstroUtf8Sha256 $stepArgsJson
+            Write-Output "LAUNCHER_BATCH[ASTRO_CHILD_STEP_START]: index=$($step.Index); count=$($commandPlan.Count); command=$stepCommand; argument_count=$($stepArgs.Count); arguments_sha256=$stepArgsSha256; ownership=$targetOwnershipId"
+            & $stepCommand @stepArgs
+            # Capture immediately, before logging or cleanup can overwrite it.
+            $stepExit = if ($null -ne $LASTEXITCODE) {
+                [int]$LASTEXITCODE
+            }
+            else {
+                0
+            }
+            $commandExit = $stepExit
+            Write-Output "LAUNCHER_BATCH[ASTRO_CHILD_STEP_EXIT]: index=$($step.Index); count=$($commandPlan.Count); command=$stepCommand; exit=$stepExit; ownership=$targetOwnershipId"
+            if ($stepExit -ne 0) {
+                Write-Output "LAUNCHER_BATCH[ASTRO_BATCH_FAIL_FAST]: failed_index=$($step.Index); skipped_count=$($commandPlan.Count - [int]$step.Index - 1); exit=$stepExit; ownership=$targetOwnershipId"
+                break
+            }
+        }
     }
     finally {
         $ErrorActionPreference = $previousErrorActionPreference
     }
-    Write-Output "LAUNCHER_EXIT[ASTRO_CHILD_EXIT]: child command exited with $commandExit"
+    Write-Output "LAUNCHER_EXIT[ASTRO_CHILD_EXIT]: command plan exited with $commandExit after one exact-owner sequence of $($commandPlan.Count) planned command(s)"
     }
 }
 catch {
@@ -6153,18 +6349,281 @@ finally {
             # target cleanup and the append-only TEMP/manifest archive transaction.
             # Stop at the first failure and preserve every source/archive byte plus
             # the exact transition for authorized recovery.
-            foreach ($ownedTarget in $cleanupTargetRoots) {
-                $targetState = Get-AstroPathEntryState $ownedTarget
-                if ($targetState.State -eq 'present') {
-                    # #421: depth-independent, not MAX_PATH-bound.
-                    Remove-TreeResilient -Path $ownedTarget
+            # #615: an owned target is never deleted by path. Finalize two equal
+            # handle-bound inventories, atomically rename the exact root below the
+            # generation TEMP, then delete only those exact identities. A hard exit
+            # after the rename leaves the target tombstone and its full finalization
+            # in the bound TEMP transaction while the canonical target name is free.
+            $targetCleanupRecords = [Collections.Generic.List[object]]::new()
+            foreach ($targetLease in $ownedTargetLeases) {
+                if ($null -eq $targetLease.Handle -or
+                    $targetLease.Handle.IsInvalid -or
+                    $targetLease.Handle.IsClosed) {
+                    throw "exact target cleanup lease is not retained: $($targetLease.Path)"
                 }
-                elseif ($targetState.State -ne 'absent') {
-                    throw "target presence is unevaluable before cleanup (state=$($targetState.State), error=$($targetState.Error)): $ownedTarget"
+                $targetSnapshotFirst =
+                    Get-AstroLauncherTempTreeSnapshot $targetLease
+                $targetSnapshotSecond =
+                    Get-AstroLauncherTempTreeSnapshot $targetLease
+                Assert-AstroLauncherTempSnapshotsEqual `
+                    $targetSnapshotFirst `
+                    $targetSnapshotSecond
+                if ($targetSnapshotFirst.RootFileId -cne
+                        $targetLease.RootFileId -or
+                    -not [string]::Equals(
+                        $targetSnapshotFirst.RootFinalPath,
+                        $targetLease.Path,
+                        [StringComparison]::OrdinalIgnoreCase
+                    )) {
+                    throw "retained target root changed exact identity/path before cleanup: $($targetLease.Path)"
                 }
-                $targetTerminal = Get-AstroPathEntryState $ownedTarget
-                if ($targetTerminal.State -ne 'absent') {
-                    throw "target is not absent after cleanup (state=$($targetTerminal.State), error=$($targetTerminal.Error)): $ownedTarget"
+                $targetTombstoneLeaf =
+                    ".astro-launcher-target-cleanup.v1.ownership-$targetOwnershipId.dir"
+                $targetTombstonePath = [IO.Path]::GetFullPath(
+                    (Join-Path $workspaceTemp $targetTombstoneLeaf)
+                )
+                $targetTombstoneState =
+                    Get-AstroPathEntryState $targetTombstonePath
+                if ($targetTombstoneState.State -cne 'absent') {
+                    throw "target cleanup tombstone destination is not absent (state=$($targetTombstoneState.State), error=$($targetTombstoneState.Error)): $targetTombstonePath"
+                }
+                $targetLease.CleanupSnapshot = $targetSnapshotFirst
+                $targetCleanupRecords.Add([pscustomobject]@{
+                        Lease = $targetLease
+                        SourcePath = $targetLease.Path
+                        TombstoneLeaf = $targetTombstoneLeaf
+                        TombstonePath = $targetTombstonePath
+                        Snapshot = $targetSnapshotFirst
+                    })
+            }
+
+            if ($targetCleanupRecords.Count -gt 0) {
+                if ([string]::IsNullOrWhiteSpace($targetOwnershipId)) {
+                    throw 'exact target lease exists without an ownership id'
+                }
+                if ($null -eq $workspaceTempLease -or
+                    $null -eq $workspaceTempLease.Handle -or
+                    $workspaceTempLease.Handle.IsInvalid -or
+                    $workspaceTempLease.Handle.IsClosed) {
+                    throw 'exact target cleanup requires the retained generation TEMP handle'
+                }
+                $ownershipManifestRecord = [ordered]@{
+                    path = $targetOwnershipManifestPath
+                    sha256 = $targetOwnershipManifestSha256
+                    state = if ($null -eq $targetOwnershipManifestPath) {
+                        'not-published-before-launcher-fault'
+                    }
+                    else {
+                        $ownershipManifestState =
+                            Get-AstroPathEntryState $targetOwnershipManifestPath
+                        if ($ownershipManifestState.State -cne 'present') {
+                            throw "target ownership manifest is not present at cleanup (state=$($ownershipManifestState.State), error=$($ownershipManifestState.Error)): $targetOwnershipManifestPath"
+                        }
+                        $ownershipManifestHash = (
+                            Get-Sha256Hex `
+                                -LiteralPath $targetOwnershipManifestPath
+                        ).Hash.ToLowerInvariant()
+                        if ($ownershipManifestHash -cne
+                            $targetOwnershipManifestSha256) {
+                            throw "target ownership manifest hash changed before cleanup (expected=$targetOwnershipManifestSha256, observed=$ownershipManifestHash)"
+                        }
+                        'published-and-hash-verified'
+                    }
+                }
+                $targetCleanupRootRecords = @(
+                    foreach ($record in $targetCleanupRecords) {
+                        [ordered]@{
+                            source_path = $record.SourcePath
+                            tombstone_path = $record.TombstonePath
+                            root_file_id = $record.Snapshot.RootFileId
+                            root_state = $record.Snapshot.RootState
+                            exact_inventory_sha256 =
+                                $record.Snapshot.InventorySha256
+                            entry_count = $record.Snapshot.EntryCount
+                            exact_entries =
+                                [string[]]$record.Snapshot.Entries
+                            backup_state_scope =
+                                $record.Snapshot.BackupStateScope
+                            security_descriptor_scope =
+                                $record.Snapshot.SecurityDescriptorScope
+                            metadata_disposition_atomicity =
+                                $record.Snapshot.MetadataDispositionAtomicity
+                            coverage_gap_issue =
+                                $record.Snapshot.CoverageGapIssue
+                        }
+                    }
+                )
+                $targetCleanupFinalization = [ordered]@{
+                    schema =
+                        'astrolabe.launcher-target-cleanup-finalization.v1'
+                    phase =
+                        'exact-inventory-finalized-before-handle-rename'
+                    ownership_id = $targetOwnershipId
+                    recorded_at_utc = [DateTime]::UtcNow.ToString('o')
+                    owner = [ordered]@{
+                        pid = $PID
+                        owner_process_start_utc_ticks =
+                            $launcherProcessStartUtcTicks
+                        issue = $drivingIssue
+                        launcher_lock_sha256 = $launcherLockSha256
+                        cleanup_transition_path =
+                            $launcherLockCleanupTransaction.CleanupPath
+                        cleanup_transition_file_id =
+                            $launcherLockCleanupTransaction.FileId
+                        cleanup_transition_sha256 =
+                            $launcherLockCleanupTransaction.Sha256
+                    }
+                    ownership_manifest = $ownershipManifestRecord
+                    roots = $targetCleanupRootRecords
+                }
+                $targetCleanupFinalizationText =
+                    $targetCleanupFinalization |
+                        ConvertTo-Json -Compress -Depth 12
+                $targetCleanupFinalizationPath = Join-Path `
+                    $workspaceTemp `
+                    'target-cleanup.finalization.v1.json'
+                Write-NewDurableUtf8File `
+                    -LiteralPath $targetCleanupFinalizationPath `
+                    -Text $targetCleanupFinalizationText
+                $targetCleanupFinalizationReadback = [IO.File]::ReadAllText(
+                    $targetCleanupFinalizationPath,
+                    [Text.UTF8Encoding]::new($false, $true)
+                )
+                if ($targetCleanupFinalizationReadback -cne
+                    $targetCleanupFinalizationText) {
+                    throw 'target cleanup finalization durable readback differs from written bytes'
+                }
+                $targetCleanupFinalizationSha256 = (
+                    Get-Sha256Hex `
+                        -LiteralPath $targetCleanupFinalizationPath
+                ).Hash.ToLowerInvariant()
+                Write-Output "TARGET[ASTRO_TARGET_CLEANUP_FINALIZED]: ownership=$targetOwnershipId; roots=$($targetCleanupRecords.Count); finalization=$targetCleanupFinalizationPath; finalization_sha256=$targetCleanupFinalizationSha256; cleanup_transition=$($launcherLockCleanupTransaction.CleanupPath)"
+
+                $targetTerminalRecords = @(
+                    foreach ($record in $targetCleanupRecords) {
+                        [AstroLauncherTempNative]::RenameExactDirectoryNoReplace(
+                            $record.Lease.Handle,
+                            $workspaceTempLease.Handle,
+                            $record.TombstoneLeaf
+                        )
+                        $record.Lease.Path = $record.TombstonePath
+                        $renamedSnapshot =
+                            Get-AstroLauncherTempTreeSnapshot $record.Lease
+                        Assert-AstroLauncherTempSnapshotsEqual `
+                            $record.Snapshot `
+                            $renamedSnapshot
+                        if (-not [string]::Equals(
+                                $renamedSnapshot.RootFinalPath,
+                                $record.TombstonePath,
+                                [StringComparison]::OrdinalIgnoreCase
+                            )) {
+                            throw "exact target rename resolved to an unexpected destination ('$($record.TombstonePath)' -> '$($renamedSnapshot.RootFinalPath)')"
+                        }
+                        $sourceAfterRename =
+                            Get-AstroPathEntryState $record.SourcePath
+                        if ($sourceAfterRename.State -cne 'absent') {
+                            throw "canonical target source is not absent after exact rename (state=$($sourceAfterRename.State), error=$($sourceAfterRename.Error)): $($record.SourcePath)"
+                        }
+                        Write-Output "TARGET[ASTRO_TARGET_TOMBSTONE_BOUND]: ownership=$targetOwnershipId; source=$($record.SourcePath); source_state=absent; tombstone=$($record.TombstonePath); file_id=$($record.Snapshot.RootFileId); inventory_sha256=$($record.Snapshot.InventorySha256); entries=$($record.Snapshot.EntryCount)"
+
+                        [AstroLauncherTempNative]::DeleteExactTreeContents(
+                            $record.Lease.Handle,
+                            [string[]]$record.Snapshot.Entries
+                        )
+                        $emptyTarget =
+                            Get-AstroLauncherTempTreeSnapshot $record.Lease
+                        if ($emptyTarget.RootFileId -cne
+                                $record.Snapshot.RootFileId -or
+                            $emptyTarget.EntryCount -ne 0) {
+                            throw "target tombstone changed identity or remained nonempty after exact content deletion: $($record.TombstonePath)"
+                        }
+                        [AstroLauncherTempNative]::MarkExactDirectoryDeletePending(
+                            $record.Lease.Handle,
+                            $emptyTarget.RootState
+                        )
+                        $record.Lease.Handle.Dispose()
+                        $record.Lease.Disposed = $true
+                        $tombstoneTerminal =
+                            Get-AstroPathEntryState $record.TombstonePath
+                        $sourceTerminal =
+                            Get-AstroPathEntryState $record.SourcePath
+                        if ($tombstoneTerminal.State -cne 'absent' -or
+                            $sourceTerminal.State -cne 'absent') {
+                            throw "exact target cleanup terminal readback failed (source=$($sourceTerminal.State)/$($sourceTerminal.Error), tombstone=$($tombstoneTerminal.State)/$($tombstoneTerminal.Error))"
+                        }
+                        Write-Output "TARGET[ASTRO_TARGET_EXACT_DELETE_COMPLETE]: ownership=$targetOwnershipId; source=$($record.SourcePath); source_state=absent; tombstone=$($record.TombstonePath); tombstone_state=absent; prior_file_id=$($record.Snapshot.RootFileId); prior_inventory_sha256=$($record.Snapshot.InventorySha256); prior_entries=$($record.Snapshot.EntryCount)"
+                        [ordered]@{
+                            source_path = $record.SourcePath
+                            source_state = $sourceTerminal.State
+                            tombstone_path = $record.TombstonePath
+                            tombstone_state = $tombstoneTerminal.State
+                            prior_root_file_id =
+                                $record.Snapshot.RootFileId
+                            prior_exact_inventory_sha256 =
+                                $record.Snapshot.InventorySha256
+                            prior_entry_count =
+                                $record.Snapshot.EntryCount
+                            empty_exact_inventory_sha256 =
+                                $emptyTarget.InventorySha256
+                        }
+                    }
+                )
+                foreach ($ownedTarget in $cleanupTargetRoots) {
+                    $targetTerminal =
+                        Get-AstroPathEntryState $ownedTarget
+                    if ($targetTerminal.State -cne 'absent') {
+                        throw "owned target path is not absent after exact cleanup (state=$($targetTerminal.State), error=$($targetTerminal.Error)): $ownedTarget"
+                    }
+                }
+                $targetCleanupCompletion = [ordered]@{
+                    schema =
+                        'astrolabe.launcher-target-cleanup-completion.v1'
+                    phase = 'complete-all-exact-target-names-absent'
+                    ownership_id = $targetOwnershipId
+                    completed_at_utc = [DateTime]::UtcNow.ToString('o')
+                    owner = [ordered]@{
+                        pid = $PID
+                        owner_process_start_utc_ticks =
+                            $launcherProcessStartUtcTicks
+                        issue = $drivingIssue
+                        launcher_lock_sha256 = $launcherLockSha256
+                    }
+                    finalization = [ordered]@{
+                        path = $targetCleanupFinalizationPath
+                        sha256 = $targetCleanupFinalizationSha256
+                    }
+                    roots = $targetTerminalRecords
+                }
+                $targetCleanupCompletionText =
+                    $targetCleanupCompletion |
+                        ConvertTo-Json -Compress -Depth 10
+                $targetCleanupCompletionPath = Join-Path `
+                    $workspaceTemp `
+                    'target-cleanup.completion.v1.json'
+                Write-NewDurableUtf8File `
+                    -LiteralPath $targetCleanupCompletionPath `
+                    -Text $targetCleanupCompletionText
+                $targetCleanupCompletionReadback = [IO.File]::ReadAllText(
+                    $targetCleanupCompletionPath,
+                    [Text.UTF8Encoding]::new($false, $true)
+                )
+                if ($targetCleanupCompletionReadback -cne
+                    $targetCleanupCompletionText) {
+                    throw 'target cleanup completion durable readback differs from written bytes'
+                }
+                $targetCleanupCompletionSha256 = (
+                    Get-Sha256Hex `
+                        -LiteralPath $targetCleanupCompletionPath
+                ).Hash.ToLowerInvariant()
+                Write-Output "TARGET[ASTRO_TARGET_CLEANUP_COMPLETION_READBACK]: ownership=$targetOwnershipId; roots=$($targetTerminalRecords.Count); completion=$targetCleanupCompletionPath; completion_sha256=$targetCleanupCompletionSha256; canonical_and_tombstone_states=absent"
+            }
+            else {
+                foreach ($ownedTarget in $cleanupTargetRoots) {
+                    $targetTerminal =
+                        Get-AstroPathEntryState $ownedTarget
+                    if ($targetTerminal.State -cne 'absent') {
+                        throw "unleased target is not absent and path deletion is forbidden (state=$($targetTerminal.State), error=$($targetTerminal.Error)): $ownedTarget"
+                    }
                 }
             }
 
@@ -6323,6 +6782,21 @@ finally {
         }
         catch {
             $cleanupErrors += "CUDA toolkit junction handle release failed while preserving namespace state: $($_.Exception.Message)"
+        }
+    }
+    foreach ($targetLease in $ownedTargetLeases) {
+        if ($null -ne $targetLease.Handle -and
+            -not $targetLease.Handle.IsClosed) {
+            try {
+                $preservedTargetState =
+                    Get-AstroPathEntryState $targetLease.Path
+                $targetLease.Handle.Dispose()
+                $targetLease.Disposed = $true
+                Write-Output "TARGET[ASTRO_TARGET_HANDLE_RELEASED_PRESERVING]: ownership=$targetOwnershipId; path=$($targetLease.Path); file_id=$($targetLease.RootFileId); state_before_release=$($preservedTargetState.State); no namespace mutation was authorized by handle release"
+            }
+            catch {
+                $cleanupErrors += "retained exact target handle release failed while preserving namespace state: $($_.Exception.Message)"
+            }
         }
     }
     if ($null -ne $workspaceTempLease -and
