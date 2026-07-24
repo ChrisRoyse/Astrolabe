@@ -26,6 +26,7 @@ using System;
 using System.ComponentModel;
 using System.Globalization;
 using System.Runtime.InteropServices;
+using System.Security.Cryptography;
 using System.Text;
 using Microsoft.Win32.SafeHandles;
 
@@ -51,6 +52,9 @@ public static class AstroLauncherLockNative
     private const int FILE_ID_INFO_CLASS = 18;
     private const int FILE_RENAME_INFO_CLASS = 3;
     private const int FILE_DISPOSITION_INFO_CLASS = 4;
+    private const int FILE_DISPOSITION_INFO_EX_CLASS = 21;
+    private const uint FILE_DISPOSITION_DELETE = 0x00000001;
+    private const uint FILE_DISPOSITION_IGNORE_READONLY_ATTRIBUTE = 0x00000010;
     private const int JOB_OBJECT_BASIC_PROCESS_ID_LIST_CLASS = 3;
     private const int ERROR_FILE_NOT_FOUND = 2;
     private const int ERROR_INSUFFICIENT_BUFFER = 122;
@@ -361,6 +365,43 @@ public static class AstroLauncherLockNative
                     information.NumberOfLinks + ": " + path
                 );
             }
+            return handle;
+        }
+        catch
+        {
+            handle.Dispose();
+            throw;
+        }
+    }
+
+    public static SafeFileHandle OpenExactDispositionFile(string path)
+    {
+        SafeFileHandle handle = CreateFileW(
+            GetExtendedLengthPath(path),
+            GENERIC_READ | DELETE_ACCESS,
+            FILE_SHARE_READ,
+            IntPtr.Zero,
+            OPEN_EXISTING,
+            FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_SEQUENTIAL_SCAN,
+            IntPtr.Zero
+        );
+        if (handle.IsInvalid)
+        {
+            int error = Marshal.GetLastWin32Error();
+            handle.Dispose();
+            throw new Win32Exception(
+                error,
+                "could not open exact read-only-aware disposition source " +
+                "(native_error=" + error + "; path=" + path + ")"
+            );
+        }
+        try
+        {
+            RequireDiskHandle(handle, "exact disposition source");
+            RequireExactOrdinarySingleLinkFile(
+                handle,
+                "exact disposition source"
+            );
             return handle;
         }
         catch
@@ -724,6 +765,109 @@ public static class AstroLauncherLockNative
         return result;
     }
 
+    public static string ComputeExactFileSha256(SafeFileHandle handle)
+    {
+        RequireExactOrdinarySingleLinkFile(
+            handle,
+            "exact retained digest source"
+        );
+        long sizeBefore;
+        if (!GetFileSizeEx(handle, out sizeBefore))
+        {
+            throw new Win32Exception(
+                Marshal.GetLastWin32Error(),
+                "could not read exact retained digest-source size"
+            );
+        }
+        if (sizeBefore < 0)
+        {
+            throw new InvalidOperationException(
+                "exact retained digest-source size was negative"
+            );
+        }
+        long ignored;
+        if (!SetFilePointerEx(handle, 0, out ignored, FILE_BEGIN))
+        {
+            throw new Win32Exception(
+                Marshal.GetLastWin32Error(),
+                "could not rewind exact retained digest source"
+            );
+        }
+
+        const int BufferSize = 1048576;
+        IntPtr nativeBuffer = Marshal.AllocHGlobal(BufferSize);
+        byte[] managedBuffer = new byte[BufferSize];
+        long total = 0;
+        byte[] hash;
+        try
+        {
+            using (SHA256 digest = SHA256.Create())
+            {
+                while (total < sizeBefore)
+                {
+                    uint requested = (uint)Math.Min(
+                        (long)BufferSize,
+                        sizeBefore - total
+                    );
+                    uint read;
+                    if (!ReadFile(
+                            handle,
+                            nativeBuffer,
+                            requested,
+                            out read,
+                            IntPtr.Zero
+                        ))
+                    {
+                        throw new Win32Exception(
+                            Marshal.GetLastWin32Error(),
+                            "could not read exact retained digest-source bytes"
+                        );
+                    }
+                    if (read == 0)
+                    {
+                        throw new InvalidOperationException(
+                            "exact retained digest-source read ended at byte " +
+                            total.ToString(CultureInfo.InvariantCulture) +
+                            " of " +
+                            sizeBefore.ToString(CultureInfo.InvariantCulture)
+                        );
+                    }
+                    Marshal.Copy(
+                        nativeBuffer,
+                        managedBuffer,
+                        0,
+                        checked((int)read)
+                    );
+                    digest.TransformBlock(
+                        managedBuffer,
+                        0,
+                        checked((int)read),
+                        managedBuffer,
+                        0
+                    );
+                    total += read;
+                }
+                digest.TransformFinalBlock(new byte[0], 0, 0);
+                hash = digest.Hash;
+            }
+        }
+        finally
+        {
+            Marshal.FreeHGlobal(nativeBuffer);
+        }
+
+        long sizeAfter;
+        if (!GetFileSizeEx(handle, out sizeAfter) ||
+            sizeAfter != sizeBefore ||
+            total != sizeBefore)
+        {
+            throw new InvalidOperationException(
+                "exact retained digest-source size changed during hashing"
+            );
+        }
+        return BitConverter.ToString(hash).Replace("-", "").ToLowerInvariant();
+    }
+
     public static void FlushExactFile(SafeFileHandle handle)
     {
         if (!FlushFileBuffers(handle))
@@ -976,6 +1120,43 @@ public static class AstroLauncherLockNative
                 throw new Win32Exception(
                     Marshal.GetLastWin32Error(),
                     "exact retained-handle FILE_DISPOSITION_INFO delete failed"
+                );
+            }
+        }
+        finally
+        {
+            Marshal.FreeHGlobal(information);
+        }
+    }
+
+    public static void DeleteExactFileHandleIgnoringReadOnly(
+        SafeFileHandle file
+    )
+    {
+        RequireExactOrdinarySingleLinkFile(
+            file,
+            "exact read-only-aware disposition-delete source"
+        );
+        IntPtr information = Marshal.AllocHGlobal(4);
+        try
+        {
+            uint flags =
+                FILE_DISPOSITION_DELETE |
+                FILE_DISPOSITION_IGNORE_READONLY_ATTRIBUTE;
+            Marshal.WriteInt32(information, unchecked((int)flags));
+            if (!SetFileInformationByHandle(
+                    file,
+                    FILE_DISPOSITION_INFO_EX_CLASS,
+                    information,
+                    4
+                ))
+            {
+                int error = Marshal.GetLastWin32Error();
+                throw new Win32Exception(
+                    error,
+                    "exact retained-handle FILE_DISPOSITION_INFO_EX delete " +
+                    "failed; native_error=" +
+                    error.ToString(CultureInfo.InvariantCulture)
                 );
             }
         }
@@ -1528,6 +1709,460 @@ function Remove-AstroOrdinaryFlatDirectoryLongPath {
     $terminal = Get-AstroPathEntryState $full
     if ($terminal.State -cne 'absent') {
         throw "exact flat-directory delete did not reach absence (state=$($terminal.State), error=$($terminal.Error)): $full"
+    }
+}
+
+function Get-AstroOrdinaryDirectoryTreeInventoryLongPath {
+    <#
+    Produces a content- and identity-bound inventory of one ordinary directory
+    tree without traversing reparses. Exact read/delete-denying handles remain
+    live for the complete observation so every recorded file and directory is
+    the same filesystem object whose bytes and metadata were read.
+    #>
+    param([Parameter(Mandatory)][string]$LiteralPath)
+
+    $root = [IO.Path]::GetFullPath($LiteralPath)
+    $rootPrefix = $root.TrimEnd('\', '/') +
+        [IO.Path]::DirectorySeparatorChar
+    $records = [Collections.Generic.List[object]]::new()
+    $handles = [Collections.Generic.List[object]]::new()
+    $visit = $null
+    try {
+        $visit = {
+            param(
+                [Parameter(Mandatory)][string]$Directory,
+                [Parameter(Mandatory)][string]$RelativePath
+            )
+
+            $directoryState = Get-AstroPathEntryState $Directory
+            if ($directoryState.State -cne 'present' -or
+                ($directoryState.Attributes -band
+                    [IO.FileAttributes]::Directory) -eq 0 -or
+                ($directoryState.Attributes -band
+                    [IO.FileAttributes]::ReparsePoint) -ne 0) {
+                throw (
+                    'ordinary tree inventory requires an ordinary directory ' +
+                    "(state=$($directoryState.State), " +
+                    "attributes=$($directoryState.Attributes), " +
+                    "error=$($directoryState.Error)): $Directory"
+                )
+            }
+            $directoryHandle =
+                [AstroLauncherLockNative]::OpenExactDeleteDirectory(
+                    $Directory
+                )
+            $handles.Add($directoryHandle)
+            $directoryFinal = ConvertFrom-AstroNativeFinalPath (
+                [AstroLauncherLockNative]::GetFileFinalPath(
+                    $directoryHandle
+                )
+            )
+            if (-not [string]::Equals(
+                    $directoryFinal.TrimEnd('\', '/'),
+                    $Directory.TrimEnd('\', '/'),
+                    [StringComparison]::OrdinalIgnoreCase
+                )) {
+                throw (
+                    "ordinary tree directory handle resolved to " +
+                    "'$directoryFinal', expected '$Directory'"
+                )
+            }
+            $records.Add([ordered]@{
+                relative_path = $RelativePath
+                kind = 'directory'
+                file_id =
+                    [AstroLauncherLockNative]::GetFileIdentity(
+                        $directoryHandle
+                    )
+                attributes = [uint32]$directoryState.Attributes
+                bytes = $null
+                sha256 = $null
+            })
+
+            foreach ($entry in @(
+                    Get-AstroDirectoryEntriesLongPath $Directory
+                )) {
+                $entryFull = [IO.Path]::GetFullPath($entry.FullName)
+                if (-not $entryFull.StartsWith(
+                        $rootPrefix,
+                        [StringComparison]::OrdinalIgnoreCase
+                    )) {
+                    throw (
+                        "ordinary tree entry escapes root '$root': " +
+                        $entryFull
+                    )
+                }
+                if (($entry.Attributes -band
+                        [IO.FileAttributes]::ReparsePoint) -ne 0) {
+                    throw (
+                        'ordinary tree inventory refuses reparse entry: ' +
+                        $entryFull
+                    )
+                }
+                $entryRelative = $entryFull.Substring(
+                    $rootPrefix.Length
+                )
+                if ($entry.PSIsContainer) {
+                    & $visit $entryFull $entryRelative
+                    continue
+                }
+
+                $fileHandle =
+                    [AstroLauncherLockNative]::OpenExactProtectedReadFile(
+                        $entryFull
+                    )
+                $handles.Add($fileHandle)
+                $fileFinal = ConvertFrom-AstroNativeFinalPath (
+                    [AstroLauncherLockNative]::GetFileFinalPath(
+                        $fileHandle
+                    )
+                )
+                if (-not [string]::Equals(
+                        $fileFinal,
+                        $entryFull,
+                        [StringComparison]::OrdinalIgnoreCase
+                    )) {
+                    throw (
+                        "ordinary tree file handle resolved to '$fileFinal', " +
+                        "expected '$entryFull'"
+                    )
+                }
+                $stream = [IO.File]::Open(
+                    (ConvertTo-AstroExtendedLengthPath $entryFull),
+                    [IO.FileMode]::Open,
+                    [IO.FileAccess]::Read,
+                    [IO.FileShare]::Read
+                )
+                $hasher = [Security.Cryptography.SHA256]::Create()
+                try {
+                    $fileHash = (
+                        [BitConverter]::ToString(
+                            $hasher.ComputeHash($stream)
+                        ) -replace '-', ''
+                    ).ToLowerInvariant()
+                }
+                finally {
+                    $hasher.Dispose()
+                    $stream.Dispose()
+                }
+                $records.Add([ordered]@{
+                    relative_path = $entryRelative
+                    kind = 'file'
+                    file_id =
+                        [AstroLauncherLockNative]::GetFileIdentity(
+                            $fileHandle
+                        )
+                    attributes = [uint32]$entry.Attributes
+                    bytes = [uint64]$entry.Length
+                    sha256 = $fileHash
+                })
+            }
+        }
+
+        & $visit $root '.'
+        $orderedRecords = @(
+            $records |
+                Sort-Object -Property relative_path
+        )
+        $inventoryJson = ConvertTo-Json `
+            -InputObject ([object[]]$orderedRecords) `
+            -Depth 8 `
+            -Compress
+        $inventoryHash = Get-AstroByteSha256 (
+            [Text.Encoding]::UTF8.GetBytes($inventoryJson)
+        )
+        return [pscustomobject]@{
+            root = $root
+            entry_count = $orderedRecords.Count
+            entries = [object[]]$orderedRecords
+            json = $inventoryJson
+            sha256 = $inventoryHash
+        }
+    }
+    finally {
+        foreach ($handle in $handles) {
+            $handle.Dispose()
+        }
+    }
+}
+
+function Remove-AstroOrdinaryDirectoryTreeLongPath {
+    <#
+    Removes only the exact ordinary files and directories bound by a caller's
+    inventory hash. Every descendant gets a retained identity-checked handle;
+    reparses and namespace drift refuse before deletion. ReadOnly files are
+    deleted through FILE_DISPOSITION_INFO_EX on that exact handle, so no
+    preflight attribute mutation is needed.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$LiteralPath,
+        [Parameter(Mandatory)]
+        [ValidatePattern('^[0-9a-f]{64}$')]
+        [string]$ExpectedInventorySha256
+    )
+
+    $inventory =
+        Get-AstroOrdinaryDirectoryTreeInventoryLongPath $LiteralPath
+    if ([string]$inventory.sha256 -cne $ExpectedInventorySha256) {
+        throw (
+            'ordinary tree inventory drifted before deletion ' +
+            "(expected=$ExpectedInventorySha256, " +
+            "observed=$($inventory.sha256), " +
+            "entries=$($inventory.entry_count)): $($inventory.root)"
+        )
+    }
+
+    $root = [string]$inventory.root
+    $rootPrefix = $root.TrimEnd('\', '/') +
+        [IO.Path]::DirectorySeparatorChar
+    $leases = [Collections.Generic.List[object]]::new()
+    $expected = @{}
+    foreach ($record in @($inventory.entries)) {
+        $path = if ([string]$record.relative_path -ceq '.') {
+            $root
+        }
+        else {
+            [IO.Path]::GetFullPath(
+                (Join-Path $root ([string]$record.relative_path))
+            )
+        }
+        if (-not [string]::Equals(
+                $path,
+                $root,
+                [StringComparison]::OrdinalIgnoreCase
+            ) -and
+            -not $path.StartsWith(
+                $rootPrefix,
+                [StringComparison]::OrdinalIgnoreCase
+            )) {
+            throw "ordinary tree inventory path escapes root '$root': $path"
+        }
+        if ($expected.ContainsKey($path)) {
+            throw "ordinary tree inventory contains duplicate path: $path"
+        }
+        $expected[$path] = $record
+    }
+
+    try {
+        foreach ($path in @(
+                $expected.Keys |
+                    Where-Object {
+                        [string]$expected[$_].kind -ceq 'directory'
+                    } |
+                    Sort-Object { $_.Length }
+            )) {
+            $handle =
+                [AstroLauncherLockNative]::OpenExactDeleteDirectory($path)
+            $final = ConvertFrom-AstroNativeFinalPath (
+                [AstroLauncherLockNative]::GetFileFinalPath($handle)
+            )
+            $fileId =
+                [AstroLauncherLockNative]::GetFileIdentity($handle)
+            if (-not [string]::Equals(
+                    $final.TrimEnd('\', '/'),
+                    $path.TrimEnd('\', '/'),
+                    [StringComparison]::OrdinalIgnoreCase
+                ) -or
+                [string]$fileId -cne
+                    [string]$expected[$path].file_id) {
+                $handle.Dispose()
+                throw (
+                    "ordinary tree directory identity drifted before " +
+                    "deletion: $path"
+                )
+            }
+            $leases.Add([pscustomobject]@{
+                path = $path
+                kind = 'directory'
+                handle = $handle
+            })
+        }
+        foreach ($path in @(
+                $expected.Keys |
+                    Where-Object {
+                        [string]$expected[$_].kind -ceq 'file'
+                    } |
+                    Sort-Object
+            )) {
+            $handle =
+                [AstroLauncherLockNative]::OpenExactDispositionFile($path)
+            $final = ConvertFrom-AstroNativeFinalPath (
+                [AstroLauncherLockNative]::GetFileFinalPath($handle)
+            )
+            $fileId =
+                [AstroLauncherLockNative]::GetFileIdentity($handle)
+            $sha256 =
+                [AstroLauncherLockNative]::ComputeExactFileSha256($handle)
+            if (-not [string]::Equals(
+                    $final,
+                    $path,
+                    [StringComparison]::OrdinalIgnoreCase
+                ) -or
+                [string]$fileId -cne
+                    [string]$expected[$path].file_id -or
+                [string]$sha256 -cne
+                    [string]$expected[$path].sha256) {
+                $handle.Dispose()
+                throw (
+                    "ordinary tree file identity/bytes drifted before deletion: " +
+                    $path
+                )
+            }
+            $leases.Add([pscustomobject]@{
+                path = $path
+                kind = 'file'
+                handle = $handle
+            })
+        }
+
+        $namespace = [Collections.Generic.List[object]]::new()
+        $scan = $null
+        $scan = {
+            param(
+                [Parameter(Mandatory)][string]$Directory,
+                [Parameter(Mandatory)][string]$RelativePath
+            )
+            $state = Get-AstroPathEntryState $Directory
+            if ($state.State -cne 'present' -or
+                ($state.Attributes -band
+                    [IO.FileAttributes]::Directory) -eq 0 -or
+                ($state.Attributes -band
+                    [IO.FileAttributes]::ReparsePoint) -ne 0) {
+                throw (
+                    'ordinary tree namespace changed at directory ' +
+                    "$Directory (state=$($state.State), " +
+                    "attributes=$($state.Attributes), error=$($state.Error))"
+                )
+            }
+            $namespace.Add([ordered]@{
+                relative_path = $RelativePath
+                kind = 'directory'
+                attributes = [uint32]$state.Attributes
+                bytes = $null
+            })
+            foreach ($entry in @(
+                    Get-AstroDirectoryEntriesLongPath $Directory
+                )) {
+                $entryFull = [IO.Path]::GetFullPath($entry.FullName)
+                if (-not $entryFull.StartsWith(
+                        $rootPrefix,
+                        [StringComparison]::OrdinalIgnoreCase
+                    ) -or
+                    ($entry.Attributes -band
+                        [IO.FileAttributes]::ReparsePoint) -ne 0) {
+                    throw (
+                        'ordinary tree namespace gained escaping/reparse ' +
+                        "entry: $entryFull"
+                    )
+                }
+                $entryRelative = $entryFull.Substring(
+                    $rootPrefix.Length
+                )
+                if ($entry.PSIsContainer) {
+                    & $scan $entryFull $entryRelative
+                }
+                else {
+                    $namespace.Add([ordered]@{
+                        relative_path = $entryRelative
+                        kind = 'file'
+                        attributes = [uint32]$entry.Attributes
+                        bytes = [uint64]$entry.Length
+                    })
+                }
+            }
+        }
+        & $scan $root '.'
+        if ($namespace.Count -ne [int]$inventory.entry_count) {
+            throw (
+                'ordinary tree namespace entry count drifted under retained ' +
+                "handles (expected=$($inventory.entry_count), " +
+                "observed=$($namespace.Count)): $root"
+            )
+        }
+        foreach ($observed in $namespace) {
+            $path = if ([string]$observed.relative_path -ceq '.') {
+                $root
+            }
+            else {
+                [IO.Path]::GetFullPath(
+                    (Join-Path $root ([string]$observed.relative_path))
+                )
+            }
+            if (-not $expected.ContainsKey($path)) {
+                throw "ordinary tree namespace gained unexpected entry: $path"
+            }
+            $record = $expected[$path]
+            if ([string]$observed.kind -cne [string]$record.kind -or
+                [uint32]$observed.attributes -ne
+                    [uint32]$record.attributes -or
+                ([string]$observed.kind -ceq 'file' -and
+                    [uint64]$observed.bytes -ne [uint64]$record.bytes)) {
+                throw (
+                    'ordinary tree namespace metadata drifted under retained ' +
+                    "handles: $path"
+                )
+            }
+        }
+
+        foreach ($lease in @(
+                $leases |
+                    Where-Object { $_.kind -ceq 'file' } |
+                    Sort-Object -Property path -Descending
+            )) {
+            [AstroLauncherLockNative]::
+                DeleteExactFileHandleIgnoringReadOnly($lease.handle)
+            $lease.handle.Dispose()
+            $lease.handle = $null
+            $terminal = Get-AstroPathEntryState $lease.path
+            if ($terminal.State -cne 'absent') {
+                throw (
+                    'exact ordinary-tree file delete did not reach absence ' +
+                    "(state=$($terminal.State), error=$($terminal.Error)): " +
+                    $lease.path
+                )
+            }
+        }
+        foreach ($lease in @(
+                $leases |
+                    Where-Object { $_.kind -ceq 'directory' } |
+                    Sort-Object { $_.path.Length } -Descending
+            )) {
+            if (@(
+                    Get-AstroDirectoryEntriesLongPath $lease.path
+                ).Count -ne 0) {
+                throw (
+                    'ordinary tree directory gained or retained entries ' +
+                    "before exact delete: $($lease.path)"
+                )
+            }
+            [AstroLauncherLockNative]::
+                DeleteExactDirectoryHandle($lease.handle)
+            $lease.handle.Dispose()
+            $lease.handle = $null
+            $terminal = Get-AstroPathEntryState $lease.path
+            if ($terminal.State -cne 'absent') {
+                throw (
+                    'exact ordinary-tree directory delete did not reach ' +
+                    "absence (state=$($terminal.State), " +
+                    "error=$($terminal.Error)): $($lease.path)"
+                )
+            }
+        }
+    }
+    finally {
+        foreach ($lease in $leases) {
+            if ($null -ne $lease.handle) {
+                $lease.handle.Dispose()
+            }
+        }
+    }
+    $terminalRoot = Get-AstroPathEntryState $root
+    if ($terminalRoot.State -cne 'absent') {
+        throw (
+            'ordinary tree cleanup did not reach root absence ' +
+            "(state=$($terminalRoot.State), " +
+            "error=$($terminalRoot.Error)): $root"
+        )
     }
 }
 

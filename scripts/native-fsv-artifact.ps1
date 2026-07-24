@@ -1998,16 +1998,46 @@ try {
                     -Description 'completed evidence session'
             )
             $session = [IO.Path]::GetFullPath($inspection.session_directory)
+            try {
+                $initialTree =
+                    Get-AstroOrdinaryDirectoryTreeInventoryLongPath $session
+            }
+            catch {
+                Fail-Astro 'ASTRO_FSV_CLEANUP_TREE_INVALID' `
+                    "completed evidence tree preflight failed without mutation: $($_.Exception.Message)" `
+                    'preserve every session byte; remove reparses/foreign writers only through an explicitly authorized recovery lifecycle'
+            }
             $finalOwnerProbes = @(
                 Assert-AstroFsvOwnersInactive `
                     -Bindings $ownerBindings `
                     -CodePrefix 'ASTRO_FSV_CLEANUP' `
                     -Description 'completed evidence session final authorization'
             )
+            try {
+                $finalTree =
+                    Get-AstroOrdinaryDirectoryTreeInventoryLongPath $session
+            }
+            catch {
+                Fail-Astro 'ASTRO_FSV_CLEANUP_TREE_INVALID' `
+                    "completed evidence tree final preflight failed without mutation: $($_.Exception.Message)" `
+                    'preserve every session byte and investigate the exact filesystem state before retrying'
+            }
+            if ([string]$initialTree.sha256 -cne
+                    [string]$finalTree.sha256 -or
+                [int]$initialTree.entry_count -ne
+                    [int]$finalTree.entry_count) {
+                Fail-Astro 'ASTRO_FSV_CLEANUP_TREE_DRIFT' `
+                    "completed evidence tree changed between authorization reads (initial_sha256=$($initialTree.sha256), final_sha256=$($finalTree.sha256), initial_entries=$($initialTree.entry_count), final_entries=$($finalTree.entry_count))" `
+                    'preserve every session byte; stop the writer and retry only after the exact tree is stable'
+            }
             $before = [ordered]@{
                 session = $session
                 exists = Test-AstroPathLongPath -LiteralPath $session
                 artifact_sha256 = $inspection.sha256
+                tree = [ordered]@{
+                    entry_count = [int]$finalTree.entry_count
+                    inventory_sha256 = [string]$finalTree.sha256
+                }
                 owners = [ordered]@{
                     identities = @($ownerBindings | ForEach-Object {
                             [ordered]@{
@@ -2020,9 +2050,16 @@ try {
                     final_probes = $finalOwnerProbes
                 }
             }
-            Set-AstroFileReadOnlyLongPath `
-                -LiteralPath $inspection.artifact_path -ReadOnly $false
-            Remove-AstroOrdinaryFlatDirectoryLongPath $session
+            try {
+                Remove-AstroOrdinaryDirectoryTreeLongPath `
+                    -LiteralPath $session `
+                    -ExpectedInventorySha256 ([string]$finalTree.sha256)
+            }
+            catch {
+                Fail-Astro 'ASTRO_FSV_CLEANUP_TREE_DELETE_FAILED' `
+                    "exact completed evidence-tree deletion failed: $($_.Exception.Message)" `
+                    'preserve all remaining state; inspect the exact error and retry Cleanup only after any foreign handle or namespace drift is resolved'
+            }
             if (Test-AstroPathLongPath -LiteralPath $session) {
                 Fail-Astro 'ASTRO_FSV_CLEANUP_FAILED' "evidence session remains after cleanup: $session" `
                     'inspect open handles and retry only after every exact owner generation is dead'
