@@ -256,7 +256,7 @@ int cbm_index_spawn_worker(const char *args_json, cbm_index_worker_result_t *res
 
     char self[1024] = {0};
     if (!cbm_http_server_resolve_binary_path(NULL, self, sizeof(self)) || !self[0]) {
-        cbm_log_warn("index.supervisor.no_self_path", "action", "degrade_in_process");
+        cbm_log_error("index.supervisor.no_self_path", "action", "fail_closed");
         return -1;
     }
 
@@ -354,24 +354,18 @@ int cbm_index_spawn_worker(const char *args_json, cbm_index_worker_result_t *res
     result->outcome = r.outcome;
     result->exit_code = r.exit_code;
     result->term_signal = r.term_signal;
-#ifdef ASTRO_WORKER_DIAG
-    /* #282: slurp the response file on EVERY outcome, not only CLEAN. The
-     * worker CLI writes --response-out before exiting nonzero, so on failure
-     * this file usually carries the worker's true error (e.g. the exact
-     * isError text). Discarding it unread made contained failures
-     * unattributable — the supervisor deleted the one artifact that named the
-     * defect. */
+    /* Read the response file on EVERY outcome, not only CLEAN. A valid MCP tool
+     * execution error is fully written and closed before the CLI intentionally exits 1;
+     * the MCP layer validates both facts before preserving that response. A
+     * crash/hang/malformed response remains a process failure. */
     result->response = slurp_file(resp_path);
+#ifdef ASTRO_WORKER_DIAG
     if (r.outcome != CBM_PROC_CLEAN) {
         /* #282 (attempt 15): the worker's panic/abort text goes only to its
          * log, which lives under a run-scoped dir the gate wipes — carry a
          * bounded tail in the result so the failure artifact names the
          * defect even after cleanup. The on-disk log is still kept below. */
         result->log_tail = slurp_file_tail(log_path, CBM_WORKER_LOG_TAIL_MAX);
-    }
-#else
-    if (r.outcome == CBM_PROC_CLEAN) {
-        result->response = slurp_file(resp_path);
     }
 #endif
     (void)cbm_unlink(resp_path);

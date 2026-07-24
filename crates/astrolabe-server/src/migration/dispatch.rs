@@ -474,27 +474,48 @@ pub(crate) fn handle_index_repository(
         Ok(args) => args,
         Err(error) => return Err(publication.abort("worker argument binding", error)),
     };
-    let staged = (|| -> Result<(String, ShadowImportOutcome), DynError> {
-        let (result, resolved_project, row_sink) = match run_shadow_index_pass(
-            runner,
-            &staged_args,
-            Some(&project),
-            &skills,
-            publication.stage_cache(),
-        )? {
-            ShadowIndexPassOutcome::Completed {
-                raw_result,
-                project,
-                candidate,
-            } => (raw_result, project, candidate),
-            ShadowIndexPassOutcome::Failed { error_result } => {
-                return Err(format!(
-                    "ASTRO_SHADOW_INDEX_PASS_FAILED: {}",
-                    shadow_index_pass_error_result(&error_result)?
-                )
-                .into());
+    let pass = match run_shadow_index_pass(
+        runner,
+        &staged_args,
+        Some(&project),
+        &skills,
+        publication.stage_cache(),
+    ) {
+        Ok(pass) => pass,
+        Err(error) => {
+            return tool_error_result(
+                publication
+                    .abort("staged index execution", error)
+                    .to_string(),
+            );
+        }
+    };
+    let (result, resolved_project, row_sink) = match pass {
+        ShadowIndexPassOutcome::Completed {
+            raw_result,
+            project,
+            candidate,
+        } => (raw_result, project, candidate),
+        ShadowIndexPassOutcome::Failed { error_result } => {
+            let error_result = match shadow_index_pass_error_result(&error_result) {
+                Ok(error_result) => error_result,
+                Err(error) => {
+                    return tool_error_result(
+                        publication
+                            .abort("staged index error normalization", error)
+                            .to_string(),
+                    );
+                }
+            };
+            if let Err(error) =
+                publication.abort_preserving_tool_error("staged index refusal", &error_result)
+            {
+                return tool_error_result(error.to_string());
             }
-        };
+            return Ok(error_result);
+        }
+    };
+    let staged = (|| -> Result<(String, ShadowImportOutcome), DynError> {
         if resolved_project != project {
             return Err(format!(
                 "ASTRO_SHADOW_PROJECT_MISMATCH: staged index resolved project {resolved_project:?}, expected {project:?}; remediation: pass one canonical repo_path/project identity and retry"

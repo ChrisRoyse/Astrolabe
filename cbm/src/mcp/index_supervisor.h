@@ -52,17 +52,19 @@ typedef struct {
     cbm_proc_outcome_t outcome; /* how the worker ended */
     int exit_code;              /* worker exit code (-1 if signalled) */
     int term_signal;            /* POSIX terminating signal, else 0 */
-    char *response;             /* worker's result string on CLEAN exit (caller frees); else NULL */
-    char *log_tail;             /* #282: bounded tail of the worker's own log (stderr/panic text)
-                                 * on a non-CLEAN outcome (caller frees); else NULL. Present in
-                                 * every build for a single struct layout; only the
-                                 * ASTRO_WORKER_DIAG supervisor fills it. */
-    char *log_path;             /* persisted worker log on non-CLEAN outcome (caller frees) */
+    char *response; /* complete worker result when its response file exists (caller frees) */
+    char *log_tail; /* #282: bounded tail of the worker's own log (stderr/panic text)
+                     * on a non-CLEAN outcome (caller frees); else NULL. Present in
+                     * every build for a single struct layout; only the
+                     * ASTRO_WORKER_DIAG supervisor fills it. */
+    char *log_path; /* persisted worker log on non-CLEAN outcome (caller frees) */
 } cbm_index_worker_result_t;
 
 /* Spawn `<self> cli --index-worker index_repository <args_json> --response-out <tmp>`,
- * supervise it (quiet-timeout for hangs), reap, and classify. On a clean exit,
- * result->response holds the worker's response string (read from the temp file).
+ * supervise it (quiet-timeout for hangs), reap, and classify. On any exit,
+ * result->response holds the complete worker response when the response file exists.
+ * The MCP layer validates that envelope together with the exact process outcome before
+ * deciding whether it is an intentional tool error or a process failure.
  * Returns 0 if a worker was spawned and reaped (result filled), or -1 if the
  * child could not be spawned. Callers must fail closed; there is no in-process
  * retry or corpus-changing recovery path. */

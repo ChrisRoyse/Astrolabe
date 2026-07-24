@@ -80,6 +80,18 @@ impl ShadowPublication {
         self.abort_error(phase, error)
     }
 
+    /// Remove an unpublished staged transaction while preserving an already
+    /// validated MCP tool-error envelope for the caller. The originating error
+    /// may be returned only after both the abort journal and physical cleanup
+    /// succeed; otherwise the cleanup failure becomes authoritative.
+    pub(crate) fn abort_preserving_tool_error(
+        self,
+        phase: &str,
+        error_result: &str,
+    ) -> Result<(), DynError> {
+        self.abort_cleanup(phase, error_result)
+    }
+
     pub(crate) fn publish(
         self,
         mut outcome: ShadowImportOutcome,
@@ -451,22 +463,31 @@ impl ShadowPublication {
         Ok(())
     }
 
-    fn abort_error(&self, phase: &str, error: impl std::fmt::Display) -> DynError {
+    fn abort_cleanup(&self, phase: &str, error: impl std::fmt::Display) -> Result<(), DynError> {
         let journal_error = self.write_journal(
             "aborted",
             json!({"failed_phase": phase, "error": error.to_string()}),
         );
         let cleanup_error = remove_transaction_tree(&self.transaction_dir, &self.project_root);
-        let _ = remove_empty_dir(&self.project_root);
-        let suffix = match (journal_error, cleanup_error) {
-            (Ok(()), Ok(())) => String::new(),
-            (journal, cleanup) => format!(
-                "; transaction evidence cleanup was incomplete (journal={journal:?}, cleanup={cleanup:?}) at {}",
-                self.transaction_dir.display()
-            ),
-        };
+        let root_cleanup_error = remove_empty_dir(&self.project_root);
+        match (journal_error, cleanup_error, root_cleanup_error) {
+            (Ok(()), Ok(()), Ok(())) => Ok(()),
+            (journal, cleanup, root_cleanup) => Err(format!(
+                "ASTRO_SHADOW_PUBLICATION_ABORT_CLEANUP_FAILED: transaction evidence cleanup was incomplete (journal={journal:?}, cleanup={cleanup:?}, root_cleanup={root_cleanup:?}) at {}; originating_error={}; remediation: do not serve or retry this project until the exact transaction tree is inspected and safely reconciled",
+                self.transaction_dir.display(),
+                error
+            )
+            .into()),
+        }
+    }
+
+    fn abort_error(&self, phase: &str, error: impl std::fmt::Display) -> DynError {
+        let error = error.to_string();
+        if let Err(cleanup_error) = self.abort_cleanup(phase, &error) {
+            return cleanup_error;
+        }
         format!(
-            "ASTRO_SHADOW_PUBLICATION_ABORTED: shadow publication for project {:?} failed during {phase}: {error}{suffix}. The prior live generation was not committed. Remediation: fix the named phase error and rerun index_repository with calyx=\"shadow\"",
+            "ASTRO_SHADOW_PUBLICATION_ABORTED: shadow publication for project {:?} failed during {phase}: {error}. The prior live generation was not committed. Remediation: fix the named phase error and rerun index_repository with calyx=\"shadow\"",
             self.project
         )
         .into()

@@ -4201,6 +4201,36 @@ static char *build_strict_supervised_error(const char *args, const char *outcome
     free(json);
     return result;
 }
+
+/* A tool execution error is a completed worker result, not a worker crash. The
+ * public CLI deliberately exits 1 when its MCP result has isError:true, so the
+ * exact process outcome and the independently parsed response envelope must be
+ * evaluated together. Only the documented exit code plus a complete MCP text
+ * result is accepted. Missing/malformed responses, other exit codes, signals,
+ * crashes, kills, and hangs remain supervisor failures. */
+static bool supervised_worker_returned_tool_error(const cbm_index_worker_result_t *wr) {
+    if (!wr || wr->outcome != CBM_PROC_EXIT_NONZERO || wr->exit_code != SKIP_ONE || !wr->response ||
+        !wr->response[0]) {
+        return false;
+    }
+    yyjson_doc *doc = yyjson_read(wr->response, strlen(wr->response), 0);
+    yyjson_val *root = doc ? yyjson_doc_get_root(doc) : NULL;
+    yyjson_val *is_error = root && yyjson_is_obj(root) ? yyjson_obj_get(root, "isError") : NULL;
+    yyjson_val *content = root && yyjson_is_obj(root) ? yyjson_obj_get(root, "content") : NULL;
+    yyjson_val *first = content && yyjson_is_arr(content) && yyjson_arr_size(content) > 0
+                            ? yyjson_arr_get_first(content)
+                            : NULL;
+    yyjson_val *type = first && yyjson_is_obj(first) ? yyjson_obj_get(first, "type") : NULL;
+    yyjson_val *text = first && yyjson_is_obj(first) ? yyjson_obj_get(first, "text") : NULL;
+    bool valid = is_error && yyjson_is_bool(is_error) && yyjson_get_bool(is_error) && type &&
+                 yyjson_is_str(type) && strcmp(yyjson_get_str(type), "text") == 0 && text &&
+                 yyjson_is_str(text) && yyjson_get_str(text)[0];
+    if (doc) {
+        yyjson_doc_free(doc);
+    }
+    return valid;
+}
+
 /* Run index_repository exactly once in an isolated worker. A process or
  * response failure is a terminal structured refusal; the supervisor never
  * retries with a changed corpus and never degrades to in-process execution. */
@@ -4220,6 +4250,15 @@ static char *index_run_supervised(cbm_mcp_server_t *srv, const char *args) {
     if (wr.outcome == CBM_PROC_CLEAN && wr.response) {
         char *response = wr.response;
         wr.response = NULL;
+        cbm_index_worker_result_free(&wr);
+        supervisor_invalidate_store(srv);
+        return response;
+    }
+
+    if (supervised_worker_returned_tool_error(&wr)) {
+        char *response = wr.response;
+        wr.response = NULL;
+        cbm_log_info("index.supervisor.tool_error", "outcome", "exit_nonzero", "exit_code", "1");
         cbm_index_worker_result_free(&wr);
         supervisor_invalidate_store(srv);
         return response;
@@ -4535,16 +4574,15 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
         cbm_pipeline_error_t fatal = {0};
         bool has_fatal = cbm_pipeline_get_fatal_error(p, &fatal);
         yyjson_mut_obj_add_str(doc, root, "status", "error");
-        yyjson_mut_obj_add_str(doc, root, "code",
-                               has_fatal ? fatal.code : "CBM_PIPELINE_FAILED");
+        yyjson_mut_obj_add_str(doc, root, "code", has_fatal ? fatal.code : "CBM_PIPELINE_FAILED");
         yyjson_mut_obj_add_str(doc, root, "operation",
                                has_fatal ? fatal.operation : "cbm_pipeline_run");
         yyjson_mut_obj_add_str(doc, root, "phase", has_fatal ? fatal.phase : "pipeline");
         yyjson_mut_obj_add_str(doc, root, "path", has_fatal ? fatal.path : repo_path);
         yyjson_mut_obj_add_uint(doc, root, "requested", has_fatal ? fatal.requested : 0);
-        yyjson_mut_obj_add_str(
-            doc, root, "message",
-            has_fatal ? fatal.message : "the authoritative indexing pipeline failed");
+        yyjson_mut_obj_add_str(doc, root, "message",
+                               has_fatal ? fatal.message
+                                         : "the authoritative indexing pipeline failed");
         yyjson_mut_obj_add_str(
             doc, root, "remediation",
             has_fatal

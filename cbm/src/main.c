@@ -29,6 +29,7 @@ enum {
     MAIN_FLAG_OFF = 5, /* strlen("--ui=") */
     MAIN_PORT_OFF = 7, /* strlen("--port=") */
     MAIN_MAX_PORT = 65536,
+    MAIN_WORKER_RESPONSE_WRITE_FAILED = 2,
     PARENT_WATCHDOG_STACK_SIZE = 64 * CBM_SZ_1K, /* watchdog only polls — tiny stack suffices */
 };
 #define SLEN(s) (sizeof(s) - 1)
@@ -270,6 +271,25 @@ static int cli_print_mcp_result(const char *result) {
 
     yyjson_doc_free(doc);
     return exit_code;
+}
+
+/* Fully write and close the supervised-worker response before exit. Exit code 1 is
+ * reserved for a validated MCP isError:true result, so transport publication
+ * failure must use a distinct code that the parent can never misclassify as an
+ * intentional tool error. */
+static bool cli_write_worker_response(const char *path, const char *result) {
+    FILE *file = cbm_fopen(path, "wb");
+    if (!file) {
+        return false;
+    }
+    int write_rc = fputs(result, file);
+    int flush_rc = fflush(file);
+    int close_rc = fclose(file);
+    if (write_rc == EOF || flush_rc != 0 || close_rc != 0) {
+        (void)cbm_unlink(path);
+        return false;
+    }
+    return true;
 }
 
 /* Strip a flag from argv, returning true if found. */
@@ -589,13 +609,10 @@ static int run_cli(int argc, char **argv) {
          * and a human-readable block otherwise. */
         const char *ro = cbm_index_worker_response_out();
         if (ro) {
-            /* Supervised index worker (#832 path): the parent gates success
-             * strictly on this worker exiting 0 (CBM_PROC_CLEAN) and reads back the
-             * --response-out file. Remove any file at that path so the parent can
-             * NEVER read a stale/prior response as this run's success, and let the
-             * non-zero exit below be the honest signal that this worker produced no
-             * index result — the parent then degrades in-process (non-strict) or
-             * fails closed (strict, #405) through its existing outcome handling. */
+            /* Supervised index worker (#832 path): remove any file at that path
+             * so the parent can NEVER read a stale/prior response as this run's
+             * result. The non-zero exit below plus the missing response is an
+             * unambiguous supervisor failure, never an intentional tool error. */
             (void)cbm_unlink(ro);
         }
         if (raw_json) {
@@ -640,15 +657,11 @@ static int run_cli(int argc, char **argv) {
 
     if (result) {
         /* Supervised worker: hand the full result string to the parent via the
-         * response file before printing (parent reads it back on a clean exit). */
+         * response file before printing. The parent validates this publication
+         * together with the exact process outcome. */
         const char *ro = cbm_index_worker_response_out();
-        if (ro) {
-            FILE *rf = cbm_fopen(ro, "wb");
-            if (rf) {
-                (void)fputs(result, rf);
-                (void)fclose(rf);
-            }
-        }
+        bool worker_response_written =
+            !cbm_index_worker_active() || (ro && cli_write_worker_response(ro, result));
         if (raw_json) {
             /* #425: the JSON payload is unchanged (byte-for-byte on stdout),
              * but the process exit code now reflects the tool outcome —
@@ -663,6 +676,15 @@ static int run_cli(int argc, char **argv) {
             exit_code = cli_print_mcp_result(result);
         }
         if (cbm_index_worker_active()) {
+            if (!worker_response_written) {
+                cbm_log_error(
+                    "index.worker.response_write_failed", "code",
+                    "CBM_INDEX_WORKER_RESPONSE_WRITE_FAILED", "message",
+                    "the complete supervised worker response could not be published", "remediation",
+                    "inspect the worker response path and storage device before retrying");
+                fflush(NULL);
+                _Exit(MAIN_WORKER_RESPONSE_WRITE_FAILED);
+            }
             /* Supervised worker: the response is delivered (file + stdout).
              * Skip the multi-GB teardown (server/store frees) — the process
              * dies now and the OS reclaims everything wholesale; piecemeal
