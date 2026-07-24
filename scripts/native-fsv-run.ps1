@@ -9,10 +9,11 @@
     remains open for the complete child lifetime, so Windows refuses artifact mutation,
     rename, and directory cleanup while the real process is running.
 
-    Before returning, it independently reads back the artifact hash, output hashes, the
-    retained Windows process handle's kernel exit code (cross-checked against Process.ExitCode),
-    and Git tree state into a durable run record. No CPU fallback, output substitution, retry,
-    or mock behavior exists here.
+    Before returning, it independently reads back the artifact hash, output hashes, and the
+    kernel exit code through both the original PROCESS_INFORMATION process handle and a
+    separately duplicated handle to that exact kernel object. It also records Git tree state
+    into a durable run record. No PID-reopened process authority, CPU fallback, output
+    substitution, retry, or mock behavior exists here.
 
 .NOTES
     Refs #600, #596, #424, #197. Manual FSV tooling; this is not a test or a gate.
@@ -88,39 +89,26 @@ function String-Sha256([AllowEmptyString()][string]$Value) {
 }
 
 function Observe-ExitedProcessCode(
-    [Diagnostics.Process]$Process,
-    [Microsoft.Win32.SafeHandles.SafeProcessHandle]$RetainedHandle
+    [AstroFsvCreatedProcess]$Process
 ) {
-    $Process.Refresh()
     if (-not $Process.HasExited) {
         Fail-Astro 'ASTRO_FSV_CHILD_STILL_LIVE' "native child PID $($Process.Id) is still live after the runner wait completed" 'preserve the FSV lock and wait for the exact recorded child to exit naturally'
     }
     try {
-        [uint32]$kernelCode = [AstroFsvAtomicFile]::ReadTerminatedProcessExitCode($RetainedHandle)
+        [uint32]$kernelCode =
+            [AstroFsvAtomicFile]::ReadTerminatedProcessExitCode($Process.ProcessHandle)
+        [uint32]$duplicateCode =
+            [AstroFsvAtomicFile]::ReadTerminatedProcessExitCode($Process.ObservationHandle)
     }
     catch {
-        Fail-Astro 'ASTRO_FSV_CHILD_EXIT_UNREADABLE' "kernel32!GetExitCodeProcess failed for retained native child PID $($Process.Id): $($_.Exception.Message)" 'preserve the session and process handle evidence; repair process-exit observation before rerunning'
-    }
-    $componentSignedCode = $null
-    $componentCode = $null
-    $componentError = $null
-    try {
-        $componentSignedCode = [int32]$Process.ExitCode
-        $componentCode = [BitConverter]::ToUInt32(
-            [BitConverter]::GetBytes($componentSignedCode),
-            0
-        )
-    }
-    catch {
-        $componentError = $_.Exception.Message
+        Fail-Astro 'ASTRO_FSV_CHILD_EXIT_UNREADABLE' "kernel32!GetExitCodeProcess failed for an exact retained handle to native child PID $($Process.Id): $($_.Exception.Message)" 'preserve the session and both exact process-handle observations; repair process-exit observation before rerunning'
     }
     return [ordered]@{
         exit_code = $kernelCode
-        primary_source = 'kernel32!GetExitCodeProcess(retained_process_handle)'
-        process_component_exit_code_signed = $componentSignedCode
-        process_component_exit_code = $componentCode
-        process_component_error = Failure-Text $componentError
-        sources_agree = $null -ne $componentCode -and $componentCode -eq $kernelCode
+        primary_source = 'kernel32!GetExitCodeProcess(PROCESS_INFORMATION.hProcess)'
+        exact_duplicate_source = 'kernel32!GetExitCodeProcess(DuplicateHandle(PROCESS_INFORMATION.hProcess))'
+        exact_duplicate_exit_code = $duplicateCode
+        sources_agree = $duplicateCode -eq $kernelCode
     }
 }
 
@@ -175,7 +163,6 @@ if (-not ([Management.Automation.PSTypeName]'AstroFsvAtomicFile').Type) {
     Add-Type -Language CSharp -TypeDefinition @'
 using System;
 using System.ComponentModel;
-using System.Diagnostics;
 using System.Runtime.InteropServices;
 using System.Text;
 using Microsoft.Win32.SafeHandles;
@@ -254,6 +241,10 @@ public sealed class AstroFsvCreatedProcess : IDisposable {
     const uint WAIT_OBJECT_0 = 0;
     const uint WAIT_TIMEOUT = 258;
     const uint WAIT_FAILED = 0xFFFFFFFF;
+    const uint INFINITE = 0xFFFFFFFF;
+    const uint DUPLICATE_SAME_ACCESS = 0x00000002;
+    const uint DUPLICATE_FAILURE_EXIT_CODE = 0xA57F0002;
+    const uint DUPLICATE_FAILURE_WAIT_MS = 30000;
 
     IntPtr threadHandle;
     bool disposed;
@@ -262,11 +253,87 @@ public sealed class AstroFsvCreatedProcess : IDisposable {
         ProcessHandle = new SafeProcessHandle(processHandle, true);
         threadHandle = primaryThreadHandle;
         ProcessId = processId;
+        try {
+            SafeProcessHandle duplicate;
+            IntPtr current = GetCurrentProcess();
+            if (!DuplicateHandle(
+                current,
+                ProcessHandle,
+                current,
+                out duplicate,
+                0,
+                false,
+                DUPLICATE_SAME_ACCESS)) {
+                int error = Marshal.GetLastWin32Error();
+                throw new Win32Exception(error,
+                    "DuplicateHandle failed for exact created native child process " +
+                    "(native_error=" + error + "; pid=" + ProcessId + ")");
+            }
+            ObservationHandle = duplicate;
+        }
+        catch (Exception duplicateFailure) {
+            Exception cleanupFailure = null;
+            try {
+                if (!TerminateProcess(ProcessHandle, DUPLICATE_FAILURE_EXIT_CODE)) {
+                    int error = Marshal.GetLastWin32Error();
+                    throw new Win32Exception(error,
+                        "TerminateProcess failed after exact process-handle duplication failure " +
+                        "(native_error=" + error + "; pid=" + ProcessId + ")");
+                }
+                uint cleanupWait = WaitForExactHandle(
+                    ProcessHandle,
+                    DUPLICATE_FAILURE_WAIT_MS,
+                    "primary process handle after duplication failure");
+                if (cleanupWait == WAIT_TIMEOUT) {
+                    throw new TimeoutException(
+                        "timed out waiting for exact suspended child cleanup after " +
+                        "process-handle duplication failure (pid=" + ProcessId +
+                        "; timeout_ms=" + DUPLICATE_FAILURE_WAIT_MS + ")");
+                }
+            }
+            catch (Exception cleanup) {
+                cleanupFailure = cleanup;
+            }
+            if (threadHandle != IntPtr.Zero) {
+                if (!CloseHandle(threadHandle) && cleanupFailure == null) {
+                    int error = Marshal.GetLastWin32Error();
+                    cleanupFailure = new Win32Exception(error,
+                        "CloseHandle failed for primary thread after process-handle duplication failure " +
+                        "(native_error=" + error + "; pid=" + ProcessId + ")");
+                }
+                threadHandle = IntPtr.Zero;
+            }
+            ProcessHandle.Dispose();
+            if (cleanupFailure != null) {
+                throw new InvalidOperationException(
+                    duplicateFailure.Message +
+                    "; exact suspended-child cleanup also failed: " +
+                    cleanupFailure.Message,
+                    duplicateFailure);
+            }
+            throw;
+        }
     }
 
     public SafeProcessHandle ProcessHandle { get; private set; }
+    public SafeProcessHandle ObservationHandle { get; private set; }
     public uint ProcessId { get; private set; }
-    public Process BoundProcess { get; private set; }
+    public int Id { get { return checked((int)ProcessId); } }
+    public bool HasExited {
+        get {
+            EnsureUsable();
+            uint primary = WaitForExactHandle(ProcessHandle, 0, "primary process handle");
+            uint duplicate =
+                WaitForExactHandle(ObservationHandle, 0, "duplicated process handle");
+            if (primary != duplicate) {
+                throw new InvalidOperationException(
+                    "exact native process handles disagree on signaled state " +
+                    "(pid=" + ProcessId + "; primary_wait=" + primary +
+                    "; duplicate_wait=" + duplicate + ")");
+            }
+            return primary == WAIT_OBJECT_0;
+        }
+    }
 
     [DllImport("kernel32.dll", SetLastError = true)]
     static extern uint ResumeThread(IntPtr thread);
@@ -280,22 +347,30 @@ public sealed class AstroFsvCreatedProcess : IDisposable {
     [DllImport("kernel32.dll", SetLastError = true)]
     static extern bool GetExitCodeProcess(SafeProcessHandle process, out uint exitCode);
 
+    [DllImport("kernel32.dll")]
+    static extern IntPtr GetCurrentProcess();
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    static extern bool DuplicateHandle(
+        IntPtr sourceProcess,
+        SafeProcessHandle sourceHandle,
+        IntPtr targetProcess,
+        out SafeProcessHandle targetHandle,
+        uint desiredAccess,
+        bool inheritHandle,
+        uint options);
+
     [DllImport("kernel32.dll", SetLastError = true)]
     static extern bool CloseHandle(IntPtr handle);
 
-    public Process BindAndResume() {
-        if (disposed)
-            throw new ObjectDisposedException("AstroFsvCreatedProcess");
-        if (BoundProcess != null)
-            throw new InvalidOperationException("native child process was already bound");
+    public AstroFsvCreatedProcess BindAndResume() {
+        EnsureUsable();
         if (threadHandle == IntPtr.Zero)
             throw new InvalidOperationException("native child primary thread handle is unavailable");
 
-        BoundProcess = Process.GetProcessById(checked((int)ProcessId));
-        BoundProcess.Refresh();
-        if (BoundProcess.HasExited)
+        if (HasExited)
             throw new InvalidOperationException(
-                "created-suspended native child exited before exact process binding (pid=" +
+                "created-suspended native child exited before exact process resume (pid=" +
                 ProcessId + ")");
 
         uint previousSuspendCount = ResumeThread(threadHandle);
@@ -312,16 +387,28 @@ public sealed class AstroFsvCreatedProcess : IDisposable {
                 "(pid=" + ProcessId + "; previous_suspend_count=" +
                 previousSuspendCount + "; expected=1)");
         }
-        return BoundProcess;
+        return this;
+    }
+
+    public void WaitForExit() {
+        EnsureUsable();
+        WaitForExactHandle(ProcessHandle, INFINITE, "primary process handle");
+        uint duplicate =
+            WaitForExactHandle(ObservationHandle, 0, "duplicated process handle");
+        if (duplicate != WAIT_OBJECT_0) {
+            throw new InvalidOperationException(
+                "duplicated exact process handle was not signaled after the primary exact " +
+                "process handle completed (pid=" + ProcessId +
+                "; duplicate_wait=" + duplicate + ")");
+        }
+    }
+
+    public void Refresh() {
+        EnsureUsable();
     }
 
     public void TerminateAndWait(uint exitCode, uint timeoutMilliseconds) {
-        if (disposed)
-            throw new ObjectDisposedException("AstroFsvCreatedProcess");
-        if (ProcessHandle == null || ProcessHandle.IsInvalid || ProcessHandle.IsClosed)
-            throw new InvalidOperationException(
-                "cannot terminate created native child because its retained process handle is unavailable " +
-                "(pid=" + ProcessId + ")");
+        EnsureUsable();
 
         if (!TerminateProcess(ProcessHandle, exitCode)) {
             int terminateError = Marshal.GetLastWin32Error();
@@ -340,22 +427,23 @@ public sealed class AstroFsvCreatedProcess : IDisposable {
             }
         }
 
-        uint waitResult = WaitForSingleObject(ProcessHandle, timeoutMilliseconds);
-        if (waitResult == WAIT_TIMEOUT) {
+        uint primaryWait = WaitForExactHandle(
+            ProcessHandle,
+            timeoutMilliseconds,
+            "primary process handle during termination");
+        if (primaryWait == WAIT_TIMEOUT) {
             throw new TimeoutException(
                 "timed out waiting for exact created native child termination " +
                 "(pid=" + ProcessId + "; timeout_ms=" + timeoutMilliseconds + ")");
         }
-        if (waitResult == WAIT_FAILED) {
-            int error = Marshal.GetLastWin32Error();
-            throw new Win32Exception(error,
-                "WaitForSingleObject failed for exact created native child " +
-                "(native_error=" + error + "; pid=" + ProcessId + ")");
-        }
-        if (waitResult != WAIT_OBJECT_0) {
+        uint duplicateWait = WaitForExactHandle(
+            ObservationHandle,
+            0,
+            "duplicated process handle after termination");
+        if (duplicateWait != WAIT_OBJECT_0) {
             throw new InvalidOperationException(
-                "WaitForSingleObject returned an unexpected result for exact created native child " +
-                "(pid=" + ProcessId + "; wait_result=" + waitResult + ")");
+                "duplicated exact process handle was not signaled after forced termination " +
+                "(pid=" + ProcessId + "; duplicate_wait=" + duplicateWait + ")");
         }
 
         uint finalCode;
@@ -369,9 +457,59 @@ public sealed class AstroFsvCreatedProcess : IDisposable {
             throw new InvalidOperationException(
                 "exact created native child still reports STILL_ACTIVE after termination wait " +
                 "(pid=" + ProcessId + ")");
+        uint duplicateCode;
+        if (!GetExitCodeProcess(ObservationHandle, out duplicateCode)) {
+            int error = Marshal.GetLastWin32Error();
+            throw new Win32Exception(error,
+                "GetExitCodeProcess failed for duplicated exact native child handle after " +
+                "termination (native_error=" + error + "; pid=" + ProcessId + ")");
+        }
+        if (duplicateCode != finalCode) {
+            throw new InvalidOperationException(
+                "exact native process handles disagree on the forced termination code " +
+                "(pid=" + ProcessId + "; primary_exit=" + finalCode +
+                "; duplicate_exit=" + duplicateCode + ")");
+        }
         ClosePrimaryThreadHandle();
-        if (BoundProcess != null)
-            BoundProcess.Refresh();
+    }
+
+    static uint WaitForExactHandle(
+        SafeProcessHandle handle,
+        uint timeoutMilliseconds,
+        string description) {
+        if (handle == null || handle.IsInvalid || handle.IsClosed)
+            throw new InvalidOperationException(
+                description + " is invalid or closed");
+        uint waitResult = WaitForSingleObject(handle, timeoutMilliseconds);
+        if (waitResult == WAIT_TIMEOUT)
+            return WAIT_TIMEOUT;
+        if (waitResult == WAIT_FAILED) {
+            int error = Marshal.GetLastWin32Error();
+            throw new Win32Exception(error,
+                "WaitForSingleObject failed for " + description +
+                " (native_error=" + error + ")");
+        }
+        if (waitResult != WAIT_OBJECT_0) {
+            throw new InvalidOperationException(
+                "WaitForSingleObject returned an unexpected result for " +
+                description + " (wait_result=" + waitResult + ")");
+        }
+        return waitResult;
+    }
+
+    void EnsureUsable() {
+        if (disposed)
+            throw new ObjectDisposedException("AstroFsvCreatedProcess");
+        if (ProcessHandle == null || ProcessHandle.IsInvalid || ProcessHandle.IsClosed)
+            throw new InvalidOperationException(
+                "primary exact native process handle is invalid or closed " +
+                "(pid=" + ProcessId + ")");
+        if (ObservationHandle == null ||
+            ObservationHandle.IsInvalid ||
+            ObservationHandle.IsClosed)
+            throw new InvalidOperationException(
+                "duplicated exact native process handle is invalid or closed " +
+                "(pid=" + ProcessId + ")");
     }
 
     void ClosePrimaryThreadHandle() {
@@ -395,6 +533,8 @@ public sealed class AstroFsvCreatedProcess : IDisposable {
             CloseHandle(threadHandle);
             threadHandle = IntPtr.Zero;
         }
+        if (ObservationHandle != null)
+            ObservationHandle.Dispose();
         if (ProcessHandle != null)
             ProcessHandle.Dispose();
     }
@@ -630,11 +770,12 @@ public static class AstroFsvNativeProcess {
                     "; creation_flags=" + creationFlags + ")");
             }
 
-            processCreated = true;
-            return new AstroFsvCreatedProcess(
+            AstroFsvCreatedProcess created = new AstroFsvCreatedProcess(
                 processInformation.hProcess,
                 processInformation.hThread,
                 processInformation.dwProcessId);
+            processCreated = true;
+            return created;
         }
         catch (Exception ex) {
             failure = ex;
@@ -779,6 +920,7 @@ $childExitCode = $null
 $childExitObservation = $null
 $childExitObservationError = $null
 $childProcessHandle = $null
+$childObservationHandle = $null
 $createdChild = $null
 $childTerminationUncertain = $false
 $artifact = $null
@@ -988,12 +1130,13 @@ try {
         Fail-Astro 'ASTRO_FSV_CHILD_CREATE_FAILED' "direct native process creation failed before a child identity was returned: $($_.Exception.Message)" 'preserve the staged session, inspect the native operation/error/path diagnostics, and repair the exact process-creation boundary before rerunning'
     }
     $childProcessHandle = $createdChild.ProcessHandle
+    $childObservationHandle = $createdChild.ObservationHandle
+    $child = $createdChild
     try {
-        $child = $createdChild.BindAndResume()
+        [void]$createdChild.BindAndResume()
     }
     catch {
         $bindFailure = $_.Exception.Message
-        $child = $createdChild.BoundProcess
         try {
             $createdChild.TerminateAndWait([uint32]0xA57F0001, [uint32]30000)
         }
@@ -1001,22 +1144,25 @@ try {
             $childTerminationUncertain = $true
             Fail-Astro 'ASTRO_FSV_CHILD_BIND_CLEANUP_FAILED' "exact child PID $($createdChild.ProcessId) could not be bound/resumed and exact termination could not be proved (bind_failure=$bindFailure; termination_failure=$($_.Exception.Message))" 'preserve the launcher/FSV state and use exact process/Job attribution before any cleanup'
         }
-        if ($null -eq $child) {
-            try {
-                foreach ($createdOutput in @($StandardOutputPath, $StandardErrorPath)) {
-                    if (Test-AstroPathLongPath -LiteralPath $createdOutput -PathType Leaf) {
-                        Remove-AstroFileLongPath $createdOutput
-                    }
+        try {
+            foreach ($createdOutput in @($StandardOutputPath, $StandardErrorPath)) {
+                if (Test-AstroPathLongPath -LiteralPath $createdOutput -PathType Leaf) {
+                    Remove-AstroFileLongPath $createdOutput
                 }
             }
-            catch {
-                Fail-Astro 'ASTRO_FSV_CHILD_BIND_OUTPUT_CLEANUP_FAILED' "exact child PID $($createdChild.ProcessId) was terminated after process binding failed, but an output created by that never-executed child could not be removed (bind_failure=$bindFailure; output_cleanup_failure=$($_.Exception.Message))" 'preserve the staged session and inspect the exact output path/handle state before lifecycle recovery'
-            }
+        }
+        catch {
+            Fail-Astro 'ASTRO_FSV_CHILD_BIND_OUTPUT_CLEANUP_FAILED' "exact child PID $($createdChild.ProcessId) was terminated after process binding failed, but an output created by that never-executed child could not be removed (bind_failure=$bindFailure; output_cleanup_failure=$($_.Exception.Message))" 'preserve the staged session and inspect the exact output path/handle state before lifecycle recovery'
         }
         Fail-Astro 'ASTRO_FSV_CHILD_BIND_FAILED' "exact child PID $($createdChild.ProcessId) was created suspended but binding/resume failed; exact termination completed (failure=$bindFailure)" 'preserve the durable failed-run record and repair native process binding before rerunning'
     }
     if ($null -eq $childProcessHandle -or $childProcessHandle.IsInvalid -or $childProcessHandle.IsClosed) {
         Fail-Astro 'ASTRO_FSV_CHILD_HANDLE_UNAVAILABLE' "native child PID $($child.Id) did not retain its exact CreateProcessW process handle" 'preserve the session and repair native process launch before rerunning'
+    }
+    if ($null -eq $childObservationHandle -or
+        $childObservationHandle.IsInvalid -or
+        $childObservationHandle.IsClosed) {
+        Fail-Astro 'ASTRO_FSV_CHILD_HANDLE_UNAVAILABLE' "native child PID $($child.Id) did not retain a duplicated handle to its exact CreateProcessW process object" 'preserve the session and repair exact process-handle duplication before rerunning'
     }
     $childStartedAtUtc = [DateTime]::UtcNow.ToString('o')
     $ownedLock = Read-AstroUtf8FileLongPath $fsvLockPath | ConvertFrom-Json
@@ -1058,9 +1204,8 @@ try {
     }
     Publish-NewFile $LiveStatePath ($liveState | ConvertTo-Json -Depth 10)
     $child.WaitForExit()
-    $child.Refresh()
     $childExitedAtUtc = [DateTime]::UtcNow.ToString('o')
-    $childExitObservation = Observe-ExitedProcessCode $child $childProcessHandle
+    $childExitObservation = Observe-ExitedProcessCode $child
     $childExitCode = [uint32]$childExitObservation.exit_code
 
     $artifactHashAfter = File-Sha256 $artifact
@@ -1183,7 +1328,7 @@ try {
     if (-not $receiptStable) { Fail-Astro 'ASTRO_FSV_RECEIPT_DRIFT' 'artifact receipt changed during the native FSV run' 'preserve state, identify the writer, rebuild, and rerun' }
     if (-not $launcherLeaseStable) { Fail-Astro 'ASTRO_FSV_LAUNCHER_LEASE_DRIFT' 'launcher lock changed during the native FSV run' 'discard the evidence and investigate the lease writer' }
     if (-not [bool]$childExitObservation.sources_agree) {
-        Fail-Astro 'ASTRO_FSV_CHILD_EXIT_OBSERVATION_MISMATCH' "kernel32 exit code $childExitCode disagrees with Process.ExitCode $($childExitObservation.process_component_exit_code) for native child PID $($child.Id)" 'preserve the run record and repair process-component exit observation; never infer success from a disagreeing source'
+        Fail-Astro 'ASTRO_FSV_CHILD_EXIT_OBSERVATION_MISMATCH' "the original and duplicated exact process handles disagree on native child PID $($child.Id) exit code (primary=$childExitCode; duplicate=$($childExitObservation.exact_duplicate_exit_code))" 'preserve the run record and repair exact process-handle observation; never infer success from disagreeing sources'
     }
     if ($childExitCode -ne 0) { exit 1 }
 }
@@ -1194,7 +1339,6 @@ catch {
             if (-not $child.HasExited) {
                 [Console]::Error.WriteLine("NATIVE_FSV[ASTRO_FSV_FAILURE_WAITING_FOR_CHILD]: runner failed after real child PID $($child.Id) started; waiting for that exact process to exit naturally before releasing its immutable artifact lease")
                 $child.WaitForExit()
-                $child.Refresh()
             }
             if ($child.HasExited) {
                 if ($null -eq $childExitedAtUtc) {
@@ -1202,7 +1346,7 @@ catch {
                 }
                 if ($null -eq $childExitCode) {
                     try {
-                        $childExitObservation = Observe-ExitedProcessCode $child $childProcessHandle
+                        $childExitObservation = Observe-ExitedProcessCode $child
                         $childExitCode = [uint32]$childExitObservation.exit_code
                     }
                     catch { $childExitObservationError = $_.Exception.Message }
