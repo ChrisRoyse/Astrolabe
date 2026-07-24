@@ -940,6 +940,8 @@ $childProcessHandle = $null
 $childObservationHandle = $null
 $createdChild = $null
 $childTerminationUncertain = $false
+$childTerminationProved = $false
+$childProcessHandlesClosed = $false
 $artifact = $null
 $artifactHashBefore = $null
 $receiptFull = $null
@@ -1224,6 +1226,7 @@ try {
     $childExitedAtUtc = [DateTime]::UtcNow.ToString('o')
     $childExitObservation = Observe-ExitedProcessCode $child
     $childExitCode = [uint32]$childExitObservation.exit_code
+    $childTerminationProved = $true
 
     $artifactHashAfter = File-Sha256 $artifact
     $receiptHashAfter = File-Sha256 $receiptFull
@@ -1281,6 +1284,15 @@ try {
         $artifactHandle.Dispose()
         $artifactHandle = $null
     }
+    if ($null -ne $createdChild) {
+        # A signaled process object is terminal, but Windows retains the process
+        # object while any primary/duplicated process handle remains open. Its
+        # executable image section can therefore still deny the exact DELETE
+        # access used by cleanup. The two retained handles already agreed on
+        # signal state and exit code above; close both before the readiness open.
+        $createdChild.Dispose()
+        $childProcessHandlesClosed = $true
+    }
     try {
         Set-AstroFileReadOnlyLongPath -LiteralPath $artifact -ReadOnly $false
         $artifactCleanupLease =
@@ -1324,6 +1336,8 @@ try {
             bytes = [uint64]$cleanupLength
             sha256 = $cleanupHash
             read_only_restored = $cleanupReadOnly
+            child_termination_proved = $childTerminationProved
+            child_process_handles_closed = $childProcessHandlesClosed
             retained_until_runner_exit = $true
         }
         $artifactStable = $artifactStable -and
@@ -1440,13 +1454,14 @@ try {
 }
 catch {
     $failure = $_
-    if ($null -ne $child) {
+    if ($null -ne $child -and -not $childTerminationProved) {
         try {
             if (-not $child.HasExited) {
                 [Console]::Error.WriteLine("NATIVE_FSV[ASTRO_FSV_FAILURE_WAITING_FOR_CHILD]: runner failed after real child PID $($child.Id) started; waiting for that exact process to exit naturally before releasing its immutable artifact lease")
                 $child.WaitForExit()
             }
             if ($child.HasExited) {
+                $childTerminationProved = $true
                 if ($null -eq $childExitedAtUtc) {
                     $childExitedAtUtc = [DateTime]::UtcNow.ToString('o')
                 }
@@ -1465,7 +1480,8 @@ catch {
     }
     $code = if ($failure.Exception.Data.Contains('AstroCode')) { [string]$failure.Exception.Data['AstroCode'] } else { 'ASTRO_FSV_RUN_INTERNAL' }
     $remediation = if ($failure.Exception.Data.Contains('AstroRemediation')) { [string]$failure.Exception.Data['AstroRemediation'] } else { 'preserve the evidence state, inspect the full error, repair the root cause, and retry from a fresh session' }
-    if ($runRecordAuthorized -and -not $runRecordWritten -and $null -ne $child -and $child.HasExited -and
+    if ($runRecordAuthorized -and -not $runRecordWritten -and
+        $null -ne $child -and $childTerminationProved -and
         -not (Test-AstroPathLongPath -LiteralPath $RunRecordPath)) {
         try {
             $failureArtifactHash = if (
@@ -1537,8 +1553,13 @@ finally {
     if ($null -ne $receiptHandle) { $receiptHandle.Dispose() }
     if ($null -ne $artifactHandle) { $artifactHandle.Dispose() }
     if ($null -ne $directoryHandle) { $directoryHandle.Dispose() }
-    $childStillLive = $childTerminationUncertain
-    if ($null -ne $child) {
+    $childStillLive = if ($childTerminationProved) {
+        $false
+    }
+    else {
+        $childTerminationUncertain
+    }
+    if ($null -ne $child -and -not $childTerminationProved) {
         try { $childStillLive = -not $child.HasExited }
         catch { $childStillLive = $true }
     }
