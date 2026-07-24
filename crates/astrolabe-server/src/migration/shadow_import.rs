@@ -53,6 +53,11 @@ pub(crate) const SHADOW_STALE_REMEDIATION: &str = "the CBM SQLite changed since 
 
 #[derive(Debug, Clone)]
 pub(crate) struct ShadowImportOutcome {
+    /// True only when the staged generation contains a real source or derived-state
+    /// change and is therefore authorized to replace the live generation. An exact
+    /// content-addressed no-op carries `false`; publication then validates and
+    /// preserves the live artifacts before discarding the stage.
+    pub(crate) publication_required: bool,
     pub(crate) vault_dir: PathBuf,
     pub(crate) vault_id: String,
     pub(crate) vault_salt: String,
@@ -1409,6 +1414,162 @@ pub(crate) fn import_shadow_vault_with_archaeology_at(
         }
     }
     shadow_phase!("import_raw_total");
+    let import_changed = report.new_cx_ids > 0
+        || report.graph_rows_written > 0
+        || report.edge_rows_written > 0
+        || report.series_mutated_rows > 0;
+    let persisted_git_source_fingerprint = read_config_value(
+        cache_dir,
+        &metadata_key(project, GIT_SOURCE_FINGERPRINT_KEY),
+    )?;
+    let persisted_git_source_repo_path =
+        read_config_value(cache_dir, &metadata_key(project, GIT_SOURCE_REPO_PATH_KEY))?;
+    let persisted_content_watermark =
+        read_config_value(cache_dir, &metadata_key(project, "vault_fingerprint"))?;
+    let git_source_identity_unchanged = persisted_git_source_fingerprint.as_deref()
+        == git_source_fingerprint.as_deref()
+        && persisted_git_source_repo_path.as_deref() == git_source_repo_path.as_deref();
+    // A published empty corpus has no prior graph atoms, so graph cardinality cannot
+    // distinguish it from a first import. The persisted, domain-tagged content
+    // watermark is the publication marker that makes an empty generation eligible
+    // for the same exact no-op path as a non-empty generation. Conversely, a prior
+    // graph with no watermark is partial/corrupt publication state and must fail
+    // closed below instead of being silently treated as a fresh import.
+    let prior_generation_observed =
+        !before_cx_by_atom.is_empty() || persisted_content_watermark.is_some();
+    let exact_noop = prior_generation_observed && !import_changed && git_source_identity_unchanged;
+    if exact_noop {
+        let persisted_content_sha256 = match persisted_content_watermark.as_deref() {
+            None => {
+                return Err(format!(
+                    "ASTRO_SHADOW_NOOP_WATERMARK_MISSING: project {project:?} has an existing graph but no persisted content watermark; remediation: preserve the live generation, inspect the incomplete prior publication, and rebuild the project from source"
+                )
+                .into());
+            }
+            Some(raw) => match parse_shadow_watermark(raw) {
+                ShadowWatermark::Tagged {
+                    algo,
+                    version,
+                    digest,
+                } if algo == SHADOW_WATERMARK_ALGO && version == SHADOW_WATERMARK_VERSION => digest,
+                classified => {
+                    return Err(format!(
+                        "ASTRO_SHADOW_NOOP_WATERMARK_INVALID: project {project:?} cannot bind an unchanged generation to persisted watermark {classified:?}; expected {SHADOW_WATERMARK_ALGO}:{SHADOW_WATERMARK_VERSION}:<sha256>; remediation: preserve the live generation, inspect the incomplete or incompatible prior publication, and rebuild the project from source"
+                    )
+                    .into());
+                }
+            },
+        };
+        let lower_state = read_persisted_lower_state(cache_dir, project)?.ok_or_else(
+            || -> DynError {
+                format!(
+                    "ASTRO_SHADOW_NOOP_LOWER_STATE_MISSING: project {project:?} has an existing graph but no complete persisted lowered-state metadata; remediation: preserve the live generation, inspect the prior publication, and rebuild the project from source"
+                )
+                .into()
+            },
+        )?;
+        if !lowered_sqlite_path(cache_dir, project).exists() {
+            return Err(format!(
+                "ASTRO_SHADOW_NOOP_LOWERED_MISSING: project {project:?} reports an exact no-op but its persisted lowered SQLite artifact is absent; remediation: preserve the live generation, inspect the prior publication, and rebuild the project from source"
+            )
+            .into());
+        }
+        let verify = verify_chain(&vault)?;
+        if !verify.is_intact() {
+            return Err(format!(
+                "ASTRO_SHADOW_NOOP_CHAIN_NOT_INTACT: project {project:?} reports an exact no-op but its staged copy does not verify intact: {}; remediation: preserve the live generation, inspect the prior publication, and rebuild the project from source",
+                verify.status
+            )
+            .into());
+        }
+        let mut weave = read_required_shadow_json(cache_dir, project, "weave_json")?;
+        let weave_object = weave.as_object_mut().ok_or_else(|| -> DynError {
+            format!(
+                "ASTRO_SHADOW_NOOP_WEAVE_INVALID: persisted weave metadata for project {project:?} is not a JSON object; remediation: preserve the live generation, inspect the prior publication, and rebuild the project from source"
+            )
+            .into()
+        })?;
+        weave_object.insert("status".to_string(), Value::String("unchanged".to_string()));
+        weave_object.insert("trust".to_string(), Value::String("verified".to_string()));
+        weave_object.insert(
+            "freshness".to_string(),
+            Value::String("current".to_string()),
+        );
+        weave_object.insert("writes_skipped".to_string(), Value::Bool(true));
+        weave_object.insert(
+            "provenance".to_string(),
+            Value::String(
+                "generation-wide content and git identity matched the published generation; every derived producer and artifact publication was skipped"
+                    .to_string(),
+            ),
+        );
+        let vault_import_source =
+            read_config_value(cache_dir, &metadata_key(project, "vault_import_source"))?
+                .ok_or_else(|| -> DynError {
+                    format!(
+                        "ASTRO_SHADOW_NOOP_IMPORT_SOURCE_MISSING: project {project:?} has no persisted vault import source; remediation: preserve the live generation, inspect the prior publication, and rebuild the project from source"
+                    )
+                    .into()
+                })?;
+        let vault_import_fallback_reason = read_config_value(
+            cache_dir,
+            &metadata_key(project, "vault_import_fallback_reason"),
+        )?
+        .filter(|reason| !reason.is_empty());
+        let search_scale = read_required_shadow_json(cache_dir, project, "search_scale_json")?;
+        let provenance = read_required_shadow_json(cache_dir, project, "provenance_json")?;
+        let git_archaeology =
+            read_required_shadow_json(cache_dir, project, "git_archaeology_json")?;
+        let kernel_context = read_required_shadow_json(cache_dir, project, "kernel_context_json")?;
+        return Ok(ShadowImportOutcome {
+            publication_required: false,
+            vault_dir,
+            vault_id: SHADOW_VAULT_ID.to_string(),
+            vault_salt,
+            sqlite_path,
+            sqlite_fingerprint_sha256: hex_lower(&report.sqlite_fingerprint_sha256),
+            // The stage was created by SQLite's snapshot API and is a logically exact
+            // destination, not a byte clone of the live file. Bind the discard decision
+            // to the already-published live digest; publication independently re-hashes
+            // the live source and requires this exact value before discarding the stage.
+            content_freshness_watermark_sha256: persisted_content_sha256,
+            lowered_sqlite_path: lowered_sqlite_path(cache_dir, project),
+            lowered_artifact_sha256: lower_state.artifact_sha256,
+            lowered_vault_fingerprint_sha256: lower_state.vault_fingerprint_sha256,
+            lowered_manifest_seq: lower_state.manifest_seq,
+            lowered_nodes: lower_state.node_count,
+            lowered_edges: lower_state.edge_count,
+            lowered_skipped_edges: lower_state.skipped_edges,
+            sqlite_nodes: report.sqlite_nodes,
+            sqlite_edges: report.sqlite_edges,
+            constellation_inputs: report.constellation_inputs,
+            structural_only: report.structural_only,
+            new_cx_ids: report.new_cx_ids,
+            reused_cx_ids: report.reused_cx_ids,
+            graph_rows_written: report.graph_rows_written,
+            edge_rows_written: report.edge_rows_written,
+            series_inputs: report.series_inputs,
+            series_mutated_rows: report.series_mutated_rows,
+            import_fsv: report.fsv.clone(),
+            cx_id_set_sha256: cx_id_set_sha256(&report.cx_ids),
+            ledger_seq: vault.latest_seq(),
+            ledger_rows_after: verify.ledger_rows,
+            verify_chain_status: verify.status,
+            vault_import_source,
+            vault_import_fallback_reason,
+            security_screen: read_required_shadow_json(cache_dir, project, "security_screen_json")?,
+            search_scale,
+            skill_tree: read_required_shadow_json(cache_dir, project, "skill_tree_json")?,
+            bridges: read_required_shadow_json(cache_dir, project, "bridge_reports_json")?,
+            kernel_context,
+            anomalies: read_required_shadow_json(cache_dir, project, "anomaly_report_json")?,
+            provenance,
+            git_archaeology,
+            weave,
+            git_source_fingerprint,
+            git_source_repo_path,
+        });
+    }
     let git_archaeology = match git_repo {
         Some(repo) => {
             let mode = match read_config_value(
@@ -1456,10 +1617,6 @@ pub(crate) fn import_shadow_vault_with_archaeology_at(
         }),
     };
     shadow_phase!("git_archaeology");
-    let import_changed = report.new_cx_ids > 0
-        || report.graph_rows_written > 0
-        || report.edge_rows_written > 0
-        || report.series_mutated_rows > 0;
     // Read the post-import snapshot ONCE and share it with the weave and the
     // invalidation lane below (#23): re-reading the full graph in each phase
     // tripled the largest fixed cost of the delta path at M scale.
@@ -1600,6 +1757,7 @@ pub(crate) fn import_shadow_vault_with_archaeology_at(
     );
 
     Ok(ShadowImportOutcome {
+        publication_required: true,
         vault_dir,
         vault_id: SHADOW_VAULT_ID.to_string(),
         vault_salt,
@@ -2583,9 +2741,35 @@ fn read_lower_config_usize(
         .transpose()
 }
 
+fn read_required_shadow_json(
+    cache_dir: &Path,
+    project: &str,
+    name: &str,
+) -> Result<Value, DynError> {
+    let key = metadata_key(project, name);
+    let raw = read_config_value(cache_dir, &key)?.ok_or_else(|| -> DynError {
+        format!(
+            "ASTRO_SHADOW_NOOP_METADATA_MISSING: exact no-op detection requires persisted metadata {key:?}; remediation: do not publish or synthesize a replacement generation, inspect the prior publication, and rebuild the project from source"
+        )
+        .into()
+    })?;
+    serde_json::from_str(&raw).map_err(|error| {
+        format!(
+            "ASTRO_SHADOW_NOOP_METADATA_INVALID: persisted metadata {key:?} is not valid JSON: {error}; remediation: do not publish or synthesize a replacement generation, inspect the prior publication, and rebuild the project from source"
+        )
+        .into()
+    })
+}
+
 pub(crate) fn grounding_summary(outcome: &ShadowImportOutcome) -> Value {
+    let status = if outcome.publication_required {
+        "imported"
+    } else {
+        "unchanged"
+    };
     json!({
-        "status": "imported",
+        "status": status,
+        "writes_skipped": !outcome.publication_required,
         "sqlite_nodes": outcome.sqlite_nodes,
         "sqlite_edges": outcome.sqlite_edges,
         "constellation_inputs": outcome.constellation_inputs,

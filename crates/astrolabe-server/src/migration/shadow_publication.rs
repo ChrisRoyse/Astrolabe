@@ -98,6 +98,9 @@ impl ShadowPublication {
         dial: MigrationDial,
         sanitized_index_args: &str,
     ) -> Result<ShadowImportOutcome, DynError> {
+        if !outcome.publication_required {
+            return self.discard_unchanged(outcome);
+        }
         remap_outcome_paths(&mut outcome, &self.stage_cache, &self.live_cache);
 
         let staged_source = sqlite_path(&self.stage_cache, &self.project);
@@ -301,6 +304,189 @@ impl ShadowPublication {
         remove_empty_dir(&self.project_root)?;
         if let Some(parent) = self.project_root.parent() {
             remove_empty_dir(parent)?;
+        }
+        Ok(outcome)
+    }
+
+    fn discard_unchanged(
+        self,
+        mut outcome: ShadowImportOutcome,
+    ) -> Result<ShadowImportOutcome, DynError> {
+        let validation = (|| -> Result<(String, String), DynError> {
+            let freshness = evaluate_shadow_content_freshness(&self.live_cache, &self.project)?;
+            if freshness != ShadowContentVerdict::Fresh {
+                return Err(format!(
+                    "ASTRO_SHADOW_NOOP_LIVE_NOT_FRESH: project {:?} was unchanged in the staged content-addressed import, but the live generation no longer verifies fresh ({freshness:?}); remediation: preserve the live and staged generations, inspect the exact source/lowered/vault/config mismatch, and retry only after repairing the authoritative live state",
+                    self.project
+                )
+                .into());
+            }
+
+            let live_source = sqlite_path(&self.live_cache, &self.project);
+            let live_lowered = lowered_sqlite_path(&self.live_cache, &self.project);
+            let live_vault = vault_dir(&self.live_cache, &self.project);
+            for (kind, path) in [
+                ("CBM source", &live_source),
+                ("lowered SQLite", &live_lowered),
+                ("Aster vault", &live_vault),
+            ] {
+                if !path.exists() {
+                    return Err(format!(
+                        "ASTRO_SHADOW_NOOP_LIVE_ARTIFACT_MISSING: required live {kind} is absent at {}; remediation: preserve the staged transaction, inspect the prior publication, and rebuild the project from source",
+                        path.display()
+                    )
+                    .into());
+                }
+            }
+
+            let source_hash = sha256_file_hex(&live_source)?;
+            if source_hash != outcome.content_freshness_watermark_sha256 {
+                return Err(format!(
+                    "ASTRO_SHADOW_NOOP_SOURCE_HASH_MISMATCH: live source hashes to {source_hash}, but the unchanged staged outcome is bound to {}; remediation: preserve both generations, inspect the concurrent source divergence, and retry only from one authoritative source generation",
+                    outcome.content_freshness_watermark_sha256
+                )
+                .into());
+            }
+            let lowered_hash = sha256_file_hex(&live_lowered)?;
+            if lowered_hash != outcome.lowered_artifact_sha256 {
+                return Err(format!(
+                    "ASTRO_SHADOW_NOOP_LOWERED_HASH_MISMATCH: live lowered artifact hashes to {lowered_hash}, but the unchanged staged outcome is bound to {}; remediation: preserve both generations, inspect the prior publication, and rebuild from source",
+                    outcome.lowered_artifact_sha256
+                )
+                .into());
+            }
+
+            let config_prefix = format!("{CONFIG_KEY_PREFIX}{}", self.project);
+            let metadata_prefix = format!("{config_prefix}.");
+            let project_rows = |cache: &Path| -> Result<Vec<(String, String)>, DynError> {
+                Ok(scan_config_prefix(cache, &config_prefix)?
+                    .into_iter()
+                    .filter(|(key, _)| {
+                        key == &dial_key(&self.project) || key.starts_with(&metadata_prefix)
+                    })
+                    .collect())
+            };
+            let staged_config_rows = project_rows(&self.stage_cache)?;
+            let live_config_rows = project_rows(&self.live_cache)?;
+            if live_config_rows != staged_config_rows {
+                return Err(format!(
+                    "ASTRO_SHADOW_NOOP_CONFIG_DIVERGED: persisted project config changed after the staged generation was seeded (stage_rows={}, live_rows={}, stage_sha256={}, live_sha256={}); remediation: preserve both generations, inspect the concurrent config writer, and retry only after one authoritative project generation is established",
+                    staged_config_rows.len(),
+                    live_config_rows.len(),
+                    hex_lower(&Sha256::digest(serde_json::to_vec(&staged_config_rows)?)),
+                    hex_lower(&Sha256::digest(serde_json::to_vec(&live_config_rows)?)),
+                )
+                .into());
+            }
+
+            let vault_id = read_config_value(
+                &self.live_cache,
+                &metadata_key(&self.project, "vault_id"),
+            )?
+            .ok_or_else(|| -> DynError {
+                format!(
+                    "ASTRO_SHADOW_NOOP_VAULT_ID_MISSING: project {:?} has no persisted vault id; remediation: preserve both generations, inspect the prior publication, and rebuild from source",
+                    self.project
+                )
+                .into()
+            })?;
+            let vault_salt = read_config_value(
+                &self.live_cache,
+                &metadata_key(&self.project, "vault_salt"),
+            )?
+            .ok_or_else(|| -> DynError {
+                format!(
+                    "ASTRO_SHADOW_NOOP_VAULT_SALT_MISSING: project {:?} has no persisted vault salt; remediation: preserve both generations, inspect the prior publication, and rebuild from source",
+                    self.project
+                )
+                .into()
+            })?;
+            if vault_id != outcome.vault_id || vault_salt != outcome.vault_salt {
+                return Err(format!(
+                    "ASTRO_SHADOW_NOOP_VAULT_IDENTITY_MISMATCH: live vault identity for project {:?} is id={vault_id:?}, salt_sha256={}; staged identity is id={:?}, salt_sha256={}; remediation: preserve both generations, inspect the mixed config/vault publication, and rebuild from source",
+                    self.project,
+                    hex_lower(&Sha256::digest(vault_salt.as_bytes())),
+                    outcome.vault_id,
+                    hex_lower(&Sha256::digest(outcome.vault_salt.as_bytes())),
+                )
+                .into());
+            }
+            let vault =
+                open_shadow_vault_read_only(&live_vault, &vault_id, &vault_salt, Vec::new())?;
+            let verification = verify_chain(&vault)?;
+            if !verification.is_intact()
+                || vault.latest_seq() != outcome.ledger_seq
+                || verification.ledger_rows != outcome.ledger_rows_after
+            {
+                return Err(format!(
+                    "ASTRO_SHADOW_NOOP_VAULT_MISMATCH: live vault verification for project {:?} is status={:?}, latest_seq={}, ledger_rows={}; unchanged staged outcome expected latest_seq={}, ledger_rows={}; remediation: preserve both generations, inspect the exact ledger divergence, and rebuild from source",
+                    self.project,
+                    verification.status,
+                    vault.latest_seq(),
+                    verification.ledger_rows,
+                    outcome.ledger_seq,
+                    outcome.ledger_rows_after
+                )
+                .into());
+            }
+            let lowered_verification =
+                verify_lowered_artifact(&vault, &live_lowered, &self.project).map_err(
+                    |error| -> DynError {
+                        format!(
+                            "ASTRO_SHADOW_NOOP_LOWERED_UNVERIFIED: live lowered artifact no longer verifies against the exact live vault generation for project {:?}: {error}; remediation: preserve both generations, inspect the artifact/vault divergence, and rebuild from source",
+                            self.project
+                        )
+                        .into()
+                    },
+                )?;
+            if lowered_verification.artifact_sha256 != lowered_hash
+                || lowered_verification.vault_fingerprint_sha256
+                    != outcome.lowered_vault_fingerprint_sha256
+            {
+                return Err(format!(
+                    "ASTRO_SHADOW_NOOP_LOWERED_IDENTITY_MISMATCH: live lowered verification returned artifact_sha256={}, vault_fingerprint_sha256={}, but the staged generation is bound to artifact_sha256={lowered_hash}, vault_fingerprint_sha256={}; remediation: preserve both generations, inspect the mixed generation, and rebuild from source",
+                    lowered_verification.artifact_sha256,
+                    lowered_verification.vault_fingerprint_sha256,
+                    outcome.lowered_vault_fingerprint_sha256
+                )
+                .into());
+            }
+            drop(vault);
+            Ok((source_hash, lowered_hash))
+        })();
+        let (source_hash, lowered_hash) = match validation {
+            Ok(validation) => validation,
+            Err(error) => {
+                return Err(self.abort_error("unchanged live-generation validation", error));
+            }
+        };
+
+        remap_outcome_paths(&mut outcome, &self.stage_cache, &self.live_cache);
+        outcome.content_freshness_watermark_sha256 = source_hash.clone();
+        outcome.lowered_artifact_sha256 = lowered_hash.clone();
+        if let Err(error) = self.write_journal(
+            "unchanged_validated",
+            json!({
+                "source_sha256": source_hash,
+                "lowered_sha256": lowered_hash,
+                "ledger_seq": outcome.ledger_seq,
+                "ledger_rows": outcome.ledger_rows_after,
+                "live_generation_preserved": true,
+                "stage_publication_skipped": true,
+            }),
+        ) {
+            return Err(self.abort_error("unchanged validation journal", error));
+        }
+        if let Err(error) = remove_transaction_tree(&self.transaction_dir, &self.project_root) {
+            return Err(self.abort_error("unchanged transaction cleanup", error));
+        }
+        if let Err(error) = remove_empty_dir(&self.project_root) {
+            return Err(self.abort_error("unchanged project-root cleanup", error));
+        }
+        if let Some(parent) = self.project_root.parent() {
+            if let Err(error) = remove_empty_dir(parent) {
+                return Err(self.abort_error("unchanged publication-root cleanup", error));
+            }
         }
         Ok(outcome)
     }
