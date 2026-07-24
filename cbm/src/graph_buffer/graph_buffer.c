@@ -23,6 +23,7 @@ enum {
     GB_DEDUP_LOOKAHEAD = 1,  /* compare current with next element */
 };
 #include "graph_buffer/graph_buffer.h"
+#include "graph_buffer/load_error.h"
 #include <yyjson/yyjson.h> // url_path extraction must match json_extract semantics
 #include "store/store.h"
 #include "sqlite_writer.h"
@@ -1426,13 +1427,84 @@ static void log_load_store_verification_failure(const char *db_path, const char 
         "failure, then retry");
 }
 
-int cbm_gbuf_load_from_db(cbm_gbuf_t *gb, const char *db_path, const char *project) {
+static void set_load_error(cbm_gbuf_load_error_t *error, const char *code, const char *operation,
+                           const char *path, size_t requested, const char *message,
+                           const char *remediation) {
+    if (!error || error->code[0] != '\0') {
+        return;
+    }
+    (void)snprintf(error->code, sizeof(error->code), "%s",
+                   code ? code : "CBM_GRAPH_STORE_LOAD_FAILED");
+    (void)snprintf(error->operation, sizeof(error->operation), "%s",
+                   operation ? operation : "graph_store_load");
+    (void)snprintf(error->phase, sizeof(error->phase), "%s", "incremental_load");
+    (void)snprintf(error->path, sizeof(error->path), "%s", path ? path : "");
+    (void)snprintf(error->message, sizeof(error->message), "%s",
+                   message ? message : "the existing graph could not be loaded");
+    (void)snprintf(error->remediation, sizeof(error->remediation), "%s",
+                   remediation ? remediation : "repair the exact graph-store failure, then retry");
+    error->requested = requested;
+}
+
+static const char *graph_verify_code(cbm_store_verify_status_t status) {
+    if (status == CBM_STORE_VERIFY_SOURCE_MISSING) {
+        return "CBM_GRAPH_STORE_SOURCE_MISSING";
+    }
+    if (status == CBM_STORE_VERIFY_INTEGRITY_FAILED) {
+        return "CBM_GRAPH_STORE_INTEGRITY_FAILED";
+    }
+    return "CBM_GRAPH_STORE_VERIFICATION_FAILED";
+}
+
+static void set_verification_load_error(cbm_gbuf_load_error_t *error, const char *db_path,
+                                        cbm_store_verify_status_t status,
+                                        const cbm_store_verify_result_t *verification) {
+    char message[CBM_SZ_512];
+    (void)snprintf(message, sizeof(message),
+                   "graph store verification failed: status=%d native_error=%lu "
+                   "sqlite_error=%d detail=%s",
+                   (int)status, (unsigned long)verification->native_error,
+                   verification->sqlite_error,
+                   verification->detail[0] ? verification->detail : "unspecified");
+    size_t requested =
+        verification->native_error != 0
+            ? (size_t)verification->native_error
+            : (size_t)(verification->sqlite_error < 0 ? 0 : verification->sqlite_error);
+    set_load_error(
+        error, graph_verify_code(status),
+        verification->operation[0] ? verification->operation : "graph_store_verify", db_path,
+        requested, message,
+        "preserve the database, WAL, and SHM together; repair the exact reported source-family "
+        "failure, then retry");
+}
+
+static void set_sqlite_load_error(cbm_gbuf_load_error_t *error, sqlite3 *db, const char *db_path,
+                                  const char *code, const char *operation, const char *message) {
+    int sqlite_error = db ? sqlite3_extended_errcode(db) : SQLITE_MISUSE;
+    char detail[CBM_SZ_512];
+    (void)snprintf(detail, sizeof(detail), "%s: sqlite_error=%d sqlite_message=%s", message,
+                   sqlite_error, db ? sqlite3_errmsg(db) : "database handle unavailable");
+    set_load_error(error, code, operation, db_path, (size_t)(sqlite_error < 0 ? 0 : sqlite_error),
+                   detail,
+                   "preserve the graph store, repair the exact SQLite failure, then retry the "
+                   "complete corpus");
+}
+
+int cbm_gbuf_load_from_db_checked(cbm_gbuf_t *gb, const char *db_path, const char *project,
+                                  cbm_gbuf_load_error_t *error) {
+    if (error) {
+        memset(error, 0, sizeof(*error));
+    }
     if (!gb || !db_path || !project) {
+        set_load_error(error, "CBM_GRAPH_STORE_LOAD_ARGUMENT_INVALID", "validate_graph_store_load",
+                       db_path, 0,
+                       "graph reload requires a graph buffer, database path, and project",
+                       "repair the incremental graph-load call contract before retrying");
         return CBM_NOT_FOUND;
     }
 
     cbm_store_t *store = NULL;
-    cbm_store_verify_result_t verification;
+    cbm_store_verify_result_t verification = {0};
     cbm_store_verify_status_t verify_status =
         cbm_store_open_path_graph_verified(db_path, project, &store, &verification);
     if (verify_status != CBM_STORE_VERIFY_OK || !store) {
@@ -1440,11 +1512,15 @@ int cbm_gbuf_load_from_db(cbm_gbuf_t *gb, const char *db_path, const char *proje
             cbm_store_close(store);
         }
         log_load_store_verification_failure(db_path, project, verify_status, &verification);
+        set_verification_load_error(error, db_path, verify_status, &verification);
         return CBM_NOT_FOUND;
     }
 
     sqlite3 *db = cbm_store_get_db(store);
     if (!db) {
+        set_load_error(error, "CBM_GRAPH_STORE_HANDLE_UNAVAILABLE", "graph_store_verified_handle",
+                       db_path, 0, "verified graph-store open returned no SQLite handle",
+                       "repair the verified store-open contract before retrying");
         cbm_store_close(store);
         return CBM_NOT_FOUND;
     }
@@ -1453,18 +1529,46 @@ int cbm_gbuf_load_from_db(cbm_gbuf_t *gb, const char *db_path, const char *proje
     sqlite3_stmt *stmt = NULL;
     if (sqlite3_prepare_v2(db, "SELECT MAX(id) FROM nodes WHERE project = ?", CBM_NOT_FOUND, &stmt,
                            NULL) != SQLITE_OK) {
+        set_sqlite_load_error(error, db, db_path, "CBM_GRAPH_NODE_MAX_PREPARE_FAILED",
+                              "graph_load_prepare_max_node_id",
+                              "the maximum persisted node ID query could not be prepared");
         cbm_store_close(store);
         return CBM_NOT_FOUND;
     }
     sqlite3_bind_text(stmt, SKIP_ONE, project, CBM_NOT_FOUND, SQLITE_STATIC);
     int64_t max_old_id = 0;
-    if (sqlite3_step(stmt) == SQLITE_ROW) {
+    int step_rc = sqlite3_step(stmt);
+    if (step_rc == SQLITE_ROW) {
         max_old_id = sqlite3_column_int64(stmt, 0);
+    } else if (step_rc != SQLITE_DONE) {
+        set_sqlite_load_error(error, db, db_path, "CBM_GRAPH_NODE_MAX_READ_FAILED",
+                              "graph_load_read_max_node_id",
+                              "the maximum persisted node ID could not be read");
+        sqlite3_finalize(stmt);
+        cbm_store_close(store);
+        return CBM_NOT_FOUND;
     }
     sqlite3_finalize(stmt);
 
+    if (max_old_id < 0 ||
+        (uint64_t)max_old_id > ((uint64_t)SIZE_MAX / sizeof(int64_t)) - SKIP_ONE) {
+        set_load_error(
+            error, "CBM_GRAPH_NODE_ID_CAPACITY_OVERFLOW", "graph_load_allocate_node_id_map",
+            db_path, max_old_id < 0 ? 0 : (size_t)max_old_id,
+            "persisted node IDs exceed the exact in-memory mapping capacity",
+            "preserve and inspect the graph store; rebuild it only from the exact source "
+            "after correcting its node-ID domain");
+        cbm_store_close(store);
+        return CBM_NOT_FOUND;
+    }
     int64_t *old_to_new = calloc((size_t)(max_old_id + SKIP_ONE), sizeof(int64_t));
     if (!old_to_new) {
+        set_load_error(error, "CBM_GRAPH_NODE_ID_MAP_ALLOC_FAILED",
+                       "graph_load_allocate_node_id_map", db_path,
+                       (size_t)(max_old_id + SKIP_ONE) * sizeof(int64_t),
+                       "the exact persisted-to-memory node ID map could not be allocated",
+                       "free memory or reduce concurrent repository workload, then retry the "
+                       "complete corpus");
         cbm_store_close(store);
         return CBM_NOT_FOUND;
     }
@@ -1476,13 +1580,16 @@ int cbm_gbuf_load_from_db(cbm_gbuf_t *gb, const char *db_path, const char *proje
             "atom_id, source_present, source_bytes, source_sha256, start_byte, end_byte "
             "FROM nodes WHERE project = ? ORDER BY id",
             CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
+        set_sqlite_load_error(error, db, db_path, "CBM_GRAPH_NODE_ROWS_PREPARE_FAILED",
+                              "graph_load_prepare_nodes",
+                              "the complete persisted node query could not be prepared");
         free(old_to_new);
         cbm_store_close(store);
         return CBM_NOT_FOUND;
     }
     sqlite3_bind_text(stmt, SKIP_ONE, project, CBM_NOT_FOUND, SQLITE_STATIC);
 
-    while (sqlite3_step(stmt) == SQLITE_ROW) {
+    while ((step_rc = sqlite3_step(stmt)) == SQLITE_ROW) {
         int64_t old_id = sqlite3_column_int64(stmt, 0);
         const char *label = (const char *)sqlite3_column_text(stmt, SKIP_ONE);
         const char *name = (const char *)sqlite3_column_text(stmt, GB_COL_2);
@@ -1500,6 +1607,18 @@ int cbm_gbuf_load_from_db(cbm_gbuf_t *gb, const char *db_path, const char *proje
         uint64_t end_byte = (uint64_t)sqlite3_column_int64(stmt, 13);
         static const uint8_t empty_source = 0;
 
+        if (old_id <= 0 || old_id > max_old_id) {
+            set_load_error(
+                error, "CBM_GRAPH_NODE_ID_INVALID", "graph_load_validate_node_id", db_path,
+                old_id < 0 ? 0 : (size_t)old_id,
+                "a persisted graph node ID is outside the positive mapping domain",
+                "preserve and inspect the graph store; rebuild it only from the exact source "
+                "after correcting its node-ID domain");
+            sqlite3_finalize(stmt);
+            free(old_to_new);
+            cbm_store_close(store);
+            return CBM_NOT_FOUND;
+        }
         int64_t new_id =
             source_present
                 ? cbm_gbuf_upsert_source_node(gb, label, name, qn, fp, sl, el,
@@ -1507,22 +1626,44 @@ int cbm_gbuf_load_from_db(cbm_gbuf_t *gb, const char *db_path, const char *proje
                                               (size_t)source_len, start_byte, end_byte, props)
                 : cbm_gbuf_upsert_node(gb, label, name, qn, fp, sl, el, props);
         const cbm_gbuf_node_t *loaded = cbm_gbuf_find_by_id(gb, new_id);
-        if (!loaded || !loaded->atom_id || !expected_atom ||
-            strcmp(loaded->atom_id, expected_atom) != 0 ||
+        if (new_id <= 0 || !loaded || !loaded->atom_id) {
+            set_load_error(error, "CBM_GRAPH_NODE_RECONSTRUCTION_FAILED",
+                           "graph_load_reconstruct_node", qn ? qn : db_path,
+                           (size_t)(old_id < 0 ? 0 : old_id),
+                           "a persisted graph node could not be reconstructed exactly in memory",
+                           "inspect the preceding graph-buffer diagnostic, repair the exact "
+                           "identity or allocation failure, then retry");
+            sqlite3_finalize(stmt);
+            free(old_to_new);
+            cbm_store_close(store);
+            return CBM_NOT_FOUND;
+        }
+        if (!expected_atom || strcmp(loaded->atom_id, expected_atom) != 0 ||
             strcmp(loaded->source_sha256 ? loaded->source_sha256 : "",
                    expected_source_sha ? expected_source_sha : "") != 0) {
             cbm_log_error("gbuf.load_atom_mismatch", "code", "CBM_NODE_ATOM_ID_MISMATCH",
                           "qualified_name", qn ? qn : "", "message",
                           "persisted atom_id does not match immutable source facts", "remediation",
                           "rebuild the SQLite store from the exact source bytes");
+            set_load_error(error, "CBM_NODE_ATOM_ID_MISMATCH", "graph_load_verify_immutable_atom",
+                           qn ? qn : db_path, 0,
+                           "persisted atom_id does not match immutable source facts",
+                           "rebuild the SQLite store from the exact source bytes");
             sqlite3_finalize(stmt);
             free(old_to_new);
             cbm_store_close(store);
             return CBM_NOT_FOUND;
         }
-        if (new_id > 0 && old_id <= max_old_id) {
-            old_to_new[old_id] = new_id;
-        }
+        old_to_new[old_id] = new_id;
+    }
+    if (step_rc != SQLITE_DONE) {
+        set_sqlite_load_error(error, db, db_path, "CBM_GRAPH_NODE_ROWS_READ_FAILED",
+                              "graph_load_read_nodes",
+                              "the complete persisted node set could not be read");
+        sqlite3_finalize(stmt);
+        free(old_to_new);
+        cbm_store_close(store);
+        return CBM_NOT_FOUND;
     }
     sqlite3_finalize(stmt);
 
@@ -1531,29 +1672,68 @@ int cbm_gbuf_load_from_db(cbm_gbuf_t *gb, const char *db_path, const char *proje
                            "SELECT source_id, target_id, type, properties "
                            "FROM edges WHERE project = ?",
                            CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
+        set_sqlite_load_error(error, db, db_path, "CBM_GRAPH_EDGE_ROWS_PREPARE_FAILED",
+                              "graph_load_prepare_edges",
+                              "the complete persisted edge query could not be prepared");
         free(old_to_new);
         cbm_store_close(store);
         return CBM_NOT_FOUND;
     }
     sqlite3_bind_text(stmt, SKIP_ONE, project, CBM_NOT_FOUND, SQLITE_STATIC);
 
-    while (sqlite3_step(stmt) == SQLITE_ROW) {
+    while ((step_rc = sqlite3_step(stmt)) == SQLITE_ROW) {
         int64_t old_src = sqlite3_column_int64(stmt, 0);
         int64_t old_tgt = sqlite3_column_int64(stmt, SKIP_ONE);
         const char *type = (const char *)sqlite3_column_text(stmt, GB_COL_2);
         const char *props = (const char *)sqlite3_column_text(stmt, GB_COL_3);
 
-        int64_t new_src = (old_src <= max_old_id) ? old_to_new[old_src] : 0;
-        int64_t new_tgt = (old_tgt <= max_old_id) ? old_to_new[old_tgt] : 0;
+        int64_t new_src = (old_src > 0 && old_src <= max_old_id) ? old_to_new[old_src] : 0;
+        int64_t new_tgt = (old_tgt > 0 && old_tgt <= max_old_id) ? old_to_new[old_tgt] : 0;
         if (new_src > 0 && new_tgt > 0) {
-            cbm_gbuf_insert_edge(gb, new_src, new_tgt, type, props);
+            if (cbm_gbuf_insert_edge(gb, new_src, new_tgt, type, props) <= 0) {
+                set_load_error(error, "CBM_GRAPH_EDGE_RECONSTRUCTION_FAILED",
+                               "graph_load_reconstruct_edge", type ? type : db_path,
+                               (size_t)(old_src < 0 ? 0 : old_src),
+                               "a persisted graph edge could not be reconstructed exactly in "
+                               "memory",
+                               "inspect the preceding graph-buffer diagnostic, repair the exact "
+                               "edge identity or allocation failure, then retry");
+                sqlite3_finalize(stmt);
+                free(old_to_new);
+                cbm_store_close(store);
+                return CBM_NOT_FOUND;
+            }
+        } else {
+            set_load_error(error, "CBM_GRAPH_EDGE_ENDPOINT_MISSING",
+                           "graph_load_resolve_edge_endpoints", type ? type : db_path,
+                           (size_t)(old_src < 0 ? 0 : old_src),
+                           "a persisted edge does not resolve to two reconstructed nodes",
+                           "preserve and inspect the graph store; repair its exact referential "
+                           "integrity before retrying");
+            sqlite3_finalize(stmt);
+            free(old_to_new);
+            cbm_store_close(store);
+            return CBM_NOT_FOUND;
         }
+    }
+    if (step_rc != SQLITE_DONE) {
+        set_sqlite_load_error(error, db, db_path, "CBM_GRAPH_EDGE_ROWS_READ_FAILED",
+                              "graph_load_read_edges",
+                              "the complete persisted edge set could not be read");
+        sqlite3_finalize(stmt);
+        free(old_to_new);
+        cbm_store_close(store);
+        return CBM_NOT_FOUND;
     }
     sqlite3_finalize(stmt);
 
     free(old_to_new);
     cbm_store_close(store);
     return 0;
+}
+
+int cbm_gbuf_load_from_db(cbm_gbuf_t *gb, const char *db_path, const char *project) {
+    return cbm_gbuf_load_from_db_checked(gb, db_path, project, NULL);
 }
 
 void cbm_gbuf_foreach_node(const cbm_gbuf_t *gb, cbm_gbuf_node_visitor_fn fn, void *userdata) {

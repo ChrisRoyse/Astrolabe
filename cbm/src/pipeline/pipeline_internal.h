@@ -11,6 +11,7 @@
 #include "pipeline/pipeline.h"
 #include "pipeline/path_alias.h"
 #include "graph_buffer/graph_buffer.h"
+#include "graph_buffer/load_error.h"
 #include "discover/discover.h"
 #include "foundation/hash_table.h"
 #include "cbm.h"
@@ -68,6 +69,12 @@ typedef struct {
     int cap;
     bool failed;
 } cbm_pkg_entries_t;
+
+/* Retain the exact first terminal pipeline diagnostic. Every string is copied
+ * into pipeline-owned fixed storage before the originating subsystem is freed. */
+void cbm_pipeline_record_fatal_error(cbm_pipeline_t *p, const char *code, const char *operation,
+                                     const char *phase, const char *path, size_t requested,
+                                     const char *message, const char *remediation);
 
 void cbm_pkg_entries_init(cbm_pkg_entries_t *e);
 void cbm_pkg_entries_free(cbm_pkg_entries_t *e);

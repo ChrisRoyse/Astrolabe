@@ -485,10 +485,9 @@ bool cbm_pipeline_get_fatal_error(const cbm_pipeline_t *p, cbm_pipeline_error_t 
     return true;
 }
 
-static void cbm_pipeline_record_fatal_error(cbm_pipeline_t *p, const char *code,
-                                            const char *operation, const char *phase,
-                                            const char *path, size_t requested,
-                                            const char *message, const char *remediation) {
+void cbm_pipeline_record_fatal_error(cbm_pipeline_t *p, const char *code, const char *operation,
+                                     const char *phase, const char *path, size_t requested,
+                                     const char *message, const char *remediation) {
     if (!p || p->fatal_error_present) {
         return;
     }

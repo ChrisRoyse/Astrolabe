@@ -1096,6 +1096,14 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
     }
 
     cbm_store_free_file_hashes(stored, stored_count);
+    /*
+     * The verified graph reader opens the DB/WAL/SHM family without write or
+     * delete sharing. Release this routing writer before that immutable-read
+     * boundary. The subsequent freeze is the physical proof: any deferred or
+     * foreign writer remains a terminal, exactly reported sharing failure.
+     */
+    cbm_store_close(store);
+    store = NULL;
 
     /* Build list of changed files */
     cbm_file_info_t *changed_files =
@@ -1110,7 +1118,6 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
         }
         free(deleted);
         free_mode_skipped(mode_skipped, mode_skipped_count);
-        cbm_store_close(store);
         return CBM_NOT_FOUND;
     }
     int ci = 0;
@@ -1128,13 +1135,24 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
     /* Step 1: Load existing graph into RAM */
     cbm_clock_gettime(CLOCK_MONOTONIC, &t);
     cbm_gbuf_t *existing = cbm_gbuf_new(project, cbm_pipeline_repo_path(p));
-    int load_rc = cbm_gbuf_load_from_db(existing, db_path, project);
+    cbm_gbuf_load_error_t load_error;
+    int load_rc = cbm_gbuf_load_from_db_checked(existing, db_path, project, &load_error);
     cbm_log_info("incremental.load_db", "rc", itoa_buf(load_rc), "nodes",
                  itoa_buf(cbm_gbuf_node_count(existing)), "edges",
                  itoa_buf(cbm_gbuf_edge_count(existing)), "elapsed_ms",
                  itoa_buf((int)elapsed_ms(t)));
 
     if (load_rc != 0) {
+        cbm_pipeline_record_fatal_error(
+            p, load_error.code[0] ? load_error.code : "CBM_GRAPH_STORE_LOAD_FAILED",
+            load_error.operation[0] ? load_error.operation : "graph_store_load",
+            load_error.phase[0] ? load_error.phase : "incremental_load",
+            load_error.path[0] ? load_error.path : db_path, load_error.requested,
+            load_error.message[0] ? load_error.message
+                                  : "the existing graph could not be loaded exactly",
+            load_error.remediation[0]
+                ? load_error.remediation
+                : "repair the exact graph-store failure, then retry the complete corpus");
         cbm_log_error("incremental.err", "msg", "load_db_failed");
         cbm_gbuf_free(existing);
         free(changed_files);
@@ -1143,11 +1161,8 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
         }
         free(deleted);
         free_mode_skipped(mode_skipped, mode_skipped_count);
-        cbm_store_close(store);
         return CBM_NOT_FOUND;
     }
-
-    cbm_store_close(store);
 
     if (snapshot_noop) {
         cbm_log_info("incremental.noop", "reason", "complete_snapshot_sink");
