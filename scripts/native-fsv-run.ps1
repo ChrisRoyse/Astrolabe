@@ -80,6 +80,21 @@ function File-Sha256([string]$Path) {
     finally { $hasher.Dispose(); $stream.Dispose() }
 }
 
+function File-Sha256UnderCleanupLease([string]$Path) {
+    # The retained cleanup-readiness lease requests read/write/delete access while
+    # sharing reads only. This independent reader must therefore share all access
+    # requested by that existing lease while itself requesting only read access.
+    $stream = [IO.File]::Open(
+        (ConvertTo-AstroExtendedLengthPath $Path),
+        [IO.FileMode]::Open,
+        [IO.FileAccess]::Read,
+        [IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete
+    )
+    $hasher = [Security.Cryptography.SHA256]::Create()
+    try { return ([BitConverter]::ToString($hasher.ComputeHash($stream)) -replace '-', '').ToLowerInvariant() }
+    finally { $hasher.Dispose(); $stream.Dispose() }
+}
+
 function String-Sha256([AllowEmptyString()][string]$Value) {
     $hasher = [Security.Cryptography.SHA256]::Create()
     try {
@@ -912,6 +927,8 @@ $launcherLockSnapshotBefore = $null
 $launcherJobName = $null
 $launcherJobProbeBefore = $null
 $directoryHandle = $null
+$artifactCleanupLease = $null
+$artifactCleanupReadiness = $null
 $fsvLockOwned = $false
 $child = $null
 $childStartedAtUtc = $null
@@ -1248,8 +1265,96 @@ try {
             $launcherOwner.OwnerProcessStartUtcTicks -and
         $launcherOwnerAfter.Sha256 -ceq $launcherLockHashBefore -and
         $launcherJobStable
+
+    # #708: a completed native child and a stable run record are not sufficient
+    # cleanup evidence. Prove the *same* access/share request used by exact cleanup
+    # can be acquired before returning to the caller. The execution lease must be
+    # closed first because it deliberately denies DELETE for the whole child run.
+    #
+    # Read-only is reversibly cleared because OpenExactRenameSource requests
+    # GENERIC_WRITE and Windows returns ERROR_ACCESS_DENIED for that exact open on
+    # a read-only file. Once the cleanup lease is retained, restore read-only and
+    # independently re-read final path, identity, link count, length, and bytes.
+    # The retained lease shares reads only, so it protects the artifact against
+    # write/delete drift until this runner exits.
+    if ($null -ne $artifactHandle) {
+        $artifactHandle.Dispose()
+        $artifactHandle = $null
+    }
+    try {
+        Set-AstroFileReadOnlyLongPath -LiteralPath $artifact -ReadOnly $false
+        $artifactCleanupLease =
+            [AstroLauncherLockNative]::OpenExactRenameSource($artifact)
+        Set-AstroFileReadOnlyLongPath -LiteralPath $artifact -ReadOnly $true
+
+        $cleanupFinalPath = ConvertFrom-AstroNativeFinalPath (
+            [AstroLauncherLockNative]::GetFileFinalPath($artifactCleanupLease)
+        )
+        if (-not [string]::Equals(
+                $cleanupFinalPath,
+                $artifact,
+                [StringComparison]::OrdinalIgnoreCase
+            )) {
+            throw "cleanup-readiness lease resolved to '$cleanupFinalPath', expected '$artifact'"
+        }
+        $cleanupFileId =
+            [AstroLauncherLockNative]::GetFileIdentity($artifactCleanupLease)
+        $cleanupLinks =
+            [AstroLauncherLockNative]::GetNumberOfLinks($artifactCleanupLease)
+        $cleanupLength = Get-AstroFileLengthLongPath $artifact
+        $cleanupHash = File-Sha256UnderCleanupLease $artifact
+        $cleanupAttributes = [IO.File]::GetAttributes(
+            (ConvertTo-AstroExtendedLengthPath $artifact)
+        )
+        $cleanupReadOnly =
+            ($cleanupAttributes -band [IO.FileAttributes]::ReadOnly) -ne 0
+        if ($cleanupLinks -ne 1 -or
+            $cleanupLength -ne [uint64]$receipt.artifact.bytes -or
+            $cleanupHash -cne $artifactHashAfter -or
+            -not $cleanupReadOnly) {
+            throw "cleanup-readiness readback drifted (links=$cleanupLinks, bytes=$cleanupLength, sha256=$cleanupHash, read_only=$cleanupReadOnly)"
+        }
+        $artifactCleanupReadiness = [ordered]@{
+            established = $true
+            operation =
+                'CreateFileW(GENERIC_READ|GENERIC_WRITE|DELETE,FILE_SHARE_READ)'
+            final_path = $cleanupFinalPath
+            file_id = $cleanupFileId
+            links = [uint32]$cleanupLinks
+            bytes = [uint64]$cleanupLength
+            sha256 = $cleanupHash
+            read_only_restored = $cleanupReadOnly
+            retained_until_runner_exit = $true
+        }
+        $artifactStable = $artifactStable -and
+            $cleanupHash -ceq $artifactHashAfter
+    }
+    catch {
+        $readinessFailure = $_
+        if ($null -ne $artifactCleanupLease) {
+            $artifactCleanupLease.Dispose()
+            $artifactCleanupLease = $null
+        }
+        try {
+            if (Test-AstroPathLongPath -LiteralPath $artifact -PathType Leaf) {
+                Set-AstroFileReadOnlyLongPath `
+                    -LiteralPath $artifact -ReadOnly $true
+            }
+        }
+        catch {
+            Fail-Astro 'ASTRO_FSV_ARTIFACT_CLEANUP_READINESS_RESTORE_FAILED' `
+                "exact cleanup readiness failed and the staged artifact read-only attribute could not be restored (readiness_failure=$($readinessFailure.Exception.Message); restore_failure=$($_.Exception.Message))" `
+                'preserve the session and inspect the exact native error/handle owner before any lifecycle cleanup'
+        }
+        Fail-Astro 'ASTRO_FSV_ARTIFACT_CLEANUP_NOT_READY' `
+            "the staged artifact is not exactly ready for cleanup after native child termination: $($readinessFailure.Exception.Message)" `
+            'preserve the session; inspect the native error and exact live handle owner, then repair handle lifetime before retrying'
+    }
+
     $verdict = if ($childExitCode -eq 0 -and [bool]$childExitObservation.sources_agree -and
-        $treeStable -and $artifactStable -and $receiptStable -and $launcherLeaseStable) {
+        $treeStable -and $artifactStable -and $receiptStable -and
+        $launcherLeaseStable -and
+        [bool]$artifactCleanupReadiness.established) {
         'verified'
     } else {
         'failed'
@@ -1271,6 +1376,7 @@ try {
             timestamp_basis = 'runner-observed-utc'
         }
         artifact = [ordered]@{ path = $artifact; bytes = Get-AstroFileLengthLongPath $artifact; sha256 = $artifactHashAfter; stable = $artifactStable; delete_share_denied_for_run = $true }
+        cleanup_readiness = $artifactCleanupReadiness
         receipt = [ordered]@{ path = $receiptFull; sha256_before = $receiptHashBefore; sha256_after = $receiptHashAfter; stable = $receiptStable }
         launcher_lease = [ordered]@{
             path = $launcherLockPath
@@ -1364,7 +1470,15 @@ catch {
         try {
             $failureArtifactHash = if (
                 Test-AstroPathLongPath -LiteralPath $artifact -PathType Leaf
-            ) { File-Sha256 $artifact } else { $null }
+            ) {
+                if ($null -ne $artifactCleanupLease) {
+                    File-Sha256UnderCleanupLease $artifact
+                }
+                else {
+                    File-Sha256 $artifact
+                }
+            }
+            else { $null }
             $failureRecord = [ordered]@{
                 schema = 'astrolabe.native-fsv-run.v1'
                 verdict = 'failed'
@@ -1444,4 +1558,7 @@ finally {
     }
     if ($null -ne $createdChild) { $createdChild.Dispose() }
     if ($null -ne $child) { $child.Dispose() }
+    if ($null -ne $artifactCleanupLease) {
+        $artifactCleanupLease.Dispose()
+    }
 }

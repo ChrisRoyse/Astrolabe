@@ -336,7 +336,8 @@ public static class AstroLauncherLockNative
             handle.Dispose();
             throw new Win32Exception(
                 error,
-                "could not open exact write-denying rename source: " + path
+                "could not open exact write-denying rename source " +
+                "(native_error=" + error + "; path=" + path + ")"
             );
         }
         try
