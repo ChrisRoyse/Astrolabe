@@ -34,3 +34,16 @@ Write-Output (
     "workspace_root=$entryRoot"
 )
 & $authorityPath -WorkspaceRoot $entryRoot @args
+$authorityExitCode = $LASTEXITCODE
+if ($null -eq $authorityExitCode) {
+    throw (
+        'LAUNCHER_AUTHORITY[ASTRO_LAUNCHER_AUTHORITY_EXIT_MISSING]: ' +
+        "{code=ASTRO_LAUNCHER_AUTHORITY_EXIT_MISSING; " +
+        "message=`"canonical launcher protocol authority v$protocolAuthorityVersion " +
+        "returned without an explicit process exit code`"; " +
+        "remediation=`"preserve all launcher state, inspect the canonical " +
+        "authority terminal path at '$authorityPath', and repair its explicit " +
+        "exit contract before retrying`"}"
+    )
+}
+exit [int]$authorityExitCode
