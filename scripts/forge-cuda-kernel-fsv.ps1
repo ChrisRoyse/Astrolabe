@@ -151,8 +151,7 @@ $runRecordPath = Join-Path $session 'run.json'
 $liveStatePath = Join-Path $session 'live.json'
 $argumentsJson = ConvertTo-AstroSingleStringArrayJson $payload
 
-& powershell.exe -NoProfile -ExecutionPolicy Bypass `
-    -File (Join-Path $PSScriptRoot 'native-fsv-run.ps1') `
+& (Join-Path $PSScriptRoot 'native-fsv-run.ps1') `
     -ReceiptPath $receiptPath `
     -ArgumentsJson $argumentsJson `
     -StandardOutputPath $stdoutPath `
@@ -160,9 +159,10 @@ $argumentsJson = ConvertTo-AstroSingleStringArrayJson $payload
     -RunRecordPath $runRecordPath `
     -LiveStatePath $liveStatePath `
     -Issue $Issue
-Assert-Astro ($LASTEXITCODE -eq 0) `
+$runnerSucceeded = $?
+Assert-Astro $runnerSucceeded `
     'CALYX_FORGE_CUDA_FSV_RUNNER_FAILED' `
-    "native FSV runner exited $LASTEXITCODE"
+    'native FSV runner did not complete normally'
 
 & powershell.exe -NoProfile -ExecutionPolicy Bypass `
     -File (Join-Path $PSScriptRoot 'native-fsv-artifact.ps1') `
