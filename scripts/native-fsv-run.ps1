@@ -55,15 +55,25 @@ function Assert-PathWithin([string]$Path, [string]$Root, [string]$Code, [string]
 }
 
 function Assert-NotReparseEntry([string]$Path, [string]$Description) {
-    if (-not (Test-Path -LiteralPath $Path)) { return }
-    $item = Get-Item -LiteralPath $Path -Force
-    if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+    $state = Get-AstroPathEntryState $Path
+    if ($state.State -ceq 'absent') { return }
+    if ($state.State -cne 'present') {
+        Fail-Astro 'ASTRO_FSV_PATH_UNEVALUABLE' `
+            "$Description presence/attributes are unevaluable: $Path ($($state.Error))" `
+            'repair filesystem access before executing evidence state'
+    }
+    if (($state.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
         Fail-Astro 'ASTRO_FSV_REPARSE_ENTRY_REFUSED' "$Description is a reparse point: $Path" 'use ordinary workspace-local evidence paths that cannot redirect elsewhere'
     }
 }
 
 function File-Sha256([string]$Path) {
-    $stream = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+    $stream = [IO.File]::Open(
+        (ConvertTo-AstroExtendedLengthPath $Path),
+        [IO.FileMode]::Open,
+        [IO.FileAccess]::Read,
+        [IO.FileShare]::Read
+    )
     $hasher = [Security.Cryptography.SHA256]::Create()
     try { return ([BitConverter]::ToString($hasher.ComputeHash($stream)) -replace '-', '').ToLowerInvariant() }
     finally { $hasher.Dispose(); $stream.Dispose() }
@@ -123,15 +133,20 @@ function Failure-Text($Value) {
 
 function Write-NewDurableUtf8([string]$Path, [string]$Content) {
     $bytes = [Text.UTF8Encoding]::new($false).GetBytes($Content)
-    $stream = [IO.File]::Open($Path, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+    $stream = [IO.File]::Open(
+        (ConvertTo-AstroExtendedLengthPath $Path),
+        [IO.FileMode]::CreateNew,
+        [IO.FileAccess]::Write,
+        [IO.FileShare]::None
+    )
     try { $stream.Write($bytes, 0, $bytes.Length); $stream.Flush($true) }
     finally { $stream.Dispose() }
 }
 
 function Publish-NewFile([string]$Path, [string]$Content) {
     $parent = Split-Path -Parent $Path
-    if (-not (Test-Path -LiteralPath $parent -PathType Container)) {
-        New-Item -ItemType Directory -Path $parent -Force | Out-Null
+    if (-not (Test-AstroPathLongPath -LiteralPath $parent -PathType Container)) {
+        New-AstroDirectoryLongPath $parent | Out-Null
     }
     $stage = Join-Path $parent ('.' + [IO.Path]::GetFileName($Path) + ".publishing-$PID-" + [guid]::NewGuid().ToString('N'))
     try {
@@ -139,7 +154,9 @@ function Publish-NewFile([string]$Path, [string]$Content) {
         [AstroFsvAtomicFile]::PublishNoClobber($stage, $Path)
     }
     catch {
-        Remove-Item -LiteralPath $stage -Force -ErrorAction SilentlyContinue
+        if (Test-AstroPathLongPath -LiteralPath $stage -PathType Leaf) {
+            Remove-AstroFileLongPath $stage
+        }
         throw
     }
 }
@@ -179,6 +196,15 @@ public static class AstroFsvAtomicFile {
     [DllImport("kernel32.dll", SetLastError = true)]
     static extern bool GetExitCodeProcess(SafeProcessHandle process, out uint exitCode);
 
+    static string Extended(string path) {
+        string full = System.IO.Path.GetFullPath(path);
+        if (full.StartsWith(@"\\?\", StringComparison.Ordinal))
+            return full;
+        if (full.StartsWith(@"\\", StringComparison.Ordinal))
+            return @"\\?\UNC\" + full.Substring(2);
+        return @"\\?\" + full;
+    }
+
     public static void PublishNoClobber(string source, string destination) {
         Move(source, destination, MOVEFILE_WRITE_THROUGH);
     }
@@ -188,15 +214,24 @@ public static class AstroFsvAtomicFile {
     }
 
     static void Move(string source, string destination, uint flags) {
-        if (!MoveFileExW(source, destination, flags))
-            throw new Win32Exception(Marshal.GetLastWin32Error(), "atomic write-through publication failed");
+        if (!MoveFileExW(Extended(source), Extended(destination), flags)) {
+            int error = Marshal.GetLastWin32Error();
+            throw new Win32Exception(error,
+                "MoveFileExW atomic write-through publication failed " +
+                "(native_error=" + error + "; flags=" + flags +
+                "; source=" + source + "; destination=" + destination + ")");
+        }
     }
 
     public static SafeFileHandle OpenDirectoryWithoutDeleteShare(string path) {
-        SafeFileHandle handle = CreateFileW(path, 0, FILE_SHARE_READ, IntPtr.Zero, OPEN_EXISTING,
-            FILE_FLAG_BACKUP_SEMANTICS, IntPtr.Zero);
-        if (handle.IsInvalid)
-            throw new Win32Exception(Marshal.GetLastWin32Error(), "open evidence directory lease failed");
+        SafeFileHandle handle = CreateFileW(Extended(path), 0, FILE_SHARE_READ,
+            IntPtr.Zero, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, IntPtr.Zero);
+        if (handle.IsInvalid) {
+            int error = Marshal.GetLastWin32Error();
+            throw new Win32Exception(error,
+                "CreateFileW evidence-directory lease failed (native_error=" +
+                error + "; path=" + path + ")");
+        }
         return handle;
     }
 
@@ -327,14 +362,14 @@ $argumentCount = 0
 
 try {
     if ($Issue -le 0) { Fail-Astro 'ASTRO_FSV_ISSUE_INVALID' 'Issue must be positive' 'pass the driving GitHub issue number' }
-    if (-not (Test-Path -LiteralPath $gitExe -PathType Leaf)) {
+    if (-not (Test-AstroPathLongPath -LiteralPath $gitExe -PathType Leaf)) {
         Fail-Astro 'ASTRO_FSV_GIT_MISSING' "required native Git executable is absent: $gitExe" 'restore the canonical Git for Windows installation'
     }
     $receiptFull = Assert-PathWithin $ReceiptPath $evidenceRoot 'ASTRO_FSV_RECEIPT_ESCAPE' 'receipt path'
-    if (-not (Test-Path -LiteralPath $receiptFull -PathType Leaf)) {
+    if (-not (Test-AstroPathLongPath -LiteralPath $receiptFull -PathType Leaf)) {
         Fail-Astro 'ASTRO_FSV_RECEIPT_MISSING' "receipt does not exist: $receiptFull" 'stage the native artifact first'
     }
-    try { $receipt = Get-Content -LiteralPath $receiptFull -Raw | ConvertFrom-Json }
+    try { $receipt = Read-AstroUtf8FileLongPath $receiptFull | ConvertFrom-Json }
     catch { Fail-Astro 'ASTRO_FSV_RECEIPT_INVALID' "parse receipt failed: $($_.Exception.Message)" 'stage a fresh native artifact' }
     if ($receipt.schema -ne 'astrolabe.native-fsv-artifact.v1' -or [int]$receipt.issue -ne $Issue) {
         Fail-Astro 'ASTRO_FSV_RECEIPT_INVALID' "receipt schema/issue does not match issue #$Issue" 'pass the exact receipt emitted for this driving issue'
@@ -353,7 +388,7 @@ try {
     Assert-NotReparseEntry $receiptFull 'evidence receipt'
     Assert-NotReparseEntry $sessionDirectory 'evidence session directory'
     $artifact = Assert-PathWithin ([string]$receipt.artifact.path) $sessionDirectory 'ASTRO_FSV_ARTIFACT_ESCAPE' 'artifact path'
-    if (-not (Test-Path -LiteralPath $artifact -PathType Leaf)) {
+    if (-not (Test-AstroPathLongPath -LiteralPath $artifact -PathType Leaf)) {
         Fail-Astro 'ASTRO_FSV_ARTIFACT_MISSING' "staged artifact is absent: $artifact" 'stage a fresh native artifact'
     }
     Assert-NotReparseEntry $artifact 'staged native artifact'
@@ -362,7 +397,7 @@ try {
         @($RunRecordPath, 'run record'), @($LiveStatePath, 'live state')
     )) {
         $resolved = Assert-PathWithin ([string]$pair[0]) $sessionDirectory 'ASTRO_FSV_OUTPUT_ESCAPE' ([string]$pair[1])
-        if (Test-Path -LiteralPath $resolved) {
+        if (Test-AstroPathLongPath -LiteralPath $resolved) {
             Fail-Astro 'ASTRO_FSV_OUTPUT_REUSE_REFUSED' "$($pair[1]) already exists: $resolved" 'use fresh output paths; FSV state is append-only and never overwritten'
         }
     }
@@ -445,7 +480,7 @@ try {
         Fail-Astro 'ASTRO_FSV_LAUNCHER_LEASE_MISMATCH' "retained live launcher-lock identity differs from its authoritative classifier snapshot (links=$launcherLockLinksBefore, retained_sha256=$($launcherLockSnapshotBefore.Sha256), classified_sha256=$($launcherOwner.Sha256))" 'preserve all state and investigate launcher-lock replacement, aliasing, or byte drift'
     }
     $launcherLockHashBefore = [string]$launcherLockSnapshotBefore.Sha256
-    $artifactItem = Get-Item -LiteralPath $artifact
+    $artifactItem = Get-AstroFileInfoLongPath $artifact
     if ($artifactHashBefore -cne ([string]$receipt.artifact.sha256).ToLowerInvariant() -or
         [uint64]$artifactItem.Length -ne [uint64]$receipt.artifact.bytes) {
         Fail-Astro 'ASTRO_FSV_ARTIFACT_DRIFT' 'staged artifact hash/length differs from its receipt before launch' 'discard the session, identify the writer, and rebuild'
@@ -466,8 +501,18 @@ try {
     # FileShare.Read intentionally omits write/delete sharing. Microsoft documents that a
     # subsequent delete/rename open then fails until this handle is closed.
     $directoryHandle = [AstroFsvAtomicFile]::OpenDirectoryWithoutDeleteShare($sessionDirectory)
-    $artifactHandle = [IO.File]::Open($artifact, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
-    $receiptHandle = [IO.File]::Open($receiptFull, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+    $artifactHandle = [IO.File]::Open(
+        (ConvertTo-AstroExtendedLengthPath $artifact),
+        [IO.FileMode]::Open,
+        [IO.FileAccess]::Read,
+        [IO.FileShare]::Read
+    )
+    $receiptHandle = [IO.File]::Open(
+        (ConvertTo-AstroExtendedLengthPath $receiptFull),
+        [IO.FileMode]::Open,
+        [IO.FileAccess]::Read,
+        [IO.FileShare]::Read
+    )
     $lockStage = "$fsvLockPath.$PID.tmp"
     $lockManifest = [ordered]@{
         pid = $PID
@@ -491,15 +536,19 @@ try {
     Write-NewDurableUtf8 $lockStage ($lockManifest | ConvertTo-Json -Depth 10 -Compress)
     try { [AstroFsvAtomicFile]::PublishNoClobber($lockStage, $fsvLockPath) }
     catch {
-        Remove-Item -LiteralPath $lockStage -Force -ErrorAction SilentlyContinue
+        if (Test-AstroPathLongPath -LiteralPath $lockStage -PathType Leaf) {
+            Remove-AstroFileLongPath $lockStage
+        }
         Fail-Astro 'ASTRO_FSV_LOCK_HELD' "FSV lock could not be claimed without clobbering: $fsvLockPath" 'wait for the live owner or post dead-owner evidence before removing a stale lock'
     }
     $fsvLockOwned = $true
 
     $startProcessParameters = @{
-        FilePath = $artifact
-        RedirectStandardOutput = $StandardOutputPath
-        RedirectStandardError = $StandardErrorPath
+        FilePath = ConvertTo-AstroExtendedLengthPath $artifact
+        RedirectStandardOutput =
+            ConvertTo-AstroExtendedLengthPath $StandardOutputPath
+        RedirectStandardError =
+            ConvertTo-AstroExtendedLengthPath $StandardErrorPath
         WindowStyle = 'Hidden'
         PassThru = $true
     }
@@ -512,7 +561,7 @@ try {
         Fail-Astro 'ASTRO_FSV_CHILD_HANDLE_UNAVAILABLE' "native child PID $($child.Id) did not expose a retained process handle" 'preserve the session and repair native process launch before rerunning'
     }
     $childStartedAtUtc = [DateTime]::UtcNow.ToString('o')
-    $ownedLock = Get-Content -LiteralPath $fsvLockPath -Raw | ConvertFrom-Json
+    $ownedLock = Read-AstroUtf8FileLongPath $fsvLockPath | ConvertFrom-Json
     if ([int]$ownedLock.pid -ne $PID -or [string]$ownedLock.artifact_sha256 -cne $artifactHashBefore) {
         Fail-Astro 'ASTRO_FSV_LOCK_IDENTITY_CHANGED' 'FSV lock identity changed before child PID publication' 'preserve state and investigate the competing writer'
     }
@@ -523,10 +572,13 @@ try {
     Write-NewDurableUtf8 $lockUpdateStage ($lockManifest | ConvertTo-Json -Depth 10 -Compress)
     try { [AstroFsvAtomicFile]::ReplaceOwned($lockUpdateStage, $fsvLockPath) }
     catch {
-        Remove-Item -LiteralPath $lockUpdateStage -Force -ErrorAction SilentlyContinue
+        if (Test-AstroPathLongPath -LiteralPath $lockUpdateStage -PathType Leaf) {
+            Remove-AstroFileLongPath $lockUpdateStage
+        }
         Fail-Astro 'ASTRO_FSV_LOCK_UPDATE_FAILED' "publishing child PID $($child.Id) into the FSV lock failed: $($_.Exception.Message)" 'preserve state and investigate the lock writer'
     }
-    $publishedLock = Get-Content -LiteralPath $fsvLockPath -Raw | ConvertFrom-Json
+    $publishedLock =
+        Read-AstroUtf8FileLongPath $fsvLockPath | ConvertFrom-Json
     if ([int]$publishedLock.child_pid -ne $child.Id -or [string]$publishedLock.phase -cne 'running') {
         Fail-Astro 'ASTRO_FSV_LOCK_UPDATE_FAILED' 'FSV lock child-PID readback does not match the real process' 'preserve state and investigate the durable lock write'
     }
@@ -573,7 +625,8 @@ try {
         $beforeRepo.status_sha256 -ceq $afterRepo.status_sha256 -and
         $beforeRepo.diff_sha256 -ceq $afterRepo.diff_sha256
     $artifactStable = $artifactHashBefore -ceq $artifactHashAfter -and
-        [uint64](Get-Item -LiteralPath $artifact).Length -eq [uint64]$receipt.artifact.bytes
+        (Get-AstroFileLengthLongPath $artifact) -eq
+            [uint64]$receipt.artifact.bytes
     $receiptStable = $receiptHashBefore -ceq $receiptHashAfter
     $launcherJobStable = $launcherJobProbeAfter.State -ceq 'observed' -and
         $launcherJobMembersAfter -contains $launcherPid -and
@@ -612,7 +665,7 @@ try {
             exited_at = $childExitedAtUtc
             timestamp_basis = 'runner-observed-utc'
         }
-        artifact = [ordered]@{ path = $artifact; bytes = [uint64](Get-Item -LiteralPath $artifact).Length; sha256 = $artifactHashAfter; stable = $artifactStable; delete_share_denied_for_run = $true }
+        artifact = [ordered]@{ path = $artifact; bytes = Get-AstroFileLengthLongPath $artifact; sha256 = $artifactHashAfter; stable = $artifactStable; delete_share_denied_for_run = $true }
         receipt = [ordered]@{ path = $receiptFull; sha256_before = $receiptHashBefore; sha256_after = $receiptHashAfter; stable = $receiptStable }
         launcher_lease = [ordered]@{
             path = $launcherLockPath
@@ -637,13 +690,14 @@ try {
         }
         argument_count = $argumentCount
         arguments = @($arguments)
-        stdout = [ordered]@{ path = $StandardOutputPath; bytes = [uint64](Get-Item -LiteralPath $StandardOutputPath).Length; sha256 = $stdoutHash }
-        stderr = [ordered]@{ path = $StandardErrorPath; bytes = [uint64](Get-Item -LiteralPath $StandardErrorPath).Length; sha256 = $stderrHash }
+        stdout = [ordered]@{ path = $StandardOutputPath; bytes = Get-AstroFileLengthLongPath $StandardOutputPath; sha256 = $stdoutHash }
+        stderr = [ordered]@{ path = $StandardErrorPath; bytes = Get-AstroFileLengthLongPath $StandardErrorPath; sha256 = $stderrHash }
         repository = [ordered]@{ before = $beforeRepo; after = $afterRepo; stable = $treeStable }
     }
     Write-NewDurableUtf8 $RunRecordPath ($record | ConvertTo-Json -Depth 15)
     $runRecordWritten = $true
-    $persistedRecord = Get-Content -LiteralPath $RunRecordPath -Raw | ConvertFrom-Json
+    $persistedRecord =
+        Read-AstroUtf8FileLongPath $RunRecordPath | ConvertFrom-Json
     $persistedArguments = @($persistedRecord.arguments)
     $argumentsMatch = [int]$persistedRecord.argument_count -eq $argumentCount -and
         $persistedArguments.Count -eq $argumentCount
@@ -702,9 +756,11 @@ catch {
     $code = if ($failure.Exception.Data.Contains('AstroCode')) { [string]$failure.Exception.Data['AstroCode'] } else { 'ASTRO_FSV_RUN_INTERNAL' }
     $remediation = if ($failure.Exception.Data.Contains('AstroRemediation')) { [string]$failure.Exception.Data['AstroRemediation'] } else { 'preserve the evidence state, inspect the full error, repair the root cause, and retry from a fresh session' }
     if ($runRecordAuthorized -and -not $runRecordWritten -and $null -ne $child -and $child.HasExited -and
-        -not (Test-Path -LiteralPath $RunRecordPath)) {
+        -not (Test-AstroPathLongPath -LiteralPath $RunRecordPath)) {
         try {
-            $failureArtifactHash = if (Test-Path -LiteralPath $artifact -PathType Leaf) { File-Sha256 $artifact } else { $null }
+            $failureArtifactHash = if (
+                Test-AstroPathLongPath -LiteralPath $artifact -PathType Leaf
+            ) { File-Sha256 $artifact } else { $null }
             $failureRecord = [ordered]@{
                 schema = 'astrolabe.native-fsv-run.v1'
                 verdict = 'failed'
@@ -721,7 +777,7 @@ catch {
                 }
                 artifact = [ordered]@{
                     path = $artifact
-                    bytes = if (Test-Path -LiteralPath $artifact -PathType Leaf) { [uint64](Get-Item -LiteralPath $artifact).Length } else { 0 }
+                    bytes = if (Test-AstroPathLongPath -LiteralPath $artifact -PathType Leaf) { Get-AstroFileLengthLongPath $artifact } else { 0 }
                     sha256 = $failureArtifactHash
                     stable = $false
                 }
@@ -729,13 +785,13 @@ catch {
                 arguments = @($arguments)
                 stdout = [ordered]@{
                     path = $StandardOutputPath
-                    bytes = if (Test-Path -LiteralPath $StandardOutputPath -PathType Leaf) { [uint64](Get-Item -LiteralPath $StandardOutputPath).Length } else { 0 }
-                    sha256 = if (Test-Path -LiteralPath $StandardOutputPath -PathType Leaf) { File-Sha256 $StandardOutputPath } else { $null }
+                    bytes = if (Test-AstroPathLongPath -LiteralPath $StandardOutputPath -PathType Leaf) { Get-AstroFileLengthLongPath $StandardOutputPath } else { 0 }
+                    sha256 = if (Test-AstroPathLongPath -LiteralPath $StandardOutputPath -PathType Leaf) { File-Sha256 $StandardOutputPath } else { $null }
                 }
                 stderr = [ordered]@{
                     path = $StandardErrorPath
-                    bytes = if (Test-Path -LiteralPath $StandardErrorPath -PathType Leaf) { [uint64](Get-Item -LiteralPath $StandardErrorPath).Length } else { 0 }
-                    sha256 = if (Test-Path -LiteralPath $StandardErrorPath -PathType Leaf) { File-Sha256 $StandardErrorPath } else { $null }
+                    bytes = if (Test-AstroPathLongPath -LiteralPath $StandardErrorPath -PathType Leaf) { Get-AstroFileLengthLongPath $StandardErrorPath } else { 0 }
+                    sha256 = if (Test-AstroPathLongPath -LiteralPath $StandardErrorPath -PathType Leaf) { File-Sha256 $StandardErrorPath } else { $null }
                 }
                 failure = [ordered]@{
                     code = $code
@@ -766,14 +822,15 @@ finally {
         try { $childStillLive = -not $child.HasExited }
         catch { $childStillLive = $true }
     }
-    if ($fsvLockOwned -and -not $childStillLive -and (Test-Path -LiteralPath $fsvLockPath)) {
+    if ($fsvLockOwned -and -not $childStillLive -and
+        (Test-AstroPathLongPath -LiteralPath $fsvLockPath)) {
         $owned = $false
         try {
-            $lock = Get-Content -LiteralPath $fsvLockPath -Raw | ConvertFrom-Json
+            $lock = Read-AstroUtf8FileLongPath $fsvLockPath | ConvertFrom-Json
             $owned = [int]$lock.pid -eq $PID -and [string]$lock.artifact_sha256 -ceq $artifactHashBefore
         }
         catch { $owned = $false }
-        if ($owned) { Remove-Item -LiteralPath $fsvLockPath -Force }
+        if ($owned) { Remove-AstroFileLongPath $fsvLockPath }
         else { [Console]::Error.WriteLine('NATIVE_FSV[ASTRO_FSV_LOCK_IDENTITY_CHANGED]: refusing to remove FSV lock whose identity changed while the runner was live') }
     }
     elseif ($fsvLockOwned -and $childStillLive) {

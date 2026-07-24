@@ -115,6 +115,13 @@ public static class AstroLauncherLockNative
         uint flags
     );
 
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool CreateDirectoryW(
+        string pathName,
+        IntPtr securityAttributes
+    );
+
     [DllImport("kernel32.dll", SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
     private static extern bool GetFileInformationByHandleEx(
@@ -225,6 +232,20 @@ public static class AstroLauncherLockNative
             GetExtendedLengthPath(newFileName),
             flags
         );
+    }
+
+    public static void CreateDirectoryNoReplace(string path)
+    {
+        string full = System.IO.Path.GetFullPath(path);
+        if (!CreateDirectoryW(GetExtendedLengthPath(full), IntPtr.Zero))
+        {
+            int error = Marshal.GetLastWin32Error();
+            throw new Win32Exception(
+                error,
+                "CreateDirectoryW no-clobber failed (native_error=" + error + "): " +
+                full
+            );
+        }
     }
 
     public static string GetDirectoryIdentity(string path)
@@ -486,6 +507,49 @@ public static class AstroLauncherLockNative
             {
                 throw new InvalidOperationException(
                     "exact rename destination parent must be an ordinary non-reparse directory: " +
+                    path
+                );
+            }
+            return handle;
+        }
+        catch
+        {
+            handle.Dispose();
+            throw;
+        }
+    }
+
+    public static SafeFileHandle OpenExactDeleteDirectory(string path)
+    {
+        SafeFileHandle handle = CreateFileW(
+            GetExtendedLengthPath(path),
+            FILE_READ_ATTRIBUTES | FILE_TRAVERSE | DELETE_ACCESS,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            IntPtr.Zero,
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+            IntPtr.Zero
+        );
+        if (handle.IsInvalid)
+        {
+            int error = Marshal.GetLastWin32Error();
+            handle.Dispose();
+            throw new Win32Exception(
+                error,
+                "CreateFileW exact delete-directory lease failed (native_error=" +
+                error.ToString(CultureInfo.InvariantCulture) + "; path=" + path + ")"
+            );
+        }
+        try
+        {
+            RequireDiskHandle(handle, "exact delete directory");
+            BY_HANDLE_FILE_INFORMATION information =
+                ReadBasicInformation(handle, "exact delete directory");
+            if ((information.FileAttributes & FILE_ATTRIBUTE_DIRECTORY) == 0 ||
+                (information.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0)
+            {
+                throw new InvalidOperationException(
+                    "exact delete source must be an ordinary non-reparse directory: " +
                     path
                 );
             }
@@ -833,6 +897,42 @@ public static class AstroLauncherLockNative
         }
     }
 
+    public static void DeleteExactDirectoryHandle(SafeFileHandle directory)
+    {
+        BY_HANDLE_FILE_INFORMATION information =
+            ReadBasicInformation(directory, "exact disposition-delete directory");
+        if ((information.FileAttributes & FILE_ATTRIBUTE_DIRECTORY) == 0 ||
+            (information.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0)
+        {
+            throw new InvalidOperationException(
+                "exact disposition-delete source must remain an ordinary directory"
+            );
+        }
+        IntPtr disposition = Marshal.AllocHGlobal(1);
+        try
+        {
+            Marshal.WriteByte(disposition, 0, 1);
+            if (!SetFileInformationByHandle(
+                    directory,
+                    FILE_DISPOSITION_INFO_CLASS,
+                    disposition,
+                    1
+                ))
+            {
+                int error = Marshal.GetLastWin32Error();
+                throw new Win32Exception(
+                    error,
+                    "exact directory FILE_DISPOSITION_INFO delete failed; native_error=" +
+                    error.ToString(CultureInfo.InvariantCulture)
+                );
+            }
+        }
+        finally
+        {
+            Marshal.FreeHGlobal(disposition);
+        }
+    }
+
     private static JobObjectProcessIdProbe NewJobProbe(
         string name,
         string state,
@@ -1052,6 +1152,295 @@ public static class AstroLauncherLockNative
     }
 }
 '@
+}
+
+function ConvertTo-AstroExtendedLengthPath {
+    <#
+    Canonical display paths are the protocol/source-of-truth representation. The
+    extended-length prefix is added only at the .NET/Win32 I/O boundary because it
+    disables normal `.`/`..` parsing. This keeps containment comparisons readable
+    and makes every file operation independent of machine LongPathsEnabled state.
+    #>
+    param([Parameter(Mandatory)][string]$LiteralPath)
+
+    $displayPath = $LiteralPath
+    if ($displayPath.StartsWith('\\?\UNC\', [StringComparison]::OrdinalIgnoreCase)) {
+        $displayPath = '\\' + $displayPath.Substring(8)
+    }
+    elseif ($displayPath.StartsWith('\\?\', [StringComparison]::OrdinalIgnoreCase)) {
+        $displayPath = $displayPath.Substring(4)
+    }
+    $full = [IO.Path]::GetFullPath($displayPath)
+    if ($full.StartsWith('\\', [StringComparison]::Ordinal)) {
+        return '\\?\UNC\' + $full.Substring(2)
+    }
+    return '\\?\' + $full
+}
+
+function ConvertFrom-AstroExtendedLengthPath {
+    param([Parameter(Mandatory)][string]$LiteralPath)
+
+    if ($LiteralPath.StartsWith('\\?\UNC\', [StringComparison]::OrdinalIgnoreCase)) {
+        return [IO.Path]::GetFullPath(('\\' + $LiteralPath.Substring(8)))
+    }
+    if ($LiteralPath.StartsWith('\\?\', [StringComparison]::OrdinalIgnoreCase)) {
+        return [IO.Path]::GetFullPath($LiteralPath.Substring(4))
+    }
+    return [IO.Path]::GetFullPath($LiteralPath)
+}
+
+function New-AstroDirectoryLongPath {
+    param([Parameter(Mandatory)][string]$LiteralPath)
+
+    $full = [IO.Path]::GetFullPath($LiteralPath)
+    [IO.Directory]::CreateDirectory((ConvertTo-AstroExtendedLengthPath $full)) |
+        Out-Null
+    return $full
+}
+
+function New-AstroDirectoryNoClobberLongPath {
+    param([Parameter(Mandatory)][string]$LiteralPath)
+
+    $full = [IO.Path]::GetFullPath($LiteralPath)
+    [AstroLauncherLockNative]::CreateDirectoryNoReplace($full)
+    return $full
+}
+
+function Read-AstroUtf8FileLongPath {
+    param([Parameter(Mandatory)][string]$LiteralPath)
+
+    return [IO.File]::ReadAllText(
+        (ConvertTo-AstroExtendedLengthPath $LiteralPath),
+        [Text.UTF8Encoding]::new($false, $true)
+    )
+}
+
+function Get-AstroFileLengthLongPath {
+    param([Parameter(Mandatory)][string]$LiteralPath)
+
+    $stream = [IO.File]::Open(
+        (ConvertTo-AstroExtendedLengthPath $LiteralPath),
+        [IO.FileMode]::Open,
+        [IO.FileAccess]::Read,
+        [IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete
+    )
+    try { return [uint64]$stream.Length }
+    finally { $stream.Dispose() }
+}
+
+function Test-AstroPathLongPath {
+    param(
+        [Parameter(Mandatory)][string]$LiteralPath,
+        [ValidateSet('Any', 'Leaf', 'Container')]
+        [string]$PathType = 'Any'
+    )
+
+    $state = Get-AstroPathEntryState $LiteralPath
+    if ($state.State -ceq 'absent') { return $false }
+    if ($state.State -cne 'present') {
+        throw "path presence is unevaluable (error=$($state.Error)): $([IO.Path]::GetFullPath($LiteralPath))"
+    }
+    $isDirectory =
+        ($state.Attributes -band [IO.FileAttributes]::Directory) -ne 0
+    switch ($PathType) {
+        'Leaf' { return -not $isDirectory }
+        'Container' { return $isDirectory }
+        default { return $true }
+    }
+}
+
+function Get-AstroFileInfoLongPath {
+    param([Parameter(Mandatory)][string]$LiteralPath)
+
+    $full = [IO.Path]::GetFullPath($LiteralPath)
+    $attributes = [IO.File]::GetAttributes(
+        (ConvertTo-AstroExtendedLengthPath $full)
+    )
+    if (($attributes -band [IO.FileAttributes]::Directory) -ne 0) {
+        throw "expected an ordinary file but observed a directory: $full"
+    }
+    return [pscustomobject]@{
+        FullName = $full
+        Name = [IO.Path]::GetFileName($full)
+        Attributes = $attributes
+        Length = Get-AstroFileLengthLongPath $full
+        IsReadOnly =
+            ($attributes -band [IO.FileAttributes]::ReadOnly) -ne 0
+    }
+}
+
+function Set-AstroFileReadOnlyLongPath {
+    param(
+        [Parameter(Mandatory)][string]$LiteralPath,
+        [Parameter(Mandatory)][bool]$ReadOnly
+    )
+
+    $native = ConvertTo-AstroExtendedLengthPath $LiteralPath
+    $attributes = [IO.File]::GetAttributes($native)
+    $updated = if ($ReadOnly) {
+        $attributes -bor [IO.FileAttributes]::ReadOnly
+    }
+    else {
+        $attributes -band (-bnot [IO.FileAttributes]::ReadOnly)
+    }
+    [IO.File]::SetAttributes($native, $updated)
+}
+
+function Get-AstroDirectoryEntriesLongPath {
+    param([Parameter(Mandatory)][string]$LiteralPath)
+
+    $directory = [IO.Path]::GetFullPath($LiteralPath)
+    [string[]]$nativeEntries = [IO.Directory]::GetFileSystemEntries(
+        (ConvertTo-AstroExtendedLengthPath $directory)
+    )
+    $entries = [Collections.Generic.List[object]]::new()
+    foreach ($nativeEntry in $nativeEntries) {
+        $full = ConvertFrom-AstroExtendedLengthPath $nativeEntry
+        $attributes = [IO.File]::GetAttributes(
+            (ConvertTo-AstroExtendedLengthPath $full)
+        )
+        $isDirectory =
+            ($attributes -band [IO.FileAttributes]::Directory) -ne 0
+        $length = if ($isDirectory) {
+            $null
+        }
+        else {
+            Get-AstroFileLengthLongPath $full
+        }
+        $entries.Add([pscustomobject]@{
+            Name = [IO.Path]::GetFileName($full)
+            FullName = $full
+            Attributes = $attributes
+            PSIsContainer = $isDirectory
+            Length = $length
+            IsReadOnly =
+                ($attributes -band [IO.FileAttributes]::ReadOnly) -ne 0
+        })
+    }
+    return @($entries | Sort-Object Name)
+}
+
+function Remove-AstroFileLongPath {
+    param(
+        [Parameter(Mandatory)][string]$LiteralPath,
+        [switch]$ClearReadOnly
+    )
+
+    $native = ConvertTo-AstroExtendedLengthPath $LiteralPath
+    if ($ClearReadOnly) {
+        $attributes = [IO.File]::GetAttributes($native)
+        if (($attributes -band [IO.FileAttributes]::ReadOnly) -ne 0) {
+            [IO.File]::SetAttributes(
+                $native,
+                $attributes -band (-bnot [IO.FileAttributes]::ReadOnly)
+            )
+        }
+    }
+    $full = [IO.Path]::GetFullPath($LiteralPath)
+    $handle = [AstroLauncherLockNative]::OpenExactRenameSource($full)
+    try {
+        $final = ConvertFrom-AstroNativeFinalPath (
+            [AstroLauncherLockNative]::GetFileFinalPath($handle)
+        )
+        if (-not [string]::Equals(
+                $final,
+                $full,
+                [StringComparison]::OrdinalIgnoreCase
+            )) {
+            throw "exact file-delete lease resolved to '$final', expected '$full'"
+        }
+        [AstroLauncherLockNative]::DeleteExactFileHandle($handle)
+    }
+    finally {
+        $handle.Dispose()
+    }
+    $terminal = Get-AstroPathEntryState $full
+    if ($terminal.State -cne 'absent') {
+        throw "exact file delete did not reach absence (state=$($terminal.State), error=$($terminal.Error)): $full"
+    }
+}
+
+function Remove-AstroEmptyDirectoryLongPath {
+    param([Parameter(Mandatory)][string]$LiteralPath)
+
+    $full = [IO.Path]::GetFullPath($LiteralPath)
+    $handle = [AstroLauncherLockNative]::OpenExactDeleteDirectory($full)
+    try {
+        $final = ConvertFrom-AstroNativeFinalPath (
+            [AstroLauncherLockNative]::GetFileFinalPath($handle)
+        )
+        if (-not [string]::Equals(
+                $final.TrimEnd('\', '/'),
+                $full.TrimEnd('\', '/'),
+                [StringComparison]::OrdinalIgnoreCase
+            )) {
+            throw "exact empty-directory delete lease resolved to '$final', expected '$full'"
+        }
+        if (@(Get-AstroDirectoryEntriesLongPath $full).Count -ne 0) {
+            throw "exact empty-directory delete source is not empty: $full"
+        }
+        [AstroLauncherLockNative]::DeleteExactDirectoryHandle($handle)
+    }
+    finally {
+        $handle.Dispose()
+    }
+    $terminal = Get-AstroPathEntryState $full
+    if ($terminal.State -cne 'absent') {
+        throw "exact empty-directory delete did not reach absence (state=$($terminal.State), error=$($terminal.Error)): $full"
+    }
+}
+
+function Remove-AstroOrdinaryFlatDirectoryLongPath {
+    <#
+    Native-FSV session directories are intentionally flat. Refuse nested or
+    redirected state instead of following it, clear only ReadOnly on ordinary
+    files, then remove the now-empty directory. Lifecycle callers remain
+    responsible for proving the session may be mutated.
+    #>
+    param([Parameter(Mandatory)][string]$LiteralPath)
+
+    $full = [IO.Path]::GetFullPath($LiteralPath)
+    $rootState = Get-AstroPathEntryState $full
+    if ($rootState.State -ceq 'absent') { return }
+    if ($rootState.State -cne 'present' -or
+        ($rootState.Attributes -band [IO.FileAttributes]::Directory) -eq 0 -or
+        ($rootState.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw "long-path flat-directory removal requires one ordinary directory (state=$($rootState.State), attributes=$($rootState.Attributes), error=$($rootState.Error)): $full"
+    }
+    $handle = [AstroLauncherLockNative]::OpenExactDeleteDirectory($full)
+    try {
+        $final = ConvertFrom-AstroNativeFinalPath (
+            [AstroLauncherLockNative]::GetFileFinalPath($handle)
+        )
+        if (-not [string]::Equals(
+                $final.TrimEnd('\', '/'),
+                $full.TrimEnd('\', '/'),
+                [StringComparison]::OrdinalIgnoreCase
+            )) {
+            throw "exact flat-directory delete lease resolved to '$final', expected '$full'"
+        }
+        $entries = @(Get-AstroDirectoryEntriesLongPath $full)
+        foreach ($entry in $entries) {
+            if ($entry.PSIsContainer -or
+                ($entry.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+                throw "long-path flat-directory removal refuses nested/reparse entry: $($entry.FullName)"
+            }
+        }
+        foreach ($entry in $entries) {
+            Remove-AstroFileLongPath -LiteralPath $entry.FullName -ClearReadOnly
+        }
+        if (@(Get-AstroDirectoryEntriesLongPath $full).Count -ne 0) {
+            throw "exact flat-directory delete source changed or remained nonempty: $full"
+        }
+        [AstroLauncherLockNative]::DeleteExactDirectoryHandle($handle)
+    }
+    finally {
+        $handle.Dispose()
+    }
+    $terminal = Get-AstroPathEntryState $full
+    if ($terminal.State -cne 'absent') {
+        throw "exact flat-directory delete did not reach absence (state=$($terminal.State), error=$($terminal.Error)): $full"
+    }
 }
 
 $script:AstroLauncherLockMaxBytes = 65536
@@ -1871,7 +2260,9 @@ function Get-AstroPathEntryState {
     param([Parameter(Mandatory)][string]$LiteralPath)
 
     try {
-        $attributes = [IO.File]::GetAttributes([IO.Path]::GetFullPath($LiteralPath))
+        $attributes = [IO.File]::GetAttributes(
+            (ConvertTo-AstroExtendedLengthPath $LiteralPath)
+        )
         return [pscustomobject]@{
             State = 'present'
             Attributes = $attributes
@@ -1902,7 +2293,7 @@ function Get-AstroFileSnapshot {
     $full = [IO.Path]::GetFullPath($LiteralPath)
     try {
         $stream = [IO.File]::Open(
-            $full,
+            (ConvertTo-AstroExtendedLengthPath $full),
             [IO.FileMode]::Open,
             [IO.FileAccess]::Read,
             $Share
@@ -2205,7 +2596,7 @@ function Get-AstroLauncherLockTransitions {
     try {
         $temporaryDirectoryAliases = @(
             [IO.Directory]::EnumerateFileSystemEntries(
-                $root,
+                (ConvertTo-AstroExtendedLengthPath $root),
                 '*',
                 [IO.SearchOption]::TopDirectoryOnly
             ) | Where-Object {
@@ -2280,20 +2671,21 @@ function Get-AstroLauncherLockTransitions {
         $items = [Collections.Generic.List[object]]::new()
         $activePaths = [Collections.Generic.List[string]]::new()
         foreach ($entry in [IO.Directory]::EnumerateFileSystemEntries(
-                $directory,
+                (ConvertTo-AstroExtendedLengthPath $directory),
                 '*',
                 [IO.SearchOption]::TopDirectoryOnly
             )) {
-            $leaf = [IO.Path]::GetFileName($entry)
+            $entryFull = ConvertFrom-AstroExtendedLengthPath $entry
+            $leaf = [IO.Path]::GetFileName($entryFull)
             if ([string]::Equals(
                     $leaf,
                     $prefix,
                     [StringComparison]::OrdinalIgnoreCase
                 )) {
-                $activePaths.Add([IO.Path]::GetFullPath($entry))
+                $activePaths.Add($entryFull)
                 continue
             }
-            $parsed = ConvertTo-AstroLauncherTransitionState $entry
+            $parsed = ConvertTo-AstroLauncherTransitionState $entryFull
             if ($parsed.Candidate) {
                 $items.Add($parsed)
             }

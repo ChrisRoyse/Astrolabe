@@ -84,9 +84,14 @@ function Assert-NotReparseEntry {
         [Parameter(Mandatory)][string]$Path,
         [Parameter(Mandatory)][string]$Description
     )
-    if (-not (Test-Path -LiteralPath $Path)) { return }
-    $item = Get-Item -LiteralPath $Path -Force
-    if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+    $state = Get-AstroPathEntryState $Path
+    if ($state.State -ceq 'absent') { return }
+    if ($state.State -cne 'present') {
+        Fail-Astro 'ASTRO_FSV_PATH_UNEVALUABLE' `
+            "$Description presence/attributes are unevaluable: $Path ($($state.Error))" `
+            'repair filesystem access before mutating evidence state'
+    }
+    if (($state.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
         Fail-Astro 'ASTRO_FSV_REPARSE_ENTRY_REFUSED' "$Description is a reparse point: $Path" `
             'use ordinary workspace-local files and directories; evidence paths may not redirect elsewhere'
     }
@@ -94,7 +99,12 @@ function Assert-NotReparseEntry {
 
 function File-Sha256 {
     param([Parameter(Mandatory)][string]$Path)
-    $stream = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+    $stream = [IO.File]::Open(
+        (ConvertTo-AstroExtendedLengthPath $Path),
+        [IO.FileMode]::Open,
+        [IO.FileAccess]::Read,
+        [IO.FileShare]::Read
+    )
     $hasher = [Security.Cryptography.SHA256]::Create()
     try {
         return ([BitConverter]::ToString($hasher.ComputeHash($stream)) -replace '-', '').ToLowerInvariant()
@@ -165,7 +175,12 @@ function Write-NewDurableUtf8 {
     )
     $encoding = [Text.UTF8Encoding]::new($false)
     $bytes = $encoding.GetBytes($Content)
-    $stream = [IO.File]::Open($Path, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+    $stream = [IO.File]::Open(
+        (ConvertTo-AstroExtendedLengthPath $Path),
+        [IO.FileMode]::CreateNew,
+        [IO.FileAccess]::Write,
+        [IO.FileShare]::None
+    )
     try {
         $stream.Write($bytes, 0, $bytes.Length)
         $stream.Flush($true)
@@ -180,8 +195,18 @@ function Copy-FileDurable {
         [Parameter(Mandatory)][string]$Source,
         [Parameter(Mandatory)][string]$Destination
     )
-    $input = [IO.File]::Open($Source, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
-    $output = [IO.File]::Open($Destination, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+    $input = [IO.File]::Open(
+        (ConvertTo-AstroExtendedLengthPath $Source),
+        [IO.FileMode]::Open,
+        [IO.FileAccess]::Read,
+        [IO.FileShare]::Read
+    )
+    $output = [IO.File]::Open(
+        (ConvertTo-AstroExtendedLengthPath $Destination),
+        [IO.FileMode]::CreateNew,
+        [IO.FileAccess]::Write,
+        [IO.FileShare]::None
+    )
     try {
         $input.CopyTo($output)
         $output.Flush($true)
@@ -204,10 +229,24 @@ public static class AstroFsvPublish {
     [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
     static extern bool MoveFileExW(string existingName, string newName, uint flags);
 
+    static string Extended(string path) {
+        string full = System.IO.Path.GetFullPath(path);
+        if (full.StartsWith(@"\\?\", StringComparison.Ordinal))
+            return full;
+        if (full.StartsWith(@"\\", StringComparison.Ordinal))
+            return @"\\?\UNC\" + full.Substring(2);
+        return @"\\?\" + full;
+    }
+
     public static void PublishDirectory(string source, string destination) {
-        if (!MoveFileExW(source, destination, MOVEFILE_WRITE_THROUGH))
-            throw new Win32Exception(Marshal.GetLastWin32Error(),
-                "write-through no-clobber evidence-directory publication failed");
+        if (!MoveFileExW(Extended(source), Extended(destination),
+                MOVEFILE_WRITE_THROUGH)) {
+            int error = Marshal.GetLastWin32Error();
+            throw new Win32Exception(error,
+                "MoveFileExW write-through no-clobber evidence-directory publication failed " +
+                "(native_error=" + error + "; source=" + source +
+                "; destination=" + destination + ")");
+        }
     }
 }
 '@
@@ -223,11 +262,11 @@ function Read-Receipt {
             'pass the receipt.json path emitted by the Stage operation'
     }
     $full = Assert-PathWithin $Path $EvidenceRoot 'ASTRO_FSV_RECEIPT_ESCAPE' 'receipt path'
-    if (-not (Test-Path -LiteralPath $full -PathType Leaf)) {
+    if (-not (Test-AstroPathLongPath -LiteralPath $full -PathType Leaf)) {
         Fail-Astro 'ASTRO_FSV_RECEIPT_MISSING' "evidence receipt does not exist: $full" `
             'stage the native artifact first and pass its exact persisted receipt path'
     }
-    try { $receipt = Get-Content -LiteralPath $full -Raw | ConvertFrom-Json }
+    try { $receipt = Read-AstroUtf8FileLongPath $full | ConvertFrom-Json }
     catch {
         Fail-Astro 'ASTRO_FSV_RECEIPT_INVALID' "parse evidence receipt '$full' failed: $($_.Exception.Message)" `
             'discard the incomplete evidence session and stage the artifact again'
@@ -266,12 +305,12 @@ function Inspect-ReceiptArtifact {
     }
     $artifact = Assert-PathWithin ([string]$receipt.artifact.path) $sessionDirectory `
         'ASTRO_FSV_ARTIFACT_ESCAPE' 'staged artifact path'
-    if (-not (Test-Path -LiteralPath $artifact -PathType Leaf)) {
+    if (-not (Test-AstroPathLongPath -LiteralPath $artifact -PathType Leaf)) {
         Fail-Astro 'ASTRO_FSV_ARTIFACT_MISSING' "staged native artifact is absent: $artifact" `
             'treat this evidence session as invalid and stage a fresh artifact'
     }
     Assert-NotReparseEntry $artifact 'staged native artifact'
-    $item = Get-Item -LiteralPath $artifact
+    $item = Get-AstroFileInfoLongPath $artifact
     $hash = File-Sha256 $artifact
     if ([uint64]$item.Length -ne [uint64]$receipt.artifact.bytes -or
         $hash -cne ([string]$receipt.artifact.sha256).ToLowerInvariant()) {
@@ -294,8 +333,8 @@ function Inspect-ReceiptArtifact {
 
 function Assert-FsvLockAbsent {
     param([Parameter(Mandatory)][string]$LockPath)
-    if (-not (Test-Path -LiteralPath $LockPath)) { return }
-    $rawLock = Get-Content -LiteralPath $LockPath -Raw -ErrorAction SilentlyContinue
+    if (-not (Test-AstroPathLongPath -LiteralPath $LockPath)) { return }
+    $rawLock = try { Read-AstroUtf8FileLongPath $LockPath } catch { $null }
     $lockState = $null
     try { $lockState = $rawLock | ConvertFrom-Json } catch { }
     $ownerPid = 0
@@ -344,9 +383,10 @@ function Read-PositivePid {
 function Get-SessionFileInventory {
     param([Parameter(Mandatory)][string]$Session)
     $inventory = @()
-    foreach ($entry in @(Get-ChildItem -LiteralPath $Session -Force | Sort-Object Name)) {
+    foreach ($entry in @(Get-AstroDirectoryEntriesLongPath $Session)) {
         Assert-NotReparseEntry $entry.FullName "evidence session entry '$($entry.Name)'"
-        if (-not $entry.PSIsContainer -and -not (Test-Path -LiteralPath $entry.FullName -PathType Leaf)) {
+        if (-not $entry.PSIsContainer -and
+            -not (Test-AstroPathLongPath -LiteralPath $entry.FullName -PathType Leaf)) {
             Fail-Astro 'ASTRO_FSV_QUARANTINE_ENTRY_INVALID' "evidence session entry is not an ordinary file: $($entry.FullName)" 'preserve the session and investigate its filesystem identity'
         }
         if ($entry.PSIsContainer) {
@@ -362,6 +402,20 @@ function Get-SessionFileInventory {
         }
     }
     return $inventory
+}
+
+function Remove-EmptyEvidenceParents {
+    param([Parameter(Mandatory)][string]$Session)
+
+    foreach ($parent in @(
+            (Split-Path -Parent $Session),
+            (Split-Path -Parent (Split-Path -Parent $Session))
+        )) {
+        if ((Test-AstroPathLongPath -LiteralPath $parent -PathType Container) -and
+            @(Get-AstroDirectoryEntriesLongPath $parent).Count -eq 0) {
+            Remove-AstroEmptyDirectoryLongPath $parent
+        }
+    }
 }
 
 $workspace = [IO.Path]::GetFullPath((Split-Path -Parent $PSScriptRoot))
@@ -393,12 +447,11 @@ try {
                     'pass the exact native artifact emitted below the launcher-owned target root'
             }
             $source = [IO.Path]::GetFullPath($SourcePath)
-            if (-not (Test-Path -LiteralPath $source -PathType Leaf)) {
+            if (-not (Test-AstroPathLongPath -LiteralPath $source -PathType Leaf)) {
                 Fail-Astro 'ASTRO_FSV_SOURCE_MISSING' "native build artifact does not exist: $source" `
                     'build the real native artifact successfully before staging it'
             }
             Assert-NotReparseEntry $source 'native build artifact'
-            $source = (Resolve-Path -LiteralPath $source -ErrorAction Stop).Path
             $ownedTargets = @(
                 (Join-Path $workspace 'target'),
                 (Join-Path $workspace 'calyx\target')
@@ -416,7 +469,7 @@ try {
                     "native artifact '$source' is outside the launcher-owned Cargo target roots" `
                     'stage only a real artifact emitted under workspace target/ by the native launcher'
             }
-            if (-not (Test-Path -LiteralPath $gitExe -PathType Leaf)) {
+            if (-not (Test-AstroPathLongPath -LiteralPath $gitExe -PathType Leaf)) {
                 Fail-Astro 'ASTRO_FSV_GIT_MISSING' "required native Git executable is absent: $gitExe" `
                     'restore the canonical Git for Windows installation before staging evidence'
             }
@@ -455,10 +508,10 @@ try {
             }
 
             $sourceHashBefore = File-Sha256 $source
-            $sourceItem = Get-Item -LiteralPath $source
+            $sourceItem = Get-AstroFileInfoLongPath $source
             $hashParent = Join-Path (Join-Path $evidenceRoot $TreeSha) $sourceHashBefore
             $finalDirectory = Join-Path $hashParent $SessionId
-            if (Test-Path -LiteralPath $finalDirectory) {
+            if (Test-AstroPathLongPath -LiteralPath $finalDirectory) {
                 Fail-Astro 'ASTRO_FSV_STAGE_REUSE_REFUSED' "evidence session already exists: $finalDirectory" `
                     'use a fresh SessionId; evidence sessions are immutable and never overwritten'
             }
@@ -466,10 +519,10 @@ try {
             Assert-NotReparseEntry $evidenceRoot 'evidence root'
             Assert-NotReparseEntry (Join-Path $evidenceRoot $TreeSha) 'evidence tree directory'
             Assert-NotReparseEntry $hashParent 'evidence hash directory'
-            New-Item -ItemType Directory -Path $hashParent -Force | Out-Null
+            New-AstroDirectoryLongPath $hashParent | Out-Null
             Assert-NotReparseEntry $hashParent 'evidence hash directory'
             $publishingDirectory = Join-Path $hashParent (".$SessionId.publishing-$PID-" + [guid]::NewGuid().ToString('N'))
-            New-Item -ItemType Directory -Path $publishingDirectory -ErrorAction Stop | Out-Null
+            New-AstroDirectoryNoClobberLongPath $publishingDirectory | Out-Null
             $published = $false
             try {
                 $artifactName = [IO.Path]::GetFileName($source)
@@ -477,14 +530,14 @@ try {
                 Copy-FileDurable $source $staged
                 $sourceHashAfter = File-Sha256 $source
                 $stagedHash = File-Sha256 $staged
-                $stagedItem = Get-Item -LiteralPath $staged
+                $stagedItem = Get-AstroFileInfoLongPath $staged
                 if ($sourceHashBefore -cne $sourceHashAfter -or $sourceHashBefore -cne $stagedHash -or
                     [uint64]$sourceItem.Length -ne [uint64]$stagedItem.Length) {
                     Fail-Astro 'ASTRO_FSV_STAGE_COPY_MISMATCH' `
                         "source/staged bytes changed during promotion: source_before=$sourceHashBefore source_after=$sourceHashAfter staged=$stagedHash" `
                         'discard the partial publication, stop the writer, and rebuild from a frozen tree'
                 }
-                $stagedItem.IsReadOnly = $true
+                Set-AstroFileReadOnlyLongPath -LiteralPath $staged -ReadOnly $true
                 $finalArtifact = Join-Path $finalDirectory $artifactName
                 $receipt = [ordered]@{
                     schema = 'astrolabe.native-fsv-artifact.v1'
@@ -506,8 +559,9 @@ try {
                 Assert-NotReparseEntry $finalDirectory 'published evidence session directory'
             }
             finally {
-                if (-not $published -and (Test-Path -LiteralPath $publishingDirectory)) {
-                    Remove-Item -LiteralPath $publishingDirectory -Recurse -Force -ErrorAction SilentlyContinue
+                if (-not $published -and
+                    (Test-AstroPathLongPath -LiteralPath $publishingDirectory)) {
+                    Remove-AstroOrdinaryFlatDirectoryLongPath $publishingDirectory
                 }
             }
             $receiptState = Read-Receipt (Join-Path $finalDirectory 'receipt.json') $evidenceRoot
@@ -545,7 +599,7 @@ try {
             }
             $abandonRecord = Assert-PathWithin $AbandonRecordPath $abandonRoot `
                 'ASTRO_FSV_ABANDON_RECORD_ESCAPE' 'abandonment record path'
-            if (Test-Path -LiteralPath $abandonRecord) {
+            if (Test-AstroPathLongPath -LiteralPath $abandonRecord) {
                 Fail-Astro 'ASTRO_FSV_ABANDON_RECORD_REUSE_REFUSED' "abandonment record already exists: $abandonRecord" `
                     'use one fresh append-only record path for each never-run evidence session'
             }
@@ -574,15 +628,12 @@ try {
                 [IO.Path]::GetFullPath($receiptState.Path),
                 [IO.Path]::GetFullPath($inspection.artifact_path)
             )
-            $unexpectedEntries = @(
-                Get-ChildItem -LiteralPath $session -Force |
-                    Where-Object {
-                        $full = [IO.Path]::GetFullPath($_.FullName)
-                        -not ($allowedEntries -contains $full)
-                    } |
-                    ForEach-Object { $_.FullName }
-            )
-            if ($unexpectedEntries.Count -gt 0 -or @(Get-ChildItem -LiteralPath $session -Force).Count -ne 2) {
+            $sessionEntries = @(Get-AstroDirectoryEntriesLongPath $session)
+            $unexpectedEntries = @($sessionEntries | Where-Object {
+                $full = [IO.Path]::GetFullPath($_.FullName)
+                -not ($allowedEntries -contains $full)
+            } | ForEach-Object { $_.FullName })
+            if ($unexpectedEntries.Count -gt 0 -or $sessionEntries.Count -ne 2) {
                 Fail-Astro 'ASTRO_FSV_ABANDON_NONPRISTINE' `
                     "session contains state beyond its never-run artifact and receipt: $($unexpectedEntries -join ', ')" `
                     'preserve the session; inspect the partial/live run state and use Cleanup only with a valid bound run record'
@@ -590,7 +641,7 @@ try {
             Assert-NotReparseEntry $abandonRoot 'abandonment record root'
             $recordParent = Split-Path -Parent $abandonRecord
             Assert-NotReparseEntry $recordParent 'abandonment record parent'
-            New-Item -ItemType Directory -Path $recordParent -Force | Out-Null
+            New-AstroDirectoryLongPath $recordParent | Out-Null
             Assert-NotReparseEntry $recordParent 'abandonment record parent'
             $currentRepository = Get-RepoState -GitExe $gitExe -Workspace $workspace
             $record = [ordered]@{
@@ -615,7 +666,8 @@ try {
                 }
             }
             Write-NewDurableUtf8 $abandonRecord ($record | ConvertTo-Json -Depth 15)
-            $persistedRecord = Get-Content -LiteralPath $abandonRecord -Raw | ConvertFrom-Json
+            $persistedRecord =
+                Read-AstroUtf8FileLongPath $abandonRecord | ConvertFrom-Json
             if ($persistedRecord.schema -ne 'astrolabe.native-fsv-abandon.v1' -or
                 [string]$persistedRecord.artifact.sha256 -cne [string]$inspection.sha256 -or
                 [string]$persistedRecord.failure.code -cne $ReasonCode) {
@@ -631,19 +683,14 @@ try {
                 receipt_owner_pids = @($ownerPids | ForEach-Object { [int]$_ })
                 owner_pids_live = @()
             }
-            $artifactItem = Get-Item -LiteralPath $inspection.artifact_path
-            $artifactItem.IsReadOnly = $false
-            Remove-Item -LiteralPath $session -Recurse -Force
-            if (Test-Path -LiteralPath $session) {
+            Set-AstroFileReadOnlyLongPath `
+                -LiteralPath $inspection.artifact_path -ReadOnly $false
+            Remove-AstroOrdinaryFlatDirectoryLongPath $session
+            if (Test-AstroPathLongPath -LiteralPath $session) {
                 Fail-Astro 'ASTRO_FSV_ABANDON_FAILED' "evidence session remains after abandonment: $session" `
                     'preserve the external abandonment record and inspect open handles before retrying exact cleanup'
             }
-            foreach ($parent in @((Split-Path -Parent $session), (Split-Path -Parent (Split-Path -Parent $session)))) {
-                if ((Test-Path -LiteralPath $parent -PathType Container) -and
-                    @(Get-ChildItem -LiteralPath $parent -Force).Count -eq 0) {
-                    Remove-Item -LiteralPath $parent -Force
-                }
-            }
+            Remove-EmptyEvidenceParents $session
             [ordered]@{
                 operation = 'abandon'
                 record_path = $abandonRecord
@@ -677,7 +724,7 @@ try {
             }
             $recoveryRecord = Assert-PathWithin $RecoveryRecordPath $recoveryRoot `
                 'ASTRO_FSV_QUARANTINE_RECORD_ESCAPE' 'recovery record path'
-            if (Test-Path -LiteralPath $recoveryRecord) {
+            if (Test-AstroPathLongPath -LiteralPath $recoveryRecord) {
                 Fail-Astro 'ASTRO_FSV_QUARANTINE_RECORD_REUSE_REFUSED' "recovery record already exists: $recoveryRecord" `
                     'use one fresh append-only recovery record path for each terminal partial session'
             }
@@ -687,12 +734,15 @@ try {
             }
             $liveStateFile = Assert-PathWithin $LiveStatePath $inspection.session_directory `
                 'ASTRO_FSV_QUARANTINE_LIVE_STATE_ESCAPE' 'live-state path'
-            if (-not (Test-Path -LiteralPath $liveStateFile -PathType Leaf)) {
+            if (-not (Test-AstroPathLongPath -LiteralPath $liveStateFile -PathType Leaf)) {
                 Fail-Astro 'ASTRO_FSV_QUARANTINE_LIVE_STATE_MISSING' "live-state file does not exist: $liveStateFile" `
                     'pristine never-run sessions use Abandon; preserve any unexplained nonpristine session'
             }
             Assert-NotReparseEntry $liveStateFile 'native FSV live-state file'
-            try { $liveState = Get-Content -LiteralPath $liveStateFile -Raw | ConvertFrom-Json }
+            try {
+                $liveState =
+                    Read-AstroUtf8FileLongPath $liveStateFile | ConvertFrom-Json
+            }
             catch {
                 Fail-Astro 'ASTRO_FSV_QUARANTINE_LIVE_STATE_INVALID' "parse live-state '$liveStateFile' failed: $($_.Exception.Message)" `
                     'preserve the session and investigate its incomplete process provenance'
@@ -738,11 +788,13 @@ try {
             $expectedRunRecord = Assert-PathWithin $RunRecordPath $inspection.session_directory `
                 'ASTRO_FSV_QUARANTINE_RUN_RECORD_ESCAPE' 'expected run-record path'
             $runRecordState = 'missing'
-            if (Test-Path -LiteralPath $expectedRunRecord -PathType Leaf) {
+            if (Test-AstroPathLongPath -LiteralPath $expectedRunRecord -PathType Leaf) {
                 Assert-NotReparseEntry $expectedRunRecord 'native FSV run record'
                 $runRecordState = 'invalid'
                 try {
-                    $candidateRecord = Get-Content -LiteralPath $expectedRunRecord -Raw | ConvertFrom-Json
+                    $candidateRecord =
+                        Read-AstroUtf8FileLongPath $expectedRunRecord |
+                            ConvertFrom-Json
                     if ($candidateRecord.schema -eq 'astrolabe.native-fsv-run.v1' -and
                         [int]$candidateRecord.issue -eq [int]$inspection.issue -and
                         [string]::Equals([IO.Path]::GetFullPath([string]$candidateRecord.receipt_path), $receiptState.Path, [StringComparison]::OrdinalIgnoreCase) -and
@@ -785,7 +837,7 @@ try {
             }
             Assert-NotReparseEntry $recoveryRoot 'recovery record root'
             $recordParent = Split-Path -Parent $recoveryRecord
-            New-Item -ItemType Directory -Path $recordParent -Force | Out-Null
+            New-AstroDirectoryLongPath $recordParent | Out-Null
             Assert-NotReparseEntry $recordParent 'recovery record parent'
             $currentRepository = Get-RepoState -GitExe $gitExe -Workspace $workspace
             $record = [ordered]@{
@@ -821,7 +873,8 @@ try {
                 }
             }
             Write-NewDurableUtf8 $recoveryRecord ($record | ConvertTo-Json -Depth 20)
-            $persistedRecord = Get-Content -LiteralPath $recoveryRecord -Raw | ConvertFrom-Json
+            $persistedRecord =
+                Read-AstroUtf8FileLongPath $recoveryRecord | ConvertFrom-Json
             if ($persistedRecord.schema -ne 'astrolabe.native-fsv-recovery.v1' -or
                 $persistedRecord.verdict -ne 'quarantined-unverified-run' -or
                 [string]$persistedRecord.artifact.sha256 -cne [string]$inspection.sha256 -or
@@ -840,20 +893,12 @@ try {
                 owner_pids = @($ownerPids | ForEach-Object { [int]$_ })
                 owner_pids_live = @()
             }
-            foreach ($entry in @(Get-ChildItem -LiteralPath $session -File -Force)) {
-                if ($entry.IsReadOnly) { $entry.IsReadOnly = $false }
-            }
-            Remove-Item -LiteralPath $session -Recurse -Force
-            if (Test-Path -LiteralPath $session) {
+            Remove-AstroOrdinaryFlatDirectoryLongPath $session
+            if (Test-AstroPathLongPath -LiteralPath $session) {
                 Fail-Astro 'ASTRO_FSV_QUARANTINE_FAILED' "evidence session remains after quarantine: $session" `
                     'preserve the external recovery record and inspect open handles before retrying exact cleanup'
             }
-            foreach ($parent in @((Split-Path -Parent $session), (Split-Path -Parent (Split-Path -Parent $session)))) {
-                if ((Test-Path -LiteralPath $parent -PathType Container) -and
-                    @(Get-ChildItem -LiteralPath $parent -Force).Count -eq 0) {
-                    Remove-Item -LiteralPath $parent -Force
-                }
-            }
+            Remove-EmptyEvidenceParents $session
             [ordered]@{
                 operation = 'quarantine'
                 record_path = $recoveryRecord
@@ -873,11 +918,13 @@ try {
             }
             $runRecord = Assert-PathWithin $RunRecordPath $inspection.session_directory `
                 'ASTRO_FSV_RUN_RECORD_ESCAPE' 'run record path'
-            if (-not (Test-Path -LiteralPath $runRecord -PathType Leaf)) {
+            if (-not (Test-AstroPathLongPath -LiteralPath $runRecord -PathType Leaf)) {
                 Fail-Astro 'ASTRO_FSV_RUN_RECORD_MISSING' "run record does not exist: $runRecord" `
                     'complete the real staged-artifact run and persist its readback before cleanup'
             }
-            try { $record = Get-Content -LiteralPath $runRecord -Raw | ConvertFrom-Json }
+            try {
+                $record = Read-AstroUtf8FileLongPath $runRecord | ConvertFrom-Json
+            }
             catch {
                 Fail-Astro 'ASTRO_FSV_RUN_RECORD_INVALID' "parse run record '$runRecord' failed: $($_.Exception.Message)" `
                     'preserve the evidence directory and investigate the incomplete run'
@@ -900,20 +947,21 @@ try {
                     'wait for the exact recorded process to exit; never clean a live process artifact'
             }
             $session = [IO.Path]::GetFullPath($inspection.session_directory)
-            $before = [ordered]@{ session = $session; exists = Test-Path -LiteralPath $session; artifact_sha256 = $inspection.sha256; child_pid = $childPid; child_live = $false }
-            $artifactItem = Get-Item -LiteralPath $inspection.artifact_path
-            $artifactItem.IsReadOnly = $false
-            Remove-Item -LiteralPath $session -Recurse -Force
-            if (Test-Path -LiteralPath $session) {
+            $before = [ordered]@{
+                session = $session
+                exists = Test-AstroPathLongPath -LiteralPath $session
+                artifact_sha256 = $inspection.sha256
+                child_pid = $childPid
+                child_live = $false
+            }
+            Set-AstroFileReadOnlyLongPath `
+                -LiteralPath $inspection.artifact_path -ReadOnly $false
+            Remove-AstroOrdinaryFlatDirectoryLongPath $session
+            if (Test-AstroPathLongPath -LiteralPath $session) {
                 Fail-Astro 'ASTRO_FSV_CLEANUP_FAILED' "evidence session remains after cleanup: $session" `
                     'inspect open handles and remove the exact session only after every owner PID is dead'
             }
-            foreach ($parent in @((Split-Path -Parent $session), (Split-Path -Parent (Split-Path -Parent $session)))) {
-                if ((Test-Path -LiteralPath $parent -PathType Container) -and
-                    @(Get-ChildItem -LiteralPath $parent -Force).Count -eq 0) {
-                    Remove-Item -LiteralPath $parent -Force
-                }
-            }
+            Remove-EmptyEvidenceParents $session
             [ordered]@{ operation = 'cleanup'; before = $before; after = [ordered]@{ session = $session; exists = $false } } |
                 ConvertTo-Json -Depth 10 -Compress | Write-Output
         }

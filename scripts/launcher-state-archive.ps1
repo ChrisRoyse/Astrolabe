@@ -214,7 +214,7 @@ function Write-AstroLauncherStateArchiveRecord {
     }
 
     $stream = [IO.File]::Open(
-        $path,
+        (ConvertTo-AstroExtendedLengthPath $path),
         [IO.FileMode]::CreateNew,
         [IO.FileAccess]::Write,
         [IO.FileShare]::None
@@ -415,7 +415,7 @@ function Start-AstroLauncherStateArchiveTransaction {
     ))
     $archiveRootState = Get-AstroPathEntryState $archiveRoot
     if ($archiveRootState.State -eq 'absent') {
-        [IO.Directory]::CreateDirectory($archiveRoot) | Out-Null
+        New-AstroDirectoryLongPath $archiveRoot | Out-Null
     }
     elseif ($archiveRootState.State -ne 'present' -or
         ($archiveRootState.Attributes -band [IO.FileAttributes]::Directory) -eq 0) {
@@ -437,7 +437,7 @@ function Start-AstroLauncherStateArchiveTransaction {
         if ($transactionState.State -ne 'absent') {
             throw "LAUNCHER_ARCHIVE[ASTRO_LAUNCHER_ARCHIVE_TRANSACTION_COLLISION]: state=$($transactionState.State); error=$($transactionState.Error); path=$transactionPath"
         }
-        [IO.Directory]::CreateDirectory($transactionPath) | Out-Null
+        New-AstroDirectoryNoClobberLongPath $transactionPath | Out-Null
         $transactionDirectoryLease = Open-AstroLauncherPinnedDirectoryLease (
             $transactionPath
         )
