@@ -832,6 +832,195 @@ public static class AstroFsvNativeProcess {
 '@
 }
 
+if (-not ([Management.Automation.PSTypeName]'AstroFsvRestartManager').Type) {
+    Add-Type -Language CSharp -TypeDefinition @'
+using System;
+using System.Collections.Generic;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+using System.Text;
+using FILETIME = System.Runtime.InteropServices.ComTypes.FILETIME;
+
+public sealed class AstroFsvRestartManagerOwner {
+    public uint ProcessId { get; internal set; }
+    public long ProcessStartFileTime { get; internal set; }
+    public long ProcessStartUtcTicks { get; internal set; }
+    public string ApplicationName { get; internal set; }
+    public string ServiceShortName { get; internal set; }
+    public int ApplicationType { get; internal set; }
+    public uint ApplicationStatus { get; internal set; }
+    public uint TerminalSessionId { get; internal set; }
+    public bool Restartable { get; internal set; }
+}
+
+public sealed class AstroFsvRestartManagerResult {
+    public AstroFsvRestartManagerOwner[] Owners { get; internal set; }
+    public uint RebootReasons { get; internal set; }
+}
+
+public static class AstroFsvRestartManager {
+    const int CCH_RM_SESSION_KEY = 32;
+    const int CCH_RM_MAX_APP_NAME = 255;
+    const int CCH_RM_MAX_SVC_NAME = 63;
+    const int ERROR_SUCCESS = 0;
+    const int ERROR_MORE_DATA = 234;
+
+    [StructLayout(LayoutKind.Sequential)]
+    struct RM_UNIQUE_PROCESS {
+        public uint ProcessId;
+        public FILETIME ProcessStartTime;
+    }
+
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    struct RM_PROCESS_INFO {
+        public RM_UNIQUE_PROCESS Process;
+
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = CCH_RM_MAX_APP_NAME + 1)]
+        public string ApplicationName;
+
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = CCH_RM_MAX_SVC_NAME + 1)]
+        public string ServiceShortName;
+
+        public int ApplicationType;
+        public uint ApplicationStatus;
+        public uint TerminalSessionId;
+        public int Restartable;
+    }
+
+    [DllImport("rstrtmgr.dll", CharSet = CharSet.Unicode)]
+    static extern int RmStartSession(
+        out uint sessionHandle,
+        int sessionFlags,
+        StringBuilder sessionKey);
+
+    [DllImport("rstrtmgr.dll", CharSet = CharSet.Unicode)]
+    static extern int RmRegisterResources(
+        uint sessionHandle,
+        uint fileCount,
+        string[] fileNames,
+        uint applicationCount,
+        RM_UNIQUE_PROCESS[] applications,
+        uint serviceCount,
+        string[] serviceNames);
+
+    [DllImport("rstrtmgr.dll")]
+    static extern int RmGetList(
+        uint sessionHandle,
+        out uint processInfoNeeded,
+        ref uint processInfoCount,
+        [In, Out] RM_PROCESS_INFO[] processInfo,
+        ref uint rebootReasons);
+
+    [DllImport("rstrtmgr.dll")]
+    static extern int RmEndSession(uint sessionHandle);
+
+    static long ToFileTime(FILETIME value) {
+        return ((long)(uint)value.dwHighDateTime << 32) |
+            (uint)value.dwLowDateTime;
+    }
+
+    static Win32Exception Failure(string operation, int error, string path) {
+        return new Win32Exception(
+            error,
+            operation + " failed while identifying exact artifact users " +
+            "(native_error=" + error + "; path=" + path + ")");
+    }
+
+    public static AstroFsvRestartManagerResult GetOwners(string path) {
+        if (String.IsNullOrWhiteSpace(path))
+            throw new ArgumentException("artifact path is empty", "path");
+
+        string fullPath = System.IO.Path.GetFullPath(path);
+        StringBuilder sessionKey = new StringBuilder(CCH_RM_SESSION_KEY + 1);
+        uint sessionHandle;
+        int result = RmStartSession(out sessionHandle, 0, sessionKey);
+        if (result != ERROR_SUCCESS)
+            throw Failure("RmStartSession", result, fullPath);
+
+        Exception failure = null;
+        try {
+            result = RmRegisterResources(
+                sessionHandle,
+                1,
+                new string[] { fullPath },
+                0,
+                null,
+                0,
+                null);
+            if (result != ERROR_SUCCESS)
+                throw Failure("RmRegisterResources", result, fullPath);
+
+            uint needed;
+            uint count = 0;
+            uint rebootReasons = 0;
+            result = RmGetList(
+                sessionHandle,
+                out needed,
+                ref count,
+                null,
+                ref rebootReasons);
+            if (result == ERROR_SUCCESS) {
+                return new AstroFsvRestartManagerResult {
+                    Owners = new AstroFsvRestartManagerOwner[0],
+                    RebootReasons = rebootReasons
+                };
+            }
+            if (result != ERROR_MORE_DATA)
+                throw Failure("RmGetList(size)", result, fullPath);
+            if (needed == 0)
+                throw new InvalidOperationException(
+                    "RmGetList returned ERROR_MORE_DATA with zero required owners " +
+                    "(path=" + fullPath + ")");
+
+            RM_PROCESS_INFO[] processInfo = new RM_PROCESS_INFO[needed];
+            count = needed;
+            result = RmGetList(
+                sessionHandle,
+                out needed,
+                ref count,
+                processInfo,
+                ref rebootReasons);
+            if (result != ERROR_SUCCESS)
+                throw Failure("RmGetList(data)", result, fullPath);
+
+            List<AstroFsvRestartManagerOwner> owners =
+                new List<AstroFsvRestartManagerOwner>();
+            for (int index = 0; index < count; index++) {
+                long fileTime = ToFileTime(
+                    processInfo[index].Process.ProcessStartTime);
+                owners.Add(new AstroFsvRestartManagerOwner {
+                    ProcessId = processInfo[index].Process.ProcessId,
+                    ProcessStartFileTime = fileTime,
+                    ProcessStartUtcTicks =
+                        DateTime.FromFileTimeUtc(fileTime).Ticks,
+                    ApplicationName = processInfo[index].ApplicationName,
+                    ServiceShortName = processInfo[index].ServiceShortName,
+                    ApplicationType = processInfo[index].ApplicationType,
+                    ApplicationStatus = processInfo[index].ApplicationStatus,
+                    TerminalSessionId =
+                        processInfo[index].TerminalSessionId,
+                    Restartable = processInfo[index].Restartable != 0
+                });
+            }
+            return new AstroFsvRestartManagerResult {
+                Owners = owners.ToArray(),
+                RebootReasons = rebootReasons
+            };
+        }
+        catch (Exception caught) {
+            failure = caught;
+            throw;
+        }
+        finally {
+            int endResult = RmEndSession(sessionHandle);
+            if (endResult != ERROR_SUCCESS && failure == null)
+                throw Failure("RmEndSession", endResult, fullPath);
+        }
+    }
+}
+'@
+}
+
 function Test-DescendantOf([int]$CandidatePid, [int]$AncestorPid) {
     $seen = @{}
     $current = $CandidatePid
@@ -1345,6 +1534,40 @@ try {
     }
     catch {
         $readinessFailure = $_
+        $ownerDiagnostic = try {
+            $restartManager = [AstroFsvRestartManager]::GetOwners($artifact)
+            [ordered]@{
+                state = 'observed'
+                operation =
+                    'Restart Manager RmRegisterResources(exact file) + RmGetList'
+                owners = @($restartManager.Owners | ForEach-Object {
+                    [ordered]@{
+                        pid = [uint32]$_.ProcessId
+                        process_start_filetime =
+                            [int64]$_.ProcessStartFileTime
+                        process_start_utc_ticks =
+                            [int64]$_.ProcessStartUtcTicks
+                        application_name = [string]$_.ApplicationName
+                        service_short_name = [string]$_.ServiceShortName
+                        application_type = [int]$_.ApplicationType
+                        application_status =
+                            [uint32]$_.ApplicationStatus
+                        terminal_session_id =
+                            [uint32]$_.TerminalSessionId
+                        restartable = [bool]$_.Restartable
+                    }
+                })
+                reboot_reasons = [uint32]$restartManager.RebootReasons
+            }
+        }
+        catch {
+            [ordered]@{
+                state = 'fault'
+                operation =
+                    'Restart Manager RmRegisterResources(exact file) + RmGetList'
+                error = $_.Exception.Message
+            }
+        }
         if ($null -ne $artifactCleanupLease) {
             $artifactCleanupLease.Dispose()
             $artifactCleanupLease = $null
@@ -1361,7 +1584,7 @@ try {
                 'preserve the session and inspect the exact native error/handle owner before any lifecycle cleanup'
         }
         Fail-Astro 'ASTRO_FSV_ARTIFACT_CLEANUP_NOT_READY' `
-            "the staged artifact is not exactly ready for cleanup after native child termination: $($readinessFailure.Exception.Message)" `
+            "the staged artifact is not exactly ready for cleanup after native child termination: $($readinessFailure.Exception.Message); owner_diagnostic=$($ownerDiagnostic | ConvertTo-Json -Depth 8 -Compress)" `
             'preserve the session; inspect the native error and exact live handle owner, then repair handle lifetime before retrying'
     }
 
