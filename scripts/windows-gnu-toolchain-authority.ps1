@@ -4200,7 +4200,8 @@ function Test-PinnedToolchain {
 
 function Assert-AstroNativeWindowsPlatform {
     try {
-        $isWindows = [System.Runtime.InteropServices.RuntimeInformation]::IsOSPlatform(
+        $astroRuntimeReportsWindows =
+            [System.Runtime.InteropServices.RuntimeInformation]::IsOSPlatform(
             [System.Runtime.InteropServices.OSPlatform]::Windows
         )
         $osDescription = [System.Runtime.InteropServices.RuntimeInformation]::OSDescription
@@ -4232,7 +4233,7 @@ function Assert-AstroNativeWindowsPlatform {
         "process_architecture=$processArchitecture"
     )
 
-    if (-not $isWindows) {
+    if (-not $astroRuntimeReportsWindows) {
         if ($wslMarkers.Count -gt 0) {
             throw (
                 "EXECUTION_BOUNDARY[ASTRO_NATIVE_CONTEXT_REQUIRED]: intrinsic platform is not Windows " +
