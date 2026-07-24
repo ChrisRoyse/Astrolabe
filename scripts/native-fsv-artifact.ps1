@@ -16,15 +16,17 @@
       * reuse, drift, path escape, and partial publication are structured failures.
 
     The companion native-fsv-run.ps1 holds a Windows handle that denies delete/rename while
-    the artifact is executing. Cleanup refuses any live FSV lock or live recorded child.
+    the artifact is executing. Every owner is a strict PID/process-start identity. Lifecycle
+    removal refuses exact-live and unevaluable generations, records PID reuse without treating
+    it as ownership, and accepts legacy PID-only state only through a tracker-bound migration.
 
 .NOTES
-    Refs #596, #424, #197. Manual FSV tooling; this is not a test or a gate.
+    Refs #612, #596, #424, #197. Manual FSV tooling; this is not a test or a gate.
 #>
 [CmdletBinding()]
 param(
     [Parameter(Mandatory)]
-    [ValidateSet('Stage', 'Inspect', 'Cleanup', 'Abandon', 'Quarantine')]
+    [ValidateSet('Stage', 'Inspect', 'Cleanup', 'Abandon', 'Quarantine', 'MigrateLegacy')]
     [string]$Operation,
 
     [string]$SourcePath = '',
@@ -35,7 +37,9 @@ param(
     [string]$SessionId = '',
     [string]$AbandonRecordPath = '',
     [string]$RecoveryRecordPath = '',
+    [string]$MigrationRecordPath = '',
     [string]$LiveStatePath = '',
+    [string]$TrackerCommentUrl = '',
     [string]$ReasonCode = '',
     [string]$ReasonMessage = ''
 )
@@ -252,6 +256,385 @@ public static class AstroFsvPublish {
 '@
 }
 
+function Read-AstroFsvProcessIdentity {
+    param(
+        [Parameter(Mandatory)]$Object,
+        [Parameter(Mandatory)][string]$Code,
+        [Parameter(Mandatory)][string]$Description
+    )
+
+    if ($null -eq $Object) {
+        Fail-Astro $Code "$Description is absent" `
+            'preserve the session and investigate its incomplete process provenance'
+    }
+    $properties = @($Object.PSObject.Properties | ForEach-Object Name)
+    $required = @('pid', 'process_start_utc_ticks', 'process_started_utc')
+    if ($properties.Count -ne $required.Count -or
+        @($required | Where-Object { $properties -notcontains $_ }).Count -ne 0) {
+        Fail-Astro $Code `
+            "$Description must contain exactly pid, process_start_utc_ticks, process_started_utc" `
+            'preserve the session; legacy, partial, and extended authority records require explicit schema handling'
+    }
+    $parsedPid = 0
+    $parsedTicks = 0L
+    if (-not [int]::TryParse(
+            [string]$Object.pid,
+            [Globalization.NumberStyles]::None,
+            [Globalization.CultureInfo]::InvariantCulture,
+            [ref]$parsedPid
+        ) -or $parsedPid -le 0 -or
+        -not [long]::TryParse(
+            [string]$Object.process_start_utc_ticks,
+            [Globalization.NumberStyles]::None,
+            [Globalization.CultureInfo]::InvariantCulture,
+            [ref]$parsedTicks
+        ) -or $parsedTicks -le 0 -or
+        $parsedTicks -gt [DateTime]::MaxValue.Ticks) {
+        Fail-Astro $Code "$Description has an invalid PID or process-start UTC ticks" `
+            'preserve the session and investigate its incomplete process provenance'
+    }
+    $expectedIso = ConvertTo-AstroProcessStartUtcIso $parsedTicks
+    $startedValue = $Object.process_started_utc
+    $startedMatches = if ($startedValue -is [DateTime]) {
+        $startedValue.ToUniversalTime().Ticks -eq $parsedTicks
+    }
+    elseif ($startedValue -is [DateTimeOffset]) {
+        $startedValue.UtcDateTime.Ticks -eq $parsedTicks
+    }
+    else {
+        [string]::Equals(
+            [string]$startedValue,
+            $expectedIso,
+            [StringComparison]::Ordinal
+        )
+    }
+    if (-not $startedMatches) {
+        Fail-Astro $Code `
+            "$Description process_started_utc does not resolve to its exact UTC ticks" `
+            'preserve the session and investigate identity byte drift'
+    }
+    return New-AstroProcessIdentityRecord $parsedPid $parsedTicks
+}
+
+function New-AstroFsvOwnerBinding {
+    param(
+        [Parameter(Mandatory)][string]$Role,
+        [Parameter(Mandatory)][string]$Source,
+        [Parameter(Mandatory)]$Identity
+    )
+
+    return [pscustomobject]@{
+        Role = $Role
+        Source = $Source
+        Identity = $Identity
+    }
+}
+
+function Test-AstroFsvIdentityEqual {
+    param(
+        [Parameter(Mandatory)]$Left,
+        [Parameter(Mandatory)]$Right
+    )
+
+    return [int]$Left.pid -eq [int]$Right.pid -and
+        [long]$Left.process_start_utc_ticks -eq
+            [long]$Right.process_start_utc_ticks
+}
+
+function Get-AstroFsvOwnerProbes {
+    param([Parameter(Mandatory)][object[]]$Bindings)
+
+    $probes = foreach ($binding in $Bindings) {
+        $identity = $binding.Identity
+        $probe = Get-AstroExactProcessIdentityProbe `
+            -Pid ([int]$identity.pid) `
+            -ProcessStartUtcTicks ([long]$identity.process_start_utc_ticks)
+        [ordered]@{
+            role = [string]$binding.Role
+            source = [string]$binding.Source
+            identity = $identity
+            state = $probe.State
+            numeric_pid_live = $probe.NumericPidLive
+            exact_owner_live = $probe.ExactOwnerLive
+            pid_reused = $probe.PidReused
+            observed_process_start_utc_ticks =
+                $probe.ObservedProcessStartUtcTicks
+            observed_process_started_utc =
+                $probe.ObservedProcessStartedUtc
+            observed_at_utc = $probe.ObservedAtUtc
+            error = $probe.Error
+        }
+    }
+    return @($probes)
+}
+
+function Assert-AstroFsvOwnersInactive {
+    param(
+        [Parameter(Mandatory)][object[]]$Bindings,
+        [Parameter(Mandatory)][string]$CodePrefix,
+        [Parameter(Mandatory)][string]$Description
+    )
+
+    $probes = @(Get-AstroFsvOwnerProbes $Bindings)
+    $live = @($probes | Where-Object { $_.state -ceq 'exact-live' })
+    if ($live.Count -gt 0) {
+        Fail-Astro "${CodePrefix}_LIVE_OWNER" `
+            "$Description retains exact-live owner(s): $($live | ConvertTo-Json -Depth 8 -Compress)" `
+            'wait for every exact recorded process generation to exit naturally'
+    }
+    $unevaluable = @($probes | Where-Object { $_.state -ceq 'unevaluable' })
+    if ($unevaluable.Count -gt 0) {
+        Fail-Astro "${CodePrefix}_OWNER_UNEVALUABLE" `
+            "$Description has unevaluable owner state: $($unevaluable | ConvertTo-Json -Depth 8 -Compress)" `
+            'preserve every byte and retry only when exact process identity is readable'
+    }
+    return $probes
+}
+
+function Assert-AstroFsvPersistedOwnerEnvelope {
+    param(
+        [Parameter(Mandatory)]$Owners,
+        [Parameter(Mandatory)][object[]]$ExpectedBindings,
+        [Parameter(Mandatory)][string]$Code,
+        [Parameter(Mandatory)][string]$Description
+    )
+
+    if ($null -eq $Owners -or
+        -not $Owners.PSObject.Properties['identities'] -or
+        -not $Owners.PSObject.Properties['initial_probes'] -or
+        -not $Owners.PSObject.Properties['final_probes']) {
+        Fail-Astro $Code `
+            "$Description omits its identities or authorization probes" `
+            'preserve both session and external record and investigate the durable-write mismatch'
+    }
+    $persistedIdentities = @($Owners.identities)
+    $initialProbes = @($Owners.initial_probes)
+    $finalProbes = @($Owners.final_probes)
+    if ($persistedIdentities.Count -ne $ExpectedBindings.Count -or
+        $initialProbes.Count -ne $ExpectedBindings.Count -or
+        $finalProbes.Count -ne $ExpectedBindings.Count) {
+        Fail-Astro $Code `
+            "$Description owner/probe cardinality differs from the authorization set" `
+            'preserve both session and external record and investigate the durable-write mismatch'
+    }
+    for ($index = 0; $index -lt $ExpectedBindings.Count; $index++) {
+        $expected = $ExpectedBindings[$index]
+        $persisted = $persistedIdentities[$index]
+        $persistedIdentity = Read-AstroFsvProcessIdentity `
+            $persisted.identity $Code `
+            "$Description persisted owner identity $index"
+        if ([string]$persisted.role -cne [string]$expected.Role -or
+            [string]$persisted.source -cne [string]$expected.Source -or
+            -not (Test-AstroFsvIdentityEqual `
+                $persistedIdentity $expected.Identity)) {
+            Fail-Astro $Code `
+                "$Description persisted owner identity $index differs from the authorization set" `
+                'preserve both session and external record and investigate the durable-write mismatch'
+        }
+        foreach ($probeSet in @($initialProbes, $finalProbes)) {
+            $persistedProbe = $probeSet[$index]
+            $probeIdentity = Read-AstroFsvProcessIdentity `
+                $persistedProbe.identity $Code `
+                "$Description persisted owner probe identity $index"
+            if ([string]$persistedProbe.role -cne
+                    [string]$expected.Role -or
+                [string]$persistedProbe.source -cne
+                    [string]$expected.Source -or
+                -not (Test-AstroFsvIdentityEqual `
+                    $probeIdentity $expected.Identity) -or
+                [string]$persistedProbe.state -notin
+                    @('absent', 'pid-reused')) {
+                Fail-Astro $Code `
+                    "$Description persisted owner probe $index differs from its inactive authorization" `
+                    'preserve both session and external record and investigate the durable-write mismatch'
+            }
+        }
+    }
+}
+
+function Get-AstroCurrentProcessIdentity {
+    param(
+        [Parameter(Mandatory)]
+        [Alias('Pid')]
+        [int]$ProcessId,
+        [Parameter(Mandatory)][string]$Code,
+        [Parameter(Mandatory)][string]$Description
+    )
+
+    $probe = Get-AstroProcessIdentityProbe -OwnerPid $ProcessId
+    if ($probe.State -cne 'observed') {
+        Fail-Astro $Code `
+            "$Description process identity is '$($probe.State)': $($probe.Error)" `
+            'preserve state and retry only when the live process creation time is readable'
+    }
+    return New-AstroProcessIdentityRecord `
+        $ProcessId ([long]$probe.ProcessStartUtcTicks)
+}
+
+function Invoke-AstroFsvGhJson {
+    param([Parameter(Mandatory)][string]$ApiPath)
+
+    $gh = Get-Command gh -CommandType Application -ErrorAction SilentlyContinue |
+        Select-Object -First 1
+    if ($null -eq $gh) {
+        Fail-Astro 'ASTRO_FSV_MIGRATION_GH_MISSING' `
+            'authenticated GitHub CLI is unavailable' `
+            'restore authenticated gh access; no legacy session bytes were authorized for removal'
+    }
+    $process = $null
+    try {
+        $start = [Diagnostics.ProcessStartInfo]::new()
+        $start.FileName = $gh.Source
+        $start.Arguments = 'api ' + $ApiPath
+        $start.UseShellExecute = $false
+        $start.CreateNoWindow = $true
+        $start.RedirectStandardOutput = $true
+        $start.RedirectStandardError = $true
+        $start.EnvironmentVariables['NO_COLOR'] = '1'
+        $start.EnvironmentVariables['GH_FORCE_TTY'] = '0'
+        $process = [Diagnostics.Process]::new()
+        $process.StartInfo = $start
+        if (-not $process.Start()) {
+            throw 'Process.Start returned false'
+        }
+        $stdoutTask = $process.StandardOutput.ReadToEndAsync()
+        $stderrTask = $process.StandardError.ReadToEndAsync()
+        if (-not $process.WaitForExit(30000)) {
+            try { $process.Kill() } catch {}
+            throw 'gh read exceeded the 30000 ms bounded timeout'
+        }
+        $stdout = $stdoutTask.GetAwaiter().GetResult()
+        $stderr = $stderrTask.GetAwaiter().GetResult()
+        if ($process.ExitCode -ne 0) {
+            throw "gh exited $($process.ExitCode): $stderr"
+        }
+        return $stdout | ConvertFrom-Json
+    }
+    catch {
+        Fail-Astro 'ASTRO_FSV_MIGRATION_GH_READ_FAILED' `
+            $_.Exception.Message `
+            'repair authenticated GitHub access; no legacy session bytes were authorized for removal'
+    }
+    finally {
+        if ($null -ne $process) { $process.Dispose() }
+    }
+}
+
+function Read-AstroFsvLegacyTrackerEvidence {
+    param(
+        [Parameter(Mandatory)][string]$Url,
+        [Parameter(Mandatory)][int]$ExpectedIssue,
+        [Parameter(Mandatory)][string]$ExpectedReceiptPath,
+        [Parameter(Mandatory)][string]$ExpectedReceiptSha256,
+        [Parameter(Mandatory)][string]$ExpectedSessionDirectory,
+        [Parameter(Mandatory)][string]$ExpectedInventorySha256,
+        [Parameter(Mandatory)][int[]]$ExpectedNumericOwnerPids,
+        [Parameter(Mandatory)][string]$ExpectedMigrationRecordPath
+    )
+
+    $match = [Regex]::Match(
+        $Url,
+        '^https://github\.com/(?<owner>[^/]+)/(?<repo>[^/]+)/issues/(?<issue>[1-9][0-9]*)#issuecomment-(?<comment>[1-9][0-9]*)\z',
+        [Text.RegularExpressions.RegexOptions]::CultureInvariant
+    )
+    if (-not $match.Success -or
+        [int]$match.Groups['issue'].Value -ne $ExpectedIssue) {
+        Fail-Astro 'ASTRO_FSV_MIGRATION_TRACKER_URL_INVALID' `
+            "tracker URL is not an exact issue-comment URL for #${ExpectedIssue}: $Url" `
+            'post one fresh owner-authored evidence comment on the exact driving issue'
+    }
+    $api = 'repos/{0}/{1}/issues/comments/{2}' -f
+        $match.Groups['owner'].Value,
+        $match.Groups['repo'].Value,
+        $match.Groups['comment'].Value
+    $comment = Invoke-AstroFsvGhJson $api
+    if ([string]$comment.html_url -cne $Url -or
+        [string]$comment.author_association -cne 'OWNER') {
+        Fail-Astro 'ASTRO_FSV_MIGRATION_TRACKER_IDENTITY_INVALID' `
+            'GitHub readback does not bind the exact owner-authored comment URL' `
+            'use the canonical html_url of a repository-owner evidence comment'
+    }
+    $prefix = 'ASTRO_FSV_LEGACY_MIGRATION_EVIDENCE '
+    [string[]]$markers = @(
+        [string]$comment.body -split "`r?`n" |
+            Where-Object {
+                $_.StartsWith($prefix, [StringComparison]::Ordinal)
+            }
+    )
+    if ($markers.Count -ne 1) {
+        Fail-Astro 'ASTRO_FSV_MIGRATION_TRACKER_EVIDENCE_INVALID' `
+            "tracker comment must contain exactly one '$prefix' line" `
+            'post one fresh machine-readable legacy migration evidence object'
+    }
+    try {
+        $evidence = $markers[0].Substring($prefix.Length) | ConvertFrom-Json
+    }
+    catch {
+        Fail-Astro 'ASTRO_FSV_MIGRATION_TRACKER_EVIDENCE_INVALID' `
+            "tracker evidence JSON is invalid: $($_.Exception.Message)" `
+            'post one fresh exact JSON evidence object'
+    }
+    $expectedFields = @(
+        'schema',
+        'issue',
+        'receipt_path',
+        'receipt_sha256',
+        'session_directory',
+        'inventory_sha256',
+        'legacy_numeric_owner_pids',
+        'numeric_owner_probe_state',
+        'migration_record_path',
+        'authorized_action'
+    )
+    $actualFields = @($evidence.PSObject.Properties | ForEach-Object Name)
+    if ($actualFields.Count -ne $expectedFields.Count -or
+        @($expectedFields | Where-Object { $actualFields -notcontains $_ }).Count -ne 0) {
+        Fail-Astro 'ASTRO_FSV_MIGRATION_TRACKER_EVIDENCE_INVALID' `
+            'tracker evidence fields differ from the exact legacy migration contract' `
+            'post a fresh object containing exactly the documented fields'
+    }
+    $actualPids = [int[]]@(
+        @($evidence.legacy_numeric_owner_pids) |
+            ForEach-Object { [int]$_ } |
+            Sort-Object -Unique
+    )
+    $expectedPids = [int[]]@($ExpectedNumericOwnerPids | Sort-Object -Unique)
+    if ($evidence.schema -cne
+            'astrolabe.native-fsv-legacy-migration-evidence.v1' -or
+        [int]$evidence.issue -ne $ExpectedIssue -or
+        -not [string]::Equals(
+            [IO.Path]::GetFullPath([string]$evidence.receipt_path),
+            [IO.Path]::GetFullPath($ExpectedReceiptPath),
+            [StringComparison]::OrdinalIgnoreCase
+        ) -or
+        [string]$evidence.receipt_sha256 -cne $ExpectedReceiptSha256 -or
+        -not [string]::Equals(
+            [IO.Path]::GetFullPath([string]$evidence.session_directory),
+            [IO.Path]::GetFullPath($ExpectedSessionDirectory),
+            [StringComparison]::OrdinalIgnoreCase
+        ) -or
+        [string]$evidence.inventory_sha256 -cne $ExpectedInventorySha256 -or
+        ($actualPids -join ',') -cne ($expectedPids -join ',') -or
+        [string]$evidence.numeric_owner_probe_state -cne 'all-absent' -or
+        -not [string]::Equals(
+            [IO.Path]::GetFullPath([string]$evidence.migration_record_path),
+            [IO.Path]::GetFullPath($ExpectedMigrationRecordPath),
+            [StringComparison]::OrdinalIgnoreCase
+        ) -or
+        [string]$evidence.authorized_action -cne
+            'remove-legacy-session-without-inventing-process-start-ticks') {
+        Fail-Astro 'ASTRO_FSV_MIGRATION_TRACKER_EVIDENCE_MISMATCH' `
+            'tracker evidence differs from the exact local legacy session binding' `
+            're-read physical state and post a fresh exact evidence object'
+    }
+    return [ordered]@{
+        url = $Url
+        comment_id = [long]$match.Groups['comment'].Value
+        author = [string]$comment.user.login
+        evidence = $evidence
+    }
+}
+
 function Read-Receipt {
     param(
         [Parameter(Mandatory)][string]$Path,
@@ -271,7 +654,15 @@ function Read-Receipt {
         Fail-Astro 'ASTRO_FSV_RECEIPT_INVALID' "parse evidence receipt '$full' failed: $($_.Exception.Message)" `
             'discard the incomplete evidence session and stage the artifact again'
     }
-    if ($receipt.schema -ne 'astrolabe.native-fsv-artifact.v1' -or
+    if ($receipt.schema -eq 'astrolabe.native-fsv-artifact.v1') {
+        Fail-Astro 'ASTRO_FSV_RECEIPT_LEGACY_MIGRATION_REQUIRED' `
+            "evidence receipt '$full' uses legacy PID-only schema v1" `
+            'preserve the session and use MigrateLegacy with a fresh owner-authored tracker evidence comment; never infer missing process generations'
+    }
+    if ($receipt.schema -ne 'astrolabe.native-fsv-artifact.v2' -or
+        -not $receipt.PSObject.Properties['owners'] -or
+        -not $receipt.owners.PSObject.Properties['launcher'] -or
+        -not $receipt.owners.PSObject.Properties['promoter'] -or
         -not $receipt.artifact -or -not $receipt.artifact.path -or
         [string]::IsNullOrWhiteSpace([string]$receipt.artifact.sha256)) {
         Fail-Astro 'ASTRO_FSV_RECEIPT_INVALID' "evidence receipt '$full' violates the required schema" `
@@ -296,6 +687,14 @@ function Inspect-ReceiptArtifact {
         Fail-Astro 'ASTRO_FSV_RECEIPT_INVALID' "evidence receipt '$($ReceiptState.Path)' contains invalid identity fields" `
             'discard the invalid session and stage the artifact again'
     }
+    $launcherIdentity = Read-AstroFsvProcessIdentity `
+        -Object $receipt.owners.launcher `
+        -Code 'ASTRO_FSV_RECEIPT_INVALID' `
+        -Description 'artifact receipt launcher identity'
+    $promoterIdentity = Read-AstroFsvProcessIdentity `
+        -Object $receipt.owners.promoter `
+        -Code 'ASTRO_FSV_RECEIPT_INVALID' `
+        -Description 'artifact receipt promoter identity'
     $expectedSession = Join-Path (Join-Path (Join-Path $EvidenceRoot ([string]$receipt.tree_sha)) `
         ([string]$receipt.artifact.sha256)) ([string]$receipt.session_id)
     if (-not [string]::Equals($sessionDirectory, [IO.Path]::GetFullPath($expectedSession), [StringComparison]::OrdinalIgnoreCase)) {
@@ -328,56 +727,72 @@ function Inspect-ReceiptArtifact {
         tree_sha = [string]$receipt.tree_sha
         issue = [int]$receipt.issue
         session_id = [string]$receipt.session_id
+        owners = [ordered]@{
+            launcher = $launcherIdentity
+            promoter = $promoterIdentity
+        }
+        owner_probes = @(
+            Get-AstroFsvOwnerProbes @(
+                New-AstroFsvOwnerBinding `
+                    'launcher' 'artifact receipt' $launcherIdentity
+                New-AstroFsvOwnerBinding `
+                    'promoter' 'artifact receipt' $promoterIdentity
+            )
+        )
     }
 }
 
 function Assert-FsvLockAbsent {
     param([Parameter(Mandatory)][string]$LockPath)
     if (-not (Test-AstroPathLongPath -LiteralPath $LockPath)) { return }
-    $rawLock = try { Read-AstroUtf8FileLongPath $LockPath } catch { $null }
-    $lockState = $null
-    try { $lockState = $rawLock | ConvertFrom-Json } catch { }
-    $ownerPid = 0
-    $ownerPids = New-Object System.Collections.Generic.List[int]
-    if ($null -ne $lockState -and $lockState.PSObject.Properties['pid'] -and
-        [int]::TryParse([string]$lockState.pid, [ref]$ownerPid) -and $ownerPid -gt 0) {
-        $ownerPids.Add($ownerPid)
+    try {
+        $lockState = Read-AstroUtf8FileLongPath $LockPath | ConvertFrom-Json
     }
-    if ($null -ne $lockState -and $lockState.PSObject.Properties['owner_pids']) {
-        foreach ($candidate in @($lockState.owner_pids)) {
-            $parsed = 0
-            if ([int]::TryParse([string]$candidate, [ref]$parsed) -and $parsed -gt 0 -and -not $ownerPids.Contains($parsed)) {
-                $ownerPids.Add($parsed)
-            }
-        }
+    catch {
+        Fail-Astro 'ASTRO_FSV_LOCK_INVALID' `
+            "FSV lock exists but is unreadable at ${LockPath}: $($_.Exception.Message)" `
+            'preserve the lock and session; repair or tracker-migrate the exact legacy state without inferring ownership'
     }
-    if ($null -ne $lockState -and $lockState.PSObject.Properties['child_pid']) {
-        $parsedChild = 0
-        if ([int]::TryParse([string]$lockState.child_pid, [ref]$parsedChild) -and $parsedChild -gt 0 -and -not $ownerPids.Contains($parsedChild)) {
-            $ownerPids.Add($parsedChild)
-        }
+    if ($lockState.schema -ne 'astrolabe.native-fsv-lock.v2') {
+        Fail-Astro 'ASTRO_FSV_LOCK_LEGACY_OR_UNKNOWN' `
+            "FSV lock exists with unsupported schema '$($lockState.schema)' at $LockPath" `
+            'preserve the lock and session; PID-only state has no destructive authority'
     }
-    $liveOwnerPids = @($ownerPids | Where-Object { $null -ne (Get-Process -Id $_ -ErrorAction SilentlyContinue) })
-    $code = if ($liveOwnerPids.Count -gt 0) { 'ASTRO_FSV_CLEANUP_LIVE_LOCK' } else { 'ASTRO_FSV_CLEANUP_STALE_LOCK' }
-    Fail-Astro $code "FSV lock exists at $LockPath (owner_pids=$($ownerPids -join ',') live_pids=$($liveOwnerPids -join ',')); lifecycle mutation refused" `
-        'never remove a live lock; for a stale lock, post exact PID-probe evidence to the driving issue before removing it'
-}
-
-function Read-PositivePid {
-    param(
-        [Parameter(Mandatory)]$Object,
-        [Parameter(Mandatory)][string]$Field,
-        [Parameter(Mandatory)][string]$Code,
-        [Parameter(Mandatory)][string]$Description
+    if (-not $lockState.PSObject.Properties['owners'] -or
+        -not $lockState.owners.PSObject.Properties['launcher'] -or
+        -not $lockState.owners.PSObject.Properties['runner'] -or
+        -not $lockState.owners.PSObject.Properties['child']) {
+        Fail-Astro 'ASTRO_FSV_LOCK_INVALID' `
+            "FSV lock omits the required launcher, runner, or child identity field at $LockPath" `
+            'preserve the lock and session; incomplete exact ownership has no destructive authority'
+    }
+    $bindings = New-Object System.Collections.Generic.List[object]
+    foreach ($role in @('launcher', 'runner')) {
+        $identity = Read-AstroFsvProcessIdentity $lockState.owners.$role `
+            'ASTRO_FSV_LOCK_INVALID' "FSV lock $role identity"
+        $bindings.Add((New-AstroFsvOwnerBinding $role 'FSV lock' $identity))
+    }
+    if ($null -ne $lockState.owners.child) {
+        $identity = Read-AstroFsvProcessIdentity $lockState.owners.child `
+            'ASTRO_FSV_LOCK_INVALID' 'FSV lock child identity'
+        $bindings.Add((New-AstroFsvOwnerBinding 'child' 'FSV lock' $identity))
+    }
+    $probes = @(
+        Get-AstroFsvOwnerProbes ([object[]]$bindings.ToArray())
     )
-    if (-not $Object.PSObject.Properties[$Field]) {
-        Fail-Astro $Code "$Description has no required $Field" 'preserve the session and investigate its incomplete process provenance'
+    $states = @($probes | ForEach-Object { $_.state })
+    $code = if ($states -contains 'exact-live') {
+        'ASTRO_FSV_CLEANUP_LIVE_LOCK'
     }
-    $parsedPid = 0
-    if (-not [int]::TryParse([string]$Object.$Field, [ref]$parsedPid) -or $parsedPid -le 0) {
-        Fail-Astro $Code "$Description $Field is not a positive PID" 'preserve the session and investigate its incomplete process provenance'
+    elseif ($states -contains 'unevaluable') {
+        'ASTRO_FSV_CLEANUP_UNEVALUABLE_LOCK'
     }
-    return $parsedPid
+    else {
+        'ASTRO_FSV_CLEANUP_STALE_LOCK'
+    }
+    Fail-Astro $code `
+        "FSV lock exists at $LockPath; lifecycle mutation refused; exact_probes=$($probes | ConvertTo-Json -Depth 8 -Compress)" `
+        'never remove or bypass an FSV lock; resolve it through its exact tracker-bound lifecycle'
 }
 
 function Get-SessionFileInventory {
@@ -404,6 +819,150 @@ function Get-SessionFileInventory {
     return $inventory
 }
 
+function Get-AstroFsvSessionOwnerBindings {
+    param(
+        [Parameter(Mandatory)]$ReceiptState,
+        [Parameter(Mandatory)]$Inspection,
+        [Parameter(Mandatory)][string]$RunRecordPath,
+        [Parameter(Mandatory)]$RunRecord
+    )
+
+    $bindings = New-Object System.Collections.Generic.List[object]
+    $bindings.Add((New-AstroFsvOwnerBinding `
+                'launcher' 'artifact receipt' $Inspection.owners.launcher))
+    $bindings.Add((New-AstroFsvOwnerBinding `
+                'promoter' 'artifact receipt' $Inspection.owners.promoter))
+    $runLauncher = Read-AstroFsvProcessIdentity $RunRecord.launcher `
+        'ASTRO_FSV_SESSION_OWNER_RECORD_INVALID' `
+        'run-record launcher identity'
+    $runRunner = Read-AstroFsvProcessIdentity $RunRecord.runner `
+        'ASTRO_FSV_SESSION_OWNER_RECORD_INVALID' `
+        'run-record runner identity'
+    $runChild = Read-AstroFsvProcessIdentity $RunRecord.process.identity `
+        'ASTRO_FSV_SESSION_OWNER_RECORD_INVALID' `
+        'run-record child identity'
+    if (-not (Test-AstroFsvIdentityEqual `
+            $Inspection.owners.launcher $runLauncher)) {
+        Fail-Astro 'ASTRO_FSV_SESSION_OWNER_RECORD_INVALID' `
+            "run-record launcher generation differs from its receipt: $RunRecordPath" `
+            'preserve the complete session and investigate cross-lease provenance'
+    }
+    $bindings.Add((New-AstroFsvOwnerBinding `
+                'launcher' $RunRecordPath $runLauncher))
+    $bindings.Add((New-AstroFsvOwnerBinding `
+                'runner' $RunRecordPath $runRunner))
+    $bindings.Add((New-AstroFsvOwnerBinding `
+                'child' $RunRecordPath $runChild))
+
+    if (-not $RunRecord.PSObject.Properties['live_state'] -or
+        -not $RunRecord.live_state.PSObject.Properties['path'] -or
+        -not $RunRecord.live_state.PSObject.Properties['published'] -or
+        -not $RunRecord.live_state.PSObject.Properties['bytes'] -or
+        -not $RunRecord.live_state.PSObject.Properties['sha256']) {
+        Fail-Astro 'ASTRO_FSV_SESSION_OWNER_RECORD_INVALID' `
+            "run record omits its exact live-state publication binding: $RunRecordPath" `
+            'preserve the complete session and investigate its partial durable state'
+    }
+    $liveStatePath = Assert-PathWithin `
+        ([string]$RunRecord.live_state.path) `
+        $Inspection.session_directory `
+        'ASTRO_FSV_SESSION_OWNER_RECORD_INVALID' `
+        'run-record live-state path'
+    if (-not [bool]$RunRecord.live_state.published) {
+        if (Test-AstroPathLongPath -LiteralPath $liveStatePath) {
+            Fail-Astro 'ASTRO_FSV_SESSION_OWNER_RECORD_INVALID' `
+                "run record says its live state was not published, but the path exists: $liveStatePath" `
+                'preserve the complete session and investigate the contradictory durable state'
+        }
+        if ([uint64]$RunRecord.live_state.bytes -ne 0 -or
+            $null -ne $RunRecord.live_state.sha256) {
+            Fail-Astro 'ASTRO_FSV_SESSION_OWNER_RECORD_INVALID' `
+                "unpublished live-state binding carries bytes or a hash: $RunRecordPath" `
+                'preserve the complete session and investigate the contradictory durable state'
+        }
+        return [object[]]$bindings.ToArray()
+    }
+    if (-not (Test-AstroPathLongPath `
+            -LiteralPath $liveStatePath -PathType Leaf)) {
+        Fail-Astro 'ASTRO_FSV_SESSION_OWNER_RECORD_INVALID' `
+            "run record binds a published live state that is absent: $liveStatePath" `
+            'preserve the complete session and investigate its missing durable state'
+    }
+    $liveStateItem = Get-AstroFileInfoLongPath $liveStatePath
+    $liveStateHash = File-Sha256 $liveStatePath
+    if ([uint64]$RunRecord.live_state.bytes -ne
+            [uint64]$liveStateItem.Length -or
+        [string]$RunRecord.live_state.sha256 -cne $liveStateHash) {
+        Fail-Astro 'ASTRO_FSV_SESSION_OWNER_RECORD_INVALID' `
+            "run-record live-state bytes drifted: $liveStatePath" `
+            'preserve the complete session and investigate the durable-state writer'
+    }
+    Assert-NotReparseEntry $liveStatePath 'native FSV live-state record'
+    try {
+        $liveRecord = Read-AstroUtf8FileLongPath $liveStatePath |
+            ConvertFrom-Json
+    }
+    catch {
+        Fail-Astro 'ASTRO_FSV_SESSION_OWNER_RECORD_INVALID' `
+            "live-state record is unreadable: ${liveStatePath}: $($_.Exception.Message)" `
+            'preserve the complete session and investigate its partial durable state'
+    }
+    if ($liveRecord.schema -ne 'astrolabe.native-fsv-live.v2' -or
+        -not $liveRecord.PSObject.Properties['owners'] -or
+        -not $liveRecord.owners.PSObject.Properties['launcher'] -or
+        -not $liveRecord.owners.PSObject.Properties['runner'] -or
+        -not $liveRecord.owners.PSObject.Properties['child'] -or
+        -not $liveRecord.PSObject.Properties['artifact'] -or
+        -not $liveRecord.artifact.PSObject.Properties['path'] -or
+        -not $liveRecord.artifact.PSObject.Properties['sha256']) {
+        Fail-Astro 'ASTRO_FSV_SESSION_OWNER_RECORD_INVALID' `
+            "live-state record omits required exact ownership or artifact binding: $liveStatePath" `
+            'preserve the complete session and investigate its partial durable state'
+    }
+    if ([int]$liveRecord.issue -ne [int]$Inspection.issue -or
+        [string]$liveRecord.tree_sha -cne [string]$Inspection.tree_sha -or
+        [string]$liveRecord.artifact.sha256 -cne [string]$Inspection.sha256 -or
+        -not [string]::Equals(
+            [IO.Path]::GetFullPath([string]$liveRecord.artifact.path),
+            [IO.Path]::GetFullPath($Inspection.artifact_path),
+            [StringComparison]::OrdinalIgnoreCase
+        )) {
+        Fail-Astro 'ASTRO_FSV_SESSION_OWNER_RECORD_INVALID' `
+            "live-state record is not bound to this session: $liveStatePath" `
+            'preserve the complete session and investigate cross-session provenance'
+    }
+    $liveLauncher = Read-AstroFsvProcessIdentity `
+        $liveRecord.owners.launcher `
+        'ASTRO_FSV_SESSION_OWNER_RECORD_INVALID' `
+        'live-state launcher identity'
+    $liveRunner = Read-AstroFsvProcessIdentity `
+        $liveRecord.owners.runner `
+        'ASTRO_FSV_SESSION_OWNER_RECORD_INVALID' `
+        'live-state runner identity'
+    $liveChild = Read-AstroFsvProcessIdentity `
+        $liveRecord.owners.child `
+        'ASTRO_FSV_SESSION_OWNER_RECORD_INVALID' `
+        'live-state child identity'
+    if (-not (Test-AstroFsvIdentityEqual $runLauncher $liveLauncher) -or
+        -not (Test-AstroFsvIdentityEqual $runRunner $liveRunner) -or
+        -not (Test-AstroFsvIdentityEqual $runChild $liveChild)) {
+        Fail-Astro 'ASTRO_FSV_SESSION_OWNER_RECORD_INVALID' `
+            "live-state owner generations differ from the exact run record: $liveStatePath" `
+            'preserve the complete session and investigate cross-run provenance'
+    }
+    foreach ($binding in @(
+            (New-AstroFsvOwnerBinding `
+                'launcher' $liveStatePath $liveLauncher),
+            (New-AstroFsvOwnerBinding `
+                'runner' $liveStatePath $liveRunner),
+            (New-AstroFsvOwnerBinding `
+                'child' $liveStatePath $liveChild)
+        )) {
+        $bindings.Add($binding)
+    }
+    return [object[]]$bindings.ToArray()
+}
+
 function Remove-EmptyEvidenceParents {
     param([Parameter(Mandatory)][string]$Session)
 
@@ -422,6 +981,7 @@ $workspace = [IO.Path]::GetFullPath((Split-Path -Parent $PSScriptRoot))
 $evidenceRoot = Join-Path $workspace '.tmp\native-fsv-artifacts'
 $abandonRoot = Join-Path $workspace '.tmp\native-fsv-abandon-records'
 $recoveryRoot = Join-Path $workspace '.tmp\native-fsv-recovery-records'
+$migrationRoot = Join-Path $workspace '.tmp\native-fsv-legacy-migration-records'
 $fsvLock = Join-Path (Join-Path $workspace '.tmp') 'astrolabe-fsv.lock'
 $launcherLockPath = Join-Path (Join-Path $workspace '.tmp') 'astrolabe-launcher.lock'
 $gitExe = 'C:\Program Files\Git\bin\git.exe'
@@ -486,10 +1046,26 @@ try {
                     "launcher protocol does not name the exact live issue #$Issue process identity for tree $TreeSha (state=$($launcherOwner.State), pid=$launcherPid, process_start_utc_ticks=$($launcherOwner.OwnerProcessStartUtcTicks), read_error=$($launcherOwner.ReadError), validation_error=$($launcherOwner.ValidationError))" `
                     'start artifact promotion through the native launcher with the same issue and tree'
             }
+            $launcherIdentity = New-AstroProcessIdentityRecord `
+                $launcherPid ([long]$launcherOwner.OwnerProcessStartUtcTicks)
+            $launcherIdentityProbe = Get-AstroExactProcessIdentityProbe `
+                -Pid $launcherPid `
+                -ProcessStartUtcTicks (
+                    [long]$launcherOwner.OwnerProcessStartUtcTicks
+                )
+            if ($launcherIdentityProbe.State -cne 'exact-live') {
+                Fail-Astro 'ASTRO_FSV_LAUNCHER_IDENTITY_DRIFT' `
+                    "launcher identity changed before Stage owner capture: $($launcherIdentityProbe | ConvertTo-Json -Depth 6 -Compress)" `
+                    'preserve target and protocol state; only the exact live launcher may stage an artifact'
+            }
             if (-not (Test-DescendantOf -CandidatePid $PID -AncestorPid $launcherPid)) {
                 Fail-Astro 'ASTRO_FSV_PROMOTER_NOT_OWNED' "promoter PID $PID is not a descendant of launcher PID $launcherPid" `
                     'invoke Stage synchronously from the launcher-owned child process'
             }
+            $promoterIdentity = Get-AstroCurrentProcessIdentity `
+                -Pid $PID `
+                -Code 'ASTRO_FSV_PROMOTER_IDENTITY_UNEVALUABLE' `
+                -Description 'artifact promoter'
             $repoState = Get-RepoState -GitExe $gitExe -Workspace $workspace
             if ($repoState.head_sha -cne $TreeSha) {
                 Fail-Astro 'ASTRO_FSV_TREE_MISMATCH' "current HEAD '$($repoState.head_sha)' does not match requested evidence tree '$TreeSha'" `
@@ -540,13 +1116,15 @@ try {
                 Set-AstroFileReadOnlyLongPath -LiteralPath $staged -ReadOnly $true
                 $finalArtifact = Join-Path $finalDirectory $artifactName
                 $receipt = [ordered]@{
-                    schema = 'astrolabe.native-fsv-artifact.v1'
+                    schema = 'astrolabe.native-fsv-artifact.v2'
                     issue = $Issue
                     session_id = $SessionId
                     tree_sha = $TreeSha
                     promoted_at_utc = [DateTime]::UtcNow.ToString('o')
-                    promoter_pid = $PID
-                    launcher_pid = $launcherPid
+                    owners = [ordered]@{
+                        launcher = $launcherIdentity
+                        promoter = $promoterIdentity
+                    }
                     repository = $repoState
                     source = [ordered]@{ path = $source; bytes = [uint64]$sourceItem.Length; sha256 = $sourceHashBefore }
                     artifact = [ordered]@{ path = $finalArtifact; bytes = [uint64]$stagedItem.Length; sha256 = $stagedHash; read_only = $true }
@@ -604,25 +1182,18 @@ try {
                     'use one fresh append-only record path for each never-run evidence session'
             }
             $receipt = $receiptState.Receipt
-            $ownerPids = New-Object System.Collections.Generic.List[int]
-            foreach ($field in @('launcher_pid', 'promoter_pid')) {
-                if (-not $receipt.PSObject.Properties[$field]) {
-                    Fail-Astro 'ASTRO_FSV_RECEIPT_INVALID' "receipt has no $field required for abandonment" `
-                        'preserve the session and investigate its incomplete provenance'
-                }
-                $parsedPid = 0
-                if (-not [int]::TryParse([string]$receipt.$field, [ref]$parsedPid) -or $parsedPid -le 0) {
-                    Fail-Astro 'ASTRO_FSV_RECEIPT_INVALID' "receipt $field is not a positive PID" `
-                        'preserve the session and investigate its incomplete provenance'
-                }
-                if (-not $ownerPids.Contains($parsedPid)) { $ownerPids.Add($parsedPid) }
-            }
-            $liveOwnerPids = @($ownerPids | Where-Object { $null -ne (Get-Process -Id $_ -ErrorAction SilentlyContinue) })
-            if ($liveOwnerPids.Count -gt 0) {
-                Fail-Astro 'ASTRO_FSV_ABANDON_LIVE_OWNER' `
-                    "never-run session still names live receipt owner PID(s): $($liveOwnerPids -join ',')" `
-                    'wait for every exact receipt owner to exit naturally; never abandon a live session'
-            }
+            $ownerBindings = @(
+                New-AstroFsvOwnerBinding `
+                    'launcher' 'artifact receipt' $inspection.owners.launcher
+                New-AstroFsvOwnerBinding `
+                    'promoter' 'artifact receipt' $inspection.owners.promoter
+            )
+            $initialOwnerProbes = @(
+                Assert-AstroFsvOwnersInactive `
+                    -Bindings $ownerBindings `
+                    -CodePrefix 'ASTRO_FSV_ABANDON' `
+                    -Description 'never-run evidence session'
+            )
             $session = [IO.Path]::GetFullPath($inspection.session_directory)
             $allowedEntries = @(
                 [IO.Path]::GetFullPath($receiptState.Path),
@@ -644,8 +1215,14 @@ try {
             New-AstroDirectoryLongPath $recordParent | Out-Null
             Assert-NotReparseEntry $recordParent 'abandonment record parent'
             $currentRepository = Get-RepoState -GitExe $gitExe -Workspace $workspace
+            $finalOwnerProbes = @(
+                Assert-AstroFsvOwnersInactive `
+                    -Bindings $ownerBindings `
+                    -CodePrefix 'ASTRO_FSV_ABANDON' `
+                    -Description 'never-run evidence session final authorization'
+            )
             $record = [ordered]@{
-                schema = 'astrolabe.native-fsv-abandon.v1'
+                schema = 'astrolabe.native-fsv-abandon.v2'
                 verdict = 'abandoned-before-run'
                 issue = [int]$inspection.issue
                 recorded_at_utc = [DateTime]::UtcNow.ToString('o')
@@ -658,8 +1235,17 @@ try {
                 }
                 staged_repository = $receipt.repository
                 current_repository = $currentRepository
-                receipt_owner_pids = @($ownerPids | ForEach-Object { [int]$_ })
-                owner_pids_live = @()
+                owners = [ordered]@{
+                    identities = @($ownerBindings | ForEach-Object {
+                            [ordered]@{
+                                role = $_.Role
+                                source = $_.Source
+                                identity = $_.Identity
+                            }
+                        })
+                    initial_probes = $initialOwnerProbes
+                    final_probes = $finalOwnerProbes
+                }
                 failure = [ordered]@{
                     code = $ReasonCode
                     message = $ReasonMessage
@@ -668,20 +1254,24 @@ try {
             Write-NewDurableUtf8 $abandonRecord ($record | ConvertTo-Json -Depth 15)
             $persistedRecord =
                 Read-AstroUtf8FileLongPath $abandonRecord | ConvertFrom-Json
-            if ($persistedRecord.schema -ne 'astrolabe.native-fsv-abandon.v1' -or
+            if ($persistedRecord.schema -ne 'astrolabe.native-fsv-abandon.v2' -or
                 [string]$persistedRecord.artifact.sha256 -cne [string]$inspection.sha256 -or
                 [string]$persistedRecord.failure.code -cne $ReasonCode) {
                 Fail-Astro 'ASTRO_FSV_ABANDON_RECORD_INVALID' `
                     "persisted abandonment record readback does not bind the session: $abandonRecord" `
                     'preserve both session and record and investigate the durable-write mismatch'
             }
+            Assert-AstroFsvPersistedOwnerEnvelope `
+                -Owners $persistedRecord.owners `
+                -ExpectedBindings $ownerBindings `
+                -Code 'ASTRO_FSV_ABANDON_RECORD_INVALID' `
+                -Description 'persisted abandonment record'
             $recordHash = File-Sha256 $abandonRecord
             $before = [ordered]@{
                 session = $session
                 exists = $true
                 artifact_sha256 = $inspection.sha256
-                receipt_owner_pids = @($ownerPids | ForEach-Object { [int]$_ })
-                owner_pids_live = @()
+                owners = $record.owners
             }
             Set-AstroFileReadOnlyLongPath `
                 -LiteralPath $inspection.artifact_path -ReadOnly $false
@@ -747,7 +1337,11 @@ try {
                 Fail-Astro 'ASTRO_FSV_QUARANTINE_LIVE_STATE_INVALID' "parse live-state '$liveStateFile' failed: $($_.Exception.Message)" `
                     'preserve the session and investigate its incomplete process provenance'
             }
-            if ($liveState.schema -ne 'astrolabe.native-fsv-live.v1' -or
+            if ($liveState.schema -ne 'astrolabe.native-fsv-live.v2' -or
+                -not $liveState.PSObject.Properties['owners'] -or
+                -not $liveState.owners.PSObject.Properties['launcher'] -or
+                -not $liveState.owners.PSObject.Properties['runner'] -or
+                -not $liveState.owners.PSObject.Properties['child'] -or
                 [int]$liveState.issue -ne [int]$inspection.issue -or
                 [string]$liveState.tree_sha -cne [string]$inspection.tree_sha -or
                 -not [string]::Equals([IO.Path]::GetFullPath([string]$liveState.artifact.path), $inspection.artifact_path, [StringComparison]::OrdinalIgnoreCase) -or
@@ -758,29 +1352,42 @@ try {
                     'preserve the session and investigate the cross-session or incomplete provenance'
             }
             $receipt = $receiptState.Receipt
-            $ownerPids = New-Object System.Collections.Generic.List[int]
-            foreach ($owner in @(
-                [ordered]@{ object = $receipt; field = 'launcher_pid'; description = 'artifact receipt' },
-                [ordered]@{ object = $receipt; field = 'promoter_pid'; description = 'artifact receipt' },
-                [ordered]@{ object = $liveState; field = 'launcher_pid'; description = 'runner live state' },
-                [ordered]@{ object = $liveState; field = 'runner_pid'; description = 'runner live state' },
-                [ordered]@{ object = $liveState; field = 'child_pid'; description = 'runner live state' }
-            )) {
-                $ownerPid = Read-PositivePid $owner.object $owner.field `
-                    'ASTRO_FSV_QUARANTINE_OWNER_INVALID' $owner.description
-                if (-not $ownerPids.Contains($ownerPid)) { $ownerPids.Add($ownerPid) }
-            }
-            if ([int]$receipt.launcher_pid -ne [int]$liveState.launcher_pid) {
+            $liveLauncherIdentity = Read-AstroFsvProcessIdentity `
+                $liveState.owners.launcher `
+                'ASTRO_FSV_QUARANTINE_OWNER_INVALID' `
+                'runner live-state launcher identity'
+            $liveRunnerIdentity = Read-AstroFsvProcessIdentity `
+                $liveState.owners.runner `
+                'ASTRO_FSV_QUARANTINE_OWNER_INVALID' `
+                'runner live-state runner identity'
+            $liveChildIdentity = Read-AstroFsvProcessIdentity `
+                $liveState.owners.child `
+                'ASTRO_FSV_QUARANTINE_OWNER_INVALID' `
+                'runner live-state child identity'
+            if (-not (Test-AstroFsvIdentityEqual `
+                    $inspection.owners.launcher $liveLauncherIdentity)) {
                 Fail-Astro 'ASTRO_FSV_QUARANTINE_OWNER_MISMATCH' `
-                    "receipt launcher PID $($receipt.launcher_pid) differs from runner live-state launcher PID $($liveState.launcher_pid)" `
+                    'receipt and runner live-state launcher generations differ' `
                     'preserve the session and investigate the cross-lease provenance'
             }
-            $liveOwnerPids = @($ownerPids | Where-Object { $null -ne (Get-Process -Id $_ -ErrorAction SilentlyContinue) })
-            if ($liveOwnerPids.Count -gt 0) {
-                Fail-Astro 'ASTRO_FSV_QUARANTINE_LIVE_OWNER' `
-                    "terminal partial session still names live owner PID(s): $($liveOwnerPids -join ',')" `
-                    'wait for every exact owner to exit naturally; never quarantine a live session'
-            }
+            $ownerBindings = @(
+                New-AstroFsvOwnerBinding `
+                    'launcher' 'artifact receipt' $inspection.owners.launcher
+                New-AstroFsvOwnerBinding `
+                    'promoter' 'artifact receipt' $inspection.owners.promoter
+                New-AstroFsvOwnerBinding `
+                    'launcher' 'runner live state' $liveLauncherIdentity
+                New-AstroFsvOwnerBinding `
+                    'runner' 'runner live state' $liveRunnerIdentity
+                New-AstroFsvOwnerBinding `
+                    'child' 'runner live state' $liveChildIdentity
+            )
+            $initialOwnerProbes = @(
+                Assert-AstroFsvOwnersInactive `
+                    -Bindings $ownerBindings `
+                    -CodePrefix 'ASTRO_FSV_QUARANTINE' `
+                    -Description 'terminal partial evidence session'
+            )
             if ([string]::IsNullOrWhiteSpace($RunRecordPath)) {
                 Fail-Astro 'ASTRO_FSV_QUARANTINE_RUN_RECORD_PATH_REQUIRED' 'RunRecordPath is required for Quarantine' `
                     'pass the exact run-record path that the failed runner was required to publish'
@@ -795,7 +1402,7 @@ try {
                     $candidateRecord =
                         Read-AstroUtf8FileLongPath $expectedRunRecord |
                             ConvertFrom-Json
-                    if ($candidateRecord.schema -eq 'astrolabe.native-fsv-run.v1' -and
+                    if ($candidateRecord.schema -eq 'astrolabe.native-fsv-run.v2' -and
                         [int]$candidateRecord.issue -eq [int]$inspection.issue -and
                         [string]::Equals([IO.Path]::GetFullPath([string]$candidateRecord.receipt_path), $receiptState.Path, [StringComparison]::OrdinalIgnoreCase) -and
                         [string]::Equals([IO.Path]::GetFullPath([string]$candidateRecord.artifact.path), $inspection.artifact_path, [StringComparison]::OrdinalIgnoreCase) -and
@@ -840,8 +1447,14 @@ try {
             New-AstroDirectoryLongPath $recordParent | Out-Null
             Assert-NotReparseEntry $recordParent 'recovery record parent'
             $currentRepository = Get-RepoState -GitExe $gitExe -Workspace $workspace
+            $finalOwnerProbes = @(
+                Assert-AstroFsvOwnersInactive `
+                    -Bindings $ownerBindings `
+                    -CodePrefix 'ASTRO_FSV_QUARANTINE' `
+                    -Description 'terminal partial evidence session final authorization'
+            )
             $record = [ordered]@{
-                schema = 'astrolabe.native-fsv-recovery.v1'
+                schema = 'astrolabe.native-fsv-recovery.v2'
                 verdict = 'quarantined-unverified-run'
                 issue = [int]$inspection.issue
                 recorded_at_utc = [DateTime]::UtcNow.ToString('o')
@@ -865,8 +1478,17 @@ try {
                     launcher_protocol_state = $launcherProtocolState.State
                     session_files = $inventory
                 }
-                owner_pids = @($ownerPids | ForEach-Object { [int]$_ })
-                owner_pids_live = @()
+                owners = [ordered]@{
+                    identities = @($ownerBindings | ForEach-Object {
+                            [ordered]@{
+                                role = $_.Role
+                                source = $_.Source
+                                identity = $_.Identity
+                            }
+                        })
+                    initial_probes = $initialOwnerProbes
+                    final_probes = $finalOwnerProbes
+                }
                 failure = [ordered]@{
                     code = $ReasonCode
                     message = $ReasonMessage
@@ -875,7 +1497,7 @@ try {
             Write-NewDurableUtf8 $recoveryRecord ($record | ConvertTo-Json -Depth 20)
             $persistedRecord =
                 Read-AstroUtf8FileLongPath $recoveryRecord | ConvertFrom-Json
-            if ($persistedRecord.schema -ne 'astrolabe.native-fsv-recovery.v1' -or
+            if ($persistedRecord.schema -ne 'astrolabe.native-fsv-recovery.v2' -or
                 $persistedRecord.verdict -ne 'quarantined-unverified-run' -or
                 [string]$persistedRecord.artifact.sha256 -cne [string]$inspection.sha256 -or
                 [string]$persistedRecord.failure.code -cne $ReasonCode -or
@@ -884,14 +1506,18 @@ try {
                     "persisted recovery record readback does not bind the terminal session: $recoveryRecord" `
                     'preserve both session and record and investigate the durable-write mismatch'
             }
+            Assert-AstroFsvPersistedOwnerEnvelope `
+                -Owners $persistedRecord.owners `
+                -ExpectedBindings $ownerBindings `
+                -Code 'ASTRO_FSV_QUARANTINE_RECORD_INVALID' `
+                -Description 'persisted recovery record'
             $recordHash = File-Sha256 $recoveryRecord
             $before = [ordered]@{
                 session = $session
                 exists = $true
                 artifact_sha256 = $inspection.sha256
                 file_count = $inventory.Count
-                owner_pids = @($ownerPids | ForEach-Object { [int]$_ })
-                owner_pids_live = @()
+                owners = $record.owners
             }
             Remove-AstroOrdinaryFlatDirectoryLongPath $session
             if (Test-AstroPathLongPath -LiteralPath $session) {
@@ -908,10 +1534,419 @@ try {
                 after = [ordered]@{ session = $session; exists = $false }
             } | ConvertTo-Json -Depth 22 -Compress | Write-Output
         }
+        'MigrateLegacy' {
+            if ($Issue -le 0) {
+                Fail-Astro 'ASTRO_FSV_MIGRATION_ISSUE_INVALID' `
+                    'Issue must be positive for legacy migration' `
+                    'pass the exact driving GitHub issue number'
+            }
+            Assert-FsvLockAbsent $fsvLock
+            $launcherProtocolState =
+                Read-AstroLauncherLock -LockPath $launcherLockPath
+            if ($launcherProtocolState.State -ne 'absent') {
+                Fail-Astro 'ASTRO_FSV_MIGRATION_LAUNCHER_LOCK' `
+                    "launcher protocol is '$($launcherProtocolState.State)'; legacy migration requires authoritative absence" `
+                    'wait for or tracker-reclaim the exact launcher state before migration'
+            }
+            if ([string]::IsNullOrWhiteSpace($ReceiptPath)) {
+                Fail-Astro 'ASTRO_FSV_MIGRATION_RECEIPT_REQUIRED' `
+                    'ReceiptPath is required for MigrateLegacy' `
+                    'pass the exact legacy v1 receipt inside the staged session'
+            }
+            $legacyReceiptPath = Assert-PathWithin `
+                $ReceiptPath $evidenceRoot `
+                'ASTRO_FSV_MIGRATION_RECEIPT_ESCAPE' `
+                'legacy receipt path'
+            if (-not (Test-AstroPathLongPath `
+                    -LiteralPath $legacyReceiptPath -PathType Leaf)) {
+                Fail-Astro 'ASTRO_FSV_MIGRATION_RECEIPT_MISSING' `
+                    "legacy receipt is absent: $legacyReceiptPath" `
+                    'preserve surrounding state and pass the exact persisted receipt'
+            }
+            try {
+                $legacyReceipt =
+                    Read-AstroUtf8FileLongPath $legacyReceiptPath |
+                        ConvertFrom-Json
+            }
+            catch {
+                Fail-Astro 'ASTRO_FSV_MIGRATION_RECEIPT_INVALID' `
+                    "legacy receipt parse failed: $($_.Exception.Message)" `
+                    'preserve the session; malformed state is not migration-authorizing'
+            }
+            if ($legacyReceipt.schema -ne
+                    'astrolabe.native-fsv-artifact.v1' -or
+                [int]$legacyReceipt.issue -ne $Issue -or
+                [string]$legacyReceipt.tree_sha -cnotmatch '^[0-9a-f]{40}$' -or
+                [string]$legacyReceipt.artifact.sha256 -cnotmatch
+                    '^[0-9a-f]{64}$' -or
+                [string]$legacyReceipt.session_id -cnotmatch
+                    '^[A-Za-z0-9][A-Za-z0-9._-]{0,95}$') {
+                Fail-Astro 'ASTRO_FSV_MIGRATION_RECEIPT_INVALID' `
+                    'receipt is not the exact supported legacy v1 shape/issue' `
+                    'preserve the session; only valid v1 state has this explicit migration path'
+            }
+            $legacySession =
+                [IO.Path]::GetFullPath((Split-Path -Parent $legacyReceiptPath))
+            $expectedLegacySession = Join-Path (
+                Join-Path (
+                    Join-Path $evidenceRoot ([string]$legacyReceipt.tree_sha)
+                ) ([string]$legacyReceipt.artifact.sha256)
+            ) ([string]$legacyReceipt.session_id)
+            if (-not [string]::Equals(
+                    $legacySession,
+                    [IO.Path]::GetFullPath($expectedLegacySession),
+                    [StringComparison]::OrdinalIgnoreCase
+                )) {
+                Fail-Astro 'ASTRO_FSV_MIGRATION_RECEIPT_INVALID' `
+                    'legacy receipt path differs from its tree/hash/session identity' `
+                    'preserve relocated or cross-session state for investigation'
+            }
+            Assert-NotReparseEntry $legacySession 'legacy evidence session'
+            $legacyArtifact = Assert-PathWithin `
+                ([string]$legacyReceipt.artifact.path) `
+                $legacySession `
+                'ASTRO_FSV_MIGRATION_ARTIFACT_ESCAPE' `
+                'legacy artifact path'
+            if (-not (Test-AstroPathLongPath `
+                    -LiteralPath $legacyArtifact -PathType Leaf)) {
+                Fail-Astro 'ASTRO_FSV_MIGRATION_ARTIFACT_MISSING' `
+                    "legacy artifact is absent: $legacyArtifact" `
+                    'preserve the session; incomplete legacy state is not migration-authorizing'
+            }
+            $legacyArtifactItem = Get-AstroFileInfoLongPath $legacyArtifact
+            $legacyArtifactHash = File-Sha256 $legacyArtifact
+            if ([uint64]$legacyArtifactItem.Length -ne
+                    [uint64]$legacyReceipt.artifact.bytes -or
+                $legacyArtifactHash -cne
+                    [string]$legacyReceipt.artifact.sha256) {
+                Fail-Astro 'ASTRO_FSV_MIGRATION_ARTIFACT_DRIFT' `
+                    'legacy artifact bytes differ from the receipt' `
+                    'preserve the drifted session and investigate its writer'
+            }
+            $legacyPids =
+                New-Object System.Collections.Generic.List[int]
+            foreach ($field in @('launcher_pid', 'promoter_pid')) {
+                $parsedPid = 0
+                if (-not $legacyReceipt.PSObject.Properties[$field] -or
+                    -not [int]::TryParse(
+                        [string]$legacyReceipt.$field,
+                        [Globalization.NumberStyles]::None,
+                        [Globalization.CultureInfo]::InvariantCulture,
+                        [ref]$parsedPid
+                    ) -or $parsedPid -le 0) {
+                    Fail-Astro 'ASTRO_FSV_MIGRATION_RECEIPT_INVALID' `
+                        "legacy receipt $field is absent or invalid" `
+                        'preserve the session; missing legacy numeric ownership cannot be inferred'
+                }
+                if (-not $legacyPids.Contains($parsedPid)) {
+                    $legacyPids.Add($parsedPid)
+                }
+            }
+            $legacySessionEntries =
+                @(Get-AstroDirectoryEntriesLongPath $legacySession)
+            $legacyControlPaths = @(
+                $legacyReceiptPath,
+                $legacyArtifact
+            )
+            $legacyAdditionalEntries = @(
+                $legacySessionEntries |
+                    Where-Object {
+                        [IO.Path]::GetFullPath($_.FullName) -notin
+                            $legacyControlPaths
+                    }
+            )
+            if ($legacyAdditionalEntries.Count -gt 0) {
+                if ([string]::IsNullOrWhiteSpace($RunRecordPath) -or
+                    [string]::IsNullOrWhiteSpace($LiveStatePath)) {
+                    Fail-Astro 'ASTRO_FSV_MIGRATION_CONTROL_PATH_REQUIRED' `
+                        'nonpristine legacy sessions require explicit RunRecordPath and LiveStatePath bindings' `
+                        'pass the exact two v1 control records; ordinary JSON output is never inferred to be authority'
+                }
+                $legacyRunPath = Assert-PathWithin `
+                    $RunRecordPath $legacySession `
+                    'ASTRO_FSV_MIGRATION_CONTROL_PATH_ESCAPE' `
+                    'legacy run-record path'
+                $legacyLivePath = Assert-PathWithin `
+                    $LiveStatePath $legacySession `
+                    'ASTRO_FSV_MIGRATION_CONTROL_PATH_ESCAPE' `
+                    'legacy live-state path'
+                if (-not (Test-AstroPathLongPath `
+                        -LiteralPath $legacyRunPath -PathType Leaf) -or
+                    -not (Test-AstroPathLongPath `
+                        -LiteralPath $legacyLivePath -PathType Leaf) -or
+                    [string]::Equals(
+                        $legacyRunPath,
+                        $legacyLivePath,
+                        [StringComparison]::OrdinalIgnoreCase
+                    ) -or
+                    $legacyControlPaths -contains $legacyRunPath -or
+                    $legacyControlPaths -contains $legacyLivePath) {
+                    Fail-Astro 'ASTRO_FSV_MIGRATION_CONTROL_PATH_INVALID' `
+                        'legacy run/live control paths are absent, duplicate, or overlap receipt/artifact state' `
+                        'preserve the session and pass two exact distinct persisted v1 control files'
+                }
+                try {
+                    $legacyRun =
+                        Read-AstroUtf8FileLongPath $legacyRunPath |
+                        ConvertFrom-Json
+                    $legacyLive =
+                        Read-AstroUtf8FileLongPath $legacyLivePath |
+                        ConvertFrom-Json
+                }
+                catch {
+                    Fail-Astro 'ASTRO_FSV_MIGRATION_SESSION_INVALID' `
+                        "explicit legacy run/live control state is unreadable: $($_.Exception.Message)" `
+                        'preserve malformed legacy state; migration requires a complete inventory'
+                }
+                if ($legacyRun.schema -ne 'astrolabe.native-fsv-run.v1' -or
+                    $legacyLive.schema -ne
+                        'astrolabe.native-fsv-live.v1' -or
+                    -not $legacyRun.PSObject.Properties['runner'] -or
+                    -not $legacyRun.PSObject.Properties['process'] -or
+                    -not $legacyRun.PSObject.Properties['receipt_path'] -or
+                    -not $legacyRun.PSObject.Properties['artifact'] -or
+                    -not $legacyRun.artifact.PSObject.Properties['path'] -or
+                    -not $legacyRun.artifact.PSObject.Properties['sha256'] -or
+                    -not $legacyLive.PSObject.Properties['artifact'] -or
+                    -not $legacyLive.artifact.PSObject.Properties['path'] -or
+                    -not $legacyLive.artifact.PSObject.Properties['sha256'] -or
+                    [int]$legacyRun.issue -ne $Issue -or
+                    [int]$legacyLive.issue -ne $Issue -or
+                    [string]$legacyRun.artifact.sha256 -cne
+                        [string]$legacyReceipt.artifact.sha256 -or
+                    [string]$legacyLive.artifact.sha256 -cne
+                        [string]$legacyReceipt.artifact.sha256 -or
+                    -not [string]::Equals(
+                        [IO.Path]::GetFullPath(
+                            [string]$legacyRun.receipt_path
+                        ),
+                        $legacyReceiptPath,
+                        [StringComparison]::OrdinalIgnoreCase
+                    ) -or
+                    -not [string]::Equals(
+                        [IO.Path]::GetFullPath(
+                            [string]$legacyRun.artifact.path
+                        ),
+                        $legacyArtifact,
+                        [StringComparison]::OrdinalIgnoreCase
+                    ) -or
+                    -not [string]::Equals(
+                        [IO.Path]::GetFullPath(
+                            [string]$legacyLive.artifact.path
+                        ),
+                        $legacyArtifact,
+                        [StringComparison]::OrdinalIgnoreCase
+                    )) {
+                    Fail-Astro 'ASTRO_FSV_MIGRATION_SESSION_INVALID' `
+                        'explicit legacy run/live records are incomplete or not bound to the receipt/artifact' `
+                        'preserve unknown, partial, or mixed-session state for investigation'
+                }
+                $pidValues = @(
+                    $legacyLive.launcher_pid,
+                    $legacyLive.runner_pid,
+                    $legacyLive.child_pid,
+                    $legacyRun.runner.pid,
+                    $legacyRun.runner.launcher_pid,
+                    $legacyRun.process.pid
+                )
+                if ($legacyRun.PSObject.Properties['launcher_lease']) {
+                    $pidValues += @(
+                        $legacyRun.launcher_lease.owner_pid
+                    )
+                }
+                foreach ($value in @($pidValues)) {
+                    $parsedPid = 0
+                    if (-not [int]::TryParse(
+                            [string]$value,
+                            [Globalization.NumberStyles]::None,
+                            [Globalization.CultureInfo]::InvariantCulture,
+                            [ref]$parsedPid
+                        ) -or $parsedPid -le 0) {
+                        Fail-Astro 'ASTRO_FSV_MIGRATION_SESSION_INVALID' `
+                            'legacy run/live owner PID is absent or invalid' `
+                            'preserve incomplete legacy ownership state'
+                    }
+                    if (-not $legacyPids.Contains($parsedPid)) {
+                        $legacyPids.Add($parsedPid)
+                    }
+                }
+                if ([int]$legacyLive.launcher_pid -ne
+                        [int]$legacyReceipt.launcher_pid -or
+                    [int]$legacyRun.runner.launcher_pid -ne
+                        [int]$legacyLive.launcher_pid -or
+                    [int]$legacyRun.runner.pid -ne
+                        [int]$legacyLive.runner_pid -or
+                    [int]$legacyRun.process.pid -ne
+                        [int]$legacyLive.child_pid -or
+                    ($legacyRun.PSObject.Properties['launcher_lease'] -and
+                        [int]$legacyRun.launcher_lease.owner_pid -ne
+                            [int]$legacyLive.launcher_pid)) {
+                    Fail-Astro 'ASTRO_FSV_MIGRATION_SESSION_INVALID' `
+                        'legacy receipt, live state, and run record disagree on numeric ownership' `
+                        'preserve cross-generation or contradictory legacy state for investigation'
+                }
+            }
+            $legacyInventory = @(Get-SessionFileInventory $legacySession)
+            $legacyInventoryJson =
+                $legacyInventory | ConvertTo-Json -Depth 12 -Compress
+            $legacyInventorySha256 =
+                String-Sha256 ([string]$legacyInventoryJson)
+            $legacyReceiptSha256 = File-Sha256 $legacyReceiptPath
+            $initialLegacyProbes = foreach ($legacyPid in $legacyPids) {
+                $probe =
+                    Get-AstroProcessIdentityProbe -OwnerPid $legacyPid
+                if ($probe.State -ceq 'unevaluable') {
+                    Fail-Astro 'ASTRO_FSV_MIGRATION_OWNER_UNEVALUABLE' `
+                        "legacy numeric PID $legacyPid is unevaluable: $($probe.Error)" `
+                        'preserve every session byte and retry only when PID state is readable'
+                }
+                if ($probe.State -cne 'absent') {
+                    Fail-Astro 'ASTRO_FSV_MIGRATION_PID_OCCUPIED' `
+                        "legacy numeric PID $legacyPid is occupied; v1 cannot distinguish the original owner from reuse" `
+                        'wait until every legacy numeric PID is completely absent'
+                }
+                [ordered]@{
+                    pid = $legacyPid
+                    state = 'absent'
+                    observed_at_utc = [DateTime]::UtcNow.ToString('o')
+                }
+            }
+            if ([string]::IsNullOrWhiteSpace($MigrationRecordPath)) {
+                Fail-Astro 'ASTRO_FSV_MIGRATION_RECORD_REQUIRED' `
+                    'MigrationRecordPath is required for MigrateLegacy' `
+                    "use a fresh JSON path below $migrationRoot"
+            }
+            $migrationRecord = Assert-PathWithin `
+                $MigrationRecordPath $migrationRoot `
+                'ASTRO_FSV_MIGRATION_RECORD_ESCAPE' `
+                'legacy migration record path'
+            if (Test-AstroPathLongPath -LiteralPath $migrationRecord) {
+                Fail-Astro 'ASTRO_FSV_MIGRATION_RECORD_REUSE_REFUSED' `
+                    "migration record already exists: $migrationRecord" `
+                    'use one fresh append-only record path per legacy session'
+            }
+            if ($ReasonCode -notmatch '^[A-Z][A-Z0-9_]{2,95}$' -or
+                [string]::IsNullOrWhiteSpace($ReasonMessage)) {
+                Fail-Astro 'ASTRO_FSV_MIGRATION_REASON_INVALID' `
+                    'MigrateLegacy requires a structured ReasonCode and nonblank ReasonMessage' `
+                    'describe why this exact legacy session must be retired'
+            }
+            $tracker = Read-AstroFsvLegacyTrackerEvidence `
+                -Url $TrackerCommentUrl `
+                -ExpectedIssue $Issue `
+                -ExpectedReceiptPath $legacyReceiptPath `
+                -ExpectedReceiptSha256 $legacyReceiptSha256 `
+                -ExpectedSessionDirectory $legacySession `
+                -ExpectedInventorySha256 $legacyInventorySha256 `
+                -ExpectedNumericOwnerPids ([int[]]$legacyPids.ToArray()) `
+                -ExpectedMigrationRecordPath $migrationRecord
+            $finalInventory = @(Get-SessionFileInventory $legacySession)
+            $finalInventorySha256 = String-Sha256 (
+                [string](
+                    $finalInventory |
+                        ConvertTo-Json -Depth 12 -Compress
+                )
+            )
+            if ($finalInventorySha256 -cne $legacyInventorySha256 -or
+                (File-Sha256 $legacyReceiptPath) -cne
+                    $legacyReceiptSha256) {
+                Fail-Astro 'ASTRO_FSV_MIGRATION_SESSION_DRIFT' `
+                    'legacy session inventory changed after tracker authorization' `
+                    'preserve the session and post fresh evidence for its current bytes'
+            }
+            $finalLegacyProbes = foreach ($legacyPid in $legacyPids) {
+                $probe =
+                    Get-AstroProcessIdentityProbe -OwnerPid $legacyPid
+                if ($probe.State -cne 'absent') {
+                    Fail-Astro 'ASTRO_FSV_MIGRATION_OWNER_CHANGED' `
+                        "legacy numeric PID $legacyPid changed to '$($probe.State)' before removal" `
+                        'preserve the session and repeat tracker authorization only after every numeric PID is absent'
+                }
+                [ordered]@{
+                    pid = $legacyPid
+                    state = 'absent'
+                    observed_at_utc = [DateTime]::UtcNow.ToString('o')
+                }
+            }
+            $recordParent = Split-Path -Parent $migrationRecord
+            New-AstroDirectoryLongPath $recordParent | Out-Null
+            Assert-NotReparseEntry $recordParent `
+                'legacy migration record parent'
+            $migration = [ordered]@{
+                schema = 'astrolabe.native-fsv-legacy-migration.v1'
+                verdict = 'legacy-session-removed-without-identity-inference'
+                issue = $Issue
+                recorded_at_utc = [DateTime]::UtcNow.ToString('o')
+                receipt_path = $legacyReceiptPath
+                receipt_sha256 = $legacyReceiptSha256
+                session_directory = $legacySession
+                inventory = $legacyInventory
+                inventory_sha256 = $legacyInventorySha256
+                legacy_numeric_owner_pids =
+                    [int[]]@($legacyPids | Sort-Object -Unique)
+                initial_numeric_owner_probes = @($initialLegacyProbes)
+                final_numeric_owner_probes = @($finalLegacyProbes)
+                tracker = $tracker
+                failure = [ordered]@{
+                    code = $ReasonCode
+                    message = $ReasonMessage
+                }
+            }
+            Write-NewDurableUtf8 `
+                $migrationRecord ($migration | ConvertTo-Json -Depth 22)
+            $persistedMigration =
+                Read-AstroUtf8FileLongPath $migrationRecord |
+                    ConvertFrom-Json
+            if ($persistedMigration.schema -ne
+                    'astrolabe.native-fsv-legacy-migration.v1' -or
+                [string]$persistedMigration.receipt_sha256 -cne
+                    $legacyReceiptSha256 -or
+                [string]$persistedMigration.inventory_sha256 -cne
+                    $legacyInventorySha256 -or
+                [string]$persistedMigration.tracker.url -cne
+                    $TrackerCommentUrl) {
+                Fail-Astro 'ASTRO_FSV_MIGRATION_RECORD_INVALID' `
+                    'persisted migration record does not bind the authorized legacy session' `
+                    'preserve both session and external record for investigation'
+            }
+            $migrationRecordSha256 = File-Sha256 $migrationRecord
+            Set-AstroFileReadOnlyLongPath `
+                -LiteralPath $legacyArtifact -ReadOnly $false
+            Remove-AstroOrdinaryFlatDirectoryLongPath $legacySession
+            if (Test-AstroPathLongPath -LiteralPath $legacySession) {
+                Fail-Astro 'ASTRO_FSV_MIGRATION_REMOVE_FAILED' `
+                    "legacy session remains after migration: $legacySession" `
+                    'preserve the external record and inspect exact filesystem handles'
+            }
+            Remove-EmptyEvidenceParents $legacySession
+            [ordered]@{
+                operation = 'migrate-legacy'
+                record_path = $migrationRecord
+                record_sha256 = $migrationRecordSha256
+                record = $persistedMigration
+                before = [ordered]@{
+                    session = $legacySession
+                    exists = $true
+                    receipt_sha256 = $legacyReceiptSha256
+                    inventory_sha256 = $legacyInventorySha256
+                }
+                after = [ordered]@{
+                    session = $legacySession
+                    exists = $false
+                }
+            } | ConvertTo-Json -Depth 24 -Compress | Write-Output
+        }
         'Cleanup' {
             $receiptState = Read-Receipt $ReceiptPath $evidenceRoot
             $inspection = Inspect-ReceiptArtifact $receiptState $evidenceRoot
             Assert-FsvLockAbsent $fsvLock
+            $launcherProtocolState =
+                Read-AstroLauncherLock -LockPath $launcherLockPath
+            if ($launcherProtocolState.State -ne 'absent') {
+                Fail-Astro 'ASTRO_FSV_CLEANUP_LAUNCHER_LOCK' `
+                    "launcher protocol is '$($launcherProtocolState.State)'; completed-session cleanup requires authoritative absence (transitions=$(@($launcherProtocolState.TransitionPaths) -join '; '), read_error=$($launcherProtocolState.ReadError), validation_error=$($launcherProtocolState.ValidationError))" `
+                    'wait for the exact launcher generation to exit and finish its protocol cleanup'
+            }
             if ([string]::IsNullOrWhiteSpace($RunRecordPath)) {
                 Fail-Astro 'ASTRO_FSV_RUN_RECORD_REQUIRED' 'RunRecordPath is required for Cleanup' `
                     'pass the persisted run record written by native-fsv-run.ps1 after the real process exited'
@@ -929,7 +1964,19 @@ try {
                 Fail-Astro 'ASTRO_FSV_RUN_RECORD_INVALID' "parse run record '$runRecord' failed: $($_.Exception.Message)" `
                     'preserve the evidence directory and investigate the incomplete run'
             }
-            if ($record.schema -ne 'astrolabe.native-fsv-run.v1' -or
+            if (-not $record.PSObject.Properties['launcher'] -or
+                -not $record.PSObject.Properties['runner'] -or
+                -not $record.PSObject.Properties['process'] -or
+                -not $record.process.PSObject.Properties['identity'] -or
+                -not $record.PSObject.Properties['artifact'] -or
+                -not $record.artifact.PSObject.Properties['path'] -or
+                -not $record.artifact.PSObject.Properties['sha256'] -or
+                -not $record.PSObject.Properties['receipt_path']) {
+                Fail-Astro 'ASTRO_FSV_RUN_RECORD_INVALID' `
+                    "run record '$runRecord' omits required exact ownership or artifact binding" `
+                    'preserve the evidence directory and investigate the incomplete run'
+            }
+            if ($record.schema -ne 'astrolabe.native-fsv-run.v2' -or
                 [int]$record.issue -ne [int]$inspection.issue -or
                 -not [string]::Equals([IO.Path]::GetFullPath([string]$record.receipt_path), $receiptState.Path, [StringComparison]::OrdinalIgnoreCase) -or
                 -not [string]::Equals([IO.Path]::GetFullPath([string]$record.artifact.path), $inspection.artifact_path, [StringComparison]::OrdinalIgnoreCase) -or
@@ -937,29 +1984,48 @@ try {
                 Fail-Astro 'ASTRO_FSV_RUN_RECORD_INVALID' "run record '$runRecord' is not bound to the staged artifact" `
                     'preserve the evidence directory and investigate the provenance mismatch'
             }
-            $childPid = 0
-            if (-not [int]::TryParse([string]$record.process.pid, [ref]$childPid) -or $childPid -le 0) {
-                Fail-Astro 'ASTRO_FSV_RUN_RECORD_INVALID' "run record '$runRecord' has no valid child PID" `
-                    'preserve the evidence directory and investigate the incomplete run'
-            }
-            if ($null -ne (Get-Process -Id $childPid -ErrorAction SilentlyContinue)) {
-                Fail-Astro 'ASTRO_FSV_CLEANUP_LIVE_PROCESS' "recorded native process PID $childPid is still live" `
-                    'wait for the exact recorded process to exit; never clean a live process artifact'
-            }
+            $ownerBindings = @(
+                Get-AstroFsvSessionOwnerBindings `
+                    -ReceiptState $receiptState `
+                    -Inspection $inspection `
+                    -RunRecordPath $runRecord `
+                    -RunRecord $record
+            )
+            $initialOwnerProbes = @(
+                Assert-AstroFsvOwnersInactive `
+                    -Bindings $ownerBindings `
+                    -CodePrefix 'ASTRO_FSV_CLEANUP' `
+                    -Description 'completed evidence session'
+            )
             $session = [IO.Path]::GetFullPath($inspection.session_directory)
+            $finalOwnerProbes = @(
+                Assert-AstroFsvOwnersInactive `
+                    -Bindings $ownerBindings `
+                    -CodePrefix 'ASTRO_FSV_CLEANUP' `
+                    -Description 'completed evidence session final authorization'
+            )
             $before = [ordered]@{
                 session = $session
                 exists = Test-AstroPathLongPath -LiteralPath $session
                 artifact_sha256 = $inspection.sha256
-                child_pid = $childPid
-                child_live = $false
+                owners = [ordered]@{
+                    identities = @($ownerBindings | ForEach-Object {
+                            [ordered]@{
+                                role = $_.Role
+                                source = $_.Source
+                                identity = $_.Identity
+                            }
+                        })
+                    initial_probes = $initialOwnerProbes
+                    final_probes = $finalOwnerProbes
+                }
             }
             Set-AstroFileReadOnlyLongPath `
                 -LiteralPath $inspection.artifact_path -ReadOnly $false
             Remove-AstroOrdinaryFlatDirectoryLongPath $session
             if (Test-AstroPathLongPath -LiteralPath $session) {
                 Fail-Astro 'ASTRO_FSV_CLEANUP_FAILED' "evidence session remains after cleanup: $session" `
-                    'inspect open handles and remove the exact session only after every owner PID is dead'
+                    'inspect open handles and retry only after every exact owner generation is dead'
             }
             Remove-EmptyEvidenceParents $session
             [ordered]@{ operation = 'cleanup'; before = $before; after = [ordered]@{ session = $session; exists = $false } } |

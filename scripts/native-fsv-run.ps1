@@ -11,12 +11,14 @@
 
     Before returning, it independently reads back the artifact hash, output hashes, and the
     kernel exit code through both the original PROCESS_INFORMATION process handle and a
-    separately duplicated handle to that exact kernel object. It also records Git tree state
-    into a durable run record. No PID-reopened process authority, CPU fallback, output
-    substitution, retry, or mock behavior exists here.
+    separately duplicated handle to that exact kernel object. Every launcher, runner, and child
+    owner is persisted with process-start UTC ticks; the child ticks come from GetProcessTimes
+    on the retained CreateProcess handle. It also records Git tree state into a durable run
+    record. No PID-reopened process authority, CPU fallback, output substitution, retry, or mock
+    behavior exists here.
 
 .NOTES
-    Refs #600, #596, #424, #197. Manual FSV tooling; this is not a test or a gate.
+    Refs #612, #600, #596, #424, #197. Manual FSV tooling; this is not a test or a gate.
 #>
 [CmdletBinding()]
 param(
@@ -174,6 +176,85 @@ function Get-RepoState([string]$GitExe, [string]$Workspace) {
     return [ordered]@{ head_sha = $head; status_sha256 = String-Sha256 $status; diff_sha256 = String-Sha256 $diff }
 }
 
+function Read-AstroFsvProcessIdentity(
+    $Object,
+    [string]$Code,
+    [string]$Description
+) {
+    if ($null -eq $Object) {
+        Fail-Astro $Code "$Description is absent" `
+            'preserve the session and investigate incomplete process provenance'
+    }
+    $properties = @($Object.PSObject.Properties | ForEach-Object Name)
+    $required = @('pid', 'process_start_utc_ticks', 'process_started_utc')
+    if ($properties.Count -ne $required.Count -or
+        @($required | Where-Object { $properties -notcontains $_ }).Count -ne 0) {
+        Fail-Astro $Code `
+            "$Description must contain exactly pid, process_start_utc_ticks, process_started_utc" `
+            'preserve the session; legacy and partial authority records fail closed'
+    }
+    $parsedPid = 0
+    $parsedTicks = 0L
+    if (-not [int]::TryParse(
+            [string]$Object.pid,
+            [Globalization.NumberStyles]::None,
+            [Globalization.CultureInfo]::InvariantCulture,
+            [ref]$parsedPid
+        ) -or $parsedPid -le 0 -or
+        -not [long]::TryParse(
+            [string]$Object.process_start_utc_ticks,
+            [Globalization.NumberStyles]::None,
+            [Globalization.CultureInfo]::InvariantCulture,
+            [ref]$parsedTicks
+        ) -or $parsedTicks -le 0 -or
+        $parsedTicks -gt [DateTime]::MaxValue.Ticks) {
+        Fail-Astro $Code "$Description has an invalid PID or process-start UTC ticks" `
+            'preserve the session and investigate incomplete process provenance'
+    }
+    $expectedIso = ConvertTo-AstroProcessStartUtcIso $parsedTicks
+    $startedValue = $Object.process_started_utc
+    $startedMatches = if ($startedValue -is [DateTime]) {
+        $startedValue.ToUniversalTime().Ticks -eq $parsedTicks
+    }
+    elseif ($startedValue -is [DateTimeOffset]) {
+        $startedValue.UtcDateTime.Ticks -eq $parsedTicks
+    }
+    else {
+        [string]::Equals(
+            [string]$startedValue,
+            $expectedIso,
+            [StringComparison]::Ordinal
+        )
+    }
+    if (-not $startedMatches) {
+        Fail-Astro $Code `
+            "$Description UTC diagnostic differs from its exact UTC ticks" `
+            'preserve the session and investigate durable identity drift'
+    }
+    return New-AstroProcessIdentityRecord $parsedPid $parsedTicks
+}
+
+function Test-AstroFsvIdentityEqual($Left, $Right) {
+    return [int]$Left.pid -eq [int]$Right.pid -and
+        [long]$Left.process_start_utc_ticks -eq
+            [long]$Right.process_start_utc_ticks
+}
+
+function Get-AstroCurrentProcessIdentity(
+    [Alias('Pid')][int]$ProcessId,
+    [string]$Code,
+    [string]$Description
+) {
+    $probe = Get-AstroProcessIdentityProbe -OwnerPid $ProcessId
+    if ($probe.State -cne 'observed') {
+        Fail-Astro $Code `
+            "$Description process identity is '$($probe.State)': $($probe.Error)" `
+            'preserve state and retry only when the live process creation time is readable'
+    }
+    return New-AstroProcessIdentityRecord `
+        $ProcessId ([long]$probe.ProcessStartUtcTicks)
+}
+
 if (-not ([Management.Automation.PSTypeName]'AstroFsvAtomicFile').Type) {
     Add-Type -Language CSharp -TypeDefinition @'
 using System;
@@ -264,11 +345,37 @@ public sealed class AstroFsvCreatedProcess : IDisposable {
     IntPtr threadHandle;
     bool disposed;
 
+    [StructLayout(LayoutKind.Sequential)]
+    struct FILETIME {
+        public uint Low;
+        public uint High;
+    }
+
     internal AstroFsvCreatedProcess(IntPtr processHandle, IntPtr primaryThreadHandle, uint processId) {
         ProcessHandle = new SafeProcessHandle(processHandle, true);
         threadHandle = primaryThreadHandle;
         ProcessId = processId;
         try {
+            FILETIME creation;
+            FILETIME exit;
+            FILETIME kernel;
+            FILETIME user;
+            if (!GetProcessTimes(
+                ProcessHandle,
+                out creation,
+                out exit,
+                out kernel,
+                out user)) {
+                int error = Marshal.GetLastWin32Error();
+                throw new Win32Exception(error,
+                    "GetProcessTimes failed for exact created native child " +
+                    "(native_error=" + error + "; pid=" + ProcessId + ")");
+            }
+            ulong fileTime =
+                ((ulong)creation.High << 32) | (ulong)creation.Low;
+            ProcessStartFileTime = checked((long)fileTime);
+            ProcessStartUtcTicks =
+                DateTime.FromFileTimeUtc(ProcessStartFileTime).Ticks;
             SafeProcessHandle duplicate;
             IntPtr current = GetCurrentProcess();
             if (!DuplicateHandle(
@@ -286,23 +393,23 @@ public sealed class AstroFsvCreatedProcess : IDisposable {
             }
             ObservationHandle = duplicate;
         }
-        catch (Exception duplicateFailure) {
+        catch (Exception identityFailure) {
             Exception cleanupFailure = null;
             try {
                 if (!TerminateProcess(ProcessHandle, DUPLICATE_FAILURE_EXIT_CODE)) {
                     int error = Marshal.GetLastWin32Error();
                     throw new Win32Exception(error,
-                        "TerminateProcess failed after exact process-handle duplication failure " +
+                        "TerminateProcess failed after exact process-identity capture failure " +
                         "(native_error=" + error + "; pid=" + ProcessId + ")");
                 }
                 uint cleanupWait = WaitForExactHandle(
                     ProcessHandle,
                     DUPLICATE_FAILURE_WAIT_MS,
-                    "primary process handle after duplication failure");
+                        "primary process handle after identity capture failure");
                 if (cleanupWait == WAIT_TIMEOUT) {
                     throw new TimeoutException(
                         "timed out waiting for exact suspended child cleanup after " +
-                        "process-handle duplication failure (pid=" + ProcessId +
+                        "process-identity capture failure (pid=" + ProcessId +
                         "; timeout_ms=" + DUPLICATE_FAILURE_WAIT_MS + ")");
                 }
             }
@@ -313,7 +420,7 @@ public sealed class AstroFsvCreatedProcess : IDisposable {
                 if (!CloseHandle(threadHandle) && cleanupFailure == null) {
                     int error = Marshal.GetLastWin32Error();
                     cleanupFailure = new Win32Exception(error,
-                        "CloseHandle failed for primary thread after process-handle duplication failure " +
+                        "CloseHandle failed for primary thread after process-identity capture failure " +
                         "(native_error=" + error + "; pid=" + ProcessId + ")");
                 }
                 threadHandle = IntPtr.Zero;
@@ -321,10 +428,10 @@ public sealed class AstroFsvCreatedProcess : IDisposable {
             ProcessHandle.Dispose();
             if (cleanupFailure != null) {
                 throw new InvalidOperationException(
-                    duplicateFailure.Message +
+                    identityFailure.Message +
                     "; exact suspended-child cleanup also failed: " +
                     cleanupFailure.Message,
-                    duplicateFailure);
+                    identityFailure);
             }
             throw;
         }
@@ -333,6 +440,8 @@ public sealed class AstroFsvCreatedProcess : IDisposable {
     public SafeProcessHandle ProcessHandle { get; private set; }
     public SafeProcessHandle ObservationHandle { get; private set; }
     public uint ProcessId { get; private set; }
+    public long ProcessStartFileTime { get; private set; }
+    public long ProcessStartUtcTicks { get; private set; }
     public int Id { get { return checked((int)ProcessId); } }
     public bool HasExited {
         get {
@@ -361,6 +470,14 @@ public sealed class AstroFsvCreatedProcess : IDisposable {
 
     [DllImport("kernel32.dll", SetLastError = true)]
     static extern bool GetExitCodeProcess(SafeProcessHandle process, out uint exitCode);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    static extern bool GetProcessTimes(
+        SafeProcessHandle process,
+        out FILETIME creationTime,
+        out FILETIME exitTime,
+        out FILETIME kernelTime,
+        out FILETIME userTime);
 
     [DllImport("kernel32.dll")]
     static extern IntPtr GetCurrentProcess();
@@ -1188,6 +1305,9 @@ $childProcessHandlesClosed = $false
 $artifact = $null
 $artifactHashBefore = $null
 $receiptFull = $null
+$launcherIdentity = $null
+$runnerIdentity = $null
+$childIdentity = $null
 $runRecordWritten = $false
 $runRecordAuthorized = $false
 $arguments = [string[]]::new(0)
@@ -1204,9 +1324,26 @@ try {
     }
     try { $receipt = Read-AstroUtf8FileLongPath $receiptFull | ConvertFrom-Json }
     catch { Fail-Astro 'ASTRO_FSV_RECEIPT_INVALID' "parse receipt failed: $($_.Exception.Message)" 'stage a fresh native artifact' }
-    if ($receipt.schema -ne 'astrolabe.native-fsv-artifact.v1' -or [int]$receipt.issue -ne $Issue) {
+    if ($receipt.schema -eq 'astrolabe.native-fsv-artifact.v1') {
+        Fail-Astro 'ASTRO_FSV_RECEIPT_LEGACY_MIGRATION_REQUIRED' `
+            'receipt uses legacy PID-only schema v1' `
+            'preserve the session and use the tracker-bound MigrateLegacy lifecycle; never infer process generations'
+    }
+    if ($receipt.schema -ne 'astrolabe.native-fsv-artifact.v2' -or
+        [int]$receipt.issue -ne $Issue -or
+        -not $receipt.PSObject.Properties['owners'] -or
+        -not $receipt.owners.PSObject.Properties['launcher'] -or
+        -not $receipt.owners.PSObject.Properties['promoter']) {
         Fail-Astro 'ASTRO_FSV_RECEIPT_INVALID' "receipt schema/issue does not match issue #$Issue" 'pass the exact receipt emitted for this driving issue'
     }
+    $receiptLauncherIdentity = Read-AstroFsvProcessIdentity `
+        $receipt.owners.launcher `
+        'ASTRO_FSV_RECEIPT_INVALID' `
+        'artifact receipt launcher identity'
+    $receiptPromoterIdentity = Read-AstroFsvProcessIdentity `
+        $receipt.owners.promoter `
+        'ASTRO_FSV_RECEIPT_INVALID' `
+        'artifact receipt promoter identity'
     if ([string]$receipt.tree_sha -notmatch '^[0-9a-f]{40}$' -or
         [string]$receipt.artifact.sha256 -notmatch '^[0-9a-f]{64}$' -or
         [string]$receipt.session_id -notmatch '^[A-Za-z0-9][A-Za-z0-9._-]{0,95}$') {
@@ -1250,9 +1387,21 @@ try {
         $launcherOwner.Issue -ne $Issue) {
         Fail-Astro 'ASTRO_FSV_LAUNCHER_LEASE_INVALID' "launcher protocol does not name the exact live owner process identity for issue #$Issue (state=$($launcherOwner.State), pid=$launcherPid, process_start_utc_ticks=$($launcherOwner.OwnerProcessStartUtcTicks), read_error=$($launcherOwner.ReadError), validation_error=$($launcherOwner.ValidationError))" 'start the FSV through the native launcher with the same driving issue'
     }
+    $launcherIdentity = New-AstroProcessIdentityRecord `
+        $launcherPid ([long]$launcherOwner.OwnerProcessStartUtcTicks)
+    if (-not (Test-AstroFsvIdentityEqual `
+            $launcherIdentity $receiptLauncherIdentity)) {
+        Fail-Astro 'ASTRO_FSV_RECEIPT_LAUNCHER_MISMATCH' `
+            'receipt launcher generation differs from the exact live launcher lease' `
+            'discard the cross-lease session and stage under the current exact launcher'
+    }
     if (-not (Test-DescendantOf $PID $launcherPid)) {
         Fail-Astro 'ASTRO_FSV_RUNNER_NOT_OWNED' "runner PID $PID is not a descendant of launcher PID $launcherPid" 'invoke this runner synchronously from the launcher-owned child process'
     }
+    $runnerIdentity = Get-AstroCurrentProcessIdentity `
+        $PID `
+        'ASTRO_FSV_RUNNER_IDENTITY_UNEVALUABLE' `
+        'native FSV runner'
     try {
         $launcherRootIdentity =
             [AstroLauncherLockNative]::GetDirectoryIdentity($workspace)
@@ -1348,7 +1497,7 @@ try {
     )
     $lockStage = "$fsvLockPath.$PID.tmp"
     $lockManifest = [ordered]@{
-        pid = $PID
+        schema = 'astrolabe.native-fsv-lock.v2'
         issue = $Issue
         started = [DateTime]::UtcNow.ToString('o')
         command = if ($argumentCount -gt 0) { "$artifact $argumentLine" } else { $artifact }
@@ -1357,13 +1506,15 @@ try {
         tree_sha = [string]$receipt.tree_sha
         artifact_path = $artifact
         artifact_sha256 = $artifactHashBefore
-        launcher_pid = $launcherPid
+        owners = [ordered]@{
+            launcher = $launcherIdentity
+            runner = $runnerIdentity
+            child = $null
+        }
         launcher_job = [ordered]@{
             name = $launcherJobName
             members = @($launcherJobMembersBefore)
         }
-        owner_pids = @($launcherPid, $PID)
-        child_pid = $null
         phase = 'claimed'
     }
     Write-NewDurableUtf8 $lockStage ($lockManifest | ConvertTo-Json -Depth 10 -Compress)
@@ -1428,11 +1579,34 @@ try {
     }
     $childStartedAtUtc = [DateTime]::UtcNow.ToString('o')
     $ownedLock = Read-AstroUtf8FileLongPath $fsvLockPath | ConvertFrom-Json
-    if ([int]$ownedLock.pid -ne $PID -or [string]$ownedLock.artifact_sha256 -cne $artifactHashBefore) {
+    if ($ownedLock.schema -cne 'astrolabe.native-fsv-lock.v2' -or
+        -not $ownedLock.PSObject.Properties['owners'] -or
+        -not $ownedLock.owners.PSObject.Properties['launcher'] -or
+        -not $ownedLock.owners.PSObject.Properties['runner'] -or
+        -not $ownedLock.owners.PSObject.Properties['child']) {
+        Fail-Astro 'ASTRO_FSV_LOCK_IDENTITY_CHANGED' `
+            'claimed FSV lock omits its exact owner envelope' `
+            'preserve state and investigate the competing or incomplete writer'
+    }
+    $ownedLockLauncherIdentity = Read-AstroFsvProcessIdentity `
+        $ownedLock.owners.launcher `
+        'ASTRO_FSV_LOCK_IDENTITY_CHANGED' `
+        'claimed FSV lock launcher identity'
+    $ownedLockRunnerIdentity = Read-AstroFsvProcessIdentity `
+        $ownedLock.owners.runner `
+        'ASTRO_FSV_LOCK_IDENTITY_CHANGED' `
+        'claimed FSV lock runner identity'
+    if ($null -ne $ownedLock.owners.child -or
+        -not (Test-AstroFsvIdentityEqual `
+            $ownedLockLauncherIdentity $launcherIdentity) -or
+        -not (Test-AstroFsvIdentityEqual `
+            $ownedLockRunnerIdentity $runnerIdentity) -or
+        [string]$ownedLock.artifact_sha256 -cne $artifactHashBefore) {
         Fail-Astro 'ASTRO_FSV_LOCK_IDENTITY_CHANGED' 'FSV lock identity changed before child PID publication' 'preserve state and investigate the competing writer'
     }
-    $lockManifest.child_pid = $child.Id
-    $lockManifest.owner_pids = @($launcherPid, $PID, $child.Id)
+    $childIdentity = New-AstroProcessIdentityRecord `
+        $child.Id ([long]$child.ProcessStartUtcTicks)
+    $lockManifest.owners.child = $childIdentity
     $lockManifest.phase = 'running'
     $lockUpdateStage = "$fsvLockPath.$PID.running.tmp"
     Write-NewDurableUtf8 $lockUpdateStage ($lockManifest | ConvertTo-Json -Depth 10 -Compress)
@@ -1445,18 +1619,51 @@ try {
     }
     $publishedLock =
         Read-AstroUtf8FileLongPath $fsvLockPath | ConvertFrom-Json
-    if ([int]$publishedLock.child_pid -ne $child.Id -or [string]$publishedLock.phase -cne 'running') {
+    if ($null -eq $publishedLock -or
+        -not $publishedLock.PSObject.Properties['schema'] -or
+        [string]$publishedLock.schema -cne
+            'astrolabe.native-fsv-lock.v2' -or
+        -not $publishedLock.PSObject.Properties['owners'] -or
+        $null -eq $publishedLock.owners -or
+        -not $publishedLock.owners.PSObject.Properties['launcher'] -or
+        -not $publishedLock.owners.PSObject.Properties['runner'] -or
+        -not $publishedLock.owners.PSObject.Properties['child']) {
+        Fail-Astro 'ASTRO_FSV_LOCK_UPDATE_FAILED' `
+            'published FSV lock omits its v2 exact owner envelope' `
+            'preserve state and investigate the failed durable lock update'
+    }
+    $publishedLauncherIdentity = Read-AstroFsvProcessIdentity `
+        $publishedLock.owners.launcher `
+        'ASTRO_FSV_LOCK_UPDATE_FAILED' `
+        'published FSV lock launcher identity'
+    $publishedRunnerIdentity = Read-AstroFsvProcessIdentity `
+        $publishedLock.owners.runner `
+        'ASTRO_FSV_LOCK_UPDATE_FAILED' `
+        'published FSV lock runner identity'
+    $publishedChildIdentity = Read-AstroFsvProcessIdentity `
+        $publishedLock.owners.child `
+        'ASTRO_FSV_LOCK_UPDATE_FAILED' `
+        'published FSV lock child identity'
+    if (-not (Test-AstroFsvIdentityEqual `
+            $publishedLauncherIdentity $launcherIdentity) -or
+        -not (Test-AstroFsvIdentityEqual `
+            $publishedRunnerIdentity $runnerIdentity) -or
+        -not (Test-AstroFsvIdentityEqual `
+            $publishedChildIdentity $childIdentity) -or
+        [string]$publishedLock.phase -cne 'running') {
         Fail-Astro 'ASTRO_FSV_LOCK_UPDATE_FAILED' 'FSV lock child-PID readback does not match the real process' 'preserve state and investigate the durable lock write'
     }
     $liveState = [ordered]@{
-        schema = 'astrolabe.native-fsv-live.v1'
-        runner_pid = $PID
-        launcher_pid = $launcherPid
+        schema = 'astrolabe.native-fsv-live.v2'
+        owners = [ordered]@{
+            launcher = $launcherIdentity
+            runner = $runnerIdentity
+            child = $childIdentity
+        }
         launcher_job = [ordered]@{
             name = $launcherJobName
             members_before = @($launcherJobMembersBefore)
         }
-        child_pid = $child.Id
         issue = $Issue
         tree_sha = [string]$receipt.tree_sha
         artifact = [ordered]@{ path = $artifact; bytes = [uint64]$artifactItem.Length; sha256 = $artifactHashBefore }
@@ -1465,6 +1672,53 @@ try {
         arguments = @($arguments)
     }
     Publish-NewFile $LiveStatePath ($liveState | ConvertTo-Json -Depth 10)
+    $persistedLiveState =
+        Read-AstroUtf8FileLongPath $LiveStatePath | ConvertFrom-Json
+    if ($null -eq $persistedLiveState -or
+        -not $persistedLiveState.PSObject.Properties['schema'] -or
+        [string]$persistedLiveState.schema -cne
+            'astrolabe.native-fsv-live.v2' -or
+        -not $persistedLiveState.PSObject.Properties['owners'] -or
+        $null -eq $persistedLiveState.owners -or
+        -not $persistedLiveState.owners.PSObject.Properties['launcher'] -or
+        -not $persistedLiveState.owners.PSObject.Properties['runner'] -or
+        -not $persistedLiveState.owners.PSObject.Properties['child'] -or
+        -not $persistedLiveState.PSObject.Properties['artifact'] -or
+        $null -eq $persistedLiveState.artifact -or
+        -not $persistedLiveState.artifact.PSObject.Properties['sha256']) {
+        Fail-Astro 'ASTRO_FSV_LIVE_STATE_READBACK_FAILED' `
+            'persisted live state omits its v2 exact owner/artifact envelope' `
+            'preserve the session and investigate the failed durable write'
+    }
+    $persistedLiveLauncherIdentity = Read-AstroFsvProcessIdentity `
+        $persistedLiveState.owners.launcher `
+        'ASTRO_FSV_LIVE_STATE_READBACK_FAILED' `
+        'persisted live-state launcher identity'
+    $persistedLiveRunnerIdentity = Read-AstroFsvProcessIdentity `
+        $persistedLiveState.owners.runner `
+        'ASTRO_FSV_LIVE_STATE_READBACK_FAILED' `
+        'persisted live-state runner identity'
+    $persistedLiveChildIdentity = Read-AstroFsvProcessIdentity `
+        $persistedLiveState.owners.child `
+        'ASTRO_FSV_LIVE_STATE_READBACK_FAILED' `
+        'persisted live-state child identity'
+    if ($persistedLiveState.schema -cne
+            'astrolabe.native-fsv-live.v2' -or
+        [int]$persistedLiveState.issue -ne $Issue -or
+        [string]$persistedLiveState.artifact.sha256 -cne
+            $artifactHashBefore -or
+        -not (Test-AstroFsvIdentityEqual `
+            $persistedLiveLauncherIdentity $launcherIdentity) -or
+        -not (Test-AstroFsvIdentityEqual `
+            $persistedLiveRunnerIdentity $runnerIdentity) -or
+        -not (Test-AstroFsvIdentityEqual `
+            $persistedLiveChildIdentity $childIdentity)) {
+        Fail-Astro 'ASTRO_FSV_LIVE_STATE_READBACK_FAILED' `
+            'persisted live state does not match the exact owner/artifact state' `
+            'preserve the session and investigate the failed durable write'
+    }
+    $liveStateBytes = Get-AstroFileLengthLongPath $LiveStatePath
+    $liveStateSha256 = File-Sha256 $LiveStatePath
     $child.WaitForExit()
     $childExitedAtUtc = [DateTime]::UtcNow.ToString('o')
     $childExitObservation = Observe-ExitedProcessCode $child
@@ -1717,13 +1971,14 @@ try {
         'failed'
     }
     $record = [ordered]@{
-        schema = 'astrolabe.native-fsv-run.v1'
+        schema = 'astrolabe.native-fsv-run.v2'
         verdict = $verdict
         issue = $Issue
         receipt_path = $receiptFull
-        runner = [ordered]@{ pid = $PID; launcher_pid = $launcherPid }
+        launcher = $launcherIdentity
+        runner = $runnerIdentity
         process = [ordered]@{
-            pid = $child.Id
+            identity = $childIdentity
             launch_boundary = 'kernel32!CreateProcessW(non-null extended application; STARTUPINFOEX restricted handle list)'
             standard_input = 'NUL'
             exit_code = $childExitCode
@@ -1743,8 +1998,7 @@ try {
             sha256_after = $launcherLockHashAfter
             links_before = $launcherLockLinksBefore
             links_after = $launcherLockLinksAfter
-            owner_pid = $launcherPid
-            owner_process_start_utc_ticks = $launcherOwner.OwnerProcessStartUtcTicks
+            owner = $launcherIdentity
             lease_start_utc_ticks = $launcherOwner.LeaseStartUtcTicks
             job = [ordered]@{
                 name = $launcherJobName
@@ -1758,6 +2012,12 @@ try {
         }
         argument_count = $argumentCount
         arguments = @($arguments)
+        live_state = [ordered]@{
+            path = $LiveStatePath
+            published = $true
+            bytes = $liveStateBytes
+            sha256 = $liveStateSha256
+        }
         stdout = [ordered]@{ path = $StandardOutputPath; bytes = Get-AstroFileLengthLongPath $StandardOutputPath; sha256 = $stdoutHash }
         stderr = [ordered]@{ path = $StandardErrorPath; bytes = Get-AstroFileLengthLongPath $StandardErrorPath; sha256 = $stderrHash }
         repository = [ordered]@{ before = $beforeRepo; after = $afterRepo; stable = $treeStable }
@@ -1766,6 +2026,35 @@ try {
     $runRecordWritten = $true
     $persistedRecord =
         Read-AstroUtf8FileLongPath $RunRecordPath | ConvertFrom-Json
+    if ($null -eq $persistedRecord -or
+        -not $persistedRecord.PSObject.Properties['schema'] -or
+        [string]$persistedRecord.schema -cne
+            'astrolabe.native-fsv-run.v2' -or
+        -not $persistedRecord.PSObject.Properties['launcher'] -or
+        -not $persistedRecord.PSObject.Properties['runner'] -or
+        -not $persistedRecord.PSObject.Properties['process'] -or
+        $null -eq $persistedRecord.process -or
+        -not $persistedRecord.process.PSObject.Properties['identity'] -or
+        -not $persistedRecord.process.PSObject.Properties['exit_code'] -or
+        -not $persistedRecord.process.PSObject.Properties[
+            'exit_code_observation'
+        ] -or
+        $null -eq $persistedRecord.process.exit_code_observation -or
+        -not $persistedRecord.PSObject.Properties['artifact'] -or
+        $null -eq $persistedRecord.artifact -or
+        -not $persistedRecord.artifact.PSObject.Properties['sha256'] -or
+        -not $persistedRecord.PSObject.Properties['argument_count'] -or
+        -not $persistedRecord.PSObject.Properties['arguments'] -or
+        -not $persistedRecord.PSObject.Properties['live_state'] -or
+        $null -eq $persistedRecord.live_state -or
+        -not $persistedRecord.live_state.PSObject.Properties['path'] -or
+        -not $persistedRecord.live_state.PSObject.Properties['published'] -or
+        -not $persistedRecord.live_state.PSObject.Properties['bytes'] -or
+        -not $persistedRecord.live_state.PSObject.Properties['sha256']) {
+        Fail-Astro 'ASTRO_FSV_RUN_READBACK_FAILED' `
+            'persisted run record omits its v2 exact process/artifact/live-state envelope' `
+            'preserve the session and investigate the failed durable write'
+    }
     $persistedArguments = @($persistedRecord.arguments)
     $argumentsMatch = [int]$persistedRecord.argument_count -eq $argumentCount -and
         $persistedArguments.Count -eq $argumentCount
@@ -1778,10 +2067,35 @@ try {
             }
         }
     }
-    if ([uint64]$persistedRecord.process.exit_code -ne [uint64]$childExitCode -or
+    $persistedLauncherIdentity = Read-AstroFsvProcessIdentity `
+        $persistedRecord.launcher `
+        'ASTRO_FSV_RUN_READBACK_FAILED' `
+        'persisted run-record launcher identity'
+    $persistedRunnerIdentity = Read-AstroFsvProcessIdentity `
+        $persistedRecord.runner `
+        'ASTRO_FSV_RUN_READBACK_FAILED' `
+        'persisted run-record runner identity'
+    $persistedChildIdentity = Read-AstroFsvProcessIdentity `
+        $persistedRecord.process.identity `
+        'ASTRO_FSV_RUN_READBACK_FAILED' `
+        'persisted run-record child identity'
+    if ([string]$persistedRecord.live_state.path -cne
+            $LiveStatePath -or
+        -not [bool]$persistedRecord.live_state.published -or
+        [uint64]$persistedRecord.live_state.bytes -ne
+            [uint64]$liveStateBytes -or
+        [string]$persistedRecord.live_state.sha256 -cne
+            $liveStateSha256 -or
+        [uint64]$persistedRecord.process.exit_code -ne [uint64]$childExitCode -or
         [string]$persistedRecord.process.exit_code_observation.primary_source -cne [string]$childExitObservation.primary_source -or
         [bool]$persistedRecord.process.exit_code_observation.sources_agree -ne [bool]$childExitObservation.sources_agree -or
         [string]$persistedRecord.artifact.sha256 -cne $artifactHashAfter -or
+        -not (Test-AstroFsvIdentityEqual `
+            $persistedLauncherIdentity $launcherIdentity) -or
+        -not (Test-AstroFsvIdentityEqual `
+            $persistedRunnerIdentity $runnerIdentity) -or
+        -not (Test-AstroFsvIdentityEqual `
+            $persistedChildIdentity $childIdentity) -or
         -not $argumentsMatch) {
         Fail-Astro 'ASTRO_FSV_RUN_READBACK_FAILED' 'persisted run record does not match the observed process/artifact state' 'preserve the session and investigate the failed durable write'
     }
@@ -1827,6 +2141,10 @@ catch {
         $null -ne $child -and $childTerminationProved -and
         -not (Test-AstroPathLongPath -LiteralPath $RunRecordPath)) {
         try {
+            if ($null -eq $childIdentity) {
+                $childIdentity = New-AstroProcessIdentityRecord `
+                    $child.Id ([long]$child.ProcessStartUtcTicks)
+            }
             $failureArtifactHash = if (
                 Test-AstroPathLongPath -LiteralPath $artifact -PathType Leaf
             ) {
@@ -1838,13 +2156,17 @@ catch {
                 }
             }
             else { $null }
+            $failureLiveStatePublished =
+                Test-AstroPathLongPath -LiteralPath $LiveStatePath -PathType Leaf
             $failureRecord = [ordered]@{
-                schema = 'astrolabe.native-fsv-run.v1'
+                schema = 'astrolabe.native-fsv-run.v2'
                 verdict = 'failed'
                 issue = $Issue
                 receipt_path = $receiptFull
+                launcher = $launcherIdentity
+                runner = $runnerIdentity
                 process = [ordered]@{
-                    pid = $child.Id
+                    identity = $childIdentity
                     launch_boundary = 'kernel32!CreateProcessW(non-null extended application; STARTUPINFOEX restricted handle list)'
                     standard_input = 'NUL'
                     exit_code = $childExitCode
@@ -1862,6 +2184,18 @@ catch {
                 }
                 argument_count = $argumentCount
                 arguments = @($arguments)
+                live_state = [ordered]@{
+                    path = $LiveStatePath
+                    published = $failureLiveStatePublished
+                    bytes = if ($failureLiveStatePublished) {
+                        Get-AstroFileLengthLongPath $LiveStatePath
+                    }
+                    else { 0 }
+                    sha256 = if ($failureLiveStatePublished) {
+                        File-Sha256 $LiveStatePath
+                    }
+                    else { $null }
+                }
                 stdout = [ordered]@{
                     path = $StandardOutputPath
                     bytes = if (Test-AstroPathLongPath -LiteralPath $StandardOutputPath -PathType Leaf) { Get-AstroFileLengthLongPath $StandardOutputPath } else { 0 }
@@ -1882,6 +2216,59 @@ catch {
                 }
             }
             Write-NewDurableUtf8 $RunRecordPath ($failureRecord | ConvertTo-Json -Depth 15)
+            $persistedFailure =
+                Read-AstroUtf8FileLongPath $RunRecordPath |
+                    ConvertFrom-Json
+            if ($null -eq $persistedFailure -or
+                -not $persistedFailure.PSObject.Properties['schema'] -or
+                [string]$persistedFailure.schema -cne
+                    'astrolabe.native-fsv-run.v2' -or
+                -not $persistedFailure.PSObject.Properties['launcher'] -or
+                -not $persistedFailure.PSObject.Properties['runner'] -or
+                -not $persistedFailure.PSObject.Properties['process'] -or
+                $null -eq $persistedFailure.process -or
+                -not $persistedFailure.process.PSObject.Properties[
+                    'identity'
+                ] -or
+                -not $persistedFailure.PSObject.Properties['failure'] -or
+                $null -eq $persistedFailure.failure -or
+                -not $persistedFailure.failure.PSObject.Properties['code'] -or
+                -not $persistedFailure.PSObject.Properties['live_state'] -or
+                $null -eq $persistedFailure.live_state -or
+                -not $persistedFailure.live_state.PSObject.Properties[
+                    'published'
+                ]) {
+                Fail-Astro 'ASTRO_FSV_FAILURE_RECORD_READBACK_FAILED' `
+                    'persisted failure record omits its v2 exact process/failure/live-state envelope' `
+                    'preserve the session and investigate the failed durable write'
+            }
+            $persistedFailureLauncher = Read-AstroFsvProcessIdentity `
+                $persistedFailure.launcher `
+                'ASTRO_FSV_FAILURE_RECORD_READBACK_FAILED' `
+                'persisted failure-record launcher identity'
+            $persistedFailureRunner = Read-AstroFsvProcessIdentity `
+                $persistedFailure.runner `
+                'ASTRO_FSV_FAILURE_RECORD_READBACK_FAILED' `
+                'persisted failure-record runner identity'
+            $persistedFailureChild = Read-AstroFsvProcessIdentity `
+                $persistedFailure.process.identity `
+                'ASTRO_FSV_FAILURE_RECORD_READBACK_FAILED' `
+                'persisted failure-record child identity'
+            if ($persistedFailure.schema -cne
+                    'astrolabe.native-fsv-run.v2' -or
+                [string]$persistedFailure.failure.code -cne $code -or
+                -not (Test-AstroFsvIdentityEqual `
+                    $persistedFailureLauncher $launcherIdentity) -or
+                -not (Test-AstroFsvIdentityEqual `
+                    $persistedFailureRunner $runnerIdentity) -or
+                -not (Test-AstroFsvIdentityEqual `
+                    $persistedFailureChild $childIdentity) -or
+                [bool]$persistedFailure.live_state.published -ne
+                    $failureLiveStatePublished) {
+                Fail-Astro 'ASTRO_FSV_FAILURE_RECORD_READBACK_FAILED' `
+                    'persisted failure record differs from exact observed failure state' `
+                    'preserve the session and investigate the failed durable write'
+            }
             $runRecordWritten = $true
         }
         catch {
@@ -1911,7 +2298,14 @@ finally {
         $owned = $false
         try {
             $lock = Read-AstroUtf8FileLongPath $fsvLockPath | ConvertFrom-Json
-            $owned = [int]$lock.pid -eq $PID -and [string]$lock.artifact_sha256 -ceq $artifactHashBefore
+            $lockRunnerIdentity = Read-AstroFsvProcessIdentity `
+                $lock.owners.runner `
+                'ASTRO_FSV_LOCK_IDENTITY_CHANGED' `
+                'terminal FSV lock runner identity'
+            $owned = $lock.schema -ceq 'astrolabe.native-fsv-lock.v2' -and
+                (Test-AstroFsvIdentityEqual `
+                    $lockRunnerIdentity $runnerIdentity) -and
+                [string]$lock.artifact_sha256 -ceq $artifactHashBefore
         }
         catch { $owned = $false }
         if ($owned) { Remove-AstroFileLongPath $fsvLockPath }

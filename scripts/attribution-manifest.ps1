@@ -1219,26 +1219,14 @@ function Get-AstroAttributionOwnerGenerationProbe {
         [Parameter(Mandatory)][long]$LauncherProcessStartUtcTicks
     )
 
-    $native = Get-AstroProcessIdentityProbe -OwnerPid $LauncherPid
-    $state = if ($native.State -eq 'absent') {
-        'absent'
-    } elseif ($native.State -eq 'unevaluable') {
-        'unevaluable'
-    } elseif ([long]$native.ProcessStartUtcTicks -eq
-        $LauncherProcessStartUtcTicks) {
-        'exact-live'
-    } else {
-        'pid-reused'
-    }
+    $native = Get-AstroExactProcessIdentityProbe `
+        -Pid $LauncherPid `
+        -ProcessStartUtcTicks $LauncherProcessStartUtcTicks
     return [pscustomobject]@{
-        State = $state
+        State = $native.State
         LauncherPid = $LauncherPid
         ExpectedProcessStartUtcTicks = $LauncherProcessStartUtcTicks
-        ObservedProcessStartUtcTicks = if ($native.State -eq 'observed') {
-            [long]$native.ProcessStartUtcTicks
-        } else {
-            $null
-        }
+        ObservedProcessStartUtcTicks = $native.ObservedProcessStartUtcTicks
         Error = $native.Error
     }
 }

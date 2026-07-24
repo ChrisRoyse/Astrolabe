@@ -2257,6 +2257,75 @@ function Get-AstroProcessIdentityProbe {
     }
 }
 
+function New-AstroProcessIdentityRecord {
+    param(
+        [Parameter(Mandatory)]
+        [Alias('Pid')]
+        [int]$ProcessId,
+        [Parameter(Mandatory)][long]$ProcessStartUtcTicks
+    )
+
+    if ($ProcessId -le 0 -or
+        $ProcessStartUtcTicks -le 0 -or
+        $ProcessStartUtcTicks -gt [DateTime]::MaxValue.Ticks) {
+        throw "process identity must contain a positive PID and valid UTC ticks: pid=$ProcessId, process_start_utc_ticks=$ProcessStartUtcTicks"
+    }
+    return [ordered]@{
+        pid = $ProcessId
+        process_start_utc_ticks = $ProcessStartUtcTicks
+        process_started_utc =
+            ConvertTo-AstroProcessStartUtcIso $ProcessStartUtcTicks
+    }
+}
+
+function Get-AstroExactProcessIdentityProbe {
+    param(
+        [Parameter(Mandatory)]
+        [Alias('Pid')]
+        [int]$ProcessId,
+        [Parameter(Mandatory)][long]$ProcessStartUtcTicks
+    )
+
+    if ($ProcessId -le 0 -or
+        $ProcessStartUtcTicks -le 0 -or
+        $ProcessStartUtcTicks -gt [DateTime]::MaxValue.Ticks) {
+        throw "exact process identity must contain a positive PID and valid UTC ticks: pid=$ProcessId, process_start_utc_ticks=$ProcessStartUtcTicks"
+    }
+    $expectedStartedUtc =
+        ConvertTo-AstroProcessStartUtcIso $ProcessStartUtcTicks
+    $native = Get-AstroProcessIdentityProbe -OwnerPid $ProcessId
+    $state = if ($native.State -ceq 'absent') {
+        'absent'
+    }
+    elseif ($native.State -ceq 'unevaluable') {
+        'unevaluable'
+    }
+    elseif ([long]$native.ProcessStartUtcTicks -eq $ProcessStartUtcTicks) {
+        'exact-live'
+    }
+    else {
+        'pid-reused'
+    }
+    return [pscustomobject]@{
+        State = $state
+        Pid = $ProcessId
+        ExpectedProcessStartUtcTicks = $ProcessStartUtcTicks
+        ExpectedProcessStartedUtc = $expectedStartedUtc
+        ObservedProcessStartUtcTicks = if ($native.State -ceq 'observed') {
+            [long]$native.ProcessStartUtcTicks
+        }
+        else {
+            $null
+        }
+        ObservedProcessStartedUtc = $native.ProcessStartedUtc
+        NumericPidLive = $native.State -ceq 'observed'
+        ExactOwnerLive = $state -ceq 'exact-live'
+        PidReused = $state -ceq 'pid-reused'
+        Error = $native.Error
+        ObservedAtUtc = [DateTime]::UtcNow.ToString('o')
+    }
+}
+
 function Get-AstroPathEntryState {
     param([Parameter(Mandatory)][string]$LiteralPath)
 
