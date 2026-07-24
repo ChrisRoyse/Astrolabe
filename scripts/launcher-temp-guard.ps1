@@ -70,6 +70,9 @@ public static class AstroLauncherTempNative
     private const uint FILE_ATTRIBUTE_ENCRYPTED = 0x00004000;
     private const uint INVALID_FILE_ATTRIBUTES = 0xffffffff;
     private const uint FILE_TYPE_DISK = 0x0001;
+    private const uint FSCTL_GET_REPARSE_POINT = 0x000900a8;
+    private const uint IO_REPARSE_TAG_MOUNT_POINT = 0xa0000003;
+    private const int MAXIMUM_REPARSE_DATA_BUFFER_SIZE = 16384;
     private const int FILE_ID_INFO_CLASS = 18;
     private const int FILE_BASIC_INFO_CLASS = 0;
     private const int FILE_ID_BOTH_DIRECTORY_INFO_CLASS = 10;
@@ -200,6 +203,19 @@ public static class AstroLauncherTempNative
         int informationClass,
         IntPtr information,
         uint size
+    );
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool DeviceIoControl(
+        SafeFileHandle device,
+        uint controlCode,
+        IntPtr inputBuffer,
+        uint inputBufferSize,
+        byte[] outputBuffer,
+        uint outputBufferSize,
+        out uint bytesReturned,
+        IntPtr overlapped
     );
 
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
@@ -780,6 +796,265 @@ public static class AstroLauncherTempNative
     {
         RequireOrdinaryDirectory(handle, "exact TEMP mutation directory");
         return GetFinalPath(handle);
+    }
+
+    private static byte[] ReadExactJunctionReparseData(
+        SafeFileHandle handle,
+        string description
+    )
+    {
+        BY_HANDLE_FILE_INFORMATION information = ReadInformation(handle, description);
+        if ((information.FileAttributes & FILE_ATTRIBUTE_DIRECTORY) == 0 ||
+            (information.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) == 0)
+        {
+            throw new InvalidOperationException(
+                description + " must remain one directory reparse point"
+            );
+        }
+        byte[] buffer = new byte[MAXIMUM_REPARSE_DATA_BUFFER_SIZE];
+        uint bytesReturned;
+        if (!DeviceIoControl(
+            handle,
+            FSCTL_GET_REPARSE_POINT,
+            IntPtr.Zero,
+            0,
+            buffer,
+            (uint)buffer.Length,
+            out bytesReturned,
+            IntPtr.Zero
+        ))
+        {
+            throw new Win32Exception(
+                Marshal.GetLastWin32Error(),
+                "could not read exact junction reparse bytes for " + description
+            );
+        }
+        if (bytesReturned < 16 || bytesReturned > buffer.Length)
+        {
+            throw new InvalidDataException(
+                "junction reparse byte count is invalid for " + description +
+                ": " + bytesReturned
+            );
+        }
+        uint tag = BitConverter.ToUInt32(buffer, 0);
+        ushort dataLength = BitConverter.ToUInt16(buffer, 4);
+        if (tag != IO_REPARSE_TAG_MOUNT_POINT ||
+            checked((uint)dataLength + 8U) != bytesReturned ||
+            dataLength < 8)
+        {
+            throw new InvalidDataException(
+                "expected one mount-point junction reparse buffer for " +
+                description + "; tag=0x" +
+                tag.ToString("x8", CultureInfo.InvariantCulture) +
+                "; data_length=" + dataLength +
+                "; bytes_returned=" + bytesReturned
+            );
+        }
+        byte[] exact = new byte[bytesReturned];
+        Array.Copy(buffer, exact, exact.Length);
+        return exact;
+    }
+
+    private static string ReadJunctionPathName(
+        byte[] data,
+        int offsetField,
+        int lengthField,
+        string description
+    )
+    {
+        int pathBufferOffset = 16;
+        int pathBufferBytes = data.Length - pathBufferOffset;
+        int offset = BitConverter.ToUInt16(data, offsetField);
+        int length = BitConverter.ToUInt16(data, lengthField);
+        if ((offset & 1) != 0 || (length & 1) != 0 ||
+            offset < 0 || length < 0 ||
+            offset > pathBufferBytes ||
+            length > pathBufferBytes - offset)
+        {
+            throw new InvalidDataException(
+                "junction " + description + " range is invalid"
+            );
+        }
+        return Encoding.Unicode.GetString(
+            data,
+            checked(pathBufferOffset + offset),
+            length
+        );
+    }
+
+    private static string NormalizeJunctionTargetName(
+        string value,
+        string description,
+        bool allowEmpty
+    )
+    {
+        if (String.IsNullOrEmpty(value))
+        {
+            if (allowEmpty)
+            {
+                return null;
+            }
+            throw new InvalidDataException(
+                "junction " + description + " is empty"
+            );
+        }
+        if (value.IndexOf('\0') >= 0)
+        {
+            throw new InvalidDataException(
+                "junction " + description + " contains NUL"
+            );
+        }
+        string candidate;
+        if (value.StartsWith(@"\??\UNC\", StringComparison.OrdinalIgnoreCase))
+        {
+            candidate = @"\\" + value.Substring(8);
+        }
+        else if (value.StartsWith(@"\??\", StringComparison.OrdinalIgnoreCase))
+        {
+            candidate = value.Substring(4);
+        }
+        else
+        {
+            candidate = value;
+        }
+        if (!Path.IsPathRooted(candidate))
+        {
+            throw new InvalidDataException(
+                "junction " + description + " is not one absolute target: " + value
+            );
+        }
+        return NormalizeFinalPath(candidate);
+    }
+
+    private static string Sha256Hex(byte[] bytes)
+    {
+        using (SHA256 sha = SHA256.Create())
+        {
+            byte[] digest = sha.ComputeHash(bytes);
+            StringBuilder result = new StringBuilder(digest.Length * 2);
+            foreach (byte value in digest)
+            {
+                result.Append(value.ToString("x2", CultureInfo.InvariantCulture));
+            }
+            return result.ToString();
+        }
+    }
+
+    public static SafeFileHandle OpenExactJunctionLease(string path)
+    {
+        string full = Path.GetFullPath(path).TrimEnd('\\', '/');
+        SafeFileHandle handle = OpenEntry(
+            full,
+            FILE_READ_ATTRIBUTES | DELETE_ACCESS,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            "exact CUDA toolkit junction lease"
+        );
+        try
+        {
+            ReadExactJunctionReparseData(
+                handle,
+                "exact CUDA toolkit junction lease"
+            );
+            if (!String.Equals(
+                GetFinalPath(handle),
+                full,
+                StringComparison.OrdinalIgnoreCase
+            ))
+            {
+                throw new InvalidOperationException(
+                    "exact CUDA toolkit junction lease resolved to another namespace path"
+                );
+            }
+            return handle;
+        }
+        catch
+        {
+            handle.Dispose();
+            throw;
+        }
+    }
+
+    public static string CaptureExactJunctionState(
+        SafeFileHandle handle,
+        string expectedPath,
+        string expectedTarget
+    )
+    {
+        string path = Path.GetFullPath(expectedPath).TrimEnd('\\', '/');
+        string target = Path.GetFullPath(expectedTarget).TrimEnd('\\', '/');
+        string finalPath = GetFinalPath(handle);
+        if (!String.Equals(finalPath, path, StringComparison.OrdinalIgnoreCase))
+        {
+            throw new InvalidOperationException(
+                "retained CUDA toolkit junction path changed: expected=" +
+                path + "; observed=" + finalPath
+            );
+        }
+        byte[] data = ReadExactJunctionReparseData(
+            handle,
+            "retained CUDA toolkit junction " + path
+        );
+        string substitute = NormalizeJunctionTargetName(
+            ReadJunctionPathName(data, 8, 10, "substitute name"),
+            "substitute name",
+            false
+        );
+        string print = NormalizeJunctionTargetName(
+            ReadJunctionPathName(data, 12, 14, "print name"),
+            "print name",
+            true
+        );
+        if (!String.Equals(substitute, target, StringComparison.OrdinalIgnoreCase) ||
+            (print != null &&
+                !String.Equals(print, target, StringComparison.OrdinalIgnoreCase)))
+        {
+            throw new InvalidOperationException(
+                "retained CUDA toolkit junction target differs: expected=" +
+                target + "; substitute=" + substitute + "; print=" + print
+            );
+        }
+        BY_HANDLE_FILE_INFORMATION information = ReadInformation(
+            handle,
+            "retained CUDA toolkit junction " + path
+        );
+        UTF8Encoding utf8 = new UTF8Encoding(false, true);
+        return String.Join("|", new string[] {
+            "astrolabe.cuda-toolkit-junction.state.v1",
+            GetIdentity(handle),
+            Convert.ToBase64String(utf8.GetBytes(path)),
+            Convert.ToBase64String(utf8.GetBytes(target)),
+            information.FileAttributes.ToString("x8", CultureInfo.InvariantCulture),
+            FileTimeValue(information.CreationTime).ToString(CultureInfo.InvariantCulture),
+            FileTimeValue(information.LastWriteTime).ToString(CultureInfo.InvariantCulture),
+            IO_REPARSE_TAG_MOUNT_POINT.ToString("x8", CultureInfo.InvariantCulture),
+            data.Length.ToString(CultureInfo.InvariantCulture),
+            Sha256Hex(data)
+        });
+    }
+
+    public static void DeleteExactJunctionLease(
+        SafeFileHandle handle,
+        string expectedPath,
+        string expectedTarget,
+        string expectedState
+    )
+    {
+        string path = Path.GetFullPath(expectedPath).TrimEnd('\\', '/');
+        string current = CaptureExactJunctionState(
+            handle,
+            path,
+            expectedTarget
+        );
+        if (!String.Equals(current, expectedState, StringComparison.Ordinal))
+        {
+            throw new InvalidOperationException(
+                "retained CUDA toolkit junction state changed before exact disposition: " +
+                path
+            );
+        }
+        SetDisposition(handle, path);
+        handle.Dispose();
+        RequirePathAbsent(path);
     }
 
     private static long FileTimeValue(

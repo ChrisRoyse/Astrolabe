@@ -2179,12 +2179,244 @@ function Resolve-CudaToolkitLibRoot {
     return $libRoot
 }
 
+function Get-CudaToolkitExactTargetIdentity {
+    param([Parameter(Mandatory)][string]$Target)
+
+    $handle = $null
+    try {
+        $handle = [AstroLauncherTempNative]::OpenExactDirectoryIdentity($Target)
+        return [pscustomobject]@{
+            Path = [AstroLauncherTempNative]::GetExactDirectoryFinalPath($handle)
+            FileId = [AstroLauncherTempNative]::GetExactDirectoryIdentity($handle)
+        }
+    }
+    finally {
+        if ($null -ne $handle) {
+            $handle.Dispose()
+        }
+    }
+}
+
+function Add-CudaToolkitExactJunctionLease {
+    param(
+        [Parameter(Mandatory)]$ViewLease,
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][string]$Target
+    )
+
+    $fullPath = [IO.Path]::GetFullPath($Path).TrimEnd('\', '/')
+    $fullTarget = [IO.Path]::GetFullPath($Target).TrimEnd('\', '/')
+    $workspacePrefix = $ViewLease.WorkspaceTemp.TrimEnd('\', '/') +
+        [IO.Path]::DirectorySeparatorChar
+    if (-not $fullPath.StartsWith(
+            $workspacePrefix,
+            [StringComparison]::OrdinalIgnoreCase
+        )) {
+        throw "CUDA_IMPORT_LINK[ASTRO_CUDA_TOOLKIT_VIEW_PATH_ESCAPE]: junction path escaped exact generation TEMP: $fullPath"
+    }
+    $relativePath = $fullPath.Substring($workspacePrefix.Length).Replace('\', '/')
+    $targetIdentity = Get-CudaToolkitExactTargetIdentity -Target $fullTarget
+    if (-not [string]::Equals(
+            $targetIdentity.Path,
+            $fullTarget,
+            [StringComparison]::OrdinalIgnoreCase
+        )) {
+        throw "CUDA_IMPORT_LINK[ASTRO_CUDA_TOOLKIT_VIEW_TARGET_ALIAS]: target resolved to a different final path: requested=$fullTarget; final=$($targetIdentity.Path)"
+    }
+
+    $handle = $null
+    try {
+        $handle = [AstroLauncherTempNative]::OpenExactJunctionLease($fullPath)
+        $junctionState =
+            [AstroLauncherTempNative]::CaptureExactJunctionState(
+                $handle,
+                $fullPath,
+                $fullTarget
+            )
+        $ViewLease.Junctions.Add([pscustomobject]@{
+                RelativePath = $relativePath
+                Path = $fullPath
+                Target = $fullTarget
+                TargetFileId = $targetIdentity.FileId
+                JunctionState = $junctionState
+                Handle = $handle
+                Removed = $false
+            })
+        $handle = $null
+    }
+    finally {
+        if ($null -ne $handle) {
+            $handle.Dispose()
+        }
+    }
+}
+
+function Publish-CudaToolkitViewManifest {
+    param([Parameter(Mandatory)]$ViewLease)
+
+    [string[]]$relativePaths = @(
+        $ViewLease.Junctions | ForEach-Object { $_.RelativePath }
+    )
+    [Array]::Sort($relativePaths, [StringComparer]::Ordinal)
+    $manifestJunctions = [Collections.Generic.List[object]]::new()
+    foreach ($relativePath in $relativePaths) {
+        $matches = @(
+            $ViewLease.Junctions | Where-Object {
+                $_.RelativePath -ceq $relativePath
+            }
+        )
+        if ($matches.Count -ne 1) {
+            throw "CUDA_IMPORT_LINK[ASTRO_CUDA_TOOLKIT_VIEW_MANIFEST_DUPLICATE]: expected one exact junction for '$relativePath'; observed=$($matches.Count)"
+        }
+        $entry = $matches[0]
+        $manifestJunctions.Add([ordered]@{
+                relative_path = $entry.RelativePath
+                path = $entry.Path
+                target_path = $entry.Target
+                target_file_id = $entry.TargetFileId
+                junction_state = $entry.JunctionState
+            })
+    }
+    $manifest = [ordered]@{
+        schema = 'astrolabe.cuda-toolkit-view.v1'
+        launcher = [ordered]@{
+            pid = $PID
+            process_start_utc_ticks = $launcherProcessStartUtcTicks
+            issue = $drivingIssue
+            launcher_lock_sha256 = $launcherLockSha256
+        }
+        workspace_temp = $ViewLease.WorkspaceTemp
+        view_root = $ViewLease.ViewRoot
+        junctions = @($manifestJunctions)
+    }
+    $text = ($manifest | ConvertTo-Json -Depth 12 -Compress) + "`n"
+    [byte[]]$expectedBytes = [Text.UTF8Encoding]::new(
+        $false,
+        $true
+    ).GetBytes($text)
+    Write-NewDurableUtf8File `
+        -LiteralPath $ViewLease.ManifestPath `
+        -Text $text
+    $snapshot = Get-AstroFileSnapshot `
+        -LiteralPath $ViewLease.ManifestPath `
+        -Share ([IO.FileShare]::Read)
+    if ($snapshot.Length -ne $expectedBytes.LongLength -or
+        [Convert]::ToBase64String($snapshot.Bytes) -cne
+            [Convert]::ToBase64String($expectedBytes)) {
+        throw 'CUDA_IMPORT_LINK[ASTRO_CUDA_TOOLKIT_VIEW_MANIFEST_READBACK]: durable manifest bytes differ immediately after publication'
+    }
+    $parsed = [Text.UTF8Encoding]::new($false, $true).GetString(
+        $snapshot.Bytes
+    ) | ConvertFrom-Json
+    if ($parsed.schema -cne 'astrolabe.cuda-toolkit-view.v1' -or
+        @($parsed.junctions).Count -ne $ViewLease.Junctions.Count) {
+        throw 'CUDA_IMPORT_LINK[ASTRO_CUDA_TOOLKIT_VIEW_MANIFEST_SCHEMA]: durable manifest failed independent schema/count readback'
+    }
+    $ViewLease.ManifestBytes = $expectedBytes
+    $ViewLease.ManifestSha256 = $snapshot.Sha256
+    $ViewLease.Complete = $true
+    Write-Output "CUDA_TOOLKIT_VIEW[ASTRO_CUDA_TOOLKIT_VIEW_MANIFEST]: path=$($ViewLease.ManifestPath); sha256=$($snapshot.Sha256); junctions=$($ViewLease.Junctions.Count); every junction handle retained with delete sharing denied"
+}
+
+function Remove-CudaToolkitExactJunctions {
+    param([Parameter(Mandatory)]$ViewLease)
+
+    if (-not $ViewLease.Complete -or
+        $null -eq $ViewLease.ManifestBytes -or
+        [string]::IsNullOrWhiteSpace($ViewLease.ManifestSha256)) {
+        throw 'CUDA_TOOLKIT_VIEW[ASTRO_CUDA_TOOLKIT_VIEW_MANIFEST_INCOMPLETE]: exact junction deletion requires the complete durable generation manifest'
+    }
+    $snapshot = Get-AstroFileSnapshot `
+        -LiteralPath $ViewLease.ManifestPath `
+        -Share ([IO.FileShare]::Read)
+    if ($snapshot.Sha256 -cne $ViewLease.ManifestSha256 -or
+        $snapshot.Length -ne $ViewLease.ManifestBytes.LongLength -or
+        [Convert]::ToBase64String($snapshot.Bytes) -cne
+            [Convert]::ToBase64String($ViewLease.ManifestBytes)) {
+        throw 'CUDA_TOOLKIT_VIEW[ASTRO_CUDA_TOOLKIT_VIEW_MANIFEST_CHANGED]: durable junction manifest differs before exact teardown'
+    }
+
+    $ordered = @(
+        $ViewLease.Junctions |
+            Sort-Object `
+                @{ Expression = { $_.RelativePath.Split('/').Count }; Descending = $true },
+                @{ Expression = { $_.RelativePath }; Descending = $true }
+    )
+    foreach ($entry in $ordered) {
+        if ($entry.Removed -or
+            $null -eq $entry.Handle -or
+            $entry.Handle.IsClosed -or
+            $entry.Handle.IsInvalid) {
+            throw "CUDA_TOOLKIT_VIEW[ASTRO_CUDA_TOOLKIT_VIEW_HANDLE_INVALID]: retained junction handle is unavailable: $($entry.Path)"
+        }
+        $targetBefore = Get-CudaToolkitExactTargetIdentity -Target $entry.Target
+        if ($targetBefore.FileId -cne $entry.TargetFileId -or
+            -not [string]::Equals(
+                $targetBefore.Path,
+                $entry.Target,
+                [StringComparison]::OrdinalIgnoreCase
+            )) {
+            throw "CUDA_TOOLKIT_VIEW[ASTRO_CUDA_TOOLKIT_VIEW_TARGET_CHANGED]: target identity changed before link deletion: path=$($entry.Target); expected_file_id=$($entry.TargetFileId); observed_file_id=$($targetBefore.FileId); observed_path=$($targetBefore.Path)"
+        }
+        [AstroLauncherTempNative]::DeleteExactJunctionLease(
+            $entry.Handle,
+            $entry.Path,
+            $entry.Target,
+            $entry.JunctionState
+        )
+        $entry.Removed = $true
+        $targetAfter = Get-CudaToolkitExactTargetIdentity -Target $entry.Target
+        if ($targetAfter.FileId -cne $entry.TargetFileId -or
+            -not [string]::Equals(
+                $targetAfter.Path,
+                $entry.Target,
+                [StringComparison]::OrdinalIgnoreCase
+            )) {
+            throw "CUDA_TOOLKIT_VIEW[ASTRO_CUDA_TOOLKIT_VIEW_TARGET_POSTSTATE_CHANGED]: installed CUDA target identity changed while removing only its junction: path=$($entry.Target); expected_file_id=$($entry.TargetFileId); observed_file_id=$($targetAfter.FileId); observed_path=$($targetAfter.Path)"
+        }
+        Write-Output "CUDA_TOOLKIT_VIEW[ASTRO_CUDA_TOOLKIT_VIEW_JUNCTION_REMOVED]: path=$($entry.Path); junction_state=$($entry.JunctionState); path_state=absent; target=$($entry.Target); target_file_id=$($targetAfter.FileId); target_state=present"
+    }
+    $remaining = @($ViewLease.Junctions | Where-Object { -not $_.Removed })
+    if ($remaining.Count -ne 0) {
+        throw "CUDA_TOOLKIT_VIEW[ASTRO_CUDA_TOOLKIT_VIEW_TEARDOWN_INCOMPLETE]: $($remaining.Count) manifest-bound junction(s) remain"
+    }
+    Write-Output "CUDA_TOOLKIT_VIEW[ASTRO_CUDA_TOOLKIT_VIEW_TEARDOWN_COMPLETE]: manifest=$($ViewLease.ManifestPath); manifest_sha256=$($ViewLease.ManifestSha256); removed=$($ViewLease.Junctions.Count); every installed target identity remained present"
+}
+
+function Close-CudaToolkitJunctionLeases {
+    param([Parameter(Mandatory)]$ViewLease)
+
+    $closed = 0
+    foreach ($entry in $ViewLease.Junctions) {
+        if ($null -ne $entry.Handle -and
+            -not $entry.Handle.IsClosed) {
+            $entry.Handle.Dispose()
+            $closed++
+        }
+    }
+    return $closed
+}
+
 function New-CudaToolkitNoSpaceView {
     param([Parameter(Mandatory)][string]$WorkspaceTemp)
 
     $toolkitRoot = Resolve-CudaToolkitRoot
     $libRoot = Resolve-CudaToolkitLibRoot
     $viewRoot = Join-Path $WorkspaceTemp "cuda-toolkit-root"
+    if ($null -ne $script:cudaToolkitViewLease) {
+        throw 'CUDA_IMPORT_LINK[ASTRO_CUDA_TOOLKIT_VIEW_DUPLICATE]: one launcher generation cannot create more than one CUDA toolkit view'
+    }
+    $script:cudaToolkitViewLease = [pscustomobject]@{
+        WorkspaceTemp = [IO.Path]::GetFullPath($WorkspaceTemp).TrimEnd('\', '/')
+        ViewRoot = [IO.Path]::GetFullPath($viewRoot).TrimEnd('\', '/')
+        ManifestPath = [IO.Path]::GetFullPath((
+                Join-Path $WorkspaceTemp 'cuda-toolkit-view.manifest.v1.json'
+            ))
+        ManifestBytes = $null
+        ManifestSha256 = $null
+        Junctions = [Collections.Generic.List[object]]::new()
+        Complete = $false
+    }
     $viewBin = Join-Path $viewRoot "bin"
     $viewInclude = Join-Path $viewRoot "include"
     $viewLib = Join-Path $viewRoot "lib"
@@ -2218,6 +2450,10 @@ function New-CudaToolkitNoSpaceView {
         if (-not (Test-Path -LiteralPath $path -PathType Container)) {
             throw "CUDA_IMPORT_LINK[ASTRO_CUDA_TOOLKIT_VIEW_LINK_FAILED]: CUDA toolkit view link was not created: $path -> $target"
         }
+        Add-CudaToolkitExactJunctionLease `
+            -ViewLease $script:cudaToolkitViewLease `
+            -Path $path `
+            -Target $target
     }
 
     Get-ChildItem -LiteralPath (Join-Path $toolkitRoot "lib") -Directory -ErrorAction SilentlyContinue |
@@ -2230,6 +2466,10 @@ function New-CudaToolkitNoSpaceView {
             if (-not (Test-Path -LiteralPath $path -PathType Container)) {
                 throw "CUDA_IMPORT_LINK[ASTRO_CUDA_TOOLKIT_VIEW_LINK_FAILED]: CUDA toolkit lib view link was not created: $path -> $($_.FullName)"
             }
+            Add-CudaToolkitExactJunctionLease `
+                -ViewLease $script:cudaToolkitViewLease `
+                -Path $path `
+                -Target $_.FullName
         }
 
     foreach ($link in @(
@@ -2252,6 +2492,7 @@ function New-CudaToolkitNoSpaceView {
         Require-Path $dest "copied CUDA import library is missing"
     }
 
+    Publish-CudaToolkitViewManifest -ViewLease $script:cudaToolkitViewLease
     $env:CUDA_PATH = $viewRoot
     $env:CUDA_HOME = $viewRoot
     $env:PATH = "$viewBin;$env:PATH"
@@ -4414,6 +4655,7 @@ $attributionManifest = $null
 $launcherProtocolDirectoryLease = $null
 $workspaceTempLease = $null
 $gitMutationFreezeLease = $null
+$script:cudaToolkitViewLease = $null
 $previousTempEnvironment = @{}
 foreach ($name in @("TEMP", "TMP", "TMPDIR", "GIT_CEILING_DIRECTORIES", "ASTRO_NO_ESCAPE_ATTRIBUTION")) {
     $previousTempEnvironment[$name] = Get-Item -Path "Env:$name" -ErrorAction SilentlyContinue
@@ -5923,6 +6165,10 @@ finally {
                 }
             }
 
+            if ($null -ne $script:cudaToolkitViewLease) {
+                Remove-CudaToolkitExactJunctions `
+                    -ViewLease $script:cudaToolkitViewLease
+            }
             if ($null -eq $workspaceTempLease -or
                 $null -eq $workspaceTempLease.Handle -or
                 $workspaceTempLease.Handle.IsClosed) {
@@ -6063,6 +6309,19 @@ finally {
     # Release retained handles only after every authorized exact operation. When state is
     # preserved, closing these handles permits the tracker-bound reclaimer to inspect it;
     # it never grants deletion authority to this failed cleanup path.
+    if ($null -ne $script:cudaToolkitViewLease) {
+        try {
+            $closedCudaJunctionLeases =
+                Close-CudaToolkitJunctionLeases `
+                    -ViewLease $script:cudaToolkitViewLease
+            if ($closedCudaJunctionLeases -gt 0) {
+                Write-Output "CUDA_TOOLKIT_VIEW[ASTRO_CUDA_TOOLKIT_VIEW_HANDLES_RELEASED_PRESERVING]: closed=$closedCudaJunctionLeases; no namespace object was deleted by handle release"
+            }
+        }
+        catch {
+            $cleanupErrors += "CUDA toolkit junction handle release failed while preserving namespace state: $($_.Exception.Message)"
+        }
+    }
     if ($null -ne $workspaceTempLease -and
         $null -ne $workspaceTempLease.Handle -and
         -not $workspaceTempLease.Handle.IsClosed) {
