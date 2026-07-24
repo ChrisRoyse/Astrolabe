@@ -94,6 +94,19 @@ static char *sha256_hex_alloc(const uint8_t *bytes, size_t len) {
     return hex;
 }
 
+/* Identity-bearing text has one canonical absence representation: an empty
+ * UTF-8 byte sequence. JSON properties are a separate domain whose absent
+ * value is the empty object document. Keep these conversions named and at
+ * domain boundaries so hashing, retained state, persistence, and reload all
+ * observe the same bytes. */
+static const char *canonical_identity_text(const char *text) {
+    return text ? text : "";
+}
+
+static const char *canonical_properties_json(const char *properties_json) {
+    return properties_json ? properties_json : "{}";
+}
+
 static char *make_atom_id(const char *project, const char *label, const char *name,
                           const char *qualified_name, const char *file_path, int start_line,
                           int end_line, bool source_present, const uint8_t *source_bytes,
@@ -106,11 +119,11 @@ static char *make_atom_id(const char *project, const char *label, const char *na
     }
     cbm_sha256_init(&ctx);
     const char *parts[] = {"astrolabe.cbm.atom.v2",
-                           project ? project : "",
-                           label ? label : "",
-                           name ? name : "",
-                           qualified_name ? qualified_name : "",
-                           file_path ? file_path : ""};
+                           canonical_identity_text(project),
+                           canonical_identity_text(label),
+                           canonical_identity_text(name),
+                           canonical_identity_text(qualified_name),
+                           canonical_identity_text(file_path)};
     for (size_t i = 0; i < sizeof(parts) / sizeof(parts[0]); i++) {
         hash_frame(&ctx, parts[i], strlen(parts[i]));
     }
@@ -132,7 +145,7 @@ static char *make_atom_id(const char *project, const char *label, const char *na
 }
 
 static bool valid_properties_object(const char *properties_json) {
-    const char *json = properties_json ? properties_json : "{}";
+    const char *json = canonical_properties_json(properties_json);
     yyjson_doc *doc = yyjson_read(json, strlen(json), 0);
     if (!doc) {
         return false;
@@ -287,15 +300,19 @@ static bool gbuf_ht_set(cbm_gbuf_t *gb, CBMHashTable *ht, const char *key, void 
 }
 
 static char *heap_strdup(const char *s) {
-    return s ? strdup(s) : strdup("{}");
+    return s ? strdup(s) : NULL;
 }
 
 /* Intern a repetitive string into the buffer's pool: identical content collapses
- * to a single heap copy owned by the pool. NULL maps to "{}" (matches
- * heap_strdup). The returned pointer is stable for the buffer's lifetime and
- * must never be freed or mutated by callers. Returns NULL only on OOM. */
+ * to a single heap copy owned by the pool. Callers must pass their domain's
+ * already-canonical, non-NULL bytes. The returned pointer is stable for the
+ * buffer's lifetime and must never be freed or mutated by callers. */
 static const char *gb_intern(cbm_gbuf_t *gb, const char *s) {
-    const char *key = s ? s : "{}";
+    if (!gb || !s) {
+        gbuf_index_failure(gb, "intern.input", "");
+        return NULL;
+    }
+    const char *key = s;
     const char *found = cbm_ht_get(gb->intern_pool, key);
     if (found) {
         return found;
@@ -942,11 +959,13 @@ static bool same_atom_payload(const cbm_gbuf_node_t *node, const char *label, co
                               const char *qualified_name, const char *file_path, int start_line,
                               int end_line, bool source_present, const uint8_t *source_bytes,
                               size_t source_len, uint64_t start_byte, uint64_t end_byte) {
-    return node && strcmp(node->label ? node->label : "", label ? label : "") == 0 &&
-           strcmp(node->name ? node->name : "", name ? name : "") == 0 &&
-           strcmp(node->qualified_name ? node->qualified_name : "",
-                  qualified_name ? qualified_name : "") == 0 &&
-           strcmp(node->file_path ? node->file_path : "", file_path ? file_path : "") == 0 &&
+    return node &&
+           strcmp(canonical_identity_text(node->label), canonical_identity_text(label)) == 0 &&
+           strcmp(canonical_identity_text(node->name), canonical_identity_text(name)) == 0 &&
+           strcmp(canonical_identity_text(node->qualified_name),
+                  canonical_identity_text(qualified_name)) == 0 &&
+           strcmp(canonical_identity_text(node->file_path), canonical_identity_text(file_path)) ==
+               0 &&
            node->start_line == start_line && node->end_line == end_line &&
            node->source_present == source_present && node->source_len == source_len &&
            node->start_byte == start_byte && node->end_byte == end_byte &&
@@ -959,13 +978,14 @@ static int64_t upsert_node_internal(cbm_gbuf_t *gb, const char *label, const cha
                                     const uint8_t *source_bytes, size_t source_len,
                                     uint64_t start_byte, uint64_t end_byte,
                                     const char *properties_json) {
-    const char *json = properties_json ? properties_json : "{}";
+    const char *canonical_file_path = canonical_identity_text(file_path);
+    const char *json = canonical_properties_json(properties_json);
     if (!gb || !label || !label[0] || !name || !qualified_name || !qualified_name[0] ||
         (source_present && source_len > 0 && !source_bytes) || end_byte < start_byte ||
         (source_present && end_byte - start_byte != source_len) ||
         (!source_present && (source_len != 0 || start_byte != 0 || end_byte != 0)) ||
         !valid_utf8_text(label) || !valid_utf8_text(name) || !valid_utf8_text(qualified_name) ||
-        !valid_utf8_text(file_path) || !valid_properties_object(json)) {
+        !valid_utf8_text(canonical_file_path) || !valid_properties_object(json)) {
         if (gb) {
             atomic_store(&gb->resolution_failed, true);
         }
@@ -979,8 +999,8 @@ static int64_t upsert_node_internal(cbm_gbuf_t *gb, const char *label, const cha
     }
 
     char *atom_id =
-        make_atom_id(gb->project, label, name, qualified_name, file_path, start_line, end_line,
-                     source_present, source_bytes, source_len, start_byte, end_byte);
+        make_atom_id(gb->project, label, name, qualified_name, canonical_file_path, start_line,
+                     end_line, source_present, source_bytes, source_len, start_byte, end_byte);
     if (!atom_id) {
         atomic_store(&gb->resolution_failed, true);
         cbm_log_error("gbuf.node_alloc_failed", "code", "CBM_NODE_ATOM_ALLOC_FAILED", "message",
@@ -993,9 +1013,9 @@ static int64_t upsert_node_internal(cbm_gbuf_t *gb, const char *label, const cha
      * derived-property enrichment, but immutable identity/source fields never mutate. */
     cbm_gbuf_node_t *existing = cbm_ht_get(gb->node_by_atom, atom_id);
     if (existing) {
-        bool equal = same_atom_payload(existing, label, name, qualified_name, file_path, start_line,
-                                       end_line, source_present, source_bytes, source_len,
-                                       start_byte, end_byte);
+        bool equal = same_atom_payload(existing, label, name, qualified_name, canonical_file_path,
+                                       start_line, end_line, source_present, source_bytes,
+                                       source_len, start_byte, end_byte);
         free(atom_id);
         if (!equal) {
             atomic_store(&gb->resolution_failed, true);
@@ -1033,7 +1053,7 @@ static int64_t upsert_node_internal(cbm_gbuf_t *gb, const char *label, const cha
     node->name = heap_strdup(name);
     node->atom_id = atom_id;
     node->qualified_name = heap_strdup(qualified_name);
-    node->file_path = (char *)gb_intern(gb, file_path);
+    node->file_path = (char *)gb_intern(gb, canonical_file_path);
     node->start_line = start_line;
     node->end_line = end_line;
     node->source_present = source_present;
@@ -1538,20 +1558,33 @@ void cbm_gbuf_set_row_sink(cbm_gbuf_t *gb, cbm_gbuf_row_node_sink_fn node_cb,
 
 int64_t cbm_gbuf_insert_edge(cbm_gbuf_t *gb, int64_t source_id, int64_t target_id, const char *type,
                              const char *properties_json) {
-    if (!gb || !type) {
+    const char *json = canonical_properties_json(properties_json);
+    if (!gb || !type || !type[0] || !valid_utf8_text(type) || !valid_properties_object(json)) {
+        if (gb) {
+            atomic_store(&gb->resolution_failed, true);
+        }
+        cbm_log_error("gbuf.edge_refused", "code", "CBM_EDGE_CANONICAL_INPUT_INVALID", "type",
+                      type ? type : "", "message",
+                      "edges require a non-empty UTF-8 type and a JSON object properties value",
+                      "remediation", "repair the exact edge type/properties input, then re-index");
         return 0;
     }
 
     /* Check for dedup */
     char key[EDGE_KEY_BUF];
-    make_edge_key(key, sizeof(key), source_id, target_id, type, properties_json);
+    make_edge_key(key, sizeof(key), source_id, target_id, type, json);
 
     cbm_gbuf_edge_t *existing = cbm_ht_get(gb->edge_by_key, key);
     if (existing) {
         /* Merge properties (just replace for now) */
-        if (properties_json && strcmp(properties_json, "{}") != 0) {
+        if (strcmp(json, "{}") != 0) {
+            char *replacement = heap_strdup(json);
+            if (!replacement) {
+                gbuf_index_failure(gb, "edge.properties.copy", key);
+                return 0;
+            }
             free(existing->properties_json);
-            existing->properties_json = heap_strdup(properties_json);
+            existing->properties_json = replacement;
         }
         return existing->id;
     }
@@ -1567,7 +1600,7 @@ int64_t cbm_gbuf_insert_edge(cbm_gbuf_t *gb, int64_t source_id, int64_t target_i
     edge->source_id = source_id;
     edge->target_id = target_id;
     edge->type = (char *)gb_intern(gb, type);
-    edge->properties_json = heap_strdup(properties_json);
+    edge->properties_json = heap_strdup(json);
     if (!edge->type || !edge->properties_json) {
         free_edge_strings(edge);
         free(edge);
@@ -1716,7 +1749,7 @@ static void merge_update_existing(cbm_gbuf_t *dst, cbm_gbuf_node_t *existing,
                       "preserve the inputs and report the colliding canonical frames");
         return;
     }
-    char *new_props = heap_strdup(sn->properties_json ? sn->properties_json : "{}");
+    char *new_props = heap_strdup(canonical_properties_json(sn->properties_json));
     if (!new_props) {
         atomic_store(&dst->resolution_failed, true);
         cbm_log_error("gbuf.node_alloc_failed", "code", "CBM_NODE_PROPERTIES_ALLOC_FAILED",
@@ -1765,21 +1798,21 @@ static void merge_copy_new_node(cbm_gbuf_t *dst, const cbm_gbuf_node_t *sn) {
     node->name = heap_strdup(sn->name);
     node->atom_id = heap_strdup(sn->atom_id);
     node->qualified_name = heap_strdup(sn->qualified_name);
-    node->file_path = (char *)gb_intern(dst, sn->file_path);
+    node->file_path = (char *)gb_intern(dst, canonical_identity_text(sn->file_path));
     node->start_line = sn->start_line;
     node->end_line = sn->end_line;
     node->source_present = sn->source_present;
     node->source_len = sn->source_len;
     node->start_byte = sn->start_byte;
     node->end_byte = sn->end_byte;
-    node->source_sha256 = heap_strdup(sn->source_sha256);
+    node->source_sha256 = sn->source_present ? heap_strdup(sn->source_sha256) : NULL;
     if (sn->source_len > 0) {
         node->source_bytes = malloc(sn->source_len);
         if (node->source_bytes) {
             memcpy(node->source_bytes, sn->source_bytes, sn->source_len);
         }
     }
-    node->properties_json = heap_strdup(sn->properties_json);
+    node->properties_json = heap_strdup(canonical_properties_json(sn->properties_json));
 
     if (!node->label || !node->name || !node->atom_id || !node->qualified_name ||
         !node->file_path || !node->properties_json ||
@@ -2077,17 +2110,17 @@ static CBMDumpNode *build_dump_nodes(cbm_gbuf_t *gb, int live_count, int64_t *te
             temp_to_final[n->id] = final_id;
         }
 
-        const char *fp = n->file_path ? n->file_path : "";
-        const char *props = n->properties_json ? n->properties_json : "{}";
+        const char *fp = canonical_identity_text(n->file_path);
+        const char *props = canonical_properties_json(n->properties_json);
         /* Identity text was validated before atom hashing. Dump exact copies:
          * changing even one byte here would sever atom_id from its canonical input. */
         dump_nodes[row] = (CBMDumpNode){
             .id = final_id,
             .project = gb->project,
             .label = n->label,
-            .name = heap_strdup(n->name ? n->name : ""),
+            .name = heap_strdup(canonical_identity_text(n->name)),
             .atom_id = n->atom_id,
-            .qualified_name = heap_strdup(n->qualified_name ? n->qualified_name : ""),
+            .qualified_name = heap_strdup(canonical_identity_text(n->qualified_name)),
             .file_path = heap_strdup(fp),
             .start_line = n->start_line,
             .end_line = n->end_line,
@@ -2181,7 +2214,7 @@ static CBMDumpEdge *build_dump_edges(cbm_gbuf_t *gb, const int64_t *temp_to_fina
                                : NULL;
         local_names[idx] = local_name;
 
-        const char *props = e->properties_json ? e->properties_json : "{}";
+        const char *props = canonical_properties_json(e->properties_json);
         dump_edges[idx] = (CBMDumpEdge){
             .id = idx + SKIP_ONE,
             .project = gb->project,

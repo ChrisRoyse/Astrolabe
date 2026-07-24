@@ -77,7 +77,10 @@ int cbm_gbuf_merge(cbm_gbuf_t *dst, cbm_gbuf_t *src);
 /* ── Node operations ─────────────────────────────────────────────── */
 
 /* Upsert a structural node without an attached source payload. Returns the temp ID.
- * All string fields are copied (buffer owns the copies).
+ * All string fields are copied (buffer owns the copies). A NULL file_path is
+ * canonical identity text for the empty path; a NULL properties_json is the
+ * JSON object "{}". Those domains are canonicalized independently before any
+ * identity hashing or retention.
  * Returns 0 on error. */
 int64_t cbm_gbuf_upsert_node(cbm_gbuf_t *gb, const char *label, const char *name,
                              const char *qualified_name, const char *file_path, int start_line,
@@ -173,6 +176,7 @@ void cbm_gbuf_set_row_sink(cbm_gbuf_t *gb, cbm_gbuf_row_node_sink_fn node_cb,
 /* ── Edge operations ─────────────────────────────────────────────── */
 
 /* Insert an edge. Deduplicates by (source_id, target_id, type).
+ * A NULL properties_json is canonicalized to the JSON object "{}".
  * On duplicate, merges properties (later wins). Returns edge temp ID.
  * Returns 0 on error. */
 int64_t cbm_gbuf_insert_edge(cbm_gbuf_t *gb, int64_t source_id, int64_t target_id, const char *type,
