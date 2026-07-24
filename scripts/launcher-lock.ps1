@@ -1,17 +1,19 @@
 <#
 .SYNOPSIS
-    Authoritative Astrolabe launcher-lock protocol (#197, #611).
+    Authoritative Astrolabe launcher-lock protocol (#197, #611, #613).
 
 .DESCRIPTION
     This helper is the only supported launcher-lock parser and claim/reclaim synchronizer.
     It never stops a process and never automatically removes stale state.
 
-    A schema-v2 owner is the exact Windows process identity
-    (pid, owner_process_start_utc_ticks). Claim, cleanup, and explicit reclaim serialize on
-    one Global Windows mutex whose name is derived from the opened workspace directory's
-    filesystem identity, not a lexical path. Live leases retain one READ|WRITE|DELETE
-    SafeFileHandle with FILE_SHARE_READ, so the exact claimed file remains readable for
-    observation but cannot be replaced, renamed, or deleted through a competing handle.
+    A schema-v3 lease binds one canonical protocol authority plus the exact
+    Windows process identity (pid, owner_process_start_utc_ticks). Claim,
+    cleanup, and explicit reclaim serialize on one Global Windows mutex whose
+    name is derived from the opened workspace directory's filesystem identity,
+    not a lexical path. Live leases retain one READ|WRITE|DELETE SafeFileHandle
+    with FILE_SHARE_READ, so the exact claimed file remains readable for
+    observation but cannot be replaced, renamed, or deleted through a
+    competing handle.
 
     Interrupted claim/cleanup/reclaim names are durable protocol state. They are discovered and
     refused rather than ignored. Only the explicit tracker-evidenced reclaim/quarantine
@@ -2436,7 +2438,27 @@ function Convert-AstroLauncherLockBytesToState {
         }
     }
 
-    $requiredNames = @(
+    $properties = $document.Properties
+    $schemaValue = if (
+        $properties.ContainsKey('schema') -and
+        $properties['schema'].Kind -ceq 'string'
+    ) {
+        [string]$properties['schema'].Value
+    }
+    else {
+        $null
+    }
+    $isV2 = $schemaValue -ceq 'astrolabe.launcher-lock.v2'
+    $isV3 = $schemaValue -ceq 'astrolabe.launcher-lock.v3'
+    if (-not ($isV2 -or $isV3)) {
+        return [pscustomobject]@{
+            State = 'unreadable'
+            ValidationError =
+                'schema must be the JSON string astrolabe.launcher-lock.v2 or astrolabe.launcher-lock.v3'
+            RawJson = $raw
+        }
+    }
+    $commonRequiredNames = @(
         'schema',
         'pid',
         'issue',
@@ -2449,6 +2471,25 @@ function Convert-AstroLauncherLockBytesToState {
         'status_sha256',
         'diff_sha256'
     )
+    $authorityRequiredNames = @(
+        'protocol_authority_version',
+        'protocol_authority_root',
+        'protocol_entrypoint_path',
+        'protocol_entrypoint_sha256',
+        'protocol_authority_path',
+        'protocol_authority_sha256',
+        'protocol_lock_helper_path',
+        'protocol_lock_helper_sha256',
+        'workspace_root',
+        'workspace_entrypoint_path',
+        'workspace_entrypoint_sha256'
+    )
+    $requiredNames = if ($isV3) {
+        @($commonRequiredNames + $authorityRequiredNames)
+    }
+    else {
+        @($commonRequiredNames)
+    }
     $actualNames = @($document.Names)
     $nameValid = $actualNames.Count -eq $requiredNames.Count
     foreach ($name in $requiredNames) {
@@ -2464,19 +2505,123 @@ function Convert-AstroLauncherLockBytesToState {
     if (-not $nameValid) {
         return [pscustomobject]@{
             State = 'unreadable'
-            ValidationError = 'launcher-lock JSON must contain exactly the v2 property set, once each'
+            ValidationError = "launcher-lock JSON must contain exactly the $(if ($isV3) { 'v3' } else { 'v2' }) property set, once each"
             RawJson = $raw
         }
     }
 
-    $properties = $document.Properties
-    if ($properties['schema'].Kind -cne 'string' -or
-        [string]$properties['schema'].Value -cne 'astrolabe.launcher-lock.v2') {
+    $authorityVersion = if ($isV3) { 0L } else { 2L }
+    $workspaceRoot = $null
+    if ($isV3) {
+    if ($properties['protocol_authority_version'].Kind -cne 'integer' -or
+        -not [long]::TryParse(
+            [string]$properties['protocol_authority_version'].Raw,
+            [Globalization.NumberStyles]::None,
+            [Globalization.CultureInfo]::InvariantCulture,
+            [ref]$authorityVersion
+        ) -or $authorityVersion -ne 3) {
         return [pscustomobject]@{
             State = 'unreadable'
-            ValidationError = 'schema must be the JSON string astrolabe.launcher-lock.v2'
+            ValidationError = 'protocol_authority_version must be the integral JSON number 3'
             RawJson = $raw
         }
+    }
+    $canonicalRoot = 'C:\code\Astrolabe'
+    $canonicalEntrypoint = Join-Path `
+        (Join-Path $canonicalRoot 'scripts') `
+        'windows-gnu-toolchain.ps1'
+    $canonicalAuthority = Join-Path `
+        (Join-Path $canonicalRoot 'scripts') `
+        'windows-gnu-toolchain-authority.ps1'
+    $canonicalLockHelper = Join-Path `
+        (Join-Path $canonicalRoot 'scripts') `
+        'launcher-lock.ps1'
+    foreach ($field in @(
+            'protocol_authority_root',
+            'protocol_entrypoint_path',
+            'protocol_entrypoint_sha256',
+            'protocol_authority_path',
+            'protocol_authority_sha256',
+            'protocol_lock_helper_path',
+            'protocol_lock_helper_sha256',
+            'workspace_root',
+            'workspace_entrypoint_path',
+            'workspace_entrypoint_sha256'
+        )) {
+        if ($properties[$field].Kind -cne 'string' -or
+            [string]::IsNullOrWhiteSpace(
+                [string]$properties[$field].Value
+            )) {
+            return [pscustomobject]@{
+                State = 'unreadable'
+                ValidationError = "$field must be a nonblank JSON string"
+                RawJson = $raw
+            }
+        }
+    }
+    if ([string]$properties['protocol_authority_root'].Value -cne
+            $canonicalRoot -or
+        [string]$properties['protocol_entrypoint_path'].Value -cne
+            $canonicalEntrypoint -or
+        [string]$properties['protocol_authority_path'].Value -cne
+            $canonicalAuthority -or
+        [string]$properties['protocol_lock_helper_path'].Value -cne
+            $canonicalLockHelper) {
+        return [pscustomobject]@{
+            State = 'unreadable'
+            ValidationError = 'protocol authority root/paths do not name the exact canonical authority'
+            RawJson = $raw
+        }
+    }
+    foreach ($field in @(
+            'protocol_entrypoint_sha256',
+            'protocol_authority_sha256',
+            'protocol_lock_helper_sha256',
+            'workspace_entrypoint_sha256'
+        )) {
+        if ([string]$properties[$field].Value -cnotmatch
+            '^[0-9a-f]{64}$') {
+            return [pscustomobject]@{
+                State = 'unreadable'
+                ValidationError = "$field must be exactly 64 lowercase hexadecimal characters"
+                RawJson = $raw
+            }
+        }
+    }
+    if ([string]$properties['workspace_entrypoint_sha256'].Value -cne
+        [string]$properties['protocol_entrypoint_sha256'].Value) {
+        return [pscustomobject]@{
+            State = 'unreadable'
+            ValidationError = 'workspace and canonical trampoline SHA-256 values must match exactly'
+            RawJson = $raw
+        }
+    }
+    $workspaceRoot = [string]$properties['workspace_root'].Value
+    $worktreeParent = Join-Path `
+        (Join-Path $canonicalRoot '.claude') `
+        'worktrees'
+    $workspaceRootSupported = $workspaceRoot -ceq $canonicalRoot -or
+        (
+            $workspaceRoot.StartsWith(
+                $worktreeParent +
+                    [IO.Path]::DirectorySeparatorChar,
+                [StringComparison]::OrdinalIgnoreCase
+            ) -and
+            [IO.Path]::GetDirectoryName($workspaceRoot) -ieq
+                $worktreeParent
+        )
+    $expectedWorkspaceEntrypoint = Join-Path `
+        (Join-Path $workspaceRoot 'scripts') `
+        'windows-gnu-toolchain.ps1'
+    if (-not $workspaceRootSupported -or
+        [string]$properties['workspace_entrypoint_path'].Value -cne
+            $expectedWorkspaceEntrypoint) {
+        return [pscustomobject]@{
+            State = 'unreadable'
+            ValidationError = 'workspace authority binding must name the canonical root or one direct supported registered-worktree root and its exact trampoline path'
+            RawJson = $raw
+        }
+    }
     }
     $pidValue = 0L
     if ($properties['pid'].Kind -cne 'integer' -or
@@ -2585,7 +2730,10 @@ function Convert-AstroLauncherLockBytesToState {
 
     $ownerPid = [int]$pidValue
     $probe = Get-AstroProcessIdentityProbe $ownerPid
-    $state = if ($probe.State -eq 'absent') {
+    $state = if ($isV2) {
+        'version-mismatch'
+    }
+    elseif ($probe.State -eq 'absent') {
         'stale'
     }
     elseif ($probe.State -eq 'unevaluable') {
@@ -2600,6 +2748,35 @@ function Convert-AstroLauncherLockBytesToState {
     return [pscustomobject]@{
         State = $state
         Schema = [string]$properties['schema'].Value
+        ProtocolAuthorityVersion = [int]$authorityVersion
+        ProtocolAuthorityRoot = if ($isV3) {
+            [string]$properties['protocol_authority_root'].Value
+        } else { $null }
+        ProtocolEntrypointPath = if ($isV3) {
+            [string]$properties['protocol_entrypoint_path'].Value
+        } else { $null }
+        ProtocolEntrypointSha256 = if ($isV3) {
+            [string]$properties['protocol_entrypoint_sha256'].Value
+        } else { $null }
+        ProtocolAuthorityPath = if ($isV3) {
+            [string]$properties['protocol_authority_path'].Value
+        } else { $null }
+        ProtocolAuthoritySha256 = if ($isV3) {
+            [string]$properties['protocol_authority_sha256'].Value
+        } else { $null }
+        ProtocolLockHelperPath = if ($isV3) {
+            [string]$properties['protocol_lock_helper_path'].Value
+        } else { $null }
+        ProtocolLockHelperSha256 = if ($isV3) {
+            [string]$properties['protocol_lock_helper_sha256'].Value
+        } else { $null }
+        WorkspaceRoot = $workspaceRoot
+        WorkspaceEntrypointPath = if ($isV3) {
+            [string]$properties['workspace_entrypoint_path'].Value
+        } else { $null }
+        WorkspaceEntrypointSha256 = if ($isV3) {
+            [string]$properties['workspace_entrypoint_sha256'].Value
+        } else { $null }
         OwnerPid = $ownerPid
         Issue = [int]$issueValue
         LeaseStartUtcTicks = $leaseTicks
@@ -2635,6 +2812,17 @@ function New-AstroLauncherLockState {
     return [pscustomobject]@{
         State = $State
         Schema = $null
+        ProtocolAuthorityVersion = $null
+        ProtocolAuthorityRoot = $null
+        ProtocolEntrypointPath = $null
+        ProtocolEntrypointSha256 = $null
+        ProtocolAuthorityPath = $null
+        ProtocolAuthoritySha256 = $null
+        ProtocolLockHelperPath = $null
+        ProtocolLockHelperSha256 = $null
+        WorkspaceRoot = $null
+        WorkspaceEntrypointPath = $null
+        WorkspaceEntrypointSha256 = $null
         OwnerPid = $null
         Issue = $null
         LeaseStartUtcTicks = $null
@@ -3252,6 +3440,22 @@ function Assert-AstroLauncherLockClaimable {
         }
         'unreadable' {
             throw "LAUNCHER_BOUNDARY[ASTRO_LAUNCHER_LOCK_UNREADABLE]: launcher lock is present but invalid ($($lock.ValidationError)); preserve its exact bytes and use scripts\reclaim-launcher-lock.ps1 -QuarantineUnreadable only after tracker-posted hash and exact dead-owner evidence: $LockPath"
+        }
+        'version-mismatch' {
+            throw (
+                'LAUNCHER_AUTHORITY[ASTRO_LAUNCHER_PROTOCOL_VERSION_MISMATCH]: ' +
+                "{code=ASTRO_LAUNCHER_PROTOCOL_VERSION_MISMATCH; " +
+                "message=`"launcher protocol state uses retired schema " +
+                "'$($lock.Schema)' for exact owner pid=$($lock.OwnerPid), " +
+                "process_start_utc_ticks=$($lock.OwnerProcessStartUtcTicks), " +
+                "issue=#$($lock.Issue), probe_state=$(if ($lock.ProbeError) { 'unevaluable' } elseif ($lock.PidReused) { 'pid-reused' } elseif ($null -eq $lock.ObservedProcessStartUtcTicks) { 'absent' } else { 'exact-live' }); " +
+                "it was preserved unchanged at '$LockPath'`"; " +
+                "remediation=`"re-read the owning issue, record the exact " +
+                "state hash '$($lock.Sha256)', and use the tracker-evidenced " +
+                "reclaim path from canonical authority " +
+                "'C:\code\Astrolabe\scripts\windows-gnu-toolchain-authority.ps1'; " +
+                "never execute a historical worktree launcher`"}"
+            )
         }
         'held' {
             throw "LAUNCHER_BOUNDARY[ASTRO_LAUNCHER_LOCK_HELD]: another launcher session owns this workspace (pid=$($lock.OwnerPid), owner_process_start_utc_ticks=$($lock.OwnerProcessStartUtcTicks), issue=#$($lock.Issue), lease_started=$($lock.Started), command=$($lock.Command)); never stop or clean it: $LockPath"

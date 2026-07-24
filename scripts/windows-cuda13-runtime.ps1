@@ -4,7 +4,18 @@ param(
     [ValidateNotNullOrEmpty()]
     [string]$WorkspaceRoot,
 
-    [string]$ToolchainsRoot = ""
+    [string]$ToolchainsRoot = "",
+
+    # #613: every launcher call carries the canonical protocol decision.
+    # Defaults keep parameter binding non-interactive for a retired caller, then
+    # the attestation below emits one structured fail-closed error before any
+    # bundle inspection, lock, download, extraction, or shared-state mutation.
+    [string]$LauncherProtocolAuthorityVersion = "",
+    [string]$LauncherProtocolAuthorityPath = "",
+    [string]$LauncherProtocolAuthoritySha256 = "",
+    [string]$LauncherProtocolEntrypointSha256 = "",
+    [string]$LauncherWorkspaceRoot = "",
+    [string]$LauncherWorkspaceEntrypointSha256 = ""
 )
 
 Set-StrictMode -Version Latest
@@ -16,6 +27,16 @@ $ReceiptSchema = "astrolabe.windows-ort-cuda-runtime-receipt.v2"
 $LockFileName = "ort-cuda13.3-windows-x86_64.lock.json"
 $CanonicalWorkspace = "C:\code\Astrolabe"
 $Utf8NoBom = [System.Text.UTF8Encoding]::new($false)
+
+function Fail-Runtime {
+    param(
+        [Parameter(Mandatory = $true)][string]$Code,
+        [Parameter(Mandatory = $true)][string]$Message,
+        [Parameter(Mandatory = $true)][string]$Remediation
+    )
+
+    throw "CUDA13_RUNTIME[$Code]: {code=$Code; message=`"$Message`"; remediation=`"$Remediation`"}"
+}
 
 function Fail-Runtime-Missing-Helper {
     param([Parameter(Mandatory = $true)][string]$HelperPath)
@@ -37,16 +58,6 @@ if (-not (Test-Path -LiteralPath $Cuda13RetireHelper -PathType Leaf)) {
 }
 . $Cuda13RetireHelper
 
-function Fail-Runtime {
-    param(
-        [Parameter(Mandatory = $true)][string]$Code,
-        [Parameter(Mandatory = $true)][string]$Message,
-        [Parameter(Mandatory = $true)][string]$Remediation
-    )
-
-    throw "CUDA13_RUNTIME[$Code]: {code=$Code; message=`"$Message`"; remediation=`"$Remediation`"}"
-}
-
 function Get-Sha256Hex {
     param([Parameter(Mandatory = $true)][string]$LiteralPath)
 
@@ -63,6 +74,98 @@ function Get-Sha256Hex {
     finally {
         $sha.Dispose()
     }
+}
+
+# #613: this canonical shared-state boundary is also the hard stop for every
+# historical registered launcher currently in the repository. Those launchers
+# all call this canonical provisioner before creating their old PID-only lock,
+# TEMP, target, or bundle state, but cannot supply this v3 authority binding.
+$CanonicalLauncherEntrypoint = Join-Path `
+    (Join-Path $CanonicalWorkspace 'scripts') `
+    'windows-gnu-toolchain.ps1'
+$CanonicalLauncherAuthority = Join-Path `
+    (Join-Path $CanonicalWorkspace 'scripts') `
+    'windows-gnu-toolchain-authority.ps1'
+$expectedCaller = [IO.Path]::GetFullPath($CanonicalLauncherAuthority)
+$observedCaller = if ([string]::IsNullOrWhiteSpace($MyInvocation.ScriptName)) {
+    ''
+}
+else {
+    [IO.Path]::GetFullPath($MyInvocation.ScriptName)
+}
+if ($LauncherProtocolAuthorityVersion -cne '3' -or
+    -not [string]::Equals(
+        $LauncherProtocolAuthorityPath,
+        $expectedCaller,
+        [StringComparison]::OrdinalIgnoreCase
+    ) -or
+    -not [string]::Equals(
+        $observedCaller,
+        $expectedCaller,
+        [StringComparison]::OrdinalIgnoreCase
+    ) -or
+    $LauncherProtocolAuthoritySha256 -cnotmatch '^[0-9a-f]{64}$' -or
+    $LauncherProtocolEntrypointSha256 -cnotmatch '^[0-9a-f]{64}$' -or
+    $LauncherWorkspaceEntrypointSha256 -cnotmatch '^[0-9a-f]{64}$' -or
+    [string]::IsNullOrWhiteSpace($LauncherWorkspaceRoot)) {
+    Fail-Runtime `
+        'ASTRO_LAUNCHER_PROTOCOL_VERSION_MISMATCH' `
+        "caller '$observedCaller' did not supply the complete launcher protocol authority v3 binding" `
+        "invoke '$CanonicalLauncherEntrypoint'; safely update or retire any historical registered-worktree launcher"
+}
+foreach ($authorityFile in @(
+        $CanonicalLauncherEntrypoint,
+        $CanonicalLauncherAuthority
+    )) {
+    if (-not [IO.File]::Exists($authorityFile)) {
+        Fail-Runtime `
+            'ASTRO_LAUNCHER_AUTHORITY_INCOMPLETE' `
+            "canonical authority file is absent: '$authorityFile'" `
+            "restore and verify the canonical checkout at '$CanonicalWorkspace'"
+    }
+    $authorityItem = Get-Item -LiteralPath $authorityFile -Force
+    if (($authorityItem.Attributes -band
+            [IO.FileAttributes]::ReparsePoint) -ne 0 -or
+        ($authorityItem.Attributes -band
+            [IO.FileAttributes]::Directory) -ne 0) {
+        Fail-Runtime `
+            'ASTRO_LAUNCHER_AUTHORITY_FILE_INVALID' `
+            "canonical authority path is not one ordinary non-reparse file: '$authorityFile'" `
+            "restore the exact canonical tracked file before retrying"
+    }
+}
+$observedAuthoritySha256 = Get-Sha256Hex $CanonicalLauncherAuthority
+$observedEntrypointSha256 = Get-Sha256Hex $CanonicalLauncherEntrypoint
+$launcherWorkspaceFull = try {
+    [IO.Path]::GetFullPath($LauncherWorkspaceRoot).TrimEnd('\', '/')
+}
+catch {
+    Fail-Runtime `
+        'ASTRO_LAUNCHER_WORKSPACE_INVALID' `
+        "launcher workspace root cannot be resolved: '$LauncherWorkspaceRoot'" `
+        "invoke only the canonical launcher entrypoint"
+}
+$launcherWorkspaceEntrypoint = Join-Path `
+    (Join-Path $launcherWorkspaceFull 'scripts') `
+    'windows-gnu-toolchain.ps1'
+if (-not [IO.File]::Exists($launcherWorkspaceEntrypoint)) {
+    Fail-Runtime `
+        'ASTRO_LAUNCHER_PROTOCOL_VERSION_MISMATCH' `
+        "launcher workspace entrypoint is absent: '$launcherWorkspaceEntrypoint'" `
+        "update or safely retire the historical registered worktree"
+}
+$observedWorkspaceEntrypointSha256 =
+    Get-Sha256Hex $launcherWorkspaceEntrypoint
+if ($observedAuthoritySha256 -cne $LauncherProtocolAuthoritySha256 -or
+    $observedEntrypointSha256 -cne $LauncherProtocolEntrypointSha256 -or
+    $observedWorkspaceEntrypointSha256 -cne
+        $LauncherWorkspaceEntrypointSha256 -or
+    $observedWorkspaceEntrypointSha256 -cne
+        $observedEntrypointSha256) {
+    Fail-Runtime `
+        'ASTRO_LAUNCHER_PROTOCOL_VERSION_MISMATCH' `
+        "launcher authority changed or the workspace trampoline differs from canonical bytes (authority=$observedAuthoritySha256; canonical_entrypoint=$observedEntrypointSha256; workspace_entrypoint=$observedWorkspaceEntrypointSha256)" `
+        "preserve all state; invoke '$CanonicalLauncherEntrypoint' only after restoring one clean canonical authority"
 }
 
 function Assert-ExactFields {

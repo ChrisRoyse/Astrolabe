@@ -1441,7 +1441,8 @@ function Get-AstroEmbeddedOwnerIdentity {
                 '"issue"',
                 '"owner_process_start_utc_ticks"',
                 '"owner_process_started_utc"',
-                'astrolabe.launcher-lock.v2'
+                'astrolabe.launcher-lock.v2',
+                'astrolabe.launcher-lock.v3'
             )) {
             if ($lossyAscii.IndexOf($literal, [StringComparison]::OrdinalIgnoreCase) -ge 0) {
                 $ownerIndicator = $true
@@ -1465,7 +1466,10 @@ function Get-AstroEmbeddedOwnerIdentity {
                                 'schema'
                             ) -and
                             $next -lt $raw.Length -and $raw[$next] -eq ':') -or
-                        [string]$token.Value -ceq 'astrolabe.launcher-lock.v2') {
+                        [string]$token.Value -cin @(
+                            'astrolabe.launcher-lock.v2',
+                            'astrolabe.launcher-lock.v3'
+                        )) {
                         $ownerIndicator = $true
                     }
                     $cursor = $token.NextIndex
@@ -1490,7 +1494,10 @@ function Get-AstroEmbeddedOwnerIdentity {
     $properties = $document.Properties
     $schemaIsModern = $properties.ContainsKey('schema') -and
         $properties['schema'].Kind -ceq 'string' -and
-        [string]$properties['schema'].Value -ceq 'astrolabe.launcher-lock.v2'
+        [string]$properties['schema'].Value -cin @(
+            'astrolabe.launcher-lock.v2',
+            'astrolabe.launcher-lock.v3'
+        )
     $hasPid = $properties.ContainsKey('pid')
     $hasIssue = $properties.ContainsKey('issue')
     $hasTicks = $properties.ContainsKey('owner_process_start_utc_ticks')
@@ -1548,7 +1555,7 @@ function Get-AstroEmbeddedOwnerIdentity {
             }
         }
         return [pscustomobject]@{
-            State = 'v2'
+            State = 'exact'
             Path = $Path
             Pid = [int]$pidValue
             Issue = [int]$issueValue
@@ -1853,7 +1860,7 @@ function Read-LegacyOwner {
     }
 }
 
-function Read-V2Owner {
+function Read-ExactOwner {
     param(
         [Parameter(Mandatory)][AllowEmptyCollection()][byte[]]$Bytes,
         [Parameter(Mandatory)][string]$Path
@@ -1862,7 +1869,7 @@ function Read-V2Owner {
     $state = Convert-AstroLauncherLockBytesToState $Bytes $Path
     if ($state.State -eq 'unreadable') {
         Fail-Astro 'ASTRO_LAUNCHER_LOCK_RECLAIM_UNREADABLE' `
-            "schema-v2 lock is invalid: $($state.ValidationError)" `
+            "exact-owner launcher lock is invalid: $($state.ValidationError)" `
             'preserve it or use the separate -QuarantineUnreadable mode with exact tracker evidence'
     }
     return [pscustomobject]@{
@@ -6709,7 +6716,7 @@ try {
         $owner = if ($LegacyPidOnly) {
             Read-LegacyOwner $initial.Bytes $lockFull
         } else {
-            Read-V2Owner $initial.Bytes $lockFull
+            Read-ExactOwner $initial.Bytes $lockFull
         }
         if ($owner.Pid -ne $expectedPidValue -or
             $owner.Issue -ne $expectedIssueValue -or
@@ -6741,7 +6748,7 @@ try {
                 $transitionState.Sha256 -cne $initial.Sha256)
         if ($v2Candidate.State -ne 'unreadable') {
             if (-not $transitionEnvelopeUnreadable) {
-                # A valid v2 source can still own one malformed exact attribution
+                # A valid exact-owner source can still own one malformed exact attribution
                 # stage. Defer the necessity decision until the retained, exact
                 # attribution inventory proves that this is the sole unreadable
                 # subordinate state. No mutation occurs before that proof.
@@ -6752,8 +6759,8 @@ try {
                 $v2Candidate.Issue -ne $expectedIssueValue -or
                 $v2Candidate.OwnerProcessStartUtcTicks -ne $expectedTicksValue) {
                 Fail-Astro 'ASTRO_LAUNCHER_LOCK_RECLAIM_OWNER_MISMATCH' `
-                    'valid v2 bytes inside an unreadable transition envelope differ from the expected exact owner' `
-                    'bind quarantine to the embedded v2 PID/issue/process-start ticks; never downgrade them'
+                    'valid exact-owner bytes inside an unreadable transition envelope differ from the expected exact owner' `
+                    'bind quarantine to the embedded PID/issue/process-start ticks; never downgrade them'
             }
             $owner = [pscustomobject]@{
                 Schema = $v2Candidate.Schema
@@ -6785,7 +6792,7 @@ try {
             }
             $owner = $legacyCandidate
         }
-        elseif ($embeddedOwner.State -eq 'v2') {
+        elseif ($embeddedOwner.State -eq 'exact') {
             if ($LegacyPidOnly -or
                 $embeddedOwner.Pid -ne $expectedPidValue -or
                 $embeddedOwner.Issue -ne $expectedIssueValue -or
@@ -6796,7 +6803,7 @@ try {
                     'bind quarantine to the embedded PID/issue/process-start ticks; invalid non-owner fields never authorize an ownership downgrade'
             }
             $owner = [pscustomobject]@{
-                Schema = 'embedded-v2-quarantine'
+                Schema = 'embedded-exact-quarantine'
                 Legacy = $false
                 Pid = $embeddedOwner.Pid
                 Issue = $embeddedOwner.Issue
@@ -6922,8 +6929,8 @@ try {
         if (($malformedExactStages.Count +
                 $malformedRenameTransactions.Count) -ne 1) {
             Fail-Astro 'ASTRO_LAUNCHER_LOCK_RECLAIM_QUARANTINE_NOT_REQUIRED' `
-                "QuarantineUnreadable on a valid schema-v2 source requires exactly one malformed exact attribution stage or one strictly cross-bound one-code-unit refresh rename; observed stages=$($malformedExactStages.Count), refresh_renames=$($malformedRenameTransactions.Count)" `
-                'use normal v2 reclaim when no malformed subordinate exists; preserve multiple or otherwise ambiguous malformed states for investigation'
+                "QuarantineUnreadable on a valid exact-owner source requires exactly one malformed exact attribution stage or one strictly cross-bound one-code-unit refresh rename; observed stages=$($malformedExactStages.Count), refresh_renames=$($malformedRenameTransactions.Count)" `
+                'use normal exact-owner reclaim when no malformed subordinate exists; preserve multiple or otherwise ambiguous malformed states for investigation'
         }
     }
     $subordinateCleanupPlan = if ($recognizedReclaimMarker) {
