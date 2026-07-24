@@ -3855,12 +3855,64 @@ function Test-PinnedToolchain {
     }
 }
 
-if ($env:OS -ne "Windows_NT") {
-    throw "windows-gnu-toolchain.ps1 is native Windows only"
+function Assert-AstroNativeWindowsPlatform {
+    try {
+        $isWindows = [System.Runtime.InteropServices.RuntimeInformation]::IsOSPlatform(
+            [System.Runtime.InteropServices.OSPlatform]::Windows
+        )
+        $osDescription = [System.Runtime.InteropServices.RuntimeInformation]::OSDescription
+        $frameworkDescription = [System.Runtime.InteropServices.RuntimeInformation]::FrameworkDescription
+        $processArchitecture = [System.Runtime.InteropServices.RuntimeInformation]::ProcessArchitecture.ToString()
+    }
+    catch {
+        # PSObject.TypeNames remains readable when a restricted PowerShell
+        # language mode is itself the reason the intrinsic query failed.
+        $exceptionType = $_.Exception.PSObject.TypeNames[0]
+        $exceptionMessage = $_.Exception.Message
+        throw (
+            "EXECUTION_BOUNDARY[ASTRO_PLATFORM_QUERY_FAULT]: intrinsic .NET platform query failed; " +
+            "query=RuntimeInformation.IsOSPlatform(OSPlatform.Windows); " +
+            "exception_type=$exceptionType; exception_message=$exceptionMessage; " +
+            "remediation=run from native Windows PowerShell 5.1 or newer with the platform runtime intact and report this complete diagnostic"
+        )
+    }
+
+    $wslMarkers = [Collections.Generic.List[string]]::new()
+    if (-not [string]::IsNullOrWhiteSpace([string]$env:WSL_DISTRO_NAME)) {
+        $wslMarkers.Add("WSL_DISTRO_NAME")
+    }
+    if (-not [string]::IsNullOrWhiteSpace([string]$env:WSL_INTEROP)) {
+        $wslMarkers.Add("WSL_INTEROP")
+    }
+    $platformContext = (
+        "os_description=$osDescription; framework=$frameworkDescription; " +
+        "process_architecture=$processArchitecture"
+    )
+
+    if (-not $isWindows) {
+        if ($wslMarkers.Count -gt 0) {
+            throw (
+                "EXECUTION_BOUNDARY[ASTRO_NATIVE_CONTEXT_REQUIRED]: intrinsic platform is not Windows " +
+                "and WSL execution markers are present; markers=$($wslMarkers -join ','); $platformContext; " +
+                "remediation=run this launcher from native Windows PowerShell in the canonical checkout"
+            )
+        }
+        throw (
+            "EXECUTION_BOUNDARY[ASTRO_WINDOWS_REQUIRED]: intrinsic platform is not Windows; $platformContext; " +
+            "remediation=run this launcher from native Windows PowerShell in the canonical checkout"
+        )
+    }
+
+    if ($wslMarkers.Count -gt 0) {
+        throw (
+            "EXECUTION_BOUNDARY[ASTRO_NATIVE_CONTEXT_REQUIRED]: native Windows process inherited WSL execution markers; " +
+            "markers=$($wslMarkers -join ','); $platformContext; " +
+            "remediation=start a native Windows PowerShell session directly and rerun the launcher"
+        )
+    }
 }
-if ($env:WSL_DISTRO_NAME -or $env:WSL_INTEROP) {
-    throw "EXECUTION_BOUNDARY[ASTRO_NATIVE_CONTEXT_REQUIRED]: run this launcher from native Windows PowerShell"
-}
+
+Assert-AstroNativeWindowsPlatform
 
 # #613: authority is established before any CUDA provisioner, .tmp, target,
 # Git, or shared-tool mutation. A registered worktree may supply the target
