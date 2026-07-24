@@ -88,7 +88,7 @@ mod enabled {
             &serde_json::to_value(&loaded_modules)?,
         )?;
         let gpu_identity = capture_gpu_identity_state(&ctx, &output_dir)?;
-        let gpu_processes = capture_gpu_process_state(&output_dir)?;
+        let gpu_processes = capture_gpu_process_state(&ctx, &output_dir)?;
         let edges = exercise_edges(&backend, &output_dir)?;
 
         #[cfg(feature = "cuda-policy-measurement")]
@@ -453,26 +453,53 @@ mod enabled {
         )?;
         let stdout = String::from_utf8(output.stdout)?;
         let identity = ctx.physical_identity();
-        let expected_uuid = identity.canonical_uuid().to_ascii_lowercase();
-        let canonical_pci = identity.canonical_pci_bus_id().to_ascii_lowercase();
+        let expected_uuid = identity.canonical_uuid();
+        let canonical_pci = identity.canonical_pci_bus_id();
         let expanded_pci = format!("0000{canonical_pci}");
+        let compute_capability = ctx.compute_capability();
+        let expected_compute_capability =
+            format!("{}.{}", compute_capability.0, compute_capability.1);
+        let rows = parse_nvidia_csv_rows(&stdout, 7, "GPU identity")?;
+        let mut matching_rows = 0usize;
+        for (line_number, fields) in &rows {
+            let ordinal = fields[0].parse::<u32>().map_err(|error| {
+                format!(
+                    "nvidia-smi GPU row {line_number} has invalid ordinal '{}': {error}",
+                    fields[0]
+                )
+            })?;
+            require(
+                !fields[1].is_empty()
+                    && valid_gpu_uuid(&fields[2])
+                    && valid_pci_bus_id(&fields[3])
+                    && valid_dotted_decimal(&fields[4])
+                    && fields[5].parse::<u64>().is_ok_and(|value| value > 0)
+                    && valid_compute_capability(&fields[6]),
+                &format!("nvidia-smi GPU row {line_number} has an invalid physical schema"),
+            )?;
+            if ordinal == ctx.driver_ordinal()
+                && fields[1] == ctx.name()
+                && fields[2].eq_ignore_ascii_case(&expected_uuid)
+                && (fields[3].eq_ignore_ascii_case(&canonical_pci)
+                    || fields[3].eq_ignore_ascii_case(&expanded_pci))
+                && fields[6] == expected_compute_capability
+            {
+                matching_rows += 1;
+            }
+        }
         require(
-            stdout.lines().any(|line| {
-                let line = line.to_ascii_lowercase();
-                line.contains(&expected_uuid)
-                    && (line.contains(&canonical_pci) || line.contains(&expanded_pci))
-                    && line.contains(&ctx.name().to_ascii_lowercase())
-            }),
+            matching_rows == 1,
             &format!(
-                "nvidia-smi did not report the selected physical device uuid={expected_uuid} pci={canonical_pci} name={}",
-                ctx.name()
+                "nvidia-smi reported {matching_rows} exact selected physical-device rows; expected one uuid={expected_uuid} pci={canonical_pci} name={} driver_ordinal={} compute_capability={expected_compute_capability}",
+                ctx.name(),
+                ctx.driver_ordinal()
             ),
         )?;
         write_and_verify(&output_dir.join("nvidia-smi-gpu.csv"), stdout.as_bytes())?;
         Ok(stdout)
     }
 
-    fn capture_gpu_process_state(output_dir: &Path) -> AnyResult<String> {
+    fn capture_gpu_process_state(ctx: &CudaContext, output_dir: &Path) -> AnyResult<String> {
         let output = Command::new("nvidia-smi.exe")
             .args([
                 "--query-compute-apps=pid,process_name,gpu_uuid,used_gpu_memory",
@@ -487,18 +514,214 @@ mod enabled {
             ),
         )?;
         let stdout = String::from_utf8(output.stdout)?;
+        let expected_pid = std::process::id();
+        let expected_executable = std::env::current_exe()?;
+        let expected_executable = expected_executable.to_str().ok_or_else(|| {
+            format!(
+                "current FSV executable path is not Unicode: {}",
+                expected_executable.display()
+            )
+        })?;
+        let expected_uuid = ctx.physical_identity().canonical_uuid();
+        let rows = parse_nvidia_csv_rows(&stdout, 4, "compute process")?;
+        let mut matching_rows = 0usize;
+        for (line_number, fields) in &rows {
+            let pid = fields[0].parse::<u32>().map_err(|error| {
+                format!(
+                    "nvidia-smi compute-process row {line_number} has invalid PID '{}': {error}",
+                    fields[0]
+                )
+            })?;
+            require(
+                pid > 0
+                    && !fields[1].is_empty()
+                    && valid_gpu_uuid(&fields[2])
+                    && valid_used_gpu_memory(&fields[3]),
+                &format!(
+                    "nvidia-smi compute-process row {line_number} has an invalid physical schema"
+                ),
+            )?;
+            if pid == expected_pid
+                && fields[1].eq_ignore_ascii_case(expected_executable)
+                && fields[2].eq_ignore_ascii_case(&expected_uuid)
+            {
+                matching_rows += 1;
+            }
+        }
         require(
-            stdout.lines().any(|line| {
-                line.trim_start()
-                    .starts_with(&std::process::id().to_string())
-            }),
-            "nvidia-smi did not report the live FSV process on the GPU",
+            matching_rows == 1,
+            &format!(
+                "nvidia-smi reported {matching_rows} exact live FSV process rows; expected one pid={expected_pid} executable={expected_executable} gpu_uuid={expected_uuid}"
+            ),
         )?;
         write_and_verify(
             &output_dir.join("nvidia-smi-compute-apps.csv"),
             stdout.as_bytes(),
         )?;
         Ok(stdout)
+    }
+
+    fn parse_nvidia_csv_rows(
+        source: &str,
+        expected_fields: usize,
+        description: &str,
+    ) -> AnyResult<Vec<(usize, Vec<String>)>> {
+        require(
+            !source.as_bytes().contains(&0),
+            &format!("nvidia-smi {description} CSV contains a NUL byte"),
+        )?;
+        let mut rows = Vec::new();
+        for (line_index, line) in source.lines().enumerate() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let line_number = line_index + 1;
+            let fields = parse_nvidia_csv_line(line, line_number, description)?;
+            require(
+                fields.len() == expected_fields,
+                &format!(
+                    "nvidia-smi {description} row {line_number} has {} fields, expected {expected_fields}",
+                    fields.len()
+                ),
+            )?;
+            require(
+                fields.iter().all(|field| {
+                    !field.is_empty()
+                        && !field
+                            .as_bytes()
+                            .iter()
+                            .any(|byte| matches!(byte, 0 | b'\r' | b'\n'))
+                }),
+                &format!(
+                    "nvidia-smi {description} row {line_number} contains an empty field or forbidden control byte"
+                ),
+            )?;
+            rows.push((line_number, fields));
+        }
+        require(
+            !rows.is_empty(),
+            &format!("nvidia-smi {description} CSV contains no physical rows"),
+        )?;
+        Ok(rows)
+    }
+
+    fn parse_nvidia_csv_line(
+        line: &str,
+        line_number: usize,
+        description: &str,
+    ) -> AnyResult<Vec<String>> {
+        let mut fields = Vec::new();
+        let mut field = String::new();
+        let mut chars = line.chars().peekable();
+        let mut in_quotes = false;
+        let mut quote_closed = false;
+        while let Some(character) = chars.next() {
+            if in_quotes {
+                if character == '"' {
+                    if chars.peek() == Some(&'"') {
+                        chars.next();
+                        field.push('"');
+                    } else {
+                        in_quotes = false;
+                        quote_closed = true;
+                    }
+                } else {
+                    field.push(character);
+                }
+                continue;
+            }
+            if quote_closed {
+                if character == ',' {
+                    fields.push(field.trim().to_owned());
+                    field.clear();
+                    quote_closed = false;
+                } else if !character.is_whitespace() {
+                    return Err(format!(
+                        "nvidia-smi {description} row {line_number} has non-whitespace after a closing quote"
+                    )
+                    .into());
+                }
+                continue;
+            }
+            match character {
+                ',' => {
+                    fields.push(field.trim().to_owned());
+                    field.clear();
+                }
+                '"' if field.trim().is_empty() => {
+                    field.clear();
+                    in_quotes = true;
+                }
+                '"' => {
+                    return Err(format!(
+                        "nvidia-smi {description} row {line_number} has a quote inside an unquoted field"
+                    )
+                    .into());
+                }
+                _ => field.push(character),
+            }
+        }
+        require(
+            !in_quotes,
+            &format!("nvidia-smi {description} row {line_number} has an unterminated quote"),
+        )?;
+        fields.push(field.trim().to_owned());
+        Ok(fields)
+    }
+
+    fn valid_gpu_uuid(value: &str) -> bool {
+        let Some(rest) = value.strip_prefix("GPU-") else {
+            return false;
+        };
+        let groups = rest.split('-').collect::<Vec<_>>();
+        let expected_lengths = [8usize, 4, 4, 4, 12];
+        groups.len() == expected_lengths.len()
+            && groups.iter().zip(expected_lengths).all(|(group, length)| {
+                group.len() == length && group.bytes().all(|byte| byte.is_ascii_hexdigit())
+            })
+    }
+
+    fn valid_pci_bus_id(value: &str) -> bool {
+        let components = value.split(':').collect::<Vec<_>>();
+        if components.len() != 3 {
+            return false;
+        }
+        let domain = components[0];
+        let bus = components[1];
+        let Some((device, function)) = components[2].split_once('.') else {
+            return false;
+        };
+        matches!(domain.len(), 4 | 8)
+            && bus.len() == 2
+            && device.len() == 2
+            && function.len() == 1
+            && domain.bytes().all(|byte| byte.is_ascii_hexdigit())
+            && bus.bytes().all(|byte| byte.is_ascii_hexdigit())
+            && device.bytes().all(|byte| byte.is_ascii_hexdigit())
+            && function.bytes().all(|byte| matches!(byte, b'0'..=b'7'))
+    }
+
+    fn valid_dotted_decimal(value: &str) -> bool {
+        let components = value.split('.').collect::<Vec<_>>();
+        (2..=3).contains(&components.len())
+            && components
+                .iter()
+                .all(|component| !component.is_empty() && component.parse::<u32>().is_ok())
+    }
+
+    fn valid_compute_capability(value: &str) -> bool {
+        let components = value.split('.').collect::<Vec<_>>();
+        components.len() == 2
+            && components
+                .iter()
+                .all(|component| !component.is_empty() && component.parse::<u32>().is_ok())
+    }
+
+    fn valid_used_gpu_memory(value: &str) -> bool {
+        value == "[N/A]"
+            || value
+                .strip_suffix(" MiB")
+                .is_some_and(|number| number.parse::<u64>().is_ok())
     }
 
     #[cfg(feature = "cuda-policy-measurement")]

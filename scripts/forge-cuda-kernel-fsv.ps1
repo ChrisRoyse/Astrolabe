@@ -42,6 +42,10 @@ $PSNativeCommandUseErrorActionPreference = $false
 
 $ExpectedDeviceName = 'NVIDIA GeForce RTX 5090'
 $ExpectedDeviceUuid = 'GPU-de2d5475-3447-83c3-1539-876a7257ae8a'
+$ExpectedDevicePciBusId = '00000000:01:00.0'
+$ExpectedDriverVersion = '610.47'
+$ExpectedDeviceMemoryMib = 32607
+$ExpectedComputeCapability = '12.0'
 $ExpectedToolkitVersion = '13.3.0'
 $ExpectedToolkitManifestSha256 =
     '7a600527fedf8205de85a506d7bcc01c3d85a6a8db45f030523797eeb2a356cb'
@@ -65,6 +69,107 @@ function Get-AstroSha256 {
     param([Parameter(Mandatory)][string]$Path)
 
     return (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()
+}
+
+function Read-AstroNvidiaCsv {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][string[]]$Columns
+    )
+
+    $full = [IO.Path]::GetFullPath($Path)
+    Assert-Astro (Test-Path -LiteralPath $full -PathType Leaf) `
+        'CALYX_FORGE_CUDA_FSV_NVIDIA_CSV_MISSING' `
+        "NVIDIA CSV source of truth is absent: $full"
+    try {
+        $encoding = [Text.UTF8Encoding]::new($false, $true)
+        $bytes = [IO.File]::ReadAllBytes($full)
+        $text = $encoding.GetString($bytes)
+        Assert-Astro (-not $text.Contains([char]0)) `
+            'CALYX_FORGE_CUDA_FSV_NVIDIA_CSV_INVALID' `
+            "NVIDIA CSV contains NUL bytes: $full"
+        Add-Type -AssemblyName Microsoft.VisualBasic -ErrorAction Stop
+        $reader = [IO.StringReader]::new($text)
+        $parser =
+            [Microsoft.VisualBasic.FileIO.TextFieldParser]::new($reader)
+        $parser.TextFieldType =
+            [Microsoft.VisualBasic.FileIO.FieldType]::Delimited
+        $parser.HasFieldsEnclosedInQuotes = $true
+        $parser.TrimWhiteSpace = $true
+        $parser.SetDelimiters(',')
+        $rows = [Collections.Generic.List[object]]::new()
+        try {
+            while (-not $parser.EndOfData) {
+                $lineNumber = [long]$parser.LineNumber
+                $fields = $parser.ReadFields()
+                Assert-Astro (
+                    $null -ne $fields -and
+                    $fields.Count -eq $Columns.Count
+                ) 'CALYX_FORGE_CUDA_FSV_NVIDIA_CSV_INVALID' `
+                    "NVIDIA CSV row $lineNumber has $(@($fields).Count) fields, expected $($Columns.Count): $full"
+                $record = [ordered]@{
+                    source_line = $lineNumber
+                }
+                for ($index = 0; $index -lt $Columns.Count; $index++) {
+                    $value = [string]$fields[$index]
+                    Assert-Astro (
+                        -not [string]::IsNullOrWhiteSpace($value) -and
+                        $value.IndexOfAny([char[]]@(
+                                [char]0, [char]10, [char]13
+                            )) -lt 0
+                    ) 'CALYX_FORGE_CUDA_FSV_NVIDIA_CSV_INVALID' `
+                        "NVIDIA CSV row $lineNumber field '$($Columns[$index])' is empty or contains a forbidden control byte: $full"
+                    $record[$Columns[$index]] = $value
+                }
+                [void]$rows.Add([pscustomobject]$record)
+            }
+        }
+        finally {
+            $parser.Dispose()
+            $reader.Dispose()
+        }
+    }
+    catch {
+        if ($_.Exception.Message.StartsWith(
+                'CALYX_FORGE_CUDA_FSV_NVIDIA_',
+                [StringComparison]::Ordinal
+            )) {
+            throw
+        }
+        throw (
+            'CALYX_FORGE_CUDA_FSV_NVIDIA_CSV_INVALID: ' +
+            "strict CSV parse failed for '$full' " +
+            "($($_.Exception.GetType().FullName): " +
+            "$($_.Exception.Message))"
+        )
+    }
+    Assert-Astro ($rows.Count -gt 0) `
+        'CALYX_FORGE_CUDA_FSV_NVIDIA_CSV_EMPTY' `
+        "NVIDIA CSV contains no physical rows: $full"
+    return [pscustomobject]@{
+        path = $full
+        bytes = [uint64]$bytes.Length
+        sha256 = Get-AstroSha256 $full
+        rows = [object[]]$rows.ToArray()
+    }
+}
+
+function Test-AstroCanonicalGpuUuid {
+    param([Parameter(Mandatory)][string]$Value)
+
+    return $Value -match (
+        '^GPU-[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-' +
+        '[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$'
+    )
+}
+
+function Test-AstroPciBusId {
+    param([Parameter(Mandatory)][string]$Value)
+
+    return $Value -match (
+        '^(?:[0-9A-Fa-f]{4}|[0-9A-Fa-f]{8}):' +
+        '[0-9A-Fa-f]{2}:[0-9A-Fa-f]{2}\.[0-7]$'
+    )
 }
 
 function Write-AstroReadbackText {
@@ -288,16 +393,147 @@ foreach ($edgeName in @(
 
 $gpuIdentityPath = Join-Path $payload 'nvidia-smi-gpu.csv'
 $gpuProcessesPath = Join-Path $payload 'nvidia-smi-compute-apps.csv'
-$gpuIdentity = Get-Content -LiteralPath $gpuIdentityPath -Raw
-$gpuProcesses = Get-Content -LiteralPath $gpuProcessesPath -Raw
-Assert-Astro (
-    $gpuIdentity.Contains($ExpectedDeviceUuid) -and
-    $gpuIdentity.Contains($ExpectedDeviceName) -and
-    $gpuProcesses.TrimStart().StartsWith(
-        [string]$runRecord.process.identity.pid
+$gpuIdentity = Read-AstroNvidiaCsv `
+    -Path $gpuIdentityPath `
+    -Columns @(
+        'index',
+        'name',
+        'uuid',
+        'pci_bus_id',
+        'driver_version',
+        'memory_total_mib',
+        'compute_capability'
     )
-) 'CALYX_FORGE_CUDA_FSV_NVIDIA_READBACK_INVALID' `
-    'independent NVIDIA GPU/process state readback failed'
+$gpuIdentityMatches = [Collections.Generic.List[object]]::new()
+foreach ($row in @($gpuIdentity.rows)) {
+    [uint32]$ordinal = 0
+    [uint64]$memoryMib = 0
+    Assert-Astro (
+        [uint32]::TryParse(
+            [string]$row.index,
+            [Globalization.NumberStyles]::None,
+            [Globalization.CultureInfo]::InvariantCulture,
+            [ref]$ordinal
+        ) -and
+        (Test-AstroCanonicalGpuUuid ([string]$row.uuid)) -and
+        (Test-AstroPciBusId ([string]$row.pci_bus_id)) -and
+        [string]$row.driver_version -match
+            '^[0-9]+\.[0-9]+(?:\.[0-9]+)?$' -and
+        [uint64]::TryParse(
+            [string]$row.memory_total_mib,
+            [Globalization.NumberStyles]::None,
+            [Globalization.CultureInfo]::InvariantCulture,
+            [ref]$memoryMib
+        ) -and
+        $memoryMib -gt 0 -and
+        [string]$row.compute_capability -match '^[0-9]+\.[0-9]+$'
+    ) 'CALYX_FORGE_CUDA_FSV_NVIDIA_GPU_ROW_INVALID' `
+        "NVIDIA GPU row $($row.source_line) has an invalid physical schema"
+    if (
+        $ordinal -eq [uint32]$report.execution.driver_ordinal -and
+        [string]::Equals(
+            [string]$row.name,
+            $ExpectedDeviceName,
+            [StringComparison]::Ordinal
+        ) -and
+        [string]::Equals(
+            [string]$row.uuid,
+            $ExpectedDeviceUuid,
+            [StringComparison]::OrdinalIgnoreCase
+        ) -and
+        [string]::Equals(
+            [string]$row.pci_bus_id,
+            $ExpectedDevicePciBusId,
+            [StringComparison]::OrdinalIgnoreCase
+        ) -and
+        [string]$row.driver_version -ceq $ExpectedDriverVersion -and
+        $memoryMib -eq [uint64]$ExpectedDeviceMemoryMib -and
+        [string]$row.compute_capability -ceq
+            $ExpectedComputeCapability
+    ) {
+        [void]$gpuIdentityMatches.Add($row)
+    }
+}
+Assert-Astro ($gpuIdentityMatches.Count -eq 1) `
+    'CALYX_FORGE_CUDA_FSV_NVIDIA_GPU_MATCH_INVALID' `
+    "expected exactly one selected physical GPU row, observed $($gpuIdentityMatches.Count)"
+
+$gpuProcesses = Read-AstroNvidiaCsv `
+    -Path $gpuProcessesPath `
+    -Columns @('pid', 'process_name', 'gpu_uuid', 'used_gpu_memory')
+$expectedPid = [uint32]$runRecord.process.identity.pid
+$expectedArtifactPath =
+    [IO.Path]::GetFullPath([string]$runRecord.artifact.path)
+$gpuProcessMatches = [Collections.Generic.List[object]]::new()
+foreach ($row in @($gpuProcesses.rows)) {
+    [uint32]$observedPid = 0
+    Assert-Astro (
+        [uint32]::TryParse(
+            [string]$row.pid,
+            [Globalization.NumberStyles]::None,
+            [Globalization.CultureInfo]::InvariantCulture,
+            [ref]$observedPid
+        ) -and
+        $observedPid -gt 0 -and
+        (Test-AstroCanonicalGpuUuid ([string]$row.gpu_uuid)) -and
+        [string]$row.used_gpu_memory -match
+            '^(?:\[N/A\]|[0-9]+ MiB)$'
+    ) 'CALYX_FORGE_CUDA_FSV_NVIDIA_PROCESS_ROW_INVALID' `
+        "NVIDIA process row $($row.source_line) has an invalid physical schema"
+    if (
+        $observedPid -eq $expectedPid -and
+        [string]::Equals(
+            [string]$row.gpu_uuid,
+            $ExpectedDeviceUuid,
+            [StringComparison]::OrdinalIgnoreCase
+        )
+    ) {
+        try {
+            $observedArtifactPath =
+                [IO.Path]::GetFullPath([string]$row.process_name)
+        }
+        catch {
+            throw (
+                'CALYX_FORGE_CUDA_FSV_NVIDIA_PROCESS_PATH_INVALID: ' +
+                "matching PID/UUID row $($row.source_line) contains an " +
+                "invalid executable path '$($row.process_name)': " +
+                $_.Exception.Message
+            )
+        }
+        if ([string]::Equals(
+                $observedArtifactPath,
+                $expectedArtifactPath,
+                [StringComparison]::OrdinalIgnoreCase
+            )) {
+            [void]$gpuProcessMatches.Add($row)
+        }
+    }
+}
+Assert-Astro ($gpuProcessMatches.Count -eq 1) `
+    'CALYX_FORGE_CUDA_FSV_NVIDIA_PROCESS_MATCH_INVALID' `
+    "expected exactly one PID/path/UUID-bound GPU process row, observed $($gpuProcessMatches.Count)"
+$gpuReadback = [ordered]@{
+    schema = 'calyx.forge.cuda-kernel-nvidia-readback.v1'
+    selected_gpu = $gpuIdentityMatches[0]
+    selected_process = $gpuProcessMatches[0]
+    gpu_source = [ordered]@{
+        path = $gpuIdentity.path
+        bytes = $gpuIdentity.bytes
+        sha256 = $gpuIdentity.sha256
+        row_count = @($gpuIdentity.rows).Count
+    }
+    process_source = [ordered]@{
+        path = $gpuProcesses.path
+        bytes = $gpuProcesses.bytes
+        sha256 = $gpuProcesses.sha256
+        row_count = @($gpuProcesses.rows).Count
+    }
+    expected = [ordered]@{
+        pid = $expectedPid
+        artifact_path = $expectedArtifactPath
+        gpu_uuid = $ExpectedDeviceUuid
+    }
+}
 
 $inventoryPath = Join-Path $payload 'evidence-inventory.json'
 $measurementPath = Join-Path $payload 'measurement.json'
@@ -310,6 +546,9 @@ $measurementHash = if (Test-Path -LiteralPath $measurementPath -PathType Leaf) {
 
 $analysisDirectory = Join-Path $payload 'binary-analysis'
 [IO.Directory]::CreateDirectory($analysisDirectory) | Out-Null
+$gpuReadbackPath = Join-Path $analysisDirectory 'nvidia-readback.json'
+$gpuReadbackJson = $gpuReadback | ConvertTo-Json -Depth 8
+Write-AstroReadbackText $gpuReadbackPath $gpuReadbackJson
 $cuobjdump = Join-Path $env:CUDA_PATH 'bin\cuobjdump.exe'
 $nvdisasm = Join-Path $env:CUDA_PATH 'bin\nvdisasm.exe'
 Assert-Astro (
@@ -422,6 +661,9 @@ Write-AstroReadbackText $binaryAnalysisSummaryPath $binaryAnalysisJson
     }
     disassembled_cubins = $cubins.Count
     binary_analysis_sha256 = Get-AstroSha256 $binaryAnalysisSummaryPath
+    nvidia_readback_sha256 = Get-AstroSha256 $gpuReadbackPath
+    nvidia_gpu_rows = @($gpuIdentity.rows).Count
+    nvidia_process_rows = @($gpuProcesses.rows).Count
     runtime_ordinal = [int]$report.execution.runtime_ordinal
     driver_ordinal = [int]$report.execution.driver_ordinal
     physical_device = [string]$report.execution.physical_device
