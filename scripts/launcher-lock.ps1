@@ -873,6 +873,91 @@ public static class AstroLauncherLockNative
         }
     }
 
+    public static void RenameDirectoryHandleNoReplace(
+        SafeFileHandle source,
+        SafeFileHandle destinationDirectory,
+        string destinationLeaf
+    )
+    {
+        RequireExactOrdinaryDirectory(source, "exact directory rename source");
+        RequireExactOrdinaryDirectory(
+            destinationDirectory,
+            "exact pinned directory rename destination parent"
+        );
+        if (String.IsNullOrEmpty(destinationLeaf) ||
+            destinationLeaf.IndexOf('\0') >= 0 ||
+            destinationLeaf.IndexOf('\\') >= 0 ||
+            destinationLeaf.IndexOf('/') >= 0 ||
+            destinationLeaf.IndexOfAny(System.IO.Path.GetInvalidFileNameChars()) >= 0 ||
+            destinationLeaf.EndsWith(" ", StringComparison.Ordinal) ||
+            destinationLeaf.EndsWith(".", StringComparison.Ordinal) ||
+            destinationLeaf == "." ||
+            destinationLeaf == "..")
+        {
+            throw new ArgumentException(
+                "exact directory rename destination must be one simple nonempty filename",
+                "destinationLeaf"
+            );
+        }
+        if (GetFileVolumeSerial(source) !=
+            GetFileVolumeSerial(destinationDirectory))
+        {
+            throw new InvalidOperationException(
+                "exact directory rename source and destination are on different volumes"
+            );
+        }
+        string destinationDirectoryPath = GetFileFinalPath(destinationDirectory);
+        string destinationPath = destinationDirectoryPath.EndsWith("\\", StringComparison.Ordinal)
+            ? destinationDirectoryPath + destinationLeaf
+            : destinationDirectoryPath + "\\" + destinationLeaf;
+        string extendedDestinationPath = destinationPath.StartsWith(
+            "\\\\?\\",
+            StringComparison.Ordinal
+        ) ? destinationPath : (
+            destinationPath.StartsWith("\\\\", StringComparison.Ordinal)
+                ? "\\\\?\\UNC\\" + destinationPath.Substring(2)
+                : "\\\\?\\" + destinationPath
+        );
+        byte[] nameBytes = Encoding.Unicode.GetBytes(extendedDestinationPath);
+        int rootOffset = IntPtr.Size == 8 ? 8 : 4;
+        int lengthOffset = rootOffset + IntPtr.Size;
+        int nameOffset = lengthOffset + 4;
+        int rawSize = checked(nameOffset + nameBytes.Length + 2);
+        int alignedSize = checked(
+            ((rawSize + IntPtr.Size - 1) / IntPtr.Size) * IntPtr.Size
+        );
+        IntPtr information = Marshal.AllocHGlobal(alignedSize);
+        try
+        {
+            for (int index = 0; index < alignedSize; index++)
+            {
+                Marshal.WriteByte(information, index, 0);
+            }
+            Marshal.WriteInt32(information, 0, 0);
+            Marshal.WriteIntPtr(information, rootOffset, IntPtr.Zero);
+            Marshal.WriteInt32(information, lengthOffset, nameBytes.Length);
+            Marshal.Copy(nameBytes, 0, IntPtr.Add(information, nameOffset), nameBytes.Length);
+            if (!SetFileInformationByHandle(
+                    source,
+                    FILE_RENAME_INFO_CLASS,
+                    information,
+                    (uint)alignedSize
+                ))
+            {
+                int nativeError = Marshal.GetLastWin32Error();
+                throw new Win32Exception(
+                    nativeError,
+                    "exact directory handle-bound no-replace rename failed; native_error=" +
+                    nativeError.ToString(CultureInfo.InvariantCulture)
+                );
+            }
+        }
+        finally
+        {
+            Marshal.FreeHGlobal(information);
+        }
+    }
+
     public static void DeleteExactFileHandle(SafeFileHandle file)
     {
         RequireExactOrdinarySingleLinkFile(file, "exact disposition-delete source");
@@ -3476,4 +3561,366 @@ function Assert-AstroLauncherLockClaimable {
             throw "LAUNCHER_BOUNDARY[ASTRO_LAUNCHER_LOCK_UNREADABLE]: unexpected launcher-lock state '$($lock.State)': $LockPath"
         }
     }
+}
+
+function Get-AstroCuda13RetirementTransitionPath {
+    param([Parameter(Mandatory)][string]$CanonicalWorkspaceRoot)
+
+    $root = [IO.Path]::GetFullPath($CanonicalWorkspaceRoot).TrimEnd('\', '/')
+    return [IO.Path]::Combine(
+        $root,
+        '.tmp',
+        'astrolabe-cuda13-retirement.transition.v1.json'
+    )
+}
+
+function Get-AstroCuda13RetirementMutexNameFromIdentity {
+    param([Parameter(Mandatory)][string]$CanonicalRootIdentity)
+
+    if ($CanonicalRootIdentity -cnotmatch '^[0-9a-f]{16}:[0-9a-f]{32}$') {
+        throw "CUDA retirement mutex filesystem identity is not canonical FILE_ID_INFO: $CanonicalRootIdentity"
+    }
+    $identityBytes = [Text.UTF8Encoding]::new($false, $true).GetBytes(
+        "astrolabe.cuda13-retirement.v1|$CanonicalRootIdentity"
+    )
+    $digest = Get-AstroByteSha256 $identityBytes
+    return "Global\Astrolabe.Cuda13Retirement.$digest"
+}
+
+function Enter-AstroCuda13RetirementMutex {
+    param([Parameter(Mandatory)][string]$CanonicalWorkspaceRoot)
+
+    $root = [IO.Path]::GetFullPath($CanonicalWorkspaceRoot).TrimEnd('\', '/')
+    $rootHandle = $null
+    try {
+        $rootHandle = [AstroLauncherLockNative]::OpenExactRenameDirectory($root)
+        $rootIdentity = [AstroLauncherLockNative]::GetDirectoryLockIdentity(
+            $rootHandle
+        )
+        $rootFinalPath = ConvertFrom-AstroNativeFinalPath (
+            [AstroLauncherLockNative]::GetFileFinalPath($rootHandle)
+        )
+        $rootFinalPath = [IO.Path]::GetFullPath(
+            $rootFinalPath
+        ).TrimEnd('\', '/')
+        if (-not [string]::Equals(
+                $root,
+                $rootFinalPath,
+                [StringComparison]::OrdinalIgnoreCase
+            )) {
+            throw "canonical workspace lexical path '$root' resolves to retained-handle path '$rootFinalPath'"
+        }
+        $name = Get-AstroCuda13RetirementMutexNameFromIdentity $rootIdentity
+        $security = New-AstroLauncherLockMutexSecurity
+    }
+    catch {
+        if ($null -ne $rootHandle) {
+            $rootHandle.Dispose()
+        }
+        throw "could not retain the canonical workspace while deriving its shared CUDA retirement mutex: $($_.Exception.Message)"
+    }
+
+    $createdNew = $false
+    try {
+        if ('System.Threading.MutexAcl' -as [type]) {
+            $mutex = [System.Threading.MutexAcl]::Create(
+                $false,
+                $name,
+                [ref]$createdNew,
+                $security
+            )
+        }
+        else {
+            $mutex = [Threading.Mutex]::new(
+                $false,
+                $name,
+                [ref]$createdNew,
+                $security
+            )
+        }
+    }
+    catch {
+        $rootHandle.Dispose()
+        throw "could not create/open shared CUDA retirement mutex '$name': $($_.Exception.Message)"
+    }
+
+    $acquired = $false
+    $abandoned = $false
+    try {
+        try {
+            $acquired = $mutex.WaitOne(0)
+        }
+        catch [Threading.AbandonedMutexException] {
+            $acquired = $true
+            $abandoned = $true
+        }
+        return [pscustomobject]@{
+            Name = $name
+            Mutex = $mutex
+            Acquired = $acquired
+            WasAbandoned = $abandoned
+            CreatedNew = $createdNew
+            Root = $root
+            RootFinalPath = $rootFinalPath
+            RootIdentity = $rootIdentity
+            RootHandle = $rootHandle
+        }
+    }
+    catch {
+        if ($acquired) {
+            try { $mutex.ReleaseMutex() } catch {}
+        }
+        $mutex.Dispose()
+        $rootHandle.Dispose()
+        throw
+    }
+}
+
+function Exit-AstroCuda13RetirementMutex {
+    param([Parameter(Mandatory)]$Lease)
+
+    Exit-AstroLauncherLockMutex $Lease
+}
+
+function Read-AstroCuda13RetirementTransition {
+    param([Parameter(Mandatory)][string]$CanonicalWorkspaceRoot)
+
+    $root = [IO.Path]::GetFullPath($CanonicalWorkspaceRoot).TrimEnd('\', '/')
+    $path = Get-AstroCuda13RetirementTransitionPath $root
+    $presence = Get-AstroPathEntryState $path
+    if ($presence.State -eq 'absent') {
+        return [pscustomobject]@{
+            State = 'absent'
+            Path = $path
+            OwnerPid = $null
+            OwnerProcessStartUtcTicks = $null
+            Issue = $null
+            TransactionId = $null
+            Sha256 = $null
+            FileId = $null
+            Probe = $null
+            ValidationError = $null
+            ReadError = $null
+        }
+    }
+    if ($presence.State -ne 'present') {
+        return [pscustomobject]@{
+            State = 'unevaluable'
+            Path = $path
+            OwnerPid = $null
+            OwnerProcessStartUtcTicks = $null
+            Issue = $null
+            TransactionId = $null
+            Sha256 = $null
+            FileId = $null
+            Probe = $null
+            ValidationError = $null
+            ReadError = $presence.Error
+        }
+    }
+    if (($presence.Attributes -band [IO.FileAttributes]::Directory) -ne 0 -or
+        ($presence.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+        return [pscustomobject]@{
+            State = 'unreadable'
+            Path = $path
+            OwnerPid = $null
+            OwnerProcessStartUtcTicks = $null
+            Issue = $null
+            TransactionId = $null
+            Sha256 = $null
+            FileId = $null
+            Probe = $null
+            ValidationError = 'transition path is not one ordinary non-reparse file'
+            ReadError = $null
+        }
+    }
+
+    $handle = $null
+    try {
+        $handle = [AstroLauncherLockNative]::OpenExactClassifierReadFile($path)
+        $snapshot = Get-AstroExactRetainedFileSnapshot `
+            -Handle $handle `
+            -ExpectedPath $path `
+            -MaximumBytes $script:AstroLauncherLockMaxBytes
+    }
+    catch {
+        if ($null -ne $handle) { $handle.Dispose() }
+        return [pscustomobject]@{
+            State = 'unevaluable'
+            Path = $path
+            OwnerPid = $null
+            OwnerProcessStartUtcTicks = $null
+            Issue = $null
+            TransactionId = $null
+            Sha256 = $null
+            FileId = $null
+            Probe = $null
+            ValidationError = $null
+            ReadError = $_.Exception.Message
+        }
+    }
+    finally {
+        if ($null -ne $handle -and -not $handle.IsClosed) {
+            $handle.Dispose()
+        }
+    }
+
+    $parsed = $null
+    $validationError = $null
+    try {
+        $text = [Text.UTF8Encoding]::new(
+            $false,
+            $true
+        ).GetString($snapshot.Bytes)
+        $parsed = ConvertFrom-Json -InputObject $text -ErrorAction Stop
+        $required = @(
+            'schema',
+            'canonical_workspace_root',
+            'canonical_workspace_file_id',
+            'pid',
+            'owner_process_start_utc_ticks',
+            'issue',
+            'transaction_id',
+            'started_utc'
+        )
+        $observed = @($parsed.PSObject.Properties.Name)
+        foreach ($name in $required) {
+            if ($name -cnotin $observed) {
+                throw "required property '$name' is absent"
+            }
+        }
+        foreach ($name in $observed) {
+            if ($name -cnotin $required) {
+                throw "unexpected property '$name' is present"
+            }
+        }
+        $pidValue = [long]$parsed.pid
+        $ticksValue = [long]$parsed.owner_process_start_utc_ticks
+        $issueValue = [long]$parsed.issue
+        if ([string]$parsed.schema -cne
+            'astrolabe.cuda13-retirement-transition.v1') {
+            throw "schema is not astrolabe.cuda13-retirement-transition.v1"
+        }
+        if ($pidValue -le 0 -or $pidValue -gt [int]::MaxValue -or
+            $ticksValue -le 0 -or
+            $ticksValue -gt [DateTime]::MaxValue.Ticks -or
+            $issueValue -le 0 -or $issueValue -gt [int]::MaxValue) {
+            throw 'owner PID, process-start ticks, or issue is outside its positive range'
+        }
+        if ([string]$parsed.transaction_id -cnotmatch '^[0-9a-f]{32}$') {
+            throw 'transaction_id is not 32 lowercase hexadecimal characters'
+        }
+        if ([string]$parsed.canonical_workspace_file_id -cnotmatch
+            '^[0-9a-f]{16}:[0-9a-f]{32}$') {
+            throw 'canonical_workspace_file_id is not canonical FILE_ID_INFO'
+        }
+        $rootHandle = [AstroLauncherLockNative]::OpenExactRenameDirectory($root)
+        try {
+            $rootIdentity = [AstroLauncherLockNative]::GetDirectoryLockIdentity(
+                $rootHandle
+            )
+            $rootFinal = ConvertFrom-AstroNativeFinalPath (
+                [AstroLauncherLockNative]::GetFileFinalPath($rootHandle)
+            )
+            $rootFinal = [IO.Path]::GetFullPath($rootFinal).TrimEnd('\', '/')
+        }
+        finally {
+            $rootHandle.Dispose()
+        }
+        if (-not [string]::Equals(
+                [string]$parsed.canonical_workspace_root,
+                $root,
+                [StringComparison]::OrdinalIgnoreCase
+            ) -or
+            -not [string]::Equals(
+                $rootFinal,
+                $root,
+                [StringComparison]::OrdinalIgnoreCase
+            ) -or
+            [string]$parsed.canonical_workspace_file_id -cne $rootIdentity) {
+            throw 'transition canonical workspace path/FILE_ID does not match the retained root'
+        }
+        # Windows PowerShell 5.1 eagerly materializes ISO-8601 JSON strings as
+        # DateTime, while PowerShell 7 preserves this property as a string. Validate
+        # both host representations without culture-stringifying a DateTime first.
+        if ($parsed.started_utc -is [DateTime]) {
+            $startedUtc = [DateTime]$parsed.started_utc
+            if ($startedUtc.Ticks -le 0) {
+                throw 'started_utc materialized as an invalid DateTime'
+            }
+        }
+        else {
+            [void][DateTime]::ParseExact(
+                [string]$parsed.started_utc,
+                'o',
+                [Globalization.CultureInfo]::InvariantCulture,
+                [Globalization.DateTimeStyles]::RoundtripKind
+            )
+        }
+    }
+    catch {
+        $validationError = $_.Exception.Message
+    }
+    if ($null -ne $validationError) {
+        return [pscustomobject]@{
+            State = 'unreadable'
+            Path = $path
+            OwnerPid = $null
+            OwnerProcessStartUtcTicks = $null
+            Issue = $null
+            TransactionId = $null
+            Sha256 = $snapshot.Sha256
+            FileId = $snapshot.FileId
+            Probe = $null
+            ValidationError = $validationError
+            ReadError = $null
+        }
+    }
+
+    $probe = Get-AstroExactProcessIdentityProbe `
+        -ProcessId ([int]$parsed.pid) `
+        -ProcessStartUtcTicks ([long]$parsed.owner_process_start_utc_ticks)
+    $state = if ($probe.State -ceq 'exact-live') {
+        'held'
+    }
+    elseif ($probe.State -ceq 'unevaluable') {
+        'unevaluable'
+    }
+    else {
+        'stale'
+    }
+    return [pscustomobject]@{
+        State = $state
+        Path = $path
+        OwnerPid = [int]$parsed.pid
+        OwnerProcessStartUtcTicks =
+            [long]$parsed.owner_process_start_utc_ticks
+        Issue = [int]$parsed.issue
+        TransactionId = [string]$parsed.transaction_id
+        Sha256 = $snapshot.Sha256
+        FileId = $snapshot.FileId
+        Probe = $probe
+        ValidationError = $null
+        ReadError = $probe.Error
+    }
+}
+
+function Assert-AstroCuda13RetirementAdmissionOpen {
+    param([Parameter(Mandatory)][string]$CanonicalWorkspaceRoot)
+
+    $transition = Read-AstroCuda13RetirementTransition `
+        -CanonicalWorkspaceRoot $CanonicalWorkspaceRoot
+    if ($transition.State -eq 'absent') {
+        return
+    }
+    $detail = if ($transition.ValidationError) {
+        $transition.ValidationError
+    }
+    elseif ($transition.ReadError) {
+        $transition.ReadError
+    }
+    else {
+        "owner_pid=$($transition.OwnerPid), owner_process_start_utc_ticks=$($transition.OwnerProcessStartUtcTicks), issue=#$($transition.Issue), transaction=$($transition.TransactionId), sha256=$($transition.Sha256)"
+    }
+    throw "LAUNCHER_BOUNDARY[ASTRO_CUDA13_RETIREMENT_TRANSITION_BLOCKED]: {code=ASTRO_CUDA13_RETIREMENT_TRANSITION_BLOCKED; message=`"shared CUDA retirement transition state '$($transition.State)' blocks launcher admission without change: $($transition.Path); $detail`"; remediation=`"if the exact owner is live, wait; otherwise preserve the bytes and post their path/hash plus exact owner probe to issue #$($transition.Issue) before recovery`"}"
 }

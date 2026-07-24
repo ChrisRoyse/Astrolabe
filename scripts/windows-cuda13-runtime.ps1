@@ -15,7 +15,13 @@ param(
     [string]$LauncherProtocolAuthoritySha256 = "",
     [string]$LauncherProtocolEntrypointSha256 = "",
     [string]$LauncherWorkspaceRoot = "",
-    [string]$LauncherWorkspaceEntrypointSha256 = ""
+    [string]$LauncherWorkspaceEntrypointSha256 = "",
+    [int]$LauncherOwnerPid = 0,
+    [long]$LauncherOwnerProcessStartUtcTicks = 0,
+    [int]$LauncherIssue = 0,
+    [string]$LauncherLockPath = "",
+    [string]$LauncherLockSha256 = "",
+    [string]$LauncherGitExe = ""
 )
 
 Set-StrictMode -Version Latest
@@ -107,7 +113,13 @@ if ($LauncherProtocolAuthorityVersion -cne '3' -or
     $LauncherProtocolAuthoritySha256 -cnotmatch '^[0-9a-f]{64}$' -or
     $LauncherProtocolEntrypointSha256 -cnotmatch '^[0-9a-f]{64}$' -or
     $LauncherWorkspaceEntrypointSha256 -cnotmatch '^[0-9a-f]{64}$' -or
-    [string]::IsNullOrWhiteSpace($LauncherWorkspaceRoot)) {
+    [string]::IsNullOrWhiteSpace($LauncherWorkspaceRoot) -or
+    $LauncherOwnerPid -le 0 -or
+    $LauncherOwnerProcessStartUtcTicks -le 0 -or
+    $LauncherIssue -le 0 -or
+    [string]::IsNullOrWhiteSpace($LauncherLockPath) -or
+    $LauncherLockSha256 -cnotmatch '^[0-9a-f]{64}$' -or
+    [string]::IsNullOrWhiteSpace($LauncherGitExe)) {
     Fail-Runtime `
         'ASTRO_LAUNCHER_PROTOCOL_VERSION_MISMATCH' `
         "caller '$observedCaller' did not supply the complete launcher protocol authority v3 binding" `
@@ -166,6 +178,72 @@ if ($observedAuthoritySha256 -cne $LauncherProtocolAuthoritySha256 -or
         'ASTRO_LAUNCHER_PROTOCOL_VERSION_MISMATCH' `
         "launcher authority changed or the workspace trampoline differs from canonical bytes (authority=$observedAuthoritySha256; canonical_entrypoint=$observedEntrypointSha256; workspace_entrypoint=$observedWorkspaceEntrypointSha256)" `
         "preserve all state; invoke '$CanonicalLauncherEntrypoint' only after restoring one clean canonical authority"
+}
+$currentProcess = Get-Process -Id $PID -ErrorAction Stop
+try {
+    $currentProcessStartUtcTicks =
+        [long]$currentProcess.StartTime.ToUniversalTime().Ticks
+}
+finally {
+    $currentProcess.Dispose()
+}
+$launcherLockFull = try {
+    [IO.Path]::GetFullPath($LauncherLockPath)
+}
+catch {
+    Fail-Runtime `
+        'ASTRO_CUDA13_CALLER_LEASE_INVALID' `
+        "launcher lock path is not canonical: '$LauncherLockPath'" `
+        "invoke only the canonical launcher while its exact v3 lease is active"
+}
+$launcherLock = Read-AstroLauncherLock -LockPath $launcherLockFull
+if ($LauncherOwnerPid -ne $PID -or
+    $LauncherOwnerProcessStartUtcTicks -ne $currentProcessStartUtcTicks -or
+    $launcherLock.State -cne 'held' -or
+    $launcherLock.OwnerPid -ne $LauncherOwnerPid -or
+    $launcherLock.OwnerProcessStartUtcTicks -ne
+        $LauncherOwnerProcessStartUtcTicks -or
+    $launcherLock.Issue -ne $LauncherIssue -or
+    $launcherLock.Sha256 -cne $LauncherLockSha256 -or
+    -not [string]::Equals(
+        [string]$launcherLock.WorkspaceRoot,
+        $launcherWorkspaceFull,
+        [StringComparison]::OrdinalIgnoreCase
+    )) {
+    Fail-Runtime `
+        'ASTRO_CUDA13_CALLER_LEASE_INVALID' `
+        "the runtime provisioner is not executing as the exact active launcher owner (current_pid=$PID; current_ticks=$currentProcessStartUtcTicks; supplied_pid=$LauncherOwnerPid; supplied_ticks=$LauncherOwnerProcessStartUtcTicks; lock_state=$($launcherLock.State); lock_pid=$($launcherLock.OwnerPid); lock_ticks=$($launcherLock.OwnerProcessStartUtcTicks); lock_issue=$($launcherLock.Issue); lock_sha256=$($launcherLock.Sha256))" `
+        "invoke only the canonical launcher while its exact v3 lease is active"
+}
+$launcherGitFull = try {
+    [IO.Path]::GetFullPath($LauncherGitExe)
+}
+catch {
+    Fail-Runtime `
+        'ASTRO_CUDA13_GIT_INVALID' `
+        "Git executable path is not canonical: '$LauncherGitExe'" `
+        "repair the canonical Git for Windows installation and retry"
+}
+if (-not [IO.File]::Exists($launcherGitFull)) {
+    Fail-Runtime `
+        'ASTRO_CUDA13_GIT_INVALID' `
+        "Git executable is absent: '$launcherGitFull'" `
+        "repair the canonical Git for Windows installation and retry"
+}
+$launcherGitItem = Get-Item -LiteralPath $launcherGitFull -Force
+if (($launcherGitItem.Attributes -band [IO.FileAttributes]::Directory) -ne 0 -or
+    ($launcherGitItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+    Fail-Runtime `
+        'ASTRO_CUDA13_GIT_INVALID' `
+        "Git executable is not one ordinary non-reparse file: '$launcherGitFull'" `
+        "repair the canonical Git for Windows installation and retry"
+}
+$launcherSelf = [pscustomobject]@{
+    LockPath = $launcherLockFull
+    Pid = $LauncherOwnerPid
+    OwnerProcessStartUtcTicks = $LauncherOwnerProcessStartUtcTicks
+    Issue = $LauncherIssue
+    LockSha256 = $LauncherLockSha256
 }
 
 function Assert-ExactFields {
@@ -1078,11 +1156,10 @@ function Remove-OwnedStage {
 }
 
 function Invoke-ObsoleteBundleRetirement {
-    # Retire obsolete sibling bundle roots left by prior lock revisions (#559). This runs ONLY
-    # after the active bundle is fully attested by Verify-Bundle, so a retirement fault can
-    # never compromise the active bundle. A fault is a NAMED stderr degradation, never a
-    # provisioning failure: fail-closed for deletion means nothing gets deleted, and the
-    # active bundle's attestation and the launcher's one-line stdout contract are untouched.
+    # Retire obsolete sibling bundle roots after active-bundle attestation. Retirement is a
+    # provisioning invariant: every foreign/unevaluable consumer, transition fault, inventory
+    # change, or evidence-publication failure throws a structured error. Continuing would turn
+    # an observable correctness fault back into the permanent silent leak fixed by #614.
     param(
         [Parameter(Mandatory = $true)][string]$Toolchains,
         [Parameter(Mandatory = $true)]$Lock,
@@ -1090,11 +1167,19 @@ function Invoke-ObsoleteBundleRetirement {
         [Parameter(Mandatory = $true)][string]$Workspace
     )
 
-    try {
-        Remove-AstroObsoleteCudaRuntimeRoots -ToolchainsRoot $Toolchains -RootPrefix $Lock.bundle.root_prefix -ActiveDigest $LockSha256 -WorkspaceRoot $Workspace
-    }
-    catch {
-        [Console]::Error.WriteLine("CUDA13_RETIRE[ASTRO_CUDA13_RETIRE_FAULT]: {code=ASTRO_CUDA13_RETIRE_FAULT; message=`"obsolete-bundle retirement raised an unexpected exception: $($_.Exception.Message)`"; remediation=`"inspect .toolchains for orphaned bundle roots and remove obsolete ones manually if safe`"}")
+    $retirement = Remove-AstroObsoleteCudaRuntimeRoots `
+        -ToolchainsRoot $Toolchains `
+        -RootPrefix $Lock.bundle.root_prefix `
+        -ActiveDigest $LockSha256 `
+        -WorkspaceRoot $Workspace `
+        -GitExe $launcherGitFull `
+        -DrivingIssue $LauncherIssue `
+        -CallerSelf $launcherSelf
+    if ($retirement.State -cne 'completed') {
+        Fail-Runtime `
+            'ASTRO_CUDA13_RETIRE_RESULT_INVALID' `
+            "retirement returned unexpected state '$($retirement.State)'" `
+            'preserve all protocol/evidence bytes and repair the retirement helper'
     }
 }
 

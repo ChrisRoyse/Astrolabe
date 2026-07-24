@@ -1196,6 +1196,12 @@ function Resolve-PinnedCuda13Runtime {
         [string]$LockManifest,
         [string]$WorkspaceRoot,
         [string]$ToolchainsRoot,
+        [int]$LauncherOwnerPid,
+        [long]$LauncherOwnerProcessStartUtcTicks,
+        [int]$LauncherIssue,
+        [string]$LauncherLockPath,
+        [string]$LauncherLockSha256,
+        [string]$GitExe,
         [Parameter(Mandatory)]$ProtocolAuthority
     )
 
@@ -1243,7 +1249,15 @@ function Resolve-PinnedCuda13Runtime {
                 ) `
                 -LauncherWorkspaceEntrypointSha256 (
                     [string]$ProtocolAuthority.WorkspaceEntrypointSha256
-                )
+                ) `
+                -LauncherOwnerPid $LauncherOwnerPid `
+                -LauncherOwnerProcessStartUtcTicks (
+                    $LauncherOwnerProcessStartUtcTicks
+                ) `
+                -LauncherIssue $LauncherIssue `
+                -LauncherLockPath $LauncherLockPath `
+                -LauncherLockSha256 $LauncherLockSha256 `
+                -LauncherGitExe $GitExe
         )
     }
     catch {
@@ -4479,15 +4493,26 @@ $launcherLockClaim = Join-Path $workspaceTempParent $launcherLockClaimLeaf
 $launcherLockLeaseHandle = $null
 $launcherPreclaimScratchLease = $null
 $claimTransitionPublished = $false
-$launcherClaimMutex = Enter-AstroLauncherLockMutex $launcherLock
-if (-not $launcherClaimMutex.Acquired) {
-    Exit-AstroLauncherLockMutex $launcherClaimMutex
-    throw "LAUNCHER_BOUNDARY[ASTRO_LAUNCHER_LOCK_CLAIM_BUSY]: another process owns the machine-wide launcher-lock protocol mutex ($($launcherClaimMutex.Name)); retry after its bounded transition: $launcherLock"
+$launcherClaimMutex = $null
+$cuda13RetirementAdmissionMutex =
+    Enter-AstroCuda13RetirementMutex $ExpectedWorkspace
+if (-not $cuda13RetirementAdmissionMutex.Acquired) {
+    Exit-AstroCuda13RetirementMutex $cuda13RetirementAdmissionMutex
+    throw "LAUNCHER_BOUNDARY[ASTRO_CUDA13_RETIREMENT_BUSY]: {code=ASTRO_CUDA13_RETIREMENT_BUSY; message=`"shared CUDA bundle retirement owns the canonical admission mutex $($cuda13RetirementAdmissionMutex.Name); no launcher lock was claimed in $root`"; remediation=`"wait for the bounded retirement transaction and retry`"}"
 }
-if ($launcherClaimMutex.WasAbandoned) {
-    Write-Output "LAUNCHER_BOUNDARY[ASTRO_LAUNCHER_LOCK_MUTEX_ABANDONED]: recovered abandoned Global protocol mutex $($launcherClaimMutex.Name); active and transition bytes will be fully classified before claim"
+if ($cuda13RetirementAdmissionMutex.WasAbandoned) {
+    Write-Output "LAUNCHER_BOUNDARY[ASTRO_CUDA13_RETIREMENT_MUTEX_ABANDONED]: recovered abandoned shared CUDA retirement mutex $($cuda13RetirementAdmissionMutex.Name); durable transition state will be classified before any local claim"
 }
 try {
+    Assert-AstroCuda13RetirementAdmissionOpen `
+        -CanonicalWorkspaceRoot $ExpectedWorkspace
+    $launcherClaimMutex = Enter-AstroLauncherLockMutex $launcherLock
+    if (-not $launcherClaimMutex.Acquired) {
+        throw "LAUNCHER_BOUNDARY[ASTRO_LAUNCHER_LOCK_CLAIM_BUSY]: another process owns the machine-wide launcher-lock protocol mutex ($($launcherClaimMutex.Name)); retry after its bounded transition: $launcherLock"
+    }
+    if ($launcherClaimMutex.WasAbandoned) {
+        Write-Output "LAUNCHER_BOUNDARY[ASTRO_LAUNCHER_LOCK_MUTEX_ABANDONED]: recovered abandoned Global protocol mutex $($launcherClaimMutex.Name); active and transition bytes will be fully classified before claim"
+    }
     $launcherProtocolDirectoryLease =
         Open-AstroLauncherPinnedDirectoryLease $workspaceTempParent
     Assert-AstroLauncherLockClaimable -LockPath $launcherLock
@@ -4859,7 +4884,14 @@ catch {
     throw "LAUNCHER_BOUNDARY[ASTRO_LAUNCHER_LOCK_CLAIM_FAILED]: serialized claim construction failed; delete-on-close scratch is absent, and every typed claim/manifest/TEMP/active object was preserved for explicit recovery (active_state=$($activeState.State), transitions=$transitionPaths, manifest_state=$($claimManifestState.State), temp_state=$($claimTempState.State), scratch_state=$($claimScratchTerminal.State)): $($claimFault.Exception.Message)$cleanupSuffix"
 }
 finally {
-    Exit-AstroLauncherLockMutex $launcherClaimMutex
+    try {
+        if ($null -ne $launcherClaimMutex) {
+            Exit-AstroLauncherLockMutex $launcherClaimMutex
+        }
+    }
+    finally {
+        Exit-AstroCuda13RetirementMutex $cuda13RetirementAdmissionMutex
+    }
 }
 
 # The session lock is now durably published, strictly read back, and physically immutable.
@@ -5291,6 +5323,12 @@ try {
         -LockManifest $cuda13RuntimeLock `
         -WorkspaceRoot $ExpectedWorkspace `
         -ToolchainsRoot $toolsRoot `
+        -LauncherOwnerPid $PID `
+        -LauncherOwnerProcessStartUtcTicks $launcherProcessStartUtcTicks `
+        -LauncherIssue $drivingIssue `
+        -LauncherLockPath $launcherLock `
+        -LauncherLockSha256 $launcherLockSha256 `
+        -GitExe $evidenceGitExe `
         -ProtocolAuthority $launcherProtocolAuthority
     $env:CALYX_CUDA13_RUNTIME_ROOT = $cuda13RuntimeRoot
     Write-Output "CUDA13_RUNTIME[ASTRO_CUDA13_RUNTIME_ROOT]: attested pinned runtime root exported via CALYX_CUDA13_RUNTIME_ROOT=$cuda13RuntimeRoot (PATH unchanged)"
