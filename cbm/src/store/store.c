@@ -1118,6 +1118,11 @@ typedef enum {
     STORE_INTEGRITY_IO_FAILED,
 } store_integrity_status_t;
 
+typedef enum {
+    STORE_INTEGRITY_CONTRACT_QUERY = 1,
+    STORE_INTEGRITY_CONTRACT_GRAPH_RELOAD = 2,
+} store_integrity_contract_t;
+
 typedef struct {
     store_integrity_status_t status;
     char operation[CBM_STORE_VERIFY_OPERATION_MAX];
@@ -1206,11 +1211,27 @@ static bool store_integrity_prepare_probe(sqlite3 *db, const char *operation, co
 }
 
 static store_integrity_status_t store_check_integrity_detailed(cbm_store_t *s,
+                                                               store_integrity_contract_t contract,
+                                                               const char *expected_project,
                                                                store_integrity_result_t *result) {
     store_integrity_result_init(result);
     if (!s || !s->db) {
         store_integrity_set_failure(result, STORE_INTEGRITY_IO_FAILED, "connection", SQLITE_MISUSE,
                                     "store connection is absent");
+        return result->status;
+    }
+    if (contract != STORE_INTEGRITY_CONTRACT_QUERY &&
+        contract != STORE_INTEGRITY_CONTRACT_GRAPH_RELOAD) {
+        store_integrity_set_failure(result, STORE_INTEGRITY_IO_FAILED,
+                                    "application.integrity_contract", SQLITE_MISUSE,
+                                    "unknown store integrity contract");
+        return result->status;
+    }
+    if (contract == STORE_INTEGRITY_CONTRACT_GRAPH_RELOAD &&
+        (!expected_project || !cbm_validate_project_name(expected_project))) {
+        store_integrity_set_failure(result, STORE_INTEGRITY_IO_FAILED,
+                                    "application.expected_project", SQLITE_MISUSE,
+                                    "graph reload requires a valid expected project name");
         return result->status;
     }
 
@@ -1347,24 +1368,32 @@ static store_integrity_status_t store_check_integrity_detailed(cbm_store_t *s,
     }
 
     static const struct {
+        unsigned int contracts;
         const char *operation;
         const char *sql;
     } SCHEMA_PROBES[] = {
-        {"application.schema.projects",
+        {STORE_INTEGRITY_CONTRACT_QUERY | STORE_INTEGRITY_CONTRACT_GRAPH_RELOAD,
+         "application.schema.projects",
          "SELECT name, indexed_at, root_path FROM projects LIMIT 0;"},
-        {"application.schema.file_hashes",
+        {STORE_INTEGRITY_CONTRACT_QUERY, "application.schema.file_hashes",
          "SELECT project, rel_path, sha256, mtime_ns, size FROM file_hashes LIMIT 0;"},
-        {"application.schema.nodes", "SELECT " ST_NODE_SELECT_COLUMNS " FROM nodes LIMIT 0;"},
-        {"application.schema.edges",
+        {STORE_INTEGRITY_CONTRACT_QUERY | STORE_INTEGRITY_CONTRACT_GRAPH_RELOAD,
+         "application.schema.nodes", "SELECT " ST_NODE_SELECT_COLUMNS " FROM nodes LIMIT 0;"},
+        {STORE_INTEGRITY_CONTRACT_QUERY, "application.schema.edges",
          "SELECT id, project, source_id, target_id, type, properties, url_path_gen, "
          "local_name_gen FROM edges LIMIT 0;"},
-        {"application.schema.project_summaries",
+        {STORE_INTEGRITY_CONTRACT_GRAPH_RELOAD, "application.schema.edges",
+         "SELECT project, source_id, target_id, type, properties FROM edges LIMIT 0;"},
+        {STORE_INTEGRITY_CONTRACT_QUERY, "application.schema.project_summaries",
          "SELECT project, summary, source_hash, created_at, updated_at "
          "FROM project_summaries LIMIT 0;"},
-        {"application.schema.nodes_fts",
+        {STORE_INTEGRITY_CONTRACT_QUERY, "application.schema.nodes_fts",
          "SELECT rowid, name, qualified_name, label, file_path FROM nodes_fts LIMIT 0;"},
     };
     for (size_t i = 0; i < sizeof(SCHEMA_PROBES) / sizeof(SCHEMA_PROBES[0]); i++) {
+        if ((SCHEMA_PROBES[i].contracts & (unsigned int)contract) == 0) {
+            continue;
+        }
         if (!store_integrity_prepare_probe(s->db, SCHEMA_PROBES[i].operation, SCHEMA_PROBES[i].sql,
                                            result)) {
             return result->status;
@@ -1447,6 +1476,19 @@ static store_integrity_status_t store_check_integrity_detailed(cbm_store_t *s,
         sqlite3_finalize(stmt);
         return result->status;
     }
+    if (contract == STORE_INTEGRITY_CONTRACT_GRAPH_RELOAD) {
+        size_t expected_project_bytes = strlen(expected_project);
+        if (expected_project_bytes != (size_t)name_bytes ||
+            memcmp(name, expected_project, expected_project_bytes) != 0) {
+            char detail[CBM_STORE_VERIFY_DETAIL_MAX];
+            snprintf(detail, sizeof(detail), "project row name=%.*s expected=%s", name_bytes,
+                     (const char *)name, expected_project);
+            store_integrity_set_failure(result, STORE_INTEGRITY_FAILED,
+                                        "application.project_identity", SQLITE_OK, detail);
+            sqlite3_finalize(stmt);
+            return result->status;
+        }
+    }
     rc = sqlite3_step(stmt);
     if (rc != SQLITE_DONE) {
         store_integrity_set_failure(result, STORE_INTEGRITY_FAILED,
@@ -1463,16 +1505,25 @@ static store_integrity_status_t store_check_integrity_detailed(cbm_store_t *s,
 
     result->status = STORE_INTEGRITY_OK;
     result->sqlite_error = SQLITE_OK;
-    snprintf(result->operation, sizeof(result->operation), "%s", "application.project_row");
-    snprintf(result->detail, sizeof(result->detail), "%s",
-             "SQLite integrity, foreign keys, schema version, query schema, and sole-project "
-             "invariants passed");
+    if (contract == STORE_INTEGRITY_CONTRACT_GRAPH_RELOAD) {
+        snprintf(result->operation, sizeof(result->operation), "%s",
+                 "application.project_identity");
+        snprintf(result->detail, sizeof(result->detail), "%s",
+                 "SQLite integrity, foreign keys, graph schema version, reload schema, and exact "
+                 "project identity passed");
+    } else {
+        snprintf(result->operation, sizeof(result->operation), "%s", "application.project_row");
+        snprintf(result->detail, sizeof(result->detail), "%s",
+                 "SQLite integrity, foreign keys, schema version, query schema, and sole-project "
+                 "invariants passed");
+    }
     return result->status;
 }
 
 bool cbm_store_check_integrity(cbm_store_t *s) {
     store_integrity_result_t result;
-    if (store_check_integrity_detailed(s, &result) == STORE_INTEGRITY_OK) {
+    if (store_check_integrity_detailed(s, STORE_INTEGRITY_CONTRACT_QUERY, NULL, &result) ==
+        STORE_INTEGRITY_OK) {
         return true;
     }
     char sqlite_error[ST_BUF_16];
@@ -1922,9 +1973,11 @@ static bool store_sqlite_corruption_code(int sqlite_error) {
 
 #endif /* _WIN32 */
 
-cbm_store_verify_status_t cbm_store_open_path_query_verified(const char *db_path,
-                                                             cbm_store_t **out_store,
-                                                             cbm_store_verify_result_t *result) {
+static cbm_store_verify_status_t store_open_path_verified(const char *db_path,
+                                                          store_integrity_contract_t contract,
+                                                          const char *expected_project,
+                                                          cbm_store_t **out_store,
+                                                          cbm_store_verify_result_t *result) {
     cbm_store_verify_result_t local_result;
     if (out_store) {
         *out_store = NULL;
@@ -1943,6 +1996,20 @@ cbm_store_verify_status_t cbm_store_open_path_query_verified(const char *db_path
         store_verify_set_error(result, CBM_STORE_VERIFY_IO_FAILED, "source.validate_path",
                                ERROR_INVALID_PARAMETER, SQLITE_MISUSE,
                                "database path is null or empty");
+        return result->status;
+    }
+    if (contract != STORE_INTEGRITY_CONTRACT_QUERY &&
+        contract != STORE_INTEGRITY_CONTRACT_GRAPH_RELOAD) {
+        store_verify_set_error(result, CBM_STORE_VERIFY_IO_FAILED, "source.validate_contract",
+                               ERROR_INVALID_PARAMETER, SQLITE_MISUSE,
+                               "unknown verified store contract");
+        return result->status;
+    }
+    if (contract == STORE_INTEGRITY_CONTRACT_GRAPH_RELOAD &&
+        (!expected_project || !cbm_validate_project_name(expected_project))) {
+        store_verify_set_error(result, CBM_STORE_VERIFY_IO_FAILED, "source.validate_project",
+                               ERROR_INVALID_PARAMETER, SQLITE_MISUSE,
+                               "graph reload requires a valid expected project name");
         return result->status;
     }
 
@@ -2027,8 +2094,8 @@ cbm_store_verify_status_t cbm_store_open_path_query_verified(const char *db_path
         goto cleanup;
     }
     store_integrity_result_t integrity_result;
-    store_integrity_status_t integrity_status =
-        store_check_integrity_detailed(snapshot_store, &integrity_result);
+    store_integrity_status_t integrity_status = store_check_integrity_detailed(
+        snapshot_store, contract, expected_project, &integrity_result);
     if (integrity_status != STORE_INTEGRITY_OK) {
         char operation[CBM_STORE_VERIFY_OPERATION_MAX];
         int operation_wrote =
@@ -2050,10 +2117,17 @@ cbm_store_verify_status_t cbm_store_open_path_query_verified(const char *db_path
     result->status = CBM_STORE_VERIFY_OK;
     result->native_error = ERROR_SUCCESS;
     result->sqlite_error = SQLITE_OK;
-    snprintf(result->operation, sizeof(result->operation), "%s",
-             "snapshot.application.project_row");
-    snprintf(result->detail, sizeof(result->detail), "%s",
-             "snapshot passed the project-store integrity contract");
+    if (contract == STORE_INTEGRITY_CONTRACT_GRAPH_RELOAD) {
+        snprintf(result->operation, sizeof(result->operation), "%s",
+                 "snapshot.application.project_identity");
+        snprintf(result->detail, sizeof(result->detail), "%s",
+                 "snapshot passed the graph-reload integrity contract");
+    } else {
+        snprintf(result->operation, sizeof(result->operation), "%s",
+                 "snapshot.application.project_row");
+        snprintf(result->detail, sizeof(result->detail), "%s",
+                 "snapshot passed the query-store integrity contract");
+    }
 
 cleanup:
     if (snapshot_store) {
@@ -2120,6 +2194,21 @@ cleanup:
     free(shm_path);
     return result->status;
 #endif
+}
+
+cbm_store_verify_status_t cbm_store_open_path_query_verified(const char *db_path,
+                                                             cbm_store_t **out_store,
+                                                             cbm_store_verify_result_t *result) {
+    return store_open_path_verified(db_path, STORE_INTEGRITY_CONTRACT_QUERY, NULL, out_store,
+                                    result);
+}
+
+cbm_store_verify_status_t cbm_store_open_path_graph_verified(const char *db_path,
+                                                             const char *project,
+                                                             cbm_store_t **out_store,
+                                                             cbm_store_verify_result_t *result) {
+    return store_open_path_verified(db_path, STORE_INTEGRITY_CONTRACT_GRAPH_RELOAD, project,
+                                    out_store, result);
 }
 
 cbm_store_t *cbm_store_open(const char *project) {

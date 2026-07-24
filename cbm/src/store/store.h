@@ -265,6 +265,19 @@ cbm_store_verify_status_t cbm_store_open_path_query_verified(const char *db_path
                                                              cbm_store_t **out_store,
                                                              cbm_store_verify_result_t *result);
 
+/* Verify and open the graph state consumed by cbm_gbuf_load_from_db.  This uses
+ * the same source-family freeze, byte/hash-checked snapshot, and race-free
+ * read-only publication boundary as cbm_store_open_path_query_verified, but
+ * verifies the versioned Project/Node/Edge reload contract rather than
+ * requiring query-only projections such as nodes_fts.  The sole persisted
+ * project must exactly equal `project`; a different or missing project is an
+ * integrity failure, never an empty-graph success or a retry through another
+ * open profile.  `out_store` is set only on VERIFY_OK. */
+cbm_store_verify_status_t cbm_store_open_path_graph_verified(const char *db_path,
+                                                             const char *project,
+                                                             cbm_store_t **out_store,
+                                                             cbm_store_verify_result_t *result);
+
 /* On-disk path of a file-backed store, or NULL for an in-memory (:memory:)
  * store. The returned pointer is owned by the store. */
 const char *cbm_store_db_path(const cbm_store_t *s);

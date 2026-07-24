@@ -1434,7 +1434,7 @@ int cbm_gbuf_load_from_db(cbm_gbuf_t *gb, const char *db_path, const char *proje
     cbm_store_t *store = NULL;
     cbm_store_verify_result_t verification;
     cbm_store_verify_status_t verify_status =
-        cbm_store_open_path_query_verified(db_path, &store, &verification);
+        cbm_store_open_path_graph_verified(db_path, project, &store, &verification);
     if (verify_status != CBM_STORE_VERIFY_OK || !store) {
         if (store) {
             cbm_store_close(store);
