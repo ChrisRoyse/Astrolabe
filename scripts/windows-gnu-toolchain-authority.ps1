@@ -6509,7 +6509,7 @@ finally {
                         $record.Lease.Path = $record.TombstonePath
                         $renamedSnapshot =
                             Get-AstroLauncherTempTreeSnapshot $record.Lease
-                        Assert-AstroLauncherTreeSnapshotContentEqual `
+                        Assert-AstroLauncherTreeSnapshotAcrossExactRename `
                             -Before $record.Snapshot `
                             -After $renamedSnapshot `
                             -Description 'owned target tree across exact rename'

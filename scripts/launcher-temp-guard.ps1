@@ -447,7 +447,8 @@ public static class AstroLauncherTempNative
         string path,
         uint desiredAccess,
         uint shareMode,
-        string description
+        string description,
+        bool suppressAccessTimeUpdate = false
     )
     {
         SafeFileHandle handle = CreateFileW(
@@ -467,6 +468,10 @@ public static class AstroLauncherTempNative
         }
         try
         {
+            if (suppressAccessTimeUpdate)
+            {
+                SuppressAccessTimeUpdate(handle, description);
+            }
             RequireDisk(handle, description);
             return handle;
         }
@@ -485,7 +490,8 @@ public static class AstroLauncherTempNative
                 FILE_WRITE_ATTRIBUTES | GENERIC_READ | READ_CONTROL |
                 DELETE_ACCESS,
             FILE_SHARE_READ,
-            "exact TEMP mutation directory"
+            "exact TEMP mutation directory",
+            true
         );
         try
         {
@@ -559,7 +565,8 @@ public static class AstroLauncherTempNative
             FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES | FILE_TRAVERSE |
                 FILE_WRITE_ATTRIBUTES | GENERIC_READ | READ_CONTROL,
             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-            "exact TEMP root backup-state observer"
+            "exact TEMP root backup-state observer",
+            true
         );
         try
         {
@@ -1642,11 +1649,11 @@ public static class AstroLauncherTempNative
         string description
     )
     {
-        // Reading backup data can itself advance or defer LastAccessTime.  The
-        // retained handle denies WRITE and DELETE sharing, so obtain two
-        // consecutive identical post-observation states rather than comparing
-        // the pre-read atime with the side effects of that same read.  Every
-        // ordinary data/security byte is still streamed and hashed each pass.
+        // SetFileTime suppresses access-time updates caused through this handle,
+        // but NTFS may still publish a delayed update caused by an earlier
+        // handle.  Require two consecutive equal observer-neutral states rather
+        // than treating LastAccessTime as authorization. Every other basic field
+        // and every ordinary data/security byte remains exact across both passes.
         ExactBackupState previous = null;
         const int MAX_CONVERGENCE_PASSES = 8;
         for (int pass = 1; pass <= MAX_CONVERGENCE_PASSES; pass++)
@@ -1657,8 +1664,14 @@ public static class AstroLauncherTempNative
                 description + " convergence_pass=" + pass
             );
             if (previous != null && String.Equals(
-                previous.Canonical,
-                current.Canonical,
+                CanonicalStateWithoutLastAccessTime(
+                    previous.Canonical,
+                    description + " prior convergence state"
+                ),
+                CanonicalStateWithoutLastAccessTime(
+                    current.Canonical,
+                    description + " current convergence state"
+                ),
                 StringComparison.Ordinal
             ))
             {
@@ -1668,7 +1681,8 @@ public static class AstroLauncherTempNative
         }
         throw new InvalidOperationException(
             "TEMP_BACKUP_STATE_NONCONVERGENT: " + description +
-            " did not yield two consecutive identical exact states in " +
+            " did not yield two consecutive identical states beyond " +
+            "observer-neutral LastAccessTime in " +
             MAX_CONVERGENCE_PASSES + " passes"
         );
     }
@@ -1951,7 +1965,8 @@ public static class AstroLauncherTempNative
                 GENERIC_READ | READ_CONTROL | FILE_READ_ATTRIBUTES |
                     FILE_WRITE_ATTRIBUTES,
                 FILE_SHARE_READ,
-                "exact TEMP mutation-denying snapshot entry"
+                "exact TEMP mutation-denying snapshot entry",
+                true
             ))
             {
                 BY_HANDLE_FILE_INFORMATION information =
@@ -2047,6 +2062,114 @@ public static class AstroLauncherTempNative
         }
     }
 
+    public static bool ExactRootStateEqualAcrossRename(
+        string beforeToken,
+        string afterToken
+    )
+    {
+        string before = DecodeCanonicalBackupStateToken(
+            beforeToken,
+            "pre-rename exact directory state"
+        );
+        string after = DecodeCanonicalBackupStateToken(
+            afterToken,
+            "post-rename exact directory state"
+        );
+        return String.Equals(
+            CanonicalStateWithoutAccessOrChangeTime(
+                before,
+                "pre-rename exact directory state"
+            ),
+            CanonicalStateWithoutAccessOrChangeTime(
+                after,
+                "post-rename exact directory state"
+            ),
+            StringComparison.Ordinal
+        );
+    }
+
+    public static bool ExactRootStateEqualIgnoringLastAccessTime(
+        string beforeToken,
+        string afterToken
+    )
+    {
+        string before = DecodeCanonicalBackupStateToken(
+            beforeToken,
+            "first exact directory state"
+        );
+        string after = DecodeCanonicalBackupStateToken(
+            afterToken,
+            "second exact directory state"
+        );
+        return String.Equals(
+            CanonicalStateWithoutLastAccessTime(
+                before,
+                "first exact directory state"
+            ),
+            CanonicalStateWithoutLastAccessTime(
+                after,
+                "second exact directory state"
+            ),
+            StringComparison.Ordinal
+        );
+    }
+
+    public static bool ExactTreeEntriesEqualIgnoringLastAccessTime(
+        string[] beforeRecords,
+        string[] afterRecords
+    )
+    {
+        if (beforeRecords == null || afterRecords == null)
+        {
+            throw new ArgumentNullException(
+                beforeRecords == null
+                    ? "beforeRecords"
+                    : "afterRecords"
+            );
+        }
+        if (beforeRecords.Length != afterRecords.Length)
+        {
+            return false;
+        }
+        for (int index = 0; index < beforeRecords.Length; index++)
+        {
+            ExpectedEntry before = ParseExpectedEntry(beforeRecords[index]);
+            ExpectedEntry after = ParseExpectedEntry(afterRecords[index]);
+            if (before.IsDirectory != after.IsDirectory ||
+                !String.Equals(
+                    before.RelativePath,
+                    after.RelativePath,
+                    StringComparison.Ordinal
+                ) ||
+                !String.Equals(
+                    before.FileId,
+                    after.FileId,
+                    StringComparison.Ordinal
+                ) ||
+                !String.Equals(
+                    before.ShortNameToken,
+                    after.ShortNameToken,
+                    StringComparison.Ordinal
+                ) ||
+                before.LinkCount != after.LinkCount ||
+                !String.Equals(
+                    CanonicalStateWithoutLastAccessTime(
+                        before.ExactBackupState,
+                        "first exact entry backup-state"
+                    ),
+                    CanonicalStateWithoutLastAccessTime(
+                        after.ExactBackupState,
+                        "second exact entry backup-state"
+                    ),
+                    StringComparison.Ordinal
+                ))
+            {
+                return false;
+            }
+        }
+        return true;
+    }
+
     public static SafeFileHandle ProtectExactLiveDirectoryForCleanup(
         SafeFileHandle liveRoot,
         string expectedPath,
@@ -2077,7 +2200,10 @@ public static class AstroLauncherTempNative
                 new UTF8Encoding(false, true).GetBytes(observerState.Canonical)
             );
             if (!String.Equals(GetIdentity(observer), expectedFileId, StringComparison.Ordinal) ||
-                !String.Equals(observerToken, expectedRootState, StringComparison.Ordinal))
+                !ExactRootStateEqualIgnoringLastAccessTime(
+                    observerToken,
+                    expectedRootState
+                ))
             {
                 throw new InvalidOperationException(
                     "live TEMP cleanup-transfer observer differs from captured root state"
@@ -2102,7 +2228,10 @@ public static class AstroLauncherTempNative
             );
             if (!String.Equals(GetIdentity(protectedRoot), expectedFileId, StringComparison.Ordinal) ||
                 !String.Equals(GetIdentity(observer), expectedFileId, StringComparison.Ordinal) ||
-                !String.Equals(protectedToken, expectedRootState, StringComparison.Ordinal) ||
+                !ExactRootStateEqualIgnoringLastAccessTime(
+                    protectedToken,
+                    expectedRootState
+                ) ||
                 !String.Equals(GetFinalPath(protectedRoot), path, StringComparison.OrdinalIgnoreCase))
             {
                 throw new InvalidOperationException(
@@ -2124,22 +2253,6 @@ public static class AstroLauncherTempNative
                 observer.Dispose();
             }
         }
-    }
-
-    private static bool EqualExact(string[] left, string[] right)
-    {
-        if (left == null || right == null || left.Length != right.Length)
-        {
-            return false;
-        }
-        for (int index = 0; index < left.Length; index++)
-        {
-            if (!String.Equals(left[index], right[index], StringComparison.Ordinal))
-            {
-                return false;
-            }
-        }
-        return true;
     }
 
     private static ExpectedEntry ParseExpectedEntry(string record)
@@ -2282,29 +2395,206 @@ public static class AstroLauncherTempNative
             canonical.Substring(fifth + 1);
     }
 
-    private static string CanonicalFileAfterAuthorizedUnlinkState(string canonical)
+    private static string DecodeCanonicalBackupStateToken(
+        string token,
+        string description
+    )
     {
-        // Removing one already-authorized hard-link name advances the shared
-        // NTFS object's ChangeTime.  Creation/access/write times, attributes,
-        // bytes, security, EA/object metadata, and stream inventory must remain
-        // exact through every remaining name.
+        if (String.IsNullOrEmpty(token))
+        {
+            throw new InvalidDataException(description + " token is empty");
+        }
+        byte[] bytes;
+        string canonical;
+        try
+        {
+            bytes = Convert.FromBase64String(token);
+            canonical = new UTF8Encoding(false, true).GetString(bytes);
+        }
+        catch (Exception fault)
+        {
+            throw new InvalidDataException(
+                description + " token is not canonical base64/UTF-8",
+                fault
+            );
+        }
+        if (bytes.Length == 0 ||
+            !String.Equals(
+                Convert.ToBase64String(bytes),
+                token,
+                StringComparison.Ordinal
+            ))
+        {
+            throw new InvalidDataException(
+                description + " token has a non-canonical base64 encoding"
+            );
+        }
+        return canonical;
+    }
+
+    private static void ValidateCanonicalBasicInfo(
+        string canonical,
+        string description,
+        out int first,
+        out int second,
+        out int third,
+        out int fourth,
+        out int fifth
+    )
+    {
         if (String.IsNullOrEmpty(canonical))
         {
-            throw new InvalidDataException("TEMP file backup-state token is empty");
+            throw new InvalidDataException(description + " is empty");
         }
-        int first = canonical.IndexOf(',');
-        int second = first < 0 ? -1 : canonical.IndexOf(',', first + 1);
-        int third = second < 0 ? -1 : canonical.IndexOf(',', second + 1);
-        int fourth = third < 0 ? -1 : canonical.IndexOf(',', third + 1);
-        int fifth = fourth < 0 ? -1 : canonical.IndexOf(',', fourth + 1);
+        first = canonical.IndexOf(',');
+        second = first < 0 ? -1 : canonical.IndexOf(',', first + 1);
+        third = second < 0 ? -1 : canonical.IndexOf(',', second + 1);
+        fourth = third < 0 ? -1 : canonical.IndexOf(',', third + 1);
+        fifth = fourth < 0 ? -1 : canonical.IndexOf(',', fourth + 1);
         if (first <= 0 || second <= first + 1 || third <= second + 1 ||
             fourth <= third + 1 || fifth <= fourth + 1)
         {
+            throw new InvalidDataException(description + " is malformed");
+        }
+        string creation = canonical.Substring(0, first);
+        string access = canonical.Substring(first + 1, second - first - 1);
+        string write = canonical.Substring(second + 1, third - second - 1);
+        string change = canonical.Substring(third + 1, fourth - third - 1);
+        string attributes = canonical.Substring(
+            fourth + 1,
+            fifth - fourth - 1
+        );
+        long creationValue;
+        long accessValue;
+        long writeValue;
+        long changeValue;
+        uint attributesValue;
+        if (!Int64.TryParse(
+                creation,
+                NumberStyles.AllowLeadingSign,
+                CultureInfo.InvariantCulture,
+                out creationValue
+            ) ||
+            !String.Equals(
+                creationValue.ToString(CultureInfo.InvariantCulture),
+                creation,
+                StringComparison.Ordinal
+            ) ||
+            !Int64.TryParse(
+                access,
+                NumberStyles.AllowLeadingSign,
+                CultureInfo.InvariantCulture,
+                out accessValue
+            ) ||
+            !String.Equals(
+                accessValue.ToString(CultureInfo.InvariantCulture),
+                access,
+                StringComparison.Ordinal
+            ) ||
+            !Int64.TryParse(
+                write,
+                NumberStyles.AllowLeadingSign,
+                CultureInfo.InvariantCulture,
+                out writeValue
+            ) ||
+            !String.Equals(
+                writeValue.ToString(CultureInfo.InvariantCulture),
+                write,
+                StringComparison.Ordinal
+            ) ||
+            !Int64.TryParse(
+                change,
+                NumberStyles.AllowLeadingSign,
+                CultureInfo.InvariantCulture,
+                out changeValue
+            ) ||
+            !String.Equals(
+                changeValue.ToString(CultureInfo.InvariantCulture),
+                change,
+                StringComparison.Ordinal
+            ) ||
+            !UInt32.TryParse(
+                attributes,
+                NumberStyles.None,
+                CultureInfo.InvariantCulture,
+                out attributesValue
+            ) ||
+            !String.Equals(
+                attributesValue.ToString(CultureInfo.InvariantCulture),
+                attributes,
+                StringComparison.Ordinal
+            ))
+        {
             throw new InvalidDataException(
-                "TEMP file backup-state token is malformed"
+                description + " has malformed basic-information fields"
             );
         }
-        return canonical.Substring(0, third + 1) + canonical.Substring(fourth + 1);
+    }
+
+    private static string CanonicalStateWithoutLastAccessTime(
+        string canonical,
+        string description
+    )
+    {
+        int first;
+        int second;
+        int third;
+        int fourth;
+        int fifth;
+        ValidateCanonicalBasicInfo(
+            canonical,
+            description,
+            out first,
+            out second,
+            out third,
+            out fourth,
+            out fifth
+        );
+        // NTFS can publish LastAccessTime up to one hour after the causal read.
+        // It is recorded for evidence but cannot be a stable authorization
+        // field. Creation/write/change times, attributes, bytes, security,
+        // EA/object metadata, and streams remain exact.
+        return canonical.Substring(0, first + 1) +
+            canonical.Substring(second + 1);
+    }
+
+    private static string CanonicalStateWithoutAccessOrChangeTime(
+        string canonical,
+        string description
+    )
+    {
+        int first;
+        int second;
+        int third;
+        int fourth;
+        int fifth;
+        ValidateCanonicalBasicInfo(
+            canonical,
+            description,
+            out first,
+            out second,
+            out third,
+            out fourth,
+            out fifth
+        );
+        // The exact rename advances ChangeTime. LastAccessTime is independently
+        // delayed/observer-sensitive. Both stay recorded, while this projection
+        // requires every other root field and all backup-state bytes to match.
+        return canonical.Substring(0, first + 1) +
+            canonical.Substring(second + 1, third - second) +
+            canonical.Substring(fourth + 1);
+    }
+
+    private static string CanonicalFileAfterAuthorizedUnlinkState(string canonical)
+    {
+        // Removing one already-authorized hard-link name advances the shared
+        // NTFS object's ChangeTime. LastAccessTime remains observer-neutral;
+        // creation/write times, attributes, bytes, security, EA/object metadata,
+        // and stream inventory must remain exact through every remaining name.
+        return CanonicalStateWithoutAccessOrChangeTime(
+            canonical,
+            "TEMP file backup-state token"
+        );
     }
 
     private static void SetDisposition(
@@ -2360,10 +2650,16 @@ public static class AstroLauncherTempNative
         RequireOrdinaryDirectory(root, "exact TEMP mutation directory");
         string rootPath = GetFinalPath(root);
         string[] current = CaptureExactTreeEntries(root);
-        if (!EqualExact(current, expectedEntries))
+        if (!ExactTreeEntriesEqualIgnoringLastAccessTime(
+                current,
+                expectedEntries
+            ))
         {
             throw new InvalidOperationException(
-                "TEMP tree changed between retained snapshots and exact deletion"
+                "TEMP tree changed beyond observer-neutral LastAccessTime between retained snapshots and exact deletion; expected_entries=" +
+                expectedEntries.Length.ToString(CultureInfo.InvariantCulture) +
+                " current_entries=" +
+                current.Length.ToString(CultureInfo.InvariantCulture)
             );
         }
 
@@ -2428,7 +2724,8 @@ public static class AstroLauncherTempNative
                 path,
                 desiredAccess,
                 FILE_SHARE_READ,
-                "exact TEMP deletion entry"
+                "exact TEMP deletion entry",
+                true
             ))
             {
                 BY_HANDLE_FILE_INFORMATION information =
@@ -2509,8 +2806,18 @@ public static class AstroLauncherTempNative
                 {
                     exactStateMatches = removedLinks == 0
                         ? String.Equals(
-                            currentRecord,
-                            expected.ExactRecord,
+                            CanonicalStateWithoutLastAccessTime(
+                                backupBefore.Canonical,
+                                "current exact deletion file backup-state"
+                            ),
+                            CanonicalStateWithoutLastAccessTime(
+                                expected.ExactBackupState,
+                                "retained exact deletion file backup-state"
+                            ),
+                            StringComparison.Ordinal
+                        ) && String.Equals(
+                            GetExactShortNameToken(path),
+                            expected.ShortNameToken,
                             StringComparison.Ordinal
                         )
                         : String.Equals(
@@ -2657,10 +2964,13 @@ public static class AstroLauncherTempNative
         // preceding snapshot.  Calling CaptureBackupState on the retained handle
         // made valid cleanup fail when SetFileTime correctly rejected its rights.
         string beforeToken = CaptureExactRootState(root);
-        if (!String.Equals(beforeToken, expectedRootState, StringComparison.Ordinal))
+        if (!ExactRootStateEqualIgnoringLastAccessTime(
+                beforeToken,
+                expectedRootState
+            ))
         {
             throw new InvalidOperationException(
-                "TEMP root backup/basic/security state changed before exact disposition"
+                "TEMP root backup/basic/security state changed beyond observer-neutral LastAccessTime before exact disposition"
             );
         }
         // SetDisposition is the final filesystem call on this handle.  Dispose
@@ -3254,7 +3564,7 @@ function Get-AstroLauncherTempTreeSnapshot {
         InventorySha256 = Get-AstroByteSha256 $bytes
         Entries = $entries
         BackupStateScope =
-            'BackupRead default-data/EA/owner-group-DACL-security/object-id + FILE_BASIC_INFO + per-entry NTFS short-name bytes; ADS/link/property/reparse/sparse/TXFS rejected'
+            'BackupRead default-data/EA/owner-group-DACL-security/object-id + FILE_BASIC_INFO + per-entry NTFS short-name bytes; LastAccessTime recorded but observer-neutral; root ChangeTime neutral only across the authorized exact rename; ADS/link/property/reparse/sparse/TXFS rejected'
         SecurityDescriptorScope =
             'READ_CONTROL backup security stream; SACL not proven (coverage #620)'
         MetadataDispositionAtomicity =
@@ -3270,13 +3580,60 @@ function Assert-AstroLauncherTreeSnapshotContentEqual {
         [Parameter(Mandatory)][string]$Description
     )
 
-    if ($Before.RootFileId -cne $After.RootFileId -or
-        $Before.RootState -cne $After.RootState -or
-        $Before.EntryCount -ne $After.EntryCount -or
-        $Before.InventorySha256 -cne $After.InventorySha256 -or
-        [string]::Join("`n", [string[]]$Before.Entries) -cne
-            [string]::Join("`n", [string[]]$After.Entries)) {
-        throw "$Description changed object identity or exact content: $($Before.Path)"
+    $differences = [Collections.Generic.List[string]]::new()
+    if ($Before.RootFileId -cne $After.RootFileId) {
+        $differences.Add('root-file-id')
+    }
+    if (-not [AstroLauncherTempNative]::ExactRootStateEqualIgnoringLastAccessTime(
+            [string]$Before.RootState,
+            [string]$After.RootState
+        )) {
+        $differences.Add('root-state-beyond-last-access-time')
+    }
+    if ($Before.EntryCount -ne $After.EntryCount) {
+        $differences.Add('entry-count')
+    }
+    if (-not [AstroLauncherTempNative]::
+        ExactTreeEntriesEqualIgnoringLastAccessTime(
+            [string[]]$Before.Entries,
+            [string[]]$After.Entries
+        )) {
+        $differences.Add('entry-records-beyond-last-access-time')
+    }
+    if ($differences.Count -gt 0) {
+        throw "$Description changed object identity or exact content beyond observer-neutral LastAccessTime (differences=$($differences -join ','), before_file_id=$($Before.RootFileId), after_file_id=$($After.RootFileId), before_entries=$($Before.EntryCount), after_entries=$($After.EntryCount), before_inventory=$($Before.InventorySha256), after_inventory=$($After.InventorySha256)): $($Before.Path)"
+    }
+}
+
+function Assert-AstroLauncherTreeSnapshotAcrossExactRename {
+    param(
+        [Parameter(Mandatory)]$Before,
+        [Parameter(Mandatory)]$After,
+        [Parameter(Mandatory)][string]$Description
+    )
+
+    $differences = [Collections.Generic.List[string]]::new()
+    if ($Before.RootFileId -cne $After.RootFileId) {
+        $differences.Add('root-file-id')
+    }
+    if (-not [AstroLauncherTempNative]::ExactRootStateEqualAcrossRename(
+            [string]$Before.RootState,
+            [string]$After.RootState
+        )) {
+        $differences.Add('root-state-beyond-rename-induced-change-time')
+    }
+    if ($Before.EntryCount -ne $After.EntryCount) {
+        $differences.Add('entry-count')
+    }
+    if (-not [AstroLauncherTempNative]::
+        ExactTreeEntriesEqualIgnoringLastAccessTime(
+            [string[]]$Before.Entries,
+            [string[]]$After.Entries
+        )) {
+        $differences.Add('entry-records-beyond-last-access-time')
+    }
+    if ($differences.Count -gt 0) {
+        throw "$Description changed object identity or exact content beyond the authorized NTFS ChangeTime update and observer-neutral LastAccessTime (differences=$($differences -join ','), before_file_id=$($Before.RootFileId), after_file_id=$($After.RootFileId), before_entries=$($Before.EntryCount), after_entries=$($After.EntryCount), before_root_state=$($Before.RootState), after_root_state=$($After.RootState)): $($Before.Path)"
     }
 }
 
@@ -3779,7 +4136,7 @@ function Move-AstroLauncherTempLeaseToCleanupTombstone {
             )) {
             throw "retained TEMP rename resolved to an unexpected destination ('$destination' -> '$($after.RootFinalPath)')"
         }
-        Assert-AstroLauncherTreeSnapshotContentEqual `
+        Assert-AstroLauncherTreeSnapshotAcrossExactRename `
             -Before $before `
             -After $after `
             -Description 'retained TEMP tree across exact rename'
