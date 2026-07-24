@@ -1177,6 +1177,7 @@ static CBMFileResult *cbm_extract_file_impl(const char *source, int source_len,
     return result;
 
 extraction_failed:
+    cbm_file_result_discard_atoms(result);
     ts_tree_delete(tree);
     result->cached_tree = NULL;
     return result;
