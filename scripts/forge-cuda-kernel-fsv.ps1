@@ -84,12 +84,23 @@ function Write-AstroReadbackText {
 function ConvertTo-AstroSingleStringArrayJson {
     param([Parameter(Mandatory)][string]$Value)
 
-    $escaped = $Value.Replace('\', '\\').Replace('"', '\"')
-    $escaped = $escaped.Replace("`r", '\r').Replace("`n", '\n')
-    $escaped = $escaped.Replace("`t", '\t')
-    $json = '["' + $escaped + '"]'
-    $readback = @($json | ConvertFrom-Json)
+    try {
+        Add-Type -AssemblyName System.Web.Extensions -ErrorAction Stop
+        $serializer =
+            [System.Web.Script.Serialization.JavaScriptSerializer]::new()
+        $json = $serializer.Serialize([object[]]@($Value))
+        $readback = $serializer.DeserializeObject($json)
+    }
+    catch {
+        throw (
+            'CALYX_FORGE_CUDA_FSV_ARGUMENT_JSON_SERIALIZER_FAILED: ' +
+            "the required Windows JSON serializer could not encode and read back " +
+            "the runner argument array ($($_.Exception.GetType().FullName): " +
+            "$($_.Exception.Message))"
+        )
+    }
     Assert-Astro (
+        $readback -is [object[]] -and
         $readback.Count -eq 1 -and
         $readback[0] -is [string] -and
         [string]$readback[0] -ceq $Value
