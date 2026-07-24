@@ -1167,7 +1167,7 @@ function Invoke-ObsoleteBundleRetirement {
         [Parameter(Mandatory = $true)][string]$Workspace
     )
 
-    $retirement = Remove-AstroObsoleteCudaRuntimeRoots `
+    $retirement = Remove-AstroObsoleteCudaBundleRoots `
         -ToolchainsRoot $Toolchains `
         -RootPrefix $Lock.bundle.root_prefix `
         -ActiveDigest $LockSha256 `

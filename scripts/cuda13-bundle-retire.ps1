@@ -419,11 +419,76 @@ function Get-AstroCuda13RegisteredLockInventory {
     }
 }
 
+function Get-AstroCuda13LinkSupportOwnershipProbe {
+    param(
+        [Parameter(Mandatory)][string]$CandidatePath,
+        [Parameter(Mandatory)][string]$NameDigest,
+        [Parameter(Mandatory)][string]$RootPrefix
+    )
+
+    try {
+        if ($RootPrefix -cne 'cuda-msvc-link-support-v1') {
+            throw "unsupported link-support root prefix '$RootPrefix'"
+        }
+        foreach ($validator in @(
+                'Read-AstroCudaLinkSupportManifest',
+                'Assert-AstroCudaLinkSupportRoot'
+            )) {
+            if (-not (Get-Command -Name $validator `
+                    -ErrorAction SilentlyContinue)) {
+                throw "the exact authority-owned link-support validator '$validator' is unavailable"
+            }
+        }
+        $manifest = Read-AstroCudaLinkSupportManifest (
+            Join-Path $CandidatePath 'manifest.v1.json'
+        )
+        $inputDigest = [string]$manifest.Parsed.input_digest
+        $contractSha256 =
+            [string]$manifest.Parsed.input_contract_sha256
+        if ($inputDigest -cne $NameDigest -or
+            $contractSha256 -cne $NameDigest) {
+            throw "name/embedded-input digest mismatch (name=$NameDigest; input=$inputDigest; contract=$contractSha256)"
+        }
+        $validated = Assert-AstroCudaLinkSupportRoot `
+            -BundleRoot $CandidatePath `
+            -ExpectedInputDigest $NameDigest `
+            -ExpectedContractSha256 $NameDigest `
+            -ExpectedContractText $null `
+            -ExpectedSourceFiles $null
+        if ($validated.ManifestSha256 -cne $manifest.Sha256 -or
+            $validated.InputDigest -cne $NameDigest) {
+            throw 'independent exact validation differs from the retained manifest snapshot'
+        }
+        return [pscustomobject]@{
+            Owned = $true
+            Detail = $null
+            LockLeafSha256 = $null
+            ReceiptSha256 = $validated.ManifestSha256
+        }
+    }
+    catch {
+        return [pscustomobject]@{
+            Owned = $false
+            Detail = $_.Exception.Message
+            LockLeafSha256 = $null
+            ReceiptSha256 = $null
+        }
+    }
+}
+
 function Get-AstroCuda13OwnershipProbe {
     param(
         [Parameter(Mandatory)][string]$CandidatePath,
-        [Parameter(Mandatory)][string]$NameDigest
+        [Parameter(Mandatory)][string]$NameDigest,
+        [Parameter(Mandatory)][string]$RootPrefix
     )
+
+    if ($RootPrefix -ceq 'cuda-msvc-link-support-v1') {
+        return Get-AstroCuda13LinkSupportOwnershipProbe `
+            -CandidatePath $CandidatePath `
+            -NameDigest $NameDigest `
+            -RootPrefix $RootPrefix
+    }
 
     $shaPath = Join-Path $CandidatePath 'bundle.lock.sha256'
     $receiptPath = Join-Path $CandidatePath 'bundle.receipt.json'
@@ -486,11 +551,13 @@ function Get-AstroCuda13OwnershipProbe {
 function Test-AstroCudaRootOwned {
     param(
         [Parameter(Mandatory)][string]$CandidatePath,
-        [Parameter(Mandatory)][string]$NameDigest
+        [Parameter(Mandatory)][string]$NameDigest,
+        [Parameter(Mandatory)][string]$RootPrefix
     )
     return [bool](Get-AstroCuda13OwnershipProbe `
             -CandidatePath $CandidatePath `
-            -NameDigest $NameDigest).Owned
+            -NameDigest $NameDigest `
+            -RootPrefix $RootPrefix).Owned
 }
 
 function Get-AstroCuda13BundleInventory {
@@ -560,7 +627,8 @@ function Get-AstroCuda13BundleInventory {
         }
         $ownership = Get-AstroCuda13OwnershipProbe `
             -CandidatePath $path `
-            -NameDigest $digest
+            -NameDigest $digest `
+            -RootPrefix $RootPrefix
         if (-not $ownership.Owned) {
             $blockers += [ordered]@{
                 code = 'bundle-root-ownership-mismatch'
@@ -1143,7 +1211,7 @@ function Remove-AstroCuda13TransitionLease {
     }
 }
 
-function Remove-AstroObsoleteCudaRuntimeRoots {
+function Remove-AstroObsoleteCudaBundleRoots {
     param(
         [Parameter(Mandatory)][string]$ToolchainsRoot,
         [Parameter(Mandatory)][string]$RootPrefix,
@@ -1336,10 +1404,18 @@ function Remove-AstroObsoleteCudaRuntimeRoots {
                     "registered-root/lock/bundle inventory changed under the transition (first=$($baseline.Sha256); second=$($second.Sha256))" `
                     'preserve the store and investigate the concurrent state change'
             }
-            $sourceHandle =
-                [AstroLauncherLockNative]::OpenExactDeleteDirectory(
-                    [string]$candidate.path
-                )
+            try {
+                $sourceHandle =
+                    [AstroLauncherLockNative]::OpenExactDeleteDirectory(
+                        [string]$candidate.path
+                    )
+            }
+            catch {
+                Throw-AstroCuda13Retirement `
+                    'ASTRO_CUDA13_RETIRE_CANDIDATE_LEASE_BLOCKED' `
+                    "the exact obsolete-root delete lease could not be acquired and no root byte was mutated: $($candidate.path); $($_.Exception.Message)" `
+                    'preserve the root; wait for any retained consumer handle to close, then re-read the driving issue and retry serialized retirement'
+            }
             $sourceHandleOwned = $true
             try {
                 $treeSecond = Get-AstroCuda13BundleTreeSnapshot `

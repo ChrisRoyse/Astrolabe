@@ -378,6 +378,13 @@ $SccacheCacheSize = "20G"
 # "0" means "run permanently" (mozilla/sccache docs/Configuration.md) and is a mode, not
 # a tunable threshold: it removes the race condition rather than widening a window.
 $SccacheIdleTimeout = "0"
+# #710: pinned sccache 0.16.0 stops accepting work on the explicit shutdown RPC,
+# then waits at most ten seconds for active service instances to drain. Give that
+# upstream contract five additional seconds for Windows process/conhost teardown
+# and Job/completion-port observation. The launcher never kills a child at this
+# deadline: any remaining or unevaluable exact generation preserves all state.
+$SccacheShutdownDrainSeconds = 15
+$SccacheShutdownPollMilliseconds = 50
 # #242: stable per-root server port window. Ports must sit OUTSIDE the Windows dynamic
 # (ephemeral) range -- `netsh int ipv4 show dynamicport tcp` reports 49152..65535 on this
 # host, and `netsh int ipv4 show excludedportrange protocol=tcp` reserves several 100-port
@@ -431,6 +438,16 @@ $CudaImportLibNames = @(
     "cublas.lib",
     "cublasLt.lib"
 )
+# #711: Cargo fingerprints the effective RUSTFLAGS and sccache hashes the parsed
+# rustc command. CUDA/MSVC link inputs therefore need one stable path whose name
+# changes only with the verified input/tool contract, never with a launcher PID,
+# process-start tick, lease hash, or generation TEMP.
+$CudaLinkSupportSchema = "astrolabe.cuda-msvc-link-support.v1"
+$CudaLinkSupportInputSchema = "astrolabe.cuda-msvc-link-support-input.v1"
+$CudaLinkSupportRootPrefix = "cuda-msvc-link-support-v1-"
+$CudaLinkSupportStagePrefix = ".cuda-msvc-link-support-v1.stage."
+$CudaLinkSupportManifestName = "manifest.v1.json"
+$CudaLinkSupportPayloadName = "payload"
 $RuntimeDlls = @("libgcc_s_seh-1.dll", "libwinpthread-1.dll")
 $RequiredLlvmTools = @("clang-tidy.exe", "clang-format.exe")
 # #303: the lld linker ships in the same pinned LLVM 20.1.8 bundle as clang-tidy/clang-format.
@@ -2278,6 +2295,1152 @@ function Resolve-CudaToolkitLibRoot {
     return $libRoot
 }
 
+function Get-AstroRetainedStreamSha256 {
+    param([Parameter(Mandatory)]$Stream)
+
+    if (-not $Stream.CanRead -or -not $Stream.CanSeek) {
+        throw 'retained file digest requires one readable seekable stream'
+    }
+    $position = $Stream.Position
+    $sha = [Security.Cryptography.SHA256]::Create()
+    try {
+        $Stream.Position = 0
+        return ([BitConverter]::ToString(
+                $sha.ComputeHash($Stream)
+            ) -replace '-', '').ToLowerInvariant()
+    }
+    finally {
+        $Stream.Position = $position
+        $sha.Dispose()
+    }
+}
+
+function Open-AstroCudaLinkInputFile {
+    param(
+        [Parameter(Mandatory)][string]$Role,
+        [Parameter(Mandatory)][string]$Path
+    )
+
+    $full = [IO.Path]::GetFullPath($Path)
+    $state = Get-AstroPathEntryState $full
+    if ($state.State -cne 'present' -or
+        ($state.Attributes -band [IO.FileAttributes]::Directory) -ne 0 -or
+        ($state.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw "CUDA_LINK_SUPPORT[ASTRO_CUDA_LINK_INPUT_INVALID]: {code=ASTRO_CUDA_LINK_INPUT_INVALID; message=`"input '$Role' is not one ordinary non-reparse file (state=$($state.State); attributes=$($state.Attributes); error=$($state.Error)): $full`"; remediation=`"repair the pinned CUDA/MSVC/Windows Kit/LLVM installation and rerun`"}"
+    }
+    $stream = $null
+    try {
+        # Every producer receives read sharing, while write/delete sharing is
+        # denied until extraction/copy and the second digest readback finish.
+        $stream = [IO.File]::Open(
+            $full,
+            [IO.FileMode]::Open,
+            [IO.FileAccess]::Read,
+            [IO.FileShare]::Read
+        )
+        $finalPath = ConvertFrom-AstroNativeFinalPath (
+            [AstroLauncherLockNative]::GetFileFinalPath(
+                $stream.SafeFileHandle
+            )
+        )
+        $finalPath = [IO.Path]::GetFullPath($finalPath)
+        if (-not [string]::Equals(
+                $full,
+                $finalPath,
+                [StringComparison]::OrdinalIgnoreCase
+            )) {
+            throw "input final path differs from requested path: requested=$full; final=$finalPath"
+        }
+        return [pscustomobject]@{
+            Role = $Role
+            Path = $full
+            FinalPath = $finalPath
+            FileId = [AstroLauncherLockNative]::GetFileIdentity(
+                $stream.SafeFileHandle
+            )
+            LinkCount = [AstroLauncherTempNative]::GetExactFileLinkCount(
+                $stream.SafeFileHandle
+            )
+            Length = [uint64]$stream.Length
+            Sha256 = Get-AstroRetainedStreamSha256 $stream
+            Stream = $stream
+        }
+    }
+    catch {
+        if ($null -ne $stream) {
+            $stream.Dispose()
+        }
+        throw
+    }
+}
+
+function Assert-AstroCudaLinkInputFileStable {
+    param([Parameter(Mandatory)]$Lease)
+
+    if ($null -eq $Lease.Stream -or
+        $Lease.Stream.SafeFileHandle.IsClosed) {
+        throw "retained input stream is unavailable: $($Lease.Role)"
+    }
+    $finalPath = ConvertFrom-AstroNativeFinalPath (
+        [AstroLauncherLockNative]::GetFileFinalPath(
+            $Lease.Stream.SafeFileHandle
+        )
+    )
+    $finalPath = [IO.Path]::GetFullPath($finalPath)
+    $fileId = [AstroLauncherLockNative]::GetFileIdentity(
+        $Lease.Stream.SafeFileHandle
+    )
+    $length = [uint64]$Lease.Stream.Length
+    $sha256 = Get-AstroRetainedStreamSha256 $Lease.Stream
+    if (-not [string]::Equals(
+            $Lease.Path,
+            $finalPath,
+            [StringComparison]::OrdinalIgnoreCase
+        ) -or
+        $fileId -cne $Lease.FileId -or
+        $length -ne $Lease.Length -or
+        $sha256 -cne $Lease.Sha256 -or
+        [AstroLauncherTempNative]::GetExactFileLinkCount(
+            $Lease.Stream.SafeFileHandle
+        ) -ne $Lease.LinkCount) {
+        throw "retained input changed during bundle preparation: role=$($Lease.Role); path=$($Lease.Path); expected_file_id=$($Lease.FileId); observed_file_id=$fileId; expected_length=$($Lease.Length); observed_length=$length; expected_sha256=$($Lease.Sha256); observed_sha256=$sha256"
+    }
+}
+
+function Close-AstroCudaLinkFileLeases {
+    param([AllowNull()]$Leases)
+
+    $closed = 0
+    foreach ($lease in @($Leases)) {
+        if ($null -ne $lease -and
+            $null -ne $lease.Stream -and
+            -not $lease.Stream.SafeFileHandle.IsClosed) {
+            $lease.Stream.Dispose()
+            $closed++
+        }
+    }
+    return $closed
+}
+
+function New-AstroCudaLinkInputContext {
+    param(
+        [Parameter(Mandatory)][string]$MsvcLibRoot,
+        [Parameter(Mandatory)][string]$LlvmBin,
+        [Parameter(Mandatory)][string]$CudaLibRoot
+    )
+
+    $specifications = [Collections.Generic.List[object]]::new()
+    $specifications.Add([pscustomobject]@{
+            Role = 'llvm-ar'
+            Path = (Join-Path $LlvmBin 'llvm-ar.exe')
+        })
+    $specifications.Add([pscustomobject]@{
+            Role = 'lld-linker'
+            Path = (Join-Path $LlvmBin 'ld.lld.exe')
+        })
+    $specifications.Add([pscustomobject]@{
+            Role = 'msvc-runtime-archive'
+            Path = (Join-Path $MsvcLibRoot $MsvcRuntimeArchiveName)
+        })
+    $specifications.Add([pscustomobject]@{
+            Role = 'msvc-vcstartup-archive'
+            Path = (Join-Path $MsvcLibRoot $MsvcVcStartupArchiveName)
+        })
+    foreach ($name in $MsvcRuntimeImportLibNames) {
+        $specifications.Add([pscustomobject]@{
+                Role = "msvc-runtime-import/$name"
+                Path = (Join-Path $MsvcLibRoot $name)
+            })
+    }
+    $specifications.Add([pscustomobject]@{
+            Role = "windows-kit-ucrt-import/$WindowsKitUcrtImportLibName"
+            Path = (Resolve-WindowsKitUcrtLibPath)
+        })
+    foreach ($name in $CudaImportLibNames) {
+        $specifications.Add([pscustomobject]@{
+                Role = "cuda-import/$name"
+                Path = (Join-Path $CudaLibRoot $name)
+            })
+    }
+
+    $leases = [Collections.Generic.List[object]]::new()
+    try {
+        foreach ($specification in $specifications) {
+            $leases.Add((
+                    Open-AstroCudaLinkInputFile `
+                        -Role $specification.Role `
+                        -Path $specification.Path
+                ))
+        }
+        $contractFiles = [Collections.Generic.List[object]]::new()
+        $sourceFiles = [Collections.Generic.List[object]]::new()
+        foreach ($lease in $leases) {
+            $contractFiles.Add([ordered]@{
+                    role = $lease.Role
+                    source_path = $lease.Path
+                    length = $lease.Length
+                    sha256 = $lease.Sha256
+                })
+            $sourceFiles.Add([ordered]@{
+                    role = $lease.Role
+                    source_path = $lease.Path
+                    final_path = $lease.FinalPath
+                    file_id = $lease.FileId
+                    link_count = $lease.LinkCount
+                    length = $lease.Length
+                    sha256 = $lease.Sha256
+                })
+        }
+        $contract = [ordered]@{
+            schema = $CudaLinkSupportInputSchema
+            extractor = [ordered]@{
+                expected_llvm_version = $ExpectedClangTidyVersion
+                executable_role = 'llvm-ar'
+            }
+            linker = [ordered]@{
+                expected_llvm_version = $ExpectedClangTidyVersion
+                executable_role = 'lld-linker'
+            }
+            archives = [ordered]@{
+                msvc_runtime = $MsvcRuntimeArchiveName
+                msvc_runtime_members = @($MsvcRuntimeSupportMembers)
+                msvc_vcstartup = $MsvcVcStartupArchiveName
+                msvc_vcstartup_members =
+                    @($MsvcVcStartupSupportMembers)
+            }
+            runtime_import_names = @($MsvcRuntimeImportLibNames)
+            windows_kit_ucrt_import_name =
+                $WindowsKitUcrtImportLibName
+            cuda_import_names = @($CudaImportLibNames)
+            linker_contract = @(
+                '-fuse-ld=lld',
+                '-Wl,/nodefaultlib:libcpmt',
+                '-Wl,/nodefaultlib:LIBCMT',
+                '-Wl,/nodefaultlib:OLDNAMES',
+                '-lkernel32'
+            )
+            files = @($contractFiles)
+        }
+        $contractText = $contract | ConvertTo-Json -Compress -Depth 12
+        return [pscustomobject]@{
+            InputDigest = Get-AstroUtf8Sha256 $contractText
+            Contract = $contract
+            ContractText = $contractText
+            ContractSha256 = Get-AstroUtf8Sha256 $contractText
+            SourceFiles = @($sourceFiles)
+            Leases = @($leases)
+        }
+    }
+    catch {
+        [void](Close-AstroCudaLinkFileLeases $leases)
+        throw
+    }
+}
+
+function Get-AstroCudaLinkSupportExpectedPaths {
+    [string[]]$paths = @(
+        'cuda-imports',
+        'cuda-msvc-runtime-imports',
+        'cuda-msvc-runtime-support',
+        'cuda-msvc-vcstartup-support',
+        'cuda-windowskit-ucrt-import'
+    )
+    foreach ($name in $CudaImportLibNames) {
+        $paths += "cuda-imports/$name"
+    }
+    foreach ($name in $MsvcRuntimeImportLibNames) {
+        $paths += "cuda-msvc-runtime-imports/$name"
+    }
+    foreach ($name in $MsvcRuntimeSupportMembers) {
+        $paths += "cuda-msvc-runtime-support/$name"
+    }
+    foreach ($name in $MsvcVcStartupSupportMembers) {
+        $paths += "cuda-msvc-vcstartup-support/$name"
+    }
+    $paths += "cuda-windowskit-ucrt-import/$WindowsKitUcrtImportLibName"
+    [Array]::Sort($paths, [StringComparer]::Ordinal)
+    return $paths
+}
+
+function Get-AstroCudaLinkSupportInventory {
+    param([Parameter(Mandatory)][string]$PayloadRoot)
+
+    $root = [IO.Path]::GetFullPath($PayloadRoot).TrimEnd('\', '/')
+    $rootState = Get-AstroPathEntryState $root
+    if ($rootState.State -cne 'present' -or
+        ($rootState.Attributes -band [IO.FileAttributes]::Directory) -eq 0 -or
+        ($rootState.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw "payload root is not one ordinary non-reparse directory (state=$($rootState.State); attributes=$($rootState.Attributes); error=$($rootState.Error)): $root"
+    }
+    $rootHandle = $null
+    try {
+        $rootHandle =
+            [AstroLauncherTempNative]::OpenExactDirectoryIdentity($root)
+        $rootFileId =
+            [AstroLauncherTempNative]::GetExactDirectoryIdentity($rootHandle)
+        $rootFinalPath = [IO.Path]::GetFullPath(
+            [AstroLauncherTempNative]::GetExactDirectoryFinalPath(
+                $rootHandle
+            )
+        ).TrimEnd('\', '/')
+        if (-not [string]::Equals(
+                $root,
+                $rootFinalPath,
+                [StringComparison]::OrdinalIgnoreCase
+            )) {
+            throw "payload root final path changed: requested=$root; final=$rootFinalPath"
+        }
+
+        $items = @(
+            Get-ChildItem `
+                -LiteralPath $root `
+                -Force `
+                -Recurse `
+                -ErrorAction Stop
+        )
+        [string[]]$paths = @(
+            $items | ForEach-Object {
+                [IO.Path]::GetFullPath($_.FullName)
+            }
+        )
+        [Array]::Sort($paths, [StringComparer]::Ordinal)
+        $contentLines = [Collections.Generic.List[string]]::new()
+        $identityLines = [Collections.Generic.List[string]]::new()
+        $records = [Collections.Generic.List[object]]::new()
+        [uint64]$totalBytes = 0
+        foreach ($path in $paths) {
+            $prefix = $root + [IO.Path]::DirectorySeparatorChar
+            if (-not $path.StartsWith(
+                    $prefix,
+                    [StringComparison]::OrdinalIgnoreCase
+                )) {
+                throw "payload inventory escaped its exact root: $path"
+            }
+            $entry = Get-Item -LiteralPath $path -Force -ErrorAction Stop
+            if (($entry.Attributes -band
+                    [IO.FileAttributes]::ReparsePoint) -ne 0) {
+                throw "payload contains an unsupported reparse entry: $path"
+            }
+            $relative = $path.Substring($prefix.Length).Replace('\', '/')
+            $relativeBase64 = [Convert]::ToBase64String(
+                [Text.UTF8Encoding]::new($false, $true).GetBytes(
+                    $relative
+                )
+            )
+            if ($entry.PSIsContainer) {
+                $handle = $null
+                try {
+                    $handle =
+                        [AstroLauncherTempNative]::OpenExactDirectoryIdentity(
+                            $path
+                        )
+                    $fileId =
+                        [AstroLauncherTempNative]::GetExactDirectoryIdentity(
+                            $handle
+                        )
+                }
+                finally {
+                    if ($null -ne $handle) { $handle.Dispose() }
+                }
+                $contentLines.Add("D`t$relativeBase64")
+                $identityLines.Add("D`t$relativeBase64`t$fileId")
+                $records.Add([pscustomobject]@{
+                        RelativePath = $relative
+                        Kind = 'directory'
+                        FileId = $fileId
+                        Length = $null
+                        Sha256 = $null
+                    })
+                continue
+            }
+            if (($entry.Attributes -band
+                    [IO.FileAttributes]::Directory) -ne 0) {
+                throw "payload contains an unsupported entry type: $path"
+            }
+            $stream = $null
+            try {
+                $stream = [IO.File]::Open(
+                    $path,
+                    [IO.FileMode]::Open,
+                    [IO.FileAccess]::Read,
+                    [IO.FileShare]::Read
+                )
+                $fileId = [AstroLauncherLockNative]::GetFileIdentity(
+                    $stream.SafeFileHandle
+                )
+                $linkCount =
+                    [AstroLauncherTempNative]::GetExactFileLinkCount(
+                        $stream.SafeFileHandle
+                    )
+                if ($linkCount -ne 1) {
+                    throw "payload file has $linkCount filesystem links; exactly one is required: $path"
+                }
+                $length = [uint64]$stream.Length
+                $sha256 = Get-AstroRetainedStreamSha256 $stream
+            }
+            finally {
+                if ($null -ne $stream) { $stream.Dispose() }
+            }
+            $totalBytes = [uint64]($totalBytes + $length)
+            $contentLines.Add(
+                "F`t$relativeBase64`t$length`t$sha256"
+            )
+            $identityLines.Add(
+                "F`t$relativeBase64`t$fileId`t$length`t$sha256"
+            )
+            $records.Add([pscustomobject]@{
+                    RelativePath = $relative
+                    Kind = 'file'
+                    FileId = $fileId
+                    Length = $length
+                    Sha256 = $sha256
+                })
+        }
+        $exactLease = [pscustomobject]@{
+            Path = $root
+            Handle = $rootHandle
+        }
+        $exact = Get-AstroLauncherTempTreeSnapshot $exactLease
+        if ($exact.RootFileId -cne $rootFileId -or
+            -not [string]::Equals(
+                $exact.RootFinalPath,
+                $root,
+                [StringComparison]::OrdinalIgnoreCase
+            )) {
+            throw 'payload exact snapshot changed retained root identity/path'
+        }
+        return [pscustomobject]@{
+            PayloadRoot = $root
+            RootFileId = $rootFileId
+            EntryCount = $records.Count
+            TotalBytes = $totalBytes
+            ContentSha256 = Get-AstroUtf8Sha256 (
+                $contentLines -join "`n"
+            )
+            IdentitySha256 = Get-AstroUtf8Sha256 (
+                $identityLines -join "`n"
+            )
+            ExactInventorySha256 = $exact.InventorySha256
+            ExactRootState = $exact.RootState
+            ExactEntries = [string[]]@($exact.Entries)
+            Records = @($records)
+            RelativePaths = [string[]]@(
+                $records | ForEach-Object { $_.RelativePath }
+            )
+        }
+    }
+    finally {
+        if ($null -ne $rootHandle) {
+            $rootHandle.Dispose()
+        }
+    }
+}
+
+function Assert-AstroCudaLinkExpectedInventory {
+    param([Parameter(Mandatory)]$Inventory)
+
+    [string[]]$expected = @(Get-AstroCudaLinkSupportExpectedPaths)
+    [string[]]$actual = @($Inventory.RelativePaths)
+    [Array]::Sort($actual, [StringComparer]::Ordinal)
+    if ($expected.Count -ne $actual.Count) {
+        throw "payload path count differs from the exact contract (expected=$($expected.Count); observed=$($actual.Count))"
+    }
+    for ($index = 0; $index -lt $expected.Count; $index++) {
+        if ($expected[$index] -cne $actual[$index]) {
+            throw "payload path differs at index $index ('$($expected[$index])' != '$($actual[$index])')"
+        }
+    }
+}
+
+function Copy-CudaImportLibs {
+    param(
+        [Parameter(Mandatory)][string]$CudaLibRoot,
+        [Parameter(Mandatory)][string]$PayloadRoot
+    )
+
+    $outDir = Join-Path $PayloadRoot 'cuda-imports'
+    [AstroLauncherLockNative]::CreateDirectoryNoReplace($outDir)
+    $paths = [Collections.Generic.List[string]]::new()
+    foreach ($name in $CudaImportLibNames) {
+        $source = Join-Path $CudaLibRoot $name
+        Require-Path $source "required CUDA import library is missing"
+        $destination = Join-Path $outDir $name
+        Copy-Item `
+            -LiteralPath $source `
+            -Destination $destination `
+            -ErrorAction Stop
+        Require-Path $destination "copied stable CUDA import library is missing"
+        $paths.Add($destination)
+    }
+    return @($paths)
+}
+
+function Read-AstroCudaLinkSupportManifest {
+    param([Parameter(Mandatory)][string]$Path)
+
+    $lease = Open-AstroCudaLinkInputFile `
+        -Role 'bundle/manifest-read' `
+        -Path $Path
+    try {
+        if ($lease.LinkCount -ne 1) {
+            throw "manifest has $($lease.LinkCount) filesystem links; exactly one is required"
+        }
+        if ($lease.Length -gt
+            $script:AstroLauncherProtocolSnapshotMaxBytes) {
+            throw "manifest exceeds the $script:AstroLauncherProtocolSnapshotMaxBytes-byte safety limit"
+        }
+        $bytes = New-Object byte[] ([int]$lease.Length)
+        $lease.Stream.Position = 0
+        $offset = 0
+        while ($offset -lt $bytes.Length) {
+            $read = $lease.Stream.Read(
+                $bytes,
+                $offset,
+                $bytes.Length - $offset
+            )
+            if ($read -le 0) {
+                throw "manifest snapshot ended at byte $offset of $($bytes.Length)"
+            }
+            $offset += $read
+        }
+        $text = [Text.UTF8Encoding]::new($false, $true).GetString(
+            $bytes
+        )
+        if ($text.Length -gt 0 -and $text[0] -eq [char]0xfeff) {
+            throw 'UTF-8 BOM is not permitted'
+        }
+        $parsed = $text | ConvertFrom-Json
+    }
+    catch {
+        throw "manifest is not strict UTF-8 JSON: $($_.Exception.Message)"
+    }
+    finally {
+        [void](Close-AstroCudaLinkFileLeases @($lease))
+    }
+    return [pscustomobject]@{
+        Path = $lease.Path
+        FinalPath = $lease.FinalPath
+        FileId = $lease.FileId
+        LinkCount = $lease.LinkCount
+        Length = $lease.Length
+        Sha256 = Get-AstroByteSha256 $bytes
+        Bytes = $bytes
+        Parsed = $parsed
+    }
+}
+
+function Assert-AstroCudaLinkSupportRoot {
+    param(
+        [Parameter(Mandatory)][string]$BundleRoot,
+        [Parameter(Mandatory)][string]$ExpectedInputDigest,
+        [Parameter(Mandatory)][string]$ExpectedContractSha256,
+        [AllowNull()][string]$ExpectedContractText,
+        [AllowNull()]$ExpectedSourceFiles
+    )
+
+    $root = [IO.Path]::GetFullPath($BundleRoot).TrimEnd('\', '/')
+    $state = Get-AstroPathEntryState $root
+    if ($state.State -cne 'present' -or
+        ($state.Attributes -band [IO.FileAttributes]::Directory) -eq 0 -or
+        ($state.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw "bundle root is not one ordinary non-reparse directory (state=$($state.State); attributes=$($state.Attributes); error=$($state.Error)): $root"
+    }
+    $expectedLeaf = "$CudaLinkSupportRootPrefix$ExpectedInputDigest"
+    if ([IO.Path]::GetFileName($root) -cne $expectedLeaf) {
+        throw "bundle leaf does not bind the expected input digest: expected=$expectedLeaf; observed=$([IO.Path]::GetFileName($root))"
+    }
+    $rootItems = @(
+        Get-ChildItem -LiteralPath $root -Force -ErrorAction Stop
+    )
+    [string[]]$rootNames = @($rootItems | ForEach-Object { $_.Name })
+    [Array]::Sort($rootNames, [StringComparer]::Ordinal)
+    [string[]]$expectedRootNames = @(
+        $CudaLinkSupportManifestName,
+        $CudaLinkSupportPayloadName
+    )
+    [Array]::Sort($expectedRootNames, [StringComparer]::Ordinal)
+    if ($rootNames.Count -ne 2 -or
+        $rootNames[0] -cne $expectedRootNames[0] -or
+        $rootNames[1] -cne $expectedRootNames[1]) {
+        throw "bundle root entries differ from the exact manifest+payload contract: $($rootNames -join ',')"
+    }
+    foreach ($item in $rootItems) {
+        if (($item.Attributes -band
+                [IO.FileAttributes]::ReparsePoint) -ne 0) {
+            throw "bundle root contains an unsupported reparse entry: $($item.FullName)"
+        }
+    }
+    $manifestPath = Join-Path $root $CudaLinkSupportManifestName
+    $manifest = Read-AstroCudaLinkSupportManifest $manifestPath
+    $parsed = $manifest.Parsed
+    if ($parsed.schema -cne $CudaLinkSupportSchema -or
+        $parsed.input_digest -cne $ExpectedInputDigest -or
+        $parsed.input_contract_sha256 -cne
+            $ExpectedContractSha256) {
+        throw "manifest schema/input contract mismatch (schema=$($parsed.schema); digest=$($parsed.input_digest); contract_sha256=$($parsed.input_contract_sha256))"
+    }
+    $observedContractText =
+        $parsed.input_contract | ConvertTo-Json -Compress -Depth 12
+    $observedContractSha256 =
+        Get-AstroUtf8Sha256 $observedContractText
+    if ($parsed.input_digest -cne $observedContractSha256 -or
+        $parsed.input_contract_sha256 -cne $observedContractSha256 -or
+        $parsed.input_contract.schema -cne $CudaLinkSupportInputSchema) {
+        throw "manifest input contract bytes are not self-authenticating (schema=$($parsed.input_contract.schema); digest=$($parsed.input_digest); contract_sha256=$($parsed.input_contract_sha256); observed_sha256=$observedContractSha256)"
+    }
+    if (-not [string]::IsNullOrEmpty($ExpectedContractText) -and
+        $observedContractText -cne $ExpectedContractText) {
+        throw 'manifest input contract bytes differ from the retained current-input contract'
+    }
+    $contractFiles = @($parsed.input_contract.files)
+    $sourceFiles = @($parsed.source_files)
+    if ($contractFiles.Count -eq 0 -or
+        $sourceFiles.Count -ne $contractFiles.Count) {
+        throw "manifest source-file attribution count differs from its input contract (contract=$($contractFiles.Count); sources=$($sourceFiles.Count))"
+    }
+    $roles = [Collections.Generic.HashSet[string]]::new(
+        [StringComparer]::Ordinal
+    )
+    for ($index = 0; $index -lt $contractFiles.Count; $index++) {
+        $contractFile = $contractFiles[$index]
+        $sourceFile = $sourceFiles[$index]
+        if ([string]::IsNullOrWhiteSpace([string]$contractFile.role) -or
+            -not $roles.Add([string]$contractFile.role) -or
+            [string]::IsNullOrWhiteSpace([string]$contractFile.source_path) -or
+            [string]$contractFile.sha256 -cnotmatch '^[0-9a-f]{64}$' -or
+            [uint64]$contractFile.length -eq 0 -or
+            [string]$sourceFile.role -cne [string]$contractFile.role -or
+            [string]$sourceFile.source_path -cne
+                [string]$contractFile.source_path -or
+            -not [string]::Equals(
+                [string]$sourceFile.final_path,
+                [string]$contractFile.source_path,
+                [StringComparison]::OrdinalIgnoreCase
+            ) -or
+            [uint64]$sourceFile.length -ne [uint64]$contractFile.length -or
+            [string]$sourceFile.sha256 -cne [string]$contractFile.sha256 -or
+            [string]$sourceFile.file_id -cnotmatch
+                '^[0-9a-f]{16}:[0-9a-f]{32}$' -or
+            [uint64]$sourceFile.link_count -eq 0) {
+            throw "manifest source-file attribution differs from input contract at index $index (role=$($contractFile.role))"
+        }
+    }
+    if ([int]$parsed.publisher.pid -le 0 -or
+        [long]$parsed.publisher.process_start_utc_ticks -le 0 -or
+        [int]$parsed.publisher.issue -le 0 -or
+        [string]$parsed.publisher.launcher_lock_sha256 -cnotmatch
+            '^[0-9a-f]{64}$') {
+        throw 'manifest publisher does not bind one positive exact launcher identity, issue, and lock hash'
+    }
+    if ($null -ne $ExpectedSourceFiles) {
+        $expectedSourceText =
+            @($ExpectedSourceFiles) |
+                ConvertTo-Json -Compress -Depth 8
+        $observedSourceText =
+            @($sourceFiles) |
+                ConvertTo-Json -Compress -Depth 8
+        if ($observedSourceText -cne $expectedSourceText) {
+            throw 'manifest source-file identities differ from the retained current-input generations'
+        }
+    }
+    if ([string]$parsed.bundle.root_leaf -cne $expectedLeaf) {
+        throw "manifest root leaf does not equal its content-addressed namespace: $($parsed.bundle.root_leaf)"
+    }
+    $rootHandle = $null
+    try {
+        $rootHandle =
+            [AstroLauncherTempNative]::OpenExactDirectoryIdentity($root)
+        $rootFileId =
+            [AstroLauncherTempNative]::GetExactDirectoryIdentity($rootHandle)
+    }
+    finally {
+        if ($null -ne $rootHandle) { $rootHandle.Dispose() }
+    }
+    if ($rootFileId -cne [string]$parsed.bundle.root_file_id) {
+        throw "bundle root FILE_ID differs from manifest (expected=$($parsed.bundle.root_file_id); observed=$rootFileId)"
+    }
+    $payloadRoot = Join-Path $root $CudaLinkSupportPayloadName
+    $inventory = Get-AstroCudaLinkSupportInventory $payloadRoot
+    Assert-AstroCudaLinkExpectedInventory $inventory
+    [string[]]$manifestExactEntries = @(
+        $parsed.payload.exact_entries | ForEach-Object { [string]$_ }
+    )
+    $exactRootEqual =
+        [AstroLauncherTempNative]::ExactRootStateEqualIgnoringLastAccessTime(
+            [string]$parsed.payload.exact_root_state,
+            [string]$inventory.ExactRootState
+        )
+    $exactEntriesEqual =
+        [AstroLauncherTempNative]::ExactTreeEntriesEqualIgnoringLastAccessTime(
+            $manifestExactEntries,
+            [string[]]$inventory.ExactEntries
+        )
+    if ($inventory.RootFileId -cne
+            [string]$parsed.payload.root_file_id -or
+        $inventory.EntryCount -ne [int]$parsed.payload.entry_count -or
+        $inventory.TotalBytes -ne [uint64]$parsed.payload.total_bytes -or
+        $inventory.ContentSha256 -cne
+            [string]$parsed.payload.content_sha256 -or
+        $inventory.IdentitySha256 -cne
+            [string]$parsed.payload.identity_sha256 -or
+        -not $exactRootEqual -or
+        -not $exactEntriesEqual) {
+        throw "payload bytes/identity/exact inventory differ from manifest: root_file_id=$($inventory.RootFileId); entries=$($inventory.EntryCount); bytes=$($inventory.TotalBytes); content_sha256=$($inventory.ContentSha256); identity_sha256=$($inventory.IdentitySha256); exact_inventory_sha256=$($inventory.ExactInventorySha256)"
+    }
+    return [pscustomobject]@{
+        Root = $root
+        RootFileId = $rootFileId
+        PayloadRoot = $payloadRoot
+        ManifestPath = $manifestPath
+        ManifestSha256 = $manifest.Sha256
+        ManifestLength = $manifest.Length
+        InputDigest = $ExpectedInputDigest
+        InputContractText = $observedContractText
+        SourceFiles = @($sourceFiles)
+        Inventory = $inventory
+        RuntimeSupport = Join-Path `
+            $payloadRoot `
+            'cuda-msvc-runtime-support'
+        VcStartupSupport = Join-Path `
+            $payloadRoot `
+            'cuda-msvc-vcstartup-support'
+        RuntimeImports = Join-Path `
+            $payloadRoot `
+            'cuda-msvc-runtime-imports'
+        UcrtImports = Join-Path `
+            $payloadRoot `
+            'cuda-windowskit-ucrt-import'
+        CudaImports = Join-Path $payloadRoot 'cuda-imports'
+    }
+}
+
+function Open-AstroCudaLinkSupportRuntimeLease {
+    param([Parameter(Mandatory)]$Bundle)
+
+    $rootHandle = $null
+    $payloadHandle = $null
+    $fileLeases = [Collections.Generic.List[object]]::new()
+    try {
+        $rootHandle =
+            [AstroLauncherTempNative]::OpenExactLiveDirectoryLease(
+                $Bundle.Root
+            )
+        $payloadHandle =
+            [AstroLauncherTempNative]::OpenExactLiveDirectoryLease(
+                $Bundle.PayloadRoot
+            )
+        foreach ($record in @(
+                $Bundle.Inventory.Records |
+                    Where-Object { $_.Kind -ceq 'file' }
+            )) {
+            $path = Join-Path `
+                $Bundle.PayloadRoot `
+                ($record.RelativePath.Replace(
+                        '/',
+                        [IO.Path]::DirectorySeparatorChar
+                    ))
+            $stream = [IO.File]::Open(
+                $path,
+                [IO.FileMode]::Open,
+                [IO.FileAccess]::Read,
+                [IO.FileShare]::Read
+            )
+            $fileLeases.Add([pscustomobject]@{
+                    Role = "bundle/$($record.RelativePath)"
+                    Path = $path
+                    FinalPath = $path
+                    FileId = $record.FileId
+                    LinkCount = 1
+                    Length = $record.Length
+                    Sha256 = $record.Sha256
+                    Stream = $stream
+                })
+        }
+        $manifestLease = Open-AstroCudaLinkInputFile `
+            -Role 'bundle/manifest' `
+            -Path $Bundle.ManifestPath
+        $fileLeases.Add($manifestLease)
+        foreach ($lease in $fileLeases) {
+            Assert-AstroCudaLinkInputFileStable $lease
+        }
+        $runtimeLease = [pscustomobject]@{
+            Bundle = $Bundle
+            RootHandle = $rootHandle
+            PayloadHandle = $payloadHandle
+            FileLeases = @($fileLeases)
+            Closed = $false
+        }
+        [void](Assert-AstroCudaLinkSupportRuntimeLease $runtimeLease)
+        return $runtimeLease
+    }
+    catch {
+        [void](Close-AstroCudaLinkFileLeases $fileLeases)
+        if ($null -ne $payloadHandle) { $payloadHandle.Dispose() }
+        if ($null -ne $rootHandle) { $rootHandle.Dispose() }
+        throw
+    }
+}
+
+function Assert-AstroCudaLinkSupportRuntimeLease {
+    param([Parameter(Mandatory)]$Lease)
+
+    if ($Lease.Closed -or
+        $null -eq $Lease.RootHandle -or
+        $Lease.RootHandle.IsClosed -or
+        $null -eq $Lease.PayloadHandle -or
+        $Lease.PayloadHandle.IsClosed) {
+        throw 'CUDA link-support runtime lease is not live'
+    }
+    $rootFileId =
+        [AstroLauncherTempNative]::GetExactDirectoryIdentity(
+            $Lease.RootHandle
+        )
+    $payloadFileId =
+        [AstroLauncherTempNative]::GetExactDirectoryIdentity(
+            $Lease.PayloadHandle
+        )
+    if ($rootFileId -cne $Lease.Bundle.RootFileId -or
+        $payloadFileId -cne $Lease.Bundle.Inventory.RootFileId) {
+        throw "retained bundle directory identity changed (root=$rootFileId; payload=$payloadFileId)"
+    }
+    foreach ($fileLease in $Lease.FileLeases) {
+        Assert-AstroCudaLinkInputFileStable $fileLease
+    }
+    $validated = Assert-AstroCudaLinkSupportRoot `
+        -BundleRoot $Lease.Bundle.Root `
+        -ExpectedInputDigest $Lease.Bundle.InputDigest `
+        -ExpectedContractSha256 (
+            [string]$Lease.Bundle.InputContractSha256
+        ) `
+        -ExpectedContractText $Lease.Bundle.InputContractText `
+        -ExpectedSourceFiles $Lease.Bundle.SourceFiles
+    $runtimeExactRootEqual =
+        [AstroLauncherTempNative]::ExactRootStateEqualIgnoringLastAccessTime(
+            [string]$validated.Inventory.ExactRootState,
+            [string]$Lease.Bundle.Inventory.ExactRootState
+        )
+    $runtimeExactEntriesEqual =
+        [AstroLauncherTempNative]::ExactTreeEntriesEqualIgnoringLastAccessTime(
+            [string[]]$validated.Inventory.ExactEntries,
+            [string[]]$Lease.Bundle.Inventory.ExactEntries
+        )
+    if ($validated.ManifestSha256 -cne
+            $Lease.Bundle.ManifestSha256 -or
+        $validated.Inventory.ContentSha256 -cne
+            $Lease.Bundle.Inventory.ContentSha256 -or
+        $validated.Inventory.IdentitySha256 -cne
+            $Lease.Bundle.Inventory.IdentitySha256 -or
+        -not $runtimeExactRootEqual -or
+        -not $runtimeExactEntriesEqual) {
+        throw 'retained bundle changed across the child-command window'
+    }
+    return $validated
+}
+
+function Close-AstroCudaLinkSupportRuntimeLease {
+    param([Parameter(Mandatory)]$Lease)
+
+    if ($Lease.Closed) { return 0 }
+    $closed = Close-AstroCudaLinkFileLeases $Lease.FileLeases
+    if ($null -ne $Lease.PayloadHandle -and
+        -not $Lease.PayloadHandle.IsClosed) {
+        $Lease.PayloadHandle.Dispose()
+        $closed++
+    }
+    if ($null -ne $Lease.RootHandle -and
+        -not $Lease.RootHandle.IsClosed) {
+        $Lease.RootHandle.Dispose()
+        $closed++
+    }
+    $Lease.Closed = $true
+    return $closed
+}
+
+function Resolve-AstroCudaLinkSupportBundle {
+    param(
+        [Parameter(Mandatory)][string]$ToolsRoot,
+        [Parameter(Mandatory)][string]$MsvcLibRoot,
+        [Parameter(Mandatory)][string]$LlvmBin
+    )
+
+    $cudaLibRoot = Resolve-CudaToolkitLibRoot
+    $inputs = New-AstroCudaLinkInputContext `
+        -MsvcLibRoot $MsvcLibRoot `
+        -LlvmBin $LlvmBin `
+        -CudaLibRoot $cudaLibRoot
+    $mutexLease = $null
+    $stageHandle = $null
+    $toolsHandle = $null
+    try {
+        $mutexLease = Enter-AstroCuda13RetirementMutex $ExpectedWorkspace
+        if (-not $mutexLease.Acquired) {
+            throw "CUDA_LINK_SUPPORT[ASTRO_CUDA_LINK_MUTEX_BUSY]: {code=ASTRO_CUDA_LINK_MUTEX_BUSY; message=`"shared CUDA mutation mutex $($mutexLease.Name) is held by another exact session`"; remediation=`"wait for that bounded shared-toolchain operation and retry`"}"
+        }
+        Assert-AstroCuda13RetirementAdmissionOpen `
+            -CanonicalWorkspaceRoot $ExpectedWorkspace
+
+        $matching = @(
+            Get-ChildItem `
+                -LiteralPath $ToolsRoot `
+                -Directory `
+                -Force `
+                -ErrorAction Stop |
+                Where-Object {
+                    $_.Name.StartsWith(
+                        '.cuda-msvc-link-support-v1',
+                        [StringComparison]::Ordinal
+                    ) -or
+                    $_.Name.StartsWith(
+                        $CudaLinkSupportRootPrefix,
+                        [StringComparison]::Ordinal
+                    )
+                }
+        )
+        $partial = @(
+            $matching | Where-Object {
+                $_.Name.StartsWith(
+                    $CudaLinkSupportStagePrefix,
+                    [StringComparison]::Ordinal
+                )
+            }
+        )
+        if ($partial.Count -ne 0) {
+            throw "CUDA_LINK_SUPPORT[ASTRO_CUDA_LINK_PARTIAL_STAGE]: {code=ASTRO_CUDA_LINK_PARTIAL_STAGE; message=`"one or more interrupted private stages are present and were preserved: $(@($partial.FullName) -join '; ')`"; remediation=`"inspect and hash the exact stages, prove no launcher owns them, then remove only those exact invalid stages before retrying`"}"
+        }
+        $unexpected = @(
+            $matching | Where-Object {
+                $_.Name -cnotmatch (
+                    '^' + [regex]::Escape($CudaLinkSupportRootPrefix) +
+                    '[0-9a-f]{64}$'
+                )
+            }
+        )
+        if ($unexpected.Count -ne 0) {
+            throw "CUDA_LINK_SUPPORT[ASTRO_CUDA_LINK_NAMESPACE_INVALID]: {code=ASTRO_CUDA_LINK_NAMESPACE_INVALID; message=`"unexpected shared CUDA link-support namespace entries were preserved: $(@($unexpected.FullName) -join '; ')`"; remediation=`"inspect the exact entries and remove/quarantine only state not owned by a live launcher before retrying`"}"
+        }
+        $historicalRoots = @(
+            $matching | Where-Object {
+                $_.Name -cmatch (
+                    '^' + [regex]::Escape($CudaLinkSupportRootPrefix) +
+                    '[0-9a-f]{64}$'
+                )
+            }
+        )
+        foreach ($historicalRoot in $historicalRoots) {
+            try {
+                $historicalManifest = Read-AstroCudaLinkSupportManifest (
+                    Join-Path `
+                        $historicalRoot.FullName `
+                        $CudaLinkSupportManifestName
+                )
+                $historicalDigest =
+                    [string]$historicalManifest.Parsed.input_digest
+                $historicalContractSha256 =
+                    [string]$historicalManifest.Parsed.input_contract_sha256
+                if ($historicalDigest -cnotmatch '^[0-9a-f]{64}$' -or
+                    $historicalContractSha256 -cnotmatch
+                        '^[0-9a-f]{64}$') {
+                    throw 'manifest input digest/contract hash is not canonical lowercase SHA-256'
+                }
+                [void](Assert-AstroCudaLinkSupportRoot `
+                        -BundleRoot $historicalRoot.FullName `
+                        -ExpectedInputDigest $historicalDigest `
+                        -ExpectedContractSha256 $historicalContractSha256 `
+                        -ExpectedContractText $null `
+                        -ExpectedSourceFiles $null)
+            }
+            catch {
+                throw "CUDA_LINK_SUPPORT[ASTRO_CUDA_LINK_HISTORICAL_INVALID]: {code=ASTRO_CUDA_LINK_HISTORICAL_INVALID; message=`"historical content-addressed root is malformed or changed and was preserved: $($historicalRoot.FullName); $($_.Exception.Message)`"; remediation=`"prove no live launcher owns the exact root, inventory and hash it, then use the shared CUDA mutation mutex to retire or quarantine only that root`"}"
+            }
+        }
+
+        $bundleLeaf = "$CudaLinkSupportRootPrefix$($inputs.InputDigest)"
+        $bundleRoot = Join-Path $ToolsRoot $bundleLeaf
+        $bundleState = Get-AstroPathEntryState $bundleRoot
+        $published = $false
+        if ($bundleState.State -eq 'absent') {
+            $stageLeaf = "$CudaLinkSupportStagePrefix$([guid]::NewGuid().ToString('N'))"
+            $stageRoot = Join-Path $ToolsRoot $stageLeaf
+            [AstroLauncherLockNative]::CreateDirectoryNoReplace($stageRoot)
+            $stageHandle =
+                [AstroLauncherTempNative]::OpenExactLiveDirectoryLease(
+                    $stageRoot
+                )
+            $stageRootFileId =
+                [AstroLauncherTempNative]::GetExactDirectoryIdentity(
+                    $stageHandle
+                )
+            $payloadRoot = Join-Path `
+                $stageRoot `
+                $CudaLinkSupportPayloadName
+            [AstroLauncherLockNative]::CreateDirectoryNoReplace($payloadRoot)
+
+            [void](Expand-MsvcRuntimeSupportObjects `
+                    -MsvcLibRoot $MsvcLibRoot `
+                    -LlvmBin $LlvmBin `
+                    -WorkspaceTemp $payloadRoot)
+            [void](Expand-MsvcVcStartupSupportObjects `
+                    -MsvcLibRoot $MsvcLibRoot `
+                    -LlvmBin $LlvmBin `
+                    -WorkspaceTemp $payloadRoot)
+            [void](Copy-MsvcRuntimeImportLibs `
+                    -MsvcLibRoot $MsvcLibRoot `
+                    -WorkspaceTemp $payloadRoot)
+            [void](Copy-UcrtImportLib -WorkspaceTemp $payloadRoot)
+            [void](Copy-CudaImportLibs `
+                    -CudaLibRoot $cudaLibRoot `
+                    -PayloadRoot $payloadRoot)
+            foreach ($inputLease in $inputs.Leases) {
+                Assert-AstroCudaLinkInputFileStable $inputLease
+            }
+
+            $inventory = Get-AstroCudaLinkSupportInventory $payloadRoot
+            Assert-AstroCudaLinkExpectedInventory $inventory
+            $manifest = [ordered]@{
+                schema = $CudaLinkSupportSchema
+                input_digest = $inputs.InputDigest
+                input_contract_sha256 = $inputs.ContractSha256
+                input_contract = $inputs.Contract
+                source_files = @($inputs.SourceFiles)
+                publisher = [ordered]@{
+                    pid = $PID
+                    process_start_utc_ticks =
+                        $launcherProcessStartUtcTicks
+                    issue = $drivingIssue
+                    launcher_lock_sha256 = $launcherLockSha256
+                }
+                bundle = [ordered]@{
+                    root_leaf = $bundleLeaf
+                    root_file_id = $stageRootFileId
+                }
+                payload = [ordered]@{
+                    root_file_id = $inventory.RootFileId
+                    entry_count = $inventory.EntryCount
+                    total_bytes = $inventory.TotalBytes
+                    content_sha256 = $inventory.ContentSha256
+                    identity_sha256 = $inventory.IdentitySha256
+                    exact_inventory_sha256 =
+                        $inventory.ExactInventorySha256
+                    exact_root_state = $inventory.ExactRootState
+                    exact_entries = @($inventory.ExactEntries)
+                }
+            }
+            $manifestText =
+                ($manifest | ConvertTo-Json -Compress -Depth 14) + "`n"
+            $manifestPath = Join-Path `
+                $stageRoot `
+                $CudaLinkSupportManifestName
+            Write-NewDurableUtf8File `
+                -LiteralPath $manifestPath `
+                -Text $manifestText
+            $manifestReadback =
+                Read-AstroCudaLinkSupportManifest $manifestPath
+            $expectedManifestBytes =
+                [Text.UTF8Encoding]::new($false, $true).GetBytes(
+                    $manifestText
+                )
+            if ($manifestReadback.Length -ne
+                    $expectedManifestBytes.LongLength -or
+                [Convert]::ToBase64String($manifestReadback.Bytes) -cne
+                    [Convert]::ToBase64String($expectedManifestBytes)) {
+                throw 'durable staged manifest differs from intended bytes'
+            }
+
+            $toolsHandle =
+                [AstroLauncherTempNative]::OpenExactDirectoryIdentity(
+                    $ToolsRoot
+                )
+            [AstroLauncherTempNative]::RenameExactDirectoryNoReplace(
+                $stageHandle,
+                $toolsHandle,
+                $bundleLeaf
+            )
+            $stageState = Get-AstroPathEntryState $stageRoot
+            $finalState = Get-AstroPathEntryState $bundleRoot
+            $finalPath = [IO.Path]::GetFullPath(
+                [AstroLauncherTempNative]::GetExactDirectoryFinalPath(
+                    $stageHandle
+                )
+            ).TrimEnd('\', '/')
+            if ($stageState.State -cne 'absent' -or
+                $finalState.State -cne 'present' -or
+                -not [string]::Equals(
+                    $finalPath,
+                    $bundleRoot,
+                    [StringComparison]::OrdinalIgnoreCase
+                ) -or
+                [AstroLauncherTempNative]::GetExactDirectoryIdentity(
+                    $stageHandle
+                ) -cne $stageRootFileId) {
+                throw "atomic bundle publication failed exact source/final/FILE_ID readback (stage=$($stageState.State); final=$($finalState.State); final_path=$finalPath)"
+            }
+            $published = $true
+        }
+        elseif ($bundleState.State -ne 'present') {
+            throw "CUDA_LINK_SUPPORT[ASTRO_CUDA_LINK_ROOT_UNEVALUABLE]: {code=ASTRO_CUDA_LINK_ROOT_UNEVALUABLE; message=`"expected content-addressed root state is $($bundleState.State): $bundleRoot; $($bundleState.Error)`"; remediation=`"preserve the state and repair filesystem observability before retrying`"}"
+        }
+
+        $validated = Assert-AstroCudaLinkSupportRoot `
+            -BundleRoot $bundleRoot `
+            -ExpectedInputDigest $inputs.InputDigest `
+            -ExpectedContractSha256 $inputs.ContractSha256 `
+            -ExpectedContractText $inputs.ContractText `
+            -ExpectedSourceFiles $inputs.SourceFiles
+        $validated | Add-Member `
+            -NotePropertyName InputContractSha256 `
+            -NotePropertyValue $inputs.ContractSha256
+        $validated | Add-Member `
+            -NotePropertyName Published `
+            -NotePropertyValue $published
+        $historicalCount = @(
+            $historicalRoots | Where-Object {
+                $_.Name -cne $bundleLeaf -and
+                $_.Name -cmatch (
+                    '^' + [regex]::Escape($CudaLinkSupportRootPrefix) +
+                    '[0-9a-f]{64}$'
+                )
+            }
+        ).Count
+        $retirementSelf = [pscustomobject]@{
+            Pid = $PID
+            OwnerProcessStartUtcTicks =
+                $launcherProcessStartUtcTicks
+            Issue = $drivingIssue
+            LockPath = $launcherLock
+            LockSha256 = $launcherLockSha256
+        }
+        $retirement =
+            Remove-AstroObsoleteCudaBundleRoots `
+                -ToolchainsRoot $ToolsRoot `
+                -RootPrefix (
+                    $CudaLinkSupportRootPrefix.TrimEnd('-')
+                ) `
+                -ActiveDigest $inputs.InputDigest `
+                -WorkspaceRoot $ExpectedWorkspace `
+                -GitExe $evidenceGitExe `
+                -DrivingIssue $drivingIssue `
+                -CallerSelf $retirementSelf
+        if ($retirement.State -cne 'completed' -or
+            $retirement.InitialCandidateCount -ne
+                $historicalCount -or
+            $retirement.RetiredCount -ne $historicalCount) {
+            throw "CUDA_LINK_SUPPORT[ASTRO_CUDA_LINK_RETIRE_RESULT]: {code=ASTRO_CUDA_LINK_RETIRE_RESULT; message=`"serialized retirement result differs from the validated historical-root inventory (state=$($retirement.State); expected=$historicalCount; candidates=$($retirement.InitialCandidateCount); retired=$($retirement.RetiredCount))`"; remediation=`"preserve every root and retirement record; inspect the exact inventory/transition evidence before retrying`"}"
+        }
+        $historicalCount = 0
+        Write-Host "CUDA_LINK_SUPPORT[ASTRO_CUDA_LINK_RETIREMENT_ATTESTED]: active_digest=$($inputs.InputDigest); retired=$($retirement.RetiredCount); final_inventory_sha256=$($retirement.FinalInventorySha256); transition=$($retirement.TransitionTransactionId); every obsolete root disposition has durable intent/completion readback"
+        Write-Host "CUDA_LINK_SUPPORT[ASTRO_CUDA_LINK_BUNDLE_ATTESTED]: root=$($validated.Root); input_digest=$($validated.InputDigest); manifest_sha256=$($validated.ManifestSha256); payload_content_sha256=$($validated.Inventory.ContentSha256); payload_identity_sha256=$($validated.Inventory.IdentitySha256); payload_exact_observation_sha256=$($validated.Inventory.ExactInventorySha256); exact_metadata_equal_ignoring_last_access=true; entries=$($validated.Inventory.EntryCount); bytes=$($validated.Inventory.TotalBytes); published=$published; historical_roots=$historicalCount; mutex=$($mutexLease.Name)"
+        return $validated
+    }
+    finally {
+        if ($null -ne $toolsHandle) { $toolsHandle.Dispose() }
+        if ($null -ne $stageHandle) { $stageHandle.Dispose() }
+        if ($null -ne $mutexLease) {
+            Exit-AstroCuda13RetirementMutex $mutexLease
+        }
+        [void](Close-AstroCudaLinkFileLeases $inputs.Leases)
+    }
+}
+
 function Get-CudaToolkitExactTargetIdentity {
     param([Parameter(Mandatory)][string]$Target)
 
@@ -2603,6 +3766,7 @@ function New-CudaToolkitNoSpaceView {
 
 function Set-CudaMsvcRuntimeLinkEnvironment {
     param(
+        [Parameter(Mandatory)][string]$ToolsRoot,
         [Parameter(Mandatory)][string]$LlvmBin,
         [Parameter(Mandatory)][string]$WorkspaceTemp
     )
@@ -2612,11 +3776,41 @@ function Set-CudaMsvcRuntimeLinkEnvironment {
     }
 
     $libRoot = Resolve-MsvcLibRootFromCudaCcbin -Ccbin $env:FORGE_CUDA_CCBIN
-    $supportObjects = Expand-MsvcRuntimeSupportObjects -MsvcLibRoot $libRoot -LlvmBin $LlvmBin -WorkspaceTemp $WorkspaceTemp
-    $vcStartupObjects = Expand-MsvcVcStartupSupportObjects -MsvcLibRoot $libRoot -LlvmBin $LlvmBin -WorkspaceTemp $WorkspaceTemp
-    $importLibs = Copy-MsvcRuntimeImportLibs -MsvcLibRoot $libRoot -WorkspaceTemp $WorkspaceTemp
-    $ucrtImportLib = Copy-UcrtImportLib -WorkspaceTemp $WorkspaceTemp
-    $cudaImportLibDir = New-CudaToolkitNoSpaceView -WorkspaceTemp $WorkspaceTemp
+    if ($null -ne $script:cudaLinkSupportLease) {
+        throw 'CUDA_LINK_SUPPORT[ASTRO_CUDA_LINK_LEASE_DUPLICATE]: one launcher generation cannot acquire more than one stable link-support lease'
+    }
+    $bundle = Resolve-AstroCudaLinkSupportBundle `
+        -ToolsRoot $ToolsRoot `
+        -MsvcLibRoot $libRoot `
+        -LlvmBin $LlvmBin
+    $script:cudaLinkSupportLease =
+        Open-AstroCudaLinkSupportRuntimeLease -Bundle $bundle
+    $supportObjects = @(
+        $MsvcRuntimeSupportMembers |
+            ForEach-Object {
+                Join-Path $bundle.RuntimeSupport $_
+            }
+    )
+    $vcStartupObjects = @(
+        $MsvcVcStartupSupportMembers |
+            ForEach-Object {
+                Join-Path $bundle.VcStartupSupport $_
+            }
+    )
+    $importLibs = @(
+        $MsvcRuntimeImportLibNames |
+            ForEach-Object {
+                Join-Path $bundle.RuntimeImports $_
+            }
+    )
+    $ucrtImportLib = Join-Path `
+        $bundle.UcrtImports `
+        $WindowsKitUcrtImportLibName
+    $cudaImportLibDir = $bundle.CudaImports
+    # CUDA discovery and nvcc still require the generation-bound no-space view.
+    # It is exact-manifested and torn down under #707, but it is deliberately
+    # absent from every compiler flag and cache key.
+    [void](New-CudaToolkitNoSpaceView -WorkspaceTemp $WorkspaceTemp)
     $pinnedLld = Assert-GccResolvesPinnedLld -GccExe $env:CC -LlvmBin $LlvmBin -ScratchDir $WorkspaceTemp
     $lldPrefix = ($LlvmBin.TrimEnd('\', '/')) + '\'
     $rustFlagTokens = @(
@@ -2639,7 +3833,7 @@ function Set-CudaMsvcRuntimeLinkEnvironment {
     $rustFlagTokens += @("-C", "link-arg=$ucrtImportLib")
     $rustFlagTokens += @("-C", "link-arg=-lkernel32")
     Add-Rustflags -Tokens $rustFlagTokens
-    Write-Output "CUDA_MSVC_RUNTIME_LINK[ASTRO_CUDA_MSVC_SUPPORT_OBJECTS]: verified pinned LLD at $pinnedLld; extracted $($supportObjects.Count) support object(s) from $MsvcRuntimeArchiveName, $($vcStartupObjects.Count) support object(s) from $MsvcVcStartupArchiveName, copied $($importLibs.Count + 1) MSVC/UCRT import lib(s), copied $($CudaImportLibNames.Count) CUDA import lib(s), set CUDA_PATH to no-space view $env:CUDA_PATH, and enabled MSVC defaultlib suppression under $WorkspaceTemp"
+    Write-Output "CUDA_MSVC_RUNTIME_LINK[ASTRO_CUDA_MSVC_SUPPORT_OBJECTS]: verified pinned LLD at $pinnedLld; stable_bundle=$($bundle.Root); input_digest=$($bundle.InputDigest); manifest_sha256=$($bundle.ManifestSha256); payload_content_sha256=$($bundle.Inventory.ContentSha256); bound $($supportObjects.Count) support object(s) from $MsvcRuntimeArchiveName, $($vcStartupObjects.Count) support object(s) from $MsvcVcStartupArchiveName, $($importLibs.Count + 1) MSVC/UCRT import lib(s), and $($CudaImportLibNames.Count) CUDA import lib(s); generation TEMP appears only in exact CUDA discovery view $env:CUDA_PATH"
 }
 
 function Set-ToolchainEnvironment {
@@ -2902,6 +4096,12 @@ public class AstroTreeRecorder {
     // treats it as open provenance and still consults the exact kernel Job).
     readonly Dictionary<int, List<long[]>> pidIntervals = new Dictionary<int, List<long[]>>();
     readonly object gate = new object();
+    // Manifest bytes and the manifest namespace are one shared resource.  The state
+    // gate protects the in-memory snapshot only; this count-one gate spans the complete
+    // destination-CAS publication and any consumer operation that must observe a
+    // quiescent final path.  SemaphoreSlim is intentionally non-thread-affine because
+    // PowerShell acquires and disposes the consumer lease through separate CLR calls.
+    readonly SemaphoreSlim manifestPublicationGate = new SemaphoreSlim(1, 1);
     string manifestPath;
     int launcherPid;
     long launcherProcessStartUtcTicks;
@@ -2914,6 +4114,7 @@ public class AstroTreeRecorder {
     long lastTimestampNs;
     byte[] lastManifestBytes;
     string lastManifestFileIdentity;
+    const int RECORDER_BARRIER_TIMEOUT_SECONDS = 30;
     static readonly long UnixEpochTicks = new DateTime(
         1970, 1, 1, 0, 0, 0, DateTimeKind.Utc
     ).Ticks;
@@ -3081,7 +4282,7 @@ public class AstroTreeRecorder {
             r.thread.IsBackground = true;
             r.thread.Name = "Astrolabe exact tree attribution recorder";
             r.thread.Start();
-            if (!r.workerReady.Wait(TimeSpan.FromSeconds(30)))
+            if (!r.workerReady.Wait(TimeSpan.FromSeconds(RECORDER_BARRIER_TIMEOUT_SECONDS)))
                 throw new TimeoutException("tree-attribution worker did not reach its startup barrier");
             r.ThrowIfWorkerFaulted();
             return r;
@@ -3091,7 +4292,7 @@ public class AstroTreeRecorder {
             if (r.thread != null && r.thread.IsAlive) {
                 if (!PostQueuedCompletionStatus(r.port, STOP_SENTINEL, UIntPtr.Zero, IntPtr.Zero))
                     faults.Add(new Win32Exception(Marshal.GetLastWin32Error(), "could not post startup-failure stop sentinel"));
-                if (!r.thread.Join(TimeSpan.FromSeconds(30)))
+                if (!r.thread.Join(TimeSpan.FromSeconds(RECORDER_BARRIER_TIMEOUT_SECONDS)))
                     faults.Add(new TimeoutException("tree-attribution worker did not terminate after startup failure"));
             }
             if (r.port != IntPtr.Zero && !CloseHandle(r.port))
@@ -3848,81 +5049,94 @@ public class AstroTreeRecorder {
     }
 
     void Flush() {
-        List<KeyValuePair<int, List<long[]>>> snap = new List<KeyValuePair<int, List<long[]>>>();
-        long flushNs;
-        byte[] previousBytes;
-        string previousIdentity;
-        lock (gate) {
-            foreach (KeyValuePair<int, List<long[]>> entry in pidIntervals) {
-                List<long[]> copy = new List<long[]>();
-                foreach (long[] span in entry.Value) copy.Add(new long[] { span[0], span[1] });
-                snap.Add(new KeyValuePair<int, List<long[]>>(entry.Key, copy));
+        if (!manifestPublicationGate.Wait(
+                TimeSpan.FromSeconds(RECORDER_BARRIER_TIMEOUT_SECONDS)
+            )) {
+            throw new TimeoutException(
+                "tree-attribution manifest publisher could not acquire its exact publication gate within " +
+                RECORDER_BARRIER_TIMEOUT_SECONDS.ToString(CultureInfo.InvariantCulture) +
+                " seconds"
+            );
+        }
+        try {
+            List<KeyValuePair<int, List<long[]>>> snap = new List<KeyValuePair<int, List<long[]>>>();
+            long flushNs;
+            byte[] previousBytes;
+            string previousIdentity;
+            lock (gate) {
+                foreach (KeyValuePair<int, List<long[]>> entry in pidIntervals) {
+                    List<long[]> copy = new List<long[]>();
+                    foreach (long[] span in entry.Value) copy.Add(new long[] { span[0], span[1] });
+                    snap.Add(new KeyValuePair<int, List<long[]>>(entry.Key, copy));
+                }
+                flushNs = NowUnixNs();
+                previousBytes = lastManifestBytes == null
+                    ? null
+                    : (byte[])lastManifestBytes.Clone();
+                previousIdentity = lastManifestFileIdentity;
             }
-            flushNs = NowUnixNs();
-            previousBytes = lastManifestBytes == null
-                ? null
-                : (byte[])lastManifestBytes.Clone();
-            previousIdentity = lastManifestFileIdentity;
-        }
-        snap.Sort(delegate(
-            KeyValuePair<int, List<long[]>> left,
-            KeyValuePair<int, List<long[]>> right
-        ) { return left.Key.CompareTo(right.Key); });
-        StringBuilder sb = new StringBuilder();
-        sb.Append("{\"schema\":\"astrolabe.no_escape_attribution.v3\",\"launcher_pid\":");
-        AppendInt(sb, launcherPid);
-        sb.Append(",\"launcher_process_start_utc_ticks\":");
-        AppendLong(sb, launcherProcessStartUtcTicks);
-        sb.Append(",\"launcher_lock_sha256\":");
-        AppendJsonString(sb, launcherLockSha256);
-        sb.Append(",\"launcher_lease_start_utc_ticks\":");
-        AppendLong(sb, launcherLeaseStartUtcTicks);
-        sb.Append(",\"job_object_name\":");
-        AppendJsonString(sb, jobObjectName);
-        sb.Append(",\"job_limit_flags\":");
-        AppendLong(sb, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE);
-        sb.Append(",\"run_started_unix_ns\":");
-        AppendLong(sb, runStartedNs);
-        // written_at stamps this exact durable generation. Recovery validates its
-        // temporal relation to the lease and PID intervals; it never infers a newer
-        // process-tree state from an older manifest generation.
-        sb.Append(",\"written_at\":");
-        AppendLong(sb, flushNs);
-        sb.Append(",\"tree_pids\":[");
-        for (int i = 0; i < snap.Count; i++) { if (i > 0) sb.Append(','); AppendInt(sb, snap[i].Key); }
-        sb.Append("],\"pid_first_seen\":{");
-        for (int i = 0; i < snap.Count; i++) {
-            if (i > 0) sb.Append(',');
-            sb.Append('"'); AppendInt(sb, snap[i].Key); sb.Append("\":"); AppendLong(sb, snap[i].Value[0][0]);
-        }
-        sb.Append("},\"pid_intervals\":{");
-        for (int i = 0; i < snap.Count; i++) {
-            if (i > 0) sb.Append(',');
-            sb.Append('"'); AppendInt(sb, snap[i].Key); sb.Append("\":[");
-            List<long[]> spans = snap[i].Value;
-            for (int j = 0; j < spans.Count; j++) {
-                if (j > 0) sb.Append(',');
-                sb.Append('['); AppendLong(sb, spans[j][0]); sb.Append(',');
-                if (spans[j][1] == OPEN) sb.Append("null"); else AppendLong(sb, spans[j][1]);
+            snap.Sort(delegate(
+                KeyValuePair<int, List<long[]>> left,
+                KeyValuePair<int, List<long[]>> right
+            ) { return left.Key.CompareTo(right.Key); });
+            StringBuilder sb = new StringBuilder();
+            sb.Append("{\"schema\":\"astrolabe.no_escape_attribution.v3\",\"launcher_pid\":");
+            AppendInt(sb, launcherPid);
+            sb.Append(",\"launcher_process_start_utc_ticks\":");
+            AppendLong(sb, launcherProcessStartUtcTicks);
+            sb.Append(",\"launcher_lock_sha256\":");
+            AppendJsonString(sb, launcherLockSha256);
+            sb.Append(",\"launcher_lease_start_utc_ticks\":");
+            AppendLong(sb, launcherLeaseStartUtcTicks);
+            sb.Append(",\"job_object_name\":");
+            AppendJsonString(sb, jobObjectName);
+            sb.Append(",\"job_limit_flags\":");
+            AppendLong(sb, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE);
+            sb.Append(",\"run_started_unix_ns\":");
+            AppendLong(sb, runStartedNs);
+            // written_at stamps this exact durable generation. Recovery validates its
+            // temporal relation to the lease and PID intervals; it never infers a newer
+            // process-tree state from an older manifest generation.
+            sb.Append(",\"written_at\":");
+            AppendLong(sb, flushNs);
+            sb.Append(",\"tree_pids\":[");
+            for (int i = 0; i < snap.Count; i++) { if (i > 0) sb.Append(','); AppendInt(sb, snap[i].Key); }
+            sb.Append("],\"pid_first_seen\":{");
+            for (int i = 0; i < snap.Count; i++) {
+                if (i > 0) sb.Append(',');
+                sb.Append('"'); AppendInt(sb, snap[i].Key); sb.Append("\":"); AppendLong(sb, snap[i].Value[0][0]);
+            }
+            sb.Append("},\"pid_intervals\":{");
+            for (int i = 0; i < snap.Count; i++) {
+                if (i > 0) sb.Append(',');
+                sb.Append('"'); AppendInt(sb, snap[i].Key); sb.Append("\":[");
+                List<long[]> spans = snap[i].Value;
+                for (int j = 0; j < spans.Count; j++) {
+                    if (j > 0) sb.Append(',');
+                    sb.Append('['); AppendLong(sb, spans[j][0]); sb.Append(',');
+                    if (spans[j][1] == OPEN) sb.Append("null"); else AppendLong(sb, spans[j][1]);
+                    sb.Append(']');
+                }
                 sb.Append(']');
             }
-            sb.Append(']');
-        }
-        // #621: owned_paths belonged to the retired no-escape gate's Restart Manager
-        // store scan. Preserve the strict versioned field and canonical shape, but publish the
-        // honest empty set; exact Job membership is the production cleanup authority.
-        sb.Append("},\"owned_paths\":[]}");
-        byte[] intended = new UTF8Encoding(false, true).GetBytes(sb.ToString());
-        string publishedIdentity = PublishManifestBytes(
-            intended,
-            previousBytes,
-            previousIdentity
-        );
-        lock (gate) {
-            lastManifestBytes = (byte[])intended.Clone();
-            lastManifestFileIdentity = publishedIdentity;
-            lastFlushNs = flushNs;
-            dirty = false;
+            // #621: owned_paths belonged to the retired no-escape gate's Restart Manager
+            // store scan. Preserve the strict versioned field and canonical shape, but publish the
+            // honest empty set; exact Job membership is the production cleanup authority.
+            sb.Append("},\"owned_paths\":[]}");
+            byte[] intended = new UTF8Encoding(false, true).GetBytes(sb.ToString());
+            string publishedIdentity = PublishManifestBytes(
+                intended,
+                previousBytes,
+                previousIdentity
+            );
+            lock (gate) {
+                lastManifestBytes = (byte[])intended.Clone();
+                lastManifestFileIdentity = publishedIdentity;
+                lastFlushNs = flushNs;
+                dirty = false;
+            }
+        } finally {
+            manifestPublicationGate.Release();
         }
     }
 
@@ -3931,7 +5145,7 @@ public class AstroTreeRecorder {
         ThrowIfWorkerFaulted();
         if (!PostQueuedCompletionStatus(port, STOP_SENTINEL, UIntPtr.Zero, IntPtr.Zero))
             throw new Win32Exception(Marshal.GetLastWin32Error(), "could not post tree-attribution stop barrier");
-        if (thread == null || !thread.Join(TimeSpan.FromSeconds(30)))
+        if (thread == null || !thread.Join(TimeSpan.FromSeconds(RECORDER_BARRIER_TIMEOUT_SECONDS)))
             throw new TimeoutException("tree-attribution worker did not terminate at the stop barrier");
         ThrowIfWorkerFaulted();
         // Final atomic publication happens only after every completion queued before the
@@ -3942,9 +5156,122 @@ public class AstroTreeRecorder {
     }
 
     public byte[] GetLastManifestBytes() {
-        lock (gate) {
-            if (lastManifestBytes == null) throw new InvalidOperationException("no durable attribution manifest has been published");
-            return (byte[])lastManifestBytes.Clone();
+        if (!manifestPublicationGate.Wait(
+                TimeSpan.FromSeconds(RECORDER_BARRIER_TIMEOUT_SECONDS)
+            )) {
+            throw new TimeoutException(
+                "tree-attribution manifest readback could not acquire its exact publication gate within " +
+                RECORDER_BARRIER_TIMEOUT_SECONDS.ToString(CultureInfo.InvariantCulture) +
+                " seconds"
+            );
+        }
+        try {
+            ThrowIfWorkerFaulted();
+            lock (gate) {
+                if (lastManifestBytes == null) throw new InvalidOperationException("no durable attribution manifest has been published");
+                return (byte[])lastManifestBytes.Clone();
+            }
+        } finally {
+            manifestPublicationGate.Release();
+        }
+    }
+
+    public sealed class StableManifestReadLease : IDisposable {
+        AstroTreeRecorder owner;
+        readonly byte[] manifestBytes;
+
+        internal StableManifestReadLease(
+            AstroTreeRecorder owner,
+            byte[] manifestBytes,
+            string manifestFileIdentity,
+            long waitElapsedMilliseconds
+        ) {
+            this.owner = owner;
+            this.manifestBytes = (byte[])manifestBytes.Clone();
+            ManifestFileIdentity = manifestFileIdentity;
+            WaitElapsedMilliseconds = waitElapsedMilliseconds;
+        }
+
+        public string ManifestFileIdentity { get; private set; }
+        public long WaitElapsedMilliseconds { get; private set; }
+
+        public byte[] GetManifestBytes() {
+            return (byte[])manifestBytes.Clone();
+        }
+
+        public void Dispose() {
+            AstroTreeRecorder current = Interlocked.Exchange(ref owner, null);
+            if (current != null) current.ReleaseManifestPublicationGate();
+        }
+    }
+
+    void ReleaseManifestPublicationGate() {
+        manifestPublicationGate.Release();
+    }
+
+    public StableManifestReadLease AcquireStableManifestReadLease() {
+        System.Diagnostics.Stopwatch wait = System.Diagnostics.Stopwatch.StartNew();
+        if (!manifestPublicationGate.Wait(
+                TimeSpan.FromSeconds(RECORDER_BARRIER_TIMEOUT_SECONDS)
+            )) {
+            wait.Stop();
+            throw new TimeoutException(
+                "tree-attribution stable-manifest consumer could not acquire its exact publication gate within " +
+                RECORDER_BARRIER_TIMEOUT_SECONDS.ToString(CultureInfo.InvariantCulture) +
+                " seconds (elapsed_ms=" +
+                wait.ElapsedMilliseconds.ToString(CultureInfo.InvariantCulture) + ")"
+            );
+        }
+        wait.Stop();
+        try {
+            ThrowIfWorkerFaulted();
+            byte[] intended;
+            string intendedIdentity;
+            lock (gate) {
+                if (lastManifestBytes == null)
+                    throw new InvalidOperationException("no durable attribution manifest has been published");
+                if (String.IsNullOrEmpty(lastManifestFileIdentity))
+                    throw new InvalidOperationException("durable attribution manifest FILE_ID binding is missing");
+                intended = (byte[])lastManifestBytes.Clone();
+                intendedIdentity = lastManifestFileIdentity;
+            }
+
+            using (FileStream current = OpenProtectedRead(
+                manifestPath,
+                "stable attribution-manifest consumer lease"
+            )) {
+                RequireOrdinarySingleLink(
+                    current.SafeFileHandle,
+                    "stable attribution-manifest consumer lease"
+                );
+                RequireAttributionProtocolPath(
+                    current.SafeFileHandle,
+                    manifestPath,
+                    "stable attribution-manifest consumer lease"
+                );
+                string observedIdentity = GetFileIdentity(current.SafeFileHandle);
+                byte[] observedBytes = ReadAllExact(current);
+                if (!String.Equals(
+                        observedIdentity,
+                        intendedIdentity,
+                        StringComparison.Ordinal
+                    ) ||
+                    !BytesEqual(observedBytes, intended)) {
+                    throw new InvalidDataException(
+                        "stable attribution-manifest final path/FILE_ID/bytes differ from the producer's durable binding"
+                    );
+                }
+            }
+
+            return new StableManifestReadLease(
+                this,
+                intended,
+                intendedIdentity,
+                wait.ElapsedMilliseconds
+            );
+        } catch {
+            manifestPublicationGate.Release();
+            throw;
         }
     }
 
@@ -4558,10 +5885,10 @@ if ($RecoverPreservedTarget) {
             [Globalization.NumberStyles]::None,
             [Globalization.CultureInfo]::InvariantCulture,
             [ref]$expectedRecoveryEntryCount
-        ) -or $expectedRecoveryEntryCount -le 0 -or
+        ) -or $expectedRecoveryEntryCount -lt 0 -or
         $PriorRecoveryTransactionId -cnotmatch '^[0-9a-f]{32}$' -or
         $TrackerCommentUrl -cnotmatch "^https://github\.com/ChrisRoyse/Astrolabe/issues/$drivingIssue#issuecomment-[1-9][0-9]*$") {
-        throw "TARGET_RECOVERY[ASTRO_PRESERVED_TARGET_ARGUMENT_INVALID]: {code=ASTRO_PRESERVED_TARGET_ARGUMENT_INVALID; message=`"preserved-target recovery requires the canonical root, no child command/bootstrap, exact lowercase inventory/transaction hashes, a positive entry count, and a tracker URL for the driving issue`"; remediation=`"post the exact inventory evidence on the driving issue and pass only the documented recovery parameters`"}"
+        throw "TARGET_RECOVERY[ASTRO_PRESERVED_TARGET_ARGUMENT_INVALID]: {code=ASTRO_PRESERVED_TARGET_ARGUMENT_INVALID; message=`"preserved-target recovery requires the canonical root, no child command/bootstrap, exact lowercase inventory/transaction hashes, a nonnegative entry count, and a tracker URL for the driving issue`"; remediation=`"post the exact inventory evidence on the driving issue and pass only the documented recovery parameters`"}"
     }
 }
 elseif (-not [string]::IsNullOrEmpty($TrackerCommentUrl) -or
@@ -4775,6 +6102,7 @@ $launcherProtocolDirectoryLease = $null
 $workspaceTempLease = $null
 $gitMutationFreezeLease = $null
 $script:cudaToolkitViewLease = $null
+$script:cudaLinkSupportLease = $null
 $ownedTargetLeases = [Collections.Generic.List[object]]::new()
 $targetOwnershipId = $null
 $targetOwnershipManifestPath = $null
@@ -4800,6 +6128,7 @@ Assert-NoAmbientCargoTargetEscape -OwnedTargetRoot $target
 # stale ownership is removed only by the tracker-bound explicit reclaim command. Claim and
 # reclaim share one crash-released named mutex so check/create/archive operations cannot race.
 . (Join-Path $PSScriptRoot "launcher-lock.ps1")
+. (Join-Path $PSScriptRoot "cuda13-bundle-retire.ps1")
 # #301: the no-escape attribution manifest lifecycle (dead-PID startup sweep + own-manifest
 # exit removal) lives in one audited, dot-sourceable helper that -- like the lock helper --
 # NEVER stops a process and treats a live-PID manifest as inviolable.
@@ -5354,7 +6683,19 @@ try {
         )) {
         throw "LAUNCHER_BOUNDARY[ASTRO_LAUNCHER_ACTIVE_PAIR_INVALID]: active lock does not retain its prepublication ordinary exact-session TEMP (state=$($workspaceTempState.State), attributes=$($workspaceTempState.Attributes), error=$($workspaceTempState.Error)): $workspaceTemp"
     }
+    $stableManifestReadLease = $null
     try {
+        try {
+            $stableManifestReadLease =
+                $treeRecorder.AcquireStableManifestReadLease()
+            $stableManifestBytes =
+                $stableManifestReadLease.GetManifestBytes()
+            Write-Output "NO_ESCAPE[ASTRO_ATTRIBUTION_STABLE_READ_LEASE_HELD]: manifest=$attributionManifest; file_id=$($stableManifestReadLease.ManifestFileIdentity); bytes=$($stableManifestBytes.Length); sha256=$(Get-AstroByteSha256 $stableManifestBytes); wait_ms=$($stableManifestReadLease.WaitElapsedMilliseconds); scope=paired-temp-and-attribution-sweeps"
+        }
+        catch {
+            throw "LAUNCHER_BOUNDARY[ASTRO_ATTRIBUTION_STABLE_READ_LEASE_FAILED]: {code=ASTRO_ATTRIBUTION_STABLE_READ_LEASE_FAILED; message=`"the exact live attribution producer could not establish one quiescent manifest path/FILE_ID/byte binding for the immediate sweeps: $($_.Exception.Message)`"; remediation=`"preserve every owned byte; inspect the recorder worker fault and typed refresh transaction state, then use only the tracker-bound recovery protocol after the exact owner and Job are inactive`"}"
+        }
+
         # The paired TEMP cleaner owns the only legal dead-generation mutation order:
         # exact TEMP first, then its exact manifest/stage evidence. Running the manifest
         # classifier first could erase the sole authority needed to classify that TEMP.
@@ -5408,14 +6749,11 @@ try {
         }
         Write-Output "NO_ESCAPE[ASTRO_ATTRIBUTION_SWEEP]: exact dead-generation TEMP pairs=$(@($tempSweep.Removed).Count), manifests=$(@($tempSweep.RemovedManifests).Count), stages=$(@($tempSweep.RemovedStages).Count), tombstones=$(@($tempSweep.RemovedTombstones).Count); current exact generation preserved"
     }
-    catch {
-        # A dead, complete pair is intentionally tracker-archived rather than swept.
-        # Its presence is a run-precondition failure, not evidence that this exact
-        # launcher's Job membership or cleanup authority is unsafe.  Keeping it out
-        # of cleanupErrors lets the already-published exact owner remove target/ and
-        # archive its own state in finally; otherwise target presence and pair
-        # archival form an unrecoverable cycle (#620).
-        throw
+    finally {
+        if ($null -ne $stableManifestReadLease) {
+            $stableManifestReadLease.Dispose()
+            Write-Output "NO_ESCAPE[ASTRO_ATTRIBUTION_STABLE_READ_LEASE_RELEASED]: manifest=$attributionManifest; scope=paired-temp-and-attribution-sweeps"
+        }
     }
     # #651: a stale-owner reclaim may correctly archive the only prior lease while
     # preserving target/. A fresh ordinary launcher cannot infer ownership from those
@@ -5897,7 +7235,10 @@ try {
     }
     else {
     Set-WorkspaceTempEnvironment -WorkspaceTemp $workspaceTemp
-    Set-CudaMsvcRuntimeLinkEnvironment -LlvmBin $llvmBin -WorkspaceTemp $workspaceTemp
+    Set-CudaMsvcRuntimeLinkEnvironment `
+        -ToolsRoot $toolsRoot `
+        -LlvmBin $llvmBin `
+        -WorkspaceTemp $workspaceTemp
     # #190: ensure the sccache server is up and zero its counters so --show-stats in
     # the finally reports THIS run's cold-vs-warm hit rate. The on-disk cache in
     # $sccacheDir persists across runs and the target/ wipe.
@@ -6102,13 +7443,26 @@ finally {
     catch {
         $cleanupErrors += "GIT_FREEZE[ASTRO_EVIDENCE_LEASE_UNVERIFIED]: {code=ASTRO_EVIDENCE_LEASE_UNVERIFIED; message=`"the evidence-lease tree fingerprint could not be re-verified: $($_.Exception.Message)`"; remediation=`"treat this run's artifacts as non-evidence; repair the repository state and rebuild`"}"
     }
+    try {
+        if ($null -ne $script:cudaLinkSupportLease) {
+            $cudaLinkTerminal =
+                Assert-AstroCudaLinkSupportRuntimeLease `
+                    -Lease $script:cudaLinkSupportLease
+            Write-Output "CUDA_LINK_SUPPORT[ASTRO_CUDA_LINK_BUNDLE_STABLE]: root=$($cudaLinkTerminal.Root); root_file_id=$($cudaLinkTerminal.RootFileId); manifest_sha256=$($cudaLinkTerminal.ManifestSha256); payload_root_file_id=$($cudaLinkTerminal.Inventory.RootFileId); payload_content_sha256=$($cudaLinkTerminal.Inventory.ContentSha256); payload_identity_sha256=$($cudaLinkTerminal.Inventory.IdentitySha256); payload_exact_observation_sha256=$($cudaLinkTerminal.Inventory.ExactInventorySha256); exact_metadata_equal_ignoring_last_access=true; child_window=stable"
+        }
+    }
+    catch {
+        $cleanupErrors += "CUDA_LINK_SUPPORT[ASTRO_CUDA_LINK_BUNDLE_CHANGED]: {code=ASTRO_CUDA_LINK_BUNDLE_CHANGED; message=`"the retained immutable link-support bundle could not be re-verified after the child command: $($_.Exception.Message)`"; remediation=`"treat every artifact from this run as invalid, preserve launcher state, inspect the exact bundle/manifest hashes, and repair or retire only after proving no launcher owns it`"}"
+    }
 
-    # The named Job Object is the kernel source of truth for current membership. Before
-    # stopping the session-owned sccache daemon, distinguish only the exact process
-    # generation(s) captured causally at its startup. Every other member protects the full
-    # state; there are no image-name fallbacks and no telemetry exceptions.
+    # The named Job Object is the kernel source of truth for current membership. Validate
+    # the exact sccache server generation and its unique root-port listener before sending
+    # the shutdown RPC. Dynamic descendants created after server startup are expected:
+    # sccache can retain compiler/service processes briefly after Cargo exits. Record their
+    # exact generations, but neither trust nor mutate them. The upstream shutdown protocol
+    # stops new work and drains active services; the complete Job must then become empty.
     $deferCleanupForLiveChildren = $false
-    $unexpectedJobPids = @()
+    $preStopDynamicMembers = [Collections.Generic.List[object]]::new()
     $preStopJobPids = @()
     try {
         if ($null -eq $treeRecorder) {
@@ -6124,13 +7478,53 @@ finally {
                     Where-Object { $_.Pid -eq $jobPid }
             )
             if ($infrastructure.Count -ne 1) {
-                $unexpectedJobPids += $jobPid
+                $identity = Get-AstroProcessIdentityProbe $jobPid
+                if ($identity.State -ne 'observed') {
+                    $jobPidsAfterIdentityProbe = @(
+                        $treeRecorder.GetActiveProcessIds()
+                    )
+                    if ($jobPidsAfterIdentityProbe -notcontains $jobPid) {
+                        continue
+                    }
+                    throw "dynamic Job Object member PID $jobPid could not be bound to an exact process generation (state=$($identity.State), error=$($identity.Error))"
+                }
+                $rows = @(Get-CimInstance `
+                    -ClassName Win32_Process `
+                    -Filter "ProcessId = $jobPid" `
+                    -ErrorAction Stop)
+                if ($rows.Count -ne 1 -or
+                    [string]::IsNullOrWhiteSpace(
+                        [string]$rows[0].ExecutablePath
+                    )) {
+                    $jobPidsAfterRowProbe = @(
+                        $treeRecorder.GetActiveProcessIds()
+                    )
+                    if ($jobPidsAfterRowProbe -notcontains $jobPid) {
+                        continue
+                    }
+                    throw "dynamic Job Object member PID $jobPid did not yield exactly one process row with an executable path"
+                }
+                $preStopDynamicMembers.Add([pscustomobject]@{
+                    Pid = [int]$jobPid
+                    ProcessStartUtcTicks =
+                        [long]$identity.ProcessStartUtcTicks
+                    ImagePath = [IO.Path]::GetFullPath(
+                        [string]$rows[0].ExecutablePath
+                    )
+                    ParentPid = [int]$rows[0].ParentProcessId
+                })
                 continue
             }
             $identity = Get-AstroProcessIdentityProbe $jobPid
             if ($identity.State -ne 'observed' -or
                 [long]$identity.ProcessStartUtcTicks -ne
                     [long]$infrastructure[0].ProcessStartUtcTicks) {
+                $jobPidsAfterIdentityProbe = @(
+                    $treeRecorder.GetActiveProcessIds()
+                )
+                if ($jobPidsAfterIdentityProbe -notcontains $jobPid) {
+                    continue
+                }
                 throw "sccache Job Object member PID $jobPid no longer binds its captured process generation (state=$($identity.State), expected_ticks=$($infrastructure[0].ProcessStartUtcTicks), observed_ticks=$($identity.ProcessStartUtcTicks), error=$($identity.Error))"
             }
             $rows = @(Get-CimInstance `
@@ -6146,22 +7540,67 @@ finally {
                 ) -or
                 [int]$rows[0].ParentProcessId -ne
                     [int]$infrastructure[0].ParentPid) {
+                $jobPidsAfterRowProbe = @(
+                    $treeRecorder.GetActiveProcessIds()
+                )
+                if ($jobPidsAfterRowProbe -notcontains $jobPid) {
+                    continue
+                }
                 throw "captured sccache infrastructure PID $jobPid changed exact image/parent topology before shutdown"
+            }
+        }
+        if ($sccacheDaemonStarted) {
+            $capturedServers = @(
+                $sccacheOwnedJobMembers |
+                    Where-Object { $_.Role -ceq 'server' }
+            )
+            if ($capturedServers.Count -ne 1 -or
+                $preStopJobPids -notcontains $capturedServers[0].Pid) {
+                throw "captured exact sccache server generation is not live in the Job before shutdown (captured=$($capturedServers.Count), job_pids=$($preStopJobPids -join ','))"
+            }
+            $serverIdentity = Get-AstroProcessIdentityProbe `
+                $capturedServers[0].Pid
+            if ($serverIdentity.State -ne 'observed' -or
+                [long]$serverIdentity.ProcessStartUtcTicks -ne
+                    [long]$capturedServers[0].ProcessStartUtcTicks) {
+                throw "captured sccache server PID $($capturedServers[0].Pid) no longer binds its exact startup generation (state=$($serverIdentity.State), expected_ticks=$($capturedServers[0].ProcessStartUtcTicks), observed_ticks=$($serverIdentity.ProcessStartUtcTicks), error=$($serverIdentity.Error))"
+            }
+            $preStopListeners = @(
+                Get-NetTCPConnection `
+                    -State Listen `
+                    -LocalAddress '127.0.0.1' `
+                    -LocalPort $sccacheServerPort `
+                    -ErrorAction Stop
+            )
+            if ($preStopListeners.Count -ne 1 -or
+                [int]$preStopListeners[0].OwningProcess -ne
+                    [int]$capturedServers[0].Pid) {
+                throw "exact 127.0.0.1:$sccacheServerPort listener no longer belongs uniquely to captured sccache PID $($capturedServers[0].Pid) before shutdown (count=$($preStopListeners.Count), owners=$(@($preStopListeners.OwningProcess) -join ','))"
             }
         }
     }
     catch {
         $deferCleanupForLiveChildren = $true
-        $cleanupErrors += "exact-session Job Object membership is unevaluable: $($_.Exception.Message)"
+        $cleanupErrors += "SCCACHE[ASTRO_CACHE_PRESTOP_UNEVALUABLE]: {code=ASTRO_CACHE_PRESTOP_UNEVALUABLE; message=`"exact-session Job/server/listener state is not mutation-authorizing before sccache shutdown: $($_.Exception.Message)`"; remediation=`"preserve target, TEMP, manifest, and launcher protocol; inspect the exact Job members and root-port listener, then use tracker-bound recovery only after every exact generation is inactive`"}"
     }
-    if ($unexpectedJobPids.Count -gt 0) {
-        $deferCleanupForLiveChildren = $true
-        $cleanupErrors += "unexpected exact-session Job Object member PID(s) remain live: $($unexpectedJobPids -join ', ')"
+    if ($preStopDynamicMembers.Count -gt 0) {
+        $dynamicDescriptions = @(
+            $preStopDynamicMembers | ForEach-Object {
+                'pid={0},ticks={1},parent={2},image={3}' -f @(
+                    $_.Pid,
+                    $_.ProcessStartUtcTicks,
+                    $_.ParentPid,
+                    $_.ImagePath
+                )
+            }
+        )
+        Write-Output "SCCACHE[ASTRO_CACHE_DYNAMIC_MEMBERS_BEFORE_STOP]: count=$($preStopDynamicMembers.Count); members=$($dynamicDescriptions -join '; ')"
     }
 
-    # Stop only the exact infrastructure generation(s) created by this lease, and only
-    # when no other member needs the build state. All daemon command failures are cleanup
-    # errors; none are relabeled as an acceptable empty result.
+    # Stop only the exact server generation created by this lease. The RPC itself is
+    # addressed through the independently revalidated unique listener. It is safe while
+    # dynamic descendants remain because pinned sccache stops accepting new work and
+    # drains active service instances before its process exits. No Job member is killed.
     if (-not $deferCleanupForLiveChildren -and $sccacheDaemonStarted) {
         try {
             Write-Output "SCCACHE[ASTRO_CACHE_STATS]:"
@@ -6175,30 +7614,57 @@ finally {
                 $cleanupErrors += "exact session sccache stop failed with exit $($sccacheStop.ExitCode): $($sccacheStop.Output -join ' | ')"
             }
             else {
-                $shutdownDeadline = [DateTime]::UtcNow.AddSeconds(10)
+                $shutdownWatch = [Diagnostics.Stopwatch]::StartNew()
                 do {
-                    $sameGenerationLive = @(
-                        $sccacheOwnedJobMembers | Where-Object {
-                            $probe = Get-AstroProcessIdentityProbe $_.Pid
-                            $probe.State -eq 'observed' -and
-                                [long]$probe.ProcessStartUtcTicks -eq
-                                    [long]$_.ProcessStartUtcTicks
-                        }
+                    $remainingJobChildren = @(
+                        $treeRecorder.GetActiveProcessIds() |
+                            Where-Object { $_ -ne $PID } |
+                            Sort-Object -Unique
                     )
-                    if ($sameGenerationLive.Count -eq 0) { break }
-                    Start-Sleep -Milliseconds 50
-                } while ([DateTime]::UtcNow -lt $shutdownDeadline)
-                if ($sameGenerationLive.Count -ne 0) {
-                    $liveDescriptions = @(
-                        $sameGenerationLive | ForEach-Object {
-                            '{0}:{1}:{2}' -f @(
-                                $_.Role,
-                                $_.Pid,
-                                $_.ProcessStartUtcTicks
+                    if ($remainingJobChildren.Count -eq 0) { break }
+                    Start-Sleep `
+                        -Milliseconds $SccacheShutdownPollMilliseconds
+                } while (
+                    $shutdownWatch.Elapsed.TotalSeconds -lt
+                        $SccacheShutdownDrainSeconds
+                )
+                $shutdownWatch.Stop()
+                if ($remainingJobChildren.Count -ne 0) {
+                    $liveDescriptions = [Collections.Generic.List[string]]::new()
+                    foreach ($livePid in $remainingJobChildren) {
+                        $probe = Get-AstroProcessIdentityProbe $livePid
+                        $rows = @(Get-CimInstance `
+                            -ClassName Win32_Process `
+                            -Filter "ProcessId = $livePid" `
+                            -ErrorAction SilentlyContinue)
+                        $parentDescription = if ($rows.Count -eq 1) {
+                            [int]$rows[0].ParentProcessId
+                        }
+                        else { '<unevaluable>' }
+                        $imageDescription = if ($rows.Count -eq 1 -and
+                            -not [string]::IsNullOrWhiteSpace(
+                                [string]$rows[0].ExecutablePath
+                            )) {
+                            [IO.Path]::GetFullPath(
+                                [string]$rows[0].ExecutablePath
                             )
                         }
-                    )
-                    $cleanupErrors += "exact sccache infrastructure generation(s) remained live after graceful --stop-server: $($liveDescriptions -join ', ')"
+                        else { '<unevaluable>' }
+                        $liveDescriptions.Add((
+                            'pid={0},state={1},ticks={2},parent={3},image={4},error={5}' -f @(
+                                $livePid,
+                                $probe.State,
+                                $probe.ProcessStartUtcTicks,
+                                $parentDescription,
+                                $imageDescription,
+                                $probe.Error
+                            )
+                        ))
+                    }
+                    $cleanupErrors += "SCCACHE[ASTRO_CACHE_SHUTDOWN_DRAIN_TIMEOUT]: {code=ASTRO_CACHE_SHUTDOWN_DRAIN_TIMEOUT; message=`"the exact Job retained child generation(s) $($liveDescriptions -join '; ') after the graceful sccache shutdown RPC and $($shutdownWatch.ElapsedMilliseconds) ms of a $($SccacheShutdownDrainSeconds * 1000) ms deadline`"; remediation=`"preserve every owned byte; diagnose the named exact process generations and sccache server logs, then use tracker-bound recovery only after the owner and Job are inactive`"}"
+                }
+                else {
+                    Write-Output "SCCACHE[ASTRO_CACHE_SHUTDOWN_DRAINED]: elapsed_ms=$($shutdownWatch.ElapsedMilliseconds); deadline_ms=$($SccacheShutdownDrainSeconds * 1000); pre_stop_dynamic_members=$($preStopDynamicMembers.Count); terminal_job_children=0"
                 }
                 $remainingListeners = @(
                     Get-NetTCPConnection `
@@ -6773,6 +8239,17 @@ finally {
     # Release retained handles only after every authorized exact operation. When state is
     # preserved, closing these handles permits the tracker-bound reclaimer to inspect it;
     # it never grants deletion authority to this failed cleanup path.
+    if ($null -ne $script:cudaLinkSupportLease) {
+        try {
+            $closedCudaLinkSupportHandles =
+                Close-AstroCudaLinkSupportRuntimeLease `
+                    -Lease $script:cudaLinkSupportLease
+            Write-Output "CUDA_LINK_SUPPORT[ASTRO_CUDA_LINK_BUNDLE_HANDLES_RELEASED]: root=$($script:cudaLinkSupportLease.Bundle.Root); closed=$closedCudaLinkSupportHandles; no shared bundle byte was mutated"
+        }
+        catch {
+            $cleanupErrors += "CUDA link-support retained handle release failed without mutating shared state: $($_.Exception.Message)"
+        }
+    }
     if ($null -ne $script:cudaToolkitViewLease) {
         try {
             $closedCudaJunctionLeases =
