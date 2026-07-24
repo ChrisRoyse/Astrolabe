@@ -10,6 +10,7 @@ publish.workspace = true
 default = []
 cuda-runtime-boundary = ["dep:windows-sys"]
 cuda = ["dep:cudarc", "cuda-runtime-boundary"]
+cuda-policy-measurement = ["cuda"]
 
 [dependencies]
 calyx-core = { path = "../calyx-core" }
@@ -22,6 +23,11 @@ serde_json.workspace = true
 sha2.workspace = true
 tracing.workspace = true
 wide.workspace = true
+
+[build-dependencies]
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61.2", features = [

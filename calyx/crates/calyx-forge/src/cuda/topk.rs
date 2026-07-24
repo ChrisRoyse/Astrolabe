@@ -1,16 +1,15 @@
-use std::str;
 use std::sync::Arc;
 
 use cudarc::driver::{CudaModule, CudaSlice, LaunchConfig, PushKernelArg};
-use cudarc::nvrtc::Ptx;
 
-use crate::cuda::kernels::TOPK_PTX;
+use crate::cuda::kernels::{TOPK_CUBIN, load_embedded_cubin};
 use crate::{CUDA_EXACT_TOPK_MAX_K, CudaContext, ForgeError, Result};
 
 const TOPK_BLOCK: usize = CUDA_EXACT_TOPK_MAX_K;
 const TOPK_REMEDIATION: &str =
     "Reject non-finite scores and keep deterministic score/index ordering";
-const DEVICE_REMEDIATION: &str = "Check CUDA, embedded topk PTX, and CUDA GPU device availability";
+const DEVICE_REMEDIATION: &str =
+    "Check CUDA, the attested embedded topk CUBIN, and the configured sm_120a device";
 
 pub fn topk_gpu(
     ctx: &CudaContext,
@@ -171,17 +170,7 @@ fn merge_chunks(
 }
 
 fn topk_module(ctx: &CudaContext) -> Result<Arc<CudaModule>> {
-    if let Some(module) = ctx.topk_module_cache().get() {
-        return Ok(module.clone());
-    }
-    let ptx = str::from_utf8(TOPK_PTX)
-        .map_err(|err| device_unavailable(ctx, format!("topk PTX is not UTF-8: {err}")))?;
-    let module = ctx
-        .inner()
-        .load_module(Ptx::from_src(ptx))
-        .map_err(|err| device_unavailable(ctx, format!("topk PTX load failed: {err}")))?;
-    let _ = ctx.topk_module_cache().set(module.clone());
-    Ok(module)
+    load_embedded_cubin(ctx, "topk", TOPK_CUBIN, ctx.topk_module_cache())
 }
 
 fn check_device_len(actual: usize, expected: usize) -> Result<()> {

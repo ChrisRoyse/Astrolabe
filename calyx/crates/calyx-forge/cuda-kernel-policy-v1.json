@@ -1,0 +1,12 @@
+{
+  "schema": "calyx.forge.cuda-kernel-policy.v1",
+  "status": "measurement-pending",
+  "measurement_issue": 492,
+  "decision": {
+    "module_kind": "cubin",
+    "fmad": false
+  },
+  "measurement": {
+    "note": "Transient bootstrap record used only by the explicit cuda-policy-measurement build. Replace with physical RTX 5090 measurements before production verification."
+  }
+}

@@ -38,11 +38,18 @@ pub use grouped_gemm::{
     build_grouped_gemm_plan, execute_grouped_gemm, execute_grouped_gemm_strict,
     read_grouped_gemm_output,
 };
+pub use kernels::{
+    CUDA_KERNEL_POLICY_JSON, CudaKernelBuildAttestation, CudaKernelModuleAttestation,
+    CudaKernelRuntimeAttestation, cuda_kernel_build_attestation,
+};
 pub use ragged_gemm::{
     RaggedBatch, build_ragged_batch, build_ragged_batch_from_slabs, extract_ragged_results,
     try_extract_ragged_results,
 };
 pub use topk::topk_gpu;
+
+#[cfg(feature = "cuda-policy-measurement")]
+pub use kernels::{CUDA_KERNEL_MEASUREMENT_ARTIFACTS, CudaKernelMeasurementArtifact};
 
 #[derive(Clone, Debug)]
 pub struct CudaBackend {

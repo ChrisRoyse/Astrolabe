@@ -1,9 +1,10 @@
 use std::sync::Arc;
 
 use cudarc::driver::{CudaFunction, CudaModule, CudaSlice, LaunchConfig, PushKernelArg};
-use cudarc::nvrtc::Ptx;
 
-use crate::cuda::kernels::MXFP_GEMM_CUBIN;
+use crate::cuda::kernels::{
+    CudaKernelRuntimeAttestation, MXFP_GEMM_CUBIN, ensure_kernel_capability, load_embedded_cubin,
+};
 use crate::{CudaContext, ForgeError, Result};
 
 pub(super) const MXFP_WARP_THREADS: u32 = 32;
@@ -11,7 +12,7 @@ pub(super) const MXFP_GEMM_MAX_DIM: usize = 1 << 20;
 pub(super) const MXFP_GEMM_MAX_MATRIX_ELEMENTS: usize = 1 << 28;
 const MXFP_DEVICE_REMEDIATION: &str = "Run the packed OCP MX kernel on the pinned Blackwell sm_120 device with CUDA 13.3; use the K-axis block layout and do not decode operands or fall back to SGEMM";
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
 pub struct MxPackedGemmEvidence {
     pub backend: &'static str,
     pub element: &'static str,
@@ -29,6 +30,7 @@ pub struct MxPackedGemmEvidence {
     pub device: String,
     pub compute_capability: (i32, i32),
     pub device_selection_authority: &'static str,
+    pub module: CudaKernelRuntimeAttestation,
 }
 
 pub(super) struct PackedPlanStorage {
@@ -47,6 +49,7 @@ pub(super) struct PackedPlanStorage {
     device: String,
     compute_capability: (i32, i32),
     device_selection_authority: &'static str,
+    module_attestation: CudaKernelRuntimeAttestation,
     module_cache_hit_at_creation: bool,
     execution_count: u64,
 }
@@ -140,6 +143,13 @@ impl PackedPlanStorage {
                 format!("load native kernel {kernel} failed: {error}"),
             )
         })?;
+        let module_attestation = ctx.kernel_module_attestation("mxfp_gemm")?.ok_or_else(|| {
+            ForgeError::RuntimeBoundary {
+                code: "CALYX_FORGE_CUDA_KERNEL_ATTESTATION_MISSING",
+                detail: "mxfp_gemm module was loaded but its runtime receipt is absent".to_string(),
+                remediation: MXFP_DEVICE_REMEDIATION,
+            }
+        })?;
 
         Ok(Self {
             a_codes,
@@ -157,6 +167,7 @@ impl PackedPlanStorage {
             device: ctx.physical_identity().canonical_execution_token(),
             compute_capability: ctx.compute_capability(),
             device_selection_authority: ctx.selection_authority(),
+            module_attestation,
             module_cache_hit_at_creation,
             execution_count: 0,
         })
@@ -317,6 +328,7 @@ impl PackedPlanStorage {
             device: self.device.clone(),
             compute_capability: self.compute_capability,
             device_selection_authority: self.device_selection_authority,
+            module: self.module_attestation.clone(),
         }
     }
 }
@@ -403,44 +415,21 @@ pub(super) fn packed_shape_error(
     }
 }
 
-fn ensure_sm120(ctx: &CudaContext, element: &'static str, shape: [usize; 3]) -> Result<()> {
-    if ctx.compute_capability() == (12, 0) {
-        Ok(())
-    } else {
-        Err(device_error(
-            ctx,
-            element,
-            shape,
-            format!(
-                "native OCP MX block-scaled MMA requires exactly sm_120; detected sm_{}{}",
-                ctx.compute_capability().0,
-                ctx.compute_capability().1
-            ),
-        ))
-    }
+fn ensure_sm120(ctx: &CudaContext, _element: &'static str, _shape: [usize; 3]) -> Result<()> {
+    ensure_kernel_capability(ctx, "mxfp_gemm")
 }
 
 fn mxfp_module(
     ctx: &CudaContext,
-    element: &'static str,
-    shape: [usize; 3],
+    _element: &'static str,
+    _shape: [usize; 3],
 ) -> Result<Arc<CudaModule>> {
-    if let Some(module) = ctx.mxfp_gemm_module_cache().get() {
-        return Ok(module.clone());
-    }
-    let module = ctx
-        .inner()
-        .load_module(Ptx::from_binary(MXFP_GEMM_CUBIN.to_vec()))
-        .map_err(|error| {
-            device_error(
-                ctx,
-                element,
-                shape,
-                format!("load embedded sm_120 MX CUBIN failed: {error}"),
-            )
-        })?;
-    let _ = ctx.mxfp_gemm_module_cache().set(module.clone());
-    Ok(module)
+    load_embedded_cubin(
+        ctx,
+        "mxfp_gemm",
+        MXFP_GEMM_CUBIN,
+        ctx.mxfp_gemm_module_cache(),
+    )
 }
 
 fn device_error(

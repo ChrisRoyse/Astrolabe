@@ -1,9 +1,8 @@
 use std::sync::{Arc, OnceLock};
 
-use cudarc::driver::{
-    CudaContext as CudarcContext, CudaModule, CudaStream as CudarcStream, result, sys,
-};
+use cudarc::driver::{CudaContext as CudarcContext, CudaStream as CudarcStream, result, sys};
 
+use super::kernels::{CudaKernelRuntimeAttestation, LoadedCudaModule, runtime_attestation};
 use crate::{BackendKind, DeviceInfo, ForgeError, PinnedCudaDeviceIdentity, Result};
 
 const BYTES_PER_MIB: u64 = 1024 * 1024;
@@ -16,6 +15,7 @@ const CUDA_IDENTITY_REMEDIATION: &str = "terminate the process, preserve its CUD
 pub struct CudaContext {
     inner: Arc<CudarcContext>,
     determinism: bool,
+    runtime_ordinal: u32,
     driver_ordinal: u32,
     physical_identity: PinnedCudaDeviceIdentity,
     name: String,
@@ -23,9 +23,9 @@ pub struct CudaContext {
     total_mem_mib: u64,
     free_mem_mib_at_init: u64,
     dependency_boundary: CudaDependencyBoundary,
-    distance_module: Arc<OnceLock<Arc<CudaModule>>>,
-    topk_module: Arc<OnceLock<Arc<CudaModule>>>,
-    mxfp_gemm_module: Arc<OnceLock<Arc<CudaModule>>>,
+    distance_module: Arc<OnceLock<Result<LoadedCudaModule>>>,
+    topk_module: Arc<OnceLock<Result<LoadedCudaModule>>>,
+    mxfp_gemm_module: Arc<OnceLock<Result<LoadedCudaModule>>>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -116,6 +116,11 @@ impl CudaContext {
         self.driver_ordinal
     }
 
+    /// CUDA Runtime-visible ordinal selected through [`crate::CUDA_DEVICE_ENV`].
+    pub fn runtime_ordinal(&self) -> u32 {
+        self.runtime_ordinal
+    }
+
     pub fn driver_ordinal(&self) -> u32 {
         self.driver_ordinal
     }
@@ -200,16 +205,58 @@ impl CudaContext {
         Ok(free_bytes)
     }
 
-    pub(crate) fn distance_module_cache(&self) -> &OnceLock<Arc<CudaModule>> {
+    pub(crate) fn distance_module_cache(&self) -> &OnceLock<Result<LoadedCudaModule>> {
         &self.distance_module
     }
 
-    pub(crate) fn topk_module_cache(&self) -> &OnceLock<Arc<CudaModule>> {
+    pub(crate) fn topk_module_cache(&self) -> &OnceLock<Result<LoadedCudaModule>> {
         &self.topk_module
     }
 
-    pub(crate) fn mxfp_gemm_module_cache(&self) -> &OnceLock<Arc<CudaModule>> {
+    pub(crate) fn mxfp_gemm_module_cache(&self) -> &OnceLock<Result<LoadedCudaModule>> {
         &self.mxfp_gemm_module
+    }
+
+    /// Returns hash-complete receipts for every embedded kernel module that the
+    /// CUDA driver has physically loaded in this context.
+    pub fn loaded_kernel_modules(&self) -> Result<Vec<CudaKernelRuntimeAttestation>> {
+        let mut modules = Vec::with_capacity(3);
+        for (name, loaded) in [
+            ("distance", self.distance_module.get()),
+            ("topk", self.topk_module.get()),
+            ("mxfp_gemm", self.mxfp_gemm_module.get()),
+        ] {
+            if let Some(loaded) = loaded {
+                match loaded {
+                    Ok(loaded) => modules.push(runtime_attestation(self, name, loaded)?),
+                    Err(error) => return Err(error.clone()),
+                }
+            }
+        }
+        Ok(modules)
+    }
+
+    pub(crate) fn kernel_module_attestation(
+        &self,
+        name: &'static str,
+    ) -> Result<Option<CudaKernelRuntimeAttestation>> {
+        let loaded = match name {
+            "distance" => self.distance_module.get(),
+            "topk" => self.topk_module.get(),
+            "mxfp_gemm" => self.mxfp_gemm_module.get(),
+            _ => {
+                return Err(ForgeError::RuntimeBoundary {
+                    code: "CALYX_FORGE_CUDA_KERNEL_ATTESTATION_MISSING",
+                    detail: format!("unknown embedded kernel set {name}"),
+                    remediation: "Use one of the compiled distance, topk, or mxfp_gemm kernel-set names",
+                });
+            }
+        };
+        match loaded {
+            Some(Ok(loaded)) => runtime_attestation(self, name, loaded).map(Some),
+            Some(Err(error)) => Err(error.clone()),
+            None => Ok(None),
+        }
     }
 }
 
@@ -234,6 +281,7 @@ pub fn init_cuda(runtime_ordinal: u32, determinism: bool) -> Result<CudaContext>
         let driver_ordinal = runtime_ordinal;
         let identity = driver_device_identity_for_ordinal(driver_ordinal)?;
         init_cuda_driver_ordinal(
+            runtime_ordinal,
             driver_ordinal,
             identity,
             determinism,
@@ -288,6 +336,7 @@ fn init_cuda_from_selected(
         }
     }
     init_cuda_driver_ordinal(
+        selected.ordinal,
         selected.cuda_driver_ordinal,
         selected.identity,
         determinism,
@@ -297,6 +346,7 @@ fn init_cuda_from_selected(
 }
 
 fn init_cuda_driver_ordinal(
+    runtime_ordinal: u32,
     driver_ordinal: u32,
     physical_identity: PinnedCudaDeviceIdentity,
     determinism: bool,
@@ -372,6 +422,7 @@ fn init_cuda_driver_ordinal(
     Ok(CudaContext {
         inner,
         determinism,
+        runtime_ordinal,
         driver_ordinal,
         physical_identity,
         name,
@@ -412,6 +463,7 @@ pub fn init_cuda_by_pci_bus_id(pci_bus_id: &str, determinism: bool) -> Result<Cu
         let driver_ordinal = driver_ordinal_for_pci_bus_id(pci_bus_id)?;
         let identity = driver_device_identity_for_ordinal(driver_ordinal)?;
         init_cuda_driver_ordinal(
+            driver_ordinal,
             driver_ordinal,
             identity,
             determinism,

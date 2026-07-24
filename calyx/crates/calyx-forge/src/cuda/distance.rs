@@ -1,18 +1,16 @@
-use std::str;
 use std::sync::Arc;
 
 use cudarc::driver::{CudaModule, CudaSlice, LaunchConfig, PushKernelArg};
-use cudarc::nvrtc::Ptx;
 
 use crate::cpu::{check_finite, check_shape_2d};
-use crate::cuda::kernels::DISTANCE_PTX;
+use crate::cuda::kernels::{DISTANCE_CUBIN, load_embedded_cubin};
 use crate::{CudaContext, ForgeError, Result};
 
 const BLOCK_THREADS: u32 = 256;
 const DISTANCE_REMEDIATION: &str =
     "Check CUDA distance kernel inputs and fail closed instead of returning invalid scores";
 const DEVICE_REMEDIATION: &str =
-    "Check CUDA, embedded distance PTX, and CUDA GPU device availability";
+    "Check CUDA, the attested embedded distance CUBIN, and the configured sm_120a device";
 
 pub fn cosine_batch_gpu(
     ctx: &CudaContext,
@@ -302,17 +300,7 @@ fn launch_normalize(
 }
 
 fn distance_module(ctx: &CudaContext) -> Result<Arc<CudaModule>> {
-    if let Some(module) = ctx.distance_module_cache().get() {
-        return Ok(module.clone());
-    }
-    let ptx = str::from_utf8(DISTANCE_PTX)
-        .map_err(|err| device_unavailable(ctx, format!("distance PTX is not UTF-8: {err}")))?;
-    let module = ctx
-        .inner()
-        .load_module(Ptx::from_src(ptx))
-        .map_err(|err| device_unavailable(ctx, format!("distance PTX load failed: {err}")))?;
-    let _ = ctx.distance_module_cache().set(module.clone());
-    Ok(module)
+    load_embedded_cubin(ctx, "distance", DISTANCE_CUBIN, ctx.distance_module_cache())
 }
 
 fn check_device_output(

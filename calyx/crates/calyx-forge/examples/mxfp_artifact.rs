@@ -13,8 +13,9 @@ use sha2::{Digest, Sha256};
 
 #[cfg(feature = "cuda")]
 use calyx_forge::{
-    MxFp4GemmPlan, MxFp8GemmPlan, init_cuda_native_kernel, pack_mxfp4_a_row_major,
-    pack_mxfp4_b_column_major, pack_mxfp8_a_row_major, pack_mxfp8_b_column_major,
+    MxFp4GemmPlan, MxFp8GemmPlan, configured_cuda_runtime_ordinal, init_cuda_native_kernel,
+    pack_mxfp4_a_row_major, pack_mxfp4_b_column_major, pack_mxfp8_a_row_major,
+    pack_mxfp8_b_column_major,
 };
 
 const M: usize = 16;
@@ -330,7 +331,7 @@ fn exercise_gpu(
 ) -> Result<Value, Box<dyn std::error::Error>> {
     use calyx_forge::cuda::kernels::MXFP_GEMM_CUBIN;
 
-    let ctx = init_cuda_native_kernel(0, false)?;
+    let ctx = init_cuda_native_kernel(configured_cuda_runtime_ordinal()?, false)?;
     let stream = ctx.inner().default_stream();
     let a4 = pack_mxfp4_a_row_major(a, M, K)?;
     let b4 = pack_mxfp4_b_column_major(b, K, N)?;
@@ -497,6 +498,7 @@ fn evidence_json(evidence: &calyx_forge::MxPackedGemmEvidence) -> Value {
         "module_cache_hit_at_creation": evidence.module_cache_hit_at_creation,
         "execution_count": evidence.execution_count,
         "device_selection_authority": evidence.device_selection_authority,
+        "module": &evidence.module,
     })
 }
 
