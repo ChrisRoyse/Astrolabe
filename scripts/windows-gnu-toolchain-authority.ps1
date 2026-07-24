@@ -2315,7 +2315,10 @@ function Publish-CudaToolkitViewManifest {
     $ViewLease.ManifestBytes = $expectedBytes
     $ViewLease.ManifestSha256 = $snapshot.Sha256
     $ViewLease.Complete = $true
-    Write-Output "CUDA_TOOLKIT_VIEW[ASTRO_CUDA_TOOLKIT_VIEW_MANIFEST]: path=$($ViewLease.ManifestPath); sha256=$($snapshot.Sha256); junctions=$($ViewLease.Junctions.Count); every junction handle retained with delete sharing denied"
+    # New-CudaToolkitNoSpaceView's success-pipeline contract is exactly one
+    # import-library path. Host telemetry must not become an additional return
+    # value and then an accidental RUSTFLAGS -L argument.
+    Write-Host "CUDA_TOOLKIT_VIEW[ASTRO_CUDA_TOOLKIT_VIEW_MANIFEST]: path=$($ViewLease.ManifestPath); sha256=$($snapshot.Sha256); junctions=$($ViewLease.Junctions.Count); every junction handle retained with delete sharing denied"
 }
 
 function Remove-CudaToolkitExactJunctions {
