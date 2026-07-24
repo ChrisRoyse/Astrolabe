@@ -379,13 +379,18 @@ pub struct SqliteImportReport {
     pub series_inputs: usize,
     /// Registry/reverse/QN/recurrence rows changed by this run.
     pub series_mutated_rows: usize,
-    /// Latest vault sequence after the run ledger append.
+    /// Latest vault sequence after this import. Unchanged on a physical no-op.
     pub seq: Seq,
-    /// Ledger sequence of the real `EntryKind::Ingest` run record.
-    pub ledger_seq: u64,
+    /// Ledger sequence of this import's paired `EntryKind::Ingest` mutation.
+    ///
+    /// `None` means the authoritative write-set was empty and no vault or ledger
+    /// mutation was committed. A no-op never invents an audit event.
+    #[serde(default)]
+    pub ledger_seq: Option<u64>,
     /// Ledger rows visible before this import began.
     pub ledger_rows_before: usize,
-    /// Ledger rows visible after the run record was appended.
+    /// Ledger rows visible after the import. Equal to
+    /// [`Self::ledger_rows_before`] on an isolated physical no-op.
     pub ledger_rows_after: usize,
     /// Exact skipped-edge counters.
     pub edge_skips: EdgeSkipCounters,
@@ -394,7 +399,7 @@ pub struct SqliteImportReport {
     /// Post-write CF readback verification counts.
     pub readback: SqliteImportReadback,
     /// Unforgeable full-readback witness when this import changed vault rows.
-    /// An idempotent ledger-only replay carries labeled absence (`None`).
+    /// An idempotent physical no-op carries labeled absence (`None`).
     #[serde(default, skip_deserializing)]
     pub fsv: Option<FsvAck>,
     /// Imported constellation ids in deterministic node-id order.
@@ -1304,7 +1309,7 @@ where
         series_inputs,
         series_mutated_rows,
         seq: vault.latest_seq(),
-        ledger_seq: ledger_ref.seq,
+        ledger_seq: ledger_ref.as_ref().map(|reference| reference.seq),
         ledger_rows_before: input.ledger_rows_before,
         ledger_rows_after,
         edge_skips: prepared.edge_skips,
@@ -4573,11 +4578,12 @@ where
     Ok(entry.entry_hash == reference.hash)
 }
 
-/// Outcome of [`write_import_rows`]: the paired ledger ref, the committed-state
-/// FSV ack (absent when no rows were staged), graph rows written, edge rows
-/// written, and labeled sub-phase timings.
+/// Outcome of [`write_import_rows`]: the paired ledger ref (absent exactly when
+/// no mutation was committed), the committed-state FSV ack (also absent on that
+/// physical no-op), graph rows written, edge rows written, and labeled
+/// sub-phase timings.
 type ImportWriteOutcome = (
-    LedgerRef,
+    Option<LedgerRef>,
     Option<FsvAck>,
     usize,
     usize,
@@ -4670,14 +4676,8 @@ where
     sub_phase = std::time::Instant::now();
 
     if rows.is_empty() {
-        let ledger_ref = vault.append_ledger_entry(
-            EntryKind::Ingest,
-            SubjectId::Query(sqlite_fingerprint.to_vec()),
-            payload,
-            ActorId::Service(ASTROLABE_INGEST_ACTOR.to_string()),
-        )?;
         return Ok((
-            ledger_ref,
+            None,
             None,
             graph_rows_written,
             edge_rows_written,
@@ -4728,7 +4728,7 @@ where
         sub_phase.elapsed().as_millis() as u64,
     ));
     Ok((
-        ledger_ref,
+        Some(ledger_ref),
         Some(fsv),
         graph_rows_written,
         edge_rows_written,

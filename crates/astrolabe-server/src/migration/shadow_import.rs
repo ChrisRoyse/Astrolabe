@@ -1405,6 +1405,7 @@ pub(crate) fn import_shadow_vault_with_archaeology_at(
             _shadow_mark = std::time::Instant::now();
         }};
     }
+    let vault_seq_before_import = vault.latest_seq();
     let shadow_import =
         import_shadow_vault_report(&sqlite_path, &vault, &ShadowSlotRuntime, &options, row_sink)?;
     let report = shadow_import.report;
@@ -1418,6 +1419,28 @@ pub(crate) fn import_shadow_vault_with_archaeology_at(
         || report.graph_rows_written > 0
         || report.edge_rows_written > 0
         || report.series_mutated_rows > 0;
+    let vault_seq_after_import = vault.latest_seq();
+    let mutation_contract_valid = if import_changed {
+        vault_seq_after_import > vault_seq_before_import
+            && report.ledger_rows_after > report.ledger_rows_before
+            && report.ledger_seq.is_some()
+            && report.fsv.is_some()
+    } else {
+        vault_seq_after_import == vault_seq_before_import
+            && report.ledger_rows_after == report.ledger_rows_before
+            && report.ledger_seq.is_none()
+            && report.fsv.is_none()
+    };
+    if !mutation_contract_valid {
+        return Err(format!(
+            "ASTRO_SHADOW_IMPORT_MUTATION_CONTRACT_BROKEN: project {project:?} import_changed={import_changed}, vault_seq_before={vault_seq_before_import}, vault_seq_after={vault_seq_after_import}, ledger_rows_before={}, ledger_rows_after={}, ledger_seq={:?}, fsv_present={}; remediation: preserve the staged generation, inspect the importer write set and paired ledger path, and do not publish until mutation evidence agrees exactly with durable state",
+            report.ledger_rows_before,
+            report.ledger_rows_after,
+            report.ledger_seq,
+            report.fsv.is_some(),
+        )
+        .into());
+    }
     let persisted_git_source_fingerprint = read_config_value(
         cache_dir,
         &metadata_key(project, GIT_SOURCE_FINGERPRINT_KEY),
