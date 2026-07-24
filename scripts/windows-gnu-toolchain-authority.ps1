@@ -6509,9 +6509,10 @@ finally {
                         $record.Lease.Path = $record.TombstonePath
                         $renamedSnapshot =
                             Get-AstroLauncherTempTreeSnapshot $record.Lease
-                        Assert-AstroLauncherTempSnapshotsEqual `
-                            $record.Snapshot `
-                            $renamedSnapshot
+                        Assert-AstroLauncherTreeSnapshotContentEqual `
+                            -Before $record.Snapshot `
+                            -After $renamedSnapshot `
+                            -Description 'owned target tree across exact rename'
                         if (-not [string]::Equals(
                                 $renamedSnapshot.RootFinalPath,
                                 $record.TombstonePath,

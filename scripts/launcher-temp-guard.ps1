@@ -3263,24 +3263,39 @@ function Get-AstroLauncherTempTreeSnapshot {
     }
 }
 
+function Assert-AstroLauncherTreeSnapshotContentEqual {
+    param(
+        [Parameter(Mandatory)]$Before,
+        [Parameter(Mandatory)]$After,
+        [Parameter(Mandatory)][string]$Description
+    )
+
+    if ($Before.RootFileId -cne $After.RootFileId -or
+        $Before.RootState -cne $After.RootState -or
+        $Before.EntryCount -ne $After.EntryCount -or
+        $Before.InventorySha256 -cne $After.InventorySha256 -or
+        [string]::Join("`n", [string[]]$Before.Entries) -cne
+            [string]::Join("`n", [string[]]$After.Entries)) {
+        throw "$Description changed object identity or exact content: $($Before.Path)"
+    }
+}
+
 function Assert-AstroLauncherTempSnapshotsEqual {
     param(
         [Parameter(Mandatory)]$Before,
         [Parameter(Mandatory)]$After
     )
 
-    if ($Before.RootFileId -cne $After.RootFileId -or
-        -not [string]::Equals(
+    Assert-AstroLauncherTreeSnapshotContentEqual `
+        -Before $Before `
+        -After $After `
+        -Description 'launcher TEMP tree'
+    if (-not [string]::Equals(
             $Before.RootFinalPath,
             $After.RootFinalPath,
             [StringComparison]::OrdinalIgnoreCase
-        ) -or
-        $Before.RootState -cne $After.RootState -or
-        $Before.EntryCount -ne $After.EntryCount -or
-        $Before.InventorySha256 -cne $After.InventorySha256 -or
-        [string]::Join("`n", [string[]]$Before.Entries) -cne
-            [string]::Join("`n", [string[]]$After.Entries)) {
-        throw "launcher TEMP tree changed across deletion-authority probes: $($Before.Path)"
+        )) {
+        throw "launcher TEMP tree changed namespace location across deletion-authority probes: $($Before.Path)"
     }
 }
 
@@ -3764,7 +3779,10 @@ function Move-AstroLauncherTempLeaseToCleanupTombstone {
             )) {
             throw "retained TEMP rename resolved to an unexpected destination ('$destination' -> '$($after.RootFinalPath)')"
         }
-        Assert-AstroLauncherTempSnapshotsEqual $before $after
+        Assert-AstroLauncherTreeSnapshotContentEqual `
+            -Before $before `
+            -After $after `
+            -Description 'retained TEMP tree across exact rename'
         $sourceState = Get-AstroPathEntryState $source
         if ($sourceState.State -ne 'absent') {
             throw "TEMP cleanup rename did not make the original path absent (state=$($sourceState.State), error=$($sourceState.Error)): $source"
