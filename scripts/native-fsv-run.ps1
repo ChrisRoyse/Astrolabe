@@ -175,7 +175,9 @@ if (-not ([Management.Automation.PSTypeName]'AstroFsvAtomicFile').Type) {
     Add-Type -Language CSharp -TypeDefinition @'
 using System;
 using System.ComponentModel;
+using System.Diagnostics;
 using System.Runtime.InteropServices;
+using System.Text;
 using Microsoft.Win32.SafeHandles;
 
 public static class AstroFsvAtomicFile {
@@ -244,6 +246,431 @@ public static class AstroFsvAtomicFile {
         if (exitCode == STILL_ACTIVE)
             throw new InvalidOperationException("retained native process handle still reports STILL_ACTIVE");
         return exitCode;
+    }
+}
+
+public sealed class AstroFsvCreatedProcess : IDisposable {
+    const uint STILL_ACTIVE = 259;
+    const uint WAIT_OBJECT_0 = 0;
+    const uint WAIT_TIMEOUT = 258;
+    const uint WAIT_FAILED = 0xFFFFFFFF;
+
+    IntPtr threadHandle;
+    bool disposed;
+
+    internal AstroFsvCreatedProcess(IntPtr processHandle, IntPtr primaryThreadHandle, uint processId) {
+        ProcessHandle = new SafeProcessHandle(processHandle, true);
+        threadHandle = primaryThreadHandle;
+        ProcessId = processId;
+    }
+
+    public SafeProcessHandle ProcessHandle { get; private set; }
+    public uint ProcessId { get; private set; }
+    public Process BoundProcess { get; private set; }
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    static extern uint ResumeThread(IntPtr thread);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    static extern bool TerminateProcess(SafeProcessHandle process, uint exitCode);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    static extern uint WaitForSingleObject(SafeProcessHandle handle, uint milliseconds);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    static extern bool GetExitCodeProcess(SafeProcessHandle process, out uint exitCode);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    static extern bool CloseHandle(IntPtr handle);
+
+    public Process BindAndResume() {
+        if (disposed)
+            throw new ObjectDisposedException("AstroFsvCreatedProcess");
+        if (BoundProcess != null)
+            throw new InvalidOperationException("native child process was already bound");
+        if (threadHandle == IntPtr.Zero)
+            throw new InvalidOperationException("native child primary thread handle is unavailable");
+
+        BoundProcess = Process.GetProcessById(checked((int)ProcessId));
+        BoundProcess.Refresh();
+        if (BoundProcess.HasExited)
+            throw new InvalidOperationException(
+                "created-suspended native child exited before exact process binding (pid=" +
+                ProcessId + ")");
+
+        uint previousSuspendCount = ResumeThread(threadHandle);
+        if (previousSuspendCount == UInt32.MaxValue) {
+            int error = Marshal.GetLastWin32Error();
+            throw new Win32Exception(error,
+                "ResumeThread failed for created-suspended native child " +
+                "(native_error=" + error + "; pid=" + ProcessId + ")");
+        }
+        ClosePrimaryThreadHandle();
+        if (previousSuspendCount != 1) {
+            throw new InvalidOperationException(
+                "created-suspended native child had an unexpected primary-thread suspend count " +
+                "(pid=" + ProcessId + "; previous_suspend_count=" +
+                previousSuspendCount + "; expected=1)");
+        }
+        return BoundProcess;
+    }
+
+    public void TerminateAndWait(uint exitCode, uint timeoutMilliseconds) {
+        if (disposed)
+            throw new ObjectDisposedException("AstroFsvCreatedProcess");
+        if (ProcessHandle == null || ProcessHandle.IsInvalid || ProcessHandle.IsClosed)
+            throw new InvalidOperationException(
+                "cannot terminate created native child because its retained process handle is unavailable " +
+                "(pid=" + ProcessId + ")");
+
+        if (!TerminateProcess(ProcessHandle, exitCode)) {
+            int terminateError = Marshal.GetLastWin32Error();
+            uint observedCode;
+            if (!GetExitCodeProcess(ProcessHandle, out observedCode)) {
+                int observeError = Marshal.GetLastWin32Error();
+                throw new Win32Exception(observeError,
+                    "TerminateProcess and follow-up GetExitCodeProcess both failed for created native child " +
+                    "(pid=" + ProcessId + "; terminate_native_error=" + terminateError +
+                    "; observe_native_error=" + observeError + ")");
+            }
+            if (observedCode == STILL_ACTIVE) {
+                throw new Win32Exception(terminateError,
+                    "TerminateProcess failed and the exact created native child remains live " +
+                    "(native_error=" + terminateError + "; pid=" + ProcessId + ")");
+            }
+        }
+
+        uint waitResult = WaitForSingleObject(ProcessHandle, timeoutMilliseconds);
+        if (waitResult == WAIT_TIMEOUT) {
+            throw new TimeoutException(
+                "timed out waiting for exact created native child termination " +
+                "(pid=" + ProcessId + "; timeout_ms=" + timeoutMilliseconds + ")");
+        }
+        if (waitResult == WAIT_FAILED) {
+            int error = Marshal.GetLastWin32Error();
+            throw new Win32Exception(error,
+                "WaitForSingleObject failed for exact created native child " +
+                "(native_error=" + error + "; pid=" + ProcessId + ")");
+        }
+        if (waitResult != WAIT_OBJECT_0) {
+            throw new InvalidOperationException(
+                "WaitForSingleObject returned an unexpected result for exact created native child " +
+                "(pid=" + ProcessId + "; wait_result=" + waitResult + ")");
+        }
+
+        uint finalCode;
+        if (!GetExitCodeProcess(ProcessHandle, out finalCode)) {
+            int error = Marshal.GetLastWin32Error();
+            throw new Win32Exception(error,
+                "GetExitCodeProcess failed after exact created native child termination " +
+                "(native_error=" + error + "; pid=" + ProcessId + ")");
+        }
+        if (finalCode == STILL_ACTIVE)
+            throw new InvalidOperationException(
+                "exact created native child still reports STILL_ACTIVE after termination wait " +
+                "(pid=" + ProcessId + ")");
+        ClosePrimaryThreadHandle();
+        if (BoundProcess != null)
+            BoundProcess.Refresh();
+    }
+
+    void ClosePrimaryThreadHandle() {
+        if (threadHandle == IntPtr.Zero)
+            return;
+        IntPtr owned = threadHandle;
+        threadHandle = IntPtr.Zero;
+        if (!CloseHandle(owned)) {
+            int error = Marshal.GetLastWin32Error();
+            throw new Win32Exception(error,
+                "CloseHandle failed for created native child primary thread " +
+                "(native_error=" + error + "; pid=" + ProcessId + ")");
+        }
+    }
+
+    public void Dispose() {
+        if (disposed)
+            return;
+        disposed = true;
+        if (threadHandle != IntPtr.Zero) {
+            CloseHandle(threadHandle);
+            threadHandle = IntPtr.Zero;
+        }
+        if (ProcessHandle != null)
+            ProcessHandle.Dispose();
+    }
+}
+
+public static class AstroFsvNativeProcess {
+    const uint GENERIC_READ = 0x80000000;
+    const uint GENERIC_WRITE = 0x40000000;
+    const uint FILE_SHARE_READ = 0x00000001;
+    const uint CREATE_NEW = 1;
+    const uint OPEN_EXISTING = 3;
+    const uint FILE_ATTRIBUTE_NORMAL = 0x00000080;
+    const uint STARTF_USESTDHANDLES = 0x00000100;
+    const uint CREATE_SUSPENDED = 0x00000004;
+    const uint EXTENDED_STARTUPINFO_PRESENT = 0x00080000;
+    const uint CREATE_NO_WINDOW = 0x08000000;
+    const uint PROC_THREAD_ATTRIBUTE_HANDLE_LIST = 0x00020002;
+    const int ERROR_INSUFFICIENT_BUFFER = 122;
+
+    [StructLayout(LayoutKind.Sequential)]
+    struct SECURITY_ATTRIBUTES {
+        public int nLength;
+        public IntPtr lpSecurityDescriptor;
+        public int bInheritHandle;
+    }
+
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    struct STARTUPINFO {
+        public int cb;
+        public string lpReserved;
+        public string lpDesktop;
+        public string lpTitle;
+        public int dwX;
+        public int dwY;
+        public int dwXSize;
+        public int dwYSize;
+        public int dwXCountChars;
+        public int dwYCountChars;
+        public int dwFillAttribute;
+        public int dwFlags;
+        public short wShowWindow;
+        public short cbReserved2;
+        public IntPtr lpReserved2;
+        public IntPtr hStdInput;
+        public IntPtr hStdOutput;
+        public IntPtr hStdError;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    struct STARTUPINFOEX {
+        public STARTUPINFO StartupInfo;
+        public IntPtr lpAttributeList;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    struct PROCESS_INFORMATION {
+        public IntPtr hProcess;
+        public IntPtr hThread;
+        public uint dwProcessId;
+        public uint dwThreadId;
+    }
+
+    [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    static extern SafeFileHandle CreateFileW(string name, uint access, uint share,
+        ref SECURITY_ATTRIBUTES security, uint creation, uint flags, IntPtr template);
+
+    [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    static extern bool DeleteFileW(string name);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    static extern bool InitializeProcThreadAttributeList(
+        IntPtr attributeList, int attributeCount, int flags, ref IntPtr size);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    static extern bool UpdateProcThreadAttribute(
+        IntPtr attributeList, uint flags, IntPtr attribute, IntPtr value,
+        IntPtr size, IntPtr previousValue, IntPtr returnSize);
+
+    [DllImport("kernel32.dll")]
+    static extern void DeleteProcThreadAttributeList(IntPtr attributeList);
+
+    [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    static extern bool CreateProcessW(
+        string applicationName,
+        StringBuilder commandLine,
+        IntPtr processAttributes,
+        IntPtr threadAttributes,
+        bool inheritHandles,
+        uint creationFlags,
+        IntPtr environment,
+        string currentDirectory,
+        ref STARTUPINFOEX startupInfo,
+        out PROCESS_INFORMATION processInformation);
+
+    static string Extended(string path) {
+        string full = System.IO.Path.GetFullPath(path);
+        if (full.StartsWith(@"\\?\", StringComparison.Ordinal))
+            return full;
+        if (full.StartsWith(@"\\", StringComparison.Ordinal))
+            return @"\\?\UNC\" + full.Substring(2);
+        return @"\\?\" + full;
+    }
+
+    static SafeFileHandle OpenInherited(
+        string path, uint access, uint creation, string operation) {
+        SECURITY_ATTRIBUTES security = new SECURITY_ATTRIBUTES();
+        security.nLength = Marshal.SizeOf(typeof(SECURITY_ATTRIBUTES));
+        security.lpSecurityDescriptor = IntPtr.Zero;
+        security.bInheritHandle = 1;
+        SafeFileHandle handle = CreateFileW(path, access, FILE_SHARE_READ,
+            ref security, creation, FILE_ATTRIBUTE_NORMAL, IntPtr.Zero);
+        if (handle.IsInvalid) {
+            int error = Marshal.GetLastWin32Error();
+            handle.Dispose();
+            throw new Win32Exception(error,
+                operation + " failed (native_error=" + error + "; path=" + path + ")");
+        }
+        return handle;
+    }
+
+    static string RemoveCreatedOutput(string path) {
+        if (String.IsNullOrEmpty(path))
+            return null;
+        if (DeleteFileW(Extended(path)))
+            return null;
+        int error = Marshal.GetLastWin32Error();
+        return "DeleteFileW pre-launch cleanup failed (native_error=" + error +
+            "; path=" + path + ")";
+    }
+
+    public static AstroFsvCreatedProcess CreateSuspended(
+        string applicationPath,
+        string commandLine,
+        string standardOutputPath,
+        string standardErrorPath) {
+        if (String.IsNullOrWhiteSpace(applicationPath))
+            throw new ArgumentException("applicationPath is empty", "applicationPath");
+        if (String.IsNullOrWhiteSpace(commandLine))
+            throw new ArgumentException("commandLine is empty", "commandLine");
+        if (commandLine.Length > 32766)
+            throw new ArgumentOutOfRangeException("commandLine",
+                "CreateProcessW command line exceeds 32,766 UTF-16 characters " +
+                "(actual=" + commandLine.Length + ")");
+
+        SafeFileHandle standardInput = null;
+        SafeFileHandle standardOutput = null;
+        SafeFileHandle standardError = null;
+        IntPtr attributeList = IntPtr.Zero;
+        IntPtr handleList = IntPtr.Zero;
+        bool outputCreated = false;
+        bool errorCreated = false;
+        bool processCreated = false;
+        Exception failure = null;
+        try {
+            standardInput = OpenInherited("NUL", GENERIC_READ, OPEN_EXISTING,
+                "CreateFileW inherited stdin=NUL");
+            standardOutput = OpenInherited(Extended(standardOutputPath), GENERIC_WRITE,
+                CREATE_NEW, "CreateFileW no-clobber inherited stdout");
+            outputCreated = true;
+            standardError = OpenInherited(Extended(standardErrorPath), GENERIC_WRITE,
+                CREATE_NEW, "CreateFileW no-clobber inherited stderr");
+            errorCreated = true;
+
+            IntPtr attributeBytes = IntPtr.Zero;
+            bool sizingResult = InitializeProcThreadAttributeList(
+                IntPtr.Zero, 1, 0, ref attributeBytes);
+            int sizingError = Marshal.GetLastWin32Error();
+            if (sizingResult || sizingError != ERROR_INSUFFICIENT_BUFFER ||
+                attributeBytes == IntPtr.Zero) {
+                throw new Win32Exception(sizingError,
+                    "InitializeProcThreadAttributeList sizing failed " +
+                    "(native_error=" + sizingError + "; requested_attributes=1)");
+            }
+            attributeList = Marshal.AllocHGlobal(attributeBytes);
+            if (!InitializeProcThreadAttributeList(
+                attributeList, 1, 0, ref attributeBytes)) {
+                int error = Marshal.GetLastWin32Error();
+                throw new Win32Exception(error,
+                    "InitializeProcThreadAttributeList allocation failed " +
+                    "(native_error=" + error + "; requested_attributes=1)");
+            }
+
+            handleList = Marshal.AllocHGlobal(IntPtr.Size * 3);
+            Marshal.WriteIntPtr(handleList, 0, standardInput.DangerousGetHandle());
+            Marshal.WriteIntPtr(handleList, IntPtr.Size,
+                standardOutput.DangerousGetHandle());
+            Marshal.WriteIntPtr(handleList, IntPtr.Size * 2,
+                standardError.DangerousGetHandle());
+            if (!UpdateProcThreadAttribute(
+                attributeList, 0,
+                new IntPtr(PROC_THREAD_ATTRIBUTE_HANDLE_LIST),
+                handleList, new IntPtr(IntPtr.Size * 3),
+                IntPtr.Zero, IntPtr.Zero)) {
+                int error = Marshal.GetLastWin32Error();
+                throw new Win32Exception(error,
+                    "UpdateProcThreadAttribute restricted handle list failed " +
+                    "(native_error=" + error + "; inherited_handle_count=3)");
+            }
+
+            STARTUPINFOEX startup = new STARTUPINFOEX();
+            startup.StartupInfo.cb = Marshal.SizeOf(typeof(STARTUPINFOEX));
+            startup.StartupInfo.dwFlags = unchecked((int)STARTF_USESTDHANDLES);
+            startup.StartupInfo.hStdInput = standardInput.DangerousGetHandle();
+            startup.StartupInfo.hStdOutput = standardOutput.DangerousGetHandle();
+            startup.StartupInfo.hStdError = standardError.DangerousGetHandle();
+            startup.lpAttributeList = attributeList;
+
+            StringBuilder mutableCommandLine =
+                new StringBuilder(commandLine, commandLine.Length + 1);
+            PROCESS_INFORMATION processInformation;
+            uint creationFlags =
+                CREATE_SUSPENDED | EXTENDED_STARTUPINFO_PRESENT | CREATE_NO_WINDOW;
+            if (!CreateProcessW(
+                Extended(applicationPath),
+                mutableCommandLine,
+                IntPtr.Zero,
+                IntPtr.Zero,
+                true,
+                creationFlags,
+                IntPtr.Zero,
+                null,
+                ref startup,
+                out processInformation)) {
+                int error = Marshal.GetLastWin32Error();
+                throw new Win32Exception(error,
+                    "CreateProcessW exact extended application launch failed " +
+                    "(native_error=" + error +
+                    "; application=" + applicationPath +
+                    "; application_extended=" + Extended(applicationPath) +
+                    "; command_line_utf16_characters=" + commandLine.Length +
+                    "; stdout=" + standardOutputPath +
+                    "; stderr=" + standardErrorPath +
+                    "; creation_flags=" + creationFlags + ")");
+            }
+
+            processCreated = true;
+            return new AstroFsvCreatedProcess(
+                processInformation.hProcess,
+                processInformation.hThread,
+                processInformation.dwProcessId);
+        }
+        catch (Exception ex) {
+            failure = ex;
+            throw;
+        }
+        finally {
+            if (attributeList != IntPtr.Zero) {
+                DeleteProcThreadAttributeList(attributeList);
+                Marshal.FreeHGlobal(attributeList);
+            }
+            if (handleList != IntPtr.Zero)
+                Marshal.FreeHGlobal(handleList);
+            if (standardError != null)
+                standardError.Dispose();
+            if (standardOutput != null)
+                standardOutput.Dispose();
+            if (standardInput != null)
+                standardInput.Dispose();
+
+            if (!processCreated) {
+                string errorCleanup = errorCreated
+                    ? RemoveCreatedOutput(standardErrorPath)
+                    : null;
+                string outputCleanup = outputCreated
+                    ? RemoveCreatedOutput(standardOutputPath)
+                    : null;
+                if (failure != null &&
+                    (!String.IsNullOrEmpty(errorCleanup) ||
+                     !String.IsNullOrEmpty(outputCleanup))) {
+                    throw new InvalidOperationException(
+                        failure.Message + "; pre-launch cleanup: " +
+                        (errorCleanup ?? "stderr=absent") + "; " +
+                        (outputCleanup ?? "stdout=absent"), failure);
+                }
+            }
+        }
     }
 }
 '@
@@ -352,6 +779,8 @@ $childExitCode = $null
 $childExitObservation = $null
 $childExitObservationError = $null
 $childProcessHandle = $null
+$createdChild = $null
+$childTerminationUncertain = $false
 $artifact = $null
 $artifactHashBefore = $null
 $receiptFull = $null
@@ -543,22 +972,51 @@ try {
     }
     $fsvLockOwned = $true
 
-    $startProcessParameters = @{
-        FilePath = ConvertTo-AstroExtendedLengthPath $artifact
-        RedirectStandardOutput =
-            ConvertTo-AstroExtendedLengthPath $StandardOutputPath
-        RedirectStandardError =
-            ConvertTo-AstroExtendedLengthPath $StandardErrorPath
-        WindowStyle = 'Hidden'
-        PassThru = $true
-    }
+    $commandLine = ConvertTo-WindowsCommandLineArgument $artifact
     if ($argumentCount -gt 0) {
-        $startProcessParameters.ArgumentList = $argumentLine
+        $commandLine += " $argumentLine"
     }
-    $child = Start-Process @startProcessParameters
-    $childProcessHandle = $child.SafeHandle
+    try {
+        $createdChild = [AstroFsvNativeProcess]::CreateSuspended(
+            $artifact,
+            $commandLine,
+            $StandardOutputPath,
+            $StandardErrorPath
+        )
+    }
+    catch {
+        Fail-Astro 'ASTRO_FSV_CHILD_CREATE_FAILED' "direct native process creation failed before a child identity was returned: $($_.Exception.Message)" 'preserve the staged session, inspect the native operation/error/path diagnostics, and repair the exact process-creation boundary before rerunning'
+    }
+    $childProcessHandle = $createdChild.ProcessHandle
+    try {
+        $child = $createdChild.BindAndResume()
+    }
+    catch {
+        $bindFailure = $_.Exception.Message
+        $child = $createdChild.BoundProcess
+        try {
+            $createdChild.TerminateAndWait([uint32]0xA57F0001, [uint32]30000)
+        }
+        catch {
+            $childTerminationUncertain = $true
+            Fail-Astro 'ASTRO_FSV_CHILD_BIND_CLEANUP_FAILED' "exact child PID $($createdChild.ProcessId) could not be bound/resumed and exact termination could not be proved (bind_failure=$bindFailure; termination_failure=$($_.Exception.Message))" 'preserve the launcher/FSV state and use exact process/Job attribution before any cleanup'
+        }
+        if ($null -eq $child) {
+            try {
+                foreach ($createdOutput in @($StandardOutputPath, $StandardErrorPath)) {
+                    if (Test-AstroPathLongPath -LiteralPath $createdOutput -PathType Leaf) {
+                        Remove-AstroFileLongPath $createdOutput
+                    }
+                }
+            }
+            catch {
+                Fail-Astro 'ASTRO_FSV_CHILD_BIND_OUTPUT_CLEANUP_FAILED' "exact child PID $($createdChild.ProcessId) was terminated after process binding failed, but an output created by that never-executed child could not be removed (bind_failure=$bindFailure; output_cleanup_failure=$($_.Exception.Message))" 'preserve the staged session and inspect the exact output path/handle state before lifecycle recovery'
+            }
+        }
+        Fail-Astro 'ASTRO_FSV_CHILD_BIND_FAILED' "exact child PID $($createdChild.ProcessId) was created suspended but binding/resume failed; exact termination completed (failure=$bindFailure)" 'preserve the durable failed-run record and repair native process binding before rerunning'
+    }
     if ($null -eq $childProcessHandle -or $childProcessHandle.IsInvalid -or $childProcessHandle.IsClosed) {
-        Fail-Astro 'ASTRO_FSV_CHILD_HANDLE_UNAVAILABLE' "native child PID $($child.Id) did not expose a retained process handle" 'preserve the session and repair native process launch before rerunning'
+        Fail-Astro 'ASTRO_FSV_CHILD_HANDLE_UNAVAILABLE' "native child PID $($child.Id) did not retain its exact CreateProcessW process handle" 'preserve the session and repair native process launch before rerunning'
     }
     $childStartedAtUtc = [DateTime]::UtcNow.ToString('o')
     $ownedLock = Read-AstroUtf8FileLongPath $fsvLockPath | ConvertFrom-Json
@@ -659,6 +1117,8 @@ try {
         runner = [ordered]@{ pid = $PID; launcher_pid = $launcherPid }
         process = [ordered]@{
             pid = $child.Id
+            launch_boundary = 'kernel32!CreateProcessW(non-null extended application; STARTUPINFOEX restricted handle list)'
+            standard_input = 'NUL'
             exit_code = $childExitCode
             exit_code_observation = $childExitObservation
             started_at = $childStartedAtUtc
@@ -768,6 +1228,8 @@ catch {
                 receipt_path = $receiptFull
                 process = [ordered]@{
                     pid = $child.Id
+                    launch_boundary = 'kernel32!CreateProcessW(non-null extended application; STARTUPINFOEX restricted handle list)'
+                    standard_input = 'NUL'
                     exit_code = $childExitCode
                     exit_code_observation = $childExitObservation
                     exit_code_observation_error = Failure-Text $childExitObservationError
@@ -817,7 +1279,7 @@ finally {
     if ($null -ne $receiptHandle) { $receiptHandle.Dispose() }
     if ($null -ne $artifactHandle) { $artifactHandle.Dispose() }
     if ($null -ne $directoryHandle) { $directoryHandle.Dispose() }
-    $childStillLive = $false
+    $childStillLive = $childTerminationUncertain
     if ($null -ne $child) {
         try { $childStillLive = -not $child.HasExited }
         catch { $childStillLive = $true }
@@ -836,4 +1298,6 @@ finally {
     elseif ($fsvLockOwned -and $childStillLive) {
         [Console]::Error.WriteLine('NATIVE_FSV[ASTRO_FSV_LOCK_PRESERVED_LIVE_CHILD]: preserving the FSV lock because the recorded real child is still live')
     }
+    if ($null -ne $createdChild) { $createdChild.Dispose() }
+    if ($null -ne $child) { $child.Dispose() }
 }
