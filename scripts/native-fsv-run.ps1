@@ -856,6 +856,7 @@ public sealed class AstroFsvRestartManagerOwner {
 public sealed class AstroFsvRestartManagerResult {
     public AstroFsvRestartManagerOwner[] Owners { get; internal set; }
     public uint RebootReasons { get; internal set; }
+    public int ListQueryAttempts { get; internal set; }
 }
 
 public static class AstroFsvRestartManager {
@@ -950,62 +951,62 @@ public static class AstroFsvRestartManager {
             if (result != ERROR_SUCCESS)
                 throw Failure("RmRegisterResources", result, fullPath);
 
-            uint needed;
-            uint count = 0;
-            uint rebootReasons = 0;
-            result = RmGetList(
-                sessionHandle,
-                out needed,
-                ref count,
-                null,
-                ref rebootReasons);
-            if (result == ERROR_SUCCESS) {
-                return new AstroFsvRestartManagerResult {
-                    Owners = new AstroFsvRestartManagerOwner[0],
-                    RebootReasons = rebootReasons
-                };
+            RM_PROCESS_INFO[] processInfo = null;
+            for (int attempt = 1; attempt <= 5; attempt++) {
+                uint needed;
+                uint count = processInfo == null
+                    ? 0
+                    : (uint)processInfo.Length;
+                uint rebootReasons = 0;
+                result = RmGetList(
+                    sessionHandle,
+                    out needed,
+                    ref count,
+                    processInfo,
+                    ref rebootReasons);
+                if (result == ERROR_SUCCESS) {
+                    List<AstroFsvRestartManagerOwner> owners =
+                        new List<AstroFsvRestartManagerOwner>();
+                    for (int index = 0; index < count; index++) {
+                        long fileTime = ToFileTime(
+                            processInfo[index].Process.ProcessStartTime);
+                        owners.Add(new AstroFsvRestartManagerOwner {
+                            ProcessId =
+                                processInfo[index].Process.ProcessId,
+                            ProcessStartFileTime = fileTime,
+                            ProcessStartUtcTicks =
+                                DateTime.FromFileTimeUtc(fileTime).Ticks,
+                            ApplicationName =
+                                processInfo[index].ApplicationName,
+                            ServiceShortName =
+                                processInfo[index].ServiceShortName,
+                            ApplicationType =
+                                processInfo[index].ApplicationType,
+                            ApplicationStatus =
+                                processInfo[index].ApplicationStatus,
+                            TerminalSessionId =
+                                processInfo[index].TerminalSessionId,
+                            Restartable =
+                                processInfo[index].Restartable != 0
+                        });
+                    }
+                    return new AstroFsvRestartManagerResult {
+                        Owners = owners.ToArray(),
+                        RebootReasons = rebootReasons,
+                        ListQueryAttempts = attempt
+                    };
+                }
+                if (result != ERROR_MORE_DATA)
+                    throw Failure("RmGetList", result, fullPath);
+                if (needed == 0)
+                    throw new InvalidOperationException(
+                        "RmGetList returned ERROR_MORE_DATA with zero required " +
+                        "owners (attempt=" + attempt + "; path=" + fullPath + ")");
+                processInfo = new RM_PROCESS_INFO[needed];
             }
-            if (result != ERROR_MORE_DATA)
-                throw Failure("RmGetList(size)", result, fullPath);
-            if (needed == 0)
-                throw new InvalidOperationException(
-                    "RmGetList returned ERROR_MORE_DATA with zero required owners " +
-                    "(path=" + fullPath + ")");
-
-            RM_PROCESS_INFO[] processInfo = new RM_PROCESS_INFO[needed];
-            count = needed;
-            result = RmGetList(
-                sessionHandle,
-                out needed,
-                ref count,
-                processInfo,
-                ref rebootReasons);
-            if (result != ERROR_SUCCESS)
-                throw Failure("RmGetList(data)", result, fullPath);
-
-            List<AstroFsvRestartManagerOwner> owners =
-                new List<AstroFsvRestartManagerOwner>();
-            for (int index = 0; index < count; index++) {
-                long fileTime = ToFileTime(
-                    processInfo[index].Process.ProcessStartTime);
-                owners.Add(new AstroFsvRestartManagerOwner {
-                    ProcessId = processInfo[index].Process.ProcessId,
-                    ProcessStartFileTime = fileTime,
-                    ProcessStartUtcTicks =
-                        DateTime.FromFileTimeUtc(fileTime).Ticks,
-                    ApplicationName = processInfo[index].ApplicationName,
-                    ServiceShortName = processInfo[index].ServiceShortName,
-                    ApplicationType = processInfo[index].ApplicationType,
-                    ApplicationStatus = processInfo[index].ApplicationStatus,
-                    TerminalSessionId =
-                        processInfo[index].TerminalSessionId,
-                    Restartable = processInfo[index].Restartable != 0
-                });
-            }
-            return new AstroFsvRestartManagerResult {
-                Owners = owners.ToArray(),
-                RebootReasons = rebootReasons
-            };
+            throw new InvalidOperationException(
+                "RmGetList owner cardinality changed across five bounded " +
+                "buffer reads (path=" + fullPath + ")");
         }
         catch (Exception caught) {
             failure = caught;
@@ -1019,6 +1020,59 @@ public static class AstroFsvRestartManager {
     }
 }
 '@
+}
+
+function Get-AstroNativeErrorCode([Exception]$Exception) {
+    $current = $Exception
+    $depth = 0
+    while ($null -ne $current -and $depth -lt 16) {
+        if ($current -is [ComponentModel.Win32Exception]) {
+            return [int]$current.NativeErrorCode
+        }
+        $current = $current.InnerException
+        $depth++
+    }
+    return $null
+}
+
+function Get-AstroArtifactOwnerDiagnostic([string]$ArtifactPath) {
+    try {
+        $restartManager =
+            [AstroFsvRestartManager]::GetOwners($ArtifactPath)
+        return [ordered]@{
+            state = 'observed'
+            operation =
+                'Restart Manager RmRegisterResources(exact file) + RmGetList'
+            list_query_attempts =
+                [int]$restartManager.ListQueryAttempts
+            owners = @($restartManager.Owners | ForEach-Object {
+                [ordered]@{
+                    pid = [uint32]$_.ProcessId
+                    process_start_filetime =
+                        [int64]$_.ProcessStartFileTime
+                    process_start_utc_ticks =
+                        [int64]$_.ProcessStartUtcTicks
+                    application_name = [string]$_.ApplicationName
+                    service_short_name = [string]$_.ServiceShortName
+                    application_type = [int]$_.ApplicationType
+                    application_status =
+                        [uint32]$_.ApplicationStatus
+                    terminal_session_id =
+                        [uint32]$_.TerminalSessionId
+                    restartable = [bool]$_.Restartable
+                }
+            })
+            reboot_reasons = [uint32]$restartManager.RebootReasons
+        }
+    }
+    catch {
+        return [ordered]@{
+            state = 'fault'
+            operation =
+                'Restart Manager RmRegisterResources(exact file) + RmGetList'
+            error = $_.Exception.Message
+        }
+    }
 }
 
 function Test-DescendantOf([int]$CandidatePid, [int]$AncestorPid) {
@@ -1474,19 +1528,92 @@ try {
         $artifactHandle = $null
     }
     if ($null -ne $createdChild) {
-        # A signaled process object is terminal, but Windows retains the process
-        # object while any primary/duplicated process handle remains open. Its
-        # executable image section can therefore still deny the exact DELETE
-        # access used by cleanup. The two retained handles already agreed on
-        # signal state and exit code above; close both before the readiness open.
+        # The two retained exact handles already agreed on signal state and exit
+        # code. Close them before readiness so any remaining owner is foreign to
+        # the runner's explicit process-observation state.
         $createdChild.Dispose()
         $childProcessHandlesClosed = $true
     }
+    $cleanupReadinessTimeoutMs = 15000
+    $cleanupReadinessInitialDelayMs = 100
+    $cleanupReadinessMaximumDelayMs = 1000
+    $cleanupReadinessDelayMs = $cleanupReadinessInitialDelayMs
+    $cleanupReadinessAttempts = [Collections.Generic.List[object]]::new()
+    $cleanupReadinessStopwatch = [Diagnostics.Stopwatch]::StartNew()
     try {
-        Set-AstroFileReadOnlyLongPath -LiteralPath $artifact -ReadOnly $false
-        $artifactCleanupLease =
-            [AstroLauncherLockNative]::OpenExactRenameSource($artifact)
-        Set-AstroFileReadOnlyLongPath -LiteralPath $artifact -ReadOnly $true
+        while ($null -eq $artifactCleanupLease) {
+            Set-AstroFileReadOnlyLongPath `
+                -LiteralPath $artifact -ReadOnly $false
+            $openFailure = $null
+            try {
+                $artifactCleanupLease =
+                    [AstroLauncherLockNative]::OpenExactRenameSource(
+                        $artifact
+                    )
+            }
+            catch {
+                $openFailure = $_
+            }
+
+            if ($null -ne $artifactCleanupLease) {
+                Set-AstroFileReadOnlyLongPath `
+                    -LiteralPath $artifact -ReadOnly $true
+                break
+            }
+
+            # Never leave the immutable receipt artifact writable while waiting
+            # for a foreign Windows reader to release its exact file handle.
+            Set-AstroFileReadOnlyLongPath `
+                -LiteralPath $artifact -ReadOnly $true
+            $nativeError =
+                Get-AstroNativeErrorCode $openFailure.Exception
+            $ownerDiagnostic =
+                Get-AstroArtifactOwnerDiagnostic $artifact
+            $cleanupReadinessAttempts.Add([ordered]@{
+                attempt = $cleanupReadinessAttempts.Count + 1
+                elapsed_ms =
+                    [int64]$cleanupReadinessStopwatch.ElapsedMilliseconds
+                native_error = $nativeError
+                message = $openFailure.Exception.Message
+                owner_diagnostic = $ownerDiagnostic
+                read_only_restored = $true
+            })
+
+            if ($nativeError -ne 32) {
+                throw "cleanup-readiness open failed with non-transient native error (native_error=$nativeError; failure=$($openFailure.Exception.Message))"
+            }
+            if ([string]$ownerDiagnostic.state -cne 'observed' -or
+                @($ownerDiagnostic.owners).Count -eq 0) {
+                throw "cleanup-readiness sharing violation has no complete nonempty owner attribution (owner_diagnostic=$($ownerDiagnostic | ConvertTo-Json -Depth 8 -Compress))"
+            }
+            $ownedTreePids = @(
+                @($launcherJobMembersAfter) +
+                @($launcherPid, $PID, $child.Id) |
+                    Sort-Object -Unique
+            )
+            $internalOwners = @($ownerDiagnostic.owners | Where-Object {
+                [uint32]$_.pid -in $ownedTreePids
+            })
+            if ($internalOwners.Count -ne 0) {
+                throw "cleanup-readiness sharing violation is owned by an exact member of the launcher Job (owners=$($internalOwners | ConvertTo-Json -Depth 8 -Compress); job=$launcherJobName)"
+            }
+
+            $remainingMs = $cleanupReadinessTimeoutMs -
+                [int64]$cleanupReadinessStopwatch.ElapsedMilliseconds
+            if ($remainingMs -le 0) {
+                throw "cleanup-readiness sharing violation exceeded its bounded foreign-owner transition (timeout_ms=$cleanupReadinessTimeoutMs)"
+            }
+            $waitMs = [int][Math]::Min(
+                [int64]$cleanupReadinessDelayMs,
+                $remainingMs
+            )
+            [Threading.Thread]::Sleep($waitMs)
+            $cleanupReadinessDelayMs = [int][Math]::Min(
+                [int64]$cleanupReadinessDelayMs * 2,
+                [int64]$cleanupReadinessMaximumDelayMs
+            )
+        }
+        $cleanupReadinessStopwatch.Stop()
 
         $cleanupFinalPath = ConvertFrom-AstroNativeFinalPath (
             [AstroLauncherLockNative]::GetFileFinalPath($artifactCleanupLease)
@@ -1528,49 +1655,42 @@ try {
             child_termination_proved = $childTerminationProved
             child_process_handles_closed = $childProcessHandlesClosed
             retained_until_runner_exit = $true
+            transition = [ordered]@{
+                kind = if ($cleanupReadinessAttempts.Count -eq 0) {
+                    'immediate'
+                } else {
+                    'bounded-foreign-owner-sharing-violation'
+                }
+                timeout_ms = $cleanupReadinessTimeoutMs
+                initial_delay_ms = $cleanupReadinessInitialDelayMs
+                maximum_delay_ms = $cleanupReadinessMaximumDelayMs
+                failed_attempts = @($cleanupReadinessAttempts)
+                successful_attempt =
+                    $cleanupReadinessAttempts.Count + 1
+                elapsed_ms =
+                    [int64]$cleanupReadinessStopwatch.ElapsedMilliseconds
+            }
         }
         $artifactStable = $artifactStable -and
             $cleanupHash -ceq $artifactHashAfter
     }
     catch {
+        $cleanupReadinessStopwatch.Stop()
         $readinessFailure = $_
-        $ownerDiagnostic = try {
-            $restartManager = [AstroFsvRestartManager]::GetOwners($artifact)
-            [ordered]@{
-                state = 'observed'
-                operation =
-                    'Restart Manager RmRegisterResources(exact file) + RmGetList'
-                owners = @($restartManager.Owners | ForEach-Object {
-                    [ordered]@{
-                        pid = [uint32]$_.ProcessId
-                        process_start_filetime =
-                            [int64]$_.ProcessStartFileTime
-                        process_start_utc_ticks =
-                            [int64]$_.ProcessStartUtcTicks
-                        application_name = [string]$_.ApplicationName
-                        service_short_name = [string]$_.ServiceShortName
-                        application_type = [int]$_.ApplicationType
-                        application_status =
-                            [uint32]$_.ApplicationStatus
-                        terminal_session_id =
-                            [uint32]$_.TerminalSessionId
-                        restartable = [bool]$_.Restartable
-                    }
-                })
-                reboot_reasons = [uint32]$restartManager.RebootReasons
-            }
-        }
-        catch {
-            [ordered]@{
-                state = 'fault'
-                operation =
-                    'Restart Manager RmRegisterResources(exact file) + RmGetList'
-                error = $_.Exception.Message
-            }
-        }
         if ($null -ne $artifactCleanupLease) {
             $artifactCleanupLease.Dispose()
             $artifactCleanupLease = $null
+        }
+        $ownerDiagnostic =
+            Get-AstroArtifactOwnerDiagnostic $artifact
+        $transitionFailure = [ordered]@{
+            timeout_ms = $cleanupReadinessTimeoutMs
+            initial_delay_ms = $cleanupReadinessInitialDelayMs
+            maximum_delay_ms = $cleanupReadinessMaximumDelayMs
+            elapsed_ms =
+                [int64]$cleanupReadinessStopwatch.ElapsedMilliseconds
+            failed_attempts = @($cleanupReadinessAttempts)
+            final_owner_diagnostic = $ownerDiagnostic
         }
         try {
             if (Test-AstroPathLongPath -LiteralPath $artifact -PathType Leaf) {
@@ -1584,8 +1704,8 @@ try {
                 'preserve the session and inspect the exact native error/handle owner before any lifecycle cleanup'
         }
         Fail-Astro 'ASTRO_FSV_ARTIFACT_CLEANUP_NOT_READY' `
-            "the staged artifact is not exactly ready for cleanup after native child termination: $($readinessFailure.Exception.Message); owner_diagnostic=$($ownerDiagnostic | ConvertTo-Json -Depth 8 -Compress)" `
-            'preserve the session; inspect the native error and exact live handle owner, then repair handle lifetime before retrying'
+            "the staged artifact is not exactly ready for cleanup after native child termination: $($readinessFailure.Exception.Message); transition=$($transitionFailure | ConvertTo-Json -Depth 12 -Compress)" `
+            'preserve the session; inspect the exact native error and PID/creation-time owner transition, then repair or release that owner before rerunning'
     }
 
     $verdict = if ($childExitCode -eq 0 -and [bool]$childExitObservation.sources_agree -and
