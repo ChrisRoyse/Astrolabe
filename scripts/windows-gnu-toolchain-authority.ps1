@@ -259,6 +259,79 @@ $RequiredLlvmTools = @("clang-tidy.exe", "clang-format.exe")
 # with the stale linker (a "no silent fallback" invariant breach surfaced by #270).
 $ExpectedLldVersion = "20.1.8"
 $PinnedLldExeName = "ld.lld.exe"
+# Win32 MAX_PATH is 260 characters including the terminating NUL. The pinned
+# MinGW GCC 14.1 driver/front end are not longPathAware, so every ordinary DOS
+# path handed to a native tool must contain at most 259 visible characters.
+# This is a platform ABI boundary, not a tunable threshold.
+$NativeWin32MaxPathCharacters = 259
+
+function Assert-AstroNativeToolPath {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][string]$Purpose
+    )
+
+    $full = [IO.Path]::GetFullPath($Path)
+    if ($full.Length -gt $NativeWin32MaxPathCharacters) {
+        throw (
+            'LAUNCHER_BOUNDARY[ASTRO_NATIVE_TOOL_PATH_TOO_LONG]: ' +
+            "{code=ASTRO_NATIVE_TOOL_PATH_TOO_LONG; message=`"native " +
+            "$Purpose path is $($full.Length) characters; pinned GCC/MinGW " +
+            "accepts at most $NativeWin32MaxPathCharacters visible " +
+            "characters: $full`"; remediation=`"use the canonical checkout " +
+            "or provision a shorter direct-child worktree name through " +
+            "scripts\launcher-worktree.ps1; do not relocate TEMP or enable " +
+            "host-global long-path policy`"}"
+        )
+    }
+}
+
+function Assert-AstroLauncherNativePathContract {
+    param([Parameter(Mandatory)][string]$Root)
+
+    # Use the widest legal owner fields so admission cannot pass for a small
+    # current PID and fail later for another exact process generation.
+    $maxGenerationLeaf = (
+        "windows-gnu-toolchain-v2.pid-$([uint32]::MaxValue)." +
+        "ticks-$([long]::MaxValue).lock-sha256-$('f' * 64)"
+    )
+    $maxGenerationRoot = Join-Path `
+        (Join-Path $Root '.tmp') `
+        $maxGenerationLeaf
+    $nativeDescendants = [Collections.Generic.List[string]]::new()
+    foreach ($relative in @('lld-probe.c', 'lld-probe.exe')) {
+        $nativeDescendants.Add($relative)
+    }
+    foreach ($member in $MsvcRuntimeSupportMembers) {
+        $nativeDescendants.Add(
+            (Join-Path 'cuda-msvc-runtime-support' $member)
+        )
+    }
+    foreach ($member in $MsvcVcStartupSupportMembers) {
+        $nativeDescendants.Add(
+            (Join-Path 'cuda-msvc-vcstartup-support' $member)
+        )
+    }
+    foreach ($name in $MsvcRuntimeImportLibNames) {
+        $nativeDescendants.Add(
+            (Join-Path 'cuda-msvc-runtime-imports' $name)
+        )
+    }
+    $nativeDescendants.Add(
+        (Join-Path 'cuda-windowskit-ucrt-import' `
+            $WindowsKitUcrtImportLibName)
+    )
+    foreach ($name in $CudaImportLibNames) {
+        $nativeDescendants.Add(
+            (Join-Path 'cuda-toolkit-root\lib\x64' $name)
+        )
+    }
+    foreach ($relative in $nativeDescendants) {
+        Assert-AstroNativeToolPath `
+            -Path (Join-Path $maxGenerationRoot $relative) `
+            -Purpose "launcher scratch '$relative'"
+    }
+}
 
 function Require-Path {
     param([string]$Path, [string]$Message)
@@ -3649,9 +3722,17 @@ function Assert-GccResolvesPinnedLld {
     # concatenation becomes "<bin>ld.lld" instead of "<bin>\ld.lld".
     $lldPrefix = ($LlvmBin.TrimEnd('\', '/')) + '\'
     New-Item -ItemType Directory -Path $ScratchDir -Force | Out-Null
-    $probeNonce = [Guid]::NewGuid().ToString('N')
-    $trivialC = Join-Path $ScratchDir "astro-lld-probe.pid-$PID.nonce-$probeNonce.c"
-    $trivialExe = Join-Path $ScratchDir "astro-lld-probe.pid-$PID.nonce-$probeNonce.exe"
+    # ScratchDir is already a unique, exact-owner-bound launcher generation.
+    # Additional PID/nonce text provided no isolation and could push a supported
+    # worktree path beyond native GCC's MAX_PATH boundary.
+    $trivialC = Join-Path $ScratchDir 'lld-probe.c'
+    $trivialExe = Join-Path $ScratchDir 'lld-probe.exe'
+    Assert-AstroNativeToolPath `
+        -Path $trivialC `
+        -Purpose 'pinned-LLD probe input'
+    Assert-AstroNativeToolPath `
+        -Path $trivialExe `
+        -Purpose 'pinned-LLD probe output'
     Write-NewDurableUtf8File `
         -LiteralPath $trivialC `
         -Text 'int main(void){return 0;}'
@@ -4303,6 +4384,7 @@ Assert-NoAmbientCargoTargetEscape -OwnedTargetRoot $target
 # that transition is visible; active publication occurs only after the strict manifest/TEMP/
 # Job pair is complete. Target/config/toolchain mutation remains active-lock-only.
 # Reparse/alias roots are refused consistently across claim and recovery.
+Assert-AstroLauncherNativePathContract -Root $root
 Assert-AstroLauncherRootCanonical $root
 $workspaceTempParentState = Get-AstroPathEntryState $workspaceTempParent
 if ($workspaceTempParentState.State -eq 'absent') {

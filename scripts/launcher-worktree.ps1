@@ -30,6 +30,64 @@ $supportedParent = Join-Path `
 $retiredParent = Join-Path `
     (Join-Path $canonicalRoot '.claude') `
     'retired-worktrees'
+$nativeWin32MaxPathCharacters = 259
+
+function Assert-AstroSupportedWorktreeNativePathContract {
+    param([Parameter(Mandatory)][string]$Path)
+
+    # This mirrors the canonical authority's widest exact-owner generation and
+    # current native-tool descendants. Provision must refuse before `git
+    # worktree add`; the authority independently rechecks the complete set
+    # before creating .tmp for every actual launch.
+    $maxGenerationLeaf = (
+        "windows-gnu-toolchain-v2.pid-$([uint32]::MaxValue)." +
+        "ticks-$([long]::MaxValue).lock-sha256-$('f' * 64)"
+    )
+    $maxGenerationRoot = Join-Path `
+        (Join-Path $Path '.tmp') `
+        $maxGenerationLeaf
+    $nativeDescendants = @(
+        'lld-probe.c',
+        'lld-probe.exe',
+        'cuda-msvc-runtime-support\amdsecgs.obj',
+        'cuda-msvc-runtime-support\gshandler.obj',
+        'cuda-msvc-runtime-support\gshandlereh4.obj',
+        'cuda-msvc-runtime-support\gs_cookie.obj',
+        'cuda-msvc-runtime-support\gs_report.obj',
+        'cuda-msvc-runtime-support\thread_safe_statics.obj',
+        'cuda-msvc-vcstartup-support\delete_scalar_size.obj',
+        'cuda-msvc-vcstartup-support\delete_array_size.obj',
+        'cuda-msvc-vcstartup-support\std_type_info_static.obj',
+        'cuda-msvc-vcstartup-support\ehvecdtr.obj',
+        'cuda-msvc-vcstartup-support\fltused.obj',
+        'cuda-msvc-runtime-imports\vcruntime.lib',
+        'cuda-msvc-runtime-imports\msvcprt.lib',
+        'cuda-windowskit-ucrt-import\ucrt.lib',
+        'cuda-toolkit-root\lib\x64\cudart.lib',
+        'cuda-toolkit-root\lib\x64\cuda.lib',
+        'cuda-toolkit-root\lib\x64\nvrtc.lib',
+        'cuda-toolkit-root\lib\x64\curand.lib',
+        'cuda-toolkit-root\lib\x64\cublas.lib',
+        'cuda-toolkit-root\lib\x64\cublasLt.lib'
+    )
+    foreach ($relative in $nativeDescendants) {
+        $candidate = [IO.Path]::GetFullPath(
+            (Join-Path $maxGenerationRoot $relative)
+        )
+        if ($candidate.Length -gt $nativeWin32MaxPathCharacters) {
+            throw (
+                'LAUNCHER_WORKTREE[ASTRO_WORKTREE_NATIVE_PATH_TOO_LONG]: ' +
+                "{code=ASTRO_WORKTREE_NATIVE_PATH_TOO_LONG; message=`"the " +
+                "supported worktree name would create a native launcher " +
+                "path of $($candidate.Length) characters; pinned GCC/MinGW " +
+                "accepts at most $nativeWin32MaxPathCharacters visible " +
+                "characters: $candidate`"; remediation=`"choose a shorter " +
+                "worktree name and rerun Provision; no filesystem or Git " +
+                "state was created`"}"
+            )
+        }
+    }
+}
 
 foreach ($requiredFile in @(
         $canonicalEntrypoint,
@@ -473,6 +531,8 @@ switch ($Operation) {
                 'Provision requires -Location Supported'
             )
         }
+        Assert-AstroSupportedWorktreeNativePathContract `
+            -Path $supportedPath
         if ([IO.Directory]::Exists($supportedPath) -or
             [IO.File]::Exists($supportedPath)) {
             throw (
