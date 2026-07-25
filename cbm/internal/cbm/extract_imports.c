@@ -359,6 +359,18 @@ static CBMImport make_es_import(const char *local_name, const char *module_path)
     };
 }
 
+/* Side-effect imports and re-exports carry a ModuleRequest but introduce no
+ * local import binding in the source module. Keep their exact reachability as
+ * an unbound code dependency; a path component is not a source identifier. */
+static CBMImport make_es_unbound_import(const char *module_path) {
+    return (CBMImport){
+        .module_path = module_path,
+        .dependency_kind = "es_module",
+        .resolution = CBM_IMPORT_RESOLVE_ES_SOURCE,
+        .binding = CBM_IMPORT_BINDING_UNBOUND,
+    };
+}
+
 // Find the source string node in an ES import_statement.
 static TSNode find_es_source_node(TSNode node) {
     TSNode source_node = ts_node_child_by_field_name(node, TS_FIELD("source"));
@@ -478,7 +490,7 @@ static bool process_es_import_statement(CBMExtractCtx *ctx, TSNode node) {
         }
     }
     if (!found) {
-        CBMImport imp = make_es_import(path_last(a, path), path);
+        CBMImport imp = make_es_unbound_import(path);
         if (!cbm_imports_push(&ctx->result->imports, a, imp)) {
             return false;
         }
@@ -580,8 +592,7 @@ static void walk_es_imports(CBMExtractCtx *ctx, TSNode root) {
             if (!ts_node_is_null(src)) {
                 char *path = strip_quotes(ctx->arena, cbm_node_text(ctx->arena, src, ctx->source));
                 if (path && path[0]) {
-                    CBMImport imp = {.local_name = path_last(ctx->arena, path),
-                                     .module_path = path};
+                    CBMImport imp = make_es_unbound_import(path);
                     if (!cbm_imports_push(&ctx->result->imports, ctx->arena, imp)) {
                         return;
                     }
