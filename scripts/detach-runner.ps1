@@ -25,14 +25,13 @@ $earlyRunDirectory = [IO.Path]::GetFullPath($RunDirectory)
 if (-not [IO.Directory]::Exists($earlyRunDirectory)) {
     throw "DETACH_RUNNER[ASTRO_DETACH_RUN_DIRECTORY_MISSING]: {code=ASTRO_DETACH_RUN_DIRECTORY_MISSING; message=`"bound run directory is missing: $earlyRunDirectory`"; remediation=`"preserve task state and inspect the immutable action definition`"}"
 }
-$env:TEMP = $earlyRunDirectory
-$env:TMP = $earlyRunDirectory
-$env:TMPDIR = $earlyRunDirectory
-
 $protocolPath = Join-Path $PSScriptRoot 'detach-protocol.ps1'
+$strictJsonPath = Join-Path $PSScriptRoot 'detach-strict-json.ps1'
+$compilerStatePath = Join-Path $PSScriptRoot 'detach-compiler-state.ps1'
+$lockHelperPath = Join-Path $PSScriptRoot 'launcher-lock.ps1'
 $spawnPath = Join-Path $PSScriptRoot 'detach-spawn.ps1'
 . $protocolPath
-. $spawnPath
+. $compilerStatePath
 
 $run = Assert-AstroDetachedRunDirectory $RunDirectory
 $logPath = Join-Path $run 'launcher.log'
@@ -92,6 +91,9 @@ try {
 
     foreach ($binding in @(
             @{ Path = $protocolPath; Expected = [string]$intentPayload.protocol_sha256 },
+            @{ Path = $strictJsonPath; Expected = [string]$intentPayload.strict_json_sha256 },
+            @{ Path = $compilerStatePath; Expected = [string]$intentPayload.compiler_state_sha256 },
+            @{ Path = $lockHelperPath; Expected = [string]$intentPayload.launcher_lock_sha256 },
             @{ Path = $spawnPath; Expected = [string]$intentPayload.spawn_sha256 },
             @{ Path = $PSCommandPath; Expected = [string]$intentPayload.runner_sha256 },
             @{
@@ -104,6 +106,35 @@ try {
         if ($actual -cne $binding.Expected) {
             throw "bound script hash changed before detached runner execution: $($binding.Path) expected=$($binding.Expected) observed=$actual"
         }
+    }
+
+    $compilerState = $null
+    $compilerEvidence = $null
+    try {
+        $compilerState = Start-AstroDetachedCompilerScope `
+            -RunDirectory $run `
+            -Role runner `
+            -Issue ([int]$intentPayload.issue)
+        . $lockHelperPath
+        . $spawnPath
+        $compilerEvidence = Complete-AstroDetachedCompilerScope $compilerState
+    }
+    catch {
+        $compilerFailure = $_
+        if ($null -ne $compilerState) {
+            try {
+                [void](Write-AstroDetachedCompilerFault `
+                    -State $compilerState `
+                    -Code 'ASTRO_DETACH_RUNNER_COMPILER_FAILED' `
+                    -Message $compilerFailure.Exception.Message `
+                    -Remediation 'preserve the run/compiler state and task; inspect immutable compiler evidence before tracker-bound recovery' `
+                    -Stage 'runner-import-or-cleanup')
+            }
+            catch {
+                throw "DETACH_RUNNER[ASTRO_DETACH_COMPILER_FAULT_PUBLISH_FAILED]: {code=ASTRO_DETACH_COMPILER_FAULT_PUBLISH_FAILED; message=`"runner compiler failed ('$($compilerFailure.Exception.Message)') and its durable fault also failed ('$($_.Exception.Message)')`"; remediation=`"preserve all run/task/compiler bytes and inspect both failures`"}"
+            }
+        }
+        throw "DETACH_RUNNER[ASTRO_DETACH_RUNNER_COMPILER_FAILED]: {code=ASTRO_DETACH_RUNNER_COMPILER_FAILED; message=`"$($compilerFailure.Exception.Message)`"; remediation=`"preserve run and task state; inspect compiler-state records`"}"
     }
 
     $taskService = Get-AstroDetachedTaskService
@@ -130,6 +161,21 @@ try {
             task_xml_sha256 = $taskXmlSha256
             task_session_id = $runnerIdentity.session_id
             task_logon_type = [string]$intentPayload.task_logon_type
+            compiler = [ordered]@{
+                intent_path = $compilerEvidence.Intent.Path
+                intent_sha256 = $compilerEvidence.Intent.Sha256
+                authorization_path = $compilerEvidence.Authorization.Path
+                authorization_sha256 = $compilerEvidence.Authorization.Sha256
+                renamed_path = $compilerEvidence.Renamed.Path
+                renamed_sha256 = $compilerEvidence.Renamed.Sha256
+                completion_path = $compilerEvidence.Completion.Path
+                completion_sha256 = $compilerEvidence.Completion.Sha256
+                scope_path = $compilerEvidence.ScopePath
+                scope_file_id = $compilerEvidence.ScopeFileId
+                inventory_sha256 = $compilerEvidence.InventorySha256
+                scope_state = $compilerEvidence.ScopeState
+                tombstone_state = $compilerEvidence.TombstoneState
+            }
         })
     $chain = Read-AstroDetachedRecord `
         -RunDirectory $run `

@@ -36,6 +36,8 @@ public static class AstroLauncherLockNative
     private const uint FILE_READ_ATTRIBUTES = 0x0080;
     private const uint FILE_TRAVERSE = 0x0020;
     private const uint DELETE_ACCESS = 0x00010000;
+    private const uint READ_CONTROL = 0x00020000;
+    private const uint ACCESS_SYSTEM_SECURITY = 0x01000000;
     private const uint GENERIC_READ = 0x80000000;
     private const uint GENERIC_WRITE = 0x40000000;
     private const uint FILE_SHARE_READ = 0x00000001;
@@ -59,6 +61,17 @@ public static class AstroLauncherLockNative
     private const int ERROR_FILE_NOT_FOUND = 2;
     private const int ERROR_INSUFFICIENT_BUFFER = 122;
     private const int ERROR_MORE_DATA = 234;
+    private const int ERROR_NOT_ALL_ASSIGNED = 1300;
+    private const uint TOKEN_ADJUST_PRIVILEGES = 0x0020;
+    private const uint TOKEN_QUERY = 0x0008;
+    private const uint SE_PRIVILEGE_ENABLED = 0x00000002;
+    private const uint OWNER_SECURITY_INFORMATION = 0x00000001;
+    private const uint GROUP_SECURITY_INFORMATION = 0x00000002;
+    private const uint DACL_SECURITY_INFORMATION = 0x00000004;
+    private const uint SACL_SECURITY_INFORMATION = 0x00000008;
+    private const uint LABEL_SECURITY_INFORMATION = 0x00000010;
+    private const int SE_FILE_OBJECT = 6;
+    private const uint SDDL_REVISION_1 = 1;
     private const int MAX_JOB_PROCESS_IDS = 1048576;
 
     public sealed class JobObjectProcessIdProbe
@@ -87,6 +100,27 @@ public static class AstroLauncherLockNative
         public uint FileIndexLow;
     }
 
+    [StructLayout(LayoutKind.Sequential)]
+    private struct LUID
+    {
+        public uint LowPart;
+        public int HighPart;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct LUID_AND_ATTRIBUTES
+    {
+        public LUID Luid;
+        public uint Attributes;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct TOKEN_PRIVILEGES
+    {
+        public uint PrivilegeCount;
+        public LUID_AND_ATTRIBUTES Privileges;
+    }
+
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
     private static extern SafeFileHandle CreateFileW(
         string fileName,
@@ -104,6 +138,62 @@ public static class AstroLauncherLockNative
         SafeFileHandle file,
         out BY_HANDLE_FILE_INFORMATION information
     );
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool CloseHandle(IntPtr handle);
+
+    [DllImport("advapi32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool OpenProcessToken(
+        IntPtr processHandle,
+        uint desiredAccess,
+        out IntPtr tokenHandle
+    );
+
+    [DllImport("advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool LookupPrivilegeValueW(
+        string systemName,
+        string name,
+        out LUID luid
+    );
+
+    [DllImport("advapi32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool AdjustTokenPrivileges(
+        IntPtr tokenHandle,
+        [MarshalAs(UnmanagedType.Bool)] bool disableAllPrivileges,
+        ref TOKEN_PRIVILEGES newState,
+        uint bufferLength,
+        IntPtr previousState,
+        IntPtr returnLength
+    );
+
+    [DllImport("advapi32.dll", SetLastError = true)]
+    private static extern uint GetSecurityInfo(
+        IntPtr handle,
+        int objectType,
+        uint securityInfo,
+        out IntPtr owner,
+        out IntPtr group,
+        out IntPtr dacl,
+        out IntPtr sacl,
+        out IntPtr securityDescriptor
+    );
+
+    [DllImport("advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool ConvertSecurityDescriptorToStringSecurityDescriptorW(
+        IntPtr securityDescriptor,
+        uint revision,
+        uint securityInfo,
+        out IntPtr stringSecurityDescriptor,
+        out uint stringSecurityDescriptorLength
+    );
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern IntPtr LocalFree(IntPtr memory);
 
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
     private static extern uint GetFinalPathNameByHandleW(
@@ -627,6 +717,169 @@ public static class AstroLauncherLockNative
         {
             handle.Dispose();
             throw;
+        }
+    }
+
+    public static void EnableCurrentTokenSecurityPrivilege()
+    {
+        IntPtr token = IntPtr.Zero;
+        if (!OpenProcessToken(
+                System.Diagnostics.Process.GetCurrentProcess().Handle,
+                TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY,
+                out token
+            ))
+        {
+            throw new Win32Exception(
+                Marshal.GetLastWin32Error(),
+                "OpenProcessToken failed while enabling SeSecurityPrivilege"
+            );
+        }
+        try
+        {
+            LUID luid;
+            if (!LookupPrivilegeValueW(null, "SeSecurityPrivilege", out luid))
+            {
+                throw new Win32Exception(
+                    Marshal.GetLastWin32Error(),
+                    "LookupPrivilegeValueW failed for SeSecurityPrivilege"
+                );
+            }
+            TOKEN_PRIVILEGES privileges = new TOKEN_PRIVILEGES();
+            privileges.PrivilegeCount = 1;
+            privileges.Privileges = new LUID_AND_ATTRIBUTES();
+            privileges.Privileges.Luid = luid;
+            privileges.Privileges.Attributes = SE_PRIVILEGE_ENABLED;
+            if (!AdjustTokenPrivileges(
+                    token,
+                    false,
+                    ref privileges,
+                    0,
+                    IntPtr.Zero,
+                    IntPtr.Zero
+                ))
+            {
+                throw new Win32Exception(
+                    Marshal.GetLastWin32Error(),
+                    "AdjustTokenPrivileges failed for SeSecurityPrivilege"
+                );
+            }
+            int error = Marshal.GetLastWin32Error();
+            if (error == ERROR_NOT_ALL_ASSIGNED)
+            {
+                throw new Win32Exception(
+                    error,
+                    "the current token does not hold SeSecurityPrivilege"
+                );
+            }
+        }
+        finally
+        {
+            if (token != IntPtr.Zero) CloseHandle(token);
+        }
+    }
+
+    public static SafeFileHandle OpenExactRecoveryDirectory(string path)
+    {
+        EnableCurrentTokenSecurityPrivilege();
+        SafeFileHandle handle = CreateFileW(
+            GetExtendedLengthPath(path),
+            FILE_READ_ATTRIBUTES | FILE_TRAVERSE | DELETE_ACCESS |
+                READ_CONTROL | ACCESS_SYSTEM_SECURITY,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            IntPtr.Zero,
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+            IntPtr.Zero
+        );
+        if (handle.IsInvalid)
+        {
+            int error = Marshal.GetLastWin32Error();
+            handle.Dispose();
+            throw new Win32Exception(
+                error,
+                "could not open exact security/recovery directory: " + path
+            );
+        }
+        try
+        {
+            RequireDiskHandle(handle, "exact security/recovery directory");
+            BY_HANDLE_FILE_INFORMATION information =
+                ReadBasicInformation(handle, "exact security/recovery directory");
+            if ((information.FileAttributes & FILE_ATTRIBUTE_DIRECTORY) == 0 ||
+                (information.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0)
+            {
+                throw new InvalidOperationException(
+                    "recovery source must be one ordinary non-reparse directory: " + path
+                );
+            }
+            return handle;
+        }
+        catch
+        {
+            handle.Dispose();
+            throw;
+        }
+    }
+
+    public static string GetExactSecurityDescriptorSddl(SafeFileHandle handle)
+    {
+        EnableCurrentTokenSecurityPrivilege();
+        IntPtr owner;
+        IntPtr group;
+        IntPtr dacl;
+        IntPtr sacl;
+        IntPtr descriptor;
+        uint information = OWNER_SECURITY_INFORMATION |
+            GROUP_SECURITY_INFORMATION |
+            DACL_SECURITY_INFORMATION |
+            SACL_SECURITY_INFORMATION |
+            LABEL_SECURITY_INFORMATION;
+        uint result = GetSecurityInfo(
+            handle.DangerousGetHandle(),
+            SE_FILE_OBJECT,
+            information,
+            out owner,
+            out group,
+            out dacl,
+            out sacl,
+            out descriptor
+        );
+        if (result != 0)
+        {
+            throw new Win32Exception(
+                unchecked((int)result),
+                "GetSecurityInfo failed for exact recovery directory"
+            );
+        }
+        try
+        {
+            IntPtr text;
+            uint textLength;
+            if (!ConvertSecurityDescriptorToStringSecurityDescriptorW(
+                    descriptor,
+                    SDDL_REVISION_1,
+                    information,
+                    out text,
+                    out textLength
+                ))
+            {
+                throw new Win32Exception(
+                    Marshal.GetLastWin32Error(),
+                    "could not convert exact recovery security descriptor to SDDL"
+                );
+            }
+            try
+            {
+                return Marshal.PtrToStringUni(text);
+            }
+            finally
+            {
+                LocalFree(text);
+            }
+        }
+        finally
+        {
+            LocalFree(descriptor);
         }
     }
 

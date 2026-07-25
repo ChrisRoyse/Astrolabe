@@ -6,7 +6,8 @@
     Creates one fresh repository-local run directory, persists immutable intent and exact
     task-definition readback, starts a create-only GUID task, then reports readiness only
     after an independent authoritative launcher-lock read proves that the durable work
-    identity is the live v3 lease owner.
+    identity is the live v3 lease owner. Coordinator and runner native imports compile only
+    inside exact owner-bound run children and publish durable cleanup or fault evidence.
 
     This command never overwrites state or tasks, never deletes/stops work on readiness
     timeout, and never infers ownership from a numeric PID.
@@ -45,20 +46,15 @@ $ErrorActionPreference = 'Stop'
 $PSNativeCommandUseErrorActionPreference = $false
 $observerStartedUtcTicks = [DateTime]::UtcNow.Ticks
 
-$bootstrapTemp = 'C:\code\Astrolabe\.tmp'
-if (-not [IO.Directory]::Exists($bootstrapTemp)) {
-    throw "DETACH_RUN[ASTRO_DETACH_TMP_MISSING]: {code=ASTRO_DETACH_TMP_MISSING; message=`"canonical repository .tmp directory is missing`"; remediation=`"restore the canonical workspace layout before detached execution`"}"
-}
-$env:TEMP = $bootstrapTemp
-$env:TMP = $bootstrapTemp
-$env:TMPDIR = $bootstrapTemp
-
 $protocolPath = Join-Path $PSScriptRoot 'detach-protocol.ps1'
+$strictJsonPath = Join-Path $PSScriptRoot 'detach-strict-json.ps1'
+$compilerStatePath = Join-Path $PSScriptRoot 'detach-compiler-state.ps1'
+$lockHelperPath = Join-Path $PSScriptRoot 'launcher-lock.ps1'
 $spawnPath = Join-Path $PSScriptRoot 'detach-spawn.ps1'
 $runnerPath = Join-Path $PSScriptRoot 'detach-runner.ps1'
 $launcherPath = Join-Path $PSScriptRoot 'windows-gnu-toolchain.ps1'
 . $protocolPath
-. $spawnPath
+. $compilerStatePath
 
 function ConvertFrom-AstroDetachedCommandPlan {
     param(
@@ -234,8 +230,41 @@ elseif ($RunId -cnotmatch '^[0-9a-f]{32}$') {
     throw "DETACH_RUN[ASTRO_DETACH_RUN_ID_INVALID]: {code=ASTRO_DETACH_RUN_ID_INVALID; message=`"RunId must be 32 lowercase hexadecimal characters`"; remediation=`"omit it for a fresh GUID or pass one canonical GUID N value`"}"
 }
 
+$runDirectory = New-AstroDetachedRunDirectory $RunId
+$compilerState = $null
+$compilerEvidence = $null
+try {
+    $compilerState = Start-AstroDetachedCompilerScope `
+        -RunDirectory $runDirectory `
+        -Role coordinator `
+        -Issue $Issue
+    . $lockHelperPath
+    . $spawnPath
+    $compilerEvidence = Complete-AstroDetachedCompilerScope $compilerState
+}
+catch {
+    $compilerFailure = $_
+    if ($null -ne $compilerState) {
+        try {
+            [void](Write-AstroDetachedCompilerFault `
+                -State $compilerState `
+                -Code 'ASTRO_DETACH_COORDINATOR_COMPILER_FAILED' `
+                -Message $compilerFailure.Exception.Message `
+                -Remediation 'preserve the run and compiler scope; inspect the immutable compiler intent/fault before tracker-bound recovery' `
+                -Stage 'coordinator-import-or-cleanup')
+        }
+        catch {
+            throw "DETACH_RUN[ASTRO_DETACH_COMPILER_FAULT_PUBLISH_FAILED]: {code=ASTRO_DETACH_COMPILER_FAULT_PUBLISH_FAILED; message=`"coordinator compiler failed ('$($compilerFailure.Exception.Message)') and its durable fault also failed ('$($_.Exception.Message)')`"; remediation=`"preserve every run/compiler byte and inspect both failures before recovery`"}"
+        }
+    }
+    throw "DETACH_RUN[ASTRO_DETACH_COORDINATOR_COMPILER_FAILED]: {code=ASTRO_DETACH_COORDINATOR_COMPILER_FAILED; message=`"$($compilerFailure.Exception.Message)`"; remediation=`"preserve the run and inspect compiler-state records; do not create or start a task`"}"
+}
+
 $bindings = [ordered]@{
     protocol = Get-AstroDetachedScriptBinding $protocolPath
+    strict_json = Get-AstroDetachedScriptBinding $strictJsonPath
+    compiler_state = Get-AstroDetachedScriptBinding $compilerStatePath
+    launcher_lock = Get-AstroDetachedScriptBinding $lockHelperPath
     spawn = Get-AstroDetachedScriptBinding $spawnPath
     runner = Get-AstroDetachedScriptBinding $runnerPath
     launcher = Get-AstroDetachedScriptBinding $launcherPath
@@ -247,7 +276,6 @@ if (-not [IO.File]::Exists($powershellPath)) {
     throw "DETACH_RUN[ASTRO_DETACH_SYSTEM_POWERSHELL_MISSING]: {code=ASTRO_DETACH_SYSTEM_POWERSHELL_MISSING; message=`"absolute System32 Windows PowerShell is missing: $powershellPath`"; remediation=`"repair the supported Windows runtime before detached execution`"}"
 }
 
-$runDirectory = New-AstroDetachedRunDirectory $RunId
 $taskNameExact = "Astrolabe.Detached.$RunId"
 $principal = [Security.Principal.WindowsIdentity]::GetCurrent().Name
 $principalSid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
@@ -279,12 +307,33 @@ $intentRecord = Write-AstroDetachedRecord `
         powershell_path = $powershellPath
         protocol_path = $bindings.protocol.path
         protocol_sha256 = $bindings.protocol.sha256
+        strict_json_path = $bindings.strict_json.path
+        strict_json_sha256 = $bindings.strict_json.sha256
+        compiler_state_path = $bindings.compiler_state.path
+        compiler_state_sha256 = $bindings.compiler_state.sha256
+        launcher_lock_path = $bindings.launcher_lock.path
+        launcher_lock_sha256 = $bindings.launcher_lock.sha256
         spawn_path = $bindings.spawn.path
         spawn_sha256 = $bindings.spawn.sha256
         runner_path = $bindings.runner.path
         runner_sha256 = $bindings.runner.sha256
         launcher_path = $bindings.launcher.path
         launcher_sha256 = $bindings.launcher.sha256
+        coordinator_compiler = [ordered]@{
+            intent_path = $compilerEvidence.Intent.Path
+            intent_sha256 = $compilerEvidence.Intent.Sha256
+            authorization_path = $compilerEvidence.Authorization.Path
+            authorization_sha256 = $compilerEvidence.Authorization.Sha256
+            renamed_path = $compilerEvidence.Renamed.Path
+            renamed_sha256 = $compilerEvidence.Renamed.Sha256
+            completion_path = $compilerEvidence.Completion.Path
+            completion_sha256 = $compilerEvidence.Completion.Sha256
+            scope_path = $compilerEvidence.ScopePath
+            scope_file_id = $compilerEvidence.ScopeFileId
+            inventory_sha256 = $compilerEvidence.InventorySha256
+            scope_state = $compilerEvidence.ScopeState
+            tombstone_state = $compilerEvidence.TombstoneState
+        }
     })
 
 $taskService = $null

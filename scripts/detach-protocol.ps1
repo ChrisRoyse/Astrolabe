@@ -19,32 +19,9 @@ $script:AstroDetachedStateRoot = Join-Path `
     'detached-runs'
 $script:AstroDetachedRecordMaximumBytes = 8MB
 
-$lockHelper = Join-Path $PSScriptRoot 'launcher-lock.ps1'
+$strictJsonHelper = Join-Path $PSScriptRoot 'detach-strict-json.ps1'
 if (-not (Test-Path Function:\ConvertFrom-AstroStrictFlatJsonObject)) {
-    . $lockHelper
-}
-
-if (-not ([System.Management.Automation.PSTypeName]'AstroDetachedProtocolNative').Type) {
-    Add-Type -Language CSharp -TypeDefinition @'
-using System;
-using System.ComponentModel;
-using System.Runtime.InteropServices;
-
-public static class AstroDetachedProtocolNative {
-    [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
-    private static extern bool CreateDirectoryW(
-        string lpPathName,
-        IntPtr lpSecurityAttributes
-    );
-
-    public static void CreateDirectoryNoReplace(string path) {
-        if (!CreateDirectoryW(path, IntPtr.Zero))
-            throw new Win32Exception(
-                Marshal.GetLastWin32Error(),
-                "CreateDirectoryW create-new failed for '" + path + "'");
-    }
-}
-'@
+    . $strictJsonHelper
 }
 
 function Get-AstroDetachedSha256Bytes {
@@ -213,6 +190,69 @@ function Assert-AstroDetachedOrdinaryDirectory {
     return $full
 }
 
+function New-AstroDetachedDirectoryNoReplace {
+    <#
+    Scripting.FileSystemObject.CreateFolder is an in-process Windows create-new
+    directory operation.  Unlike Directory.CreateDirectory, it reports an
+    existing destination as an error.  The detached bootstrap uses it before any
+    CodeDOM compiler can run, then independently validates the resulting object.
+    #>
+    param([Parameter(Mandatory)][string]$Path)
+
+    $full = [IO.Path]::GetFullPath($Path).TrimEnd('\', '/')
+    $parent = [IO.Path]::GetDirectoryName($full).TrimEnd('\', '/')
+    $leaf = [IO.Path]::GetFileName($full)
+    if ([string]::IsNullOrEmpty($leaf) -or
+        [IO.Path]::Combine($parent, $leaf) -cne $full) {
+        throw "DETACH_PROTOCOL[ASTRO_DETACH_CREATE_PATH_INVALID]: {code=ASTRO_DETACH_CREATE_PATH_INVALID; message=`"create-new directory path is not one canonical direct child: $full`"; remediation=`"pass one absolute child path beneath an already validated ordinary parent`"}"
+    }
+    [void](Assert-AstroDetachedOrdinaryDirectory $parent)
+    if ([IO.File]::Exists($full) -or [IO.Directory]::Exists($full)) {
+        throw "DETACH_PROTOCOL[ASTRO_DETACH_CREATE_COLLISION]: {code=ASTRO_DETACH_CREATE_COLLISION; message=`"create-new directory destination already exists: $full`"; remediation=`"preserve the existing object and choose a fresh generation name`"}"
+    }
+
+    $fileSystemObject = $null
+    $createdFolder = $null
+    try {
+        $fileSystemObject = New-Object -ComObject Scripting.FileSystemObject
+        $createdFolder = $fileSystemObject.CreateFolder($full)
+        $reported = [IO.Path]::GetFullPath(
+            [string]$createdFolder.Path
+        ).TrimEnd('\', '/')
+        if (-not [string]::Equals(
+                $reported,
+                $full,
+                [StringComparison]::OrdinalIgnoreCase
+            )) {
+            throw "CreateFolder returned '$reported', expected '$full'"
+        }
+    }
+    catch {
+        throw "DETACH_PROTOCOL[ASTRO_DETACH_CREATE_NEW_FAILED]: {code=ASTRO_DETACH_CREATE_NEW_FAILED; message=`"Windows create-new directory failed for '$full': $($_.Exception.Message)`"; remediation=`"preserve any observed path, inspect the exact collision/security state, and retry only with a fresh generation`"}"
+    }
+    finally {
+        if ($null -ne $createdFolder -and
+            [Runtime.InteropServices.Marshal]::IsComObject($createdFolder)) {
+            [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject(
+                $createdFolder
+            )
+        }
+        if ($null -ne $fileSystemObject -and
+            [Runtime.InteropServices.Marshal]::IsComObject($fileSystemObject)) {
+            [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject(
+                $fileSystemObject
+            )
+        }
+    }
+
+    $readback = Assert-AstroDetachedOrdinaryDirectory $full
+    if ([IO.Path]::GetDirectoryName($readback).TrimEnd('\', '/') -cne $parent -or
+        [IO.Path]::GetFileName($readback) -cne $leaf) {
+        throw "DETACH_PROTOCOL[ASTRO_DETACH_CREATE_READBACK_DRIFT]: {code=ASTRO_DETACH_CREATE_READBACK_DRIFT; message=`"created directory escaped its exact parent/leaf binding: $readback`"; remediation=`"preserve the namespace object and inspect its final path before any use`"}"
+    }
+    return $readback
+}
+
 function Initialize-AstroDetachedStateRoot {
     $tmp = Assert-AstroDetachedOrdinaryDirectory (
         Join-Path $script:AstroDetachedCanonicalRoot '.tmp'
@@ -220,7 +260,7 @@ function Initialize-AstroDetachedStateRoot {
     $root = $script:AstroDetachedStateRoot
     if (-not [IO.Directory]::Exists($root)) {
         try {
-            [AstroDetachedProtocolNative]::CreateDirectoryNoReplace($root)
+            [void](New-AstroDetachedDirectoryNoReplace $root)
         }
         catch {
             if (-not [IO.Directory]::Exists($root)) {
@@ -244,7 +284,7 @@ function New-AstroDetachedRunDirectory {
     $root = Initialize-AstroDetachedStateRoot
     $runDirectory = Join-Path $root $RunId
     try {
-        [AstroDetachedProtocolNative]::CreateDirectoryNoReplace($runDirectory)
+        [void](New-AstroDetachedDirectoryNoReplace $runDirectory)
     }
     catch {
         throw "DETACH_PROTOCOL[ASTRO_DETACH_STATE_COLLISION]: {code=ASTRO_DETACH_STATE_COLLISION; message=`"create-new run directory refused existing or uncreatable path '$runDirectory': $($_.Exception.Message)`"; remediation=`"never overwrite or delete it; choose a fresh run ID and inspect the existing state independently`"}"
