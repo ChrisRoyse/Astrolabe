@@ -10,7 +10,7 @@ ASTROLABE is a coding MCP server for AI agents that fuses two parents into one n
 | [`AGENTS.md`](AGENTS.md) | Condensed agent context (same rules, short form) |
 | [`docs/astrolabe-blueprint.md`](docs/astrolabe-blueprint.md) | Plan of record — the 23-part design (vision, capability catalog, phases P0–P10) |
 | [`docs/BUILDING_ON_CALYX.md`](docs/BUILDING_ON_CALYX.md) | Binding upstream doctrine — the Calyx builder's handbook the blueprint derives from |
-| [EPIC #65](https://github.com/ChrisRoyse/Astrolabe/issues/65) | Master build tracker — dependency spine, phase gates, `ASTROLABE_DONE` predicate |
+| [EPIC #65](https://github.com/ChrisRoyse/Astrolabe/issues/65) | Master build tracker — dependency spine, phase completion criteria, `ASTROLABE_DONE` predicate |
 | [#139](https://github.com/ChrisRoyse/Astrolabe/issues/139) | Agent protocol — **GitHub issues are the single source of truth for project state** |
 
 The blueprint records *design*; it never records *progress*. All state — done, in progress, remaining — lives on GitHub issues.
@@ -31,7 +31,7 @@ The blueprint records *design*; it never records *progress*. All state — done,
 
 ## Building natively on Windows
 
-Build and test evidence is produced with the native Windows GNU toolchain, because the Rust host and the static `libcbm.a` archive must share one ABI. All work runs from `C:\code\Astrolabe` with native Windows executables; for POSIX scripts use a Git for Windows bash (`C:\Program Files\Git\bin\bash.exe`) so the toolchain stays consistent. WSL may be installed and running on the machine — that is fine; project tooling does not detect, block on, or modify it.
+Build and manual-FSV evidence is produced with the native Windows GNU toolchain, because the Rust host and the static `libcbm.a` archive must share one ABI. All work runs from `C:\code\Astrolabe` with native Windows executables; for POSIX scripts use a Git for Windows bash (`C:\Program Files\Git\bin\bash.exe`) so the toolchain stays consistent. WSL may be installed and running on the machine — that is fine; project tooling does not detect, block on, or modify it.
 
 Prerequisites and toolchain facts:
 
@@ -43,29 +43,59 @@ Prerequisites and toolchain facts:
   powershell -ExecutionPolicy Bypass -File scripts\windows-gnu-toolchain.ps1 -Issue <driving-issue> -Bootstrap
   ```
 
-- Run every native Cargo or aggregate command **through the launcher** so it selects the matching runtime and pinned lint tools, confines child `TEMP`/`TMP`/`TMPDIR` to a launcher-owned `.tmp` child inside the workspace, and removes that child and `target/` on exit. Aggregate evidence must stream directly through the repository wrapper, which creates no log file and must not be wrapped in `Tee-Object` or redirected to a host-side file:
+- Claim and re-read the driving GitHub issue before launching. Run every native Cargo or C build command **through the launcher** so it selects the matching runtime and pinned analysis tools, confines child `TEMP`/`TMP`/`TMPDIR` to a launcher-owned workspace child, and lets the exact live owner remove its generation and `target/` on exit. A single command is passed as JSON:
 
   ```powershell
-  .\scripts\invoke-native-aggregate.ps1 -Gate full -UnboundedWorkspaceTests
+  $toolArgs = '["check", "--workspace"]'
+  .\scripts\windows-gnu-toolchain.ps1 -Issue <driving-issue> -Command cargo -CommandArgsJson $toolArgs
+  ```
+
+  A contiguous check/build batch is one nested JSON plan owned by one launcher generation:
+
+  ```powershell
+  $batch = '[["cargo", "check", "--workspace"], ["cargo", "build", "--workspace"]]'
+  .\scripts\windows-gnu-toolchain.ps1 -Issue <driving-issue> -BatchCommandsJson $batch
   ```
 
 - DLL search order matters: the MinGW `bin` directory must precede the Rust GNU host `bin` on `PATH` so `libstdc++-6.dll` loads its matching `libgcc_s_seh-1.dll`. The launcher arranges this; that is one reason not to bypass it.
-- Pure-Rust iteration: `cargo check -p <crate> --all-targets` is fast and does not need the C toolchain; anything touching `cbm-sys` does.
+- For focused pure-Rust iteration, pass `check -p <crate> --all-targets` through the same launcher. Anything touching `cbm-sys` also exercises the pinned C toolchain.
 
-## Verification
+## Manual Full State Verification
 
-- `scripts/check.sh` — portable aggregate (all portable gates; emits the named `SKIP[ASTRO_EGRESS_LINUX_REQUIRED]` for the one Linux/strace probe — a recorded coverage gap tracked in [#224](https://github.com/ChrisRoyse/Astrolabe/issues/224), closable by a manual Linux-host run, never pass evidence).
-- `scripts/check-full.sh` — complete local gate. It bounds the workspace-test phase by default; exit `125` with `DEFERRED[ASTRO_NATIVE_AGGREGATE]` means downstream suites did not run and is **not** passing evidence. Use the printed `ASTROLABE_WORKSPACE_TEST_TIMEOUT_SECS=0` continuation for an intentional full run.
-- `scripts/check-release.sh` — full release gate (binary size + `ASTROLABE_DONE` predicate).
-- Formatter: `python scripts/native-cargo-fmt.py --all -- --check`. Do **not** run bare `cargo fmt --all` on Windows — upstream cargo-fmt builds one command line beyond the OS limit on this workspace graph.
-- CBM lint: `scripts/ci-cbm-lint.sh` (historical filename; it is a local gate — on non-Linux hosts clang-tidy is skipped by name as a tracked coverage gap; cppcheck/format/NOLINT gates still run).
-- **There is no CI/CD.** GitHub Actions is banned in this repository (owner directive, 2026-07-11): no workflows, no required checks, no hosted pipelines. All verification is local full-state verification — the scripts above, run natively, with evidence recorded on the closing GitHub issue. The `ci/` directory holds local gate configs consumed by the check scripts; the name is historical, and nothing in it is GitHub configuration ([#224](https://github.com/ChrisRoyse/Astrolabe/issues/224)).
+Astrolabe uses no test suite, aggregate gate, or CI/CD. Verification is a manual comparison with reality, performed natively on Windows and recorded on the driving GitHub issue:
 
-Platform-limited gates are skipped **by name** (`SKIP[...]`/`INFO[...]` markers), never silently; a named skip is a recorded, issue-tracked coverage gap — not local pass evidence.
+1. Define the source of truth for the behavior: persisted database rows, graph bytes, files, process state, or another physical result.
+2. Build and exercise the real artifact against real data. Synthetic inputs are useful when their exact expected outputs are known; they are real inputs, not mocks.
+3. Independently read the source of truth after execution instead of trusting a command's return value or response echo.
+4. Manually exercise the happy path and at least three relevant boundaries, recording before/after state for each.
+5. Record the native command, commit SHA, artifact hash, execution context, and physical readback on the issue. A failure or unavailable observation is explicit evidence of a gap, never a pass.
+
+For an artifact that must run after Cargo output cleanup, stage it during the same issue-owned launcher lease with `scripts\native-fsv-artifact.ps1`, and execute/read it only through `scripts\native-fsv-run.ps1`. Follow the exact lifecycle in `CLAUDE.md`; never execute closure evidence directly from disposable `target/`.
+
+The complete Rust formatting inspection is:
+
+```powershell
+python scripts/native-cargo-fmt.py --all -- --check
+```
+
+Do not run bare `cargo fmt --all` on native Windows: upstream cargo-fmt builds one command line beyond the Windows limit for this workspace graph.
+
+For a non-build inspection, remain read-only and run:
+
+```powershell
+Set-Location C:\code\Astrolabe
+git status --short --branch
+Get-Content -LiteralPath CLAUDE.md -Raw
+gh issue view <driving-issue> --comments
+Test-Path -LiteralPath .tmp\astrolabe-launcher.lock
+Test-Path -LiteralPath target
+```
+
+The final two reads report physical namespace state only; they never authorize deletion. Preserve any non-absent launcher or target state and follow the issue-bound ownership/recovery procedure in `CLAUDE.md`.
 
 ## Hygiene invariants (enforced by the workflow)
 
-- `target/` is disposable evidence workspace: every build/test/check batch deletes `C:\code\Astrolabe\target` immediately after evidence capture — including on failure — and verifies it absent before any pause, issue close, or handoff.
+- `target/` is disposable evidence workspace: the exact live launcher owner removes `C:\code\Astrolabe\target` immediately after every build/manual-verification batch — including on failure — and its absence is independently read back before any pause, issue close, or handoff.
 - Repository-controlled outputs stay under `C:\code\Astrolabe` (normally `target/`) and are never committed.
 - Every commit message body references its issue (`Refs #N` / `Closes #N`).
-- Standing invariants for every PR (the HONEST conjunct — trust/freshness/provenance labels, no silent fallback, no unmeasured constants, FSV byte-readback tests, fail-closed `{code, message, remediation}` errors) are listed in `CLAUDE.md` and EPIC #65.
+- Standing invariants for every change (the HONEST conjunct — trust/freshness/provenance labels, no silent fallback, no unmeasured constants, independent FSV byte readback, fail-closed `{code, message, remediation}` errors) are listed in `CLAUDE.md` and EPIC #65.
