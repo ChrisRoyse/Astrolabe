@@ -25,7 +25,7 @@ param(
     [int]$Issue,
 
     [Parameter(Mandatory)]
-    [ValidateSet('ArchiveAndReindex', 'ResumeReindex')]
+    [ValidateSet('ArchiveAndReindex', 'ResumeReindex', 'RecoverInterruptedResume')]
     [string]$Operation,
 
     [Parameter(Mandatory)]
@@ -54,7 +54,19 @@ param(
     [int]$ExpectedSchemaVersion,
 
     [ValidateRange(60, 86400)]
-    [int]$ReindexTimeoutSeconds = 14400
+    [int]$ReindexTimeoutSeconds = 14400,
+
+    [string]$InterruptedAttemptPrefix = '',
+
+    [string]$ExpectedInterruptedIntentSha256 = '',
+
+    [string]$ExpectedJournalTailSha256 = '',
+
+    [string]$LauncherRecoveryCompletionPath = '',
+
+    [string]$ExpectedLauncherRecoveryCompletionSha256 = '',
+
+    [string]$RecoveryTrackerCommentUrl = ''
 )
 
 Set-StrictMode -Version Latest
@@ -492,6 +504,583 @@ function Get-ValidatedJournal {
     return [pscustomobject]@{ Records = @($records); TailSha256 = $previous }
 }
 
+function Read-CbmMigrationJson {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][string]$Purpose
+    )
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        Throw-CbmMigrationError -Code 'CBM_STORE_MIGRATION_RECOVERY_RECORD_MISSING' `
+            -Message "$Purpose is absent: $Path" `
+            -Remediation 'preserve the transaction and pass only the exact immutable recovery evidence'
+    }
+    try {
+        return Get-Content -Raw -LiteralPath $Path | ConvertFrom-Json -Depth 100
+    }
+    catch {
+        Throw-CbmMigrationError -Code 'CBM_STORE_MIGRATION_RECOVERY_RECORD_INVALID' `
+            -Message "$Purpose is not valid JSON: $Path; detail=$($_.Exception.Message)" `
+            -Remediation 'preserve the exact bytes and investigate the malformed recovery evidence'
+    }
+}
+
+function Read-CbmRecoveryTrackerEvidence {
+    param(
+        [Parameter(Mandatory)][string]$CommentUrl,
+        [Parameter(Mandatory)][int]$OwningIssue,
+        [Parameter(Mandatory)][string]$ExpectedEvidenceLine
+    )
+    $pattern = '^https://github\.com/ChrisRoyse/Astrolabe/issues/' +
+        [Regex]::Escape([string]$OwningIssue) + '#issuecomment-(?<id>[1-9][0-9]*)$'
+    if ($CommentUrl -cnotmatch $pattern) {
+        Throw-CbmMigrationError -Code 'CBM_STORE_MIGRATION_RECOVERY_TRACKER_URL_INVALID' `
+            -Message "tracker URL is not an exact comment on owning issue #$OwningIssue`: $CommentUrl" `
+            -Remediation 'post the exact recovery marker on the owning migration issue and pass its canonical URL'
+    }
+    [long]$commentId = $Matches['id']
+    $gh = Get-Command gh.exe -CommandType Application -ErrorAction SilentlyContinue
+    if ($null -eq $gh) {
+        Throw-CbmMigrationError -Code 'CBM_STORE_MIGRATION_RECOVERY_GH_MISSING' `
+            -Message 'gh.exe is unavailable for the mandatory independent tracker read' `
+            -Remediation 'install and authenticate GitHub CLI, then retry without changing migration state'
+    }
+    $start = [Diagnostics.ProcessStartInfo]::new()
+    $start.FileName = $gh.Source
+    $start.UseShellExecute = $false
+    $start.CreateNoWindow = $true
+    $start.RedirectStandardOutput = $true
+    $start.RedirectStandardError = $true
+    $start.ArgumentList.Add('api')
+    $start.ArgumentList.Add("repos/ChrisRoyse/Astrolabe/issues/comments/$commentId")
+    $process = [Diagnostics.Process]::new()
+    $process.StartInfo = $start
+    if (-not $process.Start()) {
+        Throw-CbmMigrationError -Code 'CBM_STORE_MIGRATION_RECOVERY_GH_START_FAILED' `
+            -Message "could not start gh.exe for tracker comment $commentId" `
+            -Remediation 'inspect GitHub CLI execution policy and retry without changing migration state'
+    }
+    $stdoutTask = $process.StandardOutput.ReadToEndAsync()
+    $stderrTask = $process.StandardError.ReadToEndAsync()
+    if (-not $process.WaitForExit(60000)) {
+        try {
+            $process.Kill($true)
+            $process.WaitForExit()
+        }
+        catch {
+            Throw-CbmMigrationError -Code 'CBM_STORE_MIGRATION_RECOVERY_GH_TIMEOUT_UNTERMINATED' `
+                -Message "tracker read exceeded 60000 ms and owned gh process could not be terminated: pid=$($process.Id); detail=$($_.Exception.Message)" `
+                -Remediation 'preserve migration state and inspect the exact owned GitHub CLI process generation'
+        }
+        Throw-CbmMigrationError -Code 'CBM_STORE_MIGRATION_RECOVERY_GH_TIMEOUT' `
+            -Message "tracker read exceeded 60000 ms: comment=$commentId" `
+            -Remediation 'preserve migration state and restore bounded GitHub API access before retrying'
+    }
+    $stdout = $stdoutTask.GetAwaiter().GetResult()
+    $stderr = $stderrTask.GetAwaiter().GetResult()
+    if ($process.ExitCode -ne 0) {
+        Throw-CbmMigrationError -Code 'CBM_STORE_MIGRATION_RECOVERY_GH_FAILED' `
+            -Message "gh api failed for tracker comment $commentId (exit=$($process.ExitCode)): $($stderr.Trim())" `
+            -Remediation 'restore authenticated GitHub access and retry without changing migration state'
+    }
+    try {
+        $comment = $stdout | ConvertFrom-Json -Depth 30
+    }
+    catch {
+        Throw-CbmMigrationError -Code 'CBM_STORE_MIGRATION_RECOVERY_TRACKER_INVALID' `
+            -Message "GitHub comment response is not valid JSON: $($_.Exception.Message)" `
+            -Remediation 'preserve migration state and investigate the GitHub API response'
+    }
+    $expectedApiIssue = "https://api.github.com/repos/ChrisRoyse/Astrolabe/issues/$OwningIssue"
+    if ([long]$comment.id -ne $commentId -or [string]$comment.html_url -cne $CommentUrl -or
+        [string]$comment.issue_url -cne $expectedApiIssue -or
+        [string]$comment.user.login -cne 'ChrisRoyse' -or
+        [string]$comment.author_association -cne 'OWNER') {
+        Throw-CbmMigrationError -Code 'CBM_STORE_MIGRATION_RECOVERY_TRACKER_IDENTITY_MISMATCH' `
+            -Message 'tracker response does not bind the exact repository owner, issue, comment id, and canonical URL' `
+            -Remediation 'use one owner-authored comment on the owning migration issue'
+    }
+    $markerPrefix = 'CBM_STORE_MIGRATION_INTERRUPTION_RECOVERY '
+    $markerLines = @(([string]$comment.body -split "`r?`n") | Where-Object {
+        $_.StartsWith($markerPrefix, [StringComparison]::Ordinal)
+    })
+    if ($markerLines.Count -ne 1 -or $markerLines[0] -cne $ExpectedEvidenceLine) {
+        Throw-CbmMigrationError -Code 'CBM_STORE_MIGRATION_RECOVERY_TRACKER_EVIDENCE_MISMATCH' `
+            -Message "tracker comment must contain exactly one byte-exact recovery marker; found=$($markerLines.Count)" `
+            -Remediation 'post the generated exact marker without editing or duplicating it'
+    }
+    $bodyBytes = [Text.UTF8Encoding]::new($false).GetBytes([string]$comment.body)
+    return [pscustomobject]@{
+        Url = $CommentUrl
+        Id = $commentId
+        UpdatedAt = [string]$comment.updated_at
+        BodySha256 = [Convert]::ToHexString(
+            [Security.Cryptography.SHA256]::HashData($bodyBytes)
+        ).ToLowerInvariant()
+    }
+}
+
+function Assert-CbmRecoveredAttemptTerminal {
+    param(
+        [Parameter(Mandatory)][string]$TransactionPath,
+        [Parameter(Mandatory)][string]$AttemptPrefix,
+        [Parameter(Mandatory)][string]$IntentSha256,
+        [Parameter(Mandatory)]$JournalState
+    )
+    $authorizationPath = [IO.Path]::Combine(
+        $TransactionPath, "$AttemptPrefix-interruption-recovery.authorization.json")
+    $faultPath = [IO.Path]::Combine($TransactionPath, "$AttemptPrefix-fault.json")
+    $completionPath = [IO.Path]::Combine(
+        $TransactionPath, "$AttemptPrefix-interruption-recovery.completion.json")
+    $authorization = Read-CbmMigrationJson -Path $authorizationPath `
+        -Purpose "$AttemptPrefix recovery authorization"
+    $fault = Read-CbmMigrationJson -Path $faultPath -Purpose "$AttemptPrefix recovered fault"
+    $completion = Read-CbmMigrationJson -Path $completionPath `
+        -Purpose "$AttemptPrefix recovery completion"
+    $authorizationSha = Get-FileSha256 -Path $authorizationPath
+    $faultSha = Get-FileSha256 -Path $faultPath
+    if ($authorization.schema -ne 1 -or $authorization.status -cne 'authorized' -or
+        $authorization.issue -ne $Issue -or $authorization.attempt_prefix -cne $AttemptPrefix -or
+        [string]$authorization.intent_sha256 -cne $IntentSha256 -or
+        $fault.schema -ne 1 -or $fault.status -cne 'fault' -or $fault.issue -ne $Issue -or
+        $fault.fault_kind -cne 'interrupted_resume_recovered' -or
+        $fault.attempt_prefix -cne $AttemptPrefix -or
+        [string]$fault.intent_sha256 -cne $IntentSha256 -or
+        [string]$fault.recovery_authorization_sha256 -cne $authorizationSha -or
+        [string]$fault.launcher_recovery_completion_sha256 -cne
+            [string]$authorization.launcher_recovery_completion_sha256 -or
+        [string]$fault.migration_script_sha256 -cne
+            [string]$authorization.migration_script_sha256 -or
+        [string]$fault.launcher_lock_helper_sha256 -cne
+            [string]$authorization.launcher_lock_helper_sha256 -or
+        $completion.schema -ne 1 -or $completion.status -cne 'interruption_recovered' -or
+        $completion.issue -ne $Issue -or $completion.attempt_prefix -cne $AttemptPrefix -or
+        $completion.transaction_path -cne $TransactionPath -or
+        [string]$completion.intent_sha256 -cne $IntentSha256 -or
+        [string]$completion.recovery_authorization_sha256 -cne $authorizationSha -or
+        [string]$completion.recovered_fault_sha256 -cne $faultSha -or
+        [string]$completion.launcher_recovery_completion_sha256 -cne
+            [string]$authorization.launcher_recovery_completion_sha256 -or
+        [string]$completion.migration_script_sha256 -cne
+            [string]$authorization.migration_script_sha256 -or
+        [string]$completion.launcher_lock_helper_sha256 -cne
+            [string]$authorization.launcher_lock_helper_sha256) {
+        Throw-CbmMigrationError -Code 'CBM_STORE_MIGRATION_RECOVERY_TERMINAL_INVALID' `
+            -Message "$AttemptPrefix recovery authorization, fault, and completion do not cross-bind exactly" `
+            -Remediation 'preserve every record and investigate the interrupted recovery protocol'
+    }
+    $matches = @($JournalState.Records | Where-Object {
+        $_.payload.event -ceq 'resume_interruption_recovered' -and
+        $_.payload.data.attempt_prefix -ceq $AttemptPrefix -and
+        $_.payload.data.intent_sha256 -ceq $IntentSha256 -and
+        $_.payload.data.recovery_authorization_sha256 -ceq $authorizationSha -and
+        $_.payload.data.recovered_fault_sha256 -ceq $faultSha -and
+        $_.payload.data.launcher_recovery_completion_sha256 -ceq
+            [string]$authorization.launcher_recovery_completion_sha256 -and
+        $_.payload.data.migration_script_sha256 -ceq
+            [string]$authorization.migration_script_sha256 -and
+        $_.payload.data.launcher_lock_helper_sha256 -ceq
+            [string]$authorization.launcher_lock_helper_sha256
+    })
+    if ($matches.Count -ne 1 -or
+        [string]$completion.final_journal_record_sha256 -cne
+            [string]$matches[0].payload_sha256) {
+        Throw-CbmMigrationError -Code 'CBM_STORE_MIGRATION_RECOVERY_JOURNAL_UNBOUND' `
+            -Message "$AttemptPrefix recovery terminal records are not bound by exactly one journal event" `
+            -Remediation 'preserve the transaction and investigate the interrupted recovery journal phase'
+    }
+}
+
+function Write-CbmRecoveryDurableJson {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)]$Value
+    )
+    if (Test-Path -LiteralPath $Path) {
+        Throw-CbmMigrationError -Code 'CBM_STORE_MIGRATION_RECOVERY_RECORD_EXISTS' `
+            -Message "recovery record already exists: $Path" `
+            -Remediation 'read and validate the immutable existing phase record; never overwrite it'
+    }
+    $scratch = "$Path.scratch-$PID-$([Guid]::NewGuid().ToString('N'))"
+    $bytes = [Text.UTF8Encoding]::new($false).GetBytes(
+        ($Value | ConvertTo-Json -Depth 20 -Compress)
+    )
+    $stream = [IO.File]::Open($scratch, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write,
+        [IO.FileShare]::Read)
+    try {
+        $stream.Write($bytes, 0, $bytes.Length)
+        $stream.Flush($true)
+    }
+    finally {
+        $stream.Dispose()
+    }
+    Move-AstroFileWriteThroughNoReplace -Source $scratch -Destination $Path
+}
+
+function Invoke-CbmInterruptedResumeRecovery {
+    param(
+        [Parameter(Mandatory)][string]$TransactionPath,
+        [Parameter(Mandatory)][string]$JournalPath,
+        [Parameter(Mandatory)]$JournalState,
+        [Parameter(Mandatory)][string]$Repository,
+        [Parameter(Mandatory)][string[]]$TargetFamilyPaths
+    )
+    if ($InterruptedAttemptPrefix -cnotmatch '^resume-(?<number>[0-9]{3})$' -or
+        [int]$Matches['number'] -lt 1 -or
+        $ExpectedInterruptedIntentSha256 -cnotmatch '^[0-9a-fA-F]{64}$' -or
+        $ExpectedJournalTailSha256 -cnotmatch '^[0-9a-fA-F]{64}$' -or
+        [string]::IsNullOrWhiteSpace($LauncherRecoveryCompletionPath) -or
+        $ExpectedLauncherRecoveryCompletionSha256 -cnotmatch '^[0-9a-fA-F]{64}$' -or
+        [string]::IsNullOrWhiteSpace($RecoveryTrackerCommentUrl)) {
+        Throw-CbmMigrationError -Code 'CBM_STORE_MIGRATION_RECOVERY_INPUT_INVALID' `
+            -Message 'interrupted recovery requires one canonical attempt prefix, exact hashes, one launcher completion path, and one tracker comment URL' `
+            -Remediation 'measure every immutable input and pass all explicit recovery bindings'
+    }
+    $intentExpectedSha = $ExpectedInterruptedIntentSha256.ToLowerInvariant()
+    $journalExpectedTail = $ExpectedJournalTailSha256.ToLowerInvariant()
+    $launcherExpectedSha = $ExpectedLauncherRecoveryCompletionSha256.ToLowerInvariant()
+    $targetMembers = @($TargetFamilyPaths | Where-Object { Test-Path -LiteralPath $_ })
+    if ($targetMembers.Count -ne 0) {
+        Throw-CbmMigrationError -Code 'CBM_STORE_MIGRATION_RECOVERY_TARGET_EXISTS' `
+            -Message "canonical target family exists during recovery: $($targetMembers -join ', ')" `
+            -Remediation 'preserve the target and investigate whether the interrupted child published real state'
+    }
+
+    $attemptIntentPath = [IO.Path]::Combine(
+        $TransactionPath, "$InterruptedAttemptPrefix-intent.json")
+    $attemptIntent = Read-CbmMigrationJson -Path $attemptIntentPath `
+        -Purpose "$InterruptedAttemptPrefix intent"
+    $intentSha = Get-FileSha256 -Path $attemptIntentPath
+    $archiveCompletePath = [IO.Path]::Combine($TransactionPath, 'archive-complete.json')
+    if ($intentSha -cne $intentExpectedSha -or $attemptIntent.schema -ne 1 -or
+        $attemptIntent.operation -cne 'ResumeReindex' -or $attemptIntent.issue -ne $Issue -or
+        $attemptIntent.project -cne $Project -or
+        -not [string]::Equals([string]$attemptIntent.repository_path, $Repository,
+            [StringComparison]::OrdinalIgnoreCase) -or
+        -not [string]::Equals([string]$attemptIntent.transaction_path, $TransactionPath,
+            [StringComparison]::OrdinalIgnoreCase) -or
+        [string]$attemptIntent.archive_complete_sha256 -cne
+            (Get-FileSha256 -Path $archiveCompletePath) -or
+        $attemptIntent.expected_schema_version -ne $ExpectedSchemaVersion) {
+        Throw-CbmMigrationError -Code 'CBM_STORE_MIGRATION_RECOVERY_INTENT_MISMATCH' `
+            -Message "$InterruptedAttemptPrefix intent does not bind the exact immutable migration identity" `
+            -Remediation 'preserve the transaction and use the exact interrupted intent named in tracker evidence'
+    }
+    $attemptNumbers = @(Get-ChildItem -LiteralPath $TransactionPath -File -Force |
+        ForEach-Object {
+            if ($_.Name -cmatch '^resume-(\d{3})-intent\.json$') { [int]$Matches[1] }
+        })
+    $interruptedNumber = [int]($InterruptedAttemptPrefix.Substring(7))
+    if ($attemptNumbers.Count -eq 0 -or
+        [int](($attemptNumbers | Measure-Object -Maximum).Maximum) -ne $interruptedNumber) {
+        Throw-CbmMigrationError -Code 'CBM_STORE_MIGRATION_RECOVERY_NOT_LATEST_ATTEMPT' `
+            -Message "$InterruptedAttemptPrefix is not the latest durable resume intent" `
+            -Remediation 'never recover an older attempt after a later attempt has been published'
+    }
+
+    $intentJournalMatches = @($JournalState.Records | Where-Object {
+        [string]$_.payload_sha256 -ceq $journalExpectedTail -and
+        $_.payload.event -ceq 'resume_intent_published' -and
+        $_.payload.data.issue -eq $Issue -and
+        $_.payload.data.transaction_path -ceq $TransactionPath -and
+        $_.payload.data.created_utc -ceq $attemptIntent.created_utc
+    })
+    if ($intentJournalMatches.Count -ne 1) {
+        Throw-CbmMigrationError -Code 'CBM_STORE_MIGRATION_RECOVERY_JOURNAL_INTENT_UNBOUND' `
+            -Message 'expected journal tail is not the unique interrupted resume-intent event' `
+            -Remediation 'pass the payload SHA-256 of the exact resume_intent_published record'
+    }
+    $recordAfterIntent = @($JournalState.Records | Where-Object {
+        $_.payload.previous_record_sha256 -ceq $journalExpectedTail
+    })
+    if ($recordAfterIntent.Count -gt 1 -or
+        ($recordAfterIntent.Count -eq 1 -and
+            $recordAfterIntent[0].payload.event -cne 'resume_interruption_recovered')) {
+        Throw-CbmMigrationError -Code 'CBM_STORE_MIGRATION_RECOVERY_JOURNAL_ADVANCED' `
+            -Message 'journal contains an unexpected event after the interrupted intent' `
+            -Remediation 'preserve the journal and investigate the competing migration writer'
+    }
+
+    $launcherCompletion = Get-CanonicalExistingPath `
+        -Path $LauncherRecoveryCompletionPath -Kind File
+    $allowedRecoveryRoot = [IO.Path]::Combine($Repository, '.tmp', 'lock-recovery').TrimEnd('\') + '\'
+    if (-not $launcherCompletion.StartsWith($allowedRecoveryRoot,
+            [StringComparison]::OrdinalIgnoreCase)) {
+        Throw-CbmMigrationError -Code 'CBM_STORE_MIGRATION_RECOVERY_LAUNCHER_PATH_INVALID' `
+            -Message "launcher recovery completion is outside repository authority: $launcherCompletion" `
+            -Remediation 'pass the exact supported launcher recovery completion under .tmp\\lock-recovery'
+    }
+    $launcherSha = Get-FileSha256 -Path $launcherCompletion
+    $launcherRecord = Read-CbmMigrationJson -Path $launcherCompletion `
+        -Purpose 'launcher recovery completion'
+    $pidProbe = $launcherRecord.post_publication_pid_probe
+    $attributionProbe = $launcherRecord.post_publication_attribution_probe
+    $jobProbeRecord = $attributionProbe.exact_job_object_probe
+    if ($launcherSha -cne $launcherExpectedSha -or
+        $launcherRecord.schema -cne 'astrolabe.launcher-lock-recovery.completion.v6' -or
+        $pidProbe.state -cne 'absent' -or [bool]$pidProbe.legacy_pid_only -or
+        [int]$pidProbe.pid -le 0 -or [long]$pidProbe.owner_process_start_utc_ticks -le 0 -or
+        $attributionProbe.exact_job_object_name -cnotmatch
+            '^Global\\Astrolabe\.LauncherTree\.[0-9a-f]{64}$' -or
+        $jobProbeRecord.state -cne 'absent' -or @($jobProbeRecord.process_ids).Count -ne 0 -or
+        $launcherRecord.expected_final_protocol.active_state -cne 'absent' -or
+        @($launcherRecord.expected_final_protocol.transition_paths).Count -ne 0) {
+        Throw-CbmMigrationError -Code 'CBM_STORE_MIGRATION_RECOVERY_LAUNCHER_COMPLETION_INVALID' `
+            -Message 'launcher completion does not prove exact owner/Job absence and an empty launcher namespace' `
+            -Remediation 'use the exact successful v6 launcher recovery completion and measured hash'
+    }
+
+    $scriptPath = Get-CanonicalExistingPath -Path $PSCommandPath -Kind File
+    $expectedScriptPath = [IO.Path]::Combine(
+        $Repository, 'scripts', 'migrate-cbm-store.ps1')
+    $launcherHelperPath = Get-CanonicalExistingPath `
+        -Path ([IO.Path]::Combine($Repository, 'scripts', 'launcher-lock.ps1')) -Kind File
+    if (-not [string]::Equals($scriptPath, $expectedScriptPath,
+            [StringComparison]::OrdinalIgnoreCase)) {
+        Throw-CbmMigrationError -Code 'CBM_STORE_MIGRATION_RECOVERY_SCRIPT_PATH_INVALID' `
+            -Message "recovery script is not the repository-owned canonical path: $scriptPath" `
+            -Remediation 'run the exact repository scripts\\migrate-cbm-store.ps1 bytes'
+    }
+    $scriptSha = Get-FileSha256 -Path $scriptPath
+    $launcherHelperSha = Get-FileSha256 -Path $launcherHelperPath
+    if (('AstroLauncherLockNative' -as [type]) -or
+        (Get-Command Get-AstroLauncherJobObjectProbe -ErrorAction SilentlyContinue) -or
+        (Get-Command Read-AstroLauncherLock -ErrorAction SilentlyContinue)) {
+        Throw-CbmMigrationError -Code 'CBM_STORE_MIGRATION_RECOVERY_HELPER_PRELOADED' `
+            -Message 'launcher-lock native type or query functions were loaded before exact helper import' `
+            -Remediation 'run recovery in a fresh PowerShell process so only the hash-bound helper defines authority'
+    }
+    . $launcherHelperPath
+    $ownerProbe = Get-AstroExactProcessIdentityProbe `
+        -ProcessId ([int]$pidProbe.pid) `
+        -ProcessStartUtcTicks ([long]$pidProbe.owner_process_start_utc_ticks)
+    $jobProbe = Get-AstroLauncherJobObjectProbe `
+        -Name ([string]$attributionProbe.exact_job_object_name)
+    $launcherLockPath = [IO.Path]::Combine($Repository, '.tmp', 'astrolabe-launcher.lock')
+    $launcherState = Read-AstroLauncherLock -LockPath $launcherLockPath
+    if ($ownerProbe.State -cnotin @('absent', 'pid-reused') -or
+        $jobProbe.State -cne 'absent' -or @($jobProbe.ProcessIds).Count -ne 0 -or
+        $launcherState.State -cne 'absent' -or @($launcherState.TransitionPaths).Count -ne 0) {
+        Throw-CbmMigrationError -Code 'CBM_STORE_MIGRATION_RECOVERY_LAUNCHER_NOT_QUIESCENT' `
+            -Message "launcher is not quiescent: owner=$($ownerProbe.State), job=$($jobProbe.State), active=$($launcherState.State), transitions=$(@($launcherState.TransitionPaths).Count)" `
+            -Remediation 'recover the exact live or interrupted launcher protocol before migration recovery'
+    }
+
+    $evidence = [ordered]@{
+        schema = 1
+        issue = $Issue
+        transaction_path = $TransactionPath
+        attempt_prefix = $InterruptedAttemptPrefix
+        intent_sha256 = $intentSha
+        journal_tail_sha256 = $journalExpectedTail
+        launcher_recovery_completion_path = $launcherCompletion
+        launcher_recovery_completion_sha256 = $launcherSha
+        migration_script_path = $scriptPath
+        migration_script_sha256 = $scriptSha
+        launcher_lock_helper_path = $launcherHelperPath
+        launcher_lock_helper_sha256 = $launcherHelperSha
+        owner_pid = [int]$pidProbe.pid
+        owner_process_start_utc_ticks = [long]$pidProbe.owner_process_start_utc_ticks
+        job_object_name = [string]$attributionProbe.exact_job_object_name
+    }
+    $evidenceLine = 'CBM_STORE_MIGRATION_INTERRUPTION_RECOVERY ' +
+        ($evidence | ConvertTo-Json -Compress)
+    $trackerFirst = Read-CbmRecoveryTrackerEvidence `
+        -CommentUrl $RecoveryTrackerCommentUrl -OwningIssue $Issue `
+        -ExpectedEvidenceLine $evidenceLine
+
+    $authorizationPath = [IO.Path]::Combine(
+        $TransactionPath, "$InterruptedAttemptPrefix-interruption-recovery.authorization.json")
+    $faultPath = [IO.Path]::Combine($TransactionPath, "$InterruptedAttemptPrefix-fault.json")
+    $completionPath = [IO.Path]::Combine(
+        $TransactionPath, "$InterruptedAttemptPrefix-interruption-recovery.completion.json")
+    $authorizationValue = [ordered]@{
+        schema = 1
+        status = 'authorized'
+        issue = $Issue
+        authorized_utc = [DateTime]::UtcNow.ToString('o')
+        transaction_path = $TransactionPath
+        attempt_prefix = $InterruptedAttemptPrefix
+        intent_path = $attemptIntentPath
+        intent_sha256 = $intentSha
+        journal_tail_before_sha256 = $journalExpectedTail
+        launcher_recovery_completion_path = $launcherCompletion
+        launcher_recovery_completion_sha256 = $launcherSha
+        migration_script_path = $scriptPath
+        migration_script_sha256 = $scriptSha
+        launcher_lock_helper_path = $launcherHelperPath
+        launcher_lock_helper_sha256 = $launcherHelperSha
+        tracker = [ordered]@{
+            url = $trackerFirst.Url
+            comment_id = $trackerFirst.Id
+            updated_at = $trackerFirst.UpdatedAt
+            body_sha256 = $trackerFirst.BodySha256
+        }
+        owner_probe_before = $ownerProbe
+        job_probe_before = $jobProbe
+        launcher_state_before = [ordered]@{
+            state = $launcherState.State
+            transition_paths = @($launcherState.TransitionPaths)
+        }
+    }
+    if (-not (Test-Path -LiteralPath $authorizationPath)) {
+        Write-CbmRecoveryDurableJson -Path $authorizationPath -Value $authorizationValue
+    }
+    $authorization = Read-CbmMigrationJson -Path $authorizationPath `
+        -Purpose "$InterruptedAttemptPrefix recovery authorization"
+    $authorizationSha = Get-FileSha256 -Path $authorizationPath
+    if ($authorization.schema -ne 1 -or $authorization.status -cne 'authorized' -or
+        $authorization.issue -ne $Issue -or
+        $authorization.transaction_path -cne $TransactionPath -or
+        $authorization.attempt_prefix -cne $InterruptedAttemptPrefix -or
+        [string]$authorization.intent_sha256 -cne $intentSha -or
+        [string]$authorization.journal_tail_before_sha256 -cne $journalExpectedTail -or
+        [string]$authorization.launcher_recovery_completion_path -cne $launcherCompletion -or
+        [string]$authorization.launcher_recovery_completion_sha256 -cne $launcherSha -or
+        [string]$authorization.migration_script_path -cne $scriptPath -or
+        [string]$authorization.migration_script_sha256 -cne $scriptSha -or
+        [string]$authorization.launcher_lock_helper_path -cne $launcherHelperPath -or
+        [string]$authorization.launcher_lock_helper_sha256 -cne $launcherHelperSha -or
+        [string]$authorization.tracker.url -cne $trackerFirst.Url -or
+        [long]$authorization.tracker.comment_id -ne $trackerFirst.Id -or
+        [string]$authorization.tracker.updated_at -cne $trackerFirst.UpdatedAt -or
+        [string]$authorization.tracker.body_sha256 -cne $trackerFirst.BodySha256) {
+        Throw-CbmMigrationError -Code 'CBM_STORE_MIGRATION_RECOVERY_AUTHORIZATION_CONFLICT' `
+            -Message 'recovery authorization does not exactly match immutable inputs and tracker bytes' `
+            -Remediation 'preserve all phase records and investigate the conflicting recovery invocation'
+    }
+
+    $trackerSecond = Read-CbmRecoveryTrackerEvidence `
+        -CommentUrl $RecoveryTrackerCommentUrl -OwningIssue $Issue `
+        -ExpectedEvidenceLine $evidenceLine
+    $ownerSecond = Get-AstroExactProcessIdentityProbe `
+        -ProcessId ([int]$pidProbe.pid) `
+        -ProcessStartUtcTicks ([long]$pidProbe.owner_process_start_utc_ticks)
+    $jobSecond = Get-AstroLauncherJobObjectProbe `
+        -Name ([string]$attributionProbe.exact_job_object_name)
+    $launcherSecond = Read-AstroLauncherLock -LockPath $launcherLockPath
+    if ($trackerSecond.UpdatedAt -cne $trackerFirst.UpdatedAt -or
+        $trackerSecond.BodySha256 -cne $trackerFirst.BodySha256 -or
+        $ownerSecond.State -cnotin @('absent', 'pid-reused') -or
+        $jobSecond.State -cne 'absent' -or @($jobSecond.ProcessIds).Count -ne 0 -or
+        $launcherSecond.State -cne 'absent' -or @($launcherSecond.TransitionPaths).Count -ne 0 -or
+        (Get-FileSha256 -Path $attemptIntentPath) -cne $intentSha -or
+        (Get-FileSha256 -Path $launcherCompletion) -cne $launcherSha -or
+        (Get-FileSha256 -Path $scriptPath) -cne $scriptSha -or
+        (Get-FileSha256 -Path $launcherHelperPath) -cne $launcherHelperSha) {
+        Throw-CbmMigrationError -Code 'CBM_STORE_MIGRATION_RECOVERY_AUTHORITY_DRIFT' `
+            -Message 'tracker, owner, Job Object, launcher namespace, intent, or launcher completion changed across authorization' `
+            -Remediation 'preserve the authorization and investigate the exact state change before any terminal record'
+    }
+
+    if (-not (Test-Path -LiteralPath $faultPath)) {
+        Write-CbmRecoveryDurableJson -Path $faultPath -Value ([ordered]@{
+            schema = 1
+            issue = $Issue
+            status = 'fault'
+            fault_kind = 'interrupted_resume_recovered'
+            fault_utc = [DateTime]::UtcNow.ToString('o')
+            attempt_prefix = $InterruptedAttemptPrefix
+            intent_sha256 = $intentSha
+            recovery_authorization_sha256 = $authorizationSha
+            launcher_recovery_completion_sha256 = $launcherSha
+            migration_script_sha256 = $scriptSha
+            launcher_lock_helper_sha256 = $launcherHelperSha
+            message = 'the exact resume process generation ended before its ordinary catch could publish a terminal fault'
+            remediation = 'resume only after recovery completion and journal readback agree'
+        })
+    }
+    $fault = Read-CbmMigrationJson -Path $faultPath `
+        -Purpose "$InterruptedAttemptPrefix recovered fault"
+    $faultSha = Get-FileSha256 -Path $faultPath
+    if ($fault.schema -ne 1 -or $fault.issue -ne $Issue -or $fault.status -cne 'fault' -or
+        $fault.fault_kind -cne 'interrupted_resume_recovered' -or
+        $fault.attempt_prefix -cne $InterruptedAttemptPrefix -or
+        [string]$fault.intent_sha256 -cne $intentSha -or
+        [string]$fault.recovery_authorization_sha256 -cne $authorizationSha -or
+        [string]$fault.launcher_recovery_completion_sha256 -cne $launcherSha -or
+        [string]$fault.migration_script_sha256 -cne $scriptSha -or
+        [string]$fault.launcher_lock_helper_sha256 -cne $launcherHelperSha) {
+        Throw-CbmMigrationError -Code 'CBM_STORE_MIGRATION_RECOVERY_FAULT_CONFLICT' `
+            -Message 'recovered-fault record does not exactly bind the authorization and intent' `
+            -Remediation 'preserve all records and investigate the conflicting terminal fault'
+    }
+
+    $recoveryJournalData = [ordered]@{
+        attempt_prefix = $InterruptedAttemptPrefix
+        intent_sha256 = $intentSha
+        recovery_authorization_sha256 = $authorizationSha
+        recovered_fault_sha256 = $faultSha
+        launcher_recovery_completion_sha256 = $launcherSha
+        migration_script_sha256 = $scriptSha
+        launcher_lock_helper_sha256 = $launcherHelperSha
+    }
+    $journalCurrent = Get-ValidatedJournal -JournalPath $JournalPath
+    if ($journalCurrent.TailSha256 -ceq $journalExpectedTail) {
+        $recoveryJournalTail = Add-JournalRecord -JournalPath $JournalPath `
+            -PreviousSha256 $journalExpectedTail -Event 'resume_interruption_recovered' `
+            -Data $recoveryJournalData
+    }
+    else {
+        $tailRecord = $journalCurrent.Records[-1]
+        if ($tailRecord.payload.event -cne 'resume_interruption_recovered' -or
+            $tailRecord.payload.previous_record_sha256 -cne $journalExpectedTail -or
+            $tailRecord.payload.data.attempt_prefix -cne $InterruptedAttemptPrefix -or
+            $tailRecord.payload.data.intent_sha256 -cne $intentSha -or
+            $tailRecord.payload.data.recovery_authorization_sha256 -cne $authorizationSha -or
+            $tailRecord.payload.data.recovered_fault_sha256 -cne $faultSha -or
+            $tailRecord.payload.data.launcher_recovery_completion_sha256 -cne $launcherSha -or
+            $tailRecord.payload.data.migration_script_sha256 -cne $scriptSha -or
+            $tailRecord.payload.data.launcher_lock_helper_sha256 -cne $launcherHelperSha) {
+            Throw-CbmMigrationError -Code 'CBM_STORE_MIGRATION_RECOVERY_JOURNAL_CONFLICT' `
+                -Message 'journal advanced without the exact idempotent recovery event' `
+                -Remediation 'preserve the journal and investigate the competing migration writer'
+        }
+        $recoveryJournalTail = [string]$tailRecord.payload_sha256
+    }
+
+    if (-not (Test-Path -LiteralPath $completionPath)) {
+        Write-CbmRecoveryDurableJson -Path $completionPath -Value ([ordered]@{
+            schema = 1
+            issue = $Issue
+            status = 'interruption_recovered'
+            completed_utc = [DateTime]::UtcNow.ToString('o')
+            transaction_path = $TransactionPath
+            attempt_prefix = $InterruptedAttemptPrefix
+            intent_sha256 = $intentSha
+            recovery_authorization_sha256 = $authorizationSha
+            recovered_fault_sha256 = $faultSha
+            launcher_recovery_completion_sha256 = $launcherSha
+            migration_script_sha256 = $scriptSha
+            launcher_lock_helper_sha256 = $launcherHelperSha
+            final_journal_record_sha256 = $recoveryJournalTail
+        })
+    }
+    $finalJournal = Get-ValidatedJournal -JournalPath $JournalPath
+    Assert-CbmRecoveredAttemptTerminal -TransactionPath $TransactionPath `
+        -AttemptPrefix $InterruptedAttemptPrefix -IntentSha256 $intentSha `
+        -JournalState $finalJournal
+    if ($finalJournal.TailSha256 -cne $recoveryJournalTail) {
+        Throw-CbmMigrationError -Code 'CBM_STORE_MIGRATION_RECOVERY_FINAL_TAIL_DRIFT' `
+            -Message 'journal advanced after interruption-recovery completion' `
+            -Remediation 'preserve all state and investigate the competing migration writer'
+    }
+    [ordered]@{
+        schema = 1
+        status = 'interruption_recovered'
+        issue = $Issue
+        transaction_path = $TransactionPath
+        attempt_prefix = $InterruptedAttemptPrefix
+        intent_sha256 = $intentSha
+        authorization_sha256 = $authorizationSha
+        recovered_fault_sha256 = $faultSha
+        completion_sha256 = Get-FileSha256 -Path $completionPath
+        final_journal_record_sha256 = $finalJournal.TailSha256
+        launcher_owner_state = $ownerSecond.State
+        launcher_job_state = $jobSecond.State
+        launcher_protocol_state = $launcherSecond.State
+    } | ConvertTo-Json -Depth 8 -Compress
+}
+
 function Invoke-CbmTool {
     param(
         [Parameter(Mandatory)][string]$Executable,
@@ -833,17 +1422,43 @@ try {
                 -Remediation 'preserve the transaction and compare journal/archive-complete hashes to the issue evidence'
         }
         $previous = $journalState.TailSha256
+        if ($Operation -ceq 'RecoverInterruptedResume') {
+            Invoke-CbmInterruptedResumeRecovery `
+                -TransactionPath $transactionPath -JournalPath $journal `
+                -JournalState $journalState -Repository $repository `
+                -TargetFamilyPaths $targetFamilyPaths
+            return
+        }
         $attemptNumbers = @(Get-ChildItem -LiteralPath $transactionPath -File -Force |
             ForEach-Object {
                 if ($_.Name -cmatch '^resume-(\d{3})-intent\.json$') { [int]$Matches[1] }
             })
         foreach ($priorNumber in $attemptNumbers) {
             $priorPrefix = 'resume-{0:D3}' -f $priorNumber
-            if (-not (Test-Path -LiteralPath ([IO.Path]::Combine(
-                $transactionPath, "$priorPrefix-fault.json")) -PathType Leaf)) {
+            $priorIntentPath = [IO.Path]::Combine(
+                $transactionPath, "$priorPrefix-intent.json")
+            $priorFaultPath = [IO.Path]::Combine(
+                $transactionPath, "$priorPrefix-fault.json")
+            if (-not (Test-Path -LiteralPath $priorFaultPath -PathType Leaf)) {
                 Throw-CbmMigrationError -Code 'CBM_STORE_MIGRATION_RESUME_INTERRUPTED' `
                     -Message "prior resume attempt lacks a terminal fault record: $priorPrefix" `
-                    -Remediation 'preserve the transaction and investigate the interrupted exact process generation before another attempt'
+                    -Remediation 'preserve the transaction and run RecoverInterruptedResume only after tracker-bound exact-generation recovery'
+            }
+            $priorFault = Read-CbmMigrationJson -Path $priorFaultPath `
+                -Purpose "$priorPrefix terminal fault"
+            if ($priorFault.schema -ne 1 -or $priorFault.issue -ne $Issue -or
+                $priorFault.status -cne 'fault') {
+                Throw-CbmMigrationError -Code 'CBM_STORE_MIGRATION_RESUME_FAULT_INVALID' `
+                    -Message "prior resume attempt has an invalid terminal fault: $priorPrefix" `
+                    -Remediation 'preserve the transaction and investigate the malformed attempt terminal state'
+            }
+            $faultKindProperty = $priorFault.PSObject.Properties['fault_kind']
+            if ($null -ne $faultKindProperty -and
+                [string]$faultKindProperty.Value -ceq 'interrupted_resume_recovered') {
+                Assert-CbmRecoveredAttemptTerminal -TransactionPath $transactionPath `
+                    -AttemptPrefix $priorPrefix `
+                    -IntentSha256 (Get-FileSha256 -Path $priorIntentPath) `
+                    -JournalState $journalState
             }
         }
         $attemptNumber = if ($attemptNumbers.Count -eq 0) { 1 } else {
