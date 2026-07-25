@@ -15,6 +15,7 @@
 #include <stdatomic.h>
 
 #include "graph_buffer/row_sink.h"
+#include "cbm.h"
 
 /* ── Opaque handle ──────────────────────────────────────────────── */
 
@@ -122,6 +123,15 @@ void cbm_gbuf_refuse_resolution(cbm_gbuf_t *gb);
 /* Find a node by qualified name. Returns NULL if not found and poisons
  * persistence when the qualified name maps to multiple stable atoms. */
 const cbm_gbuf_node_t *cbm_gbuf_find_by_qn(const cbm_gbuf_t *gb, const char *qn);
+
+/* Resolve a semantic reference within the namespace retained from source
+ * syntax. Qualified names are display/search keys, never stable identities.
+ * Exactly one live atom in `domain` is returned. Zero in-domain candidates is
+ * an ordinary miss (the textual registry candidate belonged to another
+ * namespace); multiple in-domain candidates poison persistence and emit the
+ * operation plus every exact atom candidate. */
+const cbm_gbuf_node_t *cbm_gbuf_find_by_qn_domain(const cbm_gbuf_t *gb, const char *qn,
+                                                  CBMReferenceDomain domain, const char *operation);
 
 /* Resolve a qualified name at an exact source location. The path and 1-based
  * line are both required. Exactly one live atom whose inclusive line range

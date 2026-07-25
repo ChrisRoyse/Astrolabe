@@ -666,23 +666,13 @@ static int persist_hashes(cbm_store_t *store, const char *project, cbm_file_info
  * container nodes (File / Module / Folder / ...) lets a type usage like `Word`
  * resolve to the same-named Module node instead of the Class node. Only
  * callable / declared symbols belong in the registry. */
-static bool incr_label_is_registry_symbol(const char *label) {
-    /* Mirror pass_definitions.c / pass_parallel.c registry seeding EXACTLY:
-     * callables + every type-like container (Class/Struct/Interface/Enum/Type/
-     * Trait) + Variable/Field. Struct included so an incremental re-resolve seeds
-     * the same struct type nodes a full reindex would. */
-    return label && (strcmp(label, "Function") == 0 || strcmp(label, "Method") == 0 ||
-                     cbm_label_is_type_like(label) || strcmp(label, "Variable") == 0 ||
-                     strcmp(label, "Field") == 0);
-}
-
 /* Callback for cbm_gbuf_foreach_node: seed the registry with the existing
  * project's definition symbols so the resolver can match cross-file symbols
  * during incremental. Mirrors the full-index registry contents exactly so an
  * incremental re-resolve picks the same nodes a full reindex would. */
 static void registry_visitor(const cbm_gbuf_node_t *node, void *userdata) {
     cbm_registry_t *r = (cbm_registry_t *)userdata;
-    if (!incr_label_is_registry_symbol(node->label)) {
+    if (!cbm_pipeline_definition_is_registry_symbol(node->label, node->file_path)) {
         return;
     }
     (void)cbm_registry_add(r, node->name, node->qualified_name, node->label);
@@ -714,8 +704,7 @@ static int run_extract_resolve(cbm_pipeline_ctx_t *ctx, cbm_file_info_t *changed
         }
         {
             cbm_clock_gettime(CLOCK_MONOTONIC, &t);
-            int rc =
-                cbm_parallel_extract(ctx, changed_files, ci, cache, &shared_ids, worker_count);
+            int rc = cbm_parallel_extract(ctx, changed_files, ci, cache, &shared_ids, worker_count);
             cbm_gbuf_set_next_id(ctx->gbuf, atomic_load(&shared_ids));
             cbm_log_info("pass.timing", "pass", "incr_extract", "elapsed_ms",
                          itoa_buf((int)elapsed_ms(t)));

@@ -271,10 +271,22 @@ typedef struct {
     CBMImportResolution resolution;
 } CBMImport;
 
+/* Semantic namespace carried by a source reference. A display qualified name
+ * is not a definition identity: languages can legally use the same spelling
+ * for values, callables, and types. Extraction retains the syntax-owned domain
+ * so graph resolution can select exactly one stable atom in that domain. */
+typedef enum {
+    CBM_REF_DOMAIN_SYMBOL = 0,   /* value, callable, or type; syntax did not narrow it */
+    CBM_REF_DOMAIN_VALUE = 1,    /* Variable / Field */
+    CBM_REF_DOMAIN_CALLABLE = 2, /* Function / Method / callable type */
+    CBM_REF_DOMAIN_TYPE = 3,     /* Class / Struct / Interface / Enum / Type / Trait */
+} CBMReferenceDomain;
+
 typedef struct {
-    const char *ref_name;          // referenced identifier
-    const char *enclosing_func_qn; // QN of enclosing function (or module QN)
-    int start_line;                // 1-based source line for stable-atom attribution
+    const char *ref_name;             // referenced identifier
+    const char *enclosing_func_qn;    // QN of enclosing function (or module QN)
+    int start_line;                   // 1-based source line for stable-atom attribution
+    CBMReferenceDomain target_domain; // exact semantic namespace derived from parser syntax
 } CBMUsage;
 
 typedef struct {

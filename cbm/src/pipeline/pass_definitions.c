@@ -481,18 +481,12 @@ static void process_def(cbm_pipeline_ctx_t *ctx, const CBMCallArray *calls,
         def->file_path ? def->file_path : rel, (int)def->start_line, (int)def->end_line,
         (const uint8_t *)def->source, (size_t)def->source_len, def->start_byte, def->end_byte,
         props);
-    /* Register callable symbols + every type-like container (Class/Struct/
-     * Interface/Enum/Type/Trait). Type-like defs must be in the registry so
-     * `class Foo : IBar` (INHERITS), `impl Trait for S` (IMPLEMENTS), and method/
-     * field resolution can reach them — Struct included so Rust/Go/Swift/D structs
-     * resolve as type targets just as a Class did. Variable/Field defs are also
-     * registered so pass_usages.c can resolve READS/WRITES accesses (rw->var_name)
-     * to a Variable/Field node QN.
-     * KEEP IN SYNC with pass_parallel.c and pipeline_incremental.c's seed sets. */
-    if (node_id > 0 && def->label &&
-        (strcmp(def->label, "Function") == 0 || strcmp(def->label, "Method") == 0 ||
-         cbm_label_is_type_like(def->label) || strcmp(def->label, "Variable") == 0 ||
-         strcmp(def->label, "Field") == 0)) {
+    /* The code registry is a semantic-reference index, not a catalog of every
+     * graph fact. Config/data Variable atoms remain in the graph but cannot be
+     * selected as code callees/usages. KEEP IN SYNC with pass_parallel.c and
+     * pipeline_incremental.c. */
+    if (node_id > 0 && cbm_pipeline_definition_is_registry_symbol(
+                           def->label, def->file_path ? def->file_path : rel)) {
         (void)cbm_registry_add(ctx->registry, def->name, def->qualified_name, def->label);
     }
     char *file_qn = cbm_pipeline_fqn_compute(ctx->project_name, rel, "__file__");
@@ -791,9 +785,8 @@ int cbm_pipeline_pass_definitions(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
      * has_error (or a discovered file that could not be read/extracted) makes
      * the whole pass fail before imports, later passes, or publication can see
      * a partial graph. */
-    int extraction_rc =
-        cbm_pipeline_reject_file_failures(ctx->pipeline, files, file_count, local_cache,
-                                          "sequential_extract");
+    int extraction_rc = cbm_pipeline_reject_file_failures(ctx->pipeline, files, file_count,
+                                                          local_cache, "sequential_extract");
     if (extraction_rc != 0) {
         if (owns_local_cache) {
             for (int i = 0; i < file_count; i++) {

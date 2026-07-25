@@ -603,23 +603,16 @@ static bool is_checked_exception(const char *name) {
     return true;
 }
 
-static const char *resolve_as_class(const cbm_registry_t *reg, const char *name,
-                                    const char *module_qn, const char **imp_keys,
-                                    const char **imp_vals, int imp_count) {
+static const cbm_gbuf_node_t *resolve_as_type(const cbm_registry_t *reg, const cbm_gbuf_t *gbuf,
+                                              const char *name, const char *module_qn,
+                                              const char **imp_keys, const char **imp_vals,
+                                              int imp_count, const char *operation) {
     cbm_resolution_t res =
         cbm_registry_resolve(reg, name, module_qn, imp_keys, imp_vals, imp_count);
     if (!res.qualified_name || res.qualified_name[0] == '\0') {
         return NULL;
     }
-    /* Accept any type-like container (Class/Struct/Interface/Enum/Type/Trait):
-     * base classes, Rust `impl Trait for S` struct receivers, and Go struct
-     * embedding all resolve through here. Struct included so the struct receiver
-     * of an IMPLEMENTS edge is not dropped. */
-    const char *label = cbm_registry_label_of(reg, res.qualified_name);
-    if (!cbm_label_is_type_like(label)) {
-        return NULL;
-    }
-    return res.qualified_name;
+    return cbm_gbuf_find_by_qn_domain(gbuf, res.qualified_name, CBM_REF_DOMAIN_TYPE, operation);
 }
 
 static void extract_decorator_func(const char *dec, char *out, size_t outsz) {
@@ -1175,14 +1168,11 @@ static int register_and_link_def(cbm_pipeline_ctx_t *ctx, const CBMDefinition *d
     if (!def->name || !def->qualified_name || !def->label) {
         return 0;
     }
-    /* Register callable symbols + every type-like container (Class/Struct/
-     * Interface/Enum/Type/Trait) — see pass_definitions.c for rationale. Struct
-     * included so Rust/Go/Swift/D structs resolve as type targets. Variable/Field
-     * defs are registered too so READS/WRITES can resolve.
-     * KEEP IN SYNC with pass_definitions.c and pipeline_incremental.c. */
-    if (strcmp(def->label, "Function") == 0 || strcmp(def->label, "Method") == 0 ||
-        cbm_label_is_type_like(def->label) || strcmp(def->label, "Variable") == 0 ||
-        strcmp(def->label, "Field") == 0) {
+    /* Code-reference symbols only. Config/data keys remain graph atoms but do
+     * not enter textual code resolution. KEEP IN SYNC with the sequential and
+     * incremental paths. */
+    if (cbm_pipeline_definition_is_registry_symbol(def->label,
+                                                   def->file_path ? def->file_path : rel)) {
         if (cbm_registry_add(ctx->registry, def->name, def->qualified_name, def->label)) {
             (*reg_entries)++;
         }
@@ -1713,7 +1703,8 @@ static void emit_route_registration(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *sou
     if (handler_ref && handler_ref[0] != '\0') {
         cbm_resolution_t hres = cbm_registry_resolve(registry, handler_ref, module_qn, ik, iv, ic);
         if (hres.qualified_name && hres.qualified_name[0] != '\0') {
-            const cbm_gbuf_node_t *h = cbm_gbuf_find_by_qn(main_gbuf, hres.qualified_name);
+            const cbm_gbuf_node_t *h = cbm_gbuf_find_by_qn_domain(
+                main_gbuf, hres.qualified_name, CBM_REF_DOMAIN_CALLABLE, "parallel.route_handler");
             if (h) {
                 char hp[CBM_SZ_1K]; /* must exceed escaped value + wrapper or snprintf cuts the
                                        closing brace */
@@ -2118,7 +2109,8 @@ static void try_field_type_hint(resolve_ctx_t *rc, cbm_resolution_t *res, const 
     cbm_registry_find_by_name(rc->registry, method, &cands, &cand_count);
     for (int ci = 0; ci < cand_count; ci++) {
         if (strstr(cands[ci], type_name) || strstr(cands[ci], iface_name)) {
-            const cbm_gbuf_node_t *better = cbm_gbuf_find_by_qn(rc->main_gbuf, cands[ci]);
+            const cbm_gbuf_node_t *better = cbm_gbuf_find_by_qn_domain(
+                rc->main_gbuf, cands[ci], CBM_REF_DOMAIN_CALLABLE, "parallel.field_type_hint");
             if (better && better->id != source_id) {
                 res->qualified_name = cands[ci];
                 res->confidence = PP_FIELD_HINT_CONF;
@@ -2382,7 +2374,8 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
         if (lsp_target && res.qualified_name == lsp_target->qualified_name) {
             target_node = lsp_target;
         } else {
-            target_node = cbm_gbuf_find_by_qn(rc->main_gbuf, res.qualified_name);
+            target_node = cbm_gbuf_find_by_qn_domain(
+                rc->main_gbuf, res.qualified_name, CBM_REF_DOMAIN_CALLABLE, "parallel.call_target");
         }
         atomic_fetch_add_explicit(&rc->time_ns_rc_target, extract_now_ns() - _rc_t0,
                                   memory_order_relaxed);
@@ -2440,7 +2433,8 @@ static void resolve_file_usages(resolve_ctx_t *rc, resolve_worker_state_t *ws,
         if (!res.qualified_name || res.qualified_name[0] == '\0') {
             continue;
         }
-        const cbm_gbuf_node_t *tgt = cbm_gbuf_find_by_qn(rc->main_gbuf, res.qualified_name);
+        const cbm_gbuf_node_t *tgt = cbm_gbuf_find_by_qn_domain(
+            rc->main_gbuf, res.qualified_name, usage->target_domain, "parallel.reference_target");
         if (!tgt || src->id == tgt->id) {
             continue;
         }
@@ -2473,7 +2467,8 @@ static void resolve_file_throws(resolve_ctx_t *rc, resolve_worker_state_t *ws,
         if (!res.qualified_name || res.qualified_name[0] == '\0') {
             continue;
         }
-        const cbm_gbuf_node_t *tgt = cbm_gbuf_find_by_qn(rc->main_gbuf, res.qualified_name);
+        const cbm_gbuf_node_t *tgt = cbm_gbuf_find_by_qn_domain(
+            rc->main_gbuf, res.qualified_name, CBM_REF_DOMAIN_TYPE, "parallel.exception_type");
         if (!tgt || src->id == tgt->id) {
             continue;
         }
@@ -2500,7 +2495,8 @@ static void resolve_file_rw(resolve_ctx_t *rc, resolve_worker_state_t *ws, CBMFi
         if (!res.qualified_name || res.qualified_name[0] == '\0') {
             continue;
         }
-        const cbm_gbuf_node_t *tgt = cbm_gbuf_find_by_qn(rc->main_gbuf, res.qualified_name);
+        const cbm_gbuf_node_t *tgt = cbm_gbuf_find_by_qn_domain(
+            rc->main_gbuf, res.qualified_name, CBM_REF_DOMAIN_VALUE, "parallel.read_write_target");
         if (!tgt || src->id == tgt->id) {
             continue;
         }
@@ -2517,13 +2513,15 @@ static void resolve_def_inherits(resolve_ctx_t *rc, resolve_worker_state_t *ws,
         return;
     }
     for (int b = 0; def->base_classes[b]; b++) {
-        const char *bqn = resolve_as_class(rc->registry, def->base_classes[b], mq, ik, iv, ic);
-        if (!bqn) {
+        const cbm_gbuf_node_t *bn =
+            resolve_as_type(rc->registry, rc->main_gbuf, def->base_classes[b], mq, ik, iv, ic,
+                            "parallel.base_type");
+        if (!bn) {
             continue;
         }
-        const cbm_gbuf_node_t *bn = cbm_gbuf_find_by_qn(rc->main_gbuf, bqn);
         if (bn && node->id != bn->id) {
-            cbm_gbuf_insert_edge(ws->local_edge_buf, node->id, bn->id, "INHERITS", "{}");
+            const char *edge_type = strcmp(bn->label, "Interface") == 0 ? "IMPLEMENTS" : "INHERITS";
+            cbm_gbuf_insert_edge(ws->local_edge_buf, node->id, bn->id, edge_type, "{}");
             ws->semantic_resolved++;
         }
     }
@@ -2554,7 +2552,8 @@ static void resolve_def_decorators(resolve_ctx_t *rc, resolve_worker_state_t *ws
         }
         const cbm_gbuf_node_t *dn = NULL;
         if (res.qualified_name && res.qualified_name[0] != '\0') {
-            dn = cbm_gbuf_find_by_qn(rc->main_gbuf, res.qualified_name);
+            dn = cbm_gbuf_find_by_qn_domain(rc->main_gbuf, res.qualified_name,
+                                            CBM_REF_DOMAIN_CALLABLE, "parallel.decorator");
         }
         int64_t dn_id = 0;
         if (dn) {
@@ -2612,15 +2611,15 @@ static void resolve_file_semantic(resolve_ctx_t *rc, resolve_worker_state_t *ws,
         if (!it->trait_name || !it->struct_name) {
             continue;
         }
-        const char *tqn = resolve_as_class(rc->registry, it->trait_name, module_qn, imp_keys,
-                                           imp_vals, imp_count);
-        const char *sqn = resolve_as_class(rc->registry, it->struct_name, module_qn, imp_keys,
-                                           imp_vals, imp_count);
-        if (!tqn || !sqn) {
+        const cbm_gbuf_node_t *tn =
+            resolve_as_type(rc->registry, rc->main_gbuf, it->trait_name, module_qn, imp_keys,
+                            imp_vals, imp_count, "parallel.impl_trait");
+        const cbm_gbuf_node_t *sn =
+            resolve_as_type(rc->registry, rc->main_gbuf, it->struct_name, module_qn, imp_keys,
+                            imp_vals, imp_count, "parallel.impl_receiver");
+        if (!tn || !sn) {
             continue;
         }
-        const cbm_gbuf_node_t *tn = cbm_gbuf_find_by_qn(rc->main_gbuf, tqn);
-        const cbm_gbuf_node_t *sn = cbm_gbuf_find_by_qn(rc->main_gbuf, sqn);
         if (tn && sn && tn->id != sn->id) {
             cbm_gbuf_insert_edge(ws->local_edge_buf, sn->id, tn->id, "IMPLEMENTS", "{}");
             ws->semantic_resolved++;

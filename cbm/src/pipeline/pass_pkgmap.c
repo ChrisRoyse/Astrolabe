@@ -1491,6 +1491,14 @@ int cbm_pipeline_import_map_build(const cbm_gbuf_t *gbuf, const char *project_na
                 free(owned_local);
                 continue;
             }
+            /* A glob has no local identifier named `*`. Each distinct target is
+             * a namespace contributor used by import-reachability resolution,
+             * so multiple glob edges must remain in the ordered arrays. */
+            if (strcmp(owned_local, "*") == 0) {
+                duplicate = -1;
+            }
+        }
+        if (duplicate >= 0) {
             const cbm_gbuf_node_t *previous = cbm_gbuf_find_by_id(gbuf, target_ids[duplicate]);
             cbm_log_error(
                 "pkgmap.import_map_failed", "code", "CBM_IMPORT_LOCAL_NAME_AMBIGUOUS", "component",
@@ -1499,7 +1507,7 @@ int cbm_pipeline_import_map_build(const cbm_gbuf_t *gbuf, const char *project_na
                 previous && previous->atom_id ? previous->atom_id : "", "candidate_b_atom_id",
                 target->atom_id, "message",
                 "one local import name resolves to multiple exact graph targets", "remediation",
-                "make the source import alias unambiguous and retry indexing");
+                "make the explicit source import alias unambiguous and retry indexing");
             free(owned_local);
             cbm_pipeline_import_map_free(keys, vals, count);
             free(target_ids);

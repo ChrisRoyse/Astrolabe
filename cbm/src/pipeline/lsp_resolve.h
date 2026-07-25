@@ -240,7 +240,8 @@ static inline const cbm_gbuf_node_t *cbm_pipeline_lsp_target_node(const cbm_gbuf
     if (!gbuf || !callee_qn) {
         return NULL;
     }
-    const cbm_gbuf_node_t *direct = cbm_gbuf_find_by_qn(gbuf, callee_qn);
+    const cbm_gbuf_node_t *direct =
+        cbm_gbuf_find_by_qn_domain(gbuf, callee_qn, CBM_REF_DOMAIN_CALLABLE, "lsp.call_target");
     if (direct) {
         return direct;
     }
@@ -250,7 +251,8 @@ static inline const cbm_gbuf_node_t *cbm_pipeline_lsp_target_node(const cbm_gbuf
             char buf[CBM_SZ_1K];
             int written = snprintf(buf, sizeof(buf), "%s.%s", project_name, callee_qn);
             if (written > 0 && (size_t)written < sizeof(buf)) {
-                const cbm_gbuf_node_t *prefixed = cbm_gbuf_find_by_qn(gbuf, buf);
+                const cbm_gbuf_node_t *prefixed = cbm_gbuf_find_by_qn_domain(
+                    gbuf, buf, CBM_REF_DOMAIN_CALLABLE, "lsp.prefixed_call_target");
                 if (prefixed) {
                     return prefixed;
                 }

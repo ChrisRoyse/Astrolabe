@@ -1277,6 +1277,116 @@ const cbm_gbuf_node_t *cbm_gbuf_find_by_qn(const cbm_gbuf_t *gb, const char *qn)
     return node;
 }
 
+static bool label_in_reference_domain(const char *label, CBMReferenceDomain domain) {
+    if (!label) {
+        return false;
+    }
+    bool value = strcmp(label, "Variable") == 0 || strcmp(label, "Field") == 0;
+    bool callable = strcmp(label, "Function") == 0 || strcmp(label, "Method") == 0 ||
+                    strcmp(label, "Macro") == 0;
+    bool type = strcmp(label, "Class") == 0 || strcmp(label, "Struct") == 0 ||
+                strcmp(label, "Interface") == 0 || strcmp(label, "Enum") == 0 ||
+                strcmp(label, "Type") == 0 || strcmp(label, "Trait") == 0;
+    switch (domain) {
+    case CBM_REF_DOMAIN_VALUE:
+        return value;
+    case CBM_REF_DOMAIN_CALLABLE:
+        /* Tuple structs/classes and equivalent type constructors use call
+         * syntax in several supported languages. */
+        return callable || type;
+    case CBM_REF_DOMAIN_TYPE:
+        return type;
+    case CBM_REF_DOMAIN_SYMBOL:
+        return value || callable || type;
+    default:
+        return false;
+    }
+}
+
+static const char *reference_domain_name(CBMReferenceDomain domain) {
+    switch (domain) {
+    case CBM_REF_DOMAIN_VALUE:
+        return "value";
+    case CBM_REF_DOMAIN_CALLABLE:
+        return "callable";
+    case CBM_REF_DOMAIN_TYPE:
+        return "type";
+    case CBM_REF_DOMAIN_SYMBOL:
+        return "symbol";
+    default:
+        return "invalid";
+    }
+}
+
+const cbm_gbuf_node_t *cbm_gbuf_find_by_qn_domain(const cbm_gbuf_t *gb, const char *qn,
+                                                  CBMReferenceDomain domain,
+                                                  const char *operation) {
+    if (!gb || !qn || !qn[0] || !operation || !operation[0]) {
+        return NULL;
+    }
+
+    void *indexed = cbm_ht_get(gb->node_by_qn, qn);
+    if (!indexed) {
+        return NULL;
+    }
+    if (indexed != AMBIGUOUS_QN) {
+        const cbm_gbuf_node_t *node = indexed;
+        return label_in_reference_domain(node->label, domain) ? node : NULL;
+    }
+
+    const cbm_gbuf_node_t *match = NULL;
+    int match_count = 0;
+    for (int i = 0; i < gb->nodes.count; i++) {
+        const cbm_gbuf_node_t *candidate = gb->nodes.items[i];
+        if (!node_is_live(gb, candidate) || !candidate->qualified_name ||
+            strcmp(candidate->qualified_name, qn) != 0 ||
+            !label_in_reference_domain(candidate->label, domain)) {
+            continue;
+        }
+        match = candidate;
+        match_count++;
+    }
+    if (match_count <= 1) {
+        return match;
+    }
+
+    char count_buf[CBM_SZ_32];
+    snprintf(count_buf, sizeof(count_buf), "%d", match_count);
+    atomic_store(&((cbm_gbuf_t *)gb)->resolution_failed, true);
+    cbm_log_error("gbuf.domain_resolution_ambiguous", "code", "CBM_NODE_DOMAIN_AMBIGUOUS",
+                  "operation", operation, "qualified_name", qn, "target_domain",
+                  reference_domain_name(domain), "candidate_count", count_buf, "message",
+                  "source syntax resolves to multiple stable atoms in the same semantic domain",
+                  "remediation",
+                  "resolve by atom_id, exact signature, receiver type, or source location before "
+                  "persistence");
+
+    int ordinal = 0;
+    for (int i = 0; i < gb->nodes.count; i++) {
+        const cbm_gbuf_node_t *candidate = gb->nodes.items[i];
+        if (!node_is_live(gb, candidate) || !candidate->qualified_name ||
+            strcmp(candidate->qualified_name, qn) != 0 ||
+            !label_in_reference_domain(candidate->label, domain)) {
+            continue;
+        }
+        char ordinal_buf[CBM_SZ_32];
+        char start_line_buf[CBM_SZ_32];
+        char end_line_buf[CBM_SZ_32];
+        snprintf(ordinal_buf, sizeof(ordinal_buf), "%d", ++ordinal);
+        snprintf(start_line_buf, sizeof(start_line_buf), "%d", candidate->start_line);
+        snprintf(end_line_buf, sizeof(end_line_buf), "%d", candidate->end_line);
+        cbm_log_error("gbuf.domain_resolution_candidate", "code", "CBM_NODE_DOMAIN_CANDIDATE",
+                      "operation", operation, "qualified_name", qn, "target_domain",
+                      reference_domain_name(domain), "candidate_ordinal", ordinal_buf, "atom_id",
+                      candidate->atom_id ? candidate->atom_id : "", "label",
+                      candidate->label ? candidate->label : "", "file_path",
+                      candidate->file_path ? candidate->file_path : "", "start_line",
+                      start_line_buf, "end_line", end_line_buf, "source_sha256",
+                      candidate->source_sha256 ? candidate->source_sha256 : "");
+    }
+    return NULL;
+}
+
 const cbm_gbuf_node_t *cbm_gbuf_find_by_qn_location(const cbm_gbuf_t *gb, const char *qn,
                                                     const char *file_path, int line) {
     if (!gb || !qn || !file_path || line <= 0) {

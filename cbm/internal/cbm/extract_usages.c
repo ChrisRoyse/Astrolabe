@@ -74,6 +74,24 @@ static bool is_reference_node(TSNode node, CBMLanguage lang) {
     }
 }
 
+/* Preserve the semantic namespace expressed by the concrete syntax. Rust (and
+ * several other grammars) deliberately distinguishes `x.field` from
+ * `x.method()`: field_identifier outside a call is a value reference, while a
+ * type_identifier is a type reference. Other identifier shapes can denote a
+ * first-class function, value, or type and therefore retain the wider SYMBOL
+ * domain; the graph resolver will still require exactly one stable atom. */
+static CBMReferenceDomain reference_target_domain(TSNode node) {
+    const char *kind = ts_node_type(node);
+    if (strcmp(kind, "type_identifier") == 0 || strcmp(kind, "constructor") == 0 ||
+        strcmp(kind, "constructor_path") == 0) {
+        return CBM_REF_DOMAIN_TYPE;
+    }
+    if (strcmp(kind, "field_identifier") == 0) {
+        return CBM_REF_DOMAIN_VALUE;
+    }
+    return CBM_REF_DOMAIN_SYMBOL;
+}
+
 static bool same_source_span(TSNode left, TSNode right) {
     return !ts_node_is_null(left) && ts_node_start_byte(left) == ts_node_start_byte(right) &&
            ts_node_end_byte(left) == ts_node_end_byte(right);
@@ -119,6 +137,7 @@ static void try_emit_usage(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *s
         usage.ref_name = name;
         usage.enclosing_func_qn = cbm_enclosing_func_qn_cached(ctx, node);
         usage.start_line = (int)ts_node_start_point(node).row + 1;
+        usage.target_domain = reference_target_domain(node);
         if (!cbm_usages_push(&ctx->result->usages, ctx->arena, usage)) {
             return;
         }
@@ -178,6 +197,7 @@ void handle_usages(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec, Wal
         usage.ref_name = name;
         usage.enclosing_func_qn = state->enclosing_func_qn;
         usage.start_line = (int)ts_node_start_point(node).row + 1;
+        usage.target_domain = reference_target_domain(node);
         if (!cbm_usages_push(&ctx->result->usages, ctx->arena, usage)) {
             return;
         }

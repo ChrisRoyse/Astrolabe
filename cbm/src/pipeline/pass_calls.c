@@ -119,7 +119,8 @@ static void handle_route_registration(cbm_pipeline_ctx_t *ctx, const CBMCall *ca
         cbm_resolution_t hres = cbm_registry_resolve(ctx->registry, call->second_arg_name,
                                                      module_qn, imp_keys, imp_vals, imp_count);
         if (hres.qualified_name != NULL && hres.qualified_name[0] != '\0') {
-            const cbm_gbuf_node_t *handler = cbm_gbuf_find_by_qn(ctx->gbuf, hres.qualified_name);
+            const cbm_gbuf_node_t *handler = cbm_gbuf_find_by_qn_domain(
+                ctx->gbuf, hres.qualified_name, CBM_REF_DOMAIN_CALLABLE, "calls.route_handler");
             if (handler != NULL) {
                 char hprops[CBM_SZ_1K]; /* must exceed escaped value + wrapper or snprintf cuts the
                                            closing brace */
@@ -466,7 +467,8 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call,
         }
     }
 
-    const cbm_gbuf_node_t *target_node = cbm_gbuf_find_by_qn(ctx->gbuf, res.qualified_name);
+    const cbm_gbuf_node_t *target_node = cbm_gbuf_find_by_qn_domain(
+        ctx->gbuf, res.qualified_name, CBM_REF_DOMAIN_CALLABLE, "calls.call_target");
     if (!target_node || source_node->id == target_node->id) {
         return 0;
     }
@@ -627,7 +629,8 @@ static int scan_depends_in_sig(cbm_pipeline_ctx_t *ctx, const cbm_regex_t *re, c
         cbm_resolution_t res = cbm_registry_resolve(ctx->registry, func_ref, module_qn, ik, iv, ic);
         if (res.qualified_name && res.qualified_name[0] != '\0') {
             const cbm_gbuf_node_t *sn = cbm_pipeline_find_definition_node(ctx->gbuf, def, "");
-            const cbm_gbuf_node_t *tn = cbm_gbuf_find_by_qn(ctx->gbuf, res.qualified_name);
+            const cbm_gbuf_node_t *tn = cbm_gbuf_find_by_qn_domain(
+                ctx->gbuf, res.qualified_name, CBM_REF_DOMAIN_CALLABLE, "calls.fastapi_dependency");
             if (sn && tn && sn->id != tn->id) {
                 cbm_gbuf_insert_edge(ctx->gbuf, sn->id, tn->id, "CALLS",
                                      "{\"confidence\":0.95,\"strategy\":\"fastapi_depends\"}");

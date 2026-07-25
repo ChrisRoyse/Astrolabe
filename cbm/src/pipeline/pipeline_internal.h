@@ -48,6 +48,27 @@ static inline bool cbm_pipeline_node_is_dir_container(const cbm_gbuf_node_t *nod
            (strcmp(node->label, "Folder") == 0 || strcmp(node->label, "Project") == 0);
 }
 
+bool cbm_has_config_extension(const char *path);
+
+/* Only definitions that participate in code name resolution belong in the
+ * semantic registry. Config/data keys remain first-class stable graph atoms,
+ * but putting them in the code registry lets common keys such as `name` win a
+ * weak call/usage resolution in unrelated source files. */
+static inline bool cbm_pipeline_definition_is_registry_symbol(const char *label,
+                                                              const char *file_path) {
+    if (!label) {
+        return false;
+    }
+    if (strcmp(label, "Function") == 0 || strcmp(label, "Method") == 0 ||
+        cbm_label_is_type_like(label)) {
+        return true;
+    }
+    if (strcmp(label, "Variable") != 0 && strcmp(label, "Field") != 0) {
+        return false;
+    }
+    return !cbm_has_config_extension(file_path);
+}
+
 /* Time unit conversions */
 #define CBM_NS_PER_SEC 1000000000LL
 #define CBM_US_PER_SEC 1000000LL
@@ -183,11 +204,14 @@ const cbm_gbuf_node_t *cbm_pipeline_resolve_import_node(const cbm_pipeline_ctx_t
                                                         const CBMImport *imp,
                                                         CBMHashTable *namespace_map);
 
-/* Build the only authoritative local-name -> module-QN map from resolved
- * IMPORTS edges owned by the exact source File container. Malformed edges,
- * missing targets, duplicate aliases with different targets, and allocation
- * failures are hard errors. Values borrow graph-buffer storage; keys and both
- * arrays are released with cbm_pipeline_import_map_free(). */
+/* Build the only authoritative import bindings from resolved IMPORTS edges
+ * owned by the exact source File container. Ordinary local aliases are
+ * one-to-one and conflicting targets are hard errors. A `*` key is a glob
+ * namespace directive, not a local alias: every distinct target remains in the
+ * arrays so reachability sees the complete namespace set, while direct alias
+ * lookup ignores `*`. Malformed edges, missing targets, and allocation failures
+ * remain hard errors. Values borrow graph-buffer storage; keys and both arrays
+ * are released with cbm_pipeline_import_map_free(). */
 int cbm_pipeline_import_map_build(const cbm_gbuf_t *gbuf, const char *project_name,
                                   const char *rel_path, const char ***out_keys,
                                   const char ***out_vals, int *out_count);
@@ -306,9 +330,6 @@ bool cbm_is_env_var_name(const char *s);
  * Writes normalized form to norm_out (underscore-joined).
  * Returns token count. tokens_out[] receives borrowed pointers into norm_out. */
 int cbm_normalize_config_key(const char *key, char *norm_out, size_t norm_sz);
-
-/* Check if a file path has a config file extension (.toml, .yaml, .env, etc.) */
-bool cbm_has_config_extension(const char *path);
 
 /* ── Enrichment helpers (pass_enrichment.c) ──────────────────────── */
 

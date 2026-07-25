@@ -261,7 +261,10 @@ void cbm_registry_import_map_cache_begin(const char **keys, const char **vals, i
         return;
     }
     for (int i = 0; i < count; i++) {
-        if (keys[i] && vals[i]) {
+        /* `*` is a multi-valued namespace directive, never a direct alias.
+         * Its target remains in vals[] for reachability, but inserting it in
+         * this single-value hash would overwrite another valid glob target. */
+        if (keys[i] && vals[i] && strcmp(keys[i], "*") != 0) {
             if (!cbm_ht_set_checked(_import_map_cache, keys[i], (void *)(uintptr_t)vals[i], NULL)) {
                 _registry_cache_failed = true;
                 cbm_log_error("registry.cache_failed", "code", "CBM_IMPORT_CACHE_INSERT_FAILED",

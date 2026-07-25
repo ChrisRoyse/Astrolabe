@@ -74,25 +74,19 @@ static const char *itoa_log(int val) {
     return bufs[i];
 }
 
-/* Resolve a class/type name through the registry. Returns borrowed QN or NULL. */
-static const char *resolve_as_class(const cbm_registry_t *reg, const char *name,
-                                    const char *module_qn, const char **imp_keys,
-                                    const char **imp_vals, int imp_count) {
+/* Resolve a class/type name through the textual registry, then bind it to one
+ * stable graph atom in the type namespace. */
+static const cbm_gbuf_node_t *resolve_as_type(const cbm_registry_t *reg, const cbm_gbuf_t *gbuf,
+                                              const char *name, const char *module_qn,
+                                              const char **imp_keys, const char **imp_vals,
+                                              int imp_count, const char *operation) {
     cbm_resolution_t res =
         cbm_registry_resolve(reg, name, module_qn, imp_keys, imp_vals, imp_count);
     if (!res.qualified_name || res.qualified_name[0] == '\0') {
         return NULL;
     }
 
-    /* Verify it's a type-like container (Class/Struct/Interface/Enum/Type/Trait):
-     * a base/embedded type, impl receiver, or inheritance target must resolve to
-     * one of these. Struct included so Rust/Go/Swift/D `impl Trait for S` and Go
-     * struct embedding resolve. */
-    const char *label = cbm_registry_label_of(reg, res.qualified_name);
-    if (!cbm_label_is_type_like(label)) {
-        return NULL;
-    }
-    return res.qualified_name;
+    return cbm_gbuf_find_by_qn_domain(gbuf, res.qualified_name, CBM_REF_DOMAIN_TYPE, operation);
 }
 
 /* Extract decorator function name from the raw attribute/annotation text.
@@ -191,7 +185,8 @@ static int check_go_class_implements(cbm_pipeline_ctx_t *ctx, const cbm_gbuf_nod
         if (!found) {
             char method_qn[CBM_SZ_512];
             snprintf(method_qn, sizeof(method_qn), "%s%s", prefix, imethods[m].name);
-            found = cbm_gbuf_find_by_qn(ctx->gbuf, method_qn);
+            found = cbm_gbuf_find_by_qn_domain(ctx->gbuf, method_qn, CBM_REF_DOMAIN_CALLABLE,
+                                               "semantic.go_method");
         }
         if (!found) {
             return 0; /* struct does not satisfy the interface */
@@ -305,7 +300,8 @@ static void resolve_decorator(cbm_pipeline_ctx_t *ctx, const cbm_gbuf_node_t *no
     }
     const cbm_gbuf_node_t *dec = NULL;
     if (res.qualified_name && res.qualified_name[0] != '\0') {
-        dec = cbm_gbuf_find_by_qn(ctx->gbuf, res.qualified_name);
+        dec = cbm_gbuf_find_by_qn_domain(ctx->gbuf, res.qualified_name, CBM_REF_DOMAIN_CALLABLE,
+                                         "semantic.decorator");
     }
     if (!dec) {
         /* The decorator target is not a local symbol (external attribute /
@@ -352,20 +348,18 @@ static void sem_process_def_edges(cbm_pipeline_ctx_t *ctx, const CBMDefinition *
     }
     if (def->base_classes) {
         for (int b = 0; def->base_classes[b]; b++) {
-            const char *base_qn = resolve_as_class(ctx->registry, def->base_classes[b], module_qn,
-                                                   imp_keys, imp_vals, imp_count);
-            if (!base_qn) {
+            const cbm_gbuf_node_t *base_node =
+                resolve_as_type(ctx->registry, ctx->gbuf, def->base_classes[b], module_qn, imp_keys,
+                                imp_vals, imp_count, "semantic.base_type");
+            if (!base_node) {
                 continue;
             }
-            const cbm_gbuf_node_t *base_node = cbm_gbuf_find_by_qn(ctx->gbuf, base_qn);
             if (base_node && node->id != base_node->id) {
                 /* A base that resolves to an Interface is an IMPLEMENTS relation
                  * (Java `implements`, C# `: IFace`, TS `implements`); a Class/
                  * Type/Enum base is plain INHERITS. */
-                const char *base_label = cbm_registry_label_of(ctx->registry, base_qn);
-                const char *edge_type = (base_label && strcmp(base_label, "Interface") == 0)
-                                            ? "IMPLEMENTS"
-                                            : "INHERITS";
+                const char *edge_type =
+                    (strcmp(base_node->label, "Interface") == 0) ? "IMPLEMENTS" : "INHERITS";
                 cbm_gbuf_insert_edge(ctx->gbuf, node->id, base_node->id, edge_type, "{}");
                 (*inherits_count)++;
             }
@@ -410,18 +404,18 @@ static int resolve_impl_traits(cbm_pipeline_ctx_t *ctx, const CBMFileResult *res
         if (!it->trait_name || !it->struct_name) {
             continue;
         }
-        const char *trait_qn = resolve_as_class(ctx->registry, it->trait_name, module_qn, imp_keys,
-                                                imp_vals, imp_count);
-        if (!trait_qn) {
+        const cbm_gbuf_node_t *tn =
+            resolve_as_type(ctx->registry, ctx->gbuf, it->trait_name, module_qn, imp_keys, imp_vals,
+                            imp_count, "semantic.impl_trait");
+        if (!tn) {
             continue;
         }
-        const char *struct_qn = resolve_as_class(ctx->registry, it->struct_name, module_qn,
-                                                 imp_keys, imp_vals, imp_count);
-        if (!struct_qn) {
+        const cbm_gbuf_node_t *sn =
+            resolve_as_type(ctx->registry, ctx->gbuf, it->struct_name, module_qn, imp_keys,
+                            imp_vals, imp_count, "semantic.impl_receiver");
+        if (!sn) {
             continue;
         }
-        const cbm_gbuf_node_t *tn = cbm_gbuf_find_by_qn(ctx->gbuf, trait_qn);
-        const cbm_gbuf_node_t *sn = cbm_gbuf_find_by_qn(ctx->gbuf, struct_qn);
         if (tn && sn && tn->id != sn->id) {
             cbm_gbuf_insert_edge(ctx->gbuf, sn->id, tn->id, "IMPLEMENTS", "{}");
             count++;
