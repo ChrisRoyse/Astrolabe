@@ -242,6 +242,7 @@ struct cbm_gbuf {
     /* Secondary node indexes */
     CBMHashTable *nodes_by_label; /* key: label, value: (node_ptr_array_t*) */
     CBMHashTable *nodes_by_name;  /* key: name, value: (node_ptr_array_t*) */
+    CBMHashTable *nodes_by_file;  /* key: exact file_path, value: (node_ptr_array_t*) */
 
     /* Edge storage: array of pointers to individually heap-allocated edges */
     CBM_DYN_ARRAY(cbm_gbuf_edge_t *) edges;
@@ -599,6 +600,15 @@ static bool register_node_in_indexes(cbm_gbuf_t *gb, cbm_gbuf_node_t *node) {
         gbuf_index_failure(gb, "nodes_by_name.append", node->name);
         return false;
     }
+
+    if (node->file_path && node->file_path[0]) {
+        node_ptr_array_t *by_file = get_or_create_node_array(gb, gb->nodes_by_file, node->file_path,
+                                                             "nodes_by_file.insert");
+        if (!by_file || !cbm_da_push_checked(by_file, (const cbm_gbuf_node_t *)node)) {
+            gbuf_index_failure(gb, "nodes_by_file.append", node->file_path);
+            return false;
+        }
+    }
     return true;
 }
 
@@ -701,6 +711,9 @@ static void release_gbuf_indexes(cbm_gbuf_t *gb) {
     cbm_ht_foreach(gb->nodes_by_name, free_node_array, NULL);
     cbm_ht_free(gb->nodes_by_name);
     gb->nodes_by_name = NULL;
+    cbm_ht_foreach(gb->nodes_by_file, free_node_array, NULL);
+    cbm_ht_free(gb->nodes_by_file);
+    gb->nodes_by_file = NULL;
     cbm_ht_foreach(gb->edge_by_key, free_key_only, NULL);
     cbm_ht_free(gb->edge_by_key);
     gb->edge_by_key = NULL;
@@ -741,6 +754,7 @@ cbm_gbuf_t *cbm_gbuf_new(const char *project, const char *root_path) {
     gb->by_id_cap = 0;
     gb->nodes_by_label = cbm_ht_create(CBM_SZ_32);
     gb->nodes_by_name = cbm_ht_create(CBM_SZ_256);
+    gb->nodes_by_file = cbm_ht_create(CBM_SZ_256);
 
     gb->edge_by_key = cbm_ht_create(CBM_SZ_512);
     gb->edges_by_source_type = cbm_ht_create(CBM_SZ_256);
@@ -750,7 +764,7 @@ cbm_gbuf_t *cbm_gbuf_new(const char *project, const char *root_path) {
     gb->intern_pool = cbm_ht_create(CBM_SZ_1K);
 
     if (!gb->project || !gb->root_path || !gb->node_by_atom || !gb->node_by_qn ||
-        !gb->nodes_by_label || !gb->nodes_by_name || !gb->edge_by_key ||
+        !gb->nodes_by_label || !gb->nodes_by_name || !gb->nodes_by_file || !gb->edge_by_key ||
         !gb->edges_by_source_type || !gb->edges_by_target_type || !gb->edges_by_type ||
         !gb->intern_pool) {
         cbm_log_error("gbuf.create_failed", "code", "CBM_GRAPH_ALLOC_FAILED", "project", project,
@@ -808,6 +822,10 @@ void cbm_gbuf_free(cbm_gbuf_t *gb) {
     if (gb->nodes_by_name) {
         cbm_ht_foreach(gb->nodes_by_name, free_node_array, NULL);
         cbm_ht_free(gb->nodes_by_name);
+    }
+    if (gb->nodes_by_file) {
+        cbm_ht_foreach(gb->nodes_by_file, free_node_array, NULL);
+        cbm_ht_free(gb->nodes_by_file);
     }
     if (gb->edge_by_key) {
         cbm_ht_foreach(gb->edge_by_key, free_key_only, NULL);
@@ -1142,6 +1160,64 @@ const cbm_gbuf_node_t *cbm_gbuf_find_by_atom_id(const cbm_gbuf_t *gb, const char
     return cbm_ht_get(gb->node_by_atom, atom_id);
 }
 
+void cbm_gbuf_refuse_resolution(cbm_gbuf_t *gb) {
+    if (gb) {
+        atomic_store(&gb->resolution_failed, true);
+    }
+}
+
+const cbm_gbuf_node_t *cbm_gbuf_find_source_container(const cbm_gbuf_t *gb, const char *label,
+                                                      const char *file_path) {
+    if (!gb || !label || !label[0] || !file_path || !file_path[0]) {
+        return NULL;
+    }
+
+    node_ptr_array_t *candidates = cbm_ht_get(gb->nodes_by_file, file_path);
+    if (!candidates) {
+        return NULL;
+    }
+    const cbm_gbuf_node_t *match = NULL;
+    int match_count = 0;
+    for (int i = 0; i < candidates->count; i++) {
+        const cbm_gbuf_node_t *node = candidates->items[i];
+        if (!node_is_live(gb, node) || !node->source_present || !node->label || !node->file_path ||
+            strcmp(node->label, label) != 0 || strcmp(node->file_path, file_path) != 0) {
+            continue;
+        }
+        match = node;
+        match_count++;
+    }
+
+    if (match_count <= 1) {
+        return match;
+    }
+
+    char count_buf[CBM_SZ_32];
+    snprintf(count_buf, sizeof(count_buf), "%d", match_count);
+    atomic_store(&((cbm_gbuf_t *)gb)->resolution_failed, true);
+    cbm_log_error("gbuf.source_container_ambiguous", "code", "CBM_SOURCE_CONTAINER_AMBIGUOUS",
+                  "label", label, "file_path", file_path, "candidate_count", count_buf, "message",
+                  "exact source-container path resolves to multiple stable atoms", "remediation",
+                  "inspect the candidate atom identities and repair duplicate source ownership");
+
+    int ordinal = 0;
+    for (int i = 0; i < candidates->count; i++) {
+        const cbm_gbuf_node_t *node = candidates->items[i];
+        if (!node_is_live(gb, node) || !node->source_present || !node->label || !node->file_path ||
+            strcmp(node->label, label) != 0 || strcmp(node->file_path, file_path) != 0) {
+            continue;
+        }
+        char ordinal_buf[CBM_SZ_32];
+        snprintf(ordinal_buf, sizeof(ordinal_buf), "%d", ++ordinal);
+        cbm_log_error("gbuf.source_container_candidate", "code", "CBM_SOURCE_CONTAINER_CANDIDATE",
+                      "label", label, "file_path", file_path, "candidate_ordinal", ordinal_buf,
+                      "atom_id", node->atom_id ? node->atom_id : "", "qualified_name",
+                      node->qualified_name ? node->qualified_name : "", "source_sha256",
+                      node->source_sha256 ? node->source_sha256 : "");
+    }
+    return NULL;
+}
+
 bool cbm_gbuf_resolution_failed(const cbm_gbuf_t *gb) {
     return gb && atomic_load(&gb->resolution_failed);
 }
@@ -1366,6 +1442,7 @@ int cbm_gbuf_delete_by_file(cbm_gbuf_t *gb, const char *file_path) {
         /* Remove from secondary indexes */
         remove_node_from_ptr_array(cbm_ht_get(gb->nodes_by_label, n->label), n->id);
         remove_node_from_ptr_array(cbm_ht_get(gb->nodes_by_name, n->name), n->id);
+        remove_node_from_ptr_array(cbm_ht_get(gb->nodes_by_file, n->file_path), n->id);
 
         /* Remove from primary indexes */
         cbm_ht_delete(gb->node_by_atom, n->atom_id);

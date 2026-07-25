@@ -529,11 +529,16 @@ impl Default for CBMCall {
         }
     }
 }
+pub const CBMImportResolution_CBM_IMPORT_RESOLVE_SEMANTIC: CBMImportResolution = 0;
+pub const CBMImportResolution_CBM_IMPORT_RESOLVE_EXACT_SOURCE: CBMImportResolution = 1;
+pub const CBMImportResolution_CBM_IMPORT_RESOLVE_EXTERNAL_SOURCE: CBMImportResolution = 2;
+pub type CBMImportResolution = ::std::os::raw::c_int;
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct CBMImport {
     pub local_name: *const ::std::os::raw::c_char,
     pub module_path: *const ::std::os::raw::c_char,
+    pub resolution: CBMImportResolution,
 }
 impl Default for CBMImport {
     fn default() -> Self {

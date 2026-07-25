@@ -709,13 +709,18 @@ static void parse_c_imports(CBMExtractCtx *ctx) {
             continue;
         }
 
-        char *path = strip_quotes(a, cbm_node_text(a, path_node, ctx->source));
+        char *raw_path = cbm_node_text(a, path_node, ctx->source);
+        CBMImportResolution resolution = raw_path && raw_path[0] == '<'
+                                             ? CBM_IMPORT_RESOLVE_EXTERNAL_SOURCE
+                                             : CBM_IMPORT_RESOLVE_EXACT_SOURCE;
+        char *path = strip_quotes(a, raw_path);
         path = strip_angle_brackets(a, path);
         if (!path || !path[0]) {
             continue;
         }
 
-        CBMImport imp = {.local_name = path_last(a, path), .module_path = path};
+        CBMImport imp = {
+            .local_name = path_last(a, path), .module_path = path, .resolution = resolution};
         if (!cbm_imports_push(&ctx->result->imports, a, imp)) {
             return;
         }

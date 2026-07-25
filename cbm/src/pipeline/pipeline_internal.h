@@ -125,9 +125,9 @@ typedef struct {
 
 /* Fail-closed barrier over authoritative per-file results. Scans in discovery
  * order so the same corpus always reports the same first causal failure. */
-int cbm_pipeline_reject_file_failures(cbm_pipeline_t *pipeline,
-                                      const cbm_file_info_t *files, int file_count,
-                                      CBMFileResult *const *results, const char *phase);
+int cbm_pipeline_reject_file_failures(cbm_pipeline_t *pipeline, const cbm_file_info_t *files,
+                                      int file_count, CBMFileResult *const *results,
+                                      const char *phase);
 
 static inline int cbm_pipeline_relpath_is_excluded(const char *rel_path, char *const *excluded_dirs,
                                                    int excluded_count) {
@@ -159,23 +159,39 @@ char *cbm_pipeline_resolve_module(const cbm_pipeline_ctx_t *ctx, const char *sou
 
 /* Resolve an import to its in-graph target node, or NULL if unresolvable.
  *
- * Resolution order (first hit wins):
- *   1. Module-path resolution (relative / pkgmap / fqn_module) → existing node.
+ * Exact source-path candidates are evaluated together and multiple distinct
+ * matches refuse persistence. Only after no exact source exists does semantic
+ * resolution proceed:
+ *   1. Exact source-backed Module by repository-relative file_path.
+ *   2. Module-path resolution (relative / pkgmap / fqn_module) → existing node.
  *      This preserves the behavior for Python/TS/Go whose module path maps
  *      directly to a sibling Module/File QN.
- *   2. namespace_map[module_path-prefix] → File node QN (Java/Kotlin/C#/PHP
+ *   3. namespace_map[module_path-prefix] → File node QN (Java/Kotlin/C#/PHP
  *      `using`/`import` of a NAMESPACE that the path-based QN cannot express).
- *   3. Symbol-name fallback: the import's last path segment matched against an
+ *   4. Symbol-name fallback: the import's last path segment matched against an
  *      in-graph definition node of the same simple name in a different file
  *      (Rust `use crate::util::helper`, Java `import com.example.Util`, ...).
+ * Quoted C-family includes are exact-source assertions and never enter semantic
+ * fallback. Angle-bracket includes remain external unless a future captured
+ * compilation context supplies their exact include root.
  *
- * `namespace_map` may be NULL (skips step 2).  `source_file_qn` is the importing
- * file's __file__ QN, used to avoid self-imports in step 3. */
+ * `namespace_map` may be NULL (skips step 3).  `source_file_qn` is the importing
+ * file's __file__ QN, used to avoid self-imports in step 4. */
 const cbm_gbuf_node_t *cbm_pipeline_resolve_import_node(const cbm_pipeline_ctx_t *ctx,
                                                         const char *source_rel,
                                                         const char *source_file_qn,
                                                         const CBMImport *imp,
                                                         CBMHashTable *namespace_map);
+
+/* Build the only authoritative local-name -> module-QN map from resolved
+ * IMPORTS edges owned by the exact source File container. Malformed edges,
+ * missing targets, duplicate aliases with different targets, and allocation
+ * failures are hard errors. Values borrow graph-buffer storage; keys and both
+ * arrays are released with cbm_pipeline_import_map_free(). */
+int cbm_pipeline_import_map_build(const cbm_gbuf_t *gbuf, const char *project_name,
+                                  const char *rel_path, const char ***out_keys,
+                                  const char ***out_vals, int *out_count);
+void cbm_pipeline_import_map_free(const char **keys, const char **vals, int count);
 
 /* Build a namespace → File-node-QN map from a set of extraction results.
  * Each result that declared a namespace/package contributes one entry keyed by
@@ -575,8 +591,8 @@ int cbm_pipeline_pass_lsp_cross(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *
                                 int file_count, CBMFileResult **cache);
 
 /* Sub-passes called from pass_calls: pattern-based edge extraction */
-void cbm_pipeline_pass_fastapi_depends(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files,
-                                       int file_count);
+int cbm_pipeline_pass_fastapi_depends(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files,
+                                      int file_count);
 
 int cbm_pipeline_pass_usages(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, int file_count);
 

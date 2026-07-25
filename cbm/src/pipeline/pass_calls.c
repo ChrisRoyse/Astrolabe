@@ -93,112 +93,6 @@ static const char *itoa_log(int val) {
     return bufs[i];
 }
 
-/* Build per-file import map from cached extraction result or graph buffer edges.
- * Returns parallel arrays of (local_name, module_qn) pairs. Caller frees. */
-/* Parse "local_name":"value" from JSON properties string. Returns strdup'd key or NULL. */
-static char *extract_local_name_from_json(const char *props_json) {
-    if (!props_json) {
-        return NULL;
-    }
-    const char *start = strstr(props_json, "\"local_name\":\"");
-    if (!start) {
-        return NULL;
-    }
-    start += strlen("\"local_name\":\"");
-    const char *end = strchr(start, '"');
-    if (!end || end <= start) {
-        return NULL;
-    }
-    return cbm_strndup(start, end - start);
-}
-
-static int build_import_map(cbm_pipeline_ctx_t *ctx, const char *rel_path,
-                            const CBMFileResult *result, const char ***out_keys,
-                            const char ***out_vals, int *out_count) {
-    *out_keys = NULL;
-    *out_vals = NULL;
-    *out_count = 0;
-
-    /* Fast path: build from cached extraction result (no JSON parsing) */
-    if (result && result->imports.count > 0) {
-        const char **keys = calloc((size_t)result->imports.count, sizeof(const char *));
-        const char **vals = calloc((size_t)result->imports.count, sizeof(const char *));
-        int count = 0;
-
-        for (int i = 0; i < result->imports.count; i++) {
-            const CBMImport *imp = &result->imports.items[i];
-            if (!imp->local_name || !imp->local_name[0] || !imp->module_path) {
-                continue;
-            }
-            char *target_qn = cbm_pipeline_fqn_module(ctx->project_name, imp->module_path);
-            const cbm_gbuf_node_t *target = cbm_gbuf_find_by_qn(ctx->gbuf, target_qn);
-            free(target_qn);
-            if (!target) {
-                continue;
-            }
-            keys[count] = strdup(imp->local_name);
-            vals[count] = target->qualified_name; /* borrowed from gbuf */
-            count++;
-        }
-
-        *out_keys = keys;
-        *out_vals = vals;
-        *out_count = count;
-        return 0;
-    }
-
-    /* Slow path: scan graph buffer IMPORTS edges + parse JSON properties */
-    char *file_qn = cbm_pipeline_fqn_compute(ctx->project_name, rel_path, "__file__");
-    const cbm_gbuf_node_t *file_node = cbm_gbuf_find_by_qn(ctx->gbuf, file_qn);
-    free(file_qn);
-    if (!file_node) {
-        return 0;
-    }
-
-    const cbm_gbuf_edge_t **edges = NULL;
-    int edge_count = 0;
-    int rc = cbm_gbuf_find_edges_by_source_type(ctx->gbuf, file_node->id, "IMPORTS", &edges,
-                                                &edge_count);
-    if (rc != 0 || edge_count == 0) {
-        return 0;
-    }
-
-    const char **keys = calloc(edge_count, sizeof(const char *));
-    const char **vals = calloc(edge_count, sizeof(const char *));
-    int count = 0;
-
-    for (int i = 0; i < edge_count; i++) {
-        const cbm_gbuf_edge_t *e = edges[i];
-        const cbm_gbuf_node_t *target = cbm_gbuf_find_by_id(ctx->gbuf, e->target_id);
-        if (!target) {
-            continue;
-        }
-        char *key = extract_local_name_from_json(e->properties_json);
-        if (key) {
-            keys[count] = key;
-            vals[count] = target->qualified_name;
-            count++;
-        }
-    }
-
-    *out_keys = keys;
-    *out_vals = vals;
-    *out_count = count;
-    return 0;
-}
-
-static void free_import_map(const char **keys, const char **vals, int count) {
-    if (keys) {
-        for (int i = 0; i < count; i++) {
-            free((void *)keys[i]);
-        }
-        free((void *)keys);
-    }
-    if (vals) {
-        free((void *)vals);
-    }
-}
-
 /* Handle a route registration call: create Route node + HANDLES edge. */
 static void handle_route_registration(cbm_pipeline_ctx_t *ctx, const CBMCall *call,
                                       const cbm_gbuf_node_t *source_node, const char *module_qn,
@@ -337,7 +231,8 @@ static void emit_http_async_edge(cbm_pipeline_ctx_t *ctx, const CBMCall *call,
         }
         char esc_callee[CBM_SZ_256];
         cbm_json_escape(esc_callee, sizeof(esc_callee), call->callee_name);
-        char props[CBM_SZ_2K]; /* 2K: match the parallel finalize buffer so args truncate alike (#516) */
+        char props[CBM_SZ_2K]; /* 2K: match the parallel finalize buffer so args truncate alike
+                                  (#516) */
         snprintf(props, sizeof(props),
                  "{\"callee\":\"%s\",\"confidence\":%.2f,\"strategy\":\"%s\",\"candidates\":%d}",
                  esc_callee, res->confidence, res->strategy ? res->strategy : "unknown",
@@ -355,7 +250,8 @@ static void emit_http_async_edge(cbm_pipeline_ctx_t *ctx, const CBMCall *call,
     char esc_url[CBM_SZ_256];
     cbm_json_escape(esc_callee, sizeof(esc_callee), call->callee_name);
     cbm_json_escape(esc_url, sizeof(esc_url), url_or_topic);
-    char props[CBM_SZ_2K]; /* 2K: match the parallel finalize buffer so args truncate alike (#516) */
+    char
+        props[CBM_SZ_2K]; /* 2K: match the parallel finalize buffer so args truncate alike (#516) */
     snprintf(props, sizeof(props), "{\"callee\":\"%s\",\"url_path\":\"%s\"%s%s%s%s%s}", esc_callee,
              esc_url, method ? ",\"method\":\"" : "", method ? method : "", method ? "\"" : "",
              broker ? ",\"broker\":\"" : "", broker ? broker : "");
@@ -392,7 +288,8 @@ static void emit_classified_edge(cbm_pipeline_ctx_t *ctx, const CBMCall *call,
         char esc_k[CBM_SZ_256];
         cbm_json_escape(esc_c, sizeof(esc_c), call->callee_name);
         cbm_json_escape(esc_k, sizeof(esc_k), call->first_string_arg ? call->first_string_arg : "");
-        char props[CBM_SZ_2K]; /* 2K: match the parallel finalize buffer so args truncate alike (#516) */
+        char props[CBM_SZ_2K]; /* 2K: match the parallel finalize buffer so args truncate alike
+                                  (#516) */
         snprintf(props, sizeof(props), "{\"callee\":\"%s\",\"key\":\"%s\",\"confidence\":%.2f}",
                  esc_c, esc_k, res->confidence);
         calls_emit_edge(ctx->gbuf, source->id, target->id, "CONFIGURES", props, sizeof(props),
@@ -404,7 +301,8 @@ static void emit_classified_edge(cbm_pipeline_ctx_t *ctx, const CBMCall *call,
     }
     char esc_c2[CBM_SZ_256];
     cbm_json_escape(esc_c2, sizeof(esc_c2), call->callee_name);
-    char props[CBM_SZ_2K]; /* 2K: match the parallel finalize buffer so args truncate alike (#516) */
+    char
+        props[CBM_SZ_2K]; /* 2K: match the parallel finalize buffer so args truncate alike (#516) */
     snprintf(props, sizeof(props),
              "{\"callee\":\"%s\",\"confidence\":%.2f,\"strategy\":\"%s\",\"candidates\":%d}",
              esc_c2, res->confidence, res->strategy ? res->strategy : "unknown",
@@ -417,9 +315,8 @@ static const cbm_gbuf_node_t *calls_find_source(cbm_pipeline_ctx_t *ctx, const c
                                                 const char *enclosing_qn, int call_line) {
     const cbm_gbuf_node_t *src = NULL;
     if (enclosing_qn) {
-        src = call_line > 0
-                  ? cbm_gbuf_find_by_qn_location(ctx->gbuf, enclosing_qn, rel, call_line)
-                  : cbm_gbuf_find_by_qn(ctx->gbuf, enclosing_qn);
+        src = call_line > 0 ? cbm_gbuf_find_by_qn_location(ctx->gbuf, enclosing_qn, rel, call_line)
+                            : cbm_gbuf_find_by_qn(ctx->gbuf, enclosing_qn);
         /* A class-level call in a directory-module language carries the
          * DIRECTORY module QN, which hits the shared Folder/Project node —
          * attribute to this file's File node instead (#787). */
@@ -630,7 +527,13 @@ int cbm_pipeline_pass_calls(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *file
         const char **imp_keys = NULL;
         const char **imp_vals = NULL;
         int imp_count = 0;
-        build_import_map(ctx, rel, result, &imp_keys, &imp_vals, &imp_count);
+        if (cbm_pipeline_import_map_build(ctx->gbuf, ctx->project_name, rel, &imp_keys, &imp_vals,
+                                          &imp_count) != 0) {
+            if (result_owned) {
+                cbm_free_result(result);
+            }
+            return CBM_NOT_FOUND;
+        }
 
         /* Compute module QN for same-module resolution (directory-based for
          * Java/Go so it matches their def-node QNs in the registry). */
@@ -653,7 +556,7 @@ int cbm_pipeline_pass_calls(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *file
         }
 
         free(module_qn);
-        free_import_map(imp_keys, imp_vals, imp_count);
+        cbm_pipeline_import_map_free(imp_keys, imp_vals, imp_count);
         if (result_owned) {
             cbm_free_result(result);
         }
@@ -664,9 +567,7 @@ int cbm_pipeline_pass_calls(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *file
                  itoa_log(errors));
 
     /* Additional pattern-based edge passes run after normal call resolution */
-    cbm_pipeline_pass_fastapi_depends(ctx, files, file_count);
-
-    return 0;
+    return cbm_pipeline_pass_fastapi_depends(ctx, files, file_count);
 }
 
 /* ── FastAPI Depends() tracking ──────────────────────────────────── */
@@ -725,8 +626,7 @@ static int scan_depends_in_sig(cbm_pipeline_ctx_t *ctx, const cbm_regex_t *re, c
         func_ref[ref_len] = '\0';
         cbm_resolution_t res = cbm_registry_resolve(ctx->registry, func_ref, module_qn, ik, iv, ic);
         if (res.qualified_name && res.qualified_name[0] != '\0') {
-            const cbm_gbuf_node_t *sn =
-                cbm_pipeline_find_definition_node(ctx->gbuf, def, "");
+            const cbm_gbuf_node_t *sn = cbm_pipeline_find_definition_node(ctx->gbuf, def, "");
             const cbm_gbuf_node_t *tn = cbm_gbuf_find_by_qn(ctx->gbuf, res.qualified_name);
             if (sn && tn && sn->id != tn->id) {
                 cbm_gbuf_insert_edge(ctx->gbuf, sn->id, tn->id, "CALLS",
@@ -754,19 +654,25 @@ static bool file_has_depends_call(const CBMFileResult *result) {
     return false;
 }
 
-void cbm_pipeline_pass_fastapi_depends(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files,
-                                       int file_count) {
+int cbm_pipeline_pass_fastapi_depends(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files,
+                                      int file_count) {
     cbm_regex_t depends_re;
     if (cbm_regcomp(&depends_re, "Depends\\(([A-Za-z_][A-Za-z0-9_.]*)", CBM_REG_EXTENDED) != 0) {
-        return;
+        cbm_log_error("pass.fastapi_depends_failed", "code", "CBM_FASTAPI_REGEX_COMPILE_FAILED",
+                      "component", "calls.fastapi_depends", "operation", "compile_pattern",
+                      "message", "FastAPI dependency pattern could not be compiled", "remediation",
+                      "inspect the native regex runtime and retry indexing");
+        return CBM_NOT_FOUND;
     }
 
     int edge_count = 0;
+    int status = 0;
     for (int i = 0; i < file_count; i++) {
         if (files[i].language != CBM_LANG_PYTHON) {
             continue;
         }
         if (cbm_pipeline_check_cancel(ctx)) {
+            status = CBM_NOT_FOUND;
             break;
         }
 
@@ -789,7 +695,13 @@ void cbm_pipeline_pass_fastapi_depends(cbm_pipeline_ctx_t *ctx, const cbm_file_i
         const char **imp_keys = NULL;
         const char **imp_vals = NULL;
         int imp_count = 0;
-        build_import_map(ctx, files[i].rel_path, result, &imp_keys, &imp_vals, &imp_count);
+        if (cbm_pipeline_import_map_build(ctx->gbuf, ctx->project_name, files[i].rel_path,
+                                          &imp_keys, &imp_vals, &imp_count) != 0) {
+            free(module_qn);
+            free(source);
+            status = CBM_NOT_FOUND;
+            break;
+        }
 
         for (int d = 0; d < result->defs.count; d++) {
             CBMDefinition *def = &result->defs.items[d];
@@ -808,7 +720,7 @@ void cbm_pipeline_pass_fastapi_depends(cbm_pipeline_ctx_t *ctx, const cbm_file_i
         }
 
         free(module_qn);
-        free_import_map(imp_keys, imp_vals, imp_count);
+        cbm_pipeline_import_map_free(imp_keys, imp_vals, imp_count);
         free(source);
     }
 
@@ -816,6 +728,7 @@ void cbm_pipeline_pass_fastapi_depends(cbm_pipeline_ctx_t *ctx, const cbm_file_i
     if (edge_count > 0) {
         cbm_log_info("pass.fastapi_depends", "edges", itoa_log(edge_count));
     }
+    return status;
 }
 
 /* DLL resolve tracking removed — triggered Windows Defender false positive.

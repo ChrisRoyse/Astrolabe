@@ -255,9 +255,20 @@ typedef struct {
                                         // x.foo() whose receiver is not this/super. Default false.
 } CBMCall;
 
+typedef enum {
+    /* Language-level module/package import. Semantic resolution is allowed. */
+    CBM_IMPORT_RESOLVE_SEMANTIC = 0,
+    /* A quoted source include whose exact repository path is authoritative. */
+    CBM_IMPORT_RESOLVE_EXACT_SOURCE = 1,
+    /* A system/external include. Without a captured include root it must not be
+     * guessed against repository files. */
+    CBM_IMPORT_RESOLVE_EXTERNAL_SOURCE = 2,
+} CBMImportResolution;
+
 typedef struct {
     const char *local_name;  // local alias or name
     const char *module_path; // resolved module path / QN
+    CBMImportResolution resolution;
 } CBMImport;
 
 typedef struct {

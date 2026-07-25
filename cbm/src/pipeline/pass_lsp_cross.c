@@ -351,114 +351,6 @@ CBMLSPDef *cbm_pxc_collect_all_defs(CBMFileResult **cache, const cbm_file_info_t
     return defs;
 }
 
-static void pxc_free_import_map(const char **keys, const char **vals, int count);
-
-/* Build per-file import map (local_name -> resolved module QN) from gbuf
- * IMPORTS edges. Mirrors build_import_map() in pass_parallel.c. Returns 0
- * with *out_count = 0 when the file has no IMPORTS edges. Caller frees keys
- * with pxc_free_import_map. */
-static int pxc_build_import_map(const cbm_gbuf_t *gbuf, const char *project_name,
-                                const char *rel_path, const char ***out_keys,
-                                const char ***out_vals, int *out_count) {
-    *out_keys = NULL;
-    *out_vals = NULL;
-    *out_count = 0;
-
-    char *file_qn = cbm_pipeline_fqn_compute(project_name, rel_path, "__file__");
-    if (!file_qn) {
-        cbm_log_error("lsp_cross.import_map_failed", "code", "CBM_IMPORT_MAP_FQN_ALLOC_FAILED",
-                      "component", "lsp_cross.import_map", "operation", "file_fqn", "file",
-                      rel_path ? rel_path : "<unknown>", "message",
-                      "import map could not allocate its file identity", "remediation",
-                      "free memory or reduce repository size, then retry");
-        return -1;
-    }
-    const cbm_gbuf_node_t *file_node = cbm_gbuf_find_by_qn(gbuf, file_qn);
-    free(file_qn);
-    if (!file_node)
-        return 0;
-
-    const cbm_gbuf_edge_t **edges = NULL;
-    int edge_count = 0;
-    int rc =
-        cbm_gbuf_find_edges_by_source_type(gbuf, file_node->id, "IMPORTS", &edges, &edge_count);
-    if (rc != 0) {
-        cbm_log_error("lsp_cross.import_map_failed", "code", "CBM_IMPORT_MAP_QUERY_FAILED",
-                      "component", "lsp_cross.import_map", "operation", "query_edges", "file",
-                      rel_path ? rel_path : "<unknown>", "message",
-                      "import map could not query every IMPORTS edge", "remediation",
-                      "inspect the graph-buffer diagnostic and retry");
-        return -1;
-    }
-    if (edge_count == 0)
-        return 0;
-
-    const char **keys = (const char **)calloc((size_t)edge_count, sizeof(const char *));
-    const char **vals = (const char **)calloc((size_t)edge_count, sizeof(const char *));
-    if (!keys || !vals) {
-        free(keys);
-        free(vals);
-        cbm_log_error("lsp_cross.import_map_failed", "code", "CBM_IMPORT_MAP_ALLOC_FAILED",
-                      "component", "lsp_cross.import_map", "operation", "allocate_entries", "file",
-                      rel_path ? rel_path : "<unknown>", "message",
-                      "import map could not allocate every IMPORTS entry", "remediation",
-                      "free memory or reduce repository size, then retry");
-        return -1;
-    }
-    int count = 0;
-    for (int i = 0; i < edge_count; i++) {
-        const cbm_gbuf_edge_t *e = edges[i];
-        const cbm_gbuf_node_t *target = cbm_gbuf_find_by_id(gbuf, e->target_id);
-        if (!target || !e->properties_json)
-            continue;
-        const char *start = strstr(e->properties_json, "\"local_name\":\"");
-        if (!start)
-            continue;
-        start += strlen("\"local_name\":\"");
-        const char *end = strchr(start, '"');
-        if (!end || end <= start)
-            continue;
-        size_t n = (size_t)(end - start);
-        if (n == SIZE_MAX) {
-            pxc_free_import_map(keys, vals, count);
-            cbm_log_error("lsp_cross.import_map_failed", "code", "CBM_IMPORT_NAME_OVERFLOW",
-                          "component", "lsp_cross.import_map", "operation", "copy_local_name",
-                          "file", rel_path ? rel_path : "<unknown>", "message",
-                          "import local-name length exceeds the addressable allocation size",
-                          "remediation", "inspect the malformed IMPORTS edge and retry");
-            return -1;
-        }
-        char *local = (char *)malloc(n + 1);
-        if (!local) {
-            pxc_free_import_map(keys, vals, count);
-            cbm_log_error("lsp_cross.import_map_failed", "code", "CBM_IMPORT_NAME_ALLOC_FAILED",
-                          "component", "lsp_cross.import_map", "operation", "copy_local_name",
-                          "file", rel_path ? rel_path : "<unknown>", "message",
-                          "import map could not retain an import local name", "remediation",
-                          "free memory or reduce repository size, then retry");
-            return -1;
-        }
-        memcpy(local, start, n);
-        local[n] = '\0';
-        keys[count] = local;
-        vals[count] = target->qualified_name; /* borrowed from gbuf */
-        count++;
-    }
-    *out_keys = keys;
-    *out_vals = vals;
-    *out_count = count;
-    return 0;
-}
-
-static void pxc_free_import_map(const char **keys, const char **vals, int count) {
-    if (keys) {
-        for (int i = 0; i < count; i++)
-            free((void *)keys[i]);
-        free((void *)keys);
-    }
-    free((void *)vals); /* vals strings borrowed from gbuf — don't free elements */
-}
-
 /* Detect TS dialect flags from a relative path. */
 void cbm_pxc_ts_modes(CBMLanguage lang, const char *rel_path, bool *out_js, bool *out_jsx,
                       bool *out_dts) {
@@ -1055,8 +947,8 @@ int cbm_pipeline_pass_lsp_cross(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *
         const char **imp_keys = NULL;
         const char **imp_vals = NULL;
         int imp_count = 0;
-        if (pxc_build_import_map(ctx->gbuf, ctx->project_name, files[i].rel_path, &imp_keys,
-                                 &imp_vals, &imp_count) != 0) {
+        if (cbm_pipeline_import_map_build(ctx->gbuf, ctx->project_name, files[i].rel_path,
+                                          &imp_keys, &imp_vals, &imp_count) != 0) {
             free(source);
             status = -1;
             goto cleanup;
@@ -1075,7 +967,7 @@ int cbm_pipeline_pass_lsp_cross(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *
                           files[i].rel_path ? files[i].rel_path : "<unknown>", "requested_bytes",
                           requested, "message", "cross-LSP file resolution allocation failed",
                           "remediation", "free memory or reduce repository size, then retry");
-            pxc_free_import_map(imp_keys, imp_vals, imp_count);
+            cbm_pipeline_import_map_free(imp_keys, imp_vals, imp_count);
             free(source);
             status = -1;
             goto cleanup;
@@ -1083,7 +975,7 @@ int cbm_pipeline_pass_lsp_cross(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *
         per_lang_calls++;
         processed++;
 
-        pxc_free_import_map(imp_keys, imp_vals, imp_count);
+        cbm_pipeline_import_map_free(imp_keys, imp_vals, imp_count);
         free(source);
     }
 

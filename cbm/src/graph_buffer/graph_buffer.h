@@ -34,11 +34,11 @@ typedef struct {
     char *file_path;      /* heap-owned */
     int start_line;
     int end_line;
-    bool source_present;    /* distinguishes no source from an exact empty source */
-    uint8_t *source_bytes;  /* heap-owned byte-exact source when source_present */
+    bool source_present;   /* distinguishes no source from an exact empty source */
+    uint8_t *source_bytes; /* heap-owned byte-exact source when source_present */
     size_t source_len;
-    char *source_sha256;    /* heap-owned lowercase SHA-256 when source_present */
-    uint64_t start_byte;    /* end-exclusive byte span within the indexed file */
+    char *source_sha256; /* heap-owned lowercase SHA-256 when source_present */
+    uint64_t start_byte; /* end-exclusive byte span within the indexed file */
     uint64_t end_byte;
     char *properties_json; /* heap-owned JSON string, "{}" default */
 } cbm_gbuf_node_t;
@@ -97,13 +97,27 @@ int64_t cbm_gbuf_upsert_source_node(cbm_gbuf_t *gb, const char *label, const cha
                                     const char *properties_json);
 
 /* Resolve a source-backed node by the complete canonical identity frame. */
-const cbm_gbuf_node_t *cbm_gbuf_find_source_node(
-    const cbm_gbuf_t *gb, const char *label, const char *name, const char *qualified_name,
-    const char *file_path, int start_line, int end_line, const uint8_t *source_bytes,
-    size_t source_len, uint64_t start_byte, uint64_t end_byte);
+const cbm_gbuf_node_t *cbm_gbuf_find_source_node(const cbm_gbuf_t *gb, const char *label,
+                                                 const char *name, const char *qualified_name,
+                                                 const char *file_path, int start_line,
+                                                 int end_line, const uint8_t *source_bytes,
+                                                 size_t source_len, uint64_t start_byte,
+                                                 uint64_t end_byte);
 
 /* Resolve an already-known stable atom without consulting its display QN. */
 const cbm_gbuf_node_t *cbm_gbuf_find_by_atom_id(const cbm_gbuf_t *gb, const char *atom_id);
+
+/* Resolve one source-backed container by its exact identity-bearing path domain.
+ * Qualified names are intentionally not consulted: a semantic module alias may
+ * name several physical source/header files. Exactly one live source atom with
+ * the requested label and repository-relative file_path is returned. Multiple
+ * matches poison persistence and emit complete candidate diagnostics. */
+const cbm_gbuf_node_t *cbm_gbuf_find_source_container(const cbm_gbuf_t *gb, const char *label,
+                                                      const char *file_path);
+
+/* Mark a caller-diagnosed reference ambiguity as terminal for persistence.
+ * Callers must emit a structured diagnostic before invoking this function. */
+void cbm_gbuf_refuse_resolution(cbm_gbuf_t *gb);
 
 /* Find a node by qualified name. Returns NULL if not found and poisons
  * persistence when the qualified name maps to multiple stable atoms. */
@@ -120,9 +134,11 @@ const cbm_gbuf_node_t *cbm_gbuf_find_by_qn_location(const cbm_gbuf_t *gb, const 
  * The semantic locator is exact (QN/path/label/name plus the prior signature
  * property when present). A deleted locator returns NULL; an existing but
  * signature-incompatible or ambiguous locator poisons persistence. */
-const cbm_gbuf_node_t *cbm_gbuf_find_successor_node(
-    const cbm_gbuf_t *gb, const char *qualified_name, const char *file_path, const char *label,
-    const char *name, const char *previous_properties_json);
+const cbm_gbuf_node_t *cbm_gbuf_find_successor_node(const cbm_gbuf_t *gb,
+                                                    const char *qualified_name,
+                                                    const char *file_path, const char *label,
+                                                    const char *name,
+                                                    const char *previous_properties_json);
 
 /* True after any canonical identity or reference-resolution failure. */
 bool cbm_gbuf_resolution_failed(const cbm_gbuf_t *gb);

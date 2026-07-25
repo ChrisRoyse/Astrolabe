@@ -1330,6 +1330,259 @@ static bool import_targetable_label(const char *label) {
     return false;
 }
 
+void cbm_pipeline_import_map_free(const char **keys, const char **vals, int count) {
+    if (keys) {
+        for (int i = 0; i < count; i++) {
+            free((void *)keys[i]);
+        }
+        free((void *)keys);
+    }
+    free((void *)vals);
+}
+
+/* IMPORTS edges are the sole authority after import resolution. Decode them in
+ * one place so sequential, parallel, and cross-LSP consumers cannot drift back
+ * to source-cache/QN shortcuts or silently reinterpret graph faults as an empty
+ * import set. */
+int cbm_pipeline_import_map_build(const cbm_gbuf_t *gbuf, const char *project_name,
+                                  const char *rel_path, const char ***out_keys,
+                                  const char ***out_vals, int *out_count) {
+    if (!out_keys || !out_vals || !out_count) {
+        cbm_log_error("pkgmap.import_map_failed", "code", "CBM_IMPORT_MAP_OUTPUT_INVALID",
+                      "component", "pipeline.import_map", "operation", "validate_outputs", "file",
+                      rel_path ? rel_path : "<unknown>", "message",
+                      "import-map output ownership pointers are required", "remediation",
+                      "repair the internal import-map caller contract");
+        return CBM_NOT_FOUND;
+    }
+    *out_keys = NULL;
+    *out_vals = NULL;
+    *out_count = 0;
+
+    if (!gbuf || !project_name || !project_name[0] || !rel_path || !rel_path[0]) {
+        cbm_log_error("pkgmap.import_map_failed", "code", "CBM_IMPORT_MAP_INPUT_INVALID",
+                      "component", "pipeline.import_map", "operation", "validate_inputs", "project",
+                      project_name ? project_name : "", "file", rel_path ? rel_path : "", "message",
+                      "import-map graph, project, and exact source path are required",
+                      "remediation", "repair the internal import-map caller contract");
+        return CBM_NOT_FOUND;
+    }
+
+    const cbm_gbuf_node_t *file_node = cbm_gbuf_find_source_container(gbuf, "File", rel_path);
+    if (!file_node) {
+        cbm_log_error(
+            "pkgmap.import_map_failed", "code",
+            cbm_gbuf_resolution_failed(gbuf) ? "CBM_IMPORT_MAP_FILE_AMBIGUOUS"
+                                             : "CBM_IMPORT_MAP_FILE_MISSING",
+            "component", "pipeline.import_map", "operation", "resolve_source_file", "project",
+            project_name, "file", rel_path, "message",
+            "resolved import edges have no unique exact source File owner", "remediation",
+            "inspect source-container diagnostics and rebuild the graph from exact source bytes");
+        return CBM_NOT_FOUND;
+    }
+
+    const cbm_gbuf_edge_t **edges = NULL;
+    int edge_count = 0;
+    if (cbm_gbuf_find_edges_by_source_type(gbuf, file_node->id, "IMPORTS", &edges, &edge_count) !=
+            0 ||
+        edge_count < 0 || (edge_count > 0 && !edges)) {
+        cbm_log_error("pkgmap.import_map_failed", "code", "CBM_IMPORT_MAP_QUERY_FAILED",
+                      "component", "pipeline.import_map", "operation", "query_import_edges",
+                      "project", project_name, "file", rel_path, "message",
+                      "the complete resolved IMPORTS edge set could not be read", "remediation",
+                      "inspect graph-buffer state and retry indexing");
+        return CBM_NOT_FOUND;
+    }
+    if (edge_count == 0) {
+        return 0;
+    }
+
+    size_t capacity = (size_t)edge_count;
+    if (capacity > SIZE_MAX / sizeof(const char *) || capacity > SIZE_MAX / sizeof(int64_t)) {
+        cbm_log_error("pkgmap.import_map_failed", "code", "CBM_IMPORT_MAP_CAPACITY_OVERFLOW",
+                      "component", "pipeline.import_map", "operation", "size_entries", "project",
+                      project_name, "file", rel_path, "message",
+                      "IMPORTS edge count exceeds the addressable import-map capacity",
+                      "remediation", "inspect the corrupted graph edge count and retry indexing");
+        return CBM_NOT_FOUND;
+    }
+
+    const char **keys = calloc(capacity, sizeof(const char *));
+    const char **vals = calloc(capacity, sizeof(const char *));
+    int64_t *target_ids = calloc(capacity, sizeof(int64_t));
+    if (!keys || !vals || !target_ids) {
+        free(keys);
+        free(vals);
+        free(target_ids);
+        cbm_log_error("pkgmap.import_map_failed", "code", "CBM_IMPORT_MAP_ALLOC_FAILED",
+                      "component", "pipeline.import_map", "operation", "allocate_entries",
+                      "project", project_name, "file", rel_path, "message",
+                      "import map could not allocate every resolved IMPORTS entry", "remediation",
+                      "free memory or reduce repository size, then retry");
+        return CBM_NOT_FOUND;
+    }
+
+    int count = 0;
+    for (int i = 0; i < edge_count; i++) {
+        const cbm_gbuf_edge_t *edge = edges[i];
+        const cbm_gbuf_node_t *target = edge ? cbm_gbuf_find_by_id(gbuf, edge->target_id) : NULL;
+        if (!edge || !target || !target->qualified_name || !target->qualified_name[0] ||
+            !target->atom_id || !target->atom_id[0] || !edge->properties_json) {
+            char edge_ordinal[CBM_SZ_32];
+            snprintf(edge_ordinal, sizeof(edge_ordinal), "%d", i + SKIP_ONE);
+            cbm_pipeline_import_map_free(keys, vals, count);
+            free(target_ids);
+            cbm_log_error("pkgmap.import_map_failed", "code", "CBM_IMPORT_MAP_EDGE_INVALID",
+                          "component", "pipeline.import_map", "operation", "validate_edge",
+                          "project", project_name, "file", rel_path, "edge_ordinal", edge_ordinal,
+                          "message",
+                          "IMPORTS edge is missing its target identity or properties document",
+                          "remediation", "inspect graph construction and retry indexing");
+            return CBM_NOT_FOUND;
+        }
+
+        yyjson_read_err json_error;
+        yyjson_doc *doc = yyjson_read_opts(edge->properties_json, strlen(edge->properties_json), 0,
+                                           NULL, &json_error);
+        yyjson_val *root = doc ? yyjson_doc_get_root(doc) : NULL;
+        yyjson_val *local_value = yyjson_is_obj(root) ? yyjson_obj_get(root, "local_name") : NULL;
+        const char *local_name = yyjson_is_str(local_value) ? yyjson_get_str(local_value) : NULL;
+        size_t local_len = local_name ? yyjson_get_len(local_value) : 0;
+        if (!local_name || local_len == 0 || strlen(local_name) != local_len) {
+            char edge_id[CBM_SZ_32];
+            snprintf(edge_id, sizeof(edge_id), "%lld", (long long)edge->id);
+            const char *json_detail =
+                doc ? "local_name must be a non-empty JSON string without NUL"
+                    : (json_error.msg ? json_error.msg : "properties JSON parse failed");
+            yyjson_doc_free(doc);
+            cbm_pipeline_import_map_free(keys, vals, count);
+            free(target_ids);
+            cbm_log_error("pkgmap.import_map_failed", "code", "CBM_IMPORT_MAP_PROPERTIES_INVALID",
+                          "component", "pipeline.import_map", "operation", "decode_local_name",
+                          "project", project_name, "file", rel_path, "edge_id", edge_id, "detail",
+                          json_detail, "message",
+                          "IMPORTS edge does not carry one valid local-name identity",
+                          "remediation", "repair import edge construction and retry indexing");
+            return CBM_NOT_FOUND;
+        }
+
+        char *owned_local = strdup(local_name);
+        yyjson_doc_free(doc);
+        if (!owned_local) {
+            cbm_pipeline_import_map_free(keys, vals, count);
+            free(target_ids);
+            cbm_log_error("pkgmap.import_map_failed", "code", "CBM_IMPORT_NAME_ALLOC_FAILED",
+                          "component", "pipeline.import_map", "operation", "copy_local_name",
+                          "project", project_name, "file", rel_path, "message",
+                          "import map could not retain an import local name", "remediation",
+                          "free memory or reduce repository size, then retry");
+            return CBM_NOT_FOUND;
+        }
+
+        int duplicate = -1;
+        for (int j = 0; j < count; j++) {
+            if (strcmp(keys[j], owned_local) == 0) {
+                duplicate = j;
+                break;
+            }
+        }
+        if (duplicate >= 0) {
+            if (target_ids[duplicate] == edge->target_id) {
+                free(owned_local);
+                continue;
+            }
+            const cbm_gbuf_node_t *previous = cbm_gbuf_find_by_id(gbuf, target_ids[duplicate]);
+            cbm_log_error(
+                "pkgmap.import_map_failed", "code", "CBM_IMPORT_LOCAL_NAME_AMBIGUOUS", "component",
+                "pipeline.import_map", "operation", "deduplicate_local_name", "project",
+                project_name, "file", rel_path, "local_name", owned_local, "candidate_a_atom_id",
+                previous && previous->atom_id ? previous->atom_id : "", "candidate_b_atom_id",
+                target->atom_id, "message",
+                "one local import name resolves to multiple exact graph targets", "remediation",
+                "make the source import alias unambiguous and retry indexing");
+            free(owned_local);
+            cbm_pipeline_import_map_free(keys, vals, count);
+            free(target_ids);
+            return CBM_NOT_FOUND;
+        }
+
+        keys[count] = owned_local;
+        vals[count] = target->qualified_name;
+        target_ids[count] = edge->target_id;
+        count++;
+    }
+
+    free(target_ids);
+    *out_keys = keys;
+    *out_vals = vals;
+    *out_count = count;
+    return 0;
+}
+
+typedef enum {
+    SOURCE_PATH_NORMALIZED = 0,
+    SOURCE_PATH_INVALID = 1,
+    SOURCE_PATH_ALLOC_FAILED = 2,
+} source_path_status_t;
+
+/* Normalize a repository-relative source candidate without dropping its file
+ * extension. The semantic module normalizer deliberately strips extensions;
+ * exact source-container resolution must never reuse that domain. */
+static source_path_status_t normalize_source_candidate(char *path) {
+    if (!path || !path[0]) {
+        return SOURCE_PATH_INVALID;
+    }
+    cbm_normalize_path_sep(path);
+    size_t path_len = strlen(path);
+    if (path[0] == '/' || (path_len >= PAIR_LEN && path[1] == ':')) {
+        return SOURCE_PATH_INVALID;
+    }
+    if (path_len > (SIZE_MAX / sizeof(size_t)) - SKIP_ONE) {
+        return SOURCE_PATH_ALLOC_FAILED;
+    }
+    size_t *segment_starts = malloc((path_len + SKIP_ONE) * sizeof(size_t));
+    if (!segment_starts) {
+        return SOURCE_PATH_ALLOC_FAILED;
+    }
+
+    size_t out = 0;
+    size_t segment_count = 0;
+    const char *cursor = path;
+    while (*cursor) {
+        while (*cursor == '/') {
+            cursor++;
+        }
+        if (!*cursor) {
+            break;
+        }
+        const char *segment = cursor;
+        while (*cursor && *cursor != '/') {
+            cursor++;
+        }
+        size_t segment_len = (size_t)(cursor - segment);
+        if (segment_len == SKIP_ONE && segment[0] == '.') {
+            continue;
+        }
+        if (segment_len == PAIR_LEN && segment[0] == '.' && segment[1] == '.') {
+            if (segment_count == 0) {
+                free(segment_starts);
+                return SOURCE_PATH_INVALID;
+            }
+            out = segment_starts[--segment_count];
+            continue;
+        }
+        segment_starts[segment_count++] = out;
+        if (out > 0) {
+            path[out++] = '/';
+        }
+        memmove(path + out, segment, segment_len);
+        out += segment_len;
+    }
+    path[out] = '\0';
+    free(segment_starts);
+    return out > 0 ? SOURCE_PATH_NORMALIZED : SOURCE_PATH_INVALID;
+}
+
 /* Resolve a sibling-file import: a bare path/name (no leading "./") that names
  * a file relative to the importer's directory.  This covers build/markup
  * grammars whose import string is a sibling filename or directory rather than a
@@ -1340,13 +1593,13 @@ static bool import_targetable_label(const char *label) {
  *   - Meson `subdir('lib')`            → `lib/meson.build`
  *   - func  `#include "utils.fc"`      → sibling `utils.fc`
  *   - Pony  `use "util"`               → sibling `util.pony`
- * Builds a path relative to source_rel's directory, then looks up the resulting
- * File/Module-node QN (extension is stripped by fqn_module).  Returns a borrowed
- * node or NULL.  Several filename conventions are tried in turn. */
+ * Builds exact repository-relative path candidates and resolves a source-backed
+ * Module by (label, file_path), without consulting the non-unique semantic QN.
+ * All structurally valid candidates are evaluated; multiple distinct live atoms
+ * are terminal ambiguity rather than an order-dependent winner. */
 static const cbm_gbuf_node_t *resolve_sibling_file(const cbm_pipeline_ctx_t *ctx,
-                                                   const char *source_rel,
-                                                   const char *source_file_qn,
-                                                   const char *module_path) {
+                                                   const char *source_rel, const char *module_path,
+                                                   bool exact_source_only) {
     if (!module_path || !module_path[0]) {
         return NULL;
     }
@@ -1357,7 +1610,7 @@ static const cbm_gbuf_node_t *resolve_sibling_file(const cbm_pipeline_ctx_t *ctx
     }
 
     /* Candidate relative paths, in priority order. */
-    char *cands[4] = {0};
+    char *cands[5] = {0};
     int ncand = 0;
     const char *base = module_path;
     /* Skip a leading "./". */
@@ -1366,8 +1619,14 @@ static const cbm_gbuf_node_t *resolve_sibling_file(const cbm_pipeline_ctx_t *ctx
     }
     /* 1. Direct sibling: dir/<module_path>. */
     cands[ncand++] = concat3(dir, dir[0] ? "/" : "", base);
-    /* 2. SCSS partial: dir/[subdir/]_<basename>.scss (underscore-prefixed). */
-    {
+    /* Repository-root and convention-derived paths belong to semantic/build
+     * imports. A quoted C-family include guarantees only the importing file's
+     * directory before compiler-configured include roots. Until those roots are
+     * captured, guessing repository root would fabricate provenance. */
+    if (!exact_source_only) {
+        /* 2. Repository-root semantic path. */
+        cands[ncand++] = strdup(base);
+        /* 3. SCSS partial: dir/[subdir/]_<basename>.scss (underscore-prefixed). */
         const char *slash = strrchr(base, '/');
         const char *bn = slash ? slash + 1 : base;
         char *dpart = slash ? cbm_strndup(base, (size_t)(slash - base)) : strdup("");
@@ -1388,23 +1647,20 @@ static const cbm_gbuf_node_t *resolve_sibling_file(const cbm_pipeline_ctx_t *ctx
             goto allocation_failed;
         }
         free(dpart);
-    }
-    /* 3. Meson subdir: dir/<module_path>/meson.build. */
-    {
+        /* 4. Meson subdir: dir/<module_path>/meson.build. */
         char *meson_rel = concat3(base, "/", "meson.build");
         if (!meson_rel) {
             goto allocation_failed;
         }
         cands[ncand++] = concat3(dir, dir[0] ? "/" : "", meson_rel);
         free(meson_rel);
-    }
-    /* 4. Basename sibling: dir/<basename(module_path)>.  Covers include paths
-     *    that carry a non-relative prefix (Hyprlang `source = ~/.config/.../x.conf`,
-     *    absolute include paths) but reference a file sitting beside the importer. */
-    {
-        const char *slash = strrchr(base, '/');
-        if (slash && slash[1]) {
-            cands[ncand++] = concat3(dir, dir[0] ? "/" : "", slash + 1);
+        /* 5. Basename sibling: dir/<basename(module_path)>.  Covers include paths
+         *    that carry a non-relative prefix (Hyprlang
+         *    `source = ~/.config/.../x.conf`, absolute include paths) but reference
+         *    a file sitting beside the importer. */
+        const char *base_slash = strrchr(base, '/');
+        if (base_slash && base_slash[1]) {
+            cands[ncand++] = concat3(dir, dir[0] ? "/" : "", base_slash + 1);
         }
     }
 
@@ -1415,19 +1671,41 @@ static const cbm_gbuf_node_t *resolve_sibling_file(const cbm_pipeline_ctx_t *ctx
     }
 
     const cbm_gbuf_node_t *found = NULL;
+    const char *found_path = NULL;
     for (int i = 0; i < ncand; i++) {
-        char *qn = cbm_pipeline_fqn_module(ctx->project_name, cands[i]);
-        if (!qn) {
+        source_path_status_t path_status = normalize_source_candidate(cands[i]);
+        if (path_status == SOURCE_PATH_ALLOC_FAILED) {
             goto allocation_failed;
         }
-        const cbm_gbuf_node_t *n = cbm_gbuf_find_by_qn(ctx->gbuf, qn);
-        free(qn);
-        if (n && import_targetable_label(n->label) &&
-            (!source_file_qn || !n->qualified_name ||
-             strcmp(n->qualified_name, source_file_qn) != 0)) {
-            found = n;
-            break;
+        if (path_status == SOURCE_PATH_INVALID) {
+            continue;
         }
+        const cbm_gbuf_node_t *n = cbm_gbuf_find_source_container(ctx->gbuf, "Module", cands[i]);
+        if (!n || (source_rel && n->file_path && strcmp(n->file_path, source_rel) == 0)) {
+            continue;
+        }
+        if (!found) {
+            found = n;
+            found_path = cands[i];
+            continue;
+        }
+        if (found->atom_id && n->atom_id && strcmp(found->atom_id, n->atom_id) == 0) {
+            continue;
+        }
+        cbm_log_error("pkgmap.source_import_ambiguous", "code", "CBM_IMPORT_SOURCE_AMBIGUOUS",
+                      "module", module_path, "source", source_rel ? source_rel : "",
+                      "candidate_a_path", found_path ? found_path : "", "candidate_a_atom_id",
+                      found->atom_id ? found->atom_id : "", "candidate_b_path", cands[i],
+                      "candidate_b_atom_id", n->atom_id ? n->atom_id : "", "message",
+                      "one import spelling resolves to multiple exact source containers",
+                      "remediation",
+                      "make the import path unambiguous or configure one exact source root");
+        cbm_gbuf_refuse_resolution(ctx->gbuf);
+        if (ctx->cancelled) {
+            atomic_store(ctx->cancelled, SKIP_ONE);
+        }
+        found = NULL;
+        break;
     }
     for (int i = 0; i < ncand; i++) {
         free(cands[i]);
@@ -1459,7 +1737,32 @@ const cbm_gbuf_node_t *cbm_pipeline_resolve_import_node(const cbm_pipeline_ctx_t
         return NULL;
     }
 
-    /* Strategy 1: module-path resolution → existing node (Python/TS/Go).
+    /* Angle-bracket C-family includes identify an external/include-root search
+     * domain. The extractor has no compile-command include roots, so binding one
+     * to a repository sibling would be fabricated provenance. */
+    if (imp->resolution == CBM_IMPORT_RESOLVE_EXTERNAL_SOURCE) {
+        return NULL;
+    }
+
+    /* Strategy 1: exact source-path resolution. C/C++ includes and other
+     * source-bearing imports retain their filename extension, so resolve the
+     * physical Module atom before consulting the extensionless semantic alias. */
+    {
+        const cbm_gbuf_node_t *source_target = resolve_sibling_file(
+            ctx, source_rel, imp->module_path, imp->resolution == CBM_IMPORT_RESOLVE_EXACT_SOURCE);
+        if (source_target || cbm_gbuf_resolution_failed(ctx->gbuf) ||
+            (ctx->cancelled && atomic_load(ctx->cancelled))) {
+            return source_target;
+        }
+        /* A quoted source include is an exact identity assertion. If neither
+         * exact spelling exists, it is unresolved; never reinterpret its stem
+         * as a semantic module and accidentally bind missing.h to missing.c. */
+        if (imp->resolution == CBM_IMPORT_RESOLVE_EXACT_SOURCE) {
+            return NULL;
+        }
+    }
+
+    /* Strategy 2: module-path resolution → existing node (Python/TS/Go).
      * No label filter here: directory-module languages (Go/Java packages)
      * legitimately resolve straight to a Folder node -- that's the intended,
      * correct import target, not a collision. The Folder-collision problem
@@ -1473,18 +1776,7 @@ const cbm_gbuf_node_t *cbm_pipeline_resolve_import_node(const cbm_pipeline_ctx_t
         return target;
     }
 
-    /* Strategy 1b: sibling-file resolution for build/markup grammars whose
-     * import string is a sibling filename or directory (SCSS partials, Just/
-     * BitBake/func includes, Meson subdir, Pony use). */
-    {
-        const cbm_gbuf_node_t *sib =
-            resolve_sibling_file(ctx, source_rel, source_file_qn, imp->module_path);
-        if (sib) {
-            return sib;
-        }
-    }
-
-    /* Strategy 2: namespace map.  `using App.Utils`, `import com.example.Foo`,
+    /* Strategy 3: namespace map.  `using App.Utils`, `import com.example.Foo`,
      * `use App\Utils\Helper` name a NAMESPACE (or a member of it) that the
      * path-based QN cannot express.  Try the full module path and progressively
      * shorter prefixes (dropping the trailing member segment) so both a bare
@@ -1575,7 +1867,7 @@ const cbm_gbuf_node_t *cbm_pipeline_resolve_import_node(const cbm_pipeline_ctx_t
         free(norm);
     }
 
-    /* Strategy 3: symbol-name fallback.  Derive a representative imported
+    /* Strategy 4: symbol-name fallback.  Derive a representative imported
      * symbol (handling alias / glob / grouped forms) and match it against an
      * in-graph definition of the same simple name in another file
      * (Rust `helper`, Java `Util`, Kotlin grouped, ...). */
@@ -1719,7 +2011,7 @@ const cbm_gbuf_node_t *cbm_pipeline_resolve_import_node(const cbm_pipeline_ctx_t
     free(cands);
     free(owned_seg);
 
-    /* Strategy 4: crate-relative module path → File/Module node.  Rust glob
+    /* Strategy 5: crate-relative module path → File/Module node.  Rust glob
      * `use crate::ops::*` names a module, not a symbol; strip the glob and the
      * `crate::`/`self::`/`super::` prefix, convert `::`→`/`, then resolve the
      * remaining path (and successive prefixes) to a Module/File node. */
