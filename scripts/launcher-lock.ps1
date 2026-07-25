@@ -113,7 +113,15 @@ public static class AstroLauncherLockNative
         uint flags
     );
 
-    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private const uint MOVEFILE_WRITE_THROUGH = 0x00000008;
+
+    [DllImport(
+        "kernel32.dll",
+        EntryPoint = "MoveFileExW",
+        CharSet = CharSet.Unicode,
+        ExactSpelling = true,
+        SetLastError = true
+    )]
     [return: MarshalAs(UnmanagedType.Bool)]
     private static extern bool MoveFileExWNative(
         string existingFileName,
@@ -227,16 +235,32 @@ public static class AstroLauncherLockNative
         return "\\\\?\\" + full;
     }
 
-    public static bool MoveFileExW(
+    public static void MoveFileWriteThroughNoReplace(
         string existingFileName,
-        string newFileName,
-        uint flags
+        string newFileName
     )
     {
-        return MoveFileExWNative(
-            GetExtendedLengthPath(existingFileName),
-            GetExtendedLengthPath(newFileName),
-            flags
+        string source = GetExtendedLengthPath(existingFileName);
+        string destination = GetExtendedLengthPath(newFileName);
+        if (MoveFileExWNative(source, destination, MOVEFILE_WRITE_THROUGH))
+        {
+            return;
+        }
+
+        int nativeError = Marshal.GetLastWin32Error();
+        string nativeMessage = new Win32Exception(nativeError).Message;
+        throw new Win32Exception(
+            nativeError,
+            string.Format(
+                CultureInfo.InvariantCulture,
+                "MoveFileExW failed (native_error={0}, native_message='{1}', " +
+                    "flags=0x{2:x8}, source='{3}', destination='{4}')",
+                nativeError,
+                nativeMessage,
+                MOVEFILE_WRITE_THROUGH,
+                existingFileName,
+                newFileName
+            )
         );
     }
 
@@ -3436,32 +3460,142 @@ function Exit-AstroLauncherLockMutex {
     }
 }
 
+function Throw-AstroFileMoveFailure {
+    param(
+        [Parameter(Mandatory)][string]$Code,
+        [Parameter(Mandatory)][string]$Message,
+        [Parameter(Mandatory)][string]$Remediation,
+        [Parameter(Mandatory)][string]$SourcePath,
+        [Parameter(Mandatory)][string]$DestinationPath,
+        [Nullable[int]]$NativeErrorCode
+    )
+
+    $exception = [InvalidOperationException]::new(
+        "$Code`: $Message`nRemediation: $Remediation"
+    )
+    $exception.Data['AstroCode'] = $Code
+    $exception.Data['AstroRemediation'] = $Remediation
+    $exception.Data['SourcePath'] = $SourcePath
+    $exception.Data['DestinationPath'] = $DestinationPath
+    $exception.Data['MoveFlags'] = '0x00000008'
+    if ($null -ne $NativeErrorCode) {
+        $exception.Data['NativeErrorCode'] = [int]$NativeErrorCode
+    }
+    throw $exception
+}
+
 function Move-AstroFileWriteThroughNoReplace {
     param(
         [Parameter(Mandatory)][string]$Source,
         [Parameter(Mandatory)][string]$Destination
     )
 
-    $sourceFull = [IO.Path]::GetFullPath($Source)
-    $destinationFull = [IO.Path]::GetFullPath($Destination)
+    try {
+        $sourceFull = [IO.Path]::GetFullPath($Source)
+        $destinationFull = [IO.Path]::GetFullPath($Destination)
+    }
+    catch {
+        Throw-AstroFileMoveFailure `
+            -Code 'ASTRO_FILE_MOVE_PATH_INVALID' `
+            -Message "source or destination path is invalid: $($_.Exception.Message)" `
+            -Remediation (
+                'supply two canonical Windows file paths; do not normalize, ' +
+                'truncate, or redirect an invalid path'
+            ) `
+            -SourcePath $Source `
+            -DestinationPath $Destination
+    }
+
     $destinationState = Get-AstroPathEntryState $destinationFull
-    if ($destinationState.State -eq 'present') {
-        throw "destination already exists; refusing no-replace move: $destinationFull"
+    if ($destinationState.State -cne 'absent' -and
+        $destinationState.State -cne 'present') {
+        Throw-AstroFileMoveFailure `
+            -Code 'ASTRO_FILE_MOVE_DESTINATION_UNEVALUABLE' `
+            -Message (
+                'destination presence is unevaluable ' +
+                "(state=$($destinationState.State), " +
+                "error=$($destinationState.Error)): $destinationFull"
+            ) `
+            -Remediation (
+                'preserve both namespaces, repair the destination probe failure, ' +
+                'and retry only after its exact presence is evaluable'
+            ) `
+            -SourcePath $sourceFull `
+            -DestinationPath $destinationFull
     }
-    if ($destinationState.State -ne 'absent') {
-        throw "destination presence is unevaluable; refusing no-replace move: $destinationFull ($($destinationState.Error))"
-    }
-    # MOVEFILE_WRITE_THROUGH = 0x8. REPLACE_EXISTING and COPY_ALLOWED are omitted.
-    if (-not [AstroLauncherLockNative]::MoveFileExW(
+
+    # The native operation is the atomic no-replace authority. A destination that
+    # was present during the probe still reaches Win32 so its exact error survives.
+    try {
+        [AstroLauncherLockNative]::MoveFileWriteThroughNoReplace(
             $sourceFull,
-            $destinationFull,
-            [uint32]0x8
-        )) {
-        $errorCode = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
-        throw [ComponentModel.Win32Exception]::new(
-            $errorCode,
-            "write-through no-replace move failed '$sourceFull' -> '$destinationFull'"
+            $destinationFull
         )
+    }
+    catch {
+        $failure = $_.Exception
+        $cursor = $failure
+        $nativeFailure = $null
+        $typeChain = [Collections.Generic.List[string]]::new()
+        while ($null -ne $cursor) {
+            $typeChain.Add($cursor.GetType().FullName)
+            if ($cursor -is [ComponentModel.Win32Exception]) {
+                $nativeFailure = $cursor
+                break
+            }
+            $cursor = $cursor.InnerException
+        }
+
+        if ($null -ne $nativeFailure) {
+            $nativeError = [int]$nativeFailure.NativeErrorCode
+            $remediation = switch ($nativeError) {
+                { $_ -eq 2 -or $_ -eq 3 } {
+                    'preserve the destination, restore or correct the exact source ' +
+                    'namespace, then retry only the same no-replace move'
+                    break
+                }
+                { $_ -eq 80 -or $_ -eq 183 } {
+                    'preserve both objects and choose a verified absent destination ' +
+                    'or reconcile the existing object; never delete or replace it'
+                    break
+                }
+                17 {
+                    'choose a destination on the source volume; cross-volume ' +
+                    'copy/delete fallback is intentionally forbidden'
+                    break
+                }
+                5 {
+                    'inspect access control and open-handle sharing on both exact ' +
+                    'paths, repair authorization, and retry without bypassing it'
+                    break
+                }
+                default {
+                    'inspect the exact Win32 error, namespaces, volume, access ' +
+                    'control, and sharing state; repair the cause and retry only ' +
+                    'this no-replace write-through operation'
+                }
+            }
+            Throw-AstroFileMoveFailure `
+                -Code 'ASTRO_FILE_MOVE_NATIVE_FAILED' `
+                -Message $nativeFailure.Message `
+                -Remediation $remediation `
+                -SourcePath $sourceFull `
+                -DestinationPath $destinationFull `
+                -NativeErrorCode $nativeError
+        }
+
+        Throw-AstroFileMoveFailure `
+            -Code 'ASTRO_FILE_MOVE_INTEROP_FAILED' `
+            -Message (
+                "managed/native invocation failed (types=$($typeChain -join ' -> '), " +
+                "message=$($failure.Message))"
+            ) `
+            -Remediation (
+                'verify the pinned Windows runtime and the exact MoveFileExW ' +
+                'binding, repair the interop defect, and retry without fallback'
+            ) `
+            -SourcePath $sourceFull `
+            -DestinationPath $destinationFull
     }
 }
 
