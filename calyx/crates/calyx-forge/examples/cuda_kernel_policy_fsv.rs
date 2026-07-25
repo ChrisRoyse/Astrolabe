@@ -21,6 +21,7 @@ mod enabled {
         pack_mxfp4_a_row_major, pack_mxfp4_b_column_major, pack_mxfp8_a_row_major,
         pack_mxfp8_b_column_major,
     };
+    #[cfg(feature = "cuda-policy-measurement")]
     use cudarc::driver::{LaunchConfig, PushKernelArg};
     #[cfg(feature = "cuda-policy-measurement")]
     use cudarc::nvrtc::Ptx;
@@ -1567,6 +1568,7 @@ mod enabled {
             .collect()
     }
 
+    #[cfg(feature = "cuda-policy-measurement")]
     fn hex(bytes: &[u8]) -> String {
         bytes.iter().map(|byte| format!("{byte:02x}")).collect()
     }
