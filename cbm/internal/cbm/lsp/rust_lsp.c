@@ -4060,10 +4060,11 @@ static void rust_expand_user_macro(RustLSPContext *ctx, const char *mname, TSNod
 /* Known standard macros do not share one argument grammar.  Treating every raw
  * token tree as a tuple expression loses valid `vec![value; count]` and named
  * formatting operands, while walking token soup can invent calls in tokens the
- * macro never evaluates.  Split only at top-level separators, validate the
- * exact selected macro grammar, and parse each evaluated operand independently.
- * Any unsupported form or parser failure makes the arena sticky-failed, so an
- * incomplete file can never be published as a complete semantic graph. */
+ * macro never evaluates.  Reparse the whole input with Rust's expression grammar
+ * to recover exact operand spans, validate the selected macro's semantic grammar,
+ * and parse each evaluated operand independently.  Any unsupported form or
+ * parser failure makes the arena sticky-failed, so an incomplete file can never
+ * be published as a complete semantic graph. */
 typedef struct {
     const MacroToken *first;
     const MacroToken *last;
@@ -4076,56 +4077,180 @@ static bool rust_known_macro_fail(RustLSPContext *ctx, const char *operation, si
     return false;
 }
 
-static bool rust_known_macro_parse_args(RustLSPContext *ctx, const char *source, size_t source_len,
+static bool rust_known_macro_parse_args(RustLSPContext *ctx, const char *macro_name,
+                                        const char *source, size_t source_len,
                                         RustKnownMacroArg **out_args, size_t *out_count) {
     MacroToken *tokens = NULL;
     if (!macro_lex(ctx, source, source_len, &tokens)) {
         return false;
     }
 
+    if (source_len > (size_t)INT_MAX || source_len > UINT32_MAX) {
+        cbm_arena_mark_failed(ctx->arena, "CBM_RUST_KNOWN_MACRO_EXPRESSION_OVERFLOW",
+                              "rust_lsp_known_macro_argument_source", source_len);
+        return false;
+    }
+    bool vec_macro = strcmp(macro_name, "vec") == 0;
+    const char *prefix =
+        vec_macro ? "fn __cbm_macro_args() { let _ = [" : "fn __cbm_macro_args() { __cbm_macro(";
+    const char *suffix = vec_macro ? "]; }\n" : "); }\n";
+    size_t prefix_len = strlen(prefix);
+    size_t wrapper_len = prefix_len + source_len + strlen(suffix);
+    if (wrapper_len > UINT32_MAX || wrapper_len > (size_t)INT_MAX ||
+        !macro_work(ctx, wrapper_len, "rust_lsp_known_macro_argument_grammar")) {
+        if (!cbm_arena_failed(ctx->arena)) {
+            cbm_arena_mark_failed(ctx->arena, "CBM_RUST_KNOWN_MACRO_EXPRESSION_OVERFLOW",
+                                  "rust_lsp_known_macro_argument_wrapper", wrapper_len);
+        }
+        return false;
+    }
+    char *wrapped =
+        cbm_arena_sprintf(ctx->arena, "%s%.*s%s", prefix, (int)source_len, source, suffix);
+    if (!wrapped) {
+        return false;
+    }
+
+    TSParser *parser = ts_parser_new();
+    if (!parser) {
+        cbm_arena_mark_failed(ctx->arena, "CBM_RUST_MACRO_PARSER_ALLOC_FAILED",
+                              "rust_lsp_known_macro_argument_parser_new", wrapper_len);
+        return false;
+    }
+    if (!ts_parser_set_language(parser, tree_sitter_rust())) {
+        cbm_arena_mark_failed(ctx->arena, "CBM_RUST_MACRO_GRAMMAR_ABI_MISMATCH",
+                              "rust_lsp_known_macro_argument_parser_language", wrapper_len);
+        ts_parser_delete(parser);
+        return false;
+    }
+    TSTree *tree = ts_parser_parse_string(parser, NULL, wrapped, (uint32_t)wrapper_len);
+    if (!tree) {
+        cbm_arena_mark_failed(ctx->arena, "CBM_RUST_KNOWN_MACRO_PARSE_FAILED",
+                              "rust_lsp_known_macro_argument_grammar", source_len);
+        ts_parser_delete(parser);
+        return false;
+    }
+    TSNode root = ts_tree_root_node(tree);
+    if (ts_node_has_error(root)) {
+        ts_tree_delete(tree);
+        ts_parser_delete(parser);
+        return rust_known_macro_fail(ctx, "rust_lsp_known_macro_argument_grammar", source_len);
+    }
+
+    const char *marker = vec_macro ? "[" : "__cbm_macro(";
+    const char *marker_at = strstr(prefix, marker);
+    if (!marker_at) {
+        ts_tree_delete(tree);
+        ts_parser_delete(parser);
+        return rust_known_macro_fail(ctx, "rust_lsp_known_macro_wrapper_marker", source_len);
+    }
+    uint32_t outer_start = (uint32_t)(marker_at - prefix);
+    uint32_t outer_end = (uint32_t)(prefix_len + source_len + 1);
+    TSNode outer = ts_node_named_descendant_for_byte_range(root, outer_start, outer_end);
+    const char *expected_type = vec_macro ? "array_expression" : "call_expression";
+    if (ts_node_is_null(outer) || strcmp(ts_node_type(outer), expected_type) != 0 ||
+        ts_node_start_byte(outer) != outer_start || ts_node_end_byte(outer) != outer_end) {
+        ts_tree_delete(tree);
+        ts_parser_delete(parser);
+        return rust_known_macro_fail(ctx, "rust_lsp_known_macro_wrapper_shape", source_len);
+    }
+    TSNode operands = outer;
+    if (!vec_macro) {
+        operands = ts_node_child_by_field_name(outer, "arguments", 9);
+        if (ts_node_is_null(operands) || strcmp(ts_node_type(operands), "arguments") != 0) {
+            ts_tree_delete(tree);
+            ts_parser_delete(parser);
+            return rust_known_macro_fail(ctx, "rust_lsp_known_macro_arguments_node", source_len);
+        }
+    }
+
+    TSNode *operand_nodes = NULL;
+    size_t operand_count = 0;
+    size_t operand_capacity = 0;
+    for (uint32_t i = 0; i < ts_node_named_child_count(operands); i++) {
+        TSNode child = ts_node_named_child(operands, i);
+        if (ts_node_is_null(child) || ts_node_is_extra(child)) {
+            continue;
+        }
+        if (!cbm_lsp_semantic_array_reserve(
+                ctx->arena, (void **)&operand_nodes, operand_count, &operand_capacity,
+                sizeof(*operand_nodes), operand_count + 1, "rust known macro grammar operands")) {
+            ts_tree_delete(tree);
+            ts_parser_delete(parser);
+            return false;
+        }
+        operand_nodes[operand_count++] = child;
+    }
+
     RustKnownMacroArg *args = NULL;
     size_t count = 0;
     size_t capacity = 0;
-    const MacroToken *first = NULL;
-    const MacroToken *last = NULL;
-    for (const MacroToken *token = tokens; token; token = token->next) {
-        bool separator = macro_token_text_is(token, ",") || macro_token_text_is(token, ";");
-        if (!separator) {
-            if (!first) {
-                first = token;
+    const MacroToken *cursor = tokens;
+    for (size_t i = 0; i < operand_count; i++) {
+        uint32_t wrapped_start = ts_node_start_byte(operand_nodes[i]);
+        uint32_t wrapped_end = ts_node_end_byte(operand_nodes[i]);
+        if (wrapped_start < prefix_len || wrapped_end <= wrapped_start ||
+            wrapped_end > prefix_len + source_len) {
+            ts_tree_delete(tree);
+            ts_parser_delete(parser);
+            return rust_known_macro_fail(ctx, "rust_lsp_known_macro_operand_range", i);
+        }
+        const char *operand_start = source + (wrapped_start - (uint32_t)prefix_len);
+        const char *operand_end = source + (wrapped_end - (uint32_t)prefix_len);
+        if (!cursor || cursor->text != operand_start) {
+            ts_tree_delete(tree);
+            ts_parser_delete(parser);
+            return rust_known_macro_fail(ctx, "rust_lsp_known_macro_operand_start", i);
+        }
+        const MacroToken *first = cursor;
+        const MacroToken *last = NULL;
+        while (cursor && cursor->text + cursor->len <= operand_end) {
+            last = cursor;
+            cursor = cursor->next;
+        }
+        if (!last || last->text + last->len != operand_end) {
+            ts_tree_delete(tree);
+            ts_parser_delete(parser);
+            return rust_known_macro_fail(ctx, "rust_lsp_known_macro_operand_end", i);
+        }
+        char separator = 0;
+        if (cursor && (macro_token_text_is(cursor, ",") || macro_token_text_is(cursor, ";"))) {
+            separator = cursor->text[0];
+            cursor = cursor->next;
+        }
+        if (i + 1 < operand_count) {
+            uint32_t next_start = ts_node_start_byte(operand_nodes[i + 1]);
+            const char *expected_next = source + (next_start - (uint32_t)prefix_len);
+            if (!separator || !cursor || cursor->text != expected_next) {
+                ts_tree_delete(tree);
+                ts_parser_delete(parser);
+                return rust_known_macro_fail(ctx, "rust_lsp_known_macro_operand_separator", i);
             }
-            last = token;
-            continue;
-        }
-        if (!first || !last) {
-            return rust_known_macro_fail(ctx, "rust_lsp_known_macro_empty_operand", source_len);
+        } else if (cursor) {
+            ts_tree_delete(tree);
+            ts_parser_delete(parser);
+            return rust_known_macro_fail(ctx, "rust_lsp_known_macro_trailing_tokens", i);
         }
         if (!cbm_lsp_semantic_array_reserve(ctx->arena, (void **)&args, count, &capacity,
                                             sizeof(*args), count + 1,
                                             "rust known macro argument spans")) {
+            ts_tree_delete(tree);
+            ts_parser_delete(parser);
             return false;
         }
         args[count++] = (RustKnownMacroArg){
             .first = first,
             .last = last,
-            .separator_after = token->text[0],
+            .separator_after = separator,
         };
-        first = NULL;
-        last = NULL;
     }
-    if (first && last) {
-        if (!cbm_lsp_semantic_array_reserve(ctx->arena, (void **)&args, count, &capacity,
-                                            sizeof(*args), count + 1,
-                                            "rust known macro argument spans")) {
-            return false;
-        }
-        args[count++] = (RustKnownMacroArg){
-            .first = first,
-            .last = last,
-            .separator_after = 0,
-        };
+    if ((operand_count == 0 && tokens) || cursor) {
+        ts_tree_delete(tree);
+        ts_parser_delete(parser);
+        return rust_known_macro_fail(ctx, "rust_lsp_known_macro_unmapped_tokens", source_len);
     }
 
+    ts_tree_delete(tree);
+    ts_parser_delete(parser);
     *out_args = args;
     *out_count = count;
     return true;
@@ -4151,6 +4276,101 @@ static bool macro_token_is_string_literal(const MacroToken *token) {
         return macro_scan_quoted(token->text, token->len, 0, '"') == token->len;
     }
     return token->text[0] == 'r' && macro_scan_raw_string(token->text, token->len, 0) == token->len;
+}
+
+static bool macro_token_is_concat_literal(const MacroToken *token) {
+    if (!macro_token_is_literal(token)) {
+        return false;
+    }
+    if (macro_token_is_string_literal(token) || macro_token_text_is(token, "true") ||
+        macro_token_text_is(token, "false") || isdigit((unsigned char)token->text[0]) ||
+        token->text[0] == '\'') {
+        return true;
+    }
+    /* rustc rejects byte/byte-string and C-string literals in concat!. */
+    return false;
+}
+
+static bool rust_literal_producer_arg(RustLSPContext *ctx, const RustKnownMacroArg *arg,
+                                      size_t depth);
+
+static bool rust_concat_literal_arg(RustLSPContext *ctx, const RustKnownMacroArg *arg,
+                                    size_t depth) {
+    if (!arg || !arg->first || !arg->last) {
+        return false;
+    }
+    if (arg->first == arg->last && macro_token_is_concat_literal(arg->first)) {
+        return true;
+    }
+    const MacroToken *minus = arg->first;
+    const MacroToken *number = minus ? minus->next : NULL;
+    if (number && number == arg->last && macro_token_text_is(minus, "-") && !number->open &&
+        number->len > 0 && isdigit((unsigned char)number->text[0])) {
+        return true;
+    }
+    return rust_literal_producer_arg(ctx, arg, depth);
+}
+
+static bool rust_literal_producer_arg(RustLSPContext *ctx, const RustKnownMacroArg *arg,
+                                      size_t depth) {
+    if (!ctx || !arg || !arg->first || !arg->last) {
+        return false;
+    }
+    if (arg->first == arg->last && macro_token_is_string_literal(arg->first)) {
+        return true;
+    }
+    if (depth >= (size_t)ctx->macro_expand_depth_limit) {
+        cbm_arena_mark_failed(ctx->arena, "CBM_LSP_ANALYSIS_LIMIT_EXCEEDED",
+                              "rust_lsp_literal_producer_depth", depth);
+        return false;
+    }
+    const MacroToken *name = arg->first;
+    const MacroToken *bang = name->next;
+    const MacroToken *group = bang ? bang->next : NULL;
+    if (!macro_token_is_identifier(name) || !macro_token_text_is(bang, "!") || !group ||
+        !group->open || group != arg->last) {
+        return false;
+    }
+
+    if (macro_token_text_is(name, "stringify")) {
+        /* Rust accepts any balanced token tree, including an empty one. */
+        return true;
+    }
+    if (macro_token_text_is(name, "file") || macro_token_text_is(name, "module_path")) {
+        return group->children == NULL;
+    }
+
+    bool concat = macro_token_text_is(name, "concat");
+    bool env = macro_token_text_is(name, "env");
+    bool include_str = macro_token_text_is(name, "include_str");
+    if (!concat && !env && !include_str) {
+        return false;
+    }
+    if (group->len < 2) {
+        return false;
+    }
+    RustKnownMacroArg *nested = NULL;
+    size_t nested_count = 0;
+    const char *inner = group->text + 1;
+    size_t inner_len = group->len - 2;
+    const char *producer_name = concat ? "concat" : (env ? "env" : "include_str");
+    if (!rust_known_macro_parse_args(ctx, producer_name, inner, inner_len, &nested,
+                                     &nested_count) ||
+        !rust_known_macro_comma_list(ctx, nested, nested_count,
+                                     "rust_lsp_literal_producer_separators")) {
+        return false;
+    }
+    if ((env && (nested_count == 0 || nested_count > 2)) || (include_str && nested_count != 1)) {
+        return false;
+    }
+    for (size_t i = 0; i < nested_count; i++) {
+        bool valid = concat ? rust_concat_literal_arg(ctx, &nested[i], depth + 1)
+                            : rust_literal_producer_arg(ctx, &nested[i], depth + 1);
+        if (!valid) {
+            return false;
+        }
+    }
+    return true;
 }
 
 static bool rust_resolve_known_macro_expr(RustLSPContext *ctx, const RustKnownMacroArg *arg,
@@ -4280,8 +4500,7 @@ static bool rust_resolve_format_macro_args(RustLSPContext *ctx, const char *macr
     }
 
     const RustKnownMacroArg *format_arg = &args[format_index];
-    bool format_literal =
-        format_arg->first == format_arg->last && macro_token_is_string_literal(format_arg->first);
+    bool format_literal = rust_literal_producer_arg(ctx, format_arg, 0);
     if (!format_literal) {
         if (panic_macro && count == 1) {
             return rust_resolve_known_macro_expr(ctx, format_arg, NULL,
@@ -4352,6 +4571,9 @@ static bool rust_resolve_fixed_macro_args(RustLSPContext *ctx, const char *macro
         return rust_known_macro_fail(ctx, "rust_lsp_fixed_macro_cardinality", count);
     }
     for (size_t i = 0; i < count; i++) {
+        if (!rust_literal_producer_arg(ctx, &args[i], 0)) {
+            return rust_known_macro_fail(ctx, "rust_lsp_fixed_macro_literal_operand", i);
+        }
         if (!rust_resolve_known_macro_expr(ctx, &args[i], NULL, "rust_lsp_fixed_macro_operand")) {
             return false;
         }
@@ -4365,6 +4587,9 @@ static bool rust_resolve_concat_macro_args(RustLSPContext *ctx, const RustKnownM
         return false;
     }
     for (size_t i = 0; i < count; i++) {
+        if (!rust_concat_literal_arg(ctx, &args[i], 0)) {
+            return rust_known_macro_fail(ctx, "rust_lsp_concat_macro_literal_operand", i);
+        }
         if (!rust_resolve_known_macro_expr(ctx, &args[i], NULL, "rust_lsp_concat_macro_operand")) {
             return false;
         }
@@ -4405,7 +4630,7 @@ static bool rust_resolve_known_macro_args(RustLSPContext *ctx, const char *macro
 
     RustKnownMacroArg *args = NULL;
     size_t count = 0;
-    if (!rust_known_macro_parse_args(ctx, inner, (size_t)inner_len, &args, &count)) {
+    if (!rust_known_macro_parse_args(ctx, macro_name, inner, (size_t)inner_len, &args, &count)) {
         return false;
     }
 
