@@ -12,6 +12,7 @@
  */
 #include "foundation/compat.h"
 #include "foundation/constants.h"
+#include "foundation/platform.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -162,12 +163,13 @@ int cbm_mkstemp(char *tmpl, size_t capacity) {
 
 #ifdef _WIN32
 int cbm_clock_gettime(int clk_id, struct timespec *tp) {
-    (void)clk_id;
-    LARGE_INTEGER freq, count;
-    QueryPerformanceFrequency(&freq);
-    QueryPerformanceCounter(&count);
-    tp->tv_sec = (time_t)(count.QuadPart / freq.QuadPart);
-    tp->tv_nsec = (long)((count.QuadPart % freq.QuadPart) * 1000000000LL / freq.QuadPart);
+    if (clk_id != CLOCK_MONOTONIC || !tp) {
+        errno = EINVAL;
+        return -1;
+    }
+    uint64_t now_ns = cbm_now_ns();
+    tp->tv_sec = (time_t)(now_ns / CBM_NSEC_PER_SEC);
+    tp->tv_nsec = (long)(now_ns % CBM_NSEC_PER_SEC);
     return 0;
 }
 #endif

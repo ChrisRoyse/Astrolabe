@@ -12,6 +12,7 @@
 #include <fcntl.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 /* Canonicalize a Windows drive letter to upper-case in place: "c:/x" -> "C:/x".
@@ -89,17 +90,126 @@ void cbm_munmap(void *addr, size_t size) {
     }
 }
 
-uint64_t cbm_now_ns(void) {
-    LARGE_INTEGER freq, count;
-    QueryPerformanceFrequency(&freq);
-    QueryPerformanceCounter(&count);
-    return (uint64_t)count.QuadPart * 1000000000ULL / (uint64_t)freq.QuadPart;
+static INIT_ONCE cbm_qpc_frequency_once = INIT_ONCE_STATIC_INIT;
+static uint64_t cbm_qpc_frequency_hz;
+static DWORD cbm_qpc_frequency_error;
+static bool cbm_qpc_frequency_query_failed;
+
+static _Noreturn void cbm_windows_clock_fail(const char *code, DWORD native_error,
+                                             const char *message, const char *remediation) {
+    fprintf(stderr,
+            "level=fatal msg=platform.clock_failed code=%s native_error_kind=win32 "
+            "native_error=%lu message=%s remediation=%s\n",
+            code, (unsigned long)native_error, message, remediation);
+    fflush(stderr);
+    abort();
 }
 
-#define CBM_USEC_PER_SEC 1000000ULL
+static BOOL CALLBACK cbm_initialize_qpc_frequency(PINIT_ONCE once, PVOID parameter,
+                                                  PVOID *context) {
+    (void)once;
+    (void)parameter;
+    (void)context;
+
+    LARGE_INTEGER frequency;
+    if (!QueryPerformanceFrequency(&frequency)) {
+        cbm_qpc_frequency_query_failed = true;
+        cbm_qpc_frequency_error = GetLastError();
+        if (cbm_qpc_frequency_error == ERROR_SUCCESS) {
+            cbm_qpc_frequency_error = ERROR_GEN_FAILURE;
+        }
+        return TRUE;
+    }
+    if (frequency.QuadPart <= 0) {
+        cbm_qpc_frequency_error = ERROR_INVALID_DATA;
+        return TRUE;
+    }
+
+    uint64_t frequency_hz = (uint64_t)frequency.QuadPart;
+    if (frequency_hz - 1 > UINT64_MAX / CBM_NSEC_PER_SEC) {
+        cbm_qpc_frequency_error = ERROR_ARITHMETIC_OVERFLOW;
+        return TRUE;
+    }
+
+    cbm_qpc_frequency_hz = frequency_hz;
+    return TRUE;
+}
+
+static uint64_t cbm_get_qpc_frequency(void) {
+    if (!InitOnceExecuteOnce(&cbm_qpc_frequency_once, cbm_initialize_qpc_frequency, NULL, NULL)) {
+        DWORD native_error = GetLastError();
+        if (native_error == ERROR_SUCCESS) {
+            native_error = ERROR_GEN_FAILURE;
+        }
+        cbm_windows_clock_fail("CBM_CLOCK_FREQUENCY_INIT_FAILED", native_error,
+                               "QueryPerformanceFrequency_initialization_failed",
+                               "resolve_the_reported_Windows_clock_failure_and_retry");
+    }
+    if (cbm_qpc_frequency_error != ERROR_SUCCESS) {
+        if (cbm_qpc_frequency_query_failed) {
+            cbm_windows_clock_fail("CBM_CLOCK_FREQUENCY_READ_FAILED", cbm_qpc_frequency_error,
+                                   "QueryPerformanceFrequency_failed",
+                                   "resolve_the_reported_Windows_clock_failure_and_retry");
+        }
+        cbm_windows_clock_fail("CBM_CLOCK_FREQUENCY_INVALID", cbm_qpc_frequency_error,
+                               "QueryPerformanceFrequency_returned_an_unusable_value",
+                               "repair_the_Windows_high_resolution_clock_and_retry");
+    }
+    return cbm_qpc_frequency_hz;
+}
+
+static uint64_t cbm_qpc_ticks_to_ns(uint64_t ticks, uint64_t frequency_hz) {
+    if (frequency_hz == 0) {
+        cbm_windows_clock_fail("CBM_CLOCK_FREQUENCY_INVALID", ERROR_INVALID_DATA,
+                               "QPC_frequency_is_zero",
+                               "repair_the_Windows_high_resolution_clock_and_retry");
+    }
+    if (frequency_hz - 1 > UINT64_MAX / CBM_NSEC_PER_SEC) {
+        cbm_windows_clock_fail("CBM_CLOCK_FREQUENCY_INVALID", ERROR_ARITHMETIC_OVERFLOW,
+                               "QPC_frequency_cannot_be_scaled_to_nanoseconds",
+                               "repair_the_Windows_high_resolution_clock_and_retry");
+    }
+
+    uint64_t whole_seconds = ticks / frequency_hz;
+    uint64_t remainder_ticks = ticks % frequency_hz;
+    if (whole_seconds > UINT64_MAX / CBM_NSEC_PER_SEC) {
+        cbm_windows_clock_fail("CBM_CLOCK_CONVERSION_OVERFLOW", ERROR_ARITHMETIC_OVERFLOW,
+                               "QPC_whole_seconds_cannot_be_represented_in_nanoseconds",
+                               "restart_on_a_supported_Windows_clock_epoch");
+    }
+
+    uint64_t whole_nanoseconds = whole_seconds * CBM_NSEC_PER_SEC;
+    uint64_t fractional_nanoseconds = remainder_ticks * CBM_NSEC_PER_SEC / frequency_hz;
+    if (fractional_nanoseconds > UINT64_MAX - whole_nanoseconds) {
+        cbm_windows_clock_fail("CBM_CLOCK_CONVERSION_OVERFLOW", ERROR_ARITHMETIC_OVERFLOW,
+                               "QPC_timestamp_cannot_be_represented_in_nanoseconds",
+                               "restart_on_a_supported_Windows_clock_epoch");
+    }
+    return whole_nanoseconds + fractional_nanoseconds;
+}
+
+uint64_t cbm_now_ns(void) {
+    uint64_t frequency_hz = cbm_get_qpc_frequency();
+    LARGE_INTEGER counter;
+    if (!QueryPerformanceCounter(&counter)) {
+        DWORD native_error = GetLastError();
+        if (native_error == ERROR_SUCCESS) {
+            native_error = ERROR_GEN_FAILURE;
+        }
+        cbm_windows_clock_fail("CBM_CLOCK_COUNTER_READ_FAILED", native_error,
+                               "QueryPerformanceCounter_failed",
+                               "resolve_the_reported_Windows_clock_failure_and_retry");
+    }
+    if (counter.QuadPart < 0) {
+        cbm_windows_clock_fail("CBM_CLOCK_COUNTER_INVALID", ERROR_INVALID_DATA,
+                               "QueryPerformanceCounter_returned_a_negative_value",
+                               "repair_the_Windows_high_resolution_clock_and_retry");
+    }
+    return cbm_qpc_ticks_to_ns((uint64_t)counter.QuadPart, frequency_hz);
+}
 
 uint64_t cbm_now_ms(void) {
-    return cbm_now_ns() / CBM_USEC_PER_SEC;
+    return cbm_now_ns() / CBM_NSEC_PER_MSEC;
 }
 
 int cbm_nprocs(void) {
