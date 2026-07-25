@@ -1732,6 +1732,175 @@ static source_path_status_t normalize_source_candidate(char *path) {
     return out > 0 ? SOURCE_PATH_NORMALIZED : SOURCE_PATH_INVALID;
 }
 
+static char *replace_source_extension(const char *path, size_t suffix_len,
+                                      const char *replacement) {
+    size_t path_len = path ? strlen(path) : 0;
+    size_t replacement_len = replacement ? strlen(replacement) : 0;
+    if (!path || suffix_len > path_len || replacement_len > SIZE_MAX - (path_len - suffix_len) - 1) {
+        return NULL;
+    }
+    size_t stem_len = path_len - suffix_len;
+    char *result = malloc(stem_len + replacement_len + 1);
+    if (!result) {
+        return NULL;
+    }
+    memcpy(result, path, stem_len);
+    memcpy(result + stem_len, replacement, replacement_len);
+    result[stem_len + replacement_len] = '\0';
+    return result;
+}
+
+/* Resolve the source file behind an explicit relative ECMAScript runtime
+ * extension. TypeScript's documented substitution order is retained in cands,
+ * but graph provenance is stricter than compiler winner selection: more than
+ * one live exact source is ambiguous corpus state and zero is a missing asserted
+ * dependency. Either condition refuses before semantic-QN lookup. */
+static const cbm_gbuf_node_t *resolve_es_extension_substitution(
+    const cbm_pipeline_ctx_t *ctx, const char *source_rel, const char *module_path,
+    bool *out_applicable) {
+    if (out_applicable) {
+        *out_applicable = false;
+    }
+    if (!ctx || !source_rel || !module_path || !out_applicable ||
+        !((module_path[0] == '.' && module_path[1] == '/') ||
+          (module_path[0] == '.' && module_path[1] == '.' && module_path[2] == '/'))) {
+        return NULL;
+    }
+
+    const char *replacements[5] = {0};
+    size_t suffix_len = 0;
+    int candidate_count = 0;
+    if (ends_with(module_path, ".mjs")) {
+        const char *family[] = {".mts", ".d.mts", ".mjs"};
+        memcpy(replacements, family, sizeof(family));
+        suffix_len = strlen(".mjs");
+        candidate_count = 3;
+    } else if (ends_with(module_path, ".cjs")) {
+        const char *family[] = {".cts", ".d.cts", ".cjs"};
+        memcpy(replacements, family, sizeof(family));
+        suffix_len = strlen(".cjs");
+        candidate_count = 3;
+    } else if (ends_with(module_path, ".jsx")) {
+        const char *family[] = {".tsx", ".d.ts", ".jsx"};
+        memcpy(replacements, family, sizeof(family));
+        suffix_len = strlen(".jsx");
+        candidate_count = 3;
+    } else if (ends_with(module_path, ".js")) {
+        const char *family[] = {".ts", ".tsx", ".d.ts", ".js", ".jsx"};
+        memcpy(replacements, family, sizeof(family));
+        suffix_len = strlen(".js");
+        candidate_count = 5;
+    } else {
+        return NULL;
+    }
+    *out_applicable = true;
+
+    char *dir = path_dirname(source_rel);
+    char *runtime_path = dir ? concat3(dir, dir[0] ? "/" : "", module_path) : NULL;
+    free(dir);
+    if (!runtime_path) {
+        goto allocation_failed;
+    }
+    source_path_status_t path_status = normalize_source_candidate(runtime_path);
+    if (path_status == SOURCE_PATH_ALLOC_FAILED) {
+        free(runtime_path);
+        goto allocation_failed;
+    }
+    if (path_status != SOURCE_PATH_NORMALIZED) {
+        cbm_log_error("pkgmap.es_substitution_failed", "code", "CBM_IMPORT_ES_PATH_INVALID",
+                      "source", source_rel, "module", module_path, "message",
+                      "relative ECMAScript import path cannot identify a repository source",
+                      "remediation", "repair the relative import path and retry indexing");
+        free(runtime_path);
+        cbm_gbuf_refuse_resolution(ctx->gbuf);
+        if (ctx->cancelled) {
+            atomic_store(ctx->cancelled, SKIP_ONE);
+        }
+        return NULL;
+    }
+
+    char *cands[5] = {0};
+    const cbm_gbuf_node_t *matches[5] = {0};
+    int match_count = 0;
+    for (int i = 0; i < candidate_count; i++) {
+        cands[i] = replace_source_extension(runtime_path, suffix_len, replacements[i]);
+        if (!cands[i]) {
+            free(runtime_path);
+            for (int j = 0; j < candidate_count; j++) {
+                free(cands[j]);
+            }
+            goto allocation_failed;
+        }
+        const cbm_gbuf_node_t *candidate =
+            cbm_gbuf_find_source_container(ctx->gbuf, "Module", cands[i]);
+        if (cbm_gbuf_resolution_failed(ctx->gbuf)) {
+            free(runtime_path);
+            for (int j = 0; j < candidate_count; j++) {
+                free(cands[j]);
+            }
+            if (ctx->cancelled) {
+                atomic_store(ctx->cancelled, SKIP_ONE);
+            }
+            return NULL;
+        }
+        if (candidate) {
+            matches[match_count++] = candidate;
+        }
+    }
+    free(runtime_path);
+
+    if (match_count == 1) {
+        const cbm_gbuf_node_t *result = matches[0];
+        for (int i = 0; i < candidate_count; i++) {
+            free(cands[i]);
+        }
+        return result;
+    }
+
+    const char *candidate_atoms[5] = {"", "", "", "", ""};
+    for (int i = 0; i < candidate_count; i++) {
+        const cbm_gbuf_node_t *candidate =
+            cbm_gbuf_find_source_container(ctx->gbuf, "Module", cands[i]);
+        if (candidate && candidate->atom_id) {
+            candidate_atoms[i] = candidate->atom_id;
+        }
+    }
+    char match_count_text[PKGMAP_ITOA_BUF];
+    snprintf(match_count_text, sizeof(match_count_text), "%d", match_count);
+    cbm_log_error(
+        "pkgmap.es_substitution_failed", "code",
+        match_count == 0 ? "CBM_IMPORT_ES_SOURCE_MISSING" : "CBM_IMPORT_ES_SOURCE_AMBIGUOUS",
+        "source", source_rel, "module", module_path, "match_count", match_count_text,
+        "candidate_1_path", cands[0] ? cands[0] : "", "candidate_1_atom_id", candidate_atoms[0],
+        "candidate_2_path", cands[1] ? cands[1] : "", "candidate_2_atom_id", candidate_atoms[1],
+        "candidate_3_path", cands[2] ? cands[2] : "", "candidate_3_atom_id", candidate_atoms[2],
+        "candidate_4_path", cands[3] ? cands[3] : "", "candidate_4_atom_id", candidate_atoms[3],
+        "candidate_5_path", cands[4] ? cands[4] : "", "candidate_5_atom_id", candidate_atoms[4],
+        "message", match_count == 0 ? "no exact source exists for the extension substitution family"
+                                    : "multiple exact sources exist for one runtime import spelling",
+        "remediation", match_count == 0 ? "restore the exact imported source or repair the specifier"
+                                        : "remove the conflicting source candidates and retry indexing");
+    for (int i = 0; i < candidate_count; i++) {
+        free(cands[i]);
+    }
+    cbm_gbuf_refuse_resolution(ctx->gbuf);
+    if (ctx->cancelled) {
+        atomic_store(ctx->cancelled, SKIP_ONE);
+    }
+    return NULL;
+
+allocation_failed:
+    cbm_log_error("pkgmap.es_substitution_failed", "code", "CBM_IMPORT_ES_SUBSTITUTION_ALLOC_FAILED",
+                  "source", source_rel ? source_rel : "", "module", module_path ? module_path : "",
+                  "message", "extension substitution could not allocate every ordered path",
+                  "remediation", "free memory or reduce the import path size, then retry indexing");
+    cbm_gbuf_refuse_resolution(ctx->gbuf);
+    if (ctx->cancelled) {
+        atomic_store(ctx->cancelled, SKIP_ONE);
+    }
+    return NULL;
+}
+
 /* Resolve a sibling-file import: a bare path/name (no leading "./") that names
  * a file relative to the importer's directory.  This covers build/markup
  * grammars whose import string is a sibling filename or directory rather than a
@@ -1891,6 +2060,15 @@ const cbm_gbuf_node_t *cbm_pipeline_resolve_import_node(const cbm_pipeline_ctx_t
      * to a repository sibling would be fabricated provenance. */
     if (imp->resolution == CBM_IMPORT_RESOLVE_EXTERNAL_SOURCE) {
         return NULL;
+    }
+
+    if (imp->resolution == CBM_IMPORT_RESOLVE_ES_SOURCE) {
+        bool substitution_applies = false;
+        const cbm_gbuf_node_t *substituted = resolve_es_extension_substitution(
+            ctx, source_rel, imp->module_path, &substitution_applies);
+        if (substitution_applies) {
+            return substituted;
+        }
     }
 
     /* Strategy 1: exact source-path resolution. C/C++ includes and other

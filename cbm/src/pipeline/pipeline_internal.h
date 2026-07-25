@@ -183,7 +183,9 @@ char *cbm_pipeline_resolve_module(const cbm_pipeline_ctx_t *ctx, const char *sou
  * Exact source-path candidates are evaluated together and multiple distinct
  * matches refuse persistence. Only after no exact source exists does semantic
  * resolution proceed:
- *   1. Exact source-backed Module by repository-relative file_path.
+ *   1. Exact source-backed Module by repository-relative file_path. Relative
+ *      ECMAScript runtime extensions first use their ordered TypeScript source
+ *      substitution family; zero or multiple live candidates refuse.
  *   2. Module-path resolution (relative / pkgmap / fqn_module) → existing node.
  *      This preserves the behavior for Python/TS/Go whose module path maps
  *      directly to a sibling Module/File QN.

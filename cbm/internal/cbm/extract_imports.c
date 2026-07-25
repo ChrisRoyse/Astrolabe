@@ -350,6 +350,14 @@ static void parse_python_imports(CBMExtractCtx *ctx) {
 // import X from "Y"; import {A, B} from "Y"; import * as X from "Y"
 // const X = require("Y")
 
+static CBMImport make_es_import(const char *local_name, const char *module_path) {
+    return (CBMImport){
+        .local_name = local_name,
+        .module_path = module_path,
+        .resolution = CBM_IMPORT_RESOLVE_ES_SOURCE,
+    };
+}
+
 // Find the source string node in an ES import_statement.
 static TSNode find_es_source_node(TSNode node) {
     TSNode source_node = ts_node_child_by_field_name(node, TS_FIELD("source"));
@@ -384,7 +392,7 @@ static bool process_named_imports(CBMExtractCtx *ctx, TSNode sub, const char *pa
         if (!ts_node_is_null(orig)) {
             char *local_name = !ts_node_is_null(local) ? cbm_node_text(a, local, ctx->source)
                                                        : cbm_node_text(a, orig, ctx->source);
-            CBMImport imp = {.local_name = local_name, .module_path = path};
+            CBMImport imp = make_es_import(local_name, path);
             if (!cbm_imports_push(&ctx->result->imports, a, imp)) {
                 return false;
             }
@@ -404,7 +412,7 @@ static bool process_import_clause(CBMExtractCtx *ctx, TSNode clause, const char 
         const char *sk = ts_node_type(sub);
         if (strcmp(sk, "identifier") == 0) {
             char *name = cbm_node_text(a, sub, ctx->source);
-            CBMImport imp = {.local_name = name, .module_path = path};
+            CBMImport imp = make_es_import(name, path);
             if (!cbm_imports_push(&ctx->result->imports, a, imp)) {
                 return false;
             }
@@ -416,7 +424,7 @@ static bool process_import_clause(CBMExtractCtx *ctx, TSNode clause, const char 
             }
             if (!ts_node_is_null(as_name)) {
                 char *name = cbm_node_text(a, as_name, ctx->source);
-                CBMImport imp = {.local_name = name, .module_path = path};
+                CBMImport imp = make_es_import(name, path);
                 if (!cbm_imports_push(&ctx->result->imports, a, imp)) {
                     return false;
                 }
@@ -453,7 +461,7 @@ static bool process_es_import_statement(CBMExtractCtx *ctx, TSNode node) {
         const char *ck = ts_node_type(child);
         if (strcmp(ck, "identifier") == 0) {
             char *name = cbm_node_text(a, child, ctx->source);
-            CBMImport imp = {.local_name = name, .module_path = path};
+            CBMImport imp = make_es_import(name, path);
             if (!cbm_imports_push(&ctx->result->imports, a, imp)) {
                 return false;
             }
@@ -469,7 +477,7 @@ static bool process_es_import_statement(CBMExtractCtx *ctx, TSNode node) {
         }
     }
     if (!found) {
-        CBMImport imp = {.local_name = path_last(a, path), .module_path = path};
+        CBMImport imp = make_es_import(path_last(a, path), path);
         if (!cbm_imports_push(&ctx->result->imports, a, imp)) {
             return false;
         }
@@ -538,7 +546,7 @@ static bool process_commonjs_require(CBMExtractCtx *ctx, TSNode call) {
         local_name = path_last(a, path);
     }
 
-    CBMImport imp = {.local_name = local_name, .module_path = path};
+    CBMImport imp = make_es_import(local_name, path);
     if (!cbm_imports_push(&ctx->result->imports, a, imp)) {
         return false;
     }

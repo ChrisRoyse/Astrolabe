@@ -263,6 +263,10 @@ typedef enum {
     /* A system/external include. Without a captured include root it must not be
      * guessed against repository files. */
     CBM_IMPORT_RESOLVE_EXTERNAL_SOURCE = 2,
+    /* An ECMAScript runtime module spelling. Relative .js/.jsx/.mjs/.cjs
+     * specifiers use the ordered TypeScript source-extension substitution
+     * contract before any semantic module lookup. */
+    CBM_IMPORT_RESOLVE_ES_SOURCE = 3,
 } CBMImportResolution;
 
 /* Whether an import-like source relationship binds a name in the importing
