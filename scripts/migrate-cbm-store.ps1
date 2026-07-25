@@ -9,7 +9,10 @@
     independent post-rename identity/hash readback make partial completion
     diagnosable.  Only after the legacy source paths are proven absent is the
     supplied real codebase-memory binary allowed to index the canonical source
-    repository under the explicit stable project alias.
+    repository under the explicit stable project alias.  ResumeReindex
+    revalidates a completed immutable archive and its hash-linked journal, then
+    creates one append-only attempt without repeating or reversing the archive
+    transition.
 
     This command never upgrades, deletes, or silently rebuilds a legacy store in
     place.  A failed archive or reindex leaves its transaction directory and
@@ -22,7 +25,7 @@ param(
     [int]$Issue,
 
     [Parameter(Mandatory)]
-    [ValidateSet('ArchiveAndReindex')]
+    [ValidateSet('ArchiveAndReindex', 'ResumeReindex')]
     [string]$Operation,
 
     [Parameter(Mandatory)]
@@ -232,7 +235,8 @@ function Write-InitialDurableJson {
 function Initialize-CbmMigrationNative {
     param(
         [Parameter(Mandatory)][string]$TransactionPath,
-        [Parameter(Mandatory)][string]$CompilerScope
+        [Parameter(Mandatory)][string]$CompilerScope,
+        [string]$RecordPrefix = 'compiler'
     )
     [IO.Directory]::CreateDirectory($CompilerScope) | Out-Null
     $owner = Get-Process -Id $PID -ErrorAction Stop
@@ -240,7 +244,7 @@ function Initialize-CbmMigrationNative {
         pid = $PID
         process_start_utc_ticks = $owner.StartTime.ToUniversalTime().Ticks
     }
-    $intentPath = [IO.Path]::Combine($TransactionPath, 'compiler-intent.json')
+    $intentPath = [IO.Path]::Combine($TransactionPath, "$RecordPrefix-intent.json")
     Write-InitialDurableJson -Path $intentPath -Value ([ordered]@{
         schema = 1
         issue = $Issue
@@ -267,7 +271,7 @@ function Initialize-CbmMigrationNative {
     }
     catch {
         Write-InitialDurableJson `
-            -Path ([IO.Path]::Combine($TransactionPath, 'compiler-fault.json')) `
+            -Path ([IO.Path]::Combine($TransactionPath, "$RecordPrefix-fault.json")) `
             -Value ([ordered]@{
                 schema = 1
                 issue = $Issue
@@ -294,7 +298,7 @@ function Initialize-CbmMigrationNative {
             }
         })
     Write-InitialDurableJson `
-        -Path ([IO.Path]::Combine($TransactionPath, 'compiler-completion.json')) `
+        -Path ([IO.Path]::Combine($TransactionPath, "$RecordPrefix-completion.json")) `
         -Value ([ordered]@{
             schema = 1
             issue = $Issue
@@ -375,7 +379,7 @@ function New-FamilyGuardRecord {
 function Write-DurableUtf8 {
     param(
         [Parameter(Mandatory)][string]$Path,
-        [Parameter(Mandatory)][string]$Text
+        [Parameter(Mandatory)][AllowEmptyString()][string]$Text
     )
     if (Test-Path -LiteralPath $Path) {
         Throw-CbmMigrationError -Code 'CBM_STORE_MIGRATION_RECORD_EXISTS' `
@@ -437,6 +441,57 @@ function Add-JournalRecord {
     return $recordSha
 }
 
+function Get-ValidatedJournal {
+    param([Parameter(Mandatory)][string]$JournalPath)
+    if (-not (Test-Path -LiteralPath $JournalPath -PathType Leaf)) {
+        Throw-CbmMigrationError -Code 'CBM_STORE_MIGRATION_JOURNAL_MISSING' `
+            -Message "transaction journal is absent: $JournalPath" `
+            -Remediation 'preserve the transaction; resume requires the complete original hash chain'
+    }
+    $lines = @([IO.File]::ReadAllLines($JournalPath) | Where-Object { $_.Length -gt 0 })
+    if ($lines.Count -eq 0) {
+        Throw-CbmMigrationError -Code 'CBM_STORE_MIGRATION_JOURNAL_EMPTY' `
+            -Message "transaction journal has no records: $JournalPath" `
+            -Remediation 'preserve the transaction and investigate missing durable transition records'
+    }
+    $records = [Collections.Generic.List[object]]::new()
+    $previous = '0' * 64
+    for ($i = 0; $i -lt $lines.Count; $i++) {
+        $document = $null
+        try {
+            $document = [Text.Json.JsonDocument]::Parse($lines[$i])
+            $record = $lines[$i] | ConvertFrom-Json -Depth 30
+        }
+        catch {
+            Throw-CbmMigrationError -Code 'CBM_STORE_MIGRATION_JOURNAL_INVALID' `
+                -Message "journal record $i is not valid JSON: $($_.Exception.Message)" `
+                -Remediation 'preserve the transaction and investigate journal corruption'
+        }
+        if ($null -eq $record.payload -or
+            [string]$record.payload.previous_record_sha256 -cne $previous -or
+            [string]$record.payload_sha256 -cnotmatch '^[0-9a-f]{64}$') {
+            Throw-CbmMigrationError -Code 'CBM_STORE_MIGRATION_JOURNAL_CHAIN_INVALID' `
+                -Message "journal record $i does not bind the preceding record" `
+                -Remediation 'preserve the transaction and compare the append-only journal to its issue evidence'
+        }
+        $payloadText = $document.RootElement.GetProperty('payload').GetRawText()
+        $computed = [Convert]::ToHexString(
+            [Security.Cryptography.SHA256]::HashData(
+                [Text.UTF8Encoding]::new($false).GetBytes($payloadText)
+            )
+        ).ToLowerInvariant()
+        if ($computed -cne [string]$record.payload_sha256) {
+            Throw-CbmMigrationError -Code 'CBM_STORE_MIGRATION_JOURNAL_HASH_INVALID' `
+                -Message "journal record $i hash=$($record.payload_sha256) computed=$computed" `
+                -Remediation 'preserve the transaction and investigate journal byte or schema drift'
+        }
+        $document.Dispose()
+        $records.Add($record)
+        $previous = $computed
+    }
+    return [pscustomobject]@{ Records = @($records); TailSha256 = $previous }
+}
+
 function Invoke-CbmTool {
     param(
         [Parameter(Mandatory)][string]$Executable,
@@ -488,12 +543,47 @@ function Invoke-CbmTool {
 
 $transactionPath = $null
 $transactionOwned = $false
+$attemptPrefix = $null
+$faultRecordPath = $null
 $guards = [Collections.Generic.List[object]]::new()
 $targetRecords = [Collections.Generic.List[object]]::new()
+$mutexMaterial = [IO.Path]::GetFullPath($LegacyDbPath).ToUpperInvariant()
+$mutexDigest = [Convert]::ToHexString(
+    [Security.Cryptography.SHA256]::HashData(
+        [Text.UTF8Encoding]::new($false).GetBytes($mutexMaterial)
+    )
+).ToLowerInvariant()
+$migrationMutex = [Threading.Mutex]::new($false, "Global\Astrolabe.CbmStoreMigration.$mutexDigest")
+$migrationMutexHeld = $false
 try {
-    $legacy = Get-CanonicalExistingPath -Path $LegacyDbPath -Kind File
+    try {
+        $migrationMutexHeld = $migrationMutex.WaitOne(0)
+    }
+    catch [Threading.AbandonedMutexException] {
+        $migrationMutexHeld = $true
+    }
+    if (-not $migrationMutexHeld) {
+        Throw-CbmMigrationError -Code 'CBM_STORE_MIGRATION_TRANSACTION_HELD' `
+            -Message "another process holds the exact store migration mutex: $mutexMaterial" `
+            -Remediation 'inspect the live migration owner and retry only after its exact process generation exits'
+    }
+}
+catch {
+    $migrationMutex.Dispose()
+    throw
+}
+try {
     $repository = Get-CanonicalExistingPath -Path $RepositoryPath -Kind Directory
     $binary = Get-CanonicalExistingPath -Path $BinaryPath -Kind File
+    if ($Operation -eq 'ArchiveAndReindex') {
+        $legacy = Get-CanonicalExistingPath -Path $LegacyDbPath -Kind File
+    }
+    else {
+        $legacyParent = Get-CanonicalExistingPath `
+            -Path ([IO.Path]::GetDirectoryName([IO.Path]::GetFullPath($LegacyDbPath))) `
+            -Kind Directory
+        $legacy = [IO.Path]::Combine($legacyParent, [IO.Path]::GetFileName($LegacyDbPath))
+    }
     if ([IO.Path]::GetExtension($legacy) -cne '.db') {
         Throw-CbmMigrationError -Code 'CBM_STORE_MIGRATION_DB_SUFFIX_INVALID' `
             -Message "legacy source is not a .db file: $legacy" `
@@ -517,7 +607,7 @@ try {
     }
     $targetFamilyPaths = @($target, "$target-wal", "$target-shm")
     $existingTargetMembers = @($targetFamilyPaths | Where-Object { Test-Path -LiteralPath $_ })
-    if ($existingTargetMembers.Count -ne 0) {
+    if ($Operation -eq 'ArchiveAndReindex' -and $existingTargetMembers.Count -ne 0) {
         Throw-CbmMigrationError -Code 'CBM_STORE_MIGRATION_TARGET_EXISTS' `
             -Message "canonical target family already exists: $($existingTargetMembers -join ', ')" `
             -Remediation 'inspect and verify every existing target-family member; this transaction never overwrites any of them'
@@ -525,17 +615,19 @@ try {
 
     $transactionId = "issue-$Issue-$expectedDb-$Project"
     $archiveRoot = [IO.Path]::Combine($cache, 'archive', 'cbm-store-migrations')
-    [IO.Directory]::CreateDirectory($archiveRoot) | Out-Null
     $transactionPath = [IO.Path]::Combine($archiveRoot, $transactionId)
-    if (Test-Path -LiteralPath $transactionPath) {
-        Throw-CbmMigrationError -Code 'CBM_STORE_MIGRATION_TRANSACTION_EXISTS' `
-            -Message "transaction already exists: $transactionPath" `
-            -Remediation 'inspect the existing immutable transaction and resume only through a reviewed recovery operation'
-    }
-    [IO.Directory]::CreateDirectory($transactionPath) | Out-Null
-    $transactionOwned = $true
-    Initialize-CbmMigrationNative -TransactionPath $transactionPath `
-        -CompilerScope ([IO.Path]::Combine($transactionPath, 'compiler-scope'))
+    if ($Operation -eq 'ArchiveAndReindex') {
+        [IO.Directory]::CreateDirectory($archiveRoot) | Out-Null
+        if (Test-Path -LiteralPath $transactionPath) {
+            Throw-CbmMigrationError -Code 'CBM_STORE_MIGRATION_TRANSACTION_EXISTS' `
+                -Message "transaction already exists: $transactionPath" `
+                -Remediation 'inspect the existing immutable transaction and resume only through a reviewed recovery operation'
+        }
+        [IO.Directory]::CreateDirectory($transactionPath) | Out-Null
+        $transactionOwned = $true
+        $faultRecordPath = [IO.Path]::Combine($transactionPath, 'fault.json')
+        Initialize-CbmMigrationNative -TransactionPath $transactionPath `
+            -CompilerScope ([IO.Path]::Combine($transactionPath, 'compiler-scope'))
 
     # Guard the primary first. Denying FILE_SHARE_WRITE makes an existing or
     # newly starting SQLite writer incompatible before sidecar membership is
@@ -639,6 +731,155 @@ try {
     Write-DurableJson -Path ([IO.Path]::Combine($transactionPath, 'archive-complete.json')) `
         -Value $archiveComplete
 
+    }
+    else {
+        if (-not (Test-Path -LiteralPath $transactionPath -PathType Container)) {
+            Throw-CbmMigrationError -Code 'CBM_STORE_MIGRATION_TRANSACTION_MISSING' `
+                -Message "reviewed archive transaction is absent: $transactionPath" `
+                -Remediation 'pass the exact issue, source hash, legacy path, and project of the completed archive'
+        }
+        if (Test-Path -LiteralPath ([IO.Path]::Combine($transactionPath, 'completion.json'))) {
+            Throw-CbmMigrationError -Code 'CBM_STORE_MIGRATION_ALREADY_COMPLETE' `
+                -Message "transaction already has immutable completion: $transactionPath" `
+                -Remediation 'verify the existing completion and canonical target; never run the reindex again'
+        }
+        $intentPath = [IO.Path]::Combine($transactionPath, 'intent.json')
+        $archiveCompletePath = [IO.Path]::Combine($transactionPath, 'archive-complete.json')
+        $initialFaultPath = [IO.Path]::Combine($transactionPath, 'fault.json')
+        foreach ($required in @($intentPath, $archiveCompletePath, $initialFaultPath)) {
+            if (-not (Test-Path -LiteralPath $required -PathType Leaf)) {
+                Throw-CbmMigrationError -Code 'CBM_STORE_MIGRATION_RESUME_RECORD_MISSING' `
+                    -Message "required immutable resume record is absent: $required" `
+                    -Remediation 'preserve the transaction; resume only a fully recorded archive fault'
+            }
+        }
+        try {
+            $intent = Get-Content -Raw -LiteralPath $intentPath | ConvertFrom-Json -Depth 30
+            $archiveComplete = Get-Content -Raw -LiteralPath $archiveCompletePath |
+                ConvertFrom-Json -Depth 30
+            $initialFault = Get-Content -Raw -LiteralPath $initialFaultPath |
+                ConvertFrom-Json -Depth 30
+        }
+        catch {
+            Throw-CbmMigrationError -Code 'CBM_STORE_MIGRATION_RESUME_RECORD_INVALID' `
+                -Message "immutable resume record is not valid JSON: $($_.Exception.Message)" `
+                -Remediation 'preserve the transaction and compare its record hashes to the issue evidence'
+        }
+        if (@($intent.source_family).Count -ne @($archiveComplete.members).Count -or
+            @($intent.source_family).Count -eq 0) {
+            Throw-CbmMigrationError -Code 'CBM_STORE_MIGRATION_ARCHIVE_MEMBERSHIP_INVALID' `
+                -Message 'intent and archive-complete family cardinalities differ or are empty' `
+                -Remediation 'preserve the transaction and investigate partial archive publication'
+        }
+        $sameLegacy = [string]::Equals([string]$intent.source_family[0].source_path, $legacy,
+            [StringComparison]::OrdinalIgnoreCase)
+        if ($intent.schema -ne 1 -or $intent.operation -cne 'ArchiveAndReindex' -or
+            $intent.issue -ne $Issue -or $intent.project -cne $Project -or
+            -not [string]::Equals([string]$intent.repository_path, $repository,
+                [StringComparison]::OrdinalIgnoreCase) -or
+            -not [string]::Equals([string]$intent.canonical_target_db_path, $target,
+                [StringComparison]::OrdinalIgnoreCase) -or
+            $intent.expected_schema_version -ne $ExpectedSchemaVersion -or -not $sameLegacy -or
+            [string]$intent.source_family[0].sha256 -cne $expectedDb -or
+            $archiveComplete.schema -ne 1 -or $archiveComplete.issue -ne $Issue -or
+            $archiveComplete.status -cne 'archive_complete' -or
+            $initialFault.schema -ne 1 -or $initialFault.issue -ne $Issue -or
+            $initialFault.status -cne 'fault') {
+            Throw-CbmMigrationError -Code 'CBM_STORE_MIGRATION_RESUME_IDENTITY_MISMATCH' `
+                -Message 'issue/source/project/repository/schema records do not bind the requested archive' `
+                -Remediation 'use the exact inputs from immutable intent.json; never retarget an archive transaction'
+        }
+        $archiveReadback = @()
+        foreach ($member in @($intent.source_family)) {
+            $completed = @($archiveComplete.members | Where-Object {
+                [string]::Equals([string]$_.source_path, [string]$member.source_path,
+                    [StringComparison]::OrdinalIgnoreCase) -and
+                [string]::Equals([string]$_.archive_path, [string]$member.archive_path,
+                    [StringComparison]::OrdinalIgnoreCase)
+            })
+            if ($completed.Count -ne 1 -or (Test-Path -LiteralPath $member.source_path) -or
+                -not (Test-Path -LiteralPath $member.archive_path -PathType Leaf)) {
+                Throw-CbmMigrationError -Code 'CBM_STORE_MIGRATION_ARCHIVE_STATE_INVALID' `
+                    -Message "source/archive namespace readback failed for $($member.source_path)" `
+                    -Remediation 'preserve every byte; repair no state until the archive discrepancy is understood'
+            }
+            $archiveItem = Get-Item -LiteralPath $member.archive_path -Force
+            $archiveSha = Get-FileSha256 -Path $member.archive_path
+            if ($archiveItem.Length -ne $member.length -or $archiveSha -cne $member.sha256 -or
+                $completed[0].length -ne $member.length -or
+                [string]$completed[0].sha256 -cne [string]$member.sha256 -or
+                -not [bool]$completed[0].source_absent) {
+                Throw-CbmMigrationError -Code 'CBM_STORE_MIGRATION_ARCHIVE_HASH_DRIFT' `
+                    -Message "archived member identity/hash drifted: $($member.archive_path)" `
+                    -Remediation 'preserve the transaction and investigate storage corruption'
+            }
+            $archiveReadback += [ordered]@{
+                source_path = [string]$member.source_path
+                source_absent = $true
+                archive_path = [string]$member.archive_path
+                length = $archiveItem.Length
+                sha256 = $archiveSha
+            }
+        }
+        $journal = [IO.Path]::Combine($transactionPath, 'journal.ndjson')
+        $journalState = Get-ValidatedJournal -JournalPath $journal
+        if (@($journalState.Records | Where-Object {
+            [string]$_.payload_sha256 -ceq [string]$archiveComplete.final_journal_record_sha256
+        }).Count -ne 1) {
+            Throw-CbmMigrationError -Code 'CBM_STORE_MIGRATION_ARCHIVE_JOURNAL_UNBOUND' `
+                -Message 'archive-complete final journal hash is absent or duplicated in the journal chain' `
+                -Remediation 'preserve the transaction and compare journal/archive-complete hashes to the issue evidence'
+        }
+        $previous = $journalState.TailSha256
+        $attemptNumbers = @(Get-ChildItem -LiteralPath $transactionPath -File -Force |
+            ForEach-Object {
+                if ($_.Name -cmatch '^resume-(\d{3})-intent\.json$') { [int]$Matches[1] }
+            })
+        foreach ($priorNumber in $attemptNumbers) {
+            $priorPrefix = 'resume-{0:D3}' -f $priorNumber
+            if (-not (Test-Path -LiteralPath ([IO.Path]::Combine(
+                $transactionPath, "$priorPrefix-fault.json")) -PathType Leaf)) {
+                Throw-CbmMigrationError -Code 'CBM_STORE_MIGRATION_RESUME_INTERRUPTED' `
+                    -Message "prior resume attempt lacks a terminal fault record: $priorPrefix" `
+                    -Remediation 'preserve the transaction and investigate the interrupted exact process generation before another attempt'
+            }
+        }
+        $attemptNumber = if ($attemptNumbers.Count -eq 0) { 1 } else {
+            [int](($attemptNumbers | Measure-Object -Maximum).Maximum) + 1
+        }
+        if ($attemptNumber -gt 999) {
+            Throw-CbmMigrationError -Code 'CBM_STORE_MIGRATION_RESUME_ATTEMPT_LIMIT' `
+                -Message 'transaction already contains 999 append-only resume attempts' `
+                -Remediation 'preserve the transaction and open a dedicated recovery issue before any further attempt'
+        }
+        $attemptPrefix = 'resume-{0:D3}' -f $attemptNumber
+        $attemptIntent = [ordered]@{
+            schema = 1
+            operation = 'ResumeReindex'
+            issue = $Issue
+            created_utc = [DateTime]::UtcNow.ToString('o')
+            project = $Project
+            repository_path = $repository
+            canonical_target_db_path = $target
+            transaction_path = $transactionPath
+            archive_complete_sha256 = Get-FileSha256 -Path $archiveCompletePath
+            journal_tail_before_sha256 = $previous
+            binary_path = $binary
+            binary_sha256 = $binarySha
+            expected_schema_version = $ExpectedSchemaVersion
+        }
+        Write-InitialDurableJson `
+            -Path ([IO.Path]::Combine($transactionPath, "$attemptPrefix-intent.json")) `
+            -Value $attemptIntent
+        $transactionOwned = $true
+        $faultRecordPath = [IO.Path]::Combine($transactionPath, "$attemptPrefix-fault.json")
+        Initialize-CbmMigrationNative -TransactionPath $transactionPath `
+            -CompilerScope ([IO.Path]::Combine($transactionPath, "$attemptPrefix-compiler-scope")) `
+            -RecordPrefix "$attemptPrefix-compiler"
+        $previous = Add-JournalRecord -JournalPath $journal -PreviousSha256 $previous `
+            -Event 'resume_intent_published' -Data $attemptIntent
+    }
+
     $existingTargetMembers = @($targetFamilyPaths | Where-Object { Test-Path -LiteralPath $_ })
     if ($existingTargetMembers.Count -ne 0) {
         Throw-CbmMigrationError -Code 'CBM_STORE_MIGRATION_TARGET_APPEARED' `
@@ -646,7 +887,8 @@ try {
             -Remediation 'preserve the complete archive and inspect the foreign target-family writer before reindexing'
     }
 
-    $argsPath = [IO.Path]::Combine($transactionPath, 'reindex-args.json')
+    $recordStem = if ($attemptPrefix) { "$attemptPrefix-" } else { '' }
+    $argsPath = [IO.Path]::Combine($transactionPath, "${recordStem}reindex-args.json")
     Write-DurableJson -Path $argsPath -Value ([ordered]@{
         repo_path = $repository
         name = $Project
@@ -654,11 +896,13 @@ try {
         persistence = $false
     })
     $run = Invoke-CbmTool -Executable $binary -Tool 'index_repository' -ArgsPath $argsPath `
-        -StdoutPath ([IO.Path]::Combine($transactionPath, 'reindex.stdout.json')) `
-        -StderrPath ([IO.Path]::Combine($transactionPath, 'reindex.stderr.log')) `
+        -StdoutPath ([IO.Path]::Combine($transactionPath, "${recordStem}reindex.stdout.json")) `
+        -StderrPath ([IO.Path]::Combine($transactionPath, "${recordStem}reindex.stderr.log")) `
         -TimeoutSeconds $ReindexTimeoutSeconds
     $previous = Add-JournalRecord -JournalPath $journal -PreviousSha256 $previous `
-        -Event 'reindex_process_exited' -Data ([ordered]@{
+        -Event $(if ($attemptPrefix) { 'resume_reindex_process_exited' } else {
+            'reindex_process_exited'
+        }) -Data ([ordered]@{
             process = $run.Identity
             exit_code = $run.ExitCode
             stdout_sha256 = $run.StdoutSha256
@@ -678,7 +922,8 @@ try {
     # A successful index return is not query admission. Start a fresh real
     # process so the newly published exact alias must independently pass the
     # schema, internal project identity, and live-root provenance boundary.
-    $admissionArgsPath = [IO.Path]::Combine($transactionPath, 'admission-args.json')
+    $admissionArgsPath = [IO.Path]::Combine($transactionPath,
+        "${recordStem}admission-args.json")
     Write-DurableJson -Path $admissionArgsPath -Value ([ordered]@{
         project = $Project
         name_pattern = '.*'
@@ -686,11 +931,13 @@ try {
     })
     $admission = Invoke-CbmTool -Executable $binary -Tool 'search_graph' `
         -ArgsPath $admissionArgsPath `
-        -StdoutPath ([IO.Path]::Combine($transactionPath, 'admission.stdout.json')) `
-        -StderrPath ([IO.Path]::Combine($transactionPath, 'admission.stderr.log')) `
+        -StdoutPath ([IO.Path]::Combine($transactionPath, "${recordStem}admission.stdout.json")) `
+        -StderrPath ([IO.Path]::Combine($transactionPath, "${recordStem}admission.stderr.log")) `
         -TimeoutSeconds $ReindexTimeoutSeconds
     $previous = Add-JournalRecord -JournalPath $journal -PreviousSha256 $previous `
-        -Event 'query_admission_process_exited' -Data ([ordered]@{
+        -Event $(if ($attemptPrefix) { 'resume_query_admission_process_exited' } else {
+            'query_admission_process_exited'
+        }) -Data ([ordered]@{
             process = $admission.Identity
             exit_code = $admission.ExitCode
             stdout_sha256 = $admission.StdoutSha256
@@ -784,6 +1031,8 @@ try {
         schema = 1
         issue = $Issue
         status = 'complete'
+        operation = $Operation
+        attempt_prefix = $attemptPrefix
         completed_utc = [DateTime]::UtcNow.ToString('o')
         project = $Project
         repository_path = $repository
@@ -819,7 +1068,12 @@ catch {
         }
     }
     if ($transactionOwned -and $transactionPath -and (Test-Path -LiteralPath $transactionPath)) {
-        $faultPath = [IO.Path]::Combine($transactionPath, 'fault.json')
+        $faultPath = if ($faultRecordPath) {
+            $faultRecordPath
+        }
+        else {
+            [IO.Path]::Combine($transactionPath, 'fault.json')
+        }
         if (-not (Test-Path -LiteralPath $faultPath)) {
             try {
                 $fault = [ordered]@{
@@ -843,4 +1097,10 @@ catch {
         }
     }
     throw
+}
+finally {
+    if ($migrationMutexHeld) {
+        $migrationMutex.ReleaseMutex()
+    }
+    $migrationMutex.Dispose()
 }
