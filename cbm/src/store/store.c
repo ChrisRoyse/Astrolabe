@@ -396,9 +396,9 @@ static int init_schema(cbm_store_t *s) {
             CBM_NOT_FOUND, &objects, NULL);
         if (prepare_rc != SQLITE_OK) {
             cbm_log_error("store.schema_freshness_probe_failed", "code",
-                          "CBM_SCHEMA_FRESHNESS_UNREADABLE", "sqlite_error",
-                          sqlite3_errmsg(s->db), "message",
-                          "the version-0 store could not be proven physically empty", "remediation",
+                          "CBM_SCHEMA_FRESHNESS_UNREADABLE", "sqlite_error", sqlite3_errmsg(s->db),
+                          "message", "the version-0 store could not be proven physically empty",
+                          "remediation",
                           "repair or remove the unreadable cache and rebuild from source");
             return CBM_STORE_ERR;
         }
@@ -408,22 +408,21 @@ static int init_schema(cbm_store_t *s) {
         int finalize_rc = sqlite3_finalize(objects);
         if (step_rc != SQLITE_ROW || second_step_rc != SQLITE_DONE || finalize_rc != SQLITE_OK) {
             cbm_log_error("store.schema_freshness_probe_failed", "code",
-                          "CBM_SCHEMA_FRESHNESS_UNREADABLE", "sqlite_error",
-                          sqlite3_errmsg(s->db), "message",
-                          "the version-0 schema inventory could not be read exactly", "remediation",
+                          "CBM_SCHEMA_FRESHNESS_UNREADABLE", "sqlite_error", sqlite3_errmsg(s->db),
+                          "message", "the version-0 schema inventory could not be read exactly",
+                          "remediation",
                           "repair or remove the unreadable cache and rebuild from source");
             return CBM_STORE_ERR;
         }
         if (object_count != 0) {
             char count_buf[CBM_SZ_32];
             snprintf(count_buf, sizeof(count_buf), "%d", object_count);
-            cbm_log_error("store.schema_unversioned_refused", "code",
-                          "CBM_SCHEMA_VERSION_UNSTAMPED", "application_object_count", count_buf,
-                          "message",
-                          "a version-0 database already contains application schema objects",
-                          "remediation",
-                          "remove the unversioned cache and rebuild it from source; in-place "
-                          "identity migration is unsupported");
+            cbm_log_error(
+                "store.schema_unversioned_refused", "code", "CBM_SCHEMA_VERSION_UNSTAMPED",
+                "application_object_count", count_buf, "message",
+                "a version-0 database already contains application schema objects", "remediation",
+                "remove the unversioned cache and rebuild it from source; in-place "
+                "identity migration is unsupported");
             return CBM_STORE_ERR;
         }
     }
@@ -563,8 +562,8 @@ static int init_schema(cbm_store_t *s) {
         }
     }
     char schema_stamp[CBM_SZ_64];
-    int schema_stamp_len = snprintf(schema_stamp, sizeof(schema_stamp),
-                                    "PRAGMA user_version = %d;", CBM_GRAPH_SCHEMA_VERSION);
+    int schema_stamp_len = snprintf(schema_stamp, sizeof(schema_stamp), "PRAGMA user_version = %d;",
+                                    CBM_GRAPH_SCHEMA_VERSION);
     if (schema_stamp_len < 0 || (size_t)schema_stamp_len >= sizeof(schema_stamp)) {
         cbm_log_error("store.schema_version_stamp_failed", "code",
                       "CBM_SCHEMA_VERSION_FORMAT_FAILED", "message",
@@ -581,8 +580,7 @@ static int init_schema(cbm_store_t *s) {
         cbm_log_error("store.schema_version_readback_failed", "code",
                       "CBM_SCHEMA_VERSION_READBACK_FAILED", "message",
                       "SQLite did not persist the stable-atom/file-path schema version",
-                      "remediation",
-                      "repair the store path or filesystem and rebuild from source");
+                      "remediation", "repair the store path or filesystem and rebuild from source");
         return CBM_STORE_ERR;
     }
     return CBM_STORE_OK;
@@ -1227,11 +1225,16 @@ static store_integrity_status_t store_check_integrity_detailed(cbm_store_t *s,
                                     "unknown store integrity contract");
         return result->status;
     }
-    if (contract == STORE_INTEGRITY_CONTRACT_GRAPH_RELOAD &&
-        (!expected_project || !cbm_validate_project_name(expected_project))) {
+    if (expected_project && !cbm_validate_project_name(expected_project)) {
+        store_integrity_set_failure(
+            result, STORE_INTEGRITY_IO_FAILED, "application.expected_project", SQLITE_MISUSE,
+            "project-bound verification requires a valid expected project name");
+        return result->status;
+    }
+    if (contract == STORE_INTEGRITY_CONTRACT_GRAPH_RELOAD && !expected_project) {
         store_integrity_set_failure(result, STORE_INTEGRITY_IO_FAILED,
                                     "application.expected_project", SQLITE_MISUSE,
-                                    "graph reload requires a valid expected project name");
+                                    "graph reload requires an expected project name");
         return result->status;
     }
 
@@ -1476,7 +1479,7 @@ static store_integrity_status_t store_check_integrity_detailed(cbm_store_t *s,
         sqlite3_finalize(stmt);
         return result->status;
     }
-    if (contract == STORE_INTEGRITY_CONTRACT_GRAPH_RELOAD) {
+    if (expected_project) {
         size_t expected_project_bytes = strlen(expected_project);
         if (expected_project_bytes != (size_t)name_bytes ||
             memcmp(name, expected_project, expected_project_bytes) != 0) {
@@ -1488,6 +1491,58 @@ static store_integrity_status_t store_check_integrity_detailed(cbm_store_t *s,
             sqlite3_finalize(stmt);
             return result->status;
         }
+
+        char persisted_root[CBM_STORE_VERIFY_PATH_MAX];
+        if ((size_t)root_path_bytes >= sizeof(persisted_root)) {
+            store_integrity_set_failure(result, STORE_INTEGRITY_IO_FAILED,
+                                        "application.project_root.capacity", SQLITE_TOOBIG,
+                                        "persisted project root exceeds provenance path capacity");
+            sqlite3_finalize(stmt);
+            return result->status;
+        }
+        memcpy(persisted_root, root_path, (size_t)root_path_bytes);
+        persisted_root[root_path_bytes] = '\0';
+        cbm_normalize_path_sep(persisted_root);
+
+        if (cbm_path_is_ephemeral_launcher_root(persisted_root)) {
+            char detail[CBM_STORE_VERIFY_DETAIL_MAX];
+            snprintf(detail, sizeof(detail),
+                     "persisted root_path is inside a disposable Astrolabe launcher generation: "
+                     "%s",
+                     persisted_root);
+            store_integrity_set_failure(result, STORE_INTEGRITY_FAILED,
+                                        "application.project_root.ephemeral", SQLITE_OK, detail);
+            sqlite3_finalize(stmt);
+            return result->status;
+        }
+
+        char *canonical_root = cbm_canonicalize_existing_path(persisted_root);
+        if (!canonical_root) {
+            char detail[CBM_STORE_VERIFY_DETAIL_MAX];
+            snprintf(detail, sizeof(detail), "persisted root_path is absent or unreadable: %s",
+                     persisted_root);
+            store_integrity_set_failure(result, STORE_INTEGRITY_FAILED,
+                                        "application.project_root.resolve", SQLITE_OK, detail);
+            sqlite3_finalize(stmt);
+            return result->status;
+        }
+        cbm_normalize_path_sep(canonical_root);
+#ifdef _WIN32
+        bool root_matches = _stricmp(canonical_root, persisted_root) == 0;
+#else
+        bool root_matches = strcmp(canonical_root, persisted_root) == 0;
+#endif
+        if (!root_matches) {
+            char detail[CBM_STORE_VERIFY_DETAIL_MAX];
+            snprintf(detail, sizeof(detail), "persisted root_path=%s canonical_root=%s",
+                     persisted_root, canonical_root);
+            free(canonical_root);
+            store_integrity_set_failure(result, STORE_INTEGRITY_FAILED,
+                                        "application.project_root.identity", SQLITE_OK, detail);
+            sqlite3_finalize(stmt);
+            return result->status;
+        }
+        free(canonical_root);
     }
     rc = sqlite3_step(stmt);
     if (rc != SQLITE_DONE) {
@@ -1511,6 +1566,12 @@ static store_integrity_status_t store_check_integrity_detailed(cbm_store_t *s,
         snprintf(result->detail, sizeof(result->detail), "%s",
                  "SQLite integrity, foreign keys, graph schema version, reload schema, and exact "
                  "project identity passed");
+    } else if (expected_project) {
+        snprintf(result->operation, sizeof(result->operation), "%s",
+                 "application.project_provenance");
+        snprintf(result->detail, sizeof(result->detail), "%s",
+                 "SQLite integrity, foreign keys, query schema, exact project identity, and "
+                 "canonical live root provenance passed");
     } else {
         snprintf(result->operation, sizeof(result->operation), "%s", "application.project_row");
         snprintf(result->detail, sizeof(result->detail), "%s",
@@ -2200,6 +2261,26 @@ cbm_store_verify_status_t cbm_store_open_path_query_verified(const char *db_path
                                                              cbm_store_t **out_store,
                                                              cbm_store_verify_result_t *result) {
     return store_open_path_verified(db_path, STORE_INTEGRITY_CONTRACT_QUERY, NULL, out_store,
+                                    result);
+}
+
+cbm_store_verify_status_t cbm_store_open_path_project_query_verified(
+    const char *db_path, const char *project, cbm_store_t **out_store,
+    cbm_store_verify_result_t *result) {
+    if (!project || !cbm_validate_project_name(project)) {
+        if (out_store) {
+            *out_store = NULL;
+        }
+        if (result) {
+            store_verify_result_init(result);
+            store_verify_set_error(result, CBM_STORE_VERIFY_IO_FAILED, "source.validate_project",
+                                   ERROR_INVALID_PARAMETER, SQLITE_MISUSE,
+                                   "project query requires a valid exact project name");
+            return result->status;
+        }
+        return CBM_STORE_VERIFY_IO_FAILED;
+    }
+    return store_open_path_verified(db_path, STORE_INTEGRITY_CONTRACT_QUERY, project, out_store,
                                     result);
 }
 

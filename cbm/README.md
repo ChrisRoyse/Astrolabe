@@ -415,7 +415,7 @@ codebase-memory-mcp cli trace_path --args-file trace-args.json  # trace-args.jso
 | Tool | Description |
 |------|-------------|
 | `index_repository` | Index a repository into the graph. Auto-sync keeps it fresh after that. |
-| `list_projects` | List all indexed projects with node/edge counts. |
+| `list_projects` | List exact provenance-valid projects with node/edge counts, plus structured refusals for unusable store candidates. |
 | `delete_project` | Remove a project and all its graph data. |
 | `index_status` | Check indexing status of a project. |
 

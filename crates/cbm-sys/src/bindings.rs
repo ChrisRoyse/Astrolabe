@@ -2689,6 +2689,14 @@ unsafe extern "C" {
     ) -> cbm_store_verify_status_t;
 }
 unsafe extern "C" {
+    pub fn cbm_store_open_path_project_query_verified(
+        db_path: *const ::std::os::raw::c_char,
+        project: *const ::std::os::raw::c_char,
+        out_store: *mut *mut cbm_store_t,
+        result: *mut cbm_store_verify_result_t,
+    ) -> cbm_store_verify_status_t;
+}
+unsafe extern "C" {
     pub fn cbm_store_open_path_graph_verified(
         db_path: *const ::std::os::raw::c_char,
         project: *const ::std::os::raw::c_char,

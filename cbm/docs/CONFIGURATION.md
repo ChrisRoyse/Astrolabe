@@ -11,6 +11,24 @@ This page documents the configuration files that `codebase-memory-mcp` reads or 
 | CLI-managed runtime settings | `${CBM_CACHE_DIR:-~/.cache/codebase-memory-mcp}/_config.db` | SQLite | Written by `codebase-memory-mcp config set/reset`. |
 | UI settings | `${CBM_CACHE_DIR:-~/.cache/codebase-memory-mcp}/config.json` | JSON | Stores `ui_enabled` and `ui_port`. |
 
+Project stores do not use `_config.db` as an alias registry. A query name is
+bound only to the exact `${CBM_CACHE_DIR}/<project>.db` family. Before query
+admission, a source-frozen derivative must prove the supported schema, the sole
+internal project name, and an existing canonical `root_path`. The server never
+scans the cache to adopt a differently named database as a fallback.
+
+`list_projects` returns valid projects plus `store_refusals` and
+`refused_store_count`. A legacy, corrupt, drifted, or source-less candidate is
+therefore visible with its exact path/operation/remediation but cannot prevent
+unrelated valid projects from being listed or queried.
+
+Canonicalization is not permission to persist build scratch. Roots inside the
+Astrolabe native launcher namespace `.tmp/windows-gnu-toolchain-*` are refused
+before indexing starts and again at query admission, even if a caller supplies
+a stable-looking alias. This prevents a currently-live launcher generation from
+becoming durable registry authority and then drifting when exact-owner cleanup
+removes it.
+
 ## 1. Custom File Extension Mapping
 
 Two optional JSON files let you map additional file extensions to built-in languages.
@@ -128,3 +146,41 @@ codebase-memory-mcp install --dry-run
 ```
 
 That prints the specific config files the installer would modify without writing anything.
+
+## 6. Explicit Legacy Store Migration (Astrolabe native Windows)
+
+Never rename, delete, upgrade, or reindex over an integrity/provenance-refused
+store by hand. From the canonical Astrolabe checkout, use the tracker-bound
+archive transaction with hashes measured from the exact current files and the
+reviewed native binary:
+
+```powershell
+.\scripts\migrate-cbm-store.ps1 `
+  -Issue 719 `
+  -Operation ArchiveAndReindex `
+  -LegacyDbPath 'C:\path\to\cache\legacy.db' `
+  -ExpectedDbSha256 '<64 lowercase hex characters>' `
+  -RepositoryPath 'C:\path\to\canonical\repository' `
+  -Project 'stable-alias' `
+  -BinaryPath 'C:\path\to\codebase-memory-mcp.exe' `
+  -ExpectedBinarySha256 '<64 lowercase hex characters>' `
+  -ExpectedSchemaVersion '<reviewed CBM_GRAPH_SCHEMA_VERSION integer>'
+```
+
+The command retains exact no-write/no-delete-share handles over the complete
+DB/WAL/SHM family, publishes durable hash-linked intent/transition records,
+renames each exact file without replacement into a content-addressed
+issue-bound archive, proves the source namespace absent and archive bytes
+unchanged, and only then invokes a real `index_repository` from the canonical
+source root under the explicit alias. A separate native process must then admit
+and query that exact alias. Completion freezes and hashes the complete new
+DB/WAL/SHM family, re-reads every archived hash plus source absence, and records
+both process identities and outputs. Any ambiguity fails closed and preserves
+the transaction directory for diagnosis.
+
+The Win32 handle interop compiler is also transaction-owned: only after the
+issue/hash directory exists does the script create its `compiler-scope`, bind
+the exact PowerShell owner identity, redirect compiler TEMP there, and publish
+durable compiler intent/inventory/completion or fault records. It never creates
+an anonymous compiler child in workspace `.tmp`, and an existing transaction is
+never modified by a new refusal attempt.

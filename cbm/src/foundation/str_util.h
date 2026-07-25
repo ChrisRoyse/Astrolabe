@@ -63,6 +63,13 @@ bool cbm_validate_shell_arg(const char *s);
  * Returns true if safe, false if the name could escape the cache directory. */
 bool cbm_validate_project_name(const char *name);
 
+/* Return true when an existing canonical path is inside an Astrolabe native
+ * launcher generation root (`.tmp/windows-gnu-toolchain-*`).  Those roots are
+ * disposable build/verification state and can never be durable project-store
+ * provenance, even when a caller supplies an otherwise stable project alias.
+ * Both slash spellings are recognized; Windows matching is case-insensitive. */
+bool cbm_path_is_ephemeral_launcher_root(const char *path);
+
 /* Safe snprintf append: clamps offset to prevent buffer overflow on truncation.
  * When snprintf truncates, it returns what it WOULD have written, which can make
  * offset > bufsize. Next call: bufsize - offset wraps unsigned → huge → overflow.

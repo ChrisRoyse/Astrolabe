@@ -8,6 +8,7 @@
 // operations
 
 #include "foundation/constants.h"
+#include "foundation/schema_version.h"
 
 enum {
     MCP_FIELD_SIZE = 1040,
@@ -762,6 +763,33 @@ static char *canonicalize_repo_path_if_exists(char *repo_path) {
     return NULL;
 }
 
+static char *build_ephemeral_project_root_error(const char *repo_path) {
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    if (!doc) {
+        return heap_strdup(
+            "{\"code\":\"CBM_EPHEMERAL_PROJECT_ROOT\",\"message\":\"repository root is "
+            "inside a disposable Astrolabe launcher generation\",\"remediation\":\"index "
+            "the stable canonical repository root instead\"}");
+    }
+    yyjson_mut_val *root = yyjson_mut_obj(doc);
+    yyjson_mut_doc_set_root(doc, root);
+    yyjson_mut_obj_add_str(doc, root, "code", "CBM_EPHEMERAL_PROJECT_ROOT");
+    yyjson_mut_obj_add_str(
+        doc, root, "message",
+        "repository root is inside .tmp/windows-gnu-toolchain-*, a disposable Astrolabe "
+        "launcher generation that can never be durable project-store provenance");
+    yyjson_mut_obj_add_str(doc, root, "repo_path", repo_path ? repo_path : "");
+    yyjson_mut_obj_add_str(
+        doc, root, "remediation",
+        "index the stable canonical repository root; never copy, alias, or preserve a launcher "
+        "generation as a project store");
+    yyjson_mut_obj_add_bool(doc, root, "index_started", false);
+    yyjson_mut_obj_add_bool(doc, root, "store_created", false);
+    char *json = yyjson_mut_write(doc, 0, NULL);
+    yyjson_mut_doc_free(doc);
+    return json ? json : heap_strdup("{\"code\":\"CBM_EPHEMERAL_PROJECT_ROOT\"}");
+}
+
 static char *normalize_project_arg(char *project) {
     if (!project || (!strchr(project, '/') && !strchr(project, '\\'))) {
         return project;
@@ -1039,6 +1067,16 @@ static void reset_store_error_state(cbm_mcp_server_t *srv) {
     srv->store_error_shm_path[0] = '\0';
 }
 
+static bool store_error_is_provenance(const cbm_store_verify_result_t *verification) {
+    if (!verification) {
+        return false;
+    }
+    return strstr(verification->operation, "application.project_identity") != NULL ||
+           strstr(verification->operation, "application.project_root") != NULL ||
+           strstr(verification->operation, "source.project_filename") != NULL ||
+           strstr(verification->operation, "source.project_identity") != NULL;
+}
+
 static void record_store_error_state(cbm_mcp_server_t *srv, const char *project,
                                      const char *db_path,
                                      const cbm_store_verify_result_t *verification) {
@@ -1057,13 +1095,16 @@ static void record_store_error_state(cbm_mcp_server_t *srv, const char *project,
     snprintf(native_error, sizeof(native_error), "%lu",
              (unsigned long)srv->store_verify.native_error);
     snprintf(sqlite_error, sizeof(sqlite_error), "%d", srv->store_verify.sqlite_error);
-    cbm_log_error(srv->store_verify.status == CBM_STORE_VERIFY_INTEGRITY_FAILED
-                      ? "store.integrity_failed"
-                      : "store.verification_failed",
+    bool provenance_failed = store_error_is_provenance(&srv->store_verify);
+    cbm_log_error(provenance_failed ? "store.provenance_failed"
+                                    : (srv->store_verify.status == CBM_STORE_VERIFY_INTEGRITY_FAILED
+                                           ? "store.integrity_failed"
+                                           : "store.verification_failed"),
                   "code",
-                  srv->store_verify.status == CBM_STORE_VERIFY_INTEGRITY_FAILED
-                      ? "CBM_STORE_INTEGRITY_FAILED"
-                      : "CBM_STORE_VERIFICATION_FAILED",
+                  provenance_failed ? "CBM_STORE_PROVENANCE_FAILED"
+                                    : (srv->store_verify.status == CBM_STORE_VERIFY_INTEGRITY_FAILED
+                                           ? "CBM_STORE_INTEGRITY_FAILED"
+                                           : "CBM_STORE_VERIFICATION_FAILED"),
                   "project", project ? project : "", "db_path", srv->store_error_db_path,
                   "wal_path", srv->store_error_wal_path, "shm_path", srv->store_error_shm_path,
                   "operation", srv->store_verify.operation, "native_error", native_error,
@@ -1102,12 +1143,6 @@ static db_project_inspect_status_t db_internal_project_name(cbm_mcp_server_t *sr
                                                             size_t name_sz,
                                                             cbm_store_t **out_store);
 
-/* #704 fallback: scan the cache dir for the db whose sole internal project name
- * equals `project`, returning an open store handle (caller owns it) or NULL.
- * Used only when <project>.db is absent or its internal name differs from the
- * passed name (drifted filename). Defined after is_project_db_file below. */
-static cbm_store_t *resolve_store_fallback_scan(cbm_mcp_server_t *srv, const char *project);
-
 /* Open the right project's .db file for query tools.
  * Caches the connection — reopens only when project changes.
  * Tracks last-access time so the event loop can evict idle stores. */
@@ -1138,7 +1173,7 @@ static cbm_store_t *resolve_store(cbm_mcp_server_t *srv, const char *project) {
     project_db_path(project, path, sizeof(path));
     cbm_store_verify_result_t verification;
     cbm_store_verify_status_t verify_status =
-        cbm_store_open_path_query_verified(path, &srv->store, &verification);
+        cbm_store_open_path_project_query_verified(path, project, &srv->store, &verification);
     if (verify_status == CBM_STORE_VERIFY_INTEGRITY_FAILED ||
         verify_status == CBM_STORE_VERIFY_IO_FAILED) {
         srv->owns_store = false;
@@ -1146,9 +1181,10 @@ static cbm_store_t *resolve_store(cbm_mcp_server_t *srv, const char *project) {
         return NULL;
     }
 
-    /* A genuinely absent source proceeds to the drifted-filename scan without
-     * creating a ghost .db file.  VERIFY_OK already published the source query
-     * connection while its verified DB/WAL guards were still live. */
+    /* VERIFY_OK already published the exact source query connection while its
+     * verified DB/WAL guards were still live.  A missing exact source stays
+     * missing: cache-wide fallback adoption made unrelated invalid candidates
+     * poison aliases and could bind a caller to a drifted filename/root. */
     if (srv->store) {
         /* Verify the project actually exists in this database.
          * A .db file may exist but be empty (e.g., after delete_project on
@@ -1163,9 +1199,10 @@ static cbm_store_t *resolve_store(cbm_mcp_server_t *srv, const char *project) {
             srv->current_project = heap_strdup(project);
             return srv->store; /* fast path: filename == internal name */
         }
-        /* #704: <project>.db exists but its INTERNAL project name differs from
-         * the passed name (a copied/renamed db, or a legacy '.'-vs-'-' username
-         * twin). Close it and fall through to the cache-dir scan below. */
+        /* The verified boundary already required the sole internal name to
+         * equal `project`.  Reaching NOT_FOUND here is therefore drift between
+         * verification and the published connection, never authority to scan
+         * for and adopt another file. */
         if (project_rc != CBM_STORE_NOT_FOUND) {
             record_store_query_failure(srv, project, path, srv->store, CBM_STORE_VERIFY_IO_FAILED,
                                        "source.query_project_row", cbm_store_error(srv->store));
@@ -1173,22 +1210,13 @@ static cbm_store_t *resolve_store(cbm_mcp_server_t *srv, const char *project) {
             srv->store = NULL;
             return NULL;
         }
+        record_store_query_failure(srv, project, path, srv->store,
+                                   CBM_STORE_VERIFY_INTEGRITY_FAILED,
+                                   "source.project_identity_post_publish",
+                                   "verified exact project row disappeared before query admission");
         cbm_store_close(srv->store);
         srv->store = NULL;
-    }
-
-    /* #704 fallback: either <project>.db is absent or its internal name drifted
-     * from its filename. Node rows are keyed on the INTERNAL name (== the passed
-     * name, since list_projects now advertises internal names), so scan the
-     * cache dir for the db whose sole internal project name equals `project` and
-     * adopt it. Runs ONLY on the fallback — the common fast path is unchanged.
-     * No match → NULL (a genuine typo stays not-found). */
-    cbm_store_t *scanned = resolve_store_fallback_scan(srv, project);
-    if (scanned) {
-        srv->store = scanned;
-        srv->owns_store = true;
-        free(srv->current_project);
-        srv->current_project = heap_strdup(project);
+        return NULL;
     }
 
     return srv->store;
@@ -1232,8 +1260,11 @@ static int collect_db_project_names(cbm_mcp_server_t *srv, const char *dir_path,
         db_project_inspect_status_t inspect =
             db_internal_project_name(srv, "", full_path, iname, sizeof(iname), NULL);
         if (inspect == DB_PROJECT_INSPECT_FAILED) {
-            cbm_closedir(d);
-            return CBM_NOT_FOUND;
+            /* An unrelated unusable candidate is not project identity
+             * authority.  It was logged with exact path/operation; omit it
+             * from this compact hint and let list_projects expose the complete
+             * structured refusal inventory. */
+            continue;
         }
         if (inspect == DB_PROJECT_INSPECT_GHOST) {
             continue;
@@ -1294,9 +1325,13 @@ static void add_git_context_json(yyjson_mut_doc *doc, yyjson_mut_val *obj, const
 
 /* Build a helpful error listing available projects. Caller must free() result. */
 static char *build_integrity_failed_error(const cbm_mcp_server_t *srv);
+static char *build_provenance_failed_error(const cbm_mcp_server_t *srv);
 static char *build_store_verification_failed_error(const cbm_mcp_server_t *srv);
 
 static char *build_recorded_store_error(const cbm_mcp_server_t *srv) {
+    if (store_error_is_provenance(&srv->store_verify)) {
+        return build_provenance_failed_error(srv);
+    }
     return srv->store_verify.status == CBM_STORE_VERIFY_INTEGRITY_FAILED
                ? build_integrity_failed_error(srv)
                : build_store_verification_failed_error(srv);
@@ -1405,6 +1440,45 @@ static char *build_integrity_failed_error(const cbm_mcp_server_t *srv) {
     return json;
 }
 
+static char *build_provenance_failed_error(const cbm_mcp_server_t *srv) {
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    if (!doc) {
+        return heap_strdup(
+            "{\"code\":\"CBM_STORE_PROVENANCE_FAILED\","
+            "\"message\":\"project alias and persisted store provenance disagree\","
+            "\"remediation\":\"preserve the complete family; archive/reindex the exact "
+            "store or restore its canonical source root\"}");
+    }
+    yyjson_mut_val *root = yyjson_mut_obj(doc);
+    yyjson_mut_doc_set_root(doc, root);
+    yyjson_mut_obj_add_str(doc, root, "code", "CBM_STORE_PROVENANCE_FAILED");
+    yyjson_mut_obj_add_str(
+        doc, root, "message",
+        "project alias, canonical database filename, internal project identity, and live source "
+        "root did not form one exact provenance chain; query admission was refused");
+    yyjson_mut_obj_add_str(
+        doc, root, "remediation",
+        "preserve the complete DB/WAL/SHM family; use the explicit hash-bound archive/reindex "
+        "migration for a legacy store, or restore and re-index the canonical repository root");
+    yyjson_mut_obj_add_str(doc, root, "project", srv->store_error_project);
+    yyjson_mut_obj_add_str(doc, root, "failed_operation", srv->store_verify.operation);
+    yyjson_mut_obj_add_str(doc, root, "detail", srv->store_verify.detail);
+    yyjson_mut_obj_add_str(doc, root, "db_path", srv->store_error_db_path);
+    yyjson_mut_obj_add_str(doc, root, "wal_path", srv->store_error_wal_path);
+    yyjson_mut_obj_add_str(doc, root, "shm_path", srv->store_error_shm_path);
+    yyjson_mut_obj_add_int(doc, root, "expected_schema_version", CBM_GRAPH_SCHEMA_VERSION);
+    yyjson_mut_obj_add_int(doc, root, "native_error", (int64_t)srv->store_verify.native_error);
+    yyjson_mut_obj_add_int(doc, root, "sqlite_error", srv->store_verify.sqlite_error);
+    yyjson_mut_obj_add_bool(doc, root, "db_present", srv->store_verify.db_present);
+    yyjson_mut_obj_add_bool(doc, root, "wal_present", srv->store_verify.wal_present);
+    yyjson_mut_obj_add_bool(doc, root, "shm_present", srv->store_verify.shm_present);
+    yyjson_mut_obj_add_bool(doc, root, "family_preserved_in_place", true);
+    yyjson_mut_obj_add_bool(doc, root, "source_mutation_attempted", false);
+    char *json = yyjson_mut_write(doc, 0, NULL);
+    yyjson_mut_doc_free(doc);
+    return json ? json : heap_strdup("{\"code\":\"CBM_STORE_PROVENANCE_FAILED\"}");
+}
+
 static char *build_store_verification_failed_error(const cbm_mcp_server_t *srv) {
     yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
     if (!doc) {
@@ -1466,6 +1540,9 @@ static char *build_store_verification_failed_error(const cbm_mcp_server_t *srv) 
 
 static char *build_no_store_error(cbm_mcp_server_t *srv, const char *project) {
     if (srv && project && strcmp(srv->store_error_project, project) == 0) {
+        if (store_error_is_provenance(&srv->store_verify)) {
+            return build_provenance_failed_error(srv);
+        }
         if (srv->store_verify.status == CBM_STORE_VERIFY_INTEGRITY_FAILED) {
             return build_integrity_failed_error(srv);
         }
@@ -1587,6 +1664,18 @@ static bool is_project_db_file(const char *name, size_t len) {
     return true;
 }
 
+static bool project_name_from_db_path(const char *full_path, char *project, size_t project_sz) {
+    const char *base = cbm_path_base(full_path);
+    size_t len = base ? strlen(base) : 0;
+    if (!base || !is_project_db_file(base, len) || len <= MCP_DB_EXT ||
+        len - MCP_DB_EXT >= project_sz) {
+        return false;
+    }
+    memcpy(project, base, len - MCP_DB_EXT);
+    project[len - MCP_DB_EXT] = '\0';
+    return cbm_validate_project_name(project);
+}
+
 /* db_internal_project_name — see forward declaration above resolve_store. */
 static db_project_inspect_status_t db_internal_project_name(cbm_mcp_server_t *srv,
                                                             const char *error_project,
@@ -1602,10 +1691,19 @@ static db_project_inspect_status_t db_internal_project_name(cbm_mcp_server_t *sr
         return DB_PROJECT_INSPECT_GHOST;
     }
 
+    char expected_project[CBM_SZ_1K];
+    if (!project_name_from_db_path(full_path, expected_project, sizeof(expected_project))) {
+        record_store_query_failure(
+            srv, error_project, full_path, NULL, CBM_STORE_VERIFY_INTEGRITY_FAILED,
+            "source.project_filename",
+            "database filename does not encode one valid canonical project name");
+        return DB_PROJECT_INSPECT_FAILED;
+    }
+
     cbm_store_t *st = NULL;
     cbm_store_verify_result_t verification;
     cbm_store_verify_status_t verify_status =
-        cbm_store_open_path_query_verified(full_path, &st, &verification);
+        cbm_store_open_path_project_query_verified(full_path, expected_project, &st, &verification);
     if (verify_status == CBM_STORE_VERIFY_SOURCE_MISSING) {
         return DB_PROJECT_INSPECT_GHOST;
     }
@@ -1637,48 +1735,6 @@ static db_project_inspect_status_t db_internal_project_name(cbm_mcp_server_t *sr
         cbm_store_close(st);
     }
     return ok ? DB_PROJECT_INSPECT_OK : DB_PROJECT_INSPECT_FAILED;
-}
-
-/* resolve_store_fallback_scan — see forward declaration above resolve_store. */
-static cbm_store_t *resolve_store_fallback_scan(cbm_mcp_server_t *srv, const char *project) {
-    char dir_path[CBM_SZ_1K];
-    cache_dir(dir_path, sizeof(dir_path));
-    cbm_dir_t *d = cbm_opendir(dir_path);
-    if (!d) {
-        if (cbm_path_exists(dir_path)) {
-            record_store_query_failure(srv, project, dir_path, NULL, CBM_STORE_VERIFY_IO_FAILED,
-                                       "discovery.open_cache_directory",
-                                       "the project cache directory could not be enumerated");
-        }
-        return NULL;
-    }
-    cbm_store_t *found = NULL;
-    cbm_dirent_t *entry;
-    while ((entry = cbm_readdir(d)) != NULL) {
-        const char *n = entry->name;
-        size_t len = strlen(n);
-        if (!is_project_db_file(n, len)) {
-            continue;
-        }
-        char full_path[CBM_SZ_2K];
-        snprintf(full_path, sizeof(full_path), "%s/%s", dir_path, n);
-        char iname[CBM_SZ_1K];
-        cbm_store_t *st = NULL;
-        db_project_inspect_status_t inspect =
-            db_internal_project_name(srv, project, full_path, iname, sizeof(iname), &st);
-        if (inspect == DB_PROJECT_INSPECT_FAILED) {
-            break;
-        }
-        if (inspect == DB_PROJECT_INSPECT_OK) {
-            if (strcmp(iname, project) == 0) {
-                found = st; /* adopt — caller takes ownership */
-                break;
-            }
-            cbm_store_close(st);
-        }
-    }
-    cbm_closedir(d);
-    return found;
 }
 
 /* Open a .db file briefly, collect node/edge counts and root_path,
@@ -1735,8 +1791,40 @@ static db_project_inspect_status_t build_project_json_entry(cbm_mcp_server_t *sr
     return DB_PROJECT_INSPECT_OK;
 }
 
+static const char *recorded_store_error_code(const cbm_mcp_server_t *srv) {
+    if (store_error_is_provenance(&srv->store_verify)) {
+        return "CBM_STORE_PROVENANCE_FAILED";
+    }
+    return srv->store_verify.status == CBM_STORE_VERIFY_INTEGRITY_FAILED
+               ? "CBM_STORE_INTEGRITY_FAILED"
+               : "CBM_STORE_VERIFICATION_FAILED";
+}
+
+static void append_store_refusal_json(yyjson_mut_doc *doc, yyjson_mut_val *refusals,
+                                      const cbm_mcp_server_t *srv) {
+    yyjson_mut_val *item = yyjson_mut_obj(doc);
+    yyjson_mut_obj_add_str(doc, item, "code", recorded_store_error_code(srv));
+    yyjson_mut_obj_add_str(doc, item, "db_path", srv->store_error_db_path);
+    yyjson_mut_obj_add_str(doc, item, "wal_path", srv->store_error_wal_path);
+    yyjson_mut_obj_add_str(doc, item, "shm_path", srv->store_error_shm_path);
+    yyjson_mut_obj_add_str(doc, item, "failed_operation", srv->store_verify.operation);
+    yyjson_mut_obj_add_str(doc, item, "detail", srv->store_verify.detail);
+    yyjson_mut_obj_add_int(doc, item, "expected_schema_version", CBM_GRAPH_SCHEMA_VERSION);
+    yyjson_mut_obj_add_bool(doc, item, "db_present", srv->store_verify.db_present);
+    yyjson_mut_obj_add_bool(doc, item, "wal_present", srv->store_verify.wal_present);
+    yyjson_mut_obj_add_bool(doc, item, "shm_present", srv->store_verify.shm_present);
+    yyjson_mut_obj_add_bool(doc, item, "source_mutation_attempted", false);
+    yyjson_mut_obj_add_str(
+        doc, item, "remediation",
+        "preserve the complete family; run the explicit hash-bound archive/reindex migration "
+        "for this exact path, or repair the reported canonical project provenance");
+    yyjson_mut_arr_add_val(refusals, item);
+}
+
 /* list_projects: scan cache directory for .db files.
- * Each project is a single .db file — no central registry needed. */
+ * Exact filename + internal identity + live canonical root form the registry.
+ * Every unusable candidate is reported explicitly and cannot poison valid
+ * project discovery. */
 static char *handle_list_projects(cbm_mcp_server_t *srv, const char *args) {
     (void)args;
     reset_store_error_state(srv);
@@ -1750,6 +1838,7 @@ static char *handle_list_projects(cbm_mcp_server_t *srv, const char *args) {
     yyjson_mut_val *root = yyjson_mut_obj(doc);
     yyjson_mut_doc_set_root(doc, root);
     yyjson_mut_val *arr = yyjson_mut_arr(doc);
+    yyjson_mut_val *refusals = yyjson_mut_arr(doc);
 
     if (!d && cbm_path_exists(dir_path)) {
         record_store_query_failure(srv, "", dir_path, NULL, CBM_STORE_VERIFY_IO_FAILED,
@@ -1786,17 +1875,17 @@ static char *handle_list_projects(cbm_mcp_server_t *srv, const char *args) {
         db_project_inspect_status_t inspect =
             build_project_json_entry(srv, doc, arr, dir_path, name, len, size_bytes);
         if (inspect == DB_PROJECT_INSPECT_FAILED) {
-            cbm_closedir(d);
-            yyjson_mut_doc_free(doc);
-            char *error = build_recorded_store_error(srv);
-            char *result = cbm_mcp_text_result(error, true);
-            free(error);
-            return result;
+            append_store_refusal_json(doc, refusals, srv);
+            continue;
         }
     }
     cbm_closedir(d);
 
     yyjson_mut_obj_add_val(doc, root, "projects", arr);
+    yyjson_mut_obj_add_val(doc, root, "store_refusals", refusals);
+    yyjson_mut_obj_add_int(doc, root, "refused_store_count",
+                           (int64_t)yyjson_mut_arr_size(refusals));
+    yyjson_mut_obj_add_bool(doc, root, "discovery_complete", true);
 
     /* Guide user when no projects are indexed */
     if (yyjson_mut_arr_size(arr) == 0) {
@@ -4432,6 +4521,19 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
             "CBM_REPO_PATH_UNRESOLVABLE: repo_path does not resolve to an existing readable "
             "filesystem object; pass an existing repository path",
             true);
+    }
+
+    if (cbm_path_is_ephemeral_launcher_root(repo_path)) {
+        cbm_log_error("index.ephemeral_project_root", "code", "CBM_EPHEMERAL_PROJECT_ROOT",
+                      "repo_path", repo_path, "index_started", "false", "store_created", "false",
+                      "remediation", "index the stable canonical repository root", NULL);
+        char *error = build_ephemeral_project_root_error(repo_path);
+        free(mode_str);
+        free(name_override);
+        free(repo_path);
+        char *result = cbm_mcp_text_result(error, true);
+        free(error);
+        return result;
     }
 
     /* Optional workspace boundary: when CBM_ALLOWED_ROOT is set (agentic /

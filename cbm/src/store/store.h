@@ -265,6 +265,16 @@ cbm_store_verify_status_t cbm_store_open_path_query_verified(const char *db_path
                                                              cbm_store_t **out_store,
                                                              cbm_store_verify_result_t *result);
 
+/* Verify and open the exact named project consumed by MCP query tools.  In
+ * addition to the complete query schema contract, the sole persisted project
+ * name must equal `project` and its persisted root_path must resolve to the
+ * same canonical, currently existing filesystem path.  This is the query
+ * admission boundary for project/store provenance: callers must never obtain
+ * an alias by scanning for and adopting a differently named database file. */
+cbm_store_verify_status_t cbm_store_open_path_project_query_verified(
+    const char *db_path, const char *project, cbm_store_t **out_store,
+    cbm_store_verify_result_t *result);
+
 /* Verify and open the graph state consumed by cbm_gbuf_load_from_db.  This uses
  * the same source-family freeze, byte/hash-checked snapshot, and race-free
  * read-only publication boundary as cbm_store_open_path_query_verified, but

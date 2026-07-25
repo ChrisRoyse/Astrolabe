@@ -569,6 +569,41 @@ bool cbm_validate_project_name(const char *name) {
     return true;
 }
 
+static bool path_marker_char_equal(char actual, char expected) {
+    if (expected == '/') {
+        return actual == '/' || actual == '\\';
+    }
+#ifdef _WIN32
+    if (actual >= 'A' && actual <= 'Z') {
+        actual = (char)(actual - 'A' + 'a');
+    }
+#endif
+    return actual == expected;
+}
+
+bool cbm_path_is_ephemeral_launcher_root(const char *path) {
+    static const char marker[] = ".tmp/windows-gnu-toolchain-";
+    if (!path || !path[0]) {
+        return false;
+    }
+
+    size_t marker_len = sizeof(marker) - 1;
+    size_t path_len = strlen(path);
+    for (size_t i = 0; i + marker_len <= path_len; i++) {
+        if (i > 0 && path[i - 1] != '/' && path[i - 1] != '\\') {
+            continue;
+        }
+        size_t j = 0;
+        while (j < marker_len && path_marker_char_equal(path[i + j], marker[j])) {
+            j++;
+        }
+        if (j == marker_len) {
+            return true;
+        }
+    }
+    return false;
+}
+
 enum {
     UTF8_REPLACEMENT_LEN = 3, /* U+FFFD encodes as EF BF BD */
 };
