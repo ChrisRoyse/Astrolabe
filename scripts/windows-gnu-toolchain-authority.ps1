@@ -6307,6 +6307,19 @@ Assert-NoAmbientCargoTargetEscape -OwnedTargetRoot $target
 # Reparse/alias roots are refused consistently across claim and recovery.
 Assert-AstroLauncherNativePathContract -Root $root
 Assert-AstroLauncherRootCanonical $root
+# #735: an ordinary launcher cannot acquire recovery authority over target bytes left by
+# another generation. Refuse those bytes before publishing this generation's lock/TEMP/
+# manifest pair, so a known orphan cannot make every attempted admission accumulate one more
+# dead pair. The post-claim preflight below remains the second control for a target that appears
+# after this read-only boundary.
+if (-not $RecoverPreservedTarget) {
+    foreach ($ownedTarget in $ownedTargetRoots) {
+        $targetBeforeClaim = Get-AstroPathEntryState $ownedTarget
+        if ($targetBeforeClaim.State -cne 'absent') {
+            throw "TARGET[ASTRO_TARGET_PREEXISTING_UNOWNED_BEFORE_CLAIM]: {code=ASTRO_TARGET_PREEXISTING_UNOWNED_BEFORE_CLAIM; message=`"owned target path is not absent before launcher protocol publication (state=$($targetBeforeClaim.State); attributes=$($targetBeforeClaim.Attributes); error=$($targetBeforeClaim.Error)): $ownedTarget`"; remediation=`"do not retry ordinary launcher admission; preserve the path and use only the tracker-bound -RecoverPreservedTarget transaction, then archive each proven-dead complete pair with scripts\archive-launcher-state.ps1`"}"
+        }
+    }
+}
 $workspaceTempParentState = Get-AstroPathEntryState $workspaceTempParent
 if ($workspaceTempParentState.State -eq 'absent') {
     [IO.Directory]::CreateDirectory($workspaceTempParent) | Out-Null

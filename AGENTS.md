@@ -4,6 +4,8 @@
 
 The execution boundary is non-negotiable:
 
+- Dead-generation recovery (#735): never retry an ordinary launcher while an owned `target/` or dead complete TEMP/manifest pair remains. Ordinary admission refuses a non-absent target before publishing a new protocol generation. After exact owner-generation and deterministic-Job absence plus the required machine-readable tracker comment, archive the lock/transition with `scripts\reclaim-launcher-lock.ps1`, recover only the hash-bound target through `scripts\windows-gnu-toolchain.ps1 -RecoverPreservedTarget ...`, then archive each complete pair with `scripts\archive-launcher-state.ps1`. These are distinct durable transactions; target absence must be read back before pair archival. Preserve every byte on any identity, hash, Job, tracker, or readback mismatch.
+
 - Work only from the canonical checkout at `C:\code\Astrolabe`.
 - Produce build/test evidence with native Windows processes and the native GNU toolchain, because the Rust host and the static `libcbm.a` archive must share one ABI. Run POSIX scripts under a Git for Windows Bash executable (e.g. `C:\Program Files\Git\bin\bash.exe`) for a consistent, pinned toolchain.
 - WSL coexistence: WSL is a normal, permitted part of this Windows machine. Project scripts, the launcher, and gates must never treat WSL (services, packages, distributions, `wsl.exe`, `wslservice`, `vmmemWSL`, `C:\Windows\System32\bash.exe`) as a fault condition, must never fail closed on its presence, and must never stop, disable, uninstall, or DISM-service it. Do not build anything that wipes or polices WSL to keep the host "pure." Evidence runs natively only to match the shipping target, not out of hostility toward WSL.
