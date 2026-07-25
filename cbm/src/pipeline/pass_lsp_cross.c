@@ -449,7 +449,7 @@ static bool pxc_append_results(CBMArena *dst_arena, CBMResolvedCallArray *dst_ca
             cbm_arena_destroy(&keys);
             return false;
         }
-        if (k && cbm_ht_has(seen, k))
+        if (cbm_ht_has(seen, k))
             continue;
         if (!cbm_ht_set_checked(seen, k, (void *)1, NULL)) {
             cbm_log_error("lsp_cross.append_failed", "code", "CBM_LSP_DEDUP_INSERT_FAILED",

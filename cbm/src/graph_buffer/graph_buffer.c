@@ -731,7 +731,8 @@ static void release_gbuf_indexes(cbm_gbuf_t *gb) {
 /* ── Lifecycle ──────────────────────────────────────────────────── */
 
 cbm_gbuf_t *cbm_gbuf_new(const char *project, const char *root_path) {
-    if (!project || !project[0] || !valid_utf8_text(project) || !valid_utf8_text(root_path)) {
+    if (!project || !project[0] || !root_path || !root_path[0] || !valid_utf8_text(project) ||
+        !valid_utf8_text(root_path)) {
         cbm_log_error("gbuf.create_refused", "code", "CBM_GRAPH_IDENTITY_TEXT_INVALID", "project",
                       project ? project : "", "message",
                       "project or root identity is empty or not valid UTF-8", "remediation",
@@ -743,8 +744,8 @@ cbm_gbuf_t *cbm_gbuf_new(const char *project, const char *root_path) {
         return NULL;
     }
 
-    gb->project = strdup(project ? project : "");
-    gb->root_path = strdup(root_path ? root_path : "");
+    gb->project = strdup(project);
+    gb->root_path = strdup(root_path);
     gb->next_id = SKIP_ONE;
     gb->shared_ids = NULL;
 
@@ -1705,8 +1706,7 @@ int cbm_gbuf_load_from_db_checked(cbm_gbuf_t *gb, const char *db_path, const cha
         const cbm_gbuf_node_t *loaded = cbm_gbuf_find_by_id(gb, new_id);
         if (new_id <= 0 || !loaded || !loaded->atom_id) {
             set_load_error(error, "CBM_GRAPH_NODE_RECONSTRUCTION_FAILED",
-                           "graph_load_reconstruct_node", qn ? qn : db_path,
-                           (size_t)(old_id < 0 ? 0 : old_id),
+                           "graph_load_reconstruct_node", qn ? qn : db_path, (size_t)old_id,
                            "a persisted graph node could not be reconstructed exactly in memory",
                            "inspect the preceding graph-buffer diagnostic, repair the exact "
                            "identity or allocation failure, then retry");
