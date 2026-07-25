@@ -45,6 +45,7 @@ using Microsoft.Win32.SafeHandles;
 public static class AstroLauncherTempNative
 {
     private const uint FILE_LIST_DIRECTORY = 0x0001;
+    private const uint FILE_READ_DATA = 0x0001;
     private const uint FILE_READ_ATTRIBUTES = 0x0080;
     private const uint FILE_WRITE_ATTRIBUTES = 0x0100;
     private const uint FILE_TRAVERSE = 0x0020;
@@ -77,6 +78,7 @@ public static class AstroLauncherTempNative
     private const int FILE_ID_BOTH_DIRECTORY_INFO_CLASS = 10;
     private const int FILE_RENAME_INFO_CLASS = 3;
     private const int FILE_DISPOSITION_INFO_CLASS = 4;
+    private const int FILE_LINK_INFO_CLASS = 11;
     private const int ERROR_FILE_NOT_FOUND = 2;
     private const int ERROR_PATH_NOT_FOUND = 3;
     private const int ERROR_NO_MORE_FILES = 18;
@@ -120,6 +122,13 @@ public static class AstroLauncherTempNative
         public long LastWriteTime;
         public long ChangeTime;
         public uint FileAttributes;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct IO_STATUS_BLOCK
+    {
+        public IntPtr Status;
+        public UIntPtr Information;
     }
 
     [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
@@ -204,6 +213,18 @@ public static class AstroLauncherTempNative
         uint size
     );
 
+    [DllImport("ntdll.dll")]
+    private static extern int NtSetInformationFile(
+        SafeFileHandle file,
+        out IO_STATUS_BLOCK ioStatusBlock,
+        IntPtr information,
+        uint size,
+        int informationClass
+    );
+
+    [DllImport("ntdll.dll")]
+    private static extern uint RtlNtStatusToDosError(int status);
+
     [DllImport("kernel32.dll", SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
     private static extern bool DeviceIoControl(
@@ -219,14 +240,6 @@ public static class AstroLauncherTempNative
 
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
     private static extern uint GetFileAttributesW(string path);
-
-    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
-    [return: MarshalAs(UnmanagedType.Bool)]
-    private static extern bool CreateHardLinkW(
-        string newFileName,
-        string existingFileName,
-        IntPtr securityAttributes
-    );
 
     [DllImport("kernel32.dll", SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
@@ -579,13 +592,29 @@ public static class AstroLauncherTempNative
         }
     }
 
+    // #619 publication anchor.  Win32 enforces READ/WRITE share access per file
+    // (the stream control block), so a handle that withholds FILE_SHARE_WRITE
+    // denies writes through *every* hard link of that file -- including a link
+    // that does not exist yet.  DELETE share access is instead enforced per link
+    // (IoCheckLinkShareAccess), so this anchor's withheld FILE_SHARE_DELETE
+    // protects only the scratch link and the published link needs its own
+    // delete-denying lease.
+    //
+    // The anchor deliberately requests no write access.  That is what allows the
+    // write-denying guard below to be opened while the anchor stays live, which
+    // in turn is what keeps the object continuously write-denied across the
+    // moment the published link is created.  FILE_FLAG_DELETE_ON_CLOSE is armed
+    // by this creating syscall, so a hard death at any point before the guard and
+    // anchor are released removes the scratch link in-kernel.  FILE_SHARE_WRITE
+    // is granted only because the transient writer must open the same link; the
+    // writer's own withheld FILE_SHARE_WRITE denies peers for that interval.
     public static SafeFileHandle CreateDeleteOnCloseScratch(string path)
     {
         string full = Path.GetFullPath(path);
         SafeFileHandle handle = CreateFileW(
             GetExtendedLengthPath(full),
-            GENERIC_READ | DELETE_ACCESS,
-            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            FILE_READ_DATA | FILE_READ_ATTRIBUTES | DELETE_ACCESS,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
             IntPtr.Zero,
             CREATE_NEW,
             FILE_ATTRIBUTE_NORMAL | FILE_FLAG_DELETE_ON_CLOSE |
@@ -622,20 +651,97 @@ public static class AstroLauncherTempNative
         }
     }
 
-    public static SafeFileHandle OpenExactScratchPublisher(string path)
+    // Transient scratch writer (#619).  It is the only handle in the publication
+    // lifecycle that ever holds FILE_WRITE_DATA, and it is closed before the
+    // published link is created, so no write-capable handle to the object can
+    // coexist with the published link.  It withholds FILE_SHARE_WRITE, so peers
+    // are denied writes for its whole lifetime, and it requests no DELETE access
+    // because the anchor no longer shares DELETE on the scratch link.
+    public static SafeFileHandle OpenExactScratchWriter(string path)
     {
         SafeFileHandle handle = OpenEntry(
             Path.GetFullPath(path),
-            GENERIC_READ | GENERIC_WRITE | DELETE_ACCESS,
+            GENERIC_READ | GENERIC_WRITE,
             FILE_SHARE_READ | FILE_SHARE_DELETE,
-            "exact write-denying launcher scratch publisher"
+            "exact write-denying launcher scratch writer"
         );
         try
         {
             RequireOrdinarySingleLinkFile(
                 handle,
-                "exact write-denying launcher scratch publisher"
+                "exact write-denying launcher scratch writer"
             );
+            return handle;
+        }
+        catch
+        {
+            handle.Dispose();
+            throw;
+        }
+    }
+
+    // Continuous write-denying publication guard (#619).  Opened on the scratch
+    // link after the transient writer is closed and held live across the
+    // FileLinkInformation publication and the published lease open.  Because
+    // READ/WRITE share access is per file, this single withheld FILE_SHARE_WRITE
+    // denies every peer write to the published link from before that link exists
+    // until the published lease -- which withholds FILE_SHARE_WRITE itself --
+    // has been established.  There is therefore no instant at which a path-only
+    // peer can mutate the published object.  It shares DELETE because the anchor
+    // still holds DELETE access on the same link for its delete-on-close.
+    public static SafeFileHandle OpenExactWriteDenyingPublicationGuard(string path)
+    {
+        SafeFileHandle handle = OpenEntry(
+            Path.GetFullPath(path),
+            FILE_READ_DATA | FILE_READ_ATTRIBUTES,
+            FILE_SHARE_READ | FILE_SHARE_DELETE,
+            "exact write-denying publication guard"
+        );
+        try
+        {
+            RequireOrdinarySingleLinkFile(
+                handle,
+                "exact write-denying publication guard"
+            );
+            return handle;
+        }
+        catch
+        {
+            handle.Dispose();
+            throw;
+        }
+    }
+
+    // Immutable published-claim lease (#619).  It withholds both FILE_SHARE_WRITE
+    // and FILE_SHARE_DELETE, so for its whole lifetime no peer can write the
+    // object through any link and no peer can delete or rename the published
+    // link.  It deliberately requests no write access: a lease holding
+    // FILE_WRITE_DATA could not be opened while the write-denying guard is live,
+    // which would reintroduce the writable publication window this lease exists
+    // to eliminate.  DELETE access is retained so the owner can still rename the
+    // lease by handle and set its own disposition.
+    public static SafeFileHandle OpenExactPublishedClaimLease(string path)
+    {
+        SafeFileHandle handle = OpenEntry(
+            Path.GetFullPath(path),
+            GENERIC_READ | DELETE_ACCESS,
+            FILE_SHARE_READ,
+            "exact immutable published claim lease"
+        );
+        try
+        {
+            BY_HANDLE_FILE_INFORMATION information = ReadInformation(
+                handle,
+                "exact immutable published claim lease"
+            );
+            if ((information.FileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0 ||
+                (information.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0 ||
+                information.NumberOfLinks == 0)
+            {
+                throw new InvalidOperationException(
+                    "immutable published claim lease must bind an ordinary linked file"
+                );
+            }
             return handle;
         }
         catch
@@ -650,7 +756,9 @@ public static class AstroLauncherTempNative
     // it is compatible with both retained scratch handles, but it requests
     // READ only and therefore cannot mutate the publication object.  Keeping
     // it live bridges identity across closing every handle opened through the
-    // delete-on-close scratch name.
+    // delete-on-close scratch name.  It is not an immutability lease: Win32
+    // cannot tighten an open file object's share mask, and an equivalent-token
+    // peer is explicitly outside the launcher security-principal boundary.
     public static SafeFileHandle OpenExactSharedPublicationObserver(string path)
     {
         SafeFileHandle handle = OpenEntry(
@@ -726,6 +834,7 @@ public static class AstroLauncherTempNative
     public static void CreateExactHardLinkNoReplace(
         SafeFileHandle source,
         string expectedSourcePath,
+        SafeFileHandle destinationDirectory,
         string destinationPath
     )
     {
@@ -739,34 +848,84 @@ public static class AstroLauncherTempNative
             );
         }
         string destination = Path.GetFullPath(destinationPath);
-        uint attributes = GetFileAttributesW(GetExtendedLengthPath(destination));
-        if (attributes != INVALID_FILE_ATTRIBUTES)
-        {
-            throw new IOException(
-                "no-replace launcher claim destination already exists: " + destination
-            );
-        }
-        int absenceError = Marshal.GetLastWin32Error();
-        if (absenceError != ERROR_FILE_NOT_FOUND && absenceError != ERROR_PATH_NOT_FOUND)
-        {
-            throw new Win32Exception(
-                absenceError,
-                "launcher claim destination absence is unevaluable: " + destination
-            );
-        }
-        // CreateHardLinkW is atomic and has no replace-existing mode. Return
-        // immediately after the kernel reports success; the caller records the
-        // typed transition before performing any fallible readback.
-        if (!CreateHardLinkW(
-            GetExtendedLengthPath(destination),
-            GetExtendedLengthPath(sourceFinal),
-            IntPtr.Zero
+        RequireOrdinaryDirectory(
+            destinationDirectory,
+            "launcher claim destination directory"
+        );
+        string destinationParent = Path.GetDirectoryName(destination);
+        string retainedParent = GetFinalPath(destinationDirectory);
+        if (!String.Equals(
+            destinationParent.TrimEnd('\\', '/'),
+            retainedParent.TrimEnd('\\', '/'),
+            StringComparison.OrdinalIgnoreCase
         ))
         {
-            throw new Win32Exception(
-                Marshal.GetLastWin32Error(),
-                "atomic no-replace launcher claim hard-link publication failed"
+            throw new InvalidOperationException(
+                "launcher claim destination directory handle differs from destination parent"
             );
+        }
+        string destinationLeaf = Path.GetFileName(destination);
+        if (String.IsNullOrEmpty(destinationLeaf) ||
+            destinationLeaf.IndexOfAny(new char[] { '\\', '/' }) >= 0)
+        {
+            throw new InvalidOperationException(
+                "launcher claim destination leaf is empty or contains a separator"
+            );
+        }
+        // FILE_LINK_INFO binds the publication syscall to the already-retained
+        // source FILE_OBJECT. ReplaceIfExists remains FALSE, so collision and
+        // source identity are decided together by NTFS. SetFileInformationByHandle
+        // does not expose FileLinkInfo in its supported Win32 class table, so use
+        // the documented NT FileLinkInformation ABI with the already-retained
+        // exact destination-directory handle and a relative leaf.
+        byte[] nameBytes = Encoding.Unicode.GetBytes(destinationLeaf);
+        int rootOffset = IntPtr.Size == 8 ? 8 : 4;
+        int lengthOffset = rootOffset + IntPtr.Size;
+        int nameOffset = lengthOffset + 4;
+        int rawSize = checked(nameOffset + nameBytes.Length + 2);
+        int bufferSize = checked(
+            ((rawSize + IntPtr.Size - 1) / IntPtr.Size) * IntPtr.Size
+        );
+        IntPtr buffer = Marshal.AllocHGlobal(bufferSize);
+        bool directoryReferenceAdded = false;
+        try
+        {
+            destinationDirectory.DangerousAddRef(ref directoryReferenceAdded);
+            for (int i = 0; i < bufferSize; i++) Marshal.WriteByte(buffer, i, 0);
+            Marshal.WriteInt32(buffer, 0, 0);
+            Marshal.WriteIntPtr(
+                buffer,
+                rootOffset,
+                destinationDirectory.DangerousGetHandle()
+            );
+            Marshal.WriteInt32(buffer, lengthOffset, nameBytes.Length);
+            Marshal.Copy(nameBytes, 0, IntPtr.Add(buffer, nameOffset), nameBytes.Length);
+            IO_STATUS_BLOCK ioStatus;
+            int nativeStatus = NtSetInformationFile(
+                source,
+                out ioStatus,
+                buffer,
+                (uint)bufferSize,
+                FILE_LINK_INFO_CLASS
+            );
+            if (nativeStatus < 0)
+            {
+                uint nativeError = RtlNtStatusToDosError(nativeStatus);
+                throw new Win32Exception(
+                    unchecked((int)nativeError),
+                    "LAUNCHER_BOUNDARY[ASTRO_LAUNCHER_PUBLICATION_LINK_FAILED]: " +
+                    "atomic by-handle no-replace launcher claim publication failed " +
+                    "(native_ntstatus=0x" +
+                    unchecked((uint)nativeStatus).ToString("x8", CultureInfo.InvariantCulture) +
+                    "; native_error=" + nativeError.ToString(CultureInfo.InvariantCulture) +
+                    "; destination=" + destination + ")"
+                );
+            }
+        }
+        finally
+        {
+            if (directoryReferenceAdded) destinationDirectory.DangerousRelease();
+            Marshal.FreeHGlobal(buffer);
         }
     }
 
@@ -3008,44 +3167,69 @@ function New-AstroLauncherPreclaimScratchLease {
     }
 
     $deleteOnCloseHandle = $null
-    $publisherHandle = $null
+    $writerHandle = $null
+    $guardHandle = $null
     try {
+        # #619 handle lifecycle.  The anchor is created first and holds no write
+        # access, so the write-denying guard can be opened later while the anchor
+        # is still live.  The transient writer is the only write-capable handle
+        # and is closed before the guard is opened; from the guard's open until
+        # the immutable published lease is established the object is continuously
+        # write-denied, so the published link never has a writable instant.
         $deleteOnCloseHandle =
             [AstroLauncherTempNative]::CreateDeleteOnCloseScratch($full)
         $deleteOnCloseFileId =
             [AstroLauncherTempNative]::GetExactSingleLinkFileIdentity(
                 $deleteOnCloseHandle
             )
-        $publisherHandle =
-            [AstroLauncherTempNative]::OpenExactScratchPublisher($full)
-        $publisherFileId =
+        $writerHandle =
+            [AstroLauncherTempNative]::OpenExactScratchWriter($full)
+        $writerFileId =
             [AstroLauncherTempNative]::GetExactSingleLinkFileIdentity(
-                $publisherHandle
+                $writerHandle
             )
-        if ($publisherFileId -cne $deleteOnCloseFileId) {
-            throw 'scratch publisher and delete-on-close primary bind different FILE_IDs'
+        if ($writerFileId -cne $deleteOnCloseFileId) {
+            throw 'scratch writer and delete-on-close primary bind different FILE_IDs'
         }
         [AstroLauncherTempNative]::WriteExactScratchAndFlush(
-            $publisherHandle,
+            $writerHandle,
             $Bytes
         )
+        # Retire every write-capable handle before the guard is opened.  After
+        # this disposal no handle in this process can write the object again.
+        $writerHandle.Dispose()
+        $writerHandle = $null
+
+        $guardHandle =
+            [AstroLauncherTempNative]::OpenExactWriteDenyingPublicationGuard($full)
+        $guardFileId =
+            [AstroLauncherTempNative]::GetExactSingleLinkFileIdentity(
+                $guardHandle
+            )
+        if ($guardFileId -cne $deleteOnCloseFileId) {
+            throw 'publication guard and delete-on-close primary bind different FILE_IDs'
+        }
+        # This readback runs through the guard, i.e. after writes are denied.  It
+        # is the cut that detects any peer that mutated the unpublished scratch
+        # while the writer was being handed over; nothing is published yet, so a
+        # mismatch fails closed with the source intact.
         $snapshot = Get-AstroExactRetainedFileSnapshot `
-            -Handle $publisherHandle `
+            -Handle $guardHandle `
             -ExpectedPath $full `
             -MaximumBytes $script:AstroLauncherLockMaxBytes
         if ($snapshot.Length -ne [uint64]$Bytes.LongLength -or
             [Convert]::ToBase64String($snapshot.Bytes) -cne
                 [Convert]::ToBase64String($Bytes) -or
             [AstroLauncherTempNative]::GetExactFileLinkCount(
-                $publisherHandle
+                $guardHandle
             ) -ne 1) {
             throw 'durable delete-on-close scratch differs from its intended exact bytes or link count'
         }
         return [pscustomobject]@{
             Path = $full
-            SafeFileHandle = $publisherHandle
-            Handle = $publisherHandle
-            Stream = $publisherHandle
+            SafeFileHandle = $guardHandle
+            Handle = $guardHandle
+            Stream = $guardHandle
             DeleteOnCloseHandle = $deleteOnCloseHandle
             DeleteOnCloseFileId = $deleteOnCloseFileId
             InitialSnapshot = $snapshot
@@ -3054,6 +3238,8 @@ function New-AstroLauncherPreclaimScratchLease {
             Sha256 = $snapshot.Sha256
             Bytes = $snapshot.Bytes
             DeleteOnClose = $true
+            WriteAccess = $false
+            WriterClosed = $true
             ScratchLinkClosed = $false
             Disposed = $false
         }
@@ -3064,9 +3250,13 @@ function New-AstroLauncherPreclaimScratchLease {
             -not $deleteOnCloseHandle.IsClosed) {
             $deleteOnCloseHandle.Dispose()
         }
-        if ($null -ne $publisherHandle -and
-            -not $publisherHandle.IsClosed) {
-            $publisherHandle.Dispose()
+        if ($null -ne $writerHandle -and
+            -not $writerHandle.IsClosed) {
+            $writerHandle.Dispose()
+        }
+        if ($null -ne $guardHandle -and
+            -not $guardHandle.IsClosed) {
+            $guardHandle.Dispose()
         }
         $terminal = Get-AstroPathEntryState $full
         throw "delete-on-close preclaim scratch construction failed (terminal_state=$($terminal.State), terminal_error=$($terminal.Error)): $message"
@@ -3111,80 +3301,65 @@ function Complete-AstroLauncherPreclaimScratchPublication {
 
     $observer = $null
     $claimHandle = $null
+    $publicationStage = 'validate-published-two-link-object'
     try {
-        # A Windows delete-on-close name is not removed until every handle that
-        # was opened through that name is closed.  First retain a read-only
-        # observer opened through the published claim name; it shares the
-        # publisher's WRITE/DELETE access and bridges the exact FILE_ID while
-        # both scratch-path handles are released.
-        $observer =
-            [AstroLauncherTempNative]::OpenExactSharedPublicationObserver(
-                $claimFull
-            )
-        $observerBefore = Get-AstroExactRetainedFileSnapshot `
-            -Handle $observer `
+        # #619 ordering.  The write-denying guard opened before publication is
+        # still live here, so the published link -- which is a second link to the
+        # same file -- is already write-denied to every peer, because Win32
+        # enforces READ/WRITE share access per file rather than per link.  The
+        # immutable published lease is therefore opened BEFORE any scratch handle
+        # is released.  Its own withheld FILE_SHARE_WRITE/FILE_SHARE_DELETE takes
+        # over while the guard still denies writes, so the object is continuously
+        # protected and there is no instant at which a path-only peer can mutate
+        # the published claim.  The lease holds no write access precisely so that
+        # it can be opened while the guard is live.
+        $publicationStage = 'open-immutable-published-lease'
+        $claimHandle =
+            [AstroLauncherTempNative]::OpenExactPublishedClaimLease($claimFull)
+        $publicationStage = 'validate-immutable-published-lease'
+        $publishedBefore = Get-AstroExactRetainedFileSnapshot `
+            -Handle $claimHandle `
             -ExpectedPath $claimFull `
             -MaximumBytes $script:AstroLauncherLockMaxBytes
-        if ($observerBefore.FileId -cne
+        if ($publishedBefore.FileId -cne
                 $ScratchLease.CurrentSnapshot.FileId -or
-            $observerBefore.Length -ne [uint64]$ExpectedBytes.LongLength -or
-            $observerBefore.Sha256 -cne $ScratchLease.CurrentSnapshot.Sha256 -or
-            [Convert]::ToBase64String($observerBefore.Bytes) -cne
+            $publishedBefore.Length -ne [uint64]$ExpectedBytes.LongLength -or
+            $publishedBefore.Sha256 -cne $ScratchLease.CurrentSnapshot.Sha256 -or
+            [Convert]::ToBase64String($publishedBefore.Bytes) -cne
                 [Convert]::ToBase64String($ExpectedBytes) -or
-            [AstroLauncherTempNative]::GetExactFileLinkCount($observer) -ne 2) {
-            throw 'published claim observer differs from the exact two-link durable scratch object'
+            [AstroLauncherTempNative]::GetExactFileLinkCount($claimHandle) -ne 2) {
+            throw 'immutable published lease differs from the exact two-link durable scratch object'
         }
 
+        # A Windows delete-on-close name is not removed until every handle that
+        # was opened through that name is closed.  Both scratch-path handles are
+        # released here; the published link survives and stays protected by the
+        # lease opened above.
+        $publicationStage = 'close-delete-on-close-primary'
         $ScratchLease.DeleteOnCloseHandle.Dispose()
         $ScratchLease.ScratchLinkClosed = $true
-        # The publisher continues denying WRITE while the primary's
-        # delete-on-close is armed.  Closing the publisher last retires the
-        # scratch link atomically; the final-name observer then bridges the
-        # immutable claim identity without exposing a writeable interval.
+        $publicationStage = 'close-write-denying-publication-guard'
         $ScratchLease.SafeFileHandle.Dispose()
         $ScratchLease.Disposed = $true
+        $publicationStage = 'readback-retired-scratch'
         $scratchTerminal = Get-AstroPathEntryState $scratchPath
         if ($scratchTerminal.State -ne 'absent') {
             throw "delete-on-close scratch link is not absent after closing every scratch-path handle (state=$($scratchTerminal.State), error=$($scratchTerminal.Error)): $scratchPath"
         }
-        if ([AstroLauncherTempNative]::GetExactFileLinkCount($observer) -ne 1) {
-            throw 'published claim did not become the sole link after every scratch-path handle closed'
-        }
-        $observerAfter = Get-AstroExactRetainedFileSnapshot `
-            -Handle $observer `
-            -ExpectedPath $claimFull `
-            -MaximumBytes $script:AstroLauncherLockMaxBytes
-        if ($observerAfter.FileId -cne $observerBefore.FileId -or
-            $observerAfter.Length -ne $observerBefore.Length -or
-            $observerAfter.Sha256 -cne $observerBefore.Sha256 -or
-            [Convert]::ToBase64String($observerAfter.Bytes) -cne
-                [Convert]::ToBase64String($observerBefore.Bytes)) {
-            throw 'published claim changed while the scratch name was retired'
-        }
-
-        # Establish the normal write/delete-denying claim lease only by the
-        # final name, while the shared observer still pins the proven object.
-        $claimHandle = [AstroLauncherLockNative]::OpenExactRenameSource($claimFull)
+        $publicationStage = 'validate-sole-published-link'
         $snapshot = Get-AstroExactRetainedFileSnapshot `
             -Handle $claimHandle `
             -ExpectedPath $claimFull `
             -MaximumBytes $script:AstroLauncherLockMaxBytes
-        if ($snapshot.FileId -cne $observerAfter.FileId -or
-            $snapshot.Length -ne $observerAfter.Length -or
-            $snapshot.Sha256 -cne $observerAfter.Sha256 -or
+        if ($snapshot.FileId -cne $publishedBefore.FileId -or
+            $snapshot.Length -ne $publishedBefore.Length -or
+            $snapshot.Sha256 -cne $publishedBefore.Sha256 -or
             [Convert]::ToBase64String($snapshot.Bytes) -cne
                 [Convert]::ToBase64String($ExpectedBytes) -or
             [AstroLauncherTempNative]::GetExactFileLinkCount(
                 $claimHandle
             ) -ne 1) {
-            throw 'final restrictive claim lease differs from its retained publication observer'
-        }
-        $observer.Dispose()
-        $observer = $null
-        if ([AstroLauncherTempNative]::GetExactFileLinkCount(
-                $claimHandle
-            ) -ne 1) {
-            throw 'published claim gained another filesystem link before restrictive-lease handoff'
+            throw 'published claim changed or did not become the sole link while the scratch name was retired'
         }
 
         $state = Convert-AstroLauncherLockBytesToState $snapshot.Bytes $claimFull
@@ -3203,6 +3378,12 @@ function Complete-AstroLauncherPreclaimScratchPublication {
             Sha256 = $snapshot.Sha256
             Bytes = $snapshot.Bytes
             Disposed = $false
+            # #619: the published lease intentionally holds no FILE_WRITE_DATA so
+            # that its share mask can deny peer writes for the whole lease
+            # lifetime.  Consumers must not attempt FlushFileBuffers on it; the
+            # object's data was durably flushed before publication and can never
+            # change afterwards.
+            WriteAccess = $false
             ScratchPath = $scratchPath
             ScratchTerminalState = $scratchTerminal.State
         }
@@ -3210,13 +3391,50 @@ function Complete-AstroLauncherPreclaimScratchPublication {
         return $result
     }
     catch {
+        $publicationFault = $_.Exception
+        $nativeError = if ($publicationFault -is [ComponentModel.Win32Exception]) {
+            $publicationFault.NativeErrorCode
+        }
+        elseif ($null -ne $publicationFault.InnerException -and
+            $publicationFault.InnerException -is [ComponentModel.Win32Exception]) {
+            $publicationFault.InnerException.NativeErrorCode
+        }
+        else {
+            0
+        }
         if ($null -ne $claimHandle -and -not $claimHandle.IsClosed) {
             $claimHandle.Dispose()
         }
         if ($null -ne $observer -and -not $observer.IsClosed) {
             $observer.Dispose()
         }
-        throw
+        $scratchState = Get-AstroPathEntryState $scratchPath
+        $finalState = Get-AstroPathEntryState $claimFull
+        $finalReadback = 'not-present'
+        if ($finalState.State -eq 'present') {
+            $finalProbe = $null
+            try {
+                $finalProbe =
+                    [AstroLauncherTempNative]::OpenExactSharedPublicationObserver(
+                        $claimFull
+                    )
+                $finalSnapshot = Get-AstroExactRetainedFileSnapshot `
+                    -Handle $finalProbe `
+                    -ExpectedPath $claimFull `
+                    -MaximumBytes $script:AstroLauncherLockMaxBytes
+                $finalReadback = "file_id=$($finalSnapshot.FileId),length=$($finalSnapshot.Length),sha256=$($finalSnapshot.Sha256)"
+            }
+            catch {
+                $finalReadback = "unevaluable:$($_.Exception.GetType().FullName):$($_.Exception.Message)"
+            }
+            finally {
+                if ($null -ne $finalProbe -and -not $finalProbe.IsClosed) {
+                    $finalProbe.Dispose()
+                }
+            }
+        }
+        $expectedSha256 = Get-AstroByteSha256 $ExpectedBytes
+        throw "LAUNCHER_BOUNDARY[ASTRO_LAUNCHER_PUBLICATION_LEASE_TRANSITION_BROKEN]: {code=ASTRO_LAUNCHER_PUBLICATION_LEASE_TRANSITION_BROKEN; stage=$publicationStage; native_error=$nativeError; scratch_path=$scratchPath; scratch_state=$($scratchState.State); scratch_error=$($scratchState.Error); final_path=$claimFull; final_state=$($finalState.State); final_error=$($finalState.Error); final_readback=$finalReadback; expected_length=$($ExpectedBytes.LongLength); expected_sha256=$expectedSha256; message=$($publicationFault.GetType().FullName): $($publicationFault.Message); remediation=preserve every surviving scratch/final/transition byte, identify the interfering principal and exact native error, then use only the tracker-bound recovery protocol after the exact owner and Job are inactive}"
     }
 }
 

@@ -4899,6 +4899,35 @@ function Assert-AstroLauncherPinnedDirectoryLease {
     }
 }
 
+function Invoke-AstroExactLeaseDurabilityFlush {
+    param(
+        [Parameter(Mandatory)]$Lease,
+        [Parameter(Mandatory)][string]$Operation
+    )
+
+    # FlushFileBuffers requires GENERIC_WRITE on the handle.  A lease that
+    # declares WriteAccess=$false is an immutable published object (#619): it
+    # deliberately holds no write access so that its share mask can deny peer
+    # writes through every link of the file for the whole lease lifetime, which
+    # is exactly what removes the writable publication window.  Its bytes were
+    # durably flushed by the pre-publication scratch write and can never change
+    # again, so no data durability is lost here.  Only the namespace metadata of
+    # $Operation is left to NTFS logging, and a transition interrupted before
+    # that metadata lands is classified as an interrupted transition and fails
+    # closed.  This skip is declared on every occurrence, never silent.
+    if ($Lease.PSObject.Properties['WriteAccess'] -and
+        $Lease.WriteAccess -eq $false) {
+        Write-Information -MessageData (
+            'LAUNCHER_LOCK[ASTRO_LAUNCHER_IMMUTABLE_LEASE_FLUSH_DECLARED]: ' +
+            "operation=$Operation; path=$($Lease.Path); " +
+            'reason=immutable published lease holds no write access by design (#619); ' +
+            'data_durability_owner=pre-publication scratch FlushFileBuffers'
+        ) -InformationAction Continue
+        return
+    }
+    [AstroLauncherLockNative]::FlushExactFile($Lease.SafeFileHandle)
+}
+
 function Rename-AstroExactFileHandleNoReplace {
     param(
         [Parameter(Mandatory)]$Lease,
@@ -4951,7 +4980,7 @@ function Rename-AstroExactFileHandleNoReplace {
         $DestinationDirectoryLease.SafeFileHandle,
         $DestinationLeaf
     )
-    [AstroLauncherLockNative]::FlushExactFile($Lease.SafeFileHandle)
+    Invoke-AstroExactLeaseDurabilityFlush -Lease $Lease -Operation 'no-replace rename'
 
     $after = Get-AstroExactRetainedFileSnapshot `
         -Handle $Lease.SafeFileHandle `
@@ -4990,7 +5019,7 @@ function Invoke-AstroExactFileDispositionDelete {
     # DeleteFile=TRUE except CloseHandle.  Complete the final authorized readback
     # first, then arm deletion and immediately close before observing the pathname.
     $before = Assert-AstroLauncherLockLeaseCurrent $Lease
-    [AstroLauncherLockNative]::FlushExactFile($Lease.SafeFileHandle)
+    Invoke-AstroExactLeaseDurabilityFlush -Lease $Lease -Operation 'disposition delete'
     [AstroLauncherLockNative]::DeleteExactFileHandle($Lease.SafeFileHandle)
     try {
         $Lease.SafeFileHandle.Dispose()

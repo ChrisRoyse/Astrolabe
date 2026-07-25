@@ -3964,6 +3964,16 @@ public class AstroTreeRecorder {
     static extern bool QueryInformationJobObject(IntPtr job, int cls, IntPtr info, uint len, out uint returnedLength);
     [DllImport("kernel32", SetLastError = true)]
     static extern bool SetFileInformationByHandle(SafeFileHandle file, int cls, IntPtr info, uint len);
+    [DllImport("ntdll")]
+    static extern int NtSetInformationFile(
+        SafeFileHandle file,
+        out IO_STATUS_BLOCK ioStatusBlock,
+        IntPtr information,
+        uint length,
+        int informationClass
+    );
+    [DllImport("ntdll")]
+    static extern uint RtlNtStatusToDosError(int status);
     [DllImport("kernel32", SetLastError = true, CharSet = CharSet.Unicode)]
     static extern uint GetFinalPathNameByHandleW(SafeFileHandle file, StringBuilder path, uint pathLength, uint flags);
     [DllImport("kernel32", SetLastError = true)]
@@ -3977,12 +3987,6 @@ public class AstroTreeRecorder {
         uint creationDisposition,
         uint flagsAndAttributes,
         IntPtr templateFile
-    );
-    [DllImport("kernel32", SetLastError = true, CharSet = CharSet.Unicode)]
-    static extern bool CreateHardLinkW(
-        string newFileName,
-        string existingFileName,
-        IntPtr securityAttributes
     );
     [DllImport("kernel32", SetLastError = true, CharSet = CharSet.Unicode)]
     static extern uint GetFileAttributesW(string fileName);
@@ -3999,6 +4003,7 @@ public class AstroTreeRecorder {
     const int JobObjectBasicProcessIdList = 3;
     const int FileRenameInfo = 3;
     const int FileDispositionInfo = 4;
+    const int FileLinkInfo = 11;
     const int FileIdInfo = 18;
     const uint JOB_OBJECT_MSG_NEW_PROCESS = 6;
     const uint JOB_OBJECT_MSG_EXIT_PROCESS = 7;
@@ -4019,19 +4024,27 @@ public class AstroTreeRecorder {
     const uint GENERIC_READ = 0x80000000;
     const uint GENERIC_WRITE = 0x40000000;
     const uint DELETE_ACCESS = 0x00010000;
+    const uint FILE_ADD_FILE = 0x00000002;
+    const uint FILE_TRAVERSE = 0x00000020;
+    const uint FILE_READ_ATTRIBUTES = 0x00000080;
     const uint FILE_SHARE_READ = 0x00000001;
     const uint FILE_SHARE_WRITE = 0x00000002;
     const uint FILE_SHARE_DELETE = 0x00000004;
     const uint CREATE_NEW = 1;
     const uint OPEN_EXISTING = 3;
     const uint FILE_ATTRIBUTE_NORMAL = 0x00000080;
+    const uint FILE_ATTRIBUTE_DIRECTORY = 0x00000010;
+    const uint FILE_ATTRIBUTE_REPARSE_POINT = 0x00000400;
     const uint FILE_FLAG_WRITE_THROUGH = 0x80000000;
+    const uint FILE_FLAG_BACKUP_SEMANTICS = 0x02000000;
     const uint FILE_FLAG_DELETE_ON_CLOSE = 0x04000000;
     const uint FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000;
     const uint INVALID_FILE_ATTRIBUTES = 0xffffffff;
 
     [StructLayout(LayoutKind.Sequential)]
     struct JOBOBJECT_ASSOCIATE_COMPLETION_PORT { public IntPtr CompletionKey; public IntPtr CompletionPort; }
+    [StructLayout(LayoutKind.Sequential)]
+    struct IO_STATUS_BLOCK { public IntPtr Status; public UIntPtr Information; }
 
     [StructLayout(LayoutKind.Sequential)]
     struct JOBOBJECT_BASIC_LIMIT_INFORMATION {
@@ -4583,6 +4596,101 @@ public class AstroTreeRecorder {
         }
     }
 
+    static SafeFileHandle OpenPublicationDirectory(string path) {
+        string full = Path.GetFullPath(path).TrimEnd(new char[] { '\\', '/' });
+        SafeFileHandle directory = CreateFileW(
+            GetExtendedLengthPath(full),
+            FILE_ADD_FILE | FILE_TRAVERSE | FILE_READ_ATTRIBUTES,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            IntPtr.Zero,
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+            IntPtr.Zero
+        );
+        if (directory == null || directory.IsInvalid) {
+            int nativeError = Marshal.GetLastWin32Error();
+            if (directory != null) directory.Dispose();
+            throw new Win32Exception(
+                nativeError,
+                "could not open exact attribution publication directory: " + full
+            );
+        }
+        try {
+            BY_HANDLE_FILE_INFORMATION information;
+            if (!GetFileInformationByHandle(directory, out information))
+                throw new Win32Exception(
+                    Marshal.GetLastWin32Error(),
+                    "could not inspect exact attribution publication directory"
+                );
+            if ((information.FileAttributes & FILE_ATTRIBUTE_DIRECTORY) == 0 ||
+                (information.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0)
+                throw new InvalidDataException(
+                    "attribution publication directory must be ordinary and non-reparse: " + full
+                );
+            if (!String.Equals(GetFinalPath(directory), full, StringComparison.OrdinalIgnoreCase))
+                throw new InvalidDataException(
+                    "attribution publication directory handle resolved away from its exact parent: " + full
+                );
+            return directory;
+        } catch {
+            directory.Dispose();
+            throw;
+        }
+    }
+
+    static void LinkHandleNoReplace(SafeFileHandle source, string destination) {
+        string full = Path.GetFullPath(destination);
+        string parent = Path.GetDirectoryName(full);
+        string leaf = Path.GetFileName(full);
+        if (String.IsNullOrEmpty(parent) || String.IsNullOrEmpty(leaf) ||
+            leaf.IndexOfAny(new char[] { '\\', '/' }) >= 0)
+            throw new InvalidDataException(
+                "attribution publication destination lacks one exact parent/leaf: " + full
+            );
+        byte[] nameBytes = Encoding.Unicode.GetBytes(leaf);
+        int rootOffset = IntPtr.Size == 8 ? 8 : 4;
+        int lengthOffset = rootOffset + IntPtr.Size;
+        int nameOffset = lengthOffset + 4;
+        int rawSize = checked(nameOffset + nameBytes.Length + 2);
+        int bufferSize = checked(
+            ((rawSize + IntPtr.Size - 1) / IntPtr.Size) * IntPtr.Size
+        );
+        IntPtr buffer = Marshal.AllocHGlobal(bufferSize);
+        SafeFileHandle directory = null;
+        bool directoryReferenceAdded = false;
+        try {
+            directory = OpenPublicationDirectory(parent);
+            directory.DangerousAddRef(ref directoryReferenceAdded);
+            for (int i = 0; i < bufferSize; i++) Marshal.WriteByte(buffer, i, 0);
+            Marshal.WriteInt32(buffer, 0, 0);
+            Marshal.WriteIntPtr(buffer, rootOffset, directory.DangerousGetHandle());
+            Marshal.WriteInt32(buffer, lengthOffset, nameBytes.Length);
+            Marshal.Copy(nameBytes, 0, IntPtr.Add(buffer, nameOffset), nameBytes.Length);
+            IO_STATUS_BLOCK ioStatus;
+            int nativeStatus = NtSetInformationFile(
+                source,
+                out ioStatus,
+                buffer,
+                (uint)bufferSize,
+                FileLinkInfo
+            );
+            if (nativeStatus < 0) {
+                uint nativeError = RtlNtStatusToDosError(nativeStatus);
+                throw new Win32Exception(
+                    unchecked((int)nativeError),
+                    "atomic by-handle no-replace attribution publication failed; native_ntstatus=0x" +
+                    unchecked((uint)nativeStatus).ToString("x8", CultureInfo.InvariantCulture) +
+                    "; native_error=" + nativeError.ToString(CultureInfo.InvariantCulture) +
+                    "; destination=" + full
+                );
+            }
+        } finally {
+            if (directoryReferenceAdded) directory.DangerousRelease();
+            if (directory != null) directory.Dispose();
+            Marshal.FreeHGlobal(buffer);
+        }
+    }
+
     static void SetDeleteDisposition(SafeFileHandle source, string description) {
         IntPtr buffer = Marshal.AllocHGlobal(1);
         try {
@@ -4722,6 +4830,39 @@ public class AstroTreeRecorder {
         );
     }
 
+    static int FindPublicationNativeError(Exception fault) {
+        for (Exception current = fault; current != null; current = current.InnerException) {
+            Win32Exception native = current as Win32Exception;
+            if (native != null) return native.NativeErrorCode;
+        }
+        return 0;
+    }
+
+    static string DescribePublicationPath(string path) {
+        uint attributes = GetFileAttributesW(GetExtendedLengthPath(path));
+        if (attributes == INVALID_FILE_ATTRIBUTES) {
+            int absenceError = Marshal.GetLastWin32Error();
+            if (absenceError == ERROR_FILE_NOT_FOUND || absenceError == ERROR_PATH_NOT_FOUND)
+                return "absent";
+            return "unevaluable:native_error=" +
+                absenceError.ToString(CultureInfo.InvariantCulture);
+        }
+        FileStream probe = null;
+        try {
+            probe = OpenLinkedObserver(path, "publication fault readback");
+            byte[] bytes = ReadAllExact(probe);
+            return "present:file_id=" + GetFileIdentity(probe.SafeFileHandle) +
+                ",length=" + bytes.LongLength.ToString(CultureInfo.InvariantCulture) +
+                ",sha256=" + Sha256Hex(bytes);
+        } catch (Exception fault) {
+            return "present:readback_unevaluable:native_error=" +
+                FindPublicationNativeError(fault).ToString(CultureInfo.InvariantCulture) +
+                ",exception=" + fault.GetType().FullName + ",message=" + fault.Message;
+        } finally {
+            if (probe != null) probe.Dispose();
+        }
+    }
+
     static FileStream PublishScratchHardLinkAndProtect(
         ref FileStream scratch,
         string scratchPath,
@@ -4730,39 +4871,43 @@ public class AstroTreeRecorder {
         bool retainMutationAuthority,
         string description
     ) {
-        if (scratch == null || scratch.SafeFileHandle.IsInvalid || scratch.SafeFileHandle.IsClosed)
-            throw new InvalidOperationException(description + " requires one live scratch handle");
-        string scratchIdentity = GetFileIdentity(scratch.SafeFileHandle);
-        byte[] scratchBytes = ReadAllExact(scratch);
-        if (!BytesEqual(scratchBytes, intended))
-            throw new InvalidDataException(description + " scratch bytes changed before publication");
-        if (!CreateHardLinkW(
-                GetExtendedLengthPath(destination),
-                GetExtendedLengthPath(scratchPath),
-                IntPtr.Zero
-            )) {
-            throw new Win32Exception(
-                Marshal.GetLastWin32Error(),
-                description + " no-replace CreateHardLinkW publication failed"
-            );
-        }
-        scratch.Flush(true);
-
         FileStream observer = null;
         FileStream retained = null;
+        string stage = "validate-scratch";
         try {
+            if (scratch == null || scratch.SafeFileHandle.IsInvalid || scratch.SafeFileHandle.IsClosed)
+                throw new InvalidOperationException(description + " requires one live scratch handle");
+            string scratchIdentity = GetFileIdentity(scratch.SafeFileHandle);
+            byte[] scratchBytes = ReadAllExact(scratch);
+            if (!BytesEqual(scratchBytes, intended))
+                throw new InvalidDataException(description + " scratch bytes changed before publication");
+
+            // FILE_LINK_INFO binds the no-replace namespace operation to the
+            // retained source FILE_OBJECT. It still cannot alter that file
+            // object's immutable Win32 share registration; the all-sharing
+            // observer remains an identity bridge, not an equivalent-token
+            // immutability boundary.
+            stage = "create-no-replace-hard-link";
+            LinkHandleNoReplace(scratch.SafeFileHandle, destination);
+            scratch.Flush(true);
+
+            stage = "open-final-identity-observer";
             observer = OpenLinkedObserver(destination, description + " linked observer");
             if (!String.Equals(GetFileIdentity(observer.SafeFileHandle), scratchIdentity, StringComparison.Ordinal) ||
                 !BytesEqual(ReadAllExact(observer), intended))
                 throw new InvalidDataException(description + " linked observer does not match the exact scratch object/bytes");
 
+            stage = "close-delete-on-close-scratch";
             scratch.Dispose();
             scratch = null;
+            stage = "readback-retired-scratch";
             RequirePathAbsent(scratchPath, description + " delete-on-close scratch");
 
+            stage = "open-final-restrictive-lease";
             retained = retainMutationAuthority
                 ? OpenProtectedMutation(destination, description + " protected mutation lease")
                 : OpenProtectedRead(destination, description + " protected read lease");
+            stage = "validate-final-restrictive-lease";
             RequireOrdinarySingleLink(retained.SafeFileHandle, description + " published final");
             RequireAttributionProtocolPath(
                 retained.SafeFileHandle,
@@ -4773,9 +4918,23 @@ public class AstroTreeRecorder {
                 !BytesEqual(ReadAllExact(retained), intended))
                 throw new InvalidDataException(description + " protected final path/FILE_ID/bytes differ from its scratch binding");
             return retained;
-        } catch {
+        } catch (Exception fault) {
             if (retained != null) retained.Dispose();
-            throw;
+            retained = null;
+            string scratchState = DescribePublicationPath(scratchPath);
+            string finalState = DescribePublicationPath(destination);
+            throw new IOException(
+                "ATTRIBUTION_PUBLICATION[ASTRO_ATTRIBUTION_PUBLICATION_LEASE_TRANSITION_BROKEN]: " +
+                "{code=ASTRO_ATTRIBUTION_PUBLICATION_LEASE_TRANSITION_BROKEN; stage=" + stage +
+                "; native_error=" + FindPublicationNativeError(fault).ToString(CultureInfo.InvariantCulture) +
+                "; scratch_path=" + Path.GetFullPath(scratchPath) + "; scratch_state=" + scratchState +
+                "; final_path=" + Path.GetFullPath(destination) + "; final_state=" + finalState +
+                "; expected_length=" + intended.LongLength.ToString(CultureInfo.InvariantCulture) +
+                "; expected_sha256=" + Sha256Hex(intended) + "; message=" +
+                fault.GetType().FullName + ": " + fault.Message +
+                "; remediation=preserve every surviving scratch/final/refresh byte, identify the interfering principal and exact native error, then use only the tracker-bound recovery protocol after the exact owner and Job are inactive}",
+                fault
+            );
         } finally {
             if (observer != null) observer.Dispose();
         }
@@ -6273,9 +6432,10 @@ try {
 
     # The unreserved scratch has FILE_FLAG_DELETE_ON_CLOSE from its creation syscall.
     # Therefore a hard death before publication removes it in-kernel. Once its complete
-    # durable bytes are independently read back, CreateHardLinkW atomically publishes the
-    # typed no-replace claim. A hard death after that syscall leaves the complete claim and
-    # removes only the scratch link; there is no incomplete classifier-visible stage.
+    # durable bytes are independently read back, FILE_LINK_INFO atomically publishes the
+    # exact retained FILE_OBJECT as the typed no-replace claim. A hard death after that
+    # syscall leaves the complete claim and removes only the scratch link; there is no
+    # incomplete classifier-visible stage.
     $launcherPreclaimScratchLease = New-AstroLauncherPreclaimScratchLease `
         -Path $launcherLockScratch `
         -Bytes $launcherLockBytes `
@@ -6294,6 +6454,7 @@ try {
     [AstroLauncherTempNative]::CreateExactHardLinkNoReplace(
         $launcherPreclaimScratchLease.SafeFileHandle,
         $launcherLockScratch,
+        $launcherProtocolDirectoryLease.SafeFileHandle,
         $launcherLockClaim
     )
     # This assignment is deliberately the first PowerShell operation after the atomic
