@@ -549,12 +549,18 @@ impl Default for CBMImport {
         }
     }
 }
+pub const CBMReferenceDomain_CBM_REF_DOMAIN_SYMBOL: CBMReferenceDomain = 0;
+pub const CBMReferenceDomain_CBM_REF_DOMAIN_VALUE: CBMReferenceDomain = 1;
+pub const CBMReferenceDomain_CBM_REF_DOMAIN_CALLABLE: CBMReferenceDomain = 2;
+pub const CBMReferenceDomain_CBM_REF_DOMAIN_TYPE: CBMReferenceDomain = 3;
+pub type CBMReferenceDomain = ::std::os::raw::c_int;
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct CBMUsage {
     pub ref_name: *const ::std::os::raw::c_char,
     pub enclosing_func_qn: *const ::std::os::raw::c_char,
     pub start_line: ::std::os::raw::c_int,
+    pub target_domain: CBMReferenceDomain,
 }
 impl Default for CBMUsage {
     fn default() -> Self {
