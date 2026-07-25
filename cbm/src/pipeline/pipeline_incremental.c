@@ -783,37 +783,70 @@ static int run_extract_resolve(cbm_pipeline_ctx_t *ctx, cbm_file_info_t *changed
     return 0;
 }
 
+/* Post-extraction pass return contract, identical to the full pipeline's
+ * run_predump_passes gate: NEGATIVE is a hard failure that must abort before the
+ * replacement database is swapped in, ZERO/POSITIVE is a success count. These
+ * codes used to be discarded here, so an incremental reindex swapped in a
+ * database built by a pass that had already failed closed and recorded its exact
+ * {code, operation, message, remediation} — the structured diagnostic existed but
+ * changed nothing (#730). */
+static int run_postpass_gate(const char *name, int rc) {
+    if (rc < 0) {
+        cbm_log_error("pipeline.incremental.postpass.failed", "pass", name, "code",
+                      "CBM_INCREMENTAL_POSTPASS_FAILED", "message",
+                      "incremental post-extraction pass failed before database swap", "remediation",
+                      "inspect the preceding structured pass error and retry after fixing the "
+                      "reported cause");
+    }
+    return rc;
+}
+
 /* Run post-extraction passes (tests, decorator tags, configlink). */
-static void run_postpasses(cbm_pipeline_ctx_t *ctx, cbm_file_info_t *changed_files, int ci,
-                           const char *project) {
+static int run_postpasses(cbm_pipeline_ctx_t *ctx, cbm_file_info_t *changed_files, int ci,
+                          const char *project) {
     struct timespec t;
+    int rc = 0;
 
     cbm_clock_gettime(CLOCK_MONOTONIC, &t);
     cbm_pipeline_pass_tests(ctx, changed_files, ci);
     cbm_log_info("pass.timing", "pass", "incr_tests", "elapsed_ms", itoa_buf((int)elapsed_ms(t)));
 
     cbm_clock_gettime(CLOCK_MONOTONIC, &t);
-    cbm_pipeline_pass_decorator_tags(ctx->gbuf, project);
+    rc = run_postpass_gate("incr_decorator_tags",
+                           cbm_pipeline_pass_decorator_tags(ctx->gbuf, project));
     cbm_log_info("pass.timing", "pass", "incr_decorator_tags", "elapsed_ms",
                  itoa_buf((int)elapsed_ms(t)));
+    if (rc < 0) {
+        return rc;
+    }
 
     cbm_clock_gettime(CLOCK_MONOTONIC, &t);
-    cbm_pipeline_pass_configlink(ctx);
+    rc = run_postpass_gate("incr_configlink", cbm_pipeline_pass_configlink(ctx));
     cbm_log_info("pass.timing", "pass", "incr_configlink", "elapsed_ms",
                  itoa_buf((int)elapsed_ms(t)));
+    if (rc < 0) {
+        return rc;
+    }
 
     /* SIMILAR_TO + SEMANTICALLY_RELATED edges only in moderate/full modes */
     if (ctx->mode <= CBM_MODE_MODERATE) {
         cbm_clock_gettime(CLOCK_MONOTONIC, &t);
-        cbm_pipeline_pass_similarity(ctx);
+        rc = run_postpass_gate("incr_similarity", cbm_pipeline_pass_similarity(ctx));
         cbm_log_info("pass.timing", "pass", "incr_similarity", "elapsed_ms",
                      itoa_buf((int)elapsed_ms(t)));
+        if (rc < 0) {
+            return rc;
+        }
 
         cbm_clock_gettime(CLOCK_MONOTONIC, &t);
-        cbm_pipeline_pass_semantic_edges(ctx);
+        rc = run_postpass_gate("incr_semantic_edges", cbm_pipeline_pass_semantic_edges(ctx));
         cbm_log_info("pass.timing", "pass", "incr_semantic_edges", "elapsed_ms",
                      itoa_buf((int)elapsed_ms(t)));
+        if (rc < 0) {
+            return rc;
+        }
     }
+    return 0;
 }
 /* Build the complete replacement beside the live DB, finalize all mandatory
  * state, then atomically swap it into place. The prior source of truth remains
@@ -1349,7 +1382,16 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
         return extract_rc;
     }
     cbm_pipeline_pass_k8s(&ctx, changed_files, ci);
-    run_postpasses(&ctx, changed_files, ci, project);
+    int postpass_rc = run_postpasses(&ctx, changed_files, ci, project);
+    if (postpass_rc < 0) {
+        incr_free_edge_capture(&edge_cap);
+        free(changed_files);
+        cbm_registry_free(registry);
+        cbm_path_alias_collection_free(path_aliases);
+        free_mode_skipped(mode_skipped, mode_skipped_count);
+        cbm_gbuf_free(existing);
+        return postpass_rc;
+    }
 
     free(changed_files);
     cbm_registry_free(registry);

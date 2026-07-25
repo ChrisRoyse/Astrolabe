@@ -60,6 +60,44 @@ pub fn parent_system() -> astrolabe_domain::ParentSystem {
 /// its host thread from the single declared knob.
 pub use astrolabe_domain::knobs::cbm_pipeline_host_stack_bytes;
 
+/// Name given to the sized host thread every binary entrypoint runs on.
+const CBM_HOST_THREAD_NAME: &str = "astrolabe-cbm-host";
+
+/// Runs [`run_from_env`] on an explicitly sized host thread and returns its
+/// process exit code.
+///
+/// **Every binary entrypoint must call this, never [`run_from_env`] directly.**
+///
+/// A process main thread's stack reserve is fixed by the PE header at link time
+/// (1–2 MiB by default) and cannot be resized after start. Any dispatch mode —
+/// `cli <tool>`, the stdio server loop, hook-augment — can enter the in-process
+/// CBM pipeline, whose predump passes need several MiB of frame. Because
+/// mingw-w64 emits a `___chkstk_ms` probe in the prologue of any function whose
+/// frame exceeds one page, an oversized frame faults on *function entry*, before
+/// a single log line: the process dies with a diagnostic-free
+/// `STATUS_STACK_OVERFLOW` (`0xC00000FD`) and publishes no database.
+///
+/// #364 introduced the sized host thread but wired it into `src/main.rs` only,
+/// so the `codebase-memory-mcp` shim — the binary the installed MCP server and
+/// every CLI driver actually execute — still entered the pipeline on the
+/// undersized process main thread and died exactly that way (#730). Centralising
+/// the bootstrap here makes that class of divergence unrepresentable: a new
+/// entrypoint gets the declared reserve by construction.
+pub fn run_from_env_on_sized_host_thread() -> i32 {
+    let host = thread::Builder::new()
+        .name(CBM_HOST_THREAD_NAME.to_string())
+        .stack_size(cbm_pipeline_host_stack_bytes())
+        .spawn(run_from_env)
+        .expect("spawn sized CBM host thread");
+    match host.join() {
+        Ok(code) => code,
+        Err(_) => {
+            eprintln!("astrolabe: CBM host thread panicked");
+            1
+        }
+    }
+}
+
 pub fn run_from_env() -> i32 {
     let args: Vec<String> = env::args().collect();
     let hook_mode = is_hook_augment_invocation(&args);
