@@ -276,12 +276,14 @@ typedef enum {
 typedef enum {
     CBM_IMPORT_BINDING_LOCAL = 0,
     CBM_IMPORT_BINDING_RESOURCE = 1,
+    CBM_IMPORT_BINDING_UNBOUND = 2,
 } CBMImportBinding;
 
 typedef struct {
-    const char *local_name;    // local alias/name; NULL for an unbound resource
-    const char *module_path;   // resolved module path / QN
-    const char *resource_kind; // exact resource category; NULL for a local binding
+    const char *local_name;      // local alias/name; NULL for an unbound dependency
+    const char *module_path;     // resolved module path / QN
+    const char *resource_kind;   // document/resource category; otherwise NULL
+    const char *dependency_kind; // unbound code dependency category; otherwise NULL
     CBMImportResolution resolution;
     CBMImportBinding binding;
 } CBMImport;

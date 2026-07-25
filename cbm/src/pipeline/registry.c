@@ -708,7 +708,7 @@ static cbm_resolution_t resolve_import_map(const cbm_registry_t *r, const char *
         resolved = (const char *)cbm_ht_get(_import_map_cache, prefix);
     } else {
         for (int i = 0; i < map_count; i++) {
-            if (strcmp(keys[i], prefix) == 0) {
+            if (keys[i] && strcmp(keys[i], prefix) == 0) {
                 resolved = vals[i];
                 break;
             }

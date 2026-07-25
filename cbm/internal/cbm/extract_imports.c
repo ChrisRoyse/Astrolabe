@@ -23,6 +23,7 @@ enum {
 static void parse_go_imports(CBMExtractCtx *ctx);
 static void parse_python_imports(CBMExtractCtx *ctx);
 static void parse_es_imports(CBMExtractCtx *ctx);
+static void parse_bash_imports(CBMExtractCtx *ctx);
 static void parse_java_imports(CBMExtractCtx *ctx);
 static void parse_rust_imports(CBMExtractCtx *ctx);
 static void parse_c_imports(CBMExtractCtx *ctx);
@@ -1054,6 +1055,95 @@ static void parse_generic_imports(CBMExtractCtx *ctx, const char *node_type) {
         }
     } while (ts_tree_cursor_goto_next_sibling(&cursor));
     ts_tree_cursor_delete(&cursor);
+}
+
+// --- Bash source imports ---
+// Only the `.` and `source` builtins execute another file in the current shell.
+// A generic `command` node is not an import: exports, assignments, utilities,
+// and function calls must never be fabricated as graph dependencies.
+static void parse_bash_imports(CBMExtractCtx *ctx) {
+    CBMArena *a = ctx->arena;
+    TSNodeStack stack;
+    ts_nstack_init(&stack, a, CBM_SZ_512);
+    ts_nstack_push(&stack, a, ctx->root);
+    while (stack.count > 0) {
+        TSNode node = ts_nstack_pop(&stack);
+        if (strcmp(ts_node_type(node), "command") != 0) {
+            ts_nstack_push_children(&stack, a, node);
+            continue;
+        }
+        /* A command may contain command substitutions with their own source
+         * builtin. Queue descendants before classifying this command. */
+        ts_nstack_push_children(&stack, a, node);
+
+        TSNode name = ts_node_child_by_field_name(node, TS_FIELD("name"));
+        uint32_t child_count = ts_node_named_child_count(node);
+        uint32_t name_index = child_count;
+        if (ts_node_is_null(name)) {
+            for (uint32_t i = 0; i < child_count; i++) {
+                TSNode child = ts_node_named_child(node, i);
+                if (strcmp(ts_node_type(child), "command_name") == 0) {
+                    name = child;
+                    name_index = i;
+                    break;
+                }
+            }
+        } else {
+            for (uint32_t i = 0; i < child_count; i++) {
+                TSNode child = ts_node_named_child(node, i);
+                if (ts_node_start_byte(child) == ts_node_start_byte(name) &&
+                    ts_node_end_byte(child) == ts_node_end_byte(name)) {
+                    name_index = i;
+                    break;
+                }
+            }
+        }
+        if (ts_node_is_null(name)) {
+            continue;
+        }
+        char *command_name = cbm_node_text(a, name, ctx->source);
+        if (!command_name || (strcmp(command_name, ".") != 0 && strcmp(command_name, "source") != 0)) {
+            continue;
+        }
+
+        TSNode argument = {0};
+        for (uint32_t i = name_index + SKIP_ONE; i < child_count; i++) {
+            TSNode child = ts_node_named_child(node, i);
+            const char *kind = ts_node_type(child);
+            if (strcmp(kind, "file_redirect") != 0 && strcmp(kind, "heredoc_redirect") != 0) {
+                argument = child;
+                break;
+            }
+        }
+        if (ts_node_is_null(argument)) {
+            cbm_file_result_set_error(ctx->result, "CBM_BASH_SOURCE_ARGUMENT_MISSING",
+                                      "extract_bash_source", "extraction", 0,
+                                      "the Bash source builtin has no filename argument",
+                                      "supply one source filename and retry indexing");
+            return;
+        }
+        char *path = strip_quotes(a, cbm_node_text(a, argument, ctx->source));
+        if (!path || !path[0]) {
+            cbm_file_result_set_error(ctx->result, "CBM_BASH_SOURCE_ARGUMENT_INVALID",
+                                      "extract_bash_source", "extraction", 0,
+                                      "the Bash source filename is empty or unreadable",
+                                      "supply one non-empty source filename and retry indexing");
+            return;
+        }
+        bool exact_relative = (path[0] == '.' && path[1] == '/') ||
+                              (path[0] == '.' && path[1] == '.' && path[2] == '/');
+        CBMImport imp = {
+            .local_name = NULL,
+            .module_path = path,
+            .dependency_kind = "bash_source",
+            .resolution = exact_relative ? CBM_IMPORT_RESOLVE_EXACT_SOURCE
+                                         : CBM_IMPORT_RESOLVE_EXTERNAL_SOURCE,
+            .binding = CBM_IMPORT_BINDING_UNBOUND,
+        };
+        if (!cbm_imports_push(&ctx->result->imports, a, imp)) {
+            return;
+        }
+    }
 }
 
 // --- Kotlin imports ---
@@ -3001,8 +3091,7 @@ void cbm_extract_imports(CBMExtractCtx *ctx) {
         parse_generic_imports(ctx, "call");
         break;
     case CBM_LANG_BASH:
-        // source/. commands
-        parse_generic_imports(ctx, "command");
+        parse_bash_imports(ctx);
         break;
     case CBM_LANG_ZIG:
         parse_zig_imports(ctx);

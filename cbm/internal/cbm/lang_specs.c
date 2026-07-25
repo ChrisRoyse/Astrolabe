@@ -482,7 +482,6 @@ static const char *c_assign_types[] = {"assignment_expression", NULL};
 static const char *bash_func_types[] = {"function_definition", NULL};
 static const char *bash_module_types[] = {"program", NULL};
 static const char *bash_call_types[] = {"command", NULL};
-static const char *bash_import_types[] = {"command", NULL};
 static const char *bash_branch_types[] = {"if_statement",   "while_statement", "for_statement",
                                           "case_statement", "elif_clause",     NULL};
 static const char *bash_var_types[] = {"variable_assignment", NULL};
@@ -1701,7 +1700,7 @@ static const CBMLangSpec lang_specs[CBM_LANG_COUNT] = {
 
     // CBM_LANG_BASH
     [CBM_LANG_BASH] = {CBM_LANG_BASH, bash_func_types, empty_types, empty_types, bash_module_types,
-                       bash_call_types, bash_import_types, empty_types, bash_branch_types,
+                       bash_call_types, empty_types, empty_types, bash_branch_types,
                        bash_var_types, bash_var_types, empty_types, NULL, empty_types, NULL, NULL,
                        tree_sitter_bash, NULL},
 

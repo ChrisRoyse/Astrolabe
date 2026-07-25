@@ -1360,21 +1360,29 @@ char *cbm_pipeline_import_edge_properties(cbm_pipeline_ctx_t *ctx, const char *r
     const char *value = NULL;
     const char *property = NULL;
     if (imp && imp->binding == CBM_IMPORT_BINDING_LOCAL && imp->local_name &&
-        imp->local_name[0] && (!imp->resource_kind || !imp->resource_kind[0])) {
+        imp->local_name[0] && (!imp->resource_kind || !imp->resource_kind[0]) &&
+        (!imp->dependency_kind || !imp->dependency_kind[0])) {
         binding = "local";
         property = "local_name";
         value = imp->local_name;
     } else if (imp && imp->binding == CBM_IMPORT_BINDING_RESOURCE &&
                (!imp->local_name || !imp->local_name[0]) && imp->resource_kind &&
-               imp->resource_kind[0]) {
+               imp->resource_kind[0] && (!imp->dependency_kind || !imp->dependency_kind[0])) {
         binding = "resource";
         property = "resource_kind";
         value = imp->resource_kind;
+    } else if (imp && imp->binding == CBM_IMPORT_BINDING_UNBOUND &&
+               (!imp->local_name || !imp->local_name[0]) &&
+               (!imp->resource_kind || !imp->resource_kind[0]) && imp->dependency_kind &&
+               imp->dependency_kind[0]) {
+        binding = "unbound";
+        property = "dependency_kind";
+        value = imp->dependency_kind;
     } else {
         cbm_log_error("pkgmap.import_properties_failed", "code", "CBM_IMPORT_BINDING_INVALID",
                       "component", "pipeline.import_edges", "operation", "validate_binding",
                       "file", rel_path ? rel_path : "", "message",
-                      "an import must carry exactly one local binding or one unbound resource kind",
+                      "an import must carry exactly one local, resource, or unbound-code identity",
                       "remediation", "repair the language extractor import identity contract");
         if (ctx && ctx->gbuf) {
             cbm_gbuf_refuse_resolution(ctx->gbuf);
@@ -1441,6 +1449,9 @@ int cbm_pipeline_import_edge_binding(const char *properties_json, CBMImportBindi
             result = 0;
         } else if (strcmp(binding_kind, "resource") == 0) {
             *out_binding = CBM_IMPORT_BINDING_RESOURCE;
+            result = 0;
+        } else if (strcmp(binding_kind, "unbound") == 0) {
+            *out_binding = CBM_IMPORT_BINDING_UNBOUND;
             result = 0;
         }
     }
@@ -1559,11 +1570,12 @@ int cbm_pipeline_import_map_build(const cbm_gbuf_t *gbuf, const char *project_na
             yyjson_is_str(binding_value) ? yyjson_get_str(binding_value) : NULL;
         size_t binding_len = binding_kind ? yyjson_get_len(binding_value) : 0;
         if (!binding_kind || binding_len == 0 || strlen(binding_kind) != binding_len ||
-            (strcmp(binding_kind, "local") != 0 && strcmp(binding_kind, "resource") != 0)) {
+            (strcmp(binding_kind, "local") != 0 && strcmp(binding_kind, "resource") != 0 &&
+             strcmp(binding_kind, "unbound") != 0)) {
             char edge_id[CBM_SZ_32];
             snprintf(edge_id, sizeof(edge_id), "%lld", (long long)edge->id);
             const char *json_detail =
-                doc ? "binding_kind must be exactly local or resource"
+                doc ? "binding_kind must be exactly local, resource, or unbound"
                     : (json_error.msg ? json_error.msg : "properties JSON parse failed");
             yyjson_doc_free(doc);
             cbm_pipeline_import_map_free(keys, vals, count);
@@ -1579,17 +1591,26 @@ int cbm_pipeline_import_map_build(const cbm_gbuf_t *gbuf, const char *project_na
 
         yyjson_val *local_value = yyjson_obj_get(root, "local_name");
         yyjson_val *resource_value = yyjson_obj_get(root, "resource_kind");
+        yyjson_val *dependency_value = yyjson_obj_get(root, "dependency_kind");
         const char *local_name = yyjson_is_str(local_value) ? yyjson_get_str(local_value) : NULL;
         const char *resource_kind =
             yyjson_is_str(resource_value) ? yyjson_get_str(resource_value) : NULL;
+        const char *dependency_kind =
+            yyjson_is_str(dependency_value) ? yyjson_get_str(dependency_value) : NULL;
         size_t local_len = local_name ? yyjson_get_len(local_value) : 0;
         size_t resource_len = resource_kind ? yyjson_get_len(resource_value) : 0;
+        size_t dependency_len = dependency_kind ? yyjson_get_len(dependency_value) : 0;
         bool local_valid = local_name && local_len > 0 && strlen(local_name) == local_len &&
-                           resource_value == NULL;
+                           resource_value == NULL && dependency_value == NULL;
         bool resource_valid = resource_kind && resource_len > 0 &&
-                              strlen(resource_kind) == resource_len && local_value == NULL;
+                              strlen(resource_kind) == resource_len && local_value == NULL &&
+                              dependency_value == NULL;
+        bool dependency_valid = dependency_kind && dependency_len > 0 &&
+                                strlen(dependency_kind) == dependency_len && local_value == NULL &&
+                                resource_value == NULL;
         if ((strcmp(binding_kind, "local") == 0 && !local_valid) ||
-            (strcmp(binding_kind, "resource") == 0 && !resource_valid)) {
+            (strcmp(binding_kind, "resource") == 0 && !resource_valid) ||
+            (strcmp(binding_kind, "unbound") == 0 && !dependency_valid)) {
             char edge_id[CBM_SZ_32];
             snprintf(edge_id, sizeof(edge_id), "%lld", (long long)edge->id);
             yyjson_doc_free(doc);
@@ -1604,6 +1625,14 @@ int cbm_pipeline_import_map_build(const cbm_gbuf_t *gbuf, const char *project_na
         }
         if (strcmp(binding_kind, "resource") == 0) {
             yyjson_doc_free(doc);
+            continue;
+        }
+        if (strcmp(binding_kind, "unbound") == 0) {
+            yyjson_doc_free(doc);
+            keys[count] = NULL;
+            vals[count] = target->qualified_name;
+            target_ids[count] = edge->target_id;
+            count++;
             continue;
         }
 
@@ -1622,7 +1651,7 @@ int cbm_pipeline_import_map_build(const cbm_gbuf_t *gbuf, const char *project_na
 
         int duplicate = -1;
         for (int j = 0; j < count; j++) {
-            if (strcmp(keys[j], owned_local) == 0) {
+            if (keys[j] && strcmp(keys[j], owned_local) == 0) {
                 duplicate = j;
                 break;
             }
@@ -2059,6 +2088,16 @@ const cbm_gbuf_node_t *cbm_pipeline_resolve_import_node(const cbm_pipeline_ctx_t
      * domain. The extractor has no compile-command include roots, so binding one
      * to a repository sibling would be fabricated provenance. */
     if (imp->resolution == CBM_IMPORT_RESOLVE_EXTERNAL_SOURCE) {
+        if (imp->binding == CBM_IMPORT_BINDING_UNBOUND) {
+            cbm_log_warn("pkgmap.unbound_source_external", "code",
+                         "CBM_IMPORT_UNBOUND_SOURCE_EXTERNAL", "source",
+                         source_rel ? source_rel : "", "module", imp->module_path,
+                         "dependency_kind", imp->dependency_kind ? imp->dependency_kind : "",
+                         "message",
+                         "an unbound source dependency requires runtime path or variable resolution",
+                         "remediation",
+                         "capture the authoritative runtime search context before binding a target");
+        }
         return NULL;
     }
 
@@ -2085,6 +2124,18 @@ const cbm_gbuf_node_t *cbm_pipeline_resolve_import_node(const cbm_pipeline_ctx_t
          * exact spelling exists, it is unresolved; never reinterpret its stem
          * as a semantic module and accidentally bind missing.h to missing.c. */
         if (imp->resolution == CBM_IMPORT_RESOLVE_EXACT_SOURCE) {
+            if (imp->binding == CBM_IMPORT_BINDING_UNBOUND) {
+                cbm_log_error("pkgmap.unbound_source_missing", "code",
+                              "CBM_IMPORT_UNBOUND_SOURCE_MISSING", "source",
+                              source_rel ? source_rel : "", "module", imp->module_path,
+                              "dependency_kind", imp->dependency_kind ? imp->dependency_kind : "",
+                              "message", "an exact unbound source dependency has no target",
+                              "remediation", "restore the exact source file or repair the path");
+                cbm_gbuf_refuse_resolution(ctx->gbuf);
+                if (ctx->cancelled) {
+                    atomic_store(ctx->cancelled, SKIP_ONE);
+                }
+            }
             return NULL;
         }
     }

@@ -218,8 +218,9 @@ int cbm_pipeline_import_edge_binding(const char *properties_json, CBMImportBindi
  * one-to-one and conflicting targets are hard errors. A `*` key is a glob
  * namespace directive, not a local alias: every distinct target remains in the
  * arrays so reachability sees the complete namespace set, while direct alias
- * lookup ignores `*`. Unbound resource edges remain in the graph but never
- * enter code-identifier lookup. Malformed edges, missing targets, and
+ * lookup ignores `*`. Resource edges remain in the graph but never enter code
+ * lookup. Unbound code dependencies retain a NULL key and target value so they
+ * contribute to reachability without becoming direct aliases. Malformed edges, missing targets, and
  * allocation failures remain hard errors. Values borrow graph-buffer storage;
  * keys and both arrays are released with cbm_pipeline_import_map_free(). */
 int cbm_pipeline_import_map_build(const cbm_gbuf_t *gbuf, const char *project_name,

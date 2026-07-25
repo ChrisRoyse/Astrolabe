@@ -362,8 +362,8 @@ static uint64_t fnv1a64(const char *s, size_t len) {
  * pass_semantic.c, pass_lsp_cross.c) expects one local_name per edge, so
  * losing an edge here silently breaks cross-file call resolution for
  * whichever symbol got dropped, not just "who imports X" queries. Unbound
- * resource IMPORTS deliberately have no local_name and therefore deduplicate
- * by exact (source,target,type). Other edge types keep the same plain key:
+ * resource and unbound-code IMPORTS deliberately have no local_name and
+ * therefore deduplicate by exact (source,target,type). Other edge types keep the same plain key:
  * collapsing repeat
  * edges of the same type between the same two nodes (e.g. multiple call
  * sites) into one is the existing, intended dedup behavior there.
