@@ -1214,11 +1214,12 @@ static int create_imports_edges(cbm_pipeline_ctx_t *ctx, const CBMFileResult *re
         const cbm_gbuf_node_t *target =
             cbm_pipeline_resolve_import_node(ctx, rel, file_qn, imp, namespace_map);
         if (target && target->id != source_node->id) {
-            char esc_ln[CBM_SZ_128];
-            cbm_json_escape(esc_ln, sizeof(esc_ln), imp->local_name ? imp->local_name : "");
-            char imp_props[CBM_SZ_256];
-            snprintf(imp_props, sizeof(imp_props), "{\"local_name\":\"%s\"}", esc_ln);
+            char *imp_props = cbm_pipeline_import_edge_properties(ctx, rel, imp);
+            if (!imp_props) {
+                break;
+            }
             cbm_gbuf_insert_edge(ctx->gbuf, source_node->id, target->id, "IMPORTS", imp_props);
+            free(imp_props);
             count++;
         }
     }

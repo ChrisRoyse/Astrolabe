@@ -136,8 +136,12 @@ static void handle_kustomize(cbm_pipeline_ctx_t *ctx, const char *path, const ch
             free(target_qn);
 
             if (target) {
-                cbm_gbuf_insert_edge(ctx->gbuf, mod_id, target->id, "IMPORTS",
-                                     "{\"via\":\"kustomize\"}");
+                char *imp_props = cbm_pipeline_import_edge_properties(ctx, rel_path, imp);
+                if (!imp_props) {
+                    break;
+                }
+                cbm_gbuf_insert_edge(ctx->gbuf, mod_id, target->id, "IMPORTS", imp_props);
+                free(imp_props);
                 import_count++;
             }
         }

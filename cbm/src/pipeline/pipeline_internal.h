@@ -202,16 +202,24 @@ const cbm_gbuf_node_t *cbm_pipeline_resolve_import_node(const cbm_pipeline_ctx_t
                                                         const char *source_rel,
                                                         const char *source_file_qn,
                                                         const CBMImport *imp,
-                                                        CBMHashTable *namespace_map);
+                                                         CBMHashTable *namespace_map);
+
+/* Serialize and validate the identity properties for one resolved IMPORTS
+ * edge. The returned JSON document is heap-owned. Invalid local/resource
+ * combinations refuse graph resolution and return NULL. */
+char *cbm_pipeline_import_edge_properties(cbm_pipeline_ctx_t *ctx, const char *rel_path,
+                                          const CBMImport *imp);
+int cbm_pipeline_import_edge_binding(const char *properties_json, CBMImportBinding *out_binding);
 
 /* Build the only authoritative import bindings from resolved IMPORTS edges
  * owned by the exact source File container. Ordinary local aliases are
  * one-to-one and conflicting targets are hard errors. A `*` key is a glob
  * namespace directive, not a local alias: every distinct target remains in the
  * arrays so reachability sees the complete namespace set, while direct alias
- * lookup ignores `*`. Malformed edges, missing targets, and allocation failures
- * remain hard errors. Values borrow graph-buffer storage; keys and both arrays
- * are released with cbm_pipeline_import_map_free(). */
+ * lookup ignores `*`. Unbound resource edges remain in the graph but never
+ * enter code-identifier lookup. Malformed edges, missing targets, and
+ * allocation failures remain hard errors. Values borrow graph-buffer storage;
+ * keys and both arrays are released with cbm_pipeline_import_map_free(). */
 int cbm_pipeline_import_map_build(const cbm_gbuf_t *gbuf, const char *project_name,
                                   const char *rel_path, const char ***out_keys,
                                   const char ***out_vals, int *out_count);

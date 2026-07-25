@@ -75,8 +75,9 @@ static int is_kustomize_list_key(const char *key) {
 // Kustomize extraction
 // ---------------------------------------------------------------------------
 
-// Walk a block_sequence node and emit one CBMImport per block_sequence_item
-// scalar child, using key_name as the local_name.
+// Walk a block_sequence node and emit one unbound resource import per
+// block_sequence_item scalar child. Kustomize collection keys describe the
+// relationship kind; they do not bind lexical identifiers in the overlay.
 static void emit_kustomize_sequence(CBMExtractCtx *ctx, TSNode seq_node, const char *key_name) {
     CBMArena *a = ctx->arena;
     uint32_t n = ts_node_child_count(seq_node);
@@ -93,9 +94,16 @@ static void emit_kustomize_sequence(CBMExtractCtx *ctx, TSNode seq_node, const c
             if (!scalar) {
                 continue;
             }
+            const char *resource_kind = cbm_arena_sprintf(a, "kustomize_%s", key_name);
+            if (!resource_kind) {
+                return;
+            }
             CBMImport imp = {
-                .local_name = cbm_arena_strdup(a, key_name),
+                .local_name = NULL,
                 .module_path = cbm_arena_strdup(a, scalar),
+                .resource_kind = resource_kind,
+                .resolution = CBM_IMPORT_RESOLVE_EXACT_SOURCE,
+                .binding = CBM_IMPORT_BINDING_RESOURCE,
             };
             if (!cbm_imports_push(&ctx->result->imports, a, imp)) {
                 return;

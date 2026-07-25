@@ -967,6 +967,17 @@ static int strategy_dep_imports(cbm_pipeline_ctx_t *ctx) {
 
     rc = 0;
     for (int ii = 0; ii < import_count; ii++) {
+        CBMImportBinding binding;
+        if (cbm_pipeline_import_edge_binding(imports[ii]->properties_json, &binding) != 0) {
+            rc = configlink_failure(ctx, "CBM_CONFIGLINK_IMPORT_BINDING_INVALID",
+                                    "decode_import_binding", (size_t)ii,
+                                    "an IMPORTS edge has no valid binding category",
+                                    "repair import edge construction and retry indexing");
+            goto done;
+        }
+        if (binding == CBM_IMPORT_BINDING_RESOURCE) {
+            continue;
+        }
         const cbm_gbuf_node_t *target = cbm_gbuf_find_by_id(gb, imports[ii]->target_id);
         if (!target) {
             continue;

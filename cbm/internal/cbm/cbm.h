@@ -265,10 +265,21 @@ typedef enum {
     CBM_IMPORT_RESOLVE_EXTERNAL_SOURCE = 2,
 } CBMImportResolution;
 
+/* Whether an import-like source relationship binds a name in the importing
+ * language. Document resources are graph dependencies, not lexical aliases;
+ * keeping that distinction in the extracted value prevents filenames and
+ * extensions from entering identifier-resolution maps. */
+typedef enum {
+    CBM_IMPORT_BINDING_LOCAL = 0,
+    CBM_IMPORT_BINDING_RESOURCE = 1,
+} CBMImportBinding;
+
 typedef struct {
-    const char *local_name;  // local alias or name
-    const char *module_path; // resolved module path / QN
+    const char *local_name;    // local alias/name; NULL for an unbound resource
+    const char *module_path;   // resolved module path / QN
+    const char *resource_kind; // exact resource category; NULL for a local binding
     CBMImportResolution resolution;
+    CBMImportBinding binding;
 } CBMImport;
 
 /* Semantic namespace carried by a source reference. A display qualified name

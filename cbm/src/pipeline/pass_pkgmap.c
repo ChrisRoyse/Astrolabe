@@ -1340,6 +1340,114 @@ void cbm_pipeline_import_map_free(const char **keys, const char **vals, int coun
     free((void *)vals);
 }
 
+static char *import_property_value(const char *value) {
+    size_t value_len = value ? strlen(value) : 0;
+    if (value_len > ((size_t)INT_MAX - SKIP_ONE) / 6) {
+        return NULL;
+    }
+    size_t capacity = value_len * 6 + SKIP_ONE;
+    char *escaped = malloc(capacity);
+    if (!escaped) {
+        return NULL;
+    }
+    cbm_json_escape(escaped, (int)capacity, value ? value : "");
+    return escaped;
+}
+
+char *cbm_pipeline_import_edge_properties(cbm_pipeline_ctx_t *ctx, const char *rel_path,
+                                          const CBMImport *imp) {
+    const char *binding = NULL;
+    const char *value = NULL;
+    const char *property = NULL;
+    if (imp && imp->binding == CBM_IMPORT_BINDING_LOCAL && imp->local_name &&
+        imp->local_name[0] && (!imp->resource_kind || !imp->resource_kind[0])) {
+        binding = "local";
+        property = "local_name";
+        value = imp->local_name;
+    } else if (imp && imp->binding == CBM_IMPORT_BINDING_RESOURCE &&
+               (!imp->local_name || !imp->local_name[0]) && imp->resource_kind &&
+               imp->resource_kind[0]) {
+        binding = "resource";
+        property = "resource_kind";
+        value = imp->resource_kind;
+    } else {
+        cbm_log_error("pkgmap.import_properties_failed", "code", "CBM_IMPORT_BINDING_INVALID",
+                      "component", "pipeline.import_edges", "operation", "validate_binding",
+                      "file", rel_path ? rel_path : "", "message",
+                      "an import must carry exactly one local binding or one unbound resource kind",
+                      "remediation", "repair the language extractor import identity contract");
+        if (ctx && ctx->gbuf) {
+            cbm_gbuf_refuse_resolution(ctx->gbuf);
+        }
+        if (ctx && ctx->cancelled) {
+            atomic_store(ctx->cancelled, SKIP_ONE);
+        }
+        return NULL;
+    }
+
+    char *escaped = import_property_value(value);
+    if (!escaped) {
+        cbm_log_error("pkgmap.import_properties_failed", "code", "CBM_IMPORT_PROPERTIES_ALLOC_FAILED",
+                      "component", "pipeline.import_edges", "operation", "serialize_binding",
+                      "file", rel_path ? rel_path : "", "message",
+                      "an import edge could not retain its complete identity properties",
+                      "remediation", "free memory or reduce the import identifier size, then retry");
+        if (ctx && ctx->gbuf) {
+            cbm_gbuf_refuse_resolution(ctx->gbuf);
+        }
+        if (ctx && ctx->cancelled) {
+            atomic_store(ctx->cancelled, SKIP_ONE);
+        }
+        return NULL;
+    }
+
+    size_t needed = strlen(binding) + strlen(property) + strlen(escaped) + CBM_SZ_64;
+    char *json = malloc(needed);
+    if (!json) {
+        free(escaped);
+        cbm_log_error("pkgmap.import_properties_failed", "code", "CBM_IMPORT_PROPERTIES_ALLOC_FAILED",
+                      "component", "pipeline.import_edges", "operation", "allocate_document",
+                      "file", rel_path ? rel_path : "", "message",
+                      "an import edge could not allocate its identity properties document",
+                      "remediation", "free memory and retry indexing");
+        if (ctx && ctx->gbuf) {
+            cbm_gbuf_refuse_resolution(ctx->gbuf);
+        }
+        if (ctx && ctx->cancelled) {
+            atomic_store(ctx->cancelled, SKIP_ONE);
+        }
+        return NULL;
+    }
+    snprintf(json, needed, "{\"binding_kind\":\"%s\",\"%s\":\"%s\"}", binding, property,
+             escaped);
+    free(escaped);
+    return json;
+}
+
+int cbm_pipeline_import_edge_binding(const char *properties_json, CBMImportBinding *out_binding) {
+    if (!properties_json || !out_binding) {
+        return CBM_NOT_FOUND;
+    }
+    yyjson_doc *doc = yyjson_read(properties_json, strlen(properties_json), 0);
+    yyjson_val *root = doc ? yyjson_doc_get_root(doc) : NULL;
+    yyjson_val *binding_value =
+        yyjson_is_obj(root) ? yyjson_obj_get(root, "binding_kind") : NULL;
+    const char *binding_kind = yyjson_is_str(binding_value) ? yyjson_get_str(binding_value) : NULL;
+    size_t binding_len = binding_kind ? yyjson_get_len(binding_value) : 0;
+    int result = CBM_NOT_FOUND;
+    if (binding_kind && binding_len > 0 && strlen(binding_kind) == binding_len) {
+        if (strcmp(binding_kind, "local") == 0) {
+            *out_binding = CBM_IMPORT_BINDING_LOCAL;
+            result = 0;
+        } else if (strcmp(binding_kind, "resource") == 0) {
+            *out_binding = CBM_IMPORT_BINDING_RESOURCE;
+            result = 0;
+        }
+    }
+    yyjson_doc_free(doc);
+    return result;
+}
+
 /* IMPORTS edges are the sole authority after import resolution. Decode them in
  * one place so sequential, parallel, and cross-LSP consumers cannot drift back
  * to source-cache/QN shortcuts or silently reinterpret graph faults as an empty
@@ -1445,25 +1553,58 @@ int cbm_pipeline_import_map_build(const cbm_gbuf_t *gbuf, const char *project_na
         yyjson_doc *doc = yyjson_read_opts(edge->properties_json, strlen(edge->properties_json), 0,
                                            NULL, &json_error);
         yyjson_val *root = doc ? yyjson_doc_get_root(doc) : NULL;
-        yyjson_val *local_value = yyjson_is_obj(root) ? yyjson_obj_get(root, "local_name") : NULL;
-        const char *local_name = yyjson_is_str(local_value) ? yyjson_get_str(local_value) : NULL;
-        size_t local_len = local_name ? yyjson_get_len(local_value) : 0;
-        if (!local_name || local_len == 0 || strlen(local_name) != local_len) {
+        yyjson_val *binding_value =
+            yyjson_is_obj(root) ? yyjson_obj_get(root, "binding_kind") : NULL;
+        const char *binding_kind =
+            yyjson_is_str(binding_value) ? yyjson_get_str(binding_value) : NULL;
+        size_t binding_len = binding_kind ? yyjson_get_len(binding_value) : 0;
+        if (!binding_kind || binding_len == 0 || strlen(binding_kind) != binding_len ||
+            (strcmp(binding_kind, "local") != 0 && strcmp(binding_kind, "resource") != 0)) {
             char edge_id[CBM_SZ_32];
             snprintf(edge_id, sizeof(edge_id), "%lld", (long long)edge->id);
             const char *json_detail =
-                doc ? "local_name must be a non-empty JSON string without NUL"
+                doc ? "binding_kind must be exactly local or resource"
                     : (json_error.msg ? json_error.msg : "properties JSON parse failed");
             yyjson_doc_free(doc);
             cbm_pipeline_import_map_free(keys, vals, count);
             free(target_ids);
             cbm_log_error("pkgmap.import_map_failed", "code", "CBM_IMPORT_MAP_PROPERTIES_INVALID",
-                          "component", "pipeline.import_map", "operation", "decode_local_name",
+                          "component", "pipeline.import_map", "operation", "decode_binding_kind",
                           "project", project_name, "file", rel_path, "edge_id", edge_id, "detail",
                           json_detail, "message",
-                          "IMPORTS edge does not carry one valid local-name identity",
+                          "IMPORTS edge does not carry one valid binding category",
                           "remediation", "repair import edge construction and retry indexing");
             return CBM_NOT_FOUND;
+        }
+
+        yyjson_val *local_value = yyjson_obj_get(root, "local_name");
+        yyjson_val *resource_value = yyjson_obj_get(root, "resource_kind");
+        const char *local_name = yyjson_is_str(local_value) ? yyjson_get_str(local_value) : NULL;
+        const char *resource_kind =
+            yyjson_is_str(resource_value) ? yyjson_get_str(resource_value) : NULL;
+        size_t local_len = local_name ? yyjson_get_len(local_value) : 0;
+        size_t resource_len = resource_kind ? yyjson_get_len(resource_value) : 0;
+        bool local_valid = local_name && local_len > 0 && strlen(local_name) == local_len &&
+                           resource_value == NULL;
+        bool resource_valid = resource_kind && resource_len > 0 &&
+                              strlen(resource_kind) == resource_len && local_value == NULL;
+        if ((strcmp(binding_kind, "local") == 0 && !local_valid) ||
+            (strcmp(binding_kind, "resource") == 0 && !resource_valid)) {
+            char edge_id[CBM_SZ_32];
+            snprintf(edge_id, sizeof(edge_id), "%lld", (long long)edge->id);
+            yyjson_doc_free(doc);
+            cbm_pipeline_import_map_free(keys, vals, count);
+            free(target_ids);
+            cbm_log_error("pkgmap.import_map_failed", "code", "CBM_IMPORT_MAP_PROPERTIES_INVALID",
+                          "component", "pipeline.import_map", "operation", "validate_binding",
+                          "project", project_name, "file", rel_path, "edge_id", edge_id, "message",
+                          "IMPORTS binding properties contradict their declared category",
+                          "remediation", "repair import edge construction and retry indexing");
+            return CBM_NOT_FOUND;
+        }
+        if (strcmp(binding_kind, "resource") == 0) {
+            yyjson_doc_free(doc);
+            continue;
         }
 
         char *owned_local = strdup(local_name);

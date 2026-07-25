@@ -2171,6 +2171,14 @@ static void parse_css_imports(CBMExtractCtx *ctx) {
 static void html_extract_tag_src(CBMExtractCtx *ctx, TSNode tag) {
     CBMArena *a = ctx->arena;
     uint32_t nc = ts_node_named_child_count(tag);
+    const char *tag_name = NULL;
+    for (uint32_t j = 0; j < nc; j++) {
+        TSNode child = ts_node_named_child(tag, j);
+        if (strcmp(ts_node_type(child), "tag_name") == 0) {
+            tag_name = cbm_node_text(a, child, ctx->source);
+            break;
+        }
+    }
     for (uint32_t j = 0; j < nc; j++) {
         TSNode attr = ts_node_named_child(tag, j);
         if (strcmp(ts_node_type(attr), "attribute") != 0) {
@@ -2187,7 +2195,19 @@ static void html_extract_tag_src(CBMExtractCtx *ctx, TSNode tag) {
             path = cbm_node_text(a, val, ctx->source);
         }
         if (path && path[0]) {
-            CBMImport imp = {.local_name = path_last(a, path), .module_path = path};
+            const char *resource_kind = strcmp(an, "src") == 0 ? "html_src" : "html_href";
+            if (tag_name && strcmp(tag_name, "script") == 0 && strcmp(an, "src") == 0) {
+                resource_kind = "html_script";
+            } else if (tag_name && strcmp(tag_name, "link") == 0 && strcmp(an, "href") == 0) {
+                resource_kind = "html_link";
+            }
+            CBMImport imp = {
+                .local_name = NULL,
+                .module_path = path,
+                .resource_kind = resource_kind,
+                .resolution = CBM_IMPORT_RESOLVE_EXACT_SOURCE,
+                .binding = CBM_IMPORT_BINDING_RESOURCE,
+            };
             if (!cbm_imports_push(&ctx->result->imports, a, imp)) {
                 return;
             }

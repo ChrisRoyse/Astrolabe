@@ -622,17 +622,12 @@ static int create_import_edges_for_file(cbm_pipeline_ctx_t *ctx, const CBMFileRe
         const cbm_gbuf_node_t *target =
             cbm_pipeline_resolve_import_node(ctx, rel, file_qn, imp, namespace_map);
         if (target && target->id != source_node->id) {
-            /* #402: local_name captures a source fragment that, for Rust
-             * brace-grouped imports (`use a::{\n  B,\n  C}`), spans lines and
-             * carries raw control chars. Emitting it verbatim produced invalid
-             * JSON (unescaped U+000A) and the strict streaming importer
-             * fail-closed on the whole shadow stream. Escape per JSON spec,
-             * mirroring pass_parallel.c::create_imports_edges. */
-            char esc_ln[CBM_SZ_128];
-            cbm_json_escape(esc_ln, sizeof(esc_ln), imp->local_name ? imp->local_name : "");
-            char imp_props[CBM_SZ_256];
-            snprintf(imp_props, sizeof(imp_props), "{\"local_name\":\"%s\"}", esc_ln);
+            char *imp_props = cbm_pipeline_import_edge_properties(ctx, rel, imp);
+            if (!imp_props) {
+                break;
+            }
             cbm_gbuf_insert_edge(ctx->gbuf, source_node->id, target->id, "IMPORTS", imp_props);
+            free(imp_props);
             count++;
         }
     }

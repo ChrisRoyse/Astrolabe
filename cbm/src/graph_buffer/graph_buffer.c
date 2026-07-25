@@ -354,15 +354,17 @@ static uint64_t fnv1a64(const char *s, size_t len) {
     return h;
 }
 
-/* IMPORTS edges carry exactly one imported symbol's local_name (#768): two
+/* Code IMPORTS edges carry exactly one imported symbol's local_name (#768): two
  * named imports from the same specifier resolve to the same (source,
  * target) pair but are distinct symbols. Key on local_name too so the
  * second import doesn't dedup-collide with and overwrite the first —
  * every pass that walks IMPORTS edges (pass_calls.c, pass_usages.c,
  * pass_semantic.c, pass_lsp_cross.c) expects one local_name per edge, so
  * losing an edge here silently breaks cross-file call resolution for
- * whichever symbol got dropped, not just "who imports X" queries. Other
- * edge types keep the plain (source,target,type) key: collapsing repeat
+ * whichever symbol got dropped, not just "who imports X" queries. Unbound
+ * resource IMPORTS deliberately have no local_name and therefore deduplicate
+ * by exact (source,target,type). Other edge types keep the same plain key:
+ * collapsing repeat
  * edges of the same type between the same two nodes (e.g. multiple call
  * sites) into one is the existing, intended dedup behavior there.
  *
