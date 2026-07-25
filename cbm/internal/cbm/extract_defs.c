@@ -1878,12 +1878,6 @@ static const char **extract_decorators(CBMArena *a, TSNode node, const char *sou
     return result;
 }
 
-/* Rust: two same-named functions guarded by mutually-exclusive #[cfg(...)]
- * attributes both parse as distinct function_item nodes and otherwise receive
- * the SAME qualified_name, so the second graph upsert silently overwrites the
- * first and one branch is lost (#495). Fold the cfg predicate into the QN so
- * each cfg-gated twin gets a DISTINCT, predicate-encoding QN. Returns the
- * (possibly suffixed) QN; the original QN when no cfg attribute is present. */
 /* Rust: mark a function as a test when it carries a test attribute (#855).
  * cbm's test detection is otherwise file-path-based (cbm_is_test_file:
  * *_test.rs / test_*), so inline #[test]/#[tokio::test] functions inside a
@@ -1911,32 +1905,6 @@ static bool rust_def_is_test(const char *const *decorators) {
         }
     }
     return false;
-}
-
-static const char *rust_cfg_qualified_name(CBMArena *a, const char *base_qn,
-                                           const char *const *decorators) {
-    if (!decorators) {
-        return base_qn;
-    }
-    for (int i = 0; decorators[i]; i++) {
-        const char *cfg = strstr(decorators[i], "cfg(");
-        if (!cfg) {
-            continue;
-        }
-        /* Build a compact predicate suffix from the cfg(...) text, dropping
-         * whitespace and quotes so the QN stays readable and stable. */
-        char buf[CBM_SZ_256];
-        size_t bi = 0;
-        for (const char *p = cfg; *p && bi + 1 < sizeof(buf); p++) {
-            if (*p == ' ' || *p == '\t' || *p == '"' || *p == '\'') {
-                continue;
-            }
-            buf[bi++] = *p;
-        }
-        buf[bi] = '\0';
-        return cbm_arena_sprintf(a, "%s#%s", base_qn, buf);
-    }
-    return base_qn;
 }
 
 // Extract base class name text from a single base_class child node.
@@ -3234,10 +3202,7 @@ static void extract_func_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec 
     def.decorators = extract_decorators(a, node, ctx->source, ctx->language, spec);
     extract_route_from_decorators(a, node, ctx->source, spec, &def.route_path, &def.route_method);
 
-    // Rust: disambiguate cfg-gated twin functions by folding the #[cfg(...)]
-    // predicate into the QN so both branches survive the graph upsert (#495).
     if (ctx->language == CBM_LANG_RUST) {
-        def.qualified_name = rust_cfg_qualified_name(a, def.qualified_name, def.decorators);
         def.is_test = rust_def_is_test(def.decorators);
     }
 
