@@ -204,7 +204,7 @@ const cbm_gbuf_node_t *cbm_pipeline_resolve_import_node(const cbm_pipeline_ctx_t
                                                         const char *source_rel,
                                                         const char *source_file_qn,
                                                         const CBMImport *imp,
-                                                         CBMHashTable *namespace_map);
+                                                        CBMHashTable *namespace_map);
 
 /* Serialize and validate the identity properties for one resolved IMPORTS
  * edge. The returned JSON document is heap-owned. Invalid local/resource
