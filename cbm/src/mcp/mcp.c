@@ -4190,6 +4190,98 @@ static char *build_index_success_response(cbm_mcp_server_t *srv, yyjson_mut_doc 
     return NULL;
 }
 
+/* A supervised worker deliberately skips deep graph/server destruction before
+ * _Exit, but SQLite is an external resource whose library destructor is part
+ * of the on-disk correctness contract.  Close the success-readback store
+ * explicitly, then prove that no WAL/SHM state remains.  Never unlink a
+ * sidecar here: its presence may belong to a concurrent reader and is therefore
+ * a terminal publication error, not cleanup permission. */
+static char *finalize_index_worker_store(cbm_mcp_server_t *srv, const char *project_name) {
+    if (!cbm_index_worker_active() || !srv || !srv->store || !srv->owns_store) {
+        return NULL;
+    }
+    const char *borrowed_path = cbm_store_db_path(srv->store);
+    char *db_path = borrowed_path ? heap_strdup(borrowed_path) : NULL;
+    bool path_alloc_failed = borrowed_path && !db_path;
+    cbm_store_close(srv->store);
+    srv->store = NULL;
+    free(srv->current_project);
+    srv->current_project = NULL;
+    srv->store_last_used = 0;
+
+    const char *code = NULL;
+    const char *message = NULL;
+    bool wal_present = false;
+    bool shm_present = false;
+    char *wal_path = NULL;
+    char *shm_path = NULL;
+    if (path_alloc_failed) {
+        code = "CBM_INDEX_WORKER_STORE_PATH_ALLOC_FAILED";
+        message = "the worker could not retain the authoritative store path through finalization";
+    } else if (db_path) {
+        size_t path_len = strlen(db_path);
+        if (path_len > SIZE_MAX - 5) {
+            code = "CBM_INDEX_WORKER_STORE_PATH_OVERFLOW";
+            message = "the worker store path cannot represent WAL and shared-memory members";
+        } else {
+            wal_path = malloc(path_len + 5);
+            shm_path = malloc(path_len + 5);
+            if (!wal_path || !shm_path) {
+                code = "CBM_INDEX_WORKER_STORE_PATH_ALLOC_FAILED";
+                message = "the worker could not allocate authoritative sidecar paths";
+            } else {
+                snprintf(wal_path, path_len + 5, "%s-wal", db_path);
+                snprintf(shm_path, path_len + 5, "%s-shm", db_path);
+                wal_present = cbm_path_exists(wal_path);
+                shm_present = cbm_path_exists(shm_path);
+                if (wal_present || shm_present) {
+                    code = "CBM_INDEX_WORKER_STORE_FINALIZE_FAILED";
+                    message =
+                        "the worker readback store retained WAL or shared-memory state after close";
+                }
+            }
+        }
+    }
+    if (!code) {
+        free(db_path);
+        free(wal_path);
+        free(shm_path);
+        return NULL;
+    }
+
+    cbm_log_error("index.worker.store_finalize_failed", "code", code, "project",
+                  project_name ? project_name : "", "db_path", db_path ? db_path : "",
+                  "wal_present", wal_present ? "true" : "false", "shm_present",
+                  shm_present ? "true" : "false", "message", message, "remediation",
+                  "close concurrent readers or writers, preserve the database family, and retry");
+    yyjson_mut_doc *error_doc = yyjson_mut_doc_new(NULL);
+    yyjson_mut_val *error_root = error_doc ? yyjson_mut_obj(error_doc) : NULL;
+    char *error_json = NULL;
+    if (error_doc && error_root) {
+        yyjson_mut_doc_set_root(error_doc, error_root);
+        yyjson_mut_obj_add_strcpy(error_doc, error_root, "code", code);
+        yyjson_mut_obj_add_strcpy(error_doc, error_root, "message", message);
+        yyjson_mut_obj_add_str(
+            error_doc, error_root, "remediation",
+            "close concurrent readers or writers, preserve the database family, and retry");
+        yyjson_mut_obj_add_strcpy(error_doc, error_root, "project",
+                                  project_name ? project_name : "");
+        yyjson_mut_obj_add_strcpy(error_doc, error_root, "db_path", db_path ? db_path : "");
+        yyjson_mut_obj_add_bool(error_doc, error_root, "wal_present", wal_present);
+        yyjson_mut_obj_add_bool(error_doc, error_root, "shm_present", shm_present);
+        yyjson_mut_obj_add_bool(error_doc, error_root, "sqlite_publication_started", true);
+        error_json = yyjson_mut_write(error_doc, 0, NULL);
+    }
+    if (error_doc) {
+        yyjson_mut_doc_free(error_doc);
+    }
+    free(db_path);
+    free(wal_path);
+    free(shm_path);
+    return error_json ? error_json
+                      : heap_strdup("{\"code\":\"CBM_INDEX_WORKER_STORE_FINALIZE_FAILED\"}");
+}
+
 /* Build the response for a worker that crashed/hung/failed without producing a
  * result. The crash is already contained (this process survived); we report it
  * rather than dying. Precise skip-and-continue (quarantine the culprit, index the
@@ -4708,6 +4800,15 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
                 : "inspect the preceding structured diagnostics, fix the exact failure, then retry "
                   "the complete corpus");
         yyjson_mut_obj_add_bool(doc, root, "sqlite_publication_started", false);
+    }
+
+    char *worker_store_error = finalize_index_worker_store(srv, project_name);
+    if (worker_store_error) {
+        if (rc == 0 && !postcondition_error) {
+            postcondition_error = worker_store_error;
+        } else {
+            free(worker_store_error);
+        }
     }
 
     bool response_is_error = rc != 0 || postcondition_error != NULL;

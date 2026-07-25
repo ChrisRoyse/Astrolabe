@@ -3042,6 +3042,26 @@ int cbm_store_find_nodes_by_file(cbm_store_t *s, const char *project, const char
                               project, file_path, out, count);
 }
 
+/* A cached COUNT statement reaches SQLITE_ROW, not SQLITE_DONE.  Reset it
+ * before returning so the connection releases its read transaction instead of
+ * retaining a table lock until the next invocation or store destruction. */
+static int finish_cached_count(cbm_store_t *s, sqlite3_stmt *stmt, int step_rc,
+                               const char *operation) {
+    int result = CBM_STORE_ERR;
+    if (step_rc == SQLITE_ROW) {
+        result = sqlite3_column_int(stmt, 0);
+    } else {
+        store_set_error_sqlite(s, operation);
+    }
+    int reset_rc = sqlite3_reset(stmt);
+    int clear_rc = sqlite3_clear_bindings(stmt);
+    if (reset_rc != SQLITE_OK || clear_rc != SQLITE_OK) {
+        store_set_error_sqlite(s, operation);
+        return CBM_STORE_ERR;
+    }
+    return result;
+}
+
 int cbm_store_count_nodes(cbm_store_t *s, const char *project) {
     if (!s || !s->db) {
         return 0;
@@ -3053,10 +3073,7 @@ int cbm_store_count_nodes(cbm_store_t *s, const char *project) {
     }
 
     bind_text(stmt, SKIP_ONE, project);
-    if (sqlite3_step(stmt) == SQLITE_ROW) {
-        return sqlite3_column_int(stmt, 0);
-    }
-    return 0;
+    return finish_cached_count(s, stmt, sqlite3_step(stmt), "count_nodes.step_or_reset");
 }
 
 int cbm_store_delete_nodes_by_project(cbm_store_t *s, const char *project) {
@@ -3312,10 +3329,7 @@ int cbm_store_count_edges(cbm_store_t *s, const char *project) {
     }
 
     bind_text(stmt, SKIP_ONE, project);
-    if (sqlite3_step(stmt) == SQLITE_ROW) {
-        return sqlite3_column_int(stmt, 0);
-    }
-    return 0;
+    return finish_cached_count(s, stmt, sqlite3_step(stmt), "count_edges.step_or_reset");
 }
 
 int cbm_store_count_edges_by_type(cbm_store_t *s, const char *project, const char *type) {
@@ -3328,10 +3342,7 @@ int cbm_store_count_edges_by_type(cbm_store_t *s, const char *project, const cha
 
     bind_text(stmt, SKIP_ONE, project);
     bind_text(stmt, ST_COL_2, type);
-    if (sqlite3_step(stmt) == SQLITE_ROW) {
-        return sqlite3_column_int(stmt, 0);
-    }
-    return 0;
+    return finish_cached_count(s, stmt, sqlite3_step(stmt), "count_edges_by_type.step_or_reset");
 }
 
 int cbm_store_delete_edges_by_project(cbm_store_t *s, const char *project) {
