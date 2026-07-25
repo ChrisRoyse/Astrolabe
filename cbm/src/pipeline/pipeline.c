@@ -666,6 +666,84 @@ uint_least64_t cbm_pipeline_get_unresolved_reference_source_skips(const cbm_pipe
     return p ? p->unresolved_reference_source_skips : 0;
 }
 
+static bool reference_source_is_callable_scope(const cbm_gbuf_node_t *node) {
+    if (!node || !node->label) {
+        return false;
+    }
+    return strcmp(node->label, "Function") == 0 || strcmp(node->label, "Method") == 0 ||
+           strcmp(node->label, "Macro") == 0 || cbm_label_is_type_like(node->label);
+}
+
+const cbm_gbuf_node_t *cbm_pipeline_find_reference_source(
+    const cbm_gbuf_t *gbuf, const char *project_name, const char *rel_path, const char *module_qn,
+    const char *enclosing_qn, int source_line, const char *operation) {
+    if (!gbuf || !project_name || !project_name[0] || !rel_path || !rel_path[0] || !operation ||
+        !operation[0]) {
+        if (gbuf) {
+            cbm_log_error("pipeline.reference_source_invalid", "code",
+                          "CBM_REFERENCE_SOURCE_ARGUMENT_INVALID", "operation",
+                          operation ? operation : "", "project", project_name ? project_name : "",
+                          "file_path", rel_path ? rel_path : "", "message",
+                          "reference source resolution requires a graph, project, path, and "
+                          "diagnostic operation",
+                          "remediation",
+                          "preserve the complete source identity frame through extraction and "
+                          "resolution");
+            cbm_gbuf_refuse_resolution((cbm_gbuf_t *)gbuf);
+        }
+        return NULL;
+    }
+
+    bool has_enclosing = enclosing_qn && enclosing_qn[0];
+    if (has_enclosing && (!module_qn || !module_qn[0])) {
+        cbm_log_error("pipeline.reference_source_module_missing", "code",
+                      "CBM_REFERENCE_MODULE_QN_MISSING", "operation", operation, "project",
+                      project_name, "file_path", rel_path, "enclosing_qualified_name", enclosing_qn,
+                      "message",
+                      "an enclosing scope was extracted without the module identity needed to "
+                      "distinguish top-level ownership",
+                      "remediation",
+                      "preserve the module qualified name from extraction through reference "
+                      "resolution, then re-index the complete corpus");
+        cbm_gbuf_refuse_resolution((cbm_gbuf_t *)gbuf);
+        return NULL;
+    }
+
+    bool top_level = !has_enclosing || strcmp(enclosing_qn, module_qn) == 0;
+    if (top_level) {
+        const cbm_gbuf_node_t *file = cbm_gbuf_find_source_container(gbuf, "File", rel_path);
+        if (!file) {
+            cbm_log_error("pipeline.reference_file_source_missing", "code",
+                          "CBM_REFERENCE_FILE_SOURCE_NOT_FOUND", "operation", operation, "project",
+                          project_name, "file_path", rel_path, "message",
+                          "top-level reference has no unique source-backed File atom at its exact "
+                          "repository path",
+                          "remediation",
+                          "repair structure-pass File ownership and re-index the complete corpus");
+            cbm_gbuf_refuse_resolution((cbm_gbuf_t *)gbuf);
+        }
+        return file;
+    }
+
+    bool source_ambiguous = false;
+    const cbm_gbuf_node_t *source =
+        source_line > 0
+            ? cbm_gbuf_find_by_qn_location(gbuf, enclosing_qn, rel_path, source_line)
+            : cbm_gbuf_find_by_qn_domain_status(gbuf, enclosing_qn, CBM_REF_DOMAIN_CALLABLE,
+                                                operation, &source_ambiguous);
+    if (source_ambiguous) {
+        return NULL;
+    }
+    if (source && !reference_source_is_callable_scope(source)) {
+        source = NULL;
+    }
+    if (!source) {
+        cbm_gbuf_record_unresolved_reference_source(gbuf, operation, enclosing_qn, rel_path,
+                                                    source_line);
+    }
+    return source;
+}
+
 bool cbm_pipeline_row_sink_active(const cbm_pipeline_t *p) {
     return p && p->row_sink_active;
 }

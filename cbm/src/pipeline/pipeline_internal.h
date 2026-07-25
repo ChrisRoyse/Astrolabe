@@ -35,19 +35,6 @@
  * out_sz >= strlen(in) + 1 always suffices. Returns out. */
 const char *cbm_route_canon_path(const char *in, char *out, size_t out_sz);
 
-/* True when a graph node is a structural directory container (Folder/Project)
- * rather than a code node. In a directory-based-module language (Java/Go, see
- * cbm_lang_module_is_dir) a file's module QN equals its directory QN, so an
- * enclosing-scope lookup for a CLASS-LEVEL usage/call (enclosing_func_qn ==
- * module_qn) resolves to the ONE Folder/Project node shared by every file in
- * that package. Sourcing an edge there conflates all same-package files into a
- * single source node with an arbitrary file_path (#787). Source-node finders
- * must treat such a hit as a miss and fall back to the per-file File node. */
-static inline bool cbm_pipeline_node_is_dir_container(const cbm_gbuf_node_t *node) {
-    return node && node->label &&
-           (strcmp(node->label, "Folder") == 0 || strcmp(node->label, "Project") == 0);
-}
-
 bool cbm_has_config_extension(const char *path);
 
 /* Only definitions that participate in code name resolution belong in the
@@ -701,6 +688,16 @@ void cbm_pipeline_set_ambiguous_reference_skips(cbm_pipeline_t *p, uint_least64_
 /* Record unresolved enclosing-source skips from an incremental graph buffer
  * before the caller frees it. */
 void cbm_pipeline_set_unresolved_reference_source_skips(cbm_pipeline_t *p, uint_least64_t skips);
+
+/* Resolve the physical source owner of an extracted semantic reference.
+ * An absent enclosing QN, or one exactly equal to the file's module QN, is a
+ * top-level reference and belongs to the exact path-indexed File atom. A
+ * different enclosing QN must resolve to a callable/type atom at the retained
+ * source location; it is never re-attributed to File on a miss. */
+const cbm_gbuf_node_t *cbm_pipeline_find_reference_source(
+    const cbm_gbuf_t *gbuf, const char *project_name, const char *rel_path, const char *module_qn,
+    const char *enclosing_qn, int source_line, const char *operation);
+
 /* Complete-snapshot sink helpers shared with the incremental route. */
 bool cbm_pipeline_row_sink_active(const cbm_pipeline_t *p);
 void cbm_pipeline_attach_row_sink(cbm_pipeline_t *p, cbm_gbuf_t *gbuf);

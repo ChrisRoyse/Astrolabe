@@ -516,29 +516,9 @@ static void process_def(cbm_pipeline_ctx_t *ctx, const CBMCallArray *calls,
 /* Find the source node for a channel edge: enclosing function or file node. */
 static const cbm_gbuf_node_t *find_channel_source(cbm_pipeline_ctx_t *ctx, const CBMChannel *ch,
                                                   const char *rel, const char *module_qn) {
-    const cbm_gbuf_node_t *node = NULL;
-    bool source_ambiguous = false;
-    if (ch->enclosing_func_qn && ch->enclosing_func_qn[0]) {
-        node = ch->start_line > 0 ? cbm_gbuf_find_by_qn_location(ctx->gbuf, ch->enclosing_func_qn,
-                                                                 rel, ch->start_line)
-                                  : cbm_gbuf_find_by_qn_domain_status(
-                                        ctx->gbuf, ch->enclosing_func_qn, CBM_REF_DOMAIN_CALLABLE,
-                                        "channel.reference_source", &source_ambiguous);
-        if (source_ambiguous) {
-            return NULL;
-        }
-        if (!node && (!module_qn || strcmp(ch->enclosing_func_qn, module_qn) != 0)) {
-            cbm_gbuf_record_unresolved_reference_source(ctx->gbuf, "channel.reference_source",
-                                                        ch->enclosing_func_qn, rel, ch->start_line);
-            return NULL;
-        }
-    }
-    if (!node) {
-        char *file_qn = cbm_pipeline_fqn_compute(ctx->project_name, rel, "__file__");
-        node = cbm_gbuf_find_by_qn(ctx->gbuf, file_qn);
-        free(file_qn);
-    }
-    return node;
+    return cbm_pipeline_find_reference_source(ctx->gbuf, ctx->project_name, rel, module_qn,
+                                              ch->enclosing_func_qn, ch->start_line,
+                                              "channel.reference_source");
 }
 
 static void create_channel_edges_for_file(cbm_pipeline_ctx_t *ctx, const CBMFileResult *result,
@@ -579,8 +559,6 @@ static void create_channel_edges_for_file(cbm_pipeline_ctx_t *ctx, const CBMFile
 static int create_env_configures_for_file(cbm_pipeline_ctx_t *ctx, const CBMFileResult *result,
                                           const char *rel, const char *module_qn) {
     int count = 0;
-    char *file_qn = NULL;
-    const cbm_gbuf_node_t *file_node = NULL;
     for (int j = 0; j < result->env_accesses.count; j++) {
         const CBMEnvAccess *ea = &result->env_accesses.items[j];
         if (!ea->env_key || !ea->env_key[0]) {
@@ -597,39 +575,15 @@ static int create_env_configures_for_file(cbm_pipeline_ctx_t *ctx, const CBMFile
         if (env_id <= 0) {
             continue;
         }
-        const cbm_gbuf_node_t *src = NULL;
-        bool source_ambiguous = false;
-        if (ea->enclosing_func_qn && ea->enclosing_func_qn[0]) {
-            src = ea->start_line > 0
-                      ? cbm_gbuf_find_by_qn_location(ctx->gbuf, ea->enclosing_func_qn, rel,
-                                                     ea->start_line)
-                      : cbm_gbuf_find_by_qn_domain_status(
-                            ctx->gbuf, ea->enclosing_func_qn, CBM_REF_DOMAIN_CALLABLE,
-                            "environment.reference_source", &source_ambiguous);
-            if (source_ambiguous) {
-                continue;
-            }
-            if (!src && (!module_qn || strcmp(ea->enclosing_func_qn, module_qn) != 0)) {
-                cbm_gbuf_record_unresolved_reference_source(
-                    ctx->gbuf, "environment.reference_source", ea->enclosing_func_qn, rel,
-                    ea->start_line);
-                continue;
-            }
-        }
-        if (!src) {
-            if (!file_qn) {
-                file_qn = cbm_pipeline_fqn_compute(ctx->project_name, rel, "__file__");
-                file_node = cbm_gbuf_find_by_qn(ctx->gbuf, file_qn);
-            }
-            src = file_node;
-        }
+        const cbm_gbuf_node_t *src = cbm_pipeline_find_reference_source(
+            ctx->gbuf, ctx->project_name, rel, module_qn, ea->enclosing_func_qn, ea->start_line,
+            "environment.reference_source");
         if (src && src->id != env_id) {
             cbm_gbuf_insert_edge(ctx->gbuf, src->id, env_id, "CONFIGURES",
                                  "{\"strategy\":\"env_access\"}");
             count++;
         }
     }
-    free(file_qn);
     return count;
 }
 

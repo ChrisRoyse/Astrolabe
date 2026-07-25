@@ -1230,29 +1230,9 @@ static int create_imports_edges(cbm_pipeline_ctx_t *ctx, const CBMFileResult *re
 /* Find channel source node (enclosing function or file). */
 static const cbm_gbuf_node_t *find_channel_src(cbm_pipeline_ctx_t *ctx, const CBMChannel *ch,
                                                const char *rel, const char *module_qn) {
-    const cbm_gbuf_node_t *node = NULL;
-    bool source_ambiguous = false;
-    if (ch->enclosing_func_qn && ch->enclosing_func_qn[0]) {
-        node = ch->start_line > 0 ? cbm_gbuf_find_by_qn_location(ctx->gbuf, ch->enclosing_func_qn,
-                                                                 rel, ch->start_line)
-                                  : cbm_gbuf_find_by_qn_domain_status(
-                                        ctx->gbuf, ch->enclosing_func_qn, CBM_REF_DOMAIN_CALLABLE,
-                                        "parallel.channel_source", &source_ambiguous);
-        if (source_ambiguous) {
-            return NULL;
-        }
-        if (!node && (!module_qn || strcmp(ch->enclosing_func_qn, module_qn) != 0)) {
-            cbm_gbuf_record_unresolved_reference_source(ctx->gbuf, "parallel.channel_source",
-                                                        ch->enclosing_func_qn, rel, ch->start_line);
-            return NULL;
-        }
-    }
-    if (!node) {
-        char *file_qn = cbm_pipeline_fqn_compute(ctx->project_name, rel, "__file__");
-        node = cbm_gbuf_find_by_qn(ctx->gbuf, file_qn);
-        free(file_qn);
-    }
-    return node;
+    return cbm_pipeline_find_reference_source(ctx->gbuf, ctx->project_name, rel, module_qn,
+                                              ch->enclosing_func_qn, ch->start_line,
+                                              "parallel.channel_source");
 }
 
 /* Create Channel nodes + EMITS/LISTENS_ON edges for one file. */
@@ -2061,35 +2041,10 @@ static void emit_service_edge(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *source,
 /* Find the source node for an edge: enclosing function or file node. */
 static const cbm_gbuf_node_t *find_source_node(const cbm_gbuf_t *gbuf, const char *project,
                                                const char *rel, const char *module_qn,
-                                               const char *enclosing_qn, int call_line) {
-    const cbm_gbuf_node_t *src = NULL;
-    bool source_ambiguous = false;
-    if (enclosing_qn && enclosing_qn[0]) {
-        src =
-            call_line > 0
-                ? cbm_gbuf_find_by_qn_location(gbuf, enclosing_qn, rel, call_line)
-                : cbm_gbuf_find_by_qn_domain_status(gbuf, enclosing_qn, CBM_REF_DOMAIN_CALLABLE,
-                                                    "parallel.reference_source", &source_ambiguous);
-        if (source_ambiguous) {
-            return NULL;
-        }
-        /* A class-level reference in a directory-module language carries the
-         * DIRECTORY module QN, which hits the shared Folder/Project node —
-         * attribute to this file's File node instead (#787). */
-        if (cbm_pipeline_node_is_dir_container(src)) {
-            src = NULL;
-        } else if (!src && (!module_qn || strcmp(enclosing_qn, module_qn) != 0)) {
-            cbm_gbuf_record_unresolved_reference_source(gbuf, "parallel.reference_source",
-                                                        enclosing_qn, rel, call_line);
-            return NULL;
-        }
-    }
-    if (!src) {
-        char *file_qn = cbm_pipeline_fqn_compute(project, rel, "__file__");
-        src = cbm_gbuf_find_by_qn(gbuf, file_qn);
-        free(file_qn);
-    }
-    return src;
+                                               const char *enclosing_qn, int call_line,
+                                               const char *operation) {
+    return cbm_pipeline_find_reference_source(gbuf, project, rel, module_qn, enclosing_qn,
+                                              call_line, operation);
 }
 
 /* Field type hint resolution for obj.Method() with multiple candidates.
@@ -2259,9 +2214,9 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
             continue;
         }
         uint64_t _rc_t0 = extract_now_ns();
-        const cbm_gbuf_node_t *source_node =
-            find_source_node(rc->main_gbuf, rc->project_name, rel, module_qn,
-                             call->enclosing_func_qn, call->start_line);
+        const cbm_gbuf_node_t *source_node = find_source_node(
+            rc->main_gbuf, rc->project_name, rel, module_qn, call->enclosing_func_qn,
+            call->start_line, "parallel.calls.reference_source");
         atomic_fetch_add_explicit(&rc->time_ns_rc_source, extract_now_ns() - _rc_t0,
                                   memory_order_relaxed);
         if (!source_node) {
@@ -2450,9 +2405,9 @@ static void resolve_file_usages(resolve_ctx_t *rc, resolve_worker_state_t *ws,
         if (!usage->ref_name) {
             continue;
         }
-        const cbm_gbuf_node_t *src =
-            find_source_node(rc->main_gbuf, rc->project_name, rel, module_qn,
-                             usage->enclosing_func_qn, usage->start_line);
+        const cbm_gbuf_node_t *src = find_source_node(
+            rc->main_gbuf, rc->project_name, rel, module_qn, usage->enclosing_func_qn,
+            usage->start_line, "parallel.usages.reference_source");
         if (!src) {
             continue;
         }
@@ -2484,9 +2439,9 @@ static void resolve_file_throws(resolve_ctx_t *rc, resolve_worker_state_t *ws,
         if (!thr->exception_name || !thr->enclosing_func_qn) {
             continue;
         }
-        const cbm_gbuf_node_t *src =
-            find_source_node(rc->main_gbuf, rc->project_name, rel, module_qn,
-                             thr->enclosing_func_qn, thr->start_line);
+        const cbm_gbuf_node_t *src = find_source_node(
+            rc->main_gbuf, rc->project_name, rel, module_qn, thr->enclosing_func_qn,
+            thr->start_line, "parallel.throws.reference_source");
         if (!src) {
             continue;
         }
@@ -2514,8 +2469,9 @@ static void resolve_file_rw(resolve_ctx_t *rc, resolve_worker_state_t *ws, CBMFi
         if (!rw->var_name) {
             continue;
         }
-        const cbm_gbuf_node_t *src = find_source_node(
-            rc->main_gbuf, rc->project_name, rel, module_qn, rw->enclosing_func_qn, rw->start_line);
+        const cbm_gbuf_node_t *src =
+            find_source_node(rc->main_gbuf, rc->project_name, rel, module_qn, rw->enclosing_func_qn,
+                             rw->start_line, "parallel.read_write.reference_source");
         if (!src) {
             continue;
         }
