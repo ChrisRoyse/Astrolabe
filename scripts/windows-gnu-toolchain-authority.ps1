@@ -25,7 +25,7 @@ param(
     # then exit. Runs before the lock/workspace/toolchain-env machinery so it can prove the
     # linker-resolution guard in isolation (FSV) without a full native build. -LlvmBinOverride
     # points the resolver at a sandbox bin (never a real build path) for the missing-binary
-    # edge test; empty means the canonical pinned .toolchains bin.
+    # edge probe; empty means the canonical pinned .toolchains bin.
     [switch]$ProbeLld,
     [string]$LlvmBinOverride = "",
     # #625: mutating launcher work always runs in a dedicated native PowerShell
@@ -372,8 +372,8 @@ $ExpectedSccacheVersion = "0.16.0"
 $SccacheCacheSize = "20G"
 # #242: the sccache local daemon must never idle-exit mid-run. Its default idle timeout
 # is 600s; a long libcbm C build leaves rustc idle well past that, the daemon exits, and
-# the next Rust phase fires N concurrent sccache clients (cargo's parallel rustc, further
-# amplified by trybuild's NESTED cargo) that each auto-start a server on the same fixed
+# the next Rust phase fires N concurrent sccache clients (Cargo's parallel rustc plus any
+# nested Cargo command) that each auto-start a server on the same fixed
 # port -- all but one lose the bind race and die with WSAEADDRINUSE (os error 10048).
 # "0" means "run permanently" (mozilla/sccache docs/Configuration.md) and is a mode, not
 # a tunable threshold: it removes the race condition rather than widening a window.
@@ -1898,8 +1898,8 @@ function Get-SccacheServerPort {
     # function of that root, so (a) reruns in one root reuse one warm server, (b) sibling
     # worktrees and the canonical workspace never share a daemon, and (c) the launcher's
     # session lock -- which serialises launcher runs within a root -- therefore also makes
-    # THIS root's server unambiguously owned by THIS session. Every child, including
-    # trybuild's nested cargo, inherits SCCACHE_SERVER_PORT and so talks to the one server
+    # THIS root's server unambiguously owned by THIS session. Every Cargo/rustc descendant
+    # inherits SCCACHE_SERVER_PORT and so talks to the one server
     # the launcher already started instead of racing to create its own.
     #
     # SHA256.Create()/ComputeHash is used rather than the .NET 5+ [SHA256]::HashData static:
@@ -3880,19 +3880,19 @@ function Set-ToolchainEnvironment {
     $env:CARGO_INCREMENTAL = "0"
     # #534/#566: authoritative CARGO_TARGET_DIR. Cargo precedence is CLI --target-dir > env
     # CARGO_TARGET_DIR > env CARGO_BUILD_TARGET_DIR > config, so exporting this pins every
-    # Cargo descendant -- root workspace, nested `--manifest-path calyx/Cargo.toml`, and the
-    # nested cargo trybuild would spawn -- to the launcher-owned target root regardless of the
-    # manifest it resolves. A child `--target-dir` (which would outrank this) is refused up
+    # Cargo descendant -- the root workspace and any nested `--manifest-path` invocation --
+    # to the launcher-owned target root regardless of the manifest it resolves. A child
+    # `--target-dir` (which would outrank this) is refused up
     # front by Assert-NoCargoTargetDirOverride, and an escaping ambient value is refused by
     # Assert-NoAmbientCargoTargetEscape, so this value is the single, owned target directory.
     $env:CARGO_TARGET_DIR = $CargoTargetRoot
-    # #242: every descendant of the child command -- cargo, its parallel rustc processes,
-    # and the NESTED cargo that trybuild spawns -- inherits these two, so they all address
+    # #242: every descendant of the child command -- Cargo, its parallel rustc processes,
+    # and any explicitly invoked nested Cargo -- inherits these two, so they all address
     # the single server this launcher pre-starts on this root's port and none of them ever
     # takes the auto-start path that produced the os error 10048 bind race. RUSTC_WRAPPER
-    # is deliberately NOT unset for nested cargo: an unset wrapper would silently drop the
-    # trybuild phase out of the cache (an unlabelled degradation), whereas server
-    # inheritance keeps one consistent, cached, deterministic compile path.
+    # deliberately remains set for nested Cargo: unsetting it there would silently drop
+    # those compiles from the cache, whereas server inheritance keeps one consistent,
+    # cached, deterministic compile path.
     $env:SCCACHE_SERVER_PORT = $SccacheServerPort
     $env:SCCACHE_IDLE_TIMEOUT = $SccacheIdleTimeout
     Set-CudaHostCompilerEnvironment
@@ -6066,8 +6066,8 @@ $toolsRoot = Join-Path $ExpectedWorkspace ".toolchains"
 # deterministic, non-ephemeral port. #226 derived a port for worktrees only, which left the
 # canonical workspace on sccache's machine-wide default (127.0.0.1:4226): a stray default-port
 # server from any other project on this host, or an orphan started under a since-deleted
-# per-session temp dir, would then silently serve the canonical gate. Deriving the port here
-# for both roots makes server ownership follow the launcher session lock exactly.
+# per-session temp dir, would then silently serve the canonical launcher command. Deriving
+# the port here for both roots makes server ownership follow the launcher session lock exactly.
 $sccacheServerPort = Get-SccacheServerPort -Root $root
 Set-Location -LiteralPath $root
 $target = Join-Path $root "target"
@@ -8351,11 +8351,10 @@ finally {
 #
 # In every case the exit is EXPLICIT. The previous code only called `exit` when the child
 # was non-zero and otherwise fell off the end of the script, which leaves $LASTEXITCODE as
-# whatever the last native command in the finally block set — `sccache --stop-server`,
-# exit 2 once the daemon had idle-timed-out. Callers that invoke this launcher in-session
-# (`& .\scripts\windows-gnu-toolchain.ps1 ...`, which is exactly what
-# scripts/invoke-native-aggregate.ps1 does before reading $LASTEXITCODE) then observed 2
-# and reported a fully green gate as red.
+# whatever the last native command in the finally block set — for example,
+# `sccache --stop-server` could exit 2 once the daemon had idle-timed-out. An in-session
+# caller that reads $LASTEXITCODE after `& .\scripts\windows-gnu-toolchain.ps1 ...` would
+# then observe the cleanup command's code instead of the completed child command's code.
 if ($null -ne $launcherFault) {
     if ($cleanupErrors.Count -gt 0) {
         [Console]::Error.WriteLine("LAUNCHER_BOUNDARY[ASTRO_LAUNCHER_CLEANUP_FAILED]: " + ($cleanupErrors -join "; "))
