@@ -527,6 +527,10 @@ function Read-AstroFsvLegacyTrackerEvidence {
         [Parameter(Mandatory)][string]$ExpectedReceiptPath,
         [Parameter(Mandatory)][string]$ExpectedReceiptSha256,
         [Parameter(Mandatory)][string]$ExpectedSessionDirectory,
+        [Parameter(Mandatory)][string]$ExpectedInventorySchema,
+        [Parameter(Mandatory)][string]$ExpectedInventoryEncoding,
+        [Parameter(Mandatory)][int]$ExpectedInventoryEntryCount,
+        [Parameter(Mandatory)][uint64]$ExpectedInventoryCanonicalByteCount,
         [Parameter(Mandatory)][string]$ExpectedInventorySha256,
         [Parameter(Mandatory)][int[]]$ExpectedNumericOwnerPids,
         [Parameter(Mandatory)][string]$ExpectedMigrationRecordPath
@@ -580,6 +584,10 @@ function Read-AstroFsvLegacyTrackerEvidence {
         'receipt_path',
         'receipt_sha256',
         'session_directory',
+        'inventory_schema',
+        'inventory_encoding',
+        'inventory_entry_count',
+        'inventory_canonical_byte_count',
         'inventory_sha256',
         'legacy_numeric_owner_pids',
         'numeric_owner_probe_state',
@@ -600,7 +608,7 @@ function Read-AstroFsvLegacyTrackerEvidence {
     )
     $expectedPids = [int[]]@($ExpectedNumericOwnerPids | Sort-Object -Unique)
     if ($evidence.schema -cne
-            'astrolabe.native-fsv-legacy-migration-evidence.v1' -or
+            'astrolabe.native-fsv-legacy-migration-evidence.v2' -or
         [int]$evidence.issue -ne $ExpectedIssue -or
         -not [string]::Equals(
             [IO.Path]::GetFullPath([string]$evidence.receipt_path),
@@ -613,6 +621,14 @@ function Read-AstroFsvLegacyTrackerEvidence {
             [IO.Path]::GetFullPath($ExpectedSessionDirectory),
             [StringComparison]::OrdinalIgnoreCase
         ) -or
+        [string]$evidence.inventory_schema -cne
+            $ExpectedInventorySchema -or
+        [string]$evidence.inventory_encoding -cne
+            $ExpectedInventoryEncoding -or
+        [int]$evidence.inventory_entry_count -ne
+            $ExpectedInventoryEntryCount -or
+        [uint64]$evidence.inventory_canonical_byte_count -ne
+            $ExpectedInventoryCanonicalByteCount -or
         [string]$evidence.inventory_sha256 -cne $ExpectedInventorySha256 -or
         ($actualPids -join ',') -cne ($expectedPids -join ',') -or
         [string]$evidence.numeric_owner_probe_state -cne 'all-absent' -or
@@ -1787,10 +1803,19 @@ try {
                 }
             }
             $legacyInventory = @(Get-SessionFileInventory $legacySession)
-            $legacyInventoryJson =
-                $legacyInventory | ConvertTo-Json -Depth 12 -Compress
-            $legacyInventorySha256 =
-                String-Sha256 ([string]$legacyInventoryJson)
+            try {
+                $legacyTree =
+                    Get-AstroOrdinaryDirectoryTreeInventoryLongPath `
+                        $legacySession
+            }
+            catch {
+                Fail-Astro 'ASTRO_FSV_MIGRATION_INVENTORY_INVALID' `
+                    "legacy session canonical inventory failed without mutation: $($_.Exception.Message)" `
+                    'preserve every session byte and investigate the exact ordinary-tree state'
+            }
+            $legacyInventorySchema = [string]$legacyTree.schema
+            $legacyInventoryEncoding = [string]$legacyTree.encoding
+            $legacyInventorySha256 = [string]$legacyTree.sha256
             $legacyReceiptSha256 = File-Sha256 $legacyReceiptPath
             $initialLegacyProbes = foreach ($legacyPid in $legacyPids) {
                 $probe =
@@ -1837,17 +1862,35 @@ try {
                 -ExpectedReceiptPath $legacyReceiptPath `
                 -ExpectedReceiptSha256 $legacyReceiptSha256 `
                 -ExpectedSessionDirectory $legacySession `
+                -ExpectedInventorySchema $legacyInventorySchema `
+                -ExpectedInventoryEncoding $legacyInventoryEncoding `
+                -ExpectedInventoryEntryCount `
+                    ([int]$legacyTree.entry_count) `
+                -ExpectedInventoryCanonicalByteCount `
+                    ([uint64]$legacyTree.canonical_bytes_length) `
                 -ExpectedInventorySha256 $legacyInventorySha256 `
                 -ExpectedNumericOwnerPids ([int[]]$legacyPids.ToArray()) `
                 -ExpectedMigrationRecordPath $migrationRecord
-            $finalInventory = @(Get-SessionFileInventory $legacySession)
-            $finalInventorySha256 = String-Sha256 (
-                [string](
-                    $finalInventory |
-                        ConvertTo-Json -Depth 12 -Compress
-                )
-            )
-            if ($finalInventorySha256 -cne $legacyInventorySha256 -or
+            try {
+                $finalLegacyTree =
+                    Get-AstroOrdinaryDirectoryTreeInventoryLongPath `
+                        $legacySession
+            }
+            catch {
+                Fail-Astro 'ASTRO_FSV_MIGRATION_SESSION_DRIFT' `
+                    "legacy session final canonical inventory failed without mutation: $($_.Exception.Message)" `
+                    'preserve the session and post fresh evidence for its current exact tree'
+            }
+            if ([string]$finalLegacyTree.schema -cne
+                    $legacyInventorySchema -or
+                [string]$finalLegacyTree.encoding -cne
+                    $legacyInventoryEncoding -or
+                [string]$finalLegacyTree.sha256 -cne
+                    $legacyInventorySha256 -or
+                [uint64]$finalLegacyTree.canonical_bytes_length -ne
+                    [uint64]$legacyTree.canonical_bytes_length -or
+                [int]$finalLegacyTree.entry_count -ne
+                    [int]$legacyTree.entry_count -or
                 (File-Sha256 $legacyReceiptPath) -cne
                     $legacyReceiptSha256) {
                 Fail-Astro 'ASTRO_FSV_MIGRATION_SESSION_DRIFT' `
@@ -1873,7 +1916,7 @@ try {
             Assert-NotReparseEntry $recordParent `
                 'legacy migration record parent'
             $migration = [ordered]@{
-                schema = 'astrolabe.native-fsv-legacy-migration.v1'
+                schema = 'astrolabe.native-fsv-legacy-migration.v2'
                 verdict = 'legacy-session-removed-without-identity-inference'
                 issue = $Issue
                 recorded_at_utc = [DateTime]::UtcNow.ToString('o')
@@ -1881,6 +1924,11 @@ try {
                 receipt_sha256 = $legacyReceiptSha256
                 session_directory = $legacySession
                 inventory = $legacyInventory
+                inventory_schema = $legacyInventorySchema
+                inventory_encoding = $legacyInventoryEncoding
+                inventory_entry_count = [int]$legacyTree.entry_count
+                inventory_canonical_byte_count =
+                    [uint64]$legacyTree.canonical_bytes_length
                 inventory_sha256 = $legacyInventorySha256
                 legacy_numeric_owner_pids =
                     [int[]]@($legacyPids | Sort-Object -Unique)
@@ -1898,9 +1946,17 @@ try {
                 Read-AstroUtf8FileLongPath $migrationRecord |
                     ConvertFrom-Json
             if ($persistedMigration.schema -ne
-                    'astrolabe.native-fsv-legacy-migration.v1' -or
+                    'astrolabe.native-fsv-legacy-migration.v2' -or
                 [string]$persistedMigration.receipt_sha256 -cne
                     $legacyReceiptSha256 -or
+                [string]$persistedMigration.inventory_schema -cne
+                    $legacyInventorySchema -or
+                [string]$persistedMigration.inventory_encoding -cne
+                    $legacyInventoryEncoding -or
+                [int]$persistedMigration.inventory_entry_count -ne
+                    [int]$legacyTree.entry_count -or
+                [uint64]$persistedMigration.inventory_canonical_byte_count -ne
+                    [uint64]$legacyTree.canonical_bytes_length -or
                 [string]$persistedMigration.inventory_sha256 -cne
                     $legacyInventorySha256 -or
                 [string]$persistedMigration.tracker.url -cne
@@ -1928,6 +1984,11 @@ try {
                     session = $legacySession
                     exists = $true
                     receipt_sha256 = $legacyReceiptSha256
+                    inventory_schema = $legacyInventorySchema
+                    inventory_encoding = $legacyInventoryEncoding
+                    inventory_entry_count = [int]$legacyTree.entry_count
+                    inventory_canonical_byte_count =
+                        [uint64]$legacyTree.canonical_bytes_length
                     inventory_sha256 = $legacyInventorySha256
                 }
                 after = [ordered]@{
@@ -2022,12 +2083,18 @@ try {
                     "completed evidence tree final preflight failed without mutation: $($_.Exception.Message)" `
                     'preserve every session byte and investigate the exact filesystem state before retrying'
             }
-            if ([string]$initialTree.sha256 -cne
+            if ([string]$initialTree.schema -cne
+                    [string]$finalTree.schema -or
+                [string]$initialTree.encoding -cne
+                    [string]$finalTree.encoding -or
+                [string]$initialTree.sha256 -cne
                     [string]$finalTree.sha256 -or
+                [uint64]$initialTree.canonical_bytes_length -ne
+                    [uint64]$finalTree.canonical_bytes_length -or
                 [int]$initialTree.entry_count -ne
                     [int]$finalTree.entry_count) {
                 Fail-Astro 'ASTRO_FSV_CLEANUP_TREE_DRIFT' `
-                    "completed evidence tree changed between authorization reads (initial_sha256=$($initialTree.sha256), final_sha256=$($finalTree.sha256), initial_entries=$($initialTree.entry_count), final_entries=$($finalTree.entry_count))" `
+                    "completed evidence tree changed between authorization reads (initial_schema=$($initialTree.schema), final_schema=$($finalTree.schema), initial_encoding=$($initialTree.encoding), final_encoding=$($finalTree.encoding), initial_canonical_bytes=$($initialTree.canonical_bytes_length), final_canonical_bytes=$($finalTree.canonical_bytes_length), initial_sha256=$($initialTree.sha256), final_sha256=$($finalTree.sha256), initial_entries=$($initialTree.entry_count), final_entries=$($finalTree.entry_count))" `
                     'preserve every session byte; stop the writer and retry only after the exact tree is stable'
             }
             $before = [ordered]@{
@@ -2035,7 +2102,11 @@ try {
                 exists = Test-AstroPathLongPath -LiteralPath $session
                 artifact_sha256 = $inspection.sha256
                 tree = [ordered]@{
+                    schema = [string]$finalTree.schema
+                    encoding = [string]$finalTree.encoding
                     entry_count = [int]$finalTree.entry_count
+                    canonical_byte_count =
+                        [uint64]$finalTree.canonical_bytes_length
                     inventory_sha256 = [string]$finalTree.sha256
                 }
                 owners = [ordered]@{
@@ -2053,6 +2124,8 @@ try {
             try {
                 Remove-AstroOrdinaryDirectoryTreeLongPath `
                     -LiteralPath $session `
+                    -ExpectedInventorySchema ([string]$finalTree.schema) `
+                    -ExpectedInventoryEncoding ([string]$finalTree.encoding) `
                     -ExpectedInventorySha256 ([string]$finalTree.sha256)
             }
             catch {

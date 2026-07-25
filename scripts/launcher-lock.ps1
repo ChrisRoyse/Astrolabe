@@ -1712,6 +1712,496 @@ function Remove-AstroOrdinaryFlatDirectoryLongPath {
     }
 }
 
+function Throw-AstroOrdinaryTreeInventoryFailure {
+    param(
+        [Parameter(Mandatory)][string]$Code,
+        [Parameter(Mandatory)][string]$Message,
+        [Parameter(Mandatory)][string]$Remediation
+    )
+
+    $exception = [InvalidOperationException]::new(
+        "$Code`: $Message`nRemediation: $Remediation"
+    )
+    $exception.Data['AstroCode'] = $Code
+    $exception.Data['AstroRemediation'] = $Remediation
+    throw $exception
+}
+
+function Assert-AstroOrdinaryTreeInventoryContract {
+    param(
+        [Parameter(Mandatory)][string]$Schema,
+        [Parameter(Mandatory)][string]$Encoding
+    )
+
+    $requiredSchema =
+        'astrolabe.ordinary-directory-tree-inventory.v1'
+    $requiredEncoding =
+        'astrolabe.ordinary-directory-tree-inventory.binary.v1'
+    if ($Schema -cne $requiredSchema) {
+        Throw-AstroOrdinaryTreeInventoryFailure `
+            -Code 'ASTRO_ORDINARY_TREE_INVENTORY_SCHEMA_UNSUPPORTED' `
+            -Message (
+                "ordinary-tree inventory schema '$Schema' is not the " +
+                "required '$requiredSchema'"
+            ) `
+            -Remediation (
+                're-read the physical tree with the current authoritative ' +
+                'launcher-lock helper; legacy or unknown inventory schemas ' +
+                'never authorize deletion'
+            )
+    }
+    if ($Encoding -cne $requiredEncoding) {
+        Throw-AstroOrdinaryTreeInventoryFailure `
+            -Code 'ASTRO_ORDINARY_TREE_INVENTORY_ENCODING_UNSUPPORTED' `
+            -Message (
+                "ordinary-tree inventory encoding '$Encoding' is not the " +
+                "required '$requiredEncoding'"
+            ) `
+            -Remediation (
+                're-read the physical tree with the current authoritative ' +
+                'binary encoder; never reinterpret an ambient JSON digest'
+            )
+    }
+}
+
+function Write-AstroCanonicalInventoryUInt32 {
+    param(
+        [Parameter(Mandatory)][IO.Stream]$Stream,
+        [Parameter(Mandatory)][uint32]$Value
+    )
+
+    [byte[]]$bytes = [BitConverter]::GetBytes($Value)
+    if ([BitConverter]::IsLittleEndian) {
+        [Array]::Reverse($bytes)
+    }
+    $Stream.Write($bytes, 0, $bytes.Length)
+}
+
+function Write-AstroCanonicalInventoryUInt64 {
+    param(
+        [Parameter(Mandatory)][IO.Stream]$Stream,
+        [Parameter(Mandatory)][uint64]$Value
+    )
+
+    [byte[]]$bytes = [BitConverter]::GetBytes($Value)
+    if ([BitConverter]::IsLittleEndian) {
+        [Array]::Reverse($bytes)
+    }
+    $Stream.Write($bytes, 0, $bytes.Length)
+}
+
+function Write-AstroCanonicalInventoryString {
+    param(
+        [Parameter(Mandatory)][IO.Stream]$Stream,
+        [Parameter(Mandatory)][AllowEmptyString()][string]$Value,
+        [Parameter(Mandatory)][string]$Description
+    )
+
+    try {
+        [byte[]]$bytes =
+            [Text.UTF8Encoding]::new($false, $true).GetBytes($Value)
+    }
+    catch {
+        Throw-AstroOrdinaryTreeInventoryFailure `
+            -Code 'ASTRO_ORDINARY_TREE_INVENTORY_UTF8_INVALID' `
+            -Message "$Description is not strict Unicode: $($_.Exception.Message)" `
+            -Remediation (
+                'preserve the physical tree and investigate the exact Windows ' +
+                'namespace spelling; malformed UTF-16 is never hashable authority'
+            )
+    }
+    Write-AstroCanonicalInventoryUInt64 `
+        -Stream $Stream -Value ([uint64]$bytes.Length)
+    if ($bytes.Length -ne 0) {
+        $Stream.Write($bytes, 0, $bytes.Length)
+    }
+}
+
+function ConvertTo-AstroCanonicalInventorySha256Bytes {
+    param(
+        [Parameter(Mandatory)][string]$Value,
+        [Parameter(Mandatory)][string]$Description
+    )
+
+    if ($Value -cnotmatch '^[0-9a-f]{64}$') {
+        Throw-AstroOrdinaryTreeInventoryFailure `
+            -Code 'ASTRO_ORDINARY_TREE_INVENTORY_RECORD_MALFORMED' `
+            -Message "$Description is not one exact lowercase SHA-256 value" `
+            -Remediation (
+                'preserve the physical tree and regenerate the record from a ' +
+                'retained ordinary-file handle'
+            )
+    }
+    [byte[]]$bytes = [byte[]]::new(32)
+    for ($index = 0; $index -lt $bytes.Length; $index++) {
+        $bytes[$index] = [Convert]::ToByte(
+            $Value.Substring($index * 2, 2),
+            16
+        )
+    }
+    return ,$bytes
+}
+
+function Get-AstroOrdinaryTreeInventoryRecordFields {
+    param([Parameter(Mandatory)]$Record)
+
+    if ($Record -is [Collections.IDictionary]) {
+        return [string[]]@($Record.Keys | ForEach-Object { [string]$_ })
+    }
+    return [string[]]@(
+        $Record.PSObject.Properties | ForEach-Object { [string]$_.Name }
+    )
+}
+
+function Get-AstroOrdinaryTreeInventoryRecordValue {
+    param(
+        [Parameter(Mandatory)]$Record,
+        [Parameter(Mandatory)][string]$Field
+    )
+
+    if ($Record -is [Collections.IDictionary]) {
+        return $Record[$Field]
+    }
+    return $Record.PSObject.Properties[$Field].Value
+}
+
+function Get-AstroOrdinaryTreeInventoryOrderedRecords {
+    param(
+        [Parameter(Mandatory)]
+        [AllowEmptyCollection()]
+        [object[]]$Records
+    )
+
+    $expectedFields = [string[]]@(
+        'relative_path',
+        'kind',
+        'file_id',
+        'attributes',
+        'bytes',
+        'sha256'
+    )
+    for ($recordIndex = 0;
+        $recordIndex -lt $Records.Count;
+        $recordIndex++) {
+        $record = $Records[$recordIndex]
+        if ($null -eq $record) {
+            Throw-AstroOrdinaryTreeInventoryFailure `
+                -Code 'ASTRO_ORDINARY_TREE_INVENTORY_RECORD_MALFORMED' `
+                -Message "record $recordIndex is null" `
+                -Remediation (
+                    'preserve the physical tree and regenerate every record from ' +
+                    'the authoritative retained-handle inventory reader'
+                )
+        }
+        [string[]]$actualFields = @(
+            Get-AstroOrdinaryTreeInventoryRecordFields -Record $record
+        )
+        if ($actualFields.Count -ne $expectedFields.Count -or
+            @(
+                $expectedFields |
+                    Where-Object { $actualFields -cnotcontains $_ }
+            ).Count -ne 0) {
+            Throw-AstroOrdinaryTreeInventoryFailure `
+                -Code 'ASTRO_ORDINARY_TREE_INVENTORY_RECORD_MALFORMED' `
+                -Message (
+                    "record $recordIndex fields differ from the exact " +
+                    "contract (expected=$($expectedFields -join ','), " +
+                    "actual=$($actualFields -join ','))"
+                ) `
+                -Remediation (
+                    'preserve the physical tree and regenerate every record from ' +
+                    'the authoritative retained-handle inventory reader'
+                )
+        }
+        $relativePath = Get-AstroOrdinaryTreeInventoryRecordValue `
+            -Record $record -Field 'relative_path'
+        if ($relativePath -isnot [string]) {
+            Throw-AstroOrdinaryTreeInventoryFailure `
+                -Code 'ASTRO_ORDINARY_TREE_INVENTORY_RECORD_MALFORMED' `
+                -Message "record $recordIndex relative_path is not a string" `
+                -Remediation (
+                    'preserve the physical tree and regenerate the record without ' +
+                    'a serializer round-trip that erases field types'
+                )
+        }
+    }
+
+    [object[]]$orderedRecords = @($Records)
+    $comparison = [Comparison[object]]{
+        param($left, $right)
+
+        $leftPath = [string](
+            Get-AstroOrdinaryTreeInventoryRecordValue `
+                -Record $left -Field 'relative_path'
+        )
+        $rightPath = [string](
+            Get-AstroOrdinaryTreeInventoryRecordValue `
+                -Record $right -Field 'relative_path'
+        )
+        if ($leftPath -ceq '.' -and $rightPath -cne '.') { return -1 }
+        if ($rightPath -ceq '.' -and $leftPath -cne '.') { return 1 }
+        return [StringComparer]::Ordinal.Compare($leftPath, $rightPath)
+    }
+    [Array]::Sort($orderedRecords, $comparison)
+    return $orderedRecords
+}
+
+function ConvertTo-AstroOrdinaryTreeInventoryCanonicalBytes {
+    <#
+    The hash domain is deliberately narrower than JSON. It is one versioned,
+    fixed-width binary record stream: domain/schema/encoding strings, count,
+    then root-first + ordinal-path records with explicit enum/null markers.
+    Strings are strict BOM-free UTF-8 with big-endian UInt64 byte lengths;
+    integers are fixed-width big-endian; SHA-256 values are raw 32-byte fields.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Schema,
+        [Parameter(Mandatory)][string]$Encoding,
+        [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Records
+    )
+
+    Assert-AstroOrdinaryTreeInventoryContract `
+        -Schema $Schema -Encoding $Encoding
+    [object[]]$orderedRecords = @(
+        Get-AstroOrdinaryTreeInventoryOrderedRecords -Records $Records
+    )
+
+    $paths = [Collections.Generic.HashSet[string]]::new(
+        [StringComparer]::Ordinal
+    )
+    $rootCount = 0
+    $stream = [IO.MemoryStream]::new()
+    try {
+        Write-AstroCanonicalInventoryString `
+            -Stream $stream `
+            -Value 'astrolabe.ordinary-directory-tree-inventory' `
+            -Description 'ordinary-tree inventory domain'
+        Write-AstroCanonicalInventoryString `
+            -Stream $stream -Value $Schema -Description 'inventory schema'
+        Write-AstroCanonicalInventoryString `
+            -Stream $stream -Value $Encoding -Description 'inventory encoding'
+        Write-AstroCanonicalInventoryUInt64 `
+            -Stream $stream -Value ([uint64]$orderedRecords.Count)
+
+        for ($recordIndex = 0;
+            $recordIndex -lt $orderedRecords.Count;
+            $recordIndex++) {
+            $record = $orderedRecords[$recordIndex]
+            $relativePath = Get-AstroOrdinaryTreeInventoryRecordValue `
+                -Record $record -Field 'relative_path'
+            $kind = Get-AstroOrdinaryTreeInventoryRecordValue `
+                -Record $record -Field 'kind'
+            $fileId = Get-AstroOrdinaryTreeInventoryRecordValue `
+                -Record $record -Field 'file_id'
+            $attributes = Get-AstroOrdinaryTreeInventoryRecordValue `
+                -Record $record -Field 'attributes'
+            $byteLength = Get-AstroOrdinaryTreeInventoryRecordValue `
+                -Record $record -Field 'bytes'
+            $sha256 = Get-AstroOrdinaryTreeInventoryRecordValue `
+                -Record $record -Field 'sha256'
+
+            if ($relativePath -isnot [string] -or
+                [string]::IsNullOrEmpty([string]$relativePath) -or
+                [IO.Path]::IsPathRooted([string]$relativePath) -or
+                ([string]$relativePath).Contains('/') -or
+                ([string]$relativePath).StartsWith(
+                    '\', [StringComparison]::Ordinal
+                ) -or
+                ([string]$relativePath).EndsWith(
+                    '\', [StringComparison]::Ordinal
+                ) -or
+                @(
+                    ([string]$relativePath).ToCharArray() |
+                        Where-Object { [char]::IsControl($_) }
+                ).Count -ne 0) {
+                Throw-AstroOrdinaryTreeInventoryFailure `
+                    -Code 'ASTRO_ORDINARY_TREE_INVENTORY_PATH_INVALID' `
+                    -Message "record $recordIndex has a noncanonical relative path" `
+                    -Remediation (
+                        'preserve the physical tree; use only the exact relative ' +
+                        'path returned by the retained ordinary-tree walk'
+                    )
+            }
+            if ([string]$relativePath -ceq '.') {
+                $rootCount++
+            }
+            else {
+                [string[]]$segments =
+                    ([string]$relativePath).Split([char]92)
+                if (@(
+                        $segments |
+                            Where-Object {
+                                [string]::IsNullOrEmpty($_) -or
+                                $_ -ceq '.' -or $_ -ceq '..'
+                            }
+                    ).Count -ne 0) {
+                    Throw-AstroOrdinaryTreeInventoryFailure `
+                        -Code 'ASTRO_ORDINARY_TREE_INVENTORY_PATH_INVALID' `
+                        -Message (
+                            "record $recordIndex path contains an empty or dot " +
+                            'segment'
+                        ) `
+                        -Remediation (
+                            'preserve the tree and investigate namespace drift; ' +
+                            'canonical inventory paths never contain dot segments'
+                        )
+                }
+            }
+            if (-not $paths.Add([string]$relativePath)) {
+                Throw-AstroOrdinaryTreeInventoryFailure `
+                    -Code 'ASTRO_ORDINARY_TREE_INVENTORY_PATH_DUPLICATE' `
+                    -Message (
+                        "record $recordIndex duplicates ordinal path " +
+                        "'$relativePath'"
+                    ) `
+                    -Remediation (
+                        'preserve the tree and repeat the retained-handle walk; ' +
+                        'duplicate authority is never canonicalized away'
+                    )
+            }
+            if ($kind -isnot [string] -or
+                [string]$kind -cnotin @('directory', 'file')) {
+                Throw-AstroOrdinaryTreeInventoryFailure `
+                    -Code 'ASTRO_ORDINARY_TREE_INVENTORY_RECORD_MALFORMED' `
+                    -Message "record $recordIndex has invalid kind '$kind'" `
+                    -Remediation (
+                        'regenerate the record; the only canonical kinds are ' +
+                        'directory and file'
+                    )
+            }
+            if ($fileId -isnot [string] -or
+                [string]$fileId -cnotmatch
+                    '^[0-9a-f]{16}:[0-9a-f]{32}$') {
+                Throw-AstroOrdinaryTreeInventoryFailure `
+                    -Code 'ASTRO_ORDINARY_TREE_INVENTORY_RECORD_MALFORMED' `
+                    -Message "record $recordIndex has invalid FILE_ID '$fileId'" `
+                    -Remediation (
+                        'regenerate the record from its retained Windows file ' +
+                        'handle; never infer or normalize a FILE_ID'
+                    )
+            }
+            if ($attributes -isnot [uint32]) {
+                $attributeType = if ($null -eq $attributes) {
+                    '<null>'
+                }
+                else {
+                    $attributes.GetType().FullName
+                }
+                Throw-AstroOrdinaryTreeInventoryFailure `
+                    -Code 'ASTRO_ORDINARY_TREE_INVENTORY_RECORD_MALFORMED' `
+                    -Message (
+                        "record $recordIndex attributes type is " +
+                        "'$attributeType', expected UInt32"
+                    ) `
+                    -Remediation (
+                        'regenerate the record without a JSON or textual ' +
+                        'round-trip that erases numeric width'
+                    )
+            }
+            $isDirectoryAttribute =
+                ([uint32]$attributes -band
+                    [uint32][IO.FileAttributes]::Directory) -ne 0
+            $isReparseAttribute =
+                ([uint32]$attributes -band
+                    [uint32][IO.FileAttributes]::ReparsePoint) -ne 0
+            if ($isReparseAttribute -or
+                ([string]$kind -ceq 'directory') -ne
+                    $isDirectoryAttribute) {
+                Throw-AstroOrdinaryTreeInventoryFailure `
+                    -Code 'ASTRO_ORDINARY_TREE_INVENTORY_RECORD_MALFORMED' `
+                    -Message (
+                        "record $recordIndex kind/attributes are inconsistent " +
+                        "or reparse-bearing (kind=$kind, attributes=$attributes)"
+                    ) `
+                    -Remediation (
+                        'preserve the tree; ordinary inventories never traverse ' +
+                        'or encode reparse entries'
+                    )
+            }
+            if ([string]$kind -ceq 'directory') {
+                if ($null -ne $byteLength -or $null -ne $sha256) {
+                    Throw-AstroOrdinaryTreeInventoryFailure `
+                        -Code 'ASTRO_ORDINARY_TREE_INVENTORY_RECORD_MALFORMED' `
+                        -Message (
+                            "directory record $recordIndex must contain exact " +
+                            'null byte/hash fields'
+                        ) `
+                        -Remediation (
+                            'regenerate the record from its retained directory ' +
+                            'handle without synthesizing file metadata'
+                        )
+                }
+            }
+            else {
+                if ($byteLength -isnot [uint64] -or
+                    $sha256 -isnot [string]) {
+                    Throw-AstroOrdinaryTreeInventoryFailure `
+                        -Code 'ASTRO_ORDINARY_TREE_INVENTORY_RECORD_MALFORMED' `
+                        -Message (
+                            "file record $recordIndex requires UInt64 bytes and " +
+                            'one lowercase SHA-256 string'
+                        ) `
+                        -Remediation (
+                            'regenerate the record from its retained ordinary-file ' +
+                            'handle without a lossy serializer round-trip'
+                        )
+                }
+            }
+
+            Write-AstroCanonicalInventoryString `
+                -Stream $stream -Value ([string]$relativePath) `
+                -Description "record $recordIndex relative path"
+            $stream.WriteByte(
+                $(if ([string]$kind -ceq 'directory') { 1 } else { 2 })
+            )
+            Write-AstroCanonicalInventoryString `
+                -Stream $stream -Value ([string]$fileId) `
+                -Description "record $recordIndex FILE_ID"
+            Write-AstroCanonicalInventoryUInt32 `
+                -Stream $stream -Value ([uint32]$attributes)
+            if ([string]$kind -ceq 'directory') {
+                $stream.WriteByte(0)
+                $stream.WriteByte(0)
+            }
+            else {
+                $stream.WriteByte(1)
+                Write-AstroCanonicalInventoryUInt64 `
+                    -Stream $stream -Value ([uint64]$byteLength)
+                $stream.WriteByte(1)
+                [byte[]]$hashBytes =
+                    ConvertTo-AstroCanonicalInventorySha256Bytes `
+                        -Value ([string]$sha256) `
+                        -Description "record $recordIndex SHA-256"
+                $stream.Write($hashBytes, 0, $hashBytes.Length)
+            }
+        }
+        if ($rootCount -ne 1 -or $orderedRecords.Count -eq 0 -or
+            [string](
+                Get-AstroOrdinaryTreeInventoryRecordValue `
+                    -Record $orderedRecords[0] -Field 'relative_path'
+            ) -cne '.' -or
+            [string](
+                Get-AstroOrdinaryTreeInventoryRecordValue `
+                    -Record $orderedRecords[0] -Field 'kind'
+            ) -cne 'directory') {
+            Throw-AstroOrdinaryTreeInventoryFailure `
+                -Code 'ASTRO_ORDINARY_TREE_INVENTORY_ROOT_INVALID' `
+                -Message (
+                    'inventory must contain one root directory record and encode ' +
+                    'it before every ordinal descendant'
+                ) `
+                -Remediation (
+                    'preserve the physical tree and repeat the authoritative ' +
+                    'retained-handle walk from its exact root'
+                )
+        }
+        return ,([byte[]]$stream.ToArray())
+    }
+    finally {
+        $stream.Dispose()
+    }
+}
+
 function Get-AstroOrdinaryDirectoryTreeInventoryLongPath {
     <#
     Produces a content- and identity-bound inventory of one ordinary directory
@@ -1735,17 +2225,35 @@ function Get-AstroOrdinaryDirectoryTreeInventoryLongPath {
             )
 
             $directoryState = Get-AstroPathEntryState $Directory
-            if ($directoryState.State -cne 'present' -or
-                ($directoryState.Attributes -band
-                    [IO.FileAttributes]::Directory) -eq 0 -or
+            if ($directoryState.State -ceq 'present' -and
                 ($directoryState.Attributes -band
                     [IO.FileAttributes]::ReparsePoint) -ne 0) {
-                throw (
+                Throw-AstroOrdinaryTreeInventoryFailure `
+                    -Code 'ASTRO_ORDINARY_TREE_INVENTORY_REPARSE_REFUSED' `
+                    -Message (
+                        "ordinary-tree inventory refuses reparse directory " +
+                        "'$Directory' (attributes=$($directoryState.Attributes))"
+                    ) `
+                    -Remediation (
+                        'preserve the namespace object and inventory only a real ' +
+                        'ordinary directory tree; never traverse the reparse target'
+                    )
+            }
+            if ($directoryState.State -cne 'present' -or
+                ($directoryState.Attributes -band
+                    [IO.FileAttributes]::Directory) -eq 0) {
+                Throw-AstroOrdinaryTreeInventoryFailure `
+                    -Code 'ASTRO_ORDINARY_TREE_INVENTORY_ROOT_INVALID' `
+                    -Message (
                     'ordinary tree inventory requires an ordinary directory ' +
                     "(state=$($directoryState.State), " +
                     "attributes=$($directoryState.Attributes), " +
                     "error=$($directoryState.Error)): $Directory"
-                )
+                    ) `
+                    -Remediation (
+                        'preserve the path and inspect its exact filesystem state; ' +
+                        'only one present ordinary directory is valid authority'
+                    )
             }
             $directoryHandle =
                 [AstroLauncherLockNative]::OpenExactDeleteDirectory(
@@ -1787,17 +2295,29 @@ function Get-AstroOrdinaryDirectoryTreeInventoryLongPath {
                         $rootPrefix,
                         [StringComparison]::OrdinalIgnoreCase
                     )) {
-                    throw (
-                        "ordinary tree entry escapes root '$root': " +
-                        $entryFull
-                    )
+                    Throw-AstroOrdinaryTreeInventoryFailure `
+                        -Code 'ASTRO_ORDINARY_TREE_INVENTORY_PATH_ESCAPE' `
+                        -Message (
+                            "ordinary-tree entry escapes root '$root': " +
+                            $entryFull
+                        ) `
+                        -Remediation (
+                            'preserve the tree and investigate namespace drift; ' +
+                            'never hash or delete an entry outside the retained root'
+                        )
                 }
                 if (($entry.Attributes -band
                         [IO.FileAttributes]::ReparsePoint) -ne 0) {
-                    throw (
-                        'ordinary tree inventory refuses reparse entry: ' +
-                        $entryFull
-                    )
+                    Throw-AstroOrdinaryTreeInventoryFailure `
+                        -Code 'ASTRO_ORDINARY_TREE_INVENTORY_REPARSE_REFUSED' `
+                        -Message (
+                            'ordinary-tree inventory refuses reparse entry: ' +
+                            $entryFull
+                        ) `
+                        -Remediation (
+                            'preserve the namespace object and inventory only an ' +
+                            'ordinary tree; never traverse or hash its target'
+                        )
                 }
                 $entryRelative = $entryFull.Substring(
                     $rootPrefix.Length
@@ -1860,22 +2380,27 @@ function Get-AstroOrdinaryDirectoryTreeInventoryLongPath {
         }
 
         & $visit $root '.'
-        $orderedRecords = @(
-            $records |
-                Sort-Object -Property relative_path
+        [byte[]]$canonicalBytes =
+            ConvertTo-AstroOrdinaryTreeInventoryCanonicalBytes `
+                -Schema `
+                    'astrolabe.ordinary-directory-tree-inventory.v1' `
+                -Encoding `
+                    'astrolabe.ordinary-directory-tree-inventory.binary.v1' `
+                -Records ([object[]]$records.ToArray())
+        [object[]]$orderedRecords = @(
+            Get-AstroOrdinaryTreeInventoryOrderedRecords `
+                -Records ([object[]]$records.ToArray())
         )
-        $inventoryJson = ConvertTo-Json `
-            -InputObject ([object[]]$orderedRecords) `
-            -Depth 8 `
-            -Compress
-        $inventoryHash = Get-AstroByteSha256 (
-            [Text.Encoding]::UTF8.GetBytes($inventoryJson)
-        )
+        $inventoryHash = Get-AstroByteSha256 $canonicalBytes
         return [pscustomobject]@{
+            schema = 'astrolabe.ordinary-directory-tree-inventory.v1'
+            encoding =
+                'astrolabe.ordinary-directory-tree-inventory.binary.v1'
             root = $root
             entry_count = $orderedRecords.Count
             entries = [object[]]$orderedRecords
-            json = $inventoryJson
+            canonical_bytes = $canonicalBytes
+            canonical_bytes_length = [uint64]$canonicalBytes.Length
             sha256 = $inventoryHash
         }
     }
@@ -1896,20 +2421,35 @@ function Remove-AstroOrdinaryDirectoryTreeLongPath {
     #>
     param(
         [Parameter(Mandatory)][string]$LiteralPath,
+        [Parameter(Mandatory)][string]$ExpectedInventorySchema,
+        [Parameter(Mandatory)][string]$ExpectedInventoryEncoding,
         [Parameter(Mandatory)]
         [ValidatePattern('^[0-9a-f]{64}$')]
         [string]$ExpectedInventorySha256
     )
 
+    Assert-AstroOrdinaryTreeInventoryContract `
+        -Schema $ExpectedInventorySchema `
+        -Encoding $ExpectedInventoryEncoding
     $inventory =
         Get-AstroOrdinaryDirectoryTreeInventoryLongPath $LiteralPath
-    if ([string]$inventory.sha256 -cne $ExpectedInventorySha256) {
-        throw (
-            'ordinary tree inventory drifted before deletion ' +
-            "(expected=$ExpectedInventorySha256, " +
-            "observed=$($inventory.sha256), " +
-            "entries=$($inventory.entry_count)): $($inventory.root)"
-        )
+    if ([string]$inventory.schema -cne $ExpectedInventorySchema -or
+        [string]$inventory.encoding -cne $ExpectedInventoryEncoding -or
+        [string]$inventory.sha256 -cne $ExpectedInventorySha256) {
+        Throw-AstroOrdinaryTreeInventoryFailure `
+            -Code 'ASTRO_ORDINARY_TREE_INVENTORY_DRIFT' `
+            -Message (
+                'ordinary-tree canonical inventory drifted before deletion ' +
+                "(schema=$($inventory.schema), " +
+                "encoding=$($inventory.encoding), " +
+                "expected=$ExpectedInventorySha256, " +
+                "observed=$($inventory.sha256), " +
+                "entries=$($inventory.entry_count)): $($inventory.root)"
+            ) `
+            -Remediation (
+                'preserve every tree byte; stop the writer and acquire a fresh ' +
+                'canonical inventory before any deletion is authorized'
+            )
     }
 
     $root = [string]$inventory.root
