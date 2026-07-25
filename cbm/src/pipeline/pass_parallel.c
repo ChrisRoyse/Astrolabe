@@ -1231,10 +1231,16 @@ static int create_imports_edges(cbm_pipeline_ctx_t *ctx, const CBMFileResult *re
 static const cbm_gbuf_node_t *find_channel_src(cbm_pipeline_ctx_t *ctx, const CBMChannel *ch,
                                                const char *rel) {
     const cbm_gbuf_node_t *node = NULL;
+    bool source_ambiguous = false;
     if (ch->enclosing_func_qn && ch->enclosing_func_qn[0]) {
         node = ch->start_line > 0 ? cbm_gbuf_find_by_qn_location(ctx->gbuf, ch->enclosing_func_qn,
                                                                  rel, ch->start_line)
-                                  : cbm_gbuf_find_by_qn(ctx->gbuf, ch->enclosing_func_qn);
+                                  : cbm_gbuf_find_by_qn_domain_status(
+                                        ctx->gbuf, ch->enclosing_func_qn, CBM_REF_DOMAIN_CALLABLE,
+                                        "parallel.channel_source", &source_ambiguous);
+        if (source_ambiguous) {
+            return NULL;
+        }
     }
     if (!node) {
         char *file_qn = cbm_pipeline_fqn_compute(ctx->project_name, rel, "__file__");
@@ -2049,9 +2055,16 @@ static const cbm_gbuf_node_t *find_source_node(const cbm_gbuf_t *gbuf, const cha
                                                const char *rel, const char *enclosing_qn,
                                                int call_line) {
     const cbm_gbuf_node_t *src = NULL;
+    bool source_ambiguous = false;
     if (enclosing_qn) {
-        src = call_line > 0 ? cbm_gbuf_find_by_qn_location(gbuf, enclosing_qn, rel, call_line)
-                            : cbm_gbuf_find_by_qn(gbuf, enclosing_qn);
+        src =
+            call_line > 0
+                ? cbm_gbuf_find_by_qn_location(gbuf, enclosing_qn, rel, call_line)
+                : cbm_gbuf_find_by_qn_domain_status(gbuf, enclosing_qn, CBM_REF_DOMAIN_CALLABLE,
+                                                    "parallel.reference_source", &source_ambiguous);
+        if (source_ambiguous) {
+            return NULL;
+        }
         /* A class-level reference in a directory-module language carries the
          * DIRECTORY module QN, which hits the shared Folder/Project node —
          * attribute to this file's File node instead (#787). */

@@ -45,7 +45,7 @@ static void rust_resolve_calls_in_node(RustLSPContext *ctx, TSNode node);
 static void rust_resolve_calls_in_node_inner(RustLSPContext *ctx, TSNode node);
 static void rust_emit_resolved_call(RustLSPContext *ctx, const char *callee_qn,
                                     const char *strategy, float confidence);
-static void rust_inject_syn_call(RustLSPContext *ctx, const char *callee_qn);
+static void rust_inject_syn_call(RustLSPContext *ctx, const char *callee_qn, int start_line);
 static void rust_emit_unresolved_call(RustLSPContext *ctx, const char *expr_text,
                                       const char *reason);
 static const CBMType *rust_lookup_field(RustLSPContext *ctx, const char *type_qn,
@@ -2607,7 +2607,8 @@ static const char *rust_binop_trait_method(const char *op_text) {
  * T::index). Sound-only: we emit nothing when the operand type is unknown,
  * primitive, or the type has no such method registered — so we never guess on
  * built-in arithmetic. */
-static void rust_emit_operator_call(RustLSPContext *ctx, const CBMType *recv, const char *method) {
+static void rust_emit_operator_call(RustLSPContext *ctx, const CBMType *recv, const char *method,
+                                    TSNode source_node) {
     if (!recv || !method)
         return;
     const CBMType *base = recv;
@@ -2629,7 +2630,10 @@ static void rust_emit_operator_call(RustLSPContext *ctx, const CBMType *recv, co
         /* `a + b` is a binary_expression, never a syntactic call node, so the
          * extractor produced no CBMCall to pair with the resolved_call above.
          * Inject one so the pipeline emits the CALLS edge. */
-        rust_inject_syn_call(ctx, m->qualified_name);
+        if (ctx->inject_syn_calls == 0) {
+            rust_inject_syn_call(ctx, m->qualified_name,
+                                 (int)ts_node_start_point(source_node).row + 1);
+        }
     }
 }
 
@@ -4024,9 +4028,11 @@ static void rust_expand_user_macro(RustLSPContext *ctx, const char *mname, TSNod
         return;
     }
     uint32_t saved_origin_byte = ctx->macro_origin_byte;
+    int saved_origin_line = ctx->macro_origin_line;
     bool saved_origin_valid = ctx->macro_origin_valid;
     if (!ctx->macro_origin_valid) {
         ctx->macro_origin_byte = invocation_byte;
+        ctx->macro_origin_line = (int)ts_node_start_point(invocation).row + 1;
         ctx->macro_origin_valid = true;
     }
     ctx->macro_expand_depth++;
@@ -4052,6 +4058,7 @@ static void rust_expand_user_macro(RustLSPContext *ctx, const char *mname, TSNod
     }
     ctx->macro_expand_depth--;
     ctx->macro_origin_byte = saved_origin_byte;
+    ctx->macro_origin_line = saved_origin_line;
     ctx->macro_origin_valid = saved_origin_valid;
     ts_tree_delete(tree);
     ts_parser_delete(parser);
@@ -4635,9 +4642,11 @@ static bool rust_resolve_known_macro_args(RustLSPContext *ctx, const char *macro
     }
 
     uint32_t saved_origin_byte = ctx->macro_origin_byte;
+    int saved_origin_line = ctx->macro_origin_line;
     bool saved_origin_valid = ctx->macro_origin_valid;
     if (!ctx->macro_origin_valid) {
         ctx->macro_origin_byte = ts_node_start_byte(invocation);
+        ctx->macro_origin_line = (int)ts_node_start_point(invocation).row + 1;
         ctx->macro_origin_valid = true;
     }
 
@@ -4654,6 +4663,7 @@ static bool rust_resolve_known_macro_args(RustLSPContext *ctx, const char *macro
         resolved = rust_resolve_format_macro_args(ctx, macro_name, args, count);
     }
     ctx->macro_origin_byte = saved_origin_byte;
+    ctx->macro_origin_line = saved_origin_line;
     ctx->macro_origin_valid = saved_origin_valid;
     return resolved;
 }
@@ -4840,8 +4850,8 @@ void rust_process_statement(RustLSPContext *ctx, TSNode node) {
  * callee_name, matching how the resolver's short-name comparison works. Only
  * used for calls the syntactic extractor cannot see (operator desugaring,
  * macro-hidden method calls). */
-static void rust_inject_syn_call(RustLSPContext *ctx, const char *callee_qn) {
-    if (!ctx || !ctx->syn_calls || !callee_qn || !ctx->enclosing_func_qn)
+static void rust_inject_syn_call(RustLSPContext *ctx, const char *callee_qn, int start_line) {
+    if (!ctx || !ctx->syn_calls || !callee_qn || !ctx->enclosing_func_qn || start_line <= 0)
         return;
     const char *dot = strrchr(callee_qn, '.');
     const char *short_name = dot ? dot + 1 : callee_qn;
@@ -4850,6 +4860,7 @@ static void rust_inject_syn_call(RustLSPContext *ctx, const char *callee_qn) {
     CBMCall call = {0};
     call.callee_name = cbm_arena_strdup(ctx->arena, short_name);
     call.enclosing_func_qn = ctx->enclosing_func_qn;
+    call.start_line = start_line;
     if (!cbm_calls_push(ctx->syn_calls, ctx->arena, call)) {
         return;
     }
@@ -4870,7 +4881,7 @@ static void rust_emit_resolved_call(RustLSPContext *ctx, const char *callee_qn,
         return;
     }
     if (ctx->inject_syn_calls > 0) {
-        rust_inject_syn_call(ctx, callee_qn);
+        rust_inject_syn_call(ctx, callee_qn, ctx->macro_origin_line);
     }
 }
 
@@ -5359,7 +5370,7 @@ static void rust_resolve_calls_in_node_inner(RustLSPContext *ctx, TSNode node) {
                 char *op = rust_node_text(ctx, c);
                 const char *method = rust_binop_trait_method(op);
                 if (method) {
-                    rust_emit_operator_call(ctx, rust_eval_expr_type(ctx, left), method);
+                    rust_emit_operator_call(ctx, rust_eval_expr_type(ctx, left), method, node);
                 }
                 break; /* operator is the sole anonymous child */
             }
@@ -5370,7 +5381,7 @@ static void rust_resolve_calls_in_node_inner(RustLSPContext *ctx, TSNode node) {
             value = ts_node_named_child(node, 0);
         }
         if (!ts_node_is_null(value)) {
-            rust_emit_operator_call(ctx, rust_eval_expr_type(ctx, value), "index");
+            rust_emit_operator_call(ctx, rust_eval_expr_type(ctx, value), "index", node);
         }
     }
 

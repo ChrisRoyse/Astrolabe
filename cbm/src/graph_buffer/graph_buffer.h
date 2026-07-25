@@ -128,10 +128,18 @@ const cbm_gbuf_node_t *cbm_gbuf_find_by_qn(const cbm_gbuf_t *gb, const char *qn)
  * syntax. Qualified names are display/search keys, never stable identities.
  * Exactly one live atom in `domain` is returned. Zero in-domain candidates is
  * an ordinary miss (the textual registry candidate belonged to another
- * namespace); multiple in-domain candidates poison persistence and emit the
- * operation plus every exact atom candidate. */
+ * namespace); multiple in-domain candidates skip and count that reference
+ * edge while emitting the operation plus every exact atom candidate. */
 const cbm_gbuf_node_t *cbm_gbuf_find_by_qn_domain(const cbm_gbuf_t *gb, const char *qn,
                                                   CBMReferenceDomain domain, const char *operation);
+
+/* Status-bearing form used by source attribution. `ambiguous` is set only
+ * when multiple live atoms remain in the requested domain. This lets callers
+ * skip that reference edge instead of incorrectly re-attributing it to a file
+ * node after the counted ambiguity. */
+const cbm_gbuf_node_t *cbm_gbuf_find_by_qn_domain_status(const cbm_gbuf_t *gb, const char *qn,
+                                                         CBMReferenceDomain domain,
+                                                         const char *operation, bool *ambiguous);
 
 /* Resolve a qualified name at an exact source location. The path and 1-based
  * line are both required. Exactly one live atom whose inclusive line range

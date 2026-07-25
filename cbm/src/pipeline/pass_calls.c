@@ -315,9 +315,16 @@ static void emit_classified_edge(cbm_pipeline_ctx_t *ctx, const CBMCall *call,
 static const cbm_gbuf_node_t *calls_find_source(cbm_pipeline_ctx_t *ctx, const char *rel,
                                                 const char *enclosing_qn, int call_line) {
     const cbm_gbuf_node_t *src = NULL;
+    bool source_ambiguous = false;
     if (enclosing_qn) {
-        src = call_line > 0 ? cbm_gbuf_find_by_qn_location(ctx->gbuf, enclosing_qn, rel, call_line)
-                            : cbm_gbuf_find_by_qn(ctx->gbuf, enclosing_qn);
+        src = call_line > 0
+                  ? cbm_gbuf_find_by_qn_location(ctx->gbuf, enclosing_qn, rel, call_line)
+                  : cbm_gbuf_find_by_qn_domain_status(ctx->gbuf, enclosing_qn,
+                                                      CBM_REF_DOMAIN_CALLABLE,
+                                                      "calls.reference_source", &source_ambiguous);
+        if (source_ambiguous) {
+            return NULL;
+        }
         /* A class-level call in a directory-module language carries the
          * DIRECTORY module QN, which hits the shared Folder/Project node —
          * attribute to this file's File node instead (#787). */

@@ -1333,9 +1333,12 @@ static const char *reference_domain_name(CBMReferenceDomain domain) {
     }
 }
 
-const cbm_gbuf_node_t *cbm_gbuf_find_by_qn_domain(const cbm_gbuf_t *gb, const char *qn,
-                                                  CBMReferenceDomain domain,
-                                                  const char *operation) {
+const cbm_gbuf_node_t *cbm_gbuf_find_by_qn_domain_status(const cbm_gbuf_t *gb, const char *qn,
+                                                         CBMReferenceDomain domain,
+                                                         const char *operation, bool *ambiguous) {
+    if (ambiguous) {
+        *ambiguous = false;
+    }
     if (!gb || !qn || !qn[0] || !operation || !operation[0]) {
         return NULL;
     }
@@ -1363,6 +1366,9 @@ const cbm_gbuf_node_t *cbm_gbuf_find_by_qn_domain(const cbm_gbuf_t *gb, const ch
     }
     if (match_count <= 1) {
         return match;
+    }
+    if (ambiguous) {
+        *ambiguous = true;
     }
 
     char count_buf[CBM_SZ_32];
@@ -1409,6 +1415,12 @@ const cbm_gbuf_node_t *cbm_gbuf_find_by_qn_domain(const cbm_gbuf_t *gb, const ch
                      candidate->source_sha256 ? candidate->source_sha256 : "");
     }
     return NULL;
+}
+
+const cbm_gbuf_node_t *cbm_gbuf_find_by_qn_domain(const cbm_gbuf_t *gb, const char *qn,
+                                                  CBMReferenceDomain domain,
+                                                  const char *operation) {
+    return cbm_gbuf_find_by_qn_domain_status(gb, qn, domain, operation, NULL);
 }
 
 const cbm_gbuf_node_t *cbm_gbuf_find_by_qn_location(const cbm_gbuf_t *gb, const char *qn,

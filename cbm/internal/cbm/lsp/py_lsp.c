@@ -2487,7 +2487,8 @@ static const char *py_binop_dunder(const char *op_text) {
  * guessing the sole class that declares the dunder would mis-resolve ordinary
  * built-in subscripts/operators (`some_list[0]`, `a + b` on ints) onto an
  * unrelated user class, so we only resolve when the receiver type is known. */
-static void py_emit_dunder_call(PyLSPContext *ctx, const CBMType *recv, const char *dunder) {
+static void py_emit_dunder_call(PyLSPContext *ctx, const CBMType *recv, const char *dunder,
+                                TSNode source_node) {
     if (!recv || recv->kind != CBM_TYPE_NAMED || !dunder)
         return;
     const CBMRegisteredFunc *f = py_lookup_attribute(ctx, recv->data.named.qualified_name, dunder);
@@ -2505,6 +2506,7 @@ static void py_emit_dunder_call(PyLSPContext *ctx, const CBMType *recv, const ch
             memset(&call, 0, sizeof(call));
             call.callee_name = cbm_arena_strdup(ctx->arena, dunder);
             call.enclosing_func_qn = ctx->enclosing_func_qn;
+            call.start_line = (int)ts_node_start_point(source_node).row + 1;
             if (!cbm_calls_push(ctx->syn_calls, ctx->arena, call)) {
                 return;
             }
@@ -2535,13 +2537,13 @@ static void py_resolve_calls_in_inner(PyLSPContext *ctx, TSNode node) {
         if (!ts_node_is_null(left) && !ts_node_is_null(op)) {
             const char *dunder = py_binop_dunder(py_node_text(ctx, op));
             if (dunder) {
-                py_emit_dunder_call(ctx, py_eval_expr_type(ctx, left), dunder);
+                py_emit_dunder_call(ctx, py_eval_expr_type(ctx, left), dunder, node);
             }
         }
     } else if (strcmp(k, "subscript") == 0) {
         TSNode value = ts_node_child_by_field_name(node, "value", 5);
         if (!ts_node_is_null(value)) {
-            py_emit_dunder_call(ctx, py_eval_expr_type(ctx, value), "__getitem__");
+            py_emit_dunder_call(ctx, py_eval_expr_type(ctx, value), "__getitem__", node);
         }
     }
 

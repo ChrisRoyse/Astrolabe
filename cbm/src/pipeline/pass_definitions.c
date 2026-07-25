@@ -511,10 +511,16 @@ static void process_def(cbm_pipeline_ctx_t *ctx, const CBMCallArray *calls,
 static const cbm_gbuf_node_t *find_channel_source(cbm_pipeline_ctx_t *ctx, const CBMChannel *ch,
                                                   const char *rel) {
     const cbm_gbuf_node_t *node = NULL;
+    bool source_ambiguous = false;
     if (ch->enclosing_func_qn && ch->enclosing_func_qn[0]) {
         node = ch->start_line > 0 ? cbm_gbuf_find_by_qn_location(ctx->gbuf, ch->enclosing_func_qn,
                                                                  rel, ch->start_line)
-                                  : cbm_gbuf_find_by_qn(ctx->gbuf, ch->enclosing_func_qn);
+                                  : cbm_gbuf_find_by_qn_domain_status(
+                                        ctx->gbuf, ch->enclosing_func_qn, CBM_REF_DOMAIN_CALLABLE,
+                                        "channel.reference_source", &source_ambiguous);
+        if (source_ambiguous) {
+            return NULL;
+        }
     }
     if (!node) {
         char *file_qn = cbm_pipeline_fqn_compute(ctx->project_name, rel, "__file__");
@@ -581,10 +587,17 @@ static int create_env_configures_for_file(cbm_pipeline_ctx_t *ctx, const CBMFile
             continue;
         }
         const cbm_gbuf_node_t *src = NULL;
+        bool source_ambiguous = false;
         if (ea->enclosing_func_qn && ea->enclosing_func_qn[0]) {
-            src = ea->start_line > 0 ? cbm_gbuf_find_by_qn_location(
-                                           ctx->gbuf, ea->enclosing_func_qn, rel, ea->start_line)
-                                     : cbm_gbuf_find_by_qn(ctx->gbuf, ea->enclosing_func_qn);
+            src = ea->start_line > 0
+                      ? cbm_gbuf_find_by_qn_location(ctx->gbuf, ea->enclosing_func_qn, rel,
+                                                     ea->start_line)
+                      : cbm_gbuf_find_by_qn_domain_status(
+                            ctx->gbuf, ea->enclosing_func_qn, CBM_REF_DOMAIN_CALLABLE,
+                            "environment.reference_source", &source_ambiguous);
+            if (source_ambiguous) {
+                continue;
+            }
         }
         if (!src) {
             if (!file_qn) {

@@ -121,6 +121,7 @@ typedef struct {
     int macro_match_depth;
     int macro_match_depth_limit;
     uint32_t macro_origin_byte;
+    int macro_origin_line;
     bool macro_origin_valid;
 
     /* Pathological-input guard: counts the number of call-resolution

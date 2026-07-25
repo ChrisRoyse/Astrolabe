@@ -1619,6 +1619,7 @@ static void extract_jsx_component_ref(CBMExtractCtx *ctx, TSNode node, const cha
         CBMCall call = {0};
         call.callee_name = name;
         call.enclosing_func_qn = enclosing_func_qn;
+        call.start_line = (int)ts_node_start_point(node).row + TS_LINE_OFFSET;
         if (!cbm_calls_push(&ctx->result->calls, ctx->arena, call)) {
             return;
         }
@@ -1954,6 +1955,7 @@ void handle_calls(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec, Walk
                             CBMCall xcall = {0};
                             xcall.callee_name = cbm_arena_sprintf(ctx->arena, "%s.%s", cls, mth);
                             xcall.enclosing_func_qn = call.enclosing_func_qn;
+                            xcall.start_line = call.start_line;
                             if (!cbm_calls_push(&ctx->result->calls, ctx->arena, xcall)) {
                                 return;
                             }

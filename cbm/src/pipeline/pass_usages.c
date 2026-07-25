@@ -91,10 +91,16 @@ static bool is_checked_exception(const char *name) {
 static const cbm_gbuf_node_t *find_enclosing_node(cbm_pipeline_ctx_t *ctx, const char *func_qn,
                                                   const char *rel_path, int source_line) {
     const cbm_gbuf_node_t *node = NULL;
+    bool source_ambiguous = false;
     if (func_qn && func_qn[0]) {
-        node = source_line > 0
-                   ? cbm_gbuf_find_by_qn_location(ctx->gbuf, func_qn, rel_path, source_line)
-                   : cbm_gbuf_find_by_qn(ctx->gbuf, func_qn);
+        node =
+            source_line > 0
+                ? cbm_gbuf_find_by_qn_location(ctx->gbuf, func_qn, rel_path, source_line)
+                : cbm_gbuf_find_by_qn_domain_status(ctx->gbuf, func_qn, CBM_REF_DOMAIN_CALLABLE,
+                                                    "usages.reference_source", &source_ambiguous);
+        if (source_ambiguous) {
+            return NULL;
+        }
         /* A class-level reference in a directory-module language carries the
          * DIRECTORY module QN, which hits the shared Folder/Project node —
          * attribute to this file's File node instead (#787). */
