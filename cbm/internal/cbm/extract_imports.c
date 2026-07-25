@@ -107,6 +107,22 @@ static const char *path_last(CBMArena *a, const char *path) {
     return path;
 }
 
+// Get the final physical filename component without interpreting '.' as a
+// semantic-language separator. The returned pointer aliases the arena-owned
+// path and therefore needs no extra allocation.
+static const char *file_path_last(const char *path) {
+    if (!path) {
+        return NULL;
+    }
+    const char *last = path;
+    for (const char *p = path; *p; p++) {
+        if (*p == '/' || *p == '\\') {
+            last = p + SKIP_ONE;
+        }
+    }
+    return last;
+}
+
 // --- Go imports ---
 // import_declaration -> import_spec_list -> import_spec -> (name, path)
 
@@ -720,7 +736,7 @@ static void parse_c_imports(CBMExtractCtx *ctx) {
         }
 
         CBMImport imp = {
-            .local_name = path_last(a, path), .module_path = path, .resolution = resolution};
+            .local_name = file_path_last(path), .module_path = path, .resolution = resolution};
         if (!cbm_imports_push(&ctx->result->imports, a, imp)) {
             return;
         }
