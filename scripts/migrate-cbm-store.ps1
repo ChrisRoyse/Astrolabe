@@ -499,7 +499,8 @@ function Invoke-CbmTool {
         [Parameter(Mandatory)][string]$ArgsPath,
         [Parameter(Mandatory)][string]$StdoutPath,
         [Parameter(Mandatory)][string]$StderrPath,
-        [Parameter(Mandatory)][int]$TimeoutSeconds
+        [Parameter(Mandatory)][int]$TimeoutSeconds,
+        [Parameter(Mandatory)][string]$CacheDirectory
     )
     $start = [Diagnostics.ProcessStartInfo]::new()
     $start.FileName = $Executable
@@ -507,6 +508,7 @@ function Invoke-CbmTool {
     $start.CreateNoWindow = $true
     $start.RedirectStandardOutput = $true
     $start.RedirectStandardError = $true
+    $start.Environment['CBM_CACHE_DIR'] = $CacheDirectory
     $start.ArgumentList.Add('cli')
     $start.ArgumentList.Add('--json')
     $start.ArgumentList.Add($Tool)
@@ -898,7 +900,7 @@ try {
     $run = Invoke-CbmTool -Executable $binary -Tool 'index_repository' -ArgsPath $argsPath `
         -StdoutPath ([IO.Path]::Combine($transactionPath, "${recordStem}reindex.stdout.json")) `
         -StderrPath ([IO.Path]::Combine($transactionPath, "${recordStem}reindex.stderr.log")) `
-        -TimeoutSeconds $ReindexTimeoutSeconds
+        -TimeoutSeconds $ReindexTimeoutSeconds -CacheDirectory $cache
     $previous = Add-JournalRecord -JournalPath $journal -PreviousSha256 $previous `
         -Event $(if ($attemptPrefix) { 'resume_reindex_process_exited' } else {
             'reindex_process_exited'
@@ -933,7 +935,7 @@ try {
         -ArgsPath $admissionArgsPath `
         -StdoutPath ([IO.Path]::Combine($transactionPath, "${recordStem}admission.stdout.json")) `
         -StderrPath ([IO.Path]::Combine($transactionPath, "${recordStem}admission.stderr.log")) `
-        -TimeoutSeconds $ReindexTimeoutSeconds
+        -TimeoutSeconds $ReindexTimeoutSeconds -CacheDirectory $cache
     $previous = Add-JournalRecord -JournalPath $journal -PreviousSha256 $previous `
         -Event $(if ($attemptPrefix) { 'resume_query_admission_process_exited' } else {
             'query_admission_process_exited'
