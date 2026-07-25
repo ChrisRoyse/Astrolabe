@@ -239,6 +239,10 @@ struct cbm_gbuf {
      * counted here so the index result can report it: degradation is disclosed,
      * never silent (standing invariant 3). */
     _Atomic uint_least64_t ambiguous_reference_skips;
+    /* Counted source-attribution misses. A non-empty enclosing callable QN is
+     * an assertion of source ownership; if its exact atom is absent, the edge
+     * is skipped instead of being silently attached to the File node. */
+    _Atomic uint_least64_t unresolved_reference_source_skips;
     /* Primary index: "id" string → cbm_gbuf_node_t* */
     /* Dense id → node array (ids are sequential from alloc_next_id, shared
      * with edges → holes where edges took ids). Replaces a hash table keyed
@@ -1232,6 +1236,35 @@ const cbm_gbuf_node_t *cbm_gbuf_find_source_container(const cbm_gbuf_t *gb, cons
 
 uint_least64_t cbm_gbuf_ambiguous_reference_skips(const cbm_gbuf_t *gb) {
     return gb ? atomic_load(&((cbm_gbuf_t *)gb)->ambiguous_reference_skips) : 0;
+}
+
+uint_least64_t cbm_gbuf_unresolved_reference_source_skips(const cbm_gbuf_t *gb) {
+    return gb ? atomic_load(&((cbm_gbuf_t *)gb)->unresolved_reference_source_skips) : 0;
+}
+
+void cbm_gbuf_record_unresolved_reference_source(const cbm_gbuf_t *gb, const char *operation,
+                                                 const char *qualified_name, const char *file_path,
+                                                 int source_line) {
+    if (!gb || !operation || !operation[0] || !qualified_name || !qualified_name[0]) {
+        return;
+    }
+
+    uint_least64_t skips =
+        atomic_fetch_add(&((cbm_gbuf_t *)gb)->unresolved_reference_source_skips, 1) + 1;
+    char line_buf[CBM_SZ_32];
+    char skip_buf[CBM_SZ_32];
+    snprintf(line_buf, sizeof(line_buf), "%d", source_line);
+    snprintf(skip_buf, sizeof(skip_buf), "%llu", (unsigned long long)skips);
+    cbm_log_warn(
+        "gbuf.reference_source_unresolved", "code", "CBM_REFERENCE_SOURCE_NOT_FOUND", "operation",
+        operation, "qualified_name", qualified_name, "file_path", file_path ? file_path : "",
+        "source_line", line_buf, "disposition", "reference_edge_skipped",
+        "unresolved_reference_source_skips", skip_buf, "message",
+        "extracted reference names an enclosing callable but no exact stable source atom owns "
+        "that location; the edge is skipped instead of being attributed to the File node",
+        "remediation",
+        "preserve the source qualified name and 1-based location from extraction through "
+        "resolution, then re-index to recover the edge");
 }
 
 bool cbm_gbuf_resolution_failed(const cbm_gbuf_t *gb) {

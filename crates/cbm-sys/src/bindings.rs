@@ -2074,6 +2074,11 @@ unsafe extern "C" {
     pub fn cbm_pipeline_get_ambiguous_reference_skips(p: *const cbm_pipeline_t) -> uint_least64_t;
 }
 unsafe extern "C" {
+    pub fn cbm_pipeline_get_unresolved_reference_source_skips(
+        p: *const cbm_pipeline_t,
+    ) -> uint_least64_t;
+}
+unsafe extern "C" {
     pub fn cbm_pipeline_get_fatal_error(
         p: *const cbm_pipeline_t,
         out: *mut cbm_pipeline_error_t,

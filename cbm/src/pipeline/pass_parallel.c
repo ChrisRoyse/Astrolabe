@@ -1229,7 +1229,7 @@ static int create_imports_edges(cbm_pipeline_ctx_t *ctx, const CBMFileResult *re
 
 /* Find channel source node (enclosing function or file). */
 static const cbm_gbuf_node_t *find_channel_src(cbm_pipeline_ctx_t *ctx, const CBMChannel *ch,
-                                               const char *rel) {
+                                               const char *rel, const char *module_qn) {
     const cbm_gbuf_node_t *node = NULL;
     bool source_ambiguous = false;
     if (ch->enclosing_func_qn && ch->enclosing_func_qn[0]) {
@@ -1239,6 +1239,11 @@ static const cbm_gbuf_node_t *find_channel_src(cbm_pipeline_ctx_t *ctx, const CB
                                         ctx->gbuf, ch->enclosing_func_qn, CBM_REF_DOMAIN_CALLABLE,
                                         "parallel.channel_source", &source_ambiguous);
         if (source_ambiguous) {
+            return NULL;
+        }
+        if (!node && (!module_qn || strcmp(ch->enclosing_func_qn, module_qn) != 0)) {
+            cbm_gbuf_record_unresolved_reference_source(ctx->gbuf, "parallel.channel_source",
+                                                        ch->enclosing_func_qn, rel, ch->start_line);
             return NULL;
         }
     }
@@ -1252,7 +1257,7 @@ static const cbm_gbuf_node_t *find_channel_src(cbm_pipeline_ctx_t *ctx, const CB
 
 /* Create Channel nodes + EMITS/LISTENS_ON edges for one file. */
 static void create_channel_edges(cbm_pipeline_ctx_t *ctx, const CBMFileResult *result,
-                                 const char *rel) {
+                                 const char *rel, const char *module_qn) {
     for (int j = 0; j < result->channels.count; j++) {
         CBMChannel *ch = &result->channels.items[j];
         if (!ch->channel_name || !ch->channel_name[0]) {
@@ -1268,7 +1273,7 @@ static void create_channel_edges(cbm_pipeline_ctx_t *ctx, const CBMFileResult *r
                  ch->transport ? ch->transport : "unknown", esc_cn);
         int64_t channel_id = cbm_gbuf_upsert_node(ctx->gbuf, "Channel", ch->channel_name,
                                                   channel_qn, "", 0, 0, channel_props);
-        const cbm_gbuf_node_t *src_node = find_channel_src(ctx, ch, rel);
+        const cbm_gbuf_node_t *src_node = find_channel_src(ctx, ch, rel, module_qn);
         if (src_node && channel_id > 0) {
             const char *edge_type = ch->direction == CBM_CHANNEL_EMIT ? "EMITS" : "LISTENS_ON";
             char edge_props[CBM_SZ_128];
@@ -1332,7 +1337,10 @@ int cbm_build_registry_from_cache(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
         }
 
         imports_edges += create_imports_edges(ctx, result, rel, namespace_map);
-        create_channel_edges(ctx, result, rel);
+        char *module_qn = cbm_pipeline_fqn_module_dir(ctx->project_name, rel,
+                                                      pp_module_is_dir(files[i].language));
+        create_channel_edges(ctx, result, rel, module_qn);
+        free(module_qn);
     }
 
     cbm_pipeline_namespace_map_free(namespace_map);
@@ -2052,11 +2060,11 @@ static void emit_service_edge(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *source,
 
 /* Find the source node for an edge: enclosing function or file node. */
 static const cbm_gbuf_node_t *find_source_node(const cbm_gbuf_t *gbuf, const char *project,
-                                               const char *rel, const char *enclosing_qn,
-                                               int call_line) {
+                                               const char *rel, const char *module_qn,
+                                               const char *enclosing_qn, int call_line) {
     const cbm_gbuf_node_t *src = NULL;
     bool source_ambiguous = false;
-    if (enclosing_qn) {
+    if (enclosing_qn && enclosing_qn[0]) {
         src =
             call_line > 0
                 ? cbm_gbuf_find_by_qn_location(gbuf, enclosing_qn, rel, call_line)
@@ -2070,6 +2078,10 @@ static const cbm_gbuf_node_t *find_source_node(const cbm_gbuf_t *gbuf, const cha
          * attribute to this file's File node instead (#787). */
         if (cbm_pipeline_node_is_dir_container(src)) {
             src = NULL;
+        } else if (!src && (!module_qn || strcmp(enclosing_qn, module_qn) != 0)) {
+            cbm_gbuf_record_unresolved_reference_source(gbuf, "parallel.reference_source",
+                                                        enclosing_qn, rel, call_line);
+            return NULL;
         }
     }
     if (!src) {
@@ -2247,8 +2259,9 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
             continue;
         }
         uint64_t _rc_t0 = extract_now_ns();
-        const cbm_gbuf_node_t *source_node = find_source_node(
-            rc->main_gbuf, rc->project_name, rel, call->enclosing_func_qn, call->start_line);
+        const cbm_gbuf_node_t *source_node =
+            find_source_node(rc->main_gbuf, rc->project_name, rel, module_qn,
+                             call->enclosing_func_qn, call->start_line);
         atomic_fetch_add_explicit(&rc->time_ns_rc_source, extract_now_ns() - _rc_t0,
                                   memory_order_relaxed);
         if (!source_node) {
@@ -2437,8 +2450,9 @@ static void resolve_file_usages(resolve_ctx_t *rc, resolve_worker_state_t *ws,
         if (!usage->ref_name) {
             continue;
         }
-        const cbm_gbuf_node_t *src = find_source_node(rc->main_gbuf, rc->project_name, rel,
-                                                      usage->enclosing_func_qn, usage->start_line);
+        const cbm_gbuf_node_t *src =
+            find_source_node(rc->main_gbuf, rc->project_name, rel, module_qn,
+                             usage->enclosing_func_qn, usage->start_line);
         if (!src) {
             continue;
         }
@@ -2470,8 +2484,9 @@ static void resolve_file_throws(resolve_ctx_t *rc, resolve_worker_state_t *ws,
         if (!thr->exception_name || !thr->enclosing_func_qn) {
             continue;
         }
-        const cbm_gbuf_node_t *src = find_source_node(rc->main_gbuf, rc->project_name, rel,
-                                                      thr->enclosing_func_qn, thr->start_line);
+        const cbm_gbuf_node_t *src =
+            find_source_node(rc->main_gbuf, rc->project_name, rel, module_qn,
+                             thr->enclosing_func_qn, thr->start_line);
         if (!src) {
             continue;
         }
@@ -2499,8 +2514,8 @@ static void resolve_file_rw(resolve_ctx_t *rc, resolve_worker_state_t *ws, CBMFi
         if (!rw->var_name) {
             continue;
         }
-        const cbm_gbuf_node_t *src = find_source_node(rc->main_gbuf, rc->project_name, rel,
-                                                      rw->enclosing_func_qn, rw->start_line);
+        const cbm_gbuf_node_t *src = find_source_node(
+            rc->main_gbuf, rc->project_name, rel, module_qn, rw->enclosing_func_qn, rw->start_line);
         if (!src) {
             continue;
         }

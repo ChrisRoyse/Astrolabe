@@ -4169,6 +4169,21 @@ static char *build_index_success_response(cbm_mcp_server_t *srv, yyjson_mut_doc 
             "the exact qualified names, candidate atoms, and source locations.");
     }
 
+    /* A source-attribution miss is distinct from same-domain ambiguity: the
+     * extractor asserted a callable owner, but its exact stable source atom was
+     * absent. The edge is refused rather than silently becoming File-owned. */
+    uint_least64_t unresolved_source_skips = cbm_pipeline_get_unresolved_reference_source_skips(p);
+    yyjson_mut_obj_add_uint(doc, root, "unresolved_reference_source_skips",
+                            (uint64_t)unresolved_source_skips);
+    if (unresolved_source_skips > 0) {
+        yyjson_mut_obj_add_str(
+            doc, root, "unresolved_reference_source_hint",
+            "Some reference edges were skipped because their extracted enclosing callable "
+            "could not be matched to an exact stable source atom. No edge was re-attributed "
+            "to a File node; see CBM_REFERENCE_SOURCE_NOT_FOUND log entries for the exact "
+            "operation, qualified name, source path, and line.");
+    }
+
     bool adr_exists = project_has_adr(store, project_name, repo_path);
     yyjson_mut_obj_add_bool(doc, root, "adr_present", adr_exists);
     if (!adr_exists) {

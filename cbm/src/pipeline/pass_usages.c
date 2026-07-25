@@ -89,7 +89,8 @@ static bool is_checked_exception(const char *name) {
 
 /* Find the graph buffer node for an enclosing function QN, falling back to file node. */
 static const cbm_gbuf_node_t *find_enclosing_node(cbm_pipeline_ctx_t *ctx, const char *func_qn,
-                                                  const char *rel_path, int source_line) {
+                                                  const char *rel_path, const char *module_qn,
+                                                  int source_line) {
     const cbm_gbuf_node_t *node = NULL;
     bool source_ambiguous = false;
     if (func_qn && func_qn[0]) {
@@ -106,6 +107,10 @@ static const cbm_gbuf_node_t *find_enclosing_node(cbm_pipeline_ctx_t *ctx, const
          * attribute to this file's File node instead (#787). */
         if (cbm_pipeline_node_is_dir_container(node)) {
             node = NULL;
+        } else if (!node && (!module_qn || strcmp(func_qn, module_qn) != 0)) {
+            cbm_gbuf_record_unresolved_reference_source(ctx->gbuf, "usages.reference_source",
+                                                        func_qn, rel_path, source_line);
+            return NULL;
         }
     }
     if (!node) {
@@ -128,7 +133,7 @@ static int resolve_usage_edges(cbm_pipeline_ctx_t *ctx, const CBMFileResult *res
         }
 
         const cbm_gbuf_node_t *src =
-            find_enclosing_node(ctx, usage->enclosing_func_qn, rel, usage->start_line);
+            find_enclosing_node(ctx, usage->enclosing_func_qn, rel, module_qn, usage->start_line);
         if (!src) {
             continue;
         }
@@ -169,7 +174,7 @@ static int resolve_throw_edges(cbm_pipeline_ctx_t *ctx, const CBMFileResult *res
         }
 
         const cbm_gbuf_node_t *src =
-            find_enclosing_node(ctx, thr->enclosing_func_qn, rel, thr->start_line);
+            find_enclosing_node(ctx, thr->enclosing_func_qn, rel, module_qn, thr->start_line);
         if (!src) {
             continue;
         }
@@ -205,7 +210,7 @@ static int resolve_rw_edges(cbm_pipeline_ctx_t *ctx, const CBMFileResult *result
         }
 
         const cbm_gbuf_node_t *src =
-            find_enclosing_node(ctx, rw->enclosing_func_qn, rel, rw->start_line);
+            find_enclosing_node(ctx, rw->enclosing_func_qn, rel, module_qn, rw->start_line);
         if (!src) {
             continue;
         }

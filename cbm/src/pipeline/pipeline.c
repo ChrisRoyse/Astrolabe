@@ -210,6 +210,11 @@ struct cbm_pipeline {
      * buffer before it is freed so the tool result can disclose the loss. */
     uint_least64_t ambiguous_reference_skips;
 
+    /* Reference edges skipped because an extracted non-empty enclosing
+     * callable QN had no exact stable source atom. Kept separate from semantic
+     * ambiguity so the success response identifies the actual degradation. */
+    uint_least64_t unresolved_reference_source_skips;
+
     /* ADR (project_summaries) captured before a full-reindex DB delete, so it
      * can be restored after the rebuild. NULL when no ADR existed. Issue #516. */
     char *saved_adr;
@@ -277,6 +282,7 @@ cbm_pipeline_t *cbm_pipeline_new(const char *repo_path, const char *db_path,
     p->committed_nodes = -1;
     p->committed_edges = -1;
     p->ambiguous_reference_skips = 0;
+    p->unresolved_reference_source_skips = 0;
     atomic_init(&p->cancelled, 0);
 
     return p;
@@ -648,6 +654,16 @@ void cbm_pipeline_set_ambiguous_reference_skips(cbm_pipeline_t *p, uint_least64_
 
 uint_least64_t cbm_pipeline_get_ambiguous_reference_skips(const cbm_pipeline_t *p) {
     return p ? p->ambiguous_reference_skips : 0;
+}
+
+void cbm_pipeline_set_unresolved_reference_source_skips(cbm_pipeline_t *p, uint_least64_t skips) {
+    if (p) {
+        p->unresolved_reference_source_skips = skips;
+    }
+}
+
+uint_least64_t cbm_pipeline_get_unresolved_reference_source_skips(const cbm_pipeline_t *p) {
+    return p ? p->unresolved_reference_source_skips : 0;
 }
 
 bool cbm_pipeline_row_sink_active(const cbm_pipeline_t *p) {
@@ -2235,6 +2251,7 @@ cleanup:
     /* Capture the counted degradations before the graph buffer that owns them
      * is destroyed — an unreported skip is a silent loss (#727). */
     p->ambiguous_reference_skips = cbm_gbuf_ambiguous_reference_skips(p->gbuf);
+    p->unresolved_reference_source_skips = cbm_gbuf_unresolved_reference_source_skips(p->gbuf);
     cbm_gbuf_free(p->gbuf);
     p->gbuf = NULL;
     cbm_registry_free(p->registry);

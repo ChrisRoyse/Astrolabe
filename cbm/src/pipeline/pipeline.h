@@ -111,6 +111,12 @@ void cbm_pipeline_get_committed_counts(const cbm_pipeline_t *p, int *nodes, int 
  * an unreported skip is exactly the silent degradation invariant 3 forbids. */
 uint_least64_t cbm_pipeline_get_ambiguous_reference_skips(const cbm_pipeline_t *p);
 
+/* Reference edges skipped because extraction asserted a non-empty enclosing
+ * callable QN but no exact stable source atom owned the recorded path/line.
+ * A successful index MUST disclose this count; such references are never
+ * silently re-attributed to a File node. */
+uint_least64_t cbm_pipeline_get_unresolved_reference_source_skips(const cbm_pipeline_t *p);
+
 /* Read the exact first fatal pipeline diagnostic. Returns false and zeroes
  * `out` when no fatal diagnostic has been recorded. Every pointer is borrowed
  * from the pipeline and remains valid until cbm_pipeline_free(). */

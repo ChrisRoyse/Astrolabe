@@ -167,6 +167,15 @@ bool cbm_gbuf_resolution_failed(const cbm_gbuf_t *gb);
  * callers MUST surface this count or the loss becomes silent. */
 uint_least64_t cbm_gbuf_ambiguous_reference_skips(const cbm_gbuf_t *gb);
 
+/* Record and diagnose a reference edge whose extracted syntax names an
+ * enclosing callable but whose exact source atom cannot be found. Such a
+ * reference must never be silently re-attributed to the containing File.
+ * The corpus may still publish, so every skip is counted for the index result. */
+void cbm_gbuf_record_unresolved_reference_source(const cbm_gbuf_t *gb, const char *operation,
+                                                 const char *qualified_name, const char *file_path,
+                                                 int source_line);
+uint_least64_t cbm_gbuf_unresolved_reference_source_skips(const cbm_gbuf_t *gb);
+
 /* Find a node by temp ID. Returns NULL if not found. */
 const cbm_gbuf_node_t *cbm_gbuf_find_by_id(const cbm_gbuf_t *gb, int64_t id);
 

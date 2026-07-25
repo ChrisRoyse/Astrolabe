@@ -33,6 +33,12 @@ enum { PD_JSON_FIELD_OVERHEAD = 6 };
 #include <stdlib.h>
 #include <string.h>
 
+/* MUST match cbm_lang_module_is_dir() in the extractor: top-level references
+ * carry the module QN and are legitimately attributed to the per-file File. */
+static bool pd_module_is_dir(CBMLanguage lang) {
+    return lang == CBM_LANG_JAVA || lang == CBM_LANG_GO;
+}
+
 /* Read entire file into heap-allocated buffer. Returns NULL on error.
  * Caller must free(). Sets *out_len to byte count. *out_size receives the
  * on-disk size and *out_status the failure reason, so the caller can attribute
@@ -509,7 +515,7 @@ static void process_def(cbm_pipeline_ctx_t *ctx, const CBMCallArray *calls,
  * Mirrors the parallel path in cbm_build_registry_from_cache — keep in sync. */
 /* Find the source node for a channel edge: enclosing function or file node. */
 static const cbm_gbuf_node_t *find_channel_source(cbm_pipeline_ctx_t *ctx, const CBMChannel *ch,
-                                                  const char *rel) {
+                                                  const char *rel, const char *module_qn) {
     const cbm_gbuf_node_t *node = NULL;
     bool source_ambiguous = false;
     if (ch->enclosing_func_qn && ch->enclosing_func_qn[0]) {
@@ -519,6 +525,11 @@ static const cbm_gbuf_node_t *find_channel_source(cbm_pipeline_ctx_t *ctx, const
                                         ctx->gbuf, ch->enclosing_func_qn, CBM_REF_DOMAIN_CALLABLE,
                                         "channel.reference_source", &source_ambiguous);
         if (source_ambiguous) {
+            return NULL;
+        }
+        if (!node && (!module_qn || strcmp(ch->enclosing_func_qn, module_qn) != 0)) {
+            cbm_gbuf_record_unresolved_reference_source(ctx->gbuf, "channel.reference_source",
+                                                        ch->enclosing_func_qn, rel, ch->start_line);
             return NULL;
         }
     }
@@ -531,7 +542,7 @@ static const cbm_gbuf_node_t *find_channel_source(cbm_pipeline_ctx_t *ctx, const
 }
 
 static void create_channel_edges_for_file(cbm_pipeline_ctx_t *ctx, const CBMFileResult *result,
-                                          const char *rel) {
+                                          const char *rel, const char *module_qn) {
     for (int j = 0; j < result->channels.count; j++) {
         const CBMChannel *ch = &result->channels.items[j];
         if (!ch->channel_name || !ch->channel_name[0]) {
@@ -548,7 +559,7 @@ static void create_channel_edges_for_file(cbm_pipeline_ctx_t *ctx, const CBMFile
         int64_t channel_id = cbm_gbuf_upsert_node(ctx->gbuf, "Channel", ch->channel_name,
                                                   channel_qn, "", 0, 0, channel_props);
 
-        const cbm_gbuf_node_t *src_node = find_channel_source(ctx, ch, rel);
+        const cbm_gbuf_node_t *src_node = find_channel_source(ctx, ch, rel, module_qn);
         if (src_node && channel_id > 0) {
             const char *edge_type = ch->direction == CBM_CHANNEL_EMIT ? "EMITS" : "LISTENS_ON";
             char edge_props[CBM_SZ_128];
@@ -566,7 +577,7 @@ static void create_channel_edges_for_file(cbm_pipeline_ctx_t *ctx, const CBMFile
  * so environment-driven configuration is visible even when the accessor is a
  * stdlib symbol that never resolves to an in-graph callee. */
 static int create_env_configures_for_file(cbm_pipeline_ctx_t *ctx, const CBMFileResult *result,
-                                          const char *rel) {
+                                          const char *rel, const char *module_qn) {
     int count = 0;
     char *file_qn = NULL;
     const cbm_gbuf_node_t *file_node = NULL;
@@ -596,6 +607,12 @@ static int create_env_configures_for_file(cbm_pipeline_ctx_t *ctx, const CBMFile
                             ctx->gbuf, ea->enclosing_func_qn, CBM_REF_DOMAIN_CALLABLE,
                             "environment.reference_source", &source_ambiguous);
             if (source_ambiguous) {
+                continue;
+            }
+            if (!src && (!module_qn || strcmp(ea->enclosing_func_qn, module_qn) != 0)) {
+                cbm_gbuf_record_unresolved_reference_source(
+                    ctx->gbuf, "environment.reference_source", ea->enclosing_func_qn, rel,
+                    ea->start_line);
                 continue;
             }
         }
@@ -783,8 +800,11 @@ int cbm_pipeline_pass_definitions(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
              * own defs are now persisted before the lookup. No namespace
              * map is available without the cache (single-file scope). */
             total_imports += create_import_edges_for_file(ctx, result, rel, NULL);
-            create_channel_edges_for_file(ctx, result, rel);
-            create_env_configures_for_file(ctx, result, rel);
+            char *module_qn =
+                cbm_pipeline_fqn_module_dir(ctx->project_name, rel, pd_module_is_dir(lang));
+            create_channel_edges_for_file(ctx, result, rel, module_qn);
+            create_env_configures_for_file(ctx, result, rel, module_qn);
+            free(module_qn);
             cbm_free_result(result);
         }
     }
@@ -853,8 +873,11 @@ int cbm_pipeline_pass_definitions(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
             }
             total_imports +=
                 create_import_edges_for_file(ctx, result, files[i].rel_path, namespace_map);
-            create_channel_edges_for_file(ctx, result, files[i].rel_path);
-            create_env_configures_for_file(ctx, result, files[i].rel_path);
+            char *module_qn = cbm_pipeline_fqn_module_dir(ctx->project_name, files[i].rel_path,
+                                                          pd_module_is_dir(files[i].language));
+            create_channel_edges_for_file(ctx, result, files[i].rel_path, module_qn);
+            create_env_configures_for_file(ctx, result, files[i].rel_path, module_qn);
+            free(module_qn);
         }
         cbm_pipeline_namespace_map_free(namespace_map);
         if (owns_local_cache) {

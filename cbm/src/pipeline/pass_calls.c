@@ -313,10 +313,11 @@ static void emit_classified_edge(cbm_pipeline_ctx_t *ctx, const CBMCall *call,
 
 /* Find source node for a call: enclosing function or file node. */
 static const cbm_gbuf_node_t *calls_find_source(cbm_pipeline_ctx_t *ctx, const char *rel,
-                                                const char *enclosing_qn, int call_line) {
+                                                const char *module_qn, const char *enclosing_qn,
+                                                int call_line) {
     const cbm_gbuf_node_t *src = NULL;
     bool source_ambiguous = false;
-    if (enclosing_qn) {
+    if (enclosing_qn && enclosing_qn[0]) {
         src = call_line > 0
                   ? cbm_gbuf_find_by_qn_location(ctx->gbuf, enclosing_qn, rel, call_line)
                   : cbm_gbuf_find_by_qn_domain_status(ctx->gbuf, enclosing_qn,
@@ -330,6 +331,10 @@ static const cbm_gbuf_node_t *calls_find_source(cbm_pipeline_ctx_t *ctx, const c
          * attribute to this file's File node instead (#787). */
         if (cbm_pipeline_node_is_dir_container(src)) {
             src = NULL;
+        } else if (!src && (!module_qn || strcmp(enclosing_qn, module_qn) != 0)) {
+            cbm_gbuf_record_unresolved_reference_source(ctx->gbuf, "calls.reference_source",
+                                                        enclosing_qn, rel, call_line);
+            return NULL;
         }
     }
     if (!src) {
@@ -346,7 +351,7 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call,
                                const char *module_qn, const char **imp_keys, const char **imp_vals,
                                int imp_count, CBMLanguage lang) {
     const cbm_gbuf_node_t *source_node =
-        calls_find_source(ctx, rel, call->enclosing_func_qn, call->start_line);
+        calls_find_source(ctx, rel, module_qn, call->enclosing_func_qn, call->start_line);
     if (!source_node) {
         return 0;
     }

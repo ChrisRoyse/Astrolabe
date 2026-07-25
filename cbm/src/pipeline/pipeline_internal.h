@@ -698,6 +698,9 @@ void cbm_pipeline_set_committed_counts(cbm_pipeline_t *p, int nodes, int edges);
 /* Record counted domain-ambiguity skips from a graph buffer the caller owns
  * (the incremental path builds its own) before that buffer is freed (#727). */
 void cbm_pipeline_set_ambiguous_reference_skips(cbm_pipeline_t *p, uint_least64_t skips);
+/* Record unresolved enclosing-source skips from an incremental graph buffer
+ * before the caller frees it. */
+void cbm_pipeline_set_unresolved_reference_source_skips(cbm_pipeline_t *p, uint_least64_t skips);
 /* Complete-snapshot sink helpers shared with the incremental route. */
 bool cbm_pipeline_row_sink_active(const cbm_pipeline_t *p);
 void cbm_pipeline_attach_row_sink(cbm_pipeline_t *p, cbm_gbuf_t *gbuf);

@@ -1928,15 +1928,13 @@ static void py_emit_call_for(PyLSPContext *ctx, TSNode call_node) {
                     }
                 }
             }
-            // Set enclosing func to a synthetic <lambda> so emissions
-            // attribute correctly (find_resolved by "<lambda>" works).
-            const char *prev_func = ctx->enclosing_func_qn;
-            ctx->enclosing_func_qn = cbm_arena_sprintf(ctx->arena, "%s.<lambda>",
-                                                       prev_func ? prev_func : ctx->module_qn);
+            /* A lambda has no definition atom in the code graph. Attribute
+             * recovered calls to its real lexical source owner; manufacturing
+             * a `<lambda>` caller QN makes source attribution miss and used to
+             * fall through to the File node (#727). */
             if (!ts_node_is_null(body)) {
                 py_resolve_calls_in(ctx, body);
             }
-            ctx->enclosing_func_qn = prev_func;
             py_scope_restore(ctx, saved);
             return;
         }
@@ -3480,9 +3478,11 @@ void py_lsp_process_file(PyLSPContext *ctx, TSNode root) {
         TSNode c = ts_node_named_child(root, i);
         py_process_statement(ctx, c);
     }
-    // Pass 2: top-level calls (rare) and nested definitions.
+    // Pass 2: top-level calls (rare) and nested definitions. Top-level calls
+    // are source-owned by the module/File contract; there is no synthetic
+    // `__module__` definition atom to own their edges (#727).
     const char *prev_func = ctx->enclosing_func_qn;
-    ctx->enclosing_func_qn = cbm_arena_sprintf(ctx->arena, "%s.__module__", ctx->module_qn);
+    ctx->enclosing_func_qn = ctx->module_qn;
     for (uint32_t i = 0; i < nc; i++) {
         TSNode c = ts_node_named_child(root, i);
         const char *ck = ts_node_type(c);
