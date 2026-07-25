@@ -477,6 +477,14 @@ try {
         temp_inventory_error = $completion.TempInventoryError
         temp_entries = $completion.TempEntryCount
         temp_inventory_sha256 = $completion.TempInventorySha256
+        temp_integrity_state = $completion.TempIntegrityState
+        temp_authorization_to_rename_state =
+            $completion.TempAuthorizationToRenameState
+        temp_rename_operation_state = $completion.TempRenameOperationState
+        temp_rename_to_completion_state =
+            $completion.TempRenameToCompletionState
+        temp_authorization_to_completion_state =
+            $completion.TempAuthorizationToCompletionState
         manifest_source_state = $directManifest.State
         manifest_archive_path = $completion.ManifestArchivePath
         manifest_file_id = $completion.ManifestFileId

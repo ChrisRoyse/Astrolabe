@@ -6,9 +6,12 @@
     Destructive recursive TEMP cleanup cannot atomically bind every authorized
     metadata class to FileDispositionInfo.  This module therefore never deletes
     launcher TEMP or attribution evidence.  It publishes a durable authorization
-    record, moves the complete TEMP directory and exact manifest by retained-handle
-    no-replace rename into one generation-bound transaction directory, then
-    publishes a durable completion record and independently reads the archive back.
+    record whose snapshots are diagnostic observations and never deletion
+    authority, moves the complete TEMP directory and exact manifest by
+    retained-handle no-replace rename into one generation-bound transaction
+    directory, then publishes a durable completion record and independently reads
+    the archive back. Completion explicitly classifies stable, changed-preserved,
+    and opaque-preserved state at every public transaction cut.
 
     A fault at any cut preserves every source or archive byte.  The transaction
     directory is append-only evidence and is never removed by ordinary launcher
@@ -78,6 +81,88 @@ function Get-AstroLauncherTempArchiveSnapshot {
         } else { $null }
         InventorySha256 = $inventorySha256
         Entries = $entries
+    }
+}
+
+function ConvertTo-AstroLauncherTempArchiveSnapshotRecord {
+    param([Parameter(Mandatory)]$Snapshot)
+
+    return [ordered]@{
+        path = $Snapshot.Path
+        root_file_id = $Snapshot.RootFileId
+        root_final_path = $Snapshot.RootFinalPath
+        root_state = $Snapshot.RootState
+        inventory_state = $Snapshot.InventoryState
+        inventory_error = $Snapshot.InventoryError
+        entry_count = $Snapshot.EntryCount
+        inventory_sha256 = $Snapshot.InventorySha256
+    }
+}
+
+function Compare-AstroLauncherTempArchiveSnapshots {
+    param(
+        [Parameter(Mandatory)]$Before,
+        [Parameter(Mandatory)]$After,
+        [ValidateSet('same-namespace', 'exact-rename')]
+        [string]$ComparisonMode = 'same-namespace'
+    )
+
+    if ($Before.RootFileId -cne $After.RootFileId) {
+        throw 'LAUNCHER_ARCHIVE[ASTRO_LAUNCHER_ARCHIVE_TEMP_IDENTITY_CHANGED]: retained TEMP FILE_ID changed between observations'
+    }
+    $rootStateRawEqual = $Before.RootState -ceq $After.RootState
+    $rootStateEqual = if ($ComparisonMode -ceq 'exact-rename') {
+        [AstroLauncherTempNative]::ExactRootStateEqualAcrossRename(
+            [string]$Before.RootState,
+            [string]$After.RootState
+        )
+    }
+    else {
+        [AstroLauncherTempNative]::ExactRootStateEqualIgnoringLastAccessTime(
+            [string]$Before.RootState,
+            [string]$After.RootState
+        )
+    }
+    $bothInventoriesExact =
+        $Before.InventoryState -ceq 'exact' -and
+        $After.InventoryState -ceq 'exact'
+    $inventoryEqual = if ($bothInventoriesExact) {
+        $Before.EntryCount -eq $After.EntryCount -and
+        [AstroLauncherTempNative]::
+            ExactTreeEntriesEqualIgnoringLastAccessTime(
+                [string[]]$Before.Entries,
+                [string[]]$After.Entries
+            )
+    } else { $null }
+    $integrityState = if (-not $rootStateEqual -or
+        ($bothInventoriesExact -and -not $inventoryEqual)) {
+        'changed-preserved'
+    }
+    elseif ($bothInventoriesExact) {
+        'stable-exact'
+    }
+    else {
+        'opaque-preserved'
+    }
+
+    return [ordered]@{
+        state = $integrityState
+        comparison_mode = $ComparisonMode
+        root_file_id_equal = $true
+        root_state_equal = $rootStateEqual
+        root_state_raw_equal = $rootStateRawEqual
+        inventory_comparison = if ($bothInventoriesExact) {
+            if ($inventoryEqual) { 'equal-normalized' } else { 'changed' }
+        } else { 'unavailable' }
+        inventory_sha256_equal = if ($bothInventoriesExact) {
+            $Before.InventorySha256 -ceq $After.InventorySha256
+        } else { $null }
+        before_inventory_state = $Before.InventoryState
+        before_entry_count = $Before.EntryCount
+        before_inventory_sha256 = $Before.InventorySha256
+        after_inventory_state = $After.InventoryState
+        after_entry_count = $After.EntryCount
+        after_inventory_sha256 = $After.InventorySha256
     }
 }
 
@@ -452,13 +537,21 @@ function Start-AstroLauncherStateArchiveTransaction {
             Join-Path $transactionPath 'manifest.json'
         ))
         $authorization = [ordered]@{
-            schema = 'astrolabe.launcher-state-archive.authorization.v1'
+            schema = 'astrolabe.launcher-state-archive.authorization.v2'
             transaction_id = $transactionId
             created_utc = [DateTime]::UtcNow.ToString('O')
             authority = [ordered]@{
                 mode = $AuthorityMode
                 driving_issue = $DrivingIssue
                 tracker_comment_url = $TrackerCommentUrl
+            }
+            policy = [ordered]@{
+                destructive_authority = 'none'
+                snapshot_role = 'diagnostic-observation-only'
+                namespace_operation =
+                    'same-volume-retained-handle-no-replace-rename'
+                concurrent_change_policy = 'preserve-and-classify'
+                ambiguous_state_policy = 'preserve-and-report'
             }
             generation = [ordered]@{
                 launcher_pid = $ManifestLease.Parsed.LauncherPid
@@ -520,6 +613,7 @@ function Start-AstroLauncherStateArchiveTransaction {
             ManifestBefore = $manifestBefore
             AuthorizationLease = $authorizationLease
             TempMoved = $false
+            TempMoveBefore = $null
             TempAfter = $null
             ManifestMoved = $false
             ManifestAfter = $null
@@ -557,6 +651,10 @@ function Move-AstroLauncherStateArchiveTemp {
         }
     }
     $before = Get-AstroLauncherTempArchiveSnapshot $Transaction.TempLease
+    if ($before.RootFileId -cne $Transaction.TempBefore.RootFileId) {
+        throw 'LAUNCHER_ARCHIVE[ASTRO_LAUNCHER_ARCHIVE_TEMP_IDENTITY_DRIFT]: TEMP FILE_ID changed before archive rename'
+    }
+    $Transaction.TempMoveBefore = $before
     [AstroLauncherTempNative]::RenameExactDirectoryNoReplace(
         $Transaction.TempLease.Handle,
         $Transaction.TransactionDirectoryLease.SafeFileHandle,
@@ -579,6 +677,10 @@ function Move-AstroLauncherStateArchiveTemp {
     }
     $Transaction.TempMoved = $true
     $Transaction.TempAfter = $after
+    $integrity = Compare-AstroLauncherTempArchiveSnapshots `
+        -Before $Transaction.TempBefore `
+        -After $after `
+        -ComparisonMode exact-rename
     return [pscustomobject]@{
         State = 'archived'
         SourcePath = $source
@@ -588,6 +690,7 @@ function Move-AstroLauncherStateArchiveTemp {
         InventoryError = $after.InventoryError
         EntryCount = $after.EntryCount
         InventorySha256 = $after.InventorySha256
+        IntegrityState = $integrity.state
         SourcePathState = $sourceState.State
     }
 }
@@ -658,6 +761,10 @@ function Complete-AstroLauncherStateArchiveTransaction {
     if (-not $Transaction.TempMoved -or -not $Transaction.ManifestMoved) {
         throw 'LAUNCHER_ARCHIVE[ASTRO_LAUNCHER_ARCHIVE_INCOMPLETE]: both retained sources must be archived before completion'
     }
+    if ($null -eq $Transaction.TempMoveBefore -or
+        $null -eq $Transaction.TempAfter) {
+        throw 'LAUNCHER_ARCHIVE[ASTRO_LAUNCHER_ARCHIVE_TEMP_OBSERVATIONS_MISSING]: archive completion requires pre-rename and post-rename TEMP observations'
+    }
     $tempAfter = Get-AstroLauncherTempArchiveSnapshot $Transaction.TempLease
     $manifestAfter = Get-AstroExactRetainedFileSnapshot `
         -Handle $Transaction.ManifestLease.Handle `
@@ -678,15 +785,75 @@ function Complete-AstroLauncherStateArchiveTransaction {
             throw "LAUNCHER_ARCHIVE[ASTRO_LAUNCHER_ARCHIVE_SOURCE_RECREATED]: state=$($state.State); error=$($state.Error); path=$source"
         }
     }
+    $authorizationToRename = Compare-AstroLauncherTempArchiveSnapshots `
+        -Before $Transaction.TempBefore `
+        -After $Transaction.TempMoveBefore
+    $renameOperation = Compare-AstroLauncherTempArchiveSnapshots `
+        -Before $Transaction.TempMoveBefore `
+        -After $Transaction.TempAfter `
+        -ComparisonMode exact-rename
+    $renameToCompletion = Compare-AstroLauncherTempArchiveSnapshots `
+        -Before $Transaction.TempAfter `
+        -After $tempAfter
+    $authorizationToCompletion = Compare-AstroLauncherTempArchiveSnapshots `
+        -Before $Transaction.TempBefore `
+        -After $tempAfter `
+        -ComparisonMode exact-rename
+    $tempIntegrityState = if (@(
+            $authorizationToRename,
+            $renameOperation,
+            $renameToCompletion,
+            $authorizationToCompletion
+        ) | Where-Object { $_.state -ceq 'changed-preserved' }) {
+        'changed-preserved'
+    }
+    elseif (@(
+            $authorizationToRename,
+            $renameOperation,
+            $renameToCompletion,
+            $authorizationToCompletion
+        ) | Where-Object { $_.state -ceq 'opaque-preserved' }) {
+        'opaque-preserved'
+    }
+    else {
+        'stable-exact'
+    }
     $completion = [ordered]@{
-        schema = 'astrolabe.launcher-state-archive.completion.v1'
+        schema = 'astrolabe.launcher-state-archive.completion.v2'
         transaction_id = $Transaction.TransactionId
         completed_utc = [DateTime]::UtcNow.ToString('O')
+        policy = [ordered]@{
+            destructive_authority = 'none'
+            snapshot_role = 'diagnostic-observation-only'
+            namespace_operation =
+                'same-volume-retained-handle-no-replace-rename'
+            concurrent_change_policy = 'preserve-and-classify'
+            ambiguous_state_policy = 'preserve-and-report'
+        }
         authorization = [ordered]@{
             path = $Transaction.AuthorizationLease.Path
             file_id = $Transaction.AuthorizationLease.FileId
             bytes = $Transaction.AuthorizationLease.Length
             sha256 = $Transaction.AuthorizationLease.Sha256
+        }
+        temp_integrity = [ordered]@{
+            state = $tempIntegrityState
+            observations = [ordered]@{
+                authorization = ConvertTo-AstroLauncherTempArchiveSnapshotRecord `
+                    $Transaction.TempBefore
+                rename_before = ConvertTo-AstroLauncherTempArchiveSnapshotRecord `
+                    $Transaction.TempMoveBefore
+                rename_after = ConvertTo-AstroLauncherTempArchiveSnapshotRecord `
+                    $Transaction.TempAfter
+                completion = ConvertTo-AstroLauncherTempArchiveSnapshotRecord `
+                    $tempAfter
+            }
+            comparisons = [ordered]@{
+                authorization_to_rename = $authorizationToRename
+                rename_operation = $renameOperation
+                rename_to_completion = $renameToCompletion
+                authorization_to_completion = $authorizationToCompletion
+            }
         }
         terminal = [ordered]@{
             temp_source_state = 'absent'
@@ -731,6 +898,12 @@ function Complete-AstroLauncherStateArchiveTransaction {
         TempInventoryError = $tempAfter.InventoryError
         TempEntryCount = $tempAfter.EntryCount
         TempInventorySha256 = $tempAfter.InventorySha256
+        TempIntegrityState = $tempIntegrityState
+        TempAuthorizationToRenameState = $authorizationToRename.state
+        TempRenameOperationState = $renameOperation.state
+        TempRenameToCompletionState = $renameToCompletion.state
+        TempAuthorizationToCompletionState =
+            $authorizationToCompletion.state
         ManifestArchivePath = $Transaction.ManifestDestination
         ManifestFileId = $manifestAfter.FileId
         ManifestLength = $manifestAfter.Length

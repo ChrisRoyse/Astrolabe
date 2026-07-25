@@ -3186,6 +3186,8 @@ function Move-AstroAttributionEvidenceLeaseToCleanupTombstone {
         [Parameter(Mandatory)]$DestinationDirectoryLease
     )
 
+    throw 'ATTRIBUTION[ASTRO_ATTRIBUTION_DESTRUCTIVE_TRANSITION_RETIRED]: destructive attribution tombstone transitions are forbidden; use the append-only launcher-state archive transaction'
+
     if ($null -eq $Lease -or $null -eq $Lease.Handle -or
         $Lease.Handle.IsInvalid -or $Lease.Handle.IsClosed) {
         throw 'attribution cleanup rename requires one live retained evidence mutation lease'
@@ -3317,6 +3319,8 @@ function Close-AstroAttributionEvidenceMutationLease {
 
 function Complete-AstroDeadAttributionEvidenceDeletion {
     param([Parameter(Mandatory)]$Lease)
+
+    throw 'ATTRIBUTION[ASTRO_ATTRIBUTION_DESTRUCTION_RETIRED]: attribution evidence destruction is forbidden; preserve the retained generation through the append-only launcher-state archive transaction'
 
     if ($null -eq $Lease -or $null -eq $Lease.Handle -or
         $Lease.Handle.IsInvalid -or $Lease.Handle.IsClosed) {

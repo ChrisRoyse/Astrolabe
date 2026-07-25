@@ -9,11 +9,10 @@
     empty), malformed, legacy, missing, mismatched, changing, and unevaluable
     state is preserving.
 
-    Pair cleanup is one recoverable transaction. It retains the exact evidence
-    file and TEMP directory handles, renames TEMP first, then renames the same
-    evidence handle, validates the captured tree while deleting only captured
-    identities, and uses FILE_DISPOSITION_INFO for both final objects. Every
-    crash boundary leaves a reserved state that the next pass can classify.
+    Ordinary sweeps are read-only classifiers. Launcher TEMP/attribution
+    destruction is permanently retired by #620; the legacy mutation entrypoints
+    below fail closed. Live-owner cleanup and tracker-authorized recovery move
+    the complete retained objects into the append-only launcher-state archive.
 #>
 
 if (-not (Get-Command Get-AstroAttributionInventory -ErrorAction SilentlyContinue)) {
@@ -3879,6 +3878,8 @@ function Start-AstroLiveLauncherTempExactDisposition {
         [Parameter(Mandatory)][string]$JobObjectName
     )
 
+    throw 'LAUNCHER_TEMP[ASTRO_LAUNCHER_TEMP_DESTRUCTION_RETIRED]: launcher TEMP destruction is forbidden; preserve the retained generation through the append-only launcher-state archive transaction'
+
     if ($Lease.Kind -cne 'temp-cleanup-tombstone' -or
         $null -eq $Lease.Snapshot) {
         throw 'live TEMP exact disposition requires a captured cleanup-tombstone lease'
@@ -4072,6 +4073,8 @@ function Move-AstroLauncherTempLeaseToCleanupTombstone {
         [Parameter(Mandatory)]$DestinationDirectoryLease
     )
 
+    throw 'LAUNCHER_TEMP[ASTRO_LAUNCHER_TEMP_DESTRUCTIVE_TRANSITION_RETIRED]: destructive TEMP tombstone transitions are forbidden; use the append-only launcher-state archive transaction'
+
     if ($Lease.Kind -ceq 'temp-cleanup-tombstone') {
         return [pscustomobject]@{
             State = 'already-cleanup-tombstone'
@@ -4168,6 +4171,8 @@ function Start-AstroLauncherTempExactDisposition {
         [Parameter(Mandatory)]$Lease,
         [Parameter(Mandatory)]$EvidenceLease
     )
+
+    throw 'LAUNCHER_TEMP[ASTRO_LAUNCHER_TEMP_DESTRUCTION_RETIRED]: launcher TEMP destruction is forbidden; preserve the retained generation through the append-only launcher-state archive transaction'
 
     if ($Lease.Kind -cne 'temp-cleanup-tombstone') {
         throw 'TEMP recursive cleanup requires the exact directory to be in cleanup-tombstone state'
