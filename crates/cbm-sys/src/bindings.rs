@@ -11,6 +11,7 @@ pub const CBM_STORE_OK: u32 = 0;
 pub const CBM_STORE_ERR: i32 = -1;
 pub const CBM_STORE_NOT_FOUND: i32 = -2;
 pub const CBM_ADR_MAX_LENGTH: u32 = 8000;
+pub type uint_least64_t = ::std::os::raw::c_ulonglong;
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct CBMArena {
@@ -2060,6 +2061,9 @@ unsafe extern "C" {
         nodes: *mut ::std::os::raw::c_int,
         edges: *mut ::std::os::raw::c_int,
     );
+}
+unsafe extern "C" {
+    pub fn cbm_pipeline_get_ambiguous_reference_skips(p: *const cbm_pipeline_t) -> uint_least64_t;
 }
 unsafe extern "C" {
     pub fn cbm_pipeline_get_fatal_error(

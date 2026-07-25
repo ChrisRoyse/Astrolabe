@@ -1190,6 +1190,7 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
         cbm_log_info("incremental.noop", "reason", "complete_snapshot_sink");
         cbm_pipeline_set_committed_counts(p, cbm_gbuf_node_count(existing),
                                           cbm_gbuf_edge_count(existing));
+        cbm_pipeline_set_ambiguous_reference_skips(p, cbm_gbuf_ambiguous_reference_skips(existing));
         int persist_rc =
             dump_and_persist(p, existing, db_path, project, files, file_count, mode_skipped,
                              mode_skipped_count, cbm_pipeline_repo_path(p));
@@ -1421,6 +1422,7 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
      * covers incremental reindexes, not just full ones. */
     cbm_pipeline_set_committed_counts(p, cbm_gbuf_node_count(existing),
                                       cbm_gbuf_edge_count(existing));
+    cbm_pipeline_set_ambiguous_reference_skips(p, cbm_gbuf_ambiguous_reference_skips(existing));
     int persist_rc = dump_and_persist(p, existing, db_path, project, files, file_count,
                                       mode_skipped, mode_skipped_count, cbm_pipeline_repo_path(p));
     free_mode_skipped(mode_skipped, mode_skipped_count);

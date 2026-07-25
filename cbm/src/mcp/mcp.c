@@ -4153,6 +4153,22 @@ static char *build_index_success_response(cbm_mcp_server_t *srv, yyjson_mut_doc 
     yyjson_mut_obj_add_int(doc, root, "expected_nodes", exp_nodes);
     yyjson_mut_obj_add_int(doc, root, "expected_edges", exp_edges);
 
+    /* #727: a reference whose source syntax resolves to several stable atoms in
+     * one semantic domain (e.g. `#[cfg]`-gated methods sharing a qualified
+     * name) has its edge skipped rather than refusing the whole corpus. The
+     * count is always emitted — including 0 — so a consumer can rely on the
+     * field and a degraded index can never read as a clean one. */
+    uint_least64_t ambiguous_skips = cbm_pipeline_get_ambiguous_reference_skips(p);
+    yyjson_mut_obj_add_uint(doc, root, "ambiguous_reference_skips", (uint64_t)ambiguous_skips);
+    if (ambiguous_skips > 0) {
+        yyjson_mut_obj_add_str(
+            doc, root, "ambiguous_reference_hint",
+            "Some reference edges were skipped because one qualified name resolved to "
+            "multiple stable atoms in the same semantic domain. The graph is complete "
+            "except for those edges; see the CBM_NODE_DOMAIN_AMBIGUOUS log entries for "
+            "the exact qualified names, candidate atoms, and source locations.");
+    }
+
     bool adr_exists = project_has_adr(store, project_name, repo_path);
     yyjson_mut_obj_add_bool(doc, root, "adr_present", adr_exists);
     if (!adr_exists) {

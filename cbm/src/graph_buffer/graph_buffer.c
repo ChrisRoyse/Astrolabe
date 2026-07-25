@@ -230,6 +230,15 @@ struct cbm_gbuf {
     CBMHashTable *node_by_atom;
     CBMHashTable *node_by_qn;
     _Atomic bool resolution_failed;
+    /* Counted, labelled degradations — NOT failures (#727). A reference whose
+     * source syntax resolves to several stable atoms in one semantic domain
+     * (e.g. three `#[cfg]`-gated methods sharing a qualified name) cannot be
+     * narrowed without evaluating the gate, and refusing the whole corpus for
+     * it made Astrolabe unable to index its own server crate. The reference
+     * edge is skipped instead, every candidate is logged, and the skip is
+     * counted here so the index result can report it: degradation is disclosed,
+     * never silent (standing invariant 3). */
+    _Atomic uint_least64_t ambiguous_reference_skips;
     /* Primary index: "id" string → cbm_gbuf_node_t* */
     /* Dense id → node array (ids are sequential from alloc_next_id, shared
      * with edges → holes where edges took ids). Replaces a hash table keyed
@@ -1219,6 +1228,10 @@ const cbm_gbuf_node_t *cbm_gbuf_find_source_container(const cbm_gbuf_t *gb, cons
     return NULL;
 }
 
+uint_least64_t cbm_gbuf_ambiguous_reference_skips(const cbm_gbuf_t *gb) {
+    return gb ? atomic_load(&((cbm_gbuf_t *)gb)->ambiguous_reference_skips) : 0;
+}
+
 bool cbm_gbuf_resolution_failed(const cbm_gbuf_t *gb) {
     return gb && atomic_load(&gb->resolution_failed);
 }
@@ -1351,15 +1364,24 @@ const cbm_gbuf_node_t *cbm_gbuf_find_by_qn_domain(const cbm_gbuf_t *gb, const ch
     }
 
     char count_buf[CBM_SZ_32];
+    char skip_buf[CBM_SZ_32];
     snprintf(count_buf, sizeof(count_buf), "%d", match_count);
-    atomic_store(&((cbm_gbuf_t *)gb)->resolution_failed, true);
-    cbm_log_error("gbuf.domain_resolution_ambiguous", "code", "CBM_NODE_DOMAIN_AMBIGUOUS",
-                  "operation", operation, "qualified_name", qn, "target_domain",
-                  reference_domain_name(domain), "candidate_count", count_buf, "message",
-                  "source syntax resolves to multiple stable atoms in the same semantic domain",
-                  "remediation",
-                  "resolve by atom_id, exact signature, receiver type, or source location before "
-                  "persistence");
+    /* Skip this one reference edge and COUNT it; do not fail the corpus (#727).
+     * `#[cfg]`-gated items legitimately share a qualified name in one domain,
+     * so a whole-graph refusal here blocked every real Rust repository. The
+     * skip is disclosed through this counter and the candidate diagnostics
+     * below — it is a labelled degradation, not a silent fallback. */
+    uint_least64_t skips = atomic_fetch_add(&((cbm_gbuf_t *)gb)->ambiguous_reference_skips, 1) + 1;
+    snprintf(skip_buf, sizeof(skip_buf), "%llu", (unsigned long long)skips);
+    cbm_log_warn("gbuf.domain_resolution_ambiguous", "code", "CBM_NODE_DOMAIN_AMBIGUOUS",
+                 "operation", operation, "qualified_name", qn, "target_domain",
+                 reference_domain_name(domain), "candidate_count", count_buf, "disposition",
+                 "reference_edge_skipped", "ambiguous_reference_skips", skip_buf, "message",
+                 "source syntax resolves to multiple stable atoms in the same semantic domain; "
+                 "the reference edge is skipped and counted, the corpus still publishes",
+                 "remediation",
+                 "resolve by atom_id, exact signature, receiver type, or source location to "
+                 "recover the edge");
 
     int ordinal = 0;
     for (int i = 0; i < gb->nodes.count; i++) {
@@ -1375,14 +1397,14 @@ const cbm_gbuf_node_t *cbm_gbuf_find_by_qn_domain(const cbm_gbuf_t *gb, const ch
         snprintf(ordinal_buf, sizeof(ordinal_buf), "%d", ++ordinal);
         snprintf(start_line_buf, sizeof(start_line_buf), "%d", candidate->start_line);
         snprintf(end_line_buf, sizeof(end_line_buf), "%d", candidate->end_line);
-        cbm_log_error("gbuf.domain_resolution_candidate", "code", "CBM_NODE_DOMAIN_CANDIDATE",
-                      "operation", operation, "qualified_name", qn, "target_domain",
-                      reference_domain_name(domain), "candidate_ordinal", ordinal_buf, "atom_id",
-                      candidate->atom_id ? candidate->atom_id : "", "label",
-                      candidate->label ? candidate->label : "", "file_path",
-                      candidate->file_path ? candidate->file_path : "", "start_line",
-                      start_line_buf, "end_line", end_line_buf, "source_sha256",
-                      candidate->source_sha256 ? candidate->source_sha256 : "");
+        cbm_log_warn("gbuf.domain_resolution_candidate", "code", "CBM_NODE_DOMAIN_CANDIDATE",
+                     "operation", operation, "qualified_name", qn, "target_domain",
+                     reference_domain_name(domain), "candidate_ordinal", ordinal_buf, "atom_id",
+                     candidate->atom_id ? candidate->atom_id : "", "label",
+                     candidate->label ? candidate->label : "", "file_path",
+                     candidate->file_path ? candidate->file_path : "", "start_line", start_line_buf,
+                     "end_line", end_line_buf, "source_sha256",
+                     candidate->source_sha256 ? candidate->source_sha256 : "");
     }
     return NULL;
 }

@@ -153,6 +153,12 @@ const cbm_gbuf_node_t *cbm_gbuf_find_successor_node(const cbm_gbuf_t *gb,
 /* True after any canonical identity or reference-resolution failure. */
 bool cbm_gbuf_resolution_failed(const cbm_gbuf_t *gb);
 
+/* Number of reference edges skipped because their source syntax resolved to
+ * several stable atoms in one semantic domain (#727). These are counted,
+ * labelled degradations rather than failures: the corpus still publishes, so
+ * callers MUST surface this count or the loss becomes silent. */
+uint_least64_t cbm_gbuf_ambiguous_reference_skips(const cbm_gbuf_t *gb);
+
 /* Find a node by temp ID. Returns NULL if not found. */
 const cbm_gbuf_node_t *cbm_gbuf_find_by_id(const cbm_gbuf_t *gb, int64_t id);
 

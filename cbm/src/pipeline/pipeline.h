@@ -105,6 +105,12 @@ void cbm_pipeline_get_excluded(const cbm_pipeline_t *p, char ***out, int *count)
  * Nodes are the #334 plausibility-gate axis; edges are informational only. */
 void cbm_pipeline_get_committed_counts(const cbm_pipeline_t *p, int *nodes, int *edges);
 
+/* Reference edges skipped because their source syntax resolved to several
+ * stable atoms in one semantic domain (#727). The corpus still publishes, so
+ * every caller that reports a successful index MUST also report this count —
+ * an unreported skip is exactly the silent degradation invariant 3 forbids. */
+uint_least64_t cbm_pipeline_get_ambiguous_reference_skips(const cbm_pipeline_t *p);
+
 /* Read the exact first fatal pipeline diagnostic. Returns false and zeroes
  * `out` when no fatal diagnostic has been recorded. Every pointer is borrowed
  * from the pipeline and remains valid until cbm_pipeline_free(). */

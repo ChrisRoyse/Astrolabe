@@ -205,6 +205,11 @@ struct cbm_pipeline {
     int committed_nodes;
     int committed_edges;
 
+    /* Reference edges skipped because their source syntax resolved to several
+     * stable atoms in one semantic domain (#727). Captured from the graph
+     * buffer before it is freed so the tool result can disclose the loss. */
+    uint_least64_t ambiguous_reference_skips;
+
     /* ADR (project_summaries) captured before a full-reindex DB delete, so it
      * can be restored after the rebuild. NULL when no ADR existed. Issue #516. */
     char *saved_adr;
@@ -271,6 +276,7 @@ cbm_pipeline_t *cbm_pipeline_new(const char *repo_path, const char *db_path,
     p->persistence = false;
     p->committed_nodes = -1;
     p->committed_edges = -1;
+    p->ambiguous_reference_skips = 0;
     atomic_init(&p->cancelled, 0);
 
     return p;
@@ -569,24 +575,23 @@ int cbm_pipeline_reject_file_failures(cbm_pipeline_t *p, const cbm_file_info_t *
             const CBMExtractionError *error = &result->error;
             cbm_pipeline_record_fatal_error(
                 p,
-                error->code ? error->code
-                            : cbm_pipeline_code_from_legacy_reason(result->error_msg),
+                error->code ? error->code : cbm_pipeline_code_from_legacy_reason(result->error_msg),
                 error->operation ? error->operation : "cbm_extract_file",
                 error->phase ? error->phase : phase, rel_path, error->requested,
-                error->message ? error->message
-                               : (result->error_msg ? result->error_msg
-                                                    : "authoritative extraction failed"),
-                error->remediation
-                    ? error->remediation
-                    : "inspect the exact extraction failure, fix the cause, then retry the complete "
-                      "corpus");
+                error->message
+                    ? error->message
+                    : (result->error_msg ? result->error_msg : "authoritative extraction failed"),
+                error->remediation ? error->remediation
+                                   : "inspect the exact extraction failure, fix the cause, then "
+                                     "retry the complete "
+                                     "corpus");
             return CBM_NOT_FOUND;
         }
         if (result && cbm_arena_failed(&result->arena)) {
             cbm_pipeline_record_fatal_error(
                 p, cbm_arena_failure_code(&result->arena),
-                cbm_arena_failure_operation(&result->arena), phase ? phase : "extract",
-                rel_path, cbm_arena_failure_bytes(&result->arena),
+                cbm_arena_failure_operation(&result->arena), phase ? phase : "extract", rel_path,
+                cbm_arena_failure_bytes(&result->arena),
                 "an authoritative per-file arena entered a failed state; no partial extraction may "
                 "be persisted",
                 "inspect the exact arena code, operation, and requested quantity, fix the cause, "
@@ -607,10 +612,11 @@ int cbm_pipeline_reject_file_failures(cbm_pipeline_t *p, const cbm_file_info_t *
                            : "CBM_EXTRACTION_RESULT_MISSING";
             }
             cbm_pipeline_record_fatal_error(
-                p, code, error->phase ? error->phase : "extract",
-                phase ? phase : "extract", rel_path, (size_t)files[i].size,
+                p, code, error->phase ? error->phase : "extract", phase ? phase : "extract",
+                rel_path, (size_t)files[i].size,
                 error->reason ? error->reason : "a discovered source file was not extracted",
-                "repair the source/read/extraction failure, then retry the complete corpus; partial "
+                "repair the source/read/extraction failure, then retry the complete corpus; "
+                "partial "
                 "publication is forbidden");
             return CBM_NOT_FOUND;
         }
@@ -632,6 +638,16 @@ void cbm_pipeline_set_committed_counts(cbm_pipeline_t *p, int nodes, int edges) 
         p->committed_nodes = nodes;
         p->committed_edges = edges;
     }
+}
+
+void cbm_pipeline_set_ambiguous_reference_skips(cbm_pipeline_t *p, uint_least64_t skips) {
+    if (p) {
+        p->ambiguous_reference_skips = skips;
+    }
+}
+
+uint_least64_t cbm_pipeline_get_ambiguous_reference_skips(const cbm_pipeline_t *p) {
+    return p ? p->ambiguous_reference_skips : 0;
 }
 
 bool cbm_pipeline_row_sink_active(const cbm_pipeline_t *p) {
@@ -1360,8 +1376,7 @@ static int run_parallel_pipeline(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
     CBMFileResult **cache = (CBMFileResult **)calloc(file_count, sizeof(CBMFileResult *));
     if (!cache) {
         cbm_log_error("pipeline.err", "phase", "cache_alloc");
-        return cbm_pipeline_reject_file_failures(p, files, file_count, NULL,
-                                                 "parallel_cache");
+        return cbm_pipeline_reject_file_failures(p, files, file_count, NULL, "parallel_cache");
     }
     cbm_clock_gettime(CLOCK_MONOTONIC, t);
     int rc = cbm_parallel_extract(ctx, files, file_count, cache, &shared_ids, worker_count);
@@ -2217,6 +2232,9 @@ cleanup:
     cbm_pkgmap_free(cbm_pipeline_get_pkgmap());
     cbm_pipeline_set_pkgmap(NULL);
     free(source_files);
+    /* Capture the counted degradations before the graph buffer that owns them
+     * is destroyed — an unreported skip is a silent loss (#727). */
+    p->ambiguous_reference_skips = cbm_gbuf_ambiguous_reference_skips(p->gbuf);
     cbm_gbuf_free(p->gbuf);
     p->gbuf = NULL;
     cbm_registry_free(p->registry);

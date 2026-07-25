@@ -683,6 +683,10 @@ atomic_int *cbm_pipeline_cancelled_ptr(cbm_pipeline_t *p);
 /* Record committed graph size (#334 gate axis) from the incremental path,
  * which cannot see the opaque cbm_pipeline struct. Call before the dump. */
 void cbm_pipeline_set_committed_counts(cbm_pipeline_t *p, int nodes, int edges);
+
+/* Record counted domain-ambiguity skips from a graph buffer the caller owns
+ * (the incremental path builds its own) before that buffer is freed (#727). */
+void cbm_pipeline_set_ambiguous_reference_skips(cbm_pipeline_t *p, uint_least64_t skips);
 /* Complete-snapshot sink helpers shared with the incremental route. */
 bool cbm_pipeline_row_sink_active(const cbm_pipeline_t *p);
 void cbm_pipeline_attach_row_sink(cbm_pipeline_t *p, cbm_gbuf_t *gbuf);
