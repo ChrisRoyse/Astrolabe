@@ -198,6 +198,13 @@ struct cbm_pipeline {
     char fatal_error_remediation[PL_ERROR_REMEDIATION];
     size_t fatal_error_requested;
 
+    /* Exact live-store identity frozen during routing. A full rebuild may only
+     * publish over the same bytes; another process replacing or mutating the
+     * source while the stage is built is a terminal provenance conflict. */
+    bool routed_store_present;
+    uint64_t routed_store_bytes;
+    char routed_store_sha256[CBM_SHA256_HEX_LEN + 1];
+
     /* User-defined extension overrides (loaded once per run) */
     cbm_userconfig_t *userconfig;
 
@@ -1738,33 +1745,48 @@ static int validate_existing_store_project_identity(cbm_pipeline_t *p, cbm_store
     return 0;
 }
 
-static int prepare_live_store_for_atomic_replacement(const char *db_path) {
-    if (!cbm_path_exists(db_path)) {
+static int preserve_existing_adr(cbm_pipeline_t *p, cbm_store_t *store, const char *db_path) {
+    cbm_adr_t existing = {0};
+    int rc = cbm_store_adr_get(store, p->project_name, &existing);
+    if (rc == CBM_STORE_NOT_FOUND) {
         return 0;
     }
-    cbm_store_t *store = cbm_store_open_path(db_path);
-    if (!store || !cbm_store_check_integrity(store)) {
-        if (store) {
-            cbm_store_close(store);
-        }
-        cbm_log_error("pipeline.route_failed", "code", "CBM_PIPELINE_REPLACED_STORE_VERIFY_FAILED",
-                      "path", db_path, "message",
-                      "the live store could not be verified before atomic replacement",
-                      "remediation", "preserve and repair or restore the store, then retry");
-        return CBM_NOT_FOUND;
-    }
-    int rc = cbm_store_checkpoint(store);
-    if (rc == CBM_STORE_OK) {
-        rc = cbm_store_exec(store, "PRAGMA journal_mode=DELETE;");
-    }
-    cbm_store_close(store);
     if (rc != CBM_STORE_OK) {
-        cbm_log_error("pipeline.route_failed", "code",
-                      "CBM_PIPELINE_REPLACED_STORE_CHECKPOINT_FAILED", "path", db_path, "message",
-                      "the live store could not be checkpointed before atomic replacement",
-                      "remediation", "close active readers and retry indexing");
+        const char *detail = cbm_store_error(store);
+        cbm_log_error("pipeline.route_failed", "code", "CBM_PIPELINE_ADR_READ_FAILED", "operation",
+                      "preserve_existing_adr", "store_path", db_path, "project", p->project_name,
+                      "publication_started", "false", "message",
+                      detail && detail[0] ? detail : "the existing ADR could not be read",
+                      "remediation",
+                      "preserve the complete store family, inspect the SQLite diagnostic, and "
+                      "retry");
+        cbm_pipeline_record_fatal_error(
+            p, "CBM_PIPELINE_ADR_READ_FAILED", "preserve_existing_adr", "route", db_path, 0,
+            detail && detail[0] ? detail : "the existing ADR could not be read",
+            "preserve the complete store family, inspect the SQLite diagnostic, and retry");
         return CBM_NOT_FOUND;
     }
+
+    char *saved_adr = NULL;
+    if (existing.content) {
+        saved_adr = strdup(existing.content);
+        if (!saved_adr) {
+            cbm_store_adr_free(&existing);
+            cbm_log_error("pipeline.route_failed", "code", "CBM_PIPELINE_ADR_ALLOC_FAILED",
+                          "operation", "preserve_existing_adr", "store_path", db_path, "project",
+                          p->project_name, "publication_started", "false", "message",
+                          "the existing ADR could not be retained in memory", "remediation",
+                          "free memory and retry the complete corpus");
+            cbm_pipeline_record_fatal_error(p, "CBM_PIPELINE_ADR_ALLOC_FAILED",
+                                            "preserve_existing_adr", "route", db_path, 0,
+                                            "the existing ADR could not be retained in memory",
+                                            "free memory and retry the complete corpus");
+            return CBM_NOT_FOUND;
+        }
+    }
+    free(p->saved_adr);
+    p->saved_adr = saved_adr;
+    cbm_store_adr_free(&existing);
     return 0;
 }
 
@@ -1772,6 +1794,9 @@ static int prepare_live_store_for_atomic_replacement(const char *db_path) {
  * Returns 0 when incremental completed, PL_ROUTE_FULL when a full rebuild is
  * required, or CBM_NOT_FOUND on a terminal error. */
 static int try_incremental_or_delete_db(cbm_pipeline_t *p, cbm_file_info_t *files, int file_count) {
+    p->routed_store_present = false;
+    p->routed_store_bytes = 0;
+    p->routed_store_sha256[0] = '\0';
     char *db_path = resolve_db_path(p);
     if (!db_path) {
         return CBM_NOT_FOUND;
@@ -1793,9 +1818,9 @@ static int try_incremental_or_delete_db(cbm_pipeline_t *p, cbm_file_info_t *file
     /* Provenance admission must be read-only. The ordinary store opener enters
      * SQLite's write-capable lifecycle and can create/checkpoint WAL state even
      * when the identity check subsequently refuses. Freeze and verify the source
-     * family first, then compare the incoming root through the returned
-     * read-only query connection. Only an exact match may reach a read-write
-     * open below. */
+     * family first, then compare the incoming root and select the route through
+     * the returned read-only query connection. Only the incremental executor may
+     * enter a read-write lifecycle after that route is selected. */
     cbm_store_t *identity_store = NULL;
     cbm_store_verify_result_t verification = {0};
     cbm_store_verify_status_t verification_status = cbm_store_open_path_project_query_verified(
@@ -1840,81 +1865,100 @@ static int try_incremental_or_delete_db(cbm_pipeline_t *p, cbm_file_info_t *file
         free(db_path);
         return CBM_NOT_FOUND;
     }
-    cbm_store_close(identity_store);
-
-    cbm_store_t *check_store = cbm_store_open_path(db_path);
-    if (check_store && cbm_store_check_integrity(check_store)) {
-        if (p->mode == CBM_MODE_FULL) {
-            cbm_store_close(check_store);
-            cbm_log_info("pipeline.route", "path", "full", "reason", "explicit_full_mode");
-            goto full_reindex;
-        }
-        cbm_file_hash_t *hashes = NULL;
-        int hash_count = 0;
-        int hash_rc = cbm_store_get_file_hashes(check_store, p->project_name, &hashes, &hash_count);
-        if (hash_rc != CBM_STORE_OK) {
-            cbm_store_close(check_store);
-            cbm_log_error("pipeline.route_failed", "code", "CBM_PIPELINE_HASH_ROWS_READ_FAILED",
-                          "path", db_path, "message",
-                          "the complete incremental identity set could not be read", "remediation",
-                          "inspect the structured store error and retry");
+    if (verification.db_sha256[0] == '\0') {
+        cbm_log_error(
+            "pipeline.route_failed", "code", "CBM_PIPELINE_STORE_IDENTITY_DIGEST_MISSING",
+            "operation", "verify_existing_store_project", "store_path", db_path, "project",
+            p->project_name, "publication_started", "false", "message",
+            "verified routing did not retain the live database SHA-256", "remediation",
+            "preserve the complete store family and inspect the verifier before retrying");
+        cbm_pipeline_record_fatal_error(
+            p, "CBM_PIPELINE_STORE_IDENTITY_DIGEST_MISSING", "verify_existing_store_project",
+            "route", db_path, 0, "verified routing did not retain the live database SHA-256",
+            "preserve the complete store family and inspect the verifier before retrying");
+        cbm_store_close(identity_store);
+        free(db_path);
+        return CBM_NOT_FOUND;
+    }
+    p->routed_store_present = true;
+    p->routed_store_bytes = verification.db_bytes;
+    (void)snprintf(p->routed_store_sha256, sizeof(p->routed_store_sha256), "%s",
+                   verification.db_sha256);
+    if (p->mode == CBM_MODE_FULL) {
+        if (verification.wal_present || verification.shm_present) {
+            cbm_log_error(
+                "pipeline.route_failed", "code", "CBM_PIPELINE_EXPLICIT_FULL_LIVE_SIDECAR_PRESENT",
+                "operation", "route_explicit_full", "store_path", db_path, "project",
+                p->project_name, "wal_present", verification.wal_present ? "true" : "false",
+                "shm_present", verification.shm_present ? "true" : "false", "publication_started",
+                "false", "message",
+                "the verified live store has an active WAL or shared-memory sidecar", "remediation",
+                "finish the active writer, preserve the complete store family, and retry");
+            cbm_pipeline_record_fatal_error(
+                p, "CBM_PIPELINE_EXPLICIT_FULL_LIVE_SIDECAR_PRESENT", "route_explicit_full",
+                "route", db_path, 0,
+                "the verified live store has an active WAL or shared-memory sidecar",
+                "finish the active writer, preserve the complete store family, and retry");
+            cbm_store_close(identity_store);
             free(db_path);
             return CBM_NOT_FOUND;
         }
+    }
+    if (preserve_existing_adr(p, identity_store, db_path) != 0) {
+        cbm_store_close(identity_store);
+        free(db_path);
+        return CBM_NOT_FOUND;
+    }
+    if (p->mode == CBM_MODE_FULL) {
+        cbm_store_close(identity_store);
+        cbm_log_info("pipeline.route", "path", "full", "reason", "explicit_full_mode",
+                     "live_store_mutated", "false");
+        cbm_log_info("pipeline.route", "path", "reindex", "action", "build_atomic_replacement");
+        free(db_path);
+        return PL_ROUTE_FULL;
+    }
+    cbm_file_hash_t *hashes = NULL;
+    int hash_count = 0;
+    int hash_rc = cbm_store_get_file_hashes(identity_store, p->project_name, &hashes, &hash_count);
+    if (hash_rc != CBM_STORE_OK) {
+        const char *detail = cbm_store_error(identity_store);
+        cbm_log_error(
+            "pipeline.route_failed", "code", "CBM_PIPELINE_HASH_ROWS_READ_FAILED", "operation",
+            "read_verified_file_hashes", "path", db_path, "message",
+            detail && detail[0] ? detail
+                                : "the complete incremental identity set could not be read",
+            "remediation", "preserve the store, inspect the SQLite diagnostic, and retry");
+        cbm_pipeline_record_fatal_error(
+            p, "CBM_PIPELINE_HASH_ROWS_READ_FAILED", "read_verified_file_hashes", "route", db_path,
+            0,
+            detail && detail[0] ? detail
+                                : "the complete incremental identity set could not be read",
+            "preserve the store, inspect the SQLite diagnostic, and retry");
         cbm_store_free_file_hashes(hashes, hash_count);
-        cbm_store_close(check_store);
-        if (hash_count > 0 && file_count <= hash_count + (hash_count / PAIR_LEN)) {
-            cbm_log_info("pipeline.route", "path", "incremental", "stored_hashes",
-                         itoa_buf(hash_count));
-            int rc = cbm_pipeline_run_incremental(p, db_path, files, file_count);
-            if (rc == CBM_INCREMENTAL_REBUILD_REQUIRED) {
-                cbm_log_info("pipeline.route", "path", "full", "reason",
-                             "incremental_content_contract_requires_rebuild");
-            } else {
-                free(db_path);
-                return rc;
-            }
-        }
-        if (hash_count > 0) {
-            cbm_log_info("pipeline.route", "path", "mode_change_reindex", "stored_hashes",
-                         itoa_buf(hash_count), "discovered", itoa_buf(file_count));
-        }
-    } else if (check_store) {
-        cbm_store_close(check_store);
-        cbm_log_error("pipeline.route_failed", "code", "CBM_PIPELINE_STORE_INTEGRITY_FAILED",
-                      "path", db_path, "message",
-                      "the existing store failed integrity verification", "remediation",
-                      "preserve the store and repair or restore it before retrying");
-        free(db_path);
-        return CBM_NOT_FOUND;
-    } else {
-        cbm_log_error("pipeline.route_failed", "code", "CBM_PIPELINE_STORE_OPEN_FAILED", "path",
-                      db_path, "message", "the existing store could not be opened for routing",
-                      "remediation", "inspect the structured store error and retry");
+        cbm_store_close(identity_store);
         free(db_path);
         return CBM_NOT_FOUND;
     }
-full_reindex:
+    cbm_store_free_file_hashes(hashes, hash_count);
+    cbm_store_close(identity_store);
+
+    if (hash_count > 0 && file_count <= hash_count + (hash_count / PAIR_LEN)) {
+        cbm_log_info("pipeline.route", "path", "incremental", "stored_hashes",
+                     itoa_buf(hash_count));
+        int rc = cbm_pipeline_run_incremental(p, db_path, files, file_count);
+        if (rc == CBM_INCREMENTAL_REBUILD_REQUIRED) {
+            cbm_log_info("pipeline.route", "path", "full", "reason",
+                         "incremental_content_contract_requires_rebuild");
+        } else {
+            free(db_path);
+            return rc;
+        }
+    }
+    if (hash_count > 0) {
+        cbm_log_info("pipeline.route", "path", "mode_change_reindex", "stored_hashes",
+                     itoa_buf(hash_count), "discovered", itoa_buf(file_count));
+    }
     cbm_log_info("pipeline.route", "path", "reindex", "action", "build_atomic_replacement");
-    /* Capture any ADR before the atomic full-reindex replacement. */
-    {
-        cbm_store_t *adr_store = cbm_store_open_path(db_path);
-        if (adr_store) {
-            cbm_adr_t existing;
-            if (cbm_store_adr_get(adr_store, p->project_name, &existing) == CBM_STORE_OK) {
-                if (existing.content) {
-                    free(p->saved_adr);
-                    p->saved_adr = strdup(existing.content);
-                }
-                cbm_store_adr_free(&existing);
-            }
-            cbm_store_close(adr_store);
-        }
-    }
-    if (prepare_live_store_for_atomic_replacement(db_path) != 0) {
-        free(db_path);
-        return CBM_NOT_FOUND;
-    }
     free(db_path);
     return PL_ROUTE_FULL;
 }
@@ -1927,6 +1971,123 @@ static int remove_optional_pipeline_file(const char *path, const char *code) {
                   "a stale or sidecar file could not be removed", "remediation",
                   "close processes holding the store and retry indexing");
     return CBM_NOT_FOUND;
+}
+
+static int verify_live_store_before_publication(cbm_pipeline_t *p, const char *db_path,
+                                                const char *live_wal, const char *live_shm) {
+    if (cbm_path_exists(live_wal) || cbm_path_exists(live_shm)) {
+        cbm_log_error("pipeline.persist_failed", "code", "CBM_PIPELINE_LIVE_WAL_PRESENT",
+                      "operation", "verify_live_store_before_publication", "path", db_path,
+                      "wal_present", cbm_path_exists(live_wal) ? "true" : "false", "shm_present",
+                      cbm_path_exists(live_shm) ? "true" : "false", "publication_started", "false",
+                      "message",
+                      "the live store acquired a WAL or shared-memory sidecar before swap",
+                      "remediation", "finish the concurrent writer and retry indexing");
+        cbm_pipeline_record_fatal_error(
+            p, "CBM_PIPELINE_LIVE_WAL_PRESENT", "verify_live_store_before_publication", "persist",
+            db_path, 0, "the live store acquired a WAL or shared-memory sidecar before swap",
+            "finish the concurrent writer and retry indexing");
+        return CBM_NOT_FOUND;
+    }
+    if (!p->routed_store_present) {
+        if (!cbm_path_exists(db_path)) {
+            return 0;
+        }
+        cbm_log_error(
+            "pipeline.persist_failed", "code", "CBM_PIPELINE_LIVE_STORE_APPEARED", "operation",
+            "verify_live_store_before_publication", "path", db_path, "publication_started", "false",
+            "message", "a live database appeared after routing selected an absent destination",
+            "remediation", "preserve the unexpected store, use a distinct project name, and retry");
+        cbm_pipeline_record_fatal_error(
+            p, "CBM_PIPELINE_LIVE_STORE_APPEARED", "verify_live_store_before_publication",
+            "persist", db_path, 0,
+            "a live database appeared after routing selected an absent destination",
+            "preserve the unexpected store, use a distinct project name, and retry");
+        return CBM_NOT_FOUND;
+    }
+
+    cbm_store_t *live_store = NULL;
+    cbm_store_verify_result_t verification = {0};
+    cbm_store_verify_status_t status = cbm_store_open_path_project_query_verified(
+        db_path, p->project_name, &live_store, &verification);
+    if (status != CBM_STORE_VERIFY_OK || !live_store) {
+        char native_error[32];
+        char sqlite_error[32];
+        (void)snprintf(native_error, sizeof(native_error), "%lu",
+                       (unsigned long)verification.native_error);
+        (void)snprintf(sqlite_error, sizeof(sqlite_error), "%d", verification.sqlite_error);
+        cbm_log_error(
+            "pipeline.persist_failed", "code", "CBM_PIPELINE_LIVE_STORE_REVERIFY_FAILED",
+            "operation",
+            verification.operation[0] ? verification.operation
+                                      : "verify_live_store_before_publication",
+            "path", db_path, "project", p->project_name, "native_error_kind", "win32",
+            "native_error", native_error, "sqlite_error", sqlite_error, "wal_present",
+            verification.wal_present ? "true" : "false", "shm_present",
+            verification.shm_present ? "true" : "false", "publication_started", "false", "message",
+            verification.detail[0] ? verification.detail : "the live store could not be reverified",
+            "remediation",
+            "preserve the complete live family and staged store, resolve the reported conflict, "
+            "and retry");
+        cbm_pipeline_record_fatal_error(
+            p, "CBM_PIPELINE_LIVE_STORE_REVERIFY_FAILED",
+            verification.operation[0] ? verification.operation
+                                      : "verify_live_store_before_publication",
+            "persist", db_path, 0,
+            verification.detail[0] ? verification.detail : "the live store could not be reverified",
+            "preserve the complete live family, resolve the reported conflict, and retry");
+        if (live_store) {
+            cbm_store_close(live_store);
+        }
+        return CBM_NOT_FOUND;
+    }
+
+    int identity_rc = validate_existing_store_project_identity(p, live_store, db_path);
+    cbm_store_close(live_store);
+    if (identity_rc != 0) {
+        return CBM_NOT_FOUND;
+    }
+    if (verification.wal_present || verification.shm_present) {
+        cbm_log_error("pipeline.persist_failed", "code", "CBM_PIPELINE_LIVE_WAL_PRESENT",
+                      "operation", "verify_live_store_before_publication", "path", db_path,
+                      "wal_present", verification.wal_present ? "true" : "false", "shm_present",
+                      verification.shm_present ? "true" : "false", "publication_started", "false",
+                      "message",
+                      "the verified live store acquired a WAL or shared-memory sidecar before swap",
+                      "remediation", "finish the concurrent writer and retry indexing");
+        cbm_pipeline_record_fatal_error(
+            p, "CBM_PIPELINE_LIVE_WAL_PRESENT", "verify_live_store_before_publication", "persist",
+            db_path, 0,
+            "the verified live store acquired a WAL or shared-memory sidecar before swap",
+            "finish the concurrent writer and retry indexing");
+        return CBM_NOT_FOUND;
+    }
+    if (verification.db_bytes != p->routed_store_bytes ||
+        strcmp(verification.db_sha256, p->routed_store_sha256) != 0) {
+        char expected_bytes[32];
+        char observed_bytes[32];
+        (void)snprintf(expected_bytes, sizeof(expected_bytes), "%llu",
+                       (unsigned long long)p->routed_store_bytes);
+        (void)snprintf(observed_bytes, sizeof(observed_bytes), "%llu",
+                       (unsigned long long)verification.db_bytes);
+        cbm_log_error(
+            "pipeline.persist_failed", "code", "CBM_PIPELINE_LIVE_STORE_PROVENANCE_DRIFT",
+            "operation", "verify_live_store_before_publication", "path", db_path, "project",
+            p->project_name, "expected_bytes", expected_bytes, "observed_bytes", observed_bytes,
+            "expected_sha256", p->routed_store_sha256, "observed_sha256", verification.db_sha256,
+            "publication_started", "false", "message",
+            "the live database bytes changed after the full rebuild was routed", "remediation",
+            "preserve both generations, reconcile the concurrent publisher, and retry from the "
+            "current live store");
+        cbm_pipeline_record_fatal_error(
+            p, "CBM_PIPELINE_LIVE_STORE_PROVENANCE_DRIFT", "verify_live_store_before_publication",
+            "persist", db_path, (size_t)verification.db_bytes,
+            "the live database bytes changed after the full rebuild was routed",
+            "preserve both generations, reconcile the concurrent publisher, and retry from the "
+            "current live store");
+        return CBM_NOT_FOUND;
+    }
+    return 0;
 }
 
 /* Dump the complete graph to a sibling stage, finalize every mandatory row,
@@ -2160,11 +2321,7 @@ static int dump_and_persist_hashes(cbm_pipeline_t *p, const cbm_file_info_t *fil
     }
     snprintf(live_wal, sidecar_size, "%s-wal", db_path);
     snprintf(live_shm, sidecar_size, "%s-shm", db_path);
-    if (cbm_path_exists(live_wal) || cbm_path_exists(live_shm)) {
-        cbm_log_error("pipeline.persist_failed", "code", "CBM_PIPELINE_LIVE_WAL_PRESENT", "path",
-                      db_path, "message",
-                      "the verified live store acquired a WAL or shared-memory sidecar before swap",
-                      "remediation", "close concurrent readers/writers and retry indexing");
+    if (verify_live_store_before_publication(p, db_path, live_wal, live_shm) != 0) {
         (void)remove_optional_pipeline_file(stage, "CBM_PIPELINE_FAILED_STAGE_REMOVE_FAILED");
         free(live_wal);
         free(live_shm);

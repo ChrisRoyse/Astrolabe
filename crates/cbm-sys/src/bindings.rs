@@ -2350,6 +2350,8 @@ pub struct cbm_store_verify_result_t {
     pub scratch_created: bool,
     pub scratch_cleanup_complete: bool,
     pub cleanup_native_error: u32,
+    pub db_bytes: u64,
+    pub db_sha256: [::std::os::raw::c_char; 65usize],
     pub operation: [::std::os::raw::c_char; 64usize],
     pub cleanup_operation: [::std::os::raw::c_char; 64usize],
     pub detail: [::std::os::raw::c_char; 512usize],

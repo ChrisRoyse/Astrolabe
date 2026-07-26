@@ -922,9 +922,29 @@ static int store_authorizer(void *user_data, int action, const char *p3, const c
     }
 }
 
+static void store_log_open_failure(const char *path, const char *operation, sqlite3 *db, int rc,
+                                   const char *detail) {
+    int sqlite_error = db ? sqlite3_extended_errcode(db) : rc;
+    if (sqlite_error == SQLITE_OK && rc != SQLITE_OK) {
+        sqlite_error = rc;
+    }
+    char sqlite_error_buf[CBM_SZ_32];
+    snprintf(sqlite_error_buf, sizeof(sqlite_error_buf), "%d", sqlite_error);
+    const char *sqlite_detail = db && sqlite3_extended_errcode(db) != SQLITE_OK
+                                    ? sqlite3_errmsg(db)
+                                    : sqlite3_errstr(sqlite_error);
+    cbm_log_error("store.open_failed", "code", "CBM_STORE_OPEN_FAILED", "db_path", path ? path : "",
+                  "operation", operation ? operation : "unknown", "sqlite_error", sqlite_error_buf,
+                  "detail", detail && detail[0] ? detail : sqlite_detail, "remediation",
+                  "preserve the database, WAL, and SHM together; resolve the reported SQLite "
+                  "failure, then retry");
+}
+
 static cbm_store_t *store_open_internal(const char *path, bool in_memory) {
     cbm_store_t *s = calloc(CBM_ALLOC_ONE, sizeof(cbm_store_t));
     if (!s) {
+        store_log_open_failure(path, "store.allocate", NULL, SQLITE_NOMEM,
+                               "the store handle could not be allocated");
         return NULL;
     }
 
@@ -935,12 +955,23 @@ static cbm_store_t *store_open_internal(const char *path, bool in_memory) {
 
     int rc = sqlite3_open_v2(path, &s->db, flags, NULL);
     if (rc != SQLITE_OK) {
+        store_log_open_failure(path, "sqlite3_open_v2", s->db, rc, NULL);
+        sqlite3_close_v2(s->db);
+        s->db = NULL;
         free(s);
         return NULL;
     }
 
     if (path && !in_memory) {
         s->db_path = heap_strdup(path);
+        if (!s->db_path) {
+            store_log_open_failure(path, "store.copy_path", s->db, SQLITE_NOMEM,
+                                   "the canonical store path could not be retained in memory");
+            sqlite3_close_v2(s->db);
+            s->db = NULL;
+            free(s);
+            return NULL;
+        }
     }
 
     /* Security: block ATTACH/DETACH to prevent file creation via SQL injection.
@@ -960,9 +991,19 @@ static cbm_store_t *store_open_internal(const char *path, bool in_memory) {
     sqlite3_create_function(s->db, "cbm_camel_split", SKIP_ONE, SQLITE_UTF8 | SQLITE_DETERMINISTIC,
                             NULL, sqlite_camel_split, NULL, NULL);
 
-    if (configure_pragmas(s, in_memory, false) != CBM_STORE_OK || init_schema(s) != CBM_STORE_OK ||
-        create_user_indexes(s) != CBM_STORE_OK) {
-        sqlite3_close(s->db);
+    const char *failed_operation = NULL;
+    if (configure_pragmas(s, in_memory, false) != CBM_STORE_OK) {
+        failed_operation = "configure_pragmas";
+    } else if (init_schema(s) != CBM_STORE_OK) {
+        failed_operation = "init_schema";
+    } else if (create_user_indexes(s) != CBM_STORE_OK) {
+        failed_operation = "create_user_indexes";
+    }
+    if (failed_operation) {
+        store_log_open_failure(path, failed_operation, s->db, sqlite3_extended_errcode(s->db),
+                               s->errbuf);
+        sqlite3_close_v2(s->db);
+        s->db = NULL;
         safe_str_free(&s->db_path);
         free(s);
         return NULL;
@@ -1754,7 +1795,8 @@ static bool store_hash_handle(HANDLE handle, uint8_t digest[CBM_SHA256_DIGEST_LE
 }
 
 static bool store_copy_frozen_member(HANDLE source, const char *destination,
-                                     cbm_store_verify_result_t *result, const char *operation) {
+                                     cbm_store_verify_result_t *result, const char *operation,
+                                     uint64_t *out_source_bytes, char *out_source_sha256) {
     wchar_t *wide_destination = cbm_utf8_to_wide_path(destination);
     if (!wide_destination) {
         store_verify_set_error(result, CBM_STORE_VERIFY_IO_FAILED, operation,
@@ -1860,6 +1902,17 @@ static bool store_copy_frozen_member(HANDLE source, const char *destination,
         store_verify_set_error(result, CBM_STORE_VERIFY_IO_FAILED, operation, ERROR_CRC, SQLITE_OK,
                                "snapshot bytes or SHA-256 differ from the frozen source member");
         return false;
+    }
+    if (out_source_bytes) {
+        *out_source_bytes = source_bytes;
+    }
+    if (out_source_sha256) {
+        static const char hex[] = "0123456789abcdef";
+        for (size_t i = 0; i < CBM_SHA256_DIGEST_LEN; i++) {
+            out_source_sha256[i * 2] = hex[source_digest[i] >> 4];
+            out_source_sha256[i * 2 + 1] = hex[source_digest[i] & 0x0f];
+        }
+        out_source_sha256[CBM_SHA256_HEX_LEN] = '\0';
     }
     return true;
 }
@@ -2122,7 +2175,8 @@ static cbm_store_verify_status_t store_open_path_verified(const char *db_path,
                                "snapshot database path exceeds the verified path capacity");
         goto cleanup;
     }
-    if (!store_copy_frozen_member(family.db, snapshot_db, result, "snapshot.copy_db")) {
+    if (!store_copy_frozen_member(family.db, snapshot_db, result, "snapshot.copy_db",
+                                  &result->db_bytes, result->db_sha256)) {
         goto cleanup;
     }
     if (result->wal_present) {
@@ -2133,8 +2187,8 @@ static cbm_store_verify_status_t store_open_path_verified(const char *db_path,
                                    "snapshot WAL path could not be allocated");
             goto cleanup;
         }
-        bool copied =
-            store_copy_frozen_member(family.wal, snapshot_wal, result, "snapshot.copy_wal");
+        bool copied = store_copy_frozen_member(family.wal, snapshot_wal, result,
+                                               "snapshot.copy_wal", NULL, NULL);
         free(snapshot_wal);
         if (!copied) {
             goto cleanup;
