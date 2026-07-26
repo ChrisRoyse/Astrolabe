@@ -820,6 +820,42 @@ function Restore-ConfigIfChanged {
     }
 }
 
+function Assert-NoIncompleteActivationTransaction {
+    param([Parameter(Mandatory)][string]$Root)
+
+    foreach ($child in @(Get-ChildItem -LiteralPath $Root -Force -ErrorAction Stop)) {
+        if (-not $child.PSIsContainer -or
+            ($child.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+            Fail-AstroGlobalActivation `
+                'ASTRO_GLOBAL_ACTIVATION_TRANSACTION_ROOT_ENTRY_INVALID' `
+                "activation transaction root contains a non-ordinary child: $($child.FullName)" `
+                'preserve the entry and reconcile the dedicated transaction root explicitly'
+        }
+        $intentState = Get-AstroPathEntryState `
+            (Join-Path $child.FullName 'intent.json')
+        $completionState = Get-AstroPathEntryState `
+            (Join-Path $child.FullName 'completion.json')
+        $faultState = Get-AstroPathEntryState `
+            (Join-Path $child.FullName 'fault.json')
+        $intentPresent = $intentState.State -ceq 'present' -and
+            ($intentState.Attributes -band [IO.FileAttributes]::Directory) -eq 0 -and
+            ($intentState.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0
+        $completionPresent = $completionState.State -ceq 'present' -and
+            ($completionState.Attributes -band [IO.FileAttributes]::Directory) -eq 0 -and
+            ($completionState.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0
+        $faultPresent = $faultState.State -ceq 'present' -and
+            ($faultState.Attributes -band [IO.FileAttributes]::Directory) -eq 0 -and
+            ($faultState.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0
+        $terminalCount = [int]$completionPresent + [int]$faultPresent
+        if (-not $intentPresent -or $terminalCount -ne 1) {
+            Fail-AstroGlobalActivation `
+                'ASTRO_GLOBAL_ACTIVATION_INCOMPLETE_TRANSACTION' `
+                "prior activation transaction is nonterminal or ambiguous: $($child.FullName) (intent=$($intentState.State); completion=$($completionState.State); fault=$($faultState.State))" `
+                'preserve every transaction byte and reconcile the exact prior config state before another activation'
+        }
+    }
+}
+
 $transactionPath = $null
 $activationMutex = $null
 $mutexHeld = $false
@@ -831,6 +867,9 @@ $codexCommitAttempted = $false
 $claudeCommitAttempted = $false
 $codexReplacementBackupPath = $null
 $claudeReplacementBackupPath = $null
+$completionPath = $null
+$completionSha256 = $null
+$completionPublished = $false
 $rollback = [Collections.Generic.List[object]]::new()
 
 try {
@@ -998,6 +1037,7 @@ try {
             "another exact config activation owns $mutexName" `
             'wait for that transaction to publish completion or fault, then re-read both configs'
     }
+    Assert-NoIncompleteActivationTransaction $TransactionRoot
 
     $codexBefore = Read-ConfigSnapshot $CodexConfigPath 'Codex user configuration'
     $claudeBefore = Read-ConfigSnapshot $ClaudeConfigPath 'Claude user configuration'
@@ -1236,10 +1276,11 @@ try {
         source_of_truth = @($CodexConfigPath, $ClaudeConfigPath)
     }
     $completionPath = Join-Path $transactionPath 'completion.json'
-    Write-NewDurableJson $completionPath $completion
+    $completionStagePath = Join-Path $transactionPath 'completion.stage.json'
+    Write-NewDurableJson $completionStagePath $completion
     $completionReadback = Get-StrictJsonHashtable `
-        (Read-AstroUtf8FileLongPath $completionPath) `
-        'activation completion readback'
+        (Read-AstroUtf8FileLongPath $completionStagePath) `
+        'activation completion stage readback'
     if ([string]$completionReadback['verdict'] -cne 'activated' -or
         [string]$completionReadback['codex']['after_sha256'] -cne
             $codexAfter.sha256 -or
@@ -1249,12 +1290,31 @@ try {
             'durable activation completion record differs from physical config readback' `
             'preserve the transaction and both configs; do not claim global activation'
     }
+    $completionSha256 = Get-FileSha256 $completionStagePath
+    [AstroLauncherLockNative]::MoveFileWriteThroughNoReplace(
+        $completionStagePath,
+        $completionPath
+    )
+    $completionPublished = $true
+    $completionFinalReadback = Get-StrictJsonHashtable `
+        (Read-AstroUtf8FileLongPath $completionPath) `
+        'activation completion final readback'
+    if ((Get-FileSha256 $completionPath) -cne $completionSha256 -or
+        [string]$completionFinalReadback['verdict'] -cne 'activated' -or
+        [string]$completionFinalReadback['codex']['after_sha256'] -cne
+            $codexAfter.sha256 -or
+        [string]$completionFinalReadback['claude_code']['after_sha256'] -cne
+            $claudeAfter.sha256) {
+        Fail-AstroGlobalActivation 'ASTRO_GLOBAL_ACTIVATION_COMPLETION_MISMATCH' `
+            'published completion differs from its validated stage or physical config readback' `
+            'preserve the terminal transaction and both activated configs for exact readback'
+    }
 
     [ordered]@{
         code = 'ASTRO_GLOBAL_MCP_ACTIVATED'
         transaction_path = $transactionPath
         completion_path = $completionPath
-        completion_sha256 = Get-FileSha256 $completionPath
+        completion_sha256 = $completionSha256
         issue = $Issue
         tree_sha = $ExpectedTreeSha
         artifact_path = $artifactPath
