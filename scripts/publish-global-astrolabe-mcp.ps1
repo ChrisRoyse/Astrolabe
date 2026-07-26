@@ -6,9 +6,11 @@
     The native build target is disposable launcher-owned state. This command accepts only a
     content-addressed native-fsv-artifact.v2 receipt plus a verified native-fsv-run.v2 record
     created under the same live issue-owned launcher generation. It copies the exact staged
-    artifact into a fresh generation beneath the user's Astrolabe program directory, flushes
-    every new file, and publishes the complete directory with MoveFileExW write-through and
-    no replacement.
+    artifact plus its recursively measured non-system PE dependency closure into a fresh
+    generation beneath the user's Astrolabe program directory, flushes every new file, and
+    publishes the complete directory with MoveFileExW write-through and no replacement. PE
+    imports are measured with the launcher-pinned LLVM inspector; platform DLLs stay provided
+    by Windows, while every other import must resolve to the pinned launcher toolchain.
 
     Existing generations are never reused or replaced. Client configuration is deliberately a
     separate transaction: Codex and Claude Code must be switched to the exact published path
@@ -112,6 +114,13 @@ function File-Sha256 {
     }
 }
 
+function String-Sha256 {
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$Value)
+
+    $bytes = [Text.UTF8Encoding]::new($false, $true).GetBytes($Value)
+    return Get-AstroByteSha256 $bytes
+}
+
 function File-Identity {
     param([Parameter(Mandatory)][string]$Path)
 
@@ -173,6 +182,187 @@ function Copy-NewDurableFile {
         finally { $output.Dispose() }
     }
     finally { $input.Dispose() }
+}
+
+function Get-PeImportedDllNames {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][string]$InspectorPath
+    )
+
+    $output = @(& $InspectorPath --coff-imports $Path 2>&1)
+    $exitCode = $LASTEXITCODE
+    if ($exitCode -ne 0) {
+        Fail-AstroGlobalPublish 'ASTRO_GLOBAL_PUBLISH_PE_INSPECTION_FAILED' `
+            "llvm-readobj exited $exitCode while reading PE imports from '$Path': $(@($output | ForEach-Object { [string]$_ }) -join ' | ')" `
+            'preserve the artifact and repair the pinned LLVM inspector before publication'
+    }
+
+    $names = [Collections.Generic.List[string]]::new()
+    foreach ($line in $output) {
+        $text = [string]$line
+        if ($text -match '^\s*Name:\s*(?<name>[^\s]+\.dll)\s*$') {
+            $names.Add([string]$Matches['name'])
+        }
+    }
+    if ($names.Count -eq 0) {
+        Fail-AstroGlobalPublish 'ASTRO_GLOBAL_PUBLISH_PE_IMPORTS_EMPTY' `
+            "pinned inspector reported no PE imports for '$Path'" `
+            'preserve the artifact and investigate the inspector format or incomplete native binary'
+    }
+    return @(
+        $names |
+            Sort-Object { $_.ToLowerInvariant() } -Unique
+    )
+}
+
+function Resolve-AstroImportedDll {
+    param(
+        [Parameter(Mandatory)][string]$Name,
+        [Parameter(Mandatory)][string]$SystemDirectory,
+        [Parameter(Mandatory)][string[]]$PathEntries,
+        [Parameter(Mandatory)][string]$ToolchainsRoot
+    )
+
+    if ($Name.StartsWith('api-ms-win-', [StringComparison]::OrdinalIgnoreCase) -or
+        $Name.StartsWith('ext-ms-win-', [StringComparison]::OrdinalIgnoreCase)) {
+        return [pscustomobject]@{
+            kind = 'windows-api-set'
+            name = $Name.ToLowerInvariant()
+            path = $null
+            path_index = $null
+        }
+    }
+
+    $systemCandidate = Join-Path $SystemDirectory $Name
+    $systemState = Get-AstroPathEntryState $systemCandidate
+    if ($systemState.State -ceq 'present') {
+        Assert-OrdinaryEntry $systemCandidate "Windows system DLL $Name"
+        if (($systemState.Attributes -band [IO.FileAttributes]::Directory) -ne 0) {
+            Fail-AstroGlobalPublish 'ASTRO_GLOBAL_PUBLISH_SYSTEM_DLL_INVALID' `
+                "Windows system DLL resolution is a directory: $systemCandidate" `
+                'repair the Windows runtime before publishing the native application'
+        }
+        return [pscustomobject]@{
+            kind = 'windows-system'
+            name = $Name.ToLowerInvariant()
+            path = [IO.Path]::GetFullPath($systemCandidate)
+            path_index = $null
+        }
+    }
+    if ($systemState.State -cne 'absent') {
+        Fail-AstroGlobalPublish 'ASTRO_GLOBAL_PUBLISH_SYSTEM_DLL_UNEVALUABLE' `
+            "Windows system DLL '$Name' is unevaluable at '$systemCandidate' (state=$($systemState.State); error=$($systemState.Error))" `
+            'preserve the publication state and repair the exact Windows runtime path'
+    }
+
+    for ($index = 0; $index -lt $PathEntries.Count; $index++) {
+        $entry = $PathEntries[$index]
+        if ([string]::IsNullOrWhiteSpace($entry)) { continue }
+        $candidate = Join-Path $entry $Name
+        $candidateState = Get-AstroPathEntryState $candidate
+        if ($candidateState.State -ceq 'absent') { continue }
+        if ($candidateState.State -cne 'present') {
+            Fail-AstroGlobalPublish 'ASTRO_GLOBAL_PUBLISH_RUNTIME_DLL_UNEVALUABLE' `
+                "runtime DLL '$Name' is unevaluable at PATH entry $index '$candidate' (state=$($candidateState.State); error=$($candidateState.Error))" `
+                'repair the exact pinned toolchain runtime path before publication'
+        }
+        Assert-OrdinaryEntry $candidate "runtime DLL $Name"
+        if (($candidateState.Attributes -band [IO.FileAttributes]::Directory) -ne 0) {
+            Fail-AstroGlobalPublish 'ASTRO_GLOBAL_PUBLISH_RUNTIME_DLL_INVALID' `
+                "runtime DLL resolution is a directory: $candidate" `
+                'repair the pinned toolchain runtime before publication'
+        }
+        $resolved = [IO.Path]::GetFullPath($candidate)
+        [void](Assert-PathWithin `
+                $resolved $ToolchainsRoot `
+                'ASTRO_GLOBAL_PUBLISH_RUNTIME_DLL_UNPINNED' `
+                "runtime DLL $Name")
+        return [pscustomobject]@{
+            kind = 'pinned-toolchain-runtime'
+            name = $Name.ToLowerInvariant()
+            path = $resolved
+            path_index = $index
+        }
+    }
+
+    Fail-AstroGlobalPublish 'ASTRO_GLOBAL_PUBLISH_RUNTIME_DLL_MISSING' `
+        "PE import '$Name' resolves neither to the Windows system directory nor the pinned launcher PATH" `
+        'publish only from the native launcher with the complete pinned runtime available'
+}
+
+function Get-AstroRuntimeDependencyClosure {
+    param(
+        [Parameter(Mandatory)][string]$ArtifactPath,
+        [Parameter(Mandatory)][string]$InspectorPath,
+        [Parameter(Mandatory)][string]$SystemDirectory,
+        [Parameter(Mandatory)][string[]]$PathEntries,
+        [Parameter(Mandatory)][string]$ToolchainsRoot
+    )
+
+    $queue = [Collections.Generic.Queue[string]]::new()
+    $queue.Enqueue([IO.Path]::GetFullPath($ArtifactPath))
+    $scanned = [Collections.Generic.HashSet[string]]::new(
+        [StringComparer]::OrdinalIgnoreCase
+    )
+    $runtimeByName = [Collections.Generic.Dictionary[string, object]]::new(
+        [StringComparer]::OrdinalIgnoreCase
+    )
+    $systemNames = [Collections.Generic.HashSet[string]]::new(
+        [StringComparer]::OrdinalIgnoreCase
+    )
+
+    while ($queue.Count -gt 0) {
+        $current = $queue.Dequeue()
+        if (-not $scanned.Add($current)) { continue }
+        foreach ($name in Get-PeImportedDllNames `
+                -Path $current `
+                -InspectorPath $InspectorPath) {
+            $resolution = Resolve-AstroImportedDll `
+                -Name $name `
+                -SystemDirectory $SystemDirectory `
+                -PathEntries $PathEntries `
+                -ToolchainsRoot $ToolchainsRoot
+            if ($resolution.kind -cne 'pinned-toolchain-runtime') {
+                [void]$systemNames.Add([string]$resolution.name)
+                continue
+            }
+
+            if ($runtimeByName.ContainsKey([string]$resolution.name)) {
+                $existing = $runtimeByName[[string]$resolution.name]
+                if (-not [string]::Equals(
+                        [string]$existing.source_path,
+                        [string]$resolution.path,
+                        [StringComparison]::OrdinalIgnoreCase
+                    )) {
+                    Fail-AstroGlobalPublish 'ASTRO_GLOBAL_PUBLISH_RUNTIME_DLL_COLLISION' `
+                        "runtime DLL '$($resolution.name)' resolved to both '$($existing.source_path)' and '$($resolution.path)'" `
+                        'repair the launcher PATH so every imported module has one exact pinned source'
+                }
+                continue
+            }
+
+            $source = [string]$resolution.path
+            $record = [ordered]@{
+                name = [string]$resolution.name
+                source_path = $source
+                bytes = [uint64](Get-AstroFileLengthLongPath $source)
+                sha256 = File-Sha256 $source
+                path_index = [int]$resolution.path_index
+            }
+            $runtimeByName.Add([string]$resolution.name, $record)
+            $queue.Enqueue($source)
+        }
+    }
+
+    return [pscustomobject]@{
+        runtime = @(
+            $runtimeByName.Values |
+                Sort-Object { [string]$_.name }
+        )
+        system_modules = @($systemNames | Sort-Object)
+        scanned_paths = @($scanned | Sort-Object)
+    }
 }
 
 function Test-DescendantOf {
@@ -389,6 +579,54 @@ if ([IO.Path]::GetFileName($artifactPath) -cne 'codebase-memory-mcp.exe') {
         'build and stage astrolabe-server --bin codebase-memory-mcp'
 }
 
+$toolchainsRoot = Join-Path $workspace '.toolchains'
+Assert-OrdinaryEntry $toolchainsRoot 'pinned toolchains root'
+try {
+    $inspectorCommand = Get-Command 'llvm-readobj.exe' `
+        -CommandType Application `
+        -ErrorAction Stop |
+        Select-Object -First 1
+}
+catch {
+    Fail-AstroGlobalPublish 'ASTRO_GLOBAL_PUBLISH_PE_INSPECTOR_MISSING' `
+        "pinned llvm-readobj.exe is not resolvable in the launcher environment: $($_.Exception.Message)" `
+        'run publication only through the canonical launcher with its pinned LLVM analysis bundle'
+}
+$inspectorPath = [IO.Path]::GetFullPath([string]$inspectorCommand.Path)
+[void](Assert-PathWithin `
+        $inspectorPath $toolchainsRoot `
+        'ASTRO_GLOBAL_PUBLISH_PE_INSPECTOR_UNPINNED' `
+        'PE import inspector')
+Assert-OrdinaryEntry $inspectorPath 'PE import inspector'
+$inspectorHash = File-Sha256 $inspectorPath
+$systemDirectory = [IO.Path]::GetFullPath(
+    [Environment]::SystemDirectory
+)
+if ([string]::IsNullOrWhiteSpace($env:PATH)) {
+    Fail-AstroGlobalPublish 'ASTRO_GLOBAL_PUBLISH_PATH_MISSING' `
+        'PATH is absent; the pinned native runtime closure cannot be resolved' `
+        'run publication only through the canonical launcher environment'
+}
+$pathEntries = @(
+    $env:PATH.Split([IO.Path]::PathSeparator) |
+        Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
+        ForEach-Object {
+            [IO.Path]::GetFullPath(([string]$_).Trim().Trim('"'))
+        }
+)
+$runtimeClosure = Get-AstroRuntimeDependencyClosure `
+    -ArtifactPath $artifactPath `
+    -InspectorPath $inspectorPath `
+    -SystemDirectory $systemDirectory `
+    -PathEntries $pathEntries `
+    -ToolchainsRoot $toolchainsRoot
+$runtimeClosureMaterial = @(
+    $runtimeClosure.runtime | ForEach-Object {
+        "$([string]$_.name)`t$([uint64]$_.bytes)`t$([string]$_.sha256)"
+    }
+) -join "`n"
+$runtimeClosureSha = String-Sha256 $runtimeClosureMaterial
+
 Assert-OrdinaryEntry $InstallRoot 'global Astrolabe install root' -AllowAbsent
 New-AstroDirectoryLongPath $InstallRoot | Out-Null
 Assert-OrdinaryEntry $InstallRoot 'global Astrolabe install root'
@@ -397,7 +635,7 @@ Assert-OrdinaryEntry $generationsRoot 'global generations root' -AllowAbsent
 New-AstroDirectoryLongPath $generationsRoot | Out-Null
 Assert-OrdinaryEntry $generationsRoot 'global generations root'
 
-$generationName = "$ExpectedTreeSha-$artifactHashBefore"
+$generationName = "$ExpectedTreeSha-$artifactHashBefore-$runtimeClosureSha"
 $generationPath = Join-Path $generationsRoot $generationName
 if (Test-AstroPathLongPath -LiteralPath $generationPath) {
     Fail-AstroGlobalPublish 'ASTRO_GLOBAL_PUBLISH_GENERATION_EXISTS' `
@@ -427,6 +665,34 @@ Set-AstroFileReadOnlyLongPath -LiteralPath $publishedArtifact -ReadOnly $true
 
 $finalArtifact = Join-Path $generationPath 'codebase-memory-mcp.exe'
 $finalReceipt = Join-Path $generationPath 'publication.json'
+$publishedRuntime = @(
+    foreach ($dependency in $runtimeClosure.runtime) {
+        $source = [string]$dependency.source_path
+        $stagePath = Join-Path $publishingPath ([string]$dependency.name)
+        $finalPath = Join-Path $generationPath ([string]$dependency.name)
+        Copy-NewDurableFile $source $stagePath
+        $sourceHashAfter = File-Sha256 $source
+        $stageHash = File-Sha256 $stagePath
+        $stageLength = [uint64](Get-AstroFileLengthLongPath $stagePath)
+        if ($sourceHashAfter -cne [string]$dependency.sha256 -or
+            $stageHash -cne [string]$dependency.sha256 -or
+            $stageLength -ne [uint64]$dependency.bytes) {
+            Fail-AstroGlobalPublish 'ASTRO_GLOBAL_PUBLISH_RUNTIME_COPY_MISMATCH' `
+                "runtime DLL '$($dependency.name)' changed during copy (source_after=$sourceHashAfter; stage=$stageHash; stage_bytes=$stageLength; expected_sha256=$($dependency.sha256); expected_bytes=$($dependency.bytes))" `
+                'preserve the publication stage and investigate pinned runtime drift'
+        }
+        Set-AstroFileReadOnlyLongPath -LiteralPath $stagePath -ReadOnly $true
+        [ordered]@{
+            name = [string]$dependency.name
+            source_path = $source
+            installed_path = $finalPath
+            bytes = [uint64]$dependency.bytes
+            sha256 = [string]$dependency.sha256
+            path_index = [int]$dependency.path_index
+            read_only = $true
+        }
+    }
+)
 $codexConfigPath = if ([string]::IsNullOrWhiteSpace($env:CODEX_HOME)) {
     Join-Path $env:USERPROFILE '.codex\config.toml'
 } else {
@@ -434,7 +700,7 @@ $codexConfigPath = if ([string]::IsNullOrWhiteSpace($env:CODEX_HOME)) {
 }
 $claudeUserConfigPath = Join-Path $env:USERPROFILE '.claude.json'
 $publication = [ordered]@{
-    schema = 'astrolabe.global-mcp-publication.v1'
+    schema = 'astrolabe.global-mcp-publication.v2'
     issue = $Issue
     published_at_utc = [DateTime]::UtcNow.ToString('o')
     tree_sha = $ExpectedTreeSha
@@ -459,6 +725,22 @@ $publication = [ordered]@{
         bytes = $artifactLength
         sha256 = $artifactHashBefore
         read_only = $true
+    }
+    runtime_closure = [ordered]@{
+        dependency_count = $publishedRuntime.Count
+        sha256 = $runtimeClosureSha
+        inspector = [ordered]@{
+            path = $inspectorPath
+            bytes = [uint64](Get-AstroFileLengthLongPath $inspectorPath)
+            sha256 = $inspectorHash
+            operation = 'llvm-readobj --coff-imports'
+        }
+        system_directory = $systemDirectory
+        system_modules = @($runtimeClosure.system_modules)
+        scanned_paths = @($runtimeClosure.scanned_paths)
+        dependencies = @($publishedRuntime)
+        resolution =
+            'recursive PE imports; Windows system/API-set modules retained in platform; every other module copied from first pinned launcher PATH match'
     }
     generation = [ordered]@{
         root = $generationPath
@@ -508,7 +790,15 @@ $finalIdentity = File-Identity $finalArtifact
 $finalReceiptHash = File-Sha256 $finalReceipt
 $finalArtifactInfo = Get-AstroFileInfoLongPath $finalArtifact
 $finalReceiptInfo = Get-AstroFileInfoLongPath $finalReceipt
-if ([string]$persistedReceipt.schema -cne 'astrolabe.global-mcp-publication.v1' -or
+$persistedDependencies = @(
+    $persistedReceipt.runtime_closure.dependencies
+)
+$persistedClosureMaterial = @(
+    $persistedDependencies | ForEach-Object {
+        "$([string]$_.name)`t$([uint64]$_.bytes)`t$([string]$_.sha256)"
+    }
+) -join "`n"
+if ([string]$persistedReceipt.schema -cne 'astrolabe.global-mcp-publication.v2' -or
     [string]$persistedReceipt.tree_sha -cne $ExpectedTreeSha -or
     [string]$persistedReceipt.artifact.installed_path -cne $finalArtifact -or
     [string]$persistedReceipt.client_configuration.command -cne
@@ -516,6 +806,12 @@ if ([string]$persistedReceipt.schema -cne 'astrolabe.global-mcp-publication.v1' 
     [string]$persistedReceipt.client_configuration.server_name -cne
         'astrolabe' -or
     [bool]$persistedReceipt.client_configuration.codex.required -ne $true -or
+    [string]$persistedReceipt.runtime_closure.sha256 -cne
+        $runtimeClosureSha -or
+    [int]$persistedReceipt.runtime_closure.dependency_count -ne
+        $publishedRuntime.Count -or
+    $persistedDependencies.Count -ne $publishedRuntime.Count -or
+    (String-Sha256 $persistedClosureMaterial) -cne $runtimeClosureSha -or
     [string]$persistedReceipt.artifact.sha256 -cne $finalHash -or
     [uint64]$persistedReceipt.artifact.bytes -ne $finalLength -or
     -not $finalArtifactInfo.IsReadOnly -or
@@ -526,6 +822,47 @@ if ([string]$persistedReceipt.schema -cne 'astrolabe.global-mcp-publication.v1' 
         "published generation readback differs from authority: $generationPath" `
         'preserve the immutable generation and investigate the exact receipt/artifact mismatch'
 }
+for ($index = 0; $index -lt $publishedRuntime.Count; $index++) {
+    $expected = $publishedRuntime[$index]
+    $actual = $persistedDependencies[$index]
+    if ([string]$actual.name -cne [string]$expected.name -or
+        [string]$actual.source_path -cne [string]$expected.source_path -or
+        [string]$actual.installed_path -cne
+            [string]$expected.installed_path -or
+        [uint64]$actual.bytes -ne [uint64]$expected.bytes -or
+        [string]$actual.sha256 -cne [string]$expected.sha256 -or
+        [int]$actual.path_index -ne [int]$expected.path_index -or
+        [bool]$actual.read_only -ne $true) {
+        Fail-AstroGlobalPublish 'ASTRO_GLOBAL_PUBLISH_RUNTIME_RECEIPT_MISMATCH' `
+            "persisted runtime dependency index $index differs from the measured closure" `
+            'preserve the immutable generation and inspect its exact publication receipt'
+    }
+}
+
+$runtimeReadback = @(
+    foreach ($dependency in $publishedRuntime) {
+        $path = [string]$dependency.installed_path
+        Assert-OrdinaryEntry $path "published runtime DLL $($dependency.name)"
+        $hash = File-Sha256 $path
+        $length = [uint64](Get-AstroFileLengthLongPath $path)
+        $info = Get-AstroFileInfoLongPath $path
+        if ($hash -cne [string]$dependency.sha256 -or
+            $length -ne [uint64]$dependency.bytes -or
+            -not $info.IsReadOnly) {
+            Fail-AstroGlobalPublish 'ASTRO_GLOBAL_PUBLISH_RUNTIME_READBACK_MISMATCH' `
+                "published runtime DLL '$($dependency.name)' differs from its exact closure record (path=$path; sha256=$hash; bytes=$length; read_only=$($info.IsReadOnly))" `
+                'preserve the immutable generation and inspect the exact runtime dependency bytes'
+        }
+        [ordered]@{
+            name = [string]$dependency.name
+            path = $path
+            bytes = $length
+            sha256 = $hash
+            file_id = File-Identity $path
+            read_only = $info.IsReadOnly
+        }
+    }
+)
 
 [ordered]@{
     code = 'ASTRO_GLOBAL_MCP_PUBLISHED'
@@ -544,6 +881,11 @@ if ([string]$persistedReceipt.schema -cne 'astrolabe.global-mcp-publication.v1' 
         bytes = [uint64](Get-AstroFileLengthLongPath $finalReceipt)
         sha256 = $finalReceiptHash
         read_only = $finalReceiptInfo.IsReadOnly
+    }
+    runtime_closure = [ordered]@{
+        sha256 = $runtimeClosureSha
+        dependency_count = $runtimeReadback.Count
+        dependencies = @($runtimeReadback)
     }
     source_stage_absent = -not (Test-AstroPathLongPath -LiteralPath $publishingPath)
 } | ConvertTo-Json -Depth 10 -Compress | Write-Output
