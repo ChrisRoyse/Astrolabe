@@ -11,6 +11,7 @@ pub const CBM_STORE_OK: u32 = 0;
 pub const CBM_STORE_ERR: i32 = -1;
 pub const CBM_STORE_NOT_FOUND: i32 = -2;
 pub const CBM_ADR_MAX_LENGTH: u32 = 8000;
+pub const CBM_VECTOR_SEARCH_MAX_KEYWORDS: u32 = 32;
 pub type uint_least64_t = ::std::os::raw::c_ulonglong;
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
