@@ -36,6 +36,8 @@ enum {
 };
 #define MCP_MS_TO_US 1000LL
 #define MCP_S_TO_US 1000000LL
+#define MCP_STRINGIFY_INNER(value) #value
+#define MCP_STRINGIFY(value) MCP_STRINGIFY_INNER(value)
 
 #define SLEN(s) (sizeof(s) - 1)
 #include "mcp/mcp.h"
@@ -372,7 +374,8 @@ static const tool_def_t TOOLS[] = {
      "\"relationship\":{\"type\":\"string\"},\"min_degree\":{\"type\":\"integer\"},"
      "\"max_degree\":{\"type\":\"integer\"},\"exclude_entry_points\":{\"type\":\"boolean\"},"
      "\"include_connected\":{\"type\":\"boolean\"},\"semantic_query\":{"
-     "\"type\":\"array\",\"items\":{\"type\":\"string\"},\"description\":\"MUST be an ARRAY of "
+     "\"type\":\"array\",\"maxItems\":" MCP_STRINGIFY(CBM_VECTOR_SEARCH_MAX_KEYWORDS) ","
+     "\"items\":{\"type\":\"string\"},\"description\":\"MUST be an ARRAY of "
      "keyword strings (e.g. [\\\"send\\\",\\\"pubsub\\\",\\\"publish\\\"]) — NOT a single string. "
      "Each keyword is scored independently via per-keyword min-cosine; results reflect functions "
      "that score well on ALL keywords. Requires moderate/full index mode. Results appear in the "
@@ -2843,23 +2846,25 @@ static void emit_search_results(yyjson_mut_doc *doc, yyjson_mut_val *root,
     *out_pdoc_count = pdoc_count;
 }
 
-/* Extract keyword strings from a yyjson array into `keywords`.  Returns the
- * number of strings copied (capped at `max_out`). */
-static int extract_semantic_keywords(yyjson_val *sq_val, const char **keywords, int max_out) {
-    int kw_count = (int)yyjson_arr_size(sq_val);
-    if (kw_count > max_out) {
-        kw_count = max_out;
+/* Extract every keyword string or refuse the complete array.  The public
+ * request boundary is fixed, so extraction never accepts truncation authority. */
+static bool extract_semantic_keywords(yyjson_val *sq_val, const char **keywords, int *out_count) {
+    size_t kw_count = yyjson_arr_size(sq_val);
+    if (kw_count > CBM_VECTOR_SEARCH_MAX_KEYWORDS) {
+        return false;
     }
     size_t kw_idx = 0;
     size_t kw_max = 0;
     yyjson_val *kw_val;
     int ki = 0;
     yyjson_arr_foreach(sq_val, kw_idx, kw_max, kw_val) {
-        if (ki < kw_count && yyjson_is_str(kw_val)) {
-            keywords[ki++] = yyjson_get_str(kw_val);
+        if (!yyjson_is_str(kw_val)) {
+            return false;
         }
+        keywords[ki++] = yyjson_get_str(kw_val);
     }
-    return ki;
+    *out_count = ki;
+    return true;
 }
 
 /* Emit cbm_vector_result_t entries as a "semantic_results" array on the doc. */
@@ -2883,10 +2888,14 @@ static void emit_semantic_results(yyjson_mut_doc *doc, yyjson_mut_val *root,
 
 typedef struct {
     bool type_error;
+    bool limit_error;
+    size_t keyword_count;
     bool store_error;
     int sqlite_error;
     char detail[CBM_SZ_512];
 } semantic_query_outcome_t;
+
+static char *search_graph_semantic_limit_error_result(size_t actual_count);
 
 /* Append semantic_query results only after the complete vector search
  * succeeds. A store failure is snapshotted for the caller; the exact-search
@@ -2895,7 +2904,6 @@ typedef struct {
 static semantic_query_outcome_t run_semantic_query(yyjson_mut_doc *doc, yyjson_mut_val *root,
                                                    const char *args, cbm_store_t *store,
                                                    const char *project, int limit) {
-    enum { MAX_KW_SEARCH = 32 };
     semantic_query_outcome_t outcome = {0};
     yyjson_doc *args_doc = yyjson_read(args, strlen(args), 0);
     yyjson_val *args_root = args_doc ? yyjson_doc_get_root(args_doc) : NULL;
@@ -2903,8 +2911,17 @@ static semantic_query_outcome_t run_semantic_query(yyjson_mut_doc *doc, yyjson_m
     if (sq_val && !yyjson_is_arr(sq_val)) {
         outcome.type_error = true;
     } else if (sq_val && yyjson_arr_size(sq_val) > 0) {
-        const char *keywords[MAX_KW_SEARCH];
-        int ki = extract_semantic_keywords(sq_val, keywords, MAX_KW_SEARCH);
+        outcome.keyword_count = yyjson_arr_size(sq_val);
+        if (outcome.keyword_count > CBM_VECTOR_SEARCH_MAX_KEYWORDS) {
+            outcome.limit_error = true;
+            goto semantic_done;
+        }
+        const char *keywords[CBM_VECTOR_SEARCH_MAX_KEYWORDS];
+        int ki = 0;
+        if (!extract_semantic_keywords(sq_val, keywords, &ki)) {
+            outcome.type_error = true;
+            goto semantic_done;
+        }
         cbm_vector_result_t *vresults = NULL;
         int vcount = 0;
         int sem_limit = limit > 0 ? limit : CBM_SZ_16;
@@ -2921,6 +2938,7 @@ static semantic_query_outcome_t run_semantic_query(yyjson_mut_doc *doc, yyjson_m
             cbm_store_free_vector_results(vresults, vcount);
         }
     }
+semantic_done:
     if (args_doc) {
         yyjson_doc_free(args_doc);
     }
@@ -2938,7 +2956,7 @@ static char *search_graph_argument_error_result(const char *argument, const char
         return cbm_mcp_text_result(
             "{\"code\":\"CBM_MCP_INVALID_ARGUMENT\",\"message\":\"search_graph arguments do "
             "not conform to the advertised inputSchema\",\"remediation\":\"send a JSON object "
-            "whose fields have the advertised JSON types\"}",
+            "whose fields satisfy the advertised types and bounds\"}",
             true);
     }
 
@@ -2950,7 +2968,8 @@ static char *search_graph_argument_error_result(const char *argument, const char
     yyjson_mut_obj_add_str(doc, root, "message", message);
     yyjson_mut_obj_add_str(doc, root, "remediation",
                            "send search_graph arguments that conform to the inputSchema returned "
-                           "by tools/list; correct the named field's JSON type and retry");
+                           "by tools/list; correct the named field's type, range, or item count and "
+                           "retry");
     yyjson_mut_obj_add_str(doc, root, "argument", argument);
     yyjson_mut_obj_add_str(doc, root, "expected_type", expected);
     yyjson_mut_obj_add_str(doc, root, "actual_type", actual);
@@ -2967,6 +2986,15 @@ static char *search_graph_argument_error_result(const char *argument, const char
     char *result = cbm_mcp_text_result(json, true);
     free(json);
     return result;
+}
+
+static char *search_graph_semantic_limit_error_result(size_t actual_count) {
+    char expected[CBM_SZ_64];
+    char actual[CBM_SZ_64];
+    snprintf(expected, sizeof(expected), "an array of at most %d keyword strings",
+             CBM_VECTOR_SEARCH_MAX_KEYWORDS);
+    snprintf(actual, sizeof(actual), "an array of %zu items", actual_count);
+    return search_graph_argument_error_result("semantic_query", expected, actual);
 }
 
 /* Validate every field whose type is declared by search_graph's tools/list
@@ -3051,6 +3079,12 @@ static char *validate_search_graph_arguments(const char *args) {
         return result;
     }
     if (semantic_query) {
+        size_t semantic_count = yyjson_arr_size(semantic_query);
+        if (semantic_count > CBM_VECTOR_SEARCH_MAX_KEYWORDS) {
+            char *result = search_graph_semantic_limit_error_result(semantic_count);
+            yyjson_doc_free(doc);
+            return result;
+        }
         size_t index, max;
         yyjson_val *item;
         yyjson_arr_foreach(semantic_query, index, max, item) {
@@ -3214,7 +3248,7 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
 
     semantic_query_outcome_t semantic = run_semantic_query(doc, root, args, store, project, limit);
 
-    if (semantic.type_error || semantic.store_error) {
+    if (semantic.type_error || semantic.limit_error || semantic.store_error) {
         for (int pi = 0; pi < props_doc_count; pi++) {
             yyjson_doc_free(props_docs[pi]);
         }
@@ -3234,6 +3268,9 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
                 "inspect the persisted vector/store diagnostic, repair or re-index the project "
                 "store if required, and retry the unchanged request",
                 semantic.sqlite_error, semantic.detail);
+        }
+        if (semantic.limit_error) {
+            return search_graph_semantic_limit_error_result(semantic.keyword_count);
         }
         return cbm_mcp_text_result(
             "semantic_query must be an array of keyword strings, e.g. "

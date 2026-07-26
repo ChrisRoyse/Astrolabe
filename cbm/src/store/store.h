@@ -771,6 +771,10 @@ void cbm_store_free_file_hashes(cbm_file_hash_t *hashes, int count);
 
 /* ── Vector search ───────────────────────────────────────────────── */
 
+/* Public request boundary for semantic vector search.  MCP schema,
+ * validation, and execution must all consume this exact value. */
+#define CBM_VECTOR_SEARCH_MAX_KEYWORDS 32
+
 /* Result from vector similarity search. */
 typedef struct {
     int64_t node_id;

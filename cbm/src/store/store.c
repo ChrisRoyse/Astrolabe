@@ -4854,24 +4854,50 @@ static int bfs_collect_edges(cbm_store_t *s, int64_t start_id, const cbm_node_ho
 }
 
 /* Build parameterized placeholder list "?1,?2,?3" for N edge types. */
-static void bfs_build_types_clause(int edge_type_count, char *buf, int buf_sz) {
+static bool bfs_build_types_clause(int edge_type_count, char *buf, int buf_sz) {
+    if (!buf || buf_sz <= 0) {
+        return false;
+    }
+    buf[0] = '\0';
     if (edge_type_count <= 0) {
-        snprintf(buf, buf_sz, "?1");
-        return;
+        int written = snprintf(buf, (size_t)buf_sz, "?1");
+        return written >= 0 && written < buf_sz;
     }
     int tlen = 0;
     for (int i = 0; i < edge_type_count; i++) {
         if (i > 0) {
-            tlen += snprintf(buf + tlen, buf_sz - tlen, ",");
-            if (tlen >= buf_sz) {
-                tlen = buf_sz - SKIP_ONE;
+            int written = snprintf(buf + tlen, (size_t)(buf_sz - tlen), ",");
+            if (written < 0 || written >= buf_sz - tlen) {
+                return false;
             }
+            tlen += written;
         }
-        tlen += snprintf(buf + tlen, buf_sz - tlen, "?%d", i + SKIP_ONE);
-        if (tlen >= buf_sz) {
-            tlen = buf_sz - SKIP_ONE;
+        int written = snprintf(buf + tlen, (size_t)(buf_sz - tlen), "?%d", i + SKIP_ONE);
+        if (written < 0 || written >= buf_sz - tlen) {
+            return false;
         }
+        tlen += written;
     }
+    return true;
+}
+
+/* Once the root transfers into out, every failure owns the same destruction
+ * transaction.  SQLite cleanup can replace the connection diagnostic, so keep
+ * the exact failure text across statement finalization and result destruction. */
+static int bfs_fail_after_root(cbm_store_t *s, sqlite3_stmt *stmt, cbm_node_hop_t *visited,
+                               int visited_count, cbm_traverse_result_t *out) {
+    char diagnostic[sizeof(s->errbuf)];
+    snprintf(diagnostic, sizeof(diagnostic), "%s", s->errbuf);
+    if (stmt) {
+        sqlite3_finalize(stmt);
+    }
+    if (visited) {
+        out->visited = visited;
+        out->visited_count = visited_count;
+    }
+    cbm_store_traverse_free(out);
+    snprintf(s->errbuf, sizeof(s->errbuf), "%s", diagnostic);
+    return CBM_STORE_ERR;
 }
 
 int cbm_store_bfs(cbm_store_t *s, int64_t start_id, const char *direction, const char **edge_types,
@@ -4886,7 +4912,10 @@ int cbm_store_bfs(cbm_store_t *s, int64_t start_id, const char *direction, const
     out->root = root;
 
     char types_clause[CBM_SZ_512];
-    bfs_build_types_clause(edge_type_count, types_clause, (int)sizeof(types_clause));
+    if (!bfs_build_types_clause(edge_type_count, types_clause, (int)sizeof(types_clause))) {
+        store_set_error(s, "bfs edge type placeholder list exceeds its exact representation");
+        return bfs_fail_after_root(s, NULL, NULL, 0, out);
+    }
 
     /* Build recursive CTE for BFS */
     char sql[CBM_SZ_4K];
@@ -4902,7 +4931,7 @@ int cbm_store_bfs(cbm_store_t *s, int64_t start_id, const char *direction, const
         next_id = "e.target_id";
     }
 
-    snprintf(sql, sizeof(sql),
+    int sql_len = snprintf(sql, sizeof(sql),
              "WITH RECURSIVE bfs(node_id, hop) AS ("
              "  SELECT %lld, 0"
              "  UNION"
@@ -4917,22 +4946,33 @@ int cbm_store_bfs(cbm_store_t *s, int64_t start_id, const char *direction, const
              "WHERE bfs.hop > 0 " /* exclude root */
              "ORDER BY bfs.hop "
              "LIMIT %d;",
-             (long long)start_id, next_id, join_cond, types_clause, max_depth, max_results);
+                           (long long)start_id, next_id, join_cond, types_clause, max_depth,
+                           max_results);
+    if (sql_len < 0 || (size_t)sql_len >= sizeof(sql)) {
+        store_set_error(s, "bfs SQL exceeds its exact representation");
+        return bfs_fail_after_root(s, NULL, NULL, 0, out);
+    }
 
     sqlite3_stmt *stmt = NULL;
     rc = sqlite3_prepare_v2(s->db, sql, CBM_NOT_FOUND, &stmt, NULL);
     if (rc != SQLITE_OK) {
         store_set_error_sqlite(s, "bfs prepare");
-        return CBM_STORE_ERR;
+        return bfs_fail_after_root(s, stmt, NULL, 0, out);
     }
 
     /* Bind edge type parameters */
     if (edge_type_count > 0) {
         for (int i = 0; i < edge_type_count; i++) {
-            bind_text(stmt, i + SKIP_ONE, edge_types[i]);
+            if (bind_text(stmt, i + SKIP_ONE, edge_types[i]) != SQLITE_OK) {
+                store_set_error_sqlite(s, "bfs bind edge type");
+                return bfs_fail_after_root(s, stmt, NULL, 0, out);
+            }
         }
     } else {
-        bind_text(stmt, SKIP_ONE, "CALLS");
+        if (bind_text(stmt, SKIP_ONE, "CALLS") != SQLITE_OK) {
+            store_set_error_sqlite(s, "bfs bind default edge type");
+            return bfs_fail_after_root(s, stmt, NULL, 0, out);
+        }
     }
 
     int cap = 0;
@@ -4943,37 +4983,25 @@ int cbm_store_bfs(cbm_store_t *s, int64_t start_id, const char *direction, const
     while ((step_rc = sqlite3_step(stmt)) == SQLITE_ROW) {
         if (store_array_reserve(s, (void **)&visited, &cap, n + 1, sizeof(*visited), "bfs") !=
             CBM_STORE_OK) {
-            for (int i = 0; i < n; i++) {
-                cbm_node_free_fields(&visited[i].node);
-            }
-            free(visited);
-            sqlite3_finalize(stmt);
-            cbm_store_traverse_free(out);
-            return CBM_STORE_ERR;
+            return bfs_fail_after_root(s, stmt, visited, n, out);
         }
         if (scan_node(s, stmt, &visited[n].node) != CBM_STORE_OK) {
-            for (int i = 0; i < n; i++) {
-                cbm_node_free_fields(&visited[i].node);
-            }
-            free(visited);
-            sqlite3_finalize(stmt);
-            return CBM_STORE_ERR;
+            return bfs_fail_after_root(s, stmt, visited, n, out);
         }
         visited[n].hop = sqlite3_column_int(stmt, ST_NODE_COL_COUNT);
         n++;
     }
     if (step_rc != SQLITE_DONE) {
-        for (int i = 0; i < n; i++) {
-            cbm_node_free_fields(&visited[i].node);
-        }
-        free(visited);
         store_set_error_sqlite(s, "bfs step");
-        sqlite3_finalize(stmt);
-        cbm_store_traverse_free(out);
-        return CBM_STORE_ERR;
+        return bfs_fail_after_root(s, stmt, visited, n, out);
     }
 
-    sqlite3_finalize(stmt);
+    rc = sqlite3_finalize(stmt);
+    stmt = NULL;
+    if (rc != SQLITE_OK) {
+        store_set_error_sqlite(s, "bfs finalize");
+        return bfs_fail_after_root(s, NULL, visited, n, out);
+    }
 
     out->visited = visited;
     out->visited_count = n;
@@ -4982,8 +5010,7 @@ int cbm_store_bfs(cbm_store_t *s, int64_t start_id, const char *direction, const
     if (n > 0) {
         if (bfs_collect_edges(s, start_id, out->visited, n, types_clause, edge_types,
                               edge_type_count, &out->edges, &out->edge_count) != CBM_STORE_OK) {
-            cbm_store_traverse_free(out);
-            return CBM_STORE_ERR;
+            return bfs_fail_after_root(s, NULL, NULL, 0, out);
         }
     } else {
         out->edges = NULL;
@@ -8874,7 +8901,6 @@ void cbm_store_free_vector_results(cbm_vector_result_t *results, int count) {
  * ALL keywords must be relevant, not just the average. */
 enum {
     VS_VEC_DIM = 768,
-    VS_MAX_KW = 32,
     VS_STR_BUF = 16,
 };
 
@@ -8958,9 +8984,9 @@ static bool vs_normalize_and_quantize(const float *src, int8_t *dst) {
 static int vs_build_keyword_vectors(cbm_store_t *s, const char *project, const char **keywords,
                                     int keyword_count, int8_t (*kw_vecs)[VS_VEC_DIM]) {
     int actual_kw = 0;
-    if (keyword_count > VS_MAX_KW) {
+    if (keyword_count > CBM_VECTOR_SEARCH_MAX_KEYWORDS) {
         snprintf(s->errbuf, sizeof(s->errbuf), "vector search received %d keywords; maximum is %d",
-                 keyword_count, VS_MAX_KW);
+                 keyword_count, CBM_VECTOR_SEARCH_MAX_KEYWORDS);
         cbm_log_error("store.vector_search", "code", "CBM_VECTOR_KEYWORD_LIMIT_EXCEEDED", "message",
                       s->errbuf, "remediation",
                       "submit no more than the documented keyword maximum");
@@ -9114,7 +9140,7 @@ int cbm_store_vector_search(cbm_store_t *s, const char *project, const char **ke
         return CBM_STORE_ERR;
     }
 
-    int8_t kw_vecs[VS_MAX_KW][VS_VEC_DIM];
+    int8_t kw_vecs[CBM_VECTOR_SEARCH_MAX_KEYWORDS][VS_VEC_DIM];
     int actual_kw = vs_build_keyword_vectors(s, project, keywords, keyword_count, kw_vecs);
     if (actual_kw <= 0) {
         return CBM_STORE_ERR;
