@@ -2199,18 +2199,100 @@ function Prepend-PathListEnv {
 function Add-Rustflags {
     param([Parameter(Mandatory)][string[]]$Tokens)
 
-    $addition = ($Tokens -join " ")
-    $existingItem = Get-Item -Path "Env:RUSTFLAGS" -ErrorAction SilentlyContinue
-    $existing = if ($null -ne $existingItem) { $existingItem.Value } else { "" }
-    if ($existing -and $existing.Contains($addition)) {
-        return
+    foreach ($token in $Tokens) {
+        [void](Add-EffectiveCargoRustflag -Token $token)
     }
-    if ([string]::IsNullOrWhiteSpace($existing)) {
-        $env:RUSTFLAGS = $addition
+}
+
+function Get-EffectiveCargoRustflagsSource {
+    # Cargo's rustflag sources are mutually exclusive. An explicitly present
+    # CARGO_ENCODED_RUSTFLAGS wins even when RUSTFLAGS is also set, so launcher
+    # policy must amend the source Cargo will actually consume.
+    $encodedItem = Get-Item `
+        -Path "Env:CARGO_ENCODED_RUSTFLAGS" `
+        -ErrorAction SilentlyContinue
+    if ($null -ne $encodedItem) {
+        return [pscustomobject]@{
+            Name = 'CARGO_ENCODED_RUSTFLAGS'
+            Value = [string]$encodedItem.Value
+            Encoded = $true
+        }
+    }
+
+    $rustflagsItem = Get-Item `
+        -Path "Env:RUSTFLAGS" `
+        -ErrorAction SilentlyContinue
+    return [pscustomobject]@{
+        Name = 'RUSTFLAGS'
+        Value = if ($null -ne $rustflagsItem) {
+            [string]$rustflagsItem.Value
+        }
+        else {
+            ''
+        }
+        Encoded = $false
+    }
+}
+
+function Get-EffectiveCargoRustflagsText {
+    $source = Get-EffectiveCargoRustflagsSource
+    if ($source.Encoded) {
+        return $source.Value.Replace([string][char]0x1f, ' ')
+    }
+    return $source.Value
+}
+
+function Add-EffectiveCargoRustflag {
+    param(
+        [Parameter(Mandatory)][string]$Token,
+        [switch]$Prepend
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Token) -or $Token -match '\s') {
+        throw "LAUNCHER_BOUNDARY[ASTRO_CARGO_RUSTFLAG_TOKEN_INVALID]: launcher-owned Cargo rustflag must be one nonempty token, found '$Token'"
+    }
+
+    $source = Get-EffectiveCargoRustflagsSource
+    if ($source.Encoded) {
+        $separator = [string][char]0x1f
+        $tokens = if ([string]::IsNullOrEmpty($source.Value)) {
+            @()
+        }
+        else {
+            @($source.Value -split [regex]::Escape($separator))
+        }
+        if ($tokens -ccontains $Token) {
+            return $source.Name
+        }
+        $value = if ([string]::IsNullOrEmpty($source.Value)) {
+            $Token
+        }
+        elseif ($Prepend) {
+            "$Token$separator$($source.Value)"
+        }
+        else {
+            "$($source.Value)$separator$Token"
+        }
+        Set-Item `
+            -Path "Env:CARGO_ENCODED_RUSTFLAGS" `
+            -Value $value
+        return $source.Name
+    }
+
+    $escapedToken = [regex]::Escape($Token)
+    if ($source.Value -match "(?:^|\s)$escapedToken(?:\s|$)") {
+        return $source.Name
+    }
+    if ([string]::IsNullOrWhiteSpace($source.Value)) {
+        $env:RUSTFLAGS = $Token
+    }
+    elseif ($Prepend) {
+        $env:RUSTFLAGS = "$Token $($source.Value)"
     }
     else {
-        $env:RUSTFLAGS = "$existing $addition"
+        $env:RUSTFLAGS = "$($source.Value) $Token"
     }
+    return $source.Name
 }
 
 function Expand-MsvcRuntimeSupportObjects {
@@ -7488,22 +7570,33 @@ try {
     Test-PinnedToolchain -MingwBin $mingwBin -LlvmBin $llvmBin -CppcheckRoot $cppcheckRoot -RipgrepRoot $ripgrepRoot -SccacheExe $sccacheExe
     Write-Output "WINDOWS_GNU_TOOLCHAIN: Rust $RustToolchain, GCC $ExpectedGccVersion, LLVM $ExpectedClangTidyVersion, Cppcheck $ExpectedCppcheckVersion, ripgrep $RipgrepVersion, sccache $ExpectedSccacheVersion, runtime $mingwBin"
 
-    # #303: when the operator opts into the #270 lld linker (RUSTFLAGS carries -fuse-ld=lld),
+    # #303: when the operator opts into the #270 lld linker (the effective Cargo rustflags
+    # carry -fuse-ld=lld),
     # guarantee the pinned LLVM 20.1.8 ld.lld -- never the host's unpinned MSVS BuildTools LLD --
     # is the one gcc/collect2 uses. Set-ToolchainEnvironment already prepends the pinned LLVM bin
     # to PATH; here we (1) end-to-end probe gcc and FAIL CLOSED unless it resolves LLD 20.1.8,
     # then (2) pin collect2's ld.lld search to the pinned dir via -B for the actual child build,
     # so a poisoned PATH cannot silently downgrade the linker. This only ADDS a pin when lld is
     # already requested; the default ld.bfd path is untouched.
-    if ($env:RUSTFLAGS -and ($env:RUSTFLAGS -match 'fuse-ld=lld')) {
+    $effectiveCargoRustflags = Get-EffectiveCargoRustflagsText
+    if ($effectiveCargoRustflags -match 'fuse-ld=lld') {
         $pinnedLld = Assert-GccResolvesPinnedLld -GccExe $env:CC -LlvmBin $llvmBin -ScratchDir $workspaceTemp
         $lldPrefix = ($llvmBin.TrimEnd('\', '/')) + '\'
         $lldPinArg = "-Clink-arg=-B$lldPrefix"
-        if ($env:RUSTFLAGS -notmatch [regex]::Escape($lldPinArg)) {
-            $env:RUSTFLAGS = "$lldPinArg $($env:RUSTFLAGS)"
-        }
-        Write-Output "LLD[ASTRO_PINNED_LLD]: lld-enabled build detected in RUSTFLAGS; verified gcc resolves $pinnedLld (LLD $ExpectedLldVersion); pinned collect2 ld.lld search via -B$lldPrefix ahead of PATH"
+        $lldRustflagsSource = Add-EffectiveCargoRustflag `
+            -Token $lldPinArg `
+            -Prepend
+        Write-Output "LLD[ASTRO_PINNED_LLD]: lld-enabled build detected in $lldRustflagsSource; verified gcc resolves $pinnedLld (LLD $ExpectedLldVersion); pinned collect2 ld.lld search via -B$lldPrefix ahead of PATH"
     }
+
+    # #755: GNU ld.bfd inserts the current time into PE/COFF images by default,
+    # so two otherwise-identical clean builds produce different executable bytes.
+    # LLD's MinGW driver accepts the same spelling as an alias for /timestamp:0.
+    # Append after all ambient/launcher linker selection flags so explicit zero is
+    # the effective last setting. Do not use SOURCE_DATE_EPOCH or post-link mutation.
+    $timestampRustflagsSource = Add-EffectiveCargoRustflag `
+        -Token '-Clink-arg=-Wl,--no-insert-timestamp'
+    Write-Output "LINK_REPRODUCIBILITY[ASTRO_PE_TIMESTAMP_ZERO]: appended -Wl,--no-insert-timestamp to effective Cargo source $timestampRustflagsSource; ld.bfd remains default and LLD remains explicit opt-in"
 
     if ($commandPlan.Count -eq 0) {
         # Environment-probe mode: the toolchain env is set up and reported ready, no child runs.

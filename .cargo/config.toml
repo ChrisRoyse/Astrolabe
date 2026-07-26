@@ -1,5 +1,12 @@
 # ASTROLABE cargo configuration.
 #
+# Canonical native builds receive `-Clink-arg=-Wl,--no-insert-timestamp`
+# from scripts/windows-gnu-toolchain-authority.ps1 (issue #755). The launcher
+# must own that policy because Cargo treats CARGO_ENCODED_RUSTFLAGS, RUSTFLAGS,
+# target rustflags, and build rustflags as mutually exclusive sources; putting
+# the deterministic PE setting here would silently lose it whenever the #270
+# process-local LLD opt-in uses RUSTFLAGS.
+#
 # ─────────────────────────────────────────────────────────────────────────────
 # Opt-in: LLD linker for the x86_64-pc-windows-gnu target (issue #270)
 # ─────────────────────────────────────────────────────────────────────────────
