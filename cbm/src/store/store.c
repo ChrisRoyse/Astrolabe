@@ -4931,23 +4931,23 @@ int cbm_store_bfs(cbm_store_t *s, int64_t start_id, const char *direction, const
         next_id = "e.target_id";
     }
 
-    int sql_len = snprintf(sql, sizeof(sql),
-             "WITH RECURSIVE bfs(node_id, hop) AS ("
-             "  SELECT %lld, 0"
-             "  UNION"
-             "  SELECT %s, bfs.hop + 1"
-             "  FROM bfs"
-             "  JOIN edges e ON %s"
-             "  WHERE e.type IN (%s) AND bfs.hop < %d"
-             ")"
-             "SELECT DISTINCT " ST_NODE_SELECT_COLUMNS_N ", bfs.hop "
-             "FROM bfs "
-             "JOIN nodes n ON n.id = bfs.node_id "
-             "WHERE bfs.hop > 0 " /* exclude root */
-             "ORDER BY bfs.hop "
-             "LIMIT %d;",
-                           (long long)start_id, next_id, join_cond, types_clause, max_depth,
-                           max_results);
+    int sql_len =
+        snprintf(sql, sizeof(sql),
+                 "WITH RECURSIVE bfs(node_id, hop) AS ("
+                 "  SELECT %lld, 0"
+                 "  UNION"
+                 "  SELECT %s, bfs.hop + 1"
+                 "  FROM bfs"
+                 "  JOIN edges e ON %s"
+                 "  WHERE e.type IN (%s) AND bfs.hop < %d"
+                 ")"
+                 "SELECT DISTINCT " ST_NODE_SELECT_COLUMNS_N ", bfs.hop "
+                 "FROM bfs "
+                 "JOIN nodes n ON n.id = bfs.node_id "
+                 "WHERE bfs.hop > 0 " /* exclude root */
+                 "ORDER BY bfs.hop "
+                 "LIMIT %d;",
+                 (long long)start_id, next_id, join_cond, types_clause, max_depth, max_results);
     if (sql_len < 0 || (size_t)sql_len >= sizeof(sql)) {
         store_set_error(s, "bfs SQL exceeds its exact representation");
         return bfs_fail_after_root(s, NULL, NULL, 0, out);

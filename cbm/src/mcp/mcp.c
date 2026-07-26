@@ -374,19 +374,32 @@ static const tool_def_t TOOLS[] = {
      "\"relationship\":{\"type\":\"string\"},\"min_degree\":{\"type\":\"integer\"},"
      "\"max_degree\":{\"type\":\"integer\"},\"exclude_entry_points\":{\"type\":\"boolean\"},"
      "\"include_connected\":{\"type\":\"boolean\"},\"semantic_query\":{"
-     "\"type\":\"array\",\"maxItems\":" MCP_STRINGIFY(CBM_VECTOR_SEARCH_MAX_KEYWORDS) ","
-     "\"items\":{\"type\":\"string\"},\"description\":\"MUST be an ARRAY of "
-     "keyword strings (e.g. [\\\"send\\\",\\\"pubsub\\\",\\\"publish\\\"]) — NOT a single string. "
-     "Each keyword is scored independently via per-keyword min-cosine; results reflect functions "
-     "that score well on ALL keywords. Requires moderate/full index mode. Results appear in the "
-     "'semantic_results' field (separate from 'results').\"},\"limit\":{\"type\":"
-     "\"integer\",\"description\":\"Max results per call. Default 200. Response carries "
-     "'total' (full match count) and 'has_more' (true if truncated) so callers can "
-     "detect the limit and paginate.\",\"minimum\":1,\"maximum\":2147483647},"
-     "\"offset\":{\"type\":\"integer\",\"default\":0,\"minimum\":0,\"maximum\":2147483647,"
-     "\"description\":\"Skip the first N matching nodes. Combine with 'limit' to page: "
-     "increment offset by limit and re-call while has_more is true.\"}},"
-     "\"required\":[\"project\"]}"},
+     "\"type\":\"array\",\"maxItems\":" MCP_STRINGIFY(
+         CBM_VECTOR_SEARCH_MAX_KEYWORDS) ","
+                                         "\"items\":{\"type\":\"string\"},\"description\":\"MUST "
+                                         "be an ARRAY of "
+                                         "keyword strings (e.g. "
+                                         "[\\\"send\\\",\\\"pubsub\\\",\\\"publish\\\"]) — NOT a "
+                                         "single string. "
+                                         "Each keyword is scored independently via per-keyword "
+                                         "min-cosine; results reflect functions "
+                                         "that score well on ALL keywords. Requires moderate/full "
+                                         "index mode. Results appear in the "
+                                         "'semantic_results' field (separate from "
+                                         "'results').\"},\"limit\":{\"type\":"
+                                         "\"integer\",\"description\":\"Max results per call. "
+                                         "Default 200. Response carries "
+                                         "'total' (full match count) and 'has_more' (true if "
+                                         "truncated) so callers can "
+                                         "detect the limit and "
+                                         "paginate.\",\"minimum\":1,\"maximum\":2147483647},"
+                                         "\"offset\":{\"type\":\"integer\",\"default\":0,"
+                                         "\"minimum\":0,\"maximum\":2147483647,"
+                                         "\"description\":\"Skip the first N matching nodes. "
+                                         "Combine with 'limit' to page: "
+                                         "increment offset by limit and re-call while has_more is "
+                                         "true.\"}},"
+                                         "\"required\":[\"project\"]}"},
 
     {"query_graph", "Query graph",
      "Execute a Cypher query against the knowledge graph for complex multi-hop patterns, "
@@ -2966,10 +2979,11 @@ static char *search_graph_argument_error_result(const char *argument, const char
              argument, expected, actual);
     yyjson_mut_obj_add_str(doc, root, "code", "CBM_MCP_INVALID_ARGUMENT");
     yyjson_mut_obj_add_str(doc, root, "message", message);
-    yyjson_mut_obj_add_str(doc, root, "remediation",
-                           "send search_graph arguments that conform to the inputSchema returned "
-                           "by tools/list; correct the named field's type, range, or item count and "
-                           "retry");
+    yyjson_mut_obj_add_str(
+        doc, root, "remediation",
+        "send search_graph arguments that conform to the inputSchema returned "
+        "by tools/list; correct the named field's type, range, or item count and "
+        "retry");
     yyjson_mut_obj_add_str(doc, root, "argument", argument);
     yyjson_mut_obj_add_str(doc, root, "expected_type", expected);
     yyjson_mut_obj_add_str(doc, root, "actual_type", actual);
