@@ -1222,6 +1222,55 @@ static cbm_store_t *resolve_store(cbm_mcp_server_t *srv, const char *project) {
     return srv->store;
 }
 
+/* Convert one verified cached query store into a separate, verified mutation
+ * handle without reopening through the create/schema/journal initializer.  The
+ * query handle remains open until the writer has opened and verified the same
+ * exact path/project/root, binding the pathname against replacement.  It is
+ * then closed before the caller can mutate, so this server never blocks its own
+ * rollback-journal commit. */
+static cbm_store_t *resolve_mutation_store(cbm_mcp_server_t *srv, const char *project,
+                                           bool *out_owned) {
+    if (out_owned) {
+        *out_owned = false;
+    }
+    cbm_store_t *resolved = resolve_store(srv, project);
+    if (!resolved) {
+        return NULL;
+    }
+    const char *db_path = cbm_store_db_path(resolved);
+    if (!db_path) {
+        return resolved;
+    }
+
+    cbm_store_t *writer = NULL;
+    cbm_store_verify_result_t verification;
+    cbm_store_verify_status_t status =
+        cbm_store_open_path_project_writer_existing(db_path, project, &writer, &verification);
+    if (status != CBM_STORE_VERIFY_OK || !writer) {
+        record_store_error_state(srv, project, db_path, &verification);
+        return NULL;
+    }
+
+    if (srv->store != resolved || !srv->owns_store) {
+        cbm_store_close(writer);
+        record_store_query_failure(
+            srv, project, db_path, resolved, CBM_STORE_VERIFY_IO_FAILED,
+            "source.writer.cached_query_ownership",
+            "verified path-backed query store is not owned by this MCP server");
+        return NULL;
+    }
+    cbm_store_close(srv->store);
+    srv->store = NULL;
+    srv->owns_store = false;
+    free(srv->current_project);
+    srv->current_project = NULL;
+    srv->store_last_used = 0;
+    if (out_owned) {
+        *out_owned = true;
+    }
+    return writer;
+}
+
 /* Forward decl — definition lives below alongside list_projects. */
 static bool is_project_db_file(const char *name, size_t len);
 
@@ -7777,49 +7826,6 @@ static void adr_fill_write_error(yyjson_mut_doc *doc, yyjson_mut_val *root, cbm_
         "the SQLite error persists, preserve the DB/WAL/SHM family together and inspect them.");
 }
 
-/* Build a standalone structured error for the case where the dedicated
- * read-write handle to a resolved (existing) project DB could not be opened.
- * The open already honors the store's 10s busy_timeout internally, so a lock
- * held that long is genuinely stuck, not a quick transient — the caller returns
- * this structured diagnostic rather than spinning further retries. */
-static char *build_adr_open_error(const char *db_path) {
-    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
-    if (!doc) {
-        return heap_strdup("{\"status\":\"write_error\",\"code\":\"CBM_STORE_ADR_OPEN_FAILED\","
-                           "\"message\":\"could not open a read-write handle to the project "
-                           "database\",\"remediation\":\"resolve the reported filesystem/SQLite "
-                           "failure and retry\"}");
-    }
-    yyjson_mut_val *root = yyjson_mut_obj(doc);
-    yyjson_mut_doc_set_root(doc, root);
-    yyjson_mut_obj_add_str(doc, root, "status", "write_error");
-    yyjson_mut_obj_add_str(doc, root, "code", "CBM_STORE_ADR_OPEN_FAILED");
-    yyjson_mut_obj_add_str(
-        doc, root, "message",
-        "could not open a dedicated read-write handle to the project database for the ADR write");
-    yyjson_mut_obj_add_str(doc, root, "stage", "sqlite.open_rw");
-    yyjson_mut_obj_add_strcpy(doc, root, "db_path", db_path ? db_path : "");
-    if (db_path) {
-        yyjson_mut_obj_add_bool(doc, root, "db_present", cbm_path_exists(db_path));
-        adr_add_family_presence(doc, root, db_path);
-    }
-    yyjson_mut_obj_add_str(
-        doc, root, "remediation",
-        "the database file exists (project resolved) but a read-write open failed -- likely a "
-        "sharing violation from AV/indexing or another process holding it exclusively, a "
-        "read-only file/volume, or a corrupt WAL/SHM. Free the writer, clear the read-only "
-        "attribute, or preserve and inspect the DB/WAL/SHM family, then retry.");
-    char *json = yy_doc_to_str(doc);
-    yyjson_mut_doc_free(doc);
-    if (!json) {
-        return heap_strdup("{\"status\":\"write_error\",\"code\":\"CBM_STORE_ADR_OPEN_FAILED\","
-                           "\"message\":\"could not open a read-write handle to the project "
-                           "database\",\"remediation\":\"resolve the reported filesystem/SQLite "
-                           "failure and retry\"}");
-    }
-    return json;
-}
-
 static char *handle_manage_adr(cbm_mcp_server_t *srv, const char *args) {
     char *project = get_project_arg(args);
     char *mode_str = cbm_mcp_get_string_arg(args, "mode");
@@ -7832,8 +7838,9 @@ static char *handle_manage_adr(cbm_mcp_server_t *srv, const char *args) {
     /* ADRs are stored in the SQLite store (project_summaries), the SAME
      * backend the UI /api/adr endpoints use — so writes via the MCP tool and
      * the UI are visible to each other (#256). */
-    cbm_store_t *resolved = resolve_store(srv, project);
-    if (!resolved) {
+    bool owns_mutation_store = false;
+    cbm_store_t *store = resolve_mutation_store(srv, project, &owns_mutation_store);
+    if (!store) {
         char *err = build_no_store_error(srv, project);
         char *res = cbm_mcp_text_result(err, true);
         free(err);
@@ -7843,30 +7850,6 @@ static char *handle_manage_adr(cbm_mcp_server_t *srv, const char *args) {
         return res;
     }
 
-    /* resolve_store opens file-backed projects READ-ONLY (query stores must
-     * not mutate the DB). manage_adr is the only resolve_store caller that
-     * WRITES, so it needs a writable handle. For a file-backed project open a
-     * dedicated read-write handle to the same DB file (the project is verified
-     * to exist via resolve_store, so cbm_store_open_path won't create a ghost
-     * DB). For an in-memory / embedded store (db_path == NULL) the resolved
-     * store is already writable — use it directly. */
-    cbm_store_t *store = resolved;
-    cbm_store_t *owned_rw = NULL;
-    const char *resolved_db_path = cbm_store_db_path(resolved);
-    if (resolved_db_path) {
-        owned_rw = cbm_store_open_path(resolved_db_path);
-        if (!owned_rw) {
-            char *err = build_adr_open_error(resolved_db_path);
-            char *res = cbm_mcp_text_result(err, true);
-            free(err);
-            free(project);
-            free(mode_str);
-            free(content);
-            return res;
-        }
-        store = owned_rw;
-    }
-
     /* One-time migration: older versions wrote ADRs to a file at
      * <root>/.codebase-memory/adr.md. If the store has no ADR yet but that
      * legacy file exists, import it so nothing is lost on upgrade. */
@@ -7874,7 +7857,14 @@ static char *handle_manage_adr(cbm_mcp_server_t *srv, const char *args) {
     memset(&adr, 0, sizeof(adr));
     bool have_adr = (cbm_store_adr_get(store, project, &adr) == CBM_STORE_OK);
     if (!have_adr) {
-        char *root_path = get_project_root(srv, project);
+        cbm_project_t persisted_project = {0};
+        char *root_path = NULL;
+        if (cbm_store_get_project(store, project, &persisted_project) == CBM_STORE_OK) {
+            root_path = heap_strdup(persisted_project.root_path);
+        }
+        safe_str_free(&persisted_project.name);
+        safe_str_free(&persisted_project.indexed_at);
+        safe_str_free(&persisted_project.root_path);
         char *legacy = adr_read_legacy_file(root_path);
         free(root_path);
         if (legacy) {
@@ -7914,8 +7904,8 @@ static char *handle_manage_adr(cbm_mcp_server_t *srv, const char *args) {
     if (have_adr) {
         cbm_store_adr_free(&adr);
     }
-    if (owned_rw) {
-        cbm_store_close(owned_rw);
+    if (owns_mutation_store) {
+        cbm_store_close(store);
     }
     free(project);
     free(mode_str);
@@ -7973,31 +7963,16 @@ static cbm_trace_simple_t *collect_simple(yyjson_val *traces, int *out_n) {
 static char *handle_ingest_traces(cbm_mcp_server_t *srv, const char *args) {
     char *project = get_project_arg(args);
 
-    cbm_store_t *resolved = resolve_store(srv, project);
-    if (!resolved) {
+    bool owns_mutation_store = false;
+    cbm_store_t *store = resolve_mutation_store(srv, project, &owns_mutation_store);
+    if (!store) {
         char *err = build_no_store_error(srv, project);
         char *res = cbm_mcp_text_result(err, true);
         free(err);
         free(project);
         return res;
     }
-    /* resolve_store opens file-backed projects READ-ONLY; ingestion mutates, so
-     * open a dedicated read-write handle to the same DB (mirrors manage_adr). */
-    cbm_store_t *store = resolved;
-    cbm_store_t *owned_rw = NULL;
-    const char *resolved_db_path = cbm_store_db_path(resolved);
-    if (resolved_db_path) {
-        owned_rw = cbm_store_open_path(resolved_db_path);
-        if (!owned_rw) {
-            char *err = build_no_store_error(srv, project);
-            char *res = cbm_mcp_text_result(err, true);
-            free(err);
-            free(project);
-            return res;
-        }
-        store = owned_rw;
-    }
-    const char *eff_project = project ? project : srv->current_project;
+    const char *eff_project = project;
 
     cbm_otlp_batch_t batch = {0};
     cbm_trace_ingest_stats_t stats = {0};
@@ -8110,8 +8085,8 @@ static char *handle_ingest_traces(cbm_mcp_server_t *srv, const char *args) {
     }
     free(err_detail);
     free(b64);
-    if (owned_rw) {
-        cbm_store_close(owned_rw);
+    if (owns_mutation_store) {
+        cbm_store_close(store);
     }
     free(project);
 

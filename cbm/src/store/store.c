@@ -2338,6 +2338,147 @@ cbm_store_verify_status_t cbm_store_open_path_project_query_verified(
                                     result);
 }
 
+cbm_store_verify_status_t cbm_store_open_path_project_writer_existing(
+    const char *db_path, const char *project, cbm_store_t **out_store,
+    cbm_store_verify_result_t *result) {
+    cbm_store_verify_result_t local_result;
+    if (out_store) {
+        *out_store = NULL;
+    }
+    if (!result) {
+        result = &local_result;
+    }
+    store_verify_result_init(result);
+    if (!out_store) {
+        store_verify_set_error(result, CBM_STORE_VERIFY_IO_FAILED, "source.writer.validate_output",
+                               0, SQLITE_MISUSE, "writer output pointer is required");
+        return result->status;
+    }
+    if (!db_path || db_path[0] == '\0') {
+        store_verify_set_error(result, CBM_STORE_VERIFY_IO_FAILED, "source.writer.validate_path", 0,
+                               SQLITE_MISUSE, "database path is null or empty");
+        return result->status;
+    }
+    if (!project || !cbm_validate_project_name(project)) {
+        store_verify_set_error(result, CBM_STORE_VERIFY_IO_FAILED, "source.writer.validate_project",
+                               0, SQLITE_MISUSE,
+                               "existing-store writer requires a valid exact project name");
+        return result->status;
+    }
+
+    cbm_store_t *writer = calloc(CBM_ALLOC_ONE, sizeof(cbm_store_t));
+    if (!writer) {
+        store_verify_set_error(result, CBM_STORE_VERIFY_IO_FAILED, "source.writer.allocate", 0,
+                               SQLITE_NOMEM, "writer store handle could not be allocated");
+        return result->status;
+    }
+
+    int rc = sqlite3_open_v2(db_path, &writer->db, SQLITE_OPEN_READWRITE, NULL);
+    if (rc != SQLITE_OK) {
+        int sqlite_error = writer->db ? sqlite3_extended_errcode(writer->db) : rc;
+        store_verify_set_error(result, CBM_STORE_VERIFY_IO_FAILED, "source.writer.sqlite_open", 0,
+                               sqlite_error,
+                               writer->db ? sqlite3_errmsg(writer->db) : sqlite3_errstr(rc));
+        store_log_open_failure(db_path, "source.writer.sqlite_open", writer->db, sqlite_error,
+                               result->detail);
+        sqlite3_close_v2(writer->db);
+        free(writer);
+        return result->status;
+    }
+    result->db_present = true;
+
+    int read_only = sqlite3_db_readonly(writer->db, "main");
+    if (read_only != 0) {
+        store_verify_set_error(result, CBM_STORE_VERIFY_IO_FAILED, "source.writer.assert_readwrite",
+                               0, read_only < 0 ? SQLITE_ERROR : SQLITE_READONLY,
+                               read_only < 0
+                                   ? "SQLite could not resolve the main database name"
+                                   : "SQLITE_OPEN_READWRITE degraded to a read-only connection");
+        store_log_open_failure(db_path, "source.writer.assert_readwrite", writer->db,
+                               result->sqlite_error, result->detail);
+        sqlite3_close_v2(writer->db);
+        free(writer);
+        return result->status;
+    }
+
+    writer->db_path = heap_strdup(db_path);
+    if (!writer->db_path) {
+        store_verify_set_error(result, CBM_STORE_VERIFY_IO_FAILED, "source.writer.copy_path", 0,
+                               SQLITE_NOMEM, "existing writer database path could not be retained");
+        store_log_open_failure(db_path, "source.writer.copy_path", writer->db, SQLITE_NOMEM,
+                               result->detail);
+        sqlite3_close_v2(writer->db);
+        free(writer);
+        return result->status;
+    }
+
+    const char *failed_operation = NULL;
+    if (sqlite3_set_authorizer(writer->db, store_authorizer, NULL) != SQLITE_OK) {
+        failed_operation = "source.writer.install_authorizer";
+    } else if (sqlite3_create_function(writer->db, "regexp", ST_COL_2,
+                                       SQLITE_UTF8 | SQLITE_DETERMINISTIC, NULL, sqlite_regexp,
+                                       NULL, NULL) != SQLITE_OK) {
+        failed_operation = "source.writer.register_regexp";
+    } else if (sqlite3_create_function(writer->db, "iregexp", ST_COL_2,
+                                       SQLITE_UTF8 | SQLITE_DETERMINISTIC, NULL, sqlite_iregexp,
+                                       NULL, NULL) != SQLITE_OK) {
+        failed_operation = "source.writer.register_iregexp";
+    } else if (sqlite3_create_function(writer->db, "cbm_cosine_i8", ST_COL_2,
+                                       SQLITE_UTF8 | SQLITE_DETERMINISTIC, NULL, sqlite_cosine_i8,
+                                       NULL, NULL) != SQLITE_OK) {
+        failed_operation = "source.writer.register_cosine";
+    } else if (sqlite3_create_function(writer->db, "cbm_camel_split", SKIP_ONE,
+                                       SQLITE_UTF8 | SQLITE_DETERMINISTIC, NULL, sqlite_camel_split,
+                                       NULL, NULL) != SQLITE_OK) {
+        failed_operation = "source.writer.register_camel_split";
+    } else if (configure_pragmas(writer, false, true) != CBM_STORE_OK) {
+        /* The read-only profile is intentionally used on this writable
+         * connection: it configures foreign keys, TEMP, busy timeout, and mmap
+         * without changing journal_mode or synchronous. */
+        failed_operation = "source.writer.configure_nonmutating_pragmas";
+    }
+    if (failed_operation) {
+        int sqlite_error = sqlite3_extended_errcode(writer->db);
+        store_verify_set_error(result, CBM_STORE_VERIFY_IO_FAILED, failed_operation, 0,
+                               sqlite_error, sqlite3_errmsg(writer->db));
+        store_log_open_failure(db_path, failed_operation, writer->db, sqlite_error, result->detail);
+        cbm_store_close(writer);
+        return result->status;
+    }
+
+    store_integrity_result_t integrity_result;
+    store_integrity_status_t integrity_status = store_check_integrity_detailed(
+        writer, STORE_INTEGRITY_CONTRACT_QUERY, project, &integrity_result);
+    if (integrity_status != STORE_INTEGRITY_OK) {
+        char operation[CBM_STORE_VERIFY_OPERATION_MAX];
+        int wrote =
+            snprintf(operation, sizeof(operation), "source.writer.%s", integrity_result.operation);
+        if (wrote < 0 || (size_t)wrote >= sizeof(operation)) {
+            store_verify_set_error(result, CBM_STORE_VERIFY_IO_FAILED,
+                                   "source.writer.integrity_operation_overflow", 0, SQLITE_TOOBIG,
+                                   "writer integrity operation exceeds diagnostic capacity");
+        } else {
+            store_verify_set_error(
+                result,
+                integrity_status == STORE_INTEGRITY_IO_FAILED ? CBM_STORE_VERIFY_IO_FAILED
+                                                              : CBM_STORE_VERIFY_INTEGRITY_FAILED,
+                operation, 0, integrity_result.sqlite_error, integrity_result.detail);
+        }
+        cbm_store_close(writer);
+        return result->status;
+    }
+
+    result->status = CBM_STORE_VERIFY_OK;
+    result->sqlite_error = SQLITE_OK;
+    snprintf(result->operation, sizeof(result->operation), "%s",
+             "source.writer.application.project_identity");
+    snprintf(result->detail, sizeof(result->detail), "%s",
+             "existing writer passed the exact project/root integrity contract without changing "
+             "journal mode");
+    *out_store = writer;
+    return result->status;
+}
+
 cbm_store_verify_status_t cbm_store_open_path_graph_verified(const char *db_path,
                                                              const char *project,
                                                              cbm_store_t **out_store,

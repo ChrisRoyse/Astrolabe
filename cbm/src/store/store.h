@@ -277,6 +277,18 @@ cbm_store_verify_status_t cbm_store_open_path_project_query_verified(
     const char *db_path, const char *project, cbm_store_t **out_store,
     cbm_store_verify_result_t *result);
 
+/* Open one already-verified named project for mutation without creating or
+ * initializing anything.  The database must already exist and be genuinely
+ * writable.  This preserves its current journal mode, applies only
+ * connection-local/non-mode-changing pragmas, and verifies the complete query
+ * integrity + exact project/root contract on the returned connection.  Keep a
+ * previously verified query connection open until this call succeeds to bind
+ * the pathname against replacement; close that query connection before the
+ * first mutation. */
+cbm_store_verify_status_t cbm_store_open_path_project_writer_existing(
+    const char *db_path, const char *project, cbm_store_t **out_store,
+    cbm_store_verify_result_t *result);
+
 /* Verify and open the graph state consumed by cbm_gbuf_load_from_db.  This uses
  * the same source-family freeze, byte/hash-checked snapshot, and race-free
  * read-only publication boundary as cbm_store_open_path_query_verified, but
