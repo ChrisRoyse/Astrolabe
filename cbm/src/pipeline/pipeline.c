@@ -1844,6 +1844,11 @@ static int try_incremental_or_delete_db(cbm_pipeline_t *p, cbm_file_info_t *file
 
     cbm_store_t *check_store = cbm_store_open_path(db_path);
     if (check_store && cbm_store_check_integrity(check_store)) {
+        if (p->mode == CBM_MODE_FULL) {
+            cbm_store_close(check_store);
+            cbm_log_info("pipeline.route", "path", "full", "reason", "explicit_full_mode");
+            goto full_reindex;
+        }
         cbm_file_hash_t *hashes = NULL;
         int hash_count = 0;
         int hash_rc = cbm_store_get_file_hashes(check_store, p->project_name, &hashes, &hash_count);
@@ -1889,6 +1894,7 @@ static int try_incremental_or_delete_db(cbm_pipeline_t *p, cbm_file_info_t *file
         free(db_path);
         return CBM_NOT_FOUND;
     }
+full_reindex:
     cbm_log_info("pipeline.route", "path", "reindex", "action", "build_atomic_replacement");
     /* Capture any ADR before the atomic full-reindex replacement. */
     {
