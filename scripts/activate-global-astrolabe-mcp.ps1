@@ -629,9 +629,9 @@ function New-CodexCandidate {
         [Parameter(Mandatory)][string]$CandidateHome
     )
 
+    $span = Get-CodexTargetSpan $BeforeText
     Assert-CodexConfigParses $CliPath $BeforeHome 'Codex user configuration'
     $beforeReadback = Get-CodexTargetReadback $CliPath $BeforeHome
-    $span = Get-CodexTargetSpan $BeforeText
     if ($beforeReadback.found -ne $span.found) {
         Fail-AstroGlobalActivation 'ASTRO_GLOBAL_ACTIVATION_CODEX_TARGET_AMBIGUOUS' `
             "Codex semantic target presence ($($beforeReadback.found)) disagrees with one canonical [mcp_servers.astrolabe] table ($($span.found))" `
@@ -813,6 +813,36 @@ function Restore-ConfigIfChanged {
     return [ordered]@{
         role = $Role
         verdict = 'restored'
+        sha256 = $restored.snapshot.sha256
+        file_id = $restored.snapshot.file_id
+        failed_after_path = $restored.failed_after_path
+        failed_after_sha256 = $restored.failed_after_sha256
+    }
+}
+
+function Restore-ObservedReplacementBackup {
+    param(
+        [Parameter(Mandatory)]$Before,
+        [Parameter(Mandatory)]$ObservedBackup,
+        [Parameter(Mandatory)][string]$ReplacementBackupPath,
+        [Parameter(Mandatory)][string]$TransactionPath,
+        [Parameter(Mandatory)][string]$Role
+    )
+
+    $observedAtConfigPath = [pscustomobject]@{
+        path = $Before.path
+        bytes_value = $ObservedBackup.bytes_value
+        text = $ObservedBackup.text
+        bytes = $ObservedBackup.bytes
+        sha256 = $ObservedBackup.sha256
+        file_id = $ObservedBackup.file_id
+        last_write_utc = $ObservedBackup.last_write_utc
+    }
+    $restored = Restore-ConfigBeforeImage `
+        $observedAtConfigPath $ReplacementBackupPath $TransactionPath $Role
+    return [ordered]@{
+        role = $Role
+        verdict = 'restored_observed_concurrent_state'
         sha256 = $restored.snapshot.sha256
         file_id = $restored.snapshot.file_id
         failed_after_path = $restored.failed_after_path
@@ -1187,9 +1217,18 @@ try {
     Flush-ExistingDurableFile $CodexConfigPath 'Codex activation config'
     $codexBackup = Read-ConfigSnapshot `
         $codexReplacementBackupPath 'Codex replacement backup'
-    Assert-SnapshotEquals $codexBefore $codexBackup `
-        'ASTRO_GLOBAL_ACTIVATION_CODEX_BACKUP_MISMATCH' `
-        'Codex replacement backup'
+    if (-not (Test-SnapshotEquals $codexBefore $codexBackup)) {
+        $outcome = Restore-ObservedReplacementBackup `
+            $codexBefore $codexBackup $codexReplacementBackupPath `
+            $transactionPath 'codex'
+        $rollback.Add($outcome)
+        $codexCommitAttempted = $false
+        $codexCommitted = $false
+        Fail-AstroGlobalActivation `
+            'ASTRO_GLOBAL_ACTIVATION_CODEX_POST_SNAPSHOT_DRIFT' `
+            "Codex config changed after precommit snapshot (snapshot_sha256=$($codexBefore.sha256); replacement_time_sha256=$($codexBackup.sha256)); the exact replacement-time file was restored" `
+            'preserve the transaction, reconcile the concurrent Codex config update, and retry from fresh snapshots'
+    }
     $codexAfter = Read-ConfigSnapshot $CodexConfigPath 'Codex activation readback'
     Assert-SnapshotEquals $codexCommitStage $codexAfter `
         'ASTRO_GLOBAL_ACTIVATION_CODEX_READBACK_MISMATCH' `
@@ -1218,9 +1257,19 @@ try {
     Flush-ExistingDurableFile $ClaudeConfigPath 'Claude activation config'
     $claudeBackup = Read-ConfigSnapshot `
         $claudeReplacementBackupPath 'Claude replacement backup'
-    Assert-SnapshotEquals $claudeBefore $claudeBackup `
-        'ASTRO_GLOBAL_ACTIVATION_CLAUDE_BACKUP_MISMATCH' `
-        'Claude replacement backup'
+    if (-not (Test-SnapshotEquals $claudeBefore $claudeBackup)) {
+        $outcome = Restore-ObservedReplacementBackup `
+            $claudeBefore $claudeBackup $claudeReplacementBackupPath `
+            $transactionPath 'claude'
+        $outcome.role = 'claude_code'
+        $rollback.Add($outcome)
+        $claudeCommitAttempted = $false
+        $claudeCommitted = $false
+        Fail-AstroGlobalActivation `
+            'ASTRO_GLOBAL_ACTIVATION_CLAUDE_POST_SNAPSHOT_DRIFT' `
+            "Claude config changed after precommit snapshot (snapshot_sha256=$($claudeBefore.sha256); replacement_time_sha256=$($claudeBackup.sha256)); the exact replacement-time file was restored" `
+            'preserve the transaction, reconcile the concurrent Claude config update, and retry from fresh snapshots'
+    }
     $claudeAfter = Read-ConfigSnapshot $ClaudeConfigPath 'Claude activation readback'
     Assert-SnapshotEquals $claudeCommitStage $claudeAfter `
         'ASTRO_GLOBAL_ACTIVATION_CLAUDE_READBACK_MISMATCH' `
