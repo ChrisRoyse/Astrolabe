@@ -10,6 +10,7 @@ use std::panic::AssertUnwindSafe;
 use std::path::PathBuf;
 use std::ptr::{self, NonNull};
 use std::rc::Rc;
+use std::sync::OnceLock;
 use std::thread::{self, ThreadId};
 
 pub const CRATE_NAME: &str = env!("CARGO_PKG_NAME");
@@ -421,6 +422,23 @@ pub fn route_cbm_logs_to_tracing() -> Result<(), BridgeError> {
     Ok(())
 }
 
+static CBM_PROFILE_ACTIVE: OnceLock<bool> = OnceLock::new();
+
+/// Initializes libcbm's inherited profile mode exactly once and returns its
+/// process-global verdict.
+///
+/// The host needs this before constructing its Rust tracing subscriber: every
+/// native profile record is INFO, so a CLI WARN subscriber would discard the
+/// events before the supervisor can retain them. The environment contract stays
+/// native-owned; Rust consumes only libcbm's initialized verdict (#767).
+pub fn initialize_cbm_profile_mode() -> Result<bool, BridgeError> {
+    initialize_cbm_allocator()?;
+    Ok(*CBM_PROFILE_ACTIVE.get_or_init(|| unsafe {
+        cbm_sys::cbm_profile_init();
+        cbm_sys::cbm_profile_is_active()
+    }))
+}
+
 /// How libcbm's own logging is initialized for this host process (#392).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CbmLogMode {
@@ -514,16 +532,14 @@ fn initialize_cbm_host_process_with_log_mode(
     initialize_cbm_allocator()?;
     let binary_path = binary_path.map(CString::new).transpose()?;
 
+    let profile_active = initialize_cbm_profile_mode()?;
     // SAFETY: all called CBM startup functions are process-global initializers
     // intended for main() startup. The optional binary path C string is live for
     // the duration of the call; CBM copies it internally.
     unsafe {
-        // The fused Rust host replaces cbm/main.c, so it must initialize the
-        // native profile mode before choosing a log floor. Profiling emits INFO
-        // records; preserving the ordinary CLI WARN floor while profiling is
-        // active would retain an empty worker log and hide its exact path (#767).
-        cbm_sys::cbm_profile_init();
-        let profile_active = cbm_sys::cbm_profile_is_active();
+        // The one-time initializer above resolves native profile mode before
+        // this function chooses the libcbm log floor; run_from_env calls the
+        // same initializer before choosing the Rust tracing floor (#767).
         cbm_sys::cbm_log_init_from_env();
         match log_mode {
             CbmLogMode::Default => {}

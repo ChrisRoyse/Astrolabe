@@ -109,8 +109,18 @@ pub fn run_from_env() -> i32 {
     // INFO.
     let cli_mode = is_cli_invocation(&args);
     let _hook_deadline = hook_mode.then(|| HookDeadline::start(HOOK_AUGMENT_BUDGET_MS));
+    let profile_active = match astrolabe_bridge::initialize_cbm_profile_mode() {
+        Ok(active) => active,
+        Err(error) => {
+            if hook_mode {
+                return 0;
+            }
+            eprintln!("astrolabe: startup failed: {error}");
+            return 1;
+        }
+    };
     if !hook_mode {
-        initialize_tracing(if cli_mode {
+        initialize_tracing(if cli_mode && !profile_active {
             cli_stderr_tracing_level()
         } else {
             LevelFilter::INFO
