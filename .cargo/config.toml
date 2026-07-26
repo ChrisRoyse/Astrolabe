@@ -8,11 +8,13 @@
 # process-local LLD opt-in uses RUSTFLAGS.
 #
 # ─────────────────────────────────────────────────────────────────────────────
-# Opt-in: LLD linker for the x86_64-pc-windows-gnu target (issue #270)
+# Standalone opt-in: LLD linker for x86_64-pc-windows-gnu (issue #270)
 # ─────────────────────────────────────────────────────────────────────────────
-# Status: OPT-IN, NOT the silent default. ld.bfd (the mingw binutils linker)
-# remains the default so no gate/build silently changes linker without an
-# explicit operator choice (issue #270 DoD: "no silent linker downgrade").
+# Status: this block documents the standalone GCC/Cargo choice from #270.
+# The canonical launcher now supplies pinned LLD as part of its mandatory
+# CUDA/MSVC runtime-link contract; it does not read this commented block to do
+# so. Outside that launcher-owned contract, GCC still defaults to ld.bfd and
+# the process-local RUSTFLAGS opt-in below remains explicit.
 #
 # Measured on this workspace (2026-07-13), pure final-link of the libcbm-linked
 # `astrolabe` binary (446 MB dev artifact), isolated with a timing linker

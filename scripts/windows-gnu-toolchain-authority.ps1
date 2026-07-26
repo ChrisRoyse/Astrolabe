@@ -2199,8 +2199,31 @@ function Prepend-PathListEnv {
 function Add-Rustflags {
     param([Parameter(Mandatory)][string[]]$Tokens)
 
-    foreach ($token in $Tokens) {
-        [void](Add-EffectiveCargoRustflag -Token $token)
+    $source = Get-EffectiveCargoRustflagsSource
+    if ($source.Encoded) {
+        $separator = [string][char]0x1f
+        $addition = $Tokens -join $separator
+        if ($source.Value -and $source.Value.Contains($addition)) {
+            return
+        }
+        if ([string]::IsNullOrEmpty($source.Value)) {
+            $env:CARGO_ENCODED_RUSTFLAGS = $addition
+        }
+        else {
+            $env:CARGO_ENCODED_RUSTFLAGS = "$($source.Value)$separator$addition"
+        }
+        return
+    }
+
+    $addition = $Tokens -join ' '
+    if ($source.Value -and $source.Value.Contains($addition)) {
+        return
+    }
+    if ([string]::IsNullOrWhiteSpace($source.Value)) {
+        $env:RUSTFLAGS = $addition
+    }
+    else {
+        $env:RUSTFLAGS = "$($source.Value) $addition"
     }
 }
 
@@ -7589,15 +7612,6 @@ try {
         Write-Output "LLD[ASTRO_PINNED_LLD]: lld-enabled build detected in $lldRustflagsSource; verified gcc resolves $pinnedLld (LLD $ExpectedLldVersion); pinned collect2 ld.lld search via -B$lldPrefix ahead of PATH"
     }
 
-    # #755: GNU ld.bfd inserts the current time into PE/COFF images by default,
-    # so two otherwise-identical clean builds produce different executable bytes.
-    # LLD's MinGW driver accepts the same spelling as an alias for /timestamp:0.
-    # Append after all ambient/launcher linker selection flags so explicit zero is
-    # the effective last setting. Do not use SOURCE_DATE_EPOCH or post-link mutation.
-    $timestampRustflagsSource = Add-EffectiveCargoRustflag `
-        -Token '-Clink-arg=-Wl,--no-insert-timestamp'
-    Write-Output "LINK_REPRODUCIBILITY[ASTRO_PE_TIMESTAMP_ZERO]: appended -Wl,--no-insert-timestamp to effective Cargo source $timestampRustflagsSource; ld.bfd remains default and LLD remains explicit opt-in"
-
     if ($commandPlan.Count -eq 0) {
         # Environment-probe mode: the toolchain env is set up and reported ready, no child runs.
         # The finally still removes the lock and the (unused) per-run TEMP; $sccacheDaemonStarted
@@ -7611,6 +7625,14 @@ try {
         -ToolsRoot $toolsRoot `
         -LlvmBin $llvmBin `
         -WorkspaceTemp $workspaceTemp
+    # #755: GNU ld.bfd inserts the current time into PE/COFF images by default,
+    # so two otherwise-identical clean builds produce different executable bytes.
+    # LLD's MinGW driver accepts the same spelling as an alias for /timestamp:0.
+    # Append after the complete CUDA/MSVC linker contract so explicit zero is the
+    # effective last timestamp setting. Do not use SOURCE_DATE_EPOCH or mutate the PE.
+    $timestampRustflagsSource = Add-EffectiveCargoRustflag `
+        -Token '-Clink-arg=-Wl,--no-insert-timestamp'
+    Write-Output "LINK_REPRODUCIBILITY[ASTRO_PE_TIMESTAMP_ZERO]: appended -Wl,--no-insert-timestamp to effective Cargo source $timestampRustflagsSource after the pinned CUDA/MSVC LLD contract; linker selection unchanged"
     # #190: ensure the sccache server is up and zero its counters so --show-stats in
     # the finally reports THIS run's cold-vs-warm hit rate. The on-disk cache in
     # $sccacheDir persists across runs and the target/ wipe.
