@@ -2245,6 +2245,14 @@ const cbm_gbuf_node_t *cbm_pipeline_resolve_import_node(const cbm_pipeline_ctx_t
         free(norm);
     }
 
+    /* An unresolved ECMAScript ModuleRequest is either runtime/builtin/external
+     * or an unmodeled host mapping. Strategies 1-3 are the only grounded
+     * in-repository resolutions. Never reinterpret a bare `node:path`/package
+     * specifier as a global simple symbol across languages. */
+    if (imp->resolution == CBM_IMPORT_RESOLVE_ES_SOURCE) {
+        return NULL;
+    }
+
     /* Strategy 4: symbol-name fallback.  Derive a representative imported
      * symbol (handling alias / glob / grouped forms) and match it against an
      * in-graph definition of the same simple name in another file
