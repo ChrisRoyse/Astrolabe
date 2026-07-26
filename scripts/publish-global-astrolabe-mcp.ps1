@@ -106,7 +106,9 @@ function File-Sha256 {
     )
     $hasher = [Security.Cryptography.SHA256]::Create()
     try {
-        return ([Convert]::ToHexString($hasher.ComputeHash($stream))).ToLowerInvariant()
+        return (
+            [BitConverter]::ToString($hasher.ComputeHash($stream)) -replace '-', ''
+        ).ToLowerInvariant()
     }
     finally {
         $hasher.Dispose()
