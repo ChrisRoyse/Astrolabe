@@ -99,6 +99,7 @@ pub(crate) fn should_intercept_tool_call(tool_name: &str) -> bool {
             | "delete_project"
             | "index_status"
             | "get_architecture"
+            | "search_graph"
             | "detect_changes"
             | "query_graph"
             | "trace_path"
@@ -337,6 +338,7 @@ pub(crate) fn should_wrap_tool(
             };
             Ok(read_dial(&project)? == MigrationDial::Shadow)
         }
+        "search_graph" => Ok(search_graph_has_astrolabe_knob(args)),
         "detect_changes" => {
             // Only augment grounded risk when the project is shadow-indexed; a
             // non-shadow project has no vault, so it passes straight through with
@@ -657,6 +659,14 @@ const SEARCH_GRAPH_ASTROLABE_ONLY_KEYS: [&str; 4] = [
     "propagated_label",
 ];
 
+/// Keep schema overlay routing and execution on one exact extension-key set so
+/// a newly advertised knob cannot bypass Astrolabe's validator over JSON-RPC.
+fn search_graph_has_astrolabe_knob(args: &Map<String, Value>) -> bool {
+    SEARCH_GRAPH_ASTROLABE_ONLY_KEYS
+        .iter()
+        .any(|key| args.contains_key(*key))
+}
+
 fn search_graph_argument_type_error(
     argument: &str,
     expected_type: &str,
@@ -724,9 +734,7 @@ pub(crate) fn handle_search_graph(
     }
 
     let label_filter = string_arg(args_obj, "propagated_label").map(ToOwned::to_owned);
-    let carries_astrolabe_knob = SEARCH_GRAPH_ASTROLABE_ONLY_KEYS
-        .iter()
-        .any(|key| args_obj.contains_key(*key));
+    let carries_astrolabe_knob = search_graph_has_astrolabe_knob(args_obj);
     if !carries_astrolabe_knob {
         // Pure legacy request — pass the original bytes through unchanged.
         return Ok(runner.handle_tool_raw("search_graph", args_json)?);
