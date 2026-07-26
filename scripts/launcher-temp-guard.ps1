@@ -2368,6 +2368,51 @@ public static class AstroLauncherTempNative
         return true;
     }
 
+    public static string GetExactTreeAuthorizationState(
+        string rootStateToken,
+        string[] entryRecords
+    )
+    {
+        if (entryRecords == null)
+        {
+            throw new ArgumentNullException("entryRecords");
+        }
+
+        string rootState = DecodeCanonicalBackupStateToken(
+            rootStateToken,
+            "exact tree authorization root state"
+        );
+        UTF8Encoding utf8 = new UTF8Encoding(false, true);
+        string projectedRoot = Convert.ToBase64String(
+            utf8.GetBytes(CanonicalStateWithoutLastAccessTime(
+                rootState,
+                "exact tree authorization root state"
+            ))
+        );
+        string[] projectedEntries = new string[entryRecords.Length];
+        for (int index = 0; index < entryRecords.Length; index++)
+        {
+            ExpectedEntry entry = ParseExpectedEntry(entryRecords[index]);
+            string[] parts = entryRecords[index].Split(new char[] { '|' });
+            parts[3] = Convert.ToBase64String(
+                utf8.GetBytes(CanonicalStateWithoutLastAccessTime(
+                    entry.ExactBackupState,
+                    "exact tree authorization entry state"
+                ))
+            );
+            projectedEntries[index] = String.Join("|", parts);
+        }
+        Array.Sort(projectedEntries, StringComparer.Ordinal);
+
+        StringBuilder canonical = new StringBuilder(projectedRoot);
+        foreach (string projectedEntry in projectedEntries)
+        {
+            canonical.Append('\n');
+            canonical.Append(projectedEntry);
+        }
+        return canonical.ToString();
+    }
+
     public static SafeFileHandle ProtectExactLiveDirectoryForCleanup(
         SafeFileHandle liveRoot,
         string expectedPath,

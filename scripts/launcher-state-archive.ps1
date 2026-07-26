@@ -50,14 +50,25 @@ function Get-AstroLauncherTempArchiveSnapshot {
     $inventoryState = 'exact'
     $inventoryError = $null
     $inventorySha256 = $null
+    $observationInventorySha256 = $null
     try {
         [string[]]$entries = @(
             [AstroLauncherTempNative]::CaptureExactTreeEntries($Lease.Handle)
         )
-        $bytes = [Text.UTF8Encoding]::new($false, $true).GetBytes(
+        $observationBytes = [Text.UTF8Encoding]::new($false, $true).GetBytes(
             $rootState + "`n" + ($entries -join "`n")
         )
-        $inventorySha256 = Get-AstroByteSha256 $bytes
+        $observationInventorySha256 = Get-AstroByteSha256 $observationBytes
+        $authorizationState =
+            [AstroLauncherTempNative]::GetExactTreeAuthorizationState(
+                $rootState,
+                $entries
+            )
+        $authorizationBytes =
+            [Text.UTF8Encoding]::new($false, $true).GetBytes(
+                $authorizationState
+            )
+        $inventorySha256 = Get-AstroByteSha256 $authorizationBytes
     }
     catch {
         # Archive correctness is the retained root's same-volume namespace move,
@@ -80,7 +91,12 @@ function Get-AstroLauncherTempArchiveSnapshot {
             $entries.Count
         } else { $null }
         InventorySha256 = $inventorySha256
+        ObservationInventorySha256 = if ($inventoryState -ceq 'exact') {
+            $observationInventorySha256
+        } else { $null }
         Entries = $entries
+        InventoryAuthorizationScope =
+            'exact FILE_ID/path/link-count/short-name/creation-write-change-time/attributes/bytes/security/EA-object/streams; observer-neutral LastAccessTime excluded; raw observation retained separately'
     }
 }
 
@@ -96,6 +112,8 @@ function ConvertTo-AstroLauncherTempArchiveSnapshotRecord {
         inventory_error = $Snapshot.InventoryError
         entry_count = $Snapshot.EntryCount
         inventory_sha256 = $Snapshot.InventorySha256
+        inventory_observation_sha256 = $Snapshot.ObservationInventorySha256
+        inventory_authorization_scope = $Snapshot.InventoryAuthorizationScope
     }
 }
 
@@ -157,12 +175,20 @@ function Compare-AstroLauncherTempArchiveSnapshots {
         inventory_sha256_equal = if ($bothInventoriesExact) {
             $Before.InventorySha256 -ceq $After.InventorySha256
         } else { $null }
+        inventory_observation_sha256_equal = if ($bothInventoriesExact) {
+            $Before.ObservationInventorySha256 -ceq
+                $After.ObservationInventorySha256
+        } else { $null }
         before_inventory_state = $Before.InventoryState
         before_entry_count = $Before.EntryCount
         before_inventory_sha256 = $Before.InventorySha256
+        before_inventory_observation_sha256 =
+            $Before.ObservationInventorySha256
         after_inventory_state = $After.InventoryState
         after_entry_count = $After.EntryCount
         after_inventory_sha256 = $After.InventorySha256
+        after_inventory_observation_sha256 =
+            $After.ObservationInventorySha256
     }
 }
 
