@@ -1789,13 +1789,61 @@ static int try_incremental_or_delete_db(cbm_pipeline_t *p, cbm_file_info_t *file
         free(db_path);
         return CBM_NOT_FOUND;
     }
+
+    /* Provenance admission must be read-only. The ordinary store opener enters
+     * SQLite's write-capable lifecycle and can create/checkpoint WAL state even
+     * when the identity check subsequently refuses. Freeze and verify the source
+     * family first, then compare the incoming root through the returned
+     * read-only query connection. Only an exact match may reach a read-write
+     * open below. */
+    cbm_store_t *identity_store = NULL;
+    cbm_store_verify_result_t verification = {0};
+    cbm_store_verify_status_t verification_status = cbm_store_open_path_project_query_verified(
+        db_path, p->project_name, &identity_store, &verification);
+    if (verification_status != CBM_STORE_VERIFY_OK || !identity_store) {
+        char native_error[32];
+        char sqlite_error[32];
+        (void)snprintf(native_error, sizeof(native_error), "%lu",
+                       (unsigned long)verification.native_error);
+        (void)snprintf(sqlite_error, sizeof(sqlite_error), "%d", verification.sqlite_error);
+        const char *detail = verification.detail[0]
+                                 ? verification.detail
+                                 : "the existing store project provenance could not be verified";
+        cbm_log_error(
+            "pipeline.route_failed", "code", "CBM_PIPELINE_STORE_PROJECT_PROVENANCE_FAILED",
+            "operation",
+            verification.operation[0] ? verification.operation : "verify_existing_store_project",
+            "store_path", db_path, "requested_project", p->project_name, "requested_root",
+            p->repo_path, "native_error", native_error, "sqlite_error", sqlite_error, "db_present",
+            verification.db_present ? "true" : "false", "wal_present",
+            verification.wal_present ? "true" : "false", "shm_present",
+            verification.shm_present ? "true" : "false", "family_frozen",
+            verification.family_frozen ? "true" : "false", "scratch_cleanup_complete",
+            verification.scratch_cleanup_complete ? "true" : "false", "publication_started",
+            "false", "message", detail, "remediation",
+            "preserve the complete store family and explicitly archive, repair, or delete it "
+            "before rebinding");
+        cbm_pipeline_record_fatal_error(
+            p, "CBM_PIPELINE_STORE_PROJECT_PROVENANCE_FAILED",
+            verification.operation[0] ? verification.operation : "verify_existing_store_project",
+            "route", db_path, 0, detail,
+            "preserve the complete store family and explicitly archive, repair, or delete it "
+            "before rebinding");
+        if (identity_store) {
+            cbm_store_close(identity_store);
+        }
+        free(db_path);
+        return CBM_NOT_FOUND;
+    }
+    if (validate_existing_store_project_identity(p, identity_store, db_path) != 0) {
+        cbm_store_close(identity_store);
+        free(db_path);
+        return CBM_NOT_FOUND;
+    }
+    cbm_store_close(identity_store);
+
     cbm_store_t *check_store = cbm_store_open_path(db_path);
     if (check_store && cbm_store_check_integrity(check_store)) {
-        if (validate_existing_store_project_identity(p, check_store, db_path) != 0) {
-            cbm_store_close(check_store);
-            free(db_path);
-            return CBM_NOT_FOUND;
-        }
         cbm_file_hash_t *hashes = NULL;
         int hash_count = 0;
         int hash_rc = cbm_store_get_file_hashes(check_store, p->project_name, &hashes, &hash_count);
