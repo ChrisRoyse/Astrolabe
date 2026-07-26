@@ -101,6 +101,10 @@ static TSNode ps_command_elements(TSNode command) {
     return ts_node_child_by_field_name(command, "command_elements", 16);
 }
 
+static bool ps_argument_separator(TSNode node) {
+    return strcmp(ts_node_type(node), "command_argument_sep") == 0;
+}
+
 static TSNode ps_find_command_parameter(CBMExtractCtx *ctx, TSNode command, const char *parameter,
                                         int *matches) {
     TSNode found = {0};
@@ -161,11 +165,17 @@ static TSNode ps_value_after_parameter(CBMExtractCtx *ctx, TSNode command, TSNod
         if (ts_node_start_byte(child) != ts_node_start_byte(parameter)) {
             continue;
         }
-        if (i + 1 >= count ||
-            strcmp(ts_node_type(ts_node_named_child(elements, i + 1)), "command_parameter") == 0) {
-            return (TSNode){0};
+        for (uint32_t j = i + 1; j < count; j++) {
+            TSNode candidate = ts_node_named_child(elements, j);
+            if (ps_argument_separator(candidate)) {
+                continue;
+            }
+            if (strcmp(ts_node_type(candidate), "command_parameter") == 0) {
+                return (TSNode){0};
+            }
+            return ps_single_value(candidate);
         }
-        return ps_single_value(ts_node_named_child(elements, i + 1));
+        return (TSNode){0};
     }
     return (TSNode){0};
 }

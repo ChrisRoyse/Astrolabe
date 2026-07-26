@@ -1903,13 +1903,44 @@ static TSNode ps_command_elements(TSNode command) {
     return ts_node_child_by_field_name(command, TS_FIELD("command_elements"));
 }
 
+static bool ps_argument_separator(TSNode node) {
+    return strcmp(ts_node_type(node), "command_argument_sep") == 0;
+}
+
+static uint32_t ps_significant_element_count(TSNode elements) {
+    uint32_t count = ts_node_is_null(elements) ? 0 : ts_node_named_child_count(elements);
+    uint32_t significant = 0;
+    for (uint32_t i = 0; i < count; i++) {
+        if (!ps_argument_separator(ts_node_named_child(elements, i))) {
+            significant++;
+        }
+    }
+    return significant;
+}
+
+static TSNode ps_significant_element_at(TSNode elements, uint32_t ordinal) {
+    uint32_t count = ts_node_is_null(elements) ? 0 : ts_node_named_child_count(elements);
+    uint32_t significant = 0;
+    for (uint32_t i = 0; i < count; i++) {
+        TSNode child = ts_node_named_child(elements, i);
+        if (ps_argument_separator(child)) {
+            continue;
+        }
+        if (significant == ordinal) {
+            return child;
+        }
+        significant++;
+    }
+    return (TSNode){0};
+}
+
 static TSNode ps_using_target(CBMExtractCtx *ctx, TSNode command) {
     TSNode elements = ps_command_elements(command);
-    if (ts_node_is_null(elements) || ts_node_named_child_count(elements) != 2) {
+    if (ts_node_is_null(elements) || ps_significant_element_count(elements) != 2) {
         return (TSNode){0};
     }
-    TSNode qualifier = ps_single_command_value(ts_node_named_child(elements, 0));
-    TSNode target = ps_single_command_value(ts_node_named_child(elements, 1));
+    TSNode qualifier = ps_single_command_value(ps_significant_element_at(elements, 0));
+    TSNode target = ps_single_command_value(ps_significant_element_at(elements, 1));
     if (ts_node_is_null(qualifier) || ts_node_is_null(target)) {
         return (TSNode){0};
     }
@@ -1926,11 +1957,11 @@ static TSNode ps_import_module_target(CBMExtractCtx *ctx, TSNode command) {
     if (ts_node_is_null(elements)) {
         return (TSNode){0};
     }
-    uint32_t count = ts_node_named_child_count(elements);
+    uint32_t count = ps_significant_element_count(elements);
     int name_parameter_count = 0;
     TSNode named_target = {0};
     for (uint32_t i = 0; i < count; i++) {
-        TSNode child = ts_node_named_child(elements, i);
+        TSNode child = ps_significant_element_at(elements, i);
         if (strcmp(ts_node_type(child), "command_parameter") != 0) {
             continue;
         }
@@ -1939,19 +1970,24 @@ static TSNode ps_import_module_target(CBMExtractCtx *ctx, TSNode command) {
             continue;
         }
         name_parameter_count++;
-        if (i + 1 < count &&
-            strcmp(ts_node_type(ts_node_named_child(elements, i + 1)), "command_parameter") != 0) {
-            named_target = ps_single_command_value(ts_node_named_child(elements, i + 1));
+        if (i + 1 < count) {
+            TSNode candidate = ps_significant_element_at(elements, i + 1);
+            if (strcmp(ts_node_type(candidate), "command_parameter") != 0) {
+                named_target = ps_single_command_value(candidate);
+            }
         }
     }
     if (name_parameter_count > 0) {
         return name_parameter_count == 1 ? named_target : (TSNode){0};
     }
-    if (count == 0 ||
-        strcmp(ts_node_type(ts_node_named_child(elements, 0)), "command_parameter") == 0) {
+    if (count == 0) {
         return (TSNode){0};
     }
-    return ps_single_command_value(ts_node_named_child(elements, 0));
+    TSNode first = ps_significant_element_at(elements, 0);
+    if (strcmp(ts_node_type(first), "command_parameter") == 0) {
+        return (TSNode){0};
+    }
+    return ps_single_command_value(first);
 }
 
 static bool ps_command_has_dot_operator(CBMExtractCtx *ctx, TSNode command) {
