@@ -920,46 +920,148 @@ function Get-AstroOwnedCargoTargetRoots {
     return @($roots | Select-Object -Unique)
 }
 
+function Invoke-AstroGitRawCapture {
+    param(
+        [Parameter(Mandatory)][string]$GitExe,
+        [Parameter(Mandatory)][string]$Root,
+        [Parameter(Mandatory)][string]$Arguments
+    )
+
+    $rootArgument = [IO.Path]::GetFullPath($Root).TrimEnd('\', '/')
+    if ($rootArgument.Contains('"')) {
+        throw "workspace path contains a quote and cannot be passed to native Git: $rootArgument"
+    }
+    $start = [Diagnostics.ProcessStartInfo]::new()
+    $start.FileName = $GitExe
+    $start.Arguments = "-C `"$rootArgument`" $Arguments"
+    $start.UseShellExecute = $false
+    $start.CreateNoWindow = $true
+    $start.RedirectStandardOutput = $true
+    $start.RedirectStandardError = $true
+    $process = [Diagnostics.Process]::new()
+    $process.StartInfo = $start
+    $stdout = [IO.MemoryStream]::new()
+    try {
+        if (-not $process.Start()) {
+            throw 'native Git process did not start'
+        }
+        $stderrTask = $process.StandardError.ReadToEndAsync()
+        $process.StandardOutput.BaseStream.CopyTo($stdout)
+        $process.WaitForExit()
+        return [pscustomobject]@{
+            ExitCode = $process.ExitCode
+            Bytes = $stdout.ToArray()
+            Stderr = $stderrTask.GetAwaiter().GetResult()
+        }
+    }
+    finally {
+        $stdout.Dispose()
+        $process.Dispose()
+    }
+}
+
+function Get-AstroRootDirectoryEntryEvidence {
+    param([Parameter(Mandatory)][string]$Root)
+
+    $handle = [AstroLauncherTempNative]::OpenExactDirectoryBackupObserver($Root)
+    try {
+        return [pscustomobject]@{
+            FileId = [AstroLauncherTempNative]::GetExactDirectoryIdentity($handle)
+            FinalPath = [AstroLauncherTempNative]::GetExactDirectoryFinalPath($handle)
+            Entries = [string[]][AstroLauncherTempNative]::CaptureExactDirectoryEntryTokens(
+                $handle
+            )
+        }
+    }
+    finally {
+        $handle.Dispose()
+    }
+}
+
 function Get-AstroRepoEvidenceState {
     # #424/#519: the frozen-tree evidence fingerprint for a build root, captured read-only.
     #
     #   HeadSha      -- `git rev-parse HEAD` (the commit the built artifact is attributable to)
-    #   StatusSha256 -- SHA-256 of `git status --porcelain` (tracked AND untracked path states;
-    #                   catches adds/removes/stage changes and new untracked sources)
-    #   DiffSha256   -- SHA-256 of `git diff HEAD` (content-level tracked deltas vs HEAD;
+    #   StatusSha256 -- SHA-256 of the exact NUL-delimited `git status --porcelain=v1` bytes
+    #                   (tracked AND untracked path states; arbitrary names remain unambiguous)
+    #   DiffSha256   -- SHA-256 of the exact `git diff --binary HEAD` bytes (tracked deltas;
     #                   catches byte edits inside already-dirty tracked files)
     #
     # Limitations recorded honestly: a content edit inside an UNTRACKED file whose path set is
     # unchanged is not captured (path-level only for untracked); everything tracked is captured
     # at content level. `git status` may racily refresh the index cache, which is why the
-    # fingerprint hashes command OUTPUT, never raw index bytes.
+    # fingerprint hashes exact command OUTPUT, never raw index bytes. Physical root-directory
+    # inventories bookend Git so a reserved DOS device name can be classified as an NT entry,
+    # a transient namespace entry, or a Git-only observation without normalizing it away (#746).
     param(
         [Parameter(Mandatory)][string]$GitExe,
         [Parameter(Mandatory)][string]$Root
     )
 
+    try {
+        $rootEntriesBefore = Get-AstroRootDirectoryEntryEvidence -Root $Root
+    }
+    catch {
+        throw "GIT_FREEZE[ASTRO_GIT_EVIDENCE_STATE_UNREADABLE]: {code=ASTRO_GIT_EVIDENCE_STATE_UNREADABLE; message=`"could not capture the exact root directory entries before Git evidence at $Root`: $($_.Exception.Message)`"; remediation=`"repair root-directory handle/enumeration access before acquiring evidence`"}"
+    }
     $head = Invoke-NativeCapture -Exe $GitExe -Arguments @("-C", $Root, "rev-parse", "HEAD")
     $headSha = (@($head.Output) -join "`n").Trim()
     if ($head.ExitCode -ne 0 -or $headSha -notmatch '^[0-9a-f]{40}$') {
         throw "GIT_FREEZE[ASTRO_GIT_EVIDENCE_STATE_UNREADABLE]: {code=ASTRO_GIT_EVIDENCE_STATE_UNREADABLE; message=`"could not resolve HEAD for evidence-lease recording at $Root (git exit=$($head.ExitCode): $headSha)`"; remediation=`"run the launcher from a healthy git checkout of the workspace; repair the repository state first`"}"
     }
-    $status = Invoke-NativeCapture -Exe $GitExe -Arguments @("-C", $Root, "status", "--porcelain")
+    $status = Invoke-AstroGitRawCapture `
+        -GitExe $GitExe `
+        -Root $Root `
+        -Arguments '-c core.quotepath=false status --porcelain=v1 -z --untracked-files=normal'
     if ($status.ExitCode -ne 0) {
-        throw "GIT_FREEZE[ASTRO_GIT_EVIDENCE_STATE_UNREADABLE]: {code=ASTRO_GIT_EVIDENCE_STATE_UNREADABLE; message=`"'git status --porcelain' failed for evidence-lease recording at $Root (exit=$($status.ExitCode))`"; remediation=`"run the launcher from a healthy git checkout of the workspace; repair the repository state first`"}"
+        throw "GIT_FREEZE[ASTRO_GIT_EVIDENCE_STATE_UNREADABLE]: {code=ASTRO_GIT_EVIDENCE_STATE_UNREADABLE; message=`"'git status --porcelain=v1 -z' failed for evidence-lease recording at $Root (exit=$($status.ExitCode), stderr=$($status.Stderr))`"; remediation=`"run the launcher from a healthy git checkout of the workspace; repair the repository state first`"}"
     }
-    $diff = Invoke-NativeCapture -Exe $GitExe -Arguments @("-C", $Root, "diff", "HEAD")
-    if ($diff.ExitCode -ne 0) {
-        throw "GIT_FREEZE[ASTRO_GIT_EVIDENCE_STATE_UNREADABLE]: {code=ASTRO_GIT_EVIDENCE_STATE_UNREADABLE; message=`"'git diff HEAD' failed for evidence-lease recording at $Root (exit=$($diff.ExitCode))`"; remediation=`"run the launcher from a healthy git checkout of the workspace; repair the repository state first`"}"
-    }
-    $sha = [System.Security.Cryptography.SHA256]::Create()
     try {
-        $statusSha = ([System.BitConverter]::ToString($sha.ComputeHash([System.Text.Encoding]::UTF8.GetBytes((@($status.Output) -join "`n")))) -replace '-', '').ToLowerInvariant()
-        $diffSha = ([System.BitConverter]::ToString($sha.ComputeHash([System.Text.Encoding]::UTF8.GetBytes((@($diff.Output) -join "`n")))) -replace '-', '').ToLowerInvariant()
+        $statusText = [Text.UTF8Encoding]::new($false, $true).GetString($status.Bytes)
     }
-    finally {
-        $sha.Dispose()
+    catch {
+        throw "GIT_FREEZE[ASTRO_GIT_EVIDENCE_STATE_UNREADABLE]: {code=ASTRO_GIT_EVIDENCE_STATE_UNREADABLE; message=`"Git status emitted bytes that are not strict UTF-8 at $Root`: $($_.Exception.Message)`"; remediation=`"rename the unsupported Windows worktree path before acquiring evidence`"}"
     }
-    return [pscustomobject]@{ HeadSha = $headSha; StatusSha256 = $statusSha; DiffSha256 = $diffSha }
+    if ($status.Bytes.Length -gt 0 -and $status.Bytes[$status.Bytes.Length - 1] -ne 0) {
+        throw "GIT_FREEZE[ASTRO_GIT_EVIDENCE_STATE_UNREADABLE]: {code=ASTRO_GIT_EVIDENCE_STATE_UNREADABLE; message=`"nonempty Git porcelain-v1 -z output lacks its terminal NUL at $Root`"; remediation=`"repair or replace the native Git executable before acquiring evidence`"}"
+    }
+    $statusParts = @($statusText.Split([char]0))
+    $statusRecords = if ($statusText.Length -eq 0) {
+        @()
+    }
+    else {
+        @($statusParts[0..($statusParts.Count - 2)])
+    }
+    $diff = Invoke-AstroGitRawCapture `
+        -GitExe $GitExe `
+        -Root $Root `
+        -Arguments 'diff --binary HEAD'
+    if ($diff.ExitCode -ne 0) {
+        throw "GIT_FREEZE[ASTRO_GIT_EVIDENCE_STATE_UNREADABLE]: {code=ASTRO_GIT_EVIDENCE_STATE_UNREADABLE; message=`"'git diff --binary HEAD' failed for evidence-lease recording at $Root (exit=$($diff.ExitCode), stderr=$($diff.Stderr))`"; remediation=`"run the launcher from a healthy git checkout of the workspace; repair the repository state first`"}"
+    }
+    try {
+        $rootEntriesAfter = Get-AstroRootDirectoryEntryEvidence -Root $Root
+    }
+    catch {
+        throw "GIT_FREEZE[ASTRO_GIT_EVIDENCE_STATE_UNREADABLE]: {code=ASTRO_GIT_EVIDENCE_STATE_UNREADABLE; message=`"could not capture the exact root directory entries after Git evidence at $Root`: $($_.Exception.Message)`"; remediation=`"repair root-directory handle/enumeration access before acquiring evidence`"}"
+    }
+    if ($rootEntriesAfter.FileId -cne $rootEntriesBefore.FileId -or
+        -not [string]::Equals(
+            $rootEntriesAfter.FinalPath,
+            $rootEntriesBefore.FinalPath,
+            [StringComparison]::OrdinalIgnoreCase
+        )) {
+        throw "GIT_FREEZE[ASTRO_GIT_EVIDENCE_STATE_UNREADABLE]: {code=ASTRO_GIT_EVIDENCE_STATE_UNREADABLE; message=`"the evidence root identity/path changed while Git state was captured (file_id=$($rootEntriesBefore.FileId) -> $($rootEntriesAfter.FileId), path=$($rootEntriesBefore.FinalPath) -> $($rootEntriesAfter.FinalPath))`"; remediation=`"restore the canonical checkout identity before acquiring evidence`"}"
+    }
+    return [pscustomobject]@{
+        HeadSha = $headSha
+        StatusSha256 = Get-AstroByteSha256 $status.Bytes
+        StatusBytesBase64 = [Convert]::ToBase64String($status.Bytes)
+        StatusRecords = [string[]]$statusRecords
+        DiffSha256 = Get-AstroByteSha256 $diff.Bytes
+        RootDirectoryBefore = $rootEntriesBefore
+        RootDirectoryAfter = $rootEntriesAfter
+    }
 }
 
 function Get-AstroGitPath {
@@ -7126,7 +7228,8 @@ try {
             $finalizationHash = (Get-Sha256Hex -LiteralPath $finalizationPath).Hash.ToLowerInvariant()
             $preservedTargetRecoveryFinalizationPath = $finalizationPath
 
-            [AstroLauncherTempNative]::DeleteExactTreeContents(
+            [string[]]$readOnlyAttributeTransitions =
+                [AstroLauncherTempNative]::DeleteExactTreeContentsWithAttributeTransitions(
                 $targetHandle,
                 [string[]]$exactBefore.Entries
             )
@@ -7166,6 +7269,8 @@ try {
                     prior_exact_inventory_sha256 = $exactBefore.InventorySha256
                     prior_portable_inventory_sha256 = $portableBefore.InventorySha256
                     prior_entry_count = $portableBefore.EntryCount
+                    read_only_attribute_transitions =
+                        $readOnlyAttributeTransitions
                     empty_exact_inventory_sha256 = $emptyTarget.InventorySha256
                 }
             }
@@ -7608,7 +7713,78 @@ finally {
         if ($repoEvidenceAfter.HeadSha -cne $repoEvidenceBefore.HeadSha -or
             $repoEvidenceAfter.StatusSha256 -cne $repoEvidenceBefore.StatusSha256 -or
             $repoEvidenceAfter.DiffSha256 -cne $repoEvidenceBefore.DiffSha256) {
-            $cleanupErrors += "GIT_FREEZE[ASTRO_LAUNCHER_TREE_MUTATED]: {code=ASTRO_LAUNCHER_TREE_MUTATED; message=`"the build root $root mutated during the evidence lease: head $($repoEvidenceBefore.HeadSha) -> $($repoEvidenceAfter.HeadSha), status_sha256 $($repoEvidenceBefore.StatusSha256) -> $($repoEvidenceAfter.StatusSha256), diff_sha256 $($repoEvidenceBefore.DiffSha256) -> $($repoEvidenceAfter.DiffSha256); this run's artifacts are NOT closure evidence (#424)`"; remediation=`"freeze the checkout for the whole build+FSV window (mutate only in an independent registered worktree), then rebuild`"}"
+            $mutationDiagnosticSummary = 'diagnostic=unavailable'
+            try {
+                if ($null -eq $workspaceTempLease -or
+                    $null -eq $workspaceTempLease.Handle -or
+                    $workspaceTempLease.Handle.IsClosed) {
+                    throw 'the retained generation TEMP lease is unavailable'
+                }
+                $mutationDiagnosticPath = Join-Path `
+                    $workspaceTemp `
+                    'git-freeze-mutation.v1.json'
+                $mutationDiagnostic = [ordered]@{
+                    schema = 'astrolabe.git-freeze-mutation.v1'
+                    recorded_at_utc = [DateTime]::UtcNow.ToString('o')
+                    owner = [ordered]@{
+                        pid = $PID
+                        owner_process_start_utc_ticks = $launcherProcessStartUtcTicks
+                        issue = $drivingIssue
+                        job_object_name = $launcherTreeJobObjectName
+                        launcher_lock_path = $launcherLock
+                        launcher_lock_sha256 = $launcherLockSha256
+                    }
+                    root = $root
+                    before = [ordered]@{
+                        head_sha = $repoEvidenceBefore.HeadSha
+                        status_sha256 = $repoEvidenceBefore.StatusSha256
+                        status_bytes_base64 = $repoEvidenceBefore.StatusBytesBase64
+                        status_records = @($repoEvidenceBefore.StatusRecords)
+                        diff_sha256 = $repoEvidenceBefore.DiffSha256
+                        directory_before_git = $repoEvidenceBefore.RootDirectoryBefore
+                        directory_after_git = $repoEvidenceBefore.RootDirectoryAfter
+                    }
+                    after = [ordered]@{
+                        head_sha = $repoEvidenceAfter.HeadSha
+                        status_sha256 = $repoEvidenceAfter.StatusSha256
+                        status_bytes_base64 = $repoEvidenceAfter.StatusBytesBase64
+                        status_records = @($repoEvidenceAfter.StatusRecords)
+                        diff_sha256 = $repoEvidenceAfter.DiffSha256
+                        directory_before_git = $repoEvidenceAfter.RootDirectoryBefore
+                        directory_after_git = $repoEvidenceAfter.RootDirectoryAfter
+                    }
+                    classification = [ordered]@{
+                        git_status_changed = $repoEvidenceAfter.StatusSha256 -cne
+                            $repoEvidenceBefore.StatusSha256
+                        physical_directory_observation =
+                            'compare UTF-16LE long-name tokens and FILE_ID tokens across the four root inventories'
+                        remediation =
+                            'preserve this generation; identify the exact creating process/operation, remove that producer, and rebuild from an unchanged checkout'
+                    }
+                }
+                $mutationDiagnosticText = $mutationDiagnostic |
+                    ConvertTo-Json -Compress -Depth 16
+                Write-NewDurableUtf8File `
+                    -LiteralPath $mutationDiagnosticPath `
+                    -Text $mutationDiagnosticText
+                $mutationDiagnosticReadback = [IO.File]::ReadAllText(
+                    $mutationDiagnosticPath,
+                    [Text.UTF8Encoding]::new($false, $true)
+                )
+                if ($mutationDiagnosticReadback -cne $mutationDiagnosticText) {
+                    throw 'durable mutation diagnostic bytes differ after readback'
+                }
+                $mutationDiagnosticSha256 = (
+                    Get-Sha256Hex -LiteralPath $mutationDiagnosticPath
+                ).Hash.ToLowerInvariant()
+                $mutationDiagnosticSummary =
+                    "diagnostic=$mutationDiagnosticPath; diagnostic_sha256=$mutationDiagnosticSha256"
+                Write-Output "GIT_FREEZE[ASTRO_LAUNCHER_TREE_MUTATION_DIAGNOSTIC]: path=$mutationDiagnosticPath; sha256=$mutationDiagnosticSha256; before_status_base64=$($repoEvidenceBefore.StatusBytesBase64); after_status_base64=$($repoEvidenceAfter.StatusBytesBase64)"
+            }
+            catch {
+                $cleanupErrors += "GIT_FREEZE[ASTRO_LAUNCHER_TREE_MUTATION_DIAGNOSTIC_FAILED]: {code=ASTRO_LAUNCHER_TREE_MUTATION_DIAGNOSTIC_FAILED; message=`"the mutated checkout was preserved but its create-once diagnostic could not be published: $($_.Exception.Message)`"; remediation=`"preserve the complete launcher generation and inspect its exact TEMP, raw launcher output, and root namespace before tracker-bound recovery`"}"
+            }
+            $cleanupErrors += "GIT_FREEZE[ASTRO_LAUNCHER_TREE_MUTATED]: {code=ASTRO_LAUNCHER_TREE_MUTATED; message=`"the build root $root mutated during the evidence lease: head $($repoEvidenceBefore.HeadSha) -> $($repoEvidenceAfter.HeadSha), status_sha256 $($repoEvidenceBefore.StatusSha256) -> $($repoEvidenceAfter.StatusSha256), diff_sha256 $($repoEvidenceBefore.DiffSha256) -> $($repoEvidenceAfter.DiffSha256); $mutationDiagnosticSummary; this run's artifacts are NOT closure evidence (#424/#746)`"; remediation=`"preserve the complete generation, classify the raw Git bytes against the exact directory-entry FILE_ID evidence, remove the creating operation, then rebuild from an unchanged checkout`"}"
         }
         else {
             Write-Output "GIT_FREEZE[ASTRO_EVIDENCE_LEASE_STABLE]: head=$($repoEvidenceAfter.HeadSha) unchanged; status/diff fingerprints unchanged across the lease window (#424/#519)"
@@ -8166,9 +8342,10 @@ finally {
                         if ($sourceAfterRename.State -cne 'absent') {
                             throw "canonical target source is not absent after exact rename (state=$($sourceAfterRename.State), error=$($sourceAfterRename.Error)): $($record.SourcePath)"
                         }
-                        Write-Output "TARGET[ASTRO_TARGET_TOMBSTONE_BOUND]: ownership=$targetOwnershipId; source=$($record.SourcePath); source_state=absent; tombstone=$($record.TombstonePath); file_id=$($record.Snapshot.RootFileId); inventory_sha256=$($record.Snapshot.InventorySha256); entries=$($record.Snapshot.EntryCount)"
+                        [Console]::Out.WriteLine("TARGET[ASTRO_TARGET_TOMBSTONE_BOUND]: ownership=$targetOwnershipId; source=$($record.SourcePath); source_state=absent; tombstone=$($record.TombstonePath); file_id=$($record.Snapshot.RootFileId); inventory_sha256=$($record.Snapshot.InventorySha256); entries=$($record.Snapshot.EntryCount)")
 
-                        [AstroLauncherTempNative]::DeleteExactTreeContents(
+                        [string[]]$readOnlyAttributeTransitions =
+                            [AstroLauncherTempNative]::DeleteExactTreeContentsWithAttributeTransitions(
                             $record.Lease.Handle,
                             [string[]]$record.Snapshot.Entries
                         )
@@ -8193,7 +8370,7 @@ finally {
                             $sourceTerminal.State -cne 'absent') {
                             throw "exact target cleanup terminal readback failed (source=$($sourceTerminal.State)/$($sourceTerminal.Error), tombstone=$($tombstoneTerminal.State)/$($tombstoneTerminal.Error))"
                         }
-                        Write-Output "TARGET[ASTRO_TARGET_EXACT_DELETE_COMPLETE]: ownership=$targetOwnershipId; source=$($record.SourcePath); source_state=absent; tombstone=$($record.TombstonePath); tombstone_state=absent; prior_file_id=$($record.Snapshot.RootFileId); prior_inventory_sha256=$($record.Snapshot.InventorySha256); prior_entries=$($record.Snapshot.EntryCount)"
+                        [Console]::Out.WriteLine("TARGET[ASTRO_TARGET_EXACT_DELETE_COMPLETE]: ownership=$targetOwnershipId; source=$($record.SourcePath); source_state=absent; tombstone=$($record.TombstonePath); tombstone_state=absent; prior_file_id=$($record.Snapshot.RootFileId); prior_inventory_sha256=$($record.Snapshot.InventorySha256); prior_entries=$($record.Snapshot.EntryCount); read_only_attribute_transitions=$($readOnlyAttributeTransitions.Count)")
                         [ordered]@{
                             source_path = $record.SourcePath
                             source_state = $sourceTerminal.State
@@ -8205,11 +8382,77 @@ finally {
                                 $record.Snapshot.InventorySha256
                             prior_entry_count =
                                 $record.Snapshot.EntryCount
+                            read_only_attribute_transitions =
+                                $readOnlyAttributeTransitions
                             empty_exact_inventory_sha256 =
                                 $emptyTarget.InventorySha256
                         }
                     }
                 )
+                if ($targetTerminalRecords.Count -ne
+                        $targetCleanupRecords.Count) {
+                    throw "target cleanup terminal record cardinality differs from retained roots (records=$($targetTerminalRecords.Count), roots=$($targetCleanupRecords.Count))"
+                }
+                [string[]]$targetTerminalFields = @(
+                    'source_path',
+                    'source_state',
+                    'tombstone_path',
+                    'tombstone_state',
+                    'prior_root_file_id',
+                    'prior_exact_inventory_sha256',
+                    'prior_entry_count',
+                    'read_only_attribute_transitions',
+                    'empty_exact_inventory_sha256'
+                )
+                for ($recordIndex = 0;
+                    $recordIndex -lt $targetTerminalRecords.Count;
+                    $recordIndex++) {
+                    $terminalRecord = $targetTerminalRecords[$recordIndex]
+                    $retainedRecord = $targetCleanupRecords[$recordIndex]
+                    if ($terminalRecord -isnot
+                        [Collections.Specialized.OrderedDictionary]) {
+                        throw "target cleanup terminal root $recordIndex is not one ordered structured record (type=$($terminalRecord.GetType().FullName))"
+                    }
+                    [string[]]$actualFields = @($terminalRecord.Keys)
+                    if ($actualFields.Count -ne $targetTerminalFields.Count) {
+                        throw "target cleanup terminal root $recordIndex has $($actualFields.Count) fields; expected $($targetTerminalFields.Count)"
+                    }
+                    for ($fieldIndex = 0;
+                        $fieldIndex -lt $targetTerminalFields.Count;
+                        $fieldIndex++) {
+                        if ($actualFields[$fieldIndex] -cne
+                            $targetTerminalFields[$fieldIndex]) {
+                            throw "target cleanup terminal root $recordIndex field $fieldIndex is '$($actualFields[$fieldIndex])'; expected '$($targetTerminalFields[$fieldIndex])'"
+                        }
+                    }
+                    if ($terminalRecord.source_path -cne
+                            $retainedRecord.SourcePath -or
+                        $terminalRecord.tombstone_path -cne
+                            $retainedRecord.TombstonePath -or
+                        $terminalRecord.source_state -cne 'absent' -or
+                        $terminalRecord.tombstone_state -cne 'absent' -or
+                        $terminalRecord.prior_root_file_id -cne
+                            $retainedRecord.Snapshot.RootFileId -or
+                        $terminalRecord.prior_exact_inventory_sha256 -cne
+                            $retainedRecord.Snapshot.InventorySha256 -or
+                        $terminalRecord.prior_entry_count -ne
+                            $retainedRecord.Snapshot.EntryCount -or
+                        [string]::IsNullOrWhiteSpace(
+                            $terminalRecord.empty_exact_inventory_sha256
+                        )) {
+                        throw "target cleanup terminal root $recordIndex differs from its exact retained root or terminal absence contract"
+                    }
+                    [string[]]$terminalTransitions = @(
+                        $terminalRecord.read_only_attribute_transitions
+                    )
+                    foreach ($terminalTransition in $terminalTransitions) {
+                        if ($terminalTransition -cnotmatch
+                            '^astrolabe\.temp-readonly-disposition-transition\.v1\|[0-9a-f]{16}:[0-9a-f]{32}\|[0-9a-f]{8}\|[0-9a-f]{8}\|[A-Za-z0-9+/]+={0,2}\|[A-Za-z0-9+/]+={0,2}$') {
+                            throw "target cleanup terminal root $recordIndex contains a malformed read-only attribute transition record"
+                        }
+                    }
+                }
+                [Console]::Out.WriteLine("TARGET[ASTRO_TARGET_CLEANUP_RECORD_SHAPE_VERIFIED]: ownership=$targetOwnershipId; structured_roots=$($targetTerminalRecords.Count); scalar_roots=0")
                 foreach ($ownedTarget in $cleanupTargetRoots) {
                     $targetTerminal =
                         Get-AstroPathEntryState $ownedTarget

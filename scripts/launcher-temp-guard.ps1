@@ -58,6 +58,7 @@ public static class AstroLauncherTempNative
     private const uint FILE_SHARE_DELETE = 0x00000004;
     private const uint OPEN_EXISTING = 3;
     private const uint CREATE_NEW = 1;
+    private const uint FILE_ATTRIBUTE_READONLY = 0x00000001;
     private const uint FILE_ATTRIBUTE_NORMAL = 0x00000080;
     private const uint FILE_ATTRIBUTE_ARCHIVE = 0x00000020;
     private const uint FILE_FLAG_BACKUP_SEMANTICS = 0x02000000;
@@ -163,7 +164,10 @@ public static class AstroLauncherTempNative
     private sealed class ExactDirectoryEntry
     {
         public string Path;
+        public string LongNameToken;
         public string ShortNameToken;
+        public uint Attributes;
+        public string FileIdToken;
     }
 
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
@@ -1973,8 +1977,10 @@ public static class AstroLauncherTempNative
                         );
                     }
                     int nextOffset = Marshal.ReadInt32(buffer, offset);
+                    uint attributes = unchecked((uint)Marshal.ReadInt32(buffer, offset + 56));
                     int nameBytes = Marshal.ReadInt32(buffer, offset + 60);
                     byte shortNameBytes = Marshal.ReadByte(buffer, offset + 68);
+                    ulong fileId = unchecked((ulong)Marshal.ReadInt64(buffer, offset + 96));
                     if (nameBytes < 0 || (nameBytes & 1) != 0 ||
                         nameBytes > DIRECTORY_ENUMERATION_BUFFER_BYTES - offset -
                             FILE_ID_BOTH_DIRECTORY_NAME_OFFSET)
@@ -2010,6 +2016,9 @@ public static class AstroLauncherTempNative
                         ),
                         nameBytes / 2
                     );
+                    string longNameToken = Convert.ToBase64String(
+                        Encoding.Unicode.GetBytes(name)
+                    );
                     if (name != "." && name != "..")
                     {
                         if (String.IsNullOrEmpty(name) || name.IndexOf('\0') >= 0 ||
@@ -2023,7 +2032,10 @@ public static class AstroLauncherTempNative
                         entries.Add(new ExactDirectoryEntry
                         {
                             Path = Path.Combine(directoryPath, name),
-                            ShortNameToken = shortNameToken
+                            LongNameToken = longNameToken,
+                            ShortNameToken = shortNameToken,
+                            Attributes = attributes,
+                            FileIdToken = fileId.ToString("x16", CultureInfo.InvariantCulture)
                         });
                     }
                     if (nextOffset == 0)
@@ -2183,6 +2195,34 @@ public static class AstroLauncherTempNative
             }
         }
         string[] result = records.ToArray();
+        Array.Sort(result, StringComparer.Ordinal);
+        return result;
+    }
+
+    public static string[] CaptureExactDirectoryEntryTokens(SafeFileHandle root)
+    {
+        RequireOrdinaryDirectory(root, "exact directory-entry evidence root");
+        string rootPath = GetFinalPath(root);
+        string rootId = GetIdentity(root);
+        ExactDirectoryEntry[] entries = EnumerateExactDirectoryEntries(
+            root,
+            "exact directory-entry evidence root " + rootPath
+        );
+        if (!String.Equals(GetIdentity(root), rootId, StringComparison.Ordinal) ||
+            !String.Equals(GetFinalPath(root), rootPath, StringComparison.OrdinalIgnoreCase))
+        {
+            throw new InvalidOperationException(
+                "directory-entry evidence root identity/path changed during enumeration"
+            );
+        }
+        string[] result = new string[entries.Length];
+        for (int index = 0; index < entries.Length; index++)
+        {
+            ExactDirectoryEntry entry = entries[index];
+            result[index] = entry.LongNameToken + "|" +
+                entry.Attributes.ToString("x8", CultureInfo.InvariantCulture) + "|" +
+                entry.FileIdToken + "|" + entry.ShortNameToken;
+        }
         Array.Sort(result, StringComparer.Ordinal);
         return result;
     }
@@ -2743,6 +2783,61 @@ public static class AstroLauncherTempNative
             canonical.Substring(fourth + 1);
     }
 
+    private static uint CanonicalBasicAttributes(
+        string canonical,
+        string description
+    )
+    {
+        int first;
+        int second;
+        int third;
+        int fourth;
+        int fifth;
+        ValidateCanonicalBasicInfo(
+            canonical,
+            description,
+            out first,
+            out second,
+            out third,
+            out fourth,
+            out fifth
+        );
+        return UInt32.Parse(
+            canonical.Substring(fourth + 1, fifth - fourth - 1),
+            NumberStyles.None,
+            CultureInfo.InvariantCulture
+        );
+    }
+
+    private static string CanonicalFileAfterAuthorizedAttributeChangeState(
+        string canonical,
+        string description
+    )
+    {
+        int first;
+        int second;
+        int third;
+        int fourth;
+        int fifth;
+        ValidateCanonicalBasicInfo(
+            canonical,
+            description,
+            out first,
+            out second,
+            out third,
+            out fourth,
+            out fifth
+        );
+        // Clearing READONLY advances ChangeTime and necessarily changes the
+        // attribute field. LastAccessTime remains observer-neutral. Preserve
+        // exact creation/write times plus every backup/security/data byte; the
+        // caller independently binds the one allowed before/after attribute
+        // transition and the same FILE_ID/link set.
+        return canonical.Substring(0, first + 1) +
+            canonical.Substring(second + 1, third - second) +
+            canonical.Substring(fifth + 1);
+    }
+
     private static string CanonicalFileAfterAuthorizedUnlinkState(string canonical)
     {
         // Removing one already-authorized hard-link name advances the shared
@@ -2753,6 +2848,158 @@ public static class AstroLauncherTempNative
             canonical,
             "TEMP file backup-state token"
         );
+    }
+
+    private static ExactBackupState ClearReadOnlyForExactDisposition(
+        SafeFileHandle handle,
+        string path,
+        string expectedFileId,
+        BY_HANDLE_FILE_INFORMATION information,
+        ExactBackupState before,
+        out string transitionRecord
+    )
+    {
+        transitionRecord = null;
+        if ((information.FileAttributes & FILE_ATTRIBUTE_READONLY) == 0)
+        {
+            return before;
+        }
+        if ((information.FileAttributes &
+             (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) != 0)
+        {
+            throw new InvalidOperationException(
+                "TEMP_READONLY_TRANSITION_NON_ORDINARY: " + path
+            );
+        }
+        RequireSupportedAttributes(
+            information.FileAttributes,
+            "exact read-only disposition transition " + path
+        );
+        string identityBefore = GetIdentity(handle);
+        if (!String.Equals(identityBefore, expectedFileId, StringComparison.Ordinal))
+        {
+            throw new InvalidOperationException(
+                "TEMP_READONLY_TRANSITION_FILE_ID_MISMATCH: " + path
+            );
+        }
+        FILE_BASIC_INFO basicBefore = ReadBasicInfo(
+            handle,
+            "exact read-only disposition transition before " + path
+        );
+        if (basicBefore.FileAttributes != information.FileAttributes ||
+            CanonicalBasicAttributes(
+                before.Canonical,
+                "exact read-only disposition transition before state"
+            ) != information.FileAttributes)
+        {
+            throw new InvalidOperationException(
+                "TEMP_READONLY_TRANSITION_ATTRIBUTE_MISMATCH: " + path
+            );
+        }
+
+        uint afterAttributes = information.FileAttributes & ~FILE_ATTRIBUTE_READONLY;
+        if (afterAttributes == 0)
+        {
+            afterAttributes = FILE_ATTRIBUTE_NORMAL;
+        }
+        FILE_BASIC_INFO update = new FILE_BASIC_INFO
+        {
+            CreationTime = 0,
+            LastAccessTime = 0,
+            LastWriteTime = 0,
+            ChangeTime = 0,
+            FileAttributes = afterAttributes
+        };
+        int updateSize = Marshal.SizeOf(typeof(FILE_BASIC_INFO));
+        IntPtr updateBuffer = Marshal.AllocHGlobal(updateSize);
+        try
+        {
+            Marshal.StructureToPtr(update, updateBuffer, false);
+            if (!SetFileInformationByHandle(
+                    handle,
+                    FILE_BASIC_INFO_CLASS,
+                    updateBuffer,
+                    (uint)updateSize
+                ))
+            {
+                int nativeError = Marshal.GetLastWin32Error();
+                throw new Win32Exception(
+                    nativeError,
+                    "TEMP_READONLY_TRANSITION_FAILED: exact handle-bound read-only " +
+                    "attribute clear failed for " + path + "; native_error=" +
+                    nativeError.ToString(CultureInfo.InvariantCulture)
+                );
+            }
+        }
+        finally
+        {
+            Marshal.FreeHGlobal(updateBuffer);
+        }
+
+        BY_HANDLE_FILE_INFORMATION informationAfter = ReadInformation(
+            handle,
+            "exact read-only disposition transition after " + path
+        );
+        ExactBackupState after = CaptureBackupState(
+            handle,
+            false,
+            "exact read-only disposition transition after " + path
+        );
+        informationAfter = ReadInformation(
+            handle,
+            "exact read-only disposition transition final readback " + path
+        );
+        if (!String.Equals(GetIdentity(handle), identityBefore, StringComparison.Ordinal) ||
+            informationAfter.NumberOfLinks != information.NumberOfLinks ||
+            informationAfter.FileSizeHigh != information.FileSizeHigh ||
+            informationAfter.FileSizeLow != information.FileSizeLow ||
+            informationAfter.FileAttributes != afterAttributes ||
+            CanonicalBasicAttributes(
+                after.Canonical,
+                "exact read-only disposition transition after state"
+            ) != afterAttributes ||
+            !String.Equals(
+                CanonicalFileAfterAuthorizedAttributeChangeState(
+                    before.Canonical,
+                    "exact read-only disposition transition before projection"
+                ),
+                CanonicalFileAfterAuthorizedAttributeChangeState(
+                    after.Canonical,
+                    "exact read-only disposition transition after projection"
+                ),
+                StringComparison.Ordinal
+            ))
+        {
+            throw new InvalidOperationException(
+                "TEMP_READONLY_TRANSITION_READBACK_MISMATCH: exact FILE_ID, link count, " +
+                "size, attributes, or backup/security/data state changed unexpectedly for " +
+                path
+            );
+        }
+        transitionRecord =
+            "astrolabe.temp-readonly-disposition-transition.v1|" +
+            identityBefore + "|" +
+            information.FileAttributes.ToString("x8", CultureInfo.InvariantCulture) + "|" +
+            afterAttributes.ToString("x8", CultureInfo.InvariantCulture) + "|" +
+            Convert.ToBase64String(
+                new UTF8Encoding(false, true).GetBytes(before.Canonical)
+            ) + "|" +
+            Convert.ToBase64String(
+                new UTF8Encoding(false, true).GetBytes(after.Canonical)
+            );
+        Console.Out.WriteLine(
+            "LAUNCHER_TEMP[ASTRO_LAUNCHER_TEMP_READONLY_ATTRIBUTE_CLEARED]: " +
+            "file_id=" + identityBefore + "; before_attributes=0x" +
+            information.FileAttributes.ToString("x8", CultureInfo.InvariantCulture) +
+            "; after_attributes=0x" +
+            afterAttributes.ToString("x8", CultureInfo.InvariantCulture) +
+            "; before_state_sha256=" +
+            Sha256Hex(new UTF8Encoding(false, true).GetBytes(before.Canonical)) +
+            "; after_state_sha256=" +
+            Sha256Hex(new UTF8Encoding(false, true).GetBytes(after.Canonical)) +
+            "; path=" + path
+        );
+        return after;
     }
 
     private static void SetDisposition(
@@ -2800,7 +3047,7 @@ public static class AstroLauncherTempNative
         }
     }
 
-    public static void DeleteExactTreeContents(
+    public static string[] DeleteExactTreeContentsWithAttributeTransitions(
         SafeFileHandle root,
         string[] expectedEntries
     )
@@ -2866,6 +3113,11 @@ public static class AstroLauncherTempNative
 
         Dictionary<string, uint> removedLinksById =
             new Dictionary<string, uint>(StringComparer.Ordinal);
+        Dictionary<string, uint> readOnlyBeforeAttributesById =
+            new Dictionary<string, uint>(StringComparer.Ordinal);
+        Dictionary<string, uint> readOnlyAfterAttributesById =
+            new Dictionary<string, uint>(StringComparer.Ordinal);
+        List<string> readOnlyAttributeTransitions = new List<string>();
         foreach (ExpectedEntry expected in parsed)
         {
             string path = Path.GetFullPath(Path.Combine(rootPath, expected.RelativePath));
@@ -2962,8 +3214,57 @@ public static class AstroLauncherTempNative
                 }
                 else
                 {
-                    exactStateMatches = removedLinks == 0
-                        ? String.Equals(
+                    uint readOnlyBeforeAttributes;
+                    uint readOnlyAfterAttributes;
+                    bool hasReadOnlyBeforeAttributes =
+                        readOnlyBeforeAttributesById.TryGetValue(
+                            expected.FileId,
+                            out readOnlyBeforeAttributes
+                        );
+                    bool hasReadOnlyAfterAttributes =
+                        readOnlyAfterAttributesById.TryGetValue(
+                            expected.FileId,
+                            out readOnlyAfterAttributes
+                        );
+                    if (hasReadOnlyBeforeAttributes != hasReadOnlyAfterAttributes)
+                    {
+                        throw new InvalidOperationException(
+                            "TEMP_READONLY_TRANSITION_STATE_INCOMPLETE: " + path
+                        );
+                    }
+                    bool priorReadOnlyTransition =
+                        hasReadOnlyBeforeAttributes && hasReadOnlyAfterAttributes;
+                    if (priorReadOnlyTransition)
+                    {
+                        exactStateMatches = removedLinks > 0 &&
+                            CanonicalBasicAttributes(
+                                expected.ExactBackupState,
+                                "retained exact deletion file backup-state"
+                            ) == readOnlyBeforeAttributes &&
+                            CanonicalBasicAttributes(
+                                backupBefore.Canonical,
+                                "current exact deletion file backup-state"
+                            ) == readOnlyAfterAttributes &&
+                            String.Equals(
+                                CanonicalFileAfterAuthorizedAttributeChangeState(
+                                    backupBefore.Canonical,
+                                    "current exact deletion file after read-only transition"
+                                ),
+                                CanonicalFileAfterAuthorizedAttributeChangeState(
+                                    expected.ExactBackupState,
+                                    "retained exact deletion file before read-only transition"
+                                ),
+                                StringComparison.Ordinal
+                            ) && String.Equals(
+                                GetExactShortNameToken(path),
+                                expected.ShortNameToken,
+                                StringComparison.Ordinal
+                            );
+                    }
+                    else
+                    {
+                        exactStateMatches = removedLinks == 0
+                            ? String.Equals(
                             CanonicalStateWithoutLastAccessTime(
                                 backupBefore.Canonical,
                                 "current exact deletion file backup-state"
@@ -2987,12 +3288,53 @@ public static class AstroLauncherTempNative
                             expected.ShortNameToken,
                             StringComparison.Ordinal
                         );
+                    }
                 }
                 if (!exactStateMatches)
                 {
                     throw new InvalidOperationException(
                         "TEMP entry backup/basic/security state changed before exact deletion: " +
                         path
+                    );
+                }
+                if (!expected.IsDirectory &&
+                    (information.FileAttributes & FILE_ATTRIBUTE_READONLY) != 0)
+                {
+                    uint beforeAttributes = information.FileAttributes;
+                    string transitionRecord;
+                    backupBefore = ClearReadOnlyForExactDisposition(
+                        handle,
+                        path,
+                        expected.FileId,
+                        information,
+                        backupBefore,
+                        out transitionRecord
+                    );
+                    if (String.IsNullOrEmpty(transitionRecord))
+                    {
+                        throw new InvalidOperationException(
+                            "TEMP_READONLY_TRANSITION_RECORD_MISSING: " + path
+                        );
+                    }
+                    readOnlyAttributeTransitions.Add(transitionRecord);
+                    information = ReadInformation(
+                        handle,
+                        "exact TEMP deletion entry after read-only transition"
+                    );
+                    if (readOnlyBeforeAttributesById.ContainsKey(expected.FileId) ||
+                        readOnlyAfterAttributesById.ContainsKey(expected.FileId))
+                    {
+                        throw new InvalidOperationException(
+                            "TEMP_READONLY_TRANSITION_DUPLICATE: " + path
+                        );
+                    }
+                    readOnlyBeforeAttributesById.Add(
+                        expected.FileId,
+                        beforeAttributes
+                    );
+                    readOnlyAfterAttributesById.Add(
+                        expected.FileId,
+                        information.FileAttributes
                     );
                 }
                 // FileDispositionInfo=TRUE is the final handle operation.  The
@@ -3018,6 +3360,15 @@ public static class AstroLauncherTempNative
                 String.Join(",", remaining)
             );
         }
+        return readOnlyAttributeTransitions.ToArray();
+    }
+
+    public static void DeleteExactTreeContents(
+        SafeFileHandle root,
+        string[] expectedEntries
+    )
+    {
+        DeleteExactTreeContentsWithAttributeTransitions(root, expectedEntries);
     }
 
     public static void RenameExactDirectoryNoReplace(
