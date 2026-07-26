@@ -12,9 +12,10 @@
     rejection, and builds both candidates before changing either Source of Truth. Candidate and
     before-image bytes plus intent/candidate/completion or fault records remain in an append-only
     activation transaction. Each config is replaced with metadata-preserving ReplaceFileW,
-    explicitly flushed, and read back. Any partial failure attempts exact before-image rollback and reports the
-    independently read physical end state; it never reports global activation unless both files
-    agree on the exact immutable executable.
+    explicitly flushed, and read back. Any partial failure attempts exact before-image rollback
+    only while the live path is still the exact activation-owned replacement; concurrent state
+    is preserved and reported. It never reports global activation unless both files agree on the
+    exact immutable executable.
 
 .NOTES
     Manual FSV/activation tooling for #773. This is not a fallback installer or a test harness.
@@ -782,9 +783,10 @@ function Restore-ConfigBeforeImage {
     }
 }
 
-function Restore-ConfigIfChanged {
+function Restore-ConfigIfOwned {
     param(
         [Parameter(Mandatory)]$Before,
+        [Parameter(Mandatory)]$OwnedCommitted,
         [Parameter(Mandatory)][string]$ReplacementBackupPath,
         [Parameter(Mandatory)][string]$TransactionPath,
         [Parameter(Mandatory)][string]$Role
@@ -802,19 +804,41 @@ function Restore-ConfigIfChanged {
                 failed_after_sha256 = $null
             }
         }
+
+        if (-not (Test-SnapshotEquals $OwnedCommitted $current)) {
+            return [ordered]@{
+                role = $Role
+                verdict = 'concurrent_state_preserved'
+                sha256 = $current.sha256
+                file_id = $current.file_id
+                owned_sha256 = $OwnedCommitted.sha256
+                owned_file_id = $OwnedCommitted.file_id
+                failed_after_path = $null
+                failed_after_sha256 = $null
+            }
+        }
     }
     catch {
-        # An absent/unevaluable target is handled by the exact backup restore
-        # below; its own diagnostic remains authoritative if recovery fails.
+        return [ordered]@{
+            role = $Role
+            verdict = 'concurrent_state_unevaluable_preserved'
+            error = $_.Exception.Message
+            owned_sha256 = $OwnedCommitted.sha256
+            owned_file_id = $OwnedCommitted.file_id
+            failed_after_path = $null
+            failed_after_sha256 = $null
+        }
     }
 
     $restored = Restore-ConfigBeforeImage `
         $Before $ReplacementBackupPath $TransactionPath $Role
     return [ordered]@{
         role = $Role
-        verdict = 'restored'
+        verdict = 'restored_owned_candidate'
         sha256 = $restored.snapshot.sha256
         file_id = $restored.snapshot.file_id
+        owned_sha256 = $OwnedCommitted.sha256
+        owned_file_id = $OwnedCommitted.file_id
         failed_after_path = $restored.failed_after_path
         failed_after_sha256 = $restored.failed_after_sha256
     }
@@ -824,6 +848,7 @@ function Restore-ObservedReplacementBackup {
     param(
         [Parameter(Mandatory)]$Before,
         [Parameter(Mandatory)]$ObservedBackup,
+        [Parameter(Mandatory)]$OwnedCommitted,
         [Parameter(Mandatory)][string]$ReplacementBackupPath,
         [Parameter(Mandatory)][string]$TransactionPath,
         [Parameter(Mandatory)][string]$Role
@@ -838,16 +863,16 @@ function Restore-ObservedReplacementBackup {
         file_id = $ObservedBackup.file_id
         last_write_utc = $ObservedBackup.last_write_utc
     }
-    $restored = Restore-ConfigBeforeImage `
-        $observedAtConfigPath $ReplacementBackupPath $TransactionPath $Role
-    return [ordered]@{
-        role = $Role
-        verdict = 'restored_observed_concurrent_state'
-        sha256 = $restored.snapshot.sha256
-        file_id = $restored.snapshot.file_id
-        failed_after_path = $restored.failed_after_path
-        failed_after_sha256 = $restored.failed_after_sha256
+    $outcome = Restore-ConfigIfOwned `
+        $observedAtConfigPath $OwnedCommitted $ReplacementBackupPath `
+        $TransactionPath $Role
+    if ($outcome.verdict -ceq 'restored_owned_candidate') {
+        $outcome.verdict = 'restored_observed_concurrent_state'
     }
+    elseif ($outcome.verdict -ceq 'unchanged') {
+        $outcome.verdict = 'observed_concurrent_state_already_present'
+    }
+    return $outcome
 }
 
 function Assert-NoIncompleteActivationTransaction {
@@ -1138,7 +1163,7 @@ try {
             }
         }
         commit_protocol =
-            'candidate-both-first; exact precommit drift read; ReplaceFileW metadata-preserving commit with original-file backup; explicit file flush/readback; reverse exact backup rollback on any partial failure'
+            'candidate-both-first; exact precommit drift read; ReplaceFileW metadata-preserving commit with original-file backup; explicit file flush/readback; ownership-checked reverse replacement that never overwrites concurrent state'
     }
     Write-NewDurableJson (Join-Path $transactionPath 'intent.json') $intent
 
@@ -1219,7 +1244,8 @@ try {
         $codexReplacementBackupPath 'Codex replacement backup'
     if (-not (Test-SnapshotEquals $codexBefore $codexBackup)) {
         $outcome = Restore-ObservedReplacementBackup `
-            $codexBefore $codexBackup $codexReplacementBackupPath `
+            $codexBefore $codexBackup $codexCommitStage `
+            $codexReplacementBackupPath `
             $transactionPath 'codex'
         $rollback.Add($outcome)
         $codexCommitAttempted = $false
@@ -1259,7 +1285,8 @@ try {
         $claudeReplacementBackupPath 'Claude replacement backup'
     if (-not (Test-SnapshotEquals $claudeBefore $claudeBackup)) {
         $outcome = Restore-ObservedReplacementBackup `
-            $claudeBefore $claudeBackup $claudeReplacementBackupPath `
+            $claudeBefore $claudeBackup $claudeCommitStage `
+            $claudeReplacementBackupPath `
             $transactionPath 'claude'
         $outcome.role = 'claude_code'
         $rollback.Add($outcome)
@@ -1397,8 +1424,9 @@ catch {
         if (-not $completionPublished) {
             if ($claudeCommitAttempted -and $null -ne $claudeBefore) {
                 try {
-                    $outcome = Restore-ConfigIfChanged `
-                        $claudeBefore $claudeReplacementBackupPath `
+                    $outcome = Restore-ConfigIfOwned `
+                        $claudeBefore $claudeCommitStage `
+                        $claudeReplacementBackupPath `
                         $transactionPath 'claude'
                     $outcome.role = 'claude_code'
                     $rollback.Add($outcome)
@@ -1414,8 +1442,9 @@ catch {
             }
             if ($codexCommitAttempted -and $null -ne $codexBefore) {
                 try {
-                    $outcome = Restore-ConfigIfChanged `
-                        $codexBefore $codexReplacementBackupPath `
+                    $outcome = Restore-ConfigIfOwned `
+                        $codexBefore $codexCommitStage `
+                        $codexReplacementBackupPath `
                         $transactionPath 'codex'
                     $rollback.Add($outcome)
                     $codexCommitted = $false
