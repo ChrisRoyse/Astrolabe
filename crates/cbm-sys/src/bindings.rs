@@ -3681,6 +3681,9 @@ unsafe extern "C" {
     pub fn cbm_index_set_worker_role(is_worker: bool, response_out: *const ::std::os::raw::c_char);
 }
 unsafe extern "C" {
+    pub fn cbm_profile_init();
+}
+unsafe extern "C" {
     pub fn cbm_index_supervisor_mark_host();
 }
 unsafe extern "C" {

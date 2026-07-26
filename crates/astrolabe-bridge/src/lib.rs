@@ -539,6 +539,12 @@ fn initialize_cbm_host_process_with_log_mode(
                 );
             }
         }
+        // The fused Rust host replaces cbm/main.c, so it must run the same
+        // process-global profile initializer before the supervisor can decide
+        // whether a successful worker log is an operator-requested deliverable.
+        // Let libcbm interpret its own inherited environment instead of
+        // duplicating the CBM_PROFILE contract in Rust (#767).
+        cbm_sys::cbm_profile_init();
         cbm_sys::cbm_index_supervisor_mark_host();
         cbm_sys::cbm_cli_set_version(c"dev".as_ptr());
 
