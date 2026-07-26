@@ -4736,12 +4736,7 @@ void cbm_store_search_free(cbm_search_output_t *out) {
     }
     for (int i = 0; i < out->count; i++) {
         cbm_search_result_t *r = &out->results[i];
-        safe_str_free(&r->node.project);
-        safe_str_free(&r->node.label);
-        safe_str_free(&r->node.name);
-        safe_str_free(&r->node.qualified_name);
-        safe_str_free(&r->node.file_path);
-        safe_str_free(&r->node.properties_json);
+        cbm_node_free_fields(&r->node);
         for (int j = 0; j < r->connected_count; j++) {
             safe_str_free(&r->connected_names[j]);
         }
@@ -5003,22 +4998,11 @@ void cbm_store_traverse_free(cbm_traverse_result_t *out) {
         return;
     }
     /* Free root */
-    safe_str_free(&out->root.project);
-    safe_str_free(&out->root.label);
-    safe_str_free(&out->root.name);
-    safe_str_free(&out->root.qualified_name);
-    safe_str_free(&out->root.file_path);
-    safe_str_free(&out->root.properties_json);
+    cbm_node_free_fields(&out->root);
 
     /* Free visited */
     for (int i = 0; i < out->visited_count; i++) {
-        cbm_node_hop_t *h = &out->visited[i];
-        safe_str_free(&h->node.project);
-        safe_str_free(&h->node.label);
-        safe_str_free(&h->node.name);
-        safe_str_free(&h->node.qualified_name);
-        safe_str_free(&h->node.file_path);
-        safe_str_free(&h->node.properties_json);
+        cbm_node_free_fields(&out->visited[i].node);
     }
     free(out->visited);
 

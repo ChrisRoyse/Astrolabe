@@ -6886,15 +6886,7 @@ static void free_search_results(search_result_t *results, int count) {
 
 /* Free a file_nodes array returned from cbm_store_find_nodes_by_file. */
 static void free_file_nodes(cbm_node_t *nodes, int count) {
-    for (int j = 0; j < count; j++) {
-        safe_str_free(&nodes[j].project);
-        safe_str_free(&nodes[j].label);
-        safe_str_free(&nodes[j].name);
-        safe_str_free(&nodes[j].qualified_name);
-        safe_str_free(&nodes[j].file_path);
-        safe_str_free(&nodes[j].properties_json);
-    }
-    free(nodes);
+    cbm_store_free_nodes(nodes, count);
 }
 
 /* Classify all grep matches file-by-file into search results and raw hits. */
