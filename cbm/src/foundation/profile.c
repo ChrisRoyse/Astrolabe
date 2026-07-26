@@ -26,6 +26,10 @@ void cbm_profile_init(void) {
     }
 }
 
+bool cbm_profile_is_active(void) {
+    return cbm_profile_active;
+}
+
 void cbm_profile_enable(void) {
     cbm_profile_active = true;
 }

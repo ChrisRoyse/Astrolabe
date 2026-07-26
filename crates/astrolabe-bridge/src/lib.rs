@@ -518,6 +518,12 @@ fn initialize_cbm_host_process_with_log_mode(
     // intended for main() startup. The optional binary path C string is live for
     // the duration of the call; CBM copies it internally.
     unsafe {
+        // The fused Rust host replaces cbm/main.c, so it must initialize the
+        // native profile mode before choosing a log floor. Profiling emits INFO
+        // records; preserving the ordinary CLI WARN floor while profiling is
+        // active would retain an empty worker log and hide its exact path (#767).
+        cbm_sys::cbm_profile_init();
+        let profile_active = cbm_sys::cbm_profile_is_active();
         cbm_sys::cbm_log_init_from_env();
         match log_mode {
             CbmLogMode::Default => {}
@@ -527,9 +533,14 @@ fn initialize_cbm_host_process_with_log_mode(
                 // so its INFO `mem.init`/`vmem.init` lines are dropped at the
                 // source rather than emitted. Warn/error still flow to stderr via
                 // the tracing sink installed by route_cbm_logs_to_tracing().
-                let floor = c_int::try_from(astrolabe_domain::knobs::cli_stderr_log_level_floor())
-                    .unwrap_or(cbm_sys::CBMLogLevel_CBM_LOG_WARN);
-                cbm_sys::cbm_log_set_level(floor);
+                // Explicit profiling requests native INFO diagnostics, so it
+                // keeps the level selected by cbm_log_init_from_env.
+                if !profile_active {
+                    let floor =
+                        c_int::try_from(astrolabe_domain::knobs::cli_stderr_log_level_floor())
+                            .unwrap_or(cbm_sys::CBMLogLevel_CBM_LOG_WARN);
+                    cbm_sys::cbm_log_set_level(floor);
+                }
             }
             CbmLogMode::Silent => {
                 cbm_sys::cbm_log_set_level(cbm_sys::CBMLogLevel_CBM_LOG_NONE);
@@ -539,12 +550,6 @@ fn initialize_cbm_host_process_with_log_mode(
                 );
             }
         }
-        // The fused Rust host replaces cbm/main.c, so it must run the same
-        // process-global profile initializer before the supervisor can decide
-        // whether a successful worker log is an operator-requested deliverable.
-        // Let libcbm interpret its own inherited environment instead of
-        // duplicating the CBM_PROFILE contract in Rust (#767).
-        cbm_sys::cbm_profile_init();
         cbm_sys::cbm_index_supervisor_mark_host();
         cbm_sys::cbm_cli_set_version(c"dev".as_ptr());
 

@@ -3684,6 +3684,9 @@ unsafe extern "C" {
     pub fn cbm_profile_init();
 }
 unsafe extern "C" {
+    pub fn cbm_profile_is_active() -> bool;
+}
+unsafe extern "C" {
     pub fn cbm_index_supervisor_mark_host();
 }
 unsafe extern "C" {

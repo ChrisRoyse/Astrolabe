@@ -24,6 +24,9 @@ extern bool cbm_profile_active;
 /* Initialize profiling — reads CBM_PROFILE env var. Call once at startup. */
 void cbm_profile_init(void);
 
+/* Read the initialized process-global profile mode. */
+bool cbm_profile_is_active(void);
+
 /* Force-enable profiling at runtime (used by CLI --profile flag). */
 void cbm_profile_enable(void);
 
