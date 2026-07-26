@@ -2483,9 +2483,9 @@ static char *bm25_error_result(const char *code, const char *operation, const ch
 /* Serialize an already-snapshotted store failure. The caller captures the
  * connection diagnostic before cleanup or any later SQLite call can replace
  * it, then destroys every partial result before returning this tool error. */
-static char *search_store_error_result(const char *code, const char *operation,
-                                       const char *message, const char *remediation,
-                                       int sqlite_error, const char *detail) {
+static char *search_store_error_result(const char *code, const char *operation, const char *message,
+                                       const char *remediation, int sqlite_error,
+                                       const char *detail) {
     char sqlite_error_text[CBM_SZ_32];
     snprintf(sqlite_error_text, sizeof(sqlite_error_text), "%d", sqlite_error);
     cbm_log_error("mcp.search_graph_store_failed", "code", code, "operation", operation,
@@ -3212,8 +3212,7 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
         }
     }
 
-    semantic_query_outcome_t semantic =
-        run_semantic_query(doc, root, args, store, project, limit);
+    semantic_query_outcome_t semantic = run_semantic_query(doc, root, args, store, project, limit);
 
     if (semantic.type_error || semantic.store_error) {
         for (int pi = 0; pi < props_doc_count; pi++) {
