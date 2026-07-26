@@ -144,6 +144,63 @@ function Read-ConfigSnapshot {
     }
 }
 
+function Open-ConfigVerdictLease {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][string]$Description
+    )
+
+    Assert-OrdinaryFile $Path $Description
+    $stream = [IO.File]::Open(
+        (ConvertTo-AstroExtendedLengthPath $Path),
+        [IO.FileMode]::Open,
+        [IO.FileAccess]::Read,
+        [IO.FileShare]::Read
+    )
+    try {
+        $memory = [IO.MemoryStream]::new()
+        try {
+            $stream.CopyTo($memory)
+            $bytes = $memory.ToArray()
+        }
+        finally { $memory.Dispose() }
+        $identity = [AstroLauncherLockNative]::GetFileIdentity($stream.SafeFileHandle)
+        try {
+            $text = [Text.UTF8Encoding]::new($false, $true).GetString($bytes)
+        }
+        catch {
+            Fail-AstroGlobalActivation 'ASTRO_GLOBAL_ACTIVATION_UTF8_INVALID' `
+                "$Description is not strict UTF-8: $Path ($($_.Exception.Message))" `
+                'repair the exact configuration encoding without discarding any setting, then retry'
+        }
+        return [pscustomobject]@{
+            stream = $stream
+            acquired_at_utc = [DateTime]::UtcNow.ToString('o')
+            snapshot = [pscustomobject]@{
+                path = [IO.Path]::GetFullPath($Path)
+                bytes_value = $bytes
+                text = $text
+                bytes = [uint64]$bytes.LongLength
+                sha256 = Get-AstroByteSha256 $bytes
+                file_id = $identity
+                last_write_utc = [IO.File]::GetLastWriteTimeUtc($Path).ToString('o')
+            }
+        }
+    }
+    catch {
+        $stream.Dispose()
+        throw
+    }
+}
+
+function Close-ConfigVerdictLease {
+    param([AllowNull()]$Lease)
+
+    if ($null -ne $Lease -and $null -ne $Lease.stream) {
+        $Lease.stream.Dispose()
+    }
+}
+
 function Write-NewDurableBytes {
     param(
         [Parameter(Mandatory)][string]$Path,
@@ -179,7 +236,7 @@ function Flush-ExistingDurableFile {
     catch {
         Fail-AstroGlobalActivation 'ASTRO_GLOBAL_ACTIVATION_FLUSH_FAILED' `
             "$Description could not be flushed after replacement: $($_.Exception.Message)" `
-            'preserve the transaction; exact rollback will restore the before image'
+            'preserve the transaction; ownership-checked rollback will restore only activation-owned bytes'
     }
     finally { $stream.Dispose() }
 }
@@ -931,6 +988,8 @@ $codexCommitAttempted = $false
 $claudeCommitAttempted = $false
 $codexReplacementBackupPath = $null
 $claudeReplacementBackupPath = $null
+$codexVerdictLease = $null
+$claudeVerdictLease = $null
 $completionPath = $null
 $completionSha256 = $null
 $completionPublished = $false
@@ -1163,7 +1222,7 @@ try {
             }
         }
         commit_protocol =
-            'candidate-both-first; exact precommit drift read; ReplaceFileW metadata-preserving commit with original-file backup; explicit file flush/readback; ownership-checked reverse replacement that never overwrites concurrent state'
+            'candidate-both-first; exact precommit drift read; ReplaceFileW metadata-preserving commit with original-file backup; explicit file flush/readback; ownership-checked reverse replacement; read-share-only leases deny write/delete on both exact configs through durable completion'
     }
     Write-NewDurableJson (Join-Path $transactionPath 'intent.json') $intent
 
@@ -1270,8 +1329,14 @@ try {
         [bool]$codexLive.value['enabled'] -ne $true) {
         Fail-AstroGlobalActivation 'ASTRO_GLOBAL_ACTIVATION_CODEX_SEMANTIC_MISMATCH' `
             "persisted Codex config does not resolve the exact artifact: $($codexLive.output)" `
-            'preserve the transaction; exact rollback will restore the before image'
+            'preserve the transaction; ownership-checked rollback will restore only activation-owned bytes'
     }
+    $codexVerdictLease = Open-ConfigVerdictLease `
+        $CodexConfigPath 'Codex activation verdict lease'
+    Assert-SnapshotEquals $codexCommitStage $codexVerdictLease.snapshot `
+        'ASTRO_GLOBAL_ACTIVATION_CODEX_VERDICT_DRIFT' `
+        'Codex config before terminal verdict'
+    $codexAfter = $codexVerdictLease.snapshot
 
     $claudeCommitAttempted = $true
     [AstroLauncherLockNative]::ReplaceFilePreserveMetadata(
@@ -1309,8 +1374,14 @@ try {
         $claudeLive.command -cne $artifactPath) {
         Fail-AstroGlobalActivation 'ASTRO_GLOBAL_ACTIVATION_CLAUDE_SEMANTIC_MISMATCH' `
             'persisted Claude config does not preserve unrelated state plus the exact stdio target' `
-            'preserve the transaction; exact rollback will restore both before images'
+            'preserve the transaction; ownership-checked rollback will restore only activation-owned bytes'
     }
+    $claudeVerdictLease = Open-ConfigVerdictLease `
+        $ClaudeConfigPath 'Claude activation verdict lease'
+    Assert-SnapshotEquals $claudeCommitStage $claudeVerdictLease.snapshot `
+        'ASTRO_GLOBAL_ACTIVATION_CLAUDE_VERDICT_DRIFT' `
+        'Claude config before terminal verdict'
+    $claudeAfter = $claudeVerdictLease.snapshot
 
     $completion = [ordered]@{
         schema = 'astrolabe.global-mcp-activation.v1'
@@ -1338,6 +1409,8 @@ try {
             after_file_id = $codexAfter.file_id
             semantic_readback = $codexLive.value
             candidate_evidence_sha256 = Get-FileSha256 $codexCandidatePath
+            verdict_lease_acquired_at_utc = $codexVerdictLease.acquired_at_utc
+            verdict_lease_policy = 'read-share-only; write-and-delete-denied-through-completion'
             commit_stage_absent =
                 -not (Test-AstroPathLongPath -LiteralPath $codexCommitStagePath)
         }
@@ -1355,6 +1428,8 @@ try {
             args_count = $claudeLive.args_count
             env_count = $claudeLive.env_count
             candidate_evidence_sha256 = Get-FileSha256 $claudeCandidatePath
+            verdict_lease_acquired_at_utc = $claudeVerdictLease.acquired_at_utc
+            verdict_lease_policy = 'read-share-only; write-and-delete-denied-through-completion'
             commit_stage_absent =
                 -not (Test-AstroPathLongPath -LiteralPath $claudeCommitStagePath)
         }
@@ -1420,6 +1495,10 @@ try {
 }
 catch {
     $original = $_.Exception
+    Close-ConfigVerdictLease $claudeVerdictLease
+    $claudeVerdictLease = $null
+    Close-ConfigVerdictLease $codexVerdictLease
+    $codexVerdictLease = $null
     if ($null -ne $transactionPath) {
         if (-not $completionPublished) {
             if ($claudeCommitAttempted -and $null -ne $claudeBefore) {
@@ -1539,6 +1618,8 @@ catch {
     exit 1
 }
 finally {
+    Close-ConfigVerdictLease $claudeVerdictLease
+    Close-ConfigVerdictLease $codexVerdictLease
     if ($mutexHeld -and $null -ne $activationMutex) {
         try { $activationMutex.ReleaseMutex() } catch {}
     }
