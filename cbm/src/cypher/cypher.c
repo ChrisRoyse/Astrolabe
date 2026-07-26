@@ -2319,14 +2319,32 @@ static cbm_node_t *binding_get(binding_t *b, const char *var) {
     return NULL;
 }
 
-/* Deep copy a node: heap-dup all string fields so the binding owns them */
-static void node_deep_copy(cbm_node_t *dst, const cbm_node_t *src) {
+/* Move every cbm_node_t field as one ownership transaction.  Keeping this
+ * operation whole is essential: the store node grew exact-source owners after
+ * Cypher's original hand-written transfer, and leaving even one pointer in the
+ * source makes its authoritative destructor free the destination's storage. */
+static void node_move(cbm_node_t *dst, cbm_node_t *src) {
     *dst = *src;
+    memset(src, 0, sizeof(*src));
+}
+
+/* Build the independent node projection a binding actually consumes.  Bindings
+ * can multiply one scanned node many times, so copying its exact-source BLOB
+ * would make an ordinary graph query scale with source size.  Start from a
+ * zeroed node instead of shallow-copying the complete store node: this keeps
+ * every omitted owner NULL and prevents a binding from retaining aliases into
+ * the separately destroyed scan result. */
+static void node_binding_copy(cbm_node_t *dst, const cbm_node_t *src) {
+    memset(dst, 0, sizeof(*dst));
+    dst->id = src->id;
     dst->project = heap_strdup(src->project);
     dst->label = heap_strdup(src->label);
     dst->name = heap_strdup(src->name);
+    dst->atom_id = heap_strdup(src->atom_id);
     dst->qualified_name = heap_strdup(src->qualified_name);
     dst->file_path = heap_strdup(src->file_path);
+    dst->start_line = src->start_line;
+    dst->end_line = src->end_line;
     dst->properties_json = heap_strdup(src->properties_json);
 }
 
@@ -2334,12 +2352,7 @@ static void node_fields_free(cbm_node_t *n) {
     if (!n) {
         return;
     }
-    safe_str_free(&n->project);
-    safe_str_free(&n->label);
-    safe_str_free(&n->name);
-    safe_str_free(&n->qualified_name);
-    safe_str_free(&n->file_path);
-    safe_str_free(&n->properties_json);
+    cbm_node_free_fields(n);
 }
 
 /* Deep copy an edge (binding owns the strings) */
@@ -2389,7 +2402,7 @@ static void binding_copy(binding_t *dst, const binding_t *src) {
     dst->var_count = src->var_count;
     for (int i = 0; i < src->var_count; i++) {
         dst->var_names[i] = src->var_names[i]; /* AST-owned, not freed */
-        node_deep_copy(&dst->var_nodes[i], &src->var_nodes[i]);
+        node_binding_copy(&dst->var_nodes[i], &src->var_nodes[i]);
     }
     dst->edge_var_count = src->edge_var_count;
     for (int i = 0; i < src->edge_var_count; i++) {
@@ -2405,7 +2418,7 @@ static void binding_set(binding_t *b, const char *var, const cbm_node_t *node) {
     for (int i = 0; i < b->var_count; i++) {
         if (strcmp(b->var_names[i], var) == 0) {
             node_fields_free(&b->var_nodes[i]);
-            node_deep_copy(&b->var_nodes[i], node);
+            node_binding_copy(&b->var_nodes[i], node);
             return;
         }
     }
@@ -2413,7 +2426,7 @@ static void binding_set(binding_t *b, const char *var, const cbm_node_t *node) {
         return;
     }
     b->var_names[b->var_count] = var; /* not owned — points to AST string */
-    node_deep_copy(&b->var_nodes[b->var_count], node);
+    node_binding_copy(&b->var_nodes[b->var_count], node);
     b->var_count++;
 }
 
@@ -2914,10 +2927,12 @@ static int scan_alternation_labels(cbm_store_t *store, const char *project, cons
                 free(copy);
                 return CBM_STORE_ERR;
             }
-            memcpy(*out_nodes + *out_count, part, (size_t)pc * sizeof(cbm_node_t));
-            *out_count += pc;
+            for (int i = 0; i < pc; i++) {
+                node_move(&(*out_nodes)[*out_count], &part[i]);
+                (*out_count)++;
+            }
         }
-        free(part); /* container only — node fields moved to out_nodes */
+        cbm_store_free_nodes(part, pc); /* moved elements are zeroed */
     }
     free(copy);
     return CBM_STORE_OK;
@@ -2952,13 +2967,7 @@ static int scan_pattern_nodes(cbm_store_t *store, const char *project, int max_r
             return CBM_STORE_ERR;
         }
         for (int i = 0; i < sout.count; i++) {
-            (*out_nodes)[i] = sout.results[i].node;
-            sout.results[i].node.name = NULL;
-            sout.results[i].node.project = NULL;
-            sout.results[i].node.label = NULL;
-            sout.results[i].node.qualified_name = NULL;
-            sout.results[i].node.file_path = NULL;
-            sout.results[i].node.properties_json = NULL;
+            node_move(&(*out_nodes)[i], &sout.results[i].node);
         }
         cbm_store_search_free(&sout);
     }
@@ -2968,7 +2977,7 @@ static int scan_pattern_nodes(cbm_store_t *store, const char *project, int max_r
         for (int i = 0; i < *out_count; i++) {
             if (check_inline_props(&(*out_nodes)[i], first->props, first->prop_count, store)) {
                 if (kept != i) {
-                    (*out_nodes)[kept] = (*out_nodes)[i];
+                    node_move(&(*out_nodes)[kept], &(*out_nodes)[i]);
                 }
                 kept++;
             } else {
