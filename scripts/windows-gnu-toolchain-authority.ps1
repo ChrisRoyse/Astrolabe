@@ -4221,6 +4221,7 @@ public class AstroTreeRecorder {
     const int ERROR_MORE_DATA = 234;
     const int WAIT_TIMEOUT = 258;
     const int ERROR_FILE_NOT_FOUND = 2;
+    const int ERROR_SHARING_VIOLATION = 32;
     const int ERROR_PATH_NOT_FOUND = 3;
     // The manifest is cumulative process-lifetime provenance. Its size is determined
     // by the observed Job history, not by a policy threshold. The only format bound is
@@ -4347,6 +4348,8 @@ public class AstroTreeRecorder {
     byte[] lastManifestBytes;
     string lastManifestFileIdentity;
     const int RECORDER_BARRIER_TIMEOUT_SECONDS = 30;
+    const int PREVIOUS_MANIFEST_OPEN_MAX_ATTEMPTS = 16;
+    const int PREVIOUS_MANIFEST_OPEN_MAX_DELAY_MILLISECONDS = 1000;
     static readonly long UnixEpochTicks = new DateTime(
         1970, 1, 1, 0, 0, 0, DateTimeKind.Utc
     ).Ticks;
@@ -5430,6 +5433,177 @@ public class AstroTreeRecorder {
         );
     }
 
+    static int PreviousManifestOpenDelayMilliseconds(int failedAttempt) {
+        if (failedAttempt <= 0 ||
+            failedAttempt >= PREVIOUS_MANIFEST_OPEN_MAX_ATTEMPTS)
+            throw new ArgumentOutOfRangeException("failedAttempt");
+        long delay = 25L << Math.Min(failedAttempt - 1, 30);
+        return (int)Math.Min(
+            delay,
+            (long)PREVIOUS_MANIFEST_OPEN_MAX_DELAY_MILLISECONDS
+        );
+    }
+
+    static long PreviousManifestOpenRetryBudgetMilliseconds() {
+        long result = 0L;
+        for (int failedAttempt = 1;
+             failedAttempt < PREVIOUS_MANIFEST_OPEN_MAX_ATTEMPTS;
+             failedAttempt++) {
+            result = checked(
+                result + PreviousManifestOpenDelayMilliseconds(failedAttempt)
+            );
+        }
+        return result;
+    }
+
+    static string BuildPreviousManifestOpenDiagnostic(
+        string code,
+        string path,
+        string expectedIdentity,
+        byte[] expectedBytes,
+        int attempt,
+        int nativeError,
+        int delayMilliseconds,
+        long elapsedMilliseconds,
+        string message,
+        string remediation
+    ) {
+        StringBuilder payload = new StringBuilder();
+        payload.Append("{\"schema\":\"astrolabe.tree-attribution.previous-manifest-open.v1\",\"code\":");
+        AppendJsonString(payload, code);
+        payload.Append(",\"path\":");
+        AppendJsonString(payload, Path.GetFullPath(path));
+        payload.Append(",\"expected_file_id\":");
+        AppendJsonString(payload, expectedIdentity);
+        payload.Append(",\"expected_length\":");
+        AppendLong(payload, expectedBytes.LongLength);
+        payload.Append(",\"expected_sha256\":");
+        AppendJsonString(payload, Sha256Hex(expectedBytes));
+        payload.Append(",\"attempt\":");
+        AppendInt(payload, attempt);
+        payload.Append(",\"max_attempts\":");
+        AppendInt(payload, PREVIOUS_MANIFEST_OPEN_MAX_ATTEMPTS);
+        payload.Append(",\"max_retries\":");
+        AppendInt(payload, PREVIOUS_MANIFEST_OPEN_MAX_ATTEMPTS - 1);
+        payload.Append(",\"retry_budget_ms\":");
+        AppendLong(payload, PreviousManifestOpenRetryBudgetMilliseconds());
+        payload.Append(",\"native_error_kind\":\"win32\",\"native_error\":");
+        AppendInt(payload, nativeError);
+        payload.Append(",\"delay_ms\":");
+        AppendInt(payload, delayMilliseconds);
+        payload.Append(",\"elapsed_ms\":");
+        AppendLong(payload, elapsedMilliseconds);
+        payload.Append(",\"message\":");
+        AppendJsonString(payload, message);
+        payload.Append(",\"remediation\":");
+        AppendJsonString(payload, remediation);
+        payload.Append('}');
+        return payload.ToString();
+    }
+
+    static FileStream OpenPreviousManifestMutationWithBoundedContention(
+        string path,
+        string expectedIdentity,
+        byte[] expectedBytes
+    ) {
+        if (String.IsNullOrEmpty(expectedIdentity))
+            throw new ArgumentException(
+                "previous attribution FILE_ID binding is required",
+                "expectedIdentity"
+            );
+        if (expectedBytes == null || expectedBytes.Length == 0)
+            throw new ArgumentException(
+                "previous attribution bytes are required",
+                "expectedBytes"
+            );
+        System.Diagnostics.Stopwatch elapsed =
+            System.Diagnostics.Stopwatch.StartNew();
+        Win32Exception lastSharingFault = null;
+        for (int attempt = 1;
+             attempt <= PREVIOUS_MANIFEST_OPEN_MAX_ATTEMPTS;
+             attempt++) {
+            try {
+                FileStream acquired = OpenProtectedMutation(
+                    path,
+                    "previous attribution manifest"
+                );
+                if (attempt > 1) {
+                    Console.Out.WriteLine(
+                        "ATTRIBUTION_PUBLICATION[ASTRO_ATTRIBUTION_PREVIOUS_MANIFEST_OPEN_RECOVERED]: " +
+                        BuildPreviousManifestOpenDiagnostic(
+                            "ASTRO_ATTRIBUTION_PREVIOUS_MANIFEST_OPEN_RECOVERED",
+                            path,
+                            expectedIdentity,
+                            expectedBytes,
+                            attempt,
+                            lastSharingFault.NativeErrorCode,
+                            0,
+                            elapsed.ElapsedMilliseconds,
+                            "the exact previous-manifest mutation lease was acquired after bounded sharing contention",
+                            "none"
+                        )
+                    );
+                }
+                return acquired;
+            } catch (Win32Exception fault) {
+                if (fault.NativeErrorCode != ERROR_SHARING_VIOLATION) {
+                    throw new IOException(
+                        "ATTRIBUTION_PUBLICATION[ASTRO_ATTRIBUTION_PREVIOUS_MANIFEST_OPEN_FAILED]: " +
+                        BuildPreviousManifestOpenDiagnostic(
+                            "ASTRO_ATTRIBUTION_PREVIOUS_MANIFEST_OPEN_FAILED",
+                            path,
+                            expectedIdentity,
+                            expectedBytes,
+                            attempt,
+                            fault.NativeErrorCode,
+                            0,
+                            elapsed.ElapsedMilliseconds,
+                            "the exact previous-manifest mutation lease failed with a non-retryable native error",
+                            "repair the reported path, access, or filesystem state; preserve every manifest/protocol byte and retry only through the ordinary launcher after protocol state is absent"
+                        ),
+                        fault
+                    );
+                }
+                lastSharingFault = fault;
+                if (attempt == PREVIOUS_MANIFEST_OPEN_MAX_ATTEMPTS)
+                    break;
+                int delay = PreviousManifestOpenDelayMilliseconds(attempt);
+                Console.Out.WriteLine(
+                    "ATTRIBUTION_PUBLICATION[ASTRO_ATTRIBUTION_PREVIOUS_MANIFEST_OPEN_CONTENDED]: " +
+                    BuildPreviousManifestOpenDiagnostic(
+                        "ASTRO_ATTRIBUTION_PREVIOUS_MANIFEST_OPEN_CONTENDED",
+                        path,
+                        expectedIdentity,
+                        expectedBytes,
+                        attempt,
+                        fault.NativeErrorCode,
+                        delay,
+                        elapsed.ElapsedMilliseconds,
+                        "a live reader omitted FILE_SHARE_DELETE and denied the exact previous-manifest mutation lease",
+                        "wait only for this bounded reader window; do not widen share mode, mutate a path, or release the publication gate"
+                    )
+                );
+                Thread.Sleep(delay);
+            }
+        }
+        throw new IOException(
+            "ATTRIBUTION_PUBLICATION[ASTRO_ATTRIBUTION_PREVIOUS_MANIFEST_OPEN_CONTENTION_EXHAUSTED]: " +
+            BuildPreviousManifestOpenDiagnostic(
+                "ASTRO_ATTRIBUTION_PREVIOUS_MANIFEST_OPEN_CONTENTION_EXHAUSTED",
+                path,
+                expectedIdentity,
+                expectedBytes,
+                PREVIOUS_MANIFEST_OPEN_MAX_ATTEMPTS,
+                lastSharingFault.NativeErrorCode,
+                0,
+                elapsed.ElapsedMilliseconds,
+                "the exact previous-manifest mutation lease remained blocked through the complete bounded sharing-contention budget",
+                "close or repair the exact reader that omitted FILE_SHARE_DELETE; preserve every manifest/protocol byte and use tracker-bound recovery only after the owner and Job are inactive"
+            ),
+            lastSharingFault
+        );
+    }
+
     static FileStream OpenLinkedObserver(string path, string description) {
         return OpenExactNativeStream(
             path,
@@ -5705,7 +5879,11 @@ public class AstroTreeRecorder {
 
             if (String.IsNullOrEmpty(expectedPreviousIdentity))
                 throw new InvalidOperationException("refresh attribution FILE_ID binding is missing");
-            previous = OpenProtectedMutation(manifestPath, "previous attribution manifest");
+            previous = OpenPreviousManifestMutationWithBoundedContention(
+                manifestPath,
+                expectedPreviousIdentity,
+                expectedPrevious
+            );
             RequireOrdinarySingleLink(previous.SafeFileHandle, "previous attribution manifest");
             RequireAttributionProtocolPath(
                 previous.SafeFileHandle,
