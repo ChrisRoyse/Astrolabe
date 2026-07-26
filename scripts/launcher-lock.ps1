@@ -219,6 +219,23 @@ public static class AstroLauncherLockNative
         uint flags
     );
 
+    [DllImport(
+        "kernel32.dll",
+        EntryPoint = "ReplaceFileW",
+        CharSet = CharSet.Unicode,
+        ExactSpelling = true,
+        SetLastError = true
+    )]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool ReplaceFileWNative(
+        string replacedFileName,
+        string replacementFileName,
+        string backupFileName,
+        uint replaceFlags,
+        IntPtr exclude,
+        IntPtr reserved
+    );
+
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
     private static extern bool CreateDirectoryW(
@@ -350,6 +367,46 @@ public static class AstroLauncherLockNative
                 MOVEFILE_WRITE_THROUGH,
                 existingFileName,
                 newFileName
+            )
+        );
+    }
+
+    public static void ReplaceFilePreserveMetadata(
+        string replacedFileName,
+        string replacementFileName,
+        string backupFileName
+    )
+    {
+        string replaced = GetExtendedLengthPath(replacedFileName);
+        string replacement = GetExtendedLengthPath(replacementFileName);
+        string backup = GetExtendedLengthPath(backupFileName);
+        const uint flags = 0;
+        if (ReplaceFileWNative(
+                replaced,
+                replacement,
+                backup,
+                flags,
+                IntPtr.Zero,
+                IntPtr.Zero
+            ))
+        {
+            return;
+        }
+
+        int nativeError = Marshal.GetLastWin32Error();
+        string nativeMessage = new Win32Exception(nativeError).Message;
+        throw new Win32Exception(
+            nativeError,
+            string.Format(
+                CultureInfo.InvariantCulture,
+                "ReplaceFileW failed (native_error={0}, native_message='{1}', " +
+                    "flags=0x{2:x8}, replaced='{3}', replacement='{4}', backup='{5}')",
+                nativeError,
+                nativeMessage,
+                flags,
+                replacedFileName,
+                replacementFileName,
+                backupFileName
             )
         );
     }

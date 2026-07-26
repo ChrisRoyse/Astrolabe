@@ -12,9 +12,10 @@
     imports are measured with the launcher-pinned LLVM inspector; platform DLLs stay provided
     by Windows, while every other import must resolve to the pinned launcher toolchain.
 
-    Existing generations are never reused or replaced. Client configuration is deliberately a
-    separate transaction: Codex and Claude Code must be switched to the exact published path
-    only after this command's independent readback succeeds.
+    Existing generations are never reused or replaced. Client activation is deliberately a
+    separate receipt-bound transaction: activate-global-astrolabe-mcp.ps1 must switch Codex and
+    Claude Code to the exact published path only after this command's independent readback
+    succeeds. This publisher records activation as not_attempted and never claims client state.
 
 .NOTES
     Manual FSV/publication tooling for #751. This is not a test or a fallback installer.
@@ -695,14 +696,8 @@ $publishedRuntime = @(
         }
     }
 )
-$codexConfigPath = if ([string]::IsNullOrWhiteSpace($env:CODEX_HOME)) {
-    Join-Path $env:USERPROFILE '.codex\config.toml'
-} else {
-    Join-Path $env:CODEX_HOME 'config.toml'
-}
-$claudeUserConfigPath = Join-Path $env:USERPROFILE '.claude.json'
 $publication = [ordered]@{
-    schema = 'astrolabe.global-mcp-publication.v2'
+    schema = 'astrolabe.global-mcp-publication.v3'
     issue = $Issue
     published_at_utc = [DateTime]::UtcNow.ToString('o')
     tree_sha = $ExpectedTreeSha
@@ -750,18 +745,24 @@ $publication = [ordered]@{
         publication = 'MoveFileExW(MOVEFILE_WRITE_THROUGH,no-replace)'
         same_volume = $true
     }
-    client_configuration = [ordered]@{
+    client_activation = [ordered]@{
+        status = 'not_attempted'
+        required = $true
+        transaction_schema = 'astrolabe.global-mcp-activation.v1'
+        activation_script = [IO.Path]::GetFullPath(
+            (Join-Path $PSScriptRoot 'activate-global-astrolabe-mcp.ps1')
+        )
         server_name = 'astrolabe'
         command = $finalArtifact
         arguments = @()
         codex = [ordered]@{
-            config_path = [IO.Path]::GetFullPath($codexConfigPath)
+            scope = 'user'
             required = $true
+            enabled = $true
+            default_tools_approval_mode = 'approve'
         }
         claude_code = [ordered]@{
             scope = 'user'
-            config_readback_path =
-                [IO.Path]::GetFullPath($claudeUserConfigPath)
         }
         legacy_server_name = 'codebase-memory-mcp'
         legacy_configured_fallback_permitted = $false
@@ -800,14 +801,17 @@ $persistedClosureMaterial = @(
         "$([string]$_.name)`t$([uint64]$_.bytes)`t$([string]$_.sha256)"
     }
 ) -join "`n"
-if ([string]$persistedReceipt.schema -cne 'astrolabe.global-mcp-publication.v2' -or
+if ([string]$persistedReceipt.schema -cne 'astrolabe.global-mcp-publication.v3' -or
     [string]$persistedReceipt.tree_sha -cne $ExpectedTreeSha -or
     [string]$persistedReceipt.artifact.installed_path -cne $finalArtifact -or
-    [string]$persistedReceipt.client_configuration.command -cne
+    [string]$persistedReceipt.client_activation.status -cne
+        'not_attempted' -or
+    [bool]$persistedReceipt.client_activation.required -ne $true -or
+    [string]$persistedReceipt.client_activation.command -cne
         $finalArtifact -or
-    [string]$persistedReceipt.client_configuration.server_name -cne
+    [string]$persistedReceipt.client_activation.server_name -cne
         'astrolabe' -or
-    [bool]$persistedReceipt.client_configuration.codex.required -ne $true -or
+    [bool]$persistedReceipt.client_activation.codex.required -ne $true -or
     [string]$persistedReceipt.runtime_closure.sha256 -cne
         $runtimeClosureSha -or
     [int]$persistedReceipt.runtime_closure.dependency_count -ne
@@ -867,7 +871,7 @@ $runtimeReadback = @(
 )
 
 [ordered]@{
-    code = 'ASTRO_GLOBAL_MCP_PUBLISHED'
+    code = 'ASTRO_GLOBAL_MCP_GENERATION_PUBLISHED'
     issue = $Issue
     tree_sha = $ExpectedTreeSha
     generation_path = $generationPath
@@ -888,6 +892,12 @@ $runtimeReadback = @(
         sha256 = $runtimeClosureSha
         dependency_count = $runtimeReadback.Count
         dependencies = @($runtimeReadback)
+    }
+    client_activation = [ordered]@{
+        status = 'not_attempted'
+        required = $true
+        activation_script =
+            [string]$persistedReceipt.client_activation.activation_script
     }
     source_stage_absent = -not (Test-AstroPathLongPath -LiteralPath $publishingPath)
 } | ConvertTo-Json -Depth 10 -Compress | Write-Output
