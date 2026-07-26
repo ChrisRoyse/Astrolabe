@@ -3625,6 +3625,10 @@ pub struct cbm_vector_result_t {
     pub qualified_name: *mut ::std::os::raw::c_char,
     pub file_path: *mut ::std::os::raw::c_char,
     pub label: *mut ::std::os::raw::c_char,
+    pub start_line: ::std::os::raw::c_int,
+    pub end_line: ::std::os::raw::c_int,
+    pub start_byte: u64,
+    pub end_byte: u64,
     pub score: f64,
 }
 impl Default for cbm_vector_result_t {
