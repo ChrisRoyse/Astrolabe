@@ -4917,12 +4917,18 @@ function Invoke-AstroExactLeaseDurabilityFlush {
     # closed.  This skip is declared on every occurrence, never silent.
     if ($Lease.PSObject.Properties['WriteAccess'] -and
         $Lease.WriteAccess -eq $false) {
-        Write-Information -MessageData (
+        # The mutating launcher runs in a redirected native PowerShell host.
+        # Windows PowerShell duplicates Write-Information as formatted stdout
+        # plus a CLIXML InformationRecord on stderr even with -OutputFormat
+        # Text.  Write the declaration directly to the native stdout boundary:
+        # unlike Write-Output this cannot contaminate a caller's function
+        # return value, and unlike Write-Information it remains one text line.
+        [Console]::Out.WriteLine((
             'LAUNCHER_LOCK[ASTRO_LAUNCHER_IMMUTABLE_LEASE_FLUSH_DECLARED]: ' +
             "operation=$Operation; path=$($Lease.Path); " +
             'reason=immutable published lease holds no write access by design (#619); ' +
             'data_durability_owner=pre-publication scratch FlushFileBuffers'
-        ) -InformationAction Continue
+        ))
         return
     }
     [AstroLauncherLockNative]::FlushExactFile($Lease.SafeFileHandle)

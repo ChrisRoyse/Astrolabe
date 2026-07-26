@@ -6302,6 +6302,12 @@ if ([string]::IsNullOrEmpty($InternalDedicatedToken)) {
     $recoverPreservedTargetLiteral = if ($RecoverPreservedTarget) { '$true' } else { '$false' }
     $dedicatedCommand = @"
 [Console]::OutputEncoding = [Text.UTF8Encoding]::new(`$false, `$true)
+# Progress is a host-only PowerShell stream and cannot be redirected. Windows
+# PowerShell otherwise serializes ambient module-load progress as CLIXML on the
+# dedicated process's stderr pipe even with -OutputFormat Text. The launcher
+# emits every durable lifecycle diagnostic as native stdout/stderr text; disable
+# only this noninteractive renderer before the first module can autoload.
+`$ProgressPreference = 'SilentlyContinue'
 `$decode = {
     param([string]`$Value)
     [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String(`$Value))
