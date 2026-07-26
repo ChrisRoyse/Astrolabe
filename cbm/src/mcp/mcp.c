@@ -2480,6 +2480,57 @@ static char *bm25_error_result(const char *code, const char *operation, const ch
     return result;
 }
 
+/* Serialize an already-snapshotted store failure. The caller captures the
+ * connection diagnostic before cleanup or any later SQLite call can replace
+ * it, then destroys every partial result before returning this tool error. */
+static char *search_store_error_result(const char *code, const char *operation,
+                                       const char *message, const char *remediation,
+                                       int sqlite_error, const char *detail) {
+    char sqlite_error_text[CBM_SZ_32];
+    snprintf(sqlite_error_text, sizeof(sqlite_error_text), "%d", sqlite_error);
+    cbm_log_error("mcp.search_graph_store_failed", "code", code, "operation", operation,
+                  "sqlite_error", sqlite_error_text, "detail", detail ? detail : "", "message",
+                  message, "remediation", remediation);
+
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    yyjson_mut_val *root = doc ? yyjson_mut_obj(doc) : NULL;
+    if (!root) {
+        if (doc) {
+            yyjson_mut_doc_free(doc);
+        }
+        return cbm_mcp_text_result(
+            "{\"code\":\"CBM_SEARCH_STORE_DIAGNOSTIC_SERIALIZATION_FAILED\",\"operation\":"
+            "\"serialize_error\",\"message\":\"the search-store failure diagnostic could "
+            "not be serialized\",\"remediation\":\"free memory and retry the unchanged "
+            "request\"}",
+            true);
+    }
+    yyjson_mut_doc_set_root(doc, root);
+    yyjson_mut_obj_add_str(doc, root, "code", code);
+    yyjson_mut_obj_add_str(doc, root, "operation", operation);
+    yyjson_mut_obj_add_str(doc, root, "message", message);
+    yyjson_mut_obj_add_str(doc, root, "remediation", remediation);
+    if (sqlite_error != SQLITE_OK) {
+        yyjson_mut_obj_add_int(doc, root, "sqlite_error", sqlite_error);
+    }
+    if (detail && detail[0]) {
+        yyjson_mut_obj_add_str(doc, root, "detail", detail);
+    }
+    char *json = yy_doc_to_str(doc);
+    yyjson_mut_doc_free(doc);
+    if (!json) {
+        return cbm_mcp_text_result(
+            "{\"code\":\"CBM_SEARCH_STORE_DIAGNOSTIC_SERIALIZATION_FAILED\",\"operation\":"
+            "\"serialize_error\",\"message\":\"the search-store failure diagnostic could "
+            "not be serialized\",\"remediation\":\"free memory and retry the unchanged "
+            "request\"}",
+            true);
+    }
+    char *result = cbm_mcp_text_result(json, true);
+    free(json);
+    return result;
+}
+
 static int bm25_bind_filters(sqlite3_stmt *stmt, const char *fts_query, const char *project,
                              const char *file_like, const char *label) {
     int rc = sqlite3_bind_text(stmt, BM25_BIND_QUERY, fts_query, BM25_SQL_AUTO_LEN,
@@ -2830,35 +2881,50 @@ static void emit_semantic_results(yyjson_mut_doc *doc, yyjson_mut_val *root,
     yyjson_mut_obj_add_val(doc, root, "semantic_results", sem_results);
 }
 
-/* Append the semantic_query vector-search results onto the doc.  Returns
- * true if semantic_query was provided as a non-array (type error — caller
- * should surface to the user). */
-static bool run_semantic_query(yyjson_mut_doc *doc, yyjson_mut_val *root, const char *args,
-                               cbm_store_t *store, const char *project, int limit) {
+typedef struct {
+    bool type_error;
+    bool store_error;
+    int sqlite_error;
+    char detail[CBM_SZ_512];
+} semantic_query_outcome_t;
+
+/* Append semantic_query results only after the complete vector search
+ * succeeds. A store failure is snapshotted for the caller; the exact-search
+ * envelope already under construction must then be discarded, never returned
+ * as a partial success. */
+static semantic_query_outcome_t run_semantic_query(yyjson_mut_doc *doc, yyjson_mut_val *root,
+                                                   const char *args, cbm_store_t *store,
+                                                   const char *project, int limit) {
     enum { MAX_KW_SEARCH = 32 };
+    semantic_query_outcome_t outcome = {0};
     yyjson_doc *args_doc = yyjson_read(args, strlen(args), 0);
     yyjson_val *args_root = args_doc ? yyjson_doc_get_root(args_doc) : NULL;
     yyjson_val *sq_val = args_root ? yyjson_obj_get(args_root, "semantic_query") : NULL;
-    bool type_error = false;
     if (sq_val && !yyjson_is_arr(sq_val)) {
-        type_error = true;
+        outcome.type_error = true;
     } else if (sq_val && yyjson_arr_size(sq_val) > 0) {
         const char *keywords[MAX_KW_SEARCH];
         int ki = extract_semantic_keywords(sq_val, keywords, MAX_KW_SEARCH);
         cbm_vector_result_t *vresults = NULL;
         int vcount = 0;
         int sem_limit = limit > 0 ? limit : CBM_SZ_16;
-        if (cbm_store_vector_search(store, project, keywords, ki, sem_limit, &vresults, &vcount) ==
-                CBM_STORE_OK &&
-            vcount > 0) {
+        int vector_rc =
+            cbm_store_vector_search(store, project, keywords, ki, sem_limit, &vresults, &vcount);
+        if (vector_rc != CBM_STORE_OK) {
+            outcome.store_error = true;
+            outcome.sqlite_error = cbm_store_error_code(store);
+            snprintf(outcome.detail, sizeof(outcome.detail), "%s", cbm_store_error(store));
+        } else if (vcount > 0) {
             emit_semantic_results(doc, root, vresults, vcount);
+        }
+        if (vresults) {
             cbm_store_free_vector_results(vresults, vcount);
         }
     }
     if (args_doc) {
         yyjson_doc_free(args_doc);
     }
-    return type_error;
+    return outcome;
 }
 
 static char *search_graph_argument_error_result(const char *argument, const char *expected,
@@ -3099,7 +3165,25 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
     };
 
     cbm_search_output_t out = {0};
-    cbm_store_search(store, &params, &out);
+    int search_rc = cbm_store_search(store, &params, &out);
+    if (search_rc != CBM_STORE_OK) {
+        int sqlite_error = cbm_store_error_code(store);
+        char detail[CBM_SZ_512];
+        snprintf(detail, sizeof(detail), "%s", cbm_store_error(store));
+        cbm_store_search_free(&out);
+        free(project);
+        free(label);
+        free(name_pattern);
+        free(qn_pattern);
+        free(file_pattern);
+        free(relationship);
+        return search_store_error_result(
+            "CBM_SEARCH_EXACT_STORE_FAILED", "execute_exact_search",
+            "the verified project store could not complete the exact graph search",
+            "inspect the persisted store diagnostic, repair the project store if required, and "
+            "retry the unchanged request",
+            sqlite_error, detail);
+    }
 
     yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
     yyjson_mut_val *root = yyjson_mut_obj(doc);
@@ -3128,9 +3212,10 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
         }
     }
 
-    bool sq_type_error = run_semantic_query(doc, root, args, store, project, limit);
+    semantic_query_outcome_t semantic =
+        run_semantic_query(doc, root, args, store, project, limit);
 
-    if (sq_type_error) {
+    if (semantic.type_error || semantic.store_error) {
         for (int pi = 0; pi < props_doc_count; pi++) {
             yyjson_doc_free(props_docs[pi]);
         }
@@ -3143,6 +3228,14 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
         free(qn_pattern);
         free(file_pattern);
         free(relationship);
+        if (semantic.store_error) {
+            return search_store_error_result(
+                "CBM_SEARCH_SEMANTIC_STORE_FAILED", "execute_semantic_search",
+                "the verified project store could not complete the semantic graph search",
+                "inspect the persisted vector/store diagnostic, repair or re-index the project "
+                "store if required, and retry the unchanged request",
+                semantic.sqlite_error, semantic.detail);
+        }
         return cbm_mcp_text_result(
             "semantic_query must be an array of keyword strings, e.g. "
             "[\"send\",\"pubsub\",\"publish\"] — not a single string. Split your query "
