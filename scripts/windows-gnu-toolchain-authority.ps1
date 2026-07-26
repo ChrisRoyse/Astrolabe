@@ -3634,8 +3634,8 @@ function Resolve-AstroCudaLinkSupportBundle {
             throw "CUDA_LINK_SUPPORT[ASTRO_CUDA_LINK_RETIRE_RESULT]: {code=ASTRO_CUDA_LINK_RETIRE_RESULT; message=`"serialized retirement result differs from the validated historical-root inventory (state=$($retirement.State); expected=$historicalCount; candidates=$($retirement.InitialCandidateCount); retired=$($retirement.RetiredCount))`"; remediation=`"preserve every root and retirement record; inspect the exact inventory/transition evidence before retrying`"}"
         }
         $historicalCount = 0
-        Write-Host "CUDA_LINK_SUPPORT[ASTRO_CUDA_LINK_RETIREMENT_ATTESTED]: active_digest=$($inputs.InputDigest); retired=$($retirement.RetiredCount); final_inventory_sha256=$($retirement.FinalInventorySha256); transition=$($retirement.TransitionTransactionId); every obsolete root disposition has durable intent/completion readback"
-        Write-Host "CUDA_LINK_SUPPORT[ASTRO_CUDA_LINK_BUNDLE_ATTESTED]: root=$($validated.Root); input_digest=$($validated.InputDigest); manifest_sha256=$($validated.ManifestSha256); payload_content_sha256=$($validated.Inventory.ContentSha256); payload_identity_sha256=$($validated.Inventory.IdentitySha256); payload_exact_observation_sha256=$($validated.Inventory.ExactInventorySha256); exact_metadata_equal_ignoring_last_access=true; entries=$($validated.Inventory.EntryCount); bytes=$($validated.Inventory.TotalBytes); published=$published; historical_roots=$historicalCount; mutex=$($mutexLease.Name)"
+        [Console]::Out.WriteLine("CUDA_LINK_SUPPORT[ASTRO_CUDA_LINK_RETIREMENT_ATTESTED]: active_digest=$($inputs.InputDigest); retired=$($retirement.RetiredCount); final_inventory_sha256=$($retirement.FinalInventorySha256); transition=$($retirement.TransitionTransactionId); every obsolete root disposition has durable intent/completion readback")
+        [Console]::Out.WriteLine("CUDA_LINK_SUPPORT[ASTRO_CUDA_LINK_BUNDLE_ATTESTED]: root=$($validated.Root); input_digest=$($validated.InputDigest); manifest_sha256=$($validated.ManifestSha256); payload_content_sha256=$($validated.Inventory.ContentSha256); payload_identity_sha256=$($validated.Inventory.IdentitySha256); payload_exact_observation_sha256=$($validated.Inventory.ExactInventorySha256); exact_metadata_equal_ignoring_last_access=true; entries=$($validated.Inventory.EntryCount); bytes=$($validated.Inventory.TotalBytes); published=$published; historical_roots=$historicalCount; mutex=$($mutexLease.Name)")
         return $validated
     }
     finally {
@@ -3787,7 +3787,7 @@ function Publish-CudaToolkitViewManifest {
     # New-CudaToolkitNoSpaceView's success-pipeline contract is exactly one
     # import-library path. Host telemetry must not become an additional return
     # value and then an accidental RUSTFLAGS -L argument.
-    Write-Host "CUDA_TOOLKIT_VIEW[ASTRO_CUDA_TOOLKIT_VIEW_MANIFEST]: path=$($ViewLease.ManifestPath); sha256=$($snapshot.Sha256); junctions=$($ViewLease.Junctions.Count); every junction handle retained with delete sharing denied"
+    [Console]::Out.WriteLine("CUDA_TOOLKIT_VIEW[ASTRO_CUDA_TOOLKIT_VIEW_MANIFEST]: path=$($ViewLease.ManifestPath); sha256=$($snapshot.Sha256); junctions=$($ViewLease.Junctions.Count); every junction handle retained with delete sharing denied")
 }
 
 function Remove-CudaToolkitExactJunctions {
