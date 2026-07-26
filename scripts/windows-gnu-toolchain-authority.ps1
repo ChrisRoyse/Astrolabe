@@ -4322,6 +4322,18 @@ public class AstroTreeRecorder {
     // quiescent final path.  SemaphoreSlim is intentionally non-thread-affine because
     // PowerShell acquires and disposes the consumer lease through separate CLR calls.
     readonly SemaphoreSlim manifestPublicationGate = new SemaphoreSlim(1, 1);
+    readonly object manifestPublicationStateGate = new object();
+    string manifestPublicationHolderRole;
+    int manifestPublicationHolderManagedThreadId;
+    long manifestPublicationHolderAcquiredUtcTicks;
+    long manifestPublicationHolderGeneration;
+    long manifestPublicationNextGeneration;
+    long manifestPublicationStateRevision;
+    string manifestPublicationPhase = "idle";
+    bool manifestPeriodicPublicationDeferred;
+    long manifestPeriodicPublicationDeferredUtcTicks;
+    long manifestPeriodicPublicationDeferredByGeneration;
+    ManifestPublicationGateReleaseReadback lastStableConsumerRelease;
     string manifestPath;
     int launcherPid;
     long launcherProcessStartUtcTicks;
@@ -4338,6 +4350,38 @@ public class AstroTreeRecorder {
     static readonly long UnixEpochTicks = new DateTime(
         1970, 1, 1, 0, 0, 0, DateTimeKind.Utc
     ).Ticks;
+
+    public sealed class ManifestPublicationGateState {
+        public string Schema { get; internal set; }
+        public long StateRevision { get; internal set; }
+        public int CurrentCount { get; internal set; }
+        public string HolderRole { get; internal set; }
+        public int HolderManagedThreadId { get; internal set; }
+        public long HolderAcquiredUtcTicks { get; internal set; }
+        public long HolderGeneration { get; internal set; }
+        public string Phase { get; internal set; }
+        public bool PeriodicPublicationDeferred { get; internal set; }
+        public long PeriodicPublicationDeferredUtcTicks { get; internal set; }
+        public long PeriodicPublicationDeferredByGeneration { get; internal set; }
+        public bool WorkerStopped { get; internal set; }
+        public string WorkerFaultType { get; internal set; }
+        public string WorkerFaultMessage { get; internal set; }
+        public long ObservedUtcTicks { get; internal set; }
+    }
+
+    public sealed class ManifestPublicationGateReleaseReadback {
+        public string Schema { get; internal set; }
+        public long ReleasedHolderGeneration { get; internal set; }
+        public string ReleasedHolderRole { get; internal set; }
+        public int CountAfterRelease { get; internal set; }
+        public bool HolderAbsentAfterRelease { get; internal set; }
+        public long ReleaseStateRevision { get; internal set; }
+        public string PhaseAfterRelease { get; internal set; }
+        public long ReleasedAtUtcTicks { get; internal set; }
+        public bool PeriodicPublicationWasDeferred { get; internal set; }
+        public long PeriodicPublicationDeferredUtcTicks { get; internal set; }
+        public long PeriodicPublicationDeferredByGeneration { get; internal set; }
+    }
 
     static long UtcTicksToUnixNs(long ticks) {
         return checked((ticks - UnixEpochTicks) * 100L);
@@ -4497,7 +4541,15 @@ public class AstroTreeRecorder {
 
             // The first complete, independently read-back manifest exists before the worker
             // starts and before the caller is allowed to publish the active launcher lock.
-            r.Flush();
+            if (!r.Flush(
+                    "startup-publisher",
+                    "startup-initial-publication",
+                    false
+                )) {
+                throw new InvalidOperationException(
+                    "startup attribution publication was unexpectedly deferred"
+                );
+            }
             r.thread = new Thread(r.Loop);
             r.thread.IsBackground = true;
             r.thread.Name = "Astrolabe exact tree attribution recorder";
@@ -4594,7 +4646,13 @@ public class AstroTreeRecorder {
                 long tick = NowUnixNs();
                 bool doFlush;
                 lock (gate) { doFlush = dirty && (tick - lastFlushNs > 1000000000L); }
-                if (doFlush) Flush();
+                if (doFlush) {
+                    Flush(
+                        "periodic-publisher",
+                        "periodic-publication",
+                        true
+                    );
+                }
             }
         } catch (Exception fault) {
             lock (gate) { workerFault = fault; }
@@ -4653,6 +4711,351 @@ public class AstroTreeRecorder {
 
     static void AppendInt(StringBuilder sb, int value) {
         sb.Append(value.ToString(CultureInfo.InvariantCulture));
+    }
+
+    ManifestPublicationGateState SnapshotManifestPublicationGateLocked() {
+        Exception fault;
+        lock (gate) { fault = workerFault; }
+        return new ManifestPublicationGateState {
+            Schema = "astrolabe.tree-attribution-publication-gate.state.v1",
+            StateRevision = manifestPublicationStateRevision,
+            CurrentCount = manifestPublicationGate.CurrentCount,
+            HolderRole = manifestPublicationHolderRole,
+            HolderManagedThreadId = manifestPublicationHolderManagedThreadId,
+            HolderAcquiredUtcTicks = manifestPublicationHolderAcquiredUtcTicks,
+            HolderGeneration = manifestPublicationHolderGeneration,
+            Phase = manifestPublicationPhase,
+            PeriodicPublicationDeferred = manifestPeriodicPublicationDeferred,
+            PeriodicPublicationDeferredUtcTicks = manifestPeriodicPublicationDeferredUtcTicks,
+            PeriodicPublicationDeferredByGeneration = manifestPeriodicPublicationDeferredByGeneration,
+            WorkerStopped = workerStopped,
+            WorkerFaultType = fault == null ? null : fault.GetType().FullName,
+            WorkerFaultMessage = fault == null ? null : fault.Message,
+            ObservedUtcTicks = DateTime.UtcNow.Ticks
+        };
+    }
+
+    static ManifestPublicationGateReleaseReadback CloneReleaseReadback(
+        ManifestPublicationGateReleaseReadback source
+    ) {
+        if (source == null) return null;
+        return new ManifestPublicationGateReleaseReadback {
+            Schema = source.Schema,
+            ReleasedHolderGeneration = source.ReleasedHolderGeneration,
+            ReleasedHolderRole = source.ReleasedHolderRole,
+            CountAfterRelease = source.CountAfterRelease,
+            HolderAbsentAfterRelease = source.HolderAbsentAfterRelease,
+            ReleaseStateRevision = source.ReleaseStateRevision,
+            PhaseAfterRelease = source.PhaseAfterRelease,
+            ReleasedAtUtcTicks = source.ReleasedAtUtcTicks,
+            PeriodicPublicationWasDeferred = source.PeriodicPublicationWasDeferred,
+            PeriodicPublicationDeferredUtcTicks = source.PeriodicPublicationDeferredUtcTicks,
+            PeriodicPublicationDeferredByGeneration = source.PeriodicPublicationDeferredByGeneration
+        };
+    }
+
+    static void AppendManifestPublicationGateStateJson(
+        StringBuilder sb,
+        ManifestPublicationGateState state
+    ) {
+        sb.Append("{\"schema\":"); AppendJsonString(sb, state.Schema);
+        sb.Append(",\"state_revision\":"); AppendLong(sb, state.StateRevision);
+        sb.Append(",\"current_count\":"); AppendInt(sb, state.CurrentCount);
+        sb.Append(",\"holder_role\":");
+        if (state.HolderRole == null) sb.Append("null"); else AppendJsonString(sb, state.HolderRole);
+        sb.Append(",\"holder_managed_thread_id\":"); AppendInt(sb, state.HolderManagedThreadId);
+        sb.Append(",\"holder_acquired_utc_ticks\":"); AppendLong(sb, state.HolderAcquiredUtcTicks);
+        sb.Append(",\"holder_generation\":"); AppendLong(sb, state.HolderGeneration);
+        sb.Append(",\"phase\":"); AppendJsonString(sb, state.Phase ?? String.Empty);
+        sb.Append(",\"periodic_publication_deferred\":");
+        sb.Append(state.PeriodicPublicationDeferred ? "true" : "false");
+        sb.Append(",\"periodic_publication_deferred_utc_ticks\":");
+        AppendLong(sb, state.PeriodicPublicationDeferredUtcTicks);
+        sb.Append(",\"periodic_publication_deferred_by_generation\":");
+        AppendLong(sb, state.PeriodicPublicationDeferredByGeneration);
+        sb.Append(",\"worker_stopped\":"); sb.Append(state.WorkerStopped ? "true" : "false");
+        sb.Append(",\"worker_fault_type\":");
+        if (state.WorkerFaultType == null) sb.Append("null"); else AppendJsonString(sb, state.WorkerFaultType);
+        sb.Append(",\"worker_fault_message\":");
+        if (state.WorkerFaultMessage == null) sb.Append("null"); else AppendJsonString(sb, state.WorkerFaultMessage);
+        sb.Append(",\"observed_utc_ticks\":"); AppendLong(sb, state.ObservedUtcTicks);
+        sb.Append('}');
+    }
+
+    InvalidOperationException ManifestPublicationGateFaultLocked(
+        string code,
+        string message,
+        string remediation,
+        Exception inner
+    ) {
+        StringBuilder payload = new StringBuilder();
+        payload.Append("{\"schema\":\"astrolabe.tree-attribution-publication-gate.error.v1\",\"code\":");
+        AppendJsonString(payload, code);
+        payload.Append(",\"message\":"); AppendJsonString(payload, message);
+        payload.Append(",\"remediation\":"); AppendJsonString(payload, remediation);
+        payload.Append(",\"gate_state\":");
+        AppendManifestPublicationGateStateJson(
+            payload,
+            SnapshotManifestPublicationGateLocked()
+        );
+        payload.Append('}');
+        return new InvalidOperationException(
+            "PUBLICATION_GATE[" + code + "]: " + payload.ToString(),
+            inner
+        );
+    }
+
+    bool TryAcquireManifestPublicationGate(
+        string holderRole,
+        string phase,
+        bool deferPeriodicForStableConsumer,
+        out long holderGeneration,
+        out ManifestPublicationGateState observedState
+    ) {
+        holderGeneration = 0L;
+        observedState = null;
+        System.Diagnostics.Stopwatch wait = System.Diagnostics.Stopwatch.StartNew();
+        lock (manifestPublicationStateGate) {
+            while (manifestPublicationHolderRole != null) {
+                if (manifestPublicationGate.CurrentCount != 0) {
+                    throw ManifestPublicationGateFaultLocked(
+                        "ASTRO_ATTRIBUTION_PUBLICATION_GATE_COUNT_CORRUPT",
+                        "the publication gate has an explicit holder but its count is not zero",
+                        "preserve the attribution manifest and inspect the exact holder/release generation before tracker-bound recovery",
+                        null
+                    );
+                }
+                if (deferPeriodicForStableConsumer &&
+                    String.Equals(holderRole, "periodic-publisher", StringComparison.Ordinal) &&
+                    String.Equals(manifestPublicationHolderRole, "stable-consumer", StringComparison.Ordinal)) {
+                    manifestPeriodicPublicationDeferred = true;
+                    manifestPeriodicPublicationDeferredUtcTicks = DateTime.UtcNow.Ticks;
+                    manifestPeriodicPublicationDeferredByGeneration =
+                        manifestPublicationHolderGeneration;
+                    manifestPublicationStateRevision = checked(
+                        manifestPublicationStateRevision + 1L
+                    );
+                    observedState = SnapshotManifestPublicationGateLocked();
+                    return false;
+                }
+                if (String.Equals(holderRole, "terminal-publisher", StringComparison.Ordinal) &&
+                    String.Equals(manifestPublicationHolderRole, "stable-consumer", StringComparison.Ordinal)) {
+                    throw ManifestPublicationGateFaultLocked(
+                        "ASTRO_ATTRIBUTION_PUBLICATION_GATE_CONSUMER_HELD_AT_TERMINAL",
+                        "terminal publication was requested while the stable consumer still owns the manifest gate",
+                        "preserve every owned byte; release and independently read back the exact consumer generation before target mutation or terminal stop",
+                        null
+                    );
+                }
+                long remaining = checked(
+                    RECORDER_BARRIER_TIMEOUT_SECONDS * 1000L -
+                    wait.ElapsedMilliseconds
+                );
+                if (remaining <= 0L) {
+                    throw ManifestPublicationGateFaultLocked(
+                        "ASTRO_ATTRIBUTION_PUBLICATION_GATE_HOLDER_TIMEOUT",
+                        "the requested publication-gate role could not acquire the exact held generation within the barrier budget",
+                        "preserve every owned byte; inspect the holder role/thread/acquisition ticks/generation/phase and its exact process state",
+                        null
+                    );
+                }
+                Monitor.Wait(
+                    manifestPublicationStateGate,
+                    (int)Math.Min(remaining, Int32.MaxValue)
+                );
+            }
+            if (manifestPublicationGate.CurrentCount != 1 ||
+                !manifestPublicationGate.Wait(0)) {
+                throw ManifestPublicationGateFaultLocked(
+                    "ASTRO_ATTRIBUTION_PUBLICATION_GATE_COUNT_CORRUPT",
+                    "the holder-free publication gate did not expose exactly one acquirable permit",
+                    "preserve the attribution manifest and inspect the last exact release record before tracker-bound recovery",
+                    null
+                );
+            }
+            manifestPublicationNextGeneration = checked(
+                manifestPublicationNextGeneration + 1L
+            );
+            manifestPublicationHolderGeneration = manifestPublicationNextGeneration;
+            manifestPublicationHolderRole = holderRole;
+            manifestPublicationHolderManagedThreadId =
+                Thread.CurrentThread.ManagedThreadId;
+            manifestPublicationHolderAcquiredUtcTicks = DateTime.UtcNow.Ticks;
+            manifestPublicationPhase = phase;
+            if (String.Equals(holderRole, "periodic-publisher", StringComparison.Ordinal)) {
+                manifestPeriodicPublicationDeferred = false;
+                manifestPeriodicPublicationDeferredUtcTicks = 0L;
+                manifestPeriodicPublicationDeferredByGeneration = 0L;
+            }
+            manifestPublicationStateRevision = checked(
+                manifestPublicationStateRevision + 1L
+            );
+            holderGeneration = manifestPublicationHolderGeneration;
+            observedState = SnapshotManifestPublicationGateLocked();
+            return true;
+        }
+    }
+
+    void SetManifestPublicationPhase(
+        string holderRole,
+        long holderGeneration,
+        string phase
+    ) {
+        lock (manifestPublicationStateGate) {
+            if (!String.Equals(
+                    manifestPublicationHolderRole,
+                    holderRole,
+                    StringComparison.Ordinal
+                ) ||
+                manifestPublicationHolderGeneration != holderGeneration ||
+                manifestPublicationGate.CurrentCount != 0) {
+                throw ManifestPublicationGateFaultLocked(
+                    "ASTRO_ATTRIBUTION_PUBLICATION_GATE_HOLDER_MISMATCH",
+                    "publication phase update did not match the exact current holder generation",
+                    "preserve every owned byte and inspect the state transition that lost its exact holder binding",
+                    null
+                );
+            }
+            manifestPublicationPhase = phase;
+            manifestPublicationStateRevision = checked(
+                manifestPublicationStateRevision + 1L
+            );
+        }
+    }
+
+    ManifestPublicationGateState ReleaseManifestPublicationGateLocked(
+        string holderRole,
+        long holderGeneration,
+        string releasePhase
+    ) {
+        if (!String.Equals(
+                manifestPublicationHolderRole,
+                holderRole,
+                StringComparison.Ordinal
+            ) ||
+            manifestPublicationHolderGeneration != holderGeneration ||
+            manifestPublicationGate.CurrentCount != 0) {
+            throw ManifestPublicationGateFaultLocked(
+                "ASTRO_ATTRIBUTION_PUBLICATION_GATE_RELEASE_MISMATCH",
+                "publication release did not match the exact current holder generation/count",
+                "preserve every owned byte and inspect the mismatched release caller before tracker-bound recovery",
+                null
+            );
+        }
+        int previousCount;
+        try {
+            previousCount = manifestPublicationGate.Release();
+        }
+        catch (Exception fault) {
+            manifestPublicationPhase = releasePhase + "-fault";
+            manifestPublicationStateRevision = checked(
+                manifestPublicationStateRevision + 1L
+            );
+            throw ManifestPublicationGateFaultLocked(
+                "ASTRO_ATTRIBUTION_PUBLICATION_GATE_RELEASE_FAILED",
+                "the exact publication holder could not return its count-one permit",
+                "preserve every owned byte and inspect the exact semaphore count/holder generation",
+                fault
+            );
+        }
+        if (previousCount != 0 || manifestPublicationGate.CurrentCount != 1) {
+            throw ManifestPublicationGateFaultLocked(
+                "ASTRO_ATTRIBUTION_PUBLICATION_GATE_COUNT_CORRUPT",
+                "publication release did not transition the exact permit count from zero to one",
+                "preserve every owned byte and inspect the exact semaphore count/holder generation",
+                null
+            );
+        }
+        manifestPublicationHolderRole = null;
+        manifestPublicationHolderManagedThreadId = 0;
+        manifestPublicationHolderAcquiredUtcTicks = 0L;
+        manifestPublicationHolderGeneration = 0L;
+        manifestPublicationPhase = releasePhase;
+        manifestPublicationStateRevision = checked(
+            manifestPublicationStateRevision + 1L
+        );
+        ManifestPublicationGateState state =
+            SnapshotManifestPublicationGateLocked();
+        Monitor.PulseAll(manifestPublicationStateGate);
+        return state;
+    }
+
+    ManifestPublicationGateState ReleaseManifestPublicationGate(
+        string holderRole,
+        long holderGeneration,
+        string releasePhase
+    ) {
+        lock (manifestPublicationStateGate) {
+            return ReleaseManifestPublicationGateLocked(
+                holderRole,
+                holderGeneration,
+                releasePhase
+            );
+        }
+    }
+
+    ManifestPublicationGateReleaseReadback ReleaseStableConsumerGate(
+        long holderGeneration
+    ) {
+        lock (manifestPublicationStateGate) {
+            bool wasDeferred = manifestPeriodicPublicationDeferred;
+            long deferredTicks = manifestPeriodicPublicationDeferredUtcTicks;
+            long deferredByGeneration =
+                manifestPeriodicPublicationDeferredByGeneration;
+            ManifestPublicationGateState state =
+                ReleaseManifestPublicationGateLocked(
+                    "stable-consumer",
+                    holderGeneration,
+                    "stable-consumer-released"
+                );
+            lastStableConsumerRelease =
+                new ManifestPublicationGateReleaseReadback {
+                    Schema = "astrolabe.tree-attribution-publication-gate.release-readback.v1",
+                    ReleasedHolderGeneration = holderGeneration,
+                    ReleasedHolderRole = "stable-consumer",
+                    CountAfterRelease = state.CurrentCount,
+                    HolderAbsentAfterRelease = state.HolderRole == null,
+                    ReleaseStateRevision = state.StateRevision,
+                    PhaseAfterRelease = state.Phase,
+                    ReleasedAtUtcTicks = DateTime.UtcNow.Ticks,
+                    PeriodicPublicationWasDeferred = wasDeferred,
+                    PeriodicPublicationDeferredUtcTicks = deferredTicks,
+                    PeriodicPublicationDeferredByGeneration = deferredByGeneration
+                };
+            return CloneReleaseReadback(lastStableConsumerRelease);
+        }
+    }
+
+    public ManifestPublicationGateState GetManifestPublicationGateState() {
+        lock (manifestPublicationStateGate) {
+            return SnapshotManifestPublicationGateLocked();
+        }
+    }
+
+    public ManifestPublicationGateReleaseReadback
+        GetStableManifestConsumerReleaseReadback(long expectedHolderGeneration) {
+        lock (manifestPublicationStateGate) {
+            if (lastStableConsumerRelease == null ||
+                lastStableConsumerRelease.ReleasedHolderGeneration !=
+                    expectedHolderGeneration) {
+                throw ManifestPublicationGateFaultLocked(
+                    "ASTRO_ATTRIBUTION_PUBLICATION_GATE_RELEASE_READBACK_MISSING",
+                    "the independently requested stable-consumer release generation is absent or different",
+                    "do not mutate target; preserve every owned byte and inspect the exact lease release path",
+                    null
+                );
+            }
+            if (lastStableConsumerRelease.CountAfterRelease != 1 ||
+                !lastStableConsumerRelease.HolderAbsentAfterRelease) {
+                throw ManifestPublicationGateFaultLocked(
+                    "ASTRO_ATTRIBUTION_PUBLICATION_GATE_RELEASE_READBACK_INVALID",
+                    "the stable-consumer release record does not prove count one and holder absence",
+                    "do not mutate target; preserve every owned byte and inspect the exact release state revision",
+                    null
+                );
+            }
+            return CloneReleaseReadback(lastStableConsumerRelease);
+        }
     }
 
     static bool BytesEqual(byte[] left, byte[] right) {
@@ -5414,17 +5817,29 @@ public class AstroTreeRecorder {
         }
     }
 
-    void Flush() {
-        if (!manifestPublicationGate.Wait(
-                TimeSpan.FromSeconds(RECORDER_BARRIER_TIMEOUT_SECONDS)
+    bool Flush(
+        string holderRole,
+        string phase,
+        bool deferPeriodicForStableConsumer
+    ) {
+        long holderGeneration;
+        ManifestPublicationGateState acquisitionState;
+        if (!TryAcquireManifestPublicationGate(
+                holderRole,
+                phase,
+                deferPeriodicForStableConsumer,
+                out holderGeneration,
+                out acquisitionState
             )) {
-            throw new TimeoutException(
-                "tree-attribution manifest publisher could not acquire its exact publication gate within " +
-                RECORDER_BARRIER_TIMEOUT_SECONDS.ToString(CultureInfo.InvariantCulture) +
-                " seconds"
-            );
+            return false;
         }
+        bool publicationSucceeded = false;
         try {
+            SetManifestPublicationPhase(
+                holderRole,
+                holderGeneration,
+                phase + "-snapshot"
+            );
             List<KeyValuePair<int, List<long[]>>> snap = new List<KeyValuePair<int, List<long[]>>>();
             long flushNs;
             byte[] previousBytes;
@@ -5490,6 +5905,11 @@ public class AstroTreeRecorder {
             // honest empty set; exact Job membership is the production cleanup authority.
             sb.Append("},\"owned_paths\":[]}");
             byte[] intended = new UTF8Encoding(false, true).GetBytes(sb.ToString());
+            SetManifestPublicationPhase(
+                holderRole,
+                holderGeneration,
+                phase + "-destination-cas"
+            );
             string publishedIdentity = PublishManifestBytes(
                 intended,
                 previousBytes,
@@ -5501,8 +5921,43 @@ public class AstroTreeRecorder {
                 lastFlushNs = flushNs;
                 dirty = false;
             }
+            SetManifestPublicationPhase(
+                holderRole,
+                holderGeneration,
+                phase + "-committed"
+            );
+            publicationSucceeded = true;
+            return true;
+        } catch (Exception fault) {
+            InvalidOperationException structured;
+            lock (manifestPublicationStateGate) {
+                if (String.Equals(
+                        manifestPublicationHolderRole,
+                        holderRole,
+                        StringComparison.Ordinal
+                    ) &&
+                    manifestPublicationHolderGeneration == holderGeneration) {
+                    manifestPublicationPhase = phase + "-publisher-fault";
+                    manifestPublicationStateRevision = checked(
+                        manifestPublicationStateRevision + 1L
+                    );
+                }
+                structured = ManifestPublicationGateFaultLocked(
+                    "ASTRO_ATTRIBUTION_PUBLICATION_PUBLISHER_FAULT",
+                    "the exact manifest publisher failed during its recorded publication phase",
+                    "preserve the final/scratch/envelope/tombstone bytes and inspect the exact holder generation/phase plus typed destination-CAS state",
+                    fault
+                );
+            }
+            throw structured;
         } finally {
-            manifestPublicationGate.Release();
+            ReleaseManifestPublicationGate(
+                holderRole,
+                holderGeneration,
+                publicationSucceeded
+                    ? phase + "-released"
+                    : phase + "-fault-released"
+            );
         }
     }
 
@@ -5517,18 +5972,30 @@ public class AstroTreeRecorder {
         // Final atomic publication happens only after every completion queued before the
         // sentinel was drained by the single worker. Anything still in the kernel job is
         // independently queried by cleanup/reclaim and remains an open interval.
-        Flush();
+        if (!Flush(
+                "terminal-publisher",
+                "terminal-final-publication",
+                false
+            )) {
+            throw new InvalidOperationException(
+                "terminal attribution publication was unexpectedly deferred"
+            );
+        }
         workerStopped = true;
     }
 
     public byte[] GetLastManifestBytes() {
-        if (!manifestPublicationGate.Wait(
-                TimeSpan.FromSeconds(RECORDER_BARRIER_TIMEOUT_SECONDS)
+        long holderGeneration;
+        ManifestPublicationGateState acquisitionState;
+        if (!TryAcquireManifestPublicationGate(
+                "readback-consumer",
+                "manifest-readback",
+                false,
+                out holderGeneration,
+                out acquisitionState
             )) {
-            throw new TimeoutException(
-                "tree-attribution manifest readback could not acquire its exact publication gate within " +
-                RECORDER_BARRIER_TIMEOUT_SECONDS.ToString(CultureInfo.InvariantCulture) +
-                " seconds"
+            throw new InvalidOperationException(
+                "manifest readback acquisition was unexpectedly deferred"
             );
         }
         try {
@@ -5538,54 +6005,80 @@ public class AstroTreeRecorder {
                 return (byte[])lastManifestBytes.Clone();
             }
         } finally {
-            manifestPublicationGate.Release();
+            ReleaseManifestPublicationGate(
+                "readback-consumer",
+                holderGeneration,
+                "manifest-readback-released"
+            );
         }
     }
 
     public sealed class StableManifestReadLease : IDisposable {
         AstroTreeRecorder owner;
         readonly byte[] manifestBytes;
+        readonly long holderGeneration;
+        ManifestPublicationGateReleaseReadback releaseReadback;
 
         internal StableManifestReadLease(
             AstroTreeRecorder owner,
             byte[] manifestBytes,
             string manifestFileIdentity,
-            long waitElapsedMilliseconds
+            long waitElapsedMilliseconds,
+            long holderGeneration
         ) {
             this.owner = owner;
             this.manifestBytes = (byte[])manifestBytes.Clone();
+            this.holderGeneration = holderGeneration;
             ManifestFileIdentity = manifestFileIdentity;
             WaitElapsedMilliseconds = waitElapsedMilliseconds;
         }
 
         public string ManifestFileIdentity { get; private set; }
         public long WaitElapsedMilliseconds { get; private set; }
+        public long HolderGeneration { get { return holderGeneration; } }
 
         public byte[] GetManifestBytes() {
             return (byte[])manifestBytes.Clone();
         }
 
+        public ManifestPublicationGateReleaseReadback ReleaseAndReadBack() {
+            AstroTreeRecorder current = Interlocked.Exchange(ref owner, null);
+            if (current != null) {
+                releaseReadback = current.ReleaseStableConsumerGate(
+                    holderGeneration
+                );
+            }
+            if (releaseReadback == null) {
+                throw new InvalidOperationException(
+                    "stable manifest consumer has no exact release readback"
+                );
+            }
+            return CloneReleaseReadback(releaseReadback);
+        }
+
         public void Dispose() {
             AstroTreeRecorder current = Interlocked.Exchange(ref owner, null);
-            if (current != null) current.ReleaseManifestPublicationGate();
+            if (current != null) {
+                releaseReadback = current.ReleaseStableConsumerGate(
+                    holderGeneration
+                );
+            }
         }
-    }
-
-    void ReleaseManifestPublicationGate() {
-        manifestPublicationGate.Release();
     }
 
     public StableManifestReadLease AcquireStableManifestReadLease() {
         System.Diagnostics.Stopwatch wait = System.Diagnostics.Stopwatch.StartNew();
-        if (!manifestPublicationGate.Wait(
-                TimeSpan.FromSeconds(RECORDER_BARRIER_TIMEOUT_SECONDS)
+        long holderGeneration;
+        ManifestPublicationGateState acquisitionState;
+        if (!TryAcquireManifestPublicationGate(
+                "stable-consumer",
+                "stable-consumer-verifying-manifest",
+                false,
+                out holderGeneration,
+                out acquisitionState
             )) {
-            wait.Stop();
-            throw new TimeoutException(
-                "tree-attribution stable-manifest consumer could not acquire its exact publication gate within " +
-                RECORDER_BARRIER_TIMEOUT_SECONDS.ToString(CultureInfo.InvariantCulture) +
-                " seconds (elapsed_ms=" +
-                wait.ElapsedMilliseconds.ToString(CultureInfo.InvariantCulture) + ")"
+            throw new InvalidOperationException(
+                "stable consumer acquisition was unexpectedly deferred"
             );
         }
         wait.Stop();
@@ -5629,14 +6122,25 @@ public class AstroTreeRecorder {
                 }
             }
 
+            SetManifestPublicationPhase(
+                "stable-consumer",
+                holderGeneration,
+                "stable-consumer-held-for-startup-sweeps"
+            );
+
             return new StableManifestReadLease(
                 this,
                 intended,
                 intendedIdentity,
-                wait.ElapsedMilliseconds
+                wait.ElapsedMilliseconds,
+                holderGeneration
             );
         } catch {
-            manifestPublicationGate.Release();
+            ReleaseManifestPublicationGate(
+                "stable-consumer",
+                holderGeneration,
+                "stable-consumer-acquisition-fault-released"
+            );
             throw;
         }
     }
@@ -7180,14 +7684,22 @@ try {
         )) {
         throw "LAUNCHER_BOUNDARY[ASTRO_LAUNCHER_ACTIVE_PAIR_INVALID]: active lock does not retain its prepublication ordinary exact-session TEMP (state=$($workspaceTempState.State), attributes=$($workspaceTempState.Attributes), error=$($workspaceTempState.Error)): $workspaceTemp"
     }
+    $publicationGateBeforeStartupSweep =
+        $treeRecorder.GetManifestPublicationGateState()
+    Write-Output "NO_ESCAPE[ASTRO_ATTRIBUTION_PUBLICATION_GATE_BEFORE_STARTUP_SWEEP]: $($publicationGateBeforeStartupSweep | ConvertTo-Json -Compress -Depth 5)"
     $stableManifestReadLease = $null
+    $stableManifestHolderGeneration = 0L
     try {
         try {
             $stableManifestReadLease =
                 $treeRecorder.AcquireStableManifestReadLease()
+            $stableManifestHolderGeneration =
+                [long]$stableManifestReadLease.HolderGeneration
             $stableManifestBytes =
                 $stableManifestReadLease.GetManifestBytes()
-            Write-Output "NO_ESCAPE[ASTRO_ATTRIBUTION_STABLE_READ_LEASE_HELD]: manifest=$attributionManifest; file_id=$($stableManifestReadLease.ManifestFileIdentity); bytes=$($stableManifestBytes.Length); sha256=$(Get-AstroByteSha256 $stableManifestBytes); wait_ms=$($stableManifestReadLease.WaitElapsedMilliseconds); scope=paired-temp-and-attribution-sweeps"
+            $publicationGateHeld =
+                $treeRecorder.GetManifestPublicationGateState()
+            Write-Output "NO_ESCAPE[ASTRO_ATTRIBUTION_STABLE_READ_LEASE_HELD]: manifest=$attributionManifest; file_id=$($stableManifestReadLease.ManifestFileIdentity); bytes=$($stableManifestBytes.Length); sha256=$(Get-AstroByteSha256 $stableManifestBytes); wait_ms=$($stableManifestReadLease.WaitElapsedMilliseconds); holder_generation=$stableManifestHolderGeneration; scope=paired-temp-and-attribution-sweeps; gate_state=$($publicationGateHeld | ConvertTo-Json -Compress -Depth 5)"
         }
         catch {
             throw "LAUNCHER_BOUNDARY[ASTRO_ATTRIBUTION_STABLE_READ_LEASE_FAILED]: {code=ASTRO_ATTRIBUTION_STABLE_READ_LEASE_FAILED; message=`"the exact live attribution producer could not establish one quiescent manifest path/FILE_ID/byte binding for the immediate sweeps: $($_.Exception.Message)`"; remediation=`"preserve every owned byte; inspect the recorder worker fault and typed refresh transaction state, then use only the tracker-bound recovery protocol after the exact owner and Job are inactive`"}"
@@ -7248,10 +7760,29 @@ try {
     }
     finally {
         if ($null -ne $stableManifestReadLease) {
-            $stableManifestReadLease.Dispose()
-            Write-Output "NO_ESCAPE[ASTRO_ATTRIBUTION_STABLE_READ_LEASE_RELEASED]: manifest=$attributionManifest; scope=paired-temp-and-attribution-sweeps"
+            $releaseResult =
+                $stableManifestReadLease.ReleaseAndReadBack()
+            $stableManifestReadLease = $null
+            $releaseReadback =
+                $treeRecorder.GetStableManifestConsumerReleaseReadback(
+                    $stableManifestHolderGeneration
+                )
+            if ([long]$releaseResult.ReleasedHolderGeneration -ne
+                    $stableManifestHolderGeneration -or
+                [long]$releaseReadback.ReleasedHolderGeneration -ne
+                    $stableManifestHolderGeneration -or
+                [int]$releaseReadback.CountAfterRelease -ne 1 -or
+                -not [bool]$releaseReadback.HolderAbsentAfterRelease -or
+                [long]$releaseResult.ReleaseStateRevision -ne
+                    [long]$releaseReadback.ReleaseStateRevision) {
+                throw "LAUNCHER_BOUNDARY[ASTRO_ATTRIBUTION_PUBLICATION_GATE_RELEASE_READBACK_INVALID]: {code=ASTRO_ATTRIBUTION_PUBLICATION_GATE_RELEASE_READBACK_INVALID; message=`"stable-consumer generation $stableManifestHolderGeneration did not independently read back count one, holder absence, and the same release revision`"; remediation=`"do not mutate target; preserve every owned byte and inspect the exact consumer release record`"}"
+            }
+            Write-Output "NO_ESCAPE[ASTRO_ATTRIBUTION_STABLE_READ_LEASE_RELEASED]: manifest=$attributionManifest; scope=paired-temp-and-attribution-sweeps; release_readback=$($releaseReadback | ConvertTo-Json -Compress -Depth 5)"
         }
     }
+    $publicationGateAfterStartupSweep =
+        $treeRecorder.GetManifestPublicationGateState()
+    Write-Output "NO_ESCAPE[ASTRO_ATTRIBUTION_PUBLICATION_GATE_AFTER_STARTUP_SWEEP]: $($publicationGateAfterStartupSweep | ConvertTo-Json -Compress -Depth 5)"
     # #651: a stale-owner reclaim may correctly archive the only prior lease while
     # preserving target/. A fresh ordinary launcher cannot infer ownership from those
     # bytes. This explicit mode binds the exact tree to a pre-existing tracker comment,
@@ -8269,8 +8800,14 @@ finally {
     $finalManifestExpectedBytes = $null
     if ($null -ne $treeRecorder) {
         try {
+            $publicationGateBeforeTerminal =
+                $treeRecorder.GetManifestPublicationGateState()
+            Write-Output "NO_ESCAPE[ASTRO_ATTRIBUTION_PUBLICATION_GATE_BEFORE_TERMINAL]: $($publicationGateBeforeTerminal | ConvertTo-Json -Compress -Depth 5)"
             $treeRecorder.Stop()
             $treeRecorderStopped = $true
+            $publicationGateAfterTerminal =
+                $treeRecorder.GetManifestPublicationGateState()
+            Write-Output "NO_ESCAPE[ASTRO_ATTRIBUTION_PUBLICATION_GATE_AFTER_TERMINAL]: $($publicationGateAfterTerminal | ConvertTo-Json -Compress -Depth 5)"
             $finalManifestExpectedBytes = $treeRecorder.GetLastManifestBytes()
             $manifestSnapshot = Get-AstroFileSnapshot `
                 -LiteralPath $attributionManifest `
