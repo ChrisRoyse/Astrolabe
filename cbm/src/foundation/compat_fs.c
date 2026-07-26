@@ -672,6 +672,28 @@ int cbm_rmdir(const char *path) {
     return ret;
 }
 
+/* #762: SQLite store-family replacement may race a short-lived Windows reader.
+ * Retry only handle-contention errors; structural filesystem failures remain
+ * single-attempt, and persistent contention exhausts this 10.575-second budget
+ * with the final native error intact. */
+enum {
+    CBM_RENAME_REPLACE_MAX_RETRIES = 15,
+    CBM_RENAME_REPLACE_BACKOFF_BASE_MS = 25,
+    CBM_RENAME_REPLACE_BACKOFF_MAX_MS = 1000,
+};
+
+static bool rename_replace_error_is_transient(DWORD error) {
+    switch (error) {
+    case ERROR_ACCESS_DENIED:
+    case ERROR_SHARING_VIOLATION:
+    case ERROR_LOCK_VIOLATION:
+    case ERROR_USER_MAPPED_FILE:
+        return true;
+    default:
+        return false;
+    }
+}
+
 int cbm_rename_replace(const char *old_path, const char *new_path) {
     /* #415: extended-length widen both paths so a deep store-family atomic swap
      * (dump/import temp -> final, corrupt-db -> .corrupt backup) is not
@@ -687,8 +709,72 @@ int cbm_rename_replace(const char *old_path, const char *new_path) {
         free(wnew);
         return CBM_NOT_FOUND;
     }
-    BOOL ok = MoveFileExW(wold, wnew, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
-    g_cbm_fs_last_error = ok ? ERROR_SUCCESS : GetLastError();
+    BOOL ok = FALSE;
+    DWORD error = ERROR_SUCCESS;
+    DWORD last_retry_error = ERROR_SUCCESS;
+    DWORD backoff_ms = CBM_RENAME_REPLACE_BACKOFF_BASE_MS;
+    char max_retries_buf[CBM_SZ_32];
+    (void)snprintf(max_retries_buf, sizeof(max_retries_buf), "%d", CBM_RENAME_REPLACE_MAX_RETRIES);
+    int attempt = 0;
+    for (; attempt <= CBM_RENAME_REPLACE_MAX_RETRIES; attempt++) {
+        ok = MoveFileExW(wold, wnew, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
+        if (ok) {
+            error = ERROR_SUCCESS;
+            break;
+        }
+        error = GetLastError();
+        if (!rename_replace_error_is_transient(error) ||
+            attempt == CBM_RENAME_REPLACE_MAX_RETRIES) {
+            break;
+        }
+        last_retry_error = error;
+
+        char attempt_buf[CBM_SZ_32];
+        char error_buf[CBM_SZ_32];
+        char backoff_buf[CBM_SZ_32];
+        (void)snprintf(attempt_buf, sizeof(attempt_buf), "%d", attempt + 1);
+        (void)snprintf(error_buf, sizeof(error_buf), "%lu", (unsigned long)error);
+        (void)snprintf(backoff_buf, sizeof(backoff_buf), "%lu", (unsigned long)backoff_ms);
+        cbm_log_warn(
+            "filesystem.rename_replace.retry", "code", "CBM_FS_RENAME_REPLACE_TRANSIENT", "source",
+            old_path, "destination", new_path, "attempt", attempt_buf, "max_retries",
+            max_retries_buf, "native_error_kind", "win32", "native_error", error_buf, "backoff_ms",
+            backoff_buf, "message", "a transient Windows handle prevented atomic replacement",
+            "remediation",
+            "waiting for the current reader to close before retrying the same atomic move");
+        Sleep(backoff_ms);
+        if (backoff_ms < CBM_RENAME_REPLACE_BACKOFF_MAX_MS) {
+            backoff_ms *= 2;
+            if (backoff_ms > CBM_RENAME_REPLACE_BACKOFF_MAX_MS) {
+                backoff_ms = CBM_RENAME_REPLACE_BACKOFF_MAX_MS;
+            }
+        }
+    }
+    if (ok && attempt > 0) {
+        char attempts_buf[CBM_SZ_32];
+        char error_buf[CBM_SZ_32];
+        (void)snprintf(attempts_buf, sizeof(attempts_buf), "%d", attempt + 1);
+        (void)snprintf(error_buf, sizeof(error_buf), "%lu", (unsigned long)last_retry_error);
+        cbm_log_info("filesystem.rename_replace.recovered", "code",
+                     "CBM_FS_RENAME_REPLACE_RECOVERED", "source", old_path, "destination", new_path,
+                     "attempts", attempts_buf, "last_transient_error", error_buf,
+                     "native_error_kind", "win32", "message",
+                     "the atomic replacement succeeded after bounded transient contention",
+                     "remediation", "none");
+    }
+    g_cbm_fs_last_error = (unsigned long)error;
+    if (!ok) {
+        char attempts_buf[CBM_SZ_32];
+        char error_buf[CBM_SZ_32];
+        (void)snprintf(attempts_buf, sizeof(attempts_buf), "%d", attempt + 1);
+        (void)snprintf(error_buf, sizeof(error_buf), "%lu", (unsigned long)error);
+        cbm_log_error(
+            "filesystem.rename_replace.failed", "code", "CBM_FS_RENAME_REPLACE_FAILED", "source",
+            old_path, "destination", new_path, "attempts", attempts_buf, "native_error_kind",
+            "win32", "native_error", error_buf, "message",
+            "the bounded atomic replacement protocol did not publish the source", "remediation",
+            "close persistent handles or correct the reported filesystem error, then retry");
+    }
     free(wold);
     free(wnew);
     return ok ? 0 : CBM_NOT_FOUND;
