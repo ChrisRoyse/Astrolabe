@@ -837,6 +837,8 @@ function Assert-NoIncompleteActivationTransaction {
             (Join-Path $child.FullName 'completion.json')
         $faultState = Get-AstroPathEntryState `
             (Join-Path $child.FullName 'fault.json')
+        $completionReadbackFaultState = Get-AstroPathEntryState `
+            (Join-Path $child.FullName 'completion-readback-fault.json')
         $intentPresent = $intentState.State -ceq 'present' -and
             ($intentState.Attributes -band [IO.FileAttributes]::Directory) -eq 0 -and
             ($intentState.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0
@@ -846,11 +848,18 @@ function Assert-NoIncompleteActivationTransaction {
         $faultPresent = $faultState.State -ceq 'present' -and
             ($faultState.Attributes -band [IO.FileAttributes]::Directory) -eq 0 -and
             ($faultState.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0
+        $completionReadbackFaultPresent =
+            $completionReadbackFaultState.State -ceq 'present' -and
+            ($completionReadbackFaultState.Attributes -band
+                [IO.FileAttributes]::Directory) -eq 0 -and
+            ($completionReadbackFaultState.Attributes -band
+                [IO.FileAttributes]::ReparsePoint) -eq 0
         $terminalCount = [int]$completionPresent + [int]$faultPresent
-        if (-not $intentPresent -or $terminalCount -ne 1) {
+        if (-not $intentPresent -or $terminalCount -ne 1 -or
+            $completionReadbackFaultPresent) {
             Fail-AstroGlobalActivation `
                 'ASTRO_GLOBAL_ACTIVATION_INCOMPLETE_TRANSACTION' `
-                "prior activation transaction is nonterminal or ambiguous: $($child.FullName) (intent=$($intentState.State); completion=$($completionState.State); fault=$($faultState.State))" `
+                "prior activation transaction is nonterminal, ambiguous, or has a terminal readback fault: $($child.FullName) (intent=$($intentState.State); completion=$($completionState.State); fault=$($faultState.State); completion_readback_fault=$($completionReadbackFaultState.State))" `
                 'preserve every transaction byte and reconcile the exact prior config state before another activation'
         }
     }
@@ -1336,37 +1345,39 @@ try {
 catch {
     $original = $_.Exception
     if ($null -ne $transactionPath) {
-        if ($claudeCommitAttempted -and $null -ne $claudeBefore) {
-            try {
-                $outcome = Restore-ConfigIfChanged `
-                    $claudeBefore $claudeReplacementBackupPath `
-                    $transactionPath 'claude'
-                $outcome.role = 'claude_code'
-                $rollback.Add($outcome)
-                $claudeCommitted = $false
+        if (-not $completionPublished) {
+            if ($claudeCommitAttempted -and $null -ne $claudeBefore) {
+                try {
+                    $outcome = Restore-ConfigIfChanged `
+                        $claudeBefore $claudeReplacementBackupPath `
+                        $transactionPath 'claude'
+                    $outcome.role = 'claude_code'
+                    $rollback.Add($outcome)
+                    $claudeCommitted = $false
+                }
+                catch {
+                    $rollback.Add([ordered]@{
+                            role = 'claude_code'
+                            verdict = 'failed'
+                            error = $_.Exception.Message
+                        })
+                }
             }
-            catch {
-                $rollback.Add([ordered]@{
-                        role = 'claude_code'
-                        verdict = 'failed'
-                        error = $_.Exception.Message
-                    })
-            }
-        }
-        if ($codexCommitAttempted -and $null -ne $codexBefore) {
-            try {
-                $outcome = Restore-ConfigIfChanged `
-                    $codexBefore $codexReplacementBackupPath `
-                    $transactionPath 'codex'
-                $rollback.Add($outcome)
-                $codexCommitted = $false
-            }
-            catch {
-                $rollback.Add([ordered]@{
-                        role = 'codex'
-                        verdict = 'failed'
-                        error = $_.Exception.Message
-                    })
+            if ($codexCommitAttempted -and $null -ne $codexBefore) {
+                try {
+                    $outcome = Restore-ConfigIfChanged `
+                        $codexBefore $codexReplacementBackupPath `
+                        $transactionPath 'codex'
+                    $rollback.Add($outcome)
+                    $codexCommitted = $false
+                }
+                catch {
+                    $rollback.Add([ordered]@{
+                            role = 'codex'
+                            verdict = 'failed'
+                            error = $_.Exception.Message
+                        })
+                }
             }
         }
 
@@ -1393,10 +1404,20 @@ catch {
             }
         }
         $fault = [ordered]@{
-            schema = 'astrolabe.global-mcp-activation-fault.v1'
-            verdict = 'not_activated'
+            schema = $(if ($completionPublished) {
+                    'astrolabe.global-mcp-activation-completion-readback-fault.v1'
+                } else { 'astrolabe.global-mcp-activation-fault.v1' })
+            verdict = $(if ($completionPublished) {
+                    'activated_terminal_readback_fault'
+                } else { 'not_activated' })
             recorded_at_utc = [DateTime]::UtcNow.ToString('o')
             issue = $Issue
+            completion = $(if ($completionPublished) {
+                    [ordered]@{
+                        path = $completionPath
+                        sha256 = $completionSha256
+                    }
+                } else { $null })
             error = [ordered]@{
                 code = $(if ($original.Data['AstroCode']) {
                         [string]$original.Data['AstroCode']
@@ -1412,7 +1433,10 @@ catch {
             final_config_state = $finalStates
         }
         try {
-            Write-NewDurableJson (Join-Path $transactionPath 'fault.json') $fault
+            $faultName = if ($completionPublished) {
+                'completion-readback-fault.json'
+            } else { 'fault.json' }
+            Write-NewDurableJson (Join-Path $transactionPath $faultName) $fault
         }
         catch {
             [Console]::Error.WriteLine(
