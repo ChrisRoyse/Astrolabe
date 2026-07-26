@@ -1610,6 +1610,134 @@ static int run_parallel_pipeline(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
     return check_cancel(p) ? CBM_NOT_FOUND : 0;
 }
 
+/* A project name is the live database filename identity. Reusing that name for
+ * another repository must never authorize replacement of the existing family.
+ * Enforce the persisted (name, canonical root) tuple before incremental hash
+ * routing, checkpointing, staging, or row-sink publication. Query-time
+ * provenance checks are too late: by then atomic publication has already
+ * displaced the prior source of truth. */
+static int validate_existing_store_project_identity(cbm_pipeline_t *p, cbm_store_t *store,
+                                                    const char *db_path) {
+    cbm_project_t *projects = NULL;
+    int project_count = 0;
+    if (cbm_store_list_projects(store, &projects, &project_count) != CBM_STORE_OK) {
+        cbm_log_error(
+            "pipeline.route_failed", "code", "CBM_PIPELINE_STORE_PROJECT_IDENTITY_READ_FAILED",
+            "operation", "validate_existing_store_project_identity", "store_path", db_path,
+            "requested_project", p->project_name, "requested_root", p->repo_path,
+            "publication_started", "false", "message",
+            "the existing store project identity could not be read", "remediation",
+            "preserve the complete store family, inspect the store diagnostic, and retry");
+        cbm_pipeline_record_fatal_error(
+            p, "CBM_PIPELINE_STORE_PROJECT_IDENTITY_READ_FAILED",
+            "validate_existing_store_project_identity", "route", db_path, 0,
+            "the existing store project identity could not be read before mutation",
+            "preserve the complete store family, inspect the store diagnostic, and retry");
+        cbm_store_free_projects(projects, project_count);
+        return CBM_NOT_FOUND;
+    }
+
+    if (project_count != 1 || !projects || !projects[0].name || !projects[0].root_path) {
+        char count_text[32];
+        (void)snprintf(count_text, sizeof(count_text), "%d", project_count);
+        cbm_log_error(
+            "pipeline.route_failed", "code", "CBM_PIPELINE_STORE_PROJECT_IDENTITY_INVALID",
+            "operation", "validate_existing_store_project_identity", "store_path", db_path,
+            "requested_project", p->project_name, "requested_root", p->repo_path,
+            "persisted_project_count", count_text, "publication_started", "false", "message",
+            "the existing store does not contain one complete project identity", "remediation",
+            "preserve the complete store family and repair or explicitly archive it before "
+            "retrying");
+        cbm_pipeline_record_fatal_error(
+            p, "CBM_PIPELINE_STORE_PROJECT_IDENTITY_INVALID",
+            "validate_existing_store_project_identity", "route", db_path,
+            (size_t)(project_count < 0 ? 0 : project_count),
+            "the existing store does not contain one complete project identity",
+            "preserve the complete store family and repair or explicitly archive it before "
+            "retrying");
+        cbm_store_free_projects(projects, project_count);
+        return CBM_NOT_FOUND;
+    }
+
+    if (strcmp(projects[0].name, p->project_name) != 0) {
+        char message[PL_ERROR_MESSAGE];
+        (void)snprintf(message, sizeof(message),
+                       "the existing store belongs to project '%s', not requested project '%s'",
+                       projects[0].name, p->project_name);
+        cbm_log_error(
+            "pipeline.route_failed", "code", "CBM_PIPELINE_STORE_PROJECT_IDENTITY_MISMATCH",
+            "operation", "validate_existing_store_project_identity", "store_path", db_path,
+            "existing_project", projects[0].name, "requested_project", p->project_name,
+            "existing_root", projects[0].root_path, "requested_root", p->repo_path,
+            "publication_started", "false", "message", message, "remediation",
+            "use a distinct project name or perform an explicit archive/delete/rebind transaction");
+        cbm_pipeline_record_fatal_error(
+            p, "CBM_PIPELINE_STORE_PROJECT_IDENTITY_MISMATCH",
+            "validate_existing_store_project_identity", "route", db_path, 0, message,
+            "use a distinct project name or perform an explicit archive/delete/rebind transaction");
+        cbm_store_free_projects(projects, project_count);
+        return CBM_NOT_FOUND;
+    }
+
+    char *existing_root = cbm_canonicalize_existing_path(projects[0].root_path);
+    char *requested_root = cbm_canonicalize_existing_path(p->repo_path);
+    if (!existing_root || !requested_root) {
+        cbm_log_error("pipeline.route_failed", "code",
+                      "CBM_PIPELINE_STORE_PROJECT_ROOT_UNRESOLVABLE", "operation",
+                      "validate_existing_store_project_identity", "store_path", db_path, "project",
+                      p->project_name, "existing_root", projects[0].root_path, "requested_root",
+                      p->repo_path, "existing_root_resolved", existing_root ? "true" : "false",
+                      "requested_root_resolved", requested_root ? "true" : "false",
+                      "publication_started", "false", "message",
+                      "the existing or requested repository root is not canonical and readable",
+                      "remediation",
+                      "restore the exact repository root or explicitly archive the old store "
+                      "before rebinding");
+        cbm_pipeline_record_fatal_error(
+            p, "CBM_PIPELINE_STORE_PROJECT_ROOT_UNRESOLVABLE",
+            "validate_existing_store_project_identity", "route", db_path, 0,
+            "the existing or requested repository root is not canonical and readable",
+            "restore the exact repository root or explicitly archive the old store before "
+            "rebinding");
+        free(existing_root);
+        free(requested_root);
+        cbm_store_free_projects(projects, project_count);
+        return CBM_NOT_FOUND;
+    }
+    cbm_normalize_path_sep(existing_root);
+    cbm_normalize_path_sep(requested_root);
+#ifdef _WIN32
+    bool roots_match = _stricmp(existing_root, requested_root) == 0;
+#else
+    bool roots_match = strcmp(existing_root, requested_root) == 0;
+#endif
+    if (!roots_match) {
+        char message[PL_ERROR_MESSAGE];
+        (void)snprintf(message, sizeof(message),
+                       "project '%s' is bound to root '%s', not requested root '%s'",
+                       p->project_name, existing_root, requested_root);
+        cbm_log_error(
+            "pipeline.route_failed", "code", "CBM_PIPELINE_STORE_PROJECT_ROOT_MISMATCH",
+            "operation", "validate_existing_store_project_identity", "store_path", db_path,
+            "project", p->project_name, "existing_root", existing_root, "requested_root",
+            requested_root, "publication_started", "false", "message", message, "remediation",
+            "use a distinct project name or perform an explicit archive/delete/rebind transaction");
+        cbm_pipeline_record_fatal_error(
+            p, "CBM_PIPELINE_STORE_PROJECT_ROOT_MISMATCH",
+            "validate_existing_store_project_identity", "route", db_path, 0, message,
+            "use a distinct project name or perform an explicit archive/delete/rebind transaction");
+        free(existing_root);
+        free(requested_root);
+        cbm_store_free_projects(projects, project_count);
+        return CBM_NOT_FOUND;
+    }
+
+    free(existing_root);
+    free(requested_root);
+    cbm_store_free_projects(projects, project_count);
+    return 0;
+}
+
 static int prepare_live_store_for_atomic_replacement(const char *db_path) {
     if (!cbm_path_exists(db_path)) {
         return 0;
@@ -1663,6 +1791,11 @@ static int try_incremental_or_delete_db(cbm_pipeline_t *p, cbm_file_info_t *file
     }
     cbm_store_t *check_store = cbm_store_open_path(db_path);
     if (check_store && cbm_store_check_integrity(check_store)) {
+        if (validate_existing_store_project_identity(p, check_store, db_path) != 0) {
+            cbm_store_close(check_store);
+            free(db_path);
+            return CBM_NOT_FOUND;
+        }
         cbm_file_hash_t *hashes = NULL;
         int hash_count = 0;
         int hash_rc = cbm_store_get_file_hashes(check_store, p->project_name, &hashes, &hash_count);
