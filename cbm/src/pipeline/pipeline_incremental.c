@@ -180,11 +180,11 @@ static bool *classify_files(cbm_file_info_t *files, int file_count, cbm_file_has
  *                       new-or-deleted.
  *
  * Without this distinction, a fast-mode reindex after a full-mode index
- * would silently purge every file under `tools/`, `scripts/`, `bin/`,
- * `build/`, `docs/`, `__tests__/`, etc. — see task
- * claude-connectors/codebase-memory-index-repository-is-destructive-...
- * and the 2026-04-13 Skyline incident (packages/mcp/src/tools/ vanished
- * from a live graph mid-session).
+ * would silently purge every file under mode-excluded directories such as
+ * `generated/`, `build/`, `docs/`, and `__tests__/`. The 2026-04-13 Skyline
+ * incident demonstrated the same failure before production-bearing `tools/`,
+ * `scripts/`, and `bin/` were removed from FAST_SKIP_DIRS (#752):
+ * packages/mcp/src/tools/ vanished from a live graph mid-session.
  *
  * Mode-skipped hash preservation is the second half of the additive-merge
  * contract: dump_and_persist re-upserts these hash rows so the next reindex

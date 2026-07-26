@@ -54,14 +54,19 @@ static const char *ALWAYS_SKIP_DIRS[] = {
     /* Misc */
     ".qdrant_code_embeddings", ".tmp", "vendor", "vendored", NULL};
 
+/* Fast discovery may skip directories whose role is structurally constrained
+ * to non-runtime material. Do not classify `tools`, `scripts`, or `bin` by
+ * basename: real repositories use those names for imported production modules
+ * and executable entry points. Omitting them from the immutable source snapshot
+ * makes exact import resolution impossible (Astrolabe #752). */
 static const char *FAST_SKIP_DIRS[] = {
     "generated", "gen",           "auto-generated", "fixtures",     "testdata",    "test_data",
     "__tests__", "__mocks__",     "__snapshots__",  "__fixtures__", "__test__",    "docs",
     "doc",       "documentation", "examples",       "example",      "samples",     "sample",
     "assets",    "static",        "public",         "media",        "third_party", "thirdparty",
     "3rdparty",  "external",      "migrations",     "seeds",        "e2e",         "integration",
-    "locale",    "locales",       "i18n",           "l10n",         "scripts",     "tools",
-    "hack",      "bin",           "build",          "out",          NULL};
+    "locale",    "locales",       "i18n",           "l10n",         "hack",        "build",
+    "out",       NULL};
 
 /* ── Ignored suffixes ───────────────────────────────── */
 
