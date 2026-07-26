@@ -657,6 +657,24 @@ const SEARCH_GRAPH_ASTROLABE_ONLY_KEYS: [&str; 4] = [
     "propagated_label",
 ];
 
+fn search_graph_argument_type_error(
+    argument: &str,
+    expected_type: &str,
+    actual: &Value,
+) -> Result<String, DynError> {
+    tool_json_error_result(json!({
+        "code": "ASTRO_MCP_INVALID_ARGUMENT",
+        "message": format!(
+            "search_graph argument '{argument}' must be {expected_type}; received {}",
+            json_type_name(actual)
+        ),
+        "remediation": "send search_graph arguments that conform to the inputSchema returned by tools/list; correct the named field's JSON type and retry",
+        "argument": argument,
+        "expected_type": expected_type,
+        "actual_type": json_type_name(actual),
+    }))
+}
+
 /// `search_graph` with Astrolabe extensions (#42 fusion, #69 propagated_label).
 ///
 /// Default (no Astrolabe knob) is a byte-identical passthrough to the CBM tool.
@@ -677,6 +695,27 @@ pub(crate) fn handle_search_graph(
     let Some(args_obj) = args.as_object() else {
         return Ok(runner.handle_tool_raw("search_graph", args_json)?);
     };
+
+    if let Some(value) = args_obj.get("fusion")
+        && !value.is_boolean()
+    {
+        return search_graph_argument_type_error("fusion", "a JSON boolean", value);
+    }
+    if let Some(value) = args_obj.get("fusion_override")
+        && !value.is_object()
+    {
+        return search_graph_argument_type_error("fusion_override", "a JSON object", value);
+    }
+    if let Some(value) = args_obj.get("temporal_alpha_millis")
+        && !(value.is_i64() || value.is_u64())
+    {
+        return search_graph_argument_type_error("temporal_alpha_millis", "a JSON integer", value);
+    }
+    if let Some(value) = args_obj.get("propagated_label")
+        && !value.is_string()
+    {
+        return search_graph_argument_type_error("propagated_label", "a JSON string", value);
+    }
 
     // #42: opt-in fused engine. Only an explicit `fusion: true` diverts from the
     // legacy path; anything else keeps the byte-identical CBM passthrough.

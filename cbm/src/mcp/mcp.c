@@ -2509,7 +2509,138 @@ static bool run_semantic_query(yyjson_mut_doc *doc, yyjson_mut_val *root, const 
     return type_error;
 }
 
+static char *search_graph_argument_error_result(const char *argument, const char *expected,
+                                                const char *actual) {
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    yyjson_mut_val *root = doc ? yyjson_mut_obj(doc) : NULL;
+    if (!root) {
+        if (doc) {
+            yyjson_mut_doc_free(doc);
+        }
+        return cbm_mcp_text_result(
+            "{\"code\":\"CBM_MCP_INVALID_ARGUMENT\",\"message\":\"search_graph arguments do "
+            "not conform to the advertised inputSchema\",\"remediation\":\"send a JSON object "
+            "whose fields have the advertised JSON types\"}",
+            true);
+    }
+
+    yyjson_mut_doc_set_root(doc, root);
+    char message[CBM_SZ_512];
+    snprintf(message, sizeof(message), "search_graph argument '%s' must be %s; received %s",
+             argument, expected, actual);
+    yyjson_mut_obj_add_str(doc, root, "code", "CBM_MCP_INVALID_ARGUMENT");
+    yyjson_mut_obj_add_str(doc, root, "message", message);
+    yyjson_mut_obj_add_str(doc, root, "remediation",
+                           "send search_graph arguments that conform to the inputSchema returned "
+                           "by tools/list; correct the named field's JSON type and retry");
+    yyjson_mut_obj_add_str(doc, root, "argument", argument);
+    yyjson_mut_obj_add_str(doc, root, "expected_type", expected);
+    yyjson_mut_obj_add_str(doc, root, "actual_type", actual);
+
+    char *json = yyjson_mut_write(doc, 0, NULL);
+    yyjson_mut_doc_free(doc);
+    if (!json) {
+        return cbm_mcp_text_result(
+            "{\"code\":\"CBM_MCP_INVALID_ARGUMENT\",\"message\":\"search_graph argument "
+            "validation failed and its detailed response could not be serialized\","
+            "\"remediation\":\"free memory and retry the same corrected request\"}",
+            true);
+    }
+    char *result = cbm_mcp_text_result(json, true);
+    free(json);
+    return result;
+}
+
+/* Validate every field whose type is declared by search_graph's tools/list
+ * inputSchema before resolving a project or opening a store. The generic argument
+ * accessors intentionally return their defaults for absent fields, so without this
+ * boundary a present value of the wrong JSON type is indistinguishable from absence. */
+static char *validate_search_graph_arguments(const char *args) {
+    yyjson_doc *doc = args ? yyjson_read(args, strlen(args), 0) : NULL;
+    yyjson_val *root = doc ? yyjson_doc_get_root(doc) : NULL;
+    if (!root || !yyjson_is_obj(root)) {
+        const char *actual = root ? yyjson_get_type_desc(root) : "invalid JSON";
+        char *result = search_graph_argument_error_result("arguments", "a JSON object", actual);
+        if (doc) {
+            yyjson_doc_free(doc);
+        }
+        return result;
+    }
+
+    yyjson_val *project = yyjson_obj_get(root, "project");
+    if (!project || !yyjson_is_str(project)) {
+        const char *actual = project ? yyjson_get_type_desc(project) : "absent";
+        char *result = search_graph_argument_error_result("project", "a JSON string", actual);
+        yyjson_doc_free(doc);
+        return result;
+    }
+
+    const char *string_fields[] = {"query",      "label",        "name_pattern",
+                                   "qn_pattern", "file_pattern", "relationship"};
+    for (size_t i = 0; i < sizeof(string_fields) / sizeof(string_fields[0]); i++) {
+        yyjson_val *value = yyjson_obj_get(root, string_fields[i]);
+        if (value && !yyjson_is_str(value)) {
+            char *result = search_graph_argument_error_result(string_fields[i], "a JSON string",
+                                                              yyjson_get_type_desc(value));
+            yyjson_doc_free(doc);
+            return result;
+        }
+    }
+
+    const char *integer_fields[] = {"min_degree", "max_degree", "limit", "offset"};
+    for (size_t i = 0; i < sizeof(integer_fields) / sizeof(integer_fields[0]); i++) {
+        yyjson_val *value = yyjson_obj_get(root, integer_fields[i]);
+        if (value && !yyjson_is_int(value)) {
+            char *result = search_graph_argument_error_result(integer_fields[i], "a JSON integer",
+                                                              yyjson_get_type_desc(value));
+            yyjson_doc_free(doc);
+            return result;
+        }
+    }
+
+    const char *boolean_fields[] = {"exclude_entry_points", "include_connected"};
+    for (size_t i = 0; i < sizeof(boolean_fields) / sizeof(boolean_fields[0]); i++) {
+        yyjson_val *value = yyjson_obj_get(root, boolean_fields[i]);
+        if (value && !yyjson_is_bool(value)) {
+            char *result = search_graph_argument_error_result(boolean_fields[i], "a JSON boolean",
+                                                              yyjson_get_type_desc(value));
+            yyjson_doc_free(doc);
+            return result;
+        }
+    }
+
+    yyjson_val *semantic_query = yyjson_obj_get(root, "semantic_query");
+    if (semantic_query && !yyjson_is_arr(semantic_query)) {
+        char *result = search_graph_argument_error_result(
+            "semantic_query", "an array of JSON strings", yyjson_get_type_desc(semantic_query));
+        yyjson_doc_free(doc);
+        return result;
+    }
+    if (semantic_query) {
+        size_t index, max;
+        yyjson_val *item;
+        yyjson_arr_foreach(semantic_query, index, max, item) {
+            if (!yyjson_is_str(item)) {
+                char argument[CBM_SZ_64];
+                snprintf(argument, sizeof(argument), "semantic_query[%zu]", index);
+                char *result = search_graph_argument_error_result(argument, "a JSON string",
+                                                                  yyjson_get_type_desc(item));
+                yyjson_doc_free(doc);
+                return result;
+            }
+        }
+    }
+
+    yyjson_doc_free(doc);
+    return NULL;
+}
+
 static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
+    char *argument_error = validate_search_graph_arguments(args);
+    if (argument_error) {
+        return argument_error;
+    }
+
     char *project = get_project_arg(args);
     cbm_store_t *store = resolve_store(srv, project);
     REQUIRE_STORE(store, project);
