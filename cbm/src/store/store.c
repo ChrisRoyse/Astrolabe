@@ -9044,6 +9044,20 @@ static double vs_min_cosine_score(const int8_t *node_vec, int node_vec_len,
 static int vs_append_result(cbm_store_t *s, cbm_vector_result_t **results, int *count, int *cap,
                             sqlite3_stmt *stmt, const int8_t (*kw_vecs)[VS_VEC_DIM],
                             int actual_kw) {
+    enum {
+        VS_COL_ID = 0,
+        VS_COL_ATOM_ID = 1,
+        VS_COL_NAME = 2,
+        VS_COL_QUALIFIED_NAME = 3,
+        VS_COL_FILE_PATH = 4,
+        VS_COL_LABEL = 5,
+        VS_COL_START_LINE = 6,
+        VS_COL_END_LINE = 7,
+        VS_COL_START_BYTE = 8,
+        VS_COL_END_BYTE = 9,
+        VS_COL_SCORE = 10,
+        VS_COL_VECTOR = 11,
+    };
     if (store_array_reserve(s, (void **)results, cap, *count + 1, sizeof(**results),
                             "vector search result") != CBM_STORE_OK) {
         return CBM_STORE_ERR;
@@ -9051,12 +9065,12 @@ static int vs_append_result(cbm_store_t *s, cbm_vector_result_t **results, int *
     int idx = *count;
     cbm_vector_result_t *row = &(*results)[idx];
     memset(row, 0, sizeof(*row));
-    row->node_id = sqlite3_column_int64(stmt, 0);
-    const char *atom_id = (const char *)sqlite3_column_text(stmt, SKIP_ONE);
-    const char *name = (const char *)sqlite3_column_text(stmt, ST_COL_2);
-    const char *qn = (const char *)sqlite3_column_text(stmt, ST_COL_3);
-    const char *fp = (const char *)sqlite3_column_text(stmt, ST_COL_4);
-    const char *label = (const char *)sqlite3_column_text(stmt, ST_COL_5);
+    row->node_id = sqlite3_column_int64(stmt, VS_COL_ID);
+    const char *atom_id = (const char *)sqlite3_column_text(stmt, VS_COL_ATOM_ID);
+    const char *name = (const char *)sqlite3_column_text(stmt, VS_COL_NAME);
+    const char *qn = (const char *)sqlite3_column_text(stmt, VS_COL_QUALIFIED_NAME);
+    const char *fp = (const char *)sqlite3_column_text(stmt, VS_COL_FILE_PATH);
+    const char *label = (const char *)sqlite3_column_text(stmt, VS_COL_LABEL);
     row->atom_id = strdup(atom_id ? atom_id : "");
     row->name = strdup(name ? name : "");
     row->qualified_name = strdup(qn ? qn : "");
@@ -9075,8 +9089,27 @@ static int vs_append_result(cbm_store_t *s, cbm_vector_result_t **results, int *
                       "free memory and retry; no partial result was returned");
         return CBM_STORE_ERR;
     }
-    const int8_t *node_vec = (const int8_t *)sqlite3_column_blob(stmt, ST_COL_7);
-    int node_vec_len = sqlite3_column_bytes(stmt, ST_COL_7);
+    int64_t start_byte = sqlite3_column_int64(stmt, VS_COL_START_BYTE);
+    int64_t end_byte = sqlite3_column_int64(stmt, VS_COL_END_BYTE);
+    if (start_byte < 0 || end_byte < start_byte) {
+        free(row->atom_id);
+        free(row->name);
+        free(row->qualified_name);
+        free(row->file_path);
+        free(row->label);
+        memset(row, 0, sizeof(*row));
+        store_set_error(s, "vector search row carries an invalid persisted source span");
+        cbm_log_error("store.vector_search", "code", "CBM_STORE_SOURCE_SPAN_INVALID", "message",
+                      s->errbuf, "remediation",
+                      "repair or re-index the project store; no inferred location was returned");
+        return CBM_STORE_ERR;
+    }
+    row->start_line = sqlite3_column_int(stmt, VS_COL_START_LINE);
+    row->end_line = sqlite3_column_int(stmt, VS_COL_END_LINE);
+    row->start_byte = (uint64_t)start_byte;
+    row->end_byte = (uint64_t)end_byte;
+    const int8_t *node_vec = (const int8_t *)sqlite3_column_blob(stmt, VS_COL_VECTOR);
+    int node_vec_len = sqlite3_column_bytes(stmt, VS_COL_VECTOR);
     row->score = vs_min_cosine_score(node_vec, node_vec_len, kw_vecs, actual_kw);
     *count = idx + 1;
     return CBM_STORE_OK;
@@ -9107,6 +9140,7 @@ int cbm_store_vector_search(cbm_store_t *s, const char *project, const char **ke
      * We use the FIRST keyword as the SQL sort (for top-K pre-filter),
      * then re-score with min across all keywords in the append helper. */
     const char *sql = "SELECT n.id, n.atom_id, n.name, n.qualified_name, n.file_path, n.label,"
+                      "       n.start_line, n.end_line, n.start_byte, n.end_byte,"
                       "       cbm_cosine_i8(v.vector, ?1) as score, v.vector"
                       " FROM node_vectors v"
                       " INNER JOIN nodes n ON n.id = v.node_id"

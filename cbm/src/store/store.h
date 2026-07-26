@@ -779,6 +779,10 @@ typedef struct {
     char *qualified_name;
     char *file_path;
     char *label;
+    int start_line;
+    int end_line;
+    uint64_t start_byte;
+    uint64_t end_byte;
     double score;
 } cbm_vector_result_t;
 

@@ -351,7 +351,9 @@ static const tool_def_t TOOLS[] = {
      "semantic modes may be combined only when query is absent. PAGINATION: results are capped "
      "at limit (default 200). The response includes exact 'total' and deterministic 'has_more'; "
      "page by re-calling with offset=offset+limit until has_more is false. Narrow query mode via "
-     "label/file_pattern before paginating large result sets.",
+     "label/file_pattern before paginating large result sets. Every returned node carries its "
+     "authoritative persisted start_line, end_line, start_byte, and end_byte; genuinely spanless "
+     "structural nodes carry explicit zeroes.",
      "{\"type\":\"object\",\"properties\":{\"project\":{\"type\":\"string\"},"
      "\"query\":{\"type\":\"string\",\"description\":\"Natural-language or keyword full-text "
      "search using BM25 ranking. Identifier punctuation separates terms; camelCase identifiers are "
@@ -522,6 +524,58 @@ static const int TOOL_COUNT = sizeof(TOOLS) / sizeof(TOOLS[0]);
 
 static const char MCP_TOOL_OUTPUT_SCHEMA[] = "{\"type\":\"object\",\"additionalProperties\":true}";
 
+/* search_graph exposes two result arrays because exact/filter and semantic modes may be
+ * combined. Keep their common source-location contract explicit while allowing exact results
+ * to graft language-specific persisted properties whose names are not a closed protocol enum. */
+static const char MCP_SEARCH_GRAPH_OUTPUT_SCHEMA[] =
+    "{\"type\":\"object\",\"properties\":{"
+    "\"total\":{\"type\":\"integer\",\"minimum\":0},"
+    "\"search_mode\":{\"type\":\"string\",\"const\":\"bm25\"},"
+    "\"results\":{\"type\":\"array\",\"items\":{\"oneOf\":["
+    "{\"type\":\"object\",\"properties\":{"
+    "\"atom_id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"},"
+    "\"qualified_name\":{\"type\":\"string\"},\"label\":{\"type\":\"string\"},"
+    "\"file_path\":{\"type\":\"string\"},"
+    "\"start_line\":{\"type\":\"integer\"},\"end_line\":{\"type\":\"integer\"},"
+    "\"start_byte\":{\"type\":\"integer\",\"minimum\":0},"
+    "\"end_byte\":{\"type\":\"integer\",\"minimum\":0},"
+    "\"rank\":{\"type\":\"number\"}},"
+    "\"required\":[\"atom_id\",\"name\",\"qualified_name\",\"label\",\"file_path\","
+    "\"start_line\",\"end_line\",\"start_byte\",\"end_byte\",\"rank\"],"
+    "\"additionalProperties\":false},"
+    "{\"type\":\"object\",\"properties\":{"
+    "\"atom_id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"},"
+    "\"qualified_name\":{\"type\":\"string\"},\"label\":{\"type\":\"string\"},"
+    "\"file_path\":{\"type\":\"string\"},"
+    "\"start_line\":{\"type\":\"integer\"},\"end_line\":{\"type\":\"integer\"},"
+    "\"start_byte\":{\"type\":\"integer\",\"minimum\":0},"
+    "\"end_byte\":{\"type\":\"integer\",\"minimum\":0},"
+    "\"in_degree\":{\"type\":\"integer\",\"minimum\":0},"
+    "\"out_degree\":{\"type\":\"integer\",\"minimum\":0},"
+    "\"connected_names\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},"
+    "\"connected_edges\":{\"type\":\"array\",\"items\":{\"type\":\"object\","
+    "\"properties\":{\"name\":{\"type\":\"string\"},"
+    "\"validated\":{\"type\":\"boolean\"},\"trust\":{\"type\":\"string\"},"
+    "\"weight\":{\"type\":\"integer\"},\"provenance\":{\"type\":\"string\"},"
+    "\"provenance_error\":{\"type\":\"string\"}},\"required\":[\"name\"],"
+    "\"additionalProperties\":false}}},"
+    "\"required\":[\"atom_id\",\"name\",\"qualified_name\",\"label\",\"file_path\","
+    "\"start_line\",\"end_line\",\"start_byte\",\"end_byte\",\"in_degree\","
+    "\"out_degree\"],\"additionalProperties\":true}]}},"
+    "\"semantic_results\":{\"type\":\"array\",\"items\":{\"type\":\"object\","
+    "\"properties\":{\"atom_id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"},"
+    "\"qualified_name\":{\"type\":\"string\"},\"label\":{\"type\":\"string\"},"
+    "\"file_path\":{\"type\":\"string\"},"
+    "\"start_line\":{\"type\":\"integer\"},\"end_line\":{\"type\":\"integer\"},"
+    "\"start_byte\":{\"type\":\"integer\",\"minimum\":0},"
+    "\"end_byte\":{\"type\":\"integer\",\"minimum\":0},"
+    "\"score\":{\"type\":\"number\"}},"
+    "\"required\":[\"atom_id\",\"name\",\"qualified_name\",\"label\",\"file_path\","
+    "\"start_line\",\"end_line\",\"start_byte\",\"end_byte\",\"score\"],"
+    "\"additionalProperties\":false}},"
+    "\"has_more\":{\"type\":\"boolean\"},\"hint\":{\"type\":\"string\"}},"
+    "\"required\":[\"total\",\"results\",\"has_more\"],\"additionalProperties\":false}";
+
 static void mcp_add_json_schema(yyjson_mut_doc *doc, yyjson_mut_val *obj, const char *key,
                                 const char *schema_json) {
     yyjson_doc *schema_doc = yyjson_read(schema_json, strlen(schema_json), 0);
@@ -541,7 +595,10 @@ static void mcp_add_tool_def(yyjson_mut_doc *doc, yyjson_mut_val *tools, int i) 
     yyjson_mut_obj_add_str(doc, tool, "description", TOOLS[i].description);
 
     mcp_add_json_schema(doc, tool, "inputSchema", TOOLS[i].input_schema);
-    mcp_add_json_schema(doc, tool, "outputSchema", MCP_TOOL_OUTPUT_SCHEMA);
+    const char *output_schema = strcmp(TOOLS[i].name, "search_graph") == 0
+                                    ? MCP_SEARCH_GRAPH_OUTPUT_SCHEMA
+                                    : MCP_TOOL_OUTPUT_SCHEMA;
+    mcp_add_json_schema(doc, tool, "outputSchema", output_schema);
 
     yyjson_mut_arr_add_val(tools, tool);
 }
@@ -2216,9 +2273,11 @@ enum {
     BM25_COL_NAME = 3,
     BM25_COL_QN = 4,
     BM25_COL_FILE = 5,
-    BM25_COL_START = 6,
-    BM25_COL_END = 7,
-    BM25_COL_RANK = 8,
+    BM25_COL_START_LINE = 6,
+    BM25_COL_END_LINE = 7,
+    BM25_COL_START_BYTE = 8,
+    BM25_COL_END_BYTE = 9,
+    BM25_COL_RANK = 10,
     BM25_BIND_QUERY = 1,
     BM25_BIND_PROJECT = 2,
     BM25_BIND_LIMIT = 3,
@@ -2227,6 +2286,14 @@ enum {
     BM25_BIND_LABEL = 7,
     BM25_SQL_AUTO_LEN = -1,
 };
+
+static void mcp_add_source_location(yyjson_mut_doc *doc, yyjson_mut_val *item, int start_line,
+                                    int end_line, uint64_t start_byte, uint64_t end_byte) {
+    yyjson_mut_obj_add_int(doc, item, "start_line", start_line);
+    yyjson_mut_obj_add_int(doc, item, "end_line", end_line);
+    yyjson_mut_obj_add_uint(doc, item, "start_byte", start_byte);
+    yyjson_mut_obj_add_uint(doc, item, "end_byte", end_byte);
+}
 
 /* Module-local SQLITE_TRANSIENT wrapper to dodge performance-no-int-to-ptr.
  * See the matching helper in src/store/store.c for the same pattern. */
@@ -2550,7 +2617,7 @@ static char *bm25_search(cbm_store_t *store, const char *project, const char *qu
     /* bm25() is lower-is-better. The authoritative node ID breaks every score
      * tie so OFFSET pages are stable and cannot repeat or omit equal-ranked rows. */
     const char *sql = "SELECT n.id, n.atom_id, n.label, n.name, n.qualified_name, n.file_path, "
-                      "       n.start_line, n.end_line, "
+                      "       n.start_line, n.end_line, n.start_byte, n.end_byte, "
                       "       (bm25(nodes_fts) "
                       "        - CASE WHEN n.label IN ('Function','Method') THEN 10.0 "
                       "               WHEN n.label = 'Route' THEN 8.0 "
@@ -2622,8 +2689,10 @@ static char *bm25_search(cbm_store_t *store, const char *project, const char *qu
                                   (const char *)sqlite3_column_text(stmt, BM25_COL_LABEL));
         yyjson_mut_obj_add_strcpy(doc, item, "file_path",
                                   (const char *)sqlite3_column_text(stmt, BM25_COL_FILE));
-        yyjson_mut_obj_add_int(doc, item, "start_line", sqlite3_column_int(stmt, BM25_COL_START));
-        yyjson_mut_obj_add_int(doc, item, "end_line", sqlite3_column_int(stmt, BM25_COL_END));
+        mcp_add_source_location(doc, item, sqlite3_column_int(stmt, BM25_COL_START_LINE),
+                                sqlite3_column_int(stmt, BM25_COL_END_LINE),
+                                (uint64_t)sqlite3_column_int64(stmt, BM25_COL_START_BYTE),
+                                (uint64_t)sqlite3_column_int64(stmt, BM25_COL_END_BYTE));
         yyjson_mut_obj_add_real(doc, item, "rank", sqlite3_column_double(stmt, BM25_COL_RANK));
         yyjson_mut_arr_add_val(results, item);
         emitted++;
@@ -2704,6 +2773,8 @@ static void emit_search_results(yyjson_mut_doc *doc, yyjson_mut_val *root,
         yyjson_mut_obj_add_str(doc, item, "label", sr->node.label ? sr->node.label : "");
         yyjson_mut_obj_add_str(doc, item, "file_path",
                                sr->node.file_path ? sr->node.file_path : "");
+        mcp_add_source_location(doc, item, sr->node.start_line, sr->node.end_line,
+                                sr->node.start_byte, sr->node.end_byte);
         yyjson_mut_obj_add_int(doc, item, "in_degree", sr->in_degree);
         yyjson_mut_obj_add_int(doc, item, "out_degree", sr->out_degree);
         if (include_connected && sr->node.id > 0) {
@@ -2751,6 +2822,8 @@ static void emit_semantic_results(yyjson_mut_doc *doc, yyjson_mut_val *root,
         yyjson_mut_obj_add_strcpy(doc, vitem, "qualified_name", vresults[v].qualified_name);
         yyjson_mut_obj_add_strcpy(doc, vitem, "label", vresults[v].label);
         yyjson_mut_obj_add_strcpy(doc, vitem, "file_path", vresults[v].file_path);
+        mcp_add_source_location(doc, vitem, vresults[v].start_line, vresults[v].end_line,
+                                vresults[v].start_byte, vresults[v].end_byte);
         yyjson_mut_obj_add_real(doc, vitem, "score", vresults[v].score);
         yyjson_mut_arr_add_val(sem_results, vitem);
     }
