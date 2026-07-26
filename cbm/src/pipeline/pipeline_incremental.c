@@ -173,18 +173,18 @@ static bool *classify_files(cbm_file_info_t *files, int file_count, cbm_file_has
  *                       be purged and its hash row dropped.
  *   - "mode-skipped" — `stat()` succeeds. The file exists on disk but the
  *                       current discovery pass didn't visit it (e.g. excluded
- *                       by FAST_SKIP_DIRS in fast/moderate mode). Its nodes
+ *                       by a fast-mode file filter or an ignore rule). Its nodes
  *                       must be preserved AND its hash row must be carried
  *                       forward into the new DB so subsequent reindexes can
  *                       still see it as "known" rather than treating it as
  *                       new-or-deleted.
  *
  * Without this distinction, a fast-mode reindex after a full-mode index
- * would silently purge every file under mode-excluded directories such as
- * `generated/`, `build/`, `docs/`, and `__tests__/`. The 2026-04-13 Skyline
- * incident demonstrated the same failure before production-bearing `tools/`,
- * `scripts/`, and `bin/` were removed from FAST_SKIP_DIRS (#752):
- * packages/mcp/src/tools/ vanished from a live graph mid-session.
+ * would silently purge every file omitted by the narrower pass. The 2026-04-13
+ * Skyline incident demonstrated this failure when basename role guesses hid
+ * production source: packages/mcp/src/tools/ vanished from a live graph
+ * mid-session. All fast/moderate directory-role exclusions were removed after
+ * the same bug recurred under Leapable's public/ directory (#752).
  *
  * Mode-skipped hash preservation is the second half of the additive-merge
  * contract: dump_and_persist re-upserts these hash rows so the next reindex
@@ -265,7 +265,7 @@ static int find_deleted_files(const char *repo_path, cbm_file_info_t *files, int
             continue; /* still visited by current pass */
         }
         /* Not in current discovery — check if it's truly deleted or just
-         * mode-skipped (excluded by FAST_SKIP_DIRS etc.). */
+         * mode-skipped by a file filter or ignore rule. */
         bool preserve = false;
         char abs_path[CBM_SZ_4K];
         int n = snprintf(abs_path, sizeof(abs_path), "%s/%s", repo_path, stored[i].rel_path);

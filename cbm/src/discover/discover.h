@@ -83,7 +83,8 @@ typedef enum {
 #endif
 
 /* Check if a directory name should always be skipped (e.g. .git, node_modules).
- * Only checks the basename, not the full path. */
+ * Only invariant cache/vendor/build basenames are skipped; mode never adds
+ * semantic-role guesses that could hide imported production source. */
 bool cbm_should_skip_dir(const char *dirname, cbm_index_mode_t mode);
 
 /* Check if a file has a suffix that should be skipped (e.g. .pyc, .png). */

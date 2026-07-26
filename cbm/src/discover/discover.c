@@ -4,7 +4,7 @@
  * Walks a repository directory tree, applying:
  *   1. Hardcoded directory skip patterns (60+ dirs like .git, node_modules)
  *   2. Hardcoded suffix filters (.pyc, .png, .wasm, etc.)
- *   3. Fast-mode additional filters (docs, examples, lock files, etc.)
+ *   3. Fast-mode additional file filters (lock files, generated suffixes, etc.)
  *   4. Gitignore-style pattern matching
  *   5. Language detection for accepted files
  */
@@ -53,20 +53,6 @@ static const char *ALWAYS_SKIP_DIRS[] = {
     ".vercel", ".netlify", "deploy", "deployed",
     /* Misc */
     ".qdrant_code_embeddings", ".tmp", "vendor", "vendored", NULL};
-
-/* Fast discovery may skip directories whose role is structurally constrained
- * to non-runtime material. Do not classify `tools`, `scripts`, or `bin` by
- * basename: real repositories use those names for imported production modules
- * and executable entry points. Omitting them from the immutable source snapshot
- * makes exact import resolution impossible (Astrolabe #752). */
-static const char *FAST_SKIP_DIRS[] = {
-    "generated", "gen",           "auto-generated", "fixtures",     "testdata",    "test_data",
-    "__tests__", "__mocks__",     "__snapshots__",  "__fixtures__", "__test__",    "docs",
-    "doc",       "documentation", "examples",       "example",      "samples",     "sample",
-    "assets",    "static",        "public",         "media",        "third_party", "thirdparty",
-    "3rdparty",  "external",      "migrations",     "seeds",        "e2e",         "integration",
-    "locale",    "locales",       "i18n",           "l10n",         "hack",        "build",
-    "out",       NULL};
 
 /* ── Ignored suffixes ───────────────────────────────── */
 
@@ -381,22 +367,18 @@ static global_excludes_resolution_t resolve_global_excludes_path(const char *rep
 /* ── Public filter functions ─────────────────────── */
 
 bool cbm_should_skip_dir(const char *dirname, cbm_index_mode_t mode) {
+    (void)mode;
+
     if (!dirname) {
         return false;
     }
 
-    if (str_in_list(dirname, ALWAYS_SKIP_DIRS)) {
-        return true;
-    }
-
-    /* Fast discovery applies to both MODERATE and FAST — only FULL keeps everything. */
-    if (mode != CBM_MODE_FULL) {
-        if (str_in_list(dirname, FAST_SKIP_DIRS)) {
-            return true;
-        }
-    }
-
-    return false;
+    /* A basename such as public, generated, docs, fixtures, tools, scripts, or
+     * bin cannot prove that a directory is non-production. Real imports under
+     * each of those roles must remain available to the immutable source
+     * snapshot in every mode. Only invariant cache/vendor/build exclusions are
+     * safe here; fast/moderate filtering is file-specific (Astrolabe #752). */
+    return str_in_list(dirname, ALWAYS_SKIP_DIRS);
 }
 
 bool cbm_has_ignored_suffix(const char *filename, cbm_index_mode_t mode) {
