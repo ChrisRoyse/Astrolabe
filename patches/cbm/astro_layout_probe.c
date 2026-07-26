@@ -65,6 +65,7 @@ CBM_API int cbm_abi_layout_offset(const char *type_name, const char *field_name,
     ASTRO_LAYOUT_OFFSET_CASE(CBMFileResult, string_refs);
     ASTRO_LAYOUT_OFFSET_CASE(CBMFileResult, infra_bindings);
     ASTRO_LAYOUT_OFFSET_CASE(CBMFileResult, channels);
+    ASTRO_LAYOUT_OFFSET_CASE(CBMFileResult, diagnostics);
     ASTRO_LAYOUT_OFFSET_CASE(CBMFileResult, module_qn);
     ASTRO_LAYOUT_OFFSET_CASE(CBMFileResult, namespace_name);
     ASTRO_LAYOUT_OFFSET_CASE(CBMFileResult, exports);

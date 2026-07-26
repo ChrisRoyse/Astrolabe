@@ -3939,6 +3939,11 @@ static TSNode find_class_body(TSNode class_node, CBMLanguage lang) {
     if (lang == CBM_LANG_SMALI) {
         return class_node;
     }
+    // PowerShell class members are direct children of class_statement; there is
+    // no class-body wrapper node in this grammar.
+    if (lang == CBM_LANG_POWERSHELL) {
+        return class_node;
+    }
     // GraphQL: object/interface fields live in a fields_definition child.
     if (lang == CBM_LANG_GRAPHQL) {
         TSNode b = cbm_find_child_by_kind(class_node, "fields_definition");
@@ -4054,6 +4059,10 @@ static TSNode resolve_method_name(TSNode child, CBMLanguage lang) {
         return cbm_find_child_by_kind(child, "identifier");
     }
 
+    if (lang == CBM_LANG_POWERSHELL && strcmp(ck, "class_method_definition") == 0) {
+        return cbm_find_child_by_kind(child, "simple_name");
+    }
+
     // Pony: `fun`/`be`/`new` members are `method`/`constructor`/`ffi_method`
     // nodes with no `name` field; the name is the first plain `identifier` child
     // (mirrors the free-function case in cbm_resolve_func_name).
@@ -4120,6 +4129,12 @@ static void push_method_def(CBMExtractCtx *ctx, TSNode child, TSNode class_node,
             if (!ts_node_is_null(rt)) {
                 def.return_type = cbm_node_text(a, rt, ctx->source);
                 break;
+            }
+        }
+        if (!def.return_type && ctx->language == CBM_LANG_POWERSHELL) {
+            TSNode rt = cbm_find_child_by_kind(child, "type_literal");
+            if (!ts_node_is_null(rt)) {
+                def.return_type = cbm_node_text(a, rt, ctx->source);
             }
         }
     }
@@ -4229,7 +4244,10 @@ static void extract_class_methods(CBMExtractCtx *ctx, TSNode class_node, const c
             continue;
         }
 
-        if (!cbm_kind_in_set(method_node, spec->function_node_types)) {
+        bool powershell_method = ctx->language == CBM_LANG_POWERSHELL &&
+                                 strcmp(ts_node_type(method_node), "class_method_definition") == 0;
+        if ((!powershell_method && !cbm_kind_in_set(method_node, spec->function_node_types)) ||
+            (powershell_method && ts_node_has_error(method_node))) {
             continue;
         }
 
@@ -5494,6 +5512,12 @@ static bool extract_schema_field(CBMExtractCtx *ctx, TSNode child, const char *c
     } else if (ctx->language == CBM_LANG_SMALI) {
         name_node = cbm_find_child_by_kind(child, "field_identifier");
         type_node = cbm_find_child_by_kind(child, "field_type");
+    } else if (ctx->language == CBM_LANG_POWERSHELL) {
+        name_node = cbm_find_child_by_kind(child, "variable");
+        type_node = cbm_find_child_by_kind(child, "type_literal");
+        if (ts_node_is_null(type_node)) {
+            type_node = cbm_find_child_by_kind(child, "type_spec");
+        }
     } else {
         return false;
     }
@@ -5502,6 +5526,9 @@ static bool extract_schema_field(CBMExtractCtx *ctx, TSNode child, const char *c
         return true; // language matched but no name → nothing to emit
     }
     char *name = cbm_node_text(a, name_node, ctx->source);
+    if (ctx->language == CBM_LANG_POWERSHELL && name && name[0] == '$') {
+        name = cbm_arena_strdup(a, name + SKIP_ONE);
+    }
     if (!name || !name[0]) {
         return true;
     }
@@ -5926,6 +5953,9 @@ static const char *compute_class_qn(CBMExtractCtx *ctx, TSNode node, const char 
     }
     if (ts_node_is_null(name_node) && ctx->language == CBM_LANG_SWIFT) {
         name_node = cbm_find_child_by_kind(node, "type_identifier");
+    }
+    if (ts_node_is_null(name_node) && ctx->language == CBM_LANG_POWERSHELL) {
+        name_node = cbm_find_child_by_kind(node, "simple_name");
     }
     if (!ts_node_is_null(name_node)) {
         char *cname = cbm_node_text(ctx->arena, name_node, ctx->source);
@@ -6457,6 +6487,9 @@ static void walk_defs(CBMExtractCtx *ctx, TSNode root, const CBMLangSpec *spec, 
         }
 
         if (cbm_kind_in_set(node, spec->function_node_types)) {
+            if (ctx->language == CBM_LANG_POWERSHELL && ts_node_has_error(node)) {
+                continue;
+            }
             if (!is_template_class_node(node, ctx->language)) {
                 extract_func_def(ctx, node, spec);
                 // Most languages stop here. JS/TS (and Wolfram) descend into the
@@ -6495,6 +6528,9 @@ static void walk_defs(CBMExtractCtx *ctx, TSNode root, const CBMLangSpec *spec, 
         }
 
         if (cbm_kind_in_set(node, spec->class_node_types)) {
+            if (ctx->language == CBM_LANG_POWERSHELL && ts_node_has_error(node)) {
+                continue;
+            }
             extract_class_def(ctx, node, spec);
             const char *new_enclosing = compute_class_qn(ctx, node, frame.enclosing_class_qn);
             push_class_body_children(node, spec, &s, new_enclosing, ctx->arena);
@@ -6511,11 +6547,9 @@ static void walk_defs(CBMExtractCtx *ctx, TSNode root, const CBMLangSpec *spec, 
     if (s.failed) {
         cbm_file_result_set_error(
             ctx->result, s.error_code ? s.error_code : "CBM_WALK_DEFS_FAILED",
-            s.error_operation ? s.error_operation : "walk_defs", "definitions",
-            s.error_requested,
-            s.error_message
-                ? s.error_message
-                : "definition traversal failed; no partial extraction may be persisted",
+            s.error_operation ? s.error_operation : "walk_defs", "definitions", s.error_requested,
+            s.error_message ? s.error_message
+                            : "definition traversal failed; no partial extraction may be persisted",
             s.error_remediation
                 ? s.error_remediation
                 : "inspect the exact traversal failure, fix the cause, then retry the corpus");
@@ -6530,21 +6564,24 @@ void cbm_extract_definitions(CBMExtractCtx *ctx) {
 
     CBMArena *a = ctx->arena;
 
-    // Create module node (always first definition)
-    CBMDefinition mod;
-    memset(&mod, 0, sizeof(mod));
-    mod.name = ctx->rel_path; // will be refined by Go layer
-    mod.qualified_name = ctx->module_qn;
-    mod.label = "Module";
-    mod.file_path = ctx->rel_path;
-    mod.start_line = FIRST_LINE;
-    mod.end_line = ts_node_end_point(ctx->root).row + TS_LINE_OFFSET;
-    mod.start_byte = ts_node_start_byte(ctx->root);
-    mod.end_byte = ts_node_end_byte(ctx->root);
-    mod.is_exported = true;
-    mod.is_test = ctx->result->is_test_file;
-    if (!cbm_defs_push(&ctx->result->defs, a, mod)) {
-        return;
+    // A nested included range belongs to the host file/module. Emitting another
+    // Module atom for the embedded grammar would invent a second file identity.
+    if (!ctx->embedded) {
+        CBMDefinition mod;
+        memset(&mod, 0, sizeof(mod));
+        mod.name = ctx->rel_path; // will be refined by Go layer
+        mod.qualified_name = ctx->module_qn;
+        mod.label = "Module";
+        mod.file_path = ctx->rel_path;
+        mod.start_line = FIRST_LINE;
+        mod.end_line = ts_node_end_point(ctx->root).row + TS_LINE_OFFSET;
+        mod.start_byte = ts_node_start_byte(ctx->root);
+        mod.end_byte = ts_node_end_byte(ctx->root);
+        mod.is_exported = true;
+        mod.is_test = ctx->result->is_test_file;
+        if (!cbm_defs_push(&ctx->result->defs, a, mod)) {
+            return;
+        }
     }
 
     // Walk AST for function/class definitions

@@ -478,6 +478,30 @@ typedef struct {
     int cap;
 } CBMChannelArray;
 
+/* A recoverable source diagnostic. Unlike CBMExtractionError, this does not
+ * invalidate the complete file: trustworthy atoms outside the reported span
+ * remain publishable, while the exact degradation is persisted in the graph. */
+typedef struct {
+    const char *code;
+    const char *operation;
+    const char *message;
+    const char *remediation;
+    const char *node_type;
+    uint32_t start_line;
+    uint32_t end_line;
+    uint32_t start_byte;
+    uint32_t end_byte;
+    const char *source;
+    uint32_t source_len;
+    bool is_missing;
+} CBMParseDiagnostic;
+
+typedef struct {
+    CBMParseDiagnostic *items;
+    int count;
+    int cap;
+} CBMParseDiagnosticArray;
+
 /* Exact first failure from authoritative per-file extraction.
  *
  * Every pointer is borrowed from a static string or the result arena and is
@@ -511,6 +535,7 @@ typedef struct {
     CBMStringRefArray string_refs;       // URL/config string literals from AST
     CBMInfraBindingArray infra_bindings; // topic→URL pairs from IaC configs
     CBMChannelArray channels;            // Socket.IO / EventEmitter pub/sub participation
+    CBMParseDiagnosticArray diagnostics; // recoverable, physically persisted parse diagnostics
 
     const char *module_qn;      // module qualified name
     const char *namespace_name; // declared namespace/package (Java/Kotlin/C#/PHP), NULL if none
@@ -576,6 +601,7 @@ typedef struct {
     EFCache ef_cache;                      // enclosing function cache
     const char *enclosing_class_qn;        // for nested class QN computation
     CBMStringConstantMap string_constants; // module-level NAME = "value" pairs
+    bool embedded;                         // nested language range; suppress host Module atom
 } CBMExtractCtx;
 
 // --- Public API ---
@@ -679,6 +705,7 @@ bool cbm_infrabinding_push(CBMInfraBindingArray *arr, CBMArena *a, CBMInfraBindi
 bool cbm_impltrait_push(CBMImplTraitArray *arr, CBMArena *a, CBMImplTrait it);
 bool cbm_resolvedcall_push(CBMResolvedCallArray *arr, CBMArena *a, CBMResolvedCall rc);
 bool cbm_channels_push(CBMChannelArray *arr, CBMArena *a, CBMChannel ch);
+bool cbm_diagnostics_push(CBMParseDiagnosticArray *arr, CBMArena *a, CBMParseDiagnostic diag);
 
 // --- Sub-extractor entry points ---
 
@@ -690,6 +717,11 @@ void cbm_extract_type_refs(CBMExtractCtx *ctx);
 void cbm_extract_env_accesses(CBMExtractCtx *ctx);
 void cbm_extract_type_assigns(CBMExtractCtx *ctx);
 void cbm_extract_channels(CBMExtractCtx *ctx);
+bool cbm_powershell_add_diagnostic(CBMExtractCtx *ctx, TSNode node, const char *code,
+                                   const char *operation, const char *message,
+                                   const char *remediation, bool is_missing);
+void cbm_powershell_record_parse_diagnostics(CBMExtractCtx *ctx);
+void cbm_powershell_extract_embedded_csharp(CBMExtractCtx *ctx);
 
 // Single-pass unified extraction (replaces the 7 calls above except defs+imports).
 void cbm_extract_unified(CBMExtractCtx *ctx);

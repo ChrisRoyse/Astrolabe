@@ -1042,10 +1042,9 @@ static const char *gleam_var_types[] = {"let", "constant", NULL};
 static const char *gleam_assign_types[] = {"let_assert", NULL};
 static const char *gleam_module_types[] = {"source_file", NULL};
 static const char *powershell_func_types[] = {"function_statement", NULL};
-static const char *powershell_class_types[] = {"class_statement", "enum_statement", "type_spec",
-                                               NULL};
+static const char *powershell_class_types[] = {"class_statement", "enum_statement", NULL};
+static const char *powershell_field_types[] = {"class_property_definition", NULL};
 static const char *powershell_call_types[] = {"invokation_expression", "command", NULL};
-static const char *powershell_import_types[] = {"using_statement", NULL};
 static const char *powershell_branch_types[] = {
     "if_statement",    "for_statement", "foreach_statement",
     "while_statement", "do_statement",  "switch_statement",
@@ -1700,9 +1699,9 @@ static const CBMLangSpec lang_specs[CBM_LANG_COUNT] = {
 
     // CBM_LANG_BASH
     [CBM_LANG_BASH] = {CBM_LANG_BASH, bash_func_types, empty_types, empty_types, bash_module_types,
-                       bash_call_types, empty_types, empty_types, bash_branch_types,
-                       bash_var_types, bash_var_types, empty_types, NULL, empty_types, NULL, NULL,
-                       tree_sitter_bash, NULL},
+                       bash_call_types, empty_types, empty_types, bash_branch_types, bash_var_types,
+                       bash_var_types, empty_types, NULL, empty_types, NULL, NULL, tree_sitter_bash,
+                       NULL},
 
     // CBM_LANG_ZIG
     [CBM_LANG_ZIG] = {CBM_LANG_ZIG, zig_func_types, zig_class_types, zig_field_types,
@@ -2046,8 +2045,8 @@ static const CBMLangSpec lang_specs[CBM_LANG_COUNT] = {
 
     // CBM_LANG_POWERSHELL
     [CBM_LANG_POWERSHELL] = {CBM_LANG_POWERSHELL, powershell_func_types, powershell_class_types,
-                             empty_types, powershell_module_types, powershell_call_types,
-                             powershell_import_types, empty_types, powershell_branch_types,
+                             powershell_field_types, powershell_module_types, powershell_call_types,
+                             empty_types, empty_types, powershell_branch_types,
                              powershell_var_types, powershell_assign_types, powershell_throw_types,
                              NULL, empty_types, NULL, NULL, tree_sitter_powershell, NULL},
 

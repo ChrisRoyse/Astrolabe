@@ -535,9 +535,24 @@ static char *extract_css_callee(CBMArena *a, TSNode node, const char *source, co
     return ts_node_is_null(fn) ? NULL : cbm_node_text(a, fn, source);
 }
 
-// PowerShell: a `command` node's callee is its `command_name` child.
+// PowerShell: commands carry command_name; static/member invocations carry the
+// invoked member as a direct simple_name child (nested invocations therefore
+// emit their own exact `new` / member calls).
 static char *extract_powershell_callee(CBMArena *a, TSNode node, const char *source,
                                        const char *nk) {
+    if (ts_node_has_error(node)) {
+        return NULL;
+    }
+    if (strcmp(nk, "invokation_expression") == 0) {
+        uint32_t n = ts_node_named_child_count(node);
+        for (uint32_t i = 0; i < n; i++) {
+            TSNode c = ts_node_named_child(node, i);
+            if (strcmp(ts_node_type(c), "simple_name") == 0) {
+                return cbm_node_text(a, c, source);
+            }
+        }
+        return NULL;
+    }
     if (strcmp(nk, "command") != 0) {
         return NULL;
     }

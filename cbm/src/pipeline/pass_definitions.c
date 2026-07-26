@@ -467,6 +467,53 @@ const cbm_gbuf_node_t *cbm_pipeline_find_definition_node(const cbm_gbuf_t *gbuf,
         def->end_byte);
 }
 
+/* Persist one recoverable parser degradation as an ordinary graph fact. The
+ * node properties retain exact byte offsets even for a zero-width MISSING
+ * token, where the generic source columns correctly remain empty. */
+static void process_diagnostic(cbm_pipeline_ctx_t *ctx, const CBMParseDiagnostic *diag,
+                               const char *rel) {
+    if (!diag || !diag->code || !diag->node_type) {
+        return;
+    }
+    char *file_qn = cbm_pipeline_fqn_compute(ctx->project_name, rel, "__file__");
+    if (!file_qn) {
+        return;
+    }
+    char qn[CBM_SZ_2K];
+    int qn_len = snprintf(qn, sizeof(qn), "%s.__parse_diagnostic__.%s.%u.%u.%s", file_qn,
+                          diag->code, diag->start_byte, diag->end_byte, diag->node_type);
+    if (qn_len <= 0 || (size_t)qn_len >= sizeof(qn)) {
+        cbm_log_error("diagnostic.identity_failed", "code", "CBM_DIAGNOSTIC_QN_OVERFLOW", "path",
+                      rel, "message", "the parse diagnostic identity exceeded its graph buffer",
+                      "remediation", "shorten the source path or diagnostic code and retry");
+        cbm_gbuf_refuse_resolution(ctx->gbuf);
+        free(file_qn);
+        return;
+    }
+    char operation[CBM_SZ_256], node_type[CBM_SZ_256], message[CBM_SZ_512], remediation[CBM_SZ_512];
+    cbm_json_escape(operation, sizeof(operation), diag->operation ? diag->operation : "parse");
+    cbm_json_escape(node_type, sizeof(node_type), diag->node_type);
+    cbm_json_escape(message, sizeof(message), diag->message ? diag->message : "parse degradation");
+    cbm_json_escape(remediation, sizeof(remediation),
+                    diag->remediation ? diag->remediation : "inspect the exact source span");
+    char props[CBM_SZ_2K];
+    snprintf(props, sizeof(props),
+             "{\"code\":\"%s\",\"operation\":\"%s\",\"node_type\":\"%s\","
+             "\"message\":\"%s\",\"remediation\":\"%s\",\"start_byte\":%u,"
+             "\"end_byte\":%u,\"missing\":%s}",
+             diag->code, operation, node_type, message, remediation, diag->start_byte,
+             diag->end_byte, diag->is_missing ? "true" : "false");
+    int64_t node_id = cbm_gbuf_upsert_source_node(
+        ctx->gbuf, "ParseDiagnostic", diag->code, qn, rel, (int)diag->start_line,
+        (int)diag->end_line, (const uint8_t *)diag->source, (size_t)diag->source_len,
+        diag->start_byte, diag->end_byte, props);
+    const cbm_gbuf_node_t *file_node = cbm_gbuf_find_by_qn(ctx->gbuf, file_qn);
+    if (file_node && node_id > 0) {
+        cbm_gbuf_insert_edge(ctx->gbuf, file_node->id, node_id, "HAS_DIAGNOSTIC", "{}");
+    }
+    free(file_qn);
+}
+
 /* Process one definition: create node, register, DEFINES + DEFINES_METHOD edges. */
 static void process_def(cbm_pipeline_ctx_t *ctx, const CBMCallArray *calls,
                         const CBMDefinition *def, const char *rel) {
@@ -658,6 +705,7 @@ int cbm_pipeline_pass_definitions(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
     int total_defs = 0;
     int total_calls = 0;
     int total_imports = 0;
+    int total_diagnostics = 0;
     int errors = 0;
 
     /* Sequential pass must extract all defs (which create Module/Function/...
@@ -740,6 +788,10 @@ int cbm_pipeline_pass_definitions(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
         for (int d = 0; d < result->defs.count; d++) {
             process_def(ctx, &result->calls, &result->defs.items[d], rel);
             total_defs++;
+        }
+        for (int d = 0; d < result->diagnostics.count; d++) {
+            process_diagnostic(ctx, &result->diagnostics.items[d], rel);
+            total_diagnostics++;
         }
 
         /* Store calls for pass_calls (we save them in the extraction results
@@ -845,7 +897,7 @@ int cbm_pipeline_pass_definitions(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
     }
 
     cbm_log_info("pass.done", "pass", "definitions", "defs", itoa_log(total_defs), "calls",
-                 itoa_log(total_calls), "imports", itoa_log(total_imports), "errors",
-                 itoa_log(errors));
+                 itoa_log(total_calls), "imports", itoa_log(total_imports), "diagnostics",
+                 itoa_log(total_diagnostics), "errors", itoa_log(errors));
     return cbm_registry_failed(ctx->registry) ? CBM_NOT_FOUND : 0;
 }

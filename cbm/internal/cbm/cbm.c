@@ -239,6 +239,13 @@ bool cbm_channels_push(CBMChannelArray *arr, CBMArena *a, CBMChannel ch) {
     return true;
 }
 
+bool cbm_diagnostics_push(CBMParseDiagnosticArray *arr, CBMArena *a, CBMParseDiagnostic diag) {
+    if (!arr || !GROW_ARRAY_CHECKED(arr, a, "diagnostics.push"))
+        return false;
+    arr->items[arr->count++] = diag;
+    return true;
+}
+
 // --- String input reader (for parse_with_options) ---
 
 typedef struct {
@@ -642,6 +649,7 @@ static void cbm_file_result_discard_atoms(CBMFileResult *result) {
     result->string_refs.count = 0;
     result->infra_bindings.count = 0;
     result->channels.count = 0;
+    result->diagnostics.count = 0;
     result->imports_count = 0;
     result->exports = NULL;
     result->constants = NULL;
@@ -675,9 +683,8 @@ void cbm_file_result_set_error(CBMFileResult *result, const char *code, const ch
 }
 
 static bool cbm_extract_code_is_resource_failure(const char *code) {
-    return code &&
-           (strstr(code, "ALLOC") != NULL || strstr(code, "CAPACITY") != NULL ||
-            strstr(code, "OVERFLOW") != NULL || strstr(code, "LIMIT_EXCEEDED") != NULL);
+    return code && (strstr(code, "ALLOC") != NULL || strstr(code, "CAPACITY") != NULL ||
+                    strstr(code, "OVERFLOW") != NULL || strstr(code, "LIMIT_EXCEEDED") != NULL);
 }
 
 static const char *cbm_extract_failure_message(const char *code) {
@@ -714,7 +721,8 @@ static const char *cbm_extract_failure_remediation(const char *code) {
                "workload, then retry the complete corpus";
     }
     if (cbm_extract_code_is_resource_failure(code)) {
-        return "inspect the requested quantity and operation, raise the declared limit deliberately "
+        return "inspect the requested quantity and operation, raise the declared limit "
+               "deliberately "
                "or reduce resource demand, then retry";
     }
     return "inspect the exact code and operation, fix the source or extractor, then retry the "
@@ -877,6 +885,13 @@ static CBMFileResult *cbm_extract_file_impl(const char *source, int source_len,
         .root = root,
     };
 
+    if (language == CBM_LANG_POWERSHELL) {
+        cbm_powershell_record_parse_diagnostics(&ctx);
+        if (!cbm_extract_arena_ok(result, "powershell_parse_diagnostics", rel_path)) {
+            goto extraction_failed;
+        }
+    }
+
     // Run extractors: defs + imports use separate walks (unique recursion patterns),
     // then a single unified cursor walk handles the remaining 7 extractors.
     cbm_extract_definitions(&ctx);
@@ -893,6 +908,14 @@ static CBMFileResult *cbm_extract_file_impl(const char *source, int source_len,
     cbm_extract_unified(&ctx);
     if (!cbm_extract_arena_ok(result, "unified_atoms", rel_path)) {
         goto extraction_failed;
+    }
+
+    if (language == CBM_LANG_POWERSHELL) {
+        cbm_powershell_extract_embedded_csharp(&ctx);
+        if (result->has_error ||
+            !cbm_extract_arena_ok(result, "powershell_embedded_csharp", rel_path)) {
+            goto extraction_failed;
+        }
     }
 
     // Channel detection (Socket.IO / EventEmitter) — JS/TS only.

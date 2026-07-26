@@ -976,6 +976,47 @@ impl Default for CBMChannelArray {
 }
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
+pub struct CBMParseDiagnostic {
+    pub code: *const ::std::os::raw::c_char,
+    pub operation: *const ::std::os::raw::c_char,
+    pub message: *const ::std::os::raw::c_char,
+    pub remediation: *const ::std::os::raw::c_char,
+    pub node_type: *const ::std::os::raw::c_char,
+    pub start_line: u32,
+    pub end_line: u32,
+    pub start_byte: u32,
+    pub end_byte: u32,
+    pub source: *const ::std::os::raw::c_char,
+    pub source_len: u32,
+    pub is_missing: bool,
+}
+impl Default for CBMParseDiagnostic {
+    fn default() -> Self {
+        let mut s = ::std::mem::MaybeUninit::<Self>::uninit();
+        unsafe {
+            ::std::ptr::write_bytes(s.as_mut_ptr(), 0, 1);
+            s.assume_init()
+        }
+    }
+}
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct CBMParseDiagnosticArray {
+    pub items: *mut CBMParseDiagnostic,
+    pub count: ::std::os::raw::c_int,
+    pub cap: ::std::os::raw::c_int,
+}
+impl Default for CBMParseDiagnosticArray {
+    fn default() -> Self {
+        let mut s = ::std::mem::MaybeUninit::<Self>::uninit();
+        unsafe {
+            ::std::ptr::write_bytes(s.as_mut_ptr(), 0, 1);
+            s.assume_init()
+        }
+    }
+}
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
 pub struct CBMExtractionError {
     pub code: *const ::std::os::raw::c_char,
     pub operation: *const ::std::os::raw::c_char,
@@ -1011,6 +1052,7 @@ pub struct CBMFileResult {
     pub string_refs: CBMStringRefArray,
     pub infra_bindings: CBMInfraBindingArray,
     pub channels: CBMChannelArray,
+    pub diagnostics: CBMParseDiagnosticArray,
     pub module_qn: *const ::std::os::raw::c_char,
     pub namespace_name: *const ::std::os::raw::c_char,
     pub exports: *mut *const ::std::os::raw::c_char,
@@ -1098,6 +1140,7 @@ pub struct CBMExtractCtx {
     pub ef_cache: EFCache,
     pub enclosing_class_qn: *const ::std::os::raw::c_char,
     pub string_constants: CBMStringConstantMap,
+    pub embedded: bool,
 }
 impl Default for CBMExtractCtx {
     fn default() -> Self {
@@ -1265,6 +1308,13 @@ unsafe extern "C" {
     pub fn cbm_channels_push(arr: *mut CBMChannelArray, a: *mut CBMArena, ch: CBMChannel) -> bool;
 }
 unsafe extern "C" {
+    pub fn cbm_diagnostics_push(
+        arr: *mut CBMParseDiagnosticArray,
+        a: *mut CBMArena,
+        diag: CBMParseDiagnostic,
+    ) -> bool;
+}
+unsafe extern "C" {
     pub fn cbm_extract_definitions(ctx: *mut CBMExtractCtx);
 }
 unsafe extern "C" {
@@ -1287,6 +1337,23 @@ unsafe extern "C" {
 }
 unsafe extern "C" {
     pub fn cbm_extract_channels(ctx: *mut CBMExtractCtx);
+}
+unsafe extern "C" {
+    pub fn cbm_powershell_add_diagnostic(
+        ctx: *mut CBMExtractCtx,
+        node: TSNode,
+        code: *const ::std::os::raw::c_char,
+        operation: *const ::std::os::raw::c_char,
+        message: *const ::std::os::raw::c_char,
+        remediation: *const ::std::os::raw::c_char,
+        is_missing: bool,
+    ) -> bool;
+}
+unsafe extern "C" {
+    pub fn cbm_powershell_record_parse_diagnostics(ctx: *mut CBMExtractCtx);
+}
+unsafe extern "C" {
+    pub fn cbm_powershell_extract_embedded_csharp(ctx: *mut CBMExtractCtx);
 }
 unsafe extern "C" {
     pub fn cbm_extract_unified(ctx: *mut CBMExtractCtx);

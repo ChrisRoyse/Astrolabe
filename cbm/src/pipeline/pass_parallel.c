@@ -742,6 +742,48 @@ static void insert_def_into_gbuf(extract_worker_state_t *ws, const cbm_file_info
     }
 }
 
+static void insert_diagnostic_into_gbuf(extract_worker_state_t *ws, const cbm_file_info_t *fi,
+                                        const char *project_name, const CBMParseDiagnostic *diag) {
+    if (!diag || !diag->code || !diag->node_type) {
+        return;
+    }
+    char *file_qn = cbm_pipeline_fqn_compute(project_name, fi->rel_path, "__file__");
+    if (!file_qn) {
+        ws->errors++;
+        return;
+    }
+    char qn[CBM_SZ_2K];
+    int qn_len = snprintf(qn, sizeof(qn), "%s.__parse_diagnostic__.%s.%u.%u.%s", file_qn,
+                          diag->code, diag->start_byte, diag->end_byte, diag->node_type);
+    free(file_qn);
+    if (qn_len <= 0 || (size_t)qn_len >= sizeof(qn)) {
+        ws->errors++;
+        return;
+    }
+    char operation[CBM_SZ_256], node_type[CBM_SZ_256], message[CBM_SZ_512], remediation[CBM_SZ_512];
+    cbm_json_escape(operation, sizeof(operation), diag->operation ? diag->operation : "parse");
+    cbm_json_escape(node_type, sizeof(node_type), diag->node_type);
+    cbm_json_escape(message, sizeof(message), diag->message ? diag->message : "parse degradation");
+    cbm_json_escape(remediation, sizeof(remediation),
+                    diag->remediation ? diag->remediation : "inspect the exact source span");
+    char props[CBM_SZ_2K];
+    snprintf(props, sizeof(props),
+             "{\"code\":\"%s\",\"operation\":\"%s\",\"node_type\":\"%s\","
+             "\"message\":\"%s\",\"remediation\":\"%s\",\"start_byte\":%u,"
+             "\"end_byte\":%u,\"missing\":%s}",
+             diag->code, operation, node_type, message, remediation, diag->start_byte,
+             diag->end_byte, diag->is_missing ? "true" : "false");
+    int64_t node_id = cbm_gbuf_upsert_source_node(
+        ws->local_gbuf, "ParseDiagnostic", diag->code, qn, fi->rel_path, (int)diag->start_line,
+        (int)diag->end_line, (const uint8_t *)diag->source, (size_t)diag->source_len,
+        diag->start_byte, diag->end_byte, props);
+    if (node_id > 0) {
+        ws->nodes_created++;
+    } else {
+        ws->errors++;
+    }
+}
+
 static void log_extract_fail(int pos, uint64_t ms, const char *path) {
     if (pos < PP_LOG_THRESH) {
         cbm_log_warn("parallel.extract.file.fail", "pos", itoa_log(pos), "elapsed_ms",
@@ -888,6 +930,9 @@ static void extract_worker(int worker_id, void *ctx_ptr) {
             if (def->qualified_name && def->name) {
                 insert_def_into_gbuf(ws, fi, &result->calls, def);
             }
+        }
+        for (int d = 0; d < result->diagnostics.count; d++) {
+            insert_diagnostic_into_gbuf(ws, fi, ec->project_name, &result->diagnostics.items[d]);
         }
 
         /* Free TSTree immediately — arena strings survive for registry+resolve.
@@ -1196,6 +1241,30 @@ static int register_and_link_def(cbm_pipeline_ctx_t *ctx, const CBMDefinition *d
     return edges;
 }
 
+static int link_diagnostic(cbm_pipeline_ctx_t *ctx, const CBMParseDiagnostic *diag,
+                           const char *rel) {
+    if (!diag || !diag->code || !diag->node_type) {
+        return 0;
+    }
+    char *file_qn = cbm_pipeline_fqn_compute(ctx->project_name, rel, "__file__");
+    if (!file_qn) {
+        return 0;
+    }
+    char qn[CBM_SZ_2K];
+    int qn_len = snprintf(qn, sizeof(qn), "%s.__parse_diagnostic__.%s.%u.%u.%s", file_qn,
+                          diag->code, diag->start_byte, diag->end_byte, diag->node_type);
+    const cbm_gbuf_node_t *file_node = cbm_gbuf_find_by_qn(ctx->gbuf, file_qn);
+    const cbm_gbuf_node_t *diag_node =
+        (qn_len > 0 && (size_t)qn_len < sizeof(qn)) ? cbm_gbuf_find_by_qn(ctx->gbuf, qn) : NULL;
+    int linked = 0;
+    if (file_node && diag_node) {
+        cbm_gbuf_insert_edge(ctx->gbuf, file_node->id, diag_node->id, "HAS_DIAGNOSTIC", "{}");
+        linked = 1;
+    }
+    free(file_qn);
+    return linked;
+}
+
 /* Create IMPORTS edges for one file's imports (parallel path). */
 static int create_imports_edges(cbm_pipeline_ctx_t *ctx, const CBMFileResult *result,
                                 const char *rel, CBMHashTable *namespace_map) {
@@ -1271,6 +1340,7 @@ int cbm_build_registry_from_cache(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
     int reg_entries = 0;
     int defines_edges = 0;
     int imports_edges = 0;
+    int diagnostic_edges = 0;
 
     /* Namespace/package → File-QN map for namespace imports (C# `using`,
      * Java/Kotlin `import`, PHP `use`). Built from the full result cache so
@@ -1315,6 +1385,9 @@ int cbm_build_registry_from_cache(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
                 return CBM_NOT_FOUND;
             }
         }
+        for (int d = 0; d < result->diagnostics.count; d++) {
+            diagnostic_edges += link_diagnostic(ctx, &result->diagnostics.items[d], rel);
+        }
 
         imports_edges += create_imports_edges(ctx, result, rel, namespace_map);
         char *module_qn = cbm_pipeline_fqn_module_dir(ctx->project_name, rel,
@@ -1326,7 +1399,8 @@ int cbm_build_registry_from_cache(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
     cbm_pipeline_namespace_map_free(namespace_map);
 
     cbm_log_info("parallel.registry.done", "entries", itoa_log(reg_entries), "defines",
-                 itoa_log(defines_edges), "imports", itoa_log(imports_edges));
+                 itoa_log(defines_edges), "imports", itoa_log(imports_edges), "diagnostics",
+                 itoa_log(diagnostic_edges));
     return 0;
 }
 

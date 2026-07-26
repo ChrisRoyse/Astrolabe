@@ -1113,7 +1113,8 @@ static void parse_bash_imports(CBMExtractCtx *ctx) {
             continue;
         }
         char *command_name = cbm_node_text(a, name, ctx->source);
-        if (!command_name || (strcmp(command_name, ".") != 0 && strcmp(command_name, "source") != 0)) {
+        if (!command_name ||
+            (strcmp(command_name, ".") != 0 && strcmp(command_name, "source") != 0)) {
             continue;
         }
 
@@ -1825,11 +1826,268 @@ static void parse_pascal_imports(CBMExtractCtx *ctx) {
 }
 
 // --- PowerShell imports ---
-// tree-sitter-powershell models `using module ./M` / `using namespace System.IO`
-// as a plain `command` whose command_name is "using" — deeply nested under
-// statement_list -> pipeline -> pipeline_chain. The module path is the LAST
-// generic_token child of command_elements (after the "module"/"namespace"/
-// "assembly" qualifier). DFS for such commands.
+
+static bool ps_ci_equal(const char *left, const char *right) {
+    if (!left || !right) {
+        return false;
+    }
+    while (*left && *right) {
+        if (tolower((unsigned char)*left) != tolower((unsigned char)*right)) {
+            return false;
+        }
+        left++;
+        right++;
+    }
+    return *left == '\0' && *right == '\0';
+}
+
+static bool ps_relative_path(const char *path) {
+    return path && ((path[0] == '.' && (path[1] == '/' || path[1] == '\\')) ||
+                    (path[0] == '.' && path[1] == '.' && (path[2] == '/' || path[2] == '\\')));
+}
+
+static char *ps_normalize_slashes(CBMArena *a, const char *path) {
+    char *copy = cbm_arena_strdup(a, path);
+    if (!copy) {
+        return NULL;
+    }
+    for (char *p = copy; *p; p++) {
+        if (*p == '\\') {
+            *p = '/';
+        }
+    }
+    return copy;
+}
+
+static bool ps_command_value_kind(const char *kind) {
+    return strcmp(kind, "generic_token") == 0 || strcmp(kind, "string_literal") == 0 ||
+           strcmp(kind, "expandable_string_literal") == 0 ||
+           strcmp(kind, "verbatim_command_argument") == 0 || strcmp(kind, "variable") == 0;
+}
+
+/* Resolve one top-level command element to exactly one AST value. Nested
+ * commands and compound values are deliberately unsupported: choosing one of
+ * their descendants would invent PowerShell parameter-binding semantics. */
+static TSNode ps_single_command_value(TSNode element) {
+    if (ps_command_value_kind(ts_node_type(element))) {
+        return element;
+    }
+    TSNode found = {0};
+    TSNodeStack stack;
+    CBMArena scratch;
+    cbm_arena_init(&scratch);
+    ts_nstack_init(&stack, &scratch, CBM_SZ_128);
+    ts_nstack_push_children(&stack, &scratch, element);
+    while (stack.count > 0) {
+        TSNode node = ts_nstack_pop(&stack);
+        const char *kind = ts_node_type(node);
+        if (strcmp(kind, "command") == 0 || strcmp(kind, "command_parameter") == 0) {
+            found = (TSNode){0};
+            break;
+        }
+        if (ps_command_value_kind(kind)) {
+            if (!ts_node_is_null(found)) {
+                found = (TSNode){0};
+                break;
+            }
+            found = node;
+            continue;
+        }
+        ts_nstack_push_children(&stack, &scratch, node);
+    }
+    cbm_arena_destroy(&scratch);
+    return found;
+}
+
+static TSNode ps_command_elements(TSNode command) {
+    return ts_node_child_by_field_name(command, TS_FIELD("command_elements"));
+}
+
+static TSNode ps_using_target(CBMExtractCtx *ctx, TSNode command) {
+    TSNode elements = ps_command_elements(command);
+    if (ts_node_is_null(elements) || ts_node_named_child_count(elements) != 2) {
+        return (TSNode){0};
+    }
+    TSNode qualifier = ps_single_command_value(ts_node_named_child(elements, 0));
+    TSNode target = ps_single_command_value(ts_node_named_child(elements, 1));
+    if (ts_node_is_null(qualifier) || ts_node_is_null(target)) {
+        return (TSNode){0};
+    }
+    char *text = cbm_node_text(ctx->arena, qualifier, ctx->source);
+    if (!ps_ci_equal(text, "module") && !ps_ci_equal(text, "namespace") &&
+        !ps_ci_equal(text, "assembly")) {
+        return (TSNode){0};
+    }
+    return target;
+}
+
+static TSNode ps_import_module_target(CBMExtractCtx *ctx, TSNode command) {
+    TSNode elements = ps_command_elements(command);
+    if (ts_node_is_null(elements)) {
+        return (TSNode){0};
+    }
+    uint32_t count = ts_node_named_child_count(elements);
+    int name_parameter_count = 0;
+    TSNode named_target = {0};
+    for (uint32_t i = 0; i < count; i++) {
+        TSNode child = ts_node_named_child(elements, i);
+        if (strcmp(ts_node_type(child), "command_parameter") != 0) {
+            continue;
+        }
+        char *parameter = cbm_node_text(ctx->arena, child, ctx->source);
+        if (!ps_ci_equal(parameter, "-Name")) {
+            continue;
+        }
+        name_parameter_count++;
+        if (i + 1 < count &&
+            strcmp(ts_node_type(ts_node_named_child(elements, i + 1)), "command_parameter") != 0) {
+            named_target = ps_single_command_value(ts_node_named_child(elements, i + 1));
+        }
+    }
+    if (name_parameter_count > 0) {
+        return name_parameter_count == 1 ? named_target : (TSNode){0};
+    }
+    if (count == 0 ||
+        strcmp(ts_node_type(ts_node_named_child(elements, 0)), "command_parameter") == 0) {
+        return (TSNode){0};
+    }
+    return ps_single_command_value(ts_node_named_child(elements, 0));
+}
+
+static bool ps_command_has_dot_operator(CBMExtractCtx *ctx, TSNode command) {
+    CBMArena scratch;
+    cbm_arena_init(&scratch);
+    TSNodeStack stack;
+    ts_nstack_init(&stack, &scratch, CBM_SZ_128);
+    ts_nstack_push_children(&stack, &scratch, command);
+    while (stack.count > 0) {
+        TSNode node = ts_nstack_pop(&stack);
+        if (strcmp(ts_node_type(node), "command") == 0) {
+            continue;
+        }
+        if (strcmp(ts_node_type(node), "command_invokation_operator") == 0) {
+            char *op = cbm_node_text(&scratch, node, ctx->source);
+            if (op && strcmp(op, ".") == 0) {
+                cbm_arena_destroy(&scratch);
+                return true;
+            }
+        }
+        ts_nstack_push_children(&stack, &scratch, node);
+    }
+    cbm_arena_destroy(&scratch);
+    return false;
+}
+
+/* Resolve only source spellings whose value is determined by syntax alone:
+ * ./x, ../x, $PSScriptRoot/x, or Join-Path $PSScriptRoot 'x'. */
+static char *ps_exact_dot_source_path(CBMExtractCtx *ctx, TSNode command) {
+    char *raw = cbm_node_text(ctx->arena, command, ctx->source);
+    if (!raw) {
+        return NULL;
+    }
+    const char *p = raw;
+    while (*p && isspace((unsigned char)*p)) {
+        p++;
+    }
+    if (*p != '.') {
+        return NULL;
+    }
+    p++;
+    while (*p && isspace((unsigned char)*p)) {
+        p++;
+    }
+
+    bool join_path = false;
+    if (*p == '(') {
+        join_path = true;
+        p++;
+        while (*p && isspace((unsigned char)*p)) {
+            p++;
+        }
+        static const char join_prefix[] = "Join-Path";
+        if (_strnicmp(p, join_prefix, sizeof(join_prefix) - SKIP_ONE) != 0) {
+            return NULL;
+        }
+        p += sizeof(join_prefix) - SKIP_ONE;
+        while (*p && isspace((unsigned char)*p)) {
+            p++;
+        }
+        static const char root_name[] = "$PSScriptRoot";
+        if (_strnicmp(p, root_name, sizeof(root_name) - SKIP_ONE) != 0) {
+            return NULL;
+        }
+        p += sizeof(root_name) - SKIP_ONE;
+        while (*p && isspace((unsigned char)*p)) {
+            p++;
+        }
+    }
+
+    char quote = (*p == '\'' || *p == '"') ? *p++ : '\0';
+    const char *start = p;
+    const char *end = NULL;
+    if (quote) {
+        end = strchr(p, quote);
+        if (!end) {
+            return NULL;
+        }
+        p = end + SKIP_ONE;
+    } else {
+        while (*p && !isspace((unsigned char)*p) && *p != ')') {
+            p++;
+        }
+        end = p;
+    }
+    while (*p && isspace((unsigned char)*p)) {
+        p++;
+    }
+    if ((join_path && (*p != ')' || p[SKIP_ONE] != '\0')) || (!join_path && *p != '\0') ||
+        end <= start) {
+        return NULL;
+    }
+    char *value = cbm_arena_strndup(ctx->arena, start, (size_t)(end - start));
+    if (!value || strchr(value, '`')) {
+        return NULL;
+    }
+
+    static const char root_prefix[] = "$PSScriptRoot";
+    if (join_path) {
+        if (strchr(value, '$') || value[0] == '/' || value[0] == '\\') {
+            return NULL;
+        }
+        value = cbm_arena_sprintf(ctx->arena, "./%s", value);
+    } else if (_strnicmp(value, root_prefix, sizeof(root_prefix) - SKIP_ONE) == 0) {
+        const char *suffix = value + sizeof(root_prefix) - SKIP_ONE;
+        if ((*suffix != '/' && *suffix != '\\') || strchr(suffix + SKIP_ONE, '$')) {
+            return NULL;
+        }
+        value = cbm_arena_sprintf(ctx->arena, ".%s", suffix);
+    } else if (!ps_relative_path(value) || strchr(value, '$')) {
+        return NULL;
+    }
+    return ps_normalize_slashes(ctx->arena, value);
+}
+
+static void ps_push_import(CBMExtractCtx *ctx, TSNode command, const char *path,
+                           const char *dependency_kind, bool unbound) {
+    if (!path || !path[0]) {
+        cbm_powershell_add_diagnostic(
+            ctx, command, "CBM_POWERSHELL_IMPORT_TARGET_UNRESOLVED", "extract_powershell_import",
+            "the PowerShell import target is dynamic or has no authoritative source spelling",
+            "use a literal relative path, $PSScriptRoot path, or exact Join-Path expression",
+            false);
+        return;
+    }
+    bool exact = ps_relative_path(path);
+    CBMImport imp = {
+        .local_name = unbound ? NULL : path_last(ctx->arena, path),
+        .module_path = (char *)path,
+        .dependency_kind = dependency_kind,
+        .resolution = exact ? CBM_IMPORT_RESOLVE_EXACT_SOURCE : CBM_IMPORT_RESOLVE_SEMANTIC,
+        .binding = unbound ? CBM_IMPORT_BINDING_UNBOUND : CBM_IMPORT_BINDING_LOCAL,
+    };
+    (void)cbm_imports_push(&ctx->result->imports, ctx->arena, imp);
+}
+
 static void parse_powershell_imports(CBMExtractCtx *ctx) {
     CBMArena *a = ctx->arena;
     TSNodeStack stack;
@@ -1838,38 +2096,33 @@ static void parse_powershell_imports(CBMExtractCtx *ctx) {
     while (stack.count > 0) {
         TSNode node = ts_nstack_pop(&stack);
         if (strcmp(ts_node_type(node), "command") == 0) {
+            if (ts_node_has_error(node)) {
+                continue;
+            }
             TSNode name = ts_node_child_by_field_name(node, TS_FIELD("command_name"));
             char *nm = ts_node_is_null(name) ? NULL : cbm_node_text(a, name, ctx->source);
-            if (nm && strcmp(nm, "using") == 0) {
-                /* Find the last generic_token anywhere under the command — that
-                 * is the module path / namespace / assembly being imported. */
-                TSNodeStack inner;
-                ts_nstack_init(&inner, a, CBM_SZ_512);
-                ts_nstack_push(&inner, a, node);
-                const char *last_tok = NULL;
-                uint32_t last_start = 0;
-                while (inner.count > 0) {
-                    TSNode c = ts_nstack_pop(&inner);
-                    if (strcmp(ts_node_type(c), "generic_token") == 0) {
-                        char *t = cbm_node_text(a, c, ctx->source);
-                        uint32_t sb = ts_node_start_byte(c);
-                        if (t && t[0] && strcmp(t, "module") != 0 && strcmp(t, "namespace") != 0 &&
-                            strcmp(t, "assembly") != 0 && (last_tok == NULL || sb > last_start)) {
-                            last_tok = t;
-                            last_start = sb;
-                        }
-                    }
-                    ts_nstack_push_children(&inner, a, c);
+            if (nm && (ps_ci_equal(nm, "using") || ps_ci_equal(nm, "Import-Module"))) {
+                TSNode value = ps_ci_equal(nm, "using") ? ps_using_target(ctx, node)
+                                                        : ps_import_module_target(ctx, node);
+                char *path = ts_node_is_null(value) ? NULL : cbm_node_text(a, value, ctx->source);
+                path = strip_quotes(a, path);
+                if (path && strchr(path, '$')) {
+                    path = NULL;
                 }
-                if (last_tok && last_tok[0]) {
-                    CBMImport imp = {.local_name = path_last(a, last_tok),
-                                     .module_path = (char *)last_tok};
-                    if (!cbm_imports_push(&ctx->result->imports, a, imp)) {
-                        return;
-                    }
+                if (path) {
+                    path = ps_normalize_slashes(a, path);
                 }
+                ps_push_import(ctx, node, path,
+                               ps_ci_equal(nm, "using") ? "powershell_using"
+                                                        : "powershell_import_module",
+                               false);
+                continue;
             }
-            continue; /* commands don't nest imports further */
+            if (ps_command_has_dot_operator(ctx, node)) {
+                char *path = ps_exact_dot_source_path(ctx, node);
+                ps_push_import(ctx, node, path, "powershell_dot_source", true);
+                continue;
+            }
         }
         ts_nstack_push_children(&stack, a, node);
     }

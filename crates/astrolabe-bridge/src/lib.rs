@@ -1896,6 +1896,49 @@ impl ExtractedFile {
         }
     }
 
+    pub fn diagnostics(&self) -> Result<Vec<ParseDiagnostic>, BridgeError> {
+        // SAFETY: self owns a live CBMFileResult until Drop; array/source pointers are
+        // CBM-owned and remain valid for the duration of this copy.
+        unsafe {
+            array_slice(
+                self.raw().diagnostics.items,
+                self.raw().diagnostics.count,
+                "diagnostics",
+            )?
+            .iter()
+            .map(|item| {
+                let source = if item.source_len == 0 {
+                    Vec::new()
+                } else {
+                    if item.source.is_null() {
+                        return Err(envelope(
+                            "ASTRO_CBM_NULL_FIELD",
+                            "CBM returned NULL for required field diagnostic.source",
+                            "Treat this as FFI contract drift and keep the raw result for debugging.",
+                        ));
+                    }
+                    std::slice::from_raw_parts(item.source.cast::<u8>(), item.source_len as usize)
+                        .to_vec()
+                };
+                Ok(ParseDiagnostic {
+                    code: self.required_string(item.code, "diagnostic.code")?,
+                    operation: self.required_string(item.operation, "diagnostic.operation")?,
+                    message: self.required_string(item.message, "diagnostic.message")?,
+                    remediation: self
+                        .required_string(item.remediation, "diagnostic.remediation")?,
+                    node_type: self.required_string(item.node_type, "diagnostic.node_type")?,
+                    start_line: item.start_line,
+                    end_line: item.end_line,
+                    start_byte: item.start_byte,
+                    end_byte: item.end_byte,
+                    source,
+                    is_missing: item.is_missing,
+                })
+            })
+            .collect()
+        }
+    }
+
     pub fn routes(&self) -> Result<Vec<Route>, BridgeError> {
         Ok(self
             .definitions()?
@@ -2183,6 +2226,21 @@ pub struct Channel {
     pub transport: Option<String>,
     pub enclosing_func_qn: Option<String>,
     pub direction: cbm_sys::CBMChannelDirection,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct ParseDiagnostic {
+    pub code: String,
+    pub operation: String,
+    pub message: String,
+    pub remediation: String,
+    pub node_type: String,
+    pub start_line: u32,
+    pub end_line: u32,
+    pub start_byte: u32,
+    pub end_byte: u32,
+    pub source: Vec<u8>,
+    pub is_missing: bool,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
