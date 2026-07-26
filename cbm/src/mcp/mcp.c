@@ -341,26 +341,31 @@ static const tool_def_t TOOLS[] = {
      "},\"required\":[\"repo_path\"]}"},
 
     {"search_graph", "Search graph",
-     "Search the code knowledge graph for functions, classes, routes, and variables. Use INSTEAD "
-     "OF grep/glob when finding code definitions, implementations, or relationships. Three search "
-     "modes: (1) query='update settings' for BM25 ranked full-text search with camelCase "
-     "splitting and structural label boosting — recommended for natural-language discovery; "
-     "(2) name_pattern='.*regex.*' for exact pattern matching; (3) semantic_query=[...] for "
-     "vector cosine search that bridges vocabulary (finds 'publish' when you search 'send'). "
-     "The three modes are independent and can be combined in a single call. "
-     "PAGINATION: results are capped at limit (default 200) — broader queries are silently "
-     "truncated. The response always includes 'total' (full match count before limit) and "
-     "'has_more' (true when total > offset+returned). Detect truncation with has_more, then "
-     "page by re-calling with offset=offset+limit until has_more is false. Narrow first via "
-     "label/file_pattern/min_degree before paginating large result sets.",
+     "Search the code knowledge graph for indexed symbols and structural nodes. Use INSTEAD OF "
+     "grep/glob when finding code definitions, implementations, or relationships. Search modes: "
+     "(1) query='update settings' for BM25 ranked full-text search with camelCase splitting and "
+     "symbol-category boosting — recommended for natural-language discovery; (2) "
+     "name_pattern='.*regex.*' for exact pattern matching; (3) semantic_query=[...] for vector "
+     "cosine search that bridges vocabulary (finds 'publish' when you search 'send'). The query "
+     "mode is exclusive and supports project, label, file_pattern, limit, and offset; exact and "
+     "semantic modes may be combined only when query is absent. PAGINATION: results are capped "
+     "at limit (default 200). The response includes exact 'total' and deterministic 'has_more'; "
+     "page by re-calling with offset=offset+limit until has_more is false. Narrow query mode via "
+     "label/file_pattern before paginating large result sets.",
      "{\"type\":\"object\",\"properties\":{\"project\":{\"type\":\"string\"},"
      "\"query\":{\"type\":\"string\",\"description\":\"Natural-language or keyword full-text "
-     "search using BM25 ranking. Tokens are split on whitespace; camelCase identifiers are "
+     "search using BM25 ranking. Identifier punctuation separates terms; camelCase identifiers are "
      "indexed as individual words (updateCloudClient → update, cloud, client). Results are "
-     "ranked with structural boosting: Functions/Methods +10, Routes +8, Classes/Interfaces +5. "
-     "Noise labels (File/Folder/Module/Variable) are filtered out. When provided, name_pattern "
-     "is ignored.\"},"
-     "\"label\":{\"type\":\"string\"},\"name_pattern\":{\"type\":\"string\"},\"qn_pattern\":{"
+     "ranked with symbol-category boosting: Functions/Methods +10, Routes +8, "
+     "Classes/Interfaces/Types/Enums +5. Without label, structural containers "
+     "File/Folder/Module/Section/Project are excluded; Variables and other symbols remain. An "
+     "explicit label selects exactly that label, including a structural label. query cannot be "
+     "combined with name_pattern, qn_pattern, relationship, degree/connection filters, or "
+     "semantic_query.\"},"
+     "\"label\":{\"type\":\"string\",\"description\":\"Exact persisted node label. In query mode, "
+     "omitting this excludes only structural containers; providing it selects exactly that "
+     "label.\"},"
+     "\"name_pattern\":{\"type\":\"string\"},\"qn_pattern\":{"
      "\"type\":\"string\"},\"file_pattern\":{\"type\":\"string\"},"
      "\"relationship\":{\"type\":\"string\"},\"min_degree\":{\"type\":\"integer\"},"
      "\"max_degree\":{\"type\":\"integer\"},\"exclude_entry_points\":{\"type\":\"boolean\"},"
@@ -372,7 +377,8 @@ static const tool_def_t TOOLS[] = {
      "'semantic_results' field (separate from 'results').\"},\"limit\":{\"type\":"
      "\"integer\",\"description\":\"Max results per call. Default 200. Response carries "
      "'total' (full match count) and 'has_more' (true if truncated) so callers can "
-     "detect the limit and paginate.\"},\"offset\":{\"type\":\"integer\",\"default\":0,"
+     "detect the limit and paginate.\",\"minimum\":1,\"maximum\":2147483647},"
+     "\"offset\":{\"type\":\"integer\",\"default\":0,\"minimum\":0,\"maximum\":2147483647,"
      "\"description\":\"Skip the first N matching nodes. Combine with 'limit' to page: "
      "increment offset by limit and re-call while has_more is true.\"}},"
      "\"required\":[\"project\"]}"},
@@ -2202,16 +2208,8 @@ static void enrich_connected(yyjson_mut_doc *doc, yyjson_mut_val *item, cbm_stor
     }
 }
 
-/* Build an FTS5 MATCH expression from a free-form query string by splitting
- * on whitespace and joining the terms with OR.  Each token is also sanitized:
- * anything that isn't alnum or underscore is dropped, so the caller can't
- * inject FTS5 operators or double-quoted phrases.  Returns the number of
- * tokens emitted (0 if the query contained no usable terms). */
+/* BM25 query/result column and binding positions. */
 enum {
-    BM25_MIN_BUF = 2, /* minimum buffer size: at least NUL + one char */
-    BM25_SEP_RESERVE = 1,
-    BM25_QUERY_BUF = 1024,
-    BM25_DEFAULT_LIMIT = 100,
     BM25_COL_ID = 0,
     BM25_COL_ATOM_ID = 1,
     BM25_COL_LABEL = 2,
@@ -2225,16 +2223,9 @@ enum {
     BM25_BIND_PROJECT = 2,
     BM25_BIND_LIMIT = 3,
     BM25_BIND_OFFSET = 4,
-    BM25_BIND_INNER = 5,
     BM25_BIND_FILE = 6,
+    BM25_BIND_LABEL = 7,
     BM25_SQL_AUTO_LEN = -1,
-    /* Inner FTS5 candidate cap.  SQLite can early-terminate a plain FTS5 query
-     * (no JOIN/WHERE on outer table) of the form:
-     *   SELECT rowid, bm25() FROM nodes_fts WHERE MATCH ? ORDER BY bm25() LIMIT N
-     * By fetching only the top BM25_INNER_LIMIT candidates from the FTS5 index
-     * and then joining/filtering/re-ranking those, we bound all work to O(N) where
-     * N = BM25_INNER_LIMIT rather than the full match set size. */
-    BM25_INNER_LIMIT = 2000,
 };
 
 /* Module-local SQLITE_TRANSIENT wrapper to dodge performance-no-int-to-ptr.
@@ -2247,175 +2238,379 @@ static sqlite3_destructor_type mcp_sqlite_transient(void) {
 }
 #define MCP_SQLITE_TRANSIENT (mcp_sqlite_transient())
 
-static int bm25_build_match(const char *query, char *out, size_t out_size) {
-    if (!query || !out || out_size < BM25_MIN_BUF) {
-        return 0;
-    }
-    size_t pos = 0;
-    int tokens = 0;
-    const char *p = query;
-    while (*p) {
-        while (*p && !((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') ||
-                       (*p >= '0' && *p <= '9') || *p == '_')) {
-            p++;
-        }
-        if (!*p) {
-            break;
-        }
-        const char *tok_start = p;
-        while (*p && ((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') ||
-                      (*p >= '0' && *p <= '9') || *p == '_')) {
-            p++;
-        }
-        size_t tok_len = (size_t)(p - tok_start);
-        if (tok_len == 0) {
-            continue;
-        }
-        const char *sep = (tokens > 0) ? " OR " : "";
-        size_t sep_len = strlen(sep);
-        if (pos + sep_len + tok_len + BM25_SEP_RESERVE >= out_size) {
-            break; /* out of room — stop cleanly, keep what we have */
-        }
-        memcpy(out + pos, sep, sep_len);
-        pos += sep_len;
-        memcpy(out + pos, tok_start, tok_len);
-        pos += tok_len;
-        tokens++;
-    }
-    out[pos] = '\0';
-    return tokens;
+static bool bm25_is_token_byte(unsigned char ch) {
+    return (ch >= (unsigned char)'a' && ch <= (unsigned char)'z') ||
+           (ch >= (unsigned char)'A' && ch <= (unsigned char)'Z') ||
+           (ch >= (unsigned char)'0' && ch <= (unsigned char)'9') || ch == (unsigned char)'_' ||
+           ch >= 0x80;
 }
 
-static char *bm25_file_pattern_like(const char *file_pattern) {
+/* Build one exact FTS5 MATCH expression without a hidden query-size cap.
+ * ASCII punctuation separates terms; UTF-8 bytes remain together for the
+ * unicode61 tokenizer. Every term is quoted so words such as AND/OR/NOT stay
+ * literal search terms rather than becoming caller-supplied FTS operators. */
+static char *bm25_build_match(const char *query, size_t *out_tokens) {
+    if (!query || !out_tokens) {
+        return NULL;
+    }
+    *out_tokens = 0;
+    size_t required = 0;
+    const unsigned char *p = (const unsigned char *)query;
+    while (*p) {
+        while (*p && !bm25_is_token_byte(*p)) {
+            p++;
+        }
+        const unsigned char *start = p;
+        while (*p && bm25_is_token_byte(*p)) {
+            p++;
+        }
+        size_t token_len = (size_t)(p - start);
+        if (token_len == 0) {
+            continue;
+        }
+        size_t separator_len = *out_tokens > 0 ? SLEN(" OR ") : 0;
+        if (required > SIZE_MAX - separator_len) {
+            return NULL;
+        }
+        required += separator_len;
+        if (required > SIZE_MAX - SLEN("\"\"")) {
+            return NULL;
+        }
+        required += SLEN("\"\"");
+        if (required > SIZE_MAX - token_len) {
+            return NULL;
+        }
+        required += token_len;
+        (*out_tokens)++;
+    }
+    if (required == SIZE_MAX) {
+        return NULL;
+    }
+
+    char *out = malloc(required + SKIP_ONE);
+    if (!out) {
+        return NULL;
+    }
+    size_t pos = 0;
+    size_t emitted = 0;
+    p = (const unsigned char *)query;
+    while (*p) {
+        while (*p && !bm25_is_token_byte(*p)) {
+            p++;
+        }
+        const unsigned char *start = p;
+        while (*p && bm25_is_token_byte(*p)) {
+            p++;
+        }
+        size_t token_len = (size_t)(p - start);
+        if (token_len == 0) {
+            continue;
+        }
+        if (emitted > 0) {
+            memcpy(out + pos, " OR ", SLEN(" OR "));
+            pos += SLEN(" OR ");
+        }
+        out[pos++] = '"';
+        memcpy(out + pos, start, token_len);
+        pos += token_len;
+        out[pos++] = '"';
+        emitted++;
+    }
+    out[pos] = '\0';
+    return out;
+}
+
+static char *bm25_file_pattern_like(const char *file_pattern, bool *out_failed) {
+    *out_failed = false;
     if (!file_pattern) {
         return NULL;
     }
-    char *like = cbm_glob_to_like(file_pattern);
-    if (like && !strchr(file_pattern, '*') && !strchr(file_pattern, '?')) {
-        size_t len = strlen(like);
-        char *contains = malloc(len + MCP_SEPARATOR + SKIP_ONE);
-        if (contains) {
-            contains[0] = '%';
-            memcpy(contains + SKIP_ONE, like, len);
-            contains[len + SKIP_ONE] = '%';
-            contains[len + MCP_SEPARATOR] = '\0';
-            free(like);
-            like = contains;
+    size_t pattern_len = strlen(file_pattern);
+    if (pattern_len == SIZE_MAX) {
+        *out_failed = true;
+        return NULL;
+    }
+    char *like = malloc(pattern_len + SKIP_ONE);
+    if (!like) {
+        *out_failed = true;
+        return NULL;
+    }
+    size_t like_len = 0;
+    for (size_t i = 0; i < pattern_len; i++) {
+        if (file_pattern[i] == '*' && i + SKIP_ONE < pattern_len &&
+            file_pattern[i + SKIP_ONE] == '*') {
+            if (like_len > 0 && like[like_len - SKIP_ONE] == '/') {
+                like_len--;
+            }
+            like[like_len++] = '%';
+            i++;
+            if (i + SKIP_ONE < pattern_len && file_pattern[i + SKIP_ONE] == '/') {
+                i++;
+            }
+        } else if (file_pattern[i] == '*') {
+            like[like_len++] = '%';
+        } else if (file_pattern[i] == '?') {
+            like[like_len++] = '_';
+        } else {
+            like[like_len++] = file_pattern[i];
         }
+    }
+    like[like_len] = '\0';
+    if (!strchr(file_pattern, '*') && !strchr(file_pattern, '?')) {
+        if (like_len > SIZE_MAX - MCP_SEPARATOR - SKIP_ONE) {
+            free(like);
+            *out_failed = true;
+            return NULL;
+        }
+        char *contains = malloc(like_len + MCP_SEPARATOR + SKIP_ONE);
+        if (!contains) {
+            free(like);
+            *out_failed = true;
+            return NULL;
+        }
+        contains[0] = '%';
+        memcpy(contains + SKIP_ONE, like, like_len);
+        contains[like_len + SKIP_ONE] = '%';
+        contains[like_len + MCP_SEPARATOR] = '\0';
+        free(like);
+        like = contains;
     }
     return like;
 }
 
-/* Run the BM25 full-text search path and return the JSON result string.
- * Returns NULL if FTS5 is unavailable or the query produced no usable tokens,
- * in which case the caller falls back to the regex-based search path. */
+static char *bm25_error_result(const char *code, const char *operation, const char *message,
+                               const char *remediation, int sqlite_error, const char *detail) {
+    char sqlite_error_text[CBM_SZ_32];
+    snprintf(sqlite_error_text, sizeof(sqlite_error_text), "%d", sqlite_error);
+    cbm_log_error("mcp.search_graph_bm25_failed", "code", code, "operation", operation,
+                  "sqlite_error", sqlite_error_text, "detail", detail ? detail : "", "message",
+                  message, "remediation", remediation);
+
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    yyjson_mut_val *root = yyjson_mut_obj(doc);
+    yyjson_mut_doc_set_root(doc, root);
+    yyjson_mut_obj_add_str(doc, root, "code", code);
+    yyjson_mut_obj_add_str(doc, root, "operation", operation);
+    yyjson_mut_obj_add_str(doc, root, "message", message);
+    yyjson_mut_obj_add_str(doc, root, "remediation", remediation);
+    if (sqlite_error != SQLITE_OK) {
+        yyjson_mut_obj_add_int(doc, root, "sqlite_error", sqlite_error);
+    }
+    if (detail && detail[0]) {
+        yyjson_mut_obj_add_str(doc, root, "detail", detail);
+    }
+    char *json = yy_doc_to_str(doc);
+    yyjson_mut_doc_free(doc);
+    if (!json) {
+        return cbm_mcp_text_result(
+            "{\"code\":\"CBM_SEARCH_BM25_SERIALIZATION_FAILED\",\"operation\":"
+            "\"serialize_error\",\"message\":\"the BM25 failure diagnostic could not be "
+            "serialized\",\"remediation\":\"free memory and retry the same request\"}",
+            true);
+    }
+    char *result = cbm_mcp_text_result(json, true);
+    free(json);
+    return result;
+}
+
+static int bm25_bind_filters(sqlite3_stmt *stmt, const char *fts_query, const char *project,
+                             const char *file_like, const char *label) {
+    int rc = sqlite3_bind_text(stmt, BM25_BIND_QUERY, fts_query, BM25_SQL_AUTO_LEN,
+                               MCP_SQLITE_TRANSIENT);
+    if (rc == SQLITE_OK) {
+        rc = sqlite3_bind_text(stmt, BM25_BIND_PROJECT, project, BM25_SQL_AUTO_LEN,
+                               MCP_SQLITE_TRANSIENT);
+    }
+    if (rc == SQLITE_OK) {
+        rc = file_like ? sqlite3_bind_text(stmt, BM25_BIND_FILE, file_like, BM25_SQL_AUTO_LEN,
+                                           MCP_SQLITE_TRANSIENT)
+                       : sqlite3_bind_null(stmt, BM25_BIND_FILE);
+    }
+    if (rc == SQLITE_OK) {
+        rc = label ? sqlite3_bind_text(stmt, BM25_BIND_LABEL, label, BM25_SQL_AUTO_LEN,
+                                       MCP_SQLITE_TRANSIENT)
+                   : sqlite3_bind_null(stmt, BM25_BIND_LABEL);
+    }
+    return rc;
+}
+
+/* Run the one exclusive BM25 full-text query path and return a complete MCP
+ * result. No tokenization, FTS, count, filtering, or serialization failure may
+ * be reinterpreted as the unrelated regex mode. */
 static char *bm25_search(cbm_store_t *store, const char *project, const char *query,
-                         const char *file_pattern, int limit, int offset) {
+                         const char *label, const char *file_pattern, int limit, int offset) {
     sqlite3 *db = cbm_store_get_db(store);
     if (!db) {
-        return NULL;
+        return bm25_error_result(
+            "CBM_SEARCH_BM25_STORE_UNAVAILABLE", "open_query_store",
+            "the verified project store has no SQLite query connection",
+            "preserve the store and inspect its verification/open diagnostics before retrying",
+            SQLITE_OK, "cbm_store_get_db returned NULL");
     }
-    char fts_query[BM25_QUERY_BUF];
-    int tok_count = bm25_build_match(query, fts_query, sizeof(fts_query));
-    if (tok_count == 0) {
-        return NULL;
-    }
-    char *file_like = bm25_file_pattern_like(file_pattern);
 
-    /* BM25 ranked query using a two-step approach to enable FTS5 early termination.
-     *
-     * Flat queries of the form:
-     *   SELECT ... FROM nodes_fts JOIN nodes WHERE MATCH ? AND n.project=? ORDER BY rank LIMIT N
-     * block FTS5's WAND/MaxScore early-exit because the outer JOIN+WHERE conditions
-     * are invisible to the FTS5 planner — it must score every matching document before
-     * the project/label filter can discard any of them.  On a large codebase with 100K+
-     * matches, this causes multi-minute queries.
-     *
-     * The fix: let FTS5 drive the inner subquery alone.  SQLite CAN early-terminate
-     *   SELECT rowid, bm25(nodes_fts) FROM nodes_fts WHERE MATCH ? ORDER BY bm25() LIMIT N
-     * because no outer predicate blocks it.  We fetch BM25_INNER_LIMIT top candidates
-     * from the FTS5 index, then join/filter/boost only those rows.  bm25() returns a
-     * NEGATIVE score (lower = more relevant). */
-    const char *sql =
-        "SELECT n.id, n.atom_id, n.label, n.name, n.qualified_name, n.file_path, "
-        "       n.start_line, n.end_line, "
-        "       (fts.base_rank "
-        "        - CASE WHEN n.label IN ('Function','Method') THEN 10.0 "
-        "               WHEN n.label = 'Route' THEN 8.0 "
-        "               WHEN n.label IN ('Class','Interface','Type','Enum') THEN 5.0 "
-        "               ELSE 0.0 END) AS rank "
-        "FROM ("
-        "    SELECT rowid, bm25(nodes_fts) AS base_rank"
-        "    FROM nodes_fts WHERE nodes_fts MATCH ?1"
-        "    ORDER BY base_rank LIMIT ?5"
-        ") fts "
-        "JOIN nodes n ON n.id = fts.rowid "
-        "WHERE n.project = ?2 "
-        "  AND n.label NOT IN ('File','Folder','Module','Section','Variable','Project') "
-        "  AND (?6 IS NULL OR n.file_path LIKE ?6) "
-        "ORDER BY rank "
-        "LIMIT ?3 OFFSET ?4";
+    size_t token_count = 0;
+    char *fts_query = bm25_build_match(query, &token_count);
+    if (!fts_query) {
+        return bm25_error_result(
+            "CBM_SEARCH_BM25_ALLOCATION_FAILED", "build_match_expression",
+            "the complete BM25 MATCH expression could not be allocated",
+            "free memory or submit a shorter query, then retry; no partial query was executed",
+            SQLITE_OK, "MATCH expression size overflow or allocation failure");
+    }
+    if (token_count == 0) {
+        free(fts_query);
+        return bm25_error_result("CBM_SEARCH_BM25_QUERY_EMPTY", "build_match_expression",
+                                 "query contains no searchable letters, digits, or underscores",
+                                 "provide at least one searchable Unicode or ASCII term", SQLITE_OK,
+                                 "no FTS5 term was emitted");
+    }
+
+    bool file_pattern_failed = false;
+    char *file_like = bm25_file_pattern_like(file_pattern, &file_pattern_failed);
+    if (file_pattern_failed) {
+        free(fts_query);
+        return bm25_error_result(
+            "CBM_SEARCH_BM25_ALLOCATION_FAILED", "build_file_filter",
+            "the complete BM25 file-pattern filter could not be allocated",
+            "free memory or submit a shorter file_pattern, then retry; no unfiltered query was "
+            "executed",
+            SQLITE_OK, "file-pattern size overflow or allocation failure");
+    }
+
+    /* Count the exact same contracted domain used by the ranked page. The
+     * contentless FTS table supplies authoritative matching rowids; all stored
+     * node fields and filters come from the joined nodes table. */
+    const char *count_sql =
+        "SELECT COUNT(*) "
+        "FROM nodes_fts "
+        "JOIN nodes n ON n.id = nodes_fts.rowid "
+        "WHERE nodes_fts MATCH ?1 "
+        "  AND n.project = ?2 "
+        "  AND ((?7 IS NULL AND "
+        "        n.label NOT IN ('File','Folder','Module','Section','Project')) "
+        "       OR n.label = ?7) "
+        "  AND (?6 IS NULL OR n.file_path LIKE ?6)";
+    sqlite3_stmt *count_stmt = NULL;
+    int rc = sqlite3_prepare_v2(db, count_sql, BM25_SQL_AUTO_LEN, &count_stmt, NULL);
+    if (rc != SQLITE_OK) {
+        int sqlite_error = sqlite3_extended_errcode(db);
+        char detail_copy[CBM_SZ_512];
+        snprintf(detail_copy, sizeof(detail_copy), "%s", sqlite3_errmsg(db));
+        free(file_like);
+        free(fts_query);
+        return bm25_error_result(
+            "CBM_SEARCH_BM25_PREPARE_FAILED", "prepare_exact_count",
+            "SQLite could not prepare the exact BM25 count query",
+            "inspect the persisted FTS5/schema diagnostic and repair the project store before "
+            "retrying",
+            sqlite_error != SQLITE_OK ? sqlite_error : rc, detail_copy);
+    }
+    rc = bm25_bind_filters(count_stmt, fts_query, project, file_like, label);
+    if (rc != SQLITE_OK) {
+        int sqlite_error = sqlite3_extended_errcode(db);
+        char detail_copy[CBM_SZ_512];
+        snprintf(detail_copy, sizeof(detail_copy), "%s", sqlite3_errmsg(db));
+        sqlite3_finalize(count_stmt);
+        free(file_like);
+        free(fts_query);
+        return bm25_error_result("CBM_SEARCH_BM25_BIND_FAILED", "bind_exact_count",
+                                 "SQLite could not bind the complete BM25 count query",
+                                 "inspect the SQLite diagnostic and retry the unchanged request",
+                                 sqlite_error != SQLITE_OK ? sqlite_error : rc, detail_copy);
+    }
+    rc = sqlite3_step(count_stmt);
+    if (rc != SQLITE_ROW) {
+        int sqlite_error = sqlite3_extended_errcode(db);
+        char detail_copy[CBM_SZ_512];
+        snprintf(detail_copy, sizeof(detail_copy), "%s", sqlite3_errmsg(db));
+        sqlite3_finalize(count_stmt);
+        free(file_like);
+        free(fts_query);
+        return bm25_error_result(
+            "CBM_SEARCH_BM25_COUNT_FAILED", "execute_exact_count",
+            "SQLite did not return the exact BM25 match count",
+            "inspect the persisted FTS5/store diagnostic and retry after repairing the store",
+            sqlite_error != SQLITE_OK ? sqlite_error : rc, detail_copy);
+    }
+    sqlite3_int64 total = sqlite3_column_int64(count_stmt, 0);
+    rc = sqlite3_finalize(count_stmt);
+    if (rc != SQLITE_OK) {
+        int sqlite_error = sqlite3_extended_errcode(db);
+        char detail_copy[CBM_SZ_512];
+        snprintf(detail_copy, sizeof(detail_copy), "%s", sqlite3_errmsg(db));
+        free(file_like);
+        free(fts_query);
+        return bm25_error_result(
+            "CBM_SEARCH_BM25_COUNT_FAILED", "finalize_exact_count",
+            "SQLite could not finalize the exact BM25 count query",
+            "inspect the persisted FTS5/store diagnostic and retry after repairing the store",
+            sqlite_error != SQLITE_OK ? sqlite_error : rc, detail_copy);
+    }
+
+    /* bm25() is lower-is-better. The authoritative node ID breaks every score
+     * tie so OFFSET pages are stable and cannot repeat or omit equal-ranked rows. */
+    const char *sql = "SELECT n.id, n.atom_id, n.label, n.name, n.qualified_name, n.file_path, "
+                      "       n.start_line, n.end_line, "
+                      "       (bm25(nodes_fts) "
+                      "        - CASE WHEN n.label IN ('Function','Method') THEN 10.0 "
+                      "               WHEN n.label = 'Route' THEN 8.0 "
+                      "               WHEN n.label IN ('Class','Interface','Type','Enum') THEN 5.0 "
+                      "               ELSE 0.0 END) AS rank "
+                      "FROM nodes_fts "
+                      "JOIN nodes n ON n.id = nodes_fts.rowid "
+                      "WHERE nodes_fts MATCH ?1 "
+                      "  AND n.project = ?2 "
+                      "  AND ((?7 IS NULL AND "
+                      "        n.label NOT IN ('File','Folder','Module','Section','Project')) "
+                      "       OR n.label = ?7) "
+                      "  AND (?6 IS NULL OR n.file_path LIKE ?6) "
+                      "ORDER BY rank, n.id "
+                      "LIMIT ?3 OFFSET ?4";
 
     sqlite3_stmt *stmt = NULL;
-    if (sqlite3_prepare_v2(db, sql, BM25_SQL_AUTO_LEN, &stmt, NULL) != SQLITE_OK) {
+    rc = sqlite3_prepare_v2(db, sql, BM25_SQL_AUTO_LEN, &stmt, NULL);
+    if (rc != SQLITE_OK) {
+        int sqlite_error = sqlite3_extended_errcode(db);
+        char detail_copy[CBM_SZ_512];
+        snprintf(detail_copy, sizeof(detail_copy), "%s", sqlite3_errmsg(db));
         free(file_like);
-        return NULL;
+        free(fts_query);
+        return bm25_error_result(
+            "CBM_SEARCH_BM25_PREPARE_FAILED", "prepare_ranked_page",
+            "SQLite could not prepare the ranked BM25 page query",
+            "inspect the persisted FTS5/schema diagnostic and repair the project store before "
+            "retrying",
+            sqlite_error != SQLITE_OK ? sqlite_error : rc, detail_copy);
     }
-    sqlite3_bind_text(stmt, BM25_BIND_QUERY, fts_query, BM25_SQL_AUTO_LEN, MCP_SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt, BM25_BIND_PROJECT, project, BM25_SQL_AUTO_LEN, MCP_SQLITE_TRANSIENT);
-    sqlite3_bind_int(stmt, BM25_BIND_LIMIT, limit > 0 ? limit : BM25_DEFAULT_LIMIT);
-    sqlite3_bind_int(stmt, BM25_BIND_OFFSET, offset > 0 ? offset : 0);
-    sqlite3_bind_int(stmt, BM25_BIND_INNER, BM25_INNER_LIMIT);
-    if (file_like) {
-        sqlite3_bind_text(stmt, BM25_BIND_FILE, file_like, BM25_SQL_AUTO_LEN, MCP_SQLITE_TRANSIENT);
-    } else {
-        sqlite3_bind_null(stmt, BM25_BIND_FILE);
+    rc = bm25_bind_filters(stmt, fts_query, project, file_like, label);
+    if (rc == SQLITE_OK) {
+        rc = sqlite3_bind_int(stmt, BM25_BIND_LIMIT, limit);
     }
-
-    /* Count hits within the same inner-limit window — capped at BM25_INNER_LIMIT.
-     * Uses the identical subquery structure so the FTS5 early-exit applies here too. */
-    int total = 0;
-    {
-        const char *count_sql =
-            "SELECT COUNT(*) FROM ("
-            "    SELECT fts.rowid FROM ("
-            "        SELECT rowid FROM nodes_fts WHERE nodes_fts MATCH ?1"
-            "        ORDER BY bm25(nodes_fts) LIMIT ?3"
-            "    ) fts "
-            "    JOIN nodes n ON n.id = fts.rowid "
-            "    WHERE n.project = ?2 "
-            "      AND n.label NOT IN ('File','Folder','Module','Section','Variable','Project')"
-            "      AND (?6 IS NULL OR n.file_path LIKE ?6)"
-            ")";
-        sqlite3_stmt *cs = NULL;
-        if (sqlite3_prepare_v2(db, count_sql, BM25_SQL_AUTO_LEN, &cs, NULL) == SQLITE_OK) {
-            sqlite3_bind_text(cs, BM25_BIND_QUERY, fts_query, BM25_SQL_AUTO_LEN,
-                              MCP_SQLITE_TRANSIENT);
-            sqlite3_bind_text(cs, BM25_BIND_PROJECT, project, BM25_SQL_AUTO_LEN,
-                              MCP_SQLITE_TRANSIENT);
-            sqlite3_bind_int(cs, BM25_BIND_LIMIT, BM25_INNER_LIMIT);
-            if (file_like) {
-                sqlite3_bind_text(cs, BM25_BIND_FILE, file_like, BM25_SQL_AUTO_LEN,
-                                  MCP_SQLITE_TRANSIENT);
-            } else {
-                sqlite3_bind_null(cs, BM25_BIND_FILE);
-            }
-            if (sqlite3_step(cs) == SQLITE_ROW) {
-                total = sqlite3_column_int(cs, 0);
-            }
-            sqlite3_finalize(cs);
-        }
+    if (rc == SQLITE_OK) {
+        rc = sqlite3_bind_int(stmt, BM25_BIND_OFFSET, offset);
+    }
+    if (rc != SQLITE_OK) {
+        int sqlite_error = sqlite3_extended_errcode(db);
+        char detail_copy[CBM_SZ_512];
+        snprintf(detail_copy, sizeof(detail_copy), "%s", sqlite3_errmsg(db));
+        sqlite3_finalize(stmt);
+        free(file_like);
+        free(fts_query);
+        return bm25_error_result("CBM_SEARCH_BM25_BIND_FAILED", "bind_ranked_page",
+                                 "SQLite could not bind the complete ranked BM25 page query",
+                                 "inspect the SQLite diagnostic and retry the unchanged request",
+                                 sqlite_error != SQLITE_OK ? sqlite_error : rc, detail_copy);
     }
 
     yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
     yyjson_mut_val *root = yyjson_mut_obj(doc);
     yyjson_mut_doc_set_root(doc, root);
-    yyjson_mut_obj_add_int(doc, root, "total", total);
+    yyjson_mut_obj_add_uint(doc, root, "total", (uint64_t)total);
     yyjson_mut_obj_add_str(doc, root, "search_mode", "bm25");
 
     yyjson_mut_val *results = yyjson_mut_arr(doc);
     int emitted = 0;
-    while (sqlite3_step(stmt) == SQLITE_ROW) {
+    while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
         yyjson_mut_val *item = yyjson_mut_obj(doc);
         yyjson_mut_obj_add_strcpy(doc, item, "atom_id",
                                   (const char *)sqlite3_column_text(stmt, BM25_COL_ATOM_ID));
@@ -2433,15 +2628,50 @@ static char *bm25_search(cbm_store_t *store, const char *project, const char *qu
         yyjson_mut_arr_add_val(results, item);
         emitted++;
     }
-    sqlite3_finalize(stmt);
+    if (rc != SQLITE_DONE) {
+        int sqlite_error = sqlite3_extended_errcode(db);
+        char detail_copy[CBM_SZ_512];
+        snprintf(detail_copy, sizeof(detail_copy), "%s", sqlite3_errmsg(db));
+        sqlite3_finalize(stmt);
+        yyjson_mut_doc_free(doc);
+        free(file_like);
+        free(fts_query);
+        return bm25_error_result(
+            "CBM_SEARCH_BM25_EXECUTE_FAILED", "execute_ranked_page",
+            "SQLite could not complete the ranked BM25 page query",
+            "inspect the persisted FTS5/store diagnostic and retry after repairing the store",
+            sqlite_error != SQLITE_OK ? sqlite_error : rc, detail_copy);
+    }
+    rc = sqlite3_finalize(stmt);
     free(file_like);
+    free(fts_query);
+    if (rc != SQLITE_OK) {
+        int sqlite_error = sqlite3_extended_errcode(db);
+        char detail_copy[CBM_SZ_512];
+        snprintf(detail_copy, sizeof(detail_copy), "%s", sqlite3_errmsg(db));
+        yyjson_mut_doc_free(doc);
+        return bm25_error_result(
+            "CBM_SEARCH_BM25_EXECUTE_FAILED", "finalize_ranked_page",
+            "SQLite could not finalize the ranked BM25 page query",
+            "inspect the persisted FTS5/store diagnostic and retry after repairing the store",
+            sqlite_error != SQLITE_OK ? sqlite_error : rc, detail_copy);
+    }
 
     yyjson_mut_obj_add_val(doc, root, "results", results);
-    yyjson_mut_obj_add_bool(doc, root, "has_more", total > offset + emitted);
+    yyjson_mut_obj_add_bool(doc, root, "has_more",
+                            total > (sqlite3_int64)offset + (sqlite3_int64)emitted);
 
     char *json = yy_doc_to_str(doc);
     yyjson_mut_doc_free(doc);
-    return json;
+    if (!json) {
+        return bm25_error_result("CBM_SEARCH_BM25_SERIALIZATION_FAILED", "serialize_ranked_page",
+                                 "the exact BM25 result could not be serialized",
+                                 "free memory and retry; no partial result was returned", SQLITE_OK,
+                                 "yyjson_mut_write returned NULL");
+    }
+    char *result = cbm_mcp_text_result(json, false);
+    free(json);
+    return result;
 }
 
 /* Forward declaration — defined later. enrich_node_properties parses the
@@ -2646,6 +2876,22 @@ static char *validate_search_graph_arguments(const char *args) {
             return result;
         }
     }
+    yyjson_val *limit_value = yyjson_obj_get(root, "limit");
+    if (limit_value &&
+        (yyjson_get_sint(limit_value) <= 0 || yyjson_get_sint(limit_value) > INT_MAX)) {
+        char *result = search_graph_argument_error_result(
+            "limit", "a JSON integer from 1 through 2147483647", "an out-of-range JSON integer");
+        yyjson_doc_free(doc);
+        return result;
+    }
+    yyjson_val *offset_value = yyjson_obj_get(root, "offset");
+    if (offset_value &&
+        (yyjson_get_sint(offset_value) < 0 || yyjson_get_sint(offset_value) > INT_MAX)) {
+        char *result = search_graph_argument_error_result(
+            "offset", "a JSON integer from 0 through 2147483647", "an out-of-range JSON integer");
+        yyjson_doc_free(doc);
+        return result;
+    }
 
     const char *boolean_fields[] = {"exclude_entry_points", "include_connected"};
     for (size_t i = 0; i < sizeof(boolean_fields) / sizeof(boolean_fields[0]); i++) {
@@ -2680,6 +2926,30 @@ static char *validate_search_graph_arguments(const char *args) {
         }
     }
 
+    yyjson_val *query_value = yyjson_obj_get(root, "query");
+    if (query_value) {
+        if (yyjson_get_len(query_value) == 0) {
+            char *result = search_graph_argument_error_result("query", "a non-empty JSON string",
+                                                              "an empty JSON string");
+            yyjson_doc_free(doc);
+            return result;
+        }
+        const char *incompatible_fields[] = {
+            "name_pattern", "qn_pattern",           "relationship",      "min_degree",
+            "max_degree",   "exclude_entry_points", "include_connected", "semantic_query",
+        };
+        for (size_t i = 0; i < sizeof(incompatible_fields) / sizeof(incompatible_fields[0]); i++) {
+            yyjson_val *value = yyjson_obj_get(root, incompatible_fields[i]);
+            if (value) {
+                char *result = search_graph_argument_error_result(incompatible_fields[i],
+                                                                  "absent when query is provided",
+                                                                  yyjson_get_type_desc(value));
+                yyjson_doc_free(doc);
+                return result;
+            }
+        }
+    }
+
     yyjson_doc_free(doc);
     return NULL;
 }
@@ -2700,24 +2970,21 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
         return not_indexed;
     }
 
-    /* BM25 path: if `query` is set, run FTS5 full-text search with ranking
-     * and return early.  The regex/vector path below is untouched for all
-     * other callers.  If FTS5 is unavailable or the query is empty after
-     * tokenization, fall through to the regex path. */
+    /* An explicit query selects one exclusive BM25 path. Every failure is
+     * returned from that mode; it is never reinterpreted as regex/vector search. */
     char *query = cbm_mcp_get_string_arg(args, "query");
-    if (query && query[0]) {
-        int q_limit = cbm_mcp_get_int_arg(args, "limit", BM25_DEFAULT_LIMIT);
+    if (query) {
+        int q_limit = cbm_mcp_get_int_arg(args, "limit", CBM_DEFAULT_SEARCH_LIMIT);
         int q_offset = cbm_mcp_get_int_arg(args, "offset", 0);
+        char *q_label = cbm_mcp_get_string_arg(args, "label");
         char *q_file_pattern = cbm_mcp_get_string_arg(args, "file_pattern");
-        char *bm25_json = bm25_search(store, project, query, q_file_pattern, q_limit, q_offset);
+        char *result =
+            bm25_search(store, project, query, q_label, q_file_pattern, q_limit, q_offset);
+        free(q_label);
         free(q_file_pattern);
-        if (bm25_json) {
-            free(query);
-            free(project);
-            char *result = cbm_mcp_text_result(bm25_json, false);
-            free(bm25_json);
-            return result;
-        }
+        free(query);
+        free(project);
+        return result;
     }
     free(query);
 
