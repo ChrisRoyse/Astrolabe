@@ -6301,6 +6301,7 @@ if ([string]::IsNullOrEmpty($InternalDedicatedToken)) {
     $bootstrapLiteral = if ($Bootstrap) { '$true' } else { '$false' }
     $recoverPreservedTargetLiteral = if ($RecoverPreservedTarget) { '$true' } else { '$false' }
     $dedicatedCommand = @"
+[Console]::OutputEncoding = [Text.UTF8Encoding]::new(`$false, `$true)
 `$decode = {
     param([string]`$Value)
     [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String(`$Value))
@@ -6334,9 +6335,25 @@ exit `$dedicatedExit
     }
     $startInfo = [Diagnostics.ProcessStartInfo]::new()
     $startInfo.FileName = $hostExecutable
-    $startInfo.Arguments = "-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand $encodedDedicatedCommand"
+    $startInfo.Arguments = "-NoLogo -NoProfile -NonInteractive -OutputFormat Text -ExecutionPolicy Bypass -EncodedCommand $encodedDedicatedCommand"
     $startInfo.WorkingDirectory = $root
     $startInfo.UseShellExecute = $false
+    # #759: this Process object is the public wrapper's only exact handle to the
+    # dedicated owner. Inheriting the host handles sends the owner's transcript
+    # around PowerShell's caller-visible streams, so ordinary `*>` capture loses
+    # every causal diagnostic between STARTED and TERMINAL. Redirect both pipes
+    # and keep one asynchronous line read outstanding on each while the child is
+    # live. The wrapper therefore never waits for exit with a full pipe and never
+    # accumulates the complete transcript in memory. Dedicated stderr is emitted
+    # as an explicitly tagged success-stream record: creating PowerShell
+    # ErrorRecords here would make the caller's ErrorActionPreference part of the
+    # launcher's control flow and could turn a diagnostic into an interruption.
+    $startInfo.RedirectStandardOutput = $true
+    $startInfo.RedirectStandardError = $true
+    $startInfo.StandardOutputEncoding =
+        [Text.UTF8Encoding]::new($false, $true)
+    $startInfo.StandardErrorEncoding =
+        [Text.UTF8Encoding]::new($false, $true)
     $startInfo.EnvironmentVariables['ASTRO_LAUNCHER_WRAPPER_TOKEN'] =
         $wrapperToken
     $startInfo.EnvironmentVariables['ASTRO_LAUNCHER_WRAPPER_PID'] =
@@ -6345,19 +6362,112 @@ exit `$dedicatedExit
         $wrapperTicks.ToString([Globalization.CultureInfo]::InvariantCulture)
     $dedicatedProcess = [Diagnostics.Process]::new()
     $dedicatedProcess.StartInfo = $startInfo
+    $dedicatedStdoutTask = $null
+    $dedicatedStderrTask = $null
+    $dedicatedStdoutClosed = $false
+    $dedicatedStderrClosed = $false
+    $dedicatedStdoutLines = 0L
+    $dedicatedStderrLines = 0L
+    $dedicatedRelaySequence = 0L
+    $dedicatedStarted = $false
     try {
         if (-not $dedicatedProcess.Start()) {
             throw 'native process creation returned false'
         }
+        $dedicatedStarted = $true
         $dedicatedPid = $dedicatedProcess.Id
         $dedicatedTicks =
             $dedicatedProcess.StartTime.ToUniversalTime().Ticks
         Write-Output "LAUNCHER_BOUNDARY[ASTRO_LAUNCHER_DEDICATED_STARTED]: pid=$dedicatedPid; owner_process_start_utc_ticks=$dedicatedTicks; wrapper_pid=$PID; wrapper_process_start_utc_ticks=$wrapperTicks"
+        $dedicatedStdoutTask =
+            $dedicatedProcess.StandardOutput.ReadLineAsync()
+        $dedicatedStderrTask =
+            $dedicatedProcess.StandardError.ReadLineAsync()
+        while (-not $dedicatedStdoutClosed -or
+            -not $dedicatedStderrClosed) {
+            $pendingReads = [Collections.Generic.List[Threading.Tasks.Task]]::new()
+            if (-not $dedicatedStdoutClosed) {
+                $pendingReads.Add($dedicatedStdoutTask)
+            }
+            if (-not $dedicatedStderrClosed) {
+                $pendingReads.Add($dedicatedStderrTask)
+            }
+            if ($pendingReads.Count -eq 0) { break }
+            [void][Threading.Tasks.Task]::WaitAny(
+                $pendingReads.ToArray(),
+                250
+            )
+            if (-not $dedicatedStdoutClosed -and
+                $dedicatedStdoutTask.IsCompleted) {
+                $stdoutLine =
+                    $dedicatedStdoutTask.GetAwaiter().GetResult()
+                if ($null -eq $stdoutLine) {
+                    $dedicatedStdoutClosed = $true
+                }
+                else {
+                    $dedicatedStdoutLines++
+                    Write-Output $stdoutLine
+                    $dedicatedStdoutTask =
+                        $dedicatedProcess.StandardOutput.ReadLineAsync()
+                }
+            }
+            if (-not $dedicatedStderrClosed -and
+                $dedicatedStderrTask.IsCompleted) {
+                $stderrLine =
+                    $dedicatedStderrTask.GetAwaiter().GetResult()
+                if ($null -eq $stderrLine) {
+                    $dedicatedStderrClosed = $true
+                }
+                else {
+                    $dedicatedStderrLines++
+                    $dedicatedRelaySequence++
+                    Write-Output (
+                        'LAUNCHER_RELAY[ASTRO_DEDICATED_STDERR]: ' +
+                        "sequence=$dedicatedRelaySequence; text=$stderrLine"
+                    )
+                    $dedicatedStderrTask =
+                        $dedicatedProcess.StandardError.ReadLineAsync()
+                }
+            }
+        }
+        # The parameterless wait is required after asynchronous draining so the
+        # runtime finishes process-exit and redirected-buffer bookkeeping before
+        # ExitCode is read.
         $dedicatedProcess.WaitForExit()
         $dedicatedExit = [int]$dedicatedProcess.ExitCode
+        Write-Output "LAUNCHER_RELAY[ASTRO_DEDICATED_STREAMS_DRAINED]: stdout_lines=$dedicatedStdoutLines; stderr_lines=$dedicatedStderrLines; stdout_eof=$dedicatedStdoutClosed; stderr_eof=$dedicatedStderrClosed"
     }
     catch {
-        throw "LAUNCHER_BOUNDARY[ASTRO_LAUNCHER_DEDICATED_START_FAILED]: {code=ASTRO_LAUNCHER_DEDICATED_START_FAILED; message=`"the dedicated native launcher process could not be executed/read back: $($_.Exception.Message)`"; remediation=`"preserve all existing protocol state, repair native PowerShell process creation, and retry the public launcher invocation`"}"
+        $relayFault = $_
+        $relayOwnerTerminal = if ($dedicatedStarted) {
+            'unevaluated'
+        }
+        else {
+            'not-started'
+        }
+        $relayOwnerCleanupError = '<absent>'
+        if ($dedicatedStarted) {
+            try {
+                if (-not $dedicatedProcess.HasExited) {
+                    # The wrapper retains the exact Process handle returned by
+                    # Start. Terminating only that bound owner makes its
+                    # process-lifetime Job handle close; KILL_ON_JOB_CLOSE then
+                    # removes its attributed descendants while protocol bytes
+                    # remain preserved for tracker-bound recovery.
+                    $dedicatedProcess.Kill()
+                    $dedicatedProcess.WaitForExit()
+                    $relayOwnerTerminal = 'exact-owner-terminated'
+                }
+                else {
+                    $relayOwnerTerminal = 'already-absent'
+                }
+            }
+            catch {
+                $relayOwnerTerminal = 'unevaluable'
+                $relayOwnerCleanupError = $_.Exception.Message
+            }
+        }
+        throw "LAUNCHER_BOUNDARY[ASTRO_LAUNCHER_DEDICATED_RELAY_FAILED]: {code=ASTRO_LAUNCHER_DEDICATED_RELAY_FAILED; message=`"the dedicated native launcher process could not be started or its redirected output/terminal state could not be drained exactly: $($relayFault.Exception.Message); owner_terminal=$relayOwnerTerminal; owner_cleanup_error=$relayOwnerCleanupError`"; remediation=`"preserve all existing protocol state; inspect the exact dedicated process identity plus stdout/stderr pipe state, repair the public relay, and retry only after any owner generation and Job are inactive`"}"
     }
     finally {
         $dedicatedProcess.Dispose()
