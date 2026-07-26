@@ -2985,12 +2985,10 @@ static const char *where_exact_seek_value(const cbm_where_clause_t *where, const
     return NULL;
 }
 
-static const char *inline_exact_seek_value(const cbm_node_pattern_t *node,
-                                           const char *property) {
+static const char *inline_exact_seek_value(const cbm_node_pattern_t *node, const char *property) {
     for (int i = 0; i < node->prop_count; i++) {
         if (node->props[i].key && node->props[i].value &&
-            strcmp(node->props[i].key, property) == 0 &&
-            !looks_like_regex(node->props[i].value)) {
+            strcmp(node->props[i].key, property) == 0 && !looks_like_regex(node->props[i].value)) {
             return node->props[i].value;
         }
     }
