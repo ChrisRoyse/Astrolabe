@@ -2938,23 +2938,134 @@ static int scan_alternation_labels(cbm_store_t *store, const char *project, cons
     return CBM_STORE_OK;
 }
 
-static int scan_pattern_nodes(cbm_store_t *store, const char *project, int max_rows,
-                              cbm_node_pattern_t *first, cbm_node_t **out_nodes, int *out_count) {
-    if (first->label && strchr(first->label, '|')) {
+/* An exact equality below an AND is a necessary condition for the whole WHERE
+ * expression and can therefore seed an indexed lookup without changing query
+ * meaning.  OR/XOR/NOT subtrees are deliberately opaque: using either branch
+ * as a seek would discard rows admitted by the other branch. */
+static const char *expr_exact_seek_value(const cbm_expr_t *expr, const char *variable,
+                                         const char *property) { // NOLINT(misc-no-recursion)
+    if (!expr || !variable || !property) {
+        return NULL;
+    }
+    if (expr->type == EXPR_CONDITION) {
+        const cbm_condition_t *cond = &expr->cond;
+        if (!cond->negated && cond->variable && cond->property && cond->op && cond->value &&
+            strcmp(cond->variable, variable) == 0 && strcmp(cond->property, property) == 0 &&
+            strcmp(cond->op, "=") == 0) {
+            return cond->value;
+        }
+        return NULL;
+    }
+    if (expr->type != EXPR_AND) {
+        return NULL;
+    }
+    const char *value = expr_exact_seek_value(expr->left, variable, property);
+    return value ? value : expr_exact_seek_value(expr->right, variable, property);
+}
+
+static const char *where_exact_seek_value(const cbm_where_clause_t *where, const char *variable,
+                                          const char *property) {
+    if (!where || !variable) {
+        return NULL;
+    }
+    if (where->root) {
+        return expr_exact_seek_value(where->root, variable, property);
+    }
+    if (where->count > 1 && (!where->op || strcmp(where->op, "AND") != 0)) {
+        return NULL;
+    }
+    for (int i = 0; i < where->count; i++) {
+        const cbm_condition_t *cond = &where->conditions[i];
+        if (!cond->negated && cond->variable && cond->property && cond->op && cond->value &&
+            strcmp(cond->variable, variable) == 0 && strcmp(cond->property, property) == 0 &&
+            strcmp(cond->op, "=") == 0) {
+            return cond->value;
+        }
+    }
+    return NULL;
+}
+
+static const char *inline_exact_seek_value(const cbm_node_pattern_t *node,
+                                           const char *property) {
+    for (int i = 0; i < node->prop_count; i++) {
+        if (node->props[i].key && node->props[i].value &&
+            strcmp(node->props[i].key, property) == 0 &&
+            !looks_like_regex(node->props[i].value)) {
+            return node->props[i].value;
+        }
+    }
+    return NULL;
+}
+
+static bool is_aggregate_func(const char *func); /* defined with RETURN helpers below */
+
+/* Only a pure, single-pattern row stream may stop its candidate access at the
+ * output cap.  Every operator that can reject, combine, reorder, deduplicate,
+ * aggregate, or skip rows needs the complete candidate domain first. */
+static int candidate_prefix_limit(const cbm_query_t *query, int max_rows, bool union_context) {
+    if (!query || union_context || query->pattern_count != SKIP_ONE || query->where ||
+        query->with_clause || query->post_with_where || query->unwind_expr ||
+        query->patterns[0].rel_count != 0) {
+        return 0;
+    }
+    const cbm_return_clause_t *ret = query->ret;
+    if (!ret) {
+        return max_rows;
+    }
+    if (ret->distinct || ret->order_by || ret->skip > 0) {
+        return 0;
+    }
+    for (int i = 0; i < ret->count; i++) {
+        if (is_aggregate_func(ret->items[i].func)) {
+            return 0;
+        }
+    }
+    if (ret->limit >= 0 && ret->limit < max_rows) {
+        return ret->limit;
+    }
+    return max_rows;
+}
+
+static int scan_pattern_nodes(cbm_store_t *store, const char *project, int prefix_limit,
+                              const cbm_where_clause_t *where, cbm_node_pattern_t *first,
+                              cbm_node_t **out_nodes, int *out_count) {
+    const char *name = inline_exact_seek_value(first, "name");
+    const char *qualified_name = inline_exact_seek_value(first, "qualified_name");
+    if (!name) {
+        name = where_exact_seek_value(where, first->variable, "name");
+    }
+    if (!qualified_name) {
+        qualified_name = where_exact_seek_value(where, first->variable, "qualified_name");
+    }
+
+    bool label_applied = false;
+    if (name) {
+        if (cbm_store_find_nodes_by_name(store, project, name, out_nodes, out_count) !=
+            CBM_STORE_OK) {
+            return CBM_STORE_ERR;
+        }
+    } else if (qualified_name) {
+        if (cbm_store_find_nodes_by_qn(store, project, qualified_name, out_nodes, out_count) !=
+            CBM_STORE_OK) {
+            return CBM_STORE_ERR;
+        }
+    } else if (first->label && strchr(first->label, '|')) {
         if (scan_alternation_labels(store, project, first->label, out_nodes, out_count) !=
             CBM_STORE_OK) {
             return CBM_STORE_ERR;
         }
+        label_applied = true;
     } else if (first->label) {
         if (cbm_store_find_nodes_by_label(store, project, first->label, out_nodes, out_count) !=
             CBM_STORE_OK) {
             return CBM_STORE_ERR;
         }
-    } else {
+        label_applied = true;
+    } else if (prefix_limit > 0) {
         cbm_search_params_t params = {.project = project,
                                       .min_degree = CYP_FOUND_NONE,
                                       .max_degree = CYP_FOUND_NONE,
-                                      .limit = max_rows * CYP_GROWTH_10};
+                                      .limit = prefix_limit};
         cbm_search_output_t sout = {0};
         if (cbm_store_search(store, &params, &sout) != CBM_STORE_OK) {
             return CBM_STORE_ERR;
@@ -2970,12 +3081,20 @@ static int scan_pattern_nodes(cbm_store_t *store, const char *project, int max_r
             node_move(&(*out_nodes)[i], &sout.results[i].node);
         }
         cbm_store_search_free(&sout);
+    } else if (cbm_store_find_nodes_by_project(store, project, out_nodes, out_count) !=
+               CBM_STORE_OK) {
+        return CBM_STORE_ERR;
     }
-    /* Apply inline property filters — free rejected nodes' strings */
-    if (first->prop_count > 0) {
+
+    /* Indexed name/QN seeks do not incorporate a pattern label.  Apply it
+     * together with any remaining inline properties before binding. */
+    if ((!label_applied && first->label) || first->prop_count > 0) {
         int kept = 0;
         for (int i = 0; i < *out_count; i++) {
-            if (check_inline_props(&(*out_nodes)[i], first->props, first->prop_count, store)) {
+            bool label_matches =
+                !first->label || label_alt_matches((*out_nodes)[i].label, first->label);
+            if (label_matches &&
+                check_inline_props(&(*out_nodes)[i], first->props, first->prop_count, store)) {
                 if (kept != i) {
                     node_move(&(*out_nodes)[kept], &(*out_nodes)[i]);
                 }
@@ -4620,7 +4739,7 @@ static int expand_additional_patterns(cbm_store_t *store, cbm_query_t *q, const 
 
         cbm_node_t *extra_nodes = NULL;
         int extra_count = 0;
-        if (scan_pattern_nodes(store, project, max_rows, &patn->nodes[0], &extra_nodes,
+        if (scan_pattern_nodes(store, project, 0, q->where, &patn->nodes[0], &extra_nodes,
                                &extra_count) != CBM_STORE_OK) {
             return CBM_STORE_ERR;
         }
@@ -4672,14 +4791,15 @@ static void execute_return_clause(cbm_query_t *q, cbm_return_clause_t *ret, bind
 }
 
 static int execute_single(cbm_store_t *store, cbm_query_t *q, const char *project, int max_rows,
-                          result_builder_t *rb) {
+                          bool union_context, result_builder_t *rb) {
     cbm_pattern_t *pat0 = &q->patterns[0];
 
     /* Step 1: Scan initial nodes */
     cbm_node_t *scanned = NULL;
     int scan_count = 0;
-    if (scan_pattern_nodes(store, project, max_rows, &pat0->nodes[0], &scanned, &scan_count) !=
-        CBM_STORE_OK) {
+    int prefix_limit = candidate_prefix_limit(q, max_rows, union_context);
+    if (scan_pattern_nodes(store, project, prefix_limit, q->where, &pat0->nodes[0], &scanned,
+                           &scan_count) != CBM_STORE_OK) {
         return CBM_STORE_ERR;
     }
 
@@ -4783,7 +4903,8 @@ int cbm_cypher_execute(cbm_store_t *store, const char *query, const char *projec
 
     result_builder_t rb = {0};
     // cppcheck-suppress knownConditionTrueFalse
-    if (execute_single(store, q, project, max_rows, &rb) < 0) {
+    bool union_context = q->union_next != NULL;
+    if (execute_single(store, q, project, max_rows, union_context, &rb) < 0) {
         rb_free(&rb);
         cbm_query_free(q);
         out->error = heap_strdup("Cypher execution failed before a complete result was assembled");
@@ -4795,7 +4916,7 @@ int cbm_cypher_execute(cbm_store_t *store, const char *query, const char *projec
     while (uq) {
         result_builder_t rb2 = {0};
         // cppcheck-suppress knownConditionTrueFalse
-        if (execute_single(store, uq, project, max_rows, &rb2) < 0) {
+        if (execute_single(store, uq, project, max_rows, union_context, &rb2) < 0) {
             rb_free(&rb);
             rb_free(&rb2);
             cbm_query_free(q);

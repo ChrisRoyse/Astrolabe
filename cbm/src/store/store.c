@@ -162,7 +162,9 @@ struct cbm_store {
     sqlite3_stmt *stmt_find_node_by_atom_id;
     sqlite3_stmt *stmt_find_node_by_qn;
     sqlite3_stmt *stmt_find_node_by_qn_any; /* QN lookup without project filter */
+    sqlite3_stmt *stmt_find_nodes_by_project;
     sqlite3_stmt *stmt_find_nodes_by_name;
+    sqlite3_stmt *stmt_find_nodes_by_qn;
     sqlite3_stmt *stmt_find_nodes_by_name_any; /* name lookup without project filter */
     sqlite3_stmt *stmt_find_nodes_by_label;
     sqlite3_stmt *stmt_find_nodes_by_file;
@@ -2521,7 +2523,9 @@ void cbm_store_close(cbm_store_t *s) {
     finalize_stmt(&s->stmt_find_node_by_atom_id);
     finalize_stmt(&s->stmt_find_node_by_qn);
     finalize_stmt(&s->stmt_find_node_by_qn_any);
+    finalize_stmt(&s->stmt_find_nodes_by_project);
     finalize_stmt(&s->stmt_find_nodes_by_name);
+    finalize_stmt(&s->stmt_find_nodes_by_qn);
     finalize_stmt(&s->stmt_find_nodes_by_name_any);
     finalize_stmt(&s->stmt_find_nodes_by_label);
     finalize_stmt(&s->stmt_find_nodes_by_file);
@@ -3159,13 +3163,14 @@ int cbm_store_find_node_ids_by_qns(cbm_store_t *s, const char *project, const ch
 
 /* Generic: find multiple nodes by a single-column filter. */
 static int find_nodes_generic(cbm_store_t *s, sqlite3_stmt **slot, const char *sql,
-                              const char *project, const char *val, cbm_node_t **out, int *count) {
+                              const char *project, const char *val, bool bind_filter,
+                              cbm_node_t **out, int *count) {
     if (!out || !count) {
         return CBM_STORE_ERR;
     }
     *out = NULL;
     *count = 0;
-    if (!s || !s->db || !slot || !sql || !project || !val) {
+    if (!s || !s->db || !slot || !sql || !project || (bind_filter && !val)) {
         if (s) {
             store_set_error(s, "find_nodes_generic received an invalid argument");
         }
@@ -3181,7 +3186,9 @@ static int find_nodes_generic(cbm_store_t *s, sqlite3_stmt **slot, const char *s
     }
 
     bind_text(stmt, SKIP_ONE, project);
-    bind_text(stmt, ST_COL_2, val);
+    if (bind_filter) {
+        bind_text(stmt, ST_COL_2, val);
+    }
 
     int cap = 0;
     int n = 0;
@@ -3218,7 +3225,22 @@ int cbm_store_find_nodes_by_name(cbm_store_t *s, const char *project, const char
     return find_nodes_generic(s, &s->stmt_find_nodes_by_name,
                               "SELECT " ST_NODE_SELECT_COLUMNS " FROM nodes "
                               "WHERE project = ?1 AND name = ?2;",
-                              project, name, out, count);
+                              project, name, true, out, count);
+}
+
+int cbm_store_find_nodes_by_project(cbm_store_t *s, const char *project, cbm_node_t **out,
+                                    int *count) {
+    return find_nodes_generic(s, &s->stmt_find_nodes_by_project,
+                              "SELECT " ST_NODE_SELECT_COLUMNS " FROM nodes WHERE project = ?1;",
+                              project, NULL, false, out, count);
+}
+
+int cbm_store_find_nodes_by_qn(cbm_store_t *s, const char *project, const char *qualified_name,
+                               cbm_node_t **out, int *count) {
+    return find_nodes_generic(s, &s->stmt_find_nodes_by_qn,
+                              "SELECT " ST_NODE_SELECT_COLUMNS " FROM nodes "
+                              "WHERE project = ?1 AND qualified_name = ?2;",
+                              project, qualified_name, true, out, count);
 }
 
 int cbm_store_find_nodes_by_label(cbm_store_t *s, const char *project, const char *label,
@@ -3226,7 +3248,7 @@ int cbm_store_find_nodes_by_label(cbm_store_t *s, const char *project, const cha
     return find_nodes_generic(s, &s->stmt_find_nodes_by_label,
                               "SELECT " ST_NODE_SELECT_COLUMNS " FROM nodes "
                               "WHERE project = ?1 AND label = ?2;",
-                              project, label, out, count);
+                              project, label, true, out, count);
 }
 
 int cbm_store_find_nodes_by_file(cbm_store_t *s, const char *project, const char *file_path,
@@ -3234,7 +3256,7 @@ int cbm_store_find_nodes_by_file(cbm_store_t *s, const char *project, const char
     return find_nodes_generic(s, &s->stmt_find_nodes_by_file,
                               "SELECT " ST_NODE_SELECT_COLUMNS " FROM nodes "
                               "WHERE project = ?1 AND file_path = ?2;",
-                              project, file_path, out, count);
+                              project, file_path, true, out, count);
 }
 
 /* A cached COUNT statement reaches SQLITE_ROW, not SQLITE_DONE.  Reset it
