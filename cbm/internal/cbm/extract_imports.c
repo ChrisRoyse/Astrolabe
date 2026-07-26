@@ -2104,7 +2104,7 @@ static char *ps_exact_dot_source_path(CBMExtractCtx *ctx, TSNode command) {
 }
 
 static void ps_push_import(CBMExtractCtx *ctx, TSNode command, const char *path,
-                           const char *dependency_kind, bool unbound) {
+                           const char *dependency_kind) {
     if (!path || !path[0]) {
         cbm_powershell_add_diagnostic(
             ctx, command, "CBM_POWERSHELL_IMPORT_TARGET_UNRESOLVED", "extract_powershell_import",
@@ -2115,11 +2115,11 @@ static void ps_push_import(CBMExtractCtx *ctx, TSNode command, const char *path,
     }
     bool exact = ps_relative_path(path);
     CBMImport imp = {
-        .local_name = unbound ? NULL : path_last(ctx->arena, path),
+        .local_name = NULL,
         .module_path = (char *)path,
         .dependency_kind = dependency_kind,
         .resolution = exact ? CBM_IMPORT_RESOLVE_EXACT_SOURCE : CBM_IMPORT_RESOLVE_SEMANTIC,
-        .binding = unbound ? CBM_IMPORT_BINDING_UNBOUND : CBM_IMPORT_BINDING_LOCAL,
+        .binding = CBM_IMPORT_BINDING_UNBOUND,
     };
     (void)cbm_imports_push(&ctx->result->imports, ctx->arena, imp);
 }
@@ -2150,13 +2150,12 @@ static void parse_powershell_imports(CBMExtractCtx *ctx) {
                 }
                 ps_push_import(ctx, node, path,
                                ps_ci_equal(nm, "using") ? "powershell_using"
-                                                        : "powershell_import_module",
-                               false);
+                                                        : "powershell_import_module");
                 continue;
             }
             if (ps_command_has_dot_operator(ctx, node)) {
                 char *path = ps_exact_dot_source_path(ctx, node);
-                ps_push_import(ctx, node, path, "powershell_dot_source", true);
+                ps_push_import(ctx, node, path, "powershell_dot_source");
                 continue;
             }
         }
