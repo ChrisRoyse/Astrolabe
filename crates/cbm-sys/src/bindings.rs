@@ -2939,6 +2939,23 @@ unsafe extern "C" {
     ) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {
+    pub fn cbm_store_find_nodes_by_project(
+        s: *mut cbm_store_t,
+        project: *const ::std::os::raw::c_char,
+        out: *mut *mut cbm_node_t,
+        count: *mut ::std::os::raw::c_int,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn cbm_store_find_nodes_by_qn(
+        s: *mut cbm_store_t,
+        project: *const ::std::os::raw::c_char,
+        qualified_name: *const ::std::os::raw::c_char,
+        out: *mut *mut cbm_node_t,
+        count: *mut ::std::os::raw::c_int,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
     pub fn cbm_store_find_nodes_by_name_any(
         s: *mut cbm_store_t,
         name: *const ::std::os::raw::c_char,
