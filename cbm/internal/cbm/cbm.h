@@ -240,6 +240,28 @@ typedef struct {
 
 #define CBM_MAX_CALL_ARGS 8
 
+/* Source-owned evidence available for a reference before graph resolution.
+ * A lexical local carries the exact binding and visibility spans below; a
+ * member requires receiver/type evidence from an LSP resolver and must never
+ * be guessed by its trailing field name. */
+typedef enum {
+    CBM_REF_EVIDENCE_UNQUALIFIED = 0,
+    CBM_REF_EVIDENCE_LOCAL = 1,
+    CBM_REF_EVIDENCE_QUALIFIED_PATH = 2,
+    CBM_REF_EVIDENCE_MEMBER = 3,
+} CBMReferenceEvidence;
+
+typedef struct {
+    CBMReferenceEvidence evidence;
+    uint32_t reference_start_byte;
+    uint32_t reference_end_byte;
+    uint32_t binding_start_byte;
+    uint32_t binding_end_byte;
+    uint32_t scope_start_byte;
+    uint32_t scope_end_byte;
+    const char *resolved_target_qn; // exact syntax/type-selected persisted target, otherwise NULL
+} CBMReferenceIdentity;
+
 typedef struct {
     const char *callee_name;            // raw callee text ("pkg.Func", "foo")
     const char *enclosing_func_qn;      // QN of enclosing function (or module QN)
@@ -253,6 +275,7 @@ typedef struct {
     bool is_method;                     // method/member call with a non-self receiver. Perl:
                                         // arrow/method call ($obj->m). TS/JS/TSX: member call
                                         // x.foo() whose receiver is not this/super. Default false.
+    CBMReferenceIdentity reference;     // lexical/path/member evidence for target admission
 } CBMCall;
 
 typedef enum {
@@ -300,16 +323,28 @@ typedef enum {
 } CBMReferenceDomain;
 
 typedef struct {
+    const char *name;
+    const char *enclosing_func_qn;
+    uint32_t definition_start_byte;
+    uint32_t definition_end_byte;
+    uint32_t scope_start_byte;
+    uint32_t scope_end_byte;
+    CBMReferenceDomain target_domain;
+} CBMLocalBinding;
+
+typedef struct {
     const char *ref_name;             // referenced identifier
     const char *enclosing_func_qn;    // QN of enclosing function (or module QN)
     int start_line;                   // 1-based source line for stable-atom attribution
     CBMReferenceDomain target_domain; // exact semantic namespace derived from parser syntax
+    CBMReferenceIdentity reference;   // exact local binding/path/member evidence
 } CBMUsage;
 
 typedef struct {
     const char *exception_name;    // exception class/type name
     const char *enclosing_func_qn; // QN of enclosing function
     int start_line;                // 1-based source line for stable-atom attribution
+    CBMReferenceIdentity reference;
 } CBMThrow;
 
 typedef struct {
@@ -317,6 +352,7 @@ typedef struct {
     const char *enclosing_func_qn; // QN of enclosing function
     int start_line;                // 1-based source line for stable-atom attribution
     bool is_write;                 // true = write, false = read
+    CBMReferenceIdentity reference;
 } CBMReadWrite;
 
 typedef struct {
@@ -425,6 +461,12 @@ typedef struct {
 } CBMUsageArray;
 
 typedef struct {
+    CBMLocalBinding *items;
+    int count;
+    int cap;
+} CBMLocalBindingArray;
+
+typedef struct {
     CBMThrow *items;
     int count;
     int cap;
@@ -525,6 +567,7 @@ typedef struct {
     CBMCallArray calls;
     CBMImportArray imports;
     CBMUsageArray usages;
+    CBMLocalBindingArray local_bindings;
     CBMThrowArray throws;
     CBMRWArray rw;
     CBMTypeRefArray type_refs;
@@ -703,6 +746,7 @@ bool cbm_defs_push(CBMDefArray *arr, CBMArena *a, CBMDefinition def);
 bool cbm_calls_push(CBMCallArray *arr, CBMArena *a, CBMCall call);
 bool cbm_imports_push(CBMImportArray *arr, CBMArena *a, CBMImport imp);
 bool cbm_usages_push(CBMUsageArray *arr, CBMArena *a, CBMUsage usage);
+bool cbm_local_bindings_push(CBMLocalBindingArray *arr, CBMArena *a, CBMLocalBinding binding);
 bool cbm_throws_push(CBMThrowArray *arr, CBMArena *a, CBMThrow thr);
 bool cbm_rw_push(CBMRWArray *arr, CBMArena *a, CBMReadWrite rw);
 bool cbm_typerefs_push(CBMTypeRefArray *arr, CBMArena *a, CBMTypeRef tr);

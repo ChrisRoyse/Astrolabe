@@ -219,6 +219,13 @@ bool cbm_usages_push(CBMUsageArray *arr, CBMArena *a, CBMUsage usage) {
     return true;
 }
 
+bool cbm_local_bindings_push(CBMLocalBindingArray *arr, CBMArena *a, CBMLocalBinding binding) {
+    if (!arr || !GROW_ARRAY_CHECKED(arr, a, "local_bindings.push"))
+        return false;
+    arr->items[arr->count++] = binding;
+    return true;
+}
+
 bool cbm_throws_push(CBMThrowArray *arr, CBMArena *a, CBMThrow thr) {
     if (!arr || !GROW_ARRAY_CHECKED(arr, a, "throws.push"))
         return false;
@@ -690,6 +697,7 @@ static void cbm_file_result_discard_atoms(CBMFileResult *result) {
     result->calls.count = 0;
     result->imports.count = 0;
     result->usages.count = 0;
+    result->local_bindings.count = 0;
     result->throws.count = 0;
     result->rw.count = 0;
     result->type_refs.count = 0;
@@ -962,6 +970,10 @@ static CBMFileResult *cbm_extract_file_impl(const char *source, int source_len,
     }
     cbm_extract_imports(&ctx);
     if (!cbm_extract_arena_ok(result, "imports", rel_path)) {
+        goto extraction_failed;
+    }
+    cbm_extract_reference_bindings(&ctx);
+    if (!cbm_extract_arena_ok(result, "reference_bindings", rel_path)) {
         goto extraction_failed;
     }
     cbm_extract_unified(&ctx);

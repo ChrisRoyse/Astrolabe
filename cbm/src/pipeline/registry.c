@@ -726,10 +726,16 @@ static cbm_resolution_t resolve_import_map(const cbm_registry_t *r, const char *
      * resolved.requireAdmin — not just resolved, which would point at the
      * module node and miss the function entirely. */
     char candidate[CBM_SZ_512];
+    int candidate_len = 0;
     if (suffix && suffix[0]) {
-        snprintf(candidate, sizeof(candidate), "%s.%s", resolved, suffix);
+        candidate_len = snprintf(candidate, sizeof(candidate), "%s.%s", resolved, suffix);
     } else {
-        snprintf(candidate, sizeof(candidate), "%s.%s", resolved, prefix);
+        candidate_len = snprintf(candidate, sizeof(candidate), "%s.%s", resolved, prefix);
+    }
+    if (candidate_len <= 0 || (size_t)candidate_len >= sizeof(candidate)) {
+        cbm_resolution_t overflow = {0};
+        overflow.strategy = "import_candidate_overflow";
+        return overflow;
     }
     /* Use cbm_ht_get_key to get the persistent heap-owned key string */
     const char *stored_key = cbm_ht_get_key(r->exact, candidate);
@@ -746,20 +752,38 @@ static cbm_resolution_t resolve_import_map(const cbm_registry_t *r, const char *
     if (suffix && suffix[0]) {
         char resolved_dot[CBM_SZ_512];
         char dot_suffix[CBM_SZ_256];
-        snprintf(resolved_dot, sizeof(resolved_dot), "%s.", resolved);
-        snprintf(dot_suffix, sizeof(dot_suffix), ".%s", suffix);
+        int resolved_dot_len = snprintf(resolved_dot, sizeof(resolved_dot), "%s.", resolved);
+        int dot_suffix_len = snprintf(dot_suffix, sizeof(dot_suffix), ".%s", suffix);
+        if (resolved_dot_len <= 0 || (size_t)resolved_dot_len >= sizeof(resolved_dot) ||
+            dot_suffix_len <= 0 || (size_t)dot_suffix_len >= sizeof(dot_suffix)) {
+            cbm_resolution_t overflow = {0};
+            overflow.strategy = "import_suffix_overflow";
+            return overflow;
+        }
         qn_array_t *arr = cbm_ht_get(r->by_name, simple_name(suffix));
         if (arr) {
             size_t rd_len = strlen(resolved_dot);
             size_t ds_len = strlen(dot_suffix);
+            const char *match = NULL;
+            int matches = 0;
             for (int i = 0; i < arr->count; i++) {
                 const char *qn = arr->items[i];
                 size_t klen = strlen(qn);
                 if (klen >= rd_len + ds_len && strncmp(qn, resolved_dot, rd_len) == 0 &&
                     strcmp(qn + klen - ds_len, dot_suffix) == 0) {
-                    return (cbm_resolution_t){qn, "import_map_suffix", CONF_IMPORT_MAP_SUFFIX,
-                                              REG_RESOLVED};
+                    match = qn;
+                    matches++;
                 }
+            }
+            if (matches == REG_RESOLVED) {
+                return (cbm_resolution_t){match, "import_map_suffix", CONF_IMPORT_MAP_SUFFIX,
+                                          REG_RESOLVED};
+            }
+            if (matches > REG_RESOLVED) {
+                cbm_resolution_t ambiguous = {0};
+                ambiguous.strategy = "ambiguous_import_path";
+                ambiguous.candidate_count = matches;
+                return ambiguous;
             }
         }
     }
@@ -831,7 +855,11 @@ static cbm_resolution_t resolve_multi_with_imports(const qn_array_t *arr, const 
  * both reduce to "run", so the bare-name scorer would route every caller to a
  * single winner. Language agnostic: callees with no separator return NULL and
  * leave behavior unchanged. */
-static const char *qualified_suffix_match(const qn_array_t *arr, const char *callee_name) {
+static const char *qualified_suffix_match(const qn_array_t *arr, const char *callee_name,
+                                          int *out_match_count) {
+    if (out_match_count) {
+        *out_match_count = 0;
+    }
     /* Normalize "::" → "." so the tail composes with dotted candidate QNs. */
     char dotted[CBM_SZ_512];
     size_t w = 0;
@@ -850,6 +878,7 @@ static const char *qualified_suffix_match(const qn_array_t *arr, const char *cal
         return NULL;
     }
     const char *match = NULL;
+    int match_count = 0;
     for (int i = 0; i < arr->count; i++) {
         const char *qn = arr->items[i];
         size_t qlen = strlen(qn);
@@ -864,12 +893,13 @@ static const char *qualified_suffix_match(const qn_array_t *arr, const char *cal
         if (tail != qn && tail[-1] != '.') {
             continue;
         }
-        if (match) {
-            return NULL; /* ambiguous — more than one qualified tail matches */
-        }
         match = qn;
+        match_count++;
     }
-    return match;
+    if (out_match_count) {
+        *out_match_count = match_count;
+    }
+    return match_count == REG_RESOLVED ? match : NULL;
 }
 
 /* Strategy 3+4: Name lookup + suffix match */
@@ -889,7 +919,7 @@ static cbm_resolution_t resolve_name_lookup(const cbm_registry_t *r, const char 
      * candidates by full qualified tail, before bare-name scoring collapses
      * them onto a single winner. */
     if (arr->count > 1) {
-        const char *q = qualified_suffix_match(arr, callee_name);
+        const char *q = qualified_suffix_match(arr, callee_name, NULL);
         if (q) {
             return (cbm_resolution_t){q, "qualified_suffix", CONF_QUALIFIED_SUFFIX, REG_RESOLVED};
         }
@@ -915,6 +945,128 @@ static cbm_resolution_t resolve_name_lookup(const cbm_registry_t *r, const char 
         return (cbm_resolution_t){best, "suffix_match", conf, arr->count};
     }
     return empty_result();
+}
+
+static cbm_resolution_t resolve_same_module_exact(const cbm_registry_t *registry,
+                                                  const char *module_qn,
+                                                  const char *reference_name) {
+    char normalized[CBM_SZ_512];
+    size_t written = 0;
+    const char *cursor = reference_name;
+    while (*cursor && written + SKIP_ONE < sizeof(normalized)) {
+        if (cursor[0] == ':' && cursor[1] == ':') {
+            normalized[written++] = '.';
+            cursor += 2;
+        } else {
+            normalized[written++] = *cursor++;
+        }
+    }
+    if (*cursor) {
+        cbm_resolution_t overflow = {0};
+        overflow.strategy = "same_module_reference_overflow";
+        return overflow;
+    }
+    normalized[written] = '\0';
+    char candidate[CBM_SZ_512];
+    int candidate_len = snprintf(candidate, sizeof(candidate), "%s.%s", module_qn, normalized);
+    if (candidate_len <= 0 || (size_t)candidate_len >= sizeof(candidate)) {
+        cbm_resolution_t overflow = {0};
+        overflow.strategy = "same_module_candidate_overflow";
+        return overflow;
+    }
+    const char *stored = cbm_ht_get_key(registry->exact, candidate);
+    return stored ? (cbm_resolution_t){stored, "same_module", CONF_SAME_MODULE, REG_RESOLVED}
+                  : empty_result();
+}
+
+cbm_resolution_t cbm_registry_resolve_exact(const cbm_registry_t *r, const char *reference_name,
+                                            const char *module_qn, const char **import_map_keys,
+                                            const char **import_map_vals, int import_map_count) {
+    if (!r || !reference_name || !reference_name[0] || !module_qn) {
+        cbm_resolution_t invalid = {0};
+        invalid.strategy = "invalid_reference_evidence";
+        return invalid;
+    }
+    if (strlen(reference_name) >= CBM_SZ_512) {
+        cbm_resolution_t overflow = {0};
+        overflow.strategy = "reference_name_overflow";
+        return overflow;
+    }
+
+    char prefix[CBM_SZ_256] = {0};
+    const char *suffix = NULL;
+    const char *dot = strchr(reference_name, '.');
+    const char *colons = strstr(reference_name, "::");
+    const char *separator = dot;
+    size_t separator_len = SKIP_ONE;
+    if (colons && (!separator || colons < separator)) {
+        separator = colons;
+        separator_len = 2;
+    }
+    if (separator) {
+        size_t prefix_len = (size_t)(separator - reference_name);
+        if (prefix_len >= sizeof(prefix)) {
+            cbm_resolution_t overflow = {0};
+            overflow.strategy = "qualified_prefix_overflow";
+            return overflow;
+        }
+        memcpy(prefix, reference_name, prefix_len);
+        prefix[prefix_len] = '\0';
+        suffix = separator + separator_len;
+    } else {
+        int written = snprintf(prefix, sizeof(prefix), "%s", reference_name);
+        if (written <= 0 || (size_t)written >= sizeof(prefix)) {
+            cbm_resolution_t overflow = {0};
+            overflow.strategy = "reference_name_overflow";
+            return overflow;
+        }
+    }
+
+    cbm_resolution_t result =
+        resolve_import_map(r, prefix, suffix, import_map_keys, import_map_vals, import_map_count);
+    if (result.qualified_name && result.qualified_name[0]) {
+        return result;
+    }
+    if (result.strategy && strcmp(result.strategy, "ambiguous_import_path") == 0) {
+        return result;
+    }
+    if (result.strategy && strstr(result.strategy, "overflow")) {
+        return result;
+    }
+
+    result = resolve_same_module_exact(r, module_qn, reference_name);
+    if (result.qualified_name && result.qualified_name[0]) {
+        return result;
+    }
+    if (result.strategy && strstr(result.strategy, "overflow")) {
+        return result;
+    }
+
+    qn_array_t *candidates = cbm_ht_get(r->by_name, simple_name(reference_name));
+    int qualified_matches = 0;
+    if (separator && candidates && candidates->count > 0) {
+        const char *qualified =
+            qualified_suffix_match(candidates, reference_name, &qualified_matches);
+        if (qualified) {
+            return (cbm_resolution_t){qualified, "qualified_path", CONF_QUALIFIED_SUFFIX,
+                                      REG_RESOLVED};
+        }
+    }
+
+    cbm_resolution_t unresolved = {0};
+    unresolved.candidate_count = candidates ? candidates->count : 0;
+    if (!candidates || candidates->count == 0) {
+        unresolved.strategy = "target_missing";
+    } else if (separator && qualified_matches > REG_RESOLVED) {
+        unresolved.strategy = "ambiguous_qualified_path";
+    } else if (separator) {
+        unresolved.strategy = "qualified_path_unmatched";
+    } else if (candidates->count == REG_RESOLVED) {
+        unresolved.strategy = "scope_evidence_missing";
+    } else {
+        unresolved.strategy = "ambiguous_without_evidence";
+    }
+    return unresolved;
 }
 
 cbm_resolution_t cbm_registry_resolve(const cbm_registry_t *r, const char *callee_name,

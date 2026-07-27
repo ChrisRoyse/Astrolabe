@@ -508,6 +508,32 @@ impl Default for CBMCallArg {
         }
     }
 }
+pub const CBMReferenceEvidence_CBM_REF_EVIDENCE_UNQUALIFIED: CBMReferenceEvidence = 0;
+pub const CBMReferenceEvidence_CBM_REF_EVIDENCE_LOCAL: CBMReferenceEvidence = 1;
+pub const CBMReferenceEvidence_CBM_REF_EVIDENCE_QUALIFIED_PATH: CBMReferenceEvidence = 2;
+pub const CBMReferenceEvidence_CBM_REF_EVIDENCE_MEMBER: CBMReferenceEvidence = 3;
+pub type CBMReferenceEvidence = ::std::os::raw::c_int;
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct CBMReferenceIdentity {
+    pub evidence: CBMReferenceEvidence,
+    pub reference_start_byte: u32,
+    pub reference_end_byte: u32,
+    pub binding_start_byte: u32,
+    pub binding_end_byte: u32,
+    pub scope_start_byte: u32,
+    pub scope_end_byte: u32,
+    pub resolved_target_qn: *const ::std::os::raw::c_char,
+}
+impl Default for CBMReferenceIdentity {
+    fn default() -> Self {
+        let mut s = ::std::mem::MaybeUninit::<Self>::uninit();
+        unsafe {
+            ::std::ptr::write_bytes(s.as_mut_ptr(), 0, 1);
+            s.assume_init()
+        }
+    }
+}
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct CBMCall {
@@ -521,6 +547,7 @@ pub struct CBMCall {
     pub branch_depth: ::std::os::raw::c_int,
     pub start_line: ::std::os::raw::c_int,
     pub is_method: bool,
+    pub reference: CBMReferenceIdentity,
 }
 impl Default for CBMCall {
     fn default() -> Self {
@@ -566,11 +593,32 @@ pub const CBMReferenceDomain_CBM_REF_DOMAIN_TYPE: CBMReferenceDomain = 3;
 pub type CBMReferenceDomain = ::std::os::raw::c_int;
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
+pub struct CBMLocalBinding {
+    pub name: *const ::std::os::raw::c_char,
+    pub enclosing_func_qn: *const ::std::os::raw::c_char,
+    pub definition_start_byte: u32,
+    pub definition_end_byte: u32,
+    pub scope_start_byte: u32,
+    pub scope_end_byte: u32,
+    pub target_domain: CBMReferenceDomain,
+}
+impl Default for CBMLocalBinding {
+    fn default() -> Self {
+        let mut s = ::std::mem::MaybeUninit::<Self>::uninit();
+        unsafe {
+            ::std::ptr::write_bytes(s.as_mut_ptr(), 0, 1);
+            s.assume_init()
+        }
+    }
+}
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
 pub struct CBMUsage {
     pub ref_name: *const ::std::os::raw::c_char,
     pub enclosing_func_qn: *const ::std::os::raw::c_char,
     pub start_line: ::std::os::raw::c_int,
     pub target_domain: CBMReferenceDomain,
+    pub reference: CBMReferenceIdentity,
 }
 impl Default for CBMUsage {
     fn default() -> Self {
@@ -587,6 +635,7 @@ pub struct CBMThrow {
     pub exception_name: *const ::std::os::raw::c_char,
     pub enclosing_func_qn: *const ::std::os::raw::c_char,
     pub start_line: ::std::os::raw::c_int,
+    pub reference: CBMReferenceIdentity,
 }
 impl Default for CBMThrow {
     fn default() -> Self {
@@ -604,6 +653,7 @@ pub struct CBMReadWrite {
     pub enclosing_func_qn: *const ::std::os::raw::c_char,
     pub start_line: ::std::os::raw::c_int,
     pub is_write: bool,
+    pub reference: CBMReferenceIdentity,
 }
 impl Default for CBMReadWrite {
     fn default() -> Self {
@@ -833,6 +883,22 @@ impl Default for CBMUsageArray {
 }
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
+pub struct CBMLocalBindingArray {
+    pub items: *mut CBMLocalBinding,
+    pub count: ::std::os::raw::c_int,
+    pub cap: ::std::os::raw::c_int,
+}
+impl Default for CBMLocalBindingArray {
+    fn default() -> Self {
+        let mut s = ::std::mem::MaybeUninit::<Self>::uninit();
+        unsafe {
+            ::std::ptr::write_bytes(s.as_mut_ptr(), 0, 1);
+            s.assume_init()
+        }
+    }
+}
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
 pub struct CBMThrowArray {
     pub items: *mut CBMThrow,
     pub count: ::std::os::raw::c_int,
@@ -1043,6 +1109,7 @@ pub struct CBMFileResult {
     pub calls: CBMCallArray,
     pub imports: CBMImportArray,
     pub usages: CBMUsageArray,
+    pub local_bindings: CBMLocalBindingArray,
     pub throws: CBMThrowArray,
     pub rw: CBMRWArray,
     pub type_refs: CBMTypeRefArray,
@@ -1266,6 +1333,13 @@ unsafe extern "C" {
 }
 unsafe extern "C" {
     pub fn cbm_usages_push(arr: *mut CBMUsageArray, a: *mut CBMArena, usage: CBMUsage) -> bool;
+}
+unsafe extern "C" {
+    pub fn cbm_local_bindings_push(
+        arr: *mut CBMLocalBindingArray,
+        a: *mut CBMArena,
+        binding: CBMLocalBinding,
+    ) -> bool;
 }
 unsafe extern "C" {
     pub fn cbm_throws_push(arr: *mut CBMThrowArray, a: *mut CBMArena, thr: CBMThrow) -> bool;
@@ -2295,6 +2369,16 @@ unsafe extern "C" {
     pub fn cbm_registry_resolve(
         r: *const cbm_registry_t,
         callee_name: *const ::std::os::raw::c_char,
+        module_qn: *const ::std::os::raw::c_char,
+        import_map_keys: *mut *const ::std::os::raw::c_char,
+        import_map_vals: *mut *const ::std::os::raw::c_char,
+        import_map_count: ::std::os::raw::c_int,
+    ) -> cbm_resolution_t;
+}
+unsafe extern "C" {
+    pub fn cbm_registry_resolve_exact(
+        r: *const cbm_registry_t,
+        reference_name: *const ::std::os::raw::c_char,
         module_qn: *const ::std::os::raw::c_char,
         import_map_keys: *mut *const ::std::os::raw::c_char,
         import_map_vals: *mut *const ::std::os::raw::c_char,

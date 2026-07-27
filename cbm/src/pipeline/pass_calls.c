@@ -4,7 +4,7 @@
  * For each discovered file:
  *   1. Re-extract calls (cbm_extract_file)
  *   2. Build per-file import map from IMPORTS edges in graph buffer
- *   3. Resolve each call via registry (import_map → same_module → unique → suffix)
+ *   3. Resolve each call only from LSP/import/module/qualified-path evidence
  *   4. Create CALLS edges in graph buffer with confidence/strategy properties
  *
  * Depends on: pass_definitions having populated the registry and graph buffer
@@ -93,6 +93,26 @@ static const char *itoa_log(int val) {
     return bufs[i];
 }
 
+typedef struct {
+    int local_only;
+    int member_without_type;
+    int target_missing;
+    int ambiguous;
+    int incompatible;
+} call_resolution_stats_t;
+
+static void calls_record_unresolved(const cbm_resolution_t *resolution,
+                                    call_resolution_stats_t *stats) {
+    if (resolution->strategy && strstr(resolution->strategy, "ambiguous")) {
+        stats->ambiguous++;
+    } else if (resolution->strategy && (strstr(resolution->strategy, "overflow") ||
+                                        strstr(resolution->strategy, "invalid"))) {
+        stats->incompatible++;
+    } else {
+        stats->target_missing++;
+    }
+}
+
 /* Handle a route registration call: create Route node + HANDLES edge. */
 static void handle_route_registration(cbm_pipeline_ctx_t *ctx, const CBMCall *call,
                                       const cbm_gbuf_node_t *source_node, const char *module_qn,
@@ -116,8 +136,8 @@ static void handle_route_registration(cbm_pipeline_ctx_t *ctx, const CBMCall *ca
              esc_fa);
     cbm_gbuf_insert_edge(ctx->gbuf, source_node->id, route_id, "CALLS", props);
     if (call->second_arg_name != NULL && call->second_arg_name[0] != '\0') {
-        cbm_resolution_t hres = cbm_registry_resolve(ctx->registry, call->second_arg_name,
-                                                     module_qn, imp_keys, imp_vals, imp_count);
+        cbm_resolution_t hres = cbm_registry_resolve_exact(
+            ctx->registry, call->second_arg_name, module_qn, imp_keys, imp_vals, imp_count);
         if (hres.qualified_name != NULL && hres.qualified_name[0] != '\0') {
             const cbm_gbuf_node_t *handler = cbm_gbuf_find_by_qn_domain(
                 ctx->gbuf, hres.qualified_name, CBM_REF_DOMAIN_CALLABLE, "calls.route_handler");
@@ -323,7 +343,7 @@ static const cbm_gbuf_node_t *calls_find_source(cbm_pipeline_ctx_t *ctx, const c
 static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call,
                                const CBMResolvedCallArray *lsp_calls, const char *rel,
                                const char *module_qn, const char **imp_keys, const char **imp_vals,
-                               int imp_count, CBMLanguage lang) {
+                               int imp_count, CBMLanguage lang, call_resolution_stats_t *stats) {
     const cbm_gbuf_node_t *source_node =
         calls_find_source(ctx, rel, module_qn, call->enclosing_func_qn, call->start_line);
     if (!source_node) {
@@ -350,6 +370,10 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call,
             return SKIP_ONE;
         }
     }
+    if (call->reference.evidence == CBM_REF_EVIDENCE_LOCAL) {
+        stats->local_only++;
+        return 0;
+    }
 
     /* Service-pattern HTTP/ASYNC client call (`requests.get(url)`): the service
      * signal lives in the callee_name. The registry can mis-resolve such a call
@@ -374,9 +398,23 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call,
             return SKIP_ONE;
         }
     }
+    if (call->reference.evidence == CBM_REF_EVIDENCE_MEMBER &&
+        !call->reference.resolved_target_qn) {
+        if (cbm_service_pattern_route_method(call->callee_name) != NULL && call->first_string_arg &&
+            call->first_string_arg[0] == '/') {
+            handle_route_registration(ctx, call, source_node, module_qn, imp_keys, imp_vals,
+                                      imp_count);
+            return SKIP_ONE;
+        }
+        stats->member_without_type++;
+        return 0;
+    }
 
-    cbm_resolution_t res = cbm_registry_resolve(ctx->registry, call->callee_name, module_qn,
-                                                imp_keys, imp_vals, imp_count);
+    cbm_resolution_t res =
+        call->reference.resolved_target_qn
+            ? (cbm_resolution_t){call->reference.resolved_target_qn, "self_member", 1.0, 1}
+            : cbm_registry_resolve_exact(ctx->registry, call->callee_name, module_qn, imp_keys,
+                                         imp_vals, imp_count);
     if (!res.qualified_name || res.qualified_name[0] == '\0') {
         /* Resolution is empty when the callee belongs to an EXTERNAL client
          * library whose source is not in the indexed tree (e.g. `requests.get`,
@@ -402,6 +440,7 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call,
                 return SKIP_ONE;
             }
         }
+        calls_record_unresolved(&res, stats);
         return 0;
     }
 
@@ -456,6 +495,9 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call,
     const cbm_gbuf_node_t *target_node = cbm_gbuf_find_by_qn_domain(
         ctx->gbuf, res.qualified_name, CBM_REF_DOMAIN_CALLABLE, "calls.call_target");
     if (!target_node || source_node->id == target_node->id) {
+        if (!target_node) {
+            stats->incompatible++;
+        }
         return 0;
     }
     emit_classified_edge(ctx, call, source_node, target_node, &res, module_qn, imp_keys, imp_vals,
@@ -491,6 +533,7 @@ int cbm_pipeline_pass_calls(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *file
     int resolved = 0;
     int unresolved = 0;
     int errors = 0;
+    call_resolution_stats_t stats = {0};
 
     for (int i = 0; i < file_count; i++) {
         if (cbm_pipeline_check_cancel(ctx)) {
@@ -537,7 +580,7 @@ int cbm_pipeline_pass_calls(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *file
             }
             total_calls++;
             if (resolve_single_call(ctx, call, &result->resolved_calls, rel, module_qn, imp_keys,
-                                    imp_vals, imp_count, files[i].language)) {
+                                    imp_vals, imp_count, files[i].language, &stats)) {
                 resolved++;
             } else {
                 unresolved++;
@@ -554,6 +597,14 @@ int cbm_pipeline_pass_calls(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *file
     cbm_log_info("pass.done", "pass", "calls", "total", itoa_log(total_calls), "resolved",
                  itoa_log(resolved), "unresolved", itoa_log(unresolved), "errors",
                  itoa_log(errors));
+    cbm_log_info("reference.resolution.refused", "code", "CBM_REFERENCE_TARGET_REFUSED", "pass",
+                 "calls", "local_only", itoa_log(stats.local_only), "member_without_type",
+                 itoa_log(stats.member_without_type), "message",
+                 "textual call targets without lexical or receiver/type evidence were not emitted");
+    cbm_log_info("reference.resolution.unresolved", "code", "CBM_REFERENCE_TARGET_UNRESOLVED",
+                 "pass", "calls", "target_missing", itoa_log(stats.target_missing), "ambiguous",
+                 itoa_log(stats.ambiguous), "incompatible", itoa_log(stats.incompatible),
+                 "remediation", "add exact import, module, qualified-path, or LSP type evidence");
 
     /* Additional pattern-based edge passes run after normal call resolution */
     return cbm_pipeline_pass_fastapi_depends(ctx, files, file_count);
@@ -613,7 +664,8 @@ static int scan_depends_in_sig(cbm_pipeline_ctx_t *ctx, const cbm_regex_t *re, c
         }
         memcpy(func_ref, scan + match[SKIP_ONE].rm_so, (size_t)ref_len);
         func_ref[ref_len] = '\0';
-        cbm_resolution_t res = cbm_registry_resolve(ctx->registry, func_ref, module_qn, ik, iv, ic);
+        cbm_resolution_t res =
+            cbm_registry_resolve_exact(ctx->registry, func_ref, module_qn, ik, iv, ic);
         if (res.qualified_name && res.qualified_name[0] != '\0') {
             const cbm_gbuf_node_t *sn = cbm_pipeline_find_definition_node(ctx->gbuf, def, "");
             const cbm_gbuf_node_t *tn = cbm_gbuf_find_by_qn_domain(

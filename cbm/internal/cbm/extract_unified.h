@@ -44,6 +44,16 @@ void handle_env_accesses(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spe
 void handle_type_assigns(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec,
                          WalkState *state);
 
+/* Capture source-span-bound lexical bindings before the unified reference walk,
+ * then classify a concrete reference without consulting repository-global
+ * names. The current complete implementation covers Rust's binding constructs;
+ * other languages retain syntax evidence and are resolved only by exact
+ * import/module/path rules downstream. */
+void cbm_extract_reference_bindings(CBMExtractCtx *ctx);
+CBMReferenceIdentity cbm_reference_identity(CBMExtractCtx *ctx, TSNode node, const char *name,
+                                            CBMReferenceDomain domain, bool is_member);
+bool cbm_reference_is_local_definition(const CBMExtractCtx *ctx, TSNode node);
+
 // Single-pass extraction using TSTreeCursor. Visits every node once,
 // dispatching to all handlers per node. Replaces the 7 separate walk_*
 // functions for calls/usages/throws/readwrites/type_refs/env_accesses/type_assigns.

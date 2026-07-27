@@ -6,8 +6,9 @@
  *   - THROWS/RAISES edges: exception types
  *   - READS/WRITES edges: variable read/write access patterns
  *
- * All three use the same registry lookup strategy. Combined into one pass
- * to avoid triple re-extraction.
+ * All three share the same exact-evidence admission rule. Lexical locals and
+ * untyped members become explicit non-edge outcomes; repository-global bare
+ * names are never guessed. Combined into one pass to avoid triple re-extraction.
  *
  * Depends on: pass_definitions having populated the registry and graph buffer
  */
@@ -73,6 +74,39 @@ static const char *itoa_log(int val) {
     return bufs[i];
 }
 
+typedef struct {
+    int local_only;
+    int member_without_type;
+    int target_missing;
+    int ambiguous;
+    int incompatible;
+} reference_resolution_stats_t;
+
+static bool reference_requires_refusal(const CBMReferenceIdentity *identity,
+                                       reference_resolution_stats_t *stats) {
+    if (identity->evidence == CBM_REF_EVIDENCE_LOCAL) {
+        stats->local_only++;
+        return true;
+    }
+    if (identity->evidence == CBM_REF_EVIDENCE_MEMBER && !identity->resolved_target_qn) {
+        stats->member_without_type++;
+        return true;
+    }
+    return false;
+}
+
+static void record_unresolved(const cbm_resolution_t *resolution,
+                              reference_resolution_stats_t *stats) {
+    if (resolution->strategy && strstr(resolution->strategy, "ambiguous")) {
+        stats->ambiguous++;
+    } else if (resolution->strategy && (strstr(resolution->strategy, "overflow") ||
+                                        strstr(resolution->strategy, "invalid"))) {
+        stats->incompatible++;
+    } else {
+        stats->target_missing++;
+    }
+}
+
 /* Check if an exception name is a "checked" exception (Java-style).
  * Checked: Exception, IOException, etc. (extends Exception, not RuntimeException).
  * Simple heuristic: if name contains "Error" or "Panic", it's a runtime exception. */
@@ -98,11 +132,15 @@ static const cbm_gbuf_node_t *find_enclosing_node(cbm_pipeline_ctx_t *ctx, const
 /* Resolve USAGE edges for one file's extracted usages. */
 static int resolve_usage_edges(cbm_pipeline_ctx_t *ctx, const CBMFileResult *result,
                                const char *rel, const char *module_qn, const char **imp_keys,
-                               const char **imp_vals, int imp_count) {
+                               const char **imp_vals, int imp_count,
+                               reference_resolution_stats_t *stats) {
     int resolved = 0;
     for (int u = 0; u < result->usages.count; u++) {
         CBMUsage *usage = &result->usages.items[u];
         if (!usage->ref_name) {
+            continue;
+        }
+        if (reference_requires_refusal(&usage->reference, stats)) {
             continue;
         }
 
@@ -113,15 +151,22 @@ static int resolve_usage_edges(cbm_pipeline_ctx_t *ctx, const CBMFileResult *res
             continue;
         }
 
-        cbm_resolution_t res = cbm_registry_resolve(ctx->registry, usage->ref_name, module_qn,
-                                                    imp_keys, imp_vals, imp_count);
+        cbm_resolution_t res =
+            usage->reference.resolved_target_qn
+                ? (cbm_resolution_t){usage->reference.resolved_target_qn, "self_member", 1.0, 1}
+                : cbm_registry_resolve_exact(ctx->registry, usage->ref_name, module_qn, imp_keys,
+                                             imp_vals, imp_count);
         if (!res.qualified_name || res.qualified_name[0] == '\0') {
+            record_unresolved(&res, stats);
             continue;
         }
 
         const cbm_gbuf_node_t *tgt = cbm_gbuf_find_by_qn_domain(
             ctx->gbuf, res.qualified_name, usage->target_domain, "usages.reference_target");
         if (!tgt || src->id == tgt->id) {
+            if (!tgt) {
+                stats->incompatible++;
+            }
             continue;
         }
 
@@ -140,11 +185,15 @@ static int resolve_usage_edges(cbm_pipeline_ctx_t *ctx, const CBMFileResult *res
 /* Resolve THROWS/RAISES edges for one file's extracted throws. */
 static int resolve_throw_edges(cbm_pipeline_ctx_t *ctx, const CBMFileResult *result,
                                const char *rel, const char *module_qn, const char **imp_keys,
-                               const char **imp_vals, int imp_count) {
+                               const char **imp_vals, int imp_count,
+                               reference_resolution_stats_t *stats) {
     int resolved = 0;
     for (int t = 0; t < result->throws.count; t++) {
         CBMThrow *thr = &result->throws.items[t];
         if (!thr->exception_name || !thr->enclosing_func_qn) {
+            continue;
+        }
+        if (reference_requires_refusal(&thr->reference, stats)) {
             continue;
         }
 
@@ -156,15 +205,24 @@ static int resolve_throw_edges(cbm_pipeline_ctx_t *ctx, const CBMFileResult *res
         }
 
         const char *edge_type = is_checked_exception(thr->exception_name) ? "THROWS" : "RAISES";
-        cbm_resolution_t res = cbm_registry_resolve(ctx->registry, thr->exception_name, module_qn,
-                                                    imp_keys, imp_vals, imp_count);
+        cbm_resolution_t res =
+            thr->reference.resolved_target_qn
+                ? (cbm_resolution_t){thr->reference.resolved_target_qn, "self_member", 1.0, 1}
+                : cbm_registry_resolve_exact(ctx->registry, thr->exception_name, module_qn,
+                                             imp_keys, imp_vals, imp_count);
 
         const cbm_gbuf_node_t *tgt = NULL;
         if (res.qualified_name && res.qualified_name[0]) {
             tgt = cbm_gbuf_find_by_qn_domain(ctx->gbuf, res.qualified_name, CBM_REF_DOMAIN_TYPE,
                                              "usages.exception_type");
         }
+        if (!res.qualified_name || !res.qualified_name[0]) {
+            record_unresolved(&res, stats);
+        }
         if (!tgt || src->id == tgt->id) {
+            if (res.qualified_name && res.qualified_name[0] && !tgt) {
+                stats->incompatible++;
+            }
             continue;
         }
 
@@ -177,11 +235,14 @@ static int resolve_throw_edges(cbm_pipeline_ctx_t *ctx, const CBMFileResult *res
 /* Resolve READS/WRITES edges for one file's extracted read/write accesses. */
 static int resolve_rw_edges(cbm_pipeline_ctx_t *ctx, const CBMFileResult *result, const char *rel,
                             const char *module_qn, const char **imp_keys, const char **imp_vals,
-                            int imp_count) {
+                            int imp_count, reference_resolution_stats_t *stats) {
     int resolved = 0;
     for (int r = 0; r < result->rw.count; r++) {
         CBMReadWrite *rw = &result->rw.items[r];
         if (!rw->var_name) {
+            continue;
+        }
+        if (reference_requires_refusal(&rw->reference, stats)) {
             continue;
         }
 
@@ -192,15 +253,22 @@ static int resolve_rw_edges(cbm_pipeline_ctx_t *ctx, const CBMFileResult *result
             continue;
         }
 
-        cbm_resolution_t res = cbm_registry_resolve(ctx->registry, rw->var_name, module_qn,
-                                                    imp_keys, imp_vals, imp_count);
+        cbm_resolution_t res =
+            rw->reference.resolved_target_qn
+                ? (cbm_resolution_t){rw->reference.resolved_target_qn, "self_member", 1.0, 1}
+                : cbm_registry_resolve_exact(ctx->registry, rw->var_name, module_qn, imp_keys,
+                                             imp_vals, imp_count);
         if (!res.qualified_name || res.qualified_name[0] == '\0') {
+            record_unresolved(&res, stats);
             continue;
         }
 
         const cbm_gbuf_node_t *tgt = cbm_gbuf_find_by_qn_domain(
             ctx->gbuf, res.qualified_name, CBM_REF_DOMAIN_VALUE, "usages.read_write_target");
         if (!tgt || src->id == tgt->id) {
+            if (!tgt) {
+                stats->incompatible++;
+            }
             continue;
         }
 
@@ -219,6 +287,7 @@ int cbm_pipeline_pass_usages(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *fil
     int throw_resolved = 0;
     int rw_resolved = 0;
     int errors = 0;
+    reference_resolution_stats_t stats = {0};
 
     for (int i = 0; i < file_count; i++) {
         if (cbm_pipeline_check_cancel(ctx)) {
@@ -273,10 +342,11 @@ int cbm_pipeline_pass_usages(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *fil
                                                       pu_module_is_dir(files[i].language));
 
         usage_resolved +=
-            resolve_usage_edges(ctx, result, rel, module_qn, imp_keys, imp_vals, imp_count);
+            resolve_usage_edges(ctx, result, rel, module_qn, imp_keys, imp_vals, imp_count, &stats);
         throw_resolved +=
-            resolve_throw_edges(ctx, result, rel, module_qn, imp_keys, imp_vals, imp_count);
-        rw_resolved += resolve_rw_edges(ctx, result, rel, module_qn, imp_keys, imp_vals, imp_count);
+            resolve_throw_edges(ctx, result, rel, module_qn, imp_keys, imp_vals, imp_count, &stats);
+        rw_resolved +=
+            resolve_rw_edges(ctx, result, rel, module_qn, imp_keys, imp_vals, imp_count, &stats);
 
         free(module_qn);
         cbm_pipeline_import_map_free(imp_keys, imp_vals, imp_count);
@@ -287,5 +357,13 @@ int cbm_pipeline_pass_usages(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *fil
 
     cbm_log_info("pass.done", "pass", "usages", "usage", itoa_log(usage_resolved), "throws",
                  itoa_log(throw_resolved), "rw", itoa_log(rw_resolved), "errors", itoa_log(errors));
+    cbm_log_info("reference.resolution.refused", "code", "CBM_REFERENCE_TARGET_REFUSED", "pass",
+                 "usages", "local_only", itoa_log(stats.local_only), "member_without_type",
+                 itoa_log(stats.member_without_type), "message",
+                 "references without persisted scope or receiver/type evidence were not emitted");
+    cbm_log_info("reference.resolution.unresolved", "code", "CBM_REFERENCE_TARGET_UNRESOLVED",
+                 "pass", "usages", "target_missing", itoa_log(stats.target_missing), "ambiguous",
+                 itoa_log(stats.ambiguous), "incompatible", itoa_log(stats.incompatible),
+                 "remediation", "add exact import, module, qualified-path, or type evidence");
     return 0;
 }

@@ -38,7 +38,11 @@ static bool is_throw_node(TSNode node, const CBMLangSpec *spec) {
 }
 
 // Resolve exception name from the first meaningful child of a throw/raise node.
-static char *resolve_exception_name(CBMArena *a, TSNode throw_node, const char *source) {
+static char *resolve_exception_name(CBMArena *a, TSNode throw_node, const char *source,
+                                    TSNode *out_reference) {
+    if (out_reference) {
+        *out_reference = (TSNode){0};
+    }
     uint32_t nc = ts_node_child_count(throw_node);
     for (uint32_t i = 0; i < nc; i++) {
         TSNode child = ts_node_child(throw_node, i);
@@ -64,9 +68,15 @@ static char *resolve_exception_name(CBMArena *a, TSNode throw_node, const char *
                 fn = ts_node_named_child(child, 0);
             }
             if (!ts_node_is_null(fn)) {
+                if (out_reference) {
+                    *out_reference = fn;
+                }
                 return cbm_node_text(a, fn, source);
             }
         } else {
+            if (out_reference) {
+                *out_reference = child;
+            }
             return cbm_node_text(a, child, source);
         }
         break;
@@ -97,9 +107,13 @@ static void extract_throws_clause(CBMExtractCtx *ctx, TSNode node, const CBMLang
             strcmp(ck, "scoped_type_identifier") == 0) {
             char *exc = cbm_node_text(ctx->arena, child, ctx->source);
             if (exc && exc[0]) {
-                CBMThrow thr = {.exception_name = exc,
-                                .enclosing_func_qn = func_qn,
-                                .start_line = (int)ts_node_start_point(child).row + 1};
+                CBMThrow thr = {
+                    .exception_name = exc,
+                    .enclosing_func_qn = func_qn,
+                    .start_line = (int)ts_node_start_point(child).row + 1,
+                    .reference =
+                        cbm_reference_identity(ctx, child, exc, CBM_REF_DOMAIN_TYPE, false),
+                };
                 if (!cbm_throws_push(&ctx->result->throws, ctx->arena, thr)) {
                     return;
                 }
@@ -111,14 +125,19 @@ static void extract_throws_clause(CBMExtractCtx *ctx, TSNode node, const CBMLang
 // Process a single node for throw extraction (called from iterative walker).
 static void process_throw_node(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec) {
     if (is_throw_node(node, spec)) {
-        char *exc_name = resolve_exception_name(ctx->arena, node, ctx->source);
+        TSNode reference = {0};
+        char *exc_name = resolve_exception_name(ctx->arena, node, ctx->source, &reference);
         if (exc_name && exc_name[0]) {
             // UTF-8-boundary-safe truncation (never split a multibyte char; #362).
             cbm_utf8_truncate(exc_name, MAX_EXCEPTION_NAME_LEN);
-            CBMThrow thr;
+            CBMThrow thr = {0};
             thr.exception_name = exc_name;
             thr.enclosing_func_qn = cbm_enclosing_func_qn_cached(ctx, node);
             thr.start_line = (int)ts_node_start_point(node).row + 1;
+            if (!ts_node_is_null(reference)) {
+                thr.reference =
+                    cbm_reference_identity(ctx, reference, exc_name, CBM_REF_DOMAIN_TYPE, false);
+            }
             if (!cbm_throws_push(&ctx->result->throws, ctx->arena, thr)) {
                 return;
             }
@@ -152,7 +171,14 @@ static void walk_throws(CBMExtractCtx *ctx, TSNode root, const CBMLangSpec *spec
 //   - field/member/selector access (`self.total = ...`, `obj.Field = ...` →
 //     write the trailing field name `total`/`Field`)
 // Returns NULL if no simple write target can be determined.
-static char *resolve_lhs_write_name(CBMExtractCtx *ctx, TSNode left) {
+static char *resolve_lhs_write_name(CBMExtractCtx *ctx, TSNode left, TSNode *out_reference,
+                                    bool *out_member) {
+    if (out_reference) {
+        *out_reference = (TSNode){0};
+    }
+    if (out_member) {
+        *out_member = false;
+    }
     // Unwrap a single-element expression_list (Go).
     if (strcmp(ts_node_type(left), "expression_list") == 0) {
         if (ts_node_named_child_count(left) != 1) {
@@ -162,6 +188,9 @@ static char *resolve_lhs_write_name(CBMExtractCtx *ctx, TSNode left) {
     }
     const char *lk = ts_node_type(left);
     if (strcmp(lk, "identifier") == 0 || strcmp(lk, "simple_identifier") == 0) {
+        if (out_reference) {
+            *out_reference = left;
+        }
         return cbm_node_text(ctx->arena, left, ctx->source);
     }
     // Indexed write: write the base operand's identifier (`cache[k]` → cache).
@@ -176,6 +205,9 @@ static char *resolve_lhs_write_name(CBMExtractCtx *ctx, TSNode left) {
         if (!ts_node_is_null(base)) {
             const char *bk = ts_node_type(base);
             if (strcmp(bk, "identifier") == 0 || strcmp(bk, "simple_identifier") == 0) {
+                if (out_reference) {
+                    *out_reference = base;
+                }
                 return cbm_node_text(ctx->arena, base, ctx->source);
             }
         }
@@ -190,6 +222,12 @@ static char *resolve_lhs_write_name(CBMExtractCtx *ctx, TSNode left) {
             fld = ts_node_child_by_field_name(left, TS_FIELD("name"));
         }
         if (!ts_node_is_null(fld)) {
+            if (out_reference) {
+                *out_reference = fld;
+            }
+            if (out_member) {
+                *out_member = true;
+            }
             return cbm_node_text(ctx->arena, fld, ctx->source);
         }
         return NULL;
@@ -257,13 +295,19 @@ static void try_emit_assignment_write(CBMExtractCtx *ctx, TSNode node, const cha
     if (ts_node_is_null(left)) {
         return;
     }
-    char *name = resolve_lhs_write_name(ctx, left);
+    TSNode reference = {0};
+    bool is_member = false;
+    char *name = resolve_lhs_write_name(ctx, left, &reference, &is_member);
     if (name && name[0] && !cbm_is_keyword(name, ctx->language)) {
-        CBMReadWrite rw;
+        CBMReadWrite rw = {0};
         rw.var_name = name;
         rw.is_write = true;
         rw.enclosing_func_qn = func_qn;
         rw.start_line = (int)ts_node_start_point(node).row + 1;
+        if (!ts_node_is_null(reference)) {
+            rw.reference =
+                cbm_reference_identity(ctx, reference, name, CBM_REF_DOMAIN_VALUE, is_member);
+        }
         if (!cbm_rw_push(&ctx->result->rw, ctx->arena, rw)) {
             return;
         }
@@ -314,14 +358,19 @@ void handle_throws(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec, Wal
     }
 
     if (has_throws && is_throw_node(node, spec)) {
-        char *exc_name = resolve_exception_name(ctx->arena, node, ctx->source);
+        TSNode reference = {0};
+        char *exc_name = resolve_exception_name(ctx->arena, node, ctx->source, &reference);
         if (exc_name && exc_name[0]) {
             // UTF-8-boundary-safe truncation (never split a multibyte char; #362).
             cbm_utf8_truncate(exc_name, MAX_EXCEPTION_NAME_LEN);
-            CBMThrow thr;
+            CBMThrow thr = {0};
             thr.exception_name = exc_name;
             thr.enclosing_func_qn = state->enclosing_func_qn;
             thr.start_line = (int)ts_node_start_point(node).row + 1;
+            if (!ts_node_is_null(reference)) {
+                thr.reference =
+                    cbm_reference_identity(ctx, reference, exc_name, CBM_REF_DOMAIN_TYPE, false);
+            }
             if (!cbm_throws_push(&ctx->result->throws, ctx->arena, thr)) {
                 return;
             }
@@ -340,13 +389,19 @@ void handle_readwrites(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec,
         TSNode left = resolve_write_lhs_node(node);
 
         if (!ts_node_is_null(left)) {
-            char *name = resolve_lhs_write_name(ctx, left);
+            TSNode reference = {0};
+            bool is_member = false;
+            char *name = resolve_lhs_write_name(ctx, left, &reference, &is_member);
             if (name && name[0] && !cbm_is_keyword(name, ctx->language)) {
-                CBMReadWrite rw;
+                CBMReadWrite rw = {0};
                 rw.var_name = name;
                 rw.is_write = true;
                 rw.enclosing_func_qn = state->enclosing_func_qn;
                 rw.start_line = (int)ts_node_start_point(node).row + 1;
+                if (!ts_node_is_null(reference)) {
+                    rw.reference = cbm_reference_identity(ctx, reference, name,
+                                                          CBM_REF_DOMAIN_VALUE, is_member);
+                }
                 if (!cbm_rw_push(&ctx->result->rw, ctx->arena, rw)) {
                     return;
                 }

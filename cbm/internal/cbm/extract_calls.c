@@ -1894,6 +1894,26 @@ static void extract_java_method_reference(CBMExtractCtx *ctx, TSNode node, const
     }
 }
 
+static TSNode call_reference_node(TSNode call) {
+    TSNode reference = ts_node_child_by_field_name(call, TS_FIELD("function"));
+    if (ts_node_is_null(reference)) {
+        reference = ts_node_child_by_field_name(call, TS_FIELD("name"));
+    }
+    if (ts_node_is_null(reference) && ts_node_named_child_count(call) > 0) {
+        reference = ts_node_named_child(call, 0);
+    }
+    return ts_node_is_null(reference) ? call : reference;
+}
+
+static bool call_reference_is_member(TSNode reference, bool language_member) {
+    const char *kind = ts_node_type(reference);
+    return language_member || strcmp(kind, "field_expression") == 0 ||
+           strcmp(kind, "member_expression") == 0 ||
+           strcmp(kind, "member_access_expression") == 0 ||
+           strcmp(kind, "method_call_expression") == 0 ||
+           strcmp(kind, "selector_expression") == 0 || strcmp(kind, "attribute") == 0;
+}
+
 void handle_calls(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec, WalkState *state) {
     if (!spec->call_node_types || !spec->call_node_types[0]) {
         return;
@@ -1943,6 +1963,11 @@ void handle_calls(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec, Walk
                     }
                 }
             }
+
+            TSNode reference = call_reference_node(node);
+            call.reference =
+                cbm_reference_identity(ctx, reference, call.callee_name, CBM_REF_DOMAIN_CALLABLE,
+                                       call_reference_is_member(reference, call.is_method));
 
             TSNode args = ts_node_child_by_field_name(node, TS_FIELD("arguments"));
             if (!ts_node_is_null(args)) {

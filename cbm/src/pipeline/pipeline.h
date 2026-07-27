@@ -234,6 +234,15 @@ cbm_resolution_t cbm_registry_resolve(const cbm_registry_t *r, const char *calle
                                       const char *module_qn, const char **import_map_keys,
                                       const char **import_map_vals, int import_map_count);
 
+/* Evidence-only resolver for persisted graph targets. It admits only an exact
+ * import binding, exact same-module identity, or a unique explicit qualified
+ * path tail. Repository-global unique-name and scored suffix candidates are
+ * diagnostic-only and are never returned as targets. An unresolved result
+ * carries a stable strategy reason and candidate_count for aggregate logging. */
+cbm_resolution_t cbm_registry_resolve_exact(const cbm_registry_t *r, const char *reference_name,
+                                            const char *module_qn, const char **import_map_keys,
+                                            const char **import_map_vals, int import_map_count);
+
 /* Per-file memoization cache for is_import_reachable. Thread-local —
  * each resolve worker owns its own cache. Call _begin at the start
  * of resolve_file_calls (or any per-file resolve loop) and _end at

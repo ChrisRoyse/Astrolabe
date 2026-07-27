@@ -74,19 +74,45 @@ static const char *itoa_log(int val) {
     return bufs[i];
 }
 
+typedef struct {
+    int target_missing;
+    int ambiguous;
+    int incompatible;
+    int synthetic_external;
+} semantic_resolution_stats_t;
+
+static void semantic_record_unresolved(const cbm_resolution_t *resolution,
+                                       semantic_resolution_stats_t *stats) {
+    if (resolution->strategy && strstr(resolution->strategy, "ambiguous")) {
+        stats->ambiguous++;
+    } else if (resolution->strategy && (strstr(resolution->strategy, "overflow") ||
+                                        strstr(resolution->strategy, "invalid"))) {
+        stats->incompatible++;
+    } else {
+        stats->target_missing++;
+    }
+}
+
 /* Resolve a class/type name through the textual registry, then bind it to one
  * stable graph atom in the type namespace. */
 static const cbm_gbuf_node_t *resolve_as_type(const cbm_registry_t *reg, const cbm_gbuf_t *gbuf,
                                               const char *name, const char *module_qn,
                                               const char **imp_keys, const char **imp_vals,
-                                              int imp_count, const char *operation) {
+                                              int imp_count, const char *operation,
+                                              semantic_resolution_stats_t *stats) {
     cbm_resolution_t res =
-        cbm_registry_resolve(reg, name, module_qn, imp_keys, imp_vals, imp_count);
+        cbm_registry_resolve_exact(reg, name, module_qn, imp_keys, imp_vals, imp_count);
     if (!res.qualified_name || res.qualified_name[0] == '\0') {
+        semantic_record_unresolved(&res, stats);
         return NULL;
     }
 
-    return cbm_gbuf_find_by_qn_domain(gbuf, res.qualified_name, CBM_REF_DOMAIN_TYPE, operation);
+    const cbm_gbuf_node_t *node =
+        cbm_gbuf_find_by_qn_domain(gbuf, res.qualified_name, CBM_REF_DOMAIN_TYPE, operation);
+    if (!node) {
+        stats->incompatible++;
+    }
+    return node;
 }
 
 /* Extract decorator function name from the raw attribute/annotation text.
@@ -279,14 +305,15 @@ static void synth_decorator_qn(const char *func_name, char *out, size_t outsz) {
 /* Resolve one decorator and create DECORATES edge. */
 static void resolve_decorator(cbm_pipeline_ctx_t *ctx, const cbm_gbuf_node_t *node,
                               const char *decorator, const char *module_qn, const char **imp_keys,
-                              const char **imp_vals, int imp_count, int *count) {
+                              const char **imp_vals, int imp_count, int *count,
+                              semantic_resolution_stats_t *stats) {
     char func_name[CBM_SZ_256];
     extract_decorator_func(decorator, func_name, sizeof(func_name));
     if (func_name[0] == '\0') {
         return;
     }
-    cbm_resolution_t res =
-        cbm_registry_resolve(ctx->registry, func_name, module_qn, imp_keys, imp_vals, imp_count);
+    cbm_resolution_t res = cbm_registry_resolve_exact(ctx->registry, func_name, module_qn, imp_keys,
+                                                      imp_vals, imp_count);
     if ((!res.qualified_name || res.qualified_name[0] == '\0') && !strchr(func_name, '.')) {
         /* C# attributes are referenced by their short name (`[Log]`) but declared
          * with the conventional `Attribute` suffix (`class LogAttribute`).  Retry
@@ -294,14 +321,19 @@ static void resolve_decorator(cbm_pipeline_ctx_t *ctx, const cbm_gbuf_node_t *no
         char with_suffix[CBM_SZ_256];
         int wn = snprintf(with_suffix, sizeof(with_suffix), "%sAttribute", func_name);
         if (wn > 0 && (size_t)wn < sizeof(with_suffix)) {
-            res = cbm_registry_resolve(ctx->registry, with_suffix, module_qn, imp_keys, imp_vals,
-                                       imp_count);
+            res = cbm_registry_resolve_exact(ctx->registry, with_suffix, module_qn, imp_keys,
+                                             imp_vals, imp_count);
         }
     }
     const cbm_gbuf_node_t *dec = NULL;
     if (res.qualified_name && res.qualified_name[0] != '\0') {
         dec = cbm_gbuf_find_by_qn_domain(ctx->gbuf, res.qualified_name, CBM_REF_DOMAIN_CALLABLE,
                                          "semantic.decorator");
+        if (!dec) {
+            stats->incompatible++;
+        }
+    } else {
+        semantic_record_unresolved(&res, stats);
     }
     if (!dec) {
         /* The decorator target is not a local symbol (external attribute /
@@ -317,6 +349,7 @@ static void resolve_decorator(cbm_pipeline_ctx_t *ctx, const cbm_gbuf_node_t *no
             cbm_gbuf_upsert_node(ctx->gbuf, "Decorator", func_name, syn_qn, "", 0, 0, "{}");
         if (syn_id != 0) {
             dec = cbm_gbuf_find_by_qn(ctx->gbuf, syn_qn);
+            stats->synthetic_external++;
         }
     }
     if (dec && node->id != dec->id) {
@@ -338,7 +371,7 @@ static void resolve_decorator(cbm_pipeline_ctx_t *ctx, const cbm_gbuf_node_t *no
 static void sem_process_def_edges(cbm_pipeline_ctx_t *ctx, const CBMDefinition *def,
                                   const char *module_qn, const char **imp_keys,
                                   const char **imp_vals, int imp_count, int *inherits_count,
-                                  int *decorates_count) {
+                                  int *decorates_count, semantic_resolution_stats_t *stats) {
     if (!def->qualified_name) {
         return;
     }
@@ -350,7 +383,7 @@ static void sem_process_def_edges(cbm_pipeline_ctx_t *ctx, const CBMDefinition *
         for (int b = 0; def->base_classes[b]; b++) {
             const cbm_gbuf_node_t *base_node =
                 resolve_as_type(ctx->registry, ctx->gbuf, def->base_classes[b], module_qn, imp_keys,
-                                imp_vals, imp_count, "semantic.base_type");
+                                imp_vals, imp_count, "semantic.base_type", stats);
             if (!base_node) {
                 continue;
             }
@@ -368,7 +401,7 @@ static void sem_process_def_edges(cbm_pipeline_ctx_t *ctx, const CBMDefinition *
     if (def->decorators) {
         for (int dc = 0; def->decorators[dc]; dc++) {
             resolve_decorator(ctx, node, def->decorators[dc], module_qn, imp_keys, imp_vals,
-                              imp_count, decorates_count);
+                              imp_count, decorates_count, stats);
         }
     }
 }
@@ -398,7 +431,7 @@ static CBMFileResult *sem_get_or_extract(cbm_pipeline_ctx_t *ctx, int file_idx,
 /* Resolve Rust impl traits for one file's extraction results. */
 static int resolve_impl_traits(cbm_pipeline_ctx_t *ctx, const CBMFileResult *result,
                                const char *module_qn, const char **imp_keys, const char **imp_vals,
-                               int imp_count) {
+                               int imp_count, semantic_resolution_stats_t *stats) {
     int count = 0;
     for (int t = 0; t < result->impl_traits.count; t++) {
         CBMImplTrait *it = &result->impl_traits.items[t];
@@ -407,13 +440,13 @@ static int resolve_impl_traits(cbm_pipeline_ctx_t *ctx, const CBMFileResult *res
         }
         const cbm_gbuf_node_t *tn =
             resolve_as_type(ctx->registry, ctx->gbuf, it->trait_name, module_qn, imp_keys, imp_vals,
-                            imp_count, "semantic.impl_trait");
+                            imp_count, "semantic.impl_trait", stats);
         if (!tn) {
             continue;
         }
         const cbm_gbuf_node_t *sn =
             resolve_as_type(ctx->registry, ctx->gbuf, it->struct_name, module_qn, imp_keys,
-                            imp_vals, imp_count, "semantic.impl_receiver");
+                            imp_vals, imp_count, "semantic.impl_receiver", stats);
         if (!sn) {
             continue;
         }
@@ -433,6 +466,7 @@ int cbm_pipeline_pass_semantic(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *f
     int decorates_count = 0;
     int implements_count = 0;
     int errors = 0;
+    semantic_resolution_stats_t stats = {0};
 
     for (int i = 0; i < file_count; i++) {
         if (cbm_pipeline_check_cancel(ctx)) {
@@ -466,12 +500,12 @@ int cbm_pipeline_pass_semantic(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *f
         /* ── INHERITS + DECORATES from definitions ──────────────── */
         for (int d = 0; d < result->defs.count; d++) {
             sem_process_def_edges(ctx, &result->defs.items[d], module_qn, imp_keys, imp_vals,
-                                  imp_count, &inherits_count, &decorates_count);
+                                  imp_count, &inherits_count, &decorates_count, &stats);
         }
 
         /* ── IMPLEMENTS from impl_traits (Rust) ─────────────────── */
         implements_count +=
-            resolve_impl_traits(ctx, result, module_qn, imp_keys, imp_vals, imp_count);
+            resolve_impl_traits(ctx, result, module_qn, imp_keys, imp_vals, imp_count, &stats);
 
         free(module_qn);
         cbm_pipeline_import_map_free(imp_keys, imp_vals, imp_count);
@@ -487,5 +521,9 @@ int cbm_pipeline_pass_semantic(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *f
     cbm_log_info("pass.done", "pass", "semantic", "inherits", itoa_log(inherits_count), "decorates",
                  itoa_log(decorates_count), "implements", itoa_log(implements_count), "errors",
                  itoa_log(errors));
+    cbm_log_info("reference.resolution.unresolved", "code", "CBM_REFERENCE_TARGET_UNRESOLVED",
+                 "pass", "semantic", "target_missing", itoa_log(stats.target_missing), "ambiguous",
+                 itoa_log(stats.ambiguous), "incompatible", itoa_log(stats.incompatible),
+                 "synthetic_external", itoa_log(stats.synthetic_external));
     return 0;
 }

@@ -39,8 +39,6 @@ enum {
 #define PP_NSEC_PER_SEC 1000000000ULL
 #define PP_USEC_PER_MS 1000000ULL
 #define PP_HALF_CONF 0.5
-#define PP_FIELD_HINT_CONF 0.85
-enum { PP_CSHARP_M_PREFIX_LEN = 2 };
 
 /* Absolute source-retention ceilings for the parallel extract pipeline.
  *
@@ -606,9 +604,13 @@ static bool is_checked_exception(const char *name) {
 static const cbm_gbuf_node_t *resolve_as_type(const cbm_registry_t *reg, const cbm_gbuf_t *gbuf,
                                               const char *name, const char *module_qn,
                                               const char **imp_keys, const char **imp_vals,
-                                              int imp_count, const char *operation) {
+                                              int imp_count, const char *operation,
+                                              cbm_resolution_t *out_resolution) {
     cbm_resolution_t res =
-        cbm_registry_resolve(reg, name, module_qn, imp_keys, imp_vals, imp_count);
+        cbm_registry_resolve_exact(reg, name, module_qn, imp_keys, imp_vals, imp_count);
+    if (out_resolution) {
+        *out_resolution = res;
+    }
     if (!res.qualified_name || res.qualified_name[0] == '\0') {
         return NULL;
     }
@@ -1418,7 +1420,12 @@ typedef struct __attribute__((aligned(CBM_CACHE_LINE))) {
      * registry's textual matcher. Surfaced in the parallel.resolve.done
      * log line so divergence between pipelines becomes observable. */
     int lsp_overrides;
-    char _pad[CBM_CACHE_LINE - sizeof(cbm_gbuf_t *) - ((PP_RING + 1) * sizeof(int))];
+    int reference_local_only;
+    int reference_member_without_type;
+    int reference_target_missing;
+    int reference_ambiguous;
+    int reference_incompatible;
+    char _pad[CBM_CACHE_LINE - sizeof(cbm_gbuf_t *) - ((PP_RING + 6) * sizeof(int))];
 } resolve_worker_state_t;
 
 typedef struct {
@@ -1492,7 +1499,6 @@ typedef struct {
      * doesn't pinpoint. */
     _Atomic uint64_t time_ns_rc_lsp_lookup; /* lsp_idx + fallback scan */
     _Atomic uint64_t time_ns_rc_resolve;    /* lsp_target_node OR registry_resolve */
-    _Atomic uint64_t time_ns_rc_hint;       /* try_field_type_hint */
     _Atomic uint64_t time_ns_rc_target;     /* gbuf_find_by_qn for target */
     _Atomic uint64_t time_ns_rc_emit;       /* emit_service_edge */
     _Atomic uint64_t time_ns_rc_source;     /* find_source_node */
@@ -1771,7 +1777,8 @@ static void emit_route_registration(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *sou
              esc_rp);
     cbm_gbuf_insert_edge(gbuf, source->id, rid, "CALLS", props);
     if (handler_ref && handler_ref[0] != '\0') {
-        cbm_resolution_t hres = cbm_registry_resolve(registry, handler_ref, module_qn, ik, iv, ic);
+        cbm_resolution_t hres =
+            cbm_registry_resolve_exact(registry, handler_ref, module_qn, ik, iv, ic);
         if (hres.qualified_name && hres.qualified_name[0] != '\0') {
             const cbm_gbuf_node_t *h = cbm_gbuf_find_by_qn_domain(
                 main_gbuf, hres.qualified_name, CBM_REF_DOMAIN_CALLABLE, "parallel.route_handler");
@@ -2122,61 +2129,6 @@ static const cbm_gbuf_node_t *find_source_node(const cbm_gbuf_t *gbuf, const cha
                                               call_line, operation);
 }
 
-/* Field type hint resolution for obj.Method() with multiple candidates.
- * Strips C# field prefixes (_ / m_), capitalizes to get type name, and
- * checks if TypeName.Method or ITypeName.Method exists among candidates. */
-static void try_field_type_hint(resolve_ctx_t *rc, cbm_resolution_t *res, const char *callee_name,
-                                int64_t source_id) {
-    if (!res->qualified_name || res->candidate_count <= SKIP_ONE) {
-        return;
-    }
-    const char *dot = strchr(callee_name, '.');
-    if (!dot) {
-        return;
-    }
-    size_t plen = (size_t)(dot - callee_name);
-    char obj_name[CBM_SZ_256];
-    if (plen >= sizeof(obj_name)) {
-        return;
-    }
-    memcpy(obj_name, callee_name, plen);
-    obj_name[plen] = '\0';
-
-    const char *type_hint = obj_name;
-    if (type_hint[0] == '_') {
-        type_hint++;
-    }
-    if (type_hint[0] == 'm' && type_hint[SKIP_ONE] == '_') {
-        type_hint += PP_CSHARP_M_PREFIX_LEN;
-    }
-
-    char type_name[CBM_SZ_256];
-    snprintf(type_name, sizeof(type_name), "%s", type_hint);
-    if (type_name[0] >= 'a' && type_name[0] <= 'z') {
-        type_name[0] -= ('a' - 'A');
-    }
-
-    char iface_name[CBM_SZ_256];
-    snprintf(iface_name, sizeof(iface_name), "I%s", type_name);
-
-    const char *method = dot + SKIP_ONE;
-    const char **cands = NULL;
-    int cand_count = 0;
-    cbm_registry_find_by_name(rc->registry, method, &cands, &cand_count);
-    for (int ci = 0; ci < cand_count; ci++) {
-        if (strstr(cands[ci], type_name) || strstr(cands[ci], iface_name)) {
-            const cbm_gbuf_node_t *better = cbm_gbuf_find_by_qn_domain(
-                rc->main_gbuf, cands[ci], CBM_REF_DOMAIN_CALLABLE, "parallel.field_type_hint");
-            if (better && better->id != source_id) {
-                res->qualified_name = cands[ci];
-                res->confidence = PP_FIELD_HINT_CONF;
-                res->strategy = "field_type_hint";
-                return;
-            }
-        }
-    }
-}
-
 /* Free a strdup'd key stored in the per-file lsp_idx hash table. */
 static void lsp_idx_free_key(const char *key, void *value, void *ud) {
     (void)value;
@@ -2202,6 +2154,18 @@ static char *lsp_idx_key_alloc(const char *caller_qn, const char *callee_leaf) {
     key[caller_len] = '|';
     memcpy(key + caller_len + 1, callee_leaf, leaf_len + 1);
     return key;
+}
+
+static void parallel_record_unresolved(resolve_worker_state_t *worker,
+                                       const cbm_resolution_t *resolution) {
+    if (resolution->strategy && strstr(resolution->strategy, "ambiguous")) {
+        worker->reference_ambiguous++;
+    } else if (resolution->strategy && (strstr(resolution->strategy, "overflow") ||
+                                        strstr(resolution->strategy, "invalid"))) {
+        worker->reference_incompatible++;
+    } else {
+        worker->reference_target_missing++;
+    }
 }
 
 /* Resolve calls for one file and emit CALLS/HTTP_CALLS/ASYNC_CALLS edges. */
@@ -2346,26 +2310,26 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
                 res.candidate_count = 1;
                 ws->lsp_overrides++;
             }
+        } else if (call->reference.resolved_target_qn) {
+            res = (cbm_resolution_t){call->reference.resolved_target_qn, "self_member", 1.0, 1};
         } else {
-            res = cbm_registry_resolve(rc->registry, call->callee_name, module_qn, imp_keys,
-                                       imp_vals, imp_count);
+            res = cbm_registry_resolve_exact(rc->registry, call->callee_name, module_qn, imp_keys,
+                                             imp_vals, imp_count);
         }
         atomic_fetch_add_explicit(&rc->time_ns_rc_resolve, extract_now_ns() - _rc_t0,
                                   memory_order_relaxed);
-
-        _rc_t0 = extract_now_ns();
-        try_field_type_hint(rc, &res, call->callee_name, source_node->id);
-        atomic_fetch_add_explicit(&rc->time_ns_rc_hint, extract_now_ns() - _rc_t0,
-                                  memory_order_relaxed);
+        if (!lsp_target && call->reference.evidence == CBM_REF_EVIDENCE_LOCAL) {
+            ws->reference_local_only++;
+            continue;
+        }
 
         /* Perl call-graph noise guard (#476), mirroring the sequential pass
          * (pass_calls.c). Perl has no LSP resolver; for builtins (push/shift/
          * keys/...) and method calls ($obj->m, unresolved receiver), suppress
          * only WEAK cross-file short-name matches and keep the high-confidence
          * same_module / import_map strategies so a genuine same-file or
-         * imported call to a builtin-named sub still resolves. Placed after the
-         * field-type hint so a hint cannot re-introduce a suppressed edge.
-         * Gated to Perl — other languages are unaffected. */
+         * imported call to a builtin-named sub still resolves. Gated to Perl —
+         * other languages are unaffected. */
         if (cbm_perl_suppress_generic_match(lang == CBM_LANG_PERL, call->is_method,
                                             call->callee_name, res.strategy)) {
             continue;
@@ -2410,6 +2374,24 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
                 continue;
             }
         }
+        if (!lsp_target && call->reference.evidence == CBM_REF_EVIDENCE_MEMBER &&
+            !call->reference.resolved_target_qn) {
+            if (cbm_service_pattern_route_method(call->callee_name) != NULL &&
+                call->first_string_arg && call->first_string_arg[0] == '/') {
+                cbm_resolution_t route_resolution = {
+                    .qualified_name = call->callee_name,
+                    .confidence = PP_HALF_CONF,
+                    .strategy = "route_syntax",
+                };
+                emit_service_edge(ws->local_edge_buf, source_node, source_node, call,
+                                  &route_resolution, module_qn, rc->registry, rc->main_gbuf,
+                                  imp_keys, imp_vals, imp_count, false);
+                ws->calls_resolved++;
+            } else {
+                ws->reference_member_without_type++;
+            }
+            continue;
+        }
 
         if (!res.qualified_name || res.qualified_name[0] == '\0') {
             if (cbm_service_pattern_route_method(call->callee_name) != NULL) {
@@ -2420,12 +2402,11 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
                                   module_qn, rc->registry, rc->main_gbuf, imp_keys, imp_vals,
                                   imp_count, false);
             }
+            parallel_record_unresolved(ws, &res);
             continue;
         }
         /* Reuse lsp_target as target_node when LSP resolved — avoids a
-         * second cbm_gbuf_find_by_qn lookup. try_field_type_hint may have
-         * upgraded res.qualified_name to a different candidate, in which
-         * case we must re-resolve. */
+         * second cbm_gbuf_find_by_qn lookup. */
         _rc_t0 = extract_now_ns();
         const cbm_gbuf_node_t *target_node;
         if (lsp_target && res.qualified_name == lsp_target->qualified_name) {
@@ -2455,6 +2436,9 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
                     ws->calls_resolved++;
                 }
             }
+            if (!target_node && psvc != CBM_SVC_HTTP && psvc != CBM_SVC_ASYNC) {
+                ws->reference_incompatible++;
+            }
             continue;
         }
         _rc_t0 = extract_now_ns();
@@ -2480,20 +2464,36 @@ static void resolve_file_usages(resolve_ctx_t *rc, resolve_worker_state_t *ws,
         if (!usage->ref_name) {
             continue;
         }
+        if (usage->reference.evidence == CBM_REF_EVIDENCE_LOCAL) {
+            ws->reference_local_only++;
+            continue;
+        }
+        if (usage->reference.evidence == CBM_REF_EVIDENCE_MEMBER &&
+            !usage->reference.resolved_target_qn) {
+            ws->reference_member_without_type++;
+            continue;
+        }
         const cbm_gbuf_node_t *src = find_source_node(
             rc->main_gbuf, rc->project_name, rel, module_qn, usage->enclosing_func_qn,
             usage->start_line, "parallel.usages.reference_source");
         if (!src) {
             continue;
         }
-        cbm_resolution_t res = cbm_registry_resolve(rc->registry, usage->ref_name, module_qn,
-                                                    imp_keys, imp_vals, imp_count);
+        cbm_resolution_t res =
+            usage->reference.resolved_target_qn
+                ? (cbm_resolution_t){usage->reference.resolved_target_qn, "self_member", 1.0, 1}
+                : cbm_registry_resolve_exact(rc->registry, usage->ref_name, module_qn, imp_keys,
+                                             imp_vals, imp_count);
         if (!res.qualified_name || res.qualified_name[0] == '\0') {
+            parallel_record_unresolved(ws, &res);
             continue;
         }
         const cbm_gbuf_node_t *tgt = cbm_gbuf_find_by_qn_domain(
             rc->main_gbuf, res.qualified_name, usage->target_domain, "parallel.reference_target");
         if (!tgt || src->id == tgt->id) {
+            if (!tgt) {
+                ws->reference_incompatible++;
+            }
             continue;
         }
         char uprops[CBM_SZ_256];
@@ -2514,6 +2514,15 @@ static void resolve_file_throws(resolve_ctx_t *rc, resolve_worker_state_t *ws,
         if (!thr->exception_name || !thr->enclosing_func_qn) {
             continue;
         }
+        if (thr->reference.evidence == CBM_REF_EVIDENCE_LOCAL) {
+            ws->reference_local_only++;
+            continue;
+        }
+        if (thr->reference.evidence == CBM_REF_EVIDENCE_MEMBER &&
+            !thr->reference.resolved_target_qn) {
+            ws->reference_member_without_type++;
+            continue;
+        }
         const cbm_gbuf_node_t *src = find_source_node(
             rc->main_gbuf, rc->project_name, rel, module_qn, thr->enclosing_func_qn,
             thr->start_line, "parallel.throws.reference_source");
@@ -2521,14 +2530,21 @@ static void resolve_file_throws(resolve_ctx_t *rc, resolve_worker_state_t *ws,
             continue;
         }
         const char *edge_type = is_checked_exception(thr->exception_name) ? "THROWS" : "RAISES";
-        cbm_resolution_t res = cbm_registry_resolve(rc->registry, thr->exception_name, module_qn,
-                                                    imp_keys, imp_vals, imp_count);
+        cbm_resolution_t res =
+            thr->reference.resolved_target_qn
+                ? (cbm_resolution_t){thr->reference.resolved_target_qn, "self_member", 1.0, 1}
+                : cbm_registry_resolve_exact(rc->registry, thr->exception_name, module_qn, imp_keys,
+                                             imp_vals, imp_count);
         if (!res.qualified_name || res.qualified_name[0] == '\0') {
+            parallel_record_unresolved(ws, &res);
             continue;
         }
         const cbm_gbuf_node_t *tgt = cbm_gbuf_find_by_qn_domain(
             rc->main_gbuf, res.qualified_name, CBM_REF_DOMAIN_TYPE, "parallel.exception_type");
         if (!tgt || src->id == tgt->id) {
+            if (!tgt) {
+                ws->reference_incompatible++;
+            }
             continue;
         }
         cbm_gbuf_insert_edge(ws->local_edge_buf, src->id, tgt->id, edge_type, "{}");
@@ -2544,20 +2560,36 @@ static void resolve_file_rw(resolve_ctx_t *rc, resolve_worker_state_t *ws, CBMFi
         if (!rw->var_name) {
             continue;
         }
+        if (rw->reference.evidence == CBM_REF_EVIDENCE_LOCAL) {
+            ws->reference_local_only++;
+            continue;
+        }
+        if (rw->reference.evidence == CBM_REF_EVIDENCE_MEMBER &&
+            !rw->reference.resolved_target_qn) {
+            ws->reference_member_without_type++;
+            continue;
+        }
         const cbm_gbuf_node_t *src =
             find_source_node(rc->main_gbuf, rc->project_name, rel, module_qn, rw->enclosing_func_qn,
                              rw->start_line, "parallel.read_write.reference_source");
         if (!src) {
             continue;
         }
-        cbm_resolution_t res = cbm_registry_resolve(rc->registry, rw->var_name, module_qn, imp_keys,
-                                                    imp_vals, imp_count);
+        cbm_resolution_t res =
+            rw->reference.resolved_target_qn
+                ? (cbm_resolution_t){rw->reference.resolved_target_qn, "self_member", 1.0, 1}
+                : cbm_registry_resolve_exact(rc->registry, rw->var_name, module_qn, imp_keys,
+                                             imp_vals, imp_count);
         if (!res.qualified_name || res.qualified_name[0] == '\0') {
+            parallel_record_unresolved(ws, &res);
             continue;
         }
         const cbm_gbuf_node_t *tgt = cbm_gbuf_find_by_qn_domain(
             rc->main_gbuf, res.qualified_name, CBM_REF_DOMAIN_VALUE, "parallel.read_write_target");
         if (!tgt || src->id == tgt->id) {
+            if (!tgt) {
+                ws->reference_incompatible++;
+            }
             continue;
         }
         const char *etype = rw->is_write ? "WRITES" : "READS";
@@ -2573,10 +2605,16 @@ static void resolve_def_inherits(resolve_ctx_t *rc, resolve_worker_state_t *ws,
         return;
     }
     for (int b = 0; def->base_classes[b]; b++) {
+        cbm_resolution_t resolution = {0};
         const cbm_gbuf_node_t *bn =
             resolve_as_type(rc->registry, rc->main_gbuf, def->base_classes[b], mq, ik, iv, ic,
-                            "parallel.base_type");
+                            "parallel.base_type", &resolution);
         if (!bn) {
+            if (resolution.qualified_name && resolution.qualified_name[0]) {
+                ws->reference_incompatible++;
+            } else {
+                parallel_record_unresolved(ws, &resolution);
+            }
             continue;
         }
         if (bn && node->id != bn->id) {
@@ -2600,20 +2638,25 @@ static void resolve_def_decorators(resolve_ctx_t *rc, resolve_worker_state_t *ws
         if (fn[0] == '\0') {
             continue;
         }
-        cbm_resolution_t res = cbm_registry_resolve(rc->registry, fn, mq, ik, iv, ic);
+        cbm_resolution_t res = cbm_registry_resolve_exact(rc->registry, fn, mq, ik, iv, ic);
         if ((!res.qualified_name || res.qualified_name[0] == '\0') && !strchr(fn, '.')) {
             /* C# attributes are referenced by their short name (`[Log]`) but
              * declared with an `Attribute` suffix (`class LogAttribute`). */
             char with_suffix[CBM_SZ_256];
             int wn = snprintf(with_suffix, sizeof(with_suffix), "%sAttribute", fn);
             if (wn > 0 && (size_t)wn < sizeof(with_suffix)) {
-                res = cbm_registry_resolve(rc->registry, with_suffix, mq, ik, iv, ic);
+                res = cbm_registry_resolve_exact(rc->registry, with_suffix, mq, ik, iv, ic);
             }
         }
         const cbm_gbuf_node_t *dn = NULL;
         if (res.qualified_name && res.qualified_name[0] != '\0') {
             dn = cbm_gbuf_find_by_qn_domain(rc->main_gbuf, res.qualified_name,
                                             CBM_REF_DOMAIN_CALLABLE, "parallel.decorator");
+            if (!dn) {
+                ws->reference_incompatible++;
+            }
+        } else {
+            parallel_record_unresolved(ws, &res);
         }
         int64_t dn_id = 0;
         if (dn) {
@@ -2671,13 +2714,29 @@ static void resolve_file_semantic(resolve_ctx_t *rc, resolve_worker_state_t *ws,
         if (!it->trait_name || !it->struct_name) {
             continue;
         }
+        cbm_resolution_t trait_resolution = {0};
+        cbm_resolution_t receiver_resolution = {0};
         const cbm_gbuf_node_t *tn =
             resolve_as_type(rc->registry, rc->main_gbuf, it->trait_name, module_qn, imp_keys,
-                            imp_vals, imp_count, "parallel.impl_trait");
+                            imp_vals, imp_count, "parallel.impl_trait", &trait_resolution);
         const cbm_gbuf_node_t *sn =
             resolve_as_type(rc->registry, rc->main_gbuf, it->struct_name, module_qn, imp_keys,
-                            imp_vals, imp_count, "parallel.impl_receiver");
+                            imp_vals, imp_count, "parallel.impl_receiver", &receiver_resolution);
         if (!tn || !sn) {
+            if (!tn) {
+                if (trait_resolution.qualified_name && trait_resolution.qualified_name[0]) {
+                    ws->reference_incompatible++;
+                } else {
+                    parallel_record_unresolved(ws, &trait_resolution);
+                }
+            }
+            if (!sn) {
+                if (receiver_resolution.qualified_name && receiver_resolution.qualified_name[0]) {
+                    ws->reference_incompatible++;
+                } else {
+                    parallel_record_unresolved(ws, &receiver_resolution);
+                }
+            }
             continue;
         }
         if (tn && sn && tn->id != sn->id) {
@@ -3055,7 +3114,17 @@ int cbm_parallel_resolve(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, 
     int total_usages = 0;
     int total_semantic = 0;
     int total_lsp_overrides = 0;
+    int total_reference_local_only = 0;
+    int total_reference_member_without_type = 0;
+    int total_reference_target_missing = 0;
+    int total_reference_ambiguous = 0;
+    int total_reference_incompatible = 0;
     for (int i = 0; i < worker_count; i++) {
+        total_reference_local_only += workers[i].reference_local_only;
+        total_reference_member_without_type += workers[i].reference_member_without_type;
+        total_reference_target_missing += workers[i].reference_target_missing;
+        total_reference_ambiguous += workers[i].reference_ambiguous;
+        total_reference_incompatible += workers[i].reference_incompatible;
         if (workers[i].local_edge_buf) {
             cbm_gbuf_merge(ctx->gbuf, workers[i].local_edge_buf);
             total_calls += workers[i].calls_resolved;
@@ -3091,6 +3160,15 @@ int cbm_parallel_resolve(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, 
     cbm_log_info("parallel.resolve.done", "calls", itoa_log(total_calls), "usages",
                  itoa_log(total_usages), "semantic", itoa_log(total_semantic + go_impl),
                  "lsp_overrides", itoa_log(total_lsp_overrides));
+    cbm_log_info("reference.resolution.refused", "code", "CBM_REFERENCE_TARGET_REFUSED", "pass",
+                 "parallel", "local_only", itoa_log(total_reference_local_only),
+                 "member_without_type", itoa_log(total_reference_member_without_type), "message",
+                 "references without persisted scope or receiver/type evidence were not emitted");
+    cbm_log_info("reference.resolution.unresolved", "code", "CBM_REFERENCE_TARGET_UNRESOLVED",
+                 "pass", "parallel", "target_missing", itoa_log(total_reference_target_missing),
+                 "ambiguous", itoa_log(total_reference_ambiguous), "incompatible",
+                 itoa_log(total_reference_incompatible), "remediation",
+                 "add exact import, module, qualified-path, or LSP type evidence");
 
     /* Per-sub-phase breakdown so we stop guessing about hot paths.
      * Numbers are summed across workers (total CPU-ms, not wall-time).
@@ -3138,7 +3216,7 @@ int cbm_parallel_resolve(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, 
     cbm_log_info("parallel.resolve.phase_ms_b", "resolve_usages", use_buf, "resolve_throws",
                  thr_buf, "resolve_rw", rw_buf, "resolve_semantic", sem_buf);
 
-    char src_buf[32], lsp_buf[32], rsv_buf[32], hnt_buf[32], tgt_buf[32], emt_buf[32];
+    char src_buf[32], lsp_buf[32], rsv_buf[32], tgt_buf[32], emt_buf[32];
     snprintf(
         src_buf, sizeof(src_buf), "%llu",
         (unsigned long long)(atomic_load_explicit(&rc.time_ns_rc_source, memory_order_relaxed) /
@@ -3151,9 +3229,6 @@ int cbm_parallel_resolve(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, 
         rsv_buf, sizeof(rsv_buf), "%llu",
         (unsigned long long)(atomic_load_explicit(&rc.time_ns_rc_resolve, memory_order_relaxed) /
                              1000000ULL));
-    snprintf(hnt_buf, sizeof(hnt_buf), "%llu",
-             (unsigned long long)(atomic_load_explicit(&rc.time_ns_rc_hint, memory_order_relaxed) /
-                                  1000000ULL));
     snprintf(
         tgt_buf, sizeof(tgt_buf), "%llu",
         (unsigned long long)(atomic_load_explicit(&rc.time_ns_rc_target, memory_order_relaxed) /
@@ -3163,7 +3238,6 @@ int cbm_parallel_resolve(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, 
                                   1000000ULL));
     cbm_log_info("parallel.resolve.calls_breakdown", "find_source", src_buf, "lsp_lookup", lsp_buf,
                  "resolve", rsv_buf);
-    cbm_log_info("parallel.resolve.calls_breakdown2", "field_hint", hnt_buf, "find_target", tgt_buf,
-                 "emit_edge", emt_buf);
+    cbm_log_info("parallel.resolve.calls_breakdown2", "find_target", tgt_buf, "emit_edge", emt_buf);
     return 0;
 }
