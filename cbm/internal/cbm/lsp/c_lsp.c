@@ -3599,6 +3599,24 @@ static void c_resolve_calls_in_node_inner(CLSPContext *ctx, TSNode node) {
         return;
     const char *kind = ts_node_type(node);
 
+    if (strcmp(kind, "call_expression") == 0 && ctx->primary_source_lines) {
+        size_t expanded_line = (size_t)ts_node_start_point(node).row + 1U;
+        if (expanded_line == 0 || expanded_line > ctx->expanded_line_count) {
+            cbm_arena_mark_failed(ctx->arena, "CBM_PREPROCESS_LSP_LINE_UNMAPPED",
+                                  "c_lsp_expansion_source_map", expanded_line);
+            return;
+        }
+        uint32_t source_line = ctx->primary_source_lines[expanded_line - 1];
+        if (source_line == UINT32_MAX) {
+            return;
+        }
+        if (source_line == 0) {
+            cbm_arena_mark_failed(ctx->arena, "CBM_PREPROCESS_LSP_ORIGIN_INVALID",
+                                  "c_lsp_expansion_source_map", expanded_line);
+            return;
+        }
+    }
+
     // Process statements for scope building
     c_process_statement(ctx, node);
 
@@ -5230,8 +5248,9 @@ static const CBMType *c_parse_return_type_text(CBMArena *a, const char *text,
 // Entry point: single-file LSP
 // ============================================================================
 
-void cbm_run_c_lsp(CBMArena *arena, CBMFileResult *result, const char *source, int source_len,
-                   TSNode root, bool cpp_mode) {
+static void run_c_lsp(CBMArena *arena, CBMFileResult *result, const char *source, int source_len,
+                      TSNode root, bool cpp_mode, const uint32_t *primary_source_lines,
+                      size_t expanded_line_count) {
 
     CBMTypeRegistry reg;
     cbm_registry_init(&reg, arena);
@@ -5385,8 +5404,22 @@ void cbm_run_c_lsp(CBMArena *arena, CBMFileResult *result, const char *source, i
     // Initialize context and run
     CLSPContext ctx;
     c_lsp_init(&ctx, arena, source, source_len, &reg, module_qn, cpp_mode, &result->resolved_calls);
+    ctx.primary_source_lines = primary_source_lines;
+    ctx.expanded_line_count = expanded_line_count;
 
     c_lsp_process_file(&ctx, root);
+}
+
+void cbm_run_c_lsp(CBMArena *arena, CBMFileResult *result, const char *source, int source_len,
+                   TSNode root, bool cpp_mode) {
+    run_c_lsp(arena, result, source, source_len, root, cpp_mode, NULL, 0);
+}
+
+void cbm_run_c_lsp_mapped(CBMArena *arena, CBMFileResult *result, const char *source,
+                          int source_len, TSNode root, bool cpp_mode,
+                          const uint32_t *primary_source_lines, size_t expanded_line_count) {
+    run_c_lsp(arena, result, source, source_len, root, cpp_mode, primary_source_lines,
+              expanded_line_count);
 }
 
 // ============================================================================

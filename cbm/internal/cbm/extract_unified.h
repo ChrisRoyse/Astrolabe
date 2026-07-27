@@ -50,4 +50,10 @@ void handle_type_assigns(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spe
 // Definitions and imports stay as separate passes (different recursion patterns).
 void cbm_extract_unified(CBMExtractCtx *ctx);
 
+// C/C++ preprocessor second pass. It intentionally emits only calls (plus the
+// internal scope/string-constant state needed to construct those calls). The
+// caller must translate every appended expanded-buffer line through the
+// preprocessor expansion map before the file result can leave extraction.
+void cbm_extract_preprocessed_calls(CBMExtractCtx *ctx);
+
 #endif // CBM_EXTRACT_UNIFIED_H

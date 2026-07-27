@@ -54,6 +54,56 @@ int cbm_macro_extraction_enabled(void) {
     return atomic_load_explicit(&g_extract_macros, memory_order_relaxed);
 }
 
+static bool remap_preprocessed_calls(CBMFileResult *result, int calls_before,
+                                     const uint32_t *primary_source_lines,
+                                     size_t expanded_line_count, const char *rel_path) {
+    int write = calls_before;
+    int foreign_calls = 0;
+    for (int read = calls_before; read < result->calls.count; read++) {
+        CBMCall call = result->calls.items[read];
+        if (call.start_line <= 0 || (size_t)call.start_line > expanded_line_count) {
+            cbm_log_error("preprocessor.call_source_map_failed", "code",
+                          "CBM_PREPROCESS_CALL_LINE_UNMAPPED", "file",
+                          rel_path ? rel_path : "<input>", "expanded_line", "out_of_range");
+            cbm_file_result_set_error(
+                result, "CBM_PREPROCESS_CALL_LINE_UNMAPPED", "remap_preprocessed_calls",
+                "preprocessor_source_map", (size_t)(call.start_line > 0 ? call.start_line : 0),
+                "a macro-expanded call has no bounded expansion location in the parsed buffer",
+                "preserve the outermost macro expansion location for every emitted token, then "
+                "retry the complete corpus");
+            return false;
+        }
+        uint32_t source_line = primary_source_lines[call.start_line - 1];
+        if (source_line == UINT32_MAX) {
+            foreign_calls++;
+            continue;
+        }
+        if (source_line == 0) {
+            cbm_log_error("preprocessor.call_source_map_failed", "code",
+                          "CBM_PREPROCESS_CALL_ORIGIN_INVALID", "file",
+                          rel_path ? rel_path : "<input>", "expanded_line", "unmapped");
+            cbm_file_result_set_error(
+                result, "CBM_PREPROCESS_CALL_ORIGIN_INVALID", "remap_preprocessed_calls",
+                "preprocessor_source_map", (size_t)call.start_line,
+                "a macro-expanded call resolves to a generated or invalid source-map line",
+                "repair the expansion map so the call names one exact primary-file invocation "
+                "line, then retry the complete corpus");
+            return false;
+        }
+        call.start_line = (int)source_line;
+        result->calls.items[write++] = call;
+    }
+    result->calls.count = write;
+    if (foreign_calls > 0) {
+        char skipped[32];
+        snprintf(skipped, sizeof(skipped), "%d", foreign_calls);
+        cbm_log_info("preprocessor.foreign_source_calls_excluded", "file",
+                     rel_path ? rel_path : "<input>", "calls", skipped, "reason",
+                     "included_file_owned");
+    }
+    return true;
+}
+
 #define NSEC_PER_SEC 1000000000ULL
 #define USEC_TO_NSEC 1000ULL
 /* Use compat.h's cbm_clock_gettime which accepts CLOCK_MONOTONIC (value
@@ -985,31 +1035,49 @@ static CBMFileResult *cbm_extract_file_impl(const char *source, int source_len,
     }
     atomic_fetch_add(&total_lsp_ns, now_ns() - lsp_start);
 
-    // Calls extracted so far all carry ORIGINAL-source line numbers; the C/C++
-    // preprocessor second pass below appends calls with EXPANDED-source lines,
-    // which must not be used for the def line-range attribution of the bottleneck
-    // metrics. Remember the boundary.
-    int orig_calls_count = result->calls.count;
-
     // Second pass: preprocess C/C++/CUDA and extract additional macro-hidden calls.
-    // Defs keep original-source line numbers; only CALLS are extracted from expanded source.
+    // Defs keep original-source positions. The expansion map translates every
+    // appended CALL back to its exact primary-file invocation line before the
+    // result can leave this block; no other unified record kind is appended.
     if (language == CBM_LANG_C || language == CBM_LANG_CPP || language == CBM_LANG_CUDA) {
         uint64_t pp_start = now_ns();
         CBMPreprocessStatus pp_status = CBM_PREPROCESS_NO_DIRECTIVES;
         char *pp_diagnostic = NULL;
+        uint32_t *primary_source_lines = NULL;
+        size_t expanded_line_count = 0;
         char *expanded = cbm_preprocess(source, source_len, rel_path, extra_defines, include_paths,
-                                        language != CBM_LANG_C, &pp_status, &pp_diagnostic);
+                                        language != CBM_LANG_C, &pp_status, &pp_diagnostic,
+                                        &primary_source_lines, &expanded_line_count);
         if (pp_status == CBM_PREPROCESS_FAILED) {
-            cbm_log_warn("preprocessor.failed", "reason", pp_diagnostic ? pp_diagnostic : "unknown",
-                         "file", rel_path ? rel_path : "<input>");
+            cbm_log_error("preprocessor.failed", "code", "CBM_PREPROCESS_FAILED", "reason",
+                          pp_diagnostic ? pp_diagnostic : "unknown", "file",
+                          rel_path ? rel_path : "<input>");
+            cbm_file_result_set_error(
+                result, "CBM_PREPROCESS_FAILED", "cbm_preprocess", "preprocessor_source_map", 0,
+                "authoritative C-family preprocessing or expansion mapping failed; no partial "
+                "original-only graph may be persisted",
+                "inspect the exact preprocessor diagnostic, repair the source or expansion-map "
+                "contract, then retry the complete corpus");
         }
-        if (expanded) {
-            int expanded_len = (int)strlen(expanded);
-            // Record calls count before second pass
+        if (expanded && !result->has_error) {
+            size_t expanded_size = strlen(expanded);
+            if (expanded_size > INT_MAX || !primary_source_lines || expanded_line_count == 0) {
+                cbm_log_error("preprocessor.expansion_invalid", "code",
+                              "CBM_PREPROCESS_EXPANSION_INVALID", "file",
+                              rel_path ? rel_path : "<input>");
+                cbm_file_result_set_error(
+                    result, "CBM_PREPROCESS_EXPANSION_INVALID", "cbm_preprocess",
+                    "preprocessor_source_map", expanded_size,
+                    "the expanded source and its physical expansion map are incomplete or exceed "
+                    "the parser boundary",
+                    "produce one bounded map entry for every expanded physical line, then retry "
+                    "the complete corpus");
+            }
+            int expanded_len = result->has_error ? 0 : (int)expanded_size;
             int calls_before = result->calls.count;
 
             // Parse expanded source with fresh tree
-            TSParser *pp_parser = get_thread_parser(ts_lang, language);
+            TSParser *pp_parser = result->has_error ? NULL : get_thread_parser(ts_lang, language);
             if (pp_parser) {
                 ts_parser_reset(pp_parser);
                 CBMStringInput pp_input = {expanded, (uint32_t)expanded_len};
@@ -1036,27 +1104,51 @@ static CBMFileResult *cbm_extract_file_impl(const char *source, int source_len,
                         .rel_path = rel_path,
                         .module_qn = result->module_qn,
                         .root = pp_root,
+                        .string_constants = ctx.string_constants,
                     };
-                    // Re-run unified extraction on expanded source.
-                    // This adds macro-expanded calls; duplicates with original calls are
-                    // harmless (pipeline deduplicates by caller+callee).
-                    cbm_extract_unified(&pp_ctx);
+                    cbm_extract_preprocessed_calls(&pp_ctx);
 
                     // Also run LSP on expanded source for additional type-resolved
                     // calls (language is already C/C++/CUDA — checked in enclosing
                     // block). Runs in every mode.
-                    cbm_run_c_lsp(a, result, expanded, expanded_len, pp_root,
-                                  language != CBM_LANG_C);
+                    if (!result->has_error) {
+                        cbm_run_c_lsp_mapped(a, result, expanded, expanded_len, pp_root,
+                                             language != CBM_LANG_C, primary_source_lines,
+                                             expanded_line_count);
+                    }
+                    if (!result->has_error) {
+                        remap_preprocessed_calls(result, calls_before, primary_source_lines,
+                                                 expanded_line_count, rel_path);
+                    }
 
                     ts_tree_delete(pp_tree);
+                } else {
+                    cbm_file_result_set_error(
+                        result, "CBM_PREPROCESS_PARSE_FAILED", "ts_parser_parse_with_options",
+                        "preprocessor_parse", expanded_size,
+                        "the mapped preprocessor output could not be parsed; no partial "
+                        "original-only graph may be persisted",
+                        "inspect the exact expanded source and grammar, repair the parse failure, "
+                        "then retry the complete corpus");
                 }
+            } else if (!result->has_error) {
+                cbm_file_result_set_error(
+                    result, "CBM_PREPROCESS_PARSER_ALLOC_FAILED", "get_thread_parser",
+                    "preprocessor_parse", expanded_size,
+                    "the authoritative parser for mapped preprocessor output could not be "
+                    "allocated",
+                    "free memory or reduce concurrent extraction workers, then retry the "
+                    "complete corpus");
             }
-            cbm_preprocess_free(expanded);
             atomic_fetch_add(&total_files_preprocessed, 1);
-            (void)calls_before; // used for future logging
         }
+        cbm_preprocess_free(expanded);
+        cbm_preprocess_line_map_free(primary_source_lines);
         cbm_preprocess_diagnostic_free(pp_diagnostic);
         atomic_fetch_add(&total_preprocess_ns, now_ns() - pp_start);
+        if (result->has_error) {
+            goto extraction_failed;
+        }
         if (!cbm_extract_arena_ok(result, "preprocessor_atoms", rel_path)) {
             goto extraction_failed;
         }
@@ -1090,7 +1182,7 @@ static CBMFileResult *cbm_extract_file_impl(const char *source, int source_len,
         d->param_count = pc;
     }
 
-    for (int ci = 0; ci < orig_calls_count; ci++) {
+    for (int ci = 0; ci < result->calls.count; ci++) {
         const CBMCall *c = &result->calls.items[ci];
         if (!c->callee_name || c->start_line <= 0) {
             continue;

@@ -8,6 +8,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <exception>
+#include <limits>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -41,7 +42,8 @@ static bool is_name_char(char c) {
 
 static bool matches_directive(const char *name, int len) {
     static const char *const directives[] = {
-        "define", "if", "ifdef", "ifndef", "elif", NULL,
+        "define", "undef", "include", "if",    "ifdef",   "ifndef",
+        "elif",   "else",  "endif",   "error", "warning", NULL,
     };
     for (int i = 0; directives[i]; i++) {
         size_t dlen = strlen(directives[i]);
@@ -74,6 +76,107 @@ static bool source_has_preprocessor_work(const char *source, int source_len) {
             return true;
     }
     return false;
+}
+
+static bool source_has_line_control(const char *source, int source_len) {
+    for (int i = 0; i < source_len; i++) {
+        if (source[i] != '#')
+            continue;
+        bool line_prefix_is_space = true;
+        for (int p = i - 1; p >= 0 && source[p] != '\n' && source[p] != '\r'; p--) {
+            if (source[p] != ' ' && source[p] != '\t') {
+                line_prefix_is_space = false;
+                break;
+            }
+        }
+        if (!line_prefix_is_space)
+            continue;
+        int j = i + 1;
+        while (j < source_len && (source[j] == ' ' || source[j] == '\t'))
+            j++;
+        static const char directive[] = "line";
+        if (j + 4 <= source_len && strncmp(source + j, directive, 4) == 0 &&
+            (j + 4 == source_len || !is_name_char(source[j + 4])))
+            return true;
+    }
+    return false;
+}
+
+static unsigned int physical_line_count(const char *source, int source_len) {
+    unsigned int count = 1;
+    for (int i = 0; i < source_len; i++) {
+        if (source[i] == '\n') {
+            if (count == std::numeric_limits<unsigned int>::max())
+                return 0;
+            count++;
+        }
+    }
+    return count;
+}
+
+static bool parse_generated_line_directive(const std::string &line, unsigned int *line_out,
+                                           std::string *file_out) {
+    static const std::string prefix = "#line ";
+    if (line.compare(0, prefix.size(), prefix) != 0)
+        return false;
+
+    size_t pos = prefix.size();
+    if (pos >= line.size() || line[pos] < '0' || line[pos] > '9')
+        return false;
+    unsigned int value = 0;
+    while (pos < line.size() && line[pos] >= '0' && line[pos] <= '9') {
+        unsigned int digit = static_cast<unsigned int>(line[pos] - '0');
+        if (value > (std::numeric_limits<unsigned int>::max() - digit) / 10U)
+            return false;
+        value = value * 10U + digit;
+        pos++;
+    }
+    if (value == 0 || pos + 3 > line.size() || line[pos] != ' ' || line[pos + 1] != '"' ||
+        line.back() != '"')
+        return false;
+
+    *line_out = value;
+    *file_out = line.substr(pos + 2, line.size() - pos - 3);
+    return true;
+}
+
+static bool build_primary_source_line_map(const std::string &expanded,
+                                          const std::string &primary_file,
+                                          unsigned int source_line_count,
+                                          std::vector<uint32_t> *map, std::string *diagnostic) {
+    unsigned int logical_line = 1;
+    bool primary = true;
+    size_t start = 0;
+
+    for (;;) {
+        size_t end = expanded.find('\n', start);
+        std::string line =
+            expanded.substr(start, end == std::string::npos ? std::string::npos : end - start);
+        unsigned int directive_line = 0;
+        std::string directive_file;
+        if (line.compare(0, 6, "#line ") == 0) {
+            if (!parse_generated_line_directive(line, &directive_line, &directive_file)) {
+                *diagnostic = "malformed generated #line directive in preprocessor output";
+                return false;
+            }
+            map->push_back(0);
+            logical_line = directive_line;
+            primary = directive_file == primary_file;
+        } else if (!primary) {
+            map->push_back(std::numeric_limits<uint32_t>::max());
+            if (logical_line < std::numeric_limits<unsigned int>::max())
+                logical_line++;
+        } else {
+            map->push_back(logical_line <= source_line_count ? logical_line : 0);
+            if (logical_line < std::numeric_limits<unsigned int>::max())
+                logical_line++;
+        }
+
+        if (end == std::string::npos)
+            break;
+        start = end + 1;
+    }
+    return true;
 }
 
 static const char *output_type_name(simplecpp::Output::Type type) {
@@ -183,18 +286,17 @@ static std::string fatal_output_summary(const simplecpp::OutputList &outputs,
 
 extern "C" {
 
-char* cbm_preprocess(
-    const char* source, int source_len,
-    const char* filename,
-    const char** extra_defines,
-    const char** include_paths,
-    int cpp_mode,
-    CBMPreprocessStatus *status_out,
-    char **diagnostic_out
-) {
+char *cbm_preprocess(const char *source, int source_len, const char *filename,
+                     const char **extra_defines, const char **include_paths, int cpp_mode,
+                     CBMPreprocessStatus *status_out, char **diagnostic_out,
+                     uint32_t **primary_source_lines_out, size_t *expanded_line_count_out) {
     set_status(status_out, CBM_PREPROCESS_NO_DIRECTIVES);
     if (diagnostic_out)
         *diagnostic_out = NULL;
+    if (primary_source_lines_out)
+        *primary_source_lines_out = NULL;
+    if (expanded_line_count_out)
+        *expanded_line_count_out = 0;
 
     if (!source || source_len <= 0)
         return NULL;
@@ -202,8 +304,30 @@ char* cbm_preprocess(
     if (!source_has_preprocessor_work(source, source_len))
         return NULL;
 
+    if (!primary_source_lines_out || !expanded_line_count_out) {
+        set_status(status_out, CBM_PREPROCESS_FAILED);
+        set_diagnostic(diagnostic_out, "preprocessor expansion map outputs are required");
+        return NULL;
+    }
+    if (source_has_line_control(source, source_len)) {
+        set_status(status_out, CBM_PREPROCESS_FAILED);
+        set_diagnostic(diagnostic_out,
+                       "physical expansion mapping is undefined for input containing #line");
+        return NULL;
+    }
+
     try {
         simplecpp::DUI dui;
+#if defined(_WIN32)
+        // ASTROLABE currently ships only for native Windows. Compile-command
+        // defines can refine compiler-specific branches, but the host target is
+        // an authoritative baseline even when a repository has no compilation
+        // database (for example, a source-level _WIN32/#error split).
+        dui.defines.push_back("_WIN32=1");
+#if defined(_WIN64)
+        dui.defines.push_back("_WIN64=1");
+#endif
+#endif
         if (extra_defines) {
             for (int i = 0; extra_defines[i]; i++)
                 dui.defines.push_back(extra_defines[i]);
@@ -239,14 +363,45 @@ char* cbm_preprocess(
         }
 
         std::string result = output.stringify();
+        std::vector<uint32_t> primary_source_lines;
+        std::string map_diagnostic;
+        unsigned int source_lines = physical_line_count(source, source_len);
+        if (source_lines == 0 ||
+            !build_primary_source_line_map(result, files[0], source_lines, &primary_source_lines,
+                                           &map_diagnostic)) {
+            simplecpp::cleanup(filedata);
+            set_status(status_out, CBM_PREPROCESS_FAILED);
+            set_diagnostic(diagnostic_out, map_diagnostic.empty()
+                                               ? "preprocessor physical line count overflow"
+                                               : map_diagnostic);
+            return NULL;
+        }
         simplecpp::cleanup(filedata);
 
-        char* out = dup_string(result);
+        char *out = dup_string(result);
         if (!out) {
             set_status(status_out, CBM_PREPROCESS_FAILED);
             set_diagnostic(diagnostic_out, "allocation failed while copying preprocessed source");
             return NULL;
         }
+        if (primary_source_lines.size() > std::numeric_limits<size_t>::max() / sizeof(uint32_t)) {
+            free(out);
+            set_status(status_out, CBM_PREPROCESS_FAILED);
+            set_diagnostic(diagnostic_out, "preprocessor expansion map size overflow");
+            return NULL;
+        }
+        size_t map_bytes = primary_source_lines.size() * sizeof(uint32_t);
+        uint32_t *line_map = static_cast<uint32_t *>(malloc(map_bytes));
+        if (!line_map) {
+            free(out);
+            set_status(status_out, CBM_PREPROCESS_FAILED);
+            set_diagnostic(diagnostic_out,
+                           "allocation failed while copying preprocessor expansion map");
+            return NULL;
+        }
+        memcpy(line_map, primary_source_lines.data(), map_bytes);
+        *primary_source_lines_out = line_map;
+        *expanded_line_count_out = primary_source_lines.size();
         set_status(status_out, CBM_PREPROCESS_OK);
         return out;
     } catch (const std::exception &e) {
@@ -265,11 +420,15 @@ char* cbm_preprocess(
     }
 }
 
-void cbm_preprocess_free(char* expanded) {
+void cbm_preprocess_free(char *expanded) {
     free(expanded);
 }
 
-void cbm_preprocess_diagnostic_free(char* diagnostic) {
+void cbm_preprocess_line_map_free(uint32_t *primary_source_lines) {
+    free(primary_source_lines);
+}
+
+void cbm_preprocess_diagnostic_free(char *diagnostic) {
     free(diagnostic);
 }
 
