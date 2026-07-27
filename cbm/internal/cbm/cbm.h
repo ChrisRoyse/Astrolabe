@@ -642,6 +642,14 @@ CBMFileResult *cbm_extract_file(const char *source, int source_len, CBMLanguage 
                                 const char **include_paths  // NULL-terminated, or NULL
 );
 
+// Production extraction with the physical immutable-snapshot path that owns
+// source. C-family preprocessing uses source_path for the standard quoted-
+// include search rooted at the including file; graph identity remains rel_path.
+CBMFileResult *cbm_extract_file_at_path(const char *source, int source_len, CBMLanguage language,
+                                        const char *project, const char *rel_path,
+                                        const char *source_path, int64_t timeout_micros,
+                                        const char **extra_defines, const char **include_paths);
+
 /* Set the first authoritative failure on a file result. Later failures do not
  * overwrite it, so callers receive one deterministic causal diagnostic. */
 void cbm_file_result_set_error(CBMFileResult *result, const char *code, const char *operation,

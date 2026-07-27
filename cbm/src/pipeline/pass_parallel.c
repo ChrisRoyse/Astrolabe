@@ -901,8 +901,9 @@ static void extract_worker(int worker_id, void *ctx_ptr) {
 
         uint64_t file_t0 = extract_now_ns();
 
-        CBMFileResult *result = cbm_extract_file(source, source_len, fi->language, ec->project_name,
-                                                 fi->rel_path, CBM_EXTRACT_BUDGET, NULL, NULL);
+        CBMFileResult *result =
+            cbm_extract_file_at_path(source, source_len, fi->language, ec->project_name,
+                                     fi->rel_path, fi->path, CBM_EXTRACT_BUDGET, NULL, NULL);
 
         uint64_t file_elapsed_ms = (extract_now_ns() - file_t0) / PP_USEC_PER_MS;
 

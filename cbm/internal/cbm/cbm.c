@@ -678,8 +678,9 @@ static int count_params_from_signature(const char *sig) {
 
 static CBMFileResult *cbm_extract_file_impl(const char *source, int source_len,
                                             CBMLanguage language, const char *project,
-                                            const char *rel_path, int64_t timeout_micros,
-                                            const char **extra_defines, const char **include_paths);
+                                            const char *rel_path, const char *source_path,
+                                            int64_t timeout_micros, const char **extra_defines,
+                                            const char **include_paths);
 
 static void cbm_file_result_discard_atoms(CBMFileResult *result) {
     if (!result) {
@@ -802,14 +803,22 @@ static bool cbm_extract_arena_ok(CBMFileResult *result, const char *phase, const
 CBMFileResult *cbm_extract_file(const char *source, int source_len, CBMLanguage language,
                                 const char *project, const char *rel_path, int64_t timeout_micros,
                                 const char **extra_defines, const char **include_paths) {
-    return cbm_extract_file_impl(source, source_len, language, project, rel_path, timeout_micros,
-                                 extra_defines, include_paths);
+    return cbm_extract_file_impl(source, source_len, language, project, rel_path, NULL,
+                                 timeout_micros, extra_defines, include_paths);
+}
+
+CBMFileResult *cbm_extract_file_at_path(const char *source, int source_len, CBMLanguage language,
+                                        const char *project, const char *rel_path,
+                                        const char *source_path, int64_t timeout_micros,
+                                        const char **extra_defines, const char **include_paths) {
+    return cbm_extract_file_impl(source, source_len, language, project, rel_path, source_path,
+                                 timeout_micros, extra_defines, include_paths);
 }
 
 static CBMFileResult *cbm_extract_file_impl(const char *source, int source_len,
                                             CBMLanguage language, const char *project,
-                                            const char *rel_path, int64_t timeout_micros,
-                                            const char **extra_defines,
+                                            const char *rel_path, const char *source_path,
+                                            int64_t timeout_micros, const char **extra_defines,
                                             const char **include_paths) {
     // Allocate result on heap (arena inside for all string data)
     enum { SINGLE = 1 };
@@ -1045,9 +1054,11 @@ static CBMFileResult *cbm_extract_file_impl(const char *source, int source_len,
         char *pp_diagnostic = NULL;
         uint32_t *primary_source_lines = NULL;
         size_t expanded_line_count = 0;
-        char *expanded = cbm_preprocess(source, source_len, rel_path, extra_defines, include_paths,
-                                        language != CBM_LANG_C, &pp_status, &pp_diagnostic,
-                                        &primary_source_lines, &expanded_line_count);
+        const char *preprocessor_path = source_path && source_path[0] ? source_path : rel_path;
+        char *expanded =
+            cbm_preprocess(source, source_len, preprocessor_path, extra_defines, include_paths,
+                           language != CBM_LANG_C, &pp_status, &pp_diagnostic,
+                           &primary_source_lines, &expanded_line_count);
         if (pp_status == CBM_PREPROCESS_FAILED) {
             cbm_log_error("preprocessor.failed", "code", "CBM_PREPROCESS_FAILED", "reason",
                           pp_diagnostic ? pp_diagnostic : "unknown", "file",

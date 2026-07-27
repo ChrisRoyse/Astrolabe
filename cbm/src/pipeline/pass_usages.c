@@ -240,8 +240,9 @@ int cbm_pipeline_pass_usages(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *fil
                 errors++;
                 continue;
             }
-            result = cbm_extract_file(source, source_len, files[i].language, ctx->project_name, rel,
-                                      CBM_EXTRACT_BUDGET, NULL, NULL);
+            result =
+                cbm_extract_file_at_path(source, source_len, files[i].language, ctx->project_name,
+                                         rel, files[i].path, CBM_EXTRACT_BUDGET, NULL, NULL);
             free(source);
             if (!result) {
                 errors++;
