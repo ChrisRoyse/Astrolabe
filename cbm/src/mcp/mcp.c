@@ -7497,7 +7497,9 @@ static bool validate_utf8_source_file(const char *path, search_scope_result_t *r
             }
             sequence[i] = (unsigned char)next;
         }
-        if (!valid || cbm_utf8_sequence_len(sequence) != expected) {
+        /* cbm_utf8_sequence_len intentionally validates only multibyte
+         * sequences.  Non-NUL ASCII is already a complete one-byte sequence. */
+        if (!valid || (expected > SKIP_ONE && cbm_utf8_sequence_len(sequence) != expected)) {
             result->status = SEARCH_SCOPE_INVALID_SOURCE;
             snprintf(result->operation, sizeof(result->operation), "%s", "scope.validate_utf8");
             snprintf(result->detail, sizeof(result->detail),
