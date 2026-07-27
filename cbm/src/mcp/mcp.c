@@ -118,12 +118,23 @@ static char *heap_strdup(const char *s) {
     return d;
 }
 
-/* Write yyjson_mut_doc to heap-allocated JSON string.
- * ALLOW_INVALID_UNICODE: some database strings may contain non-UTF-8 bytes
- * from older indexing runs — don't fail serialization over it. */
+/* Write yyjson_mut_doc to a heap-allocated, strict UTF-8 JSON string.
+ * MCP is a UTF-8 protocol boundary.  Invalid persisted/process text must fail
+ * here with an exact diagnostic rather than leaking malformed JSON to a host
+ * that can only reject the entire response. */
 static char *yy_doc_to_str(yyjson_mut_doc *doc) {
     size_t len = 0;
-    char *s = yyjson_mut_write(doc, YYJSON_WRITE_ALLOW_INVALID_UNICODE, &len);
+    yyjson_write_err error = {0};
+    char *s = yyjson_mut_write_opts(doc, 0, NULL, &len, &error);
+    if (!s) {
+        char writer_code[CBM_SZ_32];
+        snprintf(writer_code, sizeof(writer_code), "%u", (unsigned int)error.code);
+        cbm_log_error("mcp.json_serialization_failed", "code", "CBM_MCP_JSON_SERIALIZATION_FAILED",
+                      "writer_code", writer_code, "writer_message",
+                      error.msg ? error.msg : "unknown yyjson writer failure", "remediation",
+                      "repair the invalid response field or free memory, then retry the exact "
+                      "operation");
+    }
     return s;
 }
 
@@ -255,12 +266,37 @@ char *cbm_jsonrpc_format_error(int64_t id, int code, const char *message) {
  * ══════════════════════════════════════════════════════════════════ */
 
 char *cbm_mcp_text_result(const char *text, bool is_error) {
+    if (!text) {
+        cbm_log_error("mcp.null_text_result", "code", "CBM_MCP_TEXT_RESULT_MISSING", "message",
+                      "a tool attempted to publish a missing result payload", "remediation",
+                      "inspect the preceding serialization diagnostic and retry only after the "
+                      "reported response field is repaired");
+        text = "{\"code\":\"CBM_MCP_TEXT_RESULT_MISSING\",\"message\":\"the tool could not "
+               "serialize its result payload\",\"remediation\":\"inspect the server's "
+               "CBM_MCP_JSON_SERIALIZATION_FAILED log and repair the reported field before "
+               "retrying\"}";
+        is_error = true;
+    }
     yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    if (!doc) {
+        cbm_log_error("mcp.result_envelope_allocation_failed", "code",
+                      "CBM_MCP_RESULT_ENVELOPE_ALLOCATION_FAILED", "operation",
+                      "yyjson_mut_doc_new", "remediation", "free memory and retry the exact call");
+        return NULL;
+    }
     yyjson_mut_val *root = yyjson_mut_obj(doc);
-    yyjson_mut_doc_set_root(doc, root);
-
     yyjson_mut_val *content = yyjson_mut_arr(doc);
     yyjson_mut_val *item = yyjson_mut_obj(doc);
+    if (!root || !content || !item) {
+        cbm_log_error("mcp.result_envelope_allocation_failed", "code",
+                      "CBM_MCP_RESULT_ENVELOPE_ALLOCATION_FAILED", "operation",
+                      "allocate_result_values", "remediation",
+                      "free memory and retry the exact call");
+        yyjson_mut_doc_free(doc);
+        return NULL;
+    }
+    yyjson_mut_doc_set_root(doc, root);
+
     yyjson_mut_obj_add_str(doc, item, "type", "text");
     yyjson_mut_obj_add_str(doc, item, "text", text ? text : "");
     yyjson_mut_arr_add_val(content, item);
@@ -6540,6 +6576,7 @@ static char *build_grep_cmd(bool use_regex, const char *file_pattern, const char
     const char *with_filter =
         "powershell -NoProfile -NonInteractive -Command \"$ErrorActionPreference = 'Stop'; "
         "$utf8 = [Text.UTF8Encoding]::new($false, $true); "
+        "[Console]::OutputEncoding = $utf8; "
         "$pat = [IO.File]::ReadAllText('%s', $utf8); "
         "Get-Content -LiteralPath '%s' -Encoding UTF8 | ForEach-Object { "
         "Select-String -LiteralPath $_ -Pattern $pat%s -ErrorAction Stop } "
@@ -6549,6 +6586,7 @@ static char *build_grep_cmd(bool use_regex, const char *file_pattern, const char
     const char *without_filter =
         "powershell -NoProfile -NonInteractive -Command \"$ErrorActionPreference = 'Stop'; "
         "$utf8 = [Text.UTF8Encoding]::new($false, $true); "
+        "[Console]::OutputEncoding = $utf8; "
         "$pat = [IO.File]::ReadAllText('%s', $utf8); "
         "Get-Content -LiteralPath '%s' -Encoding UTF8 | ForEach-Object { "
         "Select-String -LiteralPath $_ -Pattern $pat%s -ErrorAction Stop } "
@@ -6665,7 +6703,13 @@ static source_verify_status_t attach_result_source(yyjson_mut_doc *doc, yyjson_m
     }
 
     yyjson_mut_obj_add_str(doc, item, "atom_id", r->atom_id);
-    yyjson_mut_obj_add_str(doc, item, "file_sha256", verified.current_sha256);
+    if (!yyjson_mut_obj_add_strcpy(doc, item, "file_sha256", verified.current_sha256)) {
+        verified_source_free(&verified);
+        return source_failure(failure, SOURCE_VERIFY_ERROR, "CBM_SEARCH_SERIALIZATION_FAILED",
+                              "file_identity_copy_failed", "response.copy_file_identity",
+                              "the verified file identity could not be copied into the response",
+                              0);
+    }
     yyjson_mut_obj_add_str(doc, item, "source_sha256", r->source_sha256);
     yyjson_mut_obj_add_uint(doc, item, "start_byte", r->start_byte);
     yyjson_mut_obj_add_uint(doc, item, "end_byte", r->end_byte);
@@ -7106,8 +7150,25 @@ static grep_match_t *collect_grep_matches(FILE *fp, const char *root_path, size_
             free_grep_matches(matches, count);
             return NULL;
         }
-        char *path = heap_strdup(yyjson_get_str(path_value));
-        char *content = heap_strdup(yyjson_get_str(content_value));
+        const char *path_text = yyjson_get_str(path_value);
+        const char *content_text = yyjson_get_str(content_value);
+        size_t path_length = yyjson_get_len(path_value);
+        size_t content_length = yyjson_get_len(content_value);
+        if (!source_bytes_are_utf8((const uint8_t *)path_text, path_length) ||
+            !source_bytes_are_utf8((const uint8_t *)content_text, content_length)) {
+            result->status = SEARCH_COLLECT_MALFORMED;
+            snprintf(result->operation, sizeof(result->operation), "%s",
+                     "search.validate_process_encoding");
+            snprintf(result->detail, sizeof(result->detail),
+                     "search output record %d contains non-UTF-8 or embedded-NUL path/content",
+                     count + SKIP_ONE);
+            yyjson_doc_free(doc);
+            free(record);
+            free_grep_matches(matches, count);
+            return NULL;
+        }
+        char *path = heap_strdup(path_text);
+        char *content = heap_strdup(content_text);
         yyjson_doc_free(doc);
 #else
         char *sep1 = strchr(record, ':');
