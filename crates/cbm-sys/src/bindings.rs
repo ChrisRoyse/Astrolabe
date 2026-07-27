@@ -2516,6 +2516,24 @@ impl Default for cbm_file_hash_t {
         }
     }
 }
+pub const CBM_FILE_SHA256_CAPACITY: _bindgen_ty_4 = 65;
+pub type _bindgen_ty_4 = ::std::os::raw::c_int;
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct cbm_file_identity_t {
+    pub sha256: [::std::os::raw::c_char; 65usize],
+    pub mtime_ns: i64,
+    pub size: i64,
+}
+impl Default for cbm_file_identity_t {
+    fn default() -> Self {
+        let mut s = ::std::mem::MaybeUninit::<Self>::uninit();
+        unsafe {
+            ::std::ptr::write_bytes(s.as_mut_ptr(), 0, 1);
+            s.assume_init()
+        }
+    }
+}
 unsafe extern "C" {
     pub fn cbm_store_find_nodes_by_file_overlap(
         s: *mut cbm_store_t,
@@ -3138,6 +3156,14 @@ unsafe extern "C" {
         project: *const ::std::os::raw::c_char,
         out: *mut *mut cbm_file_hash_t,
         count: *mut ::std::os::raw::c_int,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn cbm_store_get_file_identity(
+        s: *mut cbm_store_t,
+        project: *const ::std::os::raw::c_char,
+        rel_path: *const ::std::os::raw::c_char,
+        out: *mut cbm_file_identity_t,
     ) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {

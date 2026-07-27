@@ -58,6 +58,8 @@ enum {
 #include "foundation/compat_thread.h"
 #include "foundation/log.h"
 #include "foundation/limits.h"
+#include "foundation/sha256.h"
+#include "foundation/win_utf8.h"
 #include "mcp/index_supervisor.h"
 #include "foundation/str_util.h"
 #include "foundation/compat_regex.h"
@@ -69,6 +71,10 @@ enum {
 #include <direct.h>
 #include <io.h>
 #include <process.h>
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
 #define getpid _getpid
 #else
 #include <unistd.h>
@@ -86,9 +92,6 @@ enum {
 #include <errno.h>
 
 /* ── Constants ────────────────────────────────────────────────── */
-
-/* Default snippet fallback line count */
-#define SNIPPET_DEFAULT_LINES 50
 
 /* Idle store eviction: close cached project store after this many seconds
  * of inactivity to free SQLite memory during idle periods. */
@@ -4441,103 +4444,8 @@ trace_failed:
 /* ── Helper: free heap fields of a stack-allocated node ────────── */
 
 static void free_node_contents(cbm_node_t *n) {
-    safe_str_free(&n->project);
-    safe_str_free(&n->label);
-    safe_str_free(&n->name);
-    safe_str_free(&n->qualified_name);
-    safe_str_free(&n->file_path);
-    safe_str_free(&n->properties_json);
+    cbm_node_free_fields(n);
     memset(n, 0, sizeof(*n));
-}
-
-/* ── Helper: read lines [start, end] from a file ─────────────── */
-
-static char *read_file_lines(const char *path, int start, int end) {
-    FILE *fp = cbm_fopen(path, "rb");
-    if (!fp) {
-        return NULL;
-    }
-
-    size_t cap = CBM_SZ_4K;
-    char *buf = malloc(cap);
-    if (!buf) {
-        fclose(fp);
-        errno = ENOMEM;
-        return NULL;
-    }
-    size_t len = 0;
-    buf[0] = '\0';
-
-    int lineno = SKIP_ONE;
-    bool failed = false;
-    for (;;) {
-        int ch = fgetc(fp);
-        if (ch == EOF) {
-            if (ferror(fp)) {
-                failed = true;
-            }
-            break;
-        }
-        if (ch == '\0') {
-            errno = EILSEQ;
-            failed = true;
-            break;
-        }
-        if (lineno >= start && lineno <= end) {
-            if (len + MCP_SEPARATOR > cap) {
-                size_t next = cap * PAIR_LEN;
-                if (next <= cap) {
-                    errno = ENOMEM;
-                    failed = true;
-                    break;
-                }
-                char *grown = realloc(buf, next);
-                if (!grown) {
-                    errno = ENOMEM;
-                    failed = true;
-                    break;
-                }
-                buf = grown;
-                cap = next;
-            }
-            buf[len++] = (char)ch;
-            buf[len] = '\0';
-        }
-        if (ch == '\n') {
-            if (lineno == end) {
-                break;
-            }
-            if (lineno == INT_MAX) {
-                errno = EOVERFLOW;
-                failed = true;
-                break;
-            }
-            lineno++;
-        }
-    }
-
-    if (fclose(fp) != 0) {
-        failed = true;
-    }
-    if (failed || len == 0) {
-        free(buf);
-        return NULL;
-    }
-    const unsigned char *cursor = (const unsigned char *)buf;
-    while (*cursor) {
-        if (*cursor <= 0x7f) {
-            cursor++;
-            continue;
-        }
-        int sequence_len = cbm_utf8_sequence_len(cursor);
-        if (sequence_len <= 0) {
-            free(buf);
-            errno = EILSEQ;
-            return NULL;
-        }
-        cursor += sequence_len;
-    }
-    return buf;
 }
 
 /* ── Helper: get project root_path from store ─────────────────── */
@@ -5513,18 +5421,10 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
 
 /* ── get_code_snippet ─────────────────────────────────────────── */
 
-/* Copy a node from an array into a heap-allocated standalone node. */
-static void copy_node(const cbm_node_t *src, cbm_node_t *dst) {
-    dst->id = src->id;
-    dst->project = heap_strdup(src->project);
-    dst->label = heap_strdup(src->label);
-    dst->name = heap_strdup(src->name);
-    dst->atom_id = heap_strdup(src->atom_id);
-    dst->qualified_name = heap_strdup(src->qualified_name);
-    dst->file_path = heap_strdup(src->file_path);
-    dst->start_line = src->start_line;
-    dst->end_line = src->end_line;
-    dst->properties_json = src->properties_json ? heap_strdup(src->properties_json) : NULL;
+/* Transfer a complete exact-source node out of a store-owned result array. */
+static void move_node(cbm_node_t *src, cbm_node_t *dst) {
+    *dst = *src;
+    memset(src, 0, sizeof(*src));
 }
 
 /* Build a JSON suggestions response for ambiguous or fuzzy results. */
@@ -5611,8 +5511,8 @@ static yyjson_doc *enrich_node_properties(yyjson_mut_doc *doc, yyjson_mut_val *o
 /* True only when abs_path, after full filesystem resolution (collapsing `..` AND
  * following symlinks/junctions to their real target), stays within root_path. This
  * is the single containment guard every MCP file-read sink must pass before reading
- * a file into a tool response: both the snippet path (resolve_snippet_source) and
- * the search path (attach_result_source) route through it, so a result whose
+ * a file into a tool response: both exact snippet verification and search source
+ * enrichment route through it, so a result whose
  * indexed path escapes the project root — via a `..` segment, or a symlink /
  * Windows junction picked up during discovery — is never read back out.
  *
@@ -5665,90 +5565,559 @@ bool cbm_path_within_root(const char *root_path, const char *abs_path) {
     return within;
 }
 
-static char *resolve_snippet_source(const char *root_path, const char *file_path, int start,
-                                    int end, char **out_abs_path) {
-    *out_abs_path = NULL;
-    if (!root_path || !file_path) {
-        return NULL;
-    }
-    size_t apsz = strlen(root_path) + strlen(file_path) + MCP_SEPARATOR;
-    char *abs_path = malloc(apsz);
-    snprintf(abs_path, apsz, "%s/%s", root_path, file_path);
-
-    *out_abs_path = abs_path;
-    if (cbm_path_within_root(root_path, abs_path)) {
-        return read_file_lines(abs_path, start, end);
-    }
-    return NULL;
-}
-
 static bool utf8_is_cont(unsigned char c) {
     return (c & 0xC0) == 0x80;
 }
 
-static char *sanitize_utf8_lossy(const char *s) {
+static bool source_bytes_are_utf8(const uint8_t *bytes, size_t len) {
     enum {
-        UTF8_REPLACEMENT_LEN = 3,
         UTF8_THREE_BYTE_LEN = 3,
         UTF8_FOUR_BYTE_LEN = 4,
         UTF8_FOURTH_BYTE = 3,
     };
-    if (!s) {
-        return NULL;
+    if (!bytes && len > 0) {
+        return false;
     }
-    size_t len = strlen(s);
-    if (len > (((size_t)-1) - SKIP_ONE) / UTF8_REPLACEMENT_LEN) {
-        return NULL;
-    }
-    char *out = malloc(len * UTF8_REPLACEMENT_LEN + SKIP_ONE);
-    if (!out) {
-        return NULL;
-    }
-
-    const unsigned char *p = (const unsigned char *)s;
-    const unsigned char *end = p + len;
-    unsigned char *dst = (unsigned char *)out;
-    while (p < end) {
-        unsigned char c = *p;
+    size_t at = 0;
+    while (at < len) {
+        unsigned char c = bytes[at];
         size_t n = 0;
-        if (c < 0x80) {
+        if (c == '\0') {
+            return false;
+        } else if (c < 0x80) {
             n = 1;
-        } else if (c >= 0xC2 && c <= 0xDF && p + 1 < end && utf8_is_cont(p[1])) {
+        } else if (c >= 0xC2 && c <= 0xDF && len - at >= 2 && utf8_is_cont(bytes[at + 1])) {
             n = 2;
-        } else if (c == 0xE0 && p + 2 < end && p[1] >= 0xA0 && p[1] <= 0xBF && utf8_is_cont(p[2])) {
+        } else if (c == 0xE0 && len - at >= UTF8_THREE_BYTE_LEN && bytes[at + 1] >= 0xA0 &&
+                   bytes[at + 1] <= 0xBF && utf8_is_cont(bytes[at + 2])) {
             n = UTF8_THREE_BYTE_LEN;
-        } else if (c >= 0xE1 && c <= 0xEC && p + 2 < end && utf8_is_cont(p[1]) &&
-                   utf8_is_cont(p[2])) {
+        } else if (c >= 0xE1 && c <= 0xEC && len - at >= UTF8_THREE_BYTE_LEN &&
+                   utf8_is_cont(bytes[at + 1]) && utf8_is_cont(bytes[at + 2])) {
             n = UTF8_THREE_BYTE_LEN;
-        } else if (c == 0xED && p + 2 < end && p[1] >= 0x80 && p[1] <= 0x9F && utf8_is_cont(p[2])) {
+        } else if (c == 0xED && len - at >= UTF8_THREE_BYTE_LEN && bytes[at + 1] >= 0x80 &&
+                   bytes[at + 1] <= 0x9F && utf8_is_cont(bytes[at + 2])) {
             n = UTF8_THREE_BYTE_LEN;
-        } else if (c >= 0xEE && c <= 0xEF && p + 2 < end && utf8_is_cont(p[1]) &&
-                   utf8_is_cont(p[2])) {
+        } else if (c >= 0xEE && c <= 0xEF && len - at >= UTF8_THREE_BYTE_LEN &&
+                   utf8_is_cont(bytes[at + 1]) && utf8_is_cont(bytes[at + 2])) {
             n = UTF8_THREE_BYTE_LEN;
-        } else if (c == 0xF0 && p + UTF8_FOURTH_BYTE < end && p[1] >= 0x90 && p[1] <= 0xBF &&
-                   utf8_is_cont(p[2]) && utf8_is_cont(p[UTF8_FOURTH_BYTE])) {
+        } else if (c == 0xF0 && len - at >= UTF8_FOUR_BYTE_LEN && bytes[at + 1] >= 0x90 &&
+                   bytes[at + 1] <= 0xBF && utf8_is_cont(bytes[at + 2]) &&
+                   utf8_is_cont(bytes[at + UTF8_FOURTH_BYTE])) {
             n = UTF8_FOUR_BYTE_LEN;
-        } else if (c >= 0xF1 && c <= 0xF3 && p + UTF8_FOURTH_BYTE < end && utf8_is_cont(p[1]) &&
-                   utf8_is_cont(p[2]) && utf8_is_cont(p[UTF8_FOURTH_BYTE])) {
+        } else if (c >= 0xF1 && c <= 0xF3 && len - at >= UTF8_FOUR_BYTE_LEN &&
+                   utf8_is_cont(bytes[at + 1]) && utf8_is_cont(bytes[at + 2]) &&
+                   utf8_is_cont(bytes[at + UTF8_FOURTH_BYTE])) {
             n = UTF8_FOUR_BYTE_LEN;
-        } else if (c == 0xF4 && p + UTF8_FOURTH_BYTE < end && p[1] >= 0x80 && p[1] <= 0x8F &&
-                   utf8_is_cont(p[2]) && utf8_is_cont(p[UTF8_FOURTH_BYTE])) {
+        } else if (c == 0xF4 && len - at >= UTF8_FOUR_BYTE_LEN && bytes[at + 1] >= 0x80 &&
+                   bytes[at + 1] <= 0x8F && utf8_is_cont(bytes[at + 2]) &&
+                   utf8_is_cont(bytes[at + UTF8_FOURTH_BYTE])) {
             n = UTF8_FOUR_BYTE_LEN;
         }
+        if (n == 0) {
+            return false;
+        }
+        at += n;
+    }
+    return true;
+}
 
-        if (n > 0) {
-            memcpy(dst, p, n);
-            dst += n;
-            p += n;
-        } else {
-            *dst++ = 0xEF;
-            *dst++ = 0xBF;
-            *dst++ = 0xBD;
-            p++;
+typedef enum {
+    SOURCE_VERIFY_OK = 0,
+    SOURCE_VERIFY_DRIFT = 1,
+    SOURCE_VERIFY_ERROR = 2,
+} source_verify_status_t;
+
+typedef struct {
+    char code[CBM_SZ_64];
+    char reason[CBM_SZ_64];
+    char operation[CBM_SZ_64];
+    char detail[CBM_SZ_512];
+    char project[CBM_SZ_256];
+    char atom_id[CBM_FILE_SHA256_CAPACITY];
+    char file_path[CBM_STORE_VERIFY_PATH_MAX];
+    char absolute_path[CBM_STORE_VERIFY_PATH_MAX];
+    cbm_file_identity_t indexed_file;
+    bool current_exists;
+    int64_t current_size;
+    int64_t current_mtime_ns;
+    bool current_sha256_present;
+    char current_sha256[CBM_FILE_SHA256_CAPACITY];
+    bool current_span_sha256_present;
+    char current_span_sha256[CBM_FILE_SHA256_CAPACITY];
+    char indexed_source_sha256[CBM_FILE_SHA256_CAPACITY];
+    uint64_t start_byte;
+    uint64_t end_byte;
+    uint64_t source_len;
+    uint32_t native_error;
+} source_verification_failure_t;
+
+typedef struct {
+    char *absolute_path;
+    uint8_t *bytes;
+    size_t len;
+    cbm_file_identity_t indexed_file;
+    int64_t current_mtime_ns;
+    char current_sha256[CBM_FILE_SHA256_CAPACITY];
+} verified_source_t;
+
+static void verified_source_free(verified_source_t *source) {
+    if (!source) {
+        return;
+    }
+    free(source->absolute_path);
+    free(source->bytes);
+    memset(source, 0, sizeof(*source));
+}
+
+static bool is_lower_hex_sha256(const char *value) {
+    if (!value || strlen(value) != CBM_SHA256_HEX_LEN) {
+        return false;
+    }
+    for (size_t i = 0; i < CBM_SHA256_HEX_LEN; i++) {
+        if (!((value[i] >= '0' && value[i] <= '9') || (value[i] >= 'a' && value[i] <= 'f'))) {
+            return false;
         }
     }
-    *dst = '\0';
-    return out;
+    return true;
+}
+
+static void source_failure_init(source_verification_failure_t *failure, const char *project,
+                                const cbm_node_t *node) {
+    memset(failure, 0, sizeof(*failure));
+    snprintf(failure->project, sizeof(failure->project), "%s", project ? project : "");
+    snprintf(failure->atom_id, sizeof(failure->atom_id), "%s",
+             node && node->atom_id ? node->atom_id : "");
+    snprintf(failure->file_path, sizeof(failure->file_path), "%s",
+             node && node->file_path ? node->file_path : "");
+    snprintf(failure->indexed_source_sha256, sizeof(failure->indexed_source_sha256), "%s",
+             node && node->source_sha256 ? node->source_sha256 : "");
+    if (node) {
+        failure->start_byte = node->start_byte;
+        failure->end_byte = node->end_byte;
+        failure->source_len = node->source_len;
+    }
+}
+
+static source_verify_status_t source_failure(source_verification_failure_t *failure,
+                                             source_verify_status_t status, const char *code,
+                                             const char *reason, const char *operation,
+                                             const char *detail, uint32_t native_error) {
+    if (!detail) {
+        detail = "the source verifier did not receive a storage diagnostic";
+    }
+    snprintf(failure->code, sizeof(failure->code), "%s", code);
+    snprintf(failure->reason, sizeof(failure->reason), "%s", reason);
+    snprintf(failure->operation, sizeof(failure->operation), "%s", operation);
+    snprintf(failure->detail, sizeof(failure->detail), "%s", detail);
+    failure->native_error = native_error;
+    char native_buf[CBM_SZ_32];
+    char indexed_size_buf[CBM_SZ_32];
+    char current_size_buf[CBM_SZ_32];
+    snprintf(native_buf, sizeof(native_buf), "%lu", (unsigned long)native_error);
+    snprintf(indexed_size_buf, sizeof(indexed_size_buf), "%lld",
+             (long long)failure->indexed_file.size);
+    snprintf(current_size_buf, sizeof(current_size_buf), "%lld", (long long)failure->current_size);
+    cbm_log_error("source.verify_refused", "code", code, "reason", reason, "operation", operation,
+                  "project", failure->project, "atom_id", failure->atom_id, "file_path",
+                  failure->file_path, "indexed_file_sha256", failure->indexed_file.sha256,
+                  "current_file_sha256",
+                  failure->current_sha256_present ? failure->current_sha256 : "unavailable",
+                  "indexed_size", indexed_size_buf, "current_size", current_size_buf,
+                  "native_error", native_buf, "message", detail, "remediation",
+                  "re-index the exact current repository revision, then retry the same atom_id");
+    return status;
+}
+
+static char *source_refusal_result(const source_verification_failure_t *failure) {
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    yyjson_mut_val *root = doc ? yyjson_mut_obj(doc) : NULL;
+    if (!doc || !root) {
+        if (doc) {
+            yyjson_mut_doc_free(doc);
+        }
+        return cbm_mcp_text_result(
+            "{\"code\":\"CBM_SOURCE_REFUSAL_SERIALIZATION_FAILED\",\"message\":\"source "
+            "refusal could not be serialized\",\"remediation\":\"free memory and retry\"}",
+            true);
+    }
+    yyjson_mut_doc_set_root(doc, root);
+    yyjson_mut_obj_add_str(doc, root, "code", failure->code);
+    yyjson_mut_obj_add_str(doc, root, "message",
+                           strcmp(failure->code, "ASTRO_SOURCE_DRIFT") == 0
+                               ? "indexed source identity does not match the current file"
+                               : "source identity could not be verified");
+    yyjson_mut_obj_add_str(
+        doc, root, "remediation",
+        "re-index the exact current repository revision, then retry the same "
+        "atom_id; inspect the recorded operation and native error if re-indexing "
+        "does not resolve the refusal");
+    yyjson_mut_obj_add_str(doc, root, "reason", failure->reason);
+    yyjson_mut_obj_add_str(doc, root, "failed_operation", failure->operation);
+    yyjson_mut_obj_add_str(doc, root, "detail", failure->detail);
+    yyjson_mut_obj_add_str(doc, root, "trust", "refused");
+    yyjson_mut_obj_add_str(doc, root, "freshness", "drifted_or_unverifiable");
+    yyjson_mut_obj_add_str(doc, root, "provenance",
+                           "SQLite file_hashes + SQLite nodes exact-source tuple + current file "
+                           "handle readback");
+    yyjson_mut_obj_add_str(doc, root, "project", failure->project);
+    yyjson_mut_obj_add_str(doc, root, "atom_id", failure->atom_id);
+    yyjson_mut_obj_add_str(doc, root, "file_path", failure->file_path);
+    yyjson_mut_obj_add_str(doc, root, "absolute_path", failure->absolute_path);
+    yyjson_mut_obj_add_uint(doc, root, "native_error", failure->native_error);
+
+    yyjson_mut_val *indexed = yyjson_mut_obj(doc);
+    yyjson_mut_obj_add_str(doc, indexed, "file_sha256", failure->indexed_file.sha256);
+    yyjson_mut_obj_add_sint(doc, indexed, "file_size", failure->indexed_file.size);
+    yyjson_mut_obj_add_sint(doc, indexed, "file_mtime_ns", failure->indexed_file.mtime_ns);
+    yyjson_mut_obj_add_str(doc, indexed, "source_sha256", failure->indexed_source_sha256);
+    yyjson_mut_obj_add_uint(doc, indexed, "source_start_byte", failure->start_byte);
+    yyjson_mut_obj_add_uint(doc, indexed, "source_end_byte", failure->end_byte);
+    yyjson_mut_obj_add_uint(doc, indexed, "source_bytes", failure->source_len);
+    yyjson_mut_obj_add_val(doc, root, "indexed", indexed);
+
+    yyjson_mut_val *current = yyjson_mut_obj(doc);
+    yyjson_mut_obj_add_bool(doc, current, "exists", failure->current_exists);
+    yyjson_mut_obj_add_sint(doc, current, "file_size", failure->current_size);
+    yyjson_mut_obj_add_sint(doc, current, "file_mtime_ns", failure->current_mtime_ns);
+    if (failure->current_sha256_present) {
+        yyjson_mut_obj_add_str(doc, current, "file_sha256", failure->current_sha256);
+    } else {
+        yyjson_mut_obj_add_null(doc, current, "file_sha256");
+    }
+    if (failure->current_span_sha256_present) {
+        yyjson_mut_obj_add_str(doc, current, "span_sha256", failure->current_span_sha256);
+    } else {
+        yyjson_mut_obj_add_null(doc, current, "span_sha256");
+    }
+    yyjson_mut_obj_add_val(doc, root, "current", current);
+
+    char *json = yy_doc_to_str(doc);
+    yyjson_mut_doc_free(doc);
+    if (!json) {
+        return cbm_mcp_text_result(
+            "{\"code\":\"CBM_SOURCE_REFUSAL_SERIALIZATION_FAILED\",\"message\":\"source "
+            "refusal serialization failed\",\"remediation\":\"free memory and retry\"}",
+            true);
+    }
+    char *result = cbm_mcp_text_result(json, true);
+    free(json);
+    return result;
+}
+
+#ifdef _WIN32
+typedef struct {
+    FILE_ID_INFO id;
+    FILE_BASIC_INFO basic;
+    FILE_STANDARD_INFO standard;
+} mcp_file_identity_t;
+
+static bool mcp_get_file_identity(HANDLE handle, mcp_file_identity_t *identity) {
+    return GetFileInformationByHandleEx(handle, FileIdInfo, &identity->id, sizeof(identity->id)) &&
+           GetFileInformationByHandleEx(handle, FileBasicInfo, &identity->basic,
+                                        sizeof(identity->basic)) &&
+           GetFileInformationByHandleEx(handle, FileStandardInfo, &identity->standard,
+                                        sizeof(identity->standard));
+}
+
+static bool mcp_file_identity_equal(const mcp_file_identity_t *a, const mcp_file_identity_t *b) {
+    return a->id.VolumeSerialNumber == b->id.VolumeSerialNumber &&
+           memcmp(a->id.FileId.Identifier, b->id.FileId.Identifier,
+                  sizeof(a->id.FileId.Identifier)) == 0 &&
+           a->standard.EndOfFile.QuadPart == b->standard.EndOfFile.QuadPart &&
+           a->basic.LastWriteTime.QuadPart == b->basic.LastWriteTime.QuadPart &&
+           a->basic.ChangeTime.QuadPart == b->basic.ChangeTime.QuadPart &&
+           a->standard.Directory == b->standard.Directory &&
+           a->standard.DeletePending == b->standard.DeletePending;
+}
+
+static int64_t mcp_filetime_to_unix_ns(LONGLONG ticks) {
+    const LONGLONG epoch_delta = 116444736000000000LL;
+    if (ticks < epoch_delta || ticks - epoch_delta > INT64_MAX / 100LL) {
+        return 0;
+    }
+    return (int64_t)((ticks - epoch_delta) * 100LL);
+}
+
+static bool mcp_windows_missing_error(DWORD error) {
+    return error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND;
+}
+#endif
+
+static source_verify_status_t verify_node_source(cbm_store_t *store, const char *project,
+                                                 const char *root_path, const cbm_node_t *node,
+                                                 verified_source_t *verified,
+                                                 source_verification_failure_t *failure) {
+    memset(verified, 0, sizeof(*verified));
+    source_failure_init(failure, project, node);
+    if (!store || !project || !root_path) {
+        return source_failure(
+            failure, SOURCE_VERIFY_ERROR, "CBM_SOURCE_VERIFICATION_FAILED",
+            "project_source_context_unavailable", "source.resolve_project_context",
+            "the verified project store or persisted project root is unavailable", 0);
+    }
+    if (!node || !node->file_path || !node->source_present ||
+        !is_lower_hex_sha256(node->source_sha256) || node->end_byte < node->start_byte ||
+        node->end_byte - node->start_byte != node->source_len ||
+        (node->source_len > 0 && !node->source_bytes)) {
+        return source_failure(failure, SOURCE_VERIFY_ERROR, "CBM_SOURCE_IDENTITY_INVALID",
+                              "indexed_source_tuple_invalid", "source.validate_indexed_tuple",
+                              "the node does not carry a complete canonical exact-source tuple", 0);
+    }
+    char persisted_source_sha256[CBM_FILE_SHA256_CAPACITY];
+    cbm_sha256_hex(node->source_bytes, node->source_len, persisted_source_sha256);
+    if (strcmp(persisted_source_sha256, node->source_sha256) != 0) {
+        return source_failure(failure, SOURCE_VERIFY_ERROR, "CBM_SOURCE_IDENTITY_INVALID",
+                              "indexed_source_blob_hash_mismatch", "source.hash_indexed_blob",
+                              "the persisted source BLOB does not match its persisted SHA-256", 0);
+    }
+
+    int identity_rc =
+        cbm_store_get_file_identity(store, project, node->file_path, &failure->indexed_file);
+    if (identity_rc != CBM_STORE_OK) {
+        const char *detail = identity_rc == CBM_STORE_NOT_FOUND
+                                 ? "the node file has no persisted file_hashes identity row"
+                                 : cbm_store_error(store);
+        return source_failure(failure, SOURCE_VERIFY_ERROR, "CBM_SOURCE_IDENTITY_INVALID",
+                              identity_rc == CBM_STORE_NOT_FOUND
+                                  ? "indexed_file_identity_missing"
+                                  : "indexed_file_identity_unreadable",
+                              "source.query_file_identity", detail, 0);
+    }
+    if (!is_lower_hex_sha256(failure->indexed_file.sha256) || failure->indexed_file.size < 0) {
+        return source_failure(failure, SOURCE_VERIFY_ERROR, "CBM_SOURCE_IDENTITY_INVALID",
+                              "indexed_file_identity_invalid", "source.validate_file_identity",
+                              "the persisted file identity has an invalid digest or size", 0);
+    }
+
+    size_t root_len = strlen(root_path);
+    size_t file_len = strlen(node->file_path);
+    if (root_len > SIZE_MAX - file_len - MCP_SEPARATOR) {
+        return source_failure(failure, SOURCE_VERIFY_ERROR, "CBM_SOURCE_VERIFICATION_FAILED",
+                              "source_path_overflow", "source.build_path",
+                              "the indexed source path exceeds addressable memory", 0);
+    }
+    size_t abs_len = root_len + file_len + MCP_SEPARATOR;
+    verified->absolute_path = malloc(abs_len);
+    if (!verified->absolute_path) {
+        return source_failure(failure, SOURCE_VERIFY_ERROR, "CBM_SOURCE_VERIFICATION_FAILED",
+                              "source_path_allocation_failed", "source.allocate_path",
+                              "the absolute source path could not be allocated", 0);
+    }
+    snprintf(verified->absolute_path, abs_len, "%s/%s", root_path, node->file_path);
+    snprintf(failure->absolute_path, sizeof(failure->absolute_path), "%s", verified->absolute_path);
+
+#ifdef _WIN32
+    wchar_t *wide_path = cbm_utf8_to_wide_path(verified->absolute_path);
+    if (!wide_path) {
+        uint32_t error = (uint32_t)GetLastError();
+        verified_source_free(verified);
+        return source_failure(failure, SOURCE_VERIFY_ERROR, "CBM_SOURCE_VERIFICATION_FAILED",
+                              "source_path_encoding_failed", "source.widen_path",
+                              "the UTF-8 source path could not be converted to a Windows path",
+                              error);
+    }
+    HANDLE handle = CreateFileW(wide_path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING,
+                                FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, NULL);
+    free(wide_path);
+    if (handle == INVALID_HANDLE_VALUE) {
+        DWORD error = GetLastError();
+        verified_source_free(verified);
+        if (mcp_windows_missing_error(error)) {
+            return source_failure(failure, SOURCE_VERIFY_DRIFT, "ASTRO_SOURCE_DRIFT",
+                                  "current_file_missing", "source.open_current",
+                                  "the indexed source path is absent from the current repository",
+                                  (uint32_t)error);
+        }
+        return source_failure(failure, SOURCE_VERIFY_ERROR, "CBM_SOURCE_VERIFICATION_FAILED",
+                              "current_file_open_failed", "source.open_current",
+                              "the current source file could not be opened for stable readback",
+                              (uint32_t)error);
+    }
+    failure->current_exists = true;
+    mcp_file_identity_t before = {0};
+    if (!mcp_get_file_identity(handle, &before)) {
+        DWORD error = GetLastError();
+        CloseHandle(handle);
+        verified_source_free(verified);
+        return source_failure(
+            failure, SOURCE_VERIFY_ERROR, "CBM_SOURCE_VERIFICATION_FAILED",
+            "current_file_identity_unreadable", "source.inspect_current",
+            "the current file identity could not be read from its retained handle",
+            (uint32_t)error);
+    }
+    failure->current_size = before.standard.EndOfFile.QuadPart;
+    failure->current_mtime_ns = mcp_filetime_to_unix_ns(before.basic.LastWriteTime.QuadPart);
+    if (before.standard.Directory || before.standard.DeletePending ||
+        before.standard.EndOfFile.QuadPart < 0) {
+        CloseHandle(handle);
+        verified_source_free(verified);
+        return source_failure(failure, SOURCE_VERIFY_DRIFT, "ASTRO_SOURCE_DRIFT",
+                              "current_path_not_regular_file", "source.inspect_current",
+                              "the indexed path no longer resolves to a stable regular file", 0);
+    }
+    if (!cbm_path_within_root(root_path, verified->absolute_path)) {
+        CloseHandle(handle);
+        verified_source_free(verified);
+        return source_failure(failure, SOURCE_VERIFY_DRIFT, "ASTRO_SOURCE_DRIFT",
+                              "current_path_outside_project_root", "source.validate_containment",
+                              "the indexed path no longer resolves inside the project root", 0);
+    }
+    uint64_t current_size = (uint64_t)before.standard.EndOfFile.QuadPart;
+    long max_file_bytes = cbm_max_file_bytes();
+    if (current_size > SIZE_MAX - SKIP_ONE || current_size > (uint64_t)max_file_bytes) {
+        CloseHandle(handle);
+        verified_source_free(verified);
+        return source_failure(failure, SOURCE_VERIFY_DRIFT, "ASTRO_SOURCE_DRIFT",
+                              "current_file_oversized", "source.bound_current_read",
+                              "the current file exceeds the configured exact-read limit", 0);
+    }
+    verified->bytes = malloc((size_t)current_size + SKIP_ONE);
+    if (!verified->bytes) {
+        CloseHandle(handle);
+        verified_source_free(verified);
+        return source_failure(failure, SOURCE_VERIFY_ERROR, "CBM_SOURCE_VERIFICATION_FAILED",
+                              "current_file_allocation_failed", "source.allocate_current",
+                              "the current source snapshot buffer could not be allocated", 0);
+    }
+    size_t total = 0;
+    while (total < (size_t)current_size) {
+        DWORD wanted =
+            (DWORD)(((size_t)current_size - total) > CBM_SZ_64K ? CBM_SZ_64K
+                                                                : ((size_t)current_size - total));
+        DWORD got = 0;
+        if (!ReadFile(handle, verified->bytes + total, wanted, &got, NULL)) {
+            DWORD error = GetLastError();
+            CloseHandle(handle);
+            verified_source_free(verified);
+            return source_failure(failure, SOURCE_VERIFY_ERROR, "CBM_SOURCE_VERIFICATION_FAILED",
+                                  "current_file_read_failed", "source.read_current",
+                                  "the retained current file handle could not be read completely",
+                                  (uint32_t)error);
+        }
+        if (got == 0) {
+            break;
+        }
+        total += got;
+    }
+    uint8_t extra = 0;
+    DWORD extra_count = 0;
+    bool extra_read_ok = ReadFile(handle, &extra, 1, &extra_count, NULL) != 0;
+    DWORD extra_error = extra_read_ok ? ERROR_SUCCESS : GetLastError();
+    mcp_file_identity_t after = {0};
+    bool after_ok = mcp_get_file_identity(handle, &after);
+    DWORD after_error = after_ok ? ERROR_SUCCESS : GetLastError();
+    bool close_ok = CloseHandle(handle) != 0;
+    DWORD close_error = close_ok ? ERROR_SUCCESS : GetLastError();
+    if (!extra_read_ok || !after_ok || !close_ok) {
+        verified_source_free(verified);
+        return source_failure(
+            failure, SOURCE_VERIFY_ERROR, "CBM_SOURCE_VERIFICATION_FAILED",
+            "current_file_readback_incomplete", "source.finalize_current_read",
+            "the current file readback could not be finalized and inspected",
+            (uint32_t)(extra_error ? extra_error : (after_error ? after_error : close_error)));
+    }
+    if (total != (size_t)current_size || extra_count != 0 ||
+        !mcp_file_identity_equal(&before, &after)) {
+        verified_source_free(verified);
+        return source_failure(failure, SOURCE_VERIFY_DRIFT, "ASTRO_SOURCE_DRIFT",
+                              "current_file_changed_during_verification",
+                              "source.compare_retained_identity",
+                              "the current file changed while its bytes were being verified", 0);
+    }
+    verified->bytes[total] = '\0';
+    verified->len = total;
+    verified->current_mtime_ns = failure->current_mtime_ns;
+    verified->indexed_file = failure->indexed_file;
+    cbm_sha256_hex(verified->bytes, verified->len, verified->current_sha256);
+    snprintf(failure->current_sha256, sizeof(failure->current_sha256), "%s",
+             verified->current_sha256);
+    failure->current_sha256_present = true;
+#else
+    verified_source_free(verified);
+    return source_failure(failure, SOURCE_VERIFY_ERROR, "CBM_SOURCE_VERIFICATION_FAILED",
+                          "native_windows_verifier_unavailable", "source.capture_current",
+                          "exact source verification is implemented for the native Windows target",
+                          0);
+#endif
+
+    if (verified->len != (size_t)failure->indexed_file.size) {
+        verified_source_free(verified);
+        return source_failure(failure, SOURCE_VERIFY_DRIFT, "ASTRO_SOURCE_DRIFT",
+                              "current_file_size_mismatch", "source.compare_file_size",
+                              "the current file size differs from the indexed file size", 0);
+    }
+    if (strcmp(verified->current_sha256, failure->indexed_file.sha256) != 0) {
+        verified_source_free(verified);
+        return source_failure(failure, SOURCE_VERIFY_DRIFT, "ASTRO_SOURCE_DRIFT",
+                              "current_file_hash_mismatch", "source.compare_file_sha256",
+                              "the current file SHA-256 differs from the indexed file SHA-256", 0);
+    }
+    if (node->end_byte > verified->len) {
+        verified_source_free(verified);
+        return source_failure(failure, SOURCE_VERIFY_DRIFT, "ASTRO_SOURCE_DRIFT",
+                              "indexed_source_span_outside_current_file",
+                              "source.validate_byte_span",
+                              "the indexed byte span extends beyond the current file", 0);
+    }
+    const uint8_t *current_span = verified->bytes + node->start_byte;
+    cbm_sha256_hex(current_span, node->source_len, failure->current_span_sha256);
+    failure->current_span_sha256_present = true;
+    if (strcmp(failure->current_span_sha256, node->source_sha256) != 0 ||
+        (node->source_len > 0 && memcmp(current_span, node->source_bytes, node->source_len) != 0)) {
+        verified_source_free(verified);
+        return source_failure(
+            failure, SOURCE_VERIFY_DRIFT, "ASTRO_SOURCE_DRIFT", "current_source_span_mismatch",
+            "source.compare_exact_span",
+            "the current indexed byte span differs from the persisted source BLOB", 0);
+    }
+    return SOURCE_VERIFY_OK;
+}
+
+static bool copy_source_line_range(const uint8_t *bytes, size_t len, int start_line, int end_line,
+                                   char **out, size_t *out_len) {
+    *out = NULL;
+    *out_len = 0;
+    if ((!bytes && len > 0) || start_line < SKIP_ONE || end_line < start_line) {
+        return false;
+    }
+    size_t start = SIZE_MAX;
+    size_t end = len;
+    int line = SKIP_ONE;
+    for (size_t i = 0; i < len; i++) {
+        if (line == start_line && start == SIZE_MAX) {
+            start = i;
+        }
+        if (bytes[i] == '\n') {
+            if (line == end_line) {
+                end = i + SKIP_ONE;
+                break;
+            }
+            if (line == INT_MAX) {
+                return false;
+            }
+            line++;
+        }
+    }
+    if (start == SIZE_MAX && line == start_line) {
+        start = len;
+    }
+    if (start == SIZE_MAX || end < start || end == start) {
+        return false;
+    }
+    size_t range_len = end - start;
+    char *copy = malloc(range_len + SKIP_ONE);
+    if (!copy) {
+        return false;
+    }
+    memcpy(copy, bytes + start, range_len);
+    copy[range_len] = '\0';
+    if (!source_bytes_are_utf8((const uint8_t *)copy, range_len)) {
+        free(copy);
+        return false;
+    }
+    *out = copy;
+    *out_len = range_len;
+    return true;
 }
 
 /* Build an enriched snippet response for a resolved node. */
@@ -5765,18 +6134,43 @@ static void add_string_array(yyjson_mut_doc *doc, yyjson_mut_val *obj, const cha
     yyjson_mut_obj_add_val(doc, obj, key, arr);
 }
 
-static char *build_snippet_response(cbm_mcp_server_t *srv, cbm_node_t *node,
+static char *build_snippet_response(cbm_mcp_server_t *srv, cbm_store_t *store, cbm_node_t *node,
                                     const char *match_method, bool include_neighbors,
                                     cbm_node_t *alternatives, int alt_count) {
     char *root_path = get_project_root(srv, node->project);
-
-    int start = node->start_line > 0 ? node->start_line : SKIP_ONE;
-    int end = node->end_line > start ? node->end_line : start + SNIPPET_DEFAULT_LINES;
-    char *abs_path = NULL;
-    char *source = resolve_snippet_source(root_path, node->file_path, start, end, &abs_path);
+    verified_source_t verified = {0};
+    source_verification_failure_t failure = {0};
+    source_verify_status_t verify_status =
+        verify_node_source(store, node->project, root_path, node, &verified, &failure);
+    if (verify_status != SOURCE_VERIFY_OK) {
+        char *result = source_refusal_result(&failure);
+        verified_source_free(&verified);
+        free(root_path);
+        return result;
+    }
+    if (!source_bytes_are_utf8(node->source_bytes, node->source_len)) {
+        source_failure(&failure, SOURCE_VERIFY_ERROR, "CBM_SOURCE_IDENTITY_INVALID",
+                       "indexed_source_not_utf8", "source.validate_response_encoding",
+                       "the exact persisted source bytes are not valid NUL-free UTF-8", 0);
+        char *result = source_refusal_result(&failure);
+        verified_source_free(&verified);
+        free(root_path);
+        return result;
+    }
 
     yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
-    yyjson_mut_val *root_obj = yyjson_mut_obj(doc);
+    yyjson_mut_val *root_obj = doc ? yyjson_mut_obj(doc) : NULL;
+    if (!doc || !root_obj) {
+        if (doc) {
+            yyjson_mut_doc_free(doc);
+        }
+        verified_source_free(&verified);
+        free(root_path);
+        return cbm_mcp_text_result(
+            "{\"code\":\"CBM_SNIPPET_SERIALIZATION_FAILED\",\"message\":\"snippet response "
+            "allocation failed\",\"remediation\":\"free memory and retry the same atom_id\"}",
+            true);
+    }
     yyjson_mut_doc_set_root(doc, root_obj);
 
     yyjson_mut_obj_add_str(doc, root_obj, "atom_id", node->atom_id ? node->atom_id : "");
@@ -5785,26 +6179,28 @@ static char *build_snippet_response(cbm_mcp_server_t *srv, cbm_node_t *node,
                            node->qualified_name ? node->qualified_name : "");
     yyjson_mut_obj_add_str(doc, root_obj, "label", node->label ? node->label : "");
 
-    const char *display_path = "";
-    if (abs_path) {
-        display_path = abs_path;
-    } else if (node->file_path) {
-        display_path = node->file_path;
-    }
-    yyjson_mut_obj_add_str(doc, root_obj, "file_path", display_path);
-    yyjson_mut_obj_add_int(doc, root_obj, "start_line", start);
-    yyjson_mut_obj_add_int(doc, root_obj, "end_line", end);
-
-    if (source) {
-        char *safe_source = sanitize_utf8_lossy(source);
-        if (safe_source) {
-            yyjson_mut_obj_add_strcpy(doc, root_obj, "source", safe_source);
-            free(safe_source);
-        } else {
-            yyjson_mut_obj_add_str(doc, root_obj, "source", "(source not available)");
-        }
-    } else {
-        yyjson_mut_obj_add_str(doc, root_obj, "source", "(source not available)");
+    yyjson_mut_obj_add_str(doc, root_obj, "file_path", verified.absolute_path);
+    yyjson_mut_obj_add_int(doc, root_obj, "start_line", node->start_line);
+    yyjson_mut_obj_add_int(doc, root_obj, "end_line", node->end_line);
+    yyjson_mut_obj_add_uint(doc, root_obj, "start_byte", node->start_byte);
+    yyjson_mut_obj_add_uint(doc, root_obj, "end_byte", node->end_byte);
+    yyjson_mut_obj_add_str(doc, root_obj, "file_sha256", verified.current_sha256);
+    yyjson_mut_obj_add_str(doc, root_obj, "source_sha256", node->source_sha256);
+    yyjson_mut_obj_add_str(doc, root_obj, "trust", "grounded");
+    yyjson_mut_obj_add_str(doc, root_obj, "freshness", "verified_current");
+    yyjson_mut_obj_add_str(doc, root_obj, "provenance",
+                           "SQLite exact-source BLOB verified against the current file SHA-256 and "
+                           "byte span");
+    if (!yyjson_mut_obj_add_strncpy(doc, root_obj, "source", (const char *)node->source_bytes,
+                                    node->source_len)) {
+        yyjson_mut_doc_free(doc);
+        verified_source_free(&verified);
+        free(root_path);
+        return cbm_mcp_text_result(
+            "{\"code\":\"CBM_SNIPPET_SERIALIZATION_FAILED\",\"message\":\"exact source "
+            "bytes could not be copied into the response\",\"remediation\":\"free memory and "
+            "retry the same atom_id\"}",
+            true);
     }
 
     /* match_method — omitted for exact matches */
@@ -5816,7 +6212,6 @@ static char *build_snippet_response(cbm_mcp_server_t *srv, cbm_node_t *node,
     yyjson_doc *props_doc = enrich_node_properties(doc, root_obj, node->properties_json);
 
     /* Caller/callee counts — store already resolved by calling handler */
-    cbm_store_t *store = srv->store;
     int in_deg = 0;
     int out_deg = 0;
     cbm_store_node_degree(store, node->id, &in_deg, &out_deg);
@@ -5863,8 +6258,15 @@ static char *build_snippet_response(cbm_mcp_server_t *srv, cbm_node_t *node,
     free(nb_callers);
     free(nb_callees);
     free(root_path);
-    free(abs_path);
-    free(source);
+    verified_source_free(&verified);
+
+    if (!json) {
+        return cbm_mcp_text_result(
+            "{\"code\":\"CBM_SNIPPET_SERIALIZATION_FAILED\",\"message\":\"snippet response "
+            "serialization failed\",\"remediation\":\"free memory and retry the same "
+            "atom_id\"}",
+            true);
+    }
 
     char *result = cbm_mcp_text_result(json, false);
     free(json);
@@ -5912,7 +6314,8 @@ static char *handle_get_code_snippet(cbm_mcp_server_t *srv, const char *args) {
     if (atom_id) {
         int atom_rc = cbm_store_find_node_by_atom_id(store, effective_project, atom_id, &node);
         if (atom_rc == CBM_STORE_OK) {
-            char *result = build_snippet_response(srv, &node, NULL, include_neighbors, NULL, 0);
+            char *result =
+                build_snippet_response(srv, store, &node, NULL, include_neighbors, NULL, 0);
             free_node_contents(&node);
             free(atom_id);
             free(project);
@@ -5932,7 +6335,7 @@ static char *handle_get_code_snippet(cbm_mcp_server_t *srv, const char *args) {
     /* Qualified names are display metadata and may resolve only when unique. */
     int rc = cbm_store_find_node_by_qn(store, effective_project, qn, &node);
     if (rc == CBM_STORE_OK) {
-        char *result = build_snippet_response(srv, &node, NULL, include_neighbors, NULL, 0);
+        char *result = build_snippet_response(srv, store, &node, NULL, include_neighbors, NULL, 0);
         free_node_contents(&node);
         free(atom_id);
         free(qn);
@@ -5978,9 +6381,10 @@ static char *handle_get_code_snippet(cbm_mcp_server_t *srv, const char *args) {
     }
 
     if (suffix_count == SKIP_ONE) {
-        copy_node(&suffix_nodes[0], &node);
+        move_node(&suffix_nodes[0], &node);
         cbm_store_free_nodes(suffix_nodes, suffix_count);
-        char *result = build_snippet_response(srv, &node, "suffix", include_neighbors, NULL, 0);
+        char *result =
+            build_snippet_response(srv, store, &node, "suffix", include_neighbors, NULL, 0);
         free_node_contents(&node);
         free(qn);
         free(project);
@@ -5995,9 +6399,10 @@ static char *handle_get_code_snippet(cbm_mcp_server_t *srv, const char *args) {
         bool snip_ambiguous = false;
         int ssel = pick_resolved_node(suffix_nodes, suffix_count, &snip_ambiguous);
         if (!snip_ambiguous) {
-            copy_node(&suffix_nodes[ssel], &node);
+            move_node(&suffix_nodes[ssel], &node);
             cbm_store_free_nodes(suffix_nodes, suffix_count);
-            char *result = build_snippet_response(srv, &node, "suffix", include_neighbors, NULL, 0);
+            char *result =
+                build_snippet_response(srv, store, &node, "suffix", include_neighbors, NULL, 0);
             free_node_contents(&node);
             free(qn);
             free(project);
@@ -6034,11 +6439,18 @@ typedef struct {
 typedef struct {
     int64_t node_id; /* 0 = raw match (no containing node) */
     char *node_name;
+    char *atom_id;
     char *qualified_name;
     char *label;
     char *file;
     int start_line;
     int end_line;
+    bool source_present;
+    uint8_t *source_bytes;
+    size_t source_len;
+    char *source_sha256;
+    uint64_t start_byte;
+    uint64_t end_byte;
     int in_degree;
     int out_degree;
     int score;
@@ -6212,86 +6624,100 @@ static yyjson_mut_val *build_dedup_files_array(yyjson_mut_doc *doc, search_resul
     return files_arr;
 }
 
-/* Attach source or context lines to a search result JSON item. */
-static bool attach_result_source(yyjson_mut_doc *doc, yyjson_mut_val *item, search_result_t *r,
-                                 int mode, int context_lines, const char *root_path,
-                                 search_response_error_t *error) {
+/* Attach source or context only after the graph tuple and current file have
+ * been proven byte-identical. */
+static source_verify_status_t attach_result_source(yyjson_mut_doc *doc, yyjson_mut_val *item,
+                                                   search_result_t *r, int mode, int context_lines,
+                                                   cbm_store_t *store, const char *project,
+                                                   const char *root_path,
+                                                   source_verification_failure_t *failure) {
     enum { MODE_FULL = 1 };
-    if (r->start_line <= 0 || r->end_line <= 0) {
-        return true;
-    }
     if (mode != MODE_FULL && context_lines <= 0) {
-        return true;
+        yyjson_mut_obj_add_str(doc, item, "trust", "indexed_graph_metadata");
+        yyjson_mut_obj_add_str(doc, item, "freshness", "source_not_requested");
+        yyjson_mut_obj_add_str(doc, item, "provenance",
+                               "live grep match enriched with persisted graph metadata");
+        return SOURCE_VERIFY_OK;
     }
-    size_t root_len = strlen(root_path);
-    size_t file_len = strlen(r->file);
-    if (root_len > SIZE_MAX - file_len - MCP_SEPARATOR) {
-        snprintf(error->operation, sizeof(error->operation), "%s", "response.build_source_path");
-        snprintf(error->detail, sizeof(error->detail), "%s",
-                 "source path exceeds addressable memory");
-        return false;
+    cbm_node_t node = {
+        .id = r->node_id,
+        .project = project,
+        .label = r->label,
+        .name = r->node_name,
+        .atom_id = r->atom_id,
+        .qualified_name = r->qualified_name,
+        .file_path = r->file,
+        .start_line = r->start_line,
+        .end_line = r->end_line,
+        .source_present = r->source_present,
+        .source_bytes = r->source_bytes,
+        .source_len = r->source_len,
+        .source_sha256 = r->source_sha256,
+        .start_byte = r->start_byte,
+        .end_byte = r->end_byte,
+    };
+    verified_source_t verified = {0};
+    source_verify_status_t status =
+        verify_node_source(store, project, root_path, &node, &verified, failure);
+    if (status != SOURCE_VERIFY_OK) {
+        verified_source_free(&verified);
+        return status;
     }
-    size_t abs_len = root_len + file_len + MCP_SEPARATOR;
-    char *abs_path = malloc(abs_len);
-    if (!abs_path) {
-        snprintf(error->operation, sizeof(error->operation), "%s", "response.allocate_source_path");
-        snprintf(error->detail, sizeof(error->detail), "source-path allocation failed at %zu bytes",
-                 abs_len);
-        return false;
-    }
-    snprintf(abs_path, abs_len, "%s/%s", root_path, r->file);
 
-    /* Containment: a search result whose indexed path resolves outside the
-     * project root (a `..` segment, or a symlink/junction that discovery
-     * followed) must not be read back into the response. Same guard the
-     * snippet path already uses. */
-    if (!cbm_path_within_root(root_path, abs_path)) {
-        snprintf(error->operation, sizeof(error->operation), "%s", "response.validate_source_path");
-        snprintf(error->detail, sizeof(error->detail),
-                 "indexed source path resolves outside the project root: %.400s", r->file);
-        free(abs_path);
-        return false;
-    }
+    yyjson_mut_obj_add_str(doc, item, "atom_id", r->atom_id);
+    yyjson_mut_obj_add_str(doc, item, "file_sha256", verified.current_sha256);
+    yyjson_mut_obj_add_str(doc, item, "source_sha256", r->source_sha256);
+    yyjson_mut_obj_add_uint(doc, item, "start_byte", r->start_byte);
+    yyjson_mut_obj_add_uint(doc, item, "end_byte", r->end_byte);
+    yyjson_mut_obj_add_str(doc, item, "trust", "grounded");
+    yyjson_mut_obj_add_str(doc, item, "freshness", "verified_current");
+    yyjson_mut_obj_add_str(doc, item, "provenance",
+                           "SQLite exact-source tuple verified against a stable current-file "
+                           "handle readback");
 
     if (mode == MODE_FULL) {
-        char *source = read_file_lines(abs_path, r->start_line, r->end_line);
-        if (!source) {
-            snprintf(error->operation, sizeof(error->operation), "%s", "response.read_source");
-            snprintf(error->detail, sizeof(error->detail), "source readback failed for %.360s: %s",
-                     abs_path, strerror(errno));
-            free(abs_path);
-            return false;
+        if (!source_bytes_are_utf8(r->source_bytes, r->source_len) ||
+            !yyjson_mut_obj_add_strncpy(doc, item, "source", (const char *)r->source_bytes,
+                                        r->source_len)) {
+            verified_source_free(&verified);
+            return source_failure(
+                failure, SOURCE_VERIFY_ERROR, "CBM_SOURCE_RESPONSE_ENCODING_INVALID",
+                "indexed_source_response_encoding_failed", "response.copy_exact_source",
+                "the verified source is not NUL-free UTF-8 or could not be "
+                "copied into the response",
+                0);
         }
-        yyjson_mut_obj_add_strcpy(doc, item, "source", source);
-        free(source);
     } else if (context_lines > 0 && r->match_count > 0) {
         int ctx_start = r->match_lines[0] - context_lines;
         if (r->match_lines[r->match_count - SKIP_ONE] > INT_MAX - context_lines) {
-            snprintf(error->operation, sizeof(error->operation), "%s",
-                     "response.compute_context_range");
-            snprintf(error->detail, sizeof(error->detail), "%s",
-                     "context range exceeds the representable line-number range");
-            free(abs_path);
-            return false;
+            verified_source_free(&verified);
+            return source_failure(failure, SOURCE_VERIFY_ERROR, "CBM_SOURCE_RESPONSE_RANGE_INVALID",
+                                  "context_line_range_overflow", "response.compute_context_range",
+                                  "the context range exceeds representable line numbers", 0);
         }
         int ctx_end = r->match_lines[r->match_count - SKIP_ONE] + context_lines;
         if (ctx_start < SKIP_ONE) {
             ctx_start = SKIP_ONE;
         }
-        char *ctx = read_file_lines(abs_path, ctx_start, ctx_end);
-        if (!ctx) {
-            snprintf(error->operation, sizeof(error->operation), "%s", "response.read_context");
-            snprintf(error->detail, sizeof(error->detail), "context readback failed for %.360s: %s",
-                     abs_path, strerror(errno));
-            free(abs_path);
-            return false;
+        char *ctx = NULL;
+        size_t ctx_len = 0;
+        if (!copy_source_line_range(verified.bytes, verified.len, ctx_start, ctx_end, &ctx,
+                                    &ctx_len) ||
+            !yyjson_mut_obj_add_strncpy(doc, item, "context", ctx, ctx_len)) {
+            free(ctx);
+            verified_source_free(&verified);
+            return source_failure(failure, SOURCE_VERIFY_ERROR,
+                                  "CBM_SOURCE_RESPONSE_ENCODING_INVALID",
+                                  "context_response_encoding_failed", "response.copy_context",
+                                  "the verified context range is absent, invalid UTF-8, or could "
+                                  "not be copied into the response",
+                                  0);
         }
-        yyjson_mut_obj_add_strcpy(doc, item, "context", ctx);
         yyjson_mut_obj_add_int(doc, item, "context_start", ctx_start);
         free(ctx);
     }
-    free(abs_path);
-    return true;
+    verified_source_free(&verified);
+    return SOURCE_VERIFY_OK;
 }
 
 /* Build directory distribution object from search results (top-level dir → count). */
@@ -6353,8 +6779,9 @@ static yyjson_mut_val *build_dir_distribution(yyjson_mut_doc *doc, search_result
 /* Phase 4: assemble JSON output from search results */
 static char *assemble_search_output(search_result_t *sr, int sr_count, grep_match_t **raw,
                                     int raw_count, int gm_count, int limit, int mode,
-                                    int context_lines, const char *root_path,
-                                    bool warn_literal_pipe, uint64_t elapsed_ms) {
+                                    int context_lines, cbm_store_t *store, const char *project,
+                                    const char *root_path, bool warn_literal_pipe,
+                                    uint64_t elapsed_ms) {
     enum { MODE_COMPACT = 0, MODE_FULL = 1, MODE_FILES = 2, SEARCH_SLOW_MS = 5000 };
 
     yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
@@ -6377,7 +6804,7 @@ static char *assemble_search_output(search_result_t *sr, int sr_count, grep_matc
     yyjson_mut_doc_set_root(doc, root_obj);
 
     int output_count = sr_count < limit ? sr_count : limit;
-    search_response_error_t response_error = {0};
+    source_verification_failure_t source_failure_detail = {0};
 
     if (mode == MODE_FILES) {
         yyjson_mut_val *files = build_dedup_files_array(doc, sr, output_count, raw, raw_count);
@@ -6413,14 +6840,12 @@ static char *assemble_search_output(search_result_t *sr, int sr_count, grep_matc
                 yyjson_mut_arr_add_int(doc, ml, r->match_lines[j]);
             }
             yyjson_mut_obj_add_val(doc, item, "match_lines", ml);
-            if (!attach_result_source(doc, item, r, mode, context_lines, root_path,
-                                      &response_error)) {
+            source_verify_status_t source_status =
+                attach_result_source(doc, item, r, mode, context_lines, store, project, root_path,
+                                     &source_failure_detail);
+            if (source_status != SOURCE_VERIFY_OK) {
                 yyjson_mut_doc_free(doc);
-                return search_operation_error_result(
-                    "CBM_SEARCH_SOURCE_READBACK_FAILED",
-                    "search response could not read the exact indexed source bytes",
-                    "restore the indexed source revision or re-index it, then retry",
-                    &response_error);
+                return source_refusal_result(&source_failure_detail);
             }
             yyjson_mut_arr_add_val(results_arr, item);
         }
@@ -6434,6 +6859,9 @@ static char *assemble_search_output(search_result_t *sr, int sr_count, grep_matc
             yyjson_mut_obj_add_str(doc, item, "file", raw[ri]->file);
             yyjson_mut_obj_add_int(doc, item, "line", raw[ri]->line);
             yyjson_mut_obj_add_str(doc, item, "content", raw[ri]->content);
+            yyjson_mut_obj_add_str(doc, item, "trust", "live_observation");
+            yyjson_mut_obj_add_str(doc, item, "freshness", "observed_during_search");
+            yyjson_mut_obj_add_str(doc, item, "provenance", "live grep without graph span");
             yyjson_mut_arr_add_val(raw_arr, item);
         }
         yyjson_mut_obj_add_val(doc, root_obj, "raw_matches", raw_arr);
@@ -6847,6 +7275,18 @@ static bool add_search_match_line(search_result_t *result, int line) {
     return true;
 }
 
+static void free_search_result_fields(search_result_t *result) {
+    free(result->node_name);
+    free(result->atom_id);
+    free(result->qualified_name);
+    free(result->label);
+    free(result->file);
+    free(result->source_bytes);
+    free(result->source_sha256);
+    free(result->match_lines);
+    memset(result, 0, sizeof(*result));
+}
+
 static bool add_to_search_results(search_result_t **sr, int *sr_count, int *sr_cap, cbm_node_t *n,
                                   int line) {
     for (int j = 0; j < *sr_count; j++) {
@@ -6870,25 +7310,30 @@ static bool add_to_search_results(search_result_t **sr, int *sr_count, int *sr_c
     search_result_t *r = &(*sr)[*sr_count];
     r->node_id = n->id;
     r->node_name = heap_strdup(n->name ? n->name : "");
+    r->atom_id = heap_strdup(n->atom_id ? n->atom_id : "");
     r->qualified_name = heap_strdup(n->qualified_name ? n->qualified_name : "");
     r->label = heap_strdup(n->label ? n->label : "");
     r->file = heap_strdup(n->file_path ? n->file_path : "");
-    if (!r->node_name || !r->qualified_name || !r->label || !r->file) {
-        free(r->node_name);
-        free(r->qualified_name);
-        free(r->label);
-        free(r->file);
-        memset(r, 0, sizeof(*r));
+    r->source_sha256 = heap_strdup(n->source_sha256 ? n->source_sha256 : "");
+    r->source_present = n->source_present;
+    r->source_len = n->source_len;
+    r->start_byte = n->start_byte;
+    r->end_byte = n->end_byte;
+    if (n->source_len > 0 && n->source_bytes) {
+        r->source_bytes = malloc(n->source_len);
+        if (r->source_bytes) {
+            memcpy(r->source_bytes, n->source_bytes, n->source_len);
+        }
+    }
+    if (!r->node_name || !r->atom_id || !r->qualified_name || !r->label || !r->file ||
+        !r->source_sha256 || (n->source_len > 0 && !r->source_bytes)) {
+        free_search_result_fields(r);
         return false;
     }
     r->start_line = n->start_line;
     r->end_line = n->end_line;
     if (!add_search_match_line(r, line)) {
-        free(r->node_name);
-        free(r->qualified_name);
-        free(r->label);
-        free(r->file);
-        memset(r, 0, sizeof(*r));
+        free_search_result_fields(r);
         return false;
     }
     (*sr_count)++;
@@ -6925,11 +7370,7 @@ static void free_search_results(search_result_t *results, int count) {
         return;
     }
     for (int i = 0; i < count; i++) {
-        free(results[i].node_name);
-        free(results[i].qualified_name);
-        free(results[i].label);
-        free(results[i].file);
-        free(results[i].match_lines);
+        free_search_result_fields(&results[i]);
     }
     free(results);
 }
@@ -7965,9 +8406,9 @@ static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
 
     /* ── Phase 4: Context assembly (extracted helper) ─────────── */
 
-    char *result =
-        assemble_search_output(sr, sr_count, raw, raw_count, gm_count, limit, mode, context_lines,
-                               root_path, pat_has_pipe && !use_regex, cbm_now_ms() - search_t0);
+    char *result = assemble_search_output(sr, sr_count, raw, raw_count, gm_count, limit, mode,
+                                          context_lines, store, project, root_path,
+                                          pat_has_pipe && !use_regex, cbm_now_ms() - search_t0);
     free_grep_matches(gm, gm_count);
     free_search_results(sr, sr_count);
     free(raw);

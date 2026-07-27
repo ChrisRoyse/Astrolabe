@@ -104,6 +104,16 @@ typedef struct {
     int64_t size;
 } cbm_file_hash_t;
 
+enum { CBM_FILE_SHA256_CAPACITY = 65 };
+
+/* Fixed-size identity for one indexed file. Unlike cbm_file_hash_t, this is
+ * caller-owned and requires no allocation or release. */
+typedef struct {
+    char sha256[CBM_FILE_SHA256_CAPACITY];
+    int64_t mtime_ns;
+    int64_t size;
+} cbm_file_identity_t;
+
 /* Find nodes overlapping a line range in a file (excludes Module/Package). */
 int cbm_store_find_nodes_by_file_overlap(cbm_store_t *s, const char *project, const char *file_path,
                                          int start_line, int end_line, cbm_node_t **out,
@@ -505,6 +515,10 @@ int cbm_store_upsert_file_hash(cbm_store_t *s, const char *project, const char *
 
 int cbm_store_get_file_hashes(cbm_store_t *s, const char *project, cbm_file_hash_t **out,
                               int *count);
+
+/* Read the exact persisted identity of one indexed file. */
+int cbm_store_get_file_identity(cbm_store_t *s, const char *project, const char *rel_path,
+                                cbm_file_identity_t *out);
 
 int cbm_store_delete_file_hash(cbm_store_t *s, const char *project, const char *rel_path);
 

@@ -191,6 +191,7 @@ struct cbm_store {
 
     sqlite3_stmt *stmt_upsert_file_hash;
     sqlite3_stmt *stmt_get_file_hashes;
+    sqlite3_stmt *stmt_get_file_identity;
     sqlite3_stmt *stmt_delete_file_hash;
     sqlite3_stmt *stmt_delete_file_hashes;
 };
@@ -2552,6 +2553,7 @@ void cbm_store_close(cbm_store_t *s) {
 
     finalize_stmt(&s->stmt_upsert_file_hash);
     finalize_stmt(&s->stmt_get_file_hashes);
+    finalize_stmt(&s->stmt_get_file_identity);
     finalize_stmt(&s->stmt_delete_file_hash);
     finalize_stmt(&s->stmt_delete_file_hashes);
 
@@ -3684,6 +3686,50 @@ int cbm_store_get_file_hashes(cbm_store_t *s, const char *project, cbm_file_hash
 
     *out = arr;
     *count = n;
+    return CBM_STORE_OK;
+}
+
+int cbm_store_get_file_identity(cbm_store_t *s, const char *project, const char *rel_path,
+                                cbm_file_identity_t *out) {
+    if (!s || !s->db || !project || !rel_path || !out) {
+        return CBM_STORE_ERR;
+    }
+    memset(out, 0, sizeof(*out));
+    sqlite3_stmt *stmt = prepare_cached(
+        s, &s->stmt_get_file_identity,
+        "SELECT sha256, mtime_ns, size FROM file_hashes WHERE project = ?1 AND rel_path = ?2;");
+    if (!stmt) {
+        return CBM_STORE_ERR;
+    }
+    bind_text(stmt, SKIP_ONE, project);
+    bind_text(stmt, ST_COL_2, rel_path);
+    int rc = sqlite3_step(stmt);
+    if (rc == SQLITE_DONE) {
+        return CBM_STORE_NOT_FOUND;
+    }
+    if (rc != SQLITE_ROW) {
+        store_set_error_sqlite(s, "get_file_identity step");
+        return CBM_STORE_ERR;
+    }
+    const char *sha256 = (const char *)sqlite3_column_text(stmt, 0);
+    if (!is_canonical_atom_id(sha256)) {
+        store_set_error(s, "get_file_identity row has a non-canonical SHA-256");
+        return CBM_STORE_ERR;
+    }
+    memcpy(out->sha256, sha256, CBM_FILE_SHA256_CAPACITY);
+    out->mtime_ns = sqlite3_column_int64(stmt, SKIP_ONE);
+    out->size = sqlite3_column_int64(stmt, ST_COL_2);
+    if (out->size < 0) {
+        memset(out, 0, sizeof(*out));
+        store_set_error(s, "get_file_identity row has a negative size");
+        return CBM_STORE_ERR;
+    }
+    int done_rc = sqlite3_step(stmt);
+    if (done_rc != SQLITE_DONE) {
+        memset(out, 0, sizeof(*out));
+        store_set_error_sqlite(s, "get_file_identity completion");
+        return CBM_STORE_ERR;
+    }
     return CBM_STORE_OK;
 }
 
