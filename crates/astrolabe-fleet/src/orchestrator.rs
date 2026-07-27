@@ -94,6 +94,9 @@ pub const ASTRO_FLEET_STORE_BUDGET: &str = "ASTRO_FLEET_STORE_BUDGET";
 /// Refusal code when a repo's store directory pre-exists with content the
 /// pipeline does not recognize as its own (#454): refuse, never overwrite.
 pub const ASTRO_FLEET_STORE_FOREIGN: &str = "ASTRO_FLEET_STORE_FOREIGN";
+/// Refusal code when the stable fleet store key and the server-derived inner
+/// project identity cannot be bound through the durable kernel scope.
+pub const ASTRO_FLEET_PROJECT_IDENTITY: &str = "ASTRO_FLEET_PROJECT_IDENTITY";
 
 /// Declared default fleet store root (per-repo CBM cache/vault sets).
 pub const DEFAULT_STORE_ROOT: &str = r"D:\astrolabe-fleet\store";
@@ -129,6 +132,95 @@ pub fn kernel_scope_id(project: &str) -> String {
 /// catalog-derived — the same mapping as the clone farm's directory name).
 pub fn project_name(full_name: &str) -> String {
     full_name.replace('/', "__")
+}
+
+/// Exact separation between one stable fleet catalog/store key and the
+/// path-derived project identity used inside CBM, shadow-vault salts, and the
+/// per-repo kernel scope (#808).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct RepoStoreIdentity {
+    /// Stable outer directory and fleet provenance key (`owner__repo`).
+    pub store_key: String,
+    /// Server-derived CBM/shadow identity.
+    pub index_project: String,
+    /// Durable per-repo kernel scope (`repo:<index_project>`).
+    pub kernel_scope: String,
+}
+
+/// Decodes a kerneled catalog row's exact store/inner identity binding.
+///
+/// Legacy rows remain explicit rather than guessed: their already-durable
+/// `kernel_scope_id` supplies the inner project, which happens to equal the
+/// outer key for artifacts created before caller-selected names were retired.
+pub fn repo_store_identity(row: &FleetRepoRow) -> Result<RepoStoreIdentity, CalyxError> {
+    let store_key = project_name(&row.record.full_name);
+    let kernel_scope = row.kernel_scope_id.as_deref().ok_or_else(|| {
+        project_identity_error(
+            &row.record.full_name,
+            "catalog row has no durable kernel_scope_id",
+        )
+    })?;
+    let index_project = kernel_scope
+        .strip_prefix("repo:")
+        .filter(|project| valid_index_project(project))
+        .ok_or_else(|| {
+            project_identity_error(
+                &row.record.full_name,
+                &format!(
+                    "kernel_scope_id {kernel_scope:?} is not repo:<valid path-derived project>"
+                ),
+            )
+        })?
+        .to_string();
+    Ok(RepoStoreIdentity {
+        store_key,
+        index_project,
+        kernel_scope: kernel_scope.to_string(),
+    })
+}
+
+/// Resolves one stable `owner__repo` key to its unique durable catalog
+/// identity. No directory-name inference is permitted.
+pub fn catalog_store_identity(
+    catalog: &FleetCatalog,
+    store_key: &str,
+) -> Result<RepoStoreIdentity, CalyxError> {
+    let mut matches = catalog
+        .query(None, None)?
+        .into_iter()
+        .filter(|row| project_name(&row.record.full_name) == store_key);
+    let row = matches.next().ok_or_else(|| {
+        project_identity_error(
+            store_key,
+            "stable store key has no matching fleet catalog row",
+        )
+    })?;
+    if matches.next().is_some() {
+        return Err(project_identity_error(
+            store_key,
+            "stable store key maps to more than one fleet catalog row",
+        ));
+    }
+    repo_store_identity(&row)
+}
+
+fn valid_index_project(project: &str) -> bool {
+    !project.is_empty()
+        && project.len() <= 255
+        && !project.starts_with('.')
+        && !project.ends_with('-')
+        && !project.contains("..")
+        && project
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+}
+
+fn project_identity_error(subject: &str, detail: &str) -> CalyxError {
+    CalyxError {
+        code: ASTRO_FLEET_PROJECT_IDENTITY,
+        message: format!("fleet project identity for {subject} is inconsistent: {detail}"),
+        remediation: "preserve the catalog and store bytes; re-run index_repository without a name override and bind only its returned project through the durable repo:<project> kernel scope",
+    }
 }
 
 /// Declared knobs of one pipeline pass.
@@ -610,8 +702,8 @@ pub fn run_pipeline_pass_outcome(
 /// returned to the main thread, never applied here.
 fn pipeline_job(row: &FleetRepoRow, config: &PipelineConfig) -> JobResult {
     let started = Instant::now();
-    let project = project_name(&row.record.full_name);
-    let store_dir = config.store_root.join(&project);
+    let store_key = project_name(&row.record.full_name);
+    let store_dir = config.store_root.join(&store_key);
     let wiped_partial_store = std::cell::Cell::new(false);
     let wiped_partial_store = &wiped_partial_store;
     let verdict_base = move |outcome: Outcome, stage: Option<&str>, detail: String| RepoVerdict {
@@ -730,7 +822,8 @@ fn pipeline_job(row: &FleetRepoRow, config: &PipelineConfig) -> JobResult {
         // recognizes as its own may be wiped: anything else is foreign
         // content and the job refuses rather than overwrite (#454).
         if store_dir.exists() {
-            if let Some(foreign) = foreign_store_entry(&store_dir, &project) {
+            if let Some(foreign) = foreign_store_entry(&store_dir, &store_key, clone_path.as_str())
+            {
                 return fail(
                     "preflight",
                     format!(
@@ -766,7 +859,6 @@ fn pipeline_job(row: &FleetRepoRow, config: &PipelineConfig) -> JobResult {
     let args_path = store_dir.join("index-args.json");
     let args_json = json!({
         "repo_path": clone_path,
-        "name": project,
         "calyx": "shadow",
         "mode": "fast",
     });
@@ -975,6 +1067,34 @@ fn pipeline_job(row: &FleetRepoRow, config: &PipelineConfig) -> JobResult {
             )),
         );
     }
+    let index_project = match inner["project"].as_str() {
+        Some(project) if valid_index_project(project) => project.to_string(),
+        Some(project) => {
+            return fail(
+                "identity",
+                format!(
+                    "{ASTRO_FLEET_PROJECT_IDENTITY}: index_repository returned invalid path-derived project {project:?}"
+                ),
+                Some(format!(
+                    "repo: {}\nphase: returned project identity\nreturned project: {project:?}\n",
+                    row.record.full_name
+                )),
+            );
+        }
+        None => {
+            return fail(
+                "identity",
+                format!(
+                    "{ASTRO_FLEET_PROJECT_IDENTITY}: index_repository result carries no project"
+                ),
+                Some(format!(
+                    "repo: {}\nphase: returned project identity\nresult head:\n{}\n",
+                    row.record.full_name,
+                    head_of(&inner.to_string(), 8000)
+                )),
+            );
+        }
+    };
     let vault_fingerprint = inner["vault_fingerprint"]
         .as_str()
         .unwrap_or_default()
@@ -1000,14 +1120,27 @@ fn pipeline_job(row: &FleetRepoRow, config: &PipelineConfig) -> JobResult {
             )),
         );
     }
+    let scope = kernel_scope_id(&index_project);
+    if kernel["scope_id"].as_str() != Some(scope.as_str()) {
+        return fail(
+            "identity",
+            format!(
+                "{ASTRO_FLEET_PROJECT_IDENTITY}: kernel scope {:?} differs from returned-project scope {scope:?}",
+                kernel["scope_id"].as_str()
+            ),
+            Some(format!(
+                "repo: {}\nphase: kernel identity binding\nstable store key: {store_key}\nreturned project: {index_project}\nreported kernel: {kernel}\n",
+                row.record.full_name
+            )),
+        );
+    }
     let reported_members_hash = kernel["members_hash"]
         .as_str()
         .unwrap_or_default()
         .to_string();
 
     // Independent persisted-state verification (the transition gate).
-    let scope = kernel_scope_id(&project);
-    let verify = verify_persisted(&store_dir, &project, &scope, &reported_members_hash);
+    let verify = verify_persisted(&store_dir, &index_project, &scope, &reported_members_hash);
     let (sqlite_nodes, sqlite_edges, vault_base_rows, kernel_member_count) = match verify {
         Ok(counts) => counts,
         Err(detail) => {
@@ -1112,7 +1245,9 @@ fn pipeline_job(row: &FleetRepoRow, config: &PipelineConfig) -> JobResult {
             github_id: row.record.github_id,
             outcome,
             stage: None,
-            detail: format!("pipeline complete; kernel scope {scope}"),
+            detail: format!(
+                "pipeline complete; stable store {store_key}, path-derived project {index_project}, kernel scope {scope}"
+            ),
             head_commit_hash: Some(head),
             sqlite_nodes: Some(sqlite_nodes),
             sqlite_edges: Some(sqlite_edges),
@@ -1136,10 +1271,14 @@ fn pipeline_job(row: &FleetRepoRow, config: &PipelineConfig) -> JobResult {
 /// CxId derivation is salted per project ([`shadow_vault_salt`]) even though
 /// the vault ULID is shared; intersecting two projects' key dumps proves (or
 /// falsifies) that independently of the writer.
-pub fn vault_base_keys(store_root: &Path, project: &str) -> Result<Vec<String>, CalyxError> {
+pub fn vault_base_keys(
+    store_root: &Path,
+    store_key: &str,
+    index_project: &str,
+) -> Result<Vec<String>, CalyxError> {
     let vault_dir = store_root
-        .join(project)
-        .join(format!("{project}.astrolabe-vault"));
+        .join(store_key)
+        .join(format!("{index_project}.astrolabe-vault"));
     let vault_id = VaultId::from_str(SHADOW_VAULT_ID).map_err(|error| CalyxError {
         code: ASTRO_FLEET_STORE_UNAVAILABLE,
         message: format!("shadow vault id failed to parse: {error:?}"),
@@ -1148,7 +1287,7 @@ pub fn vault_base_keys(store_root: &Path, project: &str) -> Result<Vec<String>, 
     let vault = AsterVault::open(
         &vault_dir,
         vault_id,
-        shadow_vault_salt(project).into_bytes(),
+        shadow_vault_salt(index_project).into_bytes(),
         VaultOptions {
             read_only: true,
             ..VaultOptions::default()
@@ -1196,14 +1335,16 @@ fn dir_size_bytes(dir: &Path) -> Result<u64, String> {
 /// Returns the first entry of `store_dir` this pipeline does not recognize as
 /// its own output for `project`, or `None` when every entry is recognized
 /// (#454: only a recognized store may be wiped for a clean re-run).
-fn foreign_store_entry(store_dir: &Path, project: &str) -> Option<String> {
-    const FIXED: [&str; 5] = [
+fn foreign_store_entry(store_dir: &Path, store_key: &str, clone_path: &str) -> Option<String> {
+    const FIXED: [&str; 6] = [
         "_config.db",
         "index-args.json",
         "pipeline-stdout.json",
         "pipeline-stderr.txt",
         "logs",
+        ".astrolabe-shadow-publication",
     ];
+    let completed_index_project = completed_pipeline_index_project(store_dir, clone_path);
     let entries = match fs::read_dir(store_dir) {
         Ok(entries) => entries,
         // Unreadable = unknown = foreign; the caller refuses.
@@ -1215,13 +1356,40 @@ fn foreign_store_entry(store_dir: &Path, project: &str) -> Option<String> {
             Err(error) => return Some(format!("<unreadable entry: {error}>")),
         };
         let recognized = FIXED.contains(&name.as_str())
-            || name.starts_with(&format!("{project}."))
+            || name.starts_with(&format!("{store_key}."))
+            || completed_index_project
+                .as_ref()
+                .is_some_and(|project| name.starts_with(&format!("{project}.")))
             || name.starts_with("_config.db");
         if !recognized {
             return Some(name);
         }
     }
     None
+}
+
+/// Recovers the inner project identity only from a completed, successful
+/// pipeline response whose exact args file binds the current clone and
+/// contains no caller-selected name. This lets a `cloned` row safely recognize
+/// and redo a torn post-index/pre-catalog store without accepting arbitrary
+/// directory prefixes.
+fn completed_pipeline_index_project(store_dir: &Path, clone_path: &str) -> Option<String> {
+    let args: Value =
+        serde_json::from_slice(&fs::read(store_dir.join("index-args.json")).ok()?).ok()?;
+    if args["repo_path"].as_str() != Some(clone_path) || args.get("name").is_some() {
+        return None;
+    }
+    let envelope: Value =
+        serde_json::from_slice(&fs::read(store_dir.join("pipeline-stdout.json")).ok()?).ok()?;
+    if envelope["isError"].as_bool().unwrap_or(true) {
+        return None;
+    }
+    let inner: Value = serde_json::from_str(envelope["content"][0]["text"].as_str()?).ok()?;
+    if inner["status"].as_str() != Some("indexed") {
+        return None;
+    }
+    let project = inner["project"].as_str()?;
+    valid_index_project(project).then(|| project.to_string())
 }
 
 /// Independent persisted-state readback: CBM sqlite counts, shadow-vault Base

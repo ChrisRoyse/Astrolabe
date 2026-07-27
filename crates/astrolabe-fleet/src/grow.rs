@@ -102,10 +102,10 @@ use crate::clone_farm::{FarmConfig, Selection, run_clone_pass_outcome, safe_reas
 use crate::compose::{ComposeConfig, FLEET_KERNEL_REPORT_KIND, compose_fleet_kernel};
 use crate::discover::run_discovery;
 use crate::orchestrator::{
-    PipelineConfig, SHADOW_VAULT_ID, kernel_scope_id, project_name, run_pipeline_pass_outcome,
+    PipelineConfig, SHADOW_VAULT_ID, project_name, repo_store_identity, run_pipeline_pass_outcome,
     shadow_vault_salt,
 };
-use crate::record::{SourceRetirementStage, TransitionContext};
+use crate::record::{FleetRepoRow, SourceRetirementStage, TransitionContext};
 use crate::retirement::{RetirementConfig, run_source_retirement_pass};
 use crate::state::RepoState;
 
@@ -261,11 +261,12 @@ impl GrowConfig {
 /// `Ok(None)` when the vault or artifact does not exist.
 fn repo_kernel_members_hash(
     store_root: &Path,
-    project: &str,
+    row: &FleetRepoRow,
 ) -> Result<Option<String>, CalyxError> {
+    let identity = repo_store_identity(row)?;
     let vault_dir = store_root
-        .join(project)
-        .join(format!("{project}.astrolabe-vault"));
+        .join(&identity.store_key)
+        .join(format!("{}.astrolabe-vault", identity.index_project));
     if !vault_dir.exists() {
         return Ok(None);
     }
@@ -277,18 +278,22 @@ fn repo_kernel_members_hash(
     let vault = AsterVault::open(
         &vault_dir,
         vault_id,
-        shadow_vault_salt(project).into_bytes(),
+        shadow_vault_salt(&identity.index_project).into_bytes(),
         VaultOptions {
             read_only: true,
             ..VaultOptions::default()
         },
     )?;
-    let scope = kernel_scope_id(project);
-    let artifact = read_persisted_kernel_artifact(&vault, &scope).map_err(|error| CalyxError {
-        code: "ASTRO_FLEET_KERNEL_READBACK",
-        message: format!("read per-repo kernel artifact for {scope}: {error}"),
-        remediation: "the per-repo kernel row is unreadable; re-run the pipeline for this repo",
-    })?;
+    let artifact = read_persisted_kernel_artifact(&vault, &identity.kernel_scope).map_err(
+        |error| CalyxError {
+            code: "ASTRO_FLEET_KERNEL_READBACK",
+            message: format!(
+                "read per-repo kernel artifact for {}: {error}",
+                identity.kernel_scope
+            ),
+            remediation: "the per-repo kernel row is unreadable; re-run the pipeline for this repo",
+        },
+    )?;
     Ok(artifact.map(|artifact| artifact.members_hash))
 }
 
@@ -900,7 +905,7 @@ pub fn run_growth_cycle(catalog: &FleetCatalog, config: &GrowConfig) -> Result<V
         let mut current: BTreeMap<String, String> = BTreeMap::new();
         for row in &kerneled_rows {
             let project = project_name(&row.record.full_name);
-            match repo_kernel_members_hash(&config.pipeline.store_root, &project) {
+            match repo_kernel_members_hash(&config.pipeline.store_root, row) {
                 Ok(Some(hash)) => {
                     current.insert(project, hash);
                 }

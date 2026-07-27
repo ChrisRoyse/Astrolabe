@@ -74,7 +74,9 @@ use serde_json::{Value, json};
 
 use crate::catalog::FleetCatalog;
 use crate::dedup::{AtomFrames, parse_atom_frames};
-use crate::orchestrator::{SHADOW_VAULT_ID, kernel_scope_id, shadow_vault_salt};
+use crate::orchestrator::{
+    SHADOW_VAULT_ID, catalog_store_identity, kernel_scope_id, shadow_vault_salt,
+};
 
 /// Report kind under which the compose sidecar persists in the fleet catalog.
 pub const FLEET_KERNEL_REPORT_KIND: &str = "fleet-kernel";
@@ -327,10 +329,14 @@ pub struct RepoKernelLoad {
     pub missing_vector: usize,
 }
 
-fn open_shadow_vault(store_root: &Path, project: &str) -> Result<AsterVault, CalyxError> {
+fn open_shadow_vault(
+    store_root: &Path,
+    store_key: &str,
+    index_project: &str,
+) -> Result<AsterVault, CalyxError> {
     let vault_dir = store_root
-        .join(project)
-        .join(format!("{project}.astrolabe-vault"));
+        .join(store_key)
+        .join(format!("{index_project}.astrolabe-vault"));
     let vault_id = VaultId::from_str(SHADOW_VAULT_ID).map_err(|error| CalyxError {
         code: ASTRO_FLEET_COMPOSE_INNER,
         message: format!("shadow vault id failed to parse: {error:?}"),
@@ -339,7 +345,7 @@ fn open_shadow_vault(store_root: &Path, project: &str) -> Result<AsterVault, Cal
     AsterVault::open(
         &vault_dir,
         vault_id,
-        shadow_vault_salt(project).into_bytes(),
+        shadow_vault_salt(index_project).into_bytes(),
         VaultOptions {
             read_only: true,
             ..VaultOptions::default()
@@ -389,25 +395,26 @@ fn input_atoms_by_cx(
 /// never a silent omission. Every other failure is fail-closed.
 pub fn load_repo_kernel(
     store_root: &Path,
-    project: &str,
+    store_key: &str,
+    index_project: &str,
 ) -> Result<Option<RepoKernelLoad>, CalyxError> {
     let vault_dir = store_root
-        .join(project)
-        .join(format!("{project}.astrolabe-vault"));
+        .join(store_key)
+        .join(format!("{index_project}.astrolabe-vault"));
     if !vault_dir.exists() {
         return Ok(None);
     }
-    let vault = open_shadow_vault(store_root, project)?;
-    let scope = kernel_scope_id(project);
+    let vault = open_shadow_vault(store_root, store_key, index_project)?;
+    let scope = kernel_scope_id(index_project);
     let artifact = read_persisted_kernel_artifact(&vault, &scope)
         .map_err(|error| inner_err("read per-repo kernel artifact", error))?;
     let Some(artifact) = artifact else {
         return Ok(None);
     };
 
-    let by_cx = input_atoms_by_cx(&vault, project)?;
+    let by_cx = input_atoms_by_cx(&vault, index_project)?;
 
-    let corpus = read_search_corpus_from_vault(&vault, project, &[SLOT_CODE_SEMANTIC])
+    let corpus = read_search_corpus_from_vault(&vault, index_project, &[SLOT_CODE_SEMANTIC])
         .map_err(|error| inner_err("read S18 corpus", error))?;
     let mut vec_by_name: BTreeMap<String, Vec<f32>> = BTreeMap::new();
     for symbol in corpus.symbols {
@@ -423,7 +430,7 @@ pub fn load_repo_kernel(
             return Err(CalyxError {
                 code: ASTRO_FLEET_COMPOSE_MEMBER_UNRESOLVED,
                 message: format!(
-                    "kernel member {} of project {project} has no stored #446 input record",
+                    "kernel member {} of project {store_key} (inner identity {index_project}) has no stored #446 input record",
                     member.id
                 ),
                 remediation: "re-run index_repository for the repo so the input store covers \
@@ -435,7 +442,7 @@ pub fn load_repo_kernel(
             missing_vector += 1;
         }
         occurrences.push(MemberOccurrence {
-            project: project.to_string(),
+            project: store_key.to_string(),
             cx: member.id,
             qualified_name: frames.qualified_name.clone(),
             rel_file_path: frames.rel_file_path.clone(),
@@ -457,7 +464,7 @@ pub fn load_repo_kernel(
     }
 
     Ok(Some(RepoKernelLoad {
-        project: project.to_string(),
+        project: store_key.to_string(),
         members_hash: artifact.members_hash.clone(),
         node_count: artifact.node_count,
         recall_permille: artifact.recall.permille,
@@ -863,11 +870,14 @@ pub fn compose_fleet_kernel(
     let mut loads: Vec<RepoKernelLoad> = Vec::new();
     let mut skipped: Vec<Value> = Vec::new();
     for project in projects {
-        match load_repo_kernel(store_root, project)? {
+        let identity = catalog_store_identity(catalog, project)?;
+        match load_repo_kernel(store_root, &identity.store_key, &identity.index_project)? {
             Some(load) => loads.push(load),
             None => skipped.push(json!({
                 "project": project,
-                "reason": "no persisted kernel artifact in the project vault",
+                "index_project": identity.index_project,
+                "kernel_scope": identity.kernel_scope,
+                "reason": "no persisted kernel artifact in the bound project vault",
             })),
         }
     }
@@ -1538,8 +1548,9 @@ pub fn verify_member_provenance(
 
     let mut verified = 0_usize;
     for (project, claims) in &by_project {
-        let vault = open_shadow_vault(store_root, project)?;
-        let by_cx = input_atoms_by_cx(&vault, project)?;
+        let identity = catalog_store_identity(catalog, project)?;
+        let vault = open_shadow_vault(store_root, &identity.store_key, &identity.index_project)?;
+        let by_cx = input_atoms_by_cx(&vault, &identity.index_project)?;
         for (fleet_cx, claim) in claims {
             let cx_str = claim.get("cx").and_then(Value::as_str).unwrap_or("");
             let cx = CxId::from_str(cx_str).map_err(|error| CalyxError {

@@ -800,10 +800,21 @@ fn run(args: &[String]) -> Result<(), CalyxError> {
             };
             let mut per_project = Vec::with_capacity(projects.len());
             for project in &projects {
-                let atoms = astrolabe_fleet::dedup::project_atoms(&store_root, project)?;
+                let identity =
+                    astrolabe_fleet::orchestrator::catalog_store_identity(&catalog, project)?;
+                let atoms = astrolabe_fleet::dedup::project_atoms(
+                    &store_root,
+                    &identity.store_key,
+                    &identity.index_project,
+                )?;
                 eprintln!(
                     "{}",
-                    serde_json::json!({ "project": project, "atoms": atoms.len() })
+                    serde_json::json!({
+                        "project": project,
+                        "index_project": identity.index_project,
+                        "kernel_scope": identity.kernel_scope,
+                        "atoms": atoms.len(),
+                    })
                 );
                 per_project.push((project.clone(), atoms));
             }
@@ -953,13 +964,24 @@ fn run(args: &[String]) -> Result<(), CalyxError> {
             let project = opts
                 .get("project")
                 .ok_or_else(|| usage("probe-vault-keys needs --project <org__repo>"))?;
-            let keys = astrolabe_fleet::orchestrator::vault_base_keys(&store_root, project)?;
+            let identity =
+                astrolabe_fleet::orchestrator::catalog_store_identity(&catalog, project)?;
+            let keys = astrolabe_fleet::orchestrator::vault_base_keys(
+                &store_root,
+                &identity.store_key,
+                &identity.index_project,
+            )?;
             for key in &keys {
                 println!("{key}");
             }
             eprintln!(
                 "{}",
-                serde_json::json!({ "project": project, "base_keys": keys.len() })
+                serde_json::json!({
+                    "project": project,
+                    "index_project": identity.index_project,
+                    "kernel_scope": identity.kernel_scope,
+                    "base_keys": keys.len(),
+                })
             );
             Ok(())
         }

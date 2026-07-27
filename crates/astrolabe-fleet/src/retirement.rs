@@ -23,6 +23,7 @@ use serde_json::{Value, json};
 use crate::catalog::FleetCatalog;
 use crate::clone_farm::{git_capture, integrity_gate, same_remote, target_dir};
 use crate::compose::{FLEET_KERNEL_REPORT_KIND, load_repo_kernel, read_fleet_kernel};
+use crate::orchestrator::repo_store_identity;
 use crate::record::{FleetRepoRow, SourceRetirement, SourceRetirementStage};
 use crate::state::RepoState;
 
@@ -663,8 +664,9 @@ fn verify_kernel_binding(
     expected_repo_hash: Option<&str>,
 ) -> Result<KernelBinding, CalyxError> {
     let name = row.record.full_name.as_str();
-    let project = name.replace('/', "__");
-    let repo = load_repo_kernel(store_root, &project)?
+    let identity = repo_store_identity(row)?;
+    let project = identity.store_key;
+    let repo = load_repo_kernel(store_root, &project, &identity.index_project)?
         .ok_or_else(|| refusal(name, "per-repo persisted kernel is absent"))?;
     if let Some(expected) = expected_repo_hash
         && repo.members_hash != expected

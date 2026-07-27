@@ -148,10 +148,14 @@ pub fn parse_atom_frames(bytes: &[u8]) -> Result<AtomFrames, CalyxError> {
 /// Reads every stored atom input of `project`'s shadow vault and returns the
 /// parsed frames. Fails closed on any unreadable or unparseable input; a vault
 /// with zero stored inputs returns an empty vec (the caller labels it).
-pub fn project_atoms(store_root: &Path, project: &str) -> Result<Vec<AtomFrames>, CalyxError> {
+pub fn project_atoms(
+    store_root: &Path,
+    store_key: &str,
+    index_project: &str,
+) -> Result<Vec<AtomFrames>, CalyxError> {
     let vault_dir = store_root
-        .join(project)
-        .join(format!("{project}.astrolabe-vault"));
+        .join(store_key)
+        .join(format!("{index_project}.astrolabe-vault"));
     let vault_id = VaultId::from_str(SHADOW_VAULT_ID).map_err(|error| CalyxError {
         code: ASTRO_FLEET_DEDUP_FRAME_INVALID,
         message: format!("shadow vault id failed to parse: {error:?}"),
@@ -160,7 +164,7 @@ pub fn project_atoms(store_root: &Path, project: &str) -> Result<Vec<AtomFrames>
     let vault = AsterVault::open(
         &vault_dir,
         vault_id,
-        shadow_vault_salt(project).into_bytes(),
+        shadow_vault_salt(index_project).into_bytes(),
         VaultOptions {
             read_only: true,
             ..VaultOptions::default()
