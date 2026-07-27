@@ -4212,6 +4212,7 @@ public class AstroTreeRecorder {
     const int FileDispositionInfo = 4;
     const int FileLinkInfo = 11;
     const int FileIdInfo = 18;
+    const int FileDispositionInfoEx = 21;
     const uint JOB_OBJECT_MSG_NEW_PROCESS = 6;
     const uint JOB_OBJECT_MSG_EXIT_PROCESS = 7;
     const uint JOB_OBJECT_MSG_ABNORMAL_EXIT_PROCESS = 8;
@@ -4247,6 +4248,9 @@ public class AstroTreeRecorder {
     const uint FILE_FLAG_BACKUP_SEMANTICS = 0x02000000;
     const uint FILE_FLAG_DELETE_ON_CLOSE = 0x04000000;
     const uint FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000;
+    const uint FILE_DISPOSITION_FLAG_DELETE = 0x00000001;
+    const uint FILE_DISPOSITION_FLAG_POSIX_SEMANTICS = 0x00000002;
+    const uint FILE_DISPOSITION_FLAG_ON_CLOSE = 0x00000008;
     const uint INVALID_FILE_ATTRIBUTES = 0xffffffff;
 
     [StructLayout(LayoutKind.Sequential)]
@@ -5318,6 +5322,28 @@ public class AstroTreeRecorder {
         }
     }
 
+    static void SetPosixDeleteOnCloseDisposition(SafeFileHandle source, string description) {
+        IntPtr buffer = Marshal.AllocHGlobal(sizeof(uint));
+        try {
+            uint flags = FILE_DISPOSITION_FLAG_DELETE |
+                FILE_DISPOSITION_FLAG_POSIX_SEMANTICS |
+                FILE_DISPOSITION_FLAG_ON_CLOSE;
+            Marshal.WriteInt32(buffer, unchecked((int)flags));
+            if (!SetFileInformationByHandle(
+                    source,
+                    FileDispositionInfoEx,
+                    buffer,
+                    sizeof(uint)
+                ))
+                throw new Win32Exception(
+                    Marshal.GetLastWin32Error(),
+                    "could not set exact POSIX FILE_DISPOSITION_INFO_EX for " + description
+                );
+        } finally {
+            Marshal.FreeHGlobal(buffer);
+        }
+    }
+
     static string Sha256Hex(byte[] bytes) {
         using (SHA256 sha = SHA256.Create()) {
             byte[] digest = sha.ComputeHash(bytes);
@@ -5674,6 +5700,19 @@ public class AstroTreeRecorder {
             stage = "create-no-replace-hard-link";
             LinkHandleNoReplace(scratch.SafeFileHandle, destination);
             scratch.Flush(true);
+
+            // FILE_FLAG_DELETE_ON_CLOSE uses legacy delete semantics: the
+            // scratch link can remain delete-pending until every handle to the
+            // file closes. The identity observer below intentionally remains
+            // open, so convert this already-delete-on-close handle to POSIX
+            // on-close semantics before opening it. Closing the scratch handle
+            // then removes only its visible link immediately while the final
+            // hard link and observer stay bound to the same FILE_OBJECT.
+            stage = "configure-posix-delete-on-close";
+            SetPosixDeleteOnCloseDisposition(
+                scratch.SafeFileHandle,
+                description + " scratch"
+            );
 
             stage = "open-final-identity-observer";
             observer = OpenLinkedObserver(destination, description + " linked observer");
