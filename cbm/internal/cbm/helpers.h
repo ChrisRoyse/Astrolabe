@@ -12,6 +12,13 @@ void *cbm_memmem(const void *haystack, size_t haystack_len, const void *needle, 
 // Extract text of a node from source. Returns arena-allocated string.
 char *cbm_node_text(CBMArena *a, TSNode node, const char *source);
 
+// Extract the nominal implementing type from a Rust impl_item `type` node.
+// Tree-sitter preserves generic arguments in that node (`HashingWriter<W>`),
+// while definition identity is the base nominal type (`HashingWriter`). Keep
+// this normalization shared by every extractor so method/field QNs cannot
+// diverge. Returns an arena-allocated string.
+char *cbm_rust_impl_nominal_type(CBMArena *a, TSNode type_node, const char *source);
+
 // Truncate a NUL-terminated, valid-UTF-8 string IN PLACE to at most
 // `max_bytes` bytes WITHOUT splitting a multibyte character. If the cut point
 // lands inside a multibyte sequence (the byte at `max_bytes` is a UTF-8

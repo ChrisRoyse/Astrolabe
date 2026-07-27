@@ -82,6 +82,18 @@ char *cbm_node_text(CBMArena *a, TSNode node, const char *source) {
     return cbm_arena_strndup(a, source + start, end - start);
 }
 
+char *cbm_rust_impl_nominal_type(CBMArena *a, TSNode type_node, const char *source) {
+    char *type_name = cbm_node_text(a, type_node, source);
+    if (!type_name) {
+        return NULL;
+    }
+    char *generic = strchr(type_name, '<');
+    if (generic) {
+        *generic = '\0';
+    }
+    return type_name;
+}
+
 // --- Keyword sets per language ---
 
 static const char *go_keywords[] = {
@@ -945,22 +957,17 @@ const char *cbm_enclosing_func_qn(CBMArena *a, TSNode node, CBMLanguage lang, co
                 continue;
             }
             TSNode class_name = ts_node_child_by_field_name(cur, TS_FIELD("name"));
+            if (ts_node_is_null(class_name) && lang == CBM_LANG_RUST &&
+                strcmp(ts_node_type(cur), "impl_item") == 0) {
+                class_name = ts_node_child_by_field_name(cur, TS_FIELD("type"));
+            }
             if (ts_node_is_null(class_name)) {
                 continue;
             }
-            char *cname = cbm_node_text(a, class_name, source);
+            char *cname = lang == CBM_LANG_RUST ? cbm_rust_impl_nominal_type(a, class_name, source)
+                                                : cbm_node_text(a, class_name, source);
             if (!cname || !cname[0]) {
                 continue;
-            }
-            /* Rust definition extraction binds associated methods to the
-             * nominal implementing type (`HashingWriter`), not the impl's
-             * generic spelling (`HashingWriter<W>`). Preserve that same stable
-             * owner identity in every semantic extractor. */
-            if (lang == CBM_LANG_RUST) {
-                char *generic = strchr(cname, '<');
-                if (generic) {
-                    *generic = '\0';
-                }
             }
             class_chain = class_chain ? cbm_arena_sprintf(a, "%s.%s", cname, class_chain) : cname;
         }

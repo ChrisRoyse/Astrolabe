@@ -450,7 +450,9 @@ static const char *compute_class_qn(CBMExtractCtx *ctx, TSNode node, const WalkS
         return NULL;
     }
 
-    char *name = cbm_node_text(ctx->arena, name_node, ctx->source);
+    char *name = ctx->language == CBM_LANG_RUST && strcmp(ts_node_type(node), "impl_item") == 0
+                     ? cbm_rust_impl_nominal_type(ctx->arena, name_node, ctx->source)
+                     : cbm_node_text(ctx->arena, name_node, ctx->source);
     if (!name || !name[0]) {
         return NULL;
     }
@@ -1147,7 +1149,7 @@ static void push_boundary_scopes(CBMExtractCtx *ctx, TSNode node, const CBMLangS
     } else if (ctx->language == CBM_LANG_RUST && strcmp(ts_node_type(node), "impl_item") == 0) {
         TSNode type_node = ts_node_child_by_field_name(node, TS_FIELD("type"));
         if (!ts_node_is_null(type_node)) {
-            char *type_name = cbm_node_text(ctx->arena, type_node, ctx->source);
+            char *type_name = cbm_rust_impl_nominal_type(ctx->arena, type_node, ctx->source);
             if (type_name && type_name[0]) {
                 const char *tqn =
                     cbm_fqn_compute(ctx->arena, ctx->project, ctx->rel_path, type_name);

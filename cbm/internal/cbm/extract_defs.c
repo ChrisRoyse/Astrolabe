@@ -4270,17 +4270,9 @@ static void extract_rust_impl(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec
         return;
     }
 
-    char *type_name = cbm_node_text(a, type_node, ctx->source);
+    char *type_name = cbm_rust_impl_nominal_type(a, type_node, ctx->source);
     if (!type_name || !type_name[0]) {
         return;
-    }
-    /* Strip generic args from the implementing type: `Buffer<T>` → `Buffer`,
-     * `Wrapper<T>` → `Wrapper`. The struct identity is the base name. */
-    {
-        char *lt = strchr(type_name, '<');
-        if (lt) {
-            *lt = '\0';
-        }
     }
 
     // Check for "impl Trait for Struct" pattern
