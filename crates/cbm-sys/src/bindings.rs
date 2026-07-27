@@ -2683,7 +2683,7 @@ unsafe extern "C" {
         node_id: i64,
         in_deg: *mut ::std::os::raw::c_int,
         out_deg: *mut ::std::os::raw::c_int,
-    );
+    ) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {
     pub fn cbm_store_node_neighbor_names(
@@ -2960,6 +2960,9 @@ unsafe extern "C" {
 }
 unsafe extern "C" {
     pub fn cbm_store_error_code(s: *mut cbm_store_t) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn cbm_store_clear_error(s: *mut cbm_store_t);
 }
 unsafe extern "C" {
     pub fn cbm_store_begin(s: *mut cbm_store_t) -> ::std::os::raw::c_int;

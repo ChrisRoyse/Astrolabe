@@ -2189,7 +2189,9 @@ static const char *node_prop(const cbm_node_t *n, const char *prop, cbm_store_t 
     if (store && (strcmp(prop, "in_degree") == 0 || strcmp(prop, "out_degree") == 0)) {
         int in_deg = 0;
         int out_deg = 0;
-        cbm_store_node_degree(store, n->id, &in_deg, &out_deg);
+        if (cbm_store_node_degree(store, n->id, &in_deg, &out_deg) != CBM_STORE_OK) {
+            return "";
+        }
         int val = (strcmp(prop, "in_degree") == 0) ? in_deg : out_deg;
         snprintf(out, CBM_SZ_512, "%d", val);
         return out;
@@ -4888,6 +4890,7 @@ static int execute_single(cbm_store_t *store, cbm_query_t *q, const char *projec
 int cbm_cypher_execute(cbm_store_t *store, const char *query, const char *project, int max_rows,
                        cbm_cypher_result_t *out) {
     memset(out, 0, sizeof(*out));
+    cbm_store_clear_error(store);
     if (max_rows <= 0) {
         max_rows = CYPHER_RESULT_CEILING;
     }
@@ -4905,7 +4908,17 @@ int cbm_cypher_execute(cbm_store_t *store, const char *query, const char *projec
     if (execute_single(store, q, project, max_rows, union_context, &rb) < 0) {
         rb_free(&rb);
         cbm_query_free(q);
-        out->error = heap_strdup("Cypher execution failed before a complete result was assembled");
+        const char *store_error = cbm_store_error(store);
+        out->error =
+            heap_strdup(store_error && store_error[0]
+                            ? store_error
+                            : "Cypher execution failed before a complete result was assembled");
+        return CBM_NOT_FOUND;
+    }
+    if (cbm_store_error(store)[0]) {
+        rb_free(&rb);
+        cbm_query_free(q);
+        out->error = heap_strdup(cbm_store_error(store));
         return CBM_NOT_FOUND;
     }
 
@@ -4918,6 +4931,15 @@ int cbm_cypher_execute(cbm_store_t *store, const char *query, const char *projec
             rb_free(&rb);
             rb_free(&rb2);
             cbm_query_free(q);
+            out->error = heap_strdup(cbm_store_error(store)[0] ? cbm_store_error(store)
+                                                               : "Cypher UNION execution failed");
+            return CBM_NOT_FOUND;
+        }
+        if (cbm_store_error(store)[0]) {
+            rb_free(&rb);
+            rb_free(&rb2);
+            cbm_query_free(q);
+            out->error = heap_strdup(cbm_store_error(store));
             return CBM_NOT_FOUND;
         }
         /* Concatenate rows from rb2 into rb */

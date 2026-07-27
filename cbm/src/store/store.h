@@ -125,8 +125,11 @@ int cbm_store_find_nodes_by_file_overlap(cbm_store_t *s, const char *project, co
 int cbm_store_find_nodes_by_qn_suffix(cbm_store_t *s, const char *project, const char *suffix,
                                       cbm_node_t **out, int *count);
 
-/* Get CALLS degree of a node (inbound and outbound). */
-void cbm_store_node_degree(cbm_store_t *s, int64_t node_id, int *in_deg, int *out_deg);
+/* Get CALLS degree of a node (inbound and outbound).
+ * Returns CBM_STORE_OK only when both exact counts were read. On failure both
+ * outputs remain zero and cbm_store_error()/cbm_store_error_code() retain the
+ * causal SQLite operation. */
+int cbm_store_node_degree(cbm_store_t *s, int64_t node_id, int *in_deg, int *out_deg);
 
 /* Get caller/callee names for a node (CALLS/HTTP_CALLS/ASYNC_CALLS edges).
  * Returns 0 on success. Caller must free each out_callers[i]/out_callees[i]
@@ -336,6 +339,9 @@ const char *cbm_store_error(cbm_store_t *s);
 
 /* Get SQLite's exact extended result code for the last operation. */
 int cbm_store_error_code(cbm_store_t *s);
+
+/* Clear the retained error at the start of a compound store operation. */
+void cbm_store_clear_error(cbm_store_t *s);
 
 /* ── Transaction ────────────────────────────────────────────────── */
 

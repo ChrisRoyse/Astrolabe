@@ -155,6 +155,7 @@ struct cbm_store {
     sqlite3 *db;
     const char *db_path; /* heap-allocated, or NULL for :memory: */
     char errbuf[CBM_SZ_512];
+    int errcode;
 
     /* Prepared statements (lazily initialized, cached for lifetime) */
     sqlite3_stmt *stmt_upsert_node;
@@ -200,10 +201,26 @@ struct cbm_store {
 
 static void store_set_error(cbm_store_t *s, const char *msg) {
     snprintf(s->errbuf, sizeof(s->errbuf), "%s", msg);
+    s->errcode = SQLITE_ERROR;
 }
 
 static void store_set_error_sqlite(cbm_store_t *s, const char *prefix) {
     snprintf(s->errbuf, sizeof(s->errbuf), "%s: %s", prefix, sqlite3_errmsg(s->db));
+    s->errcode = sqlite3_extended_errcode(s->db);
+}
+
+static void store_set_error_sqlite_code(cbm_store_t *s, const char *prefix, int sqlite_code) {
+    const char *detail = sqlite3_errstr(sqlite_code);
+    if (sqlite3_extended_errcode(s->db) == sqlite_code) {
+        const char *connection_detail = sqlite3_errmsg(s->db);
+        if (connection_detail && connection_detail[0] &&
+            strcmp(connection_detail, "not an error") != 0) {
+            detail = connection_detail;
+        }
+    }
+    snprintf(s->errbuf, sizeof(s->errbuf), "%s: %s", prefix,
+             detail && detail[0] ? detail : "SQLite operation failed");
+    s->errcode = sqlite_code;
 }
 
 /* Grow an authoritative store result without changing either the pointer or
@@ -3124,7 +3141,15 @@ const char *cbm_store_error(cbm_store_t *s) {
 }
 
 int cbm_store_error_code(cbm_store_t *s) {
-    return s && s->db ? sqlite3_extended_errcode(s->db) : SQLITE_MISUSE;
+    return s ? s->errcode : SQLITE_MISUSE;
+}
+
+void cbm_store_clear_error(cbm_store_t *s) {
+    if (!s) {
+        return;
+    }
+    s->errbuf[0] = '\0';
+    s->errcode = SQLITE_OK;
 }
 
 /* ── Transaction ────────────────────────────────────────────────── */
@@ -4436,35 +4461,86 @@ int cbm_store_find_nodes_by_qn_suffix(cbm_store_t *s, const char *project, const
 
 /* ── NodeDegree ────────────────────────────────────────────────── */
 
-void cbm_store_node_degree(cbm_store_t *s, int64_t node_id, int *in_deg, int *out_deg) {
-    if (!s) {
-        if (in_deg)
-            *in_deg = 0;
-        if (out_deg)
-            *out_deg = 0;
-        return;
-    }
-    *in_deg = 0;
-    *out_deg = 0;
-
-    const char *in_sql = "SELECT COUNT(*) FROM edges WHERE target_id = ?1 AND type = 'CALLS'";
+static int query_node_degree(cbm_store_t *s, const char *sql, int64_t node_id, int *degree,
+                             const char *operation) {
     sqlite3_stmt *stmt = NULL;
-    if (sqlite3_prepare_v2(s->db, in_sql, CBM_NOT_FOUND, &stmt, NULL) == SQLITE_OK) {
-        sqlite3_bind_int64(stmt, SKIP_ONE, node_id);
-        if (sqlite3_step(stmt) == SQLITE_ROW) {
-            *in_deg = sqlite3_column_int(stmt, 0);
-        }
+    int rc = sqlite3_prepare_v2(s->db, sql, CBM_NOT_FOUND, &stmt, NULL);
+    if (rc != SQLITE_OK) {
+        char detail[CBM_SZ_128];
+        snprintf(detail, sizeof(detail), "node_degree %s prepare", operation);
+        store_set_error_sqlite_code(s, detail, rc);
+        return CBM_STORE_ERR;
+    }
+
+    rc = sqlite3_bind_int64(stmt, SKIP_ONE, node_id);
+    if (rc != SQLITE_OK) {
+        char detail[CBM_SZ_128];
+        snprintf(detail, sizeof(detail), "node_degree %s bind node", operation);
+        store_set_error_sqlite_code(s, detail, rc);
         sqlite3_finalize(stmt);
+        return CBM_STORE_ERR;
+    }
+
+    rc = sqlite3_step(stmt);
+    if (rc != SQLITE_ROW) {
+        char detail[CBM_SZ_128];
+        snprintf(detail, sizeof(detail), "node_degree %s step", operation);
+        store_set_error_sqlite_code(s, detail, rc);
+        sqlite3_finalize(stmt);
+        return CBM_STORE_ERR;
+    }
+    sqlite3_int64 value = sqlite3_column_int64(stmt, 0);
+    if (value < 0 || value > INT_MAX) {
+        char detail[CBM_SZ_128];
+        snprintf(detail, sizeof(detail), "node_degree %s count", operation);
+        store_set_error_sqlite_code(s, detail, SQLITE_TOOBIG);
+        sqlite3_finalize(stmt);
+        return CBM_STORE_ERR;
+    }
+
+    rc = sqlite3_finalize(stmt);
+    if (rc != SQLITE_OK) {
+        char detail[CBM_SZ_128];
+        snprintf(detail, sizeof(detail), "node_degree %s finalize", operation);
+        store_set_error_sqlite_code(s, detail, rc);
+        return CBM_STORE_ERR;
+    }
+
+    *degree = (int)value;
+    return CBM_STORE_OK;
+}
+
+int cbm_store_node_degree(cbm_store_t *s, int64_t node_id, int *in_deg, int *out_deg) {
+    if (in_deg) {
+        *in_deg = 0;
+    }
+    if (out_deg) {
+        *out_deg = 0;
+    }
+    if (!s) {
+        return CBM_STORE_ERR;
+    }
+    if (!in_deg || !out_deg) {
+        store_set_error(s, "node_degree received a null output pointer");
+        s->errcode = SQLITE_MISUSE;
+        return CBM_STORE_ERR;
+    }
+
+    int inbound = 0;
+    int outbound = 0;
+    const char *in_sql = "SELECT COUNT(*) FROM edges WHERE target_id = ?1 AND type = 'CALLS'";
+    if (query_node_degree(s, in_sql, node_id, &inbound, "inbound") != CBM_STORE_OK) {
+        return CBM_STORE_ERR;
     }
 
     const char *out_sql = "SELECT COUNT(*) FROM edges WHERE source_id = ?1 AND type = 'CALLS'";
-    if (sqlite3_prepare_v2(s->db, out_sql, CBM_NOT_FOUND, &stmt, NULL) == SQLITE_OK) {
-        sqlite3_bind_int64(stmt, SKIP_ONE, node_id);
-        if (sqlite3_step(stmt) == SQLITE_ROW) {
-            *out_deg = sqlite3_column_int(stmt, 0);
-        }
-        sqlite3_finalize(stmt);
+    if (query_node_degree(s, out_sql, node_id, &outbound, "outbound") != CBM_STORE_OK) {
+        return CBM_STORE_ERR;
     }
+
+    *in_deg = inbound;
+    *out_deg = outbound;
+    return CBM_STORE_OK;
 }
 
 /* ── Node neighbor names ──────────────────────────────────────── */

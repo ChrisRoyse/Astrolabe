@@ -3602,6 +3602,18 @@ static char *handle_query_graph(cbm_mcp_server_t *srv, const char *args) {
     int rc = cbm_cypher_execute(store, query, project, max_rows, &result);
 
     if (rc < 0) {
+        if (cbm_store_error(store)[0]) {
+            record_store_query_failure(srv, project, cbm_store_db_path(store), store,
+                                       CBM_STORE_VERIFY_IO_FAILED, "query_graph.execute",
+                                       cbm_store_error(store));
+            char *error = build_recorded_store_error(srv);
+            char *resp = cbm_mcp_text_result(error, true);
+            free(error);
+            cbm_cypher_result_free(&result);
+            free(query);
+            free(project);
+            return resp;
+        }
         char *err_msg = result.error ? result.error : "query execution failed";
         char *resp = cbm_mcp_text_result(err_msg, true);
         cbm_cypher_result_free(&result);
@@ -6626,7 +6638,18 @@ static char *build_snippet_response(cbm_mcp_server_t *srv, cbm_store_t *store, c
     /* Caller/callee counts — store already resolved by calling handler */
     int in_deg = 0;
     int out_deg = 0;
-    cbm_store_node_degree(store, node->id, &in_deg, &out_deg);
+    int degree_status = cbm_store_node_degree(store, node->id, &in_deg, &out_deg);
+    if (degree_status != CBM_STORE_OK) {
+        record_store_query_failure(srv, node->project, cbm_store_db_path(store), store,
+                                   CBM_STORE_VERIFY_IO_FAILED, "source.query_snippet_degree",
+                                   cbm_store_error(store));
+        char *result = build_recorded_store_error(srv);
+        yyjson_mut_doc_free(doc);
+        yyjson_doc_free(props_doc);
+        free(root_path);
+        verified_source_free(&verified);
+        return result;
+    }
     yyjson_mut_obj_add_int(doc, root_obj, "callers", in_deg);
     yyjson_mut_obj_add_int(doc, root_obj, "callees", out_deg);
 
