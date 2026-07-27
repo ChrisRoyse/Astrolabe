@@ -18,9 +18,11 @@
 
 typedef struct cbm_store cbm_store_t;
 
-/* Result of a source-preserving integrity verification.  The verifier freezes
- * the complete source DB/WAL/SHM family before inspecting a separate snapshot,
- * so SQLite never opens a source family that is about to be rejected. */
+/* Result of a source-preserving integrity verification. The verifier freezes
+ * the complete source DB/WAL/SHM family before use. A sidecar-free database may
+ * reuse a prior full verification only through an atomically published receipt
+ * bound to its exact bytes, SQLite build, schema, contract, and project; all
+ * other generations are inspected through a separate verified snapshot. */
 typedef enum {
     CBM_STORE_VERIFY_OK = 0,
     CBM_STORE_VERIFY_SOURCE_MISSING = 1,

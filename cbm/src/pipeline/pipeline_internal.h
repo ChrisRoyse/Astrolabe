@@ -13,6 +13,7 @@
 #include "graph_buffer/graph_buffer.h"
 #include "graph_buffer/load_error.h"
 #include "discover/discover.h"
+#include "store/store.h"
 #include "foundation/hash_table.h"
 #include "cbm.h"
 #include "lsp/go_lsp.h" /* CBMLSPDef for cbm_parallel_resolve cross-LSP inputs */
@@ -681,11 +682,12 @@ int cbm_pipeline_unique_stage_path(const char *db_path, const char *kind, char *
 
 /* ── Incremental pipeline (pipeline_incremental.c) ───────────────── */
 
-/* Run incremental re-index on an existing disk DB.
- * Classifies files by mtime+size, deletes changed nodes, re-parses changed
- * files, merges into disk DB. Returns 0 on success. */
+/* Run incremental re-index against an already verified read-only store and its
+ * complete persisted hash set. This function takes ownership of store/stored,
+ * classifies exact captured SHA-256 values, and opens no live writer. */
 int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_file_info_t *files,
-                                 int file_count);
+                                 int file_count, cbm_store_t *store, cbm_file_hash_t *stored,
+                                 int stored_count);
 
 enum { CBM_INCREMENTAL_REBUILD_REQUIRED = 2 };
 

@@ -1942,6 +1942,154 @@ static int preserve_existing_adr(cbm_pipeline_t *p, cbm_store_t *store, const ch
     return 0;
 }
 
+/* Before paying for a complete mirrored source generation, prove whether the
+ * current repository is byte-identical to the persisted generation. This path
+ * is intentionally available only when no complete-row sink is registered:
+ * such a sink requires a full materialized stream even for an unchanged graph.
+ *
+ * Returns 0 when an exact read-only no-op completed, PL_ROUTE_FULL when source
+ * capture/routing must continue, or CBM_NOT_FOUND on an unevaluable state. */
+static int try_unchanged_before_snapshot(cbm_pipeline_t *p, const cbm_discover_opts_t *opts,
+                                         cbm_file_info_t *files, int file_count) {
+    if (p->mode == CBM_MODE_FULL || cbm_pipeline_row_sink_active(p)) {
+        return PL_ROUTE_FULL;
+    }
+
+    char *db_path = resolve_db_path(p);
+    if (!db_path) {
+        return CBM_NOT_FOUND;
+    }
+    struct stat db_st;
+    if (stat(db_path, &db_st) != 0) {
+        int stat_error = errno;
+        free(db_path);
+        if (stat_error == ENOENT || stat_error == ENOTDIR) {
+            return PL_ROUTE_FULL;
+        }
+        cbm_log_error("pipeline.unchanged_failed", "code",
+                      "CBM_PIPELINE_UNCHANGED_STORE_STAT_FAILED", "message",
+                      "the existing store path could not be inspected before source capture",
+                      "remediation", "restore store access and retry indexing");
+        return CBM_NOT_FOUND;
+    }
+
+    cbm_store_t *store = NULL;
+    cbm_store_verify_result_t verification = {0};
+    cbm_store_verify_status_t status =
+        cbm_store_open_path_project_query_verified(db_path, p->project_name, &store, &verification);
+    if (status != CBM_STORE_VERIFY_OK || !store) {
+        char native_error[32];
+        char sqlite_error[32];
+        (void)snprintf(native_error, sizeof(native_error), "%lu",
+                       (unsigned long)verification.native_error);
+        (void)snprintf(sqlite_error, sizeof(sqlite_error), "%d", verification.sqlite_error);
+        const char *detail = verification.detail[0]
+                                 ? verification.detail
+                                 : "the existing store could not be verified before source capture";
+        cbm_log_error("pipeline.unchanged_failed", "code",
+                      "CBM_PIPELINE_UNCHANGED_STORE_PROVENANCE_FAILED", "operation",
+                      verification.operation[0] ? verification.operation : "verify_unchanged_store",
+                      "store_path", db_path, "project", p->project_name, "native_error",
+                      native_error, "sqlite_error", sqlite_error, "message", detail, "remediation",
+                      "preserve the complete store family, repair the exact diagnostic, and retry");
+        cbm_pipeline_record_fatal_error(
+            p, "CBM_PIPELINE_UNCHANGED_STORE_PROVENANCE_FAILED",
+            verification.operation[0] ? verification.operation : "verify_unchanged_store",
+            "unchanged_route", db_path, 0, detail,
+            "preserve the complete store family, repair the exact diagnostic, and retry");
+        if (store) {
+            cbm_store_close(store);
+        }
+        free(db_path);
+        return CBM_NOT_FOUND;
+    }
+    if (validate_existing_store_project_identity(p, store, db_path) != 0 ||
+        preserve_existing_adr(p, store, db_path) != 0) {
+        cbm_store_close(store);
+        free(db_path);
+        return CBM_NOT_FOUND;
+    }
+    if (verification.db_sha256[0] == '\0') {
+        cbm_pipeline_record_fatal_error(
+            p, "CBM_PIPELINE_UNCHANGED_STORE_DIGEST_MISSING", "verify_unchanged_store",
+            "unchanged_route", db_path, 0,
+            "verified unchanged routing did not retain the live database SHA-256",
+            "preserve the store family and inspect the verifier before retrying");
+        cbm_store_close(store);
+        free(db_path);
+        return CBM_NOT_FOUND;
+    }
+
+    cbm_file_hash_t *hashes = NULL;
+    int hash_count = 0;
+    if (cbm_store_get_file_hashes(store, p->project_name, &hashes, &hash_count) != CBM_STORE_OK) {
+        const char *detail = cbm_store_error(store);
+        cbm_pipeline_record_fatal_error(
+            p, "CBM_PIPELINE_UNCHANGED_HASH_ROWS_READ_FAILED", "read_unchanged_file_hashes",
+            "unchanged_route", db_path, 0,
+            detail && detail[0] ? detail
+                                : "the complete persisted file identity set could not be read",
+            "preserve the store, repair the exact SQLite diagnostic, and retry");
+        cbm_store_free_file_hashes(hashes, hash_count);
+        cbm_store_close(store);
+        free(db_path);
+        return CBM_NOT_FOUND;
+    }
+    if (hash_count <= 0 || file_count != hash_count) {
+        cbm_store_free_file_hashes(hashes, hash_count);
+        cbm_store_close(store);
+        free(db_path);
+        return PL_ROUTE_FULL;
+    }
+
+    cbm_pipeline_phase_probe_t verify_probe =
+        cbm_pipeline_phase_probe_start(p, "unchanged_source_verify");
+    bool unchanged = false;
+    int source_status = cbm_source_snapshot_verify_unchanged(p->repo_path, opts, files, file_count,
+                                                             hashes, hash_count, &unchanged);
+    cbm_pipeline_phase_probe_end(p, "unchanged_source_verify", &verify_probe);
+    cbm_store_free_file_hashes(hashes, hash_count);
+    if (source_status != 0) {
+        cbm_store_close(store);
+        free(db_path);
+        return CBM_NOT_FOUND;
+    }
+    if (!unchanged) {
+        cbm_store_close(store);
+        free(db_path);
+        return PL_ROUTE_FULL;
+    }
+
+    cbm_pipeline_phase_probe_t finish_probe =
+        cbm_pipeline_phase_probe_start(p, "unchanged_result_readback");
+    int committed_nodes = cbm_store_count_nodes(store, p->project_name);
+    int committed_edges = cbm_store_count_edges(store, p->project_name);
+    if (committed_nodes < 0 || committed_edges < 0) {
+        const char *detail = cbm_store_error(store);
+        cbm_pipeline_record_fatal_error(
+            p, "CBM_PIPELINE_UNCHANGED_COUNTS_READ_FAILED", "read_unchanged_graph_counts",
+            "unchanged_route", db_path, 0,
+            detail && detail[0] ? detail : "the exact persisted graph counts could not be read",
+            "preserve the store, repair the exact SQLite diagnostic, and retry");
+        cbm_store_close(store);
+        free(db_path);
+        return CBM_NOT_FOUND;
+    }
+    cbm_store_close(store);
+
+    p->routed_store_present = true;
+    p->routed_store_bytes = verification.db_bytes;
+    (void)snprintf(p->routed_store_sha256, sizeof(p->routed_store_sha256), "%s",
+                   verification.db_sha256);
+    cbm_pipeline_set_committed_counts(p, committed_nodes, committed_edges);
+    cbm_pipeline_phase_probe_end(p, "unchanged_result_readback", &finish_probe);
+    cbm_log_info("pipeline.route", "path", "unchanged_read_only", "source_snapshot_started",
+                 "false", "sqlite_publication_started", "false", "nodes", itoa_buf(committed_nodes),
+                 "edges", itoa_buf(committed_edges));
+    free(db_path);
+    return 0;
+}
+
 /* Try incremental pipeline or select an atomic full reindex.
  * Returns 0 when incremental completed, PL_ROUTE_FULL when a full rebuild is
  * required, or CBM_NOT_FOUND on a terminal error. */
@@ -2091,15 +2239,15 @@ static int try_incremental_or_delete_db(cbm_pipeline_t *p, cbm_file_info_t *file
         free(db_path);
         return CBM_NOT_FOUND;
     }
-    cbm_store_free_file_hashes(hashes, hash_count);
-    cbm_store_close(identity_store);
-
     if (hash_count > 0 && file_count <= hash_count + (hash_count / PAIR_LEN)) {
         cbm_log_info("pipeline.route", "path", "incremental", "stored_hashes",
                      itoa_buf(hash_count));
         cbm_pipeline_phase_probe_t incremental_probe =
             cbm_pipeline_phase_probe_start(p, "incremental_total");
-        int rc = cbm_pipeline_run_incremental(p, db_path, files, file_count);
+        int rc = cbm_pipeline_run_incremental(p, db_path, files, file_count, identity_store, hashes,
+                                              hash_count);
+        identity_store = NULL;
+        hashes = NULL;
         cbm_pipeline_phase_probe_end(p, "incremental_total", &incremental_probe);
         if (rc == CBM_INCREMENTAL_REBUILD_REQUIRED) {
             cbm_log_info("pipeline.route", "path", "full", "reason",
@@ -2109,6 +2257,8 @@ static int try_incremental_or_delete_db(cbm_pipeline_t *p, cbm_file_info_t *file
             return rc;
         }
     }
+    cbm_store_free_file_hashes(hashes, hash_count);
+    cbm_store_close(identity_store);
     if (hash_count > 0) {
         cbm_log_info("pipeline.route", "path", "mode_change_reindex", "stored_hashes",
                      itoa_buf(hash_count), "discovered", itoa_buf(file_count));
@@ -2742,6 +2892,40 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
         goto cleanup;
     }
 
+    for (int i = 0; i < file_count; i++) {
+        if (!files[i].auxiliary) {
+            source_count++;
+        }
+    }
+    if (source_count == 0) {
+        cbm_log_error("pipeline.err", "phase", "discovery", "code",
+                      "CBM_PIPELINE_EMPTY_SOURCE_CORPUS", "repo_path", p->repo_path,
+                      "discovered_files", itoa_buf(file_count), "message",
+                      "repository discovery produced no non-auxiliary source files; refusing a "
+                      "structural-only index",
+                      "remediation",
+                      "add a supported readable source file or correct discovery, mode, and ignore "
+                      "configuration before retrying");
+        rc = CBM_PIPELINE_EMPTY_SOURCE_CORPUS;
+        goto cleanup;
+    }
+
+    cbm_pipeline_phase_probe_t unchanged_route_probe =
+        cbm_pipeline_phase_probe_start(p, "unchanged_route");
+    rc = try_unchanged_before_snapshot(p, &opts, files, file_count);
+    cbm_pipeline_phase_probe_end(p, "unchanged_route", &unchanged_route_probe);
+    if (rc == 0 || rc == CBM_NOT_FOUND) {
+        goto cleanup;
+    }
+    if (rc != PL_ROUTE_FULL) {
+        cbm_log_error("pipeline.err", "code", "CBM_PIPELINE_PRE_SNAPSHOT_ROUTE_INVALID", "phase",
+                      "unchanged_route", "message",
+                      "the pre-snapshot router returned an unknown status", "remediation",
+                      "inspect the router implementation before retrying");
+        rc = CBM_NOT_FOUND;
+        goto cleanup;
+    }
+
     CBM_PROF_START(t_snapshot);
     cbm_pipeline_phase_probe_t snapshot_probe =
         cbm_pipeline_phase_probe_start(p, "source_snapshot");
@@ -2767,23 +2951,6 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
     cbm_userconfig_free(p->userconfig);
     p->userconfig = captured_userconfig;
     cbm_set_user_lang_config(p->userconfig);
-    for (int i = 0; i < file_count; i++) {
-        if (!files[i].auxiliary) {
-            source_count++;
-        }
-    }
-    if (source_count == 0) {
-        cbm_log_error("pipeline.err", "phase", "source_snapshot", "code",
-                      "CBM_PIPELINE_EMPTY_SOURCE_CORPUS", "repo_path", p->repo_path,
-                      "discovered_files", itoa_buf(file_count), "message",
-                      "repository discovery produced no non-auxiliary source files; refusing a "
-                      "structural-only index",
-                      "remediation",
-                      "add a supported readable source file or correct discovery, mode, and ignore "
-                      "configuration before retrying");
-        rc = CBM_PIPELINE_EMPTY_SOURCE_CORPUS;
-        goto cleanup;
-    }
     source_files = malloc((size_t)source_count * sizeof(*source_files));
     if (!source_files) {
         cbm_log_error("pipeline.err", "code", "CBM_PIPELINE_SOURCE_VIEW_ALLOC_FAILED", "phase",

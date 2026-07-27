@@ -191,8 +191,12 @@ pub fn query_store_search_schema_counts(
     unsafe {
         let mut verification = cbm_store_verify_result_t::default();
         let mut store = ptr::null_mut();
-        let status =
-            cbm_store_open_path_query_verified(db_path.as_ptr(), &mut store, &mut verification);
+        let status = cbm_store_open_path_project_query_verified(
+            db_path.as_ptr(),
+            project.as_ptr(),
+            &mut store,
+            &mut verification,
+        );
         if status != cbm_store_verify_status_t_CBM_STORE_VERIFY_OK || store.is_null() {
             if !store.is_null() {
                 cbm_store_close(store);
@@ -232,12 +236,6 @@ unsafe fn query_open_store_search_schema_counts(
     label: &CString,
     sort_by: &CString,
 ) -> Result<CbmStoreQuerySchemaCounts, String> {
-    if unsafe { !cbm_store_check_integrity(store) } {
-        return Err(format!("CBM store integrity check failed: {}", unsafe {
-            store_error_message(store)
-        }));
-    }
-
     let params = cbm_search_params_t {
         project: project.as_ptr(),
         label: label.as_ptr(),

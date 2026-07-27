@@ -1033,79 +1033,28 @@ cleanup:
     return result;
 }
 
-/* A routing store is opened read/write and therefore enters WAL mode. Before
- * either returning a no-op or handing the live graph to a verified read-only
- * reload, restore the sidecar-free publication boundary. The close is part of
- * this operation; callers must not reuse the store. Never unlink a remaining
- * sidecar because it can be authoritative evidence of a concurrent client. */
-static int finalize_incremental_live_store(cbm_store_t *store, const char *db_path,
-                                           const char *operation) {
-    int finalize_rc = cbm_store_checkpoint(store);
-    if (finalize_rc == CBM_STORE_OK) {
-        finalize_rc = cbm_store_exec(store, "PRAGMA journal_mode=DELETE;");
-    }
-    cbm_store_close(store);
-    if (finalize_rc != CBM_STORE_OK) {
-        cbm_log_error(
-            "incremental.live_store_finalize_failed", "code",
-            "CBM_INCREMENTAL_LIVE_STORE_FINALIZE_FAILED", "operation", operation, "path", db_path,
-            "message", "the live store could not checkpoint and leave WAL mode", "remediation",
-            "close concurrent readers or writers, preserve the database family, and retry");
-        return CBM_NOT_FOUND;
-    }
-
-    size_t db_path_len = strlen(db_path);
-    char *live_wal = db_path_len <= SIZE_MAX - 5 ? malloc(db_path_len + 5) : NULL;
-    char *live_shm = db_path_len <= SIZE_MAX - 5 ? malloc(db_path_len + 5) : NULL;
-    if (!live_wal || !live_shm) {
-        free(live_wal);
-        free(live_shm);
-        cbm_log_error("incremental.live_store_finalize_failed", "code",
-                      "CBM_INCREMENTAL_LIVE_STORE_SIDECAR_PATH_ALLOC_FAILED", "operation",
-                      operation, "path", db_path, "message",
-                      "the finalized sidecar paths could not be allocated", "remediation",
-                      "free memory and retry the exact corpus");
-        return CBM_NOT_FOUND;
-    }
-    snprintf(live_wal, db_path_len + 5, "%s-wal", db_path);
-    snprintf(live_shm, db_path_len + 5, "%s-shm", db_path);
-    bool wal_present = cbm_path_exists(live_wal);
-    bool shm_present = cbm_path_exists(live_shm);
-    free(live_wal);
-    free(live_shm);
-    if (wal_present || shm_present) {
-        cbm_log_error(
-            "incremental.live_store_finalize_failed", "code",
-            "CBM_INCREMENTAL_LIVE_STORE_SIDECAR_REMAINS", "operation", operation, "path", db_path,
-            "wal_present", wal_present ? "true" : "false", "shm_present",
-            shm_present ? "true" : "false", "message",
-            "the live store retained WAL or shared-memory state after close", "remediation",
-            "close concurrent readers or writers and retry without deleting sidecar evidence");
-        return CBM_NOT_FOUND;
-    }
-    return 0;
-}
-
 /* ── Incremental pipeline entry point ────────────────────────────── */
 
 int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_file_info_t *files,
-                                 int file_count) {
+                                 int file_count, cbm_store_t *store, cbm_file_hash_t *stored,
+                                 int stored_count) {
     struct timespec t0;
     cbm_clock_gettime(CLOCK_MONOTONIC, &t0);
 
     const char *project = cbm_pipeline_project_name(p);
 
-    /* Open existing disk DB */
-    cbm_store_t *store = cbm_store_open_path(db_path);
-    if (!store) {
-        cbm_log_error("incremental.err", "msg", "open_db_failed", "path", db_path);
+    if (!store || stored_count < 0 || (stored_count > 0 && !stored)) {
+        cbm_log_error("incremental.err", "code", "CBM_INCREMENTAL_VERIFIED_INPUT_MISSING", "path",
+                      db_path, "message",
+                      "incremental execution requires an already verified read-only store and "
+                      "complete hash set",
+                      "remediation", "repair the routing contract and retry the complete corpus");
+        if (store) {
+            cbm_store_close(store);
+        }
+        cbm_store_free_file_hashes(stored, stored_count > 0 ? stored_count : 0);
         return CBM_NOT_FOUND;
     }
-
-    /* Load stored file hashes */
-    cbm_file_hash_t *stored = NULL;
-    int stored_count = 0;
-    cbm_store_get_file_hashes(store, project, &stored, &stored_count);
 
     for (int i = 0; i < stored_count; i++) {
         if (!stored[i].sha256 || strlen(stored[i].sha256) != CBM_SHA256_HEX_LEN) {
@@ -1203,15 +1152,12 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
             cbm_store_close(store);
             return CBM_NOT_FOUND;
         }
-        int finalize_rc =
-            finalize_incremental_live_store(store, db_path, "unchanged_graph_publication");
+        cbm_store_close(store);
+        store = NULL;
         free(is_changed);
         free(deleted);
         free_mode_skipped(mode_skipped, mode_skipped_count);
         cbm_store_free_file_hashes(stored, stored_count);
-        if (finalize_rc != 0) {
-            return CBM_NOT_FOUND;
-        }
         cbm_pipeline_set_committed_counts(p, committed_nodes, committed_edges);
         cbm_pipeline_phase_probe_end(p, "incr_noop_finalize", &noop_probe);
         cbm_log_info("incremental.noop", "reason", "no_changes", "nodes", itoa_buf(committed_nodes),
@@ -1220,21 +1166,10 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
     }
 
     cbm_store_free_file_hashes(stored, stored_count);
-    /*
-     * The verified graph reader opens the DB/WAL/SHM family without write or
-     * delete sharing. Release this routing writer before that immutable-read
-     * boundary. The subsequent freeze is the physical proof: any deferred or
-     * foreign writer remains a terminal, exactly reported sharing failure.
-     */
-    if (finalize_incremental_live_store(store, db_path, "verified_graph_reload") != 0) {
-        free(is_changed);
-        for (int i = 0; i < deleted_count; i++) {
-            free(deleted[i]);
-        }
-        free(deleted);
-        free_mode_skipped(mode_skipped, mode_skipped_count);
-        return CBM_NOT_FOUND;
-    }
+    /* The route supplied a verified read-only connection. Close it without
+     * entering WAL, checkpointing, or changing journal mode before the separate
+     * verified graph reload. */
+    cbm_store_close(store);
     store = NULL;
 
     /* Build list of changed files */

@@ -1033,8 +1033,9 @@ where
 }
 
 /// Open the CBM source SQLite read-only with the #76 SQLITE_BUSY retry window.
-/// Kept as a named helper so the busy-timeout contract is directly asserted by
-/// `cbm_source_connection_sets_busy_timeout`.
+/// The exact current file extent is requested for memory-mapped reads so the
+/// supervised row readback shares OS-backed database pages with other local MCP
+/// processes instead of copying the same corpus into each process's page cache.
 fn open_cbm_source_connection(sqlite_path: &Path) -> IngestResult<Connection> {
     // #412: extended-length (`\\?\`) normalization so the CBM `<project>.db` under
     // a deep store (total path > MAX_PATH) is read back instead of failing closed.
@@ -1050,6 +1051,29 @@ fn open_cbm_source_connection(sqlite_path: &Path) -> IngestResult<Connection> {
             CBM_SOURCE_DB_BUSY_TIMEOUT_MS,
         ))
         .map_err(|error| invalid_sqlite(format!("set SQLite busy timeout: {error}")))?;
+    connection
+        .pragma_update(None, "temp_store", "MEMORY")
+        .map_err(|error| {
+            invalid_sqlite(format!("set SQLite temporary storage to memory: {error}"))
+        })?;
+    let sqlite_bytes = std::fs::metadata(&open_path)
+        .map_err(|error| invalid_sqlite(format!("read SQLite input extent: {error}")))?
+        .len();
+    let requested_mmap = i64::try_from(sqlite_bytes)
+        .map_err(|_| invalid_sqlite("SQLite input extent exceeds signed 64-bit mmap range"))?;
+    if requested_mmap > 0 {
+        connection
+            .pragma_update(None, "mmap_size", requested_mmap)
+            .map_err(|error| invalid_sqlite(format!("set SQLite mmap extent: {error}")))?;
+        let observed_mmap = connection
+            .pragma_query_value(None, "mmap_size", |row| row.get::<_, i64>(0))
+            .map_err(|error| invalid_sqlite(format!("read back SQLite mmap extent: {error}")))?;
+        if observed_mmap <= 0 || observed_mmap > requested_mmap {
+            return Err(invalid_sqlite(format!(
+                "SQLite mmap extent readback {observed_mmap} is not positive and bounded by the requested database extent {requested_mmap}"
+            )));
+        }
+    }
     validate_cbm_source_schema(&connection)?;
     Ok(connection)
 }
@@ -2440,19 +2464,19 @@ fn expected_raw_guard_slot_rows(prepared: &PreparedBatch, gate: &QuantizationGat
         .sum()
 }
 
-fn read_nodes(connection: &Connection, project: &str) -> IngestResult<Vec<RawNodeRow>> {
-    let vectors = read_node_vectors(connection, project)?;
+fn read_nodes(connection: &Connection, expected_project: &str) -> IngestResult<Vec<RawNodeRow>> {
+    let vectors = read_node_vectors(connection, expected_project)?;
     let mut statement = connection
         .prepare(
             "SELECT id, project, label, name, qualified_name, \
              COALESCE(file_path, ''), COALESCE(start_line, 0), \
              COALESCE(end_line, 0), COALESCE(properties, '{}'), atom_id, \
              source_present, source_bytes, source_sha256, start_byte, end_byte \
-             FROM nodes WHERE project = ?1 ORDER BY id",
+             FROM nodes ORDER BY id",
         )
         .map_err(|error| invalid_sqlite(format!("prepare nodes query: {error}")))?;
     let rows = statement
-        .query_map(params![project], |row| {
+        .query_map([], |row| {
             Ok((
                 row.get::<_, i64>(0)?,
                 row.get::<_, String>(1)?,
@@ -2477,7 +2501,7 @@ fn read_nodes(connection: &Connection, project: &str) -> IngestResult<Vec<RawNod
     for row in rows {
         let (
             id,
-            project,
+            row_project,
             label,
             name,
             qualified_name,
@@ -2499,6 +2523,11 @@ fn read_nodes(connection: &Connection, project: &str) -> IngestResult<Vec<RawNod
                  current binary"
             ))
         })?;
+        if row_project != expected_project {
+            return Err(invalid_sqlite(format!(
+                "node {id} belongs to project {row_project:?}, expected {expected_project:?}"
+            )));
+        }
         if atom_id.len() != 64
             || !atom_id
                 .bytes()
@@ -2565,7 +2594,7 @@ fn read_nodes(connection: &Connection, project: &str) -> IngestResult<Vec<RawNod
         }
         out.push(RawNodeRow {
             id,
-            project,
+            project: row_project,
             label,
             name,
             atom_id,
@@ -2588,29 +2617,38 @@ fn read_nodes(connection: &Connection, project: &str) -> IngestResult<Vec<RawNod
 
 fn read_node_vectors(
     connection: &Connection,
-    project: &str,
+    expected_project: &str,
 ) -> IngestResult<HashMap<i64, Vec<u8>>> {
     if !table_exists(connection, "node_vectors")? {
         return Ok(HashMap::new());
     }
     let mut statement = connection
-        .prepare("SELECT node_id, vector FROM node_vectors WHERE project = ?1 ORDER BY node_id")
+        .prepare("SELECT node_id, project, vector FROM node_vectors")
         .map_err(|error| invalid_sqlite(format!("prepare node_vectors query: {error}")))?;
     let rows = statement
-        .query_map(params![project], |row| {
-            Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?))
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Vec<u8>>(2)?,
+            ))
         })
         .map_err(|error| invalid_sqlite(format!("query node_vectors: {error}")))?;
     let mut out = HashMap::new();
     for row in rows {
-        let (node_id, vector) =
+        let (node_id, row_project, vector) =
             row.map_err(|error| invalid_sqlite(format!("read node_vectors row: {error}")))?;
+        if row_project != expected_project {
+            return Err(invalid_sqlite(format!(
+                "node vector {node_id} belongs to project {row_project:?}, expected {expected_project:?}"
+            )));
+        }
         out.insert(node_id, vector);
     }
     Ok(out)
 }
 
-fn read_edges(connection: &Connection, project: &str) -> IngestResult<Vec<RawEdgeRow>> {
+fn read_edges(connection: &Connection, expected_project: &str) -> IngestResult<Vec<RawEdgeRow>> {
     if !table_exists(connection, "edges")? {
         return Err(invalid_sqlite(
             "SQLite dump has no edges table; a Codebase Memory MCP dump always \
@@ -2624,12 +2662,11 @@ fn read_edges(connection: &Connection, project: &str) -> IngestResult<Vec<RawEdg
              CASE WHEN type = 'IMPORTS' AND json_valid(COALESCE(properties, '{}')) \
              THEN COALESCE(CAST(json_extract(properties, '$.local_name') AS TEXT), '') \
              ELSE '' END AS local_name_gen \
-             FROM edges WHERE project = ?1 \
-             ORDER BY source_id, target_id, type, local_name_gen, id",
+             FROM edges",
         )
         .map_err(|error| invalid_sqlite(format!("prepare edges query: {error}")))?;
     let rows = statement
-        .query_map(params![project], |row| {
+        .query_map([], |row| {
             Ok((
                 row.get::<_, i64>(0)?,
                 row.get::<_, String>(1)?,
@@ -2644,7 +2681,7 @@ fn read_edges(connection: &Connection, project: &str) -> IngestResult<Vec<RawEdg
 
     let mut out = Vec::new();
     for row in rows {
-        let (id, project, source_id, target_id, edge_type, properties_json, local_name_gen) =
+        let (id, row_project, source_id, target_id, edge_type, properties_json, local_name_gen) =
             row.map_err(|error| {
                 invalid_sqlite(format!(
                     "read edges row: {error}; a non-UTF-8 text column violates the \
@@ -2653,6 +2690,11 @@ fn read_edges(connection: &Connection, project: &str) -> IngestResult<Vec<RawEdg
                      current binary"
                 ))
             })?;
+        if row_project != expected_project {
+            return Err(invalid_sqlite(format!(
+                "edge {id} belongs to project {row_project:?}, expected {expected_project:?}"
+            )));
+        }
         let properties = serde_json::from_str::<Value>(&properties_json).map_err(|error| {
             invalid_sqlite(format!("edge {id} properties JSON is invalid: {error}"))
         })?;
@@ -2663,7 +2705,7 @@ fn read_edges(connection: &Connection, project: &str) -> IngestResult<Vec<RawEdg
         }
         out.push(RawEdgeRow {
             id,
-            project,
+            project: row_project,
             source_id,
             target_id,
             edge_type,
@@ -2672,6 +2714,14 @@ fn read_edges(connection: &Connection, project: &str) -> IngestResult<Vec<RawEdg
             local_name_gen,
         });
     }
+    out.sort_by(|left, right| {
+        left.source_id
+            .cmp(&right.source_id)
+            .then_with(|| left.target_id.cmp(&right.target_id))
+            .then_with(|| left.edge_type.cmp(&right.edge_type))
+            .then_with(|| left.local_name_gen.cmp(&right.local_name_gen))
+            .then_with(|| left.id.cmp(&right.id))
+    });
     Ok(out)
 }
 
@@ -2746,6 +2796,23 @@ pub struct CbmSqlitePipelineRows {
     pub graph_schema_version: u32,
 }
 
+fn validate_pipeline_project(connection: &Connection, expected_project: &str) -> IngestResult<()> {
+    let mut statement = connection
+        .prepare("SELECT name FROM projects")
+        .map_err(|error| invalid_sqlite(format!("prepare pipeline project query: {error}")))?;
+    let projects = statement
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(|error| invalid_sqlite(format!("query pipeline project: {error}")))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| invalid_sqlite(format!("read pipeline project: {error}")))?;
+    if projects.len() != 1 || projects[0] != expected_project {
+        return Err(invalid_sqlite(format!(
+            "pipeline SQLite must contain exactly project {expected_project:?}, observed {projects:?}"
+        )));
+    }
+    Ok(())
+}
+
 /// Reads the CBM pipeline row stream for `project` back from a persisted CBM SQLite
 /// dump (`<project>.db`), reproducing the graph-buffer row sink's output from real
 /// persisted bytes (#405).
@@ -2767,6 +2834,7 @@ pub fn read_cbm_sqlite_pipeline_rows(
     project: &str,
 ) -> IngestResult<CbmSqlitePipelineRows> {
     let connection = open_cbm_source_connection(sqlite_path)?;
+    validate_pipeline_project(&connection, project)?;
     let raw_nodes = read_nodes(&connection, project)?;
     let raw_edges = read_edges(&connection, project)?;
     let raw_file_hashes = read_file_hashes(&connection, project)?;

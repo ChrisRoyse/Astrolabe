@@ -5,6 +5,7 @@
 #include "foundation/constants.h"
 #include "foundation/log.h"
 #include "foundation/sha256.h"
+#include "foundation/hash_table.h"
 #include "foundation/win_utf8.h"
 
 #include <errno.h>
@@ -90,6 +91,8 @@ static void digest_to_hex(const uint8_t digest[CBM_SHA256_DIGEST_LEN],
     out[CBM_SHA256_HEX_LEN] = '\0';
 }
 
+static int64_t filetime_to_unix_ns(LONGLONG ticks);
+
 static bool hash_handle(HANDLE handle, uint8_t digest[CBM_SHA256_DIGEST_LEN], uint64_t *byte_count,
                         DWORD *native_error) {
     LARGE_INTEGER zero = {.QuadPart = 0};
@@ -120,6 +123,100 @@ static bool hash_handle(HANDLE handle, uint8_t digest[CBM_SHA256_DIGEST_LEN], ui
     cbm_sha256_final(&hash, digest);
     *byte_count = total;
     return true;
+}
+
+typedef enum {
+    SNAPSHOT_LIVE_MATCH = 0,
+    SNAPSHOT_LIVE_CHANGED = 1,
+    SNAPSHOT_LIVE_ERROR = 2,
+} snapshot_live_match_t;
+
+static bool snapshot_is_lower_sha256(const char *value) {
+    if (!value || strlen(value) != CBM_SHA256_HEX_LEN) {
+        return false;
+    }
+    for (size_t i = 0; i < CBM_SHA256_HEX_LEN; i++) {
+        if (!((value[i] >= '0' && value[i] <= '9') || (value[i] >= 'a' && value[i] <= 'f'))) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static snapshot_live_match_t snapshot_hash_live_match(const cbm_file_info_t *file,
+                                                      const cbm_file_hash_t *expected,
+                                                      cbm_file_info_t *verified) {
+    wchar_t *wide_source = cbm_utf8_to_wide_path(file->path);
+    if (!wide_source) {
+        snapshot_log_failure("CBM_SOURCE_UNCHANGED_PATH_ENCODING_FAILED", "widen_live_path",
+                             file->path, GetLastError());
+        return SNAPSHOT_LIVE_ERROR;
+    }
+    HANDLE source = CreateFileW(
+        wide_source, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN | FILE_FLAG_OPEN_REPARSE_POINT, NULL);
+    free(wide_source);
+    if (source == INVALID_HANDLE_VALUE) {
+        snapshot_log_failure("CBM_SOURCE_UNCHANGED_OPEN_FAILED", "open_live_source", file->path,
+                             GetLastError());
+        return SNAPSHOT_LIVE_ERROR;
+    }
+
+    FILE_ATTRIBUTE_TAG_INFO tag = {0};
+    snapshot_identity_t before = {0};
+    if (!GetFileInformationByHandleEx(source, FileAttributeTagInfo, &tag, sizeof(tag)) ||
+        (tag.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0 ||
+        !snapshot_get_identity(source, &before)) {
+        DWORD error = GetLastError();
+        CloseHandle(source);
+        snapshot_log_failure("CBM_SOURCE_UNCHANGED_IDENTITY_FAILED", "inspect_live_source",
+                             file->path, error ? error : ERROR_FILE_INVALID);
+        return SNAPSHOT_LIVE_ERROR;
+    }
+    if (before.standard.EndOfFile.QuadPart < 0 ||
+        before.standard.EndOfFile.QuadPart != file->size ||
+        before.standard.EndOfFile.QuadPart != expected->size) {
+        CloseHandle(source);
+        return SNAPSHOT_LIVE_CHANGED;
+    }
+
+    uint8_t digest[CBM_SHA256_DIGEST_LEN];
+    uint64_t bytes = 0;
+    DWORD error = ERROR_SUCCESS;
+    bool hashed = hash_handle(source, digest, &bytes, &error);
+    snapshot_identity_t after = {0};
+    bool inspected_after = snapshot_get_identity(source, &after);
+    if (!CloseHandle(source) && hashed && inspected_after) {
+        error = GetLastError();
+        hashed = false;
+    }
+    if (!hashed || !inspected_after) {
+        snapshot_log_failure("CBM_SOURCE_UNCHANGED_READ_FAILED", "hash_live_source", file->path,
+                             error ? error : GetLastError());
+        return SNAPSHOT_LIVE_ERROR;
+    }
+    if (!snapshot_identity_equal(&before, &after) ||
+        bytes != (uint64_t)before.standard.EndOfFile.QuadPart) {
+        snapshot_log_failure("CBM_SOURCE_UNCHANGED_MUTATED", "verify_live_source_identity",
+                             file->path, ERROR_FILE_INVALID);
+        return SNAPSHOT_LIVE_ERROR;
+    }
+
+    char sha256[CBM_SHA256_HEX_LEN + 1];
+    digest_to_hex(digest, sha256);
+    if (strcmp(sha256, expected->sha256) != 0) {
+        return SNAPSHOT_LIVE_CHANGED;
+    }
+
+    *verified = *file;
+    verified->live_path = file->path;
+    verified->size = (int64_t)bytes;
+    verified->mtime_ns = filetime_to_unix_ns(before.basic.LastWriteTime.QuadPart);
+    verified->source_volume_serial = before.id.VolumeSerialNumber;
+    memcpy(verified->source_file_id, before.id.FileId.Identifier, sizeof(verified->source_file_id));
+    verified->source_change_time_100ns = before.basic.ChangeTime.QuadPart;
+    memcpy(verified->sha256, sha256, sizeof(verified->sha256));
+    return SNAPSHOT_LIVE_MATCH;
 }
 
 static bool copy_and_hash(HANDLE source, HANDLE destination, uint8_t digest[CBM_SHA256_DIGEST_LEN],
@@ -436,6 +533,78 @@ static int snapshot_verify_namespace(const char *repo_path, const cbm_discover_o
                              ERROR_FILE_INVALID);
         return CBM_NOT_FOUND;
     }
+    return 0;
+}
+
+int cbm_source_snapshot_verify_unchanged(const char *repo_path, const cbm_discover_opts_t *opts,
+                                         cbm_file_info_t *files, int file_count,
+                                         const cbm_file_hash_t *stored, int stored_count,
+                                         bool *out_unchanged) {
+    if (!repo_path || !opts || file_count < 0 || stored_count < 0 || (file_count > 0 && !files) ||
+        (stored_count > 0 && !stored) || !out_unchanged) {
+        snapshot_log_failure("CBM_SOURCE_UNCHANGED_INVALID_ARGUMENT", "validate_unchanged",
+                             repo_path, ERROR_INVALID_PARAMETER);
+        return CBM_NOT_FOUND;
+    }
+    *out_unchanged = false;
+    if (file_count != stored_count) {
+        return 0;
+    }
+
+    CBMHashTable *by_path = cbm_ht_create(stored_count > 0 ? (size_t)stored_count * 2u : CBM_SZ_64);
+    if (!by_path) {
+        snapshot_log_failure("CBM_SOURCE_UNCHANGED_INDEX_ALLOC_FAILED", "allocate_hash_index",
+                             repo_path, ERROR_NOT_ENOUGH_MEMORY);
+        return CBM_NOT_FOUND;
+    }
+    for (int i = 0; i < stored_count; i++) {
+        if (!stored[i].rel_path || stored[i].rel_path[0] == '\0' ||
+            !snapshot_is_lower_sha256(stored[i].sha256) || stored[i].size < 0 ||
+            !cbm_ht_set_checked(by_path, stored[i].rel_path, (void *)&stored[i], NULL)) {
+            snapshot_log_failure("CBM_SOURCE_UNCHANGED_HASH_ROW_INVALID", "index_persisted_hashes",
+                                 stored[i].rel_path ? stored[i].rel_path : repo_path,
+                                 ERROR_INVALID_DATA);
+            cbm_ht_free(by_path);
+            return CBM_NOT_FOUND;
+        }
+    }
+
+    for (int i = 0; i < file_count; i++) {
+        const cbm_file_hash_t *expected = cbm_ht_get(by_path, files[i].rel_path);
+        if (!expected || files[i].size != expected->size) {
+            cbm_ht_free(by_path);
+            return 0;
+        }
+    }
+
+    cbm_file_info_t *verified =
+        calloc((size_t)(file_count > 0 ? file_count : 1), sizeof(*verified));
+    if (!verified) {
+        snapshot_log_failure("CBM_SOURCE_UNCHANGED_IDENTITY_ALLOC_FAILED",
+                             "allocate_identity_readback", repo_path, ERROR_NOT_ENOUGH_MEMORY);
+        cbm_ht_free(by_path);
+        return CBM_NOT_FOUND;
+    }
+    for (int i = 0; i < file_count; i++) {
+        const cbm_file_hash_t *expected = cbm_ht_get(by_path, files[i].rel_path);
+        snapshot_live_match_t match = snapshot_hash_live_match(&files[i], expected, &verified[i]);
+        if (match != SNAPSHOT_LIVE_MATCH) {
+            free(verified);
+            cbm_ht_free(by_path);
+            return match == SNAPSHOT_LIVE_CHANGED ? 0 : CBM_NOT_FOUND;
+        }
+    }
+    cbm_ht_free(by_path);
+
+    if (snapshot_verify_namespace(repo_path, opts, verified, file_count) != 0) {
+        free(verified);
+        return CBM_NOT_FOUND;
+    }
+    free(verified);
+    *out_unchanged = true;
+    char count_buf[32];
+    snprintf(count_buf, sizeof(count_buf), "%d", file_count);
+    cbm_log_info("source_snapshot.unchanged", "files", count_buf, "source_copy_started", "false");
     return 0;
 }
 

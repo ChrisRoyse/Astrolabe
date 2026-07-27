@@ -1252,6 +1252,324 @@ static bool store_integrity_prepare_probe(sqlite3 *db, const char *operation, co
     return true;
 }
 
+/* The complete integrity contract intentionally retains SQLite's full
+ * O(N log N) index/table consistency proof.  With the connection's ordinary
+ * small page cache, however, that proof repeatedly xRead()s the same table
+ * pages while walking every index.  Map the exact current logical database
+ * extent before the proof so SQLite can reuse the OS-backed pages across those
+ * walks and across independent MCP processes.  This is a connection-local read
+ * policy only: it changes no database bytes and removes no integrity check. */
+static bool store_integrity_map_database(sqlite3 *db, store_integrity_result_t *result) {
+    const char *filename = sqlite3_db_filename(db, "main");
+    if (!filename || filename[0] == '\0') {
+        return true;
+    }
+    char configured_mmap[ST_BUF_64];
+    int configured_mmap_status =
+        cbm_read_env("CBM_SQLITE_MMAP_SIZE", configured_mmap, sizeof(configured_mmap));
+    if (configured_mmap_status != 0) {
+        /* configure_pragmas already validated and applied an explicitly supplied
+         * value. Preserve that exact operator policy instead of silently
+         * replacing it with the data-derived integrity-check extent. */
+        return true;
+    }
+
+    sqlite3_stmt *stmt = NULL;
+    int rc = sqlite3_prepare_v2(db, "PRAGMA main.page_count;", CBM_NOT_FOUND, &stmt, NULL);
+    if (rc != SQLITE_OK) {
+        store_integrity_set_sqlite_failure(result, "sqlite.integrity_mmap.page_count.prepare", db,
+                                           rc);
+        if (stmt) {
+            sqlite3_finalize(stmt);
+        }
+        return false;
+    }
+    rc = sqlite3_step(stmt);
+    sqlite3_int64 page_count = rc == SQLITE_ROW ? sqlite3_column_int64(stmt, 0) : -1;
+    if (rc != SQLITE_ROW) {
+        store_integrity_set_sqlite_failure(result, "sqlite.integrity_mmap.page_count.step", db, rc);
+        sqlite3_finalize(stmt);
+        return false;
+    }
+    if (page_count < 0) {
+        store_integrity_set_failure(result, STORE_INTEGRITY_IO_FAILED,
+                                    "sqlite.integrity_mmap.page_count.value", SQLITE_CORRUPT,
+                                    "PRAGMA page_count returned a negative database extent");
+        sqlite3_finalize(stmt);
+        return false;
+    }
+    rc = sqlite3_step(stmt);
+    if (rc != SQLITE_DONE) {
+        store_integrity_set_failure(result, STORE_INTEGRITY_IO_FAILED,
+                                    "sqlite.integrity_mmap.page_count.cardinality", SQLITE_ERROR,
+                                    "PRAGMA page_count did not return exactly one row");
+        sqlite3_finalize(stmt);
+        return false;
+    }
+    rc = sqlite3_finalize(stmt);
+    stmt = NULL;
+    if (rc != SQLITE_OK) {
+        store_integrity_set_sqlite_failure(result, "sqlite.integrity_mmap.page_count.finalize", db,
+                                           rc);
+        return false;
+    }
+
+    rc = sqlite3_prepare_v2(db, "PRAGMA main.page_size;", CBM_NOT_FOUND, &stmt, NULL);
+    if (rc != SQLITE_OK) {
+        store_integrity_set_sqlite_failure(result, "sqlite.integrity_mmap.page_size.prepare", db,
+                                           rc);
+        if (stmt) {
+            sqlite3_finalize(stmt);
+        }
+        return false;
+    }
+    rc = sqlite3_step(stmt);
+    sqlite3_int64 page_size = rc == SQLITE_ROW ? sqlite3_column_int64(stmt, 0) : -1;
+    if (rc != SQLITE_ROW) {
+        store_integrity_set_sqlite_failure(result, "sqlite.integrity_mmap.page_size.step", db, rc);
+        sqlite3_finalize(stmt);
+        return false;
+    }
+    if (page_size <= 0) {
+        store_integrity_set_failure(result, STORE_INTEGRITY_IO_FAILED,
+                                    "sqlite.integrity_mmap.page_size.value", SQLITE_CORRUPT,
+                                    "PRAGMA page_size returned a non-positive page extent");
+        sqlite3_finalize(stmt);
+        return false;
+    }
+    rc = sqlite3_step(stmt);
+    if (rc != SQLITE_DONE) {
+        store_integrity_set_failure(result, STORE_INTEGRITY_IO_FAILED,
+                                    "sqlite.integrity_mmap.page_size.cardinality", SQLITE_ERROR,
+                                    "PRAGMA page_size did not return exactly one row");
+        sqlite3_finalize(stmt);
+        return false;
+    }
+    rc = sqlite3_finalize(stmt);
+    stmt = NULL;
+    if (rc != SQLITE_OK) {
+        store_integrity_set_sqlite_failure(result, "sqlite.integrity_mmap.page_size.finalize", db,
+                                           rc);
+        return false;
+    }
+
+    if (page_count == 0) {
+        return true;
+    }
+    if (page_count > INT64_MAX / page_size) {
+        store_integrity_set_failure(result, STORE_INTEGRITY_IO_FAILED,
+                                    "sqlite.integrity_mmap.extent", SQLITE_TOOBIG,
+                                    "database page extent exceeds SQLite's signed 64-bit range");
+        return false;
+    }
+    sqlite3_int64 database_bytes = page_count * page_size;
+    char sql[ST_BUF_64];
+    int wrote =
+        snprintf(sql, sizeof(sql), "PRAGMA main.mmap_size = %lld;", (long long)database_bytes);
+    if (wrote < 0 || (size_t)wrote >= sizeof(sql)) {
+        store_integrity_set_failure(result, STORE_INTEGRITY_IO_FAILED,
+                                    "sqlite.integrity_mmap.format", SQLITE_TOOBIG,
+                                    "database mmap extent exceeds statement capacity");
+        return false;
+    }
+
+    rc = sqlite3_prepare_v2(db, sql, CBM_NOT_FOUND, &stmt, NULL);
+    if (rc != SQLITE_OK) {
+        store_integrity_set_sqlite_failure(result, "sqlite.integrity_mmap.prepare", db, rc);
+        if (stmt) {
+            sqlite3_finalize(stmt);
+        }
+        return false;
+    }
+    rc = sqlite3_step(stmt);
+    sqlite3_int64 mapped_bytes = rc == SQLITE_ROW ? sqlite3_column_int64(stmt, 0) : -1;
+    if (rc != SQLITE_ROW || mapped_bytes <= 0 || mapped_bytes > database_bytes) {
+        store_integrity_set_failure(result, STORE_INTEGRITY_IO_FAILED,
+                                    "sqlite.integrity_mmap.apply", rc,
+                                    "SQLite did not apply a positive bounded mmap extent");
+        sqlite3_finalize(stmt);
+        return false;
+    }
+    rc = sqlite3_step(stmt);
+    if (rc != SQLITE_DONE) {
+        store_integrity_set_failure(result, STORE_INTEGRITY_IO_FAILED,
+                                    "sqlite.integrity_mmap.cardinality", SQLITE_ERROR,
+                                    "PRAGMA mmap_size did not return exactly one row");
+        sqlite3_finalize(stmt);
+        return false;
+    }
+    rc = sqlite3_finalize(stmt);
+    if (rc != SQLITE_OK) {
+        store_integrity_set_sqlite_failure(result, "sqlite.integrity_mmap.finalize", db, rc);
+        return false;
+    }
+    return true;
+}
+
+/* Project/root provenance includes live filesystem state and therefore cannot
+ * be cached by a database-content receipt. Keep it separate from the expensive
+ * byte-internal SQLite checks so every verified open re-evaluates it. */
+static bool store_check_project_provenance(cbm_store_t *s, const char *expected_project,
+                                           store_integrity_result_t *result) {
+    sqlite3_stmt *stmt = NULL;
+    int rc =
+        sqlite3_prepare_v2(s->db, "SELECT count(*) FROM projects;", CBM_NOT_FOUND, &stmt, NULL);
+    if (rc != SQLITE_OK) {
+        store_integrity_set_sqlite_failure(result, "application.project_count.prepare", s->db, rc);
+        if (stmt) {
+            sqlite3_finalize(stmt);
+        }
+        return false;
+    }
+    rc = sqlite3_step(stmt);
+    sqlite3_int64 project_count = rc == SQLITE_ROW ? sqlite3_column_int64(stmt, 0) : -1;
+    if (rc != SQLITE_ROW || project_count != 1) {
+        if (rc != SQLITE_ROW) {
+            store_integrity_set_sqlite_failure(result, "application.project_count.step", s->db, rc);
+        } else {
+            char detail[ST_BUF_64];
+            snprintf(detail, sizeof(detail), "projects rows=%lld expected=1",
+                     (long long)project_count);
+            store_integrity_set_failure(result, STORE_INTEGRITY_FAILED, "application.project_count",
+                                        SQLITE_OK, detail);
+        }
+        sqlite3_finalize(stmt);
+        return false;
+    }
+    rc = sqlite3_step(stmt);
+    if (rc != SQLITE_DONE) {
+        store_integrity_set_failure(result, STORE_INTEGRITY_FAILED,
+                                    "application.project_count.cardinality", SQLITE_OK,
+                                    "project count query did not return exactly one row");
+        sqlite3_finalize(stmt);
+        return false;
+    }
+    rc = sqlite3_finalize(stmt);
+    stmt = NULL;
+    if (rc != SQLITE_OK) {
+        store_integrity_set_sqlite_failure(result, "application.project_count.finalize", s->db, rc);
+        return false;
+    }
+
+    rc = sqlite3_prepare_v2(s->db, "SELECT name, indexed_at, root_path FROM projects;",
+                            CBM_NOT_FOUND, &stmt, NULL);
+    if (rc != SQLITE_OK) {
+        store_integrity_set_sqlite_failure(result, "application.project_row.prepare", s->db, rc);
+        if (stmt) {
+            sqlite3_finalize(stmt);
+        }
+        return false;
+    }
+    rc = sqlite3_step(stmt);
+    if (rc != SQLITE_ROW) {
+        store_integrity_set_sqlite_failure(result, "application.project_row.step", s->db, rc);
+        sqlite3_finalize(stmt);
+        return false;
+    }
+    const unsigned char *name = sqlite3_column_text(stmt, 0);
+    const unsigned char *indexed_at = sqlite3_column_text(stmt, 1);
+    const unsigned char *root_path = sqlite3_column_text(stmt, 2);
+    int name_bytes = sqlite3_column_bytes(stmt, 0);
+    int indexed_at_bytes = sqlite3_column_bytes(stmt, 1);
+    int root_path_bytes = sqlite3_column_bytes(stmt, 2);
+    const char *row_violation = NULL;
+    if (sqlite3_column_type(stmt, 0) != SQLITE_TEXT || name_bytes <= 0 || !name ||
+        !cbm_validate_project_name((const char *)name)) {
+        row_violation = "project name must be non-empty valid UTF-8 project-name text";
+    } else if (sqlite3_column_type(stmt, 1) != SQLITE_TEXT || indexed_at_bytes <= 0 ||
+               !indexed_at) {
+        row_violation = "indexed_at must be non-empty text";
+    } else if (sqlite3_column_type(stmt, 2) != SQLITE_TEXT ||
+               !store_root_path_is_absolute(root_path, root_path_bytes)) {
+        row_violation = "root_path must be a non-empty absolute POSIX, drive, or UNC path";
+    }
+    if (row_violation) {
+        store_integrity_set_failure(result, STORE_INTEGRITY_FAILED, "application.project_row",
+                                    SQLITE_OK, row_violation);
+        sqlite3_finalize(stmt);
+        return false;
+    }
+    if (expected_project) {
+        size_t expected_project_bytes = strlen(expected_project);
+        if (expected_project_bytes != (size_t)name_bytes ||
+            memcmp(name, expected_project, expected_project_bytes) != 0) {
+            char detail[CBM_STORE_VERIFY_DETAIL_MAX];
+            snprintf(detail, sizeof(detail), "project row name=%.*s expected=%s", name_bytes,
+                     (const char *)name, expected_project);
+            store_integrity_set_failure(result, STORE_INTEGRITY_FAILED,
+                                        "application.project_identity", SQLITE_OK, detail);
+            sqlite3_finalize(stmt);
+            return false;
+        }
+
+        char persisted_root[CBM_STORE_VERIFY_PATH_MAX];
+        if ((size_t)root_path_bytes >= sizeof(persisted_root)) {
+            store_integrity_set_failure(result, STORE_INTEGRITY_IO_FAILED,
+                                        "application.project_root.capacity", SQLITE_TOOBIG,
+                                        "persisted project root exceeds provenance path capacity");
+            sqlite3_finalize(stmt);
+            return false;
+        }
+        memcpy(persisted_root, root_path, (size_t)root_path_bytes);
+        persisted_root[root_path_bytes] = '\0';
+        cbm_normalize_path_sep(persisted_root);
+
+        if (cbm_path_is_ephemeral_launcher_root(persisted_root)) {
+            char detail[CBM_STORE_VERIFY_DETAIL_MAX];
+            snprintf(detail, sizeof(detail),
+                     "persisted root_path is inside a disposable Astrolabe launcher generation: "
+                     "%s",
+                     persisted_root);
+            store_integrity_set_failure(result, STORE_INTEGRITY_FAILED,
+                                        "application.project_root.ephemeral", SQLITE_OK, detail);
+            sqlite3_finalize(stmt);
+            return false;
+        }
+
+        char *canonical_root = cbm_canonicalize_existing_path(persisted_root);
+        if (!canonical_root) {
+            char detail[CBM_STORE_VERIFY_DETAIL_MAX];
+            snprintf(detail, sizeof(detail), "persisted root_path is absent or unreadable: %s",
+                     persisted_root);
+            store_integrity_set_failure(result, STORE_INTEGRITY_FAILED,
+                                        "application.project_root.resolve", SQLITE_OK, detail);
+            sqlite3_finalize(stmt);
+            return false;
+        }
+        cbm_normalize_path_sep(canonical_root);
+#ifdef _WIN32
+        bool root_matches = _stricmp(canonical_root, persisted_root) == 0;
+#else
+        bool root_matches = strcmp(canonical_root, persisted_root) == 0;
+#endif
+        if (!root_matches) {
+            char detail[CBM_STORE_VERIFY_DETAIL_MAX];
+            snprintf(detail, sizeof(detail), "persisted root_path=%s canonical_root=%s",
+                     persisted_root, canonical_root);
+            free(canonical_root);
+            store_integrity_set_failure(result, STORE_INTEGRITY_FAILED,
+                                        "application.project_root.identity", SQLITE_OK, detail);
+            sqlite3_finalize(stmt);
+            return false;
+        }
+        free(canonical_root);
+    }
+    rc = sqlite3_step(stmt);
+    if (rc != SQLITE_DONE) {
+        store_integrity_set_failure(result, STORE_INTEGRITY_FAILED,
+                                    "application.project_row.cardinality", SQLITE_OK,
+                                    "sole-project query returned more than one row");
+        sqlite3_finalize(stmt);
+        return false;
+    }
+    rc = sqlite3_finalize(stmt);
+    if (rc != SQLITE_OK) {
+        store_integrity_set_sqlite_failure(result, "application.project_row.finalize", s->db, rc);
+        return false;
+    }
+    return true;
+}
+
 static store_integrity_status_t store_check_integrity_detailed(cbm_store_t *s,
                                                                store_integrity_contract_t contract,
                                                                const char *expected_project,
@@ -1279,6 +1597,9 @@ static store_integrity_status_t store_check_integrity_detailed(cbm_store_t *s,
         store_integrity_set_failure(result, STORE_INTEGRITY_IO_FAILED,
                                     "application.expected_project", SQLITE_MISUSE,
                                     "graph reload requires an expected project name");
+        return result->status;
+    }
+    if (!store_integrity_map_database(s->db, result)) {
         return result->status;
     }
 
@@ -1447,158 +1768,7 @@ static store_integrity_status_t store_check_integrity_detailed(cbm_store_t *s,
         }
     }
 
-    rc = sqlite3_prepare_v2(s->db, "SELECT count(*) FROM projects;", CBM_NOT_FOUND, &stmt, NULL);
-    if (rc != SQLITE_OK) {
-        store_integrity_set_sqlite_failure(result, "application.project_count.prepare", s->db, rc);
-        if (stmt) {
-            sqlite3_finalize(stmt);
-        }
-        return result->status;
-    }
-    rc = sqlite3_step(stmt);
-    sqlite3_int64 project_count = rc == SQLITE_ROW ? sqlite3_column_int64(stmt, 0) : -1;
-    if (rc != SQLITE_ROW || project_count != 1) {
-        if (rc != SQLITE_ROW) {
-            store_integrity_set_sqlite_failure(result, "application.project_count.step", s->db, rc);
-        } else {
-            char detail[ST_BUF_64];
-            snprintf(detail, sizeof(detail), "projects rows=%lld expected=1",
-                     (long long)project_count);
-            store_integrity_set_failure(result, STORE_INTEGRITY_FAILED, "application.project_count",
-                                        SQLITE_OK, detail);
-        }
-        sqlite3_finalize(stmt);
-        return result->status;
-    }
-    rc = sqlite3_step(stmt);
-    if (rc != SQLITE_DONE) {
-        store_integrity_set_failure(result, STORE_INTEGRITY_FAILED,
-                                    "application.project_count.cardinality", SQLITE_OK,
-                                    "project count query did not return exactly one row");
-        sqlite3_finalize(stmt);
-        return result->status;
-    }
-    rc = sqlite3_finalize(stmt);
-    stmt = NULL;
-    if (rc != SQLITE_OK) {
-        store_integrity_set_sqlite_failure(result, "application.project_count.finalize", s->db, rc);
-        return result->status;
-    }
-
-    rc = sqlite3_prepare_v2(s->db, "SELECT name, indexed_at, root_path FROM projects;",
-                            CBM_NOT_FOUND, &stmt, NULL);
-    if (rc != SQLITE_OK) {
-        store_integrity_set_sqlite_failure(result, "application.project_row.prepare", s->db, rc);
-        if (stmt) {
-            sqlite3_finalize(stmt);
-        }
-        return result->status;
-    }
-    rc = sqlite3_step(stmt);
-    if (rc != SQLITE_ROW) {
-        store_integrity_set_sqlite_failure(result, "application.project_row.step", s->db, rc);
-        sqlite3_finalize(stmt);
-        return result->status;
-    }
-    const unsigned char *name = sqlite3_column_text(stmt, 0);
-    const unsigned char *indexed_at = sqlite3_column_text(stmt, 1);
-    const unsigned char *root_path = sqlite3_column_text(stmt, 2);
-    int name_bytes = sqlite3_column_bytes(stmt, 0);
-    int indexed_at_bytes = sqlite3_column_bytes(stmt, 1);
-    int root_path_bytes = sqlite3_column_bytes(stmt, 2);
-    const char *row_violation = NULL;
-    if (sqlite3_column_type(stmt, 0) != SQLITE_TEXT || name_bytes <= 0 || !name ||
-        !cbm_validate_project_name((const char *)name)) {
-        row_violation = "project name must be non-empty valid UTF-8 project-name text";
-    } else if (sqlite3_column_type(stmt, 1) != SQLITE_TEXT || indexed_at_bytes <= 0 ||
-               !indexed_at) {
-        row_violation = "indexed_at must be non-empty text";
-    } else if (sqlite3_column_type(stmt, 2) != SQLITE_TEXT ||
-               !store_root_path_is_absolute(root_path, root_path_bytes)) {
-        row_violation = "root_path must be a non-empty absolute POSIX, drive, or UNC path";
-    }
-    if (row_violation) {
-        store_integrity_set_failure(result, STORE_INTEGRITY_FAILED, "application.project_row",
-                                    SQLITE_OK, row_violation);
-        sqlite3_finalize(stmt);
-        return result->status;
-    }
-    if (expected_project) {
-        size_t expected_project_bytes = strlen(expected_project);
-        if (expected_project_bytes != (size_t)name_bytes ||
-            memcmp(name, expected_project, expected_project_bytes) != 0) {
-            char detail[CBM_STORE_VERIFY_DETAIL_MAX];
-            snprintf(detail, sizeof(detail), "project row name=%.*s expected=%s", name_bytes,
-                     (const char *)name, expected_project);
-            store_integrity_set_failure(result, STORE_INTEGRITY_FAILED,
-                                        "application.project_identity", SQLITE_OK, detail);
-            sqlite3_finalize(stmt);
-            return result->status;
-        }
-
-        char persisted_root[CBM_STORE_VERIFY_PATH_MAX];
-        if ((size_t)root_path_bytes >= sizeof(persisted_root)) {
-            store_integrity_set_failure(result, STORE_INTEGRITY_IO_FAILED,
-                                        "application.project_root.capacity", SQLITE_TOOBIG,
-                                        "persisted project root exceeds provenance path capacity");
-            sqlite3_finalize(stmt);
-            return result->status;
-        }
-        memcpy(persisted_root, root_path, (size_t)root_path_bytes);
-        persisted_root[root_path_bytes] = '\0';
-        cbm_normalize_path_sep(persisted_root);
-
-        if (cbm_path_is_ephemeral_launcher_root(persisted_root)) {
-            char detail[CBM_STORE_VERIFY_DETAIL_MAX];
-            snprintf(detail, sizeof(detail),
-                     "persisted root_path is inside a disposable Astrolabe launcher generation: "
-                     "%s",
-                     persisted_root);
-            store_integrity_set_failure(result, STORE_INTEGRITY_FAILED,
-                                        "application.project_root.ephemeral", SQLITE_OK, detail);
-            sqlite3_finalize(stmt);
-            return result->status;
-        }
-
-        char *canonical_root = cbm_canonicalize_existing_path(persisted_root);
-        if (!canonical_root) {
-            char detail[CBM_STORE_VERIFY_DETAIL_MAX];
-            snprintf(detail, sizeof(detail), "persisted root_path is absent or unreadable: %s",
-                     persisted_root);
-            store_integrity_set_failure(result, STORE_INTEGRITY_FAILED,
-                                        "application.project_root.resolve", SQLITE_OK, detail);
-            sqlite3_finalize(stmt);
-            return result->status;
-        }
-        cbm_normalize_path_sep(canonical_root);
-#ifdef _WIN32
-        bool root_matches = _stricmp(canonical_root, persisted_root) == 0;
-#else
-        bool root_matches = strcmp(canonical_root, persisted_root) == 0;
-#endif
-        if (!root_matches) {
-            char detail[CBM_STORE_VERIFY_DETAIL_MAX];
-            snprintf(detail, sizeof(detail), "persisted root_path=%s canonical_root=%s",
-                     persisted_root, canonical_root);
-            free(canonical_root);
-            store_integrity_set_failure(result, STORE_INTEGRITY_FAILED,
-                                        "application.project_root.identity", SQLITE_OK, detail);
-            sqlite3_finalize(stmt);
-            return result->status;
-        }
-        free(canonical_root);
-    }
-    rc = sqlite3_step(stmt);
-    if (rc != SQLITE_DONE) {
-        store_integrity_set_failure(result, STORE_INTEGRITY_FAILED,
-                                    "application.project_row.cardinality", SQLITE_OK,
-                                    "sole-project query returned more than one row");
-        sqlite3_finalize(stmt);
-        return result->status;
-    }
-    rc = sqlite3_finalize(stmt);
-    if (rc != SQLITE_OK) {
-        store_integrity_set_sqlite_failure(result, "application.project_row.finalize", s->db, rc);
+    if (!store_check_project_provenance(s, expected_project, result)) {
         return result->status;
     }
 
@@ -1920,6 +2090,306 @@ static bool store_copy_frozen_member(HANDLE source, const char *destination,
     return true;
 }
 
+typedef enum {
+    STORE_RECEIPT_ABSENT = 0,
+    STORE_RECEIPT_VALID = 1,
+    STORE_RECEIPT_ERROR = 2,
+} store_receipt_state_t;
+
+/* Revision of the exact static verification contract summarized by a receipt.
+ * Increment this whenever those checks change so an older executable's proof
+ * cannot be reinterpreted under a newer contract. */
+enum { STORE_RECEIPT_VERIFIER_REVISION = 1 };
+
+typedef struct {
+    int verifier_revision;
+    int graph_schema;
+    int sqlite_version;
+    char sqlite_build_sha256[CBM_SHA256_HEX_LEN + 1];
+    int contract;
+    uint64_t db_bytes;
+    char db_sha256[CBM_SHA256_HEX_LEN + 1];
+    char project[CBM_STORE_VERIFY_PATH_MAX];
+} store_integrity_receipt_t;
+
+static bool store_is_lower_sha256(const char *value) {
+    if (!value || strlen(value) != CBM_SHA256_HEX_LEN) {
+        return false;
+    }
+    for (size_t i = 0; i < CBM_SHA256_HEX_LEN; i++) {
+        if (!((value[i] >= '0' && value[i] <= '9') || (value[i] >= 'a' && value[i] <= 'f'))) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static void store_sqlite_build_sha256(char out[CBM_SHA256_HEX_LEN + 1]) {
+    cbm_sha256_ctx hash;
+    cbm_sha256_init(&hash);
+    const char *source_id = sqlite3_sourceid();
+    cbm_sha256_update(&hash, source_id, strlen(source_id));
+    const uint8_t separator = 0;
+    cbm_sha256_update(&hash, &separator, sizeof(separator));
+    for (int i = 0;; i++) {
+        const char *option = sqlite3_compileoption_get(i);
+        if (!option) {
+            break;
+        }
+        cbm_sha256_update(&hash, option, strlen(option));
+        cbm_sha256_update(&hash, &separator, sizeof(separator));
+    }
+    uint8_t digest[CBM_SHA256_DIGEST_LEN];
+    cbm_sha256_final(&hash, digest);
+    static const char digits[] = "0123456789abcdef";
+    for (size_t i = 0; i < CBM_SHA256_DIGEST_LEN; i++) {
+        out[i * 2] = digits[digest[i] >> 4];
+        out[i * 2 + 1] = digits[digest[i] & 15];
+    }
+    out[CBM_SHA256_HEX_LEN] = '\0';
+}
+
+static bool store_hash_frozen_identity(HANDLE source, cbm_store_verify_result_t *result,
+                                       const char *operation, uint64_t *out_bytes,
+                                       char out_sha256[CBM_SHA256_HEX_LEN + 1]) {
+    uint8_t digest[CBM_SHA256_DIGEST_LEN];
+    DWORD native_error = ERROR_SUCCESS;
+    if (!store_hash_handle(source, digest, out_bytes, &native_error)) {
+        store_verify_set_error(result, CBM_STORE_VERIFY_IO_FAILED, operation, native_error,
+                               SQLITE_OK, "frozen database identity could not be hashed");
+        return false;
+    }
+    static const char digits[] = "0123456789abcdef";
+    for (size_t i = 0; i < CBM_SHA256_DIGEST_LEN; i++) {
+        out_sha256[i * 2] = digits[digest[i] >> 4];
+        out_sha256[i * 2 + 1] = digits[digest[i] & 15];
+    }
+    out_sha256[CBM_SHA256_HEX_LEN] = '\0';
+    return true;
+}
+
+static store_receipt_state_t store_receipt_read(const char *path,
+                                                store_integrity_receipt_t *receipt,
+                                                cbm_store_verify_result_t *result) {
+    memset(receipt, 0, sizeof(*receipt));
+    wchar_t *wide = cbm_utf8_to_wide_path(path);
+    if (!wide) {
+        store_verify_set_error(result, CBM_STORE_VERIFY_IO_FAILED, "receipt.path_encoding",
+                               ERROR_NO_UNICODE_TRANSLATION, SQLITE_OK,
+                               "integrity receipt path could not be converted to UTF-16");
+        return STORE_RECEIPT_ERROR;
+    }
+    HANDLE handle = CreateFileW(
+        wide, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE, NULL, OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN | FILE_FLAG_OPEN_REPARSE_POINT, NULL);
+    DWORD open_error = handle == INVALID_HANDLE_VALUE ? GetLastError() : ERROR_SUCCESS;
+    free(wide);
+    if (handle == INVALID_HANDLE_VALUE) {
+        if (store_source_missing_error(open_error)) {
+            return STORE_RECEIPT_ABSENT;
+        }
+        store_verify_set_error(result, CBM_STORE_VERIFY_IO_FAILED, "receipt.open", open_error,
+                               SQLITE_OK, "integrity receipt could not be opened read-only");
+        return STORE_RECEIPT_ERROR;
+    }
+
+    FILE_ATTRIBUTE_TAG_INFO tag = {0};
+    LARGE_INTEGER size = {0};
+    enum { STORE_RECEIPT_TEXT_CAPACITY = CBM_STORE_VERIFY_PATH_MAX + 512 };
+    char text[STORE_RECEIPT_TEXT_CAPACITY];
+    if (!GetFileInformationByHandleEx(handle, FileAttributeTagInfo, &tag, sizeof(tag)) ||
+        (tag.FileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) != 0 ||
+        !GetFileSizeEx(handle, &size) || size.QuadPart <= 0 ||
+        size.QuadPart >= (LONGLONG)sizeof(text)) {
+        DWORD error = GetLastError();
+        CloseHandle(handle);
+        store_verify_set_error(result, CBM_STORE_VERIFY_IO_FAILED, "receipt.inspect",
+                               error ? error : ERROR_INVALID_DATA, SQLITE_OK,
+                               "integrity receipt is not one bounded ordinary file");
+        return STORE_RECEIPT_ERROR;
+    }
+    DWORD expected = (DWORD)size.QuadPart;
+    DWORD got = 0;
+    bool read_ok = ReadFile(handle, text, expected, &got, NULL) != 0 && got == expected;
+    char extra = '\0';
+    DWORD extra_count = 0;
+    bool eof_ok =
+        read_ok && ReadFile(handle, &extra, 1, &extra_count, NULL) != 0 && extra_count == 0;
+    DWORD read_error = eof_ok ? ERROR_SUCCESS : GetLastError();
+    bool close_ok = CloseHandle(handle) != 0;
+    if (!eof_ok || !close_ok) {
+        store_verify_set_error(result, CBM_STORE_VERIFY_IO_FAILED, "receipt.read",
+                               read_error ? read_error : GetLastError(), SQLITE_OK,
+                               "integrity receipt could not be read exactly through EOF");
+        return STORE_RECEIPT_ERROR;
+    }
+    text[got] = '\0';
+
+    unsigned long long db_bytes = 0;
+    int consumed = 0;
+    int parsed = sscanf(text,
+                        "cbm.store-integrity.v1\n"
+                        "verifier_revision=%d\n"
+                        "graph_schema=%d\n"
+                        "sqlite_version=%d\n"
+                        "sqlite_build_sha256=%64[0-9a-f]\n"
+                        "contract=%d\n"
+                        "db_bytes=%llu\n"
+                        "db_sha256=%64[0-9a-f]\n"
+                        "project=%4095[A-Za-z0-9_.-]\n%n",
+                        &receipt->verifier_revision, &receipt->graph_schema,
+                        &receipt->sqlite_version, receipt->sqlite_build_sha256, &receipt->contract,
+                        &db_bytes, receipt->db_sha256, receipt->project, &consumed);
+    receipt->db_bytes = (uint64_t)db_bytes;
+    if (parsed != 8 || consumed != (int)got ||
+        !store_is_lower_sha256(receipt->sqlite_build_sha256) ||
+        !store_is_lower_sha256(receipt->db_sha256) ||
+        !cbm_validate_project_name(receipt->project)) {
+        store_verify_set_error(result, CBM_STORE_VERIFY_IO_FAILED, "receipt.parse",
+                               ERROR_INVALID_DATA, SQLITE_OK,
+                               "integrity receipt is malformed or non-canonical");
+        return STORE_RECEIPT_ERROR;
+    }
+    return STORE_RECEIPT_VALID;
+}
+
+static bool store_receipt_matches_static(const store_integrity_receipt_t *receipt,
+                                         store_integrity_contract_t contract,
+                                         const char *expected_project) {
+    char sqlite_build_sha256[CBM_SHA256_HEX_LEN + 1];
+    store_sqlite_build_sha256(sqlite_build_sha256);
+    return receipt->verifier_revision == STORE_RECEIPT_VERIFIER_REVISION &&
+           receipt->graph_schema == CBM_GRAPH_SCHEMA_VERSION &&
+           receipt->sqlite_version == sqlite3_libversion_number() &&
+           strcmp(receipt->sqlite_build_sha256, sqlite_build_sha256) == 0 &&
+           receipt->contract == (int)contract && strcmp(receipt->project, expected_project) == 0;
+}
+
+static bool store_receipt_matches_identity(const store_integrity_receipt_t *receipt,
+                                           uint64_t db_bytes, const char *db_sha256) {
+    return receipt->db_bytes == db_bytes && strcmp(receipt->db_sha256, db_sha256) == 0;
+}
+
+static bool store_receipt_write(const char *path, store_integrity_contract_t contract,
+                                const char *expected_project, uint64_t db_bytes,
+                                const char *db_sha256, cbm_store_verify_result_t *result) {
+    enum { STORE_RECEIPT_TEXT_CAPACITY = CBM_STORE_VERIFY_PATH_MAX + 512 };
+    char text[STORE_RECEIPT_TEXT_CAPACITY];
+    char sqlite_build_sha256[CBM_SHA256_HEX_LEN + 1];
+    store_sqlite_build_sha256(sqlite_build_sha256);
+    int text_len = snprintf(text, sizeof(text),
+                            "cbm.store-integrity.v1\n"
+                            "verifier_revision=%d\n"
+                            "graph_schema=%d\n"
+                            "sqlite_version=%d\n"
+                            "sqlite_build_sha256=%s\n"
+                            "contract=%d\n"
+                            "db_bytes=%llu\n"
+                            "db_sha256=%s\n"
+                            "project=%s\n",
+                            STORE_RECEIPT_VERIFIER_REVISION, CBM_GRAPH_SCHEMA_VERSION,
+                            sqlite3_libversion_number(), sqlite_build_sha256, (int)contract,
+                            (unsigned long long)db_bytes, db_sha256, expected_project);
+    if (text_len <= 0 || (size_t)text_len >= sizeof(text)) {
+        store_verify_set_error(result, CBM_STORE_VERIFY_IO_FAILED, "receipt.serialize",
+                               ERROR_BUFFER_OVERFLOW, SQLITE_TOOBIG,
+                               "integrity receipt exceeds its bounded representation");
+        return false;
+    }
+
+    static volatile LONG receipt_sequence;
+    LARGE_INTEGER counter;
+    QueryPerformanceCounter(&counter);
+    LONG sequence = InterlockedIncrement(&receipt_sequence);
+    size_t path_len = strlen(path);
+    const size_t suffix_capacity = 96;
+    if (path_len > SIZE_MAX - suffix_capacity) {
+        store_verify_set_error(result, CBM_STORE_VERIFY_IO_FAILED, "receipt.stage_path",
+                               ERROR_ARITHMETIC_OVERFLOW, SQLITE_TOOBIG,
+                               "integrity receipt stage path overflows addressable memory");
+        return false;
+    }
+    char *stage = malloc(path_len + suffix_capacity);
+    if (!stage) {
+        store_verify_set_error(result, CBM_STORE_VERIFY_IO_FAILED, "receipt.stage_path",
+                               ERROR_NOT_ENOUGH_MEMORY, SQLITE_NOMEM,
+                               "integrity receipt stage path could not be allocated");
+        return false;
+    }
+    int stage_len = snprintf(stage, path_len + suffix_capacity, "%s.tmp.%lu.%016llx.%ld", path,
+                             (unsigned long)GetCurrentProcessId(),
+                             (unsigned long long)counter.QuadPart, (long)sequence);
+    wchar_t *wide_stage = stage_len > 0 && (size_t)stage_len < path_len + suffix_capacity
+                              ? cbm_utf8_to_wide_path(stage)
+                              : NULL;
+    if (!wide_stage) {
+        free(stage);
+        store_verify_set_error(result, CBM_STORE_VERIFY_IO_FAILED, "receipt.stage_path",
+                               ERROR_NO_UNICODE_TRANSLATION, SQLITE_OK,
+                               "integrity receipt stage path could not be represented");
+        return false;
+    }
+
+    HANDLE output = CreateFileW(wide_stage, GENERIC_WRITE, 0, NULL, CREATE_NEW,
+                                FILE_ATTRIBUTE_NORMAL | FILE_FLAG_WRITE_THROUGH, NULL);
+    free(wide_stage);
+    if (output == INVALID_HANDLE_VALUE) {
+        DWORD error = GetLastError();
+        free(stage);
+        store_verify_set_error(result, CBM_STORE_VERIFY_IO_FAILED, "receipt.stage_create", error,
+                               SQLITE_OK, "exclusive integrity receipt stage could not be created");
+        return false;
+    }
+    DWORD offset = 0;
+    DWORD write_error = ERROR_SUCCESS;
+    while (offset < (DWORD)text_len) {
+        DWORD written = 0;
+        if (!WriteFile(output, text + offset, (DWORD)text_len - offset, &written, NULL) ||
+            written == 0) {
+            write_error = GetLastError();
+            if (write_error == ERROR_SUCCESS) {
+                write_error = ERROR_WRITE_FAULT;
+            }
+            break;
+        }
+        offset += written;
+    }
+    bool flushed = write_error == ERROR_SUCCESS && FlushFileBuffers(output) != 0;
+    if (!flushed && write_error == ERROR_SUCCESS) {
+        write_error = GetLastError();
+    }
+    bool closed = CloseHandle(output) != 0;
+    if (!closed && write_error == ERROR_SUCCESS) {
+        write_error = GetLastError();
+    }
+    if (write_error != ERROR_SUCCESS || cbm_rename_replace(stage, path) != 0) {
+        if (write_error == ERROR_SUCCESS) {
+            write_error = cbm_fs_last_error();
+        }
+        (void)cbm_unlink(stage);
+        free(stage);
+        store_verify_set_error(result, CBM_STORE_VERIFY_IO_FAILED, "receipt.publish", write_error,
+                               SQLITE_OK,
+                               "durable integrity receipt could not be atomically published");
+        return false;
+    }
+    free(stage);
+
+    store_integrity_receipt_t readback;
+    store_receipt_state_t readback_state = store_receipt_read(path, &readback, result);
+    if (readback_state != STORE_RECEIPT_VALID ||
+        !store_receipt_matches_static(&readback, contract, expected_project) ||
+        !store_receipt_matches_identity(&readback, db_bytes, db_sha256)) {
+        if (readback_state == STORE_RECEIPT_VALID) {
+            store_verify_set_error(result, CBM_STORE_VERIFY_IO_FAILED, "receipt.readback",
+                                   ERROR_CRC, SQLITE_OK,
+                                   "published integrity receipt differs from the verified proof");
+        }
+        return false;
+    }
+    return true;
+}
+
 static bool store_create_scratch_directory(cbm_store_verify_result_t *result) {
     wchar_t temp_wide[CBM_STORE_VERIFY_PATH_MAX];
     DWORD temp_len = GetTempPathW((DWORD)(sizeof(temp_wide) / sizeof(temp_wide[0])), temp_wide);
@@ -2140,8 +2610,10 @@ static cbm_store_verify_status_t store_open_path_verified(const char *db_path,
     store_frozen_family_init(&family);
     char *wal_path = store_member_path(db_path, "-wal");
     char *shm_path = store_member_path(db_path, "-shm");
+    char *receipt_path = NULL;
     char snapshot_db[CBM_STORE_VERIFY_PATH_MAX] = "";
     cbm_store_t *snapshot_store = NULL;
+    bool receipt_hit = false;
     if (!wal_path || !shm_path) {
         store_verify_set_error(result, CBM_STORE_VERIFY_IO_FAILED, "source.build_family_paths",
                                ERROR_NOT_ENOUGH_MEMORY, SQLITE_NOMEM,
@@ -2167,84 +2639,136 @@ static cbm_store_verify_status_t store_open_path_verified(const char *db_path,
     }
     result->family_frozen = true;
 
-    if (!store_create_scratch_directory(result)) {
-        goto cleanup;
-    }
-    int path_wrote =
-        snprintf(snapshot_db, sizeof(snapshot_db), "%s/snapshot.db", result->scratch_path);
-    if (path_wrote < 0 || (size_t)path_wrote >= sizeof(snapshot_db)) {
-        store_verify_set_error(result, CBM_STORE_VERIFY_IO_FAILED, "snapshot.build_db_path",
-                               ERROR_BUFFER_OVERFLOW, SQLITE_OK,
-                               "snapshot database path exceeds the verified path capacity");
-        goto cleanup;
-    }
-    if (!store_copy_frozen_member(family.db, snapshot_db, result, "snapshot.copy_db",
-                                  &result->db_bytes, result->db_sha256)) {
-        goto cleanup;
-    }
-    if (result->wal_present) {
-        char *snapshot_wal = store_member_path(snapshot_db, "-wal");
-        if (!snapshot_wal) {
-            store_verify_set_error(result, CBM_STORE_VERIFY_IO_FAILED, "snapshot.build_wal_path",
+    bool receipt_eligible = expected_project && !result->wal_present && !result->shm_present;
+    if (receipt_eligible) {
+        const char *receipt_suffix = contract == STORE_INTEGRITY_CONTRACT_QUERY
+                                         ? ".integrity-query-v1"
+                                         : ".integrity-graph-v1";
+        receipt_path = store_member_path(db_path, receipt_suffix);
+        if (!receipt_path) {
+            store_verify_set_error(result, CBM_STORE_VERIFY_IO_FAILED, "receipt.build_path",
                                    ERROR_NOT_ENOUGH_MEMORY, SQLITE_NOMEM,
-                                   "snapshot WAL path could not be allocated");
+                                   "integrity receipt path could not be allocated");
             goto cleanup;
         }
-        bool copied = store_copy_frozen_member(family.wal, snapshot_wal, result,
-                                               "snapshot.copy_wal", NULL, NULL);
-        free(snapshot_wal);
-        if (!copied) {
+        store_integrity_receipt_t receipt;
+        store_receipt_state_t receipt_state = store_receipt_read(receipt_path, &receipt, result);
+        if (receipt_state == STORE_RECEIPT_ERROR) {
             goto cleanup;
+        }
+        if (receipt_state == STORE_RECEIPT_VALID &&
+            store_receipt_matches_static(&receipt, contract, expected_project)) {
+            if (!store_hash_frozen_identity(family.db, result, "receipt.hash_frozen_db",
+                                            &result->db_bytes, result->db_sha256)) {
+                goto cleanup;
+            }
+            receipt_hit =
+                store_receipt_matches_identity(&receipt, result->db_bytes, result->db_sha256);
         }
     }
 
-    int sqlite_error = SQLITE_OK;
-    char sqlite_detail[CBM_STORE_VERIFY_DETAIL_MAX] = "";
-    snapshot_store = store_open_path_query_internal(snapshot_db, &sqlite_error, sqlite_detail,
-                                                    sizeof(sqlite_detail));
-    if (!snapshot_store) {
-        store_verify_set_error(
-            result,
-            store_sqlite_corruption_code(sqlite_error) ? CBM_STORE_VERIFY_INTEGRITY_FAILED
-                                                       : CBM_STORE_VERIFY_IO_FAILED,
-            "snapshot.sqlite_open", ERROR_SUCCESS, sqlite_error,
-            sqlite_detail[0] ? sqlite_detail : "snapshot SQLite open or first read failed");
-        goto cleanup;
-    }
-    store_integrity_result_t integrity_result;
-    store_integrity_status_t integrity_status = store_check_integrity_detailed(
-        snapshot_store, contract, expected_project, &integrity_result);
-    if (integrity_status != STORE_INTEGRITY_OK) {
-        char operation[CBM_STORE_VERIFY_OPERATION_MAX];
-        int operation_wrote =
-            snprintf(operation, sizeof(operation), "snapshot.%s", integrity_result.operation);
-        if (operation_wrote < 0 || (size_t)operation_wrote >= sizeof(operation)) {
-            store_verify_set_error(result, CBM_STORE_VERIFY_IO_FAILED,
-                                   "snapshot.integrity_operation_overflow", ERROR_BUFFER_OVERFLOW,
-                                   SQLITE_TOOBIG,
-                                   "integrity diagnostic operation exceeds verified capacity");
+    if (!receipt_hit) {
+        if (!store_create_scratch_directory(result)) {
             goto cleanup;
         }
-        store_verify_set_error(
-            result,
-            integrity_status == STORE_INTEGRITY_IO_FAILED ? CBM_STORE_VERIFY_IO_FAILED
-                                                          : CBM_STORE_VERIFY_INTEGRITY_FAILED,
-            operation, ERROR_SUCCESS, integrity_result.sqlite_error, integrity_result.detail);
-        goto cleanup;
-    }
-    result->status = CBM_STORE_VERIFY_OK;
-    result->native_error = ERROR_SUCCESS;
-    result->sqlite_error = SQLITE_OK;
-    if (contract == STORE_INTEGRITY_CONTRACT_GRAPH_RELOAD) {
-        snprintf(result->operation, sizeof(result->operation), "%s",
-                 "snapshot.application.project_identity");
-        snprintf(result->detail, sizeof(result->detail), "%s",
-                 "snapshot passed the graph-reload integrity contract");
+        int path_wrote =
+            snprintf(snapshot_db, sizeof(snapshot_db), "%s/snapshot.db", result->scratch_path);
+        if (path_wrote < 0 || (size_t)path_wrote >= sizeof(snapshot_db)) {
+            store_verify_set_error(result, CBM_STORE_VERIFY_IO_FAILED, "snapshot.build_db_path",
+                                   ERROR_BUFFER_OVERFLOW, SQLITE_OK,
+                                   "snapshot database path exceeds the verified path capacity");
+            goto cleanup;
+        }
+        if (!store_copy_frozen_member(family.db, snapshot_db, result, "snapshot.copy_db",
+                                      &result->db_bytes, result->db_sha256)) {
+            goto cleanup;
+        }
+        if (result->wal_present) {
+            char *snapshot_wal = store_member_path(snapshot_db, "-wal");
+            if (!snapshot_wal) {
+                store_verify_set_error(result, CBM_STORE_VERIFY_IO_FAILED,
+                                       "snapshot.build_wal_path", ERROR_NOT_ENOUGH_MEMORY,
+                                       SQLITE_NOMEM, "snapshot WAL path could not be allocated");
+                goto cleanup;
+            }
+            bool copied = store_copy_frozen_member(family.wal, snapshot_wal, result,
+                                                   "snapshot.copy_wal", NULL, NULL);
+            free(snapshot_wal);
+            if (!copied) {
+                goto cleanup;
+            }
+        }
+
+        int sqlite_error = SQLITE_OK;
+        char sqlite_detail[CBM_STORE_VERIFY_DETAIL_MAX] = "";
+        snapshot_store = store_open_path_query_internal(snapshot_db, &sqlite_error, sqlite_detail,
+                                                        sizeof(sqlite_detail));
+        if (!snapshot_store) {
+            store_verify_set_error(
+                result,
+                store_sqlite_corruption_code(sqlite_error) ? CBM_STORE_VERIFY_INTEGRITY_FAILED
+                                                           : CBM_STORE_VERIFY_IO_FAILED,
+                "snapshot.sqlite_open", ERROR_SUCCESS, sqlite_error,
+                sqlite_detail[0] ? sqlite_detail : "snapshot SQLite open or first read failed");
+            goto cleanup;
+        }
+        store_integrity_result_t integrity_result;
+        store_integrity_status_t integrity_status = store_check_integrity_detailed(
+            snapshot_store, contract, expected_project, &integrity_result);
+        if (integrity_status != STORE_INTEGRITY_OK) {
+            char operation[CBM_STORE_VERIFY_OPERATION_MAX];
+            int operation_wrote =
+                snprintf(operation, sizeof(operation), "snapshot.%s", integrity_result.operation);
+            if (operation_wrote < 0 || (size_t)operation_wrote >= sizeof(operation)) {
+                store_verify_set_error(result, CBM_STORE_VERIFY_IO_FAILED,
+                                       "snapshot.integrity_operation_overflow",
+                                       ERROR_BUFFER_OVERFLOW, SQLITE_TOOBIG,
+                                       "integrity diagnostic operation exceeds verified capacity");
+                goto cleanup;
+            }
+            store_verify_set_error(
+                result,
+                integrity_status == STORE_INTEGRITY_IO_FAILED ? CBM_STORE_VERIFY_IO_FAILED
+                                                              : CBM_STORE_VERIFY_INTEGRITY_FAILED,
+                operation, ERROR_SUCCESS, integrity_result.sqlite_error, integrity_result.detail);
+            goto cleanup;
+        }
+        if (receipt_eligible && !store_receipt_write(receipt_path, contract, expected_project,
+                                                     result->db_bytes, result->db_sha256, result)) {
+            goto cleanup;
+        }
+        result->status = CBM_STORE_VERIFY_OK;
+        result->native_error = ERROR_SUCCESS;
+        result->sqlite_error = SQLITE_OK;
+        if (contract == STORE_INTEGRITY_CONTRACT_GRAPH_RELOAD) {
+            snprintf(result->operation, sizeof(result->operation), "%s",
+                     "snapshot.application.project_identity");
+            snprintf(result->detail, sizeof(result->detail), "%s",
+                     receipt_eligible
+                         ? "full graph-reload integrity passed and its exact-content receipt was "
+                           "published"
+                         : "full graph-reload integrity passed; receipt publication was ineligible "
+                           "because the frozen database family included a WAL or SHM sidecar");
+        } else {
+            snprintf(result->operation, sizeof(result->operation), "%s",
+                     "snapshot.application.project_row");
+            const char *query_detail =
+                receipt_eligible ? "full query-store integrity passed and its exact-content "
+                                   "receipt was published"
+                : expected_project
+                    ? "full query-store integrity passed; receipt publication was ineligible "
+                      "because the frozen database family included a WAL or SHM sidecar"
+                    : "full query-store integrity passed without receipt publication because no "
+                      "exact project identity was supplied";
+            snprintf(result->detail, sizeof(result->detail), "%s", query_detail);
+        }
     } else {
-        snprintf(result->operation, sizeof(result->operation), "%s",
-                 "snapshot.application.project_row");
+        result->status = CBM_STORE_VERIFY_OK;
+        result->native_error = ERROR_SUCCESS;
+        result->sqlite_error = SQLITE_OK;
+        snprintf(result->operation, sizeof(result->operation), "%s", "receipt.exact_content");
         snprintf(result->detail, sizeof(result->detail), "%s",
-                 "snapshot passed the query-store integrity contract");
+                 "exact database bytes reused the matching full-integrity receipt");
     }
 
 cleanup:
@@ -2287,7 +2811,29 @@ cleanup:
                         ? source_sqlite_detail
                         : "verified source could not be opened before releasing DB/WAL guards");
             } else {
-                *out_store = opened;
+                store_integrity_result_t provenance;
+                store_integrity_result_init(&provenance);
+                if (!store_check_project_provenance(opened, expected_project, &provenance)) {
+                    char operation[CBM_STORE_VERIFY_OPERATION_MAX];
+                    int wrote =
+                        snprintf(operation, sizeof(operation), "source.%s", provenance.operation);
+                    cbm_store_close(opened);
+                    if (wrote < 0 || (size_t)wrote >= sizeof(operation)) {
+                        store_verify_set_error(
+                            result, CBM_STORE_VERIFY_IO_FAILED,
+                            "source.project_provenance_operation_overflow", ERROR_BUFFER_OVERFLOW,
+                            SQLITE_TOOBIG, "live provenance diagnostic exceeds verified capacity");
+                    } else {
+                        store_verify_set_error(result,
+                                               provenance.status == STORE_INTEGRITY_IO_FAILED
+                                                   ? CBM_STORE_VERIFY_IO_FAILED
+                                                   : CBM_STORE_VERIFY_INTEGRITY_FAILED,
+                                               operation, ERROR_SUCCESS, provenance.sqlite_error,
+                                               provenance.detail);
+                    }
+                } else {
+                    *out_store = opened;
+                }
             }
         }
     }
@@ -2310,6 +2856,7 @@ cleanup:
     }
     free(wal_path);
     free(shm_path);
+    free(receipt_path);
     return result->status;
 #endif
 }
