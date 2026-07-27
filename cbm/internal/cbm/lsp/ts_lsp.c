@@ -1807,6 +1807,61 @@ static const CBMType *return_type_of(CBMArena *arena, const CBMType *sig) {
     return cbm_type_tuple(arena, sig->data.func.return_types, count);
 }
 
+/*
+ * Tree-sitter's JavaScript/TypeScript grammar represents ordinary binary
+ * operators as left-associated binary_expression trees. A flat chain such as
+ * 'a && b && c' must consume evaluator work, but it is not semantic recursion:
+ * recursing through that grammar spine makes the source's predicate count
+ * consume native stack frames and the declared expression-depth budget.
+ *
+ * Walk only the binary-expression spine explicitly. Pushing right before left
+ * preserves the previous left-to-right operand evaluation order and therefore
+ * preserves resolved-call emission order. Re-enter the recursive evaluator
+ * only for non-binary operands, so its guard continues to measure genuinely
+ * nested expression evaluation. The aggregation below is equivalent to the
+ * former recursive branch: any string operand makes the binary result string;
+ * otherwise a well-formed binary tree produces number.
+ */
+static const CBMType *eval_binary_expr_type(TSLSPContext *ctx, TSNode root) {
+    TSNodeStack pending = {0};
+    bool saw_operand = false;
+    bool saw_string = false;
+    if (!ts_node_stack_push(ctx, &pending, root, "ts_lsp_binary_expression_worklist")) {
+        return cbm_type_unknown();
+    }
+
+    while (pending.count > 0) {
+        TSNode node = pending.items[--pending.count];
+        if (strcmp(ts_node_type(node), "binary_expression") == 0) {
+            TSNode left = ts_node_child_by_field_name(node, "left", TS_LSP_FIELD_LEN("left"));
+            TSNode right = ts_node_child_by_field_name(node, "right", TS_LSP_FIELD_LEN("right"));
+            if (ts_node_is_null(left) || ts_node_is_null(right)) {
+                return cbm_type_unknown();
+            }
+            if (!ts_node_stack_push(ctx, &pending, right, "ts_lsp_binary_expression_worklist") ||
+                !ts_node_stack_push(ctx, &pending, left, "ts_lsp_binary_expression_worklist")) {
+                return cbm_type_unknown();
+            }
+            continue;
+        }
+
+        const CBMType *operand = ts_eval_expr_type(ctx, node);
+        if (cbm_arena_failed(ctx->arena)) {
+            return cbm_type_unknown();
+        }
+        saw_operand = true;
+        if (operand && operand->kind == CBM_TYPE_BUILTIN && operand->data.builtin.name &&
+            strcmp(operand->data.builtin.name, "string") == 0) {
+            saw_string = true;
+        }
+    }
+
+    if (!saw_operand) {
+        return cbm_type_unknown();
+    }
+    return cbm_type_builtin(ctx->arena, saw_string ? "string" : "number");
+}
+
 const CBMType *ts_eval_expr_type(TSLSPContext *ctx, TSNode node) {
     if (!ctx || ts_node_is_null(node))
         return cbm_type_unknown();
@@ -2088,21 +2143,7 @@ const CBMType *ts_eval_expr_type(TSLSPContext *ctx, TSNode node) {
             result = cbm_type_union(ctx->arena, members, 2);
         }
     } else if (strcmp(kind, "binary_expression") == 0) {
-        // String concatenation `a + b` where either side is string → string.
-        TSNode left = ts_node_child_by_field_name(node, "left", TS_LSP_FIELD_LEN("left"));
-        TSNode right = ts_node_child_by_field_name(node, "right", TS_LSP_FIELD_LEN("right"));
-        if (!ts_node_is_null(left) && !ts_node_is_null(right)) {
-            const CBMType *l = ts_eval_expr_type(ctx, left);
-            const CBMType *r = ts_eval_expr_type(ctx, right);
-            if ((l && l->kind == CBM_TYPE_BUILTIN && l->data.builtin.name &&
-                 strcmp(l->data.builtin.name, "string") == 0) ||
-                (r && r->kind == CBM_TYPE_BUILTIN && r->data.builtin.name &&
-                 strcmp(r->data.builtin.name, "string") == 0)) {
-                result = cbm_type_builtin(ctx->arena, "string");
-            } else {
-                result = cbm_type_builtin(ctx->arena, "number");
-            }
-        }
+        result = eval_binary_expr_type(ctx, node);
     }
 
     ctx->eval_depth--;
