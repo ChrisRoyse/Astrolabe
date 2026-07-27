@@ -628,14 +628,19 @@ char *cbm_project_name_from_path(const char *abs_path) {
         return strdup("root");
     }
 
-    /* #432: canonicalize via the long-path-safe wrapper. The old ANSI
-     * `_access(...,0) + _fullpath` pair (Windows) was MAX_PATH-bound, so a source
-     * file whose absolute path exceeds 260 chars failed to canonicalize and the
-     * project name was derived from the raw un-normalized path. cbm_canonicalize_
-     * existing_path resolves through GetFullPathNameW + cbm_path_exists
-     * ("\\?\"-widened) on Windows and realpath on POSIX, returning a heap string
-     * (free()) or NULL. On NULL we keep the original abs_path (no ANSI fallback). */
-    char *canonical = cbm_canonicalize_existing_path(abs_path);
+    /* Existing roots use their final filesystem identity. On Windows this
+     * resolves junctions, symlinks, and 8.3 aliases so one physical repository
+     * cannot acquire multiple project/database names. Non-path inputs retain
+     * the legacy deterministic mapping used by project-name normalization. */
+    bool existing_path = cbm_path_exists(abs_path);
+    char *canonical = existing_path ? cbm_real_path_final(abs_path) : NULL;
+    if (existing_path && !canonical) {
+        cbm_log_error("project.identity_failed", "code", "CBM_PROJECT_ROOT_IDENTITY_UNRESOLVABLE",
+                      "operation", "cbm_real_path_final", "path", abs_path, "message",
+                      "an existing project root could not be bound to its final filesystem path",
+                      "remediation", "restore readable directory identity and retry");
+        return NULL;
+    }
     const char *name_path = abs_path;
     if (canonical) {
         cbm_normalize_path_sep(canonical);

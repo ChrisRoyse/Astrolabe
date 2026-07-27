@@ -43,7 +43,6 @@ struct Config {
     generated_files: usize,
     corpus_class: CorpusClass,
     gate_ratio: f64,
-    project: String,
 }
 
 struct RunTiming {
@@ -96,18 +95,9 @@ fn run() -> Result<(), Box<dyn Error>> {
         let baseline_db = work_dir.join(format!("baseline-{run}.db"));
         let row_sink_db = work_dir.join(format!("row-sink-{run}.db"));
 
-        let baseline_us = time_pipeline_run(
-            &repo_path,
-            &baseline_db,
-            config.mode,
-            &format!("{}-baseline-{run}", config.project),
-        )?;
-        let (row_sink_us, row_sink_nodes, row_sink_edges) = time_row_sink_run(
-            &repo_path,
-            &row_sink_db,
-            config.mode,
-            &format!("{}-row-sink-{run}", config.project),
-        )?;
+        let baseline_us = time_pipeline_run(&repo_path, &baseline_db, config.mode)?;
+        let (row_sink_us, row_sink_nodes, row_sink_edges) =
+            time_row_sink_run(&repo_path, &row_sink_db, config.mode)?;
         timings.push(RunTiming {
             baseline_us,
             row_sink_us,
@@ -175,8 +165,6 @@ impl Config {
         let mut generated_files = DEFAULT_GENERATED_FILES;
         let mut corpus_class = CorpusClass::Small;
         let mut gate_ratio = None;
-        let mut project = format!("row-sink-bench-{}-{}", std::process::id(), now_nanos());
-
         let mut index = 0;
         while index < args.len() {
             match args[index].as_str() {
@@ -211,10 +199,6 @@ impl Config {
                     }
                     gate_ratio = Some(ratio);
                 }
-                "--project" => {
-                    index += 1;
-                    project = required_arg(&args, index, "--project")?;
-                }
                 "--help" | "-h" => {
                     print_usage();
                     std::process::exit(0);
@@ -232,7 +216,6 @@ impl Config {
             generated_files,
             corpus_class,
             gate_ratio: gate_ratio.unwrap_or_else(|| corpus_class.default_gate_ratio()),
-            project,
         })
     }
 }
@@ -241,11 +224,9 @@ fn time_pipeline_run(
     repo_path: &Path,
     db_path: &Path,
     mode: CbmIndexMode,
-    project: &str,
 ) -> Result<u128, Box<dyn Error>> {
     cleanup_db_path(db_path);
     let mut pipeline = CbmPipeline::new(path_str(repo_path)?, path_str(db_path)?, mode)?;
-    pipeline.set_project_name(project)?;
     let started = Instant::now();
     pipeline.run_to_sqlite()?;
     Ok(started.elapsed().as_micros())
@@ -255,11 +236,9 @@ fn time_row_sink_run(
     repo_path: &Path,
     db_path: &Path,
     mode: CbmIndexMode,
-    project: &str,
 ) -> Result<(u128, usize, usize), Box<dyn Error>> {
     cleanup_db_path(db_path);
     let mut pipeline = CbmPipeline::new(path_str(repo_path)?, path_str(db_path)?, mode)?;
-    pipeline.set_project_name(project)?;
     let started = Instant::now();
     let rows = pipeline.collect_rows()?;
     Ok((
@@ -355,6 +334,6 @@ fn print_usage() {
     eprintln!(
         "usage: cargo run -p astrolabe-bridge --release --example bench_row_sink_overhead -- \\\n\
          [--repo PATH] [--mode full|moderate|fast] [--repeats N] [--files N] \\\n\
-         [--corpus-class small|medium|large] [--gate-ratio R] [--project NAME]"
+         [--corpus-class small|medium|large] [--gate-ratio R]"
     );
 }

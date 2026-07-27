@@ -852,6 +852,7 @@ impl HistoricalExtractionPool {
         &mut self,
         scoped_root: &Path,
         database: &Path,
+        identity_root: &Path,
         project: &str,
         commit: &str,
     ) -> Result<HistoricalExtract, DynError> {
@@ -871,6 +872,7 @@ impl HistoricalExtractionPool {
         let request = json!({
             "scoped_root": path_str(scoped_root)?,
             "database": path_str(database)?,
+            "identity_root": path_str(identity_root)?,
             "project": project,
             "mode": "fast",
         });
@@ -1121,11 +1123,12 @@ fn archaeology_extract_fault_detail(
 fn extract_rows_once(
     scoped_root: &str,
     database: &str,
+    identity_root: &str,
     project: &str,
     mode: CbmIndexMode,
 ) -> Result<CbmPipelineRows, DynError> {
     let mut pipeline = CbmPipeline::new(scoped_root, database, mode)?;
-    pipeline.set_project_name(project)?;
+    pipeline.bind_project_identity_root(identity_root, project)?;
     let rows = pipeline.collect_rows()?;
     drop(pipeline);
     Ok(rows)
@@ -1139,24 +1142,30 @@ fn extract_rows_once(
 /// to the pre-#530 nonzero-exit child).
 fn build_serve_response(request: &Value) -> Value {
     let field = |key: &str| request.get(key).and_then(Value::as_str);
-    let (scoped_root, database, project) =
-        match (field("scoped_root"), field("database"), field("project")) {
-            (Some(scoped_root), Some(database), Some(project)) => (scoped_root, database, project),
-            _ => {
-                return json!({
-                    "ok": false,
-                    "error": "archaeology_extract_error: request missing required string field \
-                              (scoped_root/database/project)",
-                });
-            }
-        };
+    let (scoped_root, database, identity_root, project) = match (
+        field("scoped_root"),
+        field("database"),
+        field("identity_root"),
+        field("project"),
+    ) {
+        (Some(scoped_root), Some(database), Some(identity_root), Some(project)) => {
+            (scoped_root, database, identity_root, project)
+        }
+        _ => {
+            return json!({
+                "ok": false,
+                "error": "archaeology_extract_error: request missing required string field \
+                          (scoped_root/database/identity_root/project)",
+            });
+        }
+    };
     let mode = match request.get("mode").and_then(Value::as_str) {
         Some("full") => CbmIndexMode::Full,
         Some("moderate") => CbmIndexMode::Moderate,
         // Historical re-index is always Fast; anything else (incl. absent) maps to it.
         _ => CbmIndexMode::Fast,
     };
-    match extract_rows_once(scoped_root, database, project, mode) {
+    match extract_rows_once(scoped_root, database, identity_root, project, mode) {
         Ok(rows) => {
             let mut envelope = serialize_pipeline_rows(&rows);
             if let Value::Object(map) = &mut envelope {
@@ -1607,6 +1616,11 @@ fn index_historical_commit(
         .into());
     }
     let database = cache_dir.join(format!("{ARCHAEOLOGY_DB_PREFIX}{nonce}.db"));
+    let identity_root = if corpus_rel.is_empty() {
+        repo.to_path_buf()
+    } else {
+        repo.join(corpus_rel)
+    };
     // #439: materialize ONLY the implicated files (file-scoped) or the whole member
     // subtree (pre-#439). Both leave `scoped_root` (below) at the same base, so CBM
     // emits byte-identical subtree-relative node paths in either mode.
@@ -1663,7 +1677,7 @@ fn index_historical_commit(
         // in-process path (#418/#439 identity contract). A fault is CONTAINED as
         // `HistoricalExtract::Crashed`, the host survives, and the caller degrades this
         // one commit (labeled, counted) instead of the whole index dying silently.
-        pool.extract(&scoped_root, &database, project, commit)
+        pool.extract(&scoped_root, &database, &identity_root, project, commit)
     })();
     // Ask git to release and remove its worktree registration first; retries below
     // sweep any file/dir it leaves behind under Windows handle latency.

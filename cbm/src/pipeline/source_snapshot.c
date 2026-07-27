@@ -256,31 +256,54 @@ static int snapshot_capture_one(const char *snapshot_root, cbm_file_info_t *file
     }
 
     uint8_t captured_digest[CBM_SHA256_DIGEST_LEN];
-    uint8_t replay_digest[CBM_SHA256_DIGEST_LEN];
     uint64_t captured_bytes = 0;
-    uint64_t replay_bytes = 0;
     DWORD error = ERROR_SUCCESS;
-    bool ok = copy_and_hash(source, destination, captured_digest, &captured_bytes, &error) &&
-              FlushFileBuffers(destination) &&
-              hash_handle(source, replay_digest, &replay_bytes, &error);
-    if (!ok && error == ERROR_SUCCESS) {
-        error = GetLastError();
+    /* The retained source handle was opened with FILE_SHARE_READ only. Windows
+     * refuses that open when an existing writer/delete handle conflicts and
+     * refuses every new writer/delete open until this handle closes. The
+     * before/after FILE_ID + size + last-write/change-time comparison therefore
+     * proves that the single copy-and-hash read observed one stable source
+     * generation; replaying every source byte through the same protected handle
+     * added no independent evidence.
+     *
+     * The destination is transaction-ephemeral and is consumed only after it is
+     * closed and independently reopened, byte-counted, and SHA-256 verified
+     * below. It is not a crash-durable publication, so forcing each file to
+     * persistent media with FlushFileBuffers added thousands of synchronous disk
+     * barriers without strengthening the readback or publication contract. */
+    bool ok = copy_and_hash(source, destination, captured_digest, &captured_bytes, &error);
+    if (!ok) {
+        snapshot_log_failure("CBM_SOURCE_SNAPSHOT_COPY_FAILED", "copy_source", source_path,
+                             error ? error : GetLastError());
+        CloseHandle(destination);
+        CloseHandle(source);
+        DeleteFileW(wide_destination);
+        free(wide_source);
+        free(wide_destination);
+        free(destination_path);
+        return CBM_NOT_FOUND;
     }
+
     snapshot_identity_t after = {0};
-    if (ok) {
-        ok = snapshot_get_identity(source, &after);
-        if (!ok) {
-            error = GetLastError();
-        }
+    if (!snapshot_get_identity(source, &after)) {
+        error = GetLastError();
+        snapshot_log_failure("CBM_SOURCE_SNAPSHOT_SOURCE_IDENTITY_FAILED",
+                             "inspect_source_after_copy", source_path, error);
+        CloseHandle(destination);
+        CloseHandle(source);
+        DeleteFileW(wide_destination);
+        free(wide_source);
+        free(wide_destination);
+        free(destination_path);
+        return CBM_NOT_FOUND;
     }
     CloseHandle(destination);
     CloseHandle(source);
 
-    if (!ok || !snapshot_identity_equal(&before, &after) || captured_bytes != replay_bytes ||
-        captured_bytes != (uint64_t)before.standard.EndOfFile.QuadPart ||
-        memcmp(captured_digest, replay_digest, sizeof(captured_digest)) != 0) {
-        snapshot_log_failure("CBM_SOURCE_SNAPSHOT_SOURCE_MUTATED", "capture_and_replay",
-                             source_path, error ? error : ERROR_FILE_INVALID);
+    if (!snapshot_identity_equal(&before, &after) ||
+        captured_bytes != (uint64_t)before.standard.EndOfFile.QuadPart) {
+        snapshot_log_failure("CBM_SOURCE_SNAPSHOT_SOURCE_MUTATED", "capture_identity", source_path,
+                             error ? error : ERROR_FILE_INVALID);
         DeleteFileW(wide_destination);
         free(wide_source);
         free(wide_destination);

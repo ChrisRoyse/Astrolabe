@@ -471,7 +471,14 @@ pub(crate) fn handle_index_repository(
             shadow_import_lock_path(&cache_dir, &project).display()
         ));
     };
+    let shadow_started = std::time::Instant::now();
+    let stage_started = std::time::Instant::now();
     let publication = ShadowPublication::begin(&cache_dir, &project)?;
+    eprintln!(
+        "astro.shadow.index_phase phase=stage_seed elapsed_ms={} total_ms={}",
+        stage_started.elapsed().as_millis(),
+        shadow_started.elapsed().as_millis()
+    );
     let staged_args = match shadow_worker_args(&sanitized_args, publication.stage_cache()) {
         Ok(args) => args,
         Err(error) => return Err(publication.abort("worker argument binding", error)),
@@ -540,10 +547,16 @@ pub(crate) fn handle_index_repository(
             return tool_error_result(publication.abort("staged build", error).to_string());
         }
     };
+    let publish_started = std::time::Instant::now();
     let outcome = match publication.publish(outcome, dial, &sanitized_args) {
         Ok(outcome) => outcome,
         Err(error) => return tool_error_result(error.to_string()),
     };
+    eprintln!(
+        "astro.shadow.index_phase phase=publication elapsed_ms={} total_ms={}",
+        publish_started.elapsed().as_millis(),
+        shadow_started.elapsed().as_millis()
+    );
     augment_tool_result(
         &result,
         json!({

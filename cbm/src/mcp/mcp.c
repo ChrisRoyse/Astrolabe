@@ -100,6 +100,13 @@ enum {
 /* Directory permissions: rwxr-xr-x */
 #define ADR_DIR_PERMS 0755
 
+/* One installed Astrolabe generation may serve many MCP clients, but one native
+ * index already uses the host's measured default worker count (all detected
+ * processors for an initial index). A single crash-recoverable host lease keeps
+ * that expensive work from being oversubscribed across independent MCP parents.
+ * Contention is reported immediately rather than consuming the caller's MCP
+ * deadline in an invisible queue. Query-only parents never acquire this lease. */
+
 /* JSON-RPC 2.0 standard error codes */
 #define JSONRPC_PARSE_ERROR (-32700)
 #define JSONRPC_METHOD_NOT_FOUND (-32601)
@@ -117,6 +124,212 @@ static char *heap_strdup(const char *s) {
     }
     return d;
 }
+
+static char *yy_doc_to_str(yyjson_mut_doc *doc);
+
+#ifdef _WIN32
+typedef struct {
+    HANDLE project_mutex;
+    HANDLE host_mutex;
+} cbm_index_admission_t;
+
+static char *index_admission_error(const char *code, const char *project, const char *repo_path,
+                                   const char *message, const char *remediation) {
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    if (!doc) {
+        cbm_log_error("index.admission.failed", "code", "CBM_INDEX_ADMISSION_RESPONSE_ALLOC_FAILED",
+                      "project", project, "repo_path", repo_path, "message",
+                      "the exact indexing admission failure could not be serialized", "remediation",
+                      "free memory and retry the unchanged request");
+        return NULL;
+    }
+    yyjson_mut_val *root = yyjson_mut_obj(doc);
+    yyjson_mut_doc_set_root(doc, root);
+    yyjson_mut_obj_add_str(doc, root, "status", "error");
+    yyjson_mut_obj_add_str(doc, root, "code", code);
+    yyjson_mut_obj_add_str(doc, root, "operation", "acquire_index_admission");
+    yyjson_mut_obj_add_str(doc, root, "project", project);
+    yyjson_mut_obj_add_str(doc, root, "repo_path", repo_path);
+    yyjson_mut_obj_add_bool(doc, root, "pipeline_started", false);
+    yyjson_mut_obj_add_bool(doc, root, "sqlite_publication_started", false);
+    yyjson_mut_obj_add_str(doc, root, "message", message);
+    yyjson_mut_obj_add_str(doc, root, "remediation", remediation);
+    char *json = yy_doc_to_str(doc);
+    yyjson_mut_doc_free(doc);
+    return json;
+}
+
+static char *acquire_index_admission(const char *project, const char *repo_path,
+                                     cbm_index_admission_t *admission) {
+    memset(admission, 0, sizeof(*admission));
+
+    char project_digest[CBM_SHA256_HEX_LEN + 1];
+    cbm_sha256_hex(project, strlen(project), project_digest);
+    wchar_t project_mutex_name[CBM_SZ_128];
+    int project_name_len = swprintf(project_mutex_name, CBM_SZ_128,
+                                    L"Global\\Astrolabe.IndexProject.v1.%hs", project_digest);
+    if (project_name_len <= 0 || project_name_len >= CBM_SZ_128) {
+        cbm_log_error("index.admission.failed", "code", "CBM_INDEX_PROJECT_MUTEX_NAME_FAILED",
+                      "project", project, "repo_path", repo_path, "message",
+                      "the canonical project mutex name could not be constructed", "remediation",
+                      "preserve the project store and retry the exact request");
+        return index_admission_error("CBM_INDEX_PROJECT_MUTEX_NAME_FAILED", project, repo_path,
+                                     "the canonical project mutex name could not be constructed",
+                                     "preserve the project store and retry the exact request");
+    }
+
+    admission->project_mutex = CreateMutexW(NULL, FALSE, project_mutex_name);
+    if (!admission->project_mutex) {
+        char native_error[CBM_SZ_32];
+        snprintf(native_error, sizeof(native_error), "%lu", (unsigned long)GetLastError());
+        cbm_log_error("index.admission.failed", "code", "CBM_INDEX_PROJECT_MUTEX_CREATE_FAILED",
+                      "project", project, "repo_path", repo_path, "native_error_kind", "win32",
+                      "native_error", native_error, "message",
+                      "the cross-process project writer mutex could not be opened", "remediation",
+                      "resolve the reported Windows named-object failure and retry");
+        return index_admission_error(
+            "CBM_INDEX_PROJECT_MUTEX_CREATE_FAILED", project, repo_path,
+            "the cross-process project writer mutex could not be opened",
+            "resolve the structured Windows error and retry the unchanged request");
+    }
+    DWORD project_wait = WaitForSingleObject(admission->project_mutex, 0);
+    if (project_wait == WAIT_TIMEOUT) {
+        CloseHandle(admission->project_mutex);
+        admission->project_mutex = NULL;
+        cbm_log_error("index.admission.refused", "code", "CBM_INDEX_PROJECT_BUSY", "project",
+                      project, "repo_path", repo_path, "pipeline_started", "false",
+                      "sqlite_publication_started", "false", "message",
+                      "another Astrolabe process owns the exact project writer generation",
+                      "remediation", "let the reported project index finish, then retry once");
+        return index_admission_error(
+            "CBM_INDEX_PROJECT_BUSY", project, repo_path,
+            "another Astrolabe process owns the exact project writer generation",
+            "let the exact project index finish, then retry once");
+    }
+    if (project_wait == WAIT_ABANDONED) {
+        ReleaseMutex(admission->project_mutex);
+        CloseHandle(admission->project_mutex);
+        admission->project_mutex = NULL;
+        cbm_log_error(
+            "index.admission.refused", "code", "CBM_INDEX_PROJECT_OWNER_ABANDONED", "project",
+            project, "repo_path", repo_path, "pipeline_started", "false",
+            "sqlite_publication_started", "false", "message",
+            "the previous exact project writer terminated without releasing its generation",
+            "remediation",
+            "inspect the project database family and structured worker diagnostics, then retry");
+        return index_admission_error(
+            "CBM_INDEX_PROJECT_OWNER_ABANDONED", project, repo_path,
+            "the previous exact project writer terminated without releasing its generation",
+            "inspect the complete project database family and worker diagnostics, then retry");
+    }
+    if (project_wait != WAIT_OBJECT_0) {
+        char native_error[CBM_SZ_32];
+        snprintf(native_error, sizeof(native_error), "%lu", (unsigned long)GetLastError());
+        CloseHandle(admission->project_mutex);
+        admission->project_mutex = NULL;
+        cbm_log_error("index.admission.failed", "code", "CBM_INDEX_PROJECT_MUTEX_WAIT_FAILED",
+                      "project", project, "repo_path", repo_path, "native_error_kind", "win32",
+                      "native_error", native_error, "message",
+                      "the exact project writer mutex could not be evaluated", "remediation",
+                      "resolve the reported Windows wait failure and retry");
+        return index_admission_error(
+            "CBM_INDEX_PROJECT_MUTEX_WAIT_FAILED", project, repo_path,
+            "the exact project writer mutex could not be evaluated",
+            "resolve the structured Windows error and retry the unchanged request");
+    }
+
+    admission->host_mutex = CreateMutexW(NULL, FALSE, L"Global\\Astrolabe.ExpensiveIndexHost.v1");
+    if (!admission->host_mutex) {
+        char native_error[CBM_SZ_32];
+        snprintf(native_error, sizeof(native_error), "%lu", (unsigned long)GetLastError());
+        cbm_log_error("index.admission.failed", "code", "CBM_INDEX_HOST_MUTEX_CREATE_FAILED",
+                      "project", project, "repo_path", repo_path, "native_error_kind", "win32",
+                      "native_error", native_error, "message",
+                      "the host-wide expensive-index lease could not be opened", "remediation",
+                      "resolve the reported Windows named-object failure and retry");
+        ReleaseMutex(admission->project_mutex);
+        CloseHandle(admission->project_mutex);
+        admission->project_mutex = NULL;
+        return index_admission_error(
+            "CBM_INDEX_HOST_MUTEX_CREATE_FAILED", project, repo_path,
+            "the host-wide expensive-index lease could not be opened",
+            "resolve the structured Windows error and retry the unchanged request");
+    }
+
+    DWORD host_wait = WaitForSingleObject(admission->host_mutex, 0);
+    if (host_wait == WAIT_TIMEOUT) {
+        CloseHandle(admission->host_mutex);
+        admission->host_mutex = NULL;
+        ReleaseMutex(admission->project_mutex);
+        CloseHandle(admission->project_mutex);
+        admission->project_mutex = NULL;
+        cbm_log_error("index.admission.refused", "code", "CBM_INDEX_HOST_BUSY", "project", project,
+                      "repo_path", repo_path, "pipeline_started", "false",
+                      "sqlite_publication_started", "false", "message",
+                      "another Astrolabe process owns the host-wide expensive-index generation",
+                      "remediation", "let that index finish, then retry the unchanged request");
+        return index_admission_error(
+            "CBM_INDEX_HOST_BUSY", project, repo_path,
+            "another Astrolabe process owns the host-wide expensive-index generation",
+            "let the active index finish, then retry the unchanged request");
+    }
+    if (host_wait != WAIT_OBJECT_0 && host_wait != WAIT_ABANDONED) {
+        char native_error[CBM_SZ_32];
+        snprintf(native_error, sizeof(native_error), "%lu", (unsigned long)GetLastError());
+        CloseHandle(admission->host_mutex);
+        admission->host_mutex = NULL;
+        ReleaseMutex(admission->project_mutex);
+        CloseHandle(admission->project_mutex);
+        admission->project_mutex = NULL;
+        cbm_log_error("index.admission.failed", "code", "CBM_INDEX_HOST_MUTEX_WAIT_FAILED",
+                      "project", project, "repo_path", repo_path, "native_error_kind", "win32",
+                      "native_error", native_error, "message",
+                      "the host-wide expensive-index lease could not be evaluated", "remediation",
+                      "resolve the reported Windows wait failure and retry");
+        return index_admission_error(
+            "CBM_INDEX_HOST_MUTEX_WAIT_FAILED", project, repo_path,
+            "the host-wide expensive-index lease could not be evaluated",
+            "resolve the structured Windows error and retry the unchanged request");
+    }
+
+    cbm_log_info("index.admission.acquired", "project", project, "repo_path", repo_path,
+                 "waited_ms", "0", "recovered_abandoned_capacity",
+                 host_wait == WAIT_ABANDONED ? "true" : "false");
+    return NULL;
+}
+
+static bool release_index_admission(cbm_index_admission_t *admission, const char *project,
+                                    const char *repo_path) {
+    bool released = true;
+    if (admission->host_mutex) {
+        if (!ReleaseMutex(admission->host_mutex)) {
+            char native_error[CBM_SZ_32];
+            snprintf(native_error, sizeof(native_error), "%lu", (unsigned long)GetLastError());
+            cbm_log_error("index.admission.release_failed", "code",
+                          "CBM_INDEX_HOST_MUTEX_RELEASE_FAILED", "project", project, "repo_path",
+                          repo_path, "native_error_kind", "win32", "native_error", native_error,
+                          "remediation", "inspect the exact worker thread ownership and retry");
+            released = false;
+        }
+        CloseHandle(admission->host_mutex);
+        admission->host_mutex = NULL;
+    }
+    if (admission->project_mutex) {
+        if (!ReleaseMutex(admission->project_mutex)) {
+            char native_error[CBM_SZ_32];
+            snprintf(native_error, sizeof(native_error), "%lu", (unsigned long)GetLastError());
+            cbm_log_error("index.admission.release_failed", "code",
+                          "CBM_INDEX_PROJECT_MUTEX_RELEASE_FAILED", "project", project, "repo_path",
+                          repo_path, "native_error_kind", "win32", "native_error", native_error,
+                          "remediation", "inspect the exact worker thread ownership and retry");
+            released = false;
+        }
+        CloseHandle(admission->project_mutex);
+        admission->project_mutex = NULL;
+    }
+    return released;
+}
+#endif
 
 /* Write yyjson_mut_doc to a heap-allocated, strict UTF-8 JSON string.
  * MCP is a UTF-8 protocol boundary.  Invalid persisted/process text must fail
@@ -373,9 +586,6 @@ static const tool_def_t TOOLS[] = {
      "\"target_projects\":{\"type\":\"array\",\"items\":{\"type\":\"string\"},"
      "\"description\":\"Projects to search for cross-repo links (cross-repo-intelligence mode). "
      "Use [\\\"*\\\"] for all indexed projects. Run list_projects to see available projects.\"},"
-     "\"name\":{\"type\":\"string\",\"description\":"
-     "\"Override the derived project name. Non-ASCII bytes are encoded and unsafe path characters "
-     "are normalized.\"},"
      "\"persistence\":{\"type\":\"boolean\",\"default\":false,\"description\":"
      "\"Write compressed artifact to .codebase-memory/graph.db.zst for team sharing. "
      "Teammates can bootstrap from the artifact instead of full re-indexing.\"}"
@@ -855,19 +1065,27 @@ char *cbm_mcp_get_string_arg(const char *args_json, const char *key) {
     return result;
 }
 
+static bool cbm_mcp_has_arg(const char *args_json, const char *key) {
+    yyjson_doc *doc = yyjson_read(args_json, strlen(args_json), 0);
+    if (!doc) {
+        return false;
+    }
+    yyjson_val *root = yyjson_doc_get_root(doc);
+    bool present = root && yyjson_is_obj(root) && yyjson_obj_get(root, key) != NULL;
+    yyjson_doc_free(doc);
+    return present;
+}
+
 static char *canonicalize_repo_path_if_exists(char *repo_path) {
     if (!repo_path) {
         return NULL;
     }
-    /* #432: canonicalize via the long-path-safe wrapper. The old ANSI
-     * `_access(...,0) + _fullpath` pair was MAX_PATH-bound, so a repo path deeper
-     * than 260 chars failed to canonicalize (false not-found / _fullpath NULL) and
-     * was indexed under its raw un-normalized form. cbm_canonicalize_existing_path
-     * resolves through GetFullPathNameW + cbm_path_exists ("\\?\"-widened); it
-     * returns a heap string (free()) or NULL when the path is absent/unresolvable.
-     * Absence is terminal: indexing or project lookup must never continue under a
-     * raw path whose filesystem identity was not established. */
-    char *canonical = cbm_canonicalize_existing_path(repo_path);
+    /* Bind the repository to its final filesystem path, not merely a lexical
+     * absolute spelling. On Windows this resolves junctions, symlinks, and 8.3
+     * aliases through an opened handle, so independent MCP parents derive one
+     * project/admission identity for the same physical root. Failure is terminal:
+     * indexing must never continue under an unresolved alias. */
+    char *canonical = cbm_real_path_final(repo_path);
     if (canonical) {
         cbm_normalize_path_sep(canonical);
         free(repo_path);
@@ -929,8 +1147,7 @@ static char *normalize_project_arg(char *project) {
  * aliases a caller naturally reaches for (#640): list_projects surfaces the
  * field as "name" and the not-found hint says "pass the project name", so
  * "project_name" is the usual guess; "project_id" / "projectName" are accepted
- * too. NOT bare "name" — index_repository uses "name" for an explicit
- * project-name override. Caller must free() the result. */
+ * too. Caller must free() the result. */
 static char *get_project_arg(const char *args_json) {
     char *p = cbm_mcp_get_string_arg(args_json, "project");
     if (!p) {
@@ -4720,6 +4937,62 @@ static char *build_index_state_mismatch_error(const char *project_name, int expe
     return json ? json : heap_strdup("{\"code\":\"CBM_INDEX_PERSISTED_STATE_MISMATCH\"}");
 }
 
+static char *build_index_telemetry_error(const char *project_name, size_t metric_count) {
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    if (!doc) {
+        return heap_strdup(
+            "{\"code\":\"CBM_INDEX_PHASE_TELEMETRY_INCOMPLETE\",\"message\":\"the completed "
+            "index did not retain a complete native phase metric set\",\"sqlite_publication_"
+            "started\":true}");
+    }
+    yyjson_mut_val *root = yyjson_mut_obj(doc);
+    yyjson_mut_doc_set_root(doc, root);
+    yyjson_mut_obj_add_str(doc, root, "status", "error");
+    yyjson_mut_obj_add_str(doc, root, "code", "CBM_INDEX_PHASE_TELEMETRY_INCOMPLETE");
+    yyjson_mut_obj_add_str(doc, root, "operation", "retain_pipeline_phase_metrics");
+    yyjson_mut_obj_add_str(
+        doc, root, "message",
+        "the index published its verified database but did not retain every native phase metric");
+    yyjson_mut_obj_add_str(
+        doc, root, "remediation",
+        "preserve the published database and inspect CBM_PIPELINE_IO_COUNTER_READ_FAILED or "
+        "CBM_PIPELINE_PHASE_METRIC_CAPACITY_EXCEEDED before retrying");
+    yyjson_mut_obj_add_str(doc, root, "project", project_name);
+    yyjson_mut_obj_add_uint(doc, root, "phase_metric_count", (uint64_t)metric_count);
+    yyjson_mut_obj_add_bool(doc, root, "phase_metrics_complete", false);
+    yyjson_mut_obj_add_bool(doc, root, "sqlite_publication_started", true);
+    yyjson_mut_obj_add_bool(doc, root, "source_family_preserved", true);
+    char *json = yyjson_mut_write(doc, 0, NULL);
+    yyjson_mut_doc_free(doc);
+    return json ? json : heap_strdup("{\"code\":\"CBM_INDEX_PHASE_TELEMETRY_INCOMPLETE\"}");
+}
+
+static bool add_pipeline_phase_metrics(yyjson_mut_doc *doc, yyjson_mut_val *root,
+                                       const cbm_pipeline_t *p, size_t *metric_count_out) {
+    const cbm_pipeline_phase_metric_t *metrics = NULL;
+    size_t metric_count = 0;
+    bool complete = false;
+    cbm_pipeline_get_phase_metrics(p, &metrics, &metric_count, &complete);
+    if (metric_count_out) {
+        *metric_count_out = metric_count;
+    }
+
+    yyjson_mut_val *items = yyjson_mut_arr(doc);
+    for (size_t i = 0; metrics && i < metric_count; i++) {
+        yyjson_mut_val *metric = yyjson_mut_obj(doc);
+        yyjson_mut_obj_add_strcpy(doc, metric, "phase", metrics[i].phase ? metrics[i].phase : "");
+        yyjson_mut_obj_add_uint(doc, metric, "elapsed_ms", metrics[i].elapsed_ms);
+        yyjson_mut_obj_add_uint(doc, metric, "read_bytes", metrics[i].read_bytes);
+        yyjson_mut_obj_add_uint(doc, metric, "write_bytes", metrics[i].write_bytes);
+        yyjson_mut_obj_add_uint(doc, metric, "other_bytes", metrics[i].other_bytes);
+        yyjson_mut_arr_add_val(items, metric);
+    }
+    yyjson_mut_obj_add_val(doc, root, "phase_metrics", items);
+    yyjson_mut_obj_add_uint(doc, root, "phase_metric_count", (uint64_t)metric_count);
+    yyjson_mut_obj_add_bool(doc, root, "phase_metrics_complete", complete);
+    return complete && metrics && metric_count > 0;
+}
+
 /* Build the success portion only after the persisted source of truth has been
  * verified and independently read back. Returns a structured error on failure. */
 static char *build_index_success_response(cbm_mcp_server_t *srv, yyjson_mut_doc *doc,
@@ -4753,6 +5026,11 @@ static char *build_index_success_response(cbm_mcp_server_t *srv, yyjson_mut_doc 
                       "persisted node/edge counts differ from the completed in-memory graph",
                       "remediation", "preserve the database family and inspect persistence");
         return build_index_state_mismatch_error(project_name, exp_nodes, exp_edges, nodes, edges);
+    }
+
+    size_t phase_metric_count = 0;
+    if (!add_pipeline_phase_metrics(doc, root, p, &phase_metric_count)) {
+        return build_index_telemetry_error(project_name, phase_metric_count);
     }
 
     yyjson_mut_obj_add_int(doc, root, "nodes", nodes);
@@ -5234,6 +5512,7 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
 
     char *repo_path = cbm_mcp_get_string_arg(args, "repo_path");
     char *mode_str = cbm_mcp_get_string_arg(args, "mode");
+    bool name_override_present = cbm_mcp_has_arg(args, "name");
     char *name_override = cbm_mcp_get_string_arg(args, "name");
     cbm_normalize_path_sep(repo_path);
 
@@ -5265,6 +5544,26 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
         free(error);
         return result;
     }
+
+    if (name_override_present) {
+        cbm_log_error("index.project_identity.refused", "code", "CBM_PROJECT_NAME_OVERRIDE_REFUSED",
+                      "repo_path", repo_path, "requested_name",
+                      name_override ? name_override : "<non-string>", "pipeline_started", "false",
+                      "sqlite_publication_started", "false", "message",
+                      "project storage identity is derived only from the canonical repository root",
+                      "remediation",
+                      "remove the name argument and use the project returned by index_repository");
+        free(mode_str);
+        free(name_override);
+        free(repo_path);
+        return cbm_mcp_text_result(
+            "CBM_PROJECT_NAME_OVERRIDE_REFUSED: project storage identity is derived only from "
+            "the canonical repository root; remove the name argument and use the project returned "
+            "by index_repository",
+            true);
+    }
+    free(name_override);
+    name_override = NULL;
 
     /* Optional workspace boundary: when CBM_ALLOWED_ROOT is set (agentic /
      * multi-tenant deployments where repo_path may be influenced by an
@@ -5300,29 +5599,55 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
 
     cbm_pipeline_t *p = cbm_pipeline_new(repo_path, NULL, mode);
     if (!p) {
-        free(name_override);
         free(repo_path);
         return cbm_mcp_text_result("failed to create pipeline", true);
     }
     if (cbm_pipeline_set_sink(p, srv->row_sink_active ? &srv->row_sink : NULL) != 0) {
         cbm_pipeline_free(p);
-        free(name_override);
         free(repo_path);
         return cbm_mcp_text_result(
             "CBM_ROW_SINK_INSTALL_FAILED: the complete row-sink descriptor was refused; inspect "
             "the structured native diagnostic and retry",
             true);
     }
-    if (name_override && name_override[0] && !cbm_pipeline_set_project_name(p, name_override)) {
-        cbm_pipeline_free(p);
-        free(name_override);
-        free(repo_path);
-        return cbm_mcp_text_result("invalid project name", true);
-    }
-    free(name_override);
     cbm_pipeline_set_persistence(p, persistence);
 
     char *project_name = heap_strdup(cbm_pipeline_project_name(p));
+    if (!project_name) {
+        cbm_pipeline_free(p);
+        free(repo_path);
+        return cbm_mcp_text_result(
+            "CBM_PROJECT_IDENTITY_ALLOC_FAILED: the canonical project identity could not be "
+            "retained; free memory and retry the unchanged request",
+            true);
+    }
+
+#ifdef _WIN32
+    cbm_index_admission_t admission = {0};
+    char *admission_error = acquire_index_admission(project_name, repo_path, &admission);
+    if (admission_error || !admission.project_mutex || !admission.host_mutex) {
+        cbm_pipeline_free(p);
+        free(project_name);
+        free(repo_path);
+        char *result = cbm_mcp_text_result(
+            admission_error
+                ? admission_error
+                : "CBM_INDEX_ADMISSION_RESPONSE_ALLOC_FAILED: indexing admission failed and its "
+                  "structured response could not be allocated; inspect the preceding native "
+                  "diagnostic and retry the unchanged request",
+            true);
+        free(admission_error);
+        return result;
+    }
+#else
+    cbm_pipeline_free(p);
+    free(project_name);
+    free(repo_path);
+    return cbm_mcp_text_result(
+        "CBM_INDEX_HOST_ADMISSION_UNSUPPORTED: this build cannot provide the required "
+        "cross-process project isolation and host-wide indexing admission",
+        true);
+#endif
 
     /* Bootstrap from artifact if no local DB exists */
     try_artifact_bootstrap(project_name, repo_path);
@@ -5432,6 +5757,23 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
             free(worker_store_error);
         }
     }
+
+#ifdef _WIN32
+    if (!release_index_admission(&admission, project_name, repo_path)) {
+        char *release_error = heap_strdup(
+            "{\"status\":\"error\",\"code\":\"CBM_INDEX_ADMISSION_RELEASE_FAILED\","
+            "\"operation\":\"release_index_admission\",\"message\":\"the completed indexing "
+            "generation could not release its exact project or host ownership\","
+            "\"remediation\":\"inspect the preceding structured Windows diagnostic and the "
+            "published project database before retrying\"}");
+        if (!postcondition_error && release_error) {
+            postcondition_error = release_error;
+        } else {
+            free(release_error);
+        }
+        rc = CBM_NOT_FOUND;
+    }
+#endif
 
     bool response_is_error = rc != 0 || postcondition_error != NULL;
     char *json = postcondition_error ? postcondition_error : yy_doc_to_str(doc);
@@ -5562,7 +5904,7 @@ static yyjson_doc *enrich_node_properties(yyjson_mut_doc *doc, yyjson_mut_val *o
  * junction-followed form (the "resolve first, then compare" order — comparing
  * before resolution is the classic bypass, cf. CVE-2022-41722) and comparing them
  * in the same canonical namespace closes both holes. Because both come from the
- * same resolver they share the extended-length "\\?\" prefix and OS-native
+ * same resolver they share the ordinary DOS/UNC namespace and OS-native
  * backslash separators; the compare is case-insensitive per NTFS with a strict
  * separator/NUL boundary so "C:\root2" never matches root "C:\root". Fail-closed:
  * any canonicalization failure (including a non-existent/unopenable path) → false,
@@ -5903,7 +6245,7 @@ static char *mcp_final_path_from_handle(HANDLE handle, DWORD *native_error) {
         free(wide);
         return NULL;
     }
-    char *path = cbm_wide_to_utf8(wide);
+    char *path = cbm_wide_final_path_to_utf8(wide);
     free(wide);
     if (!path) {
         *native_error = ERROR_NO_UNICODE_TRANSLATION;

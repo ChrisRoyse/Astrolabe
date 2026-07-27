@@ -39,6 +39,18 @@ typedef struct {
     size_t requested;
 } cbm_pipeline_error_t;
 
+/* One retained native worker phase measurement. The phase string and array are
+ * pipeline-owned and remain valid until cbm_pipeline_free(). I/O counters are
+ * exact GetProcessIoCounters transfer-byte deltas for the worker process over
+ * this phase; elapsed_ms is measured from the monotonic clock. */
+typedef struct {
+    const char *phase;
+    uint64_t elapsed_ms;
+    uint64_t read_bytes;
+    uint64_t write_bytes;
+    uint64_t other_bytes;
+} cbm_pipeline_phase_metric_t;
+
 /* Distinct terminal result for a repository with no non-auxiliary source
  * files. Callers must surface this as a structured refusal; it is never a
  * successful structural-only index. */
@@ -89,8 +101,10 @@ void cbm_pipeline_cancel(cbm_pipeline_t *p);
  * owned by the pipeline. Valid until cbm_pipeline_free(). */
 const char *cbm_pipeline_project_name(const cbm_pipeline_t *p);
 
-/* Override the derived project name with a sanitized user-provided label. */
-bool cbm_pipeline_set_project_name(cbm_pipeline_t *p, const char *name);
+/* Bind semantic row identity to an existing canonical repository root. This is
+ * used when a controlled scratch checkout must emit rows for its durable source
+ * repository (for example Git archaeology). Arbitrary labels are not accepted. */
+bool cbm_pipeline_set_project_identity_root(cbm_pipeline_t *p, const char *identity_root);
 
 /* Get the index mode (CBM_MODE_FULL, CBM_MODE_MODERATE, CBM_MODE_FAST). */
 int cbm_pipeline_get_mode(const cbm_pipeline_t *p);
@@ -104,6 +118,14 @@ void cbm_pipeline_get_excluded(const cbm_pipeline_t *p, char ***out, int *count)
 /* Committed node/edge counts captured at dump time (-1 when dump did not run).
  * Nodes are the #334 plausibility-gate axis; edges are informational only. */
 void cbm_pipeline_get_committed_counts(const cbm_pipeline_t *p, int *nodes, int *edges);
+
+/* Return every completed phase metric in execution order plus an explicit
+ * completeness bit. A successful index response must refuse its success
+ * postcondition when complete=false; clean-worker logs are intentionally
+ * ephemeral, so this array is the retained diagnostic source of truth. */
+void cbm_pipeline_get_phase_metrics(const cbm_pipeline_t *p,
+                                    const cbm_pipeline_phase_metric_t **out, size_t *count,
+                                    bool *complete);
 
 /* Reference edges skipped because their source syntax resolved to several
  * stable atoms in one semantic domain (#727). The corpus still publishes, so

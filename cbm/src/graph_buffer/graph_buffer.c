@@ -1462,10 +1462,15 @@ const cbm_gbuf_node_t *cbm_gbuf_find_by_qn_location(const cbm_gbuf_t *gb, const 
         return NULL;
     }
 
+    node_ptr_array_t *candidates = cbm_ht_get(gb->nodes_by_file, file_path);
+    if (!candidates) {
+        return NULL;
+    }
+
     const cbm_gbuf_node_t *match = NULL;
     int match_count = 0;
-    for (int i = 0; i < gb->nodes.count; i++) {
-        const cbm_gbuf_node_t *node = gb->nodes.items[i];
+    for (int i = 0; i < candidates->count; i++) {
+        const cbm_gbuf_node_t *node = candidates->items[i];
         if (!node_is_live(gb, node) || !node->qualified_name || !node->file_path ||
             strcmp(node->qualified_name, qn) != 0 || strcmp(node->file_path, file_path) != 0 ||
             node->start_line <= 0 || node->end_line < node->start_line || line < node->start_line ||

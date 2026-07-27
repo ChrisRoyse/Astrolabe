@@ -103,13 +103,16 @@ char *cbm_canonicalize_existing_path(const char *path);
  * Windows: opens the path with FILE_FLAG_BACKUP_SEMANTICS (so a *directory* handle
  * opens, not only a file) and dwDesiredAccess=0 (metadata query only — no read/
  * write intent, so restrictive ACLs and sharing do not block the probe), then
- * GetFinalPathNameByHandleW with FILE_NAME_NORMALIZED | VOLUME_NAME_DOS. The
- * returned path is long-path-safe and carries the extended-length "\\?\" (or
- * "\\?\UNC\") prefix; the prefix is retained, NOT stripped, so two results of this
- * function prefix-compare like-for-like. POSIX: realpath(path, NULL) (resolves
- * symlinks + '.'/'..', mallocs the result). The path MUST exist and be openable;
- * a non-existent or unopenable path yields NULL — for a read sink that is the
- * correct fail-closed answer, since such a file could not be read regardless. */
+ * GetFinalPathNameByHandleW with FILE_NAME_NORMALIZED | VOLUME_NAME_DOS. Its
+ * extended-length "\\?\" / "\\?\UNC\" presentation prefix is converted to the
+ * ordinary DOS/UNC spelling before return so persisted roots and downstream path
+ * normalization never receive the non-filesystem "//?/" form. Long-path support
+ * is retained because every Win32 filesystem boundary adds the prefix back through
+ * cbm_utf8_to_wide_path. Two results still prefix-compare like-for-like. POSIX:
+ * realpath(path, NULL) (resolves symlinks + '.'/'..', mallocs the result). The
+ * path MUST exist and be openable; a non-existent or unopenable path yields NULL
+ * — for a read sink that is the correct fail-closed answer, since such a file
+ * could not be read regardless. */
 char *cbm_real_path_final(const char *path);
 
 /* Delete an empty directory. Returns 0 on success. */

@@ -575,30 +575,8 @@ char *cbm_canonicalize_existing_path(const char *path) {
         free(full);
         return NULL;
     }
-    char *u8full = cbm_wide_to_utf8(full);
+    char *result = cbm_wide_final_path_to_utf8(full);
     free(full);
-    if (!u8full) {
-        return NULL;
-    }
-    /* Strip a leading extended-length prefix so the canonical path is a clean
-     * drive/UNC form (the "\\?\" and "\\?\UNC\" bytes are ASCII, so slicing the
-     * UTF-8 byte string never splits a multibyte sequence). */
-    char *result;
-    if (strncmp(u8full, "\\\\?\\UNC\\", 8) == 0) {
-        /* "\\?\UNC\server\share\..." -> "\\server\share\..." */
-        size_t rest = strlen(u8full + 8);
-        result = (char *)malloc(rest + 3);
-        if (result) {
-            result[0] = '\\';
-            result[1] = '\\';
-            memcpy(result + 2, u8full + 8, rest + 1);
-        }
-    } else if (strncmp(u8full, "\\\\?\\", 4) == 0) {
-        result = _strdup(u8full + 4);
-    } else {
-        result = _strdup(u8full);
-    }
-    free(u8full);
     if (!result) {
         return NULL;
     }
@@ -656,7 +634,7 @@ char *cbm_real_path_final(const char *path) {
         free(buf);
         return NULL;
     }
-    char *u8 = cbm_wide_to_utf8(buf);
+    char *u8 = cbm_wide_final_path_to_utf8(buf);
     free(buf);
     return u8;
 }

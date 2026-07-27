@@ -8,6 +8,7 @@
 #endif
 #include <windows.h>
 #include <stdlib.h>
+#include <string.h>
 #include <wchar.h>
 
 static inline wchar_t *cbm_utf8_to_wide(const char *utf8) {
@@ -112,6 +113,32 @@ static inline char *cbm_wide_to_utf8(const wchar_t *wide) {
         free(u8);
         SetLastError(error != ERROR_SUCCESS ? error : ERROR_NO_UNICODE_TRANSLATION);
         return NULL;
+    }
+    return u8;
+}
+
+/* Convert GetFinalPathNameByHandleW(VOLUME_NAME_DOS) output to the ordinary
+ * DOS/UNC spelling used by persisted repository roots and the rest of the C
+ * pipeline. The Win32 API normally emits "\\?\C:\..." or
+ * "\\?\UNC\server\share\..."; keeping that prefix and then normalizing path
+ * separators produces the non-filesystem spelling "//?/C:/...".
+ *
+ * Removing the presentation prefix does not weaken long-path support:
+ * cbm_utf8_to_wide_path adds it back at every Win32 filesystem boundary. Do the
+ * conversion in place so all handle-final-path callers share one exact rule and
+ * no second allocation can fail after the UTF-8 conversion succeeds. */
+static inline char *cbm_wide_final_path_to_utf8(const wchar_t *wide) {
+    char *u8 = cbm_wide_to_utf8(wide);
+    if (!u8) {
+        return NULL;
+    }
+    if (strncmp(u8, "\\\\?\\UNC\\", 8) == 0) {
+        size_t rest = strlen(u8 + 8);
+        memmove(u8 + 2, u8 + 8, rest + 1);
+        u8[0] = '\\';
+        u8[1] = '\\';
+    } else if (strncmp(u8, "\\\\?\\", 4) == 0) {
+        memmove(u8, u8 + 4, strlen(u8 + 4) + 1);
     }
     return u8;
 }

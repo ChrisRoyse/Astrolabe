@@ -18,6 +18,8 @@
 #include "lsp/go_lsp.h" /* CBMLSPDef for cbm_parallel_resolve cross-LSP inputs */
 #include <stdatomic.h>
 #include <string.h>
+#include <time.h>
+#include <windows.h>
 
 /* ── Shared pipeline constants ─────────────────────────────────── */
 
@@ -83,6 +85,19 @@ typedef struct {
 void cbm_pipeline_record_fatal_error(cbm_pipeline_t *p, const char *code, const char *operation,
                                      const char *phase, const char *path, size_t requested,
                                      const char *message, const char *remediation);
+
+/* Allocation-free native worker phase probe shared by the full and incremental
+ * pipelines. Completion appends one retained metric to the owning pipeline and
+ * marks the run incomplete on any process-accounting or representation failure. */
+typedef struct {
+    struct timespec started;
+    IO_COUNTERS io;
+    bool io_valid;
+} cbm_pipeline_phase_probe_t;
+
+cbm_pipeline_phase_probe_t cbm_pipeline_phase_probe_start(cbm_pipeline_t *p, const char *phase);
+void cbm_pipeline_phase_probe_end(cbm_pipeline_t *p, const char *phase,
+                                  const cbm_pipeline_phase_probe_t *probe);
 
 void cbm_pkg_entries_init(cbm_pkg_entries_t *e);
 void cbm_pkg_entries_free(cbm_pkg_entries_t *e);

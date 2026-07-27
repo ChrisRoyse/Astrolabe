@@ -1386,22 +1386,20 @@ pub(crate) fn import_shadow_vault_with_archaeology_at(
         }
         Err(err) => return Err(err.into()),
     };
-    // #401 shadow-import phase telemetry: opt-in, labeled, permanent (mirrors the
-    // libcbm CBM_PROFILE pattern). Silent unless the operator sets ASTRO_SHADOW_TIMING,
-    // so a normal index prints nothing; when set, each corpus-wide phase's wall-clock
-    // is emitted to stderr so cold-index throughput can be attributed to a real phase
-    // instead of guessed. Low volume (one line per phase per index), never per-row spew.
-    let shadow_timing = std::env::var_os("ASTRO_SHADOW_TIMING").is_some();
+    // Always-retained, low-volume phase telemetry. Indexing failures must be
+    // attributable from the normal worker/host log without reproducing them under
+    // a profiling-only environment. One line is emitted per corpus-wide phase,
+    // never per row.
+    let shadow_started = std::time::Instant::now();
     let mut _shadow_mark = std::time::Instant::now();
     macro_rules! shadow_phase {
         ($name:expr) => {{
-            if shadow_timing {
-                eprintln!(
-                    "astro.shadow.timing phase={} ms={}",
-                    $name,
-                    _shadow_mark.elapsed().as_millis()
-                );
-            }
+            eprintln!(
+                "astro.shadow.phase phase={} elapsed_ms={} total_ms={}",
+                $name,
+                _shadow_mark.elapsed().as_millis(),
+                shadow_started.elapsed().as_millis()
+            );
             _shadow_mark = std::time::Instant::now();
         }};
     }
@@ -1409,10 +1407,11 @@ pub(crate) fn import_shadow_vault_with_archaeology_at(
     let shadow_import =
         import_shadow_vault_report(&sqlite_path, &vault, &ShadowSlotRuntime, &options, row_sink)?;
     let report = shadow_import.report;
-    if shadow_timing {
-        for (label, ms) in &report.timing_ms.0 {
-            eprintln!("astro.shadow.timing phase=import_raw.{label} ms={ms}");
-        }
+    for (label, ms) in &report.timing_ms.0 {
+        eprintln!(
+            "astro.shadow.phase phase=import_raw.{label} elapsed_ms={ms} total_ms={}",
+            shadow_started.elapsed().as_millis()
+        );
     }
     shadow_phase!("import_raw_total");
     let import_changed = report.new_cx_ids > 0
@@ -2331,7 +2330,13 @@ pub(crate) fn run_shadow_index_pass(
     skills: &SkillDiscoveryConfig,
     cache_dir: &Path,
 ) -> Result<ShadowIndexPassOutcome, DynError> {
+    let pass_started = std::time::Instant::now();
     let raw_result = runner.handle_index_repository_supervised(sanitized_args)?;
+    eprintln!(
+        "astro.shadow.index_phase phase=supervised_native_index elapsed_ms={} total_ms={}",
+        pass_started.elapsed().as_millis(),
+        pass_started.elapsed().as_millis()
+    );
     if tool_result_is_error(&raw_result)? {
         return Ok(ShadowIndexPassOutcome::Failed {
             error_result: raw_result,
@@ -2349,8 +2354,20 @@ pub(crate) fn run_shadow_index_pass(
         )
         .into());
     }
+    let rows_started = std::time::Instant::now();
     let rows = read_shadow_pipeline_rows(&sqlite_path, &project)?;
+    eprintln!(
+        "astro.shadow.index_phase phase=sqlite_row_readback elapsed_ms={} total_ms={}",
+        rows_started.elapsed().as_millis(),
+        pass_started.elapsed().as_millis()
+    );
+    let candidate_started = std::time::Instant::now();
     let candidate = row_sink_import_candidate_from_rows_with_skills(rows, skills);
+    eprintln!(
+        "astro.shadow.index_phase phase=row_candidate_build elapsed_ms={} total_ms={}",
+        candidate_started.elapsed().as_millis(),
+        pass_started.elapsed().as_millis()
+    );
     Ok(ShadowIndexPassOutcome::Completed {
         raw_result,
         project,

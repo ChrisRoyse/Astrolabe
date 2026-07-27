@@ -378,12 +378,13 @@ int cbm_index_spawn_worker(const char *args_json, cbm_index_worker_result_t *res
     cbm_log_info("index.supervisor.reap", "outcome", cbm_proc_outcome_str(r.outcome), "exit_code",
                  exit_buf, "signal", sig);
 
-    /* Observability: on a CLEAN run the worker log is noise → delete it. On
-     * ANY failure keep it and surface its path + raw exit code, so the worker's own
-     * stdout/stderr (pipeline logs, any assert/abort text, the exact exit code) is
-     * available post-mortem instead of vanishing. Previously the log was ALWAYS
-     * deleted and only outcome+signal were logged, so a worker that exited non-zero
-     * left nothing to diagnose — the CI blind spot that hid this bug (a mangled JSON
+    /* Observability: a CLEAN response retains its complete phase metrics, so
+     * the redundant worker log can be deleted without losing the performance
+     * trail. On ANY failure keep it and surface its path + raw exit code, so the
+     * worker's own stdout/stderr (pipeline logs, any assert/abort text, the exact
+     * exit code) is available post-mortem instead of vanishing. Previously the
+     * log was ALWAYS deleted and only outcome+signal were logged, so a worker
+     * that exited non-zero left nothing to diagnose (a mangled JSON
      * arg → "repo_path is required" exit) behind a generic "crashed on a file".
      *
      * Exception: under CBM_PROFILE the log IS the deliverable — the worker's

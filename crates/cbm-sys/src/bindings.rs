@@ -2172,6 +2172,24 @@ impl Default for cbm_pipeline_error_t {
         }
     }
 }
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct cbm_pipeline_phase_metric_t {
+    pub phase: *const ::std::os::raw::c_char,
+    pub elapsed_ms: u64,
+    pub read_bytes: u64,
+    pub write_bytes: u64,
+    pub other_bytes: u64,
+}
+impl Default for cbm_pipeline_phase_metric_t {
+    fn default() -> Self {
+        let mut s = ::std::mem::MaybeUninit::<Self>::uninit();
+        unsafe {
+            ::std::ptr::write_bytes(s.as_mut_ptr(), 0, 1);
+            s.assume_init()
+        }
+    }
+}
 pub const CBM_PIPELINE_EMPTY_SOURCE_CORPUS: _bindgen_ty_2 = -2001;
 pub type _bindgen_ty_2 = ::std::os::raw::c_int;
 unsafe extern "C" {
@@ -2203,9 +2221,9 @@ unsafe extern "C" {
     pub fn cbm_pipeline_project_name(p: *const cbm_pipeline_t) -> *const ::std::os::raw::c_char;
 }
 unsafe extern "C" {
-    pub fn cbm_pipeline_set_project_name(
+    pub fn cbm_pipeline_set_project_identity_root(
         p: *mut cbm_pipeline_t,
-        name: *const ::std::os::raw::c_char,
+        identity_root: *const ::std::os::raw::c_char,
     ) -> bool;
 }
 unsafe extern "C" {
@@ -2223,6 +2241,14 @@ unsafe extern "C" {
         p: *const cbm_pipeline_t,
         nodes: *mut ::std::os::raw::c_int,
         edges: *mut ::std::os::raw::c_int,
+    );
+}
+unsafe extern "C" {
+    pub fn cbm_pipeline_get_phase_metrics(
+        p: *const cbm_pipeline_t,
+        out: *mut *const cbm_pipeline_phase_metric_t,
+        count: *mut usize,
+        complete: *mut bool,
     );
 }
 unsafe extern "C" {

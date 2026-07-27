@@ -1496,22 +1496,40 @@ impl CbmPipeline {
         map_cbm_status(rc)
     }
 
-    pub fn set_project_name(&mut self, name: &str) -> Result<(), BridgeError> {
+    pub fn bind_project_identity_root(
+        &mut self,
+        identity_root: &str,
+        expected_project: &str,
+    ) -> Result<(), BridgeError> {
         self.ensure_owner_thread()?;
-        let name = CString::new(name)?;
-        // SAFETY: self owns the pipeline pointer. CBM copies and normalizes the
-        // provided project name during the call.
-        let accepted =
-            unsafe { cbm_sys::cbm_pipeline_set_project_name(self.ptr.as_ptr(), name.as_ptr()) };
-        if accepted {
-            Ok(())
-        } else {
-            Err(envelope(
-                "ASTRO_CBM_PIPELINE_PROJECT_NAME",
-                "CBM rejected the requested pipeline project name",
-                "Use a non-empty project name valid for CBM cache path construction.",
-            ))
+        let identity_root = CString::new(identity_root)?;
+        // SAFETY: self owns the pipeline pointer. CBM resolves the supplied
+        // existing repository root and derives the project identity from it.
+        let accepted = unsafe {
+            cbm_sys::cbm_pipeline_set_project_identity_root(
+                self.ptr.as_ptr(),
+                identity_root.as_ptr(),
+            )
+        };
+        if !accepted {
+            return Err(envelope(
+                "ASTRO_CBM_PIPELINE_PROJECT_IDENTITY_ROOT",
+                "CBM could not derive project identity from the supplied repository root",
+                "Pass the existing durable repository root that owns this controlled checkout.",
+            ));
         }
+        let observed = self.project_name()?;
+        if observed != expected_project {
+            return Err(envelope(
+                "ASTRO_CBM_PIPELINE_PROJECT_IDENTITY_MISMATCH",
+                format!(
+                    "root-derived project identity {observed:?} does not match expected \
+                     identity {expected_project:?}"
+                ),
+                "Bind the scratch extraction to the exact durable corpus root used by the live index.",
+            ));
+        }
+        Ok(())
     }
 
     pub fn project_name(&self) -> Result<String, BridgeError> {
