@@ -709,19 +709,6 @@ const cbm_gbuf_node_t *cbm_pipeline_find_reference_source(
     }
 
     bool top_level = !has_enclosing || strcmp(enclosing_qn, module_qn) == 0;
-    bool source_resolution_failed = false;
-    const cbm_gbuf_node_t *source =
-        source_line > 0 ? cbm_gbuf_find_reference_owner_at(gbuf, enclosing_qn, rel_path,
-                                                           source_line, operation,
-                                                           &source_resolution_failed)
-                        : NULL;
-    if (source_resolution_failed) {
-        return NULL;
-    }
-    if (source) {
-        return source;
-    }
-
     if (top_level) {
         const cbm_gbuf_node_t *file = cbm_gbuf_find_source_container(gbuf, "File", rel_path);
         if (!file) {
@@ -737,14 +724,26 @@ const cbm_gbuf_node_t *cbm_pipeline_find_reference_source(
         return file;
     }
 
+    bool source_resolution_failed = false;
+    const cbm_gbuf_node_t *source =
+        source_line > 0
+            ? cbm_gbuf_find_reference_owner_at(gbuf, enclosing_qn, rel_path, source_line, operation,
+                                               &source_resolution_failed)
+            : NULL;
+    if (source_resolution_failed) {
+        return NULL;
+    }
+    if (source) {
+        return source;
+    }
+
     if (source_line <= 0) {
         char line_buf[CBM_SZ_32];
         snprintf(line_buf, sizeof(line_buf), "%d", source_line);
         cbm_log_error("pipeline.reference_source_location_missing", "code",
-                      "CBM_REFERENCE_SOURCE_LOCATION_MISSING", "operation", operation,
-                      "project", project_name, "file_path", rel_path,
-                      "enclosing_qualified_name", enclosing_qn, "source_line", line_buf,
-                      "message",
+                      "CBM_REFERENCE_SOURCE_LOCATION_MISSING", "operation", operation, "project",
+                      project_name, "file_path", rel_path, "enclosing_qualified_name", enclosing_qn,
+                      "source_line", line_buf, "message",
                       "an enclosing callable reference has no positive 1-based source line",
                       "remediation",
                       "preserve the parser source position through extraction and retry the "
