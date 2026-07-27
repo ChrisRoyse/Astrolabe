@@ -6635,8 +6635,20 @@ static char *build_snippet_response(cbm_mcp_server_t *srv, cbm_store_t *store, c
     char **nb_callees = NULL;
     int nb_callee_count = 0;
     if (include_neighbors) {
-        cbm_store_node_neighbor_names(store, node->id, MCP_DEFAULT_LIMIT, &nb_callers,
-                                      &nb_caller_count, &nb_callees, &nb_callee_count);
+        int neighbor_status =
+            cbm_store_node_neighbor_names(store, node->id, MCP_DEFAULT_LIMIT, &nb_callers,
+                                          &nb_caller_count, &nb_callees, &nb_callee_count);
+        if (neighbor_status != CBM_STORE_OK) {
+            record_store_query_failure(srv, node->project, cbm_store_db_path(store), store,
+                                       CBM_STORE_VERIFY_IO_FAILED, "source.query_snippet_neighbors",
+                                       cbm_store_error(store));
+            char *result = build_recorded_store_error(srv);
+            yyjson_mut_doc_free(doc);
+            yyjson_doc_free(props_doc);
+            free(root_path);
+            verified_source_free(&verified);
+            return result;
+        }
         add_string_array(doc, root_obj, "caller_names", nb_callers, nb_caller_count);
         add_string_array(doc, root_obj, "callee_names", nb_callees, nb_callee_count);
     }
