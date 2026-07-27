@@ -673,14 +673,6 @@ uint_least64_t cbm_pipeline_get_unresolved_reference_source_skips(const cbm_pipe
     return p ? p->unresolved_reference_source_skips : 0;
 }
 
-static bool reference_source_is_callable_scope(const cbm_gbuf_node_t *node) {
-    if (!node || !node->label) {
-        return false;
-    }
-    return strcmp(node->label, "Function") == 0 || strcmp(node->label, "Method") == 0 ||
-           strcmp(node->label, "Macro") == 0 || cbm_label_is_type_like(node->label);
-}
-
 const cbm_gbuf_node_t *cbm_pipeline_find_reference_source(
     const cbm_gbuf_t *gbuf, const char *project_name, const char *rel_path, const char *module_qn,
     const char *enclosing_qn, int source_line, const char *operation) {
@@ -717,6 +709,19 @@ const cbm_gbuf_node_t *cbm_pipeline_find_reference_source(
     }
 
     bool top_level = !has_enclosing || strcmp(enclosing_qn, module_qn) == 0;
+    bool source_resolution_failed = false;
+    const cbm_gbuf_node_t *source =
+        source_line > 0 ? cbm_gbuf_find_reference_owner_at(gbuf, enclosing_qn, rel_path,
+                                                           source_line, operation,
+                                                           &source_resolution_failed)
+                        : NULL;
+    if (source_resolution_failed) {
+        return NULL;
+    }
+    if (source) {
+        return source;
+    }
+
     if (top_level) {
         const cbm_gbuf_node_t *file = cbm_gbuf_find_source_container(gbuf, "File", rel_path);
         if (!file) {
@@ -732,23 +737,24 @@ const cbm_gbuf_node_t *cbm_pipeline_find_reference_source(
         return file;
     }
 
-    bool source_ambiguous = false;
-    const cbm_gbuf_node_t *source =
-        source_line > 0
-            ? cbm_gbuf_find_by_qn_location(gbuf, enclosing_qn, rel_path, source_line)
-            : cbm_gbuf_find_by_qn_domain_status(gbuf, enclosing_qn, CBM_REF_DOMAIN_CALLABLE,
-                                                operation, &source_ambiguous);
-    if (source_ambiguous) {
+    if (source_line <= 0) {
+        char line_buf[CBM_SZ_32];
+        snprintf(line_buf, sizeof(line_buf), "%d", source_line);
+        cbm_log_error("pipeline.reference_source_location_missing", "code",
+                      "CBM_REFERENCE_SOURCE_LOCATION_MISSING", "operation", operation,
+                      "project", project_name, "file_path", rel_path,
+                      "enclosing_qualified_name", enclosing_qn, "source_line", line_buf,
+                      "message",
+                      "an enclosing callable reference has no positive 1-based source line",
+                      "remediation",
+                      "preserve the parser source position through extraction and retry the "
+                      "complete corpus");
+        cbm_gbuf_refuse_resolution((cbm_gbuf_t *)gbuf);
         return NULL;
     }
-    if (source && !reference_source_is_callable_scope(source)) {
-        source = NULL;
-    }
-    if (!source) {
-        cbm_gbuf_record_unresolved_reference_source(gbuf, operation, enclosing_qn, rel_path,
-                                                    source_line);
-    }
-    return source;
+    cbm_gbuf_record_unresolved_reference_source(gbuf, operation, enclosing_qn, rel_path,
+                                                source_line);
+    return NULL;
 }
 
 bool cbm_pipeline_row_sink_active(const cbm_pipeline_t *p) {

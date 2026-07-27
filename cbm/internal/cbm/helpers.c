@@ -952,6 +952,16 @@ const char *cbm_enclosing_func_qn(CBMArena *a, TSNode node, CBMLanguage lang, co
             if (!cname || !cname[0]) {
                 continue;
             }
+            /* Rust definition extraction binds associated methods to the
+             * nominal implementing type (`HashingWriter`), not the impl's
+             * generic spelling (`HashingWriter<W>`). Preserve that same stable
+             * owner identity in every semantic extractor. */
+            if (lang == CBM_LANG_RUST) {
+                char *generic = strchr(cname, '<');
+                if (generic) {
+                    *generic = '\0';
+                }
+            }
             class_chain = class_chain ? cbm_arena_sprintf(a, "%s.%s", cname, class_chain) : cname;
         }
         if (class_chain) {

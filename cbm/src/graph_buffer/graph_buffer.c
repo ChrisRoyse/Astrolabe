@@ -1492,6 +1492,196 @@ const cbm_gbuf_node_t *cbm_gbuf_find_by_qn_location(const cbm_gbuf_t *gb, const 
     return match;
 }
 
+static bool reference_owner_candidate(const cbm_gbuf_t *gb, const cbm_gbuf_node_t *node,
+                                      const char *file_path) {
+    return node_is_live(gb, node) && node->source_present && node->file_path &&
+           strcmp(node->file_path, file_path) == 0 &&
+           label_in_reference_domain(node->label, CBM_REF_DOMAIN_CALLABLE);
+}
+
+static bool reference_owner_span_valid(const cbm_gbuf_node_t *node) {
+    return node->atom_id && node->atom_id[0] && node->qualified_name &&
+           node->qualified_name[0] && node->source_sha256 && node->source_sha256[0] &&
+           node->start_line > 0 && node->end_line >= node->start_line &&
+           node->end_byte > node->start_byte &&
+           node->end_byte - node->start_byte == (uint64_t)node->source_len &&
+           node->source_bytes;
+}
+
+static void log_reference_owner_candidate(const char *event, const char *code,
+                                          const char *operation, const char *claimed_qn,
+                                          const char *file_path, int line, int ordinal,
+                                          const cbm_gbuf_node_t *candidate) {
+    char line_buf[CBM_SZ_32];
+    char ordinal_buf[CBM_SZ_32];
+    char start_line_buf[CBM_SZ_32];
+    char end_line_buf[CBM_SZ_32];
+    char start_byte_buf[CBM_SZ_32];
+    char end_byte_buf[CBM_SZ_32];
+    snprintf(line_buf, sizeof(line_buf), "%d", line);
+    snprintf(ordinal_buf, sizeof(ordinal_buf), "%d", ordinal);
+    snprintf(start_line_buf, sizeof(start_line_buf), "%d", candidate->start_line);
+    snprintf(end_line_buf, sizeof(end_line_buf), "%d", candidate->end_line);
+    snprintf(start_byte_buf, sizeof(start_byte_buf), "%llu",
+             (unsigned long long)candidate->start_byte);
+    snprintf(end_byte_buf, sizeof(end_byte_buf), "%llu",
+             (unsigned long long)candidate->end_byte);
+    cbm_log_error(event, "code", code, "operation", operation, "claimed_qualified_name",
+                  claimed_qn ? claimed_qn : "", "file_path", file_path, "line", line_buf,
+                  "candidate_ordinal", ordinal_buf, "atom_id",
+                  candidate->atom_id ? candidate->atom_id : "", "qualified_name",
+                  candidate->qualified_name ? candidate->qualified_name : "", "label",
+                  candidate->label ? candidate->label : "", "start_line", start_line_buf,
+                  "end_line", end_line_buf, "start_byte", start_byte_buf, "end_byte",
+                  end_byte_buf, "source_sha256",
+                  candidate->source_sha256 ? candidate->source_sha256 : "");
+}
+
+const cbm_gbuf_node_t *cbm_gbuf_find_reference_owner_at(
+    const cbm_gbuf_t *gb, const char *claimed_qn, const char *file_path, int line,
+    const char *operation, bool *failed) {
+    if (failed) {
+        *failed = false;
+    }
+    if (!gb || !file_path || !file_path[0] || line <= 0 || !operation || !operation[0]) {
+        if (gb) {
+            char line_buf[CBM_SZ_32];
+            snprintf(line_buf, sizeof(line_buf), "%d", line);
+            atomic_store(&((cbm_gbuf_t *)gb)->resolution_failed, true);
+            cbm_log_error("gbuf.reference_source_location_invalid", "code",
+                          "CBM_REFERENCE_SOURCE_LOCATION_INVALID", "operation",
+                          operation ? operation : "", "claimed_qualified_name",
+                          claimed_qn ? claimed_qn : "", "file_path",
+                          file_path ? file_path : "", "line", line_buf, "message",
+                          "reference source ownership requires an exact path and positive "
+                          "1-based source line",
+                          "remediation",
+                          "preserve the parser source location through extraction and retry the "
+                          "complete corpus");
+        }
+        if (failed) {
+            *failed = true;
+        }
+        return NULL;
+    }
+
+    node_ptr_array_t *file_nodes = cbm_ht_get(gb->nodes_by_file, file_path);
+    if (!file_nodes) {
+        return NULL;
+    }
+
+    const cbm_gbuf_node_t *smallest = NULL;
+    uint64_t smallest_width = UINT64_MAX;
+    int smallest_count = 0;
+    int containing_count = 0;
+    for (int i = 0; i < file_nodes->count; i++) {
+        const cbm_gbuf_node_t *candidate = file_nodes->items[i];
+        if (!reference_owner_candidate(gb, candidate, file_path)) {
+            continue;
+        }
+        if (!reference_owner_span_valid(candidate)) {
+            atomic_store(&((cbm_gbuf_t *)gb)->resolution_failed, true);
+            cbm_log_error("gbuf.reference_source_span_invalid", "code",
+                          "CBM_REFERENCE_SOURCE_SPAN_INVALID", "operation", operation,
+                          "claimed_qualified_name", claimed_qn ? claimed_qn : "", "file_path",
+                          file_path, "message",
+                          "a source-backed callable candidate has an incomplete or malformed "
+                          "identity span",
+                          "remediation",
+                          "repair definition span persistence and re-index the complete corpus");
+            log_reference_owner_candidate("gbuf.reference_source_invalid_candidate",
+                                          "CBM_REFERENCE_SOURCE_INVALID_CANDIDATE", operation,
+                                          claimed_qn, file_path, line, 1, candidate);
+            if (failed) {
+                *failed = true;
+            }
+            return NULL;
+        }
+        if (line < candidate->start_line || line > candidate->end_line) {
+            continue;
+        }
+        containing_count++;
+        uint64_t width = candidate->end_byte - candidate->start_byte;
+        if (width < smallest_width) {
+            smallest = candidate;
+            smallest_width = width;
+            smallest_count = 1;
+        } else if (width == smallest_width) {
+            smallest_count++;
+        }
+    }
+    if (containing_count == 0) {
+        return NULL;
+    }
+
+    if (smallest_count == 1) {
+        bool contained_by_all = true;
+        for (int i = 0; i < file_nodes->count; i++) {
+            const cbm_gbuf_node_t *candidate = file_nodes->items[i];
+            if (!reference_owner_candidate(gb, candidate, file_path) ||
+                line < candidate->start_line || line > candidate->end_line) {
+                continue;
+            }
+            if (smallest->start_byte < candidate->start_byte ||
+                smallest->end_byte > candidate->end_byte) {
+                contained_by_all = false;
+                break;
+            }
+        }
+        if (contained_by_all) {
+            return smallest;
+        }
+    }
+
+    const cbm_gbuf_node_t *exact_qn = NULL;
+    int exact_qn_count = 0;
+    if (claimed_qn && claimed_qn[0]) {
+        for (int i = 0; i < file_nodes->count; i++) {
+            const cbm_gbuf_node_t *candidate = file_nodes->items[i];
+            if (!reference_owner_candidate(gb, candidate, file_path) ||
+                line < candidate->start_line || line > candidate->end_line ||
+                strcmp(candidate->qualified_name, claimed_qn) != 0) {
+                continue;
+            }
+            exact_qn = candidate;
+            exact_qn_count++;
+        }
+    }
+    if (exact_qn_count == 1) {
+        return exact_qn;
+    }
+
+    char line_buf[CBM_SZ_32];
+    char count_buf[CBM_SZ_32];
+    snprintf(line_buf, sizeof(line_buf), "%d", line);
+    snprintf(count_buf, sizeof(count_buf), "%d", containing_count);
+    atomic_store(&((cbm_gbuf_t *)gb)->resolution_failed, true);
+    cbm_log_error("gbuf.reference_source_location_ambiguous", "code",
+                  "CBM_REFERENCE_SOURCE_LOCATION_AMBIGUOUS", "operation", operation,
+                  "claimed_qualified_name", claimed_qn ? claimed_qn : "", "file_path",
+                  file_path, "line", line_buf, "candidate_count", count_buf, "message",
+                  "the source line intersects incomparable stable callable atoms and no unique "
+                  "exact qualified-name candidate exists",
+                  "remediation",
+                  "preserve an exact source byte position or stable atom identity through "
+                  "extraction before retrying persistence");
+    int ordinal = 0;
+    for (int i = 0; i < file_nodes->count; i++) {
+        const cbm_gbuf_node_t *candidate = file_nodes->items[i];
+        if (!reference_owner_candidate(gb, candidate, file_path) ||
+            line < candidate->start_line || line > candidate->end_line) {
+            continue;
+        }
+        log_reference_owner_candidate("gbuf.reference_source_location_candidate",
+                                      "CBM_REFERENCE_SOURCE_LOCATION_CANDIDATE", operation,
+                                      claimed_qn, file_path, line, ++ordinal, candidate);
+    }
+    if (failed) {
+        *failed = true;
+    }
+    return NULL;
+}
+
 const cbm_gbuf_node_t *cbm_gbuf_find_by_id(const cbm_gbuf_t *gb, int64_t id) {
     if (!gb || !gb->by_id || id < 0 || id >= gb->by_id_cap) {
         return NULL;

@@ -148,6 +148,19 @@ const cbm_gbuf_node_t *cbm_gbuf_find_by_qn_domain_status(const cbm_gbuf_t *gb, c
 const cbm_gbuf_node_t *cbm_gbuf_find_by_qn_location(const cbm_gbuf_t *gb, const char *qn,
                                                     const char *file_path, int line);
 
+/* Resolve the persisted source owner of a semantic reference. The exact
+ * repository path and 1-based line select live source-backed callable/type
+ * atoms; the unique atom whose byte span is contained by every other
+ * containing candidate is the owner. A claimed qualified name is used only to
+ * disambiguate incomparable same-line siblings because extractor spelling may
+ * describe an unpersisted nested callable or retain generic syntax. Invalid
+ * spans and unresolved sibling ambiguity poison persistence and set *failed.
+ * Zero candidates are an ordinary miss so the pipeline can emit its counted
+ * reference-edge skip. */
+const cbm_gbuf_node_t *cbm_gbuf_find_reference_owner_at(
+    const cbm_gbuf_t *gb, const char *claimed_qn, const char *file_path, int line,
+    const char *operation, bool *failed);
+
 /* Match the successor of a changed atom for incremental edge re-resolution.
  * The semantic locator is exact (QN/path/label/name plus the prior signature
  * property when present). A deleted locator returns NULL; an existing but

@@ -184,26 +184,7 @@ static const char *resolve_identifier(const chan_const_table_t *tbl, const char 
 /* ── Enclosing function detection ───────────────────────────────── */
 
 static const char *enclosing_function_qn(CBMExtractCtx *ctx, TSNode node) {
-    TSNode parent = ts_node_parent(node);
-    while (!ts_node_is_null(parent)) {
-        const char *pk = ts_node_type(parent);
-        if (strcmp(pk, "function_declaration") == 0 || strcmp(pk, "method_definition") == 0 ||
-            strcmp(pk, "arrow_function") == 0 || strcmp(pk, "function_expression") == 0 ||
-            strcmp(pk, "function") == 0 || strcmp(pk, "method_signature") == 0 ||
-            strcmp(pk, "function_definition") == 0 || strcmp(pk, "method_declaration") == 0 ||
-            strcmp(pk, "function_item") == 0 || strcmp(pk, "def") == 0) {
-            TSNode name_node = ts_node_child_by_field_name(parent, TS_FIELD("name"));
-            if (!ts_node_is_null(name_node)) {
-                char *name = cbm_node_text(ctx->arena, name_node, ctx->source);
-                if (name && name[0]) {
-                    return name;
-                }
-            }
-            return NULL;
-        }
-        parent = ts_node_parent(parent);
-    }
-    return NULL;
+    return cbm_enclosing_func_qn_cached(ctx, node);
 }
 
 /* ── Channel name extraction from arguments ──────────────────────── */
