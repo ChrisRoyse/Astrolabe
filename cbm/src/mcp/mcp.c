@@ -5546,9 +5546,9 @@ static yyjson_doc *enrich_node_properties(yyjson_mut_doc *doc, yyjson_mut_val *o
  * string (caller frees) or NULL if path is invalid/unreadable. */
 /* True only when abs_path, after full filesystem resolution (collapsing `..` AND
  * following symlinks/junctions to their real target), stays within root_path. This
- * is the single containment guard every MCP file-read sink must pass before reading
- * a file into a tool response: both exact snippet verification and search source
- * enrichment route through it, so a result whose
+ * is the path-based containment guard MCP file-read sinks pass before reading a
+ * file into a tool response. Search scope materialization performs the same
+ * resolved comparison with its already-retained source handle, so a result whose
  * indexed path escapes the project root — via a `..` segment, or a symlink /
  * Windows junction picked up during discovery — is never read back out.
  *
@@ -5567,35 +5567,41 @@ static yyjson_doc *enrich_node_properties(yyjson_mut_doc *doc, yyjson_mut_val *o
  * separator/NUL boundary so "C:\root2" never matches root "C:\root". Fail-closed:
  * any canonicalization failure (including a non-existent/unopenable path) → false,
  * with no lexical/ANSI fallback. */
+static bool resolved_path_within_root(const char *real_root, const char *real_file) {
+    if (!real_root || !real_file) {
+        return false;
+    }
+    bool within = false;
+    size_t root_len = strlen(real_root);
+    size_t file_len = strlen(real_file);
+    /* Ignore a trailing separator on the resolved root (e.g. a volume root
+     * "\\?\C:\") so the boundary test below is well-defined. */
+    while (root_len > 0 && (real_root[root_len - 1] == '\\' || real_root[root_len - 1] == '/')) {
+        root_len--;
+    }
+    if (root_len > 0 && file_len >= root_len &&
+#ifdef _WIN32
+        /* NTFS is case-insensitive: compare case-folded so a differently-cased
+         * spelling of the root cannot look like an escape (and a legitimate
+         * differently-cased file is not falsely refused). */
+        _strnicmp(real_file, real_root, root_len) == 0 &&
+#else
+        strncmp(real_file, real_root, root_len) == 0 &&
+#endif
+        (real_file[root_len] == '\\' || real_file[root_len] == '/' ||
+         real_file[root_len] == '\0')) {
+        within = true;
+    }
+    return within;
+}
+
 bool cbm_path_within_root(const char *root_path, const char *abs_path) {
     if (!root_path || !abs_path) {
         return false;
     }
     char *real_root = cbm_real_path_final(root_path);
     char *real_file = cbm_real_path_final(abs_path);
-    bool within = false;
-    if (real_root && real_file) {
-        size_t root_len = strlen(real_root);
-        /* Ignore a trailing separator on the resolved root (e.g. a volume root
-         * "\\?\C:\") so the boundary test below is well-defined. */
-        while (root_len > 0 &&
-               (real_root[root_len - 1] == '\\' || real_root[root_len - 1] == '/')) {
-            root_len--;
-        }
-        if (root_len > 0 &&
-#ifdef _WIN32
-            /* NTFS is case-insensitive: compare case-folded so a differently-cased
-             * spelling of the root cannot look like an escape (and a legitimate
-             * differently-cased file is not falsely refused). */
-            _strnicmp(real_file, real_root, root_len) == 0 &&
-#else
-            strncmp(real_file, real_root, root_len) == 0 &&
-#endif
-            (real_file[root_len] == '\\' || real_file[root_len] == '/' ||
-             real_file[root_len] == '\0')) {
-            within = true;
-        }
-    }
+    bool within = resolved_path_within_root(real_root, real_file);
     free(real_root);
     free(real_file);
     return within;
@@ -5876,6 +5882,34 @@ static int64_t mcp_filetime_to_unix_ns(LONGLONG ticks) {
 
 static bool mcp_windows_missing_error(DWORD error) {
     return error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND;
+}
+
+static char *mcp_final_path_from_handle(HANDLE handle, DWORD *native_error) {
+    *native_error = ERROR_SUCCESS;
+    const DWORD flags = FILE_NAME_NORMALIZED | VOLUME_NAME_DOS;
+    DWORD needed = GetFinalPathNameByHandleW(handle, NULL, 0, flags);
+    if (needed == 0) {
+        *native_error = GetLastError();
+        return NULL;
+    }
+    wchar_t *wide = calloc((size_t)needed, sizeof(*wide));
+    if (!wide) {
+        *native_error = ERROR_NOT_ENOUGH_MEMORY;
+        return NULL;
+    }
+    DWORD written = GetFinalPathNameByHandleW(handle, wide, needed, flags);
+    if (written == 0 || written >= needed) {
+        *native_error = written == 0 ? GetLastError() : ERROR_INSUFFICIENT_BUFFER;
+        free(wide);
+        return NULL;
+    }
+    char *path = cbm_wide_to_utf8(wide);
+    free(wide);
+    if (!path) {
+        *native_error = ERROR_NO_UNICODE_TRANSLATION;
+        return NULL;
+    }
+    return path;
 }
 #endif
 
@@ -7556,6 +7590,38 @@ static void bind_search_scope_identity(search_scope_result_t *result,
              indexed->sha256 ? indexed->sha256 : "");
 }
 
+static bool search_scope_relative_path_is_canonical(const char *path) {
+    if (!path || path[0] == '\0' || path[0] == '/' || path[0] == '\\') {
+        return false;
+    }
+    const char *component = path;
+    for (const char *cursor = path;; cursor++) {
+        char current = *cursor;
+#ifdef _WIN32
+        if (current == ':') {
+            return false;
+        }
+#endif
+        if (current != '\0' && current != '/' && current != '\\') {
+            continue;
+        }
+        size_t component_len = (size_t)(cursor - component);
+        if (component_len == 0 || (component_len == 1 && component[0] == '.') ||
+            (component_len == 2 && component[0] == '.' && component[1] == '.')) {
+            return false;
+        }
+#ifdef _WIN32
+        if (component[component_len - 1] == '.' || component[component_len - 1] == ' ') {
+            return false;
+        }
+#endif
+        if (current == '\0') {
+            return true;
+        }
+        component = cursor + 1;
+    }
+}
+
 static bool validate_search_scope_identity(const char *project, const cbm_file_hash_t *indexed,
                                            search_scope_result_t *result) {
     bind_search_scope_identity(result, indexed);
@@ -7576,6 +7642,15 @@ static bool validate_search_scope_identity(const char *project, const cbm_file_h
         snprintf(result->operation, sizeof(result->operation), "%s", "scope.validate_path");
         snprintf(result->detail, sizeof(result->detail),
                  "indexed path contains a forbidden record separator: %.400s", indexed->rel_path);
+        return false;
+    }
+    if (!search_scope_relative_path_is_canonical(indexed->rel_path)) {
+        result->status = SEARCH_SCOPE_INVALID_PATH;
+        snprintf(result->operation, sizeof(result->operation), "%s",
+                 "scope.validate_indexed_path_shape");
+        snprintf(result->detail, sizeof(result->detail),
+                 "indexed path is not a canonical relative component sequence: %.400s",
+                 indexed->rel_path);
         return false;
     }
     return true;
@@ -7614,7 +7689,8 @@ static bool validate_search_scope_utf8(const uint8_t *bytes, size_t len, size_t 
     return true;
 }
 
-static bool validate_scoped_source_file(const char *absolute_path, const cbm_file_hash_t *indexed,
+static bool validate_scoped_source_file(const char *root_path, const char *absolute_path,
+                                        const cbm_file_hash_t *indexed,
                                         search_scope_result_t *result) {
 #ifdef _WIN32
     wchar_t *wide_path = cbm_utf8_to_wide_path(absolute_path);
@@ -7658,6 +7734,39 @@ static bool validate_scoped_source_file(const char *absolute_path, const cbm_fil
     }
     result->current_is_directory = before.standard.Directory != 0;
     result->current_size = before.standard.EndOfFile.QuadPart;
+
+    SetLastError(ERROR_SUCCESS);
+    char *real_root = cbm_real_path_final(root_path);
+    DWORD root_error = real_root ? ERROR_SUCCESS : GetLastError();
+    DWORD current_error = ERROR_SUCCESS;
+    char *real_current = mcp_final_path_from_handle(handle, &current_error);
+    if (!real_root || !real_current) {
+        result->native_error = (uint32_t)(root_error ? root_error : current_error);
+        if (result->native_error == ERROR_SUCCESS) {
+            result->native_error = ERROR_INVALID_DATA;
+        }
+        free(real_root);
+        free(real_current);
+        CloseHandle(handle);
+        result->status = SEARCH_SCOPE_IO_FAILED;
+        snprintf(result->operation, sizeof(result->operation), "%s",
+                 "scope.resolve_current_containment");
+        snprintf(result->detail, sizeof(result->detail),
+                 "retained source/root final paths could not be resolved: %.360s", absolute_path);
+        return false;
+    }
+    bool within_root = resolved_path_within_root(real_root, real_current);
+    free(real_root);
+    free(real_current);
+    if (!within_root) {
+        CloseHandle(handle);
+        result->status = SEARCH_SCOPE_DRIFT;
+        snprintf(result->operation, sizeof(result->operation), "%s",
+                 "scope.validate_current_containment");
+        snprintf(result->detail, sizeof(result->detail),
+                 "current indexed path resolves outside the project root: %.360s", absolute_path);
+        return false;
+    }
     if (before.standard.Directory) {
         CloseHandle(handle);
         result->status = SEARCH_SCOPE_INVALID_IDENTITY;
@@ -7786,6 +7895,7 @@ static bool validate_scoped_source_file(const char *absolute_path, const cbm_fil
     free(bytes);
     return true;
 #else
+    (void)root_path;
     (void)absolute_path;
     (void)indexed;
     result->status = SEARCH_SCOPE_IO_FAILED;
@@ -7892,18 +8002,7 @@ static search_scope_status_t write_scoped_filelist(cbm_mcp_server_t *srv, const 
             break;
         }
         snprintf(absolute_path, absolute_len, "%s/%s", root_path, relative_path);
-        if (!cbm_path_within_root(root_path, absolute_path)) {
-            result->status = SEARCH_SCOPE_INVALID_PATH;
-            snprintf(result->operation, sizeof(result->operation), "%s",
-                     "scope.validate_source_path");
-            snprintf(result->detail, sizeof(result->detail),
-                     "indexed source path resolves outside the project root: %.400s",
-                     relative_path);
-            free(absolute_path);
-            write_ok = false;
-            break;
-        }
-        if (!validate_scoped_source_file(absolute_path, indexed, result)) {
+        if (!validate_scoped_source_file(root_path, absolute_path, indexed, result)) {
             free(absolute_path);
             write_ok = false;
             break;
