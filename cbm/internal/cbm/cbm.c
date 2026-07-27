@@ -1085,6 +1085,26 @@ static CBMFileResult *cbm_extract_file_impl(const char *source, int source_len,
                     "the complete corpus");
             }
             int expanded_len = result->has_error ? 0 : (int)expanded_size;
+
+            // Once preprocessing succeeds, its mapped tree is the authoritative call view for
+            // this translation unit. The original syntax tree can contain calls in inactive
+            // conditional branches and cannot expose macro replacement calls, so mixing the two
+            // views creates both false positives and duplicates. Definitions and every non-call
+            // record remain owned by the original physical-source tree.
+            int original_calls = result->calls.count;
+            int original_resolved_calls = result->resolved_calls.count;
+            result->calls.count = 0;
+            result->resolved_calls.count = 0;
+            if (original_calls > 0 || original_resolved_calls > 0) {
+                char calls_replaced[32];
+                char resolutions_replaced[32];
+                snprintf(calls_replaced, sizeof(calls_replaced), "%d", original_calls);
+                snprintf(resolutions_replaced, sizeof(resolutions_replaced), "%d",
+                         original_resolved_calls);
+                cbm_log_info("preprocessor.original_call_view_replaced", "file",
+                             rel_path ? rel_path : "<input>", "calls", calls_replaced,
+                             "resolved_calls", resolutions_replaced);
+            }
             int calls_before = result->calls.count;
 
             // Parse expanded source with fresh tree
