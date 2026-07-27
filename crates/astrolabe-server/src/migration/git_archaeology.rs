@@ -1,5 +1,6 @@
 use super::*;
 
+use std::io::Write;
 use std::process::{Child, Command, Stdio};
 
 use astrolabe_anchors::archaeology::{
@@ -30,8 +31,9 @@ const ARCHAEOLOGY_ACTOR: &str = "astrolabe-git-archaeology";
 /// CWD is hard-capped at MAX_PATH and `core.longpaths` covers git's file I/O but
 /// NOT the `chdir` git performs into a `-C <worktree>` root, so on a deep store dir
 /// `git checkout` died with `cannot change to '<deep>/…-worktree-…'`. The worktree
-/// is relocated to a short temp base ([`archaeology_worktree_home`], #427); only the
-/// `\\?\`-safe scratch `.db` (SQLite, #412) stays under the store.
+/// is relocated to a compact explicit scratch namespace
+/// ([`archaeology_scratch_scope`], #427/#809); only the `\\?\`-safe scratch `.db`
+/// (SQLite, #412) stays under the store.
 ///
 /// DRIFT CONTRACT: MUST byte-match the C-side `CBM_ASTRO_ARCHAEOLOGY_DB_PREFIX`
 /// (declared in `cbm/src/mcp/mcp.h`); the compile-time assertion below binds
@@ -62,14 +64,21 @@ const _: () = {
     );
 };
 
-/// Directory-name prefix for the transient git-archaeology scratch WORKTREE, now
-/// rooted under a short temp base ([`archaeology_worktree_home`]) rather than the
-/// (possibly deep) CBM store dir (#427). The embedded owner PID is the sweep's
+/// Required process configuration for the one product-owned archaeology scratch
+/// namespace (#809). There is deliberately no ambient-TEMP or store-directory
+/// fallback: callers must name one absolute local root whose path satisfies Git's
+/// Windows current-directory budget.
+const ARCHAEOLOGY_ROOT_ENV: &str = "ASTRO_ARCHAEOLOGY_ROOT";
+const ARCHAEOLOGY_SCOPE_SCHEMA: &str = "astrolabe.archaeology-scratch-scope.v1";
+
+/// Directory-name prefix for the transient git-archaeology scratch WORKTREE,
+/// rooted under the repo+project-bound compact namespace returned by
+/// [`archaeology_scratch_scope`]. The embedded owner PID is the sweep's
 /// concurrency discriminator: [`sweep_orphan_worktrees`] removes a leftover
 /// worktree only when its PID is dead, so a concurrent live archaeology pass is
 /// never swept out from under itself. Unlike the scratch `.db`, this name carries
 /// no C-side enumeration contract — it never lands in a CBM store dir.
-const ARCHAEOLOGY_WORKTREE_PREFIX: &str = "astrolabe-archaeology-worktree-";
+const ARCHAEOLOGY_WORKTREE_PREFIX: &str = "w-";
 
 /// Byte budget for the scratch-worktree root path. [`add_historical_worktree`]
 /// runs `git -C <worktree> checkout …`, which makes git `chdir` into the worktree
@@ -237,6 +246,12 @@ pub(crate) fn run_git_archaeology<C: Clock>(
     // namespace. Empty (corpus IS the toplevel) => whole-repo control path,
     // byte-identical to pre-scoping behavior on every axis.
     let corpus_rel = git_show_prefix(repo)?;
+    let git_root = git_toplevel(repo)?;
+    // Resolve, validate, bind, and read back the one explicit scratch namespace
+    // before the history mine or any historical Git mutation. Fleet supplies this
+    // root to every child; direct server launches must configure it themselves.
+    // No alternate path is attempted on any failure.
+    let scratch_scope = archaeology_scratch_scope(&git_root, project)?;
     // #434 phase-internal timing: opt-in via ASTRO_ARCH_TIMING, off by default so
     // production indexing is byte-for-byte unaffected. When set, the mine vs the
     // per-evidence-commit historical-reindex loop are timed separately (with counts)
@@ -384,7 +399,6 @@ pub(crate) fn run_git_archaeology<C: Clock>(
     // the discovered git root + the subtree pathspec so a consumer sees
     // `parent_repo(<root>) pathspec=<subtree>` rather than an unlabeled implicit walk
     // (invariant 1: no unlabeled claim; invariant 3: no silent fallback).
-    let git_root = git_toplevel(repo)?;
     let (archaeology_source, pathspec) = if corpus_rel.is_empty() {
         (ARCHAEOLOGY_SOURCE_OWN_REPO, None)
     } else {
@@ -405,24 +419,11 @@ pub(crate) fn run_git_archaeology<C: Clock>(
         skipped_gitlink_paths: mined.skipped_gitlink_paths + force_removed_skipped_gitlink,
         skipped_unblamable_paths: mined.skipped_unblamable_paths,
         archaeology_source,
-        git_root,
+        git_root: git_root.clone(),
         pathspec,
         ..GitArchaeologyImportReport::default()
     };
-    // Relocate archaeology scratch worktrees to a short temp base (#427): a deep
-    // store dir would push the worktree root past the Windows `chdir` MAX_PATH cap
-    // that `git -C <worktree> checkout` hits (`core.longpaths` does not cover
-    // `chdir`). The scratch `.db` stays under the store dir (`\\?\`-safe, #412).
-    let worktree_home = archaeology_worktree_home();
-    fs::create_dir_all(&worktree_home).map_err(|error| -> DynError {
-        format!(
-            "ASTRO_ARCHAEOLOGY_WORKTREE_HOME_UNUSABLE: could not create the archaeology \
-             scratch-worktree base {}: {error}; remediation: point TMP/TEMP at a writable, \
-             short directory and re-run index_repository",
-            worktree_home.display()
-        )
-        .into()
-    })?;
+    let worktree_home = scratch_scope.worktree_home;
     // Best-effort, PID-gated sweep of worktrees left at this shared home by a prior
     // pass that crashed before cleanup (invariant 3: counted telemetry, never a
     // silent skip). Only dead-PID orphans are removed, so a concurrently-running
@@ -439,7 +440,7 @@ pub(crate) fn run_git_archaeology<C: Clock>(
     // respawn for the next, never a host exit. The worker is proactively recycled (killed
     // + respawned) every [`ARCHAEOLOGY_POOL_RECYCLE_AFTER_DEFAULT`] commits to bound the
     // cumulative C-heap damage of the #515 fault class to one interval.
-    let mut pool = HistoricalExtractionPool::new()?;
+    let mut pool = HistoricalExtractionPool::new(&scratch_scope.pool_home)?;
     let index_loop_start = std::time::Instant::now();
     let mut index_calls = 0usize;
     let mut index_ms_total = 0u128;
@@ -555,6 +556,18 @@ pub(crate) fn run_git_archaeology<C: Clock>(
     Ok(report)
 }
 
+/// Validate and durably bind the exact archaeology scratch scope before the
+/// shadow publication or native index pass starts. A non-git corpus never calls
+/// this preflight; its archaeology result remains explicitly unavailable.
+pub(crate) fn preflight_git_archaeology_scratch(
+    repo: &Path,
+    project: &str,
+) -> Result<(), DynError> {
+    let git_root = git_toplevel(repo)?;
+    let _ = archaeology_scratch_scope(&git_root, project)?;
+    Ok(())
+}
+
 /// #515 fail-closed ceiling for one isolated historical-commit extraction child.
 /// File-scoped historical indexing (#439) materializes only the handful of files an
 /// evidence group touches, so a single extraction is sub-second in practice; this
@@ -597,21 +610,12 @@ fn archaeology_pool_recycle_after() -> u64 {
 }
 
 /// Directory-name prefix for a transient git-archaeology extraction POOL dir (#530),
-/// rooted under the short temp base [`archaeology_pool_home`]. The embedded owner PID is
+/// rooted under the repo+project-bound compact namespace returned by
+/// [`archaeology_scratch_scope`]. The embedded owner PID is
 /// the sweep's concurrency discriminator: [`sweep_orphan_pools`] removes a leftover pool
 /// dir only when its PID is dead, so a concurrent live archaeology pass is never swept
 /// out from under itself.
-const ARCHAEOLOGY_POOL_PREFIX: &str = "astrolabe-archaeology-pool-";
-
-/// Short, collision-safe base directory for archaeology extraction pool dirs (#530),
-/// deliberately OUTSIDE the CBM store dir (mirroring [`archaeology_worktree_home`], #427)
-/// so a deep store never pushes the pool handshake files past the Windows MAX_PATH cap.
-/// One shared temp subdirectory serves all owners; per-pool collision-safety comes from
-/// the `<pid>-<nanos>` nonce, and cross-process safety from PID-gated orphan sweeping
-/// ([`sweep_orphan_pools`]).
-fn archaeology_pool_home() -> PathBuf {
-    std::env::temp_dir().join("astrolabe-archaeology-pools")
-}
+const ARCHAEOLOGY_POOL_PREFIX: &str = "p-";
 
 /// Categorized read of one pooled-worker response file (#530), so the caller can tell a
 /// clean extraction from a RECOVERABLE Rust-level pipeline error (the worker stays warm)
@@ -707,7 +711,7 @@ impl HistoricalExtractionPool {
     /// first [`extract`](Self::extract) spawns lazily, so a pass with zero evidence
     /// commits never pays a spawn. Sweeps dead-PID orphan pool dirs first (#530), the
     /// same PID-gated discipline the scratch worktrees use (#427).
-    fn new() -> Result<Self, DynError> {
+    fn new(home: &Path) -> Result<Self, DynError> {
         let exe = std::env::current_exe().map_err(|error| -> DynError {
             format!(
                 "ASTRO_ARCHAEOLOGY_POOL_EXE_UNRESOLVED: could not resolve the running astrolabe \
@@ -716,17 +720,7 @@ impl HistoricalExtractionPool {
             )
             .into()
         })?;
-        let home = archaeology_pool_home();
-        fs::create_dir_all(&home).map_err(|error| -> DynError {
-            format!(
-                "ASTRO_ARCHAEOLOGY_POOL_HOME_UNUSABLE: could not create the archaeology \
-                 extraction-pool base {}: {error}; remediation: point TMP/TEMP at a writable, \
-                 short directory and re-run index_repository",
-                home.display()
-            )
-            .into()
-        })?;
-        sweep_orphan_pools(&home);
+        sweep_orphan_pools(home);
         let nonce = format!(
             "{}-{}",
             std::process::id(),
@@ -736,8 +730,8 @@ impl HistoricalExtractionPool {
         fs::create_dir_all(&pool_dir).map_err(|error| -> DynError {
             format!(
                 "ASTRO_ARCHAEOLOGY_POOL_DIR_UNUSABLE: could not create the archaeology \
-                 extraction-pool dir {}: {error}; remediation: point TMP/TEMP at a writable \
-                 directory and re-run index_repository",
+                 extraction-pool dir {}: {error}; remediation: ensure {ARCHAEOLOGY_ROOT_ENV} \
+                 names a writable local directory and re-run index_repository",
                 pool_dir.display()
             )
             .into()
@@ -763,7 +757,8 @@ impl HistoricalExtractionPool {
         let log = fs::File::create(&self.log_path).map_err(|error| -> DynError {
             format!(
                 "ASTRO_ARCHAEOLOGY_POOL_LOG_UNUSABLE: could not create the pooled worker log {}: \
-                 {error}; remediation: point TMP/TEMP at a writable directory and re-run",
+                 {error}; remediation: ensure {ARCHAEOLOGY_ROOT_ENV} names a writable local \
+                 directory and re-run",
                 self.log_path.display()
             )
             .into()
@@ -1599,18 +1594,19 @@ fn index_historical_commit(
         std::process::id(),
         SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos()
     );
-    // Worktree at the short temp home (#427); the `.db` scratch store stays under
-    // the store dir where the C enumerator's reserved-prefix filter can see it.
+    // Worktree at the compact explicit home (#427/#809); the `.db` scratch store
+    // stays under the store dir where the C enumerator's reserved-prefix filter
+    // can see it.
     let worktree = worktree_home.join(format!("{ARCHAEOLOGY_WORKTREE_PREFIX}{nonce}"));
-    let worktree_len = worktree.as_os_str().len();
+    let worktree_len = windows_path_units(&worktree);
     if worktree_len > ARCHAEOLOGY_WORKTREE_CWD_BUDGET {
         return Err(format!(
             "ASTRO_ARCHAEOLOGY_WORKTREE_BASE_TOO_DEEP: archaeology scratch-worktree root {root} is \
-             {worktree_len} bytes, over the {ARCHAEOLOGY_WORKTREE_CWD_BUDGET}-byte budget that \
+             {worktree_len} UTF-16 units, over the \
+             {ARCHAEOLOGY_WORKTREE_CWD_BUDGET}-unit budget that \
              keeps git's chdir into the worktree under the Windows MAX_PATH (260) cap (no \\\\?\\ \
-             form or git config lifts the chdir limit); remediation: point TMP/TEMP at a shorter \
-             directory (e.g. C:\\t) so the archaeology temp base is short, then re-run \
-             index_repository",
+             form or git config lifts the chdir limit); remediation: configure a shorter \
+             {ARCHAEOLOGY_ROOT_ENV} and re-run index_repository",
             root = worktree.display(),
         )
         .into());
@@ -1762,21 +1758,207 @@ fn remove_path_with_retry(path: &Path, remove: impl Fn(&Path) -> std::io::Result
     !path.exists()
 }
 
-/// Short, collision-safe base directory for archaeology scratch worktrees,
-/// deliberately OUTSIDE the CBM store dir so a deep store never pushes the
-/// worktree root past the Windows `chdir` MAX_PATH cap (#427). One shared temp
-/// subdirectory serves all owners; per-worktree collision-safety comes from the
-/// `<pid>-<nanos>` nonce, and cross-process safety from PID-gated orphan sweeping
-/// ([`sweep_orphan_worktrees`]). Exactly ONE home is chosen — no store-dir-then-temp
-/// fallback chain (issue #427: pick one home for the worktree). `std::env::temp_dir`
-/// is normally short (`%LOCALAPPDATA%\Temp`) but not guaranteed so; the per-commit
-/// [`ARCHAEOLOGY_WORKTREE_CWD_BUDGET`] guard fails closed if this base is itself deep.
-fn archaeology_worktree_home() -> PathBuf {
-    std::env::temp_dir().join("astrolabe-archaeology-worktrees")
+struct ArchaeologyScratchScope {
+    worktree_home: PathBuf,
+    pool_home: PathBuf,
 }
 
-/// Best-effort sweep of archaeology scratch worktrees left at the shared temp
-/// home by a prior pass that crashed between `git worktree add` and cleanup (#427).
+/// Resolve the one explicit archaeology root and bind one compact physical scope
+/// to the exact `(git toplevel, path-derived project)` identity. The scope
+/// manifest is durable state: a hash collision, torn write, or manually reused
+/// directory refuses without sweeping any existing child.
+fn archaeology_scratch_scope(
+    git_root: &str,
+    project: &str,
+) -> Result<ArchaeologyScratchScope, DynError> {
+    let raw = std::env::var_os(ARCHAEOLOGY_ROOT_ENV).ok_or_else(|| -> DynError {
+        format!(
+            "ASTRO_ARCHAEOLOGY_ROOT_MISSING: {ARCHAEOLOGY_ROOT_ENV} is not set; remediation: \
+             configure one short absolute local archaeology scratch root and re-run \
+             index_repository"
+        )
+        .into()
+    })?;
+    if raw.is_empty() {
+        return Err(format!(
+            "ASTRO_ARCHAEOLOGY_ROOT_EMPTY: {ARCHAEOLOGY_ROOT_ENV} is empty; remediation: \
+             configure one short absolute local archaeology scratch root and re-run \
+             index_repository"
+        )
+        .into());
+    }
+    let root = PathBuf::from(raw);
+    if !root.is_absolute()
+        || root.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::CurDir | std::path::Component::ParentDir
+            )
+        })
+    {
+        return Err(format!(
+            "ASTRO_ARCHAEOLOGY_ROOT_INVALID: {ARCHAEOLOGY_ROOT_ENV}={} is not a normalized \
+             absolute path; remediation: configure one absolute path without . or .. components",
+            root.display()
+        )
+        .into());
+    }
+    #[cfg(windows)]
+    {
+        use std::path::{Component, Prefix};
+        match root.components().next() {
+            Some(Component::Prefix(prefix)) if matches!(prefix.kind(), Prefix::Disk(_)) => {}
+            _ => {
+                return Err(format!(
+                    "ASTRO_ARCHAEOLOGY_ROOT_NOT_LOCAL: {ARCHAEOLOGY_ROOT_ENV}={} is not a local \
+                     drive path accepted by Git's Windows current-directory handling; \
+                     remediation: configure a short drive-qualified path such as C:\\astro-arch",
+                    root.display()
+                )
+                .into());
+            }
+        }
+    }
+
+    let mut hasher = Sha256::new();
+    hasher.update(git_root.as_bytes());
+    hasher.update([0]);
+    hasher.update(project.as_bytes());
+    let digest = hex_lower(&hasher.finalize());
+    let scope_key = format!("s-{}", &digest[..16]);
+    let scope_dir = root.join(&scope_key);
+    let worktree_home = scope_dir.join("w");
+    let pool_home = scope_dir.join("p");
+    let longest_owner = "4294967295-18446744073709551615";
+    let worktree_preview =
+        worktree_home.join(format!("{ARCHAEOLOGY_WORKTREE_PREFIX}{longest_owner}"));
+    let pool_preview = pool_home
+        .join(format!("{ARCHAEOLOGY_POOL_PREFIX}{longest_owner}"))
+        .join("response-18446744073709551615.json");
+    for (kind, preview) in [
+        ("worktree", &worktree_preview),
+        ("pool-handshake", &pool_preview),
+    ] {
+        let units = windows_path_units(preview);
+        if units > ARCHAEOLOGY_WORKTREE_CWD_BUDGET {
+            return Err(format!(
+                "ASTRO_ARCHAEOLOGY_ROOT_TOO_DEEP: configured {ARCHAEOLOGY_ROOT_ENV}={} makes the \
+                 longest {kind} path {} UTF-16 units, over the \
+                 {ARCHAEOLOGY_WORKTREE_CWD_BUDGET}-unit Windows budget; remediation: configure \
+                 one shorter absolute local root",
+                root.display(),
+                units
+            )
+            .into());
+        }
+    }
+
+    fs::create_dir_all(&scope_dir).map_err(|error| -> DynError {
+        format!(
+            "ASTRO_ARCHAEOLOGY_ROOT_UNUSABLE: could not create bound scratch scope {}: {error}; \
+             remediation: make {ARCHAEOLOGY_ROOT_ENV} writable or configure another explicit root",
+            scope_dir.display()
+        )
+        .into()
+    })?;
+    let manifest_path = scope_dir.join("scope.json");
+    let binding = json!({
+        "git_root": git_root,
+        "project": project,
+        "schema": ARCHAEOLOGY_SCOPE_SCHEMA,
+        "scope_key": scope_key,
+    });
+    let binding_bytes = serde_json::to_vec_pretty(&binding)?;
+    match fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&manifest_path)
+    {
+        Ok(mut manifest) => {
+            manifest.write_all(&binding_bytes)?;
+            manifest.sync_all()?;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => {
+            return Err(format!(
+                "ASTRO_ARCHAEOLOGY_SCOPE_MANIFEST_UNUSABLE: could not publish {}: {error}; \
+                 remediation: preserve the scope and repair its filesystem before retrying",
+                manifest_path.display()
+            )
+            .into());
+        }
+    }
+    let readback_bytes = fs::read(&manifest_path).map_err(|error| -> DynError {
+        format!(
+            "ASTRO_ARCHAEOLOGY_SCOPE_MANIFEST_UNREADABLE: could not read back {}: {error}; \
+             remediation: preserve the scope and repair its manifest before retrying",
+            manifest_path.display()
+        )
+        .into()
+    })?;
+    let readback: Value = serde_json::from_slice(&readback_bytes).map_err(|error| -> DynError {
+        format!(
+            "ASTRO_ARCHAEOLOGY_SCOPE_MANIFEST_MALFORMED: {} is not valid JSON: {error}; \
+             remediation: preserve the scope and inspect the torn or foreign manifest",
+            manifest_path.display()
+        )
+        .into()
+    })?;
+    if readback != binding {
+        return Err(format!(
+            "ASTRO_ARCHAEOLOGY_SCOPE_IDENTITY_MISMATCH: {} does not bind the requested git root \
+             and project; remediation: preserve the existing scope and configure a distinct root",
+            manifest_path.display()
+        )
+        .into());
+    }
+    fs::create_dir_all(&worktree_home).map_err(|error| -> DynError {
+        format!(
+            "ASTRO_ARCHAEOLOGY_WORKTREE_HOME_UNUSABLE: could not create {}: {error}; \
+             remediation: preserve the scope and repair its local filesystem before retrying",
+            worktree_home.display()
+        )
+        .into()
+    })?;
+    fs::create_dir_all(&pool_home).map_err(|error| -> DynError {
+        format!(
+            "ASTRO_ARCHAEOLOGY_POOL_HOME_UNUSABLE: could not create {}: {error}; remediation: \
+             preserve the scope and repair its local filesystem before retrying",
+            pool_home.display()
+        )
+        .into()
+    })?;
+    let manifest_sha256 = hex_lower(&Sha256::digest(&readback_bytes));
+    eprintln!(
+        "astro.archaeology.scratch_scope root={} scope={} project={} git_root={} manifest={} \
+         manifest_sha256={}",
+        root.display(),
+        scope_dir.display(),
+        project,
+        git_root,
+        manifest_path.display(),
+        manifest_sha256,
+    );
+    Ok(ArchaeologyScratchScope {
+        worktree_home,
+        pool_home,
+    })
+}
+
+#[cfg(windows)]
+fn windows_path_units(path: &Path) -> usize {
+    use std::os::windows::ffi::OsStrExt;
+    path.as_os_str().encode_wide().count()
+}
+
+#[cfg(not(windows))]
+fn windows_path_units(path: &Path) -> usize {
+    path.as_os_str().len()
+}
+
+/// Best-effort sweep of archaeology scratch worktrees left in this exact
+/// repo+project-bound scope by a prior pass that crashed between `git worktree add`
+/// and cleanup (#427/#809).
 /// Only worktrees whose embedded owner PID is dead are removed, so a
 /// concurrently-running pass — its own live PID stamped in the directory name — is
 /// never swept out from under itself. After removing stale directories, `git
@@ -1878,7 +2060,8 @@ fn git_checked(repo: &Path, args: &[&str]) -> Result<(), DynError> {
 /// `sparse-checkout init` (which force-enables `extensions.worktreeConfig` in the
 /// enclosing repo's SHARED `.git/config`), no per-worktree sparse state is written, so
 /// the canonical repo config is never mutated. `core.longpaths=true` guards every
-/// tree-touching call: even joined to the short temp worktree base (#427), deep
+/// tree-touching call: even joined to the compact explicit worktree base
+/// (#427/#809), deep
 /// member file paths still exceed the Windows 260-char limit for git's file I/O
 /// (the worktree ROOT is separately kept under the `chdir` cap by
 /// [`ARCHAEOLOGY_WORKTREE_CWD_BUDGET`], which `core.longpaths` cannot reach).

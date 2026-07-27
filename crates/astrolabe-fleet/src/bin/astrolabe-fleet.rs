@@ -19,7 +19,8 @@
 //!                              [--size-cap-bytes <n>] [--budget-bytes <n>]
 //!                              [--parallelism <n>] [--timeout-secs <n>] [--at <unix-secs>]
 //! astrolabe-fleet pipeline     [--root <dir>] [--store-root <dir>] [--astrolabe-bin <exe>]
-//!                              [--nomic-dir <dir>] (--repo <owner/name> ... | --all-cloned)
+//!                              [--archaeology-root <dir>] [--nomic-dir <dir>]
+//!                              (--repo <owner/name> ... | --all-cloned)
 //!                              [--limit <n>] [--parallelism <n>] [--timeout-secs <n>]
 //!                              [--force] [--at <unix-secs>]
 //! astrolabe-fleet retire-source [--root <dir>] [--farm-root <dir>]
@@ -31,7 +32,8 @@
 //!                              [--retire-sources]
 //!                              [--force-repo <owner/name> ...] [--max-repos-per-cycle <n>]
 //!                              [--debt-threshold-repos <n>] [--farm-root <dir>]
-//!                              [--store-root <dir>] [--astrolabe-bin <exe>] [--nomic-dir <dir>]
+//!                              [--store-root <dir>] [--archaeology-root <dir>]
+//!                              [--astrolabe-bin <exe>] [--nomic-dir <dir>]
 //!                              [--size-cap-bytes <n>] [--budget-bytes <n>]
 //!                              [--store-budget-bytes <n>] [--parallelism <n>]
 //!                              [--timeout-secs <n>] [--at <unix-secs>]
@@ -369,6 +371,7 @@ fn run(args: &[String]) -> Result<(), CalyxError> {
             opts.reject_unknown(&[
                 "root",
                 "store-root",
+                "archaeology-root",
                 "astrolabe-bin",
                 "nomic-dir",
                 "repo",
@@ -384,6 +387,9 @@ fn run(args: &[String]) -> Result<(), CalyxError> {
                 astrolabe_fleet::orchestrator::PipelineConfig::with_default_bin(opts.at_or_now()?);
             if let Some(store_root) = opts.get("store-root") {
                 config.store_root = PathBuf::from(store_root);
+            }
+            if let Some(archaeology_root) = opts.get("archaeology-root") {
+                config.archaeology_root = PathBuf::from(archaeology_root);
             }
             if let Some(bin) = opts.get("astrolabe-bin") {
                 config.astrolabe_bin = PathBuf::from(bin);
@@ -471,6 +477,7 @@ fn run(args: &[String]) -> Result<(), CalyxError> {
                 "root",
                 "farm-root",
                 "store-root",
+                "archaeology-root",
                 "astrolabe-bin",
                 "nomic-dir",
                 "scope",
@@ -561,6 +568,9 @@ fn run(args: &[String]) -> Result<(), CalyxError> {
             let mut pipeline = astrolabe_fleet::orchestrator::PipelineConfig::with_default_bin(0);
             if let Some(store_root) = opts.get("store-root") {
                 pipeline.store_root = PathBuf::from(store_root);
+            }
+            if let Some(archaeology_root) = opts.get("archaeology-root") {
+                pipeline.archaeology_root = PathBuf::from(archaeology_root);
             }
             if let Some(bin) = opts.get("astrolabe-bin") {
                 pipeline.astrolabe_bin = PathBuf::from(bin);

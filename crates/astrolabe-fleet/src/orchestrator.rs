@@ -100,6 +100,9 @@ pub const ASTRO_FLEET_PROJECT_IDENTITY: &str = "ASTRO_FLEET_PROJECT_IDENTITY";
 
 /// Declared default fleet store root (per-repo CBM cache/vault sets).
 pub const DEFAULT_STORE_ROOT: &str = r"D:\astrolabe-fleet\store";
+/// Declared product-owned scratch root for Git archaeology. Every pipeline child
+/// receives this as `ASTRO_ARCHAEOLOGY_ROOT`; the server never consults ambient TEMP.
+pub const DEFAULT_ARCHAEOLOGY_ROOT: &str = r"D:\astrolabe-fleet\scratch";
 /// Declared default nomic vector-blob directory (#442: a relocated
 /// `astrolabe.exe` needs `ASTRO_NOMIC_DIR` or it fails with a structured
 /// error; the orchestrator always sets it).
@@ -228,6 +231,8 @@ fn project_identity_error(subject: &str, detail: &str) -> CalyxError {
 pub struct PipelineConfig {
     /// Fleet store root holding one `<org>__<repo>` store dir per repo.
     pub store_root: PathBuf,
+    /// Compact local base for repo+project-bound archaeology worktree/pool scopes.
+    pub archaeology_root: PathBuf,
     /// The pipeline binary (`astrolabe.exe`).
     pub astrolabe_bin: PathBuf,
     /// Nomic vector-blob directory exported as `ASTRO_NOMIC_DIR` (#442).
@@ -257,6 +262,7 @@ impl PipelineConfig {
             .unwrap_or_else(|| PathBuf::from("astrolabe.exe"));
         Self {
             store_root: PathBuf::from(DEFAULT_STORE_ROOT),
+            archaeology_root: PathBuf::from(DEFAULT_ARCHAEOLOGY_ROOT),
             astrolabe_bin: sibling,
             nomic_dir: PathBuf::from(DEFAULT_NOMIC_DIR),
             parallelism: DEFAULT_PIPELINE_PARALLELISM,
@@ -889,6 +895,7 @@ fn pipeline_job(row: &FleetRepoRow, config: &PipelineConfig) -> JobResult {
         .args(["cli", "--json", "index_repository", "--args-file"])
         .arg(&args_path)
         .env("CBM_CACHE_DIR", &store_dir)
+        .env("ASTRO_ARCHAEOLOGY_ROOT", &config.archaeology_root)
         .env("ASTRO_NOMIC_DIR", &config.nomic_dir)
         .env("ASTRO_SHADOW_TIMING", "1")
         .stdin(Stdio::null())

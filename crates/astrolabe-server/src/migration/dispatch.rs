@@ -465,6 +465,14 @@ pub(crate) fn handle_index_repository(
         };
 
     let cache_dir = astrolabe_bridge::cbm_cache_dir()?;
+    if let Some(repo) = repo_path
+        .as_deref()
+        .filter(|repo| astrolabe_anchors::archaeology::is_git_work_tree(repo))
+        && let Err(error) =
+            super::git_archaeology::preflight_git_archaeology_scratch(repo, &project)
+    {
+        return tool_error_result(error.to_string());
+    }
     let Some(_shadow_import_lock) = try_shadow_import_lock(&cache_dir, &project)? else {
         return tool_error_result(format!(
             "ASTRO_SHADOW_IMPORT_BUSY: a shadow publication for project {project:?} is already active at {}; remediation: retry after that exact owner completes",
