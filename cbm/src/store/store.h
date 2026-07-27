@@ -126,10 +126,6 @@ int cbm_store_find_nodes_by_qn_suffix(cbm_store_t *s, const char *project, const
 /* Get CALLS degree of a node (inbound and outbound). */
 void cbm_store_node_degree(cbm_store_t *s, int64_t node_id, int *in_deg, int *out_deg);
 
-/* Get distinct file paths for a project. Caller must free each out[i] and out itself.
- * Returns CBM_STORE_OK or CBM_STORE_ERR. */
-int cbm_store_list_files(cbm_store_t *s, const char *project, char ***out, int *count);
-
 /* Get caller/callee names for a node (CALLS/HTTP_CALLS/ASYNC_CALLS edges).
  * Returns 0 on success. Caller must free each out_callers[i]/out_callees[i]
  * and the arrays themselves. */
@@ -513,6 +509,7 @@ int cbm_store_delete_edges_by_type(cbm_store_t *s, const char *project, const ch
 int cbm_store_upsert_file_hash(cbm_store_t *s, const char *project, const char *rel_path,
                                const char *sha256, int64_t mtime_ns, int64_t size);
 
+/* Read every authoritative indexed-file identity in binary path order. */
 int cbm_store_get_file_hashes(cbm_store_t *s, const char *project, cbm_file_hash_t **out,
                               int *count);
 

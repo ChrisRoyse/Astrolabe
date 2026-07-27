@@ -3647,7 +3647,8 @@ int cbm_store_get_file_hashes(cbm_store_t *s, const char *project, cbm_file_hash
                               int *count) {
     sqlite3_stmt *stmt = prepare_cached(s, &s->stmt_get_file_hashes,
                                         "SELECT project, rel_path, sha256, mtime_ns, size "
-                                        "FROM file_hashes WHERE project = ?1;");
+                                        "FROM file_hashes WHERE project = ?1 "
+                                        "ORDER BY rel_path COLLATE BINARY;");
     if (!stmt) {
         return CBM_STORE_ERR;
     }
@@ -3917,79 +3918,6 @@ void cbm_store_node_degree(cbm_store_t *s, int64_t node_id, int *in_deg, int *ou
         }
         sqlite3_finalize(stmt);
     }
-}
-
-/* ── List distinct file paths ────────────────────────────────── */
-
-int cbm_store_list_files(cbm_store_t *s, const char *project, char ***out, int *count) {
-    *out = NULL;
-    *count = 0;
-    if (!s || !s->db || !project) {
-        return CBM_STORE_ERR;
-    }
-
-    const char *sql = "SELECT DISTINCT file_path FROM nodes "
-                      "WHERE project = ?1 AND file_path IS NOT NULL AND file_path != ''";
-    sqlite3_stmt *stmt = NULL;
-    if (sqlite3_prepare_v2(s->db, sql, CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
-        store_set_error_sqlite(s, "list_files.prepare");
-        return CBM_STORE_ERR;
-    }
-    sqlite3_bind_text(stmt, SKIP_ONE, project, CBM_NOT_FOUND, SQLITE_STATIC);
-
-    int cap = CBM_SZ_64;
-    int n = 0;
-    char **files = malloc(cap * sizeof(char *));
-    if (!files) {
-        sqlite3_finalize(stmt);
-        store_set_error(s, "list_files allocation failed");
-        return CBM_STORE_ERR;
-    }
-    int step_rc = SQLITE_OK;
-    while ((step_rc = sqlite3_step(stmt)) == SQLITE_ROW) {
-        const char *fp = (const char *)sqlite3_column_text(stmt, 0);
-        if (!fp) {
-            continue;
-        }
-        if (n >= cap) {
-            cap *= ST_GROWTH;
-            char **grown = realloc(files, cap * sizeof(char *));
-            if (!grown) {
-                for (int i = 0; i < n; i++) {
-                    free(files[i]);
-                }
-                free(files);
-                sqlite3_finalize(stmt);
-                store_set_error(s, "list_files growth allocation failed");
-                return CBM_STORE_ERR;
-            }
-            files = grown;
-        }
-        files[n] = heap_strdup(fp);
-        if (!files[n]) {
-            for (int i = 0; i < n; i++) {
-                free(files[i]);
-            }
-            free(files);
-            sqlite3_finalize(stmt);
-            store_set_error(s, "list_files path allocation failed");
-            return CBM_STORE_ERR;
-        }
-        n++;
-    }
-    if (step_rc != SQLITE_DONE) {
-        for (int i = 0; i < n; i++) {
-            free(files[i]);
-        }
-        free(files);
-        store_set_error_sqlite(s, "list_files.step");
-        sqlite3_finalize(stmt);
-        return CBM_STORE_ERR;
-    }
-    sqlite3_finalize(stmt);
-    *out = files;
-    *count = n;
-    return CBM_STORE_OK;
 }
 
 /* ── Node neighbor names ──────────────────────────────────────── */

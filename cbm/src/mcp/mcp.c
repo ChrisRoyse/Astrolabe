@@ -7502,6 +7502,8 @@ typedef enum {
     SEARCH_SCOPE_STORE_FAILED,
     SEARCH_SCOPE_EMPTY,
     SEARCH_SCOPE_INVALID_PATH,
+    SEARCH_SCOPE_INVALID_IDENTITY,
+    SEARCH_SCOPE_DRIFT,
     SEARCH_SCOPE_INVALID_SOURCE,
     SEARCH_SCOPE_IO_FAILED,
 } search_scope_status_t;
@@ -7510,75 +7512,288 @@ typedef struct {
     search_scope_status_t status;
     char operation[CBM_SZ_64];
     char detail[CBM_SZ_512];
+    bool indexed_identity_present;
+    char indexed_path[CBM_SZ_512];
+    char indexed_sha256[CBM_FILE_SHA256_CAPACITY];
+    int64_t indexed_size;
+    bool current_exists;
+    bool current_is_directory;
+    int64_t current_size;
+    bool current_sha256_present;
+    char current_sha256[CBM_FILE_SHA256_CAPACITY];
+    uint32_t native_error;
 } search_scope_result_t;
 
-static bool validate_utf8_source_file(const char *path, search_scope_result_t *result) {
-    FILE *fp = cbm_fopen(path, "rb");
-    if (!fp) {
-        result->status = SEARCH_SCOPE_IO_FAILED;
-        snprintf(result->operation, sizeof(result->operation), "%s", "scope.open_source");
-        snprintf(result->detail, sizeof(result->detail), "source open failed for %.360s: %s", path,
-                 strerror(errno));
+static void reset_search_scope_identity(search_scope_result_t *result) {
+    if (!result) {
+        return;
+    }
+    result->indexed_identity_present = false;
+    result->indexed_path[0] = '\0';
+    result->indexed_sha256[0] = '\0';
+    result->indexed_size = 0;
+    result->current_exists = false;
+    result->current_is_directory = false;
+    result->current_size = 0;
+    result->current_sha256_present = false;
+    result->current_sha256[0] = '\0';
+    result->native_error = 0;
+    result->operation[0] = '\0';
+    result->detail[0] = '\0';
+}
+
+static void bind_search_scope_identity(search_scope_result_t *result,
+                                       const cbm_file_hash_t *indexed) {
+    reset_search_scope_identity(result);
+    if (!result || !indexed) {
+        return;
+    }
+    result->indexed_identity_present = true;
+    result->indexed_size = indexed->size;
+    snprintf(result->indexed_path, sizeof(result->indexed_path), "%s",
+             indexed->rel_path ? indexed->rel_path : "");
+    snprintf(result->indexed_sha256, sizeof(result->indexed_sha256), "%s",
+             indexed->sha256 ? indexed->sha256 : "");
+}
+
+static bool validate_search_scope_identity(const char *project, const cbm_file_hash_t *indexed,
+                                           search_scope_result_t *result) {
+    bind_search_scope_identity(result, indexed);
+    if (!project || !indexed || !indexed->project || !indexed->rel_path || !indexed->sha256 ||
+        strcmp(indexed->project, project) != 0 || indexed->rel_path[0] == '\0' ||
+        !is_lower_hex_sha256(indexed->sha256) || indexed->size < 0) {
+        result->status = SEARCH_SCOPE_INVALID_IDENTITY;
+        snprintf(result->operation, sizeof(result->operation), "%s",
+                 "scope.validate_indexed_identity");
+        snprintf(result->detail, sizeof(result->detail),
+                 "file_hashes row is not a complete canonical identity for project %.160s and "
+                 "path %.240s",
+                 project ? project : "", indexed && indexed->rel_path ? indexed->rel_path : "");
         return false;
     }
-    uint64_t offset = 0;
-    bool valid = true;
-    for (;;) {
-        int first = fgetc(fp);
-        if (first == EOF) {
-            if (ferror(fp)) {
-                result->status = SEARCH_SCOPE_IO_FAILED;
-                snprintf(result->operation, sizeof(result->operation), "%s", "scope.read_source");
-                snprintf(result->detail, sizeof(result->detail),
-                         "source read failed for %.360s at byte %llu: %s", path,
-                         (unsigned long long)offset, strerror(errno));
-                valid = false;
-            }
-            break;
-        }
-        unsigned char sequence[5] = {(unsigned char)first, 0, 0, 0, 0};
+    if (strpbrk(indexed->rel_path, "\r\n") != NULL) {
+        result->status = SEARCH_SCOPE_INVALID_PATH;
+        snprintf(result->operation, sizeof(result->operation), "%s", "scope.validate_path");
+        snprintf(result->detail, sizeof(result->detail),
+                 "indexed path contains a forbidden record separator: %.400s", indexed->rel_path);
+        return false;
+    }
+    return true;
+}
+
+static bool validate_search_scope_utf8(const uint8_t *bytes, size_t len, size_t *bad_offset,
+                                       bool *embedded_nul) {
+    *bad_offset = 0;
+    *embedded_nul = false;
+    size_t offset = 0;
+    while (offset < len) {
+        unsigned char sequence[5] = {0, 0, 0, 0, 0};
+        sequence[0] = bytes[offset];
         if (sequence[0] == 0) {
-            result->status = SEARCH_SCOPE_INVALID_SOURCE;
-            snprintf(result->operation, sizeof(result->operation), "%s", "scope.validate_utf8");
-            snprintf(result->detail, sizeof(result->detail),
-                     "source contains an embedded NUL at byte %llu: %.360s",
-                     (unsigned long long)offset, path);
-            valid = false;
-            break;
+            *bad_offset = offset;
+            *embedded_nul = true;
+            return false;
         }
         int expected = sequence[0] <= 0x7f   ? 1
                        : sequence[0] <= 0xdf ? 2
                        : sequence[0] <= 0xef ? 3
                                              : 4;
-        for (int i = SKIP_ONE; i < expected; i++) {
-            int next = fgetc(fp);
-            if (next == EOF) {
-                valid = false;
-                break;
-            }
-            sequence[i] = (unsigned char)next;
+        if ((size_t)expected > len - offset) {
+            *bad_offset = offset;
+            return false;
         }
+        memcpy(sequence, bytes + offset, (size_t)expected);
         /* cbm_utf8_sequence_len intentionally validates only multibyte
-         * sequences.  Non-NUL ASCII is already a complete one-byte sequence. */
-        if (!valid || (expected > SKIP_ONE && cbm_utf8_sequence_len(sequence) != expected)) {
-            result->status = SEARCH_SCOPE_INVALID_SOURCE;
-            snprintf(result->operation, sizeof(result->operation), "%s", "scope.validate_utf8");
+         * sequences. Non-NUL ASCII is already a complete one-byte sequence. */
+        if (expected > SKIP_ONE && cbm_utf8_sequence_len(sequence) != expected) {
+            *bad_offset = offset;
+            return false;
+        }
+        offset += (size_t)expected;
+    }
+    return true;
+}
+
+static bool validate_scoped_source_file(const char *absolute_path, const cbm_file_hash_t *indexed,
+                                        search_scope_result_t *result) {
+#ifdef _WIN32
+    wchar_t *wide_path = cbm_utf8_to_wide_path(absolute_path);
+    if (!wide_path) {
+        result->status = SEARCH_SCOPE_INVALID_PATH;
+        result->native_error = (uint32_t)GetLastError();
+        snprintf(result->operation, sizeof(result->operation), "%s", "scope.widen_source_path");
+        snprintf(result->detail, sizeof(result->detail),
+                 "indexed UTF-8 source path could not be converted to a Windows path: %.360s",
+                 absolute_path);
+        return false;
+    }
+    HANDLE handle = CreateFileW(wide_path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING,
+                                FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_SEQUENTIAL_SCAN, NULL);
+    free(wide_path);
+    if (handle == INVALID_HANDLE_VALUE) {
+        DWORD error = GetLastError();
+        result->native_error = (uint32_t)error;
+        result->status =
+            mcp_windows_missing_error(error) ? SEARCH_SCOPE_DRIFT : SEARCH_SCOPE_IO_FAILED;
+        snprintf(result->operation, sizeof(result->operation), "%s", "scope.open_current");
+        snprintf(result->detail, sizeof(result->detail),
+                 mcp_windows_missing_error(error)
+                     ? "indexed source is absent from the current repository: %.360s"
+                     : "current source could not be opened for retained identity readback: %.360s",
+                 absolute_path);
+        return false;
+    }
+
+    result->current_exists = true;
+    mcp_file_identity_t before = {0};
+    if (!mcp_get_file_identity(handle, &before)) {
+        result->native_error = (uint32_t)GetLastError();
+        CloseHandle(handle);
+        result->status = SEARCH_SCOPE_IO_FAILED;
+        snprintf(result->operation, sizeof(result->operation), "%s", "scope.inspect_current");
+        snprintf(result->detail, sizeof(result->detail),
+                 "current source identity could not be read from its retained handle: %.360s",
+                 absolute_path);
+        return false;
+    }
+    result->current_is_directory = before.standard.Directory != 0;
+    result->current_size = before.standard.EndOfFile.QuadPart;
+    if (before.standard.Directory) {
+        CloseHandle(handle);
+        result->status = SEARCH_SCOPE_INVALID_IDENTITY;
+        snprintf(result->operation, sizeof(result->operation), "%s", "scope.inspect_current");
+        snprintf(result->detail, sizeof(result->detail),
+                 "file_hashes identity resolves to a directory instead of a source file: %.360s",
+                 absolute_path);
+        return false;
+    }
+    if (before.standard.DeletePending || before.standard.EndOfFile.QuadPart < 0) {
+        CloseHandle(handle);
+        result->status = SEARCH_SCOPE_DRIFT;
+        snprintf(result->operation, sizeof(result->operation), "%s", "scope.inspect_current");
+        snprintf(result->detail, sizeof(result->detail),
+                 "indexed source no longer resolves to a stable regular file: %.360s",
+                 absolute_path);
+        return false;
+    }
+    if (before.standard.EndOfFile.QuadPart != indexed->size) {
+        CloseHandle(handle);
+        result->status = SEARCH_SCOPE_DRIFT;
+        snprintf(result->operation, sizeof(result->operation), "%s", "scope.compare_current_size");
+        snprintf(result->detail, sizeof(result->detail),
+                 "current source size differs from file_hashes identity: %.360s", absolute_path);
+        return false;
+    }
+
+    uint64_t current_size = (uint64_t)before.standard.EndOfFile.QuadPart;
+    long max_file_bytes = cbm_max_file_bytes();
+    if (current_size > SIZE_MAX - SKIP_ONE || current_size > (uint64_t)max_file_bytes) {
+        CloseHandle(handle);
+        result->status = SEARCH_SCOPE_DRIFT;
+        snprintf(result->operation, sizeof(result->operation), "%s", "scope.bound_current_read");
+        snprintf(result->detail, sizeof(result->detail),
+                 "current source exceeds the configured exact-read limit: %.360s", absolute_path);
+        return false;
+    }
+    uint8_t *bytes = malloc((size_t)current_size + SKIP_ONE);
+    if (!bytes) {
+        CloseHandle(handle);
+        result->status = SEARCH_SCOPE_IO_FAILED;
+        snprintf(result->operation, sizeof(result->operation), "%s", "scope.allocate_current");
+        snprintf(result->detail, sizeof(result->detail),
+                 "current source snapshot allocation failed at %llu bytes",
+                 (unsigned long long)current_size + SKIP_ONE);
+        return false;
+    }
+
+    size_t total = 0;
+    while (total < (size_t)current_size) {
+        DWORD wanted =
+            (DWORD)(((size_t)current_size - total) > CBM_SZ_64K ? CBM_SZ_64K
+                                                                : ((size_t)current_size - total));
+        DWORD got = 0;
+        if (!ReadFile(handle, bytes + total, wanted, &got, NULL)) {
+            result->native_error = (uint32_t)GetLastError();
+            free(bytes);
+            CloseHandle(handle);
+            result->status = SEARCH_SCOPE_IO_FAILED;
+            snprintf(result->operation, sizeof(result->operation), "%s", "scope.read_current");
             snprintf(result->detail, sizeof(result->detail),
-                     "source is not valid UTF-8 at byte %llu: %.360s", (unsigned long long)offset,
-                     path);
-            valid = false;
+                     "retained current source handle could not be read completely: %.360s",
+                     absolute_path);
+            return false;
+        }
+        if (got == 0) {
             break;
         }
-        offset += (uint64_t)expected;
+        total += got;
     }
-    if (fclose(fp) != 0 && valid) {
+    uint8_t extra = 0;
+    DWORD extra_count = 0;
+    bool extra_ok = ReadFile(handle, &extra, 1, &extra_count, NULL) != 0;
+    DWORD extra_error = extra_ok ? ERROR_SUCCESS : GetLastError();
+    mcp_file_identity_t after = {0};
+    bool after_ok = mcp_get_file_identity(handle, &after);
+    DWORD after_error = after_ok ? ERROR_SUCCESS : GetLastError();
+    bool close_ok = CloseHandle(handle) != 0;
+    DWORD close_error = close_ok ? ERROR_SUCCESS : GetLastError();
+    if (!extra_ok || !after_ok || !close_ok) {
+        result->native_error =
+            (uint32_t)(extra_error ? extra_error : (after_error ? after_error : close_error));
+        free(bytes);
         result->status = SEARCH_SCOPE_IO_FAILED;
-        snprintf(result->operation, sizeof(result->operation), "%s", "scope.close_source");
-        snprintf(result->detail, sizeof(result->detail), "source close failed for %.360s: %s", path,
-                 strerror(errno));
-        valid = false;
+        snprintf(result->operation, sizeof(result->operation), "%s", "scope.finalize_current_read");
+        snprintf(result->detail, sizeof(result->detail),
+                 "current source readback could not be finalized and inspected: %.360s",
+                 absolute_path);
+        return false;
     }
-    return valid;
+    if (total != (size_t)current_size || extra_count != 0 ||
+        !mcp_file_identity_equal(&before, &after)) {
+        free(bytes);
+        result->status = SEARCH_SCOPE_DRIFT;
+        snprintf(result->operation, sizeof(result->operation), "%s",
+                 "scope.compare_retained_identity");
+        snprintf(result->detail, sizeof(result->detail),
+                 "current source changed during retained-handle verification: %.360s",
+                 absolute_path);
+        return false;
+    }
+    bytes[total] = 0;
+    cbm_sha256_hex(bytes, total, result->current_sha256);
+    result->current_sha256_present = true;
+    if (strcmp(result->current_sha256, indexed->sha256) != 0) {
+        free(bytes);
+        result->status = SEARCH_SCOPE_DRIFT;
+        snprintf(result->operation, sizeof(result->operation), "%s",
+                 "scope.compare_current_sha256");
+        snprintf(result->detail, sizeof(result->detail),
+                 "current source SHA-256 differs from file_hashes identity: %.360s", absolute_path);
+        return false;
+    }
+    size_t bad_offset = 0;
+    bool embedded_nul = false;
+    if (!validate_search_scope_utf8(bytes, total, &bad_offset, &embedded_nul)) {
+        free(bytes);
+        result->status = SEARCH_SCOPE_INVALID_SOURCE;
+        snprintf(result->operation, sizeof(result->operation), "%s", "scope.validate_utf8");
+        snprintf(result->detail, sizeof(result->detail),
+                 embedded_nul ? "source contains an embedded NUL at byte %llu: %.360s"
+                              : "source is not valid UTF-8 at byte %llu: %.360s",
+                 (unsigned long long)bad_offset, absolute_path);
+        return false;
+    }
+    free(bytes);
+    return true;
+#else
+    (void)absolute_path;
+    (void)indexed;
+    result->status = SEARCH_SCOPE_IO_FAILED;
+    snprintf(result->operation, sizeof(result->operation), "%s", "scope.capture_current");
+    snprintf(result->detail, sizeof(result->detail), "%s",
+             "exact scoped-source identity verification is implemented for native Windows");
+    return false;
+#endif
 }
 
 /* Write the exact indexed file list for scoped grep.
@@ -7605,9 +7820,10 @@ static search_scope_status_t write_scoped_filelist(cbm_mcp_server_t *srv, const 
                  "the verified project store could not be resolved");
         return result->status;
     }
-    char **indexed_files = NULL;
+    cbm_file_hash_t *indexed_files = NULL;
     int indexed_count = 0;
-    if (cbm_store_list_files(pre_store, project, &indexed_files, &indexed_count) != CBM_STORE_OK) {
+    if (cbm_store_get_file_hashes(pre_store, project, &indexed_files, &indexed_count) !=
+        CBM_STORE_OK) {
         record_store_query_failure(srv, project, cbm_store_db_path(pre_store), pre_store,
                                    CBM_STORE_VERIFY_IO_FAILED, "source.query_indexed_files",
                                    cbm_store_error(pre_store));
@@ -7617,7 +7833,7 @@ static search_scope_status_t write_scoped_filelist(cbm_mcp_server_t *srv, const 
         return result->status;
     }
     if (indexed_count == 0) {
-        free(indexed_files);
+        cbm_store_free_file_hashes(indexed_files, indexed_count);
         result->status = SEARCH_SCOPE_EMPTY;
         snprintf(result->operation, sizeof(result->operation), "%s", "scope.query_indexed_files");
         snprintf(result->detail, sizeof(result->detail), "%s",
@@ -7626,10 +7842,7 @@ static search_scope_status_t write_scoped_filelist(cbm_mcp_server_t *srv, const 
     }
     FILE *fl = cbm_fopen(filelist, "wb");
     if (!fl) {
-        for (int fi = 0; fi < indexed_count; fi++) {
-            free(indexed_files[fi]);
-        }
-        free(indexed_files);
+        cbm_store_free_file_hashes(indexed_files, indexed_count);
         result->status = SEARCH_SCOPE_IO_FAILED;
         snprintf(result->operation, sizeof(result->operation), "%s", "scope.open_filelist");
         snprintf(result->detail, sizeof(result->detail), "filelist open failed: %s",
@@ -7640,27 +7853,25 @@ static search_scope_status_t write_scoped_filelist(cbm_mcp_server_t *srv, const 
     bool write_ok = true;
     int written = 0;
     for (int fi = 0; fi < indexed_count; fi++) {
-        /* A source path never legitimately contains a newline or carriage
-         * return. Those bytes are the filelist record separator, so rejecting
-         * the complete operation is the only non-lossy response. */
-        if (strpbrk(indexed_files[fi], "\r\n") != NULL) {
-            result->status = SEARCH_SCOPE_INVALID_PATH;
-            snprintf(result->operation, sizeof(result->operation), "%s", "scope.validate_path");
-            snprintf(result->detail, sizeof(result->detail),
-                     "indexed path contains a forbidden record separator: %s", indexed_files[fi]);
+        cbm_file_hash_t *indexed = &indexed_files[fi];
+        if (!validate_search_scope_identity(project, indexed, result)) {
             write_ok = false;
             break;
         }
-        if (has_path_filter && path_regex) {
 #ifdef _WIN32
-            cbm_normalize_path_sep(indexed_files[fi]);
+        /* The store owns this allocation for the duration of the call. Search
+         * paths use one canonical separator before both regex and file-list
+         * evaluation. */
+        cbm_normalize_path_sep((char *)indexed->rel_path);
 #endif
-            if (cbm_regexec(path_regex, indexed_files[fi], 0, NULL, 0) != CBM_REG_OK) {
+        const char *relative_path = indexed->rel_path;
+        if (has_path_filter && path_regex) {
+            if (cbm_regexec(path_regex, relative_path, 0, NULL, 0) != CBM_REG_OK) {
                 continue;
             }
         }
         size_t root_len = strlen(root_path);
-        size_t path_len = strlen(indexed_files[fi]);
+        size_t path_len = strlen(relative_path);
         if (root_len > SIZE_MAX - path_len - MCP_SEPARATOR) {
             result->status = SEARCH_SCOPE_IO_FAILED;
             snprintf(result->operation, sizeof(result->operation), "%s", "scope.build_source_path");
@@ -7680,26 +7891,26 @@ static search_scope_status_t write_scoped_filelist(cbm_mcp_server_t *srv, const 
             write_ok = false;
             break;
         }
-        snprintf(absolute_path, absolute_len, "%s/%s", root_path, indexed_files[fi]);
+        snprintf(absolute_path, absolute_len, "%s/%s", root_path, relative_path);
         if (!cbm_path_within_root(root_path, absolute_path)) {
             result->status = SEARCH_SCOPE_INVALID_PATH;
             snprintf(result->operation, sizeof(result->operation), "%s",
                      "scope.validate_source_path");
             snprintf(result->detail, sizeof(result->detail),
                      "indexed source path resolves outside the project root: %.400s",
-                     indexed_files[fi]);
+                     relative_path);
             free(absolute_path);
             write_ok = false;
             break;
         }
-        if (!validate_utf8_source_file(absolute_path, result)) {
+        if (!validate_scoped_source_file(absolute_path, indexed, result)) {
             free(absolute_path);
             write_ok = false;
             break;
         }
         free(absolute_path);
         write_ok = fwrite(root_path, 1, root_len, fl) == root_len && fputc('/', fl) != EOF &&
-                   fwrite(indexed_files[fi], 1, path_len, fl) == path_len;
+                   fwrite(relative_path, 1, path_len, fl) == path_len;
 #ifdef _WIN32
         write_ok = write_ok && fputc('\n', fl) != EOF;
 #else
@@ -7721,10 +7932,7 @@ static search_scope_status_t write_scoped_filelist(cbm_mcp_server_t *srv, const 
         snprintf(result->detail, sizeof(result->detail), "filelist close failed: %s",
                  strerror(errno));
     }
-    for (int fi = 0; fi < indexed_count; fi++) {
-        free(indexed_files[fi]);
-    }
-    free(indexed_files);
+    cbm_store_free_file_hashes(indexed_files, indexed_count);
     if (!write_ok) {
         cbm_unlink(filelist);
         return result->status;
@@ -7735,25 +7943,73 @@ static search_scope_status_t write_scoped_filelist(cbm_mcp_server_t *srv, const 
 }
 
 static char *build_search_scope_error(const char *code, const search_scope_result_t *scope) {
+    char native_error[CBM_SZ_32];
+    char indexed_size[CBM_SZ_32];
+    char current_size[CBM_SZ_32];
+    snprintf(native_error, sizeof(native_error), "%lu", (unsigned long)scope->native_error);
+    snprintf(indexed_size, sizeof(indexed_size), "%lld", (long long)scope->indexed_size);
+    snprintf(current_size, sizeof(current_size), "%lld", (long long)scope->current_size);
+    cbm_log_error("search.scope_refused", "code", code, "operation", scope->operation, "file_path",
+                  scope->indexed_path, "indexed_file_sha256", scope->indexed_sha256,
+                  "current_file_sha256",
+                  scope->current_sha256_present ? scope->current_sha256 : "unavailable",
+                  "indexed_size", indexed_size, "current_size", current_size, "native_error",
+                  native_error, "message", scope->detail, "remediation",
+                  "repair or re-index the exact current repository revision, then retry");
     yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
-    if (!doc) {
+    yyjson_mut_val *root = doc ? yyjson_mut_obj(doc) : NULL;
+    if (!doc || !root) {
+        if (doc) {
+            yyjson_mut_doc_free(doc);
+        }
         return heap_strdup(
             "{\"code\":\"CBM_SEARCH_SCOPE_FAILED\",\"message\":\"indexed search scope could not "
             "be materialized\",\"remediation\":\"repair the indexed project state and retry\"}");
     }
-    yyjson_mut_val *root = yyjson_mut_obj(doc);
     yyjson_mut_doc_set_root(doc, root);
     yyjson_mut_obj_add_str(doc, root, "code", code);
-    yyjson_mut_obj_add_str(doc, root, "message",
-                           "search_code could not materialize the exact persisted indexed-file "
-                           "scope and refused to search a different corpus");
+    const char *message =
+        strcmp(code, "ASTRO_SOURCE_DRIFT") == 0
+            ? "indexed search-scope identity does not match the current repository"
+        : strcmp(code, "CBM_SEARCH_SCOPE_IDENTITY_INVALID") == 0
+            ? "persisted search scope contains an invalid source-file identity"
+            : "search_code could not materialize the exact persisted indexed-file scope and "
+              "refused to search a different corpus";
+    yyjson_mut_obj_add_str(doc, root, "message", message);
     yyjson_mut_obj_add_str(doc, root, "remediation",
-                           "repair or re-index the project, resolve the reported scope operation, "
-                           "then retry");
+                           "repair or re-index the exact current repository revision, resolve the "
+                           "reported scope operation, then retry");
     yyjson_mut_obj_add_str(doc, root, "failed_operation", scope->operation);
     yyjson_mut_obj_add_str(doc, root, "detail", scope->detail);
+    yyjson_mut_obj_add_str(doc, root, "trust", "refused");
+    yyjson_mut_obj_add_str(doc, root, "freshness", "drifted_or_unverifiable");
+    yyjson_mut_obj_add_str(doc, root, "provenance",
+                           "SQLite file_hashes + retained current-file handle readback");
+    yyjson_mut_obj_add_uint(doc, root, "native_error", scope->native_error);
+    if (scope->indexed_identity_present) {
+        yyjson_mut_val *indexed = yyjson_mut_obj(doc);
+        yyjson_mut_obj_add_str(doc, indexed, "file_path", scope->indexed_path);
+        yyjson_mut_obj_add_str(doc, indexed, "file_sha256", scope->indexed_sha256);
+        yyjson_mut_obj_add_sint(doc, indexed, "file_size", scope->indexed_size);
+        yyjson_mut_obj_add_val(doc, root, "indexed", indexed);
+
+        yyjson_mut_val *current = yyjson_mut_obj(doc);
+        yyjson_mut_obj_add_bool(doc, current, "exists", scope->current_exists);
+        yyjson_mut_obj_add_bool(doc, current, "is_directory", scope->current_is_directory);
+        if (scope->current_exists) {
+            yyjson_mut_obj_add_sint(doc, current, "file_size", scope->current_size);
+        } else {
+            yyjson_mut_obj_add_null(doc, current, "file_size");
+        }
+        if (scope->current_sha256_present) {
+            yyjson_mut_obj_add_str(doc, current, "file_sha256", scope->current_sha256);
+        } else {
+            yyjson_mut_obj_add_null(doc, current, "file_sha256");
+        }
+        yyjson_mut_obj_add_val(doc, root, "current", current);
+    }
     yyjson_mut_obj_add_bool(doc, root, "recursive_fallback_attempted", false);
-    char *json = yyjson_mut_write(doc, 0, NULL);
+    char *json = yy_doc_to_str(doc);
     yyjson_mut_doc_free(doc);
     return json ? json : heap_strdup("{\"code\":\"CBM_SEARCH_SCOPE_FAILED\"}");
 }
@@ -8220,8 +8476,11 @@ static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
             error = build_no_store_error(srv, project);
         } else {
             const char *code =
-                scope_status == SEARCH_SCOPE_EMPTY            ? "CBM_SEARCH_INDEX_EMPTY"
-                : scope_status == SEARCH_SCOPE_INVALID_PATH   ? "CBM_SEARCH_INDEXED_PATH_INVALID"
+                scope_status == SEARCH_SCOPE_EMPTY          ? "CBM_SEARCH_INDEX_EMPTY"
+                : scope_status == SEARCH_SCOPE_INVALID_PATH ? "CBM_SEARCH_INDEXED_PATH_INVALID"
+                : scope_status == SEARCH_SCOPE_INVALID_IDENTITY
+                    ? "CBM_SEARCH_SCOPE_IDENTITY_INVALID"
+                : scope_status == SEARCH_SCOPE_DRIFT          ? "ASTRO_SOURCE_DRIFT"
                 : scope_status == SEARCH_SCOPE_INVALID_SOURCE ? "CBM_SEARCH_SOURCE_ENCODING_INVALID"
                                                               : "CBM_SEARCH_SCOPE_IO_FAILED";
             error = build_search_scope_error(code, &scope);
