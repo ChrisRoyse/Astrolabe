@@ -1177,6 +1177,19 @@ unsafe extern "C" {
     ) -> *mut CBMFileResult;
 }
 unsafe extern "C" {
+    pub fn cbm_extract_file_at_path(
+        source: *const ::std::os::raw::c_char,
+        source_len: ::std::os::raw::c_int,
+        language: CBMLanguage,
+        project: *const ::std::os::raw::c_char,
+        rel_path: *const ::std::os::raw::c_char,
+        source_path: *const ::std::os::raw::c_char,
+        timeout_micros: i64,
+        extra_defines: *mut *const ::std::os::raw::c_char,
+        include_paths: *mut *const ::std::os::raw::c_char,
+    ) -> *mut CBMFileResult;
+}
+unsafe extern "C" {
     pub fn cbm_file_result_set_error(
         result: *mut CBMFileResult,
         code: *const ::std::os::raw::c_char,
