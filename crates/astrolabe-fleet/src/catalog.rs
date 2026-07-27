@@ -25,8 +25,8 @@ use serde::Serialize;
 use serde_json::json;
 
 use crate::record::{
-    FleetRepoRow, RepoRecord, TransitionContext, decode_repo_constellation,
-    encode_repo_constellation, repo_cx_id,
+    FleetRepoRow, RepoRecord, SourceRetirement, SourceRetirementStage, TransitionContext,
+    decode_repo_constellation, encode_repo_constellation, repo_cx_id,
 };
 use crate::state::{ALL_STATES, RepoState, check_transition};
 
@@ -46,6 +46,8 @@ pub const ASTRO_FLEET_REPORT_INVALID: &str = "ASTRO_FLEET_REPORT_INVALID";
 pub const ASTRO_FLEET_TIMESTAMP_REQUIRED: &str = "ASTRO_FLEET_TIMESTAMP_REQUIRED";
 /// Refusal code for an `update_facts` call that would change nothing (#451).
 pub const ASTRO_FLEET_FACTS_UNCHANGED: &str = "ASTRO_FLEET_FACTS_UNCHANGED";
+/// Refusal code for a mismatched source-retirement catalog transaction.
+pub const ASTRO_FLEET_SOURCE_RETIREMENT_STATE: &str = "ASTRO_FLEET_SOURCE_RETIREMENT_STATE";
 
 /// Declared vault id of the fleet catalog (a fixed ULID so every open
 /// resolves the same vault identity).
@@ -216,6 +218,7 @@ impl FleetCatalog {
             clone_bytes: None,
             store_bytes: None,
             checkout_exclusions: Vec::new(),
+            source_retirement: None,
         };
         let payload = serde_json::to_vec(&json!({
             "event": "fleet_repo_registered",
@@ -430,6 +433,279 @@ impl FleetCatalog {
             });
         }
         let payload = serde_json::to_vec(&payload).expect("static ledger payload serializes");
+        let (commit_seq, ledger_seq) = self.commit_row(&row, EntryKind::Admin, payload)?;
+        Ok(TransitionReport {
+            cx_id,
+            from: row.state,
+            to: row.state,
+            commit_seq,
+            ledger_seq,
+        })
+    }
+
+    /// Persists the write-ahead intent for one exact post-kernel source
+    /// retirement (#807). The row remains `kerneled`: its durable kernel still
+    /// exists and remains a fleet-composition input.
+    pub fn begin_source_retirement(
+        &self,
+        github_id: u64,
+        full_name: &str,
+        retirement: SourceRetirement,
+    ) -> Result<TransitionReport, CalyxError> {
+        require_timestamp(retirement.requested_at_unix_secs)?;
+        if retirement.stage != SourceRetirementStage::Intent {
+            return Err(source_retirement_error(
+                full_name,
+                format!(
+                    "new transaction {} starts at {}, expected intent",
+                    retirement.transaction_id,
+                    retirement.stage.as_str()
+                ),
+            ));
+        }
+        let cx_id = repo_cx_id(github_id, full_name, FLEET_VAULT_SALT);
+        let mut row = self.get(cx_id)?;
+        if row.state != RepoState::Kerneled {
+            return Err(source_retirement_error(
+                full_name,
+                format!("state {} is not kerneled", row.state.as_str()),
+            ));
+        }
+        if row
+            .source_retirement
+            .as_ref()
+            .is_some_and(|existing| existing.stage != SourceRetirementStage::Rehydrated)
+        {
+            return Err(source_retirement_error(
+                full_name,
+                "another source-retirement transaction is already durable".to_string(),
+            ));
+        }
+        if row.clone_path.as_deref() != Some(retirement.source_path.as_str())
+            || row.clone_bytes != Some(retirement.clone_bytes)
+            || row.head_commit_hash.as_deref() != Some(retirement.head_commit_hash.as_str())
+        {
+            return Err(source_retirement_error(
+                full_name,
+                "intent source path, bytes, or HEAD differs from the live catalog facts"
+                    .to_string(),
+            ));
+        }
+        row.source_retirement = Some(retirement.clone());
+        let payload = serde_json::to_vec(&json!({
+            "event": "fleet_source_retirement_intent",
+            "github_id": github_id,
+            "full_name": full_name,
+            "transaction_id": retirement.transaction_id,
+            "stage": retirement.stage.as_str(),
+            "at_unix_secs": retirement.requested_at_unix_secs,
+            "source_path": retirement.source_path,
+            "tombstone_path": retirement.tombstone_path,
+            "head_commit_hash": retirement.head_commit_hash,
+            "clone_bytes": retirement.clone_bytes,
+            "inventory_hash": retirement.inventory_hash,
+            "inventory_entries": retirement.inventory_entries,
+            "repo_members_hash": retirement.repo_members_hash,
+            "fleet_scope": retirement.fleet_scope,
+            "fleet_compose_input_hash": retirement.fleet_compose_input_hash,
+            "fleet_members_hash": retirement.fleet_members_hash,
+        }))
+        .expect("source retirement intent serializes");
+        let (commit_seq, ledger_seq) = self.commit_row(&row, EntryKind::Admin, payload)?;
+        Ok(TransitionReport {
+            cx_id,
+            from: row.state,
+            to: row.state,
+            commit_seq,
+            ledger_seq,
+        })
+    }
+
+    /// Advances an exact source-retirement transaction through its two
+    /// pre-finalization stages.
+    pub fn advance_source_retirement(
+        &self,
+        github_id: u64,
+        full_name: &str,
+        transaction_id: &str,
+        expected: SourceRetirementStage,
+        next: SourceRetirementStage,
+        at_unix_secs: u64,
+    ) -> Result<TransitionReport, CalyxError> {
+        require_timestamp(at_unix_secs)?;
+        let legal = matches!(
+            (expected, next),
+            (
+                SourceRetirementStage::Intent,
+                SourceRetirementStage::Renamed
+            ) | (
+                SourceRetirementStage::Renamed,
+                SourceRetirementStage::Deleting
+            )
+        );
+        if !legal {
+            return Err(source_retirement_error(
+                full_name,
+                format!(
+                    "illegal retirement stage advance {} -> {}",
+                    expected.as_str(),
+                    next.as_str()
+                ),
+            ));
+        }
+        let cx_id = repo_cx_id(github_id, full_name, FLEET_VAULT_SALT);
+        let mut row = self.get(cx_id)?;
+        let retirement = row.source_retirement.as_mut().ok_or_else(|| {
+            source_retirement_error(full_name, "row has no retirement transaction".to_string())
+        })?;
+        if retirement.transaction_id != transaction_id || retirement.stage != expected {
+            return Err(source_retirement_error(
+                full_name,
+                format!(
+                    "expected transaction {transaction_id} at {}, found {} at {}",
+                    expected.as_str(),
+                    retirement.transaction_id,
+                    retirement.stage.as_str()
+                ),
+            ));
+        }
+        retirement.stage = next;
+        let payload = serde_json::to_vec(&json!({
+            "event": "fleet_source_retirement_stage",
+            "github_id": github_id,
+            "full_name": full_name,
+            "transaction_id": transaction_id,
+            "from_stage": expected.as_str(),
+            "to_stage": next.as_str(),
+            "at_unix_secs": at_unix_secs,
+        }))
+        .expect("source retirement stage serializes");
+        let (commit_seq, ledger_seq) = self.commit_row(&row, EntryKind::Admin, payload)?;
+        Ok(TransitionReport {
+            cx_id,
+            from: row.state,
+            to: row.state,
+            commit_seq,
+            ledger_seq,
+        })
+    }
+
+    /// Finalizes exact source/tombstone absence, clears only live clone facts,
+    /// and retains the full retirement evidence on the row.
+    pub fn finalize_source_retirement(
+        &self,
+        github_id: u64,
+        full_name: &str,
+        transaction_id: &str,
+        at_unix_secs: u64,
+    ) -> Result<TransitionReport, CalyxError> {
+        require_timestamp(at_unix_secs)?;
+        let cx_id = repo_cx_id(github_id, full_name, FLEET_VAULT_SALT);
+        let mut row = self.get(cx_id)?;
+        let retirement = row.source_retirement.as_mut().ok_or_else(|| {
+            source_retirement_error(full_name, "row has no retirement transaction".to_string())
+        })?;
+        if retirement.transaction_id != transaction_id
+            || retirement.stage != SourceRetirementStage::Deleting
+        {
+            return Err(source_retirement_error(
+                full_name,
+                format!(
+                    "finalize expected transaction {transaction_id} at deleting, found {} at {}",
+                    retirement.transaction_id,
+                    retirement.stage.as_str()
+                ),
+            ));
+        }
+        if row.clone_path.as_deref() != Some(retirement.source_path.as_str())
+            || row.clone_bytes != Some(retirement.clone_bytes)
+            || row.head_commit_hash.as_deref() != Some(retirement.head_commit_hash.as_str())
+        {
+            return Err(source_retirement_error(
+                full_name,
+                "live clone facts drifted after retirement intent".to_string(),
+            ));
+        }
+        retirement.stage = SourceRetirementStage::Retired;
+        retirement.completed_at_unix_secs = Some(at_unix_secs);
+        row.clone_path = None;
+        row.clone_bytes = None;
+        let payload = serde_json::to_vec(&json!({
+            "event": "fleet_source_retirement_finalized",
+            "github_id": github_id,
+            "full_name": full_name,
+            "transaction_id": transaction_id,
+            "stage": SourceRetirementStage::Retired.as_str(),
+            "at_unix_secs": at_unix_secs,
+            "head_commit_hash": retirement.head_commit_hash,
+            "inventory_hash": retirement.inventory_hash,
+            "repo_members_hash": retirement.repo_members_hash,
+            "fleet_scope": retirement.fleet_scope,
+            "fleet_compose_input_hash": retirement.fleet_compose_input_hash,
+            "fleet_members_hash": retirement.fleet_members_hash,
+        }))
+        .expect("source retirement finalization serializes");
+        let (commit_seq, ledger_seq) = self.commit_row(&row, EntryKind::Admin, payload)?;
+        Ok(TransitionReport {
+            cx_id,
+            from: row.state,
+            to: row.state,
+            commit_seq,
+            ledger_seq,
+        })
+    }
+
+    /// Restores live clone facts on an exactly retired kernel without
+    /// changing its durable lifecycle state or discarding kernel history.
+    pub fn rehydrate_source(
+        &self,
+        github_id: u64,
+        full_name: &str,
+        at_unix_secs: u64,
+        clone_path: String,
+        head_commit_hash: String,
+        clone_bytes: u64,
+        checkout_exclusions: Vec<String>,
+    ) -> Result<TransitionReport, CalyxError> {
+        require_timestamp(at_unix_secs)?;
+        let cx_id = repo_cx_id(github_id, full_name, FLEET_VAULT_SALT);
+        let mut row = self.get(cx_id)?;
+        let retirement = row.source_retirement.as_mut().ok_or_else(|| {
+            source_retirement_error(full_name, "row has no retirement transaction".to_string())
+        })?;
+        if row.state != RepoState::Kerneled
+            || retirement.stage != SourceRetirementStage::Retired
+            || row.clone_path.is_some()
+            || row.clone_bytes.is_some()
+        {
+            return Err(source_retirement_error(
+                full_name,
+                format!(
+                    "rehydration requires a kerneled, retired row with no live clone facts; state={}, stage={}, clone_path_present={}, clone_bytes_present={}",
+                    row.state.as_str(),
+                    retirement.stage.as_str(),
+                    row.clone_path.is_some(),
+                    row.clone_bytes.is_some()
+                ),
+            ));
+        }
+        retirement.stage = SourceRetirementStage::Rehydrated;
+        row.clone_path = Some(clone_path.clone());
+        row.head_commit_hash = Some(head_commit_hash.clone());
+        row.clone_bytes = Some(clone_bytes);
+        row.checkout_exclusions = checkout_exclusions;
+        let payload = serde_json::to_vec(&json!({
+            "event": "fleet_source_rehydrated",
+            "github_id": github_id,
+            "full_name": full_name,
+            "transaction_id": retirement.transaction_id,
+            "stage": SourceRetirementStage::Rehydrated.as_str(),
+            "at_unix_secs": at_unix_secs,
+            "clone_path": clone_path,
+            "head_commit_hash": head_commit_hash,
+            "clone_bytes": clone_bytes,
+        }))
+        .expect("source rehydration serializes");
         let (commit_seq, ledger_seq) = self.commit_row(&row, EntryKind::Admin, payload)?;
         Ok(TransitionReport {
             cx_id,
@@ -863,6 +1139,14 @@ pub fn run_report_key(run_id: &str) -> Vec<u8> {
     key.extend_from_slice(RUN_REPORT_NAMESPACE);
     key.extend_from_slice(run_id.as_bytes());
     key
+}
+
+fn source_retirement_error(full_name: &str, detail: String) -> CalyxError {
+    CalyxError {
+        code: ASTRO_FLEET_SOURCE_RETIREMENT_STATE,
+        message: format!("source-retirement state for {full_name} is inconsistent: {detail}"),
+        remediation: "preserve the source/tombstone and catalog bytes; resume only the exact durable transaction after repairing the named mismatch",
+    }
 }
 
 fn require_timestamp(at_unix_secs: u64) -> Result<(), CalyxError> {

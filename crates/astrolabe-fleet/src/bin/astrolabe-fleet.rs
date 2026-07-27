@@ -22,9 +22,13 @@
 //!                              [--nomic-dir <dir>] (--repo <owner/name> ... | --all-cloned)
 //!                              [--limit <n>] [--parallelism <n>] [--timeout-secs <n>]
 //!                              [--force] [--at <unix-secs>]
+//! astrolabe-fleet retire-source [--root <dir>] [--farm-root <dir>]
+//!                              [--store-root <dir>] [--scope <fleet-scope>]
+//!                              --repo <owner/name> ... [--at <unix-secs>]
 //! astrolabe-fleet grow         [--root <dir>] (--once | --cycles <n>) [--interval-secs <n>]
 //!                              [--scope <fleet-scope>] [--discovery] [--language <csv>]
 //!                              [--star-floor <n>] [--acquire] [--retry-quarantined]
+//!                              [--retire-sources]
 //!                              [--force-repo <owner/name> ...] [--max-repos-per-cycle <n>]
 //!                              [--debt-threshold-repos <n>] [--farm-root <dir>]
 //!                              [--store-root <dir>] [--astrolabe-bin <exe>] [--nomic-dir <dir>]
@@ -66,7 +70,7 @@ use astrolabe_fleet::state::RepoState;
 use calyx_core::{CalyxError, CxId};
 use serde_json::json;
 
-const USAGE: &str = "usage: astrolabe-fleet <catalog-init|register|set-state|get|list|discover|clone|pipeline|grow|ledger-scan|report|report-read|report-list|run-report-read|probe-vault-keys|dedup-census|compose|kernel-read> [--root <dir>] [verb options]; see crate docs";
+const USAGE: &str = "usage: astrolabe-fleet <catalog-init|register|set-state|get|list|discover|clone|pipeline|retire-source|grow|ledger-scan|report|report-read|report-list|run-report-read|probe-vault-keys|dedup-census|compose|kernel-read> [--root <dir>] [verb options]; see crate docs";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -100,13 +104,14 @@ fn run(args: &[String]) -> Result<(), CalyxError> {
     // for the whole pass; read verbs stay lock-free. A second mutating pass on
     // the same root refuses fail-closed (ASTRO_FLEET_FARM_LOCKED) instead of
     // racing the store the way the 2026-07-16 dual retry-release did (#460).
-    const MUTATING_VERBS: [&str; 10] = [
+    const MUTATING_VERBS: [&str; 11] = [
         "catalog-init",
         "register",
         "set-state",
         "discover",
         "clone",
         "pipeline",
+        "retire-source",
         "grow",
         "report",
         "dedup-census",
@@ -429,6 +434,38 @@ fn run(args: &[String]) -> Result<(), CalyxError> {
             println!("{report}");
             Ok(())
         }
+        "retire-source" => {
+            opts.reject_unknown(&["root", "farm-root", "store-root", "scope", "repo", "at"])?;
+            let repos: Vec<String> = opts
+                .get_all("repo")
+                .into_iter()
+                .map(str::to_string)
+                .collect();
+            if repos.is_empty() {
+                return Err(usage(
+                    "retire-source needs at least one --repo <owner/name>",
+                ));
+            }
+            let config = astrolabe_fleet::retirement::RetirementConfig {
+                farm_root: PathBuf::from(
+                    opts.get("farm-root")
+                        .unwrap_or(astrolabe_fleet::clone_farm::DEFAULT_FARM_ROOT),
+                ),
+                store_root: PathBuf::from(
+                    opts.get("store-root")
+                        .unwrap_or(astrolabe_fleet::orchestrator::DEFAULT_STORE_ROOT),
+                ),
+                scope: opts.get("scope").unwrap_or("fleet:rust:v1").to_string(),
+                at_unix_secs: opts.at_or_now()?,
+            };
+            let outcome =
+                astrolabe_fleet::retirement::run_source_retirement_pass(&catalog, &config, &repos)?;
+            if let Some(refusal) = outcome.refusal {
+                return Err(refusal);
+            }
+            println!("{}", outcome.report);
+            Ok(())
+        }
         "grow" => {
             opts.reject_unknown(&[
                 "root",
@@ -445,6 +482,7 @@ fn run(args: &[String]) -> Result<(), CalyxError> {
                 "discovery",
                 "acquire",
                 "retry-quarantined",
+                "retire-sources",
                 "force-repo",
                 "max-repos-per-cycle",
                 "debt-threshold-repos",
@@ -572,6 +610,7 @@ fn run(args: &[String]) -> Result<(), CalyxError> {
             config.discovery = opts.flag("discovery");
             config.acquire = opts.flag("acquire");
             config.retry_quarantined = opts.flag("retry-quarantined");
+            config.retire_sources = opts.flag("retire-sources");
             config.force_repos = opts
                 .get_all("force-repo")
                 .into_iter()

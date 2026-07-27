@@ -22,17 +22,19 @@
 //! head, which the update fetch advances). Classes, in priority order:
 //!
 //! 1. **forced** — operator-named `--force-repo` refreshes;
-//! 2. **stale** — kerneled with `indexed_commit_hash != head_commit_hash`,
+//! 2. **rehydrate** — retired kerneled sources selected by force or whose
+//!    discovery `pushed_at` advanced since retirement (#807);
+//! 3. **stale** — kerneled with `indexed_commit_hash != head_commit_hash`,
 //!    plus kerneled rows with *unknown* grounding (pre-#457 rows the ledger
 //!    backfill could not ground — they fail toward re-work, never toward a
 //!    silent skip);
-//! 3. **resume** — `cloned`/`indexed` rows a crashed run left mid-pipeline;
-//! 4. **re-entrant** — `discovered` rows that already carry a clone
+//! 4. **resume** — `cloned`/`indexed` rows a crashed run left mid-pipeline;
+//! 5. **re-entrant** — `discovered` rows that already carry a clone
 //!    investment (`clone_path` set: quarantine retry releases and reappeared
 //!    repos). Selected without `--acquire`: production FSV showed a retried
 //!    repo otherwise competes against the entire discovered backlog on stars
 //!    (or, without `--acquire`, can never re-enter at all);
-//! 5. **acquire** — fresh `discovered` rows, only with `--acquire`
+//! 6. **acquire** — fresh `discovered` rows, only with `--acquire`
 //!    (scale-wave intake is #460's go/no-go decision, not an implicit side
 //!    effect).
 //!
@@ -103,7 +105,8 @@ use crate::orchestrator::{
     PipelineConfig, SHADOW_VAULT_ID, kernel_scope_id, project_name, run_pipeline_pass_outcome,
     shadow_vault_salt,
 };
-use crate::record::TransitionContext;
+use crate::record::{SourceRetirementStage, TransitionContext};
+use crate::retirement::{RetirementConfig, run_source_retirement_pass};
 use crate::state::RepoState;
 
 /// Refusal code when a growth cycle (or the grow loop) recorded any error.
@@ -207,6 +210,8 @@ pub struct GrowConfig {
     pub acquire: bool,
     /// Release quarantined repos back to `discovered` for a retry.
     pub retry_quarantined: bool,
+    /// Retire successfully composed source checkouts after each cycle (#807).
+    pub retire_sources: bool,
     /// Operator-named kerneled repos to force-refresh this cycle.
     pub force_repos: Vec<String>,
     /// Bounded (re-)index work per cycle ([`KNOB_MAX_REPOS_PER_CYCLE`]).
@@ -234,6 +239,7 @@ impl GrowConfig {
             discovery: false,
             acquire: false,
             retry_quarantined: false,
+            retire_sources: false,
             force_repos: Vec::new(),
             max_repos_per_cycle: knob_default(KNOB_MAX_REPOS_PER_CYCLE),
             debt_threshold_repos: knob_default(KNOB_DEBT_THRESHOLD),
@@ -601,17 +607,32 @@ pub fn run_growth_cycle(catalog: &FleetCatalog, config: &GrowConfig) -> Result<V
         .filter(|name| known.contains(name))
         .collect();
     let mut forced: Vec<(u64, String)> = Vec::new();
+    let mut rehydrate: Vec<(u64, String)> = Vec::new();
     let mut stale: Vec<(u64, String, Value)> = Vec::new();
     let mut resume: Vec<(u64, String)> = Vec::new();
     let mut reentrant: Vec<(u64, String)> = Vec::new();
     let mut acquire: Vec<(u64, String)> = Vec::new();
     for row in &rows {
         let name = row.record.full_name.clone();
+        let retired = row
+            .source_retirement
+            .as_ref()
+            .filter(|retirement| retirement.stage == SourceRetirementStage::Retired);
         if forced_set.contains(name.as_str()) {
-            forced.push((row.record.stars, name));
+            if retired.is_some() {
+                rehydrate.push((row.record.stars, name));
+            } else {
+                forced.push((row.record.stars, name));
+            }
             continue;
         }
         match row.state {
+            RepoState::Kerneled
+                if retired
+                    .is_some_and(|retirement| retirement.pushed_at != row.record.pushed_at) =>
+            {
+                rehydrate.push((row.record.stars, name));
+            }
             RepoState::Kerneled => match (&row.indexed_commit_hash, &row.head_commit_hash) {
                 (Some(grounded), Some(head)) if grounded != head => {
                     stale.push((
@@ -646,7 +667,13 @@ pub fn run_growth_cycle(catalog: &FleetCatalog, config: &GrowConfig) -> Result<V
             _ => {}
         }
     }
-    for class in [&mut forced, &mut resume, &mut reentrant, &mut acquire] {
+    for class in [
+        &mut forced,
+        &mut rehydrate,
+        &mut resume,
+        &mut reentrant,
+        &mut acquire,
+    ] {
         class.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
     }
     stale.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
@@ -661,6 +688,10 @@ pub fn run_growth_cycle(catalog: &FleetCatalog, config: &GrowConfig) -> Result<V
     let mut remaining = config.max_repos_per_cycle as usize;
     let (selected_forced, deferred_forced) = take_within(
         forced.iter().map(|(_, n)| n.clone()).collect(),
+        &mut remaining,
+    );
+    let (selected_rehydrate, deferred_rehydrate) = take_within(
+        rehydrate.iter().map(|(_, n)| n.clone()).collect(),
         &mut remaining,
     );
     let (selected_stale, deferred_stale) = take_within(
@@ -682,6 +713,7 @@ pub fn run_growth_cycle(catalog: &FleetCatalog, config: &GrowConfig) -> Result<V
     let selection = json!({
         "candidates": {
             "forced": forced.len(),
+            "rehydrate": rehydrate.len(),
             "stale": stale.len(),
             "resume": resume.len(),
             "reentrant": reentrant.len(),
@@ -690,6 +722,7 @@ pub fn run_growth_cycle(catalog: &FleetCatalog, config: &GrowConfig) -> Result<V
         "stale_detail": stale.iter().map(|(_, name, why)| json!({"full_name": name, "why": why})).collect::<Vec<_>>(),
         "selected": {
             "forced": selected_forced,
+            "rehydrate": selected_rehydrate,
             "stale": selected_stale,
             "resume": selected_resume,
             "reentrant": selected_reentrant,
@@ -697,11 +730,13 @@ pub fn run_growth_cycle(catalog: &FleetCatalog, config: &GrowConfig) -> Result<V
         },
         "deferred": {
             "forced": deferred_forced,
+            "rehydrate": deferred_rehydrate,
             "stale": deferred_stale,
             "resume": deferred_resume,
             "reentrant": deferred_reentrant,
             "acquire": deferred_acquire,
             "total": deferred_forced
+                + deferred_rehydrate
                 + deferred_stale
                 + deferred_resume
                 + deferred_reentrant
@@ -713,7 +748,7 @@ pub fn run_growth_cycle(catalog: &FleetCatalog, config: &GrowConfig) -> Result<V
     // Phase 5: acquire clones for selected `discovered` rows (re-entrants
     // adopt or recover their existing clone; fresh acquires download).
     let mut clone_attribution: BTreeMap<u64, RepoState> = BTreeMap::new();
-    let clone_names: Vec<String> = ["reentrant", "acquire"]
+    let clone_names: Vec<String> = ["rehydrate", "reentrant", "acquire"]
         .iter()
         .flat_map(|class| {
             selection["selected"][*class]
@@ -738,6 +773,9 @@ pub fn run_growth_cycle(catalog: &FleetCatalog, config: &GrowConfig) -> Result<V
                         Some("acquired") | Some("adopted") | Some("recovered") => {
                             clone_attribution.insert(github_id, RepoState::Cloned);
                         }
+                        Some("rehydrated") => {
+                            clone_attribution.insert(github_id, RepoState::Kerneled);
+                        }
                         Some("quarantined") => {
                             clone_attribution.insert(github_id, RepoState::Quarantined);
                         }
@@ -760,7 +798,14 @@ pub fn run_growth_cycle(catalog: &FleetCatalog, config: &GrowConfig) -> Result<V
     // stale/forced ones that must re-run.
     let mut pipeline_attribution: BTreeMap<u64, RepoState> = BTreeMap::new();
     let mut worklist: Vec<String> = Vec::new();
-    for list in ["forced", "stale", "resume", "reentrant", "acquire"] {
+    for list in [
+        "forced",
+        "rehydrate",
+        "stale",
+        "resume",
+        "reentrant",
+        "acquire",
+    ] {
         if let Some(names) = selection["selected"][list].as_array() {
             worklist.extend(names.iter().filter_map(|v| v.as_str().map(str::to_string)));
         }
@@ -931,7 +976,46 @@ pub fn run_growth_cycle(catalog: &FleetCatalog, config: &GrowConfig) -> Result<V
         })
     };
 
-    // Phase 8: reconciliation — independent AFTER snapshot; every observed
+    // Phase 8: optional post-compose source retirement (#807). The retirement
+    // path independently proves each exact per-repo kernel is present in the
+    // current fleet sidecar/artifact before reclaiming its checkout.
+    let retirement = if config.retire_sources {
+        let workset: BTreeSet<&str> = worklist.iter().map(String::as_str).collect();
+        let eligible: Vec<String> = catalog
+            .query(Some(RepoState::Kerneled), None)?
+            .into_iter()
+            .filter(|row| {
+                workset.contains(row.record.full_name.as_str()) && row.clone_path.is_some()
+            })
+            .map(|row| row.record.full_name)
+            .collect();
+        if eligible.is_empty() {
+            json!({"skipped": "no successfully kerneled source checkout from this cycle"})
+        } else {
+            let retirement_config = RetirementConfig {
+                farm_root: config.farm.farm_root.clone(),
+                store_root: config.pipeline.store_root.clone(),
+                scope: config.scope.clone(),
+                at_unix_secs: at,
+            };
+            match run_source_retirement_pass(catalog, &retirement_config, &eligible) {
+                Ok(outcome) => {
+                    if let Some(refusal) = &outcome.refusal {
+                        errors.push(cycle_error("source-retirement", refusal));
+                    }
+                    outcome.report
+                }
+                Err(error) => {
+                    errors.push(cycle_error("source-retirement", &error));
+                    json!({"error": error.code})
+                }
+            }
+        }
+    } else {
+        json!({"skipped": "source retirement not requested this cycle"})
+    };
+
+    // Phase 9: reconciliation — independent AFTER snapshot; every observed
     // state change must be attributed to a phase verdict of this cycle.
     let after_rows = catalog.query(None, None)?;
     let counts_after = catalog.counts_by_state()?;
@@ -1026,6 +1110,7 @@ pub fn run_growth_cycle(catalog: &FleetCatalog, config: &GrowConfig) -> Result<V
             "discovery": config.discovery,
             "acquire": config.acquire,
             "retry_quarantined": config.retry_quarantined,
+            "retire_sources": config.retire_sources,
             "force_repos": config.force_repos,
             "max_repos_per_cycle": config.max_repos_per_cycle,
             "debt_threshold_repos": config.debt_threshold_repos,
@@ -1039,6 +1124,7 @@ pub fn run_growth_cycle(catalog: &FleetCatalog, config: &GrowConfig) -> Result<V
         "acquire_report": acquire_report,
         "pipeline": pipeline_report,
         "debt": debt_report,
+        "source_retirement": retirement,
         "reconcile": reconcile,
         "errors": errors,
         "wall_secs": started.elapsed().as_secs_f64(),

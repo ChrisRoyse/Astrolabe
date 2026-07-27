@@ -161,6 +161,9 @@ pub enum Outcome {
     Adopted,
     /// A torn/broken target directory was removed and re-cloned clean.
     Recovered,
+    /// A deliberately retired kerneled source was cloned again without
+    /// discarding its durable store/kernel history (#807).
+    Rehydrated,
     /// Update fetch moved the head watermark.
     Updated,
     /// Update fetch found nothing new — explicit no-op.
@@ -274,6 +277,21 @@ pub fn run_clone_pass_outcome(
     } else {
         &[RepoState::Discovered]
     };
+    let retired_source = |row: &FleetRepoRow| {
+        row.state == RepoState::Kerneled
+            && row.clone_path.is_none()
+            && row.clone_bytes.is_none()
+            && row.source_retirement.as_ref().is_some_and(|retirement| {
+                retirement.stage == crate::record::SourceRetirementStage::Retired
+            })
+    };
+    let eligible = |row: &FleetRepoRow, explicit: bool| {
+        if update {
+            source_states.contains(&row.state) && row.clone_path.is_some()
+        } else {
+            source_states.contains(&row.state) || (explicit && retired_source(row))
+        }
+    };
     let all_rows = catalog.query(None, None)?;
     let mut selected: Vec<FleetRepoRow> = Vec::new();
     let mut skipped_state: Vec<RepoOutcome> = Vec::new();
@@ -282,7 +300,7 @@ pub fn run_clone_pass_outcome(
             let wanted: BTreeSet<&str> = names.iter().map(String::as_str).collect();
             for row in &all_rows {
                 if wanted.contains(row.record.full_name.as_str()) {
-                    if source_states.contains(&row.state) {
+                    if eligible(row, true) {
                         selected.push(row.clone());
                     } else {
                         skipped_state.push(RepoOutcome {
@@ -316,7 +334,7 @@ pub fn run_clone_pass_outcome(
         }
         Selection::All { limit } => {
             for row in &all_rows {
-                if source_states.contains(&row.state) {
+                if eligible(row, false) {
                     selected.push(row.clone());
                 }
             }
@@ -405,7 +423,7 @@ pub fn run_clone_pass_outcome(
         // deadline generously exceeds the per-repo git timeout, so a worker
         // that dies without sending (panic) surfaces as a structured error
         // instead of a hung pass.
-        let result = rx
+        let mut result = rx
             .recv_timeout(Duration::from_secs(config.timeout_secs.saturating_mul(2) + 120))
             .map_err(|error| CalyxError {
                 code: ASTRO_FLEET_GIT_SPAWN,
@@ -423,23 +441,43 @@ pub fn run_clone_pass_outcome(
             Outcome::Acquired | Outcome::Adopted | Outcome::Recovered => {
                 let head = result.head.clone().expect("gated outcomes carry a head");
                 let bytes = result.bytes.expect("gated outcomes carry bytes");
-                catalog.transition(
-                    result.row.record.github_id,
-                    &result.row.record.full_name,
-                    RepoState::Cloned,
-                    TransitionContext {
-                        at_unix_secs: config.at_unix_secs,
-                        clone_path: Some(
-                            target_dir(&config.farm_root, &result.row.record.full_name)
-                                .display()
-                                .to_string(),
+                let path = target_dir(&config.farm_root, &result.row.record.full_name)
+                    .display()
+                    .to_string();
+                if retired_source(&result.row) {
+                    let exclusions = result.exclusions.clone().ok_or_else(|| CalyxError {
+                        code: ASTRO_FLEET_GIT_SPAWN,
+                        message: format!(
+                            "successful rehydration of {} carried no checkout-exclusions readback",
+                            result.row.record.full_name
                         ),
-                        head_commit_hash: Some(head),
-                        clone_bytes: Some(bytes),
-                        checkout_exclusions: result.exclusions.clone(),
-                        ..TransitionContext::default()
-                    },
-                )?;
+                        remediation: "internal defect: every successful acquisition must report the exact checkout exclusions",
+                    })?;
+                    catalog.rehydrate_source(
+                        result.row.record.github_id,
+                        &result.row.record.full_name,
+                        config.at_unix_secs,
+                        path,
+                        head,
+                        bytes,
+                        exclusions,
+                    )?;
+                    result.outcome = Outcome::Rehydrated;
+                } else {
+                    catalog.transition(
+                        result.row.record.github_id,
+                        &result.row.record.full_name,
+                        RepoState::Cloned,
+                        TransitionContext {
+                            at_unix_secs: config.at_unix_secs,
+                            clone_path: Some(path),
+                            head_commit_hash: Some(head),
+                            clone_bytes: Some(bytes),
+                            checkout_exclusions: result.exclusions.clone(),
+                            ..TransitionContext::default()
+                        },
+                    )?;
+                }
                 farm_bytes += bytes;
             }
             Outcome::Updated => {
@@ -466,6 +504,7 @@ pub fn run_clone_pass_outcome(
             // No catalog mutation: explicit no-op, foreign-content conflict,
             // or a kept-state update failure — all counted below.
             Outcome::Noop
+            | Outcome::Rehydrated
             | Outcome::Conflict
             | Outcome::UpdateFailed
             | Outcome::SkippedState
@@ -490,6 +529,7 @@ pub fn run_clone_pass_outcome(
         "acquired": count(Outcome::Acquired),
         "adopted": count(Outcome::Adopted),
         "recovered": count(Outcome::Recovered),
+        "rehydrated": count(Outcome::Rehydrated),
         "updated": count(Outcome::Updated),
         "noop": count(Outcome::Noop),
         "skipped_state": count(Outcome::SkippedState),
@@ -1176,7 +1216,7 @@ fn measure_dir_bytes(dir: &Path) -> u64 {
 
 /// URL equivalence for adoption: scheme-insensitive host + path, tolerant of a
 /// trailing `.git`.
-fn same_remote(a: &str, b: &str) -> bool {
+pub(crate) fn same_remote(a: &str, b: &str) -> bool {
     let norm = |url: &str| {
         url.trim()
             .trim_end_matches('/')
@@ -1191,7 +1231,7 @@ fn same_remote(a: &str, b: &str) -> bool {
 
 /// Integrity gate: `rev-parse HEAD` + `fsck --connectivity-only`.
 /// Returns the head SHA or the failing detail.
-fn integrity_gate(dir: &Path) -> Result<String, String> {
+pub(crate) fn integrity_gate(dir: &Path) -> Result<String, String> {
     let (ok, head, stderr) = match git_capture(&["rev-parse", "HEAD"], dir) {
         Ok(triple) => triple,
         Err(error) => return Err(format!("rev-parse spawn failed: {}", error.message)),

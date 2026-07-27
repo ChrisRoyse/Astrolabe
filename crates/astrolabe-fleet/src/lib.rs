@@ -31,6 +31,7 @@ pub mod farm_lock;
 pub mod grow;
 pub mod orchestrator;
 pub mod record;
+pub mod retirement;
 pub mod state;
 
 pub use catalog::{
@@ -58,8 +59,12 @@ pub use orchestrator::{
     PipelineConfig, run_pipeline_pass,
 };
 pub use record::{
-    FLEET_PANEL_VERSION, FleetRepoRow, RepoRecord, TransitionContext, repo_cx_id,
-    repo_identity_bytes,
+    FLEET_PANEL_VERSION, FleetRepoRow, RepoRecord, SourceRetirement, SourceRetirementStage,
+    TransitionContext, repo_cx_id, repo_identity_bytes,
+};
+pub use retirement::{
+    ASTRO_FLEET_SOURCE_RETIREMENT_INCOMPLETE, ASTRO_FLEET_SOURCE_RETIREMENT_REFUSED,
+    RetirementConfig, RetirementPassOutcome, run_source_retirement_pass,
 };
 pub use state::{
     ASTRO_FLEET_ILLEGAL_TRANSITION, ASTRO_FLEET_UNKNOWN_STATE, RepoState, check_transition,

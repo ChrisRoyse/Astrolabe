@@ -98,6 +98,9 @@ pub const META_QUARANTINE_REASON: &str = "quarantine_reason";
 pub const META_CHECKOUT_EXCLUSIONS: &str = "checkout_exclusions";
 /// Recorded reason, required when marking a repo departed (#450).
 pub const META_DEPARTED_REASON: &str = "departed_reason";
+/// Durable post-kernel source-retirement transaction (#807), encoded as one
+/// typed JSON object. The ledger retains every prior version.
+pub const META_SOURCE_RETIREMENT: &str = "source_retirement";
 /// Prefix of per-transition timestamp keys: `ts_<state>` = unix seconds the
 /// record entered `<state>`.
 pub const META_TS_PREFIX: &str = "ts_";
@@ -214,6 +217,72 @@ pub struct TransitionContext {
     pub checkout_exclusions: Option<Vec<String>>,
 }
 
+/// Durable stage of one post-kernel source-retirement transaction (#807).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceRetirementStage {
+    /// Catalog intent is durable; the checkout has not yet been authoritatively renamed.
+    Intent,
+    /// The checkout was renamed and its no-follow inventory was re-read.
+    Renamed,
+    /// Deletion authority is durable; partial deletion may resume on the bound tombstone.
+    Deleting,
+    /// Source and tombstone are absent and live clone facts are clear.
+    Retired,
+    /// A later exact clone restored the source without discarding kernel history.
+    Rehydrated,
+}
+
+impl SourceRetirementStage {
+    /// Stable ledger/report spelling.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Intent => "intent",
+            Self::Renamed => "renamed",
+            Self::Deleting => "deleting",
+            Self::Retired => "retired",
+            Self::Rehydrated => "rehydrated",
+        }
+    }
+}
+
+/// Exact evidence binding a source checkout to its durable per-repo and fleet
+/// kernels before the checkout can be reclaimed.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SourceRetirement {
+    /// Deterministic transaction identity.
+    pub transaction_id: String,
+    /// Current durable transaction stage.
+    pub stage: SourceRetirementStage,
+    /// Unix seconds at which retirement was requested.
+    pub requested_at_unix_secs: u64,
+    /// Unix seconds at which source/tombstone absence was finalized.
+    #[serde(default)]
+    pub completed_at_unix_secs: Option<u64>,
+    /// Canonical source checkout path.
+    pub source_path: String,
+    /// Same-volume tombstone path owned by this transaction.
+    pub tombstone_path: String,
+    /// Exact Git HEAD retired.
+    pub head_commit_hash: String,
+    /// Discovery watermark at retirement; later drift triggers rehydration.
+    pub pushed_at: String,
+    /// Measured checkout bytes before retirement.
+    pub clone_bytes: u64,
+    /// Deterministic no-follow inventory hash.
+    pub inventory_hash: String,
+    /// Number of inventory entries beneath the checkout.
+    pub inventory_entries: u64,
+    /// Persisted per-repo kernel members hash.
+    pub repo_members_hash: String,
+    /// Cumulative fleet scope that already includes the repo.
+    pub fleet_scope: String,
+    /// Exact cumulative composition input identity.
+    pub fleet_compose_input_hash: String,
+    /// Exact cumulative fleet members hash.
+    pub fleet_members_hash: String,
+}
+
 /// One decoded catalog row: the discovery facts plus the lifecycle fields.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct FleetRepoRow {
@@ -249,6 +318,8 @@ pub struct FleetRepoRow {
     /// checkout (#480), reason-annotated. Empty means the checkout is
     /// complete — the normal case.
     pub checkout_exclusions: Vec<String>,
+    /// Latest post-kernel source-retirement transaction, when any.
+    pub source_retirement: Option<SourceRetirement>,
 }
 
 /// Canonical identity bytes of a repository record:
@@ -331,6 +402,12 @@ pub fn encode_repo_constellation(
         metadata.insert(
             META_CHECKOUT_EXCLUSIONS.to_string(),
             serde_json::to_string(&row.checkout_exclusions).expect("string array serializes"),
+        );
+    }
+    if let Some(retirement) = &row.source_retirement {
+        metadata.insert(
+            META_SOURCE_RETIREMENT.to_string(),
+            serde_json::to_string(retirement).expect("source retirement serializes"),
         );
     }
     for (key, at) in &row.state_timestamps {
@@ -463,6 +540,14 @@ pub fn decode_repo_constellation(
                     "metadata {META_CHECKOUT_EXCLUSIONS:?} is not a JSON string array: {error}"
                 ))
             })?,
+        },
+        source_retirement: match constellation.metadata.get(META_SOURCE_RETIREMENT) {
+            None => None,
+            Some(raw) => Some(serde_json::from_str(raw).map_err(|error| {
+                corrupt(format!(
+                    "metadata {META_SOURCE_RETIREMENT:?} is not a source-retirement object: {error}"
+                ))
+            })?),
         },
     })
 }
