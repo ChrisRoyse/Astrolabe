@@ -21,7 +21,7 @@ use calyx_aster::cf::{ColumnFamily, XTermKind, xterm_key};
 use calyx_aster::mvcc::tombstone_value;
 use calyx_aster::vault::AsterVault;
 use calyx_core::{CalyxError, Clock, CxId, LedgerRef, SlotId, VaultStore};
-use calyx_ledger::{ActorId, EntryKind, RedactionPolicy, SubjectId};
+use calyx_ledger::{ActorId, EntryKind, SubjectId};
 use calyx_loom::agreement_graph::XtermRow;
 use calyx_loom::{
     CrossTermKey, CrossTermKind as LoomCrossTermKind, CrossTermValue as LoomCrossTermValue,
@@ -246,8 +246,6 @@ where
         "xterm_dump_hash": xterm_dump_hash,
     }))
     .map_err(|error| xterm_corrupt(format!("encode eager xterm ledger payload: {error}")))?;
-    RedactionPolicy::check_payload(&payload)?;
-
     let subject = SubjectId::Query(format!("astrolabe-eager-xterm:{xterm_dump_hash}").into_bytes());
     let actor = ActorId::Service(actor);
     let mut fsv_plan = VaultMutationPlan::new(

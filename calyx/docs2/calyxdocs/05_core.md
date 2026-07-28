@@ -201,7 +201,6 @@ wire code, constructor, PRD meaning, PRD remediation.
 | 17 | `CALYX_LEDGER_CHAIN_BROKEN` | `ledger_chain_broken` | hash-chain verify failed | quarantine range, investigate |
 | 18 | `CALYX_LEDGER_CORRUPT` | `ledger_corrupt` | ledger CF integrity violation | ledger CF integrity violation — run verify_chain to identify range |
 | 19 | `CALYX_LEDGER_APPEND_ONLY_VIOLATION` | `ledger_append_only_violation` | ledger CF append-only invariant violated | ledger CF is append-only; deletes and tombstones are forbidden |
-| 20 | `CALYX_LEDGER_SECRET_IN_PAYLOAD` | `ledger_secret_in_payload` | ledger payload contains secret-like material | ledger payload must store hashes/ids only — redact before writing |
 | 21 | `CALYX_LEDGER_ACTOR_TOO_LONG` | `ledger_actor_too_long` | ledger actor id exceeds 64 UTF-8 bytes | actor id must be <= 64 bytes UTF-8 |
 | 22 | `CALYX_LEDGER_GROUP_COMMIT_FAILED` | `ledger_group_commit_failed` | ledger hook failed during group commit | ledger hook failed — group-commit rolled back; retry the write |
 | 23 | `CALYX_REPRODUCE_NONDETERMINISTIC` | `reproduce_nondeterministic` | reproduce ledger entry lacks determinism seed | no determinism seed in ledger entry - cannot guarantee reproduce fidelity |

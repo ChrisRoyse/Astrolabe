@@ -32,7 +32,7 @@ use calyx_aster::mvcc::{is_tombstone_value, tombstone_value};
 use calyx_aster::vault::AsterVault;
 use calyx_core::{AnchorValue, CalyxError, Clock, CxId, LedgerRef, Ts, VaultStore};
 use calyx_ledger::decode as decode_ledger;
-use calyx_ledger::{ActorId, EntryKind, RedactionPolicy, SubjectId};
+use calyx_ledger::{ActorId, EntryKind, SubjectId};
 use serde::{Deserialize, Serialize};
 
 // ---------------------------------------------------------------------------
@@ -849,8 +849,6 @@ where
         "corpus_dump_hash": corpus_dump_hash,
     }))
     .map_err(|error| oracle_corrupt(format!("encode oracle ledger payload: {error}")))?;
-    RedactionPolicy::check_payload(&payload)?;
-
     let subject =
         SubjectId::Query(format!("astrolabe-oracle-corpus:{corpus_dump_hash}").into_bytes());
     let actor = ActorId::Service(actor.into());

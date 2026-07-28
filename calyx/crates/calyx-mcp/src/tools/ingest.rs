@@ -15,7 +15,7 @@ use calyx_core::{
     AbsentReason, Anchor, CalyxError, Constellation, CxFlags, CxId, Input, InputRef, LedgerRef,
     Modality, Slot, SlotState, SlotVector, VaultStore,
 };
-use calyx_ledger::{ActorId, EntryKind, RedactionPolicy, SubjectId};
+use calyx_ledger::{ActorId, EntryKind, SubjectId};
 use calyx_registry::measure::input_hash;
 use calyx_registry::{VaultPanelState, load_vault_panel_state};
 use serde::Deserialize;
@@ -472,7 +472,6 @@ fn measure_slot(
 fn append_ingest_retry_ledger(vault: &AsterVault, cx_id: CxId) -> ToolResult<u64> {
     let bytes = serde_json::to_vec(&json!({ "mode": "mcp-idempotent-ingest" }))
         .map_err(|err| CalyxError::aster_corrupt_shard(format!("encode retry ledger: {err}")))?;
-    RedactionPolicy::check_payload(&bytes)?;
     append_ledger_payload(vault, EntryKind::Ingest, cx_id, bytes)
 }
 

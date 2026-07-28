@@ -1351,7 +1351,7 @@ fn foreign_store_entry(store_dir: &Path, store_key: &str, clone_path: &str) -> O
         "logs",
         ".astrolabe-shadow-publication",
     ];
-    let completed_index_project = completed_pipeline_index_project(store_dir, clone_path);
+    let index_project = recognized_pipeline_index_project(store_dir, clone_path);
     let entries = match fs::read_dir(store_dir) {
         Ok(entries) => entries,
         // Unreadable = unknown = foreign; the caller refuses.
@@ -1364,7 +1364,7 @@ fn foreign_store_entry(store_dir: &Path, store_key: &str, clone_path: &str) -> O
         };
         let recognized = FIXED.contains(&name.as_str())
             || name.starts_with(&format!("{store_key}."))
-            || completed_index_project
+            || index_project
                 .as_ref()
                 .is_some_and(|project| name.starts_with(&format!("{project}.")))
             || name.starts_with("_config.db");
@@ -1375,21 +1375,28 @@ fn foreign_store_entry(store_dir: &Path, store_key: &str, clone_path: &str) -> O
     None
 }
 
-/// Recovers the inner project identity only from a completed, successful
-/// pipeline response whose exact args file binds the current clone and
-/// contains no caller-selected name. This lets a `cloned` row safely recognize
-/// and redo a torn post-index/pre-catalog store without accepting arbitrary
-/// directory prefixes.
-fn completed_pipeline_index_project(store_dir: &Path, clone_path: &str) -> Option<String> {
+/// Recovers the path-derived inner project identity from either a completed
+/// successful response or an exact interrupted shadow-publication artifact
+/// set. In both cases the args file must bind the current clone and contain no
+/// caller-selected name.
+///
+/// The interrupted case derives identity from the product's exact paired
+/// zero-byte guards. A lone/mismatched guard, symlink, nonempty guard, missing
+/// error envelope, or incomplete publication scaffold remains foreign.
+fn recognized_pipeline_index_project(store_dir: &Path, clone_path: &str) -> Option<String> {
     let args: Value =
         serde_json::from_slice(&fs::read(store_dir.join("index-args.json")).ok()?).ok()?;
-    if args["repo_path"].as_str() != Some(clone_path) || args.get("name").is_some() {
+    if args["repo_path"].as_str() != Some(clone_path)
+        || args["calyx"].as_str() != Some("shadow")
+        || args["mode"].as_str() != Some("fast")
+        || args.get("name").is_some()
+    {
         return None;
     }
     let envelope: Value =
         serde_json::from_slice(&fs::read(store_dir.join("pipeline-stdout.json")).ok()?).ok()?;
     if envelope["isError"].as_bool().unwrap_or(true) {
-        return None;
+        return interrupted_pipeline_guard_project(store_dir);
     }
     let inner: Value = serde_json::from_str(envelope["content"][0]["text"].as_str()?).ok()?;
     if inner["status"].as_str() != Some("indexed") {
@@ -1397,6 +1404,47 @@ fn completed_pipeline_index_project(store_dir: &Path, clone_path: &str) -> Optio
     }
     let project = inner["project"].as_str()?;
     valid_index_project(project).then(|| project.to_string())
+}
+
+fn interrupted_pipeline_guard_project(store_dir: &Path) -> Option<String> {
+    const LOWERED_GUARD: &str = ".astrolabe-lowered.lock.guard";
+    const SHADOW_IMPORT_GUARD: &str = ".astrolabe-shadow-import.lock.guard";
+
+    let stderr = fs::symlink_metadata(store_dir.join("pipeline-stderr.txt")).ok()?;
+    let logs = fs::symlink_metadata(store_dir.join("logs")).ok()?;
+    let publication = fs::symlink_metadata(store_dir.join(".astrolabe-shadow-publication")).ok()?;
+    if !stderr.file_type().is_file()
+        || !logs.file_type().is_dir()
+        || !publication.file_type().is_dir()
+        || fs::read_dir(store_dir.join(".astrolabe-shadow-publication"))
+            .ok()?
+            .next()
+            .is_some()
+    {
+        return None;
+    }
+
+    let lowered = exact_zero_byte_guard_project(store_dir, LOWERED_GUARD)?;
+    let shadow_import = exact_zero_byte_guard_project(store_dir, SHADOW_IMPORT_GUARD)?;
+    (lowered == shadow_import && valid_index_project(&lowered)).then_some(lowered)
+}
+
+fn exact_zero_byte_guard_project(store_dir: &Path, suffix: &str) -> Option<String> {
+    let mut project = None;
+    for entry in fs::read_dir(store_dir).ok()? {
+        let entry = entry.ok()?;
+        let name = entry.file_name();
+        let name = name.to_str()?;
+        let Some(candidate) = name.strip_suffix(suffix) else {
+            continue;
+        };
+        let metadata = fs::symlink_metadata(entry.path()).ok()?;
+        if !metadata.file_type().is_file() || metadata.len() != 0 || project.is_some() {
+            return None;
+        }
+        project = Some(candidate.to_string());
+    }
+    project
 }
 
 /// Independent persisted-state readback: CBM sqlite counts, shadow-vault Base

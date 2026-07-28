@@ -1295,15 +1295,8 @@ fn lower_ledger_payload(
     // the signed envelope; a truncated prefix would leave a ~2^64 second-preimage
     // gap in that tamper-evidence guarantee (see #84).
     //
-    // The field name MUST stay on Calyx's benign-long-token allowlist, or the
-    // ledger group-commit hook rejects the whole write with
-    // `CALYX_LEDGER_SECRET_IN_PAYLOAD` ("long non-whitespace token"): a bare
-    // 64-hex digest reads as a secret. `calyx-ledger::redaction` allows a
-    // <=64-char hex token only under a field named `hash`/`root`/`input_hash`,
-    // ending in `_hash`/`_id`/`_sha256`/`_digest`, etc. Hence `_sha256` (like the
-    // sibling `project_sha256`); renaming this back to a bare `artifact` would
-    // silently break every lowering. `vault_fp` stays a 16-hex prefix, safely
-    // under the 40-char `SECRET_TOKEN_MIN` run threshold.
+    // The explicit `_sha256` suffix documents that this is the full
+    // content-addressed graph digest, alongside the sibling project digest.
     Ok(serde_json::to_vec(&json!({
         "schema": "asl_v1",
         "project_sha256": hex_lower(&sha256_digest(rows.project.as_bytes())),

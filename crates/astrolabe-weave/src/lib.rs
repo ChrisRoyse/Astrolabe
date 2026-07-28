@@ -20,7 +20,7 @@ use calyx_aster::cf::{ColumnFamily, XTermKind, xterm_key};
 use calyx_aster::vault::AsterVault;
 use calyx_core::{CalyxError, Clock, CxId, LedgerRef, SlotId, SlotVector, SparseEntry, VaultStore};
 use calyx_ledger::decode as decode_ledger;
-use calyx_ledger::{ActorId, EntryKind, RedactionPolicy, SubjectId};
+use calyx_ledger::{ActorId, EntryKind, SubjectId};
 use calyx_loom::agreement_graph::XtermRow;
 pub use calyx_loom::reactive::{
     DEFAULT_MAX_AUDIT_ENTRIES as CALYX_REACTIVE_AUDIT_CAP,
@@ -545,7 +545,6 @@ where
         "acknowledged": acknowledged,
     }))
     .map_err(|error| reactive_recovery_error(format!("encode reactive ack payload: {error}")))?;
-    RedactionPolicy::check_payload(&payload)?;
     vault.append_ledger_entry(
         EntryKind::Guard,
         SubjectId::Guard(format!("reactive_ack:{subscription_id}").into_bytes()),

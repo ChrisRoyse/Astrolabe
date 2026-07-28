@@ -14,7 +14,6 @@ use crate::append::{LedgerCfStore, LedgerRow};
 use crate::codec::{decode, encode};
 use crate::entry::{ActorId, HASH_BYTES, LedgerEntry, SubjectId};
 use crate::kind::EntryKind;
-use crate::redaction::RedactionPolicy;
 
 pub const REPRODUCE_TOLERANCE: f64 = 1.0e-3;
 pub const REPRODUCE_PAYLOAD_TAG: &str = "reproduce_v1";
@@ -166,7 +165,6 @@ pub fn append_reproduce_entry(
         .checked_add(1)
         .ok_or_else(|| CalyxError::ledger_chain_broken("ledger timestamp exhausted"))?;
     let payload = reproduce_payload(answer_id, result, ts)?;
-    RedactionPolicy::check_payload(&payload)?;
     let entry = LedgerEntry::new(
         seq,
         prev_hash,

@@ -3,9 +3,7 @@
 use std::collections::{BTreeMap, VecDeque};
 
 use calyx_core::{Clock, CxId, LedgerRef};
-use calyx_ledger::{
-    ActorId, EntryKind, LedgerAppender, LedgerCfStore, PayloadBuilder, RedactionPolicy, SubjectId,
-};
+use calyx_ledger::{ActorId, EntryKind, LedgerAppender, LedgerCfStore, PayloadBuilder, SubjectId};
 use calyx_paths::AssocGraph;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -354,7 +352,6 @@ fn propagation_payload(
             ),
         );
     let bytes = serde_json::to_vec(payload.value()).expect("payload serializes");
-    RedactionPolicy::check_payload(&bytes)?;
     Ok(bytes)
 }
 

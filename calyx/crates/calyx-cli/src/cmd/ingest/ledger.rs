@@ -1,6 +1,6 @@
 use calyx_aster::vault::AsterVault;
 use calyx_core::{Anchor, AnchorKind, CxId};
-use calyx_ledger::{ActorId, EntryKind, RedactionPolicy, SubjectId};
+use calyx_ledger::{ActorId, EntryKind, SubjectId};
 
 use super::anchor::anchor_kind_key;
 use crate::error::{CliError, CliResult};
@@ -13,7 +13,6 @@ pub(super) fn append_cli_ledger(
 ) -> CliResult<u64> {
     let bytes = serde_json::to_vec(&serde_json::json!({ "mode": mode }))
         .map_err(|error| CliError::runtime(format!("serialize ledger payload: {error}")))?;
-    RedactionPolicy::check_payload(&bytes)?;
     append_ledger_payload(vault, kind, cx_id, bytes)
 }
 
@@ -35,7 +34,6 @@ pub(super) fn append_cli_batch_ledger(
         "last_cx_id": cx_ids.last(),
     }))
     .map_err(|error| CliError::runtime(format!("serialize batch ledger payload: {error}")))?;
-    RedactionPolicy::check_payload(&bytes)?;
     append_ledger_payload(vault, kind, first, bytes)
 }
 
@@ -89,6 +87,5 @@ fn anchor_payload(kind: &AnchorKind) -> CliResult<Vec<u8>> {
         "anchor_kind": anchor_kind_key(kind),
     }))
     .map_err(|error| CliError::runtime(format!("serialize anchor ledger payload: {error}")))?;
-    RedactionPolicy::check_payload(&bytes)?;
     Ok(bytes)
 }

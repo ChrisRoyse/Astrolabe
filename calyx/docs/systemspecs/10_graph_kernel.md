@@ -434,7 +434,7 @@ Ledger-backed writers (actor `Service("calyx-lodestar")`). `KernelBuildReceipt {
 
 - `build_kernel_pipeline_with_ledger(graph, anchors, params, graph_seq, ledger)` builds the kernel then `append_kernel_build_entry` (`EntryKind::Kernel`, subject `Kernel(kernel_id)`, payload with `kernel_id`, `members_hash`, `graph_seq`, `mfvs_approx_factor`, `mfvs_tau_star_estimate/exact`, `recall_ratio`).
 - `append_answer_hop_entry` / `append_answer_complete_entry` emit `EntryKind::Answer` entries keyed by `Query(query_cx)` with per-hop and complete-path JSON payloads.
-- All payloads pass `RedactionPolicy::check_payload`. `kernel_members_hash` = BLAKE3 over `"calyx-lodestar-kernel-members-v1"` + each member's bytes. `AnswerHopEvidence` / `AnswerCompleteHopEvidence` are the payload structs.
+- Payload producers serialize their typed structures to JSON; ledger admission is content-neutral and binds the exact bytes into the hash chain. `kernel_members_hash` = BLAKE3 over `"calyx-lodestar-kernel-members-v1"` + each member's bytes. `AnswerHopEvidence` / `AnswerCompleteHopEvidence` are the payload structs.
 
 ## C.15 Incremental kernel maintenance (`incremental.rs`)
 

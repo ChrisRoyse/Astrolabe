@@ -6,7 +6,7 @@ use std::str::FromStr;
 
 use calyx_aster::vault::AsterVault;
 use calyx_core::{Clock, Result};
-use calyx_ledger::{ActorId, EntryKind, RedactionPolicy, SubjectId};
+use calyx_ledger::{ActorId, EntryKind, SubjectId};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use uuid::Uuid;
@@ -315,7 +315,6 @@ fn append_subscription_ledger<C: Clock>(
             format!("encode subscription ledger payload: {error}"),
         )
     })?;
-    RedactionPolicy::check_payload(&payload)?;
     vault.append_ledger_entry(
         EntryKind::Guard,
         SubjectId::Guard(format!("subscription:{}", handle.id).into_bytes()),

@@ -220,13 +220,12 @@ The single write path. Fields: `store: S`, `clock: C` (`calyx_core::Clock`), `ne
   (else `CALYX_LEDGER_CORRUPT`), and each `prev_hash` matches the prior `entry_hash`.
 - `prepare(kind, subject, payload, actor) -> PreparedLedgerEntry` — builds the next row
   **without** mutating store or tip. Steps in `prepare_at`:
-  1. `redaction_policy.check_payload_with_policy(&payload)` (rejects secrets, §6).
-  2. `verify_tip()` — re-`recover_tip` and confirm it equals the in-memory tip; mismatch
+  1. `verify_tip()` — re-`recover_tip` and confirm it equals the in-memory tip; mismatch
      (concurrent writer / external mutation) → chain-broken.
-  3. `actor.validate()`, then `redaction_policy.apply_to_actor(actor)`, then validate again.
-  4. `ts = next_ts_after(last_ts)`: `clock.now()` if strictly greater than `last_ts`,
+  2. `actor.validate()`, then `redaction_policy.apply_to_actor(actor)`, then validate again.
+  3. `ts = next_ts_after(last_ts)`: `clock.now()` if strictly greater than `last_ts`,
      else `last_ts + 1` (monotonic; overflow → chain-broken).
-  5. `LedgerEntry::new(...)` (computes hash), `encode`.
+  4. `LedgerEntry::new(...)` (computes hash), `encode`.
 - `prepare_after(predecessor, …)` — chains onto an uncommitted prepared row (seq+1,
   `prev_hash = predecessor.entry_hash()`); used to stage a checkpoint behind a data row.
 - `commit_prepared(&prepared) -> Result<LedgerRef>` — rejects if `prepared.seq != next_seq`
@@ -305,26 +304,20 @@ the audit surface (§8) enforces this via `QuarantineSet`/`CALYX_LEDGER_CHAIN_BR
 
 ---
 
-## 6. Redaction and secret guardrails (`redaction.rs`)
+## 6. Explicit retention and actor redaction (`redaction.rs`)
 
 `RedactionPolicy { store_raw_input: bool, redact_actor_name: bool }` (both `false` by default).
 
-- `check_payload(&[u8])` / `check_payload_with_policy(&self, &[u8])` — empty payload OK.
-  Parses payload as JSON; if not JSON, scans as text tokens. Rejects:
-  - secret-like JSON keys: `password`, `passwd`, `token`, `secret`, `key`, or any key ending
-    `_password`/`_passwd`/`_token`/`_secret`/`_key` (but **not** public-key fields
-    `signer_pubkey`/`public_key`/`verifying_key`) → `CALYX_LEDGER_SECRET_IN_PAYLOAD`;
-  - long high-entropy tokens (`SECRET_TOKEN_MIN = 40`, or any ≥40-char no-whitespace printable
-    run) unless allowed for the field as a stable identifier.
-  - Allowed stable-identifier fields (`field_allows_stable_identifier`): `hash`, `metadata`,
-    `input_hash`, `root`, `signature` (128-hex), `weights_sha256`, the public-key fields
-    (64-hex), source-metadata (`chunk_id`/`database_name`), `quant_slot_*` (≤4096-hex), or
-    suffixes `_hash`/`_id`/`_sha256`/`_digest` (≤64 chars, hex/base58/uuid).
+- Ledger admission is content-neutral. Exact bounded payload bytes are domain
+  data and are included in the entry hash without field-name or token-shape
+  classification. JSON writers validate/serialize JSON before append; the
+  ledger codec and store enforce exact decoding, lengths, sequence, and chain
+  integrity.
 - `redact_input_ref(&InputRef) -> RedactedInput { hash, redacted: true, pointer: None }` —
   keeps the content hash, drops the raw pointer (lineage holds, content does not leak).
-- `apply_to_payload(&PayloadBuilder)` — projects JSON keeping only allowed id/hash/`ts`/
-  `redacted` fields; `input_ref` is reduced to `{hash, redacted:true}`; raw fields (`raw`,
-  `*_raw`, `*_bytes`, `plaintext`, …) kept only if `store_raw_input`.
+- `apply_to_payload(&PayloadBuilder)` — preserves every non-raw JSON field recursively;
+  `input_ref` is reduced to `{hash, redacted:true}`; raw fields (`raw`, `*_raw`,
+  `*_bytes`, `plaintext`, …) are kept only if `store_raw_input`.
 - `apply_to_actor(actor)` — when `redact_actor_name`, replaces `Agent`/`Service` names with
   `"redacted"`; `System` unchanged.
 
@@ -522,7 +515,6 @@ optional — default checkpoints are unsigned (`signature`/`signer_pubkey` = `No
 | `ledger_chain_broken` | `CALYX_LEDGER_CHAIN_BROKEN` | seq gap, prev-hash break, tip changed, seq/ts exhausted, quarantined range, tombstone seq mismatch. |
 | `ledger_corrupt` | `CALYX_LEDGER_CORRUPT` | decode failure, hash mismatch, bad tags/lengths, missing/duplicate row, invalid range, bad payload JSON. |
 | `ledger_append_only_violation` | `CALYX_LEDGER_APPEND_ONLY_VIOLATION` | overwrite, delete, or tombstone attempt on a `ledger` row. |
-| `ledger_secret_in_payload` | `CALYX_LEDGER_SECRET_IN_PAYLOAD` | secret-like field/token in payload. |
 | `ledger_actor_too_long` | `CALYX_LEDGER_ACTOR_TOO_LONG` | actor id > 64 UTF-8 bytes. |
 | `ledger_group_commit_failed` | `CALYX_LEDGER_GROUP_COMMIT_FAILED` | staging/commit failure or disabled `on_commit`. |
 | `lens_frozen_violation` | `CALYX_LENS_FROZEN_VIOLATION` | reproduce: registry weights hash ≠ recorded hash. |

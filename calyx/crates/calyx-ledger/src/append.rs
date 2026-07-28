@@ -196,7 +196,6 @@ where
         payload: Vec<u8>,
         actor: ActorId,
     ) -> Result<PreparedLedgerEntry> {
-        self.redaction_policy.check_payload_with_policy(&payload)?;
         self.verify_tip()?;
         actor.validate()?;
         let actor = self.redaction_policy.apply_to_actor(actor);

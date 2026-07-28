@@ -18,7 +18,7 @@ use calyx_aster::mvcc::tombstone_value;
 use calyx_aster::vault::AsterVault;
 use calyx_core::{CalyxError, Clock, LedgerRef, VaultStore};
 use calyx_ledger::decode as decode_ledger;
-use calyx_ledger::{ActorId, EntryKind, RedactionPolicy, SubjectId};
+use calyx_ledger::{ActorId, EntryKind, SubjectId};
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -298,8 +298,6 @@ where
         "edge_dump_hash": edge_dump_hash,
     }))
     .map_err(|error| sim_edge_corrupt(format!("encode SIM_* ledger payload: {error}")))?;
-    RedactionPolicy::check_payload(&payload)?;
-
     let subject = SubjectId::Query(format!("astrolabe-sim-edges:{edge_dump_hash}").into_bytes());
     let actor = ActorId::Service(actor);
     let mut fsv_plan = VaultMutationPlan::new(

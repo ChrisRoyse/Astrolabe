@@ -55,9 +55,8 @@ pub const SCALAR_CLONE_BYTES: &str = "clone_bytes";
 /// `--force` refreshes (issue #454). Absent until first measured.
 pub const SCALAR_STORE_BYTES: &str = "store_bytes";
 
-// Metadata keys (verbatim string facts). `head_commit` deliberately carries a
-// `_hash` suffix: the ledger secret-scanner allowlists `*_hash` fields, and a
-// bare 40-hex value under another name fails the commit closed.
+// Metadata keys (verbatim string facts). `head_commit_hash` names the
+// content-addressed value explicitly.
 /// `owner/name` as reported by GitHub.
 pub const META_FULL_NAME: &str = "full_name";
 /// HTTPS clone URL.

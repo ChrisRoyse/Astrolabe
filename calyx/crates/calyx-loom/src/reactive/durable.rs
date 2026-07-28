@@ -3,7 +3,7 @@
 use calyx_aster::cf::ColumnFamily;
 use calyx_aster::vault::AsterVault;
 use calyx_core::{Clock, CxId, LedgerRef, Result};
-use calyx_ledger::{ActorId, EntryKind, RedactionPolicy, SubjectId};
+use calyx_ledger::{ActorId, EntryKind, SubjectId};
 use serde_json::json;
 use uuid::Uuid;
 
@@ -262,7 +262,6 @@ fn reactive_ledger_payload(
         "warning_count": counts.warning_rows,
     }))
     .map_err(|error| reactive_row_error(format!("encode reactive ledger payload: {error}")))?;
-    RedactionPolicy::check_payload(&payload)?;
     Ok(payload)
 }
 

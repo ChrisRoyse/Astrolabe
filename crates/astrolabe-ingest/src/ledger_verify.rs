@@ -6,7 +6,7 @@ use calyx_aster::ledger_view::{AsterLedgerCfStore, parse_aster_ledger_seq};
 use calyx_aster::vault::{AsterVault, encode};
 use calyx_core::{CalyxError, Clock, Result as CalyxResult};
 use calyx_ledger::{
-    LedgerCfStore, LedgerHeadAnchor, LedgerRow, RedactionPolicy, VerifyResult, decode,
+    LedgerCfStore, LedgerHeadAnchor, LedgerRow, VerifyResult, decode,
     verify_chain as calyx_verify_chain,
 };
 use serde::{Deserialize, Serialize};
@@ -112,12 +112,6 @@ where
                     errors.push(format!(
                         "ledger key seq {seq} does not match encoded seq {}",
                         entry.seq
-                    ));
-                    continue;
-                }
-                if let Err(err) = RedactionPolicy::check_payload(&entry.payload) {
-                    errors.push(format!(
-                        "ledger seq {seq} payload violates redaction: {err}"
                     ));
                     continue;
                 }

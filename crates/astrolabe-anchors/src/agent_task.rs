@@ -23,7 +23,7 @@ use astrolabe_ingest::VaultMutationPlan;
 use calyx_aster::cf::ColumnFamily;
 use calyx_aster::vault::AsterVault;
 use calyx_core::{AnchorKind, AnchorValue, CalyxError, Clock, CxId, LedgerRef, Ts, VaultStore};
-use calyx_ledger::{ActorId, EntryKind, RedactionPolicy, SubjectId};
+use calyx_ledger::{ActorId, EntryKind, SubjectId};
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -314,7 +314,6 @@ where
     let value = serde_json::to_vec(&manifest)
         .map_err(|error| anchor_corrupt(format!("encode agent-task pack manifest: {error}")))?;
     let payload = pack_ledger_payload(&manifest, observed_at, true)?;
-    RedactionPolicy::check_payload(&payload)?;
     let subject = SubjectId::Query(
         format!(
             "astrolabe-agent-task-pack:{}",
@@ -357,7 +356,6 @@ where
     C: Clock,
 {
     let payload = pack_ledger_payload(manifest, observed_at, false)?;
-    RedactionPolicy::check_payload(&payload)?;
     let subject = SubjectId::Query(
         format!(
             "astrolabe-agent-task-pack:{}",
@@ -706,8 +704,6 @@ where
         "observed_at": observed_at,
     }))
     .map_err(|error| anchor_corrupt(format!("encode promotion ledger payload: {error}")))?;
-    RedactionPolicy::check_payload(&payload)?;
-
     let subject = SubjectId::Query(
         format!(
             "astrolabe-anchor-promotion:{}:{}",

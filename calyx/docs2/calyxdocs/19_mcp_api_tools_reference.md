@@ -309,8 +309,8 @@ batch, `{ results: [IngestReport, …] }`.
 content-addressed `cx_id`; **idempotent** — already-present constellations are not
 re-stored. New constellations are written (`vault.put` / `put_batch`) then `flush()`ed;
 each new one carries an Ingest ledger entry. A *repeat* ingest of an existing cx appends
-an idempotent retry ledger row (`mode: "mcp-idempotent-ingest"`) subject to
-`RedactionPolicy::check_payload`.
+an idempotent retry ledger row (`mode: "mcp-idempotent-ingest"`) whose typed JSON
+bytes are bound directly into the ledger hash chain.
 **Errors:** `InvalidParams` (both/neither of input|batch, empty text/batch, or panel has
 no active text slots); `CALYX_LENS_UNREACHABLE` if **all** applicable lens runtimes are
 unreachable; `CALYX_ASTER_CORRUPT_SHARD` on encode failure.
@@ -331,8 +331,8 @@ thumbs / label.
 
 **Returns:** `{ status: "anchored", cx_id, ledger_seq }`.
 **Side effects:** `vault.anchor_with_ledger_entry` writes the anchor + an Ingest-kind
-ledger entry (`mode: "mcp-anchor"`, `anchor_kind: <key>`), then `flush()`. Payload
-passes `RedactionPolicy::check_payload`.
+ledger entry (`mode: "mcp-anchor"`, `anchor_kind: <key>`), then `flush()`. The
+typed JSON payload bytes are bound directly into the ledger hash chain.
 **Errors:** `InvalidParams` (bad cx_id parse, unknown kind, missing/empty label for
 `label`, non-bool/non-finite value, out-of-range confidence);
 `CALYX_VAULT_ACCESS_DENIED` if cx_id does not exist; redaction/Aster errors propagate.

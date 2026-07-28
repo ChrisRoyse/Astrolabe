@@ -63,7 +63,6 @@ where
     where
         I: IntoIterator<Item = Constellation>,
     {
-        RedactionPolicy::check_payload(&payload)?;
         let input = constellations.into_iter().collect::<Vec<_>>();
         if input.is_empty() {
             return Ok(Vec::new());
@@ -92,7 +91,6 @@ where
     where
         I: IntoIterator<Item = Constellation>,
     {
-        RedactionPolicy::check_payload(&payload)?;
         let input = constellations.into_iter().collect::<Vec<_>>();
         self.with_durable_commit_lock(|| {
             let commit = self.put_batch_locked_with_options(

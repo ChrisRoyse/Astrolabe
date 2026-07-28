@@ -158,7 +158,6 @@ These are the only codes in the closed catalog, in order. "Meaning" is the doc/`
 | 17 | `CALYX_LEDGER_CHAIN_BROKEN` | hash-chain verify failed | quarantine range, investigate |
 | 18 | `CALYX_LEDGER_CORRUPT` | ledger CF integrity violation | ledger CF integrity violation — run verify_chain to identify range |
 | 19 | `CALYX_LEDGER_APPEND_ONLY_VIOLATION` | ledger CF append-only invariant violated | ledger CF is append-only; deletes and tombstones are forbidden |
-| 20 | `CALYX_LEDGER_SECRET_IN_PAYLOAD` | ledger payload contains secret-like material | ledger payload must store hashes/ids only — redact before writing |
 | 21 | `CALYX_LEDGER_ACTOR_TOO_LONG` | ledger actor id exceeds 64 UTF-8 bytes | actor id must be <= 64 bytes UTF-8 |
 | 22 | `CALYX_LEDGER_GROUP_COMMIT_FAILED` | ledger hook failed during group commit | ledger hook failed — group-commit rolled back; retry the write |
 | 23 | `CALYX_REPRODUCE_NONDETERMINISTIC` | reproduce ledger entry lacks determinism seed | no determinism seed in ledger entry - cannot guarantee reproduce fidelity |

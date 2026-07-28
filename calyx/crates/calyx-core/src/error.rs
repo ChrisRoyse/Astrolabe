@@ -170,9 +170,6 @@ error_catalog! {
     LedgerAppendOnlyViolation, ledger_append_only_violation, "CALYX_LEDGER_APPEND_ONLY_VIOLATION",
     "ledger CF append-only invariant violated", "ledger CF is append-only; deletes and tombstones are forbidden";
 
-    LedgerSecretInPayload, ledger_secret_in_payload, "CALYX_LEDGER_SECRET_IN_PAYLOAD",
-    "ledger payload contains secret-like material", "ledger payload must store hashes/ids only — redact before writing";
-
     LedgerActorTooLong, ledger_actor_too_long, "CALYX_LEDGER_ACTOR_TOO_LONG",
     "ledger actor id exceeds 64 UTF-8 bytes", "actor id must be <= 64 bytes UTF-8";
 

@@ -34,7 +34,7 @@ use calyx_aster::cf::{ColumnFamily, prefix_range};
 use calyx_aster::mvcc::tombstone_value;
 use calyx_aster::vault::AsterVault;
 use calyx_core::{Clock, VaultStore};
-use calyx_ledger::{ActorId, EntryKind, RedactionPolicy, SubjectId};
+use calyx_ledger::{ActorId, EntryKind, SubjectId};
 use serde::{Deserialize, Serialize};
 
 use crate::fsv::VaultMutationPlan;
@@ -710,8 +710,6 @@ where
         "rows_tombstoned": tombstoned.len(),
     }))
     .map_err(|error| corrupt(format!("encode ledger payload: {error}")))?;
-    RedactionPolicy::check_payload(&payload)?;
-
     if batch.is_empty() {
         vault.append_ledger_entry(kind, subject, payload, actor)?;
         vault.flush()?;

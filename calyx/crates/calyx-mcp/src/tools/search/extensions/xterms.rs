@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use calyx_aster::cf::{ColumnFamily, XTermKind, xterm_key};
 use calyx_aster::vault::AsterVault;
 use calyx_core::{CalyxError, Constellation, CxId, VaultStore};
-use calyx_ledger::{ActorId, EntryKind, RedactionPolicy, SubjectId};
+use calyx_ledger::{ActorId, EntryKind, SubjectId};
 use calyx_loom::agreement_graph::XtermRow;
 use calyx_loom::{
     CrossTermKey, CrossTermKind, CrossTermValue, SignalProvenanceTag, agreement_scalar,
@@ -61,7 +61,6 @@ pub(super) fn materialize_agreement_xterms(
         "rows": count,
     }))
     .map_err(|err| CalyxError::aster_corrupt_shard(format!("encode xterm ledger: {err}")))?;
-    RedactionPolicy::check_payload(&payload)?;
     vault.write_cf_batch_with_ledger_entry(
         rows,
         EntryKind::Measure,

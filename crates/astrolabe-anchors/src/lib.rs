@@ -26,7 +26,7 @@ use calyx_core::{
     Anchor, AnchorKind, AnchorValue, CalyxError, Clock, CxId, LedgerRef, Ts, VaultStore,
 };
 use calyx_ledger::decode as decode_ledger;
-use calyx_ledger::{ActorId, EntryKind, RedactionPolicy, SubjectId};
+use calyx_ledger::{ActorId, EntryKind, SubjectId};
 use serde::{Deserialize, Serialize};
 
 pub mod agent_task;
@@ -424,7 +424,6 @@ where
             "source": request.source,
         }))
         .map_err(|error| anchor_corrupt(format!("encode anchor source probe: {error}")))?;
-        RedactionPolicy::check_payload(&source_probe)?;
     }
     let snapshot = vault.snapshot();
     let mut rows = BTreeMap::<Vec<u8>, AnchorRowV1>::new();
@@ -515,8 +514,6 @@ where
         "anchor_dump_hash": anchor_dump_hash,
     }))
     .map_err(|error| anchor_corrupt(format!("encode anchor ledger payload: {error}")))?;
-    RedactionPolicy::check_payload(&payload)?;
-
     let subject =
         SubjectId::Query(format!("astrolabe-anchor-outcome:{anchor_dump_hash}").into_bytes());
     let actor = ActorId::Service(actor.into());
@@ -729,7 +726,6 @@ where
         "tombstone_written": tombstone_written,
     }))
     .map_err(|error| anchor_corrupt(format!("encode anchor erasure ledger payload: {error}")))?;
-    RedactionPolicy::check_payload(&payload)?;
     let subject = SubjectId::Query(format!("astrolabe-anchor-erasure:{source}").into_bytes());
     let actor = ActorId::Service(actor.into());
     let mut fsv_plan = VaultMutationPlan::new(

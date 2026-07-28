@@ -207,7 +207,6 @@ pub struct Hit {
 | `CALYX_LEDGER_CHAIN_BROKEN` | hash-chain verify failed | quarantine range, investigate |
 | `CALYX_LEDGER_CORRUPT` | ledger CF integrity violation | ledger CF integrity violation — run verify_chain to identify range |
 | `CALYX_LEDGER_APPEND_ONLY_VIOLATION` | ledger CF append-only invariant violated | ledger CF is append-only; deletes and tombstones are forbidden |
-| `CALYX_LEDGER_SECRET_IN_PAYLOAD` | ledger payload contains secret-like material | ledger payload must store hashes/ids only — redact before writing |
 | `CALYX_LEDGER_ACTOR_TOO_LONG` | ledger actor id exceeds 64 UTF-8 bytes | actor id must be <= 64 bytes UTF-8 |
 | `CALYX_LEDGER_GROUP_COMMIT_FAILED` | ledger hook failed during group commit | ledger hook failed — group-commit rolled back; retry the write |
 | `CALYX_REPRODUCE_NONDETERMINISTIC` | reproduce ledger entry lacks determinism seed | no determinism seed in ledger entry - cannot guarantee reproduce fidelity |

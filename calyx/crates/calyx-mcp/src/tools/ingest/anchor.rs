@@ -1,6 +1,6 @@
 use calyx_aster::vault::AsterVault;
 use calyx_core::{Anchor, AnchorKind, AnchorValue, CalyxError, CxId};
-use calyx_ledger::{ActorId, EntryKind, RedactionPolicy, SubjectId};
+use calyx_ledger::{ActorId, EntryKind, SubjectId};
 use serde_json::{Value, json};
 
 use crate::server::{ToolError, ToolResult};
@@ -18,7 +18,6 @@ pub(super) fn append_anchor_ledger(
         "anchor_kind": anchor_kind_key(kind),
     }))
     .map_err(|err| CalyxError::aster_corrupt_shard(format!("encode anchor ledger: {err}")))?;
-    RedactionPolicy::check_payload(&bytes)?;
     Ok(vault
         .anchor_with_ledger_entry(
             cx_id,

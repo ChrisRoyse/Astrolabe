@@ -25,7 +25,7 @@ recorded as `Guard` entries.
 - `src/verify.rs` — `verify_chain`, `VerifyResult`.
 - `src/merkle.rs` — Merkle root, ed25519 signing, `MerkleExportBundle`.
 - `src/checkpoint.rs` — `CheckpointScheduler`, `CheckpointPayload`, overlay store.
-- `src/redaction.rs` — `RedactionPolicy`, secret scanner, `PayloadBuilder`.
+- `src/redaction.rs` — explicit retention/actor `RedactionPolicy`, `PayloadBuilder`.
 - `src/group_commit.rs` — `DefaultLedgerHook`, staged rows, batch keys.
 - `src/audit.rs` + `src/audit/mentions.rs` — `audit`, `get_provenance`,
   `get_answer_trace`, quarantine lookups.
@@ -189,14 +189,12 @@ the recovered tip: `next_seq`, `prev_hash`, `last_ts`, plus a `RedactionPolicy`.
 `append(kind, subject, payload, actor)` = `prepare(...)` then
 `commit_prepared(...)`. The `prepare` path (`prepare_at`):
 
-1. `redaction_policy.check_payload_with_policy(&payload)` — reject secret-like
-   payloads (§4).
-2. `verify_tip()` — re-run `recover_tip` and confirm the store still matches the
+1. `verify_tip()` — re-run `recover_tip` and confirm the store still matches the
    cached `(next_seq, prev_hash, last_ts)`; else `CALYX_LEDGER_CHAIN_BROKEN`.
-3. `actor.validate()` (≤64 bytes).
-4. `actor = redaction_policy.apply_to_actor(actor)` then `validate()` again.
-5. `ts = next_ts_after(last_ts)` (§2.3).
-6. Build `LedgerEntry::new(seq, prev_hash, kind, subject, payload, actor, ts)`
+2. `actor.validate()` (≤64 bytes).
+3. `actor = redaction_policy.apply_to_actor(actor)` then `validate()` again.
+4. `ts = next_ts_after(last_ts)` (§2.3).
+5. Build `LedgerEntry::new(seq, prev_hash, kind, subject, payload, actor, ts)`
    (computes `entry_hash`), `encode` it, return `PreparedLedgerEntry { entry,
    bytes }`.
 
@@ -265,7 +263,7 @@ are Not determined from source.
 
 ---
 
-## 4. Redaction and secret guardrails
+## 4. Explicit retention and actor redaction
 
 `RedactionPolicy` (`src/redaction.rs`):
 
@@ -274,45 +272,26 @@ are Not determined from source.
 | `store_raw_input` | `bool` | `false` | Keep raw/plaintext fields in `apply_to_payload`. |
 | `redact_actor_name` | `bool` | `false` | Replace agent/service names with `"redacted"`. |
 
-### 4.1 Payload scanner (`check_payload_with_policy`)
+Ledger admission is content-neutral: exact bounded payload bytes are domain
+data and are included in the entry hash without field-name or token-shape
+classification. Writers that require JSON validate/serialize JSON before
+append; the ledger codec and store still enforce structural lengths, exact
+decoding, append-only sequence, and hash-chain integrity.
 
-Runs before every append. Empty payload is allowed. If the payload parses as
-JSON, `check_json_value` recurses; otherwise `check_text_tokens` scans the
-lossy-UTF-8 text. It is fail-closed: anything matching a secret heuristic raises
-`CALYX_LEDGER_SECRET_IN_PAYLOAD`.
-
-- **Secret field names** (`is_secret_field`, after normalizing non-alphanumerics
-  to `_` and lowercasing): exact `password`, `passwd`, `token`, `secret`, `key`,
-  or any field ending `_password`/`_passwd`/`_token`/`_secret`/`_key`. Public-key
-  fields are exempted first (`signer_pubkey`, `public_key`, `verifying_key`).
-- **Token heuristic** (`check_text_tokens`): a no-whitespace printable run of ≥
-  `SECRET_TOKEN_MIN = 40` chars, or any token ≥ 40 chars, is rejected unless it
-  is an *allowed stable identifier* for its field.
-
-`allowed_stable_identifier` whitelists, per field:
-- source-metadata fields (`chunk_id`, `database_name`): alphanumeric +
-  `_-.:/`, length ≤ `MAX_SOURCE_METADATA_LEN = 128`.
-- `signature`: 128 hex chars.
-- public-key fields: `MAX_HASH_OR_ID_LEN = 64` hex chars.
-- `quant_slot_*`: hex, length ≤ `MAX_QUANT_SLOT_METADATA_LEN = 4096`.
-- fields ending `_hash`/`_id`/`_sha256`/`_digest` and `hash`/`metadata`/
-  `input_hash`/`root`/`weights_sha256`: hex, base58, or UUID, length ≤ 64.
-
-### 4.2 Payload building (`apply_to_payload`, `PayloadBuilder`)
+### 4.1 Payload building (`apply_to_payload`, `PayloadBuilder`)
 
 `PayloadBuilder` is a thin JSON object builder. `apply_to_payload` filters a
 value with `filter_payload_value`/`keep_payload_field`:
 - `input_ref` is rewritten to `{hash, redacted: true}` (`filter_input_ref`,
   drops the pointer).
-- secret fields are dropped.
 - raw fields (`raw`, `raw_bytes`, `raw_input`, `input_bytes`, `plaintext`, or
   ending `_raw`/`_bytes`) are kept only if `store_raw_input`.
-- otherwise kept only if `ts`, `redacted`, or a stable-identifier field.
+- every other field is preserved recursively.
 
 `redact_input_ref(input_ref)` returns a `RedactedInput { hash, redacted: true,
 pointer: None }` preserving the content hash while dropping the pointer.
 
-### 4.3 Actor redaction
+### 4.2 Actor redaction
 
 `apply_to_actor`: when `redact_actor_name`, `Agent(_)→Agent("redacted")`,
 `Service(_)→Service("redacted")`, `System→System`. Applied inside `prepare_at`
@@ -583,7 +562,7 @@ into `CALYX_REPRODUCE_DRIFT_EXCEEDED`.
 `recover_tip`), sets `ts = last_ts + 1`, builds a JSON payload tagged
 `REPRODUCE_PAYLOAD_TAG = "reproduce_v1"` with fields `answer_id` (hex),
 `reproduced`, `max_drift`, `original_hits`, `reproduced_hits`, `ts`, runs it
-through `RedactionPolicy::check_payload`, then appends an `Admin` entry whose
+serializes the typed payload, then appends an `Admin` entry whose
 subject is `Query(answer_id)` and actor is `Service("calyx-reproduce")`, writing
 via `store.put_new`.
 
@@ -725,7 +704,6 @@ All error codes are `CalyxError` constructors from `calyx-core`
 | `CALYX_LEDGER_CORRUPT` | Bad codec bytes, hash mismatch on `decode`, invalid tags, seq mismatch, JSON/hex parse failures, divergent overlay bytes, missing/invalid checkpoint payload, fusion vector shape mismatch, tombstone payload mismatch. |
 | `CALYX_LEDGER_CHAIN_BROKEN` | Seq gap, tip changed (`verify_tip`), prev_hash mismatch in recovery, prepared/next mismatch, seq/ts exhaustion, quarantined range queried, empty quarantine range, tombstone seq mismatch. |
 | `CALYX_LEDGER_APPEND_ONLY_VIOLATION` | `put_new` over existing seq, `reject_delete`, `reject_tombstone`, overlay store write. |
-| `CALYX_LEDGER_SECRET_IN_PAYLOAD` | Secret field name or long token in payload. |
 | `CALYX_LEDGER_ACTOR_TOO_LONG` | Actor id > 64 UTF-8 bytes. |
 | `CALYX_LEDGER_GROUP_COMMIT_FAILED` | Direct `on_commit` called; stage/commit failure wrapped. |
 | `CALYX_LENS_FROZEN_VIOLATION` | Registry frozen weights hash ≠ recorded `weights_sha256`. |

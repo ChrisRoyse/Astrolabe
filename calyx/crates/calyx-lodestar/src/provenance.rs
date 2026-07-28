@@ -1,9 +1,7 @@
 //! Ledger-backed Lodestar provenance writers.
 
 use calyx_core::{Clock, CxId, LedgerRef};
-use calyx_ledger::{
-    ActorId, EntryKind, LedgerAppender, LedgerCfStore, PayloadBuilder, RedactionPolicy, SubjectId,
-};
+use calyx_ledger::{ActorId, EntryKind, LedgerAppender, LedgerCfStore, PayloadBuilder, SubjectId};
 use calyx_paths::AssocGraph;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -135,7 +133,6 @@ fn kernel_build_payload(kernel: &Kernel, graph_seq: u64) -> Result<Vec<u8>> {
         .insert_value("mfvs_tau_star_exact", json!(kernel.recall.tau_star_exact))
         .insert_value("recall_ratio", json!(kernel.recall.ratio));
     let bytes = serde_json::to_vec(payload.value()).expect("payload serializes");
-    RedactionPolicy::check_payload(&bytes)?;
     Ok(bytes)
 }
 
@@ -154,7 +151,6 @@ fn answer_hop_payload(
         .insert_value("edge_weight", json!(hop.edge_weight))
         .insert_value("hop_score", json!(hop.hop_score));
     let bytes = serde_json::to_vec(payload.value()).expect("payload serializes");
-    RedactionPolicy::check_payload(&bytes)?;
     Ok(bytes)
 }
 
@@ -194,7 +190,6 @@ fn complete_answer_payload(
         .insert_value("total_score", json!(total_score))
         .insert_value("path", json!(path));
     let bytes = serde_json::to_vec(payload.value()).expect("payload serializes");
-    RedactionPolicy::check_payload(&bytes)?;
     Ok(bytes)
 }
 

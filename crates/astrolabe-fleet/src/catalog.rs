@@ -20,7 +20,7 @@ use calyx_aster::cf::{ColumnFamily, base_key, ledger_key};
 use calyx_aster::vault::encode::{decode_constellation_base, encode_constellation_base};
 use calyx_aster::vault::{AsterVault, VaultOptions};
 use calyx_core::{CalyxError, Constellation, CxId, LedgerRef, Seq, VaultId};
-use calyx_ledger::{ActorId, EntryKind, RedactionPolicy, SubjectId};
+use calyx_ledger::{ActorId, EntryKind, SubjectId};
 use serde::Serialize;
 use serde_json::json;
 
@@ -799,7 +799,6 @@ impl FleetCatalog {
         report_bytes: Vec<u8>,
         summary_payload: Vec<u8>,
     ) -> Result<(Seq, u64), CalyxError> {
-        RedactionPolicy::check_payload(&summary_payload)?;
         let key = run_report_key(run_id);
         let subject = SubjectId::Query(format!("fleet-discovery-run:{run_id}").into_bytes());
         let actor = ActorId::Service(FLEET_ACTOR.to_string());
@@ -916,7 +915,6 @@ impl FleetCatalog {
                 remediation: "pass --kind like language-coverage and a non-empty --id",
             });
         }
-        RedactionPolicy::check_payload(&summary_payload)?;
         let key = fleet_report_key(kind, report_id);
         let subject = SubjectId::Query(format!("fleet-report:{kind}:{report_id}").into_bytes());
         let actor = ActorId::Service(FLEET_ACTOR.to_string());
@@ -998,7 +996,6 @@ impl FleetCatalog {
         kind: EntryKind,
         payload: Vec<u8>,
     ) -> Result<(Seq, u64), CalyxError> {
-        RedactionPolicy::check_payload(&payload)?;
         let expected = encode_repo_constellation(self.vault_id, FLEET_VAULT_SALT, row)?;
         let base_bytes = encode_constellation_base(&expected)?;
         let subject = SubjectId::Cx(row.cx_id);

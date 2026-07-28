@@ -59,12 +59,10 @@
 //! farm itself spawned — file-identity-attributed by construction, never a
 //! name-wide `taskkill` (#292 lesson) — retried once, then quarantined.
 //!
-//! # Ledger hygiene
+//! # Catalog reason bounds
 //!
-//! Catalog-bound reasons are built from controlled parts and passed through
-//! [`safe_reason`], which splits any ≥40-char token so the ledger
-//! secret-scanner ([`calyx_ledger::RedactionPolicy`]) never sees a
-//! secret-shaped run; the untruncated git stderr lives in the rejection report
+//! Catalog-bound reasons pass through [`safe_reason`] for a deterministic
+//! display-size cap; the untruncated git stderr lives in the rejection report
 //! file named by the repo's numeric `github_id`.
 
 use std::collections::BTreeSet;
@@ -109,8 +107,6 @@ const GIT_POLL: Duration = Duration::from_millis(200);
 /// Longest reason text persisted into the catalog row; the full text always
 /// lives in the rejection report file.
 const MAX_REASON_LEN: usize = 300;
-/// Tokens at or above the ledger scanner's secret threshold are split.
-const REASON_TOKEN_MAX: usize = 39;
 
 /// Declared knobs of one clone-farm pass.
 #[derive(Clone, Debug, Serialize)]
@@ -660,28 +656,13 @@ fn write_rejection(dir: &Path, github_id: u64, text: &str) {
     }
 }
 
-/// Catalog/ledger-safe reason text: total length capped and every token at or
-/// above the scanner's secret threshold split with an ellipsis so no
-/// secret-shaped run survives. Full text belongs in the rejection file.
+/// Catalog reason text capped to its declared display bound. Full text belongs
+/// in the rejection file.
 pub fn safe_reason(raw: &str) -> String {
-    let mut out = String::with_capacity(raw.len().min(MAX_REASON_LEN) + 8);
-    let mut token_len = 0_usize;
-    for ch in raw.chars() {
-        if out.chars().count() >= MAX_REASON_LEN {
-            out.push('…');
-            break;
-        }
-        if ch.is_whitespace() {
-            token_len = 0;
-        } else {
-            token_len += 1;
-            if token_len > REASON_TOKEN_MAX {
-                out.push('…');
-                out.push(' ');
-                token_len = 1;
-            }
-        }
-        out.push(ch);
+    let mut chars = raw.chars();
+    let mut out: String = chars.by_ref().take(MAX_REASON_LEN).collect();
+    if chars.next().is_some() {
+        out.push('…');
     }
     out
 }
