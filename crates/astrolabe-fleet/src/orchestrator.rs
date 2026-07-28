@@ -97,6 +97,12 @@ pub const ASTRO_FLEET_STORE_FOREIGN: &str = "ASTRO_FLEET_STORE_FOREIGN";
 /// Refusal code when the stable fleet store key and the server-derived inner
 /// project identity cannot be bound through the durable kernel scope.
 pub const ASTRO_FLEET_PROJECT_IDENTITY: &str = "ASTRO_FLEET_PROJECT_IDENTITY";
+/// Refusal code when a finite fleet-only host admission wait expires without
+/// starting any native index work. The source row remains in its prior state.
+pub const ASTRO_FLEET_HOST_BUSY: &str = "ASTRO_FLEET_HOST_BUSY";
+/// Refusal code for a pipeline scheduling/deadline configuration that cannot
+/// be represented exactly by the native Windows admission primitive.
+pub const ASTRO_FLEET_PIPELINE_CONFIG: &str = "ASTRO_FLEET_PIPELINE_CONFIG";
 
 /// Declared default fleet store root (per-repo CBM cache/vault sets).
 pub const DEFAULT_STORE_ROOT: &str = r"D:\astrolabe-fleet\store";
@@ -107,11 +113,20 @@ pub const DEFAULT_ARCHAEOLOGY_ROOT: &str = r"D:\astrolabe-fleet\scratch";
 /// `astrolabe.exe` needs `ASTRO_NOMIC_DIR` or it fails with a structured
 /// error; the orchestrator always sets it).
 pub const DEFAULT_NOMIC_DIR: &str = r"C:\code\Astrolabe\cbm\vendored\nomic";
-/// Declared bounded pipeline parallelism. Two, not four: each pipeline child
-/// is itself multi-threaded and memory-hungry (weave + HNSW at M scale).
+/// Declared pipeline worklist concurrency. The expensive native index phase is
+/// independently capped at [`EXPENSIVE_INDEX_HOST_CARDINALITY`].
 pub const DEFAULT_PIPELINE_PARALLELISM: usize = 2;
 /// Declared per-repo pipeline timeout, seconds.
 pub const DEFAULT_PIPELINE_TIMEOUT_SECS: u64 = 1800;
+/// Fleet-only finite wait for the authoritative host index slot. It derives
+/// from the same measured per-repo budget rather than introducing a second
+/// arbitrary duration. Ordinary MCP callers do not receive this setting.
+pub const DEFAULT_HOST_ADMISSION_TIMEOUT_SECS: u64 = DEFAULT_PIPELINE_TIMEOUT_SECS;
+/// #802 measured one full native index as consuming the host worker budget.
+/// This is the scheduler's explicit expensive-stage capacity, not a tunable.
+pub const EXPENSIVE_INDEX_HOST_CARDINALITY: usize = 1;
+/// Private child-process transport understood by the native admission layer.
+pub const FLEET_INDEX_ADMISSION_TIMEOUT_ENV: &str = "ASTRO_FLEET_INDEX_ADMISSION_TIMEOUT_MS";
 /// Poll interval while waiting on a pipeline child.
 const CHILD_POLL: Duration = Duration::from_millis(500);
 
@@ -241,6 +256,8 @@ pub struct PipelineConfig {
     pub parallelism: usize,
     /// Per-repo pipeline timeout in seconds.
     pub timeout_secs: u64,
+    /// Finite fleet-only wait for externally owned host index capacity.
+    pub host_admission_timeout_secs: u64,
     /// Re-run repos already `kerneled` and refresh their recorded facts.
     pub force: bool,
     /// Declared fleet store byte budget (#454). `None` = unbudgeted. When the
@@ -267,6 +284,7 @@ impl PipelineConfig {
             nomic_dir: PathBuf::from(DEFAULT_NOMIC_DIR),
             parallelism: DEFAULT_PIPELINE_PARALLELISM,
             timeout_secs: DEFAULT_PIPELINE_TIMEOUT_SECS,
+            host_admission_timeout_secs: DEFAULT_HOST_ADMISSION_TIMEOUT_SECS,
             force: false,
             store_budget_bytes: None,
             at_unix_secs,
@@ -294,6 +312,21 @@ pub enum Outcome {
     SkippedState,
     /// Pipeline or verification failed; record quarantined with the stage.
     Quarantined,
+    /// The finite fleet-only host admission wait expired before any native
+    /// pipeline/publication work. The catalog source state is unchanged.
+    DeferredHostBusy,
+}
+
+/// Authoritative native host-admission telemetry copied from the structured
+/// CBM result only after exact schema/path validation.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct IndexAdmissionTelemetry {
+    /// Fleet-requested finite wait in milliseconds (zero for ordinary MCP).
+    pub host_timeout_ms: u64,
+    /// Monotonic time actually spent in the native mutex wait.
+    pub host_waited_ms: u64,
+    /// The native mutex granted capacity after observing an abandoned owner.
+    pub recovered_abandoned_capacity: bool,
 }
 
 /// One repo's verdict row in the run report.
@@ -324,6 +357,8 @@ pub struct RepoVerdict {
     pub kernel_member_count: Option<u64>,
     /// Top-level pipeline stage timings (ms) parsed from the timing stream.
     pub stage_ms: BTreeMap<String, u64>,
+    /// Exact native host-admission timing when the child reached admission.
+    pub index_admission: Option<IndexAdmissionTelemetry>,
     /// A torn partial store dir from a crashed prior run was removed and the
     /// pipeline redone from scratch (the documented resume semantic) — labeled
     /// here so recovery is never a silent fallback (invariant 3).
@@ -340,6 +375,8 @@ struct JobResult {
     row: FleetRepoRow,
     verdict: RepoVerdict,
     rejection_text: Option<String>,
+    /// Exact structured capacity envelope for a scheduling deferral.
+    scheduling_text: Option<String>,
     /// Transitions the main thread must apply, in order.
     transitions: Vec<(RepoState, TransitionContext)>,
     /// `--force` fact refresh instead of transitions.
@@ -384,6 +421,12 @@ pub fn run_pipeline_pass_outcome(
     selection: &Selection,
 ) -> Result<PassOutcome, CalyxError> {
     let started = Instant::now();
+    let host_admission_timeout_ms = validate_pipeline_config(config)?;
+    let effective_index_parallelism = config.parallelism.min(EXPENSIVE_INDEX_HOST_CARDINALITY);
+    let child_budget_secs = config
+        .timeout_secs
+        .checked_add(config.host_admission_timeout_secs)
+        .ok_or_else(|| pipeline_config_error("pipeline + host admission timeout overflow"))?;
     let runs_dir = config.store_root.join("runs");
     fs::create_dir_all(&runs_dir).map_err(|error| CalyxError {
         code: ASTRO_FLEET_STORE_UNAVAILABLE,
@@ -425,6 +468,7 @@ pub fn run_pipeline_pass_outcome(
                         kernel_members_hash: None,
                         kernel_member_count: None,
                         stage_ms: BTreeMap::new(),
+                        index_admission: None,
                         wiped_partial_store: false,
                         store_bytes: None,
                         secs: 0.0,
@@ -446,6 +490,7 @@ pub fn run_pipeline_pass_outcome(
 
     let verdicts_dir = runs_dir.join(format!("verdicts-{}", config.at_unix_secs));
     let rejections_dir = runs_dir.join(format!("rejections-{}", config.at_unix_secs));
+    let scheduling_dir = runs_dir.join(format!("scheduling-{}", config.at_unix_secs));
 
     // #454 disk budget: measured once at pass start, then advanced by each
     // completed repo's measured store bytes — the walk stays O(store) once
@@ -469,7 +514,7 @@ pub fn run_pipeline_pass_outcome(
     let mut in_flight = 0_usize;
     let (tx, rx) = mpsc::channel::<JobResult>();
     loop {
-        while in_flight < config.parallelism.max(1) {
+        while in_flight < effective_index_parallelism {
             if let (Some(budget), Some(total)) = (config.store_budget_bytes, store_total_bytes)
                 && total >= budget
             {
@@ -482,7 +527,7 @@ pub fn run_pipeline_pass_outcome(
             let tx = tx.clone();
             let config_for_job = config.clone();
             thread::spawn(move || {
-                let result = pipeline_job(&row, &config_for_job);
+                let result = pipeline_job(&row, &config_for_job, host_admission_timeout_ms);
                 let _ = tx.send(result);
             });
             in_flight += 1;
@@ -491,7 +536,7 @@ pub fn run_pipeline_pass_outcome(
             break;
         }
         let result = rx
-            .recv_timeout(Duration::from_secs(config.timeout_secs.saturating_mul(2) + 300))
+            .recv_timeout(Duration::from_secs(child_budget_secs.saturating_add(300)))
             .map_err(|error| CalyxError {
                 code: ASTRO_FLEET_PIPELINE_SPAWN,
                 message: format!("pipeline worker did not report within the deadline: {error}"),
@@ -501,6 +546,9 @@ pub fn run_pipeline_pass_outcome(
 
         if let Some(text) = &result.rejection_text {
             write_side_file(&rejections_dir, result.row.record.github_id, "txt", text);
+        }
+        if let Some(text) = &result.scheduling_text {
+            write_side_file(&scheduling_dir, result.row.record.github_id, "json", text);
         }
 
         let mut verdict = result.verdict;
@@ -614,6 +662,7 @@ pub fn run_pipeline_pass_outcome(
         "stale": count(Outcome::Stale),
         "skipped_state": count(Outcome::SkippedState),
         "quarantined": count(Outcome::Quarantined),
+        "deferred_host_busy": count(Outcome::DeferredHostBusy),
         "unattempted_budget": if budget_exhausted_at.is_some() { unattempted_budget } else { 0 },
         "total": verdicts.len(),
     });
@@ -627,6 +676,12 @@ pub fn run_pipeline_pass_outcome(
         "run_id": run_id,
         "kind": "pipeline",
         "config": config,
+        "scheduler": {
+            "requested_parallelism": config.parallelism,
+            "effective_expensive_index_parallelism": effective_index_parallelism,
+            "expensive_index_host_cardinality": EXPENSIVE_INDEX_HOST_CARDINALITY,
+            "host_admission_timeout_ms": host_admission_timeout_ms,
+        },
         "counts": counts,
         "repos_per_hour": repos_per_hour,
         "verdicts": verdicts,
@@ -654,6 +709,7 @@ pub fn run_pipeline_pass_outcome(
     let (commit_seq, ledger_seq) = catalog.record_run_report(&run_id, report_bytes, summary)?;
 
     let failed = count(Outcome::Quarantined);
+    let deferred = count(Outcome::DeferredHostBusy);
     let refusal = if let Some(total) = budget_exhausted_at {
         let budget = config.store_budget_bytes.unwrap_or(0);
         let mut largest: Vec<(&str, u64)> = all_rows
@@ -674,7 +730,7 @@ pub fn run_pipeline_pass_outcome(
             code: ASTRO_FLEET_STORE_BUDGET,
             message: format!(
                 "fleet store total {total} bytes reached the declared budget {budget}; \
-                 {unattempted_budget} selected repo(s) were not attempted ({failed} quarantined this pass); \
+                 {unattempted_budget} selected repo(s) were not attempted ({failed} quarantined and {deferred} capacity-deferred this pass); \
                  largest recorded stores: [{largest_text}]; report {}",
                 report_path.display()
             ),
@@ -688,6 +744,15 @@ pub fn run_pipeline_pass_outcome(
                 report_path.display()
             ),
             remediation: "inspect the run report, per-repo verdicts, and rejection files; quarantine reasons are on the catalog rows",
+        })
+    } else if deferred > 0 {
+        Some(CalyxError {
+            code: ASTRO_FLEET_HOST_BUSY,
+            message: format!(
+                "pipeline pass {run_id} reached its finite host admission budget for {deferred} repo(s) before native index work began; report {}",
+                report_path.display()
+            ),
+            remediation: "the affected catalog rows and source stores were not classified as defective; let the active host index finish and run the next growth cycle, which naturally selects their unchanged source states",
         })
     } else {
         None
@@ -704,9 +769,179 @@ pub fn run_pipeline_pass_outcome(
     })
 }
 
+fn pipeline_config_error(detail: &str) -> CalyxError {
+    CalyxError {
+        code: ASTRO_FLEET_PIPELINE_CONFIG,
+        message: format!("fleet pipeline configuration is invalid: {detail}"),
+        remediation: "pass positive pipeline parallelism/timeout values and a finite host admission wait representable as Windows milliseconds",
+    }
+}
+
+fn validate_pipeline_config(config: &PipelineConfig) -> Result<u32, CalyxError> {
+    if config.parallelism == 0 {
+        return Err(pipeline_config_error(
+            "parallelism must be at least one; zero cannot schedule a worklist",
+        ));
+    }
+    if config.timeout_secs == 0 {
+        return Err(pipeline_config_error(
+            "pipeline timeout must be at least one second",
+        ));
+    }
+    let child_timeout_secs = config
+        .timeout_secs
+        .checked_add(config.host_admission_timeout_secs)
+        .ok_or_else(|| pipeline_config_error("pipeline + host admission timeout overflow"))?;
+    if Instant::now()
+        .checked_add(Duration::from_secs(child_timeout_secs))
+        .is_none()
+    {
+        return Err(pipeline_config_error(
+            "combined child deadline is not representable by the Windows monotonic clock",
+        ));
+    }
+    let timeout_ms = config
+        .host_admission_timeout_secs
+        .checked_mul(1000)
+        .filter(|value| *value < u64::from(u32::MAX))
+        .ok_or_else(|| {
+            pipeline_config_error(
+                "host admission timeout exceeds the finite Windows wait range (INFINITE is forbidden)",
+            )
+        })?;
+    Ok(timeout_ms as u32)
+}
+
+fn index_admission_telemetry(
+    inner: &Value,
+    expected_timeout_ms: u32,
+    timed_out: bool,
+) -> Result<IndexAdmissionTelemetry, String> {
+    let object = inner
+        .get("index_admission")
+        .and_then(Value::as_object)
+        .ok_or_else(|| "index_admission must be an object".to_string())?;
+    let host_timeout_ms = object
+        .get("host_timeout_ms")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| "index_admission.host_timeout_ms must be a u64".to_string())?;
+    let host_waited_ms = object
+        .get("host_waited_ms")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| "index_admission.host_waited_ms must be a u64".to_string())?;
+    let recovered_abandoned_capacity = object
+        .get("recovered_abandoned_capacity")
+        .and_then(Value::as_bool)
+        .ok_or_else(|| "index_admission.recovered_abandoned_capacity must be a bool".to_string())?;
+    if host_timeout_ms != u64::from(expected_timeout_ms) {
+        return Err(format!(
+            "native host_timeout_ms {host_timeout_ms} differs from fleet request {expected_timeout_ms}"
+        ));
+    }
+    if timed_out && recovered_abandoned_capacity {
+        return Err(
+            "a timed-out admission cannot also report recovered abandoned capacity".to_string(),
+        );
+    }
+    Ok(IndexAdmissionTelemetry {
+        host_timeout_ms,
+        host_waited_ms,
+        recovered_abandoned_capacity,
+    })
+}
+
+fn exact_host_busy_outcome(
+    stdout_text: &str,
+    expected_repo: &Path,
+    expected_timeout_ms: u32,
+) -> Result<Option<IndexAdmissionTelemetry>, String> {
+    let Ok(envelope) = serde_json::from_str::<Value>(stdout_text) else {
+        return Ok(None);
+    };
+    let Some(content) = envelope.get("content").and_then(Value::as_array) else {
+        return Ok(None);
+    };
+    let Some(text) = content
+        .first()
+        .and_then(Value::as_object)
+        .and_then(|item| item.get("text"))
+        .and_then(Value::as_str)
+    else {
+        return Ok(None);
+    };
+    let Ok(inner) = serde_json::from_str::<Value>(text) else {
+        return Ok(None);
+    };
+    if inner.get("code").and_then(Value::as_str) != Some("CBM_INDEX_HOST_BUSY") {
+        return Ok(None);
+    }
+
+    if envelope.get("isError").and_then(Value::as_bool) != Some(true)
+        || content.len() != 1
+        || content[0].get("type").and_then(Value::as_str) != Some("text")
+    {
+        return Err("outer tool result must be one text item with isError=true".to_string());
+    }
+    if inner.get("status").and_then(Value::as_str) != Some("error")
+        || inner.get("operation").and_then(Value::as_str) != Some("acquire_index_admission")
+        || inner.get("pipeline_started").and_then(Value::as_bool) != Some(false)
+        || inner
+            .get("sqlite_publication_started")
+            .and_then(Value::as_bool)
+            != Some(false)
+    {
+        return Err(
+            "inner status/operation/no-work flags do not describe an exact admission refusal"
+                .to_string(),
+        );
+    }
+    let _project = inner
+        .get("project")
+        .and_then(Value::as_str)
+        .filter(|project| valid_index_project(project))
+        .ok_or_else(|| "inner project is absent or invalid".to_string())?;
+    let returned_repo = inner
+        .get("repo_path")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "inner repo_path is absent".to_string())?;
+    let expected_canonical = fs::canonicalize(expected_repo).map_err(|error| {
+        format!(
+            "cannot canonicalize expected repo {}: {error}",
+            expected_repo.display()
+        )
+    })?;
+    let returned_canonical = fs::canonicalize(returned_repo).map_err(|error| {
+        format!("cannot canonicalize returned repo_path {returned_repo:?}: {error}")
+    })?;
+    let expected_path = expected_canonical.to_string_lossy().replace('/', "\\");
+    let returned_path = returned_canonical.to_string_lossy().replace('/', "\\");
+    if !expected_path.eq_ignore_ascii_case(&returned_path) {
+        return Err(format!(
+            "returned repo_path {returned_repo:?} resolves to {returned_path:?}, expected {expected_path:?}"
+        ));
+    }
+    if inner
+        .get("message")
+        .and_then(Value::as_str)
+        .is_none_or(str::is_empty)
+        || inner
+            .get("remediation")
+            .and_then(Value::as_str)
+            .is_none_or(str::is_empty)
+    {
+        return Err("inner message/remediation must be non-empty strings".to_string());
+    }
+    let telemetry = index_admission_telemetry(&inner, expected_timeout_ms, true)?;
+    Ok(Some(telemetry))
+}
+
 /// One repo's pipeline job, run on a worker thread. Catalog mutations are
 /// returned to the main thread, never applied here.
-fn pipeline_job(row: &FleetRepoRow, config: &PipelineConfig) -> JobResult {
+fn pipeline_job(
+    row: &FleetRepoRow,
+    config: &PipelineConfig,
+    host_admission_timeout_ms: u32,
+) -> JobResult {
     let started = Instant::now();
     let store_key = project_name(&row.record.full_name);
     let store_dir = config.store_root.join(&store_key);
@@ -725,6 +960,7 @@ fn pipeline_job(row: &FleetRepoRow, config: &PipelineConfig) -> JobResult {
         kernel_members_hash: None,
         kernel_member_count: None,
         stage_ms: BTreeMap::new(),
+        index_admission: None,
         wiped_partial_store: wiped_partial_store.get(),
         store_bytes: None,
         secs: started.elapsed().as_secs_f64(),
@@ -736,6 +972,7 @@ fn pipeline_job(row: &FleetRepoRow, config: &PipelineConfig) -> JobResult {
             ..verdict_base(Outcome::Quarantined, Some(stage), safe_reason(&detail))
         },
         rejection_text: rejection,
+        scheduling_text: None,
         transitions: Vec::new(),
         fact_refresh: None,
     };
@@ -786,6 +1023,7 @@ fn pipeline_job(row: &FleetRepoRow, config: &PipelineConfig) -> JobResult {
                         )
                     },
                     rejection_text: None,
+                    scheduling_text: None,
                     transitions: Vec::new(),
                     fact_refresh: None,
                 },
@@ -802,6 +1040,7 @@ fn pipeline_job(row: &FleetRepoRow, config: &PipelineConfig) -> JobResult {
                         )
                     },
                     rejection_text: None,
+                    scheduling_text: None,
                     transitions: Vec::new(),
                     fact_refresh: None,
                 },
@@ -816,6 +1055,7 @@ fn pipeline_job(row: &FleetRepoRow, config: &PipelineConfig) -> JobResult {
                         )
                     },
                     rejection_text: None,
+                    scheduling_text: None,
                     transitions: Vec::new(),
                     fact_refresh: None,
                 },
@@ -898,6 +1138,10 @@ fn pipeline_job(row: &FleetRepoRow, config: &PipelineConfig) -> JobResult {
         .env("ASTRO_ARCHAEOLOGY_ROOT", &config.archaeology_root)
         .env("ASTRO_NOMIC_DIR", &config.nomic_dir)
         .env("ASTRO_SHADOW_TIMING", "1")
+        .env(
+            FLEET_INDEX_ADMISSION_TIMEOUT_ENV,
+            host_admission_timeout_ms.to_string(),
+        )
         .stdin(Stdio::null())
         .stdout(stdout_file)
         .stderr(stderr_file);
@@ -936,7 +1180,19 @@ fn pipeline_job(row: &FleetRepoRow, config: &PipelineConfig) -> JobResult {
     // 500 ms poll — negligible against a multi-minute index.
     let mut peak_ws: u64 = 0;
     let mut peak_ws_seen = false;
-    let deadline = Instant::now() + Duration::from_secs(config.timeout_secs);
+    let child_timeout_secs = config
+        .host_admission_timeout_secs
+        .checked_add(config.timeout_secs)
+        .expect("pipeline configuration was validated before worker dispatch");
+    let Some(deadline) = Instant::now().checked_add(Duration::from_secs(child_timeout_secs)) else {
+        return fail(
+            "preflight",
+            format!(
+                "{ASTRO_FLEET_PIPELINE_CONFIG}: combined child deadline {child_timeout_secs}s is not representable by the Windows monotonic clock"
+            ),
+            None,
+        );
+    };
     let status = loop {
         if let Some(ws) = child_working_set_bytes(&child) {
             peak_ws_seen = true;
@@ -985,12 +1241,13 @@ fn pipeline_job(row: &FleetRepoRow, config: &PipelineConfig) -> JobResult {
         return fail(
             "timeout",
             format!(
-                "pipeline exceeded {}s and was killed (job-object confined); last phase={phase_label}; peak RSS={mem_label}",
-                config.timeout_secs
+                "pipeline child exceeded the combined {}s admission + {}s pipeline budgets and was killed (job-object confined); last phase={phase_label}; peak RSS={mem_label}",
+                config.host_admission_timeout_secs, config.timeout_secs
             ),
             Some(format!(
-                "repo: {}\nphase: timeout after {}s\nlast pipeline phase: {phase_label}\npeak RSS (working set): {mem_label}\nstderr tail:\n{}\n",
+                "repo: {}\nphase: timeout after {}s admission + {}s pipeline budgets\nlast pipeline phase: {phase_label}\npeak RSS (working set): {mem_label}\nstderr tail:\n{}\n",
                 row.record.full_name,
+                config.host_admission_timeout_secs,
                 config.timeout_secs,
                 tail(&stderr_text, 4000)
             )),
@@ -998,6 +1255,43 @@ fn pipeline_job(row: &FleetRepoRow, config: &PipelineConfig) -> JobResult {
     };
     let stdout_text = fs::read_to_string(&stdout_path).unwrap_or_default();
     if !status.success() {
+        match exact_host_busy_outcome(&stdout_text, &clone_dir, host_admission_timeout_ms) {
+            Ok(Some(index_admission)) => {
+                return JobResult {
+                    row: row.clone(),
+                    verdict: RepoVerdict {
+                        head_commit_hash: Some(head),
+                        index_admission: Some(index_admission.clone()),
+                        secs: started.elapsed().as_secs_f64(),
+                        ..verdict_base(
+                            Outcome::DeferredHostBusy,
+                            Some("admission"),
+                            format!(
+                                "host index capacity remained busy for {}ms of the explicit {}ms fleet budget; native pipeline and SQLite publication did not start",
+                                index_admission.host_waited_ms, index_admission.host_timeout_ms
+                            ),
+                        )
+                    },
+                    rejection_text: None,
+                    scheduling_text: Some(stdout_text),
+                    transitions: Vec::new(),
+                    fact_refresh: None,
+                };
+            }
+            Ok(None) => {}
+            Err(detail) => {
+                return fail(
+                    "parse",
+                    format!("malformed CBM_INDEX_HOST_BUSY envelope: {detail}"),
+                    Some(format!(
+                        "repo: {}\nphase: malformed host admission envelope\nstdout:\n{}\nstderr tail:\n{}\n",
+                        row.record.full_name,
+                        head_of(&stdout_text, 8000),
+                        tail(&stderr_text, 8000)
+                    )),
+                );
+            }
+        }
         // The child exited without a usable tool result. Its stdout is frequently
         // EMPTY here (a C-level pipeline fault hard-exits before the JSON is printed —
         // e.g. the rc=127 silent termination deep in the vault/lowering/kernel phase on
@@ -1074,6 +1368,21 @@ fn pipeline_job(row: &FleetRepoRow, config: &PipelineConfig) -> JobResult {
             )),
         );
     }
+    let index_admission = match index_admission_telemetry(&inner, host_admission_timeout_ms, false)
+    {
+        Ok(telemetry) => telemetry,
+        Err(detail) => {
+            return fail(
+                "parse",
+                format!("index_repository admission telemetry invalid: {detail}"),
+                Some(format!(
+                    "repo: {}\nphase: admission telemetry\n{}\n",
+                    row.record.full_name,
+                    head_of(&inner.to_string(), 8000)
+                )),
+            );
+        }
+    };
     let index_project = match inner["project"].as_str() {
         Some(project) if valid_index_project(project) => project.to_string(),
         Some(project) => {
@@ -1262,11 +1571,13 @@ fn pipeline_job(row: &FleetRepoRow, config: &PipelineConfig) -> JobResult {
             kernel_members_hash: Some(reported_members_hash),
             kernel_member_count: Some(kernel_member_count),
             stage_ms,
+            index_admission: Some(index_admission),
             wiped_partial_store: wiped_partial_store.get(),
             store_bytes: Some(store_bytes),
             secs: started.elapsed().as_secs_f64(),
         },
         rejection_text: None,
+        scheduling_text: None,
         transitions,
         fact_refresh,
     }

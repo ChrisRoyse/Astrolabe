@@ -104,8 +104,11 @@ enum {
  * index already uses the host's measured default worker count (all detected
  * processors for an initial index). A single crash-recoverable host lease keeps
  * that expensive work from being oversubscribed across independent MCP parents.
- * Contention is reported immediately rather than consuming the caller's MCP
- * deadline in an invisible queue. Query-only parents never acquire this lease. */
+ * Ordinary MCP contention is reported immediately rather than consuming the
+ * caller's deadline in an invisible queue. The fleet process may give its
+ * dedicated child an explicit finite ASTRO_FLEET_INDEX_ADMISSION_TIMEOUT_MS;
+ * absence remains the zero-time MCP contract. Query-only parents never acquire
+ * this lease. */
 
 /* JSON-RPC 2.0 standard error codes */
 #define JSONRPC_PARSE_ERROR (-32700)
@@ -131,10 +134,25 @@ static char *yy_doc_to_str(yyjson_mut_doc *doc);
 typedef struct {
     HANDLE project_mutex;
     HANDLE host_mutex;
+    DWORD host_timeout_ms;
+    uint64_t host_waited_ms;
+    bool recovered_abandoned_capacity;
 } cbm_index_admission_t;
 
+static void add_index_admission_telemetry(yyjson_mut_doc *doc, yyjson_mut_val *root,
+                                          const cbm_index_admission_t *admission) {
+    yyjson_mut_val *telemetry = yyjson_mut_obj(doc);
+    yyjson_mut_obj_add_uint(doc, telemetry, "host_timeout_ms",
+                           (uint64_t)admission->host_timeout_ms);
+    yyjson_mut_obj_add_uint(doc, telemetry, "host_waited_ms", admission->host_waited_ms);
+    yyjson_mut_obj_add_bool(doc, telemetry, "recovered_abandoned_capacity",
+                           admission->recovered_abandoned_capacity);
+    yyjson_mut_obj_add_val(doc, root, "index_admission", telemetry);
+}
+
 static char *index_admission_error(const char *code, const char *project, const char *repo_path,
-                                   const char *message, const char *remediation) {
+                                   const char *message, const char *remediation,
+                                   const cbm_index_admission_t *admission) {
     yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
     if (!doc) {
         cbm_log_error("index.admission.failed", "code", "CBM_INDEX_ADMISSION_RESPONSE_ALLOC_FAILED",
@@ -154,14 +172,76 @@ static char *index_admission_error(const char *code, const char *project, const 
     yyjson_mut_obj_add_bool(doc, root, "sqlite_publication_started", false);
     yyjson_mut_obj_add_str(doc, root, "message", message);
     yyjson_mut_obj_add_str(doc, root, "remediation", remediation);
+    add_index_admission_telemetry(doc, root, admission);
     char *json = yy_doc_to_str(doc);
     yyjson_mut_doc_free(doc);
     return json;
 }
 
+static char *load_fleet_host_timeout(const char *project, const char *repo_path,
+                                     cbm_index_admission_t *admission) {
+    char timeout_text[CBM_SZ_32];
+    int env_status =
+        cbm_read_env("ASTRO_FLEET_INDEX_ADMISSION_TIMEOUT_MS", timeout_text, sizeof(timeout_text));
+    if (env_status == 0) {
+        admission->host_timeout_ms = 0;
+        return NULL;
+    }
+    if (env_status < 0 || timeout_text[0] == '\0') {
+        cbm_log_error(
+            "index.admission.failed", "code", "CBM_INDEX_ADMISSION_WAIT_INVALID", "project",
+            project, "repo_path", repo_path, "message",
+            "ASTRO_FLEET_INDEX_ADMISSION_TIMEOUT_MS is empty or cannot be represented exactly",
+            "remediation",
+            "remove the variable for fail-fast MCP admission or pass finite decimal milliseconds");
+        return index_admission_error(
+            "CBM_INDEX_ADMISSION_WAIT_INVALID", project, repo_path,
+            "ASTRO_FLEET_INDEX_ADMISSION_TIMEOUT_MS is empty or cannot be represented exactly",
+            "remove the variable for fail-fast MCP admission or pass finite decimal milliseconds",
+            admission);
+    }
+    for (const char *cursor = timeout_text; *cursor; cursor++) {
+        if (*cursor < '0' || *cursor > '9') {
+            cbm_log_error(
+                "index.admission.failed", "code", "CBM_INDEX_ADMISSION_WAIT_INVALID", "project",
+                project, "repo_path", repo_path, "message",
+                "ASTRO_FLEET_INDEX_ADMISSION_TIMEOUT_MS is not unsigned decimal milliseconds",
+                "remediation",
+                "remove the variable for fail-fast MCP admission or pass finite decimal milliseconds");
+            return index_admission_error(
+                "CBM_INDEX_ADMISSION_WAIT_INVALID", project, repo_path,
+                "ASTRO_FLEET_INDEX_ADMISSION_TIMEOUT_MS is not unsigned decimal milliseconds",
+                "remove the variable for fail-fast MCP admission or pass finite decimal milliseconds",
+                admission);
+        }
+    }
+    errno = 0;
+    char *end = NULL;
+    unsigned long long parsed = strtoull(timeout_text, &end, 10);
+    if (errno == ERANGE || !end || *end != '\0' || parsed >= (unsigned long long)INFINITE) {
+        cbm_log_error(
+            "index.admission.failed", "code", "CBM_INDEX_ADMISSION_WAIT_INVALID", "project",
+            project, "repo_path", repo_path, "message",
+            "ASTRO_FLEET_INDEX_ADMISSION_TIMEOUT_MS is outside the finite Windows wait range",
+            "remediation",
+            "pass decimal milliseconds from zero through INFINITE-1, or remove the variable");
+        return index_admission_error(
+            "CBM_INDEX_ADMISSION_WAIT_INVALID", project, repo_path,
+            "ASTRO_FLEET_INDEX_ADMISSION_TIMEOUT_MS is outside the finite Windows wait range",
+            "pass decimal milliseconds from zero through INFINITE-1, or remove the variable",
+            admission);
+    }
+    admission->host_timeout_ms = (DWORD)parsed;
+    return NULL;
+}
+
 static char *acquire_index_admission(const char *project, const char *repo_path,
                                      cbm_index_admission_t *admission) {
     memset(admission, 0, sizeof(*admission));
+    char *timeout_error = load_fleet_host_timeout(project, repo_path, admission);
+    if (timeout_error) {
+        return timeout_error;
+    }
 
     char project_digest[CBM_SHA256_HEX_LEN + 1];
     cbm_sha256_hex(project, strlen(project), project_digest);
@@ -175,7 +255,8 @@ static char *acquire_index_admission(const char *project, const char *repo_path,
                       "preserve the project store and retry the exact request");
         return index_admission_error("CBM_INDEX_PROJECT_MUTEX_NAME_FAILED", project, repo_path,
                                      "the canonical project mutex name could not be constructed",
-                                     "preserve the project store and retry the exact request");
+                                     "preserve the project store and retry the exact request",
+                                     admission);
     }
 
     admission->project_mutex = CreateMutexW(NULL, FALSE, project_mutex_name);
@@ -190,7 +271,7 @@ static char *acquire_index_admission(const char *project, const char *repo_path,
         return index_admission_error(
             "CBM_INDEX_PROJECT_MUTEX_CREATE_FAILED", project, repo_path,
             "the cross-process project writer mutex could not be opened",
-            "resolve the structured Windows error and retry the unchanged request");
+            "resolve the structured Windows error and retry the unchanged request", admission);
     }
     DWORD project_wait = WaitForSingleObject(admission->project_mutex, 0);
     if (project_wait == WAIT_TIMEOUT) {
@@ -204,7 +285,7 @@ static char *acquire_index_admission(const char *project, const char *repo_path,
         return index_admission_error(
             "CBM_INDEX_PROJECT_BUSY", project, repo_path,
             "another Astrolabe process owns the exact project writer generation",
-            "let the exact project index finish, then retry once");
+            "let the exact project index finish, then retry once", admission);
     }
     if (project_wait == WAIT_ABANDONED) {
         ReleaseMutex(admission->project_mutex);
@@ -220,7 +301,8 @@ static char *acquire_index_admission(const char *project, const char *repo_path,
         return index_admission_error(
             "CBM_INDEX_PROJECT_OWNER_ABANDONED", project, repo_path,
             "the previous exact project writer terminated without releasing its generation",
-            "inspect the complete project database family and worker diagnostics, then retry");
+            "inspect the complete project database family and worker diagnostics, then retry",
+            admission);
     }
     if (project_wait != WAIT_OBJECT_0) {
         char native_error[CBM_SZ_32];
@@ -235,7 +317,7 @@ static char *acquire_index_admission(const char *project, const char *repo_path,
         return index_admission_error(
             "CBM_INDEX_PROJECT_MUTEX_WAIT_FAILED", project, repo_path,
             "the exact project writer mutex could not be evaluated",
-            "resolve the structured Windows error and retry the unchanged request");
+            "resolve the structured Windows error and retry the unchanged request", admission);
     }
 
     admission->host_mutex = CreateMutexW(NULL, FALSE, L"Global\\Astrolabe.ExpensiveIndexHost.v1");
@@ -253,10 +335,12 @@ static char *acquire_index_admission(const char *project, const char *repo_path,
         return index_admission_error(
             "CBM_INDEX_HOST_MUTEX_CREATE_FAILED", project, repo_path,
             "the host-wide expensive-index lease could not be opened",
-            "resolve the structured Windows error and retry the unchanged request");
+            "resolve the structured Windows error and retry the unchanged request", admission);
     }
 
-    DWORD host_wait = WaitForSingleObject(admission->host_mutex, 0);
+    uint64_t wait_started_ms = cbm_now_ms();
+    DWORD host_wait = WaitForSingleObject(admission->host_mutex, admission->host_timeout_ms);
+    admission->host_waited_ms = cbm_now_ms() - wait_started_ms;
     if (host_wait == WAIT_TIMEOUT) {
         CloseHandle(admission->host_mutex);
         admission->host_mutex = NULL;
@@ -271,7 +355,7 @@ static char *acquire_index_admission(const char *project, const char *repo_path,
         return index_admission_error(
             "CBM_INDEX_HOST_BUSY", project, repo_path,
             "another Astrolabe process owns the host-wide expensive-index generation",
-            "let the active index finish, then retry the unchanged request");
+            "let the active index finish, then retry the unchanged request", admission);
     }
     if (host_wait != WAIT_OBJECT_0 && host_wait != WAIT_ABANDONED) {
         char native_error[CBM_SZ_32];
@@ -289,12 +373,19 @@ static char *acquire_index_admission(const char *project, const char *repo_path,
         return index_admission_error(
             "CBM_INDEX_HOST_MUTEX_WAIT_FAILED", project, repo_path,
             "the host-wide expensive-index lease could not be evaluated",
-            "resolve the structured Windows error and retry the unchanged request");
+            "resolve the structured Windows error and retry the unchanged request", admission);
     }
 
+    admission->recovered_abandoned_capacity = host_wait == WAIT_ABANDONED;
+    char timeout_text[CBM_SZ_32];
+    char waited_text[CBM_SZ_32];
+    snprintf(timeout_text, sizeof(timeout_text), "%lu", (unsigned long)admission->host_timeout_ms);
+    snprintf(waited_text, sizeof(waited_text), "%llu",
+             (unsigned long long)admission->host_waited_ms);
     cbm_log_info("index.admission.acquired", "project", project, "repo_path", repo_path,
-                 "waited_ms", "0", "recovered_abandoned_capacity",
-                 host_wait == WAIT_ABANDONED ? "true" : "false");
+                 "timeout_ms", timeout_text, "waited_ms", waited_text,
+                 "recovered_abandoned_capacity",
+                 admission->recovered_abandoned_capacity ? "true" : "false");
     return NULL;
 }
 
@@ -5709,6 +5800,9 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
     yyjson_mut_doc_set_root(doc, root);
 
     yyjson_mut_obj_add_str(doc, root, "project", project_name);
+#ifdef _WIN32
+    add_index_admission_telemetry(doc, root, &admission);
+#endif
 
     char *postcondition_error = NULL;
     if (rc == 0) {

@@ -22,6 +22,7 @@
 //!                              [--archaeology-root <dir>] [--nomic-dir <dir>]
 //!                              (--repo <owner/name> ... | --all-cloned)
 //!                              [--limit <n>] [--parallelism <n>] [--timeout-secs <n>]
+//!                              [--host-admission-timeout-secs <n>]
 //!                              [--force] [--at <unix-secs>]
 //! astrolabe-fleet retire-source [--root <dir>] [--farm-root <dir>]
 //!                              [--store-root <dir>] [--scope <fleet-scope>]
@@ -36,7 +37,8 @@
 //!                              [--astrolabe-bin <exe>] [--nomic-dir <dir>]
 //!                              [--size-cap-bytes <n>] [--budget-bytes <n>]
 //!                              [--store-budget-bytes <n>] [--parallelism <n>]
-//!                              [--timeout-secs <n>] [--at <unix-secs>]
+//!                              [--timeout-secs <n>] [--host-admission-timeout-secs <n>]
+//!                              [--at <unix-secs>]
 //! astrolabe-fleet ledger-scan  [--root <dir>] [--github-id <id>] [--event <name>] [--limit <n>]
 //! ```
 //!
@@ -45,9 +47,12 @@
 //! bounded selection (forced > stale > resume > reentrant > acquire) → pipeline re-index
 //! → debt-gated fleet recomposition → reconciliation → persisted cycle
 //! report. `--once` is the Task-Scheduler-friendly single cycle; `--cycles N
-//! --interval-secs S` is the supervised loop. `--parallelism`/`--timeout-secs`
-//! apply to the pipeline phase (the clone farm keeps its own defaults except
-//! `--timeout-secs`, which bounds both).
+//! --interval-secs S` is the supervised loop. `--parallelism` records the
+//! pipeline worklist request while the measured whole-host native index stage
+//! remains explicitly capped at one; clone/download work keeps the clone
+//! farm's independent concurrency. `--timeout-secs` bounds clone and native
+//! pipeline work, and `--host-admission-timeout-secs` is the fleet-only finite
+//! wait for externally owned index capacity.
 //!
 //! `--root` defaults to the declared production catalog root
 //! [`astrolabe_fleet::discover::DEFAULT_CATALOG_ROOT`] (`D:\astrolabe-fleet\catalog`).
@@ -379,6 +384,7 @@ fn run(args: &[String]) -> Result<(), CalyxError> {
                 "limit",
                 "parallelism",
                 "timeout-secs",
+                "host-admission-timeout-secs",
                 "force",
                 "store-budget-bytes",
                 "at",
@@ -406,6 +412,16 @@ fn run(args: &[String]) -> Result<(), CalyxError> {
                 config.timeout_secs = raw
                     .parse::<u64>()
                     .map_err(|error| usage(&format!("--timeout-secs must be a u64: {error}")))?;
+                if opts.get("host-admission-timeout-secs").is_none() {
+                    config.host_admission_timeout_secs = config.timeout_secs;
+                }
+            }
+            if let Some(raw) = opts.get("host-admission-timeout-secs") {
+                config.host_admission_timeout_secs = raw.parse::<u64>().map_err(|error| {
+                    usage(&format!(
+                        "--host-admission-timeout-secs must be a u64: {error}"
+                    ))
+                })?;
             }
             config.force = opts.flag("force");
             if let Some(raw) = opts.get("store-budget-bytes") {
@@ -498,6 +514,7 @@ fn run(args: &[String]) -> Result<(), CalyxError> {
                 "store-budget-bytes",
                 "parallelism",
                 "timeout-secs",
+                "host-admission-timeout-secs",
                 "at",
             ])?;
             let once = opts.flag("once");
@@ -587,6 +604,16 @@ fn run(args: &[String]) -> Result<(), CalyxError> {
                 pipeline.timeout_secs = raw
                     .parse::<u64>()
                     .map_err(|error| usage(&format!("--timeout-secs must be a u64: {error}")))?;
+                if opts.get("host-admission-timeout-secs").is_none() {
+                    pipeline.host_admission_timeout_secs = pipeline.timeout_secs;
+                }
+            }
+            if let Some(raw) = opts.get("host-admission-timeout-secs") {
+                pipeline.host_admission_timeout_secs = raw.parse::<u64>().map_err(|error| {
+                    usage(&format!(
+                        "--host-admission-timeout-secs must be a u64: {error}"
+                    ))
+                })?;
             }
             if let Some(raw) = opts.get("store-budget-bytes") {
                 pipeline.store_budget_bytes = Some(raw.parse::<u64>().map_err(|error| {
