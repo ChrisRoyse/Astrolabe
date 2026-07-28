@@ -490,13 +490,40 @@ pub fn run_clone_pass_outcome(
                     },
                 )?;
             }
+            Outcome::Noop => {
+                let bytes = result.bytes.ok_or_else(|| CalyxError {
+                    code: ASTRO_FLEET_GIT_SPAWN,
+                    message: format!(
+                        "unchanged update outcome for {} carried no fresh byte measurement",
+                        result.row.record.full_name
+                    ),
+                    remediation: "internal defect: every successful unchanged fetch must report a strict current source measurement",
+                })?;
+                if result.row.clone_bytes != Some(bytes) {
+                    farm_bytes = farm_bytes
+                        .saturating_sub(result.row.clone_bytes.unwrap_or(0))
+                        .saturating_add(bytes);
+                    catalog.update_facts(
+                        result.row.record.github_id,
+                        &result.row.record.full_name,
+                        TransitionContext {
+                            at_unix_secs: config.at_unix_secs,
+                            clone_bytes: Some(bytes),
+                            ..TransitionContext::default()
+                        },
+                    )?;
+                    result.detail.push_str(&format!(
+                        "; clone byte measurement reconciled from {} to {bytes}",
+                        result.row.clone_bytes.unwrap_or(0)
+                    ));
+                }
+            }
             Outcome::Quarantined => {
                 apply_quarantine(catalog, config, &result.row, &result.detail)?;
             }
             // No catalog mutation: explicit no-op, foreign-content conflict,
             // or a kept-state update failure — all counted below.
-            Outcome::Noop
-            | Outcome::Rehydrated
+            Outcome::Rehydrated
             | Outcome::Conflict
             | Outcome::UpdateFailed
             | Outcome::SkippedState
@@ -1172,23 +1199,30 @@ fn write_exclusions_file(runs_dir: &Path, github_id: u64, offenders: &[(String, 
     }
 }
 
-/// Recursive on-disk byte measure of a clone directory.
-fn measure_dir_bytes(dir: &Path) -> u64 {
+/// Strict recursive no-follow on-disk byte measure of a clone directory.
+fn measure_dir_bytes(dir: &Path) -> Result<u64, String> {
     let mut total = 0_u64;
-    let Ok(entries) = fs::read_dir(dir) else {
-        return 0;
-    };
-    for entry in entries.flatten() {
-        let Ok(kind) = entry.file_type() else {
-            continue;
-        };
+    let entries = fs::read_dir(dir)
+        .map_err(|error| format!("cannot enumerate {}: {error}", dir.display()))?;
+    for entry in entries {
+        let entry =
+            entry.map_err(|error| format!("cannot read entry under {}: {error}", dir.display()))?;
+        let kind = entry
+            .file_type()
+            .map_err(|error| format!("cannot classify {}: {error}", entry.path().display()))?;
         if kind.is_dir() {
-            total += measure_dir_bytes(&entry.path());
-        } else if let Ok(meta) = entry.metadata() {
-            total += meta.len();
+            total = total
+                .checked_add(measure_dir_bytes(&entry.path())?)
+                .ok_or_else(|| format!("byte measurement overflow under {}", dir.display()))?;
+        } else {
+            let metadata = fs::symlink_metadata(entry.path())
+                .map_err(|error| format!("cannot stat {}: {error}", entry.path().display()))?;
+            total = total
+                .checked_add(metadata.len())
+                .ok_or_else(|| format!("byte measurement overflow under {}", dir.display()))?;
         }
     }
-    total
+    Ok(total)
 }
 
 /// URL equivalence for adoption: scheme-insensitive host + path, tolerant of a
@@ -1317,7 +1351,25 @@ fn acquire_job(row: &FleetRepoRow, config: &FarmConfig) -> JobResult {
                                     &offenders,
                                 );
                             }
-                            let bytes = measure_dir_bytes(&dir);
+                            let bytes = match measure_dir_bytes(&dir) {
+                                Ok(bytes) => bytes,
+                                Err(why) => {
+                                    return done(
+                                        Outcome::Quarantined,
+                                        safe_reason(&format!(
+                                            "adopted clone byte measurement failed; rejection file {}.txt has details",
+                                            row.record.github_id
+                                        )),
+                                        None,
+                                        None,
+                                        Some(format!(
+                                            "repo: {}\nphase: adoption byte measurement\n{why}\n",
+                                            row.record.full_name
+                                        )),
+                                        None,
+                                    );
+                                }
+                            };
                             if bytes > config.size_cap_bytes {
                                 return done(
                                     Outcome::Quarantined,
@@ -1478,7 +1530,26 @@ fn acquire_job(row: &FleetRepoRow, config: &FarmConfig) -> JobResult {
                         );
                     }
                     // Post-checkout measured size cap.
-                    let bytes = measure_dir_bytes(&dir);
+                    let bytes = match measure_dir_bytes(&dir) {
+                        Ok(bytes) => bytes,
+                        Err(why) => {
+                            return done(
+                                Outcome::Quarantined,
+                                safe_reason(&format!(
+                                    "fresh clone byte measurement failed; rejection file {}.txt has details",
+                                    row.record.github_id
+                                )),
+                                None,
+                                None,
+                                Some(format!(
+                                    "repo: {}\nphase: fresh clone byte measurement\n{why}\nclone directory preserved for exact inspection: {}\n",
+                                    row.record.full_name,
+                                    dir.display()
+                                )),
+                                None,
+                            );
+                        }
+                    };
                     if bytes > config.size_cap_bytes {
                         let _ = fs::remove_dir_all(&dir);
                         return done(
@@ -1662,11 +1733,30 @@ fn update_job(row: &FleetRepoRow, config: &FarmConfig) -> JobResult {
         );
     }
     if Some(fetched_head.as_str()) == row.head_commit_hash.as_deref() {
+        let bytes = match measure_dir_bytes(&dir) {
+            Ok(bytes) => bytes,
+            Err(why) => {
+                return done(
+                    Outcome::UpdateFailed,
+                    safe_reason(&format!(
+                        "unchanged fetch byte measurement failed; rejection file {}.txt has details",
+                        row.record.github_id
+                    )),
+                    None,
+                    None,
+                    Some(format!(
+                        "repo: {}\nphase: unchanged fetch byte measurement\n{why}\n",
+                        row.record.full_name
+                    )),
+                    None,
+                );
+            }
+        };
         return done(
             Outcome::Noop,
             "head watermark unchanged".into(),
             row.head_commit_hash.clone(),
-            row.clone_bytes,
+            Some(bytes),
             None,
             None,
         );
@@ -1743,7 +1833,25 @@ fn update_job(row: &FleetRepoRow, config: &FarmConfig) -> JobResult {
     }
     match integrity_gate(&dir) {
         Ok(head) => {
-            let bytes = measure_dir_bytes(&dir);
+            let bytes = match measure_dir_bytes(&dir) {
+                Ok(bytes) => bytes,
+                Err(why) => {
+                    return done(
+                        Outcome::UpdateFailed,
+                        safe_reason(&format!(
+                            "updated clone byte measurement failed; rejection file {}.txt has details",
+                            row.record.github_id
+                        )),
+                        None,
+                        None,
+                        Some(format!(
+                            "repo: {}\nphase: updated clone byte measurement\n{why}\n",
+                            row.record.full_name
+                        )),
+                        None,
+                    );
+                }
+            };
             let detail = if offenders.is_empty() {
                 "head watermark advanced".to_string()
             } else {

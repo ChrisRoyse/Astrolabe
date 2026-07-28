@@ -246,7 +246,7 @@ fn retire_one(
         .clone_path
         .as_deref()
         .ok_or_else(|| refusal(name, "kerneled row has no clone_path and is not retired"))?;
-    let clone_bytes = row
+    let catalog_clone_bytes = row
         .clone_bytes
         .ok_or_else(|| refusal(name, "kerneled row has no measured clone_bytes"))?;
     let head = row
@@ -279,14 +279,21 @@ fn retire_one(
     }
     verify_git(&row, &source_path)?;
     let inventory = inventory(&source_path)?;
-    if inventory.bytes != clone_bytes {
-        return Err(refusal(
-            name,
-            &format!(
-                "strict measured source bytes {} differ from catalog clone_bytes {clone_bytes}",
-                inventory.bytes
-            ),
-        ));
+    if inventory.bytes != catalog_clone_bytes {
+        eprintln!(
+            "{}",
+            json!({
+                "code": "ASTRO_FLEET_CLONE_BYTES_RECONCILED",
+                "message": format!(
+                    "fresh no-follow source measurement for {name} is {} bytes; prior catalog capacity observation was {catalog_clone_bytes} bytes",
+                    inventory.bytes
+                ),
+                "remediation": "none; the retirement intent atomically binds the fresh inventory measurement while preserving the prior observation in its ledger event",
+                "full_name": name,
+                "catalog_clone_bytes_before": catalog_clone_bytes,
+                "measured_clone_bytes": inventory.bytes,
+            })
+        );
     }
     let binding = verify_kernel_binding(catalog, &config.store_root, &config.scope, &row, None)?;
     let transaction_id = transaction_id(
@@ -320,7 +327,7 @@ fn retire_one(
         tombstone_path: tombstone.display().to_string(),
         head_commit_hash: head.to_string(),
         pushed_at: row.record.pushed_at.clone(),
-        clone_bytes,
+        clone_bytes: inventory.bytes,
         inventory_hash: inventory.hash,
         inventory_entries: inventory.entries,
         repo_members_hash: binding.repo_members_hash,

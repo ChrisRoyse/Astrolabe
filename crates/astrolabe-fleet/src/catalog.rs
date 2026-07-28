@@ -499,15 +499,24 @@ impl FleetCatalog {
             ));
         }
         if row.clone_path.as_deref() != Some(retirement.source_path.as_str())
-            || row.clone_bytes != Some(retirement.clone_bytes)
+            || row.clone_bytes.is_none()
             || row.head_commit_hash.as_deref() != Some(retirement.head_commit_hash.as_str())
         {
             return Err(source_retirement_error(
                 full_name,
-                "intent source path, bytes, or HEAD differs from the live catalog facts"
+                "intent source path or HEAD differs from the live catalog facts, or the live row has no prior byte measurement"
                     .to_string(),
             ));
         }
+        // `clone_bytes` is capacity telemetry, not a content identity. Even an
+        // unchanged `git fetch` writes FETCH_HEAD and may run repository
+        // maintenance. The retirement inventory is the strict, current,
+        // no-follow observation; reconcile the capacity fact in the same
+        // ledger-paired commit that makes that exact inventory authoritative.
+        let catalog_clone_bytes_before = row
+            .clone_bytes
+            .expect("live byte measurement was required immediately above");
+        row.clone_bytes = Some(retirement.clone_bytes);
         row.source_retirement = Some(retirement.clone());
         let payload = serde_json::to_vec(&json!({
             "event": "fleet_source_retirement_intent",
@@ -520,6 +529,8 @@ impl FleetCatalog {
             "tombstone_path": retirement.tombstone_path,
             "head_commit_hash": retirement.head_commit_hash,
             "clone_bytes": retirement.clone_bytes,
+            "catalog_clone_bytes_before": catalog_clone_bytes_before,
+            "measured_clone_bytes": retirement.clone_bytes,
             "inventory_hash": retirement.inventory_hash,
             "inventory_entries": retirement.inventory_entries,
             "repo_members_hash": retirement.repo_members_hash,
