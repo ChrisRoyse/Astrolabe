@@ -88,7 +88,7 @@ fn fixed_cf_tag(cf: ColumnFamily) -> u8 {
     }
 }
 
-fn decode_fixed_cf(tag: u8) -> Result<ColumnFamily> {
+pub(crate) fn decode_fixed_cf(tag: u8) -> Result<ColumnFamily> {
     Ok(match tag {
         0 => ColumnFamily::Base,
         117 => ColumnFamily::Collections,

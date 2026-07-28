@@ -4,7 +4,7 @@ mod accessors;
 mod anchor_codec;
 mod anchor_merge;
 mod batch_ingest;
-mod cf_codec;
+pub(crate) mod cf_codec;
 mod commit;
 mod compaction_bridge;
 pub mod context;

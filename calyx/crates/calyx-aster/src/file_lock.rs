@@ -1,8 +1,8 @@
 use calyx_core::{CalyxError, Result};
 use std::collections::BTreeMap;
-use std::fs::{File, OpenOptions};
+use std::fs::{File, OpenOptions, TryLockError as FileTryLockError};
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::sync::{Mutex, MutexGuard, OnceLock, TryLockError as MutexTryLockError};
 
 static PROCESS_LOCKS: OnceLock<Mutex<BTreeMap<PathBuf, &'static Mutex<()>>>> = OnceLock::new();
 
@@ -29,6 +29,42 @@ impl FileLockGuard {
             _process_guard: process_guard,
             _file: file,
         })
+    }
+
+    pub(crate) fn try_acquire(path: &Path, locked_error: fn(String) -> CalyxError) -> Result<Self> {
+        let key = lock_key(path)?;
+        let process_guard = match process_mutex(&key).try_lock() {
+            Ok(guard) => guard,
+            Err(MutexTryLockError::WouldBlock) => {
+                return Err(locked_error(format!(
+                    "another thread in this process holds {}",
+                    key.display()
+                )));
+            }
+            Err(MutexTryLockError::Poisoned(_)) => {
+                return Err(CalyxError::backpressure("file lock mutex poisoned"));
+            }
+        };
+        let file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .append(true)
+            .open(path)
+            .map_err(|error| CalyxError::disk_pressure(format!("open lock file: {error}")))?;
+        match file.try_lock() {
+            Ok(()) => Ok(Self {
+                _process_guard: process_guard,
+                _file: file,
+            }),
+            Err(FileTryLockError::WouldBlock) => Err(locked_error(format!(
+                "another process holds {}",
+                key.display()
+            ))),
+            Err(FileTryLockError::Error(error)) => Err(CalyxError::backpressure(format!(
+                "try lock file {}: {error}",
+                key.display()
+            ))),
+        }
     }
 }
 

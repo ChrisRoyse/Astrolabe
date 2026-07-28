@@ -27,6 +27,8 @@
 //! astrolabe-fleet retire-source [--root <dir>] [--farm-root <dir>]
 //!                              [--store-root <dir>] [--scope <fleet-scope>]
 //!                              --repo <owner/name> ... [--at <unix-secs>]
+//! astrolabe-fleet migrate-vault-wal [--root <dir>] [--store-root <dir>]
+//!                              --repo <owner/name>
 //! astrolabe-fleet grow         [--root <dir>] (--once | --cycles <n>) [--interval-secs <n>]
 //!                              [--scope <fleet-scope>] [--discovery] [--language <csv>]
 //!                              [--star-floor <n>] [--acquire] [--retry-quarantined]
@@ -77,7 +79,7 @@ use astrolabe_fleet::state::RepoState;
 use calyx_core::{CalyxError, CxId};
 use serde_json::json;
 
-const USAGE: &str = "usage: astrolabe-fleet <catalog-init|register|set-state|get|list|discover|clone|pipeline|retire-source|grow|ledger-scan|report|report-read|report-list|run-report-read|probe-vault-keys|dedup-census|compose|kernel-read> [--root <dir>] [verb options]; see crate docs";
+const USAGE: &str = "usage: astrolabe-fleet <catalog-init|register|set-state|get|list|discover|clone|pipeline|retire-source|migrate-vault-wal|grow|ledger-scan|report|report-read|report-list|run-report-read|probe-vault-keys|dedup-census|compose|kernel-read> [--root <dir>] [verb options]; see crate docs";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -111,7 +113,7 @@ fn run(args: &[String]) -> Result<(), CalyxError> {
     // for the whole pass; read verbs stay lock-free. A second mutating pass on
     // the same root refuses fail-closed (ASTRO_FLEET_FARM_LOCKED) instead of
     // racing the store the way the 2026-07-16 dual retry-release did (#460).
-    const MUTATING_VERBS: [&str; 11] = [
+    const MUTATING_VERBS: [&str; 12] = [
         "catalog-init",
         "register",
         "set-state",
@@ -119,6 +121,7 @@ fn run(args: &[String]) -> Result<(), CalyxError> {
         "clone",
         "pipeline",
         "retire-source",
+        "migrate-vault-wal",
         "grow",
         "report",
         "dedup-census",
@@ -486,6 +489,65 @@ fn run(args: &[String]) -> Result<(), CalyxError> {
                 return Err(refusal);
             }
             println!("{}", outcome.report);
+            Ok(())
+        }
+        "migrate-vault-wal" => {
+            opts.reject_unknown(&["root", "store-root", "repo"])?;
+            let repos = opts.get_all("repo");
+            if repos.len() != 1 {
+                return Err(usage(
+                    "migrate-vault-wal needs exactly one --repo <owner/name>",
+                ));
+            }
+            let repo = repos[0];
+            let row = catalog
+                .query(None, None)?
+                .into_iter()
+                .find(|row| row.record.full_name == repo)
+                .ok_or_else(|| CalyxError {
+                    code: "ASTRO_FLEET_PROJECT_IDENTITY",
+                    message: format!("fleet catalog has no exact repository {repo:?}"),
+                    remediation: "pass the exact owner/name stored in the fleet catalog",
+                })?;
+            let identity = astrolabe_fleet::orchestrator::repo_store_identity(&row)?;
+            let store_root = PathBuf::from(
+                opts.get("store-root")
+                    .unwrap_or(astrolabe_fleet::orchestrator::DEFAULT_STORE_ROOT),
+            );
+            let vault_path = store_root
+                .join(&identity.store_key)
+                .join(format!("{}.astrolabe-vault", identity.index_project));
+            let migration = calyx_aster::wal::migrate_legacy_wal_tail(&vault_path)?;
+            let kernel = astrolabe_fleet::compose::load_repo_kernel(
+                &store_root,
+                &identity.store_key,
+                &identity.index_project,
+            )?
+            .ok_or_else(|| CalyxError {
+                code: astrolabe_fleet::compose::ASTRO_FLEET_KERNEL_MISSING,
+                message: format!(
+                    "vault {} reopened after WAL migration but has no persisted per-repo kernel",
+                    vault_path.display()
+                ),
+                remediation: "preserve the migrated vault and re-run the real pipeline to persist its per-repo kernel before source retirement",
+            })?;
+            println!(
+                "{}",
+                serde_json::json!({
+                    "verb": "migrate-vault-wal",
+                    "repo": repo,
+                    "store_key": identity.store_key,
+                    "index_project": identity.index_project,
+                    "kernel_scope": identity.kernel_scope,
+                    "migration": migration,
+                    "kernel_readback": {
+                        "members_hash": kernel.members_hash,
+                        "member_count": kernel.occurrences.len(),
+                        "node_count": kernel.node_count,
+                        "recall_permille": kernel.recall_permille,
+                    },
+                })
+            );
             Ok(())
         }
         "grow" => {

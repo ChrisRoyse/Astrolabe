@@ -20,6 +20,68 @@ pub fn replay_dir_after(dir: impl AsRef<Path>, replay_floor_seq: u64) -> Result<
     replay_dir_locked_after(dir, replay_floor_seq)
 }
 
+/// Validates every physical record and CRC without truncating, while returning
+/// payloads only for logical commits above `replay_floor_seq`.
+///
+/// This is the full-restore verifier path: checkpointed payloads must not be
+/// interpreted again, but their physical bytes still have to pass framing and
+/// checksum validation.
+pub fn replay_dir_read_only_after(
+    dir: impl AsRef<Path>,
+    replay_floor_seq: u64,
+) -> Result<ReplayOutcome> {
+    let dir = dir.as_ref();
+    let _lock = crate::file_lock::FileLockGuard::acquire(&dir.join(".append.lock"))?;
+    replay_dir_read_only_locked_after(dir, replay_floor_seq)
+}
+
+pub(super) fn replay_dir_read_only_locked_after(
+    dir: &Path,
+    replay_floor_seq: u64,
+) -> Result<ReplayOutcome> {
+    let segments = segment::list_segments(dir)?;
+    let mut records = Vec::new();
+
+    for (_, path) in segments {
+        let mut file = File::open(&path)
+            .map_err(|error| storage_error("open WAL segment read-only", error))?;
+        let mut offset = 0;
+        loop {
+            match record::decode_logical_at(&mut file, offset)
+                .map_err(|error| storage_error("validate WAL record read-only", error))?
+            {
+                LogicalStatus::Complete(decoded) => {
+                    offset = decoded.end_offset;
+                    if decoded.seq > replay_floor_seq {
+                        records.push(ReplayRecord {
+                            seq: decoded.seq,
+                            payload: decoded.payload,
+                            segment_path: path.clone(),
+                            start_offset: decoded.start_offset,
+                            end_offset: decoded.end_offset,
+                        });
+                    }
+                }
+                LogicalStatus::Eof => break,
+                LogicalStatus::Torn { offset, message } => {
+                    return Err(TornTail {
+                        segment_path: path.clone(),
+                        offset,
+                        code: CalyxErrorCode::AsterTornWal.code(),
+                        message,
+                    }
+                    .error());
+                }
+            }
+        }
+    }
+
+    Ok(ReplayOutcome {
+        records,
+        torn_tail: None,
+    })
+}
+
 pub(super) fn replay_dir_locked(dir: &Path) -> Result<ReplayOutcome> {
     replay_dir_locked_after(dir, 0)
 }

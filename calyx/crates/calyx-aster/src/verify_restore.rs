@@ -19,10 +19,11 @@ use std::path::{Path, PathBuf};
 use crate::cf::{ColumnFamily, slot_key};
 use crate::ledger_head::read_head_anchor;
 use crate::ledger_view::parse_aster_ledger_seq;
+use crate::manifest::ManifestStore;
 use crate::sst::SstEntry;
 use crate::sst::level::SstLevel;
 use crate::vault::encode::{decode_constellation_base, decode_slot_vector, decode_write_batch};
-use crate::wal::replay_dir;
+use crate::wal::replay_dir_read_only_after;
 use calyx_core::{CalyxError, Result};
 use calyx_ledger::{
     LedgerCfStore, LedgerHeadAnchor, LedgerRow, VerifyResult, decode as decode_ledger_entry,
@@ -207,7 +208,12 @@ fn read_wal_overlay(vault: &Path) -> Result<WalOverlay> {
     if !wal_dir.is_dir() {
         return Ok(overlay);
     }
-    let replay = replay_dir(&wal_dir)?;
+    let replay_floor_seq = if vault.join("CURRENT").is_file() {
+        ManifestStore::open(vault).load_current()?.durable_seq
+    } else {
+        0
+    };
+    let replay = replay_dir_read_only_after(&wal_dir, replay_floor_seq)?;
     if let Some(torn) = replay.torn_tail {
         return Err(torn.error());
     }
