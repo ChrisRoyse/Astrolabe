@@ -1150,11 +1150,11 @@ pub(crate) fn ensure_shadow_import_current_at(
     match evaluate_shadow_content_freshness(cache_dir, project)? {
         // Live source fingerprint matches the persisted watermark, in the same digest
         // domain: nothing to refresh.
-        ShadowContentVerdict::Fresh => return Ok(ShadowRefreshStatus::Current),
+        ShadowContentVerdict::Fresh => Ok(ShadowRefreshStatus::Current),
         ShadowContentVerdict::Unverifiable {
             source_missing: true,
             ..
-        } => return Ok(ShadowRefreshStatus::StaleReindexRequired),
+        } => Ok(ShadowRefreshStatus::StaleReindexRequired),
         // Genuine staleness (#222), an out-of-band git source change (#347), an unusable
         // watermark domain (#223), or a missing/broken derived artifact while the source
         // is live. All need reconciliation against current source — but only an import
@@ -1165,7 +1165,7 @@ pub(crate) fn ensure_shadow_import_current_at(
         | ShadowContentVerdict::Unverifiable {
             source_missing: false,
             ..
-        } => return Ok(ShadowRefreshStatus::StaleReindexRequired),
+        } => Ok(ShadowRefreshStatus::StaleReindexRequired),
     }
 }
 

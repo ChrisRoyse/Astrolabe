@@ -6,6 +6,9 @@ use std::io::{Read, Write};
 const PUBLICATION_DIR: &str = ".astrolabe-shadow-publication";
 const PUBLICATION_JOURNAL: &str = "transaction.json";
 
+type StagedArtifactValidation = (String, String, String, Vec<(String, String)>);
+type PublicationConfigReadback = (Option<String>, Option<String>, Option<String>);
+
 /// Failure-atomic publication context for one shadow-index generation.
 ///
 /// All CBM, Calyx, weave, lower, and kernel work happens below `stage_cache`.
@@ -118,23 +121,22 @@ impl ShadowPublication {
                 ));
             }
         }
-        let validation =
-            (|| -> Result<(String, String, String, Vec<(String, String)>), DynError> {
-                checkpoint_sqlite(&staged_source, "staged CBM source")?;
-                checkpoint_sqlite(&staged_lowered, "staged lowered SQLite")?;
-                let source_hash = sha256_file_hex(&staged_source)?;
-                let lowered_hash = sha256_file_hex(&staged_lowered)?;
-                let vault_hash = sha256_tree_hex(&staged_vault)?;
-                let config_prefix = format!("{CONFIG_KEY_PREFIX}{}", self.project);
-                let metadata_prefix = format!("{config_prefix}.");
-                let staged_config_rows = scan_config_prefix(&self.stage_cache, &config_prefix)?
-                    .into_iter()
-                    .filter(|(key, _)| {
-                        key == &dial_key(&self.project) || key.starts_with(&metadata_prefix)
-                    })
-                    .collect::<Vec<_>>();
-                Ok((source_hash, lowered_hash, vault_hash, staged_config_rows))
-            })();
+        let validation = (|| -> Result<StagedArtifactValidation, DynError> {
+            checkpoint_sqlite(&staged_source, "staged CBM source")?;
+            checkpoint_sqlite(&staged_lowered, "staged lowered SQLite")?;
+            let source_hash = sha256_file_hex(&staged_source)?;
+            let lowered_hash = sha256_file_hex(&staged_lowered)?;
+            let vault_hash = sha256_tree_hex(&staged_vault)?;
+            let config_prefix = format!("{CONFIG_KEY_PREFIX}{}", self.project);
+            let metadata_prefix = format!("{config_prefix}.");
+            let staged_config_rows = scan_config_prefix(&self.stage_cache, &config_prefix)?
+                .into_iter()
+                .filter(|(key, _)| {
+                    key == &dial_key(&self.project) || key.starts_with(&metadata_prefix)
+                })
+                .collect::<Vec<_>>();
+            Ok((source_hash, lowered_hash, vault_hash, staged_config_rows))
+        })();
         let (source_hash, lowered_hash, vault_hash, staged_config_rows) = match validation {
             Ok(validation) => validation,
             Err(error) => return Err(self.abort_error("staged readback validation", error)),
@@ -241,23 +243,22 @@ impl ShadowPublication {
             return Err(self.abort_error("config commit", combine_rollback_error(error, rollback)));
         }
 
-        let config_readback =
-            (|| -> Result<(Option<String>, Option<String>, Option<String>), DynError> {
-                Ok((
-                    read_config_value(
-                        &self.live_cache,
-                        &metadata_key(&self.project, "sqlite_path"),
-                    )?,
-                    read_config_value(
-                        &self.live_cache,
-                        &metadata_key(&self.project, "vault_fingerprint"),
-                    )?,
-                    read_config_value(
-                        &self.live_cache,
-                        &metadata_key(&self.project, "symbol_canonical_schema"),
-                    )?,
-                ))
-            })();
+        let config_readback = (|| -> Result<PublicationConfigReadback, DynError> {
+            Ok((
+                read_config_value(
+                    &self.live_cache,
+                    &metadata_key(&self.project, "sqlite_path"),
+                )?,
+                read_config_value(
+                    &self.live_cache,
+                    &metadata_key(&self.project, "vault_fingerprint"),
+                )?,
+                read_config_value(
+                    &self.live_cache,
+                    &metadata_key(&self.project, "symbol_canonical_schema"),
+                )?,
+            ))
+        })();
         let (persisted_source, persisted_watermark, persisted_symbol_schema) = match config_readback
         {
             Ok(readback) => readback,
@@ -493,10 +494,10 @@ impl ShadowPublication {
         if let Err(error) = remove_empty_dir(&self.project_root) {
             return Err(self.abort_error("unchanged project-root cleanup", error));
         }
-        if let Some(parent) = self.project_root.parent() {
-            if let Err(error) = remove_empty_dir(parent) {
-                return Err(self.abort_error("unchanged publication-root cleanup", error));
-            }
+        if let Some(parent) = self.project_root.parent()
+            && let Err(error) = remove_empty_dir(parent)
+        {
+            return Err(self.abort_error("unchanged publication-root cleanup", error));
         }
         Ok(outcome)
     }

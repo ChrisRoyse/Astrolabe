@@ -682,6 +682,7 @@ fn interpret_pool_response(bytes: &[u8], project: &str) -> PoolResponse {
 ///     `{ok:false,error}` response so the warm worker survives it, while the commit is
 ///     still counted as a contained fault (identical accounting to the pre-#530
 ///     nonzero-exit child).
+///
 /// The worker is proactively recycled (killed + respawned) every
 /// [`ARCHAEOLOGY_POOL_RECYCLE_AFTER_DEFAULT`] commits to bound the cumulative C-heap
 /// damage of the #515 fault class to one interval.
