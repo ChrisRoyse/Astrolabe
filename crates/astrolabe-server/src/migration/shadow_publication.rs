@@ -81,6 +81,13 @@ impl ShadowPublication {
             fs::create_dir(&publication.backup_dir)?;
             publication.write_journal("initializing", json!({}))?;
             publication.seed_lower_repair = publication.seed_stage()?;
+            if let Some(repair) = publication.seed_lower_repair.as_ref() {
+                eprintln!(
+                    "astro.shadow.seed_lower_repair project={} evidence={}",
+                    publication.project,
+                    repair.evidence_json()
+                );
+            }
             let inventory = publication.stage_inventory()?;
             publication.write_journal("staged", inventory)?;
             Ok(())
