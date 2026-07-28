@@ -238,7 +238,7 @@ pub fn prepare_projection_upgrade(
         verify_intent_binding(&intent, &identity, &row, &source_path, &source_head)?;
         let transaction_dir = migration_root.join(&intent.transaction_id);
         let archive_completion = transaction_dir.join("archive-completion.json");
-        let recovered = if archive_completion.try_exists().map_err(|error| {
+        let archive_recovered = if archive_completion.try_exists().map_err(|error| {
             refusal(
                 repo,
                 &format!(
@@ -248,41 +248,79 @@ pub fn prepare_projection_upgrade(
             )
         })? {
             verify_archive_completion(repo, &intent, &archive_completion, false)?;
-            verify_recreated_family(
-                repo,
-                &database_path,
-                &identity.index_project,
-                &source_path,
-                &intent,
-            )?;
             false
         } else {
             archive_family(repo, &intent, &transaction_dir)?;
             true
         };
-        let database_sha256 = intent
-            .members
-            .iter()
-            .find(|member| member.role == "database")
-            .and_then(|member| member.sha256.clone())
-            .ok_or_else(|| refusal(repo, "pending intent has no main-database hash"))?;
+        let legacy_database_path = PathBuf::from(
+            intent
+                .members
+                .iter()
+                .find(|member| member.role == "database")
+                .ok_or_else(|| refusal(repo, "pending intent has no main-database member"))?
+                .source_path
+                .as_str(),
+        );
+        let legacy_projection_current = verify_recreated_family(
+            repo,
+            &legacy_database_path,
+            &intent.index_project,
+            &source_path,
+            &intent,
+        )?;
+        let current_database_path = store_dir.join(format!("{}.db", identity.index_project));
+        let projection_current = if identity.index_project == intent.index_project {
+            legacy_projection_current
+        } else {
+            if legacy_projection_current {
+                return Err(refusal(
+                    repo,
+                    "catalog identity advanced while the legacy projection namespace was recreated",
+                ));
+            }
+            verify_current_family(
+                repo,
+                &current_database_path,
+                &identity.index_project,
+                &source_path,
+            )?
+        };
+        if identity.index_project != intent.index_project && !projection_current {
+            return Err(refusal(
+                repo,
+                "catalog identity advanced beyond the archived legacy identity, but its current projection family is absent",
+            ));
+        }
+        let database_sha256 = if projection_current {
+            sha256_file(repo, &current_database_path)?
+        } else {
+            intent
+                .members
+                .iter()
+                .find(|member| member.role == "database")
+                .and_then(|member| member.sha256.clone())
+                .ok_or_else(|| refusal(repo, "pending intent has no main-database hash"))?
+        };
         return Ok(ProjectionUpgradePreparation {
             repo: repo.to_string(),
             store_key: identity.store_key,
             index_project: identity.index_project,
             source_head,
-            outcome: if recovered {
+            outcome: if projection_current {
+                "projection_recovered"
+            } else if archive_recovered {
                 "archive_recovered"
             } else {
                 "archived"
             }
             .to_string(),
-            reindex_required: true,
+            reindex_required: !projection_current,
             transaction_id: Some(intent.transaction_id),
             intent_path: Some(transaction_dir.join("intent.json").display().to_string()),
             archive_completion_path: Some(archive_completion.display().to_string()),
             database_sha256,
-            current_schema_version: None,
+            current_schema_version: projection_current.then_some(CURRENT_CBM_SCHEMA_VERSION),
         });
     }
 
@@ -390,25 +428,34 @@ pub fn prepare_projection_upgrade(
 pub fn complete_projection_upgrade(
     config: &ProjectionUpgradeConfig,
     preparation: &ProjectionUpgradePreparation,
+    current_identity: &RepoStoreIdentity,
     kernel_members_hash: &str,
     kernel_member_count: usize,
     pipeline_report: &Value,
 ) -> Result<Value, CalyxError> {
+    if current_identity.store_key != preparation.store_key {
+        return Err(refusal(
+            &preparation.repo,
+            "current catalog identity changed the stable store key during projection upgrade",
+        ));
+    }
     let Some(transaction_id) = preparation.transaction_id.as_deref() else {
         return Ok(json!({
             "outcome": "current_noop",
             "database_sha256": preparation.database_sha256,
+            "current_index_project": current_identity.index_project,
+            "current_kernel_scope": current_identity.kernel_scope,
             "kernel_members_hash": kernel_members_hash,
             "kernel_member_count": kernel_member_count,
         }));
     };
     let store_dir = config.store_root.join(&preparation.store_key);
-    let database_path = store_dir.join(format!("{}.db", preparation.index_project));
+    let database_path = store_dir.join(format!("{}.db", current_identity.index_project));
     let source_path = config.farm_root.join(&preparation.store_key);
     let schema = inspect_schema(
         &preparation.repo,
         &database_path,
-        &preparation.index_project,
+        &current_identity.index_project,
         &source_path,
     )?;
     if schema.kind != SchemaKind::Current {
@@ -441,6 +488,9 @@ pub fn complete_projection_upgrade(
         "transaction_id": transaction_id,
         "repo": preparation.repo,
         "source_head": preparation.source_head,
+        "archived_index_project": intent.index_project,
+        "current_index_project": current_identity.index_project,
+        "current_kernel_scope": current_identity.kernel_scope,
         "database_user_version": schema.user_version,
         "database_nodes": schema.node_count,
         "database_edges": schema.edge_count,
@@ -464,6 +514,96 @@ pub fn complete_projection_upgrade(
         "completion_path": completion_path.display().to_string(),
         "completion": completion,
     }))
+}
+
+/// Re-reads the catalog and current projection after the ordinary pipeline.
+///
+/// The explicit upgrade can legitimately migrate a legacy caller-selected
+/// project identity to the server's current path-derived identity. The
+/// admission preparation therefore cannot remain the destination authority
+/// after the pipeline commits. This readback resolves the durable catalog row,
+/// re-verifies its exact source facts, and accepts only a complete current
+/// projection family under the newly published identity.
+pub fn read_current_projection_identity(
+    catalog: &FleetCatalog,
+    config: &ProjectionUpgradeConfig,
+    preparation: &ProjectionUpgradePreparation,
+) -> Result<RepoStoreIdentity, CalyxError> {
+    let row = catalog
+        .query(None, None)?
+        .into_iter()
+        .find(|row| row.record.full_name == preparation.repo)
+        .ok_or_else(|| {
+            refusal(
+                &preparation.repo,
+                "the fleet catalog lost the exact repository during projection upgrade",
+            )
+        })?;
+    if row.state != RepoState::Kerneled {
+        return Err(refusal(
+            &preparation.repo,
+            &format!(
+                "current projection readback requires a kerneled catalog row, found {}",
+                row.state.as_str()
+            ),
+        ));
+    }
+    let identity = repo_store_identity(&row)?;
+    if identity.store_key != preparation.store_key {
+        return Err(refusal(
+            &preparation.repo,
+            "current catalog identity changed the stable store key during projection upgrade",
+        ));
+    }
+    let source_path = row
+        .clone_path
+        .as_deref()
+        .map(PathBuf::from)
+        .ok_or_else(|| {
+            refusal(
+                &preparation.repo,
+                "current catalog row has no live clone_path",
+            )
+        })?;
+    let expected_source = target_dir(&config.farm_root, &preparation.repo);
+    let source_path = canonical_dir(&preparation.repo, &source_path, "catalog clone_path")?;
+    let expected_source =
+        canonical_dir(&preparation.repo, &expected_source, "expected clone path")?;
+    if source_path != expected_source {
+        return Err(refusal(
+            &preparation.repo,
+            &format!(
+                "current catalog clone path {} differs from canonical farm path {}",
+                source_path.display(),
+                expected_source.display()
+            ),
+        ));
+    }
+    let source_head = verify_source(&row.record.clone_url, &source_path, &preparation.repo)?;
+    if source_head != preparation.source_head
+        || row.indexed_commit_hash.as_deref() != Some(preparation.source_head.as_str())
+    {
+        return Err(refusal(
+            &preparation.repo,
+            "current catalog/source revision differs from the upgrade admission revision",
+        ));
+    }
+    let database_path = config
+        .store_root
+        .join(&identity.store_key)
+        .join(format!("{}.db", identity.index_project));
+    if !verify_current_family(
+        &preparation.repo,
+        &database_path,
+        &identity.index_project,
+        &source_path,
+    )? {
+        return Err(refusal(
+            &preparation.repo,
+            "current catalog identity has no complete current projection family",
+        ));
+    }
+    Ok(identity)
 }
 
 fn verify_source(expected_remote: &str, source: &Path, repo: &str) -> Result<String, CalyxError> {
@@ -1061,25 +1201,9 @@ fn verify_recreated_family(
     index_project: &str,
     source_path: &Path,
     intent: &UpgradeIntent,
-) -> Result<(), CalyxError> {
-    if database_path.try_exists().map_err(|error| {
-        refusal(
-            repo,
-            &format!(
-                "cannot inspect regenerated database {}: {error}",
-                database_path.display()
-            ),
-        )
-    })? {
-        refuse_rollback_journal(repo, database_path)?;
-        let schema = inspect_schema(repo, database_path, index_project, source_path)?;
-        if schema.kind != SchemaKind::Current {
-            return Err(refusal(
-                repo,
-                "a completed archive transaction has a recreated database that is not the exact current CBM schema",
-            ));
-        }
-        return Ok(());
+) -> Result<bool, CalyxError> {
+    if verify_current_family(repo, database_path, index_project, source_path)? {
+        return Ok(true);
     }
     for member in &intent.members {
         if Path::new(&member.source_path)
@@ -1102,6 +1226,81 @@ fn verify_recreated_family(
                 ),
             ));
         }
+    }
+    Ok(false)
+}
+
+fn verify_current_family(
+    repo: &str,
+    database_path: &Path,
+    index_project: &str,
+    source_path: &Path,
+) -> Result<bool, CalyxError> {
+    if database_path.try_exists().map_err(|error| {
+        refusal(
+            repo,
+            &format!(
+                "cannot inspect regenerated database {}: {error}",
+                database_path.display()
+            ),
+        )
+    })? {
+        refuse_rollback_journal(repo, database_path)?;
+        let schema = inspect_schema(repo, database_path, index_project, source_path)?;
+        if schema.kind != SchemaKind::Current {
+            return Err(refusal(
+                repo,
+                "a regenerated database is not the exact current CBM schema",
+            ));
+        }
+        return Ok(true);
+    }
+    refuse_rollback_journal(repo, database_path)?;
+    for (role, member) in family_paths(database_path).into_iter().skip(1) {
+        if member.try_exists().map_err(|error| {
+            refusal(
+                repo,
+                &format!(
+                    "cannot inspect current {role} family member {}: {error}",
+                    member.display()
+                ),
+            )
+        })? {
+            return Err(refusal(
+                repo,
+                &format!(
+                    "current projection database is absent while its {role} family member {} exists",
+                    member.display()
+                ),
+            ));
+        }
+    }
+    Ok(false)
+}
+
+fn verify_intent_binding(
+    intent: &UpgradeIntent,
+    identity: &RepoStoreIdentity,
+    row: &FleetRepoRow,
+    source_path: &Path,
+    source_head: &str,
+) -> Result<(), CalyxError> {
+    let repo = row.record.full_name.as_str();
+    let intent_kernel_scope = format!("repo:{}", intent.index_project);
+    if intent.schema != TRANSACTION_SCHEMA
+        || intent.repo != repo
+        || intent.github_id != row.record.github_id
+        || intent.store_key != identity.store_key
+        || intent.kernel_scope != intent_kernel_scope
+        || Path::new(&intent.source_path) != source_path
+        || intent.source_head != source_head
+        || row.indexed_commit_hash.as_deref() != Some(intent.indexed_commit_hash.as_str())
+        || intent.remote_url != row.record.clone_url
+    {
+        return Err(refusal(
+            repo,
+            "incomplete projection-upgrade intent differs from current catalog/source identity",
+        ));
     }
     Ok(())
 }
@@ -1218,6 +1417,17 @@ fn verify_projection_completion_record(
         && completion["transaction_id"].as_str() == Some(intent.transaction_id.as_str())
         && completion["repo"].as_str() == Some(intent.repo.as_str())
         && completion["source_head"].as_str() == Some(intent.source_head.as_str())
+        && completion["archived_index_project"].as_str() == Some(intent.index_project.as_str())
+        && completion["current_index_project"]
+            .as_str()
+            .is_some_and(|project| !project.is_empty())
+        && completion["current_kernel_scope"]
+            .as_str()
+            .is_some_and(|scope| {
+                completion["current_index_project"]
+                    .as_str()
+                    .is_some_and(|project| scope == format!("repo:{project}"))
+            })
         && completion["database_user_version"].as_i64() == Some(CURRENT_CBM_SCHEMA_VERSION)
         && completion["database_nodes"]
             .as_u64()
@@ -1242,33 +1452,6 @@ fn verify_projection_completion_record(
                 "projection completion {} does not bind a complete current projection",
                 completion_path.display()
             ),
-        ));
-    }
-    Ok(())
-}
-
-fn verify_intent_binding(
-    intent: &UpgradeIntent,
-    identity: &RepoStoreIdentity,
-    row: &FleetRepoRow,
-    source_path: &Path,
-    source_head: &str,
-) -> Result<(), CalyxError> {
-    let repo = row.record.full_name.as_str();
-    if intent.schema != TRANSACTION_SCHEMA
-        || intent.repo != repo
-        || intent.github_id != row.record.github_id
-        || intent.store_key != identity.store_key
-        || intent.index_project != identity.index_project
-        || intent.kernel_scope != identity.kernel_scope
-        || Path::new(&intent.source_path) != source_path
-        || intent.source_head != source_head
-        || row.indexed_commit_hash.as_deref() != Some(intent.indexed_commit_hash.as_str())
-        || intent.remote_url != row.record.clone_url
-    {
-        return Err(refusal(
-            repo,
-            "incomplete projection-upgrade intent differs from current catalog/source identity",
         ));
     }
     Ok(())

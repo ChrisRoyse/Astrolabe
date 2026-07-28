@@ -639,33 +639,46 @@ fn run(args: &[String]) -> Result<(), CalyxError> {
             } else {
                 None
             };
+            let current_identity =
+                astrolabe_fleet::projection_upgrade::read_current_projection_identity(
+                    &catalog,
+                    &upgrade_config,
+                    &preparation,
+                )?;
             let kernel = astrolabe_fleet::compose::load_repo_kernel(
                 &upgrade_config.store_root,
-                &preparation.store_key,
-                &preparation.index_project,
+                &current_identity.store_key,
+                &current_identity.index_project,
             )?
             .ok_or_else(|| CalyxError {
                 code: astrolabe_fleet::compose::ASTRO_FLEET_KERNEL_MISSING,
                 message: format!(
                     "projection upgrade reopened current store {} but no per-repo kernel is persisted",
-                    preparation.store_key
+                    current_identity.store_key
                 ),
                 remediation: "preserve the projection and transaction; inspect the ordinary pipeline report before retrying the exact upgrade",
             })?;
+            let recovery_report = serde_json::json!({
+                "outcome": preparation.outcome,
+                "source": "current_projection_readback",
+                "current_identity": &current_identity,
+                "source_head": preparation.source_head,
+                "database_sha256": preparation.database_sha256,
+            });
             let completion = astrolabe_fleet::projection_upgrade::complete_projection_upgrade(
                 &upgrade_config,
                 &preparation,
+                &current_identity,
                 &kernel.members_hash,
                 kernel.occurrences.len(),
-                pipeline_report.as_ref().unwrap_or(&serde_json::json!({
-                    "outcome": "current_noop",
-                })),
+                pipeline_report.as_ref().unwrap_or(&recovery_report),
             )?;
             println!(
                 "{}",
                 serde_json::json!({
                     "verb": "upgrade-projection",
                     "preparation": preparation,
+                    "current_identity": current_identity,
                     "pipeline_report": pipeline_report,
                     "kernel_readback": {
                         "members_hash": kernel.members_hash,
