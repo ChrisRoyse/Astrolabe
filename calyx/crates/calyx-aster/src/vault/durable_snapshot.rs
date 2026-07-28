@@ -1,7 +1,7 @@
 use super::AsterVault;
 use calyx_core::{CalyxError, Clock, Result};
 use sha2::{Digest, Sha256};
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::Path;
 
@@ -33,7 +33,9 @@ where
         }
         self.authorize_external_copy(destination)?;
         self.with_durable_commit_lock(|| {
-            if let Err(copy_error) = copy_tree_verified(source.root(), source.root(), destination) {
+            let snapshot = copy_tree_verified(source.root(), source.root(), destination)
+                .and_then(|()| initialize_snapshot_coordination_files(destination));
+            if let Err(copy_error) = snapshot {
                 let cleanup = fs::remove_dir_all(destination);
                 return Err(match cleanup {
                     Ok(()) => copy_error,
@@ -52,6 +54,62 @@ where
     }
 }
 
+fn initialize_snapshot_coordination_files(destination: &Path) -> Result<()> {
+    for relative in [
+        Path::new("locks").join("durable.commit.lock"),
+        Path::new("wal").join(".append.lock"),
+    ] {
+        let path = destination.join(relative);
+        let parent = path.parent().ok_or_else(|| CalyxError {
+            code: "CALYX_DURABLE_SNAPSHOT_COORDINATION_PATH",
+            message: format!(
+                "snapshot coordination path has no parent: {}",
+                path.display()
+            ),
+            remediation:
+                "discard the transaction-owned destination and inspect the snapshot path boundary",
+        })?;
+        if !parent.is_dir() {
+            return Err(CalyxError {
+                code: "CALYX_DURABLE_SNAPSHOT_COORDINATION_PARENT_MISSING",
+                message: format!(
+                    "snapshot coordination parent is absent or not a directory: {}",
+                    parent.display()
+                ),
+                remediation: "discard the transaction-owned destination and inspect the source vault's required locks/wal layout",
+            });
+        }
+        let file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&path)
+            .map_err(|error| {
+                snapshot_io("create fresh destination coordination file", &path, error)
+            })?;
+        file.sync_all().map_err(|error| {
+            snapshot_io("sync fresh destination coordination file", &path, error)
+        })?;
+        drop(file);
+
+        let metadata = fs::symlink_metadata(&path).map_err(|error| {
+            snapshot_io("read back destination coordination file", &path, error)
+        })?;
+        if !metadata.file_type().is_file() || metadata.len() != 0 {
+            return Err(CalyxError {
+                code: "CALYX_DURABLE_SNAPSHOT_COORDINATION_READBACK_MISMATCH",
+                message: format!(
+                    "fresh destination coordination object {} read back with file={} bytes={}",
+                    path.display(),
+                    metadata.file_type().is_file(),
+                    metadata.len()
+                ),
+                remediation: "discard the transaction-owned destination and inspect the storage device before retrying",
+            });
+        }
+    }
+    Ok(())
+}
+
 fn copy_tree_verified(root: &Path, source: &Path, destination: &Path) -> Result<()> {
     fs::create_dir(destination)
         .map_err(|error| snapshot_io("create destination directory", destination, error))?;
@@ -68,8 +126,8 @@ fn copy_tree_verified(root: &Path, source: &Path, destination: &Path) -> Result<
             .map_err(|error| snapshot_path("derive vault-relative path", &source_path, error))?;
         // These two files coordinate writers; they are not durable vault data.
         // The snapshot already holds durable.commit.lock, so reading that file
-        // would conflict with our own Windows byte-range lock. A destination
-        // vault creates fresh coordination files when it opens.
+        // would conflict with our own Windows byte-range lock. Fresh
+        // destination-owned coordinators are initialized after the data copy.
         if relative == Path::new("locks").join("durable.commit.lock")
             || relative == Path::new("wal").join(".append.lock")
         {
