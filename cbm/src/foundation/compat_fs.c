@@ -525,20 +525,40 @@ int cbm_unlink(const char *path) {
     return ret;
 }
 
-bool cbm_path_exists(const char *path) {
-    /* #430: extended-length widen so an existence probe on a store-family path
-     * deeper than MAX_PATH (e.g. <deep-store>/<project>.db that delete_project's
-     * not_found gate checks) reports the file that is really there, instead of
-     * the false "not found" the ANSI access()/stat() probe returns past 260
-     * chars. GetFileAttributesW honors the "\\?\" prefix cbm_utf8_to_wide_path
-     * applies; short paths widen byte-identically to the historical access(). */
-    wchar_t *wpath = cbm_utf8_to_wide_path(path);
+cbm_path_probe_result_t cbm_path_probe(const char *path, unsigned long *native_error) {
+    if (native_error) {
+        *native_error = ERROR_SUCCESS;
+    }
+    DWORD conversion_error = ERROR_SUCCESS;
+    wchar_t *wpath = cbm_utf8_to_wide_path_checked(path, &conversion_error);
     if (!wpath) {
-        return false;
+        if (native_error) {
+            *native_error = (unsigned long)(conversion_error != ERROR_SUCCESS
+                                                ? conversion_error
+                                                : ERROR_NO_UNICODE_TRANSLATION);
+        }
+        return CBM_PATH_PROBE_ERROR;
     }
     DWORD attrs = GetFileAttributesW(wpath);
     free(wpath);
-    return attrs != INVALID_FILE_ATTRIBUTES;
+    if (attrs != INVALID_FILE_ATTRIBUTES) {
+        return CBM_PATH_PROBE_PRESENT;
+    }
+    DWORD error = GetLastError();
+    if (error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND) {
+        return CBM_PATH_PROBE_ABSENT;
+    }
+    if (native_error) {
+        *native_error = (unsigned long)(error != ERROR_SUCCESS ? error : ERROR_GEN_FAILURE);
+    }
+    return CBM_PATH_PROBE_ERROR;
+}
+
+bool cbm_path_exists(const char *path) {
+    /* #430/#823: keep the long-path-safe Boolean surface for observation-only
+     * callers. Route/publication admission consumes cbm_path_probe directly so
+     * a native probe error can never authorize an absent-state transition. */
+    return cbm_path_probe(path, NULL) == CBM_PATH_PROBE_PRESENT;
 }
 
 char *cbm_canonicalize_existing_path(const char *path) {
@@ -552,7 +572,7 @@ char *cbm_canonicalize_existing_path(const char *path) {
      * path is a clean drive/UNC form. Existence is then confirmed via
      * cbm_path_exists (GetFileAttributesW, "\\?\"-widened). Fail-closed: any step
      * failing returns NULL (no ANSI fallback). */
-    if (!path) {
+    if (!path || !path[0]) {
         return NULL;
     }
     wchar_t *win = cbm_utf8_to_wide_path(path);
@@ -1015,10 +1035,32 @@ int cbm_unlink(const char *path) {
     return unlink(path);
 }
 
+cbm_path_probe_result_t cbm_path_probe(const char *path, unsigned long *native_error) {
+    if (native_error) {
+        *native_error = 0;
+    }
+    if (!path || !path[0]) {
+        if (native_error) {
+            *native_error = EINVAL;
+        }
+        return CBM_PATH_PROBE_ERROR;
+    }
+    struct stat path_stat;
+    if (stat(path, &path_stat) == 0) {
+        return CBM_PATH_PROBE_PRESENT;
+    }
+    int error = errno;
+    if (error == ENOENT || error == ENOTDIR) {
+        return CBM_PATH_PROBE_ABSENT;
+    }
+    if (native_error) {
+        *native_error = (unsigned long)error;
+    }
+    return CBM_PATH_PROBE_ERROR;
+}
+
 bool cbm_path_exists(const char *path) {
-    /* POSIX access() is not MAX_PATH-bound; the Windows counterpart carries the
-     * #430 long-path work. */
-    return access(path, F_OK) == 0;
+    return cbm_path_probe(path, NULL) == CBM_PATH_PROBE_PRESENT;
 }
 
 char *cbm_canonicalize_existing_path(const char *path) {

@@ -26,31 +26,47 @@ static inline wchar_t *cbm_utf8_to_wide(const char *utf8) {
     return w;
 }
 
-/* Widen a UTF-8 *filesystem path* and, for paths at/over the Windows MAX_PATH
- * (260) barrier, add the extended-length "\\?\" prefix so the CRT/Win32 wide file
- * APIs (_wfopen, _wstat64, GetFileAttributesW, GetFileAttributesExW, FindFirstFileW,
- * CreateFileW) can reach files whose absolute path exceeds 260 chars. Without the
- * prefix those APIs fail on such paths (verified: err on this host, LongPathsEnabled
- * unset), which the discover directory walk turns into a SILENT skip — the forbidden
- * outcome in #383. This function must be used ONLY for filesystem paths, never for
- * open modes ("rb") or command lines, which is why it is a separate entry point from
- * cbm_utf8_to_wide (those callers stay on the plain widen).
- *
- * The "\\?\" prefix disables Win32 path normalization, so the path is first
- * canonicalized to a fully-qualified backslash form via GetFullPathNameW (which
- * resolves '.'/'..', converts '/'→'\\', and makes a relative path absolute against
- * the CWD — the same base the CRT would use). Paths below the barrier are returned
- * byte-identical to cbm_utf8_to_wide, so existing short-path behavior (and the C
- * test floor) is unchanged. On any canonicalization/allocation failure the function
- * degrades to the plain widened path rather than dropping the request. */
-static inline wchar_t *cbm_utf8_to_wide_path(const char *utf8) {
-    wchar_t *w = cbm_utf8_to_wide(utf8);
+/* Strictly widen a UTF-8 filesystem path and, at/over the Windows MAX_PATH
+ * barrier, convert it to an absolute extended-length "\\?\" spelling. Every
+ * conversion/canonicalization/allocation failure is returned to the caller as
+ * one native error; this is the variant for admission decisions where a failed
+ * probe must never be collapsed into "absent". */
+static inline wchar_t *cbm_utf8_to_wide_path_checked(const char *utf8, DWORD *native_error) {
+    if (native_error) {
+        *native_error = ERROR_SUCCESS;
+    }
+    if (!utf8 || !utf8[0]) {
+        if (native_error) {
+            *native_error = ERROR_INVALID_PARAMETER;
+        }
+        return NULL;
+    }
+    int len = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, utf8, -1, NULL, 0);
+    if (len <= 0) {
+        DWORD error = GetLastError();
+        if (native_error) {
+            *native_error = error != ERROR_SUCCESS ? error : ERROR_NO_UNICODE_TRANSLATION;
+        }
+        return NULL;
+    }
+    wchar_t *w = (wchar_t *)malloc((size_t)len * sizeof(wchar_t));
     if (!w) {
+        if (native_error) {
+            *native_error = ERROR_NOT_ENOUGH_MEMORY;
+        }
+        return NULL;
+    }
+    if (MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, utf8, -1, w, len) != len) {
+        DWORD error = GetLastError();
+        free(w);
+        if (native_error) {
+            *native_error = error != ERROR_SUCCESS ? error : ERROR_NO_UNICODE_TRANSLATION;
+        }
         return NULL;
     }
     size_t wlen = wcslen(w);
-    /* Below the barrier (with margin for a directory's trailing "\\*" and the CRT's
-     * 8.3 reservation): leave the path exactly as the historical widen produced it. */
+    /* Below the barrier (with margin for a directory's trailing "\\*" and the
+     * CRT's 8.3 reservation), the ordinary wide spelling is lossless. */
     if (wlen < 240) {
         return w;
     }
@@ -60,16 +76,30 @@ static inline wchar_t *cbm_utf8_to_wide_path(const char *utf8) {
     }
     DWORD need = GetFullPathNameW(w, 0, NULL, NULL);
     if (need == 0) {
-        return w; /* canonicalization unavailable — best-effort plain path */
+        DWORD error = GetLastError();
+        free(w);
+        if (native_error) {
+            *native_error = error != ERROR_SUCCESS ? error : ERROR_INVALID_NAME;
+        }
+        return NULL;
     }
     wchar_t *full = (wchar_t *)malloc((size_t)need * sizeof(wchar_t));
     if (!full) {
-        return w;
+        free(w);
+        if (native_error) {
+            *native_error = ERROR_NOT_ENOUGH_MEMORY;
+        }
+        return NULL;
     }
     DWORD got = GetFullPathNameW(w, need, full, NULL);
     if (got == 0 || got >= need) {
+        DWORD error = GetLastError();
         free(full);
-        return w;
+        free(w);
+        if (native_error) {
+            *native_error = error != ERROR_SUCCESS ? error : ERROR_FILENAME_EXCED_RANGE;
+        }
+        return NULL;
     }
     free(w);
     wchar_t *out;
@@ -77,7 +107,11 @@ static inline wchar_t *cbm_utf8_to_wide_path(const char *utf8) {
         /* UNC "\\server\share\..." -> "\\?\UNC\server\share\..." */
         out = (wchar_t *)malloc((size_t)(got + 8) * sizeof(wchar_t));
         if (!out) {
-            return full;
+            free(full);
+            if (native_error) {
+                *native_error = ERROR_NOT_ENOUGH_MEMORY;
+            }
+            return NULL;
         }
         wcscpy(out, L"\\\\?\\UNC\\");
         wcscat(out, full + 2);
@@ -85,13 +119,29 @@ static inline wchar_t *cbm_utf8_to_wide_path(const char *utf8) {
         /* Drive path "C:\..." -> "\\?\C:\..." */
         out = (wchar_t *)malloc((size_t)(got + 5) * sizeof(wchar_t));
         if (!out) {
-            return full;
+            free(full);
+            if (native_error) {
+                *native_error = ERROR_NOT_ENOUGH_MEMORY;
+            }
+            return NULL;
         }
         wcscpy(out, L"\\\\?\\");
         wcscat(out, full);
     }
     free(full);
     return out;
+}
+
+/* Widen a UTF-8 filesystem path for ordinary file operations. This shares the
+ * strict conversion contract: an operation never retries through a narrower or
+ * non-extended spelling after path preparation failed. */
+static inline wchar_t *cbm_utf8_to_wide_path(const char *utf8) {
+    DWORD error = ERROR_SUCCESS;
+    wchar_t *w = cbm_utf8_to_wide_path_checked(utf8, &error);
+    if (!w) {
+        SetLastError(error != ERROR_SUCCESS ? error : ERROR_GEN_FAILURE);
+    }
+    return w;
 }
 
 static inline char *cbm_wide_to_utf8(const wchar_t *wide) {

@@ -58,7 +58,6 @@ enum {
 #include <stdlib.h>
 #include <string.h>
 #include <stdatomic.h>
-#include <sys/stat.h>
 #include <time.h>
 #include <windows.h>
 
@@ -1942,6 +1941,19 @@ static int preserve_existing_adr(cbm_pipeline_t *p, cbm_store_t *store, const ch
     return 0;
 }
 
+static int record_path_probe_failure(cbm_pipeline_t *p, const char *event, const char *code,
+                                     const char *operation, const char *phase, const char *path,
+                                     unsigned long native_error, const char *message,
+                                     const char *remediation) {
+    char native_error_text[32];
+    (void)snprintf(native_error_text, sizeof(native_error_text), "%lu", native_error);
+    cbm_log_error(event, "code", code, "operation", operation, "path", path, "native_error_kind",
+                  "win32", "native_error", native_error_text, "publication_started", "false",
+                  "message", message, "remediation", remediation);
+    cbm_pipeline_record_fatal_error(p, code, operation, phase, path, 0, message, remediation);
+    return CBM_NOT_FOUND;
+}
+
 /* Before paying for a complete mirrored source generation, prove whether the
  * current repository is byte-identical to the persisted generation. This path
  * is intentionally available only when no complete-row sink is registered:
@@ -1959,18 +1971,20 @@ static int try_unchanged_before_snapshot(cbm_pipeline_t *p, const cbm_discover_o
     if (!db_path) {
         return CBM_NOT_FOUND;
     }
-    struct stat db_st;
-    if (stat(db_path, &db_st) != 0) {
-        int stat_error = errno;
+    unsigned long probe_error = 0;
+    cbm_path_probe_result_t probe = cbm_path_probe(db_path, &probe_error);
+    if (probe == CBM_PATH_PROBE_ABSENT) {
         free(db_path);
-        if (stat_error == ENOENT || stat_error == ENOTDIR) {
-            return PL_ROUTE_FULL;
-        }
-        cbm_log_error("pipeline.unchanged_failed", "code",
-                      "CBM_PIPELINE_UNCHANGED_STORE_STAT_FAILED", "message",
-                      "the existing store path could not be inspected before source capture",
-                      "remediation", "restore store access and retry indexing");
-        return CBM_NOT_FOUND;
+        return PL_ROUTE_FULL;
+    }
+    if (probe == CBM_PATH_PROBE_ERROR) {
+        int rc = record_path_probe_failure(
+            p, "pipeline.unchanged_failed", "CBM_PIPELINE_UNCHANGED_STORE_PROBE_FAILED",
+            "probe_existing_store_before_source_capture", "unchanged_route", db_path, probe_error,
+            "the existing store path could not be classified before source capture",
+            "preserve the store family, correct the reported native path error, and retry indexing");
+        free(db_path);
+        return rc;
     }
 
     cbm_store_t *store = NULL;
@@ -2101,18 +2115,20 @@ static int try_incremental_or_delete_db(cbm_pipeline_t *p, cbm_file_info_t *file
     if (!db_path) {
         return CBM_NOT_FOUND;
     }
-    struct stat db_st;
-    if (stat(db_path, &db_st) != 0) {
-        int stat_error = errno;
-        if (stat_error == ENOENT || stat_error == ENOTDIR) {
-            free(db_path);
-            return PL_ROUTE_FULL;
-        }
-        cbm_log_error("pipeline.route_failed", "code", "CBM_PIPELINE_STORE_STAT_FAILED", "path",
-                      db_path, "message", "the existing store path could not be inspected",
-                      "remediation", "restore store access and retry indexing");
+    unsigned long probe_error = 0;
+    cbm_path_probe_result_t probe = cbm_path_probe(db_path, &probe_error);
+    if (probe == CBM_PATH_PROBE_ABSENT) {
         free(db_path);
-        return CBM_NOT_FOUND;
+        return PL_ROUTE_FULL;
+    }
+    if (probe == CBM_PATH_PROBE_ERROR) {
+        int rc = record_path_probe_failure(
+            p, "pipeline.route_failed", "CBM_PIPELINE_STORE_PROBE_FAILED",
+            "probe_existing_store_for_route", "route", db_path, probe_error,
+            "the existing store path could not be classified",
+            "preserve the store family, correct the reported native path error, and retry indexing");
+        free(db_path);
+        return rc;
     }
 
     /* Provenance admission must be read-only. The ordinary store opener enters
@@ -2280,12 +2296,31 @@ static int remove_optional_pipeline_file(const char *path, const char *code) {
 
 static int verify_live_store_before_publication(cbm_pipeline_t *p, const char *db_path,
                                                 const char *live_wal, const char *live_shm) {
-    if (cbm_path_exists(live_wal) || cbm_path_exists(live_shm)) {
+    unsigned long wal_probe_error = 0;
+    cbm_path_probe_result_t wal_probe = cbm_path_probe(live_wal, &wal_probe_error);
+    if (wal_probe == CBM_PATH_PROBE_ERROR) {
+        return record_path_probe_failure(
+            p, "pipeline.persist_failed", "CBM_PIPELINE_LIVE_WAL_PROBE_FAILED",
+            "probe_live_wal_before_publication", "persist", live_wal, wal_probe_error,
+            "the live WAL path could not be classified before publication",
+            "preserve the complete store family, correct the reported native path error, and retry");
+    }
+    unsigned long shm_probe_error = 0;
+    cbm_path_probe_result_t shm_probe = cbm_path_probe(live_shm, &shm_probe_error);
+    if (shm_probe == CBM_PATH_PROBE_ERROR) {
+        return record_path_probe_failure(
+            p, "pipeline.persist_failed", "CBM_PIPELINE_LIVE_SHM_PROBE_FAILED",
+            "probe_live_shm_before_publication", "persist", live_shm, shm_probe_error,
+            "the live shared-memory path could not be classified before publication",
+            "preserve the complete store family, correct the reported native path error, and retry");
+    }
+    if (wal_probe == CBM_PATH_PROBE_PRESENT || shm_probe == CBM_PATH_PROBE_PRESENT) {
         cbm_log_error("pipeline.persist_failed", "code", "CBM_PIPELINE_LIVE_WAL_PRESENT",
                       "operation", "verify_live_store_before_publication", "path", db_path,
-                      "wal_present", cbm_path_exists(live_wal) ? "true" : "false", "shm_present",
-                      cbm_path_exists(live_shm) ? "true" : "false", "publication_started", "false",
-                      "message",
+                      "wal_present",
+                      wal_probe == CBM_PATH_PROBE_PRESENT ? "true" : "false", "shm_present",
+                      shm_probe == CBM_PATH_PROBE_PRESENT ? "true" : "false",
+                      "publication_started", "false", "message",
                       "the live store acquired a WAL or shared-memory sidecar before swap",
                       "remediation", "finish the concurrent writer and retry indexing");
         cbm_pipeline_record_fatal_error(
@@ -2294,8 +2329,18 @@ static int verify_live_store_before_publication(cbm_pipeline_t *p, const char *d
             "finish the concurrent writer and retry indexing");
         return CBM_NOT_FOUND;
     }
+
+    unsigned long db_probe_error = 0;
+    cbm_path_probe_result_t db_probe = cbm_path_probe(db_path, &db_probe_error);
+    if (db_probe == CBM_PATH_PROBE_ERROR) {
+        return record_path_probe_failure(
+            p, "pipeline.persist_failed", "CBM_PIPELINE_LIVE_STORE_PROBE_FAILED",
+            "probe_live_store_before_publication", "persist", db_path, db_probe_error,
+            "the live database path could not be classified before publication",
+            "preserve the complete store family, correct the reported native path error, and retry");
+    }
     if (!p->routed_store_present) {
-        if (!cbm_path_exists(db_path)) {
+        if (db_probe == CBM_PATH_PROBE_ABSENT) {
             return 0;
         }
         cbm_log_error(
@@ -2308,6 +2353,20 @@ static int verify_live_store_before_publication(cbm_pipeline_t *p, const char *d
             "persist", db_path, 0,
             "a live database appeared after routing selected an absent destination",
             "preserve the unexpected store, use a distinct project name, and retry");
+        return CBM_NOT_FOUND;
+    }
+    if (db_probe == CBM_PATH_PROBE_ABSENT) {
+        cbm_log_error(
+            "pipeline.persist_failed", "code", "CBM_PIPELINE_LIVE_STORE_DISAPPEARED", "operation",
+            "verify_live_store_before_publication", "path", db_path, "publication_started", "false",
+            "message", "the routed live database disappeared before publication", "remediation",
+            "preserve the staged store, restore or explicitly archive the routed generation, and "
+            "retry");
+        cbm_pipeline_record_fatal_error(
+            p, "CBM_PIPELINE_LIVE_STORE_DISAPPEARED", "verify_live_store_before_publication",
+            "persist", db_path, 0, "the routed live database disappeared before publication",
+            "preserve the staged store, restore or explicitly archive the routed generation, and "
+            "retry");
         return CBM_NOT_FOUND;
     }
 
