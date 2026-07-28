@@ -686,11 +686,13 @@ fn capture_family(
 ) -> Result<Vec<FamilyMember>, CalyxError> {
     let mut members = Vec::with_capacity(3);
     for (role, source) in family_paths(database_path) {
-        let archive = archive_dir.join(
-            source
-                .file_name()
-                .ok_or_else(|| refusal(repo, "database family member has no file name"))?,
-        );
+        // Keep archived members out of SQLite's live-family namespace. If the
+        // original `database.db`, `database.db-wal`, and `database.db-shm`
+        // basenames remain adjacent, opening the archived database for an
+        // audit lets SQLite checkpoint or remove the archived sidecars. Role
+        // filenames preserve the exact bytes while making every member an
+        // inert artifact.
+        let archive = archive_dir.join(format!("{role}.bin"));
         let present = source.try_exists().map_err(|error| {
             refusal(
                 repo,
