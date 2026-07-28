@@ -492,6 +492,35 @@ pub fn load_repo_kernel(
     }))
 }
 
+/// Reads only one repository's persisted Kernel artifact.
+///
+/// This is the narrow postcondition for operations such as explicit WAL
+/// migration that need to prove the durable kernel still reopens, but do not
+/// consume input bodies, graph rows, or semantic vectors. It therefore opens
+/// exactly the existing Kernel CF through the latest read-only contract and
+/// never falls back to [`load_repo_kernel`]'s composition materialization.
+pub fn read_repo_kernel_artifact(
+    store_root: &Path,
+    store_key: &str,
+    index_project: &str,
+) -> Result<Option<KernelArtifact>, CalyxError> {
+    let vault_dir = store_root
+        .join(store_key)
+        .join(format!("{index_project}.astrolabe-vault"));
+    if !vault_dir.exists() {
+        return Ok(None);
+    }
+    let vault = open_shadow_vault(
+        store_root,
+        store_key,
+        index_project,
+        vec![ColumnFamily::Kernel],
+    )?;
+    let scope = kernel_scope_id(index_project);
+    read_persisted_kernel_artifact(&vault, &scope)
+        .map_err(|error| inner_err("read narrow per-repo kernel artifact", error))
+}
+
 /// One fleet-graph node: a content-equivalence class of per-repo members.
 #[derive(Clone, Debug)]
 struct FleetNode {

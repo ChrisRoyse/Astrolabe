@@ -540,7 +540,7 @@ fn run(args: &[String]) -> Result<(), CalyxError> {
                 .join(&identity.store_key)
                 .join(format!("{}.astrolabe-vault", identity.index_project));
             let migration = calyx_aster::wal::migrate_legacy_wal_tail(&vault_path)?;
-            let kernel = astrolabe_fleet::compose::load_repo_kernel(
+            let kernel = astrolabe_fleet::compose::read_repo_kernel_artifact(
                 &store_root,
                 &identity.store_key,
                 &identity.index_project,
@@ -564,9 +564,11 @@ fn run(args: &[String]) -> Result<(), CalyxError> {
                     "migration": migration,
                     "kernel_readback": {
                         "members_hash": kernel.members_hash,
-                        "member_count": kernel.occurrences.len(),
+                        "member_count": kernel.member_count,
                         "node_count": kernel.node_count,
-                        "recall_permille": kernel.recall_permille,
+                        "recall_permille": kernel.recall.permille,
+                        "selected_cfs": ["kernel"],
+                        "full_compose_materialization": false,
                     },
                 })
             );
