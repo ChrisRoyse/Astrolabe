@@ -1640,7 +1640,19 @@ pub fn verify_member_provenance(
             &identity.store_key,
             &identity.index_project,
             vec![ColumnFamily::Base, ColumnFamily::Blob],
-        )?;
+        )
+        .map_err(|error| CalyxError {
+            code: error.code,
+            message: format!(
+                "open sampled provenance project vault {project} at {} failed: {}",
+                store_root
+                    .join(&identity.store_key)
+                    .join(format!("{}.astrolabe-vault", identity.index_project))
+                    .display(),
+                error.message
+            ),
+            remediation: error.remediation,
+        })?;
         let project_open_wall_us = elapsed_us(project_open_started);
         let open = vault.open_diagnostics();
         project_open_diagnostics.push(json!({
