@@ -32,6 +32,12 @@ pub(crate) const GIT_SOURCE_REPO_PATH_KEY: &str = "git_source_repo_path";
 /// accepted: it would hide the failed source and could publish incomplete
 /// kernel/provenance state.
 pub(crate) const ASTRO_SHADOW_ROW_SINK_IMPORT_FAILED: &str = "ASTRO_SHADOW_ROW_SINK_IMPORT_FAILED";
+/// A persisted symbol-canonical contract exists but does not name the current
+/// identity schema. Absence is the recognized legacy state and requires a full
+/// staged publication; a present different value is incompatible and must not
+/// be overwritten as though it were merely old.
+pub(crate) const ASTRO_SHADOW_SYMBOL_CANONICAL_SCHEMA_INCOMPATIBLE: &str =
+    "ASTRO_SHADOW_SYMBOL_CANONICAL_SCHEMA_INCOMPATIBLE";
 /// The out-of-process shadow index pass did not complete cleanly (#405): a hard
 /// C-level abort (segfault/abort-class), a hang, a non-fault kill, or a spawn
 /// failure. The CBM pipeline pass runs in a supervised worker subprocess precisely
@@ -53,10 +59,12 @@ pub(crate) const SHADOW_STALE_REMEDIATION: &str = "the CBM SQLite changed since 
 
 #[derive(Debug, Clone)]
 pub(crate) struct ShadowImportOutcome {
-    /// True only when the staged generation contains a real source or derived-state
-    /// change and is therefore authorized to replace the live generation. An exact
-    /// content-addressed no-op carries `false`; publication then validates and
-    /// preserves the live artifacts before discarding the stage.
+    /// True only when the staged generation contains a real source/derived-state
+    /// change or must advance a recognized legacy publication contract, and is
+    /// therefore authorized to replace the live generation. An exact
+    /// content-addressed no-op under the current contract carries `false`;
+    /// publication then validates and preserves the live artifacts before
+    /// discarding the stage.
     pub(crate) publication_required: bool,
     pub(crate) vault_dir: PathBuf,
     pub(crate) vault_id: String,
@@ -1448,6 +1456,23 @@ pub(crate) fn import_shadow_vault_with_archaeology_at(
         read_config_value(cache_dir, &metadata_key(project, GIT_SOURCE_REPO_PATH_KEY))?;
     let persisted_content_watermark =
         read_config_value(cache_dir, &metadata_key(project, "vault_fingerprint"))?;
+    let persisted_symbol_canonical_schema =
+        read_config_value(cache_dir, &metadata_key(project, "symbol_canonical_schema"))?;
+    let symbol_canonical_contract_current = match persisted_symbol_canonical_schema.as_deref() {
+        Some(persisted) if persisted == SYMBOL_CANONICAL_TAG => true,
+        None => false,
+        Some(persisted) => {
+            return Err(format!(
+                "{ASTRO_SHADOW_SYMBOL_CANONICAL_SCHEMA_INCOMPATIBLE}: project {project:?} \
+                 persists symbol canonical schema {persisted:?}, but this generation requires \
+                 {SYMBOL_CANONICAL_TAG:?}; remediation: preserve the live and staged \
+                 generations, inspect the incompatible identity contract, and migrate it \
+                 explicitly before retrying; Astrolabe will not overwrite a present unknown \
+                 schema as a legacy absence"
+            )
+            .into());
+        }
+    };
     let git_source_identity_unchanged = persisted_git_source_fingerprint.as_deref()
         == git_source_fingerprint.as_deref()
         && persisted_git_source_repo_path.as_deref() == git_source_repo_path.as_deref();
@@ -1459,7 +1484,15 @@ pub(crate) fn import_shadow_vault_with_archaeology_at(
     // closed below instead of being silently treated as a fresh import.
     let prior_generation_observed =
         !before_cx_by_atom.is_empty() || persisted_content_watermark.is_some();
-    let exact_noop = prior_generation_observed && !import_changed && git_source_identity_unchanged;
+    // Content identity alone cannot authorize discarding the stage: a recognized
+    // legacy generation with no symbol-canonical marker must pass through the
+    // normal full publication transaction once so the current marker, artifacts,
+    // and every derived metadata row advance atomically. A current generation
+    // retains the zero-write fast path.
+    let exact_noop = prior_generation_observed
+        && !import_changed
+        && git_source_identity_unchanged
+        && symbol_canonical_contract_current;
     if exact_noop {
         let persisted_content_sha256 = match persisted_content_watermark.as_deref() {
             None => {
