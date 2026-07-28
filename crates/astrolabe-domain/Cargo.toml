@@ -10,6 +10,7 @@ publish.workspace = true
 blake3 = "1"
 calyx-core.workspace = true
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 
 [lib]
 path = "src/lib.rs"

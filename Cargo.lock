@@ -103,6 +103,7 @@ dependencies = [
  "blake3",
  "calyx-core",
  "serde",
+ "serde_json",
 ]
 
 [[package]]

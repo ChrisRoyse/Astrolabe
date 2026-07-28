@@ -50,12 +50,13 @@ pub struct AtomFrames {
     pub language: String,
     /// Content key: `blake3(frame(label) ‖ frame(language) ‖ frame(snippet))`.
     pub content_key: [u8; 32],
-    /// True when the atom intentionally carries no source bytes (for example a
-    /// structural-only node). Such atoms have no content to be equivalent on: they are counted explicitly
-    /// and excluded from equivalence classes — otherwise every snippetless
-    /// atom fleet-wide collapses into one degenerate "duplicate" class (found
-    /// live on the pilot census: one 134-occurrence 10-repo `File` class).
-    pub snippet_empty: bool,
+    /// True when the atom intentionally carries no source (for example a
+    /// structural-only node). Such atoms have no content to be equivalent on:
+    /// they are counted explicitly and excluded from equivalence classes —
+    /// otherwise every source-absent atom fleet-wide collapses into one
+    /// degenerate "duplicate" class (found live on the pilot census: one
+    /// 134-occurrence 10-repo `File` class).
+    pub source_absent: bool,
 }
 
 fn take_frame<'a>(bytes: &'a [u8], cursor: &mut usize, what: &str) -> Result<&'a [u8], CalyxError> {
@@ -89,9 +90,109 @@ fn frame_of(bytes: &[u8]) -> Vec<u8> {
     out
 }
 
-/// Parses the canonical symbol frames (the exact `canonical_input_bytes`
-/// layout: tag, project, qualified_name, label, rel_file_path, language,
-/// snippet, signature, start/end line) and derives the content-only key.
+fn exact_frame_len(frame: &[u8], expected: usize, what: &str) -> Result<(), CalyxError> {
+    if frame.len() != expected {
+        return Err(invalid_frame(format!(
+            "{what} frame must contain {expected} bytes, got {}",
+            frame.len()
+        )));
+    }
+    Ok(())
+}
+
+fn invalid_frame(detail: String) -> CalyxError {
+    CalyxError {
+        code: ASTRO_FLEET_DEDUP_FRAME_INVALID,
+        message: format!("canonical input frames did not parse: {detail}"),
+        remediation: "the stored input is not a canonical symbol record; audit the vault input store",
+    }
+}
+
+fn frame_u64(frame: &[u8], what: &str) -> Result<u64, CalyxError> {
+    exact_frame_len(frame, 8, what)?;
+    Ok(u64::from_be_bytes(frame.try_into().unwrap()))
+}
+
+fn validate_utf8(frame: &[u8], what: &str) -> Result<(), CalyxError> {
+    std::str::from_utf8(frame)
+        .map(|_| ())
+        .map_err(|error| invalid_frame(format!("{what} is not UTF-8: {error}")))
+}
+
+fn parse_v1_tail<'a>(bytes: &'a [u8], cursor: &mut usize) -> Result<(&'a [u8], bool), CalyxError> {
+    let snippet = take_frame(bytes, cursor, "source_snippet_bytes")?;
+    let signature = take_frame(bytes, cursor, "signature")?;
+    let start_line = take_frame(bytes, cursor, "start_line")?;
+    let end_line = take_frame(bytes, cursor, "end_line")?;
+    validate_utf8(signature, "signature")?;
+    exact_frame_len(start_line, 4, "start_line")?;
+    exact_frame_len(end_line, 4, "end_line")?;
+    Ok((snippet, snippet.is_empty()))
+}
+
+fn parse_v2_tail<'a>(bytes: &'a [u8], cursor: &mut usize) -> Result<(&'a [u8], bool), CalyxError> {
+    let symbol_name = take_frame(bytes, cursor, "symbol_name")?;
+    let source_present = take_frame(bytes, cursor, "source_present")?;
+    let snippet = take_frame(bytes, cursor, "source_snippet_bytes")?;
+    let signature = take_frame(bytes, cursor, "signature")?;
+    let start_line = take_frame(bytes, cursor, "start_line")?;
+    let end_line = take_frame(bytes, cursor, "end_line")?;
+    let properties_digest = take_frame(bytes, cursor, "properties_digest")?;
+    let scalar_count = frame_u64(take_frame(bytes, cursor, "scalar_count")?, "scalar_count")?;
+
+    validate_utf8(symbol_name, "symbol_name")?;
+    validate_utf8(signature, "signature")?;
+    exact_frame_len(source_present, 1, "source_present")?;
+    exact_frame_len(start_line, 4, "start_line")?;
+    exact_frame_len(end_line, 4, "end_line")?;
+    exact_frame_len(properties_digest, 32, "properties_digest")?;
+    let source_absent = match source_present[0] {
+        0 => true,
+        1 => false,
+        value => {
+            return Err(invalid_frame(format!(
+                "source_present frame must contain canonical boolean 0 or 1, got {value}"
+            )));
+        }
+    };
+
+    let mut prior_scalar_key: Option<&[u8]> = None;
+    for scalar_index in 0..scalar_count {
+        let key = take_frame(bytes, cursor, "scalar_key")?;
+        let value = take_frame(bytes, cursor, "scalar_value")?;
+        validate_utf8(key, "scalar_key")?;
+        exact_frame_len(value, 8, "scalar_value")?;
+        if prior_scalar_key.is_some_and(|prior| prior >= key) {
+            return Err(invalid_frame(format!(
+                "scalar keys are not strictly increasing at index {scalar_index}"
+            )));
+        }
+        prior_scalar_key = Some(key);
+    }
+
+    let slot_count = frame_u64(
+        take_frame(bytes, cursor, "available_slot_count")?,
+        "available_slot_count",
+    )?;
+    let mut prior_slot: Option<u16> = None;
+    for slot_index in 0..slot_count {
+        let slot = take_frame(bytes, cursor, "available_slot")?;
+        exact_frame_len(slot, 2, "available_slot")?;
+        let slot = u16::from_be_bytes(slot.try_into().unwrap());
+        if prior_slot.is_some_and(|prior| prior >= slot) {
+            return Err(invalid_frame(format!(
+                "available slots are not strictly increasing at index {slot_index}"
+            )));
+        }
+        prior_slot = Some(slot);
+    }
+
+    Ok((snippet, source_absent))
+}
+
+/// Parses either supported canonical symbol frame version and derives the
+/// content-only key. Every version has an exact, fully consumed layout;
+/// unknown tags and non-canonical count/order/width encodings fail closed.
 pub fn parse_atom_frames(bytes: &[u8]) -> Result<AtomFrames, CalyxError> {
     let mut cursor = 0_usize;
     let tag = take_frame(bytes, &mut cursor, "tag")?;
@@ -100,35 +201,28 @@ pub fn parse_atom_frames(bytes: &[u8]) -> Result<AtomFrames, CalyxError> {
     let label = take_frame(bytes, &mut cursor, "label")?;
     let rel_file_path = take_frame(bytes, &mut cursor, "rel_file_path")?;
     let language = take_frame(bytes, &mut cursor, "language")?;
-    let snippet = take_frame(bytes, &mut cursor, "source_snippet_bytes")?;
-    let _signature = take_frame(bytes, &mut cursor, "signature")?;
-    let start_line = take_frame(bytes, &mut cursor, "start_line")?;
-    let end_line = take_frame(bytes, &mut cursor, "end_line")?;
-    let invalid = |detail: String| CalyxError {
-        code: ASTRO_FLEET_DEDUP_FRAME_INVALID,
-        message: format!("canonical input frames did not parse: {detail}"),
-        remediation: "the stored input is not a canonical symbol record; audit the vault input store",
+    let (snippet, source_absent) = match tag {
+        b"astro-symbol-v1" => parse_v1_tail(bytes, &mut cursor)?,
+        current if current == astrolabe_domain::SYMBOL_CANONICAL_TAG.as_bytes() => {
+            parse_v2_tail(bytes, &mut cursor)?
+        }
+        unsupported => {
+            return Err(invalid_frame(format!(
+                "canonical symbol tag {:?} is unsupported",
+                String::from_utf8_lossy(unsupported)
+            )));
+        }
     };
-    if tag != astrolabe_domain::SYMBOL_CANONICAL_TAG.as_bytes() {
-        return Err(invalid("canonical symbol tag is unsupported".to_string()));
-    }
-    if start_line.len() != 4 || end_line.len() != 4 {
-        return Err(invalid(format!(
-            "line frames must each contain four bytes, got {} and {}",
-            start_line.len(),
-            end_line.len()
-        )));
-    }
     if cursor != bytes.len() {
-        return Err(invalid(format!(
-            "{} trailing bytes remain after the canonical end_line frame",
+        return Err(invalid_frame(format!(
+            "{} trailing bytes remain after the canonical symbol frame",
             bytes.len() - cursor
         )));
     }
     let utf8 = |frame: &[u8], what: &str| {
         std::str::from_utf8(frame)
             .map(str::to_owned)
-            .map_err(|error| invalid(format!("{what} is not UTF-8: {error}")))
+            .map_err(|error| invalid_frame(format!("{what} is not UTF-8: {error}")))
     };
     let mut keyed = Vec::with_capacity(24 + label.len() + language.len() + snippet.len());
     keyed.extend_from_slice(&frame_of(label));
@@ -141,7 +235,7 @@ pub fn parse_atom_frames(bytes: &[u8]) -> Result<AtomFrames, CalyxError> {
         rel_file_path: utf8(rel_file_path, "rel_file_path")?,
         language: utf8(language, "language")?,
         content_key: *blake3::hash(&keyed).as_bytes(),
-        snippet_empty: snippet.is_empty(),
+        source_absent,
     })
 }
 
@@ -203,7 +297,7 @@ pub fn census_artifact(per_project: &[(String, Vec<AtomFrames>)]) -> Value {
     // atom, including File nodes. Structural nodes intentionally have no source;
     // they are counted explicitly and excluded instead of being collapsed into
     // one degenerate empty-content class.
-    let content_free = |atom: &AtomFrames| atom.snippet_empty;
+    let content_free = |atom: &AtomFrames| atom.source_absent;
     for (project, atoms) in per_project {
         for atom in atoms {
             if content_free(atom) {

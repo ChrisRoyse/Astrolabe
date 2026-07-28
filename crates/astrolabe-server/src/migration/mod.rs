@@ -9,6 +9,7 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use astrolabe_bridge::{CbmPipelineRows, CbmToolRunner};
+use astrolabe_domain::SYMBOL_CANONICAL_TAG;
 use astrolabe_guard::{
     PROMPT_INJECTION_FINDING_KIND, PROMPT_INJECTION_PATTERN_REGISTRY_VERSION,
     PromptInjectionFamily, PromptInjectionFinding, PromptScreenInput, PromptSourceKind,

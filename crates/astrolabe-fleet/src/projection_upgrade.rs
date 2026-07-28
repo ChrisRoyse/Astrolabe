@@ -14,15 +14,21 @@
 //! both-absent, changed hash, an unexpected rollback journal, or an unknown
 //! schema refuses without deleting anything.
 
-use std::fs::{self, OpenOptions};
-use std::io::{Read, Write};
+use std::fs::{self, File, OpenOptions};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
+use astrolabe_domain::SYMBOL_CANONICAL_TAG;
 use calyx_core::CalyxError;
-use rusqlite::{Connection, OpenFlags};
+use rusqlite::{Connection, OpenFlags, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
+
+#[cfg(windows)]
+use std::os::windows::fs::OpenOptionsExt;
+#[cfg(windows)]
+use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ;
 
 use crate::catalog::FleetCatalog;
 use crate::clone_farm::{git_capture, integrity_gate, same_remote, target_dir};
@@ -40,7 +46,9 @@ const MEMBER_SCHEMA: &str = "astrolabe.projection-upgrade.member.v1";
 const ARCHIVE_COMPLETION_SCHEMA: &str = "astrolabe.projection-upgrade.archive-completion.v1";
 const PROJECTION_COMPLETION_SCHEMA_V1: &str =
     "astrolabe.projection-upgrade.projection-completion.v1";
-const PROJECTION_COMPLETION_SCHEMA: &str = "astrolabe.projection-upgrade.projection-completion.v2";
+const PROJECTION_COMPLETION_SCHEMA_V2: &str =
+    "astrolabe.projection-upgrade.projection-completion.v2";
+const PROJECTION_COMPLETION_SCHEMA: &str = "astrolabe.projection-upgrade.projection-completion.v3";
 const MIGRATION_DIR: &str = "projection-v3";
 const LEGACY_NODE_COLUMNS: [&str; 9] = [
     "id",
@@ -121,6 +129,8 @@ pub struct ProjectionUpgradePreparation {
     pub database_sha256: String,
     /// Current schema version when this was a no-op.
     pub current_schema_version: Option<i64>,
+    /// Persisted immutable-symbol identity schema, absent for an unstamped legacy generation.
+    pub symbol_canonical_schema: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -307,6 +317,13 @@ pub fn prepare_projection_upgrade(
                 "catalog identity advanced beyond the archived legacy identity, but its current projection family is absent",
             ));
         }
+        let symbol_canonical_schema = if projection_current {
+            read_symbol_canonical_schema(repo, &store_dir, &identity.index_project)?
+        } else {
+            None
+        };
+        let symbol_identity_current =
+            symbol_canonical_schema.as_deref() == Some(SYMBOL_CANONICAL_TAG);
         let database_sha256 = if projection_current {
             sha256_file(repo, &current_database_path)?
         } else {
@@ -324,7 +341,7 @@ pub fn prepare_projection_upgrade(
             index_project: identity.index_project,
             source_head,
             indexed_commit_hash: intent.indexed_commit_hash,
-            outcome: if projection_current && catalog_current {
+            outcome: if projection_current && catalog_current && symbol_identity_current {
                 "projection_recovered"
             } else if projection_current {
                 "projection_recovered_refresh_required"
@@ -334,12 +351,13 @@ pub fn prepare_projection_upgrade(
                 "archived"
             }
             .to_string(),
-            reindex_required: !projection_current || !catalog_current,
+            reindex_required: !projection_current || !catalog_current || !symbol_identity_current,
             transaction_id: Some(intent.transaction_id),
             intent_path: Some(transaction_dir.join("intent.json").display().to_string()),
             archive_completion_path: Some(archive_completion.display().to_string()),
             database_sha256,
             current_schema_version: projection_current.then_some(CURRENT_CBM_SCHEMA_VERSION),
+            symbol_canonical_schema,
         });
     }
 
@@ -365,24 +383,28 @@ pub fn prepare_projection_upgrade(
     if schema.kind == SchemaKind::Current {
         let database_sha256 = sha256_file(repo, &database_path)?;
         let stale = indexed_head != source_head;
+        let symbol_canonical_schema =
+            read_symbol_canonical_schema(repo, &store_dir, &identity.index_project)?;
+        let identity_stale = symbol_canonical_schema.as_deref() != Some(SYMBOL_CANONICAL_TAG);
         return Ok(ProjectionUpgradePreparation {
             repo: repo.to_string(),
             store_key: identity.store_key,
             index_project: identity.index_project,
             source_head,
             indexed_commit_hash: indexed_head.to_string(),
-            outcome: if stale {
+            outcome: if stale || identity_stale {
                 "current_refresh_required"
             } else {
                 "current_noop"
             }
             .to_string(),
-            reindex_required: stale,
+            reindex_required: stale || identity_stale,
             transaction_id: None,
             intent_path: None,
             archive_completion_path: None,
             database_sha256,
             current_schema_version: Some(schema.user_version),
+            symbol_canonical_schema,
         });
     }
 
@@ -447,6 +469,7 @@ pub fn prepare_projection_upgrade(
         ),
         database_sha256,
         current_schema_version: None,
+        symbol_canonical_schema: None,
     })
 }
 
@@ -491,6 +514,7 @@ pub fn complete_projection_upgrade(
             "source_head": preparation.source_head,
             "current_index_project": current_identity.index_project,
             "current_kernel_scope": current_identity.kernel_scope,
+            "symbol_canonical_schema": SYMBOL_CANONICAL_TAG,
             "kernel_members_hash": kernel_members_hash,
             "kernel_member_count": kernel_member_count,
             "pipeline_report_sha256": pipeline_report_sha256,
@@ -537,6 +561,7 @@ pub fn complete_projection_upgrade(
         "archived_index_project": intent.index_project,
         "current_index_project": current_identity.index_project,
         "current_kernel_scope": current_identity.kernel_scope,
+        "symbol_canonical_schema": SYMBOL_CANONICAL_TAG,
         "database_user_version": schema.user_version,
         "database_nodes": schema.node_count,
         "database_edges": schema.edge_count,
@@ -676,6 +701,17 @@ pub fn read_current_projection_identity(
             "current catalog identity has no complete current projection family",
         ));
     }
+    let store_dir = config.store_root.join(&identity.store_key);
+    let symbol_canonical_schema =
+        read_symbol_canonical_schema(&preparation.repo, &store_dir, &identity.index_project)?;
+    if symbol_canonical_schema.as_deref() != Some(SYMBOL_CANONICAL_TAG) {
+        return Err(refusal(
+            &preparation.repo,
+            &format!(
+                "current projection is not stamped with required symbol canonical schema {SYMBOL_CANONICAL_TAG}"
+            ),
+        ));
+    }
     Ok(identity)
 }
 
@@ -745,6 +781,295 @@ fn verify_commit_object(repo: &str, source: &Path, commit: &str) -> Result<(), C
         ));
     }
     Ok(())
+}
+
+fn read_symbol_canonical_schema(
+    repo: &str,
+    store_dir: &Path,
+    index_project: &str,
+) -> Result<Option<String>, CalyxError> {
+    let config_path = store_dir.join("_config.db");
+    if !config_path.try_exists().map_err(|error| {
+        refusal(
+            repo,
+            &format!(
+                "cannot inspect config database {}: {error}",
+                config_path.display()
+            ),
+        )
+    })? {
+        for sidecar in [
+            PathBuf::from(format!("{}-wal", config_path.display())),
+            PathBuf::from(format!("{}-shm", config_path.display())),
+        ] {
+            if sidecar.try_exists().map_err(|error| {
+                refusal(
+                    repo,
+                    &format!(
+                        "cannot inspect config sidecar {}: {error}",
+                        sidecar.display()
+                    ),
+                )
+            })? {
+                return Err(refusal(
+                    repo,
+                    &format!(
+                        "config database {} is absent while sidecar {} exists",
+                        config_path.display(),
+                        sidecar.display()
+                    ),
+                ));
+            }
+        }
+        return Ok(None);
+    }
+    refuse_rollback_journal(repo, &config_path)?;
+    let family_before = snapshot_config_read_family(repo, &config_path)?;
+    if family_before.wal.bytes.is_some_and(|bytes| bytes != 0) {
+        return Err(refusal(
+            repo,
+            &format!(
+                "config database {} has a non-empty WAL ({} bytes); an immutable main-file read \
+                 would omit committed WAL state",
+                config_path.display(),
+                family_before.wal.bytes.unwrap_or_default(),
+            ),
+        ));
+    }
+    let mut retained_main = open_retained_config_main(repo, &config_path)?;
+    let family_retained = snapshot_config_read_family(repo, &config_path)?;
+    if family_retained != family_before {
+        return Err(refusal(
+            repo,
+            &format!(
+                "config database family changed while retaining {} for a read-only observation: \
+                 before={family_before:?}, retained={family_retained:?}",
+                config_path.display(),
+            ),
+        ));
+    }
+    let main_sha_before = sha256_open_file(repo, &config_path, &mut retained_main)?;
+    let immutable_uri = immutable_sqlite_uri(repo, &config_path)?;
+    let key = format!("astrolabe.calyx.{index_project}.symbol_canonical_schema");
+    let observation = (|| -> Result<Option<String>, CalyxError> {
+        let connection = Connection::open_with_flags(
+            &immutable_uri,
+            OpenFlags::SQLITE_OPEN_READ_ONLY
+                | OpenFlags::SQLITE_OPEN_URI
+                | OpenFlags::SQLITE_OPEN_NO_MUTEX
+                | OpenFlags::SQLITE_OPEN_PRIVATE_CACHE,
+        )
+        .map_err(|error| {
+            refusal(
+                repo,
+                &format!(
+                    "cannot open quiescent config database {} through its immutable read-only URI: \
+                     {error}",
+                    config_path.display(),
+                ),
+            )
+        })?;
+        let quick_check: String = connection
+            .query_row("PRAGMA quick_check", [], |row| row.get(0))
+            .map_err(|error| {
+                refusal(repo, &format!("config SQLite quick_check failed: {error}"))
+            })?;
+        if quick_check != "ok" {
+            return Err(refusal(
+                repo,
+                &format!("config SQLite quick_check returned {quick_check:?}"),
+            ));
+        }
+        let config_tables: i64 = connection
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'config'",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|error| refusal(repo, &format!("cannot inspect config table: {error}")))?;
+        if config_tables != 1 {
+            return Err(refusal(
+                repo,
+                &format!(
+                    "config database has {config_tables} config tables instead of exactly one"
+                ),
+            ));
+        }
+        connection
+            .query_row("SELECT value FROM config WHERE key = ?1", [&key], |row| {
+                row.get::<_, String>(0)
+            })
+            .optional()
+            .map_err(|error| {
+                refusal(
+                    repo,
+                    &format!("cannot read symbol canonical schema key {key:?}: {error}"),
+                )
+            })
+    })();
+    let main_sha_after = sha256_open_file(repo, &config_path, &mut retained_main)?;
+    let family_after = snapshot_config_read_family(repo, &config_path)?;
+    if main_sha_after != main_sha_before || family_after != family_before {
+        let observation_error = observation
+            .as_ref()
+            .err()
+            .map_or_else(|| "none".to_owned(), ToString::to_string);
+        return Err(refusal(
+            repo,
+            &format!(
+                "config database family drifted during immutable read-only observation of {}: \
+                 main SHA-256 {main_sha_before}/{main_sha_after}, \
+                 before={family_before:?}, after={family_after:?}, \
+                 observation_error={observation_error:?}",
+                config_path.display(),
+            ),
+        ));
+    }
+    drop(retained_main);
+    let value = observation?;
+    match value.as_deref() {
+        None => Ok(None),
+        Some(SYMBOL_CANONICAL_TAG) | Some("astro-symbol-v1") => Ok(value),
+        Some(other) => Err(refusal(
+            repo,
+            &format!("symbol canonical schema key {key:?} has unsupported value {other:?}"),
+        )),
+    }
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+struct ConfigFamilyMemberSnapshot {
+    bytes: Option<u64>,
+    modified_unix_nanos: Option<u128>,
+    sha256: Option<String>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+struct ConfigReadFamilySnapshot {
+    main: ConfigFamilyMemberSnapshot,
+    wal: ConfigFamilyMemberSnapshot,
+    shm: ConfigFamilyMemberSnapshot,
+}
+
+fn snapshot_config_read_family(
+    repo: &str,
+    config_path: &Path,
+) -> Result<ConfigReadFamilySnapshot, CalyxError> {
+    let members = family_paths(config_path);
+    Ok(ConfigReadFamilySnapshot {
+        main: snapshot_config_member(repo, &members[0].1)?,
+        wal: snapshot_config_member(repo, &members[1].1)?,
+        shm: snapshot_config_member(repo, &members[2].1)?,
+    })
+}
+
+fn snapshot_config_member(
+    repo: &str,
+    path: &Path,
+) -> Result<ConfigFamilyMemberSnapshot, CalyxError> {
+    let metadata = match fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(ConfigFamilyMemberSnapshot {
+                bytes: None,
+                modified_unix_nanos: None,
+                sha256: None,
+            });
+        }
+        Err(error) => {
+            return Err(refusal(
+                repo,
+                &format!(
+                    "cannot inspect config family member {}: {error}",
+                    path.display()
+                ),
+            ));
+        }
+    };
+    if !metadata.is_file() {
+        return Err(refusal(
+            repo,
+            &format!(
+                "config family member {} exists but is not a regular file",
+                path.display()
+            ),
+        ));
+    }
+    let modified_unix_nanos = metadata
+        .modified()
+        .map_err(|error| {
+            refusal(
+                repo,
+                &format!(
+                    "cannot read last-write time for config family member {}: {error}",
+                    path.display()
+                ),
+            )
+        })?
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|error| {
+            refusal(
+                repo,
+                &format!(
+                    "config family member {} has a pre-epoch last-write time: {error}",
+                    path.display()
+                ),
+            )
+        })?
+        .as_nanos();
+    Ok(ConfigFamilyMemberSnapshot {
+        bytes: Some(metadata.len()),
+        modified_unix_nanos: Some(modified_unix_nanos),
+        sha256: Some(sha256_file(repo, path)?),
+    })
+}
+
+fn open_retained_config_main(repo: &str, config_path: &Path) -> Result<File, CalyxError> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(windows)]
+    options.share_mode(FILE_SHARE_READ);
+    options.open(config_path).map_err(|error| {
+        refusal(
+            repo,
+            &format!(
+                "cannot retain config database {} with write/delete sharing denied: {error}",
+                config_path.display()
+            ),
+        )
+    })
+}
+
+fn immutable_sqlite_uri(repo: &str, config_path: &Path) -> Result<String, CalyxError> {
+    let open_path = astrolabe_domain::winpath::sqlite_open_path(config_path).map_err(|error| {
+        refusal(
+            repo,
+            &format!(
+                "cannot normalize config database {} for an immutable SQLite URI: {error}",
+                config_path.display()
+            ),
+        )
+    })?;
+    let mut uri = String::with_capacity(open_path.len().saturating_mul(3).saturating_add(36));
+    uri.push_str("file:");
+    for byte in open_path.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~' | b'/') {
+            uri.push(char::from(byte));
+        } else {
+            use std::fmt::Write as _;
+            write!(&mut uri, "%{byte:02X}").map_err(|error| {
+                refusal(
+                    repo,
+                    &format!(
+                        "cannot encode config database {} as an immutable SQLite URI: {error}",
+                        config_path.display()
+                    ),
+                )
+            })?;
+        }
+    }
+    uri.push_str("?mode=ro&immutable=1&cache=private");
+    Ok(uri)
 }
 
 fn inspect_schema(
@@ -1534,6 +1859,7 @@ fn verify_projection_completion_record(
     let completion: Value = read_json(repo, completion_path)?;
     let completion_schema = completion["schema"].as_str();
     let schema_valid = completion_schema == Some(PROJECTION_COMPLETION_SCHEMA)
+        || completion_schema == Some(PROJECTION_COMPLETION_SCHEMA_V2)
         || (intent.schema == TRANSACTION_SCHEMA_V1
             && completion_schema == Some(PROJECTION_COMPLETION_SCHEMA_V1));
     let common_valid = schema_valid
@@ -1568,7 +1894,8 @@ fn verify_projection_completion_record(
             .is_some_and(|hash| {
                 hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit())
             });
-    let v2_valid = completion_schema != Some(PROJECTION_COMPLETION_SCHEMA)
+    let versioned_fields_valid = (completion_schema != Some(PROJECTION_COMPLETION_SCHEMA)
+        && completion_schema != Some(PROJECTION_COMPLETION_SCHEMA_V2))
         || (completion["legacy_indexed_commit_hash"].as_str()
             == Some(intent.indexed_commit_hash.as_str())
             && completion["source_path"].as_str() == Some(intent.source_path.as_str())
@@ -1580,7 +1907,9 @@ fn verify_projection_completion_record(
                         &format!("cannot encode archived family for completion readback: {error}"),
                     )
                 })?);
-    let valid = common_valid && v2_valid;
+    let v3_valid = completion_schema != Some(PROJECTION_COMPLETION_SCHEMA)
+        || completion["symbol_canonical_schema"].as_str() == Some(SYMBOL_CANONICAL_TAG);
+    let valid = common_valid && versioned_fields_valid && v3_valid;
     if !valid {
         return Err(refusal(
             repo,
@@ -1773,6 +2102,19 @@ fn sha256_file(repo: &str, path: &Path) -> Result<String, CalyxError> {
         refusal(
             repo,
             &format!("cannot open {} for SHA-256: {error}", path.display()),
+        )
+    })?;
+    sha256_open_file(repo, path, &mut file)
+}
+
+fn sha256_open_file(repo: &str, path: &Path, file: &mut File) -> Result<String, CalyxError> {
+    file.seek(SeekFrom::Start(0)).map_err(|error| {
+        refusal(
+            repo,
+            &format!(
+                "cannot seek {} to the start for SHA-256: {error}",
+                path.display()
+            ),
         )
     })?;
     let mut hasher = Sha256::new();

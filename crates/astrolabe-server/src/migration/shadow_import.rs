@@ -2841,6 +2841,7 @@ pub(crate) fn grounding_summary(outcome: &ShadowImportOutcome) -> Value {
         "verify_chain": outcome.verify_chain_status,
         "fsv": outcome.import_fsv.as_ref().map(fsv_ack_envelope),
         "panel_version": SHADOW_PANEL_VERSION,
+        "symbol_canonical_schema": SYMBOL_CANONICAL_TAG,
         "panel_runtime": "cbm_frozen_v1",
         "vault_import": vault_import_summary(
             &outcome.vault_import_source,
@@ -3092,6 +3093,7 @@ pub(crate) fn persist_shadow_publication_at(
         ("ledger_seq", outcome.ledger_seq.to_string()),
         ("ledger_rows", outcome.ledger_rows_after.to_string()),
         ("panel_version", SHADOW_PANEL_VERSION.to_string()),
+        ("symbol_canonical_schema", SYMBOL_CANONICAL_TAG.to_string()),
         ("structural_only", outcome.structural_only.to_string()),
         ("new_cx_ids", outcome.new_cx_ids.to_string()),
         ("reused_cx_ids", outcome.reused_cx_ids.to_string()),

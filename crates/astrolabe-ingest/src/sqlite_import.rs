@@ -8,7 +8,7 @@ use astrolabe_domain::fsv::FsvAck;
 use astrolabe_domain::{
     ASTRO_ANCHOR_CONFIDENCE_RANGE, ASTRO_PANEL_VERSION_ZERO, ASTRO_SOURCE_DRIFT,
     ASTRO_SYMBOL_IDENTITY_EMPTY, ASTRO_SYMBOL_NON_FINITE, AnchorEvidence, DomainError, EdgeKind,
-    SERIES_ID_TAG, SeriesId, SymbolIdentity, SymbolLabel, SymbolRecord,
+    SERIES_ID_TAG, SYMBOL_CANONICAL_TAG, SeriesId, SymbolIdentity, SymbolLabel, SymbolRecord,
 };
 use astrolabe_panel::{PanelDriver, PanelInput, SlotRuntime, default_panel_slots};
 use calyx_aster::cf::{ColumnFamily, base_key, ledger_key, ledger_range, prefix_range, slot_key};
@@ -73,7 +73,7 @@ pub(crate) const EDGE_ROW_PREFIX: &[u8] = b"astrolabe:edge:v1:";
 /// O(corpus) per-symbol conversion, so a one-symbol delta reconciles only its file.
 const FILE_DIGEST_ROW_PREFIX: &[u8] = b"astrolabe:file-digest:v1:";
 const SCHEMA_NODE_MAP: &str = "astrolabe-node-map-v3";
-const SCHEMA_SYMBOL_METADATA: &str = "astrolabe-sqlite-symbol-v2";
+const SCHEMA_SYMBOL_METADATA: &str = "astrolabe-sqlite-symbol-v3";
 const SCHEMA_STRUCTURAL_NODE: &str = "astrolabe-structural-node-v2";
 const SCHEMA_PROJECT_ROW: &str = "astrolabe-cbm-project-v1";
 pub const CBM_FILE_HASH_ROW_SCHEMA: &str = "astrolabe-file-hash-v1";
@@ -1694,23 +1694,72 @@ where
         )?
         .ok_or_else(|| readback_mismatch("historical Base CF row disappeared"))?;
     let decoded = encode::decode_constellation_base(&bytes)?;
-    if decoded.cx_id != prepared.identity.cx_id
-        || decoded.vault_id != prepared.constellation.vault_id
-        || decoded.panel_version != prepared.constellation.panel_version
-        || decoded.input_ref.hash != prepared.constellation.input_ref.hash
-        || decoded.input_ref.redacted != prepared.constellation.input_ref.redacted
-        || decoded.modality != prepared.constellation.modality
-        || decoded.scalars != prepared.constellation.scalars
-    {
+    let mut differences = Vec::new();
+    if decoded.cx_id != prepared.identity.cx_id {
+        differences.push(format!(
+            "cx_id persisted={} prepared={}",
+            decoded.cx_id, prepared.identity.cx_id
+        ));
+    }
+    if decoded.vault_id != prepared.constellation.vault_id {
+        differences.push(format!(
+            "vault_id persisted={:?} prepared={:?}",
+            decoded.vault_id, prepared.constellation.vault_id
+        ));
+    }
+    if decoded.panel_version != prepared.constellation.panel_version {
+        differences.push(format!(
+            "panel_version persisted={} prepared={}",
+            decoded.panel_version, prepared.constellation.panel_version
+        ));
+    }
+    if decoded.input_ref.hash != prepared.constellation.input_ref.hash {
+        differences.push(format!(
+            "input_hash persisted={} prepared={}",
+            hex_lower(&decoded.input_ref.hash),
+            hex_lower(&prepared.constellation.input_ref.hash)
+        ));
+    }
+    if decoded.input_ref.redacted != prepared.constellation.input_ref.redacted {
+        differences.push(format!(
+            "input_redacted persisted={} prepared={}",
+            decoded.input_ref.redacted, prepared.constellation.input_ref.redacted
+        ));
+    }
+    if decoded.modality != prepared.constellation.modality {
+        differences.push(format!(
+            "modality persisted={:?} prepared={:?}",
+            decoded.modality, prepared.constellation.modality
+        ));
+    }
+    if decoded.scalars != prepared.constellation.scalars {
+        for key in decoded
+            .scalars
+            .keys()
+            .chain(prepared.constellation.scalars.keys())
+            .collect::<BTreeSet<_>>()
+        {
+            let persisted = decoded.scalars.get(key);
+            let prepared = prepared.constellation.scalars.get(key);
+            if persisted != prepared {
+                differences.push(format!(
+                    "scalar.{key} persisted={persisted:?} prepared={prepared:?}"
+                ));
+            }
+        }
+    }
+    if !differences.is_empty() {
         return Err(readback_mismatch(format!(
-            "preexisting historical Base CF fields differ for {}",
-            prepared.identity.cx_id
+            "preexisting historical Base CF fields differ for {}: {}",
+            prepared.identity.cx_id,
+            differences.join("; ")
         )));
     }
     for key in [
         "astrolabe_schema",
         "qualified_name",
         "label",
+        "symbol_canonical_schema",
         "series_id_schema",
         "series_id",
         "input_hash_blake3",
@@ -3095,6 +3144,8 @@ fn extract_nodes(raw_nodes: Vec<RawNodeRow>) -> IngestResult<Vec<ExtractedNode>>
             start_line,
             end_line,
         );
+        symbol.symbol_name = raw.name.clone();
+        symbol.source_present = raw.source_present;
         symbol.expected_source_snippet_blake3 = expected_source_blake3;
         symbol.scalars = scalar_properties(&raw.properties)?;
         symbol
@@ -3109,6 +3160,7 @@ fn extract_nodes(raw_nodes: Vec<RawNodeRow>) -> IngestResult<Vec<ExtractedNode>>
         symbol
             .scalars
             .insert("end_byte".to_string(), raw.end_byte as f64);
+        symbol.properties_json = raw.properties_json.clone();
         symbol.anchors = anchor_evidence(&raw.properties, raw.id)?;
 
         let node_vector_sha256 = raw.node_vector.as_ref().map(|bytes| sha256_digest(bytes));
@@ -3980,6 +4032,12 @@ where
             measured: None,
         });
     }
+    let mut node = node;
+    node.symbol.available_slots = options
+        .available_slots
+        .iter()
+        .map(|slot| slot.get())
+        .collect();
     let identity = node.symbol.identity(options.panel_version)?;
     let reused = vault
         .read_cf_at(
@@ -4148,12 +4206,12 @@ where
     let mut input = PanelInput::with_available_slots(node.label, options.available_slots.clone())
         .with_scalars(node.symbol.scalars.clone());
     input.source_bytes = node.symbol.source_snippet_bytes.clone();
-    input.symbol_name = node.name.clone();
+    input.symbol_name = node.symbol.symbol_name.clone();
     input.qualified_name = node.symbol.qualified_name.clone();
     input.rel_file_path = node.symbol.rel_file_path.clone();
     input.language = node.symbol.language.clone();
     input.signature = node.symbol.signature.clone();
-    input.properties = serde_json::from_str(&node.properties_json)?;
+    input.properties = serde_json::from_str(&node.symbol.properties_json)?;
     let readout = driver.measure(&input, runtime)?;
     // #386: `st` (S1 struct-trigram source) and `callees` (S4 api-callee source) are
     // emitted by libcbm into properties_json solely to feed the S1/S4 slot encoders
@@ -4276,6 +4334,10 @@ fn symbol_metadata(
     metadata.insert("file_path".to_string(), node.symbol.rel_file_path.clone());
     metadata.insert("language".to_string(), node.symbol.language.clone());
     metadata.insert("source_node_id".to_string(), node.id.to_string());
+    metadata.insert(
+        "symbol_canonical_schema".to_string(),
+        SYMBOL_CANONICAL_TAG.to_string(),
+    );
     metadata.insert("series_id_schema".to_string(), SERIES_ID_TAG.to_string());
     metadata.insert("series_id".to_string(), identity.series_id.to_string());
     metadata.insert("commit".to_string(), options.commit.clone());
@@ -4387,7 +4449,7 @@ fn symbol_exact_source_contract(
         }
         Ok(value as u64)
     };
-    let source_present = symbol.expected_source_snippet_blake3.is_some();
+    let source_present = symbol.source_present;
     let start_byte = scalar_u64("start_byte")?;
     let end_byte = scalar_u64("end_byte")?;
     if source_present {
@@ -5076,6 +5138,7 @@ fn verify_live_base_fields(
         "qualified_name",
         "label",
         "source_node_id",
+        "symbol_canonical_schema",
         "series_id_schema",
         "series_id",
     ] {
@@ -5847,6 +5910,7 @@ fn verify_node_map_matches_base(
         ("qualified_name", row.qualified_name.as_str()),
         ("label", row.label.as_str()),
         ("file_path", row.file_path.as_str()),
+        ("symbol_canonical_schema", SYMBOL_CANONICAL_TAG),
         ("series_id_schema", row.series_id_schema.as_str()),
     ];
     for (key, value) in expected {

@@ -7,7 +7,7 @@
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::str::FromStr;
 
@@ -31,13 +31,15 @@ pub const CRATE_NAME: &str = env!("CARGO_PKG_NAME");
 /// Absolute path to the owned Calyx tree used by this workspace.
 pub const CALYX_VENDOR_ROOT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../calyx");
 /// Version tag prepended to every symbol canonical byte sequence.
-pub const SYMBOL_CANONICAL_TAG: &str = "astro-symbol-v1";
+pub const SYMBOL_CANONICAL_TAG: &str = "astro-symbol-v2";
 /// Domain tag framed into every stable series identifier preimage.
 pub const SERIES_ID_TAG: &str = "astro-series-v2";
 /// Prefix used to build the per-project Calyx vault salt.
 pub const VAULT_SALT_PREFIX: &str = "astrolabe-v1:";
 /// Error code used when a symbol carries a non-finite scalar.
 pub const ASTRO_SYMBOL_NON_FINITE: &str = "ASTRO_SYMBOL_NON_FINITE";
+/// Error code used when a symbol's measurement properties are not a valid JSON object.
+pub const ASTRO_SYMBOL_PROPERTIES_INVALID: &str = "ASTRO_SYMBOL_PROPERTIES_INVALID";
 /// Error code used when project, qualified name, or label is empty.
 pub const ASTRO_SYMBOL_IDENTITY_EMPTY: &str = "ASTRO_SYMBOL_IDENTITY_EMPTY";
 /// Error code used when supplied source snippet hash does not match snippet bytes.
@@ -897,6 +899,12 @@ pub struct SymbolRecord {
     pub rel_file_path: String,
     /// Source language identifier for the observed symbol.
     pub language: String,
+    /// Symbol name supplied to the measurement panel.
+    #[serde(default)]
+    pub symbol_name: String,
+    /// Whether the exact source bytes are present rather than explicitly absent.
+    #[serde(default)]
+    pub source_present: bool,
     /// Exact source snippet bytes observed for the symbol.
     pub source_snippet_bytes: Vec<u8>,
     /// Signature string observed for the symbol.
@@ -909,6 +917,12 @@ pub struct SymbolRecord {
     pub expected_source_snippet_blake3: Option<[u8; 32]>,
     /// Numeric observations that must be finite before the symbol is admitted.
     pub scalars: BTreeMap<String, f64>,
+    /// JSON object supplied to property-driven measurement lenses.
+    #[serde(default = "empty_properties_json")]
+    pub properties_json: String,
+    /// Sorted numeric slot identifiers available to the measurement panel.
+    #[serde(default)]
+    pub available_slots: BTreeSet<u16>,
     /// Anchor evidence whose confidence values must be finite and within `(0, 1]`.
     pub anchors: Vec<AnchorEvidence>,
 }
@@ -933,12 +947,16 @@ impl SymbolRecord {
             label: label.into(),
             rel_file_path: rel_file_path.into(),
             language: language.into(),
+            symbol_name: String::new(),
+            source_present: false,
             source_snippet_bytes: source_snippet_bytes.into(),
             signature: signature.into(),
             start_line,
             end_line,
             expected_source_snippet_blake3: None,
             scalars: BTreeMap::new(),
+            properties_json: empty_properties_json(),
+            available_slots: BTreeSet::new(),
             anchors: Vec::new(),
         }
     }
@@ -1045,6 +1063,8 @@ pub fn frame(bytes: &[u8]) -> Vec<u8> {
 /// Returns the exact Astrolabe canonical byte sequence for a symbol.
 pub fn canonical_input_bytes(symbol: &SymbolRecord) -> Result<Vec<u8>> {
     symbol.validate_symbol_fields()?;
+    let properties_digest =
+        canonical_properties_digest(&symbol.properties_json, &symbol.qualified_name)?;
 
     let mut out = Vec::new();
     append_frame(&mut out, SYMBOL_CANONICAL_TAG.as_bytes());
@@ -1053,11 +1073,74 @@ pub fn canonical_input_bytes(symbol: &SymbolRecord) -> Result<Vec<u8>> {
     append_frame(&mut out, symbol.label.as_bytes());
     append_frame(&mut out, symbol.rel_file_path.as_bytes());
     append_frame(&mut out, symbol.language.as_bytes());
+    append_frame(&mut out, symbol.symbol_name.as_bytes());
+    append_frame(&mut out, &[u8::from(symbol.source_present)]);
     append_frame(&mut out, &symbol.source_snippet_bytes);
     append_frame(&mut out, symbol.signature.as_bytes());
     append_frame(&mut out, &symbol.start_line.to_be_bytes());
     append_frame(&mut out, &symbol.end_line.to_be_bytes());
+    append_frame(&mut out, &properties_digest);
+    append_frame(&mut out, &(symbol.scalars.len() as u64).to_be_bytes());
+    for (key, value) in &symbol.scalars {
+        append_frame(&mut out, key.as_bytes());
+        append_frame(&mut out, &value.to_bits().to_be_bytes());
+    }
+    append_frame(
+        &mut out,
+        &(symbol.available_slots.len() as u64).to_be_bytes(),
+    );
+    for slot in &symbol.available_slots {
+        append_frame(&mut out, &slot.to_be_bytes());
+    }
     Ok(out)
+}
+
+fn empty_properties_json() -> String {
+    "{}".to_string()
+}
+
+fn canonical_properties_digest(properties_json: &str, qualified_name: &str) -> Result<[u8; 32]> {
+    let value: serde_json::Value = serde_json::from_str(properties_json).map_err(|error| {
+        DomainError::new(
+            ASTRO_SYMBOL_PROPERTIES_INVALID,
+            format!("symbol {qualified_name} properties are invalid JSON: {error}"),
+            "Repair the persisted symbol properties as one JSON object before admitting the symbol.",
+        )
+    })?;
+    if !value.is_object() {
+        return Err(DomainError::new(
+            ASTRO_SYMBOL_PROPERTIES_INVALID,
+            format!("symbol {qualified_name} properties are not a JSON object"),
+            "Repair the persisted symbol properties as one JSON object before admitting the symbol.",
+        ));
+    }
+    let canonical = canonicalize_json(value);
+    let bytes = serde_json::to_vec(&canonical).map_err(|error| {
+        DomainError::new(
+            ASTRO_SYMBOL_PROPERTIES_INVALID,
+            format!("symbol {qualified_name} properties cannot be canonicalized: {error}"),
+            "Repair the persisted symbol properties as one JSON object before admitting the symbol.",
+        )
+    })?;
+    Ok(*blake3::hash(&bytes).as_bytes())
+}
+
+fn canonicalize_json(value: serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Array(values) => {
+            serde_json::Value::Array(values.into_iter().map(canonicalize_json).collect())
+        }
+        serde_json::Value::Object(object) => {
+            let mut entries = object.into_iter().collect::<Vec<_>>();
+            entries.sort_by(|left, right| left.0.cmp(&right.0));
+            let mut canonical = serde_json::Map::new();
+            for (key, value) in entries {
+                canonical.insert(key, canonicalize_json(value));
+            }
+            serde_json::Value::Object(canonical)
+        }
+        scalar => scalar,
+    }
 }
 
 /// Returns the stable series id for a symbol.

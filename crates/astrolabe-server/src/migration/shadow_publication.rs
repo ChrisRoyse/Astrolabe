@@ -241,19 +241,25 @@ impl ShadowPublication {
             return Err(self.abort_error("config commit", combine_rollback_error(error, rollback)));
         }
 
-        let config_readback = (|| -> Result<(Option<String>, Option<String>), DynError> {
-            Ok((
-                read_config_value(
-                    &self.live_cache,
-                    &metadata_key(&self.project, "sqlite_path"),
-                )?,
-                read_config_value(
-                    &self.live_cache,
-                    &metadata_key(&self.project, "vault_fingerprint"),
-                )?,
-            ))
-        })();
-        let (persisted_source, persisted_watermark) = match config_readback {
+        let config_readback =
+            (|| -> Result<(Option<String>, Option<String>, Option<String>), DynError> {
+                Ok((
+                    read_config_value(
+                        &self.live_cache,
+                        &metadata_key(&self.project, "sqlite_path"),
+                    )?,
+                    read_config_value(
+                        &self.live_cache,
+                        &metadata_key(&self.project, "vault_fingerprint"),
+                    )?,
+                    read_config_value(
+                        &self.live_cache,
+                        &metadata_key(&self.project, "symbol_canonical_schema"),
+                    )?,
+                ))
+            })();
+        let (persisted_source, persisted_watermark, persisted_symbol_schema) = match config_readback
+        {
             Ok(readback) => readback,
             Err(error) => {
                 let _ = self.write_journal(
@@ -272,6 +278,7 @@ impl ShadowPublication {
             format_shadow_watermark(&outcome.content_freshness_watermark_sha256);
         if persisted_source.as_deref() != Some(outcome.sqlite_path.to_string_lossy().as_ref())
             || persisted_watermark.as_deref() != Some(expected_watermark.as_str())
+            || persisted_symbol_schema.as_deref() != Some(SYMBOL_CANONICAL_TAG)
         {
             self.write_journal(
                 "committed_readback_failed",
@@ -280,6 +287,8 @@ impl ShadowPublication {
                     "expected_source": outcome.sqlite_path,
                     "persisted_watermark": persisted_watermark,
                     "expected_watermark": expected_watermark,
+                    "persisted_symbol_canonical_schema": persisted_symbol_schema,
+                    "expected_symbol_canonical_schema": SYMBOL_CANONICAL_TAG,
                 }),
             )?;
             return Err(format!(
@@ -298,6 +307,7 @@ impl ShadowPublication {
                 "vault_tree_sha256": vault_hash,
                 "config_source": persisted_source,
                 "config_watermark": persisted_watermark,
+                "config_symbol_canonical_schema": persisted_symbol_schema,
             }),
         )?;
         remove_transaction_tree(&self.transaction_dir, &self.project_root)?;

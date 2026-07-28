@@ -289,13 +289,13 @@ pub struct MemberOccurrence {
     pub language: String,
     /// #455 content-only key.
     pub content_key: [u8; 32],
-    /// True for File-label or snippetless atoms (#473 proxy) — never merged.
+    /// True for File-label or source-absent atoms (#473 proxy) — never merged.
     pub content_free: bool,
-    /// True when the atom carries no snippet fingerprint bytes at all (#473
-    /// proxy). Distinct from `content_free`, which also folds in the `File`
-    /// label; kept separate so the candidacy policy can attribute each exclusion
-    /// to exactly one declared rule.
-    pub snippet_empty: bool,
+    /// True when the atom explicitly carries no source (#473 proxy). Distinct
+    /// from `content_free`, which also folds in the `File` label; kept separate
+    /// so the candidacy policy can attribute each exclusion to exactly one
+    /// declared rule.
+    pub source_absent: bool,
     /// Whether the member was grounded (Trusted anchor within hop limit) at home.
     pub grounded: bool,
     /// Per-repo measured member stats, carried for provenance + degenerate path.
@@ -449,8 +449,8 @@ pub fn load_repo_kernel(
             label: frames.label.clone(),
             language: frames.language.clone(),
             content_key: frames.content_key,
-            content_free: frames.snippet_empty || frames.label == "File",
-            snippet_empty: frames.snippet_empty,
+            content_free: frames.source_absent || frames.label == "File",
+            source_absent: frames.source_absent,
             grounded: member.grounded,
             score_permille: member.score_permille,
             degree: member.degree,
@@ -639,7 +639,7 @@ impl FleetNode {
         if self
             .occurrences
             .iter()
-            .all(|occurrence| occurrence.snippet_empty)
+            .all(|occurrence| occurrence.source_absent)
         {
             return Some(CANDIDACY_RULE_EMPTY_FINGERPRINT);
         }
