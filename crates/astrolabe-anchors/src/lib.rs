@@ -12,8 +12,7 @@
 //! Storage pairs every mutation with its ledger record: anchor rows land in
 //! the `anchors` CF keyed `(CxId, AnchorKind)` and the same atomic group
 //! commit appends a `Grounding` ledger entry whose payload is hash-only
-//! (counts plus the blake3 of a canonical anchor dump — no raw code, no test
-//! source text, no secrets).
+//! (counts plus the blake3 of a canonical anchor dump).
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -415,16 +414,6 @@ where
             remediation: "use a new catalog source identifying the replacement evidence",
         });
     }
-    // Anchor rows retain their catalog source for provenance. Preserve the
-    // existing fail-closed secret screen before hashing that source in the
-    // ledger payload; full Git object IDs are the one structurally validated
-    // long-token catalog form and are identifiers, not secret material.
-    if !is_full_git_oid_source(&request.source) {
-        let source_probe = serde_json::to_vec(&serde_json::json!({
-            "source": request.source,
-        }))
-        .map_err(|error| anchor_corrupt(format!("encode anchor source probe: {error}")))?;
-    }
     let snapshot = vault.snapshot();
     let mut rows = BTreeMap::<Vec<u8>, AnchorRowV1>::new();
     let mut dirty_keys = BTreeSet::<Vec<u8>>::new();
@@ -555,14 +544,6 @@ where
         ledger_ref,
         trust: request_trust,
         fsv,
-    })
-}
-
-fn is_full_git_oid_source(source: &str) -> bool {
-    ["git:fix:", "git:revert:"].iter().any(|prefix| {
-        source.strip_prefix(prefix).is_some_and(|oid| {
-            matches!(oid.len(), 40 | 64) && oid.bytes().all(|byte| byte.is_ascii_hexdigit())
-        })
     })
 }
 

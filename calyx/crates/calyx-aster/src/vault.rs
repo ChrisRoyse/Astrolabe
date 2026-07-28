@@ -191,9 +191,8 @@ where
         match residency.authorize(target) {
             Ok(()) => Ok(()),
             Err(violation) => {
-                // The Ledger forbids raw paths (potential secrets), so the
-                // immutable audit references paths by verifiable blake3 digest;
-                // the human-readable paths travel in the returned error message.
+                // Keep the immutable audit independent of host-specific path
+                // spellings by binding paths through their normalized digests.
                 let payload = serde_json::to_vec(&serde_json::json!({
                     "event": "residency_violation",
                     "dataset_root_hash": residency.dataset_root_digest(),

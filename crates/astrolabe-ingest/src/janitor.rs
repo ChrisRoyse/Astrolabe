@@ -300,8 +300,8 @@ fn scrub_ledger_payload(
     slice: &JanitorSliceReport,
     checkpoint: &JanitorCheckpoint,
 ) -> IngestResult<Vec<u8>> {
-    // Counts and sequence bounds only — never any ledger payload bytes — so the
-    // scrub record can never re-embed a secret from the entries it verified.
+    // Counts and sequence bounds only: the scrub record describes verification
+    // coverage without duplicating the payload bytes it verified.
     Ok(serde_json::to_vec(&json!({
         "schema": FSV_JANITOR_SCRUB_LEDGER_SCHEMA,
         "status": slice.status,

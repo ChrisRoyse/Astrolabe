@@ -524,10 +524,8 @@ fn ensure_graph_bound_to_ledger(rows: &[LedgerRow], graph_hash: &str) -> LowerRe
             continue;
         }
         saw_attestation = true;
-        // Field name must match `crate::lower_ledger_payload` exactly. It is
-        // `artifact_sha256` (not `artifact`) because Calyx's ledger secret hook
-        // only lets a 64-hex digest through under an allowlisted field suffix
-        // such as `_sha256`; see the note in `lower_ledger_payload`.
+        // Field name must match `crate::lower_ledger_payload` exactly. The
+        // digest binds this attestation to the lowered artifact bytes.
         if payload
             .get("artifact_sha256")
             .and_then(serde_json::Value::as_str)

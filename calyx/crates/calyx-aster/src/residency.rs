@@ -65,9 +65,8 @@ impl Residency {
         }
     }
 
-    /// Redaction-safe blake3 digest (hex) of a path's normalized form. The
-    /// Ledger forbids raw paths in payloads (they could be secrets), so audit
-    /// entries reference paths by this verifiable digest instead.
+    /// Blake3 digest (hex) of a path's normalized form. Audit entries use this
+    /// stable identity rather than a host-specific path spelling.
     pub fn path_digest(path: &Path) -> String {
         blake3::hash(normalize_lexical(path).to_string_lossy().as_bytes())
             .to_hex()

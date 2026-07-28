@@ -140,8 +140,8 @@ fn quant_promotion_details(event: &IndexPromotionRecord) -> Option<Value> {
         "guard_far_before": evidence.guard_far_before,
         "guard_far_after": evidence.guard_far_after,
         // Absolute paths remain only in the checksummed serving pointer. The
-        // append-only ledger records public digests/measurements, never host
-        // path material that the secret scanner must reject.
+        // append-only ledger uses stable digests so records compare across
+        // equivalent host path spellings.
         "prior_pointer_digest": activation.prior_pointer_digest,
         "candidate_pointer_digest": activation.candidate_pointer_digest,
         "observed_pointer_digest": activation.observed_pointer_digest,

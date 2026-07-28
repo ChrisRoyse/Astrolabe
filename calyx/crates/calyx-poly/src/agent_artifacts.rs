@@ -64,7 +64,7 @@ pub struct AgentForecastManifest {
 }
 
 impl AgentForecastManifest {
-    /// Hash/id-only ledger payload accepted by the Calyx ledger secret guard.
+    /// Compact hash/id provenance payload for the append-only ledger.
     pub fn provenance_payload(&self) -> Value {
         let source_cx_id = self
             .source_snapshot_refs
