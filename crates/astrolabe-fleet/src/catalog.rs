@@ -25,8 +25,9 @@ use serde::Serialize;
 use serde_json::json;
 
 use crate::record::{
-    FleetRepoRow, RepoRecord, SourceRetirement, SourceRetirementStage, TransitionContext,
-    decode_repo_constellation, encode_repo_constellation, repo_cx_id,
+    ASTRO_FLEET_REASON_INVALID, FleetRepoRow, MAX_CATALOG_REASON_CHARS, RepoRecord,
+    SourceRetirement, SourceRetirementStage, TransitionContext, decode_repo_constellation,
+    encode_repo_constellation, repo_cx_id,
 };
 use crate::state::{ALL_STATES, RepoState, check_transition};
 
@@ -275,6 +276,22 @@ impl FleetCatalog {
                 message: format!("departing {full_name} requires a non-empty departed_reason"),
                 remediation: "pass why the repo left the enumeration (deleted, private, renamed, below star floor)",
             });
+        }
+        for (field, reason) in [
+            ("quarantine_reason", ctx.quarantine_reason.as_deref()),
+            ("departed_reason", ctx.departed_reason.as_deref()),
+        ] {
+            if let Some(reason) = reason
+                && reason.chars().count() > MAX_CATALOG_REASON_CHARS
+            {
+                return Err(CalyxError {
+                    code: ASTRO_FLEET_REASON_INVALID,
+                    message: format!(
+                        "{field} for {full_name} exceeds the declared {MAX_CATALOG_REASON_CHARS}-character catalog bound"
+                    ),
+                    remediation: "store the bounded summary in the catalog and the full diagnostic in the rejection report",
+                });
+            }
         }
 
         if let Some(clone_path) = ctx.clone_path {

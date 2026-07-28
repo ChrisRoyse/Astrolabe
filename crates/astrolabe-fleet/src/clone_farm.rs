@@ -79,7 +79,7 @@ use serde::Serialize;
 use serde_json::{Value, json};
 
 use crate::catalog::FleetCatalog;
-use crate::record::{FleetRepoRow, TransitionContext};
+use crate::record::{FleetRepoRow, MAX_CATALOG_REASON_CHARS, TransitionContext};
 use crate::state::RepoState;
 
 /// Refusal code for a git invocation the farm could not spawn.
@@ -104,10 +104,6 @@ pub const DEFAULT_PARALLELISM: usize = 4;
 pub const DEFAULT_GIT_TIMEOUT_SECS: u64 = 1800;
 /// Poll interval while waiting on a git child process.
 const GIT_POLL: Duration = Duration::from_millis(200);
-/// Longest reason text persisted into the catalog row; the full text always
-/// lives in the rejection report file.
-const MAX_REASON_LEN: usize = 300;
-
 /// Declared knobs of one clone-farm pass.
 #[derive(Clone, Debug, Serialize)]
 pub struct FarmConfig {
@@ -660,7 +656,7 @@ fn write_rejection(dir: &Path, github_id: u64, text: &str) {
 /// in the rejection file.
 pub fn safe_reason(raw: &str) -> String {
     let mut chars = raw.chars();
-    let mut out: String = chars.by_ref().take(MAX_REASON_LEN).collect();
+    let mut out: String = chars.by_ref().take(MAX_CATALOG_REASON_CHARS).collect();
     if chars.next().is_some() {
         out.push('…');
     }

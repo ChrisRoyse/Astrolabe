@@ -25,6 +25,11 @@ use crate::state::RepoState;
 pub const ASTRO_FLEET_RECORD_INVALID: &str = "ASTRO_FLEET_RECORD_INVALID";
 /// Refusal code for a stored catalog row that does not decode as a repo record.
 pub const ASTRO_FLEET_RECORD_CORRUPT: &str = "ASTRO_FLEET_RECORD_CORRUPT";
+/// Refusal code for a catalog reason outside its declared display bound.
+pub const ASTRO_FLEET_REASON_INVALID: &str = "ASTRO_FLEET_REASON_INVALID";
+/// Longest reason persisted into a live catalog row, measured in Unicode
+/// scalar values. Full external diagnostics remain in rejection reports.
+pub const MAX_CATALOG_REASON_CHARS: usize = 300;
 
 /// Catalog schema version, doubling as the constellation `panel_version`.
 ///
