@@ -361,6 +361,32 @@ pub fn recover_vault(vault_dir: impl AsRef<Path>) -> Result<RecoveryOutcome> {
     })
 }
 
+/// Loads one immutable manifest generation and validates its WAL tail without
+/// truncation or write-capable lock admission.
+pub(crate) fn recover_vault_read_only(vault_dir: impl AsRef<Path>) -> Result<RecoveryOutcome> {
+    let vault_dir = vault_dir.as_ref();
+    let manifest = ManifestStore::open(vault_dir).load_current()?;
+    let replay =
+        crate::wal::replay_dir_read_only_after(vault_dir.join("wal"), manifest.durable_seq)?;
+    let wal_records: Vec<_> = replay
+        .records
+        .into_iter()
+        .filter(|record| record.seq > manifest.durable_seq)
+        .collect();
+    let last_recovered_seq = wal_records
+        .last()
+        .map_or(manifest.durable_seq, |record| record.seq);
+    let degraded_rebuildable = manifest.degraded_rebuildable;
+
+    Ok(RecoveryOutcome {
+        manifest,
+        wal_records,
+        torn_tail: replay.torn_tail,
+        last_recovered_seq,
+        degraded_rebuildable,
+    })
+}
+
 /// Reads a base CF shard through the fail-closed SST path.
 pub fn read_base_shard(path: impl AsRef<Path>, key: &[u8]) -> Result<Option<Vec<u8>>> {
     SstReader::open(path)?.get(key)

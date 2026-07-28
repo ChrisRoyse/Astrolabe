@@ -1625,7 +1625,10 @@ pub fn vault_base_keys(
         vault_id,
         shadow_vault_salt(index_project).into_bytes(),
         VaultOptions {
+            restore_mvcc_rows: false,
+            restore_ledger_hook: false,
             read_only: true,
+            selected_cfs: Some(vec![ColumnFamily::Base]),
             ..VaultOptions::default()
         },
     )?;
@@ -1816,7 +1819,10 @@ fn verify_persisted(
         vault_id,
         shadow_vault_salt(project).into_bytes(),
         VaultOptions {
+            restore_mvcc_rows: false,
+            restore_ledger_hook: false,
             read_only: true,
+            selected_cfs: Some(vec![ColumnFamily::Base, ColumnFamily::Kernel]),
             ..VaultOptions::default()
         },
     )

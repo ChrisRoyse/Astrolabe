@@ -260,7 +260,10 @@ pub fn project_atoms(
         vault_id,
         shadow_vault_salt(index_project).into_bytes(),
         VaultOptions {
+            restore_mvcc_rows: false,
+            restore_ledger_hook: false,
             read_only: true,
+            selected_cfs: Some(vec![ColumnFamily::Blob]),
             ..VaultOptions::default()
         },
     )?;

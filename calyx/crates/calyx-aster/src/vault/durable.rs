@@ -9,11 +9,11 @@ use super::encode::{WriteRow, decode_write_batch, encode_write_batch};
 use crate::cf::ColumnFamily;
 use crate::compaction::TieringPolicy;
 use crate::dedup::DedupPolicy;
-use crate::manifest::recover_vault;
+use crate::manifest::{recover_vault, recover_vault_read_only};
 use crate::pressure::DiskPressureGuard;
 use crate::resource::ResourceCounters;
 use crate::timetravel::RetentionHorizon;
-use crate::wal::{GroupCommitBatcher, WalOptions, replay_dir};
+use crate::wal::{GroupCommitBatcher, WalOptions, replay_dir, replay_dir_read_only_after};
 use calyx_core::{CalyxError, Panel, Result, SystemClock, TemporalPolicy};
 use calyx_ledger::CheckpointConfig;
 use std::fs;
@@ -132,6 +132,13 @@ impl DurableVault {
                 remediation: "open read workloads with read_only=true, or keep restore_ledger_hook=true for write-capable handles",
             });
         }
+        if options.read_only && options.restore_ledger_hook {
+            return Err(CalyxError {
+                code: "CALYX_VAULT_OPTIONS_INVALID",
+                message: "read_only=true cannot restore a write-capable ledger hook".to_string(),
+                remediation: "set restore_ledger_hook=false for read-only vault handles",
+            });
+        }
         if options.read_only && options.residency.is_some() {
             return Err(CalyxError {
                 code: "CALYX_VAULT_OPTIONS_INVALID",
@@ -221,7 +228,11 @@ impl DurableVault {
         Self::validate_options(options)?;
         let root = root.as_ref();
         if root.join("CURRENT").exists() {
-            let recovery = recover_vault(root)?;
+            let recovery = if options.read_only {
+                recover_vault_read_only(root)?
+            } else {
+                recover_vault(root)?
+            };
             if let Some(policy) = &recovery.manifest.dedup_policy {
                 validate_dedup_policy(policy, options.panel.as_ref())?;
             }
@@ -254,7 +265,11 @@ impl DurableVault {
             });
         }
 
-        let replay = replay_dir(root.join("wal"))?;
+        let replay = if options.read_only {
+            replay_dir_read_only_after(root.join("wal"), 0)?
+        } else {
+            replay_dir(root.join("wal"))?
+        };
         let last_recovered_seq = replay.records.last().map_or(0, |record| record.seq);
         // A vault does not need a CURRENT manifest before its router SSTs and
         // WAL are valid latest-state sources. Honor the caller's router mode in

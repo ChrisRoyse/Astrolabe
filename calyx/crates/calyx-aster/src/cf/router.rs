@@ -29,6 +29,8 @@ pub struct CfRouter {
     pub(super) next_file: HashMap<ColumnFamily, u64>,
     memtable_byte_cap: usize,
     resource_counters: Arc<ResourceCounters>,
+    pub(super) existing_only: bool,
+    pub(super) eager_lookup_cfs: BTreeSet<ColumnFamily>,
 }
 
 impl CfRouter {
@@ -42,6 +44,35 @@ impl CfRouter {
         cfs: impl IntoIterator<Item = ColumnFamily>,
     ) -> Result<Self> {
         Self::open_selected_cfs_with_tiering(vault_dir, memtable_byte_cap, cfs, None)
+    }
+
+    pub(crate) fn open_selected_existing_cfs(
+        vault_dir: impl AsRef<Path>,
+        memtable_byte_cap: usize,
+        cfs: impl IntoIterator<Item = ColumnFamily>,
+    ) -> Result<Self> {
+        let selected = cfs.into_iter().collect::<BTreeSet<_>>();
+        if selected.is_empty() {
+            return Err(CalyxError::aster_corrupt_shard(
+                "selected existing CF router open requires at least one column family",
+            ));
+        }
+        let mut router = Self::new_existing(vault_dir, memtable_byte_cap)?;
+        router.eager_lookup_cfs = selected.clone();
+        for cf in &selected {
+            router.ensure_existing_cf(*cf)?;
+        }
+        router.load_existing_cfs(&selected.into_iter().collect::<Vec<_>>())?;
+        Ok(router)
+    }
+
+    pub(crate) fn open_existing(
+        vault_dir: impl AsRef<Path>,
+        memtable_byte_cap: usize,
+    ) -> Result<Self> {
+        let mut router = Self::new_existing(vault_dir, memtable_byte_cap)?;
+        router.load_existing()?;
+        Ok(router)
     }
 
     pub(crate) fn open_selected_cfs_with_tiering(
@@ -105,6 +136,39 @@ impl CfRouter {
             next_file: HashMap::new(),
             memtable_byte_cap,
             resource_counters: Arc::new(ResourceCounters::default()),
+            existing_only: false,
+            eager_lookup_cfs: BTreeSet::new(),
+        })
+    }
+
+    fn new_existing(vault_dir: impl AsRef<Path>, memtable_byte_cap: usize) -> Result<Self> {
+        let vault_dir = vault_dir.as_ref().to_path_buf();
+        let cf_root = vault_dir.join("cf");
+        if !cf_root.is_dir() {
+            return Err(CalyxError {
+                code: "CALYX_READ_ONLY_CF_ROOT_MISSING",
+                message: format!(
+                    "read-only CF root {} is absent; refusing to create it",
+                    cf_root.display()
+                ),
+                remediation: "initialize the durable vault through a write-capable handle before reading",
+            });
+        }
+        let memtable_byte_cap = if memtable_byte_cap == 0 {
+            DEFAULT_MEMTABLE_BYTES
+        } else {
+            memtable_byte_cap
+        };
+        Ok(Self {
+            vault_dir,
+            tiering_policy: None,
+            memtables: HashMap::new(),
+            levels: HashMap::new(),
+            next_file: HashMap::new(),
+            memtable_byte_cap,
+            resource_counters: Arc::new(ResourceCounters::default()),
+            existing_only: true,
+            eager_lookup_cfs: BTreeSet::new(),
         })
     }
 
@@ -372,6 +436,27 @@ impl CfRouter {
         if !self.memtables.contains_key(&cf) {
             fs::create_dir_all(self.cf_dir(cf))
                 .map_err(|error| CalyxError::disk_pressure(format!("create CF dir: {error}")))?;
+        }
+        self.memtables
+            .entry(cf)
+            .or_insert_with(|| Memtable::new(self.memtable_byte_cap));
+        self.levels.entry(cf).or_default();
+        self.next_file.entry(cf).or_insert(1);
+        Ok(())
+    }
+
+    pub(super) fn ensure_existing_cf(&mut self, cf: ColumnFamily) -> Result<()> {
+        let path = self.cf_dir(cf);
+        if !path.is_dir() {
+            return Err(CalyxError {
+                code: "CALYX_READ_ONLY_CF_MISSING",
+                message: format!(
+                    "selected read-only column family {} is absent at {}",
+                    cf.name(),
+                    path.display()
+                ),
+                remediation: "open only column families persisted by this vault, or initialize the missing family through a write-capable handle",
+            });
         }
         self.memtables
             .entry(cf)

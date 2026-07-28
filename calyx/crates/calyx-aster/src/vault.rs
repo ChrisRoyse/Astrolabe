@@ -38,6 +38,7 @@ mod store;
 mod temporal_xterm;
 use crate::cf::{CfRouter, ColumnFamily, KeyRange, anchor_key, base_key, slot_key};
 use crate::dedup::DedupPolicy;
+use crate::file_lock::FileLockGuard;
 use crate::mvcc::{Freshness, ReadBarrier, Snapshot, VersionedCfStore};
 use crate::resource::{ResourceStatus, VramBudgetStatus, collect_resource_status};
 use crate::timetravel::RetentionHorizon;
@@ -90,12 +91,62 @@ pub struct AsterVault<C = SystemClock> {
     recurrence_write_lock: Mutex<()>,
     recovery_report: VaultRecoveryReport,
     residency: Option<crate::residency::Residency>,
+    _read_snapshot_guard: Option<FileLockGuard>,
+    open_diagnostics: VaultOpenDiagnostics,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VaultRecoveryReport {
     pub last_recovered_seq: Seq,
     pub torn_tail: Option<TornTail>,
+}
+
+/// Measured phases of one durable vault open.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct VaultOpenDiagnostics {
+    /// Wall time spent acquiring the retained read-snapshot lock.
+    pub read_snapshot_lock_us: u64,
+    /// Native process-counter delta while acquiring the snapshot lock.
+    pub read_snapshot_lock_usage: VaultPhaseUsage,
+    /// Wall time spent reading the manifest and replaying the WAL tail.
+    pub recovery_us: u64,
+    /// Native process-counter delta during durable recovery.
+    pub recovery_usage: VaultPhaseUsage,
+    /// Wall time spent reconstructing the optional ledger hook.
+    pub ledger_hook_us: u64,
+    /// Native process-counter delta during ledger-hook reconstruction.
+    pub ledger_hook_usage: VaultPhaseUsage,
+    /// Wall time spent opening the column-family router.
+    pub router_us: u64,
+    /// Native process-counter delta while opening the router.
+    pub router_usage: VaultPhaseUsage,
+    /// End-to-end wall time for the durable vault open.
+    pub total_us: u64,
+    /// End-to-end native process-counter delta for the durable vault open.
+    pub total_usage: VaultPhaseUsage,
+}
+
+/// Native process counters attributed to one measured open phase.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct VaultPhaseUsage {
+    /// Kernel-mode CPU time consumed during the phase, in 100 ns units.
+    pub kernel_time_100ns: u64,
+    /// User-mode CPU time consumed during the phase, in 100 ns units.
+    pub user_time_100ns: u64,
+    /// Process read-operation count accumulated during the phase.
+    pub read_operations: u64,
+    /// Process read-transfer bytes accumulated during the phase.
+    pub read_bytes: u64,
+    /// Process write-operation count accumulated during the phase.
+    pub write_operations: u64,
+    /// Process write-transfer bytes accumulated during the phase.
+    pub write_bytes: u64,
+    /// Process page faults accumulated during the phase.
+    pub page_faults: u64,
+    /// Process working-set bytes sampled after the phase.
+    pub working_set_bytes_after: u64,
+    /// Process peak working-set bytes sampled after the phase.
+    pub peak_working_set_bytes_after: u64,
 }
 
 impl AsterVault<SystemClock> {
@@ -160,6 +211,8 @@ where
                 torn_tail: None,
             },
             residency: None,
+            _read_snapshot_guard: None,
+            open_diagnostics: VaultOpenDiagnostics::default(),
         }
     }
 
@@ -246,6 +299,12 @@ where
 
     pub fn recovery_report(&self) -> &VaultRecoveryReport {
         &self.recovery_report
+    }
+
+    /// Returns the native wall-time and process-counter attribution captured
+    /// while this durable vault handle opened.
+    pub fn open_diagnostics(&self) -> VaultOpenDiagnostics {
+        self.open_diagnostics
     }
 
     pub fn vault_id(&self) -> VaultId {

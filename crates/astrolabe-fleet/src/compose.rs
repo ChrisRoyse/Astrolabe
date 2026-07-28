@@ -66,7 +66,8 @@ use astrolabe_kernel::{
 use astrolabe_panel::PANEL_V2_VERSION;
 use astrolabe_weave::search::SLOT_CODE_SEMANTIC;
 use astrolabe_weave::search_production::read_search_corpus_from_vault;
-use calyx_aster::cf::ColumnFamily;
+use calyx_aster::cf::{ColumnFamily, base_key};
+use calyx_aster::vault::encode::decode_constellation_base;
 use calyx_aster::vault::input_store::{self, read_input_bytes};
 use calyx_aster::vault::{AsterVault, VaultOptions};
 use calyx_core::{CalyxError, CxId, VaultId};
@@ -105,6 +106,8 @@ pub const ASTRO_FLEET_KERNEL_MISSING: &str = "ASTRO_FLEET_KERNEL_MISSING";
 pub const ASTRO_FLEET_KERNEL_READBACK: &str = "ASTRO_FLEET_KERNEL_READBACK";
 /// Refusal: provenance verification found a sidecar claim reality contradicts.
 pub const ASTRO_FLEET_PROVENANCE_MISMATCH: &str = "ASTRO_FLEET_PROVENANCE_MISMATCH";
+/// Refusal: provenance verification requires a positive, explicit sample.
+pub const ASTRO_FLEET_PROVENANCE_SAMPLE_INVALID: &str = "ASTRO_FLEET_PROVENANCE_SAMPLE_INVALID";
 /// Refusal: the declared candidacy policy excluded every fleet node, so there
 /// is no code-bearing candidate to compose a kernel from.
 pub const ASTRO_FLEET_COMPOSE_NO_CANDIDATES: &str = "ASTRO_FLEET_COMPOSE_NO_CANDIDATES";
@@ -333,6 +336,7 @@ fn open_shadow_vault(
     store_root: &Path,
     store_key: &str,
     index_project: &str,
+    selected_cfs: Vec<ColumnFamily>,
 ) -> Result<AsterVault, CalyxError> {
     let vault_dir = store_root
         .join(store_key)
@@ -347,7 +351,10 @@ fn open_shadow_vault(
         vault_id,
         shadow_vault_salt(index_project).into_bytes(),
         VaultOptions {
+            restore_mvcc_rows: false,
+            restore_ledger_hook: false,
             read_only: true,
+            selected_cfs: Some(selected_cfs),
             ..VaultOptions::default()
         },
     )
@@ -404,7 +411,17 @@ pub fn load_repo_kernel(
     if !vault_dir.exists() {
         return Ok(None);
     }
-    let vault = open_shadow_vault(store_root, store_key, index_project)?;
+    let vault = open_shadow_vault(
+        store_root,
+        store_key,
+        index_project,
+        vec![
+            ColumnFamily::Blob,
+            ColumnFamily::Graph,
+            ColumnFamily::Kernel,
+            ColumnFamily::slot(SLOT_CODE_SEMANTIC),
+        ],
+    )?;
     let scope = kernel_scope_id(index_project);
     let artifact = read_persisted_kernel_artifact(&vault, &scope)
         .map_err(|error| inner_err("read per-repo kernel artifact", error))?;
@@ -822,6 +839,10 @@ fn coverage_from(indexed: &IndexedGraph, members: &BTreeSet<usize>, radius: u64)
 
 fn hex32(bytes: &[u8; 32]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn elapsed_us(started: std::time::Instant) -> u64 {
+    u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX)
 }
 
 /// Compose input hash: `blake3` over the candidacy policy identity and the
@@ -1477,16 +1498,25 @@ pub fn read_fleet_kernel(
 }
 
 /// Verifies `sample_n` fleet members' provenance against reality: for each
-/// sampled member every occurrence is re-resolved by re-scanning its project
-/// vault's input store — the stored input's recomputed CxId, qualified name,
-/// path, and content key must all match the sidecar claim. Fail-closed on any
-/// divergence.
+/// sampled occurrence, its exact Cx-addressed Base row supplies the persisted
+/// input-store hash, then that one retained input is read and recomputed. CxId,
+/// qualified name, path, and content key must all match the sidecar claim.
+/// Fail-closed on any divergence.
 pub fn verify_member_provenance(
     catalog: &FleetCatalog,
     store_root: &Path,
     scope: &str,
     sample_n: usize,
 ) -> Result<Value, CalyxError> {
+    let total_started = std::time::Instant::now();
+    if sample_n == 0 {
+        return Err(CalyxError {
+            code: ASTRO_FLEET_PROVENANCE_SAMPLE_INVALID,
+            message: "provenance sample count must be greater than zero".to_string(),
+            remediation: "pass a positive --verify-provenance count; use the member count to verify all members",
+        });
+    }
+    let requested_sample_n = sample_n;
     let sidecar_bytes = catalog
         .read_fleet_report(FLEET_KERNEL_REPORT_KIND, scope)?
         .ok_or_else(|| CalyxError {
@@ -1514,30 +1544,48 @@ pub fn verify_member_provenance(
             remediation: "recompose the fleet kernel",
         });
     }
-    let sample_n = sample_n.min(members.len()).max(1);
+    let sample_n = sample_n.min(members.len());
     let mut sampled: Vec<&Value> = Vec::with_capacity(sample_n);
     for slot in 0..sample_n {
         sampled.push(&members[slot * members.len() / sample_n]);
     }
 
-    // Group sampled occurrences by project so each vault scans once.
+    // Group sampled occurrences by project so each vault opens once.
     let mut by_project: BTreeMap<String, Vec<(String, Value)>> = BTreeMap::new();
     for member in &sampled {
         let fleet_cx = member
             .get("fleet_cx")
             .and_then(Value::as_str)
-            .unwrap_or("")
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| CalyxError {
+                code: ASTRO_FLEET_KERNEL_READBACK,
+                message: "sampled sidecar member carries no fleet_cx".to_string(),
+                remediation: "recompose the fleet kernel",
+            })?
             .to_string();
-        for occurrence in member
+        let occurrences = member
             .get("occurrences")
             .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-        {
+            .filter(|occurrences| !occurrences.is_empty())
+            .ok_or_else(|| CalyxError {
+                code: ASTRO_FLEET_KERNEL_READBACK,
+                message: format!(
+                    "sampled sidecar member {fleet_cx} carries no provenance occurrences"
+                ),
+                remediation: "recompose the fleet kernel",
+            })?;
+        for occurrence in occurrences {
             let project = occurrence
                 .get("project")
                 .and_then(Value::as_str)
-                .unwrap_or("")
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| CalyxError {
+                    code: ASTRO_FLEET_KERNEL_READBACK,
+                    message: format!(
+                        "sampled sidecar member {fleet_cx} carries an occurrence with no project"
+                    ),
+                    remediation: "recompose the fleet kernel",
+                })?
                 .to_string();
             by_project
                 .entry(project)
@@ -1547,10 +1595,39 @@ pub fn verify_member_provenance(
     }
 
     let mut verified = 0_usize;
+    let mut input_body_reads = 0_usize;
+    let mut input_body_read_us = 0_u64;
+    let mut claim_compare_us = 0_u64;
+    let mut project_open_diagnostics = Vec::new();
     for (project, claims) in &by_project {
         let identity = catalog_store_identity(catalog, project)?;
-        let vault = open_shadow_vault(store_root, &identity.store_key, &identity.index_project)?;
-        let by_cx = input_atoms_by_cx(&vault, &identity.index_project)?;
+        let project_open_started = std::time::Instant::now();
+        let vault = open_shadow_vault(
+            store_root,
+            &identity.store_key,
+            &identity.index_project,
+            vec![ColumnFamily::Base, ColumnFamily::Blob],
+        )?;
+        let project_open_wall_us = elapsed_us(project_open_started);
+        let open = vault.open_diagnostics();
+        project_open_diagnostics.push(json!({
+            "project": project,
+            "wall_us": project_open_wall_us,
+            "read_snapshot_lock_us": open.read_snapshot_lock_us,
+            "read_snapshot_lock_usage": phase_usage_json(open.read_snapshot_lock_usage),
+            "recovery_us": open.recovery_us,
+            "recovery_usage": phase_usage_json(open.recovery_usage),
+            "ledger_hook_us": open.ledger_hook_us,
+            "ledger_hook_usage": phase_usage_json(open.ledger_hook_usage),
+            "router_us": open.router_us,
+            "router_usage": phase_usage_json(open.router_usage),
+            "total_us": open.total_us,
+            "total_usage": phase_usage_json(open.total_usage),
+        }));
+        let salt = astrolabe_domain::vault_salt(&identity.index_project)
+            .map_err(|error| inner_err("derive domain identity salt", error))?
+            .into_bytes();
+        let mut inputs = BTreeMap::<[u8; 32], (CxId, AtomFrames)>::new();
         for (fleet_cx, claim) in claims {
             let cx_str = claim.get("cx").and_then(Value::as_str).unwrap_or("");
             let cx = CxId::from_str(cx_str).map_err(|error| CalyxError {
@@ -1558,27 +1635,75 @@ pub fn verify_member_provenance(
                 message: format!("sidecar occurrence cx {cx_str:?} did not parse: {error:?}"),
                 remediation: "recompose the fleet kernel",
             })?;
-            let Some(frames) = by_cx.get(&cx) else {
+            let base_bytes = vault
+                .read_cf_at(vault.latest_seq(), ColumnFamily::Base, &base_key(cx))?
+                .ok_or_else(|| CalyxError {
+                    code: ASTRO_FLEET_PROVENANCE_MISMATCH,
+                    message: format!(
+                        "fleet member {fleet_cx} claims occurrence {cx} in {project}, but its Base row is absent"
+                    ),
+                    remediation: "the sidecar diverged from the project vault; recompose",
+                })?;
+            let constellation = decode_constellation_base(&base_bytes)?;
+            if constellation.cx_id != cx {
                 return Err(CalyxError {
                     code: ASTRO_FLEET_PROVENANCE_MISMATCH,
                     message: format!(
-                        "fleet member {fleet_cx} claims occurrence {cx} in {project}, but no \
-                         stored input record recomputes to that CxId"
+                        "fleet member {fleet_cx} occurrence {cx} in {project} resolved a Base row for {}",
+                        constellation.cx_id
                     ),
-                    remediation: "the sidecar diverged from the project vault; recompose",
+                    remediation: "the project Base key/value identity diverged; reindex the project",
                 });
+            }
+            if constellation.input_ref.redacted {
+                return Err(CalyxError {
+                    code: ASTRO_FLEET_KERNEL_READBACK,
+                    message: format!(
+                        "fleet member {fleet_cx} occurrence {cx} in {project} has a redacted input"
+                    ),
+                    remediation: "reindex with input retention enabled before verifying exact provenance",
+                });
+            }
+            let input_hash = constellation.input_ref.hash;
+            let expected_pointer = input_store::input_pointer(&input_hash);
+            if constellation.input_ref.pointer.as_deref() != Some(expected_pointer.as_str()) {
+                return Err(CalyxError {
+                    code: ASTRO_FLEET_PROVENANCE_MISMATCH,
+                    message: format!(
+                        "fleet member {fleet_cx} occurrence {cx} in {project} carries input pointer {:?}, expected {expected_pointer:?}",
+                        constellation.input_ref.pointer
+                    ),
+                    remediation: "the Base row and retained input-store address diverged; reindex the project",
+                });
+            }
+            let (rederived_cx, frames) = match inputs.entry(input_hash) {
+                std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    let read_started = std::time::Instant::now();
+                    let bytes = read_input_bytes(&vault, &input_hash)?;
+                    input_body_read_us =
+                        input_body_read_us.saturating_add(elapsed_us(read_started));
+                    input_body_reads += 1;
+                    let frames = parse_atom_frames(&bytes)?;
+                    let rederived = cx_id_from_canonical(&bytes, PANEL_V2_VERSION, &salt)
+                        .map_err(|error| inner_err("derive sampled provenance CxId", error))?;
+                    entry.insert((rederived, frames))
+                }
             };
+            let compare_started = std::time::Instant::now();
             let claimed_name = claim.get("qualified_name").and_then(Value::as_str);
             let claimed_path = claim.get("rel_file_path").and_then(Value::as_str);
             let claimed_key = claim.get("content_key").and_then(Value::as_str);
-            if claimed_name != Some(frames.qualified_name.as_str())
+            if *rederived_cx != cx
+                || claimed_name != Some(frames.qualified_name.as_str())
                 || claimed_path != Some(frames.rel_file_path.as_str())
                 || claimed_key != Some(hex32(&frames.content_key).as_str())
             {
                 return Err(CalyxError {
                     code: ASTRO_FLEET_PROVENANCE_MISMATCH,
                     message: format!(
-                        "fleet member {fleet_cx} occurrence {cx} in {project}: sidecar claims \
+                        "fleet member {fleet_cx} occurrence {cx} in {project}: input recomputes \
+                         to {rederived_cx}; sidecar claims \
                          name={claimed_name:?} path={claimed_path:?} key={claimed_key:?} but the \
                          vault holds name={:?} path={:?} key={:?}",
                         frames.qualified_name,
@@ -1588,6 +1713,7 @@ pub fn verify_member_provenance(
                     remediation: "the sidecar diverged from the project vault; recompose",
                 });
             }
+            claim_compare_us = claim_compare_us.saturating_add(elapsed_us(compare_started));
             verified += 1;
         }
     }
@@ -1595,8 +1721,33 @@ pub fn verify_member_provenance(
     Ok(json!({
         "verb": "kernel-read",
         "provenance_verified": true,
+        "requested_sample_members": requested_sample_n,
         "sampled_members": sampled.len(),
         "occurrences_verified": verified,
         "projects_scanned": by_project.len(),
+        "performance": {
+            "total_us": elapsed_us(total_started),
+            "project_vault_opens": project_open_diagnostics,
+            "input_body_reads": input_body_reads,
+            "input_body_read_us": input_body_read_us,
+            "claim_compare_us": claim_compare_us,
+            "full_blob_scan": false,
+            "blob_scan_rows": 0,
+            "blob_scan_us": 0,
+        },
     }))
+}
+
+fn phase_usage_json(usage: calyx_aster::vault::VaultPhaseUsage) -> Value {
+    json!({
+        "kernel_time_100ns": usage.kernel_time_100ns,
+        "user_time_100ns": usage.user_time_100ns,
+        "read_operations": usage.read_operations,
+        "read_bytes": usage.read_bytes,
+        "write_operations": usage.write_operations,
+        "write_bytes": usage.write_bytes,
+        "page_faults": usage.page_faults,
+        "working_set_bytes_after": usage.working_set_bytes_after,
+        "peak_working_set_bytes_after": usage.peak_working_set_bytes_after,
+    })
 }

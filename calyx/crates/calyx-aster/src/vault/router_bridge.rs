@@ -1,4 +1,4 @@
-use super::{AsterVault, DEFAULT_LEASE_MS, VaultRecoveryReport};
+use super::{AsterVault, DEFAULT_LEASE_MS, VaultOpenDiagnostics, VaultRecoveryReport};
 use crate::cf::CfRouter;
 use crate::dedup::DedupPolicy;
 use crate::mvcc::{Freshness, Snapshot, VersionedCfStore};
@@ -32,6 +32,8 @@ where
                 torn_tail: None,
             },
             residency: None,
+            _read_snapshot_guard: None,
+            open_diagnostics: VaultOpenDiagnostics::default(),
         }
     }
 

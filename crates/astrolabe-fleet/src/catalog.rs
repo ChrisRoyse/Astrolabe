@@ -160,6 +160,42 @@ impl FleetCatalog {
         Ok(Self { vault, vault_id })
     }
 
+    /// Opens an existing catalog as a latest-state read snapshot over exactly
+    /// the column families consumed by the caller.
+    pub fn open_read_only(
+        root: &Path,
+        selected_cfs: Vec<ColumnFamily>,
+    ) -> Result<Self, CalyxError> {
+        if !root.is_dir() {
+            return Err(CalyxError {
+                code: "ASTRO_FLEET_ROOT_UNAVAILABLE",
+                message: format!(
+                    "fleet catalog root {} is absent; refusing to create it for a read",
+                    root.display()
+                ),
+                remediation: "initialize the catalog with catalog-init before using read-only verbs",
+            });
+        }
+        let vault_id = VaultId::from_str(FLEET_VAULT_ID).map_err(|error| CalyxError {
+            code: "ASTRO_FLEET_VAULT_ID_INVALID",
+            message: format!("declared fleet vault id failed to parse: {error:?}"),
+            remediation: "internal defect: FLEET_VAULT_ID must be a valid ULID literal",
+        })?;
+        let vault = AsterVault::open(
+            root,
+            vault_id,
+            FLEET_VAULT_SALT.to_vec(),
+            VaultOptions {
+                restore_mvcc_rows: false,
+                restore_ledger_hook: false,
+                read_only: true,
+                selected_cfs: Some(selected_cfs),
+                ..VaultOptions::default()
+            },
+        )?;
+        Ok(Self { vault, vault_id })
+    }
+
     /// Registers (or idempotently re-registers) a repository.
     ///
     /// A brand-new identity persists at [`RepoState::Discovered`] with an

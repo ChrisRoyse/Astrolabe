@@ -20,18 +20,20 @@ pub fn replay_dir_after(dir: impl AsRef<Path>, replay_floor_seq: u64) -> Result<
     replay_dir_locked_after(dir, replay_floor_seq)
 }
 
-/// Validates every physical record and CRC without truncating, while returning
-/// payloads only for logical commits above `replay_floor_seq`.
+/// Validates record framing without truncating, while returning payloads only
+/// for logical commits above `replay_floor_seq`.
 ///
-/// This is the full-restore verifier path: checkpointed payloads must not be
-/// interpreted again, but their physical bytes still have to pass framing and
-/// checksum validation.
+/// Checkpointed records are represented by the hash-validated manifest/SST
+/// generation, so their headers establish the next physical boundary without
+/// cold-reading obsolete payload pages. The uncheckpointed tail is decoded
+/// and CRC-validated in full.
 pub fn replay_dir_read_only_after(
     dir: impl AsRef<Path>,
     replay_floor_seq: u64,
 ) -> Result<ReplayOutcome> {
     let dir = dir.as_ref();
-    let _lock = crate::file_lock::FileLockGuard::acquire(&dir.join(".append.lock"))?;
+    let _lock =
+        crate::file_lock::FileLockGuard::acquire_shared_existing(&dir.join(".append.lock"))?;
     replay_dir_read_only_locked_after(dir, replay_floor_seq)
 }
 
@@ -47,6 +49,25 @@ pub(super) fn replay_dir_read_only_locked_after(
             .map_err(|error| storage_error("open WAL segment read-only", error))?;
         let mut offset = 0;
         loop {
+            let header = match record::read_header_at(&mut file, offset)
+                .map_err(|error| storage_error("decode WAL header read-only", error))?
+            {
+                record::HeaderStatus::Complete(header) => header,
+                record::HeaderStatus::Eof => break,
+                record::HeaderStatus::Torn { offset, message } => {
+                    return Err(TornTail {
+                        segment_path: path.clone(),
+                        offset,
+                        code: CalyxErrorCode::AsterTornWal.code(),
+                        message,
+                    }
+                    .error());
+                }
+            };
+            if header.seq <= replay_floor_seq {
+                offset = header.end_offset;
+                continue;
+            }
             match record::decode_logical_at(&mut file, offset)
                 .map_err(|error| storage_error("validate WAL record read-only", error))?
             {

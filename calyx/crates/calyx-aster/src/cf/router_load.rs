@@ -84,15 +84,26 @@ impl CfRouter {
             .max()
             .unwrap_or(0)
             + 1;
-        self.ensure_cf(cf)?;
-        self.levels.insert(cf, load_level_for_cf(cf, files)?);
+        if self.existing_only {
+            self.ensure_existing_cf(cf)?;
+        } else {
+            self.ensure_cf(cf)?;
+        }
+        self.levels.insert(
+            cf,
+            load_level_for_cf(cf, files, self.eager_lookup_cfs.contains(&cf))?,
+        );
         self.next_file.insert(cf, next);
         Ok(())
     }
 }
 
-fn load_level_for_cf(cf: ColumnFamily, files: Vec<PathBuf>) -> Result<SstLevel> {
-    if eager_lookup_on_open(cf) {
+fn load_level_for_cf(
+    cf: ColumnFamily,
+    files: Vec<PathBuf>,
+    selected_read_lookup: bool,
+) -> Result<SstLevel> {
+    if selected_read_lookup || eager_lookup_on_open(cf) {
         SstLevel::from_oldest_first_with_lookup(files)
     } else {
         Ok(SstLevel::from_oldest_first(files))

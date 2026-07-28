@@ -12,6 +12,8 @@ where
         options: VaultOptions,
         clock: C,
     ) -> Result<Self> {
+        let total_started = std::time::Instant::now();
+        let total_usage_before = current_process_usage()?;
         // Startup guard (#276): refuse to open a durable vault if crash-injection
         // failpoints are armed in an optimized, non-test build. No-op in normal
         // and debug/test builds.
@@ -19,7 +21,25 @@ where
         DurableVault::validate_options(&options)?;
         let clock = std::sync::Arc::new(clock);
         let vault_root = vault_dir.as_ref().to_path_buf();
+        let read_snapshot_lock_started = std::time::Instant::now();
+        let read_snapshot_lock_usage_before = current_process_usage()?;
+        let read_snapshot_guard = if options.read_only {
+            Some(crate::file_lock::FileLockGuard::acquire_shared_existing(
+                &vault_root.join("locks").join("durable.commit.lock"),
+            )?)
+        } else {
+            None
+        };
+        let read_snapshot_lock_us = elapsed_us(read_snapshot_lock_started);
+        let read_snapshot_lock_usage =
+            current_process_usage()?.phase_since(read_snapshot_lock_usage_before);
+        let recovery_started = std::time::Instant::now();
+        let recovery_usage_before = current_process_usage()?;
         let recovery = DurableVault::recover_batches(vault_dir.as_ref(), &options)?;
+        let recovery_us = elapsed_us(recovery_started);
+        let recovery_usage = current_process_usage()?.phase_since(recovery_usage_before);
+        let ledger_hook_started = std::time::Instant::now();
+        let ledger_hook_usage_before = current_process_usage()?;
         let ledger_hook = if options.restore_ledger_hook {
             Some(ledger_hook::recover_hook_from_vault_dir(
                 vault_dir.as_ref(),
@@ -31,22 +51,36 @@ where
         } else {
             None
         };
+        let ledger_hook_us = elapsed_us(ledger_hook_started);
+        let ledger_hook_usage = current_process_usage()?.phase_since(ledger_hook_usage_before);
         let recovery_report = VaultRecoveryReport {
             last_recovered_seq: recovery.last_recovered_seq,
             torn_tail: recovery.torn_tail.clone(),
         };
+        let router_started = std::time::Instant::now();
+        let router_usage_before = current_process_usage()?;
         let router = match &options.selected_cfs {
+            Some(cfs) if options.read_only => CfRouter::open_selected_existing_cfs(
+                vault_dir.as_ref(),
+                options.memtable_byte_cap,
+                cfs.iter().copied(),
+            )?,
             Some(cfs) => CfRouter::open_selected_cfs(
                 vault_dir.as_ref(),
                 options.memtable_byte_cap,
                 cfs.iter().copied(),
             )?,
+            None if options.read_only => {
+                CfRouter::open_existing(vault_dir.as_ref(), options.memtable_byte_cap)?
+            }
             None => CfRouter::open_with_tiering(
                 vault_dir.as_ref(),
                 options.memtable_byte_cap,
                 options.tiering_policy.clone(),
             )?,
         };
+        let router_us = elapsed_us(router_started);
+        let router_usage = current_process_usage()?.phase_since(router_usage_before);
         let rows = if recovery.router_latest_readback {
             VersionedCfStore::new_with_router_latest_readback(recovery.last_recovered_seq, router)
         } else {
@@ -124,6 +158,18 @@ where
         {
             pin.enforce_tier_roots(&tiering.tier_roots())?;
         }
+        let open_diagnostics = VaultOpenDiagnostics {
+            read_snapshot_lock_us,
+            read_snapshot_lock_usage,
+            recovery_us,
+            recovery_usage,
+            ledger_hook_us,
+            ledger_hook_usage,
+            router_us,
+            router_usage,
+            total_us: elapsed_us(total_started),
+            total_usage: current_process_usage()?.phase_since(total_usage_before),
+        };
         Ok(Self {
             vault_id,
             vault_salt: vault_salt.into(),
@@ -137,6 +183,107 @@ where
             recurrence_write_lock: Mutex::new(()),
             recovery_report,
             residency,
+            _read_snapshot_guard: read_snapshot_guard,
+            open_diagnostics,
         })
+    }
+}
+
+fn elapsed_us(started: std::time::Instant) -> u64 {
+    u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX)
+}
+
+#[derive(Clone, Copy)]
+struct ProcessUsage {
+    kernel_time_100ns: u64,
+    user_time_100ns: u64,
+    read_operations: u64,
+    read_bytes: u64,
+    write_operations: u64,
+    write_bytes: u64,
+    page_faults: u64,
+    working_set_bytes: u64,
+    peak_working_set_bytes: u64,
+}
+
+impl ProcessUsage {
+    fn phase_since(self, before: Self) -> VaultPhaseUsage {
+        VaultPhaseUsage {
+            kernel_time_100ns: self
+                .kernel_time_100ns
+                .saturating_sub(before.kernel_time_100ns),
+            user_time_100ns: self.user_time_100ns.saturating_sub(before.user_time_100ns),
+            read_operations: self.read_operations.saturating_sub(before.read_operations),
+            read_bytes: self.read_bytes.saturating_sub(before.read_bytes),
+            write_operations: self
+                .write_operations
+                .saturating_sub(before.write_operations),
+            write_bytes: self.write_bytes.saturating_sub(before.write_bytes),
+            page_faults: self.page_faults.saturating_sub(before.page_faults),
+            working_set_bytes_after: self.working_set_bytes,
+            peak_working_set_bytes_after: self.peak_working_set_bytes,
+        }
+    }
+}
+
+fn current_process_usage() -> Result<ProcessUsage> {
+    use windows_sys::Win32::Foundation::{FILETIME, GetLastError};
+    use windows_sys::Win32::System::ProcessStatus::{
+        K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS,
+    };
+    use windows_sys::Win32::System::Threading::{
+        GetCurrentProcess, GetProcessIoCounters, GetProcessTimes, IO_COUNTERS,
+    };
+
+    let mut creation = FILETIME::default();
+    let mut exit = FILETIME::default();
+    let mut kernel = FILETIME::default();
+    let mut user = FILETIME::default();
+    let mut io = IO_COUNTERS::default();
+    let mut memory: PROCESS_MEMORY_COUNTERS = unsafe { std::mem::zeroed() };
+    let process = unsafe { GetCurrentProcess() };
+    // SAFETY: the pseudo-handle is valid in this process and every pointer
+    // names a correctly sized writable Windows POD.
+    unsafe {
+        if GetProcessTimes(process, &mut creation, &mut exit, &mut kernel, &mut user) == 0 {
+            return Err(process_usage_error("GetProcessTimes", GetLastError()));
+        }
+        if GetProcessIoCounters(process, &mut io) == 0 {
+            return Err(process_usage_error("GetProcessIoCounters", GetLastError()));
+        }
+        if K32GetProcessMemoryInfo(
+            process,
+            &raw mut memory,
+            std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32,
+        ) == 0
+        {
+            return Err(process_usage_error(
+                "K32GetProcessMemoryInfo",
+                GetLastError(),
+            ));
+        }
+    }
+    Ok(ProcessUsage {
+        kernel_time_100ns: filetime_value(kernel),
+        user_time_100ns: filetime_value(user),
+        read_operations: io.ReadOperationCount,
+        read_bytes: io.ReadTransferCount,
+        write_operations: io.WriteOperationCount,
+        write_bytes: io.WriteTransferCount,
+        page_faults: u64::from(memory.PageFaultCount),
+        working_set_bytes: memory.WorkingSetSize as u64,
+        peak_working_set_bytes: memory.PeakWorkingSetSize as u64,
+    })
+}
+
+fn filetime_value(value: windows_sys::Win32::Foundation::FILETIME) -> u64 {
+    (u64::from(value.dwHighDateTime) << 32) | u64::from(value.dwLowDateTime)
+}
+
+fn process_usage_error(operation: &str, os_code: u32) -> CalyxError {
+    CalyxError {
+        code: "CALYX_VAULT_OPEN_PROCESS_METRICS",
+        message: format!("{operation} failed with Win32 error {os_code}"),
+        remediation: "inspect the native process-query failure; durable open phase diagnostics are mandatory",
     }
 }

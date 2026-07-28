@@ -280,7 +280,10 @@ fn repo_kernel_members_hash(
         vault_id,
         shadow_vault_salt(&identity.index_project).into_bytes(),
         VaultOptions {
+            restore_mvcc_rows: false,
+            restore_ledger_hook: false,
             read_only: true,
+            selected_cfs: Some(vec![ColumnFamily::Kernel]),
             ..VaultOptions::default()
         },
     )?;

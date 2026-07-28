@@ -77,12 +77,14 @@
 use std::io::BufRead;
 use std::path::PathBuf;
 use std::process::ExitCode;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use astrolabe_fleet::catalog::FleetCatalog;
 use astrolabe_fleet::record::{RepoRecord, TransitionContext};
 use astrolabe_fleet::state::RepoState;
+use calyx_aster::cf::ColumnFamily;
 use calyx_core::{CalyxError, CxId};
+use serde::Serialize;
 use serde_json::json;
 
 const USAGE: &str = "usage: astrolabe-fleet <catalog-init|register|set-state|get|list|discover|clone|pipeline|retire-source|migrate-vault-wal|upgrade-projection|grow|ledger-scan|report|report-read|report-list|run-report-read|probe-vault-keys|dedup-census|compose|kernel-read> [--root <dir>] [verb options]; see crate docs";
@@ -134,11 +136,24 @@ fn run(args: &[String]) -> Result<(), CalyxError> {
         "dedup-census",
         "compose",
     ];
+    let read_cfs = read_verb_cfs(verb);
+    if !MUTATING_VERBS.contains(&verb) && read_cfs.is_none() {
+        return Err(usage(&format!("unknown verb {verb:?}")));
+    }
+    let command_metrics_before = (verb == "kernel-read")
+        .then(current_process_metrics)
+        .transpose()?;
     let _farm_lock = MUTATING_VERBS
         .contains(&verb)
         .then(|| astrolabe_fleet::farm_lock::FarmLock::acquire(&root, verb))
         .transpose()?;
-    let catalog = FleetCatalog::open(&root)?;
+    let catalog_open_started = Instant::now();
+    let catalog = match read_cfs {
+        Some(cfs) => FleetCatalog::open_read_only(&root, cfs)?,
+        None => FleetCatalog::open(&root)?,
+    };
+    let catalog_open_wall_us =
+        u64::try_from(catalog_open_started.elapsed().as_micros()).unwrap_or(u64::MAX);
     match verb {
         "catalog-init" => {
             opts.reject_unknown(&["root"])?;
@@ -1193,6 +1208,28 @@ fn run(args: &[String]) -> Result<(), CalyxError> {
                 )?;
                 out["provenance"] = verify;
             }
+            let command_metrics_after = current_process_metrics()?;
+            let command_metrics_before = command_metrics_before
+                .expect("kernel-read always captures process metrics before catalog open");
+            let open = catalog.vault().open_diagnostics();
+            out["performance"] = json!({
+                "catalog_open_wall_us": catalog_open_wall_us,
+                "catalog_open": {
+                    "read_snapshot_lock_us": open.read_snapshot_lock_us,
+                    "read_snapshot_lock_usage": phase_usage_json(open.read_snapshot_lock_usage),
+                    "recovery_us": open.recovery_us,
+                    "recovery_usage": phase_usage_json(open.recovery_usage),
+                    "ledger_hook_us": open.ledger_hook_us,
+                    "ledger_hook_usage": phase_usage_json(open.ledger_hook_usage),
+                    "router_us": open.router_us,
+                    "router_usage": phase_usage_json(open.router_usage),
+                    "total_us": open.total_us,
+                    "total_usage": phase_usage_json(open.total_usage),
+                },
+                "process_before": command_metrics_before,
+                "process_after": command_metrics_after,
+                "process_delta": command_metrics_after.delta(command_metrics_before),
+            });
             println!("{out}");
             Ok(())
         }
@@ -1267,6 +1304,144 @@ fn run(args: &[String]) -> Result<(), CalyxError> {
             Ok(())
         }
         other => Err(usage(&format!("unknown verb {other:?}"))),
+    }
+}
+
+fn read_verb_cfs(verb: &str) -> Option<Vec<ColumnFamily>> {
+    let cfs = match verb {
+        "get" | "list" | "probe-vault-keys" => vec![ColumnFamily::Base],
+        "ledger-scan" => vec![ColumnFamily::Ledger],
+        "report-read" | "report-list" => vec![ColumnFamily::Blob],
+        "run-report-read" => vec![ColumnFamily::Blob, ColumnFamily::Ledger],
+        "kernel-read" => vec![
+            ColumnFamily::Base,
+            ColumnFamily::Blob,
+            ColumnFamily::Kernel,
+            ColumnFamily::Ledger,
+        ],
+        _ => return None,
+    };
+    Some(cfs)
+}
+
+#[derive(Clone, Copy, Debug, Serialize)]
+struct ProcessMetrics {
+    kernel_time_100ns: u64,
+    user_time_100ns: u64,
+    read_operations: u64,
+    read_bytes: u64,
+    write_operations: u64,
+    write_bytes: u64,
+    page_faults: u64,
+    working_set_bytes: u64,
+    peak_working_set_bytes: u64,
+    pagefile_bytes: u64,
+    peak_pagefile_bytes: u64,
+}
+
+impl ProcessMetrics {
+    fn delta(self, before: Self) -> Self {
+        Self {
+            kernel_time_100ns: self
+                .kernel_time_100ns
+                .saturating_sub(before.kernel_time_100ns),
+            user_time_100ns: self.user_time_100ns.saturating_sub(before.user_time_100ns),
+            read_operations: self.read_operations.saturating_sub(before.read_operations),
+            read_bytes: self.read_bytes.saturating_sub(before.read_bytes),
+            write_operations: self
+                .write_operations
+                .saturating_sub(before.write_operations),
+            write_bytes: self.write_bytes.saturating_sub(before.write_bytes),
+            page_faults: self.page_faults.saturating_sub(before.page_faults),
+            working_set_bytes: self
+                .working_set_bytes
+                .saturating_sub(before.working_set_bytes),
+            peak_working_set_bytes: self
+                .peak_working_set_bytes
+                .saturating_sub(before.peak_working_set_bytes),
+            pagefile_bytes: self.pagefile_bytes.saturating_sub(before.pagefile_bytes),
+            peak_pagefile_bytes: self
+                .peak_pagefile_bytes
+                .saturating_sub(before.peak_pagefile_bytes),
+        }
+    }
+}
+
+fn current_process_metrics() -> Result<ProcessMetrics, CalyxError> {
+    use windows_sys::Win32::Foundation::{FILETIME, GetLastError};
+    use windows_sys::Win32::System::ProcessStatus::{
+        K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS,
+    };
+    use windows_sys::Win32::System::Threading::{
+        GetCurrentProcess, GetProcessIoCounters, GetProcessTimes, IO_COUNTERS,
+    };
+
+    let mut creation = FILETIME::default();
+    let mut exit = FILETIME::default();
+    let mut kernel = FILETIME::default();
+    let mut user = FILETIME::default();
+    let mut io = IO_COUNTERS::default();
+    let mut memory: PROCESS_MEMORY_COUNTERS = unsafe { std::mem::zeroed() };
+    let process = unsafe { GetCurrentProcess() };
+    // SAFETY: the pseudo-handle is valid in this process and every output
+    // pointer names a correctly sized writable Windows POD for the call.
+    unsafe {
+        if GetProcessTimes(process, &mut creation, &mut exit, &mut kernel, &mut user) == 0 {
+            return Err(process_metric_error("GetProcessTimes", GetLastError()));
+        }
+        if GetProcessIoCounters(process, &mut io) == 0 {
+            return Err(process_metric_error("GetProcessIoCounters", GetLastError()));
+        }
+        if K32GetProcessMemoryInfo(
+            process,
+            &raw mut memory,
+            std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32,
+        ) == 0
+        {
+            return Err(process_metric_error(
+                "K32GetProcessMemoryInfo",
+                GetLastError(),
+            ));
+        }
+    }
+    Ok(ProcessMetrics {
+        kernel_time_100ns: filetime_u64(kernel),
+        user_time_100ns: filetime_u64(user),
+        read_operations: io.ReadOperationCount,
+        read_bytes: io.ReadTransferCount,
+        write_operations: io.WriteOperationCount,
+        write_bytes: io.WriteTransferCount,
+        page_faults: u64::from(memory.PageFaultCount),
+        working_set_bytes: memory.WorkingSetSize as u64,
+        peak_working_set_bytes: memory.PeakWorkingSetSize as u64,
+        pagefile_bytes: memory.PagefileUsage as u64,
+        peak_pagefile_bytes: memory.PeakPagefileUsage as u64,
+    })
+}
+
+fn phase_usage_json(usage: calyx_aster::vault::VaultPhaseUsage) -> serde_json::Value {
+    json!({
+        "kernel_time_100ns": usage.kernel_time_100ns,
+        "user_time_100ns": usage.user_time_100ns,
+        "read_operations": usage.read_operations,
+        "read_bytes": usage.read_bytes,
+        "write_operations": usage.write_operations,
+        "write_bytes": usage.write_bytes,
+        "page_faults": usage.page_faults,
+        "working_set_bytes_after": usage.working_set_bytes_after,
+        "peak_working_set_bytes_after": usage.peak_working_set_bytes_after,
+    })
+}
+
+fn filetime_u64(value: windows_sys::Win32::Foundation::FILETIME) -> u64 {
+    (u64::from(value.dwHighDateTime) << 32) | u64::from(value.dwLowDateTime)
+}
+
+fn process_metric_error(operation: &str, os_code: u32) -> CalyxError {
+    CalyxError {
+        code: "ASTRO_FLEET_PROCESS_METRICS",
+        message: format!("{operation} failed with Win32 error {os_code}"),
+        remediation: "inspect the native process-query failure; kernel-read diagnostics are mandatory",
     }
 }
 
