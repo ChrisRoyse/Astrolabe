@@ -7,7 +7,7 @@ use astrolabe_lower::{LowerDebouncer, RunOutcome};
 use calyx_core::SystemClock;
 
 pub(crate) const LOWERING_DEBOUNCE_STATUS_KEY: &str = "lowering_debounce_json";
-const LOWERING_PENDING_KEY: &str = "lowering_pending";
+pub(crate) const LOWERING_PENDING_KEY: &str = "lowering_pending";
 
 static LOWERING_DEBOUNCERS: OnceLock<Mutex<BTreeMap<String, Arc<LowerDebouncer<SystemClock>>>>> =
     OnceLock::new();
@@ -35,54 +35,6 @@ fn project_debouncer(
     }
     map.insert(registry_key, Arc::clone(&debouncer));
     Ok(debouncer)
-}
-
-pub(crate) fn schedule_project_lowering(
-    cache_dir: &Path,
-    project: &str,
-) -> Result<Value, DynError> {
-    let debouncer = project_debouncer(cache_dir, project)?;
-    debouncer.request_regeneration();
-    write_config_value(
-        cache_dir,
-        &metadata_key(project, LOWERING_PENDING_KEY),
-        "true",
-    )?;
-    let status = json!({
-        "schema": "astrolabe-lowering-debounce-v1",
-        "status": "waiting",
-        "pending": true,
-        "window_ms": debouncer.window_ms(),
-        "freshness": "stale",
-        "trust": "verified",
-        "provenance": "production weave mutation scheduled trailing-edge regeneration",
-    });
-    write_config_value(
-        cache_dir,
-        &metadata_key(project, LOWERING_DEBOUNCE_STATUS_KEY),
-        &serde_json::to_string(&status)?,
-    )?;
-    Ok(status)
-}
-
-pub(crate) fn schedule_lowering_after_convergence(
-    cache_dir: &Path,
-    project: &str,
-    import_changed: bool,
-    weave: &Value,
-) -> Result<Option<Value>, DynError> {
-    if import_changed || weave_mutated_lower_inputs(weave) {
-        Ok(Some(schedule_project_lowering(cache_dir, project)?))
-    } else {
-        Ok(None)
-    }
-}
-
-fn weave_mutated_lower_inputs(weave: &Value) -> bool {
-    ["similarity", "eager_cross_terms"].into_iter().any(|name| {
-        weave[name]["rows_written"].as_u64().unwrap_or(0) > 0
-            || weave[name]["rows_tombstoned"].as_u64().unwrap_or(0) > 0
-    })
 }
 
 pub(crate) fn drive_project_lowering(cache_dir: &Path, project: &str) -> Result<Value, DynError> {
@@ -155,7 +107,7 @@ pub(crate) fn read_lowering_status(
     .transpose()
 }
 
-fn persist_regenerated_lowering(
+pub(crate) fn persist_regenerated_lowering(
     cache_dir: &Path,
     project: &str,
     report: &astrolabe_lower::LoweredSqliteReport,

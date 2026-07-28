@@ -194,14 +194,27 @@ fn snapshot_cx_by_atom(
     Ok(by_atom)
 }
 
-#[derive(Debug, Clone)]
-struct ShadowLowerState {
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub(crate) struct ShadowLowerState {
     artifact_sha256: String,
     vault_fingerprint_sha256: String,
     manifest_seq: u64,
     node_count: usize,
     edge_count: usize,
     skipped_edges: usize,
+}
+
+impl ShadowLowerState {
+    pub(crate) fn evidence_json(&self) -> Value {
+        json!({
+            "artifact_sha256": self.artifact_sha256,
+            "vault_fingerprint_sha256": self.vault_fingerprint_sha256,
+            "manifest_seq": self.manifest_seq,
+            "node_count": self.node_count,
+            "edge_count": self.edge_count,
+            "skipped_edges": self.skipped_edges,
+        })
+    }
 }
 
 impl From<astrolabe_lower::LoweredSqliteReport> for ShadowLowerState {
@@ -1780,18 +1793,8 @@ pub(crate) fn import_shadow_vault_with_archaeology_at(
         object.insert("signal_cards".to_string(), signal_cards);
     }
     let lowered_sqlite_path = lowered_sqlite_path(cache_dir, project);
-    let prior_lower = if delta.is_some() {
-        read_persisted_lower_state(cache_dir, project)?
-    } else {
-        None
-    };
-    let lower_state = match prior_lower {
-        Some(prior) if lowered_sqlite_path.exists() => {
-            schedule_lowering_after_convergence(cache_dir, project, import_changed, &weave)?;
-            prior
-        }
-        _ => ShadowLowerState::from(lower_shadow_sqlite(cache_dir, project, &vault)?),
-    };
+    let lower_state =
+        resolve_coherent_shadow_lower(cache_dir, project, &vault, &lowered_sqlite_path)?;
     shadow_phase!("lowering");
     let verify = verify_chain(&vault)?;
     shadow_phase!("verify_chain");
@@ -2720,10 +2723,9 @@ where
 /// once — the second blocks on the lock, then opens, regenerates, and observes a
 /// complete (never torn) artifact.
 ///
-/// Exercised end-to-end by the two-process FSV test
-/// `lowered_regen_serializes_across_two_real_processes_under_lock`. The production
 /// The production lowering lane drives this entrypoint through
-/// `LowerDebouncer::run_due` after a persisted weave mutation.
+/// `LowerDebouncer::run_due` when recovering durable lowering debt recorded by an
+/// older generation.
 pub(crate) fn regenerate_lowered_under_lock(
     cache_dir: &Path,
     project: &str,
@@ -2746,7 +2748,7 @@ pub(crate) fn regenerate_lowered_under_lock(
     })
 }
 
-fn read_persisted_lower_state(
+pub(crate) fn read_persisted_lower_state(
     cache_dir: &Path,
     project: &str,
 ) -> Result<Option<ShadowLowerState>, DynError> {
@@ -2784,6 +2786,119 @@ fn read_persisted_lower_state(
         edge_count,
         skipped_edges,
     }))
+}
+
+fn resolve_coherent_shadow_lower<C>(
+    cache_dir: &Path,
+    project: &str,
+    vault: &AsterVault<C>,
+    artifact_path: &Path,
+) -> Result<ShadowLowerState, DynError>
+where
+    C: Clock,
+{
+    let persisted = read_persisted_lower_state(cache_dir, project)?;
+    match (persisted, artifact_path.exists()) {
+        (None, false) => regenerate_and_persist_shadow_lower(cache_dir, project, vault),
+        (Some(persisted), true) => {
+            validate_configured_lower_artifact_hash(project, artifact_path, &persisted)?;
+            match verify_lowered_artifact(vault, artifact_path, project) {
+                Ok(verification) => {
+                    validate_lower_verification(project, &persisted, &verification)?;
+                    Ok(persisted)
+                }
+                Err(error)
+                    if error.code() == Some(astrolabe_lower::ASTRO_LOWER_ARTIFACT_STALE) =>
+                {
+                    regenerate_and_persist_shadow_lower(cache_dir, project, vault)
+                }
+                Err(error) => Err(format!(
+                    "ASTRO_SHADOW_LOWERED_UNVERIFIED: the staged lower for project {project:?} failed integrity verification and cannot be replaced as ordinary delta work: {error}. Remediation: preserve the live generation, inspect the exact named lower-artifact failure, and rebuild only after its cause is established"
+                )
+                .into()),
+            }
+        }
+        (Some(_), false) => Err(format!(
+            "ASTRO_SHADOW_LOWER_STATE_ASYMMETRIC: project {project:?} has complete persisted lower metadata but no artifact at {}. Remediation: preserve the generation and rebuild it from authoritative source; do not synthesize a missing artifact",
+            artifact_path.display()
+        )
+        .into()),
+        (None, true) => Err(format!(
+            "ASTRO_SHADOW_LOWER_STATE_ASYMMETRIC: project {project:?} has a lowered artifact at {} but no complete persisted lower metadata. Remediation: preserve the generation and inspect the incomplete publication; do not adopt unbound artifact bytes",
+            artifact_path.display()
+        )
+        .into()),
+    }
+}
+
+pub(crate) fn regenerate_and_persist_shadow_lower<C>(
+    cache_dir: &Path,
+    project: &str,
+    vault: &AsterVault<C>,
+) -> Result<ShadowLowerState, DynError>
+where
+    C: Clock,
+{
+    let report = lower_shadow_sqlite(cache_dir, project, vault)?;
+    persist_regenerated_lowering(cache_dir, project, &report)?;
+    let state = ShadowLowerState::from(report);
+    let persisted = read_persisted_lower_state(cache_dir, project)?.ok_or_else(|| -> DynError {
+        format!(
+            "ASTRO_SHADOW_LOWER_CONFIG_READBACK_MISSING: regenerated lower metadata for project {project:?} was not physically readable after its config transaction. Remediation: abort this staged generation and inspect its config database before retrying"
+        )
+        .into()
+    })?;
+    if persisted != state {
+        return Err(format!(
+            "ASTRO_SHADOW_LOWER_CONFIG_READBACK_MISMATCH: regenerated lower metadata for project {project:?} read back as {persisted:?}, expected {state:?}. Remediation: abort this staged generation and inspect the config transaction before retrying"
+        )
+        .into());
+    }
+    validate_configured_lower_artifact_hash(
+        project,
+        &lowered_sqlite_path(cache_dir, project),
+        &state,
+    )?;
+    let verification =
+        verify_lowered_artifact(vault, lowered_sqlite_path(cache_dir, project), project)?;
+    validate_lower_verification(project, &state, &verification)?;
+    Ok(state)
+}
+
+pub(crate) fn validate_configured_lower_artifact_hash(
+    project: &str,
+    artifact_path: &Path,
+    state: &ShadowLowerState,
+) -> Result<(), DynError> {
+    let physical_hash = sha256_file_hex(artifact_path)?;
+    if physical_hash != state.artifact_sha256 {
+        return Err(format!(
+            "ASTRO_SHADOW_LOWER_CONFIG_HASH_MISMATCH: exact lowered bytes for project {project:?} hash to {physical_hash}, but config binds {}. Remediation: preserve the mixed generation and rebuild it from authoritative source; never repair a stale fingerprint on top of a configured-hash mismatch",
+            state.artifact_sha256
+        )
+        .into());
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_lower_verification(
+    project: &str,
+    state: &ShadowLowerState,
+    verification: &astrolabe_lower::LoweredArtifactVerification,
+) -> Result<(), DynError> {
+    if verification.artifact_sha256 != state.artifact_sha256
+        || verification.vault_fingerprint_sha256 != state.vault_fingerprint_sha256
+    {
+        return Err(format!(
+            "ASTRO_SHADOW_LOWER_VERIFICATION_MISMATCH: independently verified lower identity for project {project:?} is artifact_sha256={} vault_fingerprint_sha256={}, but config binds artifact_sha256={} vault_fingerprint_sha256={}. Remediation: preserve the mixed generation and rebuild it from authoritative source",
+            verification.artifact_sha256,
+            verification.vault_fingerprint_sha256,
+            state.artifact_sha256,
+            state.vault_fingerprint_sha256
+        )
+        .into());
+    }
+    Ok(())
 }
 
 fn read_lower_config_u64(
@@ -3063,6 +3178,20 @@ pub(crate) fn persist_shadow_publication_at(
     let provenance_json = serde_json::to_string(&outcome.provenance)?;
     let git_archaeology_json = serde_json::to_string(&outcome.git_archaeology)?;
     let weave_json = serde_json::to_string(&outcome.weave)?;
+    let lowering_status_json = serde_json::to_string(&json!({
+        "schema": "astrolabe-lowering-debounce-v1",
+        "status": "current",
+        "pending": false,
+        "freshness": "fresh",
+        "trust": "verified",
+        "artifact_sha256": outcome.lowered_artifact_sha256,
+        "vault_fingerprint_sha256": outcome.lowered_vault_fingerprint_sha256,
+        "manifest_seq": outcome.lowered_manifest_seq,
+        "node_count": outcome.lowered_nodes,
+        "edge_count": outcome.lowered_edges,
+        "skipped_edges": outcome.lowered_skipped_edges,
+        "provenance": "lowered artifact independently verified against the unpublished shadow vault before coherent generation commit",
+    }))?;
     let invalidations_json =
         serde_json::to_string(outcome.weave.get("invalidations").unwrap_or(&json!({
             "schema": "astrolabe.delta_invalidation.v1",
@@ -3123,6 +3252,8 @@ pub(crate) fn persist_shadow_publication_at(
             "lowered_skipped_edges",
             outcome.lowered_skipped_edges.to_string(),
         ),
+        (LOWERING_PENDING_KEY, "false".to_string()),
+        (LOWERING_DEBOUNCE_STATUS_KEY, lowering_status_json),
         ("ledger_seq", outcome.ledger_seq.to_string()),
         ("ledger_rows", outcome.ledger_rows_after.to_string()),
         ("panel_version", SHADOW_PANEL_VERSION.to_string()),

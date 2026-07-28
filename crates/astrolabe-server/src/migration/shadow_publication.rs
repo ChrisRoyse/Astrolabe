@@ -6,8 +6,26 @@ use std::io::{Read, Write};
 const PUBLICATION_DIR: &str = ".astrolabe-shadow-publication";
 const PUBLICATION_JOURNAL: &str = "transaction.json";
 
-type StagedArtifactValidation = (String, String, String, Vec<(String, String)>);
+type StagedArtifactValidation = (String, String, String, String, Vec<(String, String)>);
 type PublicationConfigReadback = (Option<String>, Option<String>, Option<String>);
+
+#[derive(Debug, Clone)]
+struct SeedLowerRepair {
+    prior: ShadowLowerState,
+    repaired: ShadowLowerState,
+}
+
+impl SeedLowerRepair {
+    fn evidence_json(&self) -> Value {
+        json!({
+            "schema": "astrolabe.shadow-seed-lower-repair.v1",
+            "reason": astrolabe_lower::ASTRO_LOWER_ARTIFACT_STALE,
+            "prior": self.prior.evidence_json(),
+            "repaired": self.repaired.evidence_json(),
+            "live_generation_mutated": false,
+        })
+    }
+}
 
 /// Failure-atomic publication context for one shadow-index generation.
 ///
@@ -23,6 +41,7 @@ pub(crate) struct ShadowPublication {
     transaction_dir: PathBuf,
     stage_cache: PathBuf,
     backup_dir: PathBuf,
+    seed_lower_repair: Option<SeedLowerRepair>,
 }
 
 impl ShadowPublication {
@@ -48,19 +67,20 @@ impl ShadowPublication {
         let stage_cache = transaction_dir.join("stage");
         let backup_dir = transaction_dir.join("backup");
         fs::create_dir(&transaction_dir)?;
-        let publication = Self {
+        let mut publication = Self {
             live_cache: live_cache.to_path_buf(),
             project: project.to_string(),
             project_root,
             transaction_dir,
             stage_cache,
             backup_dir,
+            seed_lower_repair: None,
         };
         let initialized = (|| -> Result<(), DynError> {
             fs::create_dir(&publication.stage_cache)?;
             fs::create_dir(&publication.backup_dir)?;
             publication.write_journal("initializing", json!({}))?;
-            publication.seed_stage()?;
+            publication.seed_lower_repair = publication.seed_stage()?;
             let inventory = publication.stage_inventory()?;
             publication.write_journal("staged", inventory)?;
             Ok(())
@@ -101,6 +121,9 @@ impl ShadowPublication {
         dial: MigrationDial,
         sanitized_index_args: &str,
     ) -> Result<ShadowImportOutcome, DynError> {
+        if self.seed_lower_repair.is_some() {
+            outcome.publication_required = true;
+        }
         if !outcome.publication_required {
             return self.discard_unchanged(outcome);
         }
@@ -127,6 +150,45 @@ impl ShadowPublication {
             let source_hash = sha256_file_hex(&staged_source)?;
             let lowered_hash = sha256_file_hex(&staged_lowered)?;
             let vault_hash = sha256_tree_hex(&staged_vault)?;
+            let vault = open_shadow_vault_read_only(
+                &staged_vault,
+                &outcome.vault_id,
+                &outcome.vault_salt,
+                Vec::new(),
+            )?;
+            let chain = verify_chain(&vault)?;
+            if !chain.is_intact()
+                || vault.latest_seq() != outcome.ledger_seq
+                || chain.ledger_rows != outcome.ledger_rows_after
+            {
+                return Err(format!(
+                    "ASTRO_SHADOW_PUBLICATION_VAULT_READBACK_MISMATCH: staged vault verification for project {:?} is status={:?}, latest_seq={}, ledger_rows={}; outcome binds latest_seq={}, ledger_rows={}. Remediation: abort this generation and inspect the staged writer that changed the vault after outcome construction",
+                    self.project,
+                    chain.status,
+                    vault.latest_seq(),
+                    chain.ledger_rows,
+                    outcome.ledger_seq,
+                    outcome.ledger_rows_after,
+                )
+                .into());
+            }
+            let lowered_verification =
+                verify_lowered_artifact(&vault, &staged_lowered, &self.project).map_err(
+                    |error| -> DynError {
+                        format!(
+                            "ASTRO_SHADOW_PUBLICATION_LOWERED_UNVERIFIED: staged lowered artifact does not verify against the exact pre-commit vault generation for project {:?}: {error}. Remediation: abort this generation; regenerate and verify the lower inside the same unpublished stage before retrying",
+                            self.project
+                        )
+                        .into()
+                    },
+                )?;
+            if lowered_verification.artifact_sha256 != lowered_hash {
+                return Err(format!(
+                    "ASTRO_SHADOW_PUBLICATION_LOWERED_READBACK_MISMATCH: independently verified lower for project {:?} hashes to {}, but the physical pre-commit read hashes to {lowered_hash}. Remediation: abort this generation and inspect the concurrent staged artifact writer",
+                    self.project, lowered_verification.artifact_sha256
+                )
+                .into());
+            }
             let config_prefix = format!("{CONFIG_KEY_PREFIX}{}", self.project);
             let metadata_prefix = format!("{config_prefix}.");
             let staged_config_rows = scan_config_prefix(&self.stage_cache, &config_prefix)?
@@ -135,12 +197,19 @@ impl ShadowPublication {
                     key == &dial_key(&self.project) || key.starts_with(&metadata_prefix)
                 })
                 .collect::<Vec<_>>();
-            Ok((source_hash, lowered_hash, vault_hash, staged_config_rows))
+            Ok((
+                source_hash,
+                lowered_hash,
+                vault_hash,
+                lowered_verification.vault_fingerprint_sha256,
+                staged_config_rows,
+            ))
         })();
-        let (source_hash, lowered_hash, vault_hash, staged_config_rows) = match validation {
-            Ok(validation) => validation,
-            Err(error) => return Err(self.abort_error("staged readback validation", error)),
-        };
+        let (source_hash, lowered_hash, vault_hash, lowered_vault_fingerprint, staged_config_rows) =
+            match validation {
+                Ok(validation) => validation,
+                Err(error) => return Err(self.abort_error("staged readback validation", error)),
+            };
         if source_hash != outcome.content_freshness_watermark_sha256 {
             return Err(self.abort_error(
                 "pre-publication source readback",
@@ -159,11 +228,21 @@ impl ShadowPublication {
                 ),
             ));
         }
+        if lowered_vault_fingerprint != outcome.lowered_vault_fingerprint_sha256 {
+            return Err(self.abort_error(
+                "pre-publication lowered fingerprint readback",
+                format!(
+                    "ASTRO_SHADOW_PUBLICATION_LOWERED_FINGERPRINT_MISMATCH: staged lower verifies at vault fingerprint {lowered_vault_fingerprint}, but the validated outcome binds {}",
+                    outcome.lowered_vault_fingerprint_sha256
+                ),
+            ));
+        }
         if let Err(error) = self.write_journal(
             "validated",
             json!({
                 "source_sha256": source_hash,
                 "lowered_sha256": lowered_hash,
+                "lowered_vault_fingerprint_sha256": lowered_vault_fingerprint,
                 "vault_tree_sha256": vault_hash,
             }),
         ) {
@@ -309,6 +388,10 @@ impl ShadowPublication {
                 "config_source": persisted_source,
                 "config_watermark": persisted_watermark,
                 "config_symbol_canonical_schema": persisted_symbol_schema,
+                "seed_lower_repair": self
+                    .seed_lower_repair
+                    .as_ref()
+                    .map(SeedLowerRepair::evidence_json),
             }),
         )?;
         remove_transaction_tree(&self.transaction_dir, &self.project_root)?;
@@ -502,7 +585,7 @@ impl ShadowPublication {
         Ok(outcome)
     }
 
-    fn seed_stage(&self) -> Result<(), DynError> {
+    fn seed_stage(&self) -> Result<Option<SeedLowerRepair>, DynError> {
         let live_config = self.live_cache.join("_config.db");
         if live_config.exists() {
             sqlite_snapshot(&live_config, &self.stage_cache.join("_config.db"))?;
@@ -516,7 +599,7 @@ impl ShadowPublication {
             }
 
             match (live_lowered.exists(), live_vault.exists()) {
-                (false, false) => Ok(()),
+                (false, false) => Ok(None),
                 (true, true) => {
                     let staged_lowered = lowered_sqlite_path(&self.stage_cache, &self.project);
                     exact_quiescent_sqlite_snapshot(
@@ -542,35 +625,72 @@ impl ShadowPublication {
                         &salt,
                         Vec::new(),
                     )?;
-                    let verification = verify_lowered_artifact(
+                    let prior = read_persisted_lower_state(&self.stage_cache, &self.project)?
+                        .ok_or_else(|| {
+                            format!(
+                                "ASTRO_SHADOW_PUBLICATION_SEED_LOWER_STATE_INCOMPLETE: live project {:?} has derived artifacts but no complete persisted lower metadata. Remediation: preserve the mixed generation and rebuild it from authoritative source; do not infer missing bindings",
+                                self.project
+                            )
+                        })?;
+                    validate_configured_lower_artifact_hash(
+                        &self.project,
+                        &staged_lowered,
+                        &prior,
+                    )?;
+                    match verify_lowered_artifact(
                         &staged_vault,
                         &staged_lowered,
                         &self.project,
-                    )
-                    .map_err(|error| {
-                        format!(
-                            "ASTRO_SHADOW_PUBLICATION_SEED_LOWERED_UNVERIFIED: staged lowered artifact and vault manifest do not verify for project {:?}: {error}. Remediation: do not publish this generation; inspect the live lowered artifact, vault lowering manifest, and ledger chain, then rebuild them from source",
+                    ) {
+                        Ok(verification) => {
+                            validate_lower_verification(
+                                &self.project,
+                                &prior,
+                                &verification,
+                            )?;
+                            Ok(None)
+                        }
+                        Err(error)
+                            if error.code()
+                                == Some(astrolabe_lower::ASTRO_LOWER_ARTIFACT_STALE) =>
+                        {
+                            drop(staged_vault);
+                            let writable_vault = open_shadow_vault_writable(
+                                &staged_vault_dir,
+                                SHADOW_VAULT_ID,
+                                &salt,
+                                Vec::new(),
+                            )?;
+                            let repaired = regenerate_and_persist_shadow_lower(
+                                &self.stage_cache,
+                                &self.project,
+                                &writable_vault,
+                            )?;
+                            drop(writable_vault);
+                            let readback_vault = open_shadow_vault_read_only(
+                                &staged_vault_dir,
+                                SHADOW_VAULT_ID,
+                                &salt,
+                                Vec::new(),
+                            )?;
+                            let readback = verify_lowered_artifact(
+                                &readback_vault,
+                                &staged_lowered,
+                                &self.project,
+                            )?;
+                            validate_lower_verification(
+                                &self.project,
+                                &repaired,
+                                &readback,
+                            )?;
+                            Ok(Some(SeedLowerRepair { prior, repaired }))
+                        }
+                        Err(error) => Err(format!(
+                            "ASTRO_SHADOW_PUBLICATION_SEED_LOWERED_UNVERIFIED: staged lowered artifact and vault manifest do not verify for project {:?}: {error}. Remediation: do not publish this generation; inspect the live lowered artifact, vault lowering manifest, config binding, and ledger chain, then rebuild from source",
                             self.project
                         )
-                    })?;
-                    let configured_hash = read_config_value(
-                        &self.stage_cache,
-                        &metadata_key(&self.project, "lowered_artifact_sha256"),
-                    )?
-                    .ok_or_else(|| {
-                        format!(
-                            "ASTRO_SHADOW_PUBLICATION_SEED_LOWERED_HASH_MISSING: live project {:?} has a lowered artifact and vault manifest but no persisted lowered_artifact_sha256. Remediation: do not publish mixed-generation state; rebuild the project from source",
-                            self.project
-                        )
-                    })?;
-                    if verification.artifact_sha256 != configured_hash {
-                        return Err(format!(
-                            "ASTRO_SHADOW_PUBLICATION_SEED_LOWERED_HASH_MISMATCH: exact staged lowered artifact hashes to {} but the staged config commits to {configured_hash} for project {:?}. Remediation: do not publish mixed-generation state; inspect the live config transaction and rebuild the project from source",
-                            verification.artifact_sha256, self.project
-                        )
-                        .into());
+                        .into()),
                     }
-                    Ok(())
                 }
                 (lowered_present, vault_present) => Err(format!(
                     "ASTRO_SHADOW_PUBLICATION_SEED_INCOMPLETE: project {:?} has asymmetric live derived state (lowered_present={lowered_present}, vault_present={vault_present}). Remediation: do not synthesize or reuse a partial generation; inspect the prior publication transaction and rebuild the project from source",
@@ -587,6 +707,10 @@ impl ShadowPublication {
             "source_present": sqlite_path(&self.stage_cache, &self.project).exists(),
             "lowered_present": lowered_sqlite_path(&self.stage_cache, &self.project).exists(),
             "vault_present": vault_dir(&self.stage_cache, &self.project).exists(),
+            "seed_lower_repair": self
+                .seed_lower_repair
+                .as_ref()
+                .map(SeedLowerRepair::evidence_json),
         }))
     }
 
@@ -954,7 +1078,7 @@ fn combine_rollback_error(
     }
 }
 
-fn sha256_file_hex(path: &Path) -> Result<String, DynError> {
+pub(crate) fn sha256_file_hex(path: &Path) -> Result<String, DynError> {
     let mut file = fs::File::open(path)?;
     let mut hasher = Sha256::new();
     let mut buffer = vec![0_u8; 1024 * 1024];
