@@ -76,7 +76,8 @@ use serde_json::{Value, json};
 use crate::catalog::FleetCatalog;
 use crate::dedup::{AtomFrames, parse_atom_frames};
 use crate::orchestrator::{
-    SHADOW_VAULT_ID, catalog_store_identity, kernel_scope_id, shadow_vault_salt,
+    ASTRO_FLEET_PROJECT_IDENTITY, RepoStoreIdentity, SHADOW_VAULT_ID, catalog_store_identity,
+    kernel_scope_id, project_name, repo_store_identity, shadow_vault_salt,
 };
 
 /// Report kind under which the compose sidecar persists in the fleet catalog.
@@ -1594,13 +1595,45 @@ pub fn verify_member_provenance(
         }
     }
 
+    let mut project_identities = BTreeMap::<String, RepoStoreIdentity>::new();
+    for row in catalog.query(None, None)? {
+        let project = project_name(&row.record.full_name);
+        if !by_project.contains_key(&project) {
+            continue;
+        }
+        let identity = repo_store_identity(&row)?;
+        if project_identities
+            .insert(project.clone(), identity)
+            .is_some()
+        {
+            return Err(CalyxError {
+                code: ASTRO_FLEET_PROJECT_IDENTITY,
+                message: format!(
+                    "fleet project identity for {project} is inconsistent: stable store key maps to more than one fleet catalog row"
+                ),
+                remediation: "preserve the catalog and store bytes; resolve the duplicate durable project identity before verifying provenance",
+            });
+        }
+    }
+    for project in by_project.keys() {
+        if !project_identities.contains_key(project) {
+            return Err(CalyxError {
+                code: ASTRO_FLEET_PROJECT_IDENTITY,
+                message: format!(
+                    "fleet project identity for {project} is inconsistent: stable store key has no matching fleet catalog row"
+                ),
+                remediation: "preserve the catalog and store bytes; re-run index_repository and bind only its durable returned project",
+            });
+        }
+    }
+
     let mut verified = 0_usize;
     let mut input_body_reads = 0_usize;
     let mut input_body_read_us = 0_u64;
     let mut claim_compare_us = 0_u64;
     let mut project_open_diagnostics = Vec::new();
     for (project, claims) in &by_project {
-        let identity = catalog_store_identity(catalog, project)?;
+        let identity = &project_identities[project];
         let project_open_started = std::time::Instant::now();
         let vault = open_shadow_vault(
             store_root,
