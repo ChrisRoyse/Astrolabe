@@ -1703,70 +1703,6 @@ static bool is_project_db_file(const char *name, size_t len);
 /* Forward decl — definition lives below in handle_trace_call_path's helpers. */
 static void free_node_contents(cbm_node_t *n);
 
-/* Scan cache dir for .db files, writing comma-separated quoted names into out.
- * Returns the number of projects found. */
-static int collect_db_project_names(cbm_mcp_server_t *srv, const char *dir_path, char *out,
-                                    size_t out_sz) {
-    int count = 0;
-    int offset = 0;
-    cbm_dir_t *d = cbm_opendir(dir_path);
-    if (!d) {
-        if (!cbm_path_exists(dir_path)) {
-            return 0;
-        }
-        record_store_query_failure(srv, "", dir_path, NULL, CBM_STORE_VERIFY_IO_FAILED,
-                                   "discovery.open_cache_directory",
-                                   "the project cache directory could not be enumerated");
-        return CBM_NOT_FOUND;
-    }
-    cbm_dirent_t *entry;
-    while ((entry = cbm_readdir(d)) != NULL) {
-        const char *n = entry->name;
-        size_t len = strlen(n);
-        if (!is_project_db_file(n, len)) {
-            continue;
-        }
-        /* #704: advertise the db's INTERNAL project name, not its filename, and
-         * skip ghost/empty/corrupt dbs — so the hint lists names the user can
-         * actually pass to resolve a store. */
-        char full_path[CBM_SZ_2K];
-        snprintf(full_path, sizeof(full_path), "%s/%s", dir_path, n);
-        char iname[CBM_SZ_1K];
-        db_project_inspect_status_t inspect =
-            db_internal_project_name(srv, "", full_path, iname, sizeof(iname), NULL);
-        if (inspect == DB_PROJECT_INSPECT_FAILED) {
-            /* An unrelated unusable candidate is not project identity
-             * authority.  It was logged with exact path/operation; omit it
-             * from this compact hint and let list_projects expose the complete
-             * structured refusal inventory. */
-            continue;
-        }
-        if (inspect == DB_PROJECT_INSPECT_GHOST) {
-            continue;
-        }
-        /* Element-boundary write: only emit this name if the WHOLE element —
-         * optional leading comma + "iname" — plus the NUL fits in what remains.
-         * Never truncate mid-token; a partial name would corrupt the JSON array
-         * (issue #235). Stop cleanly at the last name that fits: the array then
-         * always holds complete names and `count` == its length. */
-        size_t off = (size_t)offset;
-        size_t need = strlen(iname) + 2 /* quotes */ + (count > 0 ? 1u : 0u) /* comma */;
-        if (off + need + 1 > out_sz) {
-            break; /* would not fit entirely — stop at this element boundary */
-        }
-        if (count > 0) {
-            out[offset++] = ',';
-        }
-        int wrote = snprintf(out + offset, out_sz - (size_t)offset, "\"%s\"", iname);
-        if (wrote > 0) {
-            offset += wrote; /* guaranteed to fit (checked above) — no truncation */
-        }
-        count++;
-    }
-    cbm_closedir(d);
-    return count;
-}
-
 static void add_git_context_string(yyjson_mut_doc *doc, yyjson_mut_val *obj, const char *key,
                                    const char *value) {
     if (value) {
@@ -1813,29 +1749,14 @@ static char *build_recorded_store_error(const cbm_mcp_server_t *srv) {
 }
 
 static char *build_project_list_error(cbm_mcp_server_t *srv, const char *reason) {
-    char dir_path[CBM_SZ_1K];
-    cache_dir(dir_path, sizeof(dir_path));
-
-    char projects[CBM_SZ_4K] = "";
-    int count = collect_db_project_names(srv, dir_path, projects, sizeof(projects));
-    if (count < 0) {
-        return build_recorded_store_error(srv);
-    }
-
-    enum { ERR_BUF_SZ = 5120 };
+    (void)srv;
+    enum { ERR_BUF_SZ = 1024 };
     char buf[ERR_BUF_SZ];
-    if (count > 0) {
-        snprintf(buf, sizeof(buf),
-                 "{\"error\":\"%s\",\"hint\":\"Use list_projects to see all indexed projects, "
-                 "then pass it as the \\\"project\\\" "
-                 "argument.\",\"available_projects\":[%s],\"count\":%d}",
-                 reason, projects, count);
-    } else {
-        snprintf(buf, sizeof(buf),
-                 "{\"error\":\"%s\",\"hint\":\"No projects indexed yet. "
-                 "Call index_repository first.\"}",
-                 reason);
-    }
+    snprintf(buf, sizeof(buf),
+             "{\"error\":\"%s\",\"hint\":\"Use list_projects to inspect indexed projects and "
+             "structured store refusals, then pass an exact returned name as the "
+             "\\\"project\\\" argument.\"}",
+             reason);
     return heap_strdup(buf);
 }
 
@@ -2279,21 +2200,55 @@ static void append_store_refusal_json(yyjson_mut_doc *doc, yyjson_mut_val *refus
                                       const cbm_mcp_server_t *srv) {
     yyjson_mut_val *item = yyjson_mut_obj(doc);
     yyjson_mut_obj_add_str(doc, item, "code", recorded_store_error_code(srv));
-    yyjson_mut_obj_add_str(doc, item, "db_path", srv->store_error_db_path);
-    yyjson_mut_obj_add_str(doc, item, "wal_path", srv->store_error_wal_path);
-    yyjson_mut_obj_add_str(doc, item, "shm_path", srv->store_error_shm_path);
-    yyjson_mut_obj_add_str(doc, item, "failed_operation", srv->store_verify.operation);
-    yyjson_mut_obj_add_str(doc, item, "detail", srv->store_verify.detail);
+    /* The server error envelope is reused for the next candidate.  yyjson's
+     * non-copying string API would therefore make every prior refusal point at
+     * bytes that are about to be overwritten.  Each item must own the exact
+     * diagnostic generation observed for its candidate. */
+    yyjson_mut_obj_add_strcpy(doc, item, "db_path", srv->store_error_db_path);
+    yyjson_mut_obj_add_strcpy(doc, item, "wal_path", srv->store_error_wal_path);
+    yyjson_mut_obj_add_strcpy(doc, item, "shm_path", srv->store_error_shm_path);
+    yyjson_mut_obj_add_strcpy(doc, item, "failed_operation", srv->store_verify.operation);
+    yyjson_mut_obj_add_strcpy(doc, item, "detail", srv->store_verify.detail);
+    yyjson_mut_obj_add_int(doc, item, "native_error", (int64_t)srv->store_verify.native_error);
+    yyjson_mut_obj_add_int(doc, item, "sqlite_error", srv->store_verify.sqlite_error);
     yyjson_mut_obj_add_int(doc, item, "expected_schema_version", CBM_GRAPH_SCHEMA_VERSION);
     yyjson_mut_obj_add_bool(doc, item, "db_present", srv->store_verify.db_present);
     yyjson_mut_obj_add_bool(doc, item, "wal_present", srv->store_verify.wal_present);
     yyjson_mut_obj_add_bool(doc, item, "shm_present", srv->store_verify.shm_present);
+    yyjson_mut_obj_add_int(doc, item, "db_bytes", (int64_t)srv->store_verify.db_bytes);
+    yyjson_mut_obj_add_strcpy(doc, item, "db_sha256", srv->store_verify.db_sha256);
+    yyjson_mut_obj_add_bool(doc, item, "family_frozen", srv->store_verify.family_frozen);
+    yyjson_mut_obj_add_bool(doc, item, "family_guard_release_complete",
+                            srv->store_verify.family_guard_release_complete);
+    yyjson_mut_obj_add_bool(doc, item, "scratch_created", srv->store_verify.scratch_created);
+    yyjson_mut_obj_add_strcpy(doc, item, "scratch_path", srv->store_verify.scratch_path);
+    yyjson_mut_obj_add_bool(doc, item, "scratch_cleanup_complete",
+                            srv->store_verify.scratch_cleanup_complete);
+    yyjson_mut_obj_add_strcpy(doc, item, "cleanup_operation",
+                              srv->store_verify.cleanup_operation);
+    yyjson_mut_obj_add_int(doc, item, "cleanup_native_error",
+                           (int64_t)srv->store_verify.cleanup_native_error);
     yyjson_mut_obj_add_bool(doc, item, "source_mutation_attempted", false);
     yyjson_mut_obj_add_str(
         doc, item, "remediation",
         "preserve the complete family; run the explicit hash-bound archive/reindex migration "
         "for this exact path, or repair the reported canonical project provenance");
     yyjson_mut_arr_add_val(refusals, item);
+}
+
+static void append_ghost_store_json(yyjson_mut_doc *doc, yyjson_mut_val *ghosts,
+                                    const char *db_path, int64_t observed_size_bytes) {
+    yyjson_mut_val *item = yyjson_mut_obj(doc);
+    yyjson_mut_obj_add_str(doc, item, "code", "CBM_STORE_GHOST");
+    yyjson_mut_obj_add_strcpy(doc, item, "db_path", db_path);
+    yyjson_mut_obj_add_int(doc, item, "observed_size_bytes", observed_size_bytes);
+    yyjson_mut_obj_add_bool(doc, item, "db_present", cbm_path_exists(db_path));
+    yyjson_mut_obj_add_str(
+        doc, item, "detail",
+        "candidate was zero bytes or disappeared before verified inspection; it is not a "
+        "database-integrity failure and was not opened");
+    yyjson_mut_obj_add_bool(doc, item, "source_mutation_attempted", false);
+    yyjson_mut_arr_add_val(ghosts, item);
 }
 
 /* list_projects: scan cache directory for .db files.
@@ -2314,6 +2269,7 @@ static char *handle_list_projects(cbm_mcp_server_t *srv, const char *args) {
     yyjson_mut_doc_set_root(doc, root);
     yyjson_mut_val *arr = yyjson_mut_arr(doc);
     yyjson_mut_val *refusals = yyjson_mut_arr(doc);
+    yyjson_mut_val *ghosts = yyjson_mut_arr(doc);
 
     if (!d && cbm_path_exists(dir_path)) {
         record_store_query_failure(srv, "", dir_path, NULL, CBM_STORE_VERIFY_IO_FAILED,
@@ -2353,6 +2309,9 @@ static char *handle_list_projects(cbm_mcp_server_t *srv, const char *args) {
             append_store_refusal_json(doc, refusals, srv);
             continue;
         }
+        if (inspect == DB_PROJECT_INSPECT_GHOST) {
+            append_ghost_store_json(doc, ghosts, full_path, size_bytes);
+        }
     }
     cbm_closedir(d);
 
@@ -2360,6 +2319,9 @@ static char *handle_list_projects(cbm_mcp_server_t *srv, const char *args) {
     yyjson_mut_obj_add_val(doc, root, "store_refusals", refusals);
     yyjson_mut_obj_add_int(doc, root, "refused_store_count",
                            (int64_t)yyjson_mut_arr_size(refusals));
+    yyjson_mut_obj_add_val(doc, root, "ghost_stores", ghosts);
+    yyjson_mut_obj_add_int(doc, root, "ghost_store_count",
+                           (int64_t)yyjson_mut_arr_size(ghosts));
     yyjson_mut_obj_add_bool(doc, root, "discovery_complete", true);
 
     /* Guide user when no projects are indexed */
