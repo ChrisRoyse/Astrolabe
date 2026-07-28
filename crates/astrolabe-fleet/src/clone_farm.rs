@@ -78,7 +78,7 @@ use calyx_core::CalyxError;
 use serde::Serialize;
 use serde_json::{Value, json};
 
-use crate::catalog::FleetCatalog;
+use crate::catalog::{FleetCatalog, SourceRehydration};
 use crate::record::{FleetRepoRow, MAX_CATALOG_REASON_CHARS, TransitionContext};
 use crate::state::RepoState;
 
@@ -445,15 +445,15 @@ pub fn run_clone_pass_outcome(
                         ),
                         remediation: "internal defect: every successful acquisition must report the exact checkout exclusions",
                     })?;
-                    catalog.rehydrate_source(
-                        result.row.record.github_id,
-                        &result.row.record.full_name,
-                        config.at_unix_secs,
-                        path,
-                        head,
-                        bytes,
-                        exclusions,
-                    )?;
+                    catalog.rehydrate_source(SourceRehydration {
+                        github_id: result.row.record.github_id,
+                        full_name: &result.row.record.full_name,
+                        at_unix_secs: config.at_unix_secs,
+                        clone_path: path,
+                        head_commit_hash: head,
+                        clone_bytes: bytes,
+                        checkout_exclusions: exclusions,
+                    })?;
                     result.outcome = Outcome::Rehydrated;
                 } else {
                     catalog.transition(

@@ -98,6 +98,25 @@ pub struct TransitionReport {
     pub ledger_seq: u64,
 }
 
+/// Exact live checkout facts used to rehydrate one retired source.
+#[derive(Clone, Debug)]
+pub struct SourceRehydration<'a> {
+    /// GitHub repository identity.
+    pub github_id: u64,
+    /// Canonical `owner/name` repository identity.
+    pub full_name: &'a str,
+    /// Nonzero catalog mutation timestamp.
+    pub at_unix_secs: u64,
+    /// Canonical path of the restored checkout.
+    pub clone_path: String,
+    /// Exact commit checked out in the restored source.
+    pub head_commit_hash: String,
+    /// Fresh strict no-follow checkout byte measurement.
+    pub clone_bytes: u64,
+    /// Exact sparse-checkout exclusions applied to the restored source.
+    pub checkout_exclusions: Vec<String>,
+}
+
 /// Handle over the fleet catalog vault.
 pub struct FleetCatalog {
     vault: AsterVault,
@@ -687,14 +706,17 @@ impl FleetCatalog {
     /// changing its durable lifecycle state or discarding kernel history.
     pub fn rehydrate_source(
         &self,
-        github_id: u64,
-        full_name: &str,
-        at_unix_secs: u64,
-        clone_path: String,
-        head_commit_hash: String,
-        clone_bytes: u64,
-        checkout_exclusions: Vec<String>,
+        request: SourceRehydration<'_>,
     ) -> Result<TransitionReport, CalyxError> {
+        let SourceRehydration {
+            github_id,
+            full_name,
+            at_unix_secs,
+            clone_path,
+            head_commit_hash,
+            clone_bytes,
+            checkout_exclusions,
+        } = request;
         require_timestamp(at_unix_secs)?;
         let cx_id = repo_cx_id(github_id, full_name, FLEET_VAULT_SALT);
         let mut row = self.get(cx_id)?;

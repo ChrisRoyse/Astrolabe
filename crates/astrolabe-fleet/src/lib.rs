@@ -36,7 +36,7 @@ pub mod state;
 
 pub use catalog::{
     FLEET_ACTOR, FLEET_VAULT_ID, FLEET_VAULT_SALT, FleetCatalog, RegisterOutcome, RegisterReport,
-    TransitionReport,
+    SourceRehydration, TransitionReport,
 };
 pub use clone_farm::{
     ASTRO_FLEET_CLONE_PASS_INCOMPLETE, ASTRO_FLEET_CLONE_TARGET_CONFLICT,
