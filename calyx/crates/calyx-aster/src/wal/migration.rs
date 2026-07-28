@@ -17,7 +17,6 @@ use sha2::{Digest, Sha256};
 
 use super::record::LogicalStatus;
 use super::{record, replay, segment, storage_error};
-use crate::cf::ColumnFamily;
 use crate::manifest::ManifestStore;
 use crate::vault::cf_codec::decode_fixed_cf;
 use crate::vault::encode::{WriteRow, decode_write_batch, encode_write_batch};
@@ -1256,8 +1255,6 @@ fn verify_file_identity(path: &Path, bytes: u64, hash: &str, label: &str) -> Res
 
 #[cfg(windows)]
 fn replace_file_with_backup(source: &Path, stage: &Path, backup: &Path) -> Result<()> {
-    use std::os::windows::ffi::OsStrExt;
-
     use windows_sys::Win32::Storage::FileSystem::{REPLACEFILE_WRITE_THROUGH, ReplaceFileW};
 
     let source_wide = wide_path(source)?;
