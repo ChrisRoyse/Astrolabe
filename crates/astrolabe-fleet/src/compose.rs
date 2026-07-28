@@ -417,6 +417,7 @@ pub fn load_repo_kernel(
         store_key,
         index_project,
         vec![
+            ColumnFamily::Base,
             ColumnFamily::Blob,
             ColumnFamily::Graph,
             ColumnFamily::Kernel,
