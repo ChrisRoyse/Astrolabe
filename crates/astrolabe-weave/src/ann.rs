@@ -373,15 +373,32 @@ fn dense_candidates(
         ));
     }
     hnsw_dense_candidates(
-        family,
-        dim,
-        &dense_inputs,
-        quant,
-        config,
-        span,
-        group,
+        HnswDenseCandidatePlan {
+            family,
+            dim,
+            dense_inputs: &dense_inputs,
+            quant,
+            config,
+            span,
+            group,
+        },
         per_source,
     )
+}
+
+/// Immutable inputs for one seeded-HNSW dense candidate build.
+///
+/// Keeping these related values in one named plan makes their meaning explicit at
+/// the call boundary while leaving the separately mutable candidate destination
+/// visible.
+struct HnswDenseCandidatePlan<'a> {
+    family: SimilarityFamily,
+    dim: u32,
+    dense_inputs: &'a [Vec<f32>],
+    quant: QuantConfig,
+    config: &'a AnnCandidateConfig,
+    span: usize,
+    group: &'a [usize],
 }
 
 /// Sequential seeded-HNSW dense candidate build (#433) — the byte-parity default.
@@ -392,15 +409,18 @@ fn dense_candidates(
 /// sharded across `weave_similarity_workers` (read-only searches, so worker-count
 /// invariant), and the pair recording stays sequential in ordinal order.
 fn hnsw_dense_candidates(
-    family: SimilarityFamily,
-    dim: u32,
-    dense_inputs: &[Vec<f32>],
-    quant: QuantConfig,
-    config: &AnnCandidateConfig,
-    span: usize,
-    group: &[usize],
+    plan: HnswDenseCandidatePlan<'_>,
     per_source: &mut [Vec<usize>],
 ) -> Result<usize, SimilarityPlanError> {
+    let HnswDenseCandidatePlan {
+        family,
+        dim,
+        dense_inputs,
+        quant,
+        config,
+        span,
+        group,
+    } = plan;
     let ann_failure =
         |message: String| SimilarityPlanError::AnnCandidateFailure { family, message };
     let mut index = HnswIndex::new(family.slot(), dim, config.seed)
