@@ -12,6 +12,12 @@ void *cbm_memmem(const void *haystack, size_t haystack_len, const void *needle, 
 // Extract text of a node from source. Returns arena-allocated string.
 char *cbm_node_text(CBMArena *a, TSNode node, const char *source);
 
+// Convert Tree-sitter's half-open node range to the 1-based inclusive end line
+// persisted by CBM. A nonempty node ending at column zero owns bytes only
+// through the preceding line; storing end_point.row + 1 in that case assigns
+// the boundary line to both adjacent nodes.
+uint32_t cbm_node_end_line_inclusive(TSNode node);
+
 // Extract the nominal implementing type from a Rust impl_item `type` node.
 // Tree-sitter preserves generic arguments in that node (`HashingWriter<W>`),
 // while definition identity is the base nominal type (`HashingWriter`). Keep

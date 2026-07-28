@@ -82,6 +82,16 @@ char *cbm_node_text(CBMArena *a, TSNode node, const char *source) {
     return cbm_arena_strndup(a, source + start, end - start);
 }
 
+uint32_t cbm_node_end_line_inclusive(TSNode node) {
+    TSPoint start = ts_node_start_point(node);
+    TSPoint end = ts_node_end_point(node);
+    if (ts_node_end_byte(node) > ts_node_start_byte(node) && end.column == 0 &&
+        end.row > start.row) {
+        return end.row;
+    }
+    return end.row + 1;
+}
+
 char *cbm_rust_impl_nominal_type(CBMArena *a, TSNode type_node, const char *source) {
     char *type_name = cbm_node_text(a, type_node, source);
     if (!type_name) {

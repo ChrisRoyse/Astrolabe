@@ -192,7 +192,7 @@ static void emit_kustomize_kind_def(CBMExtractCtx *ctx, TSNode mapping) {
         def.label = cbm_arena_strdup(a, "Resource");
         def.file_path = ctx->rel_path;
         def.start_line = ts_node_start_point(mapping).row + TS_LINE_OFFSET;
-        def.end_line = ts_node_end_point(mapping).row + TS_LINE_OFFSET;
+        def.end_line = cbm_node_end_line_inclusive(mapping);
         if (!cbm_defs_push(&ctx->result->defs, a, def)) {
             return;
         }
@@ -352,7 +352,7 @@ static void extract_k8s_manifest(CBMExtractCtx *ctx) {
         def.label = cbm_arena_strdup(a, "Resource");
         def.file_path = ctx->rel_path;
         def.start_line = ts_node_start_point(mapping).row + TS_LINE_OFFSET;
-        def.end_line = ts_node_end_point(mapping).row + TS_LINE_OFFSET;
+        def.end_line = cbm_node_end_line_inclusive(mapping);
         if (!cbm_defs_push(&ctx->result->defs, a, def)) {
             return;
         }

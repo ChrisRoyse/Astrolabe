@@ -40,7 +40,7 @@ bool cbm_powershell_add_diagnostic(CBMExtractCtx *ctx, TSNode node, const char *
         .remediation = remediation,
         .node_type = ts_node_type(node),
         .start_line = ts_node_start_point(node).row + 1,
-        .end_line = ts_node_end_point(node).row + 1,
+        .end_line = cbm_node_end_line_inclusive(node),
         .start_byte = start,
         .end_byte = end,
         .is_missing = is_missing,
