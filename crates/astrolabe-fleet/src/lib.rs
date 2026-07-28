@@ -30,6 +30,7 @@ pub mod discover;
 pub mod farm_lock;
 pub mod grow;
 pub mod orchestrator;
+pub mod projection_upgrade;
 pub mod record;
 pub mod retirement;
 pub mod state;
@@ -59,6 +60,10 @@ pub use orchestrator::{
     DEFAULT_NOMIC_DIR, DEFAULT_PIPELINE_PARALLELISM, DEFAULT_PIPELINE_TIMEOUT_SECS,
     DEFAULT_STORE_ROOT, EXPENSIVE_INDEX_HOST_CARDINALITY, IndexAdmissionTelemetry, PipelineConfig,
     run_pipeline_pass,
+};
+pub use projection_upgrade::{
+    ASTRO_FLEET_PROJECTION_UPGRADE_REFUSED, ProjectionUpgradeConfig, ProjectionUpgradePreparation,
+    complete_projection_upgrade, prepare_projection_upgrade,
 };
 pub use record::{
     FLEET_PANEL_VERSION, FleetRepoRow, RepoRecord, SourceRetirement, SourceRetirementStage,

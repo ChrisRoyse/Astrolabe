@@ -260,6 +260,11 @@ pub struct PipelineConfig {
     pub host_admission_timeout_secs: u64,
     /// Re-run repos already `kerneled` and refresh their recorded facts.
     pub force: bool,
+    /// Keep a pre-existing `kerneled` catalog row in that state when an
+    /// explicit recovery pipeline fails. The failed verdict/report remains
+    /// durable; this only prevents the failure recorder from making the exact
+    /// recovery path inadmissible on its next attempt.
+    pub retain_kerneled_state_on_failure: bool,
     /// Declared fleet store byte budget (#454). `None` = unbudgeted. When the
     /// measured store-root total reaches this, the pass stops launching new
     /// repos, drains in-flight work, and fails closed with an eviction
@@ -286,6 +291,7 @@ impl PipelineConfig {
             timeout_secs: DEFAULT_PIPELINE_TIMEOUT_SECS,
             host_admission_timeout_secs: DEFAULT_HOST_ADMISSION_TIMEOUT_SECS,
             force: false,
+            retain_kerneled_state_on_failure: false,
             store_budget_bytes: None,
             at_unix_secs,
         }
@@ -552,6 +558,8 @@ pub fn run_pipeline_pass_outcome(
         }
 
         let mut verdict = result.verdict;
+        let retain_kerneled_state =
+            config.retain_kerneled_state_on_failure && result.row.state == RepoState::Kerneled;
         // Catalog mutations stay on this thread, and a transition that fails
         // its own write-path FSV downgrades the verdict to quarantined — the
         // report never claims a state the vault refused to persist.
@@ -591,7 +599,12 @@ pub fn run_pipeline_pass_outcome(
             verdict.outcome = Outcome::Quarantined;
             verdict.stage = Some("catalog".to_string());
             verdict.detail = detail.clone();
-            if let Err(record_error) = catalog.transition(
+            if retain_kerneled_state {
+                verdict.detail = safe_reason(&format!(
+                    "{} — pre-existing kerneled state retained for explicit recovery",
+                    verdict.detail
+                ));
+            } else if let Err(record_error) = catalog.transition(
                 result.row.record.github_id,
                 &result.row.record.full_name,
                 RepoState::Quarantined,
@@ -606,8 +619,13 @@ pub fn run_pipeline_pass_outcome(
                     verdict.detail, record_error.code, record_error.message
                 ));
             }
-        } else if verdict.outcome == Outcome::Quarantined
-            && let Err(record_error) = catalog.transition(
+        } else if verdict.outcome == Outcome::Quarantined {
+            if retain_kerneled_state {
+                verdict.detail = safe_reason(&format!(
+                    "{} — pre-existing kerneled state retained for explicit recovery",
+                    verdict.detail
+                ));
+            } else if let Err(record_error) = catalog.transition(
                 result.row.record.github_id,
                 &result.row.record.full_name,
                 RepoState::Quarantined,
@@ -620,14 +638,14 @@ pub fn run_pipeline_pass_outcome(
                     )),
                     ..TransitionContext::default()
                 },
-            )
-        {
-            // Same containment: the verdict side-file + run report carry the
-            // full story (labeled, counted); the pass continues.
-            verdict.detail = safe_reason(&format!(
-                "{} — AND recording the quarantine was refused: {} — {}",
-                verdict.detail, record_error.code, record_error.message
-            ));
+            ) {
+                // Same containment: the verdict side-file + run report carry the
+                // full story (labeled, counted); the pass continues.
+                verdict.detail = safe_reason(&format!(
+                    "{} — AND recording the quarantine was refused: {} — {}",
+                    verdict.detail, record_error.code, record_error.message
+                ));
+            }
         }
 
         write_side_file(

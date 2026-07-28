@@ -29,6 +29,12 @@
 //!                              --repo <owner/name> ... [--at <unix-secs>]
 //! astrolabe-fleet migrate-vault-wal [--root <dir>] [--store-root <dir>]
 //!                              --repo <owner/name>
+//! astrolabe-fleet upgrade-projection [--root <dir>] [--farm-root <dir>]
+//!                              [--store-root <dir>] [--astrolabe-bin <exe>]
+//!                              [--archaeology-root <dir>] [--nomic-dir <dir>]
+//!                              [--timeout-secs <n>]
+//!                              [--host-admission-timeout-secs <n>]
+//!                              --repo <owner/name> [--at <unix-secs>]
 //! astrolabe-fleet grow         [--root <dir>] (--once | --cycles <n>) [--interval-secs <n>]
 //!                              [--scope <fleet-scope>] [--discovery] [--language <csv>]
 //!                              [--star-floor <n>] [--acquire] [--retry-quarantined]
@@ -79,7 +85,7 @@ use astrolabe_fleet::state::RepoState;
 use calyx_core::{CalyxError, CxId};
 use serde_json::json;
 
-const USAGE: &str = "usage: astrolabe-fleet <catalog-init|register|set-state|get|list|discover|clone|pipeline|retire-source|migrate-vault-wal|grow|ledger-scan|report|report-read|report-list|run-report-read|probe-vault-keys|dedup-census|compose|kernel-read> [--root <dir>] [verb options]; see crate docs";
+const USAGE: &str = "usage: astrolabe-fleet <catalog-init|register|set-state|get|list|discover|clone|pipeline|retire-source|migrate-vault-wal|upgrade-projection|grow|ledger-scan|report|report-read|report-list|run-report-read|probe-vault-keys|dedup-census|compose|kernel-read> [--root <dir>] [verb options]; see crate docs";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -113,7 +119,7 @@ fn run(args: &[String]) -> Result<(), CalyxError> {
     // for the whole pass; read verbs stay lock-free. A second mutating pass on
     // the same root refuses fail-closed (ASTRO_FLEET_FARM_LOCKED) instead of
     // racing the store the way the 2026-07-16 dual retry-release did (#460).
-    const MUTATING_VERBS: [&str; 12] = [
+    const MUTATING_VERBS: [&str; 13] = [
         "catalog-init",
         "register",
         "set-state",
@@ -122,6 +128,7 @@ fn run(args: &[String]) -> Result<(), CalyxError> {
         "pipeline",
         "retire-source",
         "migrate-vault-wal",
+        "upgrade-projection",
         "grow",
         "report",
         "dedup-census",
@@ -546,6 +553,127 @@ fn run(args: &[String]) -> Result<(), CalyxError> {
                         "node_count": kernel.node_count,
                         "recall_permille": kernel.recall_permille,
                     },
+                })
+            );
+            Ok(())
+        }
+        "upgrade-projection" => {
+            opts.reject_unknown(&[
+                "root",
+                "farm-root",
+                "store-root",
+                "archaeology-root",
+                "astrolabe-bin",
+                "nomic-dir",
+                "repo",
+                "timeout-secs",
+                "host-admission-timeout-secs",
+                "store-budget-bytes",
+                "at",
+            ])?;
+            let repos = opts.get_all("repo");
+            if repos.len() != 1 {
+                return Err(usage(
+                    "upgrade-projection needs exactly one --repo <owner/name>",
+                ));
+            }
+            let repo = repos[0];
+            let at = opts.at_or_now()?;
+            let upgrade_config = astrolabe_fleet::projection_upgrade::ProjectionUpgradeConfig {
+                farm_root: PathBuf::from(
+                    opts.get("farm-root")
+                        .unwrap_or(astrolabe_fleet::clone_farm::DEFAULT_FARM_ROOT),
+                ),
+                store_root: PathBuf::from(
+                    opts.get("store-root")
+                        .unwrap_or(astrolabe_fleet::orchestrator::DEFAULT_STORE_ROOT),
+                ),
+                at_unix_secs: at,
+            };
+            let preparation = astrolabe_fleet::projection_upgrade::prepare_projection_upgrade(
+                &catalog,
+                &upgrade_config,
+                repo,
+            )?;
+            let pipeline_report = if preparation.reindex_required {
+                let mut pipeline =
+                    astrolabe_fleet::orchestrator::PipelineConfig::with_default_bin(at);
+                pipeline.store_root = upgrade_config.store_root.clone();
+                if let Some(archaeology_root) = opts.get("archaeology-root") {
+                    pipeline.archaeology_root = PathBuf::from(archaeology_root);
+                }
+                if let Some(bin) = opts.get("astrolabe-bin") {
+                    pipeline.astrolabe_bin = PathBuf::from(bin);
+                }
+                if let Some(nomic) = opts.get("nomic-dir") {
+                    pipeline.nomic_dir = PathBuf::from(nomic);
+                }
+                if let Some(raw) = opts.get("timeout-secs") {
+                    pipeline.timeout_secs = raw.parse::<u64>().map_err(|error| {
+                        usage(&format!("--timeout-secs must be a u64: {error}"))
+                    })?;
+                    if opts.get("host-admission-timeout-secs").is_none() {
+                        pipeline.host_admission_timeout_secs = pipeline.timeout_secs;
+                    }
+                }
+                if let Some(raw) = opts.get("host-admission-timeout-secs") {
+                    pipeline.host_admission_timeout_secs = raw.parse::<u64>().map_err(|error| {
+                        usage(&format!(
+                            "--host-admission-timeout-secs must be a u64: {error}"
+                        ))
+                    })?;
+                }
+                if let Some(raw) = opts.get("store-budget-bytes") {
+                    pipeline.store_budget_bytes = Some(raw.parse::<u64>().map_err(|error| {
+                        usage(&format!("--store-budget-bytes must be a u64: {error}"))
+                    })?);
+                }
+                pipeline.parallelism = 1;
+                pipeline.force = true;
+                pipeline.retain_kerneled_state_on_failure = true;
+                Some(astrolabe_fleet::orchestrator::run_pipeline_pass(
+                    &catalog,
+                    &pipeline,
+                    &astrolabe_fleet::clone_farm::Selection::Repos(vec![repo.to_string()]),
+                )?)
+            } else {
+                None
+            };
+            let kernel = astrolabe_fleet::compose::load_repo_kernel(
+                &upgrade_config.store_root,
+                &preparation.store_key,
+                &preparation.index_project,
+            )?
+            .ok_or_else(|| CalyxError {
+                code: astrolabe_fleet::compose::ASTRO_FLEET_KERNEL_MISSING,
+                message: format!(
+                    "projection upgrade reopened current store {} but no per-repo kernel is persisted",
+                    preparation.store_key
+                ),
+                remediation: "preserve the projection and transaction; inspect the ordinary pipeline report before retrying the exact upgrade",
+            })?;
+            let completion = astrolabe_fleet::projection_upgrade::complete_projection_upgrade(
+                &upgrade_config,
+                &preparation,
+                &kernel.members_hash,
+                kernel.occurrences.len(),
+                pipeline_report.as_ref().unwrap_or(&serde_json::json!({
+                    "outcome": "current_noop",
+                })),
+            )?;
+            println!(
+                "{}",
+                serde_json::json!({
+                    "verb": "upgrade-projection",
+                    "preparation": preparation,
+                    "pipeline_report": pipeline_report,
+                    "kernel_readback": {
+                        "members_hash": kernel.members_hash,
+                        "member_count": kernel.occurrences.len(),
+                        "node_count": kernel.node_count,
+                        "recall_permille": kernel.recall_permille,
+                    },
+                    "completion": completion,
                 })
             );
             Ok(())
