@@ -3,10 +3,11 @@
 //! A populated `user_version=0` CBM database predates stable source atoms and
 //! cannot be upgraded truthfully in place. This module therefore performs the
 //! only lawful first half of the migration: under the fleet farm lock, bind
-//! the exact source revision and complete SQLite `.db`/`-wal`/`-shm` family,
-//! then move every present family member into a hash-bound same-volume
-//! archive. The ordinary pipeline is the second half and remains the sole
-//! writer of current CBM and Aster projection state.
+//! both the exact revision represented by the legacy projection and the clean
+//! current source revision, then move the complete SQLite
+//! `.db`/`-wal`/`-shm` family into a hash-bound same-volume archive. The
+//! ordinary pipeline is the second half and remains the sole writer of current
+//! CBM and Aster projection state.
 //!
 //! The archive is a resumable transaction. Every member is independently
 //! classified as source or archived bytes before a rename; both-present,
@@ -33,10 +34,13 @@ use crate::state::RepoState;
 pub const ASTRO_FLEET_PROJECTION_UPGRADE_REFUSED: &str = "ASTRO_FLEET_PROJECTION_UPGRADE_REFUSED";
 
 const CURRENT_CBM_SCHEMA_VERSION: i64 = 4;
-const TRANSACTION_SCHEMA: &str = "astrolabe.projection-upgrade.intent.v1";
+const TRANSACTION_SCHEMA_V1: &str = "astrolabe.projection-upgrade.intent.v1";
+const TRANSACTION_SCHEMA: &str = "astrolabe.projection-upgrade.intent.v2";
 const MEMBER_SCHEMA: &str = "astrolabe.projection-upgrade.member.v1";
 const ARCHIVE_COMPLETION_SCHEMA: &str = "astrolabe.projection-upgrade.archive-completion.v1";
-const PROJECTION_COMPLETION_SCHEMA: &str = "astrolabe.projection-upgrade.projection-completion.v1";
+const PROJECTION_COMPLETION_SCHEMA_V1: &str =
+    "astrolabe.projection-upgrade.projection-completion.v1";
+const PROJECTION_COMPLETION_SCHEMA: &str = "astrolabe.projection-upgrade.projection-completion.v2";
 const MIGRATION_DIR: &str = "projection-v3";
 const LEGACY_NODE_COLUMNS: [&str; 9] = [
     "id",
@@ -99,7 +103,11 @@ pub struct ProjectionUpgradePreparation {
     pub index_project: String,
     /// Exact source revision verified before archive admission.
     pub source_head: String,
-    /// `current_noop`, `archived`, or `archive_recovered`.
+    /// Exact revision represented by the admitted projection.
+    pub indexed_commit_hash: String,
+    /// `current_noop`, `current_refresh_required`, `archived`,
+    /// `archive_recovered`, `projection_recovered`, or
+    /// `projection_recovered_refresh_required`.
     pub outcome: String,
     /// Whether the ordinary exact-source pipeline must now run.
     pub reindex_required: bool,
@@ -217,18 +225,25 @@ pub fn prepare_projection_upgrade(
         ));
     }
     let source_head = verify_source(&row.record.clone_url, &source_path, repo)?;
+    let catalog_head = row.head_commit_hash.as_deref().ok_or_else(|| {
+        refusal(
+            repo,
+            "kerneled row has no head_commit_hash source grounding fact",
+        )
+    })?;
+    if catalog_head != source_head {
+        return Err(refusal(
+            repo,
+            &format!("source HEAD {source_head} differs from catalog HEAD {catalog_head}"),
+        ));
+    }
     let indexed_head = row.indexed_commit_hash.as_deref().ok_or_else(|| {
         refusal(
             repo,
             "kerneled row has no indexed_commit_hash grounding fact",
         )
     })?;
-    if indexed_head != source_head {
-        return Err(refusal(
-            repo,
-            &format!("source HEAD {source_head} differs from indexed HEAD {indexed_head}"),
-        ));
-    }
+    verify_commit_object(repo, &source_path, indexed_head)?;
 
     let store_dir = config.store_root.join(&identity.store_key);
     let database_path = store_dir.join(format!("{}.db", identity.index_project));
@@ -302,20 +317,24 @@ pub fn prepare_projection_upgrade(
                 .and_then(|member| member.sha256.clone())
                 .ok_or_else(|| refusal(repo, "pending intent has no main-database hash"))?
         };
+        let catalog_current = row.indexed_commit_hash.as_deref() == Some(source_head.as_str());
         return Ok(ProjectionUpgradePreparation {
             repo: repo.to_string(),
             store_key: identity.store_key,
             index_project: identity.index_project,
             source_head,
-            outcome: if projection_current {
+            indexed_commit_hash: intent.indexed_commit_hash,
+            outcome: if projection_current && catalog_current {
                 "projection_recovered"
+            } else if projection_current {
+                "projection_recovered_refresh_required"
             } else if archive_recovered {
                 "archive_recovered"
             } else {
                 "archived"
             }
             .to_string(),
-            reindex_required: !projection_current,
+            reindex_required: !projection_current || !catalog_current,
             transaction_id: Some(intent.transaction_id),
             intent_path: Some(transaction_dir.join("intent.json").display().to_string()),
             archive_completion_path: Some(archive_completion.display().to_string()),
@@ -345,13 +364,20 @@ pub fn prepare_projection_upgrade(
     let schema = inspect_schema(repo, &database_path, &identity.index_project, &source_path)?;
     if schema.kind == SchemaKind::Current {
         let database_sha256 = sha256_file(repo, &database_path)?;
+        let stale = indexed_head != source_head;
         return Ok(ProjectionUpgradePreparation {
             repo: repo.to_string(),
             store_key: identity.store_key,
             index_project: identity.index_project,
             source_head,
-            outcome: "current_noop".to_string(),
-            reindex_required: false,
+            indexed_commit_hash: indexed_head.to_string(),
+            outcome: if stale {
+                "current_refresh_required"
+            } else {
+                "current_noop"
+            }
+            .to_string(),
+            reindex_required: stale,
             transaction_id: None,
             intent_path: None,
             archive_completion_path: None,
@@ -408,6 +434,7 @@ pub fn prepare_projection_upgrade(
         store_key: identity.store_key,
         index_project: identity.index_project,
         source_head,
+        indexed_commit_hash: indexed_head.to_string(),
         outcome: "archived".to_string(),
         reindex_required: true,
         transaction_id: Some(transaction_id),
@@ -439,14 +466,34 @@ pub fn complete_projection_upgrade(
             "current catalog identity changed the stable store key during projection upgrade",
         ));
     }
+    let pipeline_report_bytes = serde_json::to_vec(pipeline_report).map_err(|error| {
+        refusal(
+            &preparation.repo,
+            &format!("cannot encode the exact pipeline report: {error}"),
+        )
+    })?;
+    let pipeline_report_sha256 = sha256_bytes(&pipeline_report_bytes);
     let Some(transaction_id) = preparation.transaction_id.as_deref() else {
+        let current_database_path = config
+            .store_root
+            .join(&current_identity.store_key)
+            .join(format!("{}.db", current_identity.index_project));
+        let current_database_sha256 = sha256_file(&preparation.repo, &current_database_path)?;
         return Ok(json!({
-            "outcome": "current_noop",
-            "database_sha256": preparation.database_sha256,
+            "outcome": if preparation.reindex_required {
+                "projection_refreshed"
+            } else {
+                "current_noop"
+            },
+            "admission_database_sha256": preparation.database_sha256,
+            "database_sha256": current_database_sha256,
+            "admission_indexed_commit_hash": preparation.indexed_commit_hash,
+            "source_head": preparation.source_head,
             "current_index_project": current_identity.index_project,
             "current_kernel_scope": current_identity.kernel_scope,
             "kernel_members_hash": kernel_members_hash,
             "kernel_member_count": kernel_member_count,
+            "pipeline_report_sha256": pipeline_report_sha256,
         }));
     };
     let store_dir = config.store_root.join(&preparation.store_key);
@@ -477,14 +524,13 @@ pub fn complete_projection_upgrade(
         false,
     )?;
     let current_family = capture_current_family(&preparation.repo, &database_path)?;
-    let pipeline_report_bytes = serde_json::to_vec(pipeline_report).map_err(|error| {
-        refusal(
-            &preparation.repo,
-            &format!("cannot encode the exact pipeline report: {error}"),
-        )
-    })?;
-    let completion = json!({
-        "schema": PROJECTION_COMPLETION_SCHEMA,
+    let completion_schema = if intent.schema == TRANSACTION_SCHEMA_V1 {
+        PROJECTION_COMPLETION_SCHEMA_V1
+    } else {
+        PROJECTION_COMPLETION_SCHEMA
+    };
+    let mut completion = json!({
+        "schema": completion_schema,
         "transaction_id": transaction_id,
         "repo": preparation.repo,
         "source_head": preparation.source_head,
@@ -497,8 +543,34 @@ pub fn complete_projection_upgrade(
         "current_family": current_family,
         "kernel_members_hash": kernel_members_hash,
         "kernel_member_count": kernel_member_count,
-        "pipeline_report_sha256": sha256_bytes(&pipeline_report_bytes),
+        "pipeline_report_sha256": pipeline_report_sha256,
     });
+    if completion_schema == PROJECTION_COMPLETION_SCHEMA {
+        let object = completion
+            .as_object_mut()
+            .ok_or_else(|| refusal(&preparation.repo, "projection completion is not an object"))?;
+        object.insert(
+            "legacy_indexed_commit_hash".to_string(),
+            Value::String(intent.indexed_commit_hash.clone()),
+        );
+        object.insert(
+            "source_path".to_string(),
+            Value::String(intent.source_path.clone()),
+        );
+        object.insert(
+            "remote_url".to_string(),
+            Value::String(intent.remote_url.clone()),
+        );
+        object.insert(
+            "archived_family".to_string(),
+            serde_json::to_value(&intent.members).map_err(|error| {
+                refusal(
+                    &preparation.repo,
+                    &format!("cannot encode archived family in completion: {error}"),
+                )
+            })?,
+        );
+    }
     let completion_path = transaction_dir.join("projection-completion.json");
     write_json_exact(&preparation.repo, &completion_path, &completion)?;
     let readback: Value = read_json(&preparation.repo, &completion_path)?;
@@ -581,6 +653,7 @@ pub fn read_current_projection_identity(
     }
     let source_head = verify_source(&row.record.clone_url, &source_path, &preparation.repo)?;
     if source_head != preparation.source_head
+        || row.head_commit_hash.as_deref() != Some(preparation.source_head.as_str())
         || row.indexed_commit_hash.as_deref() != Some(preparation.source_head.as_str())
     {
         return Err(refusal(
@@ -638,6 +711,40 @@ fn verify_source(expected_remote: &str, source: &Path, repo: &str) -> Result<Str
         ));
     }
     Ok(head)
+}
+
+fn verify_commit_object(repo: &str, source: &Path, commit: &str) -> Result<(), CalyxError> {
+    if !matches!(commit.len(), 40 | 64)
+        || !commit
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        return Err(refusal(
+            repo,
+            &format!("indexed_commit_hash {commit:?} is not a canonical Git object id"),
+        ));
+    }
+    let commitish = format!("{commit}^{{commit}}");
+    let (ok, resolved, stderr) = git_capture(
+        &["rev-parse", "--verify", "--end-of-options", &commitish],
+        source,
+    )?;
+    if !ok {
+        return Err(refusal(
+            repo,
+            &format!(
+                "indexed_commit_hash {commit} is not an available commit object: {}",
+                one_line(&stderr)
+            ),
+        ));
+    }
+    if resolved != commit {
+        return Err(refusal(
+            repo,
+            &format!("indexed_commit_hash {commit} resolved to different commit object {resolved}"),
+        ));
+    }
+    Ok(())
 }
 
 fn inspect_schema(
@@ -1287,14 +1394,25 @@ fn verify_intent_binding(
 ) -> Result<(), CalyxError> {
     let repo = row.record.full_name.as_str();
     let intent_kernel_scope = format!("repo:{}", intent.index_project);
-    if intent.schema != TRANSACTION_SCHEMA
-        || intent.repo != repo
+    // Recovery may observe either the pre-pipeline indexed revision or the
+    // post-pipeline source revision. No third catalog phase is admissible.
+    let catalog_indexed = row.indexed_commit_hash.as_deref();
+    let indexed_phase_valid = catalog_indexed == Some(intent.indexed_commit_hash.as_str())
+        || catalog_indexed == Some(intent.source_head.as_str());
+    if intent.schema != TRANSACTION_SCHEMA && intent.schema != TRANSACTION_SCHEMA_V1 {
+        return Err(refusal(
+            repo,
+            "incomplete projection-upgrade intent has an unsupported schema",
+        ));
+    }
+    if intent.repo != repo
         || intent.github_id != row.record.github_id
         || intent.store_key != identity.store_key
         || intent.kernel_scope != intent_kernel_scope
         || Path::new(&intent.source_path) != source_path
         || intent.source_head != source_head
-        || row.indexed_commit_hash.as_deref() != Some(intent.indexed_commit_hash.as_str())
+        || row.head_commit_hash.as_deref() != Some(intent.source_head.as_str())
+        || !indexed_phase_valid
         || intent.remote_url != row.record.clone_url
     {
         return Err(refusal(
@@ -1302,6 +1420,7 @@ fn verify_intent_binding(
             "incomplete projection-upgrade intent differs from current catalog/source identity",
         ));
     }
+    verify_commit_object(repo, source_path, &intent.indexed_commit_hash)?;
     Ok(())
 }
 
@@ -1413,7 +1532,11 @@ fn verify_projection_completion_record(
     completion_path: &Path,
 ) -> Result<(), CalyxError> {
     let completion: Value = read_json(repo, completion_path)?;
-    let valid = completion["schema"].as_str() == Some(PROJECTION_COMPLETION_SCHEMA)
+    let completion_schema = completion["schema"].as_str();
+    let schema_valid = completion_schema == Some(PROJECTION_COMPLETION_SCHEMA)
+        || (intent.schema == TRANSACTION_SCHEMA_V1
+            && completion_schema == Some(PROJECTION_COMPLETION_SCHEMA_V1));
+    let common_valid = schema_valid
         && completion["transaction_id"].as_str() == Some(intent.transaction_id.as_str())
         && completion["repo"].as_str() == Some(intent.repo.as_str())
         && completion["source_head"].as_str() == Some(intent.source_head.as_str())
@@ -1445,6 +1568,19 @@ fn verify_projection_completion_record(
             .is_some_and(|hash| {
                 hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit())
             });
+    let v2_valid = completion_schema != Some(PROJECTION_COMPLETION_SCHEMA)
+        || (completion["legacy_indexed_commit_hash"].as_str()
+            == Some(intent.indexed_commit_hash.as_str())
+            && completion["source_path"].as_str() == Some(intent.source_path.as_str())
+            && completion["remote_url"].as_str() == Some(intent.remote_url.as_str())
+            && completion["archived_family"]
+                == serde_json::to_value(&intent.members).map_err(|error| {
+                    refusal(
+                        repo,
+                        &format!("cannot encode archived family for completion readback: {error}"),
+                    )
+                })?);
+    let valid = common_valid && v2_valid;
     if !valid {
         return Err(refusal(
             repo,
@@ -1459,7 +1595,7 @@ fn verify_projection_completion_record(
 
 fn read_intent(repo: &str, path: &Path) -> Result<UpgradeIntent, CalyxError> {
     let intent: UpgradeIntent = read_json(repo, path)?;
-    if intent.schema != TRANSACTION_SCHEMA {
+    if intent.schema != TRANSACTION_SCHEMA && intent.schema != TRANSACTION_SCHEMA_V1 {
         return Err(refusal(
             repo,
             &format!("intent {} has unknown schema", path.display()),
