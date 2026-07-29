@@ -686,6 +686,26 @@ pub fn process_start_utc_ticks(pid: u32) -> Result<u64, String> {
     windows_watchdog::process_start_utc_ticks(pid)
 }
 
+/// Exact Windows process-generation probe used by durable recovery protocols.
+///
+/// A numeric PID is not an identity after process exit. Callers persist both
+/// the PID and creation FILETIME ticks, then use this result to distinguish an
+/// absent generation from a matching live owner or a reused PID.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProcessGenerationState {
+    Absent,
+    Matching,
+    Reused { actual_start_utc_ticks: u64 },
+}
+
+#[cfg(windows)]
+pub fn process_generation_state(
+    pid: u32,
+    expected_start_utc_ticks: u64,
+) -> Result<ProcessGenerationState, String> {
+    windows_watchdog::process_generation_state(pid, expected_start_utc_ticks)
+}
+
 #[cfg(not(any(unix, windows)))]
 pub fn parent_process_id() -> Option<u32> {
     None
@@ -695,6 +715,17 @@ pub fn parent_process_id() -> Option<u32> {
 pub fn process_start_utc_ticks(_pid: u32) -> Result<u64, String> {
     Err(
         "ASTRO_PROCESS_GENERATION_UNSUPPORTED: exact process creation ticks require Windows"
+            .to_string(),
+    )
+}
+
+#[cfg(not(windows))]
+pub fn process_generation_state(
+    _pid: u32,
+    _expected_start_utc_ticks: u64,
+) -> Result<ProcessGenerationState, String> {
+    Err(
+        "ASTRO_PROCESS_GENERATION_UNSUPPORTED: exact process-generation probes require Windows"
             .to_string(),
     )
 }
@@ -839,6 +870,54 @@ mod windows_watchdog {
         // SAFETY: handle came from OpenProcess and is closed exactly once here.
         unsafe { CloseHandle(handle) };
         Ok((u64::from(creation.high) << 32) | u64::from(creation.low))
+    }
+
+    pub(crate) fn process_generation_state(
+        pid: u32,
+        expected_start_utc_ticks: u64,
+    ) -> Result<super::ProcessGenerationState, String> {
+        // ERROR_INVALID_PARAMETER is the documented OpenProcess result for a
+        // PID that is not a live process. Every other open/query failure is
+        // unevaluable and must remain preserving at the caller.
+        const ERROR_INVALID_PARAMETER: u32 = 87;
+        // SAFETY: OpenProcess writes through no pointers; null is checked.
+        let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+        if handle.is_null() {
+            // SAFETY: GetLastError has no preconditions.
+            let code = unsafe { GetLastError() };
+            if code == ERROR_INVALID_PARAMETER {
+                return Ok(super::ProcessGenerationState::Absent);
+            }
+            return Err(format!(
+                "ASTRO_PROCESS_GENERATION_OPEN_FAILED: OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION) for pid {pid} failed (native_error={code})"
+            ));
+        }
+        let mut creation = FileTime { low: 0, high: 0 };
+        let mut exit = FileTime { low: 0, high: 0 };
+        let mut kernel = FileTime { low: 0, high: 0 };
+        let mut user = FileTime { low: 0, high: 0 };
+        // SAFETY: handle is live and each out pointer names a FILETIME.
+        let ok =
+            unsafe { GetProcessTimes(handle, &mut creation, &mut exit, &mut kernel, &mut user) };
+        if ok == 0 {
+            // SAFETY: read the native error before closing the valid handle.
+            let code = unsafe { GetLastError() };
+            // SAFETY: handle came from OpenProcess and is closed exactly once.
+            unsafe { CloseHandle(handle) };
+            return Err(format!(
+                "ASTRO_PROCESS_GENERATION_QUERY_FAILED: GetProcessTimes for pid {pid} failed (native_error={code})"
+            ));
+        }
+        // SAFETY: handle came from OpenProcess and is closed exactly once.
+        unsafe { CloseHandle(handle) };
+        let actual_start_utc_ticks = (u64::from(creation.high) << 32) | u64::from(creation.low);
+        if actual_start_utc_ticks == expected_start_utc_ticks {
+            Ok(super::ProcessGenerationState::Matching)
+        } else {
+            Ok(super::ProcessGenerationState::Reused {
+                actual_start_utc_ticks,
+            })
+        }
     }
 
     /// A `SYNCHRONIZE` handle to the parent process. Its wait state becomes signaled when

@@ -1,13 +1,74 @@
 use super::*;
 use rusqlite::OpenFlags;
 use rusqlite::backup::Backup;
+use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
 
 const PUBLICATION_DIR: &str = ".astrolabe-shadow-publication";
 const PUBLICATION_JOURNAL: &str = "transaction.json";
+const PUBLICATION_SCHEMA: &str = "astrolabe.shadow-publication.v2";
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PublicationOwner {
+    pid: u32,
+    process_start_utc_ticks: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FileEvidence {
+    bytes: u64,
+    sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SqliteFamilyEvidence {
+    main: Option<FileEvidence>,
+    wal: Option<FileEvidence>,
+    shm: Option<FileEvidence>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ArtifactGenerationEvidence {
+    source: SqliteFamilyEvidence,
+    lowered: SqliteFamilyEvidence,
+    vault_tree_sha256: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PublicationRecoveryManifest {
+    prior: ArtifactGenerationEvidence,
+    candidate: ArtifactGenerationEvidence,
+    prior_config_generation: Option<String>,
+    candidate_config_generation: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PublicationJournal {
+    schema: String,
+    project: String,
+    phase: String,
+    live_cache: PathBuf,
+    stage_cache: PathBuf,
+    backup_dir: PathBuf,
+    generation: String,
+    owner: PublicationOwner,
+    recovery_manifest: Option<PublicationRecoveryManifest>,
+    evidence: Value,
+}
 
 type StagedArtifactValidation = (String, String, String, String, Vec<(String, String)>);
-type PublicationConfigReadback = (Option<String>, Option<String>, Option<String>);
+type PublicationConfigReadback = (
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
 
 #[derive(Debug, Clone)]
 struct SeedLowerRepair {
@@ -41,6 +102,9 @@ pub(crate) struct ShadowPublication {
     transaction_dir: PathBuf,
     stage_cache: PathBuf,
     backup_dir: PathBuf,
+    generation: String,
+    owner: PublicationOwner,
+    recovery_manifest: Option<PublicationRecoveryManifest>,
     seed_lower_repair: Option<SeedLowerRepair>,
 }
 
@@ -49,7 +113,7 @@ impl ShadowPublication {
         fs::create_dir_all(live_cache)?;
         let project_digest = hex_lower(&Sha256::digest(project.as_bytes()));
         let project_root = live_cache.join(PUBLICATION_DIR).join(&project_digest[..32]);
-        reconcile_completed_transactions(&project_root)?;
+        reconcile_completed_transactions(&project_root, live_cache, project)?;
         if project_root.exists() && fs::read_dir(&project_root)?.next().is_some() {
             return Err(format!(
                 "ASTRO_SHADOW_PUBLICATION_INCOMPLETE: an unfinished shadow publication exists for project {project:?} under {}; live state is not safe to mutate. Remediation: inspect transaction.json and the backup/stage hashes, restore or finalize that exact transaction, then retry",
@@ -62,8 +126,16 @@ impl ShadowPublication {
             .duration_since(UNIX_EPOCH)
             .map_err(|error| format!("ASTRO_SHADOW_PUBLICATION_CLOCK: {error}"))?
             .as_nanos();
+        let owner_pid = std::process::id();
+        let owner_process_start_utc_ticks =
+            astrolabe_bridge::process_start_utc_ticks(owner_pid).map_err(|error| {
+                format!(
+                    "ASTRO_SHADOW_PUBLICATION_OWNER_IDENTITY_UNREADABLE: exact owner creation ticks for pid {owner_pid} could not be read: {error}; remediation: do not create a publication without a durable exact process generation"
+                )
+            })?;
+        let generation = format!("{owner_pid}-{owner_process_start_utc_ticks}-{nonce}");
         fs::create_dir_all(&project_root)?;
-        let transaction_dir = project_root.join(format!("{}-{nonce}", std::process::id()));
+        let transaction_dir = project_root.join(&generation);
         let stage_cache = transaction_dir.join("stage");
         let backup_dir = transaction_dir.join("backup");
         fs::create_dir(&transaction_dir)?;
@@ -74,6 +146,12 @@ impl ShadowPublication {
             transaction_dir,
             stage_cache,
             backup_dir,
+            generation,
+            owner: PublicationOwner {
+                pid: owner_pid,
+                process_start_utc_ticks: owner_process_start_utc_ticks,
+            },
+            recovery_manifest: None,
             seed_lower_repair: None,
         };
         let initialized = (|| -> Result<(), DynError> {
@@ -123,7 +201,7 @@ impl ShadowPublication {
     }
 
     pub(crate) fn publish(
-        self,
+        mut self,
         mut outcome: ShadowImportOutcome,
         dial: MigrationDial,
         sanitized_index_args: &str,
@@ -244,6 +322,23 @@ impl ShadowPublication {
                 ),
             ));
         }
+        let prior_generation = capture_artifact_generation(
+            &sqlite_path(&self.live_cache, &self.project),
+            &lowered_sqlite_path(&self.live_cache, &self.project),
+            &vault_dir(&self.live_cache, &self.project),
+        )?;
+        let candidate_generation =
+            capture_artifact_generation(&staged_source, &staged_lowered, &staged_vault)?;
+        let prior_config_generation = read_config_value(
+            &self.live_cache,
+            &metadata_key(&self.project, SHADOW_PUBLICATION_GENERATION_KEY),
+        )?;
+        self.recovery_manifest = Some(PublicationRecoveryManifest {
+            prior: prior_generation,
+            candidate: candidate_generation,
+            prior_config_generation,
+            candidate_config_generation: self.generation.clone(),
+        });
         if let Err(error) = self.write_journal(
             "validated",
             json!({
@@ -324,6 +419,7 @@ impl ShadowPublication {
             dial,
             sanitized_index_args,
             &staged_config_rows,
+            &self.generation,
         ) {
             let rollback = self.rollback_artifacts(&installed);
             return Err(self.abort_error("config commit", combine_rollback_error(error, rollback)));
@@ -343,10 +439,18 @@ impl ShadowPublication {
                     &self.live_cache,
                     &metadata_key(&self.project, "symbol_canonical_schema"),
                 )?,
+                read_config_value(
+                    &self.live_cache,
+                    &metadata_key(&self.project, SHADOW_PUBLICATION_GENERATION_KEY),
+                )?,
             ))
         })();
-        let (persisted_source, persisted_watermark, persisted_symbol_schema) = match config_readback
-        {
+        let (
+            persisted_source,
+            persisted_watermark,
+            persisted_symbol_schema,
+            persisted_publication_generation,
+        ) = match config_readback {
             Ok(readback) => readback,
             Err(error) => {
                 let _ = self.write_journal(
@@ -366,6 +470,7 @@ impl ShadowPublication {
         if persisted_source.as_deref() != Some(outcome.sqlite_path.to_string_lossy().as_ref())
             || persisted_watermark.as_deref() != Some(expected_watermark.as_str())
             || persisted_symbol_schema.as_deref() != Some(SYMBOL_CANONICAL_TAG)
+            || persisted_publication_generation.as_deref() != Some(self.generation.as_str())
         {
             self.write_journal(
                 "committed_readback_failed",
@@ -376,6 +481,8 @@ impl ShadowPublication {
                     "expected_watermark": expected_watermark,
                     "persisted_symbol_canonical_schema": persisted_symbol_schema,
                     "expected_symbol_canonical_schema": SYMBOL_CANONICAL_TAG,
+                    "persisted_publication_generation": persisted_publication_generation,
+                    "expected_publication_generation": self.generation,
                 }),
             )?;
             return Err(format!(
@@ -395,6 +502,7 @@ impl ShadowPublication {
                 "config_source": persisted_source,
                 "config_watermark": persisted_watermark,
                 "config_symbol_canonical_schema": persisted_symbol_schema,
+                "config_publication_generation": persisted_publication_generation,
                 "seed_lower_repair": self
                     .seed_lower_repair
                     .as_ref()
@@ -772,12 +880,15 @@ impl ShadowPublication {
         let path = self.transaction_dir.join(PUBLICATION_JOURNAL);
         let temporary = self.transaction_dir.join("transaction.json.pending");
         let bytes = serde_json::to_vec_pretty(&json!({
-            "schema": "astrolabe.shadow-publication.v1",
+            "schema": PUBLICATION_SCHEMA,
             "project": self.project,
             "phase": phase,
             "live_cache": self.live_cache,
             "stage_cache": self.stage_cache,
             "backup_dir": self.backup_dir,
+            "generation": self.generation,
+            "owner": self.owner,
+            "recovery_manifest": self.recovery_manifest,
             "evidence": evidence,
         }))?;
         let mut file = OpenOptions::new()
@@ -1017,22 +1128,565 @@ fn remap_value_paths(value: &mut Value, from: &Path, to: &Path) {
     }
 }
 
-fn reconcile_completed_transactions(project_root: &Path) -> Result<(), DynError> {
+fn capture_file_evidence(path: &Path) -> Result<Option<FileEvidence>, DynError> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let metadata = fs::symlink_metadata(path)?;
+    if !metadata.file_type().is_file() {
+        return Err(format!(
+            "ASTRO_SHADOW_PUBLICATION_RECOVERY_FILE_KIND: expected one ordinary file at {}, found a different filesystem object; remediation: preserve the transaction and inspect the named path",
+            path.display()
+        )
+        .into());
+    }
+    Ok(Some(FileEvidence {
+        bytes: metadata.len(),
+        sha256: sha256_file_hex(path)?,
+    }))
+}
+
+fn sqlite_sidecar_path(path: &Path, suffix: &str) -> PathBuf {
+    PathBuf::from(format!("{}{suffix}", path.display()))
+}
+
+fn capture_sqlite_family(path: &Path) -> Result<SqliteFamilyEvidence, DynError> {
+    Ok(SqliteFamilyEvidence {
+        main: capture_file_evidence(path)?,
+        wal: capture_file_evidence(&sqlite_sidecar_path(path, "-wal"))?,
+        shm: capture_file_evidence(&sqlite_sidecar_path(path, "-shm"))?,
+    })
+}
+
+fn capture_vault_evidence(path: &Path) -> Result<Option<String>, DynError> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    if !fs::symlink_metadata(path)?.file_type().is_dir() {
+        return Err(format!(
+            "ASTRO_SHADOW_PUBLICATION_RECOVERY_VAULT_KIND: expected one ordinary directory at {}, found a different filesystem object; remediation: preserve the transaction and inspect the named path",
+            path.display()
+        )
+        .into());
+    }
+    Ok(Some(sha256_tree_hex(path)?))
+}
+
+fn capture_artifact_generation(
+    source: &Path,
+    lowered: &Path,
+    vault: &Path,
+) -> Result<ArtifactGenerationEvidence, DynError> {
+    Ok(ArtifactGenerationEvidence {
+        source: capture_sqlite_family(source)?,
+        lowered: capture_sqlite_family(lowered)?,
+        vault_tree_sha256: capture_vault_evidence(vault)?,
+    })
+}
+
+fn capture_backup_generation(backup: &Path) -> Result<ArtifactGenerationEvidence, DynError> {
+    capture_artifact_generation(
+        &backup.join("source"),
+        &backup.join("lowered"),
+        &backup.join("vault"),
+    )
+}
+
+fn publication_owner_state(owner: &PublicationOwner) -> Result<String, DynError> {
+    match astrolabe_bridge::process_generation_state(
+        owner.pid,
+        owner.process_start_utc_ticks,
+    )
+    .map_err(|error| {
+        format!(
+            "ASTRO_SHADOW_PUBLICATION_OWNER_UNEVALUABLE: exact owner ({},{}) could not be classified: {error}; remediation: preserve the complete transaction until that exact process generation is evaluable",
+            owner.pid, owner.process_start_utc_ticks
+        )
+    })? {
+        astrolabe_bridge::ProcessGenerationState::Absent => Ok("absent".to_string()),
+        astrolabe_bridge::ProcessGenerationState::Reused {
+            actual_start_utc_ticks,
+        } => Ok(format!("pid_reused:{actual_start_utc_ticks}")),
+        astrolabe_bridge::ProcessGenerationState::Matching => Err(format!(
+            "ASTRO_SHADOW_PUBLICATION_OWNER_LIVE: exact owner ({},{}) is still live; remediation: wait for that exact generation to finish and never recover or remove its transaction",
+            owner.pid, owner.process_start_utc_ticks
+        )
+        .into()),
+    }
+}
+
+fn read_publication_journal(path: &Path) -> Result<PublicationJournal, DynError> {
+    let bytes = fs::read(path).map_err(|error| {
+        format!(
+            "ASTRO_SHADOW_PUBLICATION_JOURNAL_UNREADABLE: read {}: {error}",
+            path.display()
+        )
+    })?;
+    let value: Value = serde_json::from_slice(&bytes).map_err(|error| {
+        format!(
+            "ASTRO_SHADOW_PUBLICATION_JOURNAL_MALFORMED: parse {}: {error}; remediation: preserve the transaction and inspect the exact journal bytes",
+            path.display()
+        )
+    })?;
+    if value.get("schema").and_then(Value::as_str) != Some(PUBLICATION_SCHEMA) {
+        return Err(format!(
+            "ASTRO_SHADOW_PUBLICATION_LEGACY_PRESERVED: journal {} does not name schema {PUBLICATION_SCHEMA:?}; remediation: preserve every byte and recover the legacy transaction only through a separately specified migration",
+            path.display()
+        )
+        .into());
+    }
+    serde_json::from_value(value).map_err(|error| {
+        format!(
+            "ASTRO_SHADOW_PUBLICATION_JOURNAL_FIELDS: strict schema-v2 decode of {} failed: {error}; remediation: preserve every byte and repair the named journal field",
+            path.display()
+        )
+        .into()
+    })
+}
+
+fn validate_publication_journal_identity(
+    journal: &PublicationJournal,
+    transaction: &Path,
+    project_root: &Path,
+    live_cache: &Path,
+    project: &str,
+) -> Result<(), DynError> {
+    let file_name = transaction
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| -> DynError {
+            format!(
+                "ASTRO_SHADOW_PUBLICATION_TRANSACTION_NAME_INVALID: transaction path {} has no UTF-8 generation name; remediation: preserve the transaction",
+                transaction.display()
+            )
+            .into()
+        })?;
+    if journal.schema != PUBLICATION_SCHEMA
+        || journal.project != project
+        || journal.live_cache != live_cache
+        || journal.generation != file_name
+        || journal.stage_cache != transaction.join("stage")
+        || journal.backup_dir != transaction.join("backup")
+        || transaction.parent() != Some(project_root)
+    {
+        return Err(format!(
+            "ASTRO_SHADOW_PUBLICATION_RECOVERY_IDENTITY_MISMATCH: journal identity/path fields do not exactly bind transaction {}; remediation: preserve every byte and inspect schema/project/live/stage/backup/generation fields",
+            transaction.display()
+        )
+        .into());
+    }
+    Ok(())
+}
+
+fn write_recovery_journal(
+    transaction: &Path,
+    journal: &PublicationJournal,
+    phase: &str,
+    evidence: Value,
+) -> Result<(), DynError> {
+    let actor_pid = std::process::id();
+    let actor_ticks = astrolabe_bridge::process_start_utc_ticks(actor_pid)?;
+    let replacement = PublicationJournal {
+        schema: journal.schema.clone(),
+        project: journal.project.clone(),
+        phase: phase.to_string(),
+        live_cache: journal.live_cache.clone(),
+        stage_cache: journal.stage_cache.clone(),
+        backup_dir: journal.backup_dir.clone(),
+        generation: journal.generation.clone(),
+        owner: journal.owner.clone(),
+        recovery_manifest: journal.recovery_manifest.clone(),
+        evidence: json!({
+            "schema": "astrolabe.shadow-publication-recovery.v1",
+            "prior_phase": journal.phase,
+            "owner_state": publication_owner_state(&journal.owner)?,
+            "recovery_actor": {
+                "pid": actor_pid,
+                "process_start_utc_ticks": actor_ticks,
+            },
+            "readback": evidence,
+        }),
+    };
+    let pending = transaction.join("transaction.recovery.pending.json");
+    let bytes = serde_json::to_vec_pretty(&replacement)?;
+    let mut file = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&pending)?;
+    file.write_all(&bytes)?;
+    file.sync_all()?;
+    drop(file);
+    fs::rename(pending, transaction.join(PUBLICATION_JOURNAL))?;
+    Ok(())
+}
+
+fn family_entry<'a>(family: &'a SqliteFamilyEvidence, suffix: &str) -> &'a Option<FileEvidence> {
+    match suffix {
+        "" => &family.main,
+        "-wal" => &family.wal,
+        "-shm" => &family.shm,
+        _ => unreachable!("fixed SQLite family suffix"),
+    }
+}
+
+fn validate_file_distribution(
+    label: &str,
+    live_base: &Path,
+    backup_base: &Path,
+    stage_base: &Path,
+    prior: &SqliteFamilyEvidence,
+    candidate: &SqliteFamilyEvidence,
+) -> Result<(), DynError> {
+    for suffix in ["", "-wal", "-shm"] {
+        let live = capture_file_evidence(&sqlite_sidecar_path(live_base, suffix))?;
+        let backup = capture_file_evidence(&sqlite_sidecar_path(backup_base, suffix))?;
+        let stage = capture_file_evidence(&sqlite_sidecar_path(stage_base, suffix))?;
+        let expected_prior = family_entry(prior, suffix);
+        let expected_candidate = family_entry(candidate, suffix);
+        if backup.is_some() && &backup != expected_prior {
+            return Err(format!(
+                "ASTRO_SHADOW_PUBLICATION_RECOVERY_BACKUP_MISMATCH: {label}{suffix} backup does not equal the journal-bound prior file; remediation: preserve every byte"
+            )
+            .into());
+        }
+        if stage.is_some() && &stage != expected_candidate {
+            return Err(format!(
+                "ASTRO_SHADOW_PUBLICATION_RECOVERY_STAGE_MISMATCH: {label}{suffix} stage does not equal the journal-bound candidate file; remediation: preserve every byte"
+            )
+            .into());
+        }
+        if let Some(live) = &live
+            && Some(live) != expected_prior.as_ref()
+            && Some(live) != expected_candidate.as_ref()
+        {
+            return Err(format!(
+                "ASTRO_SHADOW_PUBLICATION_RECOVERY_LIVE_MISMATCH: live {label}{suffix} equals neither journal-bound prior nor candidate; remediation: preserve every byte"
+            )
+            .into());
+        }
+    }
+    Ok(())
+}
+
+fn restore_file_family(
+    live_base: &Path,
+    backup_base: &Path,
+    prior: &SqliteFamilyEvidence,
+    candidate: &SqliteFamilyEvidence,
+) -> Result<(), DynError> {
+    for suffix in ["", "-wal", "-shm"] {
+        let live_path = sqlite_sidecar_path(live_base, suffix);
+        let backup_path = sqlite_sidecar_path(backup_base, suffix);
+        let live = capture_file_evidence(&live_path)?;
+        let backup = capture_file_evidence(&backup_path)?;
+        let expected_prior = family_entry(prior, suffix);
+        let expected_candidate = family_entry(candidate, suffix);
+        match expected_prior {
+            Some(prior_file) if live.as_ref() == Some(prior_file) => {
+                if backup.is_some() {
+                    return Err("ASTRO_SHADOW_PUBLICATION_RECOVERY_DUPLICATE_PRIOR: prior file exists in both live and backup; remediation: preserve every byte".into());
+                }
+            }
+            Some(prior_file) => {
+                if backup.as_ref() != Some(prior_file) {
+                    return Err("ASTRO_SHADOW_PUBLICATION_RECOVERY_PRIOR_MISSING: journal-bound prior file exists in neither live nor backup; remediation: preserve every byte".into());
+                }
+                if let Some(live_file) = live {
+                    if Some(&live_file) != expected_candidate.as_ref() {
+                        return Err("ASTRO_SHADOW_PUBLICATION_RECOVERY_CANDIDATE_MISMATCH: live replacement is not the journal-bound candidate; remediation: preserve every byte".into());
+                    }
+                    fs::remove_file(&live_path)?;
+                }
+                fs::rename(&backup_path, &live_path)?;
+            }
+            None => {
+                if backup.is_some() {
+                    return Err("ASTRO_SHADOW_PUBLICATION_RECOVERY_UNEXPECTED_BACKUP: journal says the prior file was absent but a backup exists; remediation: preserve every byte".into());
+                }
+                if let Some(live_file) = live {
+                    if Some(&live_file) != expected_candidate.as_ref() {
+                        return Err("ASTRO_SHADOW_PUBLICATION_RECOVERY_UNEXPECTED_LIVE: journal says the prior file was absent and live is not the candidate; remediation: preserve every byte".into());
+                    }
+                    fs::remove_file(&live_path)?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_vault_distribution(
+    live: &Path,
+    backup: &Path,
+    stage: &Path,
+    prior: &Option<String>,
+    candidate: &Option<String>,
+) -> Result<(), DynError> {
+    let live_hash = capture_vault_evidence(live)?;
+    let backup_hash = capture_vault_evidence(backup)?;
+    let stage_hash = capture_vault_evidence(stage)?;
+    if backup_hash.is_some() && &backup_hash != prior {
+        return Err("ASTRO_SHADOW_PUBLICATION_RECOVERY_BACKUP_VAULT_MISMATCH: backup vault does not equal the bound prior tree; remediation: preserve every byte".into());
+    }
+    if stage_hash.is_some() && &stage_hash != candidate {
+        return Err("ASTRO_SHADOW_PUBLICATION_RECOVERY_STAGE_VAULT_MISMATCH: stage vault does not equal the bound candidate tree; remediation: preserve every byte".into());
+    }
+    if live_hash.is_some() && &live_hash != prior && &live_hash != candidate {
+        return Err("ASTRO_SHADOW_PUBLICATION_RECOVERY_LIVE_VAULT_MISMATCH: live vault equals neither bound tree; remediation: preserve every byte".into());
+    }
+    Ok(())
+}
+
+fn restore_vault(
+    live: &Path,
+    backup: &Path,
+    prior: &Option<String>,
+    candidate: &Option<String>,
+) -> Result<(), DynError> {
+    let live_hash = capture_vault_evidence(live)?;
+    let backup_hash = capture_vault_evidence(backup)?;
+    match prior {
+        Some(prior_hash) if live_hash.as_ref() == Some(prior_hash) => {
+            if backup_hash.is_some() {
+                return Err("ASTRO_SHADOW_PUBLICATION_RECOVERY_DUPLICATE_PRIOR_VAULT: prior vault exists in both live and backup; remediation: preserve every byte".into());
+            }
+        }
+        Some(prior_hash) => {
+            if backup_hash.as_ref() != Some(prior_hash) {
+                return Err("ASTRO_SHADOW_PUBLICATION_RECOVERY_PRIOR_VAULT_MISSING: prior vault exists in neither live nor backup; remediation: preserve every byte".into());
+            }
+            if let Some(live_value) = live_hash {
+                if Some(&live_value) != candidate.as_ref() {
+                    return Err("ASTRO_SHADOW_PUBLICATION_RECOVERY_CANDIDATE_VAULT_MISMATCH: live vault is not the bound candidate; remediation: preserve every byte".into());
+                }
+                fs::remove_dir_all(live)?;
+            }
+            fs::rename(backup, live)?;
+        }
+        None => {
+            if backup_hash.is_some() {
+                return Err("ASTRO_SHADOW_PUBLICATION_RECOVERY_UNEXPECTED_BACKUP_VAULT: prior vault was absent but backup exists; remediation: preserve every byte".into());
+            }
+            if let Some(live_value) = live_hash {
+                if Some(&live_value) != candidate.as_ref() {
+                    return Err("ASTRO_SHADOW_PUBLICATION_RECOVERY_UNEXPECTED_LIVE_VAULT: prior vault was absent and live is not candidate; remediation: preserve every byte".into());
+                }
+                fs::remove_dir_all(live)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_backup_names(backup: &Path) -> Result<(), DynError> {
+    if !backup.exists() {
+        return Ok(());
+    }
+    let allowed = BTreeSet::from([
+        "source",
+        "source-wal",
+        "source-shm",
+        "lowered",
+        "lowered-wal",
+        "lowered-shm",
+        "vault",
+    ]);
+    for entry in fs::read_dir(backup)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            return Err("ASTRO_SHADOW_PUBLICATION_RECOVERY_BACKUP_NAME_INVALID: non-UTF-8 backup entry; remediation: preserve every byte".into());
+        };
+        if !allowed.contains(name) {
+            return Err(format!(
+                "ASTRO_SHADOW_PUBLICATION_RECOVERY_BACKUP_ENTRY_UNEXPECTED: backup entry {name:?} is not an owned artifact name; remediation: preserve every byte"
+            )
+            .into());
+        }
+    }
+    Ok(())
+}
+
+fn rollback_interrupted_publication(
+    journal: &PublicationJournal,
+    manifest: &PublicationRecoveryManifest,
+) -> Result<Value, DynError> {
+    validate_backup_names(&journal.backup_dir)?;
+    let live_source = sqlite_path(&journal.live_cache, &journal.project);
+    let live_lowered = lowered_sqlite_path(&journal.live_cache, &journal.project);
+    let live_vault = vault_dir(&journal.live_cache, &journal.project);
+    let backup_source = journal.backup_dir.join("source");
+    let backup_lowered = journal.backup_dir.join("lowered");
+    let backup_vault = journal.backup_dir.join("vault");
+    let stage_source = sqlite_path(&journal.stage_cache, &journal.project);
+    let stage_lowered = lowered_sqlite_path(&journal.stage_cache, &journal.project);
+    let stage_vault = vault_dir(&journal.stage_cache, &journal.project);
+
+    validate_file_distribution(
+        "source",
+        &live_source,
+        &backup_source,
+        &stage_source,
+        &manifest.prior.source,
+        &manifest.candidate.source,
+    )?;
+    validate_file_distribution(
+        "lowered",
+        &live_lowered,
+        &backup_lowered,
+        &stage_lowered,
+        &manifest.prior.lowered,
+        &manifest.candidate.lowered,
+    )?;
+    validate_vault_distribution(
+        &live_vault,
+        &backup_vault,
+        &stage_vault,
+        &manifest.prior.vault_tree_sha256,
+        &manifest.candidate.vault_tree_sha256,
+    )?;
+
+    restore_vault(
+        &live_vault,
+        &backup_vault,
+        &manifest.prior.vault_tree_sha256,
+        &manifest.candidate.vault_tree_sha256,
+    )?;
+    restore_file_family(
+        &live_lowered,
+        &backup_lowered,
+        &manifest.prior.lowered,
+        &manifest.candidate.lowered,
+    )?;
+    restore_file_family(
+        &live_source,
+        &backup_source,
+        &manifest.prior.source,
+        &manifest.candidate.source,
+    )?;
+    let readback = capture_artifact_generation(&live_source, &live_lowered, &live_vault)?;
+    if readback != manifest.prior {
+        return Err("ASTRO_SHADOW_PUBLICATION_RECOVERY_ROLLBACK_READBACK_MISMATCH: restored live generation does not equal journal-bound prior state; remediation: preserve transaction and live bytes".into());
+    }
+    Ok(serde_json::to_value(readback)?)
+}
+
+fn finalize_interrupted_publication(
+    journal: &PublicationJournal,
+    manifest: &PublicationRecoveryManifest,
+) -> Result<Value, DynError> {
+    validate_backup_names(&journal.backup_dir)?;
+    let live = capture_artifact_generation(
+        &sqlite_path(&journal.live_cache, &journal.project),
+        &lowered_sqlite_path(&journal.live_cache, &journal.project),
+        &vault_dir(&journal.live_cache, &journal.project),
+    )?;
+    if live != manifest.candidate {
+        return Err("ASTRO_SHADOW_PUBLICATION_RECOVERY_COMMITTED_ARTIFACT_MISMATCH: config committed the candidate generation but live artifacts do not equal its bound hashes; remediation: preserve every byte".into());
+    }
+    let backup = capture_backup_generation(&journal.backup_dir)?;
+    if backup != manifest.prior {
+        return Err("ASTRO_SHADOW_PUBLICATION_RECOVERY_COMMITTED_BACKUP_MISMATCH: committed transaction backup does not equal its bound prior generation; remediation: preserve every byte".into());
+    }
+    Ok(json!({
+        "live": live,
+        "backup": backup,
+        "config_generation": manifest.candidate_config_generation,
+    }))
+}
+
+fn reconcile_completed_transactions(
+    project_root: &Path,
+    live_cache: &Path,
+    project: &str,
+) -> Result<(), DynError> {
     if !project_root.exists() {
         return Ok(());
     }
-    let entries = fs::read_dir(project_root)?.collect::<std::io::Result<Vec<_>>>()?;
+    let mut entries = fs::read_dir(project_root)?.collect::<std::io::Result<Vec<_>>>()?;
+    entries.sort_by_key(|entry| entry.file_name());
     for entry in entries {
         let transaction = entry.path();
         let journal = transaction.join(PUBLICATION_JOURNAL);
-        let value: Value = serde_json::from_slice(&fs::read(&journal).map_err(|error| {
-            format!(
-                "ASTRO_SHADOW_PUBLICATION_JOURNAL_UNREADABLE: read {}: {error}",
-                journal.display()
-            )
-        })?)?;
-        if value.get("phase").and_then(Value::as_str) != Some("complete") {
-            continue;
+        let mut value = read_publication_journal(&journal)?;
+        validate_publication_journal_identity(
+            &value,
+            &transaction,
+            project_root,
+            live_cache,
+            project,
+        )?;
+        let owner_state = publication_owner_state(&value.owner)?;
+        match value.phase.as_str() {
+            "complete" => {}
+            "initializing" | "staged" | "unchanged_validated" | "aborted" => {
+                if value.backup_dir.exists() && fs::read_dir(&value.backup_dir)?.next().is_some() {
+                    return Err(format!(
+                        "ASTRO_SHADOW_PUBLICATION_RECOVERY_PREINSTALL_BACKUP_NOT_EMPTY: phase {:?} has backup artifacts; remediation: preserve every byte because the journal and physical phase disagree",
+                        value.phase
+                    )
+                    .into());
+                }
+                write_recovery_journal(
+                    &transaction,
+                    &value,
+                    "rolled_back",
+                    json!({"owner_state": owner_state, "live_generation_mutated": false}),
+                )?;
+                value.phase = "rolled_back".to_string();
+            }
+            "validated" | "artifacts_installed" | "committed_readback_failed" => {
+                let manifest = value.recovery_manifest.as_ref().ok_or_else(|| -> DynError {
+                    format!(
+                        "ASTRO_SHADOW_PUBLICATION_RECOVERY_MANIFEST_MISSING: phase {:?} has no hash-bound recovery manifest; remediation: preserve every byte",
+                        value.phase
+                    )
+                    .into()
+                })?;
+                let config_generation = read_config_value(
+                    live_cache,
+                    &metadata_key(project, SHADOW_PUBLICATION_GENERATION_KEY),
+                )?;
+                if config_generation == Some(manifest.candidate_config_generation.clone()) {
+                    let readback = finalize_interrupted_publication(&value, manifest)?;
+                    write_recovery_journal(&transaction, &value, "complete", readback)?;
+                    value.phase = "complete".to_string();
+                } else if config_generation == manifest.prior_config_generation {
+                    let readback = rollback_interrupted_publication(&value, manifest)?;
+                    write_recovery_journal(&transaction, &value, "rolled_back", readback)?;
+                    value.phase = "rolled_back".to_string();
+                } else {
+                    return Err(format!(
+                        "ASTRO_SHADOW_PUBLICATION_RECOVERY_CONFIG_GENERATION_MISMATCH: live config generation {config_generation:?} equals neither prior {:?} nor candidate {:?}; remediation: preserve every byte",
+                        manifest.prior_config_generation,
+                        manifest.candidate_config_generation
+                    )
+                    .into());
+                }
+            }
+            "rolled_back" => {
+                let manifest = value.recovery_manifest.as_ref().ok_or_else(|| -> DynError {
+                    "ASTRO_SHADOW_PUBLICATION_RECOVERY_MANIFEST_MISSING: rolled-back phase has no recovery manifest; remediation: preserve every byte".into()
+                })?;
+                let live = capture_artifact_generation(
+                    &sqlite_path(live_cache, project),
+                    &lowered_sqlite_path(live_cache, project),
+                    &vault_dir(live_cache, project),
+                )?;
+                let config_generation = read_config_value(
+                    live_cache,
+                    &metadata_key(project, SHADOW_PUBLICATION_GENERATION_KEY),
+                )?;
+                if live != manifest.prior || config_generation != manifest.prior_config_generation {
+                    return Err("ASTRO_SHADOW_PUBLICATION_RECOVERY_ROLLED_BACK_DRIFT: terminal rollback readback no longer equals the journal-bound prior generation; remediation: preserve every byte".into());
+                }
+            }
+            other => {
+                return Err(format!(
+                    "ASTRO_SHADOW_PUBLICATION_RECOVERY_PHASE_INVALID: phase {other:?} is not recoverable; remediation: preserve every byte and inspect the exact journal"
+                )
+                .into());
+            }
         }
         remove_transaction_tree(&transaction, project_root)?;
     }

@@ -28,6 +28,10 @@ pub(crate) const GIT_SOURCE_FINGERPRINT_KEY: &str = "git_source_fingerprint";
 /// Metadata key holding the absolute repo path whose git source fingerprint was recorded,
 /// so the read-path freshness gate can recompute it against the live tree (#347).
 pub(crate) const GIT_SOURCE_REPO_PATH_KEY: &str = "git_source_repo_path";
+/// Unique shadow-publication generation committed atomically with every
+/// project metadata row. Interrupted multi-artifact recovery uses this as the
+/// sole commit marker; file presence never decides whether config committed.
+pub(crate) const SHADOW_PUBLICATION_GENERATION_KEY: &str = "shadow_publication_generation";
 /// The required row-stream import failed. No alternate representation is
 /// accepted: it would hide the failed source and could publish incomplete
 /// kernel/provenance state.
@@ -3167,6 +3171,7 @@ pub(crate) fn persist_shadow_publication_at(
     dial: MigrationDial,
     sanitized_index_args: &str,
     staged_config_rows: &[(String, String)],
+    publication_generation: &str,
 ) -> Result<(), DynError> {
     let mut conn = open_config(cache_dir)?;
     let security_screen_json = serde_json::to_string(&outcome.security_screen)?;
@@ -3332,6 +3337,13 @@ pub(crate) fn persist_shadow_publication_at(
         params![
             metadata_key(project, SHADOW_INDEX_ARGS_KEY),
             sanitized_index_args
+        ],
+    )?;
+    tx.execute(
+        "INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)",
+        params![
+            metadata_key(project, SHADOW_PUBLICATION_GENERATION_KEY),
+            publication_generation
         ],
     )?;
     tx.commit()?;
