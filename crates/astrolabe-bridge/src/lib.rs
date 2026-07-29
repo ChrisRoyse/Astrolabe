@@ -2433,6 +2433,18 @@ impl CbmWatcher {
         Ok(())
     }
 
+    pub fn invalidate(&mut self, project_name: &str) -> Result<(), BridgeError> {
+        self.ensure_owner_thread()?;
+        validate_project_name(project_name)?;
+        let project_name = CString::new(project_name)?;
+        // SAFETY: watcher pointer is owned by self and thread-affine. The C
+        // string is live for the duration of the call.
+        unsafe {
+            cbm_sys::cbm_watcher_invalidate(self.ptr.as_ptr(), project_name.as_ptr());
+        }
+        Ok(())
+    }
+
     pub fn poll_once(&mut self) -> Result<i32, BridgeError> {
         self.ensure_owner_thread()?;
         self.callback_state.clear_last_error();
@@ -2599,6 +2611,159 @@ fn validate_project_name(value: &str) -> Result<(), BridgeError> {
     }
 }
 
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct CbmProjectQuiescence {
+    pub elapsed_ms: u64,
+    pub attempts: u64,
+    pub native_error: u64,
+    pub failed_path: String,
+}
+
+pub struct CbmProjectTransition {
+    ptr: Option<NonNull<cbm_sys::cbm_project_transition_t>>,
+    owner: ThreadId,
+    pub recovered_abandoned_owner: bool,
+    pub owner_process_start_utc_ticks: u64,
+    _not_send_or_sync: PhantomData<Rc<()>>,
+}
+
+impl CbmProjectTransition {
+    pub fn acquire(project: &str) -> Result<Self, BridgeError> {
+        validate_project_name(project)?;
+        let project = CString::new(project)?;
+        let mut recovered_abandoned_owner = false;
+        let mut owner_process_start_utc_ticks = 0;
+        let mut native_error = 0;
+        // SAFETY: all pointers refer to live, correctly sized values for the
+        // duration of the call. The returned owner is released by this RAII type.
+        let ptr = unsafe {
+            cbm_sys::cbm_project_transition_acquire(
+                project.as_ptr(),
+                &mut recovered_abandoned_owner,
+                &mut owner_process_start_utc_ticks,
+                &mut native_error,
+            )
+        };
+        Ok(Self {
+            ptr: Some(NonNull::new(ptr).ok_or_else(|| {
+                envelope(
+                    "ASTRO_PROJECT_TRANSITION_ACQUIRE_FAILED",
+                    format!(
+                        "the exact project transition could not be acquired (native_error={native_error})"
+                    ),
+                    "If native_error is ERROR_BUSY, let the reported generation finish; otherwise resolve the Windows named-mutex failure before retrying.",
+                )
+            })?),
+            owner: thread::current().id(),
+            recovered_abandoned_owner,
+            owner_process_start_utc_ticks,
+            _not_send_or_sync: PhantomData,
+        })
+    }
+
+    pub fn wait_store_quiescent(
+        &self,
+        db_path: &str,
+        timeout_ms: u32,
+        poll_ms: u32,
+    ) -> Result<CbmProjectQuiescence, BridgeError> {
+        self.ensure_owner_thread()?;
+        let db_path = CString::new(db_path)?;
+        // SAFETY: the bindgen record is a plain C POD initialized to zero.
+        let mut report: cbm_sys::cbm_project_quiescence_result_t = unsafe { std::mem::zeroed() };
+        // SAFETY: the transition remains owned by self, the C string and report
+        // are live for the call, and this is the acquiring thread.
+        let status = unsafe {
+            cbm_sys::cbm_project_transition_wait_store_quiescent(
+                self.ptr.expect("live project transition").as_ptr(),
+                db_path.as_ptr(),
+                timeout_ms.into(),
+                poll_ms.into(),
+                &mut report,
+            )
+        };
+        // SAFETY: native initialization zeroes the fixed buffer and all writes
+        // are bounded snprintf calls, so it always contains a terminating NUL.
+        let failed_path = unsafe { CStr::from_ptr(report.failed_path.as_ptr()) }
+            .to_string_lossy()
+            .into_owned();
+        let evidence = CbmProjectQuiescence {
+            elapsed_ms: report.elapsed_ms,
+            attempts: report.attempts,
+            native_error: report.native_error as u64,
+            failed_path,
+        };
+        match status {
+            0 => Ok(evidence),
+            1 => Err(envelope(
+                "ASTRO_PROJECT_TRANSITION_QUIESCENCE_TIMEOUT",
+                format!(
+                    "the canonical store family remained open after {} ms and {} exact probes (native_error={}, path={:?})",
+                    evidence.elapsed_ms,
+                    evidence.attempts,
+                    evidence.native_error,
+                    evidence.failed_path
+                ),
+                "Identify the process retaining the exact DB/WAL/SHM handle; do not terminate it or mutate the family, then retry after cooperative quiescence works.",
+            )),
+            other => Err(envelope(
+                "ASTRO_PROJECT_TRANSITION_QUIESCENCE_PROBE_FAILED",
+                format!(
+                    "canonical store-family quiescence probe failed with status {other}, native_error={}, path={:?}",
+                    evidence.native_error, evidence.failed_path
+                ),
+                "Resolve the structured Windows file-open failure before retrying the unchanged transition.",
+            )),
+        }
+    }
+
+    pub fn release(mut self) -> Result<(), BridgeError> {
+        self.ensure_owner_thread()?;
+        self.release_inner()
+    }
+
+    fn ensure_owner_thread(&self) -> Result<(), BridgeError> {
+        if thread::current().id() == self.owner {
+            Ok(())
+        } else {
+            Err(envelope(
+                "ASTRO_PROJECT_TRANSITION_THREAD_AFFINITY",
+                "project transition used from a different thread than its acquiring owner",
+                "Acquire, quiesce, complete, and release the transition on one thread.",
+            ))
+        }
+    }
+
+    fn release_inner(&mut self) -> Result<(), BridgeError> {
+        let Some(ptr) = self.ptr.take() else {
+            return Ok(());
+        };
+        let mut native_error = 0;
+        // SAFETY: ptr is the live C owner generation and is consumed exactly once.
+        let status =
+            unsafe { cbm_sys::cbm_project_transition_release(ptr.as_ptr(), &mut native_error) };
+        if status == 0 {
+            Ok(())
+        } else {
+            Err(envelope(
+                "ASTRO_PROJECT_TRANSITION_RELEASE_FAILED",
+                format!(
+                    "the exact project transition could not be released (native_error={native_error})"
+                ),
+                "Inspect the owner thread and durable transition receipt before retrying.",
+            ))
+        }
+    }
+}
+
+impl Drop for CbmProjectTransition {
+    fn drop(&mut self) {
+        if self.ptr.is_some() && self.release_inner().is_err() {
+            eprintln!("code=ASTRO_PROJECT_TRANSITION_RELEASE_FAILED message=drop_release_failed");
+        }
+    }
+}
+
 pub struct CbmToolRunner {
     ptr: NonNull<cbm_sys::cbm_mcp_server_t>,
     owner: ThreadId,
@@ -2658,6 +2823,39 @@ impl CbmToolRunner {
             );
             take_c_string(ptr)
         }
+    }
+
+    /// Cooperatively closes this runner's exact cached project store when a
+    /// different thread/process owns the root-derived Astrolabe publication
+    /// transition. The C server remains thread-affine: resident dispatch calls
+    /// this from the same owner thread between requests.
+    pub fn quiesce_project_transition(&self) -> Result<bool, BridgeError> {
+        self.ensure_owner_thread()?;
+        // SAFETY: `self.ptr` is uniquely owned and this method is restricted to
+        // the runner's owner thread. The native function performs no callbacks.
+        let status =
+            unsafe { cbm_sys::cbm_mcp_server_quiesce_project_transition(self.ptr.as_ptr()) };
+        match status {
+            0 => Ok(false),
+            1 => Ok(true),
+            other => Err(envelope(
+                "ASTRO_CBM_PROJECT_TRANSITION_PROBE_FAILED",
+                format!(
+                    "native resident transition probe returned status {other}; the cached store was closed"
+                ),
+                "Inspect the structured native named-mutex diagnostic and resolve it before reopening the project.",
+            )),
+        }
+    }
+
+    /// Close any named project store cached by this exact runner before its
+    /// owner thread publishes a writer transition. A zero timeout is an exact
+    /// eviction request; the initial anonymous in-memory store remains exempt.
+    pub fn close_cached_project_store(&self) -> Result<(), BridgeError> {
+        self.ensure_owner_thread()?;
+        // SAFETY: `self.ptr` is uniquely owned and called on its owner thread.
+        unsafe { cbm_sys::cbm_mcp_server_evict_idle(self.ptr.as_ptr(), 0) };
+        Ok(())
     }
 
     pub fn handle_index_repository_with_rows(

@@ -291,18 +291,32 @@ pub const WATCHER_MIN_POLL_INTERVAL_MS: u64 = 50;
 /// Largest legal cadence. One second leaves four seconds of the hard five-second
 /// product budget for the actual incremental work.
 pub const WATCHER_MAX_POLL_INTERVAL_MS: u64 = 1_000;
+/// Bounded writer-admission window for cooperative resident SQLite closure.
+pub const PROJECT_TRANSITION_QUIESCENCE_TIMEOUT_MS: u64 = 5_000;
 
 /// The server-owned incremental watcher knob registry (#23).
-pub const WATCHER_KNOBS: &[U64KnobDeclaration] = &[U64KnobDeclaration {
-    registry_version: WATCHER_KNOB_REGISTRY_VERSION,
-    name: WATCHER_POLL_INTERVAL_MS_KNOB,
-    default: WATCHER_DEFAULT_POLL_INTERVAL_MS,
-    min: WATCHER_MIN_POLL_INTERVAL_MS,
-    max: WATCHER_MAX_POLL_INTERVAL_MS,
-    unit: "milliseconds",
-    source: "ASTROLABE #23 five-second M-scale convergence budget",
-    rationale: "server-owned detection cadence: 250ms spends 5% of the hard five-second convergence budget on detection and leaves 95% for changed-file extraction, vault convergence, derived projections, and lowered-SQLite readback; bounds prevent both process storms and budget exhaustion",
-}];
+pub const WATCHER_KNOBS: &[U64KnobDeclaration] = &[
+    U64KnobDeclaration {
+        registry_version: WATCHER_KNOB_REGISTRY_VERSION,
+        name: WATCHER_POLL_INTERVAL_MS_KNOB,
+        default: WATCHER_DEFAULT_POLL_INTERVAL_MS,
+        min: WATCHER_MIN_POLL_INTERVAL_MS,
+        max: WATCHER_MAX_POLL_INTERVAL_MS,
+        unit: "milliseconds",
+        source: "ASTROLABE #23 five-second M-scale convergence budget",
+        rationale: "server-owned detection cadence: 250ms spends 5% of the hard five-second convergence budget on detection and leaves 95% for changed-file extraction, vault convergence, derived projections, and lowered-SQLite readback; bounds prevent both process storms and budget exhaustion",
+    },
+    U64KnobDeclaration {
+        registry_version: WATCHER_KNOB_REGISTRY_VERSION,
+        name: "project_transition_quiescence_timeout_ms",
+        default: PROJECT_TRANSITION_QUIESCENCE_TIMEOUT_MS,
+        min: WATCHER_DEFAULT_POLL_INTERVAL_MS,
+        max: 30_000,
+        unit: "milliseconds",
+        source: "ASTROLABE #753 resident-client cooperative SQLite quiescence contract",
+        rationale: "allows twenty resident coordination observations at the 250ms shipping cadence before writer admission fails closed; it is bounded so a foreign or broken handle produces an exact diagnostic instead of an unbounded index request",
+    },
+];
 
 /// Returns the watcher declaration for `name`, or `None` when undeclared.
 pub fn watcher_knob(name: &str) -> Option<&'static U64KnobDeclaration> {

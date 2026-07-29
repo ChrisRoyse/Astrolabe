@@ -628,6 +628,21 @@ void cbm_watcher_touch(cbm_watcher_t *w, const char *project_name) {
     cbm_mutex_unlock(&w->projects_lock);
 }
 
+void cbm_watcher_invalidate(cbm_watcher_t *w, const char *project_name) {
+    if (!w || !project_name) {
+        return;
+    }
+    cbm_mutex_lock(&w->projects_lock);
+    project_state_t *s = cbm_ht_get(w->projects, project_name);
+    if (s) {
+        /* A SHA-256 worktree fingerprint is exactly 64 lowercase hex bytes;
+         * this non-hex sentinel can never equal a real observation. */
+        snprintf(s->worktree_sha256, sizeof(s->worktree_sha256), "%s", "invalidated");
+        s->next_poll_ns = 0;
+    }
+    cbm_mutex_unlock(&w->projects_lock);
+}
+
 int cbm_watcher_watch_count(cbm_watcher_t *w) {
     if (!w) {
         return 0;

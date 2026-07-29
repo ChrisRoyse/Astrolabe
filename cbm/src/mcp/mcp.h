@@ -120,6 +120,14 @@ char *cbm_mcp_get_arguments(const char *params_json);
 /* ── MCP Server ───────────────────────────────────────────────── */
 
 typedef struct cbm_mcp_server cbm_mcp_server_t;
+typedef struct cbm_project_transition cbm_project_transition_t;
+
+typedef struct {
+    uint64_t elapsed_ms;
+    uint64_t attempts;
+    unsigned long native_error;
+    char failed_path[1024];
+} cbm_project_quiescence_result_t;
 
 /* Create an MCP server. store_path is the SQLite database directory. */
 cbm_mcp_server_t *cbm_mcp_server_new(const char *store_path);
@@ -184,6 +192,23 @@ char *cbm_mcp_index_repository_supervised_strict(cbm_mcp_server_t *srv, const ch
  * Protects initial in-memory stores (those never accessed via a named project).
  * Called automatically by the event loop on poll() timeout. */
 void cbm_mcp_server_evict_idle(cbm_mcp_server_t *srv, int timeout_s);
+
+/* Close the exact cached project store when another thread/process owns the
+ * Astrolabe project transition. Returns 1 when quiesced, 0 when inactive/no
+ * named store is cached, and -1 when transition state is unevaluable. */
+int cbm_mcp_server_quiesce_project_transition(cbm_mcp_server_t *srv);
+
+/* Exact Windows owner generation used by the Rust publication wrapper. The
+ * transition is thread-owned and must be released on the acquiring thread. */
+cbm_project_transition_t *cbm_project_transition_acquire(const char *project,
+                                                         bool *recovered_abandoned_owner,
+                                                         uint64_t *owner_process_start_utc_ticks,
+                                                         unsigned long *native_error);
+int cbm_project_transition_wait_store_quiescent(
+    cbm_project_transition_t *transition, const char *db_path, unsigned long timeout_ms,
+    unsigned long poll_ms, cbm_project_quiescence_result_t *result);
+int cbm_project_transition_release(cbm_project_transition_t *transition,
+                                   unsigned long *native_error);
 
 /* Check if the server currently has a cached store open. */
 bool cbm_mcp_server_has_cached_store(cbm_mcp_server_t *srv);

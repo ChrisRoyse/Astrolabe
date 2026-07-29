@@ -1303,6 +1303,9 @@ struct cbm_mcp_server {
     char store_error_canonical_root[CBM_STORE_VERIFY_PATH_MAX];
     char store_error_canonical_project[CBM_SZ_1K];
     char store_error_canonical_db_path[CBM_STORE_VERIFY_PATH_MAX];
+    char transition_error_code[CBM_SZ_64];
+    char transition_error_project[CBM_SZ_256];
+    DWORD transition_native_error;
     char update_notice[CBM_SZ_256]; /* one-shot update notice, cleared after first injection */
     bool update_checked;            /* true after background check has been launched */
     cbm_thread_t update_tid;        /* background update check thread */
@@ -1327,6 +1330,291 @@ struct cbm_mcp_server {
     cbm_pipeline_row_sink_v1_t row_sink;
     bool row_sink_active;
 };
+
+typedef enum {
+    CBM_PROJECT_TRANSITION_INACTIVE = 0,
+    CBM_PROJECT_TRANSITION_ACTIVE = 1,
+    CBM_PROJECT_TRANSITION_PROBE_FAILED = -1,
+} cbm_project_transition_state_t;
+
+struct cbm_project_transition {
+    HANDLE mutex;
+    char project[CBM_SZ_256];
+};
+
+static bool project_transition_mutex_name(const char *project, wchar_t *name, size_t name_count) {
+    if (!project || !cbm_validate_project_name(project) || !name || name_count == 0) {
+        return false;
+    }
+    char digest[CBM_SHA256_HEX_LEN + 1];
+    cbm_sha256_hex(project, strlen(project), digest);
+    int wrote = swprintf(name, name_count, L"Global\\Astrolabe.ProjectTransition.v1.%hs", digest);
+    return wrote > 0 && (size_t)wrote < name_count;
+}
+
+static cbm_project_transition_state_t probe_project_transition(const char *project,
+                                                               DWORD *native_error) {
+    if (native_error) {
+        *native_error = ERROR_SUCCESS;
+    }
+    if (!project || !cbm_validate_project_name(project)) {
+        if (native_error) {
+            *native_error = ERROR_INVALID_PARAMETER;
+        }
+        return CBM_PROJECT_TRANSITION_PROBE_FAILED;
+    }
+#ifdef _WIN32
+    wchar_t mutex_name[CBM_SZ_128];
+    if (!project_transition_mutex_name(project, mutex_name, CBM_SZ_128)) {
+        if (native_error) {
+            *native_error = ERROR_BUFFER_OVERFLOW;
+        }
+        return CBM_PROJECT_TRANSITION_PROBE_FAILED;
+    }
+    HANDLE mutex = CreateMutexW(NULL, FALSE, mutex_name);
+    if (!mutex) {
+        if (native_error) {
+            *native_error = GetLastError();
+        }
+        return CBM_PROJECT_TRANSITION_PROBE_FAILED;
+    }
+    DWORD wait = WaitForSingleObject(mutex, 0);
+    if (wait == WAIT_TIMEOUT) {
+        CloseHandle(mutex);
+        return CBM_PROJECT_TRANSITION_ACTIVE;
+    }
+    if (wait == WAIT_OBJECT_0 || wait == WAIT_ABANDONED) {
+        bool release_ok = ReleaseMutex(mutex) != 0;
+        DWORD release_error = release_ok ? ERROR_SUCCESS : GetLastError();
+        CloseHandle(mutex);
+        if (!release_ok) {
+            if (native_error) {
+                *native_error = release_error;
+            }
+            return CBM_PROJECT_TRANSITION_PROBE_FAILED;
+        }
+        if (wait == WAIT_ABANDONED) {
+            cbm_log_warn("project.transition.recovered", "project", project, "state",
+                         "abandoned_owner_released");
+        }
+        return CBM_PROJECT_TRANSITION_INACTIVE;
+    }
+    if (native_error) {
+        *native_error = GetLastError();
+    }
+    CloseHandle(mutex);
+    return CBM_PROJECT_TRANSITION_PROBE_FAILED;
+#else
+    if (native_error) {
+        *native_error = ERROR_NOT_SUPPORTED;
+    }
+    return CBM_PROJECT_TRANSITION_PROBE_FAILED;
+#endif
+}
+
+cbm_project_transition_t *cbm_project_transition_acquire(const char *project,
+                                                         bool *recovered_abandoned_owner,
+                                                         uint64_t *owner_process_start_utc_ticks,
+                                                         unsigned long *native_error) {
+    if (recovered_abandoned_owner) {
+        *recovered_abandoned_owner = false;
+    }
+    if (native_error) {
+        *native_error = ERROR_SUCCESS;
+    }
+    if (owner_process_start_utc_ticks) {
+        *owner_process_start_utc_ticks = 0;
+    }
+#ifdef _WIN32
+    FILETIME creation = {0};
+    FILETIME exit = {0};
+    FILETIME kernel = {0};
+    FILETIME user = {0};
+    if (!owner_process_start_utc_ticks ||
+        !GetProcessTimes(GetCurrentProcess(), &creation, &exit, &kernel, &user)) {
+        if (native_error) {
+            *native_error = GetLastError();
+        }
+        return NULL;
+    }
+    *owner_process_start_utc_ticks =
+        ((uint64_t)creation.dwHighDateTime << 32) | creation.dwLowDateTime;
+    wchar_t mutex_name[CBM_SZ_128];
+    if (!project_transition_mutex_name(project, mutex_name, CBM_SZ_128)) {
+        if (native_error) {
+            *native_error = ERROR_INVALID_PARAMETER;
+        }
+        return NULL;
+    }
+    cbm_project_transition_t *transition = calloc(CBM_ALLOC_ONE, sizeof(*transition));
+    if (!transition) {
+        if (native_error) {
+            *native_error = ERROR_NOT_ENOUGH_MEMORY;
+        }
+        return NULL;
+    }
+    transition->mutex = CreateMutexW(NULL, FALSE, mutex_name);
+    if (!transition->mutex) {
+        if (native_error) {
+            *native_error = GetLastError();
+        }
+        free(transition);
+        return NULL;
+    }
+    DWORD wait = WaitForSingleObject(transition->mutex, 0);
+    if (wait != WAIT_OBJECT_0 && wait != WAIT_ABANDONED) {
+        if (native_error) {
+            *native_error = wait == WAIT_TIMEOUT ? ERROR_BUSY : GetLastError();
+        }
+        CloseHandle(transition->mutex);
+        free(transition);
+        return NULL;
+    }
+    snprintf(transition->project, sizeof(transition->project), "%s", project);
+    if (recovered_abandoned_owner) {
+        *recovered_abandoned_owner = wait == WAIT_ABANDONED;
+    }
+    return transition;
+#else
+    (void)project;
+    if (native_error) {
+        *native_error = ERROR_NOT_SUPPORTED;
+    }
+    return NULL;
+#endif
+}
+
+#ifdef _WIN32
+static HANDLE project_transition_open_exclusive(const char *path, DWORD *native_error,
+                                                bool *present) {
+    *present = false;
+    wchar_t *wide = cbm_utf8_to_wide_path(path);
+    if (!wide) {
+        *native_error = ERROR_NO_UNICODE_TRANSLATION;
+        return INVALID_HANDLE_VALUE;
+    }
+    HANDLE handle = CreateFileW(wide, GENERIC_READ, 0, NULL, OPEN_EXISTING,
+                                FILE_ATTRIBUTE_NORMAL, NULL);
+    DWORD error = handle == INVALID_HANDLE_VALUE ? GetLastError() : ERROR_SUCCESS;
+    free(wide);
+    if (handle == INVALID_HANDLE_VALUE &&
+        (error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND)) {
+        return NULL;
+    }
+    if (handle == INVALID_HANDLE_VALUE) {
+        *native_error = error;
+        return INVALID_HANDLE_VALUE;
+    }
+    *present = true;
+    return handle;
+}
+#endif
+
+int cbm_project_transition_wait_store_quiescent(
+    cbm_project_transition_t *transition, const char *db_path, unsigned long timeout_ms,
+    unsigned long poll_ms, cbm_project_quiescence_result_t *result) {
+    if (result) {
+        memset(result, 0, sizeof(*result));
+    }
+    if (!transition || !transition->mutex || !db_path || !db_path[0] || poll_ms == 0 || !result) {
+        if (result) {
+            result->native_error = ERROR_INVALID_PARAMETER;
+        }
+        return -1;
+    }
+#ifdef _WIN32
+    uint64_t started = cbm_now_ms();
+    char wal_path[CBM_STORE_VERIFY_PATH_MAX];
+    char shm_path[CBM_STORE_VERIFY_PATH_MAX];
+    int wal_len = snprintf(wal_path, sizeof(wal_path), "%s-wal", db_path);
+    int shm_len = snprintf(shm_path, sizeof(shm_path), "%s-shm", db_path);
+    if (wal_len < 0 || (size_t)wal_len >= sizeof(wal_path) || shm_len < 0 ||
+        (size_t)shm_len >= sizeof(shm_path)) {
+        result->native_error = ERROR_BUFFER_OVERFLOW;
+        return -1;
+    }
+    const char *members[] = {db_path, wal_path, shm_path};
+    for (;;) {
+        result->attempts++;
+        HANDLE held[3] = {NULL, NULL, NULL};
+        bool retry = false;
+        for (size_t i = 0; i < 3; i++) {
+            DWORD member_error = ERROR_SUCCESS;
+            bool present = false;
+            HANDLE handle =
+                project_transition_open_exclusive(members[i], &member_error, &present);
+            if (handle == INVALID_HANDLE_VALUE) {
+                snprintf(result->failed_path, sizeof(result->failed_path), "%s", members[i]);
+                result->native_error = member_error;
+                retry = member_error == ERROR_SHARING_VIOLATION ||
+                        member_error == ERROR_LOCK_VIOLATION;
+                break;
+            }
+            held[i] = present ? handle : NULL;
+        }
+        for (size_t i = 0; i < 3; i++) {
+            if (held[i]) {
+                CloseHandle(held[i]);
+            }
+        }
+        result->elapsed_ms = cbm_now_ms() - started;
+        if (result->native_error == ERROR_SUCCESS) {
+            return 0;
+        }
+        if (!retry) {
+            return -1;
+        }
+        if (result->elapsed_ms >= timeout_ms) {
+            return 1;
+        }
+        Sleep(poll_ms);
+        result->native_error = ERROR_SUCCESS;
+        result->failed_path[0] = '\0';
+    }
+#else
+    (void)db_path;
+    (void)timeout_ms;
+    (void)poll_ms;
+    result->native_error = ERROR_NOT_SUPPORTED;
+    return -1;
+#endif
+}
+
+int cbm_project_transition_release(cbm_project_transition_t *transition,
+                                   unsigned long *native_error) {
+    if (native_error) {
+        *native_error = ERROR_SUCCESS;
+    }
+    if (!transition || !transition->mutex) {
+        if (native_error) {
+            *native_error = ERROR_INVALID_PARAMETER;
+        }
+        return -1;
+    }
+    bool released = ReleaseMutex(transition->mutex) != 0;
+    DWORD error = released ? ERROR_SUCCESS : GetLastError();
+    CloseHandle(transition->mutex);
+    transition->mutex = NULL;
+    free(transition);
+    if (!released) {
+        if (native_error) {
+            *native_error = error;
+        }
+        return -1;
+    }
+    return 0;
+}
+
+static void record_project_transition_state(cbm_mcp_server_t *srv, const char *project,
+                                            cbm_project_transition_state_t state,
+                                            DWORD native_error) {
+    snprintf(srv->transition_error_project, sizeof(srv->transition_error_project), "%s",
+             project ? project : "");
+    srv->transition_native_error = native_error;
+    snprintf(srv->transition_error_code, sizeof(srv->transition_error_code), "%s",
+             state == CBM_PROJECT_TRANSITION_ACTIVE ? "CBM_PROJECT_TRANSITION_ACTIVE"
+                                                    : "CBM_PROJECT_TRANSITION_PROBE_FAILED");
+}
 
 cbm_mcp_server_t *cbm_mcp_server_new(const char *store_path) {
     cbm_mcp_server_t *srv = calloc(CBM_ALLOC_ONE, sizeof(*srv));
@@ -1448,6 +1736,41 @@ void cbm_mcp_server_evict_idle(cbm_mcp_server_t *srv, int timeout_s) {
     srv->store_last_used = 0;
 }
 
+int cbm_mcp_server_quiesce_project_transition(cbm_mcp_server_t *srv) {
+    if (!srv || !srv->store || !srv->current_project || srv->store_last_used == 0) {
+        return 0;
+    }
+    char project[CBM_SZ_256];
+    snprintf(project, sizeof(project), "%s", srv->current_project);
+    DWORD native_error = ERROR_SUCCESS;
+    cbm_project_transition_state_t state = probe_project_transition(project, &native_error);
+    if (state == CBM_PROJECT_TRANSITION_INACTIVE) {
+        return 0;
+    }
+    if (srv->owns_store) {
+        cbm_store_close(srv->store);
+    }
+    srv->store = NULL;
+    srv->owns_store = false;
+    free(srv->current_project);
+    srv->current_project = NULL;
+    srv->store_last_used = 0;
+    record_project_transition_state(srv, project, state, native_error);
+    char native_error_text[CBM_SZ_32];
+    snprintf(native_error_text, sizeof(native_error_text), "%lu", (unsigned long)native_error);
+    if (state == CBM_PROJECT_TRANSITION_ACTIVE) {
+        cbm_log_info("project.transition.quiesced", "project", project, "cached_store_closed",
+                     "true");
+        return 1;
+    }
+    cbm_log_error("project.transition.probe_failed", "code",
+                  "CBM_PROJECT_TRANSITION_PROBE_FAILED", "project", project,
+                  "native_error_kind", "win32", "native_error", native_error_text, "message",
+                  "the resident query store closed because transition ownership was unevaluable",
+                  "remediation", "resolve the named-mutex failure before reopening the project");
+    return -1;
+}
+
 bool cbm_mcp_server_has_cached_store(cbm_mcp_server_t *srv) {
     return (srv && srv->store != NULL) != 0;
 }
@@ -1516,6 +1839,9 @@ static void reset_store_error_state(cbm_mcp_server_t *srv) {
     srv->store_error_wal_path[0] = '\0';
     srv->store_error_shm_path[0] = '\0';
     clear_store_identity_error_state(srv);
+    srv->transition_error_code[0] = '\0';
+    srv->transition_error_project[0] = '\0';
+    srv->transition_native_error = ERROR_SUCCESS;
 }
 
 static bool store_error_is_provenance(const cbm_store_verify_result_t *verification) {
@@ -1711,6 +2037,22 @@ static cbm_store_t *resolve_store(cbm_mcp_server_t *srv, const char *project) {
 
     if (!project) {
         return NULL; /* project is required — no implicit fallback */
+    }
+
+    DWORD transition_native_error = ERROR_SUCCESS;
+    cbm_project_transition_state_t transition =
+        probe_project_transition(project, &transition_native_error);
+    if (transition != CBM_PROJECT_TRANSITION_INACTIVE) {
+        if (srv->owns_store && srv->store) {
+            cbm_store_close(srv->store);
+        }
+        srv->store = NULL;
+        srv->owns_store = false;
+        free(srv->current_project);
+        srv->current_project = NULL;
+        srv->store_last_used = 0;
+        record_project_transition_state(srv, project, transition, transition_native_error);
+        return NULL;
     }
 
     srv->store_last_used = time(NULL);
@@ -2080,6 +2422,34 @@ static char *build_store_verification_failed_error(const cbm_mcp_server_t *srv) 
 }
 
 static char *build_no_store_error(cbm_mcp_server_t *srv, const char *project) {
+    if (srv && project && srv->transition_error_code[0] &&
+        strcmp(srv->transition_error_project, project) == 0) {
+        yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+        if (!doc) {
+            return heap_strdup("{\"code\":\"CBM_PROJECT_TRANSITION_RESPONSE_ALLOC_FAILED\",\"message\":\"the exact project transition refusal could not be serialized\",\"remediation\":\"free memory and retry the unchanged request\"}");
+        }
+        yyjson_mut_val *root = yyjson_mut_obj(doc);
+        yyjson_mut_doc_set_root(doc, root);
+        yyjson_mut_obj_add_str(doc, root, "code", srv->transition_error_code);
+        yyjson_mut_obj_add_str(doc, root, "project", project);
+        yyjson_mut_obj_add_int(doc, root, "native_error",
+                               (int64_t)srv->transition_native_error);
+        yyjson_mut_obj_add_bool(doc, root, "cached_store_closed", true);
+        yyjson_mut_obj_add_bool(doc, root, "reopen_attempted", false);
+        yyjson_mut_obj_add_str(
+            doc, root, "message",
+            strcmp(srv->transition_error_code, "CBM_PROJECT_TRANSITION_ACTIVE") == 0
+                ? "the exact project has an active index/publication transition"
+                : "the exact project transition state could not be evaluated");
+        yyjson_mut_obj_add_str(
+            doc, root, "remediation",
+            strcmp(srv->transition_error_code, "CBM_PROJECT_TRANSITION_ACTIVE") == 0
+                ? "retry after the exact transition publishes its terminal durable state"
+                : "resolve the structured Windows named-mutex failure before retrying");
+        char *json = yyjson_mut_write(doc, 0, NULL);
+        yyjson_mut_doc_free(doc);
+        return json ? json : heap_strdup("{\"code\":\"CBM_PROJECT_TRANSITION_RESPONSE_ALLOC_FAILED\"}");
+    }
     if (srv && project && strcmp(srv->store_error_project, project) == 0) {
         if (store_error_is_provenance(&srv->store_verify)) {
             return build_provenance_failed_error(srv);

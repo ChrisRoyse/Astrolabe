@@ -48,6 +48,9 @@ void cbm_watcher_unwatch(cbm_watcher_t *w, const char *project_name);
 
 /* Refresh a project's timestamp (resets adaptive backoff). */
 void cbm_watcher_touch(cbm_watcher_t *w, const char *project_name);
+/* Force one callback on the next due poll even when Git bytes are unchanged.
+ * Used when the exact store/config observation that caused a durable fault moves. */
+void cbm_watcher_invalidate(cbm_watcher_t *w, const char *project_name);
 
 /* ── Polling ────────────────────────────────────────────────────── */
 

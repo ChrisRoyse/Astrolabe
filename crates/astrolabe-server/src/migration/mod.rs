@@ -88,6 +88,9 @@ use config_store::*;
 mod locks;
 use locks::*;
 
+mod project_transition;
+use project_transition::*;
+
 mod tool_defs;
 use tool_defs::*;
 

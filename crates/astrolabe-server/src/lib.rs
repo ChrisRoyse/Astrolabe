@@ -227,11 +227,128 @@ fn run_server() -> Result<i32, DynError> {
     let _incremental_watcher_loop = IncrementalWatcherLoop::start();
     tracing::info!("server.start version={}", env!("CARGO_PKG_VERSION"));
     let runner = CbmToolRunner::new_default()?;
-    let stdin = io::stdin();
-    let stdout = io::stdout();
-    serve_jsonrpc(&runner, stdin.lock(), stdout.lock())?;
+    serve_resident_jsonrpc(&runner)?;
     tracing::info!("server.shutdown");
     Ok(0)
+}
+
+#[derive(Debug)]
+struct ResidentJsonrpcFrame {
+    request: String,
+    content_length_framed: bool,
+}
+
+#[derive(Debug)]
+enum ResidentInput {
+    Frame(ResidentJsonrpcFrame),
+    Eof,
+    Failed(String),
+}
+
+/// Shipping resident transport. A dedicated reader may block on the client's
+/// stdin pipe, while the thread-affine CBM owner keeps a real coordination
+/// clock and can close an affected cached SQLite store between requests.
+fn serve_resident_jsonrpc(runner: &CbmToolRunner) -> Result<(), DynError> {
+    use std::sync::mpsc::{RecvTimeoutError, sync_channel};
+
+    // Capacity one preserves the original sequential backpressure: at most one
+    // complete request can wait while the owner executes the current request.
+    let (sender, receiver) = sync_channel::<ResidentInput>(1);
+    thread::Builder::new()
+        .name("astrolabe-stdio-reader".to_string())
+        .spawn(move || {
+            let stdin = io::stdin();
+            let mut reader = stdin.lock();
+            loop {
+                match read_jsonrpc_frame(&mut reader) {
+                    Ok(Some(frame)) => {
+                        if sender.send(ResidentInput::Frame(frame)).is_err() {
+                            return;
+                        }
+                    }
+                    Ok(None) => {
+                        let _ = sender.send(ResidentInput::Eof);
+                        return;
+                    }
+                    Err(error) => {
+                        let _ = sender.send(ResidentInput::Failed(error.to_string()));
+                        return;
+                    }
+                }
+            }
+        })?;
+
+    let stdout = io::stdout();
+    let mut writer = stdout.lock();
+    let cadence = Duration::from_millis(astrolabe_domain::knobs::WATCHER_DEFAULT_POLL_INTERVAL_MS);
+    loop {
+        match receiver.recv_timeout(cadence) {
+            Ok(ResidentInput::Frame(frame)) => {
+                if runner.quiesce_project_transition()? {
+                    tracing::info!("server.project_transition_quiesced");
+                }
+                if let Some(response) = dispatch_jsonrpc_request(&frame.request, &mut |request| {
+                    migration::handle_jsonrpc_raw(runner, request)
+                })? {
+                    if frame.content_length_framed {
+                        write!(
+                            writer,
+                            "Content-Length: {}\r\n\r\n{}",
+                            response.len(),
+                            response
+                        )?;
+                    } else {
+                        writeln!(writer, "{response}")?;
+                    }
+                    writer.flush()?;
+                }
+            }
+            Ok(ResidentInput::Eof) => return Ok(()),
+            Ok(ResidentInput::Failed(error)) => {
+                return Err(format!(
+                    "ASTRO_RESIDENT_STDIN_READ_FAILED: {error}; remediation: inspect the MCP client's stdin pipe and framing"
+                )
+                .into());
+            }
+            Err(RecvTimeoutError::Timeout) => {
+                if runner.quiesce_project_transition()? {
+                    tracing::info!("server.project_transition_quiesced");
+                }
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+                return Err("ASTRO_RESIDENT_STDIN_READER_DISCONNECTED: the owner lost its stdin reader without EOF or a structured read failure; remediation: inspect the reader thread failure and reconnect the MCP client".into());
+            }
+        }
+    }
+}
+
+fn read_jsonrpc_frame<R: BufRead>(
+    reader: &mut R,
+) -> Result<Option<ResidentJsonrpcFrame>, DynError> {
+    let mut line = String::new();
+    loop {
+        line.clear();
+        if reader.read_line(&mut line)? == 0 {
+            return Ok(None);
+        }
+        trim_line_ending(&mut line);
+        if line.is_empty() {
+            continue;
+        }
+        if let Some(content_len) = parse_content_length(&line)? {
+            read_content_headers(reader)?;
+            let mut body = vec![0_u8; content_len];
+            reader.read_exact(&mut body)?;
+            return Ok(Some(ResidentJsonrpcFrame {
+                request: String::from_utf8(body)?,
+                content_length_framed: true,
+            }));
+        }
+        return Ok(Some(ResidentJsonrpcFrame {
+            request: line.clone(),
+            content_length_framed: false,
+        }));
+    }
 }
 
 pub fn serve_jsonrpc<R, W>(runner: &CbmToolRunner, reader: R, writer: W) -> Result<(), DynError>

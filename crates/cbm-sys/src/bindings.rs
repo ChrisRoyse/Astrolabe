@@ -2073,6 +2073,29 @@ pub struct cbm_mcp_server {
     _unused: [u8; 0],
 }
 pub type cbm_mcp_server_t = cbm_mcp_server;
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct cbm_project_transition {
+    _unused: [u8; 0],
+}
+pub type cbm_project_transition_t = cbm_project_transition;
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct cbm_project_quiescence_result_t {
+    pub elapsed_ms: u64,
+    pub attempts: u64,
+    pub native_error: ::std::os::raw::c_ulong,
+    pub failed_path: [::std::os::raw::c_char; 1024usize],
+}
+impl Default for cbm_project_quiescence_result_t {
+    fn default() -> Self {
+        let mut s = ::std::mem::MaybeUninit::<Self>::uninit();
+        unsafe {
+            ::std::ptr::write_bytes(s.as_mut_ptr(), 0, 1);
+            s.assume_init()
+        }
+    }
+}
 unsafe extern "C" {
     pub fn cbm_mcp_server_new(store_path: *const ::std::os::raw::c_char) -> *mut cbm_mcp_server_t;
 }
@@ -2117,6 +2140,34 @@ unsafe extern "C" {
 }
 unsafe extern "C" {
     pub fn cbm_mcp_server_evict_idle(srv: *mut cbm_mcp_server_t, timeout_s: ::std::os::raw::c_int);
+}
+unsafe extern "C" {
+    pub fn cbm_mcp_server_quiesce_project_transition(
+        srv: *mut cbm_mcp_server_t,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn cbm_project_transition_acquire(
+        project: *const ::std::os::raw::c_char,
+        recovered_abandoned_owner: *mut bool,
+        owner_process_start_utc_ticks: *mut u64,
+        native_error: *mut ::std::os::raw::c_ulong,
+    ) -> *mut cbm_project_transition_t;
+}
+unsafe extern "C" {
+    pub fn cbm_project_transition_wait_store_quiescent(
+        transition: *mut cbm_project_transition_t,
+        db_path: *const ::std::os::raw::c_char,
+        timeout_ms: ::std::os::raw::c_ulong,
+        poll_ms: ::std::os::raw::c_ulong,
+        result: *mut cbm_project_quiescence_result_t,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn cbm_project_transition_release(
+        transition: *mut cbm_project_transition_t,
+        native_error: *mut ::std::os::raw::c_ulong,
+    ) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {
     pub fn cbm_mcp_server_has_cached_store(srv: *mut cbm_mcp_server_t) -> bool;
@@ -3861,6 +3912,12 @@ unsafe extern "C" {
 }
 unsafe extern "C" {
     pub fn cbm_watcher_touch(w: *mut cbm_watcher_t, project_name: *const ::std::os::raw::c_char);
+}
+unsafe extern "C" {
+    pub fn cbm_watcher_invalidate(
+        w: *mut cbm_watcher_t,
+        project_name: *const ::std::os::raw::c_char,
+    );
 }
 unsafe extern "C" {
     pub fn cbm_watcher_poll_once(w: *mut cbm_watcher_t) -> ::std::os::raw::c_int;
