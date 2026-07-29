@@ -411,7 +411,7 @@ pub(crate) fn handle_index_repository(
         }
         if let (Some(project), Some(repo_path)) = (project.as_deref(), repo_path.as_deref()) {
             let cache_dir = astrolabe_bridge::cbm_cache_dir()?;
-            return run_project_index_transition(runner, &cache_dir, project, repo_path, || {
+            return run_project_index_transition(runner, &cache_dir, project, repo_path, |_| {
                 Ok(runner.handle_tool_raw("index_repository", args_json)?)
             });
         }
@@ -446,7 +446,7 @@ pub(crate) fn handle_index_repository(
         let result =
             if let (Some(project), Some(repo_path)) = (project.as_deref(), repo_path.as_deref()) {
                 let cache_dir = astrolabe_bridge::cbm_cache_dir()?;
-                run_project_index_transition(runner, &cache_dir, project, repo_path, || {
+                run_project_index_transition(runner, &cache_dir, project, repo_path, |_| {
                     Ok(runner.handle_tool_raw("index_repository", &sanitized_args)?)
                 })?
             } else {
@@ -486,120 +486,140 @@ pub(crate) fn handle_index_repository(
     let transition_root = repo_path.as_deref().ok_or_else(|| -> DynError {
         "ASTRO_PROJECT_TRANSITION_ROOT_REQUIRED: shadow indexing requires repo_path for exact transition identity; remediation: pass the canonical repository root".into()
     })?;
-    run_project_index_transition(runner, &cache_dir, &project, transition_root, || {
-        let Some(_shadow_import_lock) = try_shadow_import_lock(&cache_dir, &project)? else {
-            return tool_error_result(format!(
-                "ASTRO_SHADOW_IMPORT_BUSY: a shadow publication for project {project:?} is already active at {}; remediation: retry after that exact owner completes",
-                shadow_import_lock_path(&cache_dir, &project).display()
-            ));
-        };
-        let shadow_started = std::time::Instant::now();
-        let stage_started = std::time::Instant::now();
-        let publication = ShadowPublication::begin(&cache_dir, &project)?;
-        eprintln!(
-            "astro.shadow.index_phase phase=stage_seed elapsed_ms={} total_ms={}",
-            stage_started.elapsed().as_millis(),
-            shadow_started.elapsed().as_millis()
-        );
-        let staged_args = match shadow_worker_args(&sanitized_args, publication.stage_cache()) {
-            Ok(args) => args,
-            Err(error) => return Err(publication.abort("worker argument binding", error)),
-        };
-        let pass = match run_shadow_index_pass(
-            runner,
-            &staged_args,
-            Some(&project),
-            &skills,
-            publication.stage_cache(),
-        ) {
-            Ok(pass) => pass,
-            Err(error) => {
-                return tool_error_result(
-                    publication
-                        .abort("staged index execution", error)
-                        .to_string(),
-                );
-            }
-        };
-        let (result, resolved_project, row_sink) = match pass {
-            ShadowIndexPassOutcome::Completed {
-                raw_result,
-                project,
-                candidate,
-            } => (raw_result, project, candidate),
-            ShadowIndexPassOutcome::Failed { error_result } => {
-                let error_result = match shadow_index_pass_error_result(&error_result) {
-                    Ok(error_result) => error_result,
-                    Err(error) => {
-                        return tool_error_result(
-                            publication
-                                .abort("staged index error normalization", error)
-                                .to_string(),
-                        );
-                    }
-                };
-                if let Err(error) =
-                    publication.abort_preserving_tool_error("staged index refusal", &error_result)
-                {
-                    return tool_error_result(error.to_string());
+    run_project_index_transition(
+        runner,
+        &cache_dir,
+        &project,
+        transition_root,
+        |transition_grant| {
+            let Some(_shadow_import_lock) = try_shadow_import_lock(&cache_dir, &project)? else {
+                return tool_error_result(format!(
+                    "ASTRO_SHADOW_IMPORT_BUSY: a shadow publication for project {project:?} is already active at {}; remediation: retry after that exact owner completes",
+                    shadow_import_lock_path(&cache_dir, &project).display()
+                ));
+            };
+            let shadow_started = std::time::Instant::now();
+            let stage_started = std::time::Instant::now();
+            let publication = ShadowPublication::begin(&cache_dir, &project)?;
+            eprintln!(
+                "astro.shadow.index_phase phase=stage_seed elapsed_ms={} total_ms={}",
+                stage_started.elapsed().as_millis(),
+                shadow_started.elapsed().as_millis()
+            );
+            let staged_args = match shadow_worker_args(
+                &sanitized_args,
+                publication.stage_cache(),
+                transition_grant,
+            ) {
+                Ok(args) => args,
+                Err(error) => return Err(publication.abort("worker argument binding", error)),
+            };
+            let pass = match run_shadow_index_pass(
+                runner,
+                &staged_args,
+                Some(&project),
+                &skills,
+                publication.stage_cache(),
+            ) {
+                Ok(pass) => pass,
+                Err(error) => {
+                    return tool_error_result(
+                        publication
+                            .abort("staged index execution", error)
+                            .to_string(),
+                    );
                 }
-                return Ok(error_result);
-            }
-        };
-        let staged = (|| -> Result<(String, ShadowImportOutcome), DynError> {
-            if resolved_project != project {
-                return Err(format!(
+            };
+            let (result, resolved_project, row_sink) = match pass {
+                ShadowIndexPassOutcome::Completed {
+                    raw_result,
+                    project,
+                    candidate,
+                } => (raw_result, project, candidate),
+                ShadowIndexPassOutcome::Failed { error_result } => {
+                    let error_result = match shadow_index_pass_error_result(&error_result) {
+                        Ok(error_result) => error_result,
+                        Err(error) => {
+                            return tool_error_result(
+                                publication
+                                    .abort("staged index error normalization", error)
+                                    .to_string(),
+                            );
+                        }
+                    };
+                    if let Err(error) = publication
+                        .abort_preserving_tool_error("staged index refusal", &error_result)
+                    {
+                        return tool_error_result(error.to_string());
+                    }
+                    return Ok(error_result);
+                }
+            };
+            let staged = (|| -> Result<(String, ShadowImportOutcome), DynError> {
+                if resolved_project != project {
+                    return Err(format!(
                 "ASTRO_SHADOW_PROJECT_MISMATCH: staged index resolved project {resolved_project:?}, expected {project:?}; remediation: pass one canonical repo_path/project identity and retry"
             )
             .into());
-            }
-            publication.checkpoint_stage_source()?;
-            let outcome = import_shadow_vault_with_archaeology_at(
-                publication.stage_cache(),
-                &project,
-                row_sink,
-                &search_scale_settings,
-                repo_path.as_deref(),
-            )?;
-            Ok((result, outcome))
-        })();
-        let (result, outcome) = match staged {
-            Ok(staged) => staged,
-            Err(error) => {
-                return tool_error_result(publication.abort("staged build", error).to_string());
-            }
-        };
-        let publish_started = std::time::Instant::now();
-        let outcome = match publication.publish(outcome, dial, &sanitized_args) {
-            Ok(outcome) => outcome,
-            Err(error) => return tool_error_result(error.to_string()),
-        };
-        eprintln!(
-            "astro.shadow.index_phase phase=publication elapsed_ms={} total_ms={}",
-            publish_started.elapsed().as_millis(),
-            shadow_started.elapsed().as_millis()
-        );
-        augment_tool_result(
-            &result,
-            json!({
-                "calyx": "shadow",
-                "vault_fingerprint": outcome.sqlite_fingerprint_sha256,
-                "grounding_summary": grounding_summary(&outcome),
-            }),
-        )
-    })
+                }
+                publication.checkpoint_stage_source()?;
+                let outcome = import_shadow_vault_with_archaeology_at(
+                    publication.stage_cache(),
+                    &project,
+                    row_sink,
+                    &search_scale_settings,
+                    repo_path.as_deref(),
+                )?;
+                Ok((result, outcome))
+            })();
+            let (result, outcome) = match staged {
+                Ok(staged) => staged,
+                Err(error) => {
+                    return tool_error_result(publication.abort("staged build", error).to_string());
+                }
+            };
+            let publish_started = std::time::Instant::now();
+            let outcome = match publication.publish(outcome, dial, &sanitized_args) {
+                Ok(outcome) => outcome,
+                Err(error) => return tool_error_result(error.to_string()),
+            };
+            eprintln!(
+                "astro.shadow.index_phase phase=publication elapsed_ms={} total_ms={}",
+                publish_started.elapsed().as_millis(),
+                shadow_started.elapsed().as_millis()
+            );
+            augment_tool_result(
+                &result,
+                json!({
+                    "calyx": "shadow",
+                    "vault_fingerprint": outcome.sqlite_fingerprint_sha256,
+                    "grounding_summary": grounding_summary(&outcome),
+                }),
+            )
+        },
+    )
 }
 
-fn shadow_worker_args(args_json: &str, stage_cache: &Path) -> Result<String, DynError> {
+fn shadow_worker_args(
+    args_json: &str,
+    stage_cache: &Path,
+    transition_grant: &ProjectTransitionWorkerGrant,
+) -> Result<String, DynError> {
     let mut value: Value = serde_json::from_str(args_json)?;
     let object = value.as_object_mut().ok_or_else(|| -> DynError {
         "ASTRO_SHADOW_INDEX_ARGS_OBJECT_REQUIRED: sanitized index arguments must remain a JSON object"
             .into()
     })?;
-    if object.contains_key(crate::ASTRO_INDEX_WORKER_CACHE_DIR_ARG) {
+    for private_arg in [
+        crate::ASTRO_INDEX_WORKER_CACHE_DIR_ARG,
+        crate::ASTRO_INDEX_WORKER_TRANSITION_GRANT_ARG,
+    ] {
+        if !object.contains_key(private_arg) {
+            continue;
+        }
         return Err(format!(
             "ASTRO_SHADOW_PRIVATE_ARG_COLLISION: caller supplied reserved argument {:?}; remediation: remove that private transport field",
-            crate::ASTRO_INDEX_WORKER_CACHE_DIR_ARG
+            private_arg
         )
         .into());
     }
@@ -613,6 +633,10 @@ fn shadow_worker_args(args_json: &str, stage_cache: &Path) -> Result<String, Dyn
     object.insert(
         crate::ASTRO_INDEX_WORKER_CACHE_DIR_ARG.to_string(),
         Value::String(stage.to_string()),
+    );
+    object.insert(
+        crate::ASTRO_INDEX_WORKER_TRANSITION_GRANT_ARG.to_string(),
+        transition_grant.for_stage(stage_cache)?,
     );
     Ok(serde_json::to_string(&value)?)
 }

@@ -29,6 +29,8 @@
  * (the gate must NOT re-supervise). response_out (may be NULL) is the file the
  * worker writes its final result string to, for the parent to read back. */
 void cbm_index_set_worker_role(bool is_worker, const char *response_out);
+void cbm_index_set_transition_writer_project(const char *project);
+bool cbm_index_transition_writer_matches(const char *project);
 bool cbm_index_worker_active(void);
 const char *cbm_index_worker_response_out(void);
 

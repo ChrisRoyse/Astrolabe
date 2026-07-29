@@ -36,6 +36,7 @@ CBM_API char *cbm_build_install_plan_json(const char *home, const char *binary_p
 /* Release a heap string returned by a CBM API through CBM's own allocator. */
 CBM_API void cbm_free_string(char *value);
 CBM_API void cbm_index_set_worker_role(bool is_worker, const char *response_out);
+CBM_API void cbm_index_set_transition_writer_project(const char *project);
 /* The fused host replaces cbm/main.c and must run this native startup
  * initializer before it activates the supervisor (#767). */
 CBM_API void cbm_profile_init(void);

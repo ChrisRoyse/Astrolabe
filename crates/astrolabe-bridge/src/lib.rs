@@ -585,12 +585,17 @@ unsafe extern "C" fn cbm_log_silent_sink(_line: *const c_char) {}
 
 pub struct CbmIndexWorkerRole {
     _response_out: Option<CString>,
+    _transition_writer_project: Option<CString>,
 }
 
 impl CbmIndexWorkerRole {
-    pub fn activate(response_out: Option<&str>) -> Result<Self, BridgeError> {
+    pub fn activate(
+        response_out: Option<&str>,
+        transition_writer_project: Option<&str>,
+    ) -> Result<Self, BridgeError> {
         initialize_cbm_allocator()?;
         let response_out = response_out.map(CString::new).transpose()?;
+        let transition_writer_project = transition_writer_project.map(CString::new).transpose()?;
         // SAFETY: CBM copies response_out into process-global worker state.
         unsafe {
             cbm_sys::cbm_index_set_worker_role(
@@ -599,9 +604,15 @@ impl CbmIndexWorkerRole {
                     .as_ref()
                     .map_or(ptr::null(), |path| path.as_ptr()),
             );
+            cbm_sys::cbm_index_set_transition_writer_project(
+                transition_writer_project
+                    .as_ref()
+                    .map_or(ptr::null(), |project| project.as_ptr()),
+            );
         }
         Ok(Self {
             _response_out: response_out,
+            _transition_writer_project: transition_writer_project,
         })
     }
 }
@@ -610,6 +621,7 @@ impl Drop for CbmIndexWorkerRole {
     fn drop(&mut self) {
         // SAFETY: resetting the process-global worker role has no preconditions.
         unsafe {
+            cbm_sys::cbm_index_set_transition_writer_project(ptr::null());
             cbm_sys::cbm_index_set_worker_role(false, ptr::null());
         }
     }
@@ -645,9 +657,22 @@ pub fn parent_process_id() -> Option<u32> {
     windows_watchdog::parent_process_id()
 }
 
+#[cfg(windows)]
+pub fn process_start_utc_ticks(pid: u32) -> Result<u64, String> {
+    windows_watchdog::process_start_utc_ticks(pid)
+}
+
 #[cfg(not(any(unix, windows)))]
 pub fn parent_process_id() -> Option<u32> {
     None
+}
+
+#[cfg(not(windows))]
+pub fn process_start_utc_ticks(_pid: u32) -> Result<u64, String> {
+    Err(
+        "ASTRO_PROCESS_GENERATION_UNSUPPORTED: exact process creation ticks require Windows"
+            .to_string(),
+    )
 }
 
 /// Outcome of a bounded wait for the parent process to exit (#253).
@@ -690,8 +715,15 @@ mod windows_watchdog {
         inherited_from_unique_process_id: usize,
     }
 
+    #[repr(C)]
+    struct FileTime {
+        low: u32,
+        high: u32,
+    }
+
     const PROCESS_BASIC_INFORMATION_CLASS: i32 = 0;
     const SYNCHRONIZE: u32 = 0x0010_0000;
+    const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x0000_1000;
     const WAIT_OBJECT_0: u32 = 0x0000_0000;
     const WAIT_TIMEOUT: u32 = 0x0000_0102;
     const WAIT_FAILED: u32 = 0xFFFF_FFFF;
@@ -714,6 +746,13 @@ mod windows_watchdog {
         fn GetCurrentProcess() -> Handle;
         fn OpenProcess(access: u32, inherit: i32, pid: u32) -> Handle;
         fn WaitForSingleObject(handle: Handle, millis: u32) -> u32;
+        fn GetProcessTimes(
+            handle: Handle,
+            creation: *mut FileTime,
+            exit: *mut FileTime,
+            kernel: *mut FileTime,
+            user: *mut FileTime,
+        ) -> i32;
         fn CloseHandle(handle: Handle) -> i32;
         fn GetLastError() -> u32;
     }
@@ -745,6 +784,37 @@ mod windows_watchdog {
         }
         let ppid = info.inherited_from_unique_process_id as u32;
         if ppid == 0 { None } else { Some(ppid) }
+    }
+
+    pub(crate) fn process_start_utc_ticks(pid: u32) -> Result<u64, String> {
+        // SAFETY: OpenProcess writes through no pointers; null is checked before use.
+        let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+        if handle.is_null() {
+            // SAFETY: GetLastError has no preconditions.
+            let code = unsafe { GetLastError() };
+            return Err(format!(
+                "ASTRO_PROCESS_GENERATION_OPEN_FAILED: OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION) for pid {pid} failed (native_error={code})"
+            ));
+        }
+        let mut creation = FileTime { low: 0, high: 0 };
+        let mut exit = FileTime { low: 0, high: 0 };
+        let mut kernel = FileTime { low: 0, high: 0 };
+        let mut user = FileTime { low: 0, high: 0 };
+        // SAFETY: handle is live and each out pointer names a correctly sized FILETIME.
+        let ok =
+            unsafe { GetProcessTimes(handle, &mut creation, &mut exit, &mut kernel, &mut user) };
+        if ok == 0 {
+            // SAFETY: GetLastError is read before closing the process handle.
+            let code = unsafe { GetLastError() };
+            // SAFETY: handle came from OpenProcess and is closed exactly once here.
+            unsafe { CloseHandle(handle) };
+            return Err(format!(
+                "ASTRO_PROCESS_GENERATION_QUERY_FAILED: GetProcessTimes for pid {pid} failed (native_error={code})"
+            ));
+        }
+        // SAFETY: handle came from OpenProcess and is closed exactly once here.
+        unsafe { CloseHandle(handle) };
+        Ok((u64::from(creation.high) << 32) | u64::from(creation.low))
     }
 
     /// A `SYNCHRONIZE` handle to the parent process. Its wait state becomes signaled when

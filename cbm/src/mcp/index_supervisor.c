@@ -38,6 +38,7 @@
 
 static bool g_worker_active = false;
 static char g_worker_response_out[1024] = {0};
+static char g_transition_writer_project[256] = {0};
 
 void cbm_index_set_worker_role(bool is_worker, const char *response_out) {
     g_worker_active = is_worker;
@@ -46,6 +47,19 @@ void cbm_index_set_worker_role(bool is_worker, const char *response_out) {
     } else {
         g_worker_response_out[0] = '\0';
     }
+}
+
+void cbm_index_set_transition_writer_project(const char *project) {
+    if (project && project[0]) {
+        snprintf(g_transition_writer_project, sizeof(g_transition_writer_project), "%s", project);
+    } else {
+        g_transition_writer_project[0] = '\0';
+    }
+}
+
+bool cbm_index_transition_writer_matches(const char *project) {
+    return g_worker_active && project && project[0] && g_transition_writer_project[0] &&
+           strcmp(g_transition_writer_project, project) == 0;
 }
 
 bool cbm_index_worker_active(void) {

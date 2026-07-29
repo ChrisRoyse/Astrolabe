@@ -1334,6 +1334,7 @@ struct cbm_mcp_server {
 typedef enum {
     CBM_PROJECT_TRANSITION_INACTIVE = 0,
     CBM_PROJECT_TRANSITION_ACTIVE = 1,
+    CBM_PROJECT_TRANSITION_ABANDONED = 2,
     CBM_PROJECT_TRANSITION_PROBE_FAILED = -1,
 } cbm_project_transition_state_t;
 
@@ -1394,8 +1395,12 @@ static cbm_project_transition_state_t probe_project_transition(const char *proje
             return CBM_PROJECT_TRANSITION_PROBE_FAILED;
         }
         if (wait == WAIT_ABANDONED) {
+            if (native_error) {
+                *native_error = ERROR_ABANDONED_WAIT_0;
+            }
             cbm_log_warn("project.transition.recovered", "project", project, "state",
                          "abandoned_owner_released");
+            return CBM_PROJECT_TRANSITION_ABANDONED;
         }
         return CBM_PROJECT_TRANSITION_INACTIVE;
     }
@@ -1611,9 +1616,28 @@ static void record_project_transition_state(cbm_mcp_server_t *srv, const char *p
     snprintf(srv->transition_error_project, sizeof(srv->transition_error_project), "%s",
              project ? project : "");
     srv->transition_native_error = native_error;
-    snprintf(srv->transition_error_code, sizeof(srv->transition_error_code), "%s",
-             state == CBM_PROJECT_TRANSITION_ACTIVE ? "CBM_PROJECT_TRANSITION_ACTIVE"
-                                                    : "CBM_PROJECT_TRANSITION_PROBE_FAILED");
+    const char *code = state == CBM_PROJECT_TRANSITION_ACTIVE
+                           ? "CBM_PROJECT_TRANSITION_ACTIVE"
+                       : state == CBM_PROJECT_TRANSITION_ABANDONED
+                           ? "CBM_PROJECT_TRANSITION_ABANDONED"
+                           : "CBM_PROJECT_TRANSITION_PROBE_FAILED";
+    snprintf(srv->transition_error_code, sizeof(srv->transition_error_code), "%s", code);
+}
+
+static bool project_transition_admits_process(cbm_mcp_server_t *srv, const char *project) {
+    DWORD native_error = ERROR_SUCCESS;
+    cbm_project_transition_state_t state = probe_project_transition(project, &native_error);
+    bool writer_granted = cbm_index_transition_writer_matches(project);
+    if ((!writer_granted && state == CBM_PROJECT_TRANSITION_INACTIVE) ||
+        (writer_granted && state == CBM_PROJECT_TRANSITION_ACTIVE)) {
+        return true;
+    }
+    record_project_transition_state(srv, project, state, native_error);
+    if (writer_granted && state == CBM_PROJECT_TRANSITION_INACTIVE) {
+        snprintf(srv->transition_error_code, sizeof(srv->transition_error_code), "%s",
+                 "CBM_PROJECT_TRANSITION_WRITER_GRANT_INACTIVE");
+    }
+    return false;
 }
 
 cbm_mcp_server_t *cbm_mcp_server_new(const char *store_path) {
@@ -2039,10 +2063,7 @@ static cbm_store_t *resolve_store(cbm_mcp_server_t *srv, const char *project) {
         return NULL; /* project is required — no implicit fallback */
     }
 
-    DWORD transition_native_error = ERROR_SUCCESS;
-    cbm_project_transition_state_t transition =
-        probe_project_transition(project, &transition_native_error);
-    if (transition != CBM_PROJECT_TRANSITION_INACTIVE) {
+    if (!project_transition_admits_process(srv, project)) {
         if (srv->owns_store && srv->store) {
             cbm_store_close(srv->store);
         }
@@ -2051,7 +2072,6 @@ static cbm_store_t *resolve_store(cbm_mcp_server_t *srv, const char *project) {
         free(srv->current_project);
         srv->current_project = NULL;
         srv->store_last_used = 0;
-        record_project_transition_state(srv, project, transition, transition_native_error);
         return NULL;
     }
 
@@ -2436,15 +2456,24 @@ static char *build_no_store_error(cbm_mcp_server_t *srv, const char *project) {
                                (int64_t)srv->transition_native_error);
         yyjson_mut_obj_add_bool(doc, root, "cached_store_closed", true);
         yyjson_mut_obj_add_bool(doc, root, "reopen_attempted", false);
+        bool active = strcmp(srv->transition_error_code, "CBM_PROJECT_TRANSITION_ACTIVE") == 0;
+        bool abandoned =
+            strcmp(srv->transition_error_code, "CBM_PROJECT_TRANSITION_ABANDONED") == 0;
+        bool granted_inactive = strcmp(srv->transition_error_code,
+                                       "CBM_PROJECT_TRANSITION_WRITER_GRANT_INACTIVE") == 0;
         yyjson_mut_obj_add_str(
             doc, root, "message",
-            strcmp(srv->transition_error_code, "CBM_PROJECT_TRANSITION_ACTIVE") == 0
-                ? "the exact project has an active index/publication transition"
+            active      ? "the exact project has an active index/publication transition"
+            : abandoned ? "the exact project writer exited without publishing a terminal transition"
+            : granted_inactive
+                ? "the supervised writer grant no longer has its exact live parent transition"
                 : "the exact project transition state could not be evaluated");
         yyjson_mut_obj_add_str(
             doc, root, "remediation",
-            strcmp(srv->transition_error_code, "CBM_PROJECT_TRANSITION_ACTIVE") == 0
-                ? "retry after the exact transition publishes its terminal durable state"
+            active      ? "retry after the exact transition publishes its terminal durable state"
+            : abandoned ? "inspect the durable transition receipt and complete exact abandoned-owner recovery before retrying"
+            : granted_inactive
+                ? "preserve the staged database and restart indexing from one live parent transition"
                 : "resolve the structured Windows named-mutex failure before retrying");
         char *json = yyjson_mut_write(doc, 0, NULL);
         yyjson_mut_doc_free(doc);
@@ -6273,6 +6302,26 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
             "CBM_PROJECT_IDENTITY_ALLOC_FAILED: the canonical project identity could not be "
             "retained; free memory and retry the unchanged request",
             true);
+    }
+
+    /* The ordinary reader transition probe is also the writer admission boundary.
+     * A normal CBM/watch worker may index only while no Rust publication transition
+     * exists. A shadow worker may cross an ACTIVE transition only when the Rust host
+     * validated and installed the exact private same-generation writer grant before
+     * entering libcbm. Refuse before artifact bootstrap, source discovery, or SQLite. */
+    if (!project_transition_admits_process(srv, project_name)) {
+        supervisor_invalidate_store(srv);
+        char *transition_error = build_no_store_error(srv, project_name);
+        cbm_pipeline_free(p);
+        free(project_name);
+        free(repo_path);
+        char *result = cbm_mcp_text_result(
+            transition_error ? transition_error
+                             : "CBM_PROJECT_TRANSITION_RESPONSE_ALLOC_FAILED: the exact writer "
+                               "admission refusal could not be serialized",
+            true);
+        free(transition_error);
+        return result;
     }
 
 #ifdef _WIN32

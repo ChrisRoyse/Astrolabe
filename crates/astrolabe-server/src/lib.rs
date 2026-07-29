@@ -26,6 +26,8 @@ use hook_augment::*;
 
 pub const CRATE_NAME: &str = env!("CARGO_PKG_NAME");
 pub(crate) const ASTRO_INDEX_WORKER_CACHE_DIR_ARG: &str = "_astrolabe_worker_cache_dir";
+pub(crate) const ASTRO_INDEX_WORKER_TRANSITION_GRANT_ARG: &str =
+    "_astrolabe_project_transition_writer";
 
 type DynError = Box<dyn Error + Send + Sync + 'static>;
 
@@ -550,13 +552,6 @@ fn run_cli(args: &[String]) -> Result<i32, DynError> {
     }
 
     let _worker_watchdog = index_worker.then(ParentWatchdog::start);
-    let _worker_role = if index_worker {
-        Some(astrolabe_bridge::CbmIndexWorkerRole::activate(
-            response_out.as_deref(),
-        )?)
-    } else {
-        None
-    };
     let tool_name = args.remove(0);
 
     // #416: a per-tool `--help`/`-h` anywhere in the tool's argument tail prints
@@ -571,10 +566,27 @@ fn run_cli(args: &[String]) -> Result<i32, DynError> {
     }
 
     let args_json = resolve_cli_args(&args)?;
-    let args_json = if index_worker {
-        configure_index_worker_cache(&args_json)?
+    let worker_configuration = if index_worker {
+        Some(configure_index_worker(&args_json)?)
     } else {
-        args_json
+        None
+    };
+    let (args_json, transition_writer_project) = worker_configuration.map_or_else(
+        || (args_json, None),
+        |configuration| {
+            (
+                configuration.args_json,
+                configuration.transition_writer_project,
+            )
+        },
+    );
+    let _worker_role = if index_worker {
+        Some(astrolabe_bridge::CbmIndexWorkerRole::activate(
+            response_out.as_deref(),
+            transition_writer_project.as_deref(),
+        )?)
+    } else {
+        None
     };
     if progress {
         eprintln!("astrolabe cli progress: start tool={tool_name}");
@@ -633,22 +645,43 @@ fn run_cli(args: &[String]) -> Result<i32, DynError> {
 /// process, then strips the private transport field before libcbm sees the tool
 /// arguments. The parent process never changes its global resolver, so other
 /// MCP runners cannot accidentally resolve the transaction-owned stage.
-fn configure_index_worker_cache(args_json: &str) -> Result<String, DynError> {
+struct IndexWorkerConfiguration {
+    args_json: String,
+    transition_writer_project: Option<String>,
+}
+
+fn configure_index_worker(args_json: &str) -> Result<IndexWorkerConfiguration, DynError> {
     let mut value: serde_json::Value = serde_json::from_str(args_json)?;
     let object = value.as_object_mut().ok_or_else(|| -> DynError {
         "ASTRO_INDEX_WORKER_ARGS_OBJECT_REQUIRED: supervised index arguments must be a JSON object"
             .into()
     })?;
-    let Some(cache_dir) = object.remove(ASTRO_INDEX_WORKER_CACHE_DIR_ARG) else {
-        // Non-shadow supervisors (HTTP/session auto-index) use the inherited
-        // resolver and do not carry Astrolabe's private stage binding.
-        return Ok(args_json.to_string());
+    let cache_dir = object.remove(ASTRO_INDEX_WORKER_CACHE_DIR_ARG);
+    let transition_grant = object.remove(ASTRO_INDEX_WORKER_TRANSITION_GRANT_ARG);
+    let (cache_dir, transition_grant) = match (cache_dir, transition_grant) {
+        (None, None) => {
+            // Non-shadow supervisors (HTTP/session auto-index) use the inherited
+            // resolver and do not carry Astrolabe's private stage binding.
+            return Ok(IndexWorkerConfiguration {
+                args_json: args_json.to_string(),
+                transition_writer_project: None,
+            });
+        }
+        (Some(cache_dir), Some(transition_grant)) => (cache_dir, transition_grant),
+        _ => {
+            return Err(
+                "ASTRO_INDEX_WORKER_PRIVATE_BINDING_INCOMPLETE: the shadow worker cache and transition writer grant must be supplied together; remediation: preserve the request and inspect the parent supervisor argument builder"
+                    .into(),
+            );
+        }
     };
     let cache_dir = cache_dir.as_str().ok_or_else(|| -> DynError {
         "ASTRO_INDEX_WORKER_CACHE_DIR_INVALID: supervised shadow worker cache directory must be a UTF-8 string"
             .into()
     })?;
     let requested = Path::new(cache_dir);
+    let transition_writer_project =
+        migration::validate_index_worker_transition_grant(transition_grant, &value, requested)?;
     let resolved = astrolabe_bridge::set_cbm_cache_dir(requested)?;
     if resolved != requested {
         return Err(format!(
@@ -658,7 +691,10 @@ fn configure_index_worker_cache(args_json: &str) -> Result<String, DynError> {
         )
         .into());
     }
-    Ok(serde_json::to_string(&value)?)
+    Ok(IndexWorkerConfiguration {
+        args_json: serde_json::to_string(&value)?,
+        transition_writer_project: Some(transition_writer_project),
+    })
 }
 
 /// Print per-tool `--help` for `astrolabe cli <tool> --help` (#416) and return 0
