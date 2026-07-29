@@ -808,6 +808,7 @@ mod windows_watchdog {
             kernel: *mut FileTime,
             user: *mut FileTime,
         ) -> i32;
+        fn GetExitCodeProcess(handle: Handle, exit_code: *mut u32) -> i32;
         fn CloseHandle(handle: Handle) -> i32;
         fn GetLastError() -> u32;
     }
@@ -876,9 +877,11 @@ mod windows_watchdog {
         pid: u32,
         expected_start_utc_ticks: u64,
     ) -> Result<super::ProcessGenerationState, String> {
-        // ERROR_INVALID_PARAMETER is the documented OpenProcess result for a
-        // PID that is not a live process. Every other open/query failure is
-        // unevaluable and must remain preserving at the caller.
+        // ERROR_INVALID_PARAMETER means no process object is addressable by
+        // this PID. A terminated object may still be openable while another
+        // handle retains it, so creation identity and GetExitCodeProcess below
+        // jointly decide whether the exact generation is still active. Every
+        // other open/query failure is unevaluable and remains preserving.
         const ERROR_INVALID_PARAMETER: u32 = 87;
         // SAFETY: OpenProcess writes through no pointers; null is checked.
         let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
@@ -908,15 +911,30 @@ mod windows_watchdog {
                 "ASTRO_PROCESS_GENERATION_QUERY_FAILED: GetProcessTimes for pid {pid} failed (native_error={code})"
             ));
         }
+        let mut exit_code = 0_u32;
+        // SAFETY: handle is still live and exit_code names one initialized u32.
+        let exit_code_ok = unsafe { GetExitCodeProcess(handle, &mut exit_code) };
+        if exit_code_ok == 0 {
+            // SAFETY: read the native error before closing the valid handle.
+            let code = unsafe { GetLastError() };
+            // SAFETY: handle came from OpenProcess and is closed exactly once.
+            unsafe { CloseHandle(handle) };
+            return Err(format!(
+                "ASTRO_PROCESS_GENERATION_EXIT_QUERY_FAILED: GetExitCodeProcess for pid {pid} failed (native_error={code})"
+            ));
+        }
         // SAFETY: handle came from OpenProcess and is closed exactly once.
         unsafe { CloseHandle(handle) };
         let actual_start_utc_ticks = (u64::from(creation.high) << 32) | u64::from(creation.low);
-        if actual_start_utc_ticks == expected_start_utc_ticks {
-            Ok(super::ProcessGenerationState::Matching)
-        } else {
+        const STILL_ACTIVE: u32 = 259;
+        if actual_start_utc_ticks != expected_start_utc_ticks {
             Ok(super::ProcessGenerationState::Reused {
                 actual_start_utc_ticks,
             })
+        } else if exit_code == STILL_ACTIVE {
+            Ok(super::ProcessGenerationState::Matching)
+        } else {
+            Ok(super::ProcessGenerationState::Absent)
         }
     }
 
