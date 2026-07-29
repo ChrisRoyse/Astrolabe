@@ -36,6 +36,11 @@
  * needs the LSP API. */
 struct CBMCargoManifest;
 
+typedef struct {
+    const char *macro_name;
+    const char *substituted_body;
+} RustMacroExpansionFrame;
+
 /* Global confidence assigned to LSP-resolved call edges. The pipeline's
  * shared override resolver (`pipeline/lsp_resolve.h`) only admits entries
  * scoring >= CBM_LSP_CONFIDENCE_FLOOR (0.6). Numbers here mirror the Go
@@ -110,8 +115,10 @@ typedef struct {
     /* Explicit per-file bounds for macro processing.  The expansion depth
      * is an Astrolabe semantic-analysis budget (not rustc's crate
      * `recursion_limit`).  Work covers tokenisation, rule matching,
-     * fragment validation, substitution, and synthetic parsing.  Matcher
-     * depth bounds recursive matcher structure independently of expansion
+     * fragment validation, substitution, and synthetic parsing.  Its default
+     * is derived from the measured source byte count plus a fixed floor;
+     * CBM_RUST_MAX_MACRO_WORK remains an exact hard override.  Matcher depth
+     * bounds recursive matcher structure independently of expansion
      * recursion.  Exhaustion is a sticky file failure, never a partial
      * expansion. */
     int macro_expand_depth;
@@ -191,11 +198,13 @@ typedef struct {
     /* CBM_LSP_DEBUG=1 in env enables verbose stderr trace. */
     bool debug;
 
-    /* Per-root-invocation macro-expansion cycle detector.  Re-observing the
-     * same (macro, substituted body) in one expansion chain is a structured
-     * non-convergent-recursion failure.  It must never silently suppress an
-     * expansion. */
-    CBMNegMemo macro_memo;
+    /* Exact active macro-expansion chain.  A frame exists only while its
+     * substituted body is being parsed/walked; completed sibling expansions
+     * are popped and may recur normally.  Full strings are compared so a hash
+     * collision can never become a false recursion failure. */
+    RustMacroExpansionFrame *macro_expansion_stack;
+    int macro_expansion_count;
+    int macro_expansion_capacity;
 } RustLSPContext;
 
 /* Initialise an empty context for processing one file. */

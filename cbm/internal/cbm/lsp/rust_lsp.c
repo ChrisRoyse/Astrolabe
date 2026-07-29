@@ -43,6 +43,7 @@
 /* Forward declarations for early callers in the file. */
 static void rust_resolve_calls_in_node(RustLSPContext *ctx, TSNode node);
 static void rust_resolve_calls_in_node_inner(RustLSPContext *ctx, TSNode node);
+static void rust_process_function(RustLSPContext *ctx, TSNode func_node, const char *receiver_qn);
 static void rust_emit_resolved_call(RustLSPContext *ctx, const char *callee_qn,
                                     const char *strategy, float confidence);
 static void rust_inject_syn_call(RustLSPContext *ctx, const char *callee_qn, int start_line);
@@ -65,10 +66,30 @@ static void rust_record_type_param_bound(RustLSPContext *ctx, const char *param_
 
 enum {
     RUST_LSP_DEFAULT_MACRO_DEPTH_LIMIT = 8,
-    RUST_LSP_DEFAULT_MACRO_WORK_LIMIT = 200000,
+    RUST_LSP_DEFAULT_MACRO_WORK_FLOOR = 200000,
+    RUST_LSP_DEFAULT_MACRO_WORK_PER_SOURCE_BYTE = 64,
     RUST_LSP_DEFAULT_MACRO_MATCH_DEPTH_LIMIT = 512,
     RUST_LSP_DEFAULT_EVAL_STEP_LIMIT = 200000,
 };
+
+static bool rust_lsp_read_macro_work_limit(CBMArena *arena, int source_len, int *out_value) {
+    int work_per_source_byte = 0;
+    if (!cbm_lsp_read_positive_limit(arena, "CBM_RUST_MACRO_WORK_PER_SOURCE_BYTE",
+                                     RUST_LSP_DEFAULT_MACRO_WORK_PER_SOURCE_BYTE,
+                                     "rust_lsp_macro_work_per_source_byte_config",
+                                     &work_per_source_byte)) {
+        return false;
+    }
+    size_t measured_source_bytes = source_len > 0 ? (size_t)source_len : 0;
+    size_t scaled_limit = measured_source_bytes > (size_t)INT_MAX / (size_t)work_per_source_byte
+                              ? (size_t)INT_MAX
+                              : measured_source_bytes * (size_t)work_per_source_byte;
+    int derived_default = scaled_limit > (size_t)RUST_LSP_DEFAULT_MACRO_WORK_FLOOR
+                              ? (int)scaled_limit
+                              : RUST_LSP_DEFAULT_MACRO_WORK_FLOOR;
+    return cbm_lsp_read_positive_limit(arena, "CBM_RUST_MAX_MACRO_WORK", derived_default,
+                                       "rust_lsp_macro_work_config", out_value);
+}
 
 void rust_lsp_init(RustLSPContext *ctx, CBMArena *arena, const char *source, int source_len,
                    const CBMTypeRegistry *registry, const char *module_qn,
@@ -87,9 +108,7 @@ void rust_lsp_init(RustLSPContext *ctx, CBMArena *arena, const char *source, int
         !cbm_lsp_read_positive_limit(
             arena, "CBM_RUST_MAX_MACRO_DEPTH", RUST_LSP_DEFAULT_MACRO_DEPTH_LIMIT,
             "rust_lsp_macro_depth_config", &ctx->macro_expand_depth_limit) ||
-        !cbm_lsp_read_positive_limit(arena, "CBM_RUST_MAX_MACRO_WORK",
-                                     RUST_LSP_DEFAULT_MACRO_WORK_LIMIT,
-                                     "rust_lsp_macro_work_config", &ctx->macro_work_limit) ||
+        !rust_lsp_read_macro_work_limit(arena, source_len, &ctx->macro_work_limit) ||
         !cbm_lsp_read_positive_limit(
             arena, "CBM_RUST_MAX_MACRO_MATCH_DEPTH", RUST_LSP_DEFAULT_MACRO_MATCH_DEPTH_LIMIT,
             "rust_lsp_macro_match_depth_config", &ctx->macro_match_depth_limit) ||
@@ -2815,6 +2834,8 @@ typedef struct {
     RustLSPContext *ctx;
     TSParser *fragment_parser;
     MacroCapture *captures;
+    const char *macro_name;
+    uint32_t invocation_byte;
 } MacroEnv;
 
 typedef struct MacroEndpoint {
@@ -2858,6 +2879,12 @@ static bool macro_work(RustLSPContext *ctx, size_t units, const char *operation)
     size_t used = ctx->macro_work_count < 0 ? 0 : (size_t)ctx->macro_work_count;
     size_t limit = ctx->macro_work_limit < 0 ? 0 : (size_t)ctx->macro_work_limit;
     if (units > limit || used > limit - units || units > (size_t)INT_MAX) {
+        fprintf(stderr,
+                "ERROR level=error msg=rust_macro.work_limit_exhausted "
+                "code=CBM_RUST_MACRO_WORK_LIMIT_EXCEEDED operation=%s used=%zu limit=%zu "
+                "requested=%zu source_bytes=%d expansion_depth=%d\n",
+                operation ? operation : "none", used, limit, units, ctx->source_len,
+                ctx->macro_expand_depth);
         cbm_arena_mark_failed(ctx->arena, "CBM_RUST_MACRO_WORK_LIMIT_EXCEEDED", operation, units);
         return false;
     }
@@ -3359,6 +3386,65 @@ static bool macro_repeat_operator(const MacroToken *token) {
            macro_token_text_is(token, "?");
 }
 
+static bool macro_boundary_token_matches(const MacroToken *pattern, const MacroToken *input) {
+    if (!pattern || !input) {
+        return false;
+    }
+    if (pattern->open || input->open) {
+        return pattern->open && input->open && pattern->open == input->open &&
+               pattern->close == input->close;
+    }
+    return macro_tokens_equal(pattern, input);
+}
+
+/* A parsed fragment can end only where the next concrete matcher token can
+ * begin.  Rust's macro fragment follow restrictions make that boundary part
+ * of the matcher grammar.  Filtering only concrete boundaries preserves all
+ * ambiguous/metavariable cases while avoiding quadratic parse attempts over
+ * prefixes that the suffix could never consume. */
+static bool macro_fragment_endpoint_possible(const MacroToken *pattern_after,
+                                             const MacroToken *outer_repetition, bool require_end,
+                                             const MacroToken *after) {
+    if (pattern_after) {
+        if (macro_token_text_is(pattern_after, "$")) {
+            return true;
+        }
+        return macro_boundary_token_matches(pattern_after, after);
+    }
+    if (require_end) {
+        return after == NULL;
+    }
+    if (!outer_repetition) {
+        return true;
+    }
+
+    const MacroToken *separator = outer_repetition->next;
+    const MacroToken *operator_token = separator;
+    if (separator && !macro_repeat_operator(separator)) {
+        operator_token = separator->next;
+    } else {
+        separator = NULL;
+    }
+    const MacroToken *repetition_suffix = operator_token ? operator_token->next : NULL;
+    /* Without a separator, `after` may begin either the next repetition
+     * iteration or the suffix.  The repetition matcher owns that choice, so
+     * filtering here would reject valid single-token iterations such as
+     * `$($token:tt)*` over a multi-token input. */
+    if (!separator) {
+        return true;
+    }
+    if (separator && macro_boundary_token_matches(separator, after)) {
+        return true;
+    }
+    if (repetition_suffix) {
+        if (macro_token_text_is(repetition_suffix, "$")) {
+            return true;
+        }
+        return macro_boundary_token_matches(repetition_suffix, after);
+    }
+    return after == NULL;
+}
+
 static MacroMatchStatus macro_match_repetition(
     MacroEnv *env, const MacroToken *group, const MacroToken *separator,
     const MacroToken *operator_token, const MacroToken *pattern_after, const MacroToken *input,
@@ -3502,6 +3588,11 @@ static MacroMatchStatus macro_match_sequence(MacroEnv *env, const MacroToken *pa
                 goto done;
             }
 
+            MacroCapture *fragment_entry_captures = env->captures;
+            bool fixed_one =
+                macro_is_fragment(fragment, "tt") || macro_is_fragment(fragment, "ident") ||
+                macro_is_fragment(fragment, "lifetime") || macro_is_fragment(fragment, "literal") ||
+                macro_is_fragment(fragment, "block");
             MacroEndpoint *endpoints = NULL;
             const MacroToken *cursor = input;
             while (cursor) {
@@ -3509,28 +3600,28 @@ static MacroMatchStatus macro_match_sequence(MacroEnv *env, const MacroToken *pa
                     status = MACRO_FATAL;
                     goto done;
                 }
-                MacroEndpoint *endpoint = (MacroEndpoint *)macro_arena_zalloc(
-                    ctx, sizeof(*endpoint), "rust_lsp_macro_endpoint");
-                if (!endpoint) {
-                    status = MACRO_FATAL;
-                    goto done;
+                const MacroToken *after = cursor->next;
+                if (macro_fragment_endpoint_possible(pattern_after, outer_repetition, require_end,
+                                                     after)) {
+                    MacroEndpoint *endpoint = (MacroEndpoint *)macro_arena_zalloc(
+                        ctx, sizeof(*endpoint), "rust_lsp_macro_endpoint");
+                    if (!endpoint) {
+                        status = MACRO_FATAL;
+                        goto done;
+                    }
+                    endpoint->after = after;
+                    endpoint->last = cursor;
+                    endpoint->previous = endpoints;
+                    endpoints = endpoint;
                 }
-                endpoint->after = cursor->next;
-                endpoint->last = cursor;
-                endpoint->previous = endpoints;
-                endpoints = endpoint;
+                if (fixed_one) {
+                    break;
+                }
                 cursor = cursor->next;
             }
             for (MacroEndpoint *endpoint = endpoints; endpoint; endpoint = endpoint->previous) {
                 const char *value = macro_capture_start(input);
                 size_t value_len = macro_capture_length(input, endpoint->last);
-                bool fixed_one =
-                    macro_is_fragment(fragment, "tt") || macro_is_fragment(fragment, "ident") ||
-                    macro_is_fragment(fragment, "lifetime") ||
-                    macro_is_fragment(fragment, "literal") || macro_is_fragment(fragment, "block");
-                if (fixed_one && endpoint->after != (input ? input->next : NULL)) {
-                    continue;
-                }
                 if (!macro_fragment_parse_clean(env, fragment, value, value_len)) {
                     if (cbm_arena_failed(ctx->arena)) {
                         status = MACRO_FATAL;
@@ -3538,7 +3629,7 @@ static MacroMatchStatus macro_match_sequence(MacroEnv *env, const MacroToken *pa
                     }
                     continue;
                 }
-                env->captures = entry_captures;
+                env->captures = fragment_entry_captures;
                 if (!macro_bind_capture(env, name_or_group, value, value_len, outer_repetition,
                                         outer_iteration)) {
                     status = MACRO_FATAL;
@@ -3551,7 +3642,7 @@ static MacroMatchStatus macro_match_sequence(MacroEnv *env, const MacroToken *pa
                 }
             }
             if (macro_is_fragment(fragment, "vis")) {
-                env->captures = entry_captures;
+                env->captures = fragment_entry_captures;
                 const char *empty_at = input ? input->text : fragment->text + fragment->len;
                 if (!macro_bind_capture(env, name_or_group, empty_at, 0, outer_repetition,
                                         outer_iteration)) {
@@ -3687,6 +3778,12 @@ static bool macro_repetition_driver(RustLSPContext *ctx, const MacroToken *token
                 }
             }
             if (!capture) {
+                fprintf(stderr,
+                        "ERROR level=error msg=rust_macro.metavariable_unbound "
+                        "code=CBM_RUST_MACRO_UNBOUND_METAVARIABLE macro=%s "
+                        "metavariable=%.*s invocation_byte=%u phase=repetition_driver\n",
+                        env->macro_name ? env->macro_name : "none", (int)next->len, next->text,
+                        env->invocation_byte);
                 cbm_arena_mark_failed(ctx->arena, "CBM_RUST_MACRO_UNBOUND_METAVARIABLE",
                                       "rust_lsp_macro_transcriber_repetition", next->len);
                 return false;
@@ -3782,9 +3879,14 @@ static bool macro_substitute_span(RustLSPContext *ctx, const MacroToken *tokens,
                     return false;
                 }
                 for (size_t iteration = 0; iteration < count; iteration++) {
-                    if (iteration && separator &&
-                        !macro_output_append(ctx, out, separator->text, separator->len)) {
-                        return false;
+                    if (iteration) {
+                        if (separator) {
+                            if (!macro_output_append(ctx, out, separator->text, separator->len)) {
+                                return false;
+                            }
+                        } else if (!macro_output_append(ctx, out, " ", 1)) {
+                            return false;
+                        }
                     }
                     const char *inner_start = name_or_group->text + 1;
                     const char *inner_end = name_or_group->text + name_or_group->len - 1;
@@ -3810,11 +3912,26 @@ static bool macro_substitute_span(RustLSPContext *ctx, const MacroToken *tokens,
                 MacroCapture *capture =
                     macro_find_capture(env, name_or_group, active_repetition, active_iteration);
                 if (!capture) {
+                    fprintf(stderr,
+                            "ERROR level=error msg=rust_macro.metavariable_unbound "
+                            "code=CBM_RUST_MACRO_UNBOUND_METAVARIABLE macro=%s "
+                            "metavariable=%.*s invocation_byte=%u phase=transcriber "
+                            "active_repetition=%s iteration=%zu\n",
+                            env->macro_name ? env->macro_name : "none", (int)name_or_group->len,
+                            name_or_group->text, env->invocation_byte,
+                            active_repetition ? "true" : "false", active_iteration);
                     cbm_arena_mark_failed(ctx->arena, "CBM_RUST_MACRO_UNBOUND_METAVARIABLE",
                                           "rust_lsp_macro_transcriber", name_or_group->len);
                     return false;
                 }
-                if (!macro_output_append(ctx, out, capture->value, capture->value_len)) {
+                /* A macro expansion is a token stream, not character pasting.  The
+                 * lexer deliberately removes trivia, so re-serializing adjacent
+                 * captures without a boundary can turn `if` + `self` into the
+                 * different token `ifself`.  Spaces around a captured token tree
+                 * preserve Rust token boundaries without changing its grammar. */
+                if (!macro_output_append(ctx, out, " ", 1) ||
+                    !macro_output_append(ctx, out, capture->value, capture->value_len) ||
+                    !macro_output_append(ctx, out, " ", 1)) {
                     return false;
                 }
             }
@@ -3856,8 +3973,322 @@ static char *macro_substitute(MacroEnv *env, const char *transcriber, size_t tra
     return out.data;
 }
 
-/* Re-parse a user macro's transcriber body as a synthetic Rust
- * function and walk it for calls. */
+typedef enum {
+    RUST_MACRO_CONTEXT_EXPRESSION = 0,
+    RUST_MACRO_CONTEXT_STATEMENT,
+    RUST_MACRO_CONTEXT_ITEM,
+    RUST_MACRO_CONTEXT_ASSOCIATED_ITEM,
+    RUST_MACRO_CONTEXT_TYPE,
+    RUST_MACRO_CONTEXT_PATTERN,
+} RustMacroExpansionContext;
+
+static const char *rust_macro_context_name(RustMacroExpansionContext context) {
+    switch (context) {
+    case RUST_MACRO_CONTEXT_EXPRESSION:
+        return "expression";
+    case RUST_MACRO_CONTEXT_STATEMENT:
+        return "statement";
+    case RUST_MACRO_CONTEXT_ITEM:
+        return "item";
+    case RUST_MACRO_CONTEXT_ASSOCIATED_ITEM:
+        return "associated_item";
+    case RUST_MACRO_CONTEXT_TYPE:
+        return "type";
+    case RUST_MACRO_CONTEXT_PATTERN:
+        return "pattern";
+    }
+    return "unknown";
+}
+
+static const char *rust_macro_child_field(TSNode parent, TSNode child) {
+    uint32_t child_count = ts_node_child_count(parent);
+    for (uint32_t i = 0; i < child_count; i++) {
+        if (ts_node_eq(ts_node_child(parent, i), child)) {
+            return ts_node_field_name_for_child(parent, i);
+        }
+    }
+    return NULL;
+}
+
+static bool rust_macro_type_container(const char *kind) {
+    if (!kind) {
+        return false;
+    }
+    size_t len = strlen(kind);
+    return (len >= 5 && strcmp(kind + len - 5, "_type") == 0) ||
+           strcmp(kind, "type_identifier") == 0 || strcmp(kind, "type_arguments") == 0 ||
+           strcmp(kind, "type_parameters") == 0 || strcmp(kind, "generic_type") == 0 ||
+           strcmp(kind, "scoped_type_identifier") == 0;
+}
+
+static bool rust_macro_pattern_container(const char *kind) {
+    return kind && (strstr(kind, "pattern") != NULL || strcmp(kind, "match_pattern") == 0 ||
+                    strcmp(kind, "or_pattern") == 0);
+}
+
+static RustMacroExpansionContext rust_macro_invocation_context(TSNode invocation) {
+    TSNode child = invocation;
+    TSNode parent = ts_node_parent(child);
+    for (int depth = 0; depth < 16 && !ts_node_is_null(parent); depth++) {
+        const char *kind = ts_node_type(parent);
+        const char *field = rust_macro_child_field(parent, child);
+        if (field && strcmp(field, "type") == 0) {
+            return RUST_MACRO_CONTEXT_TYPE;
+        }
+        if (field && strcmp(field, "pattern") == 0) {
+            return RUST_MACRO_CONTEXT_PATTERN;
+        }
+        if (rust_macro_pattern_container(kind)) {
+            return RUST_MACRO_CONTEXT_PATTERN;
+        }
+        if (rust_macro_type_container(kind)) {
+            return RUST_MACRO_CONTEXT_TYPE;
+        }
+        if (strcmp(kind, "source_file") == 0) {
+            return RUST_MACRO_CONTEXT_ITEM;
+        }
+        if (strcmp(kind, "expression_statement") == 0) {
+            return RUST_MACRO_CONTEXT_STATEMENT;
+        }
+        if (strcmp(kind, "declaration_list") == 0) {
+            TSNode owner = ts_node_parent(parent);
+            if (!ts_node_is_null(owner)) {
+                const char *owner_kind = ts_node_type(owner);
+                if (strcmp(owner_kind, "impl_item") == 0 || strcmp(owner_kind, "trait_item") == 0) {
+                    return RUST_MACRO_CONTEXT_ASSOCIATED_ITEM;
+                }
+            }
+            return RUST_MACRO_CONTEXT_ITEM;
+        }
+        if (strcmp(kind, "block") == 0) {
+            return ts_node_eq(child, invocation) ? RUST_MACRO_CONTEXT_STATEMENT
+                                                 : RUST_MACRO_CONTEXT_EXPRESSION;
+        }
+        if (strcmp(kind, "function_item") == 0 || strcmp(kind, "closure_expression") == 0 ||
+            strcmp(kind, "const_item") == 0 || strcmp(kind, "static_item") == 0) {
+            break;
+        }
+        child = parent;
+        parent = ts_node_parent(parent);
+    }
+    return RUST_MACRO_CONTEXT_EXPRESSION;
+}
+
+static bool rust_macro_expansion_active(const RustLSPContext *ctx, const char *macro_name,
+                                        const char *substituted_body, int *frame_index) {
+    if (!ctx || !macro_name || !substituted_body) {
+        return false;
+    }
+    for (int i = 0; i < ctx->macro_expansion_count; i++) {
+        const RustMacroExpansionFrame *frame = &ctx->macro_expansion_stack[i];
+        if (frame->macro_name && frame->substituted_body &&
+            strcmp(frame->macro_name, macro_name) == 0 &&
+            strcmp(frame->substituted_body, substituted_body) == 0) {
+            if (frame_index) {
+                *frame_index = i;
+            }
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool rust_macro_expansion_push(RustLSPContext *ctx, const char *macro_name,
+                                      const char *substituted_body) {
+    if (!ctx || !macro_name || !substituted_body) {
+        if (ctx) {
+            cbm_arena_mark_failed(ctx->arena, "CBM_RUST_MACRO_STACK_INVALID",
+                                  "rust_lsp_macro_expansion_push", 0);
+        }
+        return false;
+    }
+    if (ctx->macro_expansion_count >= ctx->macro_expand_depth_limit) {
+        cbm_arena_mark_failed(ctx->arena, "CBM_LSP_ANALYSIS_LIMIT_EXCEEDED",
+                              "rust_lsp_macro_expansion_stack",
+                              (size_t)ctx->macro_expand_depth_limit);
+        return false;
+    }
+    if (ctx->macro_expansion_count == ctx->macro_expansion_capacity) {
+        int new_capacity = 8;
+        if (ctx->macro_expansion_capacity > 0) {
+            if (ctx->macro_expansion_capacity > INT_MAX / 2) {
+                cbm_arena_mark_failed(ctx->arena, "CBM_RUST_MACRO_STACK_OVERFLOW",
+                                      "rust_lsp_macro_expansion_stack",
+                                      (size_t)ctx->macro_expansion_capacity);
+                return false;
+            }
+            new_capacity = ctx->macro_expansion_capacity * 2;
+        }
+        if (new_capacity > ctx->macro_expand_depth_limit) {
+            new_capacity = ctx->macro_expand_depth_limit;
+        }
+        if (new_capacity <= ctx->macro_expansion_count) {
+            cbm_arena_mark_failed(ctx->arena, "CBM_RUST_MACRO_STACK_OVERFLOW",
+                                  "rust_lsp_macro_expansion_stack", (size_t)new_capacity);
+            return false;
+        }
+        RustMacroExpansionFrame *grown = (RustMacroExpansionFrame *)macro_arena_zalloc(
+            ctx, sizeof(*grown) * (size_t)new_capacity, "rust_lsp_macro_expansion_stack");
+        if (!grown) {
+            return false;
+        }
+        if (ctx->macro_expansion_stack && ctx->macro_expansion_count > 0) {
+            memcpy(grown, ctx->macro_expansion_stack,
+                   sizeof(*grown) * (size_t)ctx->macro_expansion_count);
+        }
+        ctx->macro_expansion_stack = grown;
+        ctx->macro_expansion_capacity = new_capacity;
+    }
+    RustMacroExpansionFrame *frame = &ctx->macro_expansion_stack[ctx->macro_expansion_count++];
+    frame->macro_name = macro_name;
+    frame->substituted_body = substituted_body;
+    return true;
+}
+
+static void rust_macro_expansion_pop(RustLSPContext *ctx, const char *macro_name,
+                                     const char *substituted_body) {
+    if (!ctx || ctx->macro_expansion_count <= 0) {
+        if (ctx) {
+            cbm_arena_mark_failed(ctx->arena, "CBM_RUST_MACRO_STACK_CORRUPT",
+                                  "rust_lsp_macro_expansion_pop_empty", 0);
+        }
+        return;
+    }
+    RustMacroExpansionFrame *frame = &ctx->macro_expansion_stack[ctx->macro_expansion_count - 1];
+    if (!frame->macro_name || !frame->substituted_body ||
+        strcmp(frame->macro_name, macro_name) != 0 ||
+        strcmp(frame->substituted_body, substituted_body) != 0) {
+        cbm_arena_mark_failed(ctx->arena, "CBM_RUST_MACRO_STACK_CORRUPT",
+                              "rust_lsp_macro_expansion_pop_identity",
+                              (size_t)ctx->macro_expansion_count);
+        return;
+    }
+    frame->macro_name = NULL;
+    frame->substituted_body = NULL;
+    ctx->macro_expansion_count--;
+}
+
+static TSNode rust_macro_first_parse_error(TSNode node) {
+    if (ts_node_is_null(node) || !ts_node_has_error(node)) {
+        TSNode none = {0};
+        return none;
+    }
+    if (ts_node_is_error(node) || ts_node_is_missing(node)) {
+        return node;
+    }
+    uint32_t count = ts_node_child_count(node);
+    for (uint32_t i = 0; i < count; i++) {
+        TSNode found = rust_macro_first_parse_error(ts_node_child(node, i));
+        if (!ts_node_is_null(found)) {
+            return found;
+        }
+    }
+    return node;
+}
+
+static void rust_macro_log_failure(const char *code, const char *macro_name,
+                                   RustMacroExpansionContext context, TSNode invocation,
+                                   const char *substituted_body, TSNode parse_root,
+                                   int active_frame) {
+    TSNode parent = ts_node_parent(invocation);
+    const char *parent_kind = ts_node_is_null(parent) ? "none" : ts_node_type(parent);
+    size_t body_len = substituted_body ? strlen(substituted_body) : 0;
+    TSNode error = rust_macro_first_parse_error(parse_root);
+    const char *error_kind = ts_node_is_null(error) ? "none" : ts_node_type(error);
+    uint32_t error_start = ts_node_is_null(error) ? 0 : ts_node_start_byte(error);
+    uint32_t error_end = ts_node_is_null(error) ? 0 : ts_node_end_byte(error);
+    fprintf(stderr,
+            "ERROR level=error msg=rust_macro.expansion_failed code=%s macro=%s context=%s "
+            "invocation_parent=%s invocation_byte=%u substituted_bytes=%zu active_frame=%d "
+            "parse_error_kind=%s parse_error_start=%u parse_error_end=%u\n",
+            code, macro_name ? macro_name : "none", rust_macro_context_name(context), parent_kind,
+            ts_node_start_byte(invocation), body_len, active_frame, error_kind, error_start,
+            error_end);
+    if (substituted_body) {
+        size_t preview_len = body_len < 512 ? body_len : 512;
+        fprintf(stderr,
+                "ERROR level=error msg=rust_macro.expansion_source code=%s macro=%s "
+                "context=%s substituted_preview_bytes=%zu substituted_truncated=%s "
+                "substituted_preview_hex=",
+                code, macro_name ? macro_name : "none", rust_macro_context_name(context),
+                preview_len, preview_len == body_len ? "false" : "true");
+        for (size_t i = 0; i < preview_len; i++) {
+            fprintf(stderr, "%02x", (unsigned char)substituted_body[i]);
+        }
+        fputc('\n', stderr);
+    }
+}
+
+static char *rust_macro_wrap_expansion(RustLSPContext *ctx, RustMacroExpansionContext context,
+                                       const char *substituted) {
+    switch (context) {
+    case RUST_MACRO_CONTEXT_EXPRESSION:
+        return cbm_arena_sprintf(ctx->arena, "fn __cbm_macro_expand() { let _ = (%s); }\n",
+                                 substituted);
+    case RUST_MACRO_CONTEXT_STATEMENT:
+        return cbm_arena_sprintf(ctx->arena, "fn __cbm_macro_expand() { %s }\n", substituted);
+    case RUST_MACRO_CONTEXT_ITEM:
+        return cbm_arena_sprintf(ctx->arena, "%s\n", substituted);
+    case RUST_MACRO_CONTEXT_ASSOCIATED_ITEM:
+        return cbm_arena_sprintf(ctx->arena, "struct __CbmMacroSelf; impl __CbmMacroSelf { %s }\n",
+                                 substituted);
+    case RUST_MACRO_CONTEXT_TYPE:
+        return cbm_arena_sprintf(ctx->arena, "type __CbmMacroType = %s;\n", substituted);
+    case RUST_MACRO_CONTEXT_PATTERN:
+        return cbm_arena_sprintf(ctx->arena,
+                                 "fn __cbm_macro_expand() { match () { %s => {}, _ => {} } }\n",
+                                 substituted);
+    }
+    cbm_arena_mark_failed(ctx->arena, "CBM_RUST_MACRO_CONTEXT_INVALID",
+                          "rust_lsp_macro_expansion_context", (size_t)context);
+    return NULL;
+}
+
+static void rust_macro_walk_expansion(RustLSPContext *ctx, RustMacroExpansionContext context,
+                                      TSNode root) {
+    if (context == RUST_MACRO_CONTEXT_ITEM) {
+        uint32_t count = ts_node_child_count(root);
+        for (uint32_t i = 0; i < count; i++) {
+            TSNode item = ts_node_child(root, i);
+            if (ts_node_is_null(item) || !ts_node_is_named(item)) {
+                continue;
+            }
+            if (strcmp(ts_node_type(item), "function_item") == 0) {
+                rust_process_function(ctx, item, NULL);
+            } else {
+                rust_resolve_calls_in_node(ctx, item);
+            }
+        }
+        return;
+    }
+    if (context == RUST_MACRO_CONTEXT_ASSOCIATED_ITEM) {
+        uint32_t root_count = ts_node_child_count(root);
+        for (uint32_t i = 0; i < root_count; i++) {
+            TSNode top = ts_node_child(root, i);
+            if (ts_node_is_null(top) || strcmp(ts_node_type(top), "impl_item") != 0) {
+                continue;
+            }
+            TSNode body = ts_node_child_by_field_name(top, "body", 4);
+            uint32_t body_count = ts_node_child_count(body);
+            for (uint32_t j = 0; j < body_count; j++) {
+                TSNode item = ts_node_child(body, j);
+                if (ts_node_is_null(item) || !ts_node_is_named(item)) {
+                    continue;
+                }
+                if (strcmp(ts_node_type(item), "function_item") == 0) {
+                    rust_process_function(ctx, item, ctx->self_type_qn);
+                } else {
+                    rust_resolve_calls_in_node(ctx, item);
+                }
+            }
+        }
+        return;
+    }
+    rust_resolve_calls_in_node(ctx, root);
+}
+
+/* Re-parse a user macro's exact transcriber body in the invocation's Rust
+ * grammar context, then walk only the resulting synthetic tree for calls. */
 extern const TSLanguage *tree_sitter_rust(void);
 static void rust_expand_user_macro(RustLSPContext *ctx, const char *mname, TSNode invocation) {
     if (!ctx || !mname || !ctx->macro_rules_arr)
@@ -3932,10 +4363,13 @@ static void rust_expand_user_macro(RustLSPContext *ctx, const char *mname, TSNod
     /* Rust tries rules in source order and transcribes only the first exact
      * success.  A mismatch never grants permission to expand another body. */
     RustMacroRule *hit = NULL;
+    int candidate_rule_count = 0;
     MacroEnv env = {
         .ctx = ctx,
         .fragment_parser = parser,
         .captures = NULL,
+        .macro_name = mname,
+        .invocation_byte = invocation_byte,
     };
 
     for (int i = 0; i < ctx->macro_rules_count; i++) {
@@ -3943,6 +4377,7 @@ static void rust_expand_user_macro(RustLSPContext *ctx, const char *mname, TSNod
         if (!r || !r->macro_name || strcmp(r->macro_name, mname) != 0 ||
             r->definition_start_byte != selected_definition_start)
             continue;
+        candidate_rule_count++;
         env.captures = NULL;
         if (!r->pattern_text || !r->transcriber_text) {
             cbm_arena_mark_failed(ctx->arena, "CBM_RUST_MACRO_RULE_INVALID",
@@ -3964,6 +4399,19 @@ static void rust_expand_user_macro(RustLSPContext *ctx, const char *mname, TSNod
         return;
     }
     if (!hit) {
+        size_t invocation_len = inv_args_len > 0 ? (size_t)inv_args_len : 0;
+        size_t preview_len = invocation_len < 512 ? invocation_len : 512;
+        fprintf(stderr,
+                "ERROR level=error msg=rust_macro.no_rule_match "
+                "code=CBM_RUST_MACRO_NO_MATCH macro=%s invocation_byte=%u "
+                "invocation_bytes=%zu declared_rules=%d invocation_preview_bytes=%zu "
+                "invocation_truncated=%s invocation_preview_hex=",
+                mname, invocation_byte, invocation_len, candidate_rule_count, preview_len,
+                preview_len == invocation_len ? "false" : "true");
+        for (size_t i = 0; i < preview_len; i++) {
+            fprintf(stderr, "%02x", (unsigned char)inv_args[i]);
+        }
+        fputc('\n', stderr);
         cbm_arena_mark_failed(ctx->arena, "CBM_RUST_MACRO_NO_MATCH",
                               "rust_lsp_macro_rule_selection", (size_t)inv_args_len);
         ts_parser_delete(parser);
@@ -3977,27 +4425,24 @@ static void rust_expand_user_macro(RustLSPContext *ctx, const char *mname, TSNod
         return;
     }
 
-    /* The memo is a cycle detector, not a suppression cache. */
-    if (ctx->macro_expand_depth == 0 && ctx->macro_memo.slots) {
-        memset(ctx->macro_memo.slots, 0, sizeof(uint64_t) * (size_t)ctx->macro_memo.cap);
-        ctx->macro_memo.count = 0;
-    }
-    uint64_t mm_key = cbm_negmemo_key(3, mname, substituted);
-    if (cbm_negmemo_contains(&ctx->macro_memo, mm_key)) {
+    RustMacroExpansionContext context = rust_macro_invocation_context(invocation);
+    int active_frame = -1;
+    if (rust_macro_expansion_active(ctx, mname, substituted, &active_frame)) {
+        rust_macro_log_failure("CBM_RUST_MACRO_RECURSION_CYCLE", mname, context, invocation,
+                               substituted, (TSNode){0}, active_frame);
         cbm_arena_mark_failed(ctx->arena, "CBM_RUST_MACRO_RECURSION_CYCLE",
                               "rust_lsp_macro_expansion_cycle", strlen(substituted));
         ts_parser_delete(parser);
         return;
     }
-    cbm_negmemo_insert(&ctx->macro_memo, ctx->arena, mm_key);
-    if (cbm_arena_failed(ctx->arena)) {
+    if (!rust_macro_expansion_push(ctx, mname, substituted)) {
         ts_parser_delete(parser);
         return;
     }
 
-    /* Wrap and parse. */
-    char *wrapped = cbm_arena_sprintf(ctx->arena, "fn __cbm_macro_expand() { %s; }\n", substituted);
+    char *wrapped = rust_macro_wrap_expansion(ctx, context, substituted);
     if (!wrapped) {
+        rust_macro_expansion_pop(ctx, mname, substituted);
         ts_parser_delete(parser);
         return;
     }
@@ -4005,10 +4450,12 @@ static void rust_expand_user_macro(RustLSPContext *ctx, const char *mname, TSNod
     if (wrapped_len > UINT32_MAX) {
         cbm_arena_mark_failed(ctx->arena, "CBM_RUST_MACRO_OUTPUT_OVERFLOW",
                               "rust_lsp_macro_synthetic_source", wrapped_len);
+        rust_macro_expansion_pop(ctx, mname, substituted);
         ts_parser_delete(parser);
         return;
     }
     if (!macro_work(ctx, wrapped_len, "rust_lsp_macro_expansion_parse")) {
+        rust_macro_expansion_pop(ctx, mname, substituted);
         ts_parser_delete(parser);
         return;
     }
@@ -4016,14 +4463,18 @@ static void rust_expand_user_macro(RustLSPContext *ctx, const char *mname, TSNod
     if (!tree) {
         cbm_arena_mark_failed(ctx->arena, "CBM_RUST_MACRO_EXPANSION_PARSE_FAILED",
                               "rust_lsp_macro_expansion_parser", wrapped_len);
+        rust_macro_expansion_pop(ctx, mname, substituted);
         ts_parser_delete(parser);
         return;
     }
     TSNode root = ts_tree_root_node(tree);
     if (ts_node_has_error(root)) {
+        rust_macro_log_failure("CBM_RUST_MACRO_EXPANSION_INVALID", mname, context, invocation,
+                               substituted, root, -1);
         cbm_arena_mark_failed(ctx->arena, "CBM_RUST_MACRO_EXPANSION_INVALID",
                               "rust_lsp_macro_expansion_syntax", wrapped_len);
         ts_tree_delete(tree);
+        rust_macro_expansion_pop(ctx, mname, substituted);
         ts_parser_delete(parser);
         return;
     }
@@ -4036,31 +4487,21 @@ static void rust_expand_user_macro(RustLSPContext *ctx, const char *mname, TSNod
         ctx->macro_origin_valid = true;
     }
     ctx->macro_expand_depth++;
-    uint32_t root_children = ts_node_child_count(root);
-    for (uint32_t i = 0; i < root_children; i++) {
-        TSNode top = ts_node_child(root, i);
-        if (ts_node_is_null(top) || strcmp(ts_node_type(top), "function_item") != 0) {
-            continue;
-        }
-        TSNode body = ts_node_child_by_field_name(top, "body", 4);
-        if (ts_node_is_null(body)) {
-            continue;
-        }
-        const char *saved_source = ctx->source;
-        int saved_len = ctx->source_len;
-        ctx->source = wrapped;
-        ctx->source_len = (int)wrapped_len;
-        ctx->inject_syn_calls++;
-        rust_resolve_calls_in_node(ctx, body);
-        ctx->inject_syn_calls--;
-        ctx->source = saved_source;
-        ctx->source_len = saved_len;
-    }
+    const char *saved_source = ctx->source;
+    int saved_len = ctx->source_len;
+    ctx->source = wrapped;
+    ctx->source_len = (int)wrapped_len;
+    ctx->inject_syn_calls++;
+    rust_macro_walk_expansion(ctx, context, root);
+    ctx->inject_syn_calls--;
+    ctx->source = saved_source;
+    ctx->source_len = saved_len;
     ctx->macro_expand_depth--;
     ctx->macro_origin_byte = saved_origin_byte;
     ctx->macro_origin_line = saved_origin_line;
     ctx->macro_origin_valid = saved_origin_valid;
     ts_tree_delete(tree);
+    rust_macro_expansion_pop(ctx, mname, substituted);
     ts_parser_delete(parser);
 }
 
@@ -5609,6 +6050,7 @@ static void rust_process_function(RustLSPContext *ctx, TSNode func_node, const c
         return;
 
     const char *prefix = parent_qn ? parent_qn : ctx->module_qn;
+    const char *saved_enclosing_func_qn = ctx->enclosing_func_qn;
     ctx->enclosing_func_qn = cbm_arena_sprintf(ctx->arena, "%s.%s", prefix, name);
 
     CBMScope *saved = ctx->current_scope;
@@ -5668,7 +6110,7 @@ static void rust_process_function(RustLSPContext *ctx, TSNode func_node, const c
     }
 
     ctx->current_scope = saved;
-    ctx->enclosing_func_qn = NULL;
+    ctx->enclosing_func_qn = saved_enclosing_func_qn;
     /* Restore bound-env count so the caller's bounds are unaffected. */
     ctx->type_param_bound_count = saved_bound_count;
 }
@@ -5904,6 +6346,17 @@ static void rust_process_impl(RustLSPContext *ctx, TSNode impl_node) {
             const char *ck = ts_node_type(c);
             if (strcmp(ck, "function_item") == 0) {
                 rust_process_function(ctx, c, effective_recv);
+            } else if (strcmp(ck, "macro_invocation") == 0) {
+                TSNode macro_name = ts_node_child_by_field_name(c, "macro", 5);
+                if (!ts_node_is_null(macro_name)) {
+                    char *name = rust_node_text(ctx, macro_name);
+                    if (name) {
+                        rust_expand_user_macro(ctx, name, c);
+                    }
+                }
+            }
+            if (cbm_arena_failed(ctx->arena)) {
+                break;
             }
         }
     }
