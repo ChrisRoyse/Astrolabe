@@ -2974,13 +2974,24 @@ static bool macro_skip_trivia(RustLSPContext *ctx, const char *source, size_t le
     return true;
 }
 
+static size_t macro_scan_literal_suffix(const char *source, size_t len, size_t pos) {
+    if (pos >= len || !macro_identifier_start((unsigned char)source[pos])) {
+        return pos;
+    }
+    pos++;
+    while (pos < len && macro_identifier_continue((unsigned char)source[pos])) {
+        pos++;
+    }
+    return pos;
+}
+
 static size_t macro_scan_quoted(const char *source, size_t len, size_t start, char quote) {
     size_t pos = start + 1;
     while (pos < len) {
         if (source[pos] == '\\' && pos + 1 < len) {
             pos += 2;
         } else if (source[pos] == quote) {
-            return pos + 1;
+            return macro_scan_literal_suffix(source, len, pos + 1);
         } else {
             pos++;
         }
@@ -3018,11 +3029,159 @@ static size_t macro_scan_raw_string(const char *source, size_t len, size_t start
             end++;
         }
         if (seen == hashes) {
-            return end;
+            return macro_scan_literal_suffix(source, len, end);
         }
         pos++;
     }
     return start;
+}
+
+static bool macro_hex_digit(unsigned char c, uint32_t *value) {
+    if (c >= '0' && c <= '9') {
+        *value = (uint32_t)(c - '0');
+        return true;
+    }
+    if (c >= 'a' && c <= 'f') {
+        *value = (uint32_t)(c - 'a' + 10);
+        return true;
+    }
+    if (c >= 'A' && c <= 'F') {
+        *value = (uint32_t)(c - 'A' + 10);
+        return true;
+    }
+    return false;
+}
+
+static size_t macro_utf8_scalar_width(const char *source, size_t len, size_t start) {
+    if (start >= len) {
+        return 0;
+    }
+    unsigned char first = (unsigned char)source[start];
+    if (first < 0x80) {
+        return 1;
+    }
+    size_t width = 0;
+    uint32_t value = 0;
+    if (first >= 0xc2 && first <= 0xdf) {
+        width = 2;
+        value = (uint32_t)(first & 0x1f);
+    } else if (first >= 0xe0 && first <= 0xef) {
+        width = 3;
+        value = (uint32_t)(first & 0x0f);
+    } else if (first >= 0xf0 && first <= 0xf4) {
+        width = 4;
+        value = (uint32_t)(first & 0x07);
+    } else {
+        return 0;
+    }
+    if (width > len - start) {
+        return 0;
+    }
+    for (size_t i = 1; i < width; i++) {
+        unsigned char next = (unsigned char)source[start + i];
+        if ((next & 0xc0) != 0x80) {
+            return 0;
+        }
+        value = (value << 6) | (uint32_t)(next & 0x3f);
+    }
+    uint32_t minimum = width == 2 ? 0x80 : (width == 3 ? 0x800 : 0x10000);
+    if (value < minimum || value > 0x10ffff || (value >= 0xd800 && value <= 0xdfff)) {
+        return 0;
+    }
+    return width;
+}
+
+static size_t macro_scan_lifetime(const char *source, size_t len, size_t start) {
+    if (start >= len || source[start] != '\'' || start + 1 >= len) {
+        return start;
+    }
+    size_t pos = start + 1;
+    if (source[pos] == 'r' && pos + 2 < len && source[pos + 1] == '#' &&
+        macro_identifier_start((unsigned char)source[pos + 2])) {
+        pos += 3;
+    } else {
+        size_t first_width = macro_utf8_scalar_width(source, len, pos);
+        if (first_width == 0 || (!macro_identifier_start((unsigned char)source[pos]) &&
+                                 !isdigit((unsigned char)source[pos]))) {
+            return start;
+        }
+        pos += first_width;
+    }
+    while (pos < len && macro_identifier_continue((unsigned char)source[pos])) {
+        pos++;
+    }
+    /* A closing quote turns the complete span into a character-literal
+     * candidate (`'a'`), never a lifetime followed by punctuation. */
+    return pos < len && source[pos] == '\'' ? start : pos;
+}
+
+static size_t macro_scan_character_literal(const char *source, size_t len, size_t start,
+                                           bool byte_literal) {
+    if (start >= len || source[start] != '\'' || start + 1 >= len) {
+        return start;
+    }
+    size_t pos = start + 1;
+    unsigned char first = (unsigned char)source[pos];
+    if (first == '\\') {
+        if (pos + 1 >= len) {
+            return start;
+        }
+        unsigned char escape = (unsigned char)source[pos + 1];
+        if (escape == '\'' || escape == '"' || escape == 'n' || escape == 'r' || escape == 't' ||
+            escape == '\\' || escape == '0') {
+            pos += 2;
+        } else if (escape == 'x') {
+            uint32_t high = 0;
+            uint32_t low = 0;
+            if (pos + 3 >= len || !macro_hex_digit((unsigned char)source[pos + 2], &high) ||
+                !macro_hex_digit((unsigned char)source[pos + 3], &low) ||
+                (!byte_literal && high > 7)) {
+                return start;
+            }
+            pos += 4;
+        } else if (!byte_literal && escape == 'u') {
+            if (pos + 2 >= len || source[pos + 2] != '{') {
+                return start;
+            }
+            size_t cursor = pos + 3;
+            uint32_t value = 0;
+            size_t digits = 0;
+            while (cursor < len && source[cursor] != '}') {
+                if (source[cursor] == '_') {
+                    if (digits == 0) {
+                        return start;
+                    }
+                    cursor++;
+                    continue;
+                }
+                uint32_t digit = 0;
+                if (!macro_hex_digit((unsigned char)source[cursor], &digit) || digits == 6) {
+                    return start;
+                }
+                value = (value << 4) | digit;
+                digits++;
+                cursor++;
+            }
+            if (cursor >= len || digits == 0 || value > 0x10ffff ||
+                (value >= 0xd800 && value <= 0xdfff)) {
+                return start;
+            }
+            pos = cursor + 1;
+        } else {
+            return start;
+        }
+    } else {
+        size_t width = macro_utf8_scalar_width(source, len, pos);
+        if (width == 0 || first == '\'' || first == '\n' || first == '\r' || first == '\t' ||
+            (byte_literal && (width != 1 || first >= 0x80))) {
+            return start;
+        }
+        pos += width;
+    }
+    if (pos >= len || source[pos] != '\'') {
+        return start;
+    }
+    return macro_scan_literal_suffix(source, len, pos + 1);
 }
 
 static size_t macro_scan_leaf(const char *source, size_t len, size_t start) {
@@ -3036,34 +3195,21 @@ static size_t macro_scan_leaf(const char *source, size_t len, size_t start) {
     }
     size_t prefix = start;
     if (prefix + 1 < len && (source[prefix] == 'b' || source[prefix] == 'c') &&
-        (source[prefix + 1] == '"' || source[prefix + 1] == '\'')) {
-        size_t end = macro_scan_quoted(source, len, prefix + 1, source[prefix + 1]);
+        source[prefix + 1] == '"') {
+        size_t end = macro_scan_quoted(source, len, prefix + 1, '"');
+        return end > prefix + 1 ? end : start;
+    }
+    if (prefix + 1 < len && source[prefix] == 'b' && source[prefix + 1] == '\'') {
+        size_t end = macro_scan_character_literal(source, len, prefix + 1, true);
         return end > prefix + 1 ? end : start;
     }
     if (source[start] == '"') {
         return macro_scan_quoted(source, len, start, '"');
     }
     if (source[start] == '\'') {
-        size_t probe_limit = len - start > 16 ? start + 16 : len;
-        size_t pos = start + 1;
-        while (pos < probe_limit) {
-            if (source[pos] == '\\' && pos + 1 < probe_limit) {
-                pos += 2;
-            } else if (source[pos] == '\'') {
-                return pos + 1;
-            } else {
-                pos++;
-            }
-        }
-        pos = start + 1;
-        if (pos < len && macro_identifier_start((unsigned char)source[pos])) {
-            pos++;
-            while (pos < len && macro_identifier_continue((unsigned char)source[pos])) {
-                pos++;
-            }
-            return pos;
-        }
-        return start + 1;
+        size_t lifetime_end = macro_scan_lifetime(source, len, start);
+        return lifetime_end > start ? lifetime_end
+                                    : macro_scan_character_literal(source, len, start, false);
     }
     if (macro_identifier_start((unsigned char)source[start])) {
         size_t pos = start + 1;
@@ -3373,9 +3519,8 @@ static bool macro_token_is_identifier(const MacroToken *token) {
 }
 
 static bool macro_token_is_lifetime(const MacroToken *token) {
-    return token && !token->open && token->len > 1 && token->text[0] == '\'' &&
-           macro_identifier_start((unsigned char)token->text[1]) &&
-           token->text[token->len - 1] != '\'';
+    return token && !token->open && token->len > 1 &&
+           macro_scan_lifetime(token->text, token->len, 0) == token->len;
 }
 
 static bool macro_token_is_literal(const MacroToken *token) {
@@ -3383,14 +3528,19 @@ static bool macro_token_is_literal(const MacroToken *token) {
         return false;
     }
     unsigned char first = (unsigned char)token->text[0];
-    bool prefixed_quoted = token->len > 1 && (first == 'b' || first == 'c') &&
-                           (token->text[1] == '"' || token->text[1] == '\'' ||
+    bool byte_quoted = token->len > 1 && first == 'b' && token->text[1] == '\'' &&
+                       macro_scan_character_literal(token->text, token->len, 1, true) == token->len;
+    bool prefixed_string = token->len > 1 && (first == 'b' || first == 'c') &&
+                           ((token->text[1] == '"' &&
+                             macro_scan_quoted(token->text, token->len, 1, '"') == token->len) ||
                             macro_scan_raw_string(token->text, token->len, 0) == token->len);
     bool raw_quoted =
         first == 'r' && macro_scan_raw_string(token->text, token->len, 0) == token->len;
-    return isdigit(first) || first == '"' || (first == '\'' && !macro_token_is_lifetime(token)) ||
-           prefixed_quoted || raw_quoted || macro_token_text_is(token, "true") ||
-           macro_token_text_is(token, "false");
+    bool quoted = first == '"' && macro_scan_quoted(token->text, token->len, 0, '"') == token->len;
+    bool character = first == '\'' &&
+                     macro_scan_character_literal(token->text, token->len, 0, false) == token->len;
+    return isdigit(first) || quoted || character || byte_quoted || prefixed_string || raw_quoted ||
+           macro_token_text_is(token, "true") || macro_token_text_is(token, "false");
 }
 
 static bool macro_fragment_parse_clean(MacroEnv *env, const MacroToken *fragment, const char *value,
