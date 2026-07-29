@@ -6,11 +6,12 @@
     The native build target is disposable launcher-owned state. This command accepts only a
     content-addressed native-fsv-artifact.v2 receipt plus a verified native-fsv-run.v2 record
     created under the same live issue-owned launcher generation. It copies the exact staged
-    artifact plus its recursively measured non-system PE dependency closure into a fresh
-    generation beneath the user's Astrolabe program directory, flushes every new file, and
-    publishes the complete directory with MoveFileExW write-through and no replacement. PE
-    imports are measured with the launcher-pinned LLVM inspector; platform DLLs stay provided
-    by Windows, while every other import must resolve to the pinned launcher toolchain.
+    artifact, its recursively measured non-system PE dependency closure, and the exact
+    hash-frozen Nomic runtime-data closure into a fresh generation beneath the user's Astrolabe
+    program directory, flushes every new file, and publishes the complete directory with
+    MoveFileExW write-through and no replacement. PE imports are measured with the
+    launcher-pinned LLVM inspector; platform DLLs stay provided by Windows, while every other
+    import must resolve to the pinned launcher toolchain.
 
     Existing generations are never reused or replaced. Client activation is deliberately a
     separate receipt-bound transaction: activate-global-astrolabe-mcp.ps1 must switch Codex and
@@ -437,6 +438,13 @@ if ([string]::IsNullOrWhiteSpace($InstallRoot)) {
     $InstallRoot = Join-Path $env:LOCALAPPDATA 'Programs\Astrolabe'
 }
 $InstallRoot = [IO.Path]::GetFullPath($InstallRoot)
+$installDrive = [IO.DriveInfo]::new([IO.Path]::GetPathRoot($InstallRoot))
+if ([IO.Path]::GetPathRoot($InstallRoot) -notmatch '^[A-Za-z]:\\$' -or
+    $installDrive.DriveType -ne [IO.DriveType]::Fixed) {
+    Fail-AstroGlobalPublish 'ASTRO_GLOBAL_PUBLISH_INSTALL_ROOT_INVALID' `
+        "global install root is not on one fixed local drive: $InstallRoot (drive_type=$($installDrive.DriveType))" `
+        'select one normalized install root on a fixed local Windows drive'
+}
 
 $launcher = Read-AstroLauncherLock -LockPath $launcherLockPath
 if ($launcher.State -cne 'held' -or
@@ -629,6 +637,38 @@ $runtimeClosureMaterial = @(
     }
 ) -join "`n"
 $runtimeClosureSha = String-Sha256 $runtimeClosureMaterial
+$nomicSpecs = @(
+    [ordered]@{
+        name = 'code_tokens.txt'
+        source_path = Join-Path $workspace 'cbm\vendored\nomic\code_tokens.txt'
+        bytes = [uint64]305794
+        sha256 = 'c928f5e2f9dd85f2294a50a05dd9f2f8bc95192727579aa16b062ff8ef301d25'
+    },
+    [ordered]@{
+        name = 'code_vectors.bin'
+        source_path = Join-Path $workspace 'cbm\vendored\nomic\code_vectors.bin'
+        bytes = [uint64]31377416
+        sha256 = 'c76bba4c5032323ded6202053af5afdbbac12f6d920c691b3b3b4cd708f99e83'
+    }
+)
+foreach ($spec in $nomicSpecs) {
+    Assert-OrdinaryEntry ([string]$spec.source_path) "Nomic runtime data $($spec.name)"
+    $actualBytes = [uint64](Get-AstroFileLengthLongPath ([string]$spec.source_path))
+    $actualHash = File-Sha256 ([string]$spec.source_path)
+    if ($actualBytes -ne [uint64]$spec.bytes -or
+        $actualHash -cne [string]$spec.sha256) {
+        Fail-AstroGlobalPublish 'ASTRO_GLOBAL_PUBLISH_NOMIC_SOURCE_DRIFT' `
+            "Nomic runtime data '$($spec.name)' differs from its compiled contract (bytes=$actualBytes; sha256=$actualHash; expected_bytes=$($spec.bytes); expected_sha256=$($spec.sha256))" `
+            'restore the exact hash-frozen Nomic data owned by this tree before publication'
+    }
+}
+$nomicClosureMaterial = @(
+    $nomicSpecs | ForEach-Object {
+        "$([string]$_.name)`t$([uint64]$_.bytes)`t$([string]$_.sha256)"
+    }
+) -join "`n"
+$nomicClosureSha = String-Sha256 $nomicClosureMaterial
+$generationClosureSha = String-Sha256 "$runtimeClosureSha`n$nomicClosureSha"
 
 Assert-OrdinaryEntry $InstallRoot 'global Astrolabe install root' -AllowAbsent
 New-AstroDirectoryLongPath $InstallRoot | Out-Null
@@ -638,7 +678,7 @@ Assert-OrdinaryEntry $generationsRoot 'global generations root' -AllowAbsent
 New-AstroDirectoryLongPath $generationsRoot | Out-Null
 Assert-OrdinaryEntry $generationsRoot 'global generations root'
 
-$generationName = "$ExpectedTreeSha-$artifactHashBefore-$runtimeClosureSha"
+$generationName = "$ExpectedTreeSha-$artifactHashBefore-$generationClosureSha"
 $generationPath = Join-Path $generationsRoot $generationName
 if (Test-AstroPathLongPath -LiteralPath $generationPath) {
     Fail-AstroGlobalPublish 'ASTRO_GLOBAL_PUBLISH_GENERATION_EXISTS' `
@@ -696,8 +736,39 @@ $publishedRuntime = @(
         }
     }
 )
+$stageNomicRoot = Join-Path $publishingPath 'data\nomic'
+New-AstroDirectoryLongPath $stageNomicRoot | Out-Null
+Assert-OrdinaryEntry $stageNomicRoot 'Nomic runtime data publication directory'
+$publishedNomic = @(
+    foreach ($spec in $nomicSpecs) {
+        $source = [string]$spec.source_path
+        $stagePath = Join-Path $stageNomicRoot ([string]$spec.name)
+        $finalPath = Join-Path $generationPath "data\nomic\$([string]$spec.name)"
+        Copy-NewDurableFile $source $stagePath
+        $sourceHashAfter = File-Sha256 $source
+        $stageHash = File-Sha256 $stagePath
+        $stageLength = [uint64](Get-AstroFileLengthLongPath $stagePath)
+        if ($sourceHashAfter -cne [string]$spec.sha256 -or
+            $stageHash -cne [string]$spec.sha256 -or
+            $stageLength -ne [uint64]$spec.bytes) {
+            Fail-AstroGlobalPublish 'ASTRO_GLOBAL_PUBLISH_NOMIC_COPY_MISMATCH' `
+                "Nomic runtime data '$($spec.name)' changed during copy (source_after=$sourceHashAfter; stage=$stageHash; stage_bytes=$stageLength; expected_sha256=$($spec.sha256); expected_bytes=$($spec.bytes))" `
+                'preserve the publication stage and investigate the exact runtime-data drift'
+        }
+        Set-AstroFileReadOnlyLongPath -LiteralPath $stagePath -ReadOnly $true
+        [ordered]@{
+            name = [string]$spec.name
+            source_path = $source
+            installed_path = $finalPath
+            bytes = [uint64]$spec.bytes
+            sha256 = [string]$spec.sha256
+            read_only = $true
+        }
+    }
+)
+$archaeologyRoot = Join-Path $InstallRoot 'scratch'
 $publication = [ordered]@{
-    schema = 'astrolabe.global-mcp-publication.v3'
+    schema = 'astrolabe.global-mcp-publication.v4'
     issue = $Issue
     published_at_utc = [DateTime]::UtcNow.ToString('o')
     tree_sha = $ExpectedTreeSha
@@ -739,6 +810,13 @@ $publication = [ordered]@{
         resolution =
             'recursive PE imports; Windows system/API-set modules retained in platform; every other module copied from first pinned launcher PATH match'
     }
+    runtime_data = [ordered]@{
+        schema = 'astrolabe.global-mcp-runtime-data.v1'
+        resolution = 'exe-relative:data/nomic'
+        file_count = $publishedNomic.Count
+        sha256 = $nomicClosureSha
+        files = @($publishedNomic)
+    }
     generation = [ordered]@{
         root = $generationPath
         id = $generationName
@@ -748,13 +826,16 @@ $publication = [ordered]@{
     client_activation = [ordered]@{
         status = 'not_attempted'
         required = $true
-        transaction_schema = 'astrolabe.global-mcp-activation.v1'
+        transaction_schema = 'astrolabe.global-mcp-activation.v2'
         activation_script = [IO.Path]::GetFullPath(
             (Join-Path $PSScriptRoot 'activate-global-astrolabe-mcp.ps1')
         )
         server_name = 'astrolabe'
         command = $finalArtifact
         arguments = @()
+        environment = [ordered]@{
+            ASTRO_ARCHAEOLOGY_ROOT = $archaeologyRoot
+        }
         codex = [ordered]@{
             scope = 'user'
             required = $true
@@ -796,12 +877,13 @@ $finalReceiptInfo = Get-AstroFileInfoLongPath $finalReceipt
 $persistedDependencies = @(
     $persistedReceipt.runtime_closure.dependencies
 )
+$persistedNomic = @($persistedReceipt.runtime_data.files)
 $persistedClosureMaterial = @(
     $persistedDependencies | ForEach-Object {
         "$([string]$_.name)`t$([uint64]$_.bytes)`t$([string]$_.sha256)"
     }
 ) -join "`n"
-if ([string]$persistedReceipt.schema -cne 'astrolabe.global-mcp-publication.v3' -or
+if ([string]$persistedReceipt.schema -cne 'astrolabe.global-mcp-publication.v4' -or
     [string]$persistedReceipt.tree_sha -cne $ExpectedTreeSha -or
     [string]$persistedReceipt.artifact.installed_path -cne $finalArtifact -or
     [string]$persistedReceipt.client_activation.status -cne
@@ -812,12 +894,24 @@ if ([string]$persistedReceipt.schema -cne 'astrolabe.global-mcp-publication.v3' 
     [string]$persistedReceipt.client_activation.server_name -cne
         'astrolabe' -or
     [bool]$persistedReceipt.client_activation.codex.required -ne $true -or
+    [string]$persistedReceipt.client_activation.environment.ASTRO_ARCHAEOLOGY_ROOT -cne
+        $archaeologyRoot -or
     [string]$persistedReceipt.runtime_closure.sha256 -cne
         $runtimeClosureSha -or
     [int]$persistedReceipt.runtime_closure.dependency_count -ne
         $publishedRuntime.Count -or
     $persistedDependencies.Count -ne $publishedRuntime.Count -or
     (String-Sha256 $persistedClosureMaterial) -cne $runtimeClosureSha -or
+    [string]$persistedReceipt.runtime_data.schema -cne
+        'astrolabe.global-mcp-runtime-data.v1' -or
+    [string]$persistedReceipt.runtime_data.resolution -cne
+        'exe-relative:data/nomic' -or
+    [string]$persistedReceipt.runtime_data.sha256 -cne $nomicClosureSha -or
+    [int]$persistedReceipt.runtime_data.file_count -ne $publishedNomic.Count -or
+    $persistedNomic.Count -ne $publishedNomic.Count -or
+    (String-Sha256 (@($persistedNomic | ForEach-Object {
+                    "$([string]$_.name)`t$([uint64]$_.bytes)`t$([string]$_.sha256)"
+                }) -join "`n")) -cne $nomicClosureSha -or
     [string]$persistedReceipt.artifact.sha256 -cne $finalHash -or
     [uint64]$persistedReceipt.artifact.bytes -ne $finalLength -or
     -not $finalArtifactInfo.IsReadOnly -or
@@ -827,6 +921,20 @@ if ([string]$persistedReceipt.schema -cne 'astrolabe.global-mcp-publication.v3' 
     Fail-AstroGlobalPublish 'ASTRO_GLOBAL_PUBLISH_READBACK_MISMATCH' `
         "published generation readback differs from authority: $generationPath" `
         'preserve the immutable generation and investigate the exact receipt/artifact mismatch'
+}
+for ($index = 0; $index -lt $publishedNomic.Count; $index++) {
+    $expected = $publishedNomic[$index]
+    $actual = $persistedNomic[$index]
+    if ([string]$actual.name -cne [string]$expected.name -or
+        [string]$actual.source_path -cne [string]$expected.source_path -or
+        [string]$actual.installed_path -cne [string]$expected.installed_path -or
+        [uint64]$actual.bytes -ne [uint64]$expected.bytes -or
+        [string]$actual.sha256 -cne [string]$expected.sha256 -or
+        [bool]$actual.read_only -ne $true) {
+        Fail-AstroGlobalPublish 'ASTRO_GLOBAL_PUBLISH_NOMIC_RECEIPT_MISMATCH' `
+            "persisted Nomic runtime data index $index differs from the measured closure" `
+            'preserve the immutable generation and inspect its exact publication receipt'
+    }
 }
 for ($index = 0; $index -lt $publishedRuntime.Count; $index++) {
     $expected = $publishedRuntime[$index]
@@ -869,6 +977,30 @@ $runtimeReadback = @(
         }
     }
 )
+$nomicReadback = @(
+    foreach ($file in $publishedNomic) {
+        $path = [string]$file.installed_path
+        Assert-OrdinaryEntry $path "published Nomic runtime data $($file.name)"
+        $hash = File-Sha256 $path
+        $length = [uint64](Get-AstroFileLengthLongPath $path)
+        $info = Get-AstroFileInfoLongPath $path
+        if ($hash -cne [string]$file.sha256 -or
+            $length -ne [uint64]$file.bytes -or
+            -not $info.IsReadOnly) {
+            Fail-AstroGlobalPublish 'ASTRO_GLOBAL_PUBLISH_NOMIC_READBACK_MISMATCH' `
+                "published Nomic runtime data '$($file.name)' differs from its exact record (path=$path; sha256=$hash; bytes=$length; read_only=$($info.IsReadOnly))" `
+                'preserve the immutable generation and inspect the exact runtime-data bytes'
+        }
+        [ordered]@{
+            name = [string]$file.name
+            path = $path
+            bytes = $length
+            sha256 = $hash
+            file_id = File-Identity $path
+            read_only = $info.IsReadOnly
+        }
+    }
+)
 
 [ordered]@{
     code = 'ASTRO_GLOBAL_MCP_GENERATION_PUBLISHED'
@@ -893,11 +1025,17 @@ $runtimeReadback = @(
         dependency_count = $runtimeReadback.Count
         dependencies = @($runtimeReadback)
     }
+    runtime_data = [ordered]@{
+        sha256 = $nomicClosureSha
+        file_count = $nomicReadback.Count
+        files = @($nomicReadback)
+    }
     client_activation = [ordered]@{
         status = 'not_attempted'
         required = $true
         activation_script =
             [string]$persistedReceipt.client_activation.activation_script
+        environment = $persistedReceipt.client_activation.environment
     }
     source_stage_absent = -not (Test-AstroPathLongPath -LiteralPath $publishingPath)
 } | ConvertTo-Json -Depth 10 -Compress | Write-Output

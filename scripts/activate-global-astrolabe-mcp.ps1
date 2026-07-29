@@ -4,8 +4,9 @@
 
 .DESCRIPTION
     Publication and activation are separate durable transactions. This command accepts only an
-    immutable astrolabe.global-mcp-publication.v3 receipt whose artifact bytes still match its
-    receipt and whose frozen tree matches the live issue-owned launcher generation.
+    immutable astrolabe.global-mcp-publication.v4 receipt whose artifact and Nomic runtime-data
+    bytes still match its receipt and whose frozen tree matches the live issue-owned launcher
+    generation.
 
     It snapshots both real user configuration files, validates the complete Codex TOML through
     the installed Codex CLI, strictly parses the complete Claude JSON with duplicate-key
@@ -101,6 +102,36 @@ function Assert-OrdinaryFile {
     }
 }
 
+function Get-OrdinaryDirectoryReadback {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][string]$Description
+    )
+
+    $state = Get-AstroPathEntryState $Path
+    if ($state.State -cne 'present' -or
+        ($state.Attributes -band [IO.FileAttributes]::Directory) -eq 0 -or
+        ($state.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+        Fail-AstroGlobalActivation 'ASTRO_GLOBAL_ACTIVATION_DIRECTORY_UNAVAILABLE' `
+            "$Description is not one evaluable ordinary directory: $Path (state=$($state.State); attributes=$($state.Attributes); error=$($state.Error))" `
+            'restore the exact ordinary local directory and retry unchanged'
+    }
+    $handle = [AstroLauncherLockNative]::OpenExactRenameDirectory(
+        [IO.Path]::GetFullPath($Path)
+    )
+    try {
+        $identity = [AstroLauncherLockNative]::GetFileIdentity($handle)
+    }
+    finally { $handle.Dispose() }
+    return [pscustomobject]@{
+        path = [IO.Path]::GetFullPath($Path)
+        file_id = $identity
+        attributes = [string]$state.Attributes
+        entry_count = @(Get-AstroDirectoryEntriesLongPath $Path).Count
+        last_write_utc = [IO.Directory]::GetLastWriteTimeUtc($Path).ToString('o')
+    }
+}
+
 function Read-ConfigSnapshot {
     param(
         [Parameter(Mandatory)][string]$Path,
@@ -172,6 +203,15 @@ function Open-ConfigVerdictLease {
             Fail-AstroGlobalActivation 'ASTRO_GLOBAL_ACTIVATION_UTF8_INVALID' `
                 "$Description is not strict UTF-8: $Path ($($_.Exception.Message))" `
                 'repair the exact configuration encoding without discarding any setting, then retry'
+        }
+        $environmentValid = if (
+            [string]::IsNullOrWhiteSpace($ExpectedArchaeologyRoot)
+        ) {
+            $envCount -ge 0
+        }
+        else {
+            $envCount -eq 1 -and
+                $archaeologyRoot -ceq $ExpectedArchaeologyRoot
         }
         return [pscustomobject]@{
             stream = $stream
@@ -423,7 +463,8 @@ function Get-StrictJsonHashtable {
 function Get-ClaudeConfigInspection {
     param(
         [Parameter(Mandatory)][AllowEmptyString()][string]$Text,
-        [Parameter(Mandatory)][string]$Description
+        [Parameter(Mandatory)][string]$Description,
+        [string]$ExpectedArchaeologyRoot = ''
     )
 
     Assert-StrictJsonText $Text $Description -RequireObject
@@ -485,6 +526,7 @@ function Get-ClaudeConfigInspection {
         $command = $null
         $argsCount = -1
         $envCount = -1
+        $archaeologyRoot = $null
         $targetPropertyCount = 0
         if ($targetFound) {
             foreach ($property in $target.EnumerateObject()) {
@@ -503,7 +545,14 @@ function Get-ClaudeConfigInspection {
                 }
                 elseif ($property.Name -ceq 'env' -and
                     $property.Value.ValueKind -eq [Text.Json.JsonValueKind]::Object) {
-                    $envCount = @($property.Value.EnumerateObject()).Count
+                    $environment = @($property.Value.EnumerateObject())
+                    $envCount = $environment.Count
+                    if ($envCount -eq 1 -and
+                        $environment[0].Name -ceq 'ASTRO_ARCHAEOLOGY_ROOT' -and
+                        $environment[0].Value.ValueKind -eq
+                            [Text.Json.JsonValueKind]::String) {
+                        $archaeologyRoot = $environment[0].Value.GetString()
+                    }
                 }
             }
         }
@@ -516,10 +565,11 @@ function Get-ClaudeConfigInspection {
                 $type -ceq 'stdio' -and
                 $null -ne $command -and
                 $argsCount -eq 0 -and
-                $envCount -eq 0)
+                $environmentValid)
             command = $command
             args_count = $argsCount
             env_count = $envCount
+            archaeology_root = $archaeologyRoot
         }
     }
     finally { $document.Dispose() }
@@ -528,7 +578,8 @@ function Get-ClaudeConfigInspection {
 function New-ClaudeCandidate {
     param(
         [Parameter(Mandatory)][string]$BeforeText,
-        [Parameter(Mandatory)][string]$ArtifactPath
+        [Parameter(Mandatory)][string]$ArtifactPath,
+        [Parameter(Mandatory)][string]$ArchaeologyRoot
     )
 
     $before = Get-ClaudeConfigInspection `
@@ -552,13 +603,16 @@ function New-ClaudeCandidate {
     $target['type'] = [Text.Json.Nodes.JsonValue]::Create([string]'stdio')
     $target['command'] = [Text.Json.Nodes.JsonValue]::Create($ArtifactPath)
     $target['args'] = [Text.Json.Nodes.JsonArray]::new()
-    $target['env'] = [Text.Json.Nodes.JsonObject]::new()
+    $targetEnvironment = [Text.Json.Nodes.JsonObject]::new()
+    $targetEnvironment['ASTRO_ARCHAEOLOGY_ROOT'] =
+        [Text.Json.Nodes.JsonValue]::Create($ArchaeologyRoot)
+    $target['env'] = $targetEnvironment
     $servers['astrolabe'] = $target
     $jsonOptions = [Text.Json.JsonSerializerOptions]::new()
     $jsonOptions.WriteIndented = $true
     $candidate = $root.ToJsonString($jsonOptions)
     $candidateInspection = Get-ClaudeConfigInspection `
-        $candidate 'Claude activation candidate'
+        $candidate 'Claude activation candidate' $ArchaeologyRoot
     if ($candidateInspection.unrelated_sha256 -cne $before.unrelated_sha256) {
         Fail-AstroGlobalActivation 'ASTRO_GLOBAL_ACTIVATION_CLAUDE_UNRELATED_DRIFT' `
             'Claude activation candidate changes JSON state outside mcpServers.astrolabe' `
@@ -682,6 +736,7 @@ function New-CodexCandidate {
     param(
         [Parameter(Mandatory)][string]$BeforeText,
         [Parameter(Mandatory)][string]$ArtifactPath,
+        [Parameter(Mandatory)][string]$ArchaeologyRoot,
         [Parameter(Mandatory)][string]$CliPath,
         [Parameter(Mandatory)][string]$BeforeHome,
         [Parameter(Mandatory)][string]$CandidateHome
@@ -701,10 +756,15 @@ function New-CodexCandidate {
         $ArtifactPath,
         [type][string]
     )
+    $encodedArchaeologyRoot = [Text.Json.JsonSerializer]::Serialize(
+        $ArchaeologyRoot,
+        [type][string]
+    )
     $block = @(
         '[mcp_servers.astrolabe]'
         "command = $encodedCommand"
         'args = []'
+        "env = { ASTRO_ARCHAEOLOGY_ROOT = $encodedArchaeologyRoot }"
         'enabled = true'
         'required = true'
         'default_tools_approval_mode = "approve"'
@@ -732,7 +792,10 @@ function New-CodexCandidate {
         [bool]$after.value['enabled'] -ne $true -or
         [string]$after.value['transport']['type'] -cne 'stdio' -or
         [string]$after.value['transport']['command'] -cne $ArtifactPath -or
-        @($after.value['transport']['args']).Count -ne 0) {
+        @($after.value['transport']['args']).Count -ne 0 -or
+        @($after.value['transport']['env'].Keys).Count -ne 1 -or
+        [string]$after.value['transport']['env']['ASTRO_ARCHAEOLOGY_ROOT'] -cne
+            $ArchaeologyRoot) {
         Fail-AstroGlobalActivation 'ASTRO_GLOBAL_ACTIVATION_CODEX_CANDIDATE_INVALID' `
             "Codex rejected or reinterpreted the exact activation candidate: $($after.output)" `
             'preserve the candidate and inspect the installed Codex configuration contract'
@@ -746,6 +809,7 @@ function New-CodexCandidate {
     $targetText = $candidate.Substring($candidateSpan.start, $candidateSpan.length)
     foreach ($requiredLine in @(
             'args = []',
+            "env = { ASTRO_ARCHAEOLOGY_ROOT = $encodedArchaeologyRoot }",
             'enabled = true',
             'required = true',
             'default_tools_approval_mode = "approve"'
@@ -993,6 +1057,11 @@ $claudeVerdictLease = $null
 $completionPath = $null
 $completionSha256 = $null
 $completionPublished = $false
+$archaeologyRoot = $null
+$archaeologyReadback = $null
+$nomicDirectoryReadback = $null
+$runtimeData = $null
+$runtimeFiles = @()
 $rollback = [Collections.Generic.List[object]]::new()
 
 try {
@@ -1045,14 +1114,14 @@ try {
     }
     $receiptText = Read-AstroUtf8FileLongPath $receiptPath
     $receipt = Get-StrictJsonHashtable $receiptText 'immutable publication receipt'
-    if ([string]$receipt['schema'] -cne 'astrolabe.global-mcp-publication.v3' -or
+    if ([string]$receipt['schema'] -cne 'astrolabe.global-mcp-publication.v4' -or
         [string]$receipt['tree_sha'] -cne $ExpectedTreeSha -or
         [string]$receipt['client_activation']['status'] -cne 'not_attempted' -or
         [bool]$receipt['client_activation']['required'] -ne $true -or
         [string]$receipt['client_activation']['server_name'] -cne 'astrolabe') {
         Fail-AstroGlobalActivation 'ASTRO_GLOBAL_ACTIVATION_RECEIPT_INVALID' `
             'publication receipt schema/tree/activation contract does not authorize activation' `
-            'publish one v3 immutable generation from this exact tree before activation'
+            'publish one v4 immutable generation from this exact tree before activation'
     }
     $artifactPath = [IO.Path]::GetFullPath(
         [string]$receipt['artifact']['installed_path']
@@ -1069,6 +1138,33 @@ try {
             'receipt, generation root, artifact path, and activation command are not one exact directory' `
             'preserve the generation and inspect its immutable publication receipt'
     }
+    $environment = $receipt['client_activation']['environment']
+    if ($environment -isnot [System.Collections.IDictionary] -or
+        $environment.Count -ne 1 -or
+        -not $environment.Contains('ASTRO_ARCHAEOLOGY_ROOT')) {
+        Fail-AstroGlobalActivation 'ASTRO_GLOBAL_ACTIVATION_ENVIRONMENT_INVALID' `
+            'publication activation environment is not the exact one-variable archaeology contract' `
+            'publish one v4 generation with exactly ASTRO_ARCHAEOLOGY_ROOT'
+    }
+    $archaeologyRootRaw = [string]$environment['ASTRO_ARCHAEOLOGY_ROOT']
+    $archaeologyRoot = [IO.Path]::GetFullPath($archaeologyRootRaw)
+    $installRoot = [IO.Path]::GetFullPath(
+        (Split-Path -Parent (Split-Path -Parent $generationPath))
+    )
+    $expectedArchaeologyRoot = [IO.Path]::GetFullPath(
+        (Join-Path $installRoot 'scratch')
+    )
+    $archaeologyDrive = [IO.DriveInfo]::new(
+        [IO.Path]::GetPathRoot($archaeologyRoot)
+    )
+    if ($archaeologyRootRaw -cne $archaeologyRoot -or
+        $archaeologyRoot -cne $expectedArchaeologyRoot -or
+        [IO.Path]::GetPathRoot($archaeologyRoot) -notmatch '^[A-Za-z]:\\$' -or
+        $archaeologyDrive.DriveType -ne [IO.DriveType]::Fixed) {
+        Fail-AstroGlobalActivation 'ASTRO_GLOBAL_ACTIVATION_ARCHAEOLOGY_ROOT_INVALID' `
+            "publication archaeology root is not the normalized local install-owned path (actual=$archaeologyRootRaw; expected=$expectedArchaeologyRoot)" `
+            'publish one generation whose mutable scratch root is <install-root>\scratch on a local drive'
+    }
     Assert-OrdinaryFile $artifactPath 'immutable published Astrolabe artifact'
     $artifactHash = Get-FileSha256 $artifactPath
     $artifactBytes = [uint64](Get-AstroFileLengthLongPath $artifactPath)
@@ -1079,6 +1175,54 @@ try {
         Fail-AstroGlobalActivation 'ASTRO_GLOBAL_ACTIVATION_ARTIFACT_DRIFT' `
             'immutable artifact or receipt physical readback differs from publication authority' `
             'preserve the generation and investigate its exact bytes before activation'
+    }
+    $runtimeData = $receipt['runtime_data']
+    $runtimeFiles = @($runtimeData['files'])
+    if ([string]$runtimeData['schema'] -cne
+            'astrolabe.global-mcp-runtime-data.v1' -or
+        [string]$runtimeData['resolution'] -cne 'exe-relative:data/nomic' -or
+        [int]$runtimeData['file_count'] -ne 2 -or
+        $runtimeFiles.Count -ne 2) {
+        Fail-AstroGlobalActivation 'ASTRO_GLOBAL_ACTIVATION_RUNTIME_DATA_INVALID' `
+            'publication receipt lacks the exact two-file exe-relative Nomic runtime-data closure' `
+            'publish the hash-frozen Nomic runtime data before client activation'
+    }
+    $expectedRuntimeParent = [IO.Path]::GetFullPath(
+        (Join-Path $generationPath 'data\nomic')
+    )
+    $nomicDirectoryReadback = Get-OrdinaryDirectoryReadback `
+        $expectedRuntimeParent 'immutable Nomic runtime data directory'
+    if ($nomicDirectoryReadback.entry_count -ne 2) {
+        Fail-AstroGlobalActivation 'ASTRO_GLOBAL_ACTIVATION_RUNTIME_DATA_INVENTORY_INVALID' `
+            "Nomic runtime data directory is not the exact two-file closure: $expectedRuntimeParent (entries=$($nomicDirectoryReadback.entry_count))" `
+            'preserve the generation and inspect its exact runtime-data inventory'
+    }
+    $runtimeMaterial = @(
+        foreach ($file in $runtimeFiles) {
+            $path = [IO.Path]::GetFullPath([string]$file['installed_path'])
+            if ([IO.Path]::GetFullPath((Split-Path -Parent $path)) -cne
+                $expectedRuntimeParent) {
+                Fail-AstroGlobalActivation 'ASTRO_GLOBAL_ACTIVATION_RUNTIME_DATA_ESCAPE' `
+                    "Nomic runtime data escapes the immutable generation: $path" `
+                    'preserve the generation and inspect its publication receipt'
+            }
+            Assert-OrdinaryFile $path "immutable Nomic runtime data $($file['name'])"
+            $hash = Get-FileSha256 $path
+            $bytes = [uint64](Get-AstroFileLengthLongPath $path)
+            if ($hash -cne [string]$file['sha256'] -or
+                $bytes -ne [uint64]$file['bytes'] -or
+                -not (Get-AstroFileInfoLongPath $path).IsReadOnly) {
+                Fail-AstroGlobalActivation 'ASTRO_GLOBAL_ACTIVATION_RUNTIME_DATA_DRIFT' `
+                    "immutable Nomic runtime data differs from publication authority: $path" `
+                    'preserve the generation and investigate its runtime-data bytes'
+            }
+            "$([string]$file['name'])`t$bytes`t$hash"
+        }
+    ) -join "`n"
+    if ((Get-StringSha256 $runtimeMaterial) -cne [string]$runtimeData['sha256']) {
+        Fail-AstroGlobalActivation 'ASTRO_GLOBAL_ACTIVATION_RUNTIME_DATA_CLOSURE_MISMATCH' `
+            'Nomic runtime-data closure hash differs from its independently read files' `
+            'preserve the immutable generation and inspect its receipt ordering/content'
     }
 
     if ([string]::IsNullOrWhiteSpace($env:USERPROFILE)) {
@@ -1102,7 +1246,6 @@ try {
     Assert-OrdinaryFile $ClaudeConfigPath 'Claude user configuration'
 
     if ([string]::IsNullOrWhiteSpace($TransactionRoot)) {
-        $installRoot = Split-Path -Parent (Split-Path -Parent $generationPath)
         $TransactionRoot = Join-Path $installRoot 'activation-transactions'
     }
     $TransactionRoot = [IO.Path]::GetFullPath($TransactionRoot)
@@ -1164,6 +1307,15 @@ try {
 
     $codexBefore = Read-ConfigSnapshot $CodexConfigPath 'Codex user configuration'
     $claudeBefore = Read-ConfigSnapshot $ClaudeConfigPath 'Claude user configuration'
+    $archaeologyBefore = Get-AstroPathEntryState $archaeologyRoot
+    if ($archaeologyBefore.State -notin @('absent', 'present') -or
+        ($archaeologyBefore.State -ceq 'present' -and
+            (($archaeologyBefore.Attributes -band [IO.FileAttributes]::Directory) -eq 0 -or
+             ($archaeologyBefore.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0))) {
+        Fail-AstroGlobalActivation 'ASTRO_GLOBAL_ACTIVATION_ARCHAEOLOGY_ROOT_UNAVAILABLE' `
+            "archaeology root is neither absent nor one ordinary directory: $archaeologyRoot (state=$($archaeologyBefore.State); attributes=$($archaeologyBefore.Attributes); error=$($archaeologyBefore.Error))" `
+            'repair the exact install-owned scratch path before activation'
+    }
     $transactionId = (
         [DateTime]::UtcNow.ToString('yyyyMMddTHHmmssfffffffZ') +
         "-issue-$Issue-" + [Guid]::NewGuid().ToString('N')
@@ -1180,7 +1332,7 @@ try {
     Write-NewDurableBytes $codexBeforePath $codexBefore.bytes_value
     Write-NewDurableBytes $claudeBeforePath $claudeBefore.bytes_value
     $intent = [ordered]@{
-        schema = 'astrolabe.global-mcp-activation-intent.v1'
+        schema = 'astrolabe.global-mcp-activation-intent.v2'
         transaction_id = $transactionId
         issue = $Issue
         created_at_utc = [DateTime]::UtcNow.ToString('o')
@@ -1200,6 +1352,19 @@ try {
             path = $artifactPath
             bytes = $artifactBytes
             sha256 = $artifactHash
+        }
+        runtime = [ordered]@{
+            archaeology_root = $archaeologyRoot
+            archaeology_root_before_state = [string]$archaeologyBefore.State
+            nomic_runtime_data_sha256 = [string]$runtimeData['sha256']
+            nomic_runtime_data_file_count = $runtimeFiles.Count
+            nomic_runtime_data_directory = [ordered]@{
+                path = $nomicDirectoryReadback.path
+                file_id = $nomicDirectoryReadback.file_id
+                attributes = $nomicDirectoryReadback.attributes
+                entry_count = $nomicDirectoryReadback.entry_count
+                last_write_utc = $nomicDirectoryReadback.last_write_utc
+            }
         }
         clients = [ordered]@{
             codex = [ordered]@{
@@ -1225,6 +1390,11 @@ try {
             'candidate-both-first; exact precommit drift read; ReplaceFileW metadata-preserving commit with original-file backup; explicit file flush/readback; ownership-checked reverse replacement; read-share-only leases deny write/delete on both exact configs through durable completion'
     }
     Write-NewDurableJson (Join-Path $transactionPath 'intent.json') $intent
+    if ($archaeologyBefore.State -ceq 'absent') {
+        New-AstroDirectoryLongPath $archaeologyRoot | Out-Null
+    }
+    $archaeologyReadback = Get-OrdinaryDirectoryReadback `
+        $archaeologyRoot 'installed archaeology scratch root'
 
     $beforeHome = Join-Path $transactionPath 'codex-before-home'
     $candidateHome = Join-Path $transactionPath 'codex-candidate-home'
@@ -1233,7 +1403,8 @@ try {
     Write-NewDurableBytes (Join-Path $beforeHome 'config.toml') $codexBefore.bytes_value
 
     $codexCandidate = New-CodexCandidate `
-        $codexBefore.text $artifactPath $CodexCliPath $beforeHome $candidateHome
+        $codexBefore.text $artifactPath $archaeologyRoot `
+        $CodexCliPath $beforeHome $candidateHome
     $codexCandidatePath = Join-Path $transactionPath 'codex.candidate.toml'
     $codexCommitStagePath = Join-Path $transactionPath 'codex.commit-stage.toml'
     $candidateHomePath = Join-Path $candidateHome 'config.toml'
@@ -1243,7 +1414,8 @@ try {
     $codexCommitStage = Read-ConfigSnapshot `
         $codexCommitStagePath 'Codex activation commit stage'
 
-    $claudeCandidate = New-ClaudeCandidate $claudeBefore.text $artifactPath
+    $claudeCandidate = New-ClaudeCandidate `
+        $claudeBefore.text $artifactPath $archaeologyRoot
     $claudeCandidatePath = Join-Path $transactionPath 'claude.candidate.json'
     $claudeCommitStagePath = Join-Path $transactionPath 'claude.commit-stage.json'
     Write-NewDurableText $claudeCandidatePath $claudeCandidate.text
@@ -1251,7 +1423,7 @@ try {
     $claudeCommitStage = Read-ConfigSnapshot `
         $claudeCommitStagePath 'Claude activation commit stage'
     $candidateRecord = [ordered]@{
-        schema = 'astrolabe.global-mcp-activation-candidates.v1'
+        schema = 'astrolabe.global-mcp-activation-candidates.v2'
         transaction_id = $transactionId
         intent_sha256 = Get-FileSha256 (Join-Path $transactionPath 'intent.json')
         created_at_utc = [DateTime]::UtcNow.ToString('o')
@@ -1264,7 +1436,8 @@ try {
             target_was_present = $codexCandidate.target_was_present
             unrelated_prefix_sha256 = $codexCandidate.unrelated_prefix_sha256
             unrelated_suffix_sha256 = $codexCandidate.unrelated_suffix_sha256
-            cli_semantic_readback = 'stdio/exact-command/empty-args/enabled'
+            cli_semantic_readback =
+                'stdio/exact-command/empty-args/exact-ASTRO_ARCHAEOLOGY_ROOT/enabled'
         }
         claude_code = [ordered]@{
             path = $claudeCandidatePath
@@ -1273,7 +1446,8 @@ try {
             commit_stage_path = $claudeCommitStagePath
             commit_stage_file_id = $claudeCommitStage.file_id
             unrelated_semantic_sha256 = $claudeCandidate.unrelated_sha256
-            semantic_readback = 'user mcpServers.astrolabe stdio/exact-command/empty-args/empty-env'
+            semantic_readback =
+                'user mcpServers.astrolabe stdio/exact-command/empty-args/exact-ASTRO_ARCHAEOLOGY_ROOT'
         }
     }
     Write-NewDurableJson (Join-Path $transactionPath 'candidates.json') $candidateRecord
@@ -1326,6 +1500,9 @@ try {
     if (-not $codexLive.found -or
         [string]$codexLive.value['transport']['command'] -cne $artifactPath -or
         @($codexLive.value['transport']['args']).Count -ne 0 -or
+        @($codexLive.value['transport']['env'].Keys).Count -ne 1 -or
+        [string]$codexLive.value['transport']['env']['ASTRO_ARCHAEOLOGY_ROOT'] -cne
+            $archaeologyRoot -or
         [bool]$codexLive.value['enabled'] -ne $true) {
         Fail-AstroGlobalActivation 'ASTRO_GLOBAL_ACTIVATION_CODEX_SEMANTIC_MISMATCH' `
             "persisted Codex config does not resolve the exact artifact: $($codexLive.output)" `
@@ -1367,11 +1544,12 @@ try {
         'ASTRO_GLOBAL_ACTIVATION_CLAUDE_READBACK_MISMATCH' `
         'Claude config after replacement'
     $claudeLive = Get-ClaudeConfigInspection $claudeAfter.text `
-        'persisted Claude activation readback'
+        'persisted Claude activation readback' $archaeologyRoot
     if ($claudeLive.unrelated_sha256 -cne
             [string]$candidateRecord.claude_code.unrelated_semantic_sha256 -or
         -not $claudeLive.target_valid -or
-        $claudeLive.command -cne $artifactPath) {
+        $claudeLive.command -cne $artifactPath -or
+        $claudeLive.archaeology_root -cne $archaeologyRoot) {
         Fail-AstroGlobalActivation 'ASTRO_GLOBAL_ACTIVATION_CLAUDE_SEMANTIC_MISMATCH' `
             'persisted Claude config does not preserve unrelated state plus the exact stdio target' `
             'preserve the transaction; ownership-checked rollback will restore only activation-owned bytes'
@@ -1384,7 +1562,7 @@ try {
     $claudeAfter = $claudeVerdictLease.snapshot
 
     $completion = [ordered]@{
-        schema = 'astrolabe.global-mcp-activation.v1'
+        schema = 'astrolabe.global-mcp-activation.v2'
         verdict = 'activated'
         transaction_id = $transactionId
         completed_at_utc = [DateTime]::UtcNow.ToString('o')
@@ -1397,6 +1575,18 @@ try {
             path = $artifactPath
             bytes = $artifactBytes
             sha256 = $artifactHash
+        }
+        runtime = [ordered]@{
+            archaeology_root = [ordered]@{
+                path = $archaeologyReadback.path
+                file_id = $archaeologyReadback.file_id
+                attributes = $archaeologyReadback.attributes
+                entry_count = $archaeologyReadback.entry_count
+                last_write_utc = $archaeologyReadback.last_write_utc
+                before_state = [string]$archaeologyBefore.State
+            }
+            nomic_runtime_data_sha256 = [string]$runtimeData['sha256']
+            nomic_runtime_data_file_count = $runtimeFiles.Count
         }
         codex = [ordered]@{
             config_path = $CodexConfigPath
@@ -1427,13 +1617,21 @@ try {
             command = $claudeLive.command
             args_count = $claudeLive.args_count
             env_count = $claudeLive.env_count
+            archaeology_root = $claudeLive.archaeology_root
             candidate_evidence_sha256 = Get-FileSha256 $claudeCandidatePath
             verdict_lease_acquired_at_utc = $claudeVerdictLease.acquired_at_utc
             verdict_lease_policy = 'read-share-only; write-and-delete-denied-through-completion'
             commit_stage_absent =
                 -not (Test-AstroPathLongPath -LiteralPath $claudeCommitStagePath)
         }
-        source_of_truth = @($CodexConfigPath, $ClaudeConfigPath)
+        source_of_truth = @(
+            $receiptPath,
+            $artifactPath,
+            $expectedRuntimeParent,
+            $archaeologyRoot,
+            $CodexConfigPath,
+            $ClaudeConfigPath
+        )
     }
     $completionPath = Join-Path $transactionPath 'completion.json'
     $completionStagePath = Join-Path $transactionPath 'completion.stage.json'
@@ -1441,7 +1639,15 @@ try {
     $completionReadback = Get-StrictJsonHashtable `
         (Read-AstroUtf8FileLongPath $completionStagePath) `
         'activation completion stage readback'
-    if ([string]$completionReadback['verdict'] -cne 'activated' -or
+    if ([string]$completionReadback['schema'] -cne
+            'astrolabe.global-mcp-activation.v2' -or
+        [string]$completionReadback['verdict'] -cne 'activated' -or
+        [string]$completionReadback['runtime']['archaeology_root']['path'] -cne
+            $archaeologyRoot -or
+        [string]$completionReadback['runtime']['nomic_runtime_data_sha256'] -cne
+            [string]$runtimeData['sha256'] -or
+        [string]$completionReadback['runtime']['nomic_runtime_data_directory']['file_id'] -cne
+            $nomicDirectoryReadback.file_id -or
         [string]$completionReadback['codex']['after_sha256'] -cne
             $codexAfter.sha256 -or
         [string]$completionReadback['claude_code']['after_sha256'] -cne
@@ -1460,7 +1666,15 @@ try {
         (Read-AstroUtf8FileLongPath $completionPath) `
         'activation completion final readback'
     if ((Get-FileSha256 $completionPath) -cne $completionSha256 -or
+        [string]$completionFinalReadback['schema'] -cne
+            'astrolabe.global-mcp-activation.v2' -or
         [string]$completionFinalReadback['verdict'] -cne 'activated' -or
+        [string]$completionFinalReadback['runtime']['archaeology_root']['path'] -cne
+            $archaeologyRoot -or
+        [string]$completionFinalReadback['runtime']['nomic_runtime_data_sha256'] -cne
+            [string]$runtimeData['sha256'] -or
+        [string]$completionFinalReadback['runtime']['nomic_runtime_data_directory']['file_id'] -cne
+            $nomicDirectoryReadback.file_id -or
         [string]$completionFinalReadback['codex']['after_sha256'] -cne
             $codexAfter.sha256 -or
         [string]$completionFinalReadback['claude_code']['after_sha256'] -cne
@@ -1479,17 +1693,27 @@ try {
         tree_sha = $ExpectedTreeSha
         artifact_path = $artifactPath
         artifact_sha256 = $artifactHash
+        runtime = [ordered]@{
+            archaeology_root = $archaeologyRoot
+            archaeology_root_file_id = $archaeologyReadback.file_id
+            nomic_runtime_data_sha256 = [string]$runtimeData['sha256']
+            nomic_runtime_data_directory = $nomicDirectoryReadback.path
+            nomic_runtime_data_directory_file_id = $nomicDirectoryReadback.file_id
+        }
         codex = [ordered]@{
             config_path = $CodexConfigPath
             bytes = $codexAfter.bytes
             sha256 = $codexAfter.sha256
             command = [string]$codexLive.value['transport']['command']
+            archaeology_root =
+                [string]$codexLive.value['transport']['env']['ASTRO_ARCHAEOLOGY_ROOT']
         }
         claude_code = [ordered]@{
             config_path = $ClaudeConfigPath
             bytes = $claudeAfter.bytes
             sha256 = $claudeAfter.sha256
             command = $claudeLive.command
+            archaeology_root = $claudeLive.archaeology_root
         }
     } | ConvertTo-Json -Depth 12 -Compress | Write-Output
 }
@@ -1588,6 +1812,24 @@ catch {
             }
             rollback = @($rollback)
             final_config_state = $finalStates
+            final_runtime_state = [ordered]@{
+                archaeology_root = $(if ($null -eq $archaeologyRoot) {
+                        $null
+                    } else {
+                        try {
+                            Get-OrdinaryDirectoryReadback `
+                                $archaeologyRoot 'archaeology root fault readback'
+                        }
+                        catch {
+                            [ordered]@{
+                                path = $archaeologyRoot
+                                state = 'unevaluable'
+                                error = $_.Exception.Message
+                            }
+                        }
+                    })
+                nomic_runtime_data_directory = $nomicDirectoryReadback
+            }
         }
         try {
             $faultName = if ($completionPublished) {
