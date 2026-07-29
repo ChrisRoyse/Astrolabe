@@ -8083,12 +8083,26 @@ static char *assemble_search_output(search_result_t *sr, int sr_count, grep_matc
 /* Read grep output from fp, parse file:line:content format, apply path filter,
  * and return a dynamically-allocated grep_match_t array. */
 /* Strip root path prefix from a file path. */
+static bool search_path_separator(char ch) {
+    return ch == '/' || ch == '\\';
+}
+
 static const char *strip_root_prefix(const char *path, const char *root, size_t root_len) {
-    if (strncmp(path, root, root_len) != 0 || (path[root_len] != '\0' && path[root_len] != '/')) {
+    size_t prefix_len = root_len;
+    while (prefix_len > 1 && search_path_separator(root[prefix_len - 1])) {
+        prefix_len--;
+    }
+#ifdef _WIN32
+    int prefix_cmp = _strnicmp(path, root, prefix_len);
+#else
+    int prefix_cmp = strncmp(path, root, prefix_len);
+#endif
+    if (prefix_cmp != 0 ||
+        (path[prefix_len] != '\0' && !search_path_separator(path[prefix_len]))) {
         return path;
     }
-    const char *p = path + root_len;
-    if (*p == '/') {
+    const char *p = path + prefix_len;
+    while (search_path_separator(*p)) {
         p++;
     }
     return p;
@@ -9479,6 +9493,14 @@ static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
         free(file_pattern);
         return _res;
     }
+#ifdef _WIN32
+    /* The persisted root may retain the caller's native backslashes, while
+     * PowerShell Select-String reports its resolved Path with forward slashes.
+     * Keep one normalized lexical representation for scope construction and
+     * relative extraction; cbm_path_within_root still independently binds the
+     * existing root and result to their final filesystem objects. */
+    cbm_normalize_path_sep(root_path);
+#endif
 
     if (!validate_search_args(root_path, file_pattern)) {
         if (has_path_filter) {
