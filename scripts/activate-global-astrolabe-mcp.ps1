@@ -451,6 +451,45 @@ function Get-StrictJsonHashtable {
     return $Text | ConvertFrom-Json -AsHashtable -Depth 128
 }
 
+function Assert-ActivationCompletionReadback {
+    param(
+        [Parameter(Mandatory)][System.Collections.IDictionary]$Completion,
+        [Parameter(Mandatory)][string]$Description,
+        [Parameter(Mandatory)][string]$ExpectedArchaeologyRoot,
+        [Parameter(Mandatory)][string]$ExpectedNomicSha256,
+        [Parameter(Mandatory)][string]$ExpectedNomicDirectoryFileId,
+        [Parameter(Mandatory)][string]$ExpectedCodexSha256,
+        [Parameter(Mandatory)][string]$ExpectedClaudeSha256
+    )
+
+    $runtime = $Completion['runtime']
+    $codex = $Completion['codex']
+    $claude = $Completion['claude_code']
+    if ($runtime -isnot [System.Collections.IDictionary] -or
+        $codex -isnot [System.Collections.IDictionary] -or
+        $claude -isnot [System.Collections.IDictionary] -or
+        -not $runtime.Contains('archaeology_root') -or
+        $runtime['archaeology_root'] -isnot [System.Collections.IDictionary] -or
+        -not $runtime.Contains('nomic_runtime_data_directory') -or
+        $runtime['nomic_runtime_data_directory'] -isnot
+            [System.Collections.IDictionary] -or
+        [string]$Completion['schema'] -cne
+            'astrolabe.global-mcp-activation.v2' -or
+        [string]$Completion['verdict'] -cne 'activated' -or
+        [string]$runtime['archaeology_root']['path'] -cne
+            $ExpectedArchaeologyRoot -or
+        [string]$runtime['nomic_runtime_data_sha256'] -cne
+            $ExpectedNomicSha256 -or
+        [string]$runtime['nomic_runtime_data_directory']['file_id'] -cne
+            $ExpectedNomicDirectoryFileId -or
+        [string]$codex['after_sha256'] -cne $ExpectedCodexSha256 -or
+        [string]$claude['after_sha256'] -cne $ExpectedClaudeSha256) {
+        Fail-AstroGlobalActivation 'ASTRO_GLOBAL_ACTIVATION_COMPLETION_MISMATCH' `
+            "$Description differs from physical runtime/config readback" `
+            'preserve the transaction and both configs; do not claim global activation'
+    }
+}
+
 function Get-ClaudeConfigInspection {
     param(
         [Parameter(Mandatory)][AllowEmptyString()][string]$Text,
@@ -1588,6 +1627,13 @@ try {
             }
             nomic_runtime_data_sha256 = [string]$runtimeData['sha256']
             nomic_runtime_data_file_count = $runtimeFiles.Count
+            nomic_runtime_data_directory = [ordered]@{
+                path = $nomicDirectoryReadback.path
+                file_id = $nomicDirectoryReadback.file_id
+                attributes = $nomicDirectoryReadback.attributes
+                entry_count = $nomicDirectoryReadback.entry_count
+                last_write_utc = $nomicDirectoryReadback.last_write_utc
+            }
         }
         codex = [ordered]@{
             config_path = $CodexConfigPath
@@ -1640,23 +1686,10 @@ try {
     $completionReadback = Get-StrictJsonHashtable `
         (Read-AstroUtf8FileLongPath $completionStagePath) `
         'activation completion stage readback'
-    if ([string]$completionReadback['schema'] -cne
-            'astrolabe.global-mcp-activation.v2' -or
-        [string]$completionReadback['verdict'] -cne 'activated' -or
-        [string]$completionReadback['runtime']['archaeology_root']['path'] -cne
-            $archaeologyRoot -or
-        [string]$completionReadback['runtime']['nomic_runtime_data_sha256'] -cne
-            [string]$runtimeData['sha256'] -or
-        [string]$completionReadback['runtime']['nomic_runtime_data_directory']['file_id'] -cne
-            $nomicDirectoryReadback.file_id -or
-        [string]$completionReadback['codex']['after_sha256'] -cne
-            $codexAfter.sha256 -or
-        [string]$completionReadback['claude_code']['after_sha256'] -cne
-            $claudeAfter.sha256) {
-        Fail-AstroGlobalActivation 'ASTRO_GLOBAL_ACTIVATION_COMPLETION_MISMATCH' `
-            'durable activation completion record differs from physical config readback' `
-            'preserve the transaction and both configs; do not claim global activation'
-    }
+    Assert-ActivationCompletionReadback `
+        $completionReadback 'durable activation completion stage record' `
+        $archaeologyRoot ([string]$runtimeData['sha256']) `
+        $nomicDirectoryReadback.file_id $codexAfter.sha256 $claudeAfter.sha256
     $completionSha256 = Get-FileSha256 $completionStagePath
     [AstroLauncherLockNative]::MoveFileWriteThroughNoReplace(
         $completionStagePath,
@@ -1666,24 +1699,15 @@ try {
     $completionFinalReadback = Get-StrictJsonHashtable `
         (Read-AstroUtf8FileLongPath $completionPath) `
         'activation completion final readback'
-    if ((Get-FileSha256 $completionPath) -cne $completionSha256 -or
-        [string]$completionFinalReadback['schema'] -cne
-            'astrolabe.global-mcp-activation.v2' -or
-        [string]$completionFinalReadback['verdict'] -cne 'activated' -or
-        [string]$completionFinalReadback['runtime']['archaeology_root']['path'] -cne
-            $archaeologyRoot -or
-        [string]$completionFinalReadback['runtime']['nomic_runtime_data_sha256'] -cne
-            [string]$runtimeData['sha256'] -or
-        [string]$completionFinalReadback['runtime']['nomic_runtime_data_directory']['file_id'] -cne
-            $nomicDirectoryReadback.file_id -or
-        [string]$completionFinalReadback['codex']['after_sha256'] -cne
-            $codexAfter.sha256 -or
-        [string]$completionFinalReadback['claude_code']['after_sha256'] -cne
-            $claudeAfter.sha256) {
+    if ((Get-FileSha256 $completionPath) -cne $completionSha256) {
         Fail-AstroGlobalActivation 'ASTRO_GLOBAL_ACTIVATION_COMPLETION_MISMATCH' `
-            'published completion differs from its validated stage or physical config readback' `
+            'published completion hash differs from its validated stage' `
             'preserve the terminal transaction and both activated configs for exact readback'
     }
+    Assert-ActivationCompletionReadback `
+        $completionFinalReadback 'published activation completion record' `
+        $archaeologyRoot ([string]$runtimeData['sha256']) `
+        $nomicDirectoryReadback.file_id $codexAfter.sha256 $claudeAfter.sha256
 
     [ordered]@{
         code = 'ASTRO_GLOBAL_MCP_ACTIVATED'
