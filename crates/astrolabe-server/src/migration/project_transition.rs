@@ -313,6 +313,11 @@ struct ProjectIndexTransition<'a> {
     recovery: Value,
 }
 
+struct PriorTransitionInspection {
+    durable_incomplete_transition: bool,
+    recovery: Value,
+}
+
 impl<'a> ProjectIndexTransition<'a> {
     fn worker_grant(&self) -> ProjectTransitionWorkerGrant {
         ProjectTransitionWorkerGrant {
@@ -343,7 +348,7 @@ impl<'a> ProjectIndexTransition<'a> {
         let native = CbmProjectTransition::acquire(project)?;
         let owner_pid = std::process::id();
         let owner_process_start_utc_ticks = native.owner_process_start_utc_ticks;
-        let recovered_abandoned_owner = native.recovered_abandoned_owner;
+        let kernel_mutex_abandoned = native.recovered_abandoned_owner;
         let acquired_unix_ms = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis();
         let generation = hex_lower(&Sha256::digest(
             format!(
@@ -353,11 +358,10 @@ impl<'a> ProjectIndexTransition<'a> {
             .as_bytes(),
         ));
         let db_path = sqlite_path(cache_dir, project);
-        let recovery = if recovered_abandoned_owner {
-            inspect_abandoned_transition(cache_dir, project, &root, &db_path)?
-        } else {
-            json!({"abandoned_owner": false})
-        };
+        let prior =
+            inspect_prior_transition(cache_dir, project, &root, &db_path, kernel_mutex_abandoned)?;
+        let recovered_abandoned_owner =
+            kernel_mutex_abandoned || prior.durable_incomplete_transition;
         let mut transition = Self {
             native: Some(native),
             cache_dir,
@@ -375,7 +379,7 @@ impl<'a> ProjectIndexTransition<'a> {
                 native_error: 0,
                 failed_path: String::new(),
             },
-            recovery,
+            recovery: prior.recovery,
         };
         transition.persist("active", json!({}))?;
         let db_path = transition.db_path.to_str().ok_or_else(|| -> DynError {
@@ -449,22 +453,28 @@ impl<'a> ProjectIndexTransition<'a> {
     }
 }
 
-fn inspect_abandoned_transition(
+fn inspect_prior_transition(
     cache_dir: &Path,
     project: &str,
     canonical_root: &Path,
     canonical_db_path: &Path,
-) -> Result<Value, DynError> {
+    kernel_mutex_abandoned: bool,
+) -> Result<PriorTransitionInspection, DynError> {
     let key = metadata_key(project, PROJECT_TRANSITION_STATUS_KEY);
     let Some(raw) = read_config_value(cache_dir, &key)? else {
-        return Ok(json!({
-            "abandoned_owner": true,
-            "prior_durable_state": "absent_before_first_publication",
-        }));
+        return Ok(PriorTransitionInspection {
+            durable_incomplete_transition: false,
+            recovery: json!({
+                "abandoned_owner": kernel_mutex_abandoned,
+                "kernel_mutex_abandoned": kernel_mutex_abandoned,
+                "durable_incomplete_transition": false,
+                "prior_durable_state": "absent_before_first_publication",
+            }),
+        });
     };
     let value: Value = serde_json::from_str(&raw).map_err(|error| -> DynError {
         format!(
-            "ASTRO_PROJECT_TRANSITION_RECOVERY_STATE_MALFORMED: abandoned owner row {key:?} is not JSON ({error}); remediation: preserve the row and store family for explicit inspection"
+            "ASTRO_PROJECT_TRANSITION_RECOVERY_STATE_MALFORMED: prior transition row {key:?} is not JSON ({error}); remediation: preserve the row and store family for explicit inspection"
         )
         .into()
     })?;
@@ -475,16 +485,83 @@ fn inspect_abandoned_transition(
     let db_matches = value.get("canonical_db_path") == Some(&json!(canonical_db_path));
     if !(schema_matches && project_matches && root_matches && db_matches) {
         return Err(format!(
-            "ASTRO_PROJECT_TRANSITION_RECOVERY_IDENTITY_MISMATCH: abandoned owner row {key:?} does not bind the exact schema/project/root/store identity; remediation: preserve its bytes and resolve the identity mismatch before retrying"
+            "ASTRO_PROJECT_TRANSITION_RECOVERY_IDENTITY_MISMATCH: prior transition row {key:?} does not bind the exact schema/project/root/store identity; remediation: preserve its bytes and resolve the identity mismatch before retrying"
         )
         .into());
     }
-    Ok(json!({
-        "abandoned_owner": true,
-        "prior_durable_state": "inspected",
-        "prior_row_sha256": hex_lower(&Sha256::digest(raw.as_bytes())),
-        "prior_generation": value.get("generation"),
-        "prior_phase": value.get("phase"),
-        "prior_owner": value.get("owner"),
-    }))
+
+    let phase = value
+        .get("phase")
+        .and_then(Value::as_str)
+        .filter(|phase| {
+            matches!(
+                *phase,
+                "active" | "quiesced" | "quiescence_failed" | "terminal"
+            )
+        })
+        .ok_or_else(|| -> DynError {
+            format!(
+                "ASTRO_PROJECT_TRANSITION_RECOVERY_PHASE_INVALID: prior transition row {key:?} has no recognized phase; remediation: preserve the row and store family for explicit inspection"
+            )
+            .into()
+        })?;
+    let generation = value
+        .get("generation")
+        .and_then(Value::as_str)
+        .filter(|generation| !generation.is_empty())
+        .ok_or_else(|| -> DynError {
+            format!(
+                "ASTRO_PROJECT_TRANSITION_RECOVERY_GENERATION_INVALID: prior transition row {key:?} has no non-empty generation; remediation: preserve the row and store family for explicit inspection"
+            )
+            .into()
+        })?;
+    let owner = value
+        .get("owner")
+        .and_then(Value::as_object)
+        .ok_or_else(|| -> DynError {
+            format!(
+                "ASTRO_PROJECT_TRANSITION_RECOVERY_OWNER_INVALID: prior transition row {key:?} has no owner object; remediation: preserve the row and store family for explicit inspection"
+            )
+            .into()
+        })?;
+    let owner_pid = owner
+        .get("pid")
+        .and_then(Value::as_u64)
+        .and_then(|pid| u32::try_from(pid).ok())
+        .filter(|pid| *pid > 0)
+        .ok_or_else(|| -> DynError {
+            format!(
+                "ASTRO_PROJECT_TRANSITION_RECOVERY_OWNER_PID_INVALID: prior transition row {key:?} has no positive u32 owner PID; remediation: preserve the row and store family for explicit inspection"
+            )
+            .into()
+        })?;
+    let owner_process_start_utc_ticks = owner
+        .get("process_start_utc_ticks")
+        .and_then(Value::as_u64)
+        .filter(|ticks| *ticks > 0)
+        .ok_or_else(|| -> DynError {
+            format!(
+                "ASTRO_PROJECT_TRANSITION_RECOVERY_OWNER_TICKS_INVALID: prior transition row {key:?} has no positive owner creation ticks; remediation: preserve the row and store family for explicit inspection"
+            )
+            .into()
+        })?;
+    let durable_incomplete_transition = matches!(phase, "active" | "quiesced");
+    let abandoned_owner = kernel_mutex_abandoned || durable_incomplete_transition;
+
+    Ok(PriorTransitionInspection {
+        durable_incomplete_transition,
+        recovery: json!({
+            "abandoned_owner": abandoned_owner,
+            "kernel_mutex_abandoned": kernel_mutex_abandoned,
+            "durable_incomplete_transition": durable_incomplete_transition,
+            "prior_durable_state": "inspected",
+            "prior_row_sha256": hex_lower(&Sha256::digest(raw.as_bytes())),
+            "prior_generation": generation,
+            "prior_phase": phase,
+            "prior_owner": {
+                "pid": owner_pid,
+                "process_start_utc_ticks": owner_process_start_utc_ticks,
+            },
+        }),
+    })
 }
