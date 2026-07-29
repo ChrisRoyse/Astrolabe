@@ -6429,7 +6429,8 @@ function Start-AstroTreeAttribution {
         $intended = $recorder.GetLastManifestBytes()
         $snapshot = Get-AstroFileSnapshot `
             -LiteralPath $ManifestPath `
-            -Share ([IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete)
+            -Share ([IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete) `
+            -MaximumBytes $script:AstroAttributionManifestMaxBytes
         if ($snapshot.Length -ne $intended.Length -or
             [Convert]::ToBase64String($snapshot.Bytes) -cne
                 [Convert]::ToBase64String($intended)) {
@@ -9028,7 +9029,8 @@ finally {
             $finalManifestExpectedBytes = $treeRecorder.GetLastManifestBytes()
             $manifestSnapshot = Get-AstroFileSnapshot `
                 -LiteralPath $attributionManifest `
-                -Share ([IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete)
+                -Share ([IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete) `
+                -MaximumBytes $script:AstroAttributionManifestMaxBytes
             if ($manifestSnapshot.Length -ne
                     [uint64]$finalManifestExpectedBytes.LongLength -or
                 [Convert]::ToBase64String($manifestSnapshot.Bytes) -cne

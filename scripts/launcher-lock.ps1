@@ -4063,8 +4063,13 @@ function Get-AstroPathEntryState {
 function Get-AstroFileSnapshot {
     param(
         [Parameter(Mandatory)][string]$LiteralPath,
-        [IO.FileShare]$Share = [IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete
+        [IO.FileShare]$Share = [IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete,
+        [int]$MaximumBytes = $script:AstroLauncherProtocolSnapshotMaxBytes
     )
+
+    if ($MaximumBytes -le 0) {
+        throw "exact file snapshot maximum must be positive: $MaximumBytes"
+    }
 
     $full = [IO.Path]::GetFullPath($LiteralPath)
     try {
@@ -4079,8 +4084,8 @@ function Get-AstroFileSnapshot {
         throw "could not open '$full' for an exact read snapshot: $($_.Exception.Message)"
     }
     try {
-        if ($stream.Length -gt $script:AstroLauncherProtocolSnapshotMaxBytes) {
-            throw "launcher protocol file exceeds the $script:AstroLauncherProtocolSnapshotMaxBytes-byte safety limit: $full ($($stream.Length) bytes)"
+        if ($stream.Length -gt $MaximumBytes) {
+            throw "exact file snapshot exceeds the $MaximumBytes-byte caller contract: $full ($($stream.Length) bytes)"
         }
         $bytes = New-Object byte[] ([int]$stream.Length)
         $offset = 0

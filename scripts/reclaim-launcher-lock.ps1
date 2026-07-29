@@ -171,13 +171,29 @@ function ConvertTo-AstroComparableFinalPath {
 function Get-AstroExactRenameLeaseSnapshot {
     param(
         [Parameter(Mandatory)]$Lease,
-        [Parameter(Mandatory)][string]$Description
+        [Parameter(Mandatory)][string]$Description,
+        [int]$MaximumBytes = 0
     )
+
+    $effectiveMaximumBytes = if ($MaximumBytes -gt 0) {
+        $MaximumBytes
+    }
+    elseif ($null -ne $Lease.PSObject.Properties['MaximumBytes']) {
+        [int]$Lease.MaximumBytes
+    }
+    else {
+        $script:AstroLauncherProtocolSnapshotMaxBytes
+    }
+    if ($effectiveMaximumBytes -le 0) {
+        Fail-Astro 'ASTRO_LAUNCHER_LOCK_RECLAIM_SNAPSHOT_BOUND_INVALID' `
+            "$Description retained-handle reader has invalid maximum $effectiveMaximumBytes" `
+            'preserve every entry and repair the caller-specific reader contract'
+    }
 
     try {
         $bytes = [AstroLauncherLockNative]::ReadAllBytes(
             $Lease.Handle,
-            $script:AstroLauncherProtocolSnapshotMaxBytes
+            $effectiveMaximumBytes
         )
         $identity = [AstroLauncherLockNative]::GetFileIdentity($Lease.Handle)
         $finalPath = ConvertTo-AstroComparableFinalPath (
@@ -201,8 +217,15 @@ function Get-AstroExactRenameLeaseSnapshot {
 function Open-AstroExactRenameLease {
     param(
         [Parameter(Mandatory)][string]$Path,
-        [Parameter(Mandatory)][string]$Description
+        [Parameter(Mandatory)][string]$Description,
+        [int]$MaximumBytes = $script:AstroLauncherProtocolSnapshotMaxBytes
     )
+
+    if ($MaximumBytes -le 0) {
+        Fail-Astro 'ASTRO_LAUNCHER_LOCK_RECLAIM_SNAPSHOT_BOUND_INVALID' `
+            "$Description retained-handle reader maximum must be positive: $MaximumBytes" `
+            'preserve every entry and pass the exact file-kind reader contract'
+    }
 
     $full = [IO.Path]::GetFullPath($Path)
     try {
@@ -217,6 +240,7 @@ function Open-AstroExactRenameLease {
         Handle = $handle
         OriginalPath = $full
         Description = $Description
+        MaximumBytes = $MaximumBytes
     }
     try {
         $snapshot = Get-AstroExactRenameLeaseSnapshot $lease $Description
@@ -243,8 +267,15 @@ function Open-AstroExactEvidenceLease {
     param(
         [Parameter(Mandatory)][string]$Path,
         [Parameter(Mandatory)][string]$Description,
+        [int]$MaximumBytes = $script:AstroLauncherProtocolSnapshotMaxBytes,
         [switch]$SharedDelete
     )
+
+    if ($MaximumBytes -le 0) {
+        Fail-Astro 'ASTRO_LAUNCHER_LOCK_RECLAIM_SNAPSHOT_BOUND_INVALID' `
+            "$Description retained-handle reader maximum must be positive: $MaximumBytes" `
+            'preserve every entry and pass the exact file-kind reader contract'
+    }
 
     $full = [IO.Path]::GetFullPath($Path)
     try {
@@ -264,6 +295,7 @@ function Open-AstroExactEvidenceLease {
         Handle = $handle
         OriginalPath = $full
         Description = $Description
+        MaximumBytes = $MaximumBytes
     }
     try {
         $snapshot = Get-AstroExactRenameLeaseSnapshot $lease $Description
@@ -2407,7 +2439,8 @@ function Get-AstroReclaimAttributionProbe {
                 $artifact = $refreshArtifactByPath[$path]
                 $lease = Open-AstroExactEvidenceLease `
                     $path `
-                    "typed attribution $($artifact.Kind) $leaf"
+                    "typed attribution $($artifact.Kind) $leaf" `
+                    -MaximumBytes $script:AstroAttributionManifestMaxBytes
                 $leases.Add($lease)
                 $before = $lease.InitialSnapshot
                 if ($before.FileIdentity -cne $artifact.Snapshot.FileId -or
@@ -2443,7 +2476,8 @@ function Get-AstroReclaimAttributionProbe {
             }
             $lease = Open-AstroExactEvidenceLease `
                 $path `
-                "attribution $entryKind $leaf"
+                "attribution $entryKind $leaf" `
+                -MaximumBytes $script:AstroAttributionManifestMaxBytes
             $leases.Add($lease)
             $before = $lease.InitialSnapshot
             $parsed = Convert-AstroAttributionBytesToState `
@@ -3468,7 +3502,8 @@ function Invoke-AstroSubordinateCleanupPlan {
                 $archiveState.State -eq 'absent') {
                 $lease = Open-AstroExactRenameLease `
                     $record.path `
-                    'malformed claim-bound attribution stage'
+                    'malformed claim-bound attribution stage' `
+                    -MaximumBytes $script:AstroAttributionManifestMaxBytes
                 try {
                     $snapshot = $lease.InitialSnapshot
                     if ($snapshot.FileIdentity -cne $record.file_identity -or
@@ -3494,7 +3529,8 @@ function Invoke-AstroSubordinateCleanupPlan {
                 $archiveState.State -eq 'present') {
                 $archiveLease = Open-AstroExactEvidenceLease `
                     $record.quarantine_archive_path `
-                    'previously archived malformed attribution stage'
+                    'previously archived malformed attribution stage' `
+                    -MaximumBytes $script:AstroAttributionManifestMaxBytes
                 try {
                     $snapshot = $archiveLease.InitialSnapshot
                     if ($snapshot.FileIdentity -cne $record.file_identity -or
@@ -3602,7 +3638,8 @@ function Invoke-AstroSubordinateCleanupPlan {
             })) {
         $lease = Open-AstroExactEvidenceLease `
             $record.quarantine_archive_path `
-            'terminal malformed-stage quarantine archive'
+            'terminal malformed-stage quarantine archive' `
+            -MaximumBytes $script:AstroAttributionManifestMaxBytes
         try {
             $snapshot = $lease.InitialSnapshot
             if ($snapshot.FileIdentity -cne $record.file_identity -or
@@ -4397,7 +4434,7 @@ function Convert-AstroLinkedAttributionProbeNode {
             if ($ValueNode.Kind -ceq 'null') { return $null }
             return [uint64](ConvertFrom-AstroJsonUnsignedNode `
                 $ValueNode $FieldPath `
-                ([uint64]$script:AstroLauncherProtocolSnapshotMaxBytes) `
+                ([uint64]$script:AstroAttributionManifestMaxBytes) `
                 -Positive)
         }
         $oldId = & $nullableIdentity `
@@ -4681,7 +4718,7 @@ function Convert-AstroLinkedAttributionProbeNode {
             "$pairPath.manifest.file_identity" -Nonblank
         $manifestBytes = [uint64](ConvertFrom-AstroJsonUnsignedNode `
             $manifest.Properties['bytes'] "$pairPath.manifest.bytes" `
-            ([uint64]$script:AstroLauncherProtocolSnapshotMaxBytes) -Positive)
+            ([uint64]$script:AstroAttributionManifestMaxBytes) -Positive)
         $manifestSha = Get-AstroStrictStringValue `
             $manifest.Properties['sha256'] "$pairPath.manifest.sha256" -Nonblank
         $ownerState = Get-AstroStrictStringValue `
