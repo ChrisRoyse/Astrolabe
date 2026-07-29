@@ -151,6 +151,13 @@ fn registration_catch_up_status(
     cache_dir: &Path,
     registration: &WatchRegistration,
 ) -> Result<Option<Value>, DynError> {
+    if reconcile_shadow_publications_for_project(cache_dir, &registration.project)? {
+        tracing::info!(
+            project = %registration.project,
+            root = %registration.root,
+            "incremental_watcher.publication_recovered"
+        );
+    }
     let fingerprint_key = metadata_key(&registration.project, GIT_SOURCE_FINGERPRINT_KEY);
     let root_key = metadata_key(&registration.project, GIT_SOURCE_REPO_PATH_KEY);
     let persisted_fingerprint =

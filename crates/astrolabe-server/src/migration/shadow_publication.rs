@@ -113,7 +113,7 @@ impl ShadowPublication {
         fs::create_dir_all(live_cache)?;
         let project_digest = hex_lower(&Sha256::digest(project.as_bytes()));
         let project_root = live_cache.join(PUBLICATION_DIR).join(&project_digest[..32]);
-        reconcile_completed_transactions(&project_root, live_cache, project)?;
+        reconcile_shadow_publications_for_project(live_cache, project)?;
         if project_root.exists() && fs::read_dir(&project_root)?.next().is_some() {
             return Err(format!(
                 "ASTRO_SHADOW_PUBLICATION_INCOMPLETE: an unfinished shadow publication exists for project {project:?} under {}; live state is not safe to mutate. Remediation: inspect transaction.json and the backup/stage hashes, restore or finalize that exact transaction, then retry",
@@ -931,6 +931,24 @@ impl ShadowPublication {
         )
         .into()
     }
+}
+
+/// Reconcile any dead publication generation before a resident accepts the
+/// persisted source checkpoint as current.
+///
+/// The enabled watcher registration boundary calls this before comparing the
+/// live Git fingerprint with the persisted one. A pre-commit interruption is
+/// rolled back and therefore schedules the ordinary catch-up path; a committed
+/// candidate is finalized and remains fresh without a second index pass.
+pub(crate) fn reconcile_shadow_publications_for_project(
+    live_cache: &Path,
+    project: &str,
+) -> Result<bool, DynError> {
+    let project_digest = hex_lower(&Sha256::digest(project.as_bytes()));
+    let project_root = live_cache.join(PUBLICATION_DIR).join(&project_digest[..32]);
+    let had_transactions = project_root.exists() && fs::read_dir(&project_root)?.next().is_some();
+    reconcile_completed_transactions(&project_root, live_cache, project)?;
+    Ok(had_transactions)
 }
 
 fn sqlite_snapshot(source: &Path, destination: &Path) -> Result<(), DynError> {
