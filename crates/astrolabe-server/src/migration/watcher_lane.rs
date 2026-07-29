@@ -68,6 +68,7 @@ pub(crate) fn run_incremental_watcher_loop(shutdown: Arc<AtomicBool>) -> Result<
             .iter()
             .map(|registration| (registration.project.clone(), registration.root.clone()))
             .collect::<BTreeMap<_, _>>();
+        let mut catch_up_registrations = Vec::new();
         for stale in registered
             .keys()
             .filter(|project| !desired.contains_key(*project))
@@ -83,19 +84,54 @@ pub(crate) fn run_incremental_watcher_loop(shutdown: Arc<AtomicBool>) -> Result<
             }
             if registered.contains_key(&registration.project) {
                 watcher.unwatch(&registration.project)?;
+                registered.remove(&registration.project);
+            }
+            let catch_up = match registration_catch_up_status(&cache_dir, &registration) {
+                Ok(status) => status,
+                Err(error) => {
+                    persist_registration_error(
+                        &cache_dir,
+                        &registration.project,
+                        &format!("durable source-checkpoint reconciliation failed: {error}"),
+                    )?;
+                    tracing::warn!(
+                        project = %registration.project,
+                        root = %registration.root,
+                        error = %error,
+                        "incremental_watcher.registration_reconciliation_refused"
+                    );
+                    continue;
+                }
+            };
+            if let Some(status) = &catch_up {
+                persist_watcher_status(&cache_dir, &registration.project, status)?;
+                tracing::info!(
+                    project = %registration.project,
+                    root = %registration.root,
+                    verification = status.get("verification").and_then(Value::as_str),
+                    "incremental_watcher.catch_up_scheduled"
+                );
             }
             watcher.watch(&registration.project, &registration.root)?;
+            if catch_up.is_some() {
+                catch_up_registrations.push(registration.clone());
+            }
             registered.insert(registration.project, registration.root);
         }
 
+        // A newly watched C registration has no baseline. Its first poll must
+        // initialize that local observation before invalidation; otherwise
+        // `init_baseline` overwrites the invalidation sentinel and silently
+        // accepts changes made while disabled or while this process was down
+        // (#828). Durable source truth above decides which newly initialized
+        // registrations must be invalidated, never the in-memory baseline.
+        poll_incremental_watcher(&mut watcher);
         rearm_changed_faults(&cache_dir, &registered, &mut watcher)?;
-
-        if let Err(error) = watcher.poll_once() {
-            tracing::warn!(
-                code = %error.envelope().code,
-                message = %error.envelope().message,
-                "incremental_watcher.poll_failed"
-            );
+        for registration in &catch_up_registrations {
+            watcher.invalidate(&registration.project)?;
+        }
+        if !catch_up_registrations.is_empty() {
+            poll_incremental_watcher(&mut watcher);
         }
         for project in registered.keys() {
             if let Err(error) = drive_project_lowering(&cache_dir, project) {
@@ -109,6 +145,83 @@ pub(crate) fn run_incremental_watcher_loop(shutdown: Arc<AtomicBool>) -> Result<
         sleep_watcher_slice(&shutdown);
     }
     Ok(())
+}
+
+fn registration_catch_up_status(
+    cache_dir: &Path,
+    registration: &WatchRegistration,
+) -> Result<Option<Value>, DynError> {
+    let fingerprint_key = metadata_key(&registration.project, GIT_SOURCE_FINGERPRINT_KEY);
+    let root_key = metadata_key(&registration.project, GIT_SOURCE_REPO_PATH_KEY);
+    let persisted_fingerprint =
+        read_config_value(cache_dir, &fingerprint_key)?.filter(|value| !value.trim().is_empty());
+    let persisted_root =
+        read_config_value(cache_dir, &root_key)?.filter(|value| !value.trim().is_empty());
+
+    // Non-Git corpora have no Git source checkpoint and the native watcher has
+    // no Git strategy for them. Preserve that explicit no-watch behavior. A
+    // Git corpus with a missing checkpoint must be indexed once to mint it.
+    if persisted_fingerprint.is_none()
+        && !astrolabe_anchors::archaeology::is_git_work_tree(Path::new(&registration.root))
+    {
+        return Ok(None);
+    }
+
+    let canonical_root = fs::canonicalize(&registration.root).map_err(|error| {
+        format!(
+            "ASTRO_WATCHER_CATCH_UP_ROOT_UNREADABLE: could not canonicalize current root {:?} for project {:?}: {error}. Remediation: restore the persisted source root before automatic indexing can resume",
+            registration.root, registration.project
+        )
+    })?;
+    let (persisted_canonical_root, persisted_root_error) = match persisted_root.as_deref() {
+        Some(root) => match fs::canonicalize(root) {
+            Ok(root) => (Some(root), None),
+            Err(error) => (None, Some(error.to_string())),
+        },
+        None => (None, None),
+    };
+    let root_matches = persisted_canonical_root.as_ref() == Some(&canonical_root);
+    let live_fingerprint =
+        astrolabe_anchors::archaeology::git_source_fingerprint(Path::new(&registration.root))?;
+    if root_matches && persisted_fingerprint.as_deref() == Some(live_fingerprint.as_str()) {
+        return Ok(None);
+    }
+
+    let verification = if persisted_fingerprint.is_none() {
+        "source_checkpoint_missing"
+    } else if !root_matches {
+        "source_checkpoint_root_mismatch"
+    } else {
+        "source_fingerprint_mismatch"
+    };
+    Ok(Some(json!({
+        "schema": "astrolabe-watcher-tick-v2",
+        "status": "catch_up_scheduled",
+        "project": registration.project,
+        "root": registration.root,
+        "verification": verification,
+        "expected_source_fingerprint": persisted_fingerprint,
+        "actual_source_fingerprint": live_fingerprint,
+        "persisted_source_root": persisted_root,
+        "persisted_canonical_root": persisted_canonical_root,
+        "current_canonical_root": canonical_root,
+        "persisted_root_canonicalization_error": persisted_root_error,
+        "root_matches": root_matches,
+        "freshness": "stale",
+        "trust": "verified",
+        "worker_started": false,
+        "remediation": "allow the enabled resident lane to complete its scheduled failure-atomic index generation; inspect watcher_fault_json if it refuses",
+    })))
+}
+
+fn poll_incremental_watcher(watcher: &mut CbmWatcher) {
+    if let Err(error) = watcher.poll_once() {
+        tracing::warn!(
+            code = %error.envelope().code,
+            message = %error.envelope().message,
+            "incremental_watcher.poll_failed"
+        );
+    }
 }
 
 fn discover_watch_registrations(cache_dir: &Path) -> Result<Vec<WatchRegistration>, DynError> {
