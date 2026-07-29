@@ -3417,12 +3417,75 @@ static MacroCapture *macro_find_capture(const MacroEnv *env, const MacroToken *n
     return NULL;
 }
 
+static bool macro_nesting_coordinates_equal(const MacroNesting *left,
+                                             const MacroNesting *right) {
+    size_t left_depth = left ? left->depth : 0;
+    size_t right_depth = right ? right->depth : 0;
+    if (left_depth != right_depth) {
+        return false;
+    }
+    while (left && right) {
+        if (left->iteration != right->iteration) {
+            return false;
+        }
+        left = left->parent;
+        right = right->parent;
+    }
+    return !left && !right;
+}
+
+static MacroCapture *macro_find_capture_at_selection(const MacroEnv *env,
+                                                      const MacroBinding *binding,
+                                                      const MacroToken *name,
+                                                      const MacroNesting *selection) {
+    size_t binding_depth = binding && binding->shape ? binding->shape->depth : 0;
+    size_t selection_depth = selection ? selection->depth : 0;
+    if (!binding || binding_depth > selection_depth) {
+        return NULL;
+    }
+    for (MacroCapture *capture = env->captures; capture; capture = capture->previous) {
+        if (!macro_name_equal(capture, name)) {
+            continue;
+        }
+        const MacroNesting *capture_frame = capture->nesting;
+        bool matches = (capture_frame ? capture_frame->depth : 0) == binding_depth;
+        for (size_t depth = binding_depth; matches && depth > 0; depth--) {
+            const MacroRepeatShape *shape_frame = macro_shape_at_depth(binding->shape, depth);
+            const MacroNesting *selection_frame = macro_nesting_at_depth(selection, depth);
+            if (!shape_frame || !capture_frame || !selection_frame ||
+                capture_frame->repetition != shape_frame->repetition ||
+                capture_frame->iteration != selection_frame->iteration) {
+                matches = false;
+                break;
+            }
+            capture_frame = capture_frame->parent;
+        }
+        if (matches && !capture_frame) {
+            return capture;
+        }
+    }
+    return NULL;
+}
+
 static MacroCardinality *macro_find_cardinality(const MacroEnv *env, const MacroToken *repetition,
                                                 const MacroNesting *parent) {
     for (MacroCardinality *cardinality = env->cardinalities; cardinality;
          cardinality = cardinality->previous) {
         if (cardinality->repetition == repetition &&
             macro_nesting_equal(cardinality->parent, parent)) {
+            return cardinality;
+        }
+    }
+    return NULL;
+}
+
+static MacroCardinality *macro_find_cardinality_at_selection(const MacroEnv *env,
+                                                             const MacroToken *repetition,
+                                                             const MacroNesting *selection) {
+    for (MacroCardinality *cardinality = env->cardinalities; cardinality;
+         cardinality = cardinality->previous) {
+        if (cardinality->repetition == repetition &&
+            macro_nesting_coordinates_equal(cardinality->parent, selection)) {
             return cardinality;
         }
     }
@@ -4137,6 +4200,19 @@ static bool macro_output_append(RustLSPContext *ctx, MacroOutput *out, const cha
     return true;
 }
 
+static void macro_log_repetition_failure(const MacroEnv *env, const char *code,
+                                         const char *operation, const MacroToken *metavariable,
+                                         size_t binding_depth, size_t selection_depth) {
+    fprintf(stderr,
+            "ERROR level=error msg=rust_macro.repetition_failure code=%s operation=%s "
+            "macro=%s metavariable=%.*s binding_depth=%zu selection_depth=%zu "
+            "invocation_byte=%u\n",
+            code, operation, env->macro_name ? env->macro_name : "none",
+            metavariable ? (int)metavariable->len : 0,
+            metavariable ? metavariable->text : "", binding_depth, selection_depth,
+            env->invocation_byte);
+}
+
 static bool macro_repetition_driver(RustLSPContext *ctx, const MacroToken *tokens,
                                     const MacroEnv *env, const MacroNesting *selection,
                                     const MacroToken **driver, size_t *count) {
@@ -4173,17 +4249,24 @@ static bool macro_repetition_driver(RustLSPContext *ctx, const MacroToken *token
             }
             size_t selection_depth = selection ? selection->depth : 0;
             size_t binding_depth = binding->shape ? binding->shape->depth : 0;
-            if (binding_depth <= selection_depth ||
-                !macro_shape_matches_nesting_prefix(binding->shape, selection)) {
-                cbm_arena_mark_failed(ctx->arena, "CBM_RUST_MACRO_REPETITION_NESTING_MISMATCH",
-                                      "rust_lsp_macro_scalar_in_repetition", next->len);
-                return false;
+            if (binding_depth <= selection_depth) {
+                /* rustc's lockstep iterator treats a MatchedSingle reached
+                 * before the active RHS depth as unconstrained.  The capture
+                 * remains available to substitution but cannot drive this
+                 * repetition. */
+                token = next;
+                continue;
             }
             const MacroRepeatShape *next_shape =
                 macro_shape_at_depth(binding->shape, selection_depth + 1);
-            MacroCardinality *cardinality =
-                next_shape ? macro_find_cardinality(env, next_shape->repetition, selection) : NULL;
+            MacroCardinality *cardinality = next_shape
+                                                ? macro_find_cardinality_at_selection(
+                                                      env, next_shape->repetition, selection)
+                                                : NULL;
             if (!cardinality) {
+                macro_log_repetition_failure(env, "CBM_RUST_MACRO_REPETITION_CARDINALITY_MISSING",
+                                             "rust_lsp_macro_transcriber_repetition", next,
+                                             binding_depth, selection_depth);
                 cbm_arena_mark_failed(ctx->arena, "CBM_RUST_MACRO_REPETITION_CARDINALITY_MISSING",
                                       "rust_lsp_macro_transcriber_repetition", next->len);
                 return false;
@@ -4191,10 +4274,36 @@ static bool macro_repetition_driver(RustLSPContext *ctx, const MacroToken *token
             if (!*driver) {
                 *driver = next_shape->repetition;
                 *count = cardinality->count;
-            } else if (*driver != next_shape->repetition || *count != cardinality->count) {
+            } else if (*count != cardinality->count) {
+                fprintf(stderr,
+                        "ERROR level=error msg=rust_macro.repetition_cardinality_mismatch "
+                        "code=CBM_RUST_MACRO_REPETITION_CARDINALITY_MISMATCH macro=%s "
+                        "metavariable=%.*s binding_depth=%zu selection_depth=%zu "
+                        "expected_count=%zu actual_count=%zu invocation_byte=%u\n",
+                        env->macro_name ? env->macro_name : "none", (int)next->len, next->text,
+                        binding_depth, selection_depth, *count, cardinality->count,
+                        env->invocation_byte);
                 cbm_arena_mark_failed(ctx->arena, "CBM_RUST_MACRO_REPETITION_CARDINALITY_MISMATCH",
                                       "rust_lsp_macro_transcriber_repetition", next->len);
                 return false;
+            } else if (*driver != next_shape->repetition) {
+                const MacroToken *driver_separator = NULL;
+                const MacroToken *driver_operator = NULL;
+                const MacroToken *next_separator = NULL;
+                const MacroToken *next_operator = NULL;
+                if (!macro_repetition_parts(*driver, &driver_separator, &driver_operator) ||
+                    !macro_repetition_parts(next_shape->repetition, &next_separator,
+                                            &next_operator) ||
+                    !macro_tokens_equal(driver_operator, next_operator)) {
+                    macro_log_repetition_failure(
+                        env, "CBM_RUST_MACRO_REPETITION_NESTING_MISMATCH",
+                        "rust_lsp_macro_transcriber_peer_operator", next, binding_depth,
+                        selection_depth);
+                    cbm_arena_mark_failed(ctx->arena,
+                                          "CBM_RUST_MACRO_REPETITION_NESTING_MISMATCH",
+                                          "rust_lsp_macro_transcriber_peer_operator", next->len);
+                    return false;
+                }
             }
             token = next;
         } else if (token->open &&
@@ -4241,6 +4350,13 @@ static bool macro_substitute_span(RustLSPContext *ctx, const MacroToken *tokens,
                     return false;
                 }
                 if (!driver) {
+                    fprintf(stderr,
+                            "ERROR level=error msg=rust_macro.repetition_without_driver "
+                            "code=CBM_RUST_MACRO_REPETITION_WITHOUT_DRIVER macro=%s "
+                            "selection_depth=%zu invocation_byte=%u group_bytes=%zu\n",
+                            env->macro_name ? env->macro_name : "none",
+                            selection ? selection->depth : 0, env->invocation_byte,
+                            name_or_group->len);
                     cbm_arena_mark_failed(ctx->arena, "CBM_RUST_MACRO_REPETITION_WITHOUT_DRIVER",
                                           "rust_lsp_macro_transcriber_repetition",
                                           name_or_group->len);
@@ -4300,20 +4416,29 @@ static bool macro_substitute_span(RustLSPContext *ctx, const MacroToken *tokens,
                 }
             } else {
                 MacroBinding *binding = macro_find_binding(env, name_or_group);
-                if (!binding || !macro_shape_matches_nesting_exact(binding->shape, selection)) {
+                size_t binding_depth = binding && binding->shape ? binding->shape->depth : 0;
+                size_t selection_depth = selection ? selection->depth : 0;
+                if (!binding || binding_depth > selection_depth) {
+                    macro_log_repetition_failure(
+                        env, "CBM_RUST_MACRO_REPETITION_NESTING_MISMATCH",
+                        "rust_lsp_macro_transcriber_nesting", name_or_group, binding_depth,
+                        selection_depth);
                     cbm_arena_mark_failed(ctx->arena, "CBM_RUST_MACRO_REPETITION_NESTING_MISMATCH",
                                           "rust_lsp_macro_transcriber_nesting", name_or_group->len);
                     return false;
                 }
-                MacroCapture *capture = macro_find_capture(env, name_or_group, selection);
+                MacroCapture *capture =
+                    macro_find_capture_at_selection(env, binding, name_or_group, selection);
                 if (!capture) {
                     fprintf(stderr,
                             "ERROR level=error msg=rust_macro.metavariable_unbound "
                             "code=CBM_RUST_MACRO_UNBOUND_METAVARIABLE macro=%s "
                             "metavariable=%.*s invocation_byte=%u phase=transcriber "
-                            "active_repetition=%s iteration=%zu\n",
+                            "binding_depth=%zu selection_depth=%zu active_repetition=%s "
+                            "iteration=%zu\n",
                             env->macro_name ? env->macro_name : "none", (int)name_or_group->len,
-                            name_or_group->text, env->invocation_byte, selection ? "true" : "false",
+                            name_or_group->text, env->invocation_byte, binding_depth,
+                            selection_depth, selection ? "true" : "false",
                             selection ? selection->iteration : 0);
                     cbm_arena_mark_failed(ctx->arena, "CBM_RUST_MACRO_UNBOUND_METAVARIABLE",
                                           "rust_lsp_macro_transcriber", name_or_group->len);
