@@ -1692,7 +1692,10 @@ function Assert-CbmAliasRetryState {
             [string]$retryIntent.binary_path -cne $BinaryPath -or
             [string]$retryIntent.expected_legacy_sha256 -cne $ExpectedLegacySha256 -or
             [string]$retryIntent.expected_canonical_sha256 -cne $ExpectedCanonicalSha256 -or
-            [string]$retryIntent.expected_binary_sha256 -cne $ExpectedBinarySha256 -or
+            # A prior attempt binds the artifact it actually executed. A later
+            # reviewed retry may intentionally use newer product bytes; its own
+            # append-only intent binds that new hash below.
+            [string]$retryIntent.expected_binary_sha256 -cnotmatch '^[0-9a-f]{64}$' -or
             [string]$retryIntent.initial_fault_sha256 -cne $ExpectedFaultSha256 -or
             $retryFault.schema -ne 1 -or $retryFault.issue -ne $Issue -or
             [string]$retryFault.status -cne 'fault') {
