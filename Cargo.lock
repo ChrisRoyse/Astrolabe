@@ -241,6 +241,7 @@ dependencies = [
  "calyx-core",
  "calyx-ledger",
  "rusqlite",
+ "serde",
  "serde_json",
  "sha2",
  "tracing",
