@@ -996,7 +996,7 @@ fn blame_range(
         if String::from_utf8_lossy(&raw.stderr).contains("no such path") {
             return Ok(BlameOutcome::PathAbsent);
         }
-        return Err(git_exit_error(&args, &raw.stderr));
+        return Err(git_exit_error(&args, raw.status.code(), &raw.stderr));
     }
     let output = String::from_utf8(raw.stdout).map_err(|error| {
         ArchaeologyError::new(
@@ -1224,12 +1224,17 @@ fn is_oid(value: &str) -> bool {
 }
 
 fn git_status(repo: &Path, args: &[&str]) -> Result<bool, ArchaeologyError> {
-    let status = git_command(repo, args)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
+    let output = git_command(repo, args)
+        .output()
         .map_err(|error| git_spawn_error(args, error))?;
-    Ok(status.success())
+    match output.status.code() {
+        Some(0) => Ok(true),
+        // Both predicates routed here have a documented false result at exit 1:
+        // `merge-base --is-ancestor` for a non-ancestor and `cat-file -e` for a
+        // missing object. Every other exit is a Git fault, not a false predicate.
+        Some(1) => Ok(false),
+        _ => Err(git_exit_error(args, output.status.code(), &output.stderr)),
+    }
 }
 
 fn git_text(repo: &Path, args: &[&str]) -> Result<String, ArchaeologyError> {
@@ -1248,7 +1253,7 @@ fn git_bytes(repo: &Path, args: &[&str]) -> Result<Vec<u8>, ArchaeologyError> {
     if output.status.success() {
         Ok(output.stdout)
     } else {
-        Err(git_exit_error(args, &output.stderr))
+        Err(git_exit_error(args, output.status.code(), &output.stderr))
     }
 }
 
@@ -1274,7 +1279,7 @@ fn git_with_stdin(repo: &Path, args: &[&str], stdin: &[u8]) -> Result<Vec<u8>, A
     if output.status.success() {
         Ok(output.stdout)
     } else {
-        Err(git_exit_error(args, &output.stderr))
+        Err(git_exit_error(args, output.status.code(), &output.stderr))
     }
 }
 
@@ -1290,6 +1295,14 @@ fn git_command(repo: &Path, args: &[&str]) -> Command {
     // `LC_ALL` overrides any ambient `LANG`/`LC_*`. Path bytes are emitted
     // verbatim regardless of locale, so this does not alter mined ranges.
     command.env("LC_ALL", "C");
+    // Git archaeology is a non-interactive child of a long-lived JSON-RPC
+    // server. `Command::status()` inherits stdin by default, which bound the
+    // incremental `merge-base --is-ancestor` predicate to the MCP transport on
+    // native Windows and kept Git alive until the client closed the session
+    // (#830). No archaeology query consumes transport input: attach the null
+    // stream explicitly. `git_with_stdin` overrides this one setting with its
+    // intentional, finite patch pipe.
+    command.stdin(Stdio::null());
     command.arg("--no-replace-objects").arg("-C").arg(repo);
     command.args(args);
     command
@@ -1302,11 +1315,11 @@ fn git_spawn_error(args: &[&str], error: std::io::Error) -> ArchaeologyError {
     )
 }
 
-fn git_exit_error(args: &[&str], stderr: &[u8]) -> ArchaeologyError {
+fn git_exit_error(args: &[&str], exit_code: Option<i32>, stderr: &[u8]) -> ArchaeologyError {
     ArchaeologyError::new(
         ASTRO_ARCHAEOLOGY_GIT_FAILED,
         format!(
-            "git {args:?} failed: {}",
+            "Git child failed: phase=command_wait args={args:?} exit_code={exit_code:?} stderr={}",
             String::from_utf8_lossy(stderr).trim()
         ),
     )
