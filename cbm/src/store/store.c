@@ -1731,8 +1731,15 @@ static store_integrity_status_t store_check_integrity_detailed(cbm_store_t *s,
             char detail[ST_BUF_64];
             snprintf(detail, sizeof(detail), "user_version=%d expected=%d", user_version,
                      CBM_GRAPH_SCHEMA_VERSION);
-            store_integrity_set_failure(result, STORE_INTEGRITY_FAILED, "application.user_version",
-                                        SQLITE_OK, detail);
+            /* Keep the application-owned schema identity in the structured
+             * operation. Callers must be able to distinguish a durable on-disk
+             * incompatibility from an I/O verification failure without parsing
+             * the human-readable detail string. */
+            store_integrity_set_failure(
+                result, STORE_INTEGRITY_FAILED,
+                user_version == 0 ? "application.user_version.unstamped"
+                                  : "application.user_version.unsupported",
+                SQLITE_OK, detail);
         }
         sqlite3_finalize(stmt);
         return result->status;

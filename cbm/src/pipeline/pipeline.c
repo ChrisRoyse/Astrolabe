@@ -2104,6 +2104,35 @@ static int try_unchanged_before_snapshot(cbm_pipeline_t *p, const cbm_discover_o
     return 0;
 }
 
+static const char *route_store_verification_code(
+    const cbm_store_verify_result_t *verification) {
+    if (!verification) {
+        return "CBM_PIPELINE_STORE_PROJECT_PROVENANCE_FAILED";
+    }
+    if (verification->status == CBM_STORE_VERIFY_SOURCE_MISSING) {
+        return "CBM_STORE_SOURCE_MISSING";
+    }
+    if (verification->status != CBM_STORE_VERIFY_INTEGRITY_FAILED) {
+        /* This includes sharing violations, allocation failures, and SQLite
+         * I/O failures. Those conditions may clear without any source/store
+         * byte change, so resident scheduling must keep them retryable. */
+        return "CBM_STORE_VERIFICATION_FAILED";
+    }
+    if (strstr(verification->operation, "application.user_version.unstamped") != NULL) {
+        return "CBM_SCHEMA_VERSION_UNSTAMPED";
+    }
+    if (strstr(verification->operation, "application.user_version.unsupported") != NULL) {
+        return "CBM_SCHEMA_VERSION_UNSUPPORTED";
+    }
+    if (strstr(verification->operation, "application.project_identity") != NULL ||
+        strstr(verification->operation, "application.project_root") != NULL ||
+        strstr(verification->operation, "source.project_filename") != NULL ||
+        strstr(verification->operation, "source.project_identity") != NULL) {
+        return "CBM_STORE_PROVENANCE_FAILED";
+    }
+    return "CBM_STORE_INTEGRITY_FAILED";
+}
+
 /* Try incremental pipeline or select an atomic full reindex.
  * Returns 0 when incremental completed, PL_ROUTE_FULL when a full rebuild is
  * required, or CBM_NOT_FOUND on a terminal error. */
@@ -2142,6 +2171,7 @@ static int try_incremental_or_delete_db(cbm_pipeline_t *p, cbm_file_info_t *file
     cbm_store_verify_status_t verification_status = cbm_store_open_path_project_query_verified(
         db_path, p->project_name, &identity_store, &verification);
     if (verification_status != CBM_STORE_VERIFY_OK || !identity_store) {
+        const char *fault_code = route_store_verification_code(&verification);
         char native_error[32];
         char sqlite_error[32];
         (void)snprintf(native_error, sizeof(native_error), "%lu",
@@ -2151,7 +2181,7 @@ static int try_incremental_or_delete_db(cbm_pipeline_t *p, cbm_file_info_t *file
                                  ? verification.detail
                                  : "the existing store project provenance could not be verified";
         cbm_log_error(
-            "pipeline.route_failed", "code", "CBM_PIPELINE_STORE_PROJECT_PROVENANCE_FAILED",
+            "pipeline.route_failed", "code", fault_code,
             "operation",
             verification.operation[0] ? verification.operation : "verify_existing_store_project",
             "store_path", db_path, "requested_project", p->project_name, "requested_root",
@@ -2165,7 +2195,7 @@ static int try_incremental_or_delete_db(cbm_pipeline_t *p, cbm_file_info_t *file
             "preserve the complete store family and explicitly archive, repair, or delete it "
             "before rebinding");
         cbm_pipeline_record_fatal_error(
-            p, "CBM_PIPELINE_STORE_PROJECT_PROVENANCE_FAILED",
+            p, fault_code,
             verification.operation[0] ? verification.operation : "verify_existing_store_project",
             "route", db_path, 0, detail,
             "preserve the complete store family and explicitly archive, repair, or delete it "
