@@ -1297,6 +1297,12 @@ struct cbm_mcp_server {
     char store_error_db_path[CBM_STORE_VERIFY_PATH_MAX];
     char store_error_wal_path[CBM_STORE_VERIFY_PATH_MAX];
     char store_error_shm_path[CBM_STORE_VERIFY_PATH_MAX];
+    char store_error_stored_project[CBM_SZ_1K];
+    char store_error_stored_root[CBM_STORE_VERIFY_PATH_MAX];
+    char store_error_indexed_at[CBM_SZ_256];
+    char store_error_canonical_root[CBM_STORE_VERIFY_PATH_MAX];
+    char store_error_canonical_project[CBM_SZ_1K];
+    char store_error_canonical_db_path[CBM_STORE_VERIFY_PATH_MAX];
     char update_notice[CBM_SZ_256]; /* one-shot update notice, cleared after first injection */
     bool update_checked;            /* true after background check has been launched */
     cbm_thread_t update_tid;        /* background update check thread */
@@ -1479,8 +1485,26 @@ static const char *project_db_path(const char *project, char *buf, size_t bufsz)
 typedef enum {
     DB_PROJECT_INSPECT_OK = 0,
     DB_PROJECT_INSPECT_GHOST,
+    DB_PROJECT_INSPECT_IDENTITY_CONFLICT,
     DB_PROJECT_INSPECT_FAILED,
 } db_project_inspect_status_t;
+
+typedef struct {
+    char stored_project[CBM_SZ_1K];
+    char stored_root[CBM_STORE_VERIFY_PATH_MAX];
+    char indexed_at[CBM_SZ_256];
+    char canonical_root[CBM_STORE_VERIFY_PATH_MAX];
+    char canonical_project[CBM_SZ_1K];
+} db_project_identity_t;
+
+static void clear_store_identity_error_state(cbm_mcp_server_t *srv) {
+    srv->store_error_stored_project[0] = '\0';
+    srv->store_error_stored_root[0] = '\0';
+    srv->store_error_indexed_at[0] = '\0';
+    srv->store_error_canonical_root[0] = '\0';
+    srv->store_error_canonical_project[0] = '\0';
+    srv->store_error_canonical_db_path[0] = '\0';
+}
 
 static void reset_store_error_state(cbm_mcp_server_t *srv) {
     memset(&srv->store_verify, 0, sizeof(srv->store_verify));
@@ -1491,6 +1515,7 @@ static void reset_store_error_state(cbm_mcp_server_t *srv) {
     srv->store_error_db_path[0] = '\0';
     srv->store_error_wal_path[0] = '\0';
     srv->store_error_shm_path[0] = '\0';
+    clear_store_identity_error_state(srv);
 }
 
 static bool store_error_is_provenance(const cbm_store_verify_result_t *verification) {
@@ -1506,6 +1531,7 @@ static bool store_error_is_provenance(const cbm_store_verify_result_t *verificat
 static void record_store_error_state(cbm_mcp_server_t *srv, const char *project,
                                      const char *db_path,
                                      const cbm_store_verify_result_t *verification) {
+    clear_store_identity_error_state(srv);
     srv->store_verify = *verification;
     snprintf(srv->store_error_project, sizeof(srv->store_error_project), "%s",
              project ? project : "");
@@ -1541,6 +1567,112 @@ static void record_store_error_state(cbm_mcp_server_t *srv, const char *project,
 static void record_store_query_failure(cbm_mcp_server_t *srv, const char *project,
                                        const char *db_path, cbm_store_t *store,
                                        cbm_store_verify_status_t status, const char *operation,
+                                       const char *detail);
+
+static db_project_inspect_status_t inspect_root_derived_project_identity(
+    cbm_mcp_server_t *srv, const char *expected_project, const char *db_path, cbm_store_t *store,
+    const cbm_store_verify_result_t *verification, db_project_identity_t *identity) {
+    memset(identity, 0, sizeof(*identity));
+
+    cbm_project_t project = {0};
+    int project_rc = cbm_store_get_project(store, expected_project, &project);
+    if (project_rc != CBM_STORE_OK || !project.name || !project.root_path ||
+        !project.indexed_at) {
+        record_store_query_failure(
+            srv, expected_project, db_path, store,
+            project_rc == CBM_STORE_NOT_FOUND ? CBM_STORE_VERIFY_INTEGRITY_FAILED
+                                              : CBM_STORE_VERIFY_IO_FAILED,
+            "source.application.project_identity.read",
+            project_rc == CBM_STORE_NOT_FOUND
+                ? "verified project row disappeared before root-derived identity validation"
+                : cbm_store_error(store));
+        cbm_project_free_fields(&project);
+        return DB_PROJECT_INSPECT_FAILED;
+    }
+
+    snprintf(identity->stored_project, sizeof(identity->stored_project), "%s", project.name);
+    snprintf(identity->stored_root, sizeof(identity->stored_root), "%s", project.root_path);
+    snprintf(identity->indexed_at, sizeof(identity->indexed_at), "%s", project.indexed_at);
+
+    char *canonical_root = cbm_real_path_final(project.root_path);
+    if (!canonical_root) {
+        cbm_store_verify_result_t failure = *verification;
+        failure.status = CBM_STORE_VERIFY_INTEGRITY_FAILED;
+        snprintf(failure.operation, sizeof(failure.operation), "%s",
+                 "source.application.project_root.final");
+        snprintf(failure.detail, sizeof(failure.detail),
+                 "persisted project root has no final live filesystem identity: %.400s",
+                 project.root_path);
+        record_store_error_state(srv, expected_project, db_path, &failure);
+        snprintf(srv->store_error_stored_project, sizeof(srv->store_error_stored_project), "%s",
+                 identity->stored_project);
+        snprintf(srv->store_error_stored_root, sizeof(srv->store_error_stored_root), "%s",
+                 identity->stored_root);
+        snprintf(srv->store_error_indexed_at, sizeof(srv->store_error_indexed_at), "%s",
+                 identity->indexed_at);
+        cbm_project_free_fields(&project);
+        return DB_PROJECT_INSPECT_FAILED;
+    }
+    cbm_normalize_path_sep(canonical_root);
+    snprintf(identity->canonical_root, sizeof(identity->canonical_root), "%s", canonical_root);
+
+    char *canonical_project = cbm_project_name_from_path(canonical_root);
+    free(canonical_root);
+    if (!canonical_project) {
+        cbm_store_verify_result_t failure = *verification;
+        failure.status = CBM_STORE_VERIFY_IO_FAILED;
+        snprintf(failure.operation, sizeof(failure.operation), "%s",
+                 "source.application.project_identity.derive");
+        snprintf(failure.detail, sizeof(failure.detail),
+                 "root-derived project identity could not be allocated for canonical root %.360s",
+                 identity->canonical_root);
+        record_store_error_state(srv, expected_project, db_path, &failure);
+        snprintf(srv->store_error_stored_project, sizeof(srv->store_error_stored_project), "%s",
+                 identity->stored_project);
+        snprintf(srv->store_error_stored_root, sizeof(srv->store_error_stored_root), "%s",
+                 identity->stored_root);
+        snprintf(srv->store_error_indexed_at, sizeof(srv->store_error_indexed_at), "%s",
+                 identity->indexed_at);
+        snprintf(srv->store_error_canonical_root, sizeof(srv->store_error_canonical_root), "%s",
+                 identity->canonical_root);
+        cbm_project_free_fields(&project);
+        return DB_PROJECT_INSPECT_FAILED;
+    }
+    snprintf(identity->canonical_project, sizeof(identity->canonical_project), "%s",
+             canonical_project);
+    free(canonical_project);
+    cbm_project_free_fields(&project);
+
+    if (strcmp(identity->stored_project, identity->canonical_project) == 0) {
+        return DB_PROJECT_INSPECT_OK;
+    }
+
+    cbm_store_verify_result_t conflict = *verification;
+    conflict.status = CBM_STORE_VERIFY_INTEGRITY_FAILED;
+    snprintf(conflict.operation, sizeof(conflict.operation), "%s",
+             "source.application.project_identity.root");
+    snprintf(conflict.detail, sizeof(conflict.detail),
+             "stored project=%.120s root-derived project=%.120s canonical root=%.240s",
+             identity->stored_project, identity->canonical_project, identity->canonical_root);
+    record_store_error_state(srv, expected_project, db_path, &conflict);
+    snprintf(srv->store_error_stored_project, sizeof(srv->store_error_stored_project), "%s",
+             identity->stored_project);
+    snprintf(srv->store_error_stored_root, sizeof(srv->store_error_stored_root), "%s",
+             identity->stored_root);
+    snprintf(srv->store_error_indexed_at, sizeof(srv->store_error_indexed_at), "%s",
+             identity->indexed_at);
+    snprintf(srv->store_error_canonical_root, sizeof(srv->store_error_canonical_root), "%s",
+             identity->canonical_root);
+    snprintf(srv->store_error_canonical_project, sizeof(srv->store_error_canonical_project), "%s",
+             identity->canonical_project);
+    project_db_path(identity->canonical_project, srv->store_error_canonical_db_path,
+                    sizeof(srv->store_error_canonical_db_path));
+    return DB_PROJECT_INSPECT_IDENTITY_CONFLICT;
+}
+
+static void record_store_query_failure(cbm_mcp_server_t *srv, const char *project,
+                                       const char *db_path, cbm_store_t *store,
+                                       cbm_store_verify_status_t status, const char *operation,
                                        const char *detail) {
     cbm_store_verify_result_t failure;
     memset(&failure, 0, sizeof(failure));
@@ -1567,7 +1699,9 @@ static db_project_inspect_status_t db_internal_project_name(cbm_mcp_server_t *sr
                                                             const char *error_project,
                                                             const char *full_path, char *name_out,
                                                             size_t name_sz,
-                                                            cbm_store_t **out_store);
+                                                            cbm_store_t **out_store,
+                                                            cbm_store_verify_result_t
+                                                                *out_verification);
 
 /* Open the right project's .db file for query tools.
  * Caches the connection — reopens only when project changes.
@@ -1616,30 +1750,15 @@ static cbm_store_t *resolve_store(cbm_mcp_server_t *srv, const char *project) {
          * A .db file may exist but be empty (e.g., after delete_project on
          * Linux where unlink defers actual removal). Opening an empty/deleted
          * store without closing it leaks the SQLite connection. */
-        cbm_project_t proj_verify = {0};
-        int project_rc = cbm_store_get_project(srv->store, project, &proj_verify);
-        if (project_rc == CBM_STORE_OK) {
-            cbm_project_free_fields(&proj_verify);
+        db_project_identity_t identity;
+        db_project_inspect_status_t identity_status = inspect_root_derived_project_identity(
+            srv, project, path, srv->store, &verification, &identity);
+        if (identity_status == DB_PROJECT_INSPECT_OK) {
             srv->owns_store = true;
             free(srv->current_project);
             srv->current_project = heap_strdup(project);
             return srv->store; /* fast path: filename == internal name */
         }
-        /* The verified boundary already required the sole internal name to
-         * equal `project`.  Reaching NOT_FOUND here is therefore drift between
-         * verification and the published connection, never authority to scan
-         * for and adopt another file. */
-        if (project_rc != CBM_STORE_NOT_FOUND) {
-            record_store_query_failure(srv, project, path, srv->store, CBM_STORE_VERIFY_IO_FAILED,
-                                       "source.query_project_row", cbm_store_error(srv->store));
-            cbm_store_close(srv->store);
-            srv->store = NULL;
-            return NULL;
-        }
-        record_store_query_failure(srv, project, path, srv->store,
-                                   CBM_STORE_VERIFY_INTEGRITY_FAILED,
-                                   "source.project_identity_post_publish",
-                                   "verified exact project row disappeared before query admission");
         cbm_store_close(srv->store);
         srv->store = NULL;
         return NULL;
@@ -1802,6 +1921,19 @@ static char *build_integrity_failed_error(const cbm_mcp_server_t *srv) {
     yyjson_mut_obj_add_str(doc, root, "db_path", srv->store_error_db_path);
     yyjson_mut_obj_add_str(doc, root, "wal_path", srv->store_error_wal_path);
     yyjson_mut_obj_add_str(doc, root, "shm_path", srv->store_error_shm_path);
+    if (srv->store_error_stored_project[0]) {
+        yyjson_mut_obj_add_str(doc, root, "stored_project", srv->store_error_stored_project);
+        yyjson_mut_obj_add_str(doc, root, "stored_root", srv->store_error_stored_root);
+        yyjson_mut_obj_add_str(doc, root, "stored_indexed_at", srv->store_error_indexed_at);
+        yyjson_mut_obj_add_str(doc, root, "canonical_root", srv->store_error_canonical_root);
+        yyjson_mut_obj_add_str(doc, root, "canonical_project",
+                               srv->store_error_canonical_project);
+        yyjson_mut_obj_add_str(doc, root, "canonical_db_path",
+                               srv->store_error_canonical_db_path);
+        yyjson_mut_obj_add_bool(doc, root, "canonical_db_present",
+                                cbm_path_exists(srv->store_error_canonical_db_path));
+        yyjson_mut_obj_add_str(doc, root, "identity_selection", "root-derived");
+    }
     yyjson_mut_obj_add_bool(doc, root, "db_present", cbm_path_exists(srv->store_error_db_path));
     yyjson_mut_obj_add_bool(doc, root, "wal_present", cbm_path_exists(srv->store_error_wal_path));
     yyjson_mut_obj_add_bool(doc, root, "shm_present", cbm_path_exists(srv->store_error_shm_path));
@@ -1862,6 +1994,19 @@ static char *build_provenance_failed_error(const cbm_mcp_server_t *srv) {
     yyjson_mut_obj_add_str(doc, root, "db_path", srv->store_error_db_path);
     yyjson_mut_obj_add_str(doc, root, "wal_path", srv->store_error_wal_path);
     yyjson_mut_obj_add_str(doc, root, "shm_path", srv->store_error_shm_path);
+    if (srv->store_error_stored_project[0]) {
+        yyjson_mut_obj_add_str(doc, root, "stored_project", srv->store_error_stored_project);
+        yyjson_mut_obj_add_str(doc, root, "stored_root", srv->store_error_stored_root);
+        yyjson_mut_obj_add_str(doc, root, "stored_indexed_at", srv->store_error_indexed_at);
+        yyjson_mut_obj_add_str(doc, root, "canonical_root", srv->store_error_canonical_root);
+        yyjson_mut_obj_add_str(doc, root, "canonical_project",
+                               srv->store_error_canonical_project);
+        yyjson_mut_obj_add_str(doc, root, "canonical_db_path",
+                               srv->store_error_canonical_db_path);
+        yyjson_mut_obj_add_bool(doc, root, "canonical_db_present",
+                                cbm_path_exists(srv->store_error_canonical_db_path));
+        yyjson_mut_obj_add_str(doc, root, "identity_selection", "root-derived");
+    }
     yyjson_mut_obj_add_int(doc, root, "expected_schema_version", CBM_GRAPH_SCHEMA_VERSION);
     yyjson_mut_obj_add_int(doc, root, "native_error", (int64_t)srv->store_verify.native_error);
     yyjson_mut_obj_add_int(doc, root, "sqlite_error", srv->store_verify.sqlite_error);
@@ -2077,9 +2222,14 @@ static db_project_inspect_status_t db_internal_project_name(cbm_mcp_server_t *sr
                                                             const char *error_project,
                                                             const char *full_path, char *name_out,
                                                             size_t name_sz,
-                                                            cbm_store_t **out_store) {
+                                                            cbm_store_t **out_store,
+                                                            cbm_store_verify_result_t
+                                                                *out_verification) {
     if (out_store) {
         *out_store = NULL;
+    }
+    if (out_verification) {
+        memset(out_verification, 0, sizeof(*out_verification));
     }
     /* A zero-byte file is a recognizable abandoned ghost, not a SQLite
      * database and not evidence of corruption in persisted database bytes. */
@@ -2127,6 +2277,9 @@ static db_project_inspect_status_t db_internal_project_name(cbm_mcp_server_t *sr
     cbm_store_free_projects(projs, n);
     if (ok && out_store) {
         *out_store = st; /* transfer ownership to caller */
+        if (out_verification) {
+            *out_verification = verification;
+        }
     } else {
         cbm_store_close(st);
     }
@@ -2152,37 +2305,45 @@ static db_project_inspect_status_t build_project_json_entry(cbm_mcp_server_t *sr
      * they don't appear as resolvable projects. */
     char project_name[CBM_SZ_1K];
     cbm_store_t *pstore = NULL;
+    cbm_store_verify_result_t verification;
     db_project_inspect_status_t inspect =
-        db_internal_project_name(srv, "", full_path, project_name, sizeof(project_name), &pstore);
+        db_internal_project_name(srv, "", full_path, project_name, sizeof(project_name), &pstore,
+                                 &verification);
     if (inspect != DB_PROJECT_INSPECT_OK) {
+        return inspect;
+    }
+
+    db_project_identity_t identity;
+    inspect = inspect_root_derived_project_identity(srv, project_name, full_path, pstore,
+                                                    &verification, &identity);
+    if (inspect != DB_PROJECT_INSPECT_OK) {
+        cbm_store_close(pstore);
         return inspect;
     }
 
     int nodes = cbm_store_count_nodes(pstore, project_name);
     int edges = cbm_store_count_edges(pstore, project_name);
-    char root_path_buf[CBM_SZ_1K] = "";
-    cbm_project_t proj = {0};
-    int project_rc = cbm_store_get_project(pstore, project_name, &proj);
-    if (nodes < 0 || edges < 0 || project_rc != CBM_STORE_OK) {
+    if (nodes < 0 || edges < 0) {
         record_store_query_failure(srv, "", full_path, pstore, CBM_STORE_VERIFY_IO_FAILED,
                                    "source.query_project_details", cbm_store_error(pstore));
-        cbm_project_free_fields(&proj);
         cbm_store_close(pstore);
         return DB_PROJECT_INSPECT_FAILED;
     }
-    if (proj.root_path) {
-        snprintf(root_path_buf, sizeof(root_path_buf), "%s", proj.root_path);
-    }
-    cbm_project_free_fields(&proj);
     cbm_store_close(pstore);
 
     yyjson_mut_val *p = yyjson_mut_obj(doc);
     yyjson_mut_obj_add_strcpy(doc, p, "name", project_name);
-    yyjson_mut_obj_add_strcpy(doc, p, "root_path", root_path_buf);
-    add_git_context_json(doc, p, root_path_buf[0] ? root_path_buf : NULL);
+    yyjson_mut_obj_add_strcpy(doc, p, "root_path", identity.stored_root);
+    yyjson_mut_obj_add_strcpy(doc, p, "canonical_root", identity.canonical_root);
+    yyjson_mut_obj_add_strcpy(doc, p, "identity_source", "canonical_root");
+    yyjson_mut_obj_add_strcpy(doc, p, "indexed_at", identity.indexed_at);
+    yyjson_mut_obj_add_strcpy(doc, p, "db_path", full_path);
+    yyjson_mut_obj_add_strcpy(doc, p, "db_sha256", verification.db_sha256);
+    add_git_context_json(doc, p, identity.canonical_root);
     yyjson_mut_obj_add_int(doc, p, "nodes", nodes);
     yyjson_mut_obj_add_int(doc, p, "edges", edges);
-    yyjson_mut_obj_add_int(doc, p, "size_bytes", size_bytes);
+    yyjson_mut_obj_add_int(doc, p, "size_bytes",
+                           verification.db_bytes ? (int64_t)verification.db_bytes : size_bytes);
     yyjson_mut_arr_add_val(arr, p);
     return DB_PROJECT_INSPECT_OK;
 }
@@ -2236,6 +2397,55 @@ static void append_store_refusal_json(yyjson_mut_doc *doc, yyjson_mut_val *refus
     yyjson_mut_arr_add_val(refusals, item);
 }
 
+static void append_project_identity_conflict_json(yyjson_mut_doc *doc,
+                                                  yyjson_mut_val *conflicts,
+                                                  const cbm_mcp_server_t *srv) {
+    char canonical_wal_path[CBM_STORE_VERIFY_PATH_MAX + 5];
+    char canonical_shm_path[CBM_STORE_VERIFY_PATH_MAX + 5];
+    snprintf(canonical_wal_path, sizeof(canonical_wal_path), "%s-wal",
+             srv->store_error_canonical_db_path);
+    snprintf(canonical_shm_path, sizeof(canonical_shm_path), "%s-shm",
+             srv->store_error_canonical_db_path);
+
+    yyjson_mut_val *item = yyjson_mut_obj(doc);
+    yyjson_mut_obj_add_str(doc, item, "code", "CBM_PROJECT_IDENTITY_CONFLICT");
+    yyjson_mut_obj_add_strcpy(doc, item, "legacy_db_path", srv->store_error_db_path);
+    yyjson_mut_obj_add_strcpy(doc, item, "legacy_wal_path", srv->store_error_wal_path);
+    yyjson_mut_obj_add_strcpy(doc, item, "legacy_shm_path", srv->store_error_shm_path);
+    yyjson_mut_obj_add_strcpy(doc, item, "stored_project",
+                              srv->store_error_stored_project);
+    yyjson_mut_obj_add_strcpy(doc, item, "stored_root", srv->store_error_stored_root);
+    yyjson_mut_obj_add_strcpy(doc, item, "stored_indexed_at",
+                              srv->store_error_indexed_at);
+    yyjson_mut_obj_add_strcpy(doc, item, "canonical_root",
+                              srv->store_error_canonical_root);
+    yyjson_mut_obj_add_strcpy(doc, item, "canonical_project",
+                              srv->store_error_canonical_project);
+    yyjson_mut_obj_add_strcpy(doc, item, "canonical_db_path",
+                              srv->store_error_canonical_db_path);
+    yyjson_mut_obj_add_bool(doc, item, "canonical_db_present",
+                            cbm_path_exists(srv->store_error_canonical_db_path));
+    yyjson_mut_obj_add_bool(doc, item, "canonical_wal_present",
+                            cbm_path_exists(canonical_wal_path));
+    yyjson_mut_obj_add_bool(doc, item, "canonical_shm_present",
+                            cbm_path_exists(canonical_shm_path));
+    yyjson_mut_obj_add_int(doc, item, "legacy_db_bytes",
+                           (int64_t)srv->store_verify.db_bytes);
+    yyjson_mut_obj_add_strcpy(doc, item, "legacy_db_sha256",
+                              srv->store_verify.db_sha256);
+    yyjson_mut_obj_add_strcpy(doc, item, "failed_operation",
+                              srv->store_verify.operation);
+    yyjson_mut_obj_add_strcpy(doc, item, "detail", srv->store_verify.detail);
+    yyjson_mut_obj_add_str(doc, item, "identity_selection", "root-derived");
+    yyjson_mut_obj_add_bool(doc, item, "query_admitted", false);
+    yyjson_mut_obj_add_bool(doc, item, "source_mutation_attempted", false);
+    yyjson_mut_obj_add_str(
+        doc, item, "remediation",
+        "inspect both complete families, then run the explicit hash-bound "
+        "ArchiveAliasAgainstCanonical migration for this exact legacy DB and canonical DB");
+    yyjson_mut_arr_add_val(conflicts, item);
+}
+
 static void append_ghost_store_json(yyjson_mut_doc *doc, yyjson_mut_val *ghosts,
                                     const char *db_path, int64_t observed_size_bytes) {
     yyjson_mut_val *item = yyjson_mut_obj(doc);
@@ -2269,6 +2479,7 @@ static char *handle_list_projects(cbm_mcp_server_t *srv, const char *args) {
     yyjson_mut_doc_set_root(doc, root);
     yyjson_mut_val *arr = yyjson_mut_arr(doc);
     yyjson_mut_val *refusals = yyjson_mut_arr(doc);
+    yyjson_mut_val *conflicts = yyjson_mut_arr(doc);
     yyjson_mut_val *ghosts = yyjson_mut_arr(doc);
 
     if (!d && cbm_path_exists(dir_path)) {
@@ -2309,6 +2520,10 @@ static char *handle_list_projects(cbm_mcp_server_t *srv, const char *args) {
             append_store_refusal_json(doc, refusals, srv);
             continue;
         }
+        if (inspect == DB_PROJECT_INSPECT_IDENTITY_CONFLICT) {
+            append_project_identity_conflict_json(doc, conflicts, srv);
+            continue;
+        }
         if (inspect == DB_PROJECT_INSPECT_GHOST) {
             append_ghost_store_json(doc, ghosts, full_path, size_bytes);
         }
@@ -2319,6 +2534,9 @@ static char *handle_list_projects(cbm_mcp_server_t *srv, const char *args) {
     yyjson_mut_obj_add_val(doc, root, "store_refusals", refusals);
     yyjson_mut_obj_add_int(doc, root, "refused_store_count",
                            (int64_t)yyjson_mut_arr_size(refusals));
+    yyjson_mut_obj_add_val(doc, root, "project_identity_conflicts", conflicts);
+    yyjson_mut_obj_add_int(doc, root, "project_identity_conflict_count",
+                           (int64_t)yyjson_mut_arr_size(conflicts));
     yyjson_mut_obj_add_val(doc, root, "ghost_stores", ghosts);
     yyjson_mut_obj_add_int(doc, root, "ghost_store_count",
                            (int64_t)yyjson_mut_arr_size(ghosts));

@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-    Explicit hash-bound archive and reindex transaction for one legacy CBM store.
+    Explicit hash-bound reconciliation transaction for one legacy CBM store.
 
 .DESCRIPTION
     The source DB/WAL/SHM family is opened by exact Windows handles that deny
@@ -9,7 +9,15 @@
     independent post-rename identity/hash readback make partial completion
     diagnosable.  Only after the legacy source paths are proven absent is the
     supplied real codebase-memory binary allowed to index the canonical source
-    repository under the explicit stable project alias.  ResumeReindex
+    repository under the explicit stable project alias.
+
+    ArchiveAliasAgainstCanonical instead requires an already accepted,
+    root-derived canonical family. It verifies and hashes both families,
+    requires the real list_projects surface to report exactly one canonical
+    project plus one exact legacy identity conflict, archives only the legacy
+    family, and then independently proves the canonical family and discovery
+    state unchanged through an exact FILE_ID/length/hash release-query-reacquire
+    chain. ResumeReindex
     revalidates a completed immutable archive and its hash-linked journal, then
     creates one append-only attempt without repeating or reversing the archive
     transition.
@@ -25,7 +33,12 @@ param(
     [int]$Issue,
 
     [Parameter(Mandatory)]
-    [ValidateSet('ArchiveAndReindex', 'ResumeReindex', 'RecoverInterruptedResume')]
+    [ValidateSet(
+        'ArchiveAndReindex',
+        'ArchiveAliasAgainstCanonical',
+        'ResumeReindex',
+        'RecoverInterruptedResume'
+    )]
     [string]$Operation,
 
     [Parameter(Mandatory)]
@@ -34,6 +47,9 @@ param(
     [Parameter(Mandatory)]
     [ValidatePattern('^[0-9a-fA-F]{64}$')]
     [string]$ExpectedDbSha256,
+
+    [ValidatePattern('^$|^[0-9a-fA-F]{64}$')]
+    [string]$ExpectedCanonicalDbSha256 = '',
 
     [Parameter(Mandatory)]
     [string]$RepositoryPath,
@@ -1132,13 +1148,40 @@ function Invoke-CbmTool {
     }
 }
 
+function Read-CbmToolPayload {
+    param(
+        [Parameter(Mandatory)][string]$StdoutPath,
+        [Parameter(Mandatory)][string]$Purpose
+    )
+    try {
+        $outer = Get-Content -Raw -LiteralPath $StdoutPath |
+            ConvertFrom-Json -AsHashtable -Depth 100
+        if (-not $outer.ContainsKey('content') -or @($outer['content']).Count -lt 1 -or
+            -not $outer['content'][0].ContainsKey('text')) {
+            throw 'MCP response omitted content[0].text'
+        }
+        return [string]$outer['content'][0]['text'] |
+            ConvertFrom-Json -AsHashtable -Depth 100
+    }
+    catch {
+        Throw-CbmMigrationError -Code 'CBM_STORE_MIGRATION_TOOL_RESPONSE_INVALID' `
+            -Message "$Purpose response is not one complete MCP JSON payload: $($_.Exception.Message)" `
+            -Remediation 'preserve the transaction and inspect the exact persisted stdout/stderr bytes'
+    }
+}
+
 $transactionPath = $null
 $transactionOwned = $false
 $attemptPrefix = $null
 $faultRecordPath = $null
 $guards = [Collections.Generic.List[object]]::new()
 $targetRecords = [Collections.Generic.List[object]]::new()
-$mutexMaterial = [IO.Path]::GetFullPath($LegacyDbPath).ToUpperInvariant()
+$preflightRun = $null
+$postflightRun = $null
+$mutexMaterial = (
+    [IO.Path]::GetDirectoryName([IO.Path]::GetFullPath($LegacyDbPath)).TrimEnd('\', '/') +
+    '|' + $Project
+).ToUpperInvariant()
 $mutexDigest = [Convert]::ToHexString(
     [Security.Cryptography.SHA256]::HashData(
         [Text.UTF8Encoding]::new($false).GetBytes($mutexMaterial)
@@ -1166,7 +1209,11 @@ catch {
 try {
     $repository = Get-CanonicalExistingPath -Path $RepositoryPath -Kind Directory
     $binary = Get-CanonicalExistingPath -Path $BinaryPath -Kind File
-    if ($Operation -eq 'ArchiveAndReindex') {
+    $newArchiveOperation = $Operation -in @(
+        'ArchiveAndReindex',
+        'ArchiveAliasAgainstCanonical'
+    )
+    if ($newArchiveOperation) {
         $legacy = Get-CanonicalExistingPath -Path $LegacyDbPath -Kind File
     }
     else {
@@ -1181,6 +1228,7 @@ try {
             -Remediation 'pass the exact primary SQLite database path, not a sidecar'
     }
     $expectedDb = $ExpectedDbSha256.ToLowerInvariant()
+    $expectedCanonicalDb = $ExpectedCanonicalDbSha256.ToLowerInvariant()
     $expectedBinary = $ExpectedBinarySha256.ToLowerInvariant()
     $binarySha = Get-FileSha256 -Path $binary
     if ($binarySha -cne $expectedBinary) {
@@ -1203,11 +1251,28 @@ try {
             -Message "canonical target family already exists: $($existingTargetMembers -join ', ')" `
             -Remediation 'inspect and verify every existing target-family member; this transaction never overwrites any of them'
     }
+    if ($Operation -eq 'ArchiveAliasAgainstCanonical') {
+        if ($expectedCanonicalDb -notmatch '^[0-9a-f]{64}$') {
+            Throw-CbmMigrationError -Code 'CBM_STORE_MIGRATION_CANONICAL_HASH_REQUIRED' `
+                -Message 'ArchiveAliasAgainstCanonical requires ExpectedCanonicalDbSha256' `
+                -Remediation 'independently hash the accepted canonical primary DB and pass its exact lowercase SHA-256'
+        }
+        if (-not (Test-Path -LiteralPath $target -PathType Leaf)) {
+            Throw-CbmMigrationError -Code 'CBM_STORE_MIGRATION_CANONICAL_TARGET_MISSING' `
+                -Message "accepted canonical primary DB is absent: $target" `
+                -Remediation 'preserve the legacy family and establish one verified root-derived canonical family first'
+        }
+    }
 
-    $transactionId = "issue-$Issue-$expectedDb-$Project"
+    $transactionId = if ($Operation -eq 'ArchiveAliasAgainstCanonical') {
+        "issue-$Issue-$expectedDb-$Project-against-$expectedCanonicalDb"
+    }
+    else {
+        "issue-$Issue-$expectedDb-$Project"
+    }
     $archiveRoot = [IO.Path]::Combine($cache, 'archive', 'cbm-store-migrations')
     $transactionPath = [IO.Path]::Combine($archiveRoot, $transactionId)
-    if ($Operation -eq 'ArchiveAndReindex') {
+    if ($newArchiveOperation) {
         [IO.Directory]::CreateDirectory($archiveRoot) | Out-Null
         if (Test-Path -LiteralPath $transactionPath) {
             Throw-CbmMigrationError -Code 'CBM_STORE_MIGRATION_TRANSACTION_EXISTS' `
@@ -1220,25 +1285,114 @@ try {
         Initialize-CbmMigrationNative -TransactionPath $transactionPath `
             -CompilerScope ([IO.Path]::Combine($transactionPath, 'compiler-scope'))
 
+    if ($Operation -eq 'ArchiveAliasAgainstCanonical') {
+        # The real product verifies the complete source families first. This
+        # operation then accepts only a quiescent sidecar-free generation, so
+        # exact primary DB hashes bind all persistent SQLite state when the
+        # no-write/no-delete-share handles are acquired immediately afterward.
+        $preflightArgs = [IO.Path]::Combine($transactionPath, 'preflight-list-args.json')
+        Write-DurableJson -Path $preflightArgs -Value ([ordered]@{})
+        $preflightStdout = [IO.Path]::Combine($transactionPath, 'preflight-list.stdout.json')
+        $preflightStderr = [IO.Path]::Combine($transactionPath, 'preflight-list.stderr.log')
+        $preflightRun = Invoke-CbmTool -Executable $binary -Tool 'list_projects' `
+            -ArgsPath $preflightArgs -StdoutPath $preflightStdout -StderrPath $preflightStderr `
+            -TimeoutSeconds $ReindexTimeoutSeconds -CacheDirectory $cache
+        if ($preflightRun.ExitCode -ne 0) {
+            Throw-CbmMigrationError -Code 'CBM_STORE_MIGRATION_PREFLIGHT_LIST_FAILED' `
+                -Message "real list_projects exited $($preflightRun.ExitCode) before archival" `
+                -Remediation 'preserve both families and inspect the persisted preflight response'
+        }
+        $preflightPayload = Read-CbmToolPayload -StdoutPath $preflightStdout `
+            -Purpose 'preflight list_projects'
+        $canonicalRows = @($preflightPayload['projects'] | Where-Object {
+            [string]$_['name'] -ceq $Project -and
+            [string]::Equals(
+                [IO.Path]::GetFullPath([string]$_['db_path']),
+                $target,
+                [StringComparison]::OrdinalIgnoreCase
+            ) -and [string]$_['db_sha256'] -ceq $expectedCanonicalDb -and
+            [string]::Equals(
+                [IO.Path]::GetFullPath([string]$_['canonical_root']).TrimEnd('\', '/'),
+                $repository.TrimEnd('\', '/'),
+                [StringComparison]::OrdinalIgnoreCase
+            )
+        })
+        $legacyConflicts = @($preflightPayload['project_identity_conflicts'] |
+            Where-Object {
+                [string]::Equals(
+                    [IO.Path]::GetFullPath([string]$_['legacy_db_path']),
+                    $legacy,
+                    [StringComparison]::OrdinalIgnoreCase
+                ) -and [string]$_['legacy_db_sha256'] -ceq $expectedDb -and
+                [string]$_['canonical_project'] -ceq $Project -and
+                [string]::Equals(
+                    [IO.Path]::GetFullPath([string]$_['canonical_db_path']),
+                    $target,
+                    [StringComparison]::OrdinalIgnoreCase
+                ) -and
+                [string]::Equals(
+                    [IO.Path]::GetFullPath([string]$_['canonical_root']).TrimEnd('\', '/'),
+                    $repository.TrimEnd('\', '/'),
+                    [StringComparison]::OrdinalIgnoreCase
+                )
+            })
+        if ($canonicalRows.Count -ne 1 -or $legacyConflicts.Count -ne 1) {
+            Throw-CbmMigrationError -Code 'CBM_STORE_MIGRATION_PREFLIGHT_IDENTITY_MISMATCH' `
+                -Message "expected one accepted canonical row and one exact legacy conflict; canonical=$($canonicalRows.Count) conflict=$($legacyConflicts.Count)" `
+                -Remediation 'preserve both families; reconcile product discovery output with the reviewed paths, roots, and hashes'
+        }
+        foreach ($sidecarPath in @("$target-wal", "$target-shm", "$legacy-wal", "$legacy-shm")) {
+            if (Test-Path -LiteralPath $sidecarPath) {
+                Throw-CbmMigrationError -Code 'CBM_STORE_MIGRATION_ALIAS_FAMILY_NOT_QUIESCENT' `
+                    -Message "ArchiveAliasAgainstCanonical requires a sidecar-free generation; present=$sidecarPath" `
+                    -Remediation 'close every client, complete a normal SQLite checkpoint/close, then retry only after DB/WAL/SHM state is independently read back'
+            }
+        }
+
+        $targetPrimary = New-FamilyGuardRecord -Path $target
+        $guards.Add($targetPrimary)
+        $targetRecords.Add($targetPrimary)
+        foreach ($sidecarPath in @("$target-wal", "$target-shm")) {
+            if (Test-Path -LiteralPath $sidecarPath) {
+                Throw-CbmMigrationError -Code 'CBM_STORE_MIGRATION_CANONICAL_FAMILY_CHANGED' `
+                    -Message "canonical sidecar appeared before exact target freeze completed: $sidecarPath" `
+                    -Remediation 'preserve both families and retry only after the exact writer generation is absent'
+            }
+        }
+        if ($targetPrimary.Sha256 -cne $expectedCanonicalDb) {
+            Throw-CbmMigrationError -Code 'CBM_STORE_MIGRATION_CANONICAL_HASH_MISMATCH' `
+                -Message "canonical db sha256=$($targetPrimary.Sha256) expected=$expectedCanonicalDb" `
+                -Remediation 're-read the accepted canonical family and pass its exact current primary DB hash'
+        }
+    }
+
     # Guard the primary first. Denying FILE_SHARE_WRITE makes an existing or
     # newly starting SQLite writer incompatible before sidecar membership is
     # stated, so the DB/WAL/SHM family cannot legitimately change underneath
     # the inventory.
-    $guards.Add((New-FamilyGuardRecord -Path $legacy))
+    $legacyPrimary = New-FamilyGuardRecord -Path $legacy
+    $guards.Add($legacyPrimary)
     foreach ($suffix in @('-wal', '-shm')) {
         $sidecar = $legacy + $suffix
         if (Test-Path -LiteralPath $sidecar) {
+            if ($Operation -eq 'ArchiveAliasAgainstCanonical') {
+                Throw-CbmMigrationError -Code 'CBM_STORE_MIGRATION_ALIAS_FAMILY_CHANGED' `
+                    -Message "legacy sidecar appeared after quiescent preflight: $sidecar" `
+                    -Remediation 'preserve both families and retry only after the exact writer generation is absent'
+            }
             $guards.Add((New-FamilyGuardRecord -Path $sidecar))
         }
     }
-    if ($guards[0].Sha256 -cne $expectedDb) {
+    if ($legacyPrimary.Sha256 -cne $expectedDb) {
         Throw-CbmMigrationError -Code 'CBM_STORE_MIGRATION_DB_HASH_MISMATCH' `
-            -Message "legacy db sha256=$($guards[0].Sha256) expected=$expectedDb" `
+            -Message "legacy db sha256=$($legacyPrimary.Sha256) expected=$expectedDb" `
             -Remediation 're-read the issue authorization and pass the exact current source hash'
     }
 
     $journal = [IO.Path]::Combine($transactionPath, 'journal.ndjson')
-    $members = @($guards | ForEach-Object {
+    $members = @($guards | Where-Object {
+        -not $targetRecords.Contains($_)
+    } | ForEach-Object {
         [ordered]@{
             source_path = $_.SourcePath
             archive_path = [IO.Path]::Combine($transactionPath, [IO.Path]::GetFileName($_.SourcePath))
@@ -1259,15 +1413,37 @@ try {
         binary_sha256 = $binarySha
         expected_schema_version = $ExpectedSchemaVersion
         source_family = $members
+        canonical_target_family_preflight = @($targetRecords | ForEach-Object {
+            [ordered]@{
+                path = $_.SourcePath
+                file_id = $_.FileId
+                length = $_.Length
+                sha256 = $_.Sha256
+            }
+        })
     }
     Write-DurableJson -Path ([IO.Path]::Combine($transactionPath, 'intent.json')) -Value $intent
     $previous = Add-JournalRecord -JournalPath $journal -PreviousSha256 ('0' * 64) `
         -Event 'intent_published' -Data $intent
 
+    if ($Operation -eq 'ArchiveAliasAgainstCanonical') {
+        $previous = Add-JournalRecord -JournalPath $journal -PreviousSha256 $previous `
+            -Event 'alias_preflight_verified' -Data ([ordered]@{
+                process = $preflightRun.Identity
+                exit_code = $preflightRun.ExitCode
+                stdout_sha256 = $preflightRun.StdoutSha256
+                stderr_sha256 = $preflightRun.StderrSha256
+                canonical = $canonicalRows[0]
+                legacy_conflict = $legacyConflicts[0]
+            })
+    }
+
     # The primary DB is renamed first so the active cache namespace stops
     # advertising it before sidecars move.  All family guards remain live for
     # the complete transition, so no SQLite writer can observe a split family.
-    foreach ($guard in $guards) {
+    foreach ($guard in @($guards | Where-Object {
+        -not $targetRecords.Contains($_)
+    })) {
         $destination = [IO.Path]::Combine($transactionPath, [IO.Path]::GetFileName($guard.SourcePath))
         [CbmStoreMigrationNative]::RenameNoReplace($guard.Handle, $destination)
         $afterPath = [IO.Path]::GetFullPath([CbmStoreMigrationNative]::FinalPath($guard.Handle))
@@ -1321,6 +1497,164 @@ try {
     }
     Write-DurableJson -Path ([IO.Path]::Combine($transactionPath, 'archive-complete.json')) `
         -Value $archiveComplete
+
+    if ($Operation -eq 'ArchiveAliasAgainstCanonical') {
+        $canonicalBeforePostflight = [ordered]@{
+            path = $targetPrimary.SourcePath
+            file_id = $targetPrimary.FileId
+            length = $targetPrimary.Length
+            sha256 = $targetPrimary.Sha256
+        }
+        $targetPrimary.Handle.Dispose()
+        [void]$guards.Remove($targetPrimary)
+        $targetRecords.Clear()
+
+        $postflightArgs = [IO.Path]::Combine($transactionPath, 'postflight-list-args.json')
+        Write-DurableJson -Path $postflightArgs -Value ([ordered]@{})
+        $postflightStdout = [IO.Path]::Combine($transactionPath, 'postflight-list.stdout.json')
+        $postflightStderr = [IO.Path]::Combine($transactionPath, 'postflight-list.stderr.log')
+        $postflightRun = Invoke-CbmTool -Executable $binary -Tool 'list_projects' `
+            -ArgsPath $postflightArgs -StdoutPath $postflightStdout `
+            -StderrPath $postflightStderr -TimeoutSeconds $ReindexTimeoutSeconds `
+            -CacheDirectory $cache
+        if ($postflightRun.ExitCode -ne 0) {
+            Throw-CbmMigrationError -Code 'CBM_STORE_MIGRATION_POSTFLIGHT_LIST_FAILED' `
+                -Message "real list_projects exited $($postflightRun.ExitCode) after archival" `
+                -Remediation 'preserve the completed archive and accepted canonical family; inspect the persisted postflight response'
+        }
+        $postflightPayload = Read-CbmToolPayload -StdoutPath $postflightStdout `
+            -Purpose 'postflight list_projects'
+        $postCanonicalRows = @($postflightPayload['projects'] | Where-Object {
+            [string]$_['name'] -ceq $Project -and
+            [string]::Equals(
+                [IO.Path]::GetFullPath([string]$_['db_path']),
+                $target,
+                [StringComparison]::OrdinalIgnoreCase
+            ) -and [string]$_['db_sha256'] -ceq $expectedCanonicalDb -and
+            [string]::Equals(
+                [IO.Path]::GetFullPath([string]$_['canonical_root']).TrimEnd('\', '/'),
+                $repository.TrimEnd('\', '/'),
+                [StringComparison]::OrdinalIgnoreCase
+            )
+        })
+        $remainingLegacyConflicts = @($postflightPayload['project_identity_conflicts'] |
+            Where-Object {
+                [string]::Equals(
+                    [IO.Path]::GetFullPath([string]$_['legacy_db_path']),
+                    $legacy,
+                    [StringComparison]::OrdinalIgnoreCase
+                )
+            })
+        if ($postCanonicalRows.Count -ne 1 -or $remainingLegacyConflicts.Count -ne 0 -or
+            (Test-Path -LiteralPath $legacy)) {
+            Throw-CbmMigrationError -Code 'CBM_STORE_MIGRATION_POSTFLIGHT_IDENTITY_MISMATCH' `
+                -Message "expected one unchanged canonical row, no legacy conflict, and absent legacy path; canonical=$($postCanonicalRows.Count) conflict=$($remainingLegacyConflicts.Count) legacy_present=$(Test-Path -LiteralPath $legacy)" `
+                -Remediation 'preserve every archive/canonical byte and inspect the postflight namespace and discovery response'
+        }
+
+        foreach ($sidecarPath in @("$target-wal", "$target-shm")) {
+            if (Test-Path -LiteralPath $sidecarPath) {
+                Throw-CbmMigrationError -Code 'CBM_STORE_MIGRATION_CANONICAL_NOT_QUIESCENT' `
+                    -Message "canonical sidecar appeared during postflight readback: $sidecarPath" `
+                    -Remediation 'preserve the completed archive and canonical family; inspect the exact client generation before any further reconciliation'
+            }
+        }
+        $targetPrimary = New-FamilyGuardRecord -Path $target
+        $guards.Add($targetPrimary)
+        $targetRecords.Add($targetPrimary)
+        if ($targetPrimary.FileId -cne $canonicalBeforePostflight.file_id -or
+            $targetPrimary.Length -ne $canonicalBeforePostflight.length -or
+            $targetPrimary.Sha256 -cne $canonicalBeforePostflight.sha256) {
+            Throw-CbmMigrationError -Code 'CBM_STORE_MIGRATION_CANONICAL_POSTFLIGHT_DRIFT' `
+                -Message 'canonical FILE_ID/length/hash changed across independent product postflight' `
+                -Remediation 'preserve the archive and canonical family; inspect the exact namespace/content transition'
+        }
+
+        $targetFamilyReadback = @($targetRecords | ForEach-Object {
+            $currentSha = Get-FileSha256 -Path $_.SourcePath
+            $currentItem = Get-Item -LiteralPath $_.SourcePath -Force
+            $currentFinal = [IO.Path]::GetFullPath(
+                [CbmStoreMigrationNative]::FinalPath($_.Handle)
+            )
+            $currentId = [CbmStoreMigrationNative]::FileId($_.Handle)
+            if (-not [string]::Equals(
+                    $currentFinal,
+                    $_.SourcePath,
+                    [StringComparison]::OrdinalIgnoreCase
+                ) -or $currentId -cne $_.FileId -or
+                $currentItem.Length -ne $_.Length -or $currentSha -cne $_.Sha256) {
+                Throw-CbmMigrationError -Code 'CBM_STORE_MIGRATION_CANONICAL_READBACK_DRIFT' `
+                    -Message "accepted canonical family changed during alias archival: $($_.SourcePath)" `
+                    -Remediation 'preserve the archive and canonical family; inspect exact FILE_ID/length/hash drift'
+            }
+            [ordered]@{
+                path = $_.SourcePath
+                file_id = $currentId
+                length = $currentItem.Length
+                sha256 = $currentSha
+            }
+        })
+        $finalArchiveReadback = @($archiveReadback | ForEach-Object {
+            if (Test-Path -LiteralPath $_.source_path) {
+                Throw-CbmMigrationError -Code 'CBM_STORE_MIGRATION_SOURCE_REAPPEARED' `
+                    -Message "archived alias source reappeared: $($_.source_path)" `
+                    -Remediation 'preserve both families and investigate the foreign writer'
+            }
+            $archiveSha = Get-FileSha256 -Path $_.archive_path
+            if ($archiveSha -cne $_.sha256) {
+                Throw-CbmMigrationError -Code 'CBM_STORE_MIGRATION_ARCHIVE_HASH_DRIFT' `
+                    -Message "archived alias bytes drifted: $($_.archive_path)" `
+                    -Remediation 'preserve every byte and investigate storage corruption'
+            }
+            [ordered]@{
+                source_path = $_.source_path
+                source_absent = $true
+                archive_path = $_.archive_path
+                length = (Get-Item -LiteralPath $_.archive_path -Force).Length
+                sha256 = $archiveSha
+            }
+        })
+        $previous = Add-JournalRecord -JournalPath $journal -PreviousSha256 $previous `
+            -Event 'alias_postflight_verified' -Data ([ordered]@{
+                process = $postflightRun.Identity
+                exit_code = $postflightRun.ExitCode
+                stdout_sha256 = $postflightRun.StdoutSha256
+                stderr_sha256 = $postflightRun.StderrSha256
+                canonical = $postCanonicalRows[0]
+                legacy_source_absent = $true
+                canonical_family = $targetFamilyReadback
+                archived_source_family = $finalArchiveReadback
+            })
+        $complete = [ordered]@{
+            schema = 1
+            issue = $Issue
+            status = 'complete'
+            operation = $Operation
+            completed_utc = [DateTime]::UtcNow.ToString('o')
+            project = $Project
+            repository_path = $repository
+            archived_source_family = $finalArchiveReadback
+            canonical_target = $postCanonicalRows[0]
+            canonical_target_family = $targetFamilyReadback
+            preflight_process = $preflightRun.Identity
+            preflight_exit_code = $preflightRun.ExitCode
+            preflight_stdout_sha256 = $preflightRun.StdoutSha256
+            preflight_stderr_sha256 = $preflightRun.StderrSha256
+            postflight_process = $postflightRun.Identity
+            postflight_exit_code = $postflightRun.ExitCode
+            postflight_stdout_sha256 = $postflightRun.StdoutSha256
+            postflight_stderr_sha256 = $postflightRun.StderrSha256
+            final_journal_record_sha256 = $previous
+        }
+        Write-DurableJson -Path ([IO.Path]::Combine($transactionPath, 'completion.json')) `
+            -Value $complete
+        foreach ($guard in $guards) {
+            $guard.Handle.Dispose()
+        }
+        $guards.Clear()
+        $complete | ConvertTo-Json -Depth 12 -Compress
+        return
+    }
 
     }
     else {
