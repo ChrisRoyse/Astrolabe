@@ -13,8 +13,8 @@ use std::path::{Path, PathBuf};
 
 use astrolabe_domain::knobs::U64KnobDeclaration;
 use astrolabe_ingest::{
-    CbmGraphEdge, CbmGraphNode, CbmGraphSnapshot, read_cbm_graph_snapshot,
-    read_cbm_graph_snapshot_at,
+    ASTROLABE_FSV_JANITOR_ACTOR, CbmGraphEdge, CbmGraphNode, CbmGraphSnapshot,
+    read_cbm_graph_snapshot, read_cbm_graph_snapshot_at,
 };
 use astrolabe_weave::{
     PersistedSimilarityEdgeRow, SCHEMA_SIM_EDGE_ROW, SIM_EDGE_ROW_PREFIX, SimEdgeGraphRow,
@@ -1146,11 +1146,14 @@ fn insert_token_vectors(tx: &Transaction<'_>, rows: &LoweredRows) -> LowerResult
     Ok(())
 }
 
-/// Non-lowering ledger head hash visible at an explicit MVCC `snapshot`.
+/// Projection-relevant ledger head hash visible at an explicit MVCC `snapshot`.
 ///
 /// Pins the Ledger CF scan to `snapshot` so the fingerprint reflects exactly the
 /// ledger state as of that sequence (#43 `as_of`); passing `vault.latest_seq()`
-/// reproduces the present-time head used by the canonical lowering.
+/// reproduces the present-time head used by the canonical lowering. Lowering
+/// manifests and FSV-janitor receipts are projection metadata: neither changes
+/// an input represented in the lowered SQLite artifact, and including either
+/// would make that metadata invalidate the artifact it just recorded.
 fn source_ledger_head_hash_at<C>(vault: &AsterVault<C>, snapshot: Seq) -> LowerResult<String>
 where
     C: Clock,
@@ -1158,7 +1161,7 @@ where
     let mut selected = None;
     for (_key, bytes) in vault.scan_cf_at(snapshot, ColumnFamily::Ledger)? {
         let entry = decode(&bytes)?;
-        if matches!(&entry.actor, ActorId::Service(actor) if actor == ASTRO_LOWER_ACTOR) {
+        if is_lower_projection_metadata_actor(&entry.actor) {
             continue;
         }
         if selected.is_none_or(|(seq, _)| entry.seq > seq) {
@@ -1168,6 +1171,14 @@ where
     Ok(hex_lower(
         &selected.map_or([0_u8; 32], |(_, entry_hash)| entry_hash),
     ))
+}
+
+fn is_lower_projection_metadata_actor(actor: &ActorId) -> bool {
+    matches!(
+        actor,
+        ActorId::Service(actor)
+            if actor == ASTRO_LOWER_ACTOR || actor == ASTROLABE_FSV_JANITOR_ACTOR
+    )
 }
 
 /// Reads the persisted similarity (`SIM_*`) edge rows at an explicit MVCC
