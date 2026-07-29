@@ -126,9 +126,6 @@ pub(crate) fn strip_calyx_arg(args: &Map<String, Value>) -> Result<String, DynEr
 pub(crate) fn index_project_from_args(
     args: &Map<String, Value>,
 ) -> Result<Option<String>, DynError> {
-    if let Some(name) = string_arg(args, "name") {
-        return Ok(Some(astrolabe_bridge::cbm_project_name_from_path(name)?));
-    }
     Ok(string_arg(args, "repo_path")
         .map(astrolabe_bridge::cbm_project_name_from_path)
         .transpose()?)

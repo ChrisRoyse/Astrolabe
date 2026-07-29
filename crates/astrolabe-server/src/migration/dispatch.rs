@@ -367,6 +367,11 @@ pub(crate) fn handle_index_repository(
     let Some(args_obj) = args.as_object() else {
         return Ok(runner.handle_tool_raw("index_repository", args_json)?);
     };
+    if args_obj.contains_key("name") {
+        return tool_error_result(
+            "CBM_PROJECT_NAME_OVERRIDE_REFUSED: project storage identity is derived only from the canonical repository root; remove the name argument and use the project returned by index_repository",
+        );
+    }
 
     let search_scale_override = match parse_search_scale_override(args_obj) {
         Ok(value) => value,
