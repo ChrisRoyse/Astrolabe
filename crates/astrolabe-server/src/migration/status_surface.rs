@@ -515,12 +515,13 @@ pub(crate) fn periodic_verify_status_at(
     };
     let checked_at_unix_ms =
         read_config_u64(cache_dir, project, "periodic_verify_checked_unix_ms")?;
-    let ledger_rows = read_config_u64(cache_dir, project, "periodic_verify_ledger_rows")?;
+    let ledger_rows = read_config_optional_u64(cache_dir, project, "periodic_verify_ledger_rows")?;
     let checked_range_start =
-        read_config_u64(cache_dir, project, "periodic_verify_checked_range_start")?;
+        read_config_optional_u64(cache_dir, project, "periodic_verify_checked_range_start")?;
     let checked_range_end =
-        read_config_u64(cache_dir, project, "periodic_verify_checked_range_end")?;
-    let verified_through = read_config_u64(cache_dir, project, "periodic_verify_verified_through")?;
+        read_config_optional_u64(cache_dir, project, "periodic_verify_checked_range_end")?;
+    let verified_through =
+        read_config_optional_u64(cache_dir, project, "periodic_verify_verified_through")?;
     let scrubbed = read_config_value(
         cache_dir,
         &metadata_key(project, "periodic_verify_scrubbed"),
