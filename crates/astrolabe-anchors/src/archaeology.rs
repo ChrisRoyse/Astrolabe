@@ -367,7 +367,7 @@ pub fn mine_git_archaeology(
             // commits that only ever lived on a PR branch). Every query below —
             // the cap pre-count's `%P` lookup included — fails fatally on a
             // missing object, so resolve existence before touching the target.
-            if !git_status(repo, &["cat-file", "-e", &format!("{target}^{{commit}}")])? {
+            if !git_commit_exists(repo, &target)? {
                 skipped_unresolvable_reverts += 1;
             } else {
                 // Mass-change cap (#434): a revert whose TARGET touched more than the
@@ -1258,6 +1258,57 @@ fn is_oid(value: &str) -> bool {
     matches!(value.len(), 40 | 64) && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
+/// Resolves an exact object id as a commit through Git's documented batch
+/// protocol. `cat-file -e` promises only zero versus nonzero, so its numeric
+/// failure status cannot distinguish an unavailable object from a command
+/// failure. Batch mode represents expected absence as a successful, explicit
+/// `<query> missing` record while real child failures remain errors.
+fn git_commit_exists(repo: &Path, oid: &str) -> Result<bool, ArchaeologyError> {
+    validate_oid(oid)?;
+    let query = format!("{oid}^{{commit}}");
+    let input = format!("{query}\n");
+    let output = git_with_stdin(
+        repo,
+        &["cat-file", "--batch-check=%(objectname) %(objecttype)"],
+        input.as_bytes(),
+    )?;
+    let text = String::from_utf8(output).map_err(|error| {
+        ArchaeologyError::new(
+            ASTRO_ARCHAEOLOGY_OUTPUT_INVALID,
+            format!("cat-file --batch-check output is not UTF-8: {error}"),
+        )
+    })?;
+    let record = text.strip_suffix('\n').ok_or_else(|| {
+        ArchaeologyError::new(
+            ASTRO_ARCHAEOLOGY_OUTPUT_INVALID,
+            format!("cat-file --batch-check omitted the record terminator for {query:?}: {text:?}"),
+        )
+    })?;
+    let record = record.strip_suffix('\r').unwrap_or(record);
+    if record.contains('\r') || record.contains('\n') {
+        return Err(ArchaeologyError::new(
+            ASTRO_ARCHAEOLOGY_OUTPUT_INVALID,
+            format!("cat-file --batch-check returned multiple records for {query:?}: {text:?}"),
+        ));
+    }
+    if record == format!("{query} missing") {
+        return Ok(false);
+    }
+
+    let mut fields = record.split(' ');
+    let resolved_oid = fields.next().unwrap_or_default();
+    let object_type = fields.next().unwrap_or_default();
+    if fields.next().is_some() || object_type != "commit" || !is_oid(resolved_oid) {
+        return Err(ArchaeologyError::new(
+            ASTRO_ARCHAEOLOGY_OUTPUT_INVALID,
+            format!(
+                "cat-file --batch-check returned an invalid commit-existence record for {query:?}: {record:?}"
+            ),
+        ));
+    }
+    Ok(true)
+}
+
 fn git_status(repo: &Path, args: &[&str]) -> Result<bool, ArchaeologyError> {
     let output = git_command(repo, args)
         .output()
@@ -1265,8 +1316,8 @@ fn git_status(repo: &Path, args: &[&str]) -> Result<bool, ArchaeologyError> {
     match output.status.code() {
         Some(0) => Ok(true),
         // Every predicate routed here documents exit 1 as false:
-        // `merge-base --is-ancestor` for a non-ancestor, `cat-file -e` for a
-        // missing object, and `show-ref --verify --quiet` for a missing ref.
+        // `merge-base --is-ancestor` for a non-ancestor and
+        // `show-ref --verify --quiet` for a missing ref.
         // Every other exit is a Git fault, not a false predicate.
         Some(1) => Ok(false),
         _ => Err(git_exit_error(args, output.status.code(), &output.stderr)),
