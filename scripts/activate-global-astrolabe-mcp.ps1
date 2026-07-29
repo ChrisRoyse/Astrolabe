@@ -204,15 +204,6 @@ function Open-ConfigVerdictLease {
                 "$Description is not strict UTF-8: $Path ($($_.Exception.Message))" `
                 'repair the exact configuration encoding without discarding any setting, then retry'
         }
-        $environmentValid = if (
-            [string]::IsNullOrWhiteSpace($ExpectedArchaeologyRoot)
-        ) {
-            $envCount -ge 0
-        }
-        else {
-            $envCount -eq 1 -and
-                $archaeologyRoot -ceq $ExpectedArchaeologyRoot
-        }
         return [pscustomobject]@{
             stream = $stream
             acquired_at_utc = [DateTime]::UtcNow.ToString('o')
@@ -527,6 +518,7 @@ function Get-ClaudeConfigInspection {
         $argsCount = -1
         $envCount = -1
         $archaeologyRoot = $null
+        $environmentValid = $false
         $targetPropertyCount = 0
         if ($targetFound) {
             foreach ($property in $target.EnumerateObject()) {
@@ -555,6 +547,15 @@ function Get-ClaudeConfigInspection {
                     }
                 }
             }
+        }
+        $environmentValid = if (
+            [string]::IsNullOrWhiteSpace($ExpectedArchaeologyRoot)
+        ) {
+            $envCount -ge 0
+        }
+        else {
+            $envCount -eq 1 -and
+                $archaeologyRoot -ceq $ExpectedArchaeologyRoot
         }
         return [pscustomobject]@{
             unrelated_canonical = $unrelatedCanonical
@@ -1863,7 +1864,12 @@ finally {
     Close-ConfigVerdictLease $claudeVerdictLease
     Close-ConfigVerdictLease $codexVerdictLease
     if ($mutexHeld -and $null -ne $activationMutex) {
-        try { $activationMutex.ReleaseMutex() } catch {}
+        try { $activationMutex.ReleaseMutex() }
+        catch {
+            [Console]::Error.WriteLine(
+                "ASTRO_GLOBAL_ACTIVATION_MUTEX_RELEASE_FAILED: $($_.Exception.Message)"
+            )
+        }
     }
     if ($null -ne $activationMutex) { $activationMutex.Dispose() }
 }
