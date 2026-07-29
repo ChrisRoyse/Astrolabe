@@ -17,7 +17,10 @@
     project plus one exact legacy identity conflict, archives only the legacy
     family, and then independently proves the canonical family and discovery
     state unchanged through an exact FILE_ID/length/hash release-query-reacquire
-    chain. ResumeReindex
+    chain. ResumeAliasAgainstCanonical revalidates an immutable pre-intent
+    alias-archive fault, binds its complete append-only inventory and original
+    fault hash into a numbered retry, and reruns the same product preflight and
+    handle-bound archive path without weakening sharing. ResumeReindex
     revalidates a completed immutable archive and its hash-linked journal, then
     creates one append-only attempt without repeating or reversing the archive
     transition.
@@ -36,6 +39,7 @@ param(
     [ValidateSet(
         'ArchiveAndReindex',
         'ArchiveAliasAgainstCanonical',
+        'ResumeAliasAgainstCanonical',
         'ResumeReindex',
         'RecoverInterruptedResume'
     )]
@@ -50,6 +54,9 @@ param(
 
     [ValidatePattern('^$|^[0-9a-fA-F]{64}$')]
     [string]$ExpectedCanonicalDbSha256 = '',
+
+    [ValidatePattern('^$|^[0-9a-fA-F]{64}$')]
+    [string]$ExpectedInitialFaultSha256 = '',
 
     [Parameter(Mandatory)]
     [string]$RepositoryPath,
@@ -1170,6 +1177,258 @@ function Read-CbmToolPayload {
     }
 }
 
+function Get-CbmMigrationInventory {
+    param([Parameter(Mandatory)][string]$Path)
+    return @(Get-ChildItem -LiteralPath $Path -Recurse -Force |
+        Sort-Object FullName | ForEach-Object {
+            $record = [ordered]@{
+                relative_path = [IO.Path]::GetRelativePath($Path, $_.FullName)
+                kind = if ($_.PSIsContainer) { 'directory' } else { 'file' }
+            }
+            if (-not $_.PSIsContainer) {
+                $record.length = $_.Length
+                $record.sha256 = Get-FileSha256 -Path $_.FullName
+            }
+            $record
+        })
+}
+
+function Assert-CbmMigrationOwnerInactive {
+    param(
+        [Parameter(Mandatory)]$Owner,
+        [Parameter(Mandatory)][string]$Purpose
+    )
+    $ownerPid = [int]$Owner.pid
+    $ownerTicks = [long]$Owner.process_start_utc_ticks
+    try {
+        $process = Get-Process -Id $ownerPid -ErrorAction Stop
+    }
+    catch {
+        return
+    }
+    $observedTicks = $process.StartTime.ToUniversalTime().Ticks
+    if ($observedTicks -eq $ownerTicks) {
+        Throw-CbmMigrationError -Code 'CBM_STORE_MIGRATION_PRIOR_OWNER_LIVE' `
+            -Message "$Purpose exact owner remains live: pid=$ownerPid start_utc_ticks=$ownerTicks" `
+            -Remediation 'preserve the transaction and retry only after the exact prior owner generation exits'
+    }
+}
+
+function Assert-CbmCompilerEvidence {
+    param(
+        [Parameter(Mandatory)][string]$TransactionPath,
+        [Parameter(Mandatory)][AllowEmptyString()][string]$Prefix
+    )
+    $recordPrefix = "${Prefix}compiler"
+    $intentPath = [IO.Path]::Combine($TransactionPath, "$recordPrefix-intent.json")
+    $completionPath = [IO.Path]::Combine($TransactionPath, "$recordPrefix-completion.json")
+    $scopePath = [IO.Path]::Combine($TransactionPath, "$recordPrefix-scope")
+    foreach ($required in @($intentPath, $completionPath, $scopePath)) {
+        if (-not (Test-Path -LiteralPath $required)) {
+            Throw-CbmMigrationError -Code 'CBM_STORE_MIGRATION_RETRY_COMPILER_RECORD_MISSING' `
+                -Message "immutable compiler evidence is absent: $required" `
+                -Remediation 'preserve the transaction; retry only a complete pre-intent fault generation'
+        }
+    }
+    try {
+        $compilerIntent = Get-Content -Raw -LiteralPath $intentPath |
+            ConvertFrom-Json -Depth 30
+        $compilerCompletion = Get-Content -Raw -LiteralPath $completionPath |
+            ConvertFrom-Json -Depth 30
+    }
+    catch {
+        Throw-CbmMigrationError -Code 'CBM_STORE_MIGRATION_RETRY_COMPILER_RECORD_INVALID' `
+            -Message "compiler evidence is not complete JSON: $($_.Exception.Message)" `
+            -Remediation 'preserve the transaction and inspect its immutable compiler records'
+    }
+    $nativeSha = [Convert]::ToHexString(
+        [Security.Cryptography.SHA256]::HashData(
+            [Text.UTF8Encoding]::new($false).GetBytes($nativeSource)
+        )
+    ).ToLowerInvariant()
+    if ($compilerIntent.schema -ne 1 -or $compilerIntent.issue -ne $Issue -or
+        [string]$compilerIntent.compiler_scope -cne $scopePath -or
+        [string]$compilerIntent.source_sha256 -cne $nativeSha -or
+        $compilerCompletion.schema -ne 1 -or $compilerCompletion.issue -ne $Issue -or
+        [string]$compilerCompletion.compiler_scope -cne $scopePath -or
+        -not [bool]$compilerCompletion.native_interop_ready -or
+        [int]$compilerCompletion.owner.pid -ne [int]$compilerIntent.owner.pid -or
+        [long]$compilerCompletion.owner.process_start_utc_ticks -ne
+            [long]$compilerIntent.owner.process_start_utc_ticks) {
+        Throw-CbmMigrationError -Code 'CBM_STORE_MIGRATION_RETRY_COMPILER_RECORD_DRIFT' `
+            -Message "compiler intent/completion do not bind the current native interop and exact owner: prefix=$Prefix" `
+            -Remediation 'preserve the transaction and compare the compiler evidence to the reviewed script generation'
+    }
+    Assert-CbmMigrationOwnerInactive -Owner $compilerIntent.owner `
+        -Purpose "$recordPrefix compiler"
+
+    $observed = @(Get-ChildItem -LiteralPath $scopePath -Recurse -Force -File |
+        Sort-Object FullName | ForEach-Object {
+            [ordered]@{
+                relative_path = [IO.Path]::GetRelativePath($scopePath, $_.FullName)
+                length = $_.Length
+                sha256 = Get-FileSha256 -Path $_.FullName
+            }
+        })
+    $recorded = @($compilerCompletion.inventory)
+    if (($observed | ConvertTo-Json -Depth 10 -Compress) -cne
+        ($recorded | ConvertTo-Json -Depth 10 -Compress)) {
+        Throw-CbmMigrationError -Code 'CBM_STORE_MIGRATION_RETRY_COMPILER_INVENTORY_DRIFT' `
+            -Message "compiler scope inventory changed: $scopePath" `
+            -Remediation 'preserve the transaction and investigate the exact compiler-scope bytes'
+    }
+}
+
+function Assert-CbmAliasRetryState {
+    param(
+        [Parameter(Mandatory)][string]$TransactionPath,
+        [Parameter(Mandatory)][string]$LegacyPath,
+        [Parameter(Mandatory)][string]$CanonicalPath,
+        [Parameter(Mandatory)][string]$RepositoryPath,
+        [Parameter(Mandatory)][string]$BinaryPath,
+        [Parameter(Mandatory)][string]$ExpectedLegacySha256,
+        [Parameter(Mandatory)][string]$ExpectedCanonicalSha256,
+        [Parameter(Mandatory)][string]$ExpectedBinarySha256,
+        [Parameter(Mandatory)][string]$ExpectedFaultSha256
+    )
+    if (-not (Test-Path -LiteralPath $TransactionPath -PathType Container)) {
+        Throw-CbmMigrationError -Code 'CBM_STORE_MIGRATION_TRANSACTION_MISSING' `
+            -Message "reviewed alias transaction is absent: $TransactionPath" `
+            -Remediation 'pass the exact issue, source hash, canonical hash, path, and project of the pre-intent fault'
+    }
+    $initialNames = @(
+        'compiler-intent.json',
+        'compiler-completion.json',
+        'fault.json',
+        'preflight-list-args.json',
+        'preflight-list.stdout.json',
+        'preflight-list.stderr.log'
+    )
+    foreach ($name in $initialNames) {
+        $required = [IO.Path]::Combine($TransactionPath, $name)
+        if (-not (Test-Path -LiteralPath $required -PathType Leaf)) {
+            Throw-CbmMigrationError -Code 'CBM_STORE_MIGRATION_RETRY_RECORD_MISSING' `
+                -Message "required immutable pre-intent record is absent: $required" `
+                -Remediation 'preserve the transaction; retry only the complete original pre-intent fault'
+        }
+    }
+    $baseScope = [IO.Path]::Combine($TransactionPath, 'compiler-scope')
+    if (-not (Test-Path -LiteralPath $baseScope -PathType Container)) {
+        Throw-CbmMigrationError -Code 'CBM_STORE_MIGRATION_RETRY_RECORD_MISSING' `
+            -Message "required immutable compiler scope is absent: $baseScope" `
+            -Remediation 'preserve the transaction; retry only the complete original pre-intent fault'
+    }
+
+    $attemptNumbers = [Collections.Generic.HashSet[int]]::new()
+    foreach ($entry in @(Get-ChildItem -LiteralPath $TransactionPath -Force)) {
+        if ($entry.PSIsContainer) {
+            if ($entry.Name -ceq 'compiler-scope') {
+                continue
+            }
+            if ($entry.Name -cmatch '^alias-resume-(\d{3})-compiler-scope$') {
+                [void]$attemptNumbers.Add([int]$Matches[1])
+                continue
+            }
+        }
+        elseif ($initialNames -ccontains $entry.Name) {
+            continue
+        }
+        elseif ($entry.Name -cmatch '^alias-resume-(\d{3})-(intent|fault|compiler-intent|compiler-completion|preflight-list-args)\.json$' -or
+                $entry.Name -cmatch '^alias-resume-(\d{3})-preflight-list\.(stdout\.json|stderr\.log)$') {
+            [void]$attemptNumbers.Add([int]$Matches[1])
+            continue
+        }
+        Throw-CbmMigrationError -Code 'CBM_STORE_MIGRATION_RETRY_INVENTORY_UNEXPECTED' `
+            -Message "pre-intent retry transaction contains an unsupported entry: $($entry.FullName)" `
+            -Remediation 'preserve every byte; this operation never consumes intent, journal, archive, completion, scratch, or unknown state'
+    }
+
+    Assert-CbmCompilerEvidence -TransactionPath $TransactionPath -Prefix ''
+    try {
+        $fault = Get-Content -Raw -LiteralPath (
+            [IO.Path]::Combine($TransactionPath, 'fault.json')
+        ) | ConvertFrom-Json -Depth 30
+    }
+    catch {
+        Throw-CbmMigrationError -Code 'CBM_STORE_MIGRATION_RETRY_FAULT_INVALID' `
+            -Message "initial fault is not complete JSON: $($_.Exception.Message)" `
+            -Remediation 'preserve the transaction and inspect its immutable fault record'
+    }
+    $observedFaultSha = Get-FileSha256 -Path (
+        [IO.Path]::Combine($TransactionPath, 'fault.json')
+    )
+    if ($observedFaultSha -cne $ExpectedFaultSha256 -or $fault.schema -ne 1 -or
+        $fault.issue -ne $Issue -or [string]$fault.status -cne 'fault') {
+        Throw-CbmMigrationError -Code 'CBM_STORE_MIGRATION_RETRY_FAULT_MISMATCH' `
+            -Message "initial fault identity/hash mismatch: observed=$observedFaultSha expected=$ExpectedFaultSha256" `
+            -Remediation 'pass the exact independently reviewed initial fault SHA-256'
+    }
+    [void](Read-CbmToolPayload -StdoutPath (
+        [IO.Path]::Combine($TransactionPath, 'preflight-list.stdout.json')
+    ) -Purpose 'immutable initial preflight list_projects')
+
+    $orderedAttempts = @($attemptNumbers | Sort-Object)
+    for ($index = 0; $index -lt $orderedAttempts.Count; $index++) {
+        $number = $orderedAttempts[$index]
+        if ($number -ne ($index + 1)) {
+            Throw-CbmMigrationError -Code 'CBM_STORE_MIGRATION_RETRY_SEQUENCE_GAP' `
+                -Message "alias retry sequence is not contiguous at attempt $number" `
+                -Remediation 'preserve the transaction and investigate the missing append-only attempt'
+        }
+        $prefix = 'alias-resume-{0:D3}' -f $number
+        $retryIntentPath = [IO.Path]::Combine($TransactionPath, "$prefix-intent.json")
+        $retryFaultPath = [IO.Path]::Combine($TransactionPath, "$prefix-fault.json")
+        foreach ($required in @($retryIntentPath, $retryFaultPath)) {
+            if (-not (Test-Path -LiteralPath $required -PathType Leaf)) {
+                Throw-CbmMigrationError -Code 'CBM_STORE_MIGRATION_RETRY_ATTEMPT_UNTERMINATED' `
+                    -Message "prior alias retry lacks its immutable intent or fault: $required" `
+                    -Remediation 'preserve the transaction; recover the exact interrupted attempt before another retry'
+            }
+        }
+        try {
+            $retryIntent = Get-Content -Raw -LiteralPath $retryIntentPath |
+                ConvertFrom-Json -Depth 40
+            $retryFault = Get-Content -Raw -LiteralPath $retryFaultPath |
+                ConvertFrom-Json -Depth 30
+        }
+        catch {
+            Throw-CbmMigrationError -Code 'CBM_STORE_MIGRATION_RETRY_ATTEMPT_INVALID' `
+                -Message "prior alias retry is not complete JSON: prefix=$prefix detail=$($_.Exception.Message)" `
+                -Remediation 'preserve the transaction and inspect the exact append-only attempt'
+        }
+        if ($retryIntent.schema -ne 1 -or
+            [string]$retryIntent.operation -cne 'ResumeAliasAgainstCanonical' -or
+            $retryIntent.issue -ne $Issue -or
+            [string]$retryIntent.attempt_prefix -cne $prefix -or
+            [string]$retryIntent.transaction_path -cne $TransactionPath -or
+            [string]$retryIntent.legacy_path -cne $LegacyPath -or
+            [string]$retryIntent.canonical_path -cne $CanonicalPath -or
+            [string]$retryIntent.repository_path -cne $RepositoryPath -or
+            [string]$retryIntent.binary_path -cne $BinaryPath -or
+            [string]$retryIntent.expected_legacy_sha256 -cne $ExpectedLegacySha256 -or
+            [string]$retryIntent.expected_canonical_sha256 -cne $ExpectedCanonicalSha256 -or
+            [string]$retryIntent.expected_binary_sha256 -cne $ExpectedBinarySha256 -or
+            [string]$retryIntent.initial_fault_sha256 -cne $ExpectedFaultSha256 -or
+            $retryFault.schema -ne 1 -or $retryFault.issue -ne $Issue -or
+            [string]$retryFault.status -cne 'fault') {
+            Throw-CbmMigrationError -Code 'CBM_STORE_MIGRATION_RETRY_ATTEMPT_DRIFT' `
+                -Message "prior alias retry does not bind the exact immutable operation: prefix=$prefix" `
+                -Remediation 'preserve the transaction and compare the prior intent/fault to the authorized inputs'
+        }
+        Assert-CbmCompilerEvidence -TransactionPath $TransactionPath -Prefix "$prefix-"
+    }
+    if ($orderedAttempts.Count -ge 999) {
+        Throw-CbmMigrationError -Code 'CBM_STORE_MIGRATION_RETRY_LIMIT' `
+            -Message 'alias transaction already contains 999 append-only retry attempts' `
+            -Remediation 'preserve the transaction and open a dedicated recovery issue before further action'
+    }
+    return [pscustomobject]@{
+        NextAttempt = $orderedAttempts.Count + 1
+        InitialFaultSha256 = $observedFaultSha
+        PriorInventory = @(Get-CbmMigrationInventory -Path $TransactionPath)
+    }
+}
+
 $transactionPath = $null
 $transactionOwned = $false
 $attemptPrefix = $null
@@ -1209,11 +1468,16 @@ catch {
 try {
     $repository = Get-CanonicalExistingPath -Path $RepositoryPath -Kind Directory
     $binary = Get-CanonicalExistingPath -Path $BinaryPath -Kind File
-    $newArchiveOperation = $Operation -in @(
+    $freshArchiveOperation = $Operation -in @(
         'ArchiveAndReindex',
         'ArchiveAliasAgainstCanonical'
     )
-    if ($newArchiveOperation) {
+    $aliasArchiveOperation = $Operation -in @(
+        'ArchiveAliasAgainstCanonical',
+        'ResumeAliasAgainstCanonical'
+    )
+    $archiveExecutionOperation = $freshArchiveOperation -or $aliasArchiveOperation
+    if ($archiveExecutionOperation) {
         $legacy = Get-CanonicalExistingPath -Path $LegacyDbPath -Kind File
     }
     else {
@@ -1251,10 +1515,10 @@ try {
             -Message "canonical target family already exists: $($existingTargetMembers -join ', ')" `
             -Remediation 'inspect and verify every existing target-family member; this transaction never overwrites any of them'
     }
-    if ($Operation -eq 'ArchiveAliasAgainstCanonical') {
+    if ($aliasArchiveOperation) {
         if ($expectedCanonicalDb -notmatch '^[0-9a-f]{64}$') {
             Throw-CbmMigrationError -Code 'CBM_STORE_MIGRATION_CANONICAL_HASH_REQUIRED' `
-                -Message 'ArchiveAliasAgainstCanonical requires ExpectedCanonicalDbSha256' `
+                -Message "$Operation requires ExpectedCanonicalDbSha256" `
                 -Remediation 'independently hash the accepted canonical primary DB and pass its exact lowercase SHA-256'
         }
         if (-not (Test-Path -LiteralPath $target -PathType Leaf)) {
@@ -1262,9 +1526,15 @@ try {
                 -Message "accepted canonical primary DB is absent: $target" `
                 -Remediation 'preserve the legacy family and establish one verified root-derived canonical family first'
         }
+        if ($Operation -eq 'ResumeAliasAgainstCanonical' -and
+            $ExpectedInitialFaultSha256 -notmatch '^[0-9a-fA-F]{64}$') {
+            Throw-CbmMigrationError -Code 'CBM_STORE_MIGRATION_INITIAL_FAULT_HASH_REQUIRED' `
+                -Message 'ResumeAliasAgainstCanonical requires ExpectedInitialFaultSha256' `
+                -Remediation 'independently hash the immutable original fault.json and pass its exact SHA-256'
+        }
     }
 
-    $transactionId = if ($Operation -eq 'ArchiveAliasAgainstCanonical') {
+    $transactionId = if ($aliasArchiveOperation) {
         "issue-$Issue-$expectedDb-$Project-against-$expectedCanonicalDb"
     }
     else {
@@ -1272,28 +1542,74 @@ try {
     }
     $archiveRoot = [IO.Path]::Combine($cache, 'archive', 'cbm-store-migrations')
     $transactionPath = [IO.Path]::Combine($archiveRoot, $transactionId)
-    if ($newArchiveOperation) {
-        [IO.Directory]::CreateDirectory($archiveRoot) | Out-Null
-        if (Test-Path -LiteralPath $transactionPath) {
-            Throw-CbmMigrationError -Code 'CBM_STORE_MIGRATION_TRANSACTION_EXISTS' `
-                -Message "transaction already exists: $transactionPath" `
-                -Remediation 'inspect the existing immutable transaction and resume only through a reviewed recovery operation'
+    if ($archiveExecutionOperation) {
+        $recordStem = ''
+        $aliasRetryLineage = $null
+        if ($freshArchiveOperation) {
+            [IO.Directory]::CreateDirectory($archiveRoot) | Out-Null
+            if (Test-Path -LiteralPath $transactionPath) {
+                Throw-CbmMigrationError -Code 'CBM_STORE_MIGRATION_TRANSACTION_EXISTS' `
+                    -Message "transaction already exists: $transactionPath" `
+                    -Remediation 'inspect the existing immutable transaction and resume only through a reviewed recovery operation'
+            }
+            [IO.Directory]::CreateDirectory($transactionPath) | Out-Null
+            $transactionOwned = $true
+            $faultRecordPath = [IO.Path]::Combine($transactionPath, 'fault.json')
+            Initialize-CbmMigrationNative -TransactionPath $transactionPath `
+                -CompilerScope ([IO.Path]::Combine($transactionPath, 'compiler-scope'))
         }
-        [IO.Directory]::CreateDirectory($transactionPath) | Out-Null
-        $transactionOwned = $true
-        $faultRecordPath = [IO.Path]::Combine($transactionPath, 'fault.json')
-        Initialize-CbmMigrationNative -TransactionPath $transactionPath `
-            -CompilerScope ([IO.Path]::Combine($transactionPath, 'compiler-scope'))
+        else {
+            $expectedInitialFault = $ExpectedInitialFaultSha256.ToLowerInvariant()
+            $retryState = Assert-CbmAliasRetryState -TransactionPath $transactionPath `
+                -LegacyPath $legacy -CanonicalPath $target -RepositoryPath $repository `
+                -BinaryPath $binary -ExpectedLegacySha256 $expectedDb `
+                -ExpectedCanonicalSha256 $expectedCanonicalDb `
+                -ExpectedBinarySha256 $expectedBinary `
+                -ExpectedFaultSha256 $expectedInitialFault
+            $attemptPrefix = 'alias-resume-{0:D3}' -f $retryState.NextAttempt
+            $recordStem = "$attemptPrefix-"
+            $faultRecordPath = [IO.Path]::Combine(
+                $transactionPath, "$attemptPrefix-fault.json")
+            $transactionOwned = $true
+            $aliasRetryLineage = [ordered]@{
+                schema = 1
+                operation = 'ResumeAliasAgainstCanonical'
+                issue = $Issue
+                attempt_prefix = $attemptPrefix
+                created_utc = [DateTime]::UtcNow.ToString('o')
+                transaction_path = $transactionPath
+                legacy_path = $legacy
+                canonical_path = $target
+                repository_path = $repository
+                project = $Project
+                binary_path = $binary
+                expected_legacy_sha256 = $expectedDb
+                expected_canonical_sha256 = $expectedCanonicalDb
+                expected_binary_sha256 = $expectedBinary
+                initial_fault_sha256 = $retryState.InitialFaultSha256
+                prior_inventory = $retryState.PriorInventory
+            }
+            Write-InitialDurableJson -Path ([IO.Path]::Combine(
+                    $transactionPath, "$attemptPrefix-intent.json")) `
+                -Value $aliasRetryLineage
+            Initialize-CbmMigrationNative -TransactionPath $transactionPath `
+                -CompilerScope ([IO.Path]::Combine(
+                    $transactionPath, "$attemptPrefix-compiler-scope")) `
+                -RecordPrefix "$attemptPrefix-compiler"
+        }
 
-    if ($Operation -eq 'ArchiveAliasAgainstCanonical') {
+    if ($aliasArchiveOperation) {
         # The real product verifies the complete source families first. This
         # operation then accepts only a quiescent sidecar-free generation, so
         # exact primary DB hashes bind all persistent SQLite state when the
         # no-write/no-delete-share handles are acquired immediately afterward.
-        $preflightArgs = [IO.Path]::Combine($transactionPath, 'preflight-list-args.json')
+        $preflightArgs = [IO.Path]::Combine(
+            $transactionPath, "${recordStem}preflight-list-args.json")
         Write-DurableJson -Path $preflightArgs -Value ([ordered]@{})
-        $preflightStdout = [IO.Path]::Combine($transactionPath, 'preflight-list.stdout.json')
-        $preflightStderr = [IO.Path]::Combine($transactionPath, 'preflight-list.stderr.log')
+        $preflightStdout = [IO.Path]::Combine(
+            $transactionPath, "${recordStem}preflight-list.stdout.json")
+        $preflightStderr = [IO.Path]::Combine(
+            $transactionPath, "${recordStem}preflight-list.stderr.log")
         $preflightRun = Invoke-CbmTool -Executable $binary -Tool 'list_projects' `
             -ArgsPath $preflightArgs -StdoutPath $preflightStdout -StderrPath $preflightStderr `
             -TimeoutSeconds $ReindexTimeoutSeconds -CacheDirectory $cache
@@ -1375,7 +1691,7 @@ try {
     foreach ($suffix in @('-wal', '-shm')) {
         $sidecar = $legacy + $suffix
         if (Test-Path -LiteralPath $sidecar) {
-            if ($Operation -eq 'ArchiveAliasAgainstCanonical') {
+            if ($aliasArchiveOperation) {
                 Throw-CbmMigrationError -Code 'CBM_STORE_MIGRATION_ALIAS_FAMILY_CHANGED' `
                     -Message "legacy sidecar appeared after quiescent preflight: $sidecar" `
                     -Remediation 'preserve both families and retry only after the exact writer generation is absent'
@@ -1403,7 +1719,11 @@ try {
     })
     $intent = [ordered]@{
         schema = 1
-        operation = $Operation
+        operation = if ($aliasArchiveOperation) {
+            'ArchiveAliasAgainstCanonical'
+        } else {
+            $Operation
+        }
         issue = $Issue
         created_utc = [DateTime]::UtcNow.ToString('o')
         project = $Project
@@ -1421,12 +1741,13 @@ try {
                 sha256 = $_.Sha256
             }
         })
+        alias_retry_lineage = $aliasRetryLineage
     }
     Write-DurableJson -Path ([IO.Path]::Combine($transactionPath, 'intent.json')) -Value $intent
     $previous = Add-JournalRecord -JournalPath $journal -PreviousSha256 ('0' * 64) `
         -Event 'intent_published' -Data $intent
 
-    if ($Operation -eq 'ArchiveAliasAgainstCanonical') {
+    if ($aliasArchiveOperation) {
         $previous = Add-JournalRecord -JournalPath $journal -PreviousSha256 $previous `
             -Event 'alias_preflight_verified' -Data ([ordered]@{
                 process = $preflightRun.Identity
@@ -1498,7 +1819,7 @@ try {
     Write-DurableJson -Path ([IO.Path]::Combine($transactionPath, 'archive-complete.json')) `
         -Value $archiveComplete
 
-    if ($Operation -eq 'ArchiveAliasAgainstCanonical') {
+    if ($aliasArchiveOperation) {
         $canonicalBeforePostflight = [ordered]@{
             path = $targetPrimary.SourcePath
             file_id = $targetPrimary.FileId
@@ -1509,10 +1830,13 @@ try {
         [void]$guards.Remove($targetPrimary)
         $targetRecords.Clear()
 
-        $postflightArgs = [IO.Path]::Combine($transactionPath, 'postflight-list-args.json')
+        $postflightArgs = [IO.Path]::Combine(
+            $transactionPath, "${recordStem}postflight-list-args.json")
         Write-DurableJson -Path $postflightArgs -Value ([ordered]@{})
-        $postflightStdout = [IO.Path]::Combine($transactionPath, 'postflight-list.stdout.json')
-        $postflightStderr = [IO.Path]::Combine($transactionPath, 'postflight-list.stderr.log')
+        $postflightStdout = [IO.Path]::Combine(
+            $transactionPath, "${recordStem}postflight-list.stdout.json")
+        $postflightStderr = [IO.Path]::Combine(
+            $transactionPath, "${recordStem}postflight-list.stderr.log")
         $postflightRun = Invoke-CbmTool -Executable $binary -Tool 'list_projects' `
             -ArgsPath $postflightArgs -StdoutPath $postflightStdout `
             -StderrPath $postflightStderr -TimeoutSeconds $ReindexTimeoutSeconds `
@@ -1629,7 +1953,13 @@ try {
             schema = 1
             issue = $Issue
             status = 'complete'
-            operation = $Operation
+            operation = 'ArchiveAliasAgainstCanonical'
+            recovery_operation = if ($aliasRetryLineage) {
+                'ResumeAliasAgainstCanonical'
+            } else {
+                $null
+            }
+            recovery_attempt_prefix = $attemptPrefix
             completed_utc = [DateTime]::UtcNow.ToString('o')
             project = $Project
             repository_path = $repository
