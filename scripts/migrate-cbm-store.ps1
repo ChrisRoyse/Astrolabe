@@ -13,14 +13,15 @@
 
     ArchiveAliasAgainstCanonical instead requires an already accepted,
     root-derived canonical family. It verifies and hashes both families,
-    requires the real list_projects surface to report exactly one canonical
-    project plus one exact legacy identity conflict, archives only the legacy
-    family, and then independently proves the canonical family and discovery
-    state unchanged through an exact FILE_ID/length/hash release-query-reacquire
-    chain. ResumeAliasAgainstCanonical revalidates an immutable pre-intent
+    retains both exact guards before expensive work, and gives the real
+    list_projects surface only durable byte-exact transaction views. It
+    requires one canonical project plus one exact legacy identity conflict,
+    archives only the legacy family, and proves the canonical FILE_ID, length,
+    hash, and canonical-only product result while the original guard remains
+    live. ResumeAliasAgainstCanonical revalidates an immutable pre-intent
     alias-archive fault, binds its complete append-only inventory and original
-    fault hash into a numbered retry, and reruns the same product preflight and
-    handle-bound archive path without weakening sharing. ResumeReindex
+    fault hash into a numbered retry, and reruns the same guard-first product
+    view and handle-bound archive path without weakening sharing. ResumeReindex
     revalidates a completed immutable archive and its hash-linked journal, then
     creates one append-only attempt without repeating or reversing the archive
     transition.
@@ -386,6 +387,149 @@ function Get-FileSha256 {
     }
 }
 
+function Copy-CbmGuardedFile {
+    param(
+        [Parameter(Mandatory)]$Guard,
+        [Parameter(Mandatory)][string]$Destination
+    )
+    if (Test-Path -LiteralPath $Destination) {
+        Throw-CbmMigrationError -Code 'CBM_STORE_MIGRATION_VIEW_DESTINATION_EXISTS' `
+            -Message "product-view destination already exists: $Destination" `
+            -Remediation 'preserve the transaction and inspect the existing view evidence'
+    }
+    $source = [IO.FileStream]::new(
+        $Guard.SourcePath,
+        [IO.FileMode]::Open,
+        [IO.FileAccess]::Read,
+        [IO.FileShare]::Read -bor [IO.FileShare]::Delete,
+        1048576,
+        [IO.FileOptions]::SequentialScan
+    )
+    try {
+        $destinationStream = [IO.FileStream]::new(
+            $Destination,
+            [IO.FileMode]::CreateNew,
+            [IO.FileAccess]::Write,
+            [IO.FileShare]::Read,
+            1048576,
+            [IO.FileOptions]::SequentialScan -bor [IO.FileOptions]::WriteThrough
+        )
+        try {
+            $source.CopyTo($destinationStream, 1048576)
+            $destinationStream.Flush($true)
+        }
+        finally {
+            $destinationStream.Dispose()
+        }
+    }
+    finally {
+        $source.Dispose()
+    }
+
+    $viewItem = Get-Item -LiteralPath $Destination -Force -ErrorAction Stop
+    $viewSha = Get-FileSha256 -Path $Destination
+    $sourceFinal = [IO.Path]::GetFullPath(
+        [CbmStoreMigrationNative]::FinalPath($Guard.Handle)
+    )
+    $sourceId = [CbmStoreMigrationNative]::FileId($Guard.Handle)
+    $sourceItem = Get-Item -LiteralPath $Guard.SourcePath -Force -ErrorAction Stop
+    $sourceSha = Get-FileSha256 -Path $Guard.SourcePath
+    if (-not [string]::Equals(
+            $sourceFinal,
+            $Guard.SourcePath,
+            [StringComparison]::OrdinalIgnoreCase
+        ) -or $sourceId -cne $Guard.FileId -or
+        $sourceItem.Length -ne $Guard.Length -or $sourceSha -cne $Guard.Sha256 -or
+        $viewItem.Length -ne $Guard.Length -or $viewSha -cne $Guard.Sha256) {
+        Throw-CbmMigrationError -Code 'CBM_STORE_MIGRATION_VIEW_COPY_DRIFT' `
+            -Message "guarded source and durable product-view copy disagree: source=$($Guard.SourcePath) view=$Destination" `
+            -Remediation 'preserve the transaction and compare the retained source identity with the exact view bytes'
+    }
+    return [ordered]@{
+        source_path = $Guard.SourcePath
+        source_file_id = $sourceId
+        source_length = $sourceItem.Length
+        source_sha256 = $sourceSha
+        view_path = [IO.Path]::GetFullPath($Destination)
+        view_length = $viewItem.Length
+        view_sha256 = $viewSha
+    }
+}
+
+function New-CbmProductView {
+    param(
+        [Parameter(Mandatory)][string]$TransactionPath,
+        [Parameter(Mandatory)][AllowEmptyString()][string]$RecordStem,
+        [Parameter(Mandatory)][ValidateSet('preflight', 'postflight')][string]$Phase,
+        [Parameter(Mandatory)][object[]]$Members
+    )
+    $viewPath = [IO.Path]::Combine(
+        $TransactionPath, "${RecordStem}alias-$Phase-view")
+    $manifestPath = [IO.Path]::Combine(
+        $TransactionPath, "${RecordStem}alias-$Phase-view.json")
+    if ((Test-Path -LiteralPath $viewPath) -or (Test-Path -LiteralPath $manifestPath)) {
+        Throw-CbmMigrationError -Code 'CBM_STORE_MIGRATION_VIEW_EXISTS' `
+            -Message "product-view namespace already exists: phase=$Phase view=$viewPath manifest=$manifestPath" `
+            -Remediation 'preserve the transaction and use only the next append-only recovery generation'
+    }
+    [IO.Directory]::CreateDirectory($viewPath) | Out-Null
+    $copies = @($Members | ForEach-Object {
+        Copy-CbmGuardedFile -Guard $_ -Destination (
+            [IO.Path]::Combine($viewPath, [IO.Path]::GetFileName($_.SourcePath))
+        )
+    })
+    $manifest = [ordered]@{
+        schema = 1
+        issue = $Issue
+        phase = $Phase
+        created_utc = [DateTime]::UtcNow.ToString('o')
+        view_path = $viewPath
+        members = $copies
+    }
+    Write-DurableJson -Path $manifestPath -Value $manifest
+    return [pscustomobject]@{
+        Path = $viewPath
+        ManifestPath = $manifestPath
+        ManifestSha256 = Get-FileSha256 -Path $manifestPath
+        Members = $copies
+    }
+}
+
+function Write-CbmProductViewReadback {
+    param(
+        [Parameter(Mandatory)][string]$TransactionPath,
+        [Parameter(Mandatory)][AllowEmptyString()][string]$RecordStem,
+        [Parameter(Mandatory)][ValidateSet('preflight', 'postflight')][string]$Phase,
+        [Parameter(Mandatory)]$View
+    )
+    foreach ($member in @($View.Members)) {
+        $viewItem = Get-Item -LiteralPath $member.view_path -Force -ErrorAction Stop
+        $viewSha = Get-FileSha256 -Path $member.view_path
+        if ($viewItem.Length -ne $member.view_length -or
+            $viewSha -cne $member.view_sha256) {
+            Throw-CbmMigrationError -Code 'CBM_STORE_MIGRATION_PRODUCT_VIEW_DRIFT' `
+                -Message "product changed a source DB copy: $($member.view_path)" `
+                -Remediation 'preserve the view and product output; inspect the exact SQLite access path'
+        }
+    }
+    $readbackPath = [IO.Path]::Combine(
+        $TransactionPath, "${RecordStem}alias-$Phase-view-readback.json")
+    Write-DurableJson -Path $readbackPath -Value ([ordered]@{
+        schema = 1
+        issue = $Issue
+        phase = $Phase
+        read_utc = [DateTime]::UtcNow.ToString('o')
+        view_path = $View.Path
+        manifest_path = $View.ManifestPath
+        manifest_sha256 = $View.ManifestSha256
+        inventory = @(Get-CbmMigrationInventory -Path $View.Path)
+    })
+    return [pscustomobject]@{
+        Path = $readbackPath
+        Sha256 = Get-FileSha256 -Path $readbackPath
+    }
+}
+
 function New-FamilyGuardRecord {
     param([Parameter(Mandatory)][string]$Path)
     $handle = [CbmStoreMigrationNative]::OpenGuard($Path)
@@ -408,6 +552,32 @@ function New-FamilyGuardRecord {
     catch {
         $handle.Dispose()
         throw
+    }
+}
+
+function Get-CbmFamilyGuardReadback {
+    param([Parameter(Mandatory)]$Guard)
+    $currentFinal = [IO.Path]::GetFullPath(
+        [CbmStoreMigrationNative]::FinalPath($Guard.Handle)
+    )
+    $currentId = [CbmStoreMigrationNative]::FileId($Guard.Handle)
+    $currentItem = Get-Item -LiteralPath $Guard.SourcePath -Force -ErrorAction Stop
+    $currentSha = Get-FileSha256 -Path $Guard.SourcePath
+    if (-not [string]::Equals(
+            $currentFinal,
+            $Guard.SourcePath,
+            [StringComparison]::OrdinalIgnoreCase
+        ) -or $currentId -cne $Guard.FileId -or
+        $currentItem.Length -ne $Guard.Length -or $currentSha -cne $Guard.Sha256) {
+        Throw-CbmMigrationError -Code 'CBM_STORE_MIGRATION_GUARDED_FAMILY_DRIFT' `
+            -Message "retained family identity/length/hash changed: $($Guard.SourcePath)" `
+            -Remediation 'preserve every source and view byte; inspect the exact retained handle generation'
+    }
+    return [ordered]@{
+        path = $Guard.SourcePath
+        file_id = $currentId
+        length = $currentItem.Length
+        sha256 = $currentSha
     }
 }
 
@@ -1193,6 +1363,106 @@ function Get-CbmMigrationInventory {
         })
 }
 
+function Assert-CbmProductViewEvidence {
+    param(
+        [Parameter(Mandatory)][string]$TransactionPath,
+        [Parameter(Mandatory)][AllowEmptyString()][string]$RecordStem,
+        [Parameter(Mandatory)][ValidateSet('preflight', 'postflight')][string]$Phase
+    )
+    $viewPath = [IO.Path]::Combine(
+        $TransactionPath, "${RecordStem}alias-$Phase-view")
+    $manifestPath = [IO.Path]::Combine(
+        $TransactionPath, "${RecordStem}alias-$Phase-view.json")
+    $readbackPath = [IO.Path]::Combine(
+        $TransactionPath, "${RecordStem}alias-$Phase-view-readback.json")
+    $present = @(@($viewPath, $manifestPath, $readbackPath) | Where-Object {
+        Test-Path -LiteralPath $_
+    })
+    if ($present.Count -eq 0) {
+        return
+    }
+    if ($present.Count -ne 3 -or
+        -not (Test-Path -LiteralPath $viewPath -PathType Container) -or
+        -not (Test-Path -LiteralPath $manifestPath -PathType Leaf) -or
+        -not (Test-Path -LiteralPath $readbackPath -PathType Leaf)) {
+        Throw-CbmMigrationError -Code 'CBM_STORE_MIGRATION_RETRY_VIEW_INCOMPLETE' `
+            -Message "product-view evidence is incomplete: stem=$RecordStem phase=$Phase present=$($present -join ',')" `
+            -Remediation 'preserve the partial view; recover it through a dedicated exact-inventory transaction before another retry'
+    }
+    try {
+        $manifest = Get-Content -Raw -LiteralPath $manifestPath |
+            ConvertFrom-Json -Depth 40
+        $readback = Get-Content -Raw -LiteralPath $readbackPath |
+            ConvertFrom-Json -Depth 40
+    }
+    catch {
+        Throw-CbmMigrationError -Code 'CBM_STORE_MIGRATION_RETRY_VIEW_RECORD_INVALID' `
+            -Message "product-view evidence is not complete JSON: stem=$RecordStem phase=$Phase detail=$($_.Exception.Message)" `
+            -Remediation 'preserve the view and inspect its exact manifest/readback bytes'
+    }
+    $manifestSha = Get-FileSha256 -Path $manifestPath
+    if ($manifest.schema -ne 1 -or $manifest.issue -ne $Issue -or
+        [string]$manifest.phase -cne $Phase -or
+        [string]$manifest.view_path -cne $viewPath -or
+        $readback.schema -ne 1 -or $readback.issue -ne $Issue -or
+        [string]$readback.phase -cne $Phase -or
+        [string]$readback.view_path -cne $viewPath -or
+        [string]$readback.manifest_path -cne $manifestPath -or
+        [string]$readback.manifest_sha256 -cne $manifestSha) {
+        Throw-CbmMigrationError -Code 'CBM_STORE_MIGRATION_RETRY_VIEW_RECORD_DRIFT' `
+            -Message "product-view manifest/readback binding changed: stem=$RecordStem phase=$Phase" `
+            -Remediation 'preserve the view and compare its records with the reviewed attempt generation'
+    }
+    foreach ($member in @($manifest.members)) {
+        $memberPath = [IO.Path]::GetFullPath([string]$member.view_path)
+        $viewPrefix = $viewPath.TrimEnd('\', '/') + [IO.Path]::DirectorySeparatorChar
+        if (-not $memberPath.StartsWith($viewPrefix, [StringComparison]::OrdinalIgnoreCase) -or
+            -not (Test-Path -LiteralPath $memberPath -PathType Leaf)) {
+            Throw-CbmMigrationError -Code 'CBM_STORE_MIGRATION_RETRY_VIEW_MEMBER_MISSING' `
+                -Message "product-view member is absent or outside its view: $memberPath" `
+                -Remediation 'preserve the view and inspect its exact namespace transition'
+        }
+        $item = Get-Item -LiteralPath $memberPath -Force -ErrorAction Stop
+        $sha = Get-FileSha256 -Path $memberPath
+        if ($item.Length -ne [long]$member.view_length -or
+            $sha -cne [string]$member.view_sha256) {
+            Throw-CbmMigrationError -Code 'CBM_STORE_MIGRATION_RETRY_VIEW_MEMBER_DRIFT' `
+                -Message "product-view member bytes changed: $memberPath" `
+                -Remediation 'preserve the exact view and investigate its byte drift'
+        }
+    }
+    $observedInventory = @(Get-CbmMigrationInventory -Path $viewPath)
+    if (($observedInventory | ConvertTo-Json -Depth 12 -Compress) -cne
+        (@($readback.inventory) | ConvertTo-Json -Depth 12 -Compress)) {
+        Throw-CbmMigrationError -Code 'CBM_STORE_MIGRATION_RETRY_VIEW_INVENTORY_DRIFT' `
+            -Message "product-view inventory changed: $viewPath" `
+            -Remediation 'preserve the view and compare every exact recorded entry'
+    }
+}
+
+function Assert-CbmPreflightEvidence {
+    param(
+        [Parameter(Mandatory)][string]$TransactionPath,
+        [Parameter(Mandatory)][AllowEmptyString()][string]$RecordStem
+    )
+    $paths = @(
+        [IO.Path]::Combine($TransactionPath, "${RecordStem}preflight-list-args.json"),
+        [IO.Path]::Combine($TransactionPath, "${RecordStem}preflight-list.stdout.json"),
+        [IO.Path]::Combine($TransactionPath, "${RecordStem}preflight-list.stderr.log")
+    )
+    $present = @($paths | Where-Object { Test-Path -LiteralPath $_ -PathType Leaf })
+    if ($present.Count -eq 0) {
+        return
+    }
+    if ($present.Count -ne 3) {
+        Throw-CbmMigrationError -Code 'CBM_STORE_MIGRATION_RETRY_PREFLIGHT_INCOMPLETE' `
+            -Message "preflight evidence is partial: stem=$RecordStem present=$($present -join ',')" `
+            -Remediation 'preserve the transaction; recover the exact child generation before another retry'
+    }
+    [void](Read-CbmToolPayload -StdoutPath $paths[1] `
+        -Purpose "immutable ${RecordStem}preflight list_projects")
+}
+
 function Assert-CbmMigrationOwnerInactive {
     param(
         [Parameter(Mandatory)]$Owner,
@@ -1299,7 +1569,9 @@ function Assert-CbmAliasRetryState {
     $initialNames = @(
         'compiler-intent.json',
         'compiler-completion.json',
-        'fault.json',
+        'fault.json'
+    )
+    $initialPreflightNames = @(
         'preflight-list-args.json',
         'preflight-list.stdout.json',
         'preflight-list.stderr.log'
@@ -1325,16 +1597,28 @@ function Assert-CbmAliasRetryState {
             if ($entry.Name -ceq 'compiler-scope') {
                 continue
             }
+            if ($entry.Name -cmatch '^alias-(preflight|postflight)-view$') {
+                continue
+            }
             if ($entry.Name -cmatch '^alias-resume-(\d{3})-compiler-scope$') {
                 [void]$attemptNumbers.Add([int]$Matches[1])
                 continue
             }
+            if ($entry.Name -cmatch '^alias-resume-(\d{3})-alias-(preflight|postflight)-view$') {
+                [void]$attemptNumbers.Add([int]$Matches[1])
+                continue
+            }
         }
-        elseif ($initialNames -ccontains $entry.Name) {
+        elseif ($initialNames -ccontains $entry.Name -or
+                $initialPreflightNames -ccontains $entry.Name) {
+            continue
+        }
+        elseif ($entry.Name -cmatch '^alias-(preflight|postflight)-view(-readback)?\.json$') {
             continue
         }
         elseif ($entry.Name -cmatch '^alias-resume-(\d{3})-(intent|fault|compiler-intent|compiler-completion|preflight-list-args)\.json$' -or
-                $entry.Name -cmatch '^alias-resume-(\d{3})-preflight-list\.(stdout\.json|stderr\.log)$') {
+                $entry.Name -cmatch '^alias-resume-(\d{3})-preflight-list\.(stdout\.json|stderr\.log)$' -or
+                $entry.Name -cmatch '^alias-resume-(\d{3})-alias-(preflight|postflight)-view(-readback)?\.json$') {
             [void]$attemptNumbers.Add([int]$Matches[1])
             continue
         }
@@ -1344,6 +1628,11 @@ function Assert-CbmAliasRetryState {
     }
 
     Assert-CbmCompilerEvidence -TransactionPath $TransactionPath -Prefix ''
+    Assert-CbmProductViewEvidence -TransactionPath $TransactionPath `
+        -RecordStem '' -Phase 'preflight'
+    Assert-CbmProductViewEvidence -TransactionPath $TransactionPath `
+        -RecordStem '' -Phase 'postflight'
+    Assert-CbmPreflightEvidence -TransactionPath $TransactionPath -RecordStem ''
     try {
         $fault = Get-Content -Raw -LiteralPath (
             [IO.Path]::Combine($TransactionPath, 'fault.json')
@@ -1363,10 +1652,6 @@ function Assert-CbmAliasRetryState {
             -Message "initial fault identity/hash mismatch: observed=$observedFaultSha expected=$ExpectedFaultSha256" `
             -Remediation 'pass the exact independently reviewed initial fault SHA-256'
     }
-    [void](Read-CbmToolPayload -StdoutPath (
-        [IO.Path]::Combine($TransactionPath, 'preflight-list.stdout.json')
-    ) -Purpose 'immutable initial preflight list_projects')
-
     $orderedAttempts = @($attemptNumbers | Sort-Object)
     for ($index = 0; $index -lt $orderedAttempts.Count; $index++) {
         $number = $orderedAttempts[$index]
@@ -1416,6 +1701,12 @@ function Assert-CbmAliasRetryState {
                 -Remediation 'preserve the transaction and compare the prior intent/fault to the authorized inputs'
         }
         Assert-CbmCompilerEvidence -TransactionPath $TransactionPath -Prefix "$prefix-"
+        Assert-CbmProductViewEvidence -TransactionPath $TransactionPath `
+            -RecordStem "$prefix-" -Phase 'preflight'
+        Assert-CbmProductViewEvidence -TransactionPath $TransactionPath `
+            -RecordStem "$prefix-" -Phase 'postflight'
+        Assert-CbmPreflightEvidence -TransactionPath $TransactionPath `
+            -RecordStem "$prefix-"
     }
     if ($orderedAttempts.Count -ge 999) {
         Throw-CbmMigrationError -Code 'CBM_STORE_MIGRATION_RETRY_LIMIT' `
@@ -1599,64 +1890,11 @@ try {
         }
 
     if ($aliasArchiveOperation) {
-        # The real product verifies the complete source families first. This
-        # operation then accepts only a quiescent sidecar-free generation, so
-        # exact primary DB hashes bind all persistent SQLite state when the
-        # no-write/no-delete-share handles are acquired immediately afterward.
-        $preflightArgs = [IO.Path]::Combine(
-            $transactionPath, "${recordStem}preflight-list-args.json")
-        Write-DurableJson -Path $preflightArgs -Value ([ordered]@{})
-        $preflightStdout = [IO.Path]::Combine(
-            $transactionPath, "${recordStem}preflight-list.stdout.json")
-        $preflightStderr = [IO.Path]::Combine(
-            $transactionPath, "${recordStem}preflight-list.stderr.log")
-        $preflightRun = Invoke-CbmTool -Executable $binary -Tool 'list_projects' `
-            -ArgsPath $preflightArgs -StdoutPath $preflightStdout -StderrPath $preflightStderr `
-            -TimeoutSeconds $ReindexTimeoutSeconds -CacheDirectory $cache
-        if ($preflightRun.ExitCode -ne 0) {
-            Throw-CbmMigrationError -Code 'CBM_STORE_MIGRATION_PREFLIGHT_LIST_FAILED' `
-                -Message "real list_projects exited $($preflightRun.ExitCode) before archival" `
-                -Remediation 'preserve both families and inspect the persisted preflight response'
-        }
-        $preflightPayload = Read-CbmToolPayload -StdoutPath $preflightStdout `
-            -Purpose 'preflight list_projects'
-        $canonicalRows = @($preflightPayload['projects'] | Where-Object {
-            [string]$_['name'] -ceq $Project -and
-            [string]::Equals(
-                [IO.Path]::GetFullPath([string]$_['db_path']),
-                $target,
-                [StringComparison]::OrdinalIgnoreCase
-            ) -and [string]$_['db_sha256'] -ceq $expectedCanonicalDb -and
-            [string]::Equals(
-                [IO.Path]::GetFullPath([string]$_['canonical_root']).TrimEnd('\', '/'),
-                $repository.TrimEnd('\', '/'),
-                [StringComparison]::OrdinalIgnoreCase
-            )
-        })
-        $legacyConflicts = @($preflightPayload['project_identity_conflicts'] |
-            Where-Object {
-                [string]::Equals(
-                    [IO.Path]::GetFullPath([string]$_['legacy_db_path']),
-                    $legacy,
-                    [StringComparison]::OrdinalIgnoreCase
-                ) -and [string]$_['legacy_db_sha256'] -ceq $expectedDb -and
-                [string]$_['canonical_project'] -ceq $Project -and
-                [string]::Equals(
-                    [IO.Path]::GetFullPath([string]$_['canonical_db_path']),
-                    $target,
-                    [StringComparison]::OrdinalIgnoreCase
-                ) -and
-                [string]::Equals(
-                    [IO.Path]::GetFullPath([string]$_['canonical_root']).TrimEnd('\', '/'),
-                    $repository.TrimEnd('\', '/'),
-                    [StringComparison]::OrdinalIgnoreCase
-                )
-            })
-        if ($canonicalRows.Count -ne 1 -or $legacyConflicts.Count -ne 1) {
-            Throw-CbmMigrationError -Code 'CBM_STORE_MIGRATION_PREFLIGHT_IDENTITY_MISMATCH' `
-                -Message "expected one accepted canonical row and one exact legacy conflict; canonical=$($canonicalRows.Count) conflict=$($legacyConflicts.Count)" `
-                -Remediation 'preserve both families; reconcile product discovery output with the reviewed paths, roots, and hashes'
-        }
+        # Admission is guard-first. A sidecar check followed by a full-cache
+        # product scan left a minutes-long interval in which another resident
+        # MCP client could reopen the canonical DB. Retaining this exact
+        # no-write/no-delete-share handle closes that interval before any
+        # potentially expensive work begins.
         foreach ($sidecarPath in @("$target-wal", "$target-shm", "$legacy-wal", "$legacy-shm")) {
             if (Test-Path -LiteralPath $sidecarPath) {
                 Throw-CbmMigrationError -Code 'CBM_STORE_MIGRATION_ALIAS_FAMILY_NOT_QUIESCENT' `
@@ -1664,7 +1902,6 @@ try {
                     -Remediation 'close every client, complete a normal SQLite checkpoint/close, then retry only after DB/WAL/SHM state is independently read back'
             }
         }
-
         $targetPrimary = New-FamilyGuardRecord -Path $target
         $guards.Add($targetPrimary)
         $targetRecords.Add($targetPrimary)
@@ -1705,6 +1942,102 @@ try {
             -Remediation 're-read the issue authorization and pass the exact current source hash'
     }
 
+    if ($aliasArchiveOperation) {
+        foreach ($sidecarPath in @("$target-wal", "$target-shm", "$legacy-wal", "$legacy-shm")) {
+            if (Test-Path -LiteralPath $sidecarPath) {
+                Throw-CbmMigrationError -Code 'CBM_STORE_MIGRATION_ALIAS_FAMILY_CHANGED' `
+                    -Message "source-family sidecar appeared after exact guards were retained: $sidecarPath" `
+                    -Remediation 'preserve both guarded families and investigate the exact client generation'
+            }
+        }
+
+        # list_projects receives only byte-exact copies made while both source
+        # guards are retained. This preserves the real product identity and
+        # integrity path without rescanning unrelated project stores.
+        $preflightView = New-CbmProductView -TransactionPath $transactionPath `
+            -RecordStem $recordStem -Phase 'preflight' `
+            -Members @($targetPrimary, $legacyPrimary)
+        $preflightCanonical = [IO.Path]::Combine(
+            $preflightView.Path, [IO.Path]::GetFileName($target))
+        $preflightLegacy = [IO.Path]::Combine(
+            $preflightView.Path, [IO.Path]::GetFileName($legacy))
+        $preflightArgs = [IO.Path]::Combine(
+            $transactionPath, "${recordStem}preflight-list-args.json")
+        Write-DurableJson -Path $preflightArgs -Value ([ordered]@{})
+        $preflightStdout = [IO.Path]::Combine(
+            $transactionPath, "${recordStem}preflight-list.stdout.json")
+        $preflightStderr = [IO.Path]::Combine(
+            $transactionPath, "${recordStem}preflight-list.stderr.log")
+        try {
+            $preflightRun = Invoke-CbmTool -Executable $binary -Tool 'list_projects' `
+                -ArgsPath $preflightArgs -StdoutPath $preflightStdout `
+                -StderrPath $preflightStderr -TimeoutSeconds $ReindexTimeoutSeconds `
+                -CacheDirectory $preflightView.Path
+        }
+        finally {
+            $preflightViewReadback = Write-CbmProductViewReadback `
+                -TransactionPath $transactionPath -RecordStem $recordStem `
+                -Phase 'preflight' -View $preflightView
+        }
+        if ($preflightRun.ExitCode -ne 0) {
+            Throw-CbmMigrationError -Code 'CBM_STORE_MIGRATION_PREFLIGHT_LIST_FAILED' `
+                -Message "real list_projects exited $($preflightRun.ExitCode) before archival" `
+                -Remediation 'preserve both families, exact product view, and persisted preflight response'
+        }
+        $preflightPayload = Read-CbmToolPayload -StdoutPath $preflightStdout `
+            -Purpose 'preflight list_projects'
+        $canonicalRows = @($preflightPayload['projects'] | Where-Object {
+            [string]$_['name'] -ceq $Project -and
+            [string]::Equals(
+                [IO.Path]::GetFullPath([string]$_['db_path']),
+                $preflightCanonical,
+                [StringComparison]::OrdinalIgnoreCase
+            ) -and [string]$_['db_sha256'] -ceq $expectedCanonicalDb -and
+            [string]::Equals(
+                [IO.Path]::GetFullPath([string]$_['canonical_root']).TrimEnd('\', '/'),
+                $repository.TrimEnd('\', '/'),
+                [StringComparison]::OrdinalIgnoreCase
+            )
+        })
+        $legacyConflicts = @($preflightPayload['project_identity_conflicts'] |
+            Where-Object {
+                [string]::Equals(
+                    [IO.Path]::GetFullPath([string]$_['legacy_db_path']),
+                    $preflightLegacy,
+                    [StringComparison]::OrdinalIgnoreCase
+                ) -and [string]$_['legacy_db_sha256'] -ceq $expectedDb -and
+                [string]$_['canonical_project'] -ceq $Project -and
+                [string]::Equals(
+                    [IO.Path]::GetFullPath([string]$_['canonical_db_path']),
+                    $preflightCanonical,
+                    [StringComparison]::OrdinalIgnoreCase
+                ) -and
+                [string]::Equals(
+                    [IO.Path]::GetFullPath([string]$_['canonical_root']).TrimEnd('\', '/'),
+                    $repository.TrimEnd('\', '/'),
+                    [StringComparison]::OrdinalIgnoreCase
+                )
+            })
+        if ($canonicalRows.Count -ne 1 -or $legacyConflicts.Count -ne 1 -or
+            [int]$preflightPayload['project_identity_conflict_count'] -ne 1 -or
+            [int]$preflightPayload['refused_store_count'] -ne 0) {
+            Throw-CbmMigrationError -Code 'CBM_STORE_MIGRATION_PREFLIGHT_IDENTITY_MISMATCH' `
+                -Message "expected one accepted canonical row and one exact legacy conflict; canonical=$($canonicalRows.Count) conflict=$($legacyConflicts.Count) total_conflicts=$($preflightPayload['project_identity_conflict_count']) refused=$($preflightPayload['refused_store_count'])" `
+                -Remediation 'preserve both families; reconcile product discovery output with the exact view paths, roots, and hashes'
+        }
+        $guardedPreflightReadback = @(
+            Get-CbmFamilyGuardReadback -Guard $targetPrimary
+            Get-CbmFamilyGuardReadback -Guard $legacyPrimary
+        )
+        foreach ($sidecarPath in @("$target-wal", "$target-shm", "$legacy-wal", "$legacy-shm")) {
+            if (Test-Path -LiteralPath $sidecarPath) {
+                Throw-CbmMigrationError -Code 'CBM_STORE_MIGRATION_ALIAS_FAMILY_CHANGED' `
+                    -Message "source-family sidecar appeared during guarded product preflight: $sidecarPath" `
+                    -Remediation 'preserve both families and exact view evidence; inspect the client generation'
+            }
+        }
+    }
+
     $journal = [IO.Path]::Combine($transactionPath, 'journal.ndjson')
     $members = @($guards | Where-Object {
         -not $targetRecords.Contains($_)
@@ -1741,6 +2074,22 @@ try {
                 sha256 = $_.Sha256
             }
         })
+        alias_preflight_product_view = if ($aliasArchiveOperation) {
+            [ordered]@{
+                path = $preflightView.Path
+                manifest_path = $preflightView.ManifestPath
+                manifest_sha256 = $preflightView.ManifestSha256
+                readback_path = $preflightViewReadback.Path
+                readback_sha256 = $preflightViewReadback.Sha256
+            }
+        } else {
+            $null
+        }
+        alias_guarded_preflight_readback = if ($aliasArchiveOperation) {
+            $guardedPreflightReadback
+        } else {
+            $null
+        }
         alias_retry_lineage = $aliasRetryLineage
     }
     Write-DurableJson -Path ([IO.Path]::Combine($transactionPath, 'intent.json')) -Value $intent
@@ -1754,8 +2103,16 @@ try {
                 exit_code = $preflightRun.ExitCode
                 stdout_sha256 = $preflightRun.StdoutSha256
                 stderr_sha256 = $preflightRun.StderrSha256
-                canonical = $canonicalRows[0]
+                canonical_product_row = $canonicalRows[0]
                 legacy_conflict = $legacyConflicts[0]
+                guarded_source_families = $guardedPreflightReadback
+                product_view = [ordered]@{
+                    path = $preflightView.Path
+                    manifest_path = $preflightView.ManifestPath
+                    manifest_sha256 = $preflightView.ManifestSha256
+                    readback_path = $preflightViewReadback.Path
+                    readback_sha256 = $preflightViewReadback.Sha256
+                }
             })
     }
 
@@ -1820,16 +2177,10 @@ try {
         -Value $archiveComplete
 
     if ($aliasArchiveOperation) {
-        $canonicalBeforePostflight = [ordered]@{
-            path = $targetPrimary.SourcePath
-            file_id = $targetPrimary.FileId
-            length = $targetPrimary.Length
-            sha256 = $targetPrimary.Sha256
-        }
-        $targetPrimary.Handle.Dispose()
-        [void]$guards.Remove($targetPrimary)
-        $targetRecords.Clear()
-
+        $postflightView = New-CbmProductView -TransactionPath $transactionPath `
+            -RecordStem $recordStem -Phase 'postflight' -Members @($targetPrimary)
+        $postflightCanonical = [IO.Path]::Combine(
+            $postflightView.Path, [IO.Path]::GetFileName($target))
         $postflightArgs = [IO.Path]::Combine(
             $transactionPath, "${recordStem}postflight-list-args.json")
         Write-DurableJson -Path $postflightArgs -Value ([ordered]@{})
@@ -1837,10 +2188,17 @@ try {
             $transactionPath, "${recordStem}postflight-list.stdout.json")
         $postflightStderr = [IO.Path]::Combine(
             $transactionPath, "${recordStem}postflight-list.stderr.log")
-        $postflightRun = Invoke-CbmTool -Executable $binary -Tool 'list_projects' `
-            -ArgsPath $postflightArgs -StdoutPath $postflightStdout `
-            -StderrPath $postflightStderr -TimeoutSeconds $ReindexTimeoutSeconds `
-            -CacheDirectory $cache
+        try {
+            $postflightRun = Invoke-CbmTool -Executable $binary -Tool 'list_projects' `
+                -ArgsPath $postflightArgs -StdoutPath $postflightStdout `
+                -StderrPath $postflightStderr -TimeoutSeconds $ReindexTimeoutSeconds `
+                -CacheDirectory $postflightView.Path
+        }
+        finally {
+            $postflightViewReadback = Write-CbmProductViewReadback `
+                -TransactionPath $transactionPath -RecordStem $recordStem `
+                -Phase 'postflight' -View $postflightView
+        }
         if ($postflightRun.ExitCode -ne 0) {
             Throw-CbmMigrationError -Code 'CBM_STORE_MIGRATION_POSTFLIGHT_LIST_FAILED' `
                 -Message "real list_projects exited $($postflightRun.ExitCode) after archival" `
@@ -1852,7 +2210,7 @@ try {
             [string]$_['name'] -ceq $Project -and
             [string]::Equals(
                 [IO.Path]::GetFullPath([string]$_['db_path']),
-                $target,
+                $postflightCanonical,
                 [StringComparison]::OrdinalIgnoreCase
             ) -and [string]$_['db_sha256'] -ceq $expectedCanonicalDb -and
             [string]::Equals(
@@ -1861,18 +2219,13 @@ try {
                 [StringComparison]::OrdinalIgnoreCase
             )
         })
-        $remainingLegacyConflicts = @($postflightPayload['project_identity_conflicts'] |
-            Where-Object {
-                [string]::Equals(
-                    [IO.Path]::GetFullPath([string]$_['legacy_db_path']),
-                    $legacy,
-                    [StringComparison]::OrdinalIgnoreCase
-                )
-            })
+        $remainingLegacyConflicts = @($postflightPayload['project_identity_conflicts'])
         if ($postCanonicalRows.Count -ne 1 -or $remainingLegacyConflicts.Count -ne 0 -or
+            [int]$postflightPayload['project_identity_conflict_count'] -ne 0 -or
+            [int]$postflightPayload['refused_store_count'] -ne 0 -or
             (Test-Path -LiteralPath $legacy)) {
             Throw-CbmMigrationError -Code 'CBM_STORE_MIGRATION_POSTFLIGHT_IDENTITY_MISMATCH' `
-                -Message "expected one unchanged canonical row, no legacy conflict, and absent legacy path; canonical=$($postCanonicalRows.Count) conflict=$($remainingLegacyConflicts.Count) legacy_present=$(Test-Path -LiteralPath $legacy)" `
+                -Message "expected one unchanged canonical row, no conflict/refusal, and absent real legacy path; canonical=$($postCanonicalRows.Count) conflict=$($remainingLegacyConflicts.Count) refused=$($postflightPayload['refused_store_count']) legacy_present=$(Test-Path -LiteralPath $legacy)" `
                 -Remediation 'preserve every archive/canonical byte and inspect the postflight namespace and discovery response'
         }
 
@@ -1883,17 +2236,6 @@ try {
                     -Remediation 'preserve the completed archive and canonical family; inspect the exact client generation before any further reconciliation'
             }
         }
-        $targetPrimary = New-FamilyGuardRecord -Path $target
-        $guards.Add($targetPrimary)
-        $targetRecords.Add($targetPrimary)
-        if ($targetPrimary.FileId -cne $canonicalBeforePostflight.file_id -or
-            $targetPrimary.Length -ne $canonicalBeforePostflight.length -or
-            $targetPrimary.Sha256 -cne $canonicalBeforePostflight.sha256) {
-            Throw-CbmMigrationError -Code 'CBM_STORE_MIGRATION_CANONICAL_POSTFLIGHT_DRIFT' `
-                -Message 'canonical FILE_ID/length/hash changed across independent product postflight' `
-                -Remediation 'preserve the archive and canonical family; inspect the exact namespace/content transition'
-        }
-
         $targetFamilyReadback = @($targetRecords | ForEach-Object {
             $currentSha = Get-FileSha256 -Path $_.SourcePath
             $currentItem = Get-Item -LiteralPath $_.SourcePath -Force
@@ -1944,10 +2286,17 @@ try {
                 exit_code = $postflightRun.ExitCode
                 stdout_sha256 = $postflightRun.StdoutSha256
                 stderr_sha256 = $postflightRun.StderrSha256
-                canonical = $postCanonicalRows[0]
+                canonical_product_row = $postCanonicalRows[0]
                 legacy_source_absent = $true
                 canonical_family = $targetFamilyReadback
                 archived_source_family = $finalArchiveReadback
+                product_view = [ordered]@{
+                    path = $postflightView.Path
+                    manifest_path = $postflightView.ManifestPath
+                    manifest_sha256 = $postflightView.ManifestSha256
+                    readback_path = $postflightViewReadback.Path
+                    readback_sha256 = $postflightViewReadback.Sha256
+                }
             })
         $complete = [ordered]@{
             schema = 1
@@ -1964,8 +2313,16 @@ try {
             project = $Project
             repository_path = $repository
             archived_source_family = $finalArchiveReadback
-            canonical_target = $postCanonicalRows[0]
+            canonical_target = $targetFamilyReadback[0]
+            canonical_product_row = $postCanonicalRows[0]
             canonical_target_family = $targetFamilyReadback
+            preflight_product_view = [ordered]@{
+                path = $preflightView.Path
+                manifest_path = $preflightView.ManifestPath
+                manifest_sha256 = $preflightView.ManifestSha256
+                readback_path = $preflightViewReadback.Path
+                readback_sha256 = $preflightViewReadback.Sha256
+            }
             preflight_process = $preflightRun.Identity
             preflight_exit_code = $preflightRun.ExitCode
             preflight_stdout_sha256 = $preflightRun.StdoutSha256
@@ -1974,6 +2331,13 @@ try {
             postflight_exit_code = $postflightRun.ExitCode
             postflight_stdout_sha256 = $postflightRun.StdoutSha256
             postflight_stderr_sha256 = $postflightRun.StderrSha256
+            postflight_product_view = [ordered]@{
+                path = $postflightView.Path
+                manifest_path = $postflightView.ManifestPath
+                manifest_sha256 = $postflightView.ManifestSha256
+                readback_path = $postflightViewReadback.Path
+                readback_sha256 = $postflightViewReadback.Sha256
+            }
             final_journal_record_sha256 = $previous
         }
         Write-DurableJson -Path ([IO.Path]::Combine($transactionPath, 'completion.json')) `
