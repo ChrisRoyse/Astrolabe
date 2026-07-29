@@ -527,16 +527,46 @@ pub const GIT_SOURCE_FINGERPRINT_VERSION: &str = "v1";
 /// error when `repo` is not a usable git repository (so a missing/renamed source tree
 /// is reported, never silently treated as Fresh).
 pub fn git_source_fingerprint(repo: &Path) -> Result<String, ArchaeologyError> {
-    // HEAD oid, or an explicit unborn-branch marker for a repo with no commit yet.
-    // Any spawn/exit failure here is tolerated and disambiguated by the mandatory
-    // `git status` below: a non-repository fails that call fail-closed.
-    let head = match git_text(repo, &["rev-parse", "--verify", "HEAD"]) {
-        Ok(text) => {
-            let head = text.trim().to_string();
-            validate_oid(&head)?;
-            head
+    // HEAD oid, or an explicit unborn-branch marker for a repository whose
+    // symbolic HEAD names a ref that does not exist yet. `rev-parse` also fails
+    // for corrupt/missing objects and broken HEAD state; those are measurement
+    // faults, never evidence of an unborn repository (#831).
+    let head_args = ["rev-parse", "--verify", "HEAD"];
+    let head_output = git_command(repo, &head_args)
+        .output()
+        .map_err(|error| git_spawn_error(&head_args, error))?;
+    let head = if head_output.status.success() {
+        let head = String::from_utf8(head_output.stdout)
+            .map_err(|error| {
+                ArchaeologyError::new(
+                    ASTRO_ARCHAEOLOGY_OUTPUT_INVALID,
+                    format!("Git HEAD output is not UTF-8: {error}"),
+                )
+            })?
+            .trim()
+            .to_string();
+        validate_oid(&head)?;
+        head
+    } else {
+        let Some(symbolic_head) = git_optional_text(repo, &["symbolic-ref", "--quiet", "HEAD"])?
+        else {
+            return Err(git_exit_error(
+                &head_args,
+                head_output.status.code(),
+                &head_output.stderr,
+            ));
+        };
+        let symbolic_head = symbolic_head.trim();
+        if symbolic_head.is_empty()
+            || git_status(repo, &["show-ref", "--verify", "--quiet", symbolic_head])?
+        {
+            return Err(git_exit_error(
+                &head_args,
+                head_output.status.code(),
+                &head_output.stderr,
+            ));
         }
-        Err(_) => "unborn-head".to_string(),
+        "unborn-head".to_string()
     };
     // NUL-delimited machine status over all untracked files. This is the fail-closed
     // gate: it errors if `repo` is not a git repository, so we never fingerprint a
@@ -545,10 +575,15 @@ pub fn git_source_fingerprint(repo: &Path) -> Result<String, ArchaeologyError> {
         repo,
         &["status", "--porcelain=v1", "-z", "--untracked-files=all"],
     )?;
-    // Tracked content changes vs HEAD (staged + unstaged). Empty on an unborn head or a
-    // clean tree; a content-only re-edit still moves these bytes.
-    let diff =
-        git_bytes(repo, &["diff", "HEAD", "--no-color", "--no-ext-diff"]).unwrap_or_default();
+    // Tracked content changes vs HEAD (staged + unstaged). An explicitly
+    // classified unborn repository has no HEAD tree to diff; every committed
+    // repository must complete this measurement or the whole fingerprint
+    // refuses with the exact Git command/phase/exit/stderr (#831).
+    let diff = if head == "unborn-head" {
+        Vec::new()
+    } else {
+        git_bytes(repo, &["diff", "HEAD", "--no-color", "--no-ext-diff"])?
+    };
     // Untracked, non-ignored paths (NUL-delimited). Their current bytes are folded in so
     // a brand-new file's content — not just its presence — participates in the digest.
     let untracked = git_bytes(repo, &["ls-files", "--others", "--exclude-standard", "-z"])?;
@@ -1229,9 +1264,10 @@ fn git_status(repo: &Path, args: &[&str]) -> Result<bool, ArchaeologyError> {
         .map_err(|error| git_spawn_error(args, error))?;
     match output.status.code() {
         Some(0) => Ok(true),
-        // Both predicates routed here have a documented false result at exit 1:
-        // `merge-base --is-ancestor` for a non-ancestor and `cat-file -e` for a
-        // missing object. Every other exit is a Git fault, not a false predicate.
+        // Every predicate routed here documents exit 1 as false:
+        // `merge-base --is-ancestor` for a non-ancestor, `cat-file -e` for a
+        // missing object, and `show-ref --verify --quiet` for a missing ref.
+        // Every other exit is a Git fault, not a false predicate.
         Some(1) => Ok(false),
         _ => Err(git_exit_error(args, output.status.code(), &output.stderr)),
     }
@@ -1244,6 +1280,24 @@ fn git_text(repo: &Path, args: &[&str]) -> Result<String, ArchaeologyError> {
             format!("Git output is not UTF-8: {error}"),
         )
     })
+}
+
+/// Runs a Git query whose documented exit 1 means that the requested value is
+/// absent. Every other nonzero exit remains a command fault with full diagnostics.
+fn git_optional_text(repo: &Path, args: &[&str]) -> Result<Option<String>, ArchaeologyError> {
+    let output = git_command(repo, args)
+        .output()
+        .map_err(|error| git_spawn_error(args, error))?;
+    match output.status.code() {
+        Some(0) => String::from_utf8(output.stdout).map(Some).map_err(|error| {
+            ArchaeologyError::new(
+                ASTRO_ARCHAEOLOGY_OUTPUT_INVALID,
+                format!("Git output is not UTF-8: {error}"),
+            )
+        }),
+        Some(1) => Ok(None),
+        _ => Err(git_exit_error(args, output.status.code(), &output.stderr)),
+    }
 }
 
 fn git_bytes(repo: &Path, args: &[&str]) -> Result<Vec<u8>, ArchaeologyError> {
