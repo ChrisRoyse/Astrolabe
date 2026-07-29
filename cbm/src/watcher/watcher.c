@@ -682,39 +682,47 @@ static void init_baseline(project_state_t *s) {
     s->next_poll_ns = now_ns() + ((int64_t)s->interval_ms * US_PER_MS);
 }
 
-/* Check if a project has changes. Returns true if reindex needed. */
-static bool check_changes(project_state_t *s) {
+typedef struct {
+    char head[CBM_SZ_64];
+    bool head_observed;
+    char worktree_sha256[CBM_SHA256_HEX_LEN + 1];
+    bool worktree_observed;
+} project_observation_t;
+
+/* Observe whether a project has changes without advancing either successful
+ * baseline. The exact pre-callback observation is committed only after the
+ * index callback succeeds. This is deliberately transactional: acknowledging
+ * HEAD before a failed callback makes a committed source change invisible to
+ * every later poll, while re-observing after success can swallow bytes that
+ * changed during the index generation itself. */
+static bool check_changes(const project_state_t *s, project_observation_t *observation) {
     if (!s->is_git) {
         return false;
     }
 
+    memset(observation, 0, sizeof(*observation));
+
     /* Check HEAD movement */
-    char head[CBM_SZ_64] = {0};
-    if (git_head(s->root_path, head, sizeof(head)) == 0) {
-        if (s->last_head[0] != '\0' && strcmp(head, s->last_head) != 0) {
-            /* HEAD moved — commit, checkout, pull */
-            /* #229/#273: bounded copy with a guaranteed NUL terminator. The vendored
-             * strncpy(dst, src, sizeof-1) does not terminate when `head` fills the
-             * buffer (a genuine latent bug) and trips GCC 14 -Wstringop-truncation.
-             * strnlen caps the length, memcpy copies exactly that many bytes, and the
-             * explicit NUL terminates. Unconditional (#273): the fix ships in libcbm.a
-             * too, instead of being masked by a blanket -Wno-stringop-truncation. */
-            size_t head_len = strnlen(head, sizeof(s->last_head) - 1);
-            memcpy(s->last_head, head, head_len);
-            s->last_head[head_len] = '\0';
-            return true;
-        }
-        /* #229/#273: bounded copy with a guaranteed NUL terminator (see above). */
-        size_t head_len = strnlen(head, sizeof(s->last_head) - 1);
-        memcpy(s->last_head, head, head_len);
-        s->last_head[head_len] = '\0';
-    }
+    observation->head_observed =
+        git_head(s->root_path, observation->head, sizeof(observation->head)) == 0;
 
     /* Check whether the porcelain state changed since the last successful
      * indexing tick, including successive edits while the tree remains dirty. */
-    char worktree_sha256[CBM_SHA256_HEX_LEN + 1] = {0};
-    return git_worktree_fingerprint(s->root_path, worktree_sha256) &&
-           strcmp(worktree_sha256, s->worktree_sha256) != 0;
+    observation->worktree_observed =
+        git_worktree_fingerprint(s->root_path, observation->worktree_sha256);
+    return (observation->head_observed && strcmp(observation->head, s->last_head) != 0) ||
+           (observation->worktree_observed &&
+            strcmp(observation->worktree_sha256, s->worktree_sha256) != 0);
+}
+
+static void commit_observation(project_state_t *s, const project_observation_t *observation) {
+    if (observation->head_observed) {
+        snprintf(s->last_head, sizeof(s->last_head), "%s", observation->head);
+    }
+    if (observation->worktree_observed) {
+        snprintf(s->worktree_sha256, sizeof(s->worktree_sha256), "%s",
+                 observation->worktree_sha256);
+    }
 }
 
 /* Context for poll_once foreach callback */
@@ -813,7 +821,8 @@ static void poll_project(const char *key, void *val, void *ud) {
     }
 
     /* Check for changes */
-    bool changed = check_changes(s);
+    project_observation_t observation;
+    bool changed = check_changes(s, &observation);
     if (!changed) {
         s->next_poll_ns = ctx->now + ((int64_t)s->interval_ms * US_PER_MS);
         return;
@@ -825,9 +834,7 @@ static void poll_project(const char *key, void *val, void *ud) {
         int rc = ctx->w->index_fn(s->project_name, s->root_path, ctx->w->user_data);
         if (rc == 0) {
             ctx->reindexed++;
-            /* Update HEAD after successful reindex */
-            git_head(s->root_path, s->last_head, sizeof(s->last_head));
-            (void)git_worktree_fingerprint(s->root_path, s->worktree_sha256);
+            commit_observation(s, &observation);
             /* Refresh file count for interval */
             s->file_count = git_file_count(s->root_path);
             s->interval_ms = cbm_watcher_poll_interval_ms(s->file_count);

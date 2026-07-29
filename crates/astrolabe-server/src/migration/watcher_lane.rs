@@ -383,8 +383,10 @@ fn run_watcher_index_tick(
     let started = Instant::now();
     let response = handle_index_repository(runner, &normalized_args)?;
     let elapsed_ms = started.elapsed().as_millis() as u64;
+    let response_sha256 = hex_lower(&Sha256::digest(response.as_bytes()));
+    let response_value: Value = serde_json::from_str(&response)?;
     if tool_result_is_error(&response)? {
-        if let Some(fault_code) = terminal_watcher_fault_code(&response) {
+        if let Some(fault_code) = terminal_watcher_fault_code(&response_value) {
             let fault = json!({
                 "schema": "astrolabe-watcher-fault-v1",
                 "status": "terminal_fault",
@@ -393,7 +395,8 @@ fn run_watcher_index_tick(
                 "observation": observation,
                 "observation_sha256": observation_sha256,
                 "rearm_signature": watcher_rearm_signature(cache_dir, project, &normalized_args)?,
-                "response_sha256": hex_lower(&Sha256::digest(response.as_bytes())),
+                "response_sha256": response_sha256,
+                "response": response_value,
                 "worker_started": true,
                 "retry_suppressed_until_observation_changes": true,
                 "remediation": "repair or replace the exact source/store/config state; unchanged periodic retries are suppressed",
@@ -432,11 +435,15 @@ fn run_watcher_index_tick(
             "elapsed_ms": elapsed_ms,
             "freshness": "stale",
             "trust": "provisional",
-            "response_hash": hex_lower(&Sha256::digest(response.as_bytes())),
+            "response_sha256": response_sha256,
+            "response": response_value,
             "remediation": "inspect the index_repository error and retry the watcher tick",
         });
         persist_watcher_status(cache_dir, project, &status)?;
-        return Err(format!("watcher index tick failed for {project:?}").into());
+        return Err(format!(
+            "watcher index tick failed for {project:?}; response_sha256={response_sha256}; response={response}"
+        )
+        .into());
     }
     delete_watcher_fault(cache_dir, &fault_key)?;
     // P7.4 (#368): after the delta converges, auto-extract this project's newest
@@ -653,7 +660,7 @@ fn value_sha256(value: &Value) -> Result<String, DynError> {
     Ok(hex_lower(&Sha256::digest(serde_json::to_vec(value)?)))
 }
 
-fn terminal_watcher_fault_code(response: &str) -> Option<&'static str> {
+fn terminal_watcher_fault_code(response: &Value) -> Option<&'static str> {
     const TERMINAL_CODES: &[&str] = &[
         "CBM_SCHEMA_VERSION_UNSTAMPED",
         "CBM_SCHEMA_VERSION_UNSUPPORTED",
@@ -663,10 +670,29 @@ fn terminal_watcher_fault_code(response: &str) -> Option<&'static str> {
         "CBM_STORE_PROVENANCE_FAILED",
         "ASTRO_SHADOW_PROJECT_MISMATCH",
     ];
-    TERMINAL_CODES
-        .iter()
-        .copied()
-        .find(|code| response.contains(code))
+    let structured_code = response
+        .get("structuredContent")
+        .and_then(|value| value.get("code"))
+        .and_then(Value::as_str)
+        .or_else(|| response.get("code").and_then(Value::as_str));
+    if let Some(code) = structured_code {
+        return TERMINAL_CODES.iter().copied().find(|known| *known == code);
+    }
+    let text = response
+        .get("content")
+        .and_then(Value::as_array)
+        .and_then(|items| items.first())
+        .and_then(|item| item.get("text"))
+        .and_then(Value::as_str)?;
+    if let Ok(inner) = serde_json::from_str::<Value>(text)
+        && let Some(code) = inner.get("code").and_then(Value::as_str)
+    {
+        return TERMINAL_CODES.iter().copied().find(|known| *known == code);
+    }
+    TERMINAL_CODES.iter().copied().find(|code| {
+        text.strip_prefix(code)
+            .is_some_and(|suffix| suffix.starts_with(':') || suffix.starts_with(' '))
+    })
 }
 
 fn persist_watcher_status(cache_dir: &Path, project: &str, status: &Value) -> Result<(), DynError> {
