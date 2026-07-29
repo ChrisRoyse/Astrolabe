@@ -5122,12 +5122,36 @@ static void rust_macro_log_failure(const char *code, const char *macro_name,
     }
 }
 
+extern const TSLanguage *tree_sitter_rust(void);
+
 static char *rust_macro_wrap_expansion(RustLSPContext *ctx, RustMacroExpansionContext context,
-                                       const char *substituted) {
+                                       const char *substituted, size_t *expansion_start,
+                                       size_t *expansion_end) {
+    if (!expansion_start || !expansion_end) {
+        cbm_arena_mark_failed(ctx->arena, "CBM_RUST_MACRO_CONTEXT_INVALID",
+                              "rust_lsp_macro_expansion_bounds", 0);
+        return NULL;
+    }
+    *expansion_start = 0;
+    *expansion_end = 0;
     switch (context) {
-    case RUST_MACRO_CONTEXT_EXPRESSION:
-        return cbm_arena_sprintf(ctx->arena, "fn __cbm_macro_expand() { let _ = (%s); }\n",
-                                 substituted);
+    case RUST_MACRO_CONTEXT_EXPRESSION: {
+        static const char prefix[] = "fn __cbm_macro_expand() { let _ = {\n";
+        static const char suffix[] = "\n}; }\n";
+        size_t body_len = strlen(substituted);
+        size_t prefix_len = sizeof(prefix) - 1;
+        if (body_len > SIZE_MAX - prefix_len) {
+            cbm_arena_mark_failed(ctx->arena, "CBM_RUST_MACRO_OUTPUT_OVERFLOW",
+                                  "rust_lsp_macro_expression_bounds", body_len);
+            return NULL;
+        }
+        char *wrapped = cbm_arena_sprintf(ctx->arena, "%s%s%s", prefix, substituted, suffix);
+        if (wrapped) {
+            *expansion_start = prefix_len;
+            *expansion_end = prefix_len + body_len;
+        }
+        return wrapped;
+    }
     case RUST_MACRO_CONTEXT_STATEMENT:
         return cbm_arena_sprintf(ctx->arena, "fn __cbm_macro_expand() { %s }\n", substituted);
     case RUST_MACRO_CONTEXT_ITEM:
@@ -5147,8 +5171,185 @@ static char *rust_macro_wrap_expansion(RustLSPContext *ctx, RustMacroExpansionCo
     return NULL;
 }
 
+static bool rust_macro_node_is_expression(RustLSPContext *ctx, TSNode node,
+                                          bool *is_expression) {
+    if (!ctx || !is_expression || ts_node_is_null(node)) {
+        if (ctx) {
+            cbm_arena_mark_failed(ctx->arena, "CBM_RUST_MACRO_GRAMMAR_INVALID",
+                                  "rust_lsp_macro_expression_supertype", 0);
+        }
+        return false;
+    }
+    *is_expression = false;
+    const TSLanguage *language = tree_sitter_rust();
+    uint32_t supertype_count = 0;
+    const TSSymbol *supertypes = ts_language_supertypes(language, &supertype_count);
+    TSSymbol expression_supertype = 0;
+    bool found_expression_supertype = false;
+    for (uint32_t i = 0; i < supertype_count; i++) {
+        const char *name = ts_language_symbol_name(language, supertypes[i]);
+        if (name && strcmp(name, "_expression") == 0) {
+            expression_supertype = supertypes[i];
+            found_expression_supertype = true;
+            break;
+        }
+    }
+    if (!found_expression_supertype) {
+        cbm_arena_mark_failed(ctx->arena, "CBM_RUST_MACRO_GRAMMAR_INVALID",
+                              "rust_lsp_macro_expression_supertype", supertype_count);
+        return false;
+    }
+    uint32_t subtype_count = 0;
+    const TSSymbol *subtypes =
+        ts_language_subtypes(language, expression_supertype, &subtype_count);
+    TSSymbol node_symbol = ts_node_grammar_symbol(node);
+    for (uint32_t i = 0; i < subtype_count; i++) {
+        if (subtypes[i] == node_symbol) {
+            *is_expression = true;
+            break;
+        }
+    }
+    return true;
+}
+
+static TSNode rust_macro_expression_shape_fail(RustLSPContext *ctx, const char *macro_name,
+                                               TSNode invocation, const char *substituted,
+                                               size_t expansion_start, size_t expansion_end,
+                                               const char *reason, TSNode observed) {
+    TSNode parent = ts_node_parent(invocation);
+    const char *parent_kind = ts_node_is_null(parent) ? "none" : ts_node_type(parent);
+    const char *observed_kind = ts_node_is_null(observed) ? "none" : ts_node_type(observed);
+    uint32_t observed_start = ts_node_is_null(observed) ? 0 : ts_node_start_byte(observed);
+    uint32_t observed_end = ts_node_is_null(observed) ? 0 : ts_node_end_byte(observed);
+    size_t body_len = substituted ? strlen(substituted) : 0;
+    fprintf(stderr,
+            "ERROR level=error msg=rust_macro.expression_shape_invalid "
+            "code=CBM_RUST_MACRO_EXPANSION_INVALID macro=%s context=expression "
+            "invocation_parent=%s invocation_byte=%u substituted_bytes=%zu "
+            "expansion_start=%zu expansion_end=%zu reason=%s observed_kind=%s "
+            "observed_start=%u observed_end=%u\n",
+            macro_name ? macro_name : "none", parent_kind, ts_node_start_byte(invocation), body_len,
+            expansion_start, expansion_end, reason ? reason : "none", observed_kind,
+            observed_start, observed_end);
+    cbm_arena_mark_failed(ctx->arena, "CBM_RUST_MACRO_EXPANSION_INVALID",
+                          "rust_lsp_macro_expression_shape", body_len);
+    TSNode none = {0};
+    return none;
+}
+
+static TSNode rust_macro_expression_subtree(RustLSPContext *ctx, TSNode root,
+                                            const char *macro_name, TSNode invocation,
+                                            const char *substituted, size_t expansion_start,
+                                            size_t expansion_end) {
+    if (expansion_end < expansion_start) {
+        return rust_macro_expression_shape_fail(ctx, macro_name, invocation, substituted,
+                                                expansion_start, expansion_end,
+                                                "inverted_expansion_bounds", root);
+    }
+    if (ts_node_named_child_count(root) != 1) {
+        return rust_macro_expression_shape_fail(ctx, macro_name, invocation, substituted,
+                                                expansion_start, expansion_end,
+                                                "wrapper_root_cardinality", root);
+    }
+    TSNode function = ts_node_named_child(root, 0);
+    if (strcmp(ts_node_type(function), "function_item") != 0) {
+        return rust_macro_expression_shape_fail(ctx, macro_name, invocation, substituted,
+                                                expansion_start, expansion_end,
+                                                "wrapper_function_missing", function);
+    }
+    TSNode function_body = ts_node_child_by_field_name(function, "body", 4);
+    if (ts_node_is_null(function_body) || strcmp(ts_node_type(function_body), "block") != 0 ||
+        ts_node_named_child_count(function_body) != 1) {
+        return rust_macro_expression_shape_fail(ctx, macro_name, invocation, substituted,
+                                                expansion_start, expansion_end,
+                                                "wrapper_function_body", function_body);
+    }
+    TSNode binding = ts_node_named_child(function_body, 0);
+    if (strcmp(ts_node_type(binding), "let_declaration") != 0) {
+        return rust_macro_expression_shape_fail(ctx, macro_name, invocation, substituted,
+                                                expansion_start, expansion_end,
+                                                "wrapper_binding_missing", binding);
+    }
+    TSNode value = ts_node_child_by_field_name(binding, "value", 5);
+    if (ts_node_is_null(value) || strcmp(ts_node_type(value), "block") != 0 ||
+        expansion_start < ts_node_start_byte(value) || expansion_end > ts_node_end_byte(value)) {
+        return rust_macro_expression_shape_fail(ctx, macro_name, invocation, substituted,
+                                                expansion_start, expansion_end,
+                                                "wrapper_value_bounds", value);
+    }
+
+    TSNode expression = {0};
+    uint32_t child_count = ts_node_named_child_count(value);
+    for (uint32_t i = 0; i < child_count; i++) {
+        TSNode child = ts_node_named_child(value, i);
+        uint32_t child_start = ts_node_start_byte(child);
+        uint32_t child_end = ts_node_end_byte(child);
+        if (child_end <= expansion_start || child_start >= expansion_end) {
+            continue;
+        }
+        if (child_start < expansion_start || child_end > expansion_end) {
+            return rust_macro_expression_shape_fail(ctx, macro_name, invocation, substituted,
+                                                    expansion_start, expansion_end,
+                                                    "partial_expansion_overlap", child);
+        }
+        const char *kind = ts_node_type(child);
+        if (strcmp(kind, "line_comment") == 0 || strcmp(kind, "block_comment") == 0) {
+            continue;
+        }
+        if (strcmp(kind, "attribute_item") == 0 && ts_node_is_null(expression)) {
+            continue;
+        }
+
+        TSNode candidate = child;
+        if (strcmp(kind, "expression_statement") == 0) {
+            if (ts_node_named_child_count(child) != 1) {
+                return rust_macro_expression_shape_fail(
+                    ctx, macro_name, invocation, substituted, expansion_start, expansion_end,
+                    "expression_statement_shape", child);
+            }
+            candidate = ts_node_named_child(child, 0);
+            if (ts_node_is_null(candidate) || ts_node_start_byte(candidate) < child_start ||
+                ts_node_end_byte(candidate) > child_end) {
+                return rust_macro_expression_shape_fail(
+                    ctx, macro_name, invocation, substituted, expansion_start, expansion_end,
+                    "expression_statement_bounds", child);
+            }
+        }
+        bool is_expression = false;
+        if (!rust_macro_node_is_expression(ctx, candidate, &is_expression)) {
+            TSNode none = {0};
+            return none;
+        }
+        if (!is_expression || !ts_node_is_null(expression)) {
+            return rust_macro_expression_shape_fail(ctx, macro_name, invocation, substituted,
+                                                    expansion_start, expansion_end,
+                                                    is_expression ? "multiple_expressions"
+                                                                  : "non_expression_child",
+                                                    candidate);
+        }
+        expression = candidate;
+    }
+    if (ts_node_is_null(expression)) {
+        return rust_macro_expression_shape_fail(ctx, macro_name, invocation, substituted,
+                                                expansion_start, expansion_end,
+                                                "expression_missing", value);
+    }
+    return expression;
+}
+
 static void rust_macro_walk_expansion(RustLSPContext *ctx, RustMacroExpansionContext context,
-                                      TSNode root) {
+                                       TSNode root, const char *macro_name, TSNode invocation,
+                                       const char *substituted, size_t expansion_start,
+                                       size_t expansion_end) {
+    if (context == RUST_MACRO_CONTEXT_EXPRESSION) {
+        TSNode expression =
+            rust_macro_expression_subtree(ctx, root, macro_name, invocation, substituted,
+                                          expansion_start, expansion_end);
+        if (!ts_node_is_null(expression)) {
+            rust_resolve_calls_in_node(ctx, expression);
+        }
+        return;
+    }
     if (context == RUST_MACRO_CONTEXT_ITEM) {
         uint32_t count = ts_node_child_count(root);
         for (uint32_t i = 0; i < count; i++) {
@@ -5192,7 +5393,6 @@ static void rust_macro_walk_expansion(RustLSPContext *ctx, RustMacroExpansionCon
 
 /* Re-parse a user macro's exact transcriber body in the invocation's Rust
  * grammar context, then walk only the resulting synthetic tree for calls. */
-extern const TSLanguage *tree_sitter_rust(void);
 static void rust_expand_user_macro(RustLSPContext *ctx, const char *mname, TSNode invocation) {
     if (!ctx || !mname || !ctx->macro_rules_arr)
         return;
@@ -5343,7 +5543,10 @@ static void rust_expand_user_macro(RustLSPContext *ctx, const char *mname, TSNod
         return;
     }
 
-    char *wrapped = rust_macro_wrap_expansion(ctx, context, substituted);
+    size_t expansion_start = 0;
+    size_t expansion_end = 0;
+    char *wrapped =
+        rust_macro_wrap_expansion(ctx, context, substituted, &expansion_start, &expansion_end);
     if (!wrapped) {
         rust_macro_expansion_pop(ctx, mname, substituted);
         ts_parser_delete(parser);
@@ -5395,7 +5598,8 @@ static void rust_expand_user_macro(RustLSPContext *ctx, const char *mname, TSNod
     ctx->source = wrapped;
     ctx->source_len = (int)wrapped_len;
     ctx->inject_syn_calls++;
-    rust_macro_walk_expansion(ctx, context, root);
+    rust_macro_walk_expansion(ctx, context, root, mname, invocation, substituted, expansion_start,
+                              expansion_end);
     ctx->inject_syn_calls--;
     ctx->source = saved_source;
     ctx->source_len = saved_len;
