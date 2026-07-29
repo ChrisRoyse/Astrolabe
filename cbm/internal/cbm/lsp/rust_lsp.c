@@ -2816,6 +2816,7 @@ typedef struct MacroToken {
     size_t len;
     char open;
     char close;
+    bool desugared_doc_comment;
     struct MacroToken *children;
     struct MacroToken *next;
 } MacroToken;
@@ -2921,6 +2922,256 @@ static bool macro_work(RustLSPContext *ctx, size_t units, const char *operation)
     return true;
 }
 
+typedef enum {
+    MACRO_DOC_COMMENT_NONE = 0,
+    MACRO_DOC_COMMENT_OUTER_LINE,
+    MACRO_DOC_COMMENT_INNER_LINE,
+    MACRO_DOC_COMMENT_OUTER_BLOCK,
+    MACRO_DOC_COMMENT_INNER_BLOCK,
+} MacroDocCommentKind;
+
+static MacroDocCommentKind macro_doc_comment_kind(const char *source, size_t len, size_t pos) {
+    if (!source || pos > len || len - pos < 3 || source[pos] != '/') {
+        return MACRO_DOC_COMMENT_NONE;
+    }
+    if (source[pos + 1] == '/') {
+        if (source[pos + 2] == '!') {
+            return MACRO_DOC_COMMENT_INNER_LINE;
+        }
+        if (source[pos + 2] == '/' && (len - pos == 3 || source[pos + 3] != '/')) {
+            return MACRO_DOC_COMMENT_OUTER_LINE;
+        }
+        return MACRO_DOC_COMMENT_NONE;
+    }
+    if (source[pos + 1] != '*') {
+        return MACRO_DOC_COMMENT_NONE;
+    }
+    if (source[pos + 2] == '!') {
+        return MACRO_DOC_COMMENT_INNER_BLOCK;
+    }
+    if (source[pos + 2] == '*' && (len - pos == 3 || source[pos + 3] != '*')) {
+        return MACRO_DOC_COMMENT_OUTER_BLOCK;
+    }
+    return MACRO_DOC_COMMENT_NONE;
+}
+
+static bool macro_scan_doc_comment(RustLSPContext *ctx, const char *source, size_t len,
+                                   size_t start, MacroDocCommentKind kind,
+                                   size_t *content_start, size_t *content_end,
+                                   size_t *comment_end) {
+    if (!ctx || !source || !content_start || !content_end || !comment_end ||
+        kind == MACRO_DOC_COMMENT_NONE) {
+        if (ctx) {
+            cbm_arena_mark_failed(ctx->arena, "CBM_RUST_MACRO_TOKEN_INVALID",
+                                  "rust_lsp_macro_doc_comment_arguments", start);
+        }
+        return false;
+    }
+    bool line = kind == MACRO_DOC_COMMENT_OUTER_LINE || kind == MACRO_DOC_COMMENT_INNER_LINE;
+    if (line) {
+        size_t cursor = start + 3;
+        while (cursor < len && source[cursor] != '\n') {
+            if (source[cursor] == '\r') {
+                if (cursor + 1 < len && source[cursor + 1] == '\n') {
+                    break;
+                }
+                cbm_arena_mark_failed(ctx->arena, "CBM_RUST_MACRO_TOKEN_INVALID",
+                                      "rust_lsp_macro_doc_comment_carriage_return", cursor);
+                return false;
+            }
+            cursor++;
+        }
+        *content_start = start + 3;
+        *content_end = cursor;
+        *comment_end = cursor;
+        return true;
+    }
+
+    size_t cursor = start + 2;
+    size_t depth = 1;
+    size_t closing_start = 0;
+    while (cursor < len && depth > 0) {
+        if (cursor + 1 < len && source[cursor] == '/' && source[cursor + 1] == '*') {
+            depth++;
+            cursor += 2;
+        } else if (cursor + 1 < len && source[cursor] == '*' && source[cursor + 1] == '/') {
+            depth--;
+            closing_start = cursor;
+            cursor += 2;
+        } else {
+            if (source[cursor] == '\r') {
+                if (cursor + 1 >= len || source[cursor + 1] != '\n') {
+                    cbm_arena_mark_failed(ctx->arena, "CBM_RUST_MACRO_TOKEN_INVALID",
+                                          "rust_lsp_macro_doc_comment_carriage_return", cursor);
+                    return false;
+                }
+            }
+            cursor++;
+        }
+    }
+    if (depth != 0) {
+        cbm_arena_mark_failed(ctx->arena, "CBM_RUST_MACRO_TOKEN_INVALID",
+                              "rust_lsp_macro_unterminated_comment", len);
+        return false;
+    }
+    size_t body_start = start + 3;
+    if (body_start > closing_start) {
+        body_start = closing_start;
+    }
+    *content_start = body_start;
+    *content_end = closing_start;
+    *comment_end = cursor;
+    return true;
+}
+
+static bool macro_doc_escaped_length(RustLSPContext *ctx, const char *source, size_t start,
+                                     size_t end, size_t *escaped_len) {
+    size_t total = 0;
+    for (size_t i = start; i < end; i++) {
+        unsigned char c = (unsigned char)source[i];
+        if (c == '\r' && i + 1 < end && source[i + 1] == '\n') {
+            continue;
+        }
+        size_t additional = 1;
+        if (c == '\\' || c == '"' || c == '\n' || c == '\t') {
+            additional = 2;
+        } else if (c < 0x20 || c == 0x7f) {
+            additional = 4;
+        }
+        if (additional > SIZE_MAX - total) {
+            cbm_arena_mark_failed(ctx->arena, "CBM_RUST_MACRO_OUTPUT_OVERFLOW",
+                                  "rust_lsp_macro_doc_comment_size", end - start);
+            return false;
+        }
+        total += additional;
+    }
+    *escaped_len = total;
+    return true;
+}
+
+static bool macro_lex_doc_comment(RustLSPContext *ctx, const char *source, size_t len, size_t *pos,
+                                  MacroDocCommentKind kind, MacroToken **first,
+                                  MacroToken **last) {
+    size_t content_start = 0;
+    size_t content_end = 0;
+    size_t comment_end = 0;
+    if (!macro_scan_doc_comment(ctx, source, len, *pos, kind, &content_start, &content_end,
+                                &comment_end)) {
+        return false;
+    }
+    size_t escaped_len = 0;
+    if (!macro_doc_escaped_length(ctx, source, content_start, content_end, &escaped_len)) {
+        return false;
+    }
+    bool inner = kind == MACRO_DOC_COMMENT_INNER_LINE || kind == MACRO_DOC_COMMENT_INNER_BLOCK;
+    size_t fixed_len = inner ? 10 : 9; /* #![doc=""] or #[doc=""] */
+    if (escaped_len > SIZE_MAX - fixed_len - 1 ||
+        !macro_work(ctx, escaped_len + fixed_len, "rust_lsp_macro_doc_comment_desugar")) {
+        if (!cbm_arena_failed(ctx->arena)) {
+            cbm_arena_mark_failed(ctx->arena, "CBM_RUST_MACRO_OUTPUT_OVERFLOW",
+                                  "rust_lsp_macro_doc_comment_size", escaped_len);
+        }
+        return false;
+    }
+    size_t synthetic_len = fixed_len + escaped_len;
+    char *synthetic = (char *)cbm_arena_alloc(ctx->arena, synthetic_len + 1);
+    if (!synthetic) {
+        return false;
+    }
+    static const char hex[] = "0123456789abcdef";
+    size_t cursor = 0;
+    synthetic[cursor++] = '#';
+    if (inner) {
+        synthetic[cursor++] = '!';
+    }
+    size_t group_start = cursor;
+    synthetic[cursor++] = '[';
+    size_t doc_start = cursor;
+    memcpy(synthetic + cursor, "doc", 3);
+    cursor += 3;
+    size_t equals_start = cursor;
+    synthetic[cursor++] = '=';
+    size_t literal_start = cursor;
+    synthetic[cursor++] = '"';
+    for (size_t i = content_start; i < content_end; i++) {
+        unsigned char c = (unsigned char)source[i];
+        if (c == '\r' && i + 1 < content_end && source[i + 1] == '\n') {
+            continue;
+        }
+        if (c == '\\' || c == '"') {
+            synthetic[cursor++] = '\\';
+            synthetic[cursor++] = (char)c;
+        } else if (c == '\n') {
+            synthetic[cursor++] = '\\';
+            synthetic[cursor++] = 'n';
+        } else if (c == '\t') {
+            synthetic[cursor++] = '\\';
+            synthetic[cursor++] = 't';
+        } else if (c < 0x20 || c == 0x7f) {
+            synthetic[cursor++] = '\\';
+            synthetic[cursor++] = 'x';
+            synthetic[cursor++] = hex[c >> 4];
+            synthetic[cursor++] = hex[c & 0x0f];
+        } else {
+            synthetic[cursor++] = (char)c;
+        }
+    }
+    synthetic[cursor++] = '"';
+    size_t literal_end = cursor;
+    synthetic[cursor++] = ']';
+    synthetic[cursor] = '\0';
+    if (cursor != synthetic_len) {
+        cbm_arena_mark_failed(ctx->arena, "CBM_RUST_MACRO_STACK_CORRUPT",
+                              "rust_lsp_macro_doc_comment_layout", cursor);
+        return false;
+    }
+
+    MacroToken *hash = (MacroToken *)macro_arena_zalloc(ctx, sizeof(*hash),
+                                                        "rust_lsp_macro_doc_hash_token");
+    MacroToken *bang = inner ? (MacroToken *)macro_arena_zalloc(
+                                   ctx, sizeof(*bang), "rust_lsp_macro_doc_bang_token")
+                             : NULL;
+    MacroToken *group = (MacroToken *)macro_arena_zalloc(ctx, sizeof(*group),
+                                                         "rust_lsp_macro_doc_group_token");
+    MacroToken *doc = (MacroToken *)macro_arena_zalloc(ctx, sizeof(*doc),
+                                                       "rust_lsp_macro_doc_name_token");
+    MacroToken *equals = (MacroToken *)macro_arena_zalloc(ctx, sizeof(*equals),
+                                                          "rust_lsp_macro_doc_equals_token");
+    MacroToken *literal = (MacroToken *)macro_arena_zalloc(ctx, sizeof(*literal),
+                                                           "rust_lsp_macro_doc_literal_token");
+    if (!hash || (inner && !bang) || !group || !doc || !equals || !literal) {
+        return false;
+    }
+    hash->text = synthetic;
+    hash->len = 1;
+    hash->desugared_doc_comment = true;
+    if (inner) {
+        hash->next = bang;
+        bang->text = synthetic + 1;
+        bang->len = 1;
+        bang->next = group;
+    } else {
+        hash->next = group;
+    }
+    group->text = synthetic + group_start;
+    group->len = synthetic_len - group_start;
+    group->open = '[';
+    group->close = ']';
+    group->children = doc;
+    doc->text = synthetic + doc_start;
+    doc->len = 3;
+    doc->next = equals;
+    equals->text = synthetic + equals_start;
+    equals->len = 1;
+    equals->next = literal;
+    literal->text = synthetic + literal_start;
+    literal->len = literal_end - literal_start;
+    *first = hash;
+    *last = group;
+    *pos = comment_end;
+    return true;
+}
+
 static bool macro_token_text_is(const MacroToken *token, const char *text) {
     size_t len = strlen(text);
     return token && !token->open && token->len == len && memcmp(token->text, text, len) == 0;
@@ -2942,6 +3193,9 @@ static bool macro_skip_trivia(RustLSPContext *ctx, const char *source, size_t le
             continue;
         }
         if (c == '/' && *pos + 1 < len && source[*pos + 1] == '/') {
+            if (macro_doc_comment_kind(source, len, *pos) != MACRO_DOC_COMMENT_NONE) {
+                break;
+            }
             *pos += 2;
             while (*pos < len && source[*pos] != '\n') {
                 (*pos)++;
@@ -2949,6 +3203,9 @@ static bool macro_skip_trivia(RustLSPContext *ctx, const char *source, size_t le
             continue;
         }
         if (c == '/' && *pos + 1 < len && source[*pos + 1] == '*') {
+            if (macro_doc_comment_kind(source, len, *pos) != MACRO_DOC_COMMENT_NONE) {
+                break;
+            }
             size_t depth = 1;
             *pos += 2;
             while (*pos < len && depth > 0) {
@@ -3271,6 +3528,17 @@ static bool macro_lex_list(RustLSPContext *ctx, const char *source, size_t len, 
         if (!macro_work(ctx, 1, "rust_lsp_macro_tokenize")) {
             return false;
         }
+        MacroDocCommentKind doc_kind = macro_doc_comment_kind(source, len, *pos);
+        if (doc_kind != MACRO_DOC_COMMENT_NONE) {
+            MacroToken *doc_first = NULL;
+            MacroToken *doc_last = NULL;
+            if (!macro_lex_doc_comment(ctx, source, len, pos, doc_kind, &doc_first, &doc_last)) {
+                return false;
+            }
+            *tail = doc_first;
+            tail = &doc_last->next;
+            continue;
+        }
         MacroToken *token =
             (MacroToken *)macro_arena_zalloc(ctx, sizeof(*token), "rust_lsp_macro_token");
         if (!token) {
@@ -3309,9 +3577,121 @@ static bool macro_lex_list(RustLSPContext *ctx, const char *source, size_t len, 
     return true;
 }
 
-static bool macro_lex(RustLSPContext *ctx, const char *source, size_t len, MacroToken **out) {
+static bool macro_lex_raw(RustLSPContext *ctx, const char *source, size_t len, MacroToken **out) {
     size_t pos = 0;
     return macro_lex_list(ctx, source, len, &pos, 0, out) && pos == len;
+}
+
+static bool macro_tokens_have_desugared_doc_comment(const MacroToken *tokens) {
+    for (const MacroToken *token = tokens; token; token = token->next) {
+        if (token->desugared_doc_comment ||
+            (token->open && macro_tokens_have_desugared_doc_comment(token->children))) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool macro_canonical_length(RustLSPContext *ctx, const MacroToken *tokens,
+                                   size_t *length) {
+    size_t total = 0;
+    bool first = true;
+    for (const MacroToken *token = tokens; token; token = token->next) {
+        size_t token_len = token->len;
+        if (token->open) {
+            size_t children_len = 0;
+            if (!macro_canonical_length(ctx, token->children, &children_len) ||
+                children_len > SIZE_MAX - 2) {
+                if (!cbm_arena_failed(ctx->arena)) {
+                    cbm_arena_mark_failed(ctx->arena, "CBM_RUST_MACRO_OUTPUT_OVERFLOW",
+                                          "rust_lsp_macro_canonical_token_tree", children_len);
+                }
+                return false;
+            }
+            token_len = children_len + 2;
+        }
+        size_t separator_len = first ? 0 : 1;
+        if (separator_len > SIZE_MAX - total || token_len > SIZE_MAX - total - separator_len) {
+            cbm_arena_mark_failed(ctx->arena, "CBM_RUST_MACRO_OUTPUT_OVERFLOW",
+                                  "rust_lsp_macro_canonical_token_stream", token_len);
+            return false;
+        }
+        total += separator_len + token_len;
+        first = false;
+    }
+    *length = total;
+    return true;
+}
+
+static void macro_canonical_write(const MacroToken *tokens, char *buffer, size_t *cursor) {
+    bool first = true;
+    for (const MacroToken *token = tokens; token; token = token->next) {
+        if (!first) {
+            buffer[(*cursor)++] = ' ';
+        }
+        if (token->open) {
+            buffer[(*cursor)++] = token->open;
+            macro_canonical_write(token->children, buffer, cursor);
+            buffer[(*cursor)++] = token->close;
+        } else if (token->len) {
+            memcpy(buffer + *cursor, token->text, token->len);
+            *cursor += token->len;
+        }
+        first = false;
+    }
+}
+
+/* Doc comments are tokenized into arena-owned synthetic attributes.  A stream
+ * containing both source-backed and synthetic token pointers cannot safely use
+ * pointer subtraction for fragment captures or transcriber spans.  Canonicalize
+ * that stream once and re-lex it so every token in the operation shares one
+ * contiguous address domain.  Ordinary streams retain their exact source. */
+static bool macro_lex(RustLSPContext *ctx, const char *source, size_t len, MacroToken **out,
+                      const char **canonical_source, size_t *canonical_len) {
+    MacroToken *tokens = NULL;
+    if (!macro_lex_raw(ctx, source, len, &tokens)) {
+        return false;
+    }
+    const char *selected_source = source;
+    size_t selected_len = len;
+    if (macro_tokens_have_desugared_doc_comment(tokens)) {
+        size_t normalized_len = 0;
+        if (!macro_canonical_length(ctx, tokens, &normalized_len) ||
+            !macro_work(ctx, normalized_len ? normalized_len : 1,
+                        "rust_lsp_macro_doc_comment_canonicalize")) {
+            return false;
+        }
+        char *normalized = (char *)cbm_arena_alloc(ctx->arena, normalized_len + 1);
+        if (!normalized) {
+            return false;
+        }
+        size_t cursor = 0;
+        macro_canonical_write(tokens, normalized, &cursor);
+        if (cursor != normalized_len) {
+            cbm_arena_mark_failed(ctx->arena, "CBM_RUST_MACRO_STACK_CORRUPT",
+                                  "rust_lsp_macro_canonical_token_layout", cursor);
+            return false;
+        }
+        normalized[cursor] = '\0';
+        if (!macro_lex_raw(ctx, normalized, normalized_len, &tokens) ||
+            macro_tokens_have_desugared_doc_comment(tokens)) {
+            if (!cbm_arena_failed(ctx->arena)) {
+                cbm_arena_mark_failed(ctx->arena, "CBM_RUST_MACRO_STACK_CORRUPT",
+                                      "rust_lsp_macro_canonical_token_relex", normalized_len);
+            }
+            return false;
+        }
+        selected_source = normalized;
+        selected_len = normalized_len;
+    }
+    *out = tokens;
+    if (canonical_source) {
+        *canonical_source = selected_source;
+    }
+    if (canonical_len) {
+        *canonical_len = selected_len;
+    }
+    return true;
 }
 
 static bool macro_tokens_equal(const MacroToken *left, const MacroToken *right) {
@@ -4142,8 +4522,8 @@ static MacroMatchStatus macro_pattern_match(MacroEnv *env, const char *pattern, 
                                             const char *input, size_t input_len) {
     MacroToken *pattern_tokens = NULL;
     MacroToken *input_tokens = NULL;
-    if (!macro_lex(env->ctx, pattern, pattern_len, &pattern_tokens) ||
-        !macro_lex(env->ctx, input, input_len, &input_tokens)) {
+    if (!macro_lex(env->ctx, pattern, pattern_len, &pattern_tokens, NULL, NULL) ||
+        !macro_lex(env->ctx, input, input_len, &input_tokens, NULL, NULL)) {
         return MACRO_FATAL;
     }
     env->bindings = NULL;
@@ -4477,12 +4857,16 @@ static bool macro_substitute_span(RustLSPContext *ctx, const MacroToken *tokens,
 
 static char *macro_substitute(MacroEnv *env, const char *transcriber, size_t transcriber_len) {
     MacroToken *tokens = NULL;
-    if (!macro_lex(env->ctx, transcriber, transcriber_len, &tokens)) {
+    const char *canonical_transcriber = NULL;
+    size_t canonical_transcriber_len = 0;
+    if (!macro_lex(env->ctx, transcriber, transcriber_len, &tokens, &canonical_transcriber,
+                   &canonical_transcriber_len)) {
         return NULL;
     }
     MacroOutput out = {0};
-    if (!macro_substitute_span(env->ctx, tokens, transcriber, transcriber + transcriber_len, env,
-                               NULL, &out)) {
+    if (!macro_substitute_span(env->ctx, tokens, canonical_transcriber,
+                               canonical_transcriber + canonical_transcriber_len, env, NULL,
+                               &out)) {
         return NULL;
     }
     if (!out.data && !macro_output_reserve(env->ctx, &out, 0)) {
@@ -5048,9 +5432,14 @@ static bool rust_known_macro_parse_args(RustLSPContext *ctx, const char *macro_n
                                         const char *source, size_t source_len,
                                         RustKnownMacroArg **out_args, size_t *out_count) {
     MacroToken *tokens = NULL;
-    if (!macro_lex(ctx, source, source_len, &tokens)) {
+    const char *canonical_source = NULL;
+    size_t canonical_source_len = 0;
+    if (!macro_lex(ctx, source, source_len, &tokens, &canonical_source,
+                   &canonical_source_len)) {
         return false;
     }
+    source = canonical_source;
+    source_len = canonical_source_len;
 
     if (source_len > (size_t)INT_MAX || source_len > UINT32_MAX) {
         cbm_arena_mark_failed(ctx->arena, "CBM_RUST_KNOWN_MACRO_EXPRESSION_OVERFLOW",
