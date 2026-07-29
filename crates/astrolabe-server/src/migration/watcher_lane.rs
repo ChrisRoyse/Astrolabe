@@ -108,7 +108,7 @@ pub(crate) fn run_incremental_watcher_loop(shutdown: Arc<AtomicBool>) -> Result<
                 tracing::info!(
                     project = %registration.project,
                     root = %registration.root,
-                    verification = status.get("verification").and_then(Value::as_str),
+                    verification = status.get("verification").and_then(|value| value.as_str()),
                     "incremental_watcher.catch_up_scheduled"
                 );
             }
