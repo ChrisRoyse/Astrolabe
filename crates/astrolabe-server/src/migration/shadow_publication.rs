@@ -206,8 +206,13 @@ impl ShadowPublication {
         dial: MigrationDial,
         sanitized_index_args: &str,
     ) -> Result<ShadowImportOutcome, DynError> {
-        if self.seed_lower_repair.is_some() {
+        let repaired_unchanged_generation =
+            self.seed_lower_repair.is_some() && !outcome.publication_required;
+        let prior_live_source_sha256 = repaired_unchanged_generation
+            .then(|| outcome.content_freshness_watermark_sha256.clone());
+        if repaired_unchanged_generation {
             outcome.publication_required = true;
+            outcome.publication_reason = "seed_lower_repair";
         }
         if !outcome.publication_required {
             return self.discard_unchanged(outcome);
@@ -295,12 +300,31 @@ impl ShadowPublication {
                 Ok(validation) => validation,
                 Err(error) => return Err(self.abort_error("staged readback validation", error)),
             };
+        // An exact content/Git no-op normally binds the prior live source hash because
+        // its staged SQLite container is discarded. A staged lower repair changes that
+        // transaction into a real publication: bind it to the exact checkpointed
+        // candidate source that will be installed, never to the prior generation.
+        if repaired_unchanged_generation {
+            eprintln!(
+                "astro.shadow.publication_identity project={} generation={} reason={} prior_live_source_sha256={} candidate_source_sha256={}",
+                self.project,
+                self.generation,
+                outcome.publication_reason,
+                prior_live_source_sha256.as_deref().unwrap_or("absent"),
+                source_hash,
+            );
+            outcome.content_freshness_watermark_sha256 = source_hash.clone();
+        }
         if source_hash != outcome.content_freshness_watermark_sha256 {
             return Err(self.abort_error(
                 "pre-publication source readback",
                 format!(
-                    "ASTRO_SHADOW_PUBLICATION_SOURCE_HASH_MISMATCH: staged CBM source hash {source_hash} differs from validated import watermark {}",
-                    outcome.content_freshness_watermark_sha256
+                    "ASTRO_SHADOW_PUBLICATION_SOURCE_HASH_MISMATCH: project={:?}, generation={}, publication_reason={}, staged_source_sha256={source_hash}, validated_import_source_sha256={}, prior_live_source_sha256={}; remediation: preserve the staged and live generations, inspect which exact source identity changed, and retry only from one authoritative generation",
+                    self.project,
+                    self.generation,
+                    outcome.publication_reason,
+                    outcome.content_freshness_watermark_sha256,
+                    prior_live_source_sha256.as_deref().unwrap_or("not-applicable"),
                 ),
             ));
         }
@@ -342,7 +366,9 @@ impl ShadowPublication {
         if let Err(error) = self.write_journal(
             "validated",
             json!({
+                "publication_reason": outcome.publication_reason,
                 "source_sha256": source_hash,
+                "prior_live_source_sha256": prior_live_source_sha256,
                 "lowered_sha256": lowered_hash,
                 "lowered_vault_fingerprint_sha256": lowered_vault_fingerprint,
                 "vault_tree_sha256": vault_hash,
@@ -496,6 +522,7 @@ impl ShadowPublication {
         self.write_journal(
             "complete",
             json!({
+                "publication_reason": outcome.publication_reason,
                 "source_sha256": source_hash,
                 "lowered_sha256": lowered_hash,
                 "vault_tree_sha256": vault_hash,

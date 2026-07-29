@@ -70,6 +70,9 @@ pub(crate) struct ShadowImportOutcome {
     /// publication then validates and preserves the live artifacts before
     /// discarding the stage.
     pub(crate) publication_required: bool,
+    /// Machine-readable reason for either publishing the staged generation or
+    /// proving that the existing live generation can be retained unchanged.
+    pub(crate) publication_reason: &'static str,
     pub(crate) vault_dir: PathBuf,
     pub(crate) vault_id: String,
     pub(crate) vault_salt: String,
@@ -1595,6 +1598,7 @@ pub(crate) fn import_shadow_vault_with_archaeology_at(
         let kernel_context = read_required_shadow_json(cache_dir, project, "kernel_context_json")?;
         return Ok(ShadowImportOutcome {
             publication_required: false,
+            publication_reason: "unchanged",
             vault_dir,
             vault_id: SHADOW_VAULT_ID.to_string(),
             vault_salt,
@@ -1820,6 +1824,7 @@ pub(crate) fn import_shadow_vault_with_archaeology_at(
 
     Ok(ShadowImportOutcome {
         publication_required: true,
+        publication_reason: "source_or_derived_changed",
         vault_dir,
         vault_id: SHADOW_VAULT_ID.to_string(),
         vault_salt,
@@ -2962,6 +2967,7 @@ pub(crate) fn grounding_summary(outcome: &ShadowImportOutcome) -> Value {
     json!({
         "status": status,
         "writes_skipped": !outcome.publication_required,
+        "publication_reason": outcome.publication_reason,
         "sqlite_nodes": outcome.sqlite_nodes,
         "sqlite_edges": outcome.sqlite_edges,
         "constellation_inputs": outcome.constellation_inputs,
