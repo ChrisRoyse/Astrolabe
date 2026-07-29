@@ -2801,9 +2801,9 @@ static void rust_collect_macro_rules(RustLSPContext *ctx, TSNode root) {
  * This is a deterministic, fail-closed macro_rules! subset.  The lexer keeps
  * Rust token trees intact, the matcher validates every non-terminal with the
  * Rust grammar, captures are invocation-local arena records, and repetition
- * cardinality is preserved exactly.  Nested repetitions and metavariable
- * expressions are deliberately rejected until implemented; rejecting a file
- * is preferable to publishing a plausible but false graph. */
+ * cardinality and nesting are preserved exactly.  Metavariable expressions
+ * remain deliberately rejected until implemented; rejecting a file is
+ * preferable to publishing a plausible but false graph. */
 
 typedef enum {
     MACRO_NO_MATCH = 0,
@@ -2820,20 +2820,48 @@ typedef struct MacroToken {
     struct MacroToken *next;
 } MacroToken;
 
+typedef struct MacroNesting {
+    const MacroToken *repetition;
+    size_t iteration;
+    size_t depth;
+    const struct MacroNesting *parent;
+} MacroNesting;
+
+typedef struct MacroRepeatShape {
+    const MacroToken *repetition;
+    size_t depth;
+    const struct MacroRepeatShape *parent;
+} MacroRepeatShape;
+
+typedef struct MacroBinding {
+    const char *name;
+    size_t name_len;
+    const MacroRepeatShape *shape;
+    struct MacroBinding *previous;
+} MacroBinding;
+
 typedef struct MacroCapture {
     const char *name;
     size_t name_len;
     const char *value;
     size_t value_len;
-    const MacroToken *repetition;
-    size_t iteration;
+    const MacroNesting *nesting;
     struct MacroCapture *previous;
 } MacroCapture;
+
+typedef struct MacroCardinality {
+    const MacroToken *repetition;
+    const MacroNesting *parent;
+    size_t count;
+    struct MacroCardinality *previous;
+} MacroCardinality;
 
 typedef struct {
     RustLSPContext *ctx;
     TSParser *fragment_parser;
+    MacroBinding *bindings;
     MacroCapture *captures;
+    MacroCardinality *cardinalities;
     const char *macro_name;
     uint32_t invocation_byte;
 } MacroEnv;
@@ -2847,6 +2875,7 @@ typedef struct MacroEndpoint {
 typedef struct MacroRepeatState {
     const MacroToken *input;
     MacroCapture *captures;
+    MacroCardinality *cardinalities;
     size_t count;
     struct MacroRepeatState *previous;
 } MacroRepeatState;
@@ -3163,35 +3192,134 @@ static bool macro_name_equal(const MacroCapture *capture, const MacroToken *name
            memcmp(capture->name, name->text, name->len) == 0;
 }
 
+static bool macro_binding_name_equal(const MacroBinding *binding, const MacroToken *name) {
+    return binding && name && !name->open && binding->name_len == name->len &&
+           memcmp(binding->name, name->text, name->len) == 0;
+}
+
+static const MacroNesting *macro_nesting_at_depth(const MacroNesting *nesting, size_t depth) {
+    while (nesting && nesting->depth > depth) {
+        nesting = nesting->parent;
+    }
+    return nesting && nesting->depth == depth ? nesting : NULL;
+}
+
+static const MacroRepeatShape *macro_shape_at_depth(const MacroRepeatShape *shape, size_t depth) {
+    while (shape && shape->depth > depth) {
+        shape = shape->parent;
+    }
+    return shape && shape->depth == depth ? shape : NULL;
+}
+
+static bool macro_nesting_equal(const MacroNesting *left, const MacroNesting *right) {
+    size_t left_depth = left ? left->depth : 0;
+    size_t right_depth = right ? right->depth : 0;
+    if (left_depth != right_depth) {
+        return false;
+    }
+    while (left && right) {
+        if (left->repetition != right->repetition || left->iteration != right->iteration) {
+            return false;
+        }
+        left = left->parent;
+        right = right->parent;
+    }
+    return !left && !right;
+}
+
+static bool macro_shape_matches_nesting_prefix(const MacroRepeatShape *shape,
+                                               const MacroNesting *nesting) {
+    size_t nesting_depth = nesting ? nesting->depth : 0;
+    size_t shape_depth = shape ? shape->depth : 0;
+    if (nesting_depth > shape_depth) {
+        return false;
+    }
+    for (size_t depth = 1; depth <= nesting_depth; depth++) {
+        const MacroRepeatShape *shape_frame = macro_shape_at_depth(shape, depth);
+        const MacroNesting *nesting_frame = macro_nesting_at_depth(nesting, depth);
+        if (!shape_frame || !nesting_frame ||
+            shape_frame->repetition != nesting_frame->repetition) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool macro_shape_matches_nesting_exact(const MacroRepeatShape *shape,
+                                              const MacroNesting *nesting) {
+    size_t shape_depth = shape ? shape->depth : 0;
+    size_t nesting_depth = nesting ? nesting->depth : 0;
+    return shape_depth == nesting_depth && macro_shape_matches_nesting_prefix(shape, nesting);
+}
+
+static MacroBinding *macro_find_binding(const MacroEnv *env, const MacroToken *name) {
+    for (MacroBinding *binding = env->bindings; binding; binding = binding->previous) {
+        if (macro_binding_name_equal(binding, name)) {
+            return binding;
+        }
+    }
+    return NULL;
+}
+
 static MacroCapture *macro_find_capture(const MacroEnv *env, const MacroToken *name,
-                                        const MacroToken *repetition, size_t iteration) {
+                                        const MacroNesting *nesting) {
     for (MacroCapture *capture = env->captures; capture; capture = capture->previous) {
-        if (macro_name_equal(capture, name) && capture->repetition == repetition &&
-            (!repetition || capture->iteration == iteration)) {
+        if (macro_name_equal(capture, name) && macro_nesting_equal(capture->nesting, nesting)) {
             return capture;
         }
     }
     return NULL;
 }
 
+static MacroCardinality *macro_find_cardinality(const MacroEnv *env, const MacroToken *repetition,
+                                                const MacroNesting *parent) {
+    for (MacroCardinality *cardinality = env->cardinalities; cardinality;
+         cardinality = cardinality->previous) {
+        if (cardinality->repetition == repetition &&
+            macro_nesting_equal(cardinality->parent, parent)) {
+            return cardinality;
+        }
+    }
+    return NULL;
+}
+
+static bool macro_record_cardinality(MacroEnv *env, const MacroToken *repetition,
+                                     const MacroNesting *parent, size_t count) {
+    if (macro_find_cardinality(env, repetition, parent)) {
+        cbm_arena_mark_failed(env->ctx->arena, "CBM_RUST_MACRO_DUPLICATE_BINDING",
+                              "rust_lsp_macro_repetition_cardinality", count);
+        return false;
+    }
+    MacroCardinality *cardinality = (MacroCardinality *)macro_arena_zalloc(
+        env->ctx, sizeof(*cardinality), "rust_lsp_macro_cardinality");
+    if (!cardinality) {
+        return false;
+    }
+    cardinality->repetition = repetition;
+    cardinality->parent = parent;
+    cardinality->count = count;
+    cardinality->previous = env->cardinalities;
+    env->cardinalities = cardinality;
+    return true;
+}
+
 static bool macro_bind_capture(MacroEnv *env, const MacroToken *name, const char *value,
-                               size_t value_len, const MacroToken *repetition, size_t iteration) {
+                               size_t value_len, const MacroNesting *nesting) {
     if (!name || name->open || name->len == 0) {
         cbm_arena_mark_failed(env->ctx->arena, "CBM_RUST_MACRO_PATTERN_UNSUPPORTED",
                               "rust_lsp_macro_empty_metavariable", 0);
         return false;
     }
-    if (macro_find_capture(env, name, repetition, iteration)) {
+    MacroBinding *binding = macro_find_binding(env, name);
+    if (!binding || !macro_shape_matches_nesting_exact(binding->shape, nesting)) {
+        cbm_arena_mark_failed(env->ctx->arena, "CBM_RUST_MACRO_DUPLICATE_BINDING",
+                              "rust_lsp_macro_matcher_nesting", name->len);
+        return false;
+    }
+    if (macro_find_capture(env, name, nesting)) {
         cbm_arena_mark_failed(env->ctx->arena, "CBM_RUST_MACRO_DUPLICATE_BINDING",
                               "rust_lsp_macro_matcher_binding", name->len);
         return false;
-    }
-    for (MacroCapture *capture = env->captures; capture; capture = capture->previous) {
-        if (macro_name_equal(capture, name) && capture->repetition != repetition) {
-            cbm_arena_mark_failed(env->ctx->arena, "CBM_RUST_MACRO_DUPLICATE_BINDING",
-                                  "rust_lsp_macro_matcher_nesting", name->len);
-            return false;
-        }
     }
     MacroCapture *capture =
         (MacroCapture *)macro_arena_zalloc(env->ctx, sizeof(*capture), "rust_lsp_macro_capture");
@@ -3202,8 +3330,7 @@ static bool macro_bind_capture(MacroEnv *env, const MacroToken *name, const char
     capture->name_len = name->len;
     capture->value = value;
     capture->value_len = value_len;
-    capture->repetition = repetition;
-    capture->iteration = iteration;
+    capture->nesting = nesting;
     capture->previous = env->captures;
     env->captures = capture;
     return true;
@@ -3376,14 +3503,108 @@ static size_t macro_capture_length(const MacroToken *first, const MacroToken *la
 }
 
 static MacroMatchStatus macro_match_sequence(MacroEnv *env, const MacroToken *pattern,
-                                             const MacroToken *input,
-                                             const MacroToken *outer_repetition,
-                                             size_t outer_iteration, bool require_end,
-                                             const MacroToken **out_input);
+                                             const MacroToken *input, const MacroNesting *nesting,
+                                             bool require_end, const MacroToken **out_input);
 
 static bool macro_repeat_operator(const MacroToken *token) {
     return macro_token_text_is(token, "*") || macro_token_text_is(token, "+") ||
            macro_token_text_is(token, "?");
+}
+
+static bool macro_repetition_parts(const MacroToken *group, const MacroToken **separator,
+                                   const MacroToken **operator_token) {
+    *separator = NULL;
+    *operator_token = group ? group->next : NULL;
+    if (*operator_token && !macro_repeat_operator(*operator_token)) {
+        *separator = *operator_token;
+        *operator_token = (*operator_token)->next;
+    }
+    return group && group->open == '(' && *operator_token &&
+           macro_repeat_operator(*operator_token) && !(*separator && (*separator)->open);
+}
+
+static bool macro_register_binding(MacroEnv *env, const MacroToken *name,
+                                   const MacroRepeatShape *shape) {
+    if (macro_find_binding(env, name)) {
+        cbm_arena_mark_failed(env->ctx->arena, "CBM_RUST_MACRO_DUPLICATE_BINDING",
+                              "rust_lsp_macro_matcher_declaration", name ? name->len : 0);
+        return false;
+    }
+    MacroBinding *binding =
+        (MacroBinding *)macro_arena_zalloc(env->ctx, sizeof(*binding), "rust_lsp_macro_binding");
+    if (!binding) {
+        return false;
+    }
+    binding->name = name->text;
+    binding->name_len = name->len;
+    binding->shape = shape;
+    binding->previous = env->bindings;
+    env->bindings = binding;
+    return true;
+}
+
+static bool macro_register_matcher_bindings(MacroEnv *env, const MacroToken *tokens,
+                                            const MacroRepeatShape *shape) {
+    for (const MacroToken *token = tokens; token;) {
+        if (macro_token_text_is(token, "$")) {
+            const MacroToken *name_or_group = token->next;
+            if (!name_or_group) {
+                cbm_arena_mark_failed(env->ctx->arena, "CBM_RUST_MACRO_PATTERN_UNSUPPORTED",
+                                      "rust_lsp_macro_dangling_dollar", token->len);
+                return false;
+            }
+            if (name_or_group->open == '(') {
+                const MacroToken *separator = NULL;
+                const MacroToken *operator_token = NULL;
+                if (!macro_repetition_parts(name_or_group, &separator, &operator_token)) {
+                    cbm_arena_mark_failed(env->ctx->arena, "CBM_RUST_MACRO_PATTERN_UNSUPPORTED",
+                                          "rust_lsp_macro_repetition_operator", name_or_group->len);
+                    return false;
+                }
+                if (macro_token_text_is(operator_token, "?") && separator) {
+                    cbm_arena_mark_failed(env->ctx->arena, "CBM_RUST_MACRO_PATTERN_UNSUPPORTED",
+                                          "rust_lsp_macro_question_separator", separator->len);
+                    return false;
+                }
+                MacroRepeatShape *inner_shape = (MacroRepeatShape *)macro_arena_zalloc(
+                    env->ctx, sizeof(*inner_shape), "rust_lsp_macro_repeat_shape");
+                if (!inner_shape) {
+                    return false;
+                }
+                inner_shape->repetition = name_or_group;
+                inner_shape->depth = shape ? shape->depth + 1 : 1;
+                inner_shape->parent = shape;
+                if (!macro_register_matcher_bindings(env, name_or_group->children, inner_shape)) {
+                    return false;
+                }
+                token = operator_token->next;
+                continue;
+            }
+            if (name_or_group->open || !macro_token_is_identifier(name_or_group) ||
+                !name_or_group->next || !macro_token_text_is(name_or_group->next, ":") ||
+                !name_or_group->next->next || name_or_group->next->next->open) {
+                cbm_arena_mark_failed(env->ctx->arena, "CBM_RUST_MACRO_PATTERN_UNSUPPORTED",
+                                      "rust_lsp_macro_metavariable_syntax", name_or_group->len);
+                return false;
+            }
+            const MacroToken *fragment = name_or_group->next->next;
+            if (!macro_fragment_supported(fragment)) {
+                cbm_arena_mark_failed(env->ctx->arena, "CBM_RUST_MACRO_FRAGMENT_UNSUPPORTED",
+                                      "rust_lsp_macro_matcher_fragment", fragment->len);
+                return false;
+            }
+            if (!macro_register_binding(env, name_or_group, shape)) {
+                return false;
+            }
+            token = fragment->next;
+            continue;
+        }
+        if (token->open && !macro_register_matcher_bindings(env, token->children, shape)) {
+            return false;
+        }
+        token = token->next;
+    }
+    return true;
 }
 
 static bool macro_boundary_token_matches(const MacroToken *pattern, const MacroToken *input) {
@@ -3448,14 +3669,8 @@ static bool macro_fragment_endpoint_possible(const MacroToken *pattern_after,
 static MacroMatchStatus macro_match_repetition(
     MacroEnv *env, const MacroToken *group, const MacroToken *separator,
     const MacroToken *operator_token, const MacroToken *pattern_after, const MacroToken *input,
-    const MacroToken *outer_repetition, size_t outer_iteration, bool require_end,
-    const MacroToken **out_input) {
+    const MacroNesting *outer_nesting, bool require_end, const MacroToken **out_input) {
     RustLSPContext *ctx = env->ctx;
-    if (outer_repetition) {
-        cbm_arena_mark_failed(ctx->arena, "CBM_RUST_MACRO_NESTED_REPETITION_UNSUPPORTED",
-                              "rust_lsp_macro_matcher_repetition", group->len);
-        return MACRO_FATAL;
-    }
     if (macro_token_text_is(operator_token, "?") && separator) {
         cbm_arena_mark_failed(ctx->arena, "CBM_RUST_MACRO_PATTERN_UNSUPPORTED",
                               "rust_lsp_macro_question_separator", separator->len);
@@ -3466,6 +3681,7 @@ static MacroMatchStatus macro_match_repetition(
     MacroRepeatState initial = {
         .input = input,
         .captures = env->captures,
+        .cardinalities = env->cardinalities,
         .count = 0,
         .previous = NULL,
     };
@@ -3477,14 +3693,25 @@ static MacroMatchStatus macro_match_repetition(
             return MACRO_FATAL;
         }
         env->captures = state->captures;
+        env->cardinalities = state->cardinalities;
+        MacroNesting *body_nesting = (MacroNesting *)macro_arena_zalloc(ctx, sizeof(*body_nesting),
+                                                                        "rust_lsp_macro_nesting");
+        if (!body_nesting) {
+            return MACRO_FATAL;
+        }
+        body_nesting->repetition = group;
+        body_nesting->iteration = state->count;
+        body_nesting->depth = outer_nesting ? outer_nesting->depth + 1 : 1;
+        body_nesting->parent = outer_nesting;
         const MacroToken *body_after = NULL;
-        MacroMatchStatus body_status = macro_match_sequence(env, group->children, cursor, group,
-                                                            state->count, false, &body_after);
+        MacroMatchStatus body_status =
+            macro_match_sequence(env, group->children, cursor, body_nesting, false, &body_after);
         if (body_status == MACRO_FATAL) {
             return MACRO_FATAL;
         }
         if (body_status != MACRO_MATCH || body_after == cursor) {
             env->captures = state->captures;
+            env->cardinalities = state->cardinalities;
             break;
         }
         MacroRepeatState *next = (MacroRepeatState *)macro_arena_zalloc(
@@ -3494,6 +3721,7 @@ static MacroMatchStatus macro_match_repetition(
         }
         next->input = body_after;
         next->captures = env->captures;
+        next->cardinalities = env->cardinalities;
         next->count = state->count + 1;
         next->previous = state;
         state = next;
@@ -3511,9 +3739,12 @@ static MacroMatchStatus macro_match_repetition(
             continue;
         }
         env->captures = candidate->captures;
-        MacroMatchStatus suffix =
-            macro_match_sequence(env, pattern_after, candidate->input, outer_repetition,
-                                 outer_iteration, require_end, out_input);
+        env->cardinalities = candidate->cardinalities;
+        if (!macro_record_cardinality(env, group, outer_nesting, candidate->count)) {
+            return MACRO_FATAL;
+        }
+        MacroMatchStatus suffix = macro_match_sequence(env, pattern_after, candidate->input,
+                                                       outer_nesting, require_end, out_input);
         if (suffix == MACRO_MATCH) {
             return MACRO_MATCH;
         }
@@ -3522,14 +3753,13 @@ static MacroMatchStatus macro_match_repetition(
         }
     }
     env->captures = initial.captures;
+    env->cardinalities = initial.cardinalities;
     return MACRO_NO_MATCH;
 }
 
 static MacroMatchStatus macro_match_sequence(MacroEnv *env, const MacroToken *pattern,
-                                             const MacroToken *input,
-                                             const MacroToken *outer_repetition,
-                                             size_t outer_iteration, bool require_end,
-                                             const MacroToken **out_input) {
+                                             const MacroToken *input, const MacroNesting *nesting,
+                                             bool require_end, const MacroToken **out_input) {
     RustLSPContext *ctx = env->ctx;
     if (!macro_work(ctx, 1, "rust_lsp_macro_match")) {
         return MACRO_FATAL;
@@ -3541,6 +3771,7 @@ static MacroMatchStatus macro_match_sequence(MacroEnv *env, const MacroToken *pa
     }
     ctx->macro_match_depth++;
     MacroCapture *entry_captures = env->captures;
+    MacroCardinality *entry_cardinalities = env->cardinalities;
     MacroMatchStatus status = MACRO_NO_MATCH;
 
     while (pattern) {
@@ -3567,8 +3798,8 @@ static MacroMatchStatus macro_match_sequence(MacroEnv *env, const MacroToken *pa
                     goto done;
                 }
                 status = macro_match_repetition(env, name_or_group, separator, operator_token,
-                                                operator_token->next, input, outer_repetition,
-                                                outer_iteration, require_end, out_input);
+                                                operator_token->next, input, nesting, require_end,
+                                                out_input);
                 goto done;
             }
             if (name_or_group->open || !macro_token_is_identifier(name_or_group) ||
@@ -3601,7 +3832,8 @@ static MacroMatchStatus macro_match_sequence(MacroEnv *env, const MacroToken *pa
                     goto done;
                 }
                 const MacroToken *after = cursor->next;
-                if (macro_fragment_endpoint_possible(pattern_after, outer_repetition, require_end,
+                const MacroToken *active_repetition = nesting ? nesting->repetition : NULL;
+                if (macro_fragment_endpoint_possible(pattern_after, active_repetition, require_end,
                                                      after)) {
                     MacroEndpoint *endpoint = (MacroEndpoint *)macro_arena_zalloc(
                         ctx, sizeof(*endpoint), "rust_lsp_macro_endpoint");
@@ -3630,13 +3862,12 @@ static MacroMatchStatus macro_match_sequence(MacroEnv *env, const MacroToken *pa
                     continue;
                 }
                 env->captures = fragment_entry_captures;
-                if (!macro_bind_capture(env, name_or_group, value, value_len, outer_repetition,
-                                        outer_iteration)) {
+                if (!macro_bind_capture(env, name_or_group, value, value_len, nesting)) {
                     status = MACRO_FATAL;
                     goto done;
                 }
-                status = macro_match_sequence(env, pattern_after, endpoint->after, outer_repetition,
-                                              outer_iteration, require_end, out_input);
+                status = macro_match_sequence(env, pattern_after, endpoint->after, nesting,
+                                              require_end, out_input);
                 if (status != MACRO_NO_MATCH) {
                     goto done;
                 }
@@ -3644,13 +3875,12 @@ static MacroMatchStatus macro_match_sequence(MacroEnv *env, const MacroToken *pa
             if (macro_is_fragment(fragment, "vis")) {
                 env->captures = fragment_entry_captures;
                 const char *empty_at = input ? input->text : fragment->text + fragment->len;
-                if (!macro_bind_capture(env, name_or_group, empty_at, 0, outer_repetition,
-                                        outer_iteration)) {
+                if (!macro_bind_capture(env, name_or_group, empty_at, 0, nesting)) {
                     status = MACRO_FATAL;
                     goto done;
                 }
-                status = macro_match_sequence(env, pattern_after, input, outer_repetition,
-                                              outer_iteration, require_end, out_input);
+                status = macro_match_sequence(env, pattern_after, input, nesting, require_end,
+                                              out_input);
                 if (status != MACRO_NO_MATCH) {
                     goto done;
                 }
@@ -3669,8 +3899,8 @@ static MacroMatchStatus macro_match_sequence(MacroEnv *env, const MacroToken *pa
                 goto done;
             }
             const MacroToken *child_after = NULL;
-            status = macro_match_sequence(env, pattern->children, input->children, outer_repetition,
-                                          outer_iteration, true, &child_after);
+            status = macro_match_sequence(env, pattern->children, input->children, nesting, true,
+                                          &child_after);
             if (status != MACRO_MATCH) {
                 goto done;
             }
@@ -3689,6 +3919,7 @@ static MacroMatchStatus macro_match_sequence(MacroEnv *env, const MacroToken *pa
 done:
     if (status == MACRO_NO_MATCH) {
         env->captures = entry_captures;
+        env->cardinalities = entry_cardinalities;
     }
     ctx->macro_match_depth--;
     return status;
@@ -3702,8 +3933,14 @@ static MacroMatchStatus macro_pattern_match(MacroEnv *env, const char *pattern, 
         !macro_lex(env->ctx, input, input_len, &input_tokens)) {
         return MACRO_FATAL;
     }
+    env->bindings = NULL;
+    env->captures = NULL;
+    env->cardinalities = NULL;
+    if (!macro_register_matcher_bindings(env, pattern_tokens, NULL)) {
+        return MACRO_FATAL;
+    }
     const MacroToken *after = NULL;
-    return macro_match_sequence(env, pattern_tokens, input_tokens, NULL, 0, true, &after);
+    return macro_match_sequence(env, pattern_tokens, input_tokens, NULL, true, &after);
 }
 
 static bool macro_output_reserve(RustLSPContext *ctx, MacroOutput *out, size_t additional) {
@@ -3751,7 +3988,8 @@ static bool macro_output_append(RustLSPContext *ctx, MacroOutput *out, const cha
 }
 
 static bool macro_repetition_driver(RustLSPContext *ctx, const MacroToken *tokens,
-                                    const MacroEnv *env, const MacroToken **driver, size_t *count) {
+                                    const MacroEnv *env, const MacroNesting *selection,
+                                    const MacroToken **driver, size_t *count) {
     for (const MacroToken *token = tokens; token; token = token->next) {
         if (macro_token_text_is(token, "$")) {
             const MacroToken *next = token->next;
@@ -3761,23 +3999,18 @@ static bool macro_repetition_driver(RustLSPContext *ctx, const MacroToken *token
                 return false;
             }
             if (next->open) {
-                cbm_arena_mark_failed(ctx->arena, "CBM_RUST_MACRO_NESTED_REPETITION_UNSUPPORTED",
-                                      "rust_lsp_macro_transcriber_repetition", next->len);
-                return false;
+                if (!macro_repetition_driver(ctx, next->children, env, selection, driver, count)) {
+                    return false;
+                }
+                token = next;
+                continue;
             }
             if (macro_token_text_is(next, "crate")) {
                 token = next;
                 continue;
             }
-            MacroCapture *capture = NULL;
-            for (MacroCapture *candidate = env->captures; candidate;
-                 candidate = candidate->previous) {
-                if (macro_name_equal(candidate, next)) {
-                    capture = candidate;
-                    break;
-                }
-            }
-            if (!capture) {
+            MacroBinding *binding = macro_find_binding(env, next);
+            if (!binding) {
                 fprintf(stderr,
                         "ERROR level=error msg=rust_macro.metavariable_unbound "
                         "code=CBM_RUST_MACRO_UNBOUND_METAVARIABLE macro=%s "
@@ -3788,31 +4021,34 @@ static bool macro_repetition_driver(RustLSPContext *ctx, const MacroToken *token
                                       "rust_lsp_macro_transcriber_repetition", next->len);
                 return false;
             }
-            if (!capture->repetition) {
+            size_t selection_depth = selection ? selection->depth : 0;
+            size_t binding_depth = binding->shape ? binding->shape->depth : 0;
+            if (binding_depth <= selection_depth ||
+                !macro_shape_matches_nesting_prefix(binding->shape, selection)) {
                 cbm_arena_mark_failed(ctx->arena, "CBM_RUST_MACRO_REPETITION_NESTING_MISMATCH",
                                       "rust_lsp_macro_scalar_in_repetition", next->len);
                 return false;
             }
-            size_t capture_count = 0;
-            for (MacroCapture *candidate = env->captures; candidate;
-                 candidate = candidate->previous) {
-                if (macro_name_equal(candidate, next) &&
-                    candidate->repetition == capture->repetition &&
-                    candidate->iteration + 1 > capture_count) {
-                    capture_count = candidate->iteration + 1;
-                }
+            const MacroRepeatShape *next_shape =
+                macro_shape_at_depth(binding->shape, selection_depth + 1);
+            MacroCardinality *cardinality =
+                next_shape ? macro_find_cardinality(env, next_shape->repetition, selection) : NULL;
+            if (!cardinality) {
+                cbm_arena_mark_failed(ctx->arena, "CBM_RUST_MACRO_REPETITION_CARDINALITY_MISSING",
+                                      "rust_lsp_macro_transcriber_repetition", next->len);
+                return false;
             }
             if (!*driver) {
-                *driver = capture->repetition;
-                *count = capture_count;
-            } else if (*driver != capture->repetition || *count != capture_count) {
+                *driver = next_shape->repetition;
+                *count = cardinality->count;
+            } else if (*driver != next_shape->repetition || *count != cardinality->count) {
                 cbm_arena_mark_failed(ctx->arena, "CBM_RUST_MACRO_REPETITION_CARDINALITY_MISMATCH",
                                       "rust_lsp_macro_transcriber_repetition", next->len);
                 return false;
             }
             token = next;
         } else if (token->open &&
-                   !macro_repetition_driver(ctx, token->children, env, driver, count)) {
+                   !macro_repetition_driver(ctx, token->children, env, selection, driver, count)) {
             return false;
         }
     }
@@ -3821,8 +4057,7 @@ static bool macro_repetition_driver(RustLSPContext *ctx, const MacroToken *token
 
 static bool macro_substitute_span(RustLSPContext *ctx, const MacroToken *tokens,
                                   const char *span_start, const char *span_end, const MacroEnv *env,
-                                  const MacroToken *active_repetition, size_t active_iteration,
-                                  MacroOutput *out) {
+                                  const MacroNesting *selection, MacroOutput *out) {
     const char *cursor = span_start;
     for (const MacroToken *token = tokens; token;) {
         if (token->text < cursor || token->text + token->len > span_end) {
@@ -3841,20 +4076,9 @@ static bool macro_substitute_span(RustLSPContext *ctx, const MacroToken *tokens,
                 return false;
             }
             if (name_or_group->open) {
-                if (active_repetition) {
-                    cbm_arena_mark_failed(ctx->arena,
-                                          "CBM_RUST_MACRO_NESTED_REPETITION_UNSUPPORTED",
-                                          "rust_lsp_macro_transcriber_nested", name_or_group->len);
-                    return false;
-                }
                 const MacroToken *separator = NULL;
-                const MacroToken *operator_token = name_or_group->next;
-                if (operator_token && !macro_repeat_operator(operator_token)) {
-                    separator = operator_token;
-                    operator_token = operator_token->next;
-                }
-                if (!operator_token || !macro_repeat_operator(operator_token) ||
-                    (separator && separator->open)) {
+                const MacroToken *operator_token = NULL;
+                if (!macro_repetition_parts(name_or_group, &separator, &operator_token)) {
                     cbm_arena_mark_failed(ctx->arena, "CBM_RUST_MACRO_TRANSCRIBER_UNSUPPORTED",
                                           "rust_lsp_macro_transcriber_operator",
                                           name_or_group->len);
@@ -3862,13 +4086,23 @@ static bool macro_substitute_span(RustLSPContext *ctx, const MacroToken *tokens,
                 }
                 const MacroToken *driver = NULL;
                 size_t count = 0;
-                if (!macro_repetition_driver(ctx, name_or_group->children, env, &driver, &count)) {
+                if (!macro_repetition_driver(ctx, name_or_group->children, env, selection, &driver,
+                                             &count)) {
                     return false;
                 }
                 if (!driver) {
                     cbm_arena_mark_failed(ctx->arena, "CBM_RUST_MACRO_REPETITION_WITHOUT_DRIVER",
                                           "rust_lsp_macro_transcriber_repetition",
                                           name_or_group->len);
+                    return false;
+                }
+                const MacroToken *matcher_separator = NULL;
+                const MacroToken *matcher_operator = NULL;
+                if (!macro_repetition_parts(driver, &matcher_separator, &matcher_operator) ||
+                    !macro_tokens_equal(operator_token, matcher_operator)) {
+                    cbm_arena_mark_failed(ctx->arena, "CBM_RUST_MACRO_REPETITION_NESTING_MISMATCH",
+                                          "rust_lsp_macro_transcriber_operator",
+                                          operator_token->len);
                     return false;
                 }
                 if ((macro_token_text_is(operator_token, "+") && count == 0) ||
@@ -3890,8 +4124,14 @@ static bool macro_substitute_span(RustLSPContext *ctx, const MacroToken *tokens,
                     }
                     const char *inner_start = name_or_group->text + 1;
                     const char *inner_end = name_or_group->text + name_or_group->len - 1;
+                    MacroNesting inner_selection = {
+                        .repetition = driver,
+                        .iteration = iteration,
+                        .depth = selection ? selection->depth + 1 : 1,
+                        .parent = selection,
+                    };
                     if (!macro_substitute_span(ctx, name_or_group->children, inner_start, inner_end,
-                                               env, driver, iteration, out)) {
+                                               env, &inner_selection, out)) {
                         return false;
                     }
                 }
@@ -3909,8 +4149,13 @@ static bool macro_substitute_span(RustLSPContext *ctx, const MacroToken *tokens,
                     return false;
                 }
             } else {
-                MacroCapture *capture =
-                    macro_find_capture(env, name_or_group, active_repetition, active_iteration);
+                MacroBinding *binding = macro_find_binding(env, name_or_group);
+                if (!binding || !macro_shape_matches_nesting_exact(binding->shape, selection)) {
+                    cbm_arena_mark_failed(ctx->arena, "CBM_RUST_MACRO_REPETITION_NESTING_MISMATCH",
+                                          "rust_lsp_macro_transcriber_nesting", name_or_group->len);
+                    return false;
+                }
+                MacroCapture *capture = macro_find_capture(env, name_or_group, selection);
                 if (!capture) {
                     fprintf(stderr,
                             "ERROR level=error msg=rust_macro.metavariable_unbound "
@@ -3918,8 +4163,8 @@ static bool macro_substitute_span(RustLSPContext *ctx, const MacroToken *tokens,
                             "metavariable=%.*s invocation_byte=%u phase=transcriber "
                             "active_repetition=%s iteration=%zu\n",
                             env->macro_name ? env->macro_name : "none", (int)name_or_group->len,
-                            name_or_group->text, env->invocation_byte,
-                            active_repetition ? "true" : "false", active_iteration);
+                            name_or_group->text, env->invocation_byte, selection ? "true" : "false",
+                            selection ? selection->iteration : 0);
                     cbm_arena_mark_failed(ctx->arena, "CBM_RUST_MACRO_UNBOUND_METAVARIABLE",
                                           "rust_lsp_macro_transcriber", name_or_group->len);
                     return false;
@@ -3942,8 +4187,7 @@ static bool macro_substitute_span(RustLSPContext *ctx, const MacroToken *tokens,
         if (token->open) {
             if (!macro_output_append(ctx, out, token->text, 1) ||
                 !macro_substitute_span(ctx, token->children, token->text + 1,
-                                       token->text + token->len - 1, env, active_repetition,
-                                       active_iteration, out) ||
+                                       token->text + token->len - 1, env, selection, out) ||
                 !macro_output_append(ctx, out, token->text + token->len - 1, 1)) {
                 return false;
             }
@@ -3963,7 +4207,7 @@ static char *macro_substitute(MacroEnv *env, const char *transcriber, size_t tra
     }
     MacroOutput out = {0};
     if (!macro_substitute_span(env->ctx, tokens, transcriber, transcriber + transcriber_len, env,
-                               NULL, 0, &out)) {
+                               NULL, &out)) {
         return NULL;
     }
     if (!out.data && !macro_output_reserve(env->ctx, &out, 0)) {
