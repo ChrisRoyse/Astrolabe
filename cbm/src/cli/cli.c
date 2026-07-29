@@ -2910,18 +2910,58 @@ const char *cbm_config_get(cbm_config_t *cfg, const char *key, const char *defau
     return result;
 }
 
+cbm_config_bool_status_t cbm_config_parse_bool_strict(const char *value, bool *out) {
+    if (!value || !out) {
+        return CBM_CONFIG_BOOL_INVALID;
+    }
+    if (strcmp(value, "true") == 0 || strcmp(value, "1") == 0 || strcmp(value, "on") == 0) {
+        *out = true;
+        return CBM_CONFIG_BOOL_OK;
+    }
+    if (strcmp(value, "false") == 0 || strcmp(value, "0") == 0 || strcmp(value, "off") == 0) {
+        *out = false;
+        return CBM_CONFIG_BOOL_OK;
+    }
+    return CBM_CONFIG_BOOL_INVALID;
+}
+
+cbm_config_bool_status_t cbm_config_get_bool_strict(cbm_config_t *cfg, const char *key,
+                                                    bool default_val, bool *out) {
+    if (!cfg || !key || !out) {
+        return CBM_CONFIG_BOOL_READ_FAILED;
+    }
+
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(cfg->db, "SELECT value FROM config WHERE key = ?", SQL_NUL_TERM, &stmt,
+                           NULL) != SQLITE_OK) {
+        return CBM_CONFIG_BOOL_READ_FAILED;
+    }
+    if (sqlite3_bind_text(stmt, SQL_PARAM_1, key, SQL_NUL_TERM, cbm_sqlite_transient) !=
+        SQLITE_OK) {
+        sqlite3_finalize(stmt);
+        return CBM_CONFIG_BOOL_READ_FAILED;
+    }
+
+    cbm_config_bool_status_t status = CBM_CONFIG_BOOL_READ_FAILED;
+    int step = sqlite3_step(stmt);
+    if (step == SQLITE_DONE) {
+        *out = default_val;
+        status = CBM_CONFIG_BOOL_OK;
+    } else if (step == SQLITE_ROW) {
+        const char *value = (const char *)sqlite3_column_text(stmt, 0);
+        status = cbm_config_parse_bool_strict(value, out);
+    }
+    if (sqlite3_finalize(stmt) != SQLITE_OK && status == CBM_CONFIG_BOOL_OK) {
+        return CBM_CONFIG_BOOL_READ_FAILED;
+    }
+    return status;
+}
+
 bool cbm_config_get_bool(cbm_config_t *cfg, const char *key, bool default_val) {
-    const char *val = cbm_config_get(cfg, key, NULL);
-    if (!val) {
-        return default_val;
-    }
-    if (strcmp(val, "true") == 0 || strcmp(val, "1") == 0 || strcmp(val, "on") == 0) {
-        return true;
-    }
-    if (strcmp(val, "false") == 0 || strcmp(val, "0") == 0 || strcmp(val, "off") == 0) {
-        return false;
-    }
-    return default_val;
+    bool value = default_val;
+    return cbm_config_get_bool_strict(cfg, key, default_val, &value) == CBM_CONFIG_BOOL_OK
+               ? value
+               : default_val;
 }
 
 int cbm_config_get_int(cbm_config_t *cfg, const char *key, int default_val) {

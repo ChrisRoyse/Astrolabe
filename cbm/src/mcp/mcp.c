@@ -10613,13 +10613,18 @@ static void detect_session(cbm_mcp_server_t *srv) {
 }
 
 /* auto_watch config: gates background watcher registration (default on).
- * Multi-project users can contain a session to its own project with
- * `config set auto_watch false`. */
-static bool auto_watch_enabled(cbm_mcp_server_t *srv) {
-    if (!srv->config) {
-        return true; /* default on */
+ * Absence alone selects the default. A present malformed row or SQLite read
+ * fault fails closed so native registration cannot disagree with the fused
+ * Rust resident lane. */
+static cbm_config_bool_status_t read_auto_watch_policy(cbm_mcp_server_t *srv, bool *enabled) {
+    if (!enabled) {
+        return CBM_CONFIG_BOOL_INVALID;
     }
-    return cbm_config_get_bool(srv->config, CBM_CONFIG_AUTO_WATCH, true);
+    if (!srv->config) {
+        *enabled = true;
+        return CBM_CONFIG_BOOL_OK;
+    }
+    return cbm_config_get_bool_strict(srv->config, CBM_CONFIG_AUTO_WATCH, true, enabled);
 }
 
 /* Register the session project with the background watcher for ongoing
@@ -10628,7 +10633,19 @@ static void register_watcher_if_enabled(cbm_mcp_server_t *srv) {
     if (!srv->watcher || srv->session_project[0] == '\0' || srv->session_root[0] == '\0') {
         return;
     }
-    if (!auto_watch_enabled(srv)) {
+    bool enabled = false;
+    cbm_config_bool_status_t policy = read_auto_watch_policy(srv, &enabled);
+    if (policy != CBM_CONFIG_BOOL_OK) {
+        cbm_log_error("watcher.register.refused", "code",
+                      policy == CBM_CONFIG_BOOL_INVALID ? "CBM_AUTO_WATCH_CONFIG_INVALID"
+                                                        : "CBM_AUTO_WATCH_CONFIG_READ_FAILED",
+                      "key", CBM_CONFIG_AUTO_WATCH, "message",
+                      "the persisted auto_watch policy could not be read as a boolean",
+                      "remediation",
+                      "repair the exact auto_watch row in _config.db before watcher registration");
+        return;
+    }
+    if (!enabled) {
         cbm_log_info("watcher.register.skipped", "reason", "auto_watch_off", "project",
                      srv->session_project);
         return;

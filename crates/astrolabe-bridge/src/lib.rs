@@ -326,6 +326,30 @@ pub fn cbm_cache_dir() -> Result<PathBuf, BridgeError> {
     Ok(resolved)
 }
 
+/// Parses a persisted libcbm boolean through the native parser shared with the
+/// standalone watch-registration path.
+///
+/// This deliberately has no default: callers decide whether an absent row has
+/// a documented default before invoking it, while every present malformed row
+/// is returned as a named error.
+pub fn parse_cbm_config_bool_strict(value: &str) -> Result<bool, BridgeError> {
+    initialize_cbm_allocator()?;
+    let value_c = CString::new(value)?;
+    let mut parsed = false;
+    // SAFETY: value_c is a live NUL-terminated string and parsed is a live bool
+    // output for the duration of the call.
+    let status = unsafe { cbm_sys::cbm_config_parse_bool_strict(value_c.as_ptr(), &mut parsed) };
+    if status == 0 {
+        Ok(parsed)
+    } else {
+        Err(envelope(
+            "ASTRO_CONFIG_BOOL_INVALID",
+            format!("persisted config value {value:?} is not one of true, 1, on, false, 0, or off"),
+            "Repair or remove the exact malformed config row before retrying; Astrolabe will not substitute a default for present invalid state.",
+        ))
+    }
+}
+
 pub fn cbm_memory_budget_bytes() -> Result<usize, BridgeError> {
     initialize_cbm_allocator()?;
     // SAFETY: these CBM functions are process-global budget initializers/readers

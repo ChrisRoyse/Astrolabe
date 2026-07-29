@@ -1,6 +1,21 @@
 use super::*;
 
 pub(crate) const CONFIG_KEY_PREFIX: &str = "astrolabe.calyx.";
+pub(crate) const AUTO_WATCH_CONFIG_KEY: &str = "auto_watch";
+
+#[derive(Debug)]
+pub(crate) struct AutoWatchPolicyError {
+    pub(crate) code: &'static str,
+    message: String,
+}
+
+impl std::fmt::Display for AutoWatchPolicyError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}: {}", self.code, self.message)
+    }
+}
+
+impl std::error::Error for AutoWatchPolicyError {}
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub(crate) enum MigrationDial {
@@ -45,6 +60,29 @@ pub(crate) fn read_config_u64(
              default for persisted invalid state."
         )
         .into()
+    })
+}
+
+pub(crate) fn read_auto_watch_policy_at(cache_dir: &Path) -> Result<bool, AutoWatchPolicyError> {
+    let Some(value) = read_config_value(cache_dir, AUTO_WATCH_CONFIG_KEY).map_err(|error| {
+        AutoWatchPolicyError {
+            code: "ASTRO_AUTO_WATCH_POLICY_READ_FAILED",
+            message: format!(
+                "the persisted config key {AUTO_WATCH_CONFIG_KEY:?} could not be read from {}: {error}. Remediation: inspect SQLite integrity and repair the exact config store before automatic watcher work can resume.",
+                cache_dir.join("_config.db").display()
+            ),
+        }
+    })? else {
+        return Ok(true);
+    };
+    astrolabe_bridge::parse_cbm_config_bool_strict(&value).map_err(|error| {
+        AutoWatchPolicyError {
+            code: "ASTRO_AUTO_WATCH_POLICY_INVALID",
+            message: format!(
+                "persisted config key {AUTO_WATCH_CONFIG_KEY:?} is invalid: {error}. Remediation: repair or remove that exact row in {} before automatic watcher work can resume.",
+                cache_dir.join("_config.db").display()
+            ),
+        }
     })
 }
 

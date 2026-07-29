@@ -3975,6 +3975,12 @@ unsafe extern "C" {
     ) -> *mut ::std::os::raw::c_char;
 }
 unsafe extern "C" {
+    pub fn cbm_config_parse_bool_strict(
+        value: *const ::std::os::raw::c_char,
+        out: *mut bool,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
     pub fn cbm_free_string(value: *mut ::std::os::raw::c_char);
 }
 unsafe extern "C" {

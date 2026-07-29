@@ -33,6 +33,9 @@ CBM_API int cbm_cmd_install(int argc, char **argv);
 CBM_API int cbm_cmd_uninstall(int argc, char **argv);
 CBM_API int cbm_cmd_update(int argc, char **argv);
 CBM_API char *cbm_build_install_plan_json(const char *home, const char *binary_path);
+/* Single strict persisted-boolean parser shared by libcbm and the Rust host.
+ * Returns CBM_CONFIG_BOOL_OK (0) on success and never substitutes a default. */
+CBM_API int cbm_config_parse_bool_strict(const char *value, bool *out);
 /* Release a heap string returned by a CBM API through CBM's own allocator. */
 CBM_API void cbm_free_string(char *value);
 CBM_API void cbm_index_set_worker_role(bool is_worker, const char *response_out);

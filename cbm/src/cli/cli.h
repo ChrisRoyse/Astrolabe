@@ -294,6 +294,22 @@ const char *cbm_config_get(cbm_config_t *cfg, const char *key, const char *defau
 /* Get a config value as bool. "true"/"1"/"on" → true. */
 bool cbm_config_get_bool(cbm_config_t *cfg, const char *key, bool default_val);
 
+typedef enum {
+    CBM_CONFIG_BOOL_OK = 0,
+    CBM_CONFIG_BOOL_INVALID = 1,
+    CBM_CONFIG_BOOL_READ_FAILED = 2,
+} cbm_config_bool_status_t;
+
+/* Parse exactly one persisted boolean spelling. This is the shared parser for
+ * native and fused-host watcher policy; a present malformed value is never
+ * replaced by a default. */
+cbm_config_bool_status_t cbm_config_parse_bool_strict(const char *value, bool *out);
+
+/* Read one persisted boolean. Absence alone selects default_val. Invalid rows
+ * and SQLite failures are distinct fail-closed results. */
+cbm_config_bool_status_t cbm_config_get_bool_strict(cbm_config_t *cfg, const char *key,
+                                                    bool default_val, bool *out);
+
 /* Get a config value as int. Returns default_val if not found or invalid. */
 int cbm_config_get_int(cbm_config_t *cfg, const char *key, int default_val);
 

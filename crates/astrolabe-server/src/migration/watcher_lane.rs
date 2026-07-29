@@ -29,8 +29,40 @@ pub(crate) fn run_incremental_watcher_loop(shutdown: Arc<AtomicBool>) -> Result<
             .map_err(watcher_bridge_error)
     })?;
     let mut registered = BTreeMap::<String, String>::new();
+    let mut prior_policy_observation = None::<String>;
 
     while !shutdown.load(Ordering::Relaxed) {
+        let policy = read_auto_watch_policy_at(&cache_dir);
+        let observation = match &policy {
+            Ok(true) => "enabled".to_string(),
+            Ok(false) => "disabled".to_string(),
+            Err(error) => format!("error:{error}"),
+        };
+        if prior_policy_observation.as_deref() != Some(observation.as_str()) {
+            match &policy {
+                Ok(true) => tracing::info!(
+                    key = AUTO_WATCH_CONFIG_KEY,
+                    "incremental_watcher.policy_enabled"
+                ),
+                Ok(false) => tracing::info!(
+                    key = AUTO_WATCH_CONFIG_KEY,
+                    "incremental_watcher.policy_disabled"
+                ),
+                Err(error) => tracing::warn!(
+                    code = error.code,
+                    key = AUTO_WATCH_CONFIG_KEY,
+                    error = %error,
+                    "incremental_watcher.policy_refused"
+                ),
+            }
+            prior_policy_observation = Some(observation);
+        }
+        if !matches!(policy, Ok(true)) {
+            unwatch_all(&mut watcher, &mut registered)?;
+            sleep_watcher_slice(&shutdown);
+            continue;
+        }
+
         let discovered = discover_watch_registrations(&cache_dir)?;
         let desired = discovered
             .iter()
@@ -80,16 +112,12 @@ pub(crate) fn run_incremental_watcher_loop(shutdown: Arc<AtomicBool>) -> Result<
 }
 
 fn discover_watch_registrations(cache_dir: &Path) -> Result<Vec<WatchRegistration>, DynError> {
-    let conn = open_config(cache_dir)?;
-    let pattern = format!("{CONFIG_KEY_PREFIX}%.{SHADOW_INDEX_ARGS_KEY}");
-    let mut statement =
-        conn.prepare("SELECT key, value FROM config WHERE key LIKE ? ORDER BY key")?;
-    let rows = statement.query_map(params![pattern], |row| {
-        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-    })?;
     let mut registrations = Vec::new();
-    for row in rows {
-        let (key, args_json) = row?;
+    let index_args_suffix = format!(".{SHADOW_INDEX_ARGS_KEY}");
+    for (key, args_json) in scan_config_prefix(cache_dir, CONFIG_KEY_PREFIX)? {
+        if !key.ends_with(&index_args_suffix) {
+            continue;
+        }
         let Some(project) = project_from_metadata_key(&key, SHADOW_INDEX_ARGS_KEY) else {
             continue;
         };
@@ -140,6 +168,17 @@ fn discover_watch_registrations(cache_dir: &Path) -> Result<Vec<WatchRegistratio
         });
     }
     Ok(registrations)
+}
+
+fn unwatch_all(
+    watcher: &mut CbmWatcher,
+    registered: &mut BTreeMap<String, String>,
+) -> Result<(), BridgeError> {
+    for project in registered.keys().cloned().collect::<Vec<_>>() {
+        watcher.unwatch(&project)?;
+        registered.remove(&project);
+    }
+    Ok(())
 }
 
 fn persist_registration_error(
