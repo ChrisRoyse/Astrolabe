@@ -6,6 +6,7 @@ use crate::storage_names::{SstName, classify_sst, sst_order_key};
 use calyx_core::{CalyxError, Result as CalyxResult};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Instant;
 
 /// Per-tier resolution stats for one targeted ledger point read (#1112).
@@ -328,19 +329,20 @@ impl CommitOrderedLedgerIndex {
         let path = self.files[index].path.clone();
         self.files_opened += 1;
         let lookup = ledger_sst_lookup_metadata(&path)?;
+        let (first_key, last_key) = lookup.key_range().ok_or_else(|| {
+            CalyxError::aster_corrupt_shard(format!("ledger SST {} has no keys", path.display()))
+        })?;
         let range = (
-            parse_aster_ledger_seq(&lookup.first_key)?,
-            parse_aster_ledger_seq(&lookup.last_key)?,
+            parse_aster_ledger_seq(first_key)?,
+            parse_aster_ledger_seq(last_key)?,
         );
         self.files[index].range = Some(range);
         Ok(range)
     }
 }
 
-fn ledger_sst_lookup_metadata(path: &Path) -> CalyxResult<SstLookupMetadata> {
-    SstReader::open(path)?.lookup_metadata().ok_or_else(|| {
-        CalyxError::aster_corrupt_shard(format!("ledger SST {} has no keys", path.display()))
-    })
+fn ledger_sst_lookup_metadata(path: &Path) -> CalyxResult<Arc<SstLookupMetadata>> {
+    Ok(SstReader::open(path)?.lookup_metadata())
 }
 
 fn sorted_unique_paths(

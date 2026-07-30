@@ -4116,6 +4116,47 @@ static bool macro_identifier_keyword_allowed(MacroEnv *env, const char *text, si
     return false;
 }
 
+/* A lifetime has a different lexical contract from an ordinary identifier.
+ * In particular, `'static` and `'_` are explicit Lifetime productions, while
+ * raw lifetimes admit keywords but exclude a small reserved set and require
+ * Rust 2021 or later.  Validate the complete lifetime token here so the
+ * context-aware grammar's identifier child is never reclassified as a
+ * standalone NON_KEYWORD_IDENTIFIER. */
+static bool macro_lifetime_keyword_allowed(MacroEnv *env, const char *text, size_t len) {
+    MacroToken token = {.text = text, .len = len};
+    if (!macro_token_is_lifetime(&token) || len < 2) {
+        return false;
+    }
+
+    const char *name = text + 1;
+    size_t name_len = len - 1;
+    if (macro_keyword_text_is(name, name_len, "static") ||
+        macro_keyword_text_is(name, name_len, "_")) {
+        return true;
+    }
+
+    if (name_len > 2 && name[0] == 'r' && name[1] == '#') {
+        int edition = macro_active_edition(env);
+        if (edition == 0) {
+            fprintf(stderr,
+                    "ERROR level=error msg=rust_macro.edition_unknown "
+                    "code=CBM_RUST_MACRO_EDITION_UNKNOWN macro=%s invocation_byte=%u "
+                    "lifetime=%.*s required_edition=2021\n",
+                    env->macro_name ? env->macro_name : "none", env->invocation_byte, (int)len,
+                    text);
+            cbm_arena_mark_failed(env->ctx->arena, "CBM_RUST_MACRO_EDITION_UNKNOWN",
+                                  "rust_lsp_macro_lifetime_edition", len);
+            return false;
+        }
+        return edition >= 2021 && macro_identifier_keyword_allowed(env, name, name_len);
+    }
+
+    /* `Self` is grammar-owned in type/value paths, but it is not a legal
+     * non-raw lifetime name. */
+    return !macro_keyword_text_is(name, name_len, "Self") &&
+           macro_identifier_keyword_allowed(env, name, name_len);
+}
+
 static bool macro_fragment_identifiers_valid(MacroEnv *env, TSNode root, const char *wrapped,
                                              size_t candidate_start, size_t candidate_end) {
     TSTreeCursor cursor = ts_tree_cursor_new(root);
@@ -4130,11 +4171,21 @@ static bool macro_fragment_identifiers_valid(MacroEnv *env, TSNode root, const c
             break;
         }
         const char *type = ts_node_type(node);
-        if (overlaps && ts_node_is_named(node) && node_start >= candidate_start &&
-            node_end <= candidate_end && strstr(type, "identifier") != NULL &&
-            !macro_identifier_keyword_allowed(env, wrapped + node_start, node_end - node_start)) {
+        bool wholly_inside = overlaps && node_start >= candidate_start && node_end <= candidate_end;
+        if (wholly_inside && strcmp(type, "lifetime") == 0 &&
+            !macro_lifetime_keyword_allowed(env, wrapped + node_start, node_end - node_start)) {
             valid = false;
             break;
+        }
+        if (wholly_inside && ts_node_is_named(node) && strstr(type, "identifier") != NULL) {
+            TSNode parent = ts_node_parent(node);
+            bool lifetime_child =
+                !ts_node_is_null(parent) && strcmp(ts_node_type(parent), "lifetime") == 0;
+            if (!lifetime_child && !macro_identifier_keyword_allowed(
+                                       env, wrapped + node_start, node_end - node_start)) {
+                valid = false;
+                break;
+            }
         }
         if (overlaps && ts_tree_cursor_goto_first_child(&cursor))
             continue;
@@ -5659,22 +5710,6 @@ static bool macro_repetition_driver(RustLSPContext *ctx, const MacroToken *token
                 cbm_arena_mark_failed(ctx->arena, "CBM_RUST_MACRO_REPETITION_CARDINALITY_MISMATCH",
                                       "rust_lsp_macro_transcriber_repetition", next->len);
                 return false;
-            } else if (*driver != next_shape->repetition) {
-                const MacroToken *driver_separator = NULL;
-                const MacroToken *driver_operator = NULL;
-                const MacroToken *next_separator = NULL;
-                const MacroToken *next_operator = NULL;
-                if (!macro_repetition_parts(*driver, &driver_separator, &driver_operator) ||
-                    !macro_repetition_parts(next_shape->repetition, &next_separator,
-                                            &next_operator) ||
-                    !macro_tokens_equal(driver_operator, next_operator)) {
-                    macro_log_repetition_failure(env, "CBM_RUST_MACRO_REPETITION_NESTING_MISMATCH",
-                                                 "rust_lsp_macro_transcriber_peer_operator", next,
-                                                 binding_depth, selection_depth);
-                    cbm_arena_mark_failed(ctx->arena, "CBM_RUST_MACRO_REPETITION_NESTING_MISMATCH",
-                                          "rust_lsp_macro_transcriber_peer_operator", next->len);
-                    return false;
-                }
             }
             token = next;
         } else if (token->open &&
@@ -5731,15 +5766,6 @@ static bool macro_substitute_span(RustLSPContext *ctx, const MacroToken *tokens,
                     cbm_arena_mark_failed(ctx->arena, "CBM_RUST_MACRO_REPETITION_WITHOUT_DRIVER",
                                           "rust_lsp_macro_transcriber_repetition",
                                           name_or_group->len);
-                    return false;
-                }
-                const MacroToken *matcher_separator = NULL;
-                const MacroToken *matcher_operator = NULL;
-                if (!macro_repetition_parts(driver, &matcher_separator, &matcher_operator) ||
-                    !macro_tokens_equal(operator_token, matcher_operator)) {
-                    cbm_arena_mark_failed(ctx->arena, "CBM_RUST_MACRO_REPETITION_NESTING_MISMATCH",
-                                          "rust_lsp_macro_transcriber_operator",
-                                          operator_token->len);
                     return false;
                 }
                 if ((macro_token_text_is(operator_token, "+") && count == 0) ||

@@ -170,7 +170,7 @@ where
                         "re-read the current snapshot, rebuild the injection batch, and retry with that exact sequence",
                 });
             }
-            self.commit_rows_locked_owned(rows.clone(), true)
+            self.commit_rows_locked_owned(rows, true)
         })
     }
 
@@ -227,7 +227,7 @@ where
     ) -> Result<Seq> {
         if rows.is_empty() {
             // Empty commit: do not advance the seq or stamp a time-index entry.
-            return self.commit_prepared_rows(&rows, skip_compression_guard);
+            return self.commit_prepared_rows_owned(rows, skip_compression_guard);
         }
         // Time-travel (PH72 T04): stamp this group-commit with one time-index
         // entry in the SAME batch as the data, so the (millis -> seqno) mapping
@@ -238,7 +238,7 @@ where
         let predicted = self.rows.current_seq().saturating_add(1);
         let (cf, key, value) = crate::timetravel::entry_row(self.clock.now(), predicted);
         rows.push(encode::WriteRow { cf, key, value });
-        let committed = self.commit_prepared_rows(&rows, skip_compression_guard)?;
+        let committed = self.commit_prepared_rows_owned(rows, skip_compression_guard)?;
         if committed != predicted {
             return Err(CalyxError::aster_corrupt_shard(format!(
                 "time-index seqno prediction {predicted} diverged from committed seq {committed}"
@@ -247,9 +247,9 @@ where
         Ok(committed)
     }
 
-    fn commit_prepared_rows(
+    fn commit_prepared_rows_owned(
         &self,
-        rows: &[encode::WriteRow],
+        rows: Vec<encode::WriteRow>,
         skip_compression_guard: bool,
     ) -> Result<Seq> {
         let row_count = rows.len();
@@ -285,13 +285,13 @@ where
         }
         let Some(durable) = &self.durable else {
             let mvcc = crate::commit_timing::start();
-            let seq = self.commit_rows_to_mvcc(rows, skip_compression_guard);
+            let seq = self.commit_owned_rows_to_mvcc(rows, skip_compression_guard);
             mvcc.stop("mvcc_commit_volatile", row_count, 0);
             return seq;
         };
 
         durable.ensure_disk_write_allowed(self.rows.resource_counters())?;
-        let durable_seq = durable.append_batch(rows)?;
+        let durable_seq = durable.append_batch(&rows)?;
         // Persist the durable ledger head anchor (the external witness) as part
         // of completing the WAL-backed ledger commit, BEFORE the crash-fsv
         // failpoint. #287 candidate 4 (fail closed when a non-empty durable
@@ -304,20 +304,20 @@ where
         // closed on reopen — exactly candidate 4's intended no-silent-truncation
         // behavior.
         let anchor_timer = crate::commit_timing::start();
-        if let Some(anchor) = crate::ledger_head::newest_anchor_from_rows(rows)? {
+        if let Some(anchor) = crate::ledger_head::newest_anchor_from_rows(&rows)? {
             crate::ledger_head::write_head_anchor(durable.root(), &anchor)?;
         }
         anchor_timer.stop("ledger_head_anchor", row_count, 0);
         #[cfg(any(test, feature = "crash-fsv"))]
         crash_fsv_after_wal_append(durable_seq)?;
         let mvcc = crate::commit_timing::start();
-        let mvcc_result = self.commit_rows_to_mvcc(rows, skip_compression_guard);
+        let mvcc_result = self.commit_rows_to_mvcc(&rows, skip_compression_guard);
         mvcc.stop("mvcc_commit", row_count, 0);
         let mvcc_seq = match mvcc_result {
             Ok(seq) => seq,
             Err(mvcc_error) => {
-                let restore = self.restore_committed_rows(durable_seq, rows);
-                let checkpoint = durable.checkpoint_batch(durable_seq, rows);
+                let restore = self.restore_committed_rows(durable_seq, &rows);
+                let checkpoint = durable.checkpoint_batch(durable_seq, &rows);
                 return Err(post_wal_commit_error(
                     durable_seq,
                     &mvcc_error,
@@ -332,7 +332,7 @@ where
             )));
         }
         let stage = crate::commit_timing::start();
-        durable.stage_checkpoint_batch(durable_seq, rows)?;
+        durable.stage_checkpoint_batch_owned(durable_seq, rows)?;
         stage.stop("checkpoint_stage", row_count, 0);
         // Crash boundary (#276): the batch is now in the WAL and the MVCC
         // memtable and staged for checkpoint, but its checkpoint SST + manifest
@@ -343,6 +343,19 @@ where
         Ok(mvcc_seq)
     }
 
+    fn commit_owned_rows_to_mvcc(
+        &self,
+        rows: Vec<encode::WriteRow>,
+        skip_compression_guard: bool,
+    ) -> Result<Seq> {
+        let batch = rows.into_iter().map(|row| (row.cf, row.key, row.value));
+        if skip_compression_guard {
+            self.rows.commit_batch_unguarded(batch)
+        } else {
+            self.rows.commit_batch(batch)
+        }
+    }
+
     fn commit_rows_to_mvcc(
         &self,
         rows: &[encode::WriteRow],
@@ -350,11 +363,12 @@ where
     ) -> Result<Seq> {
         let batch = rows
             .iter()
-            .map(|row| (row.cf, row.key.clone(), row.value.clone()));
+            .map(|row| (row.cf, row.key.as_slice(), row.value.as_slice()))
+            .collect::<Vec<_>>();
         if skip_compression_guard {
-            self.rows.commit_batch_unguarded(batch)
+            self.rows.commit_batch_unguarded_borrowed(&batch)
         } else {
-            self.rows.commit_batch(batch)
+            self.rows.commit_batch_borrowed(&batch)
         }
     }
 

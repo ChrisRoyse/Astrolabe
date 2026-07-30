@@ -2868,8 +2868,8 @@ impl CbmProjectTransition {
             cbm_sys::cbm_project_transition_wait_store_quiescent(
                 self.ptr.expect("live project transition").as_ptr(),
                 db_path.as_ptr(),
-                timeout_ms.into(),
-                poll_ms.into(),
+                timeout_ms,
+                poll_ms,
                 &mut report,
             )
         };

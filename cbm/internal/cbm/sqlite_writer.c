@@ -26,6 +26,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <inttypes.h>
 #include <io.h>
 #include <limits.h>
 #include <stddef.h> // NULL
@@ -50,6 +51,7 @@
  *   16KB pages → page 65537
  */
 #define SQLITE_MAX_PAGE_SIZE 65536
+#define SQLITE_MAX_PAGE_NUMBER (UINT32_MAX - 1u)
 #define CBM_PENDING_BYTE (0x40000000u)
 #define CBM_PENDING_BYTE_PAGE ((CBM_PENDING_BYTE / CBM_PAGE_SIZE) + 1)
 
@@ -190,6 +192,8 @@ typedef struct {
     bool failed;
 } WriterIo;
 
+typedef int64_t WriterOffset;
+
 static void writer_io_record_failure(WriterIo *io, const char *operation,
                                      const char *native_error_kind, unsigned long native_error) {
     if (!io || io->failed) {
@@ -214,6 +218,59 @@ static void writer_io_record_failure(WriterIo *io, const char *operation,
 static void writer_io_record_errno(WriterIo *io, const char *operation) {
     int saved = errno;
     writer_io_record_failure(io, operation, "errno", (unsigned long)(saved ? saved : EIO));
+}
+
+static void writer_io_record_seek_errno(WriterIo *io, WriterOffset offset, int origin) {
+    int saved = errno;
+    if (!io || io->failed) {
+        return;
+    }
+    io->failed = true;
+    io->failed_operation = "seek";
+    io->native_error_kind = "errno";
+    io->native_error = (unsigned long)(saved ? saved : EIO);
+
+    char native_error_buf[32];
+    char offset_buf[32];
+    char origin_buf[32];
+    (void)snprintf(native_error_buf, sizeof(native_error_buf), "%lu", io->native_error);
+    (void)snprintf(offset_buf, sizeof(offset_buf), "%" PRId64, offset);
+    (void)snprintf(origin_buf, sizeof(origin_buf), "%d", origin);
+    cbm_log_error("sqlite_writer.io_failed", "code", "CBM_SQLITE_WRITER_IO_FAILED", "operation",
+                  "seek", "path", io->path ? io->path : "", "native_error_kind", "errno",
+                  "native_error", native_error_buf, "offset_bytes", offset_buf, "origin",
+                  origin_buf, "message",
+                  "the direct SQLite writer could not durably construct the complete staging file",
+                  "remediation",
+                  "resolve the reported filesystem failure; preserve the prior live database and "
+                  "retry indexing");
+}
+
+static void writer_record_offset_failure(WriterIo *io, const char *operation, uint32_t page_num,
+                                         const char *detail) {
+    if (!io || io->failed) {
+        return;
+    }
+    io->failed = true;
+    io->failed_operation = operation;
+    io->native_error_kind = "offset_contract";
+    io->native_error = ERROR_ARITHMETIC_OVERFLOW;
+
+    char page_num_buf[32];
+    char max_page_num_buf[32];
+    char page_size_buf[32];
+    (void)snprintf(page_num_buf, sizeof(page_num_buf), "%" PRIu32, page_num);
+    (void)snprintf(max_page_num_buf, sizeof(max_page_num_buf), "%" PRIu32,
+                   (uint32_t)SQLITE_MAX_PAGE_NUMBER);
+    (void)snprintf(page_size_buf, sizeof(page_size_buf), "%u", (unsigned int)CBM_PAGE_SIZE);
+    cbm_log_error("sqlite_writer.offset_invalid", "code", "CBM_SQLITE_WRITER_OFFSET_INVALID",
+                  "operation", operation, "path", io->path ? io->path : "", "page_num",
+                  page_num_buf, "max_page_num", max_page_num_buf, "page_size", page_size_buf,
+                  "detail", detail, "message",
+                  "the direct SQLite writer rejected an unrepresentable page position before I/O",
+                  "remediation",
+                  "preserve the source corpus and report the exact page position; no database was "
+                  "published");
 }
 
 static void writer_record_allocation_failure(WriterIo *io, const char *operation,
@@ -344,15 +401,68 @@ static bool writer_io_open_create_new(WriterIo *io) {
     return true;
 }
 
-static bool writer_io_seek(WriterIo *io, long offset, int origin) {
+static bool writer_io_seek(WriterIo *io, WriterOffset offset, int origin) {
     if (!io || !io->fp || io->failed) {
         return false;
     }
     errno = 0;
-    if (fseek(io->fp, offset, origin) != 0) {
-        writer_io_record_errno(io, "seek");
+    if (_fseeki64(io->fp, offset, origin) != 0) {
+        writer_io_record_seek_errno(io, offset, origin);
         return false;
     }
+    return true;
+}
+
+static bool writer_page_offset(WriterIo *io, uint32_t page_num, WriterOffset *out_offset) {
+    if (!out_offset) {
+        writer_record_offset_failure(io, "page_offset", page_num, "output pointer is NULL");
+        return false;
+    }
+    if (page_num == 0) {
+        writer_record_offset_failure(io, "page_offset", page_num,
+                                     "SQLite page numbers are one-based");
+        return false;
+    }
+    if (page_num > SQLITE_MAX_PAGE_NUMBER) {
+        writer_record_offset_failure(io, "page_offset", page_num,
+                                     "page number exceeds the SQLite file-format maximum");
+        return false;
+    }
+    uint64_t page_index = (uint64_t)page_num - SKIP_ONE;
+    if (page_index > (uint64_t)INT64_MAX / CBM_PAGE_SIZE) {
+        writer_record_offset_failure(io, "page_offset", page_num,
+                                     "page byte offset exceeds the signed 64-bit stream domain");
+        return false;
+    }
+    *out_offset = (WriterOffset)(page_index * CBM_PAGE_SIZE);
+    return true;
+}
+
+static bool writer_io_seek_page(WriterIo *io, uint32_t page_num) {
+    WriterOffset offset = 0;
+    return writer_page_offset(io, page_num, &offset) && writer_io_seek(io, offset, SEEK_SET);
+}
+
+static bool writer_expected_file_size(WriterIo *io, uint32_t next_page,
+                                      WriterOffset *out_size) {
+    if (!out_size) {
+        writer_record_offset_failure(io, "expected_file_size", next_page,
+                                     "output pointer is NULL");
+        return false;
+    }
+    if (next_page == 0) {
+        writer_record_offset_failure(io, "expected_file_size", next_page,
+                                     "next page wrapped below the one-based page domain");
+        return false;
+    }
+    uint64_t page_count = (uint64_t)next_page - SKIP_ONE;
+    if (page_count > (uint64_t)SQLITE_MAX_PAGE_NUMBER ||
+        page_count > (uint64_t)INT64_MAX / CBM_PAGE_SIZE) {
+        writer_record_offset_failure(io, "expected_file_size", next_page,
+                                     "database size exceeds the SQLite or stream offset domain");
+        return false;
+    }
+    *out_size = (WriterOffset)(page_count * CBM_PAGE_SIZE);
     return true;
 }
 
@@ -368,12 +478,12 @@ static bool writer_io_write(WriterIo *io, const void *data, size_t size) {
     return true;
 }
 
-static long writer_io_tell(WriterIo *io) {
+static WriterOffset writer_io_tell(WriterIo *io) {
     if (!io || !io->fp || io->failed) {
         return CBM_NOT_FOUND;
     }
     errno = 0;
-    long position = ftell(io->fp);
+    WriterOffset position = _ftelli64(io->fp);
     if (position < 0) {
         writer_io_record_errno(io, "tell");
     }
@@ -813,8 +923,7 @@ static void pb_flush_leaf(PageBuilder *pb) {
     // Write page to file. Skip the pending byte page (SQLite reserved).
     pb->next_page = cbm_skip_pending_byte(pb->next_page);
     uint32_t page_num = pb->next_page;
-    long offset = (long)(page_num - SKIP_ONE) * CBM_PAGE_SIZE;
-    if (!writer_io_seek(pb->io, offset, SEEK_SET) ||
+    if (!writer_io_seek_page(pb->io, page_num) ||
         !writer_io_write(pb->io, pb->page, CBM_PAGE_SIZE)) {
         return;
     }
@@ -923,7 +1032,7 @@ static int write_interior_page(PageBuilder *pb, uint8_t *page, int cell_count, i
     page[HDR_FRAGBYTES_OFF] = 0;
     put_u32(page + HDR_RIGHTCHILD_OFF, right_child_page);
 
-    if (!writer_io_seek(pb->io, (long)(pnum - SKIP_ONE) * CBM_PAGE_SIZE, SEEK_SET) ||
+    if (!writer_io_seek_page(pb->io, pnum) ||
         !writer_io_write(pb->io, page, CBM_PAGE_SIZE)) {
         return CBM_NOT_FOUND;
     }
@@ -1231,7 +1340,7 @@ static uint32_t write_overflow_pages(WriterIo *io, uint32_t *next_page, const ui
                                      int data_len) {
     int per_page = CBM_PAGE_SIZE - BTREE_PTR_SIZE;
     uint32_t first_page = 0;
-    long prev_next_ptr_offset = -SKIP_ONE;
+    uint32_t previous_page = 0;
 
     int offset = 0;
     while (offset < data_len) {
@@ -1241,10 +1350,10 @@ static uint32_t write_overflow_pages(WriterIo *io, uint32_t *next_page, const ui
         }
 
         // Backpatch previous overflow page's next-page pointer
-        if (prev_next_ptr_offset >= 0) {
+        if (previous_page != 0) {
             uint8_t ptr[BTREE_PTR_SIZE];
             put_u32(ptr, pnum);
-            if (!writer_io_seek(io, prev_next_ptr_offset, SEEK_SET) ||
+            if (!writer_io_seek_page(io, previous_page) ||
                 !writer_io_write(io, ptr, BTREE_PTR_SIZE)) {
                 return 0;
             }
@@ -1260,9 +1369,8 @@ static uint32_t write_overflow_pages(WriterIo *io, uint32_t *next_page, const ui
         put_u32(page, 0); // next-page pointer — 0 for now, backpatched on next iteration
         memcpy(page + BTREE_PTR_SIZE, data + offset, chunk);
 
-        long page_offset = (long)(pnum - SKIP_ONE) * CBM_PAGE_SIZE;
-        prev_next_ptr_offset = page_offset;
-        if (!writer_io_seek(io, page_offset, SEEK_SET) ||
+        previous_page = pnum;
+        if (!writer_io_seek_page(io, pnum) ||
             !writer_io_write(io, page, CBM_PAGE_SIZE)) {
             return 0;
         }
@@ -1599,7 +1707,7 @@ static uint32_t write_table_btree(WriterIo *io, uint32_t *next_page, const uint8
         put_u16(page + hdr + HDR_CELLCOUNT_OFF, 0);                     // 0 cells
         put_u16(page + hdr + HDR_CONTENT_OFF, (uint16_t)CBM_PAGE_SIZE); // content at end of page
         page[hdr + HDR_FRAGBYTES_OFF] = 0;                              // 0 fragmented bytes
-        if (!writer_io_seek(io, (long)(pnum - SKIP_ONE) * CBM_PAGE_SIZE, SEEK_SET) ||
+        if (!writer_io_seek_page(io, pnum) ||
             !writer_io_write(io, page, CBM_PAGE_SIZE)) {
             return 0;
         }
@@ -1660,7 +1768,7 @@ static uint32_t write_empty_index_leaf(WriterIo *io, uint32_t *next_page) {
     put_u16(page + HDR_CELLCOUNT_OFF, 0);
     put_u16(page + HDR_CONTENT_OFF, (uint16_t)CBM_PAGE_SIZE);
     page[HDR_FRAGBYTES_OFF] = 0;
-    if (!writer_io_seek(io, (long)(pnum - SKIP_ONE) * CBM_PAGE_SIZE, SEEK_SET) ||
+    if (!writer_io_seek_page(io, pnum) ||
         !writer_io_write(io, page, CBM_PAGE_SIZE)) {
         return 0;
     }
@@ -2416,11 +2524,14 @@ static int pad_file_to_page_boundary(WriterIo *io, uint32_t next_page) {
     if (!writer_io_seek(io, 0, SEEK_END)) {
         return ERR_WRITE_FAILED;
     }
-    long file_size = writer_io_tell(io);
+    WriterOffset file_size = writer_io_tell(io);
     if (file_size < 0) {
         return ERR_WRITE_FAILED;
     }
-    long expected_size = (long)(next_page - SKIP_ONE) * CBM_PAGE_SIZE;
+    WriterOffset expected_size = 0;
+    if (!writer_expected_file_size(io, next_page, &expected_size)) {
+        return ERR_WRITE_FAILED;
+    }
     if (file_size < expected_size) {
         uint8_t zero = 0;
         if (!writer_io_seek(io, expected_size - SKIP_ONE, SEEK_SET) ||

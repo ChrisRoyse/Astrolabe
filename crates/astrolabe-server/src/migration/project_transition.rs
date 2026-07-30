@@ -6,7 +6,7 @@ use astrolabe_domain::knobs::{
 };
 
 pub(crate) const PROJECT_TRANSITION_STATUS_KEY: &str = "project_transition_json";
-const PROJECT_TRANSITION_WORKER_GRANT_SCHEMA: &str = "astrolabe-project-transition-worker-grant-v1";
+const PROJECT_TRANSITION_WORKER_GRANT_SCHEMA: &str = "astrolabe-project-transition-worker-grant-v2";
 
 #[derive(Debug, Clone)]
 pub(crate) struct ProjectTransitionWorkerGrant {
@@ -21,11 +21,11 @@ pub(crate) struct ProjectTransitionWorkerGrant {
 }
 
 impl ProjectTransitionWorkerGrant {
-    pub(crate) fn for_stage(&self, stage_cache: &Path) -> Result<Value, DynError> {
-        let canonical_stage_cache = fs::canonicalize(stage_cache).map_err(|error| {
+    pub(crate) fn for_worker_cache(&self, worker_cache: &Path) -> Result<Value, DynError> {
+        let canonical_worker_cache = fs::canonicalize(worker_cache).map_err(|error| {
             format!(
-                "ASTRO_PROJECT_TRANSITION_STAGE_UNRESOLVED: canonicalizing worker stage {} failed: {error}; remediation: preserve the shadow publication and inspect its exact stage directory",
-                stage_cache.display()
+                "ASTRO_PROJECT_TRANSITION_WORKER_CACHE_UNRESOLVED: canonicalizing worker cache {} failed: {error}; remediation: preserve the index generation and inspect its exact cache directory",
+                worker_cache.display()
             )
         })?;
         Ok(json!({
@@ -34,7 +34,7 @@ impl ProjectTransitionWorkerGrant {
             "canonical_root": self.canonical_root,
             "canonical_db_path": self.canonical_db_path,
             "receipt_cache_dir": self.receipt_cache_dir,
-            "canonical_stage_cache": canonical_stage_cache,
+            "canonical_worker_cache": canonical_worker_cache,
             "generation": self.generation,
             "owner": {
                 "pid": self.owner_pid,
@@ -50,7 +50,7 @@ struct ProjectTransitionWorkerGrantEnvelope {
     canonical_root: PathBuf,
     canonical_db_path: PathBuf,
     receipt_cache_dir: PathBuf,
-    canonical_stage_cache: PathBuf,
+    canonical_worker_cache: PathBuf,
     generation: String,
     owner: ProjectTransitionWorkerGrantOwner,
 }
@@ -63,7 +63,7 @@ struct ProjectTransitionWorkerGrantOwner {
 pub(crate) fn validate_index_worker_transition_grant(
     grant: Value,
     public_args: &Value,
-    requested_stage_cache: &Path,
+    requested_worker_cache: &Path,
 ) -> Result<String, DynError> {
     let object = grant.as_object().ok_or_else(|| -> DynError {
         "ASTRO_PROJECT_TRANSITION_WORKER_GRANT_INVALID: the private writer grant is not a JSON object; remediation: preserve the worker request and inspect the parent transition builder".into()
@@ -71,7 +71,7 @@ pub(crate) fn validate_index_worker_transition_grant(
     let expected_keys = BTreeSet::from([
         "canonical_db_path",
         "canonical_root",
-        "canonical_stage_cache",
+        "canonical_worker_cache",
         "generation",
         "owner",
         "project",
@@ -133,7 +133,7 @@ pub(crate) fn validate_index_worker_transition_grant(
         canonical_root: PathBuf::from(string_field("canonical_root")?),
         canonical_db_path: PathBuf::from(string_field("canonical_db_path")?),
         receipt_cache_dir: PathBuf::from(string_field("receipt_cache_dir")?),
-        canonical_stage_cache: PathBuf::from(string_field("canonical_stage_cache")?),
+        canonical_worker_cache: PathBuf::from(string_field("canonical_worker_cache")?),
         generation: string_field("generation")?,
         owner: ProjectTransitionWorkerGrantOwner {
             pid: owner_pid,
@@ -148,17 +148,17 @@ pub(crate) fn validate_index_worker_transition_grant(
         .into());
     }
 
-    let canonical_stage_cache = fs::canonicalize(requested_stage_cache).map_err(|error| {
+    let canonical_worker_cache = fs::canonicalize(requested_worker_cache).map_err(|error| {
         format!(
-            "ASTRO_PROJECT_TRANSITION_WORKER_STAGE_UNRESOLVED: canonicalizing worker stage {} failed: {error}; remediation: preserve the supervised request and shadow publication stage",
-            requested_stage_cache.display()
+            "ASTRO_PROJECT_TRANSITION_WORKER_CACHE_UNRESOLVED: canonicalizing worker cache {} failed: {error}; remediation: preserve the supervised request and its publication state",
+            requested_worker_cache.display()
         )
     })?;
-    if canonical_stage_cache != grant.canonical_stage_cache {
+    if canonical_worker_cache != grant.canonical_worker_cache {
         return Err(format!(
-            "ASTRO_PROJECT_TRANSITION_WORKER_STAGE_MISMATCH: worker resolved stage {} but the grant binds {}; remediation: preserve both paths and inspect the supervisor request",
-            canonical_stage_cache.display(),
-            grant.canonical_stage_cache.display()
+            "ASTRO_PROJECT_TRANSITION_WORKER_CACHE_MISMATCH: worker resolved cache {} but the grant binds {}; remediation: preserve both paths and inspect the supervisor request",
+            canonical_worker_cache.display(),
+            grant.canonical_worker_cache.display()
         )
         .into());
     }

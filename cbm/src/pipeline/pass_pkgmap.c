@@ -19,6 +19,7 @@
 #include "foundation/hash_table.h"
 #include "foundation/log.h"
 #include "foundation/platform.h"
+#include "foundation/sha256.h"
 #include "foundation/str_util.h"
 #include "foundation/win_utf8.h"
 #include "foundation/yaml.h"
@@ -39,6 +40,7 @@ enum {
     PKGMAP_INIT_CAP = 16,
     PKGMAP_HT_INIT = 64,
     PKGMAP_ITOA_BUF = 16,
+    PKGMAP_I64TOA_BUF = 32,
     /* String lengths for manifest parsing (avoid magic numbers in memcmp) */
     TOML_NAME_LEN = 4,      /* strlen("name") */
     TOML_NAME_SP = 5,       /* strlen("name ") */
@@ -53,6 +55,13 @@ enum {
 static const char *pkgmap_itoa(int val) {
     static _Thread_local char buf[PKGMAP_ITOA_BUF];
     snprintf(buf, sizeof(buf), "%d", val);
+    return buf;
+}
+
+/* Thread-local int64->string for captured byte counts in diagnostics. */
+static const char *pkgmap_i64toa(int64_t val) {
+    static _Thread_local char buf[PKGMAP_I64TOA_BUF];
+    snprintf(buf, sizeof(buf), "%lld", (long long)val);
     return buf;
 }
 
@@ -670,7 +679,7 @@ static void parse_gemspec(const char *source, int source_len, const char *rel_pa
 
 bool cbm_pkgmap_try_parse(const char *basename, const char *rel_path, const char *source,
                           int source_len, cbm_pkg_entries_t *entries) {
-    if (!basename || !source || source_len <= 0) {
+    if (!basename || !source || source_len < 0) {
         return false;
     }
 
@@ -811,11 +820,19 @@ static bool is_pkgmap_manifest_basename(const char *basename) {
 static int pkgmap_read_captured(const cbm_file_info_t *file, char **out_source, int *out_len) {
     *out_source = NULL;
     *out_len = 0;
-    if (file->size <= 0 || file->size > INT_MAX) {
+    if (file->size < 0) {
         cbm_log_error("pkgmap.failed", "code", "CBM_PKGMAP_MANIFEST_SIZE_INVALID", "rel_path",
-                      file->rel_path, "message", "a captured manifest has an unsupported size",
-                      "remediation",
-                      "reduce the manifest below the parser address limit and retry");
+                      file->rel_path, "bytes", pkgmap_i64toa(file->size), "message",
+                      "a captured manifest has a negative inventory size", "remediation",
+                      "refresh the captured repository inventory and retry");
+        return CBM_NOT_FOUND;
+    }
+    if (file->size > INT_MAX) {
+        cbm_log_error("pkgmap.failed", "code", "CBM_PKGMAP_MANIFEST_SIZE_LIMIT_EXCEEDED",
+                      "rel_path", file->rel_path, "bytes", pkgmap_i64toa(file->size), "limit",
+                      pkgmap_itoa(INT_MAX), "message",
+                      "a captured manifest exceeds the parser address limit", "remediation",
+                      "reduce the manifest to the reported limit or less and retry");
         return CBM_NOT_FOUND;
     }
     FILE *stream = cbm_fopen(file->path, "rb");
@@ -887,6 +904,7 @@ int cbm_pkgmap_build_from_files_checked(const cbm_file_info_t *files, int file_c
             }
             yyjson_doc_free(validation);
         }
+        int entries_before = entries.count;
         if (!cbm_pkgmap_try_parse(basename, files[i].rel_path, source, source_len, &entries)) {
             free(source);
             cbm_pkg_entries_free(&entries);
@@ -895,6 +913,10 @@ int cbm_pkgmap_build_from_files_checked(const cbm_file_info_t *files, int file_c
                           "a captured manifest was selected but no parser accepted it",
                           "remediation", "synchronize manifest discovery and parser registration");
             return CBM_NOT_FOUND;
+        }
+        if (entries.count == entries_before) {
+            cbm_log_info("pkgmap.manifest_no_entry", "rel_path", files[i].rel_path, "bytes",
+                         pkgmap_itoa(source_len), "outcome", "no_supported_package_entry");
         }
         free(source);
         if (entries.failed) {
@@ -1355,7 +1377,7 @@ static char *import_property_value(const char *value) {
 }
 
 char *cbm_pipeline_import_edge_properties(cbm_pipeline_ctx_t *ctx, const char *rel_path,
-                                          const CBMImport *imp) {
+                                           const CBMImport *imp) {
     const char *binding = NULL;
     const char *value = NULL;
     const char *property = NULL;
@@ -1409,7 +1431,12 @@ char *cbm_pipeline_import_edge_properties(cbm_pipeline_ctx_t *ctx, const char *r
         return NULL;
     }
 
-    size_t needed = strlen(binding) + strlen(property) + strlen(escaped) + CBM_SZ_64;
+    const char *resolution_suffix =
+        imp && imp->resolution == CBM_IMPORT_RESOLVE_BROWSER_URL
+            ? ",\"resolution_kind\":\"browser_url\""
+            : "";
+    size_t needed =
+        strlen(binding) + strlen(property) + strlen(escaped) + strlen(resolution_suffix) + CBM_SZ_64;
     char *json = malloc(needed);
     if (!json) {
         free(escaped);
@@ -1426,8 +1453,8 @@ char *cbm_pipeline_import_edge_properties(cbm_pipeline_ctx_t *ctx, const char *r
         }
         return NULL;
     }
-    snprintf(json, needed, "{\"binding_kind\":\"%s\",\"%s\":\"%s\"}", binding, property,
-             escaped);
+    snprintf(json, needed, "{\"binding_kind\":\"%s\",\"%s\":\"%s\"%s}", binding, property,
+             escaped, resolution_suffix);
     free(escaped);
     return json;
 }
@@ -1622,6 +1649,31 @@ int cbm_pipeline_import_map_build(const cbm_gbuf_t *gbuf, const char *project_na
                           "IMPORTS binding properties contradict their declared category",
                           "remediation", "repair import edge construction and retry indexing");
             return CBM_NOT_FOUND;
+        }
+        if (target->label && strcmp(target->label, "RuntimeModuleRequest") == 0) {
+            yyjson_val *resolution_value = yyjson_obj_get(root, "resolution_kind");
+            const char *resolution_kind =
+                yyjson_is_str(resolution_value) ? yyjson_get_str(resolution_value) : NULL;
+            size_t resolution_len = resolution_kind ? yyjson_get_len(resolution_value) : 0;
+            if (!resolution_kind || resolution_len != strlen("browser_url") ||
+                strlen(resolution_kind) != resolution_len ||
+                strcmp(resolution_kind, "browser_url") != 0) {
+                char edge_id[CBM_SZ_32];
+                snprintf(edge_id, sizeof(edge_id), "%lld", (long long)edge->id);
+                yyjson_doc_free(doc);
+                cbm_pipeline_import_map_free(keys, vals, count);
+                free(target_ids);
+                cbm_log_error(
+                    "pkgmap.import_map_failed", "code",
+                    "CBM_IMPORT_RUNTIME_REQUEST_PROPERTIES_INVALID", "component",
+                    "pipeline.import_map", "operation", "validate_runtime_request", "project",
+                    project_name, "file", rel_path, "edge_id", edge_id, "message",
+                    "a runtime module request edge is not labeled with browser URL resolution",
+                    "remediation", "repair browser import extraction and rebuild the complete graph");
+                return CBM_NOT_FOUND;
+            }
+            yyjson_doc_free(doc);
+            continue;
         }
         if (strcmp(binding_kind, "resource") == 0) {
             yyjson_doc_free(doc);
@@ -2075,6 +2127,146 @@ allocation_failed:
     return NULL;
 }
 
+static const cbm_gbuf_node_t *persist_browser_module_request(
+    const cbm_pipeline_ctx_t *ctx, const char *source_rel, const char *module_path) {
+    if (!ctx || !ctx->gbuf || !ctx->project_name || !ctx->project_name[0] || !source_rel ||
+        !source_rel[0] || !module_path || !module_path[0]) {
+        cbm_log_error("pkgmap.browser_module_request_failed", "code",
+                      "CBM_IMPORT_BROWSER_REQUEST_IDENTITY_INVALID", "source",
+                      source_rel ? source_rel : "", "module", module_path ? module_path : "",
+                      "message", "a browser module request lacks its complete graph identity",
+                      "remediation", "preserve project, source file, and exact module specifier");
+        if (ctx && ctx->gbuf) {
+            cbm_gbuf_refuse_resolution(ctx->gbuf);
+        }
+        if (ctx && ctx->cancelled) {
+            atomic_store(ctx->cancelled, SKIP_ONE);
+        }
+        return NULL;
+    }
+
+    char *qn_prefix = concat3(ctx->project_name, ".__runtime_module_request__.", source_rel);
+    char *qualified_name = qn_prefix ? concat3(qn_prefix, "::", module_path) : NULL;
+    free(qn_prefix);
+    char *escaped_source = import_property_value(source_rel);
+    char *escaped_module = import_property_value(module_path);
+    if (!qualified_name || !escaped_source || !escaped_module) {
+        free(qualified_name);
+        free(escaped_source);
+        free(escaped_module);
+        cbm_log_error("pkgmap.browser_module_request_failed", "code",
+                      "CBM_IMPORT_BROWSER_REQUEST_ALLOC_FAILED", "source", source_rel, "module",
+                      module_path, "message",
+                      "the complete browser module request identity could not be allocated",
+                      "remediation", "free memory or reduce the module specifier size, then retry");
+        cbm_gbuf_refuse_resolution(ctx->gbuf);
+        if (ctx->cancelled) {
+            atomic_store(ctx->cancelled, SKIP_ONE);
+        }
+        return NULL;
+    }
+
+    size_t properties_size = CBM_SZ_256;
+    size_t escaped_source_len = strlen(escaped_source);
+    size_t escaped_module_len = strlen(escaped_module);
+    if (escaped_source_len > SIZE_MAX - properties_size ||
+        escaped_module_len > SIZE_MAX - properties_size - escaped_source_len) {
+        free(qualified_name);
+        free(escaped_source);
+        free(escaped_module);
+        cbm_log_error("pkgmap.browser_module_request_failed", "code",
+                      "CBM_IMPORT_BROWSER_REQUEST_SIZE_OVERFLOW", "source", source_rel, "module",
+                      module_path, "message", "browser module request properties exceed size_t",
+                      "remediation", "reduce the source path or module specifier size, then retry");
+        cbm_gbuf_refuse_resolution(ctx->gbuf);
+        if (ctx->cancelled) {
+            atomic_store(ctx->cancelled, SKIP_ONE);
+        }
+        return NULL;
+    }
+    properties_size += escaped_source_len + escaped_module_len;
+    char *properties = malloc(properties_size);
+    if (!properties) {
+        free(qualified_name);
+        free(escaped_source);
+        free(escaped_module);
+        cbm_log_error("pkgmap.browser_module_request_failed", "code",
+                      "CBM_IMPORT_BROWSER_REQUEST_ALLOC_FAILED", "source", source_rel, "module",
+                      module_path, "message",
+                      "browser module request properties could not be allocated", "remediation",
+                      "free memory and retry indexing");
+        cbm_gbuf_refuse_resolution(ctx->gbuf);
+        if (ctx->cancelled) {
+            atomic_store(ctx->cancelled, SKIP_ONE);
+        }
+        return NULL;
+    }
+    snprintf(properties, properties_size,
+             "{\"resolution_kind\":\"browser_url\",\"source_file\":\"%s\","
+             "\"specifier\":\"%s\",\"target_state\":\"runtime_resolution_required\"}",
+             escaped_source, escaped_module);
+
+    int64_t request_id = cbm_gbuf_upsert_node(ctx->gbuf, "RuntimeModuleRequest", module_path,
+                                              qualified_name, source_rel, 0, 0, properties);
+    const cbm_gbuf_node_t *request =
+        request_id > 0 ? cbm_gbuf_find_by_id(ctx->gbuf, request_id) : NULL;
+    bool request_valid =
+        request && request->label && strcmp(request->label, "RuntimeModuleRequest") == 0 &&
+        request->name && strcmp(request->name, module_path) == 0 && request->qualified_name &&
+        strcmp(request->qualified_name, qualified_name) == 0 && request->file_path &&
+        strcmp(request->file_path, source_rel) == 0 && request->atom_id &&
+        strlen(request->atom_id) == CBM_SHA256_HEX_LEN && request->properties_json &&
+        strcmp(request->properties_json, properties) == 0 && request->start_line == 0 &&
+        request->end_line == 0 && !request->source_present && request->source_len == 0 &&
+        request->start_byte == 0 && request->end_byte == 0;
+    free(properties);
+    free(escaped_source);
+    free(escaped_module);
+    free(qualified_name);
+    if (!request_valid) {
+        cbm_log_error("pkgmap.browser_module_request_failed", "code",
+                      "CBM_IMPORT_BROWSER_REQUEST_PERSISTED_STATE_INVALID", "source", source_rel,
+                      "module", module_path, "message",
+                      "the runtime module request graph-buffer readback does not exactly match "
+                      "its canonical identity and properties",
+                      "remediation",
+                      "inspect graph-buffer identity/property diagnostics and retry the complete "
+                      "corpus");
+        cbm_gbuf_refuse_resolution(ctx->gbuf);
+        if (ctx->cancelled) {
+            atomic_store(ctx->cancelled, SKIP_ONE);
+        }
+        return NULL;
+    }
+
+    cbm_log_warn("pkgmap.browser_module_request_persisted", "code",
+                 "CBM_IMPORT_BROWSER_RUNTIME_TARGET_UNAVAILABLE", "source", source_rel, "module",
+                 module_path, "request_atom_id", request->atom_id ? request->atom_id : "",
+                 "disposition", "runtime_request_persisted", "message",
+                 "the browser module URL has no exact source target in this repository snapshot",
+                 "remediation",
+                 "materialize the runtime artifact when executing the application; the exact request remains in the graph");
+    return request;
+}
+
+static const cbm_gbuf_node_t *resolve_browser_module_request(
+    const cbm_pipeline_ctx_t *ctx, const char *source_rel, const char *module_path) {
+    bool exact_relative =
+        module_path &&
+        ((module_path[0] == '.' && module_path[1] == '/') ||
+         (module_path[0] == '.' && module_path[1] == '.' && module_path[2] == '/')) &&
+        !strpbrk(module_path, "?#%\\");
+    if (exact_relative) {
+        const cbm_gbuf_node_t *source_target =
+            resolve_sibling_file(ctx, source_rel, module_path, true);
+        if (source_target || cbm_gbuf_resolution_failed(ctx->gbuf) ||
+            (ctx->cancelled && atomic_load(ctx->cancelled))) {
+            return source_target;
+        }
+    }
+    return persist_browser_module_request(ctx, source_rel, module_path);
+}
+
 const cbm_gbuf_node_t *cbm_pipeline_resolve_import_node(const cbm_pipeline_ctx_t *ctx,
                                                         const char *source_rel,
                                                         const char *source_file_qn,
@@ -2099,6 +2291,10 @@ const cbm_gbuf_node_t *cbm_pipeline_resolve_import_node(const cbm_pipeline_ctx_t
                          "capture the authoritative runtime search context before binding a target");
         }
         return NULL;
+    }
+
+    if (imp->resolution == CBM_IMPORT_RESOLVE_BROWSER_URL) {
+        return resolve_browser_module_request(ctx, source_rel, imp->module_path);
     }
 
     if (imp->resolution == CBM_IMPORT_RESOLVE_ES_SOURCE) {

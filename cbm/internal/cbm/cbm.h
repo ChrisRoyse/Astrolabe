@@ -228,6 +228,20 @@ typedef struct {
     uint32_t end_byte;   // exclusive end byte offset (0 when unset; end<=start => no source)
     const char *source;  // exact node source bytes (arena) or NULL
     uint32_t source_len; // authoritative byte length; never derive with strlen
+
+    // Structured-data schema aggregation (#856). These fields are NULL/zero for
+    // ordinary code definitions. A populated record represents every exact
+    // source occurrence of one normalized schema path without minting one graph
+    // atom per repeated JSON record.
+    const char *structured_path;
+    uint64_t structured_occurrence_count;
+    const char *structured_occurrence_sha256;
+    uint32_t structured_first_start_byte;
+    uint32_t structured_first_end_byte;
+    uint32_t structured_last_start_byte;
+    uint32_t structured_last_end_byte;
+    const char *structured_classification;
+    const char *structured_classification_provenance;
 } CBMDefinition;
 
 /* Argument captured from a call expression */
@@ -290,6 +304,10 @@ typedef enum {
      * specifiers use the ordered TypeScript source-extension substitution
      * contract before any semantic module lookup. */
     CBM_IMPORT_RESOLVE_ES_SOURCE = 3,
+    /* A browser-hosted ECMAScript ModuleRequest. Relative specifiers are URLs,
+     * not TypeScript source assertions: an exact repository source may bind,
+     * otherwise the runtime request itself remains a first-class graph atom. */
+    CBM_IMPORT_RESOLVE_BROWSER_URL = 4,
 } CBMImportResolution;
 
 /* Whether an import-like source relationship binds a name in the importing
@@ -587,6 +605,15 @@ typedef struct {
     const char **global_vars;   // NULL-terminated (NULL if none)
     const char **macros;        // NULL-terminated, C/C++ only (NULL if none)
 
+    // File-level structured-data summary. The pipeline persists this on the
+    // exact File atom after extraction so an empty JSON object and aggregate
+    // counts remain observable without re-reading source or inferring from
+    // child rows.
+    const char *structured_classification;
+    const char *structured_classification_provenance;
+    uint64_t structured_schema_path_count;
+    uint64_t structured_occurrence_count;
+
     bool has_error;
     const char *error_msg;
     CBMExtractionError error;
@@ -641,6 +668,10 @@ typedef struct {
     const char *rel_path;
     const char *module_qn;
     TSNode root;
+    const char *structured_classification_override;
+    const char *structured_classification_override_provenance;
+    CBMImportResolution es_import_resolution_override;
+    bool es_import_resolution_override_enabled;
     EFCache ef_cache;                      // enclosing function cache
     const char *enclosing_class_qn;        // for nested class QN computation
     CBMStringConstantMap string_constants; // module-level NAME = "value" pairs
@@ -692,6 +723,26 @@ CBMFileResult *cbm_extract_file_at_path(const char *source, int source_len, CBML
                                         const char *project, const char *rel_path,
                                         const char *source_path, int64_t timeout_micros,
                                         const char **extra_defines, const char **include_paths);
+
+/* Rust-aware production extraction. `rust_edition` is the exact effective
+ * Cargo edition for rel_path and is borrowed only for this synchronous call.
+ * NULL preserves manifest-free behavior for non-Rust inputs; an
+ * edition-sensitive Rust macro then refuses rather than guessing. */
+CBMFileResult *cbm_extract_file_at_path_with_rust_edition(
+    const char *source, int source_len, CBMLanguage language, const char *project,
+    const char *rel_path, const char *source_path, const char *rust_edition, int64_t timeout_micros,
+    const char **extra_defines, const char **include_paths);
+
+/* Production extraction with immutable repository metadata. Structured
+ * classification overrides are accepted only for structured-data languages;
+ * NULL selects measured structural classification. All metadata is borrowed
+ * only for this synchronous call. */
+CBMFileResult *cbm_extract_file_at_path_with_metadata(
+    const char *source, int source_len, CBMLanguage language, const char *project,
+    const char *rel_path, const char *source_path, const char *rust_edition,
+    const char *structured_classification_override,
+    const char *structured_classification_override_provenance, int64_t timeout_micros,
+    const char **extra_defines, const char **include_paths);
 
 /* Set the first authoritative failure on a file result. Later failures do not
  * overwrite it, so callers receive one deterministic causal diagnostic. */

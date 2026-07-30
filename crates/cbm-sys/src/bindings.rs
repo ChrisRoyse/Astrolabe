@@ -481,6 +481,15 @@ pub struct CBMDefinition {
     pub end_byte: u32,
     pub source: *const ::std::os::raw::c_char,
     pub source_len: u32,
+    pub structured_path: *const ::std::os::raw::c_char,
+    pub structured_occurrence_count: u64,
+    pub structured_occurrence_sha256: *const ::std::os::raw::c_char,
+    pub structured_first_start_byte: u32,
+    pub structured_first_end_byte: u32,
+    pub structured_last_start_byte: u32,
+    pub structured_last_end_byte: u32,
+    pub structured_classification: *const ::std::os::raw::c_char,
+    pub structured_classification_provenance: *const ::std::os::raw::c_char,
 }
 impl Default for CBMDefinition {
     fn default() -> Self {
@@ -562,6 +571,7 @@ pub const CBMImportResolution_CBM_IMPORT_RESOLVE_SEMANTIC: CBMImportResolution =
 pub const CBMImportResolution_CBM_IMPORT_RESOLVE_EXACT_SOURCE: CBMImportResolution = 1;
 pub const CBMImportResolution_CBM_IMPORT_RESOLVE_EXTERNAL_SOURCE: CBMImportResolution = 2;
 pub const CBMImportResolution_CBM_IMPORT_RESOLVE_ES_SOURCE: CBMImportResolution = 3;
+pub const CBMImportResolution_CBM_IMPORT_RESOLVE_BROWSER_URL: CBMImportResolution = 4;
 pub type CBMImportResolution = ::std::os::raw::c_int;
 pub const CBMImportBinding_CBM_IMPORT_BINDING_LOCAL: CBMImportBinding = 0;
 pub const CBMImportBinding_CBM_IMPORT_BINDING_RESOURCE: CBMImportBinding = 1;
@@ -1127,6 +1137,10 @@ pub struct CBMFileResult {
     pub constants: *mut *const ::std::os::raw::c_char,
     pub global_vars: *mut *const ::std::os::raw::c_char,
     pub macros: *mut *const ::std::os::raw::c_char,
+    pub structured_classification: *const ::std::os::raw::c_char,
+    pub structured_classification_provenance: *const ::std::os::raw::c_char,
+    pub structured_schema_path_count: u64,
+    pub structured_occurrence_count: u64,
     pub has_error: bool,
     pub error_msg: *const ::std::os::raw::c_char,
     pub error: CBMExtractionError,
@@ -1205,6 +1219,10 @@ pub struct CBMExtractCtx {
     pub rel_path: *const ::std::os::raw::c_char,
     pub module_qn: *const ::std::os::raw::c_char,
     pub root: TSNode,
+    pub structured_classification_override: *const ::std::os::raw::c_char,
+    pub structured_classification_override_provenance: *const ::std::os::raw::c_char,
+    pub es_import_resolution_override: CBMImportResolution,
+    pub es_import_resolution_override_enabled: bool,
     pub ef_cache: EFCache,
     pub enclosing_class_qn: *const ::std::os::raw::c_char,
     pub string_constants: CBMStringConstantMap,
@@ -1251,6 +1269,36 @@ unsafe extern "C" {
         project: *const ::std::os::raw::c_char,
         rel_path: *const ::std::os::raw::c_char,
         source_path: *const ::std::os::raw::c_char,
+        timeout_micros: i64,
+        extra_defines: *mut *const ::std::os::raw::c_char,
+        include_paths: *mut *const ::std::os::raw::c_char,
+    ) -> *mut CBMFileResult;
+}
+unsafe extern "C" {
+    pub fn cbm_extract_file_at_path_with_rust_edition(
+        source: *const ::std::os::raw::c_char,
+        source_len: ::std::os::raw::c_int,
+        language: CBMLanguage,
+        project: *const ::std::os::raw::c_char,
+        rel_path: *const ::std::os::raw::c_char,
+        source_path: *const ::std::os::raw::c_char,
+        rust_edition: *const ::std::os::raw::c_char,
+        timeout_micros: i64,
+        extra_defines: *mut *const ::std::os::raw::c_char,
+        include_paths: *mut *const ::std::os::raw::c_char,
+    ) -> *mut CBMFileResult;
+}
+unsafe extern "C" {
+    pub fn cbm_extract_file_at_path_with_metadata(
+        source: *const ::std::os::raw::c_char,
+        source_len: ::std::os::raw::c_int,
+        language: CBMLanguage,
+        project: *const ::std::os::raw::c_char,
+        rel_path: *const ::std::os::raw::c_char,
+        source_path: *const ::std::os::raw::c_char,
+        rust_edition: *const ::std::os::raw::c_char,
+        structured_classification_override: *const ::std::os::raw::c_char,
+        structured_classification_override_provenance: *const ::std::os::raw::c_char,
         timeout_micros: i64,
         extra_defines: *mut *const ::std::os::raw::c_char,
         include_paths: *mut *const ::std::os::raw::c_char,
@@ -1539,6 +1587,9 @@ pub struct cbm_file_info_t {
     pub source_change_time_100ns: i64,
     pub auxiliary: bool,
     pub interpretation_input: bool,
+    pub structured_classification: [::std::os::raw::c_char; 16usize],
+    pub structured_classification_provenance: [::std::os::raw::c_char; 128usize],
+    pub structured_classification_rank: u8,
 }
 impl Default for cbm_file_info_t {
     fn default() -> Self {

@@ -69,6 +69,7 @@ enum {
 #include "pipeline/pipeline.h"
 #include "pipeline/pipeline_internal.h"
 #include "pipeline/pass_lsp_cross.h" /* cbm_pxc_* helpers for fused cross-file LSP */
+#include "lsp/rust_cargo.h"
 #include "pipeline/lsp_resolve.h"
 #include "helpers.h" /* cbm_kind_in_set_free_cache — per-worker-thread cache teardown */
 #include "pipeline/worker_pool.h"
@@ -461,6 +462,20 @@ static void append_json_string(char *buf, size_t bufsize, size_t *pos, const cha
     *pos = p;
 }
 
+static void append_json_u64(char *buf, size_t bufsize, size_t *pos, const char *key,
+                            uint64_t value) {
+    char field[CBM_SZ_128];
+    int written = snprintf(field, sizeof(field), ",\"%s\":%llu", key,
+                           (unsigned long long)value);
+    if (written <= 0 || (size_t)written >= sizeof(field) ||
+        *pos + (size_t)written + PP_ESC_SPACE > bufsize) {
+        return;
+    }
+    memcpy(buf + *pos, field, (size_t)written);
+    *pos += (size_t)written;
+    buf[*pos] = '\0';
+}
+
 /* Append a JSON array of strings: ,"key":["a","b","c"]. Atomic like
  * append_json_string: emitted only if the whole array fits. */
 static void append_json_str_array(char *buf, size_t bufsize, size_t *pos, const char *key,
@@ -551,6 +566,25 @@ static void build_def_props(char *buf, size_t bufsize, const CBMDefinition *def,
     append_json_str_array(buf, bufsize, &pos, "param_types", def->param_types);
     append_json_string(buf, bufsize, &pos, "route_path", def->route_path);
     append_json_string(buf, bufsize, &pos, "route_method", def->route_method);
+    append_json_string(buf, bufsize, &pos, "structured_path", def->structured_path);
+    if (def->structured_path) {
+        append_json_u64(buf, bufsize, &pos, "structured_occurrence_count",
+                        def->structured_occurrence_count);
+        append_json_string(buf, bufsize, &pos, "structured_occurrence_sha256",
+                           def->structured_occurrence_sha256);
+        append_json_u64(buf, bufsize, &pos, "structured_first_start_byte",
+                        def->structured_first_start_byte);
+        append_json_u64(buf, bufsize, &pos, "structured_first_end_byte",
+                        def->structured_first_end_byte);
+        append_json_u64(buf, bufsize, &pos, "structured_last_start_byte",
+                        def->structured_last_start_byte);
+        append_json_u64(buf, bufsize, &pos, "structured_last_end_byte",
+                        def->structured_last_end_byte);
+        append_json_string(buf, bufsize, &pos, "structured_classification",
+                           def->structured_classification);
+        append_json_string(buf, bufsize, &pos, "structured_classification_provenance",
+                           def->structured_classification_provenance);
+    }
 
     /* MinHash fingerprint — append if present and buffer has room.
      * Hex-encoded K=64 uint32 = 512 chars + key/quotes ≈ 520 chars. */
@@ -671,6 +705,7 @@ typedef struct {
     int file_count;
     const char *project_name;
     const char *repo_path;
+    const CBMCargoManifest *rust_manifest;
 
     extract_worker_state_t *workers;
     int max_workers;
@@ -903,9 +938,15 @@ static void extract_worker(int worker_id, void *ctx_ptr) {
 
         uint64_t file_t0 = extract_now_ns();
 
-        CBMFileResult *result =
-            cbm_extract_file_at_path(source, source_len, fi->language, ec->project_name,
-                                     fi->rel_path, fi->path, CBM_EXTRACT_BUDGET, NULL, NULL);
+        const char *rust_edition = cbm_cargo_edition_for_path(ec->rust_manifest, fi->rel_path);
+        CBMFileResult *result = cbm_extract_file_at_path_with_metadata(
+            source, source_len, fi->language, ec->project_name, fi->rel_path, fi->path,
+            rust_edition,
+            fi->structured_classification[0] ? fi->structured_classification : NULL,
+            fi->structured_classification_provenance[0]
+                ? fi->structured_classification_provenance
+                : NULL,
+            CBM_EXTRACT_BUDGET, NULL, NULL);
 
         uint64_t file_elapsed_ms = (extract_now_ns() - file_t0) / PP_USEC_PER_MS;
 
@@ -1039,6 +1080,28 @@ static void log_extract_mem_stats(int worker_count) {
     }
 }
 
+void cbm_parallel_rebase_shared_ids(const cbm_gbuf_t *main_gbuf, _Atomic int64_t *shared_ids,
+                                    const char *phase) {
+    int64_t main_next_id = cbm_gbuf_next_id(main_gbuf);
+    int64_t shared_before = atomic_load_explicit(shared_ids, memory_order_relaxed);
+    int64_t shared_observed = shared_before;
+    while (shared_observed < main_next_id &&
+           !atomic_compare_exchange_weak_explicit(shared_ids, &shared_observed, main_next_id,
+                                                  memory_order_relaxed, memory_order_relaxed)) {}
+    int64_t shared_after = atomic_load_explicit(shared_ids, memory_order_relaxed);
+    if (shared_after > shared_before) {
+        char shared_before_buf[CBM_SZ_32];
+        char main_next_buf[CBM_SZ_32];
+        char shared_after_buf[CBM_SZ_32];
+        snprintf(shared_before_buf, sizeof(shared_before_buf), "%lld", (long long)shared_before);
+        snprintf(main_next_buf, sizeof(main_next_buf), "%lld", (long long)main_next_id);
+        snprintf(shared_after_buf, sizeof(shared_after_buf), "%lld", (long long)shared_after);
+        cbm_log_info("parallel.id_ceiling_rebased", "code", "CBM_GRAPH_ID_SEQUENCE_REBASED",
+                     "phase", phase, "shared_before", shared_before_buf, "main_next_id",
+                     main_next_buf, "shared_after", shared_after_buf);
+    }
+}
+
 int cbm_parallel_extract_ex(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, int file_count,
                             CBMFileResult **result_cache, _Atomic int64_t *shared_ids,
                             int worker_count, const cbm_parallel_extract_opts_t *opts) {
@@ -1117,6 +1180,7 @@ int cbm_parallel_extract_ex(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *file
         .file_count = file_count,
         .project_name = ctx->project_name,
         .repo_path = ctx->repo_path,
+        .rust_manifest = ctx->rust_manifest,
         .workers = workers,
         .max_workers = worker_count,
         .result_cache = result_cache,
@@ -1153,6 +1217,7 @@ int cbm_parallel_extract_ex(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *file
         }
     }
     CBM_PROF_END_N("parallel_extract", "4_merge_gbufs_seq", t_merge, total_nodes);
+    cbm_parallel_rebase_shared_ids(ctx->gbuf, shared_ids, "parallel_extract.merge");
 
     /* Merge per-worker failure lists into the pipeline (SEQUENTIAL — no lock).
      * Runs unconditionally (not gated on local_gbuf) so a worker whose files all
@@ -1181,6 +1246,7 @@ int cbm_parallel_extract_ex(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *file
     }
 
     int pkgmap_rc = build_captured_pkgmap(ctx);
+    cbm_parallel_rebase_shared_ids(ctx->gbuf, shared_ids, "parallel_extract.package_map");
 
     cbm_aligned_free(workers);
     free(sorted);
@@ -1380,6 +1446,11 @@ int cbm_build_registry_from_cache(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
 
         const char *rel = files[i].rel_path;
 
+        if (cbm_pipeline_enrich_structured_file(ctx, &files[i], result) != 0) {
+            cbm_pipeline_namespace_map_free(namespace_map);
+            return CBM_NOT_FOUND;
+        }
+
         /* Register callable symbols + DEFINES/DEFINES_METHOD edges */
         for (int d = 0; d < result->defs.count; d++) {
             defines_edges += register_and_link_def(ctx, &result->defs.items[d], rel, &reg_entries);
@@ -1461,6 +1532,7 @@ typedef struct {
      * cbm_run_X_lsp_cross_with_registry — skip per-file build entirely.
      * Stored as CBMCrossLspRegistries* (typedef from pass_lsp_cross.h). */
     CBMCrossLspRegistries *cross_registries;
+    const CBMCargoManifest *rust_manifest;
 
     /* F4: LAZILY-built shared Rust registry (built ONCE, on the first NULL-filter
      * rust file — the ~all_defs amplifier files). Not eager: repos whose rust files
@@ -2953,7 +3025,7 @@ static void resolve_worker(int worker_id, void *ctx_ptr) {
                 cbm_pxc_dispatch_file(lang, result, lsp_source, lsp_source_len, rel, def_module,
                                       rc->cross_registries, rc->module_def_index, rc->all_defs,
                                       rc->def_count, imp_keys, imp_vals, imp_count,
-                                      pp_rust_shared_registry_get, rc);
+                                      pp_rust_shared_registry_get, rc, rc->rust_manifest);
                 /* Free the on-demand re-read (no-op when source was retained). */
                 free_source(lsp_source_owned);
                 /* Contract: cbm_slab_reclaim() requires the thread parser to be
@@ -3084,6 +3156,7 @@ int cbm_parallel_resolve(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, 
         .def_modules = def_modules,
         .module_def_index = module_def_index,
         .cross_registries = cross_registries,
+        .rust_manifest = ctx->rust_manifest,
     };
     atomic_init(&rc.next_file_idx, 0);
     atomic_init(&rc.lsp_cross_processed, 0);
@@ -3141,6 +3214,11 @@ int cbm_parallel_resolve(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, 
 
     /* Go-style implicit interface satisfaction (needs full graph, serial) */
     int go_impl = cbm_pipeline_implements_go(ctx);
+
+    /* The sequential merge preserves worker node IDs but reallocates edges from
+     * the main graph, and the Go pass can add more main-only edges afterward.
+     * Publish the greater post-join ceiling before cancellation or handoff. */
+    cbm_parallel_rebase_shared_ids(ctx->gbuf, shared_ids, "parallel_resolve.post_merge");
 
     if (atomic_load(ctx->cancelled)) {
         return CBM_NOT_FOUND;

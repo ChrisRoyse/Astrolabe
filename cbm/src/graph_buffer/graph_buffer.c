@@ -985,6 +985,20 @@ void cbm_gbuf_set_next_id(cbm_gbuf_t *gb, int64_t next_id) {
     if (!gb) {
         return;
     }
+    if (next_id < gb->next_id) {
+        char current_buf[CBM_SZ_32];
+        char requested_buf[CBM_SZ_32];
+        snprintf(current_buf, sizeof(current_buf), "%lld", (long long)gb->next_id);
+        snprintf(requested_buf, sizeof(requested_buf), "%lld", (long long)next_id);
+        atomic_store(&gb->resolution_failed, true);
+        cbm_log_error(
+            "gbuf.id_sequence_refused", "code", "CBM_GRAPH_ID_SEQUENCE_REGRESSION",
+            "current_next_id", current_buf, "requested_next_id", requested_buf, "message",
+            "a shared graph-id handoff attempted to move the allocation ceiling backward",
+            "remediation",
+            "rebase the shared allocator after every serial graph mutation before parallel work");
+        return;
+    }
     gb->next_id = next_id;
 }
 
@@ -1232,6 +1246,98 @@ const cbm_gbuf_node_t *cbm_gbuf_find_source_container(const cbm_gbuf_t *gb, cons
                       node->source_sha256 ? node->source_sha256 : "");
     }
     return NULL;
+}
+
+int cbm_gbuf_replace_source_container_properties(cbm_gbuf_t *gb, const char *label,
+                                                 const char *file_path,
+                                                 const char *properties_json) {
+    const char *json = canonical_properties_json(properties_json);
+    cbm_gbuf_node_t *node =
+        (cbm_gbuf_node_t *)cbm_gbuf_find_source_container(gb, label, file_path);
+    if (!gb || !node || !valid_properties_object(json)) {
+        if (gb) {
+            atomic_store(&gb->resolution_failed, true);
+        }
+        cbm_log_error("gbuf.source_container_properties_refused", "code",
+                      "CBM_SOURCE_CONTAINER_PROPERTIES_INVALID", "label", label ? label : "",
+                      "file_path", file_path ? file_path : "", "message",
+                      "the exact source container or replacement properties are invalid",
+                      "remediation",
+                      "preserve source identity, supply one complete JSON object, and retry");
+        return GB_ERR;
+    }
+    char *copy = heap_strdup(json);
+    if (!copy) {
+        atomic_store(&gb->resolution_failed, true);
+        cbm_log_error("gbuf.source_container_properties_refused", "code",
+                      "CBM_SOURCE_CONTAINER_PROPERTIES_ALLOC_FAILED", "label", label,
+                      "file_path", file_path, "message",
+                      "replacement source-container properties could not be retained",
+                      "remediation", "free memory and retry the complete corpus");
+        return GB_ERR;
+    }
+    free(node->properties_json);
+    node->properties_json = copy;
+    return 0;
+}
+
+int cbm_gbuf_merge_source_container_properties(cbm_gbuf_t *gb, const char *label,
+                                               const char *file_path,
+                                               const char *properties_patch_json) {
+    const char *patch_json = canonical_properties_json(properties_patch_json);
+    cbm_gbuf_node_t *node =
+        (cbm_gbuf_node_t *)cbm_gbuf_find_source_container(gb, label, file_path);
+    yyjson_doc *base_doc = NULL;
+    yyjson_doc *patch_doc = NULL;
+    yyjson_mut_doc *merged_doc = NULL;
+    char *merged_json = NULL;
+    int rc = GB_ERR;
+
+    if (!gb || !node || !valid_properties_object(node->properties_json) ||
+        !valid_properties_object(patch_json)) {
+        if (gb) {
+            atomic_store(&gb->resolution_failed, true);
+        }
+        cbm_log_error("gbuf.source_container_properties_merge_refused", "code",
+                      "CBM_SOURCE_CONTAINER_PROPERTIES_MERGE_INPUT_INVALID", "label",
+                      label ? label : "", "file_path", file_path ? file_path : "", "message",
+                      "the exact source container or RFC 7386 object patch is invalid",
+                      "remediation",
+                      "preserve source identity and supply one valid object patch before retrying");
+        return GB_ERR;
+    }
+
+    base_doc = yyjson_read(node->properties_json, strlen(node->properties_json), 0);
+    patch_doc = yyjson_read(patch_json, strlen(patch_json), 0);
+    merged_doc = yyjson_mut_doc_new(NULL);
+    yyjson_mut_val *merged =
+        base_doc && patch_doc && merged_doc
+            ? yyjson_merge_patch(merged_doc, yyjson_doc_get_root(base_doc),
+                                 yyjson_doc_get_root(patch_doc))
+            : NULL;
+    if (merged && yyjson_mut_is_obj(merged)) {
+        yyjson_mut_doc_set_root(merged_doc, merged);
+        merged_json = yyjson_mut_write(merged_doc, 0, NULL);
+    }
+    if (merged_json && valid_properties_object(merged_json)) {
+        free(node->properties_json);
+        node->properties_json = merged_json;
+        merged_json = NULL;
+        rc = 0;
+    } else {
+        atomic_store(&gb->resolution_failed, true);
+        cbm_log_error("gbuf.source_container_properties_merge_refused", "code",
+                      "CBM_SOURCE_CONTAINER_PROPERTIES_MERGE_FAILED", "label", label,
+                      "file_path", file_path, "message",
+                      "the RFC 7386 property composition could not be retained as object JSON",
+                      "remediation", "free memory, preserve the complete corpus, and retry");
+    }
+
+    free(merged_json);
+    yyjson_mut_doc_free(merged_doc);
+    yyjson_doc_free(patch_doc);
+    yyjson_doc_free(base_doc);
+    return rc;
 }
 
 uint_least64_t cbm_gbuf_ambiguous_reference_skips(const cbm_gbuf_t *gb) {
@@ -2692,7 +2798,7 @@ static char *extract_local_name(const char *props) {
 
 /* Remap a temp edge ID to its final sequential ID, or 0 if out of range. */
 static int64_t remap_id(const int64_t *temp_to_final, int64_t max_temp_id, int64_t temp_id) {
-    return (temp_id < max_temp_id) ? temp_to_final[temp_id] : 0;
+    return (temp_id > 0 && temp_id < max_temp_id) ? temp_to_final[temp_id] : 0;
 }
 
 /* Build dump-ready node array with sequential IDs. Populates temp_to_final mapping. */
@@ -3040,6 +3146,80 @@ static int count_live_nodes(cbm_gbuf_t *gb) {
     return count;
 }
 
+/* A persisted edge is meaningful only when both endpoint IDs resolve to the
+ * exact nodes retained by the final atom-identity index.  build_dump_edges
+ * historically skipped an edge when either remap was zero, which made the
+ * direct writer's row count truthful but concealed the producer that emitted
+ * the dangling relationship.  Validate before releasing any lookup index or
+ * opening the transaction-owned writer so the complete source graph is either
+ * representable or refused with the exact offending identity. */
+static int validate_dump_edge_endpoints(cbm_gbuf_t *gb, const int64_t *temp_to_final,
+                                        int64_t max_temp_id) {
+    int invalid_count = 0;
+    for (int i = 0; i < gb->edges.count; i++) {
+        const cbm_gbuf_edge_t *edge = gb->edges.items[i];
+        const cbm_gbuf_node_t *source = cbm_gbuf_find_by_id(gb, edge->source_id);
+        const cbm_gbuf_node_t *target = cbm_gbuf_find_by_id(gb, edge->target_id);
+        bool source_live = node_is_live(gb, source);
+        bool target_live = node_is_live(gb, target);
+        int64_t source_final = remap_id(temp_to_final, max_temp_id, edge->source_id);
+        int64_t target_final = remap_id(temp_to_final, max_temp_id, edge->target_id);
+        if (source_final > 0 && target_final > 0) {
+            continue;
+        }
+
+        char ordinal_buf[CBM_SZ_32];
+        char edge_id_buf[CBM_SZ_32];
+        char source_id_buf[CBM_SZ_32];
+        char target_id_buf[CBM_SZ_32];
+        char source_final_buf[CBM_SZ_32];
+        char target_final_buf[CBM_SZ_32];
+        char max_temp_id_buf[CBM_SZ_32];
+        snprintf(ordinal_buf, sizeof(ordinal_buf), "%d", i + SKIP_ONE);
+        snprintf(edge_id_buf, sizeof(edge_id_buf), "%lld", (long long)edge->id);
+        snprintf(source_id_buf, sizeof(source_id_buf), "%lld", (long long)edge->source_id);
+        snprintf(target_id_buf, sizeof(target_id_buf), "%lld", (long long)edge->target_id);
+        snprintf(source_final_buf, sizeof(source_final_buf), "%lld", (long long)source_final);
+        snprintf(target_final_buf, sizeof(target_final_buf), "%lld", (long long)target_final);
+        snprintf(max_temp_id_buf, sizeof(max_temp_id_buf), "%lld", (long long)max_temp_id);
+        cbm_log_error(
+            "gbuf.dump.edge_endpoint_invalid", "code", "CBM_DUMP_EDGE_ENDPOINT_INVALID",
+            "edge_ordinal", ordinal_buf, "edge_id", edge_id_buf, "type",
+            edge->type ? edge->type : "", "properties",
+            edge->properties_json ? edge->properties_json : "", "source_id", source_id_buf,
+            "source_final_id", source_final_buf, "source_state",
+            !source ? "absent"
+                    : (!source_live ? "superseded"
+                                    : (source_final > 0 ? "live_mapped" : "live_unmapped")),
+            "source_atom_id", source && source->atom_id ? source->atom_id : "",
+            "source_qualified_name", source && source->qualified_name ? source->qualified_name : "",
+            "target_id", target_id_buf, "target_final_id", target_final_buf, "target_state",
+            !target ? "absent"
+                    : (!target_live ? "superseded"
+                                    : (target_final > 0 ? "live_mapped" : "live_unmapped")),
+            "target_atom_id", target && target->atom_id ? target->atom_id : "",
+            "target_qualified_name", target && target->qualified_name ? target->qualified_name : "",
+            "max_temp_id", max_temp_id_buf, "message",
+            "an in-memory edge endpoint is absent from the final live-node identity set",
+            "remediation", "repair the exact edge producer; no partial graph was persisted");
+        invalid_count++;
+    }
+
+    if (invalid_count == 0) {
+        return 0;
+    }
+
+    char invalid_buf[CBM_SZ_32];
+    char total_buf[CBM_SZ_32];
+    snprintf(invalid_buf, sizeof(invalid_buf), "%d", invalid_count);
+    snprintf(total_buf, sizeof(total_buf), "%d", gb->edges.count);
+    cbm_log_error("gbuf.dump_refused", "code", "CBM_DUMP_DANGLING_EDGES", "invalid_edges",
+                  invalid_buf, "total_edges", total_buf, "message",
+                  "the completed graph contains edges outside the final live-node set",
+                  "remediation", "repair every preceding CBM_DUMP_EDGE_ENDPOINT_INVALID producer");
+    return CBM_NOT_FOUND;
+}
+
 static void generate_iso_timestamp(char *buf, size_t buf_size) {
     time_t now = time(NULL);
     struct tm tm_buf;
@@ -3068,13 +3248,12 @@ int cbm_gbuf_dump_to_sqlite(cbm_gbuf_t *gb, const char *path) {
                       "remediation", "inspect the preceding structured graph-buffer error");
         return CBM_NOT_FOUND;
     }
-
     CBM_PROF_START(t_count);
     int live_count = count_live_nodes(gb);
     CBM_PROF_END_N("dump", "1_count_live_nodes", t_count, live_count);
 
     CBM_PROF_START(t_build_nodes);
-    int64_t max_temp_id = gb->next_id;
+    int64_t max_temp_id = cbm_gbuf_next_id(gb);
     int64_t *temp_to_final = calloc((size_t)max_temp_id, sizeof(int64_t));
     if (!temp_to_final) {
         return CBM_NOT_FOUND;
@@ -3091,6 +3270,11 @@ int cbm_gbuf_dump_to_sqlite(cbm_gbuf_t *gb, const char *path) {
          * never created; release the transients and fail closed. */
         free(src_nodes); /* NULL on this path — build_dump_nodes cleared *src_out */
         free(temp_to_final);
+        return CBM_NOT_FOUND;
+    }
+    if (validate_dump_edge_endpoints(gb, temp_to_final, max_temp_id) != 0) {
+        free_dump_resources(NULL, NULL, 0, NULL, dump_nodes, node_idx, temp_to_final);
+        free(src_nodes);
         return CBM_NOT_FOUND;
     }
 

@@ -46,7 +46,7 @@ use crate::vault::durable::DurableVault;
 use crate::vault::ledger_hook::AsterLedgerHook;
 use crate::wal::TornTail;
 use calyx_core::{CalyxError, Clock, Constellation, CxId, Result, Seq, SystemClock, VaultId};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 pub use commit::CALYX_DURABLE_COMMIT_RECONCILIATION_REQUIRED;
@@ -74,6 +74,32 @@ pub use slot_column::{
     read_materialized_slot_column,
 };
 
+/// Digest-only receipt for one ledger-bound data row.
+///
+/// Values deliberately never escape group commit: the receipt preserves the
+/// exact readback expectation in 32 bytes while the sole value allocation moves
+/// into the durable checkpoint queue.
+#[derive(Debug)]
+pub struct LedgerBoundRowDigest {
+    pub cf: ColumnFamily,
+    pub key: Vec<u8>,
+    pub value_blake3: [u8; 32],
+    pub tombstoned: bool,
+}
+
+/// Exact result of a ledger-paired data commit with compact persisted-state
+/// expectations for every caller-owned data row.
+#[derive(Debug)]
+pub struct LedgerBoundCommit {
+    /// MVCC sequence assigned to the atomic data + ledger + time-index batch.
+    pub seq: Seq,
+    /// Provenance reference stamped into every eligible data row.
+    pub ledger_ref: calyx_core::LedgerRef,
+    /// Digests of committed data rows after provenance binding, excluding the
+    /// internal Ledger and time-index rows.
+    pub data_row_digests: Vec<LedgerBoundRowDigest>,
+}
+
 const DEFAULT_LEASE_MS: u64 = 5_000;
 
 /// Single-vault Aster store with content-addressed ingest semantics.
@@ -84,6 +110,7 @@ pub struct AsterVault<C = SystemClock> {
     clock: Arc<C>,
     rows: VersionedCfStore,
     durable: Option<DurableVault>,
+    durable_root: Option<PathBuf>,
     dedup_policy: DedupPolicy,
     retention_horizon: Mutex<RetentionHorizon>,
     ledger_hook: Option<AsterLedgerHook<C>>,
@@ -201,6 +228,7 @@ where
             clock: Arc::new(clock),
             rows: VersionedCfStore::default(),
             durable: None,
+            durable_root: None,
             dedup_policy: DedupPolicy::default(),
             retention_horizon: Mutex::new(RetentionHorizon::default()),
             ledger_hook: None,

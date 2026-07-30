@@ -31,6 +31,7 @@ pub struct CfRouter {
     resource_counters: Arc<ResourceCounters>,
     pub(super) existing_only: bool,
     pub(super) eager_lookup_cfs: BTreeSet<ColumnFamily>,
+    pub(super) eager_lookup_all: bool,
 }
 
 impl CfRouter {
@@ -75,6 +76,18 @@ impl CfRouter {
         Ok(router)
     }
 
+    /// Opens an existing current-state router and validates/caches immutable
+    /// SST index metadata once for every discovered column family.
+    pub(crate) fn open_existing_latest(
+        vault_dir: impl AsRef<Path>,
+        memtable_byte_cap: usize,
+    ) -> Result<Self> {
+        let mut router = Self::new_existing(vault_dir, memtable_byte_cap)?;
+        router.eager_lookup_all = true;
+        router.load_existing()?;
+        Ok(router)
+    }
+
     pub(crate) fn open_selected_cfs_with_tiering(
         vault_dir: impl AsRef<Path>,
         memtable_byte_cap: usize,
@@ -88,6 +101,7 @@ impl CfRouter {
             ));
         }
         let mut router = Self::new_empty(vault_dir, memtable_byte_cap, tiering_policy)?;
+        router.eager_lookup_cfs = selected.clone();
         for cf in &selected {
             router.ensure_cf(*cf)?;
         }
@@ -101,6 +115,23 @@ impl CfRouter {
         tiering_policy: Option<TieringPolicy>,
     ) -> Result<Self> {
         let mut router = Self::new_empty(vault_dir, memtable_byte_cap, tiering_policy)?;
+        for cf in ColumnFamily::STATIC {
+            router.ensure_cf(cf)?;
+        }
+        router.load_existing()?;
+        Ok(router)
+    }
+
+    /// Opens a writable current-state router with one shared validated lookup
+    /// descriptor for each existing immutable SST. Newly flushed SSTs enter
+    /// the same metadata-bearing path through `push_with_lookup`.
+    pub(crate) fn open_with_tiering_latest(
+        vault_dir: impl AsRef<Path>,
+        memtable_byte_cap: usize,
+        tiering_policy: Option<TieringPolicy>,
+    ) -> Result<Self> {
+        let mut router = Self::new_empty(vault_dir, memtable_byte_cap, tiering_policy)?;
+        router.eager_lookup_all = true;
         for cf in ColumnFamily::STATIC {
             router.ensure_cf(cf)?;
         }
@@ -138,6 +169,7 @@ impl CfRouter {
             resource_counters: Arc::new(ResourceCounters::default()),
             existing_only: false,
             eager_lookup_cfs: BTreeSet::new(),
+            eager_lookup_all: false,
         })
     }
 
@@ -169,6 +201,7 @@ impl CfRouter {
             resource_counters: Arc::new(ResourceCounters::default()),
             existing_only: true,
             eager_lookup_cfs: BTreeSet::new(),
+            eager_lookup_all: false,
         })
     }
 

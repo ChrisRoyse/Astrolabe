@@ -1,4 +1,4 @@
-use super::{AsterVault, durable, encode, ledger_hook};
+use super::{AsterVault, LedgerBoundCommit, LedgerBoundRowDigest, durable, encode, ledger_hook};
 use crate::cf::ColumnFamily;
 use calyx_core::{CalyxError, Clock, CxId, LedgerRef, Result, Seq};
 use calyx_ledger::{ActorId, EntryKind, SubjectId};
@@ -15,7 +15,7 @@ where
         payload: Vec<u8>,
         actor: ActorId,
     ) -> Result<Seq> {
-        let mut data_rows = rows
+        let data_rows = rows
             .into_iter()
             .map(|(cf, key, value)| encode::WriteRow { cf, key, value })
             .collect::<Vec<_>>();
@@ -23,6 +23,48 @@ where
             return Ok(self.latest_seq());
         }
 
+        self.write_cf_batch_with_ledger_entry_owned(data_rows, kind, subject, payload, actor, false)
+            .map(|commit| commit.seq)
+    }
+
+    /// Atomically writes one ledger-paired data batch and returns digest-only
+    /// expectations for its exact post-bind data rows. Values are hashed after
+    /// provenance binding and before their sole allocations move into durable
+    /// checkpoint state.
+    ///
+    /// # Errors
+    ///
+    /// An empty data batch is invalid because it cannot produce a ledger-bound
+    /// commit receipt. All ordinary group-commit failures are propagated.
+    pub fn write_cf_batch_with_ledger_entry_with_row_digests(
+        &self,
+        rows: impl IntoIterator<Item = (ColumnFamily, Vec<u8>, Vec<u8>)>,
+        kind: EntryKind,
+        subject: SubjectId,
+        payload: Vec<u8>,
+        actor: ActorId,
+    ) -> Result<LedgerBoundCommit> {
+        let data_rows = rows
+            .into_iter()
+            .map(|(cf, key, value)| encode::WriteRow { cf, key, value })
+            .collect::<Vec<_>>();
+        if data_rows.is_empty() {
+            return Err(CalyxError::ledger_group_commit_failed(
+                "digest-bearing group commit requires at least one data row",
+            ));
+        }
+        self.write_cf_batch_with_ledger_entry_owned(data_rows, kind, subject, payload, actor, true)
+    }
+
+    fn write_cf_batch_with_ledger_entry_owned(
+        &self,
+        mut data_rows: Vec<encode::WriteRow>,
+        kind: EntryKind,
+        subject: SubjectId,
+        payload: Vec<u8>,
+        actor: ActorId,
+        collect_row_digests: bool,
+    ) -> Result<LedgerBoundCommit> {
         self.with_durable_commit_lock(|| {
             let data_row_count = data_rows.len();
             if let Some(hook) = &self.ledger_hook {
@@ -37,13 +79,20 @@ where
                 )?;
                 let ledger_ref = staged_ledger_ref(&staged)?;
                 attach_ledger_ref_to_rows(&mut data_rows, &ledger_ref)?;
+                let data_row_digests = collect_row_digests
+                    .then(|| digest_rows(&data_rows))
+                    .unwrap_or_default();
                 rows.extend(data_rows);
                 bind.stop("ledger_bind", data_row_count, 0);
                 // Ownership handed straight to the commit path: no full-batch copy
                 // to append the time-index row (#444 lever).
                 let seq = self.commit_rows_locked_owned(rows, false)?;
                 ledger_hook::commit_staged(&mut hook, &staged)?;
-                return Ok(seq);
+                return Ok(LedgerBoundCommit {
+                    seq,
+                    ledger_ref,
+                    data_row_digests,
+                });
             }
 
             let mut transient = self.transient_ledger_hook()?;
@@ -56,11 +105,18 @@ where
                 ledger_hook::stage_entry_payload(hook, &mut rows, kind, subject, payload, actor)?;
             let ledger_ref = staged_ledger_ref(&staged)?;
             attach_ledger_ref_to_rows(&mut data_rows, &ledger_ref)?;
+            let data_row_digests = collect_row_digests
+                .then(|| digest_rows(&data_rows))
+                .unwrap_or_default();
             rows.extend(data_rows);
             bind.stop("ledger_bind", data_row_count, 0);
             let seq = self.commit_rows_locked_owned(rows, false)?;
             ledger_hook::commit_staged(hook, &staged)?;
-            Ok(seq)
+            Ok(LedgerBoundCommit {
+                seq,
+                ledger_ref,
+                data_row_digests,
+            })
         })
     }
 
@@ -98,6 +154,17 @@ where
             std::sync::Arc::clone(&self.clock),
         )
     }
+}
+
+fn digest_rows(rows: &[encode::WriteRow]) -> Vec<LedgerBoundRowDigest> {
+    rows.iter()
+        .map(|row| LedgerBoundRowDigest {
+            cf: row.cf,
+            key: row.key.clone(),
+            value_blake3: *blake3::hash(&row.value).as_bytes(),
+            tombstoned: crate::mvcc::is_tombstone_value(&row.value),
+        })
+        .collect()
 }
 
 fn staged_ledger_ref(staged: &[calyx_ledger::StagedLedgerRow]) -> Result<calyx_core::LedgerRef> {

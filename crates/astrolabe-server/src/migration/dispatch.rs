@@ -411,9 +411,20 @@ pub(crate) fn handle_index_repository(
         }
         if let (Some(project), Some(repo_path)) = (project.as_deref(), repo_path.as_deref()) {
             let cache_dir = astrolabe_bridge::cbm_cache_dir()?;
-            return run_project_index_transition(runner, &cache_dir, project, repo_path, |_| {
-                Ok(runner.handle_tool_raw("index_repository", args_json)?)
-            });
+            return run_project_index_transition(
+                runner,
+                &cache_dir,
+                project,
+                repo_path,
+                |transition_grant| {
+                    run_supervised_index_with_transition(
+                        runner,
+                        args_json,
+                        &cache_dir,
+                        transition_grant,
+                    )
+                },
+            );
         }
         return Ok(runner.handle_tool_raw("index_repository", args_json)?);
     }
@@ -446,9 +457,20 @@ pub(crate) fn handle_index_repository(
         let result =
             if let (Some(project), Some(repo_path)) = (project.as_deref(), repo_path.as_deref()) {
                 let cache_dir = astrolabe_bridge::cbm_cache_dir()?;
-                run_project_index_transition(runner, &cache_dir, project, repo_path, |_| {
-                    Ok(runner.handle_tool_raw("index_repository", &sanitized_args)?)
-                })?
+                run_project_index_transition(
+                    runner,
+                    &cache_dir,
+                    project,
+                    repo_path,
+                    |transition_grant| {
+                        run_supervised_index_with_transition(
+                            runner,
+                            &sanitized_args,
+                            &cache_dir,
+                            transition_grant,
+                        )
+                    },
+                )?
             } else {
                 runner.handle_tool_raw("index_repository", &sanitized_args)?
             };
@@ -506,7 +528,7 @@ pub(crate) fn handle_index_repository(
                 stage_started.elapsed().as_millis(),
                 shadow_started.elapsed().as_millis()
             );
-            let staged_args = match shadow_worker_args(
+            let staged_args = match supervised_index_worker_args(
                 &sanitized_args,
                 publication.stage_cache(),
                 transition_grant,
@@ -600,14 +622,14 @@ pub(crate) fn handle_index_repository(
     )
 }
 
-fn shadow_worker_args(
+fn supervised_index_worker_args(
     args_json: &str,
-    stage_cache: &Path,
+    worker_cache: &Path,
     transition_grant: &ProjectTransitionWorkerGrant,
 ) -> Result<String, DynError> {
     let mut value: Value = serde_json::from_str(args_json)?;
     let object = value.as_object_mut().ok_or_else(|| -> DynError {
-        "ASTRO_SHADOW_INDEX_ARGS_OBJECT_REQUIRED: sanitized index arguments must remain a JSON object"
+        "ASTRO_INDEX_WORKER_ARGS_OBJECT_REQUIRED: sanitized index arguments must remain a JSON object"
             .into()
     })?;
     for private_arg in [
@@ -618,27 +640,37 @@ fn shadow_worker_args(
             continue;
         }
         return Err(format!(
-            "ASTRO_SHADOW_PRIVATE_ARG_COLLISION: caller supplied reserved argument {:?}; remediation: remove that private transport field",
+            "ASTRO_INDEX_WORKER_PRIVATE_ARG_COLLISION: caller supplied reserved argument {:?}; remediation: remove that private transport field",
             private_arg
         )
         .into());
     }
-    let stage = stage_cache.to_str().ok_or_else(|| -> DynError {
+    let worker_cache_text = worker_cache.to_str().ok_or_else(|| -> DynError {
         format!(
-            "ASTRO_SHADOW_STAGE_PATH_NOT_UTF8: transaction cache path is not UTF-8: {}",
-            stage_cache.display()
+            "ASTRO_INDEX_WORKER_CACHE_PATH_NOT_UTF8: transaction cache path is not UTF-8: {}",
+            worker_cache.display()
         )
         .into()
     })?;
     object.insert(
         crate::ASTRO_INDEX_WORKER_CACHE_DIR_ARG.to_string(),
-        Value::String(stage.to_string()),
+        Value::String(worker_cache_text.to_string()),
     );
     object.insert(
         crate::ASTRO_INDEX_WORKER_TRANSITION_GRANT_ARG.to_string(),
-        transition_grant.for_stage(stage_cache)?,
+        transition_grant.for_worker_cache(worker_cache)?,
     );
     Ok(serde_json::to_string(&value)?)
+}
+
+fn run_supervised_index_with_transition(
+    runner: &CbmToolRunner,
+    args_json: &str,
+    worker_cache: &Path,
+    transition_grant: &ProjectTransitionWorkerGrant,
+) -> Result<String, DynError> {
+    let worker_args = supervised_index_worker_args(args_json, worker_cache, transition_grant)?;
+    Ok(runner.handle_index_repository_supervised(&worker_args)?)
 }
 
 pub(crate) fn handle_index_status(

@@ -11,10 +11,29 @@ use memmap2::{Mmap, MmapOptions};
 use std::fs::File;
 use std::mem::{align_of, size_of};
 use std::path::{Path, PathBuf};
+#[cfg(windows)]
+use std::{mem, os::windows::io::AsRawHandle};
+#[cfg(windows)]
+use windows_sys::Win32::{
+    Foundation::{GetLastError, HANDLE},
+    Storage::FileSystem::{BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle},
+};
 
 pub const CALYX_NOT_FOUND: &str = "CALYX_NOT_FOUND";
 pub const CALYX_IO_ERROR: &str = "CALYX_IO_ERROR";
 pub const CALYX_BOUNDS_EXCEEDED: &str = "CALYX_BOUNDS_EXCEEDED";
+
+/// Exact Windows file generation captured from the same handle used to create
+/// an mmap. Immutable-table metadata may be reused only when this identity and
+/// its mutation-sensitive fields still match.
+#[cfg(windows)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct MmapFileGeneration {
+    volume_serial_number: u32,
+    file_index: u64,
+    file_len: u64,
+    last_write_time_100ns: u64,
+}
 
 /// Read-only mmap over an immutable cold column file.
 ///
@@ -25,6 +44,8 @@ pub struct MmapColumn {
     mmap: Mmap,
     path: PathBuf,
     file_len: usize,
+    #[cfg(windows)]
+    file_generation: MmapFileGeneration,
 }
 
 impl MmapColumn {
@@ -44,6 +65,18 @@ impl MmapColumn {
         if file_len == 0 {
             return Err(not_found(format!("{} is empty", path.display())));
         }
+        #[cfg(windows)]
+        let generation_before = {
+            let generation = file_generation(&file, path)?;
+            if generation.file_len != len {
+                return Err(io_error(format!(
+                    "{} length changed while its read-only mmap was admitted: metadata={len}, handle={}",
+                    path.display(),
+                    generation.file_len
+                )));
+            }
+            generation
+        };
         // SAFETY: the mapping is read-only, the file is not mutated by this
         // type, and all public slice accessors bounds-check against file_len.
         let mmap = unsafe {
@@ -51,10 +84,23 @@ impl MmapColumn {
                 .map(&file)
                 .map_err(|error| io_error(format!("mmap {}: {error}", path.display())))?
         };
+        #[cfg(windows)]
+        let file_generation = {
+            let generation_after = file_generation(&file, path)?;
+            if generation_before != generation_after {
+                return Err(io_error(format!(
+                    "{} changed while its read-only mmap was being created: before={generation_before:?}, after={generation_after:?}",
+                    path.display()
+                )));
+            }
+            generation_after
+        };
         Ok(Self {
             mmap,
             path: path.to_path_buf(),
             file_len,
+            #[cfg(windows)]
+            file_generation,
         })
     }
 
@@ -104,6 +150,11 @@ impl MmapColumn {
         &self.path
     }
 
+    #[cfg(windows)]
+    pub(crate) fn file_generation(&self) -> MmapFileGeneration {
+        self.file_generation
+    }
+
     fn checked_end(&self, offset: usize, len: usize) -> Result<usize> {
         let end = offset
             .checked_add(len)
@@ -148,6 +199,28 @@ impl MmapColumn {
     fn advise_range(&self, offset: usize, len: usize, _advice: PageAdvice) {
         let _ = self.checked_end(offset, len);
     }
+}
+
+#[cfg(windows)]
+fn file_generation(file: &File, path: &Path) -> Result<MmapFileGeneration> {
+    let mut information = unsafe { mem::zeroed::<BY_HANDLE_FILE_INFORMATION>() };
+    if unsafe { GetFileInformationByHandle(file.as_raw_handle() as HANDLE, &mut information) } == 0
+    {
+        return Err(io_error(format!(
+            "GetFileInformationByHandle {} failed with Win32 error {}",
+            path.display(),
+            unsafe { GetLastError() }
+        )));
+    }
+    Ok(MmapFileGeneration {
+        volume_serial_number: information.dwVolumeSerialNumber,
+        file_index: (u64::from(information.nFileIndexHigh) << 32)
+            | u64::from(information.nFileIndexLow),
+        file_len: (u64::from(information.nFileSizeHigh) << 32)
+            | u64::from(information.nFileSizeLow),
+        last_write_time_100ns: (u64::from(information.ftLastWriteTime.dwHighDateTime) << 32)
+            | u64::from(information.ftLastWriteTime.dwLowDateTime),
+    })
 }
 
 #[derive(Debug, Clone, Copy)]

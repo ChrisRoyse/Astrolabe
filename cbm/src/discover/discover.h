@@ -111,6 +111,9 @@ typedef struct {
     int64_t source_change_time_100ns;
     bool auxiliary;            /* interpretation input with no registered source language */
     bool interpretation_input; /* changes can affect resolution beyond this file */
+    char structured_classification[16];
+    char structured_classification_provenance[128];
+    uint8_t structured_classification_rank;
 } cbm_file_info_t;
 
 /* True for files that affect source interpretation even when they are not

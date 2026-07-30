@@ -33,6 +33,7 @@ enum {
 #include "pipeline/pipeline_internal.h"
 #include "pipeline/pass_lsp_cross.h"
 #include "pipeline/source_snapshot.h"
+#include "pipeline/structured_data.h"
 #include "pipeline/worker_pool.h"
 #include "graph_buffer/graph_buffer.h"
 #include "mcp/index_supervisor.h" /* cbm_index_worker_active — #405 FSV abort hook gate */
@@ -1723,6 +1724,13 @@ static int run_parallel_pipeline(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
     cbm_log_info("pass.timing", "pass", "lsp_cross_prepare", "elapsed_ms",
                  itoa_buf((int)elapsed_ms(*t)));
     log_phase_mem("lsp_cross_prepare");
+    /* registry_build mutates the main graph through its local next-ID counter
+     * after parallel_extract last advanced shared_ids. Rebase before another
+     * worker phase so resolve IDs begin strictly above every serially created
+     * Channel/Env/definition row. A stale handoff here used to regress the
+     * main ceiling after resolve and silently strand live high-ID nodes at
+     * dump (#841). */
+    cbm_parallel_rebase_shared_ids(p->gbuf, &shared_ids, "parallel_resolve.post_registry");
     cbm_pipeline_phase_probe_t resolve_probe =
         cbm_pipeline_phase_probe_start(p, "parallel_resolve");
     cbm_clock_gettime(CLOCK_MONOTONIC, t);
@@ -2828,6 +2836,11 @@ static int run_githistory(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx) {
     if (gh_result.count > 0 || gh_result.file_temporal_count > 0) {
         gh_edges = cbm_pipeline_githistory_apply(ctx, &gh_result);
     }
+    if (gh_edges < 0) {
+        free(gh_result.couplings);
+        free(gh_result.file_temporal);
+        return CBM_NOT_FOUND;
+    }
     cbm_log_info("pass.done", "pass", "githistory", "commits", itoa_buf(gh_result.commit_count),
                  "edges", itoa_buf(gh_edges));
     free(gh_result.couplings);
@@ -2906,12 +2919,16 @@ static int run_extraction_phase(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
         return CBM_NOT_FOUND;
     }
 
+    if (cbm_pxc_prepare_rust_manifest(ctx) != 0) {
+        return CBM_NOT_FOUND;
+    }
     int worker_count = effective_worker_count(true);
     CBM_PROF_START(t_extract_total);
     int rc = (worker_count > SKIP_ONE && file_count > MIN_FILES_FOR_PARALLEL)
                  ? run_parallel_pipeline(p, ctx, files, file_count, worker_count, &t)
                  : run_sequential_pipeline(p, ctx, files, file_count, &t);
     CBM_PROF_END_N("pipeline", "2_extraction_total", t_extract_total, file_count);
+    cbm_pxc_destroy_rust_manifest(ctx);
     if (check_cancel(p)) {
         return CBM_NOT_FOUND;
     }
@@ -3026,6 +3043,10 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
         goto cleanup;
     }
     p->source_root = source_snapshot.root;
+    if (cbm_structured_classify_files(p->repo_path, p->source_root, files, file_count) != 0) {
+        rc = CBM_NOT_FOUND;
+        goto cleanup;
+    }
     cbm_userconfig_t *captured_userconfig = NULL;
     if (cbm_userconfig_load_checked(p->source_root, &captured_userconfig) != 0 ||
         !cbm_userconfig_equal(p->userconfig, captured_userconfig)) {

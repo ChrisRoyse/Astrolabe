@@ -202,19 +202,41 @@ impl FsvRow {
     /// `store` names the physical location for the refusal message: a column
     /// family name for vault rows, an artifact path for derived files.
     pub fn content(store: impl Into<String>, key: impl Into<Vec<u8>>, bytes: &[u8]) -> Self {
+        Self::content_hash(store, key, *blake3::hash(bytes).as_bytes())
+    }
+
+    /// Plans a row from an already-computed BLAKE3 content digest.
+    ///
+    /// This is the ownership-preserving group-commit boundary: the caller may
+    /// hash a value before moving its only allocation into durable storage,
+    /// while the verification plan retains only the fixed-size expectation.
+    pub fn content_hash(
+        store: impl Into<String>,
+        key: impl Into<Vec<u8>>,
+        content_hash: [u8; 32],
+    ) -> Self {
         Self {
             store: store.into(),
             key: key.into(),
-            expectation: FsvExpectation::ContentHash(*blake3::hash(bytes).as_bytes()),
+            expectation: FsvExpectation::ContentHash(content_hash),
         }
     }
 
     /// Plans a row that must read back as absent or as the given tombstone value.
     pub fn tombstoned(store: impl Into<String>, key: impl Into<Vec<u8>>, tombstone: &[u8]) -> Self {
+        Self::tombstoned_hash(store, key, *blake3::hash(tombstone).as_bytes())
+    }
+
+    /// Plans a non-live row from the already-computed tombstone BLAKE3 digest.
+    pub fn tombstoned_hash(
+        store: impl Into<String>,
+        key: impl Into<Vec<u8>>,
+        tombstone_hash: [u8; 32],
+    ) -> Self {
         Self {
             store: store.into(),
             key: key.into(),
-            expectation: FsvExpectation::NotLive(*blake3::hash(tombstone).as_bytes()),
+            expectation: FsvExpectation::NotLive(tombstone_hash),
         }
     }
 

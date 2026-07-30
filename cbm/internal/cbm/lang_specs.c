@@ -866,24 +866,25 @@ static const char *graphql_field_types[] = {"field_definition", "input_value_def
 // so the existing ES import extractor sees real import_statement nodes.
 // Terminator: an entry whose script_node_type is NULL.
 static const CBMEmbeddedLangSpec vue_embedded_imports[] = {
-    {"script_element", "raw_text", CBM_LANG_JAVASCRIPT},
-    {NULL, NULL, 0},
+    {"script_element", "raw_text", CBM_LANG_JAVASCRIPT, CBM_IMPORT_RESOLVE_ES_SOURCE},
+    {NULL, NULL, 0, 0},
 };
 static const CBMEmbeddedLangSpec svelte_embedded_imports[] = {
-    {"script_element", "raw_text", CBM_LANG_JAVASCRIPT},
-    {NULL, NULL, 0},
+    {"script_element", "raw_text", CBM_LANG_JAVASCRIPT, CBM_IMPORT_RESOLVE_ES_SOURCE},
+    {NULL, NULL, 0, 0},
 };
 static const CBMEmbeddedLangSpec html_embedded_imports[] = {
-    {"script_element", "raw_text", CBM_LANG_JAVASCRIPT},
-    {NULL, NULL, 0},
+    {"script_element", "raw_text", CBM_LANG_JAVASCRIPT, CBM_IMPORT_RESOLVE_BROWSER_URL},
+    {NULL, NULL, 0, 0},
 };
 static const CBMEmbeddedLangSpec astro_embedded_imports[] = {
     /* Astro component scripts live in the `---` frontmatter fence, which the
      * grammar keeps as an unparsed frontmatter_js_block. Re-parse that slice
      * with the JS grammar so `import X from './X.astro'` becomes a real edge. */
-    {"frontmatter", "frontmatter_js_block", CBM_LANG_JAVASCRIPT},
-    {"script_element", "raw_text", CBM_LANG_JAVASCRIPT},
-    {NULL, NULL, 0},
+    {"frontmatter", "frontmatter_js_block", CBM_LANG_JAVASCRIPT,
+     CBM_IMPORT_RESOLVE_ES_SOURCE},
+    {"script_element", "raw_text", CBM_LANG_JAVASCRIPT, CBM_IMPORT_RESOLVE_ES_SOURCE},
+    {NULL, NULL, 0, 0},
 };
 
 // ==================== VUE ====================

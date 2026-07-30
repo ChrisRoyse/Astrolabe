@@ -19,6 +19,7 @@ enum { PD_JSON_FIELD_OVERHEAD = 6 };
 #include "pipeline/pipeline.h"
 #include <stdint.h>
 #include "pipeline/pipeline_internal.h"
+#include "pipeline/pass_lsp_cross.h"
 #include "graph_buffer/graph_buffer.h"
 #include "foundation/log.h"
 #include "foundation/str_util.h" // cbm_json_escape — control chars in string property values (#402)
@@ -264,6 +265,20 @@ static void append_json_string(char *buf, size_t bufsize, size_t *pos, const cha
     *pos = p;
 }
 
+static void append_json_u64(char *buf, size_t bufsize, size_t *pos, const char *key,
+                            uint64_t value) {
+    char field[CBM_SZ_128];
+    int written = snprintf(field, sizeof(field), ",\"%s\":%llu", key,
+                           (unsigned long long)value);
+    if (written <= 0 || (size_t)written >= sizeof(field) ||
+        *pos + (size_t)written + PD_ESC_SPACE > bufsize) {
+        return;
+    }
+    memcpy(buf + *pos, field, (size_t)written);
+    *pos += (size_t)written;
+    buf[*pos] = '\0';
+}
+
 /* Append a JSON array of strings: ,"key":["a","b","c"]. Atomic like
  * append_json_string: emitted only if the whole array fits. */
 static void append_json_str_array(char *buf, size_t bufsize, size_t *pos, const char *key,
@@ -358,6 +373,25 @@ static void build_def_props(char *buf, size_t bufsize, const CBMDefinition *def,
     append_json_str_array(buf, bufsize, &pos, "param_types", def->param_types);
     append_json_string(buf, bufsize, &pos, "route_path", def->route_path);
     append_json_string(buf, bufsize, &pos, "route_method", def->route_method);
+    append_json_string(buf, bufsize, &pos, "structured_path", def->structured_path);
+    if (def->structured_path) {
+        append_json_u64(buf, bufsize, &pos, "structured_occurrence_count",
+                        def->structured_occurrence_count);
+        append_json_string(buf, bufsize, &pos, "structured_occurrence_sha256",
+                           def->structured_occurrence_sha256);
+        append_json_u64(buf, bufsize, &pos, "structured_first_start_byte",
+                        def->structured_first_start_byte);
+        append_json_u64(buf, bufsize, &pos, "structured_first_end_byte",
+                        def->structured_first_end_byte);
+        append_json_u64(buf, bufsize, &pos, "structured_last_start_byte",
+                        def->structured_last_start_byte);
+        append_json_u64(buf, bufsize, &pos, "structured_last_end_byte",
+                        def->structured_last_end_byte);
+        append_json_string(buf, bufsize, &pos, "structured_classification",
+                           def->structured_classification);
+        append_json_string(buf, bufsize, &pos, "structured_classification_provenance",
+                           def->structured_classification_provenance);
+    }
 
     /* MinHash fingerprint — append if present and buffer has room. */
     if (def->fingerprint && def->fingerprint_k > 0 &&
@@ -393,6 +427,52 @@ static void build_def_props(char *buf, size_t bufsize, const CBMDefinition *def,
         buf[pos] = '}';
         buf[pos + SKIP_ONE] = '\0';
     }
+}
+
+int cbm_pipeline_enrich_structured_file(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *file,
+                                        const CBMFileResult *result) {
+    if (!result || !result->structured_classification) {
+        return 0;
+    }
+    if (!ctx || !ctx->gbuf || !file || !file->rel_path ||
+        !result->structured_classification_provenance) {
+        cbm_log_error("structured_data.file_summary_refused", "code",
+                      "CBM_STRUCTURED_FILE_SUMMARY_INPUT_INVALID", "message",
+                      "the structured-data file summary lacks exact graph or provenance input",
+                      "remediation", "preserve the complete extraction result and retry");
+        return CBM_NOT_FOUND;
+    }
+    const char *basename = strrchr(file->rel_path, '/');
+    basename = basename ? basename + SKIP_ONE : file->rel_path;
+    const char *extension = strrchr(basename, '.');
+    char escaped_extension[CBM_SZ_64];
+    char escaped_classification[CBM_SZ_64];
+    char escaped_provenance[CBM_SZ_512];
+    cbm_json_escape(escaped_extension, sizeof(escaped_extension), extension ? extension : "");
+    cbm_json_escape(escaped_classification, sizeof(escaped_classification),
+                    result->structured_classification);
+    cbm_json_escape(escaped_provenance, sizeof(escaped_provenance),
+                    result->structured_classification_provenance);
+    char properties[CBM_SZ_1K];
+    int written = snprintf(
+        properties, sizeof(properties),
+        "{\"extension\":\"%s\",\"structured_classification\":\"%s\","
+        "\"structured_classification_provenance\":\"%s\","
+        "\"structured_schema_path_count\":%llu,\"structured_occurrence_count\":%llu}",
+        escaped_extension, escaped_classification, escaped_provenance,
+        (unsigned long long)result->structured_schema_path_count,
+        (unsigned long long)result->structured_occurrence_count);
+    if (written <= 0 || (size_t)written >= sizeof(properties) ||
+        cbm_gbuf_merge_source_container_properties(ctx->gbuf, "File", file->rel_path,
+                                                   properties) != 0) {
+        cbm_log_error("structured_data.file_summary_refused", "code",
+                      "CBM_STRUCTURED_FILE_SUMMARY_PERSIST_FAILED", "file", file->rel_path,
+                      "message", "the measured structured-data summary could not be persisted",
+                      "remediation",
+                      "preserve the prior store, inspect graph diagnostics, and retry");
+        return CBM_NOT_FOUND;
+    }
+    return 0;
 }
 
 /* Aggregate the api-callee list for one definition. See the declaration in
@@ -763,9 +843,14 @@ int cbm_pipeline_pass_definitions(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
         }
 
         /* Extract */
-        CBMFileResult *result = cbm_extract_file_at_path(
-            source, source_len, lang, ctx->project_name, rel, path, CBM_EXTRACT_BUDGET, NULL,
-            NULL /* no extra defines or configured include paths */);
+        CBMFileResult *result = cbm_extract_file_at_path_with_metadata(
+            source, source_len, lang, ctx->project_name, rel, path,
+            cbm_pxc_rust_edition_for_file(ctx, rel),
+            files[i].structured_classification[0] ? files[i].structured_classification : NULL,
+            files[i].structured_classification_provenance[0]
+                ? files[i].structured_classification_provenance
+                : NULL,
+            CBM_EXTRACT_BUDGET, NULL, NULL /* no extra defines or configured include paths */);
         free(source);
 
         if (!result) {
@@ -780,6 +865,13 @@ int cbm_pipeline_pass_definitions(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
             cbm_pipeline_add_file_error(ctx->pipeline, rel,
                                         result->error_msg ? result->error_msg : "extract failed",
                                         "extract");
+            errors++;
+        }
+
+        if (!result->has_error &&
+            cbm_pipeline_enrich_structured_file(ctx, &files[i], result) != 0) {
+            cbm_pipeline_add_file_error(ctx->pipeline, rel,
+                                        "structured file summary persistence failed", "extract");
             errors++;
         }
 

@@ -116,6 +116,22 @@ const cbm_gbuf_node_t *cbm_gbuf_find_by_atom_id(const cbm_gbuf_t *gb, const char
 const cbm_gbuf_node_t *cbm_gbuf_find_source_container(const cbm_gbuf_t *gb, const char *label,
                                                       const char *file_path);
 
+/* Replace only the derived properties of the unique exact source container.
+ * Identity and source bytes remain immutable. Returns 0 on success and poisons
+ * persistence on absent/ambiguous input, malformed JSON, or allocation failure. */
+int cbm_gbuf_replace_source_container_properties(cbm_gbuf_t *gb, const char *label,
+                                                 const char *file_path,
+                                                 const char *properties_json);
+
+/* Apply one RFC 7386 object patch to the derived properties of the unique exact
+ * source container. Existing unrelated fields are retained and patch keys
+ * replace their prior values. Identity and source bytes remain immutable.
+ * Returns 0 on success and poisons persistence on absent/ambiguous input,
+ * malformed object JSON, merge/write failure, or allocation failure. */
+int cbm_gbuf_merge_source_container_properties(cbm_gbuf_t *gb, const char *label,
+                                               const char *file_path,
+                                               const char *properties_patch_json);
+
 /* Mark a caller-diagnosed reference ambiguity as terminal for persistence.
  * Callers must emit a structured diagnostic before invoking this function. */
 void cbm_gbuf_refuse_resolution(cbm_gbuf_t *gb);
@@ -207,7 +223,8 @@ int cbm_gbuf_node_count(const cbm_gbuf_t *gb);
 /* Get the next ID that would be assigned. Used to initialize shared atomic counters. */
 int64_t cbm_gbuf_next_id(const cbm_gbuf_t *gb);
 
-/* Set the next ID counter. Used after merging worker gbufs to sync the main counter. */
+/* Advance the next-ID counter after merging worker gbufs. A regressing handoff
+ * poisons the graph so persistence refuses instead of hiding live high-ID rows. */
 void cbm_gbuf_set_next_id(cbm_gbuf_t *gb, int64_t next_id);
 
 /* Delete all nodes with a label. Cascade-deletes referencing edges. */

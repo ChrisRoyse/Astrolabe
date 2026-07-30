@@ -5514,6 +5514,12 @@ static void add_excluded_summary(yyjson_mut_doc *doc, yyjson_mut_val *root, char
  * the JSON carries "count" + "truncated" so nothing is silently hidden. */
 enum { INDEX_SKIPPED_FILE_CAP = 50 };
 
+/* Keep successful unresolved-browser diagnostics bounded in the MCP response,
+ * while the exact complete request set remains in the verified source store. */
+enum { INDEX_BROWSER_RUNTIME_REQUEST_CAP = 50 };
+
+static bool is_lower_hex_sha256(const char *value);
+
 /* Attach a summary of per-file skips (Stage 2 / Track B). Always emits a
  * top-level "skipped_count" (0 on clean runs) so consumers can rely on it.
  * When there are skips, also emits:
@@ -5544,6 +5550,200 @@ static void add_skipped_summary(yyjson_mut_doc *doc, yyjson_mut_val *root,
     if (logfile && logfile[0]) {
         yyjson_mut_obj_add_strcpy(doc, root, "logfile", logfile);
     }
+}
+
+typedef enum {
+    BROWSER_RUNTIME_DIAGNOSTICS_OK = 0,
+    BROWSER_RUNTIME_DIAGNOSTICS_STORE_ERROR,
+    BROWSER_RUNTIME_DIAGNOSTICS_RESPONSE_ERROR,
+} browser_runtime_diagnostics_status_t;
+
+static int compare_browser_runtime_request_nodes(const void *left, const void *right) {
+    const cbm_node_t *a = left;
+    const cbm_node_t *b = right;
+    const char *a_name = a->name ? a->name : "";
+    const char *b_name = b->name ? b->name : "";
+    int result = strcmp(a_name, b_name);
+    if (result != 0) {
+        return result;
+    }
+    const char *a_qn = a->qualified_name ? a->qualified_name : "";
+    const char *b_qn = b->qualified_name ? b->qualified_name : "";
+    result = strcmp(a_qn, b_qn);
+    if (result != 0) {
+        return result;
+    }
+    return strcmp(a->atom_id ? a->atom_id : "", b->atom_id ? b->atom_id : "");
+}
+
+static bool browser_runtime_request_property_is(yyjson_val *root, const char *key,
+                                                const char *expected) {
+    yyjson_val *value = yyjson_is_obj(root) ? yyjson_obj_get(root, key) : NULL;
+    const char *text = yyjson_is_str(value) ? yyjson_get_str(value) : NULL;
+    size_t length = text ? yyjson_get_len(value) : 0;
+    return text && strlen(text) == length && strcmp(text, expected) == 0;
+}
+
+static bool validate_browser_runtime_request_node(const cbm_node_t *node, char *detail,
+                                                  size_t detail_size) {
+    if (!node || !node->label || strcmp(node->label, "RuntimeModuleRequest") != 0 ||
+        !node->name || !node->name[0] || !node->qualified_name || !node->qualified_name[0] ||
+        !node->file_path || !node->file_path[0] || !is_lower_hex_sha256(node->atom_id) ||
+        node->source_present || node->source_len != 0 || node->start_byte != 0 ||
+        node->end_byte != 0 || node->start_line != 0 || node->end_line != 0) {
+        snprintf(detail, detail_size,
+                 "RuntimeModuleRequest row has invalid identity/source fields (atom=%.64s, "
+                 "specifier=%.160s, source=%.160s)",
+                 node && node->atom_id ? node->atom_id : "",
+                 node && node->name ? node->name : "",
+                 node && node->file_path ? node->file_path : "");
+        return false;
+    }
+
+    yyjson_read_err json_error;
+    yyjson_doc *properties =
+        node->properties_json
+            ? yyjson_read_opts(node->properties_json, strlen(node->properties_json), 0, NULL,
+                               &json_error)
+            : NULL;
+    yyjson_val *property_root = properties ? yyjson_doc_get_root(properties) : NULL;
+    bool valid = browser_runtime_request_property_is(property_root, "resolution_kind",
+                                                     "browser_url") &&
+                 browser_runtime_request_property_is(property_root, "source_file",
+                                                     node->file_path) &&
+                 browser_runtime_request_property_is(property_root, "specifier", node->name) &&
+                 browser_runtime_request_property_is(property_root, "target_state",
+                                                     "runtime_resolution_required");
+    if (!valid) {
+        snprintf(detail, detail_size,
+                 "RuntimeModuleRequest properties do not exactly bind browser_url, source_file, "
+                 "specifier, and runtime_resolution_required (atom=%.64s, parse=%.160s)",
+                 node->atom_id,
+                 properties ? "valid JSON object with mismatched fields"
+                            : (node->properties_json && json_error.msg ? json_error.msg
+                                                                       : "properties absent"));
+    }
+    yyjson_doc_free(properties);
+    return valid;
+}
+
+/* A clean supervised worker is intentionally ephemeral, so its log cannot be
+ * the durable carrier for a handled RuntimeModuleRequest warning. Read the
+ * independently verified published store and place a bounded, deterministic
+ * diagnostic in the successful response. The exact uncapped set remains
+ * queryable from the source database. */
+static browser_runtime_diagnostics_status_t add_browser_runtime_request_diagnostics(
+    cbm_mcp_server_t *srv, yyjson_mut_doc *doc, yyjson_mut_val *root, cbm_store_t *store,
+    const char *project_name) {
+    cbm_node_t *requests = NULL;
+    int count = 0;
+    if (cbm_store_find_nodes_by_label(store, project_name, "RuntimeModuleRequest", &requests,
+                                      &count) != CBM_STORE_OK || count < 0) {
+        record_store_query_failure(srv, project_name, cbm_store_db_path(store), store,
+                                   CBM_STORE_VERIFY_IO_FAILED,
+                                   "source.query_browser_runtime_requests", cbm_store_error(store));
+        cbm_store_free_nodes(requests, count > 0 ? count : 0);
+        return BROWSER_RUNTIME_DIAGNOSTICS_STORE_ERROR;
+    }
+
+    if (count > 1) {
+        qsort(requests, (size_t)count, sizeof(*requests),
+              compare_browser_runtime_request_nodes);
+    }
+    for (int i = 0; i < count; i++) {
+        char detail[CBM_STORE_VERIFY_DETAIL_MAX];
+        if (!validate_browser_runtime_request_node(&requests[i], detail, sizeof(detail))) {
+            record_store_query_failure(srv, project_name, cbm_store_db_path(store), store,
+                                       CBM_STORE_VERIFY_INTEGRITY_FAILED,
+                                       "source.validate_browser_runtime_request", detail);
+            cbm_store_free_nodes(requests, count);
+            return BROWSER_RUNTIME_DIAGNOSTICS_STORE_ERROR;
+        }
+    }
+
+    bool response_ok = yyjson_mut_obj_add_int(doc, root, "browser_runtime_request_count", count);
+    if (count > 0) {
+        yyjson_mut_val *diagnostic = yyjson_mut_obj(doc);
+        yyjson_mut_val *items = yyjson_mut_arr(doc);
+        response_ok = response_ok && diagnostic && items;
+        int shown = count < INDEX_BROWSER_RUNTIME_REQUEST_CAP
+                        ? count
+                        : INDEX_BROWSER_RUNTIME_REQUEST_CAP;
+        for (int i = 0; response_ok && i < shown; i++) {
+            yyjson_mut_val *item = yyjson_mut_obj(doc);
+            response_ok = item &&
+                          yyjson_mut_obj_add_strcpy(doc, item, "atom_id", requests[i].atom_id) &&
+                          yyjson_mut_obj_add_strcpy(doc, item, "specifier", requests[i].name) &&
+                          yyjson_mut_obj_add_strcpy(doc, item, "source_file",
+                                                   requests[i].file_path) &&
+                          yyjson_mut_obj_add_strcpy(doc, item, "qualified_name",
+                                                   requests[i].qualified_name) &&
+                          yyjson_mut_obj_add_str(doc, item, "resolution_kind", "browser_url") &&
+                          yyjson_mut_obj_add_str(doc, item, "target_state",
+                                                "runtime_resolution_required") &&
+                          yyjson_mut_arr_add_val(items, item);
+        }
+        response_ok =
+            response_ok &&
+            yyjson_mut_obj_add_str(doc, diagnostic, "code",
+                                   "CBM_IMPORT_BROWSER_RUNTIME_TARGET_UNAVAILABLE") &&
+            yyjson_mut_obj_add_str(
+                doc, diagnostic, "message",
+                "browser module URLs without exact repository source targets were retained as "
+                "first-class runtime requests") &&
+            yyjson_mut_obj_add_str(
+                doc, diagnostic, "remediation",
+                "materialize each runtime artifact when executing the application; query the "
+                "persisted RuntimeModuleRequest nodes for the complete exact set") &&
+            yyjson_mut_obj_add_int(doc, diagnostic, "count", count) &&
+            yyjson_mut_obj_add_int(doc, diagnostic, "returned", shown) &&
+            yyjson_mut_obj_add_bool(doc, diagnostic, "truncated",
+                                    count > INDEX_BROWSER_RUNTIME_REQUEST_CAP) &&
+            yyjson_mut_obj_add_val(doc, diagnostic, "items", items) &&
+            yyjson_mut_obj_add_val(doc, root, "browser_runtime_requests", diagnostic);
+    }
+    cbm_store_free_nodes(requests, count);
+    return response_ok ? BROWSER_RUNTIME_DIAGNOSTICS_OK
+                       : BROWSER_RUNTIME_DIAGNOSTICS_RESPONSE_ERROR;
+}
+
+static char *build_browser_runtime_diagnostics_response_error(const char *project_name) {
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    if (!doc) {
+        return heap_strdup(
+            "{\"code\":\"CBM_INDEX_RUNTIME_REQUEST_DIAGNOSTIC_ALLOC_FAILED\","
+            "\"source_family_preserved\":true}");
+    }
+    yyjson_mut_val *root = yyjson_mut_obj(doc);
+    if (!root) {
+        yyjson_mut_doc_free(doc);
+        return heap_strdup(
+            "{\"code\":\"CBM_INDEX_RUNTIME_REQUEST_DIAGNOSTIC_ALLOC_FAILED\","
+            "\"source_family_preserved\":true}");
+    }
+    yyjson_mut_doc_set_root(doc, root);
+    bool complete =
+        yyjson_mut_obj_add_str(doc, root, "status", "error") &&
+        yyjson_mut_obj_add_str(doc, root, "code",
+                               "CBM_INDEX_RUNTIME_REQUEST_DIAGNOSTIC_ALLOC_FAILED") &&
+        yyjson_mut_obj_add_str(doc, root, "operation",
+                               "emit_browser_runtime_request_diagnostics") &&
+        yyjson_mut_obj_add_str(
+            doc, root, "message",
+            "the verified index was published but its durable runtime-request diagnostic could "
+            "not be allocated") &&
+        yyjson_mut_obj_add_str(
+            doc, root, "remediation",
+            "preserve the published source family, free memory, and inspect the persisted "
+            "RuntimeModuleRequest rows before retrying") &&
+        yyjson_mut_obj_add_strcpy(doc, root, "project", project_name ? project_name : "") &&
+        yyjson_mut_obj_add_bool(doc, root, "source_family_preserved", true);
+    char *json = complete ? yyjson_mut_write(doc, 0, NULL) : NULL;
+    yyjson_mut_doc_free(doc);
+    return json ? json
+                : heap_strdup(
+                      "{\"code\":\"CBM_INDEX_RUNTIME_REQUEST_DIAGNOSTIC_ALLOC_FAILED\","
+                      "\"source_family_preserved\":true}");
 }
 
 /* Write the FULL (uncapped) skip list to a per-run logfile — ONLY when >=1 file
@@ -5708,6 +5908,15 @@ static char *build_index_success_response(cbm_mcp_server_t *srv, yyjson_mut_doc 
                       "persisted node/edge counts differ from the completed in-memory graph",
                       "remediation", "preserve the database family and inspect persistence");
         return build_index_state_mismatch_error(project_name, exp_nodes, exp_edges, nodes, edges);
+    }
+
+    browser_runtime_diagnostics_status_t runtime_diagnostics =
+        add_browser_runtime_request_diagnostics(srv, doc, root, store, project_name);
+    if (runtime_diagnostics == BROWSER_RUNTIME_DIAGNOSTICS_STORE_ERROR) {
+        return build_recorded_store_error(srv);
+    }
+    if (runtime_diagnostics == BROWSER_RUNTIME_DIAGNOSTICS_RESPONSE_ERROR) {
+        return build_browser_runtime_diagnostics_response_error(project_name);
     }
 
     size_t phase_metric_count = 0;

@@ -23,6 +23,7 @@ enum { CC_LINE_MARGIN = 24 };
 #include "pipeline/pipeline.h"
 #include <stdint.h>
 #include "pipeline/pipeline_internal.h"
+#include "pipeline/pass_lsp_cross.h"
 #include "pipeline/lsp_resolve.h"
 #include "graph_buffer/graph_buffer.h"
 #include "foundation/log.h"
@@ -516,9 +517,9 @@ static CBMFileResult *calls_get_or_extract(cbm_pipeline_ctx_t *ctx, int idx,
     if (!src) {
         return NULL;
     }
-    CBMFileResult *r =
-        cbm_extract_file_at_path(src, slen, fi->language, ctx->project_name, fi->rel_path, fi->path,
-                                 CBM_EXTRACT_BUDGET, NULL, NULL);
+    CBMFileResult *r = cbm_extract_file_at_path_with_rust_edition(
+        src, slen, fi->language, ctx->project_name, fi->rel_path, fi->path,
+        cbm_pxc_rust_edition_for_file(ctx, fi->rel_path), CBM_EXTRACT_BUDGET, NULL, NULL);
     free(src);
     if (r) {
         *owned = true;

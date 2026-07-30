@@ -17,6 +17,7 @@ enum { INCR_RING_BUF = 4, INCR_RING_MASK = 3, INCR_TS_BUF = 24 };
 #include <stdio.h>
 #include <time.h>
 #include "pipeline/pipeline_internal.h"
+#include "pipeline/pass_lsp_cross.h"
 #include "store/store.h"
 #include "graph_buffer/graph_buffer.h"
 #include "discover/discover.h"
@@ -729,6 +730,12 @@ static int run_extract_resolve(cbm_pipeline_ctx_t *ctx, cbm_file_info_t *changed
              * next full re-index. Pass NULL/0/NULL to make the fused
              * step in resolve_worker a no-op. */
             if (rc == 0) {
+                /* incr_registry mutates the main graph after the extract
+                 * workers last advanced shared_ids. Resolve must allocate from
+                 * the resulting exact ceiling, never the stale pre-registry
+                 * value (#841). */
+                cbm_parallel_rebase_shared_ids(ctx->gbuf, &shared_ids,
+                                               "incremental_resolve.post_registry");
                 cbm_clock_gettime(CLOCK_MONOTONIC, &t);
                 cbm_pipeline_phase_probe_t resolve_probe =
                     cbm_pipeline_phase_probe_start(ctx->pipeline, "incr_resolve");
@@ -1429,7 +1436,17 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
         return CBM_NOT_FOUND;
     }
 
+    if (cbm_pxc_prepare_rust_manifest(&ctx) != 0) {
+        incr_free_edge_capture(&edge_cap);
+        free(changed_files);
+        cbm_registry_free(registry);
+        cbm_path_alias_collection_free(path_aliases);
+        free_mode_skipped(mode_skipped, mode_skipped_count);
+        cbm_gbuf_free(existing);
+        return CBM_NOT_FOUND;
+    }
     int extract_rc = run_extract_resolve(&ctx, changed_files, ci);
+    cbm_pxc_destroy_rust_manifest(&ctx);
     if (extract_rc != 0) {
         incr_free_edge_capture(&edge_cap);
         free(changed_files);

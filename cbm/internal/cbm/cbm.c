@@ -11,6 +11,7 @@
 #include "lsp/cs_lsp.h"
 #include "lsp/java_lsp.h"
 #include "lsp/kotlin_lsp.h"
+#include "lsp/rust_cargo.h"
 #include "lsp/rust_lsp.h"
 #include "preprocessor.h"
 #include "foundation/compat.h"
@@ -686,8 +687,11 @@ static int count_params_from_signature(const char *sig) {
 static CBMFileResult *cbm_extract_file_impl(const char *source, int source_len,
                                             CBMLanguage language, const char *project,
                                             const char *rel_path, const char *source_path,
-                                            int64_t timeout_micros, const char **extra_defines,
-                                            const char **include_paths);
+                                            const char *rust_edition,
+                                            const char *structured_classification_override,
+                                            const char *structured_classification_provenance,
+                                            int64_t timeout_micros,
+                                            const char **extra_defines, const char **include_paths);
 
 static void cbm_file_result_discard_atoms(CBMFileResult *result) {
     if (!result) {
@@ -811,22 +815,47 @@ static bool cbm_extract_arena_ok(CBMFileResult *result, const char *phase, const
 CBMFileResult *cbm_extract_file(const char *source, int source_len, CBMLanguage language,
                                 const char *project, const char *rel_path, int64_t timeout_micros,
                                 const char **extra_defines, const char **include_paths) {
-    return cbm_extract_file_impl(source, source_len, language, project, rel_path, NULL,
-                                 timeout_micros, extra_defines, include_paths);
+    return cbm_extract_file_impl(source, source_len, language, project, rel_path, NULL, NULL,
+                                 NULL, NULL, timeout_micros, extra_defines, include_paths);
 }
 
 CBMFileResult *cbm_extract_file_at_path(const char *source, int source_len, CBMLanguage language,
                                         const char *project, const char *rel_path,
                                         const char *source_path, int64_t timeout_micros,
                                         const char **extra_defines, const char **include_paths) {
+    return cbm_extract_file_impl(source, source_len, language, project, rel_path, source_path, NULL,
+                                 NULL, NULL, timeout_micros, extra_defines, include_paths);
+}
+
+CBMFileResult *cbm_extract_file_at_path_with_rust_edition(
+    const char *source, int source_len, CBMLanguage language, const char *project,
+    const char *rel_path, const char *source_path, const char *rust_edition, int64_t timeout_micros,
+    const char **extra_defines, const char **include_paths) {
     return cbm_extract_file_impl(source, source_len, language, project, rel_path, source_path,
-                                 timeout_micros, extra_defines, include_paths);
+                                 rust_edition, NULL, NULL, timeout_micros, extra_defines,
+                                 include_paths);
+}
+
+CBMFileResult *cbm_extract_file_at_path_with_metadata(
+    const char *source, int source_len, CBMLanguage language, const char *project,
+    const char *rel_path, const char *source_path, const char *rust_edition,
+    const char *structured_classification_override,
+    const char *structured_classification_override_provenance, int64_t timeout_micros,
+    const char **extra_defines, const char **include_paths) {
+    return cbm_extract_file_impl(
+        source, source_len, language, project, rel_path, source_path, rust_edition,
+        structured_classification_override, structured_classification_override_provenance,
+        timeout_micros, extra_defines, include_paths);
 }
 
 static CBMFileResult *cbm_extract_file_impl(const char *source, int source_len,
                                             CBMLanguage language, const char *project,
                                             const char *rel_path, const char *source_path,
-                                            int64_t timeout_micros, const char **extra_defines,
+                                            const char *rust_edition,
+                                            const char *structured_classification_override,
+                                            const char *structured_classification_provenance,
+                                            int64_t timeout_micros,
+                                            const char **extra_defines,
                                             const char **include_paths) {
     // Allocate result on heap (arena inside for all string data)
     enum { SINGLE = 1 };
@@ -950,6 +979,9 @@ static CBMFileResult *cbm_extract_file_impl(const char *source, int source_len,
         .rel_path = rel_path,
         .module_qn = result->module_qn,
         .root = root,
+        .structured_classification_override = structured_classification_override,
+        .structured_classification_override_provenance =
+            structured_classification_provenance,
     };
 
     if (language == CBM_LANG_POWERSHELL) {
@@ -1049,7 +1081,10 @@ static CBMFileResult *cbm_extract_file_impl(const char *source, int source_len,
         cbm_run_kotlin_lsp(a, result, source, source_len, root);
     }
     if (language == CBM_LANG_RUST) {
-        cbm_run_rust_lsp(a, result, source, source_len, root);
+        CBMCargoManifest active_manifest = {0};
+        active_manifest.active_edition = rust_edition;
+        cbm_run_rust_lsp_with_manifest(a, result, source, source_len, root,
+                                       rust_edition ? &active_manifest : NULL);
     }
     if (!cbm_extract_arena_ok(result, "per_file_lsp", rel_path)) {
         goto extraction_failed;

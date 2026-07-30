@@ -274,6 +274,7 @@ PIPELINE_SRCS = \
     src/pipeline/path_alias.c \
     src/pipeline/registry.c \
     src/pipeline/source_snapshot.c \
+    src/pipeline/structured_data.c \
     src/pipeline/pipeline.c \
     src/pipeline/pipeline_incremental.c \
     src/pipeline/worker_pool.c \

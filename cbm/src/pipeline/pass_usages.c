@@ -16,6 +16,7 @@
 #include "foundation/str_util.h" // cbm_json_escape
 #include "pipeline/pipeline.h"
 #include "pipeline/pipeline_internal.h"
+#include "pipeline/pass_lsp_cross.h"
 #include "graph_buffer/graph_buffer.h"
 #include "foundation/log.h"
 #include "foundation/compat.h"
@@ -309,9 +310,9 @@ int cbm_pipeline_pass_usages(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *fil
                 errors++;
                 continue;
             }
-            result =
-                cbm_extract_file_at_path(source, source_len, files[i].language, ctx->project_name,
-                                         rel, files[i].path, CBM_EXTRACT_BUDGET, NULL, NULL);
+            result = cbm_extract_file_at_path_with_rust_edition(
+                source, source_len, files[i].language, ctx->project_name, rel, files[i].path,
+                cbm_pxc_rust_edition_for_file(ctx, rel), CBM_EXTRACT_BUDGET, NULL, NULL);
             free(source);
             if (!result) {
                 errors++;

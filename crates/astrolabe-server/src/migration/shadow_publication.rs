@@ -752,11 +752,11 @@ impl ShadowPublication {
 
                     let staged_vault_dir = vault_dir(&self.stage_cache, &self.project);
                     let salt = vault_salt(&self.project);
-                    let vault = AsterVault::new_durable(
+                    let vault = open_shadow_vault_read_only(
                         &live_vault,
-                        VaultId::from_str(SHADOW_VAULT_ID)?,
-                        salt.clone().into_bytes(),
-                        VaultOptions::default(),
+                        SHADOW_VAULT_ID,
+                        &salt,
+                        Vec::new(),
                     )?;
                     vault.copy_durable_snapshot_to(&staged_vault_dir)?;
                     drop(vault);
@@ -936,10 +936,24 @@ impl ShadowPublication {
         );
         let cleanup_error = remove_transaction_tree(&self.transaction_dir, &self.project_root);
         let root_cleanup_error = remove_empty_dir(&self.project_root);
-        match (journal_error, cleanup_error, root_cleanup_error) {
-            (Ok(()), Ok(()), Ok(())) => Ok(()),
-            (journal, cleanup, root_cleanup) => Err(format!(
-                "ASTRO_SHADOW_PUBLICATION_ABORT_CLEANUP_FAILED: transaction evidence cleanup was incomplete (journal={journal:?}, cleanup={cleanup:?}, root_cleanup={root_cleanup:?}) at {}; originating_error={}; remediation: do not serve or retry this project until the exact transaction tree is inspected and safely reconciled",
+        let publication_root_cleanup_error = if let Some(parent) = self.project_root.parent() {
+            remove_empty_dir(parent)
+        } else {
+            Err(format!(
+                "ASTRO_SHADOW_PUBLICATION_ROOT_MISSING: project transaction root {} has no publication parent; remediation: preserve the exact transaction path and inspect its construction before retrying",
+                self.project_root.display()
+            )
+            .into())
+        };
+        match (
+            journal_error,
+            cleanup_error,
+            root_cleanup_error,
+            publication_root_cleanup_error,
+        ) {
+            (Ok(()), Ok(()), Ok(()), Ok(())) => Ok(()),
+            (journal, cleanup, root_cleanup, publication_root_cleanup) => Err(format!(
+                "ASTRO_SHADOW_PUBLICATION_ABORT_CLEANUP_FAILED: transaction evidence cleanup was incomplete (journal={journal:?}, cleanup={cleanup:?}, root_cleanup={root_cleanup:?}, publication_root_cleanup={publication_root_cleanup:?}) at {}; originating_error={}; remediation: do not serve or retry this project until the exact transaction tree is inspected and safely reconciled",
                 self.transaction_dir.display(),
                 error
             )

@@ -351,22 +351,29 @@ static void parse_python_imports(CBMExtractCtx *ctx) {
 // import X from "Y"; import {A, B} from "Y"; import * as X from "Y"
 // const X = require("Y")
 
-static CBMImport make_es_import(const char *local_name, const char *module_path) {
+static CBMImportResolution es_import_resolution(const CBMExtractCtx *ctx) {
+    return ctx && ctx->es_import_resolution_override_enabled
+               ? ctx->es_import_resolution_override
+               : CBM_IMPORT_RESOLVE_ES_SOURCE;
+}
+
+static CBMImport make_es_import(const CBMExtractCtx *ctx, const char *local_name,
+                                const char *module_path) {
     return (CBMImport){
         .local_name = local_name,
         .module_path = module_path,
-        .resolution = CBM_IMPORT_RESOLVE_ES_SOURCE,
+        .resolution = es_import_resolution(ctx),
     };
 }
 
 /* Side-effect imports and re-exports carry a ModuleRequest but introduce no
  * local import binding in the source module. Keep their exact reachability as
  * an unbound code dependency; a path component is not a source identifier. */
-static CBMImport make_es_unbound_import(const char *module_path) {
+static CBMImport make_es_unbound_import(const CBMExtractCtx *ctx, const char *module_path) {
     return (CBMImport){
         .module_path = module_path,
         .dependency_kind = "es_module",
-        .resolution = CBM_IMPORT_RESOLVE_ES_SOURCE,
+        .resolution = es_import_resolution(ctx),
         .binding = CBM_IMPORT_BINDING_UNBOUND,
     };
 }
@@ -405,7 +412,7 @@ static bool process_named_imports(CBMExtractCtx *ctx, TSNode sub, const char *pa
         if (!ts_node_is_null(orig)) {
             char *local_name = !ts_node_is_null(local) ? cbm_node_text(a, local, ctx->source)
                                                        : cbm_node_text(a, orig, ctx->source);
-            CBMImport imp = make_es_import(local_name, path);
+            CBMImport imp = make_es_import(ctx, local_name, path);
             if (!cbm_imports_push(&ctx->result->imports, a, imp)) {
                 return false;
             }
@@ -425,7 +432,7 @@ static bool process_import_clause(CBMExtractCtx *ctx, TSNode clause, const char 
         const char *sk = ts_node_type(sub);
         if (strcmp(sk, "identifier") == 0) {
             char *name = cbm_node_text(a, sub, ctx->source);
-            CBMImport imp = make_es_import(name, path);
+            CBMImport imp = make_es_import(ctx, name, path);
             if (!cbm_imports_push(&ctx->result->imports, a, imp)) {
                 return false;
             }
@@ -437,7 +444,7 @@ static bool process_import_clause(CBMExtractCtx *ctx, TSNode clause, const char 
             }
             if (!ts_node_is_null(as_name)) {
                 char *name = cbm_node_text(a, as_name, ctx->source);
-                CBMImport imp = make_es_import(name, path);
+                CBMImport imp = make_es_import(ctx, name, path);
                 if (!cbm_imports_push(&ctx->result->imports, a, imp)) {
                     return false;
                 }
@@ -474,7 +481,7 @@ static bool process_es_import_statement(CBMExtractCtx *ctx, TSNode node) {
         const char *ck = ts_node_type(child);
         if (strcmp(ck, "identifier") == 0) {
             char *name = cbm_node_text(a, child, ctx->source);
-            CBMImport imp = make_es_import(name, path);
+            CBMImport imp = make_es_import(ctx, name, path);
             if (!cbm_imports_push(&ctx->result->imports, a, imp)) {
                 return false;
             }
@@ -490,7 +497,7 @@ static bool process_es_import_statement(CBMExtractCtx *ctx, TSNode node) {
         }
     }
     if (!found) {
-        CBMImport imp = make_es_unbound_import(path);
+        CBMImport imp = make_es_unbound_import(ctx, path);
         if (!cbm_imports_push(&ctx->result->imports, a, imp)) {
             return false;
         }
@@ -559,7 +566,7 @@ static bool process_commonjs_require(CBMExtractCtx *ctx, TSNode call) {
         local_name = path_last(a, path);
     }
 
-    CBMImport imp = make_es_import(local_name, path);
+    CBMImport imp = make_es_import(ctx, local_name, path);
     if (!cbm_imports_push(&ctx->result->imports, a, imp)) {
         return false;
     }
@@ -592,7 +599,7 @@ static void walk_es_imports(CBMExtractCtx *ctx, TSNode root) {
             if (!ts_node_is_null(src)) {
                 char *path = strip_quotes(ctx->arena, cbm_node_text(ctx->arena, src, ctx->source));
                 if (path && path[0]) {
-                    CBMImport imp = make_es_unbound_import(path);
+                    CBMImport imp = make_es_unbound_import(ctx, path);
                     if (!cbm_imports_push(&ctx->result->imports, ctx->arena, imp)) {
                         return;
                     }
@@ -1624,6 +1631,12 @@ static void parse_embedded_imports(CBMExtractCtx *ctx) {
         return;
     }
     for (const CBMEmbeddedLangSpec *e = spec->embedded_imports; e->script_node_type != NULL; e++) {
+        if (e->import_resolution != CBM_IMPORT_RESOLVE_ES_SOURCE &&
+            e->import_resolution != CBM_IMPORT_RESOLVE_BROWSER_URL) {
+            cbm_arena_mark_failed(ctx->arena, "CBM_EMBEDDED_IMPORT_RESOLUTION_INVALID",
+                                  "embedded_import_resolution", (uint32_t)e->import_resolution);
+            return;
+        }
         const TSLanguage *embedded_lang = cbm_ts_language(e->embedded_language);
         if (!embedded_lang) {
             cbm_arena_mark_failed(ctx->arena, "CBM_EMBEDDED_GRAMMAR_UNAVAILABLE",
@@ -1692,6 +1705,8 @@ static void parse_embedded_imports(CBMExtractCtx *ctx) {
                     sub_ctx.source = sub_src;
                     sub_ctx.source_len = (int)sub_len;
                     sub_ctx.root = ts_tree_root_node(sub_tree);
+                    sub_ctx.es_import_resolution_override = e->import_resolution;
+                    sub_ctx.es_import_resolution_override_enabled = true;
                     walk_es_imports(&sub_ctx, sub_ctx.root);
                     ts_tree_delete(sub_tree);
                     if (cbm_arena_failed(ctx->arena)) {

@@ -25,15 +25,15 @@ impl DurableVault {
         self.write_manifest(seq)
     }
 
-    pub(in crate::vault) fn stage_checkpoint_batch(
+    pub(in crate::vault) fn stage_checkpoint_batch_owned(
         &self,
         seq: u64,
-        rows: &[WriteRow],
+        rows: Vec<WriteRow>,
     ) -> Result<()> {
         self.pending_checkpoint
             .lock()
             .map_err(|_| CalyxError::disk_pressure("checkpoint staging lock poisoned"))?
-            .push((seq, rows.to_vec()));
+            .push((seq, rows));
         Ok(())
     }
 
@@ -86,15 +86,20 @@ impl DurableVault {
     }
 
     pub(super) fn flush_pending_checkpoints(&self) -> Result<()> {
-        let batches = self
+        // Keep the pending guard through SST and manifest publication. Commits
+        // serialize through the vault's durable file lock, and retaining this
+        // inner guard makes failure atomic: until the manifest is durable every
+        // owned batch remains queued, without a corpus-sized clone. A failed
+        // write can therefore be retried exactly; success clears only after the
+        // crash boundary has passed.
+        let mut batches = self
             .pending_checkpoint
             .lock()
-            .map_err(|_| CalyxError::disk_pressure("checkpoint staging lock poisoned"))?
-            .clone();
+            .map_err(|_| CalyxError::disk_pressure("checkpoint staging lock poisoned"))?;
         if batches.is_empty() {
             return Ok(());
         }
-        for (seq, rows) in &batches {
+        for (seq, rows) in batches.iter() {
             self.write_rows(*seq, rows)?;
             self.advance_checkpointed_derived_content(*seq, rows);
         }
@@ -105,11 +110,7 @@ impl DurableVault {
         // advanced manifest + durable-batch SSTs (checkpoint replay), not the WAL.
         #[cfg(any(test, feature = "crash-fsv"))]
         crate::vault::failpoints::crash_fsv_after_checkpoint(last_seq)?;
-        let mut pending = self
-            .pending_checkpoint
-            .lock()
-            .map_err(|_| CalyxError::disk_pressure("checkpoint staging lock poisoned"))?;
-        pending.retain(|(seq, _)| *seq > last_seq);
+        batches.clear();
         Ok(())
     }
 }

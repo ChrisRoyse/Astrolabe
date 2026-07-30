@@ -9,20 +9,25 @@ use std::collections::BinaryHeap;
 impl SstReader {
     pub(crate) fn lower_bound(&self, key: &[u8], exclusive: bool) -> usize {
         if exclusive {
-            self.index
+            self.lookup
+                .index
                 .partition_point(|entry| entry.key.as_slice() <= key)
         } else {
-            self.index
+            self.lookup
+                .index
                 .partition_point(|entry| entry.key.as_slice() < key)
         }
     }
 
     pub(crate) fn key_at(&self, position: usize) -> Option<&[u8]> {
-        self.index.get(position).map(|entry| entry.key.as_slice())
+        self.lookup
+            .index
+            .get(position)
+            .map(|entry| entry.key.as_slice())
     }
 
     pub(crate) fn entry_at(&self, position: usize) -> Result<SstEntry> {
-        read_record(self.column.as_bytes(), self.index[position].offset)
+        read_record(self.column.as_bytes(), self.lookup.index[position].offset)
     }
 }
 
@@ -160,7 +165,7 @@ fn open_page_cursor(
         .files
         .par_iter()
         .map(|file| {
-            let reader = SstReader::open(&file.path)?;
+            let reader = file.open_reader()?;
             let mut pos = reader.lower_bound(lower, exclusive);
             while reader.key_at(pos).is_some_and(|key| key < start) {
                 pos += 1;

@@ -22,6 +22,7 @@ where
             clock: std::sync::Arc::new(clock),
             rows: VersionedCfStore::new_with_router(0, router),
             durable: None,
+            durable_root: None,
             dedup_policy: DedupPolicy::default(),
             retention_horizon: std::sync::Mutex::new(RetentionHorizon::default()),
             ledger_hook: None,

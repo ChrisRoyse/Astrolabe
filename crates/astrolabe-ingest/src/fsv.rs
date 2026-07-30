@@ -68,16 +68,35 @@ impl VaultMutationPlan {
 
     /// Plans a row that must read back byte-identical to `bytes`.
     pub fn push_content(&mut self, cf: ColumnFamily, key: Vec<u8>, bytes: &[u8]) {
+        self.push_content_hash(cf, key, *blake3::hash(bytes).as_bytes());
+    }
+
+    /// Plans an exact content readback from a digest computed before ownership
+    /// of the value moved into the vault commit.
+    pub fn push_content_hash(&mut self, cf: ColumnFamily, key: Vec<u8>, content_hash: [u8; 32]) {
         let store = cf.name();
         self.cf_by_row.insert((store.clone(), key.clone()), cf);
-        self.plan.push(FsvRow::content(store, key, bytes));
+        self.plan
+            .push(FsvRow::content_hash(store, key, content_hash));
     }
 
     /// Plans a row that must read back absent or equal to `tombstone`.
     pub fn push_tombstoned(&mut self, cf: ColumnFamily, key: Vec<u8>, tombstone: &[u8]) {
+        self.push_tombstoned_hash(cf, key, *blake3::hash(tombstone).as_bytes());
+    }
+
+    /// Plans a non-live readback from the tombstone digest computed before the
+    /// value allocation moved into the vault commit.
+    pub fn push_tombstoned_hash(
+        &mut self,
+        cf: ColumnFamily,
+        key: Vec<u8>,
+        tombstone_hash: [u8; 32],
+    ) {
         let store = cf.name();
         self.cf_by_row.insert((store.clone(), key.clone()), cf);
-        self.plan.push(FsvRow::tombstoned(store, key, tombstone));
+        self.plan
+            .push(FsvRow::tombstoned_hash(store, key, tombstone_hash));
     }
 
     /// Returns the number of planned rows.

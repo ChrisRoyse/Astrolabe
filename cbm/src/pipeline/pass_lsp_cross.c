@@ -486,27 +486,6 @@ static bool pxc_append_results(CBMArena *dst_arena, CBMResolvedCallArray *dst_ca
     return true;
 }
 
-/* ── Rust workspace manifest (Cargo.toml) for cross-CRATE resolution ──
- *
- * cbm_pxc_run_one's signature is shared with the parallel pass
- * (pass_parallel.c) and cannot grow a manifest parameter without touching
- * that file. We therefore pass the parsed workspace manifest to the Rust
- * cross-file resolver through a file-static borrowed pointer that the
- * sequential driver (cbm_pipeline_pass_lsp_cross, below) sets up once per
- * pass run from the project's root Cargo.toml. The manifest's strings are
- * owned by `g_pxc_rust_manifest_arena`; the pointer is borrowed (NULL when
- * the project has no Cargo.toml — single-crate / non-workspace projects,
- * where in-file resolution needs no workspace metadata). */
-static _Thread_local const CBMCargoManifest *g_pxc_rust_manifest = NULL;
-
-void cbm_pxc_set_rust_manifest(const CBMCargoManifest *m) {
-    g_pxc_rust_manifest = m;
-}
-
-const struct CBMCargoManifest *cbm_pxc_get_rust_manifest(void) {
-    return g_pxc_rust_manifest;
-}
-
 /* Convert a CBMLSPDef array (the pipeline's lingua franca, go_lsp.h:73)
  * into a CBMRustLSPDef array (rust_lsp.h) inside `arena`. The two structs
  * share their first 9 string fields; CBMRustLSPDef adds `trait_qn` before
@@ -547,7 +526,7 @@ static CBMRustLSPDef *pxc_lspdefs_to_rust(CBMArena *arena, const CBMLSPDef *defs
  * arena and merged into result->resolved_calls. */
 void cbm_pxc_run_one(CBMLanguage lang, CBMFileResult *r, const char *source, int source_len,
                      const char *module_qn, CBMLSPDef *defs, int def_count, const char **imp_names,
-                     const char **imp_qns, int imp_count) {
+                     const char **imp_qns, int imp_count, const CBMCargoManifest *rust_manifest) {
     TSTree *tree = r->cached_tree; /* may be NULL — LSP re-parses then */
 
     CBMArena scratch;
@@ -597,7 +576,7 @@ void cbm_pxc_run_one(CBMLanguage lang, CBMFileResult *r, const char *source, int
         CBMRustLSPDef *rdefs = pxc_lspdefs_to_rust(&scratch, defs, def_count);
         cbm_run_rust_lsp_cross_with_manifest(&scratch, source, source_len, module_qn, rdefs,
                                              def_count, imp_names, imp_qns, imp_count, tree,
-                                             g_pxc_rust_manifest, &out);
+                                             rust_manifest, &out);
         break;
     }
     default:
@@ -661,9 +640,15 @@ void cbm_pxc_dispatch_file(CBMLanguage lang, CBMFileResult *result, const char *
                            const CBMModuleDefIndex *module_def_index, CBMLSPDef *all_defs,
                            int all_def_count, const char **imp_keys, const char **imp_vals,
                            int imp_count, CBMTypeRegistry *(*rust_shared_get)(void *),
-                           void *rust_shared_ctx) {
+                           void *rust_shared_ctx, const CBMCargoManifest *rust_manifest) {
     if (!result) {
         return;
+    }
+    CBMCargoManifest rust_manifest_view;
+    if (lang == CBM_LANG_RUST && rust_manifest) {
+        rust_manifest_view = *rust_manifest;
+        rust_manifest_view.active_edition = cbm_cargo_edition_for_path(rust_manifest, rel);
+        rust_manifest = &rust_manifest_view;
     }
     bool used_prebuilt = false;
     CBMTypeRegistry *prebuilt =
@@ -760,14 +745,13 @@ void cbm_pxc_dispatch_file(CBMLanguage lang, CBMFileResult *result, const char *
     if (lang == CBM_LANG_RUST) {
         CBMTypeRegistry *shared = rust_shared_get ? rust_shared_get(rust_shared_ctx) : NULL;
         if (shared) {
-            cbm_run_rust_lsp_cross_with_registry(&result->arena, source, source_len, def_module,
-                                                 shared, imp_keys, imp_vals, imp_count,
-                                                 result->cached_tree, cbm_pxc_get_rust_manifest(),
-                                                 &result->resolved_calls,
-                                                 /*result=*/NULL);
+            cbm_run_rust_lsp_cross_with_registry(
+                &result->arena, source, source_len, def_module, shared, imp_keys, imp_vals,
+                imp_count, result->cached_tree, rust_manifest, &result->resolved_calls,
+                /*result=*/NULL);
         } else {
             cbm_pxc_run_one(lang, result, source, source_len, def_module, file_defs, file_def_count,
-                            imp_keys, imp_vals, imp_count);
+                            imp_keys, imp_vals, imp_count, rust_manifest);
         }
     } else if (lang == CBM_LANG_JAVASCRIPT || lang == CBM_LANG_TYPESCRIPT || lang == CBM_LANG_TSX) {
         bool js;
@@ -778,7 +762,7 @@ void cbm_pxc_dispatch_file(CBMLanguage lang, CBMFileResult *result, const char *
                            imp_keys, imp_vals, imp_count, js, jsx, dts);
     } else {
         cbm_pxc_run_one(lang, result, source, source_len, def_module, file_defs, file_def_count,
-                        imp_keys, imp_vals, imp_count);
+                        imp_keys, imp_vals, imp_count, rust_manifest);
     }
     free(filtered);
 }
@@ -800,7 +784,115 @@ static bool pxc_build_rust_manifest(const cbm_pipeline_ctx_t *ctx, CBMArena *mar
     memset(out_m, 0, sizeof(*out_m));
     cbm_cargo_parse(marena, toml, toml_len, out_m);
     free(toml); /* cargo parser copies into marena */
+
+    /* Resolve each explicitly declared workspace member's effective edition
+     * once. Macro fragment semantics belong to the definition crate's edition,
+     * so a single root-level default is not an exact substitute. */
+    for (int i = 0; i < out_m->member_count; i++) {
+        CBMCargoMember *member = &out_m->members[i];
+        if (!member->member_path || !member->member_path[0])
+            continue;
+        int member_n =
+            snprintf(path, sizeof(path), "%s/%s/Cargo.toml", ctx->source_root, member->member_path);
+        if (member_n <= 0 || (size_t)member_n >= sizeof(path))
+            continue;
+        int member_toml_len = 0;
+        char *member_toml = pxc_read_file(path, &member_toml_len);
+        if (!member_toml || member_toml_len <= 0) {
+            free(member_toml);
+            continue;
+        }
+        CBMCargoManifest parsed_member;
+        cbm_cargo_parse(marena, member_toml, member_toml_len, &parsed_member);
+        free(member_toml);
+        if (parsed_member.package_edition) {
+            member->edition = parsed_member.package_edition;
+        } else if (parsed_member.package_edition_inherits_workspace) {
+            member->edition = out_m->workspace_package_edition;
+        } else if (parsed_member.package_name) {
+            member->edition = "2015"; /* Cargo's specified package default. */
+        }
+    }
     return true;
+}
+
+int cbm_pxc_prepare_rust_manifest(cbm_pipeline_ctx_t *ctx) {
+    if (!ctx) {
+        return -1;
+    }
+    if (ctx->rust_manifest_prepared) {
+        return 0;
+    }
+    ctx->rust_manifest_prepared = true;
+
+    bool have_rust = false;
+    for (int i = 0; i < ctx->all_file_count; i++) {
+        if (ctx->all_files[i].language == CBM_LANG_RUST) {
+            have_rust = true;
+            break;
+        }
+    }
+    if (!have_rust) {
+        return 0;
+    }
+
+    char cargo_path[1024];
+    int cargo_path_len =
+        snprintf(cargo_path, sizeof(cargo_path), "%s/Cargo.toml", ctx->source_root);
+    if (cargo_path_len <= 0 || (size_t)cargo_path_len >= sizeof(cargo_path)) {
+        cbm_log_error("pass.err", "code", "CBM_CARGO_MANIFEST_PATH_INVALID", "pass",
+                      "rust_manifest_prepare", "operation", "construct_root_manifest_path",
+                      "message", "root Cargo manifest path exceeds the supported path buffer",
+                      "remediation", "move the repository to a shorter canonical path and retry");
+        return -1;
+    }
+    if (!cbm_path_exists(cargo_path)) {
+        cbm_log_info("rust_manifest.absent", "path", cargo_path, "rust_files",
+                     itoa_buf(ctx->all_file_count));
+        return 0;
+    }
+
+    cbm_arena_init(&ctx->rust_manifest_arena);
+    ctx->rust_manifest_arena_live = true;
+    ctx->rust_manifest =
+        (CBMCargoManifest *)cbm_arena_alloc(&ctx->rust_manifest_arena, sizeof(CBMCargoManifest));
+    if (!ctx->rust_manifest ||
+        !pxc_build_rust_manifest(ctx, &ctx->rust_manifest_arena, ctx->rust_manifest) ||
+        cbm_arena_failed(&ctx->rust_manifest_arena)) {
+        const char *failure_code = cbm_arena_failed(&ctx->rust_manifest_arena)
+                                       ? cbm_arena_failure_code(&ctx->rust_manifest_arena)
+                                       : "CBM_CARGO_MANIFEST_READ_FAILED";
+        const char *failure_operation = cbm_arena_failed(&ctx->rust_manifest_arena)
+                                            ? cbm_arena_failure_operation(&ctx->rust_manifest_arena)
+                                            : "read_root_manifest";
+        cbm_log_error("pass.err", "code", failure_code, "pass", "rust_manifest_prepare",
+                      "component", "rust_manifest", "operation", failure_operation, "path",
+                      cargo_path, "message", "Cargo manifest could not be loaded exactly",
+                      "remediation", "inspect the manifest path/read error and retry");
+        cbm_pxc_destroy_rust_manifest(ctx);
+        return -1;
+    }
+    cbm_log_info("rust_manifest.ready", "path", cargo_path, "members",
+                 itoa_buf(ctx->rust_manifest->member_count));
+    return 0;
+}
+
+void cbm_pxc_destroy_rust_manifest(cbm_pipeline_ctx_t *ctx) {
+    if (!ctx) {
+        return;
+    }
+    if (ctx->rust_manifest_arena_live) {
+        cbm_arena_destroy(&ctx->rust_manifest_arena);
+    }
+    memset(&ctx->rust_manifest_arena, 0, sizeof(ctx->rust_manifest_arena));
+    ctx->rust_manifest = NULL;
+    ctx->rust_manifest_arena_live = false;
+    ctx->rust_manifest_prepared = false;
+}
+
+const char *cbm_pxc_rust_edition_for_file(const cbm_pipeline_ctx_t *ctx,
+                                          const char *relative_path) {
+    return ctx ? cbm_cargo_edition_for_path(ctx->rust_manifest, relative_path) : NULL;
 }
 
 int cbm_pipeline_pass_lsp_cross(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files,
@@ -814,37 +906,6 @@ int cbm_pipeline_pass_lsp_cross(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *
     char **def_modules = NULL;
     CBMLSPDef *all_defs = NULL;
     CBMModuleDefIndex *module_def_index = NULL;
-
-    /* Build the Rust workspace manifest once (only when the project has at
-     * least one Rust file, to avoid an unconditional Cargo.toml read).
-     * The manifest's strings live in `cargo_arena`; the resolver borrows
-     * the pointer through the file-static set below. */
-    bool have_rust = false;
-    for (int i = 0; i < file_count; i++) {
-        if (cache[i] && files[i].language == CBM_LANG_RUST) {
-            have_rust = true;
-            break;
-        }
-    }
-    CBMArena cargo_arena;
-    CBMCargoManifest cargo_manifest;
-    bool have_manifest = false;
-    if (have_rust) {
-        cbm_arena_init(&cargo_arena);
-        have_manifest = pxc_build_rust_manifest(ctx, &cargo_arena, &cargo_manifest);
-        if (cbm_arena_failed(&cargo_arena)) {
-            char requested[32];
-            snprintf(requested, sizeof(requested), "%zu", cbm_arena_failure_bytes(&cargo_arena));
-            cbm_log_error("pass.err", "code", cbm_arena_failure_code(&cargo_arena), "pass",
-                          "lsp_cross", "component", "lsp_cross.cargo_manifest", "operation",
-                          cbm_arena_failure_operation(&cargo_arena), "requested_bytes", requested,
-                          "message", "cross-LSP Cargo manifest allocation failed", "remediation",
-                          "free memory or reduce repository size, then retry");
-            status = -1;
-            goto cleanup;
-        }
-        cbm_pxc_set_rust_manifest(have_manifest ? &cargo_manifest : NULL);
-    }
 
     /* Per-file module QN cache so we don't recompute it once per def + once
      * per call. cbm_pipeline_fqn_module mallocs; freed at end. */
@@ -956,7 +1017,7 @@ int cbm_pipeline_pass_lsp_cross(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *
 
         cbm_pxc_dispatch_file(lang, cache[i], source, source_len, files[i].rel_path, def_modules[i],
                               &cross_registries, module_def_index, all_defs, def_count, imp_keys,
-                              imp_vals, imp_count, NULL, NULL);
+                              imp_vals, imp_count, NULL, NULL, ctx->rust_manifest);
         if (cbm_arena_failed(&cache[i]->arena)) {
             char requested[32];
             snprintf(requested, sizeof(requested), "%zu",
@@ -987,14 +1048,6 @@ cleanup:
             free(def_modules[i]);
     }
     free(def_modules);
-
-    /* Drop the borrowed manifest pointer before its arena dies, so a later
-     * pass (or a stale thread-local) can never read freed manifest memory. */
-    if (have_rust) {
-        cbm_pxc_set_rust_manifest(NULL);
-        cbm_arena_destroy(&cargo_arena);
-    }
-    (void)have_manifest;
 
     if (status == 0) {
         cbm_log_info("pass.done", "pass", "lsp_cross", "files_processed", itoa_buf(processed),

@@ -11,15 +11,17 @@ where
 {
     /// Creates a byte-verified, point-in-time copy of this durable vault.
     ///
-    /// The durable commit lock is held from the source flush through the final
-    /// readback, so another process cannot append a batch between copied files.
-    /// The destination must not exist; refusing replacement prevents this
-    /// primitive from becoming an implicit overwrite or rollback mechanism.
+    /// A write-capable source takes the durable commit lock for the complete
+    /// copy. A read-only source reuses the shared snapshot lock retained from
+    /// open, which keeps writers excluded without recovering or rewriting the
+    /// source vault. The destination must not exist; refusing replacement
+    /// prevents this primitive from becoming an implicit overwrite or rollback
+    /// mechanism.
     pub fn copy_durable_snapshot_to(&self, destination: &Path) -> Result<()> {
-        let source = self.durable.as_ref().ok_or_else(|| CalyxError {
+        let source = self.durable_root.as_deref().ok_or_else(|| CalyxError {
             code: "CALYX_DURABLE_SNAPSHOT_SOURCE_REQUIRED",
             message: "a volatile Aster vault has no durable bytes to snapshot".to_string(),
-            remediation: "open the source vault with AsterVault::new_durable before requesting a durable snapshot",
+            remediation: "open the source vault with AsterVault::open before requesting a durable snapshot",
         })?;
         if destination.exists() {
             return Err(CalyxError {
@@ -32,26 +34,39 @@ where
             });
         }
         self.authorize_external_copy(destination)?;
-        self.with_durable_commit_lock(|| {
-            let snapshot = copy_tree_verified(source.root(), source.root(), destination)
-                .and_then(|()| initialize_snapshot_coordination_files(destination));
-            if let Err(copy_error) = snapshot {
-                let cleanup = fs::remove_dir_all(destination);
-                return Err(match cleanup {
-                    Ok(()) => copy_error,
-                    Err(cleanup_error) => CalyxError {
-                        code: "CALYX_DURABLE_SNAPSHOT_CLEANUP_FAILED",
-                        message: format!(
-                            "durable snapshot failed ({copy_error}); exact new destination {} also could not be removed: {cleanup_error}",
-                            destination.display()
-                        ),
-                        remediation: "preserve and inspect the exact incomplete destination; do not use it as a vault snapshot",
-                    },
+        if self.read_only {
+            if self._read_snapshot_guard.is_none() {
+                return Err(CalyxError {
+                    code: "CALYX_DURABLE_SNAPSHOT_READ_LOCK_MISSING",
+                    message: "read-only durable snapshot source has no retained shared commit lock"
+                        .to_string(),
+                    remediation: "discard this handle and reopen the source vault read-only before snapshotting",
                 });
             }
-            Ok(())
-        })
+            return copy_durable_tree_under_lock(source, destination);
+        }
+        self.with_durable_commit_lock(|| copy_durable_tree_under_lock(source, destination))
     }
+}
+
+fn copy_durable_tree_under_lock(source: &Path, destination: &Path) -> Result<()> {
+    let snapshot = copy_tree_verified(source, source, destination)
+        .and_then(|()| initialize_snapshot_coordination_files(destination));
+    if let Err(copy_error) = snapshot {
+        let cleanup = fs::remove_dir_all(destination);
+        return Err(match cleanup {
+            Ok(()) => copy_error,
+            Err(cleanup_error) => CalyxError {
+                code: "CALYX_DURABLE_SNAPSHOT_CLEANUP_FAILED",
+                message: format!(
+                    "durable snapshot failed ({copy_error}); exact new destination {} also could not be removed: {cleanup_error}",
+                    destination.display()
+                ),
+                remediation: "preserve and inspect the exact incomplete destination; do not use it as a vault snapshot",
+            },
+        });
+    }
+    Ok(())
 }
 
 fn initialize_snapshot_coordination_files(destination: &Path) -> Result<()> {

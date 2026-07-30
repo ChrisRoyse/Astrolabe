@@ -14,6 +14,7 @@ typedef struct {
     const char *script_node_type;  // e.g. "script_element"
     const char *content_node_type; // e.g. "raw_text"
     CBMLanguage embedded_language; // grammar used to re-parse the content slice
+    CBMImportResolution import_resolution; // host-owned resolution semantics
 } CBMEmbeddedLangSpec;
 
 // CBMLangSpec mirrors Go's lang.LanguageSpec with NULL-terminated string arrays.

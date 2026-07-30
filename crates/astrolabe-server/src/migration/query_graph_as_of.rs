@@ -399,7 +399,8 @@ fn prepare_as_of_store(
     }
     // Read-only over all CFs: the lowering reads Base/Graph/Ledger and the
     // time-travel resolution reads the TimeIndex CF.
-    let vault = open_shadow_vault_read_only(&vault_dir, &vault_id, &vault_salt, Vec::new())?;
+    let vault =
+        open_shadow_vault_historical_read_only(&vault_dir, &vault_id, &vault_salt, Vec::new())?;
     let snapshot = vault.as_of(canonical_millis)?;
     let resolved_seq = snapshot.seqno();
 

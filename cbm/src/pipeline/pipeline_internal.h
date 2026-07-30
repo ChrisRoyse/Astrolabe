@@ -131,6 +131,16 @@ typedef struct {
      * Owned by pipeline.c / pipeline_incremental.c. */
     const cbm_path_alias_collection_t *path_aliases;
 
+    /* One immutable Cargo manifest per pipeline execution. Prepared before
+     * any Rust extraction worker starts, shared read-only across workers, and
+     * destroyed immediately after extraction/resolve completes. This avoids
+     * per-file Cargo.toml reloads and keeps concurrent project state isolated
+     * in its owning pipeline context. */
+    struct CBMCargoManifest *rust_manifest;
+    CBMArena rust_manifest_arena;
+    bool rust_manifest_arena_live;
+    bool rust_manifest_prepared;
+
     /* Directory subtrees excluded during discovery. Borrowed from pipeline.c. */
     char **excluded_dirs;
     int excluded_count;
@@ -536,6 +546,11 @@ int cbm_parallel_extract(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, 
                          CBMFileResult **result_cache, _Atomic int64_t *shared_ids,
                          int worker_count);
 
+/* Monotonically publish the greater main/shared graph-ID ceiling after a
+ * worker join or serial main-graph mutation. Neither allocator is lowered. */
+void cbm_parallel_rebase_shared_ids(const cbm_gbuf_t *main_gbuf, _Atomic int64_t *shared_ids,
+                                    const char *phase);
+
 /* Phase 3B: Serial registry build from cached extraction results.
  * Creates DEFINES, DEFINES_METHOD, and IMPORTS edges in ctx->gbuf.
  * Registers callable symbols (Function/Method/Class) in ctx->registry. */
@@ -591,6 +606,11 @@ void cbm_pipeline_create_route_nodes(cbm_gbuf_t *gb);
  * passes; defined in pass_definitions.c. */
 int cbm_pipeline_build_def_callees(const CBMCallArray *calls, const char *def_qn,
                                    int def_start_line, int def_end_line, char *buf, int bufsize);
+
+/* Persist the measured structured-data classification/count summary on the
+ * exact source-backed File atom without re-reading its bytes. */
+int cbm_pipeline_enrich_structured_file(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *file,
+                                        const CBMFileResult *result);
 
 /* Resolve one extracted definition by its complete source-backed atom, never by
  * its non-unique display qualified name. */

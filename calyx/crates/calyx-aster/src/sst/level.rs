@@ -4,6 +4,7 @@ use calyx_core::Result;
 use rayon::prelude::*;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SstLevel {
@@ -13,7 +14,7 @@ pub struct SstLevel {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct LevelFile {
     pub(super) path: PathBuf,
-    lookup: Option<SstLookupMetadata>,
+    lookup: Option<Arc<SstLookupMetadata>>,
 }
 
 impl LevelFile {
@@ -23,16 +24,27 @@ impl LevelFile {
 
     fn with_lookup(path: PathBuf) -> Result<Self> {
         let lookup = SstReader::open(&path)?.lookup_metadata();
-        Ok(Self { path, lookup })
+        Ok(Self {
+            path,
+            lookup: Some(lookup),
+        })
     }
 
     fn may_contain(&self, key: &[u8]) -> bool {
         let Some(lookup) = &self.lookup else {
             return true;
         };
-        key >= lookup.first_key.as_slice()
-            && key <= lookup.last_key.as_slice()
-            && lookup.bloom.may_contain(key)
+        let Some((first, last)) = lookup.key_range() else {
+            return false;
+        };
+        key >= first && key <= last && lookup.bloom.may_contain(key)
+    }
+
+    pub(super) fn open_reader(&self) -> Result<SstReader> {
+        self.lookup.as_ref().map_or_else(
+            || SstReader::open(&self.path),
+            |lookup| SstReader::open_with_lookup(&self.path, Arc::clone(lookup)),
+        )
     }
 }
 
@@ -73,7 +85,7 @@ impl SstLevel {
             if !file.may_contain(key) {
                 continue;
             }
-            let reader = SstReader::open(&file.path)?;
+            let reader = file.open_reader()?;
             if let Some(value) = reader.get(key)? {
                 return Ok(Some(value));
             }
@@ -87,7 +99,7 @@ impl SstLevel {
             if !file.may_contain(key) {
                 continue;
             }
-            let reader = SstReader::open(&file.path)?;
+            let reader = file.open_reader()?;
             if let Some(value) = reader.get(key)? {
                 values.push(value);
             }
@@ -101,7 +113,7 @@ impl SstLevel {
             .par_iter()
             .enumerate()
             .map(|(index, file)| -> Result<(usize, Vec<SstEntry>)> {
-                Ok((index, SstReader::open(&file.path)?.range(start, end)?))
+                Ok((index, file.open_reader()?.range(start, end)?))
             })
             .collect::<Result<Vec<_>>>()?;
         per_file.sort_by_key(|(index, _)| *index);
@@ -130,7 +142,7 @@ impl SstLevel {
             .map(|(index, file)| -> Result<(usize, Vec<SstKeyState>)> {
                 Ok((
                     index,
-                    SstReader::open(&file.path)?.range_key_states_until(start, end)?,
+                    file.open_reader()?.range_key_states_until(start, end)?,
                 ))
             })
             .collect::<Result<Vec<_>>>()?;
@@ -188,7 +200,7 @@ impl SstLevel {
     pub fn iter(&self) -> Result<Vec<SstEntry>> {
         let mut rows = BTreeMap::new();
         for file in &self.files {
-            for entry in SstReader::open(&file.path)?.iter()? {
+            for entry in file.open_reader()?.iter()? {
                 rows.entry(entry.key).or_insert(entry.value);
             }
         }

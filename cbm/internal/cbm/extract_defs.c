@@ -5,11 +5,14 @@
 #include "foundation/constants.h"
 #include "foundation/platform.h"
 #include "foundation/log.h" // cbm_log_warn
+#include "foundation/hash_table.h"
+#include "foundation/sha256.h"
 #include "extract_node_stack.h"
 #include "simhash/minhash.h"
 #include "semantic/ast_profile.h"
 #include "tree_sitter/api.h" // TSNode, ts_node_*
 #include <stdint.h>          // uint32_t
+#include <limits.h>
 #include <stdio.h>           // snprintf
 #include <stdlib.h>          // getenv, atoi
 #include <string.h>
@@ -5315,6 +5318,564 @@ static void walk_variables_iter(CBMExtractCtx *ctx, TSNode root, const CBMLangSp
     }
 }
 
+/* ── JSON semantic schema aggregation (#856) ─────────────────────
+ *
+ * JSON data fixtures describe the same record shape many times. Treating every
+ * concrete pair occurrence as a Variable creates an occurrence graph rather
+ * than a code/schema graph. This walker keeps memory proportional to nesting
+ * depth plus distinct normalized paths, hashes every exact occurrence, and
+ * emits only after the complete file has been measured successfully. */
+
+typedef struct {
+    char *data;
+    size_t len;
+    size_t cap;
+} JSONTextBuffer;
+
+typedef struct {
+    const char *path;
+    const char *name;
+    uint64_t count;
+    cbm_sha256_ctx occurrence_hash;
+    TSNode representative_key;
+    uint32_t first_start_byte;
+    uint32_t first_end_byte;
+    uint32_t last_start_byte;
+    uint32_t last_end_byte;
+} JSONSchemaEntry;
+
+typedef struct {
+    TSNode node;
+    uint32_t next_child;
+    size_t restore_path_len;
+    bool entered;
+} JSONWalkFrame;
+
+static bool json_text_reserve(JSONTextBuffer *buf, size_t additional) {
+    if (!buf || additional > SIZE_MAX - buf->len - SKIP_CHAR) {
+        return false;
+    }
+    size_t needed = buf->len + additional + SKIP_CHAR;
+    if (needed <= buf->cap) {
+        return true;
+    }
+    size_t cap = buf->cap ? buf->cap : CBM_SZ_64;
+    while (cap < needed) {
+        if (cap > SIZE_MAX / PAIR_LEN) {
+            cap = needed;
+            break;
+        }
+        cap *= PAIR_LEN;
+    }
+    char *grown = realloc(buf->data, cap);
+    if (!grown) {
+        return false;
+    }
+    buf->data = grown;
+    buf->cap = cap;
+    return true;
+}
+
+static bool json_text_append(JSONTextBuffer *buf, const void *bytes, size_t len) {
+    if (!json_text_reserve(buf, len)) {
+        return false;
+    }
+    if (len > 0) {
+        memcpy(buf->data + buf->len, bytes, len);
+        buf->len += len;
+    }
+    buf->data[buf->len] = '\0';
+    return true;
+}
+
+static bool json_text_append_char(JSONTextBuffer *buf, char value) {
+    return json_text_append(buf, &value, SKIP_CHAR);
+}
+
+static int json_hex_value(unsigned char value) {
+    if (value >= '0' && value <= '9') {
+        return (int)(value - '0');
+    }
+    value = (unsigned char)tolower(value);
+    if (value >= 'a' && value <= 'f') {
+        return (int)(value - 'a') + 10;
+    }
+    return CBM_NOT_FOUND;
+}
+
+static bool json_parse_hex4(const char *bytes, uint32_t *value) {
+    uint32_t out = 0;
+    for (int i = 0; i < 4; i++) {
+        int digit = json_hex_value((unsigned char)bytes[i]);
+        if (digit < 0) {
+            return false;
+        }
+        out = (out << 4) | (uint32_t)digit;
+    }
+    *value = out;
+    return true;
+}
+
+static bool json_append_codepoint(JSONTextBuffer *buf, uint32_t codepoint) {
+    if (codepoint <= 0x1f) {
+        static const char hex[] = "0123456789abcdef";
+        char escaped[6] = {'\\', 'u', '0', '0', hex[(codepoint >> 4) & 15], hex[codepoint & 15]};
+        return json_text_append(buf, escaped, sizeof(escaped));
+    }
+    char utf8[4];
+    size_t len = 0;
+    if (codepoint <= 0x7f) {
+        utf8[len++] = (char)codepoint;
+    } else if (codepoint <= 0x7ff) {
+        utf8[len++] = (char)(0xc0 | (codepoint >> 6));
+        utf8[len++] = (char)(0x80 | (codepoint & 0x3f));
+    } else if (codepoint <= 0xffff) {
+        utf8[len++] = (char)(0xe0 | (codepoint >> 12));
+        utf8[len++] = (char)(0x80 | ((codepoint >> 6) & 0x3f));
+        utf8[len++] = (char)(0x80 | (codepoint & 0x3f));
+    } else if (codepoint <= 0x10ffff) {
+        utf8[len++] = (char)(0xf0 | (codepoint >> 18));
+        utf8[len++] = (char)(0x80 | ((codepoint >> 12) & 0x3f));
+        utf8[len++] = (char)(0x80 | ((codepoint >> 6) & 0x3f));
+        utf8[len++] = (char)(0x80 | (codepoint & 0x3f));
+    } else {
+        return false;
+    }
+    return json_text_append(buf, utf8, len);
+}
+
+/* Decode one JSON string key into a canonical UTF-8/display representation.
+ * Control code points remain textual \u00xx so embedded NUL never truncates a
+ * graph identity. Equivalent escape spellings otherwise converge. */
+static bool json_decode_key(const char *source, TSNode key_node, JSONTextBuffer *decoded) {
+    uint32_t start = ts_node_start_byte(key_node);
+    uint32_t end = ts_node_end_byte(key_node);
+    if (!source || end < start + PAIR_LEN || source[start] != '"' || source[end - SKIP_CHAR] != '"') {
+        return false;
+    }
+    for (uint32_t i = start + SKIP_CHAR; i < end - SKIP_CHAR; i++) {
+        unsigned char ch = (unsigned char)source[i];
+        if (ch != '\\') {
+            if (ch < 0x20 || !json_text_append_char(decoded, (char)ch)) {
+                return false;
+            }
+            continue;
+        }
+        if (++i >= end - SKIP_CHAR) {
+            return false;
+        }
+        ch = (unsigned char)source[i];
+        switch (ch) {
+        case '"':
+        case '\\':
+        case '/':
+            if (!json_text_append_char(decoded, (char)ch)) {
+                return false;
+            }
+            break;
+        case 'b':
+            if (!json_append_codepoint(decoded, '\b')) {
+                return false;
+            }
+            break;
+        case 'f':
+            if (!json_append_codepoint(decoded, '\f')) {
+                return false;
+            }
+            break;
+        case 'n':
+            if (!json_append_codepoint(decoded, '\n')) {
+                return false;
+            }
+            break;
+        case 'r':
+            if (!json_append_codepoint(decoded, '\r')) {
+                return false;
+            }
+            break;
+        case 't':
+            if (!json_append_codepoint(decoded, '\t')) {
+                return false;
+            }
+            break;
+        case 'u': {
+            if (i + 4 >= end - SKIP_CHAR) {
+                return false;
+            }
+            uint32_t codepoint = 0;
+            if (!json_parse_hex4(source + i + SKIP_CHAR, &codepoint)) {
+                return false;
+            }
+            i += 4;
+            if (codepoint >= 0xd800 && codepoint <= 0xdbff) {
+                if (i + 6 >= end || source[i + SKIP_CHAR] != '\\' ||
+                    source[i + PAIR_LEN] != 'u') {
+                    return false;
+                }
+                uint32_t low = 0;
+                if (!json_parse_hex4(source + i + 3, &low) || low < 0xdc00 || low > 0xdfff) {
+                    return false;
+                }
+                codepoint = 0x10000 + ((codepoint - 0xd800) << 10) + (low - 0xdc00);
+                i += 6;
+            } else if (codepoint >= 0xdc00 && codepoint <= 0xdfff) {
+                return false;
+            }
+            if (!json_append_codepoint(decoded, codepoint)) {
+                return false;
+            }
+            break;
+        }
+        default:
+            return false;
+        }
+    }
+    if (!decoded->data && !json_text_reserve(decoded, 0)) {
+        return false;
+    }
+    decoded->data[decoded->len] = '\0';
+    return true;
+}
+
+static bool json_path_append_key(JSONTextBuffer *path, const char *decoded_key) {
+    if (!json_text_append_char(path, '/')) {
+        return false;
+    }
+    for (const unsigned char *p = (const unsigned char *)decoded_key; *p; p++) {
+        if (*p == '~') {
+            if (!json_text_append(path, "~0", PAIR_LEN)) {
+                return false;
+            }
+        } else if (*p == '/') {
+            if (!json_text_append(path, "~1", PAIR_LEN)) {
+                return false;
+            }
+        } else if (!json_text_append_char(path, (char)*p)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static void json_hash_u32(cbm_sha256_ctx *hash, uint32_t value) {
+    uint8_t bytes[4] = {(uint8_t)value, (uint8_t)(value >> 8), (uint8_t)(value >> 16),
+                        (uint8_t)(value >> 24)};
+    cbm_sha256_update(hash, bytes, sizeof(bytes));
+}
+
+static void json_digest_hex(const uint8_t digest[CBM_SHA256_DIGEST_LEN],
+                            char out[CBM_SHA256_HEX_LEN + SKIP_CHAR]) {
+    static const char digits[] = "0123456789abcdef";
+    for (size_t i = 0; i < CBM_SHA256_DIGEST_LEN; i++) {
+        out[i * PAIR_LEN] = digits[digest[i] >> 4];
+        out[i * PAIR_LEN + SKIP_CHAR] = digits[digest[i] & 15];
+    }
+    out[CBM_SHA256_HEX_LEN] = '\0';
+}
+
+static bool json_schema_fail(CBMExtractCtx *ctx, const char *code, const char *operation,
+                             size_t requested, const char *message, const char *remediation) {
+    char requested_buf[32];
+    snprintf(requested_buf, sizeof(requested_buf), "%zu", requested);
+    cbm_log_error("structured_data.failed", "code", code, "operation", operation, "file",
+                  ctx->rel_path ? ctx->rel_path : "<input>", "requested", requested_buf,
+                  "message", message, "remediation", remediation);
+    cbm_file_result_set_error(ctx->result, code, operation, "structured_data", requested, message,
+                              remediation);
+    return false;
+}
+
+static bool json_schema_entry_push(JSONSchemaEntry **entries, size_t *count, size_t *capacity,
+                                   JSONSchemaEntry entry) {
+    if (*count >= *capacity) {
+        size_t grown = *capacity ? *capacity * PAIR_LEN : CBM_SZ_64;
+        if (grown < *capacity || grown > SIZE_MAX / sizeof(**entries)) {
+            return false;
+        }
+        JSONSchemaEntry *next = realloc(*entries, grown * sizeof(**entries));
+        if (!next) {
+            return false;
+        }
+        *entries = next;
+        *capacity = grown;
+    }
+    (*entries)[(*count)++] = entry;
+    return true;
+}
+
+static bool json_walk_frame_push(JSONWalkFrame **frames, size_t *count, size_t *capacity,
+                                 TSNode node) {
+    if (*count >= *capacity) {
+        size_t grown = *capacity ? *capacity * PAIR_LEN : CBM_SZ_64;
+        if (grown < *capacity || grown > SIZE_MAX / sizeof(**frames)) {
+            return false;
+        }
+        JSONWalkFrame *next = realloc(*frames, grown * sizeof(**frames));
+        if (!next) {
+            return false;
+        }
+        *frames = next;
+        *capacity = grown;
+    }
+    (*frames)[(*count)++] =
+        (JSONWalkFrame){.node = node, .next_child = 0, .restore_path_len = 0, .entered = false};
+    return true;
+}
+
+static int json_schema_entry_compare(const void *left, const void *right) {
+    const JSONSchemaEntry *a = left;
+    const JSONSchemaEntry *b = right;
+    return strcmp(a->path, b->path);
+}
+
+static bool json_structured_classification(CBMExtractCtx *ctx, bool repeated,
+                                           const char **classification,
+                                           const char **provenance) {
+    const char *selected = ctx->structured_classification_override;
+    const char *selected_provenance = ctx->structured_classification_override_provenance;
+    if (selected) {
+        if (strcmp(selected, "code") != 0 && strcmp(selected, "config") != 0 &&
+            strcmp(selected, "data") != 0 && strcmp(selected, "generated") != 0) {
+            return json_schema_fail(
+                ctx, "CBM_STRUCTURED_CLASSIFICATION_INVALID", "validate_classification_override",
+                strlen(selected), "the repository structured-data classification is invalid",
+                "set astrolabe-structured to code, config, data, or generated and retry");
+        }
+        if (!selected_provenance || !selected_provenance[0]) {
+            return json_schema_fail(
+                ctx, "CBM_STRUCTURED_CLASSIFICATION_PROVENANCE_MISSING",
+                "validate_classification_override", 0,
+                "an explicit structured-data classification lacks repository provenance",
+                "bind the override to its exact repository attribute and retry");
+        }
+    } else {
+        selected = repeated ? "data" : "config";
+        selected_provenance = repeated ? "structure:repeated-schema-paths"
+                                       : "structure:unique-schema-paths";
+    }
+    *classification = cbm_arena_strdup(ctx->arena, selected);
+    *provenance = cbm_arena_strdup(ctx->arena, selected_provenance);
+    return *classification && *provenance;
+}
+
+static bool extract_json_schema_variables(CBMExtractCtx *ctx, TSNode root) {
+    if (ts_node_has_error(root)) {
+        return json_schema_fail(
+            ctx, "CBM_JSON_PARSE_INVALID", "validate_complete_json_tree", 0,
+            "the JSON parse tree contains an error or missing token",
+            "repair the malformed or truncated JSON and retry the complete corpus");
+    }
+
+    CBMHashTable *by_path = cbm_ht_create(0);
+    JSONSchemaEntry *entries = NULL;
+    JSONWalkFrame *frames = NULL;
+    JSONTextBuffer path = {0};
+    size_t entry_count = 0, entry_capacity = 0, frame_count = 0, frame_capacity = 0;
+    uint64_t total_occurrences = 0;
+    bool repeated = false;
+    bool ok = by_path && json_walk_frame_push(&frames, &frame_count, &frame_capacity, root);
+    if (!ok) {
+        json_schema_fail(ctx, "CBM_JSON_SCHEMA_ALLOC_FAILED", "initialize_schema_walk", 0,
+                         "the JSON schema traversal could not allocate bounded state",
+                         "free memory or reduce concurrent extraction workers, then retry");
+        goto cleanup;
+    }
+
+    while (frame_count > 0 && ok) {
+        JSONWalkFrame *frame = &frames[frame_count - SKIP_CHAR];
+        const char *kind = ts_node_type(frame->node);
+        if (!frame->entered) {
+            frame->entered = true;
+            frame->restore_path_len = path.len;
+            if (strcmp(kind, "pair") == 0) {
+                TSNode key_node = ts_node_child_by_field_name(frame->node, TS_FIELD("key"));
+                JSONTextBuffer decoded = {0};
+                if (ts_node_is_null(key_node) || !json_decode_key(ctx->source, key_node, &decoded) ||
+                    !json_path_append_key(&path, decoded.data ? decoded.data : "")) {
+                    free(decoded.data);
+                    ok = json_schema_fail(
+                        ctx, "CBM_JSON_SCHEMA_KEY_INVALID", "normalize_json_key", 0,
+                        "a JSON object key could not be normalized without losing identity",
+                        "repair invalid key escaping or Unicode and retry the complete corpus");
+                    break;
+                }
+
+                void *encoded_index = cbm_ht_get(by_path, path.data);
+                size_t index = 0;
+                if (encoded_index) {
+                    index = (size_t)(uintptr_t)encoded_index - SKIP_CHAR;
+                } else {
+                    const char *stored_path = cbm_arena_strdup(ctx->arena, path.data);
+                    const char *stored_name = cbm_arena_strdup(ctx->arena, decoded.data);
+                    JSONSchemaEntry entry = {.path = stored_path,
+                                             .name = stored_name,
+                                             .count = 0,
+                                             .representative_key = key_node};
+                    cbm_sha256_init(&entry.occurrence_hash);
+                    static const char domain[] = "astrolabe-json-occurrence-v1";
+                    cbm_sha256_update(&entry.occurrence_hash, domain, sizeof(domain));
+                    if (!stored_path || !stored_name ||
+                        !json_schema_entry_push(&entries, &entry_count, &entry_capacity, entry)) {
+                        free(decoded.data);
+                        ok = json_schema_fail(
+                            ctx, "CBM_JSON_SCHEMA_ALLOC_FAILED", "append_schema_path", entry_count,
+                            "the distinct JSON schema-path set could not be retained",
+                            "free memory or reduce concurrent extraction workers, then retry");
+                        break;
+                    }
+                    index = entry_count - SKIP_CHAR;
+                    void *previous = NULL;
+                    if (!cbm_ht_set_checked(by_path, stored_path,
+                                            (void *)(uintptr_t)(index + SKIP_CHAR), &previous) ||
+                        previous != NULL) {
+                        free(decoded.data);
+                        ok = json_schema_fail(
+                            ctx, "CBM_JSON_SCHEMA_INDEX_FAILED", "index_schema_path", entry_count,
+                            "the JSON schema-path index could not commit an exact new identity",
+                            "free memory and retry the complete corpus");
+                        break;
+                    }
+                }
+                free(decoded.data);
+
+                JSONSchemaEntry *entry = &entries[index];
+                uint32_t start = ts_node_start_byte(frame->node);
+                uint32_t end = ts_node_end_byte(frame->node);
+                if (end < start || (size_t)end > (size_t)ctx->source_len ||
+                    entry->count == UINT64_MAX || total_occurrences == UINT64_MAX) {
+                    ok = json_schema_fail(
+                        ctx, "CBM_JSON_SCHEMA_SPAN_INVALID", "hash_schema_occurrence", end,
+                        "a JSON schema occurrence has an invalid span or exhausted its count domain",
+                        "repair the source or split an unrepresentable source unit, then retry");
+                    break;
+                }
+                if (entry->count == 0) {
+                    entry->first_start_byte = start;
+                    entry->first_end_byte = end;
+                }
+                entry->last_start_byte = start;
+                entry->last_end_byte = end;
+                entry->count++;
+                total_occurrences++;
+                repeated = repeated || entry->count > SKIP_CHAR;
+                json_hash_u32(&entry->occurrence_hash, start);
+                json_hash_u32(&entry->occurrence_hash, end);
+                json_hash_u32(&entry->occurrence_hash, end - start);
+                cbm_sha256_update(&entry->occurrence_hash, ctx->source + start, end - start);
+            } else if (strcmp(kind, "array") == 0 && !json_text_append(&path, "/*", PAIR_LEN)) {
+                ok = json_schema_fail(ctx, "CBM_JSON_SCHEMA_ALLOC_FAILED", "append_array_wildcard",
+                                      path.len,
+                                      "the normalized JSON schema path could not be extended",
+                                      "free memory and retry the complete corpus");
+                break;
+            }
+        }
+
+        TSNode child = {0};
+        bool have_child = false;
+        if (strcmp(kind, "pair") == 0) {
+            if (frame->next_child == 0) {
+                frame->next_child++;
+                child = ts_node_child_by_field_name(frame->node, TS_FIELD("value"));
+                have_child = !ts_node_is_null(child);
+            }
+        } else {
+            uint32_t named = ts_node_named_child_count(frame->node);
+            if (frame->next_child < named) {
+                child = ts_node_named_child(frame->node, frame->next_child++);
+                have_child = !ts_node_is_null(child);
+            }
+        }
+        if (have_child) {
+            if (!json_walk_frame_push(&frames, &frame_count, &frame_capacity, child)) {
+                ok = json_schema_fail(ctx, "CBM_JSON_SCHEMA_ALLOC_FAILED", "grow_schema_walk",
+                                      frame_count,
+                                      "the JSON nesting traversal could not grow its depth stack",
+                                      "free memory or reduce nesting depth, then retry");
+            }
+            continue;
+        }
+        path.len = frame->restore_path_len;
+        if (path.data) {
+            path.data[path.len] = '\0';
+        }
+        frame_count--;
+    }
+
+    if (!ok) {
+        goto cleanup;
+    }
+    if (entry_count > INT_MAX) {
+        json_schema_fail(ctx, "CBM_JSON_SCHEMA_COUNT_UNREPRESENTABLE", "emit_schema_paths",
+                         entry_count,
+                         "the distinct JSON schema-path count exceeds the graph definition domain",
+                         "split the source into semantically independent files and retry");
+        ok = false;
+        goto cleanup;
+    }
+
+    const char *classification = NULL;
+    const char *provenance = NULL;
+    if (!json_structured_classification(ctx, repeated, &classification, &provenance)) {
+        ok = false;
+        goto cleanup;
+    }
+    ctx->result->structured_classification = classification;
+    ctx->result->structured_classification_provenance = provenance;
+    ctx->result->structured_schema_path_count = (uint64_t)entry_count;
+    ctx->result->structured_occurrence_count = total_occurrences;
+
+    cbm_ht_free(by_path);
+    by_path = NULL;
+    if (entry_count > SKIP_CHAR) {
+        qsort(entries, entry_count, sizeof(*entries), json_schema_entry_compare);
+    }
+    for (size_t i = 0; i < entry_count; i++) {
+        JSONSchemaEntry *entry = &entries[i];
+        uint8_t digest[CBM_SHA256_DIGEST_LEN];
+        char digest_hex[CBM_SHA256_HEX_LEN + SKIP_CHAR];
+        cbm_sha256_final(&entry->occurrence_hash, digest);
+        json_digest_hex(digest, digest_hex);
+
+        CBMDefinition def;
+        memset(&def, 0, sizeof(def));
+        def.name = entry->name;
+        def.qualified_name = cbm_fqn_compute_source_lang(
+            ctx->arena, ctx->project, ctx->rel_path, entry->path, ctx->language);
+        def.label = "Variable";
+        def.file_path = ctx->rel_path;
+        def.start_line = ts_node_start_point(entry->representative_key).row + TS_LINE_OFFSET;
+        def.end_line = cbm_node_end_line_inclusive(entry->representative_key);
+        def.start_byte = ts_node_start_byte(entry->representative_key);
+        def.end_byte = ts_node_end_byte(entry->representative_key);
+        def.structured_path = entry->path;
+        def.structured_occurrence_count = entry->count;
+        def.structured_occurrence_sha256 = cbm_arena_strdup(ctx->arena, digest_hex);
+        def.structured_first_start_byte = entry->first_start_byte;
+        def.structured_first_end_byte = entry->first_end_byte;
+        def.structured_last_start_byte = entry->last_start_byte;
+        def.structured_last_end_byte = entry->last_end_byte;
+        def.structured_classification = classification;
+        def.structured_classification_provenance = provenance;
+        if (!def.qualified_name || !def.structured_occurrence_sha256 ||
+            !cbm_defs_push(&ctx->result->defs, ctx->arena, def)) {
+            ok = json_schema_fail(ctx, "CBM_JSON_SCHEMA_EMIT_FAILED", "emit_schema_path", i,
+                                  "a complete JSON schema atom could not be emitted",
+                                  "free memory and retry the complete corpus");
+            break;
+        }
+    }
+
+cleanup:
+    if (by_path) {
+        cbm_ht_free(by_path);
+    }
+    free(entries);
+    free(frames);
+    free(path.data);
+    return ok;
+}
+
 // True if the file's basename is values.yaml / values.yml (Helm values, #338).
 static bool is_helm_values_file(const char *rel) {
     if (!rel) {
@@ -5381,9 +5942,14 @@ static void extract_variables(CBMExtractCtx *ctx, TSNode root, const CBMLangSpec
         return;
     }
 
+    if (ctx->language == CBM_LANG_JSON) {
+        (void)extract_json_schema_variables(ctx, root);
+        return;
+    }
+
     // Config languages with nested structure: use recursive walk
     if (ctx->language == CBM_LANG_YAML || ctx->language == CBM_LANG_TOML ||
-        ctx->language == CBM_LANG_INI || ctx->language == CBM_LANG_JSON) {
+        ctx->language == CBM_LANG_INI) {
         walk_variables_iter(ctx, root, spec);
         return;
     }

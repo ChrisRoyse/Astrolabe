@@ -12,6 +12,7 @@ use std::ffi::OsString;
 use std::fs::{self, File};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 const MAGIC: &[u8; 4] = b"CXS1";
@@ -55,17 +56,28 @@ struct IndexEntry {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SstLookupMetadata {
-    pub(crate) first_key: Vec<u8>,
-    pub(crate) last_key: Vec<u8>,
+    index: Arc<Vec<IndexEntry>>,
     bloom: BloomFilter,
+    file_len: usize,
+    header_bytes: [u8; HEADER_LEN],
+    #[cfg(windows)]
+    file_generation: crate::mmap_col::MmapFileGeneration,
+}
+
+impl SstLookupMetadata {
+    pub(crate) fn key_range(&self) -> Option<(&[u8], &[u8])> {
+        Some((
+            self.index.first()?.key.as_slice(),
+            self.index.last()?.key.as_slice(),
+        ))
+    }
 }
 
 /// Memory-mapped SSTable reader.
 #[derive(Debug)]
 pub struct SstReader {
     column: MmapColumn,
-    index: Vec<IndexEntry>,
-    bloom: BloomFilter,
+    lookup: Arc<SstLookupMetadata>,
 }
 
 /// Writes a sorted immutable SSTable. The input iterator must already be ordered.
@@ -182,45 +194,94 @@ impl SstReader {
         let column = MmapColumn::open(path.as_ref())?;
         let bytes = column.as_bytes();
         let header = read_header(bytes)?;
-        let index = read_index(
+        let index = Arc::new(read_index(
             bytes,
             header.entries,
             header.index_offset,
             header.bloom_offset,
-        )?;
+        )?);
         let bloom_bytes = bytes
             .get(header.bloom_offset as usize..)
             .ok_or_else(|| CalyxError::aster_corrupt_shard("SST bloom offset out of bounds"))?;
         let bloom = BloomFilter::decode(bloom_bytes)
             .ok_or_else(|| CalyxError::aster_corrupt_shard("invalid SST bloom filter"))?;
-        Ok(Self {
-            column,
+        let header_bytes = bytes[0..HEADER_LEN]
+            .try_into()
+            .expect("read_header established the exact SST header length");
+        let lookup = Arc::new(SstLookupMetadata {
             index,
             bloom,
-        })
+            file_len: bytes.len(),
+            header_bytes,
+            #[cfg(windows)]
+            file_generation: column.file_generation(),
+        });
+        Ok(Self { column, lookup })
+    }
+
+    /// Opens an immutable SST generation using metadata produced by a prior
+    /// full body validation. Exact generation, length, and header equality are
+    /// checked before the shared index is trusted; individual record CRCs are
+    /// still checked when values are read.
+    pub(crate) fn open_with_lookup(
+        path: impl AsRef<Path>,
+        lookup: Arc<SstLookupMetadata>,
+    ) -> Result<Self> {
+        let path = path.as_ref();
+        let column = MmapColumn::open(path)?;
+        let bytes = column.as_bytes();
+        if bytes.len() != lookup.file_len {
+            return Err(CalyxError::aster_corrupt_shard(format!(
+                "SST generation length changed for {}: validated {}, reopened {}",
+                path.display(),
+                lookup.file_len,
+                bytes.len()
+            )));
+        }
+        let reopened_header = bytes
+            .get(0..HEADER_LEN)
+            .ok_or_else(|| CalyxError::aster_corrupt_shard("SST header missing on reopen"))?;
+        if reopened_header != lookup.header_bytes {
+            return Err(CalyxError::aster_corrupt_shard(format!(
+                "SST generation header changed after validation for {}",
+                path.display()
+            )));
+        }
+        #[cfg(windows)]
+        if column.file_generation() != lookup.file_generation {
+            return Err(CalyxError::aster_corrupt_shard(format!(
+                "SST file identity changed after validation for {}: validated {:?}, reopened {:?}",
+                path.display(),
+                lookup.file_generation,
+                column.file_generation()
+            )));
+        }
+        Ok(Self { column, lookup })
     }
 
     pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
-        if !self.bloom.may_contain(key) {
+        if !self.lookup.bloom.may_contain(key) {
             return Ok(None);
         }
         let Ok(position) = self
+            .lookup
             .index
             .binary_search_by(|entry| entry.key.as_slice().cmp(key))
         else {
             return Ok(None);
         };
         Ok(Some(
-            read_record(self.column.as_bytes(), self.index[position].offset)?.value,
+            read_record(self.column.as_bytes(), self.lookup.index[position].offset)?.value,
         ))
     }
 
     pub fn range(&self, start: &[u8], end: &[u8]) -> Result<Vec<SstEntry>> {
         let start_at = self
+            .lookup
             .index
             .partition_point(|entry| entry.key.as_slice() < start);
         let mut rows = Vec::new();
-        for entry in &self.index[start_at..] {
+        for entry in &self.lookup.index[start_at..] {
             if entry.key.as_slice() >= end {
                 break;
             }
@@ -239,10 +300,11 @@ impl SstReader {
         end: Option<&[u8]>,
     ) -> Result<Vec<SstKeyState>> {
         let start_at = self
+            .lookup
             .index
             .partition_point(|entry| entry.key.as_slice() < start);
         let mut rows = Vec::new();
-        for entry in &self.index[start_at..] {
+        for entry in &self.lookup.index[start_at..] {
             if end.is_some_and(|end| entry.key.as_slice() >= end) {
                 break;
             }
@@ -256,32 +318,27 @@ impl SstReader {
     }
 
     pub fn iter(&self) -> Result<Vec<SstEntry>> {
-        self.index
+        self.lookup
+            .index
             .iter()
             .map(|entry| read_record(self.column.as_bytes(), entry.offset))
             .collect()
     }
 
     pub fn bloom_may_contain(&self, key: &[u8]) -> bool {
-        self.bloom.may_contain(key)
+        self.lookup.bloom.may_contain(key)
     }
 
     /// First and last key stored in this SST, or `None` for an empty file.
     pub fn key_range(&self) -> Option<(&[u8], &[u8])> {
         Some((
-            self.index.first()?.key.as_slice(),
-            self.index.last()?.key.as_slice(),
+            self.lookup.index.first()?.key.as_slice(),
+            self.lookup.index.last()?.key.as_slice(),
         ))
     }
 
-    pub(crate) fn lookup_metadata(&self) -> Option<SstLookupMetadata> {
-        let first_key = self.index.first()?.key.clone();
-        let last_key = self.index.last()?.key.clone();
-        Some(SstLookupMetadata {
-            first_key,
-            last_key,
-            bloom: self.bloom.clone(),
-        })
+    pub(crate) fn lookup_metadata(&self) -> Arc<SstLookupMetadata> {
+        Arc::clone(&self.lookup)
     }
 }
 

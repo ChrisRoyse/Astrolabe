@@ -140,11 +140,18 @@ static inline CBMTypeRegistry *cbm_pxc_registry_for_lang(const CBMCrossLspRegist
     }
 }
 
-/* Borrow the (thread-local) Rust Cargo manifest the cross-file LSP pass set for
- * cross-crate (#56) routing. The Tier-2 prebuilt Rust resolve reads it so it sees
- * exactly what the per-file fallback (cbm_pxc_run_one) would on the same thread. */
 struct CBMCargoManifest;
-const struct CBMCargoManifest *cbm_pxc_get_rust_manifest(void);
+
+/* Prepare one immutable, project-owned Cargo manifest before extraction.
+ * Missing Cargo.toml is a valid manifest-absent state. Allocation/read state
+ * that cannot be evaluated fails closed. Repeated prepare calls are no-ops;
+ * destroy releases only this pipeline context's arena. */
+int cbm_pxc_prepare_rust_manifest(cbm_pipeline_ctx_t *ctx);
+void cbm_pxc_destroy_rust_manifest(cbm_pipeline_ctx_t *ctx);
+
+/* Exact effective edition for one repository-relative source path, or NULL
+ * when the owning package cannot be resolved without guessing. */
+const char *cbm_pxc_rust_edition_for_file(const cbm_pipeline_ctx_t *ctx, const char *relative_path);
 
 /* Run the cross-file LSP resolver for non-TS languages. Appends
  * resolved CALLS into r->resolved_calls (lives in r->arena). Caller
@@ -153,7 +160,8 @@ const struct CBMCargoManifest *cbm_pxc_get_rust_manifest(void);
  * the existing cbm_run_X_lsp_cross callee signatures. */
 void cbm_pxc_run_one(CBMLanguage lang, CBMFileResult *r, const char *source, int source_len,
                      const char *module_qn, CBMLSPDef *all_defs, int def_count,
-                     const char **imp_keys, const char **imp_vals, int imp_count);
+                     const char **imp_keys, const char **imp_vals, int imp_count,
+                     const struct CBMCargoManifest *rust_manifest);
 
 /* TS / JS / JSX / TSX variant with explicit dialect flags. */
 void cbm_pxc_run_one_ts(CBMFileResult *r, const char *source, int source_len, const char *module_qn,
@@ -173,6 +181,6 @@ void cbm_pxc_dispatch_file(CBMLanguage lang, CBMFileResult *result, const char *
                            const CBMModuleDefIndex *module_def_index, CBMLSPDef *all_defs,
                            int all_def_count, const char **imp_keys, const char **imp_vals,
                            int imp_count, CBMTypeRegistry *(*rust_shared_get)(void *),
-                           void *rust_shared_ctx);
+                           void *rust_shared_ctx, const struct CBMCargoManifest *rust_manifest);
 
 #endif /* CBM_PIPELINE_PASS_LSP_CROSS_H */

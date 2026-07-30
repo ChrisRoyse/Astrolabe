@@ -733,10 +733,8 @@ int cbm_pipeline_githistory_apply(cbm_pipeline_ctx_t *ctx, const cbm_githistory_
         edge_count++;
     }
 
-    /* Apply per-file temporal metadata to existing File nodes so callers
-     * can query change_count / last_modified for hotspot analysis. The
-     * extension is re-derived and JSON-escaped to keep the props blob
-     * well-formed even for paths with quotes or backslashes. */
+    /* Apply temporal metadata as an object patch so independent enrichment
+     * domains compose instead of erasing one another. */
     for (int i = 0; i < result->file_temporal_count; i++) {
         const cbm_file_temporal_t *ft = &result->file_temporal[i];
         char *qn = cbm_pipeline_fqn_compute(ctx->project_name, ft->file_path, "__file__");
@@ -746,25 +744,12 @@ int cbm_pipeline_githistory_apply(cbm_pipeline_ctx_t *ctx, const cbm_githistory_
             continue;
         }
 
-        const char *base = strrchr(ft->file_path, '/');
-        base = base ? base + SKIP_ONE : ft->file_path;
-        const char *ext = strrchr(base, '.');
-        char ext_escaped[CBM_SZ_64];
-        cbm_json_escape(ext_escaped, (int)sizeof(ext_escaped), ext ? ext : "");
-
-        char props[CBM_SZ_256];
-        snprintf(props, sizeof(props),
-                 "{\"extension\":\"%s\",\"last_modified\":%lld,\"change_count\":%d}", ext_escaped,
+        char props[CBM_SZ_128];
+        snprintf(props, sizeof(props), "{\"last_modified\":%lld,\"change_count\":%d}",
                  ft->last_modified, ft->change_count);
-
-        if (node->source_present) {
-            cbm_gbuf_upsert_source_node(ctx->gbuf, node->label, node->name, node->qualified_name,
-                                        node->file_path, node->start_line, node->end_line,
-                                        node->source_bytes, node->source_len, node->start_byte,
-                                        node->end_byte, props);
-        } else {
-            cbm_gbuf_upsert_node(ctx->gbuf, node->label, node->name, node->qualified_name,
-                                 node->file_path, node->start_line, node->end_line, props);
+        if (cbm_gbuf_merge_source_container_properties(ctx->gbuf, "File", ft->file_path, props) !=
+            0) {
+            return CBM_NOT_FOUND;
         }
     }
 
@@ -789,6 +774,9 @@ int cbm_pipeline_pass_githistory(cbm_pipeline_ctx_t *ctx) {
     free(result.couplings);
     free(result.file_temporal);
 
+    if (edge_count < 0) {
+        return CBM_NOT_FOUND;
+    }
     cbm_log_info("pass.done", "pass", "githistory", "commits", itoa_log(result.commit_count),
                  "edges", itoa_log(edge_count));
     return 0;

@@ -4,7 +4,10 @@ mod compression_guard;
 mod gc;
 mod read;
 mod scan_pages;
-use crate::cf::{CfRouter, ColumnFamily, KeyRange};
+use crate::cf::{
+    COMPRESSED_SLOT_VALUE_TAG, CfRouter, ColumnFamily, KeyRange, SlotFamilyKind,
+    compression_manifest_key,
+};
 use crate::gc::{SnapshotGcCounters, SnapshotGcReclaimer, SnapshotGcTick};
 use crate::mvcc::{
     Freshness, ReadBarrier, ReaderLease, SeqAllocator, Snapshot, read_barrier::first_blocking,
@@ -15,13 +18,18 @@ use crate::resource::{
 use crate::sst::{SstEntry, SstSummary};
 use calyx_core::{CalyxError, Clock, Result, Seq, Ts};
 use compression_guard::validate_compression_writes;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Bound;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
 const TOMBSTONE_VALUE: &[u8] = b"\0CALYX_ASTER_TOMBSTONE_V1";
+
+/// A compression lifecycle mutation requires the complete MVCC keyset and is
+/// therefore refused by a latest-only writable handle.
+pub const CALYX_ASTER_LATEST_ONLY_COMPRESSION_REQUIRES_MVCC: &str =
+    "CALYX_ASTER_LATEST_ONLY_COMPRESSION_REQUIRES_MVCC";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct VersionedValue {
@@ -47,6 +55,56 @@ fn sequence_conflict(expected: Seq, current: Seq) -> CalyxError {
 /// owning) lets the pre-WAL admission check and the in-commit check share one
 /// validator without cloning the batch (issue #562).
 type CompressionGuardRow<'a> = (ColumnFamily, &'a [u8], &'a [u8]);
+
+/// A row representation accepted by the shared commit implementation.
+///
+/// Normal callers hand ownership to MVCC, so [`CommitRow::into_owned`] moves
+/// their buffers into the version table. Durable group commit must retain its
+/// canonical WAL/checkpoint rows until the post-MVCC checkpoint stage, so it
+/// supplies borrowed rows and pays exactly the one copy that becomes persistent
+/// MVCC state instead of first cloning a second corpus-sized staging batch.
+trait CommitRow {
+    fn cf(&self) -> ColumnFamily;
+    fn key(&self) -> &[u8];
+    fn value(&self) -> &[u8];
+    fn into_owned(self) -> (ColumnFamily, Vec<u8>, Vec<u8>);
+}
+
+impl CommitRow for (ColumnFamily, Vec<u8>, Vec<u8>) {
+    fn cf(&self) -> ColumnFamily {
+        self.0
+    }
+
+    fn key(&self) -> &[u8] {
+        &self.1
+    }
+
+    fn value(&self) -> &[u8] {
+        &self.2
+    }
+
+    fn into_owned(self) -> (ColumnFamily, Vec<u8>, Vec<u8>) {
+        self
+    }
+}
+
+impl CommitRow for (ColumnFamily, &[u8], &[u8]) {
+    fn cf(&self) -> ColumnFamily {
+        self.0
+    }
+
+    fn key(&self) -> &[u8] {
+        self.1
+    }
+
+    fn value(&self) -> &[u8] {
+        self.2
+    }
+
+    fn into_owned(self) -> (ColumnFamily, Vec<u8>, Vec<u8>) {
+        (self.0, self.1.to_vec(), self.2.to_vec())
+    }
+}
 
 /// One CF/key read requested against a snapshot.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -285,7 +343,70 @@ impl VersionedCfStore {
     ) -> Result<()> {
         let table = self.rows.read().expect("mvcc row table poisoned");
         let current = self.current_seq();
+        self.validate_latest_only_compression_admission(rows)?;
         validate_compression_writes(&table, current, rows)
+    }
+
+    /// Latest-only mode deliberately does not retain the complete MVCC keyset.
+    /// Ordinary rows are safe because their latest state lives in the router;
+    /// compression generation changes are not, because the lifecycle validator
+    /// must reconcile the complete primary/raw keysets. Refuse those operations
+    /// before WAL append and also refuse ordinary mutations to any slot whose
+    /// live manifest is visible in the router.
+    fn validate_latest_only_compression_admission(
+        &self,
+        rows: &[CompressionGuardRow<'_>],
+    ) -> Result<()> {
+        if !self.router_latest_readback.load(Ordering::Acquire) {
+            return Ok(());
+        }
+
+        let mut touched_slots = BTreeSet::new();
+        for &(cf, _key, value) in rows {
+            match cf {
+                ColumnFamily::Compression => {
+                    return Err(latest_only_compression_error(
+                        "a compression manifest or lifecycle row was included in the batch"
+                            .to_string(),
+                    ));
+                }
+                ColumnFamily::Slot { slot, kind } => {
+                    touched_slots.insert(slot);
+                    if kind == SlotFamilyKind::Quantized
+                        && !is_tombstone_value(value)
+                        && value.first().copied() == Some(COMPRESSED_SLOT_VALUE_TAG)
+                    {
+                        return Err(latest_only_compression_error(format!(
+                            "slot {} contains a compressed-tagged primary value",
+                            slot.get()
+                        )));
+                    }
+                }
+                _ => {}
+            }
+        }
+        if touched_slots.is_empty() {
+            return Ok(());
+        }
+
+        let router = self.router.read().expect("mvcc router poisoned");
+        let router = router.as_ref().ok_or_else(|| {
+            CalyxError::aster_corrupt_shard(
+                "latest-only MVCC mode has no column-family router for compression admission",
+            )
+        })?;
+        for slot in touched_slots {
+            if router
+                .get(ColumnFamily::Compression, &compression_manifest_key(slot))?
+                .is_some_and(|value| !is_tombstone_value(&value))
+            {
+                return Err(latest_only_compression_error(format!(
+                    "slot {} has a live compression manifest in durable router state",
+                    slot.get()
+                )));
+            }
+        }
+        Ok(())
     }
 
     /// Atomically commits one write group across any number of CFs.
@@ -321,6 +442,23 @@ impl VersionedCfStore {
         self.commit_batch_inner(None, rows, true)
     }
 
+    /// Commits a borrowed write group while retaining the caller's canonical
+    /// buffers for WAL checkpointing and exact persisted-state verification.
+    /// Only the final MVCC versions allocate owned key/value bytes; there is no
+    /// intermediate owned batch proportional to the corpus.
+    pub(crate) fn commit_batch_borrowed(&self, rows: &[CompressionGuardRow<'_>]) -> Result<Seq> {
+        self.commit_batch_inner(None, rows.to_vec(), false)
+    }
+
+    /// Borrowed counterpart of [`Self::commit_batch_unguarded`], reserved for
+    /// the same fail-closed legacy reconstruction path.
+    pub(crate) fn commit_batch_unguarded_borrowed(
+        &self,
+        rows: &[CompressionGuardRow<'_>],
+    ) -> Result<Seq> {
+        self.commit_batch_inner(None, rows.to_vec(), true)
+    }
+
     /// Atomically commits one write group only when the current sequence still
     /// equals `expected_seq`.
     pub fn commit_batch_if_current<I, K, V>(&self, expected_seq: Seq, rows: I) -> Result<Seq>
@@ -336,12 +474,15 @@ impl VersionedCfStore {
         self.commit_batch_inner(Some(expected_seq), rows, false)
     }
 
-    fn commit_batch_inner(
+    fn commit_batch_inner<R>(
         &self,
         expected_seq: Option<Seq>,
-        rows: Vec<(ColumnFamily, Vec<u8>, Vec<u8>)>,
+        rows: Vec<R>,
         skip_compression_guard: bool,
-    ) -> Result<Seq> {
+    ) -> Result<Seq>
+    where
+        R: CommitRow,
+    {
         if rows.is_empty() {
             let current = self.current_seq();
             if let Some(expected) = expected_seq
@@ -359,11 +500,12 @@ impl VersionedCfStore {
         {
             return Err(sequence_conflict(expected, current));
         }
+        let borrowed: Vec<CompressionGuardRow<'_>> = rows
+            .iter()
+            .map(|row| (row.cf(), row.key(), row.value()))
+            .collect();
+        self.validate_latest_only_compression_admission(&borrowed)?;
         if !skip_compression_guard {
-            let borrowed: Vec<CompressionGuardRow<'_>> = rows
-                .iter()
-                .map(|(cf, key, value)| (*cf, key.as_slice(), value.as_slice()))
-                .collect();
             validate_compression_writes(&table, current, &borrowed)?;
         }
         if let Some(router) = self.router.write().expect("mvcc router poisoned").as_mut() {
@@ -373,8 +515,8 @@ impl VersionedCfStore {
             // that commit watermark so the flush SST orders correctly against
             // durable batches (issue #1138).
             let commit_watermark = self.current_seq() + 1;
-            for (cf, key, value) in &rows {
-                router.put_at(*cf, key, value, commit_watermark)?;
+            for row in &rows {
+                router.put_at(row.cf(), row.key(), row.value(), commit_watermark)?;
             }
         }
         // Advance the derived-content watermark BEFORE allocating the seq:
@@ -385,17 +527,20 @@ impl VersionedCfStore {
         // commit path's time-index seqno prediction).
         if rows
             .iter()
-            .any(|(cf, _, _)| cf.feeds_derived_search_content())
+            .any(|row| row.cf().feeds_derived_search_content())
         {
             self.derived_content_seq
                 .fetch_max(self.current_seq() + 1, Ordering::AcqRel);
         }
         let seq = self.seqs.allocate();
-        for (cf, key, value) in rows {
-            table
-                .entry((cf, key))
-                .or_default()
-                .push(VersionedValue { seq, value });
+        if !self.router_latest_readback.load(Ordering::Acquire) {
+            for row in rows {
+                let (cf, key, value) = row.into_owned();
+                table
+                    .entry((cf, key))
+                    .or_default()
+                    .push(VersionedValue { seq, value });
+            }
         }
         Ok(seq)
     }
@@ -475,6 +620,16 @@ impl VersionedCfStore {
             .read()
             .expect("mvcc read barriers poisoned")
             .clone()
+    }
+}
+
+fn latest_only_compression_error(reason: String) -> CalyxError {
+    CalyxError {
+        code: CALYX_ASTER_LATEST_ONLY_COMPRESSION_REQUIRES_MVCC,
+        message: format!(
+            "latest-only vault cannot validate this compression-sensitive write: {reason}"
+        ),
+        remediation: "reopen the vault with restore_mvcc_rows=true before mutating a compressed slot or its generation lifecycle",
     }
 }
 

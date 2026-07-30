@@ -156,6 +156,7 @@ bool cbm_is_auxiliary_input_name(const char *filename) {
                                               ".codebase-memory.json",
                                               ".cbmignore",
                                               ".gitignore",
+                                              ".gitattributes",
                                               NULL};
     if (str_in_list(filename, EXACT_NAMES)) {
         return true;

@@ -32,9 +32,9 @@ pub use lenses::{
     IdentifierLexicalInput, LangLabelInput, PathHierarchyInput, RECORD_VECTOR_SCALAR_KEYS,
     RecordVectorInput, RoleFlagsInput, RouteObservation, RouteSurfaceInput, StructuralTrigram,
     TestTopologyInput, TypeSurfaceInput, canonical_route_qn, cbm_camel_split_text,
-    cbm_camel_split_tokens, cbm_route_canon_path, default_api_family, encode_slot,
-    fixture_encoder_input, fixture_scalar_sidecar, layer_role_lens, s0_s9_lenses,
-    s10_s17_s21_lenses,
+    cbm_camel_split_tokens, cbm_route_canon_path, default_api_family,
+    encode_identifier_lexical_streaming, encode_slot, fixture_encoder_input,
+    fixture_scalar_sidecar, layer_role_lens, s0_s9_lenses, s10_s17_s21_lenses,
 };
 pub use similarity::{
     ASTRO_PANEL_COSINE_SHAPE_MISMATCH, ASTRO_PANEL_COSINE_UNSUPPORTED_SHAPE, slot_centroid,

@@ -17,12 +17,16 @@
 
 /* ── Tiny tokenizer ──────────────────────────────────────────── */
 
-static int skip_ws_and_comment(const char* s, int len, int from) {
+static int skip_ws_and_comment(const char *s, int len, int from) {
     while (from < len) {
         char c = s[from];
-        if (c == ' ' || c == '\t' || c == '\n' || c == '\r') { from++; continue; }
+        if (c == ' ' || c == '\t' || c == '\n' || c == '\r') {
+            from++;
+            continue;
+        }
         if (c == '#') {
-            while (from < len && s[from] != '\n') from++;
+            while (from < len && s[from] != '\n')
+                from++;
             continue;
         }
         break;
@@ -31,26 +35,29 @@ static int skip_ws_and_comment(const char* s, int len, int from) {
 }
 
 static bool is_ident_char(char c) {
-    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
-           (c >= '0' && c <= '9') || c == '_' || c == '-';
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' ||
+           c == '-' || c == '.';
 }
 
 /* Parse a bare key (ident-like). Stores arena-allocated copy in *out. */
-static int parse_key(CBMArena* a, const char* s, int len, int from,
-    const char** out) {
+static int parse_key(CBMArena *a, const char *s, int len, int from, const char **out) {
     int start = from;
     if (from < len && s[from] == '"') {
         from++;
         start = from;
         while (from < len && s[from] != '"') {
-            if (s[from] == '\\' && from + 1 < len) from += 2;
-            else from++;
+            if (s[from] == '\\' && from + 1 < len)
+                from += 2;
+            else
+                from++;
         }
         *out = cbm_arena_strndup(a, s + start, (size_t)(from - start));
-        if (from < len && s[from] == '"') from++;
+        if (from < len && s[from] == '"')
+            from++;
         return from;
     }
-    while (from < len && is_ident_char(s[from])) from++;
+    while (from < len && is_ident_char(s[from]))
+        from++;
     if (from > start) {
         *out = cbm_arena_strndup(a, s + start, (size_t)(from - start));
     }
@@ -58,35 +65,43 @@ static int parse_key(CBMArena* a, const char* s, int len, int from,
 }
 
 /* Parse a string literal (single or double quoted). */
-static int parse_string(CBMArena* a, const char* s, int len, int from,
-    const char** out) {
-    if (from >= len) return from;
+static int parse_string(CBMArena *a, const char *s, int len, int from, const char **out) {
+    if (from >= len)
+        return from;
     char q = s[from];
-    if (q != '"' && q != '\'') return from;
+    if (q != '"' && q != '\'')
+        return from;
     from++;
     int start = from;
     while (from < len && s[from] != q) {
-        if (s[from] == '\\' && from + 1 < len) from += 2;
-        else from++;
+        if (s[from] == '\\' && from + 1 < len)
+            from += 2;
+        else
+            from++;
     }
     *out = cbm_arena_strndup(a, s + start, (size_t)(from - start));
-    if (from < len) from++;
+    if (from < len)
+        from++;
     return from;
 }
 
 /* Skip a value (used for keys we don't care about). Handles strings,
  * arrays, inline tables, bare values. */
-static int skip_value(const char* s, int len, int from) {
+static int skip_value(const char *s, int len, int from) {
     from = skip_ws_and_comment(s, len, from);
-    if (from >= len) return from;
+    if (from >= len)
+        return from;
     char c = s[from];
     if (c == '"' || c == '\'') {
         from++;
         while (from < len && s[from] != c) {
-            if (s[from] == '\\' && from + 1 < len) from += 2;
-            else from++;
+            if (s[from] == '\\' && from + 1 < len)
+                from += 2;
+            else
+                from++;
         }
-        if (from < len) from++;
+        if (from < len)
+            from++;
         return from;
     }
     if (c == '[' || c == '{') {
@@ -98,38 +113,50 @@ static int skip_value(const char* s, int len, int from) {
             if (d == '"' || d == '\'') {
                 from++;
                 while (from < len && s[from] != d) {
-                    if (s[from] == '\\' && from + 1 < len) from += 2;
-                    else from++;
+                    if (s[from] == '\\' && from + 1 < len)
+                        from += 2;
+                    else
+                        from++;
                 }
-                if (from < len) from++;
+                if (from < len)
+                    from++;
                 continue;
             }
-            if (d == open) depth++;
-            else if (d == close) depth--;
+            if (d == open)
+                depth++;
+            else if (d == close)
+                depth--;
             from++;
         }
         return from;
     }
     /* Bare value: skip to end of line. */
-    while (from < len && s[from] != '\n' && s[from] != '#') from++;
+    while (from < len && s[from] != '\n' && s[from] != '#')
+        from++;
     return from;
 }
 
 /* Parse `[section.path]` header — returns the section name as a flat
  * dotted string, e.g. "dependencies" or "workspace.dependencies". */
-static int parse_section(CBMArena* a, const char* s, int len, int from,
-    const char** out) {
-    if (from >= len || s[from] != '[') return from;
+static int parse_section(CBMArena *a, const char *s, int len, int from, const char **out) {
+    if (from >= len || s[from] != '[')
+        return from;
     /* Skip leading `[` or `[[`. */
     bool array_of_tables = false;
     from++;
-    if (from < len && s[from] == '[') { array_of_tables = true; from++; }
+    if (from < len && s[from] == '[') {
+        array_of_tables = true;
+        from++;
+    }
     int start = from;
-    while (from < len && s[from] != ']') from++;
+    while (from < len && s[from] != ']')
+        from++;
     *out = cbm_arena_strndup(a, s + start, (size_t)(from - start));
     /* Consume closing `]` (or `]]`). */
-    if (from < len) from++;
-    if (array_of_tables && from < len && s[from] == ']') from++;
+    if (from < len)
+        from++;
+    if (array_of_tables && from < len && s[from] == ']')
+        from++;
     return from;
 }
 
@@ -138,30 +165,38 @@ static int parse_section(CBMArena* a, const char* s, int len, int from,
  * may be a string (the version) or an inline table. We capture both
  * shapes — only the key (crate name) and optional `path = "..."` field
  * matter for us. */
-static int parse_dep_entry(CBMArena* a, const char* s, int len, int from,
-    CBMCargoManifest* out) {
+static int parse_dep_entry(CBMArena *a, const char *s, int len, int from, CBMCargoManifest *out) {
     from = skip_ws_and_comment(s, len, from);
-    if (from >= len || s[from] == '[') return from;
-    const char* key = NULL;
+    if (from >= len || s[from] == '[')
+        return from;
+    const char *key = NULL;
     from = parse_key(a, s, len, from, &key);
     from = skip_ws_and_comment(s, len, from);
     if (from < len && s[from] == '=') {
         from++;
         from = skip_ws_and_comment(s, len, from);
     }
-    const char* path_val = NULL;
+    const char *path_val = NULL;
     if (from < len && s[from] == '{') {
         /* Inline table — scan for `path = "..."`. */
         int depth = 1;
         from++;
         while (from < len && depth > 0) {
             from = skip_ws_and_comment(s, len, from);
-            if (from >= len) break;
+            if (from >= len)
+                break;
             char c = s[from];
-            if (c == '}') { depth--; from++; continue; }
-            if (c == ',') { from++; continue; }
+            if (c == '}') {
+                depth--;
+                from++;
+                continue;
+            }
+            if (c == ',') {
+                from++;
+                continue;
+            }
             /* sub-key */
-            const char* sub_key = NULL;
+            const char *sub_key = NULL;
             from = parse_key(a, s, len, from, &sub_key);
             from = skip_ws_and_comment(s, len, from);
             if (from < len && s[from] == '=') {
@@ -187,11 +222,11 @@ static int parse_dep_entry(CBMArena* a, const char* s, int len, int from,
 
 /* ── Section dispatcher ──────────────────────────────────────── */
 
-static int parse_package_kv(CBMArena* a, const char* s, int len, int from,
-    CBMCargoManifest* out) {
+static int parse_package_kv(CBMArena *a, const char *s, int len, int from, CBMCargoManifest *out) {
     from = skip_ws_and_comment(s, len, from);
-    if (from >= len || s[from] == '[') return from;
-    const char* key = NULL;
+    if (from >= len || s[from] == '[')
+        return from;
+    const char *key = NULL;
     from = parse_key(a, s, len, from, &key);
     from = skip_ws_and_comment(s, len, from);
     if (from < len && s[from] == '=') {
@@ -202,18 +237,49 @@ static int parse_package_kv(CBMArena* a, const char* s, int len, int from,
         from = parse_string(a, s, len, from, &out->package_name);
     } else if (key && strcmp(key, "version") == 0) {
         from = parse_string(a, s, len, from, &out->package_version);
+    } else if (key && strcmp(key, "edition") == 0) {
+        from = parse_string(a, s, len, from, &out->package_edition);
+    } else if (key && strcmp(key, "edition.workspace") == 0) {
+        int start = from;
+        from = skip_value(s, len, from);
+        int value_len = from - start;
+        while (value_len > 0 && isspace((unsigned char)s[start + value_len - 1]))
+            value_len--;
+        out->package_edition_inherits_workspace =
+            value_len == 4 && strncmp(s + start, "true", 4) == 0;
     } else {
         from = skip_value(s, len, from);
     }
     return from;
 }
 
-static int parse_workspace_kv(CBMArena* a, const char* s, int len, int from,
-    CBMCargoManifest* out) {
+static int parse_workspace_package_kv(CBMArena *a, const char *s, int len, int from,
+                                      CBMCargoManifest *out) {
     from = skip_ws_and_comment(s, len, from);
-    if (from >= len || s[from] == '[') return from;
+    if (from >= len || s[from] == '[')
+        return from;
+    const char *key = NULL;
+    from = parse_key(a, s, len, from, &key);
+    from = skip_ws_and_comment(s, len, from);
+    if (from < len && s[from] == '=') {
+        from++;
+        from = skip_ws_and_comment(s, len, from);
+    }
+    if (key && strcmp(key, "edition") == 0) {
+        from = parse_string(a, s, len, from, &out->workspace_package_edition);
+    } else {
+        from = skip_value(s, len, from);
+    }
+    return from;
+}
+
+static int parse_workspace_kv(CBMArena *a, const char *s, int len, int from,
+                              CBMCargoManifest *out) {
+    from = skip_ws_and_comment(s, len, from);
+    if (from >= len || s[from] == '[')
+        return from;
     out->is_workspace_root = true;
-    const char* key = NULL;
+    const char *key = NULL;
     from = parse_key(a, s, len, from, &key);
     from = skip_ws_and_comment(s, len, from);
     if (from < len && s[from] == '=') {
@@ -225,13 +291,14 @@ static int parse_workspace_kv(CBMArena* a, const char* s, int len, int from,
         while (from < len && s[from] != ']') {
             from = skip_ws_and_comment(s, len, from);
             if (from < len && (s[from] == '"' || s[from] == '\'')) {
-                const char* mem = NULL;
+                const char *mem = NULL;
                 from = parse_string(a, s, len, from, &mem);
                 if (mem && out->member_count < CBM_CARGO_MAX_MEMBERS) {
                     /* Derive a member NAME from the path's last segment. */
-                    const char* last = mem;
-                    for (const char* p = mem; *p; p++) {
-                        if (*p == '/') last = p + 1;
+                    const char *last = mem;
+                    for (const char *p = mem; *p; p++) {
+                        if (*p == '/')
+                            last = p + 1;
                     }
                     out->members[out->member_count].member_name = last;
                     out->members[out->member_count].member_path = mem;
@@ -239,31 +306,35 @@ static int parse_workspace_kv(CBMArena* a, const char* s, int len, int from,
                 }
             }
             from = skip_ws_and_comment(s, len, from);
-            if (from < len && s[from] == ',') from++;
+            if (from < len && s[from] == ',')
+                from++;
             from = skip_ws_and_comment(s, len, from);
         }
-        if (from < len) from++;  /* consume `]` */
+        if (from < len)
+            from++; /* consume `]` */
     } else {
         from = skip_value(s, len, from);
     }
     return from;
 }
 
-void cbm_cargo_parse(CBMArena* arena, const char* src, int src_len,
-    CBMCargoManifest* out) {
-    if (!arena || !src || !out) return;
+void cbm_cargo_parse(CBMArena *arena, const char *src, int src_len, CBMCargoManifest *out) {
+    if (!arena || !src || !out)
+        return;
     memset(out, 0, sizeof(*out));
-    if (src_len <= 0) src_len = (int)strlen(src);
+    if (src_len <= 0)
+        src_len = (int)strlen(src);
 
     int from = 0;
     /* Default: pre-header content treated as [package]. */
-    const char* section = "package";
+    const char *section = "package";
 
     while (from < src_len) {
         from = skip_ws_and_comment(src, src_len, from);
-        if (from >= src_len) break;
+        if (from >= src_len)
+            break;
         if (src[from] == '[') {
-            const char* hdr = NULL;
+            const char *hdr = NULL;
             from = parse_section(arena, src, src_len, from, &hdr);
             section = hdr ? hdr : "";
             continue;
@@ -276,6 +347,8 @@ void cbm_cargo_parse(CBMArena* arena, const char* src, int src_len,
             from = parse_package_kv(arena, src, src_len, from, out);
         } else if (strcmp(section, "workspace") == 0) {
             from = parse_workspace_kv(arena, src, src_len, from, out);
+        } else if (strcmp(section, "workspace.package") == 0) {
+            from = parse_workspace_package_kv(arena, src, src_len, from, out);
         } else if (strcmp(section, "dependencies") == 0 ||
                    strcmp(section, "dev-dependencies") == 0 ||
                    strcmp(section, "build-dependencies") == 0 ||
@@ -290,30 +363,65 @@ void cbm_cargo_parse(CBMArena* arena, const char* src, int src_len,
     }
 }
 
-bool cbm_cargo_is_known_dep(const CBMCargoManifest* m, const char* head) {
-    if (!m || !head) return false;
+bool cbm_cargo_is_known_dep(const CBMCargoManifest *m, const char *head) {
+    if (!m || !head)
+        return false;
     for (int i = 0; i < m->dep_count; i++) {
         if (m->deps[i].name && strcmp(m->deps[i].name, head) == 0) {
             return true;
         }
     }
     for (int i = 0; i < m->member_count; i++) {
-        if (m->members[i].member_name &&
-            strcmp(m->members[i].member_name, head) == 0) {
+        if (m->members[i].member_name && strcmp(m->members[i].member_name, head) == 0) {
             return true;
         }
     }
     return false;
 }
 
-const CBMCargoMember* cbm_cargo_find_member(const CBMCargoManifest* m,
-    const char* name) {
-    if (!m || !name) return NULL;
+const CBMCargoMember *cbm_cargo_find_member(const CBMCargoManifest *m, const char *name) {
+    if (!m || !name)
+        return NULL;
     for (int i = 0; i < m->member_count; i++) {
-        if (m->members[i].member_name &&
-            strcmp(m->members[i].member_name, name) == 0) {
+        if (m->members[i].member_name && strcmp(m->members[i].member_name, name) == 0) {
             return &m->members[i];
         }
     }
+    return NULL;
+}
+
+static bool cargo_path_prefix(const char *path, const char *prefix) {
+    if (!path || !prefix || !prefix[0])
+        return false;
+    size_t i = 0;
+    while (prefix[i]) {
+        char left = path[i] == '\\' ? '/' : path[i];
+        char right = prefix[i] == '\\' ? '/' : prefix[i];
+        if (!path[i] || left != right)
+            return false;
+        i++;
+    }
+    return path[i] == '\0' || path[i] == '/' || path[i] == '\\';
+}
+
+const char *cbm_cargo_edition_for_path(const CBMCargoManifest *m, const char *relative_path) {
+    if (!m)
+        return NULL;
+    const CBMCargoMember *selected = NULL;
+    size_t selected_len = 0;
+    for (int i = 0; i < m->member_count; i++) {
+        const CBMCargoMember *member = &m->members[i];
+        size_t len = member->member_path ? strlen(member->member_path) : 0;
+        if (len > selected_len && cargo_path_prefix(relative_path, member->member_path)) {
+            selected = member;
+            selected_len = len;
+        }
+    }
+    if (selected)
+        return selected->edition;
+    if (m->package_edition)
+        return m->package_edition;
+    if (m->package_name)
+        return "2015"; /* Cargo's specified package default. */
     return NULL;
 }

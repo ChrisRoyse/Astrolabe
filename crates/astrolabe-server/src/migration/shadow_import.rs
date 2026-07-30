@@ -262,7 +262,10 @@ impl SlotRuntime for ShadowSlotRuntime {
                 table,
             );
         }
-        astrolabe_panel::encode_slot(slot.slot_id(), &shadow_encoder_input(input))
+        if slot.slot == 7 {
+            return encode_shadow_identifier_slot(input);
+        }
+        astrolabe_panel::encode_slot(slot.slot_id(), &shadow_encoder_input(slot.slot, input))
     }
 }
 
@@ -290,143 +293,172 @@ fn shadow_embedding_input(input: &PanelInput) -> astrolabe_panel::StaticEmbeddin
     }
 }
 
-fn shadow_encoder_input(input: &PanelInput) -> astrolabe_panel::EncoderLensInput {
+fn shadow_encoder_input(slot: u16, input: &PanelInput) -> astrolabe_panel::EncoderLensInput {
     use astrolabe_panel::{
-        ComplexityMetrics, ConfigEnvSurfaceInput, EncoderLensInput, ErrorSurfaceInput,
-        IdentifierLexicalInput, LangLabelInput, PathHierarchyInput, RECORD_VECTOR_SCALAR_KEYS,
-        RecordVectorInput, RoleFlagsInput, RouteObservation, RouteSurfaceInput, TypeSurfaceInput,
+        ConfigEnvSurfaceInput, EncoderLensInput, ErrorSurfaceInput, LangLabelInput,
+        PathHierarchyInput, RECORD_VECTOR_SCALAR_KEYS, RecordVectorInput, RoleFlagsInput,
+        TypeSurfaceInput,
     };
 
     let properties = &input.properties;
-    let body_identifiers = property_string(properties, "bt")
-        .map(text_tokens)
-        .unwrap_or_else(|| text_tokens(&String::from_utf8_lossy(&input.source_bytes)));
-    let complexity = numeric_property(properties, "complexity");
-    let cognitive = numeric_property(properties, "cognitive");
-    let loop_count = numeric_property(properties, "loop_count");
-    let loop_depth = numeric_property(properties, "loop_depth");
-    let max_access_depth = numeric_property(properties, "max_access_depth");
-    let param_count = numeric_property(properties, "param_count");
-    let body_lines = numeric_property(properties, "lines").or_else(|| {
-        Some(
-            input
-                .source_bytes
-                .iter()
-                .filter(|byte| **byte == b'\n')
-                .count() as f32,
-        )
-    });
-    let body_tokens = property_string(properties, "bt")
-        .map(|tokens| text_tokens(tokens).len() as f32)
-        .or(Some(body_identifiers.len() as f32));
-    let complexity_input = Some(ComplexityMetrics {
-        cyclomatic: complexity.unwrap_or(0.0),
-        cognitive: cognitive.unwrap_or(0.0),
-        loop_count: loop_count.unwrap_or(0.0),
-        loop_depth: loop_depth.unwrap_or(0.0),
-        max_access_depth: max_access_depth.unwrap_or(0.0),
-        param_count: param_count.unwrap_or(0.0),
-        body_lines: body_lines.unwrap_or(0.0),
-        body_tokens: body_tokens.unwrap_or(0.0),
-    });
-
-    let mut record_scalars = RECORD_VECTOR_SCALAR_KEYS
-        .iter()
-        .map(|key| ((*key).to_string(), 0.0_f32))
-        .collect::<BTreeMap<_, _>>();
-    for (key, value) in [
-        ("complexity.cyclomatic", complexity),
-        ("complexity.cognitive", cognitive),
-        ("complexity.loop_count", loop_count),
-        ("complexity.loop_depth", loop_depth),
-        ("complexity.max_access_depth", max_access_depth),
-        ("complexity.param_count", param_count),
-        ("complexity.body_lines", body_lines),
-        ("complexity.body_tokens", body_tokens),
-    ] {
-        if let Some(value) = value {
-            record_scalars.insert(key.to_string(), value);
+    let mut out = EncoderLensInput::default();
+    match slot {
+        0 => out.ast_profile = property_string(properties, "sp").and_then(parse_ast_profile),
+        // S1/S4 sources are serialized by libcbm at index time (#374). Parse
+        // only for the slot that consumes them; absent input remains an explicit
+        // slot deficit rather than a fabricated vector.
+        1 => {
+            out.struct_trigrams = property_string(properties, "st").and_then(parse_struct_trigrams)
         }
+        2 | 3 => out.complexity = Some(shadow_complexity_input(input)),
+        4 => out.api_calls = property_string(properties, "callees").and_then(parse_api_callees),
+        5 => {
+            out.type_surface = Some(TypeSurfaceInput {
+                param_types: property_strings(properties, "param_types"),
+                return_types: property_string(properties, "return_type")
+                    .filter(|value| !value.trim().is_empty())
+                    .map(|value| vec![value.to_string()])
+                    .unwrap_or_default(),
+                uses_types: property_strings(properties, "base_classes"),
+                instantiates: Vec::new(),
+            });
+        }
+        6 => out.decorators = Some(property_strings(properties, "decorators")),
+        9 => {
+            out.path_hierarchy = Some(PathHierarchyInput {
+                path: input.rel_file_path.clone(),
+            });
+        }
+        12 => {
+            let is_route = property_string(properties, "route_path")
+                .is_some_and(|path| !path.trim().is_empty());
+            let docstring = property_string(properties, "docstring").unwrap_or_default();
+            out.role_flags = Some(RoleFlagsInput {
+                is_test: bool_property(properties, "is_test"),
+                is_entry: bool_property(properties, "is_entry_point"),
+                is_exported: bool_property(properties, "is_exported"),
+                is_abstract: bool_property(properties, "is_abstract"),
+                is_async: bool_property(properties, "is_async"),
+                is_generator: bool_property(properties, "is_generator"),
+                is_route,
+                is_handler: is_route,
+                is_dead: bool_property(properties, "is_dead"),
+                is_recursive: bool_property(properties, "self_recursive"),
+                is_generated: input.rel_file_path.contains("generated")
+                    || input.rel_file_path.contains("vendor"),
+                is_documented: !docstring.trim().is_empty(),
+            });
+        }
+        13 => {
+            out.lang_label = Some(LangLabelInput {
+                language: input.language.clone(),
+                label: input.label.as_str().to_string(),
+            });
+        }
+        15 => {
+            out.error_surface = Some(ErrorSurfaceInput {
+                thrown: property_strings(properties, "throws"),
+                raised: property_strings(properties, "raises"),
+                caught: property_strings(properties, "catches"),
+            });
+        }
+        16 => {
+            out.config_env_surface = Some(ConfigEnvSurfaceInput {
+                env_keys: property_strings(properties, "env_keys"),
+                config_keys: property_strings(properties, "config_keys"),
+            });
+        }
+        17 => out.route_surface = shadow_route_surface(input),
+        21 => {
+            let complexity = numeric_property(properties, "complexity");
+            let cognitive = numeric_property(properties, "cognitive");
+            let loop_count = numeric_property(properties, "loop_count");
+            let loop_depth = numeric_property(properties, "loop_depth");
+            let max_access_depth = numeric_property(properties, "max_access_depth");
+            let param_count = numeric_property(properties, "param_count");
+            let body_lines = Some(shadow_body_line_count(input));
+            let body_tokens = Some(shadow_body_token_count(input) as f32);
+            let mut scalars = RECORD_VECTOR_SCALAR_KEYS
+                .iter()
+                .map(|key| ((*key).to_string(), 0.0_f32))
+                .collect::<BTreeMap<_, _>>();
+            for (key, value) in [
+                ("complexity.cyclomatic", complexity),
+                ("complexity.cognitive", cognitive),
+                ("complexity.loop_count", loop_count),
+                ("complexity.loop_depth", loop_depth),
+                ("complexity.max_access_depth", max_access_depth),
+                ("complexity.param_count", param_count),
+                ("complexity.body_lines", body_lines),
+                ("complexity.body_tokens", body_tokens),
+            ] {
+                if let Some(value) = value {
+                    scalars.insert(key.to_string(), value);
+                }
+            }
+            out.record_vec = Some(RecordVectorInput { scalars });
+        }
+        _ => {}
     }
+    out
+}
 
-    let route_path = property_string(properties, "route_path").unwrap_or_default();
-    let route_surface = (!route_path.trim().is_empty()).then(|| RouteSurfaceInput {
-        routes: vec![RouteObservation {
-            method: property_string(properties, "route_method")
+fn encode_shadow_identifier_slot(input: &PanelInput) -> PanelResult<SlotVector> {
+    let encode = |body_text: &str| {
+        astrolabe_panel::encode_identifier_lexical_streaming(
+            &input.symbol_name,
+            &input.qualified_name,
+            text_token_stream(body_text),
+        )
+    };
+    match property_string(&input.properties, "bt") {
+        Some(body_tokens) => encode(body_tokens),
+        None => encode(&String::from_utf8_lossy(&input.source_bytes)),
+    }
+}
+
+fn shadow_complexity_input(input: &PanelInput) -> astrolabe_panel::ComplexityMetrics {
+    let properties = &input.properties;
+    astrolabe_panel::ComplexityMetrics {
+        cyclomatic: numeric_property(properties, "complexity").unwrap_or(0.0),
+        cognitive: numeric_property(properties, "cognitive").unwrap_or(0.0),
+        loop_count: numeric_property(properties, "loop_count").unwrap_or(0.0),
+        loop_depth: numeric_property(properties, "loop_depth").unwrap_or(0.0),
+        max_access_depth: numeric_property(properties, "max_access_depth").unwrap_or(0.0),
+        param_count: numeric_property(properties, "param_count").unwrap_or(0.0),
+        body_lines: shadow_body_line_count(input),
+        body_tokens: shadow_body_token_count(input) as f32,
+    }
+}
+
+fn shadow_body_line_count(input: &PanelInput) -> f32 {
+    numeric_property(&input.properties, "lines").unwrap_or_else(|| {
+        input
+            .source_bytes
+            .iter()
+            .filter(|byte| **byte == b'\n')
+            .count() as f32
+    })
+}
+
+fn shadow_body_token_count(input: &PanelInput) -> usize {
+    match property_string(&input.properties, "bt") {
+        Some(body_tokens) => text_token_stream(body_tokens).count(),
+        None => text_token_stream(&String::from_utf8_lossy(&input.source_bytes)).count(),
+    }
+}
+
+fn shadow_route_surface(input: &PanelInput) -> Option<astrolabe_panel::RouteSurfaceInput> {
+    let route_path = property_string(&input.properties, "route_path").unwrap_or_default();
+    (!route_path.trim().is_empty()).then(|| astrolabe_panel::RouteSurfaceInput {
+        routes: vec![astrolabe_panel::RouteObservation {
+            method: property_string(&input.properties, "route_method")
                 .unwrap_or_default()
                 .to_string(),
             path: route_path.to_string(),
         }],
         channels: Vec::new(),
-    });
-    let docstring = property_string(properties, "docstring").unwrap_or_default();
-
-    EncoderLensInput {
-        ast_profile: property_string(properties, "sp").and_then(parse_ast_profile),
-        // S1 (struct_trigrams) / S4 (api_callees) guard-slot encoder sources, now
-        // serialized by libcbm at index time (#374): the `st` property carries the
-        // normalised AST node-type trigram list and `callees` the deduplicated
-        // api-callee counts. Both parse to `None` when absent so a symbol libcbm
-        // could not measure stays honestly unmeasured (a fail-closed slot deficit),
-        // never a fabricated vector.
-        struct_trigrams: property_string(properties, "st").and_then(parse_struct_trigrams),
-        complexity: complexity_input,
-        api_calls: property_string(properties, "callees").and_then(parse_api_callees),
-        type_surface: Some(TypeSurfaceInput {
-            param_types: property_strings(properties, "param_types"),
-            return_types: property_string(properties, "return_type")
-                .filter(|value| !value.trim().is_empty())
-                .map(|value| vec![value.to_string()])
-                .unwrap_or_default(),
-            uses_types: property_strings(properties, "base_classes"),
-            instantiates: Vec::new(),
-        }),
-        decorators: Some(property_strings(properties, "decorators")),
-        identifiers: Some(IdentifierLexicalInput {
-            name: input.symbol_name.clone(),
-            qualified_name: input.qualified_name.clone(),
-            body_identifiers,
-        }),
-        graph_position: None,
-        path_hierarchy: Some(PathHierarchyInput {
-            path: input.rel_file_path.clone(),
-        }),
-        churn_profile: None,
-        recency: None,
-        role_flags: Some(RoleFlagsInput {
-            is_test: bool_property(properties, "is_test"),
-            is_entry: bool_property(properties, "is_entry_point"),
-            is_exported: bool_property(properties, "is_exported"),
-            is_abstract: bool_property(properties, "is_abstract"),
-            is_async: bool_property(properties, "is_async"),
-            is_generator: bool_property(properties, "is_generator"),
-            is_route: route_surface.is_some(),
-            is_handler: route_surface.is_some(),
-            is_dead: bool_property(properties, "is_dead"),
-            is_recursive: bool_property(properties, "self_recursive"),
-            is_generated: input.rel_file_path.contains("generated")
-                || input.rel_file_path.contains("vendor"),
-            is_documented: !docstring.trim().is_empty(),
-        }),
-        lang_label: Some(LangLabelInput {
-            language: input.language.clone(),
-            label: input.label.as_str().to_string(),
-        }),
-        test_topology: None,
-        error_surface: Some(ErrorSurfaceInput {
-            thrown: property_strings(properties, "throws"),
-            raised: property_strings(properties, "raises"),
-            caught: property_strings(properties, "catches"),
-        }),
-        config_env_surface: Some(ConfigEnvSurfaceInput {
-            env_keys: property_strings(properties, "env_keys"),
-            config_keys: property_strings(properties, "config_keys"),
-        }),
-        route_surface,
-        record_vec: Some(RecordVectorInput {
-            scalars: record_scalars,
-        }),
-    }
+    })
 }
 
 fn property_string<'a>(properties: &'a Value, key: &str) -> Option<&'a str> {
@@ -464,10 +496,13 @@ fn bool_property(properties: &Value, key: &str) -> bool {
 }
 
 fn text_tokens(text: &str) -> Vec<String> {
+    text_token_stream(text).collect()
+}
+
+fn text_token_stream(text: &str) -> impl Iterator<Item = String> + '_ {
     text.split(|character: char| !character.is_alphanumeric() && character != '_')
         .filter(|part| !part.is_empty())
         .flat_map(astrolabe_panel::cbm_camel_split_tokens)
-        .collect()
 }
 
 fn parse_ast_profile(encoded: &str) -> Option<astrolabe_panel::AstProfile> {
@@ -1362,7 +1397,15 @@ pub(crate) fn import_shadow_vault_with_archaeology_at(
         &vault_dir,
         vault_id,
         vault_salt.as_bytes().to_vec(),
-        VaultOptions::default(),
+        VaultOptions {
+            // Shadow import is a current-state construction workload. Persisted
+            // rows live in bounded router memtables/SSTs; retaining a second
+            // complete historical MVCC copy during the one-shot import only
+            // multiplies corpus RSS. Historical query handles reopen explicitly
+            // with full restoration below.
+            restore_mvcc_rows: false,
+            ..VaultOptions::default()
+        },
     )?;
     // Gate every git-dependent step on the corpus actually being a git work tree
     // (#406): `dispatch.rs` passes `repo = Some(dir)` for ANY indexed directory, so a
@@ -3046,7 +3089,17 @@ pub(crate) fn open_shadow_vault_read_only(
     vault_salt: &str,
     selected_cfs: Vec<ColumnFamily>,
 ) -> Result<AsterVault, DynError> {
-    open_shadow_vault_with_access(vault_dir, vault_id, vault_salt, selected_cfs, true)
+    open_shadow_vault_with_access(vault_dir, vault_id, vault_salt, selected_cfs, true, false)
+}
+
+/// Opens the complete MVCC history for the explicit time-travel surface.
+pub(crate) fn open_shadow_vault_historical_read_only(
+    vault_dir: &Path,
+    vault_id: &str,
+    vault_salt: &str,
+    selected_cfs: Vec<ColumnFamily>,
+) -> Result<AsterVault, DynError> {
+    open_shadow_vault_with_access(vault_dir, vault_id, vault_salt, selected_cfs, true, true)
 }
 
 pub(crate) fn open_shadow_vault_writable(
@@ -3055,15 +3108,16 @@ pub(crate) fn open_shadow_vault_writable(
     vault_salt: &str,
     selected_cfs: Vec<ColumnFamily>,
 ) -> Result<AsterVault, DynError> {
-    open_shadow_vault_with_access(vault_dir, vault_id, vault_salt, selected_cfs, false)
+    open_shadow_vault_with_access(vault_dir, vault_id, vault_salt, selected_cfs, false, true)
 }
 
-pub(crate) fn open_shadow_vault_with_access(
+fn open_shadow_vault_with_access(
     vault_dir: &Path,
     vault_id: &str,
     vault_salt: &str,
     selected_cfs: Vec<ColumnFamily>,
     read_only: bool,
+    restore_mvcc_rows: bool,
 ) -> Result<AsterVault, DynError> {
     let vault_id = VaultId::from_str(vault_id)?;
     // Vault CF-selection contract (calyx-aster durable.rs): `None` = open all CFs;
@@ -3078,6 +3132,7 @@ pub(crate) fn open_shadow_vault_with_access(
         None
     };
     let options = VaultOptions {
+        restore_mvcc_rows,
         read_only,
         restore_ledger_hook: !read_only,
         selected_cfs,

@@ -51,12 +51,16 @@ pub const ASTRO_LEGACY_CBM_EDGE_ROWS: &str = "ASTRO_LEGACY_CBM_EDGE_ROWS";
 /// project name that was never imported. Fabricating a placeholder project row
 /// here would silently mask that state.
 pub const ASTRO_MISSING_CBM_PROJECT_ROW: &str = "ASTRO_MISSING_CBM_PROJECT_ROW";
+/// Refusal code for a graph row whose exact-source reference, Blob-CF payload,
+/// digest, length, or byte span fails independent readback.
+pub const ASTRO_EXACT_SOURCE_INVALID: &str = "ASTRO_EXACT_SOURCE_INVALID";
 
 const SQLITE_REMEDIATION: &str = "Open a valid Codebase Memory MCP SQLite dump with nodes, edges, and optional node_vectors tables.";
 const READBACK_REMEDIATION: &str = "Stop ingest, inspect the Aster vault, and rerun astrolabe verify --deep before trusting the batch.";
 const QUANTIZATION_GATE_REMEDIATION: &str = "Provide measured recall, panel-bits, guard-FAR, and provenance for every requested quantization candidate.";
 const LEGACY_CBM_EDGE_ROWS_REMEDIATION: &str = "Re-import the project from its Codebase Memory MCP SQLite dump so the vault persists complete astrolabe:cbm-edge:v1 raw edge rows before reading or lowering its graph snapshot.";
 const MISSING_CBM_PROJECT_ROW_REMEDIATION: &str = "Re-import the project from its Codebase Memory MCP SQLite dump so the vault persists an astrolabe:cbm-project:v1 row, and confirm the requested project name matches an imported project before reading or lowering its graph snapshot.";
+const EXACT_SOURCE_REMEDIATION: &str = "Preserve the vault, inspect the referenced cxinput:v1 Blob rows, and re-import the project from its exact CBM SQLite source before trusting graph source bytes.";
 const NODE_MAP_PREFIX: &[u8] = b"astrolabe:node-map:v2:";
 const LEGACY_NODE_MAP_PREFIX_V1: &[u8] = b"astrolabe:node-map:v1:";
 const STRUCTURAL_NODE_PREFIX: &[u8] = b"astrolabe:structural-node:v1:";
@@ -72,9 +76,12 @@ pub(crate) const EDGE_ROW_PREFIX: &[u8] = b"astrolabe:edge:v1:";
 /// incoming per-file digest against this row to short-circuit unchanged files before the
 /// O(corpus) per-symbol conversion, so a one-symbol delta reconciles only its file.
 const FILE_DIGEST_ROW_PREFIX: &[u8] = b"astrolabe:file-digest:v1:";
-const SCHEMA_NODE_MAP: &str = "astrolabe-node-map-v3";
+const SCHEMA_NODE_MAP: &str = "astrolabe-node-map-v4";
+const LEGACY_SCHEMA_NODE_MAP_V3: &str = "astrolabe-node-map-v3";
 const SCHEMA_SYMBOL_METADATA: &str = "astrolabe-sqlite-symbol-v3";
-const SCHEMA_STRUCTURAL_NODE: &str = "astrolabe-structural-node-v2";
+const SCHEMA_STRUCTURAL_NODE: &str = "astrolabe-structural-node-v3";
+const LEGACY_SCHEMA_STRUCTURAL_NODE_V2: &str = "astrolabe-structural-node-v2";
+const SCHEMA_EXACT_SOURCE_REF: &str = "astrolabe-exact-source-ref-v1";
 const SCHEMA_PROJECT_ROW: &str = "astrolabe-cbm-project-v1";
 pub const CBM_FILE_HASH_ROW_SCHEMA: &str = "astrolabe-file-hash-v1";
 const SCHEMA_PROJECT_SUMMARY_ROW: &str = "astrolabe-project-summary-v1";
@@ -760,6 +767,11 @@ struct PreparedBatch {
     structural_only: usize,
     sqlite_edges: usize,
     edge_skips: EdgeSkipCounters,
+    /// Exact source payloads referenced by v4/v3 node rows. Non-structural
+    /// payloads remain owned by their prepared constellation and are addressed
+    /// by index; structural payloads move here when their temporary node is
+    /// consumed. The map therefore adds no full-corpus source clone.
+    exact_sources: BTreeMap<[u8; 32], PreparedExactSource>,
     /// Persisted Graph CF keys this batch reuses byte-for-byte from unchanged files (#372):
     /// node-map rows for digest-reused symbols, typed/raw edge rows whose endpoints are both
     /// reused, manifest rows for unchanged files, and their file-hash rows. These keys were
@@ -771,6 +783,12 @@ struct PreparedBatch {
     encode_skip: EncodeSkipReport,
     /// Per-phase wall-clock millis of batch preparation (#23 latency telemetry).
     timing_ms: Vec<(&'static str, u64)>,
+}
+
+#[derive(Debug, Clone)]
+enum PreparedExactSource {
+    Constellation(usize),
+    Structural(Vec<u8>),
 }
 
 #[derive(Debug, Clone)]
@@ -796,7 +814,12 @@ struct NodeMapRow {
     start_line: i64,
     end_line: i64,
     source_present: bool,
+    /// Legacy v3 inline payload. New v4 rows always omit it and use
+    /// `source_ref`; retaining this decode field makes historical state explicit.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     source_bytes: Vec<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    source_ref: Option<ExactSourceRef>,
     source_sha256: String,
     start_byte: u64,
     end_byte: u64,
@@ -820,7 +843,12 @@ struct StructuralNodeRow {
     start_line: i64,
     end_line: i64,
     source_present: bool,
+    /// Legacy v2 inline payload. New v3 rows always omit it and use
+    /// `source_ref`; retaining this decode field makes historical state explicit.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     source_bytes: Vec<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    source_ref: Option<ExactSourceRef>,
     source_sha256: String,
     start_byte: u64,
     end_byte: u64,
@@ -828,6 +856,17 @@ struct StructuralNodeRow {
     properties_json: Option<String>,
     #[serde(default)]
     node_vector: Option<Vec<u8>>,
+}
+
+/// Small, self-describing pointer from a Graph row to the chunked Blob-CF
+/// exact-source payload. The duplicated typed pointer and byte length are
+/// independently checked against the addressing hash and graph span on read.
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+struct ExactSourceRef {
+    schema: String,
+    input_hash_blake3: [u8; 32],
+    pointer: String,
+    byte_len: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1625,24 +1664,28 @@ where
     })?;
     let subject = SubjectId::Query(blake3::hash(&location_digest).as_bytes().to_vec());
     let actor = ActorId::Service(ASTROLABE_INGEST_ACTOR.to_string());
-    let planned_rows = rows.clone();
-    let commit_seq = vault.write_cf_batch_with_ledger_entry(
+    let commit = vault.write_cf_batch_with_ledger_entry_with_row_digests(
         rows,
         EntryKind::Ingest,
         subject.clone(),
         payload,
         actor.clone(),
     )?;
+    let commit_seq = commit.seq;
     let ledger_ref = ledger_ref_at_commit(vault, commit_seq)?;
+    if ledger_ref != commit.ledger_ref {
+        return Err(IngestError::InvalidInput(format!(
+            "group-commit ledger receipt diverged from persisted ledger at seq {commit_seq}"
+        )));
+    }
     let mut fsv_plan = VaultMutationPlan::new(
         "admit_historical_symbol_snapshot",
         EntryKind::Ingest,
         &actor,
         &subject,
     );
-    for (cf, key, value) in planned_rows {
-        let expected = expected_group_commit_bytes(cf, value, &ledger_ref)?;
-        fsv_plan.push_content(cf, key, &expected);
+    for row in commit.data_row_digests {
+        fsv_plan.push_content_hash(row.cf, row.key, row.value_blake3);
     }
     vault.flush()?;
     let fsv = fsv_plan.verify_committed(vault, commit_seq)?;
@@ -3255,7 +3298,8 @@ where
     // row implied by that digest. Absence is vault corruption or an invalid reuse
     // classification; synthesizing a replacement would hide the broken state.
     let mut to_encode = Vec::new();
-    for prepared in &constellations {
+    let mut encoded_constellation_indices = Vec::new();
+    for (constellation_index, prepared) in constellations.iter().enumerate() {
         if digest_reuse.contains_key(&prepared.node_id) {
             let key = node_map_reuse_key(prepared, &mut project_digests)?;
             if !existing_graph.contains_key(&key) {
@@ -3270,6 +3314,9 @@ where
             preserved_keys.insert(key);
             continue;
         }
+        if prepared.symbol.source_present {
+            encoded_constellation_indices.push(constellation_index);
+        }
         to_encode.push(prepared);
     }
     encode_skip.node_map_rows_encoded = to_encode.len();
@@ -3278,8 +3325,19 @@ where
     })?;
     graph_rows.extend(node_map_rows);
     let structural_only = structural.len();
-    for node in &structural {
-        graph_rows.push(structural_graph_row(options, node)?);
+    let structural_node_ids = structural
+        .iter()
+        .map(|node| node.id)
+        .collect::<BTreeSet<_>>();
+    let mut structural_sources = Vec::new();
+    for mut node in structural {
+        graph_rows.push(structural_graph_row(options, &node)?);
+        if node.symbol.source_present {
+            structural_sources.push((
+                node.symbol.qualified_name.clone(),
+                std::mem::take(&mut node.symbol.source_snippet_bytes),
+            ));
+        }
     }
     graph_rows.extend(raw_edge_graph_rows(
         options,
@@ -3322,10 +3380,6 @@ where
     ));
     phase_start = std::time::Instant::now();
     let sqlite_edges = edges.len();
-    let structural_node_ids = structural
-        .iter()
-        .map(|node| node.id)
-        .collect::<BTreeSet<_>>();
     let (edge_rows, edge_skips) = prepare_edge_rows(
         options,
         &constellations,
@@ -3341,6 +3395,24 @@ where
         phase_start.elapsed().as_millis() as u64,
     ));
 
+    let mut exact_sources = BTreeMap::new();
+    for constellation_index in encoded_constellation_indices {
+        register_exact_source(
+            &mut exact_sources,
+            &constellations,
+            PreparedExactSource::Constellation(constellation_index),
+            &constellations[constellation_index].symbol.qualified_name,
+        )?;
+    }
+    for (qualified_name, source) in structural_sources {
+        register_exact_source(
+            &mut exact_sources,
+            &constellations,
+            PreparedExactSource::Structural(source),
+            &qualified_name,
+        )?;
+    }
+
     Ok(PreparedBatch {
         constellations,
         graph_rows,
@@ -3348,6 +3420,7 @@ where
         structural_only,
         sqlite_edges,
         edge_skips,
+        exact_sources,
         preserved_keys,
         encode_skip,
         timing_ms,
@@ -3378,6 +3451,44 @@ where
     // the worker count.
     use rayon::iter::{IntoParallelRefMutIterator, ParallelIterator};
     items.par_iter_mut().try_for_each(f)
+}
+
+fn prepared_exact_source_bytes<'a>(
+    source: &'a PreparedExactSource,
+    constellations: &'a [PreparedLiveSymbol],
+) -> IngestResult<&'a [u8]> {
+    match source {
+        PreparedExactSource::Constellation(index) => constellations
+            .get(*index)
+            .map(|prepared| prepared.symbol.source_snippet_bytes.as_slice())
+            .ok_or_else(|| {
+                IngestError::InvalidInput(format!(
+                    "prepared exact-source constellation index {index} is out of range"
+                ))
+            }),
+        PreparedExactSource::Structural(bytes) => Ok(bytes),
+    }
+}
+
+fn register_exact_source(
+    sources: &mut BTreeMap<[u8; 32], PreparedExactSource>,
+    constellations: &[PreparedLiveSymbol],
+    candidate: PreparedExactSource,
+    qualified_name: &str,
+) -> IngestResult<()> {
+    let hash = *blake3::hash(prepared_exact_source_bytes(&candidate, constellations)?).as_bytes();
+    if let Some(existing) = sources.get(&hash) {
+        if prepared_exact_source_bytes(existing, constellations)?
+            != prepared_exact_source_bytes(&candidate, constellations)?
+        {
+            return Err(IngestError::InvalidInput(format!(
+                "exact-source BLAKE3 collision while preparing symbol {qualified_name}"
+            )));
+        }
+        return Ok(());
+    }
+    sources.insert(hash, candidate);
+    Ok(())
 }
 
 /// Maps `items` through `f`, chunked over at most `workers` scoped threads,
@@ -4368,7 +4479,7 @@ fn node_map_graph_row(
     options: &SqliteImportOptions,
     prepared: &PreparedLiveSymbol,
 ) -> IngestResult<(Vec<u8>, Vec<u8>)> {
-    let (source_present, source_bytes, source_sha256, start_byte, end_byte) =
+    let (source_present, source_ref, source_sha256, start_byte, end_byte) =
         symbol_exact_source_contract(&prepared.symbol)?;
     let row = NodeMapRow {
         schema: SCHEMA_NODE_MAP.to_string(),
@@ -4386,7 +4497,8 @@ fn node_map_graph_row(
         start_line: i64::from(prepared.symbol.start_line),
         end_line: i64::from(prepared.symbol.end_line),
         source_present,
-        source_bytes,
+        source_bytes: Vec::new(),
+        source_ref,
         source_sha256,
         start_byte,
         end_byte,
@@ -4403,7 +4515,7 @@ fn structural_graph_row(
     options: &SqliteImportOptions,
     node: &ExtractedNode,
 ) -> IngestResult<(Vec<u8>, Vec<u8>)> {
-    let (source_present, source_bytes, source_sha256, start_byte, end_byte) =
+    let (source_present, source_ref, source_sha256, start_byte, end_byte) =
         symbol_exact_source_contract(&node.symbol)?;
     let row = StructuralNodeRow {
         schema: SCHEMA_STRUCTURAL_NODE.to_string(),
@@ -4418,7 +4530,8 @@ fn structural_graph_row(
         start_line: i64::from(node.symbol.start_line),
         end_line: i64::from(node.symbol.end_line),
         source_present,
-        source_bytes,
+        source_bytes: Vec::new(),
+        source_ref,
         source_sha256,
         start_byte,
         end_byte,
@@ -4433,7 +4546,7 @@ fn structural_graph_row(
 
 fn symbol_exact_source_contract(
     symbol: &SymbolRecord,
-) -> IngestResult<(bool, Vec<u8>, String, u64, u64)> {
+) -> IngestResult<(bool, Option<ExactSourceRef>, String, u64, u64)> {
     let scalar_u64 = |name: &str| -> IngestResult<u64> {
         let value = symbol.scalars.get(name).copied().ok_or_else(|| {
             IngestError::InvalidInput(format!(
@@ -4462,9 +4575,15 @@ fn symbol_exact_source_contract(
                 symbol.source_snippet_bytes.len()
             )));
         }
+        let input_hash = *blake3::hash(&symbol.source_snippet_bytes).as_bytes();
         Ok((
             true,
-            symbol.source_snippet_bytes.clone(),
+            Some(ExactSourceRef {
+                schema: SCHEMA_EXACT_SOURCE_REF.to_string(),
+                input_hash_blake3: input_hash,
+                pointer: input_store::input_pointer(&input_hash),
+                byte_len: symbol.source_snippet_bytes.len() as u64,
+            }),
             hex_lower(&sha256_digest(&symbol.source_snippet_bytes)),
             start_byte,
             end_byte,
@@ -4476,8 +4595,170 @@ fn symbol_exact_source_contract(
                 symbol.qualified_name
             )));
         }
-        Ok((false, Vec::new(), String::new(), 0, 0))
+        Ok((false, None, String::new(), 0, 0))
     }
+}
+
+fn graph_row_exact_source_ref(key: &[u8], value: &[u8]) -> IngestResult<Option<ExactSourceRef>> {
+    let (schema, source_present, source_bytes, source_ref) = if key.starts_with(NODE_MAP_PREFIX) {
+        let row: NodeMapRow = decode_graph_row(key, value)?;
+        (
+            row.schema,
+            row.source_present,
+            row.source_bytes,
+            row.source_ref,
+        )
+    } else if key.starts_with(STRUCTURAL_NODE_PREFIX) {
+        let row: StructuralNodeRow = decode_graph_row(key, value)?;
+        (
+            row.schema,
+            row.source_present,
+            row.source_bytes,
+            row.source_ref,
+        )
+    } else {
+        return Ok(None);
+    };
+    let modern = schema == SCHEMA_NODE_MAP || schema == SCHEMA_STRUCTURAL_NODE;
+    if !modern {
+        return Ok(None);
+    }
+    if !source_bytes.is_empty() {
+        return Err(IngestError::InvalidInput(format!(
+            "modern graph row schema {schema} inlines exact source bytes"
+        )));
+    }
+    match (source_present, source_ref) {
+        (true, Some(reference)) => {
+            if reference.schema != SCHEMA_EXACT_SOURCE_REF
+                || reference.pointer != input_store::input_pointer(&reference.input_hash_blake3)
+            {
+                return Err(IngestError::InvalidInput(format!(
+                    "modern graph row schema {schema} has a malformed exact-source reference"
+                )));
+            }
+            Ok(Some(reference))
+        }
+        (false, None) => Ok(None),
+        (true, None) => Err(IngestError::InvalidInput(format!(
+            "modern graph row schema {schema} declares exact source without a reference"
+        ))),
+        (false, Some(_)) => Err(IngestError::InvalidInput(format!(
+            "modern graph row schema {schema} references source while source_present=false"
+        ))),
+    }
+}
+
+fn supported_node_map_schema(schema: &str) -> bool {
+    schema == SCHEMA_NODE_MAP || schema == LEGACY_SCHEMA_NODE_MAP_V3
+}
+
+fn supported_structural_node_schema(schema: &str) -> bool {
+    schema == SCHEMA_STRUCTURAL_NODE || schema == LEGACY_SCHEMA_STRUCTURAL_NODE_V2
+}
+
+#[allow(clippy::too_many_arguments)]
+fn read_exact_source_at<C>(
+    vault: &AsterVault<C>,
+    snapshot: Seq,
+    row_kind: &str,
+    node_id: i64,
+    schema: &str,
+    modern_schema: &str,
+    legacy_schema: &str,
+    source_present: bool,
+    inline_source_bytes: &[u8],
+    source_ref: Option<&ExactSourceRef>,
+    source_sha256: &str,
+    start_byte: u64,
+    end_byte: u64,
+) -> IngestResult<Vec<u8>>
+where
+    C: Clock,
+{
+    let invalid = |detail: String| {
+        IngestError::refused(
+            ASTRO_EXACT_SOURCE_INVALID,
+            format!("{row_kind} node {node_id}: {detail}"),
+            EXACT_SOURCE_REMEDIATION,
+        )
+    };
+    if schema != modern_schema && schema != legacy_schema {
+        return Err(invalid(format!("unsupported schema {schema}")));
+    }
+    if !source_present {
+        if !inline_source_bytes.is_empty()
+            || source_ref.is_some()
+            || !source_sha256.is_empty()
+            || start_byte != 0
+            || end_byte != 0
+        {
+            return Err(invalid(
+                "source_present=false carries source payload, reference, digest, or span".into(),
+            ));
+        }
+        return Ok(Vec::new());
+    }
+    if end_byte < start_byte {
+        return Err(invalid(format!(
+            "source span {start_byte}..{end_byte} is reversed"
+        )));
+    }
+    let expected_len = end_byte - start_byte;
+    let bytes = if schema == modern_schema {
+        if !inline_source_bytes.is_empty() {
+            return Err(invalid(
+                "modern row inlines source bytes instead of using Blob-CF key/value separation"
+                    .into(),
+            ));
+        }
+        let reference = source_ref.ok_or_else(|| {
+            invalid("modern row declares source without an exact-source reference".into())
+        })?;
+        if reference.schema != SCHEMA_EXACT_SOURCE_REF {
+            return Err(invalid(format!(
+                "exact-source reference has schema {}",
+                reference.schema
+            )));
+        }
+        let expected_pointer = input_store::input_pointer(&reference.input_hash_blake3);
+        if reference.pointer != expected_pointer {
+            return Err(invalid(format!(
+                "exact-source pointer {:?} does not match its BLAKE3 address",
+                reference.pointer
+            )));
+        }
+        if reference.byte_len != expected_len {
+            return Err(invalid(format!(
+                "exact-source reference length {} disagrees with span length {expected_len}",
+                reference.byte_len
+            )));
+        }
+        input_store::reassemble_and_verify(&reference.input_hash_blake3, |key| {
+            vault.read_cf_at(snapshot, ColumnFamily::Blob, key)
+        })
+        .map_err(|error| invalid(format!("Blob-CF exact-source readback failed: {error}")))?
+    } else {
+        if source_ref.is_some() {
+            return Err(invalid(
+                "legacy inline row unexpectedly carries an exact-source reference".into(),
+            ));
+        }
+        inline_source_bytes.to_vec()
+    };
+    if bytes.len() as u64 != expected_len {
+        return Err(invalid(format!(
+            "source payload length {} disagrees with span length {expected_len}",
+            bytes.len()
+        )));
+    }
+    let actual_sha256 = hex_lower(&sha256_digest(&bytes));
+    if source_sha256 != actual_sha256 {
+        return Err(invalid(format!(
+            "source SHA-256 {source_sha256:?} does not match persisted bytes {actual_sha256}"
+        )));
+    }
+    Ok(bytes)
 }
 
 fn append_import_fingerprint(
@@ -4785,6 +5066,59 @@ where
         }
     }
 
+    // Exact source for modern Graph rows uses the same content-addressed Blob
+    // store as canonical panel inputs. Only references introduced or changed by
+    // this commit need admission; an unchanged graph row already points at its
+    // previously ledger-paired payload. Existing content-addressed payloads are
+    // independently reconstructed before reuse, while missing payloads join
+    // this exact atomic batch as fixed-size chunks plus terminal manifest.
+    let mut changed_exact_source_hashes = BTreeSet::new();
+    for (key, value) in &changes.graph_writes {
+        if let Some(source_ref) = graph_row_exact_source_ref(key, value)? {
+            changed_exact_source_hashes.insert(source_ref.input_hash_blake3);
+        }
+    }
+    for input_hash in changed_exact_source_hashes {
+        let prepared_source = prepared.exact_sources.get(&input_hash).ok_or_else(|| {
+            IngestError::InvalidInput(format!(
+                "Graph row references exact source {} but the prepared batch does not own its bytes",
+                hex_lower(&input_hash)
+            ))
+        })?;
+        let source_bytes = prepared_exact_source_bytes(prepared_source, &prepared.constellations)?;
+        if blake3::hash(source_bytes).as_bytes() != &input_hash {
+            return Err(IngestError::InvalidInput(format!(
+                "prepared exact source {} no longer matches its BLAKE3 address",
+                hex_lower(&input_hash)
+            )));
+        }
+        if !staged_input_hashes.insert(input_hash) {
+            continue;
+        }
+        if vault
+            .read_cf_at(
+                snapshot,
+                ColumnFamily::Blob,
+                &input_store::input_manifest_key(&input_hash),
+            )?
+            .is_some()
+        {
+            let persisted = input_store::reassemble_and_verify(&input_hash, |key| {
+                vault.read_cf_at(snapshot, ColumnFamily::Blob, key)
+            })?;
+            if persisted != source_bytes {
+                return Err(IngestError::InvalidInput(format!(
+                    "persisted exact source {} differs from the prepared bytes",
+                    hex_lower(&input_hash)
+                )));
+            }
+            continue;
+        }
+        for row in input_store::encode_input_rows(&input_hash, source_bytes)? {
+            rows.push((row.cf, row.key, row.value));
+        }
+    }
+
     // The Graph CF delta was derived exactly once against the shared pre-commit
     // scan (#23); this function only stages it.
     let graph_rows_written = changes.graph_rows_written;
@@ -4817,41 +5151,45 @@ where
 
     let subject = SubjectId::Query(sqlite_fingerprint.to_vec());
     let actor = ActorId::Service(ASTROLABE_INGEST_ACTOR.to_string());
-    // Calyx's group-commit path deterministically binds the staged ledger ref
-    // into Base and provenance-bearing Graph rows before persistence. Preserve
-    // the caller's write set so we can derive those exact post-bind bytes after
-    // recovering this commit's ledger ref; hashing the pre-bind input would be a
-    // false mismatch, while hashing store readback would be circular.
-    let planned_rows = rows.clone();
-
     // Deriving the ledger seq from a pre-commit `ledger_row_count` is a TOCTOU under the
     // supported cross-process concurrency: an interleaved append from another process
     // would make a fixed index point at someone else's entry. Instead, capture the commit
     // snapshot seq returned by the atomic group commit and read the newest ledger row as
     // of exactly that snapshot — later concurrent commits live at higher seqs and are
     // invisible here, so the entry recovered is unambiguously this run's record.
-    let commit_seq = vault.write_cf_batch_with_ledger_entry(
+    let commit = vault.write_cf_batch_with_ledger_entry_with_row_digests(
         rows,
         EntryKind::Ingest,
         subject.clone(),
         payload,
         actor.clone(),
     )?;
+    let commit_seq = commit.seq;
     let ledger_ref = ledger_ref_at_commit(vault, commit_seq)?;
+    if ledger_ref != commit.ledger_ref {
+        return Err(IngestError::InvalidInput(format!(
+            "group-commit ledger receipt diverged from persisted ledger at seq {commit_seq}"
+        )));
+    }
     write_timing_ms.push((
         "write_import_rows.group_commit",
         sub_phase.elapsed().as_millis() as u64,
     ));
     sub_phase = std::time::Instant::now();
     let mut fsv_plan = VaultMutationPlan::new("sqlite_import", EntryKind::Ingest, &actor, &subject);
-    for (cf, key, value) in planned_rows {
-        if value == tombstone_value() {
-            fsv_plan.push_tombstoned(cf, key, &tombstone_value());
+    for row in commit.data_row_digests {
+        if row.tombstoned {
+            fsv_plan.push_tombstoned_hash(row.cf, row.key, row.value_blake3);
         } else {
-            let expected = expected_group_commit_bytes(cf, value, &ledger_ref)?;
-            fsv_plan.push_content(cf, key, &expected);
+            fsv_plan.push_content_hash(row.cf, row.key, row.value_blake3);
         }
     }
+    vault.flush()?;
+    write_timing_ms.push((
+        "write_import_rows.checkpoint_flush",
+        sub_phase.elapsed().as_millis() as u64,
+    ));
+    sub_phase = std::time::Instant::now();
     let fsv = fsv_plan.verify_committed(vault, commit_seq)?;
     write_timing_ms.push((
         "write_import_rows.fsv_verify",
@@ -4864,40 +5202,6 @@ where
         edge_rows_written,
         write_timing_ms,
     ))
-}
-
-/// Mirrors Calyx Aster's deterministic ledger-ref attachment for FSV
-/// expectations. Expected bytes come only from the intended write plus the
-/// independently recovered paired ledger ref, never from the data-row readback
-/// that the resulting plan verifies.
-fn expected_group_commit_bytes(
-    cf: ColumnFamily,
-    value: Vec<u8>,
-    ledger_ref: &LedgerRef,
-) -> IngestResult<Vec<u8>> {
-    if cf == ColumnFamily::Base {
-        // Mirror Aster's fixed ledger-ref attachment: the production path stamps
-        // provenance through the lossless BaseRecord so the immutable per-slot
-        // hashes survive byte-for-byte. Computing expected bytes via a lossy
-        // decode -> encode round-trip would substitute placeholder-slot hashes
-        // and diverge from the real committed row.
-        let mut record = encode::BaseRecord::decode(&value)?;
-        record.set_provenance(ledger_ref.clone());
-        return Ok(record.encode()?);
-    }
-    if cf == ColumnFamily::Graph {
-        let Ok(mut json) = serde_json::from_slice::<Value>(&value) else {
-            return Ok(value);
-        };
-        let Some(object) = json.as_object_mut() else {
-            return Ok(value);
-        };
-        if object.contains_key("provenance") {
-            object.insert("provenance".to_string(), serde_json::to_value(ledger_ref)?);
-            return Ok(serde_json::to_vec(&json)?);
-        }
-    }
-    Ok(value)
 }
 
 /// Recovers the ledger reference for the group commit that produced `commit_seq`.
@@ -5030,6 +5334,32 @@ where
                 .ok_or_else(|| readback_mismatch("Graph CF row missing after import"))?;
             if actual != expected {
                 return Err(readback_mismatch("Graph CF row bytes changed after import"));
+            }
+        }
+        if written_keys.contains(key.as_slice())
+            && let Some(reference) = graph_row_exact_source_ref(key, expected)?
+        {
+            let prepared_source = prepared
+                .exact_sources
+                .get(&reference.input_hash_blake3)
+                .ok_or_else(|| {
+                    readback_mismatch(format!(
+                        "written Graph row references unowned exact source {}",
+                        hex_lower(&reference.input_hash_blake3)
+                    ))
+                })?;
+            let expected_source =
+                prepared_exact_source_bytes(prepared_source, &prepared.constellations)?;
+            let actual_source =
+                input_store::reassemble_and_verify(&reference.input_hash_blake3, |blob_key| {
+                    vault.read_cf_at(snapshot, ColumnFamily::Blob, blob_key)
+                })?;
+            if actual_source != expected_source || actual_source.len() as u64 != reference.byte_len
+            {
+                return Err(readback_mismatch(format!(
+                    "Graph row exact-source readback differs for {}",
+                    hex_lower(&reference.input_hash_blake3)
+                )));
             }
         }
         graph_rows_verified += 1;
@@ -5171,9 +5501,29 @@ where
         match serde_json::from_slice::<NodeMapRow>(&value) {
             Ok(row) => {
                 counts.node_map_rows += 1;
-                if row.schema != SCHEMA_NODE_MAP {
+                if !supported_node_map_schema(&row.schema) {
                     errors.push(format!("node map {} has wrong schema", hex_lower(&key)));
                     continue;
+                }
+                if let Err(error) = read_exact_source_at(
+                    vault,
+                    snapshot,
+                    "node-map",
+                    row.node_id,
+                    &row.schema,
+                    SCHEMA_NODE_MAP,
+                    LEGACY_SCHEMA_NODE_MAP_V3,
+                    row.source_present,
+                    &row.source_bytes,
+                    row.source_ref.as_ref(),
+                    &row.source_sha256,
+                    row.start_byte,
+                    row.end_byte,
+                ) {
+                    errors.push(format!(
+                        "node map {} exact source: {error}",
+                        hex_lower(&key)
+                    ));
                 }
                 if row.series_id_schema != SERIES_ID_TAG {
                     errors.push(format!(
@@ -5211,9 +5561,28 @@ where
         match serde_json::from_slice::<StructuralNodeRow>(&value) {
             Ok(row) => {
                 counts.structural_rows += 1;
-                if row.schema != SCHEMA_STRUCTURAL_NODE {
+                if !supported_structural_node_schema(&row.schema) {
                     errors.push(format!(
                         "structural node {} has wrong schema",
+                        hex_lower(&key)
+                    ));
+                } else if let Err(error) = read_exact_source_at(
+                    vault,
+                    snapshot,
+                    "structural",
+                    row.node_id,
+                    &row.schema,
+                    SCHEMA_STRUCTURAL_NODE,
+                    LEGACY_SCHEMA_STRUCTURAL_NODE_V2,
+                    row.source_present,
+                    &row.source_bytes,
+                    row.source_ref.as_ref(),
+                    &row.source_sha256,
+                    row.start_byte,
+                    row.end_byte,
+                ) {
+                    errors.push(format!(
+                        "structural node {} exact source: {error}",
                         hex_lower(&key)
                     ));
                 }
@@ -5298,7 +5667,7 @@ where
         if row.project != project {
             continue;
         }
-        if row.schema != SCHEMA_NODE_MAP {
+        if !supported_node_map_schema(&row.schema) {
             return Err(IngestError::InvalidInput(format!(
                 "node map row {} has wrong schema {}",
                 row.node_id, row.schema
@@ -5336,6 +5705,21 @@ where
         if let Some(decoded) = &decoded {
             panel_version.get_or_insert(decoded.panel_version);
         }
+        let source_bytes = read_exact_source_at(
+            vault,
+            snapshot,
+            "node-map",
+            row.node_id,
+            &row.schema,
+            SCHEMA_NODE_MAP,
+            LEGACY_SCHEMA_NODE_MAP_V3,
+            row.source_present,
+            &row.source_bytes,
+            row.source_ref.as_ref(),
+            &row.source_sha256,
+            row.start_byte,
+            row.end_byte,
+        )?;
         let properties_json = row.properties_json.unwrap_or_else(|| "{}".to_string());
         ensure_json_object_text(&properties_json, "node properties")?;
         nodes.push(CbmGraphNode {
@@ -5349,7 +5733,7 @@ where
             start_line: row.start_line,
             end_line: row.end_line,
             source_present: row.source_present,
-            source_bytes: row.source_bytes,
+            source_bytes,
             source_sha256: row.source_sha256,
             start_byte: row.start_byte,
             end_byte: row.end_byte,
@@ -5364,12 +5748,27 @@ where
         if row.project != project {
             continue;
         }
-        if row.schema != SCHEMA_STRUCTURAL_NODE {
+        if !supported_structural_node_schema(&row.schema) {
             return Err(IngestError::InvalidInput(format!(
                 "structural node row {} has wrong schema {}",
                 row.node_id, row.schema
             )));
         }
+        let source_bytes = read_exact_source_at(
+            vault,
+            snapshot,
+            "structural",
+            row.node_id,
+            &row.schema,
+            SCHEMA_STRUCTURAL_NODE,
+            LEGACY_SCHEMA_STRUCTURAL_NODE_V2,
+            row.source_present,
+            &row.source_bytes,
+            row.source_ref.as_ref(),
+            &row.source_sha256,
+            row.start_byte,
+            row.end_byte,
+        )?;
         let properties_json = row.properties_json.unwrap_or_else(|| "{}".to_string());
         ensure_json_object_text(&properties_json, "structural node properties")?;
         nodes.push(CbmGraphNode {
@@ -5383,7 +5782,7 @@ where
             start_line: row.start_line,
             end_line: row.end_line,
             source_present: row.source_present,
-            source_bytes: row.source_bytes,
+            source_bytes,
             source_sha256: row.source_sha256,
             start_byte: row.start_byte,
             end_byte: row.end_byte,
@@ -5661,7 +6060,8 @@ pub struct InjectedNodeFault {
 
 /// Resolves outcome subjects to current constellation ids from the node map.
 ///
-/// Reads every `astrolabe:node-map:v3` row of `project` from the vault Graph CF
+/// Reads every supported modern or historical node-map row of `project` from
+/// the vault Graph CF
 /// and returns a `qualified_name -> cx_id` map, so the `anchor_outcome` tool can
 /// bind an outcome subject id (a symbol / test-case qualified name) to the
 /// constellation id to anchor. A qualified name carried by more than one node
@@ -5682,7 +6082,7 @@ where
         if row.project != project {
             continue;
         }
-        if row.schema != SCHEMA_NODE_MAP {
+        if !supported_node_map_schema(&row.schema) {
             return Err(IngestError::InvalidInput(format!(
                 "node map row {} has wrong schema {}",
                 row.node_id, row.schema
@@ -5716,7 +6116,7 @@ where
     let snapshot = vault.latest_seq();
     let mut resolved = BTreeMap::new();
     for row in read_graph_rows::<C, NodeMapRow>(vault, snapshot, NODE_MAP_PREFIX)? {
-        if row.schema != SCHEMA_NODE_MAP {
+        if !supported_node_map_schema(&row.schema) {
             return Err(IngestError::InvalidInput(format!(
                 "node map row {} has wrong schema {}",
                 row.node_id, row.schema
@@ -5765,7 +6165,7 @@ where
     let mut selected: Option<(Vec<u8>, NodeMapRow)> = None;
     for (key, value) in rows {
         let row: NodeMapRow = decode_graph_row(&key, &value)?;
-        if row.project != project || row.schema != SCHEMA_NODE_MAP {
+        if row.project != project || !supported_node_map_schema(&row.schema) {
             continue;
         }
         if selected

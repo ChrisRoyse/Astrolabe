@@ -91,7 +91,11 @@ impl CfRouter {
         }
         self.levels.insert(
             cf,
-            load_level_for_cf(cf, files, self.eager_lookup_cfs.contains(&cf))?,
+            load_level_for_cf(
+                cf,
+                files,
+                self.eager_lookup_all || self.eager_lookup_cfs.contains(&cf),
+            )?,
         );
         self.next_file.insert(cf, next);
         Ok(())

@@ -1139,12 +1139,37 @@ fn encode_decorators(decorators: &[String]) -> PanelResult<SlotVector> {
 }
 
 fn encode_identifier_lexical(input: &IdentifierLexicalInput) -> PanelResult<SlotVector> {
+    encode_identifier_lexical_streaming(
+        &input.name,
+        &input.qualified_name,
+        input.body_identifiers.iter(),
+    )
+}
+
+/// Encodes S7 while consuming body identifiers lazily.
+///
+/// This is the production large-source boundary: callers may derive identifiers
+/// from a file-sized input without first retaining one owned `String` per token.
+/// Token splitting, occurrence weights, sorted unique-term accumulation, frozen
+/// hash seed/dimension, and final sparse-vector ordering are identical to
+/// [`IdentifierLexicalInput`] encoding.
+pub fn encode_identifier_lexical_streaming<I, S>(
+    name: &str,
+    qualified_name: &str,
+    body_identifiers: I,
+) -> PanelResult<SlotVector>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
     let mut counts: BTreeMap<String, f32> = BTreeMap::new();
-    for identifier in std::iter::once(&input.name)
-        .chain(std::iter::once(&input.qualified_name))
-        .chain(input.body_identifiers.iter())
-    {
+    for identifier in [name, qualified_name] {
         for token in cbm_camel_split_tokens(identifier) {
+            *counts.entry(format!("token:{token}")).or_insert(0.0) += 1.0;
+        }
+    }
+    for identifier in body_identifiers {
+        for token in cbm_camel_split_tokens(identifier.as_ref()) {
             *counts.entry(format!("token:{token}")).or_insert(0.0) += 1.0;
         }
     }

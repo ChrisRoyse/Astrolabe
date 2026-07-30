@@ -70,9 +70,17 @@ where
                 options.memtable_byte_cap,
                 cfs.iter().copied(),
             )?,
+            None if options.read_only && recovery.router_latest_readback => {
+                CfRouter::open_existing_latest(vault_dir.as_ref(), options.memtable_byte_cap)?
+            }
             None if options.read_only => {
                 CfRouter::open_existing(vault_dir.as_ref(), options.memtable_byte_cap)?
             }
+            None if recovery.router_latest_readback => CfRouter::open_with_tiering_latest(
+                vault_dir.as_ref(),
+                options.memtable_byte_cap,
+                options.tiering_policy.clone(),
+            )?,
             None => CfRouter::open_with_tiering(
                 vault_dir.as_ref(),
                 options.memtable_byte_cap,
@@ -176,6 +184,7 @@ where
             clock,
             rows,
             durable,
+            durable_root: Some(vault_root),
             dedup_policy,
             retention_horizon: Mutex::new(retention_horizon),
             ledger_hook,
