@@ -5600,11 +5600,9 @@ static bool validate_browser_runtime_request_node(const cbm_node_t *node, char *
         return false;
     }
 
-    yyjson_read_err json_error;
     yyjson_doc *properties =
         node->properties_json
-            ? yyjson_read_opts(node->properties_json, strlen(node->properties_json), 0, NULL,
-                               &json_error)
+            ? yyjson_read(node->properties_json, strlen(node->properties_json), 0)
             : NULL;
     yyjson_val *property_root = properties ? yyjson_doc_get_root(properties) : NULL;
     bool valid = browser_runtime_request_property_is(property_root, "resolution_kind",
@@ -5620,8 +5618,8 @@ static bool validate_browser_runtime_request_node(const cbm_node_t *node, char *
                  "specifier, and runtime_resolution_required (atom=%.64s, parse=%.160s)",
                  node->atom_id,
                  properties ? "valid JSON object with mismatched fields"
-                            : (node->properties_json && json_error.msg ? json_error.msg
-                                                                       : "properties absent"));
+                            : (node->properties_json ? "properties JSON parse failed"
+                                                     : "properties absent"));
     }
     yyjson_doc_free(properties);
     return valid;
