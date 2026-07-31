@@ -20,12 +20,15 @@ use astrolabe_domain::fsv::FsvAck;
 pub use astrolabe_domain::{GroundingKind, SourceClassification, TrustTag};
 use astrolabe_ingest::VaultMutationPlan;
 use calyx_aster::cf::{ColumnFamily, anchor_key};
-use calyx_aster::vault::AsterVault;
+use calyx_aster::ledger_view::LedgerPointReadTrace;
+use calyx_aster::vault::{
+    AsterVault, LedgerBoundGroupReceipt, LedgerBoundWriteGroup, VaultFlushReport,
+};
 use calyx_core::{
-    Anchor, AnchorKind, AnchorValue, CalyxError, Clock, CxId, LedgerRef, Ts, VaultStore,
+    Anchor, AnchorKind, AnchorValue, CalyxError, Clock, CxId, LedgerRef, Seq, Ts, VaultStore,
 };
 use calyx_ledger::decode as decode_ledger;
-use calyx_ledger::{ActorId, EntryKind, SubjectId};
+use calyx_ledger::{ActorId, EntryKind, LedgerEntryInput, LedgerRow, SubjectId};
 use serde::{Deserialize, Serialize};
 
 pub mod agent_task;
@@ -82,6 +85,8 @@ pub const ASTRO_ANCHOR_ROW_CORRUPT: &str = "ASTRO_ANCHOR_ROW_CORRUPT";
 pub const ASTRO_ANCHOR_LEDGER_MISSING: &str = "ASTRO_ANCHOR_LEDGER_MISSING";
 /// Stable failure code when a producer tries to reuse a retracted source.
 pub const ASTRO_ANCHOR_SOURCE_RETRACTED: &str = "ASTRO_ANCHOR_SOURCE_RETRACTED";
+/// Stable failure code for an empty ordered anchor batch.
+pub const ASTRO_ANCHOR_BATCH_EMPTY: &str = "ASTRO_ANCHOR_BATCH_EMPTY";
 
 /// Row schema tag for persisted anchor rows.
 pub const SCHEMA_ANCHOR_ROW: &str = "astrolabe-anchor-row-v1";
@@ -359,6 +364,100 @@ pub struct AnchorIngestReport {
     pub fsv: Option<FsvAck>,
 }
 
+/// One borrowed logical request in an ordered anchor group commit.
+#[derive(Debug, Clone, Copy)]
+pub struct OutcomeAnchorBatchItem<'a> {
+    /// Validated outcome and provenance metadata.
+    pub request: &'a OutcomeAnchorRequest,
+    /// Subject-to-constellation mapping for this logical request.
+    pub cx_ids: &'a BTreeMap<String, CxId>,
+}
+
+impl<'a> OutcomeAnchorBatchItem<'a> {
+    /// Binds one request to its exact subject mapping.
+    pub const fn new(
+        request: &'a OutcomeAnchorRequest,
+        cx_ids: &'a BTreeMap<String, CxId>,
+    ) -> Self {
+        Self { request, cx_ids }
+    }
+}
+
+/// Logical result for one request inside an ordered anchor group commit.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AnchorIngestItemReport {
+    /// New anchor values added by this logical request.
+    pub anchors_written: usize,
+    /// Existing byte-identical anchor values recognized by this request.
+    pub anchors_deduplicated: usize,
+    /// Requested subjects that had no constellation mapping.
+    pub unmapped_subjects: Vec<String>,
+    /// BLAKE3 of this request's canonical post-mutation anchor dump.
+    pub anchor_dump_hash: String,
+    /// Exact ordered Grounding entry committed for this request.
+    pub ledger_ref: LedgerRef,
+    /// Trust classification derived from this request's source.
+    pub trust: TrustTag,
+}
+
+/// Physical and logical receipt for one bounded ordered anchor group commit.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AnchorBatchIngestReport {
+    /// Per-request results in input order.
+    pub items: Vec<AnchorIngestItemReport>,
+    /// Final distinct Anchors-CF rows encoded and written once.
+    pub rows_written: usize,
+    /// One physical MVCC commit shared by all logical entries.
+    pub commit_seq: Seq,
+    /// Number of returned logical ledger refs independently point-read.
+    pub ledger_refs_verified: usize,
+    /// Physical one-open-per-selected-SST Ledger readback trace.
+    pub ledger_point_read: LedgerPointReadTrace,
+    /// Exact durable/router SST files and bytes published by the one flush.
+    pub flush: VaultFlushReport,
+    /// Full final-row readback paired to the last exact logical ledger ref.
+    /// All-ledger-only batches carry labeled absence because no anchor row was
+    /// mutated; every logical ledger row is still point-verified.
+    pub fsv: Option<FsvAck>,
+}
+
+#[derive(Debug)]
+struct AnchorIngestDraft {
+    anchors_written: usize,
+    anchors_deduplicated: usize,
+    unmapped_subjects: Vec<String>,
+    anchor_dump_hash: String,
+    subject: SubjectId,
+    payload: Vec<u8>,
+    trust: TrustTag,
+}
+
+/// Prepared ordered anchor work that has not mutated the vault.
+pub struct PreparedOutcomeAnchorBatch {
+    snapshot: Seq,
+    actor: ActorId,
+    drafts: Vec<AnchorIngestDraft>,
+    groups: Vec<LedgerBoundWriteGroup>,
+    rows_written: usize,
+}
+
+impl PreparedOutcomeAnchorBatch {
+    /// Exact snapshot against which every input row was prepared.
+    pub const fn snapshot(&self) -> Seq {
+        self.snapshot
+    }
+
+    /// Number of logical Grounding entries retained in input order.
+    pub fn logical_entries(&self) -> usize {
+        self.drafts.len()
+    }
+
+    /// Moves the prepared write groups into a larger ordered commit window.
+    pub fn take_write_groups(&mut self) -> Vec<LedgerBoundWriteGroup> {
+        std::mem::take(&mut self.groups)
+    }
+}
+
 /// Append-only retraction of every anchor attributed to one source.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AnchorTombstoneV1 {
@@ -394,157 +493,401 @@ pub fn ingest_outcome_anchors<C>(
 where
     C: Clock,
 {
-    let request_trust = classify_source(&request.source)
-        .map_err(|error| CalyxError {
-            code: error.code(),
-            message: error.message().to_string(),
-            remediation: error.remediation(),
-        })?
-        .trust;
-    if read_anchor_tombstones(vault)?
+    let mut batch = ingest_outcome_anchor_batch(
+        vault,
+        &[OutcomeAnchorBatchItem::new(request, cx_ids)],
+        actor,
+    )?;
+    let item = batch.items.pop().ok_or_else(|| {
+        anchor_ledger_mismatch("single-item anchor batch returned no logical item receipt")
+    })?;
+    Ok(AnchorIngestReport {
+        anchors_written: item.anchors_written,
+        anchors_deduplicated: item.anchors_deduplicated,
+        unmapped_subjects: item.unmapped_subjects,
+        rows_written: batch.rows_written,
+        anchor_dump_hash: item.anchor_dump_hash,
+        ledger_ref: item.ledger_ref,
+        trust: item.trust,
+        fsv: batch.fsv,
+    })
+}
+
+/// Applies several logical anchor requests in input order through one atomic
+/// multi-ledger group commit and one physical vault flush.
+///
+/// Every request retains its own canonical dump hash, counts, trust tag, and
+/// ordered `Grounding` ledger entry. Repeated keys are evolved in memory in
+/// the same order singular calls would observe and their final row is encoded
+/// once. A non-empty all-deduplicated batch still commits every logical ledger
+/// entry. Empty input refuses before reading or mutating the vault.
+pub fn ingest_outcome_anchor_batch<C>(
+    vault: &AsterVault<C>,
+    items: &[OutcomeAnchorBatchItem<'_>],
+    actor: impl Into<String>,
+) -> calyx_core::Result<AnchorBatchIngestReport>
+where
+    C: Clock,
+{
+    let mut prepared = prepare_outcome_anchor_batch(vault, items, actor)?;
+    let snapshot = prepared.snapshot();
+    let groups = prepared.take_write_groups();
+    let commit = vault.write_ledger_bound_groups_if_seq(snapshot, groups)?;
+    let flush = vault.flush_with_report()?;
+    let wanted = commit
+        .groups
         .iter()
-        .any(|tombstone| tombstone.source == request.source)
-    {
+        .map(|group| group.ledger_ref.seq)
+        .collect::<BTreeSet<_>>();
+    let (ledger_rows, ledger_point_read) = vault.read_physical_ledger_seqs(&wanted)?;
+    prepared.complete(
+        vault,
+        commit.seq,
+        commit.groups,
+        &ledger_rows,
+        ledger_point_read,
+        flush,
+    )
+}
+
+/// Prepares several logical anchor requests without mutating the vault.
+///
+/// The returned groups can be interleaved with other prepared provenance groups
+/// and committed once. Final repeated Anchor keys are attached only to the last
+/// Grounding group; every preceding logical group remains a legal zero-row
+/// Ledger transition.
+pub fn prepare_outcome_anchor_batch<C>(
+    vault: &AsterVault<C>,
+    items: &[OutcomeAnchorBatchItem<'_>],
+    actor: impl Into<String>,
+) -> calyx_core::Result<PreparedOutcomeAnchorBatch>
+where
+    C: Clock,
+{
+    if items.is_empty() {
         return Err(CalyxError {
-            code: ASTRO_ANCHOR_SOURCE_RETRACTED,
-            message: format!(
-                "anchor source {:?} was retracted and cannot be reused",
-                request.source
-            ),
-            remediation: "use a new catalog source identifying the replacement evidence",
+            code: ASTRO_ANCHOR_BATCH_EMPTY,
+            message: "ordered anchor ingest requires at least one logical request".to_string(),
+            remediation: "supply one or more validated outcome requests before committing an anchor batch",
         });
     }
+
+    let tombstoned_sources = read_anchor_tombstones(vault)?
+        .into_iter()
+        .map(|tombstone| tombstone.source)
+        .collect::<BTreeSet<_>>();
     let snapshot = vault.snapshot();
     let mut rows = BTreeMap::<Vec<u8>, AnchorRowV1>::new();
     let mut dirty_keys = BTreeSet::<Vec<u8>>::new();
-    let mut anchors_written = 0usize;
-    let mut anchors_deduplicated = 0usize;
-    let mut unmapped_subjects = Vec::new();
+    let mut drafts = Vec::with_capacity(items.len());
 
-    for subject in &request.subjects {
-        let Some(&cx_id) = cx_ids.get(&subject.subject_id) else {
-            unmapped_subjects.push(subject.subject_id.clone());
-            continue;
-        };
-        let key = anchor_key(cx_id, &subject.anchor_kind);
-        if !rows.contains_key(&key) {
-            let row = match vault.read_cf_at(snapshot, ColumnFamily::Anchors, &key)? {
-                Some(bytes) => decode_anchor_row(&key, &bytes, cx_id, &subject.anchor_kind)?,
-                None => AnchorRowV1 {
-                    schema: SCHEMA_ANCHOR_ROW.to_string(),
-                    cx_id,
-                    kind: subject.anchor_kind.clone(),
-                    anchors: Vec::new(),
-                },
+    for item in items {
+        let request = item.request;
+        let request_trust = classify_source(&request.source)
+            .map_err(|error| CalyxError {
+                code: error.code(),
+                message: error.message().to_string(),
+                remediation: error.remediation(),
+            })?
+            .trust;
+        if tombstoned_sources.contains(&request.source) {
+            return Err(CalyxError {
+                code: ASTRO_ANCHOR_SOURCE_RETRACTED,
+                message: format!(
+                    "anchor source {:?} was retracted and cannot be reused",
+                    request.source
+                ),
+                remediation: "use a new catalog source identifying the replacement evidence",
+            });
+        }
+
+        let mut item_keys = BTreeSet::<Vec<u8>>::new();
+        let mut item_dirty_keys = BTreeSet::<Vec<u8>>::new();
+        let mut anchors_written = 0usize;
+        let mut anchors_deduplicated = 0usize;
+        let mut unmapped_subjects = Vec::new();
+        for subject in &request.subjects {
+            let Some(&cx_id) = item.cx_ids.get(&subject.subject_id) else {
+                unmapped_subjects.push(subject.subject_id.clone());
+                continue;
             };
-            rows.insert(key.clone(), row);
+            let key = anchor_key(cx_id, &subject.anchor_kind);
+            if !rows.contains_key(&key) {
+                let row = match vault.read_cf_at(snapshot, ColumnFamily::Anchors, &key)? {
+                    Some(bytes) => decode_anchor_row(&key, &bytes, cx_id, &subject.anchor_kind)?,
+                    None => AnchorRowV1 {
+                        schema: SCHEMA_ANCHOR_ROW.to_string(),
+                        cx_id,
+                        kind: subject.anchor_kind.clone(),
+                        anchors: Vec::new(),
+                    },
+                };
+                rows.insert(key.clone(), row);
+            }
+            item_keys.insert(key.clone());
+            let row = rows.get_mut(&key).expect("row loaded for mapped subject");
+            let incoming = Anchor {
+                kind: subject.anchor_kind.clone(),
+                value: subject.value.clone(),
+                source: request.source.clone(),
+                observed_at: request.observed_at,
+                confidence: request.confidence,
+            };
+            match row.anchors.iter().find(|existing| {
+                existing.source == incoming.source && existing.observed_at == incoming.observed_at
+            }) {
+                Some(existing)
+                    if existing.value == incoming.value
+                        && existing.confidence.to_bits() == incoming.confidence.to_bits() =>
+                {
+                    anchors_deduplicated += 1;
+                }
+                Some(existing) => {
+                    return Err(CalyxError {
+                        code: ASTRO_ANCHOR_DEDUP_CONFLICT,
+                        message: format!(
+                            "anchor for cx {cx_id} kind {:?} source {:?} observed_at {} already \
+                             holds {:?} (confidence {}); refusing conflicting re-post",
+                            subject.anchor_kind,
+                            request.source,
+                            request.observed_at,
+                            existing.value,
+                            existing.confidence
+                        ),
+                        remediation: "post the corrected outcome under a new observed_at or source",
+                    });
+                }
+                None => {
+                    row.anchors.push(incoming);
+                    dirty_keys.insert(key.clone());
+                    item_dirty_keys.insert(key);
+                    anchors_written += 1;
+                }
+            }
         }
-        let row = rows.get_mut(&key).expect("row just inserted");
-        let incoming = Anchor {
-            kind: subject.anchor_kind.clone(),
-            value: subject.value.clone(),
-            source: request.source.clone(),
-            observed_at: request.observed_at,
-            confidence: request.confidence,
-        };
-        match row.anchors.iter().find(|existing| {
-            existing.source == incoming.source && existing.observed_at == incoming.observed_at
-        }) {
-            Some(existing)
-                if existing.value == incoming.value
-                    && existing.confidence.to_bits() == incoming.confidence.to_bits() =>
-            {
-                anchors_deduplicated += 1;
-            }
-            Some(existing) => {
-                return Err(CalyxError {
-                    code: ASTRO_ANCHOR_DEDUP_CONFLICT,
-                    message: format!(
-                        "anchor for cx {cx_id} kind {:?} source {:?} observed_at {} already \
-                         holds {:?} (confidence {}); refusing conflicting re-post",
-                        subject.anchor_kind,
-                        request.source,
-                        request.observed_at,
-                        existing.value,
-                        existing.confidence
-                    ),
-                    remediation: "post the corrected outcome under a new observed_at or source",
-                });
-            }
-            None => {
-                row.anchors.push(incoming);
-                dirty_keys.insert(key);
-                anchors_written += 1;
-            }
-        }
+
+        let dump = anchor_dump_bytes(
+            item_keys
+                .iter()
+                .map(|key| rows.get(key).expect("item key has a loaded row")),
+        );
+        let anchor_dump_hash = hex_lower(blake3::hash(&dump).as_bytes());
+        let rows_written = item_dirty_keys.len();
+        let payload = serde_json::to_vec(&serde_json::json!({
+            "schema": ANCHOR_LEDGER_SCHEMA,
+            "outcome_kind": request.kind.as_str(),
+            "source_hash": hex_lower(blake3::hash(request.source.as_bytes()).as_bytes()),
+            "observed_at": request.observed_at,
+            "anchors_written": anchors_written,
+            "anchors_deduplicated": anchors_deduplicated,
+            "unmapped_subject_count": unmapped_subjects.len(),
+            "rows_written": rows_written,
+            "anchor_dump_hash": anchor_dump_hash,
+        }))
+        .map_err(|error| anchor_corrupt(format!("encode anchor ledger payload: {error}")))?;
+        let subject =
+            SubjectId::Query(format!("astrolabe-anchor-outcome:{anchor_dump_hash}").into_bytes());
+        drafts.push(AnchorIngestDraft {
+            anchors_written,
+            anchors_deduplicated,
+            unmapped_subjects,
+            anchor_dump_hash,
+            subject,
+            payload,
+            trust: request_trust,
+        });
     }
 
-    let dump = anchor_dump_bytes(rows.values());
-    let anchor_dump_hash = hex_lower(blake3::hash(&dump).as_bytes());
-
-    let mut batch = Vec::new();
+    let actor = ActorId::Service(actor.into());
+    let entries = drafts
+        .iter()
+        .map(|draft| {
+            LedgerEntryInput::new(
+                EntryKind::Grounding,
+                draft.subject.clone(),
+                draft.payload.clone(),
+                actor.clone(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let mut writes = Vec::with_capacity(dirty_keys.len());
     for key in &dirty_keys {
         let row = rows.get(key).expect("dirty key has a row");
         let value = serde_json::to_vec(row)
             .map_err(|error| anchor_corrupt(format!("encode anchor row: {error}")))?;
-        batch.push((ColumnFamily::Anchors, key.clone(), value));
+        writes.push((ColumnFamily::Anchors, key.clone(), value));
     }
-    let rows_written = batch.len();
+    let rows_written = writes.len();
+    let last = entries.len().checked_sub(1).ok_or_else(|| {
+        anchor_ledger_mismatch("non-empty anchor batch produced no logical Ledger entry")
+    })?;
+    let groups = entries
+        .into_iter()
+        .enumerate()
+        .map(|(ordinal, entry)| {
+            let rows = if ordinal == last {
+                std::mem::take(&mut writes)
+            } else {
+                Vec::new()
+            };
+            LedgerBoundWriteGroup::new(rows, entry)
+        })
+        .collect();
 
-    let payload = serde_json::to_vec(&serde_json::json!({
-        "schema": ANCHOR_LEDGER_SCHEMA,
-        "outcome_kind": request.kind.as_str(),
-        "source_hash": hex_lower(blake3::hash(request.source.as_bytes()).as_bytes()),
-        "observed_at": request.observed_at,
-        "anchors_written": anchors_written,
-        "anchors_deduplicated": anchors_deduplicated,
-        "unmapped_subject_count": unmapped_subjects.len(),
-        "rows_written": rows_written,
-        "anchor_dump_hash": anchor_dump_hash,
-    }))
-    .map_err(|error| anchor_corrupt(format!("encode anchor ledger payload: {error}")))?;
-    let subject =
-        SubjectId::Query(format!("astrolabe-anchor-outcome:{anchor_dump_hash}").into_bytes());
-    let actor = ActorId::Service(actor.into());
-    let mut fsv_plan = VaultMutationPlan::new(
-        "ingest_outcome_anchors",
-        EntryKind::Grounding,
-        &actor,
-        &subject,
-    );
-    for (cf, key, value) in &batch {
-        fsv_plan.push_content(*cf, key.clone(), value);
-    }
-    let (ledger_ref, commit_seq) = if batch.is_empty() {
-        (
-            vault.append_ledger_entry(EntryKind::Grounding, subject, payload, actor)?,
-            None,
-        )
-    } else {
-        let commit_seq = vault.write_cf_batch_with_ledger_entry(
-            batch,
-            EntryKind::Grounding,
-            subject,
-            payload,
-            actor,
-        )?;
-        (ledger_ref_at_commit(vault, commit_seq)?, Some(commit_seq))
-    };
-    vault.flush()?;
-    let fsv = commit_seq
-        .map(|commit_seq| fsv_plan.verify_committed(vault, commit_seq))
-        .transpose()?;
-
-    Ok(AnchorIngestReport {
-        anchors_written,
-        anchors_deduplicated,
-        unmapped_subjects,
+    Ok(PreparedOutcomeAnchorBatch {
+        snapshot,
+        actor,
+        drafts,
+        groups,
         rows_written,
-        anchor_dump_hash,
-        ledger_ref,
-        trust: request_trust,
-        fsv,
     })
+}
+
+impl PreparedOutcomeAnchorBatch {
+    /// Finalizes a committed window only from independently read physical Ledger
+    /// bytes and exact post-bind row digests.
+    pub fn complete<C>(
+        self,
+        vault: &AsterVault<C>,
+        commit_seq: Seq,
+        receipts: Vec<LedgerBoundGroupReceipt>,
+        ledger_rows: &BTreeMap<u64, LedgerRow>,
+        ledger_point_read: LedgerPointReadTrace,
+        flush: VaultFlushReport,
+    ) -> calyx_core::Result<AnchorBatchIngestReport>
+    where
+        C: Clock,
+    {
+        if self.drafts.len() != receipts.len() {
+            return Err(anchor_ledger_mismatch(format!(
+                "atomic anchor batch accepted {} logical entries but returned {} group receipts",
+                self.drafts.len(),
+                receipts.len()
+            )));
+        }
+        let expected = self
+            .drafts
+            .iter()
+            .map(|draft| {
+                LedgerEntryInput::new(
+                    EntryKind::Grounding,
+                    draft.subject.clone(),
+                    draft.payload.clone(),
+                    self.actor.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        verify_anchor_ledger_entries(commit_seq, &receipts, &expected, ledger_rows)?;
+
+        let fsv = if self.rows_written == 0 {
+            None
+        } else {
+            let final_draft = self.drafts.last().ok_or_else(|| {
+                anchor_ledger_mismatch("anchor row commit has no final logical draft")
+            })?;
+            let final_receipt = receipts.last().ok_or_else(|| {
+                anchor_ledger_mismatch("anchor row commit has no final group receipt")
+            })?;
+            let ledger_bytes = ledger_rows
+                .get(&final_receipt.ledger_ref.seq)
+                .ok_or_else(|| {
+                    anchor_ledger_mismatch(format!(
+                        "physical Ledger readback omitted final anchor seq {}",
+                        final_receipt.ledger_ref.seq
+                    ))
+                })?;
+            let mut plan = VaultMutationPlan::new(
+                "ingest_outcome_anchor_batch",
+                EntryKind::Grounding,
+                &self.actor,
+                &final_draft.subject,
+            );
+            for row in &final_receipt.data_row_digests {
+                if row.tombstoned {
+                    plan.push_tombstoned_hash(row.cf, row.key.clone(), row.value_blake3);
+                } else {
+                    plan.push_content_hash(row.cf, row.key.clone(), row.value_blake3);
+                }
+            }
+            Some(plan.verify_committed_with_ledger_bytes(
+                vault,
+                commit_seq,
+                &final_receipt.ledger_ref,
+                &ledger_bytes.bytes,
+            )?)
+        };
+        let ledger_refs_verified = receipts.len();
+        let items = self
+            .drafts
+            .into_iter()
+            .zip(receipts)
+            .map(|(draft, receipt)| AnchorIngestItemReport {
+                anchors_written: draft.anchors_written,
+                anchors_deduplicated: draft.anchors_deduplicated,
+                unmapped_subjects: draft.unmapped_subjects,
+                anchor_dump_hash: draft.anchor_dump_hash,
+                ledger_ref: receipt.ledger_ref,
+                trust: draft.trust,
+            })
+            .collect();
+        Ok(AnchorBatchIngestReport {
+            items,
+            rows_written: self.rows_written,
+            commit_seq,
+            ledger_refs_verified,
+            ledger_point_read,
+            flush,
+            fsv,
+        })
+    }
+}
+
+fn verify_anchor_ledger_entries(
+    commit_seq: Seq,
+    receipts: &[LedgerBoundGroupReceipt],
+    expected: &[LedgerEntryInput],
+    ledger_rows: &BTreeMap<u64, LedgerRow>,
+) -> calyx_core::Result<()> {
+    if receipts.len() != expected.len() {
+        return Err(anchor_ledger_mismatch(format!(
+            "anchor batch expected {} logical Ledger refs but received {}",
+            expected.len(),
+            receipts.len()
+        )));
+    }
+    for (ordinal, (receipt, expected)) in receipts.iter().zip(expected).enumerate() {
+        let ledger_ref = &receipt.ledger_ref;
+        let row = ledger_rows
+            .get(&ledger_ref.seq)
+            .ok_or_else(|| {
+                anchor_ledger_mismatch(format!(
+                    "anchor batch logical entry {ordinal} seq {} is absent at commit snapshot {commit_seq}",
+                    ledger_ref.seq
+                ))
+            })?;
+        let entry = decode_ledger(&row.bytes)?;
+        if !entry.verify()
+            || entry.seq != ledger_ref.seq
+            || entry.entry_hash != ledger_ref.hash
+            || entry.kind != expected.kind
+            || entry.subject != expected.subject
+            || entry.payload != expected.payload
+            || entry.actor != expected.actor
+        {
+            return Err(anchor_ledger_mismatch(format!(
+                "anchor batch logical entry {ordinal} failed exact seq/hash/kind/subject/payload/actor readback at commit snapshot {commit_seq}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn anchor_ledger_mismatch(message: impl Into<String>) -> CalyxError {
+    CalyxError {
+        code: ASTRO_ANCHOR_LEDGER_MISSING,
+        message: message.into(),
+        remediation: "preserve the vault, run astrolabe verify --deep, and re-ingest the source evidence only after the Ledger chain is repaired",
+    }
 }
 
 /// One decoded, key-verified anchor row read back from the `anchors` CF.

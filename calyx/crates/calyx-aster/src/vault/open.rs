@@ -202,40 +202,7 @@ fn elapsed_us(started: std::time::Instant) -> u64 {
     u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX)
 }
 
-#[derive(Clone, Copy)]
-struct ProcessUsage {
-    kernel_time_100ns: u64,
-    user_time_100ns: u64,
-    read_operations: u64,
-    read_bytes: u64,
-    write_operations: u64,
-    write_bytes: u64,
-    page_faults: u64,
-    working_set_bytes: u64,
-    peak_working_set_bytes: u64,
-}
-
-impl ProcessUsage {
-    fn phase_since(self, before: Self) -> VaultPhaseUsage {
-        VaultPhaseUsage {
-            kernel_time_100ns: self
-                .kernel_time_100ns
-                .saturating_sub(before.kernel_time_100ns),
-            user_time_100ns: self.user_time_100ns.saturating_sub(before.user_time_100ns),
-            read_operations: self.read_operations.saturating_sub(before.read_operations),
-            read_bytes: self.read_bytes.saturating_sub(before.read_bytes),
-            write_operations: self
-                .write_operations
-                .saturating_sub(before.write_operations),
-            write_bytes: self.write_bytes.saturating_sub(before.write_bytes),
-            page_faults: self.page_faults.saturating_sub(before.page_faults),
-            working_set_bytes_after: self.working_set_bytes,
-            peak_working_set_bytes_after: self.peak_working_set_bytes,
-        }
-    }
-}
-
-fn current_process_usage() -> Result<ProcessUsage> {
+pub(super) fn current_process_usage() -> Result<VaultProcessUsage> {
     use windows_sys::Win32::Foundation::{FILETIME, GetLastError};
     use windows_sys::Win32::System::ProcessStatus::{
         K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS,
@@ -272,7 +239,7 @@ fn current_process_usage() -> Result<ProcessUsage> {
             ));
         }
     }
-    Ok(ProcessUsage {
+    Ok(VaultProcessUsage {
         kernel_time_100ns: filetime_value(kernel),
         user_time_100ns: filetime_value(user),
         read_operations: io.ReadOperationCount,
@@ -282,6 +249,8 @@ fn current_process_usage() -> Result<ProcessUsage> {
         page_faults: u64::from(memory.PageFaultCount),
         working_set_bytes: memory.WorkingSetSize as u64,
         peak_working_set_bytes: memory.PeakWorkingSetSize as u64,
+        private_bytes: memory.PagefileUsage as u64,
+        peak_private_bytes: memory.PeakPagefileUsage as u64,
     })
 }
 

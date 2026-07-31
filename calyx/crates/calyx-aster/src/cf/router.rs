@@ -27,7 +27,7 @@ pub struct CfRouter {
     pub(super) memtables: HashMap<ColumnFamily, Memtable>,
     pub(super) levels: HashMap<ColumnFamily, SstLevel>,
     pub(super) next_file: HashMap<ColumnFamily, u64>,
-    memtable_byte_cap: usize,
+    pub(super) memtable_byte_cap: usize,
     resource_counters: Arc<ResourceCounters>,
     pub(super) existing_only: bool,
     pub(super) eager_lookup_cfs: BTreeSet<ColumnFamily>,

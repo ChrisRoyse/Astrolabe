@@ -13,7 +13,7 @@
 use super::super::encode::WriteRow;
 use super::{DurableVault, storage_error};
 use crate::cf::ColumnFamily;
-use crate::sst::write_sst;
+use crate::sst::{SstSummary, write_sst};
 use calyx_core::{CalyxError, Result};
 use std::collections::BTreeMap;
 use std::fs;
@@ -61,7 +61,7 @@ impl DurableVault {
         Ok(())
     }
 
-    pub(super) fn write_rows(&self, seq: u64, rows: &[WriteRow]) -> Result<()> {
+    pub(super) fn write_rows(&self, seq: u64, rows: &[WriteRow]) -> Result<Vec<SstSummary>> {
         let mut by_cf = Vec::<(ColumnFamily, Vec<(usize, &WriteRow)>)>::new();
         for (index, row) in rows.iter().enumerate() {
             if let Some((_, group)) = by_cf.iter_mut().find(|(cf, _)| *cf == row.cf) {
@@ -71,6 +71,7 @@ impl DurableVault {
             }
         }
         by_cf.sort_by_key(|(cf, _)| cf.name());
+        let mut summaries = Vec::with_capacity(by_cf.len());
         for (cf, rows) in by_cf {
             let rows = latest_rows_by_key(rows);
             let first_index = rows.first().map_or(0, |(index, _)| *index);
@@ -80,12 +81,12 @@ impl DurableVault {
             let entries = rows
                 .iter()
                 .map(|(_, row)| (row.key.as_slice(), row.value.as_slice()));
-            write_sst(&path, entries)?;
+            summaries.push(write_sst(&path, entries)?);
         }
-        Ok(())
+        Ok(summaries)
     }
 
-    pub(super) fn flush_pending_checkpoints(&self) -> Result<()> {
+    pub(super) fn flush_pending_checkpoints(&self) -> Result<Vec<SstSummary>> {
         // Keep the pending guard through SST and manifest publication. Commits
         // serialize through the vault's durable file lock, and retaining this
         // inner guard makes failure atomic: until the manifest is durable every
@@ -97,10 +98,11 @@ impl DurableVault {
             .lock()
             .map_err(|_| CalyxError::disk_pressure("checkpoint staging lock poisoned"))?;
         if batches.is_empty() {
-            return Ok(());
+            return Ok(Vec::new());
         }
+        let mut summaries = Vec::new();
         for (seq, rows) in batches.iter() {
-            self.write_rows(*seq, rows)?;
+            summaries.extend(self.write_rows(*seq, rows)?);
             self.advance_checkpointed_derived_content(*seq, rows);
         }
         let last_seq = batches.last().map_or(0, |(seq, _)| *seq);
@@ -111,7 +113,7 @@ impl DurableVault {
         #[cfg(any(test, feature = "crash-fsv"))]
         crate::vault::failpoints::crash_fsv_after_checkpoint(last_seq)?;
         batches.clear();
-        Ok(())
+        Ok(summaries)
     }
 }
 

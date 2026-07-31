@@ -3,6 +3,7 @@
 mod family;
 mod key;
 mod router;
+mod router_handoff;
 mod router_load;
 mod router_scan;
 
@@ -16,6 +17,7 @@ pub use key::{
     temporal_xterm_prefix_range, verify_cx_hash_prefix, xterm_key, xterm_prefix_range,
 };
 pub use router::{CfRouter, NO_COMMIT_DOMAIN};
+pub(crate) use router_handoff::RouterManifestHandoffReport;
 
 /// Reserved leading byte for registry-owned compressed slot envelopes.
 pub const COMPRESSED_SLOT_VALUE_TAG: u8 = 16;

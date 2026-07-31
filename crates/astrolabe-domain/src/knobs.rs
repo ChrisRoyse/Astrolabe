@@ -232,6 +232,65 @@ pub fn row_sink_stream_knob(name: &str) -> Option<&'static U64KnobDeclaration> {
     ROW_SINK_STREAM_KNOBS.iter().find(|knob| knob.name == name)
 }
 
+/// Registry version tag for Git-archaeology persistence batching (#858).
+pub const ARCHAEOLOGY_PERSIST_KNOB_REGISTRY_VERSION: &str =
+    "astrolabe-archaeology-persist-knobs-v2";
+/// Name of the ordered anchor-entry group-commit bound.
+pub const ARCHAEOLOGY_ANCHOR_BATCH_ENTRIES_KNOB: &str = "archaeology_anchor_batch_entries";
+/// Default logical anchor entries per ordered group commit.
+///
+/// The #858 Bevy baseline observed one already-extracted evidence group drive at
+/// least 122,880 logical Grounding entries. The declared 65,536 ceiling cuts
+/// that real group from at least 120 commits to at most two while retaining a
+/// strict per-project bound.
+pub const ARCHAEOLOGY_DEFAULT_ANCHOR_BATCH_ENTRIES: u64 = 65_536;
+/// Smallest legal batch: every admitted group commit must make progress.
+pub const ARCHAEOLOGY_MIN_ANCHOR_BATCH_ENTRIES: u64 = 1;
+/// Largest legal batch: bounds each independently running project's staging
+/// window while allowing a deliberately measured high-fanout repository.
+pub const ARCHAEOLOGY_MAX_ANCHOR_BATCH_ENTRIES: u64 = 65_536;
+/// Name of the historical snapshots coalesced into one ordered commit window.
+pub const ARCHAEOLOGY_HISTORICAL_BATCH_GROUPS_KNOB: &str = "archaeology_historical_batch_groups";
+/// Default historical groups per commit window. This matches the existing
+/// measured extraction-worker recycle boundary and keeps each project bounded.
+pub const ARCHAEOLOGY_DEFAULT_HISTORICAL_BATCH_GROUPS: u64 = 64;
+/// Smallest legal historical window.
+pub const ARCHAEOLOGY_MIN_HISTORICAL_BATCH_GROUPS: u64 = 1;
+/// Largest legal explicit historical window.
+pub const ARCHAEOLOGY_MAX_HISTORICAL_BATCH_GROUPS: u64 = 1_024;
+
+/// Git-archaeology persistence knob registry (#858).
+pub const ARCHAEOLOGY_PERSIST_KNOBS: &[U64KnobDeclaration] = &[
+    U64KnobDeclaration {
+        registry_version: ARCHAEOLOGY_PERSIST_KNOB_REGISTRY_VERSION,
+        name: ARCHAEOLOGY_ANCHOR_BATCH_ENTRIES_KNOB,
+        default: ARCHAEOLOGY_DEFAULT_ANCHOR_BATCH_ENTRIES,
+        min: ARCHAEOLOGY_MIN_ANCHOR_BATCH_ENTRIES,
+        max: ARCHAEOLOGY_MAX_ANCHOR_BATCH_ENTRIES,
+        unit: "logical_anchor_entries",
+        source: "ASTROLABE #858 Bevy physical FSV: one high-fanout evidence group produced at least 122,880 logical Grounding transitions while the 1,024-entry seed created at least 120 commits",
+        rationale: "the measured 65,536 ceiling reduces that real group to at most two ordered atomic commits without dropping an entry; the bound is independently owned by each indexing process so 4-5 concurrent projects cannot multiply an unbounded staging allocation",
+    },
+    U64KnobDeclaration {
+        registry_version: ARCHAEOLOGY_PERSIST_KNOB_REGISTRY_VERSION,
+        name: ARCHAEOLOGY_HISTORICAL_BATCH_GROUPS_KNOB,
+        default: ARCHAEOLOGY_DEFAULT_HISTORICAL_BATCH_GROUPS,
+        min: ARCHAEOLOGY_MIN_HISTORICAL_BATCH_GROUPS,
+        max: ARCHAEOLOGY_MAX_HISTORICAL_BATCH_GROUPS,
+        unit: "historical_commit_groups",
+        source: "ASTROLABE #858 Bevy physical FSV and the existing measured 64-commit historical extraction-worker recycle boundary",
+        rationale: "coalesces repeated Base/slot/Ledger fsync and SST publication across a bounded project-local window while preserving exact Ingest/Grounding order; 64 reuses the established per-process recycle boundary instead of introducing an unrelated memory multiplier",
+    },
+];
+
+/// Returns the Git-archaeology persistence declaration for `name`, or `None`
+/// when the knob is undeclared.
+pub fn archaeology_persist_knob(name: &str) -> Option<&'static U64KnobDeclaration> {
+    ARCHAEOLOGY_PERSIST_KNOBS
+        .iter()
+        .find(|knob| knob.name == name)
+}
+
 /// Registry version tag for the debounced lowered-SQLite regeneration knobs (#225).
 pub const LOWER_DEBOUNCE_KNOB_REGISTRY_VERSION: &str = "astrolabe-lower-debounce-knobs-v1";
 

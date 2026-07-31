@@ -1432,6 +1432,8 @@ fn phase_usage_json(usage: calyx_aster::vault::VaultPhaseUsage) -> serde_json::V
         "page_faults": usage.page_faults,
         "working_set_bytes_after": usage.working_set_bytes_after,
         "peak_working_set_bytes_after": usage.peak_working_set_bytes_after,
+        "private_bytes_after": usage.private_bytes_after,
+        "peak_private_bytes_after": usage.peak_private_bytes_after,
     })
 }
 

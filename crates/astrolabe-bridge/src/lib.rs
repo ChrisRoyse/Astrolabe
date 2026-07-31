@@ -1276,6 +1276,90 @@ impl CbmIndexMode {
     }
 }
 
+/// Exact result of libcbm discovery over a real filesystem tree.
+///
+/// Both counts come from the same `cbm_discover` implementation the pipeline
+/// invokes, including mode filters, ignore policy, filename/language detection,
+/// and auxiliary-input classification. Callers can therefore avoid starting an
+/// extraction for a deliberately empty source view without duplicating that
+/// policy in Rust.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct CbmDiscoverySummary {
+    pub discovered_files: usize,
+    pub source_files: usize,
+}
+
+/// Run libcbm's authoritative discovery phase against `repo_path`.
+pub fn discover_pipeline_files(
+    repo_path: &str,
+    mode: CbmIndexMode,
+) -> Result<CbmDiscoverySummary, BridgeError> {
+    initialize_cbm_allocator()?;
+    let repo_path = CString::new(repo_path)?;
+    let options = cbm_sys::cbm_discover_opts_t {
+        mode: mode.as_raw(),
+        ignore_file: ptr::null(),
+        max_file_size: 0,
+    };
+    let mut files = ptr::null_mut();
+    let mut count = 0;
+    // SAFETY: every pointer references live storage for the duration of the call.
+    // On success libcbm owns the returned array until `cbm_discover_free` below.
+    let status =
+        unsafe { cbm_sys::cbm_discover(repo_path.as_ptr(), &options, &mut files, &mut count) };
+    if status != 0 {
+        if !files.is_null() {
+            // SAFETY: a non-null partial result is still libcbm-owned and uses the
+            // non-negative portion of the count published by the same call.
+            unsafe { cbm_sys::cbm_discover_free(files, count.max(0)) };
+        }
+        return Err(envelope(
+            "ASTRO_CBM_DISCOVERY_FAILED",
+            format!("libcbm discovery failed with status {status} for {repo_path:?}"),
+            "Inspect the discovery diagnostic for the exact path, ignore-policy, or filesystem failure and retry only after correcting it.",
+        ));
+    }
+    if count < 0 {
+        if !files.is_null() {
+            // SAFETY: an invalid negative count cannot describe initialized rows;
+            // zero releases the outer allocation without indexing through it.
+            unsafe { cbm_sys::cbm_discover_free(files, 0) };
+        }
+        return Err(envelope(
+            "ASTRO_CBM_DISCOVERY_COUNT_INVALID",
+            format!("libcbm discovery returned an invalid file count {count}"),
+            "Treat this as FFI contract drift; repair the discovery count before indexing.",
+        ));
+    }
+    let discovered_files = count as usize;
+    if discovered_files > 0 && files.is_null() {
+        return Err(envelope(
+            "ASTRO_CBM_DISCOVERY_ROWS_MISSING",
+            format!("libcbm reported {discovered_files} discovered files with a null row array"),
+            "Treat this as FFI contract drift; repair the discovery ownership contract before indexing.",
+        ));
+    }
+    let source_files = if discovered_files == 0 {
+        0
+    } else {
+        // SAFETY: successful discovery returned a non-null array containing exactly
+        // `discovered_files` initialized rows, retained until the free below.
+        unsafe { std::slice::from_raw_parts(files, discovered_files) }
+            .iter()
+            .filter(|file| !file.auxiliary)
+            .count()
+    };
+    if !files.is_null() {
+        // SAFETY: the pointer/count pair is the exact successful discovery result and
+        // is consumed once here.
+        unsafe { cbm_sys::cbm_discover_free(files, count) };
+    }
+    Ok(CbmDiscoverySummary {
+        discovered_files,
+        source_files,
+    })
+}
+
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct CbmPipelineNodeRow {
     pub id: i64,

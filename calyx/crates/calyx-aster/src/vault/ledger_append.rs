@@ -246,7 +246,7 @@ where
 
     /// Prepares a contiguous hash-chain segment without mutating either Aster
     /// or an appender. Used by no-hook atomic batches.
-    fn raw_prepared_ledger_rows(
+    pub(super) fn raw_prepared_ledger_rows(
         &self,
         entries: impl IntoIterator<Item = LedgerEntryInput>,
     ) -> Result<(Vec<encode::WriteRow>, Vec<LedgerRef>)> {
@@ -394,7 +394,7 @@ fn require_ledger_entries(entries: &[LedgerEntryInput]) -> Result<()> {
     Ok(())
 }
 
-fn logical_ledger_refs(
+pub(super) fn logical_ledger_refs(
     staged: &[calyx_ledger::StagedLedgerRow],
     expected: usize,
 ) -> Result<Vec<LedgerRef>> {

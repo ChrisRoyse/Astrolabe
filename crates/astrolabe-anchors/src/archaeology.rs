@@ -1,6 +1,6 @@
 //! Shell-free Git archaeology mining for bug-touch and revert anchors.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -199,6 +199,37 @@ pub struct ChangedRanges {
     pub skipped_gitlink_paths: usize,
 }
 
+/// Equality-stable process/output telemetry for grouped Git blame work.
+#[derive(Debug, Clone, Default)]
+pub struct GitBlameBatchTelemetry {
+    /// Original changed-line ranges requested by the SZZ miner.
+    pub requested_ranges: usize,
+    /// Exact union ranges after overlapping/adjacent requests are coalesced.
+    pub effective_ranges: usize,
+    /// Native Git blame processes spawned after grouping by `(parent, path)`.
+    pub processes: usize,
+    /// Incremental protocol records returned and strictly parsed.
+    pub returned_spans: usize,
+    /// Distinct `(commit, final-line)` attributions returned to SZZ.
+    pub returned_lines: usize,
+    /// Exact stdout bytes emitted by all incremental blame children.
+    pub stdout_bytes: u64,
+    /// Observed wall time. Deliberately excluded from equality because two
+    /// byte-identical mining passes need not take the same duration.
+    pub wall_ms: u64,
+}
+
+impl PartialEq for GitBlameBatchTelemetry {
+    fn eq(&self, other: &Self) -> bool {
+        self.requested_ranges == other.requested_ranges
+            && self.effective_ranges == other.effective_ranges
+            && self.processes == other.processes
+            && self.returned_spans == other.returned_spans
+            && self.returned_lines == other.returned_lines
+            && self.stdout_bytes == other.stdout_bytes
+    }
+}
+
 /// Deterministic result of one mining pass.
 #[derive(Debug, Clone, PartialEq)]
 pub struct GitArchaeologyReport {
@@ -230,6 +261,8 @@ pub struct GitArchaeologyReport {
     /// history, directory↔file swaps) (#514). Each is a counted, labeled skip;
     /// every other git blame failure stays fail-closed.
     pub skipped_unblamable_paths: usize,
+    /// Capability-preserving batching/read-volume telemetry for Git blame.
+    pub blame: GitBlameBatchTelemetry,
 }
 
 /// Coded, remediable archaeology error.
@@ -337,8 +370,7 @@ pub fn mine_git_archaeology(
     let read_commits_ms = read_start.elapsed().as_millis();
     let commit_count = commits.len();
     let mut diff_ms = 0u128;
-    let mut blame_ms = 0u128;
-    let mut blame_calls = 0usize;
+    let mut blame = GitBlameBatchTelemetry::default();
     let mut szz = BTreeSet::new();
     let mut reverts = BTreeSet::new();
     let mut skipped_merge_fixes = 0usize;
@@ -419,15 +451,89 @@ pub fn mine_git_archaeology(
         let old_changed = changed_old_ranges(repo, parent, &commit.sha, pathspec)?;
         skipped_gitlink_paths += old_changed.skipped_gitlink_paths;
         diff_ms += diff_start.elapsed().as_millis();
+        blame.requested_ranges = blame
+            .requested_ranges
+            .checked_add(old_changed.ranges.len())
+            .ok_or_else(|| {
+                ArchaeologyError::new(
+                    ASTRO_ARCHAEOLOGY_OUTPUT_INVALID,
+                    "Git blame requested-range telemetry overflowed usize",
+                )
+            })?;
+        let mut ranges_by_path = BTreeMap::<String, Vec<GitLineRange>>::new();
         for range in old_changed.ranges {
+            ranges_by_path
+                .entry(range.path.clone())
+                .or_default()
+                .push(range);
+        }
+        for (path, requested) in ranges_by_path {
+            let effective = coalesce_blame_ranges(&path, &requested)?;
+            blame.effective_ranges = blame
+                .effective_ranges
+                .checked_add(effective.len())
+                .ok_or_else(|| {
+                    ArchaeologyError::new(
+                        ASTRO_ARCHAEOLOGY_OUTPUT_INVALID,
+                        "Git blame effective-range telemetry overflowed usize",
+                    )
+                })?;
             let blame_start = std::time::Instant::now();
-            let outcome = blame_range(repo, parent, &range)?;
-            blame_ms += blame_start.elapsed().as_millis();
-            blame_calls += 1;
+            let outcome = blame_ranges(repo, parent, &path, &effective)?;
+            blame.wall_ms = blame
+                .wall_ms
+                .saturating_add(elapsed_u64_ms(blame_start.elapsed()));
+            blame.processes = blame.processes.checked_add(1).ok_or_else(|| {
+                ArchaeologyError::new(
+                    ASTRO_ARCHAEOLOGY_OUTPUT_INVALID,
+                    "Git blame process telemetry overflowed usize",
+                )
+            })?;
             let blamed = match outcome {
-                BlameOutcome::Blamed(findings) => findings,
+                BlameOutcome::Blamed {
+                    findings,
+                    returned_spans,
+                    stdout_bytes,
+                } => {
+                    blame.returned_spans = blame
+                        .returned_spans
+                        .checked_add(returned_spans)
+                        .ok_or_else(|| {
+                            ArchaeologyError::new(
+                                ASTRO_ARCHAEOLOGY_OUTPUT_INVALID,
+                                "Git blame returned-span telemetry overflowed usize",
+                            )
+                        })?;
+                    blame.returned_lines = blame
+                        .returned_lines
+                        .checked_add(findings.len())
+                        .ok_or_else(|| {
+                            ArchaeologyError::new(
+                                ASTRO_ARCHAEOLOGY_OUTPUT_INVALID,
+                                "Git blame returned-line telemetry overflowed usize",
+                            )
+                        })?;
+                    blame.stdout_bytes =
+                        blame
+                            .stdout_bytes
+                            .checked_add(stdout_bytes)
+                            .ok_or_else(|| {
+                                ArchaeologyError::new(
+                                    ASTRO_ARCHAEOLOGY_OUTPUT_INVALID,
+                                    "Git blame stdout-byte telemetry overflowed u64",
+                                )
+                            })?;
+                    findings
+                }
                 BlameOutcome::PathAbsent => {
-                    skipped_unblamable_paths += 1;
+                    skipped_unblamable_paths = skipped_unblamable_paths
+                        .checked_add(requested.len())
+                        .ok_or_else(|| {
+                            ArchaeologyError::new(
+                                ASTRO_ARCHAEOLOGY_OUTPUT_INVALID,
+                                "Git blame absent-path telemetry overflowed usize",
+                            )
+                        })?;
                     continue;
                 }
             };
@@ -435,7 +541,7 @@ pub fn mine_git_archaeology(
                 szz.insert(SzzFinding {
                     fix_commit: commit.sha.clone(),
                     blamed_commit,
-                    path: range.path.clone(),
+                    path: path.clone(),
                     line,
                     observed_at: commit.timestamp,
                     confidence,
@@ -446,12 +552,21 @@ pub fn mine_git_archaeology(
     if arch_timing {
         eprintln!(
             "astro.arch.timing phase=mine_internal read_commits_ms={read_commits_ms} \
-             commits={commit_count} diff_ms={diff_ms} blame_ms={blame_ms} \
-             blame_calls={blame_calls} skipped_merge_fixes={skipped_merge_fixes} \
+             commits={commit_count} diff_ms={diff_ms} blame_ms={} \
+             blame_requested_ranges={} blame_effective_ranges={} blame_processes={} \
+             blame_returned_spans={} blame_returned_lines={} blame_stdout_bytes={} \
+             skipped_merge_fixes={skipped_merge_fixes} \
              skipped_large_commits={skipped_large_commits} \
              skipped_unresolvable_reverts={skipped_unresolvable_reverts} \
              skipped_gitlink_paths={skipped_gitlink_paths} \
-             skipped_unblamable_paths={skipped_unblamable_paths} file_cap={file_cap}"
+             skipped_unblamable_paths={skipped_unblamable_paths} file_cap={file_cap}",
+            blame.wall_ms,
+            blame.requested_ranges,
+            blame.effective_ranges,
+            blame.processes,
+            blame.returned_spans,
+            blame.returned_lines,
+            blame.stdout_bytes,
         );
     }
     Ok(GitArchaeologyReport {
@@ -464,6 +579,7 @@ pub fn mine_git_archaeology(
         skipped_unresolvable_reverts,
         skipped_gitlink_paths,
         skipped_unblamable_paths,
+        blame,
     })
 }
 
@@ -503,8 +619,14 @@ pub fn is_git_work_tree(repo: &Path) -> bool {
 
 /// Self-describing algorithm tag for the git source fingerprint (#347).
 pub const GIT_SOURCE_FINGERPRINT_ALGO: &str = "blake3";
-/// Self-describing version tag for the git source fingerprint (#347).
-pub const GIT_SOURCE_FINGERPRINT_VERSION: &str = "v1";
+/// Self-describing version tag for the git source fingerprint (#347/#858).
+///
+/// v2 replaces textual patch hashing with exact current bytes for every changed
+/// tracked or untracked path. A textual Git diff deliberately does not contain
+/// binary-file bytes, so two different binary edits could previously produce the
+/// same status + `Binary files differ` payload. Persisted v1 values are therefore
+/// never compared to this stronger domain.
+pub const GIT_SOURCE_FINGERPRINT_VERSION: &str = "v2";
 
 /// Content fingerprint of the live git working tree at `repo` — the source-of-truth
 /// freshness signal for shadow imports (#347).
@@ -518,11 +640,10 @@ pub const GIT_SOURCE_FINGERPRINT_VERSION: &str = "v1";
 /// * the HEAD commit oid (catches commits / checkouts / resets),
 /// * the porcelain working-tree status (catches staged/unstaged/untracked/renamed
 ///   entries appearing or disappearing),
-/// * the tracked content diff vs HEAD (catches a content-only edit that leaves the
-///   porcelain flag unchanged), and
-/// * the bytes of each untracked, non-ignored file (catches new-file content).
+/// * the exact current bytes/type of every tracked path changed from HEAD, and
+/// * the exact current bytes/type of every untracked, non-ignored path.
 ///
-/// The returned value is `blake3:v1:<hex>` — self-describing so a persisted watermark
+/// The returned value is `blake3:v2:<hex>` — self-describing so a persisted watermark
 /// can be domain-gated exactly like the CBM-db watermark. Fails closed with a coded
 /// error when `repo` is not a usable git repository (so a missing/renamed source tree
 /// is reported, never silently treated as Fresh).
@@ -575,17 +696,32 @@ pub fn git_source_fingerprint(repo: &Path) -> Result<String, ArchaeologyError> {
         repo,
         &["status", "--porcelain=v1", "-z", "--untracked-files=all"],
     )?;
-    // Tracked content changes vs HEAD (staged + unstaged). An explicitly
-    // classified unborn repository has no HEAD tree to diff; every committed
-    // repository must complete this measurement or the whole fingerprint
-    // refuses with the exact Git command/phase/exit/stderr (#831).
-    let diff = if head == "unborn-head" {
-        Vec::new()
+    // Enumerate tracked paths changed from HEAD (staged + unstaged) rather than
+    // hashing a textual patch. Git intentionally summarizes binary patches as
+    // `Binary files differ`; that representation cannot distinguish two different
+    // current byte streams with the same status. `--no-renames` names both sides of
+    // a rename, so the absent old path and exact new bytes are both represented.
+    // An explicitly classified unborn repository has no HEAD tree to diff.
+    let changed_tracked = if head == "unborn-head" {
+        // Every index entry is new relative to the absent HEAD tree. Include
+        // staged files as well as the untracked inventory below.
+        git_bytes(repo, &["ls-files", "-z"])?
     } else {
-        git_bytes(repo, &["diff", "HEAD", "--no-color", "--no-ext-diff"])?
+        git_bytes(
+            repo,
+            &[
+                "diff",
+                "HEAD",
+                "--name-only",
+                "-z",
+                "--no-ext-diff",
+                "--no-renames",
+            ],
+        )?
     };
-    // Untracked, non-ignored paths (NUL-delimited). Their current bytes are folded in so
-    // a brand-new file's content — not just its presence — participates in the digest.
+    // Untracked, non-ignored paths (NUL-delimited). `--others` enumerates the
+    // current files and `--exclude-standard` applies the same repository ignore
+    // policy used by ordinary Git tooling.
     let untracked = git_bytes(repo, &["ls-files", "--others", "--exclude-standard", "-z"])?;
 
     let mut hasher = blake3::Hasher::new();
@@ -596,22 +732,105 @@ pub fn git_source_fingerprint(repo: &Path) -> Result<String, ArchaeologyError> {
     section(GIT_SOURCE_FINGERPRINT_VERSION.as_bytes());
     section(head.as_bytes());
     section(&status);
-    section(&diff);
-    for path in untracked.split(|byte| *byte == 0).filter(|p| !p.is_empty()) {
-        section(path);
-        let rel = String::from_utf8_lossy(path);
-        match std::fs::read(repo.join(rel.as_ref())) {
-            Ok(bytes) => section(&bytes),
-            // A path git listed but we cannot read (race: deleted between listing and
-            // read, or permissions) is folded in as a stable absence marker rather than
-            // aborting: the next status call reflects the real state, and the marker
-            // still differs from the file being present with content.
-            Err(_) => section(b"<unreadable-untracked>"),
-        }
+    let mut changed_paths = BTreeSet::new();
+    for raw in changed_tracked
+        .split(|byte| *byte == 0)
+        .chain(untracked.split(|byte| *byte == 0))
+        .filter(|path| !path.is_empty())
+    {
+        let path = std::str::from_utf8(raw).map_err(|error| {
+            ArchaeologyError::new(
+                ASTRO_ARCHAEOLOGY_OUTPUT_INVALID,
+                format!("Git changed-path output is not UTF-8: {error}"),
+            )
+        })?;
+        changed_paths.insert(path.to_string());
+    }
+    for relative in changed_paths {
+        section(relative.as_bytes());
+        fingerprint_worktree_path(repo, &relative, &mut section)?;
     }
     Ok(format!(
         "{GIT_SOURCE_FINGERPRINT_ALGO}:{GIT_SOURCE_FINGERPRINT_VERSION}:{}",
         hasher.finalize().to_hex()
+    ))
+}
+
+fn fingerprint_worktree_path(
+    repo: &Path,
+    relative: &str,
+    section: &mut impl FnMut(&[u8]),
+) -> Result<(), ArchaeologyError> {
+    let path = repo.join(relative);
+    let metadata = match std::fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            section(b"missing");
+            return Ok(());
+        }
+        Err(error) => {
+            return Err(ArchaeologyError::new(
+                ASTRO_ARCHAEOLOGY_GIT_FAILED,
+                format!(
+                    "cannot inspect changed working-tree path {relative:?} at {}: {error}",
+                    path.display()
+                ),
+            ));
+        }
+    };
+    let file_type = metadata.file_type();
+    if file_type.is_file() {
+        section(b"file");
+        let bytes = std::fs::read(&path).map_err(|error| {
+            ArchaeologyError::new(
+                ASTRO_ARCHAEOLOGY_GIT_FAILED,
+                format!(
+                    "cannot read changed working-tree file {relative:?} at {}: {error}",
+                    path.display()
+                ),
+            )
+        })?;
+        section(&bytes);
+        return Ok(());
+    }
+    if file_type.is_symlink() {
+        section(b"symlink");
+        let target = std::fs::read_link(&path).map_err(|error| {
+            ArchaeologyError::new(
+                ASTRO_ARCHAEOLOGY_GIT_FAILED,
+                format!(
+                    "cannot read changed symlink target {relative:?} at {}: {error}",
+                    path.display()
+                ),
+            )
+        })?;
+        let target = target.to_str().ok_or_else(|| {
+            ArchaeologyError::new(
+                ASTRO_ARCHAEOLOGY_OUTPUT_INVALID,
+                format!(
+                    "changed symlink target for {relative:?} is not Unicode: {}",
+                    target.display()
+                ),
+            )
+        })?;
+        section(target.as_bytes());
+        return Ok(());
+    }
+    if file_type.is_dir() {
+        // A tracked directory is a gitlink/submodule. Fold its complete live Git
+        // fingerprint in recursively so two different dirty submodule states can
+        // never collapse to the same parent ` M path` status record.
+        section(b"gitlink");
+        let nested = git_source_fingerprint(&path)?;
+        section(nested.as_bytes());
+        return Ok(());
+    }
+    Err(ArchaeologyError::new(
+        ASTRO_ARCHAEOLOGY_OUTPUT_INVALID,
+        format!(
+            "changed working-tree path {relative:?} at {} is not a file, symlink, directory, or missing path",
+            path.display()
+        ),
     ))
 }
 
@@ -998,7 +1217,11 @@ fn parse_range(raw: &str) -> Result<(u32, u32), ArchaeologyError> {
 
 /// Outcome of one blame leg (#514): findings, or a counted absent-path skip.
 enum BlameOutcome {
-    Blamed(Vec<(String, u32)>),
+    Blamed {
+        findings: Vec<(String, u32)>,
+        returned_spans: usize,
+        stdout_bytes: u64,
+    },
     /// git refused the path with `no such path` at the blamed revision — the
     /// diff names a path the parent commit does not contain (rename/move
     /// history, directory↔file swaps). A counted, labeled skip for the caller;
@@ -1006,21 +1229,105 @@ enum BlameOutcome {
     PathAbsent,
 }
 
-fn blame_range(
+fn coalesce_blame_ranges(
+    path: &str,
+    requested: &[GitLineRange],
+) -> Result<Vec<GitLineRange>, ArchaeologyError> {
+    if requested.is_empty() {
+        return Err(ArchaeologyError::new(
+            ASTRO_ARCHAEOLOGY_OUTPUT_INVALID,
+            format!("Git blame range group for {path:?} is empty"),
+        ));
+    }
+    let mut spans = requested
+        .iter()
+        .map(|range| {
+            if range.path != path || range.start_line == 0 || range.line_count == 0 {
+                return Err(ArchaeologyError::new(
+                    ASTRO_ARCHAEOLOGY_OUTPUT_INVALID,
+                    format!(
+                        "Git blame range group {path:?} contains invalid range path={:?} start={} count={}",
+                        range.path, range.start_line, range.line_count
+                    ),
+                ));
+            }
+            let end = range
+                .start_line
+                .checked_add(range.line_count - 1)
+                .ok_or_else(|| {
+                    ArchaeologyError::new(
+                        ASTRO_ARCHAEOLOGY_OUTPUT_INVALID,
+                        format!(
+                            "Git blame range for {path:?} overflows u32: start={} count={}",
+                            range.start_line, range.line_count
+                        ),
+                    )
+                })?;
+            Ok((range.start_line, end))
+        })
+        .collect::<Result<Vec<_>, ArchaeologyError>>()?;
+    spans.sort_unstable();
+
+    let mut merged = Vec::<(u32, u32)>::new();
+    for (start, end) in spans {
+        match merged.last_mut() {
+            Some((_, prior_end)) if start <= prior_end.saturating_add(1) => {
+                *prior_end = (*prior_end).max(end);
+            }
+            _ => merged.push((start, end)),
+        }
+    }
+    merged
+        .into_iter()
+        .map(|(start, end)| {
+            let line_count = end
+                .checked_sub(start)
+                .and_then(|span| span.checked_add(1))
+                .ok_or_else(|| {
+                    ArchaeologyError::new(
+                        ASTRO_ARCHAEOLOGY_OUTPUT_INVALID,
+                        format!("coalesced Git blame range for {path:?} overflowed u32"),
+                    )
+                })?;
+            Ok(GitLineRange {
+                path: path.to_string(),
+                start_line: start,
+                line_count,
+            })
+        })
+        .collect()
+}
+
+fn blame_ranges(
     repo: &Path,
     parent: &str,
-    range: &GitLineRange,
+    path: &str,
+    ranges: &[GitLineRange],
 ) -> Result<BlameOutcome, ArchaeologyError> {
-    let line_arg = format!("{},+{}", range.start_line, range.line_count);
-    let args = [
-        "blame",
-        "--line-porcelain",
-        "-L",
-        &line_arg,
-        parent,
-        "--",
-        &range.path,
-    ];
+    if ranges.is_empty() {
+        return Err(ArchaeologyError::new(
+            ASTRO_ARCHAEOLOGY_OUTPUT_INVALID,
+            format!("Git blame range group for {path:?} is empty"),
+        ));
+    }
+    let mut owned_args = vec!["blame".to_string(), "--incremental".to_string()];
+    for range in ranges {
+        if range.path != path || range.start_line == 0 || range.line_count == 0 {
+            return Err(ArchaeologyError::new(
+                ASTRO_ARCHAEOLOGY_OUTPUT_INVALID,
+                format!(
+                    "Git blame range group {path:?} contains invalid effective range path={:?} start={} count={}",
+                    range.path, range.start_line, range.line_count
+                ),
+            ));
+        }
+        owned_args.push("-L".to_string());
+        owned_args.push(format!("{},+{}", range.start_line, range.line_count));
+    }
+    owned_args.push(parent.to_string());
+    owned_args.push("--".to_string());
+    owned_args.push(path.to_string());
+    let args = owned_args.iter().map(String::as_str).collect::<Vec<_>>();
     let raw = git_command(repo, &args)
         .output()
         .map_err(|error| git_spawn_error(&args, error))?;
@@ -1033,31 +1340,157 @@ fn blame_range(
         }
         return Err(git_exit_error(&args, raw.status.code(), &raw.stderr));
     }
+    let stdout_bytes = u64::try_from(raw.stdout.len()).map_err(|_| {
+        ArchaeologyError::new(
+            ASTRO_ARCHAEOLOGY_OUTPUT_INVALID,
+            "Git blame stdout length cannot be represented as u64",
+        )
+    })?;
     let output = String::from_utf8(raw.stdout).map_err(|error| {
         ArchaeologyError::new(
             ASTRO_ARCHAEOLOGY_OUTPUT_INVALID,
             format!("Git output is not UTF-8: {error}"),
         )
     })?;
+    let allowed_lines = ranges
+        .iter()
+        .map(|range| {
+            let end = range
+                .start_line
+                .checked_add(range.line_count - 1)
+                .ok_or_else(|| {
+                    ArchaeologyError::new(
+                        ASTRO_ARCHAEOLOGY_OUTPUT_INVALID,
+                        format!("effective Git blame range for {path:?} overflows u32"),
+                    )
+                })?;
+            Ok((range.start_line, end))
+        })
+        .collect::<Result<Vec<_>, ArchaeologyError>>()?;
     let mut findings = BTreeSet::new();
-    for line in output.lines() {
-        let mut fields = line.split_whitespace();
-        let Some(raw_oid) = fields.next() else {
-            continue;
-        };
-        let oid = raw_oid.trim_start_matches('^');
-        if !is_oid(oid) {
+    let mut pending: Option<(String, u32, u32)> = None;
+    let mut returned_spans = 0usize;
+    for (line_index, line) in output.lines().enumerate() {
+        if pending.is_none() {
+            let fields = line.split_whitespace().collect::<Vec<_>>();
+            if fields.len() != 4 || !is_oid(fields[0]) {
+                return Err(ArchaeologyError::new(
+                    ASTRO_ARCHAEOLOGY_OUTPUT_INVALID,
+                    format!(
+                        "Git incremental blame entry {} for {path:?} has invalid header {line:?}",
+                        line_index + 1
+                    ),
+                ));
+            }
+            let source_line = parse_blame_u32(fields[1], "source line", path, line_index)?;
+            let result_line = parse_blame_u32(fields[2], "result line", path, line_index)?;
+            let count = parse_blame_u32(fields[3], "line count", path, line_index)?;
+            if source_line == 0 || result_line == 0 || count == 0 {
+                return Err(ArchaeologyError::new(
+                    ASTRO_ARCHAEOLOGY_OUTPUT_INVALID,
+                    format!(
+                        "Git incremental blame header for {path:?} contains a zero source/result/count: {line:?}"
+                    ),
+                ));
+            }
+            let _ = source_line.checked_add(count - 1).ok_or_else(|| {
+                ArchaeologyError::new(
+                    ASTRO_ARCHAEOLOGY_OUTPUT_INVALID,
+                    format!("Git incremental blame source span for {path:?} overflows u32"),
+                )
+            })?;
+            let _ = result_line.checked_add(count - 1).ok_or_else(|| {
+                ArchaeologyError::new(
+                    ASTRO_ARCHAEOLOGY_OUTPUT_INVALID,
+                    format!("Git incremental blame result span for {path:?} overflows u32"),
+                )
+            })?;
+            pending = Some((fields[0].to_string(), result_line, count));
             continue;
         }
-        let Some(_original) = fields.next() else {
-            continue;
-        };
-        let Some(final_line) = fields.next().and_then(|value| value.parse::<u32>().ok()) else {
-            continue;
-        };
-        findings.insert((oid.to_string(), final_line));
+        if let Some(filename) = line.strip_prefix("filename ") {
+            if filename.is_empty() {
+                return Err(ArchaeologyError::new(
+                    ASTRO_ARCHAEOLOGY_OUTPUT_INVALID,
+                    format!("Git incremental blame entry for {path:?} has an empty filename"),
+                ));
+            }
+            let (oid, result_line, count) = pending.take().expect("pending entry checked");
+            for offset in 0..count {
+                let line = result_line.checked_add(offset).ok_or_else(|| {
+                    ArchaeologyError::new(
+                        ASTRO_ARCHAEOLOGY_OUTPUT_INVALID,
+                        format!(
+                            "Git incremental blame result expansion for {path:?} overflowed u32"
+                        ),
+                    )
+                })?;
+                if !allowed_lines
+                    .iter()
+                    .any(|(start, end)| *start <= line && line <= *end)
+                {
+                    return Err(ArchaeologyError::new(
+                        ASTRO_ARCHAEOLOGY_OUTPUT_INVALID,
+                        format!(
+                            "Git incremental blame returned result line {line} outside the requested union for {path:?}"
+                        ),
+                    ));
+                }
+                findings.insert((oid.clone(), line));
+            }
+            returned_spans = returned_spans.checked_add(1).ok_or_else(|| {
+                ArchaeologyError::new(
+                    ASTRO_ARCHAEOLOGY_OUTPUT_INVALID,
+                    "Git blame returned-span count overflowed usize",
+                )
+            })?;
+        } else if line.is_empty() {
+            return Err(ArchaeologyError::new(
+                ASTRO_ARCHAEOLOGY_OUTPUT_INVALID,
+                format!("Git incremental blame entry for {path:?} contains an empty metadata line"),
+            ));
+        }
+        // Git explicitly permits new tagged metadata. Unknown nonempty tags are
+        // ignored until the mandatory `filename` terminator.
     }
-    Ok(BlameOutcome::Blamed(findings.into_iter().collect()))
+    if pending.is_some() {
+        return Err(ArchaeologyError::new(
+            ASTRO_ARCHAEOLOGY_OUTPUT_INVALID,
+            format!("Git incremental blame output for {path:?} ended before `filename`"),
+        ));
+    }
+    if returned_spans == 0 {
+        return Err(ArchaeologyError::new(
+            ASTRO_ARCHAEOLOGY_OUTPUT_INVALID,
+            format!("Git incremental blame returned no entries for non-empty ranges on {path:?}"),
+        ));
+    }
+    Ok(BlameOutcome::Blamed {
+        findings: findings.into_iter().collect(),
+        returned_spans,
+        stdout_bytes,
+    })
+}
+
+fn parse_blame_u32(
+    value: &str,
+    field: &str,
+    path: &str,
+    zero_based_line_index: usize,
+) -> Result<u32, ArchaeologyError> {
+    value.parse::<u32>().map_err(|error| {
+        ArchaeologyError::new(
+            ASTRO_ARCHAEOLOGY_OUTPUT_INVALID,
+            format!(
+                "Git incremental blame {field} at output line {} for {path:?} is invalid: {value:?}: {error}",
+                zero_based_line_index + 1
+            ),
+        )
+    })
+}
+
+fn elapsed_u64_ms(elapsed: std::time::Duration) -> u64 {
+    u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
 }
 
 fn read_commits(
@@ -1400,6 +1833,11 @@ fn git_command(repo: &Path, args: &[&str]) -> Command {
     // `LC_ALL` overrides any ambient `LANG`/`LC_*`. Path bytes are emitted
     // verbatim regardless of locale, so this does not alter mined ranges.
     command.env("LC_ALL", "C");
+    // Every archaeology/freshness child is observational. Prevent commands such
+    // as `git status` from taking the optional index refresh lock or rewriting
+    // cached stat data; several Astrolabe clients may inspect distinct projects
+    // concurrently, and a source fingerprint must never mutate its source of truth.
+    command.env("GIT_OPTIONAL_LOCKS", "0");
     // Git archaeology is a non-interactive child of a long-lived JSON-RPC
     // server. `Command::status()` inherits stdin by default, which bound the
     // incremental `merge-base --is-ancestor` predicate to the MCP transport on

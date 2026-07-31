@@ -6,7 +6,7 @@ use std::io::{Read, Write};
 
 const PUBLICATION_DIR: &str = ".astrolabe-shadow-publication";
 const PUBLICATION_JOURNAL: &str = "transaction.json";
-const PUBLICATION_SCHEMA: &str = "astrolabe.shadow-publication.v2";
+const PUBLICATION_SCHEMA: &str = "astrolabe.shadow-publication.v3";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -47,6 +47,16 @@ struct PublicationRecoveryManifest {
     candidate_config_generation: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MetadataAcknowledgementRecoveryManifest {
+    artifact_generation: ArtifactGenerationEvidence,
+    publication_generation: String,
+    keys: Vec<String>,
+    prior_rows_sha256: String,
+    candidate_rows_sha256: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PublicationJournal {
@@ -59,11 +69,14 @@ struct PublicationJournal {
     generation: String,
     owner: PublicationOwner,
     recovery_manifest: Option<PublicationRecoveryManifest>,
+    metadata_acknowledgement: Option<MetadataAcknowledgementRecoveryManifest>,
     evidence: Value,
 }
 
 type StagedArtifactValidation = (String, String, String, String, Vec<(String, String)>);
 type PublicationConfigReadback = (
+    Option<String>,
+    Option<String>,
     Option<String>,
     Option<String>,
     Option<String>,
@@ -105,6 +118,7 @@ pub(crate) struct ShadowPublication {
     generation: String,
     owner: PublicationOwner,
     recovery_manifest: Option<PublicationRecoveryManifest>,
+    metadata_acknowledgement: Option<MetadataAcknowledgementRecoveryManifest>,
     seed_lower_repair: Option<SeedLowerRepair>,
 }
 
@@ -152,6 +166,7 @@ impl ShadowPublication {
                 process_start_utc_ticks: owner_process_start_utc_ticks,
             },
             recovery_manifest: None,
+            metadata_acknowledgement: None,
             seed_lower_repair: None,
         };
         let initialized = (|| -> Result<(), DynError> {
@@ -205,6 +220,7 @@ impl ShadowPublication {
         mut outcome: ShadowImportOutcome,
         dial: MigrationDial,
         sanitized_index_args: &str,
+        index_admission_identity: &ShadowIndexAdmissionIdentity,
     ) -> Result<ShadowImportOutcome, DynError> {
         let repaired_unchanged_generation =
             self.seed_lower_repair.is_some() && !outcome.publication_required;
@@ -212,10 +228,16 @@ impl ShadowPublication {
             .then(|| outcome.content_freshness_watermark_sha256.clone());
         if repaired_unchanged_generation {
             outcome.publication_required = true;
+            outcome.metadata_publication_required = false;
             outcome.publication_reason = "seed_lower_repair";
         }
         if !outcome.publication_required {
-            return self.discard_unchanged(outcome);
+            return self.discard_unchanged(
+                outcome,
+                dial,
+                sanitized_index_args,
+                index_admission_identity,
+            );
         }
         remap_outcome_paths(&mut outcome, &self.stage_cache, &self.live_cache);
 
@@ -444,6 +466,7 @@ impl ShadowPublication {
             &outcome,
             dial,
             sanitized_index_args,
+            index_admission_identity,
             &staged_config_rows,
             &self.generation,
         ) {
@@ -469,6 +492,17 @@ impl ShadowPublication {
                     &self.live_cache,
                     &metadata_key(&self.project, SHADOW_PUBLICATION_GENERATION_KEY),
                 )?,
+                read_config_value(
+                    &self.live_cache,
+                    &metadata_key(&self.project, SHADOW_INDEX_ADMISSION_IDENTITY_KEY),
+                )?,
+                read_config_value(
+                    &self.live_cache,
+                    &metadata_key(
+                        &self.project,
+                        SHADOW_INDEX_ADMISSION_PUBLICATION_GENERATION_KEY,
+                    ),
+                )?,
             ))
         })();
         let (
@@ -476,6 +510,8 @@ impl ShadowPublication {
             persisted_watermark,
             persisted_symbol_schema,
             persisted_publication_generation,
+            persisted_index_admission_identity,
+            persisted_index_admission_publication_generation,
         ) = match config_readback {
             Ok(readback) => readback,
             Err(error) => {
@@ -493,10 +529,15 @@ impl ShadowPublication {
         };
         let expected_watermark =
             format_shadow_watermark(&outcome.content_freshness_watermark_sha256);
+        let expected_index_admission_identity = index_admission_identity.record_json()?;
         if persisted_source.as_deref() != Some(outcome.sqlite_path.to_string_lossy().as_ref())
             || persisted_watermark.as_deref() != Some(expected_watermark.as_str())
             || persisted_symbol_schema.as_deref() != Some(SYMBOL_CANONICAL_TAG)
             || persisted_publication_generation.as_deref() != Some(self.generation.as_str())
+            || persisted_index_admission_identity.as_deref()
+                != Some(expected_index_admission_identity.as_str())
+            || persisted_index_admission_publication_generation.as_deref()
+                != Some(self.generation.as_str())
         {
             self.write_journal(
                 "committed_readback_failed",
@@ -509,6 +550,10 @@ impl ShadowPublication {
                     "expected_symbol_canonical_schema": SYMBOL_CANONICAL_TAG,
                     "persisted_publication_generation": persisted_publication_generation,
                     "expected_publication_generation": self.generation,
+                    "persisted_index_admission_identity": persisted_index_admission_identity,
+                    "expected_index_admission_identity": expected_index_admission_identity,
+                    "persisted_index_admission_publication_generation": persisted_index_admission_publication_generation,
+                    "expected_index_admission_publication_generation": self.generation,
                 }),
             )?;
             return Err(format!(
@@ -530,6 +575,8 @@ impl ShadowPublication {
                 "config_watermark": persisted_watermark,
                 "config_symbol_canonical_schema": persisted_symbol_schema,
                 "config_publication_generation": persisted_publication_generation,
+                "config_index_admission_identity": persisted_index_admission_identity,
+                "config_index_admission_publication_generation": persisted_index_admission_publication_generation,
                 "seed_lower_repair": self
                     .seed_lower_repair
                     .as_ref()
@@ -547,8 +594,11 @@ impl ShadowPublication {
     fn discard_unchanged(
         self,
         mut outcome: ShadowImportOutcome,
+        dial: MigrationDial,
+        sanitized_index_args: &str,
+        index_admission_identity: &ShadowIndexAdmissionIdentity,
     ) -> Result<ShadowImportOutcome, DynError> {
-        let validation = (|| -> Result<(String, String), DynError> {
+        let validation = (|| -> Result<(String, String, Vec<(String, String)>), DynError> {
             let freshness = evaluate_shadow_content_freshness(&self.live_cache, &self.project)?;
             if freshness != ShadowContentVerdict::Fresh {
                 return Err(format!(
@@ -688,9 +738,9 @@ impl ShadowPublication {
                 .into());
             }
             drop(vault);
-            Ok((source_hash, lowered_hash))
+            Ok((source_hash, lowered_hash, live_config_rows))
         })();
-        let (source_hash, lowered_hash) = match validation {
+        let (source_hash, lowered_hash, live_config_rows) = match validation {
             Ok(validation) => validation,
             Err(error) => {
                 return Err(self.abort_error("unchanged live-generation validation", error));
@@ -700,6 +750,17 @@ impl ShadowPublication {
         remap_outcome_paths(&mut outcome, &self.stage_cache, &self.live_cache);
         outcome.content_freshness_watermark_sha256 = source_hash.clone();
         outcome.lowered_artifact_sha256 = lowered_hash.clone();
+        if outcome.metadata_publication_required {
+            return self.acknowledge_unchanged_action_metadata(
+                outcome,
+                dial,
+                sanitized_index_args,
+                index_admission_identity,
+                live_config_rows,
+                source_hash,
+                lowered_hash,
+            );
+        }
         if let Err(error) = self.write_journal(
             "unchanged_validated",
             json!({
@@ -723,6 +784,187 @@ impl ShadowPublication {
             && let Err(error) = remove_empty_dir(parent)
         {
             return Err(self.abort_error("unchanged publication-root cleanup", error));
+        }
+        Ok(outcome)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn acknowledge_unchanged_action_metadata(
+        mut self,
+        outcome: ShadowImportOutcome,
+        dial: MigrationDial,
+        sanitized_index_args: &str,
+        index_admission_identity: &ShadowIndexAdmissionIdentity,
+        live_config_rows: Vec<(String, String)>,
+        source_hash: String,
+        lowered_hash: String,
+    ) -> Result<ShadowImportOutcome, DynError> {
+        let publication_generation = read_config_value(
+            &self.live_cache,
+            &metadata_key(&self.project, SHADOW_PUBLICATION_GENERATION_KEY),
+        )?
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            self.abort_error(
+                "action metadata generation binding",
+                format!(
+                    "ASTRO_SHADOW_ACTION_METADATA_GENERATION_MISSING: project {:?} has no artifact publication generation; remediation: preserve the staged transaction and rebuild the project from authoritative source",
+                    self.project
+                ),
+            )
+        })?;
+        let artifact_generation = capture_artifact_generation(
+            &sqlite_path(&self.live_cache, &self.project),
+            &lowered_sqlite_path(&self.live_cache, &self.project),
+            &vault_dir(&self.live_cache, &self.project),
+        )?;
+        let candidate_rows = action_metadata_candidate_rows(
+            &self.project,
+            dial,
+            sanitized_index_args,
+            index_admission_identity,
+            &publication_generation,
+            &outcome,
+        )?;
+        let keys = candidate_rows
+            .iter()
+            .map(|(key, _)| key.clone())
+            .collect::<Vec<_>>();
+        let prior_rows = select_config_rows(&live_config_rows, &keys);
+        if prior_rows.len() != keys.len() {
+            return Err(self.abort_error(
+                "action metadata prior-row validation",
+                format!(
+                    "ASTRO_SHADOW_ACTION_METADATA_PRIOR_INCOMPLETE: project {:?} has {} of {} required action metadata rows; remediation: preserve the incomplete generation and rebuild it from authoritative source",
+                    self.project,
+                    prior_rows.len(),
+                    keys.len()
+                ),
+            ));
+        }
+        let prior_rows_sha256 = config_rows_sha256(&prior_rows)?;
+        let candidate_rows_sha256 = config_rows_sha256(&candidate_rows)?;
+        let candidate_project_rows = replace_config_rows(&live_config_rows, &candidate_rows);
+        if prior_rows_sha256 == candidate_rows_sha256 {
+            return Err(self.abort_error(
+                "action metadata change validation",
+                format!(
+                    "ASTRO_SHADOW_ACTION_METADATA_NOT_CHANGED: project {:?} requested a metadata publication but the exact candidate row set equals the prior set; remediation: inspect action classification and do not publish a false metadata change",
+                    self.project
+                ),
+            ));
+        }
+        self.metadata_acknowledgement = Some(MetadataAcknowledgementRecoveryManifest {
+            artifact_generation: artifact_generation.clone(),
+            publication_generation: publication_generation.clone(),
+            keys: keys.clone(),
+            prior_rows_sha256: prior_rows_sha256.clone(),
+            candidate_rows_sha256: candidate_rows_sha256.clone(),
+        });
+        if let Err(error) = self.write_journal(
+            "unchanged_metadata_validated",
+            json!({
+                "publication_reason": outcome.publication_reason,
+                "source_sha256": source_hash,
+                "lowered_sha256": lowered_hash,
+                "artifact_generation": artifact_generation,
+                "publication_generation": publication_generation,
+                "prior_rows_sha256": prior_rows_sha256,
+                "candidate_rows_sha256": candidate_rows_sha256,
+                "metadata_keys": keys,
+                "physical_artifacts_preserved": true,
+            }),
+        ) {
+            return Err(self.abort_error("action metadata validation journal", error));
+        }
+
+        if let Err(error) = persist_action_metadata_acknowledgement(
+            &self.live_cache,
+            &self.project,
+            &live_config_rows,
+            &candidate_project_rows,
+            &publication_generation,
+            &candidate_rows,
+        ) {
+            return Err(self.abort_error("action metadata config commit", error));
+        }
+
+        let readback = (|| -> Result<Value, DynError> {
+            let project_rows = project_config_rows(&self.live_cache, &self.project)?;
+            if project_rows != candidate_project_rows {
+                return Err(format!(
+                    "ASTRO_SHADOW_ACTION_METADATA_PROJECT_READBACK_MISMATCH: project {:?} complete config rows changed outside the acknowledged action metadata set (expected_sha256={}, actual_sha256={}); remediation: preserve the transaction and inspect the concurrent project config writer",
+                    self.project,
+                    config_rows_sha256(&candidate_project_rows)?,
+                    config_rows_sha256(&project_rows)?
+                )
+                .into());
+            }
+            let persisted_rows = select_config_rows(&project_rows, &keys);
+            if persisted_rows != candidate_rows {
+                return Err(format!(
+                    "ASTRO_SHADOW_ACTION_METADATA_READBACK_MISMATCH: project {:?} committed candidate row hash {}, but independent readback returned {}; remediation: preserve the transaction and inspect the exact config WAL/database state before serving this project",
+                    self.project,
+                    candidate_rows_sha256,
+                    config_rows_sha256(&persisted_rows)?
+                )
+                .into());
+            }
+            let persisted_publication_generation = read_config_value(
+                &self.live_cache,
+                &metadata_key(&self.project, SHADOW_PUBLICATION_GENERATION_KEY),
+            )?;
+            if persisted_publication_generation.as_deref() != Some(publication_generation.as_str())
+            {
+                return Err(format!(
+                    "ASTRO_SHADOW_ACTION_METADATA_GENERATION_CHANGED: project {:?} artifact publication generation changed from {:?} to {:?} during metadata acknowledgement; remediation: preserve the transaction and inspect the concurrent config writer",
+                    self.project,
+                    publication_generation,
+                    persisted_publication_generation
+                )
+                .into());
+            }
+            let persisted_artifacts = capture_artifact_generation(
+                &sqlite_path(&self.live_cache, &self.project),
+                &lowered_sqlite_path(&self.live_cache, &self.project),
+                &vault_dir(&self.live_cache, &self.project),
+            )?;
+            if persisted_artifacts != artifact_generation {
+                return Err(format!(
+                    "ASTRO_SHADOW_ACTION_METADATA_ARTIFACT_CHANGED: project {:?} source/lowered/vault generation changed during metadata-only publication; remediation: preserve the transaction and inspect the concurrent artifact writer",
+                    self.project
+                )
+                .into());
+            }
+            Ok(json!({
+                "publication_reason": outcome.publication_reason,
+                "publication_generation": publication_generation,
+                "metadata_rows_sha256": candidate_rows_sha256,
+                "metadata_keys": keys,
+                "artifact_generation": persisted_artifacts,
+                "physical_artifacts_preserved": true,
+            }))
+        })();
+        let readback = match readback {
+            Ok(readback) => readback,
+            Err(error) => {
+                let _ = self.write_journal(
+                    "unchanged_metadata_committed_readback_failed",
+                    json!({"error": error.to_string()}),
+                );
+                return Err(format!(
+                    "ASTRO_SHADOW_ACTION_METADATA_COMMIT_READBACK: metadata transaction committed but independent readback failed for project {:?}: {error}; transaction evidence remains at {}. Remediation: inspect and reconcile that exact transaction before serving or retrying this project",
+                    self.project,
+                    self.transaction_dir.display()
+                )
+                .into());
+            }
+        };
+        self.write_journal("unchanged_metadata_complete", readback)?;
+        remove_transaction_tree(&self.transaction_dir, &self.project_root)?;
+        remove_empty_dir(&self.project_root)?;
+        if let Some(parent) = self.project_root.parent() {
+            remove_empty_dir(parent)?;
         }
         Ok(outcome)
     }
@@ -916,6 +1158,7 @@ impl ShadowPublication {
             "generation": self.generation,
             "owner": self.owner,
             "recovery_manifest": self.recovery_manifest,
+            "metadata_acknowledgement": self.metadata_acknowledgement,
             "evidence": evidence,
         }))?;
         let mut file = OpenOptions::new()
@@ -972,6 +1215,181 @@ impl ShadowPublication {
         )
         .into()
     }
+}
+
+fn project_config_rows(cache_dir: &Path, project: &str) -> Result<Vec<(String, String)>, DynError> {
+    let prefix = format!("{CONFIG_KEY_PREFIX}{project}");
+    let metadata_prefix = format!("{prefix}.");
+    Ok(scan_config_prefix(cache_dir, &prefix)?
+        .into_iter()
+        .filter(|(key, _)| key == &dial_key(project) || key.starts_with(&metadata_prefix))
+        .collect())
+}
+
+fn project_config_rows_on_connection(
+    connection: &Connection,
+    project: &str,
+) -> Result<Vec<(String, String)>, DynError> {
+    let prefix = format!("{CONFIG_KEY_PREFIX}{project}");
+    let metadata_prefix = format!("{prefix}.");
+    let escaped = prefix
+        .replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_");
+    let pattern = format!("{escaped}%");
+    let mut statement = connection
+        .prepare("SELECT key, value FROM config WHERE key LIKE ? ESCAPE '\\' ORDER BY key")?;
+    let rows = statement.query_map(params![pattern], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        let row = row?;
+        if row.0 == dial_key(project) || row.0.starts_with(&metadata_prefix) {
+            out.push(row);
+        }
+    }
+    Ok(out)
+}
+
+fn select_config_rows(rows: &[(String, String)], keys: &[String]) -> Vec<(String, String)> {
+    let key_set = keys.iter().map(String::as_str).collect::<BTreeSet<_>>();
+    rows.iter()
+        .filter(|(key, _)| key_set.contains(key.as_str()))
+        .cloned()
+        .collect()
+}
+
+fn config_rows_sha256(rows: &[(String, String)]) -> Result<String, DynError> {
+    Ok(hex_lower(&Sha256::digest(serde_json::to_vec(rows)?)))
+}
+
+fn replace_config_rows(
+    prior_rows: &[(String, String)],
+    replacement_rows: &[(String, String)],
+) -> Vec<(String, String)> {
+    let mut rows = prior_rows.iter().cloned().collect::<BTreeMap<_, _>>();
+    for (key, value) in replacement_rows {
+        rows.insert(key.clone(), value.clone());
+    }
+    rows.into_iter().collect()
+}
+
+fn action_metadata_candidate_rows(
+    project: &str,
+    dial: MigrationDial,
+    sanitized_index_args: &str,
+    index_admission_identity: &ShadowIndexAdmissionIdentity,
+    publication_generation: &str,
+    outcome: &ShadowImportOutcome,
+) -> Result<Vec<(String, String)>, DynError> {
+    let mut rows = vec![
+        (dial_key(project), dial.as_str().to_string()),
+        (
+            metadata_key(project, SHADOW_INDEX_ARGS_KEY),
+            sanitized_index_args.to_string(),
+        ),
+        (
+            metadata_key(project, SHADOW_INDEX_ADMISSION_IDENTITY_KEY),
+            index_admission_identity.record_json()?,
+        ),
+        (
+            metadata_key(project, SHADOW_INDEX_ADMISSION_PUBLICATION_GENERATION_KEY),
+            publication_generation.to_string(),
+        ),
+        (
+            metadata_key(project, "search_scale_json"),
+            serde_json::to_string(&outcome.search_scale)?,
+        ),
+        (
+            metadata_key(project, "skill_tree_json"),
+            serde_json::to_string(&outcome.skill_tree)?,
+        ),
+    ];
+    rows.sort_by(|left, right| left.0.cmp(&right.0));
+    if rows.iter().map(|(key, _)| key.clone()).collect::<Vec<_>>() != action_metadata_keys(project)
+    {
+        return Err(
+            "ASTRO_SHADOW_ACTION_METADATA_KEYSET_INVALID: candidate rows do not equal the canonical action metadata key set; remediation: do not publish the incomplete acknowledgement"
+                .into(),
+        );
+    }
+    Ok(rows)
+}
+
+fn action_metadata_keys(project: &str) -> Vec<String> {
+    let mut keys = vec![
+        dial_key(project),
+        metadata_key(project, SHADOW_INDEX_ARGS_KEY),
+        metadata_key(project, SHADOW_INDEX_ADMISSION_IDENTITY_KEY),
+        metadata_key(project, SHADOW_INDEX_ADMISSION_PUBLICATION_GENERATION_KEY),
+        metadata_key(project, "search_scale_json"),
+        metadata_key(project, "skill_tree_json"),
+    ];
+    keys.sort();
+    keys
+}
+
+fn persist_action_metadata_acknowledgement(
+    cache_dir: &Path,
+    project: &str,
+    expected_project_rows: &[(String, String)],
+    candidate_project_rows: &[(String, String)],
+    expected_publication_generation: &str,
+    candidate_rows: &[(String, String)],
+) -> Result<(), DynError> {
+    let mut connection = open_config(cache_dir)?;
+    let transaction =
+        connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let transaction_project_rows = project_config_rows_on_connection(&transaction, project)?;
+    if transaction_project_rows != expected_project_rows {
+        return Err(format!(
+            "ASTRO_SHADOW_ACTION_METADATA_CONFIG_PREIMAGE_CHANGED: project {project:?} config changed before the metadata write transaction (expected_sha256={}, actual_sha256={}); remediation: preserve the staged transaction and retry only after the concurrent project operation completes",
+            config_rows_sha256(expected_project_rows)?,
+            config_rows_sha256(&transaction_project_rows)?
+        )
+        .into());
+    }
+    let publication_generation = transaction
+        .query_row(
+            "SELECT value FROM config WHERE key = ?1",
+            params![metadata_key(project, SHADOW_PUBLICATION_GENERATION_KEY)],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    if publication_generation.as_deref() != Some(expected_publication_generation) {
+        return Err(format!(
+            "ASTRO_SHADOW_ACTION_METADATA_GENERATION_PREIMAGE_CHANGED: project {project:?} artifact publication generation is {publication_generation:?}, expected {expected_publication_generation:?}; remediation: preserve the staged transaction and retry only from one authoritative generation"
+        )
+        .into());
+    }
+    for (key, value) in candidate_rows {
+        transaction.execute(
+            "INSERT OR REPLACE INTO config (key, value) VALUES (?1, ?2)",
+            params![key, value],
+        )?;
+    }
+    let transaction_readback = project_config_rows_on_connection(&transaction, project)?;
+    if transaction_readback != candidate_project_rows {
+        return Err(format!(
+            "ASTRO_SHADOW_ACTION_METADATA_TRANSACTION_PROJECT_READBACK_MISMATCH: candidate project config differs inside the write transaction (expected_sha256={}, actual_sha256={}); remediation: roll back and inspect the exact writer set before retrying",
+            config_rows_sha256(candidate_project_rows)?,
+            config_rows_sha256(&transaction_readback)?
+        )
+        .into());
+    }
+    let candidate_keys = candidate_rows
+        .iter()
+        .map(|(key, _)| key.clone())
+        .collect::<Vec<_>>();
+    if select_config_rows(&transaction_readback, &candidate_keys) != candidate_rows {
+        return Err(
+            "ASTRO_SHADOW_ACTION_METADATA_TRANSACTION_READBACK_MISMATCH: candidate rows did not read back inside the write transaction; remediation: roll back and inspect the config database before retrying"
+                .into(),
+        );
+    }
+    transaction.commit()?;
+    Ok(())
 }
 
 /// Reconcile any dead publication generation before a resident accepts the
@@ -1334,6 +1752,12 @@ fn validate_publication_journal_identity(
         )
         .into());
     }
+    if journal.recovery_manifest.is_some() && journal.metadata_acknowledgement.is_some() {
+        return Err(
+            "ASTRO_SHADOW_PUBLICATION_RECOVERY_MANIFEST_AMBIGUOUS: transaction binds both artifact replacement and metadata-only recovery; remediation: preserve every byte and inspect the journal producer"
+                .into(),
+        );
+    }
     Ok(())
 }
 
@@ -1355,6 +1779,7 @@ fn write_recovery_journal(
         generation: journal.generation.clone(),
         owner: journal.owner.clone(),
         recovery_manifest: journal.recovery_manifest.clone(),
+        metadata_acknowledgement: journal.metadata_acknowledgement.clone(),
         evidence: json!({
             "schema": "astrolabe.shadow-publication-recovery.v1",
             "prior_phase": journal.phase,
@@ -1647,11 +2072,98 @@ fn finalize_interrupted_publication(
     if backup != manifest.prior {
         return Err("ASTRO_SHADOW_PUBLICATION_RECOVERY_COMMITTED_BACKUP_MISMATCH: committed transaction backup does not equal its bound prior generation; remediation: preserve every byte".into());
     }
+    let admission_publication_generation = read_config_value(
+        &journal.live_cache,
+        &metadata_key(
+            &journal.project,
+            SHADOW_INDEX_ADMISSION_PUBLICATION_GENERATION_KEY,
+        ),
+    )?;
+    if admission_publication_generation.as_deref()
+        != Some(manifest.candidate_config_generation.as_str())
+    {
+        return Err(format!(
+            "ASTRO_SHADOW_PUBLICATION_RECOVERY_ADMISSION_BINDING_MISMATCH: committed artifact generation {:?} has admission binding {admission_publication_generation:?}; remediation: preserve every byte and inspect the atomic config transaction",
+            manifest.candidate_config_generation
+        )
+        .into());
+    }
     Ok(json!({
         "live": live,
         "backup": backup,
         "config_generation": manifest.candidate_config_generation,
+        "admission_publication_generation": admission_publication_generation,
     }))
+}
+
+fn reconcile_metadata_acknowledgement(
+    journal: &PublicationJournal,
+    manifest: &MetadataAcknowledgementRecoveryManifest,
+) -> Result<(&'static str, Value), DynError> {
+    if manifest.keys != action_metadata_keys(&journal.project) {
+        return Err(
+            "ASTRO_SHADOW_ACTION_METADATA_RECOVERY_KEYS_INVALID: journal metadata keys do not equal the canonical project-scoped action key set; remediation: preserve every byte and inspect the journal producer"
+                .into(),
+        );
+    }
+    if journal.backup_dir.exists() && fs::read_dir(&journal.backup_dir)?.next().is_some() {
+        return Err(
+            "ASTRO_SHADOW_ACTION_METADATA_RECOVERY_BACKUP_NOT_EMPTY: metadata-only transaction contains artifact backups; remediation: preserve every byte because the journal and physical scope disagree"
+                .into(),
+        );
+    }
+    let live_artifacts = capture_artifact_generation(
+        &sqlite_path(&journal.live_cache, &journal.project),
+        &lowered_sqlite_path(&journal.live_cache, &journal.project),
+        &vault_dir(&journal.live_cache, &journal.project),
+    )?;
+    if live_artifacts != manifest.artifact_generation {
+        return Err(
+            "ASTRO_SHADOW_ACTION_METADATA_RECOVERY_ARTIFACT_DRIFT: source/lowered/vault bytes no longer equal the journal-bound unchanged generation; remediation: preserve every byte and inspect the concurrent artifact mutation"
+                .into(),
+        );
+    }
+    let publication_generation = read_config_value(
+        &journal.live_cache,
+        &metadata_key(&journal.project, SHADOW_PUBLICATION_GENERATION_KEY),
+    )?;
+    if publication_generation.as_deref() != Some(manifest.publication_generation.as_str()) {
+        return Err(format!(
+            "ASTRO_SHADOW_ACTION_METADATA_RECOVERY_GENERATION_DRIFT: live artifact publication generation is {publication_generation:?}, journal binds {:?}; remediation: preserve every byte and inspect the competing project publication",
+            manifest.publication_generation
+        )
+        .into());
+    }
+    let rows = project_config_rows(&journal.live_cache, &journal.project)?;
+    let selected_rows = select_config_rows(&rows, &manifest.keys);
+    let rows_sha256 = config_rows_sha256(&selected_rows)?;
+    let candidate = rows_sha256 == manifest.candidate_rows_sha256;
+    let prior = rows_sha256 == manifest.prior_rows_sha256;
+    let resolved_phase = match journal.phase.as_str() {
+        "unchanged_metadata_complete" if candidate => "complete",
+        "unchanged_metadata_validated" | "unchanged_metadata_committed_readback_failed"
+            if candidate =>
+        {
+            "complete"
+        }
+        "unchanged_metadata_validated" | "aborted" if prior => "rolled_back",
+        phase => {
+            return Err(format!(
+                "ASTRO_SHADOW_ACTION_METADATA_RECOVERY_STATE_MISMATCH: journal phase {phase:?} has selected-row hash {rows_sha256}, prior {}, candidate {}; remediation: preserve every byte because the atomic metadata outcome cannot be classified",
+                manifest.prior_rows_sha256, manifest.candidate_rows_sha256
+            )
+            .into());
+        }
+    };
+    Ok((
+        resolved_phase,
+        json!({
+            "artifact_generation": live_artifacts,
+            "publication_generation": publication_generation,
+            "metadata_rows_sha256": rows_sha256,
+            "classified_as": resolved_phase,
+        }),
+    ))
 }
 
 fn reconcile_completed_transactions(
@@ -1676,6 +2188,19 @@ fn reconcile_completed_transactions(
             project,
         )?;
         let owner_state = publication_owner_state(&value.owner)?;
+        if let Some(metadata_acknowledgement) = value.metadata_acknowledgement.as_ref() {
+            let (resolved_phase, readback) =
+                reconcile_metadata_acknowledgement(&value, metadata_acknowledgement)?;
+            write_recovery_journal(
+                &transaction,
+                &value,
+                resolved_phase,
+                json!({"owner_state": owner_state, "metadata_acknowledgement": readback}),
+            )?;
+            value.phase = resolved_phase.to_string();
+            remove_transaction_tree(&transaction, project_root)?;
+            continue;
+        }
         match value.phase.as_str() {
             "complete" => {}
             "initializing" | "staged" | "unchanged_validated" | "aborted" => {

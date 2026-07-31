@@ -1,7 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::path::Path;
-use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use astrolabe_domain::fsv::FsvAck;
@@ -12,15 +11,16 @@ use astrolabe_domain::{
 };
 use astrolabe_panel::{PanelDriver, PanelInput, SlotRuntime, default_panel_slots};
 use calyx_aster::cf::{ColumnFamily, base_key, ledger_key, ledger_range, prefix_range, slot_key};
-use calyx_aster::ledger_view::parse_aster_ledger_seq;
 use calyx_aster::mvcc::tombstone_value;
 use calyx_aster::vault::input_store::InputRetention;
-use calyx_aster::vault::{AsterVault, encode, input_store};
+use calyx_aster::vault::{
+    AsterVault, LedgerBoundGroupReceipt, LedgerBoundWriteGroup, encode, input_store,
+};
 use calyx_core::{
     AbsentReason, Clock, Constellation, CxFlags, CxId, InputRef, LedgerRef, Modality, Seq, SlotId,
     SlotVector,
 };
-use calyx_ledger::{ActorId, EntryKind, SubjectId, decode};
+use calyx_ledger::{ActorId, EntryKind, LedgerEntryInput, LedgerRow, SubjectId, decode};
 use rusqlite::{Connection, OpenFlags, params};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -497,6 +497,212 @@ pub struct HistoricalSymbolAdmissionReport {
     /// Full persisted-row and paired-ledger readback witness for a mutation.
     #[serde(default, skip_deserializing)]
     pub fsv: Option<FsvAck>,
+}
+
+/// One historical admission prepared against a stable batch snapshot.
+///
+/// Preparation performs all parsing, panel measurement, CxId reuse checks, and
+/// row encoding without mutating the vault. A non-empty result owns exactly one
+/// `Ingest` group that may be interleaved with prepared Grounding groups inside
+/// a larger ordered atomic commit.
+pub struct PreparedHistoricalSymbolAdmission {
+    locations: Vec<HistoricalSymbolLocation>,
+    constellation_inputs: usize,
+    constellations_written: usize,
+    rows_written: usize,
+    constellations_reused: usize,
+    snapshot: Seq,
+    group: Option<LedgerBoundWriteGroup>,
+    expected_entry: Option<LedgerEntryInput>,
+}
+
+impl PreparedHistoricalSymbolAdmission {
+    /// Exact snapshot against which this admission was prepared.
+    pub const fn snapshot(&self) -> Seq {
+        self.snapshot
+    }
+
+    /// Deterministically sorted historical symbol locations.
+    pub fn locations(&self) -> &[HistoricalSymbolLocation] {
+        &self.locations
+    }
+
+    /// Whether this admission owns a logical `Ingest` group.
+    pub const fn has_write_group(&self) -> bool {
+        self.group.is_some()
+    }
+
+    /// Moves the prepared `Ingest` group into an ordered commit window.
+    pub fn take_write_group(&mut self) -> Option<LedgerBoundWriteGroup> {
+        self.group.take()
+    }
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+struct StagedHistoricalCx {
+    canonical_hash: [u8; 32],
+    semantic_hash: [u8; 32],
+}
+
+/// Mutable deduplication state for one bounded historical group-commit window.
+///
+/// The window is project-local and snapshot-bound. It prevents two prepared
+/// groups from writing the same content-addressed Base/slot or retained-input
+/// key while preserving each group's logical provenance entry and counts.
+#[derive(Debug)]
+pub struct HistoricalSymbolAdmissionBatch {
+    snapshot: Seq,
+    staged_cx: BTreeMap<CxId, StagedHistoricalCx>,
+    staged_input_hashes: BTreeSet<[u8; 32]>,
+}
+
+impl HistoricalSymbolAdmissionBatch {
+    /// Snapshot shared by every prepared group in this window.
+    pub const fn snapshot(&self) -> Seq {
+        self.snapshot
+    }
+}
+
+/// Reusable invariant and measurement context for one ordered historical-admission pass.
+///
+/// A Git archaeology pass can admit hundreds of commit snapshots into the same live
+/// vault. The legacy-layout scan, frozen panel validation, and retention lookup are
+/// properties of that pass, not of each snapshot. Opening this session validates those
+/// invariants once; [`Self::admit`] still validates every snapshot/options pair and
+/// re-reads the manifest retention policy before mutation, so a changed vault contract
+/// fails closed instead of silently reusing stale configuration.
+#[derive(Debug)]
+pub struct HistoricalSymbolAdmissionSession {
+    panel_version: u32,
+    driver: PanelDriver,
+    retention: InputRetention,
+}
+
+impl HistoricalSymbolAdmissionSession {
+    /// Opens one historical-admission pass against the current vault contract.
+    pub fn open<C>(vault: &AsterVault<C>, panel_version: u32) -> IngestResult<Self>
+    where
+        C: Clock,
+    {
+        ensure_no_legacy_series_state(vault)?;
+        Ok(Self {
+            panel_version,
+            driver: PanelDriver::new(panel_version)?,
+            retention: vault.input_retention()?,
+        })
+    }
+
+    /// Admits one snapshot while reusing the pass-owned panel driver and validated
+    /// legacy-state decision.
+    pub fn admit<C, R>(
+        &self,
+        snapshot: &CbmGraphSnapshot,
+        vault: &AsterVault<C>,
+        runtime: &R,
+        options: &SqliteImportOptions,
+    ) -> IngestResult<HistoricalSymbolAdmissionReport>
+    where
+        C: Clock,
+        R: SlotRuntime + Sync,
+    {
+        if options.panel_version != self.panel_version {
+            return Err(invalid_sqlite(format!(
+                "historical admission session panel version {} does not match snapshot option {}",
+                self.panel_version, options.panel_version
+            )));
+        }
+        let current_retention = vault.input_retention()?;
+        if current_retention != self.retention {
+            return Err(invalid_sqlite(format!(
+                "historical admission session retention changed from {} to {}; reopen the pass against the current manifest",
+                self.retention.as_str(),
+                current_retention.as_str()
+            )));
+        }
+        let mut batch = self.begin_batch(vault)?;
+        let mut prepared = self.prepare(snapshot, vault, runtime, options, &mut batch)?;
+        let Some(group) = prepared.take_write_group() else {
+            return prepared.complete(vault, batch.snapshot(), None, None);
+        };
+        let commit = vault.write_ledger_bound_groups_if_seq(batch.snapshot(), vec![group])?;
+        let mut receipts = commit.groups;
+        let receipt = receipts.pop().ok_or_else(|| {
+            readback_mismatch("historical group commit returned no logical receipt")
+        })?;
+        if !receipts.is_empty() {
+            return Err(readback_mismatch(format!(
+                "historical single-group commit returned {} extra logical receipts",
+                receipts.len()
+            )));
+        }
+        vault.flush()?;
+        let wanted = BTreeSet::from([receipt.ledger_ref.seq]);
+        let (rows, _) = vault.read_physical_ledger_seqs(&wanted)?;
+        prepared.complete(vault, commit.seq, Some(receipt), Some(&rows))
+    }
+
+    /// Starts one stable, bounded historical admission window.
+    pub fn begin_batch<C>(
+        &self,
+        vault: &AsterVault<C>,
+    ) -> IngestResult<HistoricalSymbolAdmissionBatch>
+    where
+        C: Clock,
+    {
+        let current_retention = vault.input_retention()?;
+        if current_retention != self.retention {
+            return Err(invalid_sqlite(format!(
+                "historical admission session retention changed from {} to {}; reopen the pass against the current manifest",
+                self.retention.as_str(),
+                current_retention.as_str()
+            )));
+        }
+        Ok(HistoricalSymbolAdmissionBatch {
+            snapshot: vault.latest_seq(),
+            staged_cx: BTreeMap::new(),
+            staged_input_hashes: BTreeSet::new(),
+        })
+    }
+
+    /// Prepares one snapshot into a caller-owned ordered commit window without
+    /// writing, flushing, or independently reopening any persistent file.
+    pub fn prepare<C, R>(
+        &self,
+        snapshot: &CbmGraphSnapshot,
+        vault: &AsterVault<C>,
+        runtime: &R,
+        options: &SqliteImportOptions,
+        batch: &mut HistoricalSymbolAdmissionBatch,
+    ) -> IngestResult<PreparedHistoricalSymbolAdmission>
+    where
+        C: Clock,
+        R: SlotRuntime + Sync,
+    {
+        if options.panel_version != self.panel_version {
+            return Err(invalid_sqlite(format!(
+                "historical admission session panel version {} does not match snapshot option {}",
+                self.panel_version, options.panel_version
+            )));
+        }
+        let current_retention = vault.input_retention()?;
+        if current_retention != self.retention {
+            return Err(invalid_sqlite(format!(
+                "historical admission session retention changed from {} to {}; reopen the pass against the current manifest",
+                self.retention.as_str(),
+                current_retention.as_str()
+            )));
+        }
+        let current = vault.latest_seq();
+        if current != batch.snapshot {
+            return Err(readback_mismatch(format!(
+                "historical admission window snapshot {} drifted to {current} before commit; discard and rebuild the complete window",
+                batch.snapshot
+            )));
+        }
+        prepare_historical_symbol_snapshot_with_session(
+            snapshot, vault, runtime, options, self, batch,
+        )
+    }
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Serialize)]
@@ -1489,8 +1695,23 @@ where
     C: Clock,
     R: SlotRuntime + Sync,
 {
+    let session = HistoricalSymbolAdmissionSession::open(vault, options.panel_version)?;
+    session.admit(snapshot, vault, runtime, options)
+}
+
+fn prepare_historical_symbol_snapshot_with_session<C, R>(
+    snapshot: &CbmGraphSnapshot,
+    vault: &AsterVault<C>,
+    runtime: &R,
+    options: &SqliteImportOptions,
+    session: &HistoricalSymbolAdmissionSession,
+    batch: &mut HistoricalSymbolAdmissionBatch,
+) -> IngestResult<PreparedHistoricalSymbolAdmission>
+where
+    C: Clock,
+    R: SlotRuntime + Sync,
+{
     validate_options(options)?;
-    ensure_no_legacy_series_state(vault)?;
     if options.commit.trim().is_empty() {
         return Err(invalid_sqlite(
             "historical symbol admission requires a non-empty real Git commit",
@@ -1518,17 +1739,15 @@ where
         ));
     }
 
-    let driver = PanelDriver::new(options.panel_version)?;
     // #446: historical symbols retain their canonical input bytes under the
     // same vault-manifest knob as the live import path.
-    let retention = vault.input_retention()?;
     let mut prepared = prepare_constellations_parallel(
         vault,
         runtime,
         options,
-        &driver,
+        &session.driver,
         non_structural,
-        retention,
+        session.retention,
     )?;
     prepared.sort_by(|left, right| {
         left.symbol
@@ -1566,13 +1785,13 @@ where
             cx_id: symbol.identity.cx_id,
         })
         .collect::<Vec<_>>();
-    let snapshot_seq = vault.latest_seq();
+    let snapshot_seq = batch.snapshot;
     let mut rows = Vec::new();
     let mut constellations_written = 0usize;
     let mut constellations_reused = 0usize;
     // #446: mirrors the live import path — input rows commit atomically with
     // their historical Base records under the vault's declared retention knob.
-    let mut staged_input_hashes = BTreeSet::new();
+    let mut new_staged_input_hashes = BTreeSet::new();
     // #497: content-addressed intra-batch dedup. Two implicated nodes in one
     // historical commit can canonicalize to a single CxId (in shadow/fast mode the
     // canonical inputs carry no body content, so the same symbol observed as two
@@ -1585,11 +1804,12 @@ where
     // readback (ASTRO_FSV_READBACK_MISMATCH). Admit the content once and count the
     // rest as reused. Fail closed only on a genuine hash collision — a shared CxId
     // whose canonical bytes actually differ — which must never be silently merged.
-    let mut staged_canonical: BTreeMap<CxId, [u8; 32]> = BTreeMap::new();
+    let mut new_staged_cx = BTreeMap::new();
     for symbol in &prepared {
         let cx_id = symbol.identity.cx_id;
         let key = base_key(cx_id);
         let canonical_hash = *blake3::hash(&symbol.identity.canonical_input_bytes).as_bytes();
+        let semantic_hash = historical_constellation_semantic_hash(symbol)?;
         // Cross-batch reuse: an earlier commit already persisted this content.
         if vault
             .read_cf_at(snapshot_seq, ColumnFamily::Base, &key)?
@@ -1600,13 +1820,18 @@ where
             continue;
         }
         // Intra-batch dedup (#497): this content is already staged in this commit.
-        if let Some(prior_hash) = staged_canonical.get(&cx_id) {
-            if *prior_hash != canonical_hash {
+        if let Some(prior) = new_staged_cx
+            .get(&cx_id)
+            .or_else(|| batch.staged_cx.get(&cx_id))
+        {
+            if prior.canonical_hash != canonical_hash || prior.semantic_hash != semantic_hash {
                 return Err(invalid_sqlite(format!(
-                    "historical CxId {cx_id} maps two distinct canonical inputs in one snapshot \
-                     (BLAKE3 {} vs {}); refusing to clobber the first write",
-                    hex_lower(prior_hash),
+                    "historical CxId {cx_id} maps incompatible canonical or measured content in one commit window \
+                     (canonical BLAKE3 {} vs {}, semantic BLAKE3 {} vs {}); refusing to clobber the first write",
+                    hex_lower(&prior.canonical_hash),
                     hex_lower(&canonical_hash),
+                    hex_lower(&prior.semantic_hash),
+                    hex_lower(&semantic_hash),
                 )));
             }
             constellations_reused += 1;
@@ -1624,8 +1849,11 @@ where
                 encode::encode_slot_vector(vector)?,
             ));
         }
-        if retention == InputRetention::Persist
-            && staged_input_hashes.insert(symbol.constellation.input_ref.hash)
+        if session.retention == InputRetention::Persist
+            && !batch
+                .staged_input_hashes
+                .contains(&symbol.constellation.input_ref.hash)
+            && new_staged_input_hashes.insert(symbol.constellation.input_ref.hash)
         {
             for row in input_store::encode_input_rows(
                 &symbol.constellation.input_ref.hash,
@@ -1634,20 +1862,27 @@ where
                 rows.push((row.cf, row.key, row.value));
             }
         }
-        staged_canonical.insert(cx_id, canonical_hash);
+        new_staged_cx.insert(
+            cx_id,
+            StagedHistoricalCx {
+                canonical_hash,
+                semantic_hash,
+            },
+        );
         constellations_written += 1;
     }
     let rows_written = rows.len();
+    let constellation_inputs = prepared.len();
     if rows.is_empty() {
-        return Ok(HistoricalSymbolAdmissionReport {
+        return Ok(PreparedHistoricalSymbolAdmission {
             locations,
-            constellation_inputs: prepared.len(),
+            constellation_inputs,
             constellations_written,
             rows_written,
             constellations_reused,
-            seq: snapshot_seq,
-            ledger_ref: None,
-            fsv: None,
+            snapshot: snapshot_seq,
+            group: None,
+            expected_entry: None,
         });
     }
 
@@ -1657,49 +1892,157 @@ where
         project_hash_sha256: hex_lower(&sha256_digest(options.project.as_bytes())),
         commit_hash_sha256: hex_lower(&sha256_digest(options.commit.as_bytes())),
         location_digest: hex_lower(blake3::hash(&location_digest).as_bytes()),
-        constellation_inputs: prepared.len() as u64,
+        constellation_inputs: constellation_inputs as u64,
         constellations_written: constellations_written as u64,
         rows_written: rows_written as u64,
         constellations_reused: constellations_reused as u64,
     })?;
     let subject = SubjectId::Query(blake3::hash(&location_digest).as_bytes().to_vec());
     let actor = ActorId::Service(ASTROLABE_INGEST_ACTOR.to_string());
-    let commit = vault.write_cf_batch_with_ledger_entry_with_row_digests(
-        rows,
-        EntryKind::Ingest,
-        subject.clone(),
-        payload,
-        actor.clone(),
-    )?;
-    let commit_seq = commit.seq;
-    let ledger_ref = ledger_ref_at_commit(vault, commit_seq)?;
-    if ledger_ref != commit.ledger_ref {
-        return Err(IngestError::InvalidInput(format!(
-            "group-commit ledger receipt diverged from persisted ledger at seq {commit_seq}"
-        )));
-    }
-    let mut fsv_plan = VaultMutationPlan::new(
-        "admit_historical_symbol_snapshot",
-        EntryKind::Ingest,
-        &actor,
-        &subject,
-    );
-    for row in commit.data_row_digests {
-        fsv_plan.push_content_hash(row.cf, row.key, row.value_blake3);
-    }
-    vault.flush()?;
-    let fsv = fsv_plan.verify_committed(vault, commit_seq)?;
+    let entry = LedgerEntryInput::new(EntryKind::Ingest, subject.clone(), payload, actor.clone());
+    batch.staged_cx.extend(new_staged_cx);
+    batch.staged_input_hashes.extend(new_staged_input_hashes);
 
-    Ok(HistoricalSymbolAdmissionReport {
+    Ok(PreparedHistoricalSymbolAdmission {
         locations,
-        constellation_inputs: prepared.len(),
+        constellation_inputs,
         constellations_written,
         rows_written,
         constellations_reused,
-        seq: commit_seq,
-        ledger_ref: Some(ledger_ref),
-        fsv: Some(fsv),
+        snapshot: snapshot_seq,
+        group: Some(LedgerBoundWriteGroup::new(rows, entry.clone())),
+        expected_entry: Some(entry),
     })
+}
+
+impl PreparedHistoricalSymbolAdmission {
+    /// Finalizes this admission from its exact group receipt and a separately
+    /// opened physical Ledger row map.
+    pub fn complete<C>(
+        self,
+        vault: &AsterVault<C>,
+        commit_seq: Seq,
+        receipt: Option<LedgerBoundGroupReceipt>,
+        ledger_rows: Option<&BTreeMap<u64, LedgerRow>>,
+    ) -> IngestResult<HistoricalSymbolAdmissionReport>
+    where
+        C: Clock,
+    {
+        let (ledger_ref, fsv) = match (self.expected_entry, receipt, ledger_rows) {
+            (None, None, None) => (None, None),
+            (Some(expected), Some(receipt), Some(rows)) => {
+                let physical = rows.get(&receipt.ledger_ref.seq).ok_or_else(|| {
+                    readback_mismatch(format!(
+                        "physical Ledger readback omitted historical Ingest seq {}",
+                        receipt.ledger_ref.seq
+                    ))
+                })?;
+                let entry = decode(&physical.bytes)?;
+                if !entry.verify()
+                    || entry.seq != receipt.ledger_ref.seq
+                    || entry.entry_hash != receipt.ledger_ref.hash
+                    || entry.kind != expected.kind
+                    || entry.subject != expected.subject
+                    || entry.payload != expected.payload
+                    || entry.actor != expected.actor
+                {
+                    return Err(readback_mismatch(format!(
+                        "historical Ingest seq {} failed exact hash/kind/subject/payload/actor physical readback",
+                        receipt.ledger_ref.seq
+                    )));
+                }
+                let mut plan = VaultMutationPlan::new(
+                    "admit_historical_symbol_snapshot",
+                    EntryKind::Ingest,
+                    &expected.actor,
+                    &expected.subject,
+                );
+                for row in &receipt.data_row_digests {
+                    if row.tombstoned {
+                        plan.push_tombstoned_hash(row.cf, row.key.clone(), row.value_blake3);
+                    } else {
+                        plan.push_content_hash(row.cf, row.key.clone(), row.value_blake3);
+                    }
+                }
+                let ack = plan.verify_committed_with_ledger_bytes(
+                    vault,
+                    commit_seq,
+                    &receipt.ledger_ref,
+                    &physical.bytes,
+                )?;
+                (Some(receipt.ledger_ref), Some(ack))
+            }
+            _ => {
+                return Err(readback_mismatch(
+                    "historical admission completion received an incomplete or unexpected receipt/readback tuple",
+                ));
+            }
+        };
+        Ok(HistoricalSymbolAdmissionReport {
+            locations: self.locations,
+            constellation_inputs: self.constellation_inputs,
+            constellations_written: self.constellations_written,
+            rows_written: self.rows_written,
+            constellations_reused: self.constellations_reused,
+            seq: commit_seq,
+            ledger_ref,
+            fsv,
+        })
+    }
+}
+
+fn historical_constellation_semantic_hash(
+    prepared: &PreparedConstellation,
+) -> IngestResult<[u8; 32]> {
+    let constellation = &prepared.constellation;
+    let mut bytes = Vec::new();
+    let vault_id = constellation.vault_id.to_string();
+    for field in [
+        constellation.cx_id.as_bytes().as_slice(),
+        vault_id.as_bytes(),
+        constellation.input_ref.hash.as_slice(),
+        prepared.identity.canonical_input_bytes.as_slice(),
+    ] {
+        bytes.extend_from_slice(&(field.len() as u64).to_be_bytes());
+        bytes.extend_from_slice(field);
+    }
+    bytes.extend_from_slice(&constellation.panel_version.to_be_bytes());
+    bytes.push(u8::from(constellation.input_ref.redacted));
+    let modality = serde_json::to_vec(&constellation.modality)?;
+    bytes.extend_from_slice(&(modality.len() as u64).to_be_bytes());
+    bytes.extend_from_slice(&modality);
+    for (name, value) in &constellation.scalars {
+        bytes.extend_from_slice(&(name.len() as u64).to_be_bytes());
+        bytes.extend_from_slice(name.as_bytes());
+        bytes.extend_from_slice(&value.to_bits().to_be_bytes());
+    }
+    for (slot, vector) in &constellation.slots {
+        bytes.extend_from_slice(&slot.0.to_be_bytes());
+        let encoded = encode::encode_slot_vector(vector)?;
+        bytes.extend_from_slice(&(encoded.len() as u64).to_be_bytes());
+        bytes.extend_from_slice(&encoded);
+    }
+    for key in [
+        "astrolabe_schema",
+        "qualified_name",
+        "label",
+        "symbol_canonical_schema",
+        "series_id_schema",
+        "series_id",
+        "input_hash_blake3",
+    ] {
+        let value = constellation.metadata.get(key).ok_or_else(|| {
+            invalid_sqlite(format!(
+                "prepared historical constellation {} omitted semantic metadata {key}",
+                prepared.identity.cx_id
+            ))
+        })?;
+        bytes.extend_from_slice(&(key.len() as u64).to_be_bytes());
+        bytes.extend_from_slice(key.as_bytes());
+        bytes.extend_from_slice(&(value.len() as u64).to_be_bytes());
+        bytes.extend_from_slice(value.as_bytes());
+    }
+    Ok(*blake3::hash(&bytes).as_bytes())
 }
 
 fn historical_location_digest(locations: &[HistoricalSymbolLocation]) -> Vec<u8> {
@@ -4072,36 +4415,23 @@ where
         }
         owned_chunks.push(chunk);
     }
-    thread::scope(|scope| {
-        let handles = owned_chunks
+    let prepared_chunks = parallel_map(owned_chunks, worker_count, |chunk| {
+        chunk
             .into_iter()
-            .map(|chunk| {
-                scope.spawn(move || {
-                    chunk
-                        .into_iter()
-                        .map(|node| {
-                            prepare_live_symbol(
-                                vault,
-                                runtime,
-                                options,
-                                driver,
-                                node,
-                                digest_reuse,
-                                retention,
-                            )
-                        })
-                        .collect::<IngestResult<Vec<_>>>()
-                })
+            .map(|node| {
+                prepare_live_symbol(
+                    vault,
+                    runtime,
+                    options,
+                    driver,
+                    node,
+                    digest_reuse,
+                    retention,
+                )
             })
-            .collect::<Vec<_>>();
-        let mut out = Vec::new();
-        for handle in handles {
-            out.extend(handle.join().map_err(|_| {
-                IngestError::InvalidInput("parallel live-symbol preparation panicked".into())
-            })??);
-        }
-        Ok(out)
-    })
+            .collect::<IngestResult<Vec<_>>>()
+    })?;
+    Ok(prepared_chunks.into_iter().flatten().collect())
 }
 
 fn prepare_live_symbol<C, R>(
@@ -4277,28 +4607,13 @@ where
         }
         owned_chunks.push(chunk);
     }
-    thread::scope(|scope| {
-        let mut handles = Vec::new();
-        for chunk in owned_chunks {
-            handles.push(scope.spawn(move || {
-                chunk
-                    .into_iter()
-                    .map(|node| {
-                        prepare_constellation(vault, runtime, options, driver, node, retention)
-                    })
-                    .collect::<IngestResult<Vec<_>>>()
-            }));
-        }
-        let mut out = Vec::new();
-        for handle in handles {
-            out.extend(
-                handle
-                    .join()
-                    .map_err(|_| IngestError::InvalidInput("parallel import panicked".into()))??,
-            );
-        }
-        Ok(out)
-    })
+    let prepared_chunks = parallel_map(owned_chunks, worker_count, |chunk| {
+        chunk
+            .into_iter()
+            .map(|node| prepare_constellation(vault, runtime, options, driver, node, retention))
+            .collect::<IngestResult<Vec<_>>>()
+    })?;
+    Ok(prepared_chunks.into_iter().flatten().collect())
 }
 
 fn prepare_constellation<C, R>(
@@ -5165,12 +5480,7 @@ where
         actor.clone(),
     )?;
     let commit_seq = commit.seq;
-    let ledger_ref = ledger_ref_at_commit(vault, commit_seq)?;
-    if ledger_ref != commit.ledger_ref {
-        return Err(IngestError::InvalidInput(format!(
-            "group-commit ledger receipt diverged from persisted ledger at seq {commit_seq}"
-        )));
-    }
+    let ledger_ref = commit.ledger_ref.clone();
     write_timing_ms.push((
         "write_import_rows.group_commit",
         sub_phase.elapsed().as_millis() as u64,
@@ -5190,7 +5500,7 @@ where
         sub_phase.elapsed().as_millis() as u64,
     ));
     sub_phase = std::time::Instant::now();
-    let fsv = fsv_plan.verify_committed(vault, commit_seq)?;
+    let fsv = fsv_plan.verify_committed_with_ledger_ref(vault, commit_seq, &ledger_ref)?;
     write_timing_ms.push((
         "write_import_rows.fsv_verify",
         sub_phase.elapsed().as_millis() as u64,
@@ -5202,35 +5512,6 @@ where
         edge_rows_written,
         write_timing_ms,
     ))
-}
-
-/// Recovers the ledger reference for the group commit that produced `commit_seq`.
-///
-/// The read is pinned to `commit_seq`, so the newest *pairable* Ledger CF row at that
-/// snapshot is the entry this commit staged, regardless of concurrent cross-process appends
-/// that land at later snapshots. Periodic system checkpoint entries interleaving inside the
-/// same commit at checkpoint-interval boundaries are skipped exactly (#495). Fails closed if
-/// the ledger key and encoded entry seq disagree.
-fn ledger_ref_at_commit<C>(vault: &AsterVault<C>, commit_seq: Seq) -> IngestResult<LedgerRef>
-where
-    C: Clock,
-{
-    let (key, value) = calyx_aster::ledger_view::newest_pairable_ledger(
-        vault.scan_cf_at(commit_seq, ColumnFamily::Ledger)?,
-    )?
-    .ok_or_else(|| readback_mismatch("Ledger CF empty at import commit snapshot"))?;
-    let key_seq = parse_aster_ledger_seq(&key)?;
-    let entry = decode(&value)?;
-    if entry.seq != key_seq {
-        return Err(readback_mismatch(format!(
-            "Ledger CF key seq {key_seq} does not match encoded entry seq {}",
-            entry.seq
-        )));
-    }
-    Ok(LedgerRef {
-        seq: entry.seq,
-        hash: entry.entry_hash,
-    })
 }
 
 fn verify_import_readback<C>(

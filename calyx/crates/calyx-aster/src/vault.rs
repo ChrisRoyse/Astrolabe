@@ -23,6 +23,7 @@ pub mod keyspace;
 mod layer_commit;
 mod ledger_anchor_batch;
 mod ledger_append;
+mod ledger_bound_group_batch;
 mod ledger_hook;
 pub mod ledger_stub;
 mod open;
@@ -36,11 +37,14 @@ mod slot_column;
 mod snapshot_lease;
 mod store;
 mod temporal_xterm;
-use crate::cf::{CfRouter, ColumnFamily, KeyRange, anchor_key, base_key, slot_key};
+use crate::cf::{
+    CfRouter, ColumnFamily, KeyRange, RouterManifestHandoffReport, anchor_key, base_key, slot_key,
+};
 use crate::dedup::DedupPolicy;
 use crate::file_lock::FileLockGuard;
 use crate::mvcc::{Freshness, ReadBarrier, Snapshot, VersionedCfStore};
 use crate::resource::{ResourceStatus, VramBudgetStatus, collect_resource_status};
+use crate::sst::SstSummary;
 use crate::timetravel::RetentionHorizon;
 use crate::vault::durable::DurableVault;
 use crate::vault::ledger_hook::AsterLedgerHook;
@@ -68,6 +72,9 @@ pub use keyspace::{
     CALYX_VAULT_KEYSPACE_MISMATCH, KeyspaceGuard, VaultWriteLock, VaultWriteLockGuard, vault_prefix,
 };
 pub use ledger_append::CALYX_ASTER_RAW_LEDGER_COMMIT_BOUNDARY;
+pub use ledger_bound_group_batch::{
+    LedgerBoundGroupBatchReceipt, LedgerBoundGroupReceipt, LedgerBoundWriteGroup,
+};
 pub use quota::{CALYX_QUOTA_EXCEEDED, QuotaConfig, QuotaGuard};
 pub use slot_column::{
     SlotColumnManifest, SlotColumnMaterialization, SlotColumnReadback, SlotColumnRow,
@@ -98,6 +105,110 @@ pub struct LedgerBoundCommit {
     /// Digests of committed data rows after provenance binding, excluding the
     /// internal Ledger and time-index rows.
     pub data_row_digests: Vec<LedgerBoundRowDigest>,
+}
+
+/// Physical SST publication receipt for one explicit vault flush.
+///
+/// Durable checkpoint files and router memtable files are reported separately
+/// so callers can measure write amplification from persisted bytes rather than
+/// infer it from a successful return value. Paths name this vault's exact CF
+/// directories; no rows or value buffers are retained by the receipt.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct VaultFlushReport {
+    /// Manifest-covered durable-batch SSTs written by the checkpoint layer.
+    pub durable_ssts: Vec<SstSummary>,
+    /// Router memtable SSTs written for the live latest-state view.
+    /// Durable vaults use `router_handoff` instead and leave this empty.
+    pub router_ssts: Vec<SstSummary>,
+    /// Manifest-bound durable-to-router reconciliation for durable vaults.
+    pub router_handoff: Option<VaultRouterHandoffReport>,
+}
+
+impl VaultFlushReport {
+    /// Total number of physical SST files published by this flush.
+    pub fn sst_files(&self) -> usize {
+        self.durable_ssts.len() + self.router_ssts.len()
+    }
+
+    /// Total encoded rows across all physical SST files in this flush.
+    pub fn sst_entries(&self) -> usize {
+        self.durable_ssts
+            .iter()
+            .chain(&self.router_ssts)
+            .map(|summary| summary.entries)
+            .sum()
+    }
+
+    /// Total physical SST bytes published by this flush.
+    pub fn sst_bytes(&self) -> u64 {
+        self.durable_ssts
+            .iter()
+            .chain(&self.router_ssts)
+            .map(|summary| summary.bytes)
+            .sum()
+    }
+}
+
+/// Physical receipt for one manifest-bound durable-to-router handoff.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct VaultRouterHandoffReport {
+    /// Exact immutable manifest generation that authorizes the handoff.
+    pub manifest_seq: u64,
+    /// Highest commit sequence covered by that manifest.
+    pub durable_seq: u64,
+    /// Whether an absent/behind marker required a complete CF inventory.
+    pub full_inventory: bool,
+    /// Column families reconciled under the router write lock.
+    pub column_families: usize,
+    /// Immutable SST files retained in the verified candidate levels.
+    pub candidate_sst_files: usize,
+    /// Newly published durable files attached with validated lookup metadata.
+    pub durable_sst_files_attached: usize,
+    /// Active mutable rows independently matched to immutable bytes.
+    pub memtable_rows_verified: usize,
+    /// Covered router-flush files whose rows/order were independently checked.
+    pub flush_sst_files_verified: usize,
+    /// Covered router-flush rows checked before retirement.
+    pub flush_sst_entries_verified: usize,
+    /// Covered router-flush bytes checked before retirement.
+    pub flush_sst_bytes_verified: u64,
+    /// Covered router-flush files removed and read back absent.
+    pub flush_sst_files_retired: usize,
+    /// Covered router-flush bytes removed and read back absent.
+    pub flush_sst_bytes_retired: u64,
+    /// Manifest-covered router-flush debt remaining after readback.
+    pub covered_flush_debt_files_after: usize,
+    /// Manifest-covered router-flush bytes remaining after readback.
+    pub covered_flush_debt_bytes_after: u64,
+    /// Durable completion marker independently read back after publication.
+    pub state_path: PathBuf,
+}
+
+impl VaultRouterHandoffReport {
+    fn from_internal(
+        manifest_seq: u64,
+        durable_seq: u64,
+        state_path: PathBuf,
+        report: RouterManifestHandoffReport,
+    ) -> Self {
+        Self {
+            manifest_seq,
+            durable_seq,
+            full_inventory: report.full_inventory,
+            column_families: report.column_families,
+            candidate_sst_files: report.candidate_sst_files,
+            durable_sst_files_attached: report.durable_sst_files_attached,
+            memtable_rows_verified: report.memtable_rows_verified,
+            flush_sst_files_verified: report.flush_sst_files_verified,
+            flush_sst_entries_verified: report.flush_sst_entries_verified,
+            flush_sst_bytes_verified: report.flush_sst_bytes_verified,
+            flush_sst_files_retired: report.flush_sst_files_retired,
+            flush_sst_bytes_retired: report.flush_sst_bytes_retired,
+            covered_flush_debt_files_after: report.covered_flush_debt_files_after,
+            covered_flush_debt_bytes_after: report.covered_flush_debt_bytes_after,
+            state_path,
+        }
+    }
 }
 
 const DEFAULT_LEASE_MS: u64 = 5_000;
@@ -174,6 +285,60 @@ pub struct VaultPhaseUsage {
     pub working_set_bytes_after: u64,
     /// Process peak working-set bytes sampled after the phase.
     pub peak_working_set_bytes_after: u64,
+    /// Process private committed bytes sampled after the phase.
+    pub private_bytes_after: u64,
+    /// Process peak private committed bytes sampled after the phase.
+    pub peak_private_bytes_after: u64,
+}
+
+/// One native process-counter snapshot for explicit pipeline attribution.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct VaultProcessUsage {
+    /// Cumulative kernel-mode CPU time, in 100 ns units.
+    pub kernel_time_100ns: u64,
+    /// Cumulative user-mode CPU time, in 100 ns units.
+    pub user_time_100ns: u64,
+    /// Cumulative process read operations.
+    pub read_operations: u64,
+    /// Cumulative process read-transfer bytes.
+    pub read_bytes: u64,
+    /// Cumulative process write operations.
+    pub write_operations: u64,
+    /// Cumulative process write-transfer bytes.
+    pub write_bytes: u64,
+    /// Cumulative page faults.
+    pub page_faults: u64,
+    /// Current working-set bytes.
+    pub working_set_bytes: u64,
+    /// Peak working-set bytes since process start.
+    pub peak_working_set_bytes: u64,
+    /// Current private committed bytes.
+    pub private_bytes: u64,
+    /// Peak private committed bytes since process start.
+    pub peak_private_bytes: u64,
+}
+
+impl VaultProcessUsage {
+    /// Attributes cumulative-counter deltas and end-state memory to one phase.
+    pub fn phase_since(self, before: Self) -> VaultPhaseUsage {
+        VaultPhaseUsage {
+            kernel_time_100ns: self
+                .kernel_time_100ns
+                .saturating_sub(before.kernel_time_100ns),
+            user_time_100ns: self.user_time_100ns.saturating_sub(before.user_time_100ns),
+            read_operations: self.read_operations.saturating_sub(before.read_operations),
+            read_bytes: self.read_bytes.saturating_sub(before.read_bytes),
+            write_operations: self
+                .write_operations
+                .saturating_sub(before.write_operations),
+            write_bytes: self.write_bytes.saturating_sub(before.write_bytes),
+            page_faults: self.page_faults.saturating_sub(before.page_faults),
+            working_set_bytes_after: self.working_set_bytes,
+            peak_working_set_bytes_after: self.peak_working_set_bytes,
+            private_bytes_after: self.private_bytes,
+            peak_private_bytes_after: self.peak_private_bytes,
+        }
+    }
 }
 
 impl AsterVault<SystemClock> {
@@ -335,6 +500,12 @@ where
         self.open_diagnostics
     }
 
+    /// Samples native CPU, I/O, page-fault, working-set, and private-memory
+    /// counters for explicit pipeline-phase attribution.
+    pub fn process_usage_snapshot(&self) -> Result<VaultProcessUsage> {
+        open::current_process_usage()
+    }
+
     pub fn vault_id(&self) -> VaultId {
         self.vault_id
     }
@@ -386,16 +557,61 @@ where
     }
 
     pub fn flush(&self) -> Result<()> {
+        self.flush_with_report().map(|_| ())
+    }
+
+    /// Flushes pending durable and router state and returns exact physical SST
+    /// publication metadata for independent accounting.
+    pub fn flush_with_report(&self) -> Result<VaultFlushReport> {
         self.with_durable_commit_lock(|| self.flush_locked())
     }
 
-    pub(crate) fn flush_locked(&self) -> Result<()> {
+    pub(crate) fn flush_locked(&self) -> Result<VaultFlushReport> {
         self.ensure_writeable("flush")?;
-        if let Some(durable) = &self.durable {
-            durable.flush()?;
+        let Some(durable) = &self.durable else {
+            return Ok(VaultFlushReport {
+                durable_ssts: Vec::new(),
+                router_ssts: self.rows.flush_all_cfs()?,
+                router_handoff: None,
+            });
+        };
+
+        let before = durable.current_manifest_identity()?;
+        let full_inventory = durable.router_handoff_needs_full_inventory(before.as_ref())?;
+        let durable_ssts = durable.flush()?;
+        let Some(after) = durable.current_manifest_identity()? else {
+            if durable_ssts.is_empty() {
+                return Ok(VaultFlushReport {
+                    durable_ssts,
+                    router_ssts: Vec::new(),
+                    router_handoff: None,
+                });
+            }
+            return Err(CalyxError::aster_corrupt_shard(
+                "durable checkpoint SSTs were published while CURRENT remained absent",
+            ));
+        };
+        if after.durable_seq != self.latest_seq() {
+            return Err(CalyxError::aster_corrupt_shard(format!(
+                "router handoff requires manifest durable_seq {} to equal live latest seq {}",
+                after.durable_seq,
+                self.latest_seq()
+            )));
         }
-        self.rows.flush_all_cfs()?;
-        Ok(())
+        let internal =
+            self.rows
+                .handoff_manifested_ssts(after.durable_seq, full_inventory, &durable_ssts)?;
+        let state_path = durable.publish_router_handoff(&after)?;
+        Ok(VaultFlushReport {
+            durable_ssts,
+            router_ssts: Vec::new(),
+            router_handoff: Some(VaultRouterHandoffReport::from_internal(
+                after.manifest_seq,
+                after.durable_seq,
+                state_path,
+                internal,
+            )),
+        })
     }
 
     /// Pins an explicit reader lease tracked for oldest-pinned-seq accounting.

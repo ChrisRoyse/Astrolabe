@@ -156,7 +156,7 @@ where
     }
 }
 
-fn digest_rows(rows: &[encode::WriteRow]) -> Vec<LedgerBoundRowDigest> {
+pub(super) fn digest_rows(rows: &[encode::WriteRow]) -> Vec<LedgerBoundRowDigest> {
     rows.iter()
         .map(|row| LedgerBoundRowDigest {
             cf: row.cf,
@@ -174,7 +174,10 @@ fn staged_ledger_ref(staged: &[calyx_ledger::StagedLedgerRow]) -> Result<calyx_c
         .ok_or_else(|| CalyxError::ledger_group_commit_failed("no staged ledger rows"))
 }
 
-fn attach_ledger_ref_to_rows(rows: &mut [encode::WriteRow], ledger_ref: &LedgerRef) -> Result<()> {
+pub(super) fn attach_ledger_ref_to_rows(
+    rows: &mut [encode::WriteRow],
+    ledger_ref: &LedgerRef,
+) -> Result<()> {
     for row in rows.iter_mut().filter(|row| row.cf == ColumnFamily::Base) {
         // Stamp the ledger ref through the lossless BaseRecord so the immutable
         // per-slot BLAKE3 hashes staged by the caller survive this rewrite

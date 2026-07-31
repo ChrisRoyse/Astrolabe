@@ -2,6 +2,7 @@ mod checkpointing;
 mod manifest_ops;
 mod recovery_readback;
 pub(in crate::vault) mod router_coverage;
+mod router_handoff_state;
 
 use recovery_readback::read_manifested_batches;
 
@@ -12,6 +13,7 @@ use crate::dedup::DedupPolicy;
 use crate::manifest::{recover_vault, recover_vault_read_only};
 use crate::pressure::DiskPressureGuard;
 use crate::resource::ResourceCounters;
+use crate::sst::SstSummary;
 use crate::timetravel::RetentionHorizon;
 use crate::wal::{GroupCommitBatcher, WalOptions, replay_dir, replay_dir_read_only_after};
 use calyx_core::{CalyxError, Panel, Result, SystemClock, TemporalPolicy};
@@ -358,7 +360,7 @@ impl DurableVault {
             .fetch_max(seq, Ordering::AcqRel);
     }
 
-    pub(super) fn flush(&self) -> Result<()> {
+    pub(super) fn flush(&self) -> Result<Vec<SstSummary>> {
         self.batcher.flush_sync()?;
         self.flush_pending_checkpoints()
     }

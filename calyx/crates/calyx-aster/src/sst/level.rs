@@ -2,7 +2,7 @@ use super::page;
 use super::{SstEntry, SstKeyState, SstLookupMetadata, SstReader};
 use calyx_core::Result;
 use rayon::prelude::*;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -80,6 +80,35 @@ impl SstLevel {
         Ok(())
     }
 
+    /// Reconciles an oldest-first physical inventory while retaining validated
+    /// lookup metadata for byte-identical paths that were already attached.
+    /// Paths named in `refresh` are reopened even when their names match; this
+    /// is required when a recovered checkpoint republishes a canonical batch
+    /// path before the manifest-bound router handoff observes it.
+    pub(crate) fn reconcile_oldest_first_with_lookup(
+        &self,
+        paths: impl IntoIterator<Item = PathBuf>,
+        refresh: &BTreeSet<PathBuf>,
+    ) -> Result<Self> {
+        let existing = self
+            .files
+            .iter()
+            .map(|file| (file.path.clone(), file.clone()))
+            .collect::<BTreeMap<_, _>>();
+        let mut files = Vec::new();
+        for path in paths {
+            let file = if !refresh.contains(&path) {
+                existing.get(&path).cloned()
+            } else {
+                None
+            }
+            .map_or_else(|| LevelFile::with_lookup(path), Ok)?;
+            files.push(file);
+        }
+        files.reverse();
+        Ok(Self { files })
+    }
+
     pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
         for file in &self.files {
             if !file.may_contain(key) {
@@ -88,6 +117,20 @@ impl SstLevel {
             let reader = file.open_reader()?;
             if let Some(value) = reader.get(key)? {
                 return Ok(Some(value));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Returns the newest value and the exact immutable file that supplied it.
+    pub(crate) fn get_with_source(&self, key: &[u8]) -> Result<Option<(Vec<u8>, PathBuf)>> {
+        for file in &self.files {
+            if !file.may_contain(key) {
+                continue;
+            }
+            let reader = file.open_reader()?;
+            if let Some(value) = reader.get(key)? {
+                return Ok(Some((value, file.path.clone())));
             }
         }
         Ok(None)
@@ -212,5 +255,10 @@ impl SstLevel {
 
     pub fn file_count(&self) -> usize {
         self.files.len()
+    }
+
+    /// Immutable physical paths in newest-first lookup order.
+    pub(crate) fn paths(&self) -> impl Iterator<Item = &std::path::Path> {
+        self.files.iter().map(|file| file.path.as_path())
     }
 }

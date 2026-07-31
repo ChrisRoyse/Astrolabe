@@ -7,19 +7,26 @@ use astrolabe_anchors::archaeology::{
     GitArchaeologyConfig, GitLineRange, GitMineMode, mine_git_archaeology,
 };
 use astrolabe_anchors::{
-    OutcomeAnchorRequest, OutcomeKind, OutcomeSubject, ingest_outcome_anchors,
+    OutcomeAnchorBatchItem, OutcomeAnchorRequest, OutcomeKind, OutcomeSubject,
+    PreparedOutcomeAnchorBatch, prepare_outcome_anchor_batch,
 };
 use astrolabe_bridge::{
     CbmIndexMode, CbmPipeline, CbmPipelineEdgeRow, CbmPipelineFileHashRow, CbmPipelineNodeRow,
-    CbmPipelineRowManifest, CbmPipelineRows,
+    CbmPipelineRowManifest, CbmPipelineRows, discover_pipeline_files,
 };
 // #502: share the clone farm's #480 Windows-invalid-path classifier so the historical
 // checkout and the farm never disagree on what NTFS can hold.
 use astrolabe_fleet::clone_farm::windows_invalid_path;
-use astrolabe_ingest::{HistoricalSymbolLocation, admit_historical_symbol_snapshot};
-use calyx_core::{AnchorKind, AnchorValue};
+use astrolabe_ingest::{
+    HistoricalSymbolAdmissionBatch, HistoricalSymbolAdmissionSession, HistoricalSymbolLocation,
+    PreparedHistoricalSymbolAdmission,
+};
+use calyx_aster::vault::{LedgerBoundGroupReceipt, LedgerBoundWriteGroup, VaultPhaseUsage};
+use calyx_core::{AnchorKind, AnchorValue, CxId};
 
 const ARCHAEOLOGY_ACTOR: &str = "astrolabe-git-archaeology";
+const ARCHAEOLOGY_ANCHOR_BATCH_ENV: &str = "ASTRO_ARCHAEOLOGY_ANCHOR_BATCH_ENTRIES";
+const ARCHAEOLOGY_HISTORICAL_BATCH_ENV: &str = "ASTRO_ARCHAEOLOGY_HISTORICAL_BATCH_GROUPS";
 
 /// Write-side prefix for the transient git-archaeology scratch STORE this module
 /// drops into the CBM store dir: the historical-index scratch database
@@ -70,6 +77,7 @@ const _: () = {
 /// Windows current-directory budget.
 const ARCHAEOLOGY_ROOT_ENV: &str = "ASTRO_ARCHAEOLOGY_ROOT";
 const ARCHAEOLOGY_SCOPE_SCHEMA: &str = "astrolabe.archaeology-scratch-scope.v1";
+/// Strict per-process override for the registry-declared ordered anchor batch.
 
 /// Directory-name prefix for the transient git-archaeology scratch WORKTREE,
 /// rooted under the repo+project-bound compact namespace returned by
@@ -148,6 +156,23 @@ struct Evidence {
     label: &'static str,
 }
 
+#[derive(Debug)]
+struct PendingAnchorAdmission {
+    request: OutcomeAnchorRequest,
+    cx_ids: BTreeMap<String, CxId>,
+}
+
+struct PendingArchaeologyPersistenceGroup {
+    historical: Option<PreparedHistoricalSymbolAdmission>,
+    anchors: Vec<PendingAnchorAdmission>,
+}
+
+struct ArchaeologyPersistenceWindow {
+    historical_batch: HistoricalSymbolAdmissionBatch,
+    groups: Vec<PendingArchaeologyPersistenceGroup>,
+    anchor_entries: usize,
+}
+
 #[derive(Debug, Clone, Default)]
 pub(crate) struct GitArchaeologyImportReport {
     pub(crate) head: String,
@@ -177,6 +202,20 @@ pub(crate) struct GitArchaeologyImportReport {
     /// Each is a counted, labeled mining skip (invariant 3); every other blame
     /// failure stays repo-fatal.
     pub(crate) skipped_unblamable_paths: usize,
+    /// Original SZZ line ranges submitted to Git blame.
+    pub(crate) blame_requested_ranges: usize,
+    /// Exact union ranges after overlap/adjacency coalescing.
+    pub(crate) blame_effective_ranges: usize,
+    /// Native incremental-blame processes spawned.
+    pub(crate) blame_processes: usize,
+    /// Strictly parsed incremental protocol spans.
+    pub(crate) blame_returned_spans: usize,
+    /// Distinct attributed result lines retained.
+    pub(crate) blame_returned_lines: usize,
+    /// Exact incremental-blame stdout volume.
+    pub(crate) blame_stdout_bytes: u64,
+    /// Wall time spent in grouped incremental blame.
+    pub(crate) blame_wall_ms: u64,
     /// Scratch worktrees / SQLite files that survived the bounded cleanup retry
     /// budget and were left on disk. Surfaced as a labeled count (invariant 3):
     /// a cleanup that cannot complete degrades to a counted remnant, never a
@@ -202,6 +241,22 @@ pub(crate) struct GitArchaeologyImportReport {
     /// degradation counted, never a silent skip). A nonzero value means the kernel
     /// still completed but that many historical commits contributed no anchors.
     pub(crate) historical_commits_crashed: usize,
+    /// Git processes used to create commit-bound temporary indexes and enumerate
+    /// their exact paths (two per historical commit).
+    pub(crate) historical_git_inventory_processes: usize,
+    /// Git checkout-index processes used to materialize non-empty commit views.
+    pub(crate) historical_git_checkout_processes: usize,
+    /// Exact files materialized from commit-bound temporary indexes.
+    pub(crate) historical_git_files_materialized: usize,
+    /// Materialized files recognized by the exact libcbm language resolver.
+    pub(crate) historical_git_source_files_materialized: usize,
+    /// Commit views with no recognized source file, routed directly to an explicit
+    /// empty historical result without invoking the extraction worker.
+    pub(crate) historical_commits_without_materialized_source: usize,
+    /// Per-path `git cat-file -e` process launches removed by one index inventory.
+    pub(crate) historical_git_object_probe_processes_avoided: usize,
+    /// Shared-repository worktree registration mutations removed (add + remove).
+    pub(crate) historical_git_worktree_mutations_avoided: usize,
     /// Provenance label for the git history this pass mined (#434, invariant 1/3:
     /// no unlabeled claim, no silent fallback). `own_repo` when the corpus IS its
     /// own git toplevel (`.git` at the corpus root); `parent_repo` when the corpus
@@ -217,6 +272,87 @@ pub(crate) struct GitArchaeologyImportReport {
     /// (#381). `Some("cbm")` for a `parent_repo` corpus; `None` when the corpus is
     /// the whole repository (`own_repo`, unscoped walk).
     pub(crate) pathspec: Option<String>,
+    /// Registry version that declared the ordered anchor batch bound.
+    pub(crate) anchor_batch_registry_version: &'static str,
+    /// Effective maximum logical anchor entries in one atomic commit.
+    pub(crate) anchor_batch_limit: usize,
+    /// Effective maximum historical commit groups in one atomic window.
+    pub(crate) historical_batch_group_limit: usize,
+    /// Historical commit groups prepared for persistence.
+    pub(crate) historical_admission_groups: usize,
+    /// Historical `Ingest` entries that wrote at least one physical row.
+    pub(crate) historical_admission_logical_entries: usize,
+    /// Physical commits containing one or more historical `Ingest` entries.
+    pub(crate) historical_admission_atomic_commits: usize,
+    /// Explicit flushes containing one or more historical `Ingest` entries.
+    pub(crate) historical_admission_flushes: usize,
+    /// Largest historical group window committed in this pass.
+    pub(crate) historical_admission_max_window_groups: usize,
+    /// Historical Base/slot/input rows written across committed windows.
+    pub(crate) historical_admission_rows_written: usize,
+    /// Exact historical `Ingest` Ledger refs independently read from disk.
+    pub(crate) historical_admission_ledger_refs_verified: usize,
+    /// Physical Ledger SST readers opened across shared window readbacks.
+    pub(crate) persistence_ledger_files_opened: usize,
+    /// Requested Ledger rows that required the complete-scan tier.
+    pub(crate) persistence_ledger_complete_scan_wanted: usize,
+    /// Physical persistence commits across combined historical/anchor windows.
+    pub(crate) persistence_atomic_commits: usize,
+    /// Physical flushes across combined historical/anchor windows.
+    pub(crate) persistence_flushes: usize,
+    /// Manifest-covered SST files published across persistence windows.
+    pub(crate) persistence_durable_sst_files: usize,
+    /// Manifest-covered SST rows published across persistence windows.
+    pub(crate) persistence_durable_sst_entries: usize,
+    /// Manifest-covered SST bytes published across persistence windows.
+    pub(crate) persistence_durable_sst_bytes: u64,
+    /// Logical Grounding entries admitted across all anchor batches.
+    pub(crate) anchor_logical_entries: usize,
+    /// Physical atomic commits used for those logical entries.
+    pub(crate) anchor_atomic_commits: usize,
+    /// Explicit vault flushes used for those atomic commits.
+    pub(crate) anchor_flushes: usize,
+    /// Largest logical batch observed during this pass.
+    pub(crate) anchor_max_batch_entries: usize,
+    /// Distinct final Anchors rows physically written across batches.
+    pub(crate) anchor_rows_written: usize,
+    /// Exact hash/sequence-bound Ledger refs independently point-read.
+    pub(crate) anchor_ledger_refs_verified: usize,
+    /// Manifest-covered durable SST files published by anchor flushes.
+    pub(crate) anchor_durable_sst_files: usize,
+    /// Rows encoded in manifest-covered durable SSTs.
+    pub(crate) anchor_durable_sst_entries: usize,
+    /// Bytes encoded in manifest-covered durable SSTs.
+    pub(crate) anchor_durable_sst_bytes: u64,
+    /// Live-router SST files published by anchor flushes.
+    pub(crate) anchor_router_sst_files: usize,
+    /// Rows encoded in live-router SSTs.
+    pub(crate) anchor_router_sst_entries: usize,
+    /// Bytes encoded in live-router SSTs.
+    pub(crate) anchor_router_sst_bytes: u64,
+    /// Handoffs that required a complete physical CF inventory because the
+    /// durable completion marker was absent or behind the current manifest.
+    pub(crate) anchor_router_handoff_full_inventories: usize,
+    /// Active router memtable rows byte-matched to durable SSTs.
+    pub(crate) anchor_router_handoff_memtable_rows_verified: usize,
+    /// Covered router-flush files independently verified before retirement.
+    pub(crate) anchor_router_handoff_flush_files_verified: usize,
+    /// Covered router-flush rows independently verified before retirement.
+    pub(crate) anchor_router_handoff_flush_entries_verified: usize,
+    /// Covered router-flush files physically retired and read back absent.
+    pub(crate) anchor_router_handoff_flush_files_retired: usize,
+    /// Covered router-flush bytes physically retired and read back absent.
+    pub(crate) anchor_router_handoff_flush_bytes_retired: u64,
+    /// Manifest-covered router-flush debt remaining after the latest handoff.
+    pub(crate) anchor_router_handoff_debt_files_after: usize,
+    /// Manifest-covered router-flush debt bytes remaining after the latest handoff.
+    pub(crate) anchor_router_handoff_debt_bytes_after: u64,
+    /// Wall time spent inside ordered anchor group commits, flushes, and readback.
+    pub(crate) anchor_batch_wall_ms: u64,
+    /// Wall time for historical extraction/admission plus anchor persistence.
+    pub(crate) index_loop_wall_ms: u64,
+    /// Native process counter delta and final memory state for the index loop.
+    pub(crate) index_loop_usage: VaultPhaseUsage,
 }
 
 /// Provenance source label for a `parent_repo` corpus (subtree of an enclosing repo).
@@ -235,6 +371,8 @@ pub(crate) fn run_git_archaeology<C: Clock>(
         GitMineMode::Full => "full",
         GitMineMode::Since { .. } => "incremental",
     };
+    let (anchor_batch_limit, historical_batch_group_limit) =
+        preflight_git_archaeology_persistence_limits()?;
     // Member-corpus scoping key (#403 + #381): resolve the requested corpus relative
     // to its git toplevel ONCE, up front. It drives three things: (a) it pathspec-
     // limits the history mine to the member subtree via
@@ -418,9 +556,20 @@ pub(crate) fn run_git_archaeology<C: Clock>(
         // skips — one labeled counter on the persisted summary (invariant 3).
         skipped_gitlink_paths: mined.skipped_gitlink_paths + force_removed_skipped_gitlink,
         skipped_unblamable_paths: mined.skipped_unblamable_paths,
+        blame_requested_ranges: mined.blame.requested_ranges,
+        blame_effective_ranges: mined.blame.effective_ranges,
+        blame_processes: mined.blame.processes,
+        blame_returned_spans: mined.blame.returned_spans,
+        blame_returned_lines: mined.blame.returned_lines,
+        blame_stdout_bytes: mined.blame.stdout_bytes,
+        blame_wall_ms: mined.blame.wall_ms,
         archaeology_source,
         git_root: git_root.clone(),
         pathspec,
+        anchor_batch_registry_version:
+            astrolabe_domain::knobs::ARCHAEOLOGY_PERSIST_KNOB_REGISTRY_VERSION,
+        anchor_batch_limit,
+        historical_batch_group_limit,
         ..GitArchaeologyImportReport::default()
     };
     let worktree_home = scratch_scope.worktree_home;
@@ -441,9 +590,15 @@ pub(crate) fn run_git_archaeology<C: Clock>(
     // + respawned) every [`ARCHAEOLOGY_POOL_RECYCLE_AFTER_DEFAULT`] commits to bound the
     // cumulative C-heap damage of the #515 fault class to one interval.
     let mut pool = HistoricalExtractionPool::new(&scratch_scope.pool_home)?;
+    // One archaeology pass owns one stable vault/panel contract. Reuse its validated
+    // legacy-state decision, panel driver, retention decision, and Rayon's already-live
+    // worker pool across every historical commit instead of cold-loading them per group.
+    let historical_admission = HistoricalSymbolAdmissionSession::open(vault, SHADOW_PANEL_VERSION)?;
     let index_loop_start = std::time::Instant::now();
+    let index_loop_usage_before = vault.process_usage_snapshot()?;
     let mut index_calls = 0usize;
     let mut index_ms_total = 0u128;
+    let mut persistence_window: Option<ArchaeologyPersistenceWindow> = None;
     for (commit, group) in group_evidence_by_commit(&evidence) {
         // #439 file-scoped historical index: the DISTINCT set of subtree-relative
         // implicated files this evidence group touches. Multiple ranges hitting one
@@ -470,6 +625,15 @@ pub(crate) fn run_git_archaeology<C: Clock>(
         }
         report.cleanup_remnants += indexed.cleanup_remnants;
         report.historical_paths_windows_invalid += indexed.windows_invalid_excluded;
+        report.historical_git_inventory_processes += indexed.git_inventory_processes;
+        report.historical_git_checkout_processes += indexed.git_checkout_processes;
+        report.historical_git_files_materialized += indexed.files_materialized;
+        report.historical_git_source_files_materialized += indexed.source_files_materialized;
+        report.historical_commits_without_materialized_source +=
+            usize::from(indexed.source_files_materialized == 0);
+        report.historical_git_object_probe_processes_avoided +=
+            indexed.object_probe_processes_avoided;
+        report.historical_git_worktree_mutations_avoided += 2;
         // #515: the isolated extraction child died on a C-level pipeline fault for
         // this commit's checkout. It is CONTAINED (the host process survives) instead
         // of the pre-#515 in-process fault that hard-exited the whole index_repository
@@ -491,6 +655,21 @@ pub(crate) fn run_git_archaeology<C: Clock>(
             report.evidence_without_symbol += group.len();
             continue;
         }
+        let pending_upper_bound = match persistence_window.as_ref() {
+            Some(window) => Some(window.anchor_entries.checked_add(group.len()).ok_or_else(
+                || -> DynError {
+                    "ASTRO_ARCHAEOLOGY_BATCH_OVERFLOW: pending anchor entry count overflowed usize; preserve the vault and reduce the declared batch limits"
+                        .into()
+                },
+            )?),
+            None => None,
+        };
+        if persistence_window.as_ref().is_some_and(|window| {
+            window.groups.len() >= historical_batch_group_limit
+                || pending_upper_bound.is_some_and(|count| count > anchor_batch_limit)
+        }) {
+            flush_archaeology_persistence_window(vault, &mut persistence_window, &mut report)?;
+        }
         let snapshot = pipeline_rows_to_graph_snapshot(selected);
         // Historical constellations dedup against the live shadow vault, so they must
         // be minted under the same roster version as the main shadow import
@@ -498,49 +677,84 @@ pub(crate) fn run_git_archaeology<C: Clock>(
         // defeat reuse (#336).
         let options = SqliteImportOptions::new(project, commit, SHADOW_PANEL_VERSION)
             .with_available_slots(shadow_available_slots());
-        let admission =
-            admit_historical_symbol_snapshot(&snapshot, vault, &ShadowSlotRuntime, &options)?;
-        report.historical_constellations_written += admission.constellations_written;
-        report.historical_constellations_reused += admission.constellations_reused;
-
-        for item in group {
-            let locations = admission
-                .locations
-                .iter()
-                .filter(|location| location_overlaps(location, &item.range))
-                .collect::<Vec<_>>();
-            if locations.is_empty() {
-                report.evidence_without_symbol += 1;
-                continue;
-            }
-            let mut cx_ids = BTreeMap::new();
-            let mut subjects = Vec::new();
-            for location in locations {
-                let subject_id = historical_subject_id(location);
-                if cx_ids.insert(subject_id.clone(), location.cx_id).is_none() {
-                    subjects.push(OutcomeSubject {
-                        subject_id,
-                        anchor_kind: AnchorKind::Label(item.label.to_string()),
-                        value: AnchorValue::Bool(true),
-                    });
-                }
-            }
-            let request = OutcomeAnchorRequest::new(
-                OutcomeKind::GitArchaeology,
-                item.source.clone(),
-                item.observed_at,
-                Some(item.confidence),
-                subjects,
-            )?;
-            let anchored = ingest_outcome_anchors(vault, &request, &cx_ids, ARCHAEOLOGY_ACTOR)?;
-            report.anchors_written += anchored.anchors_written;
-            report.anchors_deduplicated += anchored.anchors_deduplicated;
+        if persistence_window.is_none() {
+            persistence_window = Some(ArchaeologyPersistenceWindow {
+                historical_batch: historical_admission.begin_batch(vault)?,
+                groups: Vec::new(),
+                anchor_entries: 0,
+            });
         }
+        let window = persistence_window.as_mut().expect("window initialized");
+        let historical = historical_admission.prepare(
+            &snapshot,
+            vault,
+            &ShadowSlotRuntime,
+            &options,
+            &mut window.historical_batch,
+        )?;
+        let anchors = build_anchor_admissions(group, historical.locations(), &mut report)?;
+        report.historical_admission_groups += 1;
+
+        if anchors.len() > anchor_batch_limit {
+            if !window.groups.is_empty() || window.anchor_entries != 0 {
+                return Err(
+                    "ASTRO_ARCHAEOLOGY_BATCH_ORDER_INVALID: oversized group reached a non-empty persistence window after preflight; preserve the vault and inspect window accounting"
+                        .into(),
+                );
+            }
+            let mut chunks = anchors.into_iter();
+            let first = chunks.by_ref().take(anchor_batch_limit).collect::<Vec<_>>();
+            window.groups.push(PendingArchaeologyPersistenceGroup {
+                historical: Some(historical),
+                anchors: first,
+            });
+            window.anchor_entries = anchor_batch_limit;
+            flush_archaeology_persistence_window(vault, &mut persistence_window, &mut report)?;
+
+            let mut remaining = chunks.collect::<Vec<_>>().into_iter();
+            loop {
+                let chunk = remaining
+                    .by_ref()
+                    .take(anchor_batch_limit)
+                    .collect::<Vec<_>>();
+                if chunk.is_empty() {
+                    break;
+                }
+                let chunk_len = chunk.len();
+                persistence_window = Some(ArchaeologyPersistenceWindow {
+                    historical_batch: historical_admission.begin_batch(vault)?,
+                    groups: vec![PendingArchaeologyPersistenceGroup {
+                        historical: None,
+                        anchors: chunk,
+                    }],
+                    anchor_entries: chunk_len,
+                });
+                flush_archaeology_persistence_window(vault, &mut persistence_window, &mut report)?;
+            }
+            continue;
+        }
+
+        window.anchor_entries = window
+            .anchor_entries
+            .checked_add(anchors.len())
+            .ok_or_else(|| -> DynError {
+                "ASTRO_ARCHAEOLOGY_BATCH_OVERFLOW: persistence window anchor entry count overflowed usize; preserve the vault and reduce the declared limits"
+                    .into()
+            })?;
+        window.groups.push(PendingArchaeologyPersistenceGroup {
+            historical: Some(historical),
+            anchors,
+        });
     }
+    flush_archaeology_persistence_window(vault, &mut persistence_window, &mut report)?;
     // #530: retire the pooled worker and its scratch dir. Idempotent with Drop, but
     // called explicitly here so the served/spawn telemetry lands inside the pass and any
     // dir remnant is counted before the report is finalized.
     report.cleanup_remnants += pool.finish();
+    report.index_loop_wall_ms = elapsed_ms(index_loop_start.elapsed());
+    report.index_loop_usage = vault
+        .process_usage_snapshot()?
+        .phase_since(index_loop_usage_before);
     if arch_timing {
         eprintln!(
             "astro.arch.timing phase=index_loop file_scoped={file_scoped} ms={} \
@@ -554,6 +768,400 @@ pub(crate) fn run_git_archaeology<C: Clock>(
         );
     }
     Ok(report)
+}
+
+fn archaeology_anchor_batch_entries() -> Result<usize, DynError> {
+    archaeology_persist_limit(
+        astrolabe_domain::knobs::ARCHAEOLOGY_ANCHOR_BATCH_ENTRIES_KNOB,
+        ARCHAEOLOGY_ANCHOR_BATCH_ENV,
+        "logical anchor entries",
+    )
+}
+
+fn archaeology_historical_batch_groups() -> Result<usize, DynError> {
+    archaeology_persist_limit(
+        astrolabe_domain::knobs::ARCHAEOLOGY_HISTORICAL_BATCH_GROUPS_KNOB,
+        ARCHAEOLOGY_HISTORICAL_BATCH_ENV,
+        "historical commit groups",
+    )
+}
+
+/// Validate every operator-controlled archaeology persistence bound before an
+/// index transition or staging publication can mutate durable state.
+pub(crate) fn preflight_git_archaeology_persistence_limits() -> Result<(usize, usize), DynError> {
+    Ok((
+        archaeology_anchor_batch_entries()?,
+        archaeology_historical_batch_groups()?,
+    ))
+}
+
+fn archaeology_persist_limit(knob: &str, environment: &str, unit: &str) -> Result<usize, DynError> {
+    let declaration = astrolabe_domain::knobs::archaeology_persist_knob(knob).ok_or_else(
+        || -> DynError {
+            format!(
+                "ASTRO_ARCHAEOLOGY_PERSIST_REGISTRY_MISSING: {knob} is absent; restore the {} registry before indexing",
+                astrolabe_domain::knobs::ARCHAEOLOGY_PERSIST_KNOB_REGISTRY_VERSION
+            )
+            .into()
+        },
+    )?;
+    let Some(raw) = std::env::var_os(environment) else {
+        return usize::try_from(declaration.default).map_err(|_| {
+            format!(
+                "ASTRO_ARCHAEOLOGY_PERSIST_LIMIT_INVALID: registry default {} for {knob} cannot be represented as usize; correct {}",
+                declaration.default, declaration.registry_version
+            )
+            .into()
+        });
+    };
+    let value = raw.into_string().map_err(|raw| -> DynError {
+        format!(
+            "ASTRO_ARCHAEOLOGY_PERSIST_LIMIT_INVALID: {environment} is not Unicode ({raw:?}); remove it or set an ASCII decimal integer in {}..={} {unit}",
+            declaration.min, declaration.max
+        )
+        .into()
+    })?;
+    if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(format!(
+            "ASTRO_ARCHAEOLOGY_PERSIST_LIMIT_INVALID: {environment}={value:?} is not a non-empty ASCII decimal integer; remove it or set {}..={} {unit}",
+            declaration.min, declaration.max
+        )
+        .into());
+    }
+    let parsed = value.parse::<u64>().map_err(|error| -> DynError {
+        format!(
+            "ASTRO_ARCHAEOLOGY_PERSIST_LIMIT_INVALID: {environment}={value:?} cannot be represented as u64 ({error}); set {}..={} {unit}",
+            declaration.min, declaration.max
+        )
+        .into()
+    })?;
+    if !declaration.accepts(parsed) {
+        return Err(format!(
+            "ASTRO_ARCHAEOLOGY_PERSIST_LIMIT_INVALID: {environment}={parsed} is outside the declared {}..={} {unit} bound; correct the value before indexing",
+            declaration.min, declaration.max
+        )
+        .into());
+    }
+    usize::try_from(parsed).map_err(|_| {
+        format!(
+            "ASTRO_ARCHAEOLOGY_PERSIST_LIMIT_INVALID: {environment}={parsed} cannot be represented by this process; lower it within the declared bound"
+        )
+        .into()
+    })
+}
+
+fn build_anchor_admissions(
+    evidence: &[Evidence],
+    admitted: &[HistoricalSymbolLocation],
+    report: &mut GitArchaeologyImportReport,
+) -> Result<Vec<PendingAnchorAdmission>, DynError> {
+    let mut pending = Vec::with_capacity(evidence.len());
+    for item in evidence {
+        let locations = admitted
+            .iter()
+            .filter(|location| location_overlaps(location, &item.range))
+            .collect::<Vec<_>>();
+        if locations.is_empty() {
+            report.evidence_without_symbol += 1;
+            continue;
+        }
+        let mut cx_ids = BTreeMap::new();
+        let mut subjects = Vec::new();
+        for location in locations {
+            let subject_id = historical_subject_id(location);
+            if cx_ids.insert(subject_id.clone(), location.cx_id).is_none() {
+                subjects.push(OutcomeSubject {
+                    subject_id,
+                    anchor_kind: AnchorKind::Label(item.label.to_string()),
+                    value: AnchorValue::Bool(true),
+                });
+            }
+        }
+        let request = OutcomeAnchorRequest::new(
+            OutcomeKind::GitArchaeology,
+            item.source.clone(),
+            item.observed_at,
+            Some(item.confidence),
+            subjects,
+        )?;
+        pending.push(PendingAnchorAdmission { request, cx_ids });
+    }
+    Ok(pending)
+}
+
+fn flush_archaeology_persistence_window<C: Clock>(
+    vault: &AsterVault<C>,
+    window: &mut Option<ArchaeologyPersistenceWindow>,
+    report: &mut GitArchaeologyImportReport,
+) -> Result<(), DynError> {
+    let Some(window) = window.take() else {
+        return Ok(());
+    };
+    if window.groups.is_empty() {
+        if window.anchor_entries != 0 {
+            return Err(
+                "ASTRO_ARCHAEOLOGY_BATCH_ORDER_INVALID: empty persistence window retained nonzero anchor accounting; preserve the vault and inspect window construction"
+                    .into(),
+            );
+        }
+        return Ok(());
+    }
+    let started = std::time::Instant::now();
+    let snapshot = window.historical_batch.snapshot();
+    let historical_groups = window
+        .groups
+        .iter()
+        .filter(|group| group.historical.is_some())
+        .count();
+    let historical_entries = window
+        .groups
+        .iter()
+        .filter_map(|group| group.historical.as_ref())
+        .filter(|prepared| prepared.has_write_group())
+        .count();
+    let anchor_items = window
+        .groups
+        .iter()
+        .flat_map(|group| &group.anchors)
+        .map(|item| OutcomeAnchorBatchItem::new(&item.request, &item.cx_ids))
+        .collect::<Vec<_>>();
+    if anchor_items.len() != window.anchor_entries {
+        return Err(format!(
+            "ASTRO_ARCHAEOLOGY_BATCH_ORDER_INVALID: window counted {} anchor entries but retained {}; preserve the vault and inspect ordered staging",
+            window.anchor_entries,
+            anchor_items.len()
+        )
+        .into());
+    }
+    let mut prepared_anchors = if anchor_items.is_empty() {
+        None
+    } else {
+        Some(prepare_outcome_anchor_batch(
+            vault,
+            &anchor_items,
+            ARCHAEOLOGY_ACTOR,
+        )?)
+    };
+    let mut anchor_groups = prepared_anchors
+        .as_mut()
+        .map(PreparedOutcomeAnchorBatch::take_write_groups)
+        .unwrap_or_default()
+        .into_iter();
+    let mut ordered = Vec::<LedgerBoundWriteGroup>::new();
+    let mut completion = Vec::with_capacity(window.groups.len());
+    for mut group in window.groups {
+        let historical_has_receipt = group
+            .historical
+            .as_ref()
+            .is_some_and(PreparedHistoricalSymbolAdmission::has_write_group);
+        if let Some(write) = group
+            .historical
+            .as_mut()
+            .and_then(PreparedHistoricalSymbolAdmission::take_write_group)
+        {
+            ordered.push(write);
+        }
+        let anchor_count = group.anchors.len();
+        for _ in 0..anchor_count {
+            ordered.push(anchor_groups.next().ok_or_else(|| -> DynError {
+                "ASTRO_ARCHAEOLOGY_BATCH_ORDER_INVALID: prepared anchor groups ended before their owning evidence group; preserve the vault and inspect ordered staging"
+                    .into()
+            })?);
+        }
+        completion.push((group.historical, historical_has_receipt, anchor_count));
+    }
+    if anchor_groups.next().is_some() {
+        return Err(
+            "ASTRO_ARCHAEOLOGY_BATCH_ORDER_INVALID: prepared anchor groups remained after ordered window assembly; preserve the vault and inspect group accounting"
+                .into(),
+        );
+    }
+
+    if ordered.is_empty() {
+        for (historical, _, _) in completion {
+            if let Some(historical) = historical {
+                let admission = historical.complete(vault, snapshot, None, None)?;
+                record_historical_admission(report, admission);
+            }
+        }
+        return Ok(());
+    }
+
+    let commit = vault.write_ledger_bound_groups_if_seq(snapshot, ordered)?;
+    let flush = vault.flush_with_report()?;
+    let wanted = commit
+        .groups
+        .iter()
+        .map(|receipt| receipt.ledger_ref.seq)
+        .collect::<BTreeSet<_>>();
+    let (ledger_rows, ledger_trace) = vault.read_physical_ledger_seqs(&wanted)?;
+    let complete_scan_wanted = ledger_trace
+        .tiers
+        .iter()
+        .filter(|tier| tier.tier == "complete_scan")
+        .map(|tier| tier.wanted)
+        .sum::<usize>();
+    if complete_scan_wanted != 0 {
+        return Err(format!(
+            "ASTRO_ARCHAEOLOGY_LEDGER_POINT_READ_DEGRADED: just-published ordered window required complete-scan resolution for {complete_scan_wanted} Ledger rows; preserve the vault and repair the commit-ordered index before continuing"
+        )
+        .into());
+    }
+    report.persistence_ledger_files_opened += ledger_trace
+        .tiers
+        .iter()
+        .map(|tier| tier.files_opened)
+        .sum::<usize>();
+    report.persistence_ledger_complete_scan_wanted += complete_scan_wanted;
+    report.persistence_atomic_commits += 1;
+    report.persistence_flushes += 1;
+    report.persistence_durable_sst_files += flush.durable_ssts.len();
+    report.persistence_durable_sst_entries += flush
+        .durable_ssts
+        .iter()
+        .map(|summary| summary.entries)
+        .sum::<usize>();
+    report.persistence_durable_sst_bytes = report.persistence_durable_sst_bytes.saturating_add(
+        flush
+            .durable_ssts
+            .iter()
+            .map(|summary| summary.bytes)
+            .sum::<u64>(),
+    );
+    if historical_entries != 0 {
+        report.historical_admission_logical_entries += historical_entries;
+        report.historical_admission_atomic_commits += 1;
+        report.historical_admission_flushes += 1;
+        report.historical_admission_max_window_groups = report
+            .historical_admission_max_window_groups
+            .max(historical_groups);
+    }
+
+    let anchor_entries = window.anchor_entries;
+    if anchor_entries != 0 {
+        record_anchor_flush(report, anchor_entries, &flush);
+    }
+    let mut receipts = commit.groups.into_iter();
+    let mut anchor_receipts = Vec::<LedgerBoundGroupReceipt>::with_capacity(anchor_entries);
+    for (historical, historical_has_receipt, anchor_count) in completion {
+        if let Some(historical) = historical {
+            let historical_receipt = if historical_has_receipt {
+                Some(receipts.next().ok_or_else(|| -> DynError {
+                    "ASTRO_ARCHAEOLOGY_BATCH_ORDER_INVALID: committed receipts omitted a historical Ingest group; preserve the vault and inspect ordered staging"
+                        .into()
+                })?)
+            } else {
+                None
+            };
+            let admission_seq = if historical_has_receipt {
+                commit.seq
+            } else {
+                historical.snapshot()
+            };
+            let admission = historical.complete(
+                vault,
+                admission_seq,
+                historical_receipt,
+                historical_has_receipt.then_some(&ledger_rows),
+            )?;
+            record_historical_admission(report, admission);
+        }
+        for _ in 0..anchor_count {
+            anchor_receipts.push(receipts.next().ok_or_else(|| -> DynError {
+                "ASTRO_ARCHAEOLOGY_BATCH_ORDER_INVALID: committed receipts omitted a Grounding group; preserve the vault and inspect ordered staging"
+                    .into()
+            })?);
+        }
+    }
+    if receipts.next().is_some() {
+        return Err(
+            "ASTRO_ARCHAEOLOGY_BATCH_ORDER_INVALID: committed logical receipts remained after window finalization; preserve the vault and inspect ordered staging"
+                .into(),
+        );
+    }
+    if let Some(prepared) = prepared_anchors {
+        let batch = prepared.complete(
+            vault,
+            commit.seq,
+            anchor_receipts,
+            &ledger_rows,
+            ledger_trace,
+            flush,
+        )?;
+        report.anchor_rows_written += batch.rows_written;
+        report.anchor_ledger_refs_verified += batch.ledger_refs_verified;
+        for item in batch.items {
+            report.anchors_written += item.anchors_written;
+            report.anchors_deduplicated += item.anchors_deduplicated;
+        }
+    }
+    report.anchor_batch_wall_ms = report
+        .anchor_batch_wall_ms
+        .saturating_add(elapsed_ms(started.elapsed()));
+    Ok(())
+}
+
+fn record_historical_admission(
+    report: &mut GitArchaeologyImportReport,
+    admission: astrolabe_ingest::HistoricalSymbolAdmissionReport,
+) {
+    report.historical_constellations_written += admission.constellations_written;
+    report.historical_constellations_reused += admission.constellations_reused;
+    report.historical_admission_rows_written += admission.rows_written;
+    report.historical_admission_ledger_refs_verified += usize::from(admission.ledger_ref.is_some());
+}
+
+fn record_anchor_flush(
+    report: &mut GitArchaeologyImportReport,
+    logical_entries: usize,
+    flush: &calyx_aster::vault::VaultFlushReport,
+) {
+    report.anchor_logical_entries += logical_entries;
+    report.anchor_atomic_commits += 1;
+    report.anchor_flushes += 1;
+    report.anchor_max_batch_entries = report.anchor_max_batch_entries.max(logical_entries);
+    report.anchor_durable_sst_files += flush.durable_ssts.len();
+    report.anchor_durable_sst_entries += flush
+        .durable_ssts
+        .iter()
+        .map(|summary| summary.entries)
+        .sum::<usize>();
+    report.anchor_durable_sst_bytes = report.anchor_durable_sst_bytes.saturating_add(
+        flush
+            .durable_ssts
+            .iter()
+            .map(|summary| summary.bytes)
+            .sum::<u64>(),
+    );
+    report.anchor_router_sst_files += flush.router_ssts.len();
+    report.anchor_router_sst_entries += flush
+        .router_ssts
+        .iter()
+        .map(|summary| summary.entries)
+        .sum::<usize>();
+    report.anchor_router_sst_bytes = report.anchor_router_sst_bytes.saturating_add(
+        flush
+            .router_ssts
+            .iter()
+            .map(|summary| summary.bytes)
+            .sum::<u64>(),
+    );
+    if let Some(handoff) = &flush.router_handoff {
+        report.anchor_router_handoff_full_inventories += usize::from(handoff.full_inventory);
+        report.anchor_router_handoff_memtable_rows_verified += handoff.memtable_rows_verified;
+        report.anchor_router_handoff_flush_files_verified += handoff.flush_sst_files_verified;
+        report.anchor_router_handoff_flush_entries_verified += handoff.flush_sst_entries_verified;
+        report.anchor_router_handoff_flush_files_retired += handoff.flush_sst_files_retired;
+        report.anchor_router_handoff_flush_bytes_retired = report
+            .anchor_router_handoff_flush_bytes_retired
+            .saturating_add(handoff.flush_sst_bytes_retired);
+        report.anchor_router_handoff_debt_files_after = handoff.covered_flush_debt_files_after;
+        report.anchor_router_handoff_debt_bytes_after = handoff.covered_flush_debt_bytes_after;
+    }
+}
+
+fn elapsed_ms(elapsed: std::time::Duration) -> u64 {
+    u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
 }
 
 /// Validate and durably bind the exact archaeology scratch scope before the
@@ -1562,12 +2170,26 @@ struct HistoricalCommitIndex {
     rows: CbmPipelineRows,
     cleanup_remnants: usize,
     windows_invalid_excluded: usize,
+    git_inventory_processes: usize,
+    git_checkout_processes: usize,
+    files_materialized: usize,
+    source_files_materialized: usize,
+    object_probe_processes_avoided: usize,
     /// #515: `Some(detail)` when the isolated CBM extraction child died without
     /// producing rows (a contained C-level pipeline fault on this commit). The
     /// caller counts it, lands the evidence as `evidence_without_symbol`, and
     /// continues rather than the pre-#515 in-process fault killing the whole host.
     /// `None` on a clean extraction (`rows` carries the real result).
     crashed: Option<String>,
+}
+
+#[derive(Debug)]
+struct HistoricalMaterialization {
+    windows_invalid_excluded: usize,
+    git_inventory_processes: usize,
+    git_checkout_processes: usize,
+    files_materialized: usize,
+    object_probe_processes_avoided: usize,
 }
 
 /// Outcome of the pooled historical CBM extraction ([`HistoricalExtractionPool::extract`]):
@@ -1595,11 +2217,12 @@ fn index_historical_commit(
         std::process::id(),
         SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos()
     );
-    // Worktree at the compact explicit home (#427/#809); the `.db` scratch store
-    // stays under the store dir where the C enumerator's reserved-prefix filter
-    // can see it.
+    // Commit-bound materialization scope at the compact explicit home (#427/#809);
+    // the temporary index and checked-out tree are private children, so no shared Git
+    // worktree registration or per-path object process is needed.
     let worktree = worktree_home.join(format!("{ARCHAEOLOGY_WORKTREE_PREFIX}{nonce}"));
-    let worktree_len = windows_path_units(&worktree);
+    let checkout_root = worktree.join("tree");
+    let worktree_len = windows_path_units(&checkout_root);
     if worktree_len > ARCHAEOLOGY_WORKTREE_CWD_BUDGET {
         return Err(format!(
             "ASTRO_ARCHAEOLOGY_WORKTREE_BASE_TOO_DEEP: archaeology scratch-worktree root {root} is \
@@ -1618,18 +2241,29 @@ fn index_historical_commit(
     } else {
         repo.join(corpus_rel)
     };
-    // #439: materialize ONLY the implicated files (file-scoped) or the whole member
-    // subtree (pre-#439). Both leave `scoped_root` (below) at the same base, so CBM
-    // emits byte-identical subtree-relative node paths in either mode.
-    // #502: the file-scoped path filters out committed filenames NTFS cannot represent
-    // and returns how many it excluded at this commit; the whole-subtree path materializes
-    // a full checkout git already validated, so it excludes none.
-    let windows_invalid_excluded = if file_scoped {
-        add_historical_worktree_files(repo, &worktree, commit, corpus_rel, implicated_files)?
-    } else {
-        add_historical_worktree(repo, &worktree, commit, corpus_rel)?;
-        0
+    let materialized = match materialize_historical_tree(
+        repo,
+        &worktree,
+        &checkout_root,
+        commit,
+        corpus_rel,
+        file_scoped,
+        implicated_files,
+    ) {
+        Ok(materialized) => materialized,
+        Err(error) => {
+            let removed = remove_path_with_retry(&worktree, |path| fs::remove_dir_all(path));
+            if !removed {
+                return Err(format!(
+                    "{error}; ASTRO_ARCHAEOLOGY_MATERIALIZATION_CLEANUP_FAILED: exact scratch scope {} survived the bounded cleanup budget; preserve and inspect it before retrying",
+                    worktree.display()
+                )
+                .into());
+            }
+            return Err(error);
+        }
     };
+    let mut source_files_materialized = 0usize;
     let indexed = (|| -> Result<HistoricalExtract, DynError> {
         // Scope the historical index to the requested corpus subtree within the
         // whole-repo worktree (#403). A git worktree is always the full repository
@@ -1638,15 +2272,36 @@ fn index_historical_commit(
         // restricts CBM discovery to exactly the requested corpus; an empty
         // `corpus_rel` (corpus IS the toplevel) leaves this behavior-neutral.
         let scoped_root = if corpus_rel.is_empty() {
-            worktree.clone()
+            checkout_root.clone()
         } else {
-            worktree.join(corpus_rel)
+            checkout_root.join(corpus_rel)
         };
         // The corpus subtree may not exist at this historical commit (created or
         // renamed later). CBM cannot index a path that is not there; treat it as
         // "no historical rows for this commit" (the evidence then lands as
         // evidence_without_symbol) rather than letting CBM abort on a missing root.
         if !scoped_root.exists() {
+            return Ok(HistoricalExtract::Rows(CbmPipelineRows {
+                project: project.to_string(),
+                nodes: Vec::new(),
+                edges: Vec::new(),
+                file_hashes: Vec::new(),
+                manifest: None,
+            }));
+        }
+        // Ask libcbm's own discovery path whether this exact materialized view has a
+        // non-auxiliary Fast-mode source. This is deliberately not predicted from
+        // filename extensions: discovery also applies mode filters, ignore policy,
+        // directory policy, and auxiliary classification, and those rules must have
+        // one owner. The selected view is tiny, so this in-process walk avoids an
+        // unnecessary worker request without adding a process or parsing source twice.
+        let discovery = discover_pipeline_files(path_str(&scoped_root)?, CbmIndexMode::Fast)?;
+        source_files_materialized = discovery.source_files;
+        if source_files_materialized == 0 {
+            eprintln!(
+                "astro.archaeology.no_materialized_source commit={commit} files_materialized={} discovered_files={} outcome=explicit_empty_rows",
+                materialized.files_materialized, discovery.discovered_files
+            );
             return Ok(HistoricalExtract::Rows(CbmPipelineRows {
                 project: project.to_string(),
                 nodes: Vec::new(),
@@ -1676,35 +2331,27 @@ fn index_historical_commit(
         // one commit (labeled, counted) instead of the whole index dying silently.
         pool.extract(&scoped_root, &database, &identity_root, project, commit)
     })();
-    // Ask git to release and remove its worktree registration first; retries below
-    // sweep any file/dir it leaves behind under Windows handle latency.
-    let cleanup = git_checked(
-        repo,
-        &[
-            "-c",
-            "core.longpaths=true",
-            "worktree",
-            "remove",
-            "--force",
-            path_str(&worktree)?,
-        ],
-    );
     let mut cleanup_remnants = cleanup_archaeology_database(&database);
     if !remove_path_with_retry(&worktree, |path| fs::remove_dir_all(path)) {
         cleanup_remnants += 1;
     }
-    match (indexed, cleanup) {
-        (Ok(HistoricalExtract::Rows(rows)), Ok(())) => Ok(HistoricalCommitIndex {
+    match indexed {
+        Ok(HistoricalExtract::Rows(rows)) => Ok(HistoricalCommitIndex {
             rows,
             cleanup_remnants,
-            windows_invalid_excluded,
+            windows_invalid_excluded: materialized.windows_invalid_excluded,
+            git_inventory_processes: materialized.git_inventory_processes,
+            git_checkout_processes: materialized.git_checkout_processes,
+            files_materialized: materialized.files_materialized,
+            source_files_materialized,
+            object_probe_processes_avoided: materialized.object_probe_processes_avoided,
             crashed: None,
         }),
         // #515 contained child fault: the extraction child died without rows. Report
         // it as a labeled skip (the caller counts it and continues); the host lives.
         // Any cleanup error is subsumed — the child already released its handles when
         // it died, and the crash detail is the headline, remnants counted separately.
-        (Ok(HistoricalExtract::Crashed(detail)), _) => Ok(HistoricalCommitIndex {
+        Ok(HistoricalExtract::Crashed(detail)) => Ok(HistoricalCommitIndex {
             rows: CbmPipelineRows {
                 project: project.to_string(),
                 nodes: Vec::new(),
@@ -1713,11 +2360,15 @@ fn index_historical_commit(
                 manifest: None,
             },
             cleanup_remnants,
-            windows_invalid_excluded,
+            windows_invalid_excluded: materialized.windows_invalid_excluded,
+            git_inventory_processes: materialized.git_inventory_processes,
+            git_checkout_processes: materialized.git_checkout_processes,
+            files_materialized: materialized.files_materialized,
+            source_files_materialized,
+            object_probe_processes_avoided: materialized.object_probe_processes_avoided,
             crashed: Some(detail),
         }),
-        (Err(error), _) => Err(error),
-        (Ok(_), Err(error)) => Err(error),
+        Err(error) => Err(error),
     }
 }
 
@@ -2048,209 +2699,206 @@ fn git_checked(repo: &Path, args: &[&str]) -> Result<(), DynError> {
     }
 }
 
-/// Adds the scratch worktree that materializes a historical commit for indexing.
+/// Materializes one historical view without registering a shared Git worktree.
 ///
-/// Whole-repo corpus (`corpus_rel` empty): the pre-#381 full detached checkout —
-/// byte-identical control behavior, the whole historical toplevel tree on disk.
-///
-/// Monorepo-member corpus (#381): materialize ONLY the member subtree, not the full
-/// historical toplevel tree (for `cbm/` that is ~5,500 files per evidence commit).
-/// Add the worktree with `--no-checkout` (index only, no working files), then
-/// `checkout <commit> -- <corpus_rel>` restores exactly the member subtree from the
-/// commit's tree. Nothing else lands on disk — not even repo-root files — and, unlike
-/// `sparse-checkout init` (which force-enables `extensions.worktreeConfig` in the
-/// enclosing repo's SHARED `.git/config`), no per-worktree sparse state is written, so
-/// the canonical repo config is never mutated. `core.longpaths=true` guards every
-/// tree-touching call: even joined to the compact explicit worktree base
-/// (#427/#809), deep
-/// member file paths still exceed the Windows 260-char limit for git's file I/O
-/// (the worktree ROOT is separately kept under the `chdir` cap by
-/// [`ARCHAEOLOGY_WORKTREE_CWD_BUDGET`], which `core.longpaths` cannot reach).
-///
-/// The member subtree may be absent at this historical commit (created or renamed
-/// later); it is probed with [`git_tree_has_path`] first and only checked out when
-/// present, so a "pathspec did not match" never aborts the import. The absent case
-/// materializes nothing, and `index_historical_commit`'s `scoped_root.exists()` gate
-/// then yields zero rows (counted as `evidence_without_symbol` upstream).
-fn add_historical_worktree(
+/// `read-tree` publishes the exact commit into a scope-private temporary index;
+/// one NUL-safe `ls-files` inventory replaces N `cat-file -e` processes; and one
+/// `checkout-index` applies Git's native checkout conversion, modes, symlink policy,
+/// and historical index attributes. The checkout therefore retains Git semantics
+/// that a raw-blob materializer would lose while removing repository metadata churn
+/// and command-line/path-count limits.
+fn materialize_historical_tree(
     repo: &Path,
-    worktree: &Path,
+    scope: &Path,
+    checkout_root: &Path,
     commit: &str,
     corpus_rel: &str,
-) -> Result<(), DynError> {
-    if corpus_rel.is_empty() {
-        git_checked(
-            repo,
-            &[
-                "-c",
-                "core.longpaths=true",
-                "worktree",
-                "add",
-                "--detach",
-                path_str(worktree)?,
-                commit,
-            ],
-        )?;
-        return Ok(());
-    }
-    git_checked(
-        repo,
-        &[
-            "-c",
-            "core.longpaths=true",
-            "worktree",
-            "add",
-            "--no-checkout",
-            "--detach",
-            path_str(worktree)?,
-            commit,
-        ],
-    )?;
-    if git_tree_has_path(repo, commit, corpus_rel)? {
-        git_checked(
-            worktree,
-            &[
-                "-c",
-                "core.longpaths=true",
-                "checkout",
-                commit,
-                "--",
-                corpus_rel,
-            ],
-        )?;
-    }
-    Ok(())
-}
-
-/// Adds a scratch worktree that materializes ONLY the implicated files of one
-/// evidence commit (#439 file-scoped historical index), instead of the whole member
-/// subtree.
-///
-/// `implicated_files` are the DISTINCT subtree-relative paths the evidence group hits
-/// (already stripped of the corpus prefix and, via the `run_git_archaeology` retain,
-/// confined to the corpus). Each is rejoined to `corpus_rel` to form the toplevel
-/// pathspec git checks out; an empty `corpus_rel` (corpus IS the toplevel) uses the
-/// path as-is. The worktree is added `--no-checkout` (index only, no working files),
-/// then a SINGLE `checkout <commit> -- <present files…>` materializes exactly those
-/// files at their real subtree-relative locations under `worktree/<corpus_rel>` — so
-/// `scoped_root` (in [`index_historical_commit`]) and every emitted node path are
-/// byte-identical to the whole-subtree mode; only the non-implicated files CBM would
-/// parse and then discard are absent.
-///
-/// A pathspec that would escape the corpus is skipped defensively (the retain upstream
-/// already guarantees in-corpus paths; this never silently materializes out-of-corpus
-/// files). An implicated file ABSENT at this commit (deleted/created later, or the
-/// subtree itself absent) is filtered by [`git_tree_has_path`] before checkout, so a
-/// "pathspec did not match" never aborts the pass — the file simply is not materialized
-/// and its evidence lands as `evidence_without_symbol`, exactly as whole-subtree mode
-/// (which indexes the subtree without that file). When no implicated file is present
-/// at the commit, nothing is checked out and `scoped_root.exists()` is false, yielding
-/// zero rows — the same graceful zero-evidence outcome as an absent subtree.
-///
-/// A committed filename NTFS cannot represent — control bytes, reserved characters
-/// (`: < > " | ? *`), reserved device names, trailing dot/space (exactly the class
-/// [`astrolabe_fleet::clone_farm::windows_invalid_path`] detects, shared with the
-/// clone farm's #480 checkout classifier) — can never be checked out on Windows: a
-/// batched `git checkout` that includes it dies with `error: invalid path`, which
-/// before #502 aborted the whole historical-index pass (repo-fatal). Such paths are
-/// filtered out here and returned as a LABELED, COUNTED exclusion (invariant 3), never
-/// a quarantine and never a silent drop: the excluded file simply is not materialized,
-/// its evidence lands as `evidence_without_symbol` upstream exactly as an absent file,
-/// and the remaining representable implicated files still check out and mine normally.
-/// A genuine `git checkout` failure on a REPRESENTABLE path stays fail-closed.
-///
-/// Returns the number of implicated paths excluded as Windows-invalid at this commit.
-fn add_historical_worktree_files(
-    repo: &Path,
-    worktree: &Path,
-    commit: &str,
-    corpus_rel: &str,
+    file_scoped: bool,
     implicated_files: &BTreeSet<String>,
-) -> Result<usize, DynError> {
-    git_checked(
-        repo,
-        &[
-            "-c",
-            "core.longpaths=true",
-            "worktree",
-            "add",
-            "--no-checkout",
-            "--detach",
-            path_str(worktree)?,
-            commit,
-        ],
-    )?;
-    // Build the toplevel pathspec for each implicated file, dropping any that would
-    // escape the corpus, any NTFS cannot represent (#502), and any not present in this
-    // commit's tree.
-    let mut present: Vec<String> = Vec::new();
-    let mut windows_invalid_excluded = 0usize;
-    for rel in implicated_files {
-        let toplevel_path = if corpus_rel.is_empty() {
-            rel.clone()
-        } else {
-            format!("{corpus_rel}/{rel}")
-        };
-        // Defense-in-depth: never let a `..`/absolute/empty path escape the corpus into
-        // the enclosing worktree. The upstream retain already scopes evidence to the
-        // corpus, so this only ever drops a malformed residue — counted by absence, not
-        // silently indexed.
-        if toplevel_path.is_empty()
-            || toplevel_path.starts_with('/')
-            || toplevel_path.split('/').any(|component| component == "..")
-        {
-            continue;
-        }
-        // #502: a committed filename NTFS cannot represent can never materialize on this
-        // host, so a `git checkout` that names it aborts the entire pass. Exclude it as a
-        // labeled, counted degradation (never a repo-fatal abort, never a quarantine); the
-        // dropped file's evidence lands as `evidence_without_symbol` upstream, matching the
-        // absent-file path. This mirrors the clone farm's #480 tree classifier, sharing the
-        // exact same predicate so the two never disagree on what Windows can hold.
-        if let Some(reason) = windows_invalid_path(toplevel_path.as_bytes()) {
-            eprintln!(
-                "astro.archaeology.windows_invalid_path commit={commit} path={toplevel_path:?} \
-                 reason={reason}"
-            );
-            windows_invalid_excluded += 1;
-            continue;
-        }
-        if git_tree_has_path(repo, commit, &toplevel_path)? {
-            present.push(toplevel_path);
-        }
-    }
-    if present.is_empty() {
-        // No representable implicated file exists at this commit: materialize nothing. The
-        // caller's `scoped_root.exists()` gate then yields zero rows (evidence_without_symbol),
-        // matching the absent-subtree path — never an aborting empty checkout. Any
-        // Windows-invalid exclusions are still surfaced through the returned count.
-        return Ok(windows_invalid_excluded);
-    }
-    // One batched checkout of exactly the present implicated files. All pathspecs are
-    // pre-filtered to exist and to be Windows-representable, so git never errors on an
-    // unmatched pathspec or an invalid path.
-    let mut args: Vec<&str> = vec!["-c", "core.longpaths=true", "checkout", commit, "--"];
-    for path in &present {
-        args.push(path.as_str());
-    }
-    git_checked(worktree, &args)?;
-    Ok(windows_invalid_excluded)
-}
+) -> Result<HistoricalMaterialization, DynError> {
+    fs::create_dir(scope).map_err(|error| -> DynError {
+        format!(
+            "ASTRO_ARCHAEOLOGY_MATERIALIZATION_SCOPE_CREATE_FAILED: could not create fresh scope {}: {error}",
+            scope.display()
+        )
+        .into()
+    })?;
+    fs::create_dir(checkout_root).map_err(|error| -> DynError {
+        format!(
+            "ASTRO_ARCHAEOLOGY_MATERIALIZATION_TREE_CREATE_FAILED: could not create checkout root {}: {error}",
+            checkout_root.display()
+        )
+        .into()
+    })?;
+    let index = scope.join("index");
+    git_index_checked(repo, &index, &["read-tree", commit])?;
 
-/// Whether `commit`'s tree contains `path` (a toplevel-relative directory or file).
-/// Uses `git cat-file -e <commit>:<path>`, which exits zero iff the object exists; a
-/// missing path exits non-zero — not an error here, since an absent member subtree at
-/// a historical commit is an expected, gracefully-handled case (the caller then skips
-/// materialization). Only a genuine spawn failure propagates.
-fn git_tree_has_path(repo: &Path, commit: &str, path: &str) -> Result<bool, DynError> {
-    let spec = format!("{commit}:{path}");
     let output = Command::new("git")
         .arg("-C")
         .arg(repo)
-        .args(["cat-file", "-e", &spec])
-        .stderr(std::process::Stdio::null())
+        .args(["-c", "core.longpaths=true", "ls-files", "--cached", "-z"])
+        .env("GIT_INDEX_FILE", &index)
+        .output()
+        .map_err(|error| -> DynError {
+            format!("ASTRO_ARCHAEOLOGY_GIT_INDEX_INVENTORY_SPAWN_FAILED: commit {commit}: {error}")
+                .into()
+        })?;
+    if !output.status.success() {
+        return Err(format!(
+            "ASTRO_ARCHAEOLOGY_GIT_INDEX_INVENTORY_FAILED: commit {commit}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )
+        .into());
+    }
+    let mut inventory = BTreeSet::new();
+    for raw in output.stdout.split(|byte| *byte == 0) {
+        if raw.is_empty() {
+            continue;
+        }
+        let path = std::str::from_utf8(raw).map_err(|error| -> DynError {
+            format!(
+                "ASTRO_ARCHAEOLOGY_GIT_INDEX_PATH_INVALID_UTF8: commit {commit} contains a path that cannot be represented by the code-domain identity contract: {error}"
+            )
+            .into()
+        })?;
+        inventory.insert(path.to_string());
+    }
+
+    let mut windows_invalid_excluded = 0usize;
+    let mut object_probe_processes_avoided = 0usize;
+    let selected = if file_scoped {
+        let mut requested = BTreeSet::new();
+        for rel in implicated_files {
+            let toplevel_path = if corpus_rel.is_empty() {
+                rel.clone()
+            } else {
+                format!("{corpus_rel}/{rel}")
+            };
+            if toplevel_path.is_empty()
+                || toplevel_path.starts_with('/')
+                || toplevel_path.split('/').any(|component| component == "..")
+            {
+                return Err(format!(
+                    "ASTRO_ARCHAEOLOGY_PATH_INVALID: commit {commit} has an implicated path outside the corpus: {toplevel_path:?}; correct the mined evidence before retrying"
+                )
+                .into());
+            }
+            if let Some(reason) = windows_invalid_path(toplevel_path.as_bytes()) {
+                eprintln!(
+                    "astro.archaeology.windows_invalid_path commit={commit} path={toplevel_path:?} reason={reason}"
+                );
+                windows_invalid_excluded += 1;
+                continue;
+            }
+            requested.insert(toplevel_path);
+        }
+        object_probe_processes_avoided = requested.len();
+        requested
+            .intersection(&inventory)
+            .cloned()
+            .collect::<BTreeSet<_>>()
+    } else {
+        let prefix = if corpus_rel.is_empty() {
+            None
+        } else {
+            Some(format!("{corpus_rel}/"))
+        };
+        inventory
+            .into_iter()
+            .filter(|path| {
+                corpus_rel.is_empty()
+                    || path == corpus_rel
+                    || prefix
+                        .as_ref()
+                        .is_some_and(|prefix| path.starts_with(prefix))
+            })
+            .map(|path| {
+                if let Some(reason) = windows_invalid_path(path.as_bytes()) {
+                    Err(format!(
+                        "ASTRO_ARCHAEOLOGY_WINDOWS_PATH_UNREPRESENTABLE: commit {commit} path {path:?} cannot be materialized on Windows ({reason}); use file-scoped archaeology or correct the corpus before retrying"
+                    )
+                    .into())
+                } else {
+                    Ok(path)
+                }
+            })
+            .collect::<Result<BTreeSet<_>, DynError>>()?
+    };
+
+    let git_checkout_processes = usize::from(!selected.is_empty());
+    if !selected.is_empty() {
+        let mut input = Vec::new();
+        for path in &selected {
+            input.extend_from_slice(path.as_bytes());
+            input.push(0);
+        }
+        let prefix = format!("{}/", path_str(checkout_root)?.replace('\\', "/"));
+        let mut child = Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args([
+                "-c",
+                "core.longpaths=true",
+                "checkout-index",
+                "--force",
+                "-z",
+                "--stdin",
+            ])
+            .arg(format!("--prefix={prefix}"))
+            .env("GIT_INDEX_FILE", &index)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|error| -> DynError {
+                format!("ASTRO_ARCHAEOLOGY_GIT_CHECKOUT_SPAWN_FAILED: commit {commit}: {error}")
+                    .into()
+            })?;
+        child
+            .stdin
+            .take()
+            .ok_or_else(|| -> DynError {
+                "ASTRO_ARCHAEOLOGY_GIT_CHECKOUT_STDIN_MISSING: checkout-index did not expose its requested stdin".into()
+            })?
+            .write_all(&input)?;
+        let output = child.wait_with_output()?;
+        if !output.status.success() {
+            return Err(format!(
+                "ASTRO_ARCHAEOLOGY_GIT_CHECKOUT_FAILED: commit {commit}: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            )
+            .into());
+        }
+    }
+
+    Ok(HistoricalMaterialization {
+        windows_invalid_excluded,
+        git_inventory_processes: 2,
+        git_checkout_processes,
+        files_materialized: selected.len(),
+        object_probe_processes_avoided,
+    })
+}
+
+fn git_index_checked(repo: &Path, index: &Path, args: &[&str]) -> Result<(), DynError> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["-c", "core.longpaths=true"])
+        .args(args)
+        .env("GIT_INDEX_FILE", index)
         .output()?;
-    Ok(output.status.success())
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "ASTRO_ARCHAEOLOGY_GIT_TEMP_INDEX_FAILED: command {:?}, index {}, error {}",
+            args,
+            index.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        )
+        .into())
+    }
 }
 
 /// The requested corpus path relative to its git repository toplevel, forward-slash
@@ -2352,7 +3000,7 @@ fn historical_subject_id(location: &HistoricalSymbolLocation) -> String {
 }
 
 pub(crate) fn git_archaeology_summary(report: &GitArchaeologyImportReport) -> Value {
-    json!({
+    let mut summary = json!({
         "status": "imported",
         "mode": report.mode,
         "head": report.head,
@@ -2391,5 +3039,212 @@ pub(crate) fn git_archaeology_summary(report: &GitArchaeologyImportReport) -> Va
         "archaeology_source": report.archaeology_source,
         "git_root": report.git_root,
         "pathspec": report.pathspec,
-    })
+    });
+    let object = summary
+        .as_object_mut()
+        .expect("git archaeology summary literal is an object");
+    macro_rules! insert_number {
+        ($name:literal, $value:expr) => {
+            object.insert($name.to_string(), Value::from($value));
+        };
+    }
+    object.insert(
+        "anchor_batch_registry_version".to_string(),
+        Value::from(report.anchor_batch_registry_version),
+    );
+    insert_number!("anchor_batch_limit", report.anchor_batch_limit);
+    insert_number!(
+        "historical_batch_group_limit",
+        report.historical_batch_group_limit
+    );
+    insert_number!(
+        "historical_admission_groups",
+        report.historical_admission_groups
+    );
+    insert_number!(
+        "historical_admission_logical_entries",
+        report.historical_admission_logical_entries
+    );
+    insert_number!(
+        "historical_admission_atomic_commits",
+        report.historical_admission_atomic_commits
+    );
+    insert_number!(
+        "historical_admission_flushes",
+        report.historical_admission_flushes
+    );
+    insert_number!(
+        "historical_admission_max_window_groups",
+        report.historical_admission_max_window_groups
+    );
+    insert_number!(
+        "historical_admission_rows_written",
+        report.historical_admission_rows_written
+    );
+    insert_number!(
+        "historical_admission_ledger_refs_verified",
+        report.historical_admission_ledger_refs_verified
+    );
+    insert_number!(
+        "persistence_ledger_files_opened",
+        report.persistence_ledger_files_opened
+    );
+    insert_number!(
+        "persistence_ledger_complete_scan_wanted",
+        report.persistence_ledger_complete_scan_wanted
+    );
+    insert_number!(
+        "persistence_atomic_commits",
+        report.persistence_atomic_commits
+    );
+    insert_number!("persistence_flushes", report.persistence_flushes);
+    insert_number!(
+        "persistence_durable_sst_files",
+        report.persistence_durable_sst_files
+    );
+    insert_number!(
+        "persistence_durable_sst_entries",
+        report.persistence_durable_sst_entries
+    );
+    insert_number!(
+        "persistence_durable_sst_bytes",
+        report.persistence_durable_sst_bytes
+    );
+    insert_number!("anchor_logical_entries", report.anchor_logical_entries);
+    insert_number!("anchor_atomic_commits", report.anchor_atomic_commits);
+    insert_number!("anchor_flushes", report.anchor_flushes);
+    insert_number!("anchor_max_batch_entries", report.anchor_max_batch_entries);
+    insert_number!("anchor_rows_written", report.anchor_rows_written);
+    insert_number!(
+        "anchor_ledger_refs_verified",
+        report.anchor_ledger_refs_verified
+    );
+    insert_number!("anchor_durable_sst_files", report.anchor_durable_sst_files);
+    insert_number!(
+        "anchor_durable_sst_entries",
+        report.anchor_durable_sst_entries
+    );
+    insert_number!("anchor_durable_sst_bytes", report.anchor_durable_sst_bytes);
+    insert_number!("anchor_router_sst_files", report.anchor_router_sst_files);
+    insert_number!(
+        "anchor_router_sst_entries",
+        report.anchor_router_sst_entries
+    );
+    insert_number!("anchor_router_sst_bytes", report.anchor_router_sst_bytes);
+    insert_number!(
+        "anchor_router_handoff_full_inventories",
+        report.anchor_router_handoff_full_inventories
+    );
+    insert_number!(
+        "anchor_router_handoff_memtable_rows_verified",
+        report.anchor_router_handoff_memtable_rows_verified
+    );
+    insert_number!(
+        "anchor_router_handoff_flush_files_verified",
+        report.anchor_router_handoff_flush_files_verified
+    );
+    insert_number!(
+        "anchor_router_handoff_flush_entries_verified",
+        report.anchor_router_handoff_flush_entries_verified
+    );
+    insert_number!(
+        "anchor_router_handoff_flush_files_retired",
+        report.anchor_router_handoff_flush_files_retired
+    );
+    insert_number!(
+        "anchor_router_handoff_flush_bytes_retired",
+        report.anchor_router_handoff_flush_bytes_retired
+    );
+    insert_number!(
+        "anchor_router_handoff_debt_files_after",
+        report.anchor_router_handoff_debt_files_after
+    );
+    insert_number!(
+        "anchor_router_handoff_debt_bytes_after",
+        report.anchor_router_handoff_debt_bytes_after
+    );
+    insert_number!("anchor_batch_wall_ms", report.anchor_batch_wall_ms);
+    insert_number!("index_loop_wall_ms", report.index_loop_wall_ms);
+    insert_number!("blame_requested_ranges", report.blame_requested_ranges);
+    insert_number!("blame_effective_ranges", report.blame_effective_ranges);
+    insert_number!("blame_processes", report.blame_processes);
+    insert_number!("blame_returned_spans", report.blame_returned_spans);
+    insert_number!("blame_returned_lines", report.blame_returned_lines);
+    insert_number!("blame_stdout_bytes", report.blame_stdout_bytes);
+    insert_number!("blame_wall_ms", report.blame_wall_ms);
+    insert_number!(
+        "historical_git_inventory_processes",
+        report.historical_git_inventory_processes
+    );
+    insert_number!(
+        "historical_git_checkout_processes",
+        report.historical_git_checkout_processes
+    );
+    insert_number!(
+        "historical_git_files_materialized",
+        report.historical_git_files_materialized
+    );
+    insert_number!(
+        "historical_git_source_files_materialized",
+        report.historical_git_source_files_materialized
+    );
+    insert_number!(
+        "historical_commits_without_materialized_source",
+        report.historical_commits_without_materialized_source
+    );
+    insert_number!(
+        "historical_git_object_probe_processes_avoided",
+        report.historical_git_object_probe_processes_avoided
+    );
+    insert_number!(
+        "historical_git_worktree_mutations_avoided",
+        report.historical_git_worktree_mutations_avoided
+    );
+    let mut usage = serde_json::Map::new();
+    usage.insert(
+        "kernel_time_100ns".to_string(),
+        Value::from(report.index_loop_usage.kernel_time_100ns),
+    );
+    usage.insert(
+        "user_time_100ns".to_string(),
+        Value::from(report.index_loop_usage.user_time_100ns),
+    );
+    usage.insert(
+        "read_operations".to_string(),
+        Value::from(report.index_loop_usage.read_operations),
+    );
+    usage.insert(
+        "read_bytes".to_string(),
+        Value::from(report.index_loop_usage.read_bytes),
+    );
+    usage.insert(
+        "write_operations".to_string(),
+        Value::from(report.index_loop_usage.write_operations),
+    );
+    usage.insert(
+        "write_bytes".to_string(),
+        Value::from(report.index_loop_usage.write_bytes),
+    );
+    usage.insert(
+        "page_faults".to_string(),
+        Value::from(report.index_loop_usage.page_faults),
+    );
+    usage.insert(
+        "working_set_bytes_after".to_string(),
+        Value::from(report.index_loop_usage.working_set_bytes_after),
+    );
+    usage.insert(
+        "peak_working_set_bytes_after".to_string(),
+        Value::from(report.index_loop_usage.peak_working_set_bytes_after),
+    );
+    usage.insert(
+        "private_bytes_after".to_string(),
+        Value::from(report.index_loop_usage.private_bytes_after),
+    );
+    usage.insert(
+        "peak_private_bytes_after".to_string(),
+        Value::from(report.index_loop_usage.peak_private_bytes_after),
+    );
+    object.insert("index_loop_usage".to_string(), Value::Object(usage));
+    summary
 }

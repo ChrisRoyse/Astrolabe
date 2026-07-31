@@ -32,6 +32,12 @@ pub(crate) const GIT_SOURCE_REPO_PATH_KEY: &str = "git_source_repo_path";
 /// project metadata row. Interrupted multi-artifact recovery uses this as the
 /// sole commit marker; file presence never decides whether config committed.
 pub(crate) const SHADOW_PUBLICATION_GENERATION_KEY: &str = "shadow_publication_generation";
+/// Artifact-publication generation that the current index admission identity
+/// was evaluated against. This is deliberately separate from the action hash:
+/// a metadata-only action acknowledgement retains the exact artifact generation
+/// while atomically advancing the action-derived metadata that was proven over it.
+pub(crate) const SHADOW_INDEX_ADMISSION_PUBLICATION_GENERATION_KEY: &str =
+    "index_admission_publication_generation";
 /// The required row-stream import failed. No alternate representation is
 /// accepted: it would hide the failed source and could publish incomplete
 /// kernel/provenance state.
@@ -70,6 +76,11 @@ pub(crate) struct ShadowImportOutcome {
     /// publication then validates and preserves the live artifacts before
     /// discarding the stage.
     pub(crate) publication_required: bool,
+    /// True when the current action was evaluated over byte-identical source,
+    /// lowered, and vault artifacts but produced new action-bound metadata. The
+    /// publication layer may update only that metadata after proving the live
+    /// artifact generation and complete project-config preimage unchanged.
+    pub(crate) metadata_publication_required: bool,
     /// Machine-readable reason for either publishing the staged generation or
     /// proving that the existing live generation can be retained unchanged.
     pub(crate) publication_reason: &'static str,
@@ -1228,6 +1239,10 @@ pub(crate) fn ensure_shadow_import_current_at(
 /// last used for this project. It is committed with the published generation so
 /// operators can reproduce the exact source invocation; read paths never replay it.
 pub(crate) const SHADOW_INDEX_ARGS_KEY: &str = "index_args_json";
+/// Complete input/producer identity for the pre-seed unchanged-repository gate (#858).
+/// The record is committed in the same SQLite transaction as the artifacts it names.
+pub(crate) const SHADOW_INDEX_ADMISSION_IDENTITY_KEY: &str = "index_admission_identity_json";
+pub(crate) const SHADOW_INDEX_ADMISSION_SCHEMA: &str = "astrolabe.shadow_index_admission.v1";
 pub(crate) const GIT_ARCHAEOLOGY_HEAD_KEY: &str = "git_archaeology_head";
 
 /// Metadata key recording the path convention under which this project's git-archaeology
@@ -1246,6 +1261,215 @@ pub(crate) const GIT_ARCHAEOLOGY_PATH_CONVENTION_KEY: &str = "git_archaeology_pa
 /// anchor is re-derived under this convention (explicit reconciliation, never a silent
 /// mixed-convention incremental).
 pub(crate) const GIT_ARCHAEOLOGY_PATH_CONVENTION: &str = "subtree_relative_v1";
+
+#[derive(Debug, Clone)]
+pub(crate) struct ShadowIndexAdmissionIdentity {
+    record: Value,
+    identity_sha256: String,
+    producer_executable_sha256: String,
+}
+
+impl ShadowIndexAdmissionIdentity {
+    pub(crate) fn record_json(&self) -> Result<String, DynError> {
+        Ok(serde_json::to_string(&self.record)?)
+    }
+
+    pub(crate) fn identity_sha256(&self) -> &str {
+        &self.identity_sha256
+    }
+
+    fn producer_contract_identity(&self) -> Result<Value, DynError> {
+        let inputs = self
+            .record
+            .get("inputs")
+            .and_then(Value::as_object)
+            .ok_or_else(|| -> DynError {
+                "ASTRO_SHADOW_ADMISSION_IDENTITY_INVALID: admission inputs are not an object; remediation: preserve the generation and rebuild from authoritative source".into()
+            })?;
+        let contracts = inputs.get("contracts").ok_or_else(|| -> DynError {
+            "ASTRO_SHADOW_ADMISSION_IDENTITY_INVALID: admission inputs have no durable contract identity; remediation: preserve the generation and rebuild from authoritative source".into()
+        })?;
+        Ok(json!({
+            "contracts": contracts,
+            "producer_executable_sha256": self.producer_executable_sha256,
+        }))
+    }
+}
+
+pub(crate) fn shadow_index_action_policy(
+    cache_dir: &Path,
+    project: &str,
+    expected_identity: &ShadowIndexAdmissionIdentity,
+) -> Result<ShadowIndexActionPolicy, DynError> {
+    let identity_key = metadata_key(project, SHADOW_INDEX_ADMISSION_IDENTITY_KEY);
+    let Some(persisted_identity_raw) = read_config_value(cache_dir, &identity_key)? else {
+        return Ok(ShadowIndexActionPolicy::RebuildDerived {
+            reason: "published_admission_identity_absent".to_string(),
+        });
+    };
+    let persisted_identity =
+        parse_shadow_index_admission_identity(project, &identity_key, &persisted_identity_raw)?;
+    if persisted_identity.identity_sha256 == expected_identity.identity_sha256
+        && persisted_identity.record == expected_identity.record
+    {
+        return Ok(ShadowIndexActionPolicy::Preserve);
+    }
+
+    let reason = format!(
+        "index_action_changed:expected={} persisted={}",
+        expected_identity.identity_sha256, persisted_identity.identity_sha256
+    );
+    if persisted_identity.producer_contract_identity()?
+        == expected_identity.producer_contract_identity()?
+    {
+        Ok(ShadowIndexActionPolicy::PublishMetadata { reason })
+    } else {
+        Ok(ShadowIndexActionPolicy::RebuildDerived { reason })
+    }
+}
+
+#[derive(Debug)]
+pub(crate) enum ShadowIndexNoopAdmission {
+    Hit {
+        result: String,
+    },
+    Miss {
+        reason: String,
+        action_policy: ShadowIndexActionPolicy,
+    },
+}
+
+/// How an exact content no-op may treat the current index action.
+///
+/// `Preserve` means the complete action identity already matches. `PublishMetadata`
+/// means the producer and durable contracts match but caller-controlled arguments or
+/// knobs changed, so the current row candidate can be compared and acknowledged without
+/// replacing the physical artifacts. `RebuildDerived` is required when the producer or
+/// a durable contract changed (or no prior identity exists), because prior derived output
+/// cannot be attributed to the current producer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ShadowIndexActionPolicy {
+    Preserve,
+    PublishMetadata { reason: String },
+    RebuildDerived { reason: String },
+}
+
+impl ShadowIndexActionPolicy {
+    fn reason(&self) -> &str {
+        match self {
+            Self::Preserve => "index_action_unchanged",
+            Self::PublishMetadata { reason } | Self::RebuildDerived { reason } => reason,
+        }
+    }
+
+    fn metadata_publication_required(&self) -> bool {
+        matches!(self, Self::PublishMetadata { .. })
+    }
+
+    fn permits_content_noop(&self) -> bool {
+        !matches!(self, Self::RebuildDerived { .. })
+    }
+}
+
+/// Capture every input that can change the logical shadow generation before
+/// deciding whether an explicit `index_repository` call may be skipped.
+///
+/// This follows the same correctness rule as a content-addressed build action:
+/// source alone is insufficient. The CBM arguments, effective Astrolabe knobs,
+/// identity schema versions, and the exact executable bytes are all part of the
+/// action identity. A restarted server with a different binary therefore earns
+/// no hit against output produced by the prior implementation.
+pub(crate) fn shadow_index_admission_identity(
+    sanitized_index_args: &str,
+    search_scale: &SearchScaleSettings,
+    skills: &SkillDiscoveryConfig,
+) -> Result<ShadowIndexAdmissionIdentity, DynError> {
+    let sanitized_index_args: Value = serde_json::from_str(sanitized_index_args).map_err(
+        |error| -> DynError {
+            format!(
+                "ASTRO_SHADOW_ADMISSION_ARGS_INVALID: sanitized index arguments are not valid JSON: {error}"
+            )
+            .into()
+        },
+    )?;
+    if !sanitized_index_args.is_object() {
+        return Err(
+            "ASTRO_SHADOW_ADMISSION_ARGS_INVALID: sanitized index arguments must be a JSON object"
+                .into(),
+        );
+    }
+    let producer_executable_sha256 = current_executable_sha256()?;
+    let inputs = json!({
+        "schema": SHADOW_INDEX_ADMISSION_SCHEMA,
+        "sanitized_index_args": sanitized_index_args,
+        // `source` is intentionally excluded: runtime_default and config_readback
+        // are provenance labels for how identical effective values were obtained,
+        // not inputs that change the produced graph or kernel.
+        "effective_search_scale": {
+            "index_backend": search_scale.index_backend.as_str(),
+            "funnel_activation_records": search_scale.funnel_activation_records,
+            "estimated_index_rss_bytes": search_scale.estimated_index_rss_bytes,
+            "master_budget_bytes": search_scale.master_budget_bytes,
+            "knob_registry_version": SEARCH_SCALE_KNOB_REGISTRY_VERSION,
+        },
+        "effective_skill_discovery": {
+            "min_cluster_size": skills.min_cluster_size,
+            "min_shared_token_permille": skills.min_shared_token_permille,
+            "max_symbols": skills.max_symbols,
+            "knob_registry_version": SKILL_DISCOVERY_KNOB_REGISTRY_VERSION,
+        },
+        "contracts": {
+            "panel_version": SHADOW_PANEL_VERSION,
+            "symbol_canonical_schema": SYMBOL_CANONICAL_TAG,
+            "git_archaeology_path_convention": GIT_ARCHAEOLOGY_PATH_CONVENTION,
+            "git_source_fingerprint_algo": astrolabe_anchors::archaeology::GIT_SOURCE_FINGERPRINT_ALGO,
+            "git_source_fingerprint_version": astrolabe_anchors::archaeology::GIT_SOURCE_FINGERPRINT_VERSION,
+            "shadow_watermark_algo": SHADOW_WATERMARK_ALGO,
+            "shadow_watermark_version": SHADOW_WATERMARK_VERSION,
+        },
+        "producer_executable_sha256": producer_executable_sha256,
+    });
+    let identity_sha256 = shadow_index_admission_inputs_sha256(&inputs)?;
+    let record = json!({
+        "schema": SHADOW_INDEX_ADMISSION_SCHEMA,
+        "identity_sha256": identity_sha256,
+        "inputs": inputs,
+    });
+    Ok(ShadowIndexAdmissionIdentity {
+        record,
+        identity_sha256,
+        producer_executable_sha256,
+    })
+}
+
+fn current_executable_sha256() -> Result<String, DynError> {
+    static CURRENT_EXECUTABLE_SHA256: OnceLock<Result<String, String>> = OnceLock::new();
+    match CURRENT_EXECUTABLE_SHA256.get_or_init(|| {
+        let path = std::env::current_exe().map_err(|error| {
+            format!(
+                "ASTRO_SHADOW_PRODUCER_IDENTITY_UNAVAILABLE: current executable path is unavailable: {error}"
+            )
+        })?;
+        sha256_file_hex(&path).map_err(|error| {
+            format!(
+                "ASTRO_SHADOW_PRODUCER_IDENTITY_UNAVAILABLE: cannot hash current executable {}: {error}",
+                path.display()
+            )
+        })
+    }) {
+        Ok(digest) => Ok(digest.clone()),
+        Err(error) => Err(error.clone().into()),
+    }
+}
+
+fn shadow_index_admission_inputs_sha256(inputs: &Value) -> Result<String, DynError> {
+    let bytes = serde_json::to_vec(inputs)?;
+    let mut hasher = Sha256::new();
+    hasher.update(b"astrolabe.shadow-index-admission.inputs.v1\0");
+    hasher.update((bytes.len() as u64).to_be_bytes());
+    hasher.update(bytes);
+    Ok(hex_lower(&hasher.finalize()))
+}
 
 pub(crate) fn try_shadow_import_lock(
     cache_dir: &Path,
@@ -1367,6 +1591,7 @@ pub(crate) fn import_shadow_vault_with_archaeology_at(
     row_sink: RowSinkImportCandidate,
     search_scale_settings: &SearchScaleSettings,
     repo: Option<&Path>,
+    action_policy: &ShadowIndexActionPolicy,
 ) -> Result<ShadowImportOutcome, DynError> {
     fs::create_dir_all(cache_dir)?;
     let sqlite_path = sqlite_path(cache_dir, project);
@@ -1555,7 +1780,8 @@ pub(crate) fn import_shadow_vault_with_archaeology_at(
     let exact_noop = prior_generation_observed
         && !import_changed
         && git_source_identity_unchanged
-        && symbol_canonical_contract_current;
+        && symbol_canonical_contract_current
+        && action_policy.permits_content_noop();
     if exact_noop {
         let persisted_content_sha256 = match persisted_content_watermark.as_deref() {
             None => {
@@ -1634,14 +1860,30 @@ pub(crate) fn import_shadow_vault_with_archaeology_at(
             &metadata_key(project, "vault_import_fallback_reason"),
         )?
         .filter(|reason| !reason.is_empty());
-        let search_scale = read_required_shadow_json(cache_dir, project, "search_scale_json")?;
+        let metadata_publication_required = action_policy.metadata_publication_required();
+        let total_records = (report.sqlite_nodes as u64).saturating_add(report.sqlite_edges as u64);
+        let search_scale = if metadata_publication_required {
+            search_scale_summary(search_scale_settings, total_records)?
+        } else {
+            read_required_shadow_json(cache_dir, project, "search_scale_json")?
+        };
+        let skill_tree = if metadata_publication_required {
+            shadow_import.skill_tree
+        } else {
+            read_required_shadow_json(cache_dir, project, "skill_tree_json")?
+        };
         let provenance = read_required_shadow_json(cache_dir, project, "provenance_json")?;
         let git_archaeology =
             read_required_shadow_json(cache_dir, project, "git_archaeology_json")?;
         let kernel_context = read_required_shadow_json(cache_dir, project, "kernel_context_json")?;
         return Ok(ShadowImportOutcome {
             publication_required: false,
-            publication_reason: "unchanged",
+            metadata_publication_required,
+            publication_reason: if metadata_publication_required {
+                "source_unchanged_index_action_metadata_changed"
+            } else {
+                "unchanged"
+            },
             vault_dir,
             vault_id: SHADOW_VAULT_ID.to_string(),
             vault_salt,
@@ -1678,7 +1920,7 @@ pub(crate) fn import_shadow_vault_with_archaeology_at(
             vault_import_fallback_reason,
             security_screen: read_required_shadow_json(cache_dir, project, "security_screen_json")?,
             search_scale,
-            skill_tree: read_required_shadow_json(cache_dir, project, "skill_tree_json")?,
+            skill_tree,
             bridges: read_required_shadow_json(cache_dir, project, "bridge_reports_json")?,
             kernel_context,
             anomalies: read_required_shadow_json(cache_dir, project, "anomaly_report_json")?,
@@ -1867,6 +2109,7 @@ pub(crate) fn import_shadow_vault_with_archaeology_at(
 
     Ok(ShadowImportOutcome {
         publication_required: true,
+        metadata_publication_required: false,
         publication_reason: "source_or_derived_changed",
         vault_dir,
         vault_id: SHADOW_VAULT_ID.to_string(),
@@ -3001,15 +3244,680 @@ fn read_required_shadow_json(
     })
 }
 
+/// Attempt the pre-seed unchanged-generation path for one exact project.
+///
+/// `Hit` is returned only after separate physical reads prove that the source,
+/// effective index action, CBM SQLite, lowered artifact, vault history, and
+/// project metadata are the same generation. Expected source/producer/argument
+/// changes are cache misses and run the real pipeline. Malformed or internally
+/// inconsistent persisted state is an error, never a miss that silently rebuilds
+/// over the evidence.
+pub(crate) fn try_shadow_index_noop_admission(
+    cache_dir: &Path,
+    project: &str,
+    repo_path: &Path,
+    expected_identity: &ShadowIndexAdmissionIdentity,
+    action_policy: &ShadowIndexActionPolicy,
+) -> Result<ShadowIndexNoopAdmission, DynError> {
+    let started = Instant::now();
+    let identity_key = metadata_key(project, SHADOW_INDEX_ADMISSION_IDENTITY_KEY);
+    if action_policy != &ShadowIndexActionPolicy::Preserve {
+        return Ok(ShadowIndexNoopAdmission::Miss {
+            reason: action_policy.reason().to_string(),
+            action_policy: action_policy.clone(),
+        });
+    }
+    let persisted_identity_raw = expected_identity.record_json()?;
+
+    let admission_publication_generation = read_config_value(
+        cache_dir,
+        &metadata_key(project, SHADOW_INDEX_ADMISSION_PUBLICATION_GENERATION_KEY),
+    )?;
+
+    let publication_generation =
+        required_shadow_config_value(cache_dir, project, SHADOW_PUBLICATION_GENERATION_KEY)?;
+    if admission_publication_generation.as_deref() != Some(publication_generation.as_str()) {
+        return Ok(ShadowIndexNoopAdmission::Miss {
+            reason: "admission_artifact_generation_binding_absent_or_changed".to_string(),
+            action_policy: ShadowIndexActionPolicy::RebuildDerived {
+                reason: "admission_artifact_generation_binding_absent_or_changed".to_string(),
+            },
+        });
+    }
+    let persisted_source_fingerprint =
+        required_shadow_config_value(cache_dir, project, GIT_SOURCE_FINGERPRINT_KEY)?;
+    let persisted_repo_path =
+        required_shadow_config_value(cache_dir, project, GIT_SOURCE_REPO_PATH_KEY)?;
+    let canonical_repo = fs::canonicalize(repo_path).map_err(|error| -> DynError {
+        format!(
+            "ASTRO_SHADOW_NOOP_REPO_UNRESOLVED: canonicalizing requested repository {} failed: {error}; remediation: restore the exact indexed source root before retrying",
+            repo_path.display()
+        )
+        .into()
+    })?;
+    let canonical_persisted_repo =
+        fs::canonicalize(&persisted_repo_path).map_err(|error| -> DynError {
+            format!(
+                "ASTRO_SHADOW_NOOP_PERSISTED_REPO_UNRESOLVED: canonicalizing persisted repository {persisted_repo_path:?} failed: {error}; remediation: restore the exact indexed source root or run an explicit index from its new canonical location"
+            )
+            .into()
+        })?;
+    if canonical_repo != canonical_persisted_repo {
+        return Ok(ShadowIndexNoopAdmission::Miss {
+            reason: format!(
+                "repository_identity_changed:requested={} persisted={}",
+                canonical_repo.display(),
+                canonical_persisted_repo.display()
+            ),
+            action_policy: action_policy.clone(),
+        });
+    }
+
+    let source_fingerprint_before =
+        astrolabe_anchors::archaeology::git_source_fingerprint(&canonical_repo)?;
+    if source_fingerprint_before != persisted_source_fingerprint {
+        return Ok(ShadowIndexNoopAdmission::Miss {
+            reason: "git_source_changed".to_string(),
+            action_policy: action_policy.clone(),
+        });
+    }
+
+    let config_rows_before = shadow_project_config_rows(cache_dir, project)?;
+    let config_rows_sha256 = hex_lower(&Sha256::digest(serde_json::to_vec(&config_rows_before)?));
+
+    let source_path = sqlite_path(cache_dir, project);
+    if !source_path.exists() {
+        return Err(format!(
+            "ASTRO_SHADOW_NOOP_SOURCE_MISSING: admission identity exists for project {project:?}, but the bound CBM SQLite source is absent at {}; remediation: preserve the remaining generation and rebuild from the authoritative repository",
+            source_path.display()
+        )
+        .into());
+    }
+    let persisted_watermark =
+        required_shadow_config_value(cache_dir, project, "vault_fingerprint")?;
+    let expected_source_sha256 = match parse_shadow_watermark(&persisted_watermark) {
+        ShadowWatermark::Tagged {
+            algo,
+            version,
+            digest,
+        } if algo == SHADOW_WATERMARK_ALGO && version == SHADOW_WATERMARK_VERSION => digest,
+        classified => {
+            return Err(format!(
+                "ASTRO_SHADOW_NOOP_WATERMARK_INVALID: project {project:?} cannot bind an unchanged generation to persisted watermark {classified:?}; expected {SHADOW_WATERMARK_ALGO}:{SHADOW_WATERMARK_VERSION}:<sha256>; remediation: preserve the live generation and rebuild from authoritative source"
+            )
+            .into());
+        }
+    };
+    let actual_source_sha256 = astrolabe_ingest::fingerprint_sqlite_hex(&source_path)?;
+    if actual_source_sha256 != expected_source_sha256 {
+        return Err(format!(
+            "ASTRO_SHADOW_NOOP_SOURCE_HASH_MISMATCH: project {project:?} CBM SQLite hashes to {actual_source_sha256}, but its committed watermark binds {expected_source_sha256}; remediation: preserve the mixed generation and rebuild from the authoritative repository"
+        )
+        .into());
+    }
+    let (sqlite_nodes, sqlite_edges, sqlite_orphan_edges) =
+        read_shadow_source_counts(&source_path, project)?;
+    if sqlite_orphan_edges != 0 {
+        return Err(format!(
+            "ASTRO_SHADOW_NOOP_SOURCE_ORPHANS: project {project:?} contains {sqlite_orphan_edges} persisted source edges whose endpoint row is absent; remediation: preserve the corrupt source database and rebuild from the authoritative repository"
+        )
+        .into());
+    }
+
+    let lowered_path = PathBuf::from(required_shadow_config_value(
+        cache_dir,
+        project,
+        "lowered_sqlite_path",
+    )?);
+    let lower_state = read_persisted_lower_state(cache_dir, project)?.ok_or_else(|| -> DynError {
+        format!(
+            "ASTRO_SHADOW_NOOP_LOWER_STATE_MISSING: project {project:?} has an admission identity but no complete lowered-state metadata; remediation: preserve the incomplete generation and rebuild from authoritative source"
+        )
+        .into()
+    })?;
+    if !lowered_path.exists() {
+        return Err(format!(
+            "ASTRO_SHADOW_NOOP_LOWERED_MISSING: project {project:?} binds a lowered artifact at {}, but it is absent; remediation: preserve the incomplete generation and rebuild from authoritative source",
+            lowered_path.display()
+        )
+        .into());
+    }
+    validate_configured_lower_artifact_hash(project, &lowered_path, &lower_state)?;
+
+    let configured_vault_dir = PathBuf::from(required_shadow_config_value(
+        cache_dir,
+        project,
+        "vault_dir",
+    )?);
+    let vault_id = required_shadow_config_value(cache_dir, project, "vault_id")?;
+    let vault_salt = required_shadow_config_value(cache_dir, project, "vault_salt")?;
+    let expected_ledger_seq = required_shadow_config_u64(cache_dir, project, "ledger_seq")?;
+    let expected_ledger_rows = required_shadow_config_u64(cache_dir, project, "ledger_rows")?;
+    let vault =
+        open_shadow_vault_read_only(&configured_vault_dir, &vault_id, &vault_salt, Vec::new())?;
+    let chain = verify_chain(&vault)?;
+    if !chain.is_intact()
+        || vault.latest_seq() != expected_ledger_seq
+        || chain.ledger_rows != expected_ledger_rows
+    {
+        return Err(format!(
+            "ASTRO_SHADOW_NOOP_VAULT_MISMATCH: project {project:?} physical vault readback is status={:?}, latest_seq={}, ledger_rows={}; config binds latest_seq={expected_ledger_seq}, ledger_rows={expected_ledger_rows}; remediation: preserve the mixed generation and rebuild only after inspecting the exact ledger divergence",
+            chain.status,
+            vault.latest_seq(),
+            chain.ledger_rows
+        )
+        .into());
+    }
+    let lowered_verification =
+        verify_lowered_artifact(&vault, &lowered_path, project).map_err(|error| -> DynError {
+            format!(
+                "ASTRO_SHADOW_NOOP_LOWERED_UNVERIFIED: project {project:?} lowered artifact does not verify against its exact live vault: {error}; remediation: preserve the mixed generation and rebuild from authoritative source"
+            )
+            .into()
+        })?;
+    validate_lower_verification(project, &lower_state, &lowered_verification)?;
+    drop(vault);
+
+    let panel_version = required_shadow_config_u64(cache_dir, project, "panel_version")?;
+    if panel_version != u64::from(SHADOW_PANEL_VERSION) {
+        return Ok(ShadowIndexNoopAdmission::Miss {
+            reason: format!(
+                "panel_contract_changed:persisted={panel_version} current={SHADOW_PANEL_VERSION}"
+            ),
+            action_policy: ShadowIndexActionPolicy::RebuildDerived {
+                reason: "panel_contract_changed".to_string(),
+            },
+        });
+    }
+    let symbol_schema =
+        required_shadow_config_value(cache_dir, project, "symbol_canonical_schema")?;
+    if symbol_schema != SYMBOL_CANONICAL_TAG {
+        return Ok(ShadowIndexNoopAdmission::Miss {
+            reason: "symbol_identity_contract_changed".to_string(),
+            action_policy: ShadowIndexActionPolicy::RebuildDerived {
+                reason: "symbol_identity_contract_changed".to_string(),
+            },
+        });
+    }
+
+    let mut weave = read_required_shadow_json(cache_dir, project, "weave_json")?;
+    let weave_object = weave.as_object_mut().ok_or_else(|| -> DynError {
+        format!(
+            "ASTRO_SHADOW_NOOP_WEAVE_INVALID: persisted weave metadata for project {project:?} is not an object; remediation: preserve the generation and rebuild from authoritative source"
+        )
+        .into()
+    })?;
+    weave_object.insert("status".to_string(), Value::String("unchanged".to_string()));
+    weave_object.insert("writes_skipped".to_string(), Value::Bool(true));
+    weave_object.insert(
+        "freshness".to_string(),
+        Value::String("current".to_string()),
+    );
+    weave_object.insert("trust".to_string(), Value::String("verified".to_string()));
+
+    let persisted_archaeology =
+        read_required_shadow_json(cache_dir, project, "git_archaeology_json")?;
+    let archaeology_sha256 =
+        hex_lower(&Sha256::digest(serde_json::to_vec(&persisted_archaeology)?));
+    let archaeology_head = persisted_archaeology
+        .get("head")
+        .cloned()
+        .unwrap_or(Value::Null);
+    let git_archaeology = json!({
+        "schema": "astrolabe.git_archaeology.noop.v1",
+        "status": "unchanged",
+        "mode": "unchanged",
+        "head": archaeology_head,
+        "persisted_summary_sha256": archaeology_sha256,
+        "historical_work_skipped": true,
+        "historical_commits_crashed": 0,
+        "historical_git_checkout_processes": 0,
+        "historical_git_inventory_processes": 0,
+        "historical_git_files_materialized": 0,
+        "historical_git_source_files_materialized": 0,
+        "anchor_logical_entries": 0,
+        "anchor_atomic_commits": 0,
+        "anchor_flushes": 0,
+        "anchor_durable_sst_files": 0,
+        "anchor_router_sst_files": 0,
+        "anchor_router_handoff_debt_files_after": 0,
+        "anchor_router_handoff_debt_bytes_after": 0,
+        "index_loop_wall_ms": 0,
+        "trust": "verified",
+        "freshness": "current",
+    });
+
+    // Re-read both independently mutable authorities after the potentially long
+    // vault/lowered verification. A source edit or project-config publication that
+    // raced this read invalidates the hit instead of returning a torn snapshot.
+    let source_fingerprint_after =
+        astrolabe_anchors::archaeology::git_source_fingerprint(&canonical_repo)?;
+    if source_fingerprint_after != source_fingerprint_before
+        || source_fingerprint_after != persisted_source_fingerprint
+    {
+        return Ok(ShadowIndexNoopAdmission::Miss {
+            reason: "git_source_changed_during_noop_validation".to_string(),
+            action_policy: action_policy.clone(),
+        });
+    }
+    let config_rows_after = shadow_project_config_rows(cache_dir, project)?;
+    if config_rows_after != config_rows_before {
+        return Err(format!(
+            "ASTRO_SHADOW_NOOP_CONFIG_CHANGED: project {project:?} metadata changed during unchanged-generation validation (before_sha256={config_rows_sha256}, after_sha256={}); remediation: retry after the concurrent project operation finishes",
+            hex_lower(&Sha256::digest(serde_json::to_vec(&config_rows_after)?))
+        )
+        .into());
+    }
+    if read_config_value(cache_dir, &identity_key)?.as_deref()
+        != Some(persisted_identity_raw.as_str())
+        || read_config_value(
+            cache_dir,
+            &metadata_key(project, SHADOW_PUBLICATION_GENERATION_KEY),
+        )?
+        .as_deref()
+            != Some(publication_generation.as_str())
+        || read_config_value(
+            cache_dir,
+            &metadata_key(project, SHADOW_INDEX_ADMISSION_PUBLICATION_GENERATION_KEY),
+        )?
+        .as_deref()
+            != Some(publication_generation.as_str())
+    {
+        return Err(format!(
+            "ASTRO_SHADOW_NOOP_GENERATION_CHANGED: project {project:?} admission or publication generation changed during validation; remediation: retry after the concurrent project operation finishes"
+        )
+        .into());
+    }
+
+    let structural_only = required_shadow_config_usize(cache_dir, project, "structural_only")?;
+    let constellation_inputs = sqlite_nodes.checked_sub(structural_only).ok_or_else(|| -> DynError {
+        format!(
+            "ASTRO_SHADOW_NOOP_NODE_COUNTS_INVALID: project {project:?} has sqlite_nodes={sqlite_nodes} below persisted structural_only={structural_only}; remediation: preserve the mixed generation and rebuild from authoritative source"
+        )
+        .into()
+    })?;
+    let cx_id_set_sha256 = required_shadow_config_value(cache_dir, project, "cx_id_set_sha256")?;
+    let vault_import_source =
+        required_shadow_config_value(cache_dir, project, "vault_import_source")?;
+    let vault_import_fallback_reason = read_config_value(
+        cache_dir,
+        &metadata_key(project, "vault_import_fallback_reason"),
+    )?
+    .filter(|reason| !reason.is_empty());
+    let elapsed_ms = u64::try_from(started.elapsed().as_millis()).map_err(|error| -> DynError {
+        format!(
+            "ASTRO_SHADOW_NOOP_DURATION_OVERFLOW: unchanged validation duration cannot be represented as u64 milliseconds: {error}; remediation: inspect the process clock and retry"
+        )
+        .into()
+    })?;
+    let idempotency = json!({
+        "new_cx_ids": 0,
+        "reused_cx_ids": sqlite_nodes.saturating_sub(structural_only),
+        "graph_rows_written": 0,
+        "edge_rows_written": 0,
+        "series_inputs": 0,
+        "series_mutated_rows": 0,
+        "cx_id_set_sha256": cx_id_set_sha256,
+    });
+    let lowered = lowered_summary(
+        &lowered_path,
+        Some(&lower_state.artifact_sha256),
+        Some(&lower_state.vault_fingerprint_sha256),
+        Some(lower_state.manifest_seq),
+        Some(lower_state.node_count),
+        Some(lower_state.edge_count),
+        Some(lower_state.skipped_edges),
+    );
+    let vault_import = vault_import_summary(
+        &vault_import_source,
+        vault_import_fallback_reason.as_deref(),
+    );
+    let security_screen = read_required_shadow_json(cache_dir, project, "security_screen_json")?;
+    let search_scale = read_required_shadow_json(cache_dir, project, "search_scale_json")?;
+    let skill_tree = read_required_shadow_json(cache_dir, project, "skill_tree_json")?;
+    let bridges = read_required_shadow_json(cache_dir, project, "bridge_reports_json")?;
+    let kernel_context = read_required_shadow_json(cache_dir, project, "kernel_context_json")?;
+    let anomalies = read_required_shadow_json(cache_dir, project, "anomaly_report_json")?;
+    let provenance = read_required_shadow_json(cache_dir, project, "provenance_json")?;
+    let health = health_surface_json(
+        project,
+        &chain.status,
+        true,
+        Some(expected_ledger_seq),
+        Some(expected_ledger_rows),
+        None,
+        None,
+    );
+    let stores = stores_summary(&source_path, &configured_vault_dir, Some(&lowered_path));
+    let noop_readback = Value::Object(
+        [
+            (
+                "schema".to_string(),
+                Value::String(SHADOW_INDEX_ADMISSION_SCHEMA.to_string()),
+            ),
+            (
+                "identity_sha256".to_string(),
+                Value::String(expected_identity.identity_sha256.clone()),
+            ),
+            (
+                "producer_executable_sha256".to_string(),
+                Value::String(expected_identity.producer_executable_sha256.clone()),
+            ),
+            (
+                "publication_generation".to_string(),
+                Value::String(publication_generation.clone()),
+            ),
+            (
+                "git_source_fingerprint_before".to_string(),
+                Value::String(source_fingerprint_before.clone()),
+            ),
+            (
+                "git_source_fingerprint_after".to_string(),
+                Value::String(source_fingerprint_after.clone()),
+            ),
+            (
+                "source_sqlite_sha256".to_string(),
+                Value::String(actual_source_sha256.clone()),
+            ),
+            (
+                "lowered_artifact_sha256".to_string(),
+                Value::String(lower_state.artifact_sha256.clone()),
+            ),
+            (
+                "lowered_vault_fingerprint_sha256".to_string(),
+                Value::String(lower_state.vault_fingerprint_sha256.clone()),
+            ),
+            (
+                "config_rows".to_string(),
+                Value::from(config_rows_before.len() as u64),
+            ),
+            (
+                "config_rows_sha256".to_string(),
+                Value::String(config_rows_sha256.clone()),
+            ),
+            (
+                "sqlite_orphan_edges".to_string(),
+                Value::from(sqlite_orphan_edges as u64),
+            ),
+            ("validation_wall_ms".to_string(), Value::from(elapsed_ms)),
+            ("trust".to_string(), Value::String("verified".to_string())),
+            (
+                "freshness".to_string(),
+                Value::String("current".to_string()),
+            ),
+        ]
+        .into_iter()
+        .collect(),
+    );
+    // Assemble this intentionally wide stable response iteratively. Keeping each
+    // bounded sub-surface independent avoids compiler macro recursion while
+    // preserving every field returned by a full import.
+    let grounding = Value::Object(
+        [
+            ("status".to_string(), Value::String("unchanged".to_string())),
+            ("writes_skipped".to_string(), Value::Bool(true)),
+            (
+                "publication_reason".to_string(),
+                Value::String("source_and_index_action_unchanged".to_string()),
+            ),
+            ("sqlite_nodes".to_string(), Value::from(sqlite_nodes as u64)),
+            ("sqlite_edges".to_string(), Value::from(sqlite_edges as u64)),
+            (
+                "constellation_inputs".to_string(),
+                Value::from(constellation_inputs as u64),
+            ),
+            (
+                "structural_only".to_string(),
+                Value::from(structural_only as u64),
+            ),
+            ("idempotency".to_string(), idempotency),
+            (
+                "sqlite_path".to_string(),
+                Value::String(source_path.to_string_lossy().into_owned()),
+            ),
+            ("lowered_sqlite".to_string(), lowered),
+            (
+                "vault_dir".to_string(),
+                Value::String(configured_vault_dir.to_string_lossy().into_owned()),
+            ),
+            ("vault_id".to_string(), Value::String(vault_id)),
+            ("vault_salt".to_string(), Value::String(vault_salt)),
+            ("ledger_seq".to_string(), Value::from(expected_ledger_seq)),
+            (
+                "ledger_rows_after".to_string(),
+                Value::from(expected_ledger_rows),
+            ),
+            ("verify_chain".to_string(), Value::String(chain.status)),
+            ("fsv".to_string(), Value::Null),
+            (
+                "panel_version".to_string(),
+                Value::from(SHADOW_PANEL_VERSION),
+            ),
+            (
+                "symbol_canonical_schema".to_string(),
+                Value::String(SYMBOL_CANONICAL_TAG.to_string()),
+            ),
+            (
+                "panel_runtime".to_string(),
+                Value::String("cbm_frozen_v1".to_string()),
+            ),
+            ("vault_import".to_string(), vault_import),
+            ("security_screen".to_string(), security_screen),
+            ("search_scale".to_string(), search_scale),
+            ("skill_tree".to_string(), skill_tree),
+            ("bridges".to_string(), bridges),
+            ("kernel_context".to_string(), kernel_context),
+            ("anomalies".to_string(), anomalies),
+            ("provenance".to_string(), provenance),
+            ("git_archaeology".to_string(), git_archaeology),
+            ("weave".to_string(), weave),
+            ("health".to_string(), health),
+            ("stores".to_string(), stores),
+            ("noop_readback".to_string(), noop_readback),
+        ]
+        .into_iter()
+        .collect(),
+    );
+    let result = tool_json_result(json!({
+        "status": "unchanged",
+        "project": project,
+        "nodes": sqlite_nodes,
+        "edges": sqlite_edges,
+        "expected_nodes": sqlite_nodes,
+        "expected_edges": sqlite_edges,
+        "skipped_count": 0,
+        "calyx": "shadow",
+        "vault_fingerprint": persisted_watermark,
+        "grounding_summary": grounding,
+        "index_admission": {
+            "schema": SHADOW_INDEX_ADMISSION_SCHEMA,
+            "status": "cache_hit",
+            "identity_sha256": expected_identity.identity_sha256,
+            "producer_executable_sha256": expected_identity.producer_executable_sha256,
+            "validation_wall_ms": elapsed_ms,
+            "writes_skipped": true,
+            "trust": "verified",
+            "freshness": "current",
+        },
+    }))?;
+    Ok(ShadowIndexNoopAdmission::Hit { result })
+}
+
+fn parse_shadow_index_admission_identity(
+    project: &str,
+    key: &str,
+    raw: &str,
+) -> Result<ShadowIndexAdmissionIdentity, DynError> {
+    let record: Value = serde_json::from_str(raw).map_err(|error| -> DynError {
+        format!(
+            "ASTRO_SHADOW_ADMISSION_IDENTITY_INVALID: project {project:?} config row {key:?} is not JSON: {error}; remediation: preserve the generation and rebuild from authoritative source"
+        )
+        .into()
+    })?;
+    let object = record.as_object().ok_or_else(|| -> DynError {
+        format!(
+            "ASTRO_SHADOW_ADMISSION_IDENTITY_INVALID: project {project:?} config row {key:?} is not an object; remediation: preserve the generation and rebuild from authoritative source"
+        )
+        .into()
+    })?;
+    let schema = object.get("schema").and_then(Value::as_str).ok_or_else(|| -> DynError {
+        format!(
+            "ASTRO_SHADOW_ADMISSION_IDENTITY_INVALID: project {project:?} admission record has no schema; remediation: preserve the generation and rebuild from authoritative source"
+        )
+        .into()
+    })?;
+    if schema != SHADOW_INDEX_ADMISSION_SCHEMA {
+        return Err(format!(
+            "ASTRO_SHADOW_ADMISSION_IDENTITY_SCHEMA: project {project:?} admission schema {schema:?} is not {SHADOW_INDEX_ADMISSION_SCHEMA:?}; remediation: rebuild this generation with the active producer"
+        )
+        .into());
+    }
+    let inputs = object.get("inputs").ok_or_else(|| -> DynError {
+        format!(
+            "ASTRO_SHADOW_ADMISSION_IDENTITY_INVALID: project {project:?} admission record has no inputs; remediation: preserve the generation and rebuild from authoritative source"
+        )
+        .into()
+    })?;
+    let identity_sha256 = object
+        .get("identity_sha256")
+        .and_then(Value::as_str)
+        .filter(|digest| digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .ok_or_else(|| -> DynError {
+            format!(
+                "ASTRO_SHADOW_ADMISSION_IDENTITY_INVALID: project {project:?} admission record has no canonical SHA-256 identity; remediation: preserve the generation and rebuild from authoritative source"
+            )
+            .into()
+        })?
+        .to_string();
+    let actual_identity_sha256 = shadow_index_admission_inputs_sha256(inputs)?;
+    if actual_identity_sha256 != identity_sha256 {
+        return Err(format!(
+            "ASTRO_SHADOW_ADMISSION_IDENTITY_HASH_MISMATCH: project {project:?} admission inputs hash to {actual_identity_sha256}, but the record binds {identity_sha256}; remediation: preserve the generation and rebuild from authoritative source"
+        )
+        .into());
+    }
+    let producer_executable_sha256 = inputs
+        .get("producer_executable_sha256")
+        .and_then(Value::as_str)
+        .ok_or_else(|| -> DynError {
+            format!(
+                "ASTRO_SHADOW_ADMISSION_IDENTITY_INVALID: project {project:?} admission inputs have no producer executable identity; remediation: preserve the generation and rebuild from authoritative source"
+            )
+            .into()
+        })?
+        .to_string();
+    Ok(ShadowIndexAdmissionIdentity {
+        record,
+        identity_sha256,
+        producer_executable_sha256,
+    })
+}
+
+fn required_shadow_config_value(
+    cache_dir: &Path,
+    project: &str,
+    name: &str,
+) -> Result<String, DynError> {
+    let key = metadata_key(project, name);
+    read_config_value(cache_dir, &key)?
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| {
+            format!(
+                "ASTRO_SHADOW_NOOP_CONFIG_MISSING: exact unchanged admission requires non-empty config row {key:?}; remediation: preserve the incomplete generation and rebuild from authoritative source"
+            )
+            .into()
+        })
+}
+
+fn required_shadow_config_u64(
+    cache_dir: &Path,
+    project: &str,
+    name: &str,
+) -> Result<u64, DynError> {
+    let raw = required_shadow_config_value(cache_dir, project, name)?;
+    raw.parse::<u64>().map_err(|error| {
+        format!(
+            "ASTRO_SHADOW_NOOP_CONFIG_INVALID: project {project:?} config field {name:?} is not u64 ({raw:?}): {error}; remediation: preserve the incomplete generation and rebuild from authoritative source"
+        )
+        .into()
+    })
+}
+
+fn required_shadow_config_usize(
+    cache_dir: &Path,
+    project: &str,
+    name: &str,
+) -> Result<usize, DynError> {
+    let raw = required_shadow_config_value(cache_dir, project, name)?;
+    raw.parse::<usize>().map_err(|error| {
+        format!(
+            "ASTRO_SHADOW_NOOP_CONFIG_INVALID: project {project:?} config field {name:?} is not usize ({raw:?}): {error}; remediation: preserve the incomplete generation and rebuild from authoritative source"
+        )
+        .into()
+    })
+}
+
+fn shadow_project_config_rows(
+    cache_dir: &Path,
+    project: &str,
+) -> Result<Vec<(String, String)>, DynError> {
+    let prefix = format!("{CONFIG_KEY_PREFIX}{project}");
+    let metadata_prefix = format!("{prefix}.");
+    Ok(scan_config_prefix(cache_dir, &prefix)?
+        .into_iter()
+        .filter(|(key, _)| key == &dial_key(project) || key.starts_with(&metadata_prefix))
+        .collect())
+}
+
+fn read_shadow_source_counts(
+    source_path: &Path,
+    project: &str,
+) -> Result<(usize, usize, usize), DynError> {
+    let open_path = astrolabe_domain::winpath::sqlite_open_path(source_path)?;
+    let connection = Connection::open_with_flags(
+        open_path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX
+            | OpenFlags::SQLITE_OPEN_PRIVATE_CACHE,
+    )?;
+    connection.pragma_update(None, "query_only", true)?;
+    let count_table = |table: &str| -> Result<(usize, usize), DynError> {
+        let sql = format!(
+            "SELECT COUNT(*), COALESCE(SUM(CASE WHEN project <> ?1 THEN 1 ELSE 0 END), 0) FROM {table}"
+        );
+        let (total, foreign): (i64, i64) =
+            connection.query_row(&sql, params![project], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        Ok((usize::try_from(total)?, usize::try_from(foreign)?))
+    };
+    let (nodes, foreign_nodes) = count_table("nodes")?;
+    let (edges, foreign_edges) = count_table("edges")?;
+    if foreign_nodes != 0 || foreign_edges != 0 {
+        return Err(format!(
+            "ASTRO_SHADOW_NOOP_SOURCE_PROJECT_MISMATCH: project {project:?} source database contains foreign_nodes={foreign_nodes}, foreign_edges={foreign_edges}; remediation: preserve the mixed source and rebuild one isolated project database"
+        )
+        .into());
+    }
+    let orphan_edges: i64 = connection.query_row(
+        "SELECT COUNT(*) FROM edges e LEFT JOIN nodes s ON s.id=e.source_id LEFT JOIN nodes t ON t.id=e.target_id WHERE s.id IS NULL OR t.id IS NULL",
+        [],
+        |row| row.get(0),
+    )?;
+    Ok((nodes, edges, usize::try_from(orphan_edges)?))
+}
+
 pub(crate) fn grounding_summary(outcome: &ShadowImportOutcome) -> Value {
     let status = if outcome.publication_required {
         "imported"
+    } else if outcome.metadata_publication_required {
+        "action_metadata_updated"
     } else {
         "unchanged"
     };
     json!({
         "status": status,
-        "writes_skipped": !outcome.publication_required,
+        "writes_skipped": !outcome.publication_required && !outcome.metadata_publication_required,
+        "artifact_writes_skipped": !outcome.publication_required,
+        "action_metadata_written": outcome.metadata_publication_required,
         "publication_reason": outcome.publication_reason,
         "sqlite_nodes": outcome.sqlite_nodes,
         "sqlite_edges": outcome.sqlite_edges,
@@ -3231,6 +4139,7 @@ pub(crate) fn persist_shadow_publication_at(
     outcome: &ShadowImportOutcome,
     dial: MigrationDial,
     sanitized_index_args: &str,
+    index_admission_identity: &ShadowIndexAdmissionIdentity,
     staged_config_rows: &[(String, String)],
     publication_generation: &str,
 ) -> Result<(), DynError> {
@@ -3403,7 +4312,21 @@ pub(crate) fn persist_shadow_publication_at(
     tx.execute(
         "INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)",
         params![
+            metadata_key(project, SHADOW_INDEX_ADMISSION_IDENTITY_KEY),
+            index_admission_identity.record_json()?
+        ],
+    )?;
+    tx.execute(
+        "INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)",
+        params![
             metadata_key(project, SHADOW_PUBLICATION_GENERATION_KEY),
+            publication_generation
+        ],
+    )?;
+    tx.execute(
+        "INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)",
+        params![
+            metadata_key(project, SHADOW_INDEX_ADMISSION_PUBLICATION_GENERATION_KEY,),
             publication_generation
         ],
     )?;

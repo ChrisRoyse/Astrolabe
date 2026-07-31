@@ -5,8 +5,8 @@ mod gc;
 mod read;
 mod scan_pages;
 use crate::cf::{
-    COMPRESSED_SLOT_VALUE_TAG, CfRouter, ColumnFamily, KeyRange, SlotFamilyKind,
-    compression_manifest_key,
+    COMPRESSED_SLOT_VALUE_TAG, CfRouter, ColumnFamily, KeyRange, RouterManifestHandoffReport,
+    SlotFamilyKind, compression_manifest_key,
 };
 use crate::gc::{SnapshotGcCounters, SnapshotGcReclaimer, SnapshotGcTick};
 use crate::mvcc::{
@@ -594,6 +594,21 @@ impl VersionedCfStore {
         // the safe direction (issue #1138).
         let commit_watermark = self.current_seq();
         router.flush_pending_at(commit_watermark)
+    }
+
+    /// Reconciles the live router with manifest-covered durable SSTs while the
+    /// vault-wide durable commit lock is held by the caller.
+    pub(crate) fn handoff_manifested_ssts(
+        &self,
+        durable_seq: u64,
+        full_inventory: bool,
+        durable_ssts: &[SstSummary],
+    ) -> Result<RouterManifestHandoffReport> {
+        let mut router = self.router.write().expect("mvcc router poisoned");
+        let Some(router) = router.as_mut() else {
+            return Ok(RouterManifestHandoffReport::default());
+        };
+        router.handoff_manifested_ssts(durable_seq, full_inventory, durable_ssts)
     }
 
     pub fn install_read_barrier(&self, barrier: ReadBarrier) {

@@ -19,9 +19,9 @@ use std::collections::HashMap;
 use astrolabe_domain::fsv::{
     FsvAck, FsvLedgerExpectation, FsvLedgerReadback, FsvPlan, FsvRow, FsvSampling, verify_mutation,
 };
-use calyx_aster::cf::ColumnFamily;
+use calyx_aster::cf::{ColumnFamily, ledger_key};
 use calyx_aster::vault::AsterVault;
-use calyx_core::{CalyxError, Clock, Seq};
+use calyx_core::{CalyxError, Clock, LedgerRef, Seq};
 use calyx_ledger::{ActorId, EntryKind, SubjectId, decode};
 
 /// A planned set of column-family rows plus the ledger entry a single vault
@@ -131,6 +131,64 @@ impl VaultMutationPlan {
     where
         C: Clock,
     {
+        self.verify_committed_with_reader(vault, commit_seq, || {
+            newest_ledger_readback(vault, commit_seq)
+        })
+    }
+
+    /// Re-reads every planned row and the exact hash-bound Ledger row returned
+    /// by the atomic group commit.
+    ///
+    /// Unlike [`verify_committed`](Self::verify_committed), this path never
+    /// scans the Ledger CF: it point-reads `ledger_key(ledger_ref.seq)`, decodes
+    /// and canonically verifies the entry, and requires its sequence and hash
+    /// to match `ledger_ref` before the normal kind/actor/subject comparison.
+    pub fn verify_committed_with_ledger_ref<C>(
+        &self,
+        vault: &AsterVault<C>,
+        commit_seq: Seq,
+        ledger_ref: &LedgerRef,
+    ) -> calyx_core::Result<FsvAck>
+    where
+        C: Clock,
+    {
+        self.verify_committed_with_reader(vault, commit_seq, || {
+            exact_ledger_readback(vault, commit_seq, ledger_ref)
+        })
+    }
+
+    /// Verifies planned rows against the live snapshot while consuming Ledger
+    /// bytes that were independently read from the physical SST/WAL source.
+    ///
+    /// This is the batch counterpart to
+    /// [`verify_committed_with_ledger_ref`](Self::verify_committed_with_ledger_ref):
+    /// callers can read many exact Ledger sequences once, then pair each plan to
+    /// its hash-bound bytes without reopening the same SST for every logical row.
+    pub fn verify_committed_with_ledger_bytes<C>(
+        &self,
+        vault: &AsterVault<C>,
+        commit_seq: Seq,
+        ledger_ref: &LedgerRef,
+        ledger_bytes: &[u8],
+    ) -> calyx_core::Result<FsvAck>
+    where
+        C: Clock,
+    {
+        self.verify_committed_with_reader(vault, commit_seq, || {
+            exact_ledger_readback_bytes(commit_seq, ledger_ref, ledger_bytes).map(Some)
+        })
+    }
+
+    fn verify_committed_with_reader<C, L>(
+        &self,
+        vault: &AsterVault<C>,
+        commit_seq: Seq,
+        read_ledger: L,
+    ) -> calyx_core::Result<FsvAck>
+    where
+        C: Clock,
+        L: FnOnce() -> calyx_core::Result<Option<FsvLedgerReadback>>,
+    {
         let read_error: std::cell::RefCell<Option<CalyxError>> = std::cell::RefCell::new(None);
         let ack = verify_mutation(
             &self.plan,
@@ -165,7 +223,7 @@ impl VaultMutationPlan {
                     }
                 }
             },
-            || match newest_ledger_readback(vault, commit_seq) {
+            || match read_ledger() {
                 Ok(entry) => Ok(entry),
                 Err(err) => {
                     *read_error.borrow_mut() = Some(err);
@@ -223,6 +281,55 @@ where
         subject: subject_bytes(&entry.subject),
         entry_hash_hex: hex_lower(&entry.entry_hash),
     }))
+}
+
+fn exact_ledger_readback<C>(
+    vault: &AsterVault<C>,
+    commit_seq: Seq,
+    ledger_ref: &LedgerRef,
+) -> calyx_core::Result<Option<FsvLedgerReadback>>
+where
+    C: Clock,
+{
+    let Some(bytes) = vault.read_cf_at(
+        commit_seq,
+        ColumnFamily::Ledger,
+        &ledger_key(ledger_ref.seq),
+    )?
+    else {
+        return Ok(None);
+    };
+    Ok(Some(exact_ledger_readback_bytes(
+        commit_seq, ledger_ref, &bytes,
+    )?))
+}
+
+fn exact_ledger_readback_bytes(
+    commit_seq: Seq,
+    ledger_ref: &LedgerRef,
+    bytes: &[u8],
+) -> calyx_core::Result<FsvLedgerReadback> {
+    let entry = decode(bytes)?;
+    if !entry.verify() || entry.seq != ledger_ref.seq || entry.entry_hash != ledger_ref.hash {
+        return Err(CalyxError {
+            code: astrolabe_domain::fsv::ASTRO_FSV_LEDGER_UNPAIRED,
+            message: format!(
+                "exact Ledger readback at commit seq {commit_seq} failed canonical verification or returned seq {} hash {} but the atomic receipt requires seq {} hash {}",
+                entry.seq,
+                hex_lower(&entry.entry_hash),
+                ledger_ref.seq,
+                hex_lower(&ledger_ref.hash),
+            ),
+            remediation: "quarantine the vault, run astrolabe verify --deep, and rebuild from source bytes if the Ledger receipt diverges",
+        });
+    }
+    Ok(FsvLedgerReadback {
+        seq: entry.seq,
+        kind: entry.kind.as_str().to_string(),
+        actor: actor_name(&entry.actor),
+        subject: subject_bytes(&entry.subject),
+        entry_hash_hex: hex_lower(&entry.entry_hash),
+    })
 }
 
 fn actor_name(actor: &ActorId) -> String {

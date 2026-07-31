@@ -1,12 +1,11 @@
 use super::{insert_ledger_bytes, parse_aster_ledger_seq};
 use crate::cf::ledger_key;
+use crate::sst::SstReader;
 use crate::sst::level::SstLevel;
-use crate::sst::{SstLookupMetadata, SstReader};
 use crate::storage_names::{SstName, classify_sst, sst_order_key};
 use calyx_core::{CalyxError, Result as CalyxResult};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::time::Instant;
 
 /// Per-tier resolution stats for one targeted ledger point read (#1112).
@@ -62,9 +61,11 @@ pub(super) fn read_sst_ledger_rows(
 ) -> CalyxResult<()> {
     // Tier 1 (`probable_name`): O(1) stat probes for SSTs whose file name IS
     // the wanted seq. Only resolves on vaults where ledger seqs and WAL commit
-    // seqs coincide (e.g. single-put-per-commit test vaults); kept because it
-    // costs two stats per seq and avoids the index build entirely there.
-    {
+    // seqs coincide (for example, single-put-per-commit vaults). It costs two
+    // stats for the sole sequence and avoids the index build entirely there;
+    // multi-sequence batches skip it because their Ledger and commit domains
+    // intentionally diverge.
+    if wanted.len() == 1 {
         let started = Instant::now();
         let before = rows.len();
         let candidates = probable_ledger_sst_candidates(ledger_dirs, wanted)?;
@@ -77,6 +78,8 @@ pub(super) fn read_sst_ledger_rows(
             files_opened,
             started,
         );
+    } else {
+        trace.record("probable_name", 0, 0, 0, Instant::now());
     }
 
     // Tier 2 (`commit_ordered`): the #1112 fix. Ledger CF keys are 8-byte
@@ -92,13 +95,17 @@ pub(super) fn read_sst_ledger_rows(
         let started = Instant::now();
         let before = rows.len();
         let mut index = CommitOrderedLedgerIndex::build(ledger_dirs)?;
-        for seq in &unresolved {
-            if let Some(path) = index.resolve(*seq)? {
-                let path = path.clone();
-                index.files_opened += 1;
-                let reader = SstReader::open(&path)?;
-                if let Some(value) = reader.get(&ledger_key(*seq))? {
-                    insert_ledger_bytes(rows, *seq, value)?;
+        let mut seqs_by_file = BTreeMap::<usize, Vec<u64>>::new();
+        for seq in unresolved.iter().copied() {
+            if let Some(file_index) = index.resolve(seq)? {
+                seqs_by_file.entry(file_index).or_default().push(seq);
+            }
+        }
+        for (file_index, seqs) in seqs_by_file {
+            let reader = index.reader(file_index)?;
+            for seq in seqs {
+                if let Some(value) = reader.get(&ledger_key(seq))? {
+                    insert_ledger_bytes(rows, seq, value)?;
                 }
             }
         }
@@ -109,6 +116,8 @@ pub(super) fn read_sst_ledger_rows(
             index.files_opened,
             started,
         );
+    } else {
+        trace.record("commit_ordered", 0, 0, 0, Instant::now());
     }
 
     // Tier 3 (`named_scan`): directory scan for multi-part SSTs whose file
@@ -128,6 +137,8 @@ pub(super) fn read_sst_ledger_rows(
             files_opened,
             started,
         );
+    } else {
+        trace.record("named_scan", 0, 0, 0, Instant::now());
     }
 
     // Tier 4 (`complete_scan`): the semantic source of truth — every ledger
@@ -147,6 +158,8 @@ pub(super) fn read_sst_ledger_rows(
             files_opened,
             started,
         );
+    } else {
+        trace.record("complete_scan", 0, 0, 0, Instant::now());
     }
     Ok(())
 }
@@ -252,6 +265,8 @@ struct IndexedLedgerFile {
     path: PathBuf,
     /// Lazily-loaded (first_ledger_seq, last_ledger_seq) from the SST footer.
     range: Option<(u64, u64)>,
+    /// One retained reader shared by footer probing and every exact key read.
+    reader: Option<SstReader>,
 }
 
 impl CommitOrderedLedgerIndex {
@@ -293,7 +308,11 @@ impl CommitOrderedLedgerIndex {
         Ok(Self {
             files: paths
                 .into_iter()
-                .map(|path| IndexedLedgerFile { path, range: None })
+                .map(|path| IndexedLedgerFile {
+                    path,
+                    range: None,
+                    reader: None,
+                })
                 .collect(),
             files_opened: 0,
         })
@@ -305,7 +324,7 @@ impl CommitOrderedLedgerIndex {
     /// ranges being monotone: a bisection miss only costs the fallback, and
     /// the row itself is read (and byte-verified against duplicates) from the
     /// actual file.
-    fn resolve(&mut self, seq: u64) -> CalyxResult<Option<&PathBuf>> {
+    fn resolve(&mut self, seq: u64) -> CalyxResult<Option<usize>> {
         let mut lo = 0usize;
         let mut hi = self.files.len();
         while lo < hi {
@@ -316,7 +335,7 @@ impl CommitOrderedLedgerIndex {
             } else if seq > last {
                 lo = mid + 1;
             } else {
-                return Ok(Some(&self.files[mid].path));
+                return Ok(Some(mid));
             }
         }
         Ok(None)
@@ -327,8 +346,7 @@ impl CommitOrderedLedgerIndex {
             return Ok(range);
         }
         let path = self.files[index].path.clone();
-        self.files_opened += 1;
-        let lookup = ledger_sst_lookup_metadata(&path)?;
+        let lookup = self.reader(index)?.lookup_metadata();
         let (first_key, last_key) = lookup.key_range().ok_or_else(|| {
             CalyxError::aster_corrupt_shard(format!("ledger SST {} has no keys", path.display()))
         })?;
@@ -339,10 +357,20 @@ impl CommitOrderedLedgerIndex {
         self.files[index].range = Some(range);
         Ok(range)
     }
-}
 
-fn ledger_sst_lookup_metadata(path: &Path) -> CalyxResult<Arc<SstLookupMetadata>> {
-    Ok(SstReader::open(path)?.lookup_metadata())
+    fn reader(&mut self, index: usize) -> CalyxResult<&SstReader> {
+        if self.files[index].reader.is_none() {
+            let path = self.files[index].path.clone();
+            self.files[index].reader = Some(SstReader::open(&path)?);
+            self.files_opened += 1;
+        }
+        self.files[index].reader.as_ref().ok_or_else(|| {
+            CalyxError::aster_corrupt_shard(format!(
+                "ledger SST reader cache remained empty for {}",
+                self.files[index].path.display()
+            ))
+        })
+    }
 }
 
 fn sorted_unique_paths(

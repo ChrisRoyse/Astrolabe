@@ -490,13 +490,70 @@ pub(crate) fn handle_index_repository(
             })
         })
         .ok_or("ASTRO_SHADOW_PROJECT_UNRESOLVED: shadow indexing requires a resolvable project name or repo_path; remediation: pass a valid repo_path")?;
+    let cache_dir = astrolabe_bridge::cbm_cache_dir()?;
+    if repo_path
+        .as_deref()
+        .is_some_and(astrolabe_anchors::archaeology::is_git_work_tree)
+        && let Err(error) = super::git_archaeology::preflight_git_archaeology_persistence_limits()
+    {
+        return tool_error_result(error.to_string());
+    }
+    // Serialize the complete per-project decision before entering the durable
+    // project transition. This lets an unchanged hit remain genuinely read-only:
+    // the transition protocol persists active/terminal receipts, so acquiring it
+    // before the cache decision would mutate config on every no-op call. The same
+    // import lock is held through a miss and its full transition, preventing a
+    // competing index process from changing the effective settings between the
+    // admission read and staged publication.
+    let Some(_shadow_import_lock) = try_shadow_import_lock(&cache_dir, &project)? else {
+        return tool_error_result(format!(
+            "ASTRO_SHADOW_IMPORT_BUSY: a shadow publication for project {project:?} is already active at {}; remediation: retry after that exact owner completes",
+            shadow_import_lock_path(&cache_dir, &project).display()
+        ));
+    };
     let search_scale_settings =
         match search_scale_settings_for_import(&project, search_scale_override) {
             Ok(settings) => settings,
             Err(error) => return tool_error_result(format!("search scale config failed: {error}")),
         };
-
-    let cache_dir = astrolabe_bridge::cbm_cache_dir()?;
+    let index_admission_identity =
+        shadow_index_admission_identity(&sanitized_args, &search_scale_settings, &skills)?;
+    let mut action_policy =
+        shadow_index_action_policy(&cache_dir, &project, &index_admission_identity)?;
+    if let Some(repo) = repo_path
+        .as_deref()
+        .filter(|repo| astrolabe_anchors::archaeology::is_git_work_tree(repo))
+    {
+        match try_shadow_index_noop_admission(
+            &cache_dir,
+            &project,
+            repo,
+            &index_admission_identity,
+            &action_policy,
+        )? {
+            ShadowIndexNoopAdmission::Hit { result } => {
+                eprintln!(
+                    "astro.shadow.index_phase phase=preseed_noop status=hit project={project} identity_sha256={}",
+                    index_admission_identity.identity_sha256()
+                );
+                return Ok(result);
+            }
+            ShadowIndexNoopAdmission::Miss {
+                reason,
+                action_policy: miss_policy,
+            } => {
+                action_policy = miss_policy;
+                eprintln!(
+                    "astro.shadow.index_phase phase=preseed_noop status=miss project={project} reason={reason} identity_sha256={}",
+                    index_admission_identity.identity_sha256()
+                );
+            }
+        }
+    } else {
+        eprintln!(
+            "astro.shadow.index_phase phase=preseed_noop status=miss project={project} reason=non_git_source"
+        );
+    }
     if let Some(repo) = repo_path
         .as_deref()
         .filter(|repo| astrolabe_anchors::archaeology::is_git_work_tree(repo))
@@ -514,12 +571,6 @@ pub(crate) fn handle_index_repository(
         &project,
         transition_root,
         |transition_grant| {
-            let Some(_shadow_import_lock) = try_shadow_import_lock(&cache_dir, &project)? else {
-                return tool_error_result(format!(
-                    "ASTRO_SHADOW_IMPORT_BUSY: a shadow publication for project {project:?} is already active at {}; remediation: retry after that exact owner completes",
-                    shadow_import_lock_path(&cache_dir, &project).display()
-                ));
-            };
             let shadow_started = std::time::Instant::now();
             let stage_started = std::time::Instant::now();
             let publication = ShadowPublication::begin(&cache_dir, &project)?;
@@ -591,6 +642,7 @@ pub(crate) fn handle_index_repository(
                     row_sink,
                     &search_scale_settings,
                     repo_path.as_deref(),
+                    &action_policy,
                 )?;
                 Ok((result, outcome))
             })();
@@ -601,7 +653,12 @@ pub(crate) fn handle_index_repository(
                 }
             };
             let publish_started = std::time::Instant::now();
-            let outcome = match publication.publish(outcome, dial, &sanitized_args) {
+            let outcome = match publication.publish(
+                outcome,
+                dial,
+                &sanitized_args,
+                &index_admission_identity,
+            ) {
                 Ok(outcome) => outcome,
                 Err(error) => return tool_error_result(error.to_string()),
             };
