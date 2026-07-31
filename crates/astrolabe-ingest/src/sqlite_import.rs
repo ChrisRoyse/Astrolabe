@@ -6657,7 +6657,8 @@ fn modality_for_label(label: SymbolLabel) -> Modality {
         | SymbolLabel::Route
         | SymbolLabel::Channel
         | SymbolLabel::EnvVar
-        | SymbolLabel::ParseDiagnostic => Modality::Structured,
+        | SymbolLabel::ParseDiagnostic
+        | SymbolLabel::RuntimeModuleRequest => Modality::Structured,
         SymbolLabel::Project | SymbolLabel::Branch | SymbolLabel::Folder => Modality::Structured,
         _ => Modality::Code,
     }

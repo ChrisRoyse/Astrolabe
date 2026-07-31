@@ -444,6 +444,12 @@ pub enum SymbolLabel {
     /// Appended to preserve the persisted serde discriminants of every existing
     /// symbol label.
     ParseDiagnostic,
+    /// Browser-hosted module request whose exact runtime target is absent from
+    /// the indexed repository snapshot.
+    ///
+    /// Appended to preserve the persisted serde discriminants of every existing
+    /// symbol label.
+    RuntimeModuleRequest,
 }
 
 impl SymbolLabel {
@@ -486,6 +492,7 @@ impl SymbolLabel {
             Self::Branch => "Branch",
             Self::Folder => "Folder",
             Self::ParseDiagnostic => "ParseDiagnostic",
+            Self::RuntimeModuleRequest => "RuntimeModuleRequest",
         }
     }
 
@@ -497,7 +504,7 @@ impl SymbolLabel {
     /// Every stable node label in declaration order. The single canonical roster
     /// the ingest admission path and the emission-vocabulary parity check both
     /// enumerate.
-    pub const ALL: [Self; 36] = [
+    pub const ALL: [Self; 37] = [
         Self::Function,
         Self::Method,
         Self::Class,
@@ -534,6 +541,7 @@ impl SymbolLabel {
         Self::Branch,
         Self::Folder,
         Self::ParseDiagnostic,
+        Self::RuntimeModuleRequest,
     ];
 
     /// Parses a Codebase Memory MCP node-label string into Astrolabe's stable

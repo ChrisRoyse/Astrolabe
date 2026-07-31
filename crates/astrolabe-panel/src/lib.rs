@@ -893,7 +893,8 @@ pub const fn label_class(label: SymbolLabel) -> LabelClass {
         | SymbolLabel::Chart
         | SymbolLabel::Package
         | SymbolLabel::EnvVar
-        | SymbolLabel::ParseDiagnostic => LabelClass::StructuredResource,
+        | SymbolLabel::ParseDiagnostic
+        | SymbolLabel::RuntimeModuleRequest => LabelClass::StructuredResource,
         SymbolLabel::Section => LabelClass::Section,
         SymbolLabel::Project | SymbolLabel::Branch | SymbolLabel::Folder => LabelClass::Structural,
     }
