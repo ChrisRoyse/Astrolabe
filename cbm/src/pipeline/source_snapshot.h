@@ -9,7 +9,10 @@ typedef struct {
 } cbm_source_snapshot_t;
 
 /* Capture every discovered source/config input into one immutable, mirrored
- * snapshot and bind each file record to the captured bytes. */
+ * snapshot and bind each file record to the captured bytes. All workers are
+ * joined before return. Once root creation succeeds, snapshot owns that root on
+ * both success and failure; the caller must invoke cbm_source_snapshot_destroy
+ * exactly once so partial derived files have one cleanup owner. */
 int cbm_source_snapshot_capture(const char *repo_path, const cbm_discover_opts_t *opts,
                                 cbm_file_info_t *files, int file_count,
                                 cbm_source_snapshot_t *snapshot);

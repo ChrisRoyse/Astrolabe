@@ -2282,6 +2282,14 @@ pub struct cbm_pipeline_phase_metric_t {
     pub read_bytes: u64,
     pub write_bytes: u64,
     pub other_bytes: u64,
+    pub start_working_set_bytes: u64,
+    pub end_working_set_bytes: u64,
+    pub start_peak_working_set_bytes: u64,
+    pub end_peak_working_set_bytes: u64,
+    pub start_private_bytes: u64,
+    pub end_private_bytes: u64,
+    pub start_peak_private_bytes: u64,
+    pub end_peak_private_bytes: u64,
 }
 impl Default for cbm_pipeline_phase_metric_t {
     fn default() -> Self {

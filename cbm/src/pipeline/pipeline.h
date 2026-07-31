@@ -42,13 +42,23 @@ typedef struct {
 /* One retained native worker phase measurement. The phase string and array are
  * pipeline-owned and remain valid until cbm_pipeline_free(). I/O counters are
  * exact GetProcessIoCounters transfer-byte deltas for the worker process over
- * this phase; elapsed_ms is measured from the monotonic clock. */
+ * this phase; elapsed_ms is measured from the monotonic clock. Memory fields
+ * are exact PROCESS_MEMORY_COUNTERS_EX boundary observations: current/peak
+ * working set plus current/peak private commit in bytes. */
 typedef struct {
     const char *phase;
     uint64_t elapsed_ms;
     uint64_t read_bytes;
     uint64_t write_bytes;
     uint64_t other_bytes;
+    uint64_t start_working_set_bytes;
+    uint64_t end_working_set_bytes;
+    uint64_t start_peak_working_set_bytes;
+    uint64_t end_peak_working_set_bytes;
+    uint64_t start_private_bytes;
+    uint64_t end_private_bytes;
+    uint64_t start_peak_private_bytes;
+    uint64_t end_peak_private_bytes;
 } cbm_pipeline_phase_metric_t;
 
 /* Distinct terminal result for a repository with no non-auxiliary source

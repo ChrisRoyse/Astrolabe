@@ -21,6 +21,7 @@
 #include <string.h>
 #include <time.h>
 #include <windows.h>
+#include <psapi.h>
 
 /* ── Shared pipeline constants ─────────────────────────────────── */
 
@@ -93,7 +94,9 @@ void cbm_pipeline_record_fatal_error(cbm_pipeline_t *p, const char *code, const 
 typedef struct {
     struct timespec started;
     IO_COUNTERS io;
+    PROCESS_MEMORY_COUNTERS_EX memory;
     bool io_valid;
+    bool memory_valid;
 } cbm_pipeline_phase_probe_t;
 
 cbm_pipeline_phase_probe_t cbm_pipeline_phase_probe_start(cbm_pipeline_t *p, const char *phase);

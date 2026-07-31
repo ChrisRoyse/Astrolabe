@@ -1,3 +1,9 @@
+#ifdef _WIN32
+#ifndef _WIN32_WINNT
+#define _WIN32_WINNT 0x0602
+#endif
+#endif
+
 #include "pipeline/source_snapshot.h"
 
 #include "foundation/compat.h"
@@ -6,6 +12,7 @@
 #include "foundation/log.h"
 #include "foundation/sha256.h"
 #include "foundation/hash_table.h"
+#include "foundation/platform.h"
 #include "foundation/win_utf8.h"
 
 #include <errno.h>
@@ -20,13 +27,65 @@
 #endif
 #include <windows.h>
 
-enum { SNAPSHOT_DIR_PERMS = 0755 };
+enum {
+    SNAPSHOT_INDEX_ORIGIN = -1,
+    SNAPSHOT_INDEX_STEP = 1,
+    SNAPSHOT_MIN_WORKERS = 1,
+};
 
 typedef struct {
     FILE_ID_INFO id;
     FILE_BASIC_INFO basic;
     FILE_STANDARD_INFO standard;
 } snapshot_identity_t;
+
+typedef struct {
+    cbm_file_info_t *file;
+    char *destination_path;
+    wchar_t *wide_source;
+    wchar_t *wide_destination;
+    snapshot_identity_t source_identity;
+    uint64_t byte_count;
+    char sha256[CBM_SHA256_HEX_LEN + 1];
+    const char *failure_code;
+    const char *failure_operation;
+    const char *failure_path;
+    DWORD native_error;
+    bool complete;
+} snapshot_capture_result_t;
+
+typedef struct {
+    char *path;
+    wchar_t *wide_path;
+    size_t depth;
+} snapshot_directory_t;
+
+typedef struct {
+    bool match;
+    const char *failure_code;
+    const char *failure_operation;
+    DWORD native_error;
+} snapshot_identity_probe_result_t;
+
+typedef enum {
+    SNAPSHOT_DISPATCH_CAPTURE = 1,
+    SNAPSHOT_DISPATCH_IDENTITY = 2,
+} snapshot_dispatch_operation_t;
+
+typedef struct {
+    PTP_POOL pool;
+    TP_CALLBACK_ENVIRON environment;
+    PTP_WORK work;
+    bool environment_initialized;
+    int worker_count;
+    volatile LONG next_index;
+    int item_count;
+    snapshot_dispatch_operation_t operation;
+    snapshot_capture_result_t *capture_results;
+    cbm_file_info_t **identity_files;
+    const wchar_t **identity_wide_paths;
+    snapshot_identity_probe_result_t *identity_results;
+} snapshot_dispatcher_t;
 
 static void snapshot_log_failure(const char *code, const char *operation, const char *path,
                                  unsigned long native_error) {
@@ -264,193 +323,428 @@ static int64_t filetime_to_unix_ns(LONGLONG ticks) {
     return (int64_t)((ticks - epoch_delta) * 100LL);
 }
 
-static int snapshot_capture_one(const char *snapshot_root, cbm_file_info_t *file) {
-    const char *source_path = file->path;
-    char *destination_path = snapshot_join(snapshot_root, file->rel_path);
-    if (!destination_path) {
-        snapshot_log_failure("CBM_SOURCE_SNAPSHOT_PATH_ALLOC_FAILED", "build_destination",
-                             file->rel_path, ERROR_NOT_ENOUGH_MEMORY);
-        return CBM_NOT_FOUND;
+static void snapshot_capture_fail(snapshot_capture_result_t *result, const char *code,
+                                  const char *operation, const char *path, DWORD native_error) {
+    if (!result->failure_code) {
+        result->failure_code = code;
+        result->failure_operation = operation;
+        result->failure_path = path;
+        result->native_error = native_error != ERROR_SUCCESS ? native_error : ERROR_GEN_FAILURE;
     }
+}
 
-    char *parent = strdup(destination_path);
-    if (!parent) {
-        snapshot_log_failure("CBM_SOURCE_SNAPSHOT_PATH_ALLOC_FAILED", "copy_parent_path",
-                             file->rel_path, ERROR_NOT_ENOUGH_MEMORY);
-        free(destination_path);
-        return CBM_NOT_FOUND;
-    }
-    char *slash = strrchr(parent, '/');
-    if (slash) {
-        *slash = '\0';
-        if (!cbm_mkdir_p(parent, SNAPSHOT_DIR_PERMS)) {
-            snapshot_log_failure("CBM_SOURCE_SNAPSHOT_DIRECTORY_CREATE_FAILED", "create_parent",
-                                 parent, (unsigned long)errno);
-            free(parent);
-            free(destination_path);
-            return CBM_NOT_FOUND;
-        }
-    }
-    free(parent);
+static void snapshot_capture_prepared(snapshot_capture_result_t *result) {
+    cbm_file_info_t *file = result->file;
+    HANDLE source = INVALID_HANDLE_VALUE;
+    HANDLE destination = INVALID_HANDLE_VALUE;
+    HANDLE readback = INVALID_HANDLE_VALUE;
+    snapshot_identity_t before = {0};
+    snapshot_identity_t after = {0};
+    uint8_t captured_digest[CBM_SHA256_DIGEST_LEN] = {0};
+    uint8_t readback_digest[CBM_SHA256_DIGEST_LEN] = {0};
+    uint64_t captured_bytes = 0;
+    uint64_t readback_bytes = 0;
+    DWORD error = ERROR_SUCCESS;
 
-    wchar_t *wide_source = cbm_utf8_to_wide_path(source_path);
-    wchar_t *wide_destination = cbm_utf8_to_wide_path(destination_path);
-    if (!wide_source || !wide_destination) {
-        snapshot_log_failure("CBM_SOURCE_SNAPSHOT_PATH_ENCODING_FAILED", "widen_path", source_path,
-                             GetLastError());
-        free(wide_source);
-        free(wide_destination);
-        free(destination_path);
-        return CBM_NOT_FOUND;
-    }
-
-    HANDLE source = CreateFileW(
-        wide_source, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING,
+    source = CreateFileW(
+        result->wide_source, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING,
         FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN | FILE_FLAG_OPEN_REPARSE_POINT, NULL);
     if (source == INVALID_HANDLE_VALUE) {
-        snapshot_log_failure("CBM_SOURCE_SNAPSHOT_SOURCE_OPEN_FAILED", "open_source", source_path,
-                             GetLastError());
-        free(wide_source);
-        free(wide_destination);
-        free(destination_path);
-        return CBM_NOT_FOUND;
+        snapshot_capture_fail(result, "CBM_SOURCE_SNAPSHOT_SOURCE_OPEN_FAILED", "open_source",
+                              file->path, GetLastError());
+        goto cleanup;
     }
+
     FILE_ATTRIBUTE_TAG_INFO tag = {0};
-    snapshot_identity_t before = {0};
     if (!GetFileInformationByHandleEx(source, FileAttributeTagInfo, &tag, sizeof(tag)) ||
         (tag.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0 ||
         !snapshot_get_identity(source, &before)) {
-        DWORD error = GetLastError();
-        snapshot_log_failure("CBM_SOURCE_SNAPSHOT_SOURCE_IDENTITY_FAILED", "inspect_source",
-                             source_path, error);
-        CloseHandle(source);
-        free(wide_source);
-        free(wide_destination);
-        free(destination_path);
-        return CBM_NOT_FOUND;
+        error = GetLastError();
+        snapshot_capture_fail(result, "CBM_SOURCE_SNAPSHOT_SOURCE_IDENTITY_FAILED",
+                              "inspect_source", file->path,
+                              error != ERROR_SUCCESS ? error : ERROR_FILE_INVALID);
+        goto cleanup;
     }
     if (before.standard.EndOfFile.QuadPart < 0 ||
         before.standard.EndOfFile.QuadPart != file->size) {
-        snapshot_log_failure("CBM_SOURCE_SNAPSHOT_DISCOVERY_DRIFT", "compare_discovered_size",
-                             source_path, ERROR_FILE_INVALID);
-        CloseHandle(source);
-        free(wide_source);
-        free(wide_destination);
-        free(destination_path);
-        return CBM_NOT_FOUND;
+        snapshot_capture_fail(result, "CBM_SOURCE_SNAPSHOT_DISCOVERY_DRIFT",
+                              "compare_discovered_size", file->path, ERROR_FILE_INVALID);
+        goto cleanup;
     }
 
-    HANDLE destination = CreateFileW(wide_destination, GENERIC_WRITE, FILE_SHARE_READ, NULL,
-                                     CREATE_NEW, FILE_ATTRIBUTE_TEMPORARY, NULL);
+    destination = CreateFileW(result->wide_destination, GENERIC_WRITE, FILE_SHARE_READ, NULL,
+                              CREATE_NEW, FILE_ATTRIBUTE_TEMPORARY, NULL);
     if (destination == INVALID_HANDLE_VALUE) {
-        snapshot_log_failure("CBM_SOURCE_SNAPSHOT_DESTINATION_CREATE_FAILED", "create_snapshot",
-                             destination_path, GetLastError());
-        CloseHandle(source);
-        free(wide_source);
-        free(wide_destination);
-        free(destination_path);
-        return CBM_NOT_FOUND;
+        snapshot_capture_fail(result, "CBM_SOURCE_SNAPSHOT_DESTINATION_CREATE_FAILED",
+                              "create_snapshot", result->destination_path, GetLastError());
+        goto cleanup;
     }
 
-    uint8_t captured_digest[CBM_SHA256_DIGEST_LEN];
-    uint64_t captured_bytes = 0;
-    DWORD error = ERROR_SUCCESS;
     /* The retained source handle was opened with FILE_SHARE_READ only. Windows
      * refuses that open when an existing writer/delete handle conflicts and
      * refuses every new writer/delete open until this handle closes. The
      * before/after FILE_ID + size + last-write/change-time comparison therefore
-     * proves that the single copy-and-hash read observed one stable source
-     * generation; replaying every source byte through the same protected handle
-     * added no independent evidence.
+     * proves that this copy-and-hash read observed one stable source generation.
      *
-     * The destination is transaction-ephemeral and is consumed only after it is
-     * closed and independently reopened, byte-counted, and SHA-256 verified
-     * below. It is not a crash-durable publication, so forcing each file to
-     * persistent media with FlushFileBuffers added thousands of synchronous disk
-     * barriers without strengthening the readback or publication contract. */
-    bool ok = copy_and_hash(source, destination, captured_digest, &captured_bytes, &error);
-    if (!ok) {
-        snapshot_log_failure("CBM_SOURCE_SNAPSHOT_COPY_FAILED", "copy_source", source_path,
-                             error ? error : GetLastError());
-        CloseHandle(destination);
-        CloseHandle(source);
-        DeleteFileW(wide_destination);
-        free(wide_source);
-        free(wide_destination);
-        free(destination_path);
-        return CBM_NOT_FOUND;
+     * The destination remains transaction-ephemeral. It is closed and
+     * independently reopened, byte-counted, and SHA-256 verified below. This
+     * second read is deliberately retained as the physical snapshot proof. */
+    if (!copy_and_hash(source, destination, captured_digest, &captured_bytes, &error)) {
+        snapshot_capture_fail(result, "CBM_SOURCE_SNAPSHOT_COPY_FAILED", "copy_source", file->path,
+                              error);
+        goto cleanup;
     }
-
-    snapshot_identity_t after = {0};
     if (!snapshot_get_identity(source, &after)) {
-        error = GetLastError();
-        snapshot_log_failure("CBM_SOURCE_SNAPSHOT_SOURCE_IDENTITY_FAILED",
-                             "inspect_source_after_copy", source_path, error);
-        CloseHandle(destination);
-        CloseHandle(source);
-        DeleteFileW(wide_destination);
-        free(wide_source);
-        free(wide_destination);
-        free(destination_path);
-        return CBM_NOT_FOUND;
+        snapshot_capture_fail(result, "CBM_SOURCE_SNAPSHOT_SOURCE_IDENTITY_FAILED",
+                              "inspect_source_after_copy", file->path, GetLastError());
+        goto cleanup;
     }
-    CloseHandle(destination);
-    CloseHandle(source);
+    if (!CloseHandle(destination)) {
+        error = GetLastError();
+        destination = INVALID_HANDLE_VALUE;
+        snapshot_capture_fail(result, "CBM_SOURCE_SNAPSHOT_DESTINATION_CLOSE_FAILED",
+                              "close_snapshot_after_copy", result->destination_path, error);
+        goto cleanup;
+    }
+    destination = INVALID_HANDLE_VALUE;
+    if (!CloseHandle(source)) {
+        error = GetLastError();
+        source = INVALID_HANDLE_VALUE;
+        snapshot_capture_fail(result, "CBM_SOURCE_SNAPSHOT_SOURCE_CLOSE_FAILED",
+                              "close_source_after_copy", file->path, error);
+        goto cleanup;
+    }
+    source = INVALID_HANDLE_VALUE;
 
     if (!snapshot_identity_equal(&before, &after) ||
         captured_bytes != (uint64_t)before.standard.EndOfFile.QuadPart) {
-        snapshot_log_failure("CBM_SOURCE_SNAPSHOT_SOURCE_MUTATED", "capture_identity", source_path,
-                             error ? error : ERROR_FILE_INVALID);
-        DeleteFileW(wide_destination);
-        free(wide_source);
-        free(wide_destination);
-        free(destination_path);
-        return CBM_NOT_FOUND;
+        snapshot_capture_fail(result, "CBM_SOURCE_SNAPSHOT_SOURCE_MUTATED", "capture_identity",
+                              file->path, ERROR_FILE_INVALID);
+        goto cleanup;
     }
 
-    HANDLE readback =
-        CreateFileW(wide_destination, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING,
-                    FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, NULL);
-    uint8_t readback_digest[CBM_SHA256_DIGEST_LEN];
-    uint64_t readback_bytes = 0;
-    if (readback == INVALID_HANDLE_VALUE ||
-        !hash_handle(readback, readback_digest, &readback_bytes, &error) ||
-        readback_bytes != captured_bytes ||
+    readback = CreateFileW(result->wide_destination, GENERIC_READ, FILE_SHARE_READ, NULL,
+                           OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, NULL);
+    if (readback == INVALID_HANDLE_VALUE) {
+        snapshot_capture_fail(result, "CBM_SOURCE_SNAPSHOT_READBACK_OPEN_FAILED",
+                              "open_snapshot_readback", result->destination_path, GetLastError());
+        goto cleanup;
+    }
+    if (!hash_handle(readback, readback_digest, &readback_bytes, &error)) {
+        snapshot_capture_fail(result, "CBM_SOURCE_SNAPSHOT_READBACK_FAILED", "hash_snapshot",
+                              result->destination_path, error);
+        goto cleanup;
+    }
+    if (readback_bytes != captured_bytes ||
         memcmp(readback_digest, captured_digest, sizeof(captured_digest)) != 0) {
-        if (readback != INVALID_HANDLE_VALUE) {
-            CloseHandle(readback);
+        snapshot_capture_fail(result, "CBM_SOURCE_SNAPSHOT_READBACK_MISMATCH",
+                              "compare_snapshot_readback", result->destination_path,
+                              ERROR_FILE_CORRUPT);
+        goto cleanup;
+    }
+    if (!CloseHandle(readback)) {
+        error = GetLastError();
+        readback = INVALID_HANDLE_VALUE;
+        snapshot_capture_fail(result, "CBM_SOURCE_SNAPSHOT_READBACK_CLOSE_FAILED",
+                              "close_snapshot_readback", result->destination_path, error);
+        goto cleanup;
+    }
+    readback = INVALID_HANDLE_VALUE;
+    if (!SetFileAttributesW(result->wide_destination, FILE_ATTRIBUTE_READONLY)) {
+        snapshot_capture_fail(result, "CBM_SOURCE_SNAPSHOT_IMMUTABILITY_FAILED", "set_readonly",
+                              result->destination_path, GetLastError());
+        goto cleanup;
+    }
+
+    result->source_identity = before;
+    result->byte_count = captured_bytes;
+    digest_to_hex(captured_digest, result->sha256);
+    result->complete = true;
+
+cleanup:
+    if (readback != INVALID_HANDLE_VALUE && !CloseHandle(readback)) {
+        snapshot_capture_fail(result, "CBM_SOURCE_SNAPSHOT_READBACK_CLOSE_FAILED",
+                              "close_snapshot_readback", result->destination_path, GetLastError());
+    }
+    if (destination != INVALID_HANDLE_VALUE && !CloseHandle(destination)) {
+        snapshot_capture_fail(result, "CBM_SOURCE_SNAPSHOT_DESTINATION_CLOSE_FAILED",
+                              "close_snapshot_after_failure", result->destination_path,
+                              GetLastError());
+    }
+    if (source != INVALID_HANDLE_VALUE && !CloseHandle(source)) {
+        snapshot_capture_fail(result, "CBM_SOURCE_SNAPSHOT_SOURCE_CLOSE_FAILED",
+                              "close_source_after_failure", file->path, GetLastError());
+    }
+}
+
+static void snapshot_normalize_wide_separators(wchar_t *path) {
+    for (wchar_t *cursor = path; cursor && *cursor; cursor++) {
+        if (*cursor == L'/') {
+            *cursor = L'\\';
         }
-        snapshot_log_failure("CBM_SOURCE_SNAPSHOT_READBACK_MISMATCH", "readback_snapshot",
-                             destination_path, error ? error : GetLastError());
-        DeleteFileW(wide_destination);
-        free(wide_source);
-        free(wide_destination);
-        free(destination_path);
-        return CBM_NOT_FOUND;
     }
-    CloseHandle(readback);
-    if (!SetFileAttributesW(wide_destination, FILE_ATTRIBUTE_READONLY)) {
-        snapshot_log_failure("CBM_SOURCE_SNAPSHOT_IMMUTABILITY_FAILED", "set_readonly",
-                             destination_path, GetLastError());
-        DeleteFileW(wide_destination);
-        free(wide_source);
-        free(wide_destination);
-        free(destination_path);
+}
+
+static bool snapshot_rel_path_valid(const char *path) {
+    if (!path || path[0] == '\0' || path[0] == '/' || path[0] == '\\') {
+        return false;
+    }
+    const char *component = path;
+    for (const char *cursor = path;; cursor++) {
+        if (*cursor == ':') {
+            return false;
+        }
+        if (*cursor == '/' || *cursor == '\\' || *cursor == '\0') {
+            size_t length = (size_t)(cursor - component);
+            if (length == 0 || (length == 1 && component[0] == '.') ||
+                (length == 2 && component[0] == '.' && component[1] == '.')) {
+                return false;
+            }
+            if (*cursor == '\0') {
+                return true;
+            }
+            component = cursor + 1;
+        }
+    }
+}
+
+static int snapshot_compare_wide_paths(const wchar_t *left, const wchar_t *right) {
+    int result = CompareStringOrdinal(left, -1, right, -1, TRUE);
+    if (result == CSTR_LESS_THAN) {
+        return -1;
+    }
+    if (result == CSTR_GREATER_THAN) {
+        return 1;
+    }
+    if (result == CSTR_EQUAL) {
+        return 0;
+    }
+    return wcscmp(left, right);
+}
+
+static int snapshot_compare_capture_destinations(const void *left, const void *right) {
+    const snapshot_capture_result_t *const *a = left;
+    const snapshot_capture_result_t *const *b = right;
+    return snapshot_compare_wide_paths((*a)->wide_destination, (*b)->wide_destination);
+}
+
+static int snapshot_compare_directories(const void *left, const void *right) {
+    const snapshot_directory_t *a = left;
+    const snapshot_directory_t *b = right;
+    if (a->depth < b->depth) {
+        return -1;
+    }
+    if (a->depth > b->depth) {
+        return 1;
+    }
+    return snapshot_compare_wide_paths(a->wide_path, b->wide_path);
+}
+
+static void snapshot_directories_free(snapshot_directory_t *directories, size_t count) {
+    for (size_t i = 0; i < count; i++) {
+        free(directories[i].path);
+        free(directories[i].wide_path);
+    }
+    free(directories);
+}
+
+static void snapshot_capture_results_free(snapshot_capture_result_t *results, int count) {
+    if (!results) {
+        return;
+    }
+    for (int i = 0; i < count; i++) {
+        free(results[i].destination_path);
+        free(results[i].wide_source);
+        free(results[i].wide_destination);
+    }
+    free(results);
+}
+
+static bool snapshot_directory_append(snapshot_directory_t **directories, size_t *count,
+                                      size_t *capacity, const char *path, size_t path_length,
+                                      size_t depth) {
+    if (*count == *capacity) {
+        size_t next = *capacity == 0 ? CBM_SZ_64 : *capacity * 2u;
+        if (next < *capacity || next > SIZE_MAX / sizeof(**directories)) {
+            SetLastError(ERROR_ARITHMETIC_OVERFLOW);
+            return false;
+        }
+        snapshot_directory_t *grown = realloc(*directories, next * sizeof(**directories));
+        if (!grown) {
+            SetLastError(ERROR_NOT_ENOUGH_MEMORY);
+            return false;
+        }
+        *directories = grown;
+        *capacity = next;
+    }
+    char *copy = malloc(path_length + 1u);
+    if (!copy) {
+        SetLastError(ERROR_NOT_ENOUGH_MEMORY);
+        return false;
+    }
+    memcpy(copy, path, path_length);
+    copy[path_length] = '\0';
+    DWORD error = ERROR_SUCCESS;
+    wchar_t *wide = cbm_utf8_to_wide_path_checked(copy, &error);
+    if (!wide) {
+        free(copy);
+        SetLastError(error != ERROR_SUCCESS ? error : ERROR_NO_UNICODE_TRANSLATION);
+        return false;
+    }
+    snapshot_normalize_wide_separators(wide);
+    (*directories)[*count] = (snapshot_directory_t){
+        .path = copy,
+        .wide_path = wide,
+        .depth = depth,
+    };
+    (*count)++;
+    return true;
+}
+
+static bool snapshot_destination_exists(snapshot_capture_result_t **ordered, int count,
+                                        const wchar_t *path) {
+    int low = 0;
+    int high = count;
+    while (low < high) {
+        int middle = low + (high - low) / 2;
+        int comparison = snapshot_compare_wide_paths(ordered[middle]->wide_destination, path);
+        if (comparison < 0) {
+            low = middle + 1;
+        } else if (comparison > 0) {
+            high = middle;
+        } else {
+            return true;
+        }
+    }
+    return false;
+}
+
+static int snapshot_prepare_capture_plan(const char *root, cbm_file_info_t *files, int file_count,
+                                         snapshot_capture_result_t **results_out) {
+    snapshot_capture_result_t *results =
+        calloc((size_t)(file_count > 0 ? file_count : 1), sizeof(*results));
+    snapshot_capture_result_t **ordered =
+        calloc((size_t)(file_count > 0 ? file_count : 1), sizeof(*ordered));
+    snapshot_directory_t *directories = NULL;
+    size_t directory_count = 0;
+    size_t directory_capacity = 0;
+    if (!results || !ordered) {
+        snapshot_log_failure("CBM_SOURCE_SNAPSHOT_PLAN_ALLOC_FAILED", "allocate_capture_plan", root,
+                             ERROR_NOT_ENOUGH_MEMORY);
+        free(results);
+        free(ordered);
         return CBM_NOT_FOUND;
     }
 
-    file->live_path = file->path;
-    file->path = destination_path;
-    file->size = (int64_t)captured_bytes;
-    file->mtime_ns = filetime_to_unix_ns(before.basic.LastWriteTime.QuadPart);
-    file->source_volume_serial = before.id.VolumeSerialNumber;
-    memcpy(file->source_file_id, before.id.FileId.Identifier, sizeof(file->source_file_id));
-    file->source_change_time_100ns = before.basic.ChangeTime.QuadPart;
-    digest_to_hex(captured_digest, file->sha256);
+    size_t root_length = strlen(root);
+    for (int i = 0; i < file_count; i++) {
+        if (!snapshot_rel_path_valid(files[i].rel_path)) {
+            snapshot_log_failure("CBM_SOURCE_SNAPSHOT_RELATIVE_PATH_INVALID",
+                                 "validate_relative_path", files[i].rel_path, ERROR_INVALID_NAME);
+            goto fail;
+        }
+        results[i].file = &files[i];
+        results[i].destination_path = snapshot_join(root, files[i].rel_path);
+        if (!results[i].destination_path) {
+            snapshot_log_failure("CBM_SOURCE_SNAPSHOT_PATH_ALLOC_FAILED", "build_destination",
+                                 files[i].rel_path, ERROR_NOT_ENOUGH_MEMORY);
+            goto fail;
+        }
+        for (char *cursor = results[i].destination_path; *cursor; cursor++) {
+            if (*cursor == '\\') {
+                *cursor = '/';
+            }
+        }
 
-    free(wide_source);
-    free(wide_destination);
+        DWORD source_error = ERROR_SUCCESS;
+        DWORD destination_error = ERROR_SUCCESS;
+        results[i].wide_source = cbm_utf8_to_wide_path_checked(files[i].path, &source_error);
+        results[i].wide_destination =
+            cbm_utf8_to_wide_path_checked(results[i].destination_path, &destination_error);
+        if (!results[i].wide_source || !results[i].wide_destination) {
+            DWORD error = !results[i].wide_source ? source_error : destination_error;
+            snapshot_log_failure("CBM_SOURCE_SNAPSHOT_PATH_ENCODING_FAILED", "prepare_wide_paths",
+                                 files[i].path,
+                                 error != ERROR_SUCCESS ? error : ERROR_NO_UNICODE_TRANSLATION);
+            goto fail;
+        }
+        snapshot_normalize_wide_separators(results[i].wide_source);
+        snapshot_normalize_wide_separators(results[i].wide_destination);
+        ordered[i] = &results[i];
+
+        size_t depth = 0;
+        for (const char *cursor = results[i].destination_path + root_length + 1u; *cursor;
+             cursor++) {
+            if (*cursor != '/') {
+                continue;
+            }
+            depth++;
+            size_t prefix_length = (size_t)(cursor - results[i].destination_path);
+            if (!snapshot_directory_append(&directories, &directory_count, &directory_capacity,
+                                           results[i].destination_path, prefix_length, depth)) {
+                snapshot_log_failure("CBM_SOURCE_SNAPSHOT_DIRECTORY_PLAN_ALLOC_FAILED",
+                                     "prepare_unique_ancestors", results[i].destination_path,
+                                     GetLastError());
+                goto fail;
+            }
+        }
+    }
+
+    if (file_count > 1) {
+        qsort(ordered, (size_t)file_count, sizeof(*ordered), snapshot_compare_capture_destinations);
+    }
+    for (int i = 1; i < file_count; i++) {
+        if (snapshot_compare_wide_paths(ordered[i - 1]->wide_destination,
+                                        ordered[i]->wide_destination) == 0) {
+            snapshot_log_failure("CBM_SOURCE_SNAPSHOT_DESTINATION_COLLISION",
+                                 "validate_destination_uniqueness", ordered[i]->destination_path,
+                                 ERROR_ALREADY_EXISTS);
+            goto fail;
+        }
+    }
+
+    if (directory_count > 1) {
+        qsort(directories, directory_count, sizeof(*directories), snapshot_compare_directories);
+    }
+    size_t unique_count = 0;
+    for (size_t i = 0; i < directory_count; i++) {
+        if (unique_count > 0 && snapshot_compare_wide_paths(directories[unique_count - 1].wide_path,
+                                                            directories[i].wide_path) == 0) {
+            free(directories[i].path);
+            free(directories[i].wide_path);
+            continue;
+        }
+        if (unique_count != i) {
+            directories[unique_count] = directories[i];
+        }
+        unique_count++;
+    }
+    directory_count = unique_count;
+
+    for (size_t i = 0; i < directory_count; i++) {
+        if (snapshot_destination_exists(ordered, file_count, directories[i].wide_path)) {
+            snapshot_log_failure("CBM_SOURCE_SNAPSHOT_FILE_DIRECTORY_COLLISION",
+                                 "validate_destination_topology", directories[i].path,
+                                 ERROR_ALREADY_EXISTS);
+            goto fail;
+        }
+        if (!CreateDirectoryW(directories[i].wide_path, NULL)) {
+            snapshot_log_failure("CBM_SOURCE_SNAPSHOT_DIRECTORY_CREATE_FAILED",
+                                 "create_unique_ancestor", directories[i].path, GetLastError());
+            goto fail;
+        }
+    }
+
+    snapshot_directories_free(directories, directory_count);
+    free(ordered);
+    *results_out = results;
     return 0;
+
+fail:
+    snapshot_directories_free(directories, directory_count);
+    free(ordered);
+    snapshot_capture_results_free(results, file_count);
+    return CBM_NOT_FOUND;
 }
 
 static int compare_rel_paths(const void *left, const void *right) {
@@ -459,31 +753,167 @@ static int compare_rel_paths(const void *left, const void *right) {
     return strcmp((*a)->rel_path, (*b)->rel_path);
 }
 
-static bool snapshot_current_identity_matches(const cbm_file_info_t *file) {
-    wchar_t *wide = cbm_utf8_to_wide_path(file->live_path);
-    if (!wide) {
-        return false;
-    }
-    HANDLE handle = CreateFileW(wide, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING,
+static void snapshot_probe_current_identity(const cbm_file_info_t *file, const wchar_t *wide_path,
+                                            snapshot_identity_probe_result_t *result) {
+    HANDLE handle = CreateFileW(wide_path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING,
                                 FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT, NULL);
-    free(wide);
     if (handle == INVALID_HANDLE_VALUE) {
-        return false;
+        result->failure_code = "CBM_SOURCE_SNAPSHOT_NAMESPACE_IDENTITY_OPEN_FAILED";
+        result->failure_operation = "open_live_identity";
+        result->native_error = GetLastError();
+        return;
     }
     snapshot_identity_t identity = {0};
-    bool ok = snapshot_get_identity(handle, &identity) &&
-              identity.id.VolumeSerialNumber == file->source_volume_serial &&
-              memcmp(identity.id.FileId.Identifier, file->source_file_id,
-                     sizeof(file->source_file_id)) == 0 &&
-              identity.standard.EndOfFile.QuadPart == file->size &&
-              filetime_to_unix_ns(identity.basic.LastWriteTime.QuadPart) == file->mtime_ns &&
-              identity.basic.ChangeTime.QuadPart == file->source_change_time_100ns;
-    CloseHandle(handle);
-    return ok;
+    if (!snapshot_get_identity(handle, &identity)) {
+        result->failure_code = "CBM_SOURCE_SNAPSHOT_NAMESPACE_IDENTITY_READ_FAILED";
+        result->failure_operation = "read_live_identity";
+        result->native_error = GetLastError();
+    } else {
+        result->match =
+            identity.id.VolumeSerialNumber == file->source_volume_serial &&
+            memcmp(identity.id.FileId.Identifier, file->source_file_id,
+                   sizeof(file->source_file_id)) == 0 &&
+            identity.standard.EndOfFile.QuadPart == file->size &&
+            filetime_to_unix_ns(identity.basic.LastWriteTime.QuadPart) == file->mtime_ns &&
+            identity.basic.ChangeTime.QuadPart == file->source_change_time_100ns &&
+            !identity.standard.Directory && !identity.standard.DeletePending;
+        if (!result->match) {
+            result->failure_code = "CBM_SOURCE_SNAPSHOT_NAMESPACE_DRIFT";
+            result->failure_operation = "compare_live_identity";
+            result->native_error = ERROR_FILE_INVALID;
+        }
+    }
+    if (!CloseHandle(handle) && !result->failure_code) {
+        result->failure_code = "CBM_SOURCE_SNAPSHOT_NAMESPACE_IDENTITY_CLOSE_FAILED";
+        result->failure_operation = "close_live_identity";
+        result->native_error = GetLastError();
+        result->match = false;
+    }
+}
+
+static VOID CALLBACK snapshot_dispatch_callback(PTP_CALLBACK_INSTANCE instance, PVOID context,
+                                                PTP_WORK work) {
+    (void)instance;
+    (void)work;
+    snapshot_dispatcher_t *dispatcher = context;
+    for (;;) {
+        LONG index = InterlockedIncrement(&dispatcher->next_index);
+        if (index < 0 || index >= dispatcher->item_count) {
+            break;
+        }
+        if (dispatcher->operation == SNAPSHOT_DISPATCH_CAPTURE) {
+            snapshot_capture_prepared(&dispatcher->capture_results[index]);
+        } else if (dispatcher->operation == SNAPSHOT_DISPATCH_IDENTITY) {
+            snapshot_probe_current_identity(dispatcher->identity_files[index],
+                                            dispatcher->identity_wide_paths[index],
+                                            &dispatcher->identity_results[index]);
+        }
+    }
+}
+
+static void snapshot_dispatcher_close(snapshot_dispatcher_t *dispatcher) {
+    if (!dispatcher) {
+        return;
+    }
+    if (dispatcher->work) {
+        CloseThreadpoolWork(dispatcher->work);
+        dispatcher->work = NULL;
+    }
+    if (dispatcher->environment_initialized) {
+        DestroyThreadpoolEnvironment(&dispatcher->environment);
+        dispatcher->environment_initialized = false;
+    }
+    if (dispatcher->pool) {
+        CloseThreadpool(dispatcher->pool);
+        dispatcher->pool = NULL;
+    }
+}
+
+static int snapshot_dispatcher_init(snapshot_dispatcher_t *dispatcher, int item_count,
+                                    const char *path) {
+    memset(dispatcher, 0, sizeof(*dispatcher));
+    if (item_count == 0) {
+        return 0;
+    }
+    int workers = cbm_default_worker_count(true);
+    if (workers < SNAPSHOT_MIN_WORKERS) {
+        snapshot_log_failure("CBM_SOURCE_SNAPSHOT_WORKER_COUNT_INVALID", "admit_worker_count", path,
+                             ERROR_INVALID_DATA);
+        return CBM_NOT_FOUND;
+    }
+    if (workers > item_count) {
+        workers = item_count;
+    }
+
+    dispatcher->pool = CreateThreadpool(NULL);
+    if (!dispatcher->pool) {
+        snapshot_log_failure("CBM_SOURCE_SNAPSHOT_THREADPOOL_CREATE_FAILED", "create_threadpool",
+                             path, GetLastError());
+        return CBM_NOT_FOUND;
+    }
+    SetThreadpoolThreadMaximum(dispatcher->pool, (DWORD)workers);
+    if (!SetThreadpoolThreadMinimum(dispatcher->pool, (DWORD)workers)) {
+        snapshot_log_failure("CBM_SOURCE_SNAPSHOT_THREADPOOL_ADMISSION_FAILED",
+                             "set_threadpool_minimum", path, GetLastError());
+        snapshot_dispatcher_close(dispatcher);
+        return CBM_NOT_FOUND;
+    }
+    InitializeThreadpoolEnvironment(&dispatcher->environment);
+    dispatcher->environment_initialized = true;
+    SetThreadpoolCallbackPool(&dispatcher->environment, dispatcher->pool);
+    dispatcher->work =
+        CreateThreadpoolWork(snapshot_dispatch_callback, dispatcher, &dispatcher->environment);
+    if (!dispatcher->work) {
+        snapshot_log_failure("CBM_SOURCE_SNAPSHOT_WORK_CREATE_FAILED", "create_threadpool_work",
+                             path, GetLastError());
+        snapshot_dispatcher_close(dispatcher);
+        return CBM_NOT_FOUND;
+    }
+    dispatcher->worker_count = workers;
+    return 0;
+}
+
+static void snapshot_dispatch_capture(snapshot_dispatcher_t *dispatcher,
+                                      snapshot_capture_result_t *results, int count) {
+    if (count == 0) {
+        return;
+    }
+    dispatcher->operation = SNAPSHOT_DISPATCH_CAPTURE;
+    dispatcher->capture_results = results;
+    dispatcher->identity_files = NULL;
+    dispatcher->identity_wide_paths = NULL;
+    dispatcher->identity_results = NULL;
+    dispatcher->item_count = count;
+    InterlockedExchange(&dispatcher->next_index, SNAPSHOT_INDEX_ORIGIN);
+    for (int i = 0; i < dispatcher->worker_count; i++) {
+        SubmitThreadpoolWork(dispatcher->work);
+    }
+    WaitForThreadpoolWorkCallbacks(dispatcher->work, FALSE);
+}
+
+static void snapshot_dispatch_identity(snapshot_dispatcher_t *dispatcher, cbm_file_info_t **files,
+                                       const wchar_t **wide_paths,
+                                       snapshot_identity_probe_result_t *results, int count) {
+    if (count == 0) {
+        return;
+    }
+    dispatcher->operation = SNAPSHOT_DISPATCH_IDENTITY;
+    dispatcher->capture_results = NULL;
+    dispatcher->identity_files = files;
+    dispatcher->identity_wide_paths = wide_paths;
+    dispatcher->identity_results = results;
+    dispatcher->item_count = count;
+    InterlockedExchange(&dispatcher->next_index, SNAPSHOT_INDEX_ORIGIN);
+    for (int i = 0; i < dispatcher->worker_count; i++) {
+        SubmitThreadpoolWork(dispatcher->work);
+    }
+    WaitForThreadpoolWorkCallbacks(dispatcher->work, FALSE);
 }
 
 static int snapshot_verify_namespace(const char *repo_path, const cbm_discover_opts_t *opts,
-                                     cbm_file_info_t *captured, int captured_count) {
+                                     cbm_file_info_t *captured, int captured_count,
+                                     snapshot_dispatcher_t *dispatcher,
+                                     snapshot_capture_result_t *capture_plan) {
     cbm_file_info_t *observed = NULL;
     int observed_count = 0;
     char **excluded = NULL;
@@ -518,8 +948,7 @@ static int snapshot_verify_namespace(const char *repo_path, const cbm_discover_o
     for (int i = 0; match && i < captured_count; i++) {
         if (strcmp(a[i]->rel_path, b[i]->rel_path) != 0 || a[i]->language != b[i]->language ||
             a[i]->auxiliary != b[i]->auxiliary ||
-            a[i]->interpretation_input != b[i]->interpretation_input ||
-            !snapshot_current_identity_matches(a[i])) {
+            a[i]->interpretation_input != b[i]->interpretation_input) {
             match = false;
             mismatch = a[i]->live_path;
         }
@@ -533,6 +962,67 @@ static int snapshot_verify_namespace(const char *repo_path, const cbm_discover_o
                              ERROR_FILE_INVALID);
         return CBM_NOT_FOUND;
     }
+
+    snapshot_identity_probe_result_t *identity_results =
+        calloc((size_t)(captured_count > 0 ? captured_count : 1), sizeof(*identity_results));
+    if (!identity_results) {
+        snapshot_log_failure("CBM_SOURCE_SNAPSHOT_NAMESPACE_ALLOC_FAILED",
+                             "allocate_identity_results", repo_path, ERROR_NOT_ENOUGH_MEMORY);
+        return CBM_NOT_FOUND;
+    }
+    if (dispatcher) {
+        const wchar_t **wide_paths =
+            calloc((size_t)(captured_count > 0 ? captured_count : 1), sizeof(*wide_paths));
+        cbm_file_info_t **identity_files =
+            calloc((size_t)(captured_count > 0 ? captured_count : 1), sizeof(*identity_files));
+        if (!capture_plan || !wide_paths || !identity_files) {
+            snapshot_log_failure("CBM_SOURCE_SNAPSHOT_NAMESPACE_ALLOC_FAILED",
+                                 "prepare_identity_dispatch", repo_path, ERROR_NOT_ENOUGH_MEMORY);
+            free(wide_paths);
+            free(identity_files);
+            free(identity_results);
+            return CBM_NOT_FOUND;
+        }
+        for (int i = 0; i < captured_count; i++) {
+            identity_files[i] = &captured[i];
+            wide_paths[i] = capture_plan[i].wide_source;
+        }
+        snapshot_dispatch_identity(dispatcher, identity_files, wide_paths, identity_results,
+                                   captured_count);
+        free(wide_paths);
+        free(identity_files);
+    } else {
+        for (int i = 0; i < captured_count; i++) {
+            DWORD error = ERROR_SUCCESS;
+            wchar_t *wide = cbm_utf8_to_wide_path_checked(captured[i].live_path, &error);
+            if (!wide) {
+                identity_results[i].failure_code =
+                    "CBM_SOURCE_SNAPSHOT_NAMESPACE_IDENTITY_PATH_FAILED";
+                identity_results[i].failure_operation = "widen_live_identity_path";
+                identity_results[i].native_error =
+                    error != ERROR_SUCCESS ? error : ERROR_NO_UNICODE_TRANSLATION;
+                continue;
+            }
+            snapshot_normalize_wide_separators(wide);
+            snapshot_probe_current_identity(&captured[i], wide, &identity_results[i]);
+            free(wide);
+        }
+    }
+    for (int i = 0; i < captured_count; i++) {
+        if (!identity_results[i].match) {
+            snapshot_log_failure(
+                identity_results[i].failure_code ? identity_results[i].failure_code
+                                                 : "CBM_SOURCE_SNAPSHOT_NAMESPACE_DRIFT",
+                identity_results[i].failure_operation ? identity_results[i].failure_operation
+                                                      : "compare_live_identity",
+                captured[i].live_path,
+                identity_results[i].native_error != ERROR_SUCCESS ? identity_results[i].native_error
+                                                                  : ERROR_FILE_INVALID);
+            free(identity_results);
+            return CBM_NOT_FOUND;
+        }
+    }
+    free(identity_results);
     return 0;
 }
 
@@ -596,7 +1086,7 @@ int cbm_source_snapshot_verify_unchanged(const char *repo_path, const cbm_discov
     }
     cbm_ht_free(by_path);
 
-    if (snapshot_verify_namespace(repo_path, opts, verified, file_count) != 0) {
+    if (snapshot_verify_namespace(repo_path, opts, verified, file_count, NULL, NULL) != 0) {
         free(verified);
         return CBM_NOT_FOUND;
     }
@@ -701,19 +1191,62 @@ int cbm_source_snapshot_capture(const char *repo_path, const cbm_discover_opts_t
     free(wide_root);
     snapshot->root = root;
 
+    snapshot_dispatcher_t dispatcher = {0};
+    if (snapshot_dispatcher_init(&dispatcher, file_count, root) != 0) {
+        return CBM_NOT_FOUND;
+    }
+    snapshot_capture_result_t *results = NULL;
+    if (snapshot_prepare_capture_plan(root, files, file_count, &results) != 0) {
+        snapshot_dispatcher_close(&dispatcher);
+        return CBM_NOT_FOUND;
+    }
+
+    snapshot_dispatch_capture(&dispatcher, results, file_count);
     for (int i = 0; i < file_count; i++) {
-        if (snapshot_capture_one(root, &files[i]) != 0) {
-            (void)cbm_source_snapshot_destroy(snapshot);
+        if (!results[i].complete || results[i].failure_code) {
+            snapshot_log_failure(results[i].failure_code ? results[i].failure_code
+                                                         : "CBM_SOURCE_SNAPSHOT_CAPTURE_INCOMPLETE",
+                                 results[i].failure_operation ? results[i].failure_operation
+                                                              : "capture_worker",
+                                 results[i].failure_path ? results[i].failure_path : files[i].path,
+                                 results[i].native_error != ERROR_SUCCESS ? results[i].native_error
+                                                                          : ERROR_GEN_FAILURE);
+            snapshot_capture_results_free(results, file_count);
+            snapshot_dispatcher_close(&dispatcher);
             return CBM_NOT_FOUND;
         }
     }
-    if (snapshot_verify_namespace(repo_path, opts, files, file_count) != 0) {
-        (void)cbm_source_snapshot_destroy(snapshot);
+
+    /* Publish the staged records only after every independent file transaction
+     * completed. No worker mutates discovery state, so failure cannot expose a
+     * partially captured file array to later passes. */
+    for (int i = 0; i < file_count; i++) {
+        files[i].live_path = files[i].path;
+        files[i].path = results[i].destination_path;
+        results[i].destination_path = NULL;
+        files[i].size = (int64_t)results[i].byte_count;
+        files[i].mtime_ns =
+            filetime_to_unix_ns(results[i].source_identity.basic.LastWriteTime.QuadPart);
+        files[i].source_volume_serial = results[i].source_identity.id.VolumeSerialNumber;
+        memcpy(files[i].source_file_id, results[i].source_identity.id.FileId.Identifier,
+               sizeof(files[i].source_file_id));
+        files[i].source_change_time_100ns = results[i].source_identity.basic.ChangeTime.QuadPart;
+        memcpy(files[i].sha256, results[i].sha256, sizeof(files[i].sha256));
+    }
+    if (snapshot_verify_namespace(repo_path, opts, files, file_count, &dispatcher, results) != 0) {
+        snapshot_capture_results_free(results, file_count);
+        snapshot_dispatcher_close(&dispatcher);
         return CBM_NOT_FOUND;
     }
+    int worker_count = dispatcher.worker_count;
+    snapshot_capture_results_free(results, file_count);
+    snapshot_dispatcher_close(&dispatcher);
     char count_buf[32];
+    char worker_buf[32];
     snprintf(count_buf, sizeof(count_buf), "%d", file_count);
-    cbm_log_info("source_snapshot.complete", "root", root, "files", count_buf);
+    snprintf(worker_buf, sizeof(worker_buf), "%d", worker_count);
+    cbm_log_info("source_snapshot.complete", "root", root, "files", count_buf, "workers",
+                 worker_buf);
     return 0;
 }
 

@@ -5865,6 +5865,20 @@ static bool add_pipeline_phase_metrics(yyjson_mut_doc *doc, yyjson_mut_val *root
         yyjson_mut_obj_add_uint(doc, metric, "read_bytes", metrics[i].read_bytes);
         yyjson_mut_obj_add_uint(doc, metric, "write_bytes", metrics[i].write_bytes);
         yyjson_mut_obj_add_uint(doc, metric, "other_bytes", metrics[i].other_bytes);
+        yyjson_mut_obj_add_uint(doc, metric, "start_working_set_bytes",
+                                metrics[i].start_working_set_bytes);
+        yyjson_mut_obj_add_uint(doc, metric, "end_working_set_bytes",
+                                metrics[i].end_working_set_bytes);
+        yyjson_mut_obj_add_uint(doc, metric, "start_peak_working_set_bytes",
+                                metrics[i].start_peak_working_set_bytes);
+        yyjson_mut_obj_add_uint(doc, metric, "end_peak_working_set_bytes",
+                                metrics[i].end_peak_working_set_bytes);
+        yyjson_mut_obj_add_uint(doc, metric, "start_private_bytes", metrics[i].start_private_bytes);
+        yyjson_mut_obj_add_uint(doc, metric, "end_private_bytes", metrics[i].end_private_bytes);
+        yyjson_mut_obj_add_uint(doc, metric, "start_peak_private_bytes",
+                                metrics[i].start_peak_private_bytes);
+        yyjson_mut_obj_add_uint(doc, metric, "end_peak_private_bytes",
+                                metrics[i].end_peak_private_bytes);
         yyjson_mut_arr_add_val(items, metric);
     }
     yyjson_mut_obj_add_val(doc, root, "phase_metrics", items);

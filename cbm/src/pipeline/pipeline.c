@@ -14,8 +14,8 @@
 
 enum {
     CBM_DIR_PERMS = 0755,
-    PL_RING = 4,
-    PL_RING_MASK = 3,
+    PL_RING = 16,
+    PL_RING_MASK = 15,
     PL_SEQ_PASSES = 6,
     PL_WAL_BUF = 1040,
     PL_ERROR_CODE = 128,
@@ -296,24 +296,60 @@ cbm_pipeline_phase_probe_t cbm_pipeline_phase_probe_start(cbm_pipeline_t *p, con
                       "message", "the indexing worker I/O baseline could not be read",
                       "remediation", "resolve the reported process-accounting failure and retry");
     }
+    probe.memory.cb = sizeof(probe.memory);
+    probe.memory_valid =
+        GetProcessMemoryInfo(GetCurrentProcess(), (PROCESS_MEMORY_COUNTERS *)&probe.memory,
+                             sizeof(probe.memory)) != 0;
+    if (!probe.memory_valid) {
+        if (p) {
+            p->phase_metrics_complete = false;
+        }
+        char native_error[CBM_SZ_32];
+        snprintf(native_error, sizeof(native_error), "%lu", (unsigned long)GetLastError());
+        cbm_log_error("pipeline.telemetry_failed", "code",
+                      "CBM_PIPELINE_MEMORY_COUNTER_READ_FAILED", "phase", phase,
+                      "native_error_kind", "win32", "native_error", native_error, "message",
+                      "the indexing worker memory baseline could not be read", "remediation",
+                      "resolve the reported process-accounting failure and retry");
+    }
     return probe;
 }
 
 void cbm_pipeline_phase_probe_end(cbm_pipeline_t *p, const char *phase,
                                   const cbm_pipeline_phase_probe_t *probe) {
     IO_COUNTERS current = {0};
-    if (!probe || !probe->io_valid || !GetProcessIoCounters(GetCurrentProcess(), &current)) {
+    PROCESS_MEMORY_COUNTERS_EX current_memory = {0};
+    current_memory.cb = sizeof(current_memory);
+    bool current_io_valid =
+        probe && probe->io_valid && GetProcessIoCounters(GetCurrentProcess(), &current) != 0;
+    DWORD current_io_error = current_io_valid ? ERROR_SUCCESS : GetLastError();
+    bool current_memory_valid =
+        probe && probe->memory_valid &&
+        GetProcessMemoryInfo(GetCurrentProcess(), (PROCESS_MEMORY_COUNTERS *)&current_memory,
+                             sizeof(current_memory)) != 0;
+    DWORD current_memory_error = current_memory_valid ? ERROR_SUCCESS : GetLastError();
+    if (!current_io_valid || !current_memory_valid) {
         if (p) {
             p->phase_metrics_complete = false;
         }
-        if (probe && probe->io_valid) {
+        if (probe && probe->io_valid && !current_io_valid) {
             char native_error[CBM_SZ_32];
-            snprintf(native_error, sizeof(native_error), "%lu", (unsigned long)GetLastError());
+            snprintf(native_error, sizeof(native_error), "%lu", (unsigned long)current_io_error);
             cbm_log_error("pipeline.telemetry_failed", "code",
                           "CBM_PIPELINE_IO_COUNTER_READ_FAILED", "phase", phase,
                           "native_error_kind", "win32", "native_error", native_error, "message",
                           "the indexing worker I/O terminal state could not be read", "remediation",
                           "resolve the reported process-accounting failure and retry");
+        }
+        if (probe && probe->memory_valid && !current_memory_valid) {
+            char native_error[CBM_SZ_32];
+            snprintf(native_error, sizeof(native_error), "%lu",
+                     (unsigned long)current_memory_error);
+            cbm_log_error(
+                "pipeline.telemetry_failed", "code", "CBM_PIPELINE_MEMORY_COUNTER_READ_FAILED",
+                "phase", phase, "native_error_kind", "win32", "native_error", native_error,
+                "message", "the indexing worker memory terminal state could not be read",
+                "remediation", "resolve the reported process-accounting failure and retry");
         }
         return;
     }
@@ -341,9 +377,25 @@ void cbm_pipeline_phase_probe_end(cbm_pipeline_t *p, const char *phase,
     metric->read_bytes = phase_read_bytes;
     metric->write_bytes = phase_write_bytes;
     metric->other_bytes = phase_other_bytes;
+    metric->start_working_set_bytes = (uint64_t)probe->memory.WorkingSetSize;
+    metric->end_working_set_bytes = (uint64_t)current_memory.WorkingSetSize;
+    metric->start_peak_working_set_bytes = (uint64_t)probe->memory.PeakWorkingSetSize;
+    metric->end_peak_working_set_bytes = (uint64_t)current_memory.PeakWorkingSetSize;
+    metric->start_private_bytes = (uint64_t)probe->memory.PrivateUsage;
+    metric->end_private_bytes = (uint64_t)current_memory.PrivateUsage;
+    metric->start_peak_private_bytes = (uint64_t)probe->memory.PeakPagefileUsage;
+    metric->end_peak_private_bytes = (uint64_t)current_memory.PeakPagefileUsage;
     cbm_log_info("pipeline.phase", "phase", phase, "elapsed_ms", u64_buf(phase_elapsed_ms),
                  "read_bytes", u64_buf(phase_read_bytes), "write_bytes", u64_buf(phase_write_bytes),
-                 "other_bytes", u64_buf(phase_other_bytes));
+                 "other_bytes", u64_buf(phase_other_bytes), "start_working_set_bytes",
+                 u64_buf(metric->start_working_set_bytes), "end_working_set_bytes",
+                 u64_buf(metric->end_working_set_bytes), "start_peak_working_set_bytes",
+                 u64_buf(metric->start_peak_working_set_bytes), "end_peak_working_set_bytes",
+                 u64_buf(metric->end_peak_working_set_bytes), "start_private_bytes",
+                 u64_buf(metric->start_private_bytes), "end_private_bytes",
+                 u64_buf(metric->end_private_bytes), "start_peak_private_bytes",
+                 u64_buf(metric->start_peak_private_bytes), "end_peak_private_bytes",
+                 u64_buf(metric->end_peak_private_bytes));
 }
 
 /* Log current + peak RSS at a pipeline phase boundary (memory profiling). */
@@ -3159,9 +3211,12 @@ cleanup:
     cbm_userconfig_free(p->userconfig);
     p->userconfig = NULL;
     p->source_root = NULL;
+    cbm_pipeline_phase_probe_t source_cleanup_probe =
+        cbm_pipeline_phase_probe_start(p, "source_snapshot_cleanup");
     if (cbm_source_snapshot_destroy(&source_snapshot) != 0) {
         rc = CBM_NOT_FOUND;
     }
+    cbm_pipeline_phase_probe_end(p, "source_snapshot_cleanup", &source_cleanup_probe);
     cbm_discover_free(files, file_count);
     cbm_pipeline_phase_probe_end(p, "total", &total_probe);
     return rc;
