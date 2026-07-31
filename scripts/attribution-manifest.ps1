@@ -51,6 +51,500 @@ $script:AstroAttributionRefreshOldV1Regex =
 $script:AstroAttributionRefreshScratchV1Regex =
     '^\.astro-manifest-refresh-scratch-v1\.pid-(?<pid>[1-9][0-9]*)\.ticks-(?<ticks>[1-9][0-9]*)\.lock-sha256-(?<sha>[0-9a-f]{64})\.nonce-(?<nonce>[0-9a-f]{32})\.tmp\z'
 
+# The manifest is cumulative process-lifetime history and can contain thousands of
+# PID generations.  Parsing every scalar through a PowerShell function and compiling
+# a fresh number regex for each token made strict recovery superlinear: the real
+# 7,055-generation #859 manifest could not reach the first durable authorization in
+# six hours.  Keep the existing PowerShell semantic validator below, but construct
+# its compatibility node tree in compiled code in one linear pass.  The compiled
+# reader also reconstructs the launcher's exact producer encoding, so whitespace,
+# property order, duplicate names, string escaping, and token spelling remain
+# fail-closed rather than being normalized by a permissive JSON deserializer.
+if (-not ('AstroAttributionJsonParser' -as [type])) {
+    Add-Type -TypeDefinition @'
+using System;
+using System.Collections.Generic;
+using System.Text;
+
+public sealed class AstroAttributionJsonNode
+{
+    public string Kind { get; set; }
+    public object Value { get; set; }
+    public string Raw { get; set; }
+    public int NextIndex { get; set; }
+    public AstroAttributionJsonNode[] Items { get; set; }
+    public Dictionary<string, AstroAttributionJsonNode> Properties { get; set; }
+    public string[] Names { get; set; }
+    public string[] RawNames { get; set; }
+}
+
+public sealed class AstroAttributionJsonParseResult
+{
+    public AstroAttributionJsonNode Root { get; set; }
+    public string CanonicalJson { get; set; }
+}
+
+public static class AstroAttributionJsonParser
+{
+    public static bool ByteArraysEqual(byte[] left, byte[] right)
+    {
+        if (Object.ReferenceEquals(left, right))
+            return true;
+        if (left == null || right == null || left.Length != right.Length)
+            return false;
+        for (int index = 0; index < left.Length; index++)
+        {
+            if (left[index] != right[index])
+                return false;
+        }
+        return true;
+    }
+
+    public static AstroAttributionJsonParseResult Parse(string json)
+    {
+        if (json == null)
+            throw new ArgumentNullException("json");
+
+        Parser parser = new Parser(json);
+        return parser.ParseDocument();
+    }
+
+    private sealed class Parser
+    {
+        private readonly string json;
+        private readonly StringBuilder canonical;
+        private int index;
+
+        internal Parser(string jsonValue)
+        {
+            json = jsonValue;
+            canonical = new StringBuilder(jsonValue.Length);
+            index = 0;
+        }
+
+        internal AstroAttributionJsonParseResult ParseDocument()
+        {
+            AstroAttributionJsonNode root = ParseValue(0, "$" );
+            SkipWhitespace();
+            if (index != json.Length)
+                throw new FormatException("unexpected trailing JSON data at character " + index);
+            root.NextIndex = index;
+            return new AstroAttributionJsonParseResult
+            {
+                Root = root,
+                CanonicalJson = canonical.ToString()
+            };
+        }
+
+        private AstroAttributionJsonNode ParseValue(int depth, string jsonPath)
+        {
+            if (depth > 32)
+                throw new FormatException(jsonPath + " exceeds the 32-level attribution JSON nesting bound");
+
+            SkipWhitespace();
+            if (index >= json.Length)
+                throw new FormatException(jsonPath + " is missing a JSON value");
+
+            char character = json[index];
+            if (character == '{')
+                return ParseObject(depth, jsonPath);
+            if (character == '[')
+                return ParseArray(depth, jsonPath);
+            if (character == '"')
+            {
+                StringToken token = ParseStringToken(jsonPath);
+                AppendCanonicalString(canonical, token.Value, jsonPath);
+                return CompleteNode(new AstroAttributionJsonNode
+                {
+                    Kind = "string",
+                    Value = token.Value,
+                    Raw = token.Raw
+                });
+            }
+            if (character == '-' || (character >= '0' && character <= '9'))
+                return ParseNumber(jsonPath);
+            if (MatchLiteral("true"))
+            {
+                canonical.Append("true");
+                return CompleteNode(Scalar("boolean", true, "true"));
+            }
+            if (MatchLiteral("false"))
+            {
+                canonical.Append("false");
+                return CompleteNode(Scalar("boolean", false, "false"));
+            }
+            if (MatchLiteral("null"))
+            {
+                canonical.Append("null");
+                return CompleteNode(Scalar("null", null, "null"));
+            }
+            throw new FormatException(
+                jsonPath + " begins with an unsupported JSON token at character " + index);
+        }
+
+        private AstroAttributionJsonNode ParseObject(int depth, string jsonPath)
+        {
+            index++;
+            canonical.Append('{');
+            Dictionary<string, AstroAttributionJsonNode> properties =
+                new Dictionary<string, AstroAttributionJsonNode>(StringComparer.Ordinal);
+            List<string> names = new List<string>();
+            List<string> rawNames = new List<string>();
+            SkipWhitespace();
+            if (Consume('}'))
+            {
+                canonical.Append('}');
+                return CompleteNode(new AstroAttributionJsonNode
+                {
+                    Kind = "object",
+                    Properties = properties,
+                    Names = names.ToArray(),
+                    RawNames = rawNames.ToArray()
+                });
+            }
+
+            bool first = true;
+            while (true)
+            {
+                SkipWhitespace();
+                if (index >= json.Length || json[index] != '"')
+                    throw new FormatException(jsonPath + " property name must be a JSON string");
+                StringToken nameToken = ParseStringToken(jsonPath + " property name");
+                if (properties.ContainsKey(nameToken.Value))
+                    throw new FormatException(
+                        jsonPath + " contains duplicate decoded property '" + nameToken.Value + "'");
+                SkipWhitespace();
+                if (!Consume(':'))
+                    throw new FormatException(
+                        jsonPath + " property '" + nameToken.Value + "' is missing ':'");
+
+                if (!first)
+                    canonical.Append(',');
+                first = false;
+                AppendCanonicalString(canonical, nameToken.Value, jsonPath + " property name");
+                canonical.Append(':');
+                AstroAttributionJsonNode value = ParseValue(
+                    depth + 1,
+                    jsonPath + "." + nameToken.Value);
+                properties.Add(nameToken.Value, value);
+                names.Add(nameToken.Value);
+                rawNames.Add(nameToken.Raw);
+
+                SkipWhitespace();
+                if (Consume('}'))
+                {
+                    canonical.Append('}');
+                    return CompleteNode(new AstroAttributionJsonNode
+                    {
+                        Kind = "object",
+                        Properties = properties,
+                        Names = names.ToArray(),
+                        RawNames = rawNames.ToArray()
+                    });
+                }
+                if (!Consume(','))
+                    throw new FormatException(
+                        jsonPath + " expected ',' or '}' at character " + index);
+            }
+        }
+
+        private AstroAttributionJsonNode ParseArray(int depth, string jsonPath)
+        {
+            index++;
+            canonical.Append('[');
+            List<AstroAttributionJsonNode> items = new List<AstroAttributionJsonNode>();
+            SkipWhitespace();
+            if (Consume(']'))
+            {
+                canonical.Append(']');
+                return CompleteNode(new AstroAttributionJsonNode
+                {
+                    Kind = "array",
+                    Items = items.ToArray()
+                });
+            }
+
+            while (true)
+            {
+                if (items.Count != 0)
+                    canonical.Append(',');
+                items.Add(ParseValue(depth + 1, jsonPath + "[" + items.Count + "]"));
+                SkipWhitespace();
+                if (Consume(']'))
+                {
+                    canonical.Append(']');
+                    return CompleteNode(new AstroAttributionJsonNode
+                    {
+                        Kind = "array",
+                        Items = items.ToArray()
+                    });
+                }
+                if (!Consume(','))
+                    throw new FormatException(
+                        jsonPath + " expected ',' or ']' at character " + index);
+            }
+        }
+
+        private AstroAttributionJsonNode ParseNumber(string jsonPath)
+        {
+            int start = index;
+            if (json[index] == '-')
+            {
+                index++;
+                if (index >= json.Length)
+                    throw new FormatException(jsonPath + " contains an invalid JSON number");
+            }
+
+            if (json[index] == '0')
+            {
+                index++;
+            }
+            else if (json[index] >= '1' && json[index] <= '9')
+            {
+                index++;
+                while (index < json.Length && json[index] >= '0' && json[index] <= '9')
+                    index++;
+            }
+            else
+            {
+                throw new FormatException(jsonPath + " contains an invalid JSON number");
+            }
+
+            bool integer = true;
+            if (index < json.Length && json[index] == '.')
+            {
+                integer = false;
+                index++;
+                int fractionStart = index;
+                while (index < json.Length && json[index] >= '0' && json[index] <= '9')
+                    index++;
+                if (index == fractionStart)
+                    throw new FormatException(jsonPath + " contains an invalid JSON number");
+            }
+            if (index < json.Length && (json[index] == 'e' || json[index] == 'E'))
+            {
+                integer = false;
+                index++;
+                if (index < json.Length && (json[index] == '+' || json[index] == '-'))
+                    index++;
+                int exponentStart = index;
+                while (index < json.Length && json[index] >= '0' && json[index] <= '9')
+                    index++;
+                if (index == exponentStart)
+                    throw new FormatException(jsonPath + " contains an invalid JSON number");
+            }
+
+            string raw = json.Substring(start, index - start);
+            canonical.Append(raw);
+            return CompleteNode(new AstroAttributionJsonNode
+            {
+                Kind = integer ? "integer" : "number",
+                Value = raw,
+                Raw = raw
+            });
+        }
+
+        private StringToken ParseStringToken(string jsonPath)
+        {
+            int start = index;
+            index++;
+            StringBuilder decoded = new StringBuilder();
+            while (index < json.Length)
+            {
+                char character = json[index++];
+                if (character == '"')
+                {
+                    return new StringToken
+                    {
+                        Value = decoded.ToString(),
+                        Raw = json.Substring(start, index - start)
+                    };
+                }
+                if (character == '\\')
+                {
+                    if (index >= json.Length)
+                        throw new FormatException(jsonPath + " has an unterminated escape");
+                    char escape = json[index++];
+                    switch (escape)
+                    {
+                        case '"': decoded.Append('"'); break;
+                        case '\\': decoded.Append('\\'); break;
+                        case '/': decoded.Append('/'); break;
+                        case 'b': decoded.Append('\b'); break;
+                        case 'f': decoded.Append('\f'); break;
+                        case 'n': decoded.Append('\n'); break;
+                        case 'r': decoded.Append('\r'); break;
+                        case 't': decoded.Append('\t'); break;
+                        case 'u': AppendUnicodeEscape(decoded, jsonPath); break;
+                        default:
+                            throw new FormatException(jsonPath + " has an invalid JSON escape");
+                    }
+                    continue;
+                }
+                if (character < 0x20)
+                    throw new FormatException(jsonPath + " contains an unescaped control character");
+                if (Char.IsHighSurrogate(character))
+                {
+                    if (index >= json.Length || !Char.IsLowSurrogate(json[index]))
+                        throw new FormatException(jsonPath + " contains an unpaired high surrogate");
+                    decoded.Append(character);
+                    decoded.Append(json[index++]);
+                    continue;
+                }
+                if (Char.IsLowSurrogate(character))
+                    throw new FormatException(jsonPath + " contains an unpaired low surrogate");
+                decoded.Append(character);
+            }
+            throw new FormatException(jsonPath + " has an unterminated JSON string");
+        }
+
+        private void AppendUnicodeEscape(StringBuilder decoded, string jsonPath)
+        {
+            char first = ReadHexQuad(jsonPath);
+            if (Char.IsHighSurrogate(first))
+            {
+                if (index + 6 > json.Length || json[index] != '\\' || json[index + 1] != 'u')
+                    throw new FormatException(jsonPath + " contains an unpaired high surrogate");
+                index += 2;
+                char second = ReadHexQuad(jsonPath);
+                if (!Char.IsLowSurrogate(second))
+                    throw new FormatException(jsonPath + " contains an unpaired high surrogate");
+                decoded.Append(first);
+                decoded.Append(second);
+                return;
+            }
+            if (Char.IsLowSurrogate(first))
+                throw new FormatException(jsonPath + " contains an unpaired low surrogate");
+            decoded.Append(first);
+        }
+
+        private char ReadHexQuad(string jsonPath)
+        {
+            if (index + 4 > json.Length)
+                throw new FormatException(jsonPath + " has an incomplete Unicode escape");
+            int value = 0;
+            for (int offset = 0; offset < 4; offset++)
+            {
+                char character = json[index++];
+                int digit;
+                if (character >= '0' && character <= '9')
+                    digit = character - '0';
+                else if (character >= 'a' && character <= 'f')
+                    digit = character - 'a' + 10;
+                else if (character >= 'A' && character <= 'F')
+                    digit = character - 'A' + 10;
+                else
+                    throw new FormatException(jsonPath + " has an invalid Unicode escape");
+                value = (value << 4) | digit;
+            }
+            return (char)value;
+        }
+
+        private bool MatchLiteral(string literal)
+        {
+            if (index + literal.Length > json.Length)
+                return false;
+            for (int offset = 0; offset < literal.Length; offset++)
+            {
+                if (json[index + offset] != literal[offset])
+                    return false;
+            }
+            index += literal.Length;
+            return true;
+        }
+
+        private bool Consume(char expected)
+        {
+            if (index >= json.Length || json[index] != expected)
+                return false;
+            index++;
+            return true;
+        }
+
+        private void SkipWhitespace()
+        {
+            while (index < json.Length)
+            {
+                char character = json[index];
+                if (character != ' ' && character != '\t' &&
+                    character != '\r' && character != '\n')
+                    return;
+                index++;
+            }
+        }
+
+        private AstroAttributionJsonNode CompleteNode(AstroAttributionJsonNode node)
+        {
+            if (node.Items == null)
+                node.Items = new AstroAttributionJsonNode[0];
+            if (node.Names == null)
+                node.Names = new string[0];
+            if (node.RawNames == null)
+                node.RawNames = new string[0];
+            node.NextIndex = index;
+            return node;
+        }
+
+        private sealed class StringToken
+        {
+            internal string Value;
+            internal string Raw;
+        }
+    }
+
+    private static AstroAttributionJsonNode Scalar(string kind, object value, string raw)
+    {
+        return new AstroAttributionJsonNode
+        {
+            Kind = kind,
+            Value = value,
+            Raw = raw,
+            Items = new AstroAttributionJsonNode[0],
+            Names = new string[0],
+            RawNames = new string[0]
+        };
+    }
+
+    private static void AppendCanonicalString(StringBuilder builder, string value, string jsonPath)
+    {
+        if (value == null)
+            throw new FormatException(jsonPath + " must be a JSON string");
+        builder.Append('"');
+        for (int index = 0; index < value.Length; index++)
+        {
+            char character = value[index];
+            switch (character)
+            {
+                case '"': builder.Append("\\\""); continue;
+                case '\\': builder.Append("\\\\"); continue;
+                case '\n': builder.Append("\\n"); continue;
+                case '\r': builder.Append("\\r"); continue;
+                case '\t': builder.Append("\\t"); continue;
+            }
+            if (character < 0x20)
+            {
+                builder.Append("\\u");
+                builder.Append(((int)character).ToString("x4", System.Globalization.CultureInfo.InvariantCulture));
+                continue;
+            }
+            if (Char.IsHighSurrogate(character))
+            {
+                if (index + 1 >= value.Length || !Char.IsLowSurrogate(value[index + 1]))
+                    throw new FormatException(jsonPath + " contains an unpaired high surrogate");
+                builder.Append(character);
+                builder.Append(value[++index]);
+                continue;
+            }
+            if (Char.IsLowSurrogate(character))
+                throw new FormatException(jsonPath + " contains an unpaired low surrogate");
+            builder.Append(character);
+        }
+        builder.Append('"');
+    }
+}
+'@
+}
+
 function ConvertTo-AstroAttributionCanonicalJsonString {
     param([AllowEmptyString()][Parameter(Mandatory)][string]$Value)
 
@@ -624,15 +1118,12 @@ function Convert-AstroAttributionBytesToState {
         if ($json.Length -gt 0 -and $json[0] -eq [char]0xfeff) {
             throw 'UTF-8 BOM is not permitted'
         }
-        $root = Read-AstroAttributionJsonValueNode $json 0 0 '$'
-        $end = Get-AstroJsonNextTokenIndex $json $root.NextIndex
-        if ($end -ne $json.Length) {
-            throw "unexpected trailing JSON data at character $end"
-        }
+        $document = [AstroAttributionJsonParser]::Parse($json)
+        $root = $document.Root
         if ($root.Kind -cne 'object') {
             throw 'attribution JSON root must be one object'
         }
-        $canonical = ConvertTo-AstroAttributionCanonicalJsonNode $root
+        $canonical = $document.CanonicalJson
         if ($json -cne $canonical) {
             throw 'attribution JSON is not the exact minified producer encoding (whitespace, escapes, or token spelling differs)'
         }
@@ -781,15 +1272,16 @@ function Convert-AstroAttributionBytesToState {
         }
 
         $treeNode = $properties['tree_pids']
-        if ($treeNode.Kind -cne 'array' -or @($treeNode.Items).Count -eq 0) {
+        $treeItems = [object[]]$treeNode.Items
+        if ($treeNode.Kind -cne 'array' -or $treeItems.Count -eq 0) {
             throw '$.tree_pids must be a nonempty array'
         }
         $treePids = [Collections.Generic.List[int]]::new()
         $seenPids = [Collections.Generic.HashSet[int]]::new()
         $priorPid = 0
-        for ($index = 0; $index -lt @($treeNode.Items).Count; $index++) {
+        for ($index = 0; $index -lt $treeItems.Count; $index++) {
             $pidValue = ConvertFrom-AstroAttributionUnsignedNode `
-                $treeNode.Items[$index] `
+                $treeItems[$index] `
                 "$.tree_pids[$index]" `
                 ([uint64][int]::MaxValue) `
                 -Positive
@@ -832,22 +1324,24 @@ function Convert-AstroAttributionBytesToState {
                 throw "first-seen timestamp for PID $pidValue lies outside the run window"
             }
             $spansNode = $intervalsNode.Properties[$pidName]
+            $spanItems = [object[]]$spansNode.Items
             if ($spansNode.Kind -cne 'array' -or
-                @($spansNode.Items).Count -eq 0) {
+                $spanItems.Count -eq 0) {
                 throw "pid_intervals['$pidName'] must be a nonempty array"
             }
             $priorEnd = $null
             $lastOpen = $false
             for ($spanIndex = 0;
-                $spanIndex -lt @($spansNode.Items).Count;
+                $spanIndex -lt $spanItems.Count;
                 $spanIndex++) {
-                $spanNode = $spansNode.Items[$spanIndex]
+                $spanNode = $spanItems[$spanIndex]
+                $spanEndpoints = [object[]]$spanNode.Items
                 if ($spanNode.Kind -cne 'array' -or
-                    @($spanNode.Items).Count -ne 2) {
+                    $spanEndpoints.Count -ne 2) {
                     throw "pid_intervals['$pidName'][$spanIndex] must contain exactly [start,end]"
                 }
                 $start = ConvertFrom-AstroAttributionTimeNode `
-                    $spanNode.Items[0] `
+                    $spanEndpoints[0] `
                     "$.pid_intervals['$pidName'][$spanIndex][0]"
                 if ($start -lt $runStarted -or $start -gt $writtenAt) {
                     throw "PID $pidValue interval start lies outside the run window"
@@ -858,9 +1352,9 @@ function Convert-AstroAttributionBytesToState {
                 if ($null -ne $priorEnd -and $start -le [long]$priorEnd) {
                     throw "PID $pidValue reused-generation interval must start strictly after the prior closed interval"
                 }
-                $endNode = $spanNode.Items[1]
+                $endNode = $spanEndpoints[1]
                 if ($endNode.Kind -ceq 'null') {
-                    if ($spanIndex -ne @($spansNode.Items).Count - 1) {
+                    if ($spanIndex -ne $spanItems.Count - 1) {
                         throw "PID $pidValue has a nonterminal open interval"
                     }
                     $lastOpen = $true
@@ -881,7 +1375,7 @@ function Convert-AstroAttributionBytesToState {
                 $openPids.Add($pidValue)
             }
             if ($pidValue -eq [int]$launcherPid) {
-                $launcherSpans = @($spansNode.Items)
+                $launcherSpans = $spanItems
                 if ($firstSeen -ne $runStarted -or
                     $launcherSpans.Count -ne 1 -or
                     (ConvertFrom-AstroAttributionTimeNode `
@@ -904,8 +1398,9 @@ function Convert-AstroAttributionBytesToState {
         $ownedIgnoreCase = [Collections.Generic.HashSet[string]]::new(
             [StringComparer]::OrdinalIgnoreCase
         )
-        for ($index = 0; $index -lt @($ownedNode.Items).Count; $index++) {
-            $item = $ownedNode.Items[$index]
+        $ownedItems = [object[]]$ownedNode.Items
+        for ($index = 0; $index -lt $ownedItems.Count; $index++) {
+            $item = $ownedItems[$index]
             if ($item.Kind -cne 'string' -or
                 [string]::IsNullOrWhiteSpace([string]$item.Value) -or
                 ([string]$item.Value).IndexOf([char]0) -ge 0) {
@@ -968,6 +1463,8 @@ function Convert-AstroAttributionBytesToState {
             Path = [IO.Path]::GetFullPath($Path)
             TreePids = [int[]]@()
             OpenPids = [int[]]@()
+            OwnedPathsUnevaluable = $true
+            OwnedPaths = [string[]]@()
         }
     }
 }
@@ -1308,8 +1805,10 @@ function Get-AstroAttributionManifestProbe {
         if ($final.FileId -cne $initial.FileId -or
             $final.Length -ne $initial.Length -or
             $final.Sha256 -cne $initial.Sha256 -or
-            [Convert]::ToBase64String($final.Bytes) -cne
-                [Convert]::ToBase64String($initial.Bytes)) {
+            -not [AstroAttributionJsonParser]::ByteArraysEqual(
+                $final.Bytes,
+                $initial.Bytes
+            )) {
             throw 'retained attribution manifest changed across its owner/Job Object probes'
         }
         return [pscustomobject]@{
@@ -1462,8 +1961,10 @@ function Remove-AstroAttributionManifest {
     }
     if ($preflight.Snapshot.Length -ne $ExpectedBytes.Length -or
         $preflight.Snapshot.Sha256 -cne $expectedSha256 -or
-        [Convert]::ToBase64String($preflight.Snapshot.Bytes) -cne
-            [Convert]::ToBase64String($ExpectedBytes)) {
+        -not [AstroAttributionJsonParser]::ByteArraysEqual(
+            $preflight.Snapshot.Bytes,
+            $ExpectedBytes
+        )) {
         throw "ASTRO_ATTRIBUTION[ASTRO_ATTRIBUTION_OWN_CLEANUP_PRODUCER_READBACK_MISMATCH]: final manifest differs from the recorder's exact post-Stop durable bytes (expected_sha256=$expectedSha256, observed_sha256=$($preflight.Snapshot.Sha256)): $full"
     }
     $selfProbe = Get-AstroProcessIdentityProbe -OwnerPid $PID
@@ -1495,8 +1996,10 @@ function Remove-AstroAttributionManifest {
         if ($snapshot.FileId -cne $preflight.Snapshot.FileId -or
             $snapshot.Length -ne $preflight.Snapshot.Length -or
             $snapshot.Sha256 -cne $preflight.Snapshot.Sha256 -or
-            [Convert]::ToBase64String($snapshot.Bytes) -cne
-                [Convert]::ToBase64String($preflight.Snapshot.Bytes)) {
+            -not [AstroAttributionJsonParser]::ByteArraysEqual(
+                $snapshot.Bytes,
+                $preflight.Snapshot.Bytes
+            )) {
             throw 'manifest changed between own-cleanup preflight and retained mutation lease'
         }
         $name = $preflight.Name
@@ -1911,8 +2414,10 @@ function Get-AstroAttributionStageProbe {
         if ($final.FileId -cne $initial.FileId -or
             $final.Length -ne $initial.Length -or
             $final.Sha256 -cne $initial.Sha256 -or
-            [Convert]::ToBase64String($final.Bytes) -cne
-                [Convert]::ToBase64String($initial.Bytes)) {
+            -not [AstroAttributionJsonParser]::ByteArraysEqual(
+                $final.Bytes,
+                $initial.Bytes
+            )) {
             throw 'retained attribution stage changed across owner/Job Object probes'
         }
         return [pscustomobject]@{
@@ -2266,8 +2771,10 @@ function Get-AstroAttributionRefreshTransactions {
             if ($envelopeFinal.FileId -cne $envelopeInitial.FileId -or
                 $envelopeFinal.Length -ne $envelopeInitial.Length -or
                 $envelopeFinal.Sha256 -cne $envelopeInitial.Sha256 -or
-                [Convert]::ToBase64String($envelopeFinal.Bytes) -cne
-                    [Convert]::ToBase64String($envelopeInitial.Bytes)) {
+                -not [AstroAttributionJsonParser]::ByteArraysEqual(
+                    $envelopeFinal.Bytes,
+                    $envelopeInitial.Bytes
+                )) {
                 throw 'refresh envelope changed across transaction classification'
             }
             $logicalSnapshot = if ($state -ceq
@@ -2482,8 +2989,10 @@ function Assert-AstroAttributionRefreshSnapshotBinding {
     if ($Actual.FileId -cne $Expected.FileId -or
         $Actual.Length -ne $Expected.Length -or
         $Actual.Sha256 -cne $Expected.Sha256 -or
-        [Convert]::ToBase64String($Actual.Bytes) -cne
-            [Convert]::ToBase64String($Expected.Bytes)) {
+        -not [AstroAttributionJsonParser]::ByteArraysEqual(
+            $Actual.Bytes,
+            $Expected.Bytes
+        )) {
         throw "$Description changed FILE_ID/length/hash/bytes since stable classification"
     }
 }
@@ -3113,8 +3622,10 @@ function Open-AstroDeadAttributionEvidenceMutationLease {
         if ($snapshot.FileId -cne $Record.Snapshot.FileId -or
             $snapshot.Length -ne $Record.Snapshot.Length -or
             $snapshot.Sha256 -cne $Record.Snapshot.Sha256 -or
-            [Convert]::ToBase64String($snapshot.Bytes) -cne
-                [Convert]::ToBase64String($Record.Snapshot.Bytes)) {
+            -not [AstroAttributionJsonParser]::ByteArraysEqual(
+                $snapshot.Bytes,
+                $Record.Snapshot.Bytes
+            )) {
             throw 'evidence file changed between classification and exact mutation lease'
         }
         $parsed = Convert-AstroAttributionBytesToState `
@@ -3246,8 +3757,10 @@ function Move-AstroAttributionEvidenceLeaseToCleanupTombstone {
         if ($before.FileId -cne $Lease.Snapshot.FileId -or
             $before.Length -ne $Lease.Snapshot.Length -or
             $before.Sha256 -cne $Lease.Snapshot.Sha256 -or
-            [Convert]::ToBase64String($before.Bytes) -cne
-                [Convert]::ToBase64String($Lease.Snapshot.Bytes)) {
+            -not [AstroAttributionJsonParser]::ByteArraysEqual(
+                $before.Bytes,
+                $Lease.Snapshot.Bytes
+            )) {
             throw 'retained manifest changed before cleanup-tombstone rename'
         }
         $ownerFinal = Get-AstroAttributionOwnerGenerationProbe `
@@ -3280,8 +3793,10 @@ function Move-AstroAttributionEvidenceLeaseToCleanupTombstone {
         if ($after.FileId -cne $before.FileId -or
             $after.Length -ne $before.Length -or
             $after.Sha256 -cne $before.Sha256 -or
-            [Convert]::ToBase64String($after.Bytes) -cne
-                [Convert]::ToBase64String($before.Bytes)) {
+            -not [AstroAttributionJsonParser]::ByteArraysEqual(
+                $after.Bytes,
+                $before.Bytes
+            )) {
             throw 'attribution cleanup rename changed retained evidence identity or bytes'
         }
         $sourceState = Get-AstroPathEntryState $source
@@ -3338,8 +3853,10 @@ function Complete-AstroDeadAttributionEvidenceDeletion {
         if ($snapshot.FileId -cne $Lease.Snapshot.FileId -or
             $snapshot.Length -ne $Lease.Snapshot.Length -or
             $snapshot.Sha256 -cne $Lease.Snapshot.Sha256 -or
-            [Convert]::ToBase64String($snapshot.Bytes) -cne
-                [Convert]::ToBase64String($Lease.Snapshot.Bytes)) {
+            -not [AstroAttributionJsonParser]::ByteArraysEqual(
+                $snapshot.Bytes,
+                $Lease.Snapshot.Bytes
+            )) {
             throw 'retained evidence changed before disposition completion'
         }
         $ownerFinal = Get-AstroAttributionOwnerGenerationProbe `

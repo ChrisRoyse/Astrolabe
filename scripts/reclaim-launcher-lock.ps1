@@ -144,15 +144,10 @@ function Test-ByteArraysEqual {
         [Parameter(Mandatory)][AllowEmptyCollection()][byte[]]$Right
     )
 
-    if ($Left.Length -ne $Right.Length) {
-        return $false
+    if (-not ('AstroReclaimPublicationNative' -as [type])) {
+        $null = Initialize-AstroReclaimPublicationNative
     }
-    for ($index = 0; $index -lt $Left.Length; $index++) {
-        if ($Left[$index] -ne $Right[$index]) {
-            return $false
-        }
-    }
-    return $true
+    return [AstroReclaimPublicationNative]::ByteArraysEqual($Left, $Right)
 }
 
 function ConvertTo-AstroComparableFinalPath {
@@ -515,6 +510,20 @@ public static class AstroReclaimPublicationNative
     private const uint FILE_FLAG_SEQUENTIAL_SCAN = 0x08000000;
     private const uint FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000;
     private const uint FILE_TYPE_DISK = 0x0001;
+
+    public static bool ByteArraysEqual(byte[] left, byte[] right)
+    {
+        if (Object.ReferenceEquals(left, right))
+            return true;
+        if (left == null || right == null || left.Length != right.Length)
+            return false;
+        for (int index = 0; index < left.Length; index++)
+        {
+            if (left[index] != right[index])
+                return false;
+        }
+        return true;
+    }
 
     [StructLayout(LayoutKind.Sequential)]
     private struct BY_HANDLE_FILE_INFORMATION
@@ -2268,6 +2277,19 @@ function Get-AstroReclaimAttributionProbe {
                 'preserve every path; case drift and concurrent namespace changes are non-authorizing'
         }
     }
+    $sharedRecordByPath =
+        [Collections.Generic.Dictionary[string, object]]::new(
+            [StringComparer]::Ordinal
+        )
+    foreach ($sharedRecord in @($sharedInventory.Records)) {
+        $sharedPath = [IO.Path]::GetFullPath([string]$sharedRecord.Path)
+        if ($sharedRecordByPath.ContainsKey($sharedPath)) {
+            Fail-Astro 'ASTRO_LAUNCHER_LOCK_RECLAIM_ATTRIBUTION_UNEVALUABLE' `
+                "$ProbeName strict typed attribution inventory contains duplicate record path '$sharedPath'" `
+                'preserve every path and repair the typed inventory cardinality contract'
+        }
+        $sharedRecordByPath.Add($sharedPath, $sharedRecord)
+    }
     $leases = [Collections.Generic.List[object]]::new()
     $rawAttributionRecords = [Collections.Generic.List[object]]::new()
     $refreshTransactionRecords = [Collections.Generic.List[object]]::new()
@@ -2480,14 +2502,23 @@ function Get-AstroReclaimAttributionProbe {
                 -MaximumBytes $script:AstroAttributionManifestMaxBytes
             $leases.Add($lease)
             $before = $lease.InitialSnapshot
-            $parsed = Convert-AstroAttributionBytesToState `
-                -Bytes $before.Bytes `
-                -ExpectedLauncherPid $manifestName.LauncherPid `
-                -ExpectedLauncherProcessStartUtcTicks `
-                    $manifestName.LauncherProcessStartUtcTicks `
-                -ExpectedLauncherLockSha256 `
-                    $manifestName.LauncherLockSha256 `
-                -Path $path
+            if (-not $sharedRecordByPath.ContainsKey($path)) {
+                Fail-Astro 'ASTRO_LAUNCHER_LOCK_RECLAIM_ATTRIBUTION_CHANGED' `
+                    "$ProbeName retained attribution path has no strict typed inventory record: $path" `
+                    'preserve every path; recovery requires one complete typed snapshot'
+            }
+            $sharedRecord = $sharedRecordByPath[$path]
+            if ($null -eq $sharedRecord.Snapshot -or
+                $before.FileIdentity -cne $sharedRecord.Snapshot.FileId -or
+                $before.Length -ne $sharedRecord.Snapshot.Length -or
+                $before.Sha256 -cne $sharedRecord.Snapshot.Sha256 -or
+                -not (Test-ByteArraysEqual `
+                    $before.Bytes $sharedRecord.Snapshot.Bytes)) {
+                Fail-Astro 'ASTRO_LAUNCHER_LOCK_RECLAIM_ATTRIBUTION_CHANGED' `
+                    "$ProbeName retained attribution bytes differ from the strict typed snapshot: $path" `
+                    'preserve every path; recovery binds the exact typed FILE_ID/length/hash/bytes'
+            }
+            $parsed = $sharedRecord.Parsed
             $isNameExact = $null -ne $ExpectedOwnerProcessStartUtcTicks -and
                 $manifestName.LauncherPid -eq $ExpectedOwnerPid -and
                 $manifestName.LauncherProcessStartUtcTicks -eq
