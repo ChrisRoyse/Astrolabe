@@ -593,12 +593,12 @@ pub(crate) fn run_git_archaeology<C: Clock>(
     // #530 pooled historical-extraction worker: ONE persistent child serves the whole
     // index_loop over an atomic request/response file handshake, so the #515 per-commit
     // spawn+init cost (measured ~4.2 s/commit on rtk by wave-25) is paid once per recycle
-    // interval instead of once per commit. The #515 containment contract is preserved —
-    // a worker death/hang/malformed response is a counted, labeled
-    // `historical_commits_crashed` skip on exactly the in-flight commit plus an automatic
-    // respawn for the next, never a host exit. The worker is proactively recycled (killed
-    // + respawned) every [`ARCHAEOLOGY_POOL_RECYCLE_AFTER_DEFAULT`] commits to bound the
-    // cumulative C-heap damage of the #515 fault class to one interval.
+    // interval instead of once per commit. The #515 containment contract keeps a C-level
+    // worker death/hang/malformed response from hard-exiting the host, but it is not a
+    // publication fallback: a child fault is an index-wide correctness failure with exact
+    // commit/detail remediation. The worker is proactively recycled (killed + respawned)
+    // every [`ARCHAEOLOGY_POOL_RECYCLE_AFTER_DEFAULT`] commits to bound the cumulative
+    // C-heap damage of the #515 fault class to one interval.
     let mut pool = HistoricalExtractionPool::new(&scratch_scope.pool_home)?;
     // One archaeology pass owns one stable vault/panel contract. Reuse its validated
     // legacy-state decision, panel driver, retention decision, and Rayon's already-live
@@ -646,19 +646,46 @@ pub(crate) fn run_git_archaeology<C: Clock>(
         report.historical_git_worktree_mutations_avoided += 2;
         // #515: the isolated extraction child died on a C-level pipeline fault for
         // this commit's checkout. It is CONTAINED (the host process survives) instead
-        // of the pre-#515 in-process fault that hard-exited the whole index_repository
-        // with a silent empty-stdout rc=127. Count it, land this commit's evidence as
-        // evidence_without_symbol, log a labeled line (invariant 3: never a silent
-        // skip), and continue — the remaining commits and the kernel still complete.
+        // of the pre-#515 in-process fault that hard-exited `index_repository` with a
+        // silent empty-stdout rc=127, but Astrolabe must not publish a partial kernel
+        // that pretends this commit has no historical symbols. Fail closed with enough
+        // physical context to reproduce the exact materialization and fix CBM.
         if let Some(detail) = indexed.crashed {
             report.historical_commits_crashed += 1;
-            report.evidence_without_symbol += group.len();
             eprintln!(
-                "astro.archaeology.historical_index_crashed commit={commit} \
-                 evidence_in_group={} outcome=contained_child_fault detail={detail}",
-                group.len()
+                "astro.archaeology.historical_index_failed commit={commit} \
+                 evidence_in_group={} outcome=fail_closed cleanup_remnants={} \
+                 files_materialized={} source_files_materialized={} detail={detail}",
+                group.len(),
+                report.cleanup_remnants,
+                indexed.files_materialized,
+                indexed.source_files_materialized
             );
-            continue;
+            return Err(format!(
+                "ASTRO_ARCHAEOLOGY_HISTORICAL_INDEX_FAILED: commit={commit} \
+                 evidence_in_group={} historical_commits_crashed={} cleanup_remnants={} \
+                 windows_invalid_excluded={} files_materialized={} \
+                 source_files_materialized={} git_inventory_processes={} \
+                 git_checkout_processes={} object_probe_processes_avoided={} \
+                 worktree_mutations_avoided={} evidence_total={} \
+                 evidence_without_symbol_before={} detail={detail}; \
+                 remediation=\"preserve the vault and archaeology scratch evidence; \
+                 reproduce this exact commit/materialization and fix the CBM extraction \
+                 fault before rerunning; no partial historical archaeology was published\"",
+                group.len(),
+                report.historical_commits_crashed,
+                report.cleanup_remnants,
+                report.historical_paths_windows_invalid,
+                indexed.files_materialized,
+                indexed.source_files_materialized,
+                report.historical_git_inventory_processes,
+                report.historical_git_checkout_processes,
+                indexed.object_probe_processes_avoided,
+                report.historical_git_worktree_mutations_avoided,
+                evidence.len(),
+                report.evidence_without_symbol
+            )
+            .into());
         }
         let selected = select_implicated_rows(indexed.rows, group);
         if selected.nodes.is_empty() {
@@ -1292,16 +1319,16 @@ fn interpret_pool_response(bytes: &[u8], project: &str) -> PoolResponse {
 /// temp-then-rename), the warm worker reads it, runs the identical `CbmPipeline` (same
 /// `scoped_root`, scratch `database`, Fast mode — so emitted subtree-relative node paths
 /// and thus CxIds are byte-identical to the pre-#530 path), and writes
-/// `response-<seq>.json` (atomic). The #515 containment contract is PRESERVED:
+/// `response-<seq>.json` (atomic). The #515 containment contract is PRESERVED as
+/// host-process isolation, not as a partial-publication fallback:
 ///   * worker death mid-request (C-level fault) — detected via `try_wait` — is a
-///     [`HistoricalExtract::Crashed`] on exactly the in-flight commit plus an automatic
-///     respawn; the host never dies;
+///     [`HistoricalExtract::Crashed`] on exactly the in-flight commit; the caller fails
+///     the index-wide request with exact detail, and the host never dies;
 ///   * a worker that does not answer within [`ARCHAEOLOGY_EXTRACT_TIMEOUT`] is killed as
 ///     hung and treated the same way;
 ///   * a RECOVERABLE Rust-level pipeline error is answered as a structured
-///     `{ok:false,error}` response so the warm worker survives it, while the commit is
-///     still counted as a contained fault (identical accounting to the pre-#530
-///     nonzero-exit child).
+///     `{ok:false,error}` response so the warm worker can report it deterministically;
+///     the caller still fails the index-wide request rather than inventing empty rows.
 ///
 /// The worker is proactively recycled (killed + respawned) every
 /// [`ARCHAEOLOGY_POOL_RECYCLE_AFTER_DEFAULT`] commits to bound the cumulative C-heap
@@ -1522,10 +1549,10 @@ impl HistoricalExtractionPool {
     /// recycles the worker as needed, writes the request atomically, then waits for the
     /// response file, the worker's death, or the per-extraction timeout — whichever comes
     /// first. Returns [`HistoricalExtract::Rows`] on a clean extraction, or
-    /// [`HistoricalExtract::Crashed`] (a contained, labeled, counted fault) on a worker
-    /// death / hang / recoverable pipeline error / malformed response, exactly matching
-    /// the pre-#530 per-commit child's accounting. `scoped_root`/`database` are absolute
-    /// scratch paths; the worker resolves them itself.
+    /// [`HistoricalExtract::Crashed`] (a contained, labeled child fault) on a worker
+    /// death / hang / recoverable pipeline error / malformed response. The caller must
+    /// fail the index-wide request with the returned detail; `scoped_root`/`database`
+    /// are absolute scratch paths; the worker resolves them itself.
     fn extract(
         &mut self,
         scoped_root: &Path,
@@ -1802,9 +1829,10 @@ fn archaeology_extract_fault_detail(
     format!(
         "ASTRO_ARCHAEOLOGY_HISTORICAL_INDEX_CRASHED commit={commit} exit={exit} \
          phase=git_archaeology.historical_reindex reason=\"{reason}\" \
-         remediation=\"the fault was contained in the isolated extraction child; the host \
-         index_repository completed and this commit is counted in historical_commits_crashed; \
-         inspect the child stderr tail to find the offending input\" stderr_tail=<<{stderr_tail}>>"
+         remediation=\"the fault was contained in the isolated extraction child so the host \
+         can fail closed with structured evidence; no partial historical archaeology should \
+         be published; inspect the child stderr tail to find the offending input\" \
+         stderr_tail=<<{stderr_tail}>>"
     )
 }
 
@@ -2320,9 +2348,9 @@ struct HistoricalCommitIndex {
     source_files_materialized: usize,
     object_probe_processes_avoided: usize,
     /// #515: `Some(detail)` when the isolated CBM extraction child died without
-    /// producing rows (a contained C-level pipeline fault on this commit). The
-    /// caller counts it, lands the evidence as `evidence_without_symbol`, and
-    /// continues rather than the pre-#515 in-process fault killing the whole host.
+    /// producing rows (a contained C-level pipeline fault on this commit). The host
+    /// survives so the caller can fail the index-wide request with exact evidence
+    /// instead of publishing a partial kernel that invents empty historical rows.
     /// `None` on a clean extraction (`rows` carries the real result).
     crashed: Option<String>,
 }
@@ -2338,7 +2366,7 @@ struct HistoricalMaterialization {
 
 /// Outcome of the pooled historical CBM extraction ([`HistoricalExtractionPool::extract`]):
 /// either the extracted pipeline rows, or a contained worker fault carrying the
-/// structured detail (exit code + worker-log tail) for the labeled skip.
+/// structured detail (exit code + worker-log tail) for the fail-closed index error.
 enum HistoricalExtract {
     Rows(CbmPipelineRows),
     Crashed(String),
@@ -2471,8 +2499,9 @@ fn index_historical_commit(
         // the emitted subtree-relative node paths — and thus the CxIds framed from
         // `rel_file_path` via `canonical_input_bytes` — are byte-identical to the old
         // in-process path (#418/#439 identity contract). A fault is CONTAINED as
-        // `HistoricalExtract::Crashed`, the host survives, and the caller degrades this
-        // one commit (labeled, counted) instead of the whole index dying silently.
+        // `HistoricalExtract::Crashed` so the host survives long enough to return a
+        // structured fail-closed index error instead of dying silently or publishing a
+        // partial kernel.
         pool.extract(&scoped_root, &database, &identity_root, project, commit)
     })();
     let mut cleanup_remnants = cleanup_archaeology_database(&database);
@@ -2491,10 +2520,9 @@ fn index_historical_commit(
             object_probe_processes_avoided: materialized.object_probe_processes_avoided,
             crashed: None,
         }),
-        // #515 contained child fault: the extraction child died without rows. Report
-        // it as a labeled skip (the caller counts it and continues); the host lives.
-        // Any cleanup error is subsumed — the child already released its handles when
-        // it died, and the crash detail is the headline, remnants counted separately.
+        // #515 contained child fault: the extraction child died without rows. Return
+        // exact crash detail after materialization/database cleanup accounting; the
+        // caller fails the index-wide request and must not publish partial archaeology.
         Ok(HistoricalExtract::Crashed(detail)) => Ok(HistoricalCommitIndex {
             rows: CbmPipelineRows {
                 project: project.to_string(),
@@ -3167,10 +3195,10 @@ pub(crate) fn git_archaeology_summary(report: &GitArchaeologyImportReport) -> Va
         // excluded from the historical checkout and counted here instead of aborting the
         // whole pass repo-fatally (invariant 3: every skip counted, never silent).
         "historical_paths_windows_invalid": report.historical_paths_windows_invalid,
-        // #515 labeled degradation: historical evidence commits whose isolated CBM
-        // extraction child died on a C-level pipeline fault. Contained (the host
-        // survives with a structured result) instead of the pre-#515 silent rc=127
-        // host hard-exit; the commit's evidence lands as evidence_without_symbol.
+        // #515 fail-closed counter: successful persisted summaries must keep this at
+        // zero. A nonzero value means the isolated CBM extraction child died on a
+        // C-level pipeline fault; the host survives with structured evidence, but the
+        // index-wide request aborts before publishing partial historical archaeology.
         "historical_commits_crashed": report.historical_commits_crashed,
         "historical_post_success_worker_recycles": report.historical_post_success_worker_recycles,
         "historical_post_success_cleanup_timeouts": report.historical_post_success_cleanup_timeouts,
