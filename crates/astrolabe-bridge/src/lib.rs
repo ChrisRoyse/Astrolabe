@@ -4,10 +4,12 @@ use std::convert::TryFrom;
 use std::error::Error;
 use std::ffi::{CStr, CString, NulError};
 use std::fmt;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
 use std::marker::PhantomData;
 use std::os::raw::{c_char, c_int, c_void};
 use std::panic::AssertUnwindSafe;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::ptr::{self, NonNull};
 use std::rc::Rc;
 use std::sync::OnceLock;
@@ -1418,6 +1420,54 @@ pub struct CbmPipelineRows {
     pub manifest: Option<CbmPipelineRowManifest>,
 }
 
+pub fn pipeline_rows_success_response_value(rows: &CbmPipelineRows) -> serde_json::Value {
+    serde_json::json!({
+        "ok": true,
+        "project": rows.project,
+        "nodes": rows.nodes.iter().map(|n| serde_json::json!({
+            "id": n.id,
+            "project": n.project,
+            "label": n.label,
+            "name": n.name,
+            "atom_id": n.atom_id,
+            "qualified_name": n.qualified_name,
+            "file_path": n.file_path,
+            "start_line": n.start_line,
+            "end_line": n.end_line,
+            "source_present": n.source_present,
+            "source_bytes": n.source_bytes,
+            "source_sha256": n.source_sha256,
+            "start_byte": n.start_byte,
+            "end_byte": n.end_byte,
+            "properties_json": n.properties_json,
+        })).collect::<Vec<_>>(),
+        "edges": rows.edges.iter().map(|e| serde_json::json!({
+            "id": e.id,
+            "project": e.project,
+            "source_id": e.source_id,
+            "target_id": e.target_id,
+            "edge_type": e.edge_type,
+            "properties_json": e.properties_json,
+            "url_path_gen": e.url_path_gen,
+            "local_name_gen": e.local_name_gen,
+        })).collect::<Vec<_>>(),
+        "file_hashes": rows.file_hashes.iter().map(|f| serde_json::json!({
+            "project": f.project,
+            "rel_path": f.rel_path,
+            "sha256": f.sha256,
+            "mtime_ns": f.mtime_ns,
+            "size": f.size,
+        })).collect::<Vec<_>>(),
+        "manifest": rows.manifest.as_ref().map(|m| serde_json::json!({
+            "project": m.project,
+            "node_count": m.node_count,
+            "edge_count": m.edge_count,
+            "file_hash_count": m.file_hash_count,
+            "graph_schema_version": m.graph_schema_version,
+        })),
+    })
+}
+
 /// Result of a single `index_repository` run with the pipeline row sink attached.
 ///
 /// The raw tool result and the row capture succeed or fail independently (#123):
@@ -1439,6 +1489,13 @@ struct PipelineRowSinkState {
     file_hashes: Vec<CbmPipelineFileHashRow>,
     manifest: Option<CbmPipelineRowManifest>,
     error: Option<BridgeError>,
+    success_publisher: Option<PipelineSuccessPublisher>,
+}
+
+struct PipelineSuccessPublisher {
+    response_tmp: PathBuf,
+    response_path: PathBuf,
+    published: bool,
 }
 
 impl PipelineRowSinkState {
@@ -1450,7 +1507,18 @@ impl PipelineRowSinkState {
             file_hashes: Vec::new(),
             manifest: None,
             error: None,
+            success_publisher: None,
         }
+    }
+
+    fn new_with_success_publisher(response_tmp: PathBuf, response_path: PathBuf) -> Self {
+        let mut state = Self::new();
+        state.success_publisher = Some(PipelineSuccessPublisher {
+            response_tmp,
+            response_path,
+            published: false,
+        });
+        state
     }
 
     fn ensure_callback_thread(&self) -> Result<(), BridgeError> {
@@ -1668,6 +1736,104 @@ impl PipelineRowSinkState {
         Ok(())
     }
 
+    fn completed_rows(&self) -> Result<CbmPipelineRows, BridgeError> {
+        let manifest = self.manifest.as_ref().ok_or_else(|| {
+            envelope(
+                "ASTRO_CBM_ROW_SINK_INCOMPLETE",
+                "CBM post-success callback fired before the row-sink completion manifest",
+                "Repair the native pipeline ordering: post-success requires a completed row snapshot.",
+            )
+        })?;
+        Ok(CbmPipelineRows {
+            project: manifest.project.clone(),
+            nodes: self.nodes.clone(),
+            edges: self.edges.clone(),
+            file_hashes: self.file_hashes.clone(),
+            manifest: Some(manifest.clone()),
+        })
+    }
+
+    fn publish_success_response(&mut self) -> Result<(), BridgeError> {
+        self.ensure_callback_thread()?;
+        let rows = self.completed_rows()?;
+        let Some(publisher) = self.success_publisher.as_mut() else {
+            return Ok(());
+        };
+        if publisher.published {
+            return Err(envelope(
+                "ASTRO_CBM_ROW_SINK_SUCCESS_RESPONSE_DUPLICATE",
+                "CBM post-success callback tried to publish the same row snapshot twice",
+                "Emit exactly one post-success callback per successful pipeline run.",
+            ));
+        }
+        if publisher.response_path.exists() {
+            return Err(envelope(
+                "ASTRO_CBM_ROW_SINK_SUCCESS_RESPONSE_COLLISION",
+                format!(
+                    "success response path {} already exists before publication",
+                    publisher.response_path.display()
+                ),
+                "Preserve the colliding response file; a fresh worker sequence must start from an absent response path.",
+            ));
+        }
+        let bytes =
+            serde_json::to_vec(&pipeline_rows_success_response_value(&rows)).map_err(|error| {
+                envelope(
+                    "ASTRO_CBM_ROW_SINK_SUCCESS_RESPONSE_SERIALIZE",
+                    format!("could not serialize the completed row snapshot: {error}"),
+                    "Inspect the row values and repair the response serializer before retrying.",
+                )
+            })?;
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&publisher.response_tmp)
+            .map_err(|error| {
+                envelope(
+                    "ASTRO_CBM_ROW_SINK_SUCCESS_RESPONSE_TEMP_OPEN",
+                    format!(
+                        "could not create success response temp file {}: {error}",
+                        publisher.response_tmp.display()
+                    ),
+                    "Ensure the archaeology pool directory is writable and contains no stale temp response.",
+                )
+            })?;
+        file.write_all(&bytes).map_err(|error| {
+            envelope(
+                "ASTRO_CBM_ROW_SINK_SUCCESS_RESPONSE_TEMP_WRITE",
+                format!(
+                    "could not write complete success response temp file {}: {error}",
+                    publisher.response_tmp.display()
+                ),
+                "Inspect the storage device and retry with the preserved temp file absent.",
+            )
+        })?;
+        file.sync_all().map_err(|error| {
+            envelope(
+                "ASTRO_CBM_ROW_SINK_SUCCESS_RESPONSE_TEMP_SYNC",
+                format!(
+                    "could not flush success response temp file {}: {error}",
+                    publisher.response_tmp.display()
+                ),
+                "Inspect the storage device before trusting worker response publication.",
+            )
+        })?;
+        drop(file);
+        fs::rename(&publisher.response_tmp, &publisher.response_path).map_err(|error| {
+            envelope(
+                "ASTRO_CBM_ROW_SINK_SUCCESS_RESPONSE_RENAME",
+                format!(
+                    "could not atomically publish success response {} -> {}: {error}",
+                    publisher.response_tmp.display(),
+                    publisher.response_path.display()
+                ),
+                "Preserve both paths and retry only after the response namespace is absent.",
+            )
+        })?;
+        publisher.published = true;
+        Ok(())
+    }
+
     fn finish_callback(&mut self, result: std::thread::Result<Result<(), BridgeError>>) -> c_int {
         match result {
             Ok(Ok(())) => CALLBACK_OK,
@@ -1752,6 +1918,64 @@ impl CbmPipeline {
                 return Err(error);
             }
             map_cbm_status(rc)?;
+        }
+        let project = self.project_name()?;
+        finish_pipeline_rows(sink, project)
+    }
+
+    pub fn collect_rows_with_post_success_response(
+        &mut self,
+        response_tmp: &Path,
+        response_path: &Path,
+    ) -> Result<CbmPipelineRows, BridgeError> {
+        self.ensure_owner_thread()?;
+        let mut sink = PipelineRowSinkState::new_with_success_publisher(
+            response_tmp.to_path_buf(),
+            response_path.to_path_buf(),
+        );
+        let descriptor = pipeline_row_sink_descriptor(&mut sink);
+        // SAFETY: self owns the pipeline pointer. `sink` remains live until
+        // cbm_pipeline_run returns; the post-success callback only writes the
+        // already-copied row-sink snapshot after CBM has reached its success
+        // postcondition and before native teardown begins.
+        let rc = unsafe {
+            map_cbm_status(cbm_sys::cbm_pipeline_set_sink(
+                self.ptr.as_ptr(),
+                &descriptor,
+            ))?;
+            map_cbm_status(cbm_sys::cbm_pipeline_set_post_success_callback(
+                self.ptr.as_ptr(),
+                Some(pipeline_post_success_sink),
+                (&mut sink as *mut PipelineRowSinkState).cast::<c_void>(),
+            ))?;
+            let rc = cbm_sys::cbm_pipeline_run(self.ptr.as_ptr());
+            map_cbm_status(cbm_sys::cbm_pipeline_set_post_success_callback(
+                self.ptr.as_ptr(),
+                None,
+                ptr::null_mut(),
+            ))?;
+            map_cbm_status(cbm_sys::cbm_pipeline_set_sink(
+                self.ptr.as_ptr(),
+                ptr::null(),
+            ))?;
+            rc
+        };
+
+        if rc != 0 {
+            if let Some(error) = sink.error {
+                return Err(error);
+            }
+            map_cbm_status(rc)?;
+        }
+        if !response_path.exists() {
+            return Err(envelope(
+                "ASTRO_CBM_ROW_SINK_SUCCESS_RESPONSE_MISSING",
+                format!(
+                    "CBM reported success but post-success response {} is absent",
+                    response_path.display()
+                ),
+                "Do not trust a cleanup-dependent worker success; inspect the post-success callback path.",
+            ));
         }
         let project = self.project_name()?;
         finish_pipeline_rows(sink, project)
@@ -1914,6 +2138,14 @@ unsafe extern "C" fn pipeline_complete_sink(
         })?;
         state.complete(manifest)
     }));
+    state.finish_callback(result)
+}
+
+unsafe extern "C" fn pipeline_post_success_sink(ctx: *mut c_void) -> c_int {
+    let Some(state) = (unsafe { (ctx as *mut PipelineRowSinkState).as_mut() }) else {
+        return CALLBACK_ERROR;
+    };
+    let result = std::panic::catch_unwind(AssertUnwindSafe(|| state.publish_success_response()));
     state.finish_callback(result)
 }
 

@@ -2274,6 +2274,9 @@ impl Default for cbm_pipeline_error_t {
         }
     }
 }
+pub type cbm_pipeline_post_success_fn = ::std::option::Option<
+    unsafe extern "C" fn(ctx: *mut ::std::os::raw::c_void) -> ::std::os::raw::c_int,
+>;
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct cbm_pipeline_phase_metric_t {
@@ -2316,6 +2319,13 @@ unsafe extern "C" {
     pub fn cbm_pipeline_set_sink(
         p: *mut cbm_pipeline_t,
         sink: *const cbm_pipeline_row_sink_v1_t,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn cbm_pipeline_set_post_success_callback(
+        p: *mut cbm_pipeline_t,
+        callback: cbm_pipeline_post_success_fn,
+        ctx: *mut ::std::os::raw::c_void,
     ) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {

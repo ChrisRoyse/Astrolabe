@@ -241,6 +241,16 @@ pub(crate) struct GitArchaeologyImportReport {
     /// degradation counted, never a silent skip). A nonzero value means the kernel
     /// still completed but that many historical commits contributed no anchors.
     pub(crate) historical_commits_crashed: usize,
+    /// Successful historical extractions whose worker published a complete
+    /// post-success response but could not be reused because native teardown
+    /// then exited, faulted, or exceeded the existing extraction timeout. These
+    /// are not lost commits: the parent accepted the manifest-validated rows
+    /// and spawned a fresh worker for the next request, while surfacing the
+    /// cleanup lifecycle as explicit telemetry.
+    pub(crate) historical_post_success_worker_recycles: usize,
+    /// Subset of post-success worker recycles caused by cleanup not reaching the
+    /// next-request loop before the existing extraction timeout expired.
+    pub(crate) historical_post_success_cleanup_timeouts: usize,
     /// Git processes used to create commit-bound temporary indexes and enumerate
     /// their exact paths (two per historical commit).
     pub(crate) historical_git_inventory_processes: usize,
@@ -750,6 +760,8 @@ pub(crate) fn run_git_archaeology<C: Clock>(
     // #530: retire the pooled worker and its scratch dir. Idempotent with Drop, but
     // called explicitly here so the served/spawn telemetry lands inside the pass and any
     // dir remnant is counted before the report is finalized.
+    report.historical_post_success_worker_recycles += pool.post_success_recycles;
+    report.historical_post_success_cleanup_timeouts += pool.post_success_cleanup_timeouts;
     report.cleanup_remnants += pool.finish();
     report.index_loop_wall_ms = elapsed_ms(index_loop_start.elapsed());
     report.index_loop_usage = vault
@@ -1313,6 +1325,12 @@ struct HistoricalExtractionPool {
     served: u64,
     /// Total workers spawned across the whole pass (telemetry only).
     spawns: u64,
+    /// Workers that published a complete success response but were not reusable
+    /// after the response because native teardown exited/faulted or was killed.
+    post_success_recycles: usize,
+    /// Post-success workers killed because cleanup did not return to the serve
+    /// loop before the existing extraction timeout.
+    post_success_cleanup_timeouts: usize,
 }
 
 impl HistoricalExtractionPool {
@@ -1355,6 +1373,8 @@ impl HistoricalExtractionPool {
             seq: 0,
             served: 0,
             spawns: 0,
+            post_success_recycles: 0,
+            post_success_cleanup_timeouts: 0,
         })
     }
 
@@ -1444,6 +1464,60 @@ impl HistoricalExtractionPool {
         }
     }
 
+    fn wait_for_worker_after_response(
+        &mut self,
+        commit: &str,
+        request_path: &Path,
+        deadline: Instant,
+    ) -> bool {
+        loop {
+            let request_removed = !request_path.exists();
+            let Some(child) = self.child.as_mut() else {
+                return false;
+            };
+            let worker_pid = child.id();
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    self.child = None;
+                    self.post_success_recycles += 1;
+                    eprintln!(
+                        "astro.archaeology.pool event=post_success_worker_recycle \
+                         reason=worker_exited_after_response commit={commit} \
+                         worker_pid={worker_pid} request_removed={request_removed} exit={}",
+                        worker_exit_text(status),
+                    );
+                    return false;
+                }
+                Ok(None) if request_removed => return true,
+                Ok(None) => {
+                    if Instant::now() >= deadline {
+                        self.post_success_recycles += 1;
+                        self.post_success_cleanup_timeouts += 1;
+                        eprintln!(
+                            "astro.archaeology.pool event=post_success_worker_recycle \
+                             reason=cleanup_timeout_after_response commit={commit} \
+                             worker_pid={worker_pid} timeout_seconds={}",
+                            ARCHAEOLOGY_EXTRACT_TIMEOUT.as_secs(),
+                        );
+                        self.recycle("post_success_cleanup_timeout");
+                        return false;
+                    }
+                    thread::sleep(ARCHAEOLOGY_EXTRACT_POLL);
+                }
+                Err(error) => {
+                    self.post_success_recycles += 1;
+                    eprintln!(
+                        "astro.archaeology.pool event=post_success_worker_recycle \
+                         reason=wait_failed_after_response commit={commit} \
+                         worker_pid={worker_pid} error={error}"
+                    );
+                    self.recycle("post_success_wait_failed");
+                    return false;
+                }
+            }
+        }
+    }
+
     /// Runs one historical commit's CBM extraction on the pooled worker (#530). Spawns or
     /// recycles the worker as needed, writes the request atomically, then waits for the
     /// response file, the worker's death, or the per-extraction timeout — whichever comes
@@ -1491,8 +1565,20 @@ impl HistoricalExtractionPool {
             if response_path.exists() {
                 match fs::read(&response_path) {
                     Ok(bytes) => match interpret_pool_response(&bytes, project) {
-                        PoolResponse::Rows(rows) => break (HistoricalExtract::Rows(rows), true),
+                        PoolResponse::Rows(rows) => {
+                            let reusable = self.wait_for_worker_after_response(
+                                commit,
+                                &request_path,
+                                deadline,
+                            );
+                            break (HistoricalExtract::Rows(rows), reusable);
+                        }
                         PoolResponse::RecoverableError(message) => {
+                            let reusable = self.wait_for_worker_after_response(
+                                commit,
+                                &request_path,
+                                deadline,
+                            );
                             break (
                                 HistoricalExtract::Crashed(archaeology_extract_fault_detail(
                                     commit,
@@ -1500,10 +1586,10 @@ impl HistoricalExtractionPool {
                                     &self.log_path,
                                     &format!(
                                         "the pooled worker reported a recoverable pipeline error \
-                                         and stayed warm: {message}"
+                                         before producing rows: {message}"
                                     ),
                                 )),
-                                true,
+                                reusable,
                             );
                         }
                         PoolResponse::Malformed(detail) => {
@@ -1635,6 +1721,13 @@ impl Drop for HistoricalExtractionPool {
     }
 }
 
+fn worker_exit_text(status: std::process::ExitStatus) -> String {
+    match status.code() {
+        Some(code) => format!("{code} (0x{:08X})", code as u32),
+        None => "none".to_string(),
+    }
+}
+
 /// Best-effort PID-gated sweep of archaeology extraction pool dirs left at the shared
 /// temp home by a prior pass that crashed before cleanup (#530). Only dirs whose embedded
 /// owner PID is dead are removed, so a concurrently-running pass — its own live PID
@@ -1730,10 +1823,12 @@ fn extract_rows_once(
     identity_root: &str,
     project: &str,
     mode: CbmIndexMode,
+    response_tmp: &Path,
+    response_path: &Path,
 ) -> Result<CbmPipelineRows, DynError> {
     let mut pipeline = CbmPipeline::new(scoped_root, database, mode)?;
     pipeline.bind_project_identity_root(identity_root, project)?;
-    let rows = pipeline.collect_rows()?;
+    let rows = pipeline.collect_rows_with_post_success_response(response_tmp, response_path)?;
     drop(pipeline);
     Ok(rows)
 }
@@ -1744,7 +1839,11 @@ fn extract_rows_once(
 /// structured `{ok:false, error}` envelope so the WARM worker can report it without
 /// dying (the parent then counts that commit as a contained fault, identical accounting
 /// to the pre-#530 nonzero-exit child).
-fn build_serve_response(request: &Value) -> Value {
+fn build_serve_response(
+    request: &Value,
+    response_tmp: &Path,
+    response_path: &Path,
+) -> Result<Option<Value>, DynError> {
     let field = |key: &str| request.get(key).and_then(Value::as_str);
     let (scoped_root, database, identity_root, project) = match (
         field("scoped_root"),
@@ -1756,11 +1855,11 @@ fn build_serve_response(request: &Value) -> Value {
             (scoped_root, database, identity_root, project)
         }
         _ => {
-            return json!({
+            return Ok(Some(json!({
                 "ok": false,
                 "error": "archaeology_extract_error: request missing required string field \
                           (scoped_root/database/identity_root/project)",
-            });
+            })));
         }
     };
     let mode = match request.get("mode").and_then(Value::as_str) {
@@ -1769,19 +1868,87 @@ fn build_serve_response(request: &Value) -> Value {
         // Historical re-index is always Fast; anything else (incl. absent) maps to it.
         _ => CbmIndexMode::Fast,
     };
-    match extract_rows_once(scoped_root, database, identity_root, project, mode) {
-        Ok(rows) => {
-            let mut envelope = serialize_pipeline_rows(&rows);
-            if let Value::Object(map) = &mut envelope {
-                map.insert("ok".to_string(), Value::Bool(true));
-            }
-            envelope
+    match extract_rows_once(
+        scoped_root,
+        database,
+        identity_root,
+        project,
+        mode,
+        response_tmp,
+        response_path,
+    ) {
+        Ok(_) => Ok(None),
+        Err(error) if response_path.exists() => {
+            eprintln!(
+                "astro.archaeology.serve event=post_success_cleanup_error \
+                 response_path={} error={error}",
+                response_path.display(),
+            );
+            Ok(None)
         }
-        Err(error) => json!({
+        Err(error) => Ok(Some(json!({
             "ok": false,
             "error": format!("archaeology_extract_error: {error}"),
-        }),
+        }))),
     }
+}
+
+fn publish_pool_response(
+    response_tmp: &Path,
+    response_path: &Path,
+    response: &Value,
+) -> Result<(), DynError> {
+    if response_path.exists() {
+        return Err(format!(
+            "ASTRO_ARCHAEOLOGY_SERVE_RESPONSE_COLLISION: response path {} already exists before \
+             publication; remediation: preserve the colliding file and start a fresh worker \
+             sequence from an absent response namespace",
+            response_path.display()
+        )
+        .into());
+    }
+    let bytes = serde_json::to_vec(response)?;
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(response_tmp)
+        .map_err(|error| -> DynError {
+            format!(
+                "ASTRO_ARCHAEOLOGY_SERVE_RESPONSE_TEMP_OPEN_FAILED: could not create {}: \
+                 {error}; remediation: ensure the pool directory is writable and contains no \
+                 stale response temp",
+                response_tmp.display()
+            )
+            .into()
+        })?;
+    file.write_all(&bytes).map_err(|error| -> DynError {
+        format!(
+            "ASTRO_ARCHAEOLOGY_SERVE_RESPONSE_TEMP_WRITE_FAILED: could not write complete \
+             response temp {}: {error}; remediation: inspect storage and retry with preserved \
+             state",
+            response_tmp.display()
+        )
+        .into()
+    })?;
+    file.sync_all().map_err(|error| -> DynError {
+        format!(
+            "ASTRO_ARCHAEOLOGY_SERVE_RESPONSE_TEMP_SYNC_FAILED: could not flush response temp {}: \
+             {error}; remediation: inspect storage before trusting worker response publication",
+            response_tmp.display()
+        )
+        .into()
+    })?;
+    drop(file);
+    fs::rename(response_tmp, response_path).map_err(|error| -> DynError {
+        format!(
+            "ASTRO_ARCHAEOLOGY_SERVE_RESPONSE_RENAME_FAILED: could not atomically publish {} -> \
+             {}: {error}; remediation: preserve both paths and retry only after the response \
+             namespace is absent",
+            response_tmp.display(),
+            response_path.display()
+        )
+        .into()
+    })
 }
 
 /// Persistent serve-worker entry (#530) for `astrolabe cli --archaeology-extract-serve
@@ -1838,69 +2005,28 @@ pub(crate) fn run_archaeology_extract_serve(pool_dir: &str) -> Result<i32, DynEr
             let _ = fs::remove_file(&request_path);
             return Ok(0);
         }
-        let response = build_serve_response(&request);
         let response_path = pool_dir.join(format!("response-{seq}.json"));
         let response_tmp = pool_dir.join(format!("response-{seq}.json.tmp"));
-        fs::write(&response_tmp, serde_json::to_vec(&response)?)?;
-        // Atomic appearance for the parent: the parent never reads a half-written response.
-        fs::rename(&response_tmp, &response_path)?;
+        match build_serve_response(&request, &response_tmp, &response_path)? {
+            Some(response) => publish_pool_response(&response_tmp, &response_path, &response)?,
+            None => {
+                if !response_path.exists() {
+                    return Err(format!(
+                        "ASTRO_ARCHAEOLOGY_SERVE_SUCCESS_RESPONSE_MISSING: CBM completed the \
+                         pooled extraction but the post-success response {} is absent; \
+                         remediation: preserve the pool directory and inspect row-sink \
+                         publication diagnostics",
+                        response_path.display()
+                    )
+                    .into());
+                }
+            }
+        }
         // Drop the consumed request so the dir does not grow unbounded (the parent also
         // removes it; double-remove is harmless).
         let _ = fs::remove_file(&request_path);
         seq += 1;
     }
-}
-
-/// Serializes [`CbmPipelineRows`] to the isolated-extraction wire JSON. Manual
-/// `json!` construction (no serde derive dependency) over the flat, string/i64-only
-/// row fields — the child writes it, [`parse_extract_response`] reads it, and both
-/// preserve every field verbatim so the isolated path is byte-parity with the old
-/// in-process rows.
-fn serialize_pipeline_rows(rows: &CbmPipelineRows) -> Value {
-    json!({
-        "project": rows.project,
-        "nodes": rows.nodes.iter().map(|n| json!({
-            "id": n.id,
-            "project": n.project,
-            "label": n.label,
-            "name": n.name,
-            "atom_id": n.atom_id,
-            "qualified_name": n.qualified_name,
-            "file_path": n.file_path,
-            "start_line": n.start_line,
-            "end_line": n.end_line,
-            "source_present": n.source_present,
-            "source_bytes": n.source_bytes,
-            "source_sha256": n.source_sha256,
-            "start_byte": n.start_byte,
-            "end_byte": n.end_byte,
-            "properties_json": n.properties_json,
-        })).collect::<Vec<_>>(),
-        "edges": rows.edges.iter().map(|e| json!({
-            "id": e.id,
-            "project": e.project,
-            "source_id": e.source_id,
-            "target_id": e.target_id,
-            "edge_type": e.edge_type,
-            "properties_json": e.properties_json,
-            "url_path_gen": e.url_path_gen,
-            "local_name_gen": e.local_name_gen,
-        })).collect::<Vec<_>>(),
-        "file_hashes": rows.file_hashes.iter().map(|f| json!({
-            "project": f.project,
-            "rel_path": f.rel_path,
-            "sha256": f.sha256,
-            "mtime_ns": f.mtime_ns,
-            "size": f.size,
-        })).collect::<Vec<_>>(),
-        "manifest": rows.manifest.as_ref().map(|m| json!({
-            "project": m.project,
-            "node_count": m.node_count,
-            "edge_count": m.edge_count,
-            "file_hash_count": m.file_hash_count,
-            "graph_schema_version": m.graph_schema_version,
-        })),
-    })
 }
 
 /// Reconstructs [`CbmPipelineRows`] from the isolated-extraction child's response
@@ -3028,6 +3154,8 @@ pub(crate) fn git_archaeology_summary(report: &GitArchaeologyImportReport) -> Va
         // survives with a structured result) instead of the pre-#515 silent rc=127
         // host hard-exit; the commit's evidence lands as evidence_without_symbol.
         "historical_commits_crashed": report.historical_commits_crashed,
+        "historical_post_success_worker_recycles": report.historical_post_success_worker_recycles,
+        "historical_post_success_cleanup_timeouts": report.historical_post_success_cleanup_timeouts,
         "trust": "mixed",
         "provenance": "git_history",
         // #434 provenance labeling: the discovered git root, whether it is the

@@ -367,9 +367,24 @@ $SccacheArchiveSha256 = "B8514ED7552E148B0A032114F745118DCB801791ADAFAFEAF9935E4
 $SccacheDirectoryName = "sccache-0.16.0-x86_64-pc-windows-msvc"
 $SccacheExtractedDirectoryName = "sccache-v0.16.0-x86_64-pc-windows-msvc"
 $ExpectedSccacheVersion = "0.16.0"
-# #190: content-addressed compiler-cache budget. The cache lives in a launcher-owned
-# workspace-local dir that survives the target/ wipe, so this bounds on-disk growth.
-$SccacheCacheSize = "20G"
+# #190/#858: content-addressed compiler-cache budget. The cache lives in a
+# launcher-owned workspace-local dir that survives the target/ wipe, so this
+# must be small enough for several Astrolabe-driven projects to coexist on one
+# workstation.  Operators may opt into a different explicit size, but malformed
+# values fail before launcher mutation instead of being silently ignored.
+$DefaultSccacheCacheSize = "8G"
+function Get-AstroSccacheCacheSize {
+    $override = [Environment]::GetEnvironmentVariable('ASTROLABE_SCCACHE_CACHE_SIZE')
+    if ([string]::IsNullOrWhiteSpace($override)) {
+        return $DefaultSccacheCacheSize
+    }
+    $value = $override.Trim()
+    if ($value -cnotmatch '^[1-9][0-9]*(?:K|M|G|T)$') {
+        throw "SCCACHE[ASTRO_SCCACHE_CACHE_SIZE_INVALID]: {code=ASTRO_SCCACHE_CACHE_SIZE_INVALID; message=`"ASTROLABE_SCCACHE_CACHE_SIZE must be an explicit positive K/M/G/T size, received '$override'`"; remediation=`"set ASTROLABE_SCCACHE_CACHE_SIZE to a value such as 4G, 8G, or 12G, or unset it to use $DefaultSccacheCacheSize`"}"
+    }
+    return $value
+}
+$SccacheCacheSize = Get-AstroSccacheCacheSize
 # #242: the sccache local daemon must never idle-exit mid-run. Its default idle timeout
 # is 600s; a long libcbm C build leaves rustc idle well past that, the daemon exits, and
 # the next Rust phase fires N concurrent sccache clients (Cargo's parallel rustc plus any

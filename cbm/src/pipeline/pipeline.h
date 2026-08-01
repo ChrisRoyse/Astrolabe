@@ -39,6 +39,15 @@ typedef struct {
     size_t requested;
 } cbm_pipeline_error_t;
 
+/* Optional success hook invoked after a pipeline has completed every
+ * authoritative write/publication step and before teardown frees the graph,
+ * source snapshot, registry, and other large native state. Returning non-zero
+ * fails the pipeline with a structured native log entry. The callback is for
+ * snapshot consumers that need to publish their already-copied row-sink result
+ * before native teardown can fault; it is not a replacement for the row-sink
+ * completion manifest and is called only on rc==0. */
+typedef int (*cbm_pipeline_post_success_fn)(void *ctx);
+
 /* One retained native worker phase measurement. The phase string and array are
  * pipeline-owned and remain valid until cbm_pipeline_free(). I/O counters are
  * exact GetProcessIoCounters transfer-byte deltas for the worker process over
@@ -94,6 +103,11 @@ void cbm_pipeline_set_persistence(cbm_pipeline_t *p, bool enabled);
  * frozen ABI/version/mandatory callbacks validate exactly. Returns 0 on
  * success, -1 on refusal. */
 int cbm_pipeline_set_sink(cbm_pipeline_t *p, const cbm_pipeline_row_sink_v1_t *sink);
+
+/* Install or clear the optional post-success/pre-cleanup callback. */
+int cbm_pipeline_set_post_success_callback(cbm_pipeline_t *p,
+                                           cbm_pipeline_post_success_fn callback,
+                                           void *ctx);
 
 /* Free a pipeline and all its internal state. NULL-safe. */
 void cbm_pipeline_free(cbm_pipeline_t *p);

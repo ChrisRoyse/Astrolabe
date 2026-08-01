@@ -176,6 +176,8 @@ struct cbm_pipeline {
     cbm_pipeline_row_sink_v1_t row_sink;
     bool row_sink_active;
     bool row_sink_completed;
+    cbm_pipeline_post_success_fn post_success;
+    void *post_success_ctx;
 
     /* Indexing state (set during run) */
     cbm_gbuf_t *gbuf;
@@ -498,6 +500,32 @@ int cbm_pipeline_set_sink(cbm_pipeline_t *p, const cbm_pipeline_row_sink_v1_t *s
     if (p->gbuf) {
         cbm_gbuf_set_row_sink(p->gbuf, sink->node, sink->edge, sink->ctx);
     }
+    return 0;
+}
+
+int cbm_pipeline_set_post_success_callback(cbm_pipeline_t *p,
+                                           cbm_pipeline_post_success_fn callback, void *ctx) {
+    if (!p) {
+        cbm_log_error(
+            "pipeline.post_success_refused", "code", "CBM_PIPELINE_POST_SUCCESS_PIPELINE_NULL",
+            "message", "a post-success callback cannot be installed on a NULL pipeline",
+            "remediation", "create the pipeline successfully before installing a callback");
+        return CBM_NOT_FOUND;
+    }
+    if (!callback) {
+        p->post_success = NULL;
+        p->post_success_ctx = NULL;
+        return 0;
+    }
+    if (!ctx) {
+        cbm_log_error("pipeline.post_success_refused", "code",
+                      "CBM_PIPELINE_POST_SUCCESS_CONTEXT_NULL", "message",
+                      "a post-success callback requires a non-NULL context", "remediation",
+                      "bind the callback to the exact row-sink state that owns the snapshot");
+        return CBM_NOT_FOUND;
+    }
+    p->post_success = callback;
+    p->post_success_ctx = ctx;
     return 0;
 }
 
@@ -3192,6 +3220,23 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
                  itoa_buf(cbm_gbuf_edge_count(p->gbuf)), "elapsed_ms",
                  itoa_buf((int)elapsed_ms(t0)));
     CBM_PROF_END("pipeline", "TOTAL", t_pipeline_total);
+
+    if (p->post_success) {
+        cbm_pipeline_phase_probe_t post_success_probe =
+            cbm_pipeline_phase_probe_start(p, "post_success_pre_cleanup");
+        int post_success_rc = p->post_success(p->post_success_ctx);
+        cbm_pipeline_phase_probe_end(p, "post_success_pre_cleanup", &post_success_probe);
+        if (post_success_rc != 0) {
+            cbm_log_error(
+                "pipeline.post_success_refused", "code",
+                "CBM_PIPELINE_POST_SUCCESS_CALLBACK_FAILED", "message",
+                "the post-success callback refused the completed pipeline snapshot",
+                "remediation",
+                "inspect the callback's structured diagnostic; no cleanup-dependent success may "
+                "be reported");
+            rc = CBM_NOT_FOUND;
+        }
+    }
 
 cleanup:
     cbm_pkgmap_free(cbm_pipeline_get_pkgmap());
