@@ -276,9 +276,11 @@ impl Drop for TempFile {
 fn os_disk_sample(path: &Path) -> Result<DiskSample> {
     let stat = nix::sys::statvfs::statvfs(path)
         .map_err(|error| io_error(format!("statvfs {}: {error}", path.display())))?;
+    // statvfs block counts are 32-bit on Darwin and 64-bit on Linux; widen so
+    // one DiskSample representation serves both.
     Ok(DiskSample {
-        blocks: stat.blocks(),
-        blocks_available: stat.blocks_available(),
+        blocks: u64::from(stat.blocks()),
+        blocks_available: u64::from(stat.blocks_available()),
     })
 }
 

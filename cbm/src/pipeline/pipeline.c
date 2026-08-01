@@ -60,7 +60,15 @@ enum {
 #include <string.h>
 #include <stdatomic.h>
 #include <time.h>
+#ifdef _WIN32
 #include <windows.h>
+#else
+#include <unistd.h>
+#endif
+#ifdef __APPLE__
+#include <libproc.h>
+#include <sys/resource.h>
+#endif
 
 enum {
     PL_ROUTE_FULL = CBM_INCREMENTAL_REBUILD_REQUIRED,
@@ -75,6 +83,141 @@ static inline void *intptr_to_ptr(intptr_t v) {
     void *p;
     memcpy(&p, &v, sizeof(p));
     return p;
+}
+
+/* ── Host process accounting (#895) ────────────────────────────── */
+/*
+ * One authoritative reader per quantity per host. Every reader reports its
+ * native failure verbatim through *native_error, and cbm_proc_native_error_kind()
+ * names the domain that number belongs to, so a telemetry failure stays
+ * diagnosable instead of degrading silently.
+ *
+ * No reader estimates, substitutes, or synthesises a quantity it could not read.
+ * On failure the caller clears the matching *_valid flag and the run is marked
+ * metrics-incomplete — a labeled gap, never a fabricated number.
+ */
+
+static const char *cbm_proc_native_error_kind(void) {
+#if defined(_WIN32)
+    return "win32";
+#else
+    return "errno";
+#endif
+}
+
+static unsigned long cbm_proc_current_pid(void) {
+#if defined(_WIN32)
+    return (unsigned long)GetCurrentProcessId();
+#else
+    return (unsigned long)getpid();
+#endif
+}
+
+/* Monotonic high-resolution tick used only to make a staging identity unique.
+ * Windows uses the QPC counter; elsewhere the monotonic clock in nanoseconds.
+ * Both are strictly increasing within a process, which is the only property
+ * the staging identity depends on. */
+static bool cbm_proc_monotonic_ticks(uint64_t *out, unsigned long *native_error) {
+    *out = 0;
+    *native_error = 0;
+#if defined(_WIN32)
+    LARGE_INTEGER counter;
+    if (!QueryPerformanceCounter(&counter)) {
+        *native_error = (unsigned long)GetLastError();
+        return false;
+    }
+    *out = (uint64_t)counter.QuadPart;
+    return true;
+#else
+    struct timespec ts;
+    errno = 0;
+    if (cbm_clock_gettime(CLOCK_MONOTONIC, &ts) != 0) {
+        *native_error = (unsigned long)errno;
+        return false;
+    }
+    *out = (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+    return true;
+#endif
+}
+
+#if defined(__APPLE__)
+/* Darwin reports byte-exact per-process disk I/O and memory footprint from one
+ * proc_pid_rusage(RUSAGE_INFO_V4) sample. ri_diskio_bytesread/byteswritten are
+ * the direct analogues of the Win32 IO_COUNTERS transfer counts. */
+static bool cbm_proc_read_rusage(struct rusage_info_v4 *out, unsigned long *native_error) {
+    memset(out, 0, sizeof(*out));
+    errno = 0;
+    if (proc_pid_rusage((int)getpid(), RUSAGE_INFO_V4, (rusage_info_t *)out) != 0) {
+        *native_error = (unsigned long)errno;
+        return false;
+    }
+    *native_error = 0;
+    return true;
+}
+#endif
+
+static bool cbm_proc_read_io(cbm_proc_io_counters_t *out, unsigned long *native_error) {
+    memset(out, 0, sizeof(*out));
+    *native_error = 0;
+#if defined(_WIN32)
+    IO_COUNTERS io = {0};
+    if (!GetProcessIoCounters(GetCurrentProcess(), &io)) {
+        *native_error = (unsigned long)GetLastError();
+        return false;
+    }
+    out->read_bytes = (uint64_t)io.ReadTransferCount;
+    out->write_bytes = (uint64_t)io.WriteTransferCount;
+    out->other_bytes = (uint64_t)io.OtherTransferCount;
+    return true;
+#elif defined(__APPLE__)
+    struct rusage_info_v4 ri;
+    if (!cbm_proc_read_rusage(&ri, native_error)) {
+        return false;
+    }
+    out->read_bytes = (uint64_t)ri.ri_diskio_bytesread;
+    out->write_bytes = (uint64_t)ri.ri_diskio_byteswritten;
+    /* Darwin has no counterpart to the Win32 "other" transfer class. It stays
+     * zero on this host rather than being derived from the read/write counts. */
+    out->other_bytes = 0;
+    return true;
+#else
+    *native_error = (unsigned long)ENOSYS;
+    return false;
+#endif
+}
+
+static bool cbm_proc_read_memory(cbm_proc_memory_counters_t *out, unsigned long *native_error) {
+    memset(out, 0, sizeof(*out));
+    *native_error = 0;
+#if defined(_WIN32)
+    PROCESS_MEMORY_COUNTERS_EX pmc = {0};
+    pmc.cb = sizeof(pmc);
+    if (!GetProcessMemoryInfo(GetCurrentProcess(), (PROCESS_MEMORY_COUNTERS *)&pmc, sizeof(pmc))) {
+        *native_error = (unsigned long)GetLastError();
+        return false;
+    }
+    out->working_set_bytes = (uint64_t)pmc.WorkingSetSize;
+    out->peak_working_set_bytes = (uint64_t)pmc.PeakWorkingSetSize;
+    out->private_bytes = (uint64_t)pmc.PrivateUsage;
+    out->peak_private_bytes = (uint64_t)pmc.PeakPagefileUsage;
+    return true;
+#elif defined(__APPLE__)
+    struct rusage_info_v4 ri;
+    if (!cbm_proc_read_rusage(&ri, native_error)) {
+        return false;
+    }
+    out->working_set_bytes = (uint64_t)ri.ri_resident_size;
+    out->private_bytes = (uint64_t)ri.ri_phys_footprint;
+    /* Darwin retains a single lifetime peak (max phys footprint) rather than the
+     * separate working-set and pagefile peaks Windows tracks; both peak fields
+     * therefore carry that one measured value. */
+    out->peak_working_set_bytes = (uint64_t)ri.ri_lifetime_max_phys_footprint;
+    out->peak_private_bytes = (uint64_t)ri.ri_lifetime_max_phys_footprint;
+    return true;
+#else
+    *native_error = (unsigned long)ENOSYS;
+    return false;
+#endif
 }
 
 /* ── Global index lock ─────────────────────────────────────────── */
@@ -108,18 +251,19 @@ int cbm_pipeline_unique_stage_path(const char *db_path, const char *kind, char *
         return CBM_NOT_FOUND;
     }
     *out_path = NULL;
-    LARGE_INTEGER counter;
-    if (!QueryPerformanceCounter(&counter)) {
+    uint64_t counter = 0;
+    unsigned long clock_error = 0;
+    if (!cbm_proc_monotonic_ticks(&counter, &clock_error)) {
         char native_error[32];
-        (void)snprintf(native_error, sizeof(native_error), "%lu", (unsigned long)GetLastError());
+        (void)snprintf(native_error, sizeof(native_error), "%lu", clock_error);
         cbm_log_error("pipeline.stage_identity_failed", "code", "CBM_PIPELINE_STAGE_CLOCK_FAILED",
-                      "native_error_kind", "win32", "native_error", native_error, "message",
-                      "a unique staging identity could not be derived", "remediation",
-                      "resolve the reported Windows timing failure and retry indexing");
+                      "native_error_kind", cbm_proc_native_error_kind(), "native_error",
+                      native_error, "message", "a unique staging identity could not be derived",
+                      "remediation", "resolve the reported host timing failure and retry indexing");
         return CBM_NOT_FOUND;
     }
-    static volatile LONG sequence;
-    LONG generation = InterlockedIncrement(&sequence);
+    static atomic_int sequence;
+    int generation = atomic_fetch_add(&sequence, 1) + 1;
     if (generation <= 0) {
         cbm_log_error("pipeline.stage_identity_failed", "code",
                       "CBM_PIPELINE_STAGE_SEQUENCE_EXHAUSTED", "message",
@@ -147,8 +291,7 @@ int cbm_pipeline_unique_stage_path(const char *db_path, const char *kind, char *
         return CBM_NOT_FOUND;
     }
     int written = snprintf(path, capacity, "%s.%s-stage-%lu-%016llx-%ld", db_path, kind,
-                           (unsigned long)GetCurrentProcessId(),
-                           (unsigned long long)counter.QuadPart, (long)generation);
+                           cbm_proc_current_pid(), (unsigned long long)counter, (long)generation);
     if (written <= 0 || (size_t)written >= capacity || cbm_path_exists(path)) {
         cbm_log_error("pipeline.stage_identity_failed", "code",
                       "CBM_PIPELINE_STAGE_IDENTITY_COLLISION", "path", path, "message",
@@ -291,7 +434,7 @@ static bool cbm_pipeline_phase_trace_enabled(void) {
 
 static void cbm_pipeline_phase_trace_event(const char *event, const char *phase,
                                            const cbm_pipeline_t *p,
-                                           const PROCESS_MEMORY_COUNTERS_EX *memory,
+                                           const cbm_proc_memory_counters_t *memory,
                                            bool memory_valid) {
     if (!cbm_pipeline_phase_trace_enabled()) {
         return;
@@ -303,17 +446,17 @@ static void cbm_pipeline_phase_trace_event(const char *event, const char *phase,
     uint64_t peak_working_set_bytes = 0;
     uint64_t peak_private_bytes = 0;
     if (memory && memory_valid) {
-        working_set_bytes = (uint64_t)memory->WorkingSetSize;
-        private_bytes = (uint64_t)memory->PrivateUsage;
-        peak_working_set_bytes = (uint64_t)memory->PeakWorkingSetSize;
-        peak_private_bytes = (uint64_t)memory->PeakPagefileUsage;
+        working_set_bytes = memory->working_set_bytes;
+        private_bytes = memory->private_bytes;
+        peak_working_set_bytes = memory->peak_working_set_bytes;
+        peak_private_bytes = memory->peak_private_bytes;
     }
     fprintf(stderr,
             "ASTRO_CBM_PIPELINE_PHASE_TRACE event=%s phase=%s pid=%lu mode=%d "
             "row_sink_active=%d row_sink_completed=%d nodes=%d edges=%d memory_valid=%d "
             "working_set_bytes=%llu private_bytes=%llu peak_working_set_bytes=%llu "
             "peak_private_bytes=%llu\n",
-            event ? event : "", phase ? phase : "", (unsigned long)GetCurrentProcessId(),
+            event ? event : "", phase ? phase : "", cbm_proc_current_pid(),
             p ? (int)p->mode : -1, p && p->row_sink_active ? 1 : 0,
             p && p->row_sink_completed ? 1 : 0, nodes, edges, memory_valid ? 1 : 0,
             (unsigned long long)working_set_bytes, (unsigned long long)private_bytes,
@@ -324,31 +467,32 @@ static void cbm_pipeline_phase_trace_event(const char *event, const char *phase,
 cbm_pipeline_phase_probe_t cbm_pipeline_phase_probe_start(cbm_pipeline_t *p, const char *phase) {
     cbm_pipeline_phase_probe_t probe = {0};
     cbm_clock_gettime(CLOCK_MONOTONIC, &probe.started);
-    probe.io_valid = GetProcessIoCounters(GetCurrentProcess(), &probe.io) != 0;
+    unsigned long io_error = 0;
+    probe.io_valid = cbm_proc_read_io(&probe.io, &io_error);
     if (!probe.io_valid) {
         if (p) {
             p->phase_metrics_complete = false;
         }
         char native_error[CBM_SZ_32];
-        snprintf(native_error, sizeof(native_error), "%lu", (unsigned long)GetLastError());
+        snprintf(native_error, sizeof(native_error), "%lu", io_error);
         cbm_log_error("pipeline.telemetry_failed", "code", "CBM_PIPELINE_IO_COUNTER_READ_FAILED",
-                      "phase", phase, "native_error_kind", "win32", "native_error", native_error,
-                      "message", "the indexing worker I/O baseline could not be read",
-                      "remediation", "resolve the reported process-accounting failure and retry");
+                      "phase", phase, "native_error_kind", cbm_proc_native_error_kind(),
+                      "native_error", native_error, "message",
+                      "the indexing worker I/O baseline could not be read", "remediation",
+                      "resolve the reported process-accounting failure and retry");
     }
-    probe.memory.cb = sizeof(probe.memory);
-    probe.memory_valid =
-        GetProcessMemoryInfo(GetCurrentProcess(), (PROCESS_MEMORY_COUNTERS *)&probe.memory,
-                             sizeof(probe.memory)) != 0;
+    unsigned long memory_error = 0;
+    probe.memory_valid = cbm_proc_read_memory(&probe.memory, &memory_error);
     if (!probe.memory_valid) {
         if (p) {
             p->phase_metrics_complete = false;
         }
         char native_error[CBM_SZ_32];
-        snprintf(native_error, sizeof(native_error), "%lu", (unsigned long)GetLastError());
+        snprintf(native_error, sizeof(native_error), "%lu", memory_error);
         cbm_log_error("pipeline.telemetry_failed", "code",
                       "CBM_PIPELINE_MEMORY_COUNTER_READ_FAILED", "phase", phase,
-                      "native_error_kind", "win32", "native_error", native_error, "message",
+                      "native_error_kind", cbm_proc_native_error_kind(), "native_error",
+                      native_error, "message",
                       "the indexing worker memory baseline could not be read", "remediation",
                       "resolve the reported process-accounting failure and retry");
     }
@@ -358,17 +502,14 @@ cbm_pipeline_phase_probe_t cbm_pipeline_phase_probe_start(cbm_pipeline_t *p, con
 
 void cbm_pipeline_phase_probe_end(cbm_pipeline_t *p, const char *phase,
                                   const cbm_pipeline_phase_probe_t *probe) {
-    IO_COUNTERS current = {0};
-    PROCESS_MEMORY_COUNTERS_EX current_memory = {0};
-    current_memory.cb = sizeof(current_memory);
+    cbm_proc_io_counters_t current = {0};
+    cbm_proc_memory_counters_t current_memory = {0};
+    unsigned long current_io_error = 0;
+    unsigned long current_memory_error = 0;
     bool current_io_valid =
-        probe && probe->io_valid && GetProcessIoCounters(GetCurrentProcess(), &current) != 0;
-    DWORD current_io_error = current_io_valid ? ERROR_SUCCESS : GetLastError();
+        probe && probe->io_valid && cbm_proc_read_io(&current, &current_io_error);
     bool current_memory_valid =
-        probe && probe->memory_valid &&
-        GetProcessMemoryInfo(GetCurrentProcess(), (PROCESS_MEMORY_COUNTERS *)&current_memory,
-                             sizeof(current_memory)) != 0;
-    DWORD current_memory_error = current_memory_valid ? ERROR_SUCCESS : GetLastError();
+        probe && probe->memory_valid && cbm_proc_read_memory(&current_memory, &current_memory_error);
     cbm_pipeline_phase_trace_event("end", phase, p, &current_memory, current_memory_valid);
     if (!current_io_valid || !current_memory_valid) {
         if (p) {
@@ -376,31 +517,30 @@ void cbm_pipeline_phase_probe_end(cbm_pipeline_t *p, const char *phase,
         }
         if (probe && probe->io_valid && !current_io_valid) {
             char native_error[CBM_SZ_32];
-            snprintf(native_error, sizeof(native_error), "%lu", (unsigned long)current_io_error);
+            snprintf(native_error, sizeof(native_error), "%lu", current_io_error);
             cbm_log_error("pipeline.telemetry_failed", "code",
                           "CBM_PIPELINE_IO_COUNTER_READ_FAILED", "phase", phase,
-                          "native_error_kind", "win32", "native_error", native_error, "message",
+                          "native_error_kind", cbm_proc_native_error_kind(), "native_error",
+                          native_error, "message",
                           "the indexing worker I/O terminal state could not be read", "remediation",
                           "resolve the reported process-accounting failure and retry");
         }
         if (probe && probe->memory_valid && !current_memory_valid) {
             char native_error[CBM_SZ_32];
-            snprintf(native_error, sizeof(native_error), "%lu",
-                     (unsigned long)current_memory_error);
+            snprintf(native_error, sizeof(native_error), "%lu", current_memory_error);
             cbm_log_error(
                 "pipeline.telemetry_failed", "code", "CBM_PIPELINE_MEMORY_COUNTER_READ_FAILED",
-                "phase", phase, "native_error_kind", "win32", "native_error", native_error,
-                "message", "the indexing worker memory terminal state could not be read",
-                "remediation", "resolve the reported process-accounting failure and retry");
+                "phase", phase, "native_error_kind", cbm_proc_native_error_kind(), "native_error",
+                native_error, "message",
+                "the indexing worker memory terminal state could not be read", "remediation",
+                "resolve the reported process-accounting failure and retry");
         }
         return;
     }
     uint64_t phase_elapsed_ms = (uint64_t)elapsed_ms(probe->started);
-    uint64_t phase_read_bytes = (uint64_t)(current.ReadTransferCount - probe->io.ReadTransferCount);
-    uint64_t phase_write_bytes =
-        (uint64_t)(current.WriteTransferCount - probe->io.WriteTransferCount);
-    uint64_t phase_other_bytes =
-        (uint64_t)(current.OtherTransferCount - probe->io.OtherTransferCount);
+    uint64_t phase_read_bytes = current.read_bytes - probe->io.read_bytes;
+    uint64_t phase_write_bytes = current.write_bytes - probe->io.write_bytes;
+    uint64_t phase_other_bytes = current.other_bytes - probe->io.other_bytes;
     if (!p || p->phase_metric_count >= PL_PHASE_METRIC_CAPACITY) {
         if (p) {
             p->phase_metrics_complete = false;
@@ -419,14 +559,14 @@ void cbm_pipeline_phase_probe_end(cbm_pipeline_t *p, const char *phase,
     metric->read_bytes = phase_read_bytes;
     metric->write_bytes = phase_write_bytes;
     metric->other_bytes = phase_other_bytes;
-    metric->start_working_set_bytes = (uint64_t)probe->memory.WorkingSetSize;
-    metric->end_working_set_bytes = (uint64_t)current_memory.WorkingSetSize;
-    metric->start_peak_working_set_bytes = (uint64_t)probe->memory.PeakWorkingSetSize;
-    metric->end_peak_working_set_bytes = (uint64_t)current_memory.PeakWorkingSetSize;
-    metric->start_private_bytes = (uint64_t)probe->memory.PrivateUsage;
-    metric->end_private_bytes = (uint64_t)current_memory.PrivateUsage;
-    metric->start_peak_private_bytes = (uint64_t)probe->memory.PeakPagefileUsage;
-    metric->end_peak_private_bytes = (uint64_t)current_memory.PeakPagefileUsage;
+    metric->start_working_set_bytes = probe->memory.working_set_bytes;
+    metric->end_working_set_bytes = current_memory.working_set_bytes;
+    metric->start_peak_working_set_bytes = probe->memory.peak_working_set_bytes;
+    metric->end_peak_working_set_bytes = current_memory.peak_working_set_bytes;
+    metric->start_private_bytes = probe->memory.private_bytes;
+    metric->end_private_bytes = current_memory.private_bytes;
+    metric->start_peak_private_bytes = probe->memory.peak_private_bytes;
+    metric->end_peak_private_bytes = current_memory.peak_private_bytes;
     cbm_log_info("pipeline.phase", "phase", phase, "elapsed_ms", u64_buf(phase_elapsed_ms),
                  "read_bytes", u64_buf(phase_read_bytes), "write_bytes", u64_buf(phase_write_bytes),
                  "other_bytes", u64_buf(phase_other_bytes), "start_working_set_bytes",

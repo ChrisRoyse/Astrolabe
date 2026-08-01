@@ -306,9 +306,32 @@ fn write_layout_test_bindings(out_dir: &Path, generated: &str) {
     write_if_changed(&out_dir.join("cbm-layout-tests.rs"), generated.as_bytes());
 }
 
+/// Committed bindings file for the target being built.
+///
+/// The FFI surface is not byte-identical across hosts — MSVC and clang disagree
+/// on the underlying type of an unsigned C enum, and each libc contributes its
+/// own typedefs — so one committed file per host keeps this gate meaningful on
+/// all of them. An unsupported host fails closed here rather than silently
+/// comparing against another platform's bindings (#895).
+fn committed_bindings_path(manifest_dir: &Path) -> PathBuf {
+    let target = env::var("TARGET").unwrap_or_default();
+    if target.contains("windows") {
+        manifest_dir.join("src/bindings.rs")
+    } else if target.contains("apple") {
+        manifest_dir.join("src/bindings_macos.rs")
+    } else {
+        panic!(
+            "no committed cbm-sys bindings exist for target {target}. Generate them with \
+             ASTROLABE_BINDINGS_CANDIDATE set to a fresh absolute path below workspace .tmp, \
+             review the candidate, and commit it as src/bindings_<host>.rs together with the \
+             matching include! arm in src/lib.rs."
+        )
+    }
+}
+
 fn verify_bindings(manifest_dir: &Path, generated: &str) {
     let generated = build_support::strip_layout_tests(generated);
-    let bindings_path = manifest_dir.join("src/bindings.rs");
+    let bindings_path = committed_bindings_path(manifest_dir);
 
     if env::var_os("ASTROLABE_UPDATE_BINDINGS").is_some() {
         panic!(

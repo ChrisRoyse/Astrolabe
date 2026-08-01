@@ -1262,6 +1262,760 @@ int cbm_source_snapshot_destroy(cbm_source_snapshot_t *snapshot) {
     return rc;
 }
 
+#else /* ── POSIX source snapshot (#895) ──────────────────────────── */
+
+/*
+ * POSIX realisation of the same contract the Windows branch implements.
+ *
+ * The invariant that makes a snapshot evidence rather than a copy is unchanged:
+ * every file's identity is read from the *open descriptor* before and after its
+ * bytes are consumed, and a file whose identity or length moved across that
+ * window is a terminal error, never a silently-accepted read. Windows proves
+ * identity with (VolumeSerialNumber, FileId); POSIX proves it with (st_dev,
+ * st_ino) plus size and mtime, which is the same statement about the same
+ * object.
+ *
+ * Representation is kept byte-compatible with the Windows branch so a vault is
+ * host-independent: source_file_id carries st_ino in bytes 0..7 and st_dev in
+ * bytes 8..15, and source_change_time_100ns carries st_ctime on the same
+ * 100ns-since-1601 basis Windows ChangeTime uses.
+ *
+ * Capture is sequential here. The Windows branch fans out across a thread pool;
+ * that is a throughput property, not a correctness one, and is tracked
+ * separately rather than approximated.
+ */
+
+#include <fcntl.h>
+#include <limits.h>
+#include <stdatomic.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <unistd.h>
+#if defined(__APPLE__)
+#include <sys/clonefile.h> /* fclonefileat — APFS copy-on-write capture (#895) */
+#endif
+
+enum {
+    SNAPSHOT_COPY_CHUNK = 1 << 16,
+    SNAPSHOT_DIR_MODE = 0755,
+    /* Seconds between 1601-01-01 and 1970-01-01, for the shared tick basis. */
+    SNAPSHOT_UNIX_TO_FILETIME_SECONDS = 11644473600LL
+};
+
+typedef struct {
+    dev_t dev;
+    ino_t ino;
+    off_t size;
+    struct timespec mtime;
+    struct timespec ctime;
+} snapshot_identity_t;
+
+typedef enum {
+    SNAPSHOT_LIVE_MATCH = 0,
+    SNAPSHOT_LIVE_CHANGED = 1,
+    SNAPSHOT_LIVE_ERROR = -1
+} snapshot_live_match_t;
+
+static void snapshot_log_failure(const char *code, const char *operation, const char *path,
+                                 unsigned long native_error) {
+    char error_buf[32];
+    snprintf(error_buf, sizeof(error_buf), "%lu", native_error);
+    cbm_log_error("source_snapshot.failed", "code", code, "operation", operation, "path",
+                  path ? path : "", "native_error_kind", "errno", "native_error", error_buf,
+                  "message", "the immutable source snapshot could not be completed", "remediation",
+                  "stabilize source access, free workspace disk space, and retry indexing");
+}
+
+static char *snapshot_join(const char *left, const char *right) {
+    if (!left || !right) {
+        return NULL;
+    }
+    size_t a = strlen(left);
+    size_t b = strlen(right);
+    bool sep = a > 0 && left[a - 1] != '/';
+    if (a > SIZE_MAX - b - (sep ? 2u : 1u)) {
+        return NULL;
+    }
+    size_t n = a + b + (sep ? 1u : 0u);
+    char *out = malloc(n + 1u);
+    if (!out) {
+        return NULL;
+    }
+    memcpy(out, left, a);
+    size_t pos = a;
+    if (sep) {
+        out[pos++] = '/';
+    }
+    memcpy(out + pos, right, b);
+    out[n] = '\0';
+    return out;
+}
+
+static void digest_to_hex(const uint8_t digest[CBM_SHA256_DIGEST_LEN],
+                          char out[CBM_SHA256_HEX_LEN + 1]) {
+    static const char *hex = "0123456789abcdef";
+    for (size_t i = 0; i < CBM_SHA256_DIGEST_LEN; i++) {
+        out[i * 2] = hex[(digest[i] >> 4) & 0x0F];
+        out[i * 2 + 1] = hex[digest[i] & 0x0F];
+    }
+    out[CBM_SHA256_HEX_LEN] = '\0';
+}
+
+static bool snapshot_is_lower_sha256(const char *value) {
+    if (!value || strlen(value) != CBM_SHA256_HEX_LEN) {
+        return false;
+    }
+    for (size_t i = 0; i < CBM_SHA256_HEX_LEN; i++) {
+        if (!((value[i] >= '0' && value[i] <= '9') || (value[i] >= 'a' && value[i] <= 'f'))) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static int64_t snapshot_timespec_to_unix_ns(const struct timespec *ts) {
+    return (int64_t)ts->tv_sec * 1000000000LL + (int64_t)ts->tv_nsec;
+}
+
+/* Express a POSIX instant on the 100ns-since-1601 basis the vault already
+ * stores, so a change-time is comparable across hosts. */
+static int64_t snapshot_timespec_to_filetime_ticks(const struct timespec *ts) {
+    return ((int64_t)ts->tv_sec + SNAPSHOT_UNIX_TO_FILETIME_SECONDS) * 10000000LL +
+           (int64_t)ts->tv_nsec / 100LL;
+}
+
+static bool snapshot_identity_of_fd(int fd, snapshot_identity_t *identity) {
+    struct stat st;
+    errno = 0;
+    if (fstat(fd, &st) != 0) {
+        return false;
+    }
+    if (!S_ISREG(st.st_mode)) {
+        errno = EINVAL;
+        return false;
+    }
+    identity->dev = st.st_dev;
+    identity->ino = st.st_ino;
+    identity->size = st.st_size;
+#if defined(__APPLE__)
+    identity->mtime = st.st_mtimespec;
+    identity->ctime = st.st_ctimespec;
 #else
-#error "Calyx codebase snapshot capture is currently implemented for the native Windows target"
+    identity->mtime = st.st_mtim;
+    identity->ctime = st.st_ctim;
+#endif
+    return true;
+}
+
+static bool snapshot_identity_equal(const snapshot_identity_t *a, const snapshot_identity_t *b) {
+    return a->dev == b->dev && a->ino == b->ino && a->size == b->size &&
+           a->mtime.tv_sec == b->mtime.tv_sec && a->mtime.tv_nsec == b->mtime.tv_nsec &&
+           a->ctime.tv_sec == b->ctime.tv_sec && a->ctime.tv_nsec == b->ctime.tv_nsec;
+}
+
+static void snapshot_bind_identity(cbm_file_info_t *file, const snapshot_identity_t *identity) {
+    file->source_volume_serial = (uint64_t)identity->dev;
+    memset(file->source_file_id, 0, sizeof(file->source_file_id));
+    uint64_t ino = (uint64_t)identity->ino;
+    uint64_t dev = (uint64_t)identity->dev;
+    memcpy(file->source_file_id, &ino, sizeof(ino));
+    memcpy(file->source_file_id + sizeof(ino), &dev, sizeof(dev));
+    file->source_change_time_100ns = snapshot_timespec_to_filetime_ticks(&identity->ctime);
+    file->mtime_ns = snapshot_timespec_to_unix_ns(&identity->mtime);
+}
+
+/* Open a live source for reading without following a terminal symlink, matching
+ * the Windows branch's refusal to traverse a reparse point. */
+static int snapshot_open_source(const char *path) {
+    errno = 0;
+    return open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+}
+
+static bool snapshot_hash_fd(int fd, uint8_t digest[CBM_SHA256_DIGEST_LEN], uint64_t *byte_count,
+                             unsigned long *native_error) {
+    cbm_sha256_ctx hash;
+    cbm_sha256_init(&hash);
+    *byte_count = 0;
+    *native_error = 0;
+    char *buffer = malloc(SNAPSHOT_COPY_CHUNK);
+    if (!buffer) {
+        *native_error = (unsigned long)ENOMEM;
+        return false;
+    }
+    if (lseek(fd, 0, SEEK_SET) < 0) {
+        *native_error = (unsigned long)errno;
+        free(buffer);
+        return false;
+    }
+    for (;;) {
+        errno = 0;
+        ssize_t got = read(fd, buffer, SNAPSHOT_COPY_CHUNK);
+        if (got < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            *native_error = (unsigned long)errno;
+            free(buffer);
+            return false;
+        }
+        if (got == 0) {
+            break;
+        }
+        cbm_sha256_update(&hash, buffer, (size_t)got);
+        *byte_count += (uint64_t)got;
+    }
+    free(buffer);
+    cbm_sha256_final(&hash, digest);
+    return true;
+}
+
+/* Stream source bytes into the snapshot destination while hashing exactly what
+ * was written, so the recorded digest describes the captured bytes. */
+static bool snapshot_copy_and_hash(int source_fd, int dest_fd,
+                                   uint8_t digest[CBM_SHA256_DIGEST_LEN], uint64_t *byte_count,
+                                   unsigned long *native_error) {
+    cbm_sha256_ctx hash;
+    cbm_sha256_init(&hash);
+    *byte_count = 0;
+    *native_error = 0;
+    char *buffer = malloc(SNAPSHOT_COPY_CHUNK);
+    if (!buffer) {
+        *native_error = (unsigned long)ENOMEM;
+        return false;
+    }
+    for (;;) {
+        errno = 0;
+        ssize_t got = read(source_fd, buffer, SNAPSHOT_COPY_CHUNK);
+        if (got < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            *native_error = (unsigned long)errno;
+            free(buffer);
+            return false;
+        }
+        if (got == 0) {
+            break;
+        }
+        size_t written_total = 0;
+        while (written_total < (size_t)got) {
+            errno = 0;
+            ssize_t wrote = write(dest_fd, buffer + written_total, (size_t)got - written_total);
+            if (wrote < 0) {
+                if (errno == EINTR) {
+                    continue;
+                }
+                *native_error = (unsigned long)errno;
+                free(buffer);
+                return false;
+            }
+            written_total += (size_t)wrote;
+        }
+        cbm_sha256_update(&hash, buffer, (size_t)got);
+        *byte_count += (uint64_t)got;
+    }
+    free(buffer);
+    cbm_sha256_final(&hash, digest);
+    return true;
+}
+
+/* Reject anything that would escape the snapshot root or is not a plain
+ * repository-relative path. */
+static bool snapshot_rel_path_valid(const char *path) {
+    if (!path || path[0] == '\0' || path[0] == '/') {
+        return false;
+    }
+    const char *cursor = path;
+    while (*cursor) {
+        const char *slash = strchr(cursor, '/');
+        size_t len = slash ? (size_t)(slash - cursor) : strlen(cursor);
+        if (len == 0) {
+            return false;
+        }
+        if (len == 1 && cursor[0] == '.') {
+            return false;
+        }
+        if (len == 2 && cursor[0] == '.' && cursor[1] == '.') {
+            return false;
+        }
+        if (!slash) {
+            break;
+        }
+        cursor = slash + 1;
+    }
+    return true;
+}
+
+/* Create every parent directory of `file_path` beneath an already-existing
+ * snapshot root. */
+static bool snapshot_make_parents(const char *file_path) {
+    char *copy = strdup(file_path);
+    if (!copy) {
+        errno = ENOMEM;
+        return false;
+    }
+    char *last = strrchr(copy, '/');
+    if (!last) {
+        free(copy);
+        return true;
+    }
+    *last = '\0';
+    bool ok = cbm_mkdir_p(copy, SNAPSHOT_DIR_MODE);
+    if (!ok) {
+        snapshot_log_failure("CBM_SOURCE_SNAPSHOT_DIRECTORY_CREATE_FAILED",
+                             "create_snapshot_directory", copy, (unsigned long)errno);
+    }
+    free(copy);
+    return ok;
+}
+
+static int snapshot_remove_tree(const char *path) {
+    cbm_dir_t *dir = cbm_opendir(path);
+    if (!dir) {
+        snapshot_log_failure("CBM_SOURCE_SNAPSHOT_CLEANUP_OPEN_FAILED", "open_cleanup_root", path,
+                             cbm_fs_last_error());
+        return CBM_NOT_FOUND;
+    }
+    int rc = 0;
+    cbm_dirent_t *entry = NULL;
+    while ((entry = cbm_readdir(dir)) != NULL) {
+        char *child = snapshot_join(path, entry->name);
+        if (!child) {
+            rc = CBM_NOT_FOUND;
+            break;
+        }
+        if (entry->is_dir) {
+            if (snapshot_remove_tree(child) != 0) {
+                rc = CBM_NOT_FOUND;
+            }
+        } else if (cbm_unlink(child) != 0) {
+            snapshot_log_failure("CBM_SOURCE_SNAPSHOT_CLEANUP_FILE_FAILED", "delete_snapshot",
+                                 child, (unsigned long)errno);
+            rc = CBM_NOT_FOUND;
+        }
+        free(child);
+        if (rc != 0) {
+            break;
+        }
+    }
+    unsigned long read_error = cbm_dir_error(dir);
+    cbm_closedir(dir);
+    if (read_error != 0) {
+        snapshot_log_failure("CBM_SOURCE_SNAPSHOT_CLEANUP_READ_FAILED", "read_cleanup_root", path,
+                             read_error);
+        rc = CBM_NOT_FOUND;
+    }
+    if (rc == 0 && cbm_rmdir(path) != 0) {
+        snapshot_log_failure("CBM_SOURCE_SNAPSHOT_CLEANUP_DIRECTORY_FAILED", "remove_directory",
+                             path, (unsigned long)errno);
+        rc = CBM_NOT_FOUND;
+    }
+    return rc;
+}
+
+static int compare_rel_paths(const void *left, const void *right) {
+    const cbm_file_info_t *const *a = left;
+    const cbm_file_info_t *const *b = right;
+    return strcmp((*a)->rel_path, (*b)->rel_path);
+}
+
+/* Re-read the repository namespace and prove it is the same set of files, with
+ * the same languages, that was captured. Drift is terminal: the snapshot would
+ * otherwise describe a repository state that no longer exists. */
+static int snapshot_verify_namespace(const char *repo_path, const cbm_discover_opts_t *opts,
+                                     cbm_file_info_t *captured, int captured_count) {
+    cbm_file_info_t *observed = NULL;
+    int observed_count = 0;
+    char **excluded = NULL;
+    int excluded_count = 0;
+    if (cbm_discover_ex(repo_path, opts, &observed, &observed_count, &excluded, &excluded_count) !=
+        0) {
+        snapshot_log_failure("CBM_SOURCE_SNAPSHOT_NAMESPACE_READ_FAILED", "rediscover_namespace",
+                             repo_path, (unsigned long)errno);
+        return CBM_NOT_FOUND;
+    }
+    int rc = 0;
+    if (observed_count != captured_count) {
+        snapshot_log_failure("CBM_SOURCE_SNAPSHOT_NAMESPACE_DRIFT", "compare_namespace", repo_path,
+                             (unsigned long)EAGAIN);
+        rc = CBM_NOT_FOUND;
+    }
+    const cbm_file_info_t **a = NULL;
+    const cbm_file_info_t **b = NULL;
+    if (rc == 0 && captured_count > 0) {
+        a = calloc((size_t)captured_count, sizeof(*a));
+        b = calloc((size_t)captured_count, sizeof(*b));
+        if (!a || !b) {
+            snapshot_log_failure("CBM_SOURCE_SNAPSHOT_NAMESPACE_ALLOC_FAILED", "sort_namespace",
+                                 repo_path, (unsigned long)ENOMEM);
+            rc = CBM_NOT_FOUND;
+        }
+    }
+    if (rc == 0 && captured_count > 0) {
+        for (int i = 0; i < captured_count; i++) {
+            a[i] = &captured[i];
+            b[i] = &observed[i];
+        }
+        qsort((void *)a, (size_t)captured_count, sizeof(*a), compare_rel_paths);
+        qsort((void *)b, (size_t)captured_count, sizeof(*b), compare_rel_paths);
+        for (int i = 0; i < captured_count; i++) {
+            if (strcmp(a[i]->rel_path, b[i]->rel_path) != 0 || a[i]->language != b[i]->language) {
+                snapshot_log_failure("CBM_SOURCE_SNAPSHOT_NAMESPACE_DRIFT", "compare_namespace",
+                                     a[i]->rel_path, (unsigned long)EAGAIN);
+                rc = CBM_NOT_FOUND;
+                break;
+            }
+        }
+    }
+    free((void *)a);
+    free((void *)b);
+    cbm_discover_free(observed, observed_count);
+    cbm_discover_free_excluded(excluded, excluded_count);
+    return rc;
+}
+
+/* Hash one live file and decide whether it still matches its persisted row.
+ * A content difference is an ordinary "changed"; an unreadable or mutating
+ * source is terminal. */
+static snapshot_live_match_t snapshot_hash_live_match(const cbm_file_info_t *file,
+                                                      const cbm_file_hash_t *expected,
+                                                      cbm_file_info_t *verified) {
+    int fd = snapshot_open_source(file->path);
+    if (fd < 0) {
+        snapshot_log_failure("CBM_SOURCE_UNCHANGED_OPEN_FAILED", "open_live_source", file->path,
+                             (unsigned long)errno);
+        return SNAPSHOT_LIVE_ERROR;
+    }
+    snapshot_identity_t before;
+    if (!snapshot_identity_of_fd(fd, &before)) {
+        unsigned long error = (unsigned long)errno;
+        close(fd);
+        snapshot_log_failure("CBM_SOURCE_UNCHANGED_IDENTITY_FAILED", "inspect_live_source",
+                             file->path, error);
+        return SNAPSHOT_LIVE_ERROR;
+    }
+    if (before.size != file->size || before.size != expected->size) {
+        close(fd);
+        return SNAPSHOT_LIVE_CHANGED;
+    }
+
+    uint8_t digest[CBM_SHA256_DIGEST_LEN];
+    uint64_t bytes = 0;
+    unsigned long error = 0;
+    bool hashed = snapshot_hash_fd(fd, digest, &bytes, &error);
+    snapshot_identity_t after;
+    bool inspected_after = snapshot_identity_of_fd(fd, &after);
+    unsigned long after_error = inspected_after ? 0 : (unsigned long)errno;
+    close(fd);
+    if (!hashed || !inspected_after) {
+        snapshot_log_failure("CBM_SOURCE_UNCHANGED_READ_FAILED", "hash_live_source", file->path,
+                             error ? error : after_error);
+        return SNAPSHOT_LIVE_ERROR;
+    }
+    if (!snapshot_identity_equal(&before, &after) || bytes != (uint64_t)before.size) {
+        snapshot_log_failure("CBM_SOURCE_UNCHANGED_MUTATED", "verify_live_source_identity",
+                             file->path, (unsigned long)EAGAIN);
+        return SNAPSHOT_LIVE_ERROR;
+    }
+
+    char sha256[CBM_SHA256_HEX_LEN + 1];
+    digest_to_hex(digest, sha256);
+    if (strcmp(sha256, expected->sha256) != 0) {
+        return SNAPSHOT_LIVE_CHANGED;
+    }
+
+    *verified = *file;
+    verified->live_path = file->path;
+    verified->size = (int64_t)bytes;
+    snapshot_bind_identity(verified, &before);
+    memcpy(verified->sha256, sha256, sizeof(verified->sha256));
+    return SNAPSHOT_LIVE_MATCH;
+}
+
+/* Capture one file into the snapshot root, returning its heap destination path
+ * and binding the captured identity onto the record. */
+static int snapshot_capture_one(const char *root, cbm_file_info_t *file, char **out_destination) {
+    *out_destination = NULL;
+    if (!snapshot_rel_path_valid(file->rel_path)) {
+        snapshot_log_failure("CBM_SOURCE_SNAPSHOT_RELATIVE_PATH_INVALID", "validate_relative_path",
+                             file->rel_path ? file->rel_path : file->path, (unsigned long)EINVAL);
+        return CBM_NOT_FOUND;
+    }
+    char *destination = snapshot_join(root, file->rel_path);
+    if (!destination) {
+        snapshot_log_failure("CBM_SOURCE_SNAPSHOT_PATH_ALLOC_FAILED", "build_destination_path",
+                             file->rel_path, (unsigned long)ENOMEM);
+        return CBM_NOT_FOUND;
+    }
+    if (!snapshot_make_parents(destination)) {
+        free(destination);
+        return CBM_NOT_FOUND;
+    }
+    int source_fd = snapshot_open_source(file->path);
+    if (source_fd < 0) {
+        snapshot_log_failure("CBM_SOURCE_SNAPSHOT_OPEN_FAILED", "open_source", file->path,
+                             (unsigned long)errno);
+        free(destination);
+        return CBM_NOT_FOUND;
+    }
+    snapshot_identity_t before;
+    if (!snapshot_identity_of_fd(source_fd, &before)) {
+        unsigned long error = (unsigned long)errno;
+        close(source_fd);
+        snapshot_log_failure("CBM_SOURCE_SNAPSHOT_IDENTITY_FAILED", "inspect_source", file->path,
+                             error);
+        free(destination);
+        return CBM_NOT_FOUND;
+    }
+    uint8_t digest[CBM_SHA256_DIGEST_LEN];
+    uint64_t bytes = 0;
+    unsigned long error = 0;
+    bool copied = false;
+
+#if defined(__APPLE__)
+    /* APFS copy-on-write capture.
+     *
+     * fclonefileat() gives the snapshot a new inode that shares the source's
+     * data extents: no bytes are written, the call is O(metadata), and the
+     * capture consumes essentially no additional disk until something diverges.
+     * Cloning from the already-open `source_fd` — rather than from the path —
+     * guarantees the captured object is the exact inode whose identity was just
+     * recorded, closing the path-reopen race the Windows branch avoids with a
+     * retained handle.
+     *
+     * This replaces a byte-for-byte streaming copy, so capture drops from
+     * read+write to read-only I/O; the read that remains is the one the SHA-256
+     * requires and cannot be avoided. */
+    errno = 0;
+    bool cloned = fclonefileat(source_fd, AT_FDCWD, destination, 0) == 0;
+    int clone_errno = cloned ? 0 : errno;
+    if (!cloned && clone_errno != EXDEV && clone_errno != ENOTSUP && clone_errno != EOPNOTSUPP &&
+        clone_errno != ENOTDIR) {
+        /* A real failure, not a capability boundary. */
+        close(source_fd);
+        snapshot_log_failure("CBM_SOURCE_SNAPSHOT_CLONE_FAILED", "clone_source", file->path,
+                             (unsigned long)clone_errno);
+        free(destination);
+        return CBM_NOT_FOUND;
+    }
+    if (cloned) {
+        /* Hash the captured content from the source descriptor. The clone shares
+         * these exact extents, so this digest describes the snapshot bytes. */
+        copied = snapshot_hash_fd(source_fd, digest, &bytes, &error);
+        if (copied) {
+            /* Preserve the read-only intent the streaming path expresses through
+             * its create mode; a clone inherits the source's permissions. */
+            (void)fchmodat(AT_FDCWD, destination, 0444, AT_SYMLINK_NOFOLLOW);
+        }
+    } else {
+        /* EXDEV/ENOTSUP: the snapshot root is on a different volume or a
+         * filesystem without cloning. That is a capability boundary of the
+         * host, not a fault, so capture proceeds by streaming — and says so,
+         * rather than degrading silently. */
+        cbm_log_info("source_snapshot.clone_unavailable", "path", file->path, "mechanism",
+                     "stream_copy");
+    }
+#endif
+
+    if (!copied) {
+        errno = 0;
+        int dest_fd = open(destination, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0444);
+        if (dest_fd < 0) {
+            unsigned long open_error = (unsigned long)errno;
+            close(source_fd);
+            snapshot_log_failure("CBM_SOURCE_SNAPSHOT_DESTINATION_CREATE_FAILED",
+                                 "create_destination", destination, open_error);
+            free(destination);
+            return CBM_NOT_FOUND;
+        }
+        copied = snapshot_copy_and_hash(source_fd, dest_fd, digest, &bytes, &error);
+        if (close(dest_fd) != 0 && copied) {
+            copied = false;
+            error = (unsigned long)errno;
+        }
+    }
+
+    snapshot_identity_t after;
+    bool inspected_after = snapshot_identity_of_fd(source_fd, &after);
+    unsigned long after_error = inspected_after ? 0 : (unsigned long)errno;
+    close(source_fd);
+    if (!copied || !inspected_after) {
+        snapshot_log_failure("CBM_SOURCE_SNAPSHOT_COPY_FAILED", "capture_source", file->path,
+                             error ? error : after_error);
+        free(destination);
+        return CBM_NOT_FOUND;
+    }
+    /* The source must not have moved while its bytes were being consumed;
+     * otherwise the captured bytes describe no single coherent version. */
+    if (!snapshot_identity_equal(&before, &after) || bytes != (uint64_t)before.size) {
+        snapshot_log_failure("CBM_SOURCE_SNAPSHOT_SOURCE_MUTATED", "verify_source_identity",
+                             file->path, (unsigned long)EAGAIN);
+        free(destination);
+        return CBM_NOT_FOUND;
+    }
+
+    char sha256[CBM_SHA256_HEX_LEN + 1];
+    digest_to_hex(digest, sha256);
+    file->size = (int64_t)bytes;
+    snapshot_bind_identity(file, &before);
+    memcpy(file->sha256, sha256, sizeof(file->sha256));
+    *out_destination = destination;
+    return 0;
+}
+
+int cbm_source_snapshot_capture(const char *repo_path, const cbm_discover_opts_t *opts,
+                                cbm_file_info_t *files, int file_count,
+                                cbm_source_snapshot_t *snapshot) {
+    if (!repo_path || !opts || file_count < 0 || (file_count > 0 && !files) || !snapshot ||
+        snapshot->root) {
+        snapshot_log_failure("CBM_SOURCE_SNAPSHOT_INVALID_ARGUMENT", "validate_capture", repo_path,
+                             (unsigned long)EINVAL);
+        return CBM_NOT_FOUND;
+    }
+    const char *temp = cbm_tmpdir();
+    size_t temp_len = strlen(temp);
+    const size_t suffix_capacity = 96;
+    if (temp_len > SIZE_MAX - suffix_capacity) {
+        snapshot_log_failure("CBM_SOURCE_SNAPSHOT_PATH_OVERFLOW", "build_snapshot_root", temp,
+                             (unsigned long)EOVERFLOW);
+        return CBM_NOT_FOUND;
+    }
+    char *root = malloc(temp_len + suffix_capacity);
+    if (!root) {
+        snapshot_log_failure("CBM_SOURCE_SNAPSHOT_ROOT_ALLOC_FAILED", "allocate_snapshot_root",
+                             temp, (unsigned long)ENOMEM);
+        return CBM_NOT_FOUND;
+    }
+    struct timespec now;
+    if (cbm_clock_gettime(CLOCK_MONOTONIC, &now) != 0) {
+        snapshot_log_failure("CBM_SOURCE_SNAPSHOT_ROOT_CLOCK_FAILED", "derive_snapshot_root", temp,
+                             (unsigned long)errno);
+        free(root);
+        return CBM_NOT_FOUND;
+    }
+    static atomic_int sequence;
+    int generation = atomic_fetch_add(&sequence, 1) + 1;
+    uint64_t ticks = (uint64_t)now.tv_sec * 1000000000ULL + (uint64_t)now.tv_nsec;
+    int root_len = snprintf(root, temp_len + suffix_capacity, "%s/cbm-source-snapshot-%lu-%016llx-%d",
+                            temp, (unsigned long)getpid(), (unsigned long long)ticks, generation);
+    if (root_len <= 0 || (size_t)root_len >= temp_len + suffix_capacity) {
+        snapshot_log_failure("CBM_SOURCE_SNAPSHOT_ROOT_PATH_OVERFLOW", "build_snapshot_root", temp,
+                             (unsigned long)ENAMETOOLONG);
+        free(root);
+        return CBM_NOT_FOUND;
+    }
+    errno = 0;
+    if (mkdir(root, SNAPSHOT_DIR_MODE) != 0) {
+        snapshot_log_failure("CBM_SOURCE_SNAPSHOT_ROOT_CREATE_FAILED", "create_snapshot_root", root,
+                             (unsigned long)errno);
+        free(root);
+        return CBM_NOT_FOUND;
+    }
+    /* From here the snapshot owns the root on success and on failure, so the
+     * caller has exactly one cleanup owner. */
+    snapshot->root = root;
+
+    for (int i = 0; i < file_count; i++) {
+        char *destination = NULL;
+        if (snapshot_capture_one(root, &files[i], &destination) != 0) {
+            return CBM_NOT_FOUND;
+        }
+        files[i].live_path = files[i].path;
+        files[i].path = destination;
+    }
+
+    if (snapshot_verify_namespace(repo_path, opts, files, file_count) != 0) {
+        return CBM_NOT_FOUND;
+    }
+
+    char count_buf[32];
+    snprintf(count_buf, sizeof(count_buf), "%d", file_count);
+    cbm_log_info("source_snapshot.complete", "root", root, "files", count_buf, "workers", "1");
+    return 0;
+}
+
+int cbm_source_snapshot_verify_unchanged(const char *repo_path, const cbm_discover_opts_t *opts,
+                                         cbm_file_info_t *files, int file_count,
+                                         const cbm_file_hash_t *stored, int stored_count,
+                                         bool *out_unchanged) {
+    if (!repo_path || !opts || file_count < 0 || stored_count < 0 || (file_count > 0 && !files) ||
+        (stored_count > 0 && !stored) || !out_unchanged) {
+        snapshot_log_failure("CBM_SOURCE_UNCHANGED_INVALID_ARGUMENT", "validate_unchanged",
+                             repo_path, (unsigned long)EINVAL);
+        return CBM_NOT_FOUND;
+    }
+    *out_unchanged = false;
+    if (file_count != stored_count) {
+        return 0;
+    }
+
+    CBMHashTable *by_path = cbm_ht_create(stored_count > 0 ? (size_t)stored_count * 2u : CBM_SZ_64);
+    if (!by_path) {
+        snapshot_log_failure("CBM_SOURCE_UNCHANGED_INDEX_ALLOC_FAILED", "allocate_hash_index",
+                             repo_path, (unsigned long)ENOMEM);
+        return CBM_NOT_FOUND;
+    }
+    for (int i = 0; i < stored_count; i++) {
+        if (!stored[i].rel_path || stored[i].rel_path[0] == '\0' ||
+            !snapshot_is_lower_sha256(stored[i].sha256) || stored[i].size < 0 ||
+            !cbm_ht_set_checked(by_path, stored[i].rel_path, (void *)&stored[i], NULL)) {
+            snapshot_log_failure("CBM_SOURCE_UNCHANGED_HASH_ROW_INVALID", "index_persisted_hashes",
+                                 stored[i].rel_path ? stored[i].rel_path : repo_path,
+                                 (unsigned long)EINVAL);
+            cbm_ht_free(by_path);
+            return CBM_NOT_FOUND;
+        }
+    }
+
+    for (int i = 0; i < file_count; i++) {
+        const cbm_file_hash_t *expected = cbm_ht_get(by_path, files[i].rel_path);
+        if (!expected || files[i].size != expected->size) {
+            cbm_ht_free(by_path);
+            return 0;
+        }
+    }
+
+    cbm_file_info_t *verified =
+        calloc((size_t)(file_count > 0 ? file_count : 1), sizeof(*verified));
+    if (!verified) {
+        snapshot_log_failure("CBM_SOURCE_UNCHANGED_IDENTITY_ALLOC_FAILED",
+                             "allocate_identity_readback", repo_path, (unsigned long)ENOMEM);
+        cbm_ht_free(by_path);
+        return CBM_NOT_FOUND;
+    }
+    for (int i = 0; i < file_count; i++) {
+        const cbm_file_hash_t *expected = cbm_ht_get(by_path, files[i].rel_path);
+        snapshot_live_match_t match = snapshot_hash_live_match(&files[i], expected, &verified[i]);
+        if (match != SNAPSHOT_LIVE_MATCH) {
+            free(verified);
+            cbm_ht_free(by_path);
+            return match == SNAPSHOT_LIVE_CHANGED ? 0 : CBM_NOT_FOUND;
+        }
+    }
+    cbm_ht_free(by_path);
+
+    if (snapshot_verify_namespace(repo_path, opts, verified, file_count) != 0) {
+        free(verified);
+        return CBM_NOT_FOUND;
+    }
+    free(verified);
+    *out_unchanged = true;
+    char count_buf[32];
+    snprintf(count_buf, sizeof(count_buf), "%d", file_count);
+    cbm_log_info("source_snapshot.unchanged", "files", count_buf, "source_copy_started", "false");
+    return 0;
+}
+
+int cbm_source_snapshot_destroy(cbm_source_snapshot_t *snapshot) {
+    if (!snapshot || !snapshot->root) {
+        return 0;
+    }
+    int rc = snapshot_remove_tree(snapshot->root);
+    if (rc == 0) {
+        free(snapshot->root);
+        snapshot->root = NULL;
+    }
+    return rc;
+}
+
 #endif

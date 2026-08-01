@@ -1369,6 +1369,71 @@ impl ProcessMetrics {
     }
 }
 
+/// Darwin per-process metrics for the kernel-read diagnostics (#895).
+///
+/// `proc_pid_rusage(RUSAGE_INFO_V4)` supplies byte-exact cumulative disk I/O and
+/// the current/lifetime-peak memory footprint; `getrusage` supplies the I/O
+/// operation counts and page faults that the Darwin rusage record omits. Every
+/// value is measured — a failed query is a hard error, because these
+/// diagnostics are mandatory.
+#[cfg(target_os = "macos")]
+fn current_process_metrics() -> Result<ProcessMetrics, CalyxError> {
+    let mut info: libc::rusage_info_v4 = unsafe { std::mem::zeroed() };
+    // SAFETY: `info` is a correctly sized writable POD matching the flavor.
+    let rc = unsafe {
+        libc::proc_pid_rusage(
+            std::process::id() as libc::c_int,
+            libc::RUSAGE_INFO_V4,
+            (&raw mut info).cast::<libc::rusage_info_t>(),
+        )
+    };
+    if rc != 0 {
+        return Err(process_metric_error(
+            "proc_pid_rusage",
+            std::io::Error::last_os_error()
+                .raw_os_error()
+                .unwrap_or_default() as u32,
+        ));
+    }
+    let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+    // SAFETY: `usage` is a correctly sized writable POD for RUSAGE_SELF.
+    if unsafe { libc::getrusage(libc::RUSAGE_SELF, &raw mut usage) } != 0 {
+        return Err(process_metric_error(
+            "getrusage",
+            std::io::Error::last_os_error()
+                .raw_os_error()
+                .unwrap_or_default() as u32,
+        ));
+    }
+    Ok(ProcessMetrics {
+        // Darwin reports these totals in nanoseconds; the contract is 100ns units.
+        kernel_time_100ns: info.ri_system_time / 100,
+        user_time_100ns: info.ri_user_time / 100,
+        read_operations: u64::try_from(usage.ru_inblock).unwrap_or(0),
+        read_bytes: info.ri_diskio_bytesread,
+        write_operations: u64::try_from(usage.ru_oublock).unwrap_or(0),
+        write_bytes: info.ri_diskio_byteswritten,
+        page_faults: u64::try_from(usage.ru_majflt).unwrap_or(0)
+            + u64::try_from(usage.ru_minflt).unwrap_or(0),
+        working_set_bytes: info.ri_resident_size,
+        peak_working_set_bytes: info.ri_lifetime_max_phys_footprint,
+        pagefile_bytes: info.ri_phys_footprint,
+        // Darwin retains one lifetime peak footprint rather than separate
+        // working-set and pagefile peaks.
+        peak_pagefile_bytes: info.ri_lifetime_max_phys_footprint,
+    })
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
+fn current_process_metrics() -> Result<ProcessMetrics, CalyxError> {
+    Err(CalyxError {
+        code: "ASTRO_FLEET_PROCESS_METRICS",
+        message: "no exact per-process accounting source is implemented for this target".to_string(),
+        remediation: "implement current_process_metrics for this host; kernel-read diagnostics are mandatory",
+    })
+}
+
+#[cfg(windows)]
 fn current_process_metrics() -> Result<ProcessMetrics, CalyxError> {
     use windows_sys::Win32::Foundation::{FILETIME, GetLastError};
     use windows_sys::Win32::System::ProcessStatus::{
@@ -1437,6 +1502,7 @@ fn phase_usage_json(usage: calyx_aster::vault::VaultPhaseUsage) -> serde_json::V
     })
 }
 
+#[cfg(windows)]
 fn filetime_u64(value: windows_sys::Win32::Foundation::FILETIME) -> u64 {
     (u64::from(value.dwHighDateTime) << 32) | u64::from(value.dwLowDateTime)
 }
@@ -1444,7 +1510,7 @@ fn filetime_u64(value: windows_sys::Win32::Foundation::FILETIME) -> u64 {
 fn process_metric_error(operation: &str, os_code: u32) -> CalyxError {
     CalyxError {
         code: "ASTRO_FLEET_PROCESS_METRICS",
-        message: format!("{operation} failed with Win32 error {os_code}"),
+        message: format!("{operation} failed with OS error {os_code}"),
         remediation: "inspect the native process-query failure; kernel-read diagnostics are mandatory",
     }
 }

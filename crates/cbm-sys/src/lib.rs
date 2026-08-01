@@ -15,7 +15,16 @@ pub const CRATE_NAME: &str = env!("CARGO_PKG_NAME");
 pub const CBM_VENDOR_ROOT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../cbm");
 pub const VENDORED_MIMALLOC_VERSION: &str = env!("CBM_MIMALLOC_VERSION");
 
+// Bindings are committed per target, not generated at build time, so the FFI
+// surface stays reviewable and reproducible. They genuinely differ by host:
+// MSVC and clang disagree on the underlying type of an unsigned C enum, and each
+// libc contributes its own typedefs and stdio internals. One committed file per
+// supported host keeps the staleness gate authoritative everywhere instead of
+// only on the host that happened to generate it (#895).
+#[cfg(windows)]
 include!("bindings.rs");
+#[cfg(target_os = "macos")]
+include!("bindings_macos.rs");
 
 #[cfg(not(cbm_sys_asan))]
 #[global_allocator]

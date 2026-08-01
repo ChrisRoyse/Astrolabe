@@ -202,6 +202,7 @@ fn elapsed_us(started: std::time::Instant) -> u64 {
     u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX)
 }
 
+#[cfg(windows)]
 pub(super) fn current_process_usage() -> Result<VaultProcessUsage> {
     use windows_sys::Win32::Foundation::{FILETIME, GetLastError};
     use windows_sys::Win32::System::ProcessStatus::{
@@ -254,14 +255,89 @@ pub(super) fn current_process_usage() -> Result<VaultProcessUsage> {
     })
 }
 
+/// Darwin process accounting for the open-phase diagnostics (#895).
+///
+/// `proc_pid_rusage(RUSAGE_INFO_V4)` is the authoritative per-process source on
+/// this host and reports byte-exact cumulative disk I/O plus the current and
+/// lifetime-peak memory footprint — the direct analogues of the Win32
+/// `IO_COUNTERS` transfer counts and `PROCESS_MEMORY_COUNTERS` working-set
+/// fields. `getrusage` supplies the I/O *operation* counts, which the Darwin
+/// rusage record does not carry.
+///
+/// Every field is a measured value. Nothing is estimated, and a failed query is
+/// a hard error, because these diagnostics are mandatory for a durable open.
+#[cfg(target_os = "macos")]
+pub(super) fn current_process_usage() -> Result<VaultProcessUsage> {
+    let mut info: libc::rusage_info_v4 = unsafe { std::mem::zeroed() };
+    // SAFETY: `info` is a correctly sized, writable Darwin POD and the flavor
+    // matches the struct requested.
+    let rc = unsafe {
+        libc::proc_pid_rusage(
+            std::process::id() as libc::c_int,
+            libc::RUSAGE_INFO_V4,
+            (&raw mut info).cast::<libc::rusage_info_t>(),
+        )
+    };
+    if rc != 0 {
+        return Err(process_usage_error(
+            "proc_pid_rusage",
+            std::io::Error::last_os_error()
+                .raw_os_error()
+                .unwrap_or_default() as u32,
+        ));
+    }
+
+    let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+    // SAFETY: `usage` is a correctly sized, writable POD for RUSAGE_SELF.
+    if unsafe { libc::getrusage(libc::RUSAGE_SELF, &raw mut usage) } != 0 {
+        return Err(process_usage_error(
+            "getrusage",
+            std::io::Error::last_os_error()
+                .raw_os_error()
+                .unwrap_or_default() as u32,
+        ));
+    }
+
+    // Darwin reports these CPU totals in nanoseconds; the contract is 100ns units.
+    Ok(VaultProcessUsage {
+        kernel_time_100ns: info.ri_system_time / 100,
+        user_time_100ns: info.ri_user_time / 100,
+        read_operations: u64::try_from(usage.ru_inblock).unwrap_or(0),
+        read_bytes: info.ri_diskio_bytesread,
+        write_operations: u64::try_from(usage.ru_oublock).unwrap_or(0),
+        write_bytes: info.ri_diskio_byteswritten,
+        page_faults: u64::try_from(usage.ru_majflt).unwrap_or(0)
+            + u64::try_from(usage.ru_minflt).unwrap_or(0),
+        working_set_bytes: info.ri_resident_size,
+        peak_working_set_bytes: info.ri_lifetime_max_phys_footprint,
+        private_bytes: info.ri_phys_footprint,
+        // Darwin retains one lifetime peak footprint rather than the separate
+        // working-set and pagefile peaks Windows tracks.
+        peak_private_bytes: info.ri_lifetime_max_phys_footprint,
+    })
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
+pub(super) fn current_process_usage() -> Result<VaultProcessUsage> {
+    Err(CalyxError {
+        code: "CALYX_VAULT_OPEN_PROCESS_METRICS",
+        message: "no exact per-process accounting source is implemented for this target"
+            .to_string(),
+        remediation:
+            "implement current_process_usage for this host; durable open phase diagnostics are mandatory",
+    })
+}
+
+#[cfg(windows)]
 fn filetime_value(value: windows_sys::Win32::Foundation::FILETIME) -> u64 {
     (u64::from(value.dwHighDateTime) << 32) | u64::from(value.dwLowDateTime)
 }
 
+#[cfg(any(windows, target_os = "macos"))]
 fn process_usage_error(operation: &str, os_code: u32) -> CalyxError {
     CalyxError {
         code: "CALYX_VAULT_OPEN_PROCESS_METRICS",
-        message: format!("{operation} failed with Win32 error {os_code}"),
+        message: format!("{operation} failed with OS error {os_code}"),
         remediation: "inspect the native process-query failure; durable open phase diagnostics are mandatory",
     }
 }

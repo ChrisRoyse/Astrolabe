@@ -566,19 +566,41 @@ LIBCBM_OBJS = $(LIBCBM_C_OBJS) $(LIBCBM_CXX_OBJS) $(LIBCBM_ASM_OBJS) $(ASTRO_ALL
 # inputs that Make cannot infer from source timestamps.
 LIBCBM_DEPFILES = $(LIBCBM_OBJS:.o=.d)
 LIBCBM_DEPFLAGS = -MMD -MP
-LIBCBM_CFLAGS = $(CFLAGS_PROD) -fvisibility=hidden -DCBM_BUILDING_LIB=1
-LIBCBM_CXXFLAGS = $(CXXFLAGS_PROD) -fvisibility=hidden -DCBM_BUILDING_LIB=1
-LIBCBM_GRAMMAR_CFLAGS = $(GRAMMAR_CFLAGS) -fvisibility=hidden -DCBM_BUILDING_LIB=1
-LIBCBM_LSP_CFLAGS = $(LSP_CFLAGS) -fvisibility=hidden -DCBM_BUILDING_LIB=1
-LIBCBM_SQLITE3_CFLAGS = $(SQLITE3_CFLAGS) -fvisibility=hidden -DCBM_BUILDING_LIB=1
-LIBCBM_MIMALLOC_CFLAGS = $(MIMALLOC_CFLAGS) -fvisibility=hidden -DCBM_BUILDING_LIB=1
+
+# Exported-surface restriction (#895).
+#
+# The CBM headers carry no export-visibility attributes at all — there is no
+# CBM_API/__attribute__((visibility("default"))) anywhere in the tree. On
+# PE/COFF that is harmless, because -fvisibility=hidden is a no-op there and
+# every symbol in a static archive stays visible; that is why a Windows-only
+# build never noticed. On any ELF or Mach-O host the same flag hides the entire
+# cbm_* API, and the resulting archive links with hundreds of undefined symbols.
+#
+# It also defeats the mechanism that is actually meant to restrict the surface:
+# the libcbm.o rule derives libcbm.exports from `nm -g` and hands it to
+# `objcopy --keep-global-symbols`. That step cannot enumerate an API the
+# compiler has already hidden — with the flag on, the exports list collapsed to
+# 12 symbols instead of the full cbm_* set.
+#
+# So visibility restriction is owned by the objcopy step, not by a blanket
+# compile flag, and the flag is applied only where it is inert.
+LIBCBM_VISIBILITY :=
+ifeq ($(IS_MINGW),yes)
+LIBCBM_VISIBILITY := -fvisibility=hidden
+endif
+LIBCBM_CFLAGS = $(CFLAGS_PROD) $(LIBCBM_VISIBILITY) -DCBM_BUILDING_LIB=1
+LIBCBM_CXXFLAGS = $(CXXFLAGS_PROD) $(LIBCBM_VISIBILITY) -DCBM_BUILDING_LIB=1
+LIBCBM_GRAMMAR_CFLAGS = $(GRAMMAR_CFLAGS) $(LIBCBM_VISIBILITY) -DCBM_BUILDING_LIB=1
+LIBCBM_LSP_CFLAGS = $(LSP_CFLAGS) $(LIBCBM_VISIBILITY) -DCBM_BUILDING_LIB=1
+LIBCBM_SQLITE3_CFLAGS = $(SQLITE3_CFLAGS) $(LIBCBM_VISIBILITY) -DCBM_BUILDING_LIB=1
+LIBCBM_MIMALLOC_CFLAGS = $(MIMALLOC_CFLAGS) $(LIBCBM_VISIBILITY) -DCBM_BUILDING_LIB=1
 ifeq ($(LIBCBM_ASAN),1)
-LIBCBM_CFLAGS = $(CFLAGS_COMMON) -g -O1 $(CFLAGS_EXTRA) -fvisibility=hidden -DCBM_BUILDING_LIB=1
-LIBCBM_CXXFLAGS = $(CXXFLAGS_COMMON) -g -O1 $(CXXFLAGS_EXTRA) -fvisibility=hidden -DCBM_BUILDING_LIB=1
-LIBCBM_GRAMMAR_CFLAGS = $(GRAMMAR_CFLAGS) -g -O1 $(CFLAGS_EXTRA) -fvisibility=hidden -DCBM_BUILDING_LIB=1
-LIBCBM_LSP_CFLAGS = $(LSP_CFLAGS) -g -O1 $(CFLAGS_EXTRA) -fvisibility=hidden -DCBM_BUILDING_LIB=1
-LIBCBM_SQLITE3_CFLAGS = $(SQLITE3_CFLAGS) $(CFLAGS_EXTRA) -fvisibility=hidden -DCBM_BUILDING_LIB=1
-LIBCBM_MIMALLOC_CFLAGS = $(MIMALLOC_CFLAGS_TEST) $(CFLAGS_EXTRA) -fvisibility=hidden -DCBM_BUILDING_LIB=1
+LIBCBM_CFLAGS = $(CFLAGS_COMMON) -g -O1 $(CFLAGS_EXTRA) $(LIBCBM_VISIBILITY) -DCBM_BUILDING_LIB=1
+LIBCBM_CXXFLAGS = $(CXXFLAGS_COMMON) -g -O1 $(CXXFLAGS_EXTRA) $(LIBCBM_VISIBILITY) -DCBM_BUILDING_LIB=1
+LIBCBM_GRAMMAR_CFLAGS = $(GRAMMAR_CFLAGS) -g -O1 $(CFLAGS_EXTRA) $(LIBCBM_VISIBILITY) -DCBM_BUILDING_LIB=1
+LIBCBM_LSP_CFLAGS = $(LSP_CFLAGS) -g -O1 $(CFLAGS_EXTRA) $(LIBCBM_VISIBILITY) -DCBM_BUILDING_LIB=1
+LIBCBM_SQLITE3_CFLAGS = $(SQLITE3_CFLAGS) $(CFLAGS_EXTRA) $(LIBCBM_VISIBILITY) -DCBM_BUILDING_LIB=1
+LIBCBM_MIMALLOC_CFLAGS = $(MIMALLOC_CFLAGS_TEST) $(CFLAGS_EXTRA) $(LIBCBM_VISIBILITY) -DCBM_BUILDING_LIB=1
 endif
 LIBCBM_CFLAGS += $(LIBCBM_DEPFLAGS)
 LIBCBM_CXXFLAGS += $(LIBCBM_DEPFLAGS)
@@ -702,15 +724,15 @@ $(LIBCBM_DIR)/$(SQLITE3_SRC:.c=.o): $(SQLITE3_SRC) | $(BUILD_DIR)
 
 $(LIBCBM_DIR)/$(TRE_SRC:.c=.o): $(TRE_SRC) | $(BUILD_DIR)
 	mkdir -p $(dir $@)
-	$(CC) $(TRE_CFLAGS) $(LIBCBM_DEPFLAGS) -O2 -fvisibility=hidden -c -o $@ $<
+	$(CC) $(TRE_CFLAGS) $(LIBCBM_DEPFLAGS) -O2 $(LIBCBM_VISIBILITY) -c -o $@ $<
 
 $(LIBCBM_DIR)/$(CBM_DIR)/vendored/lz4/%.o: $(CBM_DIR)/vendored/lz4/%.c | $(BUILD_DIR)
 	mkdir -p $(dir $@)
-	$(CC) $(LIBCBM_DEPFLAGS) -std=c11 -D_DEFAULT_SOURCE -O2 -fvisibility=hidden -w -I$(CBM_DIR) -I$(CBM_DIR)/vendored/lz4 -c -o $@ $<
+	$(CC) $(LIBCBM_DEPFLAGS) -std=c11 -D_DEFAULT_SOURCE -O2 $(LIBCBM_VISIBILITY) -w -I$(CBM_DIR) -I$(CBM_DIR)/vendored/lz4 -c -o $@ $<
 
 $(LIBCBM_DIR)/$(CBM_DIR)/vendored/zstd/zstd.o: $(CBM_DIR)/vendored/zstd/zstd.c | $(BUILD_DIR)
 	mkdir -p $(dir $@)
-	$(CC) $(LIBCBM_DEPFLAGS) -std=c11 -D_DEFAULT_SOURCE -O2 -fvisibility=hidden -w -I$(CBM_DIR)/vendored/zstd -c -o $@ $<
+	$(CC) $(LIBCBM_DEPFLAGS) -std=c11 -D_DEFAULT_SOURCE -O2 $(LIBCBM_VISIBILITY) -w -I$(CBM_DIR)/vendored/zstd -c -o $@ $<
 
 $(LIBCBM_DIR)/%.o: %.c | $(BUILD_DIR)
 	mkdir -p $(dir $@)
@@ -722,15 +744,26 @@ $(LIBCBM_DIR)/%.o: %.cpp | $(BUILD_DIR)
 
 $(LIBCBM_DIR)/$(UNIXCODER_BLOB_SRC:.S=.o): $(UNIXCODER_BLOB_SRC) vendored/nomic/code_vectors.bin | $(BUILD_DIR)
 	mkdir -p $(dir $@)
-	$(CC) $(LIBCBM_DEPFLAGS) -fvisibility=hidden -c -o $@ $<
+	$(CC) $(LIBCBM_DEPFLAGS) $(LIBCBM_VISIBILITY) -c -o $@ $<
 
 $(LIBCBM_DIR)/%.o: %.S | $(BUILD_DIR)
 	mkdir -p $(dir $@)
-	$(CC) $(LIBCBM_DEPFLAGS) -fvisibility=hidden -c -o $@ $<
+	$(CC) $(LIBCBM_DEPFLAGS) $(LIBCBM_VISIBILITY) -c -o $@ $<
 
+# The linker response file exists solely to stay under the Windows command-line
+# length limit, and it is usable only where both halves support it: `$(file ...)`
+# requires GNU Make >= 4.0, and `@file` requires a binutils-style linker. Neither
+# holds on macOS — Apple ld64 has no response-file syntax and treats "@path" as a
+# literal filename, and the system make is 3.81, which expands `$(file ...)` to
+# nothing and would silently produce no response file at all. POSIX hosts have no
+# command-line length problem here, so they pass the objects directly (#895).
 $(LIBCBM_RELOC): $(LIBCBM_OBJS)
+ifeq ($(IS_MINGW),yes)
 	$(file >$(LIBCBM_OBJECTS_RSP),$(LIBCBM_OBJS))
 	$(LD) -r $(NO_EXECSTACK_LD_FLAG) $(MINGW_RELOC_LD_FLAGS) -o $@ @$(LIBCBM_OBJECTS_RSP)
+else
+	$(LD) -r $(NO_EXECSTACK_LD_FLAG) $(MINGW_RELOC_LD_FLAGS) -o $@ $(LIBCBM_OBJS)
+endif
 	$(NM) -g $@ | awk '$$1 != "U" && $$2 != "U" {print $$NF}' | grep -E '^_?cbm_' > $(LIBCBM_EXPORTS)
 	if command -v $(OBJCOPY) >/dev/null 2>&1; then \
 		if [ "$(IS_MINGW)" = "yes" ]; then $(OBJCOPY) --remove-section=.drectve $@; fi; \

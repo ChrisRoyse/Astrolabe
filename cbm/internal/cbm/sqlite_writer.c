@@ -27,7 +27,6 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <inttypes.h>
-#include <io.h>
 #include <limits.h>
 #include <stddef.h> // NULL
 #include <stdio.h>
@@ -35,7 +34,42 @@
 #include <string.h>
 #include <stdint.h>
 #include <stdbool.h>
+#ifdef _WIN32
+#include <io.h>
 #include <windows.h>
+#else
+#include <unistd.h>
+#endif
+
+/* ── Host-neutral CRT/error spellings (#895) ──────────────────────
+ * The direct SQLite writer was written against the MSVC CRT. These give the
+ * same operations their POSIX names so one body serves both hosts. */
+#ifndef _WIN32
+/* MSVC calling-convention annotation; meaningless and absent elsewhere. */
+#define __cdecl
+/* 64-bit stream offsets: MSVC spells these _fseeki64/_ftelli64. */
+#define _fseeki64 fseeko
+#define _ftelli64 ftello
+/* Native error codes the writer records, in this host's own error domain. */
+#define ERROR_ARITHMETIC_OVERFLOW ((unsigned long)EOVERFLOW)
+#define ERROR_GEN_FAILURE ((unsigned long)EIO)
+#define ERROR_INVALID_PARAMETER ((unsigned long)EINVAL)
+#endif
+
+/* Context-carrying sort. MSVC is qsort_s(base, n, size, compar, context);
+ * Darwin/BSD is qsort_r(base, n, size, context, compar) with the *same*
+ * comparator shape (context first); glibc puts the context last in both the
+ * call and the comparator, so it needs its own shim rather than a reorder. */
+#if defined(_WIN32)
+#define CBM_SORT_R(base, count, size, compar, context)                                             \
+    qsort_s((base), (count), (size), (compar), (context))
+#elif defined(__APPLE__) || defined(__FreeBSD__)
+#define CBM_SORT_R(base, count, size, compar, context)                                             \
+    qsort_r((base), (count), (size), (context), (compar))
+#else
+#define CBM_SORT_R(base, count, size, compar, context)                                             \
+    cbm_sort_r_glibc((base), (count), (size), (compar), (context))
+#endif
 
 #define CBM_PAGE_SIZE 65536
 
@@ -363,6 +397,29 @@ static void writer_record_input_failure(WriterIo *io, const char *operation, con
 }
 
 static bool writer_io_open_create_new(WriterIo *io) {
+#ifndef _WIN32
+    /* O_EXCL is the POSIX statement of CREATE_NEW: publish only if this call is
+     * the one that created the stage file, so a concurrent writer can never be
+     * silently overwritten (#895). */
+    errno = 0;
+    int fd = open(io->path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0644);
+    if (fd < 0) {
+        writer_io_record_errno(io, "create_new");
+        return false;
+    }
+    io->stage_created = true;
+
+    errno = 0;
+    io->fp = fdopen(fd, "wb");
+    if (!io->fp) {
+        int saved = errno;
+        (void)close(fd);
+        errno = saved;
+        writer_io_record_errno(io, "open_stream");
+        return false;
+    }
+    return true;
+#else
     wchar_t *wide_path = cbm_utf8_to_wide_path(io->path);
     if (!wide_path) {
         DWORD error = GetLastError();
@@ -399,6 +456,7 @@ static bool writer_io_open_create_new(WriterIo *io) {
         return false;
     }
     return true;
+#endif
 }
 
 static bool writer_io_seek(WriterIo *io, WriterOffset offset, int origin) {
@@ -505,6 +563,7 @@ static int writer_io_close(WriterIo *io, bool require_durable_sync) {
             writer_io_record_errno(io, "flush");
         }
 
+#ifdef _WIN32
         errno = 0;
         int fd = _fileno(io->fp);
         if (fd < 0) {
@@ -517,6 +576,39 @@ static int writer_io_close(WriterIo *io, bool require_durable_sync) {
                 writer_io_record_failure(io, "sync", "win32", (unsigned long)GetLastError());
             }
         }
+#else
+        errno = 0;
+        int fd = fileno(io->fp);
+        if (fd < 0) {
+            writer_io_record_errno(io, "fileno");
+        } else {
+#if defined(__APPLE__) && defined(F_FULLFSYNC)
+            /* On Darwin fsync() only hands the data to the drive; it does not
+             * wait for the drive to commit it to stable media. A published
+             * database must survive power loss, so this uses F_FULLFSYNC, the
+             * only Darwin call that gives that guarantee. F_FULLFSYNC is
+             * unsupported on some filesystems and returns ENOTSUP/EINVAL there;
+             * fall through to fsync() only for that specific refusal, and
+             * record any other failure. */
+            errno = 0;
+            if (fcntl(fd, F_FULLFSYNC, 0) == -1) {
+                if (errno == ENOTSUP || errno == EINVAL || errno == ENOTTY) {
+                    errno = 0;
+                    if (fsync(fd) != 0) {
+                        writer_io_record_errno(io, "sync");
+                    }
+                } else {
+                    writer_io_record_errno(io, "sync");
+                }
+            }
+#else
+            errno = 0;
+            if (fsync(fd) != 0) {
+                writer_io_record_errno(io, "sync");
+            }
+#endif
+        }
+#endif
     }
 
     errno = 0;
@@ -1896,6 +1988,26 @@ static inline const char *safe_str(const char *s) {
 // Returns NULL on allocation failure.
 typedef int(__cdecl *sort_compare_fn)(void *, const void *, const void *);
 
+#if !defined(_WIN32) && !defined(__APPLE__) && !defined(__FreeBSD__)
+/* glibc's qsort_r takes the context last and passes it last to the comparator.
+ * Adapt it to the context-first shape every comparator here is written in. */
+typedef struct {
+    sort_compare_fn compar;
+    void *context;
+} cbm_sort_r_glibc_ctx;
+
+static int cbm_sort_r_glibc_trampoline(const void *a, const void *b, void *ctx) {
+    cbm_sort_r_glibc_ctx *bound = (cbm_sort_r_glibc_ctx *)ctx;
+    return bound->compar(bound->context, a, b);
+}
+
+static void cbm_sort_r_glibc(void *base, size_t count, size_t size, sort_compare_fn compar,
+                             void *context) {
+    cbm_sort_r_glibc_ctx bound = {compar, context};
+    qsort_r(base, count, size, cbm_sort_r_glibc_trampoline, &bound);
+}
+#endif
+
 static int *make_sorted_perm(int n, sort_compare_fn cmp, const void *context) {
     int *perm = (int *)malloc(n * sizeof(int));
     if (!perm) {
@@ -1904,7 +2016,7 @@ static int *make_sorted_perm(int n, sort_compare_fn cmp, const void *context) {
     for (int i = 0; i < n; i++) {
         perm[i] = i;
     }
-    qsort_s(perm, (size_t)n, sizeof(int), cmp, (void *)context);
+    CBM_SORT_R(perm, (size_t)n, sizeof(int), cmp, (void *)context);
     return perm;
 }
 

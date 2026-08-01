@@ -83,6 +83,10 @@ enum {
 #endif
 #ifdef __APPLE__
 #include <mach-o/dyld.h>
+/* _NSGetEnviron — Darwin does not expose `environ` to a shared library, so the
+ * ASTRO_ENV_STORE PATH walk in find_in_path() reads the process environment
+ * through this accessor instead. */
+#include <crt_externs.h>
 #endif
 #include "foundation/compat_fs.h"
 

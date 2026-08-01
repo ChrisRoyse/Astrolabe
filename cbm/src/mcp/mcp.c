@@ -80,6 +80,10 @@ enum {
 #include <unistd.h>
 #include <poll.h>
 #include <fcntl.h>
+#include <sys/file.h> /* flock — cross-process project-transition lock (#895) */
+#endif
+#ifdef __APPLE__
+#include <sys/sysctl.h> /* KERN_PROC_PID — exact owner process start instant (#895) */
 #endif
 #include <yyjson/yyjson.h>
 #include <limits.h>
@@ -130,11 +134,27 @@ static char *heap_strdup(const char *s) {
 
 static char *yy_doc_to_str(yyjson_mut_doc *doc);
 
-#ifdef _WIN32
+/* Indexing admission (#895).
+ *
+ * Two leases guard an index run: one per project (only one writer per project)
+ * and one host-wide (only one expensive index on this machine at a time).
+ *
+ * Windows realises both as named kernel mutexes. POSIX realises them as
+ * flock() on lock files carrying the same identity, for the same reason the
+ * project-transition lock does: the kernel releases an flock when the holder
+ * dies, so a crashed indexer cannot wedge the host lease permanently. The
+ * consequence is the same honest asymmetry — an abandoned lease is
+ * indistinguishable from a free one, so `recovered_abandoned_capacity` is
+ * never asserted on POSIX rather than being fabricated. */
 typedef struct {
+#if defined(_WIN32)
     HANDLE project_mutex;
     HANDLE host_mutex;
-    DWORD host_timeout_ms;
+#else
+    int project_fd; /* flock-held; -1 when not held */
+    int host_fd;    /* flock-held; -1 when not held */
+#endif
+    unsigned long host_timeout_ms;
     uint64_t host_waited_ms;
     bool recovered_abandoned_capacity;
 } cbm_index_admission_t;
@@ -218,31 +238,176 @@ static char *load_fleet_host_timeout(const char *project, const char *repo_path,
     errno = 0;
     char *end = NULL;
     unsigned long long parsed = strtoull(timeout_text, &end, 10);
-    if (errno == ERANGE || !end || *end != '\0' || parsed >= (unsigned long long)INFINITE) {
+    /* The admission wait must be a finite millisecond budget. The ceiling is the
+     * Win32 wait range minus its INFINITE sentinel (0xFFFFFFFF), expressed here
+     * as a plain constant so the accepted range is identical on every host and
+     * does not depend on a Windows header (#895). */
+    const unsigned long long admission_timeout_exclusive_max = 0xFFFFFFFFULL;
+    if (errno == ERANGE || !end || *end != '\0' || parsed >= admission_timeout_exclusive_max) {
         cbm_log_error(
             "index.admission.failed", "code", "CBM_INDEX_ADMISSION_WAIT_INVALID", "project",
             project, "repo_path", repo_path, "message",
-            "ASTRO_FLEET_INDEX_ADMISSION_TIMEOUT_MS is outside the finite Windows wait range",
+            "ASTRO_FLEET_INDEX_ADMISSION_TIMEOUT_MS is outside the finite admission wait range",
             "remediation",
-            "pass decimal milliseconds from zero through INFINITE-1, or remove the variable");
+            "pass decimal milliseconds from 0 through 4294967294, or remove the variable");
         return index_admission_error(
             "CBM_INDEX_ADMISSION_WAIT_INVALID", project, repo_path,
-            "ASTRO_FLEET_INDEX_ADMISSION_TIMEOUT_MS is outside the finite Windows wait range",
-            "pass decimal milliseconds from zero through INFINITE-1, or remove the variable",
+            "ASTRO_FLEET_INDEX_ADMISSION_TIMEOUT_MS is outside the finite admission wait range",
+            "pass decimal milliseconds from 0 through 4294967294, or remove the variable",
             admission);
     }
-    admission->host_timeout_ms = (DWORD)parsed;
+    admission->host_timeout_ms = (unsigned long)parsed;
     return NULL;
 }
+
+#ifndef _WIN32
+/* Open a lock file and take its exclusive flock without blocking.
+ * Returns the held descriptor, or -1 with *busy set when another live process
+ * holds it and *native_error set on any other failure. */
+static int index_admission_try_lock(const char *path, bool *busy, uint32_t *native_error) {
+    *busy = false;
+    *native_error = 0;
+    errno = 0;
+    int fd = open(path, O_RDWR | O_CREAT | O_CLOEXEC, 0600);
+    if (fd < 0) {
+        *native_error = (uint32_t)errno;
+        return -1;
+    }
+    errno = 0;
+    if (flock(fd, LOCK_EX | LOCK_NB) == 0) {
+        return fd;
+    }
+    int lock_errno = errno;
+    close(fd);
+    if (lock_errno == EWOULDBLOCK || lock_errno == EAGAIN) {
+        *busy = true;
+        return -1;
+    }
+    *native_error = (uint32_t)lock_errno;
+    return -1;
+}
+#endif
 
 static char *acquire_index_admission(const char *project, const char *repo_path,
                                      cbm_index_admission_t *admission) {
     memset(admission, 0, sizeof(*admission));
+#ifndef _WIN32
+    admission->project_fd = -1;
+    admission->host_fd = -1;
+#endif
     char *timeout_error = load_fleet_host_timeout(project, repo_path, admission);
     if (timeout_error) {
         return timeout_error;
     }
 
+#ifndef _WIN32
+    {
+        char project_digest[CBM_SHA256_HEX_LEN + 1];
+        cbm_sha256_hex(project, strlen(project), project_digest);
+        char project_lock[CBM_SZ_256];
+        int written = snprintf(project_lock, sizeof(project_lock),
+                               "/tmp/Astrolabe.IndexProject.v1.%s.lock", project_digest);
+        if (written <= 0 || (size_t)written >= sizeof(project_lock)) {
+            cbm_log_error("index.admission.failed", "code", "CBM_INDEX_PROJECT_MUTEX_NAME_FAILED",
+                          "project", project, "repo_path", repo_path, "message",
+                          "the canonical project lock path could not be constructed", "remediation",
+                          "preserve the project store and retry the exact request");
+            return index_admission_error(
+                "CBM_INDEX_PROJECT_MUTEX_NAME_FAILED", project, repo_path,
+                "the canonical project lock path could not be constructed",
+                "preserve the project store and retry the exact request", admission);
+        }
+
+        bool busy = false;
+        uint32_t native_error = 0;
+        admission->project_fd = index_admission_try_lock(project_lock, &busy, &native_error);
+        if (admission->project_fd < 0) {
+            if (busy) {
+                cbm_log_error("index.admission.refused", "code", "CBM_INDEX_PROJECT_BUSY",
+                              "project", project, "repo_path", repo_path, "pipeline_started",
+                              "false", "sqlite_publication_started", "false", "message",
+                              "another process is already indexing this exact project",
+                              "remediation",
+                              "let the active index finish, then retry the unchanged request");
+                return index_admission_error(
+                    "CBM_INDEX_PROJECT_BUSY", project, repo_path,
+                    "another process is already indexing this exact project",
+                    "let the active index finish, then retry the unchanged request", admission);
+            }
+            char native_text[CBM_SZ_32];
+            snprintf(native_text, sizeof(native_text), "%lu", (unsigned long)native_error);
+            cbm_log_error("index.admission.failed", "code", "CBM_INDEX_PROJECT_MUTEX_WAIT_FAILED",
+                          "project", project, "repo_path", repo_path, "native_error_kind", "errno",
+                          "native_error", native_text, "message",
+                          "the exact project writer lease could not be evaluated", "remediation",
+                          "resolve the reported lock failure and retry");
+            return index_admission_error(
+                "CBM_INDEX_PROJECT_MUTEX_WAIT_FAILED", project, repo_path,
+                "the exact project writer lease could not be evaluated",
+                "resolve the structured host error and retry the unchanged request", admission);
+        }
+
+        /* Host-wide expensive-index lease, bounded by the configured timeout.
+         * flock has no timed variant, so the wait is an explicit poll loop that
+         * owns the budget rather than sleeping inside the kernel. */
+        const char *host_lock = "/tmp/Astrolabe.ExpensiveIndexHost.v1.lock";
+        uint64_t wait_started_ms = cbm_now_ms();
+        for (;;) {
+            busy = false;
+            native_error = 0;
+            admission->host_fd = index_admission_try_lock(host_lock, &busy, &native_error);
+            if (admission->host_fd >= 0) {
+                break;
+            }
+            if (!busy) {
+                char native_text[CBM_SZ_32];
+                snprintf(native_text, sizeof(native_text), "%lu", (unsigned long)native_error);
+                close(admission->project_fd);
+                admission->project_fd = -1;
+                cbm_log_error("index.admission.failed", "code", "CBM_INDEX_HOST_MUTEX_CREATE_FAILED",
+                              "project", project, "repo_path", repo_path, "native_error_kind",
+                              "errno", "native_error", native_text, "message",
+                              "the host-wide expensive-index lease could not be opened",
+                              "remediation", "resolve the reported lock failure and retry");
+                return index_admission_error(
+                    "CBM_INDEX_HOST_MUTEX_CREATE_FAILED", project, repo_path,
+                    "the host-wide expensive-index lease could not be opened",
+                    "resolve the structured host error and retry the unchanged request", admission);
+            }
+            admission->host_waited_ms = cbm_now_ms() - wait_started_ms;
+            if (admission->host_waited_ms >= admission->host_timeout_ms) {
+                close(admission->project_fd);
+                admission->project_fd = -1;
+                cbm_log_error(
+                    "index.admission.refused", "code", "CBM_INDEX_HOST_BUSY", "project", project,
+                    "repo_path", repo_path, "pipeline_started", "false",
+                    "sqlite_publication_started", "false", "message",
+                    "another Astrolabe process owns the host-wide expensive-index generation",
+                    "remediation", "let that index finish, then retry the unchanged request");
+                return index_admission_error(
+                    "CBM_INDEX_HOST_BUSY", project, repo_path,
+                    "another Astrolabe process owns the host-wide expensive-index generation",
+                    "let the active index finish, then retry the unchanged request", admission);
+            }
+            cbm_usleep(25ULL * 1000ULL);
+        }
+        admission->host_waited_ms = cbm_now_ms() - wait_started_ms;
+        /* The kernel reclaims an flock on process death, so a lease left by a
+         * crashed indexer is indistinguishable from a free one. Never claim a
+         * recovery that was not observed. */
+        admission->recovered_abandoned_capacity = false;
+
+        char timeout_text[CBM_SZ_32];
+        char waited_text[CBM_SZ_32];
+        snprintf(timeout_text, sizeof(timeout_text), "%lu", admission->host_timeout_ms);
+        snprintf(waited_text, sizeof(waited_text), "%llu",
+                 (unsigned long long)admission->host_waited_ms);
+        cbm_log_info("index.admission.acquired", "project", project, "repo_path", repo_path,
+                     "timeout_ms", timeout_text, "waited_ms", waited_text,
+                     "recovered_abandoned_capacity", "false");
+        return NULL;
+    }
+#else
     char project_digest[CBM_SHA256_HEX_LEN + 1];
     cbm_sha256_hex(project, strlen(project), project_digest);
     wchar_t project_mutex_name[CBM_SZ_128];
@@ -387,10 +552,45 @@ static char *acquire_index_admission(const char *project, const char *repo_path,
                  "recovered_abandoned_capacity",
                  admission->recovered_abandoned_capacity ? "true" : "false");
     return NULL;
+#endif
 }
 
 static bool release_index_admission(cbm_index_admission_t *admission, const char *project,
                                     const char *repo_path) {
+#ifndef _WIN32
+    bool released = true;
+    /* Release host lease first, mirroring the Windows order, so the narrower
+     * project lease is the last thing surrendered. */
+    if (admission->host_fd >= 0) {
+        errno = 0;
+        if (flock(admission->host_fd, LOCK_UN) != 0) {
+            char native_text[CBM_SZ_32];
+            snprintf(native_text, sizeof(native_text), "%lu", (unsigned long)errno);
+            cbm_log_error("index.admission.release_failed", "code",
+                          "CBM_INDEX_HOST_MUTEX_RELEASE_FAILED", "project", project, "repo_path",
+                          repo_path, "native_error_kind", "errno", "native_error", native_text,
+                          "remediation", "inspect the exact worker lease ownership and retry");
+            released = false;
+        }
+        close(admission->host_fd);
+        admission->host_fd = -1;
+    }
+    if (admission->project_fd >= 0) {
+        errno = 0;
+        if (flock(admission->project_fd, LOCK_UN) != 0) {
+            char native_text[CBM_SZ_32];
+            snprintf(native_text, sizeof(native_text), "%lu", (unsigned long)errno);
+            cbm_log_error("index.admission.release_failed", "code",
+                          "CBM_INDEX_PROJECT_MUTEX_RELEASE_FAILED", "project", project, "repo_path",
+                          repo_path, "native_error_kind", "errno", "native_error", native_text,
+                          "remediation", "inspect the exact worker lease ownership and retry");
+            released = false;
+        }
+        close(admission->project_fd);
+        admission->project_fd = -1;
+    }
+    return released;
+#else
     bool released = true;
     if (admission->host_mutex) {
         if (!ReleaseMutex(admission->host_mutex)) {
@@ -419,8 +619,8 @@ static bool release_index_admission(cbm_index_admission_t *admission, const char
         admission->project_mutex = NULL;
     }
     return released;
-}
 #endif
+}
 
 /* Write yyjson_mut_doc to a heap-allocated, strict UTF-8 JSON string.
  * MCP is a UTF-8 protocol boundary.  Invalid persisted/process text must fail
@@ -1287,6 +1487,28 @@ bool cbm_mcp_get_bool_arg(const char *args_json, const char *key) {
  *  MCP SERVER
  * ══════════════════════════════════════════════════════════════════ */
 
+/* Native error vocabulary for the project-transition surface, in the host's own
+ * error domain (#895). A POSIX host never reports a Win32 number it could not
+ * have produced, and vice versa. Declared here because cbm_mcp_server retains
+ * one of these codes. */
+#if defined(_WIN32)
+typedef DWORD cbm_transition_error_t;
+#define CBM_TRANSITION_OK ERROR_SUCCESS
+#define CBM_TRANSITION_E_INVAL ERROR_INVALID_PARAMETER
+#define CBM_TRANSITION_E_OVERFLOW ERROR_BUFFER_OVERFLOW
+#define CBM_TRANSITION_E_NOMEM ERROR_NOT_ENOUGH_MEMORY
+#define CBM_TRANSITION_E_BUSY ERROR_BUSY
+#define CBM_TRANSITION_E_NOTSUP ERROR_NOT_SUPPORTED
+#else
+typedef uint32_t cbm_transition_error_t;
+#define CBM_TRANSITION_OK ((uint32_t)0)
+#define CBM_TRANSITION_E_INVAL ((uint32_t)EINVAL)
+#define CBM_TRANSITION_E_OVERFLOW ((uint32_t)ENAMETOOLONG)
+#define CBM_TRANSITION_E_NOMEM ((uint32_t)ENOMEM)
+#define CBM_TRANSITION_E_BUSY ((uint32_t)EBUSY)
+#define CBM_TRANSITION_E_NOTSUP ((uint32_t)ENOTSUP)
+#endif
+
 struct cbm_mcp_server {
     cbm_store_t *store;     /* currently open project store (or NULL) */
     bool owns_store;        /* true if we opened the store */
@@ -1305,7 +1527,7 @@ struct cbm_mcp_server {
     char store_error_canonical_db_path[CBM_STORE_VERIFY_PATH_MAX];
     char transition_error_code[CBM_SZ_64];
     char transition_error_project[CBM_SZ_256];
-    DWORD transition_native_error;
+    cbm_transition_error_t transition_native_error;
     char update_notice[CBM_SZ_256]; /* one-shot update notice, cleared after first injection */
     bool update_checked;            /* true after background check has been launched */
     cbm_thread_t update_tid;        /* background update check thread */
@@ -1338,11 +1560,49 @@ typedef enum {
     CBM_PROJECT_TRANSITION_PROBE_FAILED = -1,
 } cbm_project_transition_state_t;
 
+/* ── Cross-process project-transition lock (#895) ───────────────
+ *
+ * The lock is machine-wide and keyed by the SHA-256 of the project name, so two
+ * server processes indexing the same project serialise against each other.
+ *
+ * Windows realises it as a named kernel mutex in the `Global\` namespace.
+ * POSIX hosts realise it as flock(LOCK_EX|LOCK_NB) on a lock file whose name
+ * carries the same digest. flock was chosen over a POSIX named semaphore
+ * deliberately: the kernel releases a flock when the holding descriptor closes
+ * *or the holding process dies*, which reproduces the crash-safety Win32 gives
+ * through WAIT_ABANDONED. macOS additionally lacks robust mutexes and
+ * sem_timedwait, so a named semaphore would leak a permanently-held lock on any
+ * crash — exactly the silent-wedge failure this surface must not have.
+ *
+ * One honest semantic difference: because the kernel reclaims an flock on
+ * process death, a crashed owner's lock is indistinguishable from a free lock.
+ * POSIX hosts therefore never report CBM_PROJECT_TRANSITION_ABANDONED — the
+ * recovery Windows reports explicitly has already happened implicitly. Callers
+ * are told this via the state, never by a fabricated "recovered" flag.
+ */
+
 struct cbm_project_transition {
+#if defined(_WIN32)
     HANDLE mutex;
+#else
+    int lock_fd; /* flock-held descriptor; -1 when the lock is not held */
+#endif
     char project[CBM_SZ_256];
 };
 
+/* True while this transition object still owns its host lock. */
+static bool project_transition_is_held(const cbm_project_transition_t *transition) {
+    if (!transition) {
+        return false;
+    }
+#if defined(_WIN32)
+    return transition->mutex != NULL;
+#else
+    return transition->lock_fd >= 0;
+#endif
+}
+
+#if defined(_WIN32)
 static bool project_transition_mutex_name(const char *project, wchar_t *name, size_t name_count) {
     if (!project || !cbm_validate_project_name(project) || !name || name_count == 0) {
         return false;
@@ -1352,15 +1612,88 @@ static bool project_transition_mutex_name(const char *project, wchar_t *name, si
     int wrote = swprintf(name, name_count, L"Global\\Astrolabe.ProjectTransition.v1.%hs", digest);
     return wrote > 0 && (size_t)wrote < name_count;
 }
+#else
+/* Lock-file path carrying the same project digest the Windows mutex name uses.
+ * /tmp is the machine-wide, every-user-visible location that matches the reach
+ * of the Windows `Global\` namespace; a per-user TMPDIR would let two users
+ * index one project concurrently without ever seeing each other's lock. */
+static bool project_transition_lock_path(const char *project, char *path, size_t path_count) {
+    if (!project || !cbm_validate_project_name(project) || !path || path_count == 0) {
+        return false;
+    }
+    char digest[CBM_SHA256_HEX_LEN + 1];
+    cbm_sha256_hex(project, strlen(project), digest);
+    int wrote = snprintf(path, path_count, "/tmp/Astrolabe.ProjectTransition.v1.%s.lock", digest);
+    return wrote > 0 && (size_t)wrote < path_count;
+}
+
+/* Open the project's lock file and try to take the exclusive flock without
+ * blocking. Returns the held descriptor, or -1 with *native_error set and
+ * *busy true when another live process holds it. */
+static int project_transition_try_lock(const char *project, bool *busy,
+                                       cbm_transition_error_t *native_error) {
+    *busy = false;
+    *native_error = CBM_TRANSITION_OK;
+    char path[CBM_SZ_256];
+    if (!project_transition_lock_path(project, path, sizeof(path))) {
+        *native_error = CBM_TRANSITION_E_OVERFLOW;
+        return -1;
+    }
+    errno = 0;
+    int fd = open(path, O_RDWR | O_CREAT | O_CLOEXEC, 0600);
+    if (fd < 0) {
+        *native_error = (cbm_transition_error_t)errno;
+        return -1;
+    }
+    errno = 0;
+    if (flock(fd, LOCK_EX | LOCK_NB) == 0) {
+        return fd;
+    }
+    int lock_errno = errno;
+    close(fd);
+    if (lock_errno == EWOULDBLOCK || lock_errno == EAGAIN) {
+        *busy = true;
+        *native_error = CBM_TRANSITION_E_BUSY;
+        return -1;
+    }
+    *native_error = (cbm_transition_error_t)lock_errno;
+    return -1;
+}
+#endif
+
+#if defined(__APPLE__)
+/* Exact start instant of this process, expressed on the same 100ns-since-1601
+ * basis Windows GetProcessTimes reports, so one owner-identity representation
+ * crosses both hosts. */
+static bool project_transition_process_start_ticks(uint64_t *out,
+                                                   cbm_transition_error_t *native_error) {
+    *out = 0;
+    struct kinfo_proc kp;
+    memset(&kp, 0, sizeof(kp));
+    size_t len = sizeof(kp);
+    int mib[4] = {CTL_KERN, KERN_PROC, KERN_PROC_PID, (int)getpid()};
+    errno = 0;
+    if (sysctl(mib, 4, &kp, &len, NULL, 0) != 0 || len == 0) {
+        *native_error = (cbm_transition_error_t)errno;
+        return false;
+    }
+    /* 11644473600 = seconds between 1601-01-01 and 1970-01-01. */
+    uint64_t secs = (uint64_t)kp.kp_proc.p_starttime.tv_sec;
+    uint64_t usec = (uint64_t)kp.kp_proc.p_starttime.tv_usec;
+    *out = (secs + 11644473600ULL) * 10000000ULL + usec * 10ULL;
+    *native_error = CBM_TRANSITION_OK;
+    return true;
+}
+#endif
 
 static cbm_project_transition_state_t probe_project_transition(const char *project,
-                                                               DWORD *native_error) {
+                                                               cbm_transition_error_t *native_error) {
     if (native_error) {
-        *native_error = ERROR_SUCCESS;
+        *native_error = CBM_TRANSITION_OK;
     }
     if (!project || !cbm_validate_project_name(project)) {
         if (native_error) {
-            *native_error = ERROR_INVALID_PARAMETER;
+            *native_error = CBM_TRANSITION_E_INVAL;
         }
         return CBM_PROJECT_TRANSITION_PROBE_FAILED;
     }
@@ -1410,8 +1743,21 @@ static cbm_project_transition_state_t probe_project_transition(const char *proje
     CloseHandle(mutex);
     return CBM_PROJECT_TRANSITION_PROBE_FAILED;
 #else
+    bool busy = false;
+    cbm_transition_error_t probe_error = CBM_TRANSITION_OK;
+    int fd = project_transition_try_lock(project, &busy, &probe_error);
+    if (fd >= 0) {
+        /* Taking it proves nobody else holds it; drop it immediately so the
+         * probe stays non-mutating. */
+        flock(fd, LOCK_UN);
+        close(fd);
+        return CBM_PROJECT_TRANSITION_INACTIVE;
+    }
+    if (busy) {
+        return CBM_PROJECT_TRANSITION_ACTIVE;
+    }
     if (native_error) {
-        *native_error = ERROR_NOT_SUPPORTED;
+        *native_error = probe_error;
     }
     return CBM_PROJECT_TRANSITION_PROBE_FAILED;
 #endif
@@ -1425,7 +1771,7 @@ cbm_project_transition_t *cbm_project_transition_acquire(const char *project,
         *recovered_abandoned_owner = false;
     }
     if (native_error) {
-        *native_error = ERROR_SUCCESS;
+        *native_error = CBM_TRANSITION_OK;
     }
     if (owner_process_start_utc_ticks) {
         *owner_process_start_utc_ticks = 0;
@@ -1480,10 +1826,55 @@ cbm_project_transition_t *cbm_project_transition_acquire(const char *project,
         *recovered_abandoned_owner = wait == WAIT_ABANDONED;
     }
     return transition;
+#elif defined(__APPLE__)
+    if (!owner_process_start_utc_ticks) {
+        if (native_error) {
+            *native_error = CBM_TRANSITION_E_INVAL;
+        }
+        return NULL;
+    }
+    cbm_transition_error_t start_error = CBM_TRANSITION_OK;
+    if (!project_transition_process_start_ticks(owner_process_start_utc_ticks, &start_error)) {
+        if (native_error) {
+            *native_error = start_error;
+        }
+        return NULL;
+    }
+    if (!project || !cbm_validate_project_name(project)) {
+        if (native_error) {
+            *native_error = CBM_TRANSITION_E_INVAL;
+        }
+        return NULL;
+    }
+    cbm_project_transition_t *transition = calloc(CBM_ALLOC_ONE, sizeof(*transition));
+    if (!transition) {
+        if (native_error) {
+            *native_error = CBM_TRANSITION_E_NOMEM;
+        }
+        return NULL;
+    }
+    bool busy = false;
+    cbm_transition_error_t lock_error = CBM_TRANSITION_OK;
+    transition->lock_fd = project_transition_try_lock(project, &busy, &lock_error);
+    if (transition->lock_fd < 0) {
+        if (native_error) {
+            *native_error = lock_error;
+        }
+        free(transition);
+        return NULL;
+    }
+    snprintf(transition->project, sizeof(transition->project), "%s", project);
+    /* A crashed owner's flock is reclaimed by the kernel, so an abandoned lock
+     * is indistinguishable from a free one here. Never assert recovery we did
+     * not actually observe. */
+    if (recovered_abandoned_owner) {
+        *recovered_abandoned_owner = false;
+    }
+    return transition;
 #else
     (void)project;
     if (native_error) {
-        *native_error = ERROR_NOT_SUPPORTED;
+        *native_error = CBM_TRANSITION_E_NOTSUP;
     }
     return NULL;
 #endif
@@ -1521,9 +1912,10 @@ int cbm_project_transition_wait_store_quiescent(
     if (result) {
         memset(result, 0, sizeof(*result));
     }
-    if (!transition || !transition->mutex || !db_path || !db_path[0] || poll_ms == 0 || !result) {
+    if (!project_transition_is_held(transition) || !db_path || !db_path[0] || poll_ms == 0 ||
+        !result) {
         if (result) {
-            result->native_error = ERROR_INVALID_PARAMETER;
+            result->native_error = CBM_TRANSITION_E_INVAL;
         }
         return -1;
     }
@@ -1577,29 +1969,102 @@ int cbm_project_transition_wait_store_quiescent(
         result->failed_path[0] = '\0';
     }
 #else
-    (void)db_path;
-    (void)timeout_ms;
-    (void)poll_ms;
-    result->native_error = ERROR_NOT_SUPPORTED;
-    return -1;
+    /* Windows proves quiescence with mandatory sharing: opening the db/wal/shm
+     * family with dwShareMode 0 fails while any other process holds them.
+     * POSIX has no mandatory locking, so that exact mechanism is unavailable —
+     * but the property being proven is "no other process is using this store",
+     * and on POSIX the authoritative statement about that is SQLite's own
+     * locking protocol, which every writer of this store necessarily honours.
+     *
+     * Acquiring BEGIN EXCLUSIVE succeeds only when no other connection holds a
+     * SHARED, RESERVED, or PENDING lock, and it covers the WAL and shm members
+     * as one unit because SQLite owns them. The probe rolls back immediately,
+     * so it observes without mutating. This is evidence of the same property,
+     * gathered through the mechanism that actually governs it here — not a
+     * weaker approximation of the Windows check (#895/#896). */
+    uint64_t started = cbm_now_ms();
+    for (;;) {
+        result->attempts++;
+
+        /* A store that does not exist yet cannot be held by anyone. The Windows
+         * path reaches the same conclusion via ERROR_FILE_NOT_FOUND. */
+        if (!cbm_path_exists(db_path)) {
+            result->elapsed_ms = cbm_now_ms() - started;
+            result->native_error = CBM_TRANSITION_OK;
+            return 0;
+        }
+
+        sqlite3 *probe = NULL;
+        int rc = sqlite3_open_v2(db_path, &probe, SQLITE_OPEN_READWRITE, NULL);
+        if (rc != SQLITE_OK) {
+            snprintf(result->failed_path, sizeof(result->failed_path), "%s", db_path);
+            result->native_error = (uint32_t)rc;
+            if (probe) {
+                sqlite3_close(probe);
+            }
+            return -1;
+        }
+        /* Never let SQLite sleep internally: this loop owns the retry cadence
+         * and the caller's timeout budget. */
+        sqlite3_busy_timeout(probe, 0);
+        rc = sqlite3_exec(probe, "BEGIN EXCLUSIVE", NULL, NULL, NULL);
+        if (rc == SQLITE_OK) {
+            int rollback = sqlite3_exec(probe, "ROLLBACK", NULL, NULL, NULL);
+            sqlite3_close(probe);
+            result->elapsed_ms = cbm_now_ms() - started;
+            if (rollback != SQLITE_OK) {
+                snprintf(result->failed_path, sizeof(result->failed_path), "%s", db_path);
+                result->native_error = (uint32_t)rollback;
+                return -1;
+            }
+            result->native_error = CBM_TRANSITION_OK;
+            return 0;
+        }
+        sqlite3_close(probe);
+
+        if (rc != SQLITE_BUSY && rc != SQLITE_LOCKED) {
+            snprintf(result->failed_path, sizeof(result->failed_path), "%s", db_path);
+            result->native_error = (uint32_t)rc;
+            return -1;
+        }
+
+        /* Contended: another process holds the store. */
+        snprintf(result->failed_path, sizeof(result->failed_path), "%s", db_path);
+        result->native_error = (uint32_t)rc;
+        result->elapsed_ms = cbm_now_ms() - started;
+        if (result->elapsed_ms >= timeout_ms) {
+            return 1;
+        }
+        cbm_usleep((unsigned long long)poll_ms * 1000ULL);
+        result->native_error = CBM_TRANSITION_OK;
+        result->failed_path[0] = '\0';
+    }
 #endif
 }
 
 int cbm_project_transition_release(cbm_project_transition_t *transition,
                                    unsigned long *native_error) {
     if (native_error) {
-        *native_error = ERROR_SUCCESS;
+        *native_error = CBM_TRANSITION_OK;
     }
-    if (!transition || !transition->mutex) {
+    if (!project_transition_is_held(transition)) {
         if (native_error) {
-            *native_error = ERROR_INVALID_PARAMETER;
+            *native_error = CBM_TRANSITION_E_INVAL;
         }
         return -1;
     }
+#if defined(_WIN32)
     bool released = ReleaseMutex(transition->mutex) != 0;
-    DWORD error = released ? ERROR_SUCCESS : GetLastError();
+    cbm_transition_error_t error = released ? CBM_TRANSITION_OK : (cbm_transition_error_t)GetLastError();
     CloseHandle(transition->mutex);
     transition->mutex = NULL;
+#else
+    errno = 0;
+    bool released = flock(transition->lock_fd, LOCK_UN) == 0;
+    cbm_transition_error_t error = released ? CBM_TRANSITION_OK : (cbm_transition_error_t)errno;
+    close(transition->lock_fd);
+    transition->lock_fd = -1;
+#endif
     free(transition);
     if (!released) {
         if (native_error) {
@@ -1612,7 +2077,7 @@ int cbm_project_transition_release(cbm_project_transition_t *transition,
 
 static void record_project_transition_state(cbm_mcp_server_t *srv, const char *project,
                                             cbm_project_transition_state_t state,
-                                            DWORD native_error) {
+                                            cbm_transition_error_t native_error) {
     snprintf(srv->transition_error_project, sizeof(srv->transition_error_project), "%s",
              project ? project : "");
     srv->transition_native_error = native_error;
@@ -1625,7 +2090,7 @@ static void record_project_transition_state(cbm_mcp_server_t *srv, const char *p
 }
 
 static bool project_transition_admits_process(cbm_mcp_server_t *srv, const char *project) {
-    DWORD native_error = ERROR_SUCCESS;
+    cbm_transition_error_t native_error = CBM_TRANSITION_OK;
     cbm_project_transition_state_t state = probe_project_transition(project, &native_error);
     bool writer_granted = cbm_index_transition_writer_matches(project);
     if ((!writer_granted && state == CBM_PROJECT_TRANSITION_INACTIVE) ||
@@ -1766,7 +2231,7 @@ int cbm_mcp_server_quiesce_project_transition(cbm_mcp_server_t *srv) {
     }
     char project[CBM_SZ_256];
     snprintf(project, sizeof(project), "%s", srv->current_project);
-    DWORD native_error = ERROR_SUCCESS;
+    cbm_transition_error_t native_error = CBM_TRANSITION_OK;
     cbm_project_transition_state_t state = probe_project_transition(project, &native_error);
     if (state == CBM_PROJECT_TRANSITION_INACTIVE) {
         return 0;
@@ -1865,7 +2330,7 @@ static void reset_store_error_state(cbm_mcp_server_t *srv) {
     clear_store_identity_error_state(srv);
     srv->transition_error_code[0] = '\0';
     srv->transition_error_project[0] = '\0';
-    srv->transition_native_error = ERROR_SUCCESS;
+    srv->transition_native_error = CBM_TRANSITION_OK;
 }
 
 static bool store_error_is_provenance(const cbm_store_verify_result_t *verification) {
@@ -6545,10 +7010,14 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
         return result;
     }
 
-#ifdef _WIN32
     cbm_index_admission_t admission = {0};
     char *admission_error = acquire_index_admission(project_name, repo_path, &admission);
-    if (admission_error || !admission.project_mutex || !admission.host_mutex) {
+#if defined(_WIN32)
+    bool admission_held = admission.project_mutex && admission.host_mutex;
+#else
+    bool admission_held = admission.project_fd >= 0 && admission.host_fd >= 0;
+#endif
+    if (admission_error || !admission_held) {
         cbm_pipeline_free(p);
         free(project_name);
         free(repo_path);
@@ -6562,15 +7031,6 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
         free(admission_error);
         return result;
     }
-#else
-    cbm_pipeline_free(p);
-    free(project_name);
-    free(repo_path);
-    return cbm_mcp_text_result(
-        "CBM_INDEX_HOST_ADMISSION_UNSUPPORTED: this build cannot provide the required "
-        "cross-process project isolation and host-wide indexing admission",
-        true);
-#endif
 
     /* Bootstrap from artifact if no local DB exists */
     try_artifact_bootstrap(project_name, repo_path);
@@ -6684,13 +7144,12 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
         }
     }
 
-#ifdef _WIN32
     if (!release_index_admission(&admission, project_name, repo_path)) {
         char *release_error = heap_strdup(
             "{\"status\":\"error\",\"code\":\"CBM_INDEX_ADMISSION_RELEASE_FAILED\","
             "\"operation\":\"release_index_admission\",\"message\":\"the completed indexing "
             "generation could not release its exact project or host ownership\","
-            "\"remediation\":\"inspect the preceding structured Windows diagnostic and the "
+            "\"remediation\":\"inspect the preceding structured host diagnostic and the "
             "published project database before retrying\"}");
         if (!postcondition_error && release_error) {
             postcondition_error = release_error;
@@ -6699,7 +7158,6 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
         }
         rc = CBM_NOT_FOUND;
     }
-#endif
 
     bool response_is_error = rc != 0 || postcondition_error != NULL;
     char *json = postcondition_error ? postcondition_error : yy_doc_to_str(doc);
@@ -8961,6 +9419,10 @@ static bool validate_search_scope_identity(const char *project, const cbm_file_h
     return true;
 }
 
+/* Only the Windows branch of validate_scoped_source_file() reads scoped source
+ * bytes; every other host fails that verification closed before reaching this
+ * helper, so it is compiled only where it is actually called (#895). */
+#ifdef _WIN32
 static bool validate_search_scope_utf8(const uint8_t *bytes, size_t len, size_t *bad_offset,
                                        bool *embedded_nul) {
     *bad_offset = 0;
@@ -8993,6 +9455,7 @@ static bool validate_search_scope_utf8(const uint8_t *bytes, size_t len, size_t 
     }
     return true;
 }
+#endif /* _WIN32 — validate_search_scope_utf8 */
 
 static bool validate_scoped_source_file(const char *root_path, const char *absolute_path,
                                         const cbm_file_hash_t *indexed,

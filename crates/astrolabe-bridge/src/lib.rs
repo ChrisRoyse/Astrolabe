@@ -7,7 +7,7 @@ use std::fmt;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::marker::PhantomData;
-use std::os::raw::{c_char, c_int, c_void};
+use std::os::raw::{c_char, c_int, c_ulong, c_void};
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
 use std::ptr::{self, NonNull};
@@ -578,9 +578,14 @@ fn initialize_cbm_host_process_with_log_mode(
                 // Explicit profiling requests native INFO diagnostics, so it
                 // keeps the level selected by cbm_log_init_from_env.
                 if !profile_active {
-                    let floor =
-                        c_int::try_from(astrolabe_domain::knobs::cli_stderr_log_level_floor())
-                            .unwrap_or(cbm_sys::CBMLogLevel_CBM_LOG_WARN);
+                    // CBMLogLevel is the bindgen alias for the C enum's underlying
+                    // type, which MSVC makes signed and clang makes unsigned.
+                    // Converting through the alias keeps this correct on both
+                    // rather than pinning one host's spelling (#895).
+                    let floor = cbm_sys::CBMLogLevel::try_from(
+                        astrolabe_domain::knobs::cli_stderr_log_level_floor(),
+                    )
+                    .unwrap_or(cbm_sys::CBMLogLevel_CBM_LOG_WARN);
                     cbm_sys::cbm_log_set_level(floor);
                 }
             }
@@ -713,21 +718,102 @@ pub fn parent_process_id() -> Option<u32> {
     None
 }
 
-#[cfg(not(windows))]
+/// Exact creation instant of `pid` on Darwin (#895).
+///
+/// Windows derives process identity from `GetProcessTimes` creation FILETIME.
+/// Darwin exposes the same fact through `proc_pidinfo(PROC_PIDTBSDINFO)`, whose
+/// `pbi_start_tvsec`/`pbi_start_tvusec` are the process's start instant. It is
+/// reported here on the identical 100ns-since-1601 basis so one owner-identity
+/// representation crosses both hosts and persisted values stay comparable.
+///
+/// This is a real measurement of the same property, not a stand-in: a PID plus
+/// its exact start instant distinguishes a live owner from a reused PID exactly
+/// as it does on Windows.
+#[cfg(target_os = "macos")]
+pub fn process_start_utc_ticks(pid: u32) -> Result<u64, String> {
+    // Seconds between 1601-01-01 and 1970-01-01.
+    const UNIX_TO_FILETIME_SECONDS: u64 = 11_644_473_600;
+
+    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+    // SAFETY: `info` is a correctly sized writable POD for PROC_PIDTBSDINFO.
+    let written = unsafe {
+        libc::proc_pidinfo(
+            pid as libc::c_int,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            (&raw mut info).cast::<libc::c_void>(),
+            size,
+        )
+    };
+    if written <= 0 {
+        let error = std::io::Error::last_os_error();
+        // ESRCH means the generation is simply gone, which callers treat as
+        // absence rather than as a failed probe.
+        if error.raw_os_error() == Some(libc::ESRCH) {
+            return Err(format!(
+                "ASTRO_PROCESS_GENERATION_ABSENT: no process generation exists for pid {pid}"
+            ));
+        }
+        return Err(format!(
+            "ASTRO_PROCESS_GENERATION_QUERY_FAILED: proc_pidinfo(PROC_PIDTBSDINFO, {pid}) failed: {error}"
+        ));
+    }
+    if written < size {
+        return Err(format!(
+            "ASTRO_PROCESS_GENERATION_QUERY_FAILED: proc_pidinfo(PROC_PIDTBSDINFO, {pid}) returned \
+             {written} bytes, expected {size}"
+        ));
+    }
+    Ok((info.pbi_start_tvsec + UNIX_TO_FILETIME_SECONDS) * 10_000_000
+        + info.pbi_start_tvusec * 10)
+}
+
+/// Classify `pid` against a persisted creation instant on Darwin (#895).
+///
+/// `Absent` when no such process exists, `Matching` when the live process was
+/// created at exactly the recorded instant, `Reused` when a different
+/// generation now occupies the PID. A query that fails for any other reason is
+/// an error, never silently treated as absence — absence authorises cleanup,
+/// so it must be proven rather than assumed.
+#[cfg(target_os = "macos")]
+pub fn process_generation_state(
+    pid: u32,
+    expected_start_utc_ticks: u64,
+) -> Result<ProcessGenerationState, String> {
+    match process_start_utc_ticks(pid) {
+        Ok(actual) if actual == expected_start_utc_ticks => Ok(ProcessGenerationState::Matching),
+        Ok(actual) => Ok(ProcessGenerationState::Reused {
+            actual_start_utc_ticks: actual,
+        }),
+        Err(error) => {
+            // ESRCH, and the empty-record case, both mean the generation is gone.
+            if error.starts_with("ASTRO_PROCESS_GENERATION_ABSENT")
+                || error.contains("No such process")
+            {
+                Ok(ProcessGenerationState::Absent)
+            } else {
+                Err(error)
+            }
+        }
+    }
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
 pub fn process_start_utc_ticks(_pid: u32) -> Result<u64, String> {
     Err(
-        "ASTRO_PROCESS_GENERATION_UNSUPPORTED: exact process creation ticks require Windows"
+        "ASTRO_PROCESS_GENERATION_UNSUPPORTED: exact process creation ticks are not implemented for this target"
             .to_string(),
     )
 }
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "macos")))]
 pub fn process_generation_state(
     _pid: u32,
     _expected_start_utc_ticks: u64,
 ) -> Result<ProcessGenerationState, String> {
     Err(
-        "ASTRO_PROCESS_GENERATION_UNSUPPORTED: exact process-generation probes require Windows"
+        "ASTRO_PROCESS_GENERATION_UNSUPPORTED: exact process-generation probes are not implemented for this target"
             .to_string(),
     )
 }
@@ -3184,8 +3270,11 @@ impl CbmProjectTransition {
             cbm_sys::cbm_project_transition_wait_store_quiescent(
                 self.ptr.expect("live project transition").as_ptr(),
                 db_path.as_ptr(),
-                timeout_ms,
-                poll_ms,
+                // The C parameter is `unsigned long`: 32-bit on Windows (LLP64)
+                // and 64-bit on Unix (LP64). Widening through c_ulong is exact
+                // from u32 on both rather than assuming one host's width (#895).
+                c_ulong::from(timeout_ms),
+                c_ulong::from(poll_ms),
                 &mut report,
             )
         };

@@ -4,6 +4,7 @@
 #include "lang_specs.h"      // CBMLangSpec, CBMEmbeddedLangSpec, cbm_lang_spec, cbm_ts_language
 #include "tree_sitter/api.h" // TSNode, ts_node_*
 #include "foundation/constants.h"
+#include "foundation/compat.h" /* cbm_strnicmp — host-neutral case-insensitive compare (#895) */
 #include "extract_node_stack.h"
 #include <stdint.h> // uint32_t
 #include <string.h>
@@ -2056,7 +2057,7 @@ static char *ps_exact_dot_source_path(CBMExtractCtx *ctx, TSNode command) {
             p++;
         }
         static const char join_prefix[] = "Join-Path";
-        if (_strnicmp(p, join_prefix, sizeof(join_prefix) - SKIP_ONE) != 0) {
+        if (cbm_strnicmp(p, join_prefix, sizeof(join_prefix) - SKIP_ONE) != 0) {
             return NULL;
         }
         p += sizeof(join_prefix) - SKIP_ONE;
@@ -2064,7 +2065,7 @@ static char *ps_exact_dot_source_path(CBMExtractCtx *ctx, TSNode command) {
             p++;
         }
         static const char root_name[] = "$PSScriptRoot";
-        if (_strnicmp(p, root_name, sizeof(root_name) - SKIP_ONE) != 0) {
+        if (cbm_strnicmp(p, root_name, sizeof(root_name) - SKIP_ONE) != 0) {
             return NULL;
         }
         p += sizeof(root_name) - SKIP_ONE;
@@ -2106,7 +2107,7 @@ static char *ps_exact_dot_source_path(CBMExtractCtx *ctx, TSNode command) {
             return NULL;
         }
         value = cbm_arena_sprintf(ctx->arena, "./%s", value);
-    } else if (_strnicmp(value, root_prefix, sizeof(root_prefix) - SKIP_ONE) == 0) {
+    } else if (cbm_strnicmp(value, root_prefix, sizeof(root_prefix) - SKIP_ONE) == 0) {
         const char *suffix = value + sizeof(root_prefix) - SKIP_ONE;
         if ((*suffix != '/' && *suffix != '\\') || strchr(suffix + SKIP_ONE, '$')) {
             return NULL;

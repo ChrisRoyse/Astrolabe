@@ -20,8 +20,10 @@
 #include <stdatomic.h>
 #include <string.h>
 #include <time.h>
+#ifdef _WIN32
 #include <windows.h>
 #include <psapi.h>
+#endif
 
 /* ── Shared pipeline constants ─────────────────────────────────── */
 
@@ -88,13 +90,38 @@ void cbm_pipeline_record_fatal_error(cbm_pipeline_t *p, const char *code, const 
                                      const char *phase, const char *path, size_t requested,
                                      const char *message, const char *remediation);
 
+/* Host-neutral per-process accounting counters (#895).
+ *
+ * These mirror the exact quantities the phase probe consumes, so phase metrics
+ * carry identical meaning on every host. Each platform fills them from its own
+ * authoritative process-accounting source and never from an estimate:
+ *   - Windows: GetProcessIoCounters + GetProcessMemoryInfo
+ *              (IO_COUNTERS transfer counts, PROCESS_MEMORY_COUNTERS_EX)
+ *   - Darwin:  proc_pid_rusage(RUSAGE_INFO_V4)
+ *              (ri_diskio_bytes*, ri_resident_size, ri_phys_footprint)
+ * A quantity the host cannot report authoritatively is left zero and the
+ * corresponding *_valid flag is cleared, so the run is marked metrics-incomplete
+ * rather than reporting a fabricated number. */
+typedef struct {
+    uint64_t read_bytes;
+    uint64_t write_bytes;
+    uint64_t other_bytes;
+} cbm_proc_io_counters_t;
+
+typedef struct {
+    uint64_t working_set_bytes;
+    uint64_t peak_working_set_bytes;
+    uint64_t private_bytes;
+    uint64_t peak_private_bytes;
+} cbm_proc_memory_counters_t;
+
 /* Allocation-free native worker phase probe shared by the full and incremental
  * pipelines. Completion appends one retained metric to the owning pipeline and
  * marks the run incomplete on any process-accounting or representation failure. */
 typedef struct {
     struct timespec started;
-    IO_COUNTERS io;
-    PROCESS_MEMORY_COUNTERS_EX memory;
+    cbm_proc_io_counters_t io;
+    cbm_proc_memory_counters_t memory;
     bool io_valid;
     bool memory_valid;
 } cbm_pipeline_phase_probe_t;

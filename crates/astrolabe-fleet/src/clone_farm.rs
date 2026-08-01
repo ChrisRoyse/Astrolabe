@@ -716,6 +716,7 @@ fn run_git(
         .stdout(Stdio::null())
         .stderr(stderr);
     silence_credential_prompts(&mut command);
+    contain_child(&mut command);
     if let Some(cwd) = cwd {
         command.current_dir(cwd);
     }
@@ -784,8 +785,116 @@ fn run_git(
 /// hard-killed farm left an orphaned `git.exe` writing into a torn clone dir,
 /// racing the next pass's recovery. Guarding is fail-closed — a git that
 /// cannot be tied to the job is killed rather than left to run unguarded.
+#[cfg(windows)]
 pub(crate) struct JobGuard(windows_sys::Win32::Foundation::HANDLE);
 
+/// Prepare `command` so its child can be contained as a unit.
+///
+/// Windows containment is established after spawn via a Job Object, so nothing
+/// is needed here. Unix has no Job Object: containment is a process group, and
+/// the group must be established by the child itself between fork and exec —
+/// doing it from the parent after `spawn()` races the exec and fails `EACCES`
+/// once the child has already exec'd (#895).
+#[cfg(unix)]
+pub(crate) fn contain_child(command: &mut Command) {
+    use std::os::unix::process::CommandExt;
+    // SAFETY: the closure runs in the forked child before exec and calls only
+    // setpgid, which is async-signal-safe.
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setpgid(0, 0) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+}
+
+#[cfg(windows)]
+pub(crate) fn contain_child(_command: &mut Command) {}
+
+/// Unix counterpart of the Windows Job Object guard: the child leads its own
+/// process group (established by [`contain_child`]), so the whole tree — git and
+/// the helpers it spawns — is signalled as a unit when the guard drops.
+///
+/// One honest difference from the Windows behaviour this mirrors: a Job Object
+/// with `KILL_ON_JOB_CLOSE` also kills the child when the *parent* dies for any
+/// reason, including SIGKILL. Unix has no portable equivalent — Linux has
+/// `PR_SET_PDEATHSIG`, macOS has nothing — so a hard-killed farm process can
+/// still orphan its git child here. Drop, normal exit, and panic are all
+/// covered; a SIGKILL of the farm itself is not. Tracked separately rather than
+/// papered over.
+#[cfg(unix)]
+pub(crate) struct JobGuard(libc::pid_t);
+
+#[cfg(unix)]
+impl JobGuard {
+    pub(crate) fn assign(child: &std::process::Child) -> Result<Self, String> {
+        let pid = child.id() as libc::pid_t;
+        // SAFETY: plain pgid queries on a live child and on this process.
+        let (pgid, own) = unsafe { (libc::getpgid(pid), libc::getpgid(0)) };
+        if pgid < 0 {
+            return Err(format!("getpgid failed: {}", std::io::Error::last_os_error()));
+        }
+        // Fail closed exactly as the Windows path does: if the child is not the
+        // leader of its own group, signalling that group would hit this process
+        // tree instead, so the caller must kill the child rather than run it
+        // unguarded.
+        if pgid == own || pgid != pid {
+            return Err(format!(
+                "child {pid} was not placed in its own process group (pgid {pgid}, farm pgid {own})"
+            ));
+        }
+        Ok(Self(pgid))
+    }
+}
+
+#[cfg(unix)]
+impl Drop for JobGuard {
+    fn drop(&mut self) {
+        // SAFETY: the guard owns this process group; the negative pid addresses
+        // the whole group, which contains only the child and its descendants.
+        unsafe {
+            libc::kill(-self.0, libc::SIGKILL);
+        }
+    }
+}
+
+/// Current resident working-set bytes of a LIVE child (#515, #895).
+///
+/// Darwin reports another process's footprint through `proc_pid_rusage`, the
+/// same authoritative source used elsewhere in the port. `None` on failure —
+/// labeled degradation in the caller, never a fabricated number.
+#[cfg(target_os = "macos")]
+pub(crate) fn child_working_set_bytes(child: &std::process::Child) -> Option<u64> {
+    let mut info: libc::rusage_info_v4 = unsafe { std::mem::zeroed() };
+    // SAFETY: `info` is a correctly sized writable POD matching the flavor.
+    let rc = unsafe {
+        libc::proc_pid_rusage(
+            child.id() as libc::c_int,
+            libc::RUSAGE_INFO_V4,
+            (&raw mut info).cast::<libc::rusage_info_t>(),
+        )
+    };
+    if rc != 0 {
+        return None;
+    }
+    Some(info.ri_resident_size)
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+pub(crate) fn child_working_set_bytes(child: &std::process::Child) -> Option<u64> {
+    // /proc/<pid>/statm field 2 is resident pages.
+    let statm = std::fs::read_to_string(format!("/proc/{}/statm", child.id())).ok()?;
+    let pages: u64 = statm.split_whitespace().nth(1)?.parse().ok()?;
+    let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    if page_size <= 0 {
+        return None;
+    }
+    Some(pages.saturating_mul(page_size as u64))
+}
+
+#[cfg(windows)]
 impl JobGuard {
     pub(crate) fn assign(child: &std::process::Child) -> Result<Self, String> {
         use std::os::windows::io::AsRawHandle;
@@ -833,6 +942,7 @@ impl JobGuard {
 /// that captured peak then survives the child's death for the structured
 /// child-without-a-tool-result failure detail (the rc=127 case this issue tracks).
 /// `None` when the query fails (labeled degradation in the caller, never fabricated).
+#[cfg(windows)]
 pub(crate) fn child_working_set_bytes(child: &std::process::Child) -> Option<u64> {
     use std::os::windows::io::AsRawHandle;
     use windows_sys::Win32::System::ProcessStatus::{
@@ -854,6 +964,7 @@ pub(crate) fn child_working_set_bytes(child: &std::process::Child) -> Option<u64
     }
 }
 
+#[cfg(windows)]
 impl Drop for JobGuard {
     fn drop(&mut self) {
         // SAFETY: the guard exclusively owns the job handle.
@@ -887,6 +998,7 @@ pub(crate) fn git_capture(args: &[&str], cwd: &Path) -> Result<(bool, String, St
         .current_dir(cwd)
         .args(args);
     silence_credential_prompts(&mut command);
+    contain_child(&mut command);
     let output = command.output().map_err(|error| CalyxError {
         code: ASTRO_FLEET_GIT_SPAWN,
         message: format!("failed to spawn git {}: {error}", args.join(" ")),
@@ -910,6 +1022,7 @@ fn git_capture_raw(args: &[&str], cwd: &Path) -> Result<(bool, Vec<u8>, String),
         .current_dir(cwd)
         .args(args);
     silence_credential_prompts(&mut command);
+    contain_child(&mut command);
     let output = command.output().map_err(|error| CalyxError {
         code: ASTRO_FLEET_GIT_SPAWN,
         message: format!("failed to spawn git {}: {error}", args.join(" ")),
@@ -942,6 +1055,7 @@ fn run_git_feed(args: &[&str], cwd: &Path, input: &[u8]) -> Result<(bool, String
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
     silence_credential_prompts(&mut command);
+    contain_child(&mut command);
     let mut child = command
         .spawn()
         .map_err(|error| spawn_err(error.to_string()))?;

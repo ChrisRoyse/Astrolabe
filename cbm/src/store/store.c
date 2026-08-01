@@ -76,6 +76,62 @@ enum {
 #include <sqlite3.h>
 #include <errno.h>
 #include <limits.h>
+
+/* Host-neutral native-error code for argument validation that fails before any
+ * host call is made (#895). `cbm_store_verify_result_t::native_error` carries a
+ * code in the host's own error domain; on Windows that stays the exact Win32
+ * value the verify vocabulary already used, and elsewhere it is the errno
+ * equivalent — never a Win32 number the host could not have produced. */
+#if defined(_WIN32)
+#define CBM_STORE_NATIVE_OK ((uint32_t)ERROR_SUCCESS)
+#define CBM_STORE_NATIVE_EINVAL ((uint32_t)ERROR_INVALID_PARAMETER)
+#define CBM_STORE_NATIVE_ENOMEM ((uint32_t)ERROR_NOT_ENOUGH_MEMORY)
+#define CBM_STORE_NATIVE_EOVERFLOW ((uint32_t)ERROR_BUFFER_OVERFLOW)
+#define CBM_STORE_NATIVE_EAGAIN ((uint32_t)ERROR_BUSY)
+#else
+#define CBM_STORE_NATIVE_OK ((uint32_t)0)
+#define CBM_STORE_NATIVE_EINVAL ((uint32_t)EINVAL)
+#define CBM_STORE_NATIVE_ENOMEM ((uint32_t)ENOMEM)
+#define CBM_STORE_NATIVE_EOVERFLOW ((uint32_t)EOVERFLOW)
+#define CBM_STORE_NATIVE_EAGAIN ((uint32_t)EAGAIN)
+
+#include <sys/stat.h>
+
+/* Family member path (`<db>-wal`, `<db>-shm`) for the POSIX verification path. */
+static char *store_member_path_posix(const char *db_path, const char *suffix) {
+    size_t base = strlen(db_path);
+    size_t tail = strlen(suffix);
+    if (base > SIZE_MAX - tail - 1u) {
+        return NULL;
+    }
+    char *out = malloc(base + tail + 1u);
+    if (!out) {
+        return NULL;
+    }
+    memcpy(out, db_path, base);
+    memcpy(out + base, suffix, tail + 1u);
+    return out;
+}
+
+/* Exact identity of a family member. Any in-place rewrite changes at least one
+ * of these, which is what makes the before/after comparison evidence. */
+static bool store_stat_identity_equal(const struct stat *a, const struct stat *b) {
+#if defined(__APPLE__)
+    const struct timespec a_m = a->st_mtimespec;
+    const struct timespec b_m = b->st_mtimespec;
+    const struct timespec a_c = a->st_ctimespec;
+    const struct timespec b_c = b->st_ctimespec;
+#else
+    const struct timespec a_m = a->st_mtim;
+    const struct timespec b_m = b->st_mtim;
+    const struct timespec a_c = a->st_ctim;
+    const struct timespec b_c = b->st_ctim;
+#endif
+    return a->st_dev == b->st_dev && a->st_ino == b->st_ino && a->st_size == b->st_size &&
+           a_m.tv_sec == b_m.tv_sec && a_m.tv_nsec == b_m.tv_nsec && a_c.tv_sec == b_c.tv_sec &&
+           a_c.tv_nsec == b_c.tv_nsec;
+}
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -2599,35 +2655,186 @@ static cbm_store_verify_status_t store_open_path_verified(const char *db_path,
     store_verify_result_init(result);
     if (!out_store) {
         store_verify_set_error(result, CBM_STORE_VERIFY_IO_FAILED, "source.validate_output",
-                               ERROR_INVALID_PARAMETER, SQLITE_MISUSE,
+                               CBM_STORE_NATIVE_EINVAL, SQLITE_MISUSE,
                                "verified store output pointer is required");
         return result->status;
     }
     if (!db_path || db_path[0] == '\0') {
         store_verify_set_error(result, CBM_STORE_VERIFY_IO_FAILED, "source.validate_path",
-                               ERROR_INVALID_PARAMETER, SQLITE_MISUSE,
+                               CBM_STORE_NATIVE_EINVAL, SQLITE_MISUSE,
                                "database path is null or empty");
         return result->status;
     }
     if (contract != STORE_INTEGRITY_CONTRACT_QUERY &&
         contract != STORE_INTEGRITY_CONTRACT_GRAPH_RELOAD) {
         store_verify_set_error(result, CBM_STORE_VERIFY_IO_FAILED, "source.validate_contract",
-                               ERROR_INVALID_PARAMETER, SQLITE_MISUSE,
+                               CBM_STORE_NATIVE_EINVAL, SQLITE_MISUSE,
                                "unknown verified store contract");
         return result->status;
     }
     if (contract == STORE_INTEGRITY_CONTRACT_GRAPH_RELOAD &&
         (!expected_project || !cbm_validate_project_name(expected_project))) {
         store_verify_set_error(result, CBM_STORE_VERIFY_IO_FAILED, "source.validate_project",
-                               ERROR_INVALID_PARAMETER, SQLITE_MISUSE,
+                               CBM_STORE_NATIVE_EINVAL, SQLITE_MISUSE,
                                "graph reload requires a valid expected project name");
         return result->status;
     }
 
 #ifndef _WIN32
-    store_verify_set_error(result, CBM_STORE_VERIFY_IO_FAILED, "source.freeze_family", 0,
-                           SQLITE_MISUSE,
-                           "source-preserving integrity verification requires native Windows");
+    /* Source-preserving integrity verification on POSIX (#895).
+     *
+     * Windows *prevents* mutation during verification: it opens the db/wal/shm
+     * family with write-denying share modes, copies the frozen bytes to a
+     * scratch snapshot, and verifies the copy. POSIX has no mandatory locking,
+     * so that enforcement is unavailable.
+     *
+     * The property being established, though, is "the bytes verified are the
+     * bytes about to be used". POSIX establishes it by *detection* rather than
+     * prevention: capture the exact identity of every family member
+     * (device, inode, size, mtime, ctime), verify, then re-read that identity
+     * and require it unchanged. Any concurrent mutation — including one that
+     * rewrote the file in place — changes at least mtime/ctime and is caught,
+     * and the verification fails closed. Same guarantee for the caller,
+     * different mechanism, and never a weaker claim: `family_frozen_during_
+     * verification` is reported false because nothing was frozen.
+     *
+     * Verification runs against the source directly rather than a snapshot,
+     * which is what makes the before/after identity comparison meaningful — a
+     * copy could not prove anything about the original. The Windows receipt
+     * cache is a performance optimisation over the snapshot copy; with no copy
+     * to avoid there is nothing for it to short-circuit, so it is not used
+     * here and `receipt` state is left untouched rather than faked.
+     */
+    struct stat db_before;
+    struct stat wal_before;
+    struct stat shm_before;
+    char *wal_path = store_member_path_posix(db_path, "-wal");
+    char *shm_path = store_member_path_posix(db_path, "-shm");
+    if (!wal_path || !shm_path) {
+        free(wal_path);
+        free(shm_path);
+        store_verify_set_error(result, CBM_STORE_VERIFY_IO_FAILED, "source.build_family_paths",
+                               CBM_STORE_NATIVE_ENOMEM, SQLITE_NOMEM,
+                               "database family paths could not be allocated");
+        return result->status;
+    }
+
+    result->db_present = stat(db_path, &db_before) == 0;
+    result->wal_present = stat(wal_path, &wal_before) == 0;
+    result->shm_present = stat(shm_path, &shm_before) == 0;
+    result->family_frozen = false;
+    result->family_guard_release_complete = true;
+    result->scratch_created = false;
+    result->scratch_cleanup_complete = true;
+
+    if (!result->db_present) {
+        int db_errno = errno;
+        free(wal_path);
+        free(shm_path);
+        store_verify_set_error(result, CBM_STORE_VERIFY_IO_FAILED, "source.freeze_db",
+                               (uint32_t)db_errno, SQLITE_CANTOPEN,
+                               "the source database could not be inspected");
+        return result->status;
+    }
+
+    int source_sqlite_error = SQLITE_OK;
+    char source_sqlite_detail[CBM_STORE_VERIFY_DETAIL_MAX] = "";
+    cbm_store_t *opened = store_open_path_query_internal(
+        db_path, &source_sqlite_error, source_sqlite_detail, sizeof(source_sqlite_detail));
+    if (!opened) {
+        free(wal_path);
+        free(shm_path);
+        store_verify_set_error(result, CBM_STORE_VERIFY_IO_FAILED, "source.sqlite_open",
+                               CBM_STORE_NATIVE_OK, source_sqlite_error,
+                               source_sqlite_detail[0]
+                                   ? source_sqlite_detail
+                                   : "source SQLite open or first read failed");
+        return result->status;
+    }
+
+    store_integrity_result_t integrity_result;
+    store_integrity_status_t integrity_status =
+        store_check_integrity_detailed(opened, contract, expected_project, &integrity_result);
+    if (integrity_status != STORE_INTEGRITY_OK) {
+        char operation[CBM_STORE_VERIFY_OPERATION_MAX];
+        int wrote = snprintf(operation, sizeof(operation), "source.%s", integrity_result.operation);
+        cbm_store_close(opened);
+        free(wal_path);
+        free(shm_path);
+        if (wrote < 0 || (size_t)wrote >= sizeof(operation)) {
+            store_verify_set_error(result, CBM_STORE_VERIFY_IO_FAILED,
+                                   "source.integrity_operation_overflow",
+                                   CBM_STORE_NATIVE_EOVERFLOW, SQLITE_TOOBIG,
+                                   "integrity diagnostic operation exceeds verified capacity");
+            return result->status;
+        }
+        store_verify_set_error(result,
+                               integrity_status == STORE_INTEGRITY_IO_FAILED
+                                   ? CBM_STORE_VERIFY_IO_FAILED
+                                   : CBM_STORE_VERIFY_INTEGRITY_FAILED,
+                               operation, CBM_STORE_NATIVE_OK, integrity_result.sqlite_error,
+                               integrity_result.detail);
+        return result->status;
+    }
+
+    /* Independent re-read of the family identity. Anything that moved while the
+     * integrity check ran invalidates the result, so refuse rather than hand
+     * back a store verified against bytes that no longer exist. */
+    struct stat db_after;
+    struct stat wal_after;
+    struct stat shm_after;
+    bool db_after_present = stat(db_path, &db_after) == 0;
+    bool wal_after_present = stat(wal_path, &wal_after) == 0;
+    bool shm_after_present = stat(shm_path, &shm_after) == 0;
+    free(wal_path);
+    free(shm_path);
+
+    bool unchanged =
+        db_after_present && result->db_present &&
+        store_stat_identity_equal(&db_before, &db_after) &&
+        wal_after_present == result->wal_present &&
+        (!result->wal_present || store_stat_identity_equal(&wal_before, &wal_after)) &&
+        shm_after_present == result->shm_present &&
+        (!result->shm_present || store_stat_identity_equal(&shm_before, &shm_after));
+    if (!unchanged) {
+        cbm_store_close(opened);
+        store_verify_set_error(
+            result, CBM_STORE_VERIFY_IO_FAILED, "source.verify_family_unchanged",
+            CBM_STORE_NATIVE_EAGAIN, SQLITE_OK,
+            "the source database family changed while its integrity was being verified");
+        return result->status;
+    }
+
+    store_integrity_result_t provenance;
+    store_integrity_result_init(&provenance);
+    if (!store_check_project_provenance(opened, expected_project, &provenance)) {
+        char operation[CBM_STORE_VERIFY_OPERATION_MAX];
+        int wrote = snprintf(operation, sizeof(operation), "source.%s", provenance.operation);
+        cbm_store_close(opened);
+        if (wrote < 0 || (size_t)wrote >= sizeof(operation)) {
+            store_verify_set_error(result, CBM_STORE_VERIFY_IO_FAILED,
+                                   "source.project_provenance_operation_overflow",
+                                   CBM_STORE_NATIVE_EOVERFLOW, SQLITE_TOOBIG,
+                                   "live provenance diagnostic exceeds verified capacity");
+            return result->status;
+        }
+        store_verify_set_error(result,
+                               provenance.status == STORE_INTEGRITY_IO_FAILED
+                                   ? CBM_STORE_VERIFY_IO_FAILED
+                                   : CBM_STORE_VERIFY_INTEGRITY_FAILED,
+                               operation, CBM_STORE_NATIVE_OK, provenance.sqlite_error,
+                               provenance.detail);
+        return result->status;
+    }
+
+    *out_store = opened;
+    result->status = CBM_STORE_VERIFY_OK;
+    result->native_error = CBM_STORE_NATIVE_OK;
+    result->sqlite_error = SQLITE_OK;
+    snprintf(result->operation, sizeof(result->operation), "%s", "source.verified_in_place");
+    snprintf(result->detail, sizeof(result->detail), "%s",
+             "full integrity passed and the source family identity was proven unchanged across "
+             "verification");
     return result->status;
 #else
     store_frozen_family_t family;
@@ -2902,7 +3109,7 @@ cbm_store_verify_status_t cbm_store_open_path_project_query_verified(
         if (result) {
             store_verify_result_init(result);
             store_verify_set_error(result, CBM_STORE_VERIFY_IO_FAILED, "source.validate_project",
-                                   ERROR_INVALID_PARAMETER, SQLITE_MISUSE,
+                                   CBM_STORE_NATIVE_EINVAL, SQLITE_MISUSE,
                                    "project query requires a valid exact project name");
             return result->status;
         }

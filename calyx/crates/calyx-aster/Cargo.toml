@@ -33,6 +33,9 @@ zeroize.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 nix.workspace = true
+# proc_pid_rusage / getrusage — exact process accounting for the open-phase
+# diagnostics VaultProcessUsage records (#895).
+libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61.2", features = [

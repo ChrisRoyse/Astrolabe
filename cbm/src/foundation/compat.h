@@ -34,6 +34,19 @@
 #define cbm_usleep(us) usleep((useconds_t)(us))
 #endif
 
+/* ── case-insensitive compare (#895) ──────────────────────────── */
+/* MSVC spells this _strnicmp/_stricmp; POSIX spells it strncasecmp/strcasecmp.
+ * Host-neutral code must use these names so a comparison never depends on which
+ * runtime is compiling it. */
+#ifdef _WIN32
+#define cbm_strnicmp _strnicmp
+#define cbm_stricmp _stricmp
+#else
+#include <strings.h>
+#define cbm_strnicmp strncasecmp
+#define cbm_stricmp strcasecmp
+#endif
+
 /* ── strdup / strndup ─────────────────────────────────────────── */
 #ifdef _WIN32
 #define cbm_strdup _strdup

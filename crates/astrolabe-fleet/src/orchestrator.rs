@@ -75,7 +75,7 @@ use serde_json::{Value, json};
 
 use crate::catalog::FleetCatalog;
 use crate::clone_farm::{
-    JobGuard, Selection, child_working_set_bytes, git_capture, safe_reason,
+    JobGuard, Selection, child_working_set_bytes, contain_child, git_capture, safe_reason,
     silence_credential_prompts,
 };
 use crate::record::{FleetRepoRow, TransitionContext};
@@ -1164,6 +1164,7 @@ fn pipeline_job(
         .stdout(stdout_file)
         .stderr(stderr_file);
     silence_credential_prompts(&mut command);
+    contain_child(&mut command);
     let mut child = match command.spawn() {
         Ok(child) => child,
         Err(error) => {
