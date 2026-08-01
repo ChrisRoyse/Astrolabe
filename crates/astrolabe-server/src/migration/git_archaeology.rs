@@ -1269,6 +1269,12 @@ pub(crate) fn preflight_git_archaeology_scratch(
 /// never a silent indefinite block).
 const ARCHAEOLOGY_EXTRACT_TIMEOUT: Duration = Duration::from_secs(300);
 
+/// #858 bounded diagnostic tail retained in a contained archaeology-worker fault.
+/// The previous short tail could drop the corrupting phase markers on large Rust
+/// repositories where warnings and telemetry are both active. This is still a fixed
+/// evidence budget, not an unbounded log dump.
+const ARCHAEOLOGY_EXTRACT_STDERR_TAIL_CHARS: usize = 12_000;
+
 /// #515 poll granularity while waiting on the isolated extraction child. Short so a
 /// sub-second extraction is not padded, bounded so the wait loop never spins hot.
 const ARCHAEOLOGY_EXTRACT_POLL: Duration = Duration::from_millis(25);
@@ -1469,6 +1475,12 @@ impl HistoricalExtractionPool {
         let child = Command::new(&self.exe)
             .args(["cli", "--archaeology-extract-serve", "--pool-dir"])
             .arg(&self.pool_dir)
+            // The archaeology worker is an isolated crash boundary. Its stderr is
+            // the preserved fault ledger, so native C phase markers must be emitted
+            // even when the general CBM log level is raised to WARN/ERROR for a long
+            // fleet run. This is diagnostic tracing only; it does not change the
+            // extraction result or provide a fallback path.
+            .env("ASTRO_CBM_PIPELINE_PHASE_TRACE", "1")
             .stdin(Stdio::null())
             .stdout(Stdio::from(log))
             .stderr(Stdio::from(log_clone))
@@ -1616,6 +1628,7 @@ impl HistoricalExtractionPool {
         let request_path = self.pool_dir.join(format!("request-{seq}.json"));
         let request_tmp = self.pool_dir.join(format!("request-{seq}.json.tmp"));
         let response_path = self.pool_dir.join(format!("response-{seq}.json"));
+        let response_tmp = self.pool_dir.join(format!("response-{seq}.json.tmp"));
         // A stale response from a prior seq collision cannot exist (files are removed per
         // request and on spawn), but remove defensively so `exists()` below is unambiguous.
         let _ = fs::remove_file(&response_path);
@@ -1625,16 +1638,46 @@ impl HistoricalExtractionPool {
             "identity_root": path_str(identity_root)?,
             "project": project,
             "mode": "fast",
+            "commit": commit,
+            "parent_seq": seq,
         });
         // Atomic appearance for the worker: write the temp, then rename into place, so the
         // worker never reads a half-written request.
-        fs::write(&request_tmp, serde_json::to_vec(&request)?)?;
+        let request_bytes = serde_json::to_vec(&request)?;
+        let request_sha256 = hex_lower(&Sha256::digest(&request_bytes));
+        fs::write(&request_tmp, &request_bytes)?;
         fs::rename(&request_tmp, &request_path)?;
+        log_archaeology_serve_trace(
+            "parent_request_published",
+            json!({
+                "seq": seq,
+                "commit": commit,
+                "worker_pid": self.child.as_ref().map(Child::id),
+                "request_sha256": request_sha256,
+                "request_bytes": request_bytes.len(),
+                "request": path_state_json(&request_path, false),
+                "response": path_state_json(&response_path, false),
+                "response_tmp": path_state_json(&response_tmp, false),
+                "database_family": database_family_state_json(database),
+            }),
+        );
 
         let deadline = Instant::now() + ARCHAEOLOGY_EXTRACT_TIMEOUT;
         // `(outcome, worker_survived)`: only a surviving worker advances `seq`/`served`.
         let (outcome, worker_survived): (HistoricalExtract, bool) = loop {
             if response_path.exists() {
+                log_archaeology_serve_trace(
+                    "parent_response_observed",
+                    json!({
+                        "seq": seq,
+                        "commit": commit,
+                        "worker_pid": self.child.as_ref().map(Child::id),
+                        "request": path_state_json(&request_path, false),
+                        "response": path_state_json(&response_path, true),
+                        "response_tmp": path_state_json(&response_tmp, false),
+                        "database_family": database_family_state_json(database),
+                    }),
+                );
                 match fs::read(&response_path) {
                     Ok(bytes) => match interpret_pool_response(&bytes, project) {
                         PoolResponse::Rows(rows) => {
@@ -1665,6 +1708,18 @@ impl HistoricalExtractionPool {
                             );
                         }
                         PoolResponse::Malformed(detail) => {
+                            log_archaeology_serve_trace(
+                                "parent_malformed_response",
+                                json!({
+                                    "seq": seq,
+                                    "commit": commit,
+                                    "detail": detail,
+                                    "request": path_state_json(&request_path, false),
+                                    "response": path_state_json(&response_path, true),
+                                    "response_tmp": path_state_json(&response_tmp, false),
+                                    "database_family": database_family_state_json(database),
+                                }),
+                            );
                             self.recycle("malformed_response");
                             break (
                                 HistoricalExtract::Crashed(archaeology_extract_fault_detail(
@@ -1681,6 +1736,18 @@ impl HistoricalExtractionPool {
                         }
                     },
                     Err(error) => {
+                        log_archaeology_serve_trace(
+                            "parent_response_unreadable",
+                            json!({
+                                "seq": seq,
+                                "commit": commit,
+                                "error": error.to_string(),
+                                "request": path_state_json(&request_path, false),
+                                "response": path_state_json(&response_path, false),
+                                "response_tmp": path_state_json(&response_tmp, false),
+                                "database_family": database_family_state_json(database),
+                            }),
+                        );
                         self.recycle("response_unreadable");
                         break (
                             HistoricalExtract::Crashed(archaeology_extract_fault_detail(
@@ -1706,11 +1773,27 @@ impl HistoricalExtractionPool {
                 Ok(Some(status)) => {
                     // The worker died mid-request: a CONTAINED #515 C-level fault on THIS
                     // commit. Forget the dead child so the next call respawns; the host lives.
+                    let worker_pid = self.child.as_ref().map(Child::id);
                     self.child = None;
+                    let exit_code = status.code();
+                    let exit_text = worker_exit_text(status);
+                    log_archaeology_serve_trace(
+                        "parent_worker_died_mid_request",
+                        json!({
+                            "seq": seq,
+                            "commit": commit,
+                            "worker_pid": worker_pid,
+                            "exit": exit_text,
+                            "request": path_state_json(&request_path, true),
+                            "response": path_state_json(&response_path, true),
+                            "response_tmp": path_state_json(&response_tmp, true),
+                            "database_family": database_family_state_json(database),
+                        }),
+                    );
                     break (
                         HistoricalExtract::Crashed(archaeology_extract_fault_detail(
                             commit,
-                            status.code(),
+                            exit_code,
                             &self.log_path,
                             "the pooled CBM extraction worker died mid-request (C-level pipeline \
                              fault: abort / access violation / heap-corruption class); it will be \
@@ -1739,6 +1822,18 @@ impl HistoricalExtractionPool {
                     thread::sleep(ARCHAEOLOGY_EXTRACT_POLL);
                 }
                 Err(error) => {
+                    log_archaeology_serve_trace(
+                        "parent_worker_wait_failed",
+                        json!({
+                            "seq": seq,
+                            "commit": commit,
+                            "error": error.to_string(),
+                            "request": path_state_json(&request_path, false),
+                            "response": path_state_json(&response_path, true),
+                            "response_tmp": path_state_json(&response_tmp, true),
+                            "database_family": database_family_state_json(database),
+                        }),
+                    );
                     self.recycle("wait_failed");
                     break (
                         HistoricalExtract::Crashed(archaeology_extract_fault_detail(
@@ -1758,9 +1853,26 @@ impl HistoricalExtractionPool {
 
         // Remove this request/response pair so the pool dir never grows unbounded across
         // a long loop (the worker also removes the request it consumed; double-remove is
-        // harmless).
-        let _ = fs::remove_file(&request_path);
-        let _ = fs::remove_file(&response_path);
+        // harmless). On a contained crash, preserve the handshake files until
+        // `preserve_historical_crash_artifacts` copies the pool state; deleting them here
+        // would erase the only direct proof of whether a response/temp existed.
+        if matches!(outcome, HistoricalExtract::Crashed(_)) {
+            log_archaeology_serve_trace(
+                "parent_preserving_failed_handshake",
+                json!({
+                    "seq": seq,
+                    "commit": commit,
+                    "pool_dir": self.pool_dir.display().to_string(),
+                    "request": path_state_json(&request_path, true),
+                    "response": path_state_json(&response_path, true),
+                    "response_tmp": path_state_json(&response_tmp, true),
+                    "database_family": database_family_state_json(database),
+                }),
+            );
+        } else {
+            let _ = fs::remove_file(&request_path);
+            let _ = fs::remove_file(&response_path);
+        }
         if worker_survived {
             self.seq += 1;
             self.served += 1;
@@ -1798,6 +1910,83 @@ fn worker_exit_text(status: std::process::ExitStatus) -> String {
         Some(code) => format!("{code} (0x{:08X})", code as u32),
         None => "none".to_string(),
     }
+}
+
+fn log_archaeology_serve_trace(event: &str, details: Value) {
+    let payload = json!({
+        "schema": "astrolabe.archaeology-serve-trace.v1",
+        "event": event,
+        "pid": std::process::id(),
+        "unix_ms": SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_millis())
+            .unwrap_or(0),
+        "details": details,
+    });
+    match serde_json::to_string(&payload) {
+        Ok(line) => eprintln!("ASTRO_ARCHAEOLOGY_SERVE_TRACE {line}"),
+        Err(error) => {
+            eprintln!("ASTRO_ARCHAEOLOGY_SERVE_TRACE_SERIALIZE_FAILED event={event} error={error}")
+        }
+    }
+}
+
+fn path_state_json(path: &Path, hash_file: bool) -> Value {
+    let mut state = Map::new();
+    state.insert(
+        "path".to_string(),
+        Value::String(path.display().to_string()),
+    );
+    match fs::metadata(path) {
+        Ok(metadata) => {
+            state.insert("exists".to_string(), Value::Bool(true));
+            state.insert("is_file".to_string(), Value::Bool(metadata.is_file()));
+            state.insert("is_dir".to_string(), Value::Bool(metadata.is_dir()));
+            if metadata.is_file() {
+                state.insert("bytes".to_string(), Value::from(metadata.len()));
+                if hash_file {
+                    match fs::read(path) {
+                        Ok(bytes) => {
+                            state.insert(
+                                "sha256".to_string(),
+                                Value::String(hex_lower(&Sha256::digest(bytes))),
+                            );
+                        }
+                        Err(error) => {
+                            state.insert(
+                                "sha256_error".to_string(),
+                                Value::String(error.to_string()),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            state.insert("exists".to_string(), Value::Bool(false));
+        }
+        Err(error) => {
+            state.insert("exists".to_string(), Value::Bool(false));
+            state.insert(
+                "metadata_error".to_string(),
+                Value::String(error.to_string()),
+            );
+        }
+    }
+    Value::Object(state)
+}
+
+fn database_family_state_json(database: &Path) -> Value {
+    let base = database.as_os_str().to_string_lossy();
+    Value::Array(
+        ["", "-wal", "-shm", "-journal"]
+            .into_iter()
+            .map(|suffix| {
+                let path = PathBuf::from(format!("{base}{suffix}"));
+                path_state_json(&path, suffix.is_empty())
+            })
+            .collect(),
+    )
 }
 
 /// Best-effort PID-gated sweep of archaeology extraction pool dirs left at the shared
@@ -1867,7 +2056,9 @@ fn archaeology_extract_fault_detail(
     let stderr_tail = fs::read_to_string(stderr_path)
         .map(|text| {
             let chars: Vec<char> = text.chars().collect();
-            let start = chars.len().saturating_sub(600);
+            let start = chars
+                .len()
+                .saturating_sub(ARCHAEOLOGY_EXTRACT_STDERR_TAIL_CHARS);
             chars[start..].iter().collect::<String>()
         })
         .unwrap_or_else(|_| "<child stderr unreadable>".to_string());
@@ -1895,14 +2086,73 @@ fn extract_rows_once(
     database: &str,
     identity_root: &str,
     project: &str,
+    commit: &str,
+    seq: u64,
     mode: CbmIndexMode,
     response_tmp: &Path,
     response_path: &Path,
 ) -> Result<CbmPipelineRows, DynError> {
+    log_archaeology_serve_trace(
+        "worker_extract_begin",
+        json!({
+            "seq": seq,
+            "commit": commit,
+            "scoped_root": scoped_root,
+            "database": database,
+            "identity_root": identity_root,
+            "project": project,
+            "mode": match mode {
+                CbmIndexMode::Full => "full",
+                CbmIndexMode::Moderate => "moderate",
+                CbmIndexMode::Fast => "fast",
+            },
+            "checkout": path_state_json(Path::new(scoped_root), false),
+            "database_family": database_family_state_json(Path::new(database)),
+            "response": path_state_json(response_path, false),
+            "response_tmp": path_state_json(response_tmp, false),
+        }),
+    );
     let mut pipeline = CbmPipeline::new(scoped_root, database, mode)?;
+    log_archaeology_serve_trace(
+        "worker_pipeline_created",
+        json!({
+            "seq": seq,
+            "commit": commit,
+            "database_family": database_family_state_json(Path::new(database)),
+        }),
+    );
     pipeline.bind_project_identity_root(identity_root, project)?;
+    log_archaeology_serve_trace(
+        "worker_identity_bound",
+        json!({
+            "seq": seq,
+            "commit": commit,
+            "project": project,
+        }),
+    );
     let rows = pipeline.collect_rows_with_post_success_response(response_tmp, response_path)?;
+    log_archaeology_serve_trace(
+        "worker_collect_returned",
+        json!({
+            "seq": seq,
+            "commit": commit,
+            "nodes": rows.nodes.len(),
+            "edges": rows.edges.len(),
+            "file_hashes": rows.file_hashes.len(),
+            "database_family": database_family_state_json(Path::new(database)),
+            "response": path_state_json(response_path, true),
+            "response_tmp": path_state_json(response_tmp, true),
+        }),
+    );
     drop(pipeline);
+    log_archaeology_serve_trace(
+        "worker_pipeline_dropped",
+        json!({
+            "seq": seq,
+            "commit": commit,
+            "database_family": database_family_state_json(Path::new(database)),
+        }),
+    );
     Ok(rows)
 }
 
@@ -1913,6 +2163,7 @@ fn extract_rows_once(
 /// dying (the parent then counts that commit as a contained fault, identical accounting
 /// to the pre-#530 nonzero-exit child).
 fn build_serve_response(
+    seq: u64,
     request: &Value,
     response_tmp: &Path,
     response_path: &Path,
@@ -1936,51 +2187,141 @@ fn build_serve_response(
         .into());
     }
     let field = |key: &str| request.get(key).and_then(Value::as_str);
-    let (scoped_root, database, identity_root, project) = match (
+    let (scoped_root, database, identity_root, project, commit, parent_seq) = match (
         field("scoped_root"),
         field("database"),
         field("identity_root"),
         field("project"),
+        field("commit"),
+        request.get("parent_seq").and_then(Value::as_u64),
     ) {
-        (Some(scoped_root), Some(database), Some(identity_root), Some(project)) => {
-            (scoped_root, database, identity_root, project)
-        }
+        (
+            Some(scoped_root),
+            Some(database),
+            Some(identity_root),
+            Some(project),
+            Some(commit),
+            Some(parent_seq),
+        ) => (
+            scoped_root,
+            database,
+            identity_root,
+            project,
+            commit,
+            parent_seq,
+        ),
         _ => {
+            log_archaeology_serve_trace(
+                "worker_request_missing_field",
+                json!({
+                    "seq": seq,
+                    "request_keys": request
+                        .as_object()
+                        .map(|object| object.keys().cloned().collect::<Vec<_>>())
+                        .unwrap_or_default(),
+                }),
+            );
             return Ok(Some(json!({
                 "ok": false,
                 "error": "archaeology_extract_error: request missing required string field \
-                          (scoped_root/database/identity_root/project)",
+                          (scoped_root/database/identity_root/project/commit) or numeric \
+                          parent_seq",
             })));
         }
     };
+    if parent_seq != seq {
+        return Err(format!(
+            "ASTRO_ARCHAEOLOGY_SERVE_SEQUENCE_MISMATCH: worker seq {seq} does not match request \
+             parent_seq {parent_seq}; remediation: preserve the pool directory and restart from \
+             an absent request/response namespace"
+        )
+        .into());
+    }
     let mode = match request.get("mode").and_then(Value::as_str) {
         Some("full") => CbmIndexMode::Full,
         Some("moderate") => CbmIndexMode::Moderate,
         // Historical re-index is always Fast; anything else (incl. absent) maps to it.
         _ => CbmIndexMode::Fast,
     };
+    log_archaeology_serve_trace(
+        "worker_request_decoded",
+        json!({
+            "seq": seq,
+            "commit": commit,
+            "scoped_root": scoped_root,
+            "database": database,
+            "identity_root": identity_root,
+            "project": project,
+            "mode": request.get("mode").and_then(Value::as_str).unwrap_or("fast"),
+            "checkout": path_state_json(Path::new(scoped_root), false),
+            "database_family": database_family_state_json(Path::new(database)),
+            "response": path_state_json(response_path, false),
+            "response_tmp": path_state_json(response_tmp, false),
+        }),
+    );
     match extract_rows_once(
         scoped_root,
         database,
         identity_root,
         project,
+        commit,
+        seq,
         mode,
         response_tmp,
         response_path,
     ) {
-        Ok(_) => Ok(None),
+        Ok(rows) => {
+            log_archaeology_serve_trace(
+                "worker_extract_success",
+                json!({
+                    "seq": seq,
+                    "commit": commit,
+                    "nodes": rows.nodes.len(),
+                    "edges": rows.edges.len(),
+                    "file_hashes": rows.file_hashes.len(),
+                    "database_family": database_family_state_json(Path::new(database)),
+                    "response": path_state_json(response_path, true),
+                    "response_tmp": path_state_json(response_tmp, true),
+                }),
+            );
+            Ok(None)
+        }
         Err(error) if response_path.exists() => {
             eprintln!(
                 "astro.archaeology.serve event=post_success_cleanup_error \
                  response_path={} error={error}",
                 response_path.display(),
             );
+            log_archaeology_serve_trace(
+                "worker_post_success_cleanup_error",
+                json!({
+                    "seq": seq,
+                    "commit": commit,
+                    "error": error.to_string(),
+                    "database_family": database_family_state_json(Path::new(database)),
+                    "response": path_state_json(response_path, true),
+                    "response_tmp": path_state_json(response_tmp, true),
+                }),
+            );
             Ok(None)
         }
-        Err(error) => Ok(Some(json!({
-            "ok": false,
-            "error": format!("archaeology_extract_error: {error}"),
-        }))),
+        Err(error) => {
+            log_archaeology_serve_trace(
+                "worker_extract_error",
+                json!({
+                    "seq": seq,
+                    "commit": commit,
+                    "error": error.to_string(),
+                    "database_family": database_family_state_json(Path::new(database)),
+                    "response": path_state_json(response_path, false),
+                    "response_tmp": path_state_json(response_tmp, true),
+                }),
+            );
+            Ok(Some(json!({
+                "ok": false,
+                "error": format!("archaeology_extract_error: {error}"),
+            })))
+        }
     }
 }
 
@@ -2084,6 +2425,15 @@ pub(crate) fn run_archaeology_extract_serve(pool_dir: &str) -> Result<i32, DynEr
             )
             .into()
         })?;
+        log_archaeology_serve_trace(
+            "worker_request_observed",
+            json!({
+                "seq": seq,
+                "request": path_state_json(&request_path, true),
+                "request_sha256": hex_lower(&Sha256::digest(&bytes)),
+                "request_bytes": bytes.len(),
+            }),
+        );
         let request: Value = serde_json::from_slice(&bytes).map_err(|error| -> DynError {
             format!(
                 "ASTRO_ARCHAEOLOGY_SERVE_REQUEST_INVALID: pooled request {} is not valid JSON: \
@@ -2093,13 +2443,38 @@ pub(crate) fn run_archaeology_extract_serve(pool_dir: &str) -> Result<i32, DynEr
             .into()
         })?;
         if request.get("stop").and_then(Value::as_bool) == Some(true) {
+            log_archaeology_serve_trace(
+                "worker_stop_observed",
+                json!({
+                    "seq": seq,
+                    "request": path_state_json(&request_path, true),
+                }),
+            );
             let _ = fs::remove_file(&request_path);
             return Ok(0);
         }
         let response_path = pool_dir.join(format!("response-{seq}.json"));
         let response_tmp = pool_dir.join(format!("response-{seq}.json.tmp"));
-        match build_serve_response(&request, &response_tmp, &response_path)? {
-            Some(response) => publish_pool_response(&response_tmp, &response_path, &response)?,
+        match build_serve_response(seq, &request, &response_tmp, &response_path)? {
+            Some(response) => {
+                log_archaeology_serve_trace(
+                    "worker_error_response_publish_begin",
+                    json!({
+                        "seq": seq,
+                        "response": path_state_json(&response_path, false),
+                        "response_tmp": path_state_json(&response_tmp, false),
+                    }),
+                );
+                publish_pool_response(&response_tmp, &response_path, &response)?;
+                log_archaeology_serve_trace(
+                    "worker_error_response_published",
+                    json!({
+                        "seq": seq,
+                        "response": path_state_json(&response_path, true),
+                        "response_tmp": path_state_json(&response_tmp, false),
+                    }),
+                );
+            }
             None => {
                 if !response_path.exists() {
                     return Err(format!(
@@ -2111,11 +2486,27 @@ pub(crate) fn run_archaeology_extract_serve(pool_dir: &str) -> Result<i32, DynEr
                     )
                     .into());
                 }
+                log_archaeology_serve_trace(
+                    "worker_success_response_present",
+                    json!({
+                        "seq": seq,
+                        "response": path_state_json(&response_path, true),
+                        "response_tmp": path_state_json(&response_tmp, true),
+                    }),
+                );
             }
         }
         // Drop the consumed request so the dir does not grow unbounded (the parent also
         // removes it; double-remove is harmless).
         let _ = fs::remove_file(&request_path);
+        log_archaeology_serve_trace(
+            "worker_request_removed",
+            json!({
+                "seq": seq,
+                "request": path_state_json(&request_path, false),
+                "response": path_state_json(&response_path, true),
+            }),
+        );
         seq += 1;
     }
 }
@@ -2577,6 +2968,7 @@ fn index_historical_commit(
                 &worktree,
                 &database,
                 &pool.log_path,
+                &pool.pool_dir,
                 project,
                 commit,
                 &checkout_root,
@@ -2610,6 +3002,7 @@ fn preserve_historical_crash_artifacts(
     worktree: &Path,
     database: &Path,
     worker_log: &Path,
+    pool_dir: &Path,
     project: &str,
     commit: &str,
     checkout_root: &Path,
@@ -2688,6 +3081,60 @@ fn preserve_historical_crash_artifacts(
         }
         let database_inventory = inventory_directory_for_preservation(&database_dir)?;
 
+        let preserved_pool_dir = preserved.join("pool");
+        fs::create_dir(&preserved_pool_dir).map_err(|error| -> DynError {
+            format!(
+                "ASTRO_ARCHAEOLOGY_CRASH_PRESERVE_POOL_DIR_FAILED: could not create {}: {error}; preserved checkout remains at {}",
+                preserved_pool_dir.display(),
+                preserved.display()
+            )
+            .into()
+        })?;
+        let mut pool_paths = Vec::new();
+        if pool_dir.exists() {
+            for entry in fs::read_dir(pool_dir).map_err(|error| -> DynError {
+                format!(
+                    "ASTRO_ARCHAEOLOGY_CRASH_PRESERVE_POOL_READ_FAILED: could not read pool dir {}: {error}; preserved checkout remains at {}",
+                    pool_dir.display(),
+                    preserved.display()
+                )
+                .into()
+            })? {
+                let entry = entry.map_err(|error| -> DynError {
+                    format!(
+                        "ASTRO_ARCHAEOLOGY_CRASH_PRESERVE_POOL_ENTRY_FAILED: could not read a pool dir entry in {}: {error}; preserved checkout remains at {}",
+                        pool_dir.display(),
+                        preserved.display()
+                    )
+                    .into()
+                })?;
+                let metadata = entry.metadata().map_err(|error| -> DynError {
+                    format!(
+                        "ASTRO_ARCHAEOLOGY_CRASH_PRESERVE_POOL_METADATA_FAILED: could not stat {}: {error}; preserved checkout remains at {}",
+                        entry.path().display(),
+                        preserved.display()
+                    )
+                    .into()
+                })?;
+                if !metadata.is_file() {
+                    continue;
+                }
+                let file_name = entry.file_name();
+                let destination = preserved_pool_dir.join(&file_name);
+                fs::copy(entry.path(), &destination).map_err(|error| -> DynError {
+                    format!(
+                        "ASTRO_ARCHAEOLOGY_CRASH_PRESERVE_POOL_COPY_FAILED: could not copy {} to {}: {error}; preserved checkout remains at {}",
+                        entry.path().display(),
+                        destination.display(),
+                        preserved.display()
+                    )
+                    .into()
+                })?;
+                pool_paths.push(destination.display().to_string());
+            }
+        }
+        let pool_inventory = inventory_directory_for_preservation(&preserved_pool_dir)?;
+
         let worker_log_path = preserved.join("worker.log");
         let worker_log_sha256 = if worker_log.exists() {
             fs::copy(worker_log, &worker_log_path).map_err(|error| -> DynError {
@@ -2715,6 +3162,8 @@ fn preserve_historical_crash_artifacts(
             "checkout_root": preserved_checkout.display().to_string(),
             "database_dir": database_dir.display().to_string(),
             "database_paths": database_paths,
+            "pool_dir": preserved_pool_dir.display().to_string(),
+            "pool_paths": pool_paths,
             "worker_log": worker_log.exists().then(|| worker_log_path.display().to_string()),
             "worker_log_sha256": worker_log_sha256,
             "files_materialized": materialized.files_materialized,
@@ -2725,6 +3174,7 @@ fn preserve_historical_crash_artifacts(
             "object_probe_processes_avoided": materialized.object_probe_processes_avoided,
             "checkout_inventory": tree_inventory.to_json(),
             "database_inventory": database_inventory.to_json(),
+            "pool_inventory": pool_inventory.to_json(),
         });
         let manifest_bytes = serde_json::to_vec_pretty(&manifest)?;
         fs::write(&manifest_tmp, &manifest_bytes)?;
@@ -2751,6 +3201,9 @@ fn preserve_historical_crash_artifacts(
             "database_files": database_inventory.files,
             "database_bytes": database_inventory.bytes,
             "database_inventory_sha256": database_inventory.inventory_sha256,
+            "pool_files": pool_inventory.files,
+            "pool_bytes": pool_inventory.bytes,
+            "pool_inventory_sha256": pool_inventory.inventory_sha256,
             "worker_log_sha256": worker_log_sha256,
         }))
     })();
@@ -2763,6 +3216,7 @@ fn preserve_historical_crash_artifacts(
             "original_worktree": worktree.display().to_string(),
             "original_database": database.display().to_string(),
             "worker_log": worker_log.display().to_string(),
+            "pool_dir": pool_dir.display().to_string(),
         }),
     };
     serde_json::to_string(&payload).unwrap_or_else(|error| {

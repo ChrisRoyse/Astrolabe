@@ -283,6 +283,44 @@ static const char *u64_buf(uint64_t val) {
     return bufs[i];
 }
 
+static bool cbm_pipeline_phase_trace_enabled(void) {
+    const char *raw = getenv("ASTRO_CBM_PIPELINE_PHASE_TRACE");
+    return raw && (strcmp(raw, "1") == 0 || strcmp(raw, "true") == 0 ||
+                   strcmp(raw, "TRUE") == 0);
+}
+
+static void cbm_pipeline_phase_trace_event(const char *event, const char *phase,
+                                           const cbm_pipeline_t *p,
+                                           const PROCESS_MEMORY_COUNTERS_EX *memory,
+                                           bool memory_valid) {
+    if (!cbm_pipeline_phase_trace_enabled()) {
+        return;
+    }
+    int nodes = (p && p->gbuf) ? cbm_gbuf_node_count(p->gbuf) : -1;
+    int edges = (p && p->gbuf) ? cbm_gbuf_edge_count(p->gbuf) : -1;
+    uint64_t working_set_bytes = 0;
+    uint64_t private_bytes = 0;
+    uint64_t peak_working_set_bytes = 0;
+    uint64_t peak_private_bytes = 0;
+    if (memory && memory_valid) {
+        working_set_bytes = (uint64_t)memory->WorkingSetSize;
+        private_bytes = (uint64_t)memory->PrivateUsage;
+        peak_working_set_bytes = (uint64_t)memory->PeakWorkingSetSize;
+        peak_private_bytes = (uint64_t)memory->PeakPagefileUsage;
+    }
+    fprintf(stderr,
+            "ASTRO_CBM_PIPELINE_PHASE_TRACE event=%s phase=%s pid=%lu mode=%d "
+            "row_sink_active=%d row_sink_completed=%d nodes=%d edges=%d memory_valid=%d "
+            "working_set_bytes=%llu private_bytes=%llu peak_working_set_bytes=%llu "
+            "peak_private_bytes=%llu\n",
+            event ? event : "", phase ? phase : "", (unsigned long)GetCurrentProcessId(),
+            p ? (int)p->mode : -1, p && p->row_sink_active ? 1 : 0,
+            p && p->row_sink_completed ? 1 : 0, nodes, edges, memory_valid ? 1 : 0,
+            (unsigned long long)working_set_bytes, (unsigned long long)private_bytes,
+            (unsigned long long)peak_working_set_bytes, (unsigned long long)peak_private_bytes);
+    fflush(stderr);
+}
+
 cbm_pipeline_phase_probe_t cbm_pipeline_phase_probe_start(cbm_pipeline_t *p, const char *phase) {
     cbm_pipeline_phase_probe_t probe = {0};
     cbm_clock_gettime(CLOCK_MONOTONIC, &probe.started);
@@ -314,6 +352,7 @@ cbm_pipeline_phase_probe_t cbm_pipeline_phase_probe_start(cbm_pipeline_t *p, con
                       "the indexing worker memory baseline could not be read", "remediation",
                       "resolve the reported process-accounting failure and retry");
     }
+    cbm_pipeline_phase_trace_event("start", phase, p, &probe.memory, probe.memory_valid);
     return probe;
 }
 
@@ -330,6 +369,7 @@ void cbm_pipeline_phase_probe_end(cbm_pipeline_t *p, const char *phase,
         GetProcessMemoryInfo(GetCurrentProcess(), (PROCESS_MEMORY_COUNTERS *)&current_memory,
                              sizeof(current_memory)) != 0;
     DWORD current_memory_error = current_memory_valid ? ERROR_SUCCESS : GetLastError();
+    cbm_pipeline_phase_trace_event("end", phase, p, &current_memory, current_memory_valid);
     if (!current_io_valid || !current_memory_valid) {
         if (p) {
             p->phase_metrics_complete = false;
