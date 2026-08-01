@@ -60,6 +60,14 @@ pub struct GitArchaeologyConfig {
     /// a commit "too large" (Azure DevOps VSTS: 512 changed paths). `0` disables the
     /// cap (mine every commit regardless of size — the pre-#434 behavior).
     pub max_commit_changed_files: usize,
+    /// Registry-declared number of commits fed to one `git diff-tree --stdin`
+    /// child for mine-side changed-file counts and unified diff generation (#858).
+    ///
+    /// This is a process/memory bound, not an accuracy tradeoff: every commit is
+    /// still diffed by Git with the same pathspec and the same unified-diff parser,
+    /// but process startup is amortized across the batch and the parser fails closed
+    /// if any commit header or raw record is missing/malformed.
+    pub diff_tree_batch_commits: usize,
 }
 
 /// Registry-declared default for [`GitArchaeologyConfig::max_commit_changed_files`]
@@ -78,6 +86,10 @@ impl Default for GitArchaeologyConfig {
             max_count: 10_000,
             member_prefix: None,
             max_commit_changed_files: DEFAULT_MAX_COMMIT_CHANGED_FILES,
+            diff_tree_batch_commits: usize::try_from(
+                astrolabe_domain::knobs::ARCHAEOLOGY_DEFAULT_DIFF_TREE_BATCH_COMMITS,
+            )
+            .expect("diff-tree batch default fits usize"),
         }
     }
 }
@@ -97,10 +109,16 @@ impl GitArchaeologyConfig {
                 .issue_markers
                 .iter()
                 .any(|value| value.trim().is_empty() || !value.is_ascii())
+            || self.diff_tree_batch_commits
+                < usize::try_from(astrolabe_domain::knobs::ARCHAEOLOGY_MIN_DIFF_TREE_BATCH_COMMITS)
+                    .expect("diff-tree batch min fits usize")
+            || self.diff_tree_batch_commits
+                > usize::try_from(astrolabe_domain::knobs::ARCHAEOLOGY_MAX_DIFF_TREE_BATCH_COMMITS)
+                    .expect("diff-tree batch max fits usize")
         {
             return Err(ArchaeologyError::new(
                 ASTRO_ARCHAEOLOGY_CONFIG_INVALID,
-                "Git archaeology configuration is empty, unbounded, or non-ASCII",
+                "Git archaeology configuration is empty, unbounded, non-ASCII, or outside the diff-tree batch registry",
             ));
         }
         // A member prefix, when present, is a git pathspec appended after `--` on
@@ -230,6 +248,47 @@ impl PartialEq for GitBlameBatchTelemetry {
     }
 }
 
+/// Equality-stable process/output telemetry for batched Git diff-tree work.
+#[derive(Debug, Clone, Default)]
+pub struct GitDiffTreeBatchTelemetry {
+    /// Fix-like single-parent commits submitted to the cheap changed-file count phase.
+    pub count_requested_commits: usize,
+    /// `git diff-tree --stdin --raw -z` children used for the count phase.
+    pub count_processes: usize,
+    /// Per-commit count children avoided by batching.
+    pub count_processes_avoided: usize,
+    /// Exact stdout bytes emitted by the raw count children.
+    pub count_stdout_bytes: u64,
+    /// Fix-like single-parent, under-cap commits submitted to the unified-diff phase.
+    pub ranges_requested_commits: usize,
+    /// `git diff-tree --stdin --unified=0` children used for the range phase.
+    pub ranges_processes: usize,
+    /// Per-commit content-diff children avoided by batching.
+    pub ranges_processes_avoided: usize,
+    /// Exact stdout bytes emitted by the unified-diff children.
+    pub ranges_stdout_bytes: u64,
+    /// Observed wall time for count batches. Deliberately excluded from equality.
+    pub count_wall_ms: u64,
+    /// Observed wall time for range batches. Deliberately excluded from equality.
+    pub ranges_wall_ms: u64,
+    /// Effective registry-declared batch bound used by this pass.
+    pub batch_limit_commits: usize,
+}
+
+impl PartialEq for GitDiffTreeBatchTelemetry {
+    fn eq(&self, other: &Self) -> bool {
+        self.count_requested_commits == other.count_requested_commits
+            && self.count_processes == other.count_processes
+            && self.count_processes_avoided == other.count_processes_avoided
+            && self.count_stdout_bytes == other.count_stdout_bytes
+            && self.ranges_requested_commits == other.ranges_requested_commits
+            && self.ranges_processes == other.ranges_processes
+            && self.ranges_processes_avoided == other.ranges_processes_avoided
+            && self.ranges_stdout_bytes == other.ranges_stdout_bytes
+            && self.batch_limit_commits == other.batch_limit_commits
+    }
+}
+
 /// Deterministic result of one mining pass.
 #[derive(Debug, Clone, PartialEq)]
 pub struct GitArchaeologyReport {
@@ -261,6 +320,8 @@ pub struct GitArchaeologyReport {
     /// history, directory↔file swaps) (#514). Each is a counted, labeled skip;
     /// every other git blame failure stays fail-closed.
     pub skipped_unblamable_paths: usize,
+    /// Capability-preserving batching/read-volume telemetry for Git diff-tree.
+    pub diff_tree: GitDiffTreeBatchTelemetry,
     /// Capability-preserving batching/read-volume telemetry for Git blame.
     pub blame: GitBlameBatchTelemetry,
 }
@@ -297,6 +358,12 @@ struct CommitRecord {
     parents: Vec<String>,
     timestamp: u64,
     message: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct DiffTreeCandidate {
+    commit: String,
+    parent: String,
 }
 
 /// Mines the configured Git history using native argv-only child processes.
@@ -369,7 +436,43 @@ pub fn mine_git_archaeology(
     let commits = read_commits(repo, config, range.as_deref())?;
     let read_commits_ms = read_start.elapsed().as_millis();
     let commit_count = commits.len();
-    let mut diff_ms = 0u128;
+    // #434 mass-change cap: 0 disables the cap (pre-#434 behavior — mine every commit).
+    let file_cap = config.max_commit_changed_files;
+    let mut diff_tree = GitDiffTreeBatchTelemetry {
+        batch_limit_commits: config.diff_tree_batch_commits,
+        ..GitDiffTreeBatchTelemetry::default()
+    };
+    let fix_diff_candidates = commits
+        .iter()
+        .filter_map(|commit| {
+            classify_fix_confidence(&commit.message, config)?;
+            if commit.parents.len() == 1 {
+                Some(DiffTreeCandidate {
+                    commit: commit.sha.clone(),
+                    parent: commit.parents[0].clone(),
+                })
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>();
+    let changed_file_counts = if file_cap != 0 {
+        changed_file_counts_for_commits(repo, &fix_diff_candidates, pathspec, &mut diff_tree)?
+    } else {
+        BTreeMap::new()
+    };
+    let old_range_candidates = fix_diff_candidates
+        .iter()
+        .filter(|candidate| {
+            file_cap == 0
+                || changed_file_counts
+                    .get(&candidate.commit)
+                    .is_some_and(|count| *count <= file_cap)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let changed_old_ranges_by_commit =
+        changed_old_ranges_for_commits(repo, &old_range_candidates, pathspec, &mut diff_tree)?;
     let mut blame = GitBlameBatchTelemetry::default();
     let mut szz = BTreeSet::new();
     let mut reverts = BTreeSet::new();
@@ -378,8 +481,6 @@ pub fn mine_git_archaeology(
     let mut skipped_unresolvable_reverts = 0usize;
     let mut skipped_gitlink_paths = 0usize;
     let mut skipped_unblamable_paths = 0usize;
-    // #434 mass-change cap: 0 disables the cap (pre-#434 behavior — mine every commit).
-    let file_cap = config.max_commit_changed_files;
     for commit in commits {
         let revert_target = match canonical_revert_target(&commit.message) {
             RevertTarget::Absent => None,
@@ -443,14 +544,33 @@ pub fn mine_git_archaeology(
         // from SZZ (its blame is meaningless and — for a pure-addition relocation —
         // yields zero old-side ranges anyway), count the skip, and never pay the
         // ~600k-line diff-and-parse cost that dominated the M-scale phase (#422).
-        if file_cap != 0 && changed_file_count(repo, parent, &commit.sha, pathspec)? > file_cap {
+        if file_cap != 0
+            && *changed_file_counts.get(&commit.sha).ok_or_else(|| {
+                ArchaeologyError::new(
+                    ASTRO_ARCHAEOLOGY_OUTPUT_INVALID,
+                    format!(
+                        "batched Git changed-file count is missing for fix commit {}",
+                        commit.sha
+                    ),
+                )
+            })? > file_cap
+        {
             skipped_large_commits += 1;
             continue;
         }
-        let diff_start = std::time::Instant::now();
-        let old_changed = changed_old_ranges(repo, parent, &commit.sha, pathspec)?;
+        let old_changed = changed_old_ranges_by_commit
+            .get(&commit.sha)
+            .cloned()
+            .ok_or_else(|| {
+                ArchaeologyError::new(
+                    ASTRO_ARCHAEOLOGY_OUTPUT_INVALID,
+                    format!(
+                        "batched Git old-side range output is missing for fix commit {}",
+                        commit.sha
+                    ),
+                )
+            })?;
         skipped_gitlink_paths += old_changed.skipped_gitlink_paths;
-        diff_ms += diff_start.elapsed().as_millis();
         blame.requested_ranges = blame
             .requested_ranges
             .checked_add(old_changed.ranges.len())
@@ -552,7 +672,12 @@ pub fn mine_git_archaeology(
     if arch_timing {
         eprintln!(
             "astro.arch.timing phase=mine_internal read_commits_ms={read_commits_ms} \
-             commits={commit_count} diff_ms={diff_ms} blame_ms={} \
+             commits={commit_count} diff_count_ms={} diff_ranges_ms={} blame_ms={} \
+             diff_count_requested_commits={} diff_count_processes={} \
+             diff_count_processes_avoided={} diff_count_stdout_bytes={} \
+             diff_ranges_requested_commits={} diff_ranges_processes={} \
+             diff_ranges_processes_avoided={} diff_ranges_stdout_bytes={} \
+             diff_tree_batch_limit_commits={} \
              blame_requested_ranges={} blame_effective_ranges={} blame_processes={} \
              blame_returned_spans={} blame_returned_lines={} blame_stdout_bytes={} \
              skipped_merge_fixes={skipped_merge_fixes} \
@@ -560,7 +685,18 @@ pub fn mine_git_archaeology(
              skipped_unresolvable_reverts={skipped_unresolvable_reverts} \
              skipped_gitlink_paths={skipped_gitlink_paths} \
              skipped_unblamable_paths={skipped_unblamable_paths} file_cap={file_cap}",
+            diff_tree.count_wall_ms,
+            diff_tree.ranges_wall_ms,
             blame.wall_ms,
+            diff_tree.count_requested_commits,
+            diff_tree.count_processes,
+            diff_tree.count_processes_avoided,
+            diff_tree.count_stdout_bytes,
+            diff_tree.ranges_requested_commits,
+            diff_tree.ranges_processes,
+            diff_tree.ranges_processes_avoided,
+            diff_tree.ranges_stdout_bytes,
+            diff_tree.batch_limit_commits,
             blame.requested_ranges,
             blame.effective_ranges,
             blame.processes,
@@ -579,6 +715,7 @@ pub fn mine_git_archaeology(
         skipped_unresolvable_reverts,
         skipped_gitlink_paths,
         skipped_unblamable_paths,
+        diff_tree,
         blame,
     })
 }
@@ -875,13 +1012,324 @@ pub fn changed_new_ranges_between(
     changed_ranges(repo, old, new, false, None)
 }
 
-fn changed_old_ranges(
+fn changed_file_counts_for_commits(
     repo: &Path,
-    parent: &str,
-    commit: &str,
+    candidates: &[DiffTreeCandidate],
     pathspec: Option<&str>,
-) -> Result<ChangedRanges, ArchaeologyError> {
-    changed_ranges(repo, parent, commit, true, pathspec)
+    telemetry: &mut GitDiffTreeBatchTelemetry,
+) -> Result<BTreeMap<String, usize>, ArchaeologyError> {
+    validate_diff_tree_candidates(candidates)?;
+    telemetry.count_requested_commits = telemetry
+        .count_requested_commits
+        .checked_add(candidates.len())
+        .ok_or_else(|| {
+            ArchaeologyError::new(
+                ASTRO_ARCHAEOLOGY_OUTPUT_INVALID,
+                "Git diff-tree count requested-commit telemetry overflowed usize",
+            )
+        })?;
+    let mut counts = BTreeMap::new();
+    if candidates.is_empty() {
+        return Ok(counts);
+    }
+    for chunk in candidates.chunks(telemetry.batch_limit_commits) {
+        let mut args = vec!["diff-tree", "--stdin", "--raw", "-z", "-r"];
+        if let Some(prefix) = pathspec {
+            args.push("--");
+            args.push(prefix);
+        }
+        let stdin = diff_tree_stdin(chunk);
+        let start = std::time::Instant::now();
+        let output = git_with_stdin(repo, &args, stdin.as_bytes())?;
+        telemetry.count_wall_ms = telemetry
+            .count_wall_ms
+            .saturating_add(elapsed_u64_ms(start.elapsed()));
+        telemetry.count_processes = telemetry.count_processes.checked_add(1).ok_or_else(|| {
+            ArchaeologyError::new(
+                ASTRO_ARCHAEOLOGY_OUTPUT_INVALID,
+                "Git diff-tree count process telemetry overflowed usize",
+            )
+        })?;
+        telemetry.count_stdout_bytes = telemetry
+            .count_stdout_bytes
+            .checked_add(u64::try_from(output.len()).map_err(|_| {
+                ArchaeologyError::new(
+                    ASTRO_ARCHAEOLOGY_OUTPUT_INVALID,
+                    "Git diff-tree raw count stdout length cannot be represented as u64",
+                )
+            })?)
+            .ok_or_else(|| {
+                ArchaeologyError::new(
+                    ASTRO_ARCHAEOLOGY_OUTPUT_INVALID,
+                    "Git diff-tree count stdout-byte telemetry overflowed u64",
+                )
+            })?;
+        counts.extend(parse_diff_tree_raw_counts(&output, chunk)?);
+    }
+    telemetry.count_processes_avoided = telemetry
+        .count_requested_commits
+        .saturating_sub(telemetry.count_processes);
+    Ok(counts)
+}
+
+fn changed_old_ranges_for_commits(
+    repo: &Path,
+    candidates: &[DiffTreeCandidate],
+    pathspec: Option<&str>,
+    telemetry: &mut GitDiffTreeBatchTelemetry,
+) -> Result<BTreeMap<String, ChangedRanges>, ArchaeologyError> {
+    validate_diff_tree_candidates(candidates)?;
+    telemetry.ranges_requested_commits = telemetry
+        .ranges_requested_commits
+        .checked_add(candidates.len())
+        .ok_or_else(|| {
+            ArchaeologyError::new(
+                ASTRO_ARCHAEOLOGY_OUTPUT_INVALID,
+                "Git diff-tree range requested-commit telemetry overflowed usize",
+            )
+        })?;
+    let mut ranges = BTreeMap::new();
+    if candidates.is_empty() {
+        return Ok(ranges);
+    }
+    for chunk in candidates.chunks(telemetry.batch_limit_commits) {
+        let mut args = vec![
+            "diff-tree",
+            "--stdin",
+            "--unified=0",
+            "--no-prefix",
+            "--no-color",
+            "--no-ext-diff",
+            "--no-textconv",
+            "-r",
+        ];
+        if let Some(prefix) = pathspec {
+            args.push("--");
+            args.push(prefix);
+        }
+        let stdin = diff_tree_stdin(chunk);
+        let start = std::time::Instant::now();
+        let output = git_with_stdin(repo, &args, stdin.as_bytes())?;
+        telemetry.ranges_wall_ms = telemetry
+            .ranges_wall_ms
+            .saturating_add(elapsed_u64_ms(start.elapsed()));
+        telemetry.ranges_processes =
+            telemetry.ranges_processes.checked_add(1).ok_or_else(|| {
+                ArchaeologyError::new(
+                    ASTRO_ARCHAEOLOGY_OUTPUT_INVALID,
+                    "Git diff-tree range process telemetry overflowed usize",
+                )
+            })?;
+        telemetry.ranges_stdout_bytes = telemetry
+            .ranges_stdout_bytes
+            .checked_add(u64::try_from(output.len()).map_err(|_| {
+                ArchaeologyError::new(
+                    ASTRO_ARCHAEOLOGY_OUTPUT_INVALID,
+                    "Git diff-tree unified stdout length cannot be represented as u64",
+                )
+            })?)
+            .ok_or_else(|| {
+                ArchaeologyError::new(
+                    ASTRO_ARCHAEOLOGY_OUTPUT_INVALID,
+                    "Git diff-tree range stdout-byte telemetry overflowed u64",
+                )
+            })?;
+        let output = String::from_utf8(output).map_err(|error| {
+            ArchaeologyError::new(
+                ASTRO_ARCHAEOLOGY_OUTPUT_INVALID,
+                format!("Git output is not UTF-8: {error}"),
+            )
+        })?;
+        ranges.extend(parse_diff_tree_patch_ranges(&output, chunk, true)?);
+    }
+    telemetry.ranges_processes_avoided = telemetry
+        .ranges_requested_commits
+        .saturating_sub(telemetry.ranges_processes);
+    Ok(ranges)
+}
+
+fn validate_diff_tree_candidates(candidates: &[DiffTreeCandidate]) -> Result<(), ArchaeologyError> {
+    for candidate in candidates {
+        validate_oid(&candidate.parent)?;
+        validate_oid(&candidate.commit)?;
+    }
+    Ok(())
+}
+
+fn diff_tree_stdin(candidates: &[DiffTreeCandidate]) -> String {
+    let mut stdin = String::new();
+    for candidate in candidates {
+        stdin.push_str(&candidate.commit);
+        stdin.push('\n');
+    }
+    stdin
+}
+
+fn parse_diff_tree_raw_counts(
+    output: &[u8],
+    candidates: &[DiffTreeCandidate],
+) -> Result<BTreeMap<String, usize>, ArchaeologyError> {
+    let mut tokens = output.split(|byte| *byte == 0).collect::<Vec<_>>();
+    while tokens.last().is_some_and(|token| token.is_empty()) {
+        tokens.pop();
+    }
+    let mut index = 0usize;
+    let mut counts = BTreeMap::new();
+    for (candidate_index, candidate) in candidates.iter().enumerate() {
+        let Some(header) = tokens.get(index) else {
+            return Err(ArchaeologyError::new(
+                ASTRO_ARCHAEOLOGY_OUTPUT_INVALID,
+                format!(
+                    "Git diff-tree raw output ended before commit header {}",
+                    candidate.commit
+                ),
+            ));
+        };
+        let header = utf8_trim(header)?;
+        if header != candidate.commit {
+            return Err(ArchaeologyError::new(
+                ASTRO_ARCHAEOLOGY_OUTPUT_INVALID,
+                format!(
+                    "Git diff-tree raw output header mismatch at batch index {candidate_index}: expected {}, got {header}",
+                    candidate.commit
+                ),
+            ));
+        }
+        index += 1;
+        let mut count = 0usize;
+        let next_commit = candidates.get(candidate_index + 1);
+        loop {
+            let Some(token) = tokens.get(index) else {
+                break;
+            };
+            if next_commit
+                .is_some_and(|next| diff_tree_token_matches_commit(token, next.commit.as_str()))
+            {
+                break;
+            }
+            if !token.starts_with(b":") {
+                return Err(ArchaeologyError::new(
+                    ASTRO_ARCHAEOLOGY_OUTPUT_INVALID,
+                    format!(
+                        "Git diff-tree raw output for commit {} contained a non-record token before the next commit header",
+                        candidate.commit
+                    ),
+                ));
+            }
+            let meta = std::str::from_utf8(token).map_err(|error| {
+                ArchaeologyError::new(
+                    ASTRO_ARCHAEOLOGY_OUTPUT_INVALID,
+                    format!("Git diff-tree raw metadata is not UTF-8: {error}"),
+                )
+            })?;
+            let status = meta.split_whitespace().last().ok_or_else(|| {
+                ArchaeologyError::new(
+                    ASTRO_ARCHAEOLOGY_OUTPUT_INVALID,
+                    format!("Git diff-tree raw metadata is missing a status: {meta:?}"),
+                )
+            })?;
+            let path_fields = if status.starts_with('R') || status.starts_with('C') {
+                2
+            } else {
+                1
+            };
+            index += 1;
+            for _ in 0..path_fields {
+                let Some(path) = tokens.get(index) else {
+                    return Err(ArchaeologyError::new(
+                        ASTRO_ARCHAEOLOGY_OUTPUT_INVALID,
+                        format!(
+                            "Git diff-tree raw output for commit {} ended mid-path record",
+                            candidate.commit
+                        ),
+                    ));
+                };
+                if path.is_empty() {
+                    return Err(ArchaeologyError::new(
+                        ASTRO_ARCHAEOLOGY_OUTPUT_INVALID,
+                        format!(
+                            "Git diff-tree raw output for commit {} contained an empty changed path",
+                            candidate.commit
+                        ),
+                    ));
+                }
+                index += 1;
+            }
+            count = count.checked_add(1).ok_or_else(|| {
+                ArchaeologyError::new(
+                    ASTRO_ARCHAEOLOGY_OUTPUT_INVALID,
+                    "Git diff-tree changed-file count overflowed usize",
+                )
+            })?;
+        }
+        counts.insert(candidate.commit.clone(), count);
+    }
+    if index != tokens.len() {
+        return Err(ArchaeologyError::new(
+            ASTRO_ARCHAEOLOGY_OUTPUT_INVALID,
+            "Git diff-tree raw output contained trailing records after the expected commit batch",
+        ));
+    }
+    Ok(counts)
+}
+
+fn diff_tree_token_matches_commit(token: &[u8], commit: &str) -> bool {
+    std::str::from_utf8(token)
+        .map(|value| value.trim() == commit)
+        .unwrap_or(false)
+}
+
+fn parse_diff_tree_patch_ranges(
+    output: &str,
+    candidates: &[DiffTreeCandidate],
+    old_side: bool,
+) -> Result<BTreeMap<String, ChangedRanges>, ArchaeologyError> {
+    let mut current_index = None::<usize>;
+    let mut next_header = 0usize;
+    let mut current_diff = String::new();
+    let mut ranges = BTreeMap::new();
+    for line in output.lines() {
+        if next_header < candidates.len() && line == candidates[next_header].commit.as_str() {
+            if let Some(index) = current_index.replace(next_header) {
+                let parsed = parse_unified_ranges(&current_diff, old_side)?;
+                ranges.insert(candidates[index].commit.clone(), parsed);
+                current_diff.clear();
+            }
+            next_header += 1;
+            continue;
+        }
+        let Some(index) = current_index else {
+            return Err(ArchaeologyError::new(
+                ASTRO_ARCHAEOLOGY_OUTPUT_INVALID,
+                format!(
+                    "Git diff-tree patch output began before the expected commit header: {line:?}"
+                ),
+            ));
+        };
+        if is_oid(line) {
+            return Err(ArchaeologyError::new(
+                ASTRO_ARCHAEOLOGY_OUTPUT_INVALID,
+                format!(
+                    "Git diff-tree patch output for commit {} emitted unexpected commit-like header {line}",
+                    candidates[index].commit
+                ),
+            ));
+        }
+        current_diff.push_str(line);
+        current_diff.push('\n');
+    }
+    if let Some(index) = current_index {
+        let parsed = parse_unified_ranges(&current_diff, old_side)?;
+        ranges.insert(candidates[index].commit.clone(), parsed);
+    }
+    if next_header != candidates.len() {
+        let expected = &candidates[next_header].commit;
+        return Err(ArchaeologyError::new(
+            ASTRO_ARCHAEOLOGY_OUTPUT_INVALID,
+            format!("Git diff-tree patch output did not include expected commit header {expected}"),
+        ));
+    }
+    Ok(ranges)
 }
 
 /// Cheap changed-file count between `parent` and `commit`, limited to `pathspec`

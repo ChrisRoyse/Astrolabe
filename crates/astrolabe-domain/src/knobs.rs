@@ -234,7 +234,7 @@ pub fn row_sink_stream_knob(name: &str) -> Option<&'static U64KnobDeclaration> {
 
 /// Registry version tag for Git-archaeology persistence batching (#858).
 pub const ARCHAEOLOGY_PERSIST_KNOB_REGISTRY_VERSION: &str =
-    "astrolabe-archaeology-persist-knobs-v2";
+    "astrolabe-archaeology-persist-knobs-v3";
 /// Name of the ordered anchor-entry group-commit bound.
 pub const ARCHAEOLOGY_ANCHOR_BATCH_ENTRIES_KNOB: &str = "archaeology_anchor_batch_entries";
 /// Default logical anchor entries per ordered group commit.
@@ -258,6 +258,21 @@ pub const ARCHAEOLOGY_DEFAULT_HISTORICAL_BATCH_GROUPS: u64 = 64;
 pub const ARCHAEOLOGY_MIN_HISTORICAL_BATCH_GROUPS: u64 = 1;
 /// Largest legal explicit historical window.
 pub const ARCHAEOLOGY_MAX_HISTORICAL_BATCH_GROUPS: u64 = 1_024;
+/// Name of the Git `diff-tree --stdin` commit batch bound.
+pub const ARCHAEOLOGY_DIFF_TREE_BATCH_COMMITS_KNOB: &str = "archaeology_diff_tree_batch_commits";
+/// Default commits per Git `diff-tree --stdin` child.
+///
+/// The #858 Bevy readback saw 1,025 fix-like candidates in the one-year window.
+/// A 128-commit stdin batch reduces the mine-side diff-count/content children
+/// from roughly one per candidate to nine per pass while bounding per-project
+/// stdout/request memory for the 4-5 concurrent local indexing sessions this
+/// machine is expected to run.
+pub const ARCHAEOLOGY_DEFAULT_DIFF_TREE_BATCH_COMMITS: u64 = 128;
+/// Smallest legal diff-tree batch: every spawned child must make progress.
+pub const ARCHAEOLOGY_MIN_DIFF_TREE_BATCH_COMMITS: u64 = 1;
+/// Largest legal diff-tree batch: keeps one project from creating an unbounded
+/// in-memory diff payload while still allowing a measured larger window.
+pub const ARCHAEOLOGY_MAX_DIFF_TREE_BATCH_COMMITS: u64 = 1_024;
 
 /// Git-archaeology persistence knob registry (#858).
 pub const ARCHAEOLOGY_PERSIST_KNOBS: &[U64KnobDeclaration] = &[
@@ -280,6 +295,16 @@ pub const ARCHAEOLOGY_PERSIST_KNOBS: &[U64KnobDeclaration] = &[
         unit: "historical_commit_groups",
         source: "ASTROLABE #858 Bevy physical FSV and the existing measured 64-commit historical extraction-worker recycle boundary",
         rationale: "coalesces repeated Base/slot/Ledger fsync and SST publication across a bounded project-local window while preserving exact Ingest/Grounding order; 64 reuses the established per-process recycle boundary instead of introducing an unrelated memory multiplier",
+    },
+    U64KnobDeclaration {
+        registry_version: ARCHAEOLOGY_PERSIST_KNOB_REGISTRY_VERSION,
+        name: ARCHAEOLOGY_DIFF_TREE_BATCH_COMMITS_KNOB,
+        default: ARCHAEOLOGY_DEFAULT_DIFF_TREE_BATCH_COMMITS,
+        min: ARCHAEOLOGY_MIN_DIFF_TREE_BATCH_COMMITS,
+        max: ARCHAEOLOGY_MAX_DIFF_TREE_BATCH_COMMITS,
+        unit: "commits",
+        source: "ASTROLABE #858 Bevy physical FSV: one-year mine window contained 1,025 fix-like candidates and live polling observed repeated short-lived git diff children before historical extraction",
+        rationale: "uses Git's documented diff-tree --stdin protocol to amortize process startup across a bounded per-project commit window without changing diff/blame semantics; 128 keeps each local project independent and memory-bounded while cutting Bevy-scale cold diff process count by about two orders of magnitude",
     },
 ];
 

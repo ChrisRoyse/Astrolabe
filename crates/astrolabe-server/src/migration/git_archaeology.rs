@@ -27,6 +27,7 @@ use calyx_core::{AnchorKind, AnchorValue, CxId};
 const ARCHAEOLOGY_ACTOR: &str = "astrolabe-git-archaeology";
 const ARCHAEOLOGY_ANCHOR_BATCH_ENV: &str = "ASTRO_ARCHAEOLOGY_ANCHOR_BATCH_ENTRIES";
 const ARCHAEOLOGY_HISTORICAL_BATCH_ENV: &str = "ASTRO_ARCHAEOLOGY_HISTORICAL_BATCH_GROUPS";
+const ARCHAEOLOGY_DIFF_TREE_BATCH_ENV: &str = "ASTRO_ARCHAEOLOGY_DIFF_TREE_BATCH_COMMITS";
 
 /// Write-side prefix for the transient git-archaeology scratch STORE this module
 /// drops into the CBM store dir: the historical-index scratch database
@@ -202,6 +203,28 @@ pub(crate) struct GitArchaeologyImportReport {
     /// Each is a counted, labeled mining skip (invariant 3); every other blame
     /// failure stays repo-fatal.
     pub(crate) skipped_unblamable_paths: usize,
+    /// Fix-like single-parent commits submitted to Git diff-tree raw count batching.
+    pub(crate) diff_tree_count_requested_commits: usize,
+    /// Raw count `git diff-tree --stdin` processes spawned.
+    pub(crate) diff_tree_count_processes: usize,
+    /// Per-commit raw count processes avoided by batching.
+    pub(crate) diff_tree_count_processes_avoided: usize,
+    /// Exact stdout bytes emitted by raw count batches.
+    pub(crate) diff_tree_count_stdout_bytes: u64,
+    /// Under-cap fix-like commits submitted to Git diff-tree unified range batching.
+    pub(crate) diff_tree_ranges_requested_commits: usize,
+    /// Unified range `git diff-tree --stdin` processes spawned.
+    pub(crate) diff_tree_ranges_processes: usize,
+    /// Per-commit unified range processes avoided by batching.
+    pub(crate) diff_tree_ranges_processes_avoided: usize,
+    /// Exact stdout bytes emitted by unified range batches.
+    pub(crate) diff_tree_ranges_stdout_bytes: u64,
+    /// Observed wall time for raw count batches.
+    pub(crate) diff_tree_count_wall_ms: u64,
+    /// Observed wall time for unified range batches.
+    pub(crate) diff_tree_ranges_wall_ms: u64,
+    /// Effective registry-declared diff-tree batch bound.
+    pub(crate) diff_tree_batch_limit_commits: usize,
     /// Original SZZ line ranges submitted to Git blame.
     pub(crate) blame_requested_ranges: usize,
     /// Exact union ranges after overlap/adjacency coalescing.
@@ -381,7 +404,7 @@ pub(crate) fn run_git_archaeology<C: Clock>(
         GitMineMode::Full => "full",
         GitMineMode::Since { .. } => "incremental",
     };
-    let (anchor_batch_limit, historical_batch_group_limit) =
+    let (anchor_batch_limit, historical_batch_group_limit, diff_tree_batch_limit) =
         preflight_git_archaeology_persistence_limits()?;
     // Member-corpus scoping key (#403 + #381): resolve the requested corpus relative
     // to its git toplevel ONCE, up front. It drives three things: (a) it pathspec-
@@ -409,6 +432,7 @@ pub(crate) fn run_git_archaeology<C: Clock>(
     let mine_start = std::time::Instant::now();
     let config = GitArchaeologyConfig {
         member_prefix: (!corpus_rel.is_empty()).then(|| corpus_rel.clone()),
+        diff_tree_batch_commits: diff_tree_batch_limit,
         ..GitArchaeologyConfig::default()
     };
     let mined = mine_git_archaeology(repo, &config, &mode)?;
@@ -566,6 +590,17 @@ pub(crate) fn run_git_archaeology<C: Clock>(
         // skips — one labeled counter on the persisted summary (invariant 3).
         skipped_gitlink_paths: mined.skipped_gitlink_paths + force_removed_skipped_gitlink,
         skipped_unblamable_paths: mined.skipped_unblamable_paths,
+        diff_tree_count_requested_commits: mined.diff_tree.count_requested_commits,
+        diff_tree_count_processes: mined.diff_tree.count_processes,
+        diff_tree_count_processes_avoided: mined.diff_tree.count_processes_avoided,
+        diff_tree_count_stdout_bytes: mined.diff_tree.count_stdout_bytes,
+        diff_tree_ranges_requested_commits: mined.diff_tree.ranges_requested_commits,
+        diff_tree_ranges_processes: mined.diff_tree.ranges_processes,
+        diff_tree_ranges_processes_avoided: mined.diff_tree.ranges_processes_avoided,
+        diff_tree_ranges_stdout_bytes: mined.diff_tree.ranges_stdout_bytes,
+        diff_tree_count_wall_ms: mined.diff_tree.count_wall_ms,
+        diff_tree_ranges_wall_ms: mined.diff_tree.ranges_wall_ms,
+        diff_tree_batch_limit_commits: mined.diff_tree.batch_limit_commits,
         blame_requested_ranges: mined.blame.requested_ranges,
         blame_effective_ranges: mined.blame.effective_ranges,
         blame_processes: mined.blame.processes,
@@ -825,12 +860,22 @@ fn archaeology_historical_batch_groups() -> Result<usize, DynError> {
     )
 }
 
+fn archaeology_diff_tree_batch_commits() -> Result<usize, DynError> {
+    archaeology_persist_limit(
+        astrolabe_domain::knobs::ARCHAEOLOGY_DIFF_TREE_BATCH_COMMITS_KNOB,
+        ARCHAEOLOGY_DIFF_TREE_BATCH_ENV,
+        "commits",
+    )
+}
+
 /// Validate every operator-controlled archaeology persistence bound before an
 /// index transition or staging publication can mutate durable state.
-pub(crate) fn preflight_git_archaeology_persistence_limits() -> Result<(usize, usize), DynError> {
+pub(crate) fn preflight_git_archaeology_persistence_limits()
+-> Result<(usize, usize, usize), DynError> {
     Ok((
         archaeology_anchor_batch_entries()?,
         archaeology_historical_batch_groups()?,
+        archaeology_diff_tree_batch_commits()?,
     ))
 }
 
@@ -2504,44 +2549,329 @@ fn index_historical_commit(
         // partial kernel.
         pool.extract(&scoped_root, &database, &identity_root, project, commit)
     })();
-    let mut cleanup_remnants = cleanup_archaeology_database(&database);
-    if !remove_path_with_retry(&worktree, |path| fs::remove_dir_all(path)) {
-        cleanup_remnants += 1;
-    }
     match indexed {
-        Ok(HistoricalExtract::Rows(rows)) => Ok(HistoricalCommitIndex {
-            rows,
-            cleanup_remnants,
-            windows_invalid_excluded: materialized.windows_invalid_excluded,
-            git_inventory_processes: materialized.git_inventory_processes,
-            git_checkout_processes: materialized.git_checkout_processes,
-            files_materialized: materialized.files_materialized,
-            source_files_materialized,
-            object_probe_processes_avoided: materialized.object_probe_processes_avoided,
-            crashed: None,
-        }),
+        Ok(HistoricalExtract::Rows(rows)) => {
+            let mut cleanup_remnants = cleanup_archaeology_database(&database);
+            if !remove_path_with_retry(&worktree, |path| fs::remove_dir_all(path)) {
+                cleanup_remnants += 1;
+            }
+            Ok(HistoricalCommitIndex {
+                rows,
+                cleanup_remnants,
+                windows_invalid_excluded: materialized.windows_invalid_excluded,
+                git_inventory_processes: materialized.git_inventory_processes,
+                git_checkout_processes: materialized.git_checkout_processes,
+                files_materialized: materialized.files_materialized,
+                source_files_materialized,
+                object_probe_processes_avoided: materialized.object_probe_processes_avoided,
+                crashed: None,
+            })
+        }
         // #515 contained child fault: the extraction child died without rows. Return
-        // exact crash detail after materialization/database cleanup accounting; the
-        // caller fails the index-wide request and must not publish partial archaeology.
-        Ok(HistoricalExtract::Crashed(detail)) => Ok(HistoricalCommitIndex {
-            rows: CbmPipelineRows {
-                project: project.to_string(),
-                nodes: Vec::new(),
-                edges: Vec::new(),
-                file_hashes: Vec::new(),
-                manifest: None,
-            },
-            cleanup_remnants,
-            windows_invalid_excluded: materialized.windows_invalid_excluded,
-            git_inventory_processes: materialized.git_inventory_processes,
-            git_checkout_processes: materialized.git_checkout_processes,
-            files_materialized: materialized.files_materialized,
-            source_files_materialized,
-            object_probe_processes_avoided: materialized.object_probe_processes_avoided,
-            crashed: Some(detail),
-        }),
+        // exact crash detail and preserve the exact materialized input so the caller
+        // can fail closed with enough physical state to reproduce the C fault. This
+        // intentionally does NOT clean the checkout/database on the crash path; normal
+        // success cleanup remains unchanged.
+        Ok(HistoricalExtract::Crashed(detail)) => {
+            let preservation = preserve_historical_crash_artifacts(
+                &worktree,
+                &database,
+                &pool.log_path,
+                project,
+                commit,
+                &checkout_root,
+                &materialized,
+                source_files_materialized,
+            );
+            let detail = format!("{detail} preserved_input=<<{preservation}>>");
+            Ok(HistoricalCommitIndex {
+                rows: CbmPipelineRows {
+                    project: project.to_string(),
+                    nodes: Vec::new(),
+                    edges: Vec::new(),
+                    file_hashes: Vec::new(),
+                    manifest: None,
+                },
+                cleanup_remnants: 0,
+                windows_invalid_excluded: materialized.windows_invalid_excluded,
+                git_inventory_processes: materialized.git_inventory_processes,
+                git_checkout_processes: materialized.git_checkout_processes,
+                files_materialized: materialized.files_materialized,
+                source_files_materialized,
+                object_probe_processes_avoided: materialized.object_probe_processes_avoided,
+                crashed: Some(detail),
+            })
+        }
         Err(error) => Err(error),
     }
+}
+
+fn preserve_historical_crash_artifacts(
+    worktree: &Path,
+    database: &Path,
+    worker_log: &Path,
+    project: &str,
+    commit: &str,
+    checkout_root: &Path,
+    materialized: &HistoricalMaterialization,
+    source_files_materialized: usize,
+) -> String {
+    let result = (|| -> Result<Value, DynError> {
+        let parent = worktree.parent().ok_or_else(|| -> DynError {
+            format!(
+                "ASTRO_ARCHAEOLOGY_CRASH_PRESERVE_PARENT_MISSING: worktree {} has no parent",
+                worktree.display()
+            )
+            .into()
+        })?;
+        let worktree_name = worktree
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| -> DynError {
+                format!(
+                    "ASTRO_ARCHAEOLOGY_CRASH_PRESERVE_WORKTREE_NAME_INVALID: worktree {} has no UTF-8 final component",
+                    worktree.display()
+                )
+                .into()
+            })?;
+        let preserved = parent.join(format!("crash-{}-{worktree_name}", &commit[..12]));
+        fs::rename(worktree, &preserved).map_err(|error| -> DynError {
+            format!(
+                "ASTRO_ARCHAEOLOGY_CRASH_PRESERVE_RENAME_FAILED: could not rename {} to {}: {error}; original checkout is intentionally left in place",
+                worktree.display(),
+                preserved.display()
+            )
+            .into()
+        })?;
+        let preserved_checkout = preserved.join(
+            checkout_root
+                .file_name()
+                .ok_or_else(|| -> DynError {
+                    "ASTRO_ARCHAEOLOGY_CRASH_PRESERVE_CHECKOUT_NAME_INVALID: checkout root has no final component"
+                        .into()
+                })?,
+        );
+        let tree_inventory = inventory_directory_for_preservation(&preserved_checkout)?;
+
+        let database_dir = preserved.join("database");
+        fs::create_dir(&database_dir).map_err(|error| -> DynError {
+            format!(
+                "ASTRO_ARCHAEOLOGY_CRASH_PRESERVE_DB_DIR_FAILED: could not create {}: {error}; preserved checkout remains at {}",
+                database_dir.display(),
+                preserved.display()
+            )
+            .into()
+        })?;
+        let mut database_paths = Vec::new();
+        for path in archaeology_database_family_paths(database) {
+            if !path.exists() {
+                continue;
+            }
+            let file_name = path.file_name().ok_or_else(|| -> DynError {
+                format!(
+                    "ASTRO_ARCHAEOLOGY_CRASH_PRESERVE_DB_NAME_INVALID: database sidecar {} has no file name",
+                    path.display()
+                )
+                .into()
+            })?;
+            let destination = database_dir.join(file_name);
+            fs::rename(&path, &destination).map_err(|error| -> DynError {
+                format!(
+                    "ASTRO_ARCHAEOLOGY_CRASH_PRESERVE_DB_RENAME_FAILED: could not rename {} to {}: {error}; preserved checkout remains at {}",
+                    path.display(),
+                    destination.display(),
+                    preserved.display()
+                )
+                .into()
+            })?;
+            database_paths.push(destination.display().to_string());
+        }
+        let database_inventory = inventory_directory_for_preservation(&database_dir)?;
+
+        let worker_log_path = preserved.join("worker.log");
+        let worker_log_sha256 = if worker_log.exists() {
+            fs::copy(worker_log, &worker_log_path).map_err(|error| -> DynError {
+                format!(
+                    "ASTRO_ARCHAEOLOGY_CRASH_PRESERVE_LOG_COPY_FAILED: could not copy {} to {}: {error}; preserved checkout remains at {}",
+                    worker_log.display(),
+                    worker_log_path.display(),
+                    preserved.display()
+                )
+                .into()
+            })?;
+            Some(hex_lower(&Sha256::digest(fs::read(&worker_log_path)?)))
+        } else {
+            None
+        };
+
+        let manifest_path = preserved.join("crash-preservation.json");
+        let manifest_tmp = preserved.join("crash-preservation.json.tmp");
+        let manifest = json!({
+            "schema": "astrolabe.archaeology-crash-preservation.v1",
+            "status": "preserved",
+            "project": project,
+            "commit": commit,
+            "preserved_root": preserved.display().to_string(),
+            "checkout_root": preserved_checkout.display().to_string(),
+            "database_dir": database_dir.display().to_string(),
+            "database_paths": database_paths,
+            "worker_log": worker_log.exists().then(|| worker_log_path.display().to_string()),
+            "worker_log_sha256": worker_log_sha256,
+            "files_materialized": materialized.files_materialized,
+            "source_files_materialized": source_files_materialized,
+            "windows_invalid_excluded": materialized.windows_invalid_excluded,
+            "git_inventory_processes": materialized.git_inventory_processes,
+            "git_checkout_processes": materialized.git_checkout_processes,
+            "object_probe_processes_avoided": materialized.object_probe_processes_avoided,
+            "checkout_inventory": tree_inventory.to_json(),
+            "database_inventory": database_inventory.to_json(),
+        });
+        let manifest_bytes = serde_json::to_vec_pretty(&manifest)?;
+        fs::write(&manifest_tmp, &manifest_bytes)?;
+        fs::rename(&manifest_tmp, &manifest_path)?;
+        let readback_bytes = fs::read(&manifest_path)?;
+        let readback: Value = serde_json::from_slice(&readback_bytes)?;
+        if readback != manifest {
+            return Err(format!(
+                "ASTRO_ARCHAEOLOGY_CRASH_PRESERVE_MANIFEST_DRIFT: readback of {} did not match the written manifest; preserved checkout remains at {}",
+                manifest_path.display(),
+                preserved.display()
+            )
+            .into());
+        }
+        Ok(json!({
+            "schema": "astrolabe.archaeology-crash-preservation-result.v1",
+            "status": "preserved",
+            "root": preserved.display().to_string(),
+            "manifest": manifest_path.display().to_string(),
+            "manifest_sha256": hex_lower(&Sha256::digest(readback_bytes)),
+            "checkout_files": tree_inventory.files,
+            "checkout_bytes": tree_inventory.bytes,
+            "checkout_inventory_sha256": tree_inventory.inventory_sha256,
+            "database_files": database_inventory.files,
+            "database_bytes": database_inventory.bytes,
+            "database_inventory_sha256": database_inventory.inventory_sha256,
+            "worker_log_sha256": worker_log_sha256,
+        }))
+    })();
+    let payload = match result {
+        Ok(value) => value,
+        Err(error) => json!({
+            "schema": "astrolabe.archaeology-crash-preservation-result.v1",
+            "status": "preservation_failed",
+            "error": error.to_string(),
+            "original_worktree": worktree.display().to_string(),
+            "original_database": database.display().to_string(),
+            "worker_log": worker_log.display().to_string(),
+        }),
+    };
+    serde_json::to_string(&payload).unwrap_or_else(|error| {
+        format!(
+            "{{\"schema\":\"astrolabe.archaeology-crash-preservation-result.v1\",\"status\":\"serialization_failed\",\"error\":{error:?}}}"
+        )
+    })
+}
+
+#[derive(Debug, Clone)]
+struct PreservationInventory {
+    files: usize,
+    bytes: u64,
+    inventory_sha256: String,
+}
+
+impl PreservationInventory {
+    fn to_json(&self) -> Value {
+        json!({
+            "files": self.files,
+            "bytes": self.bytes,
+            "inventory_sha256": self.inventory_sha256,
+        })
+    }
+}
+
+fn inventory_directory_for_preservation(root: &Path) -> Result<PreservationInventory, DynError> {
+    let mut records = Vec::new();
+    let mut bytes = 0u64;
+    inventory_directory_inner(root, root, &mut records, &mut bytes)?;
+    records.sort();
+    let mut hasher = Sha256::new();
+    for record in &records {
+        hasher.update(record.as_bytes());
+        hasher.update([0]);
+    }
+    Ok(PreservationInventory {
+        files: records.len(),
+        bytes,
+        inventory_sha256: hex_lower(&hasher.finalize()),
+    })
+}
+
+fn inventory_directory_inner(
+    root: &Path,
+    current: &Path,
+    records: &mut Vec<String>,
+    bytes: &mut u64,
+) -> Result<(), DynError> {
+    let entries = fs::read_dir(current).map_err(|error| -> DynError {
+        format!(
+            "ASTRO_ARCHAEOLOGY_CRASH_PRESERVE_INVENTORY_UNREADABLE: could not read {}: {error}",
+            current.display()
+        )
+        .into()
+    })?;
+    let mut entries = entries.collect::<Result<Vec<_>, _>>()?;
+    entries.sort_by_key(|entry| entry.file_name());
+    for entry in entries {
+        let path = entry.path();
+        let metadata = fs::symlink_metadata(&path)?;
+        if metadata.is_dir() {
+            inventory_directory_inner(root, &path, records, bytes)?;
+            continue;
+        }
+        let rel = path.strip_prefix(root).map_err(|error| -> DynError {
+            format!(
+                "ASTRO_ARCHAEOLOGY_CRASH_PRESERVE_INVENTORY_RELATIVE_FAILED: {} is not below {}: {error}",
+                path.display(),
+                root.display()
+            )
+            .into()
+        })?;
+        let rel = rel.to_string_lossy().replace('\\', "/");
+        if metadata.is_file() {
+            let data = fs::read(&path)?;
+            let len = u64::try_from(data.len()).map_err(|_| -> DynError {
+                format!(
+                    "ASTRO_ARCHAEOLOGY_CRASH_PRESERVE_FILE_TOO_LARGE: {} length cannot be represented as u64",
+                    path.display()
+                )
+                .into()
+            })?;
+            *bytes = bytes.checked_add(len).ok_or_else(|| -> DynError {
+                "ASTRO_ARCHAEOLOGY_CRASH_PRESERVE_INVENTORY_BYTES_OVERFLOW: preserved byte count overflowed u64"
+                    .into()
+            })?;
+            records.push(format!(
+                "file\t{rel}\t{len}\t{}",
+                hex_lower(&Sha256::digest(data))
+            ));
+        } else {
+            records.push(format!(
+                "special\t{rel}\t{}",
+                metadata.file_type().is_symlink()
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn archaeology_database_family_paths(database: &Path) -> Vec<PathBuf> {
+    let mut paths = vec![database.to_path_buf()];
+    for suffix in ["-wal", "-shm", "-journal"] {
+        let mut sidecar = database.as_os_str().to_os_string();
+        sidecar.push(suffix);
+        paths.push(PathBuf::from(sidecar));
+    }
+    paths
 }
 
 /// Removes the SQLite database and its `-wal`/`-shm`/`-journal` sidecars with a
@@ -3339,6 +3669,44 @@ pub(crate) fn git_archaeology_summary(report: &GitArchaeologyImportReport) -> Va
     );
     insert_number!("anchor_batch_wall_ms", report.anchor_batch_wall_ms);
     insert_number!("index_loop_wall_ms", report.index_loop_wall_ms);
+    insert_number!(
+        "diff_tree_count_requested_commits",
+        report.diff_tree_count_requested_commits
+    );
+    insert_number!(
+        "diff_tree_count_processes",
+        report.diff_tree_count_processes
+    );
+    insert_number!(
+        "diff_tree_count_processes_avoided",
+        report.diff_tree_count_processes_avoided
+    );
+    insert_number!(
+        "diff_tree_count_stdout_bytes",
+        report.diff_tree_count_stdout_bytes
+    );
+    insert_number!(
+        "diff_tree_ranges_requested_commits",
+        report.diff_tree_ranges_requested_commits
+    );
+    insert_number!(
+        "diff_tree_ranges_processes",
+        report.diff_tree_ranges_processes
+    );
+    insert_number!(
+        "diff_tree_ranges_processes_avoided",
+        report.diff_tree_ranges_processes_avoided
+    );
+    insert_number!(
+        "diff_tree_ranges_stdout_bytes",
+        report.diff_tree_ranges_stdout_bytes
+    );
+    insert_number!("diff_tree_count_wall_ms", report.diff_tree_count_wall_ms);
+    insert_number!("diff_tree_ranges_wall_ms", report.diff_tree_ranges_wall_ms);
+    insert_number!(
+        "diff_tree_batch_limit_commits",
+        report.diff_tree_batch_limit_commits
+    );
     insert_number!("blame_requested_ranges", report.blame_requested_ranges);
     insert_number!("blame_effective_ranges", report.blame_effective_ranges);
     insert_number!("blame_processes", report.blame_processes);
