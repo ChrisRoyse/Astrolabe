@@ -2339,26 +2339,41 @@ finally {
         try { $childStillLive = -not $child.HasExited }
         catch { $childStillLive = $true }
     }
-    if ($fsvLockOwned -and -not $childStillLive -and
-        (Test-AstroPathLongPath -LiteralPath $fsvLockPath)) {
-        $owned = $false
-        try {
-            $lock = Read-AstroUtf8FileLongPath $fsvLockPath | ConvertFrom-Json
-            $lockRunnerIdentity = Read-AstroFsvProcessIdentity `
-                $lock.owners.runner `
-                'ASTRO_FSV_LOCK_IDENTITY_CHANGED' `
-                'terminal FSV lock runner identity'
-            $owned = $lock.schema -ceq 'astrolabe.native-fsv-lock.v2' -and
-                (Test-AstroFsvIdentityEqual `
-                    $lockRunnerIdentity $runnerIdentity) -and
-                [string]$lock.artifact_sha256 -ceq $artifactHashBefore
+    if ($fsvLockOwned) {
+        if ($childStillLive) {
+            Fail-Astro `
+                'ASTRO_FSV_LOCK_PRESERVED_LIVE_CHILD' `
+                'preserving the FSV lock because the recorded real child is still live' `
+                'wait for the exact child generation to terminate, then retire the lock through the tracker-bound lifecycle'
         }
-        catch { $owned = $false }
-        if ($owned) { Remove-AstroFileLongPath $fsvLockPath }
-        else { [Console]::Error.WriteLine('NATIVE_FSV[ASTRO_FSV_LOCK_IDENTITY_CHANGED]: refusing to remove FSV lock whose identity changed while the runner was live') }
-    }
-    elseif ($fsvLockOwned -and $childStillLive) {
-        [Console]::Error.WriteLine('NATIVE_FSV[ASTRO_FSV_LOCK_PRESERVED_LIVE_CHILD]: preserving the FSV lock because the recorded real child is still live')
+        if (Test-AstroPathLongPath -LiteralPath $fsvLockPath) {
+            $owned = $false
+            try {
+                $lock = Read-AstroUtf8FileLongPath $fsvLockPath | ConvertFrom-Json
+                $lockRunnerIdentity = Read-AstroFsvProcessIdentity `
+                    $lock.owners.runner `
+                    'ASTRO_FSV_LOCK_IDENTITY_CHANGED' `
+                    'terminal FSV lock runner identity'
+                $owned = $lock.schema -ceq 'astrolabe.native-fsv-lock.v2' -and
+                    (Test-AstroFsvIdentityEqual `
+                        $lockRunnerIdentity $runnerIdentity) -and
+                    [string]$lock.artifact_sha256 -ceq $artifactHashBefore
+            }
+            catch { $owned = $false }
+            if (-not $owned) {
+                Fail-Astro `
+                    'ASTRO_FSV_LOCK_IDENTITY_CHANGED' `
+                    'terminal FSV lock no longer matches this exact runner/artifact generation' `
+                    'preserve the lock and session; retire only through the tracker-bound stale-lock lifecycle after exact identity readback'
+            }
+            Remove-AstroFileLongPath $fsvLockPath
+        }
+        if (Test-AstroPathLongPath -LiteralPath $fsvLockPath) {
+            Fail-Astro `
+                'ASTRO_FSV_LOCK_CLEANUP_READBACK_FAILED' `
+                "owned FSV lock remained after terminal cleanup: $fsvLockPath" `
+                'preserve the lock and session; retire only through the tracker-bound stale-lock lifecycle after exact owner absence'
+        }
     }
     if ($null -ne $createdChild) { $createdChild.Dispose() }
     if ($null -ne $child) { $child.Dispose() }

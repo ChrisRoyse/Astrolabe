@@ -26,7 +26,7 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory)]
-    [ValidateSet('Stage', 'Inspect', 'Cleanup', 'Abandon', 'Quarantine', 'MigrateLegacy')]
+    [ValidateSet('Stage', 'Inspect', 'Cleanup', 'Abandon', 'Quarantine', 'MigrateLegacy', 'RetireLock')]
     [string]$Operation,
 
     [string]$SourcePath = '',
@@ -1168,6 +1168,244 @@ try {
             $inspection = Inspect-ReceiptArtifact $receiptState $evidenceRoot
             [ordered]@{ operation = 'inspect'; readback = $inspection } |
                 ConvertTo-Json -Depth 12 -Compress | Write-Output
+        }
+        'RetireLock' {
+            if ($Issue -le 0) {
+                Fail-Astro 'ASTRO_FSV_LOCK_RETIRE_ISSUE_INVALID' `
+                    'Issue must be positive for stale FSV lock retirement' `
+                    'pass the driving GitHub issue number'
+            }
+            if ([string]::IsNullOrWhiteSpace($TrackerCommentUrl)) {
+                Fail-Astro 'ASTRO_FSV_LOCK_RETIRE_TRACKER_REQUIRED' `
+                    'TrackerCommentUrl is required for stale FSV lock retirement' `
+                    'post a GitHub issue comment binding the exact lock/run/session state before mutation'
+            }
+            if ($ReasonCode -notmatch '^[A-Z][A-Z0-9_]{2,95}$') {
+                Fail-Astro 'ASTRO_FSV_LOCK_RETIRE_REASON_INVALID' `
+                    "ReasonCode is not a structured upper-case code: '$ReasonCode'" `
+                    'pass the exact stable failure code that left the stale FSV lock'
+            }
+            if ([string]::IsNullOrWhiteSpace($ReasonMessage)) {
+                Fail-Astro 'ASTRO_FSV_LOCK_RETIRE_REASON_INVALID' `
+                    'ReasonMessage is required and may not be blank' `
+                    'describe the exact stale-lock condition being retired'
+            }
+            if ([string]::IsNullOrWhiteSpace($RecoveryRecordPath)) {
+                Fail-Astro 'ASTRO_FSV_LOCK_RETIRE_RECORD_REQUIRED' `
+                    'RecoveryRecordPath is required for RetireLock' `
+                    "use a fresh JSON path below $recoveryRoot; the record persists after exact lock removal"
+            }
+            if ([string]::IsNullOrWhiteSpace($RunRecordPath)) {
+                Fail-Astro 'ASTRO_FSV_LOCK_RETIRE_RUN_RECORD_REQUIRED' `
+                    'RunRecordPath is required for RetireLock' `
+                    'pass the exact run record written by native-fsv-run.ps1'
+            }
+            if ([string]::IsNullOrWhiteSpace($LiveStatePath)) {
+                Fail-Astro 'ASTRO_FSV_LOCK_RETIRE_LIVE_STATE_REQUIRED' `
+                    'LiveStatePath is required for RetireLock' `
+                    'pass the exact live-state record written by native-fsv-run.ps1'
+            }
+            $receiptState = Read-Receipt $ReceiptPath $evidenceRoot
+            $inspection = Inspect-ReceiptArtifact $receiptState $evidenceRoot
+            $launcherProtocolState =
+                Read-AstroLauncherLock -LockPath $launcherLockPath
+            if ($launcherProtocolState.State -ne 'absent') {
+                Fail-Astro 'ASTRO_FSV_LOCK_RETIRE_LAUNCHER_LOCK' `
+                    "launcher protocol is '$($launcherProtocolState.State)'; stale-lock retirement requires authoritative absence (transitions=$(@($launcherProtocolState.TransitionPaths) -join '; '), read_error=$($launcherProtocolState.ReadError), validation_error=$($launcherProtocolState.ValidationError))" `
+                    'wait for the exact launcher generation to finish or recover it through the launcher protocol before retiring the FSV lock'
+            }
+            if (-not (Test-AstroPathLongPath -LiteralPath $fsvLock -PathType Leaf)) {
+                Fail-Astro 'ASTRO_FSV_LOCK_RETIRE_ABSENT' `
+                    "FSV lock is already absent: $fsvLock" `
+                    'do not manufacture retirement evidence for an absent lock'
+            }
+            Assert-NotReparseEntry $fsvLock 'native FSV lock'
+            $lockShaBefore = File-Sha256 $fsvLock
+            try {
+                $lockState = Read-AstroUtf8FileLongPath $fsvLock | ConvertFrom-Json
+            }
+            catch {
+                Fail-Astro 'ASTRO_FSV_LOCK_RETIRE_INVALID_LOCK' `
+                    "FSV lock is unreadable: ${fsvLock}: $($_.Exception.Message)" `
+                    'preserve the lock and investigate its exact bytes'
+            }
+            if ($lockState.schema -ne 'astrolabe.native-fsv-lock.v2' -or
+                [int]$lockState.issue -ne [int]$inspection.issue -or
+                [string]$lockState.tree_sha -cne [string]$inspection.tree_sha -or
+                -not [string]::Equals([IO.Path]::GetFullPath([string]$lockState.artifact_path), $inspection.artifact_path, [StringComparison]::OrdinalIgnoreCase) -or
+                [string]$lockState.artifact_sha256 -cne [string]$inspection.sha256 -or
+                -not $lockState.PSObject.Properties['owners'] -or
+                -not $lockState.owners.PSObject.Properties['launcher'] -or
+                -not $lockState.owners.PSObject.Properties['runner'] -or
+                -not $lockState.owners.PSObject.Properties['child']) {
+                Fail-Astro 'ASTRO_FSV_LOCK_RETIRE_INVALID_LOCK' `
+                    "FSV lock is not bound to the selected issue/tree/artifact: $fsvLock" `
+                    'preserve the lock and session; retry with the exact receipt/run/live-state binding'
+            }
+            $lockLauncher = Read-AstroFsvProcessIdentity $lockState.owners.launcher `
+                'ASTRO_FSV_LOCK_RETIRE_INVALID_LOCK' 'FSV lock launcher identity'
+            $lockRunner = Read-AstroFsvProcessIdentity $lockState.owners.runner `
+                'ASTRO_FSV_LOCK_RETIRE_INVALID_LOCK' 'FSV lock runner identity'
+            $lockChild = Read-AstroFsvProcessIdentity $lockState.owners.child `
+                'ASTRO_FSV_LOCK_RETIRE_INVALID_LOCK' 'FSV lock child identity'
+            $runRecord = Assert-PathWithin $RunRecordPath $inspection.session_directory `
+                'ASTRO_FSV_LOCK_RETIRE_RUN_RECORD_ESCAPE' 'run record path'
+            if (-not (Test-AstroPathLongPath -LiteralPath $runRecord -PathType Leaf)) {
+                Fail-Astro 'ASTRO_FSV_LOCK_RETIRE_RUN_RECORD_MISSING' `
+                    "run record does not exist: $runRecord" `
+                    'preserve the lock and session; retry only with a completed run record'
+            }
+            try {
+                $record = Read-AstroUtf8FileLongPath $runRecord | ConvertFrom-Json
+            }
+            catch {
+                Fail-Astro 'ASTRO_FSV_LOCK_RETIRE_RUN_RECORD_INVALID' `
+                    "parse run record '$runRecord' failed: $($_.Exception.Message)" `
+                    'preserve the lock and session; investigate the incomplete run'
+            }
+            if ($record.schema -ne 'astrolabe.native-fsv-run.v2' -or
+                [int]$record.issue -ne [int]$inspection.issue -or
+                -not [string]::Equals([IO.Path]::GetFullPath([string]$record.receipt_path), $receiptState.Path, [StringComparison]::OrdinalIgnoreCase) -or
+                -not [string]::Equals([IO.Path]::GetFullPath([string]$record.artifact.path), $inspection.artifact_path, [StringComparison]::OrdinalIgnoreCase) -or
+                [string]$record.artifact.sha256 -cne [string]$inspection.sha256) {
+                Fail-Astro 'ASTRO_FSV_LOCK_RETIRE_RUN_RECORD_INVALID' `
+                    "run record '$runRecord' is not bound to the selected receipt/artifact" `
+                    'preserve the lock and session; retry with the exact completed run record'
+            }
+            $explicitLiveState = Assert-PathWithin $LiveStatePath $inspection.session_directory `
+                'ASTRO_FSV_LOCK_RETIRE_LIVE_STATE_ESCAPE' 'live-state path'
+            if (-not [string]::Equals(
+                    [IO.Path]::GetFullPath([string]$record.live_state.path),
+                    $explicitLiveState,
+                    [StringComparison]::OrdinalIgnoreCase
+                )) {
+                Fail-Astro 'ASTRO_FSV_LOCK_RETIRE_LIVE_STATE_MISMATCH' `
+                    "explicit live-state path does not match run-record binding: $explicitLiveState" `
+                    'preserve the lock and session; pass the exact live-state path named by the run record'
+            }
+            $sessionBindings = @(
+                Get-AstroFsvSessionOwnerBindings `
+                    -ReceiptState $receiptState `
+                    -Inspection $inspection `
+                    -RunRecordPath $runRecord `
+                    -RunRecord $record
+            )
+            $runRunner = Read-AstroFsvProcessIdentity $record.runner `
+                'ASTRO_FSV_LOCK_RETIRE_RUN_RECORD_INVALID' 'run-record runner identity'
+            $runChild = Read-AstroFsvProcessIdentity $record.process.identity `
+                'ASTRO_FSV_LOCK_RETIRE_RUN_RECORD_INVALID' 'run-record child identity'
+            if (-not (Test-AstroFsvIdentityEqual $lockLauncher $inspection.owners.launcher) -or
+                -not (Test-AstroFsvIdentityEqual $lockRunner $runRunner) -or
+                -not (Test-AstroFsvIdentityEqual $lockChild $runChild)) {
+                Fail-Astro 'ASTRO_FSV_LOCK_RETIRE_OWNER_MISMATCH' `
+                    'FSV lock owner generations differ from the selected receipt/run/live-state records' `
+                    'preserve the lock and session; retry with the exact bound artifacts'
+            }
+            $ownerBindings = New-Object System.Collections.Generic.List[object]
+            foreach ($binding in $sessionBindings) { $ownerBindings.Add($binding) }
+            $ownerBindings.Add((New-AstroFsvOwnerBinding 'launcher' $fsvLock $lockLauncher))
+            $ownerBindings.Add((New-AstroFsvOwnerBinding 'runner' $fsvLock $lockRunner))
+            $ownerBindings.Add((New-AstroFsvOwnerBinding 'child' $fsvLock $lockChild))
+            $initialOwnerProbes = @(
+                Assert-AstroFsvOwnersInactive `
+                    -Bindings ([object[]]$ownerBindings.ToArray()) `
+                    -CodePrefix 'ASTRO_FSV_LOCK_RETIRE' `
+                    -Description 'stale FSV lock retirement'
+            )
+            $recoveryRecord = Assert-PathWithin $RecoveryRecordPath $recoveryRoot `
+                'ASTRO_FSV_LOCK_RETIRE_RECORD_ESCAPE' 'retirement record path'
+            if (Test-AstroPathLongPath -LiteralPath $recoveryRecord) {
+                Fail-Astro 'ASTRO_FSV_LOCK_RETIRE_RECORD_REUSE_REFUSED' `
+                    "retirement record already exists: $recoveryRecord" `
+                    'use one fresh append-only recovery record path for each stale lock retirement'
+            }
+            Assert-NotReparseEntry $recoveryRoot 'recovery record root'
+            $recordParent = Split-Path -Parent $recoveryRecord
+            New-AstroDirectoryLongPath $recordParent | Out-Null
+            Assert-NotReparseEntry $recordParent 'retirement record parent'
+            $currentRepository = Get-RepoState -GitExe $gitExe -Workspace $workspace
+            $finalOwnerProbes = @(
+                Assert-AstroFsvOwnersInactive `
+                    -Bindings ([object[]]$ownerBindings.ToArray()) `
+                    -CodePrefix 'ASTRO_FSV_LOCK_RETIRE' `
+                    -Description 'stale FSV lock retirement final authorization'
+            )
+            $retirement = [ordered]@{
+                schema = 'astrolabe.native-fsv-lock-retirement.v1'
+                verdict = 'retired-stale-lock'
+                issue = [int]$inspection.issue
+                recorded_at_utc = [DateTime]::UtcNow.ToString('o')
+                tracker_comment_url = $TrackerCommentUrl
+                fsv_lock = [ordered]@{
+                    path = $fsvLock
+                    sha256 = $lockShaBefore
+                    state = $lockState
+                }
+                receipt_path = $receiptState.Path
+                session_directory = $inspection.session_directory
+                run_record_path = $runRecord
+                run_record_sha256 = File-Sha256 $runRecord
+                live_state_path = $explicitLiveState
+                live_state_sha256 = File-Sha256 $explicitLiveState
+                artifact = [ordered]@{
+                    path = $inspection.artifact_path
+                    bytes = [uint64]$inspection.bytes
+                    sha256 = $inspection.sha256
+                }
+                launcher_protocol_state = $launcherProtocolState.State
+                staged_repository = $receiptState.Receipt.repository
+                current_repository = $currentRepository
+                owners = [ordered]@{
+                    identities = @($ownerBindings.ToArray() | ForEach-Object {
+                            [ordered]@{
+                                role = $_.Role
+                                source = $_.Source
+                                identity = $_.Identity
+                            }
+                        })
+                    initial_probes = $initialOwnerProbes
+                    final_probes = $finalOwnerProbes
+                }
+                failure = [ordered]@{
+                    code = $ReasonCode
+                    message = $ReasonMessage
+                }
+            }
+            Write-NewDurableUtf8 $recoveryRecord ($retirement | ConvertTo-Json -Depth 24)
+            $persistedRetirement =
+                Read-AstroUtf8FileLongPath $recoveryRecord | ConvertFrom-Json
+            if ($persistedRetirement.schema -ne 'astrolabe.native-fsv-lock-retirement.v1' -or
+                [string]$persistedRetirement.fsv_lock.sha256 -cne $lockShaBefore -or
+                [string]$persistedRetirement.artifact.sha256 -cne [string]$inspection.sha256 -or
+                [string]$persistedRetirement.failure.code -cne $ReasonCode) {
+                Fail-Astro 'ASTRO_FSV_LOCK_RETIRE_RECORD_INVALID' `
+                    "persisted retirement record readback does not bind the stale lock: $recoveryRecord" `
+                    'preserve both lock and record and investigate the durable-write mismatch'
+            }
+            Assert-AstroFsvPersistedOwnerEnvelope `
+                -Owners $persistedRetirement.owners `
+                -ExpectedBindings ([object[]]$ownerBindings.ToArray()) `
+                -Code 'ASTRO_FSV_LOCK_RETIRE_RECORD_INVALID' `
+                -Description 'persisted stale-lock retirement record'
+            Remove-AstroFileLongPath $fsvLock
+            if (Test-AstroPathLongPath -LiteralPath $fsvLock) {
+                Fail-Astro 'ASTRO_FSV_LOCK_RETIRE_DELETE_FAILED' `
+                    "FSV lock remains after exact retirement delete: $fsvLock" `
+                    'preserve the recovery record and inspect open handles before retrying'
+            }
+            [ordered]@{
+                operation = 'retire-lock'
+                record_path = $recoveryRecord
+                record_sha256 = File-Sha256 $recoveryRecord
+                record = $persistedRetirement
+                before = [ordered]@{
+                    fsv_lock = $fsvLock
+                    exists = $true
+                    sha256 = $lockShaBefore
+                    owners = $retirement.owners
+                }
+                after = [ordered]@{ fsv_lock = $fsvLock; exists = $false }
+            } | ConvertTo-Json -Depth 26 -Compress | Write-Output
         }
         'Abandon' {
             $receiptState = Read-Receipt $ReceiptPath $evidenceRoot
