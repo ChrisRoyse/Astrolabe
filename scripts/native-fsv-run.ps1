@@ -166,6 +166,66 @@ function Publish-NewFile([string]$Path, [string]$Content) {
     }
 }
 
+function Remove-TerminalFsvLock {
+    param(
+        [Parameter(Mandatory)][string]$LockPath,
+        [Parameter(Mandatory)][AllowNull()]$RunnerIdentity,
+        [Parameter(Mandatory)][AllowNull()]$ChildIdentity,
+        [Parameter(Mandatory)][string]$ArtifactSha256
+    )
+
+    if (-not (Test-AstroPathLongPath -LiteralPath $LockPath)) {
+        return [ordered]@{
+            path = $LockPath
+            before_exists = $false
+            removed = $false
+            after_exists = $false
+            sha256_before = $null
+        }
+    }
+    $lockSha = File-Sha256 $LockPath
+    try {
+        $lock = Read-AstroUtf8FileLongPath $LockPath | ConvertFrom-Json
+        $lockRunnerIdentity = Read-AstroFsvProcessIdentity `
+            $lock.owners.runner `
+            'ASTRO_FSV_LOCK_IDENTITY_CHANGED' `
+            'terminal FSV lock runner identity'
+        $lockChildIdentity = Read-AstroFsvProcessIdentity `
+            $lock.owners.child `
+            'ASTRO_FSV_LOCK_IDENTITY_CHANGED' `
+            'terminal FSV lock child identity'
+    }
+    catch {
+        Fail-Astro `
+            'ASTRO_FSV_LOCK_IDENTITY_CHANGED' `
+            "terminal FSV lock is unreadable or malformed: $($_.Exception.Message)" `
+            'preserve the lock and session; retire only through the tracker-bound stale-lock lifecycle after exact identity readback'
+    }
+    if ($lock.schema -cne 'astrolabe.native-fsv-lock.v2' -or
+        -not (Test-AstroFsvIdentityEqual $lockRunnerIdentity $RunnerIdentity) -or
+        -not (Test-AstroFsvIdentityEqual $lockChildIdentity $ChildIdentity) -or
+        [string]$lock.artifact_sha256 -cne $ArtifactSha256) {
+        Fail-Astro `
+            'ASTRO_FSV_LOCK_IDENTITY_CHANGED' `
+            'terminal FSV lock no longer matches this exact runner/child/artifact generation' `
+            'preserve the lock and session; retire only through the tracker-bound stale-lock lifecycle after exact identity readback'
+    }
+    Remove-AstroFileLongPath $LockPath
+    if (Test-AstroPathLongPath -LiteralPath $LockPath) {
+        Fail-Astro `
+            'ASTRO_FSV_LOCK_CLEANUP_READBACK_FAILED' `
+            "owned FSV lock remained after terminal cleanup: $LockPath" `
+            'preserve the lock and session; retire only through the tracker-bound stale-lock lifecycle after exact owner absence'
+    }
+    return [ordered]@{
+        path = $LockPath
+        before_exists = $true
+        removed = $true
+        after_exists = $false
+        sha256_before = $lockSha
+    }
+}
+
 function Get-RepoState([string]$GitExe, [string]$Workspace) {
     $head = (& $GitExe -C $Workspace rev-parse HEAD).Trim().ToLowerInvariant()
     if ($LASTEXITCODE -ne 0) { Fail-Astro 'ASTRO_FSV_GIT_UNREADABLE' 'git rev-parse HEAD failed' 'repair repository state before evidence execution' }
@@ -1310,6 +1370,7 @@ $runnerIdentity = $null
 $childIdentity = $null
 $runRecordWritten = $false
 $runRecordAuthorized = $false
+$fsvLockCleanup = $null
 $arguments = [string[]]::new(0)
 $argumentCount = 0
 
@@ -2016,6 +2077,11 @@ try {
     } else {
         'failed'
     }
+    $fsvLockCleanup = Remove-TerminalFsvLock `
+        -LockPath $fsvLockPath `
+        -RunnerIdentity $runnerIdentity `
+        -ChildIdentity $childIdentity `
+        -ArtifactSha256 $artifactHashBefore
     $record = [ordered]@{
         schema = 'astrolabe.native-fsv-run.v2'
         verdict = $verdict
@@ -2067,6 +2133,7 @@ try {
         stdout = [ordered]@{ path = $StandardOutputPath; bytes = Get-AstroFileLengthLongPath $StandardOutputPath; sha256 = $stdoutHash }
         stderr = [ordered]@{ path = $StandardErrorPath; bytes = Get-AstroFileLengthLongPath $StandardErrorPath; sha256 = $stderrHash }
         repository = [ordered]@{ before = $beforeRepo; after = $afterRepo; stable = $treeStable }
+        fsv_lock_cleanup = $fsvLockCleanup
     }
     Write-NewDurableUtf8 $RunRecordPath ($record | ConvertTo-Json -Depth 15)
     $runRecordWritten = $true
@@ -2096,7 +2163,9 @@ try {
         -not $persistedRecord.live_state.PSObject.Properties['path'] -or
         -not $persistedRecord.live_state.PSObject.Properties['published'] -or
         -not $persistedRecord.live_state.PSObject.Properties['bytes'] -or
-        -not $persistedRecord.live_state.PSObject.Properties['sha256']) {
+        -not $persistedRecord.live_state.PSObject.Properties['sha256'] -or
+        -not $persistedRecord.PSObject.Properties['fsv_lock_cleanup'] -or
+        -not $persistedRecord.fsv_lock_cleanup.PSObject.Properties['after_exists']) {
         Fail-Astro 'ASTRO_FSV_RUN_READBACK_FAILED' `
             'persisted run record omits its v2 exact process/artifact/live-state envelope' `
             'preserve the session and investigate the failed durable write'
@@ -2136,6 +2205,7 @@ try {
         [string]$persistedRecord.process.exit_code_observation.primary_source -cne [string]$childExitObservation.primary_source -or
         [bool]$persistedRecord.process.exit_code_observation.sources_agree -ne [bool]$childExitObservation.sources_agree -or
         [string]$persistedRecord.artifact.sha256 -cne $artifactHashAfter -or
+        [bool]$persistedRecord.fsv_lock_cleanup.after_exists -ne $false -or
         -not (Test-AstroFsvIdentityEqual `
             $persistedLauncherIdentity $launcherIdentity) -or
         -not (Test-AstroFsvIdentityEqual `
@@ -2190,6 +2260,24 @@ catch {
             if ($null -eq $childIdentity) {
                 $childIdentity = New-AstroProcessIdentityRecord `
                     $child.Id ([long]$child.ProcessStartUtcTicks)
+            }
+            if ($null -eq $fsvLockCleanup) {
+                try {
+                    $fsvLockCleanup = Remove-TerminalFsvLock `
+                        -LockPath $fsvLockPath `
+                        -RunnerIdentity $runnerIdentity `
+                        -ChildIdentity $childIdentity `
+                        -ArtifactSha256 $artifactHashBefore
+                }
+                catch {
+                    $fsvLockCleanup = [ordered]@{
+                        path = $fsvLockPath
+                        before_exists = Test-AstroPathLongPath -LiteralPath $fsvLockPath
+                        removed = $false
+                        after_exists = Test-AstroPathLongPath -LiteralPath $fsvLockPath
+                        error = $_.Exception.Message
+                    }
+                }
             }
             $failureArtifactHash = if (
                 Test-AstroPathLongPath -LiteralPath $artifact -PathType Leaf
@@ -2252,6 +2340,7 @@ catch {
                     bytes = if (Test-AstroPathLongPath -LiteralPath $StandardErrorPath -PathType Leaf) { Get-AstroFileLengthLongPath $StandardErrorPath } else { 0 }
                     sha256 = if (Test-AstroPathLongPath -LiteralPath $StandardErrorPath -PathType Leaf) { File-Sha256 $StandardErrorPath } else { $null }
                 }
+                fsv_lock_cleanup = $fsvLockCleanup
                 failure = [ordered]@{
                     code = $code
                     message = $failure.Exception.Message
