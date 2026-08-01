@@ -11,6 +11,10 @@ default = []
 cuda-runtime-boundary = ["dep:windows-sys"]
 cuda = ["dep:cudarc", "cuda-runtime-boundary"]
 cuda-policy-measurement = ["cuda"]
+# Apple Silicon GPU backend. Opt-in because selecting it changes the numeric
+# artifact: GPU reductions accumulate in tree order and do not reproduce the
+# CPU backend bit-for-bit (see src/metal/mod.rs).
+metal = ["dep:metal"]
 
 [dependencies]
 calyx-core = { path = "../calyx-core" }
@@ -43,3 +47,7 @@ windows-sys = { version = "0.61.2", features = [
     "Win32_System_SystemInformation",
     "Win32_System_Threading",
 ], optional = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# metal-rs: Metal compute for the Apple Silicon GPU backend (#895).
+metal = { version = "0.33", optional = true }

@@ -11,6 +11,8 @@ pub mod compression_report;
 pub mod cpu;
 #[cfg(feature = "cuda")]
 pub mod cuda;
+#[cfg(all(feature = "metal", target_os = "macos"))]
+pub mod metal;
 mod cuda_device;
 #[cfg(all(windows, feature = "cuda-runtime-boundary"))]
 #[path = "cuda/runtime_bundle.rs"]
@@ -42,6 +44,8 @@ pub use compression_report::{
     KernelCompressionMeasurement, KernelCompressionReport, compression_report,
 };
 pub use cpu::{CpuBackend, gemm_mxfp4_packed, gemm_mxfp8_packed};
+#[cfg(all(feature = "metal", target_os = "macos"))]
+pub use metal::MetalBackend;
 #[cfg(feature = "cuda")]
 pub use cuda::{
     AbsentSlotSentinel, CUDA_KERNEL_POLICY_JSON, CudaBackend, CudaContext, CudaGreenContextStream,

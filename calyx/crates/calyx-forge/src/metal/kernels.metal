@@ -19,12 +19,31 @@ using namespace metal;
 // is a full occupancy unit on Apple GPUs (SIMD width 32, 8 SIMD groups).
 constant uint GEMM_TILE = 16u;
 
-// Threadgroup size for the row-wise reduction kernels. Must match the value the
-// host dispatches with, and must be a power of two for the tree reduction.
-constant uint REDUCE_TG = 256u;
+// Row-reduction geometry.
+//
+// Each row is reduced by ONE SIMD group (32 lanes on Apple GPUs) using the
+// hardware simd_sum() instruction, not a threadgroup barrier tree. A 256-thread
+// threadgroup therefore retires SIMD_PER_TG = 8 rows concurrently.
+//
+// This matters: the previous shape gave every row a 256-thread threadgroup and
+// log2(256) = 8 barrier rounds to reduce only `dim` elements. For the vector
+// sizes this API sees, barrier latency dominated the arithmetic entirely.
+// simd_sum needs no barriers and no threadgroup memory.
+constant uint SIMD_WIDTH = 32u;
+constant uint SIMD_PER_TG = 8u;
+constant uint ROWS_PER_TG = SIMD_PER_TG;
 
 /*
  * out[m, n] = a[m, k] * b[k, n]
+ *
+ * COLUMN-MAJOR, matching Forge's existing GEMM contract (the same layout the
+ * CUDA path documents and the CPU path indexes through col_major()):
+ *     a[d * m + row]     A is M x K
+ *     b[col * k + d]     B is K x N
+ *     out[col * m + row] out is M x N
+ *
+ * Note this differs from the distance/normalize kernels below, which operate on
+ * row-major batches of vectors. The two layouts coexist in the Forge API.
  *
  * Blocked over threadgroup memory: each threadgroup cooperatively stages a
  * GEMM_TILE x GEMM_TILE block of A and of B, then every thread accumulates its
@@ -35,7 +54,10 @@ kernel void gemm_f32(
     device const float *a     [[buffer(0)]],
     device const float *b     [[buffer(1)]],
     device float       *out   [[buffer(2)]],
-    constant uint3     &dims  [[buffer(3)]],   // (m, k, n)
+    /* uint4, not uint3: MSL sizes uint3 at 16 bytes, so a 12-byte upload
+     * leaves .z (n) reading past the buffer. Declaring the full 16-byte vector
+     * makes the host-side layout unambiguous. .w is unused. */
+    constant uint4     &dims  [[buffer(3)]],   // (m, k, n, unused)
     uint2 tg_pos              [[threadgroup_position_in_grid]],
     uint2 t_pos               [[thread_position_in_threadgroup]])
 {
@@ -59,9 +81,9 @@ kernel void gemm_f32(
         // Out-of-range lanes stage zeros so the inner product stays correct
         // without a divergent inner loop bound.
         a_tile[t_pos.y][t_pos.x] =
-            (row < m && a_col < k) ? a[(ulong)row * k + a_col] : 0.0f;
+            (row < m && a_col < k) ? a[(ulong)a_col * m + row] : 0.0f;
         b_tile[t_pos.y][t_pos.x] =
-            (b_row < k && col < n) ? b[(ulong)b_row * n + col] : 0.0f;
+            (b_row < k && col < n) ? b[(ulong)col * k + b_row] : 0.0f;
 
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -73,21 +95,8 @@ kernel void gemm_f32(
     }
 
     if (row < m && col < n) {
-        out[(ulong)row * n + col] = acc;
+        out[(ulong)col * m + row] = acc;
     }
-}
-
-/* Tree reduction of a per-thread partial into lane 0 of the threadgroup. */
-static inline float reduce_tg_sum(threadgroup float *scratch, uint tid, uint tsize)
-{
-    for (uint stride = tsize / 2u; stride > 0u; stride >>= 1u) {
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (tid < stride) {
-            scratch[tid] += scratch[tid + stride];
-        }
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    return scratch[0];
 }
 
 /*
@@ -100,22 +109,26 @@ kernel void dot_batch(
     device float       *out        [[buffer(2)]],
     constant uint2     &dims       [[buffer(3)]],   // (dim, rows)
     uint  tg_id                    [[threadgroup_position_in_grid]],
-    uint  tid                      [[thread_position_in_threadgroup]],
-    uint  tsize                    [[threads_per_threadgroup]])
+    uint  sg_id                    [[simdgroup_index_in_threadgroup]],
+    uint  lane                     [[thread_index_in_simdgroup]])
 {
     const uint dim = dims.x;
-    device const float *row = candidates + (ulong)tg_id * dim;
+    const uint rows = dims.y;
+    const uint row_idx = tg_id * ROWS_PER_TG + sg_id;
+    // row_idx is uniform across a SIMD group, so the whole group exits together
+    // and no lane reaches simd_sum() with a divergent partner.
+    if (row_idx >= rows) {
+        return;
+    }
+    device const float *row = candidates + (ulong)row_idx * dim;
 
-    threadgroup float scratch[REDUCE_TG];
     float partial = 0.0f;
-    for (uint i = tid; i < dim; i += tsize) {
+    for (uint i = lane; i < dim; i += SIMD_WIDTH) {
         partial = fma(query[i], row[i], partial);
     }
-    scratch[tid] = partial;
-
-    const float total = reduce_tg_sum(scratch, tid, tsize);
-    if (tid == 0u) {
-        out[tg_id] = total;
+    const float total = simd_sum(partial);
+    if (lane == 0u) {
+        out[row_idx] = total;
     }
 }
 
@@ -129,23 +142,25 @@ kernel void l2_batch(
     device float       *out        [[buffer(2)]],
     constant uint2     &dims       [[buffer(3)]],
     uint  tg_id                    [[threadgroup_position_in_grid]],
-    uint  tid                      [[thread_position_in_threadgroup]],
-    uint  tsize                    [[threads_per_threadgroup]])
+    uint  sg_id                    [[simdgroup_index_in_threadgroup]],
+    uint  lane                     [[thread_index_in_simdgroup]])
 {
     const uint dim = dims.x;
-    device const float *row = candidates + (ulong)tg_id * dim;
+    const uint rows = dims.y;
+    const uint row_idx = tg_id * ROWS_PER_TG + sg_id;
+    if (row_idx >= rows) {
+        return;
+    }
+    device const float *row = candidates + (ulong)row_idx * dim;
 
-    threadgroup float scratch[REDUCE_TG];
     float partial = 0.0f;
-    for (uint i = tid; i < dim; i += tsize) {
+    for (uint i = lane; i < dim; i += SIMD_WIDTH) {
         const float d = query[i] - row[i];
         partial = fma(d, d, partial);
     }
-    scratch[tid] = partial;
-
-    const float total = reduce_tg_sum(scratch, tid, tsize);
-    if (tid == 0u) {
-        out[tg_id] = total;
+    const float total = simd_sum(partial);
+    if (lane == 0u) {
+        out[row_idx] = total;
     }
 }
 
@@ -165,32 +180,32 @@ kernel void cosine_parts(
     device float       *parts      [[buffer(2)]],
     constant uint2     &dims       [[buffer(3)]],
     uint  tg_id                    [[threadgroup_position_in_grid]],
-    uint  tid                      [[thread_position_in_threadgroup]],
-    uint  tsize                    [[threads_per_threadgroup]])
+    uint  sg_id                    [[simdgroup_index_in_threadgroup]],
+    uint  lane                     [[thread_index_in_simdgroup]])
 {
     const uint dim = dims.x;
-    device const float *row = candidates + (ulong)tg_id * dim;
-
-    threadgroup float scratch[REDUCE_TG];
+    const uint rows = dims.y;
+    const uint row_idx = tg_id * ROWS_PER_TG + sg_id;
+    if (row_idx >= rows) {
+        return;
+    }
+    device const float *row = candidates + (ulong)row_idx * dim;
 
     float partial_dot = 0.0f;
     float partial_sq = 0.0f;
-    for (uint i = tid; i < dim; i += tsize) {
+    // One pass over the row produces both quantities; the candidate value is
+    // loaded once and used twice.
+    for (uint i = lane; i < dim; i += SIMD_WIDTH) {
         const float c = row[i];
         partial_dot = fma(query[i], c, partial_dot);
         partial_sq = fma(c, c, partial_sq);
     }
+    const float total_dot = simd_sum(partial_dot);
+    const float total_sq = simd_sum(partial_sq);
 
-    scratch[tid] = partial_dot;
-    const float total_dot = reduce_tg_sum(scratch, tid, tsize);
-
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    scratch[tid] = partial_sq;
-    const float total_sq = reduce_tg_sum(scratch, tid, tsize);
-
-    if (tid == 0u) {
-        parts[2u * tg_id] = total_dot;
-        parts[2u * tg_id + 1u] = total_sq;
+    if (lane == 0u) {
+        parts[2u * row_idx] = total_dot;
+        parts[2u * row_idx + 1u] = total_sq;
     }
 }
 
@@ -204,22 +219,24 @@ kernel void row_norms_sq(
     device float       *norms [[buffer(1)]],
     constant uint2     &dims  [[buffer(2)]],   // (dim, rows)
     uint  tg_id               [[threadgroup_position_in_grid]],
-    uint  tid                 [[thread_position_in_threadgroup]],
-    uint  tsize               [[threads_per_threadgroup]])
+    uint  sg_id               [[simdgroup_index_in_threadgroup]],
+    uint  lane                [[thread_index_in_simdgroup]])
 {
     const uint dim = dims.x;
-    device const float *row = vecs + (ulong)tg_id * dim;
+    const uint rows = dims.y;
+    const uint row_idx = tg_id * ROWS_PER_TG + sg_id;
+    if (row_idx >= rows) {
+        return;
+    }
+    device const float *row = vecs + (ulong)row_idx * dim;
 
-    threadgroup float scratch[REDUCE_TG];
     float partial = 0.0f;
-    for (uint i = tid; i < dim; i += tsize) {
+    for (uint i = lane; i < dim; i += SIMD_WIDTH) {
         partial = fma(row[i], row[i], partial);
     }
-    scratch[tid] = partial;
-
-    const float total = reduce_tg_sum(scratch, tid, tsize);
-    if (tid == 0u) {
-        norms[tg_id] = total;
+    const float total = simd_sum(partial);
+    if (lane == 0u) {
+        norms[row_idx] = total;
     }
 }
 

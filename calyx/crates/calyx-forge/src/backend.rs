@@ -54,6 +54,8 @@ pub trait Backend: Send + Sync {
 pub enum BackendKind {
     Cpu,
     Cuda,
+    /// Apple Silicon GPU via Metal (#895).
+    Metal,
 }
 
 impl fmt::Display for BackendKind {
@@ -61,6 +63,7 @@ impl fmt::Display for BackendKind {
         match self {
             Self::Cpu => f.write_str("cpu"),
             Self::Cuda => f.write_str("cuda"),
+            Self::Metal => f.write_str("metal"),
         }
     }
 }

@@ -72,6 +72,17 @@ fn bench_gemm(
             time_op(op, iters, flops, || backend.gemm(&a, &b, m, k, n, &mut out))
         }
         BackendKind::Cuda => bench_cuda_gemm(op, ctx, iters, flops, &a, &b, m, k, n, &mut out),
+        #[cfg(all(feature = "metal", target_os = "macos"))]
+        BackendKind::Metal => {
+            let backend = crate::metal::MetalBackend::new()?;
+            time_op(op, iters, flops, || backend.gemm(&a, &b, m, k, n, &mut out))
+        }
+        #[cfg(not(all(feature = "metal", target_os = "macos")))]
+        BackendKind::Metal => Err(crate::ForgeError::DeviceUnavailable {
+            device: "metal".to_string(),
+            detail: "this build has no Metal backend compiled in".to_string(),
+            remediation: "build calyx-forge with --features metal on macOS".to_string(),
+        }),
     }
 }
 
@@ -96,6 +107,19 @@ fn bench_cosine(
                 backend.cosine(&query, &candidates, dim, &mut out)
             })
         }
+        #[cfg(all(feature = "metal", target_os = "macos"))]
+        BackendKind::Metal => {
+            let backend = crate::metal::MetalBackend::new()?;
+            time_op(op, iters, flops, || {
+                backend.cosine(&query, &candidates, dim, &mut out)
+            })
+        }
+        #[cfg(not(all(feature = "metal", target_os = "macos")))]
+        BackendKind::Metal => Err(crate::ForgeError::DeviceUnavailable {
+            device: "metal".to_string(),
+            detail: "this build has no Metal backend compiled in".to_string(),
+            remediation: "build calyx-forge with --features metal on macOS".to_string(),
+        }),
         BackendKind::Cuda => {
             bench_cuda_cosine(op, ctx, iters, flops, &query, &candidates, dim, &mut out)
         }

@@ -49,9 +49,13 @@ use crate::backend::{Backend, BackendKind, DeviceInfo, Result};
 use crate::cpu::guard::{check_finite, check_norm_positive, check_shape_2d};
 use crate::error::ForgeError;
 
-/// Threadgroup width for the row-reduction kernels. Must equal `REDUCE_TG` in
-/// `kernels.metal` and must be a power of two for the tree reduction.
+/// Threadgroup width for the row-reduction kernels: 8 SIMD groups of 32 lanes.
+/// Must stay consistent with SIMD_WIDTH * SIMD_PER_TG in `kernels.metal`.
 const REDUCE_THREADGROUP: NSUInteger = 256;
+
+/// Rows retired per threadgroup — one per SIMD group. Must equal ROWS_PER_TG in
+/// `kernels.metal`.
+const ROWS_PER_THREADGROUP: NSUInteger = 8;
 
 /// Tile edge for the blocked GEMM. Must equal `GEMM_TILE` in `kernels.metal`.
 const GEMM_TILE: NSUInteger = 16;
@@ -141,10 +145,11 @@ impl MetalBackend {
         let name = device.name().to_string();
         // Unified memory: report the working-set limit the driver will grant.
         let vram_mib = Some(device.recommended_max_working_set_size() / (1024 * 1024));
+        let queue = Mutex::new(device.new_command_queue());
 
         Ok(Self {
             device,
-            queue: Mutex::new(device.new_command_queue()),
+            queue,
             pipelines,
             name,
             vram_mib,
@@ -190,7 +195,12 @@ impl MetalBackend {
         unsafe { std::slice::from_raw_parts(buffer.contents().cast::<f32>(), len).to_vec() }
     }
 
-    /// One threadgroup per row, `REDUCE_THREADGROUP` threads wide.
+    /// One SIMD group per row, `ROWS_PER_THREADGROUP` rows per threadgroup.
+    ///
+    /// The kernels reduce with `simd_sum()`, so there are no threadgroup
+    /// barriers and no threadgroup memory; the dispatch just has to hand each
+    /// SIMD group its own row. Threadgroup count is therefore ceil(rows / 8),
+    /// not `rows`.
     fn dispatch_row_reduction(
         &self,
         pipeline: &ComputePipelineState,
@@ -214,7 +224,7 @@ impl MetalBackend {
             dims.as_ptr().cast(),
         );
         encoder.dispatch_thread_groups(
-            MTLSize::new(rows as NSUInteger, 1, 1),
+            MTLSize::new((rows as NSUInteger).div_ceil(ROWS_PER_THREADGROUP), 1, 1),
             MTLSize::new(REDUCE_THREADGROUP, 1, 1),
         );
         encoder.end_encoding();
@@ -248,10 +258,13 @@ impl Backend for MetalBackend {
         let a_buf = self.buffer_from(a)?;
         let b_buf = self.buffer_from(b)?;
         let out_buf = self.buffer_zeroed(m * n)?;
-        let dims: [u32; 3] = [
+        // 4 elements, not 3: MSL uint3 occupies 16 bytes, so uploading 12 would
+        // leave the kernel reading n from past the end of the buffer.
+        let dims: [u32; 4] = [
             u32::try_from(m).map_err(|_| gpu_error("gemm m exceeds u32", "reduce batch size"))?,
             u32::try_from(k).map_err(|_| gpu_error("gemm k exceeds u32", "reduce dimension"))?,
             u32::try_from(n).map_err(|_| gpu_error("gemm n exceeds u32", "reduce batch size"))?,
+            0,
         ];
 
         {
