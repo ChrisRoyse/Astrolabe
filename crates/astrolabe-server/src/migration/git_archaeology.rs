@@ -1844,6 +1844,24 @@ fn build_serve_response(
     response_tmp: &Path,
     response_path: &Path,
 ) -> Result<Option<Value>, DynError> {
+    if response_path.exists() {
+        return Err(format!(
+            "ASTRO_ARCHAEOLOGY_SERVE_RESPONSE_COLLISION: response path {} already exists before \
+             processing request; remediation: preserve the colliding response file and start a \
+             fresh worker sequence from an absent response namespace",
+            response_path.display()
+        )
+        .into());
+    }
+    if response_tmp.exists() {
+        return Err(format!(
+            "ASTRO_ARCHAEOLOGY_SERVE_RESPONSE_TEMP_COLLISION: response temp path {} already \
+             exists before processing request; remediation: preserve the stale temp file and \
+             start a fresh worker sequence from an absent response namespace",
+            response_tmp.display()
+        )
+        .into());
+    }
     let field = |key: &str| request.get(key).and_then(Value::as_str);
     let (scoped_root, database, identity_root, project) = match (
         field("scoped_root"),
