@@ -2,19 +2,56 @@
  * log.c — Structured key-value logging to stderr.
  */
 #include "log.h"
+#include "foundation/compat_thread.h"
 #include "foundation/constants.h"
 #include <ctype.h>
 #include <inttypes.h>
 #include <stdarg.h>
+#include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifndef _WIN32
+#include <sched.h>
+#endif
 
 static CBMLogLevel g_log_level = CBM_LOG_INFO;
 static CBMLogFormat g_log_format = CBM_LOG_FORMAT_TEXT;
 static cbm_log_sink_fn g_log_sink = NULL;
 static CBMLogSinkMode g_log_sink_mode = CBM_LOG_SINK_REPLACE;
+static cbm_mutex_t g_log_mutex;
+static atomic_int g_log_mutex_state = 0; /* 0=absent, 1=initializing, 2=ready */
+
+static void log_mutex_wait_for_initializer(void) {
+    while (atomic_load_explicit(&g_log_mutex_state, memory_order_acquire) != 2) {
+#ifdef _WIN32
+        Sleep(0);
+#else
+        sched_yield();
+#endif
+    }
+}
+
+static void ensure_log_mutex(void) {
+    int expected = 0;
+    if (atomic_compare_exchange_strong_explicit(&g_log_mutex_state, &expected, 1,
+                                                memory_order_acq_rel, memory_order_acquire)) {
+        cbm_mutex_init(&g_log_mutex);
+        atomic_store_explicit(&g_log_mutex_state, 2, memory_order_release);
+        return;
+    }
+    log_mutex_wait_for_initializer();
+}
+
+static void log_lock(void) {
+    ensure_log_mutex();
+    cbm_mutex_lock(&g_log_mutex);
+}
+
+static void log_unlock(void) {
+    cbm_mutex_unlock(&g_log_mutex);
+}
 
 /* CBM_LOG_LEVEL support — distilled from #414 (closes #413, thanks @santanusinha). */
 void cbm_log_init_from_env(void) {
@@ -76,24 +113,36 @@ void cbm_log_set_sink(cbm_log_sink_fn fn) {
 }
 
 void cbm_log_set_sink_ex(cbm_log_sink_fn fn, CBMLogSinkMode mode) {
+    log_lock();
     g_log_sink = fn;
     g_log_sink_mode = mode;
+    log_unlock();
 }
 
 void cbm_log_set_level(CBMLogLevel level) {
+    log_lock();
     g_log_level = level;
+    log_unlock();
 }
 
 CBMLogLevel cbm_log_get_level(void) {
-    return g_log_level;
+    log_lock();
+    CBMLogLevel level = g_log_level;
+    log_unlock();
+    return level;
 }
 
 void cbm_log_set_format(CBMLogFormat format) {
+    log_lock();
     g_log_format = format;
+    log_unlock();
 }
 
 CBMLogFormat cbm_log_get_format(void) {
-    return g_log_format;
+    log_lock();
+    CBMLogFormat format = g_log_format;
+    log_unlock();
+    return format;
 }
 
 static const char *level_str(CBMLogLevel level) {
@@ -195,7 +244,7 @@ static void finish_line(char *buf, size_t bufsz, size_t pos) {
     }
 }
 
-static void emit_line(const char *line) {
+static void emit_line_locked(const char *line) {
     if (g_log_sink) {
         g_log_sink(line);
         if (g_log_sink_mode == CBM_LOG_SINK_REPLACE) {
@@ -206,7 +255,9 @@ static void emit_line(const char *line) {
 }
 
 void cbm_log(CBMLogLevel level, const char *msg, ...) {
+    log_lock();
     if (level < g_log_level) {
+        log_unlock();
         return;
     }
 
@@ -252,7 +303,8 @@ void cbm_log(CBMLogLevel level, const char *msg, ...) {
     va_end(args);
 
     finish_line(line_buf, sizeof(line_buf), pos);
-    emit_line(line_buf);
+    emit_line_locked(line_buf);
+    log_unlock();
 }
 
 void cbm_log_int(CBMLogLevel level, const char *msg, const char *key, int64_t value) {

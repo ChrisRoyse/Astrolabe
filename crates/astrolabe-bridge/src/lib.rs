@@ -660,11 +660,11 @@ unsafe extern "C" fn cbm_log_tracing_sink(line: *const c_char) {
     drop(std::panic::catch_unwind(AssertUnwindSafe(|| {
         // SAFETY: CBM calls the sink with a NUL-terminated line valid for the call.
         let line = unsafe { CStr::from_ptr(line) }.to_string_lossy();
-        if line.starts_with("level=error") {
+        if line.starts_with("level=error") || line.starts_with("{\"level\":\"error\"") {
             tracing::error!(target: "cbm", "{line}");
-        } else if line.starts_with("level=warn") {
+        } else if line.starts_with("level=warn") || line.starts_with("{\"level\":\"warn\"") {
             tracing::warn!(target: "cbm", "{line}");
-        } else if line.starts_with("level=debug") {
+        } else if line.starts_with("level=debug") || line.starts_with("{\"level\":\"debug\"") {
             tracing::debug!(target: "cbm", "{line}");
         } else {
             tracing::info!(target: "cbm", "{line}");
