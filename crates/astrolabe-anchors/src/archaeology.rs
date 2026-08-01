@@ -1033,7 +1033,7 @@ fn changed_file_counts_for_commits(
         return Ok(counts);
     }
     for chunk in candidates.chunks(telemetry.batch_limit_commits) {
-        let mut args = vec!["diff-tree", "--stdin", "--raw", "-z", "-r"];
+        let mut args = vec!["diff-tree", "--stdin", "--always", "--raw", "-z", "-r"];
         if let Some(prefix) = pathspec {
             args.push("--");
             args.push(prefix);
@@ -1096,6 +1096,7 @@ fn changed_old_ranges_for_commits(
         let mut args = vec![
             "diff-tree",
             "--stdin",
+            "--always",
             "--unified=0",
             "--no-prefix",
             "--no-color",
