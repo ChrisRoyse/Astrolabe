@@ -216,21 +216,6 @@ where
     }))
 }
 
-pub(crate) fn read_invalidation_metadata(
-    cache_dir: &Path,
-    project: &str,
-) -> Result<Value, DynError> {
-    let Some(raw) = read_config_value(cache_dir, &metadata_key(project, "invalidations_json"))?
-    else {
-        return Ok(json!({
-            "schema": INVALIDATION_SCHEMA,
-            "status": "unavailable",
-            "reason": "no shadow delta invalidation metadata has been persisted",
-        }));
-    };
-    Ok(serde_json::from_str(&raw)?)
-}
-
 pub(crate) fn invalidation_prefix(project: &str, family: &str) -> Vec<u8> {
     let mut key = INVALIDATION_PREFIX.to_vec();
     key.extend_from_slice(project.as_bytes());

@@ -191,33 +191,3 @@ pub(crate) fn required_u64_metadata(
         .and_then(Value::as_u64)
         .ok_or_else(|| format!("stored {subject} missing {key}").into())
 }
-
-pub(crate) fn read_search_scale_metadata(
-    cache_dir: &Path,
-    project: &str,
-) -> Result<Value, DynError> {
-    let Some(raw) = read_config_value(cache_dir, &metadata_key(project, "search_scale_json"))?
-    else {
-        return Ok(search_scale_unavailable_json(
-            "search scale metadata missing; rerun index_repository with calyx shadow",
-        ));
-    };
-    match serde_json::from_str::<Value>(&raw) {
-        Ok(value) => Ok(value),
-        Err(error) => Ok(search_scale_unavailable_json(&format!(
-            "stored search_scale_json invalid: {error}"
-        ))),
-    }
-}
-
-pub(crate) fn search_scale_unavailable_json(reason: &str) -> Value {
-    json!({
-        "schema": SEARCH_SCALE_SCHEMA,
-        "status": "unavailable",
-        "knob_registry_version": SEARCH_SCALE_KNOB_REGISTRY_VERSION,
-        "freshness": "not_evaluated",
-        "trust": "provisional",
-        "reason": reason,
-        "remediation": "rerun index_repository with calyx shadow after search scale planning is available",
-    })
-}

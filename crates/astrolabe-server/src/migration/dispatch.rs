@@ -482,14 +482,16 @@ pub(crate) fn handle_index_repository(
         }
         return Ok(result);
     }
-    let project = project
-        .or_else(|| {
-            repo_path.as_deref().and_then(|path| {
-                path.to_str()
-                    .and_then(|path| astrolabe_bridge::cbm_project_name_from_path(path).ok())
-            })
+    let Some(project) = project.or_else(|| {
+        repo_path.as_deref().and_then(|path| {
+            path.to_str()
+                .and_then(|path| astrolabe_bridge::cbm_project_name_from_path(path).ok())
         })
-        .ok_or("ASTRO_SHADOW_PROJECT_UNRESOLVED: shadow indexing requires a resolvable project name or repo_path; remediation: pass a valid repo_path")?;
+    }) else {
+        return tool_error_result(
+            "ASTRO_SHADOW_PROJECT_UNRESOLVED: shadow indexing requires a resolvable project name or repo_path; remediation: pass a valid repo_path",
+        );
+    };
     let cache_dir = astrolabe_bridge::cbm_cache_dir()?;
     if repo_path
         .as_deref()
@@ -672,7 +674,7 @@ pub(crate) fn handle_index_repository(
                 json!({
                     "calyx": "shadow",
                     "vault_fingerprint": outcome.sqlite_fingerprint_sha256,
-                    "grounding_summary": grounding_summary(&outcome),
+                    "grounding_summary": grounding_summary(&outcome)?,
                 }),
             )
         },
@@ -734,25 +736,115 @@ pub(crate) fn handle_index_status(
     runner: &CbmToolRunner,
     args_json: &str,
 ) -> Result<String, DynError> {
-    let Ok(args) = serde_json::from_str::<Value>(args_json) else {
-        return Ok(runner.handle_tool_raw("index_status", args_json)?);
+    let args = match serde_json::from_str::<Value>(args_json) {
+        Ok(args) => args,
+        Err(error) => {
+            return index_status_error_result(
+                "ASTRO_INDEX_STATUS_ARGS_INVALID",
+                format!("index_status arguments must be valid JSON: {error}"),
+                "Pass a JSON object containing project.",
+                None,
+                None,
+            );
+        }
     };
     let Some(args_obj) = args.as_object() else {
-        return Ok(runner.handle_tool_raw("index_status", args_json)?);
+        return index_status_error_result(
+            "ASTRO_INDEX_STATUS_ARGS_OBJECT_REQUIRED",
+            "index_status arguments must be a JSON object.",
+            "Pass {\"project\":\"<project>\"}.",
+            None,
+            None,
+        );
     };
     let Some(project) = status_project_from_args(args_obj)? else {
-        return Ok(runner.handle_tool_raw("index_status", args_json)?);
+        return index_status_error_result(
+            "ASTRO_INDEX_STATUS_PROJECT_REQUIRED",
+            "index_status requires project.",
+            "Pass project, project_name, project_id, or projectName.",
+            None,
+            None,
+        );
     };
     if read_dial(&project)? != MigrationDial::Shadow {
-        return Ok(runner.handle_tool_raw("index_status", args_json)?);
-    }
-
-    let result = runner.handle_tool_raw("index_status", args_json)?;
-    if tool_result_is_error(&result)? {
+        let result = runner.handle_tool_raw("index_status", args_json)?;
+        if tool_result_is_error(&result)? {
+            return index_status_error_result(
+                "ASTRO_INDEX_STATUS_PROJECT_NOT_FOUND",
+                format!(
+                    "index_status could not read project {project:?}: {}",
+                    tool_result_primary_text(&result).unwrap_or_else(|| result.clone())
+                ),
+                "Index the project first with calyx=\"shadow\" or pass the exact persisted project identifier.",
+                Some(&project),
+                None,
+            );
+        }
         return Ok(result);
     }
-    let summary = shadow_status_summary(&project)?;
-    augment_tool_result(&result, summary)
+
+    let summary = match shadow_status_summary(&project) {
+        Ok(summary) => summary,
+        Err(error) => {
+            let cause = error.to_string();
+            return index_status_error_result(
+                index_status_shadow_error_code(&cause),
+                format!("index_status shadow summary failed for project {project:?}: {cause}"),
+                "Inspect the named persisted shadow surface/config row, preserve the generation, and rerun index_repository with calyx=\"shadow\" from the authoritative source.",
+                Some(&project),
+                Some(cause),
+            );
+        }
+    };
+    tool_json_result(summary)
+}
+
+fn index_status_error_result(
+    code: &'static str,
+    message: impl Into<String>,
+    remediation: &'static str,
+    project: Option<&str>,
+    cause: Option<String>,
+) -> Result<String, DynError> {
+    let mut error = json!({
+        "schema": "astrolabe.index_status.error.v1",
+        "tool": "index_status",
+        "code": code,
+        "message": message.into(),
+        "remediation": remediation,
+        "trust": "verified-error",
+        "freshness": "current",
+    });
+    if let Some(project) = project {
+        error["project"] = json!(project);
+    }
+    if let Some(cause) = cause {
+        error["cause"] = json!(cause);
+    }
+    tool_json_error_result(error)
+}
+
+fn index_status_shadow_error_code(cause: &str) -> &'static str {
+    if cause.contains("ASTRO_SHADOW_SURFACE_MISSING") {
+        "ASTRO_INDEX_STATUS_SURFACE_MISSING"
+    } else if cause.contains("ASTRO_SHADOW_SURFACE_JSON_INVALID")
+        || cause.contains("ASTRO_SHADOW_SURFACE_JSON_TRAILING_BYTES")
+    {
+        "ASTRO_INDEX_STATUS_SURFACE_MALFORMED"
+    } else {
+        "ASTRO_INDEX_STATUS_SHADOW_SUMMARY_FAILED"
+    }
+}
+
+fn tool_result_primary_text(result: &str) -> Option<String> {
+    let value: Value = serde_json::from_str(result).ok()?;
+    value
+        .get("content")?
+        .as_array()?
+        .iter()
+        .filter_map(|item| item.get("text").and_then(Value::as_str))
+        .find(|text| !text.trim().is_empty())
+        .map(ToOwned::to_owned)
 }
 
 pub(crate) fn handle_get_architecture(

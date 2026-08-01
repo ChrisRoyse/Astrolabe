@@ -27,7 +27,7 @@ use astrolabe_kernel::{
     KERNEL_ANSWER_KNOB_REGISTRY_VERSION, KERNEL_ANSWER_SCHEMA, KERNEL_GAP_REPORT_SCHEMA,
     LABEL_PROPAGATION_KNOB_REGISTRY_VERSION, LABEL_PROPAGATION_SCHEMA, LabelGraphEdge,
     LabelPropagationConfig, LabelPropagationReport, LabelSeed, LabelTombstone,
-    SCOPE_SUMMARY_SCHEMA, SEARCH_SCALE_KNOB_REGISTRY_VERSION, SEARCH_SCALE_SCHEMA,
+    SCOPE_SUMMARY_SCHEMA, SEARCH_SCALE_KNOB_REGISTRY_VERSION,
     SKILL_DISCOVERY_KNOB_REGISTRY_VERSION, SKILL_TREE_SCHEMA, ScopeRecallMeasurement, ScopeSummary,
     ScopeSummaryInput, ScopeSummaryMember, SearchIndexBackend, SearchScaleConfig, SearchScalePlan,
     SkillDiscoveryConfig, SkillSymbolInput, SkillTree, bridge_report_artifact_bytes,
