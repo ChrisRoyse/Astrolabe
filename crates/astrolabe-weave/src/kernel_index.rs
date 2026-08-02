@@ -31,7 +31,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use astrolabe_ingest::read_cbm_graph_snapshot;
 use calyx_aster::vault::AsterVault;
-use calyx_core::{Clock, CxId};
+use calyx_core::{Clock, CxId, SlotId};
 
 use crate::search::{SLOT_CODE_SEMANTIC, SearchCaps, SearchError};
 use crate::search_index::{IndexKnobs, SlotIndexManifest, SlotIndexSet};
@@ -51,6 +51,10 @@ pub const KERNEL_INDEX_RECALL_GATE_PERMILLE: u64 = 950;
 
 /// Fail-closed: a kernel-member index build was requested with no members.
 pub const ASTRO_KERNEL_INDEX_NO_MEMBERS: &str = "ASTRO_KERNEL_INDEX_NO_MEMBERS";
+/// Fail-closed: a kernel-scoped text query carried no usable query vector, so
+/// there is nothing to rank the members against. Never degraded into "rank
+/// everything by global weight" — that would answer a question nobody asked.
+pub const ASTRO_KERNEL_QUERY_UNRESOLVED: &str = "ASTRO_KERNEL_QUERY_UNRESOLVED";
 /// Fail-closed: a kernel member `CxId` has no live symbol in the graph snapshot,
 /// so the member set is inconsistent with the corpus the index serves.
 pub const ASTRO_KERNEL_INDEX_MEMBER_ABSENT: &str = "ASTRO_KERNEL_INDEX_MEMBER_ABSENT";
@@ -322,6 +326,114 @@ pub fn kernel_scoped_semantic_query(
         ef,
         caps,
     )
+}
+
+/// One kernel member reached by a query, with the rank that selected it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KernelQueryMatch {
+    /// The member's stable source-atom id.
+    pub symbol_id: String,
+    /// 0-based position in the ranking; 0 is the best match.
+    pub rank: u64,
+}
+
+/// The result of ranking a kernel's members against a query vector.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KernelQueryResult {
+    /// The member set this ranking is bound to.
+    pub members_hash: String,
+    /// The vault sequence the member index was built at.
+    pub base_seq: u64,
+    /// Members carrying a persisted S18 vector (the rankable population).
+    pub indexed_member_count: usize,
+    /// The slot the ranking was produced from.
+    pub slot: SlotId,
+    /// Members reached by the query, best first.
+    pub matches: Vec<KernelQueryMatch>,
+}
+
+/// Ranks a kernel's members against a **query vector** on the kernel-scoped index.
+///
+/// This is the text-query counterpart of [`kernel_scoped_semantic_query`], which
+/// can only anchor on an already-indexed symbol. It exists so a caller holding a
+/// free-text question can resolve it into kernel members through the same frozen
+/// S18 space the corpus was measured in, instead of falling back to a
+/// query-independent ordering (#880).
+///
+/// Fail-closed contract, no silent degradation:
+/// - [`ASTRO_KERNEL_INDEX_STALE`] when `expected_members_hash` differs from the
+///   index's — a ranking against another generation's members is not an answer.
+/// - [`ASTRO_KERNEL_INDEX_ABSENT`] when the index carries no embedding-backed
+///   manifest.
+/// - [`ASTRO_KERNEL_QUERY_UNRESOLVED`] when `query_vector` is empty (the query
+///   resolved to no in-vocabulary dimension).
+/// - A query/index dimension mismatch is refused by the slot index itself.
+///
+/// `k` is supplied by the caller and is normally the full indexed member count:
+/// the kernel is already the small pre-selected set, so ranking it exhaustively
+/// avoids a truncation cap that would silently hide grounded candidates.
+pub fn kernel_query_members(
+    index: &KernelMemberIndex,
+    expected_members_hash: &str,
+    query_vector: &[f32],
+    k: u64,
+    ef: u64,
+) -> Result<KernelQueryResult, SearchError> {
+    if index.members_hash != expected_members_hash {
+        return Err(SearchError::new(
+            ASTRO_KERNEL_INDEX_STALE,
+            format!(
+                "kernel-member index members_hash {} does not match the current kernel manifest \
+                 members_hash {expected_members_hash}",
+                index.members_hash
+            ),
+            "Rebuild the kernel-member index for the current kernel manifest; its member set \
+             changed since this index was built.",
+        ));
+    }
+    let Some(manifest) = &index.manifest else {
+        return Err(SearchError::new(
+            ASTRO_KERNEL_INDEX_ABSENT,
+            format!(
+                "kernel-member index for members_hash {} is a labeled {} with no embedding-backed \
+                 index, so a query cannot reach any member",
+                index.members_hash,
+                index.index_kind.as_str()
+            ),
+            "Ensure the kernel members carry persisted S18 vectors (re-run index_repository with \
+             calyx=\"shadow\"), then rebuild the kernel-member index.",
+        ));
+    };
+    if query_vector.is_empty() {
+        return Err(SearchError::new(
+            ASTRO_KERNEL_QUERY_UNRESOLVED,
+            "the query resolved to no S18 query vector, so no kernel member can be reached by it"
+                .to_string(),
+            "Rephrase the query using vocabulary the indexed corpus actually contains; an \
+             out-of-vocabulary query is refused rather than answered from an unrelated member.",
+        ));
+    }
+
+    let index_set = SlotIndexSet::from_manifest(manifest)?;
+    let query =
+        crate::search_index::SlotQuery::text("").with_vector(SLOT_CODE_SEMANTIC, query_vector.to_vec());
+    let ranking = index_set.rank_slot(SLOT_CODE_SEMANTIC, &query, k, ef)?;
+    let matches = ranking
+        .ranked_symbol_ids
+        .into_iter()
+        .enumerate()
+        .map(|(rank, symbol_id)| KernelQueryMatch {
+            symbol_id,
+            rank: rank as u64,
+        })
+        .collect();
+    Ok(KernelQueryResult {
+        members_hash: index.members_hash.clone(),
+        base_seq: index.base_seq,
+        indexed_member_count: index.indexed_member_count,
+        slot: SLOT_CODE_SEMANTIC,
+        matches,
+    })
 }
 
 /// Measures recall@`k` of a kernel-scoped index against the full index.

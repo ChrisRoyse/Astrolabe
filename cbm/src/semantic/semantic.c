@@ -1948,6 +1948,36 @@ const char *cbm_sem_corpus_token_at(const cbm_sem_corpus_t *corpus, int index,
     return corpus->entries[index].token;
 }
 
+int cbm_sem_corpus_token_id(const cbm_sem_corpus_t *corpus, const char *token) {
+    if (!corpus || !token || !corpus->token_map) {
+        return CBM_NOT_FOUND;
+    }
+    int idx = parse_token_index(cbm_ht_get(corpus->token_map, token));
+    if (idx < 0 || idx >= corpus->entry_count) {
+        return CBM_NOT_FOUND;
+    }
+    return idx;
+}
+
+const int *cbm_sem_corpus_doc_token_ids(const cbm_sem_corpus_t *corpus, int doc_index,
+                                        int *out_count) {
+    if (out_count) {
+        *out_count = 0;
+    }
+    if (!corpus || !corpus->doc_token_ids || !corpus->doc_token_counts || doc_index < 0 ||
+        doc_index >= corpus->doc_count) {
+        return NULL;
+    }
+    const int *ids = corpus->doc_token_ids[doc_index];
+    if (!ids) {
+        return NULL;
+    }
+    if (out_count) {
+        *out_count = corpus->doc_token_counts[doc_index];
+    }
+    return ids;
+}
+
 static void free_ht_kv(const char *key, void *value, void *userdata) {
     (void)userdata;
     free((void *)key);
@@ -2026,15 +2056,24 @@ static float small_cosine(const float *a, const float *b, int dims) {
     return denom < CBM_SEM_DENOM_EPS ? 0.0F : dot / denom;
 }
 
-/* Sparse cosine over two pre-sorted (index, weight) vectors.  Returns 0 when
- * either side is empty or the magnitude product is below the epsilon guard. */
+/* Sparse cosine over two canonical CSR TF-IDF vectors — strictly ascending,
+ * duplicate-free CORPUS-GLOBAL token ids (#868), so an index equality here means
+ * "both documents contain this term" and nothing else. Returns 0 when either
+ * side is empty or the magnitude product is below the epsilon guard.
+ *
+ * Both magnitudes are properties of a vector, not of the pair, so they are
+ * accumulated once by the builder into `tfidf_norm` (same order and float
+ * precision this dot product uses) instead of being recomputed for every
+ * candidate pair. */
 static float sparse_tfidf_cosine(const cbm_sem_func_t *a, const cbm_sem_func_t *b) {
     if (a->tfidf_len <= 0 || b->tfidf_len <= 0) {
         return 0.0F;
     }
+    float denom = a->tfidf_norm * b->tfidf_norm;
+    if (!(denom > CBM_SEM_DENOM_EPS)) {
+        return 0.0F;
+    }
     float dot = 0.0F;
-    float ma = 0.0F;
-    float mb = 0.0F;
     int ia = 0;
     int ib = 0;
     while (ia < a->tfidf_len && ib < b->tfidf_len) {
@@ -2048,14 +2087,7 @@ static float sparse_tfidf_cosine(const cbm_sem_func_t *a, const cbm_sem_func_t *
             ib++;
         }
     }
-    for (int i = 0; i < a->tfidf_len; i++) {
-        ma += a->tfidf_weights[i] * a->tfidf_weights[i];
-    }
-    for (int i = 0; i < b->tfidf_len; i++) {
-        mb += b->tfidf_weights[i] * b->tfidf_weights[i];
-    }
-    float denom = sqrtf(ma) * sqrtf(mb);
-    return denom > CBM_SEM_DENOM_EPS ? (dot / denom) : 0.0F;
+    return dot / denom;
 }
 
 float cbm_sem_combined_score(const cbm_sem_func_t *a, const cbm_sem_func_t *b,

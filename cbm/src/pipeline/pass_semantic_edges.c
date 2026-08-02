@@ -27,6 +27,7 @@
 #include "foundation/platform.h"
 #include "foundation/profile.h"
 
+#include <math.h>
 #include <stdatomic.h>
 #include <stddef.h>
 #include <stdio.h>
@@ -666,12 +667,179 @@ typedef struct {
     uint8_t *qvecs; /* output: pre-quantized int8 vectors [func_count * CBM_SEM_DIM] */
     int func_count;
     _Atomic int next_idx;
+    _Atomic bool failed;
 } vec_build_ctx_t;
+
+/* Ascending comparator over corpus-global token ids. */
+static int cmp_token_id_asc(const void *lhs, const void *rhs) {
+    int a = *(const int *)lhs;
+    int b = *(const int *)rhs;
+    return (a > b) - (a < b);
+}
+
+/* Structured refusal for one function's TF-IDF vector build. Every path that
+ * reaches this leaves the function's vector empty and unpublished. */
+static void tfidf_build_error(const char *code, const char *operation, int func_index,
+                              const char *message, const char *remediation) {
+    cbm_log_error("pass.semantic.tfidf_build_failed", "code", code, "component", "semantic.tfidf",
+                  "operation", operation, "function_index", itoa_log(func_index), "message",
+                  message, "remediation", remediation);
+}
+
+/* Builds one function's canonical sparse TF-IDF vector: a strictly ascending,
+ * duplicate-free CSR of (corpus-global token id, tf_component x idf) with
+ * repeated terms aggregated, plus the L2 magnitude the pairwise scorer divides
+ * by (#868).
+ *
+ * Token identity comes from the corpus itself. The corpus already resolved every
+ * document's tokens to global ids while counting document frequency, and the
+ * pass adds documents 1:1 and index-aligned with functions, so document `f`'s id
+ * list IS this function's token identity list — no per-token hash lookup, and no
+ * chance of the vector and the corpus disagreeing about what a term is.
+ *
+ * Returns false on any allocation, identity, alignment, or numerical failure, so
+ * a partial or mis-keyed vector can never reach the scorer or an emitted edge. */
+static bool build_tfidf_vector(vec_build_ctx_t *vc, int f) {
+    cbm_sem_func_t *fn = &vc->funcs[f];
+    fn->tfidf_indices = NULL;
+    fn->tfidf_weights = NULL;
+    fn->tfidf_len = 0;
+    fn->tfidf_norm = 0.0F;
+
+    int tc = vc->token_counts[f];
+    if (tc <= 0) {
+        return true;
+    }
+
+    int id_count = 0;
+    const int *doc_ids = cbm_sem_corpus_doc_token_ids(vc->corpus, f, &id_count);
+    if (!doc_ids || id_count != tc) {
+        tfidf_build_error("CBM_SEM_TFIDF_TOKEN_IDENTITY_MISSING", "resolve_document_token_ids", f,
+                          "corpus document token identities are absent or disagree with the "
+                          "function token count",
+                          "the semantic corpus must be built from the same per-function token "
+                          "arrays this pass tokenized; re-run indexing and report this if it "
+                          "recurs");
+        return false;
+    }
+
+    /* Keep only terms the corpus gives a positive IDF: a term present in every
+     * document carries no discriminative signal (idf = ln(N/N) = 0) and would
+     * only add a constant to every pair. */
+    int *ids = malloc((size_t)tc * sizeof(int));
+    if (!ids) {
+        tfidf_build_error("CBM_SEM_TFIDF_ALLOC_FAILED", "allocate_term_scratch", f,
+                          "TF-IDF term scratch buffer could not be allocated",
+                          "free memory or reduce the indexed corpus size, then retry");
+        return false;
+    }
+    int kept = 0;
+    for (int t = 0; t < tc; t++) {
+        int gid = doc_ids[t];
+        float idf = 0.0F;
+        if (gid < 0 || !cbm_sem_corpus_token_at(vc->corpus, gid, NULL, &idf)) {
+            free(ids);
+            tfidf_build_error("CBM_SEM_TFIDF_TOKEN_IDENTITY_INVALID", "resolve_term_idf", f,
+                              "a document token id does not resolve to a corpus vocabulary entry",
+                              "re-run indexing; report this if it recurs, as it means the corpus "
+                              "vocabulary and the document id lists diverged");
+            return false;
+        }
+        if (idf > 0.0F) {
+            ids[kept++] = gid;
+        }
+    }
+    if (kept == 0) {
+        /* Honest empty vector: every term of this function is corpus-universal.
+         * sparse_tfidf_cosine scores an empty side as 0, never as a match. */
+        free(ids);
+        return true;
+    }
+
+    qsort(ids, (size_t)kept, sizeof(int), cmp_token_id_asc);
+    int unique = 1;
+    for (int i = 1; i < kept; i++) {
+        if (ids[i] != ids[i - SKIP_ONE]) {
+            unique++;
+        }
+    }
+
+    int *indices = malloc((size_t)unique * sizeof(int));
+    float *weights = malloc((size_t)unique * sizeof(float));
+    if (!indices || !weights) {
+        free(indices);
+        free(weights);
+        free(ids);
+        tfidf_build_error("CBM_SEM_TFIDF_ALLOC_FAILED", "allocate_vector", f,
+                          "TF-IDF vector arrays could not be allocated",
+                          "free memory or reduce the indexed corpus size, then retry");
+        return false;
+    }
+
+    int out = 0;
+    float sum_sq = 0.0F;
+    for (int i = 0; i < kept;) {
+        int gid = ids[i];
+        int run = SKIP_ONE;
+        while (i + run < kept && ids[i + run] == gid) {
+            run++;
+        }
+        float idf = 0.0F;
+        (void)cbm_sem_corpus_token_at(vc->corpus, gid, NULL, &idf);
+        /* Sublinear term frequency (1 + ln tf): a term written five times is
+         * more about the concept than one written once, but not five times more.
+         * tf == 1 evaluates to exactly 1.0, so a single-occurrence term keeps
+         * precisely the plain IDF weight, and the correction is a strict
+         * refinement rather than a re-scaling of every existing weight. */
+        float weight = (1.0F + logf((float)run)) * idf;
+        if (!isfinite(weight)) {
+            free(indices);
+            free(weights);
+            free(ids);
+            tfidf_build_error("CBM_SEM_TFIDF_NONFINITE_WEIGHT", "weight_term", f,
+                              "a TF-IDF term weight evaluated to a non-finite value",
+                              "report this: the corpus produced a non-finite IDF or term count");
+            return false;
+        }
+        indices[out] = gid;
+        weights[out] = weight;
+        sum_sq += weight * weight;
+        out++;
+        i += run;
+    }
+    free(ids);
+
+    if (out != unique) {
+        free(indices);
+        free(weights);
+        tfidf_build_error("CBM_SEM_TFIDF_LENGTH_MISMATCH", "finalize_vector", f,
+                          "the aggregated TF-IDF term count does not match the counted distinct "
+                          "terms",
+                          "report this: the canonical CSR build is inconsistent");
+        return false;
+    }
+    float norm = sqrtf(sum_sq);
+    if (!isfinite(norm) || norm <= 0.0F) {
+        free(indices);
+        free(weights);
+        tfidf_build_error("CBM_SEM_TFIDF_NONFINITE_NORM", "finalize_vector", f,
+                          "the TF-IDF vector magnitude is not a positive finite value",
+                          "report this: a vector with positive-IDF terms must have a positive "
+                          "magnitude");
+        return false;
+    }
+
+    fn->tfidf_indices = indices;
+    fn->tfidf_weights = weights;
+    fn->tfidf_len = out;
+    fn->tfidf_norm = norm;
+    return true;
+}
 
 static void vec_build_worker(int worker_id, void *ctx_ptr) {
     (void)worker_id;
     vec_build_ctx_t *vc = ctx_ptr;
-    while (true) {
+    while (!atomic_load_explicit(&vc->failed, memory_order_acquire)) {
         int f = atomic_fetch_add_explicit(&vc->next_idx, SKIP_ONE, memory_order_relaxed);
         if (f >= vc->func_count) {
             break;
@@ -680,21 +848,10 @@ static void vec_build_worker(int worker_id, void *ctx_ptr) {
         int tc = vc->token_counts[f];
         char **tokens = &vc->all_tokens[(ptrdiff_t)f * CBM_SEM_MAX_TOKENS];
 
-        /* TF-IDF weights */
-        int *indices = malloc((size_t)tc * sizeof(int));
-        float *weights = malloc((size_t)tc * sizeof(float));
-        int tfidf_len = 0;
-        for (int t = 0; t < tc; t++) {
-            float idf = cbm_sem_corpus_idf(vc->corpus, tokens[t]);
-            if (idf > 0.0F) {
-                indices[tfidf_len] = t;
-                weights[tfidf_len] = idf;
-                tfidf_len++;
-            }
+        if (!build_tfidf_vector(vc, f)) {
+            atomic_store_explicit(&vc->failed, true, memory_order_release);
+            return;
         }
-        vc->funcs[f].tfidf_indices = indices;
-        vc->funcs[f].tfidf_weights = weights;
-        vc->funcs[f].tfidf_len = tfidf_len;
 
         /* RI vector: sum of enriched token vectors weighted by IDF. Built in a
          * LOCAL dense buffer; only the quantized code is retained per func
@@ -1295,6 +1452,22 @@ static bool phase4_build_and_store_vectors(cbm_gbuf_t *gbuf, cbm_sem_func_t *fun
                       "free memory or reduce the indexed corpus size, then retry");
         return false;
     }
+    /* Token identity is read out of the corpus by document index, so the 1:1
+     * index alignment the corpus was built under (run_corpus_phase adds exactly
+     * these func_count documents) is a precondition, not an assumption (#868). */
+    int corpus_doc_count = cbm_sem_corpus_doc_count(corpus);
+    if (corpus_doc_count != func_count) {
+        free(qvecs);
+        cbm_log_error("pass.semantic.vector_build_failed", "code",
+                      "CBM_SEM_CORPUS_DOC_ALIGNMENT", "component", "semantic.tfidf", "operation",
+                      "verify_doc_alignment", "corpus_docs", itoa_log(corpus_doc_count),
+                      "functions", itoa_log(func_count), "message",
+                      "the semantic corpus document count does not match the function count, so "
+                      "per-function token identity cannot be resolved",
+                      "report this: the corpus must be built from exactly the functions this pass "
+                      "scanned");
+        return false;
+    }
     vec_build_ctx_t vc = {
         .funcs = funcs,
         .all_tokens = all_tokens,
@@ -1304,6 +1477,7 @@ static bool phase4_build_and_store_vectors(cbm_gbuf_t *gbuf, cbm_sem_func_t *fun
         .func_count = func_count,
     };
     atomic_init(&vc.next_idx, 0);
+    atomic_init(&vc.failed, false);
     cbm_parallel_for_opts_t opts = {
         .max_workers = worker_count,
         .force_pthreads = false,
@@ -1312,6 +1486,19 @@ static bool phase4_build_and_store_vectors(cbm_gbuf_t *gbuf, cbm_sem_func_t *fun
     cbm_parallel_for_result_t dispatch_result = {0};
     if (cbm_parallel_for(worker_count, vec_build_worker, &vc, opts, &dispatch_result) != 0) {
         free(qvecs);
+        return false;
+    }
+    if (atomic_load_explicit(&vc.failed, memory_order_acquire)) {
+        /* A worker already published the exact structured cause. Fail the pass
+         * closed: a corpus where some functions carry a TF-IDF vector and others
+         * silently carry none would emit an edge set that is not a function of
+         * the source (invariant 3). */
+        free(qvecs);
+        cbm_log_error("pass.semantic.vector_build_failed", "code", "CBM_SEM_VECTOR_BUILD_FAILED",
+                      "component", "semantic.tfidf", "operation", "build_vectors", "message",
+                      "per-function semantic vector construction failed; no semantic vectors or "
+                      "edges are published for this run",
+                      "resolve the preceding structured semantic.tfidf error and re-run indexing");
         return false;
     }
     for (int f = 0; f < func_count; f++) {

@@ -38,8 +38,19 @@ pub(crate) const ASTRO_GET_KERNEL_SCOPE_UNKNOWN: &str = "ASTRO_GET_KERNEL_SCOPE_
 /// Refusal: the on-demand FVS kernel build over the vault association graph
 /// produced no kernel (empty graph, no typed edges, or an unreachable recall gate).
 pub(crate) const ASTRO_KERNEL_BUILD_UNAVAILABLE: &str = "ASTRO_KERNEL_BUILD_UNAVAILABLE";
+/// Refusal: the kernel member index could not be read for the project — a vault,
+/// artifact, or index-build failure (#882). Distinct from
+/// [`astrolabe_weave::ASTRO_KERNEL_INDEX_ABSENT`], which means the index honestly
+/// does not exist; this one means the state could not be determined at all, and
+/// neither is ever answered with a membership-manifest substitute.
+pub(crate) const ASTRO_KERNEL_INDEX_UNAVAILABLE: &str = "ASTRO_KERNEL_INDEX_UNAVAILABLE";
 /// Refusal: `kernel_answer` requires a non-empty query.
 pub(crate) const ASTRO_KERNEL_ANSWER_QUERY_REQUIRED: &str = "ASTRO_KERNEL_ANSWER_QUERY_REQUIRED";
+/// Refusal: the query carried no token the frozen embedding table knows, so it
+/// reaches no kernel member (#880). Refusing is the point: answering an
+/// all-out-of-vocabulary question from the globally heaviest member would be a
+/// confident guess with no relationship to what was asked (invariant 2).
+pub(crate) const ASTRO_KERNEL_ANSWER_QUERY_OOV: &str = "ASTRO_KERNEL_ANSWER_QUERY_OOV";
 /// Refusal: the project has no persisted kernel artifact or association-graph
 /// projection to answer from — the answer-path substrate is absent until a kernel
 /// is built (`get_kernel mode="build"`).
@@ -226,25 +237,30 @@ pub(crate) fn handle_get_kernel(args_json: &str) -> Result<String, DynError> {
         .map(|summary| scope_gap_count(summary))
         .sum();
 
-    // #365: the served index.json upgraded to embedding_backed_hnsw when the
-    // persisted kernel members carry S18 vectors, labeled membership_manifest
-    // otherwise (or absent when no artifact is persisted).
-    let index = match read_project_kernel_artifact(&cache_dir, &project) {
-        Ok(Some(artifact)) => serve_kernel_index_value(&cache_dir, &project, &artifact),
-        Ok(None) => json!({
-            "index_kind": "membership_manifest",
-            "status": "unavailable",
-            "reason": "no persisted kernel artifact for this project",
-            "trust": "provisional",
-            "freshness": "not_evaluated",
-        }),
-        Err(error) => json!({
-            "index_kind": "membership_manifest",
-            "status": "unavailable",
-            "reason": format!("kernel artifact read failed: {error}"),
-            "trust": "provisional",
-            "freshness": "not_evaluated",
-        }),
+    // #365/#882: the served index.json reports the embedding-backed index only
+    // when its physical manifest was actually built for this generation. A
+    // membership manifest is capability ABSENCE, reported as such; a config,
+    // vault, artifact, or index-build failure is a state failure and propagates
+    // as a coded refusal. Neither is ever laundered into a served index.
+    let index = match read_kernel_index_state(&cache_dir, &project) {
+        Ok(Some(index)) => index,
+        Ok(None) => kernel_index_absent_value(
+            None,
+            &format!("project {project:?} has no persisted kernel artifact, so no member index exists"),
+        ),
+        Err(error) => {
+            return tool_json_error_result(json!({
+                "schema": "astrolabe.get_kernel.v1",
+                "status": "refused",
+                "mode": mode,
+                "project": project,
+                "code": ASTRO_KERNEL_INDEX_UNAVAILABLE,
+                "message": format!("kernel member index could not be read for project {project:?}: {error}"),
+                "remediation": "repair the shadow vault and its persisted Kernel artifact, then retry get_kernel; no membership-manifest substitute is served for a read failure",
+                "trust": "provisional",
+                "freshness": "not_evaluated",
+            }));
+        }
     };
 
     tool_json_result(json!({
@@ -343,43 +359,61 @@ pub(crate) fn read_project_kernel_artifact(
     Ok(artifact)
 }
 
-/// Serves the kernel `index.json` for a project (#365), upgrading its
-/// `index_kind` to `embedding_backed_hnsw` when the kernel members carry persisted
-/// S18 code-semantic vectors — via the weave kernel-member index (#344) — and
-/// labeling it `membership_manifest` otherwise (no member carried an S18 vector).
-/// A read/build error degrades to a labeled membership_manifest, never a silent
-/// upgrade claim.
-pub(crate) fn serve_kernel_index_value(
+/// Renders the honest capability-absence view of a kernel member index (#882).
+///
+/// A kernel whose members carry no persisted S18 vectors has **no** semantic
+/// member index. That is an absent capability, not a degraded one, so this value
+/// carries `status:"absent"` and the same [`astrolabe_weave::ASTRO_KERNEL_INDEX_ABSENT`]
+/// code `kernel_scoped_semantic_query` refuses with — never a `provisional`
+/// membership manifest dressed as an index. `freshness` is `not_evaluated`
+/// because nothing was measured.
+pub(crate) fn kernel_index_absent_value(
+    index: Option<&astrolabe_weave::KernelMemberIndex>,
+    reason: &str,
+) -> Value {
+    json!({
+        "schema": astrolabe_weave::KERNEL_MEMBER_INDEX_SCHEMA,
+        "status": "absent",
+        "code": astrolabe_weave::ASTRO_KERNEL_INDEX_ABSENT,
+        "configured_index_kind": "embedding_backed_hnsw",
+        "active_index_kind": index.map(|index| index.index_kind.as_str()),
+        "members_hash": index.map(|index| index.members_hash.clone()),
+        "base_seq": index.map(|index| index.base_seq),
+        "indexed_member_count": index.map_or(0, |index| index.indexed_member_count),
+        "missing_vector_members": index.map(|index| index.missing_vector_members.clone()),
+        "message": reason,
+        "remediation": "re-run index_repository with calyx=\"shadow\" so the kernel members carry persisted S18 code-semantic vectors, then rebuild the kernel with get_kernel mode=\"build\"; a membership manifest is not a substitute for the semantic member index",
+        "trust": "not_evaluated",
+        "freshness": "not_evaluated",
+    })
+}
+
+/// Reads the persisted kernel artifact **and** builds its embedding-backed member
+/// index for one project through a single read-only vault handle (#365/#344/#882).
+///
+/// One open per request, for one generation: the artifact read and the member
+/// index are two views of the same immutable vault state, and opening the vault
+/// twice let them disagree about which generation was served.
+///
+/// Fail-closed contract (#882): every config, vault, artifact, and index-build
+/// failure is returned as an `Err` and surfaces as a coded refusal. `Ok(None)`
+/// means no kernel artifact is persisted at all. A built index that is a labeled
+/// [`astrolabe_weave::KernelIndexKind::MembershipManifestOnly`] returns the
+/// capability-absence value — it is never reported as an equivalent index, and
+/// the embedding-backed view is served only when the physical manifest exists and
+/// its `members_hash` matches the artifact the same handle just read.
+pub(crate) fn read_kernel_index_state(
     cache_dir: &Path,
     project: &str,
-    artifact: &astrolabe_kernel::KernelArtifact,
-) -> Value {
+) -> Result<Option<Value>, DynError> {
     use astrolabe_weave::search::SLOT_CODE_SEMANTIC;
     use astrolabe_weave::search_index::IndexKnobs;
 
-    let member_cx_ids: Vec<_> = artifact.members.iter().map(|member| member.id).collect();
-    let membership_manifest = |reason: &str| {
-        json!({
-            "schema": astrolabe_weave::KERNEL_MEMBER_INDEX_SCHEMA,
-            "index_kind": "membership_manifest",
-            "members_hash": artifact.members_hash,
-            "member_count": artifact.member_count,
-            "indexed_member_count": 0,
-            "note": reason,
-            "trust": "provisional",
-            "freshness": "fresh",
-        })
-    };
-
-    let config = match shadow_vault_config_at(cache_dir, project) {
-        Ok(config) => config,
-        Err(error) => return membership_manifest(&format!("vault config unavailable: {error}")),
-    };
-    let (vault_dir, vault_id, vault_salt) = config;
+    let (vault_dir, vault_id, vault_salt) = shadow_vault_config_at(cache_dir, project)?;
     if !vault_dir.exists() {
-        return membership_manifest("shadow vault missing");
+        return Ok(None);
     }
-    let vault = match open_shadow_vault_read_only(
+    let vault = open_shadow_vault_read_only(
         &vault_dir,
         &vault_id,
         &vault_salt,
@@ -390,45 +424,68 @@ pub(crate) fn serve_kernel_index_value(
             ColumnFamily::Kv,
             ColumnFamily::slot(SLOT_CODE_SEMANTIC),
         ],
-    ) {
-        Ok(vault) => vault,
-        Err(error) => return membership_manifest(&format!("vault unavailable: {error}")),
+    )?;
+    let scope_id = kernel_artifact_scope_id(project);
+    let Some(artifact) = astrolabe_ingest::read_persisted_kernel_artifact(&vault, &scope_id)? else {
+        return Ok(None);
     };
 
+    let member_cx_ids: Vec<_> = artifact.members.iter().map(|member| member.id).collect();
     // Deterministic seed pinned per members_hash so the same member set yields the
     // same index bytes (invariant 5).
-    let index = match astrolabe_weave::build_kernel_member_index(
+    let index = astrolabe_weave::build_kernel_member_index(
         &vault,
         project,
         &member_cx_ids,
         &artifact.members_hash,
         IndexKnobs::defaults(0x4B45_524E_454C_0001),
-    ) {
-        Ok(index) => index,
-        Err(error) => {
-            return membership_manifest(&format!("kernel-member index unavailable: {error}"));
-        }
-    };
+    )?;
 
-    let embedding_backed =
-        index.index_kind == astrolabe_weave::KernelIndexKind::EmbeddingBackedHnsw;
-    json!({
+    if index.index_kind != astrolabe_weave::KernelIndexKind::EmbeddingBackedHnsw
+        || index.manifest.is_none()
+    {
+        return Ok(Some(kernel_index_absent_value(
+            Some(&index),
+            &format!(
+                "{} of {} kernel member(s) carry a persisted S18 code-semantic vector, so no \
+                 embedding-backed member index exists for members_hash {}",
+                index.indexed_member_count, artifact.member_count, artifact.members_hash
+            ),
+        )));
+    }
+    // The index is content-addressed by members_hash; serving it against a
+    // different artifact would silently answer from another generation.
+    if index.members_hash != artifact.members_hash {
+        return Err(format!(
+            "{}: kernel member index members_hash {} does not match the artifact members_hash {} \
+             read through the same vault handle",
+            astrolabe_weave::ASTRO_KERNEL_INDEX_STALE,
+            index.members_hash,
+            artifact.members_hash
+        )
+        .into());
+    }
+
+    Ok(Some(json!({
         "schema": astrolabe_weave::KERNEL_MEMBER_INDEX_SCHEMA,
+        "status": "served",
         "index_kind": index.index_kind.as_str(),
+        "selection_reason": "physical embedding-backed manifest built for this artifact's exact members_hash and base_seq",
         "members_hash": index.members_hash,
         "member_count": artifact.member_count,
         "indexed_member_count": index.indexed_member_count,
         "missing_vector_members": index.missing_vector_members,
         "semantic_dim": index.semantic_dim,
         "base_seq": index.base_seq,
-        "trust": if embedding_backed { "verified" } else { "provisional" },
+        "backend": "hnsw",
+        "trust": "verified",
         "freshness": "fresh",
         "provenance": [
             format!("kernel-artifact:scope={}", artifact.scope_id),
             "vault:slot(SLOT_CODE_SEMANTIC)".to_string(),
             "astrolabe_weave::build_kernel_member_index(#344)".to_string(),
         ],
-    })
+    })))
 }
 
 /// Reshapes one persisted scope-summary into the `get_kernel` per-scope view.
@@ -532,7 +589,7 @@ pub(crate) fn handle_kernel_answer(args_json: &str) -> Result<String, DynError> 
     if let Some(refusal) = shadow_graph_freshness_refusal(&cache_dir, &project, "kernel_answer")? {
         return Ok(refusal);
     }
-    match build_kernel_answer_inputs(&cache_dir, &project)? {
+    match build_kernel_answer_inputs(&cache_dir, &project, query)? {
         Some(inputs) => serve_kernel_answer(&cache_dir, &project, query, &scope, &inputs),
         None => tool_json_error_result(json!({
             "schema": KERNEL_ANSWER_SCHEMA,
@@ -560,8 +617,12 @@ pub(crate) struct KernelAnswerInputs {
     pub(crate) nodes: Vec<astrolabe_kernel::AnswerNode>,
     /// Directed weighted association edges from the composite projection CSR.
     pub(crate) edges: Vec<astrolabe_kernel::AnswerEdge>,
-    /// Kernel-first candidate entry set (the persisted kernel members).
+    /// Kernel-first candidate entry set for THIS query, best first (#880).
     pub(crate) matched_ids: Vec<CxId>,
+    /// How the query reached that candidate set: index identity, generation, the
+    /// embedded slot, and the ranked members. Served on both an answer and a
+    /// refusal so the selection is physically observable either way.
+    pub(crate) query_resolution: Value,
     /// Ledger head of the serving vault (the recorded answer's freshness watermark).
     pub(crate) ledger: LedgerPointer,
 }
@@ -587,7 +648,9 @@ pub(crate) struct KernelAnswerInputs {
 pub(crate) fn build_kernel_answer_inputs(
     cache_dir: &Path,
     project: &str,
+    query: &str,
 ) -> Result<Option<KernelAnswerInputs>, DynError> {
+    use astrolabe_weave::search::SLOT_CODE_SEMANTIC;
     let (vault_dir, vault_id, vault_salt) = shadow_vault_config_at(cache_dir, project)?;
     if !vault_dir.exists() {
         return Ok(None);
@@ -601,6 +664,10 @@ pub(crate) fn build_kernel_answer_inputs(
             ColumnFamily::Graph,
             ColumnFamily::Kernel,
             ColumnFamily::Kv,
+            // #880: the query is resolved against the members' persisted S18
+            // vectors through this same handle, so the ranking and the artifact
+            // are read from one generation.
+            ColumnFamily::slot(SLOT_CODE_SEMANTIC),
         ],
     )?;
     let scope_id = kernel_artifact_scope_id(project);
@@ -657,18 +724,139 @@ pub(crate) fn build_kernel_answer_inputs(
         }
     }
 
-    // Kernel-first candidate entry set: the persisted kernel members are the
-    // pre-selected high-value set the answer anchors into. Query-text narrowing of
-    // this candidate set is a future refinement (tracked as a follow-up); the entry
-    // is the highest-weight grounded, provenanced member the engine selects.
-    let matched_ids: Vec<CxId> = artifact.members.iter().map(|member| member.id).collect();
+    // #880: the kernel members are the pre-selected high-value population; WHICH
+    // of them this question reaches is resolved against the exact-generation
+    // member index, so two unrelated queries cannot select the same entry.
+    let (matched_ids, query_resolution) =
+        resolve_query_candidates(&vault, project, &artifact, query)?;
 
     Ok(Some(KernelAnswerInputs {
         nodes,
         edges,
         matched_ids,
+        query_resolution,
         ledger,
     }))
+}
+
+/// Resolves a free-text question into the kernel-first candidate set, best first
+/// (#880), returning the ranked `CxId`s and the evidence that produced them.
+///
+/// The query is embedded with the same frozen static-embedding table the shadow
+/// import measured the corpus with, then ranked on the embedding-backed
+/// kernel-member index bound to this artifact's exact `members_hash`. Ranking is
+/// exhaustive over the indexed members (`k` = the indexed member count), so no
+/// silent truncation can hide a grounded candidate from the entry gate.
+///
+/// Fail-closed, never a global-weight fallback:
+/// - [`ASTRO_KERNEL_ANSWER_QUERY_OOV`] when the query yields no S18 vector.
+/// - [`astrolabe_weave::ASTRO_KERNEL_INDEX_ABSENT`] when the members carry no
+///   persisted S18 vectors, so nothing can be ranked.
+/// - A stale index, a dimension mismatch, or a table load failure propagates the
+///   underlying coded error verbatim.
+fn resolve_query_candidates<C>(
+    vault: &AsterVault<C>,
+    project: &str,
+    artifact: &astrolabe_kernel::KernelArtifact,
+    query: &str,
+) -> Result<(Vec<CxId>, Value), DynError>
+where
+    C: Clock,
+{
+    use astrolabe_panel::{StaticEmbeddingInput, StaticEmbeddingTable, encode_static_embedding_slot};
+    use astrolabe_weave::search::SLOT_CODE_SEMANTIC;
+    use astrolabe_weave::search_index::{IndexKnobs, split_identifier_tokens};
+
+    let member_cx_ids: Vec<CxId> = artifact.members.iter().map(|member| member.id).collect();
+    // Same deterministic seed the get_kernel index surface pins, so the index a
+    // query ranks against is byte-identical to the one get_kernel reports.
+    let index = astrolabe_weave::build_kernel_member_index(
+        vault,
+        project,
+        &member_cx_ids,
+        &artifact.members_hash,
+        IndexKnobs::defaults(0x4B45_524E_454C_0001),
+    )?;
+
+    // Embed the query into S18 with the frozen table the corpus was measured
+    // with. An Absent embedding means no query token is in vocabulary.
+    let table = StaticEmbeddingTable::load_default()?;
+    let input = StaticEmbeddingInput {
+        body_tokens: split_identifier_tokens(query),
+        doc_tokens: Vec::new(),
+        name: query.to_string(),
+        qualified_name: query.to_string(),
+    };
+    let encoded = encode_static_embedding_slot(SLOT_CODE_SEMANTIC, &input, &table)?;
+    let SlotVector::Dense { data: query_vector, .. } = encoded else {
+        return Err(format!(
+            "{ASTRO_KERNEL_ANSWER_QUERY_OOV}: query {query:?} carries no token the frozen \
+             code-semantic embedding table knows, so it reaches no kernel member; remediation: \
+             rephrase the query using identifiers or vocabulary the indexed corpus contains"
+        )
+        .into());
+    };
+
+    let k = index.indexed_member_count as u64;
+    let ranked = astrolabe_weave::kernel_query_members(
+        &index,
+        &artifact.members_hash,
+        &query_vector,
+        k,
+        k,
+    )?;
+
+    // Map ranked source-atom ids back to CxIds through the same snapshot the
+    // index resolved its members from; a match with no live CxId is dropped and
+    // counted, never silently treated as a different member.
+    let snapshot = astrolabe_ingest::read_cbm_graph_snapshot(vault, project)?;
+    let cx_by_symbol: BTreeMap<&str, CxId> = snapshot
+        .nodes
+        .iter()
+        .filter_map(|node| node.cx_id.map(|cx| (node.atom_id.as_str(), cx)))
+        .collect();
+
+    let mut matched_ids: Vec<CxId> = Vec::with_capacity(ranked.matches.len());
+    let mut unresolved: Vec<&str> = Vec::new();
+    let mut ranked_json: Vec<Value> = Vec::with_capacity(ranked.matches.len());
+    for candidate in &ranked.matches {
+        match cx_by_symbol.get(candidate.symbol_id.as_str()) {
+            Some(cx) => {
+                matched_ids.push(*cx);
+                ranked_json.push(json!({
+                    "rank": candidate.rank,
+                    "symbol_id": candidate.symbol_id,
+                    "cx_id": cx.to_string(),
+                }));
+            }
+            None => unresolved.push(candidate.symbol_id.as_str()),
+        }
+    }
+
+    let evidence = json!({
+        "schema": "astrolabe.kernel_answer_query_resolution.v1",
+        "entry_selection": "query_ranked_kernel_member_index",
+        "query": query,
+        "embedded_slot": SLOT_CODE_SEMANTIC.get(),
+        "query_vector_dim": query_vector.len(),
+        "index_kind": index.index_kind.as_str(),
+        "members_hash": ranked.members_hash,
+        "base_seq": ranked.base_seq,
+        "member_count": artifact.member_count,
+        "indexed_member_count": ranked.indexed_member_count,
+        "missing_vector_members": index.missing_vector_members,
+        "ranked_member_count": matched_ids.len(),
+        "unresolved_symbol_ids": unresolved,
+        "ranked_members": ranked_json,
+        "trust": "verified",
+        "freshness": "fresh",
+        "provenance": [
+            format!("kernel-artifact:scope={}", artifact.scope_id),
+            "vault:slot(SLOT_CODE_SEMANTIC)".to_string(),
+            "astrolabe_weave::kernel_query_members(#880)".to_string(),
+        ],
+    });
+    Ok((matched_ids, evidence))
 }
 
 /// Joins per-`CxId` provenance references and the serving-vault ledger head out of
@@ -741,9 +929,9 @@ fn serve_kernel_answer(
     };
 
     match resolution {
-        astrolabe_kernel::AnswerResolution::Refused(refusal) => {
-            tool_json_error_result(kernel_answer_refusal_json(project, scope, &refusal))
-        }
+        astrolabe_kernel::AnswerResolution::Refused(refusal) => tool_json_error_result(
+            kernel_answer_refusal_json(project, scope, &refusal, &inputs.query_resolution),
+        ),
         astrolabe_kernel::AnswerResolution::Answered(answer) => {
             // #384: capture the served answer as a reproduce fixture — the recorded
             // artifact bytes plus the current-vault graph the live reproduce
@@ -763,7 +951,12 @@ fn serve_kernel_answer(
                 &inputs.matched_ids,
             );
             persist_reproduce_fixture(cache_dir, project, &answer_id, entry)?;
-            tool_json_result(served_kernel_answer_json(project, scope, &answer))
+            tool_json_result(served_kernel_answer_json(
+                project,
+                scope,
+                &answer,
+                &inputs.query_resolution,
+            ))
         }
     }
 }
@@ -773,6 +966,7 @@ fn served_kernel_answer_json(
     project: &str,
     scope: &Option<String>,
     answer: &astrolabe_kernel::KernelAnswer,
+    query_resolution: &Value,
 ) -> Value {
     json!({
         "schema": answer.schema,
@@ -804,7 +998,8 @@ fn served_kernel_answer_json(
         "total_score_permille": answer.total_score_permille,
         "provenance_refs": answer.provenance_refs,
         "answer_node_ids": answer.answer_node_ids.iter().map(ToString::to_string).collect::<Vec<_>>(),
-        "entry_selection": "kernel_weight_over_all_members (query-text narrowing pending)",
+        "entry_selection": "query_ranked_kernel_member_index",
+        "query_resolution": query_resolution,
         "reproduce": "fixture persisted at serve time; get_provenance mode=\"reproduce\" subject=answer_id",
         "trust": answer.trust,
         "freshness": answer.freshness,
@@ -816,6 +1011,7 @@ fn kernel_answer_refusal_json(
     project: &str,
     scope: &Option<String>,
     refusal: &astrolabe_kernel::AnswerRefusal,
+    query_resolution: &Value,
 ) -> Value {
     json!({
         "schema": refusal.schema,
@@ -831,6 +1027,7 @@ fn kernel_answer_refusal_json(
         })).collect::<Vec<_>>(),
         "message": refusal.message,
         "remediation": refusal.remediation,
+        "query_resolution": query_resolution,
         "trust": refusal.trust,
         "freshness": refusal.freshness,
     })
