@@ -3,6 +3,8 @@ use rusqlite::OpenFlags;
 use rusqlite::backup::Backup;
 use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
+#[cfg(windows)]
+use std::os::windows::fs::MetadataExt;
 
 const PUBLICATION_DIR: &str = ".astrolabe-shadow-publication";
 const PUBLICATION_JOURNAL: &str = "transaction.json";
@@ -1372,6 +1374,576 @@ pub(crate) fn shadow_publication_recovery_observation(
         "publication_config_sha256": publication_config_sha256,
         "publication_config_rows": config_rows,
     })))
+}
+
+pub(crate) fn shadow_publication_recovery_sentinel(
+    live_cache: &Path,
+    project: &str,
+    fault_code: &str,
+) -> Result<Option<Value>, DynError> {
+    let project_root = publication_project_root(live_cache, project);
+    if !project_root.exists() || fs::read_dir(&project_root)?.next().is_none() {
+        return Ok(None);
+    }
+    let transaction_metadata = compact_transaction_sentinel(&project_root, live_cache, project)?;
+    let config_rows = publication_recovery_relevant_config_rows(live_cache, project)?;
+    let publication_config_sha256 = config_rows_sha256(&config_rows)?;
+    Ok(Some(json!({
+        "schema": "astrolabe.shadow-publication-recovery-sentinel.v1",
+        "project": project,
+        "fault_code": fault_code,
+        "transaction_root": project_root,
+        "transaction_metadata": transaction_metadata,
+        "publication_config_sha256": publication_config_sha256,
+        "publication_config_row_count": config_rows.len(),
+        "publication_config_keys": config_rows
+            .iter()
+            .map(|(key, _)| key.clone())
+            .collect::<Vec<_>>(),
+    })))
+}
+
+fn compact_transaction_sentinel(
+    project_root: &Path,
+    live_cache: &Path,
+    project: &str,
+) -> Result<Value, DynError> {
+    let mut sentinel = CompactTransactionSentinel::new();
+    collect_compact_transaction_sentinel(project_root, live_cache, project, &mut sentinel)?;
+    let entry_digest = sentinel.entries_sha256();
+    Ok(json!({
+        "schema": "astrolabe.shadow-publication-recovery-compact-sentinel.v1",
+        "root": project_root,
+        "strategy": "project-root-direct-entries+journal-sha256+journal-bound-artifact-metadata",
+        "entry_count": sentinel.entry_count,
+        "file_count": sentinel.file_count,
+        "directory_count": sentinel.directory_count,
+        "total_file_bytes": sentinel.total_file_bytes,
+        "transaction_count": sentinel.transaction_count,
+        "journal_count": sentinel.journal_count,
+        "artifact_probe_count": sentinel.artifact_probe_count,
+        "direct_entry_count": sentinel.direct_entry_count,
+        "entries_sha256": entry_digest,
+    }))
+}
+
+struct CompactTransactionSentinel {
+    entry_count: u64,
+    file_count: u64,
+    directory_count: u64,
+    total_file_bytes: u64,
+    transaction_count: u64,
+    journal_count: u64,
+    artifact_probe_count: u64,
+    direct_entry_count: u64,
+    hasher: Sha256,
+}
+
+impl CompactTransactionSentinel {
+    fn new() -> Self {
+        let mut hasher = Sha256::new();
+        hasher.update(b"astrolabe.shadow-publication.compact-sentinel.v1\0");
+        Self {
+            entry_count: 0,
+            file_count: 0,
+            directory_count: 0,
+            total_file_bytes: 0,
+            transaction_count: 0,
+            journal_count: 0,
+            artifact_probe_count: 0,
+            direct_entry_count: 0,
+            hasher,
+        }
+    }
+
+    fn push(
+        &mut self,
+        relative_path: &str,
+        kind: &str,
+        entry_class: &str,
+        bytes: Option<u64>,
+        metadata: Value,
+    ) -> Result<(), DynError> {
+        self.entry_count += 1;
+        if kind.contains("artifact") {
+            self.artifact_probe_count += 1;
+        }
+        if kind.contains("direct") {
+            self.direct_entry_count += 1;
+        }
+        match entry_class {
+            "file" => {
+                self.file_count += 1;
+                self.total_file_bytes += bytes.unwrap_or(0);
+            }
+            "directory" => {
+                self.directory_count += 1;
+            }
+            _ => {}
+        }
+        let entry = json!({
+            "relative_path": relative_path,
+            "kind": kind,
+            "entry_class": entry_class,
+            "bytes": bytes,
+            "metadata": metadata,
+        });
+        let bytes = serde_json::to_vec(&entry)?;
+        self.hasher.update((bytes.len() as u64).to_le_bytes());
+        self.hasher.update(&bytes);
+        Ok(())
+    }
+
+    fn entries_sha256(&self) -> String {
+        hex_lower(&self.hasher.clone().finalize())
+    }
+}
+
+fn collect_compact_transaction_sentinel(
+    project_root: &Path,
+    live_cache: &Path,
+    project: &str,
+    sentinel: &mut CompactTransactionSentinel,
+) -> Result<(), DynError> {
+    let mut transactions = fs::read_dir(project_root)?.collect::<std::io::Result<Vec<_>>>()?;
+    transactions.sort_by_key(|entry| entry.file_name());
+    for transaction in transactions {
+        let path = transaction.path();
+        let metadata = fs::symlink_metadata(&path)?;
+        let file_type = metadata.file_type();
+        if file_type.is_symlink() {
+            return Err(format!(
+                "ASTRO_SHADOW_PUBLICATION_SENTINEL_SYMLINK: refused linked transaction entry {}; remediation: preserve the transaction and inspect the named path before retrying recovery",
+                path.display()
+            )
+            .into());
+        }
+        if file_type.is_dir() {
+            sentinel.transaction_count += 1;
+            let relative_path = sentinel_relative_path(project_root, &path)?;
+            sentinel.push(
+                &relative_path,
+                "transaction_directory",
+                "directory",
+                None,
+                cheap_directory_metadata(&metadata),
+            )?;
+            push_direct_children_sentinel(project_root, &path, sentinel)?;
+            push_transaction_journal_sentinel(project_root, live_cache, project, &path, sentinel)?;
+        } else if file_type.is_file() {
+            let relative_path = sentinel_relative_path(project_root, &path)?;
+            sentinel.push(
+                &relative_path,
+                "project_root_direct_file",
+                "file",
+                Some(metadata.len()),
+                cheap_file_metadata(&metadata),
+            )?;
+        } else {
+            return Err(format!(
+                "ASTRO_SHADOW_PUBLICATION_SENTINEL_SPECIAL_FILE: refused special transaction entry {}; remediation: preserve the transaction and inspect the named path before retrying recovery",
+                path.display()
+            )
+            .into());
+        }
+    }
+    Ok(())
+}
+
+fn push_direct_children_sentinel(
+    project_root: &Path,
+    directory: &Path,
+    sentinel: &mut CompactTransactionSentinel,
+) -> Result<(), DynError> {
+    let mut children = fs::read_dir(directory)?.collect::<std::io::Result<Vec<_>>>()?;
+    children.sort_by_key(|entry| entry.file_name());
+    for child in children {
+        let path = child.path();
+        let metadata = fs::symlink_metadata(&path)?;
+        let file_type = metadata.file_type();
+        if file_type.is_symlink() {
+            return Err(format!(
+                "ASTRO_SHADOW_PUBLICATION_SENTINEL_SYMLINK: refused linked transaction direct entry {}; remediation: preserve the transaction and inspect the named path before retrying recovery",
+                path.display()
+            )
+            .into());
+        }
+        let relative_path = sentinel_display_path(project_root, &path);
+        if file_type.is_dir() {
+            sentinel.push(
+                &relative_path,
+                "transaction_direct_directory",
+                "directory",
+                None,
+                cheap_directory_metadata(&metadata),
+            )?;
+        } else if file_type.is_file() {
+            sentinel.push(
+                &relative_path,
+                "transaction_direct_file",
+                "file",
+                Some(metadata.len()),
+                cheap_file_metadata(&metadata),
+            )?;
+        } else {
+            return Err(format!(
+                "ASTRO_SHADOW_PUBLICATION_SENTINEL_SPECIAL_FILE: refused special transaction direct entry {}; remediation: preserve the transaction and inspect the named path before retrying recovery",
+                path.display()
+            )
+            .into());
+        }
+    }
+    Ok(())
+}
+
+fn push_transaction_journal_sentinel(
+    project_root: &Path,
+    live_cache: &Path,
+    project: &str,
+    transaction: &Path,
+    sentinel: &mut CompactTransactionSentinel,
+) -> Result<(), DynError> {
+    let journal_path = transaction.join(PUBLICATION_JOURNAL);
+    let journal_bytes = fs::read(&journal_path).map_err(|error| {
+        format!(
+            "ASTRO_SHADOW_PUBLICATION_SENTINEL_JOURNAL_UNREADABLE: read {}: {error}; remediation: preserve the transaction and inspect the journal before retrying recovery",
+            journal_path.display()
+        )
+    })?;
+    let journal_sha256 = hex_lower(&Sha256::digest(&journal_bytes));
+    let metadata = fs::symlink_metadata(&journal_path)?;
+    if !metadata.file_type().is_file() {
+        return Err(format!(
+            "ASTRO_SHADOW_PUBLICATION_SENTINEL_JOURNAL_NOT_FILE: journal {} is not an ordinary file; remediation: preserve the transaction and inspect the exact path",
+            journal_path.display()
+        )
+        .into());
+    }
+    let journal = read_publication_journal(&journal_path)?;
+    validate_publication_journal_identity(&journal, transaction, project_root, live_cache, project)?;
+    sentinel.journal_count += 1;
+    let manifest_kind = if journal.recovery_manifest.is_some() {
+        "artifact_recovery"
+    } else if journal.metadata_acknowledgement.is_some() {
+        "metadata_acknowledgement"
+    } else {
+        "none"
+    };
+    sentinel.push(
+        &sentinel_display_path(project_root, &journal_path),
+        "transaction_journal",
+        "file",
+        Some(metadata.len()),
+        json!({
+            "journal_sha256": journal_sha256,
+            "metadata": cheap_file_metadata(&metadata),
+            "phase": journal.phase,
+            "generation": journal.generation,
+            "owner": journal.owner,
+            "manifest_kind": manifest_kind,
+        }),
+    )?;
+    if let Some(manifest) = journal.recovery_manifest.as_ref() {
+        push_recovery_manifest_sentinel(project_root, &journal, manifest, sentinel)?;
+    }
+    if let Some(manifest) = journal.metadata_acknowledgement.as_ref() {
+        push_metadata_acknowledgement_sentinel(project_root, &journal, manifest, sentinel)?;
+    }
+    Ok(())
+}
+
+fn push_recovery_manifest_sentinel(
+    project_root: &Path,
+    journal: &PublicationJournal,
+    manifest: &PublicationRecoveryManifest,
+    sentinel: &mut CompactTransactionSentinel,
+) -> Result<(), DynError> {
+    push_sqlite_family_sentinel(
+        project_root,
+        &journal.backup_dir.join("source"),
+        "artifact_backup_source",
+        &manifest.prior.source,
+        sentinel,
+    )?;
+    push_sqlite_family_sentinel(
+        project_root,
+        &journal.backup_dir.join("lowered"),
+        "artifact_backup_lowered",
+        &manifest.prior.lowered,
+        sentinel,
+    )?;
+    push_vault_sentinel(
+        project_root,
+        &journal.backup_dir.join("vault"),
+        "artifact_backup_vault",
+        &manifest.prior.vault_tree_sha256,
+        sentinel,
+    )?;
+    push_sqlite_family_sentinel(
+        project_root,
+        &sqlite_path(&journal.stage_cache, &journal.project),
+        "artifact_stage_source",
+        &manifest.candidate.source,
+        sentinel,
+    )?;
+    push_sqlite_family_sentinel(
+        project_root,
+        &lowered_sqlite_path(&journal.stage_cache, &journal.project),
+        "artifact_stage_lowered",
+        &manifest.candidate.lowered,
+        sentinel,
+    )?;
+    push_vault_sentinel(
+        project_root,
+        &vault_dir(&journal.stage_cache, &journal.project),
+        "artifact_stage_vault",
+        &manifest.candidate.vault_tree_sha256,
+        sentinel,
+    )?;
+    Ok(())
+}
+
+fn push_metadata_acknowledgement_sentinel(
+    project_root: &Path,
+    journal: &PublicationJournal,
+    manifest: &MetadataAcknowledgementRecoveryManifest,
+    sentinel: &mut CompactTransactionSentinel,
+) -> Result<(), DynError> {
+    sentinel.push(
+        "metadata_acknowledgement_manifest",
+        "metadata_acknowledgement",
+        "logical",
+        None,
+        json!({
+            "publication_generation": manifest.publication_generation,
+            "keys": manifest.keys,
+            "prior_rows_sha256": manifest.prior_rows_sha256,
+            "candidate_rows_sha256": manifest.candidate_rows_sha256,
+        }),
+    )?;
+    push_sqlite_family_sentinel(
+        project_root,
+        &sqlite_path(&journal.live_cache, &journal.project),
+        "artifact_live_source",
+        &manifest.artifact_generation.source,
+        sentinel,
+    )?;
+    push_sqlite_family_sentinel(
+        project_root,
+        &lowered_sqlite_path(&journal.live_cache, &journal.project),
+        "artifact_live_lowered",
+        &manifest.artifact_generation.lowered,
+        sentinel,
+    )?;
+    push_vault_sentinel(
+        project_root,
+        &vault_dir(&journal.live_cache, &journal.project),
+        "artifact_live_vault",
+        &manifest.artifact_generation.vault_tree_sha256,
+        sentinel,
+    )?;
+    Ok(())
+}
+
+fn push_sqlite_family_sentinel(
+    project_root: &Path,
+    base: &Path,
+    kind_prefix: &str,
+    expected: &SqliteFamilyEvidence,
+    sentinel: &mut CompactTransactionSentinel,
+) -> Result<(), DynError> {
+    push_file_probe_sentinel(
+        project_root,
+        base,
+        &format!("{kind_prefix}_main"),
+        &expected.main,
+        sentinel,
+    )?;
+    push_file_probe_sentinel(
+        project_root,
+        &sqlite_sidecar_path(base, "-wal"),
+        &format!("{kind_prefix}_wal"),
+        &expected.wal,
+        sentinel,
+    )?;
+    push_file_probe_sentinel(
+        project_root,
+        &sqlite_sidecar_path(base, "-shm"),
+        &format!("{kind_prefix}_shm"),
+        &expected.shm,
+        sentinel,
+    )?;
+    Ok(())
+}
+
+fn push_file_probe_sentinel(
+    project_root: &Path,
+    path: &Path,
+    kind: &str,
+    expected: &Option<FileEvidence>,
+    sentinel: &mut CompactTransactionSentinel,
+) -> Result<(), DynError> {
+    let (entry_class, bytes, observed) = match fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            let file_type = metadata.file_type();
+            if file_type.is_symlink() {
+                return Err(format!(
+                    "ASTRO_SHADOW_PUBLICATION_SENTINEL_SYMLINK: refused linked artifact probe {}; remediation: preserve the transaction and inspect the named path before retrying recovery",
+                    path.display()
+                )
+                .into());
+            }
+            if !file_type.is_file() {
+                return Err(format!(
+                    "ASTRO_SHADOW_PUBLICATION_SENTINEL_ARTIFACT_NOT_FILE: artifact probe {} is not an ordinary file; remediation: preserve the transaction and inspect the named path before retrying recovery",
+                    path.display()
+                )
+                .into());
+            }
+            ("file", Some(metadata.len()), cheap_file_metadata(&metadata))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            ("logical", None, json!({"state": "absent"}))
+        }
+        Err(error) => {
+            return Err(format!(
+                "ASTRO_SHADOW_PUBLICATION_SENTINEL_ARTIFACT_UNREADABLE: metadata {}: {error}; remediation: preserve the transaction and inspect the named path before retrying recovery",
+                path.display()
+            )
+            .into());
+        }
+    };
+    sentinel.push(
+        &sentinel_display_path(project_root, path),
+        kind,
+        entry_class,
+        bytes,
+        json!({
+            "expected": expected,
+            "observed": observed,
+        }),
+    )
+}
+
+fn push_vault_sentinel(
+    project_root: &Path,
+    path: &Path,
+    kind: &str,
+    expected_tree_sha256: &Option<String>,
+    sentinel: &mut CompactTransactionSentinel,
+) -> Result<(), DynError> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return sentinel.push(
+                &sentinel_display_path(project_root, path),
+                kind,
+                "logical",
+                None,
+                json!({
+                    "expected_tree_sha256": expected_tree_sha256,
+                    "observed": {"state": "absent"},
+                }),
+            );
+        }
+        Err(error) => {
+            return Err(format!(
+                "ASTRO_SHADOW_PUBLICATION_SENTINEL_VAULT_UNREADABLE: metadata {}: {error}; remediation: preserve the transaction and inspect the named vault before retrying recovery",
+                path.display()
+            )
+            .into());
+        }
+    };
+    let file_type = metadata.file_type();
+    if file_type.is_symlink() {
+        return Err(format!(
+            "ASTRO_SHADOW_PUBLICATION_SENTINEL_SYMLINK: refused linked vault probe {}; remediation: preserve the transaction and inspect the named path before retrying recovery",
+            path.display()
+        )
+        .into());
+    }
+    if !file_type.is_dir() {
+        return Err(format!(
+            "ASTRO_SHADOW_PUBLICATION_SENTINEL_VAULT_NOT_DIRECTORY: vault probe {} is not a directory; remediation: preserve the transaction and inspect the named path before retrying recovery",
+            path.display()
+        )
+        .into());
+    }
+    sentinel.push(
+        &sentinel_display_path(project_root, path),
+        kind,
+        "directory",
+        None,
+        json!({
+            "expected_tree_sha256": expected_tree_sha256,
+            "observed": cheap_directory_metadata(&metadata),
+        }),
+    )?;
+    push_direct_children_sentinel(project_root, path, sentinel)?;
+    for relative in ["CURRENT", "MANIFEST", "ROUTER_HANDOFF", "ledger_head/current.json"] {
+        let marker = path.join(relative);
+        push_file_probe_sentinel(
+            project_root,
+            &marker,
+            &format!("{kind}_marker_{}", relative.replace(['/', '\\'], "_")),
+            &None,
+            sentinel,
+        )?;
+    }
+    Ok(())
+}
+
+fn sentinel_relative_path(root: &Path, path: &Path) -> Result<String, DynError> {
+    Ok(path.strip_prefix(root)?.to_string_lossy().replace('\\', "/"))
+}
+
+fn sentinel_display_path(root: &Path, path: &Path) -> String {
+    sentinel_relative_path(root, path).unwrap_or_else(|_| path.to_string_lossy().replace('\\', "/"))
+}
+
+fn cheap_file_metadata(metadata: &fs::Metadata) -> Value {
+    #[cfg(windows)]
+    {
+        return json!({
+            "platform": "windows",
+            "kind": "file",
+            "file_attributes": metadata.file_attributes(),
+            "file_size": metadata.file_size(),
+            "creation_filetime_100ns": metadata.creation_time(),
+            "last_write_filetime_100ns": metadata.last_write_time(),
+            "readonly": metadata.permissions().readonly(),
+        });
+    }
+    #[cfg(not(windows))]
+    {
+        json!({
+            "platform": "portable",
+            "kind": "file",
+            "bytes": metadata.len(),
+            "readonly": metadata.permissions().readonly(),
+        })
+    }
+}
+
+fn cheap_directory_metadata(metadata: &fs::Metadata) -> Value {
+    #[cfg(windows)]
+    {
+        return json!({
+            "platform": "windows",
+            "kind": "directory",
+            "file_attributes": metadata.file_attributes(),
+            "creation_filetime_100ns": metadata.creation_time(),
+            "readonly": metadata.permissions().readonly(),
+        });
+    }
+    #[cfg(not(windows))]
+    {
+        json!({
+            "platform": "portable",
+            "kind": "directory",
+            "readonly": metadata.permissions().readonly(),
+        })
+    }
 }
 
 fn persist_action_metadata_acknowledgement(
