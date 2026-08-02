@@ -105,6 +105,60 @@ function String-Sha256([AllowEmptyString()][string]$Value) {
     finally { $hasher.Dispose() }
 }
 
+function ByteArray-Sha256([AllowEmptyCollection()][byte[]]$Value) {
+    $hasher = [Security.Cryptography.SHA256]::Create()
+    try {
+        return ([BitConverter]::ToString($hasher.ComputeHash($Value)) -replace '-', '').ToLowerInvariant()
+    }
+    finally { $hasher.Dispose() }
+}
+
+function Invoke-GitRawCapture {
+    param(
+        [Parameter(Mandatory)][string]$GitExe,
+        [Parameter(Mandatory)][string]$Workspace,
+        [Parameter(Mandatory)][string[]]$Arguments,
+        [Parameter(Mandatory)][string]$Description
+    )
+    $start = [Diagnostics.ProcessStartInfo]::new()
+    $start.FileName = $GitExe
+    $start.UseShellExecute = $false
+    $start.CreateNoWindow = $true
+    $start.RedirectStandardOutput = $true
+    $start.RedirectStandardError = $true
+    [void]$start.ArgumentList.Add('-C')
+    [void]$start.ArgumentList.Add([IO.Path]::GetFullPath($Workspace).TrimEnd('\', '/'))
+    foreach ($argument in $Arguments) {
+        [void]$start.ArgumentList.Add($argument)
+    }
+    $process = [Diagnostics.Process]::new()
+    $process.StartInfo = $start
+    $stdout = [IO.MemoryStream]::new()
+    try {
+        if (-not $process.Start()) {
+            Fail-Astro 'ASTRO_FSV_GIT_UNREADABLE' "$Description did not start during evidence execution" `
+                'repair native Git before executing evidence'
+        }
+        $stdoutTask = $process.StandardOutput.BaseStream.CopyToAsync($stdout)
+        $stderrTask = $process.StandardError.ReadToEndAsync()
+        if (-not $process.WaitForExit(30000)) {
+            try { $process.Kill() } catch {}
+            Fail-Astro 'ASTRO_FSV_GIT_UNREADABLE' "$Description exceeded the 30000 ms bounded timeout during evidence execution" `
+                'repair native Git or repository state before executing evidence'
+        }
+        [void]$stdoutTask.GetAwaiter().GetResult()
+        return [pscustomobject]@{
+            ExitCode = [int]$process.ExitCode
+            Bytes = [byte[]]$stdout.ToArray()
+            Stderr = $stderrTask.GetAwaiter().GetResult()
+        }
+    }
+    finally {
+        $stdout.Dispose()
+        $process.Dispose()
+    }
+}
+
 function Observe-ExitedProcessCode(
     [AstroFsvCreatedProcess]$Process
 ) {
@@ -229,11 +283,36 @@ function Remove-TerminalFsvLock {
 function Get-RepoState([string]$GitExe, [string]$Workspace) {
     $head = (& $GitExe -C $Workspace rev-parse HEAD).Trim().ToLowerInvariant()
     if ($LASTEXITCODE -ne 0) { Fail-Astro 'ASTRO_FSV_GIT_UNREADABLE' 'git rev-parse HEAD failed' 'repair repository state before evidence execution' }
-    $status = (& $GitExe -C $Workspace status --porcelain) -join "`n"
-    if ($LASTEXITCODE -ne 0) { Fail-Astro 'ASTRO_FSV_GIT_UNREADABLE' 'git status failed' 'repair repository state before evidence execution' }
-    $diff = (& $GitExe -C $Workspace diff --binary HEAD) -join "`n"
-    if ($LASTEXITCODE -ne 0) { Fail-Astro 'ASTRO_FSV_GIT_UNREADABLE' 'git diff HEAD failed' 'repair repository state before evidence execution' }
-    return [ordered]@{ head_sha = $head; status_sha256 = String-Sha256 $status; diff_sha256 = String-Sha256 $diff }
+    $status = Invoke-GitRawCapture `
+        -GitExe $GitExe `
+        -Workspace $Workspace `
+        -Arguments @(
+            '-c',
+            'core.quotepath=false',
+            'status',
+            '--porcelain=v1',
+            '-z',
+            '--untracked-files=normal'
+        ) `
+        -Description 'git status --porcelain=v1 -z --untracked-files=normal'
+    if ($status.ExitCode -ne 0) {
+        Fail-Astro 'ASTRO_FSV_GIT_UNREADABLE' "git status --porcelain=v1 -z failed during evidence execution (exit=$($status.ExitCode), stderr=$($status.Stderr))" `
+            'repair repository state before evidence execution'
+    }
+    $diff = Invoke-GitRawCapture `
+        -GitExe $GitExe `
+        -Workspace $Workspace `
+        -Arguments @('diff', '--binary', 'HEAD') `
+        -Description 'git diff --binary HEAD'
+    if ($diff.ExitCode -ne 0) {
+        Fail-Astro 'ASTRO_FSV_GIT_UNREADABLE' "git diff --binary HEAD failed during evidence execution (exit=$($diff.ExitCode), stderr=$($diff.Stderr))" `
+            'repair repository state before evidence execution'
+    }
+    return [ordered]@{
+        head_sha = $head
+        status_sha256 = ByteArray-Sha256 $status.Bytes
+        diff_sha256 = ByteArray-Sha256 $diff.Bytes
+    }
 }
 
 function Read-AstroFsvProcessIdentity(
@@ -1542,7 +1621,7 @@ try {
         [string]$launcherOwner.HeadSha -cne [string]$beforeRepo.head_sha -or
         [string]$launcherOwner.StatusSha256 -cne [string]$beforeRepo.status_sha256 -or
         [string]$launcherOwner.DiffSha256 -cne [string]$beforeRepo.diff_sha256) {
-        Fail-Astro 'ASTRO_FSV_REPOSITORY_IDENTITY_MISMATCH' 'receipt, live launcher lock, and current repository fingerprints do not identify the same frozen state' 'discard the artifact and rebuild under a fresh immutable launcher lease'
+        Fail-Astro 'ASTRO_FSV_REPOSITORY_IDENTITY_MISMATCH' "receipt, live launcher lock, and current repository fingerprints do not identify the same frozen state (receipt_status_sha256=$($receipt.repository.status_sha256), launcher_status_sha256=$($launcherOwner.StatusSha256), current_status_sha256=$($beforeRepo.status_sha256), receipt_diff_sha256=$($receipt.repository.diff_sha256), launcher_diff_sha256=$($launcherOwner.DiffSha256), current_diff_sha256=$($beforeRepo.diff_sha256))" 'discard the artifact and rebuild under a fresh immutable launcher lease'
     }
     $artifactHashBefore = File-Sha256 $artifact
     $receiptHashBefore = File-Sha256 $receiptFull
