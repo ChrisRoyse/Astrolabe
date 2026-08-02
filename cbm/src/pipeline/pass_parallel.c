@@ -113,6 +113,31 @@ void cbm_pp_bp_nap_cycles_reset(void) {
     atomic_store_explicit(&g_bp_nap_cycles, 0, memory_order_relaxed);
 }
 
+static const char *parallel_dispatch_mode_name(cbm_parallel_dispatch_mode_t mode) {
+    switch (mode) {
+    case CBM_PARALLEL_DISPATCH_MODE_NOOP:
+        return "noop";
+    case CBM_PARALLEL_DISPATCH_MODE_SERIAL:
+        return "serial";
+    case CBM_PARALLEL_DISPATCH_MODE_PARALLEL:
+        return "parallel";
+    }
+    return "unknown";
+}
+
+static void record_worker_pool_dispatch(cbm_pipeline_t *pipeline,
+                                        const cbm_parallel_for_result_t *result) {
+    if (!pipeline || !result) {
+        return;
+    }
+    cbm_pipeline_record_parallel_dispatch(
+        pipeline, result->operation ? result->operation : "parallel",
+        parallel_dispatch_mode_name(result->mode), result->code ? result->code : "",
+        result->item_count, result->requested_workers, result->admitted_workers,
+        result->created_workers, result->failed_worker_index, result->error_domain,
+        result->error_code);
+}
+
 /* Parse a positive MB-valued retention env knob (CBM_RETAIN_*_MB) into bytes.
  * Follows the limits.c strtol convention: unset / unparseable / non-positive
  * → return 0 so the caller keeps its derived default. */
@@ -1228,6 +1253,7 @@ int cbm_parallel_extract_ex(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *file
     cbm_parallel_for_result_t dispatch_result = {0};
     int dispatch_rc =
         cbm_parallel_for(worker_count, extract_worker, &ec, parallel_opts, &dispatch_result);
+    record_worker_pool_dispatch(ctx ? ctx->pipeline : NULL, &dispatch_result);
     CBM_PROF_END_N("parallel_extract", "3_dispatch_workers_parallel", t_dispatch, file_count);
     if (dispatch_rc != 0) {
         if (err_lists) {
@@ -3228,6 +3254,7 @@ int cbm_parallel_resolve(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, 
     cbm_parallel_for_result_t dispatch_result = {0};
     int dispatch_rc =
         cbm_parallel_for(worker_count, resolve_worker, &rc, opts, &dispatch_result);
+    record_worker_pool_dispatch(ctx ? ctx->pipeline : NULL, &dispatch_result);
     CBM_PROF_END_N("parallel_resolve", "1_dispatch_workers_parallel", t_resolve_dispatch,
                    file_count);
     /* Workers joined: the shared Rust registry (if built) is no longer read.

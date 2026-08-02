@@ -70,6 +70,24 @@ typedef struct {
     uint64_t end_peak_private_bytes;
 } cbm_pipeline_phase_metric_t;
 
+/* One retained worker-dispatch admission record. This is separate from phase
+ * timing: it records the execution mode the pipeline actually admitted, how
+ * many workers were requested/admitted/created, and any exact failure code.
+ * Strings are pipeline-owned fixed storage and remain valid until
+ * cbm_pipeline_free(). */
+typedef struct {
+    char operation[64];
+    char mode[16];
+    char code[96];
+    int item_count;
+    int requested_workers;
+    int admitted_workers;
+    int created_workers;
+    int failed_worker_index;
+    int error_domain;
+    unsigned long error_code;
+} cbm_pipeline_parallel_dispatch_t;
+
 /* Distinct terminal result for a repository with no non-auxiliary source
  * files. Callers must surface this as a structured refusal; it is never a
  * successful structural-only index. */
@@ -150,6 +168,13 @@ void cbm_pipeline_get_committed_counts(const cbm_pipeline_t *p, int *nodes, int 
 void cbm_pipeline_get_phase_metrics(const cbm_pipeline_t *p,
                                     const cbm_pipeline_phase_metric_t **out, size_t *count,
                                     bool *complete);
+
+/* Return every retained worker-dispatch admission record plus a completeness
+ * bit. A successful index response must carry these records so a clean CLI run
+ * does not depend on ephemeral info-level worker logs for no-fallback evidence. */
+void cbm_pipeline_get_parallel_dispatches(const cbm_pipeline_t *p,
+                                          const cbm_pipeline_parallel_dispatch_t **out,
+                                          size_t *count, bool *complete);
 
 /* Reference edges skipped because their source syntax resolved to several
  * stable atoms in one semantic domain (#727). The corpus still publishes, so

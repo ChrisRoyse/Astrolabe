@@ -26,7 +26,8 @@ enum {
      * failure path. */
     PL_ERROR_PATH = 131072,
     PL_ERROR_MESSAGE = 512,
-    PL_ERROR_REMEDIATION = 512
+    PL_ERROR_REMEDIATION = 512,
+    PL_PARALLEL_DISPATCH_CAPACITY = 64
 };
 #include "pipeline/pipeline.h"
 #include "pipeline/artifact.h"
@@ -245,6 +246,12 @@ struct cbm_pipeline {
     size_t phase_metric_count;
     bool phase_metrics_complete;
 
+    /* Retained worker-dispatch admission diagnostics. Clean CLI runs suppress
+     * info-level logs, so successful responses carry this source of truth. */
+    cbm_pipeline_parallel_dispatch_t parallel_dispatches[PL_PARALLEL_DISPATCH_CAPACITY];
+    size_t parallel_dispatch_count;
+    bool parallel_dispatches_complete;
+
     /* ADR (project_summaries) captured before a full-reindex DB delete, so it
      * can be restored after the rebuild. NULL when no ADR existed. Issue #516. */
     char *saved_adr;
@@ -447,6 +454,48 @@ void cbm_pipeline_phase_probe_end(cbm_pipeline_t *p, const char *phase,
                  u64_buf(metric->end_peak_private_bytes));
 }
 
+static void copy_parallel_dispatch_field(char *dst, size_t dst_size, const char *src) {
+    if (!dst || dst_size == 0) {
+        return;
+    }
+    (void)snprintf(dst, dst_size, "%s", src ? src : "");
+}
+
+void cbm_pipeline_record_parallel_dispatch(cbm_pipeline_t *p, const char *operation,
+                                           const char *mode, const char *code, int item_count,
+                                           int requested_workers, int admitted_workers,
+                                           int created_workers, int failed_worker_index,
+                                           int error_domain, unsigned long error_code) {
+    if (!p) {
+        return;
+    }
+    if (p->parallel_dispatch_count >= PL_PARALLEL_DISPATCH_CAPACITY) {
+        p->parallel_dispatches_complete = false;
+        cbm_log_error(
+            "pipeline.parallel_dispatch_telemetry_failed", "code",
+            "CBM_PIPELINE_PARALLEL_DISPATCH_CAPACITY_EXCEEDED", "operation",
+            operation ? operation : "parallel", "message",
+            "the finite parallel-dispatch topology exceeded its retained result representation",
+            "remediation",
+            "update the parallel-dispatch representation together with the added dispatch site");
+        return;
+    }
+    cbm_pipeline_parallel_dispatch_t *dispatch =
+        &p->parallel_dispatches[p->parallel_dispatch_count++];
+    copy_parallel_dispatch_field(dispatch->operation, sizeof(dispatch->operation),
+                                 operation ? operation : "parallel");
+    copy_parallel_dispatch_field(dispatch->mode, sizeof(dispatch->mode),
+                                 mode ? mode : "unknown");
+    copy_parallel_dispatch_field(dispatch->code, sizeof(dispatch->code), code ? code : "");
+    dispatch->item_count = item_count;
+    dispatch->requested_workers = requested_workers;
+    dispatch->admitted_workers = admitted_workers;
+    dispatch->created_workers = created_workers;
+    dispatch->failed_worker_index = failed_worker_index;
+    dispatch->error_domain = error_domain;
+    dispatch->error_code = error_code;
+}
+
 /* Log current + peak RSS at a pipeline phase boundary (memory profiling). */
 static void log_phase_mem(const char *phase) {
     enum { PL_BYTES_PER_MB = 1024 * 1024 };
@@ -499,6 +548,8 @@ cbm_pipeline_t *cbm_pipeline_new(const char *repo_path, const char *db_path,
     p->ambiguous_reference_skips = 0;
     p->unresolved_reference_source_skips = 0;
     p->parse_recovery_diagnostics = 0;
+    p->phase_metrics_complete = true;
+    p->parallel_dispatches_complete = true;
     atomic_init(&p->cancelled, 0);
 
     return p;
@@ -741,6 +792,20 @@ void cbm_pipeline_get_phase_metrics(const cbm_pipeline_t *p,
     }
     if (complete) {
         *complete = p && p->phase_metrics_complete;
+    }
+}
+
+void cbm_pipeline_get_parallel_dispatches(const cbm_pipeline_t *p,
+                                          const cbm_pipeline_parallel_dispatch_t **out,
+                                          size_t *count, bool *complete) {
+    if (out) {
+        *out = p ? p->parallel_dispatches : NULL;
+    }
+    if (count) {
+        *count = p ? p->parallel_dispatch_count : 0;
+    }
+    if (complete) {
+        *complete = p && p->parallel_dispatches_complete;
     }
 }
 
@@ -3098,9 +3163,15 @@ static int run_extraction_phase(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
         return reject_invalid_worker_count("extraction", worker_count);
     }
     CBM_PROF_START(t_extract_total);
-    int rc = (worker_count > SKIP_ONE && file_count > MIN_FILES_FOR_PARALLEL)
-                 ? run_parallel_pipeline(p, ctx, files, file_count, worker_count, &t)
-                 : run_sequential_pipeline(p, ctx, files, file_count, &t);
+    int rc = 0;
+    if (worker_count > SKIP_ONE && file_count > MIN_FILES_FOR_PARALLEL) {
+        rc = run_parallel_pipeline(p, ctx, files, file_count, worker_count, &t);
+    } else {
+        cbm_pipeline_record_parallel_dispatch(p, "extraction", "serial",
+                                              "CBM_PARALLEL_DISPATCH_OK", file_count,
+                                              worker_count, SKIP_ONE, 0, -1, 0, 0);
+        rc = run_sequential_pipeline(p, ctx, files, file_count, &t);
+    }
     CBM_PROF_END_N("pipeline", "2_extraction_total", t_extract_total, file_count);
     cbm_pxc_destroy_rust_manifest(ctx);
     if (check_cancel(p)) {
@@ -3120,6 +3191,8 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
     cbm_clock_gettime(CLOCK_MONOTONIC, &t0);
     p->phase_metric_count = 0;
     p->phase_metrics_complete = true;
+    p->parallel_dispatch_count = 0;
+    p->parallel_dispatches_complete = true;
     cbm_pipeline_phase_probe_t total_probe = cbm_pipeline_phase_probe_start(p, "total");
     cbm_path_alias_collection_t *path_aliases = NULL;
     cbm_source_snapshot_t source_snapshot = {0};

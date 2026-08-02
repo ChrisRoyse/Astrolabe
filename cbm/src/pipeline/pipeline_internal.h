@@ -88,6 +88,11 @@ void cbm_pipeline_record_fatal_error(cbm_pipeline_t *p, const char *code, const 
                                      const char *phase, const char *path, size_t requested,
                                      const char *message, const char *remediation);
 void cbm_pipeline_add_parse_recovery_diagnostics(cbm_pipeline_t *p, uint_least64_t count);
+void cbm_pipeline_record_parallel_dispatch(cbm_pipeline_t *p, const char *operation,
+                                           const char *mode, const char *code, int item_count,
+                                           int requested_workers, int admitted_workers,
+                                           int created_workers, int failed_worker_index,
+                                           int error_domain, unsigned long error_code);
 
 /* Allocation-free native worker phase probe shared by the full and incremental
  * pipelines. Completion appends one retained metric to the owning pipeline and
