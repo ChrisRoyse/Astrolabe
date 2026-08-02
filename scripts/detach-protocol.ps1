@@ -43,6 +43,143 @@ function Get-AstroDetachedUtf8Bytes {
     return [Text.UTF8Encoding]::new($false, $true).GetBytes($Text)
 }
 
+function Get-AstroDetachedCanonicalWindowsPowerShellModulePath {
+    $entries = [Collections.Generic.List[string]]::new()
+    $documents = [Environment]::GetFolderPath(
+        [Environment+SpecialFolder]::MyDocuments
+    )
+    if (-not [string]::IsNullOrWhiteSpace($documents)) {
+        $entries.Add((Join-Path $documents 'WindowsPowerShell\Modules'))
+    }
+    $programFiles = [Environment]::GetFolderPath(
+        [Environment+SpecialFolder]::ProgramFiles
+    )
+    if (-not [string]::IsNullOrWhiteSpace($programFiles)) {
+        $entries.Add((Join-Path $programFiles 'WindowsPowerShell\Modules'))
+    }
+    $entries.Add((Join-Path $env:WINDIR 'system32\WindowsPowerShell\v1.0\Modules'))
+
+    $seen = [Collections.Generic.HashSet[string]]::new(
+        [StringComparer]::OrdinalIgnoreCase
+    )
+    return @(
+        $entries |
+            ForEach-Object { [IO.Path]::GetFullPath($_).TrimEnd('\', '/') } |
+            Where-Object { $seen.Add($_) }
+    )
+}
+
+function Test-AstroDetachedPathListEquivalent {
+    param(
+        [Parameter(Mandatory)][string[]]$Actual,
+        [Parameter(Mandatory)][string[]]$Expected
+    )
+
+    if ($Actual.Count -ne $Expected.Count) {
+        return $false
+    }
+
+    for ($index = 0; $index -lt $Expected.Count; $index++) {
+        if (-not [StringComparer]::OrdinalIgnoreCase.Equals(
+                $Actual[$index],
+                $Expected[$index]
+            )) {
+            return $false
+        }
+    }
+
+    return $true
+}
+
+function Initialize-AstroDetachedPowerShellModulePath {
+    param([Parameter(Mandatory)][string]$Role)
+
+    $before = [string]$env:PSModulePath
+    $beforeEntries = @(
+        $before -split ';' |
+            ForEach-Object { $_.Trim() } |
+            Where-Object { $_ }
+    )
+    $requiredModules = @(
+        'Microsoft.PowerShell.Security',
+        'Microsoft.PowerShell.Utility'
+    )
+    $edition = [string]$PSVersionTable.PSEdition
+    $version = [string]$PSVersionTable.PSVersion
+    $policy = [ordered]@{
+        schema = 'astrolabe.detached.psmodulepath-policy.v1'
+        role = $Role
+        powershell_edition = $edition
+        powershell_version = $version
+        before = $before
+        before_entries = [string[]]$beforeEntries
+        action = 'preserved'
+        canonical_entries = @()
+        after = $before
+        offending_entries = @()
+        imported_modules = @()
+        import_error = $null
+    }
+
+    if ($edition -ceq 'Desktop') {
+        $canonicalEntries = Get-AstroDetachedCanonicalWindowsPowerShellModulePath
+        $canonical = $canonicalEntries -join ';'
+        $canonicalSet = [Collections.Generic.HashSet[string]]::new(
+            [StringComparer]::OrdinalIgnoreCase
+        )
+        foreach ($entry in $canonicalEntries) {
+            [void]$canonicalSet.Add($entry.TrimEnd('\', '/'))
+        }
+        $normalizedBefore = @(
+            $beforeEntries |
+                ForEach-Object {
+                    try { [IO.Path]::GetFullPath($_).TrimEnd('\', '/') }
+                    catch { $_.TrimEnd('\', '/') }
+                }
+        )
+        $policy.canonical_entries = [string[]]$canonicalEntries
+        $policy.offending_entries = [string[]]@(
+            $normalizedBefore |
+                Where-Object { -not $canonicalSet.Contains($_) }
+        )
+        $isCanonicalEquivalent = Test-AstroDetachedPathListEquivalent `
+            -Actual ([string[]]$normalizedBefore) `
+            -Expected ([string[]]$canonicalEntries)
+        if (-not $isCanonicalEquivalent) {
+            $env:PSModulePath = $canonical
+            $policy.action = 'normalized-windows-powershell-5.1'
+        }
+        else {
+            $policy.action = 'already-canonical-windows-powershell-5.1'
+        }
+        $policy.after = [string]$env:PSModulePath
+    }
+    else {
+        $policy.action = 'preserved-non-desktop-powershell'
+    }
+
+    try {
+        foreach ($moduleName in $requiredModules) {
+            Import-Module $moduleName -ErrorAction Stop
+            $module = Get-Module -Name $moduleName -ErrorAction Stop |
+                Select-Object -First 1
+            $policy.imported_modules += [ordered]@{
+                name = $moduleName
+                path = [string]$module.Path
+                version = [string]$module.Version
+            }
+        }
+    }
+    catch {
+        $policy.import_error = "$($_.FullyQualifiedErrorId): $($_.Exception.Message)"
+        throw "DETACH_PROTOCOL[ASTRO_DETACH_PSMODULEPATH_INVALID]: {code=ASTRO_DETACH_PSMODULEPATH_INVALID; message=`"PowerShell module path cannot load required module for $Role after policy $($policy.action): $($policy.import_error)`"; remediation=`"preserve the process state, inspect the recorded PSModulePath, and restore the canonical Windows PowerShell 5.1 module roots`"}"
+    }
+
+    $summary = ($policy | ConvertTo-Json -Compress -Depth 12)
+    Write-Host "DETACH_PROTOCOL[ASTRO_DETACH_PSMODULEPATH_POLICY]: $summary"
+    return $policy
+}
+
 function ConvertTo-AstroDetachedUtcIso {
     param([Parameter(Mandatory)][long]$UtcTicks)
 

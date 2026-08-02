@@ -31,6 +31,8 @@ $compilerStatePath = Join-Path $PSScriptRoot 'detach-compiler-state.ps1'
 $lockHelperPath = Join-Path $PSScriptRoot 'launcher-lock.ps1'
 $spawnPath = Join-Path $PSScriptRoot 'detach-spawn.ps1'
 . $protocolPath
+$modulePathPolicy = Initialize-AstroDetachedPowerShellModulePath `
+    -Role 'runner'
 . $compilerStatePath
 
 $run = Assert-AstroDetachedRunDirectory $RunDirectory
@@ -161,6 +163,7 @@ try {
             task_xml_sha256 = $taskXmlSha256
             task_session_id = $runnerIdentity.session_id
             task_logon_type = [string]$intentPayload.task_logon_type
+            psmodulepath_policy = $modulePathPolicy
             compiler = [ordered]@{
                 intent_path = $compilerEvidence.Intent.Path
                 intent_sha256 = $compilerEvidence.Intent.Sha256

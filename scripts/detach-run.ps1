@@ -54,6 +54,8 @@ $spawnPath = Join-Path $PSScriptRoot 'detach-spawn.ps1'
 $runnerPath = Join-Path $PSScriptRoot 'detach-runner.ps1'
 $launcherPath = Join-Path $PSScriptRoot 'windows-gnu-toolchain.ps1'
 . $protocolPath
+$modulePathPolicy = Initialize-AstroDetachedPowerShellModulePath `
+    -Role 'coordinator'
 . $compilerStatePath
 
 function ConvertFrom-AstroDetachedCommandPlan {
@@ -305,6 +307,7 @@ $intentRecord = Write-AstroDetachedRecord `
         principal_user_id = $principal
         principal_sid = $principalSid
         powershell_path = $powershellPath
+        psmodulepath_policy = $modulePathPolicy
         protocol_path = $bindings.protocol.path
         protocol_sha256 = $bindings.protocol.sha256
         strict_json_path = $bindings.strict_json.path
