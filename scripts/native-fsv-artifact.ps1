@@ -170,7 +170,7 @@ function Invoke-GitRawCapture {
             Fail-Astro 'ASTRO_FSV_GIT_UNREADABLE' "$Description exceeded the 30000 ms bounded timeout during artifact promotion" `
                 'repair native Git or repository state before staging evidence'
         }
-        $stdoutTask.GetAwaiter().GetResult()
+        [void]$stdoutTask.GetAwaiter().GetResult()
         return [pscustomobject]@{
             ExitCode = [int]$process.ExitCode
             Bytes = [byte[]]$stdout.ToArray()
