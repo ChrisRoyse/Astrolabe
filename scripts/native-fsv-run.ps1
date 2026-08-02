@@ -113,6 +113,40 @@ function ByteArray-Sha256([AllowEmptyCollection()][byte[]]$Value) {
     finally { $hasher.Dispose() }
 }
 
+function ConvertTo-AstroNativeCommandLineArgument {
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$Value)
+
+    # Windows PowerShell 5.1 lacks ProcessStartInfo.ArgumentList. Encode each
+    # native argument with CommandLineToArgvW's inverse rules so Git sees the
+    # exact values without shell tokenization or lossy fallback behavior.
+    if ($Value.Length -eq 0) { return '""' }
+    if ($Value -notmatch '[\s"]') { return $Value }
+
+    $builder = [Text.StringBuilder]::new()
+    [void]$builder.Append('"')
+    $slashes = 0
+    foreach ($character in $Value.ToCharArray()) {
+        if ($character -eq '\') {
+            $slashes++
+            continue
+        }
+        if ($character -eq '"') {
+            [void]$builder.Append('\', ($slashes * 2) + 1)
+            [void]$builder.Append('"')
+            $slashes = 0
+            continue
+        }
+        if ($slashes -gt 0) {
+            [void]$builder.Append('\', $slashes)
+            $slashes = 0
+        }
+        [void]$builder.Append($character)
+    }
+    if ($slashes -gt 0) { [void]$builder.Append('\', $slashes * 2) }
+    [void]$builder.Append('"')
+    return $builder.ToString()
+}
+
 function Invoke-GitRawCapture {
     param(
         [Parameter(Mandatory)][string]$GitExe,
@@ -126,11 +160,13 @@ function Invoke-GitRawCapture {
     $start.CreateNoWindow = $true
     $start.RedirectStandardOutput = $true
     $start.RedirectStandardError = $true
-    [void]$start.ArgumentList.Add('-C')
-    [void]$start.ArgumentList.Add([IO.Path]::GetFullPath($Workspace).TrimEnd('\', '/'))
-    foreach ($argument in $Arguments) {
-        [void]$start.ArgumentList.Add($argument)
-    }
+    $nativeArguments = @('-C', [IO.Path]::GetFullPath($Workspace).TrimEnd('\', '/')) + @($Arguments)
+    $start.Arguments = [string]::Join(
+        ' ',
+        @($nativeArguments | ForEach-Object {
+            ConvertTo-AstroNativeCommandLineArgument -Value ([string]$_)
+        })
+    )
     $process = [Diagnostics.Process]::new()
     $process.StartInfo = $start
     $stdout = [IO.MemoryStream]::new()
