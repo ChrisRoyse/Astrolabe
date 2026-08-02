@@ -2314,6 +2314,29 @@ impl Default for cbm_pipeline_phase_metric_t {
         }
     }
 }
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct cbm_pipeline_parallel_dispatch_t {
+    pub operation: [::std::os::raw::c_char; 64usize],
+    pub mode: [::std::os::raw::c_char; 16usize],
+    pub code: [::std::os::raw::c_char; 96usize],
+    pub item_count: ::std::os::raw::c_int,
+    pub requested_workers: ::std::os::raw::c_int,
+    pub admitted_workers: ::std::os::raw::c_int,
+    pub created_workers: ::std::os::raw::c_int,
+    pub failed_worker_index: ::std::os::raw::c_int,
+    pub error_domain: ::std::os::raw::c_int,
+    pub error_code: ::std::os::raw::c_ulong,
+}
+impl Default for cbm_pipeline_parallel_dispatch_t {
+    fn default() -> Self {
+        let mut s = ::std::mem::MaybeUninit::<Self>::uninit();
+        unsafe {
+            ::std::ptr::write_bytes(s.as_mut_ptr(), 0, 1);
+            s.assume_init()
+        }
+    }
+}
 pub const CBM_PIPELINE_EMPTY_SOURCE_CORPUS: _bindgen_ty_2 = -2001;
 pub type _bindgen_ty_2 = ::std::os::raw::c_int;
 unsafe extern "C" {
@@ -2378,6 +2401,14 @@ unsafe extern "C" {
     pub fn cbm_pipeline_get_phase_metrics(
         p: *const cbm_pipeline_t,
         out: *mut *const cbm_pipeline_phase_metric_t,
+        count: *mut usize,
+        complete: *mut bool,
+    );
+}
+unsafe extern "C" {
+    pub fn cbm_pipeline_get_parallel_dispatches(
+        p: *const cbm_pipeline_t,
+        out: *mut *const cbm_pipeline_parallel_dispatch_t,
         count: *mut usize,
         complete: *mut bool,
     );
