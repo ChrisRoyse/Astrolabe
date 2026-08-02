@@ -563,6 +563,23 @@ fn registration_recovery_fault_record(
         registration_recovery_sentinel_field(&sentinel, "transaction_metadata", "file_count");
     let transaction_metadata_directory_count =
         registration_recovery_sentinel_field(&sentinel, "transaction_metadata", "directory_count");
+    let transaction_metadata_transaction_count = registration_recovery_sentinel_field(
+        &sentinel,
+        "transaction_metadata",
+        "transaction_count",
+    );
+    let transaction_metadata_journal_count =
+        registration_recovery_sentinel_field(&sentinel, "transaction_metadata", "journal_count");
+    let transaction_metadata_artifact_probe_count = registration_recovery_sentinel_field(
+        &sentinel,
+        "transaction_metadata",
+        "artifact_probe_count",
+    );
+    let transaction_metadata_direct_entry_count = registration_recovery_sentinel_field(
+        &sentinel,
+        "transaction_metadata",
+        "direct_entry_count",
+    );
     Ok(json!({
         "schema": "astrolabe-watcher-registration-recovery-fault-v1",
         "status": "terminal_fault",
@@ -579,10 +596,14 @@ fn registration_recovery_fault_record(
         "transaction_metadata_entry_count": transaction_metadata_entry_count,
         "transaction_metadata_file_count": transaction_metadata_file_count,
         "transaction_metadata_directory_count": transaction_metadata_directory_count,
+        "transaction_metadata_transaction_count": transaction_metadata_transaction_count,
+        "transaction_metadata_journal_count": transaction_metadata_journal_count,
+        "transaction_metadata_artifact_probe_count": transaction_metadata_artifact_probe_count,
+        "transaction_metadata_direct_entry_count": transaction_metadata_direct_entry_count,
         "message": message,
         "worker_started": false,
         "retry_suppressed_until_observation_changes": true,
-        "sentinel_kind": "metadata_tree_plus_config_generation",
+        "sentinel_kind": "compact_journal_artifact_metadata_plus_config_generation",
         "full_observation_recompute_reason": recompute_reason,
         "remediation": "preserve the exact shadow-publication transaction, repair the named durable bytes or project publication config, then let the resident watcher re-admit reconciliation",
     }))
