@@ -128,6 +128,56 @@ function String-Sha256 {
     finally { $hasher.Dispose() }
 }
 
+function ByteArray-Sha256 {
+    param([Parameter(Mandatory)][AllowEmptyCollection()][byte[]]$Value)
+    $hasher = [Security.Cryptography.SHA256]::Create()
+    try {
+        return ([BitConverter]::ToString($hasher.ComputeHash($Value)) -replace '-', '').ToLowerInvariant()
+    }
+    finally { $hasher.Dispose() }
+}
+
+function Invoke-GitRawCapture {
+    param(
+        [Parameter(Mandatory)][string]$GitExe,
+        [Parameter(Mandatory)][string]$Workspace,
+        [Parameter(Mandatory)][string]$Arguments
+    )
+    $workspaceArgument = [IO.Path]::GetFullPath($Workspace).TrimEnd('\', '/')
+    if ($workspaceArgument.Contains('"')) {
+        Fail-Astro 'ASTRO_FSV_GIT_UNREADABLE' "workspace path contains a quote and cannot be passed to native Git: $workspaceArgument" `
+            'repair repository path identity before staging evidence'
+    }
+    $start = [Diagnostics.ProcessStartInfo]::new()
+    $start.FileName = $GitExe
+    $start.Arguments = "-C `"$workspaceArgument`" $Arguments"
+    $start.UseShellExecute = $false
+    $start.CreateNoWindow = $true
+    $start.RedirectStandardOutput = $true
+    $start.RedirectStandardError = $true
+    $process = [Diagnostics.Process]::new()
+    $process.StartInfo = $start
+    $stdout = [IO.MemoryStream]::new()
+    try {
+        if (-not $process.Start()) {
+            Fail-Astro 'ASTRO_FSV_GIT_UNREADABLE' 'native Git process did not start during artifact promotion' `
+                'repair native Git before staging evidence'
+        }
+        $stderrTask = $process.StandardError.ReadToEndAsync()
+        $process.StandardOutput.BaseStream.CopyTo($stdout)
+        $process.WaitForExit()
+        return [pscustomobject]@{
+            ExitCode = [int]$process.ExitCode
+            Bytes = [byte[]]$stdout.ToArray()
+            Stderr = $stderrTask.GetAwaiter().GetResult()
+        }
+    }
+    finally {
+        $stdout.Dispose()
+        $process.Dispose()
+    }
+}
+
 function Test-DescendantOf {
     param(
         [Parameter(Mandatory)][int]$CandidatePid,
@@ -155,20 +205,26 @@ function Get-RepoState {
         Fail-Astro 'ASTRO_FSV_GIT_UNREADABLE' 'git rev-parse HEAD failed during artifact promotion' `
             'repair repository state before staging evidence'
     }
-    $status = (& $GitExe -C $Workspace status --porcelain) -join "`n"
-    if ($LASTEXITCODE -ne 0) {
-        Fail-Astro 'ASTRO_FSV_GIT_UNREADABLE' 'git status --porcelain failed during artifact promotion' `
+    $status = Invoke-GitRawCapture `
+        -GitExe $GitExe `
+        -Workspace $Workspace `
+        -Arguments '-c core.quotepath=false status --porcelain=v1 -z --untracked-files=normal'
+    if ($status.ExitCode -ne 0) {
+        Fail-Astro 'ASTRO_FSV_GIT_UNREADABLE' "git status --porcelain=v1 -z failed during artifact promotion (exit=$($status.ExitCode), stderr=$($status.Stderr))" `
             'repair repository state before staging evidence'
     }
-    $diff = (& $GitExe -C $Workspace diff --binary HEAD) -join "`n"
-    if ($LASTEXITCODE -ne 0) {
-        Fail-Astro 'ASTRO_FSV_GIT_UNREADABLE' 'git diff --binary HEAD failed during artifact promotion' `
+    $diff = Invoke-GitRawCapture `
+        -GitExe $GitExe `
+        -Workspace $Workspace `
+        -Arguments 'diff --binary HEAD'
+    if ($diff.ExitCode -ne 0) {
+        Fail-Astro 'ASTRO_FSV_GIT_UNREADABLE' "git diff --binary HEAD failed during artifact promotion (exit=$($diff.ExitCode), stderr=$($diff.Stderr))" `
             'repair repository state before staging evidence'
     }
     return [ordered]@{
         head_sha = $head
-        status_sha256 = String-Sha256 $status
-        diff_sha256 = String-Sha256 $diff
+        status_sha256 = ByteArray-Sha256 $status.Bytes
+        diff_sha256 = ByteArray-Sha256 $diff.Bytes
     }
 }
 
@@ -1095,7 +1151,7 @@ try {
             if ([string]$launcherOwner.StatusSha256 -cne [string]$repoState.status_sha256 -or
                 [string]$launcherOwner.DiffSha256 -cne [string]$repoState.diff_sha256) {
                 Fail-Astro 'ASTRO_FSV_LAUNCHER_TREE_DRIFT' `
-                    'repository status/diff fingerprints differ from the launcher acquisition state' `
+                    "repository status/diff fingerprints differ from the launcher acquisition state (expected_status_sha256=$($launcherOwner.StatusSha256), actual_status_sha256=$($repoState.status_sha256), expected_diff_sha256=$($launcherOwner.DiffSha256), actual_diff_sha256=$($repoState.diff_sha256))" `
                     'discard this build, restore the frozen checkout, and rebuild from a fresh launcher lease'
             }
 
