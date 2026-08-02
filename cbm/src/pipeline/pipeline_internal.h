@@ -543,6 +543,8 @@ typedef struct {
     size_t retain_per_file_max_bytes;
 } cbm_parallel_extract_opts_t;
 
+/* worker_count must be positive for non-empty file sets. Invalid direct-call
+ * counts fail closed before worker-sized allocation or dispatch. */
 int cbm_parallel_extract_ex(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, int file_count,
                             CBMFileResult **result_cache, _Atomic int64_t *shared_ids,
                             int worker_count, const cbm_parallel_extract_opts_t *opts);
@@ -570,6 +572,8 @@ int cbm_build_registry_from_cache(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
  * pulling the pass header into every consumer of pipeline_internal.h. */
 struct CBMModuleDefIndex;
 
+/* worker_count must be positive for non-empty file sets. Invalid direct-call
+ * counts fail closed before worker-sized allocation or dispatch. */
 /* cbm_parallel_resolve's cross_registries param is typed `void*` to avoid
  * pulling lsp/go_lsp.h into every TU that includes pipeline_internal.h.
  * Callers cast a CBMCrossLspRegistries* (defined in pass_lsp_cross.h). */

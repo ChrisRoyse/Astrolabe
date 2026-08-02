@@ -1105,6 +1105,16 @@ void cbm_parallel_rebase_shared_ids(const cbm_gbuf_t *main_gbuf, _Atomic int64_t
     }
 }
 
+static int reject_invalid_parallel_worker_count(const char *operation, int worker_count) {
+    cbm_log_error("parallel.worker_count_invalid", "code", "CBM_WORKER_COUNT_INVALID",
+                  "operation", operation ? operation : "parallel", "worker_count",
+                  itoa_log(worker_count), "message", "worker-count argument is invalid",
+                  "remediation",
+                  "pass a positive worker count; when derived from CBM_WORKERS, set it to an "
+                  "integer from 1 through 256 or remove it");
+    return CBM_NOT_FOUND;
+}
+
 int cbm_parallel_extract_ex(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, int file_count,
                             CBMFileResult **result_cache, _Atomic int64_t *shared_ids,
                             int worker_count, const cbm_parallel_extract_opts_t *opts) {
@@ -1112,6 +1122,9 @@ int cbm_parallel_extract_ex(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *file
 
     if (file_count == 0) {
         return 0;
+    }
+    if (worker_count <= 0) {
+        return reject_invalid_parallel_worker_count("parallel_extract", worker_count);
     }
 
     cbm_log_info("parallel.extract.start", "files", itoa_log(file_count), "workers",
@@ -3163,6 +3176,9 @@ int cbm_parallel_resolve(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, 
     CBMCrossLspRegistries *cross_registries = (CBMCrossLspRegistries *)cross_registries_v;
     if (file_count == 0) {
         return 0;
+    }
+    if (worker_count <= 0) {
+        return reject_invalid_parallel_worker_count("parallel_resolve", worker_count);
     }
 
     cbm_log_info("parallel.resolve.start", "files", itoa_log(file_count), "workers",
