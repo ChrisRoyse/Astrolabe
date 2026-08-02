@@ -70,12 +70,9 @@ const PROJECT_SUMMARY_ROW_PREFIX: &[u8] = b"astrolabe:project-summary:v1:";
 const TOKEN_VECTOR_ROW_PREFIX: &[u8] = b"astrolabe:token-vector:v1:";
 const CBM_EDGE_ROW_PREFIX: &[u8] = b"astrolabe:cbm-edge:v1:";
 pub(crate) const EDGE_ROW_PREFIX: &[u8] = b"astrolabe:edge:v1:";
-/// Persisted per-file content-digest manifest prefix (#345). One row per source file,
-/// keyed by (project, file_path), recording the file's content digest and the identity
-/// (node_id → cx_id/series_id) of every symbol it produced. A later import compares the
-/// incoming per-file digest against this row to short-circuit unchanged files before the
-/// O(corpus) per-symbol conversion, so a one-symbol delta reconciles only its file.
-const FILE_DIGEST_ROW_PREFIX: &[u8] = b"astrolabe:file-digest:v1:";
+/// Per-file digest manifest head and bounded identity chunks (#855).
+const FILE_DIGEST_MANIFEST_V2_PREFIX: &[u8] = b"astrolabe:file-digest:v2:head:";
+const FILE_DIGEST_CHUNK_V2_PREFIX: &[u8] = b"astrolabe:file-digest:v2:chunk:";
 const SCHEMA_NODE_MAP: &str = "astrolabe-node-map-v4";
 const LEGACY_SCHEMA_NODE_MAP_V3: &str = "astrolabe-node-map-v3";
 const SCHEMA_SYMBOL_METADATA: &str = "astrolabe-sqlite-symbol-v3";
@@ -89,6 +86,12 @@ const SCHEMA_TOKEN_VECTOR_ROW: &str = "astrolabe-token-vector-v1";
 const SCHEMA_CBM_EDGE_ROW: &str = "astrolabe-cbm-edge-v1";
 pub(crate) const SCHEMA_EDGE_ROW: &str = "astrolabe-edge-v1";
 const SCHEMA_FILE_DIGEST_ROW: &str = "astrolabe-file-digest-v1";
+const SCHEMA_FILE_DIGEST_MANIFEST_V2: &str = "astrolabe-file-digest-manifest-v2";
+const SCHEMA_FILE_DIGEST_CHUNK_V2: &str = "astrolabe-file-digest-chunk-v2";
+/// 10,000 fixed-size identity triples serialize well below the 4 MiB verified
+/// chunk ceiling. The exact serialized-byte assertion below is authoritative.
+const FILE_DIGEST_CHUNK_SYMBOL_CAP: usize = 10_000;
+const FILE_DIGEST_CHUNK_MAX_BYTES: usize = 4 * 1024 * 1024;
 /// Domain separator for the per-file content digest (#345). Bumped only when the set of
 /// raw fields folded into the digest changes, so an old-domain digest can never be
 /// compared against a new-domain one (a mismatch then fails open into full reconcile).
@@ -858,6 +861,32 @@ struct FileDigestRow {
     symbols: Vec<FileDigestSymbol>,
 }
 
+/// v2 head for one source file's digest/identity manifest. The identities live
+/// in ordered chunk rows so one pathological generated source file can never
+/// manufacture an over-memtable Graph value.
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+struct FileDigestManifestV2 {
+    schema: String,
+    project: String,
+    file_path: String,
+    panel_version: u32,
+    domain: String,
+    digest: String,
+    symbol_count: usize,
+    chunk_count: usize,
+    symbols_sha256: String,
+}
+
+/// One ordered bounded piece of a v2 file digest identity manifest.
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+struct FileDigestChunkV2 {
+    schema: String,
+    project: String,
+    file_path: String,
+    chunk_index: usize,
+    symbols: Vec<FileDigestSymbol>,
+}
+
 /// Skip-accounting for the per-file digest short-circuit (#345), surfaced in the import
 /// report so an unchanged-corpus reimport can prove it converted no unchanged file
 /// (standing invariant 3: every skip is counted, never silent).
@@ -1422,7 +1451,7 @@ where
     // CxIds and `verify_preexisting_constellations` skips re-reading their Base rows —
     // turning the delta from O(corpus) into O(changed files). Any absent/mismatched digest
     // fails open into the full per-symbol reconcile.
-    let prior_manifest = read_file_digest_manifest(&existing_graph, &options.project);
+    let prior_manifest = read_file_digest_manifest(&existing_graph, &options.project)?;
     let digest_plan = plan_digest_reuse(&new_file_digests, &prior_manifest, options.panel_version);
     let file_digest_report = digest_plan.report.clone();
     timing_ms.push((
@@ -4027,25 +4056,136 @@ fn compute_file_digests(
         .collect()
 }
 
-/// Reads the persisted per-file digest manifest for `project` out of the one shared
-/// pre-commit Graph CF scan (#345). A row that fails to decode, or belongs to another
-/// project, is skipped (fail-open: the file it describes is then treated as new).
+/// Reads the persisted bounded v2 per-file digest manifest for `project` out of the one
+/// shared pre-commit Graph CF scan (#345, #855). Other projects' namespaced rows are
+/// ignored. A v2 row belonging to this project is an integrity contract: malformed,
+/// incomplete, duplicate, or over-cap state refuses admission rather than silently
+/// reconciling from an unverifiable identity map.
 fn read_file_digest_manifest(
     existing_graph: &BTreeMap<Vec<u8>, Vec<u8>>,
     project: &str,
-) -> BTreeMap<String, FileDigestRow> {
-    let mut manifest = BTreeMap::new();
+) -> IngestResult<BTreeMap<String, FileDigestRow>> {
+    let project_digest = sha256_digest(project.as_bytes());
+    let mut heads = BTreeMap::<String, FileDigestManifestV2>::new();
+    let mut chunks = BTreeMap::<String, BTreeMap<usize, FileDigestChunkV2>>::new();
     for (key, value) in existing_graph {
-        if !key.starts_with(FILE_DIGEST_ROW_PREFIX) {
-            continue;
-        }
-        if let Ok(row) = serde_json::from_slice::<FileDigestRow>(value)
-            && row.project == project
+        if manifest_v2_key_belongs_to_project(key, FILE_DIGEST_MANIFEST_V2_PREFIX, &project_digest)
         {
-            manifest.insert(row.file_path.clone(), row);
+            let head = serde_json::from_slice::<FileDigestManifestV2>(value).map_err(|error| {
+                invalid_sqlite(format!(
+                    "decode v2 file-digest manifest head for project {project:?}: {error}"
+                ))
+            })?;
+            if head.schema != SCHEMA_FILE_DIGEST_MANIFEST_V2 || head.project != project {
+                return Err(invalid_sqlite(format!(
+                    "v2 file-digest manifest head has unexpected schema/project for {project:?}: schema={:?}, project={:?}",
+                    head.schema, head.project
+                )));
+            }
+            if heads.insert(head.file_path.clone(), head).is_some() {
+                return Err(invalid_sqlite(format!(
+                    "duplicate v2 file-digest manifest heads for project {project:?}"
+                )));
+            }
+        } else if manifest_v2_key_belongs_to_project(
+            key,
+            FILE_DIGEST_CHUNK_V2_PREFIX,
+            &project_digest,
+        ) {
+            if value.len() > FILE_DIGEST_CHUNK_MAX_BYTES {
+                return Err(invalid_sqlite(format!(
+                    "persisted v2 file-digest chunk for project {project:?} is {} bytes, above the {} byte Graph-row cap",
+                    value.len(),
+                    FILE_DIGEST_CHUNK_MAX_BYTES
+                )));
+            }
+            let chunk = serde_json::from_slice::<FileDigestChunkV2>(value).map_err(|error| {
+                invalid_sqlite(format!(
+                    "decode v2 file-digest manifest chunk for project {project:?}: {error}"
+                ))
+            })?;
+            if chunk.schema != SCHEMA_FILE_DIGEST_CHUNK_V2 || chunk.project != project {
+                return Err(invalid_sqlite(format!(
+                    "v2 file-digest manifest chunk has unexpected schema/project for {project:?}: schema={:?}, project={:?}",
+                    chunk.schema, chunk.project
+                )));
+            }
+            if chunk.symbols.is_empty() || chunk.symbols.len() > FILE_DIGEST_CHUNK_SYMBOL_CAP {
+                return Err(invalid_sqlite(format!(
+                    "v2 file-digest manifest chunk {:?} index {} has invalid symbol count {}",
+                    chunk.file_path,
+                    chunk.chunk_index,
+                    chunk.symbols.len()
+                )));
+            }
+            if chunks
+                .entry(chunk.file_path.clone())
+                .or_default()
+                .insert(chunk.chunk_index, chunk)
+                .is_some()
+            {
+                return Err(invalid_sqlite(format!(
+                    "duplicate v2 file-digest manifest chunk for project {project:?}"
+                )));
+            }
         }
     }
-    manifest
+    let mut manifest = BTreeMap::new();
+    for (file_path, head) in heads {
+        let file_chunks = chunks.remove(&file_path).unwrap_or_default();
+        if file_chunks.len() != head.chunk_count {
+            return Err(invalid_sqlite(format!(
+                "v2 file-digest manifest {file_path:?} declares {} chunks but has {}",
+                head.chunk_count,
+                file_chunks.len()
+            )));
+        }
+        let mut symbols = Vec::with_capacity(head.symbol_count);
+        for index in 0..head.chunk_count {
+            let Some(chunk) = file_chunks.get(&index) else {
+                return Err(invalid_sqlite(format!(
+                    "v2 file-digest manifest {file_path:?} is missing chunk {index}"
+                )));
+            };
+            symbols.extend(chunk.symbols.iter().cloned());
+        }
+        if symbols.len() != head.symbol_count
+            || hex_lower(&sha256_digest(&serde_json::to_vec(&symbols)?)) != head.symbols_sha256
+        {
+            return Err(invalid_sqlite(format!(
+                "v2 file-digest manifest {file_path:?} failed exact symbol count/hash readback"
+            )));
+        }
+        manifest.insert(
+            file_path.clone(),
+            FileDigestRow {
+                schema: SCHEMA_FILE_DIGEST_ROW.to_string(),
+                project: head.project,
+                file_path,
+                panel_version: head.panel_version,
+                domain: head.domain,
+                digest: head.digest,
+                symbols,
+            },
+        );
+    }
+    if let Some((file_path, chunks)) = chunks.into_iter().next() {
+        return Err(invalid_sqlite(format!(
+            "v2 file-digest manifest has {} orphan chunks for {file_path:?}",
+            chunks.len()
+        )));
+    }
+    Ok(manifest)
+}
+
+fn manifest_v2_key_belongs_to_project(
+    key: &[u8],
+    prefix: &[u8],
+    project_digest: &[u8; 32],
+) -> bool {
+    key.len() == prefix.len() + 64
+        && key.starts_with(prefix)
+        && key[prefix.len()..prefix.len() + 32] == *project_digest
 }
 
 /// The digest-derived reuse plan for one import (#345): which non-structural node ids may
@@ -4101,19 +4241,17 @@ fn plan_digest_reuse(
     }
 }
 
-/// Builds the fresh per-file digest manifest rows for this import (#345), one per source
-/// file, recording the file's new digest and the identity of every non-structural symbol
-/// it produced. These flow through the same graph-row reconcile/write/readback path as the
-/// metadata rows, so an unchanged file's manifest row reverts to its persisted bytes (no
-/// write) while a changed file's row is rewritten in the same ledger-paired batch.
+/// Builds bounded v2 per-file digest manifest rows. The head records one file's
+/// full digest and identity count; ordered chunks retain every identity without
+/// allowing one generated source file to manufacture an over-memtable Graph row.
 #[allow(clippy::too_many_arguments)]
 fn file_digest_manifest_rows(
     options: &SqliteImportOptions,
     constellations: &[PreparedLiveSymbol],
     new_digests: &BTreeMap<String, String>,
-    unchanged_files: &BTreeSet<String>,
-    existing_graph: &BTreeMap<Vec<u8>, Vec<u8>>,
-    preserved_keys: &mut BTreeSet<Vec<u8>>,
+    _unchanged_files: &BTreeSet<String>,
+    _existing_graph: &BTreeMap<Vec<u8>, Vec<u8>>,
+    _preserved_keys: &mut BTreeSet<Vec<u8>>,
     encode_skip: &mut EncodeSkipReport,
     project_digests: &mut ProjectDigestCache,
 ) -> IngestResult<Vec<(Vec<u8>, Vec<u8>)>> {
@@ -4131,36 +4269,61 @@ fn file_digest_manifest_rows(
     }
     let mut rows = Vec::with_capacity(new_digests.len());
     for (file_path, digest) in new_digests {
-        let key = keyed_graph_key_with_digest(
-            FILE_DIGEST_ROW_PREFIX,
-            &project_digest,
-            file_path.as_bytes(),
-        );
-        // An unchanged file's new manifest row is byte-identical to the persisted one: the
-        // digest matched and the reused symbol identities were themselves read out of that
-        // same persisted row (#345). Carry it forward without re-encoding (#372); fail open
-        // to the encode path if the persisted row is missing.
-        if unchanged_files.contains(file_path) && existing_graph.contains_key(&key) {
-            symbols_by_file.remove(file_path.as_str());
-            encode_skip.manifest_rows_preserved += 1;
-            preserved_keys.insert(key);
-            continue;
-        }
         let mut symbols = symbols_by_file
             .remove(file_path.as_str())
             .unwrap_or_default();
         symbols.sort_by_key(|symbol| symbol.node_id);
-        let row = FileDigestRow {
-            schema: SCHEMA_FILE_DIGEST_ROW.to_string(),
+        let symbols_sha256 = hex_lower(&sha256_digest(&serde_json::to_vec(&symbols)?));
+        let chunk_count = symbols.len().div_ceil(FILE_DIGEST_CHUNK_SYMBOL_CAP);
+        let head = FileDigestManifestV2 {
+            schema: SCHEMA_FILE_DIGEST_MANIFEST_V2.to_string(),
             project: options.project.clone(),
             file_path: file_path.clone(),
             panel_version: options.panel_version,
             domain: FILE_DIGEST_DOMAIN.to_string(),
             digest: digest.clone(),
-            symbols,
+            symbol_count: symbols.len(),
+            chunk_count,
+            symbols_sha256,
         };
+        rows.push((
+            keyed_graph_key_with_digest(
+                FILE_DIGEST_MANIFEST_V2_PREFIX,
+                &project_digest,
+                file_path.as_bytes(),
+            ),
+            serde_json::to_vec(&head)?,
+        ));
+        for (chunk_index, chunk_symbols) in symbols.chunks(FILE_DIGEST_CHUNK_SYMBOL_CAP).enumerate()
+        {
+            let chunk = FileDigestChunkV2 {
+                schema: SCHEMA_FILE_DIGEST_CHUNK_V2.to_string(),
+                project: options.project.clone(),
+                file_path: file_path.clone(),
+                chunk_index,
+                symbols: chunk_symbols.to_vec(),
+            };
+            let bytes = serde_json::to_vec(&chunk)?;
+            if bytes.len() > FILE_DIGEST_CHUNK_MAX_BYTES {
+                return Err(invalid_sqlite(format!(
+                    "file digest chunk {file_path:?} index {chunk_index} is {} bytes, above the {} byte bounded Graph-row cap",
+                    bytes.len(),
+                    FILE_DIGEST_CHUNK_MAX_BYTES
+                )));
+            }
+            let mut discriminator = Vec::with_capacity(file_path.len() + 8);
+            discriminator.extend_from_slice(file_path.as_bytes());
+            discriminator.extend_from_slice(&(chunk_index as u64).to_be_bytes());
+            rows.push((
+                keyed_graph_key_with_digest(
+                    FILE_DIGEST_CHUNK_V2_PREFIX,
+                    &project_digest,
+                    &discriminator,
+                ),
+                bytes,
+            ));
+        }
         encode_skip.manifest_rows_encoded += 1;
-        rows.push((key, serde_json::to_vec(&row)?));
     }
     Ok(rows)
 }
