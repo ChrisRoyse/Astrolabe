@@ -125,8 +125,7 @@ pub(crate) struct ShadowPublication {
 impl ShadowPublication {
     pub(crate) fn begin(live_cache: &Path, project: &str) -> Result<Self, DynError> {
         fs::create_dir_all(live_cache)?;
-        let project_digest = hex_lower(&Sha256::digest(project.as_bytes()));
-        let project_root = live_cache.join(PUBLICATION_DIR).join(&project_digest[..32]);
+        let project_root = publication_project_root(live_cache, project);
         reconcile_shadow_publications_for_project(live_cache, project)?;
         if project_root.exists() && fs::read_dir(&project_root)?.next().is_some() {
             return Err(format!(
@@ -1217,6 +1216,11 @@ impl ShadowPublication {
     }
 }
 
+fn publication_project_root(live_cache: &Path, project: &str) -> PathBuf {
+    let project_digest = hex_lower(&Sha256::digest(project.as_bytes()));
+    live_cache.join(PUBLICATION_DIR).join(&project_digest[..32])
+}
+
 fn project_config_rows(cache_dir: &Path, project: &str) -> Result<Vec<(String, String)>, DynError> {
     let prefix = format!("{CONFIG_KEY_PREFIX}{project}");
     let metadata_prefix = format!("{prefix}.");
@@ -1330,6 +1334,46 @@ fn action_metadata_keys(project: &str) -> Vec<String> {
     keys
 }
 
+fn publication_recovery_relevant_config_rows(
+    cache_dir: &Path,
+    project: &str,
+) -> Result<Vec<(String, String)>, DynError> {
+    let mut keys = action_metadata_keys(project);
+    keys.push(metadata_key(project, SHADOW_PUBLICATION_GENERATION_KEY));
+    keys.sort();
+    keys.dedup();
+    let mut rows = Vec::new();
+    for key in keys {
+        if let Some(value) = read_config_value(cache_dir, &key)? {
+            rows.push((key, value));
+        }
+    }
+    Ok(rows)
+}
+
+pub(crate) fn shadow_publication_recovery_observation(
+    live_cache: &Path,
+    project: &str,
+    fault_code: &str,
+) -> Result<Option<Value>, DynError> {
+    let project_root = publication_project_root(live_cache, project);
+    if !project_root.exists() || fs::read_dir(&project_root)?.next().is_none() {
+        return Ok(None);
+    }
+    let transaction_inventory_sha256 = sha256_tree_hex(&project_root)?;
+    let config_rows = publication_recovery_relevant_config_rows(live_cache, project)?;
+    let publication_config_sha256 = config_rows_sha256(&config_rows)?;
+    Ok(Some(json!({
+        "schema": "astrolabe.shadow-publication-recovery-observation.v1",
+        "project": project,
+        "fault_code": fault_code,
+        "transaction_root": project_root,
+        "transaction_inventory_sha256": transaction_inventory_sha256,
+        "publication_config_sha256": publication_config_sha256,
+        "publication_config_rows": config_rows,
+    })))
+}
+
 fn persist_action_metadata_acknowledgement(
     cache_dir: &Path,
     project: &str,
@@ -1403,8 +1447,7 @@ pub(crate) fn reconcile_shadow_publications_for_project(
     live_cache: &Path,
     project: &str,
 ) -> Result<bool, DynError> {
-    let project_digest = hex_lower(&Sha256::digest(project.as_bytes()));
-    let project_root = live_cache.join(PUBLICATION_DIR).join(&project_digest[..32]);
+    let project_root = publication_project_root(live_cache, project);
     let had_transactions = project_root.exists() && fs::read_dir(&project_root)?.next().is_some();
     reconcile_completed_transactions(&project_root, live_cache, project)?;
     Ok(had_transactions)
