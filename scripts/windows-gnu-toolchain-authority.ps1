@@ -337,6 +337,7 @@ $CanonicalLauncherLockHelper = Join-Path `
     (Join-Path $ExpectedWorkspace 'scripts') `
     'launcher-lock.ps1'
 $RustToolchain = "1.95.0-x86_64-pc-windows-gnu"
+$NativeCargoTargetTriple = "x86_64-pc-windows-gnu"
 $ArchiveName = "x86_64-14.1.0-release-posix-seh-msvcrt-rt_v12-rev0.7z"
 $ArchiveUrl = "https://ci-mirrors.rust-lang.org/rustc/$ArchiveName"
 $ArchiveSha256 = "BC0DE4321141730E83FD2457B1F7639946CC66787BF98BA9B03770D06D414DF1"
@@ -422,6 +423,7 @@ $RequiredTools = @(
 )
 $NvccCcbinEnv = "NVCC_CCBIN"
 $ForgeCudaCcbinEnv = "FORGE_CUDA_CCBIN"
+$CudaMsvcLinkSupportEnv = "ASTROLABE_CUDA_MSVC_LINK_SUPPORT"
 $NvccAppendFlagsEnv = "NVCC_APPEND_FLAGS"
 $MsvcRuntimeArchiveName = "msvcrt.lib"
 $MsvcRuntimeSupportMembers = @(
@@ -1503,6 +1505,195 @@ function Assert-NoCargoTargetDirOverride {
             throw "LAUNCHER_BOUNDARY[ASTRO_CARGO_TARGET_DIR_OVERRIDE]: {code=ASTRO_CARGO_TARGET_DIR_OVERRIDE; message=`"the child command passes '$arg', which overrides the launcher's authoritative CARGO_TARGET_DIR and would write Cargo output outside the owned, cleaned target root`"; remediation=`"remove --target-dir from the command; the launcher confines every Cargo child (nested manifests included) to its owned target root automatically`"}"
         }
     }
+}
+
+function Test-AstroCargoCommand {
+    param([Parameter(Mandatory)][string]$Command)
+
+    $leaf = [IO.Path]::GetFileName($Command)
+    return (
+        [string]::Equals($leaf, 'cargo', [StringComparison]::OrdinalIgnoreCase) -or
+        [string]::Equals($leaf, 'cargo.exe', [StringComparison]::OrdinalIgnoreCase)
+    )
+}
+
+function Split-AstroCargoFeatureSpec {
+    param([AllowEmptyString()][string]$Spec)
+
+    if ([string]::IsNullOrWhiteSpace($Spec)) {
+        return @()
+    }
+    return @(
+        $Spec -split '[,\s]+' |
+            Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+    )
+}
+
+function Test-AstroCargoFeatureSpecRequestsCuda {
+    param([AllowEmptyString()][string]$Spec)
+
+    $cudaFeatureNames = @(
+        'cuda',
+        'candle-cuda',
+        'ml-runtime',
+        'cuda-policy-measurement',
+        'cuda-runtime-boundary'
+    )
+    foreach ($feature in @(Split-AstroCargoFeatureSpec -Spec $Spec)) {
+        $name = if ($feature.Contains('/')) {
+            [string]($feature -split '/' | Select-Object -Last 1)
+        }
+        else {
+            [string]$feature
+        }
+        foreach ($cudaFeature in $cudaFeatureNames) {
+            if ([string]::Equals($name, $cudaFeature, [StringComparison]::OrdinalIgnoreCase)) {
+                return $true
+            }
+        }
+    }
+    return $false
+}
+
+function Get-AstroCargoExplicitTargets {
+    param([string[]]$CommandArgs)
+
+    $targets = [Collections.Generic.List[string]]::new()
+    for ($index = 0; $index -lt $CommandArgs.Count; $index++) {
+        $arg = [string]$CommandArgs[$index]
+        if ($arg -ceq '--target') {
+            if ($index + 1 -ge $CommandArgs.Count -or
+                [string]::IsNullOrWhiteSpace([string]$CommandArgs[$index + 1])) {
+                throw "LAUNCHER_BOUNDARY[ASTRO_CARGO_TARGET_ARGUMENT_MISSING]: {code=ASTRO_CARGO_TARGET_ARGUMENT_MISSING; message=`"cargo command uses --target without a following target triple`"; remediation=`"pass --target $NativeCargoTargetTriple or remove the incomplete --target argument`"}"
+            }
+            $targets.Add([string]$CommandArgs[$index + 1])
+            $index++
+            continue
+        }
+        if ($arg.StartsWith('--target=', [StringComparison]::Ordinal)) {
+            $value = $arg.Substring('--target='.Length)
+            if ([string]::IsNullOrWhiteSpace($value)) {
+                throw "LAUNCHER_BOUNDARY[ASTRO_CARGO_TARGET_ARGUMENT_MISSING]: {code=ASTRO_CARGO_TARGET_ARGUMENT_MISSING; message=`"cargo command uses --target= without a target triple`"; remediation=`"pass --target=$NativeCargoTargetTriple or remove the incomplete --target argument`"}"
+            }
+            $targets.Add($value)
+        }
+    }
+    return @($targets)
+}
+
+function Test-AstroCargoArgsRequestCuda {
+    param([string[]]$CommandArgs)
+
+    for ($index = 0; $index -lt $CommandArgs.Count; $index++) {
+        $arg = [string]$CommandArgs[$index]
+        if ($arg -ceq '--features') {
+            if ($index + 1 -ge $CommandArgs.Count -or
+                [string]::IsNullOrWhiteSpace([string]$CommandArgs[$index + 1])) {
+                throw "LAUNCHER_BOUNDARY[ASTRO_CARGO_FEATURE_ARGUMENT_MISSING]: {code=ASTRO_CARGO_FEATURE_ARGUMENT_MISSING; message=`"cargo command uses --features without a following feature list`"; remediation=`"pass an explicit feature list or remove the incomplete --features argument`"}"
+            }
+            if (Test-AstroCargoFeatureSpecRequestsCuda -Spec ([string]$CommandArgs[$index + 1])) {
+                return $true
+            }
+            $index++
+            continue
+        }
+        if ($arg.StartsWith('--features=', [StringComparison]::Ordinal)) {
+            if (Test-AstroCargoFeatureSpecRequestsCuda -Spec $arg.Substring('--features='.Length)) {
+                return $true
+            }
+        }
+    }
+    return $false
+}
+
+function Get-AstroCudaLinkSupportEnvDecision {
+    $item = Get-Item -Path "Env:$CudaMsvcLinkSupportEnv" -ErrorAction SilentlyContinue
+    if ($null -eq $item -or [string]::IsNullOrWhiteSpace($item.Value)) {
+        return $null
+    }
+    $value = $item.Value.Trim()
+    if (@('1', 'true', 'required') -contains $value.ToLowerInvariant()) {
+        return [pscustomobject]@{
+            Requested = $true
+            Reason = "$CudaMsvcLinkSupportEnv=$value"
+        }
+    }
+    if (@('0', 'false', 'off', 'disabled') -contains $value.ToLowerInvariant()) {
+        return [pscustomobject]@{
+            Requested = $false
+            Reason = "$CudaMsvcLinkSupportEnv=$value"
+        }
+    }
+    throw "CUDA_MSVC_RUNTIME_LINK[ASTRO_CUDA_MSVC_LINK_SUPPORT_ENV_INVALID]: {code=ASTRO_CUDA_MSVC_LINK_SUPPORT_ENV_INVALID; message=`"$CudaMsvcLinkSupportEnv must be one of 1,true,required,0,false,off,disabled; observed '$value'`"; remediation=`"set $CudaMsvcLinkSupportEnv=required only for a launcher command plan whose nested Cargo work intentionally builds CUDA features, or unset it for ordinary non-CUDA builds`"}"
+}
+
+function Get-AstroCudaMsvcLinkSupportDecision {
+    param([Parameter(Mandatory)][object[]]$CommandPlan)
+
+    $envDecision = Get-AstroCudaLinkSupportEnvDecision
+    if ($null -ne $envDecision) {
+        return $envDecision
+    }
+
+    foreach ($step in $CommandPlan) {
+        $command = [string]$step.Command
+        [string[]]$stepArgs = @($step.Args)
+        if ((Test-AstroCargoCommand -Command $command) -and
+            (Test-AstroCargoArgsRequestCuda -CommandArgs $stepArgs)) {
+            return [pscustomobject]@{
+                Requested = $true
+                Reason = "cargo command index=$($step.Index) requested explicit CUDA feature intent"
+            }
+        }
+
+        $commandAndArgs = @($command) + @($stepArgs)
+        foreach ($part in $commandAndArgs) {
+            if ($part -match '(?i)(^|[\\/])forge-cuda-kernel-fsv\.ps1$') {
+                return [pscustomobject]@{
+                    Requested = $true
+                    Reason = "command index=$($step.Index) invokes forge-cuda-kernel-fsv.ps1"
+                }
+            }
+            if ($part -match '(?i)cuda-policy-measurement') {
+                return [pscustomobject]@{
+                    Requested = $true
+                    Reason = "command index=$($step.Index) names cuda-policy-measurement"
+                }
+            }
+        }
+    }
+
+    return [pscustomobject]@{
+        Requested = $false
+        Reason = 'no CUDA feature/script/env intent observed in command plan'
+    }
+}
+
+function Set-AstroCudaCargoTargetSplit {
+    param([Parameter(Mandatory)][object[]]$CommandPlan)
+
+    foreach ($step in $CommandPlan) {
+        if (-not (Test-AstroCargoCommand -Command ([string]$step.Command))) {
+            continue
+        }
+        foreach ($targetTriple in @(Get-AstroCargoExplicitTargets -CommandArgs ([string[]]@($step.Args)))) {
+            if (-not [string]::Equals($targetTriple, $NativeCargoTargetTriple, [StringComparison]::OrdinalIgnoreCase)) {
+                throw "CUDA_MSVC_RUNTIME_LINK[ASTRO_CUDA_MSVC_TARGET_UNSUPPORTED]: {code=ASTRO_CUDA_MSVC_TARGET_UNSUPPORTED; message=`"CUDA/MSVC link support is native-Windows-only and refuses cargo --target '$targetTriple'; expected '$NativeCargoTargetTriple'`"; remediation=`"run CUDA evidence through the native Windows GNU target '$NativeCargoTargetTriple' or remove CUDA features from this launcher command plan`"}"
+            }
+        }
+    }
+
+    $targetItem = Get-Item -Path 'Env:CARGO_BUILD_TARGET' -ErrorAction SilentlyContinue
+    if ($null -ne $targetItem -and -not [string]::IsNullOrWhiteSpace($targetItem.Value)) {
+        if (-not [string]::Equals($targetItem.Value.Trim(), $NativeCargoTargetTriple, [StringComparison]::OrdinalIgnoreCase)) {
+            throw "CUDA_MSVC_RUNTIME_LINK[ASTRO_CUDA_MSVC_TARGET_UNSUPPORTED]: {code=ASTRO_CUDA_MSVC_TARGET_UNSUPPORTED; message=`"ambient CARGO_BUILD_TARGET=$($targetItem.Value) conflicts with CUDA/MSVC link support target '$NativeCargoTargetTriple'`"; remediation=`"unset CARGO_BUILD_TARGET or set it to '$NativeCargoTargetTriple' before invoking a CUDA launcher run`"}"
+        }
+        Write-Output "CUDA_MSVC_RUNTIME_LINK[ASTRO_CUDA_MSVC_TARGET_SPLIT]: using ambient CARGO_BUILD_TARGET=$($targetItem.Value.Trim()) so Cargo keeps target link Rustflags off host build scripts and proc macros"
+        return
+    }
+
+    $env:CARGO_BUILD_TARGET = $NativeCargoTargetTriple
+    Write-Output "CUDA_MSVC_RUNTIME_LINK[ASTRO_CUDA_MSVC_TARGET_SPLIT]: set CARGO_BUILD_TARGET=$NativeCargoTargetTriple so Cargo keeps target link Rustflags off host build scripts and proc macros"
 }
 
 function Resolve-PinnedCuda13Runtime {
@@ -3990,12 +4181,19 @@ function Set-CudaMsvcRuntimeLinkEnvironment {
     param(
         [Parameter(Mandatory)][string]$ToolsRoot,
         [Parameter(Mandatory)][string]$LlvmBin,
-        [Parameter(Mandatory)][string]$WorkspaceTemp
+        [Parameter(Mandatory)][string]$WorkspaceTemp,
+        [Parameter(Mandatory)][object[]]$CommandPlan
     )
 
-    if (-not $env:FORGE_CUDA_CCBIN) {
+    $decision = Get-AstroCudaMsvcLinkSupportDecision -CommandPlan $CommandPlan
+    if (-not $decision.Requested) {
+        Write-Output "CUDA_MSVC_RUNTIME_LINK[ASTRO_CUDA_MSVC_SUPPORT_SKIPPED]: $($decision.Reason); CUDA host compiler environment remains available to build scripts, but no CUDA/MSVC linker objects or import libraries were appended to Cargo Rustflags"
         return
     }
+    if (-not $env:FORGE_CUDA_CCBIN) {
+        throw "CUDA_MSVC_RUNTIME_LINK[ASTRO_CUDA_MSVC_CCBIN_MISSING]: {code=ASTRO_CUDA_MSVC_CCBIN_MISSING; message=`"CUDA/MSVC link support was requested ($($decision.Reason)) but $ForgeCudaCcbinEnv is absent after host-compiler discovery`"; remediation=`"install Visual Studio Build Tools MSVC x64 tools or set $NvccCcbinEnv/$ForgeCudaCcbinEnv to cl.exe or its Hostx64\\x64 directory before running CUDA evidence`"}"
+    }
+    Set-AstroCudaCargoTargetSplit -CommandPlan $CommandPlan
 
     $libRoot = Resolve-MsvcLibRootFromCudaCcbin -Ccbin $env:FORGE_CUDA_CCBIN
     if ($null -ne $script:cudaLinkSupportLease) {
@@ -4055,7 +4253,7 @@ function Set-CudaMsvcRuntimeLinkEnvironment {
     $rustFlagTokens += @("-C", "link-arg=$ucrtImportLib")
     $rustFlagTokens += @("-C", "link-arg=-lkernel32")
     Add-Rustflags -Tokens $rustFlagTokens
-    Write-Output "CUDA_MSVC_RUNTIME_LINK[ASTRO_CUDA_MSVC_SUPPORT_OBJECTS]: verified pinned LLD at $pinnedLld; stable_bundle=$($bundle.Root); input_digest=$($bundle.InputDigest); manifest_sha256=$($bundle.ManifestSha256); payload_content_sha256=$($bundle.Inventory.ContentSha256); bound $($supportObjects.Count) support object(s) from $MsvcRuntimeArchiveName, $($vcStartupObjects.Count) support object(s) from $MsvcVcStartupArchiveName, $($importLibs.Count + 1) MSVC/UCRT import lib(s), and $($CudaImportLibNames.Count) CUDA import lib(s); generation TEMP appears only in exact CUDA discovery view $env:CUDA_PATH"
+    Write-Output "CUDA_MSVC_RUNTIME_LINK[ASTRO_CUDA_MSVC_SUPPORT_OBJECTS]: requested_by='$($decision.Reason)'; verified pinned LLD at $pinnedLld; stable_bundle=$($bundle.Root); input_digest=$($bundle.InputDigest); manifest_sha256=$($bundle.ManifestSha256); payload_content_sha256=$($bundle.Inventory.ContentSha256); bound $($supportObjects.Count) support object(s) from $MsvcRuntimeArchiveName, $($vcStartupObjects.Count) support object(s) from $MsvcVcStartupArchiveName, $($importLibs.Count + 1) MSVC/UCRT import lib(s), and $($CudaImportLibNames.Count) CUDA import lib(s); generation TEMP appears only in exact CUDA discovery view $env:CUDA_PATH"
 }
 
 function Set-ToolchainEnvironment {
@@ -8504,7 +8702,8 @@ try {
     Set-CudaMsvcRuntimeLinkEnvironment `
         -ToolsRoot $toolsRoot `
         -LlvmBin $llvmBin `
-        -WorkspaceTemp $workspaceTemp
+        -WorkspaceTemp $workspaceTemp `
+        -CommandPlan $commandPlan
     # #755: GNU ld.bfd inserts the current time into PE/COFF images by default,
     # so two otherwise-identical clean builds produce different executable bytes.
     # LLD's MinGW driver accepts the same spelling as an alias for /timestamp:0.
