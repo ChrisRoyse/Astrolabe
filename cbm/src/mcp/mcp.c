@@ -658,7 +658,30 @@ typedef struct {
     const char *title;
     const char *description;
     const char *input_schema; /* JSON string */
+    char *(*handler)(cbm_mcp_server_t *srv, const char *args);
+    unsigned flags;
 } tool_def_t;
+
+enum {
+    TOOL_FLAG_NONE = 0,
+    TOOL_FLAG_FIRST_PAGE_REQUIRED = 1u << 0,
+    TOOL_FLAG_PROJECT_DISCOVERY = 1u << 1,
+};
+
+static char *handle_list_projects(cbm_mcp_server_t *srv, const char *args);
+static char *handle_get_graph_schema(cbm_mcp_server_t *srv, const char *args);
+static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args);
+static char *handle_query_graph(cbm_mcp_server_t *srv, const char *args);
+static char *handle_index_status(cbm_mcp_server_t *srv, const char *args);
+static char *handle_delete_project(cbm_mcp_server_t *srv, const char *args);
+static char *handle_get_architecture(cbm_mcp_server_t *srv, const char *args);
+static char *handle_trace_call_path(cbm_mcp_server_t *srv, const char *args);
+static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args);
+static char *handle_get_code_snippet(cbm_mcp_server_t *srv, const char *args);
+static char *handle_search_code(cbm_mcp_server_t *srv, const char *args);
+static char *handle_detect_changes(cbm_mcp_server_t *srv, const char *args);
+static char *handle_manage_adr(cbm_mcp_server_t *srv, const char *args);
+static char *handle_ingest_traces(cbm_mcp_server_t *srv, const char *args);
 
 static const tool_def_t TOOLS[] = {
     {"index_repository", "Index repository",
@@ -680,7 +703,8 @@ static const tool_def_t TOOLS[] = {
      "\"persistence\":{\"type\":\"boolean\",\"default\":false,\"description\":"
      "\"Write compressed artifact to .codebase-memory/graph.db.zst for team sharing. "
      "Teammates can bootstrap from the artifact instead of full re-indexing.\"}"
-     "},\"required\":[\"repo_path\"]}"},
+     "},\"required\":[\"repo_path\"]}",
+     handle_index_repository, TOOL_FLAG_FIRST_PAGE_REQUIRED},
 
     {"search_graph", "Search graph",
      "Search the code knowledge graph for indexed symbols and structural nodes. Use INSTEAD OF "
@@ -739,7 +763,8 @@ static const tool_def_t TOOLS[] = {
                                          "Combine with 'limit' to page: "
                                          "increment offset by limit and re-call while has_more is "
                                          "true.\"}},"
-                                         "\"required\":[\"project\"]}"},
+                                         "\"required\":[\"project\"]}",
+     handle_search_graph, TOOL_FLAG_FIRST_PAGE_REQUIRED},
 
     {"query_graph", "Query graph",
      "Execute a Cypher query against the knowledge graph for complex multi-hop patterns, "
@@ -762,7 +787,8 @@ static const tool_def_t TOOLS[] = {
      "\"description\":"
      "\"Optional row limit. Default: unlimited up to a 100k row "
      "ceiling. No offset support — use search_graph for paginated browsing.\"}},"
-     "\"required\":[\"query\",\"project\"]}"},
+     "\"required\":[\"query\",\"project\"]}",
+     handle_query_graph, TOOL_FLAG_FIRST_PAGE_REQUIRED},
 
     {"trace_path", "Trace path",
      "Trace paths through the code graph. Modes: calls (callers/callees), data_flow (value "
@@ -783,7 +809,8 @@ static const tool_def_t TOOLS[] = {
      "\"},\"include_tests\":{\"type\":\"boolean\",\"default\":false,"
      "\"description\":\"Include test files in results. When false (default), test files are "
      "filtered out. When true, test nodes are included with is_test=true marker."
-     "\"}},\"required\":[\"function_name\",\"project\"]}"},
+     "\"}},\"required\":[\"function_name\",\"project\"]}",
+     handle_trace_call_path, TOOL_FLAG_FIRST_PAGE_REQUIRED},
 
     {"get_code_snippet", "Get code snippet",
      "Read source code for a function/class/symbol. IMPORTANT: First call search_graph to find the "
@@ -793,12 +820,14 @@ static const tool_def_t TOOLS[] = {
      "\"Stable source atom_id from search_graph (preferred)\"},\"qualified_name\":{"
      "\"type\":\"string\",\"description\":\"Qualified name only when unique\"},\"project\":{"
      "\"type\":\"string\"},\"include_neighbors\":{"
-     "\"type\":\"boolean\",\"default\":false}},\"required\":[\"project\"]}"},
+     "\"type\":\"boolean\",\"default\":false}},\"required\":[\"project\"]}",
+     handle_get_code_snippet, TOOL_FLAG_FIRST_PAGE_REQUIRED},
 
     {"get_graph_schema", "Get graph schema",
      "Get the schema of the knowledge graph (node labels, edge types)",
      "{\"type\":\"object\",\"properties\":{\"project\":{\"type\":\"string\"}},\"required\":["
-     "\"project\"]}"},
+     "\"project\"]}",
+     handle_get_graph_schema, TOOL_FLAG_FIRST_PAGE_REQUIRED},
 
     {"get_architecture", "Get architecture",
      "Get high-level architecture overview — packages, services, dependencies, and project "
@@ -815,7 +844,8 @@ static const tool_def_t TOOLS[] = {
      "\"overview\",\"structure\",\"dependencies\",\"routes\",\"languages\",\"packages\","
      "\"entry_points\",\"hotspots\",\"boundaries\",\"layers\",\"file_tree\",\"clusters\"]},"
      "\"description\":\"Aspects to include. 'all' = everything; 'overview' = compact summary "
-     "(all except file_tree); omit = all.\"}},\"required\":[\"project\"]}"},
+     "(all except file_tree); omit = all.\"}},\"required\":[\"project\"]}",
+     handle_get_architecture, TOOL_FLAG_FIRST_PAGE_REQUIRED},
 
     {"search_code", "Search code",
      "Graph-augmented code search. Finds text patterns via grep, then enriches results with "
@@ -839,17 +869,21 @@ static const tool_def_t TOOLS[] = {
      "\"description\":\"Max enriched results per call. Default 10. Response includes "
      "'total_grep_matches' and 'total_results' so callers can detect truncation. No "
      "offset parameter — raise limit or narrow with file_pattern / path_filter to see more."
-     "\",\"default\":10}},\"required\":[\"pattern\",\"project\"]}"},
+     "\",\"default\":10}},\"required\":[\"pattern\",\"project\"]}",
+     handle_search_code, TOOL_FLAG_FIRST_PAGE_REQUIRED},
 
     {"list_projects", "List projects", "List all indexed projects",
-     "{\"type\":\"object\",\"properties\":{}}"},
+     "{\"type\":\"object\",\"properties\":{}}", handle_list_projects,
+     TOOL_FLAG_FIRST_PAGE_REQUIRED | TOOL_FLAG_PROJECT_DISCOVERY},
     {"delete_project", "Delete project", "Delete a project from the index",
      "{\"type\":\"object\",\"properties\":{\"project\":{\"type\":\"string\"}},\"required\":["
-     "\"project\"]}"},
+     "\"project\"]}",
+     handle_delete_project, TOOL_FLAG_NONE},
 
     {"index_status", "Index status", "Get the indexing status of a project",
      "{\"type\":\"object\",\"properties\":{\"project\":{\"type\":\"string\"}},\"required\":["
-     "\"project\"]}"},
+     "\"project\"]}",
+     handle_index_status, TOOL_FLAG_NONE},
 
     {"detect_changes", "Detect changes", "Detect code changes and their impact",
      "{\"type\":\"object\",\"properties\":{\"project\":{\"type\":\"string\"},\"scope\":{\"type\":"
@@ -857,13 +891,15 @@ static const tool_def_t TOOLS[] = {
      "\"string\",\"default\":\"main\"},\"since\":{\"type\":\"string\",\"description\":"
      "\"Git ref or tag to compare from (e.g. HEAD~5, v0.5.0). Diffs <ref>...HEAD.\"}},"
      "\"required\":"
-     "[\"project\"]}"},
+     "[\"project\"]}",
+     handle_detect_changes, TOOL_FLAG_NONE},
 
     {"manage_adr", "Manage ADR", "Create or update Architecture Decision Records",
      "{\"type\":\"object\",\"properties\":{\"project\":{\"type\":\"string\"},\"mode\":{\"type\":"
      "\"string\",\"enum\":[\"get\",\"update\",\"sections\"]},\"content\":{\"type\":\"string\"},"
      "\"sections\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}}},\"required\":[\"project\"]"
-     "}"},
+     "}",
+     handle_manage_adr, TOOL_FLAG_NONE},
 
     {"ingest_traces", "Ingest traces",
      "Ingest runtime traces (OTLP protobuf/JSON or simple {caller,callee,count}) to promote "
@@ -873,10 +909,75 @@ static const tool_def_t TOOLS[] = {
      "\"string\"},\"count\":{\"type\":\"integer\"}},\"additionalProperties\":false}},"
      "\"resourceSpans\":{\"type\":\"array\",\"items\":{\"type\":\"object\"}},"
      "\"otlp_protobuf_base64\":{\"type\":\"string\"},\"project\":{\"type\":\"string\"}},"
-     "\"required\":[\"project\"]}"},
+     "\"required\":[\"project\"]}",
+     handle_ingest_traces, TOOL_FLAG_NONE},
 };
 
 static const int TOOL_COUNT = sizeof(TOOLS) / sizeof(TOOLS[0]);
+
+static const tool_def_t *cbm_mcp_find_tool_def(const char *tool_name, int *index_out) {
+    if (index_out) {
+        *index_out = -1;
+    }
+    if (!tool_name) {
+        return NULL;
+    }
+    for (int i = 0; i < TOOL_COUNT; i++) {
+        if (strcmp(TOOLS[i].name, tool_name) == 0) {
+            if (index_out) {
+                *index_out = i;
+            }
+            return &TOOLS[i];
+        }
+    }
+    return NULL;
+}
+
+static int cbm_mcp_first_page_tool_count(void) {
+    int limit = MCP_TOOLS_PAGE_SIZE;
+    for (int i = 0; i < TOOL_COUNT; i++) {
+        if ((TOOLS[i].flags & TOOL_FLAG_FIRST_PAGE_REQUIRED) && limit < i + 1) {
+            limit = i + 1;
+        }
+    }
+    return limit > TOOL_COUNT ? TOOL_COUNT : limit;
+}
+
+static const char *cbm_mcp_project_discovery_tool_name(void) {
+    int first_page_count = cbm_mcp_first_page_tool_count();
+    for (int i = 0; i < TOOL_COUNT; i++) {
+        if (TOOLS[i].flags & TOOL_FLAG_PROJECT_DISCOVERY) {
+            return i < first_page_count ? TOOLS[i].name : NULL;
+        }
+    }
+    return NULL;
+}
+
+static char *build_project_discovery_unavailable_error(const char *reason) {
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    if (!doc) {
+        return heap_strdup(
+            "{\"code\":\"CBM_MCP_PROJECT_DISCOVERY_UNAVAILABLE\","
+            "\"message\":\"project discovery remediation cannot be generated\","
+            "\"remediation\":\"repair the MCP tool roster so one project discovery tool is "
+            "advertised on the first tools/list page\"}");
+    }
+    yyjson_mut_val *root = yyjson_mut_obj(doc);
+    yyjson_mut_doc_set_root(doc, root);
+    yyjson_mut_obj_add_str(doc, root, "code", "CBM_MCP_PROJECT_DISCOVERY_UNAVAILABLE");
+    yyjson_mut_obj_add_str(doc, root, "message",
+                           "project discovery remediation cannot be generated");
+    yyjson_mut_obj_add_str(doc, root, "reason", reason ? reason : "unspecified project lookup");
+    yyjson_mut_obj_add_str(
+        doc, root, "remediation",
+        "repair the MCP tool roster so one project discovery tool is advertised on the first "
+        "tools/list page");
+    yyjson_mut_obj_add_int(doc, root, "tool_count", TOOL_COUNT);
+    yyjson_mut_obj_add_int(doc, root, "first_page_count", cbm_mcp_first_page_tool_count());
+    char *json = yy_doc_to_str(doc);
+    yyjson_mut_doc_free(doc);
+    return json;
+}
 
 static const char MCP_TOOL_OUTPUT_SCHEMA[] = "{\"type\":\"object\",\"additionalProperties\":true}";
 
@@ -1005,15 +1106,8 @@ char *cbm_mcp_tools_list(void) {
  * Used by the CLI to build --flag arguments and per-tool --help from the same
  * source of truth the MCP tools/list advertises. Static lifetime; do not free. */
 const char *cbm_mcp_tool_input_schema(const char *tool_name) {
-    if (!tool_name) {
-        return NULL;
-    }
-    for (int i = 0; i < TOOL_COUNT; i++) {
-        if (strcmp(TOOLS[i].name, tool_name) == 0) {
-            return TOOLS[i].input_schema;
-        }
-    }
-    return NULL;
+    const tool_def_t *tool = cbm_mcp_find_tool_def(tool_name, NULL);
+    return tool ? tool->input_schema : NULL;
 }
 
 static int mcp_tools_cursor_offset(const char *params_json) {
@@ -1049,8 +1143,9 @@ static int mcp_tools_cursor_offset(const char *params_json) {
 }
 
 static char *cbm_mcp_tools_list_page(const char *params_json) {
-    return cbm_mcp_tools_list_range(mcp_tools_cursor_offset(params_json), MCP_TOOLS_PAGE_SIZE,
-                                    true);
+    int offset = mcp_tools_cursor_offset(params_json);
+    int limit = offset == 0 ? cbm_mcp_first_page_tool_count() : MCP_TOOLS_PAGE_SIZE;
+    return cbm_mcp_tools_list_range(offset, limit, true);
 }
 
 /* Supported protocol versions, newest first. The server picks the newest
@@ -2231,13 +2326,17 @@ static char *build_recorded_store_error(const cbm_mcp_server_t *srv) {
 
 static char *build_project_list_error(cbm_mcp_server_t *srv, const char *reason) {
     (void)srv;
+    const char *discovery_tool = cbm_mcp_project_discovery_tool_name();
+    if (!discovery_tool) {
+        return build_project_discovery_unavailable_error(reason);
+    }
     enum { ERR_BUF_SZ = 1024 };
     char buf[ERR_BUF_SZ];
     snprintf(buf, sizeof(buf),
-             "{\"error\":\"%s\",\"hint\":\"Use list_projects to inspect indexed projects and "
+             "{\"error\":\"%s\",\"hint\":\"Use %s to inspect indexed projects and "
              "structured store refusals, then pass an exact returned name as the "
              "\\\"project\\\" argument.\"}",
-             reason);
+             reason, discovery_tool);
     return heap_strdup(buf);
 }
 
@@ -2245,10 +2344,19 @@ static char *build_project_list_error(cbm_mcp_server_t *srv, const char *reason)
  * entirely (no recognized key). Name the literal "project" key so the fix is
  * obvious (#640). Caller must free() result. */
 static char *build_missing_project_error(void) {
-    return heap_strdup("{\"error\":\"missing required argument: project\",\"hint\":\"Pass "
-                       "the project as the \\\"project\\\" argument, e.g. "
-                       "{\\\"project\\\":\\\"<name from list_projects>\\\"}. Run "
-                       "list_projects to see indexed projects.\"}");
+    const char *discovery_tool = cbm_mcp_project_discovery_tool_name();
+    if (!discovery_tool) {
+        return build_project_discovery_unavailable_error("missing required argument: project");
+    }
+    enum { ERR_BUF_SZ = 1024 };
+    char buf[ERR_BUF_SZ];
+    snprintf(buf, sizeof(buf),
+             "{\"error\":\"missing required argument: project\",\"hint\":\"Pass "
+             "the project as the \\\"project\\\" argument, e.g. "
+             "{\\\"project\\\":\\\"<name from %s>\\\"}. Run "
+             "%s to see indexed projects.\"}",
+             discovery_tool, discovery_tool);
+    return heap_strdup(buf);
 }
 
 /* Pick the right no-store error: a NULL project means the argument was missing
@@ -5426,10 +5534,21 @@ static char *handle_cross_repo_mode(const char *repo_path, const char *args) {
     if (!tp_arr || !yyjson_is_arr(tp_arr) || yyjson_arr_size(tp_arr) == 0) {
         yyjson_doc_free(jdoc);
         free(project);
-        return cbm_mcp_text_result(
-            "{\"error\":\"target_projects is required for cross-repo-intelligence mode. "
-            "Use [\\\"*\\\"] for all projects. Run list_projects to see available.\"}",
-            true);
+        const char *discovery_tool = cbm_mcp_project_discovery_tool_name();
+        if (!discovery_tool) {
+            char *error = build_project_discovery_unavailable_error(
+                "target_projects is required for cross-repo-intelligence mode");
+            char *result = cbm_mcp_text_result(error, true);
+            free(error);
+            return result;
+        }
+        enum { ERR_BUF_SZ = 512 };
+        char buf[ERR_BUF_SZ];
+        snprintf(buf, sizeof(buf),
+                 "{\"error\":\"target_projects is required for cross-repo-intelligence mode. "
+                 "Use [\\\"*\\\"] for all projects. Run %s to see available.\"}",
+                 discovery_tool);
+        return cbm_mcp_text_result(buf, true);
     }
 
     int tp_count = (int)yyjson_arr_size(tp_arr);
@@ -10764,50 +10883,24 @@ char *cbm_mcp_handle_tool(cbm_mcp_server_t *srv, const char *tool_name, const ch
         return cbm_mcp_text_result("missing tool name", true);
     }
 
-    if (strcmp(tool_name, "list_projects") == 0) {
-        return handle_list_projects(srv, args_json);
-    }
-    if (strcmp(tool_name, "get_graph_schema") == 0) {
-        return handle_get_graph_schema(srv, args_json);
-    }
-    if (strcmp(tool_name, "search_graph") == 0) {
-        return handle_search_graph(srv, args_json);
-    }
-    if (strcmp(tool_name, "query_graph") == 0) {
-        return handle_query_graph(srv, args_json);
-    }
-    if (strcmp(tool_name, "index_status") == 0) {
-        return handle_index_status(srv, args_json);
-    }
-    if (strcmp(tool_name, "delete_project") == 0) {
-        return handle_delete_project(srv, args_json);
-    }
-    if (strcmp(tool_name, "trace_path") == 0 || strcmp(tool_name, "trace_call_path") == 0) {
-        return handle_trace_call_path(srv, args_json);
-    }
-    if (strcmp(tool_name, "get_architecture") == 0) {
-        return handle_get_architecture(srv, args_json);
+    const tool_def_t *tool = cbm_mcp_find_tool_def(tool_name, NULL);
+    if (tool) {
+        if (!tool->handler) {
+            char msg[CBM_SZ_512];
+            snprintf(msg, sizeof(msg),
+                     "{\"code\":\"CBM_MCP_TOOL_HANDLER_MISSING\",\"message\":\"advertised tool "
+                     "has no dispatch handler\",\"tool\":\"%s\",\"remediation\":\"repair the "
+                     "TOOLS roster before advertising this tool\"}",
+                     tool_name);
+            return cbm_mcp_text_result(msg, true);
+        }
+        return tool->handler(srv, args_json);
     }
 
-    /* Pipeline-dependent tools */
-    if (strcmp(tool_name, "index_repository") == 0) {
-        return handle_index_repository(srv, args_json);
+    if (strcmp(tool_name, "trace_call_path") == 0) {
+        return handle_trace_call_path(srv, args_json);
     }
-    if (strcmp(tool_name, "get_code_snippet") == 0) {
-        return handle_get_code_snippet(srv, args_json);
-    }
-    if (strcmp(tool_name, "search_code") == 0) {
-        return handle_search_code(srv, args_json);
-    }
-    if (strcmp(tool_name, "detect_changes") == 0) {
-        return handle_detect_changes(srv, args_json);
-    }
-    if (strcmp(tool_name, "manage_adr") == 0) {
-        return handle_manage_adr(srv, args_json);
-    }
-    if (strcmp(tool_name, "ingest_traces") == 0) {
-        return handle_ingest_traces(srv, args_json);
-    }
+
     char msg[CBM_SZ_256];
     snprintf(msg, sizeof(msg), "unknown tool: %s", tool_name);
     return cbm_mcp_text_result(msg, true);
