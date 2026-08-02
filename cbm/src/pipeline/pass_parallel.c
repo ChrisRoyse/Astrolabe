@@ -1207,9 +1207,36 @@ int cbm_parallel_extract_ex(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *file
 
     /* Sub-phase: Dispatch workers (parse + extract per file, PARALLEL) */
     CBM_PROF_START(t_dispatch);
-    cbm_parallel_for_opts_t parallel_opts = {.max_workers = worker_count, .force_pthreads = false};
-    cbm_parallel_for(worker_count, extract_worker, &ec, parallel_opts);
+    cbm_parallel_for_opts_t parallel_opts = {
+        .max_workers = worker_count,
+        .force_pthreads = false,
+        .operation = "parallel_extract",
+    };
+    cbm_parallel_for_result_t dispatch_result = {0};
+    int dispatch_rc =
+        cbm_parallel_for(worker_count, extract_worker, &ec, parallel_opts, &dispatch_result);
     CBM_PROF_END_N("parallel_extract", "3_dispatch_workers_parallel", t_dispatch, file_count);
+    if (dispatch_rc != 0) {
+        if (err_lists) {
+            for (int i = 0; i < worker_count; i++) {
+                for (int j = 0; j < err_lists[i].count; j++) {
+                    free(err_lists[i].items[j].path);
+                    free(err_lists[i].items[j].reason);
+                    free(err_lists[i].items[j].phase);
+                }
+                free(err_lists[i].items);
+            }
+            free(err_lists);
+        }
+        for (int i = 0; i < worker_count; i++) {
+            if (workers[i].local_gbuf) {
+                cbm_gbuf_free(workers[i].local_gbuf);
+            }
+        }
+        cbm_aligned_free(workers);
+        free(sorted);
+        return CBM_NOT_FOUND;
+    }
 
     /* Sub-phase: Merge all local gbufs into main gbuf (SEQUENTIAL, gbuf not thread-safe) */
     CBM_PROF_START(t_merge);
@@ -3177,8 +3204,14 @@ int cbm_parallel_resolve(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, 
 
     /* Sub-phase: Dispatch resolve workers (per-file call/usage resolution, PARALLEL) */
     CBM_PROF_START(t_resolve_dispatch);
-    cbm_parallel_for_opts_t opts = {.max_workers = worker_count, .force_pthreads = false};
-    cbm_parallel_for(worker_count, resolve_worker, &rc, opts);
+    cbm_parallel_for_opts_t opts = {
+        .max_workers = worker_count,
+        .force_pthreads = false,
+        .operation = "parallel_resolve",
+    };
+    cbm_parallel_for_result_t dispatch_result = {0};
+    int dispatch_rc =
+        cbm_parallel_for(worker_count, resolve_worker, &rc, opts, &dispatch_result);
     CBM_PROF_END_N("parallel_resolve", "1_dispatch_workers_parallel", t_resolve_dispatch,
                    file_count);
     /* Workers joined: the shared Rust registry (if built) is no longer read.
@@ -3189,6 +3222,15 @@ int cbm_parallel_resolve(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, 
         rc.rust_shared_arena_live = false;
     }
     cbm_mutex_destroy(&rc.rust_shared_mu);
+    if (dispatch_rc != 0) {
+        for (int i = 0; i < worker_count; i++) {
+            if (workers[i].local_edge_buf) {
+                cbm_gbuf_free(workers[i].local_edge_buf);
+            }
+        }
+        cbm_aligned_free(workers);
+        return CBM_NOT_FOUND;
+    }
 
     /* Sub-phase: Merge all local edge bufs into main gbuf (SEQUENTIAL) */
     CBM_PROF_START(t_resolve_merge);
