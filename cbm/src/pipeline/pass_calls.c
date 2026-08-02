@@ -274,15 +274,18 @@ static void emit_http_async_edge(cbm_pipeline_ctx_t *ctx, const CBMCall *call,
     cbm_json_escape(esc_url, sizeof(esc_url), url_or_topic);
     char
         props[CBM_SZ_2K]; /* 2K: match the parallel finalize buffer so args truncate alike (#516) */
-    snprintf(props, sizeof(props), "{\"callee\":\"%s\",\"url_path\":\"%s\"%s%s%s%s%s}", esc_callee,
-             esc_url, method ? ",\"method\":\"" : "", method ? method : "", method ? "\"" : "",
-             broker ? ",\"broker\":\"" : "", broker ? broker : "");
-    if (broker) {
-        size_t plen = strlen(props);
-        if (plen > 0 && props[plen - SKIP_ONE] != '}') {
-            snprintf(props + plen - 1, sizeof(props) - plen + SKIP_ONE, "\"}");
-        }
-    }
+    /* Each optional member closes its own quote. The broker arm previously did
+     * not, and the trailing fixup below it could never run: the format literal
+     * always appends '}', so the `last char != '}'` guard was false every time.
+     * Every ASYNC_CALLS edge carrying a broker therefore emitted
+     *   {"callee":"c","url_path":"u","broker":"kafka}
+     * — unterminated string, not a JSON object — which the graph buffer refuses
+     * with CBM_EDGE_CANONICAL_INPUT_INVALID, failing the whole corpus. HTTP was
+     * unaffected because the method arm already closed its quote. */
+    snprintf(props, sizeof(props), "{\"callee\":\"%s\",\"url_path\":\"%s\"%s%s%s%s%s%s}",
+             esc_callee, esc_url, method ? ",\"method\":\"" : "", method ? method : "",
+             method ? "\"" : "", broker ? ",\"broker\":\"" : "", broker ? broker : "",
+             broker ? "\"" : "");
     calls_emit_edge(ctx->gbuf, source->id, route_id, edge_type, props, sizeof(props), call);
 }
 
