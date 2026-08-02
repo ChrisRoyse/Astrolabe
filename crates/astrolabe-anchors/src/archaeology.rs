@@ -11,6 +11,10 @@ pub const ASTRO_ARCHAEOLOGY_CONFIG_INVALID: &str = "ASTRO_ARCHAEOLOGY_CONFIG_INV
 pub const ASTRO_ARCHAEOLOGY_GIT_FAILED: &str = "ASTRO_ARCHAEOLOGY_GIT_FAILED";
 /// Stable failure code for Git output that cannot be interpreted safely.
 pub const ASTRO_ARCHAEOLOGY_OUTPUT_INVALID: &str = "ASTRO_ARCHAEOLOGY_OUTPUT_INVALID";
+/// Stable failure code for a disagreement between an old-side diff range and
+/// the immutable parent tree that range was derived from.
+pub const ASTRO_ARCHAEOLOGY_OBJECT_VIEW_INCONSISTENT: &str =
+    "ASTRO_ARCHAEOLOGY_OBJECT_VIEW_INCONSISTENT";
 
 const REMEDIATION: &str =
     "verify the repository and Git objects, then rerun archaeology with a validated configuration";
@@ -409,10 +413,7 @@ struct BlamePlanGroup {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum BlameTargetPreflight {
-    Blob,
-    Missing,
-}
+struct BlameTargetPreflight;
 
 /// Mines the configured Git history using native argv-only child processes.
 pub fn mine_git_archaeology(
@@ -529,7 +530,10 @@ pub fn mine_git_archaeology(
     let mut skipped_large_commits = 0usize;
     let mut skipped_unresolvable_reverts = 0usize;
     let mut skipped_gitlink_paths = 0usize;
-    let mut skipped_unblamable_paths = 0usize;
+    // A stable old-side diff range must resolve to a blob in the immutable parent
+    // tree. Keep the persisted compatibility counter at zero; any disagreement now
+    // fails closed with ASTRO_ARCHAEOLOGY_OBJECT_VIEW_INCONSISTENT.
+    let skipped_unblamable_paths = 0usize;
     for commit in commits {
         let revert_target = match canonical_revert_target(&commit.message) {
             RevertTarget::Absent => None,
@@ -647,13 +651,7 @@ pub fn mine_git_archaeology(
             });
         }
     }
-    execute_grouped_blame_plan(
-        repo,
-        &pending_blame_requests,
-        &mut blame,
-        &mut szz,
-        &mut skipped_unblamable_paths,
-    )?;
+    execute_grouped_blame_plan(repo, &pending_blame_requests, &mut blame, &mut szz)?;
     if arch_timing {
         eprintln!(
             "astro.arch.timing phase=mine_internal read_commits_ms={read_commits_ms} \
@@ -1659,18 +1657,11 @@ fn parse_range(raw: &str) -> Result<(u32, u32), ArchaeologyError> {
     Ok((start, count))
 }
 
-/// Outcome of one blame leg (#514): findings, or a counted absent-path skip.
-enum BlameOutcome {
-    Blamed {
-        findings: Vec<(String, u32)>,
-        returned_spans: usize,
-        stdout_bytes: u64,
-    },
-    /// git refused the path with `no such path` at the blamed revision — the
-    /// diff names a path the parent commit does not contain (rename/move
-    /// history, directory↔file swaps). A counted, labeled skip for the caller;
-    /// every OTHER blame failure still fails closed.
-    PathAbsent,
+/// Verified output from one grouped blame leg.
+struct BlameOutcome {
+    findings: Vec<(String, u32)>,
+    returned_spans: usize,
+    stdout_bytes: u64,
 }
 
 fn coalesce_blame_ranges(
@@ -1747,7 +1738,6 @@ fn execute_grouped_blame_plan(
     requests: &[PendingBlameRequest],
     telemetry: &mut GitBlameBatchTelemetry,
     szz: &mut BTreeSet<SzzFinding>,
-    skipped_unblamable_paths: &mut usize,
 ) -> Result<(), ArchaeologyError> {
     if requests.is_empty() {
         return Ok(());
@@ -1788,7 +1778,7 @@ fn execute_grouped_blame_plan(
 
     let mut preflight = preflight_blame_targets(repo, &groups, telemetry)?;
     for ((parent, path), group) in groups {
-        let preflight_state = preflight
+        let _preflight = preflight
             .remove(&(parent.clone(), path.clone()))
             .ok_or_else(|| {
                 ArchaeologyError::new(
@@ -1796,36 +1786,6 @@ fn execute_grouped_blame_plan(
                     format!("Git blame preflight omitted parent {parent} path {path:?}"),
                 )
             })?;
-        match preflight_state {
-            BlameTargetPreflight::Missing => {
-                let skipped =
-                    group
-                        .request_indexes
-                        .iter()
-                        .try_fold(0usize, |total, request_index| {
-                            total
-                                .checked_add(requests[*request_index].ranges.len())
-                                .ok_or_else(|| {
-                                    ArchaeologyError::new(
-                                        ASTRO_ARCHAEOLOGY_OUTPUT_INVALID,
-                                        "Git blame absent-path request telemetry overflowed usize",
-                                    )
-                                })
-                        })?;
-                checked_add_usize(
-                    skipped_unblamable_paths,
-                    skipped,
-                    "Git blame absent-path telemetry overflowed usize",
-                )?;
-                checked_add_usize(
-                    &mut telemetry.path_absent_groups,
-                    1,
-                    "Git blame absent-path group telemetry overflowed usize",
-                )?;
-                continue;
-            }
-            BlameTargetPreflight::Blob => {}
-        }
 
         let effective = coalesce_blame_ranges(&path, &group.ranges)?;
         checked_add_usize(
@@ -1843,19 +1803,11 @@ fn execute_grouped_blame_plan(
             1,
             "Git blame process telemetry overflowed usize",
         )?;
-        let BlameOutcome::Blamed {
+        let BlameOutcome {
             findings,
             returned_spans,
             stdout_bytes,
-        } = outcome
-        else {
-            return Err(ArchaeologyError::new(
-                ASTRO_ARCHAEOLOGY_OUTPUT_INVALID,
-                format!(
-                    "Git cat-file preflight proved parent {parent} path {path:?} is a blob, but Git blame reported the path absent"
-                ),
-            ));
-        };
+        } = outcome;
         checked_add_usize(
             &mut telemetry.returned_spans,
             returned_spans,
@@ -2025,17 +1977,30 @@ fn parse_blame_target_preflight_record(
         )
     })?;
     if record == format!("{parent}:{path} missing") {
-        return Ok(BlameTargetPreflight::Missing);
+        return Err(ArchaeologyError::new(
+            ASTRO_ARCHAEOLOGY_OBJECT_VIEW_INCONSISTENT,
+            format!(
+                "Git cat-file could not resolve old-side blame target parent {parent} path {path:?}; the diff and parent-tree object views disagree"
+            ),
+        ));
     }
     let mut fields = record.split(' ');
     let resolved_oid = fields.next().unwrap_or_default();
     let object_type = fields.next().unwrap_or_default();
     let size = fields.next().unwrap_or_default();
-    if fields.next().is_some() || !is_oid(resolved_oid) || object_type != "blob" {
+    if fields.next().is_some() || !is_oid(resolved_oid) {
         return Err(ArchaeologyError::new(
             ASTRO_ARCHAEOLOGY_OUTPUT_INVALID,
             format!(
-                "Git cat-file blame preflight expected blob or missing for parent {parent} path {path:?}, got {record:?}"
+                "Git cat-file blame preflight returned malformed output for parent {parent} path {path:?}: {record:?}"
+            ),
+        ));
+    }
+    if object_type != "blob" {
+        return Err(ArchaeologyError::new(
+            ASTRO_ARCHAEOLOGY_OBJECT_VIEW_INCONSISTENT,
+            format!(
+                "Git old-side blame target parent {parent} path {path:?} resolved to object {resolved_oid} of type {object_type:?}, not a blob"
             ),
         ));
     }
@@ -2047,7 +2012,7 @@ fn parse_blame_target_preflight_record(
             ),
         )
     })?;
-    Ok(BlameTargetPreflight::Blob)
+    Ok(BlameTargetPreflight)
 }
 
 fn checked_add_usize(
@@ -2106,11 +2071,14 @@ fn blame_ranges(
         .output()
         .map_err(|error| git_spawn_error(&args, error))?;
     if !raw.status.success() {
-        // Narrow containment (#514): `fatal: no such path <p> in <rev>` is the
-        // one blame refusal that means "this path does not exist at the blamed
-        // revision" — reality, not a fault. Everything else stays fail-closed.
         if String::from_utf8_lossy(&raw.stderr).contains("no such path") {
-            return Ok(BlameOutcome::PathAbsent);
+            return Err(ArchaeologyError::new(
+                ASTRO_ARCHAEOLOGY_OBJECT_VIEW_INCONSISTENT,
+                format!(
+                    "Git cat-file proved old-side target parent {parent} path {path:?} is a blob, but grouped blame could not resolve the same target: {}",
+                    String::from_utf8_lossy(&raw.stderr).trim()
+                ),
+            ));
         }
         return Err(git_exit_error(&args, raw.status.code(), &raw.stderr));
     }
@@ -2239,7 +2207,7 @@ fn blame_ranges(
             format!("Git incremental blame returned no entries for non-empty ranges on {path:?}"),
         ));
     }
-    Ok(BlameOutcome::Blamed {
+    Ok(BlameOutcome {
         findings: findings.into_iter().collect(),
         returned_spans,
         stdout_bytes,
