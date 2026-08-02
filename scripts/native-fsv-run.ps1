@@ -159,6 +159,53 @@ function Invoke-GitRawCapture {
     }
 }
 
+function Read-GitStatusFingerprint {
+    param(
+        [Parameter(Mandatory)][string]$GitExe,
+        [Parameter(Mandatory)][string]$Workspace
+    )
+    $status = Invoke-GitRawCapture `
+        -GitExe $GitExe `
+        -Workspace $Workspace `
+        -Arguments @(
+            '-c',
+            'core.quotepath=false',
+            'status',
+            '--porcelain=v1',
+            '-z',
+            '--untracked-files=normal'
+        ) `
+        -Description 'git status --porcelain=v1 -z --untracked-files=normal'
+    if ($status.ExitCode -ne 0) {
+        Fail-Astro 'ASTRO_FSV_GIT_UNREADABLE' "git status --porcelain=v1 -z failed during evidence execution (exit=$($status.ExitCode), stderr=$($status.Stderr))" `
+            'repair repository state before evidence execution'
+    }
+    try {
+        $statusText = [Text.UTF8Encoding]::new($false, $true).GetString($status.Bytes)
+    }
+    catch {
+        Fail-Astro 'ASTRO_FSV_GIT_STATUS_UTF8_INVALID' "Git status emitted bytes that are not strict UTF-8 during evidence execution: $($_.Exception.Message)" `
+            'rename the unsupported Windows worktree path before executing evidence'
+    }
+    if ($status.Bytes.Length -gt 0 -and
+        $status.Bytes[$status.Bytes.Length - 1] -ne 0) {
+        Fail-Astro 'ASTRO_FSV_GIT_STATUS_TERMINAL_NUL_MISSING' `
+            'nonempty Git porcelain-v1 -z output lacks its terminal NUL during evidence execution' `
+            'repair or replace the native Git executable before executing evidence'
+    }
+    $parts = @($statusText.Split([char]0))
+    $records = if ($statusText.Length -eq 0) {
+        @()
+    }
+    else {
+        @($parts[0..($parts.Count - 2)])
+    }
+    return [ordered]@{
+        sha256 = ByteArray-Sha256 $status.Bytes
+        records = [string[]]$records
+    }
+}
+
 function Observe-ExitedProcessCode(
     [AstroFsvCreatedProcess]$Process
 ) {
@@ -283,22 +330,7 @@ function Remove-TerminalFsvLock {
 function Get-RepoState([string]$GitExe, [string]$Workspace) {
     $head = (& $GitExe -C $Workspace rev-parse HEAD).Trim().ToLowerInvariant()
     if ($LASTEXITCODE -ne 0) { Fail-Astro 'ASTRO_FSV_GIT_UNREADABLE' 'git rev-parse HEAD failed' 'repair repository state before evidence execution' }
-    $status = Invoke-GitRawCapture `
-        -GitExe $GitExe `
-        -Workspace $Workspace `
-        -Arguments @(
-            '-c',
-            'core.quotepath=false',
-            'status',
-            '--porcelain=v1',
-            '-z',
-            '--untracked-files=normal'
-        ) `
-        -Description 'git status --porcelain=v1 -z --untracked-files=normal'
-    if ($status.ExitCode -ne 0) {
-        Fail-Astro 'ASTRO_FSV_GIT_UNREADABLE' "git status --porcelain=v1 -z failed during evidence execution (exit=$($status.ExitCode), stderr=$($status.Stderr))" `
-            'repair repository state before evidence execution'
-    }
+    $status = Read-GitStatusFingerprint -GitExe $GitExe -Workspace $Workspace
     $diff = Invoke-GitRawCapture `
         -GitExe $GitExe `
         -Workspace $Workspace `
@@ -310,7 +342,8 @@ function Get-RepoState([string]$GitExe, [string]$Workspace) {
     }
     return [ordered]@{
         head_sha = $head
-        status_sha256 = ByteArray-Sha256 $status.Bytes
+        status_sha256 = [string]$status.sha256
+        status_records = [string[]]$status.records
         diff_sha256 = ByteArray-Sha256 $diff.Bytes
     }
 }
