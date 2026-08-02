@@ -66,7 +66,7 @@ CC_FOR_SHELL := $(subst \,/,$(CC))
 # probe FAILURE is refused instead of masquerading as those answers.
 CC_MACRO_DUMP := $(shell echo | $(CC_FOR_SHELL) -dM -E - 2>/dev/null)
 ifeq ($(strip $(CC_MACRO_DUMP)),)
-$(error [#387] Makefile.cbm could not probe the compiler predefined macros for CC="$(CC)". `echo | $(CC_FOR_SHELL) -dM -E -` produced no output, so the GCC-only -Wno-* suppression set and the Windows link libraries (-lws2_32/-lpsapi/-lshell32) cannot be selected deterministically. remediation: pass a working CC=/path/to/gcc (or clang) on the make command line, or bootstrap the pinned toolchain via `powershell -ExecutionPolicy Bypass -File scripts/windows-gnu-toolchain.ps1 -Issue <driving-issue> -Bootstrap`. Refusing to guess a warning-suppression / link contract.)
+$(error [#387] Makefile.cbm could not probe the compiler predefined macros for CC="$(CC)". `echo | $(CC_FOR_SHELL) -dM -E -` produced no output, so the GCC-only -Wno-* suppression set and the Windows link libraries (-lws2_32/-lpsapi/-lshell32) cannot be selected deterministically. remediation: pass a working CC=/path/to/clang (or gcc) on the make command line. On macOS the Xcode Command Line Tools supply clang — install them with `xcode-select --install`. Refusing to guess a warning-suppression / link contract.)
 endif
 # Clang defines both __GNUC__ and __clang__ and genuinely rejects unknown -Wno-*,
 # so it must classify as IS_GCC=no; a real GCC has __GNUC__ without __clang__.

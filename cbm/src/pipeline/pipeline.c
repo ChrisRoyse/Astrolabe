@@ -369,6 +369,12 @@ struct cbm_pipeline {
      * buffer before it is freed so the tool result can disclose the loss. */
     uint_least64_t ambiguous_reference_skips;
 
+    /* Count of ERROR/MISSING parse-recovery diagnostics recorded across every
+     * extracted file (#909). Nonzero means tree-sitter could not fully parse
+     * some source, so symbols in the named spans are absent from the graph.
+     * Surfaced so a degraded index can never be mistaken for a clean one. */
+    uint_least64_t parse_recovery_diagnostics;
+
     /* Reference edges skipped because an extracted non-empty enclosing
      * callable QN had no exact stable source atom. Kept separate from semantic
      * ambiguity so the success response identifies the actual degradation. */
@@ -630,6 +636,7 @@ cbm_pipeline_t *cbm_pipeline_new(const char *repo_path, const char *db_path,
     p->committed_nodes = -1;
     p->committed_edges = -1;
     p->ambiguous_reference_skips = 0;
+    p->parse_recovery_diagnostics = 0;
     p->unresolved_reference_source_skips = 0;
     atomic_init(&p->cancelled, 0);
 
@@ -1050,6 +1057,16 @@ void cbm_pipeline_set_ambiguous_reference_skips(cbm_pipeline_t *p, uint_least64_
 
 uint_least64_t cbm_pipeline_get_ambiguous_reference_skips(const cbm_pipeline_t *p) {
     return p ? p->ambiguous_reference_skips : 0;
+}
+
+void cbm_pipeline_set_parse_recovery_diagnostics(cbm_pipeline_t *p, uint_least64_t diagnostics) {
+    if (p) {
+        p->parse_recovery_diagnostics = diagnostics;
+    }
+}
+
+uint_least64_t cbm_pipeline_get_parse_recovery_diagnostics(const cbm_pipeline_t *p) {
+    return p ? p->parse_recovery_diagnostics : 0;
 }
 
 void cbm_pipeline_set_unresolved_reference_source_skips(cbm_pipeline_t *p, uint_least64_t skips) {

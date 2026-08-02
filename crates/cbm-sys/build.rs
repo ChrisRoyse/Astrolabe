@@ -402,19 +402,26 @@ fn verify_bindings(manifest_dir: &Path, generated: &str) {
 
     let committed = fs::read_to_string(&bindings_path).unwrap_or_else(|err| {
         panic!(
-            "failed to read committed bindings at {}: {err}. Run \
-             a native launcher build with ASTROLABE_BINDINGS_CANDIDATE set to one fresh \
-             absolute path below workspace .tmp, then inspect and promote that candidate \
-             after the launcher lease ends.",
+            "failed to read committed bindings at {}: {err}. Generate a candidate with \
+             ASTROLABE_BINDINGS_CANDIDATE set to an absolute path below the workspace .tmp \
+             directory, inspect it, then copy it to the path above.",
             bindings_path.display()
         )
     });
     if normalize_bindings(&committed) != normalize_bindings(&generated) {
         panic!(
-            "cbm-sys bindings are stale. Run a native launcher build with \
-             ASTROLABE_BINDINGS_CANDIDATE set to one fresh absolute path below workspace .tmp, \
-             inspect and promote that candidate after the launcher lease ends, then rerun this \
-             ordinary build."
+            "cbm-sys bindings are stale: the committed bindings at {} no longer match what \
+             bindgen produces from the current C headers. Regenerate, inspect, then promote:\n  \
+             1. ASTROLABE_BINDINGS_CANDIDATE=$PWD/.tmp/bindings-candidate.rs cargo build -p cbm-sys\n  \
+             2. diff {} .tmp/bindings-candidate.rs   # inspect before trusting\n  \
+             3. cp .tmp/bindings-candidate.rs {}\n  \
+             4. rerun the ordinary build\n\
+             Bindings are committed per target because clang and MSVC disagree on the underlying \
+             type of an unsigned C enum, so they cannot be shared across hosts and are never \
+             regenerated silently.",
+            bindings_path.display(),
+            bindings_path.display(),
+            bindings_path.display()
         );
     }
 }

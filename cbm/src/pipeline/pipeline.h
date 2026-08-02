@@ -157,6 +157,13 @@ void cbm_pipeline_get_phase_metrics(const cbm_pipeline_t *p,
  * an unreported skip is exactly the silent degradation invariant 3 forbids. */
 uint_least64_t cbm_pipeline_get_ambiguous_reference_skips(const cbm_pipeline_t *p);
 
+/* Parse-recovery diagnostics (#909): total ERROR/MISSING spans tree-sitter had
+ * to recover from across every extracted file. Nonzero means symbols in those
+ * spans are absent from the graph — a labeled, counted degradation, never a
+ * silent one. */
+void cbm_pipeline_set_parse_recovery_diagnostics(cbm_pipeline_t *p, uint_least64_t diagnostics);
+uint_least64_t cbm_pipeline_get_parse_recovery_diagnostics(const cbm_pipeline_t *p);
+
 /* Reference edges skipped because extraction asserted a non-empty enclosing
  * callable QN but no exact stable source atom owned the recorded path/line.
  * A successful index MUST disclose this count; such references are never

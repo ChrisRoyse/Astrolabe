@@ -29,36 +29,28 @@ The blueprint records *design*; it never records *progress*. All state — done,
 - `calyx/`, `cbm/` — the two parent trees, now owned first-class source (EPIC #286): edit them directly like any other code in this repo. No pins, no patch overlays, no upstream tracking.
 - `patches/cbm/` — Astrolabe-owned libcbm build glue (`Makefile.cbm` + the `ASTRO_*` translation units) compiled directly by `crates/cbm-sys/build.rs`. Not a patch-overlay directory (that machinery was dismantled in #286).
 
-## Building natively on Windows
+## Building natively on macOS (Apple Silicon)
 
-Build and manual-FSV evidence is produced with the native Windows GNU toolchain, because the Rust host and the static `libcbm.a` archive must share one ABI. All work runs from `C:\code\Astrolabe` with native Windows executables; for POSIX scripts use a Git for Windows bash (`C:\Program Files\Git\bin\bash.exe`) so the toolchain stays consistent. WSL may be installed and running on the machine — that is fine; project tooling does not detect, block on, or modify it.
+ASTROLABE is cross-platform, and its **primary evidence-bearing host is macOS on Apple Silicon**. Build and manual-FSV evidence is produced natively on `aarch64-apple-darwin`, because the Rust host and the static `libcbm.a` archive must share one ABI — here both are arm64 Mach-O. All work runs from `/Users/steveabbey/Documents/Astrolabe`, on `main`, with no launcher and no wrapper script.
 
 Prerequisites and toolchain facts:
 
-- Rust is pinned by `rust-toolchain.toml` (Rust 1.95, edition 2024) with the **`x86_64-pc-windows-gnu` host** — the C half is a static MinGW archive, so Rust and `libcbm.a` must share one ABI. The default MSVC host toolchain cannot perform that link.
-- The C half needs GNU Make and a C/C++ toolchain (`crates/cbm-sys/build.rs` respects `MAKE`/`CC`/`CXX`/`AR`) plus libclang for bindgen. A bare `cargo check --workspace` on a default Windows shell fails at `cbm-sys` with "program not found" until these exist.
-- Bootstrap everything pinned (Rust-CI-compatible GCC 14.1 bundle, LLVM 20.1 analysis bundle, Cppcheck 2.20.0 source build) with:
+- Rust is pinned by `rust-toolchain.toml` (Rust 1.95, edition 2024), host `aarch64-apple-darwin`.
+- The C half needs GNU Make and the Xcode Command Line Tools clang (`crates/cbm-sys/build.rs` respects `MAKE`/`CC`/`CXX`/`AR`) plus libclang for bindgen. Install with `xcode-select --install`.
+- Build the server:
 
-  ```powershell
-  powershell -ExecutionPolicy Bypass -File scripts\windows-gnu-toolchain.ps1 -Issue <driving-issue> -Bootstrap
+  ```sh
+  cargo build --release -p astrolabe-server
   ```
 
-- Claim and re-read the driving GitHub issue before launching. Run every native Cargo or C build command **through the launcher** so it selects the matching runtime and pinned analysis tools, confines child `TEMP`/`TMP`/`TMPDIR` to a launcher-owned workspace child, and lets the exact live owner remove its generation and `target/` on exit. A single command is passed as JSON:
+- For focused pure-Rust iteration, `cargo check -p <crate>` is fast. Anything touching `cbm-sys` also compiles `libcbm.a` through `patches/cbm/Makefile.cbm`.
+- `cbm-sys` bindings are **committed per target** (`src/bindings_macos.rs`, `src/bindings.rs`): clang and MSVC disagree on the underlying type of an unsigned C enum, so bindings cannot be shared across hosts. Regenerate the macOS bindings only when the C headers change, and commit the result.
+- Apple Silicon note: `-fvisibility=hidden` hides the entire `cbm_*` API on Mach-O, and Apple's `ld64` has no `@file` response-file syntax. Both are handled in `patches/cbm/Makefile.cbm`; see #900.
+- GPU: the Forge **Metal** backend (`calyx/crates/calyx-forge/src/metal/`) is the Apple Silicon path, behind the opt-in `metal` feature. It is never substituted automatically — GPU reductions accumulate in tree order, so a vault written with Metal will not byte-match one written with the CPU backend.
 
-  ```powershell
-  $toolArgs = '["check", "--workspace"]'
-  .\scripts\windows-gnu-toolchain.ps1 -Issue <driving-issue> -Command cargo -CommandArgsJson $toolArgs
-  ```
+**`target/` is disposable.** It is multi-gigabyte scratch, never persistent state. Build, promote the binary you intend to exercise out of `target/`, capture the FSV readback, then `rm -rf target/` and verify absence.
 
-  A contiguous check/build batch is one nested JSON plan owned by one launcher generation:
-
-  ```powershell
-  $batch = '[["cargo", "check", "--workspace"], ["cargo", "build", "--workspace"]]'
-  .\scripts\windows-gnu-toolchain.ps1 -Issue <driving-issue> -BatchCommandsJson $batch
-  ```
-
-- DLL search order matters: the MinGW `bin` directory must precede the Rust GNU host `bin` on `PATH` so `libstdc++-6.dll` loads its matching `libgcc_s_seh-1.dll`. The launcher arranges this; that is one reason not to bypass it.
-- For focused pure-Rust iteration, pass `check -p <crate> --all-targets` through the same launcher. Anything touching `cbm-sys` also exercises the pinned C toolchain.
+Windows and Linux remain supported targets and their platform branches stay in the tree, but they no longer gate any DoD.
 
 ## Manual Full State Verification
 
@@ -70,12 +62,12 @@ Astrolabe uses no test suite, aggregate gate, or CI/CD. Verification is a manual
 4. Manually exercise the happy path and at least three relevant boundaries, recording before/after state for each.
 5. Record the native command, commit SHA, artifact hash, execution context, and physical readback on the issue. A failure or unavailable observation is explicit evidence of a gap, never a pass.
 
-For an artifact that must run after Cargo output cleanup, stage it during the same issue-owned launcher lease with `scripts\native-fsv-artifact.ps1`, and execute/read it only through `scripts\native-fsv-run.ps1`. Follow the exact lifecycle in `CLAUDE.md`; never execute closure evidence directly from disposable `target/`.
+For an artifact that must run after `target/` is deleted, copy it out of `target/release/` to its install location first (`~/.astrolabe/bin/`), record its SHA-256 alongside the commit SHA of the built tree, and exercise that promoted copy. Never execute closure evidence directly from disposable `target/`.
 
 The complete Rust formatting inspection is:
 
-```powershell
-python scripts/native-cargo-fmt.py --all -- --check
+```sh
+cargo fmt --all -- --check
 ```
 
 Do not run bare `cargo fmt --all` on native Windows: upstream cargo-fmt builds one command line beyond the Windows limit for this workspace graph.

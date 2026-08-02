@@ -38,11 +38,12 @@ prove.
 > (`x86_64-pc-windows-gnu`) only**. It says nothing about Linux or macOS.
 > Windows-green is not cross-platform-green.
 
-Companion document: **`docs/port-phase-deferrals.md`** — the
-`DEFERRED[ASTRO_PORT_PHASE]` classification: why cross-platform evidence is
-deferred (not "CI-owned", not "a permanent gap", not "a runbook to run now"),
-and how to apply the label in a DoD clause. Category A below is the tabular
-index into it. (The former `ci/known-skips.md` / `ci/cbm-test-totals.md`
+Companion document: **`docs/port-phase-deferrals.md`** — **RETIRED 2026-08-01.**
+The Windows-only scope directive is withdrawn and `DEFERRED[ASTRO_PORT_PHASE]` is
+no longer a valid label. Cross-platform work is ordinary in-scope work, and macOS
+on Apple Silicon is the primary evidence-bearing host. Category A below is
+retained as the historical index; each token it lists now needs its own owner
+issue and closure condition rather than the retired port-phase umbrella. (The former `ci/known-skips.md` / `ci/cbm-test-totals.md`
 baselines were deleted with the gate suite; the measured `windows-x64-mingw`
 CBM baseline of record is 5764/18/0, recorded in the tracker.)
 

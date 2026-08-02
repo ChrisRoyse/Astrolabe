@@ -48,8 +48,8 @@ flags per artifact:
   `GCC_ONLY_FLAGS`, keeping both diagnostics on as `-Werror` everywhere.
 
 This per-artifact matrix is verified by Full State Verification (FSV), not a gate
-script: build each artifact natively through the launcher
-(`scripts/windows-gnu-toolchain.ps1`) and read back the compiled behavior — for
+script: build each artifact natively (`cargo build --release`, which drives this
+Makefile through `crates/cbm-sys/build.rs`) and read back the compiled behavior — for
 example, confirm a guarded symbol is present only in the artifacts whose
 `-DASTRO_*` flag the Makefile passes (`nm`/disassembly of `libcbm.a` vs the
 production binaries). The former `scripts/test-cbm-overlay-sources.py` gate was

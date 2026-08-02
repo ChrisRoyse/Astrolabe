@@ -147,25 +147,36 @@ codebase-memory-mcp install --dry-run
 
 That prints the specific config files the installer would modify without writing anything.
 
-## 6. Explicit Legacy Store Migration (Astrolabe native Windows)
+## 6. Explicit Legacy Store Migration
 
 Never rename, delete, upgrade, or reindex over an integrity/provenance-refused
-store by hand. From the canonical Astrolabe checkout, use the tracker-bound
-archive transaction with hashes measured from the exact current files and the
-reviewed native binary:
+store by hand. Measure hashes from the exact current files first, archive the
+legacy store, and only then reindex from the canonical checkout:
 
-```powershell
-.\scripts\migrate-cbm-store.ps1 `
-  -Issue 719 `
-  -Operation ArchiveAndReindex `
-  -LegacyDbPath 'C:\path\to\cache\legacy.db' `
-  -ExpectedDbSha256 '<64 lowercase hex characters>' `
-  -RepositoryPath 'C:\path\to\canonical\repository' `
-  -Project 'stable-alias' `
-  -BinaryPath 'C:\path\to\codebase-memory-mcp.exe' `
-  -ExpectedBinarySha256 '<64 lowercase hex characters>' `
-  -ExpectedSchemaVersion '<reviewed CBM_GRAPH_SCHEMA_VERSION integer>'
+```sh
+# 1. Measure what you are about to act on — record these on the driving issue.
+shasum -a 256 ~/.cache/codebase-memory-mcp/<project>.db
+shasum -a 256 ~/.astrolabe/bin/codebase-memory-mcp
+
+# 2. Archive by MOVE (never delete): the bytes stay recoverable.
+mkdir -p ~/.cache/codebase-memory-mcp/archive
+mv ~/.cache/codebase-memory-mcp/<project>.db \
+   ~/.cache/codebase-memory-mcp/archive/<project>.$(date +%Y%m%dT%H%M%S).db
+
+# 3. Reindex, then read the new store back and compare against the claim.
+astrolabe cli index_repository --args-file <(echo '{"repo_path":"/abs/path","mode":"full"}')
+sqlite3 ~/.cache/codebase-memory-mcp/<project>.db \
+  "SELECT 'nodes',COUNT(*) FROM nodes UNION ALL SELECT 'edges',COUNT(*) FROM edges;"
 ```
+
+> **Known gap:** removing a store while `_config.db` still references it makes the
+> next index take the unchanged route and fail closed with
+> `CBM_PIPELINE_UNCHANGED_STORE_DIGEST_MISSING`. Archive by move as above and
+> reindex in the same session; do not leave a dangling config entry.
+
+The former PowerShell migration script was deleted with the rest of the Windows
+harness (owner directive 2026-08-01); the transaction it encoded is the three
+measured steps above.
 
 The command retains exact no-write/no-delete-share handles over the complete
 DB/WAL/SHM family, publishes durable hash-linked intent/transition records,

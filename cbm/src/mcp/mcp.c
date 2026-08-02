@@ -6413,6 +6413,11 @@ static char *build_index_success_response(cbm_mcp_server_t *srv, yyjson_mut_doc 
      * field and a degraded index can never read as a clean one. */
     uint_least64_t ambiguous_skips = cbm_pipeline_get_ambiguous_reference_skips(p);
     yyjson_mut_obj_add_uint(doc, root, "ambiguous_reference_skips", (uint64_t)ambiguous_skips);
+    /* #909: a nonzero count means tree-sitter needed error recovery, so symbols
+     * in those spans are absent from the graph. Always emitted (0 on clean
+     * runs) so consumers can rely on the field rather than infer from silence. */
+    uint_least64_t parse_recovery = cbm_pipeline_get_parse_recovery_diagnostics(p);
+    yyjson_mut_obj_add_uint(doc, root, "parse_recovery_diagnostics", (uint64_t)parse_recovery);
     if (ambiguous_skips > 0) {
         yyjson_mut_obj_add_str(
             doc, root, "ambiguous_reference_hint",

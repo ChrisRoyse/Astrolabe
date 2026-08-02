@@ -61,7 +61,7 @@ const LEGACY_RUNTIME_ENVS: &[&str] = &["ORT_DYLIB_PATH", "CALYX_ORT_CAPI", "CALY
 const SYSTEM_MODULES: &[&str] = &["nvcuda.dll", "nvml.dll"];
 const CONTRACT_REMEDIATION: &str =
     "restore the checked-in CUDA 13 runtime lock and rebuild Astrolabe from the canonical checkout";
-const BUNDLE_REMEDIATION: &str = "run scripts\\windows-gnu-toolchain.ps1 -Issue 484 -Bootstrap from C:\\code\\Astrolabe, then start a new process without legacy CUDA/ORT path variables";
+const BUNDLE_REMEDIATION: &str = "restore the pinned CUDA 13 runtime bundle for this host, then start a new process with no legacy CUDA/ORT path variables set. Note: CUDA is unavailable on Apple Silicon — the Forge backend there is Metal (calyx-forge `metal` feature), not CUDA";
 const DEVICE_REMEDIATION: &str = "repair the pinned CUDA 13 runtime and NVIDIA driver, select a CUDA Runtime-visible physical GPU, and restart the process";
 
 const LOCK_BYTES: &[u8] = include_bytes!(concat!(

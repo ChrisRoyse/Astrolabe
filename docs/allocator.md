@@ -64,10 +64,13 @@ Mimalloc remains linked only for process APIs and shim/version checks, so ASan
 owns ordinary Rust and C allocation interception. The allocator-topology tests
 that assume the mimalloc global allocator are `#[cfg(not(cbm_sys_asan))]`.
 
-ASan is a sanitizer-on-Linux facility; **executing** an ASan build is
-`DEFERRED[ASTRO_PORT_PHASE]` (tracked on #238) under the Windows-only directive.
-The wiring above is present and compiled so the deferral is a scheduling choice,
-not a missing capability.
+ASan is a sanitizer-on-Linux facility. The Windows-only directive that formerly
+deferred it (`DEFERRED[ASTRO_PORT_PHASE]`, #238) is withdrawn as of 2026-08-01, so
+this is now an ordinary open gap rather than a scoped-out deferral. The wiring
+above is present and compiled, so executing an ASan build is a scheduling choice,
+not a missing capability. Note that macOS/Apple Silicon has no direct equivalent
+of the Linux ASan configuration described here; if ASan execution is wanted on
+this host it needs its own issue naming the Darwin approach.
 
 ## Topology verification (FSV)
 

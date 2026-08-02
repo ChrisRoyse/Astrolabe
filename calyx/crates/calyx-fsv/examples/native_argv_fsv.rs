@@ -2,7 +2,12 @@
 //!
 //! This is not a test or a gate. It reports the arguments the real process
 //! received from Windows as UTF-16 code units, so operators can independently
-//! compare process reality with the durable `native-fsv-run.ps1` record.
+//! compare process reality against what they believe they invoked.
+//!
+//! Windows-only by construction: it exists because Win32 argv is UTF-16 and
+//! round-trips through a command-line string. macOS/Apple Silicon passes argv
+//! as NUL-terminated UTF-8 with no such re-parsing, so the failure mode this
+//! artifact observes does not exist there and it has no Darwin counterpart.
 
 #[cfg(not(windows))]
 compile_error!("native_argv_fsv is a Windows-only FSV artifact");

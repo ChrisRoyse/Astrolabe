@@ -13,10 +13,10 @@ Branch and dirt:
 Recent commits:
 !`git log --oneline -8`
 
-Launcher lock:
-!`powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File scripts/launcher-lock-status.ps1 -LockPath .tmp/astrolabe-launcher.lock 2>&1; echo "classifier_exit=$?"`
+Host:
+!`uname -sm; sw_vers -productVersion 2>/dev/null | sed 's/^/macOS /'`
 
-target/:
+target/ (must be absent before new work):
 !`ls -d target 2>/dev/null || echo "(absent)"`
 
 In-progress issues:

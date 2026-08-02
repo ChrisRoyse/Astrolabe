@@ -58,7 +58,7 @@ const REQUIRED_ARTIFACT_VERSIONS: &[(&str, &str)] = &[
 ];
 const CONTRACT_REMEDIATION: &str =
     "restore the checked-in CUDA 13 runtime lock and rebuild Astrolabe from the canonical checkout";
-const BUNDLE_REMEDIATION: &str = "run scripts\\windows-gnu-toolchain.ps1 -Issue 484 -Bootstrap from C:\\code\\Astrolabe, then start a new process without legacy ORT path variables";
+const BUNDLE_REMEDIATION: &str = "restore the pinned ONNX Runtime bundle for this host, then start a new process with no legacy ORT path variables set";
 
 const LOCK_BYTES: &[u8] = include_bytes!(concat!(
     env!("CARGO_MANIFEST_DIR"),

@@ -2,6 +2,7 @@
 #include "arena.h" // CBMArena, cbm_arena_init/alloc/strdup/destroy
 #include "helpers.h"
 #include "lang_specs.h"
+#include "extract_node_stack.h" // TSNodeStack — parse-recovery diagnostic walk (#909)
 #include "extract_unified.h"
 #include "lsp/go_lsp.h"
 #include "lsp/c_lsp.h"
@@ -302,6 +303,80 @@ bool cbm_diagnostics_push(CBMParseDiagnosticArray *arr, CBMArena *a, CBMParseDia
         return false;
     arr->items[arr->count++] = diag;
     return true;
+}
+
+// --- Language-neutral parse-recovery diagnostics (#909) ---
+//
+// tree-sitter returns NULL only on timeout/cancellation or allocation failure.
+// Malformed source ALWAYS yields a non-NULL tree carrying ERROR and/or MISSING
+// nodes, because error recovery is the parser's design. A caller that checks
+// only `!tree` therefore walks a known-degraded tree as if it were clean, and
+// the symbols the parser could not recover vanish with no signal — a silent
+// degradation, which standing invariant 3 forbids.
+//
+// ERROR and MISSING are distinct and BOTH must be caught: MISSING nodes are
+// zero-width tokens the parser inserted to recover, and they are not reachable
+// through an (ERROR) query. `ts_node_is_error() || ts_node_is_missing()` is the
+// exact pair. See tree-sitter/tree-sitter#396.
+//
+// This is not a fallback: the index still completes and unaffected syntax stays
+// indexed. The degradation becomes labeled and counted instead of invisible.
+static bool cbm_add_parse_diagnostic(CBMExtractCtx *ctx, TSNode node, bool missing) {
+    if (!ctx || !ctx->result || !ctx->arena || ts_node_is_null(node)) {
+        return false;
+    }
+    uint32_t start = ts_node_start_byte(node);
+    uint32_t end = ts_node_end_byte(node);
+    CBMParseDiagnostic diag = {
+        .code = missing ? "CBM_PARSE_MISSING_TOKEN" : "CBM_PARSE_RECOVERY",
+        .operation = "parse",
+        .message = missing ? "the grammar inserted a missing token to recover at this exact "
+                             "source span; symbols in this span may be absent or wrong"
+                           : "the grammar required error recovery at this exact source span; "
+                             "symbols in this span may be absent or wrong",
+        .remediation = "inspect the exact span and repair the source; unaffected syntax in this "
+                       "file remains indexed with this degradation labeled and counted",
+        .node_type = ts_node_type(node),
+        .start_line = ts_node_start_point(node).row + 1,
+        .end_line = cbm_node_end_line_inclusive(node),
+        .start_byte = start,
+        .end_byte = end,
+        .is_missing = missing,
+    };
+    if (end > start && end <= (uint32_t)ctx->source_len) {
+        diag.source = cbm_arena_strndup(ctx->arena, ctx->source + start, (size_t)(end - start));
+        diag.source_len = end - start;
+    }
+    return cbm_diagnostics_push(&ctx->result->diagnostics, ctx->arena, diag);
+}
+
+// Walk the tree and record one diagnostic per ERROR/MISSING node. Callers MUST
+// gate this on ts_node_has_error(root): that is an O(1) flag read, so a clean
+// file pays nothing and only genuinely degraded files pay for the walk.
+static void cbm_record_parse_recovery_diagnostics(CBMExtractCtx *ctx) {
+    if (!ctx || ts_node_is_null(ctx->root)) {
+        return;
+    }
+    CBMArena scratch;
+    cbm_arena_init(&scratch);
+    TSNodeStack stack;
+    ts_nstack_init(&stack, &scratch, 128);
+    ts_nstack_push(&stack, &scratch, ctx->root);
+    while (stack.count > 0 && !cbm_arena_failed(ctx->arena)) {
+        TSNode node = ts_nstack_pop(&stack);
+        bool missing = ts_node_is_missing(node);
+        if (ts_node_is_error(node) || missing) {
+            cbm_add_parse_diagnostic(ctx, node, missing);
+            // An ERROR node's children are unrecognized fragments, not
+            // independent faults; descending would multiply one syntax error
+            // into a misleading pile of diagnostics. Record the span, stop.
+            if (!missing) {
+                continue;
+            }
+        }
+        ts_nstack_push_children(&stack, &scratch, node);
+    }
+    cbm_arena_destroy(&scratch);
 }
 
 // --- String input reader (for parse_with_options) ---
@@ -984,11 +1059,28 @@ static CBMFileResult *cbm_extract_file_impl(const char *source, int source_len,
             structured_classification_provenance,
     };
 
-    if (language == CBM_LANG_POWERSHELL) {
-        cbm_powershell_record_parse_diagnostics(&ctx);
-        if (!cbm_extract_arena_ok(result, "powershell_parse_diagnostics", rel_path)) {
+    // Parse-recovery accounting (#909). ts_node_has_error is an O(1) flag read
+    // covering both ERROR and MISSING descendants, so clean files — the
+    // overwhelming majority — pay nothing and never enter the walk.
+    if (ts_node_has_error(root)) {
+        if (language == CBM_LANG_POWERSHELL) {
+            // PowerShell keeps its more specific codes (Add-Type C# payloads
+            // are diagnosed separately from host-language recovery).
+            cbm_powershell_record_parse_diagnostics(&ctx);
+        } else {
+            cbm_record_parse_recovery_diagnostics(&ctx);
+        }
+        if (!cbm_extract_arena_ok(result, "parse_diagnostics", rel_path)) {
             goto extraction_failed;
         }
+        char diag_count_buf[32];
+        char lang_id_buf[32];
+        snprintf(diag_count_buf, sizeof(diag_count_buf), "%d", result->diagnostics.count);
+        snprintf(lang_id_buf, sizeof(lang_id_buf), "%d", (int)language);
+        cbm_log_warn("parse.recovery", "file", rel_path, "language_id", lang_id_buf, "diagnostics",
+                     diag_count_buf, "message",
+                     "tree-sitter required error recovery; symbols in the named spans may be "
+                     "absent from the graph");
     }
 
     // Run extractors: defs + imports use separate walks (unique recursion patterns),

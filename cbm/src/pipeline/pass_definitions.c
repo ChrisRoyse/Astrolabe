@@ -987,6 +987,10 @@ int cbm_pipeline_pass_definitions(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
         }
     }
 
+    /* Publish the parse-recovery total so the tool result can disclose a
+     * degraded index instead of reporting a clean run (#909). */
+    cbm_pipeline_set_parse_recovery_diagnostics(ctx->pipeline, (uint_least64_t)total_diagnostics);
+
     cbm_log_info("pass.done", "pass", "definitions", "defs", itoa_log(total_defs), "calls",
                  itoa_log(total_calls), "imports", itoa_log(total_imports), "diagnostics",
                  itoa_log(total_diagnostics), "errors", itoa_log(errors));
