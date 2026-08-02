@@ -125,8 +125,8 @@ static void handle_route_registration(cbm_pipeline_ctx_t *ctx, const CBMCall *ca
              cbm_route_canon_path(call->first_string_arg, cpath, sizeof(cpath)));
     char route_props[CBM_SZ_256];
     snprintf(route_props, sizeof(route_props), "{\"method\":\"%s\"}", method ? method : "ANY");
-    int64_t route_id = cbm_gbuf_upsert_node(ctx->gbuf, "Route", call->first_string_arg, route_qn,
-                                            "", 0, 0, route_props);
+    int64_t route_id =
+        cbm_route_upsert(ctx->gbuf, route_qn, call->first_string_arg, NULL, route_props);
     char esc_cn[CBM_SZ_256]; /* sliced source text: escape quotes/newlines */
     char esc_fa[CBM_SZ_256];
     cbm_json_escape(esc_cn, sizeof(esc_cn), call->callee_name);
@@ -192,7 +192,7 @@ static int64_t create_svc_route_node(cbm_pipeline_ctx_t *ctx, const char *url, c
     } else {
         snprintf(route_props, sizeof(route_props), "{}");
     }
-    return cbm_gbuf_upsert_node(ctx->gbuf, "Route", sane_url, route_qn, "", 0, 0, route_props);
+    return cbm_route_upsert(ctx->gbuf, route_qn, sane_url, NULL, route_props);
 }
 
 /* Finalize an edge's props and emit it. Mirrors finalize_and_emit() on the

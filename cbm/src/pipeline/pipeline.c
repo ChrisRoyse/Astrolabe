@@ -1538,8 +1538,8 @@ static int process_one_infra_binding(cbm_gbuf_t *gbuf, const CBMInfraBinding *ib
                                      const char *rel_path) {
     char url_route_qn[CBM_ROUTE_QN_SIZE];
     snprintf(url_route_qn, sizeof(url_route_qn), "__route__infra__%s", ib->target_url);
-    int64_t url_route_id = cbm_gbuf_upsert_node(gbuf, "Route", ib->target_url, url_route_qn,
-                                                rel_path, 0, 0, "{\"source\":\"infra\"}");
+    int64_t url_route_id =
+        cbm_route_upsert(gbuf, url_route_qn, ib->target_url, rel_path, "{\"source\":\"infra\"}");
     char topic_route_qn[CBM_ROUTE_QN_SIZE];
     snprintf(topic_route_qn, sizeof(topic_route_qn), "__route__%s__%s",
              ib->broker ? ib->broker : "async", ib->source_name);
@@ -1552,8 +1552,14 @@ static int process_one_infra_binding(cbm_gbuf_t *gbuf, const CBMInfraBinding *ib
          * upsert its Route node so the binding maps even when no code-side dispatch
          * call created the node first (e.g. a standalone scheduler/subscription
          * manifest). */
-        topic_route_id = cbm_gbuf_upsert_node(gbuf, "Route", ib->source_name, topic_route_qn,
-                                              rel_path, 0, 0, ib->broker ? ib->broker : "async");
+        /* Properties must be a well-formed JSON object on every path (#512):
+         * this passed the bare broker string (e.g. "kafka") as the properties
+         * column, which is not JSON and cost the binding its Route node. */
+        char topic_props[CBM_SZ_256];
+        snprintf(topic_props, sizeof(topic_props), "{\"broker\":\"%s\"}",
+                 ib->broker ? ib->broker : "async");
+        topic_route_id =
+            cbm_route_upsert(gbuf, topic_route_qn, ib->source_name, rel_path, topic_props);
         if (topic_route_id <= 0) {
             return 0;
         }
@@ -1637,7 +1643,7 @@ static void try_upsert_infra_route(cbm_gbuf_t *gbuf, const CBMStringRef *sr, con
     } else {
         snprintf(route_props, sizeof(route_props), "{\"source\":\"infra\"}");
     }
-    cbm_gbuf_upsert_node(gbuf, "Route", sr->value, route_qn, fp, 0, 0, route_props);
+    cbm_route_upsert(gbuf, route_qn, sr->value, fp, route_props);
 }
 
 /* A URL string_ref that does NOT denote a route the service serves: a value

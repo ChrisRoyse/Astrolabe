@@ -41,6 +41,27 @@
  * out_sz >= strlen(in) + 1 always suffices. Returns out. */
 const char *cbm_route_canon_path(const char *in, char *out, size_t out_sz);
 
+/* Upsert a Route node under the single-atom-per-QN invariant.
+ *
+ * A Route is a rendezvous identity (a URL, topic, or RPC name), not a source
+ * atom: its canonical identity is the QN. But atom identity (make_atom_id)
+ * also covers `name`, `file_path`, and the line span, so a caller that passes
+ * a raw path as the name or the defining file as file_path mints a *second*
+ * atom under one QN. The dump then refuses the whole corpus with
+ * CBM_NODE_QN_AMBIGUOUS. #512 fixed one instance of this class (a non-UTF-8
+ * byte reaching the QN raw); routing every Route creation through this helper
+ * makes the invariant structural instead of per-call-site discipline.
+ *
+ * The display name is therefore DERIVED from the QN payload, and the
+ * identity-bearing file_path/line fields are always empty. The raw path and
+ * the defining file are preserved as "path"/"def_file" properties, which are
+ * not part of atom identity.
+ *
+ * `props` must be a well-formed JSON object (or NULL/empty for "{}"); the
+ * extra members are spliced in. Returns the node id, or 0 on failure. */
+int64_t cbm_route_upsert(cbm_gbuf_t *gb, const char *route_qn, const char *raw_path,
+                         const char *def_file, const char *props);
+
 bool cbm_has_config_extension(const char *path);
 
 /* Only definitions that participate in code name resolution belong in the

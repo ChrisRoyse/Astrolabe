@@ -769,8 +769,8 @@ static void insert_def_into_gbuf(extract_worker_state_t *ws, const cbm_file_info
         char rprops[CBM_SZ_256];
         snprintf(rprops, sizeof(rprops), "{\"method\":\"%s\",\"source\":\"decorator\"}", rm);
         int64_t route_id =
-            cbm_gbuf_upsert_node(ws->local_gbuf, "Route", def->route_path, route_qn,
-                                 def->file_path ? def->file_path : fi->rel_path, 0, 0, rprops);
+            cbm_route_upsert(ws->local_gbuf, route_qn, def->route_path,
+                             def->file_path ? def->file_path : fi->rel_path, rprops);
         char hprops[CBM_SZ_512];
         char esc_h[CBM_SZ_512];
         cbm_json_escape(esc_h, sizeof(esc_h), def->qualified_name);
@@ -1755,7 +1755,7 @@ static int64_t build_service_route(cbm_gbuf_t *gbuf, const char *arg, const char
     } else {
         snprintf(route_props, sizeof(route_props), "{}");
     }
-    return cbm_gbuf_upsert_node(gbuf, "Route", arg, route_qn, "", 0, 0, route_props);
+    return cbm_route_upsert(gbuf, route_qn, arg, NULL, route_props);
 }
 
 /* Emit HTTP_CALLS or ASYNC_CALLS edge via Route node. */
@@ -1838,7 +1838,7 @@ static void emit_route_registration(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *sou
              cbm_route_canon_path(route_path, cpath, sizeof(cpath)));
     char rp[CBM_SZ_256];
     snprintf(rp, sizeof(rp), "{\"method\":\"%s\"}", method ? method : "ANY");
-    int64_t rid = cbm_gbuf_upsert_node(gbuf, "Route", route_path, rqn, "", 0, 0, rp);
+    int64_t rid = cbm_route_upsert(gbuf, rqn, route_path, NULL, rp);
     char esc_cn[CBM_SZ_256]; /* sliced source text: escape quotes/newlines */
     char esc_rp[CBM_SZ_512];
     cbm_json_escape(esc_cn, sizeof(esc_cn), call->callee_name);
@@ -1933,8 +1933,7 @@ static void detect_url_in_args(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *source,
         char cpath[CBM_SZ_256];
         snprintf(route_qn, sizeof(route_qn), "__route__ANY__%s",
                  cbm_route_canon_path(norm, cpath, sizeof(cpath)));
-        int64_t route_id = cbm_gbuf_upsert_node(gbuf, "Route", norm, route_qn, "", 0, 0,
-                                                "{\"source\":\"arg_url\"}");
+        int64_t route_id = cbm_route_upsert(gbuf, route_qn, norm, NULL, "{\"source\":\"arg_url\"}");
         char esc_c[CBM_SZ_256];
         char esc_n[CBM_SZ_256];
         cbm_json_escape(esc_c, sizeof(esc_c), call->callee_name);
@@ -2037,8 +2036,7 @@ static void emit_grpc_edge(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *source, cons
     char route_name[CBM_SZ_256];
     snprintf(route_name, sizeof(route_name), "%s/%s", service, method);
 
-    int64_t route_id = cbm_gbuf_upsert_node(gbuf, "Route", route_name, route_qn, "", 0, 0,
-                                            "{\"source\":\"grpc\"}");
+    int64_t route_id = cbm_route_upsert(gbuf, route_qn, route_name, NULL, "{\"source\":\"grpc\"}");
 
     /* service/method are parsed out of the callee QN: escape UTF-8-strict so a
      * bad byte can't corrupt the GRPC_CALLS edges.properties cell and make the
@@ -2081,7 +2079,7 @@ static void emit_graphql_edge(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *source, c
     snprintf(route_qn, sizeof(route_qn), "__graphql__%s", p);
 
     int64_t route_id =
-        cbm_gbuf_upsert_node(gbuf, "Route", p, route_qn, "", 0, 0, "{\"source\":\"graphql\"}");
+        cbm_route_upsert(gbuf, route_qn, p, NULL, "{\"source\":\"graphql\"}");
 
     char esc_c[CBM_SZ_256];
     cbm_json_escape(esc_c, sizeof(esc_c), call->callee_name);
@@ -2118,7 +2116,7 @@ static void emit_trpc_edge(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *source, cons
     snprintf(route_qn, sizeof(route_qn), "__trpc__%s", p);
 
     int64_t route_id =
-        cbm_gbuf_upsert_node(gbuf, "Route", p, route_qn, "", 0, 0, "{\"source\":\"trpc\"}");
+        cbm_route_upsert(gbuf, route_qn, p, NULL, "{\"source\":\"trpc\"}");
 
     char esc_c[CBM_SZ_256];
     cbm_json_escape(esc_c, sizeof(esc_c), call->callee_name);
