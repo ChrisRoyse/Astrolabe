@@ -54,7 +54,7 @@ Windows and Linux remain supported targets and their platform branches stay in t
 
 ## Manual Full State Verification
 
-Astrolabe uses no test suite, aggregate gate, or CI/CD. Verification is a manual comparison with reality, performed natively on Windows and recorded on the driving GitHub issue:
+Astrolabe uses no test suite, aggregate gate, or CI/CD. Verification is a manual comparison with reality, performed natively on macOS / Apple Silicon and recorded on the driving GitHub issue:
 
 1. Define the source of truth for the behavior: persisted database rows, graph bytes, files, process state, or another physical result.
 2. Build and exercise the real artifact against real data. Synthetic inputs are useful when their exact expected outputs are known; they are real inputs, not mocks.
