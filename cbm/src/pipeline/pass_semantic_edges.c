@@ -1576,9 +1576,18 @@ int cbm_pipeline_pass_semantic_edges(cbm_pipeline_ctx_t *ctx) {
         free(node_ptrs);
         return CBM_NOT_FOUND;
     }
+    int worker_count = cbm_default_worker_count(false);
+    if (worker_count <= 0) {
+        cbm_log_error("pass.semantic.worker_count_invalid", "code", "CBM_WORKER_COUNT_INVALID",
+                      "worker_count", itoa_log(worker_count), "message",
+                      "worker-count configuration is invalid", "remediation",
+                      "set CBM_WORKERS to an integer from 1 through 256 or remove it");
+        free(funcs);
+        free(node_ptrs);
+        return CBM_NOT_FOUND;
+    }
     CBM_PROF_START(t_phase1b);
-    if (!phase1b_decode_and_build(funcs, node_ptrs, gbuf, func_count,
-                                  cbm_default_worker_count(false))) {
+    if (!phase1b_decode_and_build(funcs, node_ptrs, gbuf, func_count, worker_count)) {
         CBM_PROF_END_N("semantic_edges", "1b_decode_build_parallel", t_phase1b, func_count);
         free(funcs);
         free(node_ptrs);
@@ -1595,7 +1604,6 @@ int cbm_pipeline_pass_semantic_edges(cbm_pipeline_ctx_t *ctx) {
     }
 
     /* Phase 2: Tokenize all nodes (PARALLEL) */
-    int worker_count = cbm_default_worker_count(false);
     char **all_tokens = malloc((size_t)func_count * sizeof(char *) * CBM_SEM_MAX_TOKENS);
     int *token_counts = calloc((size_t)func_count, sizeof(int));
     if (!all_tokens || !token_counts) {

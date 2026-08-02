@@ -330,6 +330,17 @@ int cbm_pipeline_pass_similarity(cbm_pipeline_ctx_t *ctx) {
     CBM_PROF_START(t_query_emit);
     _Atomic int *edge_counts = calloc((size_t)entry_count, sizeof(_Atomic int));
     int worker_count = cbm_default_worker_count(false);
+    if (worker_count <= 0) {
+        cbm_log_error("pass.similarity.worker_count_invalid", "code",
+                      "CBM_WORKER_COUNT_INVALID", "worker_count", itoa_log(worker_count),
+                      "message", "worker-count configuration is invalid", "remediation",
+                      "set CBM_WORKERS to an integer from 1 through 256 or remove it");
+        free(edge_counts);
+        free(lsh_entries);
+        free(entries);
+        cbm_lsh_free(lsh);
+        return CBM_NOT_FOUND;
+    }
     sim_edge_buf_t *worker_bufs = calloc((size_t)worker_count, sizeof(sim_edge_buf_t));
     if (!edge_counts || !worker_bufs) {
         cbm_log_error("pass.similarity.parallel_alloc_failed", "code",

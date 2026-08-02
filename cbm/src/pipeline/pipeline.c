@@ -1103,6 +1103,14 @@ static int effective_worker_count(bool initial) {
     return cbm_default_worker_count(initial);
 }
 
+static int reject_invalid_worker_count(const char *phase, int worker_count) {
+    cbm_log_error("pipeline.worker_count_invalid", "code", "CBM_WORKER_COUNT_INVALID", "phase",
+                  phase ? phase : "unknown", "worker_count", itoa_buf(worker_count), "message",
+                  "worker-count configuration is invalid", "remediation",
+                  "set CBM_WORKERS to an integer from 1 through 256 or remove it");
+    return CBM_NOT_FOUND;
+}
+
 /* Resolve the DB path for this pipeline. Caller must free(). */
 static char *resolve_db_path(const cbm_pipeline_t *p) {
     char *path = malloc(CBM_SZ_1K);
@@ -2945,14 +2953,27 @@ static int run_githistory(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx) {
     cbm_clock_gettime(CLOCK_MONOTONIC, &t_gh);
 
     cbm_githistory_result_t gh_result = {0};
-    cbm_thread_t gh_thread;
+    cbm_thread_t gh_thread = {0};
     bool gh_threaded = false;
     gh_compute_arg_t gh_arg = {.repo_path = ctx->repo_path, .result = &gh_result};
 
     if (p->mode != CBM_MODE_FAST) {
-        if (effective_worker_count(true) > SKIP_ONE) {
+        int worker_count = effective_worker_count(true);
+        if (worker_count <= 0) {
+            return reject_invalid_worker_count("githistory", worker_count);
+        }
+        if (worker_count > SKIP_ONE) {
             if (cbm_thread_create(&gh_thread, 0, gh_compute_thread_fn, &gh_arg) == 0) {
                 gh_threaded = true;
+            } else {
+                cbm_log_error("pipeline.githistory.dispatch_failed", "code",
+                              "CBM_GITHISTORY_THREAD_CREATE_FAILED", "error_domain",
+                              itoa_buf(gh_thread.error_domain), "error_code",
+                              itoa_buf((int)gh_thread.error_code), "message",
+                              "git-history worker thread could not be admitted", "remediation",
+                              "inspect worker resource limits and retry only after the resource "
+                              "condition changes");
+                return CBM_NOT_FOUND;
             }
         }
         if (!gh_threaded) {
@@ -2965,7 +2986,18 @@ static int run_githistory(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx) {
     }
 
     if (gh_threaded) {
-        cbm_thread_join(&gh_thread);
+        if (cbm_thread_join(&gh_thread) != 0) {
+            cbm_log_error("pipeline.githistory.dispatch_failed", "code",
+                          "CBM_GITHISTORY_THREAD_JOIN_FAILED", "error_domain",
+                          itoa_buf(gh_thread.error_domain), "error_code",
+                          itoa_buf((int)gh_thread.error_code), "message",
+                          "git-history worker thread could not be joined", "remediation",
+                          "inspect worker thread diagnostics and retry unchanged only after the "
+                          "thread state is understood");
+            free(gh_result.couplings);
+            free(gh_result.file_temporal);
+            return CBM_NOT_FOUND;
+        }
         cbm_log_info("pass.timing", "pass", "githistory_compute", "elapsed_ms",
                      itoa_buf((int)elapsed_ms(t_gh)));
     }
@@ -3061,6 +3093,10 @@ static int run_extraction_phase(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
         return CBM_NOT_FOUND;
     }
     int worker_count = effective_worker_count(true);
+    if (worker_count <= 0) {
+        cbm_pxc_destroy_rust_manifest(ctx);
+        return reject_invalid_worker_count("extraction", worker_count);
+    }
     CBM_PROF_START(t_extract_total);
     int rc = (worker_count > SKIP_ONE && file_count > MIN_FILES_FOR_PARALLEL)
                  ? run_parallel_pipeline(p, ctx, files, file_count, worker_count, &t)

@@ -57,6 +57,8 @@ static const char *status_code(cbm_parallel_dispatch_status_t status) {
         return "CBM_PARALLEL_DISPATCH_THREAD_CREATE_FAILED";
     case CBM_PARALLEL_DISPATCH_THREAD_JOIN_FAILED:
         return "CBM_PARALLEL_DISPATCH_THREAD_JOIN_FAILED";
+    case CBM_PARALLEL_DISPATCH_WORKER_CONFIG_INVALID:
+        return "CBM_PARALLEL_DISPATCH_WORKER_CONFIG_INVALID";
     }
     return "CBM_PARALLEL_DISPATCH_UNKNOWN";
 }
@@ -252,10 +254,14 @@ int cbm_parallel_for(int count, cbm_parallel_fn fn, void *ctx, cbm_parallel_for_
     if (requested_workers <= 0) {
         requested_workers = cbm_default_worker_count(true);
     }
-    if (requested_workers < WP_MIN) {
-        requested_workers = SKIP_ONE;
-    }
     init_result(result, count, requested_workers, opts.operation);
+
+    if (requested_workers < WP_MIN) {
+        mark_failure(result, CBM_PARALLEL_DISPATCH_WORKER_CONFIG_INVALID, -1,
+                     CBM_THREAD_ERROR_NONE, 0);
+        log_dispatch_result(result);
+        return CBM_NOT_FOUND;
+    }
 
     if (count <= 0) {
         if (result) {

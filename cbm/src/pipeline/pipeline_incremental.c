@@ -689,6 +689,13 @@ static int run_extract_resolve(cbm_pipeline_ctx_t *ctx, cbm_file_info_t *changed
 
 #define MIN_FILES_FOR_PARALLEL_INCR 50
     int worker_count = cbm_default_worker_count(true);
+    if (worker_count <= 0) {
+        cbm_log_error("incremental.worker_count_invalid", "code", "CBM_WORKER_COUNT_INVALID",
+                      "worker_count", itoa_buf(worker_count), "message",
+                      "worker-count configuration is invalid", "remediation",
+                      "set CBM_WORKERS to an integer from 1 through 256 or remove it");
+        return CBM_NOT_FOUND;
+    }
     bool use_parallel = (worker_count > SKIP_ONE && ci > MIN_FILES_FOR_PARALLEL_INCR);
 
     if (use_parallel) {

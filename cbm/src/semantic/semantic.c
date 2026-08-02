@@ -1087,6 +1087,19 @@ int cbm_sem_corpus_add_docs_batch(cbm_sem_corpus_t *corpus, char **all_tokens,
     /* Phase B (PARALLEL): Resolve tokens → IDs and count doc_freq per entry.
      * token_map is now read-only; each worker owns its doc range (no writes
      * to shared state except atomic doc_freq counters). */
+    int worker_count = cbm_default_worker_count(false);
+    if (worker_count <= 0) {
+        char worker_buf[CBM_SZ_32];
+        snprintf(worker_buf, sizeof(worker_buf), "%d", worker_count);
+        corpus_rollback_entries(corpus, base_entry_count);
+        cbm_log_error("semantic.corpus.worker_count_invalid", "code",
+                      "CBM_WORKER_COUNT_INVALID", "operation", "add_docs_batch",
+                      "worker_count", worker_buf, "message",
+                      "worker-count configuration is invalid", "remediation",
+                      "set CBM_WORKERS to an integer from 1 through 256 or remove it");
+        return CBM_NOT_FOUND;
+    }
+
     size_t atomic_count = corpus->entry_count > 0 ? (size_t)corpus->entry_count : (size_t)SKIP_ONE;
     _Atomic int *doc_freq_atomic = calloc(atomic_count, sizeof(_Atomic int));
     if (!doc_freq_atomic) {
@@ -1096,7 +1109,6 @@ int cbm_sem_corpus_add_docs_batch(cbm_sem_corpus_t *corpus, char **all_tokens,
         return CBM_NOT_FOUND;
     }
 
-    int worker_count = cbm_default_worker_count(false);
     batch_resolve_ctx_t bc = {
         .corpus = corpus,
         .all_tokens = all_tokens,
@@ -1779,6 +1791,16 @@ bool cbm_sem_corpus_finalize(cbm_sem_corpus_t *corpus) {
     }
 
     int worker_count = cbm_default_worker_count(false);
+    if (worker_count <= 0) {
+        char worker_buf[CBM_SZ_32];
+        snprintf(worker_buf, sizeof(worker_buf), "%d", worker_count);
+        cbm_log_error("semantic.corpus.worker_count_invalid", "code",
+                      "CBM_WORKER_COUNT_INVALID", "operation", "finalize",
+                      "worker_count", worker_buf, "message",
+                      "worker-count configuration is invalid", "remediation",
+                      "set CBM_WORKERS to an integer from 1 through 256 or remove it");
+        return false;
+    }
     cbm_parallel_for_opts_t opts = {.max_workers = worker_count, .force_pthreads = false};
 
     /* Finer chunks = better load balancing for skewed token distributions. */
