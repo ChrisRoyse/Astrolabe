@@ -1,6 +1,6 @@
 use super::*;
 
-use std::io::Write;
+use std::io::{BufRead, BufReader, Read, Write};
 use std::process::{Child, Command, Stdio};
 
 use astrolabe_anchors::archaeology::{
@@ -28,6 +28,7 @@ const ARCHAEOLOGY_ACTOR: &str = "astrolabe-git-archaeology";
 const ARCHAEOLOGY_ANCHOR_BATCH_ENV: &str = "ASTRO_ARCHAEOLOGY_ANCHOR_BATCH_ENTRIES";
 const ARCHAEOLOGY_HISTORICAL_BATCH_ENV: &str = "ASTRO_ARCHAEOLOGY_HISTORICAL_BATCH_GROUPS";
 const ARCHAEOLOGY_DIFF_TREE_BATCH_ENV: &str = "ASTRO_ARCHAEOLOGY_DIFF_TREE_BATCH_COMMITS";
+const HISTORICAL_CAT_FILE_BATCH_PATHS: usize = 4096;
 
 /// Write-side prefix for the transient git-archaeology scratch STORE this module
 /// drops into the CBM store dir: the historical-index scratch database
@@ -229,8 +230,20 @@ pub(crate) struct GitArchaeologyImportReport {
     pub(crate) blame_requested_ranges: usize,
     /// Exact union ranges after overlap/adjacency coalescing.
     pub(crate) blame_effective_ranges: usize,
+    /// Distinct parent/path groups submitted to Git blame.
+    pub(crate) blame_groups: usize,
+    /// Commit-local blame requests served by an already-mined parent/path group.
+    pub(crate) blame_group_cache_hits: usize,
     /// Native incremental-blame processes spawned.
     pub(crate) blame_processes: usize,
+    /// Per-request blame processes avoided by parent/path grouping.
+    pub(crate) blame_processes_avoided: usize,
+    /// Cat-file batch-command preflight processes spawned before blame.
+    pub(crate) blame_cat_file_processes: usize,
+    /// Exact cat-file preflight stdout volume.
+    pub(crate) blame_cat_file_stdout_bytes: u64,
+    /// Parent/path groups proved absent by cat-file preflight.
+    pub(crate) blame_path_absent_groups: usize,
     /// Strictly parsed incremental protocol spans.
     pub(crate) blame_returned_spans: usize,
     /// Distinct attributed result lines retained.
@@ -239,6 +252,8 @@ pub(crate) struct GitArchaeologyImportReport {
     pub(crate) blame_stdout_bytes: u64,
     /// Wall time spent in grouped incremental blame.
     pub(crate) blame_wall_ms: u64,
+    /// Wall time spent in cat-file preflight.
+    pub(crate) blame_cat_file_wall_ms: u64,
     /// Scratch worktrees / SQLite files that survived the bounded cleanup retry
     /// budget and were left on disk. Surfaced as a labeled count (invariant 3):
     /// a cleanup that cannot complete degrades to a counted remnant, never a
@@ -274,13 +289,22 @@ pub(crate) struct GitArchaeologyImportReport {
     /// Subset of post-success worker recycles caused by cleanup not reaching the
     /// next-request loop before the existing extraction timeout expired.
     pub(crate) historical_post_success_cleanup_timeouts: usize,
-    /// Git processes used to create commit-bound temporary indexes and enumerate
-    /// their exact paths (two per historical commit).
+    /// Git processes used to resolve historical commit/path inventory. The default
+    /// file-scoped path uses bounded cat-file object-info batches; the non-default
+    /// whole-subtree measurement path still uses a temporary index inventory.
     pub(crate) historical_git_inventory_processes: usize,
     /// Git checkout-index processes used to materialize non-empty commit views.
     pub(crate) historical_git_checkout_processes: usize,
+    /// Git cat-file processes used to stream filtered historical file bytes.
+    pub(crate) historical_git_cat_file_processes: usize,
+    /// Exact stdout bytes emitted by historical materialization cat-file batches.
+    pub(crate) historical_git_cat_file_stdout_bytes: u64,
     /// Exact files materialized from commit-bound temporary indexes.
     pub(crate) historical_git_files_materialized: usize,
+    /// Requested implicated paths absent at their historical commit. This is a
+    /// labeled expected state for deleted/renamed evidence paths, never a silent
+    /// materialization miss.
+    pub(crate) historical_git_paths_absent: usize,
     /// Materialized files recognized by the exact libcbm language resolver.
     pub(crate) historical_git_source_files_materialized: usize,
     /// Commit views with no recognized source file, routed directly to an explicit
@@ -603,11 +627,18 @@ pub(crate) fn run_git_archaeology<C: Clock>(
         diff_tree_batch_limit_commits: mined.diff_tree.batch_limit_commits,
         blame_requested_ranges: mined.blame.requested_ranges,
         blame_effective_ranges: mined.blame.effective_ranges,
+        blame_groups: mined.blame.groups,
+        blame_group_cache_hits: mined.blame.group_cache_hits,
         blame_processes: mined.blame.processes,
+        blame_processes_avoided: mined.blame.processes_avoided,
+        blame_cat_file_processes: mined.blame.cat_file_processes,
+        blame_cat_file_stdout_bytes: mined.blame.cat_file_stdout_bytes,
+        blame_path_absent_groups: mined.blame.path_absent_groups,
         blame_returned_spans: mined.blame.returned_spans,
         blame_returned_lines: mined.blame.returned_lines,
         blame_stdout_bytes: mined.blame.stdout_bytes,
         blame_wall_ms: mined.blame.wall_ms,
+        blame_cat_file_wall_ms: mined.blame.cat_file_wall_ms,
         archaeology_source,
         git_root: git_root.clone(),
         pathspec,
@@ -672,7 +703,10 @@ pub(crate) fn run_git_archaeology<C: Clock>(
         report.historical_paths_windows_invalid += indexed.windows_invalid_excluded;
         report.historical_git_inventory_processes += indexed.git_inventory_processes;
         report.historical_git_checkout_processes += indexed.git_checkout_processes;
+        report.historical_git_cat_file_processes += indexed.git_cat_file_processes;
+        report.historical_git_cat_file_stdout_bytes += indexed.git_cat_file_stdout_bytes;
         report.historical_git_files_materialized += indexed.files_materialized;
+        report.historical_git_paths_absent += indexed.paths_absent;
         report.historical_git_source_files_materialized += indexed.source_files_materialized;
         report.historical_commits_without_materialized_source +=
             usize::from(indexed.source_files_materialized == 0);
@@ -700,8 +734,9 @@ pub(crate) fn run_git_archaeology<C: Clock>(
                 "ASTRO_ARCHAEOLOGY_HISTORICAL_INDEX_FAILED: commit={commit} \
                  evidence_in_group={} historical_commits_crashed={} cleanup_remnants={} \
                  windows_invalid_excluded={} files_materialized={} \
-                 source_files_materialized={} git_inventory_processes={} \
-                 git_checkout_processes={} object_probe_processes_avoided={} \
+                 source_files_materialized={} paths_absent={} git_inventory_processes={} \
+                 git_checkout_processes={} git_cat_file_processes={} \
+                 git_cat_file_stdout_bytes={} object_probe_processes_avoided={} \
                  worktree_mutations_avoided={} evidence_total={} \
                  evidence_without_symbol_before={} detail={detail}; \
                  remediation=\"preserve the vault and archaeology scratch evidence; \
@@ -713,8 +748,11 @@ pub(crate) fn run_git_archaeology<C: Clock>(
                 report.historical_paths_windows_invalid,
                 indexed.files_materialized,
                 indexed.source_files_materialized,
+                indexed.paths_absent,
                 report.historical_git_inventory_processes,
                 report.historical_git_checkout_processes,
+                report.historical_git_cat_file_processes,
+                report.historical_git_cat_file_stdout_bytes,
                 indexed.object_probe_processes_avoided,
                 report.historical_git_worktree_mutations_avoided,
                 evidence.len(),
@@ -2780,7 +2818,10 @@ struct HistoricalCommitIndex {
     windows_invalid_excluded: usize,
     git_inventory_processes: usize,
     git_checkout_processes: usize,
+    git_cat_file_processes: usize,
+    git_cat_file_stdout_bytes: u64,
     files_materialized: usize,
+    paths_absent: usize,
     source_files_materialized: usize,
     object_probe_processes_avoided: usize,
     /// #515: `Some(detail)` when the isolated CBM extraction child died without
@@ -2796,7 +2837,10 @@ struct HistoricalMaterialization {
     windows_invalid_excluded: usize,
     git_inventory_processes: usize,
     git_checkout_processes: usize,
+    git_cat_file_processes: usize,
+    git_cat_file_stdout_bytes: u64,
     files_materialized: usize,
+    paths_absent: usize,
     object_probe_processes_avoided: usize,
 }
 
@@ -2952,7 +2996,10 @@ fn index_historical_commit(
                 windows_invalid_excluded: materialized.windows_invalid_excluded,
                 git_inventory_processes: materialized.git_inventory_processes,
                 git_checkout_processes: materialized.git_checkout_processes,
+                git_cat_file_processes: materialized.git_cat_file_processes,
+                git_cat_file_stdout_bytes: materialized.git_cat_file_stdout_bytes,
                 files_materialized: materialized.files_materialized,
+                paths_absent: materialized.paths_absent,
                 source_files_materialized,
                 object_probe_processes_avoided: materialized.object_probe_processes_avoided,
                 crashed: None,
@@ -2988,7 +3035,10 @@ fn index_historical_commit(
                 windows_invalid_excluded: materialized.windows_invalid_excluded,
                 git_inventory_processes: materialized.git_inventory_processes,
                 git_checkout_processes: materialized.git_checkout_processes,
+                git_cat_file_processes: materialized.git_cat_file_processes,
+                git_cat_file_stdout_bytes: materialized.git_cat_file_stdout_bytes,
                 files_materialized: materialized.files_materialized,
+                paths_absent: materialized.paths_absent,
                 source_files_materialized,
                 object_probe_processes_avoided: materialized.object_probe_processes_avoided,
                 crashed: Some(detail),
@@ -3171,7 +3221,10 @@ fn preserve_historical_crash_artifacts(
             "windows_invalid_excluded": materialized.windows_invalid_excluded,
             "git_inventory_processes": materialized.git_inventory_processes,
             "git_checkout_processes": materialized.git_checkout_processes,
+            "git_cat_file_processes": materialized.git_cat_file_processes,
+            "git_cat_file_stdout_bytes": materialized.git_cat_file_stdout_bytes,
             "object_probe_processes_avoided": materialized.object_probe_processes_avoided,
+            "paths_absent": materialized.paths_absent,
             "checkout_inventory": tree_inventory.to_json(),
             "database_inventory": database_inventory.to_json(),
             "pool_inventory": pool_inventory.to_json(),
@@ -3657,12 +3710,13 @@ fn git_checked(repo: &Path, args: &[&str]) -> Result<(), DynError> {
 
 /// Materializes one historical view without registering a shared Git worktree.
 ///
-/// `read-tree` publishes the exact commit into a scope-private temporary index;
-/// one NUL-safe `ls-files` inventory replaces N `cat-file -e` processes; and one
-/// `checkout-index` applies Git's native checkout conversion, modes, symlink policy,
-/// and historical index attributes. The checkout therefore retains Git semantics
-/// that a raw-blob materializer would lose while removing repository metadata churn
-/// and command-line/path-count limits.
+/// The default file-scoped path does not create a temporary Git index. It resolves
+/// exact `commit:path` blobs with one bounded `cat-file --batch-command --buffer
+/// -Z` object-info process, then streams checkout-filtered bytes with one
+/// `cat-file --batch --filters -Z --buffer` process. The non-default
+/// whole-subtree measurement path keeps the older scope-private index +
+/// `checkout-index` route because it intentionally materializes a complete
+/// subtree for parity measurements.
 fn materialize_historical_tree(
     repo: &Path,
     scope: &Path,
@@ -3686,6 +3740,51 @@ fn materialize_historical_tree(
         )
         .into()
     })?;
+    let mut windows_invalid_excluded = 0usize;
+    let mut object_probe_processes_avoided = 0usize;
+    if file_scoped {
+        let mut requested = BTreeSet::new();
+        for rel in implicated_files {
+            let toplevel_path = if corpus_rel.is_empty() {
+                rel.clone()
+            } else {
+                format!("{corpus_rel}/{rel}")
+            };
+            if toplevel_path.is_empty()
+                || toplevel_path.starts_with('/')
+                || toplevel_path
+                    .split('/')
+                    .any(|component| component.is_empty() || component == "." || component == "..")
+            {
+                return Err(format!(
+                    "ASTRO_ARCHAEOLOGY_PATH_INVALID: commit {commit} has an implicated path outside the corpus: {toplevel_path:?}; correct the mined evidence before retrying"
+                )
+                .into());
+            }
+            if let Some(reason) = windows_invalid_path(toplevel_path.as_bytes()) {
+                eprintln!(
+                    "astro.archaeology.windows_invalid_path commit={commit} path={toplevel_path:?} reason={reason}"
+                );
+                windows_invalid_excluded += 1;
+                continue;
+            }
+            requested.insert(toplevel_path);
+        }
+        object_probe_processes_avoided = requested.len();
+        let materialized =
+            materialize_file_scoped_historical_blobs(repo, checkout_root, commit, &requested)?;
+        return Ok(HistoricalMaterialization {
+            windows_invalid_excluded,
+            git_inventory_processes: 0,
+            git_checkout_processes: 0,
+            git_cat_file_processes: materialized.git_cat_file_processes,
+            git_cat_file_stdout_bytes: materialized.stdout_bytes,
+            files_materialized: materialized.files_materialized,
+            paths_absent: materialized.paths_absent,
+            object_probe_processes_avoided,
+        });
+    }
+
     let index = scope.join("index");
     git_index_checked(repo, &index, &["read-tree", commit])?;
 
@@ -3720,66 +3819,31 @@ fn materialize_historical_tree(
         inventory.insert(path.to_string());
     }
 
-    let mut windows_invalid_excluded = 0usize;
-    let mut object_probe_processes_avoided = 0usize;
-    let selected = if file_scoped {
-        let mut requested = BTreeSet::new();
-        for rel in implicated_files {
-            let toplevel_path = if corpus_rel.is_empty() {
-                rel.clone()
-            } else {
-                format!("{corpus_rel}/{rel}")
-            };
-            if toplevel_path.is_empty()
-                || toplevel_path.starts_with('/')
-                || toplevel_path.split('/').any(|component| component == "..")
-            {
-                return Err(format!(
-                    "ASTRO_ARCHAEOLOGY_PATH_INVALID: commit {commit} has an implicated path outside the corpus: {toplevel_path:?}; correct the mined evidence before retrying"
-                )
-                .into());
-            }
-            if let Some(reason) = windows_invalid_path(toplevel_path.as_bytes()) {
-                eprintln!(
-                    "astro.archaeology.windows_invalid_path commit={commit} path={toplevel_path:?} reason={reason}"
-                );
-                windows_invalid_excluded += 1;
-                continue;
-            }
-            requested.insert(toplevel_path);
-        }
-        object_probe_processes_avoided = requested.len();
-        requested
-            .intersection(&inventory)
-            .cloned()
-            .collect::<BTreeSet<_>>()
+    let prefix = if corpus_rel.is_empty() {
+        None
     } else {
-        let prefix = if corpus_rel.is_empty() {
-            None
-        } else {
-            Some(format!("{corpus_rel}/"))
-        };
-        inventory
-            .into_iter()
-            .filter(|path| {
-                corpus_rel.is_empty()
-                    || path == corpus_rel
-                    || prefix
-                        .as_ref()
-                        .is_some_and(|prefix| path.starts_with(prefix))
-            })
-            .map(|path| {
-                if let Some(reason) = windows_invalid_path(path.as_bytes()) {
-                    Err(format!(
-                        "ASTRO_ARCHAEOLOGY_WINDOWS_PATH_UNREPRESENTABLE: commit {commit} path {path:?} cannot be materialized on Windows ({reason}); use file-scoped archaeology or correct the corpus before retrying"
-                    )
-                    .into())
-                } else {
-                    Ok(path)
-                }
-            })
-            .collect::<Result<BTreeSet<_>, DynError>>()?
+        Some(format!("{corpus_rel}/"))
     };
+    let selected = inventory
+        .into_iter()
+        .filter(|path| {
+            corpus_rel.is_empty()
+                || path == corpus_rel
+                || prefix
+                    .as_ref()
+                    .is_some_and(|prefix| path.starts_with(prefix))
+        })
+        .map(|path| {
+            if let Some(reason) = windows_invalid_path(path.as_bytes()) {
+                Err(format!(
+                    "ASTRO_ARCHAEOLOGY_WINDOWS_PATH_UNREPRESENTABLE: commit {commit} path {path:?} cannot be materialized on Windows ({reason}); use file-scoped archaeology or correct the corpus before retrying"
+                )
+                .into())
+            } else {
+                Ok(path)
+            }
+        })
+        .collect::<Result<BTreeSet<_>, DynError>>()?;
 
     let git_checkout_processes = usize::from(!selected.is_empty());
     if !selected.is_empty() {
@@ -3831,9 +3895,562 @@ fn materialize_historical_tree(
         windows_invalid_excluded,
         git_inventory_processes: 2,
         git_checkout_processes,
+        git_cat_file_processes: 0,
+        git_cat_file_stdout_bytes: 0,
         files_materialized: selected.len(),
+        paths_absent: 0,
         object_probe_processes_avoided,
     })
+}
+
+struct FileScopedHistoricalBlobMaterialization {
+    git_cat_file_processes: usize,
+    stdout_bytes: u64,
+    files_materialized: usize,
+    paths_absent: usize,
+}
+
+#[derive(Debug, Clone)]
+struct HistoricalBlobObject {
+    path: String,
+    object_oid: String,
+    object_mode: String,
+    object_size: u64,
+}
+
+fn materialize_file_scoped_historical_blobs(
+    repo: &Path,
+    checkout_root: &Path,
+    commit: &str,
+    requested: &BTreeSet<String>,
+) -> Result<FileScopedHistoricalBlobMaterialization, DynError> {
+    let mut report = FileScopedHistoricalBlobMaterialization {
+        git_cat_file_processes: 0,
+        stdout_bytes: 0,
+        files_materialized: 0,
+        paths_absent: 0,
+    };
+    if requested.is_empty() {
+        return Ok(report);
+    }
+
+    let requested_paths = requested.iter().map(String::as_str).collect::<Vec<_>>();
+    for chunk in requested_paths.chunks(HISTORICAL_CAT_FILE_BATCH_PATHS) {
+        let (objects, info_stdout_bytes, paths_absent) =
+            resolve_file_scoped_historical_blobs(repo, commit, chunk)?;
+        report.git_cat_file_processes = report.git_cat_file_processes.checked_add(1).ok_or_else(
+            || -> DynError {
+                "ASTRO_ARCHAEOLOGY_CAT_FILE_TELEMETRY_OVERFLOW: cat-file process count overflowed"
+                    .into()
+            },
+        )?;
+        report.stdout_bytes = report
+            .stdout_bytes
+            .checked_add(info_stdout_bytes)
+            .ok_or_else(|| -> DynError {
+                "ASTRO_ARCHAEOLOGY_CAT_FILE_TELEMETRY_OVERFLOW: cat-file stdout bytes overflowed"
+                    .into()
+            })?;
+        report.paths_absent =
+            report
+                .paths_absent
+                .checked_add(paths_absent)
+                .ok_or_else(|| -> DynError {
+                    format!(
+                        "ASTRO_ARCHAEOLOGY_CAT_FILE_ABSENT_OVERFLOW: commit {commit} absent path count overflowed"
+                    )
+                    .into()
+                })?;
+        if objects.is_empty() {
+            continue;
+        }
+
+        let streamed = stream_file_scoped_historical_blobs(repo, checkout_root, &objects)?;
+        report.git_cat_file_processes = report.git_cat_file_processes.checked_add(1).ok_or_else(
+            || -> DynError {
+                "ASTRO_ARCHAEOLOGY_CAT_FILE_TELEMETRY_OVERFLOW: cat-file process count overflowed"
+                    .into()
+            },
+        )?;
+        report.stdout_bytes = report
+            .stdout_bytes
+            .checked_add(streamed.stdout_bytes)
+            .ok_or_else(|| -> DynError {
+                "ASTRO_ARCHAEOLOGY_CAT_FILE_TELEMETRY_OVERFLOW: cat-file stdout bytes overflowed"
+                    .into()
+            })?;
+        report.files_materialized = report
+            .files_materialized
+            .checked_add(streamed.files_materialized)
+            .ok_or_else(|| -> DynError {
+                "ASTRO_ARCHAEOLOGY_CAT_FILE_MATERIALIZED_OVERFLOW: materialized file count overflowed"
+                    .into()
+            })?;
+    }
+    Ok(report)
+}
+
+fn resolve_file_scoped_historical_blobs(
+    repo: &Path,
+    commit: &str,
+    requested: &[&str],
+) -> Result<(Vec<HistoricalBlobObject>, u64, usize), DynError> {
+    let mut input = Vec::new();
+    for path in requested {
+        input.extend_from_slice(b"info ");
+        input.extend_from_slice(commit.as_bytes());
+        input.push(b':');
+        input.extend_from_slice(path.as_bytes());
+        input.push(0);
+    }
+    input.extend_from_slice(b"flush");
+    input.push(0);
+    let output = git_cat_file_with_stdin(
+        repo,
+        &[
+            "cat-file",
+            "--batch-command=%(objectname) %(objecttype) %(objectmode) %(objectsize)",
+            "--buffer",
+            "-Z",
+        ],
+        &input,
+        commit,
+        "historical file-scoped blob preflight",
+    )?;
+    let stdout_bytes = u64::try_from(output.len()).map_err(|_| -> DynError {
+        format!(
+            "ASTRO_ARCHAEOLOGY_CAT_FILE_STDOUT_TOO_LARGE: commit {commit} cat-file stdout length cannot fit u64"
+        )
+        .into()
+    })?;
+    let mut records = output.split(|byte| *byte == 0).collect::<Vec<_>>();
+    while records.last().is_some_and(|record| record.is_empty()) {
+        records.pop();
+    }
+    if records.len() != requested.len() {
+        return Err(format!(
+            "ASTRO_ARCHAEOLOGY_CAT_FILE_RECORD_COUNT_MISMATCH: commit {commit} preflight returned {} records for {} requested paths",
+            records.len(),
+            requested.len()
+        )
+        .into());
+    }
+    let mut objects = Vec::new();
+    let mut paths_absent = 0usize;
+    for (path, record) in requested.iter().zip(records) {
+        let record = std::str::from_utf8(record).map_err(|error| -> DynError {
+            format!(
+                "ASTRO_ARCHAEOLOGY_CAT_FILE_HEADER_INVALID_UTF8: commit {commit} path {path:?}: {error}"
+            )
+            .into()
+        })?;
+        let query = format!("{commit}:{path}");
+        if record == format!("{query} missing") {
+            paths_absent = paths_absent.checked_add(1).ok_or_else(|| -> DynError {
+                format!(
+                    "ASTRO_ARCHAEOLOGY_CAT_FILE_ABSENT_OVERFLOW: commit {commit} absent path count overflowed"
+                )
+                .into()
+            })?;
+            continue;
+        }
+        let (object_oid, object_type, object_mode, object_size) =
+            parse_cat_file_blob_info_record(commit, path, record)?;
+        if object_type != "blob" || !matches!(object_mode, "100644" | "100755") {
+            return Err(format!(
+                "ASTRO_ARCHAEOLOGY_CAT_FILE_OBJECT_UNSUPPORTED: commit {commit} path {path:?} expected a regular blob mode 100644/100755 or explicit missing record, got type={object_type:?} mode={object_mode:?}; remediation=\"preserve the scratch evidence and inspect the exact Git tree mode before extending materialization semantics\""
+            )
+            .into());
+        }
+        objects.push(HistoricalBlobObject {
+            path: (*path).to_string(),
+            object_oid: object_oid.to_string(),
+            object_mode: object_mode.to_string(),
+            object_size,
+        });
+    }
+    Ok((objects, stdout_bytes, paths_absent))
+}
+
+fn parse_cat_file_blob_info_record<'a>(
+    commit: &str,
+    path: &str,
+    record: &'a str,
+) -> Result<(&'a str, &'a str, &'a str, u64), DynError> {
+    let mut fields = record.split(' ');
+    let object_id = fields.next().unwrap_or_default();
+    let object_type = fields.next().unwrap_or_default();
+    let object_mode = fields.next().unwrap_or_default();
+    let size = fields.next().unwrap_or_default();
+    if fields.next().is_some()
+        || !git_object_id_like(object_id)
+        || object_type.is_empty()
+        || object_mode.is_empty()
+    {
+        return Err(format!(
+            "ASTRO_ARCHAEOLOGY_CAT_FILE_HEADER_INVALID: commit {commit} path {path:?} returned malformed preflight record {record:?}"
+        )
+        .into());
+    }
+    let size = size.parse::<u64>().map_err(|error| -> DynError {
+        format!(
+            "ASTRO_ARCHAEOLOGY_CAT_FILE_SIZE_INVALID: commit {commit} path {path:?} returned invalid blob size {size:?}: {error}"
+        )
+        .into()
+    })?;
+    Ok((object_id, object_type, object_mode, size))
+}
+
+fn git_object_id_like(value: &str) -> bool {
+    matches!(value.len(), 40 | 64) && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn stream_file_scoped_historical_blobs(
+    repo: &Path,
+    checkout_root: &Path,
+    objects: &[HistoricalBlobObject],
+) -> Result<FileScopedHistoricalBlobMaterialization, DynError> {
+    let mut child = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args([
+            "-c",
+            "core.longpaths=true",
+            "cat-file",
+            "--batch",
+            "--filters",
+            "--buffer",
+            "-Z",
+        ])
+        .env("LC_ALL", "C")
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| -> DynError {
+            format!(
+                "ASTRO_ARCHAEOLOGY_CAT_FILE_SPAWN_FAILED: failed to spawn historical content stream in {}: {error}",
+                repo.display()
+            )
+            .into()
+        })?;
+    {
+        let mut stdin = child.stdin.take().ok_or_else(|| -> DynError {
+            "ASTRO_ARCHAEOLOGY_CAT_FILE_STDIN_MISSING: historical content stream did not expose stdin"
+                .into()
+        })?;
+        for object in objects {
+            stdin.write_all(object.object_oid.as_bytes())?;
+            stdin.write_all(b" ")?;
+            stdin.write_all(object.path.as_bytes())?;
+            stdin.write_all(&[0])?;
+        }
+    }
+
+    let stderr = child.stderr.take().ok_or_else(|| -> DynError {
+        "ASTRO_ARCHAEOLOGY_CAT_FILE_STDERR_MISSING: historical content stream did not expose stderr"
+            .into()
+    })?;
+    let stderr_reader = std::thread::spawn(move || {
+        let mut reader = stderr;
+        let mut bytes = Vec::new();
+        let result = reader.read_to_end(&mut bytes);
+        (result, bytes)
+    });
+    let stdout = child.stdout.take().ok_or_else(|| -> DynError {
+        "ASTRO_ARCHAEOLOGY_CAT_FILE_STDOUT_MISSING: historical content stream did not expose stdout"
+            .into()
+    })?;
+    let mut reader = BufReader::new(stdout);
+    let parse_result =
+        parse_file_scoped_historical_blob_stream(&mut reader, checkout_root, objects);
+    if parse_result.is_err() {
+        let _ = child.kill();
+    }
+    let status = child.wait().map_err(|error| -> DynError {
+        format!(
+            "ASTRO_ARCHAEOLOGY_CAT_FILE_WAIT_FAILED: historical content stream wait failed: {error}"
+        )
+        .into()
+    })?;
+    let (stderr_result, stderr_bytes) = stderr_reader.join().map_err(|_| -> DynError {
+        "ASTRO_ARCHAEOLOGY_CAT_FILE_STDERR_JOIN_FAILED: stderr reader panicked".into()
+    })?;
+    stderr_result.map_err(|error| -> DynError {
+        format!("ASTRO_ARCHAEOLOGY_CAT_FILE_STDERR_READ_FAILED: {error}").into()
+    })?;
+    let parsed = match parse_result {
+        Ok(parsed) => parsed,
+        Err(error) => {
+            if !status.success() {
+                return Err(format!(
+                    "ASTRO_ARCHAEOLOGY_CAT_FILE_STREAM_FAILED: historical content stream exited {:?} while parsing stdout: parse_error={error}; stderr={}",
+                    status.code(),
+                    String::from_utf8_lossy(&stderr_bytes).trim()
+                )
+                .into());
+            }
+            return Err(error);
+        }
+    };
+    if !status.success() {
+        return Err(format!(
+            "ASTRO_ARCHAEOLOGY_CAT_FILE_STREAM_FAILED: historical content stream exited {:?}: {}",
+            status.code(),
+            String::from_utf8_lossy(&stderr_bytes).trim()
+        )
+        .into());
+    }
+    Ok(parsed)
+}
+
+fn parse_file_scoped_historical_blob_stream<R: BufRead>(
+    reader: &mut R,
+    checkout_root: &Path,
+    objects: &[HistoricalBlobObject],
+) -> Result<FileScopedHistoricalBlobMaterialization, DynError> {
+    let mut stdout_bytes = 0u64;
+    let mut files_materialized = 0usize;
+    let mut buffer = vec![0u8; 1024 * 1024];
+    for object in objects {
+        let mut header = Vec::new();
+        let header_bytes = reader
+            .read_until(0, &mut header)
+            .map_err(|error| -> DynError {
+                format!(
+                    "ASTRO_ARCHAEOLOGY_CAT_FILE_HEADER_READ_FAILED: path {:?}: {error}",
+                    object.path
+                )
+                .into()
+            })?;
+        if header_bytes == 0 {
+            return Err(format!(
+                "ASTRO_ARCHAEOLOGY_CAT_FILE_HEADER_MISSING: path {:?} ended before its header",
+                object.path
+            )
+            .into());
+        }
+        stdout_bytes = stdout_bytes
+            .checked_add(u64::try_from(header_bytes).map_err(|_| -> DynError {
+                "ASTRO_ARCHAEOLOGY_CAT_FILE_TELEMETRY_OVERFLOW: header length cannot fit u64".into()
+            })?)
+            .ok_or_else(|| -> DynError {
+                "ASTRO_ARCHAEOLOGY_CAT_FILE_TELEMETRY_OVERFLOW: stdout bytes overflowed".into()
+            })?;
+        if header.last() != Some(&0) {
+            return Err(format!(
+                "ASTRO_ARCHAEOLOGY_CAT_FILE_HEADER_TERMINATOR_MISSING: path {:?} header was not NUL-terminated",
+                object.path
+            )
+            .into());
+        }
+        header.pop();
+        let header = std::str::from_utf8(&header).map_err(|error| -> DynError {
+            format!(
+                "ASTRO_ARCHAEOLOGY_CAT_FILE_HEADER_INVALID_UTF8: path {:?}: {error}",
+                object.path
+            )
+            .into()
+        })?;
+        let (streamed_oid, streamed_type, streamed_size) =
+            parse_cat_file_blob_stream_header(&object.path, header)?;
+        if streamed_oid != object.object_oid || streamed_type != "blob" {
+            return Err(format!(
+                "ASTRO_ARCHAEOLOGY_CAT_FILE_HEADER_INVALID: expected object {} blob for path {:?} (mode {}, source_size {}), got {header:?}",
+                object.object_oid,
+                object.path,
+                object.object_mode,
+                object.object_size
+            )
+            .into());
+        }
+        let path = checked_join_repo_path(checkout_root, &object.path)?;
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(|error| -> DynError {
+                format!(
+                    "ASTRO_ARCHAEOLOGY_CAT_FILE_WRITE_DIR_FAILED: cannot create {}: {error}",
+                    parent.display()
+                )
+                .into()
+            })?;
+        }
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .map_err(|error| -> DynError {
+                format!(
+                    "ASTRO_ARCHAEOLOGY_CAT_FILE_WRITE_FAILED: cannot create {}: {error}",
+                    path.display()
+                )
+                .into()
+            })?;
+        let mut remaining = streamed_size;
+        while remaining > 0 {
+            let cap = buffer
+                .len()
+                .min(usize::try_from(remaining).unwrap_or(usize::MAX));
+            reader
+                .read_exact(&mut buffer[..cap])
+                .map_err(|error| -> DynError {
+                    format!(
+                        "ASTRO_ARCHAEOLOGY_CAT_FILE_BLOB_TRUNCATED: path {:?} expected {streamed_size} bytes: {error}",
+                        object.path
+                    )
+                    .into()
+                })?;
+            file.write_all(&buffer[..cap])
+                .map_err(|error| -> DynError {
+                    format!(
+                        "ASTRO_ARCHAEOLOGY_CAT_FILE_WRITE_FAILED: cannot write {}: {error}",
+                        path.display()
+                    )
+                    .into()
+                })?;
+            remaining -= u64::try_from(cap).map_err(|_| -> DynError {
+                "ASTRO_ARCHAEOLOGY_CAT_FILE_TELEMETRY_OVERFLOW: chunk length cannot fit u64".into()
+            })?;
+        }
+        let mut terminator = [0u8; 1];
+        reader
+            .read_exact(&mut terminator)
+            .map_err(|error| -> DynError {
+                format!(
+                    "ASTRO_ARCHAEOLOGY_CAT_FILE_CONTENT_TERMINATOR_MISSING: path {:?}: {error}",
+                    object.path
+                )
+                .into()
+            })?;
+        if terminator[0] != 0 {
+            return Err(format!(
+                "ASTRO_ARCHAEOLOGY_CAT_FILE_CONTENT_TERMINATOR_INVALID: path {:?} terminator byte was {} not NUL",
+                object.path, terminator[0]
+            )
+            .into());
+        }
+        stdout_bytes = stdout_bytes
+            .checked_add(streamed_size)
+            .and_then(|value| value.checked_add(1))
+            .ok_or_else(|| -> DynError {
+                "ASTRO_ARCHAEOLOGY_CAT_FILE_TELEMETRY_OVERFLOW: stdout bytes overflowed".into()
+            })?;
+        files_materialized = files_materialized.checked_add(1).ok_or_else(|| -> DynError {
+            "ASTRO_ARCHAEOLOGY_CAT_FILE_MATERIALIZED_OVERFLOW: materialized file count overflowed"
+                .into()
+        })?;
+    }
+    let mut trailing = Vec::new();
+    reader
+        .read_to_end(&mut trailing)
+        .map_err(|error| -> DynError {
+            format!("ASTRO_ARCHAEOLOGY_CAT_FILE_TRAILING_READ_FAILED: {error}").into()
+        })?;
+    if !trailing.is_empty() {
+        return Err(format!(
+            "ASTRO_ARCHAEOLOGY_CAT_FILE_TRAILING_BYTES: historical content stream emitted {} unexpected trailing byte(s)",
+            trailing.len()
+        )
+        .into());
+    }
+    Ok(FileScopedHistoricalBlobMaterialization {
+        git_cat_file_processes: 0,
+        stdout_bytes,
+        files_materialized,
+        paths_absent: 0,
+    })
+}
+
+fn parse_cat_file_blob_stream_header<'a>(
+    path: &str,
+    header: &'a str,
+) -> Result<(&'a str, &'a str, u64), DynError> {
+    let mut fields = header.split(' ');
+    let object_id = fields.next().unwrap_or_default();
+    let object_type = fields.next().unwrap_or_default();
+    let size = fields.next().unwrap_or_default();
+    if fields.next().is_some() || !git_object_id_like(object_id) || object_type.is_empty() {
+        return Err(format!(
+            "ASTRO_ARCHAEOLOGY_CAT_FILE_HEADER_INVALID: path {path:?} returned malformed stream header {header:?}"
+        )
+        .into());
+    }
+    let size = size.parse::<u64>().map_err(|error| -> DynError {
+        format!(
+            "ASTRO_ARCHAEOLOGY_CAT_FILE_SIZE_INVALID: path {path:?} returned invalid stream size {size:?}: {error}"
+        )
+        .into()
+    })?;
+    Ok((object_id, object_type, size))
+}
+
+fn checked_join_repo_path(checkout_root: &Path, path: &str) -> Result<PathBuf, DynError> {
+    if path.is_empty()
+        || path.contains('\\')
+        || path.contains('\0')
+        || path.starts_with('/')
+        || path
+            .split('/')
+            .any(|component| component.is_empty() || component == "." || component == "..")
+    {
+        return Err(format!(
+            "ASTRO_ARCHAEOLOGY_CAT_FILE_WRITE_PATH_INVALID: materialized path {path:?} is not normalized repo-relative"
+        )
+        .into());
+    }
+    Ok(path
+        .split('/')
+        .fold(checkout_root.to_path_buf(), |path, component| {
+            path.join(component)
+        }))
+}
+
+fn git_cat_file_with_stdin(
+    repo: &Path,
+    args: &[&str],
+    input: &[u8],
+    commit: &str,
+    label: &str,
+) -> Result<Vec<u8>, DynError> {
+    let mut child = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["-c", "core.longpaths=true"])
+        .args(args)
+        .env("LC_ALL", "C")
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| -> DynError {
+            format!("ASTRO_ARCHAEOLOGY_CAT_FILE_SPAWN_FAILED: commit {commit} {label}: {error}")
+                .into()
+        })?;
+    {
+        let mut stdin = child.stdin.take().ok_or_else(|| -> DynError {
+            format!(
+                "ASTRO_ARCHAEOLOGY_CAT_FILE_STDIN_MISSING: commit {commit} {label} did not expose stdin"
+            )
+            .into()
+        })?;
+        stdin.write_all(input).map_err(|error| -> DynError {
+            format!("ASTRO_ARCHAEOLOGY_CAT_FILE_STDIN_FAILED: commit {commit} {label}: {error}")
+                .into()
+        })?;
+    }
+    let output = child.wait_with_output().map_err(|error| -> DynError {
+        format!("ASTRO_ARCHAEOLOGY_CAT_FILE_WAIT_FAILED: commit {commit} {label}: {error}").into()
+    })?;
+    if output.status.success() {
+        Ok(output.stdout)
+    } else {
+        Err(format!(
+            "ASTRO_ARCHAEOLOGY_CAT_FILE_FAILED: commit {commit} {label}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )
+        .into())
+    }
 }
 
 fn git_index_checked(repo: &Path, index: &Path, args: &[&str]) -> Result<(), DynError> {
@@ -4163,11 +4780,21 @@ pub(crate) fn git_archaeology_summary(report: &GitArchaeologyImportReport) -> Va
     );
     insert_number!("blame_requested_ranges", report.blame_requested_ranges);
     insert_number!("blame_effective_ranges", report.blame_effective_ranges);
+    insert_number!("blame_groups", report.blame_groups);
+    insert_number!("blame_group_cache_hits", report.blame_group_cache_hits);
     insert_number!("blame_processes", report.blame_processes);
+    insert_number!("blame_processes_avoided", report.blame_processes_avoided);
+    insert_number!("blame_cat_file_processes", report.blame_cat_file_processes);
+    insert_number!(
+        "blame_cat_file_stdout_bytes",
+        report.blame_cat_file_stdout_bytes
+    );
+    insert_number!("blame_path_absent_groups", report.blame_path_absent_groups);
     insert_number!("blame_returned_spans", report.blame_returned_spans);
     insert_number!("blame_returned_lines", report.blame_returned_lines);
     insert_number!("blame_stdout_bytes", report.blame_stdout_bytes);
     insert_number!("blame_wall_ms", report.blame_wall_ms);
+    insert_number!("blame_cat_file_wall_ms", report.blame_cat_file_wall_ms);
     insert_number!(
         "historical_git_inventory_processes",
         report.historical_git_inventory_processes
@@ -4177,8 +4804,20 @@ pub(crate) fn git_archaeology_summary(report: &GitArchaeologyImportReport) -> Va
         report.historical_git_checkout_processes
     );
     insert_number!(
+        "historical_git_cat_file_processes",
+        report.historical_git_cat_file_processes
+    );
+    insert_number!(
+        "historical_git_cat_file_stdout_bytes",
+        report.historical_git_cat_file_stdout_bytes
+    );
+    insert_number!(
         "historical_git_files_materialized",
         report.historical_git_files_materialized
+    );
+    insert_number!(
+        "historical_git_paths_absent",
+        report.historical_git_paths_absent
     );
     insert_number!(
         "historical_git_source_files_materialized",
