@@ -163,6 +163,11 @@ uint_least64_t cbm_pipeline_get_ambiguous_reference_skips(const cbm_pipeline_t *
  * silently re-attributed to a File node. */
 uint_least64_t cbm_pipeline_get_unresolved_reference_source_skips(const cbm_pipeline_t *p);
 
+/* Recoverable tree-sitter parse diagnostics that were persisted as
+ * ParseDiagnostic graph rows. Successful index responses emit this count on
+ * every run, including zero, so malformed-source recovery is never silent. */
+uint_least64_t cbm_pipeline_get_parse_recovery_diagnostics(const cbm_pipeline_t *p);
+
 /* Read the exact first fatal pipeline diagnostic. Returns false and zeroes
  * `out` when no fatal diagnostic has been recorded. Every pointer is borrowed
  * from the pipeline and remains valid until cbm_pipeline_free(). */

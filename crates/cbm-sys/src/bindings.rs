@@ -1451,6 +1451,17 @@ unsafe extern "C" {
     ) -> bool;
 }
 unsafe extern "C" {
+    pub fn cbm_add_parse_diagnostic(
+        ctx: *mut CBMExtractCtx,
+        node: TSNode,
+        code: *const ::std::os::raw::c_char,
+        operation: *const ::std::os::raw::c_char,
+        message: *const ::std::os::raw::c_char,
+        remediation: *const ::std::os::raw::c_char,
+        is_missing: bool,
+    ) -> bool;
+}
+unsafe extern "C" {
     pub fn cbm_extract_definitions(ctx: *mut CBMExtractCtx);
 }
 unsafe extern "C" {
@@ -2378,6 +2389,9 @@ unsafe extern "C" {
     pub fn cbm_pipeline_get_unresolved_reference_source_skips(
         p: *const cbm_pipeline_t,
     ) -> uint_least64_t;
+}
+unsafe extern "C" {
+    pub fn cbm_pipeline_get_parse_recovery_diagnostics(p: *const cbm_pipeline_t) -> uint_least64_t;
 }
 unsafe extern "C" {
     pub fn cbm_pipeline_get_fatal_error(

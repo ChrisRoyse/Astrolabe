@@ -884,6 +884,8 @@ int cbm_pipeline_pass_definitions(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
             process_diagnostic(ctx, &result->diagnostics.items[d], rel);
             total_diagnostics++;
         }
+        cbm_pipeline_add_parse_recovery_diagnostics(ctx->pipeline,
+                                                    (uint_least64_t)result->diagnostics.count);
 
         /* Store calls for pass_calls (we save them in the extraction results
          * for now — a future optimization would batch these) */

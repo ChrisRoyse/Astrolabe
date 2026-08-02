@@ -2,6 +2,7 @@
 #include "arena.h" // CBMArena, cbm_arena_init/alloc/strdup/destroy
 #include "helpers.h"
 #include "lang_specs.h"
+#include "extract_node_stack.h"
 #include "extract_unified.h"
 #include "lsp/go_lsp.h"
 #include "lsp/c_lsp.h"
@@ -303,6 +304,75 @@ bool cbm_diagnostics_push(CBMParseDiagnosticArray *arr, CBMArena *a, CBMParseDia
         return false;
     arr->items[arr->count++] = diag;
     return true;
+}
+
+bool cbm_add_parse_diagnostic(CBMExtractCtx *ctx, TSNode node, const char *code,
+                              const char *operation, const char *message,
+                              const char *remediation, bool is_missing) {
+    if (!ctx || !ctx->result || !ctx->arena || ts_node_is_null(node)) {
+        return false;
+    }
+    uint32_t start = ts_node_start_byte(node);
+    uint32_t end = ts_node_end_byte(node);
+    CBMParseDiagnostic diag = {
+        .code = code,
+        .operation = operation,
+        .message = message,
+        .remediation = remediation,
+        .node_type = ts_node_type(node),
+        .start_line = ts_node_start_point(node).row + 1,
+        .end_line = cbm_node_end_line_inclusive(node),
+        .start_byte = start,
+        .end_byte = end,
+        .is_missing = is_missing,
+    };
+    if (end > start && end <= (uint32_t)ctx->source_len) {
+        diag.source = cbm_arena_strndup(ctx->arena, ctx->source + start, (size_t)(end - start));
+        diag.source_len = end - start;
+    }
+    bool pushed = cbm_diagnostics_push(&ctx->result->diagnostics, ctx->arena, diag);
+    char line_text[32];
+    (void)snprintf(line_text, sizeof(line_text), "%u", diag.start_line);
+    cbm_log_warn("extract.parse_diagnostic", "code", code ? code : "", "operation",
+                 operation ? operation : "", "path", ctx->rel_path ? ctx->rel_path : "",
+                 "node_type", diag.node_type ? diag.node_type : "", "line", line_text,
+                 "missing", is_missing ? "true" : "false", "message", message ? message : "",
+                 "remediation", remediation ? remediation : "");
+    return pushed;
+}
+
+static void cbm_record_tree_sitter_parse_diagnostics(CBMExtractCtx *ctx) {
+    if (!ctx || !ctx->result || !ctx->arena || ts_node_is_null(ctx->root) ||
+        !ts_node_has_error(ctx->root)) {
+        return;
+    }
+    CBMArena scratch;
+    cbm_arena_init(&scratch);
+    TSNodeStack stack;
+    ts_nstack_init(&stack, &scratch, 128);
+    ts_nstack_push(&stack, &scratch, ctx->root);
+    while (stack.count > 0 && !cbm_arena_failed(ctx->arena) && !cbm_arena_failed(&scratch)) {
+        TSNode node = ts_nstack_pop(&stack);
+        bool missing = ts_node_is_missing(node);
+        if (ts_node_is_error(node) || missing) {
+            (void)cbm_add_parse_diagnostic(
+                ctx, node, missing ? "CBM_PARSE_MISSING_TOKEN" : "CBM_PARSE_RECOVERY",
+                "parse_tree_sitter",
+                missing
+                    ? "the grammar inserted a zero-width missing token during tree-sitter error "
+                      "recovery"
+                    : "the grammar required tree-sitter error recovery at this exact source span",
+                "inspect the exact diagnostic span and repair the source; unaffected syntax "
+                "outside the reported recovery remains indexed with this degradation labeled "
+                "and counted",
+                missing);
+            if (ts_node_is_error(node)) {
+                continue;
+            }
+        }
+        ts_nstack_push_children(&stack, &scratch, node);
+    }
+    cbm_arena_destroy(&scratch);
 }
 
 // --- String input reader (for parse_with_options) ---
@@ -973,6 +1043,7 @@ static CBMFileResult *cbm_extract_file_impl(const char *source, int source_len,
     }
 
     TSNode root = ts_tree_root_node(tree);
+    bool root_has_parse_recovery = ts_node_has_error(root);
 
     // Compute module QN. Java/Go derive the module from the CONTAINING
     // DIRECTORY (package semantics) rather than baking the filename stem in,
@@ -1001,9 +1072,14 @@ static CBMFileResult *cbm_extract_file_impl(const char *source, int source_len,
             structured_classification_provenance,
     };
 
-    if (language == CBM_LANG_POWERSHELL) {
+    if (root_has_parse_recovery && language == CBM_LANG_POWERSHELL) {
         cbm_powershell_record_parse_diagnostics(&ctx);
         if (!cbm_extract_arena_ok(result, "powershell_parse_diagnostics", rel_path)) {
+            goto extraction_failed;
+        }
+    } else if (root_has_parse_recovery) {
+        cbm_record_tree_sitter_parse_diagnostics(&ctx);
+        if (!cbm_extract_arena_ok(result, "parse_recovery_diagnostics", rel_path)) {
             goto extraction_failed;
         }
     }

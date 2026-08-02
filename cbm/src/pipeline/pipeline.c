@@ -233,6 +233,11 @@ struct cbm_pipeline {
      * ambiguity so the success response identifies the actual degradation. */
     uint_least64_t unresolved_reference_source_skips;
 
+    /* Recoverable tree-sitter parse diagnostics persisted as ParseDiagnostic
+     * graph rows. A clean run reports zero; a recovered parse reports the
+     * exact number of diagnostic rows collected from real source trees. */
+    uint_least64_t parse_recovery_diagnostics;
+
     /* Retained successful-run phase telemetry. Fixed storage makes telemetry
      * collection allocation-free after pipeline creation and prevents clean
      * worker-log retention from accumulating on disk. */
@@ -493,6 +498,7 @@ cbm_pipeline_t *cbm_pipeline_new(const char *repo_path, const char *db_path,
     p->committed_edges = -1;
     p->ambiguous_reference_skips = 0;
     p->unresolved_reference_source_skips = 0;
+    p->parse_recovery_diagnostics = 0;
     atomic_init(&p->cancelled, 0);
 
     return p;
@@ -922,6 +928,16 @@ void cbm_pipeline_set_unresolved_reference_source_skips(cbm_pipeline_t *p, uint_
 
 uint_least64_t cbm_pipeline_get_unresolved_reference_source_skips(const cbm_pipeline_t *p) {
     return p ? p->unresolved_reference_source_skips : 0;
+}
+
+void cbm_pipeline_add_parse_recovery_diagnostics(cbm_pipeline_t *p, uint_least64_t count) {
+    if (p) {
+        p->parse_recovery_diagnostics += count;
+    }
+}
+
+uint_least64_t cbm_pipeline_get_parse_recovery_diagnostics(const cbm_pipeline_t *p) {
+    return p ? p->parse_recovery_diagnostics : 0;
 }
 
 const cbm_gbuf_node_t *cbm_pipeline_find_reference_source(

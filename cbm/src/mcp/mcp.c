@@ -5972,6 +5972,18 @@ static char *build_index_success_response(cbm_mcp_server_t *srv, yyjson_mut_doc 
             "operation, qualified name, source path, and line.");
     }
 
+    uint_least64_t parse_recovery_diagnostics =
+        cbm_pipeline_get_parse_recovery_diagnostics(p);
+    yyjson_mut_obj_add_uint(doc, root, "parse_recovery_diagnostics",
+                            (uint64_t)parse_recovery_diagnostics);
+    if (parse_recovery_diagnostics > 0) {
+        yyjson_mut_obj_add_str(
+            doc, root, "parse_recovery_hint",
+            "Some source files required tree-sitter error recovery. The graph published "
+            "unaffected syntax, and each degradation is persisted as a ParseDiagnostic node "
+            "with exact source span and remediation.");
+    }
+
     bool adr_exists = project_has_adr(store, project_name, repo_path);
     yyjson_mut_obj_add_bool(doc, root, "adr_present", adr_exists);
     if (!adr_exists) {

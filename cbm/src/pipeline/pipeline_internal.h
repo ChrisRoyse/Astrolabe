@@ -87,6 +87,7 @@ typedef struct {
 void cbm_pipeline_record_fatal_error(cbm_pipeline_t *p, const char *code, const char *operation,
                                      const char *phase, const char *path, size_t requested,
                                      const char *message, const char *remediation);
+void cbm_pipeline_add_parse_recovery_diagnostics(cbm_pipeline_t *p, uint_least64_t count);
 
 /* Allocation-free native worker phase probe shared by the full and incremental
  * pipelines. Completion appends one retained metric to the owning pipeline and

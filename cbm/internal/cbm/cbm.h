@@ -811,6 +811,9 @@ bool cbm_impltrait_push(CBMImplTraitArray *arr, CBMArena *a, CBMImplTrait it);
 bool cbm_resolvedcall_push(CBMResolvedCallArray *arr, CBMArena *a, CBMResolvedCall rc);
 bool cbm_channels_push(CBMChannelArray *arr, CBMArena *a, CBMChannel ch);
 bool cbm_diagnostics_push(CBMParseDiagnosticArray *arr, CBMArena *a, CBMParseDiagnostic diag);
+bool cbm_add_parse_diagnostic(CBMExtractCtx *ctx, TSNode node, const char *code,
+                              const char *operation, const char *message,
+                              const char *remediation, bool is_missing);
 
 // --- Sub-extractor entry points ---
 

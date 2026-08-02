@@ -696,7 +696,9 @@ typedef struct __attribute__((aligned(CBM_CACHE_LINE))) {
     cbm_gbuf_t *local_gbuf;
     int nodes_created;
     int errors;
-    char _pad[CBM_CACHE_LINE - sizeof(cbm_gbuf_t *) - (PP_ESC_SPACE * sizeof(int))];
+    uint_least64_t parse_recovery_diagnostics;
+    char _pad[CBM_CACHE_LINE - sizeof(cbm_gbuf_t *) - (PP_ESC_SPACE * sizeof(int)) -
+              sizeof(uint_least64_t)];
 } extract_worker_state_t;
 
 typedef struct {
@@ -978,6 +980,7 @@ static void extract_worker(int worker_id, void *ctx_ptr) {
         for (int d = 0; d < result->diagnostics.count; d++) {
             insert_diagnostic_into_gbuf(ws, fi, ec->project_name, &result->diagnostics.items[d]);
         }
+        ws->parse_recovery_diagnostics += (uint_least64_t)result->diagnostics.count;
 
         /* Free TSTree immediately — arena strings survive for registry+resolve.
          * This makes slab reset safe: tree-sitter's internal nodes (in slab)
@@ -1217,6 +1220,8 @@ int cbm_parallel_extract_ex(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *file
             cbm_gbuf_merge(ctx->gbuf, workers[i].local_gbuf);
             total_nodes += workers[i].nodes_created;
             total_errors += workers[i].errors;
+            cbm_pipeline_add_parse_recovery_diagnostics(ctx->pipeline,
+                                                        workers[i].parse_recovery_diagnostics);
             cbm_gbuf_free(workers[i].local_gbuf);
         }
     }
