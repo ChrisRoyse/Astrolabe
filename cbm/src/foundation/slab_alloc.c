@@ -405,8 +405,14 @@ static void slab_map_unregister_page(slab_page_t *page) {
 extern void ts_set_allocator(void *(*new_malloc)(size_t), void *(*new_calloc)(size_t, size_t),
                              void *(*new_realloc)(void *, size_t), void (*new_free)(void *));
 
+static atomic_bool g_tree_sitter_slab_installed = false;
+
 void cbm_slab_install(void) {
-    ts_set_allocator(slab_malloc, slab_calloc, slab_realloc, slab_free);
+    bool expected = false;
+    if (atomic_compare_exchange_strong_explicit(&g_tree_sitter_slab_installed, &expected, true,
+                                                memory_order_acq_rel, memory_order_acquire)) {
+        ts_set_allocator(slab_malloc, slab_calloc, slab_realloc, slab_free);
+    }
 }
 
 void cbm_slab_reset_thread(void) {

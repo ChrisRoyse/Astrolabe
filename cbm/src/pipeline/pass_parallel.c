@@ -1139,7 +1139,11 @@ int cbm_parallel_extract_ex(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *file
         return CBM_NOT_FOUND;
     }
 
-    /* Slab allocator for tree-sitter (thread-safe via TLS). */
+    /* Tree-sitter's process-global allocator is installed at cbm_alloc_init()
+     * before any parser exists. This idempotent call preserves direct callers
+     * that reach the parallel pass without going through main(), but it must not
+     * publish a new allocator generation after sequential requests have already
+     * created parser objects. */
     cbm_slab_install();
     CBM_PROF_END("parallel_extract", "1_init_libs", t_init);
 

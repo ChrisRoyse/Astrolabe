@@ -17,6 +17,7 @@
 #include "foundation/compat.h"
 #include "foundation/compat_fs.h" // cbm_fopen — crash-supervisor per-file marker write
 #include "foundation/log.h"       // cbm_log_warn — explicit preprocessor diagnostics
+#include "foundation/slab_alloc.h" // cbm_slab_install — stable tree-sitter allocator binding
 #include "tree_sitter/api.h" // TSParser, TSNode, TSTree, TSInput, TSLanguage, TSPoint, TSParseOptions, TSParseState
 #include "foundation/constants.h"
 #include "mimalloc.h" // mi_malloc/mi_calloc/mi_realloc/mi_free/mi_usable_size — bind 3rd-party allocators (#424)
@@ -356,14 +357,22 @@ static TSParser *get_thread_parser(const TSLanguage *ts_lang, CBMLanguage lang) 
 
 // --- Allocator binding (defense-in-depth, #424) ---
 
-/* Bind tree-sitter and sqlite3 to mimalloc explicitly so a correct
- * binary does NOT depend on the fragile MI_OVERRIDE symbol override. Under
+/* Bind sqlite3 to mimalloc explicitly so a correct binary does NOT depend on
+ * the fragile MI_OVERRIDE symbol override. Under
  * MI_OVERRIDE=1 — particularly the Windows static-MinGW link with
  * --allow-multiple-definition — `malloc`/`free` can resolve to DIFFERENT
  * allocators (mimalloc vs the CRT) inside third-party libs, so a block
  * allocated by mimalloc gets freed by the CRT (or vice-versa), corrupting the
- * heap freelist (#424). Binding each library through one explicit allocator
+ * heap freelist (#424). Binding sqlite through one explicit allocator
  * eliminates that mismatch class generically, on every platform.
+ *
+ * Tree-sitter is bound once to CBM's slab allocator, backed by the same process
+ * heap for non-slab allocations. That install must happen here, before the
+ * first parser object exists. Installing the slab allocator lazily in the
+ * parallel pipeline after sequential extraction has already created parsers
+ * violates Tree-sitter's global allocator contract and can corrupt the heap
+ * when a long-lived archaeology worker crosses from small sequential commits
+ * into its first parallel commit.
  *
  * Guarded to the production build (CBM_BIND_TS_ALLOCATOR=1, which CFLAGS_PROD
  * defines alongside MI_OVERRIDE=1). The test build is CRT + ASan, where binding
@@ -404,11 +413,11 @@ static void cbm_sqlite_memshutdown(void *appdata) {
 
 /* Allocator-binding state (#5). File-scope (was a function-local static) so
  * cbm_alloc_bindings_active() can read back whether cbm_alloc_init() has already
- * bound the tree-sitter/sqlite allocators to mimalloc. This gives the Rust FFI
- * tests a deterministic init-order probe: the flag flips 0 -> 1 exactly once,
- * the first time cbm_alloc_init() runs in a build that enables the binding.
- * Single-threaded startup; a plain int is fine. Always 0 in the test build
- * (CBM_BIND_TS_ALLOCATOR undefined) because the binding is a no-op there. */
+ * bound SQLite to mimalloc and Tree-sitter to CBM's slab allocator. This gives
+ * the Rust FFI tests a deterministic init-order probe: the flag flips 0 -> 1
+ * exactly once, the first time cbm_alloc_init() runs in a build that enables the
+ * binding. Single-threaded startup; a plain int is fine. Always 0 in the test
+ * build (CBM_BIND_TS_ALLOCATOR undefined) because the binding is a no-op there. */
 static int cbm_alloc_bound = 0;
 static int cbm_alloc_error = 0;
 
@@ -451,7 +460,7 @@ int cbm_alloc_init(void) {
     /* SQLite accepted its allocator. Tree-sitter has a void setter and cannot
      * reject this complete function table, so publish success only after both
      * bindings have been installed. */
-    ts_set_allocator(mi_malloc, mi_calloc, mi_realloc, mi_free);
+    cbm_slab_install();
     cbm_alloc_bound = 1;
 #endif /* CBM_BIND_TS_ALLOCATOR */
     return 0;
@@ -459,10 +468,10 @@ int cbm_alloc_init(void) {
 
 int cbm_alloc_bindings_active(void) {
     /* Reads back the file-scope binding flag cbm_alloc_init() sets. Non-zero
-     * proves cbm_alloc_init() has run and bound tree-sitter/sqlite to mimalloc
-     * (only possible in a CBM_BIND_TS_ALLOCATOR build — libcbm.a and the prod
-     * binary). Used by the Rust init-order FFI test as independent evidence,
-     * not a return-value echo. */
+     * proves cbm_alloc_init() has run and bound SQLite to mimalloc plus
+     * Tree-sitter to CBM's slab allocator (only possible in a
+     * CBM_BIND_TS_ALLOCATOR build — libcbm.a and the prod binary). Used by the
+     * Rust init-order FFI test as independent evidence, not a return-value echo. */
     return cbm_alloc_bound;
 }
 
@@ -867,6 +876,14 @@ static CBMFileResult *cbm_extract_file_impl(const char *source, int source_len,
     cbm_arena_init(&result->arena);
     CBMArena *a = &result->arena;
     if (!cbm_extract_arena_ok(result, "arena_init", rel_path)) {
+        return result;
+    }
+
+    if (cbm_init() != 0) {
+        cbm_file_result_set_error(
+            result, "CBM_ALLOCATOR_INIT_FAILED", "cbm_init", "allocator", 0,
+            "the extraction allocator contract could not be initialized before parsing",
+            "inspect allocator.bind_failed and restart the process");
         return result;
     }
 

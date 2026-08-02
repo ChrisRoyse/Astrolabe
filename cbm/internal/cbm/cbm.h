@@ -680,20 +680,22 @@ typedef struct {
 
 // --- Public API ---
 
-// Bind third-party allocators (tree-sitter, sqlite3) to mimalloc as
+// Bind SQLite to mimalloc and Tree-sitter to CBM's slab allocator as
 // defense-in-depth, so they never depend on the fragile MI_OVERRIDE symbol
-// override (#424). MUST be called as the very first statement of main(), before
-// any sqlite3_open*/sqlite3_initialize (SQLITE_CONFIG_MALLOC returns
-// SQLITE_MISUSE once sqlite has initialized).
+// override (#424) and Tree-sitter never observes an allocator transition while
+// parser/tree objects are live. MUST be called as the very first statement of
+// main(), before any sqlite3_open*/sqlite3_initialize (SQLITE_CONFIG_MALLOC
+// returns SQLITE_MISUSE once sqlite has initialized) or Tree-sitter parser use.
 // Idempotent only after confirmed success. Returns SQLITE_OK/0 on success and
 // the exact SQLite status when the binding is rejected. cbm_init() also calls
 // it so non-main entry points fail closed. In builds without
 // CBM_BIND_TS_ALLOCATOR this is a successful no-op.
 int cbm_alloc_init(void);
 
-// Init-order probe (#5). Returns non-zero once cbm_alloc_init() has bound the
-// tree-sitter/sqlite allocators to mimalloc in a build that enables the binding
-// (CBM_BIND_TS_ALLOCATOR — libcbm.a and the production binary). Always 0 in the
+// Init-order probe (#5). Returns non-zero once cbm_alloc_init() has bound
+// SQLite to mimalloc and Tree-sitter to CBM's slab allocator in a build that
+// enables the binding (CBM_BIND_TS_ALLOCATOR — libcbm.a and the production
+// binary). Always 0 in the
 // test build (the binding is a no-op there) and before the first
 // cbm_alloc_init() call. Lets Rust FFI tests read back the binding state as
 // deterministic evidence of allocator initialization ordering rather than

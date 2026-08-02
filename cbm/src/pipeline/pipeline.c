@@ -52,6 +52,8 @@ enum {
 #include "foundation/mem.h"
 #include "foundation/sha256.h"
 #include "foundation/schema_version.h"
+#include "foundation/slab_alloc.h"
+#include "helpers.h"
 
 #include <stdint.h>
 #include <errno.h>
@@ -3303,6 +3305,12 @@ cleanup:
     }
     cbm_pipeline_phase_probe_end(p, "source_snapshot_cleanup", &source_cleanup_probe);
     cbm_discover_free(files, file_count);
+    cbm_destroy_thread_parser();
+    cbm_slab_reclaim();
+    cbm_kind_in_set_free_cache();
+    cbm_mem_collect();
+    cbm_log_info("pipeline.thread_allocator_cleanup", "parser", "destroyed", "slab",
+                 "reclaimed");
     cbm_pipeline_phase_probe_end(p, "total", &total_probe);
     return rc;
 }

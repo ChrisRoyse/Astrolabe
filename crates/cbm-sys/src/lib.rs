@@ -138,12 +138,13 @@ pub fn initialize_allocator_bindings_first() -> Result<(), CbmAllocatorInitError
 /// Reads back libcbm's allocator-binding flag (#5).
 ///
 /// Returns `true` once [`initialize_allocator_bindings_first`] (via
-/// `cbm_alloc_init`) has bound the tree-sitter and SQLite allocators to the
-/// shared mimalloc heap. This is only observable in a build that enables the
-/// binding (`CBM_BIND_TS_ALLOCATOR` — the linked `libcbm.a` and the production
-/// binary); the vendored test build leaves it `false` because the binding is a
-/// deliberate no-op there. Startup code uses it as a deterministic init-order
-/// probe: SQLite and tree-sitter must never allocate before this reads `true`.
+/// `cbm_alloc_init`) has bound SQLite to the shared mimalloc heap and
+/// Tree-sitter to CBM's slab allocator. This is only observable in a build that
+/// enables the binding (`CBM_BIND_TS_ALLOCATOR` — the linked `libcbm.a` and the
+/// production binary); the vendored test build leaves it `false` because the
+/// binding is a deliberate no-op there. Startup code uses it as a deterministic
+/// init-order probe: SQLite and Tree-sitter must never allocate before this
+/// reads `true`.
 pub fn allocator_bindings_active() -> bool {
     unsafe { cbm_alloc_bindings_active() != 0 }
 }
