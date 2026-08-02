@@ -62,7 +62,26 @@ Astrolabe uses no test suite, aggregate gate, or CI/CD. Verification is a manual
 4. Manually exercise the happy path and at least three relevant boundaries, recording before/after state for each.
 5. Record the native command, commit SHA, artifact hash, execution context, and physical readback on the issue. A failure or unavailable observation is explicit evidence of a gap, never a pass.
 
-For an artifact that must run after `target/` is deleted, copy it out of `target/release/` to its install location first (`~/.astrolabe/bin/`), record its SHA-256 alongside the commit SHA of the built tree, and exercise that promoted copy. Never execute closure evidence directly from disposable `target/`.
+For an artifact that must run after `target/` is deleted, promote it out of `target/release/` to its install location first (`~/.astrolabe/bin/`), record its SHA-256 alongside the commit SHA of the built tree, and exercise that promoted copy. Never execute closure evidence directly from disposable `target/`.
+
+> **Apple Silicon: promote by atomic rename, never `cp` over a live path.**
+> Every arm64 binary must carry a valid code signature (cargo's linker applies an
+> ad-hoc one), and macOS caches signature validation **per inode**. Writing new
+> bytes into an existing inode that a running process has mapped invalidates that
+> cache, and the kernel then kills the process with
+> `SIGKILL (Code Signature Invalid)` / `CODESIGNING: Taskgated Invalid Signature`.
+> `cp` overwrites in place and hits exactly this. Write a new inode and rename it
+> over instead:
+>
+> ```sh
+> cp target/release/astrolabe ~/.astrolabe/bin/.astrolabe.new
+> mv -f ~/.astrolabe/bin/.astrolabe.new ~/.astrolabe/bin/astrolabe   # atomic
+> codesign -v ~/.astrolabe/bin/astrolabe && ~/.astrolabe/bin/astrolabe --version
+> ```
+>
+> `rename(2)` swaps the directory entry and leaves the old inode intact for
+> already-running processes, so nothing is killed mid-flight. Exit code 137
+> (128+9) from a freshly promoted binary is this bug, not a crash in the program.
 
 The complete Rust formatting inspection is:
 
