@@ -1589,6 +1589,106 @@ pub(crate) fn shadow_import_current_summary(verdict: &ShadowContentVerdict) -> V
     }
 }
 
+fn shadow_content_verdict_code(verdict: &ShadowContentVerdict) -> &'static str {
+    match verdict {
+        ShadowContentVerdict::Fresh => unreachable!(
+            "shadow_content_verdict_code is only called for non-fresh serving refusals"
+        ),
+        ShadowContentVerdict::Stale { .. } => ASTRO_SHADOW_STALE_REINDEX_REQUIRED,
+        ShadowContentVerdict::SourceOutOfBand { .. } => ASTRO_SHADOW_SOURCE_OUT_OF_BAND,
+        ShadowContentVerdict::WatermarkDomainMismatch { code, .. }
+        | ShadowContentVerdict::Unverifiable { code, .. } => code,
+    }
+}
+
+fn shadow_content_verdict_message(
+    verdict: &ShadowContentVerdict,
+    project: &str,
+    tool: &str,
+) -> String {
+    match verdict {
+        ShadowContentVerdict::Fresh => unreachable!(
+            "shadow_content_verdict_message is only called for non-fresh serving refusals"
+        ),
+        ShadowContentVerdict::Stale { expected, actual } => format!(
+            "{ASTRO_SHADOW_STALE_REINDEX_REQUIRED}: {tool} refused to serve project {project:?} \
+             because the live CBM SQLite source fingerprint differs from the persisted shadow \
+             import watermark (expected {expected}, actual {actual})"
+        ),
+        ShadowContentVerdict::SourceOutOfBand { expected, actual } => format!(
+            "{ASTRO_SHADOW_SOURCE_OUT_OF_BAND}: {tool} refused to serve project {project:?} \
+             because the live git source fingerprint differs from the persisted shadow import \
+             watermark (expected {expected}, actual {actual})"
+        ),
+        ShadowContentVerdict::WatermarkDomainMismatch { message, .. }
+        | ShadowContentVerdict::Unverifiable { message, .. } => message.clone(),
+    }
+}
+
+fn shadow_content_verdict_remediation(verdict: &ShadowContentVerdict) -> &'static str {
+    match verdict {
+        ShadowContentVerdict::Fresh => unreachable!(
+            "shadow_content_verdict_remediation is only called for non-fresh serving refusals"
+        ),
+        ShadowContentVerdict::Stale { .. } => SHADOW_STALE_REMEDIATION,
+        ShadowContentVerdict::SourceOutOfBand { .. } => SHADOW_SOURCE_OUT_OF_BAND_REMEDIATION,
+        ShadowContentVerdict::WatermarkDomainMismatch { remediation, .. }
+        | ShadowContentVerdict::Unverifiable { remediation, .. } => remediation,
+    }
+}
+
+/// Returns a tool-error envelope when a shadow-indexed graph-serving surface would
+/// otherwise serve a stale or unverifiable persisted graph.
+///
+/// The source of truth remains [`evaluate_shadow_content_freshness`]: this wrapper
+/// only converts its non-fresh verdicts into the MCP tool-result shape used by
+/// graph/navigation/kernel surfaces. It never rechecks through a separate mtime or
+/// ad-hoc dirty detector, so every graph surface refuses on the same persisted
+/// fingerprint/watermark contract.
+pub(crate) fn shadow_graph_freshness_refusal(
+    cache_dir: &Path,
+    project: &str,
+    tool: &str,
+) -> Result<Option<String>, DynError> {
+    let verdict = evaluate_shadow_content_freshness(cache_dir, project)?;
+    if verdict == ShadowContentVerdict::Fresh {
+        return Ok(None);
+    }
+    let summary = shadow_import_current_summary(&verdict);
+    let code = shadow_content_verdict_code(&verdict);
+    let message = shadow_content_verdict_message(&verdict, project, tool);
+    let remediation = shadow_content_verdict_remediation(&verdict);
+    let trust = summary.get("trust").cloned().ok_or_else(|| -> DynError {
+        format!(
+            "ASTRO_SHADOW_FRESHNESS_SUMMARY_TRUST_MISSING: non-fresh verdict {code} \
+                 produced no trust label"
+        )
+        .into()
+    })?;
+    let freshness = summary
+        .get("freshness")
+        .cloned()
+        .ok_or_else(|| -> DynError {
+            format!(
+                "ASTRO_SHADOW_FRESHNESS_SUMMARY_FRESHNESS_MISSING: non-fresh verdict {code} \
+                 produced no freshness label"
+            )
+            .into()
+        })?;
+    Ok(Some(tool_json_error_result(json!({
+        "schema": "astrolabe.shadow_freshness_refusal.v1",
+        "status": "refused",
+        "tool": tool,
+        "project": project,
+        "code": code,
+        "message": message,
+        "remediation": remediation,
+        "trust": trust,
+        "freshness": freshness,
+        "shadow_import": summary,
+    }))?))
+}
+
 pub(crate) fn import_shadow_vault_with_archaeology_at(
     cache_dir: &Path,
     project: &str,

@@ -75,6 +75,10 @@ pub(crate) fn handle_get_kernel(args_json: &str) -> Result<String, DynError> {
         ));
     }
     let scope = string_arg(args_obj, "scope").map(ToOwned::to_owned);
+    let cache_dir = astrolabe_bridge::cbm_cache_dir()?;
+    if let Some(refusal) = shadow_graph_freshness_refusal(&cache_dir, &project, "get_kernel")? {
+        return Ok(refusal);
+    }
 
     if mode == "build" {
         // #410: recompute the anchor-trust-grounded feedback-vertex-set kernel over
@@ -88,7 +92,6 @@ pub(crate) fn handle_get_kernel(args_json: &str) -> Result<String, DynError> {
         // divergence). A scope that genuinely cannot yield a kernel surfaces as a
         // coded fail-closed refusal carrying the real build-layer reason — never a
         // fabricated build.
-        let cache_dir = astrolabe_bridge::cbm_cache_dir()?;
         let (vault_dir, vault_id, vault_salt) = shadow_vault_config_at(&cache_dir, &project)?;
         if !vault_dir.exists() {
             return tool_json_error_result(json!({
@@ -118,7 +121,6 @@ pub(crate) fn handle_get_kernel(args_json: &str) -> Result<String, DynError> {
         };
     }
 
-    let cache_dir = astrolabe_bridge::cbm_cache_dir()?;
     let kernel_context = read_kernel_context_metadata(&cache_dir, &project)?;
 
     // #39: gaps + quadrant serve the flattened cross-scope grounding-gap views
@@ -527,6 +529,9 @@ pub(crate) fn handle_kernel_answer(args_json: &str) -> Result<String, DynError> 
     // artifact or projection is persisted there is nothing to answer from and we
     // fail closed rather than fabricate an ungrounded answer.
     let cache_dir = astrolabe_bridge::cbm_cache_dir()?;
+    if let Some(refusal) = shadow_graph_freshness_refusal(&cache_dir, &project, "kernel_answer")? {
+        return Ok(refusal);
+    }
     match build_kernel_answer_inputs(&cache_dir, &project)? {
         Some(inputs) => serve_kernel_answer(&cache_dir, &project, query, &scope, &inputs),
         None => tool_json_error_result(json!({

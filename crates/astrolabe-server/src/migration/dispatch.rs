@@ -330,7 +330,9 @@ pub(crate) fn should_wrap_tool(
             };
             Ok(read_dial(&project)? == MigrationDial::Shadow)
         }
-        "search_graph" => Ok(search_graph_has_astrolabe_knob(args)),
+        "search_graph" => {
+            Ok(search_graph_has_astrolabe_knob(args) || shadow_project_requested(args)?.is_some())
+        }
         "detect_changes" => {
             // Only augment grounded risk when the project is shadow-indexed; a
             // non-shadow project has no vault, so it passes straight through with
@@ -341,19 +343,28 @@ pub(crate) fn should_wrap_tool(
             Ok(read_dial(&project)? == MigrationDial::Shadow)
         }
         "trace_path" | "trace_call_path" => {
-            // The scored best-first re-rank is the ONLY divergence from CBM's plain
-            // BFS. Without `scored:true` we never intercept, so the legacy traversal
-            // is served byte-for-byte by libcbm (the #43 plain-BFS byte-parity floor).
-            Ok(trace_path_scored_requested(args))
+            // A stale shadow graph must be refused before either the scored Astrolabe
+            // ranking or the byte-identical CBM traversal can serve it (#916).
+            Ok(trace_path_scored_requested(args) || shadow_project_requested(args)?.is_some())
         }
         "query_graph" => {
-            // The `as_of` time-travel is the ONLY divergence from CBM's live Cypher.
-            // Without `as_of` we never intercept, so the query is served byte-for-byte
-            // by libcbm against the live store (#43 live-query byte-parity floor).
-            Ok(query_graph_as_of_requested(args))
+            // Live shadow Cypher reads and historical reads both answer from the
+            // persisted graph; refuse stale graph state before serving either (#916).
+            Ok(query_graph_as_of_requested(args) || shadow_project_requested(args)?.is_some())
         }
         name if is_advertised_astrolabe_tool(name) => Ok(true),
         _ => Ok(false),
+    }
+}
+
+fn shadow_project_requested(args: &Map<String, Value>) -> Result<Option<String>, DynError> {
+    let Some(project) = status_project_from_args(args)? else {
+        return Ok(None);
+    };
+    if read_dial(&project)? == MigrationDial::Shadow {
+        Ok(Some(project))
+    } else {
+        Ok(None)
     }
 }
 
@@ -851,23 +862,28 @@ pub(crate) fn handle_get_architecture(
     runner: &CbmToolRunner,
     args_json: &str,
 ) -> Result<String, DynError> {
+    let Ok(args) = serde_json::from_str::<Value>(args_json) else {
+        return Ok(runner.handle_tool_raw("get_architecture", args_json)?);
+    };
+    let Some(args_obj) = args.as_object() else {
+        return Ok(runner.handle_tool_raw("get_architecture", args_json)?);
+    };
+    let Some(project) = status_project_from_args(args_obj)? else {
+        return Ok(runner.handle_tool_raw("get_architecture", args_json)?);
+    };
+    if read_dial(&project)? != MigrationDial::Shadow {
+        return Ok(runner.handle_tool_raw("get_architecture", args_json)?);
+    }
+    let cache_dir = astrolabe_bridge::cbm_cache_dir()?;
+    if let Some(refusal) = shadow_graph_freshness_refusal(&cache_dir, &project, "get_architecture")?
+    {
+        return Ok(refusal);
+    }
+
     let result = runner.handle_tool_raw("get_architecture", args_json)?;
     if tool_result_is_error(&result)? {
         return Ok(result);
     }
-    let Ok(args) = serde_json::from_str::<Value>(args_json) else {
-        return Ok(result);
-    };
-    let Some(args_obj) = args.as_object() else {
-        return Ok(result);
-    };
-    let Some(project) = status_project_from_args(args_obj)? else {
-        return Ok(result);
-    };
-    if read_dial(&project)? != MigrationDial::Shadow {
-        return Ok(result);
-    }
-    let cache_dir = astrolabe_bridge::cbm_cache_dir()?;
     augment_tool_result(
         &result,
         json!({
@@ -968,6 +984,18 @@ pub(crate) fn handle_search_graph(
         return search_graph_argument_type_error("propagated_label", "a JSON string", value);
     }
 
+    let shadow_project = shadow_project_requested(args_obj)?;
+    let cache_dir = if shadow_project.is_some() {
+        Some(astrolabe_bridge::cbm_cache_dir()?)
+    } else {
+        None
+    };
+    if let (Some(project), Some(cache_dir)) = (shadow_project.as_deref(), cache_dir.as_ref())
+        && let Some(refusal) = shadow_graph_freshness_refusal(cache_dir, project, "search_graph")?
+    {
+        return Ok(refusal);
+    }
+
     // #42: opt-in fused engine. Only an explicit `fusion: true` diverts from the
     // legacy path; anything else keeps the byte-identical CBM passthrough.
     if args_obj.get("fusion").and_then(Value::as_bool) == Some(true) {
@@ -1010,7 +1038,10 @@ pub(crate) fn handle_search_graph(
         );
     }
 
-    let cache_dir = astrolabe_bridge::cbm_cache_dir()?;
+    let cache_dir = match cache_dir {
+        Some(cache_dir) => cache_dir,
+        None => astrolabe_bridge::cbm_cache_dir()?,
+    };
     let kernel_context = read_kernel_context_metadata(&cache_dir, &project)?;
     let labeled_symbols = match propagated_label_symbol_ids(&kernel_context, &label_filter) {
         Ok(ids) => ids,

@@ -172,9 +172,25 @@ pub(crate) fn handle_find_similar(args_json: &str) -> Result<String, DynError> {
         .or(fs_optional_u64(args, "limit")?)
         .unwrap_or(DEFAULT_FIND_SIMILAR_K);
     let ef = fs_optional_u64(args, "ef")?.unwrap_or(DEFAULT_FIND_SIMILAR_EF);
+    if !matches!(
+        mode.as_str(),
+        "structural" | "api" | "semantic" | "clone" | "agree" | "disagree"
+    ) {
+        return fs_coded_error(
+            ASTRO_FIND_SIMILAR_MODE,
+            format!(
+                "find_similar mode {mode:?} is not served by the persisted slot-vector surface"
+            ),
+            "Use mode structural, api, semantic, clone, agree, or disagree. profile/co_change/\
+             define are tracked separately and refuse rather than fabricate a neighbor list.",
+        );
+    }
     let caps = SearchCaps::default_caps();
 
     let cache_dir = astrolabe_bridge::cbm_cache_dir()?;
+    if let Some(refusal) = shadow_graph_freshness_refusal(&cache_dir, &project, "find_similar")? {
+        return Ok(refusal);
+    }
     let (vault_dir, vault_id, vault_salt) = shadow_vault_config_at(&cache_dir, &project)?;
     if !vault_dir.exists() {
         return fs_coded_error(

@@ -92,8 +92,17 @@ pub(crate) fn handle_trace_path(
     let Some(args_obj) = args.as_object() else {
         return Ok(runner.handle_tool_raw("trace_path", args_json)?);
     };
+    if let Some(project) = status_project_from_args(args_obj)?
+        && read_dial(&project)? == MigrationDial::Shadow
+    {
+        let cache_dir = astrolabe_bridge::cbm_cache_dir()?;
+        if let Some(refusal) = shadow_graph_freshness_refusal(&cache_dir, &project, "trace_path")? {
+            return Ok(refusal);
+        }
+    }
     if !trace_path_scored_requested(args_obj) {
-        // Pure legacy request — pass the original bytes through unchanged.
+        // Pure legacy request — pass the original bytes through unchanged after
+        // proving any named shadow project is source-current (#916).
         return Ok(runner.handle_tool_raw("trace_path", args_json)?);
     }
 
@@ -174,9 +183,9 @@ fn score_trace_graph_obj(graph: &mut Map<String, Value>, attenuation_permille: u
             "ordering": "score_micros descending, qualified_name ascending on a tie",
         }),
     );
-    // Envelope labels (invariant 1): the scored ranking is grounded in the live
-    // CBM traversal of the persisted store; freshness is `fresh` because the
-    // traversal is computed on demand, not read from a cached ranking.
+    // Envelope labels (invariant 1): the scored ranking is grounded in the CBM
+    // traversal of the persisted store after the serving freshness preflight has
+    // proven any named shadow source is current (#916).
     graph.insert("trust".to_string(), json!("grounded"));
     graph.insert("freshness".to_string(), json!("fresh"));
     graph.insert(
