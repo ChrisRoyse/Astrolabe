@@ -746,8 +746,15 @@ static void snapshot_capture_prepared(snapshot_capture_result_t *result) {
         result->wide_source, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING,
         FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN | FILE_FLAG_OPEN_REPARSE_POINT, NULL);
     if (source == INVALID_HANDLE_VALUE) {
-        snapshot_capture_fail(result, "CBM_SOURCE_SNAPSHOT_SOURCE_OPEN_FAILED", "open_source",
-                              file->path, GetLastError());
+        error = GetLastError();
+        if (error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND) {
+            snapshot_capture_fail_source_changed_basic(
+                result, "CBM_SOURCE_SNAPSHOT_DISCOVERY_DRIFT", "open_source", file->path,
+                "source_removed_after_discovery");
+        } else {
+            snapshot_capture_fail(result, "CBM_SOURCE_SNAPSHOT_SOURCE_OPEN_FAILED", "open_source",
+                                  file->path, error);
+        }
         goto cleanup;
     }
 
