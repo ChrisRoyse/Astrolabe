@@ -2900,7 +2900,27 @@ fn expected_raw_guard_slot_rows(prepared: &PreparedBatch, gate: &QuantizationGat
 }
 
 fn read_nodes(connection: &Connection, expected_project: &str) -> IngestResult<Vec<RawNodeRow>> {
-    let vectors = read_node_vectors(connection, expected_project)?;
+    read_nodes_with_vectors(connection, expected_project, true)
+}
+
+/// Reads the complete raw node representation used by the generic SQLite importer.
+///
+/// The out-of-process shadow pipeline has a narrower contract: it never carries
+/// `node_vectors` into its row stream.  Keeping that projection on this common
+/// reader used to open and clone the entire `node_vectors` table only for the
+/// caller to discard every value.  `include_node_vectors=false` is therefore a
+/// semantic no-op for the pipeline projection, but avoids a corpus-sized hidden
+/// allocation before the bounded import work begins (#855).
+fn read_nodes_with_vectors(
+    connection: &Connection,
+    expected_project: &str,
+    include_node_vectors: bool,
+) -> IngestResult<Vec<RawNodeRow>> {
+    let vectors = if include_node_vectors {
+        read_node_vectors(connection, expected_project)?
+    } else {
+        HashMap::new()
+    };
     let mut statement = connection
         .prepare(
             "SELECT id, project, label, name, qualified_name, \
@@ -3270,7 +3290,11 @@ pub fn read_cbm_sqlite_pipeline_rows(
 ) -> IngestResult<CbmSqlitePipelineRows> {
     let connection = open_cbm_source_connection(sqlite_path)?;
     validate_pipeline_project(&connection, project)?;
-    let raw_nodes = read_nodes(&connection, project)?;
+    // Pipeline rows intentionally have no vector field.  Do not open or clone
+    // `node_vectors` here: that table is neither part of the CBM row-sink
+    // contract nor consumed by the shadow candidate, and loading it creates a
+    // corpus-sized transient allocation before import (#855).
+    let raw_nodes = read_nodes_with_vectors(&connection, project, false)?;
     let raw_edges = read_edges(&connection, project)?;
     let raw_file_hashes = read_file_hashes(&connection, project)?;
     let nodes = raw_nodes

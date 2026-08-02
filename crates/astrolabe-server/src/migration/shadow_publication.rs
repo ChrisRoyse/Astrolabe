@@ -1620,7 +1620,13 @@ fn push_transaction_journal_sentinel(
         .into());
     }
     let journal = read_publication_journal(&journal_path)?;
-    validate_publication_journal_identity(&journal, transaction, project_root, live_cache, project)?;
+    validate_publication_journal_identity(
+        &journal,
+        transaction,
+        project_root,
+        live_cache,
+        project,
+    )?;
     sentinel.journal_count += 1;
     let manifest_kind = if journal.recovery_manifest.is_some() {
         "artifact_recovery"
@@ -1880,7 +1886,12 @@ fn push_vault_sentinel(
         }),
     )?;
     push_direct_children_sentinel(project_root, path, sentinel)?;
-    for relative in ["CURRENT", "MANIFEST", "ROUTER_HANDOFF", "ledger_head/current.json"] {
+    for relative in [
+        "CURRENT",
+        "MANIFEST",
+        "ROUTER_HANDOFF",
+        "ledger_head/current.json",
+    ] {
         let marker = path.join(relative);
         push_file_probe_sentinel(
             project_root,
@@ -1894,7 +1905,10 @@ fn push_vault_sentinel(
 }
 
 fn sentinel_relative_path(root: &Path, path: &Path) -> Result<String, DynError> {
-    Ok(path.strip_prefix(root)?.to_string_lossy().replace('\\', "/"))
+    Ok(path
+        .strip_prefix(root)?
+        .to_string_lossy()
+        .replace('\\', "/"))
 }
 
 fn sentinel_display_path(root: &Path, path: &Path) -> String {
