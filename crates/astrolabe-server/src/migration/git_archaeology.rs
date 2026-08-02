@@ -3712,11 +3712,13 @@ fn git_checked(repo: &Path, args: &[&str]) -> Result<(), DynError> {
 ///
 /// The default file-scoped path does not create a temporary Git index. It resolves
 /// exact `commit:path` blobs with one bounded `cat-file --batch-command --buffer
-/// -Z` object-info process, then streams checkout-filtered bytes with one
-/// `cat-file --batch --filters -Z --buffer` process. The non-default
-/// whole-subtree measurement path keeps the older scope-private index +
-/// `checkout-index` route because it intentionally materializes a complete
-/// subtree for parity measurements.
+/// -Z` object-info process, then streams the verified raw blob objects with one
+/// `cat-file --batch -Z --buffer` process. The raw-object stream keeps Git's
+/// `%objectsize` and content terminator contract exact; checkout filters can
+/// expand bytes beyond the reported object size and make the batch stream
+/// ambiguous. The non-default whole-subtree measurement path keeps the older
+/// scope-private index + `checkout-index` route because it intentionally
+/// materializes a complete subtree for parity measurements.
 fn materialize_historical_tree(
     repo: &Path,
     scope: &Path,
@@ -4118,7 +4120,6 @@ fn stream_file_scoped_historical_blobs(
             "core.longpaths=true",
             "cat-file",
             "--batch",
-            "--filters",
             "--buffer",
             "-Z",
         ])
@@ -4142,8 +4143,6 @@ fn stream_file_scoped_historical_blobs(
         })?;
         for object in objects {
             stdin.write_all(object.object_oid.as_bytes())?;
-            stdin.write_all(b" ")?;
-            stdin.write_all(object.path.as_bytes())?;
             stdin.write_all(&[0])?;
         }
     }
