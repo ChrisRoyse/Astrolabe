@@ -141,31 +141,36 @@ function Invoke-GitRawCapture {
     param(
         [Parameter(Mandatory)][string]$GitExe,
         [Parameter(Mandatory)][string]$Workspace,
-        [Parameter(Mandatory)][string]$Arguments
+        [Parameter(Mandatory)][string[]]$Arguments,
+        [Parameter(Mandatory)][string]$Description
     )
-    $workspaceArgument = [IO.Path]::GetFullPath($Workspace).TrimEnd('\', '/')
-    if ($workspaceArgument.Contains('"')) {
-        Fail-Astro 'ASTRO_FSV_GIT_UNREADABLE' "workspace path contains a quote and cannot be passed to native Git: $workspaceArgument" `
-            'repair repository path identity before staging evidence'
-    }
     $start = [Diagnostics.ProcessStartInfo]::new()
     $start.FileName = $GitExe
-    $start.Arguments = "-C `"$workspaceArgument`" $Arguments"
     $start.UseShellExecute = $false
     $start.CreateNoWindow = $true
     $start.RedirectStandardOutput = $true
     $start.RedirectStandardError = $true
+    [void]$start.ArgumentList.Add('-C')
+    [void]$start.ArgumentList.Add([IO.Path]::GetFullPath($Workspace).TrimEnd('\', '/'))
+    foreach ($argument in $Arguments) {
+        [void]$start.ArgumentList.Add($argument)
+    }
     $process = [Diagnostics.Process]::new()
     $process.StartInfo = $start
     $stdout = [IO.MemoryStream]::new()
     try {
         if (-not $process.Start()) {
-            Fail-Astro 'ASTRO_FSV_GIT_UNREADABLE' 'native Git process did not start during artifact promotion' `
+            Fail-Astro 'ASTRO_FSV_GIT_UNREADABLE' "$Description did not start during artifact promotion" `
                 'repair native Git before staging evidence'
         }
+        $stdoutTask = $process.StandardOutput.BaseStream.CopyToAsync($stdout)
         $stderrTask = $process.StandardError.ReadToEndAsync()
-        $process.StandardOutput.BaseStream.CopyTo($stdout)
-        $process.WaitForExit()
+        if (-not $process.WaitForExit(30000)) {
+            try { $process.Kill() } catch {}
+            Fail-Astro 'ASTRO_FSV_GIT_UNREADABLE' "$Description exceeded the 30000 ms bounded timeout during artifact promotion" `
+                'repair native Git or repository state before staging evidence'
+        }
+        $stdoutTask.GetAwaiter().GetResult()
         return [pscustomobject]@{
             ExitCode = [int]$process.ExitCode
             Bytes = [byte[]]$stdout.ToArray()
@@ -175,6 +180,53 @@ function Invoke-GitRawCapture {
     finally {
         $stdout.Dispose()
         $process.Dispose()
+    }
+}
+
+function Read-GitStatusFingerprint {
+    param(
+        [Parameter(Mandatory)][string]$GitExe,
+        [Parameter(Mandatory)][string]$Workspace
+    )
+    $status = Invoke-GitRawCapture `
+        -GitExe $GitExe `
+        -Workspace $Workspace `
+        -Arguments @(
+            '-c',
+            'core.quotepath=false',
+            'status',
+            '--porcelain=v1',
+            '-z',
+            '--untracked-files=normal'
+        ) `
+        -Description 'git status --porcelain=v1 -z --untracked-files=normal'
+    if ($status.ExitCode -ne 0) {
+        Fail-Astro 'ASTRO_FSV_GIT_UNREADABLE' "git status --porcelain=v1 -z failed during artifact promotion (exit=$($status.ExitCode), stderr=$($status.Stderr))" `
+            'repair repository state before staging evidence'
+    }
+    try {
+        $statusText = [Text.UTF8Encoding]::new($false, $true).GetString($status.Bytes)
+    }
+    catch {
+        Fail-Astro 'ASTRO_FSV_GIT_STATUS_UTF8_INVALID' "Git status emitted bytes that are not strict UTF-8 during artifact promotion: $($_.Exception.Message)" `
+            'rename the unsupported Windows worktree path before staging evidence'
+    }
+    if ($status.Bytes.Length -gt 0 -and
+        $status.Bytes[$status.Bytes.Length - 1] -ne 0) {
+        Fail-Astro 'ASTRO_FSV_GIT_STATUS_TERMINAL_NUL_MISSING' `
+            'nonempty Git porcelain-v1 -z output lacks its terminal NUL during artifact promotion' `
+            'repair or replace the native Git executable before staging evidence'
+    }
+    $parts = @($statusText.Split([char]0))
+    $records = if ($statusText.Length -eq 0) {
+        @()
+    }
+    else {
+        @($parts[0..($parts.Count - 2)])
+    }
+    return [ordered]@{
+        sha256 = ByteArray-Sha256 $status.Bytes
+        records = [string[]]$records
     }
 }
 
@@ -205,25 +257,20 @@ function Get-RepoState {
         Fail-Astro 'ASTRO_FSV_GIT_UNREADABLE' 'git rev-parse HEAD failed during artifact promotion' `
             'repair repository state before staging evidence'
     }
-    $status = Invoke-GitRawCapture `
-        -GitExe $GitExe `
-        -Workspace $Workspace `
-        -Arguments '-c core.quotepath=false status --porcelain=v1 -z --untracked-files=normal'
-    if ($status.ExitCode -ne 0) {
-        Fail-Astro 'ASTRO_FSV_GIT_UNREADABLE' "git status --porcelain=v1 -z failed during artifact promotion (exit=$($status.ExitCode), stderr=$($status.Stderr))" `
-            'repair repository state before staging evidence'
-    }
+    $status = Read-GitStatusFingerprint -GitExe $GitExe -Workspace $Workspace
     $diff = Invoke-GitRawCapture `
         -GitExe $GitExe `
         -Workspace $Workspace `
-        -Arguments 'diff --binary HEAD'
+        -Arguments @('diff', '--binary', 'HEAD') `
+        -Description 'git diff --binary HEAD'
     if ($diff.ExitCode -ne 0) {
         Fail-Astro 'ASTRO_FSV_GIT_UNREADABLE' "git diff --binary HEAD failed during artifact promotion (exit=$($diff.ExitCode), stderr=$($diff.Stderr))" `
             'repair repository state before staging evidence'
     }
     return [ordered]@{
         head_sha = $head
-        status_sha256 = ByteArray-Sha256 $status.Bytes
+        status_sha256 = [string]$status.sha256
+        status_records = [string[]]$status.records
         diff_sha256 = ByteArray-Sha256 $diff.Bytes
     }
 }
