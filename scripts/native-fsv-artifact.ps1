@@ -26,7 +26,7 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory)]
-    [ValidateSet('Stage', 'Inspect', 'Cleanup', 'Abandon', 'Quarantine', 'MigrateLegacy', 'RetireLock')]
+    [ValidateSet('Stage', 'Inspect', 'Cleanup', 'Abandon', 'PreAdmissionAbandon', 'Quarantine', 'MigrateLegacy', 'RetireLock')]
     [string]$Operation,
 
     [string]$SourcePath = '',
@@ -39,6 +39,9 @@ param(
     [string]$RecoveryRecordPath = '',
     [string]$MigrationRecordPath = '',
     [string]$LiveStatePath = '',
+    [string]$StandardOutputPath = '',
+    [string]$StandardErrorPath = '',
+    [string]$PreAdmissionDirectoryPath = '',
     [string]$TrackerCommentUrl = '',
     [string]$ReasonCode = '',
     [string]$ReasonMessage = ''
@@ -79,6 +82,27 @@ function Assert-PathWithin {
     if (-not $full.StartsWith($rootPrefix, [StringComparison]::OrdinalIgnoreCase)) {
         Fail-Astro $Code "$Description '$full' escapes required root '$($rootPrefix.TrimEnd('\'))'" `
             "use a fresh path below the required workspace-local root"
+    }
+    return $full
+}
+
+function Assert-DirectSessionChildPath {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][string]$SessionDirectory,
+        [Parameter(Mandatory)][string]$Code,
+        [Parameter(Mandatory)][string]$Description
+    )
+
+    $full = Assert-PathWithin $Path $SessionDirectory $Code $Description
+    if (-not [string]::Equals(
+            [IO.Path]::GetFullPath((Split-Path -Parent $full)),
+            [IO.Path]::GetFullPath($SessionDirectory),
+            [StringComparison]::OrdinalIgnoreCase
+        )) {
+        Fail-Astro $Code `
+            "$Description must be a direct child of staged session '$SessionDirectory': $full" `
+            'bind one fresh direct session-root path; never infer nested pre-admission state'
     }
     return $full
 }
@@ -794,6 +818,109 @@ function Read-AstroFsvLegacyTrackerEvidence {
         author = [string]$comment.user.login
         evidence = $evidence
     }
+}
+
+function Read-AstroFsvPreAdmissionTrackerEvidence {
+    param(
+        [Parameter(Mandatory)][string]$Url,
+        [Parameter(Mandatory)][int]$ExpectedIssue,
+        [Parameter(Mandatory)][string]$ExpectedReceiptPath,
+        [Parameter(Mandatory)][string]$ExpectedReceiptSha256,
+        [Parameter(Mandatory)][string]$ExpectedArtifactPath,
+        [Parameter(Mandatory)][string]$ExpectedArtifactSha256,
+        [Parameter(Mandatory)][string]$ExpectedSessionDirectory,
+        [Parameter(Mandatory)][string]$ExpectedPreAdmissionDirectory,
+        [Parameter(Mandatory)][string]$ExpectedStandardOutputPath,
+        [Parameter(Mandatory)][string]$ExpectedStandardErrorPath,
+        [Parameter(Mandatory)][string]$ExpectedRunRecordPath,
+        [Parameter(Mandatory)][string]$ExpectedLiveStatePath,
+        [Parameter(Mandatory)][string]$ExpectedInventorySchema,
+        [Parameter(Mandatory)][string]$ExpectedInventoryEncoding,
+        [Parameter(Mandatory)][int]$ExpectedInventoryEntryCount,
+        [Parameter(Mandatory)][uint64]$ExpectedInventoryCanonicalByteCount,
+        [Parameter(Mandatory)][string]$ExpectedInventorySha256,
+        [Parameter(Mandatory)][string]$ExpectedRecoveryRecordPath,
+        [Parameter(Mandatory)][string]$ExpectedReasonCode
+    )
+
+    $match = [Regex]::Match(
+        $Url,
+        '^https://github\.com/(?<owner>[^/]+)/(?<repo>[^/]+)/issues/(?<issue>[1-9][0-9]*)#issuecomment-(?<comment>[1-9][0-9]*)\z',
+        [Text.RegularExpressions.RegexOptions]::CultureInvariant
+    )
+    if (-not $match.Success -or [int]$match.Groups['issue'].Value -ne $ExpectedIssue) {
+        Fail-Astro 'ASTRO_FSV_PRE_ADMISSION_TRACKER_URL_INVALID' `
+            "tracker URL is not an exact issue-comment URL for #${ExpectedIssue}: $Url" `
+            'post one fresh owner-authored evidence comment on the exact driving issue'
+    }
+    $comment = Invoke-AstroFsvGhJson ('repos/{0}/{1}/issues/comments/{2}' -f $match.Groups['owner'].Value, $match.Groups['repo'].Value, $match.Groups['comment'].Value)
+    if ([string]$comment.html_url -cne $Url -or [string]$comment.author_association -cne 'OWNER') {
+        Fail-Astro 'ASTRO_FSV_PRE_ADMISSION_TRACKER_IDENTITY_INVALID' `
+            'GitHub readback does not bind the exact owner-authored comment URL' `
+            'use the canonical html_url of a repository-owner evidence comment'
+    }
+    $prefix = 'ASTRO_FSV_PRE_ADMISSION_ABANDON_EVIDENCE '
+    [string[]]$markers = @([string]$comment.body -split "`r?`n" | Where-Object { $_.StartsWith($prefix, [StringComparison]::Ordinal) })
+    if ($markers.Count -ne 1) {
+        Fail-Astro 'ASTRO_FSV_PRE_ADMISSION_TRACKER_EVIDENCE_INVALID' `
+            "tracker comment must contain exactly one '$prefix' line" `
+            'post one fresh machine-readable pre-admission abandonment evidence object'
+    }
+    try { $evidence = $markers[0].Substring($prefix.Length) | ConvertFrom-Json }
+    catch {
+        Fail-Astro 'ASTRO_FSV_PRE_ADMISSION_TRACKER_EVIDENCE_INVALID' `
+            "tracker evidence JSON is invalid: $($_.Exception.Message)" `
+            'post one fresh exact JSON evidence object'
+    }
+    $expectedFields = @(
+        'schema', 'issue', 'receipt_path', 'receipt_sha256', 'artifact_path', 'artifact_sha256',
+        'session_directory', 'pre_admission_directory', 'standard_output_path', 'standard_error_path',
+        'run_record_path', 'live_state_path', 'standard_output_state', 'standard_error_state',
+        'run_record_state', 'live_state_state', 'inventory_schema', 'inventory_encoding',
+        'inventory_entry_count', 'inventory_canonical_byte_count', 'inventory_sha256',
+        'receipt_owner_probe_state', 'recovery_record_path', 'reason_code', 'authorized_action'
+    )
+    $actualFields = @($evidence.PSObject.Properties | ForEach-Object Name)
+    if ($actualFields.Count -ne $expectedFields.Count -or @($expectedFields | Where-Object { $actualFields -notcontains $_ }).Count -ne 0) {
+        Fail-Astro 'ASTRO_FSV_PRE_ADMISSION_TRACKER_EVIDENCE_INVALID' `
+            'tracker evidence fields differ from the exact pre-admission abandonment contract' `
+            'post a fresh object containing exactly the documented fields'
+    }
+    $expectedPaths = @(
+        @('receipt_path', $ExpectedReceiptPath), @('artifact_path', $ExpectedArtifactPath),
+        @('session_directory', $ExpectedSessionDirectory), @('pre_admission_directory', $ExpectedPreAdmissionDirectory),
+        @('standard_output_path', $ExpectedStandardOutputPath), @('standard_error_path', $ExpectedStandardErrorPath),
+        @('run_record_path', $ExpectedRunRecordPath), @('live_state_path', $ExpectedLiveStatePath),
+        @('recovery_record_path', $ExpectedRecoveryRecordPath)
+    )
+    foreach ($pair in $expectedPaths) {
+        if (-not [string]::Equals([IO.Path]::GetFullPath([string]$evidence.($pair[0])), [IO.Path]::GetFullPath([string]$pair[1]), [StringComparison]::OrdinalIgnoreCase)) {
+            Fail-Astro 'ASTRO_FSV_PRE_ADMISSION_TRACKER_EVIDENCE_MISMATCH' `
+                "tracker evidence path differs for $($pair[0])" `
+                're-read physical state and post a fresh exact evidence object'
+        }
+    }
+    if ($evidence.schema -cne 'astrolabe.native-fsv-pre-admission-abandon-evidence.v1' -or
+        [int]$evidence.issue -ne $ExpectedIssue -or
+        [string]$evidence.receipt_sha256 -cne $ExpectedReceiptSha256 -or
+        [string]$evidence.artifact_sha256 -cne $ExpectedArtifactSha256 -or
+        [string]$evidence.standard_output_state -cne 'absent' -or
+        [string]$evidence.standard_error_state -cne 'absent' -or
+        [string]$evidence.run_record_state -cne 'absent' -or
+        [string]$evidence.live_state_state -cne 'absent' -or
+        [string]$evidence.inventory_schema -cne $ExpectedInventorySchema -or
+        [string]$evidence.inventory_encoding -cne $ExpectedInventoryEncoding -or
+        [int]$evidence.inventory_entry_count -ne $ExpectedInventoryEntryCount -or
+        [uint64]$evidence.inventory_canonical_byte_count -ne $ExpectedInventoryCanonicalByteCount -or
+        [string]$evidence.inventory_sha256 -cne $ExpectedInventorySha256 -or
+        [string]$evidence.receipt_owner_probe_state -cne 'all-inactive' -or
+        [string]$evidence.reason_code -cne $ExpectedReasonCode -or
+        [string]$evidence.authorized_action -cne 'remove-exact-pre-admission-session-without-child-or-live-state') {
+        Fail-Astro 'ASTRO_FSV_PRE_ADMISSION_TRACKER_EVIDENCE_MISMATCH' `
+            'tracker evidence differs from the exact local pre-admission session binding' `
+            're-read physical state and post a fresh exact evidence object'
+    }
+    return [ordered]@{ url = $Url; comment_id = [long]$match.Groups['comment'].Value; author = [string]$comment.user.login; evidence = $evidence }
 }
 
 function Read-Receipt {
@@ -1688,6 +1815,231 @@ try {
                 before = $before
                 after = [ordered]@{ session = $session; exists = $false }
             } | ConvertTo-Json -Depth 18 -Compress | Write-Output
+        }
+        'PreAdmissionAbandon' {
+            $receiptState = Read-Receipt $ReceiptPath $evidenceRoot
+            $inspection = Inspect-ReceiptArtifact $receiptState $evidenceRoot
+            Assert-FsvLockAbsent $fsvLock
+            $launcherProtocolState = Read-AstroLauncherLock -LockPath $launcherLockPath
+            if ($launcherProtocolState.State -ne 'absent') {
+                Fail-Astro 'ASTRO_FSV_PRE_ADMISSION_LAUNCHER_LOCK' `
+                    "launcher protocol state is '$($launcherProtocolState.State)'; pre-admission abandonment requires authoritative absence" `
+                    'wait for a live owner to finish or recover the exact launcher generation before session removal'
+            }
+            if ($ReasonCode -notmatch '^[A-Z][A-Z0-9_]{2,95}$' -or
+                [string]::IsNullOrWhiteSpace($ReasonMessage)) {
+                Fail-Astro 'ASTRO_FSV_PRE_ADMISSION_REASON_INVALID' `
+                    'PreAdmissionAbandon requires a stable upper-case ReasonCode and nonblank ReasonMessage' `
+                    'describe the exact pre-admission runner refusal before requesting tracker authorization'
+            }
+            if ([string]::IsNullOrWhiteSpace($PreAdmissionDirectoryPath) -or
+                [string]::IsNullOrWhiteSpace($StandardOutputPath) -or
+                [string]::IsNullOrWhiteSpace($StandardErrorPath) -or
+                [string]::IsNullOrWhiteSpace($RunRecordPath) -or
+                [string]::IsNullOrWhiteSpace($LiveStatePath)) {
+                Fail-Astro 'ASTRO_FSV_PRE_ADMISSION_PATH_REQUIRED' `
+                    'PreAdmissionAbandon requires the exact empty directory plus all four intended direct runner output paths' `
+                    'bind the exact pre-admission refusal paths; do not infer child or runner state'
+            }
+            if ([string]::IsNullOrWhiteSpace($RecoveryRecordPath)) {
+                Fail-Astro 'ASTRO_FSV_PRE_ADMISSION_RECORD_REQUIRED' `
+                    'RecoveryRecordPath is required for PreAdmissionAbandon' `
+                    "use a fresh JSON path below $recoveryRoot; the record persists after exact session removal"
+            }
+            $session = [IO.Path]::GetFullPath($inspection.session_directory)
+            $preAdmissionDirectory = Assert-DirectSessionChildPath `
+                $PreAdmissionDirectoryPath $session `
+                'ASTRO_FSV_PRE_ADMISSION_DIRECTORY_ESCAPE' 'pre-admission evidence directory'
+            $standardOutput = Assert-DirectSessionChildPath `
+                $StandardOutputPath $session `
+                'ASTRO_FSV_PRE_ADMISSION_OUTPUT_ESCAPE' 'standard output path'
+            $standardError = Assert-DirectSessionChildPath `
+                $StandardErrorPath $session `
+                'ASTRO_FSV_PRE_ADMISSION_OUTPUT_ESCAPE' 'standard error path'
+            $runRecord = Assert-DirectSessionChildPath `
+                $RunRecordPath $session `
+                'ASTRO_FSV_PRE_ADMISSION_OUTPUT_ESCAPE' 'run record path'
+            $liveState = Assert-DirectSessionChildPath `
+                $LiveStatePath $session `
+                'ASTRO_FSV_PRE_ADMISSION_OUTPUT_ESCAPE' 'live state path'
+            $claimedPaths = @(
+                [IO.Path]::GetFullPath($receiptState.Path),
+                [IO.Path]::GetFullPath($inspection.artifact_path),
+                $preAdmissionDirectory, $standardOutput, $standardError, $runRecord, $liveState
+            )
+            if (@($claimedPaths | Sort-Object -Unique).Count -ne $claimedPaths.Count) {
+                Fail-Astro 'ASTRO_FSV_PRE_ADMISSION_PATH_COLLISION' `
+                    'pre-admission directory, receipt, artifact, and four runner output paths must be distinct' `
+                    'bind seven distinct direct children of the selected evidence session'
+            }
+            if (-not (Test-AstroPathLongPath -LiteralPath $preAdmissionDirectory -PathType Container)) {
+                Fail-Astro 'ASTRO_FSV_PRE_ADMISSION_DIRECTORY_MISSING' `
+                    "exact pre-admission evidence directory is absent: $preAdmissionDirectory" `
+                    'use Abandon for a pristine session; this lifecycle consumes only the observed empty-directory state'
+            }
+            Assert-NotReparseEntry $preAdmissionDirectory 'pre-admission evidence directory'
+            $preAdmissionEntries = @(Get-AstroDirectoryEntriesLongPath $preAdmissionDirectory)
+            if ($preAdmissionEntries.Count -ne 0) {
+                Fail-Astro 'ASTRO_FSV_PRE_ADMISSION_DIRECTORY_NONEMPTY' `
+                    "pre-admission evidence directory contains $($preAdmissionEntries.Count) entry or entries" `
+                    'preserve every byte; any nested output might belong to a real child or incomplete runner'
+            }
+            foreach ($outputPath in @($standardOutput, $standardError, $runRecord, $liveState)) {
+                Assert-NotReparseEntry $outputPath 'pre-admission runner output path'
+                if (Test-AstroPathLongPath -LiteralPath $outputPath) {
+                    Fail-Astro 'ASTRO_FSV_PRE_ADMISSION_RUN_STATE_PRESENT' `
+                        "pre-admission session contains an expected runner output or control path: $outputPath" `
+                        'preserve the session; a real runner state must use Cleanup or Quarantine only'
+                }
+            }
+            $allowedRootEntries = @(
+                [IO.Path]::GetFullPath($receiptState.Path),
+                [IO.Path]::GetFullPath($inspection.artifact_path),
+                $preAdmissionDirectory
+            )
+            $rootEntries = @(Get-AstroDirectoryEntriesLongPath $session)
+            $unexpectedRootEntries = @($rootEntries | Where-Object {
+                    $full = [IO.Path]::GetFullPath($_.FullName)
+                    -not ($allowedRootEntries -contains $full)
+                })
+            if ($rootEntries.Count -ne 3 -or $unexpectedRootEntries.Count -ne 0) {
+                Fail-Astro 'ASTRO_FSV_PRE_ADMISSION_SESSION_SHAPE_INVALID' `
+                    "session is not the exact receipt/artifact/one-empty-directory pre-admission shape: $($rootEntries.FullName -join '; ')" `
+                    'preserve every byte; unknown state might belong to a real child or incomplete runner'
+            }
+            $recoveryRecord = Assert-PathWithin $RecoveryRecordPath $recoveryRoot `
+                'ASTRO_FSV_PRE_ADMISSION_RECORD_ESCAPE' 'pre-admission recovery record path'
+            if (Test-AstroPathLongPath -LiteralPath $recoveryRecord) {
+                Fail-Astro 'ASTRO_FSV_PRE_ADMISSION_RECORD_REUSE_REFUSED' `
+                    "pre-admission recovery record already exists: $recoveryRecord" `
+                    'use one fresh append-only recovery record path for the exact session'
+            }
+            $ownerBindings = @(
+                New-AstroFsvOwnerBinding 'launcher' 'artifact receipt' $inspection.owners.launcher
+                New-AstroFsvOwnerBinding 'promoter' 'artifact receipt' $inspection.owners.promoter
+            )
+            $initialOwnerProbes = @(Assert-AstroFsvOwnersInactive `
+                    -Bindings $ownerBindings `
+                    -CodePrefix 'ASTRO_FSV_PRE_ADMISSION' `
+                    -Description 'pre-admission evidence session')
+            $initialTree = Get-AstroOrdinaryDirectoryTreeInventoryLongPath $session
+            $receiptHash = File-Sha256 $receiptState.Path
+            $artifactHash = File-Sha256 $inspection.artifact_path
+            Assert-NotReparseEntry $recoveryRoot 'pre-admission recovery record root'
+            $recordParent = Split-Path -Parent $recoveryRecord
+            $tracker = Read-AstroFsvPreAdmissionTrackerEvidence `
+                -Url $TrackerCommentUrl `
+                -ExpectedIssue ([int]$inspection.issue) `
+                -ExpectedReceiptPath $receiptState.Path `
+                -ExpectedReceiptSha256 $receiptHash `
+                -ExpectedArtifactPath $inspection.artifact_path `
+                -ExpectedArtifactSha256 $artifactHash `
+                -ExpectedSessionDirectory $session `
+                -ExpectedPreAdmissionDirectory $preAdmissionDirectory `
+                -ExpectedStandardOutputPath $standardOutput `
+                -ExpectedStandardErrorPath $standardError `
+                -ExpectedRunRecordPath $runRecord `
+                -ExpectedLiveStatePath $liveState `
+                -ExpectedInventorySchema ([string]$initialTree.schema) `
+                -ExpectedInventoryEncoding ([string]$initialTree.encoding) `
+                -ExpectedInventoryEntryCount ([int]$initialTree.entry_count) `
+                -ExpectedInventoryCanonicalByteCount ([uint64]$initialTree.canonical_bytes_length) `
+                -ExpectedInventorySha256 ([string]$initialTree.sha256) `
+                -ExpectedRecoveryRecordPath $recoveryRecord `
+                -ExpectedReasonCode $ReasonCode
+            New-AstroDirectoryLongPath $recordParent | Out-Null
+            Assert-NotReparseEntry $recordParent 'pre-admission recovery record parent'
+            $finalTree = Get-AstroOrdinaryDirectoryTreeInventoryLongPath $session
+            if ([string]$finalTree.schema -cne [string]$initialTree.schema -or
+                [string]$finalTree.encoding -cne [string]$initialTree.encoding -or
+                [int]$finalTree.entry_count -ne [int]$initialTree.entry_count -or
+                [uint64]$finalTree.canonical_bytes_length -ne [uint64]$initialTree.canonical_bytes_length -or
+                [string]$finalTree.sha256 -cne [string]$initialTree.sha256 -or
+                (File-Sha256 $receiptState.Path) -cne $receiptHash -or
+                (File-Sha256 $inspection.artifact_path) -cne $artifactHash) {
+                Fail-Astro 'ASTRO_FSV_PRE_ADMISSION_SESSION_DRIFT' `
+                    'pre-admission session inventory or immutable receipt/artifact bytes changed after tracker authorization' `
+                    'preserve the session and post fresh evidence for its current exact state'
+            }
+            $finalOwnerProbes = @(Assert-AstroFsvOwnersInactive `
+                    -Bindings $ownerBindings `
+                    -CodePrefix 'ASTRO_FSV_PRE_ADMISSION' `
+                    -Description 'pre-admission evidence session final authorization')
+            $record = [ordered]@{
+                schema = 'astrolabe.native-fsv-pre-admission-abandon.v1'
+                verdict = 'abandoned-pre-admission-nonpristine'
+                issue = [int]$inspection.issue
+                recorded_at_utc = [DateTime]::UtcNow.ToString('o')
+                tracker = $tracker
+                receipt_path = $receiptState.Path
+                receipt_sha256 = $receiptHash
+                session_directory = $session
+                pre_admission_directory = $preAdmissionDirectory
+                runner_paths = [ordered]@{
+                    standard_output = $standardOutput
+                    standard_error = $standardError
+                    run_record = $runRecord
+                    live_state = $liveState
+                    all_absent = $true
+                }
+                artifact = [ordered]@{ path = $inspection.artifact_path; bytes = [uint64]$inspection.bytes; sha256 = $artifactHash }
+                inventory = [ordered]@{
+                    schema = [string]$finalTree.schema
+                    encoding = [string]$finalTree.encoding
+                    entry_count = [int]$finalTree.entry_count
+                    canonical_byte_count = [uint64]$finalTree.canonical_bytes_length
+                    sha256 = [string]$finalTree.sha256
+                }
+                source_of_truth = [ordered]@{
+                    fsv_lock = [ordered]@{ path = $fsvLock; exists = $false }
+                    launcher_protocol = [ordered]@{ path = $launcherLockPath; state = $launcherProtocolState.State }
+                }
+                owners = [ordered]@{
+                    identities = @($ownerBindings | ForEach-Object { [ordered]@{ role = $_.Role; source = $_.Source; identity = $_.Identity } })
+                    initial_probes = $initialOwnerProbes
+                    final_probes = $finalOwnerProbes
+                }
+                failure = [ordered]@{ code = $ReasonCode; message = $ReasonMessage }
+            }
+            Write-NewDurableUtf8 $recoveryRecord ($record | ConvertTo-Json -Depth 20)
+            $persistedRecord = Read-AstroUtf8FileLongPath $recoveryRecord | ConvertFrom-Json
+            if ($persistedRecord.schema -cne 'astrolabe.native-fsv-pre-admission-abandon.v1' -or
+                $persistedRecord.verdict -cne 'abandoned-pre-admission-nonpristine' -or
+                [string]$persistedRecord.receipt_sha256 -cne $receiptHash -or
+                [string]$persistedRecord.artifact.sha256 -cne $artifactHash -or
+                [string]$persistedRecord.inventory.sha256 -cne [string]$finalTree.sha256 -or
+                [string]$persistedRecord.failure.code -cne $ReasonCode -or
+                -not [bool]$persistedRecord.runner_paths.all_absent) {
+                Fail-Astro 'ASTRO_FSV_PRE_ADMISSION_RECORD_INVALID' `
+                    "persisted pre-admission recovery record readback does not bind the exact session: $recoveryRecord" `
+                    'preserve both session and recovery record and investigate the durable-write mismatch'
+            }
+            Assert-AstroFsvPersistedOwnerEnvelope `
+                -Owners $persistedRecord.owners `
+                -ExpectedBindings $ownerBindings `
+                -Code 'ASTRO_FSV_PRE_ADMISSION_RECORD_INVALID' `
+                -Description 'persisted pre-admission recovery record'
+            $recordHash = File-Sha256 $recoveryRecord
+            $before = [ordered]@{ session = $session; exists = $true; inventory_sha256 = [string]$finalTree.sha256; owners = $record.owners }
+            Remove-AstroOrdinaryDirectoryTreeLongPath `
+                -LiteralPath $session `
+                -ExpectedInventorySchema ([string]$finalTree.schema) `
+                -ExpectedInventoryEncoding ([string]$finalTree.encoding) `
+                -ExpectedInventorySha256 ([string]$finalTree.sha256)
+            if (Test-AstroPathLongPath -LiteralPath $session) {
+                Fail-Astro 'ASTRO_FSV_PRE_ADMISSION_DELETE_FAILED' `
+                    "evidence session remains after pre-admission abandonment: $session" `
+                    'preserve the external recovery record and inspect exact filesystem state before retrying'
+            }
+            Remove-EmptyEvidenceParents $session
+            [ordered]@{
+                operation = 'pre-admission-abandon'
+                record_path = $recoveryRecord
+                record_sha256 = $recordHash
+                record = $persistedRecord
+                before = $before
+                after = [ordered]@{ session = $session; exists = $false }
+            } | ConvertTo-Json -Depth 24 -Compress | Write-Output
         }
         'Quarantine' {
             $receiptState = Read-Receipt $ReceiptPath $evidenceRoot

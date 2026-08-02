@@ -17,6 +17,10 @@
     record. No PID-reopened process authority, CPU fallback, output substitution, retry, or mock
     behavior exists here.
 
+    StandardOutputPath, StandardErrorPath, RunRecordPath, and LiveStatePath must each be a
+    distinct absent file directly below the staged session root. The runner owns those four
+    paths; callers must not pre-create an evidence/output directory in the session.
+
 .NOTES
     Refs #612, #600, #596, #424, #197. Manual FSV tooling; this is not a test or a gate.
 #>
@@ -53,6 +57,20 @@ function Assert-PathWithin([string]$Path, [string]$Root, [string]$Code, [string]
     $full = [IO.Path]::GetFullPath($Path)
     if (-not $full.StartsWith((Path-WithTrailingSeparator $Root), [StringComparison]::OrdinalIgnoreCase)) {
         Fail-Astro $Code "$Description '$full' escapes required root '$Root'" 'use a fresh path inside the staged evidence session'
+    }
+    return $full
+}
+
+function Assert-DirectSessionRootOutputPath([string]$Path, [string]$SessionDirectory, [string]$Description) {
+    $full = Assert-PathWithin $Path $SessionDirectory 'ASTRO_FSV_OUTPUT_ESCAPE' $Description
+    if (-not [string]::Equals(
+            [IO.Path]::GetFullPath((Split-Path -Parent $full)),
+            [IO.Path]::GetFullPath($SessionDirectory),
+            [StringComparison]::OrdinalIgnoreCase
+        )) {
+        Fail-Astro 'ASTRO_FSV_OUTPUT_NOT_SESSION_ROOT' `
+            "$Description must be a direct file child of staged session '$SessionDirectory': $full" `
+            'use one fresh direct session-root output file; the runner owns its four output files and no output directories may be pre-created'
     }
     return $full
 }
@@ -1614,14 +1632,14 @@ try {
         @($StandardOutputPath, 'stdout'), @($StandardErrorPath, 'stderr'),
         @($RunRecordPath, 'run record'), @($LiveStatePath, 'live state')
     )) {
-        $resolved = Assert-PathWithin ([string]$pair[0]) $sessionDirectory 'ASTRO_FSV_OUTPUT_ESCAPE' ([string]$pair[1])
+        $resolved = Assert-DirectSessionRootOutputPath ([string]$pair[0]) $sessionDirectory ([string]$pair[1])
         if (-not $claimedPaths.Add($resolved)) {
             Fail-Astro 'ASTRO_FSV_OUTPUT_COLLISION' `
                 "$($pair[1]) path collides with another immutable session path: $resolved" `
-                'use four distinct fresh output paths inside the staged session'
+                'use four distinct fresh direct session-root output file paths'
         }
         if (Test-AstroPathLongPath -LiteralPath $resolved) {
-            Fail-Astro 'ASTRO_FSV_OUTPUT_REUSE_REFUSED' "$($pair[1]) already exists: $resolved" 'use fresh output paths; FSV state is append-only and never overwritten'
+            Fail-Astro 'ASTRO_FSV_OUTPUT_REUSE_REFUSED' "$($pair[1]) already exists: $resolved" 'use fresh direct session-root output paths; FSV state is append-only and never overwritten'
         }
         switch ([string]$pair[1]) {
             'stdout' { $StandardOutputPath = $resolved }
