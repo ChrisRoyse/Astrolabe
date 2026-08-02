@@ -1168,11 +1168,18 @@ static int effective_worker_count(bool initial) {
     return cbm_default_worker_count(initial);
 }
 
-static int reject_invalid_worker_count(const char *phase, int worker_count) {
-    cbm_log_error("pipeline.worker_count_invalid", "code", "CBM_WORKER_COUNT_INVALID", "phase",
+static int reject_invalid_worker_count(cbm_pipeline_t *p, const char *phase, int worker_count) {
+    const char *raw_workers = getenv("CBM_WORKERS");
+    const char *code = raw_workers ? "CBM_WORKERS_INVALID" : "CBM_WORKER_COUNT_INVALID";
+    cbm_log_error("pipeline.worker_count_invalid", "code", code, "phase",
                   phase ? phase : "unknown", "worker_count", itoa_buf(worker_count), "message",
                   "worker-count configuration is invalid", "remediation",
                   "set CBM_WORKERS to an integer from 1 through 256 or remove it");
+    cbm_pipeline_record_fatal_error(
+        p, code, "admit_worker_count", phase ? phase : "worker_config", p ? p->repo_path : NULL, 0,
+        raw_workers ? "CBM_WORKERS is present but is not an exact integer from 1 through 256"
+                    : "worker-count auto-detection produced no admissible worker",
+        "set CBM_WORKERS to an integer from 1 through 256 or remove it to use auto-detection");
     return CBM_NOT_FOUND;
 }
 
@@ -3025,7 +3032,7 @@ static int run_githistory(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx) {
     if (p->mode != CBM_MODE_FAST) {
         int worker_count = effective_worker_count(true);
         if (worker_count <= 0) {
-            return reject_invalid_worker_count("githistory", worker_count);
+            return reject_invalid_worker_count(p, "githistory", worker_count);
         }
         if (worker_count > SKIP_ONE) {
             if (cbm_thread_create(&gh_thread, 0, gh_compute_thread_fn, &gh_arg) == 0) {
@@ -3160,7 +3167,7 @@ static int run_extraction_phase(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
     int worker_count = effective_worker_count(true);
     if (worker_count <= 0) {
         cbm_pxc_destroy_rust_manifest(ctx);
-        return reject_invalid_worker_count("extraction", worker_count);
+        return reject_invalid_worker_count(p, "extraction", worker_count);
     }
     CBM_PROF_START(t_extract_total);
     int rc = 0;
@@ -3198,6 +3205,7 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
     cbm_source_snapshot_t source_snapshot = {0};
     cbm_file_info_t *source_files = NULL;
     int source_count = 0;
+    int rc = 0;
 
     /* C/C++ #define Macro nodes (#375) dominate extraction on macro-dense repos
      * (≈49% of nodes on the Linux kernel), so gate them to full mode — moderate
@@ -3215,6 +3223,12 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
     cbm_set_user_lang_config(p->userconfig);
     CBM_PROF_END("pipeline", "0_userconfig_load", t_userconfig);
 
+    int admitted_worker_count = effective_worker_count(true);
+    if (admitted_worker_count <= 0) {
+        rc = reject_invalid_worker_count(p, "worker_config", admitted_worker_count);
+        goto cleanup;
+    }
+
     /* Phase 1: Discover files */
     CBM_PROF_START(t_discover);
     cbm_pipeline_phase_probe_t discover_probe = cbm_pipeline_phase_probe_start(p, "discovery");
@@ -3231,8 +3245,8 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
     cbm_discover_free_excluded(p->excluded_dirs, p->excluded_count);
     p->excluded_dirs = NULL;
     p->excluded_count = 0;
-    int rc = cbm_discover_ex(p->repo_path, &opts, &files, &file_count, &p->excluded_dirs,
-                             &p->excluded_count);
+    rc = cbm_discover_ex(p->repo_path, &opts, &files, &file_count, &p->excluded_dirs,
+                         &p->excluded_count);
     if (rc != 0) {
         cbm_log_error("pipeline.err", "phase", "discover", "rc", itoa_buf(rc));
     }
