@@ -7697,6 +7697,11 @@ try {
     if ($launcherClaimMutex.WasAbandoned) {
         Write-Output "LAUNCHER_BOUNDARY[ASTRO_LAUNCHER_LOCK_MUTEX_ABANDONED]: recovered abandoned Global protocol mutex $($launcherClaimMutex.Name); active and transition bytes will be fully classified before claim"
     }
+    $fsvLifecycleState = Get-AstroFsvLifecycleInterruptionState `
+        -WorkspaceRoot $root
+    if ($fsvLifecycleState.State -cne 'absent') {
+        throw "LAUNCHER_BOUNDARY[ASTRO_FSV_LIFECYCLE_INTERRUPTED]: {code=ASTRO_FSV_LIFECYCLE_INTERRUPTED; message=`"native-FSV lifecycle state is $($fsvLifecycleState.State) (paths=$(@($fsvLifecycleState.Paths) -join ';'); error=$($fsvLifecycleState.Error)); no launcher claim was published`"; remediation=`"resume the exact tracker-bound native-FSV lifecycle transaction before building`"}"
+    }
     $launcherProtocolDirectoryLease =
         Open-AstroLauncherPinnedDirectoryLease $workspaceTempParent
     Assert-AstroLauncherLockClaimable -LockPath $launcherLock

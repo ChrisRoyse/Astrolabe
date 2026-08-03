@@ -3770,6 +3770,182 @@ function Exit-AstroLauncherLockMutex {
     }
 }
 
+function Get-AstroFsvLifecycleMutexNameFromIdentity {
+    param([Parameter(Mandatory)][string]$WorkspaceRootIdentity)
+
+    if ($WorkspaceRootIdentity -cnotmatch '^[0-9a-f]{16}:[0-9a-f]{32}$') {
+        throw "native-FSV lifecycle mutex filesystem identity is not canonical FILE_ID_INFO: $WorkspaceRootIdentity"
+    }
+    $identityBytes = [Text.Encoding]::UTF8.GetBytes(
+        "astrolabe.native-fsv-lifecycle.v1|$WorkspaceRootIdentity"
+    )
+    $digest = Get-AstroByteSha256 $identityBytes
+    return "Global\Astrolabe.NativeFsvLifecycle.$digest"
+}
+
+function Enter-AstroFsvLifecycleMutex {
+    param([Parameter(Mandatory)][string]$WorkspaceRoot)
+
+    $root = [IO.Path]::GetFullPath($WorkspaceRoot).TrimEnd('\', '/')
+    $rootHandle = $null
+    try {
+        $rootHandle = [AstroLauncherLockNative]::OpenExactRenameDirectory($root)
+        $rootIdentity = [AstroLauncherLockNative]::GetDirectoryLockIdentity(
+            $rootHandle
+        )
+        $rootFinalPath = ConvertFrom-AstroNativeFinalPath (
+            [AstroLauncherLockNative]::GetFileFinalPath($rootHandle)
+        )
+        $rootFinalPath = [IO.Path]::GetFullPath(
+            $rootFinalPath
+        ).TrimEnd('\', '/')
+        if (-not [string]::Equals(
+                $root,
+                $rootFinalPath,
+                [StringComparison]::OrdinalIgnoreCase
+            )) {
+            throw "native-FSV workspace lexical path '$root' resolves to retained-handle path '$rootFinalPath'"
+        }
+        $name = Get-AstroFsvLifecycleMutexNameFromIdentity $rootIdentity
+        $security = New-AstroLauncherLockMutexSecurity
+    }
+    catch {
+        if ($null -ne $rootHandle) {
+            $rootHandle.Dispose()
+        }
+        throw "could not retain the native-FSV workspace while deriving its shared lifecycle mutex: $($_.Exception.Message)"
+    }
+
+    $createdNew = $false
+    try {
+        if ('System.Threading.MutexAcl' -as [type]) {
+            $mutex = [System.Threading.MutexAcl]::Create(
+                $false,
+                $name,
+                [ref]$createdNew,
+                $security
+            )
+        }
+        else {
+            $mutex = [Threading.Mutex]::new(
+                $false,
+                $name,
+                [ref]$createdNew,
+                $security
+            )
+        }
+    }
+    catch {
+        $rootHandle.Dispose()
+        throw "could not create/open shared native-FSV lifecycle mutex '$name': $($_.Exception.Message)"
+    }
+
+    $acquired = $false
+    $abandoned = $false
+    try {
+        try {
+            $acquired = $mutex.WaitOne(0)
+        }
+        catch [Threading.AbandonedMutexException] {
+            $acquired = $true
+            $abandoned = $true
+        }
+        return [pscustomobject]@{
+            Name = $name
+            Mutex = $mutex
+            Acquired = $acquired
+            WasAbandoned = $abandoned
+            CreatedNew = $createdNew
+            Root = $root
+            RootFinalPath = $rootFinalPath
+            RootIdentity = $rootIdentity
+            RootHandle = $rootHandle
+        }
+    }
+    catch {
+        if ($acquired) {
+            try { $mutex.ReleaseMutex() } catch {}
+        }
+        $mutex.Dispose()
+        $rootHandle.Dispose()
+        throw
+    }
+}
+
+function Exit-AstroFsvLifecycleMutex {
+    param([Parameter(Mandatory)]$Lease)
+
+    Exit-AstroLauncherLockMutex $Lease
+}
+
+function Get-AstroFsvLifecycleInterruptionState {
+    param([Parameter(Mandatory)][string]$WorkspaceRoot)
+
+    $root = [IO.Path]::GetFullPath($WorkspaceRoot).TrimEnd('\', '/')
+    $tmpRoot = Join-Path $root '.tmp'
+    $transition = Join-Path $tmpRoot 'astrolabe-fsv-lifecycle.transition.v1.json'
+    $transitionState = Get-AstroPathEntryState $transition
+    if ($transitionState.State -cne 'absent') {
+        return [pscustomobject]@{
+            State = if ($transitionState.State -ceq 'present') {
+                'interrupted'
+            } else { 'unevaluable' }
+            Paths = [string[]]@($transition)
+            Error = $transitionState.Error
+        }
+    }
+    $recoveryRoot = Join-Path $tmpRoot 'native-fsv-recovery-records'
+    $recoveryState = Get-AstroPathEntryState $recoveryRoot
+    if ($recoveryState.State -ceq 'absent') {
+        return [pscustomobject]@{
+            State = 'absent'; Paths = [string[]]@(); Error = $null
+        }
+    }
+    if ($recoveryState.State -cne 'present' -or
+        ($recoveryState.Attributes -band [IO.FileAttributes]::Directory) -eq 0 -or
+        ($recoveryState.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+        return [pscustomobject]@{
+            State = 'unevaluable'
+            Paths = [string[]]@($recoveryRoot)
+            Error = if ($recoveryState.State -cne 'present') {
+                $recoveryState.Error
+            } else { 'native-FSV recovery root is not one ordinary directory' }
+        }
+    }
+    try {
+        $inventory = Get-AstroOrdinaryDirectoryTreeInventoryLongPath $recoveryRoot
+    }
+    catch {
+        return [pscustomobject]@{
+            State = 'unevaluable'
+            Paths = [string[]]@($recoveryRoot)
+            Error = "$($_.Exception.GetType().FullName): $($_.Exception.Message)"
+        }
+    }
+    $stages = [Collections.Generic.List[string]]::new()
+    foreach ($entry in @($inventory.entries | Where-Object {
+                [string]$_.kind -ceq 'file' -and
+                ([string]$_.relative_path -cmatch
+                    '(^|\\)\.[^\\]+\.publishing\.v1\.json\z' -or
+                 [string]$_.relative_path -cmatch
+                    '(^|\\)\.[^\\]+\.publishing-[0-9]+-[0-9a-f]{32}\z')
+            })) {
+        $stages.Add([IO.Path]::GetFullPath(
+                (Join-Path $recoveryRoot ([string]$entry.relative_path))
+            ))
+    }
+    if ($stages.Count -gt 0) {
+        return [pscustomobject]@{
+            State = 'interrupted'
+            Paths = [string[]]$stages.ToArray()
+            Error = 'one or more durable native-FSV publication stages remain'
+        }
+    }
+    return [pscustomobject]@{
+        State = 'absent'; Paths = [string[]]@(); Error = $null
+    }
+}
+
 function Throw-AstroFileMoveFailure {
     param(
         [Parameter(Mandatory)][string]$Code,

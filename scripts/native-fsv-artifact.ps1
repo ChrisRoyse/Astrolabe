@@ -26,7 +26,7 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory)]
-    [ValidateSet('Stage', 'Inspect', 'Cleanup', 'Abandon', 'PreAdmissionAbandon', 'Quarantine', 'MigrateLegacy', 'RetireLock')]
+    [ValidateSet('Stage', 'Inspect', 'Cleanup', 'Abandon', 'PreAdmissionAbandon', 'Quarantine', 'QuarantineTerminalPartial', 'MigrateLegacy', 'RetireLock', 'RetireTerminalPartialLock')]
     [string]$Operation,
 
     [string]$SourcePath = '',
@@ -38,6 +38,10 @@ param(
     [string]$AbandonRecordPath = '',
     [string]$RecoveryRecordPath = '',
     [string]$MigrationRecordPath = '',
+    [string]$LockRetirementRecordPath = '',
+    [string]$LauncherRecoveryCompletionPath = '',
+    [string]$TargetRecoveryCompletionPath = '',
+    [string[]]$LauncherArchiveCompletionPaths = @(),
     [string]$LiveStatePath = '',
     [string]$StandardOutputPath = '',
     [string]$StandardErrorPath = '',
@@ -421,8 +425,185 @@ public static class AstroFsvPublish {
                 "; destination=" + destination + ")");
         }
     }
+
+    public static void PublishFile(string source, string destination) {
+        if (!MoveFileExW(Extended(source), Extended(destination),
+                MOVEFILE_WRITE_THROUGH)) {
+            int error = Marshal.GetLastWin32Error();
+            throw new Win32Exception(error,
+                "MoveFileExW write-through no-clobber protocol-file publication failed " +
+                "(native_error=" + error + "; source=" + source +
+                "; destination=" + destination + ")");
+        }
+    }
 }
 '@
+}
+
+function Get-AstroFsvProtocolStableProjection {
+    param(
+        [Parameter(Mandatory)]$Record,
+        [Parameter(Mandatory)][string]$CodePrefix
+    )
+
+    $schema = [string]$Record.schema
+    switch ($schema) {
+        'astrolabe.native-fsv-partial-lock-retirement.authorization.v1' {
+            return [ordered]@{
+                schema = $Record.schema; phase = $Record.phase; issue = $Record.issue
+                tracker = $Record.tracker; fsv_lock = $Record.fsv_lock
+                authorization_record_path = $Record.authorization_record_path
+                completion_record_path = $Record.completion_record_path
+                lifecycle_transition_path = $Record.lifecycle_transition_path
+                receipt_path = $Record.receipt_path
+                receipt_sha256 = $Record.receipt_sha256
+                session_directory = $Record.session_directory
+                artifact = $Record.artifact
+                expected_controls = $Record.expected_controls
+                outputs = $Record.outputs
+                session_inventory = $Record.session_inventory
+                launcher_recovery_chain = $Record.launcher_recovery_chain
+                launcher_job_name = $Record.launcher_job.name
+                owner_identities = $Record.owners.identities
+                failure = $Record.failure
+            }
+        }
+        'astrolabe.native-fsv-partial-lock-retirement.completion.v1' {
+            return [ordered]@{
+                schema = $Record.schema; phase = $Record.phase; issue = $Record.issue
+                authorization = $Record.authorization; source = $Record.source
+                archive = $Record.archive; session = $Record.session
+            }
+        }
+        'astrolabe.native-fsv-terminal-partial-quarantine.authorization.v1' {
+            return [ordered]@{
+                schema = $Record.schema; phase = $Record.phase; issue = $Record.issue
+                tracker = $Record.tracker; retirement = $Record.retirement
+                receipt_path = $Record.receipt_path
+                receipt_sha256 = $Record.receipt_sha256
+                session_directory = $Record.session_directory
+                session_tombstone_path = $Record.session_tombstone_path
+                lifecycle_transition_path = $Record.lifecycle_transition_path
+                authorization_record_path = $Record.authorization_record_path
+                artifact = $Record.artifact
+                expected_controls = $Record.expected_controls
+                outputs = $Record.outputs
+                session_inventory = $Record.session_inventory
+                source_fsv_lock = $Record.source_of_truth.fsv_lock
+                source_launcher_protocol = $Record.source_of_truth.launcher_protocol
+                source_launcher_job_name = $Record.source_of_truth.launcher_job.name
+                owner_identities = $Record.owners.identities
+                failure = $Record.failure
+                completion_record_path = $Record.completion_record_path
+            }
+        }
+        'astrolabe.native-fsv-terminal-partial-quarantine.completion.v1' {
+            return [ordered]@{
+                schema = $Record.schema; phase = $Record.phase; issue = $Record.issue
+                authorization = $Record.authorization
+                retirement_completion = $Record.retirement_completion
+                session = $Record.session; tombstone = $Record.tombstone
+                fsv_lock = $Record.fsv_lock
+            }
+        }
+        default {
+            Fail-Astro "${CodePrefix}_STAGE_SCHEMA_UNSUPPORTED" `
+                "protocol publication has no stable projection for schema '$schema'" `
+                'preserve the stage and add an exact schema-specific recovery projection'
+        }
+    }
+}
+
+function Publish-NewAstroFsvProtocolRecord {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)]$Value,
+        [Parameter(Mandatory)][string]$CodePrefix,
+        [string]$StageDirectory = ''
+    )
+
+    $parent = Split-Path -Parent $Path
+    New-AstroDirectoryLongPath $parent | Out-Null
+    Assert-NotReparseEntry $parent "$CodePrefix record parent"
+    if (Test-AstroPathLongPath -LiteralPath $Path) {
+        Fail-Astro "${CodePrefix}_REUSE_REFUSED" `
+            "protocol record already exists: $Path" `
+            'resume the exact bound transaction; never overwrite an append-only protocol record'
+    }
+    $stageParent = if ([string]::IsNullOrWhiteSpace($StageDirectory)) {
+        $parent
+    } else {
+        [IO.Path]::GetFullPath($StageDirectory)
+    }
+    New-AstroDirectoryLongPath $stageParent | Out-Null
+    Assert-NotReparseEntry $stageParent "$CodePrefix publication-stage parent"
+    $stage = Join-Path $stageParent (
+        '.' + [IO.Path]::GetFileName($Path) + '.publishing.v1.json'
+    )
+    $published = $false
+    $createdStage = $false
+    try {
+        $json = $Value | ConvertTo-Json -Depth 40
+        $expectedBytes = [Text.UTF8Encoding]::new($false).GetBytes($json)
+        $expectedSha256 = Get-AstroByteSha256 $expectedBytes
+        $stageState = Get-AstroFsvStrictPathState `
+            $stage file "${CodePrefix}_STAGE_INVALID" `
+            "$CodePrefix deterministic publication stage"
+        if ($stageState.state -ceq 'absent') {
+            Write-NewDurableUtf8 $stage $json
+            $createdStage = $true
+        }
+        try { $stageReadback = Read-AstroUtf8FileLongPath $stage | ConvertFrom-Json }
+        catch {
+            Fail-Astro "${CodePrefix}_STAGE_INVALID" `
+                "durable protocol stage cannot be parsed: $stage ($($_.Exception.Message))" `
+                'preserve the stage and investigate the exact write/readback failure'
+        }
+        if ([string]$stageReadback.schema -cne [string]$Value.schema) {
+            Fail-Astro "${CodePrefix}_STAGE_INVALID" `
+                "durable protocol stage schema changed during readback: $stage" `
+                'preserve the stage and investigate the exact write/readback failure'
+        }
+        $stageSha256 = File-Sha256 $stage
+        if ($createdStage -and $stageSha256 -cne $expectedSha256) {
+            Fail-Astro "${CodePrefix}_STAGE_INVALID" `
+                "durable publication stage does not equal the requested exact bytes: $stage" `
+                'preserve the stage and investigate durable-write drift'
+        }
+        if (-not $createdStage) {
+            $stagedProjection = Get-AstroFsvProtocolStableProjection `
+                $stageReadback $CodePrefix | ConvertTo-Json -Depth 40 -Compress
+            $requestedProjection = Get-AstroFsvProtocolStableProjection `
+                $Value $CodePrefix | ConvertTo-Json -Depth 40 -Compress
+            if ($stagedProjection -cne $requestedProjection) {
+                Fail-Astro "${CodePrefix}_STAGE_MISMATCH" `
+                    "surviving deterministic stage is not the requested stable transaction: $stage" `
+                    'preserve the stage and resume only the exact transaction whose stable bindings created it'
+            }
+        }
+        [AstroFsvPublish]::PublishFile($stage, $Path)
+        $published = $true
+        $finalSha256 = File-Sha256 $Path
+        if ($finalSha256 -cne $stageSha256) {
+            Fail-Astro "${CodePrefix}_PUBLICATION_INVALID" `
+                "published protocol record differs from its durable stage: $Path" `
+                'preserve both namespaces and investigate the atomic publication boundary'
+        }
+        return [ordered]@{
+            path = [IO.Path]::GetFullPath($Path)
+            sha256 = $finalSha256
+            value = Read-AstroUtf8FileLongPath $Path | ConvertFrom-Json
+        }
+    }
+    finally {
+        if ($createdStage -and -not $published -and
+            (Test-AstroPathLongPath -LiteralPath $stage -PathType Leaf)) {
+            # A caught failure removes only the exact stage created by this live
+            # publisher. A hard-death stage is deterministic, blocks admission,
+            # and is republished only by the byte-identical resumed transaction.
+            Remove-AstroFileLongPath $stage
+        }
+    }
 }
 
 function Read-AstroFsvProcessIdentity {
@@ -568,6 +749,56 @@ function Read-AstroFsvV3ProcessEntries {
             'preserve the session and investigate incomplete multi-process provenance'
     }
     return ,([object[]]@($result | Sort-Object role, ordinal))
+}
+
+function Read-AstroFsvTerminalPartialPreLiveProcesses {
+    param(
+        [Parameter(Mandatory)]$LockState,
+        [Parameter(Mandatory)][string]$Code,
+        [Parameter(Mandatory)][string]$Description
+    )
+
+    $residentCount = [int]$LockState.resident_count
+    $processCount = [int]$LockState.process_count
+    $processes = Read-AstroFsvV3ProcessEntries `
+        $LockState.owners.processes $residentCount $processCount $Code $Description
+    $phase = [string]$LockState.phase
+    if ($phase -ceq 'creating') {
+        if ($processCount -lt 1 -or $processCount -gt $residentCount -or
+            @($processes | Where-Object { [string]$_.role -cne 'resident' }).Count -ne 0) {
+            Fail-Astro $Code `
+                "$Description creating phase does not contain one contiguous resident prefix" `
+                'preserve the terminal-partial lock and investigate its publisher'
+        }
+        for ($ordinal = 1; $ordinal -le $processCount; $ordinal++) {
+            if (@($processes | Where-Object {
+                        [string]$_.role -ceq 'resident' -and
+                        [int]$_.ordinal -eq $ordinal
+                    }).Count -ne 1) {
+                Fail-Astro $Code `
+                    "$Description creating phase omits resident ordinal $ordinal" `
+                    'preserve the terminal-partial lock and investigate its publisher'
+            }
+        }
+    }
+    elseif ($phase -ceq 'suspended') {
+        if ($processCount -ne ($residentCount + 1) -or
+            @($processes | Where-Object { [string]$_.role -ceq 'resident' }).Count -ne
+                $residentCount -or
+            @($processes | Where-Object {
+                    [string]$_.role -ceq 'indexer' -and [int]$_.ordinal -eq 0
+                }).Count -ne 1) {
+            Fail-Astro $Code `
+                "$Description suspended phase is not the complete resident-plus-indexer set" `
+                'preserve the terminal-partial lock and investigate its publisher'
+        }
+    }
+    else {
+        Fail-Astro $Code `
+            "$Description phase '$phase' is not a terminal-partial pre-live phase" `
+            'use Abandon for claimed state and normal Cleanup/Quarantine for a published live generation'
+    }
+    return ,([object[]]$processes)
 }
 
 function Test-AstroFsvV3ProcessEntriesEqual {
@@ -776,6 +1007,413 @@ function Invoke-AstroFsvGhJson {
     }
     finally {
         if ($null -ne $process) { $process.Dispose() }
+    }
+}
+
+function Read-AstroFsvExactJsonFile {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][string]$Code,
+        [Parameter(Mandatory)][string]$Description
+    )
+    $full = [IO.Path]::GetFullPath($Path)
+    if (-not (Test-AstroPathLongPath -LiteralPath $full -PathType Leaf)) {
+        Fail-Astro $Code "$Description is absent: $full" `
+            'preserve the lifecycle state and supply the exact durable record path'
+    }
+    Assert-NotReparseEntry $full $Description
+    try { $value = Read-AstroUtf8FileLongPath $full | ConvertFrom-Json }
+    catch {
+        Fail-Astro $Code "$Description is unreadable: $full ($($_.Exception.Message))" `
+            'preserve the lifecycle state and investigate the exact durable bytes'
+    }
+    return [ordered]@{
+        path = $full
+        bytes = [uint64](Get-AstroFileInfoLongPath $full).Length
+        sha256 = File-Sha256 $full
+        value = $value
+    }
+}
+
+function Get-AstroFsvStrictPathState {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][ValidateSet('file', 'directory')][string]$ExpectedKind,
+        [Parameter(Mandatory)][string]$Code,
+        [Parameter(Mandatory)][string]$Description
+    )
+    $full = [IO.Path]::GetFullPath($Path)
+    $state = Get-AstroPathEntryState $full
+    if ($state.State -ceq 'absent') {
+        return [ordered]@{ path = $full; state = 'absent'; attributes = $null }
+    }
+    if ($state.State -cne 'present') {
+        Fail-Astro $Code "$Description is unevaluable: $full ($($state.Error))" `
+            'preserve every namespace and repair the exact filesystem probe failure'
+    }
+    if (($state.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+        Fail-Astro $Code "$Description is a reparse point: $full" `
+            'preserve the namespace object; lifecycle authority requires an ordinary entry'
+    }
+    $isDirectory = ($state.Attributes -band [IO.FileAttributes]::Directory) -ne 0
+    if (($ExpectedKind -ceq 'directory') -ne $isDirectory) {
+        Fail-Astro $Code "$Description is present with the wrong entry kind: $full" `
+            'preserve the namespace and investigate the unexpected file/directory collision'
+    }
+    return [ordered]@{
+        path = $full
+        state = 'present'
+        attributes = [uint32]$state.Attributes
+    }
+}
+
+function ConvertFrom-AstroFsvPersistedInventoryEntries {
+    param(
+        [Parameter(Mandatory)][AllowEmptyCollection()]$Entries,
+        [Parameter(Mandatory)][string]$Code,
+        [Parameter(Mandatory)][string]$Description
+    )
+
+    if ($Entries -isnot [Array]) {
+        Fail-Astro $Code "$Description entries are not an array" `
+            'preserve the transition and investigate malformed inventory authority'
+    }
+    $expectedFields = @(
+        'relative_path', 'kind', 'file_id', 'attributes', 'bytes', 'sha256'
+    )
+    $typed = [Collections.Generic.List[object]]::new()
+    for ($index = 0; $index -lt $Entries.Count; $index++) {
+        $entry = $Entries[$index]
+        if ($null -eq $entry) {
+            Fail-Astro $Code "$Description entry $index is null" `
+                'preserve the transition and investigate malformed inventory authority'
+        }
+        $actualFields = @($entry.PSObject.Properties | ForEach-Object Name)
+        if ($actualFields.Count -ne $expectedFields.Count -or
+            @($expectedFields | Where-Object { $actualFields -cnotcontains $_ }).Count -ne 0) {
+            Fail-Astro $Code "$Description entry $index has a noncanonical field set" `
+                'preserve the transition and investigate malformed inventory authority'
+        }
+        $attributesText = [Convert]::ToString(
+            $entry.attributes, [Globalization.CultureInfo]::InvariantCulture
+        )
+        [uint64]$attributesWide = 0
+        if ($entry.attributes -isnot [sbyte] -and
+            $entry.attributes -isnot [byte] -and
+            $entry.attributes -isnot [int16] -and
+            $entry.attributes -isnot [uint16] -and
+            $entry.attributes -isnot [int32] -and
+            $entry.attributes -isnot [uint32] -and
+            $entry.attributes -isnot [int64] -and
+            $entry.attributes -isnot [uint64]) {
+            Fail-Astro $Code "$Description entry $index attributes are not an integral JSON value" `
+                'preserve the transition and investigate malformed inventory authority'
+        }
+        if ($attributesText -cnotmatch '^(0|[1-9][0-9]{0,9})$' -or
+            -not [uint64]::TryParse(
+                $attributesText,
+                [Globalization.NumberStyles]::None,
+                [Globalization.CultureInfo]::InvariantCulture,
+                [ref]$attributesWide
+            ) -or $attributesWide -gt [uint32]::MaxValue) {
+            Fail-Astro $Code "$Description entry $index attributes exceed UInt32" `
+                'preserve the transition and investigate malformed inventory authority'
+        }
+        $typedBytes = $null
+        if ($null -ne $entry.bytes) {
+            $bytesText = [Convert]::ToString(
+                $entry.bytes, [Globalization.CultureInfo]::InvariantCulture
+            )
+            [uint64]$bytesWide = 0
+            if (($entry.bytes -isnot [sbyte] -and
+                    $entry.bytes -isnot [byte] -and
+                    $entry.bytes -isnot [int16] -and
+                    $entry.bytes -isnot [uint16] -and
+                    $entry.bytes -isnot [int32] -and
+                    $entry.bytes -isnot [uint32] -and
+                    $entry.bytes -isnot [int64] -and
+                    $entry.bytes -isnot [uint64]) -or
+                $bytesText -cnotmatch '^(0|[1-9][0-9]{0,19})$' -or
+                -not [uint64]::TryParse(
+                    $bytesText,
+                    [Globalization.NumberStyles]::None,
+                    [Globalization.CultureInfo]::InvariantCulture,
+                    [ref]$bytesWide
+                )) {
+                Fail-Astro $Code "$Description entry $index bytes are not UInt64" `
+                    'preserve the transition and investigate malformed inventory authority'
+            }
+            $typedBytes = [uint64]$bytesWide
+        }
+        $typed.Add([ordered]@{
+            relative_path = $entry.relative_path
+            kind = $entry.kind
+            file_id = $entry.file_id
+            attributes = [uint32]$attributesWide
+            bytes = $typedBytes
+            sha256 = $entry.sha256
+        })
+    }
+    return ,([object[]]$typed.ToArray())
+}
+
+function Assert-AstroFsvPersistedAbsentJobProbe {
+    param(
+        [Parameter(Mandatory)]$Probe,
+        [Parameter(Mandatory)][string]$ExpectedName,
+        [Parameter(Mandatory)][string]$Code,
+        [Parameter(Mandatory)][string]$Description
+    )
+    $expectedFields = @(
+        'Name', 'State', 'ProcessIds', 'NativeErrorCode',
+        'NumberOfAssignedProcesses', 'NumberOfProcessIdsInList', 'Error'
+    )
+    $actualFields = if ($null -eq $Probe) { @() } else {
+        @($Probe.PSObject.Properties | ForEach-Object Name)
+    }
+    if ($null -eq $Probe -or
+        $actualFields.Count -ne $expectedFields.Count -or
+        @($expectedFields | Where-Object { $actualFields -cnotcontains $_ }).Count -ne 0 -or
+        [string]$Probe.Name -cne $ExpectedName -or
+        [string]$Probe.State -cne 'absent' -or
+        @($Probe.ProcessIds).Count -ne 0 -or
+        [int]$Probe.NativeErrorCode -ne 2 -or
+        [uint64]$Probe.NumberOfAssignedProcesses -ne 0 -or
+        [uint64]$Probe.NumberOfProcessIdsInList -ne 0 -or
+        $null -ne $Probe.Error) {
+        Fail-Astro $Code "$Description is not an exact absent Job probe for '$ExpectedName'" `
+            'preserve the transaction and investigate malformed durable Job evidence'
+    }
+}
+
+function Assert-AstroFsvPersistedRecoveryJobProbes {
+    param(
+        [Parameter(Mandatory)]$Persisted,
+        [Parameter(Mandatory)]$LauncherRecoveryChain,
+        [Parameter(Mandatory)][string]$Code,
+        [Parameter(Mandatory)][string]$Description
+    )
+    $initial = @($Persisted.initial)
+    $final = @($Persisted.final)
+    $archives = @($LauncherRecoveryChain.archives)
+    if ($initial.Count -ne $archives.Count -or $final.Count -ne $archives.Count) {
+        Fail-Astro $Code "$Description Job-probe cardinality differs from the recovery chain" `
+            'preserve the transaction and investigate malformed durable Job evidence'
+    }
+    for ($index = 0; $index -lt $archives.Count; $index++) {
+        $name = [string]$archives[$index].job_name
+        Assert-AstroFsvPersistedAbsentJobProbe `
+            $initial[$index] $name $Code "$Description initial probe $index"
+        Assert-AstroFsvPersistedAbsentJobProbe `
+            $final[$index] $name $Code "$Description final probe $index"
+    }
+}
+
+function Assert-AstroFsvLinkedFile {
+    param(
+        [Parameter(Mandatory)]$Link,
+        [Parameter(Mandatory)][string]$Code,
+        [Parameter(Mandatory)][string]$Description
+    )
+    if ($null -eq $Link -or
+        -not $Link.PSObject.Properties['path'] -or
+        -not $Link.PSObject.Properties['sha256']) {
+        Fail-Astro $Code "$Description link is missing path/SHA-256" `
+            'preserve the record chain and investigate the malformed durable link'
+    }
+    $record = Read-AstroFsvExactJsonFile `
+        -Path ([string]$Link.path) -Code $Code -Description $Description
+    if ([string]$record.sha256 -cne [string]$Link.sha256) {
+        Fail-Astro $Code "$Description SHA-256 differs from its durable link" `
+            'preserve the complete record chain and investigate byte drift'
+    }
+    if ($Link.PSObject.Properties['bytes'] -and
+        [uint64]$Link.bytes -ne [uint64]$record.bytes) {
+        Fail-Astro $Code "$Description byte count differs from its durable link" `
+            'preserve the complete record chain and investigate byte drift'
+    }
+    return $record
+}
+
+function Read-AstroFsvLauncherRecoveryChain {
+    param(
+        [Parameter(Mandatory)][int]$ExpectedIssue,
+        [Parameter(Mandatory)][string]$Workspace,
+        [Parameter(Mandatory)][string]$LauncherRecoveryPath,
+        [Parameter(Mandatory)][string]$TargetRecoveryPath,
+        [Parameter(Mandatory)][string[]]$ArchiveCompletionPaths
+    )
+    $code = 'ASTRO_FSV_PARTIAL_LOCK_LAUNCHER_RECOVERY_INVALID'
+    if ([string]::IsNullOrWhiteSpace($LauncherRecoveryPath) -or
+        [string]::IsNullOrWhiteSpace($TargetRecoveryPath) -or
+        $ArchiveCompletionPaths.Count -eq 0) {
+        Fail-Astro $code `
+            'launcher-lock, target-recovery, and launcher-pair completion paths are all required' `
+            'supply the exact durable completion chain that made target and launcher protocol absent'
+    }
+    $tmpRoot = Join-Path $Workspace '.tmp'
+    $launcherPath = Assert-PathWithin $LauncherRecoveryPath $tmpRoot $code `
+        'launcher-lock recovery completion path'
+    $targetPath = Assert-PathWithin $TargetRecoveryPath $tmpRoot $code `
+        'target recovery completion path'
+    $launcher = Read-AstroFsvExactJsonFile $launcherPath $code `
+        'launcher-lock recovery completion'
+    if ([string]$launcher.value.schema -cne
+            'astrolabe.launcher-lock-recovery.completion.v6' -or
+        [string]$launcher.value.phase -cne
+            'source-archive-committed-marker-archive-authorized' -or
+        [string]$launcher.value.expected_final_protocol.active_state -cne 'absent' -or
+        @($launcher.value.expected_final_protocol.transition_paths).Count -ne 0) {
+        Fail-Astro $code 'launcher-lock recovery completion is not terminal protocol absence' `
+            'complete the exact launcher recovery before FSV lifecycle recovery'
+    }
+    $launcherAuthorization = Assert-AstroFsvLinkedFile `
+        -Link $launcher.value.authorization -Code $code `
+        -Description 'launcher-lock recovery authorization'
+    $target = Read-AstroFsvExactJsonFile $targetPath $code `
+        'preserved-target recovery completion'
+    if ([string]$target.value.schema -cne
+            'astrolabe.preserved-target-recovery.completion.v1' -or
+        [string]$target.value.phase -cne 'complete-target-absent' -or
+        [string]$target.value.target.state -cne 'absent' -or
+        -not [string]::Equals(
+            [IO.Path]::GetFullPath([string]$target.value.target.path),
+            (Join-Path $Workspace 'target'),
+            [StringComparison]::OrdinalIgnoreCase
+        )) {
+        Fail-Astro $code 'preserved-target recovery completion does not bind canonical target absence' `
+            'complete hash-bound target recovery before FSV lifecycle recovery'
+    }
+    $targetAuthorization = Assert-AstroFsvLinkedFile `
+        -Link $target.value.authorization -Code $code `
+        -Description 'preserved-target recovery authorization'
+    [void](Assert-AstroFsvLinkedFile `
+        -Link $target.value.finalization -Code $code `
+        -Description 'preserved-target recovery finalization')
+    if ([string]$targetAuthorization.value.schema -cne
+            'astrolabe.preserved-target-recovery.authorization.v1' -or
+        [int]$targetAuthorization.value.owner.issue -ne $ExpectedIssue -or
+        [string]$targetAuthorization.value.prior_recovery_transaction_id -cne
+            [string]$launcher.value.transaction_id) {
+        Fail-Astro $code 'target recovery does not descend from the exact launcher recovery/issue' `
+            'supply the target-recovery completion authorized by this launcher-lock recovery'
+    }
+    $rootIdentity = [AstroLauncherLockNative]::GetDirectoryIdentity($Workspace)
+    if ([string]$launcherAuthorization.value.mutex.root_identity -cne $rootIdentity) {
+        Fail-Astro $code 'launcher recovery workspace identity differs from the canonical retained root' `
+            'preserve all records and use only the canonical checkout that authored them'
+    }
+    $requiredGenerations = @{}
+    $launcherEvidence = $launcherAuthorization.value.tracker.evidence
+    foreach ($generation in @(
+        [ordered]@{
+            pid = [int]$launcherEvidence.expected_pid
+            ticks = [long]$launcherEvidence.expected_owner_process_start_utc_ticks
+            lock_sha256 = [string]$launcherEvidence.lock_sha256
+        },
+        [ordered]@{
+            pid = [int]$targetAuthorization.value.owner.pid
+            ticks = [long]$targetAuthorization.value.owner.owner_process_start_utc_ticks
+            lock_sha256 = [string]$targetAuthorization.value.owner.launcher_lock_sha256
+        }
+    )) {
+        $key = "$($generation.pid)|$($generation.ticks)|$($generation.lock_sha256)"
+        $requiredGenerations[$key] = $generation
+    }
+    $archives = [Collections.Generic.List[object]]::new()
+    $observedGenerations = @{}
+    foreach ($archiveInput in @($ArchiveCompletionPaths)) {
+        $archivePath = Assert-PathWithin $archiveInput $tmpRoot $code `
+            'launcher-pair archive completion path'
+        $archive = Read-AstroFsvExactJsonFile $archivePath $code `
+            'launcher-pair archive completion'
+        if ([string]$archive.value.schema -cne
+                'astrolabe.launcher-state-archive.completion.v2' -or
+            [string]$archive.value.temp_integrity.state -cne 'stable-exact' -or
+            [string]$archive.value.terminal.temp_source_state -cne 'absent' -or
+            [string]$archive.value.terminal.manifest_source_state -cne 'absent') {
+            Fail-Astro $code 'launcher-pair archive completion is not stable exact source absence' `
+                'complete exact launcher pair archival before FSV lifecycle recovery'
+        }
+        $archiveAuthorization = Assert-AstroFsvLinkedFile `
+            -Link $archive.value.authorization -Code $code `
+            -Description 'launcher-pair archive authorization'
+        $manifest = Read-AstroFsvExactJsonFile `
+            -Path ([string]$archive.value.terminal.manifest.path) -Code $code `
+            -Description 'archived launcher attribution manifest'
+        if ([string]$manifest.sha256 -cne
+                [string]$archive.value.terminal.manifest.sha256 -or
+            [string]$archiveAuthorization.value.schema -cne
+                'astrolabe.launcher-state-archive.authorization.v2' -or
+            [int]$archiveAuthorization.value.authority.driving_issue -ne $ExpectedIssue) {
+            Fail-Astro $code 'launcher-pair archive authorization/manifest chain is inconsistent' `
+                'preserve the archive and supply only its exact completion record'
+        }
+        $generation = $archiveAuthorization.value.generation
+        $key = "$([int]$generation.launcher_pid)|$([long]$generation.launcher_process_start_utc_ticks)|$([string]$generation.launcher_lock_sha256)"
+        if ($observedGenerations.ContainsKey($key)) {
+            Fail-Astro $code "duplicate launcher archive generation supplied: $key" `
+                'supply each exact required launcher generation once'
+        }
+        $derivedJob = Get-AstroLauncherTreeJobObjectName `
+            -RootIdentity $rootIdentity `
+            -LauncherPid ([int]$generation.launcher_pid) `
+            -LauncherProcessStartUtcTicks ([long]$generation.launcher_process_start_utc_ticks) `
+            -LauncherLeaseStartUtcTicks ([long]$manifest.value.launcher_lease_start_utc_ticks) `
+            -LauncherLockSha256 ([string]$generation.launcher_lock_sha256)
+        if ([string]$manifest.value.schema -cne 'astrolabe.no_escape_attribution.v3' -or
+            [string]$manifest.value.job_object_name -cne $derivedJob -or
+            [string]$generation.job_object_name -cne $derivedJob -or
+            [int]$manifest.value.launcher_pid -ne [int]$generation.launcher_pid -or
+            [long]$manifest.value.launcher_process_start_utc_ticks -ne
+                [long]$generation.launcher_process_start_utc_ticks -or
+            [string]$manifest.value.launcher_lock_sha256 -cne
+                [string]$generation.launcher_lock_sha256) {
+            Fail-Astro $code 'archived launcher manifest does not reproduce its deterministic Job/generation' `
+                'preserve the archive and investigate the malformed generation binding'
+        }
+        $sourceTempPresent = Test-AstroPathLongPath -LiteralPath `
+            ([string]$archiveAuthorization.value.source.temp.path)
+        $sourceManifestPresent = Test-AstroPathLongPath -LiteralPath `
+            ([string]$archiveAuthorization.value.source.manifest.path)
+        if ($sourceTempPresent -or $sourceManifestPresent) {
+            Fail-Astro $code 'a launcher pair archive source namespace has reappeared' `
+                'preserve all state and reconcile the unexpected source before FSV recovery'
+        }
+        $observedGenerations[$key] = $true
+        $archives.Add([ordered]@{
+            completion = $archive
+            authorization = $archiveAuthorization
+            manifest = $manifest
+            generation_key = $key
+            job_name = $derivedJob
+        })
+    }
+    if ($observedGenerations.Count -ne $requiredGenerations.Count -or
+        @($requiredGenerations.Keys | Where-Object {
+                -not $observedGenerations.ContainsKey($_)
+            }).Count -ne 0) {
+        Fail-Astro $code 'launcher archive set does not equal the exact recovery generation set' `
+            'supply the original dead generation and every launcher generation used by target recovery'
+    }
+    if (Test-AstroPathLongPath -LiteralPath (Join-Path $Workspace 'target')) {
+        Fail-Astro $code 'canonical target exists after its bound recovery completion' `
+            'preserve it and complete the tracker-bound target lifecycle before FSV recovery'
+    }
+    $launcherProtocol = Read-AstroLauncherLock `
+        -LockPath (Join-Path $tmpRoot 'astrolabe-launcher.lock')
+    if ($launcherProtocol.State -ne 'absent') {
+        Fail-Astro $code "launcher protocol is '$($launcherProtocol.State)' after recovery" `
+            'complete the exact launcher lifecycle before FSV recovery'
+    }
+    return [ordered]@{
+        launcher_recovery = $launcher
+        launcher_recovery_authorization = $launcherAuthorization
+        target_recovery = $target
+        target_recovery_authorization = $targetAuthorization
+        archives = [object[]]$archives.ToArray()
+        required_generations = $requiredGenerations
+        root_identity = $rootIdentity
     }
 }
 
@@ -1011,6 +1649,327 @@ function Read-AstroFsvPreAdmissionTrackerEvidence {
             're-read physical state and post a fresh exact evidence object'
     }
     return [ordered]@{ url = $Url; comment_id = [long]$match.Groups['comment'].Value; author = [string]$comment.user.login; evidence = $evidence }
+}
+
+function Read-AstroFsvPartialLockTrackerEvidence {
+    param(
+        [Parameter(Mandatory)][string]$Url,
+        [Parameter(Mandatory)][int]$ExpectedIssue,
+        [Parameter(Mandatory)][string]$ExpectedLockPath,
+        [Parameter(Mandatory)][string]$ExpectedLockSha256,
+        [Parameter(Mandatory)][string]$ExpectedReceiptPath,
+        [Parameter(Mandatory)][string]$ExpectedReceiptSha256,
+        [Parameter(Mandatory)][string]$ExpectedArtifactPath,
+        [Parameter(Mandatory)][string]$ExpectedArtifactSha256,
+        [Parameter(Mandatory)][string]$ExpectedSessionDirectory,
+        [Parameter(Mandatory)][string]$ExpectedStandardOutputPath,
+        [Parameter(Mandatory)][string]$ExpectedStandardOutputSha256,
+        [Parameter(Mandatory)][string]$ExpectedStandardErrorPath,
+        [Parameter(Mandatory)][string]$ExpectedStandardErrorSha256,
+        [Parameter(Mandatory)][string]$ExpectedRunRecordPath,
+        [Parameter(Mandatory)][string]$ExpectedLiveStatePath,
+        [Parameter(Mandatory)][string]$ExpectedInventorySchema,
+        [Parameter(Mandatory)][string]$ExpectedInventoryEncoding,
+        [Parameter(Mandatory)][int]$ExpectedInventoryEntryCount,
+        [Parameter(Mandatory)][uint64]$ExpectedInventoryCanonicalByteCount,
+        [Parameter(Mandatory)][string]$ExpectedInventorySha256,
+        [Parameter(Mandatory)][string]$ExpectedRecoveryRecordPath,
+        [Parameter(Mandatory)][string]$ExpectedLockArchivePath,
+        [Parameter(Mandatory)][string]$ExpectedCompletionRecordPath,
+        [Parameter(Mandatory)][string]$ExpectedLifecycleTransitionPath,
+        [Parameter(Mandatory)][string]$ExpectedLauncherRecoveryCompletionPath,
+        [Parameter(Mandatory)][string]$ExpectedLauncherRecoveryCompletionSha256,
+        [Parameter(Mandatory)][string]$ExpectedTargetRecoveryCompletionPath,
+        [Parameter(Mandatory)][string]$ExpectedTargetRecoveryCompletionSha256,
+        [Parameter(Mandatory)][string[]]$ExpectedLauncherArchiveCompletionPaths,
+        [Parameter(Mandatory)][string[]]$ExpectedLauncherArchiveCompletionSha256s,
+        [Parameter(Mandatory)][string]$ExpectedReasonCode
+    )
+
+    $match = [Regex]::Match(
+        $Url,
+        '^https://github\.com/(?<owner>[^/]+)/(?<repo>[^/]+)/issues/(?<issue>[1-9][0-9]*)#issuecomment-(?<comment>[1-9][0-9]*)\z',
+        [Text.RegularExpressions.RegexOptions]::CultureInvariant
+    )
+    if (-not $match.Success -or [int]$match.Groups['issue'].Value -ne $ExpectedIssue) {
+        Fail-Astro 'ASTRO_FSV_PARTIAL_LOCK_TRACKER_URL_INVALID' `
+            "tracker URL is not an exact issue-comment URL for #${ExpectedIssue}: $Url" `
+            'post one fresh owner-authored evidence comment on the exact driving issue'
+    }
+    $comment = Invoke-AstroFsvGhJson ('repos/{0}/{1}/issues/comments/{2}' -f `
+            $match.Groups['owner'].Value, $match.Groups['repo'].Value, `
+            $match.Groups['comment'].Value)
+    if ([string]$comment.html_url -cne $Url -or
+        [string]$comment.author_association -cne 'OWNER') {
+        Fail-Astro 'ASTRO_FSV_PARTIAL_LOCK_TRACKER_IDENTITY_INVALID' `
+            'GitHub readback does not bind the exact owner-authored comment URL' `
+            'use the canonical html_url of a repository-owner evidence comment'
+    }
+    $prefix = 'ASTRO_FSV_PARTIAL_LOCK_RETIREMENT_EVIDENCE '
+    [string[]]$markers = @([string]$comment.body -split "`r?`n" |
+            Where-Object { $_.StartsWith($prefix, [StringComparison]::Ordinal) })
+    if ($markers.Count -ne 1) {
+        Fail-Astro 'ASTRO_FSV_PARTIAL_LOCK_TRACKER_EVIDENCE_INVALID' `
+            "tracker comment must contain exactly one '$prefix' line" `
+            'post one fresh machine-readable partial-lock retirement evidence object'
+    }
+    try { $evidence = $markers[0].Substring($prefix.Length) | ConvertFrom-Json }
+    catch {
+        Fail-Astro 'ASTRO_FSV_PARTIAL_LOCK_TRACKER_EVIDENCE_INVALID' `
+            "tracker evidence JSON is invalid: $($_.Exception.Message)" `
+            'post one fresh exact JSON evidence object'
+    }
+    $expectedFields = @(
+        'schema', 'issue', 'lock_path', 'lock_sha256', 'receipt_path',
+        'receipt_sha256', 'artifact_path', 'artifact_sha256', 'session_directory',
+        'standard_output_path', 'standard_output_sha256', 'standard_error_path',
+        'standard_error_sha256', 'run_record_path', 'run_record_state',
+        'live_state_path', 'live_state_state', 'inventory_schema',
+        'inventory_encoding', 'inventory_entry_count',
+        'inventory_canonical_byte_count', 'inventory_sha256', 'owner_probe_state',
+        'job_probe_state', 'recovery_record_path', 'lock_archive_path',
+        'completion_record_path', 'lifecycle_transition_path',
+        'launcher_recovery_completion_path', 'launcher_recovery_completion_sha256',
+        'target_recovery_completion_path', 'target_recovery_completion_sha256',
+        'launcher_archive_completion_paths', 'launcher_archive_completion_sha256s',
+        'reason_code', 'authorized_action'
+    )
+    $actualFields = @($evidence.PSObject.Properties | ForEach-Object Name)
+    if ($actualFields.Count -ne $expectedFields.Count -or
+        @($expectedFields | Where-Object { $actualFields -notcontains $_ }).Count -ne 0) {
+        Fail-Astro 'ASTRO_FSV_PARTIAL_LOCK_TRACKER_EVIDENCE_INVALID' `
+            'tracker evidence fields differ from the exact partial-lock retirement contract' `
+            'post a fresh object containing exactly the documented fields'
+    }
+    $expectedPaths = @(
+        @('lock_path', $ExpectedLockPath), @('receipt_path', $ExpectedReceiptPath),
+        @('artifact_path', $ExpectedArtifactPath),
+        @('session_directory', $ExpectedSessionDirectory),
+        @('standard_output_path', $ExpectedStandardOutputPath),
+        @('standard_error_path', $ExpectedStandardErrorPath),
+        @('run_record_path', $ExpectedRunRecordPath),
+        @('live_state_path', $ExpectedLiveStatePath),
+        @('recovery_record_path', $ExpectedRecoveryRecordPath),
+        @('lock_archive_path', $ExpectedLockArchivePath),
+        @('completion_record_path', $ExpectedCompletionRecordPath),
+        @('lifecycle_transition_path', $ExpectedLifecycleTransitionPath),
+        @('launcher_recovery_completion_path', $ExpectedLauncherRecoveryCompletionPath),
+        @('target_recovery_completion_path', $ExpectedTargetRecoveryCompletionPath)
+    )
+    foreach ($pair in $expectedPaths) {
+        if (-not [string]::Equals(
+                [IO.Path]::GetFullPath([string]$evidence.($pair[0])),
+                [IO.Path]::GetFullPath([string]$pair[1]),
+                [StringComparison]::OrdinalIgnoreCase
+            )) {
+            Fail-Astro 'ASTRO_FSV_PARTIAL_LOCK_TRACKER_EVIDENCE_MISMATCH' `
+                "tracker evidence path differs for $($pair[0])" `
+                're-read physical state and post a fresh exact evidence object'
+        }
+    }
+    $trackerArchivePaths = @($evidence.launcher_archive_completion_paths)
+    $trackerArchiveHashes = @($evidence.launcher_archive_completion_sha256s)
+    if ($trackerArchivePaths.Count -ne $ExpectedLauncherArchiveCompletionPaths.Count -or
+        $trackerArchiveHashes.Count -ne $ExpectedLauncherArchiveCompletionSha256s.Count) {
+        Fail-Astro 'ASTRO_FSV_PARTIAL_LOCK_TRACKER_EVIDENCE_MISMATCH' `
+            'tracker launcher-archive completion arrays have the wrong cardinality' `
+            're-read the exact recovery chain and post one fresh evidence object'
+    }
+    for ($index = 0; $index -lt $trackerArchivePaths.Count; $index++) {
+        if (-not [string]::Equals(
+                [IO.Path]::GetFullPath([string]$trackerArchivePaths[$index]),
+                [IO.Path]::GetFullPath([string]$ExpectedLauncherArchiveCompletionPaths[$index]),
+                [StringComparison]::OrdinalIgnoreCase
+            ) -or
+            [string]$trackerArchiveHashes[$index] -cne
+                [string]$ExpectedLauncherArchiveCompletionSha256s[$index]) {
+            Fail-Astro 'ASTRO_FSV_PARTIAL_LOCK_TRACKER_EVIDENCE_MISMATCH' `
+                "tracker launcher-archive completion binding differs at index $index" `
+                're-read the exact recovery chain and post one fresh evidence object'
+        }
+    }
+    if ($evidence.schema -cne
+            'astrolabe.native-fsv-partial-lock-retirement-evidence.v1' -or
+        [int]$evidence.issue -ne $ExpectedIssue -or
+        [string]$evidence.lock_sha256 -cne $ExpectedLockSha256 -or
+        [string]$evidence.receipt_sha256 -cne $ExpectedReceiptSha256 -or
+        [string]$evidence.artifact_sha256 -cne $ExpectedArtifactSha256 -or
+        [string]$evidence.standard_output_sha256 -cne
+            $ExpectedStandardOutputSha256 -or
+        [string]$evidence.standard_error_sha256 -cne
+            $ExpectedStandardErrorSha256 -or
+        [string]$evidence.run_record_state -cne 'absent' -or
+        [string]$evidence.live_state_state -cne 'absent' -or
+        [string]$evidence.inventory_schema -cne $ExpectedInventorySchema -or
+        [string]$evidence.inventory_encoding -cne $ExpectedInventoryEncoding -or
+        [int]$evidence.inventory_entry_count -ne $ExpectedInventoryEntryCount -or
+        [uint64]$evidence.inventory_canonical_byte_count -ne
+            $ExpectedInventoryCanonicalByteCount -or
+        [string]$evidence.inventory_sha256 -cne $ExpectedInventorySha256 -or
+        [string]$evidence.owner_probe_state -cne 'all-inactive' -or
+        [string]$evidence.job_probe_state -cne 'absent' -or
+        [string]$evidence.launcher_recovery_completion_sha256 -cne
+            $ExpectedLauncherRecoveryCompletionSha256 -or
+        [string]$evidence.target_recovery_completion_sha256 -cne
+            $ExpectedTargetRecoveryCompletionSha256 -or
+        [string]$evidence.reason_code -cne $ExpectedReasonCode -or
+        [string]$evidence.authorized_action -cne
+            'archive-exact-terminal-partial-v3-fsv-lock-only') {
+        Fail-Astro 'ASTRO_FSV_PARTIAL_LOCK_TRACKER_EVIDENCE_MISMATCH' `
+            'tracker evidence differs from the exact local partial-lock binding' `
+            're-read physical state and post a fresh exact evidence object'
+    }
+    return [ordered]@{
+        url = $Url
+        comment_id = [long]$match.Groups['comment'].Value
+        author = [string]$comment.user.login
+        created_at = [string]$comment.created_at
+        evidence = $evidence
+    }
+}
+
+function Read-AstroFsvTerminalPartialQuarantineTrackerEvidence {
+    param(
+        [Parameter(Mandatory)][string]$Url,
+        [Parameter(Mandatory)][int]$ExpectedIssue,
+        [Parameter(Mandatory)][string]$ExpectedRetirementCompletionPath,
+        [Parameter(Mandatory)][string]$ExpectedRetirementCompletionSha256,
+        [Parameter(Mandatory)][string]$ExpectedReceiptPath,
+        [Parameter(Mandatory)][string]$ExpectedReceiptSha256,
+        [Parameter(Mandatory)][string]$ExpectedArtifactPath,
+        [Parameter(Mandatory)][string]$ExpectedArtifactSha256,
+        [Parameter(Mandatory)][string]$ExpectedSessionDirectory,
+        [Parameter(Mandatory)][string]$ExpectedStandardOutputPath,
+        [Parameter(Mandatory)][string]$ExpectedStandardOutputSha256,
+        [Parameter(Mandatory)][string]$ExpectedStandardErrorPath,
+        [Parameter(Mandatory)][string]$ExpectedStandardErrorSha256,
+        [Parameter(Mandatory)][string]$ExpectedRunRecordPath,
+        [Parameter(Mandatory)][string]$ExpectedLiveStatePath,
+        [Parameter(Mandatory)][string]$ExpectedInventorySchema,
+        [Parameter(Mandatory)][string]$ExpectedInventoryEncoding,
+        [Parameter(Mandatory)][int]$ExpectedInventoryEntryCount,
+        [Parameter(Mandatory)][uint64]$ExpectedInventoryCanonicalByteCount,
+        [Parameter(Mandatory)][string]$ExpectedInventorySha256,
+        [Parameter(Mandatory)][string]$ExpectedRecoveryRecordPath,
+        [Parameter(Mandatory)][string]$ExpectedCompletionRecordPath,
+        [Parameter(Mandatory)][string]$ExpectedLifecycleTransitionPath,
+        [Parameter(Mandatory)][string]$ExpectedSessionTombstonePath,
+        [Parameter(Mandatory)][string]$ExpectedReasonCode
+    )
+
+    $match = [Regex]::Match(
+        $Url,
+        '^https://github\.com/(?<owner>[^/]+)/(?<repo>[^/]+)/issues/(?<issue>[1-9][0-9]*)#issuecomment-(?<comment>[1-9][0-9]*)\z',
+        [Text.RegularExpressions.RegexOptions]::CultureInvariant
+    )
+    if (-not $match.Success -or [int]$match.Groups['issue'].Value -ne $ExpectedIssue) {
+        Fail-Astro 'ASTRO_FSV_TERMINAL_PARTIAL_TRACKER_URL_INVALID' `
+            "tracker URL is not an exact issue-comment URL for #${ExpectedIssue}: $Url" `
+            'post one fresh owner-authored evidence comment on the exact driving issue'
+    }
+    $comment = Invoke-AstroFsvGhJson ('repos/{0}/{1}/issues/comments/{2}' -f `
+            $match.Groups['owner'].Value, $match.Groups['repo'].Value, `
+            $match.Groups['comment'].Value)
+    if ([string]$comment.html_url -cne $Url -or
+        [string]$comment.author_association -cne 'OWNER') {
+        Fail-Astro 'ASTRO_FSV_TERMINAL_PARTIAL_TRACKER_IDENTITY_INVALID' `
+            'GitHub readback does not bind the exact owner-authored comment URL' `
+            'use the canonical html_url of a repository-owner evidence comment'
+    }
+    $prefix = 'ASTRO_FSV_TERMINAL_PARTIAL_QUARANTINE_EVIDENCE '
+    [string[]]$markers = @([string]$comment.body -split "`r?`n" |
+            Where-Object { $_.StartsWith($prefix, [StringComparison]::Ordinal) })
+    if ($markers.Count -ne 1) {
+        Fail-Astro 'ASTRO_FSV_TERMINAL_PARTIAL_TRACKER_EVIDENCE_INVALID' `
+            "tracker comment must contain exactly one '$prefix' line" `
+            'post one fresh machine-readable terminal-partial quarantine evidence object'
+    }
+    try { $evidence = $markers[0].Substring($prefix.Length) | ConvertFrom-Json }
+    catch {
+        Fail-Astro 'ASTRO_FSV_TERMINAL_PARTIAL_TRACKER_EVIDENCE_INVALID' `
+            "tracker evidence JSON is invalid: $($_.Exception.Message)" `
+            'post one fresh exact JSON evidence object'
+    }
+    $expectedFields = @(
+        'schema', 'issue', 'retirement_completion_path',
+        'retirement_completion_sha256', 'receipt_path', 'receipt_sha256',
+        'artifact_path', 'artifact_sha256', 'session_directory',
+        'standard_output_path', 'standard_output_sha256', 'standard_error_path',
+        'standard_error_sha256', 'run_record_path', 'run_record_state',
+        'live_state_path', 'live_state_state', 'inventory_schema',
+        'inventory_encoding', 'inventory_entry_count',
+        'inventory_canonical_byte_count', 'inventory_sha256', 'owner_probe_state',
+        'job_probe_state', 'recovery_record_path', 'completion_record_path',
+        'lifecycle_transition_path', 'session_tombstone_path',
+        'reason_code', 'authorized_action'
+    )
+    $actualFields = @($evidence.PSObject.Properties | ForEach-Object Name)
+    if ($actualFields.Count -ne $expectedFields.Count -or
+        @($expectedFields | Where-Object { $actualFields -notcontains $_ }).Count -ne 0) {
+        Fail-Astro 'ASTRO_FSV_TERMINAL_PARTIAL_TRACKER_EVIDENCE_INVALID' `
+            'tracker evidence fields differ from the exact terminal-partial quarantine contract' `
+            'post a fresh object containing exactly the documented fields'
+    }
+    $expectedPaths = @(
+        @('retirement_completion_path', $ExpectedRetirementCompletionPath),
+        @('receipt_path', $ExpectedReceiptPath),
+        @('artifact_path', $ExpectedArtifactPath),
+        @('session_directory', $ExpectedSessionDirectory),
+        @('standard_output_path', $ExpectedStandardOutputPath),
+        @('standard_error_path', $ExpectedStandardErrorPath),
+        @('run_record_path', $ExpectedRunRecordPath),
+        @('live_state_path', $ExpectedLiveStatePath),
+        @('recovery_record_path', $ExpectedRecoveryRecordPath),
+        @('completion_record_path', $ExpectedCompletionRecordPath),
+        @('lifecycle_transition_path', $ExpectedLifecycleTransitionPath),
+        @('session_tombstone_path', $ExpectedSessionTombstonePath)
+    )
+    foreach ($pair in $expectedPaths) {
+        if (-not [string]::Equals(
+                [IO.Path]::GetFullPath([string]$evidence.($pair[0])),
+                [IO.Path]::GetFullPath([string]$pair[1]),
+                [StringComparison]::OrdinalIgnoreCase
+            )) {
+            Fail-Astro 'ASTRO_FSV_TERMINAL_PARTIAL_TRACKER_EVIDENCE_MISMATCH' `
+                "tracker evidence path differs for $($pair[0])" `
+                're-read physical state and post a fresh exact evidence object'
+        }
+    }
+    if ([string]$evidence.schema -cne
+            'astrolabe.native-fsv-terminal-partial-quarantine-evidence.v1' -or
+        [int]$evidence.issue -ne $ExpectedIssue -or
+        [string]$evidence.retirement_completion_sha256 -cne
+            $ExpectedRetirementCompletionSha256 -or
+        [string]$evidence.receipt_sha256 -cne $ExpectedReceiptSha256 -or
+        [string]$evidence.artifact_sha256 -cne $ExpectedArtifactSha256 -or
+        [string]$evidence.standard_output_sha256 -cne
+            $ExpectedStandardOutputSha256 -or
+        [string]$evidence.standard_error_sha256 -cne
+            $ExpectedStandardErrorSha256 -or
+        [string]$evidence.run_record_state -cne 'absent' -or
+        [string]$evidence.live_state_state -cne 'absent' -or
+        [string]$evidence.inventory_schema -cne $ExpectedInventorySchema -or
+        [string]$evidence.inventory_encoding -cne $ExpectedInventoryEncoding -or
+        [int]$evidence.inventory_entry_count -ne $ExpectedInventoryEntryCount -or
+        [uint64]$evidence.inventory_canonical_byte_count -ne
+            $ExpectedInventoryCanonicalByteCount -or
+        [string]$evidence.inventory_sha256 -cne $ExpectedInventorySha256 -or
+        [string]$evidence.owner_probe_state -cne 'all-inactive' -or
+        [string]$evidence.job_probe_state -cne 'absent' -or
+        [string]$evidence.reason_code -cne $ExpectedReasonCode -or
+        [string]$evidence.authorized_action -cne
+            'quarantine-exact-terminal-partial-session-after-lock-retirement') {
+        Fail-Astro 'ASTRO_FSV_TERMINAL_PARTIAL_TRACKER_EVIDENCE_MISMATCH' `
+            'tracker evidence differs from the exact local terminal-partial session binding' `
+            're-read physical state and post a fresh exact evidence object'
+    }
+    return [ordered]@{
+        url = $Url
+        comment_id = [long]$match.Groups['comment'].Value
+        author = [string]$comment.user.login
+        created_at = [string]$comment.created_at
+        evidence = $evidence
+    }
 }
 
 function Read-Receipt {
@@ -1447,12 +2406,1275 @@ function Remove-EmptyEvidenceParents {
     }
 }
 
+function Invoke-AstroFsvPartialLockRetirementResume {
+    param(
+        [Parameter(Mandatory)][int]$ExpectedIssue,
+        [Parameter(Mandatory)][string]$Workspace,
+        [Parameter(Mandatory)][string]$EvidenceRoot,
+        [Parameter(Mandatory)][string]$RecoveryRoot,
+        [Parameter(Mandatory)][string]$FsvLockPath,
+        [Parameter(Mandatory)][string]$LifecycleTransitionPath,
+        [Parameter(Mandatory)][string]$ReceiptInputPath,
+        [Parameter(Mandatory)][string]$RecoveryInputPath,
+        [Parameter(Mandatory)][string]$StandardOutputInputPath,
+        [Parameter(Mandatory)][string]$StandardErrorInputPath,
+        [Parameter(Mandatory)][string]$RunRecordInputPath,
+        [Parameter(Mandatory)][string]$LiveStateInputPath,
+        [Parameter(Mandatory)][string]$TrackerUrl,
+        [Parameter(Mandatory)][string]$FailureCode,
+        [Parameter(Mandatory)][string]$FailureMessage,
+        [Parameter(Mandatory)][string]$LauncherRecoveryInputPath,
+        [Parameter(Mandatory)][string]$TargetRecoveryInputPath,
+        [Parameter(Mandatory)][string[]]$ArchiveCompletionInputPaths
+    )
+    $code = 'ASTRO_FSV_PARTIAL_LOCK_RESUME_INVALID'
+    $authorizationPath = Assert-PathWithin $RecoveryInputPath $RecoveryRoot $code `
+        'partial-lock retirement authorization path'
+    $archivePath = $authorizationPath + '.lock.bin'
+    $completionPath = $authorizationPath + '.completed.json'
+    $transitionPresent = (Get-AstroFsvStrictPathState `
+            $LifecycleTransitionPath file $code 'canonical FSV lifecycle transition').state -ceq
+        'present'
+    $authorizationPresent = (Get-AstroFsvStrictPathState `
+            $authorizationPath file $code 'partial-lock authorization archive').state -ceq
+        'present'
+    $archivePresent = (Get-AstroFsvStrictPathState `
+            $archivePath file $code 'archived terminal-partial FSV lock').state -ceq
+        'present'
+    $completionPresent = (Get-AstroFsvStrictPathState `
+            $completionPath file $code 'partial-lock retirement completion').state -ceq
+        'present'
+    if ($transitionPresent -and $authorizationPresent) {
+        Fail-Astro $code 'canonical transition and archived authorization are both present' `
+            'preserve both namespaces and investigate the interrupted no-replace archive'
+    }
+    if (-not $transitionPresent -and -not $authorizationPresent) {
+        Fail-Astro $code 'resume state lacks both canonical transition and authorization' `
+            'preserve archive/completion bytes and restore only through their exact authored transition'
+    }
+    $activeAuthorizationPath = if ($transitionPresent) {
+        $LifecycleTransitionPath
+    } else { $authorizationPath }
+    $authorization = Read-AstroFsvExactJsonFile `
+        $activeAuthorizationPath $code 'terminal-partial lock retirement authorization'
+    $value = $authorization.value
+    foreach ($pair in @(
+            @([string]$value.authorization_record_path, $authorizationPath),
+            @([string]$value.lifecycle_transition_path, $LifecycleTransitionPath),
+            @([string]$value.completion_record_path, $completionPath),
+            @([string]$value.fsv_lock.path, $FsvLockPath),
+            @([string]$value.fsv_lock.archive_path, $archivePath),
+            @([string]$value.receipt_path, [IO.Path]::GetFullPath($ReceiptInputPath)),
+            @([string]$value.outputs.stdout.path, [IO.Path]::GetFullPath($StandardOutputInputPath)),
+            @([string]$value.outputs.stderr.path, [IO.Path]::GetFullPath($StandardErrorInputPath)),
+            @([string]$value.expected_controls.run_record_path, [IO.Path]::GetFullPath($RunRecordInputPath)),
+            @([string]$value.expected_controls.live_state_path, [IO.Path]::GetFullPath($LiveStateInputPath))
+        )) {
+        if (-not [string]::Equals(
+                [IO.Path]::GetFullPath([string]$pair[0]),
+                [IO.Path]::GetFullPath([string]$pair[1]),
+                [StringComparison]::OrdinalIgnoreCase
+            )) {
+            Fail-Astro $code 'resume arguments differ from the durable authorization path family' `
+                'resume only with the exact paths bound by the canonical transition'
+        }
+    }
+    if ([string]$value.schema -cne
+            'astrolabe.native-fsv-partial-lock-retirement.authorization.v1' -or
+        [string]$value.phase -cne 'authorized-exact-terminal-partial-lock' -or
+        [int]$value.issue -ne $ExpectedIssue -or
+        [string]$value.failure.code -cne $FailureCode -or
+        [string]$value.failure.message -cne $FailureMessage -or
+        [string]$value.tracker.url -cne $TrackerUrl -or
+        [string]$value.expected_controls.run_record_state -cne 'absent' -or
+        [string]$value.expected_controls.live_state_state -cne 'absent') {
+        Fail-Astro $code 'durable retirement authorization differs from the requested transaction' `
+            'preserve every byte and resume only the exact tracker-bound transaction'
+    }
+    $chain = Read-AstroFsvLauncherRecoveryChain `
+        -ExpectedIssue $ExpectedIssue -Workspace $Workspace `
+        -LauncherRecoveryPath $LauncherRecoveryInputPath `
+        -TargetRecoveryPath $TargetRecoveryInputPath `
+        -ArchiveCompletionPaths $ArchiveCompletionInputPaths
+    if (-not [string]::Equals(
+            [IO.Path]::GetFullPath([string]$value.launcher_recovery_chain.launcher_recovery_completion.path),
+            [IO.Path]::GetFullPath([string]$chain.launcher_recovery.path),
+            [StringComparison]::OrdinalIgnoreCase
+        ) -or
+        -not [string]::Equals(
+            [IO.Path]::GetFullPath([string]$value.launcher_recovery_chain.target_recovery_completion.path),
+            [IO.Path]::GetFullPath([string]$chain.target_recovery.path),
+            [StringComparison]::OrdinalIgnoreCase
+        ) -or
+        [string]$value.launcher_recovery_chain.launcher_recovery_completion.sha256 -cne
+            [string]$chain.launcher_recovery.sha256 -or
+        [string]$value.launcher_recovery_chain.target_recovery_completion.sha256 -cne
+            [string]$chain.target_recovery.sha256 -or
+        @($value.launcher_recovery_chain.launcher_archive_completions).Count -ne
+            @($chain.archives).Count) {
+        Fail-Astro $code 'durable launcher recovery chain differs from physical readback' `
+            'preserve the transaction and supply the exact original recovery records'
+    }
+    for ($index = 0; $index -lt @($chain.archives).Count; $index++) {
+        if (-not [string]::Equals(
+                [IO.Path]::GetFullPath([string]$value.launcher_recovery_chain.launcher_archive_completions[$index].path),
+                [IO.Path]::GetFullPath([string]$chain.archives[$index].completion.path),
+                [StringComparison]::OrdinalIgnoreCase
+            ) -or
+            [string]$value.launcher_recovery_chain.launcher_archive_completions[$index].sha256 -cne
+            [string]$chain.archives[$index].completion.sha256) {
+            Fail-Astro $code 'durable launcher archive chain differs from physical readback' `
+                'preserve the transaction and supply the exact original archive completions'
+        }
+    }
+    $receiptState = Read-Receipt $ReceiptInputPath $EvidenceRoot
+    $inspection = Inspect-ReceiptArtifact $receiptState $EvidenceRoot
+    $session = [IO.Path]::GetFullPath($inspection.session_directory)
+    if ([int]$inspection.issue -ne $ExpectedIssue -or
+        [string]$value.receipt_sha256 -cne (File-Sha256 $receiptState.Path) -or
+        [string]$value.artifact.sha256 -cne [string]$inspection.sha256 -or
+        -not [string]::Equals(
+            [IO.Path]::GetFullPath([string]$value.session_directory),
+            $session,
+            [StringComparison]::OrdinalIgnoreCase
+        )) {
+        Fail-Astro $code 'receipt/artifact/session differ from durable retirement authorization' `
+            'preserve the transaction and investigate evidence drift'
+    }
+    $stdoutPath = [IO.Path]::GetFullPath($StandardOutputInputPath)
+    $stderrPath = [IO.Path]::GetFullPath($StandardErrorInputPath)
+    $runPath = [IO.Path]::GetFullPath($RunRecordInputPath)
+    $livePath = [IO.Path]::GetFullPath($LiveStateInputPath)
+    if (-not (Test-AstroPathLongPath -LiteralPath $stdoutPath -PathType Leaf) -or
+        -not (Test-AstroPathLongPath -LiteralPath $stderrPath -PathType Leaf) -or
+        (File-Sha256 $stdoutPath) -cne [string]$value.outputs.stdout.sha256 -or
+        (File-Sha256 $stderrPath) -cne [string]$value.outputs.stderr.sha256 -or
+        (Test-AstroPathLongPath -LiteralPath $runPath) -or
+        (Test-AstroPathLongPath -LiteralPath $livePath)) {
+        Fail-Astro $code 'terminal-partial output/control state drifted during retirement' `
+            'preserve the transaction and investigate the changed session'
+    }
+    $sessionTree = Get-AstroOrdinaryDirectoryTreeInventoryLongPath $session
+    if ([string]$sessionTree.schema -cne [string]$value.session_inventory.schema -or
+        [string]$sessionTree.encoding -cne [string]$value.session_inventory.encoding -or
+        [int]$sessionTree.entry_count -ne [int]$value.session_inventory.entry_count -or
+        [uint64]$sessionTree.canonical_bytes_length -ne
+            [uint64]$value.session_inventory.canonical_bytes_length -or
+        [string]$sessionTree.sha256 -cne [string]$value.session_inventory.sha256) {
+        Fail-Astro $code 'session inventory drifted during terminal-partial lock retirement' `
+            'preserve the complete transaction and investigate the changed entry'
+    }
+    $lockReadPath = if (Test-AstroPathLongPath -LiteralPath $FsvLockPath -PathType Leaf) {
+        $FsvLockPath
+    } elseif ($archivePresent) { $archivePath } else { '' }
+    if ([string]::IsNullOrEmpty($lockReadPath) -or
+        (File-Sha256 $lockReadPath) -cne [string]$value.fsv_lock.sha256) {
+        Fail-Astro $code 'neither exact source nor exact archived FSV lock is available' `
+            'preserve all records and investigate the interrupted archive transition'
+    }
+    try { $lockState = Read-AstroUtf8FileLongPath $lockReadPath | ConvertFrom-Json }
+    catch {
+        Fail-Astro $code 'bound FSV lock bytes are not valid JSON' `
+            'preserve the source/archive and investigate its exact bytes'
+    }
+    if ([string]$lockState.schema -cne 'astrolabe.native-fsv-lock.v3' -or
+        [string]$lockState.mode -cne 'resident-cohort' -or
+        [int]$lockState.issue -ne $ExpectedIssue -or
+        [int]$lockState.process_count -le 0 -or
+        [string]$lockState.artifact_sha256 -cne [string]$inspection.sha256) {
+        Fail-Astro $code 'bound FSV lock is not the authorized terminal-partial v3 cohort' `
+            'preserve the source/archive and investigate malformed authority'
+    }
+    $lockLauncher = Read-AstroFsvProcessIdentity $lockState.owners.launcher $code `
+        'resumed FSV-lock launcher identity'
+    $lockRunner = Read-AstroFsvProcessIdentity $lockState.owners.runner $code `
+        'resumed FSV-lock runner identity'
+    $lockProcesses = Read-AstroFsvTerminalPartialPreLiveProcesses `
+        -LockState $lockState -Code $code `
+        -Description 'resumed FSV-lock process set'
+    $authorizedLockState = $value.fsv_lock.state
+    $authorizedLockLauncher = Read-AstroFsvProcessIdentity `
+        $authorizedLockState.owners.launcher $code `
+        'authorized embedded FSV-lock launcher identity'
+    $authorizedLockRunner = Read-AstroFsvProcessIdentity `
+        $authorizedLockState.owners.runner $code `
+        'authorized embedded FSV-lock runner identity'
+    $authorizedLockProcesses = Read-AstroFsvTerminalPartialPreLiveProcesses `
+        -LockState $authorizedLockState -Code $code `
+        -Description 'authorized embedded FSV-lock process set'
+    if ([string]$authorizedLockState.schema -cne [string]$lockState.schema -or
+        [string]$authorizedLockState.mode -cne [string]$lockState.mode -or
+        [int]$authorizedLockState.issue -ne [int]$lockState.issue -or
+        [string]$authorizedLockState.started -cne [string]$lockState.started -or
+        [int]$authorizedLockState.resident_count -ne [int]$lockState.resident_count -or
+        [int]$authorizedLockState.process_count -ne [int]$lockState.process_count -or
+        [string]$authorizedLockState.tree_sha -cne [string]$lockState.tree_sha -or
+        -not [string]::Equals(
+            [IO.Path]::GetFullPath([string]$authorizedLockState.artifact_path),
+            [IO.Path]::GetFullPath([string]$lockState.artifact_path),
+            [StringComparison]::OrdinalIgnoreCase
+        ) -or
+        [string]$authorizedLockState.artifact_sha256 -cne
+            [string]$lockState.artifact_sha256 -or
+        -not [string]::Equals(
+            [IO.Path]::GetFullPath([string]$authorizedLockState.cohort_plan.path),
+            [IO.Path]::GetFullPath([string]$lockState.cohort_plan.path),
+            [StringComparison]::OrdinalIgnoreCase
+        ) -or
+        [string]$authorizedLockState.cohort_plan.sha256 -cne
+            [string]$lockState.cohort_plan.sha256 -or
+        [string]$authorizedLockState.launcher_job.name -cne
+            [string]$lockState.launcher_job.name -or
+        (@($authorizedLockState.launcher_job.members) -join ',') -cne
+            (@($lockState.launcher_job.members) -join ',') -or
+        [string]$authorizedLockState.phase -cne [string]$lockState.phase -or
+        -not (Test-AstroFsvIdentityEqual $authorizedLockLauncher $lockLauncher) -or
+        -not (Test-AstroFsvIdentityEqual $authorizedLockRunner $lockRunner) -or
+        -not (Test-AstroFsvV3ProcessEntriesEqual `
+            $authorizedLockProcesses $lockProcesses)) {
+        Fail-Astro $code 'embedded authorized FSV-lock state differs from archived lock bytes' `
+            'preserve the transaction and investigate malformed durable authorization'
+    }
+    $cohortPlanPath = Assert-PathWithin `
+        ([string]$lockState.cohort_plan.path) $Workspace $code `
+        'resumed terminal-partial cohort plan'
+    $cohortPlanState = Get-AstroFsvStrictPathState `
+        $cohortPlanPath file $code 'resumed terminal-partial cohort plan'
+    if ($cohortPlanState.state -cne 'present' -or
+        (File-Sha256 $cohortPlanPath) -cne [string]$lockState.cohort_plan.sha256) {
+        Fail-Astro $code 'terminal-partial cohort plan is absent or hash-mismatched' `
+            'preserve the transaction and investigate the external plan bytes'
+    }
+    $ownerBindingList = [Collections.Generic.List[object]]::new()
+    foreach ($binding in @(
+            New-AstroFsvOwnerBinding 'launcher' 'artifact receipt' $inspection.owners.launcher
+            New-AstroFsvOwnerBinding 'promoter' 'artifact receipt' $inspection.owners.promoter
+            New-AstroFsvOwnerBinding 'launcher' 'partial FSV lock' $lockLauncher
+            New-AstroFsvOwnerBinding 'runner' 'partial FSV lock' $lockRunner
+        )) { $ownerBindingList.Add($binding) }
+    Add-AstroFsvV3ProcessBindings $ownerBindingList $lockProcesses 'partial FSV lock'
+    foreach ($archive in $chain.archives) {
+        $generation = $archive.authorization.value.generation
+        $ownerBindingList.Add((New-AstroFsvOwnerBinding 'launcher' `
+                'launcher recovery/archive chain' `
+                (New-AstroProcessIdentityRecord ([int]$generation.launcher_pid) `
+                    ([long]$generation.launcher_process_start_utc_ticks))))
+    }
+    $ownerBindings = [object[]]$ownerBindingList.ToArray()
+    $initialOwnerProbes = @(Assert-AstroFsvOwnersInactive `
+            -Bindings $ownerBindings -CodePrefix 'ASTRO_FSV_PARTIAL_LOCK' `
+            -Description 'resumed terminal-partial lock retirement')
+    $initialJobProbes = [Collections.Generic.List[object]]::new()
+    foreach ($archive in $chain.archives) {
+        $probe = Get-AstroLauncherJobObjectProbe -Name ([string]$archive.job_name)
+        if ($probe.State -cne 'absent') {
+            Fail-Astro 'ASTRO_FSV_PARTIAL_LOCK_JOB_PRESENT' `
+                "resumed launcher Job is '$($probe.State)': $($archive.job_name)" `
+                'preserve the transaction while the exact Job exists'
+        }
+        $initialJobProbes.Add($probe)
+    }
+    $matchingArchive = @($chain.archives | Where-Object {
+            [int]$_.authorization.value.generation.launcher_pid -eq [int]$lockLauncher.pid -and
+            [long]$_.authorization.value.generation.launcher_process_start_utc_ticks -eq
+                [long]$lockLauncher.process_start_utc_ticks
+        })
+    if ($matchingArchive.Count -ne 1 -or
+        [string]$lockState.launcher_job.name -cne [string]$matchingArchive[0].job_name) {
+        Fail-Astro $code 'archived lock Job does not equal its deterministic launcher archive Job' `
+            'preserve the transaction and investigate malformed attribution'
+    }
+    Assert-AstroFsvPersistedOwnerEnvelope `
+        -Owners $value.owners -ExpectedBindings $ownerBindings -Code $code `
+        -Description 'resumed terminal-partial lock-retirement authorization'
+    if ([string]$value.launcher_job.name -cne [string]$lockState.launcher_job.name) {
+        Fail-Astro $code 'persisted primary launcher Job name differs from the archived lock' `
+            'preserve the transaction and investigate malformed durable Job evidence'
+    }
+    Assert-AstroFsvPersistedAbsentJobProbe `
+        $value.launcher_job.initial_probe ([string]$lockState.launcher_job.name) `
+        $code 'persisted primary launcher initial probe'
+    Assert-AstroFsvPersistedAbsentJobProbe `
+        $value.launcher_job.final_probe ([string]$lockState.launcher_job.name) `
+        $code 'persisted primary launcher final probe'
+    Assert-AstroFsvPersistedRecoveryJobProbes `
+        -Persisted $value.recovery_launcher_job_probes `
+        -LauncherRecoveryChain $chain -Code $code `
+        -Description 'persisted recovery-launcher'
+    $chainArchivePaths = [string[]]@($chain.archives | ForEach-Object {
+            [string]$_.completion.path
+        })
+    $chainArchiveHashes = [string[]]@($chain.archives | ForEach-Object {
+            [string]$_.completion.sha256
+        })
+    $trackerReadback = Read-AstroFsvPartialLockTrackerEvidence `
+        -Url $TrackerUrl -ExpectedIssue $ExpectedIssue `
+        -ExpectedLockPath $FsvLockPath `
+        -ExpectedLockSha256 ([string]$value.fsv_lock.sha256) `
+        -ExpectedReceiptPath $receiptState.Path `
+        -ExpectedReceiptSha256 ([string]$value.receipt_sha256) `
+        -ExpectedArtifactPath $inspection.artifact_path `
+        -ExpectedArtifactSha256 $inspection.sha256 `
+        -ExpectedSessionDirectory $session `
+        -ExpectedStandardOutputPath $stdoutPath `
+        -ExpectedStandardOutputSha256 ([string]$value.outputs.stdout.sha256) `
+        -ExpectedStandardErrorPath $stderrPath `
+        -ExpectedStandardErrorSha256 ([string]$value.outputs.stderr.sha256) `
+        -ExpectedRunRecordPath $runPath -ExpectedLiveStatePath $livePath `
+        -ExpectedInventorySchema ([string]$sessionTree.schema) `
+        -ExpectedInventoryEncoding ([string]$sessionTree.encoding) `
+        -ExpectedInventoryEntryCount ([int]$sessionTree.entry_count) `
+        -ExpectedInventoryCanonicalByteCount `
+            ([uint64]$sessionTree.canonical_bytes_length) `
+        -ExpectedInventorySha256 ([string]$sessionTree.sha256) `
+        -ExpectedRecoveryRecordPath $authorizationPath `
+        -ExpectedLockArchivePath $archivePath `
+        -ExpectedCompletionRecordPath $completionPath `
+        -ExpectedLifecycleTransitionPath $LifecycleTransitionPath `
+        -ExpectedLauncherRecoveryCompletionPath `
+            ([string]$chain.launcher_recovery.path) `
+        -ExpectedLauncherRecoveryCompletionSha256 `
+            ([string]$chain.launcher_recovery.sha256) `
+        -ExpectedTargetRecoveryCompletionPath ([string]$chain.target_recovery.path) `
+        -ExpectedTargetRecoveryCompletionSha256 `
+            ([string]$chain.target_recovery.sha256) `
+        -ExpectedLauncherArchiveCompletionPaths $chainArchivePaths `
+        -ExpectedLauncherArchiveCompletionSha256s $chainArchiveHashes `
+        -ExpectedReasonCode $FailureCode
+    if ([long]$trackerReadback.comment_id -ne [long]$value.tracker.comment_id -or
+        [string]$trackerReadback.author -cne [string]$value.tracker.author -or
+        [string]$trackerReadback.created_at -cne [string]$value.tracker.created_at) {
+        Fail-Astro $code 'persisted tracker identity differs from fresh GitHub readback' `
+            'preserve the transaction and investigate edited or cross-generation authority'
+    }
+    $sourcePresent = (Get-AstroFsvStrictPathState `
+            $FsvLockPath file $code 'source terminal-partial FSV lock').state -ceq
+        'present'
+    if ($sourcePresent -and $archivePresent) {
+        Fail-Astro $code 'source and archive FSV lock are both present' `
+            'preserve both namespaces and investigate the interrupted no-replace move'
+    }
+    if ($transitionPresent -and $sourcePresent -and -not $archivePresent) {
+        if ($completionPresent) {
+            Fail-Astro $code 'completion exists before the authorized source lock was archived' `
+                'preserve the inconsistent transaction and investigate publication order'
+        }
+        Move-AstroFileWriteThroughNoReplace -Source $FsvLockPath -Destination $archivePath
+        $sourcePresent = (Get-AstroFsvStrictPathState `
+                $FsvLockPath file $code 'source terminal-partial FSV lock').state -ceq
+            'present'
+        $archivePresent = (Get-AstroFsvStrictPathState `
+                $archivePath file $code 'archived terminal-partial FSV lock').state -ceq
+            'present'
+    }
+    if ($sourcePresent -or -not $archivePresent -or
+        (File-Sha256 $archivePath) -cne [string]$value.fsv_lock.sha256) {
+        Fail-Astro $code 'lock archive state is not exact source-absent/archive-equal' `
+            'preserve all bytes and resume only after investigating namespace drift'
+    }
+    $finalOwnerProbes = @(Assert-AstroFsvOwnersInactive `
+            -Bindings $ownerBindings -CodePrefix 'ASTRO_FSV_PARTIAL_LOCK' `
+            -Description 'resumed terminal-partial lock finalization')
+    $finalJobProbes = [Collections.Generic.List[object]]::new()
+    foreach ($archive in $chain.archives) {
+        $probe = Get-AstroLauncherJobObjectProbe -Name ([string]$archive.job_name)
+        if ($probe.State -cne 'absent') {
+            Fail-Astro 'ASTRO_FSV_PARTIAL_LOCK_JOB_PRESENT' `
+                "resumed launcher Job changed to '$($probe.State)': $($archive.job_name)" `
+                'preserve the transaction while the exact Job exists'
+        }
+        $finalJobProbes.Add($probe)
+    }
+    $launcherState = Read-AstroLauncherLock `
+        -LockPath (Join-Path (Join-Path $Workspace '.tmp') 'astrolabe-launcher.lock')
+    if ($launcherState.State -ne 'absent' -or
+        (Test-AstroPathLongPath -LiteralPath (Join-Path $Workspace 'target')) -or
+        (Get-AstroOrdinaryDirectoryTreeInventoryLongPath $session).sha256 -cne
+            [string]$sessionTree.sha256) {
+        Fail-Astro $code 'launcher/target/session state changed before resumed completion' `
+            'preserve the transaction and investigate physical state drift'
+    }
+    $authorizationSha256 = [string]$authorization.sha256
+    if (-not $completionPresent) {
+        if (-not $transitionPresent) {
+            Fail-Astro $code 'archived authorization exists without its required completion' `
+                'preserve the inconsistent transaction; only the canonical transition may finalize it'
+        }
+        $completion = [ordered]@{
+            schema = 'astrolabe.native-fsv-partial-lock-retirement.completion.v1'
+            phase = 'complete-lock-archived-source-absent'
+            issue = $ExpectedIssue
+            completed_at_utc = [DateTime]::UtcNow.ToString('o')
+            authorization = [ordered]@{ path = $authorizationPath; sha256 = $authorizationSha256 }
+            source = [ordered]@{
+                path = $FsvLockPath; state = 'absent'
+                prior_sha256 = [string]$value.fsv_lock.sha256
+            }
+            archive = [ordered]@{
+                path = $archivePath
+                bytes = [uint64](Get-AstroFileInfoLongPath $archivePath).Length
+                sha256 = File-Sha256 $archivePath
+            }
+            session = [ordered]@{
+                path = $session
+                inventory_schema = [string]$sessionTree.schema
+                inventory_encoding = [string]$sessionTree.encoding
+                inventory_entry_count = [int]$sessionTree.entry_count
+                inventory_canonical_byte_count = [uint64]$sessionTree.canonical_bytes_length
+                inventory_sha256 = [string]$sessionTree.sha256
+            }
+        }
+        $completionRecord = Publish-NewAstroFsvProtocolRecord `
+            -Path $completionPath -Value $completion `
+            -CodePrefix 'ASTRO_FSV_PARTIAL_LOCK_COMPLETION'
+        $completionPresent = $true
+    }
+    else {
+        $completionRecord = Read-AstroFsvExactJsonFile `
+            $completionPath $code 'terminal-partial lock retirement completion'
+    }
+    $completionValue = $completionRecord.value
+    if ([string]$completionValue.schema -cne
+            'astrolabe.native-fsv-partial-lock-retirement.completion.v1' -or
+        [string]$completionValue.phase -cne 'complete-lock-archived-source-absent' -or
+        [int]$completionValue.issue -ne $ExpectedIssue -or
+        [string]$completionValue.authorization.sha256 -cne $authorizationSha256 -or
+        [string]$completionValue.source.state -cne 'absent' -or
+        [string]$completionValue.source.prior_sha256 -cne
+            [string]$value.fsv_lock.sha256 -or
+        [uint64]$completionValue.archive.bytes -ne
+            [uint64](Get-AstroFileInfoLongPath $archivePath).Length -or
+        [string]$completionValue.archive.sha256 -cne [string]$value.fsv_lock.sha256 -or
+        [string]$completionValue.session.inventory_schema -cne
+            [string]$sessionTree.schema -or
+        [string]$completionValue.session.inventory_encoding -cne
+            [string]$sessionTree.encoding -or
+        [int]$completionValue.session.inventory_entry_count -ne
+            [int]$sessionTree.entry_count -or
+        [uint64]$completionValue.session.inventory_canonical_byte_count -ne
+            [uint64]$sessionTree.canonical_bytes_length -or
+        [string]$completionValue.session.inventory_sha256 -cne
+            [string]$sessionTree.sha256 -or
+        -not [string]::Equals(
+            [IO.Path]::GetFullPath([string]$completionValue.authorization.path),
+            $authorizationPath,
+            [StringComparison]::OrdinalIgnoreCase
+        ) -or
+        -not [string]::Equals(
+            [IO.Path]::GetFullPath([string]$completionValue.source.path),
+            $FsvLockPath,
+            [StringComparison]::OrdinalIgnoreCase
+        ) -or
+        -not [string]::Equals(
+            [IO.Path]::GetFullPath([string]$completionValue.archive.path),
+            $archivePath,
+            [StringComparison]::OrdinalIgnoreCase
+        ) -or
+        -not [string]::Equals(
+            [IO.Path]::GetFullPath([string]$completionValue.session.path),
+            $session,
+            [StringComparison]::OrdinalIgnoreCase
+        )) {
+        Fail-Astro $code 'retirement completion does not exactly link authorization/source/archive/session' `
+            'preserve the complete record chain and investigate malformed completion bytes'
+    }
+    if ($transitionPresent) {
+        Move-AstroFileWriteThroughNoReplace `
+            -Source $LifecycleTransitionPath -Destination $authorizationPath
+        $transitionPresent = $false
+        $authorizationPresent = $true
+    }
+    if ((Get-AstroFsvStrictPathState `
+            $LifecycleTransitionPath file $code 'canonical FSV lifecycle transition').state -cne
+            'absent' -or
+        (Get-AstroFsvStrictPathState `
+            $FsvLockPath file $code 'source terminal-partial FSV lock').state -cne
+            'absent' -or
+        (Get-AstroFsvStrictPathState `
+            $authorizationPath file $code 'partial-lock authorization archive').state -cne
+            'present' -or
+        (File-Sha256 $authorizationPath) -cne $authorizationSha256 -or
+        (File-Sha256 $archivePath) -cne [string]$value.fsv_lock.sha256) {
+        Fail-Astro $code 'terminal retirement readback is not transition-absent/source-absent/archive-equal' `
+            'preserve all protocol records and inspect physical state'
+    }
+    return [ordered]@{
+        operation = 'retire-terminal-partial-lock'
+        resumed = $true
+        authorization_path = $authorizationPath
+        authorization_sha256 = $authorizationSha256
+        completion_path = $completionPath
+        completion_sha256 = File-Sha256 $completionPath
+        authorization = $value
+        completion = $completionValue
+        owner_probes = [ordered]@{ initial = $initialOwnerProbes; final = $finalOwnerProbes }
+        job_probes = [ordered]@{
+            initial = [object[]]$initialJobProbes.ToArray()
+            final = [object[]]$finalJobProbes.ToArray()
+        }
+        after = [ordered]@{
+            lifecycle_transition_state = 'absent'
+            fsv_lock_state = 'absent'
+            lock_archive_sha256 = [string]$value.fsv_lock.sha256
+            session_inventory_sha256 = [string]$sessionTree.sha256
+        }
+    }
+}
+
+function Assert-AstroFsvAuthorizedInventorySubset {
+    param(
+        [Parameter(Mandatory)]$AuthorizedEntries,
+        [Parameter(Mandatory)]$CurrentInventory,
+        [Parameter(Mandatory)][string]$Code
+    )
+    $authorized = @{}
+    foreach ($entry in @($AuthorizedEntries)) {
+        $key = ([string]$entry.relative_path).ToLowerInvariant()
+        if ([string]::IsNullOrWhiteSpace($key) -or $authorized.ContainsKey($key)) {
+            Fail-Astro $Code 'authorized tombstone inventory has an empty/duplicate relative path' `
+                'preserve the tombstone and investigate malformed authorization bytes'
+        }
+        $authorized[$key] = $entry
+    }
+    if (-not $authorized.ContainsKey('.')) {
+        Fail-Astro $Code 'authorized tombstone inventory lacks its root entry' `
+            'preserve the tombstone and investigate malformed authorization bytes'
+    }
+    $currentKeys = @{}
+    foreach ($entry in @($CurrentInventory.entries)) {
+        $key = ([string]$entry.relative_path).ToLowerInvariant()
+        if (-not $authorized.ContainsKey($key) -or $currentKeys.ContainsKey($key)) {
+            Fail-Astro $Code "tombstone contains an unauthorized/duplicate entry: $($entry.relative_path)" `
+                'preserve the tombstone; never delete an entry outside the durable authorization'
+        }
+        $expected = $authorized[$key]
+        if ([string]$entry.kind -cne [string]$expected.kind -or
+            [string]$entry.file_id -cne [string]$expected.file_id -or
+            [uint32]$entry.attributes -ne [uint32]$expected.attributes -or
+            ([string]$entry.kind -ceq 'file' -and
+                ([uint64]$entry.bytes -ne [uint64]$expected.bytes -or
+                    [string]$entry.sha256 -cne [string]$expected.sha256))) {
+            Fail-Astro $Code "tombstone entry identity/bytes drifted: $($entry.relative_path)" `
+                'preserve the tombstone and investigate the exact changed entry'
+        }
+        $currentKeys[$key] = $true
+    }
+    if (-not $currentKeys.ContainsKey('.')) {
+        Fail-Astro $Code 'present tombstone inventory lacks its root entry' `
+            'preserve the namespace and investigate the unevaluable directory state'
+    }
+    foreach ($key in @($currentKeys.Keys | Where-Object { $_ -ne '.' })) {
+        $parent = [IO.Path]::GetDirectoryName($key)
+        while (-not [string]::IsNullOrEmpty($parent)) {
+            $parentKey = $parent.ToLowerInvariant()
+            if (-not $currentKeys.ContainsKey($parentKey)) {
+                Fail-Astro $Code "tombstone inventory lacks parent closure for '$key'" `
+                    'preserve the namespace and investigate malformed tree state'
+            }
+            $parent = [IO.Path]::GetDirectoryName($parent)
+        }
+    }
+}
+
+function Get-AstroFsvRetirementDerivedOwners {
+    param(
+        [Parameter(Mandatory)]$RetirementAuthorization,
+        [Parameter(Mandatory)]$Inspection,
+        [Parameter(Mandatory)]$LauncherRecoveryChain,
+        [Parameter(Mandatory)][string]$Code
+    )
+    $lockState = $RetirementAuthorization.fsv_lock.state
+    $lockLauncher = Read-AstroFsvProcessIdentity $lockState.owners.launcher $Code `
+        'archived FSV-lock launcher identity'
+    $lockRunner = Read-AstroFsvProcessIdentity $lockState.owners.runner $Code `
+        'archived FSV-lock runner identity'
+    if (-not (Test-AstroFsvIdentityEqual $lockLauncher $Inspection.owners.launcher)) {
+        Fail-Astro $Code 'archived FSV lock and receipt launcher generations differ' `
+            'preserve the cross-generation state and investigate its publisher'
+    }
+    $lockProcesses = Read-AstroFsvV3ProcessEntries `
+        $lockState.owners.processes ([int]$lockState.resident_count) `
+        ([int]$lockState.process_count) $Code 'archived FSV-lock process set'
+    $bindings = [Collections.Generic.List[object]]::new()
+    foreach ($binding in @(
+            New-AstroFsvOwnerBinding 'launcher' 'artifact receipt' $Inspection.owners.launcher
+            New-AstroFsvOwnerBinding 'promoter' 'artifact receipt' $Inspection.owners.promoter
+            New-AstroFsvOwnerBinding 'launcher' 'partial FSV lock' $lockLauncher
+            New-AstroFsvOwnerBinding 'runner' 'partial FSV lock' $lockRunner
+        )) { $bindings.Add($binding) }
+    Add-AstroFsvV3ProcessBindings $bindings $lockProcesses 'partial FSV lock'
+    foreach ($archive in $LauncherRecoveryChain.archives) {
+        $generation = $archive.authorization.value.generation
+        $bindings.Add((New-AstroFsvOwnerBinding 'launcher' `
+                'launcher recovery/archive chain' `
+                (New-AstroProcessIdentityRecord ([int]$generation.launcher_pid) `
+                    ([long]$generation.launcher_process_start_utc_ticks))))
+    }
+    $matchingArchive = @($LauncherRecoveryChain.archives | Where-Object {
+            [int]$_.authorization.value.generation.launcher_pid -eq [int]$lockLauncher.pid -and
+            [long]$_.authorization.value.generation.launcher_process_start_utc_ticks -eq
+                [long]$lockLauncher.process_start_utc_ticks
+        })
+    if ($matchingArchive.Count -ne 1 -or
+        [string]$lockState.launcher_job.name -cne [string]$matchingArchive[0].job_name) {
+        Fail-Astro $Code 'archived FSV-lock Job does not equal its deterministic launcher Job' `
+            'preserve the record chain and investigate malformed attribution'
+    }
+    return [object[]]$bindings.ToArray()
+}
+
+function Assert-AstroFsvRecoveryJobsAbsent {
+    param(
+        [Parameter(Mandatory)]$LauncherRecoveryChain,
+        [Parameter(Mandatory)][string]$CodePrefix,
+        [Parameter(Mandatory)][string]$Description
+    )
+    $probes = [Collections.Generic.List[object]]::new()
+    foreach ($archive in $LauncherRecoveryChain.archives) {
+        $probe = Get-AstroLauncherJobObjectProbe -Name ([string]$archive.job_name)
+        if ($probe.State -cne 'absent') {
+            Fail-Astro "${CodePrefix}_JOB_PRESENT" `
+                "$Description Job is '$($probe.State)': $($archive.job_name)" `
+                'preserve the session while any exact launcher Job generation exists'
+        }
+        $probes.Add($probe)
+    }
+    return [object[]]$probes.ToArray()
+}
+
+function Invoke-AstroFsvTerminalPartialQuarantineResume {
+    param(
+        [Parameter(Mandatory)][int]$ExpectedIssue,
+        [Parameter(Mandatory)][string]$Workspace,
+        [Parameter(Mandatory)][string]$EvidenceRoot,
+        [Parameter(Mandatory)][string]$RecoveryRoot,
+        [Parameter(Mandatory)][string]$FsvLockPath,
+        [Parameter(Mandatory)][string]$LifecycleTransitionPath,
+        [Parameter(Mandatory)][string]$RecoveryInputPath,
+        [Parameter(Mandatory)][string]$RetirementCompletionInputPath,
+        [Parameter(Mandatory)][string]$TrackerUrl,
+        [Parameter(Mandatory)][string]$FailureCode,
+        [Parameter(Mandatory)][string]$FailureMessage
+    )
+    $code = 'ASTRO_FSV_TERMINAL_PARTIAL_RESUME_INVALID'
+    $authorizationPath = Assert-PathWithin $RecoveryInputPath $RecoveryRoot $code `
+        'terminal-partial quarantine authorization path'
+    $completionPath = $authorizationPath + '.completed.json'
+    $tombstonePath = $authorizationPath + '.session.dir'
+    $transitionState = Get-AstroFsvStrictPathState `
+        $LifecycleTransitionPath file $code 'canonical FSV lifecycle transition'
+    $authorizationState = Get-AstroFsvStrictPathState `
+        $authorizationPath file $code 'quarantine authorization archive'
+    $completionState = Get-AstroFsvStrictPathState `
+        $completionPath file $code 'quarantine completion'
+    $tombstoneState = Get-AstroFsvStrictPathState `
+        $tombstonePath directory $code 'quarantine session tombstone'
+    $transitionPresent = $transitionState.state -ceq 'present'
+    $authorizationPresent = $authorizationState.state -ceq 'present'
+    $completionPresent = $completionState.state -ceq 'present'
+    $tombstonePresent = $tombstoneState.state -ceq 'present'
+    if ($transitionPresent -and $authorizationPresent) {
+        Fail-Astro $code 'canonical transition and archived quarantine authorization are both present' `
+            'preserve both namespaces and investigate the interrupted authorization archive'
+    }
+    if (-not $transitionPresent -and -not $authorizationPresent) {
+        Fail-Astro $code 'quarantine resume state lacks transition/authorization authority' `
+            'preserve tombstone/completion bytes and restore only through their exact transaction'
+    }
+    $activeAuthorizationPath = if ($transitionPresent) {
+        $LifecycleTransitionPath
+    } else { $authorizationPath }
+    $authorization = Read-AstroFsvExactJsonFile `
+        $activeAuthorizationPath $code 'terminal-partial quarantine authorization'
+    $value = $authorization.value
+    foreach ($pair in @(
+            @([string]$value.authorization_record_path, $authorizationPath),
+            @([string]$value.lifecycle_transition_path, $LifecycleTransitionPath),
+            @([string]$value.completion_record_path, $completionPath),
+            @([string]$value.session_tombstone_path, $tombstonePath),
+            @([string]$value.retirement.completion_path,
+                [IO.Path]::GetFullPath($RetirementCompletionInputPath))
+        )) {
+        if (-not [string]::Equals(
+                [IO.Path]::GetFullPath([string]$pair[0]),
+                [IO.Path]::GetFullPath([string]$pair[1]),
+                [StringComparison]::OrdinalIgnoreCase
+            )) {
+            Fail-Astro $code 'quarantine resume arguments differ from durable path bindings' `
+                'resume only the exact transition-bound quarantine transaction'
+        }
+    }
+    if ([string]$value.schema -cne
+            'astrolabe.native-fsv-terminal-partial-quarantine.authorization.v1' -or
+        [string]$value.phase -cne 'authorized-exact-terminal-partial-session' -or
+        [int]$value.issue -ne $ExpectedIssue -or
+        [string]$value.failure.code -cne $FailureCode -or
+        [string]$value.failure.message -cne $FailureMessage -or
+        [string]$value.tracker.url -cne $TrackerUrl) {
+        Fail-Astro $code 'durable quarantine authorization differs from requested transaction' `
+            'preserve all state and resume only the exact tracker-bound transaction'
+    }
+    $sessionPath = Assert-PathWithin `
+        ([string]$value.session_directory) $EvidenceRoot $code `
+        'authorized terminal-partial session'
+    $requiredSessionPaths = @(
+        Assert-DirectSessionChildPath ([string]$value.receipt_path) $sessionPath `
+            $code 'authorized receipt path'
+        Assert-DirectSessionChildPath ([string]$value.artifact.path) $sessionPath `
+            $code 'authorized artifact path'
+        Assert-DirectSessionChildPath ([string]$value.outputs.stdout.path) $sessionPath `
+            $code 'authorized standard-output path'
+        Assert-DirectSessionChildPath ([string]$value.outputs.stderr.path) $sessionPath `
+            $code 'authorized standard-error path'
+    )
+    [void](Assert-DirectSessionChildPath `
+        ([string]$value.expected_controls.run_record_path) $sessionPath $code `
+        'authorized expected run-record path')
+    [void](Assert-DirectSessionChildPath `
+        ([string]$value.expected_controls.live_state_path) $sessionPath $code `
+        'authorized expected live-state path')
+    $distinctPaths = [Collections.Generic.HashSet[string]]::new(
+        [StringComparer]::OrdinalIgnoreCase
+    )
+    foreach ($path in @(
+            $requiredSessionPaths +
+            @([string]$value.expected_controls.run_record_path,
+                [string]$value.expected_controls.live_state_path)
+        )) {
+        if (-not $distinctPaths.Add([IO.Path]::GetFullPath($path))) {
+            Fail-Astro $code 'authorized receipt/artifact/output/control paths collide' `
+                'preserve the transition and investigate malformed path authority'
+        }
+    }
+    $authorizedEntries = ConvertFrom-AstroFsvPersistedInventoryEntries `
+        -Entries $value.session_inventory.entries -Code $code `
+        -Description 'authorized terminal-partial session inventory'
+    [byte[]]$authorizedCanonicalBytes =
+        ConvertTo-AstroOrdinaryTreeInventoryCanonicalBytes `
+            -Schema ([string]$value.session_inventory.schema) `
+            -Encoding ([string]$value.session_inventory.encoding) `
+            -Records $authorizedEntries
+    if ($authorizedEntries.Count -ne
+            [int]$value.session_inventory.entry_count -or
+        [uint64]$authorizedCanonicalBytes.Length -ne
+            [uint64]$value.session_inventory.canonical_bytes_length -or
+        (Get-AstroByteSha256 $authorizedCanonicalBytes) -cne
+            [string]$value.session_inventory.sha256) {
+        Fail-Astro $code 'authorized session entries do not reproduce inventory count/bytes/SHA-256' `
+            'preserve the transition and investigate malformed deletion authority'
+    }
+    $authorizedRoot = @($authorizedEntries | Where-Object {
+            [string]$_.relative_path -ceq '.' -and [string]$_.kind -ceq 'directory'
+        })
+    if ($authorizedRoot.Count -ne 1) {
+        Fail-Astro $code 'authorized session inventory does not contain one ordinary root' `
+            'preserve the transition and investigate malformed deletion authority'
+    }
+    $authorizedAbsolutePaths = @(
+        $authorizedEntries | Where-Object {
+            [string]$_.relative_path -cne '.'
+        } | ForEach-Object {
+            [IO.Path]::GetFullPath((Join-Path $sessionPath ([string]$_.relative_path)))
+        }
+    )
+    if (@($requiredSessionPaths | Where-Object {
+                $authorizedAbsolutePaths -notcontains [IO.Path]::GetFullPath($_)
+            }).Count -ne 0) {
+        Fail-Astro $code 'authorized inventory omits receipt/artifact/output source-of-truth files' `
+            'preserve the transition and investigate malformed deletion authority'
+    }
+    $retirementCompletion = Read-AstroFsvExactJsonFile `
+        ([string]$value.retirement.completion_path) $code `
+        'terminal-partial lock retirement completion'
+    $retirementAuthorization = Read-AstroFsvExactJsonFile `
+        ([string]$value.retirement.authorization_path) $code `
+        'terminal-partial lock retirement authorization'
+    $lockArchiveState = Get-AstroFsvStrictPathState `
+        ([string]$value.retirement.lock_archive_path) file $code `
+        'phase-one archived terminal-partial FSV lock'
+    if ($lockArchiveState.state -cne 'present') {
+        Fail-Astro $code 'phase-one archived FSV lock is absent' `
+            'preserve the quarantine transition and restore only its exact record chain'
+    }
+    if ([string]$retirementCompletion.sha256 -cne
+            [string]$value.retirement.completion_sha256 -or
+        [string]$retirementAuthorization.sha256 -cne
+            [string]$value.retirement.authorization_sha256 -or
+        [string]$retirementCompletion.value.authorization.sha256 -cne
+            [string]$retirementAuthorization.sha256 -or
+        [string]$retirementCompletion.value.archive.sha256 -cne
+            [string]$value.retirement.lock_archive_sha256 -or
+        (File-Sha256 ([string]$value.retirement.lock_archive_path)) -cne
+            [string]$value.retirement.lock_archive_sha256) {
+        Fail-Astro $code 'phase-one completion/authorization/archive chain drifted' `
+            'preserve the quarantine transaction and investigate the exact changed record'
+    }
+    $phaseOneValue = $retirementAuthorization.value
+    $phaseOneCompletion = $retirementCompletion.value
+    foreach ($pair in @(
+            @([string]$phaseOneCompletion.authorization.path,
+                [string]$retirementAuthorization.path),
+            @([string]$phaseOneCompletion.source.path, $FsvLockPath),
+            @([string]$phaseOneCompletion.archive.path,
+                [string]$value.retirement.lock_archive_path),
+            @([string]$phaseOneValue.fsv_lock.path, $FsvLockPath),
+            @([string]$phaseOneValue.fsv_lock.archive_path,
+                [string]$value.retirement.lock_archive_path),
+            @([string]$phaseOneCompletion.session.path,
+                [string]$phaseOneValue.session_directory),
+            @([string]$value.retirement.authorization_path,
+                [string]$retirementAuthorization.path),
+            @([string]$value.receipt_path, [string]$phaseOneValue.receipt_path),
+            @([string]$value.session_directory,
+                [string]$phaseOneValue.session_directory),
+            @([string]$value.artifact.path, [string]$phaseOneValue.artifact.path),
+            @([string]$value.outputs.stdout.path,
+                [string]$phaseOneValue.outputs.stdout.path),
+            @([string]$value.outputs.stderr.path,
+                [string]$phaseOneValue.outputs.stderr.path),
+            @([string]$value.expected_controls.run_record_path,
+                [string]$phaseOneValue.expected_controls.run_record_path),
+            @([string]$value.expected_controls.live_state_path,
+                [string]$phaseOneValue.expected_controls.live_state_path)
+        )) {
+        if (-not [string]::Equals(
+                [IO.Path]::GetFullPath([string]$pair[0]),
+                [IO.Path]::GetFullPath([string]$pair[1]),
+                [StringComparison]::OrdinalIgnoreCase
+            )) {
+            Fail-Astro $code 'phase-one and phase-two path bindings differ' `
+                'preserve the quarantine transition and investigate mixed-generation authority'
+        }
+    }
+    if ([string]$phaseOneValue.schema -cne
+            'astrolabe.native-fsv-partial-lock-retirement.authorization.v1' -or
+        [string]$phaseOneValue.phase -cne
+            'authorized-exact-terminal-partial-lock' -or
+        [int]$phaseOneValue.issue -ne $ExpectedIssue -or
+        [string]$phaseOneValue.fsv_lock.state.schema -cne
+            'astrolabe.native-fsv-lock.v3' -or
+        [string]$phaseOneValue.fsv_lock.state.mode -cne 'resident-cohort' -or
+        [string]$phaseOneCompletion.schema -cne
+            'astrolabe.native-fsv-partial-lock-retirement.completion.v1' -or
+        [string]$phaseOneCompletion.phase -cne
+            'complete-lock-archived-source-absent' -or
+        [int]$phaseOneCompletion.issue -ne $ExpectedIssue -or
+        [string]$phaseOneCompletion.source.state -cne 'absent' -or
+        [string]$phaseOneCompletion.source.prior_sha256 -cne
+            [string]$phaseOneValue.fsv_lock.sha256 -or
+        [uint64]$phaseOneCompletion.archive.bytes -ne
+            [uint64](Get-AstroFileInfoLongPath `
+                ([string]$value.retirement.lock_archive_path)).Length -or
+        [string]$phaseOneCompletion.archive.sha256 -cne
+            [string]$phaseOneValue.fsv_lock.sha256 -or
+        [string]$phaseOneCompletion.session.inventory_schema -cne
+            [string]$phaseOneValue.session_inventory.schema -or
+        [string]$phaseOneCompletion.session.inventory_encoding -cne
+            [string]$phaseOneValue.session_inventory.encoding -or
+        [int]$phaseOneCompletion.session.inventory_entry_count -ne
+            [int]$phaseOneValue.session_inventory.entry_count -or
+        [uint64]$phaseOneCompletion.session.inventory_canonical_byte_count -ne
+            [uint64]$phaseOneValue.session_inventory.canonical_bytes_length -or
+        [string]$phaseOneCompletion.session.inventory_sha256 -cne
+            [string]$phaseOneValue.session_inventory.sha256 -or
+        [string]$value.receipt_sha256 -cne [string]$phaseOneValue.receipt_sha256 -or
+        [uint64]$value.artifact.bytes -ne [uint64]$phaseOneValue.artifact.bytes -or
+        [string]$value.artifact.sha256 -cne [string]$phaseOneValue.artifact.sha256 -or
+        [string]$value.outputs.stdout.sha256 -cne
+            [string]$phaseOneValue.outputs.stdout.sha256 -or
+        [uint64]$value.outputs.stdout.bytes -ne
+            [uint64]$phaseOneValue.outputs.stdout.bytes -or
+        [string]$value.outputs.stderr.sha256 -cne
+            [string]$phaseOneValue.outputs.stderr.sha256 -or
+        [uint64]$value.outputs.stderr.bytes -ne
+            [uint64]$phaseOneValue.outputs.stderr.bytes -or
+        [string]$value.expected_controls.run_record_state -cne 'absent' -or
+        [string]$value.expected_controls.live_state_state -cne 'absent' -or
+        [string]$phaseOneValue.expected_controls.run_record_state -cne 'absent' -or
+        [string]$phaseOneValue.expected_controls.live_state_state -cne 'absent' -or
+        [string]$value.session_inventory.schema -cne
+            [string]$phaseOneValue.session_inventory.schema -or
+        [string]$value.session_inventory.encoding -cne
+            [string]$phaseOneValue.session_inventory.encoding -or
+        [int]$value.session_inventory.entry_count -ne
+            [int]$phaseOneValue.session_inventory.entry_count -or
+        [uint64]$value.session_inventory.canonical_bytes_length -ne
+            [uint64]$phaseOneValue.session_inventory.canonical_bytes_length -or
+        [string]$value.session_inventory.sha256 -cne
+            [string]$phaseOneValue.session_inventory.sha256) {
+        Fail-Astro $code 'phase-one completion/authorization and phase-two authority differ' `
+            'preserve every byte and investigate malformed or mixed-generation state'
+    }
+    $chainRecords = @($retirementAuthorization.value.launcher_recovery_chain.launcher_archive_completions)
+    $chain = Read-AstroFsvLauncherRecoveryChain `
+        -ExpectedIssue $ExpectedIssue -Workspace $Workspace `
+        -LauncherRecoveryPath `
+            ([string]$retirementAuthorization.value.launcher_recovery_chain.launcher_recovery_completion.path) `
+        -TargetRecoveryPath `
+            ([string]$retirementAuthorization.value.launcher_recovery_chain.target_recovery_completion.path) `
+        -ArchiveCompletionPaths ([string[]]@($chainRecords | ForEach-Object path))
+    if (-not [string]::Equals(
+            [IO.Path]::GetFullPath([string]$phaseOneValue.launcher_recovery_chain.launcher_recovery_completion.path),
+            [IO.Path]::GetFullPath([string]$chain.launcher_recovery.path),
+            [StringComparison]::OrdinalIgnoreCase
+        ) -or
+        -not [string]::Equals(
+            [IO.Path]::GetFullPath([string]$phaseOneValue.launcher_recovery_chain.target_recovery_completion.path),
+            [IO.Path]::GetFullPath([string]$chain.target_recovery.path),
+            [StringComparison]::OrdinalIgnoreCase
+        ) -or
+        [string]$phaseOneValue.launcher_recovery_chain.launcher_recovery_completion.sha256 -cne
+            [string]$chain.launcher_recovery.sha256 -or
+        [string]$phaseOneValue.launcher_recovery_chain.target_recovery_completion.sha256 -cne
+            [string]$chain.target_recovery.sha256 -or
+        @($chainRecords).Count -ne @($chain.archives).Count) {
+        Fail-Astro $code 'phase-one launcher recovery chain differs from physical readback' `
+            'preserve every record and investigate recovery-chain drift'
+    }
+    for ($index = 0; $index -lt @($chain.archives).Count; $index++) {
+        if (-not [string]::Equals(
+                [IO.Path]::GetFullPath([string]$chainRecords[$index].path),
+                [IO.Path]::GetFullPath([string]$chain.archives[$index].completion.path),
+                [StringComparison]::OrdinalIgnoreCase
+            ) -or
+            [string]$chainRecords[$index].sha256 -cne
+                [string]$chain.archives[$index].completion.sha256) {
+            Fail-Astro $code 'phase-one launcher archive chain differs from physical readback' `
+                'preserve every record and investigate recovery-chain drift'
+        }
+    }
+    $inspection = [ordered]@{
+        owners = [ordered]@{
+            launcher = $retirementAuthorization.value.fsv_lock.state.owners.launcher
+            promoter = $retirementAuthorization.value.owners.identities |
+                Where-Object role -eq 'promoter' | Select-Object -First 1 |
+                ForEach-Object identity
+        }
+    }
+    if ($null -eq $inspection.owners.promoter) {
+        Fail-Astro $code 'phase-one authorization lacks the receipt promoter identity' `
+            'preserve the transaction and investigate malformed owner state'
+    }
+    $ownerBindings = Get-AstroFsvRetirementDerivedOwners `
+        -RetirementAuthorization $retirementAuthorization.value `
+        -Inspection $inspection -LauncherRecoveryChain $chain -Code $code
+    Assert-AstroFsvPersistedOwnerEnvelope `
+        -Owners $retirementAuthorization.value.owners `
+        -ExpectedBindings $ownerBindings -Code $code `
+        -Description 'phase-one derived terminal-partial owner envelope'
+    Assert-AstroFsvPersistedOwnerEnvelope `
+        -Owners $value.owners -ExpectedBindings $ownerBindings -Code $code `
+        -Description 'phase-two terminal-partial quarantine owner envelope'
+    $primaryJobName = [string]$phaseOneValue.launcher_job.name
+    if ([string]$value.source_of_truth.launcher_job.name -cne $primaryJobName) {
+        Fail-Astro $code 'phase-two primary launcher Job differs from phase one' `
+            'preserve the transaction and investigate mixed-generation Job authority'
+    }
+    foreach ($probe in @(
+            $phaseOneValue.launcher_job.initial_probe,
+            $phaseOneValue.launcher_job.final_probe,
+            $value.source_of_truth.launcher_job.initial_probe,
+            $value.source_of_truth.launcher_job.final_probe
+        )) {
+        Assert-AstroFsvPersistedAbsentJobProbe `
+            $probe $primaryJobName $code 'persisted terminal-partial primary Job probe'
+    }
+    Assert-AstroFsvPersistedRecoveryJobProbes `
+        -Persisted $phaseOneValue.recovery_launcher_job_probes `
+        -LauncherRecoveryChain $chain -Code $code `
+        -Description 'phase-one persisted recovery-launcher'
+    Assert-AstroFsvPersistedRecoveryJobProbes `
+        -Persisted $value.source_of_truth.recovery_launcher_jobs `
+        -LauncherRecoveryChain $chain -Code $code `
+        -Description 'phase-two persisted recovery-launcher'
+    $trackerReadback = Read-AstroFsvTerminalPartialQuarantineTrackerEvidence `
+        -Url $TrackerUrl -ExpectedIssue $ExpectedIssue `
+        -ExpectedRetirementCompletionPath ([string]$retirementCompletion.path) `
+        -ExpectedRetirementCompletionSha256 ([string]$retirementCompletion.sha256) `
+        -ExpectedReceiptPath ([string]$value.receipt_path) `
+        -ExpectedReceiptSha256 ([string]$value.receipt_sha256) `
+        -ExpectedArtifactPath ([string]$value.artifact.path) `
+        -ExpectedArtifactSha256 ([string]$value.artifact.sha256) `
+        -ExpectedSessionDirectory $sessionPath `
+        -ExpectedStandardOutputPath ([string]$value.outputs.stdout.path) `
+        -ExpectedStandardOutputSha256 ([string]$value.outputs.stdout.sha256) `
+        -ExpectedStandardErrorPath ([string]$value.outputs.stderr.path) `
+        -ExpectedStandardErrorSha256 ([string]$value.outputs.stderr.sha256) `
+        -ExpectedRunRecordPath ([string]$value.expected_controls.run_record_path) `
+        -ExpectedLiveStatePath ([string]$value.expected_controls.live_state_path) `
+        -ExpectedInventorySchema ([string]$value.session_inventory.schema) `
+        -ExpectedInventoryEncoding ([string]$value.session_inventory.encoding) `
+        -ExpectedInventoryEntryCount ([int]$value.session_inventory.entry_count) `
+        -ExpectedInventoryCanonicalByteCount `
+            ([uint64]$value.session_inventory.canonical_bytes_length) `
+        -ExpectedInventorySha256 ([string]$value.session_inventory.sha256) `
+        -ExpectedRecoveryRecordPath $authorizationPath `
+        -ExpectedCompletionRecordPath $completionPath `
+        -ExpectedLifecycleTransitionPath $LifecycleTransitionPath `
+        -ExpectedSessionTombstonePath $tombstonePath `
+        -ExpectedReasonCode $FailureCode
+    if ([long]$trackerReadback.comment_id -ne [long]$value.tracker.comment_id -or
+        [string]$trackerReadback.author -cne [string]$value.tracker.author -or
+        [string]$trackerReadback.created_at -cne [string]$value.tracker.created_at -or
+        [long]$trackerReadback.comment_id -eq [long]$phaseOneValue.tracker.comment_id) {
+        Fail-Astro $code 'phase-two tracker identity differs from fresh GitHub readback or phase one' `
+            'preserve the transaction and investigate stale or cross-generation authority'
+    }
+    try {
+        $trackerCreated = [DateTimeOffset]::Parse(
+            [string]$trackerReadback.created_at,
+            [Globalization.CultureInfo]::InvariantCulture
+        )
+        $phaseOneCompleted = [DateTimeOffset]::Parse(
+            [string]$phaseOneCompletion.completed_at_utc,
+            [Globalization.CultureInfo]::InvariantCulture
+        )
+    }
+    catch {
+        Fail-Astro $code `
+            "phase timestamp is malformed (tracker='$($trackerReadback.created_at)'; completion='$($phaseOneCompletion.completed_at_utc)'): $($_.Exception.Message)" `
+            'preserve the transaction and investigate malformed durable timestamp authority'
+    }
+    if ($trackerCreated -le $phaseOneCompleted) {
+        Fail-Astro $code 'phase-two tracker is not provably later than phase-one completion' `
+            'post a fresh owner comment after the completed phase-one timestamp'
+    }
+    $initialOwnerProbes = @(Assert-AstroFsvOwnersInactive `
+            -Bindings $ownerBindings -CodePrefix 'ASTRO_FSV_TERMINAL_PARTIAL' `
+            -Description 'resumed terminal-partial quarantine')
+    $initialJobProbes = @(Assert-AstroFsvRecoveryJobsAbsent `
+            -LauncherRecoveryChain $chain -CodePrefix 'ASTRO_FSV_TERMINAL_PARTIAL' `
+            -Description 'resumed terminal-partial quarantine')
+    $launcherStateBeforeMutation = Read-AstroLauncherLock `
+        -LockPath (Join-Path (Join-Path $Workspace '.tmp') 'astrolabe-launcher.lock')
+    $fsvStateBeforeMutation = Get-AstroFsvStrictPathState `
+        $FsvLockPath file $code 'active native-FSV lock'
+    if ($launcherStateBeforeMutation.State -ne 'absent' -or
+        $fsvStateBeforeMutation.state -cne 'absent' -or
+        (Test-AstroPathLongPath -LiteralPath (Join-Path $Workspace 'target'))) {
+        Fail-Astro $code 'launcher/FSV/target state is not absent before quarantine mutation' `
+            'preserve the old session while any newer build or FSV generation exists'
+    }
+    $sourceState = Get-AstroFsvStrictPathState `
+        $sessionPath directory $code 'authorized terminal-partial session'
+    $sourcePresent = $sourceState.state -ceq 'present'
+    if ($sourcePresent -and $tombstonePresent) {
+        Fail-Astro $code 'source session and quarantine tombstone are both present' `
+            'preserve both namespaces and investigate the interrupted no-replace rename'
+    }
+    if ($completionPresent -and ($sourcePresent -or $tombstonePresent)) {
+        Fail-Astro $code 'quarantine completion exists while source/tombstone remains' `
+            'preserve the inconsistent state and investigate transaction ordering'
+    }
+    if ($sourcePresent) {
+        if (-not $transitionPresent -or $completionPresent) {
+            Fail-Astro $code 'source session remains without an active quarantine transition' `
+                'preserve the session and investigate the inconsistent transaction'
+        }
+        $sourceInventory = Get-AstroOrdinaryDirectoryTreeInventoryLongPath $sessionPath
+        if ([string]$sourceInventory.sha256 -cne [string]$value.session_inventory.sha256) {
+            Fail-Astro $code 'source session drifted before resumed tombstone rename' `
+                'preserve the session and investigate the changed entry'
+        }
+        $destinationParent = Split-Path -Parent $tombstonePath
+        New-AstroDirectoryLongPath $destinationParent | Out-Null
+        $sourceHandle = $null
+        $destinationHandle = $null
+        try {
+            $sourceHandle = [AstroLauncherLockNative]::OpenExactDeleteDirectory($sessionPath)
+            $destinationHandle =
+                [AstroLauncherLockNative]::OpenExactRenameDirectory($destinationParent)
+            $sourceFileId = [AstroLauncherLockNative]::GetFileIdentity($sourceHandle)
+            if ([string]$sourceFileId -cne
+                [string](@($authorizedEntries | Where-Object {
+                            [string]$_.relative_path -ceq '.'
+                        })[0].file_id)) {
+                Fail-Astro $code 'source session root FILE_ID differs from authorization' `
+                    'preserve the session and investigate namespace replacement'
+            }
+            [AstroLauncherLockNative]::RenameDirectoryHandleNoReplace(
+                $sourceHandle,
+                $destinationHandle,
+                [IO.Path]::GetFileName($tombstonePath)
+            )
+            $renamedPath = ConvertFrom-AstroNativeFinalPath (
+                [AstroLauncherLockNative]::GetFileFinalPath($sourceHandle)
+            )
+            if (-not [string]::Equals(
+                    [IO.Path]::GetFullPath($renamedPath),
+                    $tombstonePath,
+                    [StringComparison]::OrdinalIgnoreCase
+                ) -or
+                [string][AstroLauncherLockNative]::GetFileIdentity($sourceHandle) -cne
+                    [string]$sourceFileId) {
+                Fail-Astro $code 'handle-bound session rename did not preserve exact root identity' `
+                    'preserve the tombstone and investigate the namespace transition'
+            }
+        }
+        finally {
+            if ($null -ne $destinationHandle) { $destinationHandle.Dispose() }
+            if ($null -ne $sourceHandle) { $sourceHandle.Dispose() }
+        }
+        $sourcePresent = (Get-AstroFsvStrictPathState `
+                $sessionPath directory $code 'authorized terminal-partial session').state -ceq
+            'present'
+        $tombstonePresent = (Get-AstroFsvStrictPathState `
+                $tombstonePath directory $code 'quarantine session tombstone').state -ceq
+            'present'
+    }
+    if ($sourcePresent) {
+        Fail-Astro $code 'quarantine source/tombstone transition is incomplete or unevaluable' `
+            'preserve all state and inspect the exact source/tombstone namespaces'
+    }
+    while ($tombstonePresent) {
+        $currentInventory = Get-AstroOrdinaryDirectoryTreeInventoryLongPath $tombstonePath
+        Assert-AstroFsvAuthorizedInventorySubset `
+            -AuthorizedEntries $authorizedEntries `
+            -CurrentInventory $currentInventory -Code $code
+        Remove-AstroOrdinaryDirectoryTreeLongPath `
+            -LiteralPath $tombstonePath `
+            -ExpectedInventorySchema ([string]$currentInventory.schema) `
+            -ExpectedInventoryEncoding ([string]$currentInventory.encoding) `
+            -ExpectedInventorySha256 ([string]$currentInventory.sha256)
+        $tombstonePresent = (Get-AstroFsvStrictPathState `
+                $tombstonePath directory $code 'quarantine session tombstone').state -ceq
+            'present'
+    }
+    $finalOwnerProbes = @(Assert-AstroFsvOwnersInactive `
+            -Bindings $ownerBindings -CodePrefix 'ASTRO_FSV_TERMINAL_PARTIAL' `
+            -Description 'resumed terminal-partial quarantine finalization')
+    $finalJobProbes = @(Assert-AstroFsvRecoveryJobsAbsent `
+            -LauncherRecoveryChain $chain -CodePrefix 'ASTRO_FSV_TERMINAL_PARTIAL' `
+            -Description 'resumed terminal-partial quarantine finalization')
+    $launcherState = Read-AstroLauncherLock `
+        -LockPath (Join-Path (Join-Path $Workspace '.tmp') 'astrolabe-launcher.lock')
+    if ($launcherState.State -ne 'absent' -or
+        (Test-AstroPathLongPath -LiteralPath $FsvLockPath) -or
+        (Test-AstroPathLongPath -LiteralPath $sessionPath) -or
+        (Test-AstroPathLongPath -LiteralPath $tombstonePath)) {
+        Fail-Astro $code 'launcher/FSV/source/tombstone state is not terminal absence' `
+            'preserve the recovery chain and investigate physical state'
+    }
+    $authorizationSha256 = [string]$authorization.sha256
+    if (-not $completionPresent) {
+        if (-not $transitionPresent) {
+            Fail-Astro $code 'archived quarantine authorization lacks its completion' `
+                'preserve the inconsistent record chain; only the canonical transition may finalize it'
+        }
+        $completion = [ordered]@{
+            schema = 'astrolabe.native-fsv-terminal-partial-quarantine.completion.v1'
+            phase = 'complete-session-and-tombstone-absent'
+            issue = $ExpectedIssue
+            completed_at_utc = [DateTime]::UtcNow.ToString('o')
+            authorization = [ordered]@{ path = $authorizationPath; sha256 = $authorizationSha256 }
+            retirement_completion = [ordered]@{
+                path = [string]$retirementCompletion.path
+                sha256 = [string]$retirementCompletion.sha256
+            }
+            session = [ordered]@{
+                path = $sessionPath; state = 'absent'
+                prior_inventory_sha256 = [string]$value.session_inventory.sha256
+            }
+            tombstone = [ordered]@{ path = $tombstonePath; state = 'absent' }
+            fsv_lock = [ordered]@{ path = $FsvLockPath; state = 'absent' }
+        }
+        $completionRecord = Publish-NewAstroFsvProtocolRecord `
+            -Path $completionPath -Value $completion `
+            -CodePrefix 'ASTRO_FSV_TERMINAL_PARTIAL_COMPLETION'
+        $completionPresent = $true
+    }
+    else {
+        $completionRecord = Read-AstroFsvExactJsonFile `
+            $completionPath $code 'terminal-partial quarantine completion'
+    }
+    $completionValue = $completionRecord.value
+    if ([string]$completionValue.schema -cne
+            'astrolabe.native-fsv-terminal-partial-quarantine.completion.v1' -or
+        [string]$completionValue.phase -cne 'complete-session-and-tombstone-absent' -or
+        [int]$completionValue.issue -ne $ExpectedIssue -or
+        [string]$completionValue.authorization.sha256 -cne $authorizationSha256 -or
+        [string]$completionValue.retirement_completion.sha256 -cne
+            [string]$retirementCompletion.sha256 -or
+        [string]$completionValue.session.prior_inventory_sha256 -cne
+            [string]$value.session_inventory.sha256 -or
+        [string]$completionValue.session.state -cne 'absent' -or
+        [string]$completionValue.tombstone.state -cne 'absent' -or
+        [string]$completionValue.fsv_lock.state -cne 'absent' -or
+        -not [string]::Equals(
+            [IO.Path]::GetFullPath([string]$completionValue.authorization.path),
+            $authorizationPath,
+            [StringComparison]::OrdinalIgnoreCase
+        ) -or
+        -not [string]::Equals(
+            [IO.Path]::GetFullPath([string]$completionValue.retirement_completion.path),
+            [string]$retirementCompletion.path,
+            [StringComparison]::OrdinalIgnoreCase
+        ) -or
+        -not [string]::Equals(
+            [IO.Path]::GetFullPath([string]$completionValue.session.path),
+            $sessionPath,
+            [StringComparison]::OrdinalIgnoreCase
+        ) -or
+        -not [string]::Equals(
+            [IO.Path]::GetFullPath([string]$completionValue.tombstone.path),
+            $tombstonePath,
+            [StringComparison]::OrdinalIgnoreCase
+        ) -or
+        -not [string]::Equals(
+            [IO.Path]::GetFullPath([string]$completionValue.fsv_lock.path),
+            $FsvLockPath,
+            [StringComparison]::OrdinalIgnoreCase
+        )) {
+        Fail-Astro $code 'quarantine completion does not hash-link terminal source/tombstone absence' `
+            'preserve the complete record chain and investigate malformed completion bytes'
+    }
+    if ($transitionPresent) {
+        Move-AstroFileWriteThroughNoReplace `
+            -Source $LifecycleTransitionPath -Destination $authorizationPath
+    }
+    if ((Get-AstroFsvStrictPathState `
+            $LifecycleTransitionPath file $code 'canonical FSV lifecycle transition').state -cne
+            'absent' -or
+        (Get-AstroFsvStrictPathState `
+            $sessionPath directory $code 'authorized terminal-partial session').state -cne
+            'absent' -or
+        (Get-AstroFsvStrictPathState `
+            $tombstonePath directory $code 'quarantine session tombstone').state -cne
+            'absent' -or
+        (Get-AstroFsvStrictPathState `
+            $FsvLockPath file $code 'active native-FSV lock').state -cne 'absent' -or
+        (File-Sha256 $authorizationPath) -cne $authorizationSha256) {
+        Fail-Astro $code 'quarantine terminal readback differs from completion' `
+            'preserve every recovery record and inspect physical state'
+    }
+    return [ordered]@{
+        operation = 'quarantine-terminal-partial'
+        resumed = $true
+        authorization_path = $authorizationPath
+        authorization_sha256 = $authorizationSha256
+        completion_path = $completionPath
+        completion_sha256 = File-Sha256 $completionPath
+        authorization = $value
+        completion = $completionValue
+        owner_probes = [ordered]@{ initial = $initialOwnerProbes; final = $finalOwnerProbes }
+        job_probes = [ordered]@{ initial = $initialJobProbes; final = $finalJobProbes }
+        after = [ordered]@{
+            lifecycle_transition_state = 'absent'
+            session_state = 'absent'
+            tombstone_state = 'absent'
+            fsv_lock_state = 'absent'
+        }
+    }
+}
+
 $workspace = [IO.Path]::GetFullPath((Split-Path -Parent $PSScriptRoot))
 $evidenceRoot = Join-Path $workspace '.tmp\native-fsv-artifacts'
 $abandonRoot = Join-Path $workspace '.tmp\native-fsv-abandon-records'
 $recoveryRoot = Join-Path $workspace '.tmp\native-fsv-recovery-records'
 $migrationRoot = Join-Path $workspace '.tmp\native-fsv-legacy-migration-records'
 $fsvLock = Join-Path (Join-Path $workspace '.tmp') 'astrolabe-fsv.lock'
+$fsvLifecycleTransition = Join-Path (Join-Path $workspace '.tmp') `
+    'astrolabe-fsv-lifecycle.transition.v1.json'
 $launcherLockPath = Join-Path (Join-Path $workspace '.tmp') 'astrolabe-launcher.lock'
 $gitExe = 'C:\Program Files\Git\bin\git.exe'
 
@@ -1622,6 +3844,825 @@ try {
             $inspection = Inspect-ReceiptArtifact $receiptState $evidenceRoot
             [ordered]@{ operation = 'inspect'; readback = $inspection } |
                 ConvertTo-Json -Depth 12 -Compress | Write-Output
+        }
+        'RetireTerminalPartialLock' {
+            if ($Issue -le 0) {
+                Fail-Astro 'ASTRO_FSV_PARTIAL_LOCK_ISSUE_INVALID' `
+                    'Issue must be positive for terminal-partial FSV lock retirement' `
+                    'pass the exact issue bound by the staged artifact and FSV lock'
+            }
+            if ([string]::IsNullOrWhiteSpace($TrackerCommentUrl)) {
+                Fail-Astro 'ASTRO_FSV_PARTIAL_LOCK_TRACKER_REQUIRED' `
+                    'TrackerCommentUrl is required for terminal-partial FSV lock retirement' `
+                    'post a fresh owner-authored comment binding every exact source-of-truth path and hash'
+            }
+            if ($ReasonCode -notmatch '^[A-Z][A-Z0-9_]{2,95}$' -or
+                [string]::IsNullOrWhiteSpace($ReasonMessage)) {
+                Fail-Astro 'ASTRO_FSV_PARTIAL_LOCK_REASON_INVALID' `
+                    'RetireTerminalPartialLock requires a structured ReasonCode and nonblank ReasonMessage' `
+                    'describe the exact runner failure that prevented run/live publication'
+            }
+            if ([string]::IsNullOrWhiteSpace($RecoveryRecordPath)) {
+                Fail-Astro 'ASTRO_FSV_PARTIAL_LOCK_RECORD_REQUIRED' `
+                    'RecoveryRecordPath is required for terminal-partial FSV lock retirement' `
+                    "use one fresh JSON path below $recoveryRoot"
+            }
+            $fsvLifecycleMutex = Enter-AstroFsvLifecycleMutex -WorkspaceRoot $workspace
+            if (-not $fsvLifecycleMutex.Acquired) {
+                Exit-AstroFsvLifecycleMutex $fsvLifecycleMutex
+                Fail-Astro 'ASTRO_FSV_LIFECYCLE_MUTEX_HELD' `
+                    "native-FSV lifecycle mutex is held: $($fsvLifecycleMutex.Name)" `
+                    'wait for the exact active claim/recovery transaction to publish durable state'
+            }
+            # Global order for cross-protocol recovery is native-FSV lifecycle
+            # mutex first, launcher-lock mutex second. Launcher admission holds
+            # only the latter during its short claim, so contention refuses and
+            # releases rather than waiting into a lock cycle.
+            $launcherCoordinationMutex = Enter-AstroLauncherLockMutex `
+                -LockPath $launcherLockPath
+            if (-not $launcherCoordinationMutex.Acquired) {
+                $mutexName = [string]$launcherCoordinationMutex.Name
+                Exit-AstroLauncherLockMutex $launcherCoordinationMutex
+                Exit-AstroFsvLifecycleMutex $fsvLifecycleMutex
+                Fail-Astro 'ASTRO_FSV_LAUNCHER_MUTEX_HELD' `
+                    "launcher-lock coordination mutex is held: $mutexName" `
+                    'wait for launcher claim/recovery coordination to finish, then resume the exact FSV transaction'
+            }
+            try {
+            $resumeAuthorizationPath = Assert-PathWithin `
+                $RecoveryRecordPath $recoveryRoot `
+                'ASTRO_FSV_PARTIAL_LOCK_RECORD_ESCAPE' 'retirement record path'
+            $resumeArchivePath = $resumeAuthorizationPath + '.lock.bin'
+            $resumeCompletionPath = $resumeAuthorizationPath + '.completed.json'
+            if ((Test-AstroPathLongPath -LiteralPath $fsvLifecycleTransition) -or
+                (Test-AstroPathLongPath -LiteralPath $resumeAuthorizationPath) -or
+                (Test-AstroPathLongPath -LiteralPath $resumeArchivePath) -or
+                (Test-AstroPathLongPath -LiteralPath $resumeCompletionPath)) {
+                $resumeResult = Invoke-AstroFsvPartialLockRetirementResume `
+                    -ExpectedIssue $Issue -Workspace $workspace `
+                    -EvidenceRoot $evidenceRoot -RecoveryRoot $recoveryRoot `
+                    -FsvLockPath $fsvLock `
+                    -LifecycleTransitionPath $fsvLifecycleTransition `
+                    -ReceiptInputPath $ReceiptPath `
+                    -RecoveryInputPath $RecoveryRecordPath `
+                    -StandardOutputInputPath $StandardOutputPath `
+                    -StandardErrorInputPath $StandardErrorPath `
+                    -RunRecordInputPath $RunRecordPath `
+                    -LiveStateInputPath $LiveStatePath `
+                    -TrackerUrl $TrackerCommentUrl `
+                    -FailureCode $ReasonCode -FailureMessage $ReasonMessage `
+                    -LauncherRecoveryInputPath $LauncherRecoveryCompletionPath `
+                    -TargetRecoveryInputPath $TargetRecoveryCompletionPath `
+                    -ArchiveCompletionInputPaths $LauncherArchiveCompletionPaths
+                $resumeResult | ConvertTo-Json -Depth 40 -Compress | Write-Output
+                return
+            }
+            $receiptState = Read-Receipt $ReceiptPath $evidenceRoot
+            $inspection = Inspect-ReceiptArtifact $receiptState $evidenceRoot
+            if ([int]$inspection.issue -ne $Issue) {
+                Fail-Astro 'ASTRO_FSV_PARTIAL_LOCK_ISSUE_MISMATCH' `
+                    "requested issue #$Issue differs from receipt issue #$($inspection.issue)" `
+                    'retire state only through the exact issue named by its receipt and lock'
+            }
+            $launcherRecoveryChain = Read-AstroFsvLauncherRecoveryChain `
+                -ExpectedIssue $Issue -Workspace $workspace `
+                -LauncherRecoveryPath $LauncherRecoveryCompletionPath `
+                -TargetRecoveryPath $TargetRecoveryCompletionPath `
+                -ArchiveCompletionPaths $LauncherArchiveCompletionPaths
+            $launcherProtocolState = Read-AstroLauncherLock -LockPath $launcherLockPath
+            if ($launcherProtocolState.State -ne 'absent') {
+                Fail-Astro 'ASTRO_FSV_PARTIAL_LOCK_LAUNCHER_LOCK' `
+                    "launcher protocol is '$($launcherProtocolState.State)'; terminal-partial FSV lock retirement requires authoritative absence" `
+                    'complete exact launcher recovery before retiring any FSV lock'
+            }
+            if (-not (Test-AstroPathLongPath -LiteralPath $fsvLock -PathType Leaf)) {
+                Fail-Astro 'ASTRO_FSV_PARTIAL_LOCK_ABSENT' `
+                    "FSV lock is already absent: $fsvLock" `
+                    'do not manufacture retirement evidence for an absent lock'
+            }
+            Assert-NotReparseEntry $fsvLock 'terminal-partial native FSV lock'
+            $lockShaBefore = File-Sha256 $fsvLock
+            try { $lockState = Read-AstroUtf8FileLongPath $fsvLock | ConvertFrom-Json }
+            catch {
+                Fail-Astro 'ASTRO_FSV_PARTIAL_LOCK_INVALID' `
+                    "FSV lock is unreadable: ${fsvLock}: $($_.Exception.Message)" `
+                    'preserve the lock and investigate its exact bytes'
+            }
+            $lockFields = @($lockState.PSObject.Properties | ForEach-Object Name)
+            $expectedLockFields = @(
+                'schema', 'mode', 'issue', 'started', 'resident_count',
+                'process_count', 'tree_sha', 'artifact_path', 'artifact_sha256',
+                'cohort_plan', 'owners', 'launcher_job', 'phase'
+            )
+            if ($lockFields.Count -ne $expectedLockFields.Count -or
+                @($expectedLockFields | Where-Object {
+                        $lockFields -notcontains $_
+                    }).Count -ne 0 -or
+                [string]$lockState.schema -cne 'astrolabe.native-fsv-lock.v3' -or
+                [string]$lockState.mode -cne 'resident-cohort' -or
+                [int]$lockState.issue -ne $Issue -or
+                [string]$lockState.tree_sha -cne [string]$inspection.tree_sha -or
+                -not [string]::Equals(
+                    [IO.Path]::GetFullPath([string]$lockState.artifact_path),
+                    $inspection.artifact_path,
+                    [StringComparison]::OrdinalIgnoreCase
+                ) -or
+                [string]$lockState.artifact_sha256 -cne [string]$inspection.sha256 -or
+                -not $lockState.PSObject.Properties['owners'] -or
+                -not $lockState.owners.PSObject.Properties['launcher'] -or
+                -not $lockState.owners.PSObject.Properties['runner'] -or
+                -not $lockState.owners.PSObject.Properties['processes'] -or
+                -not $lockState.PSObject.Properties['resident_count'] -or
+                -not $lockState.PSObject.Properties['process_count'] -or
+                -not $lockState.PSObject.Properties['launcher_job'] -or
+                -not $lockState.launcher_job.PSObject.Properties['name'] -or
+                -not $lockState.launcher_job.PSObject.Properties['members'] -or
+                -not $lockState.PSObject.Properties['cohort_plan'] -or
+                -not $lockState.cohort_plan.PSObject.Properties['path'] -or
+                -not $lockState.cohort_plan.PSObject.Properties['sha256'] -or
+                [string]$lockState.phase -cnotin @('creating', 'suspended')) {
+                Fail-Astro 'ASTRO_FSV_PARTIAL_LOCK_INVALID' `
+                    'FSV lock is not one complete v3 cohort authority bound to the selected issue/tree/artifact' `
+                    'preserve the lock and session; mixed or incomplete authority cannot retire state'
+            }
+            $lockLauncher = Read-AstroFsvProcessIdentity $lockState.owners.launcher `
+                'ASTRO_FSV_PARTIAL_LOCK_INVALID' 'partial FSV-lock launcher identity'
+            $lockRunner = Read-AstroFsvProcessIdentity $lockState.owners.runner `
+                'ASTRO_FSV_PARTIAL_LOCK_INVALID' 'partial FSV-lock runner identity'
+            try {
+                $lockStarted = [DateTimeOffset]::Parse(
+                    [string]$lockState.started,
+                    [Globalization.CultureInfo]::InvariantCulture
+                )
+            }
+            catch {
+                Fail-Astro 'ASTRO_FSV_PARTIAL_LOCK_INVALID' `
+                    'FSV lock started timestamp is not a valid UTC timestamp' `
+                    'preserve the malformed lock and investigate its publisher'
+            }
+            if (-not (Test-AstroFsvIdentityEqual `
+                    $lockLauncher $inspection.owners.launcher)) {
+                Fail-Astro 'ASTRO_FSV_PARTIAL_LOCK_OWNER_MISMATCH' `
+                    'receipt and FSV-lock launcher generations differ' `
+                    'preserve the cross-generation state and investigate its publisher'
+            }
+            $lockProcesses = Read-AstroFsvTerminalPartialPreLiveProcesses `
+                -LockState $lockState -Code 'ASTRO_FSV_PARTIAL_LOCK_INVALID' `
+                -Description 'partial FSV-lock process set'
+            $cohortPlanPath = Assert-PathWithin `
+                ([string]$lockState.cohort_plan.path) $workspace `
+                'ASTRO_FSV_PARTIAL_LOCK_INVALID' 'partial FSV-lock cohort plan'
+            if (-not (Test-AstroPathLongPath -LiteralPath $cohortPlanPath -PathType Leaf) -or
+                (File-Sha256 $cohortPlanPath) -cne
+                    [string]$lockState.cohort_plan.sha256) {
+                Fail-Astro 'ASTRO_FSV_PARTIAL_LOCK_INVALID' `
+                    'FSV lock cohort plan is absent or differs from its bound SHA-256' `
+                    'preserve the lock/session and investigate plan drift'
+            }
+            [int[]]$jobMembers = @($lockState.launcher_job.members)
+            if ($jobMembers.Count -ne @($jobMembers | Sort-Object -Unique).Count -or
+                $jobMembers -contains 0 -or
+                $jobMembers -notcontains [int]$lockLauncher.pid -or
+                $jobMembers -notcontains [int]$lockRunner.pid) {
+                Fail-Astro 'ASTRO_FSV_PARTIAL_LOCK_INVALID' `
+                    'FSV lock initial launcher Job membership does not contain launcher and runner' `
+                    'preserve the lock/session and investigate malformed cohort attribution'
+            }
+            $matchingLauncherArchive = @($launcherRecoveryChain.archives | Where-Object {
+                    [int]$_.authorization.value.generation.launcher_pid -eq
+                        [int]$lockLauncher.pid -and
+                    [long]$_.authorization.value.generation.launcher_process_start_utc_ticks -eq
+                        [long]$lockLauncher.process_start_utc_ticks
+                })
+            if ($matchingLauncherArchive.Count -ne 1 -or
+                [string]$lockState.launcher_job.name -cne
+                    [string]$matchingLauncherArchive[0].job_name) {
+                Fail-Astro 'ASTRO_FSV_PARTIAL_LOCK_LAUNCHER_RECOVERY_INVALID' `
+                    'FSV lock Job/launcher generation is not the exact archived launcher generation' `
+                    'preserve the lock and supply its exact launcher recovery/archive chain'
+            }
+            $ownerBindingList = New-Object System.Collections.Generic.List[object]
+            foreach ($binding in @(
+                New-AstroFsvOwnerBinding `
+                    'launcher' 'artifact receipt' $inspection.owners.launcher
+                New-AstroFsvOwnerBinding `
+                    'promoter' 'artifact receipt' $inspection.owners.promoter
+                New-AstroFsvOwnerBinding `
+                    'launcher' 'partial FSV lock' $lockLauncher
+                New-AstroFsvOwnerBinding `
+                    'runner' 'partial FSV lock' $lockRunner
+            )) { $ownerBindingList.Add($binding) }
+            Add-AstroFsvV3ProcessBindings $ownerBindingList $lockProcesses `
+                'partial FSV lock'
+            foreach ($archive in $launcherRecoveryChain.archives) {
+                $archiveGeneration = $archive.authorization.value.generation
+                $archiveIdentity = New-AstroProcessIdentityRecord `
+                    ([int]$archiveGeneration.launcher_pid) `
+                    ([long]$archiveGeneration.launcher_process_start_utc_ticks)
+                $ownerBindingList.Add((New-AstroFsvOwnerBinding `
+                        'launcher' 'launcher recovery/archive chain' $archiveIdentity))
+            }
+            $ownerBindings = [object[]]$ownerBindingList.ToArray()
+            $session = [IO.Path]::GetFullPath($inspection.session_directory)
+            $stdoutPath = Assert-DirectSessionChildPath $StandardOutputPath $session `
+                'ASTRO_FSV_PARTIAL_LOCK_OUTPUT_PATH_INVALID' 'standard-output path'
+            $stderrPath = Assert-DirectSessionChildPath $StandardErrorPath $session `
+                'ASTRO_FSV_PARTIAL_LOCK_OUTPUT_PATH_INVALID' 'standard-error path'
+            $expectedRunRecord = Assert-DirectSessionChildPath $RunRecordPath $session `
+                'ASTRO_FSV_PARTIAL_LOCK_RUN_PATH_INVALID' 'expected run-record path'
+            $expectedLiveState = Assert-DirectSessionChildPath $LiveStatePath $session `
+                'ASTRO_FSV_PARTIAL_LOCK_LIVE_PATH_INVALID' 'expected live-state path'
+            $claimedPaths = [Collections.Generic.HashSet[string]]::new(
+                [StringComparer]::OrdinalIgnoreCase
+            )
+            foreach ($claimedPath in @(
+                    $receiptState.Path, $inspection.artifact_path, $stdoutPath,
+                    $stderrPath, $expectedRunRecord, $expectedLiveState
+                )) {
+                if (-not $claimedPaths.Add([IO.Path]::GetFullPath($claimedPath))) {
+                    Fail-Astro 'ASTRO_FSV_PARTIAL_LOCK_PATH_COLLISION' `
+                        "terminal-partial receipt/artifact/output/control paths collide: $claimedPath" `
+                        'preserve the session and bind six pairwise-distinct direct paths'
+                }
+            }
+            if (-not (Test-AstroPathLongPath -LiteralPath $stdoutPath -PathType Leaf) -or
+                -not (Test-AstroPathLongPath -LiteralPath $stderrPath -PathType Leaf)) {
+                Fail-Astro 'ASTRO_FSV_PARTIAL_LOCK_OUTPUT_MISSING' `
+                    'both explicit child output paths must physically exist' `
+                    'preserve the session; no exact terminal partial output family is proven'
+            }
+            foreach ($path in @($stdoutPath, $stderrPath)) {
+                Assert-NotReparseEntry $path 'terminal-partial native FSV output'
+            }
+            if ((Test-AstroPathLongPath -LiteralPath $expectedRunRecord) -or
+                (Test-AstroPathLongPath -LiteralPath $expectedLiveState)) {
+                Fail-Astro 'ASTRO_FSV_PARTIAL_LOCK_CONTROL_STATE_PRESENT' `
+                    'RetireTerminalPartialLock requires both exact expected run and live-state paths to be absent' `
+                    'use RetireLock for a completed bound run; preserve malformed mixed state'
+            }
+            $stdoutSha256 = File-Sha256 $stdoutPath
+            $stderrSha256 = File-Sha256 $stderrPath
+            $stdoutBytes = [uint64](Get-AstroFileInfoLongPath $stdoutPath).Length
+            $stderrBytes = [uint64](Get-AstroFileInfoLongPath $stderrPath).Length
+            if (($stdoutBytes + $stderrBytes) -eq 0) {
+                Fail-Astro 'ASTRO_FSV_PARTIAL_LOCK_OUTPUT_EMPTY' `
+                    'both child output files are empty; real child execution is not physically proven' `
+                    'preserve the ambiguous session and investigate its process chronology'
+            }
+            $sessionFiles = @(Get-SessionFileInventory $session)
+            $sessionTree = Get-AstroOrdinaryDirectoryTreeInventoryLongPath $session
+            if ($sessionFiles.Count -lt 4) {
+                Fail-Astro 'ASTRO_FSV_PARTIAL_LOCK_INVENTORY_INVALID' `
+                    "session inventory has only $($sessionFiles.Count) files" `
+                    'preserve ambiguous state that lacks receipt/artifact/output evidence'
+            }
+            $requiredPaths = @(
+                $receiptState.Path, $inspection.artifact_path, $stdoutPath, $stderrPath
+            ) | ForEach-Object { [IO.Path]::GetFullPath($_) }
+            $inventoryPaths = @($sessionFiles | ForEach-Object { [string]$_.path })
+            if (@($requiredPaths | Where-Object { $inventoryPaths -notcontains $_ }).Count -ne 0) {
+                Fail-Astro 'ASTRO_FSV_PARTIAL_LOCK_INVENTORY_INVALID' `
+                    'session inventory omits one or more required receipt/artifact/output paths' `
+                    'preserve the session and investigate its exact filesystem identity'
+            }
+            $receiptSha256 = File-Sha256 $receiptState.Path
+            $initialOwnerProbes = @(
+                Assert-AstroFsvOwnersInactive `
+                    -Bindings $ownerBindings `
+                    -CodePrefix 'ASTRO_FSV_PARTIAL_LOCK' `
+                    -Description 'terminal-partial FSV lock retirement'
+            )
+            $jobName = [string]$lockState.launcher_job.name
+            $jobProbeFirst = Get-AstroLauncherJobObjectProbe -Name $jobName
+            if ($jobProbeFirst.State -cne 'absent') {
+                Fail-Astro 'ASTRO_FSV_PARTIAL_LOCK_JOB_PRESENT' `
+                    "launcher Job is '$($jobProbeFirst.State)': $jobName" `
+                    'preserve the lock/session until the exact deterministic Job is absent'
+            }
+            $recoveryJobProbesFirst = [Collections.Generic.List[object]]::new()
+            foreach ($archive in $launcherRecoveryChain.archives) {
+                $probe = Get-AstroLauncherJobObjectProbe -Name ([string]$archive.job_name)
+                if ($probe.State -cne 'absent') {
+                    Fail-Astro 'ASTRO_FSV_PARTIAL_LOCK_JOB_PRESENT' `
+                        "recovery launcher Job is '$($probe.State)': $($archive.job_name)" `
+                        'preserve the lock/session while any recovery launcher generation exists'
+                }
+                $recoveryJobProbesFirst.Add($probe)
+            }
+            $recoveryRecord = Assert-PathWithin $RecoveryRecordPath $recoveryRoot `
+                'ASTRO_FSV_PARTIAL_LOCK_RECORD_ESCAPE' 'retirement record path'
+            if ((Get-AstroFsvStrictPathState `
+                    $recoveryRecord file `
+                    'ASTRO_FSV_PARTIAL_LOCK_RECORD_REUSE_REFUSED' `
+                    'partial-lock authorization archive').state -cne 'absent') {
+                Fail-Astro 'ASTRO_FSV_PARTIAL_LOCK_RECORD_REUSE_REFUSED' `
+                    "retirement record already exists: $recoveryRecord" `
+                    'use one fresh append-only record path per partial-lock generation'
+            }
+            $lockArchivePath = $recoveryRecord + '.lock.bin'
+            $completionRecordPath = $recoveryRecord + '.completed.json'
+            if ((Get-AstroFsvStrictPathState `
+                    $lockArchivePath file `
+                    'ASTRO_FSV_PARTIAL_LOCK_RECORD_REUSE_REFUSED' `
+                    'partial-lock archive').state -cne 'absent' -or
+                (Get-AstroFsvStrictPathState `
+                    $completionRecordPath file `
+                    'ASTRO_FSV_PARTIAL_LOCK_RECORD_REUSE_REFUSED' `
+                    'partial-lock completion').state -cne 'absent' -or
+                (Get-AstroFsvStrictPathState `
+                    $fsvLifecycleTransition file `
+                    'ASTRO_FSV_PARTIAL_LOCK_RECORD_REUSE_REFUSED' `
+                    'canonical FSV lifecycle transition').state -cne 'absent') {
+                Fail-Astro 'ASTRO_FSV_PARTIAL_LOCK_RECORD_REUSE_REFUSED' `
+                    'derived lock archive, completion, or canonical lifecycle transition already exists' `
+                    'use one fresh append-only recovery record path per partial-lock generation'
+            }
+            $archiveCompletionPaths = [string[]]@(
+                $launcherRecoveryChain.archives | ForEach-Object {
+                    [string]$_.completion.path
+                }
+            )
+            $archiveCompletionHashes = [string[]]@(
+                $launcherRecoveryChain.archives | ForEach-Object {
+                    [string]$_.completion.sha256
+                }
+            )
+            $tracker = Read-AstroFsvPartialLockTrackerEvidence `
+                -Url $TrackerCommentUrl -ExpectedIssue $Issue `
+                -ExpectedLockPath $fsvLock -ExpectedLockSha256 $lockShaBefore `
+                -ExpectedReceiptPath $receiptState.Path `
+                -ExpectedReceiptSha256 $receiptSha256 `
+                -ExpectedArtifactPath $inspection.artifact_path `
+                -ExpectedArtifactSha256 $inspection.sha256 `
+                -ExpectedSessionDirectory $session `
+                -ExpectedStandardOutputPath $stdoutPath `
+                -ExpectedStandardOutputSha256 $stdoutSha256 `
+                -ExpectedStandardErrorPath $stderrPath `
+                -ExpectedStandardErrorSha256 $stderrSha256 `
+                -ExpectedRunRecordPath $expectedRunRecord `
+                -ExpectedLiveStatePath $expectedLiveState `
+                -ExpectedInventorySchema ([string]$sessionTree.schema) `
+                -ExpectedInventoryEncoding ([string]$sessionTree.encoding) `
+                -ExpectedInventoryEntryCount ([int]$sessionTree.entry_count) `
+                -ExpectedInventoryCanonicalByteCount `
+                    ([uint64]$sessionTree.canonical_bytes_length) `
+                -ExpectedInventorySha256 ([string]$sessionTree.sha256) `
+                -ExpectedRecoveryRecordPath $recoveryRecord `
+                -ExpectedLockArchivePath $lockArchivePath `
+                -ExpectedCompletionRecordPath $completionRecordPath `
+                -ExpectedLifecycleTransitionPath $fsvLifecycleTransition `
+                -ExpectedLauncherRecoveryCompletionPath `
+                    ([string]$launcherRecoveryChain.launcher_recovery.path) `
+                -ExpectedLauncherRecoveryCompletionSha256 `
+                    ([string]$launcherRecoveryChain.launcher_recovery.sha256) `
+                -ExpectedTargetRecoveryCompletionPath `
+                    ([string]$launcherRecoveryChain.target_recovery.path) `
+                -ExpectedTargetRecoveryCompletionSha256 `
+                    ([string]$launcherRecoveryChain.target_recovery.sha256) `
+                -ExpectedLauncherArchiveCompletionPaths $archiveCompletionPaths `
+                -ExpectedLauncherArchiveCompletionSha256s $archiveCompletionHashes `
+                -ExpectedReasonCode $ReasonCode
+            try {
+                $trackerCreated = [DateTimeOffset]::Parse(
+                    [string]$tracker.created_at,
+                    [Globalization.CultureInfo]::InvariantCulture
+                )
+            }
+            catch {
+                Fail-Astro 'ASTRO_FSV_PARTIAL_LOCK_TRACKER_STALE' `
+                    "tracker timestamp is malformed ('$($tracker.created_at)'): $($_.Exception.Message)" `
+                    'preserve the lock and post no retirement transition'
+            }
+            $lockStartedSecond = [DateTimeOffset]::new(
+                $lockStarted.Year, $lockStarted.Month, $lockStarted.Day,
+                $lockStarted.Hour, $lockStarted.Minute, $lockStarted.Second,
+                [TimeSpan]::Zero
+            )
+            if ($trackerCreated -lt $lockStartedSecond) {
+                Fail-Astro 'ASTRO_FSV_PARTIAL_LOCK_TRACKER_STALE' `
+                    'partial-lock tracker comment predates the exact terminal-partial generation' `
+                    'post one fresh owner-authored comment after reading the preserved state'
+            }
+            $finalOwnerProbes = @(
+                Assert-AstroFsvOwnersInactive `
+                    -Bindings $ownerBindings `
+                    -CodePrefix 'ASTRO_FSV_PARTIAL_LOCK' `
+                    -Description 'terminal-partial FSV lock final authorization'
+            )
+            $jobProbeSecond = Get-AstroLauncherJobObjectProbe -Name $jobName
+            $recoveryJobProbesSecond = [Collections.Generic.List[object]]::new()
+            foreach ($archive in $launcherRecoveryChain.archives) {
+                $probe = Get-AstroLauncherJobObjectProbe -Name ([string]$archive.job_name)
+                if ($probe.State -cne 'absent') {
+                    Fail-Astro 'ASTRO_FSV_PARTIAL_LOCK_JOB_PRESENT' `
+                        "recovery launcher Job changed to '$($probe.State)': $($archive.job_name)" `
+                        'preserve the lock/session while any recovery launcher generation exists'
+                }
+                $recoveryJobProbesSecond.Add($probe)
+            }
+            $launcherRecoveryChainFinal = Read-AstroFsvLauncherRecoveryChain `
+                -ExpectedIssue $Issue -Workspace $workspace `
+                -LauncherRecoveryPath $LauncherRecoveryCompletionPath `
+                -TargetRecoveryPath $TargetRecoveryCompletionPath `
+                -ArchiveCompletionPaths $LauncherArchiveCompletionPaths
+            $archiveChainStable =
+                $launcherRecoveryChainFinal.archives.Count -eq
+                    $launcherRecoveryChain.archives.Count
+            if ($archiveChainStable) {
+                for ($archiveIndex = 0;
+                    $archiveIndex -lt $launcherRecoveryChain.archives.Count;
+                    $archiveIndex++) {
+                    if ([string]$launcherRecoveryChainFinal.archives[$archiveIndex].completion.sha256 -cne
+                        [string]$launcherRecoveryChain.archives[$archiveIndex].completion.sha256) {
+                        $archiveChainStable = $false
+                        break
+                    }
+                }
+            }
+            $launcherProtocolFinal = Read-AstroLauncherLock -LockPath $launcherLockPath
+            $finalTree = Get-AstroOrdinaryDirectoryTreeInventoryLongPath $session
+            $cohortPlanFinalState = Get-AstroFsvStrictPathState `
+                $cohortPlanPath file 'ASTRO_FSV_PARTIAL_LOCK_STATE_DRIFT' `
+                'terminal-partial cohort plan after tracker authorization'
+            if ($jobProbeSecond.State -cne 'absent' -or
+                $launcherProtocolFinal.State -ne 'absent' -or
+                $cohortPlanFinalState.state -cne 'present' -or
+                (File-Sha256 $cohortPlanPath) -cne
+                    [string]$lockState.cohort_plan.sha256 -or
+                (File-Sha256 $fsvLock) -cne $lockShaBefore -or
+                (File-Sha256 $receiptState.Path) -cne $receiptSha256 -or
+                (File-Sha256 $inspection.artifact_path) -cne $inspection.sha256 -or
+                (File-Sha256 $stdoutPath) -cne $stdoutSha256 -or
+                (File-Sha256 $stderrPath) -cne $stderrSha256 -or
+                (Test-AstroPathLongPath -LiteralPath $expectedRunRecord) -or
+                (Test-AstroPathLongPath -LiteralPath $expectedLiveState) -or
+                [string]$launcherRecoveryChainFinal.launcher_recovery.sha256 -cne
+                    [string]$launcherRecoveryChain.launcher_recovery.sha256 -or
+                [string]$launcherRecoveryChainFinal.target_recovery.sha256 -cne
+                    [string]$launcherRecoveryChain.target_recovery.sha256 -or
+                -not $archiveChainStable -or
+                [string]$finalTree.schema -cne [string]$sessionTree.schema -or
+                [string]$finalTree.encoding -cne [string]$sessionTree.encoding -or
+                [int]$finalTree.entry_count -ne [int]$sessionTree.entry_count -or
+                [uint64]$finalTree.canonical_bytes_length -ne
+                    [uint64]$sessionTree.canonical_bytes_length -or
+                [string]$finalTree.sha256 -cne [string]$sessionTree.sha256) {
+                Fail-Astro 'ASTRO_FSV_PARTIAL_LOCK_STATE_DRIFT' `
+                    'lock/session/owner/Job/launcher state changed after tracker authorization' `
+                    'preserve every byte and post fresh evidence for the current exact state'
+            }
+            $currentRepository = Get-RepoState -GitExe $gitExe -Workspace $workspace
+            $recordParent = Split-Path -Parent $recoveryRecord
+            New-AstroDirectoryLongPath $recordParent | Out-Null
+            Assert-NotReparseEntry $recordParent 'partial-lock retirement record parent'
+            $retirement = [ordered]@{
+                schema = 'astrolabe.native-fsv-partial-lock-retirement.authorization.v1'
+                phase = 'authorized-exact-terminal-partial-lock'
+                issue = $Issue
+                recorded_at_utc = [DateTime]::UtcNow.ToString('o')
+                tracker = $tracker
+                fsv_lock = [ordered]@{
+                    path = $fsvLock
+                    sha256 = $lockShaBefore
+                    state = $lockState
+                    archive_path = $lockArchivePath
+                }
+                lifecycle_transition_path = $fsvLifecycleTransition
+                authorization_record_path = $recoveryRecord
+                completion_record_path = $completionRecordPath
+                receipt_path = $receiptState.Path
+                receipt_sha256 = $receiptSha256
+                session_directory = $session
+                artifact = [ordered]@{
+                    path = $inspection.artifact_path
+                    bytes = [uint64]$inspection.bytes
+                    sha256 = $inspection.sha256
+                }
+                expected_controls = [ordered]@{
+                    run_record_path = $expectedRunRecord
+                    run_record_state = 'absent'
+                    live_state_path = $expectedLiveState
+                    live_state_state = 'absent'
+                }
+                outputs = [ordered]@{
+                    stdout = [ordered]@{
+                        path = $stdoutPath; bytes = $stdoutBytes; sha256 = $stdoutSha256
+                    }
+                    stderr = [ordered]@{
+                        path = $stderrPath; bytes = $stderrBytes; sha256 = $stderrSha256
+                    }
+                }
+                session_inventory = [ordered]@{
+                    schema = [string]$sessionTree.schema
+                    encoding = [string]$sessionTree.encoding
+                    entry_count = [int]$sessionTree.entry_count
+                    canonical_bytes_length = [uint64]$sessionTree.canonical_bytes_length
+                    sha256 = [string]$sessionTree.sha256
+                    files = $sessionFiles
+                    entries = [object[]]$sessionTree.entries
+                }
+                launcher_protocol_state = $launcherProtocolFinal.State
+                launcher_recovery_chain = [ordered]@{
+                    launcher_recovery_completion = [ordered]@{
+                        path = [string]$launcherRecoveryChain.launcher_recovery.path
+                        sha256 = [string]$launcherRecoveryChain.launcher_recovery.sha256
+                    }
+                    target_recovery_completion = [ordered]@{
+                        path = [string]$launcherRecoveryChain.target_recovery.path
+                        sha256 = [string]$launcherRecoveryChain.target_recovery.sha256
+                    }
+                    launcher_archive_completions = @(
+                        for ($archiveIndex = 0;
+                            $archiveIndex -lt $archiveCompletionPaths.Count;
+                            $archiveIndex++) {
+                            [ordered]@{
+                                path = $archiveCompletionPaths[$archiveIndex]
+                                sha256 = $archiveCompletionHashes[$archiveIndex]
+                            }
+                        }
+                    )
+                }
+                launcher_job = [ordered]@{
+                    name = $jobName
+                    initial_probe = $jobProbeFirst
+                    final_probe = $jobProbeSecond
+                }
+                recovery_launcher_job_probes = [ordered]@{
+                    initial = [object[]]$recoveryJobProbesFirst.ToArray()
+                    final = [object[]]$recoveryJobProbesSecond.ToArray()
+                }
+                staged_repository = $receiptState.Receipt.repository
+                current_repository = $currentRepository
+                owners = [ordered]@{
+                    identities = @($ownerBindings | ForEach-Object {
+                            [ordered]@{
+                                role = $_.Role; source = $_.Source; identity = $_.Identity
+                            }
+                        })
+                    initial_probes = $initialOwnerProbes
+                    final_probes = $finalOwnerProbes
+                }
+                failure = [ordered]@{ code = $ReasonCode; message = $ReasonMessage }
+            }
+            $transitionPublication = Publish-NewAstroFsvProtocolRecord `
+                -Path $fsvLifecycleTransition -Value $retirement `
+                -CodePrefix 'ASTRO_FSV_PARTIAL_LOCK_AUTHORIZATION' `
+                -StageDirectory $recordParent
+            $persisted = $transitionPublication.value
+            if ([string]$persisted.schema -cne
+                    'astrolabe.native-fsv-partial-lock-retirement.authorization.v1' -or
+                [string]$persisted.phase -cne
+                    'authorized-exact-terminal-partial-lock' -or
+                [string]$persisted.fsv_lock.sha256 -cne $lockShaBefore -or
+                -not [string]::Equals(
+                    [IO.Path]::GetFullPath([string]$persisted.fsv_lock.archive_path),
+                    $lockArchivePath,
+                    [StringComparison]::OrdinalIgnoreCase
+                ) -or
+                [string]$persisted.receipt_sha256 -cne $receiptSha256 -or
+                [string]$persisted.artifact.sha256 -cne $inspection.sha256 -or
+                [string]$persisted.session_inventory.sha256 -cne
+                    [string]$sessionTree.sha256 -or
+                [string]$persisted.failure.code -cne $ReasonCode -or
+                [string]$persisted.tracker.url -cne $TrackerCommentUrl) {
+                Fail-Astro 'ASTRO_FSV_PARTIAL_LOCK_RECORD_INVALID' `
+                    'persisted retirement record differs from the exact authorization state' `
+                    'preserve both lock and record and investigate the durable-write mismatch'
+            }
+            Assert-AstroFsvPersistedOwnerEnvelope `
+                -Owners $persisted.owners -ExpectedBindings $ownerBindings `
+                -Code 'ASTRO_FSV_PARTIAL_LOCK_RECORD_INVALID' `
+                -Description 'persisted terminal-partial lock retirement'
+            foreach ($pair in @(
+                    @([string]$persisted.authorization_record_path, $recoveryRecord),
+                    @([string]$persisted.lifecycle_transition_path,
+                        $fsvLifecycleTransition),
+                    @([string]$persisted.completion_record_path,
+                        $completionRecordPath),
+                    @([string]$persisted.fsv_lock.path, $fsvLock),
+                    @([string]$persisted.fsv_lock.archive_path, $lockArchivePath),
+                    @([string]$persisted.receipt_path, $receiptState.Path),
+                    @([string]$persisted.session_directory, $session),
+                    @([string]$persisted.artifact.path, $inspection.artifact_path),
+                    @([string]$persisted.outputs.stdout.path, $stdoutPath),
+                    @([string]$persisted.outputs.stderr.path, $stderrPath),
+                    @([string]$persisted.expected_controls.run_record_path,
+                        $expectedRunRecord),
+                    @([string]$persisted.expected_controls.live_state_path,
+                        $expectedLiveState),
+                    @([string]$persisted.launcher_recovery_chain.launcher_recovery_completion.path,
+                        [string]$launcherRecoveryChainFinal.launcher_recovery.path),
+                    @([string]$persisted.launcher_recovery_chain.target_recovery_completion.path,
+                        [string]$launcherRecoveryChainFinal.target_recovery.path)
+                )) {
+                if (-not [string]::Equals(
+                        [IO.Path]::GetFullPath([string]$pair[0]),
+                        [IO.Path]::GetFullPath([string]$pair[1]),
+                        [StringComparison]::OrdinalIgnoreCase
+                    )) {
+                    Fail-Astro 'ASTRO_FSV_PARTIAL_LOCK_RECORD_INVALID' `
+                        'persisted retirement path binding differs from the authorized state' `
+                        'preserve the lock and transition; no archive authority was established'
+                }
+            }
+            if ([string]$persisted.launcher_recovery_chain.launcher_recovery_completion.sha256 -cne
+                    [string]$launcherRecoveryChainFinal.launcher_recovery.sha256 -or
+                [string]$persisted.launcher_recovery_chain.target_recovery_completion.sha256 -cne
+                    [string]$launcherRecoveryChainFinal.target_recovery.sha256 -or
+                @($persisted.launcher_recovery_chain.launcher_archive_completions).Count -ne
+                    @($launcherRecoveryChainFinal.archives).Count) {
+                Fail-Astro 'ASTRO_FSV_PARTIAL_LOCK_RECORD_INVALID' `
+                    'persisted launcher recovery chain differs from physical readback' `
+                    'preserve the lock and transition; no archive authority was established'
+            }
+            for ($archiveIndex = 0;
+                $archiveIndex -lt @($launcherRecoveryChainFinal.archives).Count;
+                $archiveIndex++) {
+                $persistedArchive =
+                    $persisted.launcher_recovery_chain.launcher_archive_completions[$archiveIndex]
+                $physicalArchive = $launcherRecoveryChainFinal.archives[$archiveIndex].completion
+                if (-not [string]::Equals(
+                        [IO.Path]::GetFullPath([string]$persistedArchive.path),
+                        [IO.Path]::GetFullPath([string]$physicalArchive.path),
+                        [StringComparison]::OrdinalIgnoreCase
+                    ) -or
+                    [string]$persistedArchive.sha256 -cne
+                        [string]$physicalArchive.sha256) {
+                    Fail-Astro 'ASTRO_FSV_PARTIAL_LOCK_RECORD_INVALID' `
+                        "persisted launcher archive differs at index $archiveIndex" `
+                        'preserve the lock and transition; no archive authority was established'
+                }
+            }
+            Assert-AstroFsvPersistedAbsentJobProbe `
+                $persisted.launcher_job.initial_probe $jobName `
+                'ASTRO_FSV_PARTIAL_LOCK_RECORD_INVALID' `
+                'persisted primary launcher initial probe'
+            Assert-AstroFsvPersistedAbsentJobProbe `
+                $persisted.launcher_job.final_probe $jobName `
+                'ASTRO_FSV_PARTIAL_LOCK_RECORD_INVALID' `
+                'persisted primary launcher final probe'
+            Assert-AstroFsvPersistedRecoveryJobProbes `
+                -Persisted $persisted.recovery_launcher_job_probes `
+                -LauncherRecoveryChain $launcherRecoveryChainFinal `
+                -Code 'ASTRO_FSV_PARTIAL_LOCK_RECORD_INVALID' `
+                -Description 'persisted recovery-launcher'
+            $persistedLockProcesses = Read-AstroFsvTerminalPartialPreLiveProcesses `
+                -LockState $persisted.fsv_lock.state `
+                -Code 'ASTRO_FSV_PARTIAL_LOCK_RECORD_INVALID' `
+                -Description 'persisted embedded FSV-lock process set'
+            $persistedLockLauncher = Read-AstroFsvProcessIdentity `
+                $persisted.fsv_lock.state.owners.launcher `
+                'ASTRO_FSV_PARTIAL_LOCK_RECORD_INVALID' `
+                'persisted embedded FSV-lock launcher identity'
+            $persistedLockRunner = Read-AstroFsvProcessIdentity `
+                $persisted.fsv_lock.state.owners.runner `
+                'ASTRO_FSV_PARTIAL_LOCK_RECORD_INVALID' `
+                'persisted embedded FSV-lock runner identity'
+            if ([string]$persisted.launcher_job.name -cne $jobName -or
+                -not (Test-AstroFsvIdentityEqual `
+                    $persistedLockLauncher $lockLauncher) -or
+                -not (Test-AstroFsvIdentityEqual `
+                    $persistedLockRunner $lockRunner) -or
+                -not (Test-AstroFsvV3ProcessEntriesEqual `
+                    $persistedLockProcesses $lockProcesses) -or
+                -not [string]::Equals(
+                    [IO.Path]::GetFullPath(
+                        [string]$persisted.fsv_lock.state.cohort_plan.path),
+                    $cohortPlanPath,
+                    [StringComparison]::OrdinalIgnoreCase
+                ) -or
+                [string]$persisted.fsv_lock.state.cohort_plan.sha256 -cne
+                    [string]$lockState.cohort_plan.sha256) {
+                Fail-Astro 'ASTRO_FSV_PARTIAL_LOCK_RECORD_INVALID' `
+                    'persisted embedded FSV-lock provenance differs from physical lock bytes' `
+                    'preserve the lock and transition; no archive authority was established'
+            }
+            $recordSha256 = [string]$transitionPublication.sha256
+            if ((File-Sha256 $fsvLock) -cne $lockShaBefore) {
+                Fail-Astro 'ASTRO_FSV_PARTIAL_LOCK_STATE_DRIFT' `
+                    'FSV lock bytes changed after durable retirement publication' `
+                    'preserve the lock and record and investigate the competing writer'
+            }
+            Move-AstroFileWriteThroughNoReplace `
+                -Source $fsvLock -Destination $lockArchivePath
+            if ((Test-AstroPathLongPath -LiteralPath $fsvLock) -or
+                -not (Test-AstroPathLongPath -LiteralPath $lockArchivePath -PathType Leaf) -or
+                (File-Sha256 $lockArchivePath) -cne $lockShaBefore) {
+                Fail-Astro 'ASTRO_FSV_PARTIAL_LOCK_ARCHIVE_FAILED' `
+                    'exact lock archive did not publish source-absence and byte-equality' `
+                    'preserve authorization/archive state and inspect the exact filesystem transition'
+            }
+            $archiveBytes = [uint64](Get-AstroFileInfoLongPath $lockArchivePath).Length
+            $completion = [ordered]@{
+                schema = 'astrolabe.native-fsv-partial-lock-retirement.completion.v1'
+                phase = 'complete-lock-archived-source-absent'
+                issue = $Issue
+                completed_at_utc = [DateTime]::UtcNow.ToString('o')
+                authorization = [ordered]@{
+                    path = $recoveryRecord; sha256 = $recordSha256
+                }
+                source = [ordered]@{
+                    path = $fsvLock; state = 'absent'; prior_sha256 = $lockShaBefore
+                }
+                archive = [ordered]@{
+                    path = $lockArchivePath
+                    bytes = $archiveBytes
+                    sha256 = File-Sha256 $lockArchivePath
+                }
+                session = [ordered]@{
+                    path = $session
+                    inventory_schema = [string]$sessionTree.schema
+                    inventory_encoding = [string]$sessionTree.encoding
+                    inventory_entry_count = [int]$sessionTree.entry_count
+                    inventory_canonical_byte_count =
+                        [uint64]$sessionTree.canonical_bytes_length
+                    inventory_sha256 = [string]$sessionTree.sha256
+                }
+            }
+            $completionPublication = Publish-NewAstroFsvProtocolRecord `
+                -Path $completionRecordPath -Value $completion `
+                -CodePrefix 'ASTRO_FSV_PARTIAL_LOCK_COMPLETION'
+            $persistedCompletion = $completionPublication.value
+            if ([string]$persistedCompletion.schema -cne
+                    'astrolabe.native-fsv-partial-lock-retirement.completion.v1' -or
+                [string]$persistedCompletion.phase -cne
+                    'complete-lock-archived-source-absent' -or
+                [int]$persistedCompletion.issue -ne $Issue -or
+                [string]$persistedCompletion.authorization.sha256 -cne
+                    $recordSha256 -or
+                [string]$persistedCompletion.source.state -cne 'absent' -or
+                [string]$persistedCompletion.source.prior_sha256 -cne
+                    $lockShaBefore -or
+                [uint64]$persistedCompletion.archive.bytes -ne $archiveBytes -or
+                [string]$persistedCompletion.archive.sha256 -cne $lockShaBefore -or
+                [string]$persistedCompletion.session.inventory_schema -cne
+                    [string]$sessionTree.schema -or
+                [string]$persistedCompletion.session.inventory_encoding -cne
+                    [string]$sessionTree.encoding -or
+                [int]$persistedCompletion.session.inventory_entry_count -ne
+                    [int]$sessionTree.entry_count -or
+                [uint64]$persistedCompletion.session.inventory_canonical_byte_count -ne
+                    [uint64]$sessionTree.canonical_bytes_length -or
+                [string]$persistedCompletion.session.inventory_sha256 -cne
+                    [string]$sessionTree.sha256 -or
+                -not [string]::Equals(
+                    [IO.Path]::GetFullPath([string]$persistedCompletion.authorization.path),
+                    $recoveryRecord,
+                    [StringComparison]::OrdinalIgnoreCase
+                ) -or
+                -not [string]::Equals(
+                    [IO.Path]::GetFullPath([string]$persistedCompletion.source.path),
+                    $fsvLock,
+                    [StringComparison]::OrdinalIgnoreCase
+                ) -or
+                -not [string]::Equals(
+                    [IO.Path]::GetFullPath([string]$persistedCompletion.archive.path),
+                    $lockArchivePath,
+                    [StringComparison]::OrdinalIgnoreCase
+                ) -or
+                -not [string]::Equals(
+                    [IO.Path]::GetFullPath([string]$persistedCompletion.session.path),
+                    $session,
+                    [StringComparison]::OrdinalIgnoreCase
+                ) -or
+                (Test-AstroPathLongPath -LiteralPath $fsvLock) -or
+                (File-Sha256 $lockArchivePath) -cne $lockShaBefore) {
+                Fail-Astro 'ASTRO_FSV_PARTIAL_LOCK_COMPLETION_INVALID' `
+                    'persisted completion does not bind the archived exact lock and unchanged session' `
+                    'preserve authorization/archive/completion bytes and investigate durable publication'
+            }
+            Move-AstroFileWriteThroughNoReplace `
+                -Source $fsvLifecycleTransition -Destination $recoveryRecord
+            if ((Test-AstroPathLongPath -LiteralPath $fsvLifecycleTransition) -or
+                (File-Sha256 $recoveryRecord) -cne $recordSha256) {
+                Fail-Astro 'ASTRO_FSV_PARTIAL_LOCK_AUTHORIZATION_ARCHIVE_FAILED' `
+                    'canonical transition did not archive to the exact authorization record' `
+                    'preserve transition/authorization/completion state and resume the same transaction'
+            }
+            $completionSha256 = File-Sha256 $completionRecordPath
+            [ordered]@{
+                operation = 'retire-terminal-partial-lock'
+                authorization_path = $recoveryRecord
+                authorization_sha256 = $recordSha256
+                completion_path = $completionRecordPath
+                completion_sha256 = $completionSha256
+                authorization = $persisted
+                completion = $persistedCompletion
+                before = [ordered]@{
+                    fsv_lock = $fsvLock; exists = $true; sha256 = $lockShaBefore
+                }
+                after = [ordered]@{
+                    fsv_lock = $fsvLock
+                    exists = $false
+                    archive_path = $lockArchivePath
+                    archive_sha256 = $lockShaBefore
+                }
+            } | ConvertTo-Json -Depth 30 -Compress | Write-Output
+            }
+            finally {
+                try { Exit-AstroLauncherLockMutex $launcherCoordinationMutex }
+                finally { Exit-AstroFsvLifecycleMutex $fsvLifecycleMutex }
+            }
         }
         'RetireLock' {
             if ($Issue -le 0) {
@@ -2286,6 +5327,777 @@ try {
                 before = $before
                 after = [ordered]@{ session = $session; exists = $false }
             } | ConvertTo-Json -Depth 24 -Compress | Write-Output
+        }
+        'QuarantineTerminalPartial' {
+            if ($Issue -le 0) {
+                Fail-Astro 'ASTRO_FSV_TERMINAL_PARTIAL_ISSUE_INVALID' `
+                    'Issue must be positive for terminal-partial quarantine' `
+                    'pass the exact issue bound by the staged artifact and retirement completion'
+            }
+            if ([string]::IsNullOrWhiteSpace($TrackerCommentUrl)) {
+                Fail-Astro 'ASTRO_FSV_TERMINAL_PARTIAL_TRACKER_REQUIRED' `
+                    'TrackerCommentUrl is required for terminal-partial quarantine' `
+                    'post a fresh owner-authored comment after lock retirement completes'
+            }
+            if ($ReasonCode -notmatch '^[A-Z][A-Z0-9_]{2,95}$' -or
+                [string]::IsNullOrWhiteSpace($ReasonMessage)) {
+                Fail-Astro 'ASTRO_FSV_TERMINAL_PARTIAL_REASON_INVALID' `
+                    'QuarantineTerminalPartial requires a structured ReasonCode and nonblank ReasonMessage' `
+                    'describe the exact failure that left this terminal-partial session'
+            }
+            if ([string]::IsNullOrWhiteSpace($RecoveryRecordPath) -or
+                [string]::IsNullOrWhiteSpace($LockRetirementRecordPath)) {
+                Fail-Astro 'ASTRO_FSV_TERMINAL_PARTIAL_RECORD_REQUIRED' `
+                    'RecoveryRecordPath and LockRetirementRecordPath are required' `
+                    'pass one fresh quarantine authorization path and the exact completed lock-retirement record'
+            }
+            $fsvLifecycleMutex = Enter-AstroFsvLifecycleMutex -WorkspaceRoot $workspace
+            if (-not $fsvLifecycleMutex.Acquired) {
+                Exit-AstroFsvLifecycleMutex $fsvLifecycleMutex
+                Fail-Astro 'ASTRO_FSV_LIFECYCLE_MUTEX_HELD' `
+                    "native-FSV lifecycle mutex is held: $($fsvLifecycleMutex.Name)" `
+                    'wait for the exact active claim/recovery transaction to publish durable state'
+            }
+            $launcherCoordinationMutex = Enter-AstroLauncherLockMutex `
+                -LockPath $launcherLockPath
+            if (-not $launcherCoordinationMutex.Acquired) {
+                $mutexName = [string]$launcherCoordinationMutex.Name
+                Exit-AstroLauncherLockMutex $launcherCoordinationMutex
+                Exit-AstroFsvLifecycleMutex $fsvLifecycleMutex
+                Fail-Astro 'ASTRO_FSV_LAUNCHER_MUTEX_HELD' `
+                    "launcher-lock coordination mutex is held: $mutexName" `
+                    'wait for launcher claim/recovery coordination to finish, then resume the exact FSV transaction'
+            }
+            try {
+            $resumeAuthorizationPath = Assert-PathWithin `
+                $RecoveryRecordPath $recoveryRoot `
+                'ASTRO_FSV_TERMINAL_PARTIAL_RECORD_ESCAPE' `
+                'terminal-partial quarantine authorization path'
+            $resumeCompletionPath = $resumeAuthorizationPath + '.completed.json'
+            $resumeTombstonePath = $resumeAuthorizationPath + '.session.dir'
+            if ((Test-AstroPathLongPath -LiteralPath $fsvLifecycleTransition) -or
+                (Test-AstroPathLongPath -LiteralPath $resumeAuthorizationPath) -or
+                (Test-AstroPathLongPath -LiteralPath $resumeCompletionPath) -or
+                (Test-AstroPathLongPath -LiteralPath $resumeTombstonePath)) {
+                $resumeResult = Invoke-AstroFsvTerminalPartialQuarantineResume `
+                    -ExpectedIssue $Issue -Workspace $workspace `
+                    -EvidenceRoot $evidenceRoot -RecoveryRoot $recoveryRoot `
+                    -FsvLockPath $fsvLock `
+                    -LifecycleTransitionPath $fsvLifecycleTransition `
+                    -RecoveryInputPath $RecoveryRecordPath `
+                    -RetirementCompletionInputPath $LockRetirementRecordPath `
+                    -TrackerUrl $TrackerCommentUrl `
+                    -FailureCode $ReasonCode -FailureMessage $ReasonMessage
+                $resumeResult | ConvertTo-Json -Depth 40 -Compress | Write-Output
+                return
+            }
+            Assert-FsvLockAbsent $fsvLock
+            $launcherProtocolInitial = Read-AstroLauncherLock -LockPath $launcherLockPath
+            if ($launcherProtocolInitial.State -ne 'absent') {
+                Fail-Astro 'ASTRO_FSV_TERMINAL_PARTIAL_LAUNCHER_LOCK' `
+                    "launcher protocol is '$($launcherProtocolInitial.State)'" `
+                    'complete exact launcher recovery before quarantining any FSV session'
+            }
+            $receiptState = Read-Receipt $ReceiptPath $evidenceRoot
+            $inspection = Inspect-ReceiptArtifact $receiptState $evidenceRoot
+            if ([int]$inspection.issue -ne $Issue) {
+                Fail-Astro 'ASTRO_FSV_TERMINAL_PARTIAL_ISSUE_MISMATCH' `
+                    "requested issue #$Issue differs from receipt issue #$($inspection.issue)" `
+                    'quarantine only through the exact issue named by the receipt'
+            }
+            $retirementCompletionPath = Assert-PathWithin `
+                $LockRetirementRecordPath $recoveryRoot `
+                'ASTRO_FSV_TERMINAL_PARTIAL_RETIREMENT_ESCAPE' `
+                'lock-retirement completion path'
+            if (-not (Test-AstroPathLongPath `
+                    -LiteralPath $retirementCompletionPath -PathType Leaf)) {
+                Fail-Astro 'ASTRO_FSV_TERMINAL_PARTIAL_RETIREMENT_MISSING' `
+                    "lock-retirement completion is absent: $retirementCompletionPath" `
+                    'complete RetireTerminalPartialLock before session quarantine'
+            }
+            Assert-NotReparseEntry $retirementCompletionPath `
+                'terminal-partial lock-retirement completion'
+            $retirementCompletionSha256 = File-Sha256 $retirementCompletionPath
+            try {
+                $retirementCompletion =
+                    Read-AstroUtf8FileLongPath $retirementCompletionPath |
+                        ConvertFrom-Json
+            }
+            catch {
+                Fail-Astro 'ASTRO_FSV_TERMINAL_PARTIAL_RETIREMENT_INVALID' `
+                    "lock-retirement completion is unreadable: $($_.Exception.Message)" `
+                    'preserve the session and retirement state'
+            }
+            if ([string]$retirementCompletion.schema -cne
+                    'astrolabe.native-fsv-partial-lock-retirement.completion.v1' -or
+                [string]$retirementCompletion.phase -cne
+                    'complete-lock-archived-source-absent' -or
+                [int]$retirementCompletion.issue -ne $Issue -or
+                [string]$retirementCompletion.source.state -cne 'absent' -or
+                -not [string]::Equals(
+                    [IO.Path]::GetFullPath([string]$retirementCompletion.source.path),
+                    $fsvLock,
+                    [StringComparison]::OrdinalIgnoreCase
+                )) {
+                Fail-Astro 'ASTRO_FSV_TERMINAL_PARTIAL_RETIREMENT_INVALID' `
+                    'lock-retirement completion does not prove the exact terminal phase' `
+                    'preserve the session and pass only the completed phase-one record'
+            }
+            $retirementAuthorizationPath = Assert-PathWithin `
+                ([string]$retirementCompletion.authorization.path) `
+                $recoveryRoot `
+                'ASTRO_FSV_TERMINAL_PARTIAL_RETIREMENT_ESCAPE' `
+                'lock-retirement authorization path'
+            if (-not (Test-AstroPathLongPath `
+                    -LiteralPath $retirementAuthorizationPath -PathType Leaf) -or
+                (File-Sha256 $retirementAuthorizationPath) -cne
+                    [string]$retirementCompletion.authorization.sha256) {
+                Fail-Astro 'ASTRO_FSV_TERMINAL_PARTIAL_RETIREMENT_INVALID' `
+                    'lock-retirement authorization is absent or hash-mismatched' `
+                    'preserve all state and investigate the external recovery record'
+            }
+            try {
+                $retirementAuthorization =
+                    Read-AstroUtf8FileLongPath $retirementAuthorizationPath |
+                        ConvertFrom-Json
+            }
+            catch {
+                Fail-Astro 'ASTRO_FSV_TERMINAL_PARTIAL_RETIREMENT_INVALID' `
+                    "lock-retirement authorization is unreadable: $($_.Exception.Message)" `
+                    'preserve all state and investigate the external recovery record'
+            }
+            if ([string]$retirementAuthorization.schema -cne
+                    'astrolabe.native-fsv-partial-lock-retirement.authorization.v1' -or
+                [string]$retirementAuthorization.phase -cne
+                    'authorized-exact-terminal-partial-lock' -or
+                [int]$retirementAuthorization.issue -ne $Issue -or
+                -not [string]::Equals(
+                    [IO.Path]::GetFullPath(
+                        [string]$retirementAuthorization.receipt_path),
+                    $receiptState.Path,
+                    [StringComparison]::OrdinalIgnoreCase
+                ) -or
+                [string]$retirementAuthorization.receipt_sha256 -cne
+                    (File-Sha256 $receiptState.Path) -or
+                -not [string]::Equals(
+                    [IO.Path]::GetFullPath(
+                        [string]$retirementAuthorization.session_directory),
+                    $inspection.session_directory,
+                    [StringComparison]::OrdinalIgnoreCase
+                ) -or
+                -not [string]::Equals(
+                    [IO.Path]::GetFullPath(
+                        [string]$retirementAuthorization.artifact.path),
+                    $inspection.artifact_path,
+                    [StringComparison]::OrdinalIgnoreCase
+                ) -or
+                [string]$retirementAuthorization.artifact.sha256 -cne
+                    $inspection.sha256 -or
+                [string]$retirementAuthorization.fsv_lock.state.schema -cne
+                    'astrolabe.native-fsv-lock.v3' -or
+                [string]$retirementAuthorization.fsv_lock.state.mode -cne
+                    'resident-cohort') {
+                Fail-Astro 'ASTRO_FSV_TERMINAL_PARTIAL_RETIREMENT_INVALID' `
+                    'lock-retirement authorization is not bound to this receipt/artifact/session' `
+                    'preserve mixed-generation state and investigate its publisher'
+            }
+            $lockArchivePath = Assert-PathWithin `
+                ([string]$retirementAuthorization.fsv_lock.archive_path) `
+                $recoveryRoot `
+                'ASTRO_FSV_TERMINAL_PARTIAL_RETIREMENT_ESCAPE' `
+                'archived FSV-lock path'
+            if (-not (Test-AstroPathLongPath -LiteralPath $lockArchivePath -PathType Leaf) -or
+                (File-Sha256 $lockArchivePath) -cne
+                    [string]$retirementAuthorization.fsv_lock.sha256 -or
+                (File-Sha256 $lockArchivePath) -cne
+                    [string]$retirementCompletion.archive.sha256) {
+                Fail-Astro 'ASTRO_FSV_TERMINAL_PARTIAL_RETIREMENT_INVALID' `
+                    'archived FSV-lock bytes are absent or hash-mismatched' `
+                    'preserve every byte and investigate the phase-one archive'
+            }
+            if (-not [string]::Equals(
+                    [IO.Path]::GetFullPath([string]$retirementCompletion.authorization.path),
+                    $retirementAuthorizationPath,
+                    [StringComparison]::OrdinalIgnoreCase
+                ) -or
+                -not [string]::Equals(
+                    [IO.Path]::GetFullPath([string]$retirementCompletion.archive.path),
+                    $lockArchivePath,
+                    [StringComparison]::OrdinalIgnoreCase
+                ) -or
+                -not [string]::Equals(
+                    [IO.Path]::GetFullPath([string]$retirementCompletion.session.path),
+                    [IO.Path]::GetFullPath([string]$retirementAuthorization.session_directory),
+                    [StringComparison]::OrdinalIgnoreCase
+                ) -or
+                [string]$retirementCompletion.session.inventory_schema -cne
+                    [string]$retirementAuthorization.session_inventory.schema -or
+                [string]$retirementCompletion.session.inventory_encoding -cne
+                    [string]$retirementAuthorization.session_inventory.encoding -or
+                [int]$retirementCompletion.session.inventory_entry_count -ne
+                    [int]$retirementAuthorization.session_inventory.entry_count -or
+                [uint64]$retirementCompletion.session.inventory_canonical_byte_count -ne
+                    [uint64]$retirementAuthorization.session_inventory.canonical_bytes_length -or
+                [string]$retirementCompletion.session.inventory_sha256 -cne
+                    [string]$retirementAuthorization.session_inventory.sha256) {
+                Fail-Astro 'ASTRO_FSV_TERMINAL_PARTIAL_RETIREMENT_INVALID' `
+                    'phase-one completion paths/inventory do not exactly link authorization/archive/session' `
+                    'preserve every record and investigate the malformed chain'
+            }
+            $chainRecords = @(
+                $retirementAuthorization.launcher_recovery_chain.launcher_archive_completions
+            )
+            $launcherRecoveryChain = Read-AstroFsvLauncherRecoveryChain `
+                -ExpectedIssue $Issue -Workspace $workspace `
+                -LauncherRecoveryPath `
+                    ([string]$retirementAuthorization.launcher_recovery_chain.launcher_recovery_completion.path) `
+                -TargetRecoveryPath `
+                    ([string]$retirementAuthorization.launcher_recovery_chain.target_recovery_completion.path) `
+                -ArchiveCompletionPaths ([string[]]@($chainRecords | ForEach-Object {
+                            [string]$_.path
+                        }))
+            $ownerBindings = Get-AstroFsvRetirementDerivedOwners `
+                -RetirementAuthorization $retirementAuthorization `
+                -Inspection $inspection -LauncherRecoveryChain $launcherRecoveryChain `
+                -Code 'ASTRO_FSV_TERMINAL_PARTIAL_RETIREMENT_INVALID'
+            Assert-AstroFsvPersistedOwnerEnvelope `
+                -Owners $retirementAuthorization.owners `
+                -ExpectedBindings $ownerBindings `
+                -Code 'ASTRO_FSV_TERMINAL_PARTIAL_RETIREMENT_INVALID' `
+                -Description 'terminal-partial lock-retirement authorization'
+            $session = [IO.Path]::GetFullPath($inspection.session_directory)
+            $stdoutPath = Assert-DirectSessionChildPath $StandardOutputPath $session `
+                'ASTRO_FSV_TERMINAL_PARTIAL_OUTPUT_PATH_INVALID' 'standard-output path'
+            $stderrPath = Assert-DirectSessionChildPath $StandardErrorPath $session `
+                'ASTRO_FSV_TERMINAL_PARTIAL_OUTPUT_PATH_INVALID' 'standard-error path'
+            $expectedRunRecord = Assert-DirectSessionChildPath $RunRecordPath $session `
+                'ASTRO_FSV_TERMINAL_PARTIAL_RUN_PATH_INVALID' 'expected run-record path'
+            $expectedLiveState = Assert-DirectSessionChildPath $LiveStatePath $session `
+                'ASTRO_FSV_TERMINAL_PARTIAL_LIVE_PATH_INVALID' 'expected live-state path'
+            foreach ($pair in @(
+                @($stdoutPath, $retirementAuthorization.outputs.stdout.path),
+                @($stderrPath, $retirementAuthorization.outputs.stderr.path),
+                @($expectedRunRecord, $retirementAuthorization.expected_controls.run_record_path),
+                @($expectedLiveState, $retirementAuthorization.expected_controls.live_state_path)
+            )) {
+                if (-not [string]::Equals(
+                        [IO.Path]::GetFullPath([string]$pair[0]),
+                        [IO.Path]::GetFullPath([string]$pair[1]),
+                        [StringComparison]::OrdinalIgnoreCase
+                    )) {
+                    Fail-Astro 'ASTRO_FSV_TERMINAL_PARTIAL_RETIREMENT_INVALID' `
+                        'explicit output/control paths differ from phase-one authorization' `
+                        'preserve the session and use the exact phase-one path bindings'
+                }
+            }
+            if (-not (Test-AstroPathLongPath -LiteralPath $stdoutPath -PathType Leaf) -or
+                -not (Test-AstroPathLongPath -LiteralPath $stderrPath -PathType Leaf) -or
+                (File-Sha256 $stdoutPath) -cne
+                    [string]$retirementAuthorization.outputs.stdout.sha256 -or
+                (File-Sha256 $stderrPath) -cne
+                    [string]$retirementAuthorization.outputs.stderr.sha256 -or
+                (Test-AstroPathLongPath -LiteralPath $expectedRunRecord) -or
+                (Test-AstroPathLongPath -LiteralPath $expectedLiveState)) {
+                Fail-Astro 'ASTRO_FSV_TERMINAL_PARTIAL_SESSION_DRIFT' `
+                    'output/control family changed after lock retirement' `
+                    'preserve the session and post no quarantine authorization'
+            }
+            $sessionTree = Get-AstroOrdinaryDirectoryTreeInventoryLongPath $session
+            if ([string]$sessionTree.schema -cne
+                    [string]$retirementAuthorization.session_inventory.schema -or
+                [string]$sessionTree.encoding -cne
+                    [string]$retirementAuthorization.session_inventory.encoding -or
+                [int]$sessionTree.entry_count -ne
+                    [int]$retirementAuthorization.session_inventory.entry_count -or
+                [uint64]$sessionTree.canonical_bytes_length -ne
+                    [uint64]$retirementAuthorization.session_inventory.canonical_bytes_length -or
+                [string]$sessionTree.sha256 -cne
+                    [string]$retirementAuthorization.session_inventory.sha256) {
+                Fail-Astro 'ASTRO_FSV_TERMINAL_PARTIAL_SESSION_DRIFT' `
+                    'complete session inventory changed after lock retirement' `
+                    'preserve the session and post fresh evidence only after investigation'
+            }
+            $initialOwnerProbes = @(
+                Assert-AstroFsvOwnersInactive `
+                    -Bindings $ownerBindings `
+                    -CodePrefix 'ASTRO_FSV_TERMINAL_PARTIAL' `
+                    -Description 'terminal-partial quarantine'
+            )
+            $jobName = [string]$retirementAuthorization.launcher_job.name
+            $jobProbeFirst = Get-AstroLauncherJobObjectProbe -Name $jobName
+            if ($jobProbeFirst.State -cne 'absent') {
+                Fail-Astro 'ASTRO_FSV_TERMINAL_PARTIAL_JOB_PRESENT' `
+                    "launcher Job is '$($jobProbeFirst.State)': $jobName" `
+                    'preserve the session while any recorded Job generation exists'
+            }
+            $recoveryJobProbesFirst = @(Assert-AstroFsvRecoveryJobsAbsent `
+                    -LauncherRecoveryChain $launcherRecoveryChain `
+                    -CodePrefix 'ASTRO_FSV_TERMINAL_PARTIAL' `
+                    -Description 'terminal-partial quarantine')
+            $recoveryRecord = Assert-PathWithin $RecoveryRecordPath $recoveryRoot `
+                'ASTRO_FSV_TERMINAL_PARTIAL_RECORD_ESCAPE' `
+                'terminal-partial quarantine authorization path'
+            $completionRecordPath = $recoveryRecord + '.completed.json'
+            $sessionTombstonePath = $recoveryRecord + '.session.dir'
+            if ((Get-AstroFsvStrictPathState `
+                    $recoveryRecord file `
+                    'ASTRO_FSV_TERMINAL_PARTIAL_RECORD_REUSE_REFUSED' `
+                    'quarantine authorization archive').state -cne 'absent' -or
+                (Get-AstroFsvStrictPathState `
+                    $completionRecordPath file `
+                    'ASTRO_FSV_TERMINAL_PARTIAL_RECORD_REUSE_REFUSED' `
+                    'quarantine completion').state -cne 'absent' -or
+                (Get-AstroFsvStrictPathState `
+                    $sessionTombstonePath directory `
+                    'ASTRO_FSV_TERMINAL_PARTIAL_RECORD_REUSE_REFUSED' `
+                    'quarantine session tombstone').state -cne 'absent' -or
+                (Get-AstroFsvStrictPathState `
+                    $fsvLifecycleTransition file `
+                    'ASTRO_FSV_TERMINAL_PARTIAL_RECORD_REUSE_REFUSED' `
+                    'canonical FSV lifecycle transition').state -cne 'absent') {
+                Fail-Astro 'ASTRO_FSV_TERMINAL_PARTIAL_RECORD_REUSE_REFUSED' `
+                    'quarantine authorization/completion/tombstone/transition path already exists' `
+                    'use one fresh append-only recovery path per session'
+            }
+            $receiptSha256 = File-Sha256 $receiptState.Path
+            $tracker = Read-AstroFsvTerminalPartialQuarantineTrackerEvidence `
+                -Url $TrackerCommentUrl -ExpectedIssue $Issue `
+                -ExpectedRetirementCompletionPath $retirementCompletionPath `
+                -ExpectedRetirementCompletionSha256 $retirementCompletionSha256 `
+                -ExpectedReceiptPath $receiptState.Path `
+                -ExpectedReceiptSha256 $receiptSha256 `
+                -ExpectedArtifactPath $inspection.artifact_path `
+                -ExpectedArtifactSha256 $inspection.sha256 `
+                -ExpectedSessionDirectory $session `
+                -ExpectedStandardOutputPath $stdoutPath `
+                -ExpectedStandardOutputSha256 `
+                    ([string]$retirementAuthorization.outputs.stdout.sha256) `
+                -ExpectedStandardErrorPath $stderrPath `
+                -ExpectedStandardErrorSha256 `
+                    ([string]$retirementAuthorization.outputs.stderr.sha256) `
+                -ExpectedRunRecordPath $expectedRunRecord `
+                -ExpectedLiveStatePath $expectedLiveState `
+                -ExpectedInventorySchema ([string]$sessionTree.schema) `
+                -ExpectedInventoryEncoding ([string]$sessionTree.encoding) `
+                -ExpectedInventoryEntryCount ([int]$sessionTree.entry_count) `
+                -ExpectedInventoryCanonicalByteCount `
+                    ([uint64]$sessionTree.canonical_bytes_length) `
+                -ExpectedInventorySha256 ([string]$sessionTree.sha256) `
+                -ExpectedRecoveryRecordPath $recoveryRecord `
+                -ExpectedCompletionRecordPath $completionRecordPath `
+                -ExpectedLifecycleTransitionPath $fsvLifecycleTransition `
+                -ExpectedSessionTombstonePath $sessionTombstonePath `
+                -ExpectedReasonCode $ReasonCode
+            if ([long]$tracker.comment_id -eq
+                [long]$retirementAuthorization.tracker.comment_id) {
+                Fail-Astro 'ASTRO_FSV_TERMINAL_PARTIAL_TRACKER_STALE' `
+                    'quarantine tracker reuses the phase-one owner comment' `
+                    'post a distinct second-phase comment that binds the completed phase-one hash'
+            }
+            try {
+                $trackerCreated = [DateTimeOffset]::Parse(
+                    [string]$tracker.created_at,
+                    [Globalization.CultureInfo]::InvariantCulture
+                )
+                $retirementCompleted = [DateTimeOffset]::Parse(
+                    [string]$retirementCompletion.completed_at_utc,
+                    [Globalization.CultureInfo]::InvariantCulture
+                )
+            }
+            catch {
+                Fail-Astro 'ASTRO_FSV_TERMINAL_PARTIAL_TRACKER_STALE' `
+                    "phase timestamp is malformed (tracker='$($tracker.created_at)'; completion='$($retirementCompletion.completed_at_utc)'): $($_.Exception.Message)" `
+                    'preserve the session and investigate malformed durable timestamp authority'
+            }
+            if ($trackerCreated -le $retirementCompleted) {
+                Fail-Astro 'ASTRO_FSV_TERMINAL_PARTIAL_TRACKER_STALE' `
+                    'quarantine tracker is not provably later than phase-one completion' `
+                    'post a fresh second-phase comment that binds the completed phase-one hash'
+            }
+            $finalOwnerProbes = @(
+                Assert-AstroFsvOwnersInactive `
+                    -Bindings $ownerBindings `
+                    -CodePrefix 'ASTRO_FSV_TERMINAL_PARTIAL' `
+                    -Description 'terminal-partial quarantine final authorization'
+            )
+            $jobProbeSecond = Get-AstroLauncherJobObjectProbe -Name $jobName
+            $recoveryJobProbesSecond = @(Assert-AstroFsvRecoveryJobsAbsent `
+                    -LauncherRecoveryChain $launcherRecoveryChain `
+                    -CodePrefix 'ASTRO_FSV_TERMINAL_PARTIAL' `
+                    -Description 'terminal-partial quarantine final authorization')
+            $launcherRecoveryChainFinal = Read-AstroFsvLauncherRecoveryChain `
+                -ExpectedIssue $Issue -Workspace $workspace `
+                -LauncherRecoveryPath `
+                    ([string]$retirementAuthorization.launcher_recovery_chain.launcher_recovery_completion.path) `
+                -TargetRecoveryPath `
+                    ([string]$retirementAuthorization.launcher_recovery_chain.target_recovery_completion.path) `
+                -ArchiveCompletionPaths ([string[]]@($chainRecords | ForEach-Object {
+                            [string]$_.path
+                        }))
+            if ([string]$launcherRecoveryChainFinal.launcher_recovery.sha256 -cne
+                    [string]$launcherRecoveryChain.launcher_recovery.sha256 -or
+                [string]$launcherRecoveryChainFinal.target_recovery.sha256 -cne
+                    [string]$launcherRecoveryChain.target_recovery.sha256 -or
+                @($launcherRecoveryChainFinal.archives).Count -ne
+                    @($launcherRecoveryChain.archives).Count) {
+                Fail-Astro 'ASTRO_FSV_TERMINAL_PARTIAL_LAUNCHER_RECOVERY_DRIFT' `
+                    'launcher/target recovery chain changed after tracker authorization' `
+                    'preserve the session and post no quarantine transition'
+            }
+            for ($archiveIndex = 0;
+                $archiveIndex -lt @($launcherRecoveryChain.archives).Count;
+                $archiveIndex++) {
+                if ([string]$launcherRecoveryChainFinal.archives[$archiveIndex].completion.sha256 -cne
+                    [string]$launcherRecoveryChain.archives[$archiveIndex].completion.sha256) {
+                    Fail-Astro 'ASTRO_FSV_TERMINAL_PARTIAL_LAUNCHER_RECOVERY_DRIFT' `
+                        "launcher archive completion changed at index $archiveIndex" `
+                        'preserve the session and post no quarantine transition'
+                }
+            }
+            $launcherProtocolFinal = Read-AstroLauncherLock -LockPath $launcherLockPath
+            $finalTree = Get-AstroOrdinaryDirectoryTreeInventoryLongPath $session
+            if ($jobProbeSecond.State -cne 'absent' -or
+                $launcherProtocolFinal.State -ne 'absent' -or
+                (Test-AstroPathLongPath -LiteralPath (Join-Path $workspace 'target')) -or
+                (Test-AstroPathLongPath -LiteralPath $fsvLock) -or
+                (File-Sha256 $retirementCompletionPath) -cne
+                    $retirementCompletionSha256 -or
+                (File-Sha256 $lockArchivePath) -cne
+                    [string]$retirementAuthorization.fsv_lock.sha256 -or
+                (File-Sha256 $receiptState.Path) -cne $receiptSha256 -or
+                (File-Sha256 $inspection.artifact_path) -cne $inspection.sha256 -or
+                (File-Sha256 $stdoutPath) -cne
+                    [string]$retirementAuthorization.outputs.stdout.sha256 -or
+                (File-Sha256 $stderrPath) -cne
+                    [string]$retirementAuthorization.outputs.stderr.sha256 -or
+                (Test-AstroPathLongPath -LiteralPath $expectedRunRecord) -or
+                (Test-AstroPathLongPath -LiteralPath $expectedLiveState) -or
+                [string]$finalTree.schema -cne [string]$sessionTree.schema -or
+                [string]$finalTree.encoding -cne [string]$sessionTree.encoding -or
+                [int]$finalTree.entry_count -ne [int]$sessionTree.entry_count -or
+                [uint64]$finalTree.canonical_bytes_length -ne
+                    [uint64]$sessionTree.canonical_bytes_length -or
+                [string]$finalTree.sha256 -cne [string]$sessionTree.sha256) {
+                Fail-Astro 'ASTRO_FSV_TERMINAL_PARTIAL_SESSION_DRIFT' `
+                    'retirement/session/owner/Job/launcher state changed after tracker authorization' `
+                    'preserve every byte and post fresh evidence for the current exact state'
+            }
+            $sessionFiles = @(Get-SessionFileInventory $session)
+            $currentRepository = Get-RepoState -GitExe $gitExe -Workspace $workspace
+            $recordParent = Split-Path -Parent $recoveryRecord
+            New-AstroDirectoryLongPath $recordParent | Out-Null
+            Assert-NotReparseEntry $recordParent `
+                'terminal-partial quarantine record parent'
+            $authorization = [ordered]@{
+                schema = 'astrolabe.native-fsv-terminal-partial-quarantine.authorization.v1'
+                phase = 'authorized-exact-terminal-partial-session'
+                issue = $Issue
+                recorded_at_utc = [DateTime]::UtcNow.ToString('o')
+                tracker = $tracker
+                retirement = [ordered]@{
+                    completion_path = $retirementCompletionPath
+                    completion_sha256 = $retirementCompletionSha256
+                    authorization_path = $retirementAuthorizationPath
+                    authorization_sha256 =
+                        [string]$retirementCompletion.authorization.sha256
+                    lock_archive_path = $lockArchivePath
+                    lock_archive_sha256 =
+                        [string]$retirementAuthorization.fsv_lock.sha256
+                }
+                receipt_path = $receiptState.Path
+                receipt_sha256 = $receiptSha256
+                session_directory = $session
+                session_tombstone_path = $sessionTombstonePath
+                lifecycle_transition_path = $fsvLifecycleTransition
+                authorization_record_path = $recoveryRecord
+                artifact = [ordered]@{
+                    path = $inspection.artifact_path
+                    bytes = [uint64]$inspection.bytes
+                    sha256 = $inspection.sha256
+                }
+                expected_controls = [ordered]@{
+                    run_record_path = $expectedRunRecord
+                    run_record_state = 'absent'
+                    live_state_path = $expectedLiveState
+                    live_state_state = 'absent'
+                }
+                outputs = $retirementAuthorization.outputs
+                session_inventory = [ordered]@{
+                    schema = [string]$finalTree.schema
+                    encoding = [string]$finalTree.encoding
+                    entry_count = [int]$finalTree.entry_count
+                    canonical_bytes_length = [uint64]$finalTree.canonical_bytes_length
+                    sha256 = [string]$finalTree.sha256
+                    files = $sessionFiles
+                    entries = [object[]]$finalTree.entries
+                }
+                source_of_truth = [ordered]@{
+                    fsv_lock = [ordered]@{ path = $fsvLock; state = 'absent' }
+                    launcher_protocol = [ordered]@{
+                        path = $launcherLockPath; state = $launcherProtocolFinal.State
+                    }
+                    launcher_job = [ordered]@{
+                        name = $jobName
+                        initial_probe = $jobProbeFirst
+                        final_probe = $jobProbeSecond
+                    }
+                    recovery_launcher_jobs = [ordered]@{
+                        initial = $recoveryJobProbesFirst
+                        final = $recoveryJobProbesSecond
+                    }
+                }
+                staged_repository = $receiptState.Receipt.repository
+                current_repository = $currentRepository
+                owners = [ordered]@{
+                    identities = @($ownerBindings | ForEach-Object {
+                            [ordered]@{
+                                role = $_.Role; source = $_.Source; identity = $_.Identity
+                            }
+                        })
+                    initial_probes = $initialOwnerProbes
+                    final_probes = $finalOwnerProbes
+                }
+                failure = [ordered]@{ code = $ReasonCode; message = $ReasonMessage }
+                completion_record_path = $completionRecordPath
+            }
+            $transitionPublication = Publish-NewAstroFsvProtocolRecord `
+                -Path $fsvLifecycleTransition -Value $authorization `
+                -CodePrefix 'ASTRO_FSV_TERMINAL_PARTIAL_AUTHORIZATION' `
+                -StageDirectory $recordParent
+            $persistedAuthorization = $transitionPublication.value
+            if ([string]$persistedAuthorization.schema -cne
+                    'astrolabe.native-fsv-terminal-partial-quarantine.authorization.v1' -or
+                [string]$persistedAuthorization.phase -cne
+                    'authorized-exact-terminal-partial-session' -or
+                [string]$persistedAuthorization.retirement.completion_sha256 -cne
+                    $retirementCompletionSha256 -or
+                [string]$persistedAuthorization.session_inventory.sha256 -cne
+                    [string]$finalTree.sha256 -or
+                [string]$persistedAuthorization.artifact.sha256 -cne
+                    $inspection.sha256 -or
+                [string]$persistedAuthorization.failure.code -cne $ReasonCode -or
+                [string]$persistedAuthorization.tracker.url -cne $TrackerCommentUrl) {
+                Fail-Astro 'ASTRO_FSV_TERMINAL_PARTIAL_RECORD_INVALID' `
+                    'persisted quarantine authorization differs from exact state' `
+                    'preserve both session and record and investigate durable publication'
+            }
+            Assert-AstroFsvPersistedOwnerEnvelope `
+                -Owners $persistedAuthorization.owners `
+                -ExpectedBindings $ownerBindings `
+                -Code 'ASTRO_FSV_TERMINAL_PARTIAL_RECORD_INVALID' `
+                -Description 'persisted terminal-partial quarantine authorization'
+            Assert-AstroFsvPersistedAbsentJobProbe `
+                $persistedAuthorization.source_of_truth.launcher_job.initial_probe `
+                $jobName 'ASTRO_FSV_TERMINAL_PARTIAL_RECORD_INVALID' `
+                'persisted terminal-partial primary Job initial probe'
+            Assert-AstroFsvPersistedAbsentJobProbe `
+                $persistedAuthorization.source_of_truth.launcher_job.final_probe `
+                $jobName 'ASTRO_FSV_TERMINAL_PARTIAL_RECORD_INVALID' `
+                'persisted terminal-partial primary Job final probe'
+            Assert-AstroFsvPersistedRecoveryJobProbes `
+                -Persisted `
+                    $persistedAuthorization.source_of_truth.recovery_launcher_jobs `
+                -LauncherRecoveryChain $launcherRecoveryChainFinal `
+                -Code 'ASTRO_FSV_TERMINAL_PARTIAL_RECORD_INVALID' `
+                -Description 'persisted terminal-partial recovery-launcher'
+            $persistedAuthorizedEntries = ConvertFrom-AstroFsvPersistedInventoryEntries `
+                -Entries $persistedAuthorization.session_inventory.entries `
+                -Code 'ASTRO_FSV_TERMINAL_PARTIAL_RECORD_INVALID' `
+                -Description 'persisted terminal-partial session inventory'
+            [byte[]]$persistedAuthorizedBytes =
+                ConvertTo-AstroOrdinaryTreeInventoryCanonicalBytes `
+                    -Schema ([string]$persistedAuthorization.session_inventory.schema) `
+                    -Encoding ([string]$persistedAuthorization.session_inventory.encoding) `
+                    -Records $persistedAuthorizedEntries
+            if ([string]$persistedAuthorization.session_inventory.schema -cne
+                    [string]$finalTree.schema -or
+                [string]$persistedAuthorization.session_inventory.encoding -cne
+                    [string]$finalTree.encoding -or
+                [int]$persistedAuthorization.session_inventory.entry_count -ne
+                    [int]$finalTree.entry_count -or
+                [uint64]$persistedAuthorization.session_inventory.canonical_bytes_length -ne
+                    [uint64]$finalTree.canonical_bytes_length -or
+                $persistedAuthorizedEntries.Count -ne [int]$finalTree.entry_count -or
+                [uint64]$persistedAuthorizedBytes.Length -ne
+                    [uint64]$finalTree.canonical_bytes_length -or
+                (Get-AstroByteSha256 $persistedAuthorizedBytes) -cne
+                    [string]$finalTree.sha256) {
+                Fail-Astro 'ASTRO_FSV_TERMINAL_PARTIAL_RECORD_INVALID' `
+                    'persisted deletion entries do not reproduce the authorized physical inventory' `
+                    'preserve the session and transition; no deletion authority was established'
+            }
+            $authorizationSha256 = [string]$transitionPublication.sha256
+            if ((Get-AstroOrdinaryDirectoryTreeInventoryLongPath $session).sha256 -cne
+                    [string]$finalTree.sha256) {
+                Fail-Astro 'ASTRO_FSV_TERMINAL_PARTIAL_SESSION_DRIFT' `
+                    'session inventory changed after durable quarantine authorization' `
+                    'preserve the session and authorization record'
+            }
+            $sourceHandle = $null
+            $destinationHandle = $null
+            try {
+                $sourceHandle = [AstroLauncherLockNative]::OpenExactDeleteDirectory($session)
+                $destinationHandle =
+                    [AstroLauncherLockNative]::OpenExactRenameDirectory($recordParent)
+                $sourceFileId = [AstroLauncherLockNative]::GetFileIdentity($sourceHandle)
+                $authorizedRoot = @($persistedAuthorizedEntries | Where-Object {
+                        [string]$_.relative_path -ceq '.'
+                    })
+                if ($authorizedRoot.Count -ne 1 -or
+                    [string]$authorizedRoot[0].file_id -cne [string]$sourceFileId) {
+                    Fail-Astro 'ASTRO_FSV_TERMINAL_PARTIAL_SESSION_DRIFT' `
+                        'session root FILE_ID differs from its durable authorization' `
+                        'preserve the session and investigate namespace replacement'
+                }
+                [AstroLauncherLockNative]::RenameDirectoryHandleNoReplace(
+                    $sourceHandle,
+                    $destinationHandle,
+                    [IO.Path]::GetFileName($sessionTombstonePath)
+                )
+                $renamedPath = ConvertFrom-AstroNativeFinalPath (
+                    [AstroLauncherLockNative]::GetFileFinalPath($sourceHandle)
+                )
+                if (-not [string]::Equals(
+                        [IO.Path]::GetFullPath($renamedPath),
+                        $sessionTombstonePath,
+                        [StringComparison]::OrdinalIgnoreCase
+                    ) -or
+                    [string][AstroLauncherLockNative]::GetFileIdentity($sourceHandle) -cne
+                        [string]$sourceFileId) {
+                    Fail-Astro 'ASTRO_FSV_TERMINAL_PARTIAL_QUARANTINE_FAILED' `
+                        'handle-bound session rename did not preserve exact root identity' `
+                        'preserve the tombstone and investigate the namespace transition'
+                }
+            }
+            finally {
+                if ($null -ne $destinationHandle) { $destinationHandle.Dispose() }
+                if ($null -ne $sourceHandle) { $sourceHandle.Dispose() }
+            }
+            if ((Test-AstroPathLongPath -LiteralPath $session) -or
+                -not (Test-AstroPathLongPath -LiteralPath $sessionTombstonePath -PathType Container)) {
+                Fail-Astro 'ASTRO_FSV_TERMINAL_PARTIAL_QUARANTINE_FAILED' `
+                    'session-to-tombstone transition did not publish exact source absence' `
+                    'preserve the transition and inspect both namespaces'
+            }
+            $tombstoneInventory =
+                Get-AstroOrdinaryDirectoryTreeInventoryLongPath $sessionTombstonePath
+            Assert-AstroFsvAuthorizedInventorySubset `
+                -AuthorizedEntries $persistedAuthorizedEntries `
+                -CurrentInventory $tombstoneInventory `
+                -Code 'ASTRO_FSV_TERMINAL_PARTIAL_SESSION_DRIFT'
+            Remove-AstroOrdinaryDirectoryTreeLongPath `
+                -LiteralPath $sessionTombstonePath `
+                -ExpectedInventorySchema ([string]$tombstoneInventory.schema) `
+                -ExpectedInventoryEncoding ([string]$tombstoneInventory.encoding) `
+                -ExpectedInventorySha256 ([string]$tombstoneInventory.sha256)
+            if ((Test-AstroPathLongPath -LiteralPath $session) -or
+                (Test-AstroPathLongPath -LiteralPath $sessionTombstonePath)) {
+                Fail-Astro 'ASTRO_FSV_TERMINAL_PARTIAL_QUARANTINE_FAILED' `
+                    'session or tombstone remains after identity-bound removal' `
+                    'preserve the canonical transition and resume the exact transaction'
+            }
+            $completion = [ordered]@{
+                schema = 'astrolabe.native-fsv-terminal-partial-quarantine.completion.v1'
+                phase = 'complete-session-and-tombstone-absent'
+                issue = $Issue
+                completed_at_utc = [DateTime]::UtcNow.ToString('o')
+                authorization = [ordered]@{
+                    path = $recoveryRecord; sha256 = $authorizationSha256
+                }
+                retirement_completion = [ordered]@{
+                    path = $retirementCompletionPath
+                    sha256 = $retirementCompletionSha256
+                }
+                session = [ordered]@{
+                    path = $session
+                    state = 'absent'
+                    prior_inventory_sha256 = [string]$finalTree.sha256
+                }
+                tombstone = [ordered]@{
+                    path = $sessionTombstonePath
+                    state = 'absent'
+                }
+                fsv_lock = [ordered]@{ path = $fsvLock; state = 'absent' }
+            }
+            $completionPublication = Publish-NewAstroFsvProtocolRecord `
+                -Path $completionRecordPath -Value $completion `
+                -CodePrefix 'ASTRO_FSV_TERMINAL_PARTIAL_COMPLETION'
+            $persistedCompletion = $completionPublication.value
+            if ([string]$persistedCompletion.schema -cne
+                    'astrolabe.native-fsv-terminal-partial-quarantine.completion.v1' -or
+                [string]$persistedCompletion.phase -cne
+                    'complete-session-and-tombstone-absent' -or
+                [int]$persistedCompletion.issue -ne $Issue -or
+                [string]$persistedCompletion.authorization.sha256 -cne
+                    $authorizationSha256 -or
+                [string]$persistedCompletion.retirement_completion.sha256 -cne
+                    $retirementCompletionSha256 -or
+                [string]$persistedCompletion.session.prior_inventory_sha256 -cne
+                    [string]$finalTree.sha256 -or
+                [string]$persistedCompletion.session.state -cne 'absent' -or
+                [string]$persistedCompletion.tombstone.state -cne 'absent' -or
+                [string]$persistedCompletion.fsv_lock.state -cne 'absent' -or
+                -not [string]::Equals(
+                    [IO.Path]::GetFullPath([string]$persistedCompletion.authorization.path),
+                    $recoveryRecord,
+                    [StringComparison]::OrdinalIgnoreCase
+                ) -or
+                -not [string]::Equals(
+                    [IO.Path]::GetFullPath([string]$persistedCompletion.retirement_completion.path),
+                    $retirementCompletionPath,
+                    [StringComparison]::OrdinalIgnoreCase
+                ) -or
+                -not [string]::Equals(
+                    [IO.Path]::GetFullPath([string]$persistedCompletion.session.path),
+                    $session,
+                    [StringComparison]::OrdinalIgnoreCase
+                ) -or
+                -not [string]::Equals(
+                    [IO.Path]::GetFullPath([string]$persistedCompletion.tombstone.path),
+                    $sessionTombstonePath,
+                    [StringComparison]::OrdinalIgnoreCase
+                ) -or
+                -not [string]::Equals(
+                    [IO.Path]::GetFullPath([string]$persistedCompletion.fsv_lock.path),
+                    $fsvLock,
+                    [StringComparison]::OrdinalIgnoreCase
+                ) -or
+                (Test-AstroPathLongPath -LiteralPath $session) -or
+                (Test-AstroPathLongPath -LiteralPath $sessionTombstonePath) -or
+                (Test-AstroPathLongPath -LiteralPath $fsvLock)) {
+                Fail-Astro 'ASTRO_FSV_TERMINAL_PARTIAL_COMPLETION_INVALID' `
+                    'persisted completion does not prove session and FSV-lock absence' `
+                    'preserve all recovery records and inspect physical state'
+            }
+            Move-AstroFileWriteThroughNoReplace `
+                -Source $fsvLifecycleTransition -Destination $recoveryRecord
+            if ((Test-AstroPathLongPath -LiteralPath $fsvLifecycleTransition) -or
+                (File-Sha256 $recoveryRecord) -cne $authorizationSha256) {
+                Fail-Astro 'ASTRO_FSV_TERMINAL_PARTIAL_AUTHORIZATION_ARCHIVE_FAILED' `
+                    'canonical quarantine transition did not archive to the authorization record' `
+                    'preserve transition/authorization/completion state and resume the same transaction'
+            }
+            Remove-EmptyEvidenceParents $session
+            [ordered]@{
+                operation = 'quarantine-terminal-partial'
+                authorization_path = $recoveryRecord
+                authorization_sha256 = $authorizationSha256
+                completion_path = $completionRecordPath
+                completion_sha256 = File-Sha256 $completionRecordPath
+                authorization = $persistedAuthorization
+                completion = $persistedCompletion
+                before = [ordered]@{
+                    session = $session
+                    exists = $true
+                    inventory_sha256 = [string]$finalTree.sha256
+                }
+                after = [ordered]@{ session = $session; exists = $false }
+            } | ConvertTo-Json -Depth 28 -Compress | Write-Output
+            }
+            finally {
+                try { Exit-AstroLauncherLockMutex $launcherCoordinationMutex }
+                finally { Exit-AstroFsvLifecycleMutex $fsvLifecycleMutex }
+            }
         }
         'Quarantine' {
             $receiptState = Read-Receipt $ReceiptPath $evidenceRoot

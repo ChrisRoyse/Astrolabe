@@ -103,6 +103,27 @@ function File-Sha256([string]$Path) {
     finally { $hasher.Dispose(); $stream.Dispose() }
 }
 
+function Assert-AstroFsvLifecycleAdmissionClear([string]$Workspace) {
+    $state = Get-AstroFsvLifecycleInterruptionState -WorkspaceRoot $Workspace
+    if ($state.State -cne 'absent') {
+        Fail-Astro 'ASTRO_FSV_LIFECYCLE_TRANSITION_PRESENT' `
+            "native-FSV lifecycle state is '$($state.State)' (paths=$(@($state.Paths) -join ';'); error=$($state.Error))" `
+            'resume the exact durable lifecycle transaction before admitting another FSV generation'
+    }
+}
+
+function Enter-AstroFsvAdmissionLease([string]$Workspace) {
+    $lease = Enter-AstroFsvLifecycleMutex -WorkspaceRoot $Workspace
+    if (-not $lease.Acquired) {
+        $name = [string]$lease.Name
+        Exit-AstroFsvLifecycleMutex $lease
+        Fail-Astro 'ASTRO_FSV_LIFECYCLE_MUTEX_HELD' `
+            "native-FSV lifecycle mutex is held: $name" `
+            'wait for the exact active claim/recovery transaction to publish durable state'
+    }
+    return $lease
+}
+
 function File-Sha256UnderCleanupLease([string]$Path) {
     # The retained cleanup-readiness lease requests read/write/delete access while
     # sharing reads only. This independent reader must therefore share all access
@@ -280,10 +301,204 @@ function Observe-ExitedProcessCode(
     }
     return [ordered]@{
         exit_code = $kernelCode
+        exit_code_hex = ('0x{0:X8}' -f [uint64]$kernelCode)
         primary_source = 'kernel32!GetExitCodeProcess(PROCESS_INFORMATION.hProcess)'
         exact_duplicate_source = 'kernel32!GetExitCodeProcess(DuplicateHandle(PROCESS_INFORMATION.hProcess))'
         exact_duplicate_exit_code = $duplicateCode
+        exact_duplicate_exit_code_hex = ('0x{0:X8}' -f [uint64]$duplicateCode)
         sources_agree = $duplicateCode -eq $kernelCode
+    }
+}
+
+function Read-AstroFsvExitCodeObservation {
+    param(
+        [Parameter(Mandatory)][AllowNull()]$Observation,
+        [Parameter(Mandatory)][string]$Code,
+        [Parameter(Mandatory)][string]$Description
+    )
+
+    $requiredFields = @(
+        'exit_code', 'exit_code_hex', 'primary_source',
+        'exact_duplicate_source', 'exact_duplicate_exit_code',
+        'exact_duplicate_exit_code_hex', 'sources_agree'
+    )
+    if ($null -eq $Observation) {
+        Fail-Astro $Code `
+            "$Description is absent" `
+            'preserve the session and inspect the durable process observation'
+    }
+    $isDictionary = $Observation -is [Collections.IDictionary]
+    $actualFields = if ($isDictionary) {
+        @($Observation.Keys | ForEach-Object { [string]$_ })
+    }
+    else {
+        @($Observation.PSObject.Properties | ForEach-Object Name)
+    }
+    if (
+        $actualFields.Count -ne $requiredFields.Count -or
+        @($requiredFields | Where-Object {
+                $actualFields -cnotcontains $_
+            }).Count -ne 0) {
+        Fail-Astro $Code `
+            "$Description does not contain the exact exit-observation field set" `
+            'preserve the session and inspect the durable process observation'
+    }
+
+    $codes = [Collections.Generic.List[uint64]]::new()
+    foreach ($field in @('exit_code', 'exact_duplicate_exit_code')) {
+        $raw = if ($isDictionary) {
+            $Observation[$field]
+        }
+        else {
+            $Observation.$field
+        }
+        $text = if ($null -eq $raw) {
+            ''
+        }
+        else {
+            [Convert]::ToString(
+                $raw,
+                [Globalization.CultureInfo]::InvariantCulture
+            )
+        }
+        [uint64]$parsed = 0
+        if ($text -cnotmatch '^(0|[1-9][0-9]{0,9})$' -or
+            -not [uint64]::TryParse(
+                $text,
+                [Globalization.NumberStyles]::None,
+                [Globalization.CultureInfo]::InvariantCulture,
+                [ref]$parsed
+            ) -or
+            $parsed -gt [uint32]::MaxValue) {
+            Fail-Astro $Code `
+                "$Description $field is not one canonical unsigned 32-bit decimal value" `
+                'preserve the session and inspect the durable process observation'
+        }
+        $codes.Add($parsed)
+    }
+
+    $primaryHex = '0x{0:X8}' -f $codes[0]
+    $duplicateHex = '0x{0:X8}' -f $codes[1]
+    $primarySource =
+        'kernel32!GetExitCodeProcess(PROCESS_INFORMATION.hProcess)'
+    $duplicateSource =
+        'kernel32!GetExitCodeProcess(DuplicateHandle(PROCESS_INFORMATION.hProcess))'
+    $observedPrimaryHex = if ($isDictionary) {
+        [string]$Observation['exit_code_hex']
+    } else { [string]$Observation.exit_code_hex }
+    $observedDuplicateHex = if ($isDictionary) {
+        [string]$Observation['exact_duplicate_exit_code_hex']
+    } else { [string]$Observation.exact_duplicate_exit_code_hex }
+    $observedPrimarySource = if ($isDictionary) {
+        [string]$Observation['primary_source']
+    } else { [string]$Observation.primary_source }
+    $observedDuplicateSource = if ($isDictionary) {
+        [string]$Observation['exact_duplicate_source']
+    } else { [string]$Observation.exact_duplicate_source }
+    $observedAgreement = if ($isDictionary) {
+        $Observation['sources_agree']
+    } else { $Observation.sources_agree }
+    if ($observedPrimaryHex -cne $primaryHex -or
+        $observedDuplicateHex -cne
+            $duplicateHex -or
+        $observedPrimarySource -cne $primarySource -or
+        $observedDuplicateSource -cne $duplicateSource -or
+        $observedAgreement -isnot [bool] -or
+        [bool]$observedAgreement -ne ($codes[0] -eq $codes[1])) {
+        Fail-Astro $Code `
+            "$Description decimal/hex/source/agreement fields are internally inconsistent" `
+            'preserve the session and inspect the durable process observation'
+    }
+
+    return [ordered]@{
+        exit_code = [uint64]$codes[0]
+        exit_code_hex = $primaryHex
+        primary_source = $primarySource
+        exact_duplicate_source = $duplicateSource
+        exact_duplicate_exit_code = [uint64]$codes[1]
+        exact_duplicate_exit_code_hex = $duplicateHex
+        sources_agree = [bool]$observedAgreement
+    }
+}
+
+function Assert-AstroFsvExitCodeObservationReadback {
+    param(
+        [Parameter(Mandatory)]$Persisted,
+        [Parameter(Mandatory)]$Expected,
+        [Parameter(Mandatory)][string]$Code,
+        [Parameter(Mandatory)][string]$Description
+    )
+
+    $persistedObservation = Read-AstroFsvExitCodeObservation `
+        $Persisted $Code "$Description persisted observation"
+    $expectedObservation = Read-AstroFsvExitCodeObservation `
+        $Expected $Code "$Description in-memory observation"
+    foreach ($field in @(
+        'exit_code', 'exit_code_hex', 'primary_source',
+        'exact_duplicate_source', 'exact_duplicate_exit_code',
+        'exact_duplicate_exit_code_hex', 'sources_agree'
+    )) {
+        if ([string]$persistedObservation.$field -cne
+            [string]$expectedObservation.$field) {
+            Fail-Astro $Code `
+                "$Description persisted $field differs from the exact observed value" `
+                'preserve the session and investigate the failed durable write'
+        }
+    }
+    return $persistedObservation
+}
+
+function Assert-AstroFsvCohortProcessExitReadback {
+    param(
+        [Parameter(Mandatory)][object[]]$PersistedProcesses,
+        [Parameter(Mandatory)][object[]]$ExpectedStates,
+        [Parameter(Mandatory)][string]$Code,
+        [Parameter(Mandatory)][string]$Description
+    )
+
+    if ($PersistedProcesses.Count -ne $ExpectedStates.Count) {
+        Fail-Astro $Code `
+            "$Description process cardinality differs from the in-memory cohort" `
+            'preserve the session and investigate the failed durable write'
+    }
+    foreach ($expected in $ExpectedStates) {
+        $matches = @($PersistedProcesses | Where-Object {
+            [string]$_.role -ceq [string]$expected.role -and
+            [int]$_.ordinal -eq [int]$expected.ordinal
+        })
+        if ($matches.Count -ne 1) {
+            Fail-Astro $Code `
+                "$Description has no unique $($expected.role)/$($expected.ordinal) process record" `
+                'preserve the session and investigate the failed durable write'
+        }
+        $persisted = $matches[0]
+        if (-not $persisted.PSObject.Properties['exit_code'] -or
+            -not $persisted.PSObject.Properties['exit_code_observation'] -or
+            $null -eq $persisted.exit_code_observation -or
+            -not $persisted.PSObject.Properties['termination_proved'] -or
+            $persisted.termination_proved -isnot [bool] -or
+            -not $persisted.PSObject.Properties['exact_process_handles_closed'] -or
+            $persisted.exact_process_handles_closed -isnot [bool]) {
+            Fail-Astro $Code `
+                "$Description $($expected.role)/$($expected.ordinal) omits its exact exit/termination envelope" `
+                'preserve the session and investigate the failed durable write'
+        }
+        $normalized = Assert-AstroFsvExitCodeObservationReadback `
+            $persisted.exit_code_observation `
+            $expected.exit_code_observation `
+            $Code `
+            "$Description $($expected.role)/$($expected.ordinal) exit observation"
+        if ([uint64]$persisted.exit_code -ne
+                [uint64]$normalized.exit_code -or
+            [uint64]$persisted.exit_code -ne [uint64]$expected.exit_code -or
+            [bool]$persisted.termination_proved -ne
+                [bool]$expected.termination_proved -or
+            [bool]$persisted.exact_process_handles_closed -ne
+                [bool]$expected.handles_closed) {
+            Fail-Astro $Code `
+                "$Description $($expected.role)/$($expected.ordinal) exit/termination fields differ from the exact observed state" `
+                'preserve the session and investigate the failed durable write'
+        }
     }
 }
 
@@ -570,8 +785,22 @@ public sealed class AstroFsvCreatedProcess : IDisposable {
     const uint WAIT_FAILED = 0xFFFFFFFF;
     const uint INFINITE = 0xFFFFFFFF;
     const uint DUPLICATE_SAME_ACCESS = 0x00000002;
-    const uint DUPLICATE_FAILURE_EXIT_CODE = 0xA57F0002;
+    const uint BIND_FAILURE_EXIT_CODE = 0xA57F0001U;
+    const uint DUPLICATE_FAILURE_EXIT_CODE = 0xA57F0002U;
+    const uint COHORT_FAILURE_EXIT_CODE = 0xA57F0003U;
     const uint DUPLICATE_FAILURE_WAIT_MS = 30000;
+
+    public static uint BindFailureExitCode {
+        get { return BIND_FAILURE_EXIT_CODE; }
+    }
+
+    public static uint DuplicateFailureExitCode {
+        get { return DUPLICATE_FAILURE_EXIT_CODE; }
+    }
+
+    public static uint CohortFailureExitCode {
+        get { return COHORT_FAILURE_EXIT_CODE; }
+    }
 
     IntPtr threadHandle;
     bool disposed;
@@ -894,7 +1123,15 @@ public sealed class AstroFsvCreatedProcess : IDisposable {
         EnsureUsable();
     }
 
-    public void TerminateAndWait(uint exitCode, uint timeoutMilliseconds) {
+    public void TerminateAfterBindFailureAndWait(uint timeoutMilliseconds) {
+        TerminateAndWait(BIND_FAILURE_EXIT_CODE, timeoutMilliseconds);
+    }
+
+    public void TerminateAfterCohortFailureAndWait(uint timeoutMilliseconds) {
+        TerminateAndWait(COHORT_FAILURE_EXIT_CODE, timeoutMilliseconds);
+    }
+
+    void TerminateAndWait(uint exitCode, uint timeoutMilliseconds) {
         EnsureUsable();
 
         if (!TerminateProcess(ProcessHandle, exitCode)) {
@@ -2721,18 +2958,25 @@ function Invoke-AstroResidentCohort {
             }
             phase = 'claimed'
         }
-        $lockStage = "$FsvLockPath.$PID.tmp"
-        Write-NewDurableUtf8 $lockStage ($lockManifest | ConvertTo-Json -Depth 15 -Compress)
-        try { [AstroFsvAtomicFile]::PublishNoClobber($lockStage, $FsvLockPath) }
-        catch {
-            if (Test-AstroPathLongPath -LiteralPath $lockStage -PathType Leaf) {
-                Remove-AstroFileLongPath $lockStage
+        $admissionLease = Enter-AstroFsvAdmissionLease $Workspace
+        try {
+            Assert-AstroFsvLifecycleAdmissionClear $Workspace
+            $lockStage = "$FsvLockPath.$PID.tmp"
+            Write-NewDurableUtf8 $lockStage ($lockManifest | ConvertTo-Json -Depth 15 -Compress)
+            try { [AstroFsvAtomicFile]::PublishNoClobber($lockStage, $FsvLockPath) }
+            catch {
+                if (Test-AstroPathLongPath -LiteralPath $lockStage -PathType Leaf) {
+                    Remove-AstroFileLongPath $lockStage
+                }
+                Fail-Astro 'ASTRO_FSV_LOCK_HELD' `
+                    "FSV lock could not be claimed for resident cohort: $FsvLockPath" `
+                    'wait for the live owner or complete the exact tracker-bound stale-lock lifecycle'
             }
-            Fail-Astro 'ASTRO_FSV_LOCK_HELD' `
-                "FSV lock could not be claimed for resident cohort: $FsvLockPath" `
-                'wait for the live owner or complete the exact tracker-bound stale-lock lifecycle'
+            $lockOwned = $true
         }
-        $lockOwned = $true
+        finally {
+            Exit-AstroFsvLifecycleMutex $admissionLease
+        }
         Write-NewDurableUtf8 $StandardOutputPath ''
         Write-NewDurableUtf8 $StandardErrorPath ''
         Write-AstroFsvEventLine $StandardOutputPath ([ordered]@{
@@ -3148,6 +3392,11 @@ function Invoke-AstroResidentCohort {
             'ASTRO_FSV_RUN_READBACK_FAILED' 'cohort run-record process set'
         $persistedRunRunner = Read-AstroFsvProcessIdentity $persistedRun.runner `
             'ASTRO_FSV_RUN_READBACK_FAILED' 'cohort run-record runner identity'
+        Assert-AstroFsvCohortProcessExitReadback `
+            ([object[]]@($persistedRun.processes)) `
+            ([object[]]$processStates.ToArray()) `
+            'ASTRO_FSV_RUN_READBACK_FAILED' `
+            'cohort run-record process set'
         if ([string]$persistedRun.schema -cne 'astrolabe.native-fsv-run.v3' -or
             [string]$persistedRun.verdict -cne 'verified' -or
             [int]$persistedRun.resident_count -ne $plan.resident_count -or
@@ -3173,7 +3422,7 @@ function Invoke-AstroResidentCohort {
                 try {
                     if (-not [bool]$state.termination_proved) {
                         if (-not $state.native.HasExited) {
-                            $state.native.TerminateAndWait([uint32]0xA57F0003, [uint32]30000)
+                            $state.native.TerminateAfterCohortFailureAndWait([uint32]30000)
                         }
                         elseif (-not $state.native.WaitForExit([uint32]0)) {
                             throw 'exact process handle was unexpectedly unsignaled'
@@ -3295,6 +3544,11 @@ function Invoke-AstroResidentCohort {
                     [int]$persistedFailure.process_count -ne $processStates.Count) {
                     throw 'persisted v3 cohort failure record differs from exact observed state'
                 }
+                Assert-AstroFsvCohortProcessExitReadback `
+                    ([object[]]@($persistedFailure.processes)) `
+                    ([object[]]$processStates.ToArray()) `
+                    'ASTRO_FSV_COHORT_FAILURE_RECORD_READBACK_FAILED' `
+                    'cohort failure-record process set'
                 $runRecordWritten = $true
             }
             catch {
@@ -3360,6 +3614,7 @@ $arguments = [string[]]::new(0)
 $argumentCount = 0
 $argumentSource = $null
 $argumentsFileHandle = $null
+$bindCleanupDiagnostic = $null
 
 try {
     if ($Issue -le 0) { Fail-Astro 'ASTRO_FSV_ISSUE_INVALID' 'Issue must be positive' 'pass the driving GitHub issue number' }
@@ -3652,7 +3907,6 @@ try {
             -LiveStatePath $LiveStatePath
         return
     }
-    $lockStage = "$fsvLockPath.$PID.tmp"
     $lockManifest = [ordered]@{
         schema = 'astrolabe.native-fsv-lock.v2'
         issue = $Issue
@@ -3675,15 +3929,23 @@ try {
         }
         phase = 'claimed'
     }
-    Write-NewDurableUtf8 $lockStage ($lockManifest | ConvertTo-Json -Depth 10 -Compress)
-    try { [AstroFsvAtomicFile]::PublishNoClobber($lockStage, $fsvLockPath) }
-    catch {
-        if (Test-AstroPathLongPath -LiteralPath $lockStage -PathType Leaf) {
-            Remove-AstroFileLongPath $lockStage
+    $admissionLease = Enter-AstroFsvAdmissionLease $workspace
+    try {
+        Assert-AstroFsvLifecycleAdmissionClear $workspace
+        $lockStage = "$fsvLockPath.$PID.tmp"
+        Write-NewDurableUtf8 $lockStage ($lockManifest | ConvertTo-Json -Depth 10 -Compress)
+        try { [AstroFsvAtomicFile]::PublishNoClobber($lockStage, $fsvLockPath) }
+        catch {
+            if (Test-AstroPathLongPath -LiteralPath $lockStage -PathType Leaf) {
+                Remove-AstroFileLongPath $lockStage
+            }
+            Fail-Astro 'ASTRO_FSV_LOCK_HELD' "FSV lock could not be claimed without clobbering: $fsvLockPath" 'wait for the live owner or post dead-owner evidence before removing a stale lock'
         }
-        Fail-Astro 'ASTRO_FSV_LOCK_HELD' "FSV lock could not be claimed without clobbering: $fsvLockPath" 'wait for the live owner or post dead-owner evidence before removing a stale lock'
+        $fsvLockOwned = $true
     }
-    $fsvLockOwned = $true
+    finally {
+        Exit-AstroFsvLifecycleMutex $admissionLease
+    }
 
     $commandLine = ConvertTo-WindowsCommandLineArgument $artifact
     if ($argumentCount -gt 0) {
@@ -3707,25 +3969,90 @@ try {
         [void]$createdChild.BindAndResume()
     }
     catch {
-        $bindFailure = $_.Exception.Message
+        $bindFailure = $_
+        $bindFailureDiagnostic = [ordered]@{
+            message = $bindFailure.Exception.Message
+            exception_type = $bindFailure.Exception.GetType().FullName
+            native_error = Get-AstroNativeErrorCode $bindFailure.Exception
+            script_stack_trace = Failure-Text $bindFailure.ScriptStackTrace
+            invocation = Failure-Text $bindFailure.InvocationInfo.PositionMessage
+        }
+        [uint64]$expectedBindExitCode =
+            [AstroFsvCreatedProcess]::BindFailureExitCode
+        $expectedBindExitCodeHex = '0x{0:X8}' -f $expectedBindExitCode
         try {
-            $createdChild.TerminateAndWait([uint32]0xA57F0001, [uint32]30000)
+            $createdChild.TerminateAfterBindFailureAndWait([uint32]30000)
         }
         catch {
             $childTerminationUncertain = $true
-            Fail-Astro 'ASTRO_FSV_CHILD_BIND_CLEANUP_FAILED' "exact child PID $($createdChild.ProcessId) could not be bound/resumed and exact termination could not be proved (bind_failure=$bindFailure; termination_failure=$($_.Exception.Message))" 'preserve the launcher/FSV state and use exact process/Job attribution before any cleanup'
-        }
-        try {
-            foreach ($createdOutput in @($StandardOutputPath, $StandardErrorPath)) {
-                if (Test-AstroPathLongPath -LiteralPath $createdOutput -PathType Leaf) {
-                    Remove-AstroFileLongPath $createdOutput
+            $bindCleanupDiagnostic = [ordered]@{
+                bind_failure = $bindFailureDiagnostic
+                termination = [ordered]@{
+                    operation = 'TerminateAfterBindFailureAndWait'
+                    expected_exit_code = $expectedBindExitCode
+                    expected_exit_code_hex = $expectedBindExitCodeHex
+                    proved = $false
+                    failure = [ordered]@{
+                        message = $_.Exception.Message
+                        exception_type = $_.Exception.GetType().FullName
+                        native_error = Get-AstroNativeErrorCode $_.Exception
+                    }
                 }
+                outputs_preserved = $true
             }
+            Fail-Astro 'ASTRO_FSV_CHILD_BIND_CLEANUP_FAILED' `
+                "exact child PID $($createdChild.ProcessId) could not be bound/resumed and exact termination could not be proved (diagnostic=$($bindCleanupDiagnostic | ConvertTo-Json -Depth 10 -Compress))" `
+                'preserve the launcher/FSV state and use exact process/Job attribution before any cleanup'
+        }
+
+        $childTerminationProved = $true
+        $childExitedAtUtc = [DateTime]::UtcNow.ToString('o')
+        try {
+            $childExitObservation = Observe-ExitedProcessCode $createdChild
+            $childExitCode = [uint32]$childExitObservation.exit_code
         }
         catch {
-            Fail-Astro 'ASTRO_FSV_CHILD_BIND_OUTPUT_CLEANUP_FAILED' "exact child PID $($createdChild.ProcessId) was terminated after process binding failed, but an output created by that never-executed child could not be removed (bind_failure=$bindFailure; output_cleanup_failure=$($_.Exception.Message))" 'preserve the staged session and inspect the exact output path/handle state before lifecycle recovery'
+            $childExitObservationError = $_.Exception.Message
+            $bindCleanupDiagnostic = [ordered]@{
+                bind_failure = $bindFailureDiagnostic
+                termination = [ordered]@{
+                    operation = 'TerminateAfterBindFailureAndWait'
+                    expected_exit_code = $expectedBindExitCode
+                    expected_exit_code_hex = $expectedBindExitCodeHex
+                    proved = $true
+                    observation_error = $childExitObservationError
+                }
+                outputs_preserved = $true
+            }
+            Fail-Astro 'ASTRO_FSV_CHILD_BIND_EXIT_OBSERVATION_FAILED' `
+                "exact child PID $($createdChild.ProcessId) termination completed after bind/resume failure, but durable exit observation failed (diagnostic=$($bindCleanupDiagnostic | ConvertTo-Json -Depth 10 -Compress))" `
+                'preserve the FSV lock/session and repair exact retained-handle exit observation'
         }
-        Fail-Astro 'ASTRO_FSV_CHILD_BIND_FAILED' "exact child PID $($createdChild.ProcessId) was created suspended but binding/resume failed; exact termination completed (failure=$bindFailure)" 'preserve the durable failed-run record and repair native process binding before rerunning'
+        $normalizedBindObservation = Read-AstroFsvExitCodeObservation `
+            $childExitObservation `
+            'ASTRO_FSV_CHILD_BIND_EXIT_OBSERVATION_INVALID' `
+            'bind-failure cleanup exit observation'
+        $bindCleanupDiagnostic = [ordered]@{
+            bind_failure = $bindFailureDiagnostic
+            termination = [ordered]@{
+                operation = 'TerminateAfterBindFailureAndWait'
+                expected_exit_code = $expectedBindExitCode
+                expected_exit_code_hex = $expectedBindExitCodeHex
+                proved = $true
+                observation = $normalizedBindObservation
+            }
+            outputs_preserved = $true
+        }
+        if (-not [bool]$normalizedBindObservation.sources_agree -or
+            [uint64]$normalizedBindObservation.exit_code -ne
+                $expectedBindExitCode) {
+            Fail-Astro 'ASTRO_FSV_CHILD_BIND_CLEANUP_STATUS_MISMATCH' `
+                "exact child PID $($createdChild.ProcessId) terminated after bind/resume failure with a different retained-handle status (diagnostic=$($bindCleanupDiagnostic | ConvertTo-Json -Depth 10 -Compress))" `
+                'preserve the FSV lock/session and investigate the exact child lifecycle transition'
+        }
+        Fail-Astro 'ASTRO_FSV_CHILD_BIND_FAILED' `
+            "exact child PID $($createdChild.ProcessId) was created suspended but binding/resume failed; exact termination and dual-handle status readback completed (diagnostic=$($bindCleanupDiagnostic | ConvertTo-Json -Depth 10 -Compress))" `
+            'preserve the durable failed-run record and repair native process binding before rerunning'
     }
     if ($null -eq $childProcessHandle -or $childProcessHandle.IsInvalid -or $childProcessHandle.IsClosed) {
         Fail-Astro 'ASTRO_FSV_CHILD_HANDLE_UNAVAILABLE' "native child PID $($child.Id) did not retain its exact CreateProcessW process handle" 'preserve the session and repair native process launch before rerunning'
@@ -4267,6 +4594,12 @@ try {
         $persistedRecord.process.identity `
         'ASTRO_FSV_RUN_READBACK_FAILED' `
         'persisted run-record child identity'
+    $persistedChildExitObservation =
+        Assert-AstroFsvExitCodeObservationReadback `
+            $persistedRecord.process.exit_code_observation `
+            $childExitObservation `
+            'ASTRO_FSV_RUN_READBACK_FAILED' `
+            'run-record child exit observation'
     if ([string]$persistedRecord.live_state.path -cne
             $LiveStatePath -or
         -not [bool]$persistedRecord.live_state.published -or
@@ -4275,8 +4608,8 @@ try {
         [string]$persistedRecord.live_state.sha256 -cne
             $liveStateSha256 -or
         [uint64]$persistedRecord.process.exit_code -ne [uint64]$childExitCode -or
-        [string]$persistedRecord.process.exit_code_observation.primary_source -cne [string]$childExitObservation.primary_source -or
-        [bool]$persistedRecord.process.exit_code_observation.sources_agree -ne [bool]$childExitObservation.sources_agree -or
+        [uint64]$persistedRecord.process.exit_code -ne
+            [uint64]$persistedChildExitObservation.exit_code -or
         [string]$persistedRecord.artifact.sha256 -cne $artifactHashAfter -or
         [bool]$persistedRecord.fsv_lock_cleanup.after_exists -ne $false -or
         -not (Test-AstroFsvIdentityEqual `
@@ -4415,6 +4748,7 @@ catch {
                     sha256 = if (Test-AstroPathLongPath -LiteralPath $StandardErrorPath -PathType Leaf) { File-Sha256 $StandardErrorPath } else { $null }
                 }
                 fsv_lock_cleanup = $fsvLockCleanup
+                bind_cleanup = $bindCleanupDiagnostic
                 failure = [ordered]@{
                     code = $code
                     message = $failure.Exception.Message
@@ -4439,9 +4773,19 @@ catch {
                 -not $persistedFailure.process.PSObject.Properties[
                     'identity'
                 ] -or
+                -not $persistedFailure.process.PSObject.Properties[
+                    'exit_code'
+                ] -or
+                -not $persistedFailure.process.PSObject.Properties[
+                    'exit_code_observation'
+                ] -or
+                -not $persistedFailure.process.PSObject.Properties[
+                    'exit_code_observation_error'
+                ] -or
                 -not $persistedFailure.PSObject.Properties['failure'] -or
                 $null -eq $persistedFailure.failure -or
                 -not $persistedFailure.failure.PSObject.Properties['code'] -or
+                -not $persistedFailure.PSObject.Properties['bind_cleanup'] -or
                 -not $persistedFailure.PSObject.Properties['argument_source'] -or
                 $null -eq $persistedFailure.argument_source -or
                 -not $persistedFailure.PSObject.Properties['live_state'] -or
@@ -4465,9 +4809,44 @@ catch {
                 $persistedFailure.process.identity `
                 'ASTRO_FSV_FAILURE_RECORD_READBACK_FAILED' `
                 'persisted failure-record child identity'
+            if ($null -ne $childExitObservation) {
+                [void](Assert-AstroFsvExitCodeObservationReadback `
+                    $persistedFailure.process.exit_code_observation `
+                    $childExitObservation `
+                    'ASTRO_FSV_FAILURE_RECORD_READBACK_FAILED' `
+                    'failure-record child exit observation')
+            }
+            elseif ($null -ne
+                $persistedFailure.process.exit_code_observation) {
+                Fail-Astro 'ASTRO_FSV_FAILURE_RECORD_READBACK_FAILED' `
+                    'persisted failure record invented a child exit observation' `
+                    'preserve the session and investigate the failed durable write'
+            }
+            $persistedBindCleanup = if ($null -eq
+                $persistedFailure.bind_cleanup) {
+                $null
+            }
+            else {
+                $persistedFailure.bind_cleanup | ConvertTo-Json -Depth 15 -Compress
+            }
+            $expectedBindCleanup = if ($null -eq $bindCleanupDiagnostic) {
+                $null
+            }
+            else {
+                $bindCleanupDiagnostic | ConvertTo-Json -Depth 15 -Compress
+            }
             if ($persistedFailure.schema -cne
                     'astrolabe.native-fsv-run.v2' -or
                 [string]$persistedFailure.failure.code -cne $code -or
+                [string]$persistedBindCleanup -cne
+                    [string]$expectedBindCleanup -or
+                [string]$persistedFailure.process.exit_code_observation_error -cne
+                    [string](Failure-Text $childExitObservationError) -or
+                ($null -ne $childExitObservation -and
+                    [uint64]$persistedFailure.process.exit_code -ne
+                        [uint64]$childExitObservation.exit_code) -or
+                ($null -eq $childExitObservation -and
+                    $null -ne $persistedFailure.process.exit_code) -or
                 -not (Test-AstroFsvIdentityEqual `
                     $persistedFailureLauncher $launcherIdentity) -or
                 -not (Test-AstroFsvIdentityEqual `
