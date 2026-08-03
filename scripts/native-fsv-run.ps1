@@ -3028,7 +3028,7 @@ function Invoke-AstroResidentCohort {
                 created_suspended_at_utc = [DateTime]::UtcNow.ToString('o')
                 started_at_utc = $null; exited_at_utc = $null
                 exit_code = $null; exit_code_observation = $null
-                termination_proved = $false; handles_closed = $false
+                termination_proved = $false; stderr_captured = $false; handles_closed = $false
             }
             $processStates.Add($state)
             try { & $publishLock 'creating' }
@@ -3061,7 +3061,7 @@ function Invoke-AstroResidentCohort {
             created_suspended_at_utc = [DateTime]::UtcNow.ToString('o')
             started_at_utc = $null; exited_at_utc = $null
             exit_code = $null; exit_code_observation = $null
-            termination_proved = $false; handles_closed = $false
+            termination_proved = $false; stderr_captured = $false; handles_closed = $false
         })
         & $publishLock 'suspended'
 
@@ -3206,6 +3206,7 @@ function Invoke-AstroResidentCohort {
             identity = $indexer.identity; at_utc = [DateTime]::UtcNow.ToString('o')
             stderr_sha256 = String-Sha256 $indexerStderr; stderr = $indexerStderr
         })
+        $indexer.stderr_captured = $true
         if (-not [bool]$indexer.exit_code_observation.sources_agree -or
             $indexer.exit_code -ne 0 -or
             $indexerStdout.IndexOf($plan.indexer_expected_substring, [StringComparison]::Ordinal) -lt 0) {
@@ -3258,6 +3259,7 @@ function Invoke-AstroResidentCohort {
                 exit_code_observation = $state.exit_code_observation
                 stderr_sha256 = String-Sha256 $stderrText; stderr = $stderrText
             })
+            $state.stderr_captured = $true
             if (-not [bool]$state.exit_code_observation.sources_agree -or
                 $state.exit_code -ne 0) {
                 Fail-Astro 'ASTRO_FSV_COHORT_RESIDENT_EXIT_FAILED' `
@@ -3463,6 +3465,29 @@ function Invoke-AstroResidentCohort {
                 }
             }
             if (-not [bool]$state.termination_proved) { $allTerminationProved = $false }
+        }
+        if ($allTerminationProved) {
+            foreach ($state in $processStates) {
+                if ([bool]$state.stderr_captured) { continue }
+                try {
+                    $stderrText = $state.native.GetErrorText([uint32]$plan.response_timeout_ms)
+                    Write-AstroFsvEventLine $StandardErrorPath ([ordered]@{
+                        event = 'process_stderr'; role = [string]$state.role
+                        ordinal = [int]$state.ordinal; identity = $state.identity
+                        at_utc = [DateTime]::UtcNow.ToString('o')
+                        exit_code = $state.exit_code
+                        exit_code_observation = $state.exit_code_observation
+                        stderr_sha256 = String-Sha256 $stderrText; stderr = $stderrText
+                        captured_during_failure_recovery = $true
+                    })
+                    $state.stderr_captured = $true
+                }
+                catch {
+                    [Console]::Error.WriteLine(
+                        "NATIVE_FSV[ASTRO_FSV_COHORT_STDERR_CAPTURE_FAILED]: role=$($state.role); ordinal=$($state.ordinal); identity=$($state.identity | ConvertTo-Json -Compress); error=$($_.Exception.Message)"
+                    )
+                }
+            }
         }
         $code = if ($failure.Exception.Data.Contains('AstroCode')) {
             [string]$failure.Exception.Data['AstroCode']
