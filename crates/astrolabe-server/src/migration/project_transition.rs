@@ -1,12 +1,15 @@
 use super::*;
 
-use astrolabe_bridge::{CbmProjectQuiescence, CbmProjectTransition};
+use astrolabe_bridge::{
+    CbmProjectQuiescence, CbmProjectQuiescenceError, CbmProjectTransition,
+    normalize_existing_project_store,
+};
 use astrolabe_domain::knobs::{
     PROJECT_TRANSITION_QUIESCENCE_TIMEOUT_MS, WATCHER_DEFAULT_POLL_INTERVAL_MS,
 };
 
 pub(crate) const PROJECT_TRANSITION_STATUS_KEY: &str = "project_transition_json";
-const PROJECT_TRANSITION_WORKER_GRANT_SCHEMA: &str = "astrolabe-project-transition-worker-grant-v2";
+const PROJECT_TRANSITION_WORKER_GRANT_SCHEMA: &str = "astrolabe-project-transition-worker-grant-v3";
 
 #[derive(Debug, Clone)]
 pub(crate) struct ProjectTransitionWorkerGrant {
@@ -226,7 +229,8 @@ pub(crate) fn validate_index_worker_transition_grant(
         && receipt
             .pointer("/owner/process_start_utc_ticks")
             .and_then(Value::as_u64)
-            == Some(grant.owner.process_start_utc_ticks);
+            == Some(grant.owner.process_start_utc_ticks)
+        && normalization_receipt_matches(&receipt);
     if !receipt_matches {
         return Err(format!(
             "ASTRO_PROJECT_TRANSITION_WORKER_RECEIPT_MISMATCH: durable transition row {key:?} does not equal the granted quiesced generation; remediation: preserve its bytes and refuse the worker"
@@ -254,6 +258,66 @@ pub(crate) fn validate_index_worker_transition_grant(
     }
 
     Ok(grant.project)
+}
+
+fn normalization_receipt_matches(receipt: &Value) -> bool {
+    let Some(normalization) = receipt.get("normalization") else {
+        return false;
+    };
+    let holder_clear = normalization
+        .pointer("/post_close_quiescence/holder_inventory_stable")
+        .and_then(Value::as_bool)
+        == Some(true)
+        && normalization
+            .pointer("/post_close_quiescence/holder_count")
+            .and_then(Value::as_u64)
+            == Some(0);
+    match normalization.get("status").and_then(Value::as_str) {
+        Some("absent") => {
+            holder_clear
+                && normalization
+                    .pointer("/before/db/present")
+                    .and_then(Value::as_bool)
+                    == Some(false)
+                && normalization
+                    .pointer("/before/wal/present")
+                    .and_then(Value::as_bool)
+                    == Some(false)
+                && normalization
+                    .pointer("/before/shm/present")
+                    .and_then(Value::as_bool)
+                    == Some(false)
+                && normalization.get("before") == normalization.get("after")
+        }
+        Some("normalized") => {
+            holder_clear
+                && normalization
+                    .pointer("/native/journal_mode_after")
+                    .and_then(Value::as_str)
+                    == Some("delete")
+                && normalization
+                    .pointer("/native/wal_remaining_frames")
+                    .and_then(Value::as_i64)
+                    == Some(0)
+                && normalization
+                    .pointer("/native/close_connection_destroyed")
+                    .and_then(Value::as_bool)
+                    == Some(true)
+                && normalization
+                    .pointer("/after/db/present")
+                    .and_then(Value::as_bool)
+                    == Some(true)
+                && normalization
+                    .pointer("/after/wal/present")
+                    .and_then(Value::as_bool)
+                    == Some(false)
+                && normalization
+                    .pointer("/after/shm/present")
+                    .and_then(Value::as_bool)
+                    == Some(false)
+        }
+        _ => false,
+    }
 }
 
 pub(crate) fn run_project_index_transition(
@@ -310,6 +374,7 @@ struct ProjectIndexTransition<'a> {
     recovered_abandoned_owner: bool,
     acquired_unix_ms: u128,
     quiescence: CbmProjectQuiescence,
+    normalization: Value,
     recovery: Value,
 }
 
@@ -378,7 +443,16 @@ impl<'a> ProjectIndexTransition<'a> {
                 attempts: 0,
                 native_error: 0,
                 failed_path: String::new(),
+                holder_probe_status: 0,
+                holder_probe_native_error: 0,
+                holder_inventory_stable: false,
+                holder_count: 0,
+                first_holder_process_id: 0,
+                first_holder_process_start_utc_ticks: 0,
+                holder_probe_operation: String::new(),
+                first_holder_path: String::new(),
             },
+            normalization: json!({"status": "pending"}),
             recovery: prior.recovery,
         };
         transition.persist("active", json!({}))?;
@@ -400,12 +474,145 @@ impl<'a> ProjectIndexTransition<'a> {
             ) {
             Ok(quiescence) => transition.quiescence = quiescence,
             Err(error) => {
+                let CbmProjectQuiescenceError { error, evidence } = error;
+                transition.quiescence = *evidence;
                 transition.persist("quiescence_failed", json!({"error": error.to_string()}))?;
                 return Err(error.into());
             }
         }
+        match transition.normalize_store_family() {
+            Ok(normalization) => transition.normalization = normalization,
+            Err(error) => {
+                transition.normalization = json!({
+                    "status": "normalization_failed",
+                    "error": error.to_string(),
+                    "family_after_failure": sqlite_family_evidence(&transition.db_path)
+                        .unwrap_or_else(|read_error| json!({"read_error": read_error.to_string()})),
+                });
+                transition.persist("normalization_failed", json!({"error": error.to_string()}))?;
+                return Err(error);
+            }
+        }
         transition.persist("quiesced", json!({}))?;
         Ok(transition)
+    }
+
+    fn normalize_store_family(&self) -> Result<Value, DynError> {
+        let before = sqlite_family_evidence(&self.db_path)?;
+        let db_present = before
+            .pointer("/db/present")
+            .and_then(Value::as_bool)
+            .ok_or_else(|| -> DynError {
+                "ASTRO_PROJECT_NORMALIZATION_DB_EVIDENCE_INVALID: DB presence is missing from the physical family readback".into()
+            })?;
+        let wal_present = before
+            .pointer("/wal/present")
+            .and_then(Value::as_bool)
+            .unwrap_or(true);
+        let shm_present = before
+            .pointer("/shm/present")
+            .and_then(Value::as_bool)
+            .unwrap_or(true);
+        if !db_present {
+            if wal_present || shm_present {
+                return Err(format!(
+                    "ASTRO_PROJECT_NORMALIZATION_ORPHAN_SIDECAR: DB is absent but WAL/SHM is present for {}; remediation: preserve the complete family and inspect the orphaned SQLite state",
+                    self.db_path.display()
+                )
+                .into());
+            }
+            let post_quiescence = self.post_normalization_quiescence()?;
+            let after = sqlite_family_evidence(&self.db_path)?;
+            if after != before {
+                return Err(format!(
+                    "ASTRO_PROJECT_NORMALIZATION_ABSENT_DRIFT: absent family changed between independent readbacks for {}; remediation: preserve the observed paths and inspect the concurrent owner",
+                    self.db_path.display()
+                )
+                .into());
+            }
+            return Ok(json!({
+                "status": "absent",
+                "before": before,
+                "after": after,
+                "post_close_quiescence": quiescence_json(&post_quiescence),
+            }));
+        }
+
+        let db_path = self.db_path.to_str().ok_or_else(|| -> DynError {
+            format!(
+                "ASTRO_PROJECT_NORMALIZATION_DB_PATH_NOT_UTF8: {} cannot cross the native writer boundary",
+                self.db_path.display()
+            )
+            .into()
+        })?;
+        let normalized = normalize_existing_project_store(db_path, &self.project)?;
+        if normalized.journal_mode_after != "delete"
+            || !normalized.close_connection_destroyed
+            || normalized.wal_remaining_frames != 0
+        {
+            return Err(format!(
+                "ASTRO_PROJECT_NORMALIZATION_RESULT_INVALID: native normalization returned after={:?}, close_destroyed={}, remaining_frames={}; remediation: preserve the family and repair the native normalization contract",
+                normalized.journal_mode_after,
+                normalized.close_connection_destroyed,
+                normalized.wal_remaining_frames
+            )
+            .into());
+        }
+        let post_quiescence = self.post_normalization_quiescence()?;
+        let after = sqlite_family_evidence(&self.db_path)?;
+        let after_db = after.pointer("/db/present").and_then(Value::as_bool) == Some(true);
+        let after_wal = after
+            .pointer("/wal/present")
+            .and_then(Value::as_bool)
+            .unwrap_or(true);
+        let after_shm = after
+            .pointer("/shm/present")
+            .and_then(Value::as_bool)
+            .unwrap_or(true);
+        if !after_db || after_wal || after_shm {
+            return Err(format!(
+                "ASTRO_PROJECT_NORMALIZATION_FAMILY_READBACK_FAILED: post-close family for {} has db_present={after_db}, wal_present={after_wal}, shm_present={after_shm}; remediation: preserve every byte and inspect the exact later SQLite owner",
+                self.db_path.display()
+            )
+            .into());
+        }
+        Ok(json!({
+            "status": "normalized",
+            "before": before,
+            "native": {
+                "journal_mode_before": normalized.journal_mode_before,
+                "journal_mode_after": normalized.journal_mode_after,
+                "sqlite_error": normalized.sqlite_error,
+                "wal_log_frames": normalized.wal_log_frames,
+                "wal_checkpointed_frames": normalized.wal_checkpointed_frames,
+                "wal_remaining_frames": normalized.wal_remaining_frames,
+                "operation": normalized.operation,
+                "detail": normalized.detail,
+                "close_connection_destroyed": normalized.close_connection_destroyed,
+                "close_db_path": normalized.close_db_path,
+            },
+            "after": after,
+            "post_close_quiescence": quiescence_json(&post_quiescence),
+        }))
+    }
+
+    fn post_normalization_quiescence(&self) -> Result<CbmProjectQuiescence, DynError> {
+        let db_path = self.db_path.to_str().ok_or_else(|| -> DynError {
+            format!(
+                "ASTRO_PROJECT_NORMALIZATION_DB_PATH_NOT_UTF8: {} cannot cross the native quiescence boundary",
+                self.db_path.display()
+            )
+            .into()
+        })?;
+        self.native
+            .as_ref()
+            .expect("live project transition")
+            .wait_store_quiescent(
+                db_path,
+                u32::try_from(PROJECT_TRANSITION_QUIESCENCE_TIMEOUT_MS)?,
+                u32::try_from(WATCHER_DEFAULT_POLL_INTERVAL_MS)?,
+            )
+            .map_err(|failure| failure.error.into())
     }
 
     fn finish(&mut self, terminal: Value) -> Result<(), DynError> {
@@ -437,7 +644,16 @@ impl<'a> ProjectIndexTransition<'a> {
                 "attempts": self.quiescence.attempts,
                 "native_error": self.quiescence.native_error,
                 "failed_path": self.quiescence.failed_path,
+                "holder_probe_status": self.quiescence.holder_probe_status,
+                "holder_probe_native_error": self.quiescence.holder_probe_native_error,
+                "holder_inventory_stable": self.quiescence.holder_inventory_stable,
+                "holder_count": self.quiescence.holder_count,
+                "first_holder_process_id": self.quiescence.first_holder_process_id,
+                "first_holder_process_start_utc_ticks": self.quiescence.first_holder_process_start_utc_ticks,
+                "holder_probe_operation": self.quiescence.holder_probe_operation,
+                "first_holder_path": self.quiescence.first_holder_path,
             },
+            "normalization": self.normalization,
             "evidence": evidence,
         }))?;
         let key = metadata_key(&self.project, PROJECT_TRANSITION_STATUS_KEY);
@@ -451,6 +667,85 @@ impl<'a> ProjectIndexTransition<'a> {
         }
         Ok(())
     }
+}
+
+fn sqlite_family_member_path(db_path: &Path, suffix: &str) -> PathBuf {
+    let mut value = db_path.as_os_str().to_os_string();
+    value.push(suffix);
+    PathBuf::from(value)
+}
+
+fn sqlite_member_evidence(path: &Path) -> Result<Value, DynError> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if !metadata.file_type().is_file() {
+                return Err(format!(
+                    "ASTRO_PROJECT_NORMALIZATION_MEMBER_TYPE_INVALID: {} is present but is not one ordinary file; remediation: preserve the path and resolve its exact filesystem identity",
+                    path.display()
+                )
+                .into());
+            }
+            let bytes = metadata.len();
+            let sha256 = sha256_file_hex(path)?;
+            let readback = fs::symlink_metadata(path).map_err(|error| {
+                format!(
+                    "ASTRO_PROJECT_NORMALIZATION_MEMBER_READBACK_FAILED: re-reading {} failed after hashing: {error}; remediation: preserve the family and inspect the concurrent owner",
+                    path.display()
+                )
+            })?;
+            if !readback.file_type().is_file() || readback.len() != bytes {
+                return Err(format!(
+                    "ASTRO_PROJECT_NORMALIZATION_MEMBER_DRIFT: {} changed type or length while hashing; remediation: preserve the family and inspect the concurrent owner",
+                    path.display()
+                )
+                .into());
+            }
+            Ok(json!({
+                "path": path,
+                "present": true,
+                "bytes": bytes,
+                "sha256": sha256,
+            }))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(json!({
+            "path": path,
+            "present": false,
+            "bytes": 0,
+            "sha256": null,
+        })),
+        Err(error) => Err(format!(
+            "ASTRO_PROJECT_NORMALIZATION_MEMBER_PROBE_FAILED: probing {} failed: {error}; remediation: preserve the family and resolve the filesystem error",
+            path.display()
+        )
+        .into()),
+    }
+}
+
+fn sqlite_family_evidence(db_path: &Path) -> Result<Value, DynError> {
+    let wal_path = sqlite_family_member_path(db_path, "-wal");
+    let shm_path = sqlite_family_member_path(db_path, "-shm");
+    Ok(json!({
+        "db": sqlite_member_evidence(db_path)?,
+        "wal": sqlite_member_evidence(&wal_path)?,
+        "shm": sqlite_member_evidence(&shm_path)?,
+    }))
+}
+
+fn quiescence_json(value: &CbmProjectQuiescence) -> Value {
+    json!({
+        "elapsed_ms": value.elapsed_ms,
+        "attempts": value.attempts,
+        "native_error": value.native_error,
+        "failed_path": value.failed_path,
+        "holder_probe_status": value.holder_probe_status,
+        "holder_probe_native_error": value.holder_probe_native_error,
+        "holder_inventory_stable": value.holder_inventory_stable,
+        "holder_count": value.holder_count,
+        "first_holder_process_id": value.first_holder_process_id,
+        "first_holder_process_start_utc_ticks": value.first_holder_process_start_utc_ticks,
+        "holder_probe_operation": value.holder_probe_operation,
+        "first_holder_path": value.first_holder_path,
+    })
 }
 
 fn inspect_prior_transition(
@@ -496,7 +791,11 @@ fn inspect_prior_transition(
         .filter(|phase| {
             matches!(
                 *phase,
-                "active" | "quiesced" | "quiescence_failed" | "terminal"
+                "active"
+                    | "quiesced"
+                    | "quiescence_failed"
+                    | "normalization_failed"
+                    | "terminal"
             )
         })
         .ok_or_else(|| -> DynError {

@@ -20,6 +20,14 @@ struct WatchRegistration {
     root: String,
 }
 
+struct RegistrationRecoveryRefresh<'a> {
+    fault_code: &'a str,
+    prior_fault: &'a Value,
+    prior_observation: &'a Value,
+    current_sentinel: Value,
+    recompute_reason: &'a str,
+}
+
 pub(crate) fn run_incremental_watcher_loop(shutdown: Arc<AtomicBool>) -> Result<(), DynError> {
     let cache_dir = astrolabe_bridge::cbm_cache_dir()?;
     let runner = Rc::new(CbmToolRunner::new_default()?);
@@ -288,11 +296,13 @@ fn suppress_unchanged_registration_recovery_fault(
         Ok(_) => refresh_or_clear_registration_recovery_fault(
             cache_dir,
             registration,
-            fault_code,
-            &prior_fault,
-            &prior_observation,
-            current_sentinel,
-            "sentinel_changed",
+            RegistrationRecoveryRefresh {
+                fault_code,
+                prior_fault: &prior_fault,
+                prior_observation: &prior_observation,
+                current_sentinel,
+                recompute_reason: "sentinel_changed",
+            },
             registration_recovery_faults,
         ),
         Err(error) => {
@@ -300,11 +310,13 @@ fn suppress_unchanged_registration_recovery_fault(
             refresh_or_clear_registration_recovery_fault(
                 cache_dir,
                 registration,
-                fault_code,
-                &prior_fault,
-                &prior_observation,
-                current_sentinel,
-                &reason,
+                RegistrationRecoveryRefresh {
+                    fault_code,
+                    prior_fault: &prior_fault,
+                    prior_observation: &prior_observation,
+                    current_sentinel,
+                    recompute_reason: &reason,
+                },
                 registration_recovery_faults,
             )
         }
@@ -314,13 +326,16 @@ fn suppress_unchanged_registration_recovery_fault(
 fn refresh_or_clear_registration_recovery_fault(
     cache_dir: &Path,
     registration: &WatchRegistration,
-    fault_code: &str,
-    prior_fault: &Value,
-    prior_observation: &Value,
-    current_sentinel: Value,
-    recompute_reason: &str,
+    refresh: RegistrationRecoveryRefresh<'_>,
     registration_recovery_faults: &mut BTreeMap<String, Value>,
 ) -> Result<bool, DynError> {
+    let RegistrationRecoveryRefresh {
+        fault_code,
+        prior_fault,
+        prior_observation,
+        current_sentinel,
+        recompute_reason,
+    } = refresh;
     let fault_class = recovery_fault_log_class(fault_code);
     tracing::info!(
         project = %registration.project,
@@ -890,17 +905,16 @@ fn read_registration_recovery_fault(
             })
         })
         .transpose()?;
-    if let Some(fault) = fault.as_ref() {
-        if fault.get("schema").and_then(Value::as_str)
+    if let Some(fault) = fault.as_ref()
+        && (fault.get("schema").and_then(Value::as_str)
             != Some("astrolabe-watcher-registration-recovery-fault-v1")
             || fault.get("status").and_then(Value::as_str) != Some("terminal_fault")
-            || fault.get("project").and_then(Value::as_str) != Some(project)
-        {
-            return Err(format!(
-                "ASTRO_WATCHER_REGISTRATION_FAULT_IDENTITY_MISMATCH: durable registration fault row for {project:?} does not bind the expected schema/status/project; remediation: preserve the config store and inspect watcher_registration_fault_json"
-            )
-            .into());
-        }
+            || fault.get("project").and_then(Value::as_str) != Some(project))
+    {
+        return Err(format!(
+            "ASTRO_WATCHER_REGISTRATION_FAULT_IDENTITY_MISMATCH: durable registration fault row for {project:?} does not bind the expected schema/status/project; remediation: preserve the config store and inspect watcher_registration_fault_json"
+        )
+        .into());
     }
     Ok(fault)
 }
@@ -1300,11 +1314,11 @@ fn terminal_watcher_fault_code(response: &Value) -> Option<String> {
         .and_then(|value| value.get("code"))
         .and_then(Value::as_str)
         .or_else(|| response.get("code").and_then(Value::as_str));
-    if let Some(code) = structured_code {
-        if TERMINAL_CODES.contains(&code) || shadow_publication_recovery_error_code(code).is_some()
-        {
-            return Some(code.to_string());
-        }
+    if let Some(code) = structured_code
+        && (TERMINAL_CODES.contains(&code)
+            || shadow_publication_recovery_error_code(code).is_some())
+    {
+        return Some(code.to_string());
     }
     let text = response
         .get("content")
@@ -1314,11 +1328,10 @@ fn terminal_watcher_fault_code(response: &Value) -> Option<String> {
         .and_then(Value::as_str)?;
     if let Ok(inner) = serde_json::from_str::<Value>(text)
         && let Some(code) = inner.get("code").and_then(Value::as_str)
+        && (TERMINAL_CODES.contains(&code)
+            || shadow_publication_recovery_error_code(code).is_some())
     {
-        if TERMINAL_CODES.contains(&code) || shadow_publication_recovery_error_code(code).is_some()
-        {
-            return Some(code.to_string());
-        }
+        return Some(code.to_string());
     }
     if let Some(code) = TERMINAL_CODES.iter().copied().find(|code| {
         text.strip_prefix(code)

@@ -1053,7 +1053,7 @@ int main(int argc, char **argv) {
         cbm_thread_join(&watcher_tid);
     }
     cbm_watcher_free(g_watcher);
-    cbm_store_close(watch_store);
+    cbm_store_close_required(&watch_store, "main.watch_store.complete");
     cbm_mcp_server_free(g_server);
     cbm_config_close(runtime_config);
 

@@ -713,6 +713,12 @@ void cbm_pipeline_pass_complexity(cbm_pipeline_ctx_t *ctx);
  * so an identity collision is a hard failure rather than an overwrite. */
 int cbm_pipeline_unique_stage_path(const char *db_path, const char *kind, char **out_path);
 
+/* Snapshot-only, exact-probe publication admission shared by full and
+ * incremental replacement paths. It never opens the live source with SQLite. */
+int cbm_pipeline_verify_live_store_before_publication(cbm_pipeline_t *p, const char *db_path,
+                                                      const char *live_wal,
+                                                      const char *live_shm);
+
 /* ── Incremental pipeline (pipeline_incremental.c) ───────────────── */
 
 /* Run incremental re-index against an already verified read-only store and its

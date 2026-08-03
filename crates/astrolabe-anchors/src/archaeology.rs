@@ -1192,10 +1192,7 @@ fn parse_diff_tree_raw_counts(
         index += 1;
         let mut count = 0usize;
         let next_commit = candidates.get(candidate_index + 1);
-        loop {
-            let Some(token) = tokens.get(index) else {
-                break;
-            };
+        while let Some(token) = tokens.get(index) {
             if next_commit
                 .is_some_and(|next| diff_tree_token_matches_commit(token, next.commit.as_str()))
             {

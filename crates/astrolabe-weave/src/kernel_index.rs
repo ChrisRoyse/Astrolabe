@@ -415,8 +415,8 @@ pub fn kernel_query_members(
     }
 
     let index_set = SlotIndexSet::from_manifest(manifest)?;
-    let query =
-        crate::search_index::SlotQuery::text("").with_vector(SLOT_CODE_SEMANTIC, query_vector.to_vec());
+    let query = crate::search_index::SlotQuery::text("")
+        .with_vector(SLOT_CODE_SEMANTIC, query_vector.to_vec());
     let ranking = index_set.rank_slot(SLOT_CODE_SEMANTIC, &query, k, ef)?;
     let matches = ranking
         .ranked_symbol_ids

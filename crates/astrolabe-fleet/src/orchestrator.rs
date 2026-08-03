@@ -1885,52 +1885,103 @@ fn find_key<'a>(value: &'a Value, key: &str) -> Option<&'a Value> {
     }
 }
 
-/// Extracts top-level `astro.shadow.timing phase=<p> ms=<n>` lines (phases
-/// without a `.`, i.e. whole stages, plus `import_raw_total`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PipelinePhaseStream {
+    Shadow,
+    Index,
+    Archaeology,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PipelinePhaseSample<'a> {
+    stream: PipelinePhaseStream,
+    phase: &'a str,
+    elapsed_ms: Option<u64>,
+}
+
+/// Decodes one stable pipeline phase line. Current shadow telemetry uses
+/// `elapsed_ms`; `ms` remains accepted for the pre-6d763bd6 shadow stream and
+/// the archaeology stream so a current fleet binary can still diagnose a
+/// preserved older pipeline artifact. An untimed line (currently
+/// `index.preseed_noop`) remains useful to the last-phase diagnostic.
+fn decode_pipeline_phase_line(line: &str) -> Option<PipelinePhaseSample<'_>> {
+    let trimmed = line.trim();
+    let (stream, fields) = if let Some(fields) = trimmed.strip_prefix("astro.shadow.phase ") {
+        (PipelinePhaseStream::Shadow, fields)
+    } else if let Some(fields) = trimmed.strip_prefix("astro.shadow.index_phase ") {
+        (PipelinePhaseStream::Index, fields)
+    } else if let Some(fields) = trimmed.strip_prefix("astro.shadow.timing ") {
+        (PipelinePhaseStream::Shadow, fields)
+    } else if let Some(fields) = trimmed.strip_prefix("astro.arch.timing ") {
+        (PipelinePhaseStream::Archaeology, fields)
+    } else {
+        return None;
+    };
+
+    let mut phase = None;
+    let mut elapsed_ms = None;
+    let mut legacy_ms = None;
+    for field in fields.split_whitespace() {
+        if let Some(value) = field.strip_prefix("phase=") {
+            if !value.is_empty() {
+                phase = Some(value);
+            }
+        } else if let Some(value) = field.strip_prefix("elapsed_ms=") {
+            elapsed_ms = value.parse::<u64>().ok();
+        } else if let Some(value) = field.strip_prefix("ms=") {
+            legacy_ms = value.parse::<u64>().ok();
+        }
+    }
+
+    Some(PipelinePhaseSample {
+        stream,
+        phase: phase?,
+        elapsed_ms: elapsed_ms.or(legacy_ms),
+    })
+}
+
+/// Extracts top-level current and legacy shadow-stage durations. Detailed
+/// `import_raw.*` rows remain out of the compact report; outer index phases use
+/// an `index.` prefix so a future phase-name collision cannot overwrite an
+/// import duration.
 fn parse_stage_timings(stderr_text: &str) -> BTreeMap<String, u64> {
     let mut out = BTreeMap::new();
     for line in stderr_text.lines() {
-        let Some(rest) = line.trim().strip_prefix("astro.shadow.timing phase=") else {
+        let Some(sample) = decode_pipeline_phase_line(line) else {
             continue;
         };
-        let Some((phase, ms)) = rest.split_once(" ms=") else {
+        let Some(elapsed_ms) = sample.elapsed_ms else {
             continue;
         };
-        if phase.contains('.') && phase != "import_raw_total" {
-            continue;
-        }
-        if let Ok(ms) = ms.trim().parse::<u64>() {
-            out.insert(phase.to_string(), ms);
-        }
+        let phase = match sample.stream {
+            PipelinePhaseStream::Shadow if !sample.phase.contains('.') => sample.phase.to_string(),
+            PipelinePhaseStream::Index => format!("index.{}", sample.phase),
+            PipelinePhaseStream::Shadow | PipelinePhaseStream::Archaeology => continue,
+        };
+        out.insert(phase, elapsed_ms);
     }
     out
 }
 
-/// #515: the LAST pipeline phase the child announced on stderr before it died —
-/// the phase it was executing when a hard-exit (or timeout kill) cut it off. Scans
-/// both the shadow-import phase stream (`astro.shadow.timing phase=<p> ms=<n>`,
-/// emitted AFTER each phase completes) and the git-archaeology stream
-/// (`astro.arch.timing phase=<p> ...`), returning the phase name of the last such
-/// line — the completed phase immediately before the fatal one, i.e. the best
-/// available name for where the child was when it vanished. Returns `None` when the
-/// child emitted no phase line at all (died before the first one, or timing was not
-/// enabled). Used only for the structured failure detail on a child that produced no
-/// tool result, so it is fail-open: a parse miss yields `None`, never a fabrication.
+/// #515: the LAST pipeline phase the child announced on stderr before it died.
+/// Scans current shadow-import and outer index streams, the legacy shadow stream,
+/// and git archaeology. Phase lines are emitted AFTER each phase completes, so
+/// this is the completed phase immediately before the fatal one: the best
+/// available name for where the child vanished. Returns `None` only when the
+/// child emitted no recognized phase. Used solely for structured child-loss
+/// detail, so a parse miss yields `None`, never a fabricated phase.
 fn last_observed_pipeline_phase(stderr_text: &str) -> Option<String> {
     let mut last: Option<String> = None;
     for line in stderr_text.lines() {
-        let trimmed = line.trim();
-        let Some(rest) = trimmed
-            .strip_prefix("astro.shadow.timing phase=")
-            .or_else(|| trimmed.strip_prefix("astro.arch.timing phase="))
-        else {
+        let Some(sample) = decode_pipeline_phase_line(line) else {
             continue;
         };
-        // The phase token runs up to the first whitespace (before ` ms=` / ` szz=`).
-        let phase = rest.split_whitespace().next().unwrap_or(rest);
-        if !phase.is_empty() {
-            last = Some(phase.to_string());
-        }
+        last = Some(match sample.stream {
+            PipelinePhaseStream::Index => format!("index.{}", sample.phase),
+            PipelinePhaseStream::Shadow | PipelinePhaseStream::Archaeology => {
+                sample.phase.to_string()
+            }
+        });
     }
     last
 }

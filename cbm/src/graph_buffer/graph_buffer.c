@@ -2067,7 +2067,7 @@ int cbm_gbuf_load_from_db_checked(cbm_gbuf_t *gb, const char *db_path, const cha
         cbm_store_open_path_graph_verified(db_path, project, &store, &verification);
     if (verify_status != CBM_STORE_VERIFY_OK || !store) {
         if (store) {
-            cbm_store_close(store);
+            cbm_store_close_required(&store, "graph_buffer.load.verified_open_failed");
         }
         log_load_store_verification_failure(db_path, project, verify_status, &verification);
         set_verification_load_error(error, db_path, verify_status, &verification);
@@ -2079,7 +2079,7 @@ int cbm_gbuf_load_from_db_checked(cbm_gbuf_t *gb, const char *db_path, const cha
         set_load_error(error, "CBM_GRAPH_STORE_HANDLE_UNAVAILABLE", "graph_store_verified_handle",
                        db_path, 0, "verified graph-store open returned no SQLite handle",
                        "repair the verified store-open contract before retrying");
-        cbm_store_close(store);
+        cbm_store_close_required(&store, "graph_buffer.load.handle_unavailable");
         return CBM_NOT_FOUND;
     }
 
@@ -2090,7 +2090,7 @@ int cbm_gbuf_load_from_db_checked(cbm_gbuf_t *gb, const char *db_path, const cha
         set_sqlite_load_error(error, db, db_path, "CBM_GRAPH_NODE_MAX_PREPARE_FAILED",
                               "graph_load_prepare_max_node_id",
                               "the maximum persisted node ID query could not be prepared");
-        cbm_store_close(store);
+        cbm_store_close_required(&store, "graph_buffer.load.max_node_prepare_failed");
         return CBM_NOT_FOUND;
     }
     sqlite3_bind_text(stmt, SKIP_ONE, project, CBM_NOT_FOUND, SQLITE_STATIC);
@@ -2103,7 +2103,7 @@ int cbm_gbuf_load_from_db_checked(cbm_gbuf_t *gb, const char *db_path, const cha
                               "graph_load_read_max_node_id",
                               "the maximum persisted node ID could not be read");
         sqlite3_finalize(stmt);
-        cbm_store_close(store);
+        cbm_store_close_required(&store, "graph_buffer.load.max_node_read_failed");
         return CBM_NOT_FOUND;
     }
     sqlite3_finalize(stmt);
@@ -2116,7 +2116,7 @@ int cbm_gbuf_load_from_db_checked(cbm_gbuf_t *gb, const char *db_path, const cha
             "persisted node IDs exceed the exact in-memory mapping capacity",
             "preserve and inspect the graph store; rebuild it only from the exact source "
             "after correcting its node-ID domain");
-        cbm_store_close(store);
+        cbm_store_close_required(&store, "graph_buffer.load.node_id_domain_invalid");
         return CBM_NOT_FOUND;
     }
     int64_t *old_to_new = calloc((size_t)(max_old_id + SKIP_ONE), sizeof(int64_t));
@@ -2127,7 +2127,7 @@ int cbm_gbuf_load_from_db_checked(cbm_gbuf_t *gb, const char *db_path, const cha
                        "the exact persisted-to-memory node ID map could not be allocated",
                        "free memory or reduce concurrent repository workload, then retry the "
                        "complete corpus");
-        cbm_store_close(store);
+        cbm_store_close_required(&store, "graph_buffer.load.node_id_map_alloc_failed");
         return CBM_NOT_FOUND;
     }
 
@@ -2142,7 +2142,7 @@ int cbm_gbuf_load_from_db_checked(cbm_gbuf_t *gb, const char *db_path, const cha
                               "graph_load_prepare_nodes",
                               "the complete persisted node query could not be prepared");
         free(old_to_new);
-        cbm_store_close(store);
+        cbm_store_close_required(&store, "graph_buffer.load.node_rows_prepare_failed");
         return CBM_NOT_FOUND;
     }
     sqlite3_bind_text(stmt, SKIP_ONE, project, CBM_NOT_FOUND, SQLITE_STATIC);
@@ -2174,7 +2174,7 @@ int cbm_gbuf_load_from_db_checked(cbm_gbuf_t *gb, const char *db_path, const cha
                 "after correcting its node-ID domain");
             sqlite3_finalize(stmt);
             free(old_to_new);
-            cbm_store_close(store);
+            cbm_store_close_required(&store, "graph_buffer.load.node_id_out_of_range");
             return CBM_NOT_FOUND;
         }
         int64_t new_id =
@@ -2192,7 +2192,7 @@ int cbm_gbuf_load_from_db_checked(cbm_gbuf_t *gb, const char *db_path, const cha
                            "identity or allocation failure, then retry");
             sqlite3_finalize(stmt);
             free(old_to_new);
-            cbm_store_close(store);
+            cbm_store_close_required(&store, "graph_buffer.load.node_add_failed");
             return CBM_NOT_FOUND;
         }
         if (!expected_atom || strcmp(loaded->atom_id, expected_atom) != 0 ||
@@ -2208,7 +2208,7 @@ int cbm_gbuf_load_from_db_checked(cbm_gbuf_t *gb, const char *db_path, const cha
                            "rebuild the SQLite store from the exact source bytes");
             sqlite3_finalize(stmt);
             free(old_to_new);
-            cbm_store_close(store);
+            cbm_store_close_required(&store, "graph_buffer.load.node_identity_invalid");
             return CBM_NOT_FOUND;
         }
         old_to_new[old_id] = new_id;
@@ -2219,7 +2219,7 @@ int cbm_gbuf_load_from_db_checked(cbm_gbuf_t *gb, const char *db_path, const cha
                               "the complete persisted node set could not be read");
         sqlite3_finalize(stmt);
         free(old_to_new);
-        cbm_store_close(store);
+        cbm_store_close_required(&store, "graph_buffer.load.node_rows_read_failed");
         return CBM_NOT_FOUND;
     }
     sqlite3_finalize(stmt);
@@ -2233,7 +2233,7 @@ int cbm_gbuf_load_from_db_checked(cbm_gbuf_t *gb, const char *db_path, const cha
                               "graph_load_prepare_edges",
                               "the complete persisted edge query could not be prepared");
         free(old_to_new);
-        cbm_store_close(store);
+        cbm_store_close_required(&store, "graph_buffer.load.edge_rows_prepare_failed");
         return CBM_NOT_FOUND;
     }
     sqlite3_bind_text(stmt, SKIP_ONE, project, CBM_NOT_FOUND, SQLITE_STATIC);
@@ -2257,7 +2257,7 @@ int cbm_gbuf_load_from_db_checked(cbm_gbuf_t *gb, const char *db_path, const cha
                                "edge identity or allocation failure, then retry");
                 sqlite3_finalize(stmt);
                 free(old_to_new);
-                cbm_store_close(store);
+                cbm_store_close_required(&store, "graph_buffer.load.edge_add_failed");
                 return CBM_NOT_FOUND;
             }
         } else {
@@ -2269,7 +2269,7 @@ int cbm_gbuf_load_from_db_checked(cbm_gbuf_t *gb, const char *db_path, const cha
                            "integrity before retrying");
             sqlite3_finalize(stmt);
             free(old_to_new);
-            cbm_store_close(store);
+            cbm_store_close_required(&store, "graph_buffer.load.edge_endpoint_missing");
             return CBM_NOT_FOUND;
         }
     }
@@ -2279,13 +2279,13 @@ int cbm_gbuf_load_from_db_checked(cbm_gbuf_t *gb, const char *db_path, const cha
                               "the complete persisted edge set could not be read");
         sqlite3_finalize(stmt);
         free(old_to_new);
-        cbm_store_close(store);
+        cbm_store_close_required(&store, "graph_buffer.load.edge_rows_read_failed");
         return CBM_NOT_FOUND;
     }
     sqlite3_finalize(stmt);
 
     free(old_to_new);
-    cbm_store_close(store);
+    cbm_store_close_required(&store, "graph_buffer.load.complete");
     return 0;
 }
 

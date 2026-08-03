@@ -199,8 +199,9 @@ pub fn query_store_search_schema_counts(
             &mut verification,
         );
         if status != cbm_store_verify_status_t_CBM_STORE_VERIFY_OK || store.is_null() {
+            let mut close_error = None;
             if !store.is_null() {
-                cbm_store_close(store);
+                close_error = close_store_exact(&mut store).err();
             }
             let code = if status == cbm_store_verify_status_t_CBM_STORE_VERIFY_INTEGRITY_FAILED {
                 "CBM_STORE_INTEGRITY_FAILED"
@@ -209,19 +210,58 @@ pub fn query_store_search_schema_counts(
             } else {
                 "CBM_STORE_VERIFICATION_FAILED"
             };
-            return Err(format!(
+            let verification_error = format!(
                 "code={code} status={status} operation={} native_error={} sqlite_error={} detail={} remediation=preserve the database, WAL, and SHM together; resolve the reported failure, then retry",
                 c_char_array(&verification.operation),
                 verification.native_error,
                 verification.sqlite_error,
                 c_char_array(&verification.detail),
-            ));
+            );
+            return Err(match close_error {
+                Some(close_error) => format!("{verification_error}; close_error={close_error}"),
+                None => verification_error,
+            });
         }
 
         let result = query_open_store_search_schema_counts(store, &project, &label, &sort_by);
-        cbm_store_close(store);
-        result
+        let close_result = close_store_exact(&mut store);
+        match (result, close_result) {
+            (Ok(value), Ok(())) => Ok(value),
+            (Err(error), Ok(())) => Err(error),
+            (Ok(_), Err(close_error)) => Err(close_error),
+            (Err(error), Err(close_error)) => {
+                Err(format!("query_error={error}; close_error={close_error}"))
+            }
+        }
     }
+}
+
+unsafe fn close_store_exact(store: &mut *mut cbm_store_t) -> Result<(), String> {
+    let mut result = cbm_store_close_result_t::default();
+    let status = unsafe { cbm_store_close(store, &mut result) };
+    if status == CBM_STORE_CLOSE_OK && (*store).is_null() {
+        return Ok(());
+    }
+    if result.connection_destroyed == 0 || !(*store).is_null() {
+        eprintln!(
+            "code=CBM_STORE_CLOSE_LIVE_OWNER_UNRETURNABLE status={} sqlite_error={} outstanding_statements={} first_sql_sha256={} db_path={}",
+            result.status,
+            result.sqlite_close_code,
+            result.outstanding_statement_count,
+            c_char_array(&result.first_outstanding_sql_sha256),
+            c_char_array(&result.db_path),
+        );
+        std::process::abort();
+    }
+    Err(format!(
+        "code=CBM_STORE_CLOSE_FAILED status={} sqlite_error={} connection_destroyed={} outstanding_statements={} first_sql_sha256={} db_path={} remediation=preserve the exact store owner and complete the reported SQLite resource before retrying",
+        result.status,
+        result.sqlite_close_code,
+        result.connection_destroyed,
+        result.outstanding_statement_count,
+        c_char_array(&result.first_outstanding_sql_sha256),
+        c_char_array(&result.db_path),
+    ))
 }
 
 fn c_char_array<const N: usize>(value: &[std::os::raw::c_char; N]) -> String {

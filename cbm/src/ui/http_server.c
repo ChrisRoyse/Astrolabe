@@ -331,7 +331,7 @@ static void handle_repo_info(cbm_http_conn_t *c, const cbm_http_req_t *req) {
         snprintf(root_path, sizeof(root_path), "%s", proj.root_path);
     }
     cbm_project_free_fields(&proj);
-    cbm_store_close(store);
+    cbm_store_close_required(&store, "http.repo_info.complete");
 
     char branch[256] = {0};
     if (root_path[0]) {
@@ -829,7 +829,7 @@ static void handle_adr_get(cbm_http_conn_t *c, const cbm_http_req_t *req) {
     } else {
         cbm_http_replyf(c, 200, g_cors_json, "{\"has_adr\":false}");
     }
-    cbm_store_close(store);
+    cbm_store_close_required(&store, "http.adr_get.complete");
 }
 
 /* POST /api/adr — save ADR content. Body: {"project":"...","content":"..."} */
@@ -868,7 +868,7 @@ static void handle_adr_save(cbm_http_conn_t *c, const cbm_http_req_t *req) {
     }
 
     int rc = cbm_store_adr_store(store, proj, content);
-    cbm_store_close(store);
+    cbm_store_close_required(&store, "http.adr_save.complete");
 
     if (rc == CBM_STORE_OK) {
         cbm_http_replyf(c, 200, g_cors_json, "{\"saved\":true}");
@@ -1332,7 +1332,7 @@ static void handle_project_health(cbm_http_conn_t *c, const cbm_http_req_t *req)
 
     int node_count = cbm_store_count_nodes(store, name);
     int edge_count = cbm_store_count_edges(store, name);
-    cbm_store_close(store);
+    cbm_store_close_required(&store, "http.project_stats.complete");
 
     int64_t size = cbm_file_size(db_path);
 
@@ -1441,7 +1441,7 @@ static void handle_layout(cbm_http_conn_t *c, const cbm_http_req_t *req) {
     int linked_count = find_cross_repo_targets(store, project, linked, LAYOUT_MAX_LINKED);
 
     if (!layout) {
-        cbm_store_close(store);
+        cbm_store_close_required(&store, "http.layout.query_failed");
         cbm_http_replyf(c, 500, g_cors_json, "{\"error\":\"layout computation failed\"}");
         return;
     }
@@ -1453,13 +1453,13 @@ static void handle_layout(cbm_http_conn_t *c, const cbm_http_req_t *req) {
     char *primary_json = cbm_layout_to_json(layout);
     cbm_layout_free(layout);
     if (!primary_json) {
-        cbm_store_close(store);
+        cbm_store_close_required(&store, "http.layout.query_empty");
         cbm_http_replyf(c, 500, g_cors_json, "{\"error\":\"JSON serialization failed\"}");
         return;
     }
 
     if (linked_count == 0) {
-        cbm_store_close(store);
+        cbm_store_close_required(&store, "http.layout.project_missing");
         cbm_http_replyf(c, 200, g_cors_json, "%s", primary_json);
         free(primary_json);
         return;
@@ -1469,7 +1469,7 @@ static void handle_layout(cbm_http_conn_t *c, const cbm_http_req_t *req) {
     yyjson_doc *pdoc = yyjson_read(primary_json, strlen(primary_json), 0);
     free(primary_json);
     if (!pdoc) {
-        cbm_store_close(store);
+        cbm_store_close_required(&store, "http.layout.root_invalid");
         cbm_http_replyf(c, 500, g_cors_json, "{\"error\":\"JSON parse failed\"}");
         return;
     }
@@ -1499,7 +1499,7 @@ static void handle_layout(cbm_http_conn_t *c, const cbm_http_req_t *req) {
             cbm_layout_compute(lp_store, linked[li], CBM_LAYOUT_OVERVIEW, NULL, 0, max_nodes);
 
         if (!lp_layout) {
-            cbm_store_close(lp_store);
+            cbm_store_close_required(&lp_store, "http.layout.lp_project_missing");
             free(linked[li]);
             continue;
         }
@@ -1508,7 +1508,7 @@ static void handle_layout(cbm_http_conn_t *c, const cbm_http_req_t *req) {
         char *lp_json = cbm_layout_to_json(lp_layout);
         cbm_layout_free(lp_layout);
         if (!lp_json) {
-            cbm_store_close(lp_store);
+            cbm_store_close_required(&lp_store, "http.layout.lp_node_query_failed");
             free(linked[li]);
             continue;
         }
@@ -1517,7 +1517,7 @@ static void handle_layout(cbm_http_conn_t *c, const cbm_http_req_t *req) {
         yyjson_doc *lpdoc = yyjson_read(lp_json, strlen(lp_json), 0);
         free(lp_json);
         if (!lpdoc) {
-            cbm_store_close(lp_store);
+            cbm_store_close_required(&lp_store, "http.layout.lp_edge_query_failed");
             free(linked[li]);
             continue;
         }
@@ -1610,13 +1610,13 @@ static void handle_layout(cbm_http_conn_t *c, const cbm_http_req_t *req) {
         }
         yyjson_mut_obj_add_val(mdoc, entry, "cross_edges", cross_arr);
 
-        cbm_store_close(lp_store);
+        cbm_store_close_required(&lp_store, "http.layout.lp_complete");
         yyjson_mut_arr_append(lp_arr, entry);
         yyjson_mut_doc_free(lm);
         free(linked[li]);
     }
 
-    cbm_store_close(store);
+    cbm_store_close_required(&store, "http.layout.complete");
     yyjson_mut_obj_add_val(mdoc, mroot, "linked_projects", lp_arr);
 
     size_t len = 0;

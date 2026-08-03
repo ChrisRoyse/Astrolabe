@@ -84,6 +84,7 @@ type PublicationConfigReadback = (
     Option<String>,
     Option<String>,
 );
+type ShadowNoopValidation = (String, String, Vec<(String, String)>);
 
 #[derive(Debug, Clone)]
 struct SeedLowerRepair {
@@ -465,11 +466,13 @@ impl ShadowPublication {
             &self.live_cache,
             &self.project,
             &outcome,
-            dial,
-            sanitized_index_args,
-            index_admission_identity,
-            &staged_config_rows,
-            &self.generation,
+            ShadowPublicationCommit {
+                dial,
+                sanitized_index_args,
+                index_admission_identity,
+                staged_config_rows: &staged_config_rows,
+                publication_generation: &self.generation,
+            },
         ) {
             let rollback = self.rollback_artifacts(&installed);
             return Err(self.abort_error("config commit", combine_rollback_error(error, rollback)));
@@ -599,7 +602,7 @@ impl ShadowPublication {
         sanitized_index_args: &str,
         index_admission_identity: &ShadowIndexAdmissionIdentity,
     ) -> Result<ShadowImportOutcome, DynError> {
-        let validation = (|| -> Result<(String, String, Vec<(String, String)>), DynError> {
+        let validation = (|| -> Result<ShadowNoopValidation, DynError> {
             let freshness = evaluate_shadow_content_freshness(&self.live_cache, &self.project)?;
             if freshness != ShadowContentVerdict::Fresh {
                 return Err(format!(
@@ -1918,7 +1921,7 @@ fn sentinel_display_path(root: &Path, path: &Path) -> String {
 fn cheap_file_metadata(metadata: &fs::Metadata) -> Value {
     #[cfg(windows)]
     {
-        return json!({
+        json!({
             "platform": "windows",
             "kind": "file",
             "file_attributes": metadata.file_attributes(),
@@ -1926,7 +1929,7 @@ fn cheap_file_metadata(metadata: &fs::Metadata) -> Value {
             "creation_filetime_100ns": metadata.creation_time(),
             "last_write_filetime_100ns": metadata.last_write_time(),
             "readonly": metadata.permissions().readonly(),
-        });
+        })
     }
     #[cfg(not(windows))]
     {
@@ -1942,13 +1945,13 @@ fn cheap_file_metadata(metadata: &fs::Metadata) -> Value {
 fn cheap_directory_metadata(metadata: &fs::Metadata) -> Value {
     #[cfg(windows)]
     {
-        return json!({
+        json!({
             "platform": "windows",
             "kind": "directory",
             "file_attributes": metadata.file_attributes(),
             "creation_filetime_100ns": metadata.creation_time(),
             "readonly": metadata.permissions().readonly(),
-        });
+        })
     }
     #[cfg(not(windows))]
     {

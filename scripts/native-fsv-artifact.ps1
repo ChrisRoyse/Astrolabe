@@ -510,6 +510,96 @@ function Test-AstroFsvIdentityEqual {
             [long]$Right.process_start_utc_ticks
 }
 
+function Read-AstroFsvV3ProcessEntries {
+    param(
+        [Parameter(Mandatory)][AllowEmptyCollection()]$Entries,
+        [Parameter(Mandatory)][int]$ResidentCount,
+        [Parameter(Mandatory)][int]$ProcessCount,
+        [Parameter(Mandatory)][string]$Code,
+        [Parameter(Mandatory)][string]$Description
+    )
+    if ($ResidentCount -lt 2 -or $ResidentCount -gt 16 -or
+        $ProcessCount -lt 0 -or $ProcessCount -gt ($ResidentCount + 1) -or
+        $Entries -isnot [Array] -or $Entries.Count -ne $ProcessCount) {
+        Fail-Astro $Code `
+            "$Description has invalid v3 resident/process cardinality (resident_count=$ResidentCount; process_count=$ProcessCount; entries=$($Entries.Count))" `
+            'preserve the session and investigate incomplete multi-process provenance'
+    }
+    $roleOrdinals = [Collections.Generic.HashSet[string]]::new(
+        [StringComparer]::Ordinal
+    )
+    $identities = [Collections.Generic.HashSet[string]]::new(
+        [StringComparer]::Ordinal
+    )
+    $result = New-Object System.Collections.Generic.List[object]
+    foreach ($entry in $Entries) {
+        if ($null -eq $entry -or
+            -not $entry.PSObject.Properties['role'] -or
+            -not $entry.PSObject.Properties['ordinal'] -or
+            -not $entry.PSObject.Properties['identity']) {
+            Fail-Astro $Code "$Description contains a process entry without role/ordinal/identity" `
+                'preserve the session and investigate incomplete multi-process provenance'
+        }
+        $role = [string]$entry.role
+        $ordinal = [int]$entry.ordinal
+        $validRole = ($role -ceq 'indexer' -and $ordinal -eq 0) -or
+            ($role -ceq 'resident' -and $ordinal -ge 1 -and
+                $ordinal -le $ResidentCount)
+        $identity = Read-AstroFsvProcessIdentity $entry.identity $Code `
+            "$Description $role/$ordinal identity"
+        $roleOrdinal = "$role/$ordinal"
+        $identityKey = "$($identity.pid)/$($identity.process_start_utc_ticks)"
+        if (-not $validRole -or -not $roleOrdinals.Add($roleOrdinal) -or
+            -not $identities.Add($identityKey)) {
+            Fail-Astro $Code `
+                "$Description contains an invalid or duplicate role/process generation (role=$role; ordinal=$ordinal; identity=$identityKey)" `
+                'preserve the session and investigate incomplete multi-process provenance'
+        }
+        $result.Add([ordered]@{
+            role = $role
+            ordinal = $ordinal
+            identity = $identity
+        })
+    }
+    if ($ProcessCount -eq ($ResidentCount + 1) -and
+        (@($result | Where-Object role -ceq 'indexer').Count -ne 1 -or
+         @($result | Where-Object role -ceq 'resident').Count -ne $ResidentCount)) {
+        Fail-Astro $Code "$Description complete v3 process set has invalid role cardinality" `
+            'preserve the session and investigate incomplete multi-process provenance'
+    }
+    return ,([object[]]@($result | Sort-Object role, ordinal))
+}
+
+function Test-AstroFsvV3ProcessEntriesEqual {
+    param(
+        [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Left,
+        [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Right
+    )
+    if ($Left.Count -ne $Right.Count) { return $false }
+    for ($index = 0; $index -lt $Left.Count; $index++) {
+        if ([string]$Left[$index].role -cne [string]$Right[$index].role -or
+            [int]$Left[$index].ordinal -ne [int]$Right[$index].ordinal -or
+            -not (Test-AstroFsvIdentityEqual `
+                $Left[$index].identity $Right[$index].identity)) {
+            return $false
+        }
+    }
+    return $true
+}
+
+function Add-AstroFsvV3ProcessBindings {
+    param(
+        [Parameter(Mandatory)]$Bindings,
+        [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Processes,
+        [Parameter(Mandatory)][string]$Source
+    )
+    foreach ($process in $Processes) {
+        $Bindings.Add((New-AstroFsvOwnerBinding `
+            ("{0}-{1}" -f $process.role,$process.ordinal) `
+            $Source $process.identity))
+    }
+}
+
 function Get-AstroFsvOwnerProbes {
     param([Parameter(Mandatory)][object[]]$Bindings)
 
@@ -1041,15 +1131,17 @@ function Assert-FsvLockAbsent {
             "FSV lock exists but is unreadable at ${LockPath}: $($_.Exception.Message)" `
             'preserve the lock and session; repair or tracker-migrate the exact legacy state without inferring ownership'
     }
-    if ($lockState.schema -ne 'astrolabe.native-fsv-lock.v2') {
+    if ($lockState.schema -notin @(
+            'astrolabe.native-fsv-lock.v2',
+            'astrolabe.native-fsv-lock.v3'
+        )) {
         Fail-Astro 'ASTRO_FSV_LOCK_LEGACY_OR_UNKNOWN' `
             "FSV lock exists with unsupported schema '$($lockState.schema)' at $LockPath" `
             'preserve the lock and session; PID-only state has no destructive authority'
     }
     if (-not $lockState.PSObject.Properties['owners'] -or
         -not $lockState.owners.PSObject.Properties['launcher'] -or
-        -not $lockState.owners.PSObject.Properties['runner'] -or
-        -not $lockState.owners.PSObject.Properties['child']) {
+        -not $lockState.owners.PSObject.Properties['runner']) {
         Fail-Astro 'ASTRO_FSV_LOCK_INVALID' `
             "FSV lock omits the required launcher, runner, or child identity field at $LockPath" `
             'preserve the lock and session; incomplete exact ownership has no destructive authority'
@@ -1060,10 +1152,31 @@ function Assert-FsvLockAbsent {
             'ASTRO_FSV_LOCK_INVALID' "FSV lock $role identity"
         $bindings.Add((New-AstroFsvOwnerBinding $role 'FSV lock' $identity))
     }
-    if ($null -ne $lockState.owners.child) {
-        $identity = Read-AstroFsvProcessIdentity $lockState.owners.child `
-            'ASTRO_FSV_LOCK_INVALID' 'FSV lock child identity'
-        $bindings.Add((New-AstroFsvOwnerBinding 'child' 'FSV lock' $identity))
+    if ([string]$lockState.schema -ceq 'astrolabe.native-fsv-lock.v2') {
+        if (-not $lockState.owners.PSObject.Properties['child']) {
+            Fail-Astro 'ASTRO_FSV_LOCK_INVALID' `
+                "v2 FSV lock omits its child field at $LockPath" `
+                'preserve the lock/session; incomplete exact ownership has no destructive authority'
+        }
+        if ($null -ne $lockState.owners.child) {
+            $identity = Read-AstroFsvProcessIdentity $lockState.owners.child `
+                'ASTRO_FSV_LOCK_INVALID' 'FSV lock child identity'
+            $bindings.Add((New-AstroFsvOwnerBinding 'child' 'FSV lock' $identity))
+        }
+    }
+    else {
+        if (-not $lockState.PSObject.Properties['resident_count'] -or
+            -not $lockState.PSObject.Properties['process_count'] -or
+            -not $lockState.owners.PSObject.Properties['processes']) {
+            Fail-Astro 'ASTRO_FSV_LOCK_INVALID' `
+                "v3 FSV lock omits its process array/cardinality at $LockPath" `
+                'preserve the lock/session; incomplete exact ownership has no destructive authority'
+        }
+        $processes = Read-AstroFsvV3ProcessEntries `
+            $lockState.owners.processes ([int]$lockState.resident_count) `
+            ([int]$lockState.process_count) `
+            'ASTRO_FSV_LOCK_INVALID' 'FSV-lock v3 process set'
+        Add-AstroFsvV3ProcessBindings $bindings $processes 'FSV lock'
     }
     $probes = @(
         Get-AstroFsvOwnerProbes ([object[]]$bindings.ToArray())
@@ -1126,9 +1239,6 @@ function Get-AstroFsvSessionOwnerBindings {
     $runRunner = Read-AstroFsvProcessIdentity $RunRecord.runner `
         'ASTRO_FSV_SESSION_OWNER_RECORD_INVALID' `
         'run-record runner identity'
-    $runChild = Read-AstroFsvProcessIdentity $RunRecord.process.identity `
-        'ASTRO_FSV_SESSION_OWNER_RECORD_INVALID' `
-        'run-record child identity'
     if (-not (Test-AstroFsvIdentityEqual `
             $Inspection.owners.launcher $runLauncher)) {
         Fail-Astro 'ASTRO_FSV_SESSION_OWNER_RECORD_INVALID' `
@@ -1139,8 +1249,46 @@ function Get-AstroFsvSessionOwnerBindings {
                 'launcher' $RunRecordPath $runLauncher))
     $bindings.Add((New-AstroFsvOwnerBinding `
                 'runner' $RunRecordPath $runRunner))
-    $bindings.Add((New-AstroFsvOwnerBinding `
-                'child' $RunRecordPath $runChild))
+    $runVersion = $null
+    $runChild = $null
+    $runProcesses = [object[]]@()
+    $residentCount = 0
+    $processCount = 0
+    if ([string]$RunRecord.schema -ceq 'astrolabe.native-fsv-run.v2') {
+        if (-not $RunRecord.PSObject.Properties['process'] -or
+            -not $RunRecord.process.PSObject.Properties['identity']) {
+            Fail-Astro 'ASTRO_FSV_SESSION_OWNER_RECORD_INVALID' `
+                "v2 run record omits its exact child identity: $RunRecordPath" `
+                'preserve the complete session and investigate its partial durable state'
+        }
+        $runVersion = 2
+        $runChild = Read-AstroFsvProcessIdentity $RunRecord.process.identity `
+            'ASTRO_FSV_SESSION_OWNER_RECORD_INVALID' `
+            'run-record child identity'
+        $bindings.Add((New-AstroFsvOwnerBinding `
+                    'child' $RunRecordPath $runChild))
+    }
+    elseif ([string]$RunRecord.schema -ceq 'astrolabe.native-fsv-run.v3') {
+        if (-not $RunRecord.PSObject.Properties['resident_count'] -or
+            -not $RunRecord.PSObject.Properties['process_count'] -or
+            -not $RunRecord.PSObject.Properties['processes']) {
+            Fail-Astro 'ASTRO_FSV_SESSION_OWNER_RECORD_INVALID' `
+                "v3 run record omits its process-array cardinality: $RunRecordPath" `
+                'preserve the complete session and investigate its partial durable state'
+        }
+        $runVersion = 3
+        $residentCount = [int]$RunRecord.resident_count
+        $processCount = [int]$RunRecord.process_count
+        $runProcesses = Read-AstroFsvV3ProcessEntries `
+            $RunRecord.processes $residentCount $processCount `
+            'ASTRO_FSV_SESSION_OWNER_RECORD_INVALID' 'run-record v3 process set'
+        Add-AstroFsvV3ProcessBindings $bindings $runProcesses $RunRecordPath
+    }
+    else {
+        Fail-Astro 'ASTRO_FSV_SESSION_OWNER_RECORD_INVALID' `
+            "run-record schema is unsupported: $($RunRecord.schema)" `
+            'preserve the complete session and use an explicitly supported lifecycle schema'
+    }
 
     if (-not $RunRecord.PSObject.Properties['live_state'] -or
         -not $RunRecord.live_state.PSObject.Properties['path'] -or
@@ -1195,11 +1343,15 @@ function Get-AstroFsvSessionOwnerBindings {
             "live-state record is unreadable: ${liveStatePath}: $($_.Exception.Message)" `
             'preserve the complete session and investigate its partial durable state'
     }
-    if ($liveRecord.schema -ne 'astrolabe.native-fsv-live.v2' -or
+    $expectedLiveSchema = if ($runVersion -eq 2) {
+        'astrolabe.native-fsv-live.v2'
+    } else {
+        'astrolabe.native-fsv-live.v3'
+    }
+    if ($liveRecord.schema -cne $expectedLiveSchema -or
         -not $liveRecord.PSObject.Properties['owners'] -or
         -not $liveRecord.owners.PSObject.Properties['launcher'] -or
         -not $liveRecord.owners.PSObject.Properties['runner'] -or
-        -not $liveRecord.owners.PSObject.Properties['child'] -or
         -not $liveRecord.PSObject.Properties['artifact'] -or
         -not $liveRecord.artifact.PSObject.Properties['path'] -or
         -not $liveRecord.artifact.PSObject.Properties['sha256']) {
@@ -1227,26 +1379,56 @@ function Get-AstroFsvSessionOwnerBindings {
         $liveRecord.owners.runner `
         'ASTRO_FSV_SESSION_OWNER_RECORD_INVALID' `
         'live-state runner identity'
-    $liveChild = Read-AstroFsvProcessIdentity `
-        $liveRecord.owners.child `
-        'ASTRO_FSV_SESSION_OWNER_RECORD_INVALID' `
-        'live-state child identity'
     if (-not (Test-AstroFsvIdentityEqual $runLauncher $liveLauncher) -or
-        -not (Test-AstroFsvIdentityEqual $runRunner $liveRunner) -or
-        -not (Test-AstroFsvIdentityEqual $runChild $liveChild)) {
+        -not (Test-AstroFsvIdentityEqual $runRunner $liveRunner)) {
         Fail-Astro 'ASTRO_FSV_SESSION_OWNER_RECORD_INVALID' `
             "live-state owner generations differ from the exact run record: $liveStatePath" `
             'preserve the complete session and investigate cross-run provenance'
     }
     foreach ($binding in @(
-            (New-AstroFsvOwnerBinding `
-                'launcher' $liveStatePath $liveLauncher),
-            (New-AstroFsvOwnerBinding `
-                'runner' $liveStatePath $liveRunner),
-            (New-AstroFsvOwnerBinding `
-                'child' $liveStatePath $liveChild)
+            (New-AstroFsvOwnerBinding 'launcher' $liveStatePath $liveLauncher),
+            (New-AstroFsvOwnerBinding 'runner' $liveStatePath $liveRunner)
         )) {
         $bindings.Add($binding)
+    }
+    if ($runVersion -eq 2) {
+        if (-not $liveRecord.owners.PSObject.Properties['child']) {
+            Fail-Astro 'ASTRO_FSV_SESSION_OWNER_RECORD_INVALID' `
+                "v2 live state omits its exact child identity: $liveStatePath" `
+                'preserve the complete session and investigate its partial durable state'
+        }
+        $liveChild = Read-AstroFsvProcessIdentity `
+            $liveRecord.owners.child `
+            'ASTRO_FSV_SESSION_OWNER_RECORD_INVALID' `
+            'live-state child identity'
+        if (-not (Test-AstroFsvIdentityEqual $runChild $liveChild)) {
+            Fail-Astro 'ASTRO_FSV_SESSION_OWNER_RECORD_INVALID' `
+                "v2 live-state child generation differs from the run record: $liveStatePath" `
+                'preserve the complete session and investigate cross-run provenance'
+        }
+        $bindings.Add((New-AstroFsvOwnerBinding `
+                    'child' $liveStatePath $liveChild))
+    }
+    else {
+        if (-not $liveRecord.PSObject.Properties['resident_count'] -or
+            -not $liveRecord.PSObject.Properties['process_count'] -or
+            -not $liveRecord.owners.PSObject.Properties['processes'] -or
+            [int]$liveRecord.resident_count -ne $residentCount -or
+            [int]$liveRecord.process_count -ne $processCount) {
+            Fail-Astro 'ASTRO_FSV_SESSION_OWNER_RECORD_INVALID' `
+                "v3 live-state process cardinality differs from its run record: $liveStatePath" `
+                'preserve the complete session and investigate cross-run provenance'
+        }
+        $liveProcesses = Read-AstroFsvV3ProcessEntries `
+            $liveRecord.owners.processes $residentCount $processCount `
+            'ASTRO_FSV_SESSION_OWNER_RECORD_INVALID' 'live-state v3 process set'
+        if (-not (Test-AstroFsvV3ProcessEntriesEqual `
+                $runProcesses $liveProcesses)) {
+            Fail-Astro 'ASTRO_FSV_SESSION_OWNER_RECORD_INVALID' `
+                "v3 live-state process generations differ from the run record: $liveStatePath" `
+                'preserve the complete session and investigate cross-run provenance'
+        }
+        Add-AstroFsvV3ProcessBindings $bindings $liveProcesses $liveStatePath
     }
     return [object[]]$bindings.ToArray()
 }
@@ -1501,15 +1683,18 @@ try {
                     "FSV lock is unreadable: ${fsvLock}: $($_.Exception.Message)" `
                     'preserve the lock and investigate its exact bytes'
             }
-            if ($lockState.schema -ne 'astrolabe.native-fsv-lock.v2' -or
+            $lockSchemaSupported = [string]$lockState.schema -in @(
+                'astrolabe.native-fsv-lock.v2',
+                'astrolabe.native-fsv-lock.v3'
+            )
+            if (-not $lockSchemaSupported -or
                 [int]$lockState.issue -ne [int]$inspection.issue -or
                 [string]$lockState.tree_sha -cne [string]$inspection.tree_sha -or
                 -not [string]::Equals([IO.Path]::GetFullPath([string]$lockState.artifact_path), $inspection.artifact_path, [StringComparison]::OrdinalIgnoreCase) -or
                 [string]$lockState.artifact_sha256 -cne [string]$inspection.sha256 -or
                 -not $lockState.PSObject.Properties['owners'] -or
                 -not $lockState.owners.PSObject.Properties['launcher'] -or
-                -not $lockState.owners.PSObject.Properties['runner'] -or
-                -not $lockState.owners.PSObject.Properties['child']) {
+                -not $lockState.owners.PSObject.Properties['runner']) {
                 Fail-Astro 'ASTRO_FSV_LOCK_RETIRE_INVALID_LOCK' `
                     "FSV lock is not bound to the selected issue/tree/artifact: $fsvLock" `
                     'preserve the lock and session; retry with the exact receipt/run/live-state binding'
@@ -1518,8 +1703,33 @@ try {
                 'ASTRO_FSV_LOCK_RETIRE_INVALID_LOCK' 'FSV lock launcher identity'
             $lockRunner = Read-AstroFsvProcessIdentity $lockState.owners.runner `
                 'ASTRO_FSV_LOCK_RETIRE_INVALID_LOCK' 'FSV lock runner identity'
-            $lockChild = Read-AstroFsvProcessIdentity $lockState.owners.child `
-                'ASTRO_FSV_LOCK_RETIRE_INVALID_LOCK' 'FSV lock child identity'
+            $lockChild = $null
+            $lockProcesses = [object[]]@()
+            $lockResidentCount = 0
+            $lockProcessCount = 0
+            if ([string]$lockState.schema -ceq 'astrolabe.native-fsv-lock.v2') {
+                if (-not $lockState.owners.PSObject.Properties['child']) {
+                    Fail-Astro 'ASTRO_FSV_LOCK_RETIRE_INVALID_LOCK' `
+                        'v2 FSV lock omits its child identity' `
+                        'preserve the lock/session and investigate incomplete ownership state'
+                }
+                $lockChild = Read-AstroFsvProcessIdentity $lockState.owners.child `
+                    'ASTRO_FSV_LOCK_RETIRE_INVALID_LOCK' 'FSV lock child identity'
+            }
+            else {
+                if (-not $lockState.PSObject.Properties['resident_count'] -or
+                    -not $lockState.PSObject.Properties['process_count'] -or
+                    -not $lockState.owners.PSObject.Properties['processes']) {
+                    Fail-Astro 'ASTRO_FSV_LOCK_RETIRE_INVALID_LOCK' `
+                        'v3 FSV lock omits resident/process cardinality' `
+                        'preserve the lock/session and investigate incomplete ownership state'
+                }
+                $lockResidentCount = [int]$lockState.resident_count
+                $lockProcessCount = [int]$lockState.process_count
+                $lockProcesses = Read-AstroFsvV3ProcessEntries `
+                    $lockState.owners.processes $lockResidentCount $lockProcessCount `
+                    'ASTRO_FSV_LOCK_RETIRE_INVALID_LOCK' 'v3 FSV-lock process set'
+            }
             $runRecord = Assert-PathWithin $RunRecordPath $inspection.session_directory `
                 'ASTRO_FSV_LOCK_RETIRE_RUN_RECORD_ESCAPE' 'run record path'
             if (-not (Test-AstroPathLongPath -LiteralPath $runRecord -PathType Leaf)) {
@@ -1535,7 +1745,10 @@ try {
                     "parse run record '$runRecord' failed: $($_.Exception.Message)" `
                     'preserve the lock and session; investigate the incomplete run'
             }
-            if ($record.schema -ne 'astrolabe.native-fsv-run.v2' -or
+            if ($record.schema -notin @(
+                    'astrolabe.native-fsv-run.v2',
+                    'astrolabe.native-fsv-run.v3'
+                ) -or
                 [int]$record.issue -ne [int]$inspection.issue -or
                 -not [string]::Equals([IO.Path]::GetFullPath([string]$record.receipt_path), $receiptState.Path, [StringComparison]::OrdinalIgnoreCase) -or
                 -not [string]::Equals([IO.Path]::GetFullPath([string]$record.artifact.path), $inspection.artifact_path, [StringComparison]::OrdinalIgnoreCase) -or
@@ -1564,11 +1777,8 @@ try {
             )
             $runRunner = Read-AstroFsvProcessIdentity $record.runner `
                 'ASTRO_FSV_LOCK_RETIRE_RUN_RECORD_INVALID' 'run-record runner identity'
-            $runChild = Read-AstroFsvProcessIdentity $record.process.identity `
-                'ASTRO_FSV_LOCK_RETIRE_RUN_RECORD_INVALID' 'run-record child identity'
             if (-not (Test-AstroFsvIdentityEqual $lockLauncher $inspection.owners.launcher) -or
-                -not (Test-AstroFsvIdentityEqual $lockRunner $runRunner) -or
-                -not (Test-AstroFsvIdentityEqual $lockChild $runChild)) {
+                -not (Test-AstroFsvIdentityEqual $lockRunner $runRunner)) {
                 Fail-Astro 'ASTRO_FSV_LOCK_RETIRE_OWNER_MISMATCH' `
                     'FSV lock owner generations differ from the selected receipt/run/live-state records' `
                     'preserve the lock and session; retry with the exact bound artifacts'
@@ -1577,7 +1787,43 @@ try {
             foreach ($binding in $sessionBindings) { $ownerBindings.Add($binding) }
             $ownerBindings.Add((New-AstroFsvOwnerBinding 'launcher' $fsvLock $lockLauncher))
             $ownerBindings.Add((New-AstroFsvOwnerBinding 'runner' $fsvLock $lockRunner))
-            $ownerBindings.Add((New-AstroFsvOwnerBinding 'child' $fsvLock $lockChild))
+            if ([string]$lockState.schema -ceq 'astrolabe.native-fsv-lock.v2') {
+                if ([string]$record.schema -cne 'astrolabe.native-fsv-run.v2') {
+                    Fail-Astro 'ASTRO_FSV_LOCK_RETIRE_OWNER_MISMATCH' `
+                        'v2 FSV lock is paired with a non-v2 run record' `
+                        'preserve the lock/session and pass the exact bound lifecycle records'
+                }
+                $runChild = Read-AstroFsvProcessIdentity $record.process.identity `
+                    'ASTRO_FSV_LOCK_RETIRE_RUN_RECORD_INVALID' `
+                    'run-record child identity'
+                if (-not (Test-AstroFsvIdentityEqual $lockChild $runChild)) {
+                    Fail-Astro 'ASTRO_FSV_LOCK_RETIRE_OWNER_MISMATCH' `
+                        'v2 FSV-lock child generation differs from its run record' `
+                        'preserve the lock/session and pass the exact bound lifecycle records'
+                }
+                $ownerBindings.Add((New-AstroFsvOwnerBinding `
+                            'child' $fsvLock $lockChild))
+            }
+            else {
+                if ([string]$record.schema -cne 'astrolabe.native-fsv-run.v3' -or
+                    [int]$record.resident_count -ne $lockResidentCount -or
+                    [int]$record.process_count -ne $lockProcessCount) {
+                    Fail-Astro 'ASTRO_FSV_LOCK_RETIRE_OWNER_MISMATCH' `
+                        'v3 FSV-lock cardinality differs from its run record' `
+                        'preserve the lock/session and pass the exact bound lifecycle records'
+                }
+                $runProcesses = Read-AstroFsvV3ProcessEntries `
+                    $record.processes $lockResidentCount $lockProcessCount `
+                    'ASTRO_FSV_LOCK_RETIRE_RUN_RECORD_INVALID' `
+                    'v3 run-record process set'
+                if (-not (Test-AstroFsvV3ProcessEntriesEqual `
+                        $lockProcesses $runProcesses)) {
+                    Fail-Astro 'ASTRO_FSV_LOCK_RETIRE_OWNER_MISMATCH' `
+                        'v3 FSV-lock process generations differ from its run record' `
+                        'preserve the lock/session and pass the exact bound lifecycle records'
+                }
+                Add-AstroFsvV3ProcessBindings $ownerBindings $lockProcesses $fsvLock
+            }
             $initialOwnerProbes = @(
                 Assert-AstroFsvOwnersInactive `
                     -Bindings ([object[]]$ownerBindings.ToArray()) `
@@ -2088,11 +2334,14 @@ try {
                 Fail-Astro 'ASTRO_FSV_QUARANTINE_LIVE_STATE_INVALID' "parse live-state '$liveStateFile' failed: $($_.Exception.Message)" `
                     'preserve the session and investigate its incomplete process provenance'
             }
-            if ($liveState.schema -ne 'astrolabe.native-fsv-live.v2' -or
+            $liveSchemaSupported = [string]$liveState.schema -in @(
+                'astrolabe.native-fsv-live.v2',
+                'astrolabe.native-fsv-live.v3'
+            )
+            if (-not $liveSchemaSupported -or
                 -not $liveState.PSObject.Properties['owners'] -or
                 -not $liveState.owners.PSObject.Properties['launcher'] -or
                 -not $liveState.owners.PSObject.Properties['runner'] -or
-                -not $liveState.owners.PSObject.Properties['child'] -or
                 [int]$liveState.issue -ne [int]$inspection.issue -or
                 [string]$liveState.tree_sha -cne [string]$inspection.tree_sha -or
                 -not [string]::Equals([IO.Path]::GetFullPath([string]$liveState.artifact.path), $inspection.artifact_path, [StringComparison]::OrdinalIgnoreCase) -or
@@ -2111,17 +2360,14 @@ try {
                 $liveState.owners.runner `
                 'ASTRO_FSV_QUARANTINE_OWNER_INVALID' `
                 'runner live-state runner identity'
-            $liveChildIdentity = Read-AstroFsvProcessIdentity `
-                $liveState.owners.child `
-                'ASTRO_FSV_QUARANTINE_OWNER_INVALID' `
-                'runner live-state child identity'
             if (-not (Test-AstroFsvIdentityEqual `
                     $inspection.owners.launcher $liveLauncherIdentity)) {
                 Fail-Astro 'ASTRO_FSV_QUARANTINE_OWNER_MISMATCH' `
                     'receipt and runner live-state launcher generations differ' `
                     'preserve the session and investigate the cross-lease provenance'
             }
-            $ownerBindings = @(
+            $ownerBindingList = New-Object System.Collections.Generic.List[object]
+            foreach ($binding in @(
                 New-AstroFsvOwnerBinding `
                     'launcher' 'artifact receipt' $inspection.owners.launcher
                 New-AstroFsvOwnerBinding `
@@ -2130,9 +2376,37 @@ try {
                     'launcher' 'runner live state' $liveLauncherIdentity
                 New-AstroFsvOwnerBinding `
                     'runner' 'runner live state' $liveRunnerIdentity
-                New-AstroFsvOwnerBinding `
-                    'child' 'runner live state' $liveChildIdentity
-            )
+            )) { $ownerBindingList.Add($binding) }
+            if ([string]$liveState.schema -ceq 'astrolabe.native-fsv-live.v2') {
+                if (-not $liveState.owners.PSObject.Properties['child']) {
+                    Fail-Astro 'ASTRO_FSV_QUARANTINE_OWNER_INVALID' `
+                        'v2 runner live state omits its child identity' `
+                        'preserve the session and investigate incomplete process provenance'
+                }
+                $liveChildIdentity = Read-AstroFsvProcessIdentity `
+                    $liveState.owners.child `
+                    'ASTRO_FSV_QUARANTINE_OWNER_INVALID' `
+                    'runner live-state child identity'
+                $ownerBindingList.Add((New-AstroFsvOwnerBinding `
+                            'child' 'runner live state' $liveChildIdentity))
+            }
+            else {
+                if (-not $liveState.PSObject.Properties['resident_count'] -or
+                    -not $liveState.PSObject.Properties['process_count'] -or
+                    -not $liveState.owners.PSObject.Properties['processes']) {
+                    Fail-Astro 'ASTRO_FSV_QUARANTINE_OWNER_INVALID' `
+                        'v3 runner live state omits resident/process cardinality' `
+                        'preserve the session and investigate incomplete process provenance'
+                }
+                $liveProcesses = Read-AstroFsvV3ProcessEntries `
+                    $liveState.owners.processes ([int]$liveState.resident_count) `
+                    ([int]$liveState.process_count) `
+                    'ASTRO_FSV_QUARANTINE_OWNER_INVALID' `
+                    'runner v3 live-state process set'
+                Add-AstroFsvV3ProcessBindings $ownerBindingList $liveProcesses `
+                    'runner live state'
+            }
+            $ownerBindings = [object[]]$ownerBindingList.ToArray()
             $initialOwnerProbes = @(
                 Assert-AstroFsvOwnersInactive `
                     -Bindings $ownerBindings `
@@ -2153,7 +2427,30 @@ try {
                     $candidateRecord =
                         Read-AstroUtf8FileLongPath $expectedRunRecord |
                             ConvertFrom-Json
-                    if ($candidateRecord.schema -eq 'astrolabe.native-fsv-run.v2' -and
+                    $candidateProcessEnvelopeValid = $false
+                    if ([string]$candidateRecord.schema -ceq
+                            'astrolabe.native-fsv-run.v2') {
+                        $candidateProcessEnvelopeValid =
+                            $null -ne $candidateRecord.PSObject.Properties['process'] -and
+                            $null -ne $candidateRecord.process.PSObject.Properties['identity']
+                    }
+                    elseif ([string]$candidateRecord.schema -ceq
+                            'astrolabe.native-fsv-run.v3') {
+                        try {
+                            [void](Read-AstroFsvV3ProcessEntries `
+                                $candidateRecord.processes `
+                                ([int]$candidateRecord.resident_count) `
+                                ([int]$candidateRecord.process_count) `
+                                'ASTRO_FSV_QUARANTINE_CANDIDATE_INVALID' `
+                                'candidate v3 run-record process set')
+                            $candidateProcessEnvelopeValid = $true
+                        }
+                        catch { $candidateProcessEnvelopeValid = $false }
+                    }
+                    if ($candidateRecord.schema -in @(
+                            'astrolabe.native-fsv-run.v2',
+                            'astrolabe.native-fsv-run.v3'
+                        ) -and $candidateProcessEnvelopeValid -and
                         [int]$candidateRecord.issue -eq [int]$inspection.issue -and
                         [string]::Equals([IO.Path]::GetFullPath([string]$candidateRecord.receipt_path), $receiptState.Path, [StringComparison]::OrdinalIgnoreCase) -and
                         [string]::Equals([IO.Path]::GetFullPath([string]$candidateRecord.artifact.path), $inspection.artifact_path, [StringComparison]::OrdinalIgnoreCase) -and
@@ -2762,8 +3059,6 @@ try {
             }
             if (-not $record.PSObject.Properties['launcher'] -or
                 -not $record.PSObject.Properties['runner'] -or
-                -not $record.PSObject.Properties['process'] -or
-                -not $record.process.PSObject.Properties['identity'] -or
                 -not $record.PSObject.Properties['artifact'] -or
                 -not $record.artifact.PSObject.Properties['path'] -or
                 -not $record.artifact.PSObject.Properties['sha256'] -or
@@ -2772,7 +3067,23 @@ try {
                     "run record '$runRecord' omits required exact ownership or artifact binding" `
                     'preserve the evidence directory and investigate the incomplete run'
             }
-            if ($record.schema -ne 'astrolabe.native-fsv-run.v2' -or
+            $supportedRunSchema = [string]$record.schema -in @(
+                'astrolabe.native-fsv-run.v2',
+                'astrolabe.native-fsv-run.v3'
+            )
+            $processEnvelopeValid = if ([string]$record.schema -ceq
+                    'astrolabe.native-fsv-run.v2') {
+                $record.PSObject.Properties['process'] -and
+                    $record.process.PSObject.Properties['identity']
+            }
+            elseif ([string]$record.schema -ceq
+                    'astrolabe.native-fsv-run.v3') {
+                $record.PSObject.Properties['resident_count'] -and
+                    $record.PSObject.Properties['process_count'] -and
+                    $record.PSObject.Properties['processes']
+            }
+            else { $false }
+            if (-not $supportedRunSchema -or -not $processEnvelopeValid -or
                 [int]$record.issue -ne [int]$inspection.issue -or
                 -not [string]::Equals([IO.Path]::GetFullPath([string]$record.receipt_path), $receiptState.Path, [StringComparison]::OrdinalIgnoreCase) -or
                 -not [string]::Equals([IO.Path]::GetFullPath([string]$record.artifact.path), $inspection.artifact_path, [StringComparison]::OrdinalIgnoreCase) -or

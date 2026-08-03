@@ -60,16 +60,79 @@ static const char *itoa_buf(int v) {
 }
 
 static int remove_optional_file(const char *path, const char *code) {
-    if (!cbm_path_exists(path)) {
+    unsigned long before_error = 0;
+    cbm_path_probe_result_t before = cbm_path_probe(path, &before_error);
+    if (before == CBM_PATH_PROBE_ABSENT) {
         return 0;
     }
-    if (cbm_unlink(path) == 0 && !cbm_path_exists(path)) {
-        return 0;
+    if (before == CBM_PATH_PROBE_ERROR) {
+        cbm_log_error("incremental.file_remove_failed", "code", code, "path", path,
+                      "native_error", itoa_buf((int)before_error), "message",
+                      "a transaction-owned SQLite path could not be classified before removal",
+                      "remediation", "preserve the path, resolve the native probe error, and retry");
+        return CBM_NOT_FOUND;
+    }
+    if (cbm_unlink(path) == 0) {
+        unsigned long after_error = 0;
+        cbm_path_probe_result_t after = cbm_path_probe(path, &after_error);
+        if (after == CBM_PATH_PROBE_ABSENT) {
+            return 0;
+        }
+        cbm_log_error(
+            "incremental.file_remove_failed", "code", code, "path", path, "native_error",
+            itoa_buf((int)after_error), "message",
+            after == CBM_PATH_PROBE_PRESENT
+                ? "a removed transaction-owned SQLite path remained present on readback"
+                : "transaction-owned SQLite path absence could not be proven after removal",
+            "remediation", "preserve the remaining namespace state and inspect it before retrying");
+        return CBM_NOT_FOUND;
     }
     cbm_log_error("incremental.file_remove_failed", "code", code, "path", path, "message",
                   "a transaction-owned or stale SQLite file could not be removed", "remediation",
                   "close the process holding this file and retry");
     return CBM_NOT_FOUND;
+}
+
+static int require_incremental_sidecars_absent(
+    cbm_pipeline_t *pipeline, const char *wal_path, const char *shm_path,
+    const char *present_code, const char *operation, const char *message,
+    const char *remediation, bool *unevaluable) {
+    if (unevaluable) {
+        *unevaluable = false;
+    }
+    unsigned long wal_error = 0;
+    unsigned long shm_error = 0;
+    cbm_path_probe_result_t wal_probe = cbm_path_probe(wal_path, &wal_error);
+    cbm_path_probe_result_t shm_probe = cbm_path_probe(shm_path, &shm_error);
+    if (wal_probe == CBM_PATH_PROBE_ERROR || shm_probe == CBM_PATH_PROBE_ERROR) {
+        const char *failed_path = wal_probe == CBM_PATH_PROBE_ERROR ? wal_path : shm_path;
+        unsigned long native_error = wal_probe == CBM_PATH_PROBE_ERROR ? wal_error : shm_error;
+        if (unevaluable) {
+            *unevaluable = true;
+        }
+        cbm_log_error("incremental.dump_failed", "code",
+                      "CBM_INCREMENTAL_SIDECAR_PROBE_FAILED", "operation", operation, "path",
+                      failed_path, "native_error", itoa_buf((int)native_error), "message",
+                      "a SQLite sidecar path could not be classified exactly", "remediation",
+                      "preserve the complete family, resolve the native probe error, and retry");
+        cbm_pipeline_record_fatal_error(
+            pipeline, "CBM_INCREMENTAL_SIDECAR_PROBE_FAILED", operation, "incremental.persist",
+            failed_path, 0, "a SQLite sidecar path could not be classified exactly",
+            "preserve the complete family, resolve the native probe error, and retry");
+        return CBM_NOT_FOUND;
+    }
+    if (wal_probe == CBM_PATH_PROBE_PRESENT || shm_probe == CBM_PATH_PROBE_PRESENT) {
+        cbm_log_error("incremental.dump_failed", "code", present_code, "operation", operation,
+                      "wal_path", wal_path, "shm_path", shm_path, "wal_present",
+                      wal_probe == CBM_PATH_PROBE_PRESENT ? "true" : "false", "shm_present",
+                      shm_probe == CBM_PATH_PROBE_PRESENT ? "true" : "false", "message", message,
+                      "remediation", remediation);
+        cbm_pipeline_record_fatal_error(pipeline, present_code, operation, "incremental.persist",
+                                        wal_probe == CBM_PATH_PROBE_PRESENT ? wal_path : shm_path,
+                                        0, message, remediation);
+        return CBM_NOT_FOUND;
+    }
+    return 0;
 }
 
 static int allocate_sidecar_paths(const char *base, char **wal, char **shm) {
@@ -916,6 +979,8 @@ static int dump_and_persist(cbm_pipeline_t *pipeline, cbm_gbuf_t *gbuf, const ch
     char *live_wal = NULL;
     char *live_shm = NULL;
     int result = CBM_NOT_FOUND;
+    bool stage_generation_started = false;
+    bool preserve_unevaluable_stage = false;
     if (cbm_pipeline_unique_stage_path(db_path, "incremental", &stage) != 0 ||
         allocate_sidecar_paths(stage, &stage_wal, &stage_shm) != 0 ||
         allocate_sidecar_paths(db_path, &live_wal, &live_shm) != 0) {
@@ -927,15 +992,17 @@ static int dump_and_persist(cbm_pipeline_t *pipeline, cbm_gbuf_t *gbuf, const ch
         cbm_pipeline_phase_probe_end(pipeline, "incr_dump_and_persist", &persist_probe);
         return CBM_NOT_FOUND;
     }
-    if (cbm_path_exists(stage_wal) || cbm_path_exists(stage_shm)) {
-        cbm_log_error("incremental.dump_failed", "code", "CBM_INCREMENTAL_STAGE_SIDECAR_COLLISION",
-                      "path", stage, "message",
-                      "a generated transaction-owned stage sidecar already exists", "remediation",
-                      "preserve the colliding files and retry with a new indexing request");
+    if (require_incremental_sidecars_absent(
+            pipeline, stage_wal, stage_shm, "CBM_INCREMENTAL_STAGE_SIDECAR_COLLISION",
+            "probe_generated_stage_sidecars",
+            "a generated transaction-owned stage sidecar already exists",
+            "preserve the colliding files and retry with a new indexing request",
+            &preserve_unevaluable_stage) != 0) {
         goto cleanup;
     }
 
     cbm_pipeline_attach_row_sink(pipeline, gbuf);
+    stage_generation_started = true;
     int dump_rc = cbm_gbuf_dump_to_sqlite(gbuf, stage);
     cbm_log_info("incremental.dump", "rc", itoa_buf(dump_rc), "elapsed_ms",
                  itoa_buf((int)elapsed_ms(t)));
@@ -974,10 +1041,13 @@ static int dump_and_persist(cbm_pipeline_t *pipeline, cbm_gbuf_t *gbuf, const ch
                        "FROM nodes;") != CBM_STORE_OK) {
         final_rc = CBM_NOT_FOUND;
     }
-    if (final_rc == 0 &&
-        (cbm_store_checkpoint(hash_store) != CBM_STORE_OK ||
-         cbm_store_exec(hash_store, "PRAGMA journal_mode=DELETE;") != CBM_STORE_OK)) {
-        final_rc = CBM_NOT_FOUND;
+    if (final_rc == 0) {
+        cbm_store_normalize_result_t normalization;
+        if (cbm_store_exec(hash_store, "PRAGMA optimize;") != CBM_STORE_OK ||
+            cbm_store_normalize_journal_mode_delete(hash_store, &normalization) !=
+                CBM_STORE_NORMALIZE_OK) {
+            final_rc = CBM_NOT_FOUND;
+        }
     }
     if (final_rc == 0 && !cbm_store_check_integrity(hash_store)) {
         final_rc = CBM_NOT_FOUND;
@@ -986,7 +1056,7 @@ static int dump_and_persist(cbm_pipeline_t *pipeline, cbm_gbuf_t *gbuf, const ch
         final_rc = cbm_pipeline_complete_row_sink(pipeline,
                                                   (size_t)file_count + (size_t)mode_skipped_count);
     }
-    cbm_store_close(hash_store);
+    cbm_store_close_required(&hash_store, "incremental.stage.complete");
 
     if (final_rc != 0) {
         cbm_log_error("incremental.dump_failed", "code", "CBM_INCREMENTAL_STAGE_FINALIZE_FAILED",
@@ -995,19 +1065,16 @@ static int dump_and_persist(cbm_pipeline_t *pipeline, cbm_gbuf_t *gbuf, const ch
         goto cleanup;
     }
 
-    if (cbm_path_exists(stage_wal) || cbm_path_exists(stage_shm)) {
-        cbm_log_error("incremental.dump_failed", "code", "CBM_INCREMENTAL_STAGE_WAL_NOT_FINALIZED",
-                      "message",
-                      "the closed staged database still has a WAL or shared-memory sidecar",
-                      "remediation", "inspect SQLite checkpoint errors and retry");
+    if (require_incremental_sidecars_absent(
+            pipeline, stage_wal, stage_shm, "CBM_INCREMENTAL_STAGE_WAL_NOT_FINALIZED",
+            "readback_closed_stage_sidecars",
+            "the closed staged database still has a WAL or shared-memory sidecar",
+            "inspect SQLite checkpoint errors and retry", &preserve_unevaluable_stage) != 0) {
         goto cleanup;
     }
 
-    if (cbm_path_exists(live_wal) || cbm_path_exists(live_shm)) {
-        cbm_log_error("incremental.dump_failed", "code", "CBM_INCREMENTAL_LIVE_WAL_PRESENT", "path",
-                      db_path, "message",
-                      "the live store acquired a WAL or shared-memory sidecar before swap",
-                      "remediation", "close concurrent readers or writers and retry indexing");
+    if (cbm_pipeline_verify_live_store_before_publication(pipeline, db_path, live_wal,
+                                                          live_shm) != 0) {
         goto cleanup;
     }
     if (cbm_rename_replace(stage, db_path) != 0) {
@@ -1033,10 +1100,15 @@ static int dump_and_persist(cbm_pipeline_t *pipeline, cbm_gbuf_t *gbuf, const ch
     }
 
 cleanup:
-    if (result != 0) {
+    if (result != 0 && stage_generation_started && !preserve_unevaluable_stage) {
         (void)remove_optional_file(stage, "CBM_INCREMENTAL_FAILED_STAGE_REMOVE_FAILED");
         (void)remove_optional_file(stage_wal, "CBM_INCREMENTAL_FAILED_STAGE_WAL_REMOVE_FAILED");
         (void)remove_optional_file(stage_shm, "CBM_INCREMENTAL_FAILED_STAGE_SHM_REMOVE_FAILED");
+    } else if (result != 0 && preserve_unevaluable_stage) {
+        cbm_log_error("incremental.dump_failed", "code",
+                      "CBM_INCREMENTAL_STAGE_FAMILY_PRESERVED", "path", stage, "message",
+                      "the staged generation is preserved because its physical state is unevaluable",
+                      "remediation", "resolve the preceding path probe error before cleanup");
     }
     free(stage);
     free(stage_wal);
@@ -1064,7 +1136,7 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
                       "complete hash set",
                       "remediation", "repair the routing contract and retry the complete corpus");
         if (store) {
-            cbm_store_close(store);
+            cbm_store_close_required(&store, "incremental.invalid_verified_input");
         }
         cbm_store_free_file_hashes(stored, stored_count > 0 ? stored_count : 0);
         return CBM_NOT_FOUND;
@@ -1075,7 +1147,7 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
             cbm_log_info("incremental.rebuild_required", "reason", "legacy_or_invalid_digest",
                          "rel_path", stored[i].rel_path ? stored[i].rel_path : "");
             cbm_store_free_file_hashes(stored, stored_count);
-            cbm_store_close(store);
+            cbm_store_close_required(&store, "incremental.invalid_stored_digest");
             return CBM_INCREMENTAL_REBUILD_REQUIRED;
         }
     }
@@ -1088,7 +1160,7 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
         classify_files(files, file_count, stored, stored_count, &n_changed, &n_unchanged);
     if (!is_changed) {
         cbm_store_free_file_hashes(stored, stored_count);
-        cbm_store_close(store);
+        cbm_store_close_required(&store, "incremental.classification_failed");
         return CBM_NOT_FOUND;
     }
 
@@ -1098,7 +1170,7 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
                          "rel_path", files[i].rel_path);
             free(is_changed);
             cbm_store_free_file_hashes(stored, stored_count);
-            cbm_store_close(store);
+            cbm_store_close_required(&store, "incremental.auxiliary_input_changed");
             return CBM_INCREMENTAL_REBUILD_REQUIRED;
         }
     }
@@ -1115,7 +1187,7 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
     if (deleted_rc != 0) {
         free(is_changed);
         cbm_store_free_file_hashes(stored, stored_count);
-        cbm_store_close(store);
+        cbm_store_close_required(&store, "incremental.deleted_file_scan_failed");
         return CBM_NOT_FOUND;
     }
     for (int i = 0; i < deleted_count; i++) {
@@ -1131,7 +1203,7 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
             free(deleted);
             free_mode_skipped(mode_skipped, mode_skipped_count);
             cbm_store_free_file_hashes(stored, stored_count);
-            cbm_store_close(store);
+            cbm_store_close_required(&store, "incremental.auxiliary_input_deleted");
             return CBM_INCREMENTAL_REBUILD_REQUIRED;
         }
     }
@@ -1163,10 +1235,10 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
             free(deleted);
             free_mode_skipped(mode_skipped, mode_skipped_count);
             cbm_store_free_file_hashes(stored, stored_count);
-            cbm_store_close(store);
+            cbm_store_close_required(&store, "incremental.noop_count_failed");
             return CBM_NOT_FOUND;
         }
-        cbm_store_close(store);
+        cbm_store_close_required(&store, "incremental.noop_complete");
         store = NULL;
         free(is_changed);
         free(deleted);
@@ -1183,7 +1255,7 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
     /* The route supplied a verified read-only connection. Close it without
      * entering WAL, checkpointing, or changing journal mode before the separate
      * verified graph reload. */
-    cbm_store_close(store);
+    cbm_store_close_required(&store, "incremental.release_verified_route_store");
     store = NULL;
 
     /* Build list of changed files */

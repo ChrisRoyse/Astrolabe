@@ -139,6 +139,44 @@ typedef struct {
     bool recovered_abandoned_capacity;
 } cbm_index_admission_t;
 
+static void mcp_close_windows_handle_or_abort(HANDLE *handle, const char *operation) {
+    if (!handle || !*handle || *handle == INVALID_HANDLE_VALUE) {
+        return;
+    }
+    if (!CloseHandle(*handle)) {
+        DWORD error = GetLastError();
+        char native_error[CBM_SZ_32];
+        snprintf(native_error, sizeof(native_error), "%lu", (unsigned long)error);
+        cbm_log_error("mcp.windows_handle.close_failed", "code",
+                      "CBM_MCP_WINDOWS_HANDLE_CLOSE_FAILED", "operation",
+                      operation ? operation : "unknown", "native_error_kind", "win32",
+                      "native_error", native_error, "remediation",
+                      "inspect the exact process generation and preserved state; the process will "
+                      "terminate so the kernel releases the retained handle");
+        fflush(NULL);
+        abort();
+    }
+    *handle = NULL;
+}
+
+static void mcp_release_mutex_or_abort(HANDLE mutex, const char *operation, const char *project,
+                                       const char *repo_path) {
+    if (ReleaseMutex(mutex)) {
+        return;
+    }
+    DWORD error = GetLastError();
+    char native_error[CBM_SZ_32];
+    snprintf(native_error, sizeof(native_error), "%lu", (unsigned long)error);
+    cbm_log_error("index.admission.release_failed", "code", "CBM_INDEX_MUTEX_RELEASE_FAILED",
+                  "operation", operation ? operation : "unknown", "project",
+                  project ? project : "", "repo_path", repo_path ? repo_path : "",
+                  "native_error_kind", "win32", "native_error", native_error, "remediation",
+                  "inspect the exact worker thread ownership; the process will terminate so the "
+                  "kernel releases every retained admission handle");
+    fflush(NULL);
+    abort();
+}
+
 static void add_index_admission_telemetry(yyjson_mut_doc *doc, yyjson_mut_val *root,
                                           const cbm_index_admission_t *admission) {
     yyjson_mut_val *telemetry = yyjson_mut_obj(doc);
@@ -275,8 +313,8 @@ static char *acquire_index_admission(const char *project, const char *repo_path,
     }
     DWORD project_wait = WaitForSingleObject(admission->project_mutex, 0);
     if (project_wait == WAIT_TIMEOUT) {
-        CloseHandle(admission->project_mutex);
-        admission->project_mutex = NULL;
+        mcp_close_windows_handle_or_abort(&admission->project_mutex,
+                                          "index_admission.project_busy");
         cbm_log_error("index.admission.refused", "code", "CBM_INDEX_PROJECT_BUSY", "project",
                       project, "repo_path", repo_path, "pipeline_started", "false",
                       "sqlite_publication_started", "false", "message",
@@ -288,9 +326,10 @@ static char *acquire_index_admission(const char *project, const char *repo_path,
             "let the exact project index finish, then retry once", admission);
     }
     if (project_wait == WAIT_ABANDONED) {
-        ReleaseMutex(admission->project_mutex);
-        CloseHandle(admission->project_mutex);
-        admission->project_mutex = NULL;
+        mcp_release_mutex_or_abort(admission->project_mutex,
+                                   "index_admission.project_abandoned", project, repo_path);
+        mcp_close_windows_handle_or_abort(&admission->project_mutex,
+                                          "index_admission.project_abandoned");
         cbm_log_error(
             "index.admission.refused", "code", "CBM_INDEX_PROJECT_OWNER_ABANDONED", "project",
             project, "repo_path", repo_path, "pipeline_started", "false",
@@ -307,8 +346,8 @@ static char *acquire_index_admission(const char *project, const char *repo_path,
     if (project_wait != WAIT_OBJECT_0) {
         char native_error[CBM_SZ_32];
         snprintf(native_error, sizeof(native_error), "%lu", (unsigned long)GetLastError());
-        CloseHandle(admission->project_mutex);
-        admission->project_mutex = NULL;
+        mcp_close_windows_handle_or_abort(&admission->project_mutex,
+                                          "index_admission.project_wait_failed");
         cbm_log_error("index.admission.failed", "code", "CBM_INDEX_PROJECT_MUTEX_WAIT_FAILED",
                       "project", project, "repo_path", repo_path, "native_error_kind", "win32",
                       "native_error", native_error, "message",
@@ -329,9 +368,10 @@ static char *acquire_index_admission(const char *project, const char *repo_path,
                       "native_error", native_error, "message",
                       "the host-wide expensive-index lease could not be opened", "remediation",
                       "resolve the reported Windows named-object failure and retry");
-        ReleaseMutex(admission->project_mutex);
-        CloseHandle(admission->project_mutex);
-        admission->project_mutex = NULL;
+        mcp_release_mutex_or_abort(admission->project_mutex,
+                                   "index_admission.host_create_failed", project, repo_path);
+        mcp_close_windows_handle_or_abort(&admission->project_mutex,
+                                          "index_admission.host_create_failed");
         return index_admission_error(
             "CBM_INDEX_HOST_MUTEX_CREATE_FAILED", project, repo_path,
             "the host-wide expensive-index lease could not be opened",
@@ -342,11 +382,12 @@ static char *acquire_index_admission(const char *project, const char *repo_path,
     DWORD host_wait = WaitForSingleObject(admission->host_mutex, admission->host_timeout_ms);
     admission->host_waited_ms = cbm_now_ms() - wait_started_ms;
     if (host_wait == WAIT_TIMEOUT) {
-        CloseHandle(admission->host_mutex);
-        admission->host_mutex = NULL;
-        ReleaseMutex(admission->project_mutex);
-        CloseHandle(admission->project_mutex);
-        admission->project_mutex = NULL;
+        mcp_close_windows_handle_or_abort(&admission->host_mutex,
+                                          "index_admission.host_busy");
+        mcp_release_mutex_or_abort(admission->project_mutex, "index_admission.host_busy", project,
+                                   repo_path);
+        mcp_close_windows_handle_or_abort(&admission->project_mutex,
+                                          "index_admission.host_busy");
         cbm_log_error("index.admission.refused", "code", "CBM_INDEX_HOST_BUSY", "project", project,
                       "repo_path", repo_path, "pipeline_started", "false",
                       "sqlite_publication_started", "false", "message",
@@ -360,11 +401,12 @@ static char *acquire_index_admission(const char *project, const char *repo_path,
     if (host_wait != WAIT_OBJECT_0 && host_wait != WAIT_ABANDONED) {
         char native_error[CBM_SZ_32];
         snprintf(native_error, sizeof(native_error), "%lu", (unsigned long)GetLastError());
-        CloseHandle(admission->host_mutex);
-        admission->host_mutex = NULL;
-        ReleaseMutex(admission->project_mutex);
-        CloseHandle(admission->project_mutex);
-        admission->project_mutex = NULL;
+        mcp_close_windows_handle_or_abort(&admission->host_mutex,
+                                          "index_admission.host_wait_failed");
+        mcp_release_mutex_or_abort(admission->project_mutex,
+                                   "index_admission.host_wait_failed", project, repo_path);
+        mcp_close_windows_handle_or_abort(&admission->project_mutex,
+                                          "index_admission.host_wait_failed");
         cbm_log_error("index.admission.failed", "code", "CBM_INDEX_HOST_MUTEX_WAIT_FAILED",
                       "project", project, "repo_path", repo_path, "native_error_kind", "win32",
                       "native_error", native_error, "message",
@@ -391,34 +433,19 @@ static char *acquire_index_admission(const char *project, const char *repo_path,
 
 static bool release_index_admission(cbm_index_admission_t *admission, const char *project,
                                     const char *repo_path) {
-    bool released = true;
     if (admission->host_mutex) {
-        if (!ReleaseMutex(admission->host_mutex)) {
-            char native_error[CBM_SZ_32];
-            snprintf(native_error, sizeof(native_error), "%lu", (unsigned long)GetLastError());
-            cbm_log_error("index.admission.release_failed", "code",
-                          "CBM_INDEX_HOST_MUTEX_RELEASE_FAILED", "project", project, "repo_path",
-                          repo_path, "native_error_kind", "win32", "native_error", native_error,
-                          "remediation", "inspect the exact worker thread ownership and retry");
-            released = false;
-        }
-        CloseHandle(admission->host_mutex);
-        admission->host_mutex = NULL;
+        mcp_release_mutex_or_abort(admission->host_mutex, "index_admission.release_host", project,
+                                   repo_path);
+        mcp_close_windows_handle_or_abort(&admission->host_mutex,
+                                          "index_admission.release_host");
     }
     if (admission->project_mutex) {
-        if (!ReleaseMutex(admission->project_mutex)) {
-            char native_error[CBM_SZ_32];
-            snprintf(native_error, sizeof(native_error), "%lu", (unsigned long)GetLastError());
-            cbm_log_error("index.admission.release_failed", "code",
-                          "CBM_INDEX_PROJECT_MUTEX_RELEASE_FAILED", "project", project, "repo_path",
-                          repo_path, "native_error_kind", "win32", "native_error", native_error,
-                          "remediation", "inspect the exact worker thread ownership and retry");
-            released = false;
-        }
-        CloseHandle(admission->project_mutex);
-        admission->project_mutex = NULL;
+        mcp_release_mutex_or_abort(admission->project_mutex, "index_admission.release_project",
+                                   project, repo_path);
+        mcp_close_windows_handle_or_abort(&admission->project_mutex,
+                                          "index_admission.release_project");
     }
-    return released;
+    return true;
 }
 #endif
 
@@ -1401,6 +1428,27 @@ struct cbm_mcp_server {
     char transition_error_code[CBM_SZ_64];
     char transition_error_project[CBM_SZ_256];
     DWORD transition_native_error;
+    cbm_store_close_result_t store_close_result;
+    bool store_close_error_active;
+    char store_close_operation[CBM_SZ_128];
+    char store_close_project[CBM_SZ_256];
+    uint64_t store_close_cache_age_s;
+    uint64_t store_close_process_id;
+    uint64_t store_close_process_start_utc_ticks;
+    bool store_close_process_identity_available;
+    unsigned long store_close_process_identity_native_error;
+    bool store_close_db_present;
+    bool store_close_wal_present;
+    bool store_close_shm_present;
+    cbm_path_probe_result_t store_close_db_probe;
+    cbm_path_probe_result_t store_close_wal_probe;
+    cbm_path_probe_result_t store_close_shm_probe;
+    unsigned long store_close_db_probe_native_error;
+    unsigned long store_close_wal_probe_native_error;
+    unsigned long store_close_shm_probe_native_error;
+    int64_t store_close_db_bytes;
+    int64_t store_close_wal_bytes;
+    int64_t store_close_shm_bytes;
     char update_notice[CBM_SZ_256]; /* one-shot update notice, cleared after first injection */
     bool update_checked;            /* true after background check has been launched */
     cbm_thread_t update_tid;        /* background update check thread */
@@ -1425,6 +1473,359 @@ struct cbm_mcp_server {
     cbm_pipeline_row_sink_v1_t row_sink;
     bool row_sink_active;
 };
+
+static void clear_cached_store_close_error(cbm_mcp_server_t *srv) {
+    if (!srv) {
+        return;
+    }
+    memset(&srv->store_close_result, 0, sizeof(srv->store_close_result));
+    srv->store_close_error_active = false;
+    srv->store_close_operation[0] = '\0';
+    srv->store_close_project[0] = '\0';
+    srv->store_close_cache_age_s = 0;
+    srv->store_close_process_id = 0;
+    srv->store_close_process_start_utc_ticks = 0;
+    srv->store_close_process_identity_available = false;
+    srv->store_close_process_identity_native_error = ERROR_SUCCESS;
+    srv->store_close_db_present = false;
+    srv->store_close_wal_present = false;
+    srv->store_close_shm_present = false;
+    srv->store_close_db_probe = CBM_PATH_PROBE_ERROR;
+    srv->store_close_wal_probe = CBM_PATH_PROBE_ERROR;
+    srv->store_close_shm_probe = CBM_PATH_PROBE_ERROR;
+    srv->store_close_db_probe_native_error = ERROR_INVALID_PARAMETER;
+    srv->store_close_wal_probe_native_error = ERROR_INVALID_PARAMETER;
+    srv->store_close_shm_probe_native_error = ERROR_INVALID_PARAMETER;
+    srv->store_close_db_bytes = CBM_NOT_FOUND;
+    srv->store_close_wal_bytes = CBM_NOT_FOUND;
+    srv->store_close_shm_bytes = CBM_NOT_FOUND;
+}
+
+static bool current_exact_process_identity(uint64_t *process_id,
+                                           uint64_t *process_start_utc_ticks,
+                                           unsigned long *native_error) {
+    if (process_id) {
+        *process_id = 0;
+    }
+    if (process_start_utc_ticks) {
+        *process_start_utc_ticks = 0;
+    }
+    if (native_error) {
+        *native_error = ERROR_SUCCESS;
+    }
+#ifdef _WIN32
+    if (!process_id || !process_start_utc_ticks) {
+        if (native_error) {
+            *native_error = ERROR_INVALID_PARAMETER;
+        }
+        return false;
+    }
+    *process_id = (uint64_t)GetCurrentProcessId();
+    FILETIME creation = {0};
+    FILETIME exit = {0};
+    FILETIME kernel = {0};
+    FILETIME user = {0};
+    if (!GetProcessTimes(GetCurrentProcess(), &creation, &exit, &kernel, &user)) {
+        if (native_error) {
+            *native_error = GetLastError();
+        }
+        return false;
+    }
+    *process_start_utc_ticks =
+        ((uint64_t)creation.dwHighDateTime << 32) | creation.dwLowDateTime;
+    return *process_id > 0 && *process_start_utc_ticks > 0;
+#else
+    (void)process_id;
+    (void)process_start_utc_ticks;
+    if (native_error) {
+        *native_error = ERROR_NOT_SUPPORTED;
+    }
+    return false;
+#endif
+}
+
+static void cached_store_family_readback(cbm_mcp_server_t *srv, const char *db_path) {
+    if (!srv || !db_path || !db_path[0]) {
+        return;
+    }
+    char wal_path[CBM_STORE_VERIFY_PATH_MAX];
+    char shm_path[CBM_STORE_VERIFY_PATH_MAX];
+    int wal_len = snprintf(wal_path, sizeof(wal_path), "%s-wal", db_path);
+    int shm_len = snprintf(shm_path, sizeof(shm_path), "%s-shm", db_path);
+    srv->store_close_db_probe =
+        cbm_path_probe(db_path, &srv->store_close_db_probe_native_error);
+    srv->store_close_db_present = srv->store_close_db_probe == CBM_PATH_PROBE_PRESENT;
+    if (srv->store_close_db_present) {
+        srv->store_close_db_bytes = cbm_file_size(db_path);
+    }
+    if (wal_len > 0 && (size_t)wal_len < sizeof(wal_path)) {
+        srv->store_close_wal_probe =
+            cbm_path_probe(wal_path, &srv->store_close_wal_probe_native_error);
+        srv->store_close_wal_present = srv->store_close_wal_probe == CBM_PATH_PROBE_PRESENT;
+        if (srv->store_close_wal_present) {
+            srv->store_close_wal_bytes = cbm_file_size(wal_path);
+        }
+    } else {
+        srv->store_close_wal_probe_native_error = ERROR_BUFFER_OVERFLOW;
+    }
+    if (shm_len > 0 && (size_t)shm_len < sizeof(shm_path)) {
+        srv->store_close_shm_probe =
+            cbm_path_probe(shm_path, &srv->store_close_shm_probe_native_error);
+        srv->store_close_shm_present = srv->store_close_shm_probe == CBM_PATH_PROBE_PRESENT;
+        if (srv->store_close_shm_present) {
+            srv->store_close_shm_bytes = cbm_file_size(shm_path);
+        }
+    } else {
+        srv->store_close_shm_probe_native_error = ERROR_BUFFER_OVERFLOW;
+    }
+}
+
+static void clear_cached_store_metadata_after_destroy(cbm_mcp_server_t *srv) {
+    srv->store = NULL;
+    srv->owns_store = false;
+    free(srv->current_project);
+    srv->current_project = NULL;
+    srv->store_last_used = 0;
+}
+
+/* One result-bearing boundary owns every cached MCP connection close.  It logs
+ * the exact process generation when Windows can read it (and the native query
+ * error otherwise), plus a separate post-close physical read of the DB/WAL/SHM
+ * family.  Metadata is cleared only when SQLite reports that the connection was
+ * physically destroyed; otherwise the unchanged pointer and ownership remain
+ * available for diagnosis and a close failure blocks callers. */
+static int close_cached_store_exact(cbm_mcp_server_t *srv, const char *operation,
+                                    const char *project_hint) {
+    if (!srv) {
+        return CBM_NOT_FOUND;
+    }
+    if (srv->store_close_error_active) {
+        return CBM_NOT_FOUND;
+    }
+    if (!srv->store) {
+        clear_cached_store_metadata_after_destroy(srv);
+        return 0;
+    }
+    clear_cached_store_close_error(srv);
+
+    snprintf(srv->store_close_operation, sizeof(srv->store_close_operation), "%s",
+             operation ? operation : "cached_store.close");
+    snprintf(srv->store_close_project, sizeof(srv->store_close_project), "%s",
+             project_hint ? project_hint
+                          : (srv->current_project ? srv->current_project : ""));
+    time_t now = time(NULL);
+    if (srv->store_last_used > 0 && now >= srv->store_last_used) {
+        srv->store_close_cache_age_s = (uint64_t)(now - srv->store_last_used);
+    }
+
+    srv->store_close_process_identity_available = current_exact_process_identity(
+        &srv->store_close_process_id, &srv->store_close_process_start_utc_ticks,
+        &srv->store_close_process_identity_native_error);
+
+    const char *borrowed_path = cbm_store_db_path(srv->store);
+    char db_path[CBM_STORE_VERIFY_PATH_MAX];
+    snprintf(db_path, sizeof(db_path), "%s", borrowed_path ? borrowed_path : "");
+    if (!srv->owns_store) {
+        srv->store_close_error_active = true;
+        srv->store_close_result.abi_version = CBM_STORE_CLOSE_ABI_VERSION;
+        srv->store_close_result.struct_size = sizeof(srv->store_close_result);
+        srv->store_close_result.status = CBM_STORE_CLOSE_INVALID_ARGUMENT;
+        srv->store_close_result.sqlite_close_code = SQLITE_MISUSE;
+        srv->store_close_result.connection_was_present = 1;
+        snprintf(srv->store_close_result.db_path,
+                 sizeof(srv->store_close_result.db_path), "%s", db_path);
+        cached_store_family_readback(srv, db_path);
+        cbm_log_error("mcp.cached_store.close_refused", "code",
+                      "CBM_CACHED_STORE_NOT_OWNED", "operation",
+                      srv->store_close_operation, "project", srv->store_close_project,
+                      "db_path", db_path, "connection_destroyed", "false", "remediation",
+                      "retain the borrowed connection and close it through its exact owner");
+        return CBM_NOT_FOUND;
+    }
+
+    cbm_store_close_status_t close_status =
+        cbm_store_close(&srv->store, &srv->store_close_result);
+    cached_store_family_readback(srv, db_path);
+    if (srv->store_close_result.connection_destroyed) {
+        clear_cached_store_metadata_after_destroy(srv);
+    }
+
+    char close_status_text[CBM_SZ_32];
+    char sqlite_error_text[CBM_SZ_32];
+    char cache_age_text[CBM_SZ_32];
+    char process_id_text[CBM_SZ_32];
+    char process_start_text[CBM_SZ_32];
+    char process_identity_error_text[CBM_SZ_32];
+    char db_bytes_text[CBM_SZ_32];
+    char wal_bytes_text[CBM_SZ_32];
+    char shm_bytes_text[CBM_SZ_32];
+    char db_probe_text[CBM_SZ_32];
+    char wal_probe_text[CBM_SZ_32];
+    char shm_probe_text[CBM_SZ_32];
+    char db_probe_error_text[CBM_SZ_32];
+    char wal_probe_error_text[CBM_SZ_32];
+    char shm_probe_error_text[CBM_SZ_32];
+    char outstanding_text[CBM_SZ_32];
+    snprintf(close_status_text, sizeof(close_status_text), "%d", (int)close_status);
+    snprintf(sqlite_error_text, sizeof(sqlite_error_text), "%d",
+             srv->store_close_result.sqlite_close_code);
+    snprintf(cache_age_text, sizeof(cache_age_text), "%llu",
+             (unsigned long long)srv->store_close_cache_age_s);
+    snprintf(process_id_text, sizeof(process_id_text), "%llu",
+             (unsigned long long)srv->store_close_process_id);
+    snprintf(process_start_text, sizeof(process_start_text), "%llu",
+             (unsigned long long)srv->store_close_process_start_utc_ticks);
+    snprintf(process_identity_error_text, sizeof(process_identity_error_text), "%lu",
+             srv->store_close_process_identity_native_error);
+    snprintf(db_bytes_text, sizeof(db_bytes_text), "%lld",
+             (long long)srv->store_close_db_bytes);
+    snprintf(wal_bytes_text, sizeof(wal_bytes_text), "%lld",
+             (long long)srv->store_close_wal_bytes);
+    snprintf(shm_bytes_text, sizeof(shm_bytes_text), "%lld",
+             (long long)srv->store_close_shm_bytes);
+    snprintf(db_probe_text, sizeof(db_probe_text), "%d", (int)srv->store_close_db_probe);
+    snprintf(wal_probe_text, sizeof(wal_probe_text), "%d", (int)srv->store_close_wal_probe);
+    snprintf(shm_probe_text, sizeof(shm_probe_text), "%d", (int)srv->store_close_shm_probe);
+    snprintf(db_probe_error_text, sizeof(db_probe_error_text), "%lu",
+             srv->store_close_db_probe_native_error);
+    snprintf(wal_probe_error_text, sizeof(wal_probe_error_text), "%lu",
+             srv->store_close_wal_probe_native_error);
+    snprintf(shm_probe_error_text, sizeof(shm_probe_error_text), "%lu",
+             srv->store_close_shm_probe_native_error);
+    snprintf(outstanding_text, sizeof(outstanding_text), "%llu",
+             (unsigned long long)srv->store_close_result.outstanding_statement_count);
+
+    bool physically_destroyed = srv->store_close_result.connection_destroyed && !srv->store;
+    bool closed = close_status == CBM_STORE_CLOSE_OK && physically_destroyed;
+    if (closed) {
+        cbm_log_info(
+            "mcp.cached_store.closed", "operation", srv->store_close_operation, "project",
+            srv->store_close_project, "db_path", db_path, "cache_age_s", cache_age_text,
+            "process_id", process_id_text, "process_start_utc_ticks", process_start_text,
+            "process_identity_available",
+            srv->store_close_process_identity_available ? "true" : "false",
+            "process_identity_native_error", process_identity_error_text,
+            "close_status", close_status_text, "sqlite_error", sqlite_error_text,
+            "connection_destroyed", "true", "db_present",
+            srv->store_close_db_present ? "true" : "false", "db_bytes", db_bytes_text,
+            "db_probe", db_probe_text, "db_probe_native_error", db_probe_error_text,
+            "wal_present", srv->store_close_wal_present ? "true" : "false", "wal_bytes",
+            wal_bytes_text, "wal_probe", wal_probe_text, "wal_probe_native_error",
+            wal_probe_error_text, "shm_present",
+            srv->store_close_shm_present ? "true" : "false", "shm_bytes", shm_bytes_text,
+            "shm_probe", shm_probe_text, "shm_probe_native_error", shm_probe_error_text);
+        return 0;
+    }
+
+    /* sqlite3_finalize can report a statement's last execution error even when
+     * sqlite3_close subsequently destroys the connection. The initiating
+     * operation still fails, but only a retained connection is a sticky cache
+     * ownership failure. */
+    srv->store_close_error_active = !physically_destroyed;
+    cbm_log_error(
+        "mcp.cached_store.close_failed", "code", "CBM_CACHED_STORE_CLOSE_FAILED",
+        "operation", srv->store_close_operation, "project", srv->store_close_project,
+        "db_path", db_path, "cache_age_s", cache_age_text, "process_id", process_id_text,
+        "process_start_utc_ticks", process_start_text, "close_status", close_status_text,
+        "process_identity_available",
+        srv->store_close_process_identity_available ? "true" : "false",
+        "process_identity_native_error", process_identity_error_text,
+        "sqlite_error", sqlite_error_text, "connection_destroyed",
+        srv->store_close_result.connection_destroyed ? "true" : "false",
+        "outstanding_statements", outstanding_text, "first_outstanding_sql_sha256",
+        srv->store_close_result.first_outstanding_sql_sha256, "db_present",
+        srv->store_close_db_present ? "true" : "false", "db_bytes", db_bytes_text,
+        "db_probe", db_probe_text, "db_probe_native_error", db_probe_error_text,
+        "wal_present", srv->store_close_wal_present ? "true" : "false", "wal_bytes",
+        wal_bytes_text, "wal_probe", wal_probe_text, "wal_probe_native_error",
+        wal_probe_error_text, "shm_present", srv->store_close_shm_present ? "true" : "false",
+        "shm_bytes", shm_bytes_text, "shm_probe", shm_probe_text, "shm_probe_native_error",
+        shm_probe_error_text, "remediation",
+        "finalize the named outstanding statement or resolve the exact SQLite close error; "
+        "preserve the complete database family and retry only after physical close succeeds");
+    return CBM_NOT_FOUND;
+}
+
+/* Temporary query/writer handles are not cache metadata, but they use the same
+ * exact physical close contract. A diagnostic from a destroyed connection is
+ * returned as false; a retained connection terminates because no caller has a
+ * durable owner-result channel beyond its stack-local pointer. */
+static bool close_local_store_exact(cbm_store_t **store, const char *operation,
+                                    const char *project,
+                                    cbm_store_close_result_t *out_result) {
+    cbm_store_close_result_t local_result;
+    cbm_store_close_result_t *result = out_result ? out_result : &local_result;
+    cbm_store_close_status_t status = cbm_store_close(store, result);
+    if (status == CBM_STORE_CLOSE_OK && result->connection_destroyed && !*store) {
+        return true;
+    }
+    char status_text[CBM_SZ_32];
+    char sqlite_text[CBM_SZ_32];
+    char outstanding_text[CBM_SZ_32];
+    snprintf(status_text, sizeof(status_text), "%d", (int)status);
+    snprintf(sqlite_text, sizeof(sqlite_text), "%d", result->sqlite_close_code);
+    snprintf(outstanding_text, sizeof(outstanding_text), "%llu",
+             (unsigned long long)result->outstanding_statement_count);
+    cbm_log_error(
+        "mcp.local_store.close_failed", "code", "CBM_LOCAL_STORE_CLOSE_FAILED",
+        "operation", operation ? operation : "local_store.close", "project",
+        project ? project : "", "db_path", result->db_path, "close_status", status_text,
+        "sqlite_error", sqlite_text, "connection_destroyed",
+        result->connection_destroyed ? "true" : "false", "outstanding_statements",
+        outstanding_text, "first_outstanding_sql_sha256",
+        result->first_outstanding_sql_sha256, "remediation",
+        "finalize the named outstanding statement or resolve the exact SQLite close error; "
+        "preserve the complete database family");
+    if (!result->connection_destroyed || (store && *store)) {
+        /* These callers own only a stack-local slot. Returning would discard
+         * the sole exact-close owner when the caller leaves its scope. */
+        fflush(NULL);
+        abort();
+    }
+    return false;
+}
+
+static char *build_local_store_close_error(const char *operation, const char *project,
+                                           const cbm_store_close_result_t *result) {
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    yyjson_mut_val *root = doc ? yyjson_mut_obj(doc) : NULL;
+    if (!doc || !root) {
+        if (doc) {
+            yyjson_mut_doc_free(doc);
+        }
+        return heap_strdup(
+            "{\"status\":\"error\",\"code\":\"CBM_LOCAL_STORE_CLOSE_FAILED\","
+            "\"message\":\"the exact local-store close failure could not be fully "
+            "serialized\"}");
+    }
+    yyjson_mut_doc_set_root(doc, root);
+    yyjson_mut_obj_add_str(doc, root, "status", "error");
+    yyjson_mut_obj_add_str(doc, root, "code", "CBM_LOCAL_STORE_CLOSE_FAILED");
+    yyjson_mut_obj_add_strcpy(doc, root, "operation", operation ? operation : "local_store.close");
+    yyjson_mut_obj_add_strcpy(doc, root, "project", project ? project : "");
+    yyjson_mut_obj_add_strcpy(doc, root, "db_path", result ? result->db_path : "");
+    yyjson_mut_obj_add_int(doc, root, "close_status",
+                           result ? result->status : CBM_STORE_CLOSE_FAILED);
+    yyjson_mut_obj_add_int(doc, root, "sqlite_error",
+                           result ? result->sqlite_close_code : SQLITE_ERROR);
+    yyjson_mut_obj_add_bool(doc, root, "connection_destroyed",
+                            result && result->connection_destroyed);
+    yyjson_mut_obj_add_uint(doc, root, "outstanding_statement_count",
+                            result ? result->outstanding_statement_count : 0);
+    yyjson_mut_obj_add_strcpy(doc, root, "first_outstanding_sql_sha256",
+                              result ? result->first_outstanding_sql_sha256 : "");
+    yyjson_mut_obj_add_str(
+        doc, root, "message",
+        "the mutation/query connection did not close exactly; the operation is not reported as "
+        "successful");
+    yyjson_mut_obj_add_str(
+        doc, root, "remediation",
+        "finalize the named outstanding statement or resolve the exact SQLite close error and "
+        "inspect the persisted database state before retrying");
+    char *json = yyjson_mut_write(doc, 0, NULL);
+    yyjson_mut_doc_free(doc);
+    return json;
+}
 
 typedef enum {
     CBM_PROJECT_TRANSITION_INACTIVE = 0,
@@ -1476,19 +1877,12 @@ static cbm_project_transition_state_t probe_project_transition(const char *proje
     }
     DWORD wait = WaitForSingleObject(mutex, 0);
     if (wait == WAIT_TIMEOUT) {
-        CloseHandle(mutex);
+        mcp_close_windows_handle_or_abort(&mutex, "project_transition.probe_active");
         return CBM_PROJECT_TRANSITION_ACTIVE;
     }
     if (wait == WAIT_OBJECT_0 || wait == WAIT_ABANDONED) {
-        bool release_ok = ReleaseMutex(mutex) != 0;
-        DWORD release_error = release_ok ? ERROR_SUCCESS : GetLastError();
-        CloseHandle(mutex);
-        if (!release_ok) {
-            if (native_error) {
-                *native_error = release_error;
-            }
-            return CBM_PROJECT_TRANSITION_PROBE_FAILED;
-        }
+        mcp_release_mutex_or_abort(mutex, "project_transition.probe_release", project, "");
+        mcp_close_windows_handle_or_abort(&mutex, "project_transition.probe_release");
         if (wait == WAIT_ABANDONED) {
             if (native_error) {
                 *native_error = ERROR_ABANDONED_WAIT_0;
@@ -1502,7 +1896,7 @@ static cbm_project_transition_state_t probe_project_transition(const char *proje
     if (native_error) {
         *native_error = GetLastError();
     }
-    CloseHandle(mutex);
+    mcp_close_windows_handle_or_abort(&mutex, "project_transition.probe_wait_failed");
     return CBM_PROJECT_TRANSITION_PROBE_FAILED;
 #else
     if (native_error) {
@@ -1566,7 +1960,8 @@ cbm_project_transition_t *cbm_project_transition_acquire(const char *project,
         if (native_error) {
             *native_error = wait == WAIT_TIMEOUT ? ERROR_BUSY : GetLastError();
         }
-        CloseHandle(transition->mutex);
+        mcp_close_windows_handle_or_abort(&transition->mutex,
+                                          "project_transition.acquire_wait_failed");
         free(transition);
         return NULL;
     }
@@ -1608,6 +2003,466 @@ static HANDLE project_transition_open_exclusive(const char *path, DWORD *native_
     *present = true;
     return handle;
 }
+
+enum {
+    CBM_RM_SESSION_KEY_CHARS = 33,
+    CBM_RM_APP_NAME_CHARS = 256,
+    CBM_RM_SERVICE_NAME_CHARS = 64,
+    CBM_RM_LIST_ATTEMPTS = 5,
+    CBM_WINDOWS_IMAGE_PATH_CHARS = 32768,
+};
+
+typedef struct {
+    DWORD process_id;
+    FILETIME process_start_time;
+} cbm_rm_unique_process_t;
+
+typedef struct {
+    cbm_rm_unique_process_t process;
+    WCHAR application_name[CBM_RM_APP_NAME_CHARS];
+    WCHAR service_short_name[CBM_RM_SERVICE_NAME_CHARS];
+    DWORD application_type;
+    ULONG application_status;
+    DWORD terminal_session_id;
+    BOOL restartable;
+} cbm_rm_process_info_t;
+
+typedef DWORD(WINAPI *cbm_rm_start_session_fn)(DWORD *, DWORD, WCHAR *);
+typedef DWORD(WINAPI *cbm_rm_register_resources_fn)(DWORD, UINT, LPCWSTR *, UINT,
+                                                    cbm_rm_unique_process_t *, UINT,
+                                                    LPCWSTR *);
+typedef DWORD(WINAPI *cbm_rm_get_list_fn)(DWORD, UINT *, UINT *, cbm_rm_process_info_t *,
+                                         LPDWORD);
+typedef DWORD(WINAPI *cbm_rm_end_session_fn)(DWORD);
+typedef BOOL(WINAPI *cbm_query_full_process_image_name_fn)(HANDLE, DWORD, LPWSTR, PDWORD);
+
+typedef struct {
+    HMODULE restart_manager;
+    cbm_rm_start_session_fn start_session;
+    cbm_rm_register_resources_fn register_resources;
+    cbm_rm_get_list_fn get_list;
+    cbm_rm_end_session_fn end_session;
+    cbm_query_full_process_image_name_fn query_process_path;
+    DWORD native_error;
+    char operation[CBM_PROJECT_HOLDER_PROBE_OPERATION_MAX];
+    bool ready;
+} cbm_restart_manager_api_t;
+
+static INIT_ONCE project_holder_api_once = INIT_ONCE_STATIC_INIT;
+static cbm_restart_manager_api_t project_holder_api;
+
+static BOOL CALLBACK initialize_project_holder_api(PINIT_ONCE once, PVOID parameter,
+                                                   PVOID *context) {
+    (void)once;
+    (void)parameter;
+    (void)context;
+    memset(&project_holder_api, 0, sizeof(project_holder_api));
+    project_holder_api.restart_manager = LoadLibraryW(L"Rstrtmgr.dll");
+    if (!project_holder_api.restart_manager) {
+        project_holder_api.native_error = GetLastError();
+        snprintf(project_holder_api.operation, sizeof(project_holder_api.operation), "%s",
+                 "LoadLibraryW(Rstrtmgr.dll)");
+        return TRUE;
+    }
+
+    HMODULE kernel32 = GetModuleHandleW(L"kernel32.dll");
+    FARPROC start_address =
+        GetProcAddress(project_holder_api.restart_manager, "RmStartSession");
+    FARPROC register_address =
+        GetProcAddress(project_holder_api.restart_manager, "RmRegisterResources");
+    FARPROC list_address = GetProcAddress(project_holder_api.restart_manager, "RmGetList");
+    FARPROC end_address = GetProcAddress(project_holder_api.restart_manager, "RmEndSession");
+    FARPROC query_path_address =
+        kernel32 ? GetProcAddress(kernel32, "QueryFullProcessImageNameW") : NULL;
+    _Static_assert(sizeof(project_holder_api.start_session) == sizeof(start_address),
+                   "Restart Manager function pointers must match FARPROC width");
+    _Static_assert(sizeof(project_holder_api.register_resources) == sizeof(register_address),
+                   "Restart Manager function pointers must match FARPROC width");
+    _Static_assert(sizeof(project_holder_api.get_list) == sizeof(list_address),
+                   "Restart Manager function pointers must match FARPROC width");
+    _Static_assert(sizeof(project_holder_api.end_session) == sizeof(end_address),
+                   "Restart Manager function pointers must match FARPROC width");
+    _Static_assert(sizeof(project_holder_api.query_process_path) == sizeof(query_path_address),
+                   "process-query function pointers must match FARPROC width");
+    memcpy(&project_holder_api.start_session, &start_address,
+           sizeof(project_holder_api.start_session));
+    memcpy(&project_holder_api.register_resources, &register_address,
+           sizeof(project_holder_api.register_resources));
+    memcpy(&project_holder_api.get_list, &list_address,
+           sizeof(project_holder_api.get_list));
+    memcpy(&project_holder_api.end_session, &end_address,
+           sizeof(project_holder_api.end_session));
+    memcpy(&project_holder_api.query_process_path, &query_path_address,
+           sizeof(project_holder_api.query_process_path));
+    if (!project_holder_api.start_session || !project_holder_api.register_resources ||
+        !project_holder_api.get_list || !project_holder_api.end_session ||
+        !project_holder_api.query_process_path) {
+        project_holder_api.native_error = ERROR_PROC_NOT_FOUND;
+        snprintf(project_holder_api.operation, sizeof(project_holder_api.operation), "%s",
+                 "GetProcAddress(RestartManager)");
+        FreeLibrary(project_holder_api.restart_manager);
+        project_holder_api.restart_manager = NULL;
+        return TRUE;
+    }
+
+    project_holder_api.native_error = ERROR_SUCCESS;
+    snprintf(project_holder_api.operation, sizeof(project_holder_api.operation), "%s",
+             "RestartManager.cached");
+    project_holder_api.ready = true;
+    return TRUE;
+}
+
+static bool get_project_holder_api(cbm_restart_manager_api_t **api, DWORD *native_error,
+                                   const char **operation) {
+    if (api) {
+        *api = NULL;
+    }
+    if (!InitOnceExecuteOnce(&project_holder_api_once, initialize_project_holder_api, NULL,
+                             NULL)) {
+        if (native_error) {
+            *native_error = GetLastError();
+        }
+        if (operation) {
+            *operation = "InitOnceExecuteOnce(RestartManager)";
+        }
+        return false;
+    }
+    if (native_error) {
+        *native_error = project_holder_api.native_error;
+    }
+    if (operation) {
+        *operation = project_holder_api.operation;
+    }
+    if (!project_holder_api.ready) {
+        return false;
+    }
+    if (api) {
+        *api = &project_holder_api;
+    }
+    return true;
+}
+
+typedef struct {
+    uint32_t process_id;
+    uint64_t process_start_utc_ticks;
+    char path[CBM_PROJECT_HOLDER_PATH_MAX];
+} cbm_project_holder_t;
+
+typedef struct {
+    cbm_project_holder_probe_status_t status;
+    DWORD native_error;
+    char operation[CBM_PROJECT_HOLDER_PROBE_OPERATION_MAX];
+    cbm_project_holder_t *holders;
+    size_t count;
+} cbm_project_holder_inventory_t;
+
+static uint64_t filetime_raw_ticks(FILETIME value) {
+    return ((uint64_t)value.dwHighDateTime << 32) | value.dwLowDateTime;
+}
+
+static void project_holder_inventory_free(cbm_project_holder_inventory_t *inventory) {
+    if (!inventory) {
+        return;
+    }
+    free(inventory->holders);
+    inventory->holders = NULL;
+    inventory->count = 0;
+}
+
+static void project_holder_inventory_fail(cbm_project_holder_inventory_t *inventory,
+                                          cbm_project_holder_probe_status_t status,
+                                          DWORD native_error, const char *operation) {
+    inventory->status = status;
+    inventory->native_error = native_error;
+    snprintf(inventory->operation, sizeof(inventory->operation), "%s",
+             operation ? operation : "restart_manager");
+}
+
+static int compare_project_holders(const void *left, const void *right) {
+    const cbm_project_holder_t *a = left;
+    const cbm_project_holder_t *b = right;
+    if (a->process_id != b->process_id) {
+        return a->process_id < b->process_id ? -1 : 1;
+    }
+    if (a->process_start_utc_ticks != b->process_start_utc_ticks) {
+        return a->process_start_utc_ticks < b->process_start_utc_ticks ? -1 : 1;
+    }
+    return strcmp(a->path, b->path);
+}
+
+static bool project_holder_inventories_equal(const cbm_project_holder_inventory_t *a,
+                                             const cbm_project_holder_inventory_t *b) {
+    if (!a || !b || a->count != b->count) {
+        return false;
+    }
+    for (size_t i = 0; i < a->count; i++) {
+        if (a->holders[i].process_id != b->holders[i].process_id ||
+            a->holders[i].process_start_utc_ticks !=
+                b->holders[i].process_start_utc_ticks ||
+            strcmp(a->holders[i].path, b->holders[i].path) != 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static int project_holder_inventory_once(const char *const *members, size_t member_count,
+                                         cbm_project_holder_inventory_t *inventory) {
+    memset(inventory, 0, sizeof(*inventory));
+    inventory->status = CBM_PROJECT_HOLDER_PROBE_NOT_RUN;
+
+    LPCWSTR wide_members[3] = {NULL, NULL, NULL};
+    size_t registered_count = 0;
+    for (size_t i = 0; i < member_count; i++) {
+        unsigned long member_error = 0;
+        cbm_path_probe_result_t member_probe = cbm_path_probe(members[i], &member_error);
+        if (member_probe == CBM_PATH_PROBE_ERROR) {
+            project_holder_inventory_fail(inventory, CBM_PROJECT_HOLDER_PROBE_REGISTER_FAILED,
+                                          member_error, "probe_family_path");
+            for (size_t j = 0; j < registered_count; j++) {
+                free((void *)wide_members[j]);
+            }
+            return CBM_NOT_FOUND;
+        }
+        if (member_probe == CBM_PATH_PROBE_ABSENT) {
+            continue;
+        }
+        DWORD path_error = ERROR_SUCCESS;
+        wchar_t *wide = cbm_utf8_to_wide_path_checked(members[i], &path_error);
+        if (!wide) {
+            project_holder_inventory_fail(inventory, CBM_PROJECT_HOLDER_PROBE_REGISTER_FAILED,
+                                          path_error, "prepare_family_path");
+            for (size_t j = 0; j < registered_count; j++) {
+                free((void *)wide_members[j]);
+            }
+            return CBM_NOT_FOUND;
+        }
+        wide_members[registered_count++] = wide;
+    }
+    if (registered_count == 0) {
+        inventory->status = CBM_PROJECT_HOLDER_PROBE_STABLE;
+        snprintf(inventory->operation, sizeof(inventory->operation), "%s",
+                 "family_absent");
+        return 0;
+    }
+
+    cbm_restart_manager_api_t *api = NULL;
+    DWORD api_error = ERROR_SUCCESS;
+    const char *api_operation = NULL;
+    if (!get_project_holder_api(&api, &api_error, &api_operation)) {
+        project_holder_inventory_fail(inventory, CBM_PROJECT_HOLDER_PROBE_API_UNAVAILABLE,
+                                      api_error, api_operation);
+        goto cleanup_paths;
+    }
+
+    WCHAR session_key[CBM_RM_SESSION_KEY_CHARS] = {0};
+    DWORD session = 0;
+    DWORD rc = api->start_session(&session, 0, session_key);
+    if (rc != ERROR_SUCCESS) {
+        project_holder_inventory_fail(inventory, CBM_PROJECT_HOLDER_PROBE_SESSION_FAILED, rc,
+                                      "RmStartSession");
+        goto cleanup_paths;
+    }
+
+    rc = api->register_resources(session, (UINT)registered_count, wide_members, 0, NULL, 0,
+                                 NULL);
+    if (rc != ERROR_SUCCESS) {
+        project_holder_inventory_fail(inventory, CBM_PROJECT_HOLDER_PROBE_REGISTER_FAILED, rc,
+                                      "RmRegisterResources");
+        goto end_session;
+    }
+
+    cbm_rm_process_info_t *processes = NULL;
+    UINT process_capacity = 0;
+    UINT process_count = 0;
+    for (int attempt = 0; attempt < CBM_RM_LIST_ATTEMPTS; attempt++) {
+        UINT needed = 0;
+        process_count = process_capacity;
+        DWORD reboot_reasons = 0;
+        rc = api->get_list(session, &needed, &process_count, processes, &reboot_reasons);
+        if (rc == ERROR_SUCCESS) {
+            break;
+        }
+        if (rc != ERROR_MORE_DATA || needed == 0) {
+            project_holder_inventory_fail(inventory, CBM_PROJECT_HOLDER_PROBE_LIST_FAILED, rc,
+                                          "RmGetList");
+            free(processes);
+            processes = NULL;
+            goto end_session;
+        }
+        cbm_rm_process_info_t *next =
+            realloc(processes, (size_t)needed * sizeof(*processes));
+        if (!next) {
+            project_holder_inventory_fail(inventory, CBM_PROJECT_HOLDER_PROBE_LIST_FAILED,
+                                          ERROR_NOT_ENOUGH_MEMORY, "allocate_RmGetList");
+            free(processes);
+            processes = NULL;
+            goto end_session;
+        }
+        processes = next;
+        memset(processes, 0, (size_t)needed * sizeof(*processes));
+        process_capacity = needed;
+    }
+    if (rc != ERROR_SUCCESS) {
+        project_holder_inventory_fail(inventory, CBM_PROJECT_HOLDER_PROBE_LIST_FAILED, rc,
+                                      "RmGetList.bounded");
+        free(processes);
+        goto end_session;
+    }
+
+    if (process_count > 0) {
+        inventory->holders = calloc(process_count, sizeof(*inventory->holders));
+        if (!inventory->holders) {
+            project_holder_inventory_fail(inventory, CBM_PROJECT_HOLDER_PROBE_LIST_FAILED,
+                                          ERROR_NOT_ENOUGH_MEMORY, "allocate_holder_inventory");
+            free(processes);
+            goto end_session;
+        }
+    }
+    inventory->count = process_count;
+    for (UINT i = 0; i < process_count; i++) {
+        DWORD pid = processes[i].process.process_id;
+        HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+        if (!process) {
+            project_holder_inventory_fail(
+                inventory, GetLastError() == ERROR_INVALID_PARAMETER
+                               ? CBM_PROJECT_HOLDER_PROBE_PROCESS_IDENTITY_CHANGED
+                               : CBM_PROJECT_HOLDER_PROBE_PROCESS_QUERY_FAILED,
+                GetLastError(), "OpenProcess");
+            free(processes);
+            goto end_session;
+        }
+        FILETIME creation = {0};
+        FILETIME exit = {0};
+        FILETIME kernel = {0};
+        FILETIME user = {0};
+        if (!GetProcessTimes(process, &creation, &exit, &kernel, &user)) {
+            DWORD process_error = GetLastError();
+            mcp_close_windows_handle_or_abort(&process, "restart_manager.process_times");
+            project_holder_inventory_fail(
+                inventory, CBM_PROJECT_HOLDER_PROBE_PROCESS_QUERY_FAILED, process_error,
+                "GetProcessTimes");
+            free(processes);
+            goto end_session;
+        }
+        if (filetime_raw_ticks(creation) !=
+            filetime_raw_ticks(processes[i].process.process_start_time)) {
+            mcp_close_windows_handle_or_abort(&process,
+                                              "restart_manager.process_generation_mismatch");
+            project_holder_inventory_fail(
+                inventory, CBM_PROJECT_HOLDER_PROBE_PROCESS_IDENTITY_CHANGED, ERROR_RETRY,
+                "compare_process_start_time");
+            free(processes);
+            goto end_session;
+        }
+        WCHAR wide_path[CBM_WINDOWS_IMAGE_PATH_CHARS];
+        DWORD wide_count = CBM_WINDOWS_IMAGE_PATH_CHARS;
+        if (!api->query_process_path(process, 0, wide_path, &wide_count)) {
+            DWORD path_error = GetLastError();
+            mcp_close_windows_handle_or_abort(&process, "restart_manager.process_path");
+            project_holder_inventory_fail(inventory,
+                                          CBM_PROJECT_HOLDER_PROBE_PROCESS_PATH_FAILED,
+                                          path_error, "QueryFullProcessImageNameW");
+            free(processes);
+            goto end_session;
+        }
+        mcp_close_windows_handle_or_abort(&process, "restart_manager.process_complete");
+        char *utf8_path = cbm_wide_to_utf8(wide_path);
+        if (!utf8_path || strlen(utf8_path) >= sizeof(inventory->holders[i].path)) {
+            DWORD path_error = utf8_path ? ERROR_INSUFFICIENT_BUFFER : GetLastError();
+            free(utf8_path);
+            project_holder_inventory_fail(inventory,
+                                          CBM_PROJECT_HOLDER_PROBE_PROCESS_PATH_FAILED,
+                                          path_error, "encode_process_path");
+            free(processes);
+            goto end_session;
+        }
+        inventory->holders[i].process_id = pid;
+        inventory->holders[i].process_start_utc_ticks = filetime_raw_ticks(creation);
+        snprintf(inventory->holders[i].path, sizeof(inventory->holders[i].path), "%s",
+                 utf8_path);
+        free(utf8_path);
+    }
+    free(processes);
+    if (inventory->count > 1) {
+        qsort(inventory->holders, inventory->count, sizeof(*inventory->holders),
+              compare_project_holders);
+    }
+    inventory->status = CBM_PROJECT_HOLDER_PROBE_STABLE;
+    inventory->native_error = ERROR_SUCCESS;
+    snprintf(inventory->operation, sizeof(inventory->operation), "%s", "RmGetList");
+
+end_session: {
+        DWORD end_rc = api->end_session(session);
+        if (end_rc != ERROR_SUCCESS && inventory->status == CBM_PROJECT_HOLDER_PROBE_STABLE) {
+            project_holder_inventory_fail(inventory,
+                                          CBM_PROJECT_HOLDER_PROBE_END_SESSION_FAILED, end_rc,
+                                          "RmEndSession");
+        }
+    }
+cleanup_paths:
+    for (size_t i = 0; i < registered_count; i++) {
+        free((void *)wide_members[i]);
+    }
+    return inventory->status == CBM_PROJECT_HOLDER_PROBE_STABLE ? 0 : CBM_NOT_FOUND;
+}
+
+static int project_holder_inventory_stable(const char *const *members, size_t member_count,
+                                           cbm_project_quiescence_result_t *result) {
+    cbm_project_holder_inventory_t first;
+    cbm_project_holder_inventory_t second;
+    int first_rc = project_holder_inventory_once(members, member_count, &first);
+    if (first_rc != 0) {
+        bool transient = first.status == CBM_PROJECT_HOLDER_PROBE_PROCESS_IDENTITY_CHANGED ||
+                         (first.status == CBM_PROJECT_HOLDER_PROBE_LIST_FAILED &&
+                          first.native_error == ERROR_MORE_DATA);
+        result->holder_probe_status = transient ? CBM_PROJECT_HOLDER_PROBE_UNSTABLE : first.status;
+        result->holder_probe_native_error = transient ? ERROR_RETRY : first.native_error;
+        snprintf(result->holder_probe_operation, sizeof(result->holder_probe_operation), "%s",
+                 transient ? "RmGetList.transient_first_sample" : first.operation);
+        project_holder_inventory_free(&first);
+        return transient ? 1 : CBM_NOT_FOUND;
+    }
+    int second_rc = project_holder_inventory_once(members, member_count, &second);
+    if (second_rc != 0) {
+        bool transient = second.status == CBM_PROJECT_HOLDER_PROBE_PROCESS_IDENTITY_CHANGED ||
+                         (second.status == CBM_PROJECT_HOLDER_PROBE_LIST_FAILED &&
+                          second.native_error == ERROR_MORE_DATA);
+        result->holder_probe_status = transient ? CBM_PROJECT_HOLDER_PROBE_UNSTABLE : second.status;
+        result->holder_probe_native_error = transient ? ERROR_RETRY : second.native_error;
+        snprintf(result->holder_probe_operation, sizeof(result->holder_probe_operation), "%s",
+                 transient ? "RmGetList.transient_second_sample" : second.operation);
+        project_holder_inventory_free(&first);
+        project_holder_inventory_free(&second);
+        return transient ? 1 : CBM_NOT_FOUND;
+    }
+    if (!project_holder_inventories_equal(&first, &second)) {
+        result->holder_probe_status = CBM_PROJECT_HOLDER_PROBE_UNSTABLE;
+        result->holder_probe_native_error = ERROR_RETRY;
+        snprintf(result->holder_probe_operation, sizeof(result->holder_probe_operation), "%s",
+                 "compare_RmGetList");
+        project_holder_inventory_free(&first);
+        project_holder_inventory_free(&second);
+        return 1;
+    }
+
+    result->holder_probe_status = CBM_PROJECT_HOLDER_PROBE_STABLE;
+    result->holder_probe_native_error = ERROR_SUCCESS;
+    result->holder_inventory_stable = 1;
+    result->holder_count = first.count;
+    snprintf(result->holder_probe_operation, sizeof(result->holder_probe_operation), "%s",
+             "RmGetList.stable");
+    if (first.count > 0) {
+        result->first_holder_process_id = first.holders[0].process_id;
+        result->first_holder_process_start_utc_ticks =
+            first.holders[0].process_start_utc_ticks;
+        snprintf(result->first_holder_path, sizeof(result->first_holder_path), "%s",
+                 first.holders[0].path);
+    }
+    project_holder_inventory_free(&first);
+    project_holder_inventory_free(&second);
+    return 0;
+}
 #endif
 
 int cbm_project_transition_wait_store_quiescent(
@@ -1636,8 +2491,17 @@ int cbm_project_transition_wait_store_quiescent(
     const char *members[] = {db_path, wal_path, shm_path};
     for (;;) {
         result->attempts++;
+        result->holder_probe_status = CBM_PROJECT_HOLDER_PROBE_NOT_RUN;
+        result->holder_probe_native_error = ERROR_SUCCESS;
+        result->holder_inventory_stable = 0;
+        result->holder_count = 0;
+        result->first_holder_process_id = 0;
+        result->first_holder_process_start_utc_ticks = 0;
+        result->holder_probe_operation[0] = '\0';
+        result->first_holder_path[0] = '\0';
         HANDLE held[3] = {NULL, NULL, NULL};
         bool retry = false;
+        bool fatal_member_error = false;
         for (size_t i = 0; i < 3; i++) {
             DWORD member_error = ERROR_SUCCESS;
             bool present = false;
@@ -1648,23 +2512,57 @@ int cbm_project_transition_wait_store_quiescent(
                 result->native_error = member_error;
                 retry = member_error == ERROR_SHARING_VIOLATION ||
                         member_error == ERROR_LOCK_VIOLATION;
+                fatal_member_error = !retry;
                 break;
             }
             held[i] = present ? handle : NULL;
         }
         for (size_t i = 0; i < 3; i++) {
             if (held[i]) {
-                CloseHandle(held[i]);
+                mcp_close_windows_handle_or_abort(&held[i],
+                                                  "project_quiescence.family_guard");
+            }
+        }
+        int holder_rc = project_holder_inventory_stable(members, 3, result);
+        if (holder_rc < 0) {
+            result->elapsed_ms = cbm_now_ms() - started;
+            if (!fatal_member_error) {
+                result->native_error = result->holder_probe_native_error;
+            }
+            return -1;
+        }
+        if (holder_rc > 0) {
+            if (!fatal_member_error) {
+                retry = true;
+            }
+            if (!fatal_member_error && result->native_error == ERROR_SUCCESS) {
+                result->native_error = ERROR_RETRY;
+                snprintf(result->failed_path, sizeof(result->failed_path), "%s", db_path);
+            }
+        } else if (result->holder_count > 0) {
+            if (!fatal_member_error) {
+                retry = true;
+            }
+            if (!fatal_member_error && result->native_error == ERROR_SUCCESS) {
+                result->native_error = ERROR_SHARING_VIOLATION;
+                snprintf(result->failed_path, sizeof(result->failed_path), "%s", db_path);
             }
         }
         result->elapsed_ms = cbm_now_ms() - started;
-        if (result->native_error == ERROR_SUCCESS) {
+        if (fatal_member_error) {
+            return -1;
+        }
+        if (result->native_error == ERROR_SUCCESS && result->holder_inventory_stable &&
+            result->holder_count == 0) {
             return 0;
         }
         if (!retry) {
             return -1;
         }
         if (result->elapsed_ms >= timeout_ms) {
+            if (!result->holder_inventory_stable) {
+                return -1;
+            }
             return 1;
         }
         Sleep(poll_ms);
@@ -1691,17 +2589,9 @@ int cbm_project_transition_release(cbm_project_transition_t *transition,
         }
         return -1;
     }
-    bool released = ReleaseMutex(transition->mutex) != 0;
-    DWORD error = released ? ERROR_SUCCESS : GetLastError();
-    CloseHandle(transition->mutex);
-    transition->mutex = NULL;
+    mcp_release_mutex_or_abort(transition->mutex, "project_transition.release", "", "");
+    mcp_close_windows_handle_or_abort(&transition->mutex, "project_transition.release");
     free(transition);
-    if (!released) {
-        if (native_error) {
-            *native_error = error;
-        }
-        return -1;
-    }
     return 0;
 }
 
@@ -1762,6 +2652,14 @@ void cbm_mcp_server_set_project(cbm_mcp_server_t *srv, const char *project) {
     if (!srv) {
         return;
     }
+    if (srv->store_close_error_active) {
+        return;
+    }
+    if (srv->store && srv->current_project &&
+        (!project || strcmp(srv->current_project, project) != 0) &&
+        close_cached_store_exact(srv, "mcp_server.set_project", project) != 0) {
+        return;
+    }
     free(srv->current_project);
     srv->current_project = project ? heap_strdup(project) : NULL;
 }
@@ -1819,8 +2717,18 @@ void cbm_mcp_server_free(cbm_mcp_server_t *srv) {
     if (srv->autoindex_active) {
         cbm_thread_join(&srv->autoindex_tid);
     }
-    if (srv->owns_store && srv->store) {
-        cbm_store_close(srv->store);
+    if ((srv->store || srv->store_close_error_active) &&
+        close_cached_store_exact(srv, "mcp_server.free", NULL) != 0) {
+        cbm_log_error("mcp.server.free_refused", "code",
+                      "CBM_MCP_SERVER_FREE_STORE_CLOSE_FAILED", "operation",
+                      srv->store_close_operation, "project", srv->store_close_project,
+                      "connection_destroyed",
+                      srv->store_close_result.connection_destroyed ? "true" : "false",
+                      "remediation",
+                      "inspect the exact cached-store close diagnostic; this process terminates "
+                      "because the void free API cannot return the retained live owner");
+        fflush(NULL);
+        abort();
     }
     free(srv->current_project);
     free(srv->active_request_id_str);
@@ -1831,32 +2739,37 @@ void cbm_mcp_server_free(cbm_mcp_server_t *srv) {
 
 /* ── Idle store eviction ──────────────────────────────────────── */
 
-void cbm_mcp_server_evict_idle(cbm_mcp_server_t *srv, int timeout_s) {
-    if (!srv || !srv->store) {
-        return;
+int cbm_mcp_server_evict_idle(cbm_mcp_server_t *srv, int timeout_s) {
+    if (!srv) {
+        return 0;
+    }
+    if (srv->store_close_error_active) {
+        return CBM_NOT_FOUND;
+    }
+    if (!srv->store) {
+        return 0;
     }
     /* Protect initial in-memory stores that were never accessed via a named project.
      * store_last_used stays 0 until resolve_store is called with a non-NULL project. */
     if (srv->store_last_used == 0) {
-        return;
+        return 0;
     }
 
     time_t now = time(NULL);
     if ((now - srv->store_last_used) < timeout_s) {
-        return;
+        return 0;
     }
-
-    if (srv->owns_store) {
-        cbm_store_close(srv->store);
-    }
-    srv->store = NULL;
-    free(srv->current_project);
-    srv->current_project = NULL;
-    srv->store_last_used = 0;
+    return close_cached_store_exact(srv, "idle_evict", NULL);
 }
 
 int cbm_mcp_server_quiesce_project_transition(cbm_mcp_server_t *srv) {
-    if (!srv || !srv->store || !srv->current_project || srv->store_last_used == 0) {
+    if (!srv) {
+        return 0;
+    }
+    if (srv->store_close_error_active) {
+        return -1;
+    }
+    if (!srv->store || !srv->current_project || srv->store_last_used == 0) {
         return 0;
     }
     char project[CBM_SZ_256];
@@ -1866,14 +2779,17 @@ int cbm_mcp_server_quiesce_project_transition(cbm_mcp_server_t *srv) {
     if (state == CBM_PROJECT_TRANSITION_INACTIVE) {
         return 0;
     }
-    if (srv->owns_store) {
-        cbm_store_close(srv->store);
+    if (close_cached_store_exact(srv, "project_transition.quiesce", project) != 0) {
+        record_project_transition_state(srv, project, state, native_error);
+        cbm_log_error("project.transition.quiesce_failed", "code",
+                      "CBM_PROJECT_TRANSITION_STORE_CLOSE_FAILED", "project", project,
+                      "connection_destroyed",
+                      srv->store_close_result.connection_destroyed ? "true" : "false",
+                      "remediation",
+                      "resolve the exact cached-store close failure before admitting the "
+                      "transition worker or publication");
+        return -1;
     }
-    srv->store = NULL;
-    srv->owns_store = false;
-    free(srv->current_project);
-    srv->current_project = NULL;
-    srv->store_last_used = 0;
     record_project_transition_state(srv, project, state, native_error);
     char native_error_text[CBM_SZ_32];
     snprintf(native_error_text, sizeof(native_error_text), "%lu", (unsigned long)native_error);
@@ -1894,32 +2810,127 @@ bool cbm_mcp_server_has_cached_store(cbm_mcp_server_t *srv) {
     return (srv && srv->store != NULL) != 0;
 }
 
+cbm_store_close_status_t cbm_mcp_server_close_cached_project_store(
+    cbm_mcp_server_t *srv, cbm_store_close_result_t *result) {
+    if (!result) {
+        cbm_log_error("mcp.cached_store.close_refused", "code",
+                      "CBM_CACHED_STORE_CLOSE_RESULT_REQUIRED", "remediation",
+                      "provide one caller-owned fixed-width close result");
+        return CBM_STORE_CLOSE_INVALID_ARGUMENT;
+    }
+    memset(result, 0, sizeof(*result));
+    result->abi_version = CBM_STORE_CLOSE_ABI_VERSION;
+    result->struct_size = (uint32_t)sizeof(*result);
+    result->status = CBM_STORE_CLOSE_INVALID_ARGUMENT;
+    result->sqlite_close_code = SQLITE_MISUSE;
+    if (!srv) {
+        cbm_log_error("mcp.cached_store.close_refused", "code",
+                      "CBM_CACHED_STORE_SERVER_REQUIRED", "remediation",
+                      "create the MCP server before closing its cached project store");
+        return result->status;
+    }
+    if (srv->store_close_error_active) {
+        *result = srv->store_close_result;
+        return result->status;
+    }
+    if (!srv->store) {
+        cbm_store_close_status_t status = cbm_store_close(&srv->store, result);
+        srv->store_close_result = *result;
+        return status;
+    }
+    (void)close_cached_store_exact(srv, "bridge.close_cached_project_store", NULL);
+    *result = srv->store_close_result;
+    return result->status;
+}
+
 cbm_pipeline_t *cbm_mcp_server_active_pipeline(cbm_mcp_server_t *srv) {
     return srv ? srv->active_pipeline : NULL;
 }
 
 /* ── Cache dir + project DB path helpers ───────────────────────── */
 
-/* Returns the cache directory. Writes to buf, returns buf for convenience. */
-static const char *cache_dir(char *buf, size_t bufsz) {
-    const char *dir = cbm_resolve_cache_dir();
-    if (!dir) {
-        dir = cbm_tmpdir();
+/* Resolve the exact configured cache directory. There is no TEMP fallback:
+ * an unresolved or over-capacity store identity must refuse before any probe. */
+static bool cache_dir(char *buf, size_t bufsz, unsigned long *native_error) {
+    if (native_error) {
+        *native_error = ERROR_SUCCESS;
     }
-    snprintf(buf, bufsz, "%s", dir);
-    return buf;
+    if (!buf || bufsz == 0) {
+        if (native_error) {
+            *native_error = ERROR_INVALID_PARAMETER;
+        }
+        cbm_log_error("mcp.cache_path_failed", "code", "CBM_CACHE_PATH_OUTPUT_INVALID",
+                      "message", "cache path output storage is missing", "remediation",
+                      "provide one caller-owned non-empty path buffer");
+        return false;
+    }
+    buf[0] = '\0';
+    const char *dir = cbm_resolve_cache_dir();
+    if (!dir || dir[0] == '\0') {
+        if (native_error) {
+            *native_error = ERROR_PATH_NOT_FOUND;
+        }
+        cbm_log_error("mcp.cache_path_failed", "code", "CBM_CACHE_PATH_UNRESOLVED", "message",
+                      "the configured project-store directory could not be resolved",
+                      "remediation", "set one valid cache root and retry the unchanged request");
+        return false;
+    }
+    int wrote = snprintf(buf, bufsz, "%s", dir);
+    if (wrote < 0 || (size_t)wrote >= bufsz) {
+        buf[0] = '\0';
+        if (native_error) {
+            *native_error = ERROR_BUFFER_OVERFLOW;
+        }
+        cbm_log_error("mcp.cache_path_failed", "code", "CBM_CACHE_PATH_TOO_LONG", "message",
+                      "the configured project-store directory exceeds path capacity",
+                      "remediation", "shorten the configured cache root and retry");
+        return false;
+    }
+    return true;
 }
 
 /* Returns full .db path for a project: <cache_dir>/<project>.db */
-static const char *project_db_path(const char *project, char *buf, size_t bufsz) {
+static bool project_db_path(const char *project, char *buf, size_t bufsz,
+                            unsigned long *native_error) {
+    if (native_error) {
+        *native_error = ERROR_SUCCESS;
+    }
+    if (!buf || bufsz == 0) {
+        if (native_error) {
+            *native_error = ERROR_INVALID_PARAMETER;
+        }
+        cbm_log_error("mcp.project_path_failed", "code", "CBM_PROJECT_PATH_OUTPUT_INVALID",
+                      "message", "project path output storage is missing", "remediation",
+                      "provide one caller-owned non-empty path buffer");
+        return false;
+    }
+    buf[0] = '\0';
     if (!cbm_validate_project_name(project)) {
-        buf[0] = '\0';
-        return buf;
+        if (native_error) {
+            *native_error = ERROR_INVALID_NAME;
+        }
+        cbm_log_error("mcp.project_path_failed", "code", "CBM_PROJECT_PATH_NAME_INVALID",
+                      "message", "the project name cannot form a store identity", "remediation",
+                      "use the exact validated project name derived from the repository root");
+        return false;
     }
     char dir[CBM_SZ_1K];
-    cache_dir(dir, sizeof(dir));
-    snprintf(buf, bufsz, "%s/%s.db", dir, project);
-    return buf;
+    if (!cache_dir(dir, sizeof(dir), native_error)) {
+        return false;
+    }
+    int wrote = snprintf(buf, bufsz, "%s/%s.db", dir, project);
+    if (wrote < 0 || (size_t)wrote >= bufsz) {
+        buf[0] = '\0';
+        if (native_error) {
+            *native_error = ERROR_BUFFER_OVERFLOW;
+        }
+        cbm_log_error("mcp.project_path_failed", "code", "CBM_PROJECT_PATH_TOO_LONG",
+                      "project", project, "message",
+                      "the exact cache root and project name exceed destination path capacity",
+                      "remediation", "shorten the configured cache root and retry");
+        return false;
+    }
+    return true;
 }
 
 /* ── Store resolution ──────────────────────────────────────────── */
@@ -2110,8 +3121,8 @@ static db_project_inspect_status_t inspect_root_derived_project_identity(
              identity->canonical_root);
     snprintf(srv->store_error_canonical_project, sizeof(srv->store_error_canonical_project), "%s",
              identity->canonical_project);
-    project_db_path(identity->canonical_project, srv->store_error_canonical_db_path,
-                    sizeof(srv->store_error_canonical_db_path));
+    (void)project_db_path(identity->canonical_project, srv->store_error_canonical_db_path,
+                          sizeof(srv->store_error_canonical_db_path), NULL);
     return DB_PROJECT_INSPECT_IDENTITY_CONFLICT;
 }
 
@@ -2157,16 +3168,15 @@ static cbm_store_t *resolve_store(cbm_mcp_server_t *srv, const char *project) {
     if (!project) {
         return NULL; /* project is required — no implicit fallback */
     }
+    if (srv->store_close_error_active) {
+        return NULL;
+    }
 
     if (!project_transition_admits_process(srv, project)) {
-        if (srv->owns_store && srv->store) {
-            cbm_store_close(srv->store);
+        if (srv->store &&
+            close_cached_store_exact(srv, "resolve_store.transition_refusal", project) != 0) {
+            return NULL;
         }
-        srv->store = NULL;
-        srv->owns_store = false;
-        free(srv->current_project);
-        srv->current_project = NULL;
-        srv->store_last_used = 0;
         return NULL;
     }
 
@@ -2178,23 +3188,46 @@ static cbm_store_t *resolve_store(cbm_mcp_server_t *srv, const char *project) {
     }
 
     /* Close old store */
-    if (srv->owns_store && srv->store) {
-        cbm_store_close(srv->store);
-        srv->store = NULL;
+    if (srv->store &&
+        close_cached_store_exact(srv, "resolve_store.switch_project", project) != 0) {
+        return NULL;
     }
 
     /* Freeze and inspect a verified derivative before SQLite is allowed to open
      * the source.  Read-only WAL access may rewrite the source -shm wal-index;
      * a corrupt family must instead be rejected with every source byte exact. */
-    char path[CBM_SZ_1K];
-    project_db_path(project, path, sizeof(path));
+    char path[CBM_SZ_4K];
+    unsigned long path_error = ERROR_SUCCESS;
+    if (!project_db_path(project, path, sizeof(path), &path_error)) {
+        cbm_store_verify_result_t failure;
+        memset(&failure, 0, sizeof(failure));
+        failure.status = CBM_STORE_VERIFY_IO_FAILED;
+        failure.native_error = path_error;
+        failure.sqlite_error = SQLITE_CANTOPEN;
+        failure.family_guard_release_complete = true;
+        failure.scratch_cleanup_complete = true;
+        snprintf(failure.operation, sizeof(failure.operation), "%s",
+                 "resolve_store.project_db_path");
+        snprintf(failure.detail, sizeof(failure.detail), "%s",
+                 "the exact project database path could not be resolved or represented");
+        record_store_error_state(srv, project, "", &failure);
+        return NULL;
+    }
     cbm_store_verify_result_t verification;
     cbm_store_verify_status_t verify_status =
         cbm_store_open_path_project_query_verified(path, project, &srv->store, &verification);
     if (verify_status == CBM_STORE_VERIFY_INTEGRITY_FAILED ||
         verify_status == CBM_STORE_VERIFY_IO_FAILED) {
-        srv->owns_store = false;
         record_store_error_state(srv, project, path, &verification);
+        if (srv->store) {
+            /* A verified-open failure can intentionally return the still-live
+             * handle when its cleanup close failed. The output slot transferred
+             * ownership to this server even though verification did not pass. */
+            srv->owns_store = true;
+            (void)close_cached_store_exact(srv, "resolve_store.failed_verified_open", project);
+        } else {
+            srv->owns_store = false;
+        }
         return NULL;
     }
 
@@ -2203,6 +3236,7 @@ static cbm_store_t *resolve_store(cbm_mcp_server_t *srv, const char *project) {
      * missing: cache-wide fallback adoption made unrelated invalid candidates
      * poison aliases and could bind a caller to a drifted filename/root. */
     if (srv->store) {
+        srv->owns_store = true;
         /* Verify the project actually exists in this database.
          * A .db file may exist but be empty (e.g., after delete_project on
          * Linux where unlink defers actual removal). Opening an empty/deleted
@@ -2216,8 +3250,9 @@ static cbm_store_t *resolve_store(cbm_mcp_server_t *srv, const char *project) {
             srv->current_project = heap_strdup(project);
             return srv->store; /* fast path: filename == internal name */
         }
-        cbm_store_close(srv->store);
-        srv->store = NULL;
+        if (close_cached_store_exact(srv, "resolve_store.identity_refusal", project) != 0) {
+            return NULL;
+        }
         return NULL;
     }
 
@@ -2250,23 +3285,34 @@ static cbm_store_t *resolve_mutation_store(cbm_mcp_server_t *srv, const char *pr
         cbm_store_open_path_project_writer_existing(db_path, project, &writer, &verification);
     if (status != CBM_STORE_VERIFY_OK || !writer) {
         record_store_error_state(srv, project, db_path, &verification);
+        if (writer) {
+            cbm_store_close_result_t writer_close;
+            (void)close_local_store_exact(&writer,
+                                          "resolve_mutation_store.failed_verified_open",
+                                          project, &writer_close);
+        }
         return NULL;
     }
 
     if (srv->store != resolved || !srv->owns_store) {
-        cbm_store_close(writer);
+        cbm_store_close_result_t writer_close;
+        bool writer_closed = close_local_store_exact(
+            &writer, "resolve_mutation_store.ownership_refusal", project, &writer_close);
         record_store_query_failure(
             srv, project, db_path, resolved, CBM_STORE_VERIFY_IO_FAILED,
             "source.writer.cached_query_ownership",
-            "verified path-backed query store is not owned by this MCP server");
+            writer_closed
+                ? "verified path-backed query store is not owned by this MCP server"
+                : "verified mutation writer also failed exact close after cached-query "
+                  "ownership refusal");
         return NULL;
     }
-    cbm_store_close(srv->store);
-    srv->store = NULL;
-    srv->owns_store = false;
-    free(srv->current_project);
-    srv->current_project = NULL;
-    srv->store_last_used = 0;
+    if (close_cached_store_exact(srv, "resolve_mutation_store.release_query", project) != 0) {
+        cbm_store_close_result_t writer_close;
+        (void)close_local_store_exact(&writer, "resolve_mutation_store.cached_close_failure",
+                                      project, &writer_close);
+        return NULL;
+    }
     if (out_owned) {
         *out_owned = true;
     }
@@ -2550,6 +3596,70 @@ static char *build_store_verification_failed_error(const cbm_mcp_server_t *srv) 
 }
 
 static char *build_no_store_error(cbm_mcp_server_t *srv, const char *project) {
+    if (srv && srv->store_close_error_active) {
+        yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+        if (!doc) {
+            return heap_strdup(
+                "{\"code\":\"CBM_CACHED_STORE_CLOSE_RESPONSE_ALLOC_FAILED\","
+                "\"message\":\"the exact cached-store close failure could not be "
+                "serialized\",\"remediation\":\"free memory and inspect the preceding "
+                "structured close diagnostic\"}");
+        }
+        yyjson_mut_val *root = yyjson_mut_obj(doc);
+        yyjson_mut_doc_set_root(doc, root);
+        yyjson_mut_obj_add_str(doc, root, "code", "CBM_CACHED_STORE_CLOSE_FAILED");
+        yyjson_mut_obj_add_strcpy(doc, root, "operation", srv->store_close_operation);
+        yyjson_mut_obj_add_strcpy(doc, root, "project", srv->store_close_project);
+        yyjson_mut_obj_add_strcpy(doc, root, "db_path", srv->store_close_result.db_path);
+        yyjson_mut_obj_add_int(doc, root, "close_status",
+                               srv->store_close_result.status);
+        yyjson_mut_obj_add_int(doc, root, "sqlite_error",
+                               srv->store_close_result.sqlite_close_code);
+        yyjson_mut_obj_add_bool(doc, root, "connection_was_present",
+                                srv->store_close_result.connection_was_present != 0);
+        yyjson_mut_obj_add_bool(doc, root, "close_attempted",
+                                srv->store_close_result.close_attempted != 0);
+        yyjson_mut_obj_add_bool(doc, root, "connection_destroyed",
+                                srv->store_close_result.connection_destroyed != 0);
+        yyjson_mut_obj_add_uint(doc, root, "outstanding_statement_count",
+                                srv->store_close_result.outstanding_statement_count);
+        yyjson_mut_obj_add_strcpy(doc, root, "first_outstanding_sql_sha256",
+                                  srv->store_close_result.first_outstanding_sql_sha256);
+        yyjson_mut_obj_add_uint(doc, root, "cache_age_s", srv->store_close_cache_age_s);
+        yyjson_mut_obj_add_uint(doc, root, "process_id", srv->store_close_process_id);
+        yyjson_mut_obj_add_uint(doc, root, "process_start_utc_ticks",
+                                srv->store_close_process_start_utc_ticks);
+        yyjson_mut_obj_add_bool(doc, root, "db_present", srv->store_close_db_present);
+        yyjson_mut_obj_add_int(doc, root, "db_bytes", srv->store_close_db_bytes);
+        yyjson_mut_obj_add_int(doc, root, "db_probe", srv->store_close_db_probe);
+        yyjson_mut_obj_add_uint(doc, root, "db_probe_native_error",
+                               srv->store_close_db_probe_native_error);
+        yyjson_mut_obj_add_bool(doc, root, "wal_present", srv->store_close_wal_present);
+        yyjson_mut_obj_add_int(doc, root, "wal_bytes", srv->store_close_wal_bytes);
+        yyjson_mut_obj_add_int(doc, root, "wal_probe", srv->store_close_wal_probe);
+        yyjson_mut_obj_add_uint(doc, root, "wal_probe_native_error",
+                               srv->store_close_wal_probe_native_error);
+        yyjson_mut_obj_add_bool(doc, root, "shm_present", srv->store_close_shm_present);
+        yyjson_mut_obj_add_int(doc, root, "shm_bytes", srv->store_close_shm_bytes);
+        yyjson_mut_obj_add_int(doc, root, "shm_probe", srv->store_close_shm_probe);
+        yyjson_mut_obj_add_uint(doc, root, "shm_probe_native_error",
+                               srv->store_close_shm_probe_native_error);
+        yyjson_mut_obj_add_bool(doc, root, "worker_started", false);
+        yyjson_mut_obj_add_bool(doc, root, "delete_attempted", false);
+        yyjson_mut_obj_add_bool(doc, root, "sqlite_publication_started", false);
+        yyjson_mut_obj_add_str(
+            doc, root, "message",
+            "the exact cached SQLite connection did not close cleanly; no mutation, worker, "
+            "delete, publication, or success is admitted");
+        yyjson_mut_obj_add_str(
+            doc, root, "remediation",
+            "finalize the named outstanding statement or resolve the exact SQLite close error, "
+            "preserve the complete database family, and retry only after physical close "
+            "succeeds");
+        char *json = yyjson_mut_write(doc, 0, NULL);
+        yyjson_mut_doc_free(doc);
+        return json;
+    }
     if (srv && project && srv->transition_error_code[0] &&
         strcmp(srv->transition_error_project, project) == 0) {
         yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
@@ -2562,7 +3672,8 @@ static char *build_no_store_error(cbm_mcp_server_t *srv, const char *project) {
         yyjson_mut_obj_add_str(doc, root, "project", project);
         yyjson_mut_obj_add_int(doc, root, "native_error",
                                (int64_t)srv->transition_native_error);
-        yyjson_mut_obj_add_bool(doc, root, "cached_store_closed", true);
+        yyjson_mut_obj_add_bool(doc, root, "cached_store_closed",
+                                !srv->store && !srv->store_close_error_active);
         yyjson_mut_obj_add_bool(doc, root, "reopen_attempted", false);
         bool active = strcmp(srv->transition_error_code, "CBM_PROJECT_TRANSITION_ACTIVE") == 0;
         bool abandoned =
@@ -2762,6 +3873,11 @@ static db_project_inspect_status_t db_internal_project_name(cbm_mcp_server_t *sr
     }
     if (verify_status != CBM_STORE_VERIFY_OK || !st) {
         record_store_error_state(srv, error_project, full_path, &verification);
+        if (st) {
+            cbm_store_close_result_t close_result;
+            (void)close_local_store_exact(&st, "inspect_project.failed_verified_open",
+                                          error_project, &close_result);
+        }
         return DB_PROJECT_INSPECT_FAILED;
     }
     cbm_project_t *projs = NULL;
@@ -2788,7 +3904,15 @@ static db_project_inspect_status_t db_internal_project_name(cbm_mcp_server_t *sr
             *out_verification = verification;
         }
     } else {
-        cbm_store_close(st);
+        cbm_store_close_result_t close_result;
+        if (!close_local_store_exact(&st, "inspect_project.finish", error_project,
+                                     &close_result)) {
+            record_store_query_failure(
+                srv, error_project, full_path, st, CBM_STORE_VERIFY_IO_FAILED,
+                "source.query_close",
+                "temporary verified project query connection failed exact physical close");
+            ok = false;
+        }
     }
     return ok ? DB_PROJECT_INSPECT_OK : DB_PROJECT_INSPECT_FAILED;
 }
@@ -2824,7 +3948,14 @@ static db_project_inspect_status_t build_project_json_entry(cbm_mcp_server_t *sr
     inspect = inspect_root_derived_project_identity(srv, project_name, full_path, pstore,
                                                     &verification, &identity);
     if (inspect != DB_PROJECT_INSPECT_OK) {
-        cbm_store_close(pstore);
+        cbm_store_close_result_t close_result;
+        if (!close_local_store_exact(&pstore, "list_projects.identity_refusal", project_name,
+                                     &close_result)) {
+            record_store_query_failure(
+                srv, project_name, full_path, pstore, CBM_STORE_VERIFY_IO_FAILED,
+                "source.query_close",
+                "project-list identity refusal could not close its verified query connection");
+        }
         return inspect;
     }
 
@@ -2833,10 +3964,20 @@ static db_project_inspect_status_t build_project_json_entry(cbm_mcp_server_t *sr
     if (nodes < 0 || edges < 0) {
         record_store_query_failure(srv, "", full_path, pstore, CBM_STORE_VERIFY_IO_FAILED,
                                    "source.query_project_details", cbm_store_error(pstore));
-        cbm_store_close(pstore);
+        cbm_store_close_result_t close_result;
+        (void)close_local_store_exact(&pstore, "list_projects.query_failure", project_name,
+                                      &close_result);
         return DB_PROJECT_INSPECT_FAILED;
     }
-    cbm_store_close(pstore);
+    cbm_store_close_result_t close_result;
+    if (!close_local_store_exact(&pstore, "list_projects.finish", project_name,
+                                 &close_result)) {
+        record_store_query_failure(
+            srv, project_name, full_path, pstore, CBM_STORE_VERIFY_IO_FAILED,
+            "source.query_close",
+            "project-list query connection failed exact physical close");
+        return DB_PROJECT_INSPECT_FAILED;
+    }
 
     yyjson_mut_val *p = yyjson_mut_obj(doc);
     yyjson_mut_obj_add_strcpy(doc, p, "name", project_name);
@@ -2977,7 +4118,19 @@ static char *handle_list_projects(cbm_mcp_server_t *srv, const char *args) {
     reset_store_error_state(srv);
 
     char dir_path[CBM_SZ_1K];
-    cache_dir(dir_path, sizeof(dir_path));
+    unsigned long cache_path_error = ERROR_SUCCESS;
+    if (!cache_dir(dir_path, sizeof(dir_path), &cache_path_error)) {
+        char native_error[32];
+        (void)snprintf(native_error, sizeof(native_error), "%lu", cache_path_error);
+        cbm_log_error("mcp.project_discovery_failed", "code", "CBM_CACHE_PATH_UNRESOLVED",
+                      "native_error", native_error, "remediation",
+                      "set one valid cache root and retry");
+        return cbm_mcp_text_result(
+            "{\"status\":\"error\",\"code\":\"CBM_CACHE_PATH_UNRESOLVED\","
+            "\"message\":\"the exact project-store directory could not be resolved\","
+            "\"remediation\":\"set one valid cache root and retry\"}",
+            true);
+    }
 
     cbm_dir_t *d = cbm_opendir(dir_path);
 
@@ -4493,25 +5646,54 @@ static char *handle_delete_project(cbm_mcp_server_t *srv, const char *args) {
 
     /* Close store if it's the project being deleted */
     if (srv->current_project && strcmp(srv->current_project, name) == 0) {
-        if (srv->owns_store && srv->store) {
-            cbm_store_close(srv->store);
-            srv->store = NULL;
+        if (close_cached_store_exact(srv, "delete_project.before_unlink", name) != 0) {
+            char *close_json = build_no_store_error(srv, name);
+            char *result = cbm_mcp_text_result(
+                close_json ? close_json
+                           : "CBM_CACHED_STORE_CLOSE_RESPONSE_ALLOC_FAILED: the delete refusal "
+                             "could not be serialized",
+                true);
+            free(close_json);
+            free(name);
+            return result;
         }
-        free(srv->current_project);
-        srv->current_project = NULL;
     }
 
     /* Wait for any in-progress pipeline to finish before deleting */
     cbm_pipeline_lock();
 
     /* Delete the .db file + WAL/SHM */
-    char path[CBM_SZ_1K];
-    project_db_path(name, path, sizeof(path));
+    char path[CBM_SZ_4K];
+    unsigned long path_error = ERROR_SUCCESS;
+    if (!project_db_path(name, path, sizeof(path), &path_error)) {
+        char native_error[32];
+        (void)snprintf(native_error, sizeof(native_error), "%lu", path_error);
+        cbm_log_error("mcp.delete_project_failed", "code", "CBM_PROJECT_PATH_UNRESOLVED",
+                      "project", name, "native_error", native_error, "remediation",
+                      "fix the configured cache root and retry");
+        cbm_pipeline_unlock();
+        free(name);
+        return cbm_mcp_text_result(
+            "{\"status\":\"error\",\"code\":\"CBM_PROJECT_PATH_UNRESOLVED\","
+            "\"message\":\"the exact project database path could not be resolved\","
+            "\"remediation\":\"fix the configured cache root and retry\"}",
+            true);
+    }
 
-    char wal[CBM_SZ_1K];
-    char shm[CBM_SZ_1K];
-    snprintf(wal, sizeof(wal), "%s-wal", path);
-    snprintf(shm, sizeof(shm), "%s-shm", path);
+    char wal[CBM_SZ_4K];
+    char shm[CBM_SZ_4K];
+    int wal_wrote = snprintf(wal, sizeof(wal), "%s-wal", path);
+    int shm_wrote = snprintf(shm, sizeof(shm), "%s-shm", path);
+    if (wal_wrote < 0 || (size_t)wal_wrote >= sizeof(wal) || shm_wrote < 0 ||
+        (size_t)shm_wrote >= sizeof(shm)) {
+        cbm_pipeline_unlock();
+        free(name);
+        return cbm_mcp_text_result(
+            "{\"status\":\"error\",\"code\":\"CBM_PROJECT_SIDECAR_PATH_TOO_LONG\","
+            "\"message\":\"the exact project sidecar paths exceed capacity\","
+            "\"remediation\":\"shorten the configured cache root and retry\"}",
+            true);
+    }
 
     /* #430: extended-length-safe existence probe. The old access(path, F_OK)
      * was MAX_PATH-bound, so on a deep store (>260-char db path) the .db file
@@ -5591,14 +6773,230 @@ static char *handle_cross_repo_mode(const char *repo_path, const char *args) {
     return out;
 }
 
-/* Bootstrap from artifact if no local DB exists for this project. */
-static void try_artifact_bootstrap(const char *project_name, const char *repo_path) {
-    char db_buf[CBM_SZ_1K];
-    project_db_path(project_name, db_buf, sizeof(db_buf));
-    if (cbm_file_size(db_buf) < 0 && cbm_artifact_exists(repo_path)) {
-        cbm_log_info("index.artifact_bootstrap", "project", project_name);
-        cbm_artifact_import(repo_path, db_buf);
+typedef enum {
+    ARTIFACT_BOOTSTRAP_NOT_NEEDED = 0,
+    ARTIFACT_BOOTSTRAP_IMPORTED = 1,
+    ARTIFACT_BOOTSTRAP_FAILED = 2,
+} artifact_bootstrap_status_t;
+
+/* Bootstrap from an artifact only when the destination DB is exactly absent.
+ * A physically present artifact is an explicit source of truth: malformed or
+ * unimportable bytes fail the request instead of silently falling through to
+ * a fresh source index that would conceal the broken publication. */
+static artifact_bootstrap_status_t try_artifact_bootstrap(const char *project_name,
+                                                          const char *repo_path,
+                                                          cbm_artifact_import_result_t *result) {
+    memset(result, 0, sizeof(*result));
+    result->abi_version = CBM_ARTIFACT_IMPORT_ABI_VERSION;
+    result->struct_size = sizeof(*result);
+    result->status = CBM_ARTIFACT_IMPORT_FAILED_BEFORE_PUBLICATION;
+    result->destination_probe = CBM_PATH_PROBE_ERROR;
+    char db_buf[CBM_SZ_4K];
+    unsigned long path_error = ERROR_SUCCESS;
+    if (!project_db_path(project_name, db_buf, sizeof(db_buf), &path_error)) {
+        result->destination_probe_native_error = (uint32_t)path_error;
+        snprintf(result->operation, sizeof(result->operation), "%s",
+                 "bootstrap.project_db_path");
+        snprintf(result->detail, sizeof(result->detail), "%s",
+                 "the exact artifact destination path could not be resolved or represented");
+        return ARTIFACT_BOOTSTRAP_FAILED;
     }
+    snprintf(result->destination_db_path, sizeof(result->destination_db_path), "%s", db_buf);
+    unsigned long db_error = 0;
+    cbm_path_probe_result_t db_probe = cbm_path_probe(db_buf, &db_error);
+    result->destination_probe = db_probe;
+    result->destination_probe_native_error = (uint32_t)db_error;
+    if (db_probe == CBM_PATH_PROBE_ERROR) {
+        cbm_log_error("index.artifact_bootstrap", "code",
+                      "CBM_ARTIFACT_BOOTSTRAP_DB_PROBE_FAILED", "project", project_name,
+                      "db_path", db_buf, "remediation",
+                      "resolve the exact destination database path probe before retrying");
+        snprintf(result->operation, sizeof(result->operation), "%s", "bootstrap.db_probe");
+        snprintf(result->detail, sizeof(result->detail), "%s",
+                 "destination database path probe failed");
+        return ARTIFACT_BOOTSTRAP_FAILED;
+    }
+    if (db_probe == CBM_PATH_PROBE_PRESENT) {
+        return ARTIFACT_BOOTSTRAP_NOT_NEEDED;
+    }
+
+    char artifact_path[CBM_SZ_4K];
+    char metadata_path[CBM_SZ_4K];
+    int wrote = snprintf(artifact_path, sizeof(artifact_path), "%s/%s/%s", repo_path,
+                         CBM_ARTIFACT_DIR, CBM_ARTIFACT_FILENAME);
+    int metadata_wrote = snprintf(metadata_path, sizeof(metadata_path), "%s/%s/%s", repo_path,
+                                  CBM_ARTIFACT_DIR, CBM_ARTIFACT_META);
+    if (wrote < 0 || (size_t)wrote >= sizeof(artifact_path) || metadata_wrote < 0 ||
+        (size_t)metadata_wrote >= sizeof(metadata_path)) {
+        cbm_log_error("index.artifact_bootstrap", "code",
+                      "CBM_ARTIFACT_BOOTSTRAP_PATH_TOO_LONG", "project", project_name,
+                      "repo_path", repo_path);
+        snprintf(result->operation, sizeof(result->operation), "%s",
+                 "bootstrap.artifact_path");
+        snprintf(result->detail, sizeof(result->detail), "%s",
+                 "artifact path is too long");
+        return ARTIFACT_BOOTSTRAP_FAILED;
+    }
+    unsigned long artifact_error = 0;
+    unsigned long metadata_error = 0;
+    cbm_path_probe_result_t artifact_probe = cbm_path_probe(artifact_path, &artifact_error);
+    cbm_path_probe_result_t metadata_probe = cbm_path_probe(metadata_path, &metadata_error);
+    if (artifact_probe == CBM_PATH_PROBE_ERROR || metadata_probe == CBM_PATH_PROBE_ERROR) {
+        cbm_log_error("index.artifact_bootstrap", "code",
+                      "CBM_ARTIFACT_BOOTSTRAP_ARTIFACT_PROBE_FAILED", "project", project_name,
+                      "path", artifact_path, "remediation",
+                      "resolve the exact artifact path probe before retrying");
+        snprintf(result->operation, sizeof(result->operation), "%s",
+                 "bootstrap.artifact_probe");
+        snprintf(result->detail, sizeof(result->detail), "%s",
+                 "artifact path probe failed");
+        return ARTIFACT_BOOTSTRAP_FAILED;
+    }
+    if (artifact_probe == CBM_PATH_PROBE_ABSENT &&
+        metadata_probe == CBM_PATH_PROBE_ABSENT) {
+        return ARTIFACT_BOOTSTRAP_NOT_NEEDED;
+    }
+    if (artifact_probe != CBM_PATH_PROBE_PRESENT ||
+        metadata_probe != CBM_PATH_PROBE_PRESENT) {
+        cbm_log_error("index.artifact_bootstrap", "code",
+                      "CBM_ARTIFACT_BOOTSTRAP_PARTIAL_GENERATION", "project", project_name,
+                      "artifact_path", artifact_path, "metadata_path", metadata_path,
+                      "remediation",
+                      "restore one complete content-bound artifact generation before retrying");
+        snprintf(result->operation, sizeof(result->operation), "%s",
+                 "bootstrap.artifact_generation");
+        snprintf(result->detail, sizeof(result->detail), "%s",
+                 "artifact payload and metadata are not both present");
+        return ARTIFACT_BOOTSTRAP_FAILED;
+    }
+
+    cbm_log_info("index.artifact_bootstrap", "project", project_name, "path", artifact_path);
+    if (cbm_artifact_import(repo_path, db_buf, project_name, result) !=
+        CBM_ARTIFACT_IMPORT_OK) {
+        cbm_log_error("index.artifact_bootstrap", "code", "CBM_ARTIFACT_BOOTSTRAP_FAILED",
+                      "project", project_name, "path", artifact_path, "remediation",
+                      "repair or remove the explicitly published artifact before retrying; no "
+                      "fresh-index fallback was attempted");
+        return ARTIFACT_BOOTSTRAP_FAILED;
+    }
+    return ARTIFACT_BOOTSTRAP_IMPORTED;
+}
+
+static char *build_artifact_bootstrap_error(
+    const char *project_name, const char *repo_path,
+    const cbm_artifact_import_result_t *import_result) {
+    static const char allocation_failure[] =
+        "{\"status\":\"error\","
+        "\"code\":\"CBM_ARTIFACT_BOOTSTRAP_RESPONSE_ALLOC_FAILED\","
+        "\"message\":\"the artifact import failed and its complete diagnostic could not be "
+        "allocated\","
+        "\"remediation\":\"inspect the preceding artifact.import log and free memory before "
+        "retrying\"}";
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    if (!doc) {
+        cbm_log_error("index.artifact_bootstrap", "code",
+                      "CBM_ARTIFACT_BOOTSTRAP_RESPONSE_ALLOC_FAILED", "operation",
+                      "allocate_error_document", "remediation",
+                      "inspect the preceding artifact.import log and free memory before retrying");
+        return heap_strdup(allocation_failure);
+    }
+    yyjson_mut_val *root = yyjson_mut_obj(doc);
+    if (!root) {
+        yyjson_mut_doc_free(doc);
+        cbm_log_error("index.artifact_bootstrap", "code",
+                      "CBM_ARTIFACT_BOOTSTRAP_RESPONSE_ALLOC_FAILED", "operation",
+                      "allocate_error_root", "remediation",
+                      "inspect the preceding artifact.import log and free memory before retrying");
+        return heap_strdup(allocation_failure);
+    }
+    yyjson_mut_doc_set_root(doc, root);
+    const char *detail = cbm_artifact_export_last_error();
+    bool complete =
+        yyjson_mut_obj_add_str(doc, root, "status", "error") &&
+        yyjson_mut_obj_add_str(doc, root, "code", "CBM_ARTIFACT_BOOTSTRAP_FAILED") &&
+        yyjson_mut_obj_add_str(doc, root, "operation", "import_published_artifact") &&
+        yyjson_mut_obj_add_strcpy(doc, root, "project", project_name) &&
+        yyjson_mut_obj_add_strcpy(doc, root, "repo_path", repo_path) &&
+        yyjson_mut_obj_add_strcpy(doc, root, "destination_db_path",
+                                  import_result->destination_db_path) &&
+        yyjson_mut_obj_add_str(
+            doc, root, "destination_db_state",
+            import_result->destination_probe == CBM_PATH_PROBE_PRESENT
+                ? "present"
+                : (import_result->destination_probe == CBM_PATH_PROBE_ABSENT ? "absent"
+                                                                             : "probe_error")) &&
+        yyjson_mut_obj_add_uint(doc, root, "destination_probe_native_error",
+                               import_result->destination_probe_native_error) &&
+        yyjson_mut_obj_add_int(doc, root, "import_status", import_result->status) &&
+        yyjson_mut_obj_add_strcpy(doc, root, "import_operation", import_result->operation) &&
+        yyjson_mut_obj_add_strcpy(doc, root, "import_detail", import_result->detail) &&
+        yyjson_mut_obj_add_strcpy(
+            doc, root, "detail", detail ? detail : "inspect the preceding artifact.import log");
+    if (import_result->publication_started) {
+        complete = complete &&
+                   yyjson_mut_obj_add_str(
+                       doc, root, "message",
+                       "the artifact database was durably published, but its post-publication "
+                       "identity or namespace readback failed; indexing was refused") &&
+                   yyjson_mut_obj_add_str(
+                       doc, root, "remediation",
+                       "inspect the durable destination database and the preceding "
+                       "artifact.import diagnostic before retrying");
+    } else if (import_result->destination_probe == CBM_PATH_PROBE_ABSENT) {
+        complete = complete &&
+                   yyjson_mut_obj_add_str(
+                       doc, root, "message",
+                       "the explicitly published artifact could not be imported; indexing was "
+                       "refused before SQLite publication") &&
+                   yyjson_mut_obj_add_str(
+                       doc, root, "remediation",
+                       "repair or remove the explicitly published artifact, then retry the "
+                       "unchanged request");
+    } else if (import_result->destination_probe == CBM_PATH_PROBE_PRESENT) {
+        complete = complete &&
+                   yyjson_mut_obj_add_str(
+                       doc, root, "message",
+                       "the artifact import did not publish because another destination "
+                       "generation is present; indexing was refused") &&
+                   yyjson_mut_obj_add_str(
+                       doc, root, "remediation",
+                       "inspect the independently present destination generation and retry only "
+                       "after its ownership is resolved");
+    } else {
+        complete = complete &&
+                   yyjson_mut_obj_add_str(
+                       doc, root, "message",
+                       "the artifact import failed and the destination publication state could "
+                       "not be evaluated; indexing was refused") &&
+                   yyjson_mut_obj_add_str(
+                       doc, root, "remediation",
+                       "resolve the reported destination path probe failure and inspect the "
+                       "preceding artifact.import diagnostic before retrying");
+    }
+    complete = complete &&
+               yyjson_mut_obj_add_bool(doc, root, "fresh_index_fallback_attempted", false) &&
+               yyjson_mut_obj_add_bool(doc, root, "sqlite_publication_started",
+                                       import_result->publication_started != 0) &&
+               yyjson_mut_obj_add_bool(doc, root, "sqlite_publication_committed",
+                                       import_result->publication_committed != 0);
+    if (!complete) {
+        yyjson_mut_doc_free(doc);
+        cbm_log_error("index.artifact_bootstrap", "code",
+                      "CBM_ARTIFACT_BOOTSTRAP_RESPONSE_ALLOC_FAILED", "operation",
+                      "populate_error_document", "remediation",
+                      "inspect the preceding artifact.import log and free memory before retrying");
+        return heap_strdup(allocation_failure);
+    }
+    char *json = yyjson_mut_write(doc, 0, NULL);
+    yyjson_mut_doc_free(doc);
+    if (!json) {
+        cbm_log_error("index.artifact_bootstrap", "code",
+                      "CBM_ARTIFACT_BOOTSTRAP_RESPONSE_ALLOC_FAILED", "operation",
+                      "serialize_error_document", "remediation",
+                      "inspect the preceding artifact.import log and free memory before retrying");
+        return heap_strdup(allocation_failure);
+    }
+    return json;
 }
 
 /* Cap on excluded dir paths listed in the response — keep it compact on large
@@ -6216,19 +7614,26 @@ static char *finalize_index_worker_store(cbm_mcp_server_t *srv, const char *proj
     const char *borrowed_path = cbm_store_db_path(srv->store);
     char *db_path = borrowed_path ? heap_strdup(borrowed_path) : NULL;
     bool path_alloc_failed = borrowed_path && !db_path;
-    cbm_store_close(srv->store);
-    srv->store = NULL;
-    free(srv->current_project);
-    srv->current_project = NULL;
-    srv->store_last_used = 0;
+    int close_rc =
+        close_cached_store_exact(srv, "index_worker.finalize_store", project_name);
 
     const char *code = NULL;
     const char *message = NULL;
-    bool wal_present = false;
-    bool shm_present = false;
+    bool wal_present = srv->store_close_wal_present;
+    bool shm_present = srv->store_close_shm_present;
+    cbm_path_probe_result_t wal_probe = srv->store_close_wal_probe;
+    cbm_path_probe_result_t shm_probe = srv->store_close_shm_probe;
+    unsigned long wal_probe_error = srv->store_close_wal_probe_native_error;
+    unsigned long shm_probe_error = srv->store_close_shm_probe_native_error;
+    char wal_probe_error_text[CBM_SZ_32];
+    char shm_probe_error_text[CBM_SZ_32];
     char *wal_path = NULL;
     char *shm_path = NULL;
-    if (path_alloc_failed) {
+    if (close_rc != 0) {
+        code = "CBM_INDEX_WORKER_STORE_CLOSE_FAILED";
+        message =
+            "the worker SQLite connection did not close exactly; publication is not complete";
+    } else if (path_alloc_failed) {
         code = "CBM_INDEX_WORKER_STORE_PATH_ALLOC_FAILED";
         message = "the worker could not retain the authoritative store path through finalization";
     } else if (db_path) {
@@ -6245,12 +7650,19 @@ static char *finalize_index_worker_store(cbm_mcp_server_t *srv, const char *proj
             } else {
                 snprintf(wal_path, path_len + 5, "%s-wal", db_path);
                 snprintf(shm_path, path_len + 5, "%s-shm", db_path);
-                wal_present = cbm_path_exists(wal_path);
-                shm_present = cbm_path_exists(shm_path);
-                if (wal_present || shm_present) {
+                wal_probe = cbm_path_probe(wal_path, &wal_probe_error);
+                shm_probe = cbm_path_probe(shm_path, &shm_probe_error);
+                wal_present = wal_probe == CBM_PATH_PROBE_PRESENT;
+                shm_present = shm_probe == CBM_PATH_PROBE_PRESENT;
+                if (wal_probe != CBM_PATH_PROBE_ABSENT ||
+                    shm_probe != CBM_PATH_PROBE_ABSENT) {
                     code = "CBM_INDEX_WORKER_STORE_FINALIZE_FAILED";
-                    message =
-                        "the worker readback store retained WAL or shared-memory state after close";
+                    message = wal_probe == CBM_PATH_PROBE_ERROR ||
+                                      shm_probe == CBM_PATH_PROBE_ERROR
+                                  ? "the worker could not prove exact WAL/shared-memory absence "
+                                    "after close"
+                                  : "the worker readback store retained WAL or shared-memory "
+                                    "state after close";
                 }
             }
         }
@@ -6262,10 +7674,15 @@ static char *finalize_index_worker_store(cbm_mcp_server_t *srv, const char *proj
         return NULL;
     }
 
+    snprintf(wal_probe_error_text, sizeof(wal_probe_error_text), "%lu", wal_probe_error);
+    snprintf(shm_probe_error_text, sizeof(shm_probe_error_text), "%lu", shm_probe_error);
+
     cbm_log_error("index.worker.store_finalize_failed", "code", code, "project",
                   project_name ? project_name : "", "db_path", db_path ? db_path : "",
                   "wal_present", wal_present ? "true" : "false", "shm_present",
-                  shm_present ? "true" : "false", "message", message, "remediation",
+                  shm_present ? "true" : "false", "wal_probe_native_error",
+                  wal_probe_error_text, "shm_probe_native_error", shm_probe_error_text, "message",
+                  message, "remediation",
                   "close concurrent readers or writers, preserve the database family, and retry");
     yyjson_mut_doc *error_doc = yyjson_mut_doc_new(NULL);
     yyjson_mut_val *error_root = error_doc ? yyjson_mut_obj(error_doc) : NULL;
@@ -6282,6 +7699,12 @@ static char *finalize_index_worker_store(cbm_mcp_server_t *srv, const char *proj
         yyjson_mut_obj_add_strcpy(error_doc, error_root, "db_path", db_path ? db_path : "");
         yyjson_mut_obj_add_bool(error_doc, error_root, "wal_present", wal_present);
         yyjson_mut_obj_add_bool(error_doc, error_root, "shm_present", shm_present);
+        yyjson_mut_obj_add_int(error_doc, error_root, "wal_probe", wal_probe);
+        yyjson_mut_obj_add_uint(error_doc, error_root, "wal_probe_native_error",
+                               wal_probe_error);
+        yyjson_mut_obj_add_int(error_doc, error_root, "shm_probe", shm_probe);
+        yyjson_mut_obj_add_uint(error_doc, error_root, "shm_probe_native_error",
+                               shm_probe_error);
         yyjson_mut_obj_add_bool(error_doc, error_root, "sqlite_publication_started", true);
         error_json = yyjson_mut_write(error_doc, 0, NULL);
     }
@@ -6366,16 +7789,22 @@ static char *build_worker_failure_response(const char *args, cbm_proc_outcome_t 
  * background watcher path (main.c) has no MCP server / cached store — the child
  * writes the DB and the parent only needs the return code, so there is nothing
  * to invalidate. */
-static void supervisor_invalidate_store(cbm_mcp_server_t *srv) {
+static char *supervisor_invalidate_store(cbm_mcp_server_t *srv, const char *operation) {
     if (!srv) {
-        return;
+        return NULL;
     }
-    if (srv->owns_store && srv->store) {
-        cbm_store_close(srv->store);
-        srv->store = NULL;
+    if (srv->store_close_error_active ||
+        (srv->store && close_cached_store_exact(srv, operation, NULL) != 0)) {
+        char *error = build_no_store_error(srv, srv->current_project);
+        char *result = cbm_mcp_text_result(
+            error ? error
+                  : "CBM_CACHED_STORE_CLOSE_RESPONSE_ALLOC_FAILED: exact cached-store close "
+                    "failure could not be serialized",
+            true);
+        free(error);
+        return result;
     }
-    free(srv->current_project);
-    srv->current_project = NULL;
+    return NULL;
 }
 
 /* #405: fail-closed structured result for the strict (shadow) supervised index
@@ -6445,13 +7874,20 @@ static bool supervised_worker_returned_tool_error(const cbm_index_worker_result_
  * response failure is a terminal structured refusal; the supervisor never
  * retries with a changed corpus and never degrades to in-process execution. */
 static char *index_run_supervised(cbm_mcp_server_t *srv, const char *args) {
-    supervisor_invalidate_store(srv);
+    char *close_error =
+        supervisor_invalidate_store(srv, "index_supervisor.before_worker");
+    if (close_error) {
+        return close_error;
+    }
 
     cbm_index_worker_result_t wr;
     int rc = cbm_index_spawn_worker(args, &wr);
     if (rc != 0 || wr.outcome == CBM_PROC_SPAWN_FAILED) {
         cbm_index_worker_result_free(&wr);
-        supervisor_invalidate_store(srv);
+        close_error = supervisor_invalidate_store(srv, "index_supervisor.spawn_failure");
+        if (close_error) {
+            return close_error;
+        }
         return build_strict_supervised_error(
             args, "spawn_failed",
             "the isolated index worker could not be spawned; no index transaction ran");
@@ -6461,7 +7897,11 @@ static char *index_run_supervised(cbm_mcp_server_t *srv, const char *args) {
         char *response = wr.response;
         wr.response = NULL;
         cbm_index_worker_result_free(&wr);
-        supervisor_invalidate_store(srv);
+        close_error = supervisor_invalidate_store(srv, "index_supervisor.after_success");
+        if (close_error) {
+            free(response);
+            return close_error;
+        }
         return response;
     }
 
@@ -6470,11 +7910,19 @@ static char *index_run_supervised(cbm_mcp_server_t *srv, const char *args) {
         wr.response = NULL;
         cbm_log_info("index.supervisor.tool_error", "outcome", "exit_nonzero", "exit_code", "1");
         cbm_index_worker_result_free(&wr);
-        supervisor_invalidate_store(srv);
+        close_error = supervisor_invalidate_store(srv, "index_supervisor.after_tool_error");
+        if (close_error) {
+            free(response);
+            return close_error;
+        }
         return response;
     }
 
-    supervisor_invalidate_store(srv);
+    close_error = supervisor_invalidate_store(srv, "index_supervisor.after_worker_failure");
+    if (close_error) {
+        cbm_index_worker_result_free(&wr);
+        return close_error;
+    }
 #ifdef ASTRO_WORKER_DIAG
     char *failure = NULL;
     if (wr.outcome == CBM_PROC_CLEAN) {
@@ -6739,9 +8187,16 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
      * A normal CBM/watch worker may index only while no Rust publication transition
      * exists. A shadow worker may cross an ACTIVE transition only when the Rust host
      * validated and installed the exact private same-generation writer grant before
-     * entering libcbm. Refuse before artifact bootstrap, source discovery, or SQLite. */
+    * entering libcbm. Refuse before artifact bootstrap, source discovery, or SQLite. */
     if (!project_transition_admits_process(srv, project_name)) {
-        supervisor_invalidate_store(srv);
+        char *cached_close_error = supervisor_invalidate_store(
+            srv, "index_repository.transition_refusal");
+        if (cached_close_error) {
+            cbm_pipeline_free(p);
+            free(project_name);
+            free(repo_path);
+            return cached_close_error;
+        }
         char *transition_error = build_no_store_error(srv, project_name);
         cbm_pipeline_free(p);
         free(project_name);
@@ -6782,16 +8237,47 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
         true);
 #endif
 
-    /* Bootstrap from artifact if no local DB exists */
-    try_artifact_bootstrap(project_name, repo_path);
-
-    /* Close cached store — pipeline will delete + recreate the .db file */
-    if (srv->owns_store && srv->store) {
-        cbm_store_close(srv->store);
-        srv->store = NULL;
+    if (srv->store &&
+        close_cached_store_exact(srv, "index_repository.before_pipeline", project_name) != 0) {
+        char *close_json = build_no_store_error(srv, project_name);
+#ifdef _WIN32
+        (void)release_index_admission(&admission, project_name, repo_path);
+#endif
+        cbm_pipeline_free(p);
+        free(project_name);
+        free(repo_path);
+        char *result = cbm_mcp_text_result(
+            close_json ? close_json
+                       : "CBM_CACHED_STORE_CLOSE_RESPONSE_ALLOC_FAILED: the pre-index close "
+                         "failure could not be serialized",
+            true);
+        free(close_json);
+        return result;
     }
-    free(srv->current_project);
-    srv->current_project = NULL;
+
+    /* Bootstrap from artifact if no local DB exists. A present artifact is an
+     * explicit publication, so an import failure cannot be hidden by running
+     * a fresh pipeline over the source tree. */
+    cbm_artifact_import_result_t artifact_import_result;
+    artifact_bootstrap_status_t bootstrap =
+        try_artifact_bootstrap(project_name, repo_path, &artifact_import_result);
+    if (bootstrap == ARTIFACT_BOOTSTRAP_FAILED) {
+        char *bootstrap_json =
+            build_artifact_bootstrap_error(project_name, repo_path, &artifact_import_result);
+#ifdef _WIN32
+        (void)release_index_admission(&admission, project_name, repo_path);
+#endif
+        cbm_pipeline_free(p);
+        free(project_name);
+        free(repo_path);
+        char *result = cbm_mcp_text_result(
+            bootstrap_json ? bootstrap_json
+                           : "CBM_ARTIFACT_BOOTSTRAP_RESPONSE_ALLOC_FAILED: artifact import "
+                             "failed before pipeline publication",
+            true);
+        free(bootstrap_json);
+        return result;
+    }
 
     /* Serialize pipeline runs to prevent concurrent writes.
      * Track active pipeline so signal handler and notifications/cancelled
@@ -6817,13 +8303,20 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
 
     cbm_mem_collect(); /* return mimalloc pages to OS after large indexing */
 
-    /* Invalidate cached store so next query reopens the fresh database */
-    if (srv->owns_store && srv->store) {
-        cbm_store_close(srv->store);
-        srv->store = NULL;
+    /* Invalidate cached store so next query reopens the fresh database.  A
+     * close failure is the terminal response even when the pipeline itself
+     * returned zero; it never becomes an indexing success. */
+    char *post_run_close_error = NULL;
+    if (srv->store &&
+        close_cached_store_exact(srv, "index_repository.after_pipeline", project_name) != 0) {
+        post_run_close_error = build_no_store_error(srv, project_name);
+        if (!post_run_close_error) {
+            post_run_close_error = heap_strdup(
+                "{\"status\":\"error\",\"code\":\"CBM_CACHED_STORE_CLOSE_RESPONSE_ALLOC_FAILED\","
+                "\"message\":\"the post-index cached-store close failure could not be "
+                "serialized\",\"sqlite_publication_started\":true}");
+        }
     }
-    free(srv->current_project);
-    srv->current_project = NULL;
 
     yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
     yyjson_mut_val *root = yyjson_mut_obj(doc);
@@ -6834,8 +8327,8 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
     add_index_admission_telemetry(doc, root, &admission);
 #endif
 
-    char *postcondition_error = NULL;
-    if (rc == 0) {
+    char *postcondition_error = post_run_close_error;
+    if (rc == 0 && !postcondition_error) {
         /* Write the per-run logfile ONLY when there were skips (no logfile on a
          * clean run). The FULL list goes to the file; the JSON caps at 50. */
         char logfile_path[CBM_SZ_1K];
@@ -6885,7 +8378,8 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
         yyjson_mut_obj_add_bool(doc, root, "sqlite_publication_started", false);
     }
 
-    char *worker_store_error = finalize_index_worker_store(srv, project_name);
+    char *worker_store_error =
+        post_run_close_error ? NULL : finalize_index_worker_store(srv, project_name);
     if (worker_store_error) {
         if (rc == 0 && !postcondition_error) {
             postcondition_error = worker_store_error;
@@ -7485,7 +8979,7 @@ static source_verify_status_t verify_node_source(cbm_store_t *store, const char 
     mcp_file_identity_t before = {0};
     if (!mcp_get_file_identity(handle, &before)) {
         DWORD error = GetLastError();
-        CloseHandle(handle);
+        mcp_close_windows_handle_or_abort(&handle, "source.inspect_current");
         verified_source_free(verified);
         return source_failure(
             failure, SOURCE_VERIFY_ERROR, "CBM_SOURCE_VERIFICATION_FAILED",
@@ -7497,14 +8991,14 @@ static source_verify_status_t verify_node_source(cbm_store_t *store, const char 
     failure->current_mtime_ns = mcp_filetime_to_unix_ns(before.basic.LastWriteTime.QuadPart);
     if (before.standard.Directory || before.standard.DeletePending ||
         before.standard.EndOfFile.QuadPart < 0) {
-        CloseHandle(handle);
+        mcp_close_windows_handle_or_abort(&handle, "source.inspect_nonregular");
         verified_source_free(verified);
         return source_failure(failure, SOURCE_VERIFY_DRIFT, "ASTRO_SOURCE_DRIFT",
                               "current_path_not_regular_file", "source.inspect_current",
                               "the indexed path no longer resolves to a stable regular file", 0);
     }
     if (!cbm_path_within_root(root_path, verified->absolute_path)) {
-        CloseHandle(handle);
+        mcp_close_windows_handle_or_abort(&handle, "source.validate_containment");
         verified_source_free(verified);
         return source_failure(failure, SOURCE_VERIFY_DRIFT, "ASTRO_SOURCE_DRIFT",
                               "current_path_outside_project_root", "source.validate_containment",
@@ -7513,7 +9007,7 @@ static source_verify_status_t verify_node_source(cbm_store_t *store, const char 
     uint64_t current_size = (uint64_t)before.standard.EndOfFile.QuadPart;
     long max_file_bytes = cbm_max_file_bytes();
     if (current_size > SIZE_MAX - SKIP_ONE || current_size > (uint64_t)max_file_bytes) {
-        CloseHandle(handle);
+        mcp_close_windows_handle_or_abort(&handle, "source.bound_current_read");
         verified_source_free(verified);
         return source_failure(failure, SOURCE_VERIFY_DRIFT, "ASTRO_SOURCE_DRIFT",
                               "current_file_oversized", "source.bound_current_read",
@@ -7521,7 +9015,7 @@ static source_verify_status_t verify_node_source(cbm_store_t *store, const char 
     }
     verified->bytes = malloc((size_t)current_size + SKIP_ONE);
     if (!verified->bytes) {
-        CloseHandle(handle);
+        mcp_close_windows_handle_or_abort(&handle, "source.allocate_current");
         verified_source_free(verified);
         return source_failure(failure, SOURCE_VERIFY_ERROR, "CBM_SOURCE_VERIFICATION_FAILED",
                               "current_file_allocation_failed", "source.allocate_current",
@@ -7535,7 +9029,7 @@ static source_verify_status_t verify_node_source(cbm_store_t *store, const char 
         DWORD got = 0;
         if (!ReadFile(handle, verified->bytes + total, wanted, &got, NULL)) {
             DWORD error = GetLastError();
-            CloseHandle(handle);
+            mcp_close_windows_handle_or_abort(&handle, "source.read_current");
             verified_source_free(verified);
             return source_failure(failure, SOURCE_VERIFY_ERROR, "CBM_SOURCE_VERIFICATION_FAILED",
                                   "current_file_read_failed", "source.read_current",
@@ -7554,15 +9048,14 @@ static source_verify_status_t verify_node_source(cbm_store_t *store, const char 
     mcp_file_identity_t after = {0};
     bool after_ok = mcp_get_file_identity(handle, &after);
     DWORD after_error = after_ok ? ERROR_SUCCESS : GetLastError();
-    bool close_ok = CloseHandle(handle) != 0;
-    DWORD close_error = close_ok ? ERROR_SUCCESS : GetLastError();
-    if (!extra_read_ok || !after_ok || !close_ok) {
+    mcp_close_windows_handle_or_abort(&handle, "source.finalize_current_read");
+    if (!extra_read_ok || !after_ok) {
         verified_source_free(verified);
         return source_failure(
             failure, SOURCE_VERIFY_ERROR, "CBM_SOURCE_VERIFICATION_FAILED",
             "current_file_readback_incomplete", "source.finalize_current_read",
             "the current file readback could not be finalized and inspected",
-            (uint32_t)(extra_error ? extra_error : (after_error ? after_error : close_error)));
+            (uint32_t)(extra_error ? extra_error : after_error));
     }
     if (total != (size_t)current_size || extra_count != 0 ||
         !mcp_file_identity_equal(&before, &after)) {
@@ -9239,7 +10732,7 @@ static bool validate_scoped_source_file(const char *root_path, const char *absol
     mcp_file_identity_t before = {0};
     if (!mcp_get_file_identity(handle, &before)) {
         result->native_error = (uint32_t)GetLastError();
-        CloseHandle(handle);
+        mcp_close_windows_handle_or_abort(&handle, "scope.inspect_current");
         result->status = SEARCH_SCOPE_IO_FAILED;
         snprintf(result->operation, sizeof(result->operation), "%s", "scope.inspect_current");
         snprintf(result->detail, sizeof(result->detail),
@@ -9262,7 +10755,7 @@ static bool validate_scoped_source_file(const char *root_path, const char *absol
         }
         free(real_root);
         free(real_current);
-        CloseHandle(handle);
+        mcp_close_windows_handle_or_abort(&handle, "scope.resolve_current_containment");
         result->status = SEARCH_SCOPE_IO_FAILED;
         snprintf(result->operation, sizeof(result->operation), "%s",
                  "scope.resolve_current_containment");
@@ -9274,7 +10767,7 @@ static bool validate_scoped_source_file(const char *root_path, const char *absol
     free(real_root);
     free(real_current);
     if (!within_root) {
-        CloseHandle(handle);
+        mcp_close_windows_handle_or_abort(&handle, "scope.validate_current_containment");
         result->status = SEARCH_SCOPE_DRIFT;
         snprintf(result->operation, sizeof(result->operation), "%s",
                  "scope.validate_current_containment");
@@ -9283,7 +10776,7 @@ static bool validate_scoped_source_file(const char *root_path, const char *absol
         return false;
     }
     if (before.standard.Directory) {
-        CloseHandle(handle);
+        mcp_close_windows_handle_or_abort(&handle, "scope.inspect_directory");
         result->status = SEARCH_SCOPE_INVALID_IDENTITY;
         snprintf(result->operation, sizeof(result->operation), "%s", "scope.inspect_current");
         snprintf(result->detail, sizeof(result->detail),
@@ -9292,7 +10785,7 @@ static bool validate_scoped_source_file(const char *root_path, const char *absol
         return false;
     }
     if (before.standard.DeletePending || before.standard.EndOfFile.QuadPart < 0) {
-        CloseHandle(handle);
+        mcp_close_windows_handle_or_abort(&handle, "scope.inspect_nonregular");
         result->status = SEARCH_SCOPE_DRIFT;
         snprintf(result->operation, sizeof(result->operation), "%s", "scope.inspect_current");
         snprintf(result->detail, sizeof(result->detail),
@@ -9301,7 +10794,7 @@ static bool validate_scoped_source_file(const char *root_path, const char *absol
         return false;
     }
     if (before.standard.EndOfFile.QuadPart != indexed->size) {
-        CloseHandle(handle);
+        mcp_close_windows_handle_or_abort(&handle, "scope.compare_current_size");
         result->status = SEARCH_SCOPE_DRIFT;
         snprintf(result->operation, sizeof(result->operation), "%s", "scope.compare_current_size");
         snprintf(result->detail, sizeof(result->detail),
@@ -9312,7 +10805,7 @@ static bool validate_scoped_source_file(const char *root_path, const char *absol
     uint64_t current_size = (uint64_t)before.standard.EndOfFile.QuadPart;
     long max_file_bytes = cbm_max_file_bytes();
     if (current_size > SIZE_MAX - SKIP_ONE || current_size > (uint64_t)max_file_bytes) {
-        CloseHandle(handle);
+        mcp_close_windows_handle_or_abort(&handle, "scope.bound_current_read");
         result->status = SEARCH_SCOPE_DRIFT;
         snprintf(result->operation, sizeof(result->operation), "%s", "scope.bound_current_read");
         snprintf(result->detail, sizeof(result->detail),
@@ -9321,7 +10814,7 @@ static bool validate_scoped_source_file(const char *root_path, const char *absol
     }
     uint8_t *bytes = malloc((size_t)current_size + SKIP_ONE);
     if (!bytes) {
-        CloseHandle(handle);
+        mcp_close_windows_handle_or_abort(&handle, "scope.allocate_current");
         result->status = SEARCH_SCOPE_IO_FAILED;
         snprintf(result->operation, sizeof(result->operation), "%s", "scope.allocate_current");
         snprintf(result->detail, sizeof(result->detail),
@@ -9339,7 +10832,7 @@ static bool validate_scoped_source_file(const char *root_path, const char *absol
         if (!ReadFile(handle, bytes + total, wanted, &got, NULL)) {
             result->native_error = (uint32_t)GetLastError();
             free(bytes);
-            CloseHandle(handle);
+            mcp_close_windows_handle_or_abort(&handle, "scope.read_current");
             result->status = SEARCH_SCOPE_IO_FAILED;
             snprintf(result->operation, sizeof(result->operation), "%s", "scope.read_current");
             snprintf(result->detail, sizeof(result->detail),
@@ -9359,11 +10852,10 @@ static bool validate_scoped_source_file(const char *root_path, const char *absol
     mcp_file_identity_t after = {0};
     bool after_ok = mcp_get_file_identity(handle, &after);
     DWORD after_error = after_ok ? ERROR_SUCCESS : GetLastError();
-    bool close_ok = CloseHandle(handle) != 0;
-    DWORD close_error = close_ok ? ERROR_SUCCESS : GetLastError();
-    if (!extra_ok || !after_ok || !close_ok) {
+    mcp_close_windows_handle_or_abort(&handle, "scope.finalize_current_read");
+    if (!extra_ok || !after_ok) {
         result->native_error =
-            (uint32_t)(extra_error ? extra_error : (after_error ? after_error : close_error));
+            (uint32_t)(extra_error ? extra_error : after_error);
         free(bytes);
         result->status = SEARCH_SCOPE_IO_FAILED;
         snprintf(result->operation, sizeof(result->operation), "%s", "scope.finalize_current_read");
@@ -10765,7 +12257,12 @@ static char *handle_manage_adr(cbm_mcp_server_t *srv, const char *args) {
         cbm_store_adr_free(&adr);
     }
     if (owns_mutation_store) {
-        cbm_store_close(store);
+        cbm_store_close_result_t close_result;
+        if (!close_local_store_exact(&store, "manage_adr.finish", project, &close_result)) {
+            free(json);
+            json = build_local_store_close_error("manage_adr.finish", project, &close_result);
+            is_error = true;
+        }
     }
     free(project);
     free(mode_str);
@@ -10946,7 +12443,14 @@ static char *handle_ingest_traces(cbm_mcp_server_t *srv, const char *args) {
     free(err_detail);
     free(b64);
     if (owns_mutation_store) {
-        cbm_store_close(store);
+        cbm_store_close_result_t close_result;
+        if (!close_local_store_exact(&store, "ingest_traces.finish", project,
+                                     &close_result)) {
+            free(json);
+            json = build_local_store_close_error("ingest_traces.finish", project,
+                                                 &close_result);
+            is_error = true;
+        }
     }
     free(project);
 
@@ -11473,7 +12977,9 @@ static int poll_for_input_unix(cbm_mcp_server_t *srv, int fd, FILE *in) {
             return CBM_NOT_FOUND;
         }
         if (pr == 0) {
-            cbm_mcp_server_evict_idle(srv, STORE_IDLE_TIMEOUT_S);
+            if (cbm_mcp_server_evict_idle(srv, STORE_IDLE_TIMEOUT_S) != 0) {
+                return CBM_NOT_FOUND;
+            }
             return 0;
         }
         return SKIP_ONE;
@@ -11501,7 +13007,9 @@ static int poll_for_input_unix(cbm_mcp_server_t *srv, int fd, FILE *in) {
             return CBM_NOT_FOUND;
         }
         if (pr == 0) {
-            cbm_mcp_server_evict_idle(srv, STORE_IDLE_TIMEOUT_S);
+            if (cbm_mcp_server_evict_idle(srv, STORE_IDLE_TIMEOUT_S) != 0) {
+                return CBM_NOT_FOUND;
+            }
             return 0;
         }
         return SKIP_ONE;
@@ -11519,6 +13027,7 @@ int cbm_mcp_server_run(cbm_mcp_server_t *srv, FILE *in, FILE *out) {
     size_t cap = 0;
     int fd = cbm_fileno(in);
 
+    int run_status = 0;
     for (;;) {
         /* Poll with idle timeout so we can evict unused stores between requests.
          *
@@ -11543,15 +13052,22 @@ int cbm_mcp_server_run(cbm_mcp_server_t *srv, FILE *in, FILE *out) {
         HANDLE hStdin = (HANDLE)_get_osfhandle(fd);
         DWORD wr = WaitForSingleObject(hStdin, STORE_IDLE_TIMEOUT_S * MCP_TIMEOUT_MS);
         if (wr == WAIT_FAILED) {
+            run_status = CBM_NOT_FOUND;
             break;
         }
         if (wr == WAIT_TIMEOUT) {
-            cbm_mcp_server_evict_idle(srv, STORE_IDLE_TIMEOUT_S);
+            if (cbm_mcp_server_evict_idle(srv, STORE_IDLE_TIMEOUT_S) != 0) {
+                run_status = CBM_NOT_FOUND;
+                break;
+            }
             continue;
         }
 #else
         int pr = poll_for_input_unix(srv, fd, in);
         if (pr < 0) {
+            if (srv && srv->store_close_error_active) {
+                run_status = CBM_NOT_FOUND;
+            }
             break;
         }
         if (pr == 0) {
@@ -11590,7 +13106,7 @@ int cbm_mcp_server_run(cbm_mcp_server_t *srv, FILE *in, FILE *out) {
     }
 
     free(line);
-    return 0;
+    return run_status;
 }
 
 /* ── cbm_parse_file_uri ──────────────────────────────────────── */

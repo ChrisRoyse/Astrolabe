@@ -246,7 +246,9 @@ pub(crate) fn handle_get_kernel(args_json: &str) -> Result<String, DynError> {
         Ok(Some(index)) => index,
         Ok(None) => kernel_index_absent_value(
             None,
-            &format!("project {project:?} has no persisted kernel artifact, so no member index exists"),
+            &format!(
+                "project {project:?} has no persisted kernel artifact, so no member index exists"
+            ),
         ),
         Err(error) => {
             return tool_json_error_result(json!({
@@ -426,7 +428,8 @@ pub(crate) fn read_kernel_index_state(
         ],
     )?;
     let scope_id = kernel_artifact_scope_id(project);
-    let Some(artifact) = astrolabe_ingest::read_persisted_kernel_artifact(&vault, &scope_id)? else {
+    let Some(artifact) = astrolabe_ingest::read_persisted_kernel_artifact(&vault, &scope_id)?
+    else {
         return Ok(None);
     };
 
@@ -763,7 +766,9 @@ fn resolve_query_candidates<C>(
 where
     C: Clock,
 {
-    use astrolabe_panel::{StaticEmbeddingInput, StaticEmbeddingTable, encode_static_embedding_slot};
+    use astrolabe_panel::{
+        StaticEmbeddingInput, StaticEmbeddingTable, encode_static_embedding_slot,
+    };
     use astrolabe_weave::search::SLOT_CODE_SEMANTIC;
     use astrolabe_weave::search_index::{IndexKnobs, split_identifier_tokens};
 
@@ -788,7 +793,10 @@ where
         qualified_name: query.to_string(),
     };
     let encoded = encode_static_embedding_slot(SLOT_CODE_SEMANTIC, &input, &table)?;
-    let SlotVector::Dense { data: query_vector, .. } = encoded else {
+    let SlotVector::Dense {
+        data: query_vector, ..
+    } = encoded
+    else {
         return Err(format!(
             "{ASTRO_KERNEL_ANSWER_QUERY_OOV}: query {query:?} carries no token the frozen \
              code-semantic embedding table knows, so it reaches no kernel member; remediation: \
@@ -798,13 +806,8 @@ where
     };
 
     let k = index.indexed_member_count as u64;
-    let ranked = astrolabe_weave::kernel_query_members(
-        &index,
-        &artifact.members_hash,
-        &query_vector,
-        k,
-        k,
-    )?;
+    let ranked =
+        astrolabe_weave::kernel_query_members(&index, &artifact.members_hash, &query_vector, k, k)?;
 
     // Map ranked source-atom ids back to CxIds through the same snapshot the
     // index resolved its members from; a match with no live CxId is dropped and

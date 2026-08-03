@@ -24,10 +24,12 @@
 .NOTES
     Refs #612, #600, #596, #424, #197. Manual FSV tooling; this is not a test or a gate.
 #>
-[CmdletBinding()]
+[CmdletBinding(DefaultParameterSetName = 'Single')]
 param(
     [Parameter(Mandatory)][string]$ReceiptPath,
-    [Parameter(Mandatory)][string]$ArgumentsJson,
+    [Parameter(Mandatory, ParameterSetName = 'Single')][string]$ArgumentsJson,
+    [Parameter(Mandatory, ParameterSetName = 'ResidentCohort')][switch]$ResidentCohort,
+    [Parameter(Mandatory, ParameterSetName = 'ResidentCohort')][string]$CohortPlanPath,
     [Parameter(Mandatory)][string]$StandardOutputPath,
     [Parameter(Mandatory)][string]$StandardErrorPath,
     [Parameter(Mandatory)][string]$RunRecordPath,
@@ -485,8 +487,10 @@ if (-not ([Management.Automation.PSTypeName]'AstroFsvAtomicFile').Type) {
     Add-Type -Language CSharp -TypeDefinition @'
 using System;
 using System.ComponentModel;
+using System.IO;
 using System.Runtime.InteropServices;
 using System.Text;
+using System.Threading.Tasks;
 using Microsoft.Win32.SafeHandles;
 
 public static class AstroFsvAtomicFile {
@@ -570,6 +574,11 @@ public sealed class AstroFsvCreatedProcess : IDisposable {
 
     IntPtr threadHandle;
     bool disposed;
+    StreamWriter inputWriter;
+    StreamReader outputReader;
+    StreamReader errorReader;
+    Task<string> outputDrain;
+    Task<string> errorDrain;
 
     [StructLayout(LayoutKind.Sequential)]
     struct FILETIME {
@@ -658,6 +667,35 @@ public sealed class AstroFsvCreatedProcess : IDisposable {
                     "; exact suspended-child cleanup also failed: " +
                     cleanupFailure.Message,
                     identityFailure);
+            }
+            throw;
+        }
+    }
+
+    internal AstroFsvCreatedProcess(
+        IntPtr processHandle,
+        IntPtr primaryThreadHandle,
+        uint processId,
+        SafeFileHandle parentInputWrite,
+        SafeFileHandle parentOutputRead,
+        SafeFileHandle parentErrorRead) : this(processHandle, primaryThreadHandle, processId) {
+        try {
+            UTF8Encoding strictUtf8 = new UTF8Encoding(false, true);
+            inputWriter = new StreamWriter(
+                new FileStream(parentInputWrite, FileAccess.Write, 4096, false),
+                strictUtf8, 4096);
+            inputWriter.AutoFlush = true;
+            outputReader = new StreamReader(
+                new FileStream(parentOutputRead, FileAccess.Read, 4096, false),
+                strictUtf8, true, 4096, false);
+            errorReader = new StreamReader(
+                new FileStream(parentErrorRead, FileAccess.Read, 4096, false),
+                strictUtf8, true, 4096, false);
+        }
+        catch {
+            try { TerminateAndWait(DUPLICATE_FAILURE_EXIT_CODE, DUPLICATE_FAILURE_WAIT_MS); }
+            finally {
+                Dispose();
             }
             throw;
         }
@@ -759,6 +797,96 @@ public sealed class AstroFsvCreatedProcess : IDisposable {
                 "process handle completed (pid=" + ProcessId +
                 "; duplicate_wait=" + duplicate + ")");
         }
+    }
+
+    public bool WaitForExit(uint timeoutMilliseconds) {
+        EnsureUsable();
+        uint primary = WaitForExactHandle(
+            ProcessHandle, timeoutMilliseconds, "primary process handle");
+        if (primary == WAIT_TIMEOUT)
+            return false;
+        uint duplicate =
+            WaitForExactHandle(ObservationHandle, 0, "duplicated process handle");
+        if (duplicate != WAIT_OBJECT_0) {
+            throw new InvalidOperationException(
+                "duplicated exact process handle was not signaled after the primary exact " +
+                "process handle completed (pid=" + ProcessId +
+                "; duplicate_wait=" + duplicate + ")");
+        }
+        return true;
+    }
+
+    public void WriteInputLine(string line) {
+        EnsureUsable();
+        if (inputWriter == null)
+            throw new InvalidOperationException("native child has no parent-owned stdin pipe");
+        if (line == null || line.IndexOfAny(new char[] { '\r', '\n' }) >= 0)
+            throw new ArgumentException("stdin protocol message must be one non-null line", "line");
+        inputWriter.WriteLine(line);
+        inputWriter.Flush();
+    }
+
+    public string ReadOutputLine(uint timeoutMilliseconds) {
+        EnsureUsable();
+        if (outputReader == null)
+            throw new InvalidOperationException("native child has no parent-owned stdout pipe");
+        Task<string> read = outputReader.ReadLineAsync();
+        if (!read.Wait(checked((int)timeoutMilliseconds)))
+            throw new TimeoutException(
+                "timed out reading one native child stdout protocol line " +
+                "(pid=" + ProcessId + "; timeout_ms=" + timeoutMilliseconds + ")");
+        string line = read.Result;
+        if (line == null)
+            throw new EndOfStreamException(
+                "native child stdout closed before a protocol line was read " +
+                "(pid=" + ProcessId + ")");
+        return line;
+    }
+
+    public void CloseInput() {
+        if (inputWriter == null)
+            return;
+        inputWriter.Dispose();
+        inputWriter = null;
+    }
+
+    public void BeginOutputDrain() {
+        EnsureUsable();
+        if (outputReader == null || errorReader == null)
+            throw new InvalidOperationException("native child has no parent-owned output pipes");
+        if (outputDrain != null)
+            throw new InvalidOperationException("native child stdout drain is already active");
+        outputDrain = outputReader.ReadToEndAsync();
+        if (errorDrain == null)
+            errorDrain = errorReader.ReadToEndAsync();
+    }
+
+    public void BeginErrorDrain() {
+        EnsureUsable();
+        if (errorReader == null)
+            throw new InvalidOperationException("native child has no parent-owned stderr pipe");
+        if (errorDrain != null)
+            throw new InvalidOperationException("native child stderr drain is already active");
+        errorDrain = errorReader.ReadToEndAsync();
+    }
+
+    public string GetOutputText(uint timeoutMilliseconds) {
+        return GetDrainText(outputDrain, timeoutMilliseconds, "stdout");
+    }
+
+    public string GetErrorText(uint timeoutMilliseconds) {
+        return GetDrainText(errorDrain, timeoutMilliseconds, "stderr");
+    }
+
+    string GetDrainText(Task<string> drain, uint timeoutMilliseconds, string streamName) {
+        if (drain == null)
+            throw new InvalidOperationException(
+                "native child " + streamName + " drain was not started");
+        if (!drain.Wait(checked((int)timeoutMilliseconds)))
+            throw new TimeoutException(
+                "timed out draining native child " + streamName +
+                " (pid=" + ProcessId + "; timeout_ms=" + timeoutMilliseconds + ")");
+        return drain.Result;
     }
 
     public void Refresh() {
@@ -887,6 +1015,18 @@ public sealed class AstroFsvCreatedProcess : IDisposable {
         if (disposed)
             return;
         disposed = true;
+        if (inputWriter != null) {
+            inputWriter.Dispose();
+            inputWriter = null;
+        }
+        if (outputReader != null) {
+            outputReader.Dispose();
+            outputReader = null;
+        }
+        if (errorReader != null) {
+            errorReader.Dispose();
+            errorReader = null;
+        }
         if (threadHandle != IntPtr.Zero) {
             CloseHandle(threadHandle);
             threadHandle = IntPtr.Zero;
@@ -910,6 +1050,7 @@ public static class AstroFsvNativeProcess {
     const uint EXTENDED_STARTUPINFO_PRESENT = 0x00080000;
     const uint CREATE_NO_WINDOW = 0x08000000;
     const uint PROC_THREAD_ATTRIBUTE_HANDLE_LIST = 0x00020002;
+    const uint HANDLE_FLAG_INHERIT = 0x00000001;
     const int ERROR_INSUFFICIENT_BUFFER = 122;
 
     [StructLayout(LayoutKind.Sequential)]
@@ -963,6 +1104,17 @@ public static class AstroFsvNativeProcess {
     static extern bool DeleteFileW(string name);
 
     [DllImport("kernel32.dll", SetLastError = true)]
+    static extern bool CreatePipe(
+        out SafeFileHandle readPipe,
+        out SafeFileHandle writePipe,
+        ref SECURITY_ATTRIBUTES pipeAttributes,
+        uint size);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    static extern bool SetHandleInformation(
+        SafeFileHandle handle, uint mask, uint flags);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
     static extern bool InitializeProcThreadAttributeList(
         IntPtr attributeList, int attributeCount, int flags, ref IntPtr size);
 
@@ -1011,6 +1163,32 @@ public static class AstroFsvNativeProcess {
                 operation + " failed (native_error=" + error + "; path=" + path + ")");
         }
         return handle;
+    }
+
+    static void CreateInheritablePipe(
+        out SafeFileHandle readPipe,
+        out SafeFileHandle writePipe,
+        bool parentOwnsRead,
+        string description) {
+        SECURITY_ATTRIBUTES security = new SECURITY_ATTRIBUTES();
+        security.nLength = Marshal.SizeOf(typeof(SECURITY_ATTRIBUTES));
+        security.lpSecurityDescriptor = IntPtr.Zero;
+        security.bInheritHandle = 1;
+        if (!CreatePipe(out readPipe, out writePipe, ref security, 0)) {
+            int error = Marshal.GetLastWin32Error();
+            throw new Win32Exception(error,
+                "CreatePipe failed for " + description +
+                " (native_error=" + error + ")");
+        }
+        SafeFileHandle parentEnd = parentOwnsRead ? readPipe : writePipe;
+        if (!SetHandleInformation(parentEnd, HANDLE_FLAG_INHERIT, 0)) {
+            int error = Marshal.GetLastWin32Error();
+            readPipe.Dispose();
+            writePipe.Dispose();
+            throw new Win32Exception(error,
+                "SetHandleInformation(non-inheritable parent pipe end) failed for " +
+                description + " (native_error=" + error + ")");
+        }
     }
 
     static string RemoveCreatedOutput(string path) {
@@ -1169,6 +1347,139 @@ public static class AstroFsvNativeProcess {
                         (outputCleanup ?? "stdout=absent"), failure);
                 }
             }
+        }
+    }
+
+    public static AstroFsvCreatedProcess CreateSuspendedPiped(
+        string applicationPath,
+        string commandLine) {
+        if (String.IsNullOrWhiteSpace(applicationPath))
+            throw new ArgumentException("applicationPath is empty", "applicationPath");
+        if (String.IsNullOrWhiteSpace(commandLine))
+            throw new ArgumentException("commandLine is empty", "commandLine");
+        if (commandLine.Length > 32766)
+            throw new ArgumentOutOfRangeException("commandLine",
+                "CreateProcessW command line exceeds 32,766 UTF-16 characters " +
+                "(actual=" + commandLine.Length + ")");
+
+        SafeFileHandle childInputRead = null;
+        SafeFileHandle parentInputWrite = null;
+        SafeFileHandle parentOutputRead = null;
+        SafeFileHandle childOutputWrite = null;
+        SafeFileHandle parentErrorRead = null;
+        SafeFileHandle childErrorWrite = null;
+        IntPtr attributeList = IntPtr.Zero;
+        IntPtr handleList = IntPtr.Zero;
+        try {
+            CreateInheritablePipe(
+                out childInputRead, out parentInputWrite, false, "child stdin");
+            CreateInheritablePipe(
+                out parentOutputRead, out childOutputWrite, true, "child stdout");
+            CreateInheritablePipe(
+                out parentErrorRead, out childErrorWrite, true, "child stderr");
+
+            IntPtr attributeBytes = IntPtr.Zero;
+            bool sizingResult = InitializeProcThreadAttributeList(
+                IntPtr.Zero, 1, 0, ref attributeBytes);
+            int sizingError = Marshal.GetLastWin32Error();
+            if (sizingResult || sizingError != ERROR_INSUFFICIENT_BUFFER ||
+                attributeBytes == IntPtr.Zero) {
+                throw new Win32Exception(sizingError,
+                    "InitializeProcThreadAttributeList sizing failed " +
+                    "(native_error=" + sizingError + "; requested_attributes=1)");
+            }
+            attributeList = Marshal.AllocHGlobal(attributeBytes);
+            if (!InitializeProcThreadAttributeList(
+                attributeList, 1, 0, ref attributeBytes)) {
+                int error = Marshal.GetLastWin32Error();
+                throw new Win32Exception(error,
+                    "InitializeProcThreadAttributeList allocation failed " +
+                    "(native_error=" + error + "; requested_attributes=1)");
+            }
+
+            handleList = Marshal.AllocHGlobal(IntPtr.Size * 3);
+            Marshal.WriteIntPtr(handleList, 0, childInputRead.DangerousGetHandle());
+            Marshal.WriteIntPtr(
+                handleList, IntPtr.Size, childOutputWrite.DangerousGetHandle());
+            Marshal.WriteIntPtr(
+                handleList, IntPtr.Size * 2, childErrorWrite.DangerousGetHandle());
+            if (!UpdateProcThreadAttribute(
+                attributeList, 0,
+                new IntPtr(PROC_THREAD_ATTRIBUTE_HANDLE_LIST),
+                handleList, new IntPtr(IntPtr.Size * 3),
+                IntPtr.Zero, IntPtr.Zero)) {
+                int error = Marshal.GetLastWin32Error();
+                throw new Win32Exception(error,
+                    "UpdateProcThreadAttribute restricted pipe handle list failed " +
+                    "(native_error=" + error + "; inherited_handle_count=3)");
+            }
+
+            STARTUPINFOEX startup = new STARTUPINFOEX();
+            startup.StartupInfo.cb = Marshal.SizeOf(typeof(STARTUPINFOEX));
+            startup.StartupInfo.dwFlags = unchecked((int)STARTF_USESTDHANDLES);
+            startup.StartupInfo.hStdInput = childInputRead.DangerousGetHandle();
+            startup.StartupInfo.hStdOutput = childOutputWrite.DangerousGetHandle();
+            startup.StartupInfo.hStdError = childErrorWrite.DangerousGetHandle();
+            startup.lpAttributeList = attributeList;
+
+            StringBuilder mutableCommandLine =
+                new StringBuilder(commandLine, commandLine.Length + 1);
+            PROCESS_INFORMATION processInformation;
+            uint creationFlags =
+                CREATE_SUSPENDED | EXTENDED_STARTUPINFO_PRESENT | CREATE_NO_WINDOW;
+            if (!CreateProcessW(
+                Extended(applicationPath),
+                mutableCommandLine,
+                IntPtr.Zero,
+                IntPtr.Zero,
+                true,
+                creationFlags,
+                IntPtr.Zero,
+                null,
+                ref startup,
+                out processInformation)) {
+                int error = Marshal.GetLastWin32Error();
+                throw new Win32Exception(error,
+                    "CreateProcessW exact piped extended application launch failed " +
+                    "(native_error=" + error +
+                    "; application=" + applicationPath +
+                    "; application_extended=" + Extended(applicationPath) +
+                    "; command_line_utf16_characters=" + commandLine.Length +
+                    "; creation_flags=" + creationFlags + ")");
+            }
+
+            childInputRead.Dispose();
+            childInputRead = null;
+            childOutputWrite.Dispose();
+            childOutputWrite = null;
+            childErrorWrite.Dispose();
+            childErrorWrite = null;
+
+            AstroFsvCreatedProcess created = new AstroFsvCreatedProcess(
+                processInformation.hProcess,
+                processInformation.hThread,
+                processInformation.dwProcessId,
+                parentInputWrite,
+                parentOutputRead,
+                parentErrorRead);
+            parentInputWrite = null;
+            parentOutputRead = null;
+            parentErrorRead = null;
+            return created;
+        }
+        finally {
+            if (attributeList != IntPtr.Zero) {
+                DeleteProcThreadAttributeList(attributeList);
+                Marshal.FreeHGlobal(attributeList);
+            }
+            if (handleList != IntPtr.Zero)
+                Marshal.FreeHGlobal(handleList);
+            if (childInputRead != null) childInputRead.Dispose();
+            if (parentInputWrite != null) parentInputWrite.Dispose();
+            if (parentOutputRead != null) parentOutputRead.Dispose();
+            if (childOutputWrite != null) childOutputWrite.Dispose();
+            if (parentErrorRead != null) parentErrorRead.Dispose();
+            if (childErrorWrite != null) childErrorWrite.Dispose();
         }
     }
 }
@@ -1501,6 +1812,1411 @@ function ConvertFrom-FlatStringArrayJson([string]$Json) {
     }
 }
 
+function Assert-AstroExactObjectProperties {
+    param(
+        [Parameter(Mandatory)]$Object,
+        [Parameter(Mandatory)][string[]]$Names,
+        [Parameter(Mandatory)][string]$Code,
+        [Parameter(Mandatory)][string]$Description
+    )
+    if ($null -eq $Object -or $Object -isnot [psobject]) {
+        Fail-Astro $Code "$Description is absent or is not an object" `
+            'preserve the plan/session and correct the exact structured envelope'
+    }
+    $actual = @($Object.PSObject.Properties | ForEach-Object Name)
+    if ($actual.Count -ne $Names.Count -or
+        @($Names | Where-Object { $actual -cnotcontains $_ }).Count -ne 0) {
+        Fail-Astro $Code `
+            "$Description must contain exactly [$($Names -join ', ')]; observed [$($actual -join ', ')]" `
+            'preserve the plan/session and correct the exact structured envelope'
+    }
+}
+
+function ConvertFrom-AstroStrictUtf8File {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][string]$Code,
+        [Parameter(Mandatory)][string]$Description
+    )
+    $stream = [IO.File]::Open(
+        (ConvertTo-AstroExtendedLengthPath $Path),
+        [IO.FileMode]::Open,
+        [IO.FileAccess]::Read,
+        [IO.FileShare]::Read
+    )
+    try {
+        if ($stream.Length -le 0 -or $stream.Length -gt 1048576) {
+            Fail-Astro $Code "$Description length is invalid: $($stream.Length) bytes" `
+                'use one nonempty strict UTF-8 JSON plan no larger than 1 MiB'
+        }
+        $bytes = [byte[]]::new([int]$stream.Length)
+        $offset = 0
+        while ($offset -lt $bytes.Length) {
+            $read = $stream.Read($bytes, $offset, $bytes.Length - $offset)
+            if ($read -le 0) {
+                Fail-Astro $Code "$Description ended before its retained length was read" `
+                    'preserve the plan and investigate concurrent byte mutation'
+            }
+            $offset += $read
+        }
+    }
+    finally { $stream.Dispose() }
+    if ($bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and
+        $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF) {
+        Fail-Astro $Code "$Description has a UTF-8 BOM" `
+            'write canonical strict UTF-8 JSON without a BOM'
+    }
+    try { return [Text.UTF8Encoding]::new($false, $true).GetString($bytes) }
+    catch {
+        Fail-Astro $Code "$Description is not strict UTF-8: $($_.Exception.Message)" `
+            'write canonical strict UTF-8 JSON without replacement characters'
+    }
+}
+
+function ConvertFrom-AstroCohortStringArray {
+    param(
+        $Value,
+        [Parameter(Mandatory)][string]$Code,
+        [Parameter(Mandatory)][string]$Description
+    )
+    if ($Value -isnot [Array]) {
+        Fail-Astro $Code "$Description is not an array" 'use a JSON array containing only strings'
+    }
+    $result = [string[]]::new($Value.Count)
+    for ($index = 0; $index -lt $Value.Count; $index++) {
+        if ($Value[$index] -isnot [string]) {
+            Fail-Astro $Code "$Description item $index is not a string" `
+                'use a JSON array containing only strings'
+        }
+        $result[$index] = [string]$Value[$index]
+    }
+    return ,$result
+}
+
+function Read-AstroResidentCohortPlan {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][string]$Workspace,
+        [Parameter(Mandatory)][int]$ExpectedIssue
+    )
+    $manualRoot = Join-Path $Workspace '.tmp\manual-fsv'
+    $full = Assert-PathWithin $Path $manualRoot `
+        'ASTRO_FSV_COHORT_PLAN_ESCAPE' 'resident-cohort plan'
+    if (-not (Test-AstroPathLongPath -LiteralPath $full -PathType Leaf)) {
+        Fail-Astro 'ASTRO_FSV_COHORT_PLAN_MISSING' `
+            "resident-cohort plan is absent: $full" `
+            'publish the issue-scoped plan below .tmp\manual-fsv before entering the launcher'
+    }
+    Assert-NotReparseEntry $full 'resident-cohort plan'
+    $shaBefore = File-Sha256 $full
+    $json = ConvertFrom-AstroStrictUtf8File $full `
+        'ASTRO_FSV_COHORT_PLAN_INVALID' 'resident-cohort plan'
+    try { $plan = ConvertFrom-Json -InputObject $json }
+    catch {
+        Fail-Astro 'ASTRO_FSV_COHORT_PLAN_INVALID' `
+            "resident-cohort plan JSON is invalid: $($_.Exception.Message)" `
+            'publish one exact issue-scoped cohort plan object'
+    }
+    $planProperties = @(
+        'schema', 'issue', 'resident_count', 'cache_directory', 'store_paths',
+        'prime_request', 'prime_expected_substring', 'indexer_arguments',
+        'indexer_expected_substring', 'reopen_request',
+        'reopen_expected_substring', 'response_timeout_ms', 'holder_timeout_ms',
+        'indexer_timeout_ms', 'resident_exit_timeout_ms'
+    )
+    Assert-AstroExactObjectProperties $plan $planProperties `
+        'ASTRO_FSV_COHORT_PLAN_INVALID' 'resident-cohort plan'
+    if ([string]$plan.schema -cne 'astrolabe.native-fsv-resident-cohort-plan.v1' -or
+        [int]$plan.issue -ne $ExpectedIssue) {
+        Fail-Astro 'ASTRO_FSV_COHORT_PLAN_INVALID' `
+            "resident-cohort plan schema/issue does not match issue #$ExpectedIssue" `
+            'publish a fresh plan bound to the driving issue'
+    }
+    $residentCount = [int]$plan.resident_count
+    if ($residentCount -lt 2 -or $residentCount -gt 16 -or
+        [string]$residentCount -cne [string]$plan.resident_count) {
+        Fail-Astro 'ASTRO_FSV_COHORT_PLAN_INVALID' `
+            'resident_count must be an exact integer from 2 through 16' `
+            'use the smallest cohort that reproduces the real concurrency boundary'
+    }
+    $cacheDirectory = Assert-PathWithin ([string]$plan.cache_directory) $manualRoot `
+        'ASTRO_FSV_COHORT_CACHE_ESCAPE' 'resident-cohort cache directory'
+    if (-not (Test-AstroPathLongPath -LiteralPath $cacheDirectory -PathType Container)) {
+        Fail-Astro 'ASTRO_FSV_COHORT_CACHE_MISSING' `
+            "resident-cohort cache directory is absent: $cacheDirectory" `
+            'seed the real store before starting the cohort'
+    }
+    Assert-NotReparseEntry $cacheDirectory 'resident-cohort cache directory'
+    $ambientCache = [Environment]::GetEnvironmentVariable('CBM_CACHE_DIR', 'Process')
+    if ([string]::IsNullOrWhiteSpace($ambientCache) -or
+        -not [string]::Equals(
+            [IO.Path]::GetFullPath($ambientCache), $cacheDirectory,
+            [StringComparison]::OrdinalIgnoreCase)) {
+        Fail-Astro 'ASTRO_FSV_COHORT_CACHE_ENV_MISMATCH' `
+            "process CBM_CACHE_DIR does not exactly name plan cache '$cacheDirectory'" `
+            'set CBM_CACHE_DIR for the full launcher batch to the issue-scoped real store root'
+    }
+    $storePaths = ConvertFrom-AstroCohortStringArray $plan.store_paths `
+        'ASTRO_FSV_COHORT_PLAN_INVALID' 'store_paths'
+    if ($storePaths.Count -ne 3) {
+        Fail-Astro 'ASTRO_FSV_COHORT_PLAN_INVALID' `
+            'store_paths must name exactly the SQLite db, db-wal, and db-shm family' `
+            'publish the exact three paths derived from the seeded real store'
+    }
+    for ($index = 0; $index -lt $storePaths.Count; $index++) {
+        $storePaths[$index] = Assert-PathWithin $storePaths[$index] $cacheDirectory `
+            'ASTRO_FSV_COHORT_STORE_ESCAPE' "store_paths[$index]"
+    }
+    if (-not $storePaths[0].EndsWith('.db', [StringComparison]::OrdinalIgnoreCase) -or
+        -not [string]::Equals($storePaths[1], $storePaths[0] + '-wal', [StringComparison]::OrdinalIgnoreCase) -or
+        -not [string]::Equals($storePaths[2], $storePaths[0] + '-shm', [StringComparison]::OrdinalIgnoreCase)) {
+        Fail-Astro 'ASTRO_FSV_COHORT_PLAN_INVALID' `
+            'store_paths is not one exact SQLite db/db-wal/db-shm family' `
+            'publish the seeded database path followed by its literal -wal and -shm paths'
+    }
+    if (-not (Test-AstroPathLongPath -LiteralPath $storePaths[0] -PathType Leaf)) {
+        Fail-Astro 'ASTRO_FSV_COHORT_STORE_MISSING' `
+            "seeded SQLite database is absent: $($storePaths[0])" `
+            'complete the real seed invocation before starting resident processes'
+    }
+    foreach ($sidecar in $storePaths[1..2]) {
+        if (Test-AstroPathLongPath -LiteralPath $sidecar) {
+            Fail-Astro 'ASTRO_FSV_COHORT_INITIAL_SIDECAR_PRESENT' `
+                "SQLite sidecar is already present before cohort admission: $sidecar" `
+                'close every prior store owner and use a clean seeded store generation'
+        }
+    }
+    foreach ($requestName in @('prime_request', 'reopen_request')) {
+        $request = $plan.$requestName
+        Assert-AstroExactObjectProperties $request @('jsonrpc', 'id', 'method', 'params') `
+            'ASTRO_FSV_COHORT_PLAN_INVALID' $requestName
+        if ([string]$request.jsonrpc -cne '2.0' -or
+            [string]$request.method -cne 'tools/call' -or $null -eq $request.id) {
+            Fail-Astro 'ASTRO_FSV_COHORT_PLAN_INVALID' `
+                "$requestName must be one tools/call JSON-RPC 2.0 request with a non-null id" `
+                'publish the exact real resident request envelope'
+        }
+    }
+    foreach ($name in @(
+        'prime_expected_substring', 'indexer_expected_substring',
+        'reopen_expected_substring'
+    )) {
+        if ($plan.$name -isnot [string] -or [string]::IsNullOrWhiteSpace([string]$plan.$name)) {
+            Fail-Astro 'ASTRO_FSV_COHORT_PLAN_INVALID' "$name must be a nonempty string" `
+                'bind each phase to a real response marker'
+        }
+    }
+    $indexerArguments = ConvertFrom-AstroCohortStringArray $plan.indexer_arguments `
+        'ASTRO_FSV_COHORT_PLAN_INVALID' 'indexer_arguments'
+    if ($indexerArguments.Count -lt 5 -or $indexerArguments[0] -cne 'cli' -or
+        $indexerArguments -cnotcontains '--json' -or
+        $indexerArguments -cnotcontains 'index_repository' -or
+        $indexerArguments -cnotcontains '--args-file') {
+        Fail-Astro 'ASTRO_FSV_COHORT_PLAN_INVALID' `
+            'indexer_arguments must be the real cli --json index_repository --args-file invocation' `
+            'bind the cohort writer to an existing issue-scoped real arguments file'
+    }
+    $timeouts = [ordered]@{}
+    foreach ($name in @(
+        'response_timeout_ms', 'holder_timeout_ms', 'indexer_timeout_ms',
+        'resident_exit_timeout_ms'
+    )) {
+        $parsed = 0
+        if (-not [int]::TryParse(
+                [string]$plan.$name,
+                [Globalization.NumberStyles]::None,
+                [Globalization.CultureInfo]::InvariantCulture,
+                [ref]$parsed
+            ) -or $parsed -lt 1000 -or $parsed -gt 3600000 -or
+            [string]$parsed -cne [string]$plan.$name) {
+            Fail-Astro 'ASTRO_FSV_COHORT_PLAN_INVALID' `
+                "$name must be an exact integer from 1000 through 3600000" `
+                'publish bounded positive cohort time budgets in milliseconds'
+        }
+        $timeouts[$name] = $parsed
+    }
+    return [ordered]@{
+        path = $full
+        sha256_before = $shaBefore
+        resident_count = $residentCount
+        cache_directory = $cacheDirectory
+        store_paths = [string[]]$storePaths
+        prime_request = $plan.prime_request
+        prime_expected_substring = [string]$plan.prime_expected_substring
+        reopen_request = $plan.reopen_request
+        reopen_expected_substring = [string]$plan.reopen_expected_substring
+        indexer_arguments = [string[]]$indexerArguments
+        indexer_expected_substring = [string]$plan.indexer_expected_substring
+        response_timeout_ms = [int]$timeouts.response_timeout_ms
+        holder_timeout_ms = [int]$timeouts.holder_timeout_ms
+        indexer_timeout_ms = [int]$timeouts.indexer_timeout_ms
+        resident_exit_timeout_ms = [int]$timeouts.resident_exit_timeout_ms
+    }
+}
+
+function Write-AstroFsvEventLine {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)]$Event
+    )
+    $line = ($Event | ConvertTo-Json -Depth 20 -Compress) + [Environment]::NewLine
+    $stream = [IO.File]::Open(
+        (ConvertTo-AstroExtendedLengthPath $Path),
+        [IO.FileMode]::Append,
+        [IO.FileAccess]::Write,
+        [IO.FileShare]::Read
+    )
+    try {
+        $bytes = [Text.UTF8Encoding]::new($false).GetBytes($line)
+        $stream.Write($bytes, 0, $bytes.Length)
+        $stream.Flush($true)
+    }
+    finally { $stream.Dispose() }
+}
+
+function Get-AstroCohortStoreSnapshot {
+    param([Parameter(Mandatory)][string[]]$StorePaths)
+    $owners = [ordered]@{}
+    $files = [Collections.Generic.List[object]]::new()
+    foreach ($path in $StorePaths) {
+        $state = Get-AstroPathEntryState $path
+        if ($state.State -ceq 'absent') {
+            $files.Add([ordered]@{ path = $path; state = 'absent'; owners = @() })
+            continue
+        }
+        if ($state.State -cne 'present' -or
+            ($state.Attributes -band [IO.FileAttributes]::Directory) -ne 0 -or
+            ($state.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+            Fail-Astro 'ASTRO_FSV_COHORT_STORE_UNEVALUABLE' `
+                "store-family path is not an ordinary readable file: $path (state=$($state.State); error=$($state.Error))" `
+                'preserve the real store and repair path identity before lifecycle cleanup'
+        }
+        $diagnostic = Get-AstroArtifactOwnerDiagnostic $path
+        if ([string]$diagnostic.state -cne 'observed') {
+            Fail-Astro 'ASTRO_FSV_COHORT_OWNER_UNEVALUABLE' `
+                "Restart Manager could not classify exact owners of '$path': $($diagnostic.error)" `
+                'preserve every process and store byte until exact holder attribution is readable'
+        }
+        $fileOwners = [Collections.Generic.List[object]]::new()
+        foreach ($owner in @($diagnostic.owners)) {
+            $identity = New-AstroProcessIdentityRecord `
+                ([int]$owner.pid) ([long]$owner.process_start_utc_ticks)
+            $key = '{0}:{1}' -f $identity.pid,$identity.process_start_utc_ticks
+            if (-not $owners.Contains($key)) {
+                $owners[$key] = [ordered]@{
+                    identity = $identity
+                    paths = [Collections.Generic.List[string]]::new()
+                }
+            }
+            $owners[$key].paths.Add($path)
+            $fileOwners.Add($identity)
+        }
+        $files.Add([ordered]@{
+            path = $path
+            state = 'present'
+            owners = @($fileOwners | Sort-Object `
+                @{ Expression = { [int]$_.pid } },
+                @{ Expression = { [long]$_.process_start_utc_ticks } })
+        })
+    }
+    $canonicalOwners = @($owners.Values | ForEach-Object {
+        [ordered]@{
+            identity = $_.identity
+            paths = [string[]]@($_.paths | Sort-Object -Unique)
+        }
+    } | Sort-Object `
+        @{ Expression = { [int]$_.identity.pid } },
+        @{ Expression = { [long]$_.identity.process_start_utc_ticks } })
+    return [ordered]@{
+        observed_at_utc = [DateTime]::UtcNow.ToString('o')
+        files = @($files)
+        owners = @($canonicalOwners)
+        owner_signature = (@($canonicalOwners | ForEach-Object {
+            '{0}:{1}' -f $_.identity.pid,$_.identity.process_start_utc_ticks
+        }) -join ',')
+    }
+}
+
+function Wait-AstroCohortStoreOwners {
+    param(
+        [Parameter(Mandatory)][string[]]$StorePaths,
+        [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$ExpectedIdentities,
+        [Parameter(Mandatory)][int]$TimeoutMilliseconds,
+        [Parameter(Mandatory)][string]$Phase
+    )
+    $expectedSignature = @($ExpectedIdentities | Sort-Object `
+        @{ Expression = { [int]$_.pid } },
+        @{ Expression = { [long]$_.process_start_utc_ticks } } | ForEach-Object {
+            '{0}:{1}' -f $_.pid,$_.process_start_utc_ticks
+        }) -join ','
+    $attempts = [Collections.Generic.List[object]]::new()
+    $stopwatch = [Diagnostics.Stopwatch]::StartNew()
+    $previousMatchingSignature = $null
+    while ($stopwatch.ElapsedMilliseconds -le $TimeoutMilliseconds) {
+        $snapshot = Get-AstroCohortStoreSnapshot -StorePaths $StorePaths
+        $matches = [string]$snapshot.owner_signature -ceq $expectedSignature
+        $attempts.Add([ordered]@{
+            attempt = $attempts.Count + 1
+            elapsed_ms = [int64]$stopwatch.ElapsedMilliseconds
+            expected_signature = $expectedSignature
+            observed_signature = [string]$snapshot.owner_signature
+            matches = $matches
+        })
+        if ($matches -and $previousMatchingSignature -ceq $expectedSignature) {
+            $stopwatch.Stop()
+            return [ordered]@{
+                phase = $Phase
+                stable = $true
+                required_consecutive_matches = 2
+                elapsed_ms = [int64]$stopwatch.ElapsedMilliseconds
+                attempts = @($attempts)
+                snapshot = $snapshot
+            }
+        }
+        $previousMatchingSignature = if ($matches) { $expectedSignature } else { $null }
+        [Threading.Thread]::Sleep(100)
+    }
+    $stopwatch.Stop()
+    Fail-Astro 'ASTRO_FSV_COHORT_OWNER_MISMATCH' `
+        "store-owner phase '$Phase' did not reach two stable exact snapshots (expected=$expectedSignature; attempts=$($attempts | ConvertTo-Json -Depth 12 -Compress))" `
+        'preserve the cohort/store/session and inspect the exact PID/start-ticks holder chronology'
+}
+
+function Wait-AstroCohortSidecarsAbsent {
+    param(
+        [Parameter(Mandatory)][string[]]$SidecarPaths,
+        [Parameter(Mandatory)][int]$TimeoutMilliseconds,
+        [Parameter(Mandatory)][string]$Phase
+    )
+    $stopwatch = [Diagnostics.Stopwatch]::StartNew()
+    $attempts = [Collections.Generic.List[object]]::new()
+    $priorMatch = $false
+    while ($stopwatch.ElapsedMilliseconds -le $TimeoutMilliseconds) {
+        $states = @($SidecarPaths | ForEach-Object {
+            [ordered]@{ path = $_; exists = Test-AstroPathLongPath -LiteralPath $_ }
+        })
+        $match = @($states | Where-Object exists).Count -eq 0
+        $attempts.Add([ordered]@{
+            attempt = $attempts.Count + 1
+            elapsed_ms = [int64]$stopwatch.ElapsedMilliseconds
+            states = $states
+            matches = $match
+        })
+        if ($match -and $priorMatch) {
+            $stopwatch.Stop()
+            return [ordered]@{
+                phase = $Phase; stable = $true; required_consecutive_matches = 2
+                elapsed_ms = [int64]$stopwatch.ElapsedMilliseconds
+                attempts = @($attempts)
+            }
+        }
+        $priorMatch = $match
+        [Threading.Thread]::Sleep(100)
+    }
+    $stopwatch.Stop()
+    Fail-Astro 'ASTRO_FSV_COHORT_SIDECAR_RETAINED' `
+        "SQLite sidecars did not become stably absent during '$Phase': $($attempts | ConvertTo-Json -Depth 8 -Compress)" `
+        'preserve the store and exact process chronology; inspect the owner that retained the SQLite generation'
+}
+
+function Invoke-AstroCohortRequest {
+    param(
+        [Parameter(Mandatory)][AstroFsvCreatedProcess]$Process,
+        [Parameter(Mandatory)]$Request,
+        [Parameter(Mandatory)][AllowEmptyString()][string]$ExpectedSubstring,
+        [Parameter(Mandatory)][int]$TimeoutMilliseconds,
+        [Parameter(Mandatory)][string]$Phase,
+        [Parameter(Mandatory)][int]$Ordinal,
+        [Parameter(Mandatory)][string]$EventPath
+    )
+    $requestLine = $Request | ConvertTo-Json -Depth 30 -Compress
+    $Process.WriteInputLine($requestLine)
+    Write-AstroFsvEventLine $EventPath ([ordered]@{
+        event = 'request_sent'; phase = $Phase; role = 'resident'; ordinal = $Ordinal
+        identity = New-AstroProcessIdentityRecord $Process.Id ([long]$Process.ProcessStartUtcTicks)
+        at_utc = [DateTime]::UtcNow.ToString('o'); request_sha256 = String-Sha256 $requestLine
+        request = $Request
+    })
+    $responseLine = $Process.ReadOutputLine([uint32]$TimeoutMilliseconds)
+    try { $response = ConvertFrom-Json -InputObject $responseLine }
+    catch {
+        Fail-Astro 'ASTRO_FSV_COHORT_RESPONSE_INVALID' `
+            "resident $Ordinal returned invalid JSON during '$Phase': $($_.Exception.Message); line=$responseLine" `
+            'preserve the output and repair the real resident protocol response'
+    }
+    if ($null -eq $response -or [string]$response.jsonrpc -cne '2.0' -or
+        $null -eq $response.PSObject.Properties['id'] -or
+        (($response.id | ConvertTo-Json -Compress) -cne ($Request.id | ConvertTo-Json -Compress)) -or
+        ($response.PSObject.Properties['error'] -and $null -ne $response.error) -or
+        -not $response.PSObject.Properties['result'] -or
+        ($ExpectedSubstring.Length -gt 0 -and
+            $responseLine.IndexOf($ExpectedSubstring, [StringComparison]::Ordinal) -lt 0)) {
+        Fail-Astro 'ASTRO_FSV_COHORT_RESPONSE_INVALID' `
+            "resident $Ordinal returned an unexpected '$Phase' response: $responseLine" `
+            'preserve the exact response and correct the expected real request/result contract'
+    }
+    $event = [ordered]@{
+        event = 'response_received'; phase = $Phase; role = 'resident'; ordinal = $Ordinal
+        identity = New-AstroProcessIdentityRecord $Process.Id ([long]$Process.ProcessStartUtcTicks)
+        at_utc = [DateTime]::UtcNow.ToString('o'); response_sha256 = String-Sha256 $responseLine
+        response = $response
+    }
+    Write-AstroFsvEventLine $EventPath $event
+    return $event
+}
+
+function Read-AstroFsvCohortOwnerEntries {
+    param(
+        $Entries,
+        [Parameter(Mandatory)][int]$ResidentCount,
+        [int]$ExpectedProcessCount = -1,
+        [Parameter(Mandatory)][string]$Code,
+        [Parameter(Mandatory)][string]$Description
+    )
+    if ($Entries -isnot [Array] -or $Entries.Count -gt ($ResidentCount + 1) -or
+        ($ExpectedProcessCount -ge 0 -and $Entries.Count -ne $ExpectedProcessCount)) {
+        Fail-Astro $Code "$Description has an invalid process count (observed=$($Entries.Count); expected=$ExpectedProcessCount; maximum=$($ResidentCount + 1))" `
+            'preserve the lifecycle state and investigate incomplete multi-process provenance'
+    }
+    $keys = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    $identities = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    $result = [Collections.Generic.List[object]]::new()
+    foreach ($entry in $Entries) {
+        Assert-AstroExactObjectProperties $entry @('role', 'ordinal', 'identity') $Code `
+            "$Description process entry"
+        $role = [string]$entry.role
+        $ordinal = [int]$entry.ordinal
+        $valid = ($role -ceq 'indexer' -and $ordinal -eq 0) -or
+            ($role -ceq 'resident' -and $ordinal -ge 1 -and $ordinal -le $ResidentCount)
+        $identity = Read-AstroFsvProcessIdentity $entry.identity $Code `
+            "$Description $role/$ordinal identity"
+        $key = "$role/$ordinal/$($identity.pid)/$($identity.process_start_utc_ticks)"
+        $roleKey = "$role/$ordinal"
+        $identityKey = "$($identity.pid)/$($identity.process_start_utc_ticks)"
+        if (-not $valid -or -not $keys.Add($roleKey) -or
+            -not $identities.Add($identityKey)) {
+            Fail-Astro $Code "$Description has an invalid or duplicate process entry '$key'" `
+                'preserve the lifecycle state and investigate incomplete multi-process provenance'
+        }
+        $result.Add([ordered]@{ role = $role; ordinal = $ordinal; identity = $identity })
+    }
+    if ($ExpectedProcessCount -eq ($ResidentCount + 1) -and
+        (@($result | Where-Object role -ceq 'indexer').Count -ne 1 -or
+         @($result | Where-Object role -ceq 'resident').Count -ne $ResidentCount)) {
+        Fail-Astro $Code "$Description process roles/cardinality are invalid" `
+            'preserve the lifecycle state and investigate incomplete multi-process provenance'
+    }
+    return ,@($result | Sort-Object role, ordinal)
+}
+
+function Test-AstroFsvCohortOwnerEntriesEqual($Left, $Right) {
+    if ($Left.Count -ne $Right.Count) { return $false }
+    for ($index = 0; $index -lt $Left.Count; $index++) {
+        if ([string]$Left[$index].role -cne [string]$Right[$index].role -or
+            [int]$Left[$index].ordinal -ne [int]$Right[$index].ordinal -or
+            -not (Test-AstroFsvIdentityEqual $Left[$index].identity $Right[$index].identity)) {
+            return $false
+        }
+    }
+    return $true
+}
+
+function Remove-TerminalFsvCohortLock {
+    param(
+        [Parameter(Mandatory)][string]$LockPath,
+        [Parameter(Mandatory)]$RunnerIdentity,
+        [Parameter(Mandatory)][object[]]$Processes,
+        [Parameter(Mandatory)][int]$ResidentCount,
+        [Parameter(Mandatory)][string]$ArtifactSha256
+    )
+    if (-not (Test-AstroPathLongPath -LiteralPath $LockPath)) {
+        return [ordered]@{ path = $LockPath; before_exists = $false; removed = $false; after_exists = $false; sha256_before = $null }
+    }
+    $lockSha = File-Sha256 $LockPath
+    try {
+        $lock = Read-AstroUtf8FileLongPath $LockPath | ConvertFrom-Json
+        if ([string]$lock.schema -cne 'astrolabe.native-fsv-lock.v3' -or
+            [int]$lock.resident_count -ne $ResidentCount -or
+            [string]$lock.artifact_sha256 -cne $ArtifactSha256) { throw 'v3 envelope mismatch' }
+        $lockRunner = Read-AstroFsvProcessIdentity $lock.owners.runner `
+            'ASTRO_FSV_LOCK_IDENTITY_CHANGED' 'terminal cohort-lock runner identity'
+        $lockProcesses = Read-AstroFsvCohortOwnerEntries $lock.owners.processes `
+            $ResidentCount $Processes.Count 'ASTRO_FSV_LOCK_IDENTITY_CHANGED' `
+            'terminal cohort lock'
+    }
+    catch {
+        Fail-Astro 'ASTRO_FSV_LOCK_IDENTITY_CHANGED' `
+            "terminal cohort lock is unreadable, malformed, or mismatched: $($_.Exception.Message)" `
+            'preserve the lock/session and retire only after exact multi-process identity readback'
+    }
+    if (-not (Test-AstroFsvIdentityEqual $lockRunner $RunnerIdentity) -or
+        -not (Test-AstroFsvCohortOwnerEntriesEqual $lockProcesses $Processes)) {
+        Fail-Astro 'ASTRO_FSV_LOCK_IDENTITY_CHANGED' `
+            'terminal cohort lock no longer matches this exact runner/process generation set' `
+            'preserve the lock/session and retire only after exact multi-process identity readback'
+    }
+    Remove-AstroFileLongPath $LockPath
+    if (Test-AstroPathLongPath -LiteralPath $LockPath) {
+        Fail-Astro 'ASTRO_FSV_LOCK_CLEANUP_READBACK_FAILED' `
+            "owned cohort lock remained after terminal cleanup: $LockPath" `
+            'preserve the lock/session and retire only after exact multi-process owner absence'
+    }
+    return [ordered]@{ path = $LockPath; before_exists = $true; removed = $true; after_exists = $false; sha256_before = $lockSha }
+}
+
+function Open-AstroCohortCleanupReadiness {
+    param(
+        [Parameter(Mandatory)][string]$ArtifactPath,
+        [Parameter(Mandatory)][string]$ExpectedSha256,
+        [Parameter(Mandatory)][uint64]$ExpectedBytes,
+        [Parameter(Mandatory)][int[]]$OwnedPids,
+        [Parameter(Mandatory)][string]$LauncherJobName
+    )
+    $lease = $null
+    $attempts = [Collections.Generic.List[object]]::new()
+    $stopwatch = [Diagnostics.Stopwatch]::StartNew()
+    $timeoutMs = 15000
+    $delayMs = 100
+    try {
+        while ($null -eq $lease) {
+            Set-AstroFileReadOnlyLongPath -LiteralPath $ArtifactPath -ReadOnly $false
+            $openFailure = $null
+            try {
+                $lease = [AstroLauncherLockNative]::OpenExactRenameSource($ArtifactPath)
+            }
+            catch { $openFailure = $_ }
+            if ($null -ne $lease) {
+                Set-AstroFileReadOnlyLongPath -LiteralPath $ArtifactPath -ReadOnly $true
+                break
+            }
+            Set-AstroFileReadOnlyLongPath -LiteralPath $ArtifactPath -ReadOnly $true
+            $nativeError = Get-AstroNativeErrorCode $openFailure.Exception
+            $ownerDiagnostic = Get-AstroArtifactOwnerDiagnostic $ArtifactPath
+            $attempts.Add([ordered]@{
+                attempt = $attempts.Count + 1
+                elapsed_ms = [int64]$stopwatch.ElapsedMilliseconds
+                native_error = $nativeError
+                message = $openFailure.Exception.Message
+                owner_diagnostic = $ownerDiagnostic
+                read_only_restored = $true
+            })
+            if ($nativeError -ne 32 -or [string]$ownerDiagnostic.state -cne 'observed' -or
+                @($ownerDiagnostic.owners).Count -eq 0) {
+                throw "cleanup-readiness sharing failure is not a completely attributed transient (native_error=$nativeError; owner_diagnostic=$($ownerDiagnostic | ConvertTo-Json -Depth 8 -Compress))"
+            }
+            $internal = @($ownerDiagnostic.owners | Where-Object {
+                [int]$_.pid -in $OwnedPids
+            })
+            if ($internal.Count -ne 0) {
+                throw "cleanup-readiness sharing violation remains inside exact launcher Job '$LauncherJobName' (owners=$($internal | ConvertTo-Json -Depth 8 -Compress))"
+            }
+            $remaining = $timeoutMs - [int64]$stopwatch.ElapsedMilliseconds
+            if ($remaining -le 0) {
+                throw "cleanup-readiness sharing violation exceeded $timeoutMs ms"
+            }
+            [Threading.Thread]::Sleep([int][Math]::Min($delayMs, $remaining))
+            $delayMs = [int][Math]::Min($delayMs * 2, 1000)
+        }
+        $stopwatch.Stop()
+        $finalPath = ConvertFrom-AstroNativeFinalPath (
+            [AstroLauncherLockNative]::GetFileFinalPath($lease)
+        )
+        $fileId = [AstroLauncherLockNative]::GetFileIdentity($lease)
+        $links = [AstroLauncherLockNative]::GetNumberOfLinks($lease)
+        $length = Get-AstroFileLengthLongPath $ArtifactPath
+        $hash = File-Sha256UnderCleanupLease $ArtifactPath
+        $attributes = [IO.File]::GetAttributes(
+            (ConvertTo-AstroExtendedLengthPath $ArtifactPath)
+        )
+        $readOnly = ($attributes -band [IO.FileAttributes]::ReadOnly) -ne 0
+        if (-not [string]::Equals($finalPath, $ArtifactPath, [StringComparison]::OrdinalIgnoreCase) -or
+            $links -ne 1 -or $length -ne $ExpectedBytes -or
+            $hash -cne $ExpectedSha256 -or -not $readOnly) {
+            throw "cleanup-readiness readback drifted (final_path=$finalPath; links=$links; bytes=$length; sha256=$hash; read_only=$readOnly)"
+        }
+        return [pscustomobject]@{
+            Lease = $lease
+            Evidence = [ordered]@{
+                established = $true
+                operation = 'CreateFileW(GENERIC_READ|GENERIC_WRITE|DELETE,FILE_SHARE_READ)'
+                final_path = $finalPath
+                file_id = $fileId
+                links = [uint32]$links
+                bytes = [uint64]$length
+                sha256 = $hash
+                read_only_restored = $readOnly
+                process_termination_proved = $true
+                process_handles_closed = $true
+                retained_until_runner_exit = $true
+                transition = [ordered]@{
+                    kind = if ($attempts.Count -eq 0) { 'immediate' } else { 'bounded-foreign-owner-sharing-violation' }
+                    timeout_ms = $timeoutMs
+                    initial_delay_ms = 100
+                    maximum_delay_ms = 1000
+                    failed_attempts = @($attempts)
+                    successful_attempt = $attempts.Count + 1
+                    elapsed_ms = [int64]$stopwatch.ElapsedMilliseconds
+                }
+            }
+        }
+    }
+    catch {
+        $stopwatch.Stop()
+        $failure = $_
+        if ($null -ne $lease) { $lease.Dispose(); $lease = $null }
+        try {
+            if (Test-AstroPathLongPath -LiteralPath $ArtifactPath -PathType Leaf) {
+                Set-AstroFileReadOnlyLongPath -LiteralPath $ArtifactPath -ReadOnly $true
+            }
+        }
+        catch {
+            Fail-Astro 'ASTRO_FSV_ARTIFACT_CLEANUP_READINESS_RESTORE_FAILED' `
+                "cohort cleanup readiness failed and read-only restoration also failed (readiness=$($failure.Exception.Message); restore=$($_.Exception.Message))" `
+                'preserve the session and exact owner state before lifecycle cleanup'
+        }
+        Fail-Astro 'ASTRO_FSV_ARTIFACT_CLEANUP_NOT_READY' `
+            "staged cohort artifact is not exactly ready for cleanup: $($failure.Exception.Message); attempts=$($attempts | ConvertTo-Json -Depth 12 -Compress)" `
+            'preserve the session and inspect the exact native error/owner transition'
+    }
+}
+
+function Invoke-AstroResidentCohort {
+    param(
+        [Parameter(Mandatory)][string]$PlanPath,
+        [Parameter(Mandatory)][string]$Workspace,
+        [Parameter(Mandatory)][int]$IssueNumber,
+        [Parameter(Mandatory)][string]$SessionDirectory,
+        [Parameter(Mandatory)][string]$ReceiptFull,
+        [Parameter(Mandatory)]$Receipt,
+        [Parameter(Mandatory)][string]$Artifact,
+        [Parameter(Mandatory)][string]$ArtifactHashBefore,
+        [Parameter(Mandatory)][string]$ReceiptHashBefore,
+        [Parameter(Mandatory)]$ArtifactItem,
+        [Parameter(Mandatory)]$LauncherIdentity,
+        [Parameter(Mandatory)]$RunnerIdentity,
+        [Parameter(Mandatory)][int]$LauncherPid,
+        [Parameter(Mandatory)]$LauncherOwner,
+        [Parameter(Mandatory)][string]$LauncherLockPath,
+        [Parameter(Mandatory)]$LauncherLockHandle,
+        [Parameter(Mandatory)]$LauncherLockSnapshotBefore,
+        [Parameter(Mandatory)][uint32]$LauncherLockLinksBefore,
+        [Parameter(Mandatory)][string]$LauncherLockHashBefore,
+        [Parameter(Mandatory)][string]$LauncherJobName,
+        [Parameter(Mandatory)][int[]]$LauncherJobMembersBefore,
+        [Parameter(Mandatory)]$BeforeRepo,
+        [Parameter(Mandatory)][string]$GitExe,
+        [Parameter(Mandatory)]$ArtifactExecutionHandle,
+        [Parameter(Mandatory)][string]$FsvLockPath,
+        [Parameter(Mandatory)][string]$StandardOutputPath,
+        [Parameter(Mandatory)][string]$StandardErrorPath,
+        [Parameter(Mandatory)][string]$RunRecordPath,
+        [Parameter(Mandatory)][string]$LiveStatePath
+    )
+
+    $plan = Read-AstroResidentCohortPlan $PlanPath $Workspace $IssueNumber
+    $processStates = [Collections.Generic.List[object]]::new()
+    $residentResponses = [Collections.Generic.List[object]]::new()
+    $storeChronology = [Collections.Generic.List[object]]::new()
+    $cleanupLease = $null
+    $lockOwned = $false
+    $lockCleanup = $null
+    $liveStatePublished = $false
+    $liveStateBytes = 0L
+    $liveStateSha256 = $null
+    $runRecordWritten = $false
+    $lockManifest = $null
+    $cohortJobMembers = [int[]]::new(0)
+
+    $ownerEntries = {
+        return @($processStates | ForEach-Object {
+            [ordered]@{
+                role = [string]$_.role
+                ordinal = [int]$_.ordinal
+                identity = $_.identity
+            }
+        } | Sort-Object role, ordinal)
+    }
+    $publishLock = {
+        param([string]$Phase)
+        $lockManifest.phase = $Phase
+        $lockManifest.process_count = $processStates.Count
+        $lockManifest.owners.processes = @(& $ownerEntries)
+        $stage = "$FsvLockPath.$PID.$Phase.tmp"
+        Write-NewDurableUtf8 $stage ($lockManifest | ConvertTo-Json -Depth 15 -Compress)
+        try { [AstroFsvAtomicFile]::ReplaceOwned($stage, $FsvLockPath) }
+        catch {
+            if (Test-AstroPathLongPath -LiteralPath $stage -PathType Leaf) {
+                Remove-AstroFileLongPath $stage
+            }
+            throw
+        }
+        $readback = Read-AstroUtf8FileLongPath $FsvLockPath | ConvertFrom-Json
+        $readbackRunner = Read-AstroFsvProcessIdentity $readback.owners.runner `
+            'ASTRO_FSV_LOCK_UPDATE_FAILED' 'cohort-lock runner identity'
+        $readbackProcesses = Read-AstroFsvCohortOwnerEntries `
+            $readback.owners.processes $plan.resident_count $processStates.Count `
+            'ASTRO_FSV_LOCK_UPDATE_FAILED' 'cohort-lock process readback'
+        $expectedProcesses = Read-AstroFsvCohortOwnerEntries `
+            @(& $ownerEntries) $plan.resident_count $processStates.Count `
+            'ASTRO_FSV_LOCK_UPDATE_FAILED' 'local cohort process set'
+        if ([string]$readback.schema -cne 'astrolabe.native-fsv-lock.v3' -or
+            [int]$readback.issue -ne $IssueNumber -or
+            [int]$readback.resident_count -ne $plan.resident_count -or
+            [int]$readback.process_count -ne $processStates.Count -or
+            [string]$readback.phase -cne $Phase -or
+            [string]$readback.artifact_sha256 -cne $ArtifactHashBefore -or
+            -not (Test-AstroFsvIdentityEqual $readbackRunner $RunnerIdentity) -or
+            -not (Test-AstroFsvCohortOwnerEntriesEqual $readbackProcesses $expectedProcesses)) {
+            Fail-Astro 'ASTRO_FSV_LOCK_UPDATE_FAILED' `
+                "cohort-lock '$Phase' readback differs from the exact local process set" `
+                'preserve the lock/session and inspect the durable multi-process owner envelope'
+        }
+    }
+    $processRecords = {
+        return @($processStates | ForEach-Object {
+            [ordered]@{
+                role = [string]$_.role
+                ordinal = [int]$_.ordinal
+                identity = $_.identity
+                launch_boundary = 'kernel32!CreateProcessW(non-null extended application; STARTUPINFOEX restricted anonymous-pipe handle list)'
+                standard_input = 'runner-owned anonymous pipe'
+                standard_output = 'runner-owned anonymous pipe'
+                standard_error = 'runner-owned anonymous pipe'
+                argument_count = @($_.arguments).Count
+                arguments = @($_.arguments)
+                created_suspended_at_utc = $_.created_suspended_at_utc
+                started_at_utc = $_.started_at_utc
+                exited_at_utc = $_.exited_at_utc
+                exit_code = $_.exit_code
+                exit_code_observation = $_.exit_code_observation
+                termination_proved = [bool]$_.termination_proved
+                exact_process_handles_closed = [bool]$_.handles_closed
+            }
+        } | Sort-Object role, ordinal)
+    }
+
+    try {
+        $lockManifest = [ordered]@{
+            schema = 'astrolabe.native-fsv-lock.v3'
+            mode = 'resident-cohort'
+            issue = $IssueNumber
+            started = [DateTime]::UtcNow.ToString('o')
+            resident_count = $plan.resident_count
+            process_count = 0
+            tree_sha = [string]$Receipt.tree_sha
+            artifact_path = $Artifact
+            artifact_sha256 = $ArtifactHashBefore
+            cohort_plan = [ordered]@{ path = $plan.path; sha256 = $plan.sha256_before }
+            owners = [ordered]@{
+                launcher = $LauncherIdentity
+                runner = $RunnerIdentity
+                processes = @()
+            }
+            launcher_job = [ordered]@{
+                name = $LauncherJobName
+                members = @($LauncherJobMembersBefore)
+            }
+            phase = 'claimed'
+        }
+        $lockStage = "$FsvLockPath.$PID.tmp"
+        Write-NewDurableUtf8 $lockStage ($lockManifest | ConvertTo-Json -Depth 15 -Compress)
+        try { [AstroFsvAtomicFile]::PublishNoClobber($lockStage, $FsvLockPath) }
+        catch {
+            if (Test-AstroPathLongPath -LiteralPath $lockStage -PathType Leaf) {
+                Remove-AstroFileLongPath $lockStage
+            }
+            Fail-Astro 'ASTRO_FSV_LOCK_HELD' `
+                "FSV lock could not be claimed for resident cohort: $FsvLockPath" `
+                'wait for the live owner or complete the exact tracker-bound stale-lock lifecycle'
+        }
+        $lockOwned = $true
+        Write-NewDurableUtf8 $StandardOutputPath ''
+        Write-NewDurableUtf8 $StandardErrorPath ''
+        Write-AstroFsvEventLine $StandardOutputPath ([ordered]@{
+            event = 'cohort_admitted'; at_utc = [DateTime]::UtcNow.ToString('o')
+            issue = $IssueNumber; resident_count = $plan.resident_count
+            plan = [ordered]@{ path = $plan.path; sha256 = $plan.sha256_before }
+            store_paths = $plan.store_paths
+        })
+
+        for ($ordinal = 1; $ordinal -le $plan.resident_count; $ordinal++) {
+            $commandLine = ConvertTo-WindowsCommandLineArgument $Artifact
+            try {
+                $native = [AstroFsvNativeProcess]::CreateSuspendedPiped(
+                    $Artifact, $commandLine
+                )
+            }
+            catch {
+                Fail-Astro 'ASTRO_FSV_COHORT_PROCESS_CREATE_FAILED' `
+                    "resident $ordinal creation failed before a complete identity was returned: $($_.Exception.Message)" `
+                    'preserve every recorded generation and repair the exact native process boundary'
+            }
+            $state = [ordered]@{
+                role = 'resident'; ordinal = $ordinal; native = $native
+                identity = New-AstroProcessIdentityRecord $native.Id ([long]$native.ProcessStartUtcTicks)
+                arguments = [string[]]::new(0)
+                created_suspended_at_utc = [DateTime]::UtcNow.ToString('o')
+                started_at_utc = $null; exited_at_utc = $null
+                exit_code = $null; exit_code_observation = $null
+                termination_proved = $false; handles_closed = $false
+            }
+            $processStates.Add($state)
+            try { & $publishLock 'creating' }
+            catch {
+                Fail-Astro 'ASTRO_FSV_LOCK_UPDATE_FAILED' `
+                    "resident $ordinal exact identity could not be published: $($_.Exception.Message)" `
+                    'preserve the lock/session and the failure record containing every locally retained exact handle'
+            }
+        }
+
+        $indexerArgumentLine = @($plan.indexer_arguments | ForEach-Object {
+            ConvertTo-WindowsCommandLineArgument ([string]$_)
+        }) -join ' '
+        $indexerCommandLine = (ConvertTo-WindowsCommandLineArgument $Artifact) +
+            ' ' + $indexerArgumentLine
+        try {
+            $indexerNative = [AstroFsvNativeProcess]::CreateSuspendedPiped(
+                $Artifact, $indexerCommandLine
+            )
+        }
+        catch {
+            Fail-Astro 'ASTRO_FSV_COHORT_PROCESS_CREATE_FAILED' `
+                "indexer creation failed before a complete identity was returned: $($_.Exception.Message)" `
+                'preserve every recorded generation and repair the exact native process boundary'
+        }
+        $processStates.Add([ordered]@{
+            role = 'indexer'; ordinal = 0; native = $indexerNative
+            identity = New-AstroProcessIdentityRecord $indexerNative.Id ([long]$indexerNative.ProcessStartUtcTicks)
+            arguments = [string[]]$plan.indexer_arguments
+            created_suspended_at_utc = [DateTime]::UtcNow.ToString('o')
+            started_at_utc = $null; exited_at_utc = $null
+            exit_code = $null; exit_code_observation = $null
+            termination_proved = $false; handles_closed = $false
+        })
+        & $publishLock 'suspended'
+
+        $jobProbe = Get-AstroLauncherJobObjectProbe -Name $LauncherJobName
+        $cohortJobMembers = [int[]]@($jobProbe.ProcessIds | Sort-Object -Unique)
+        $missingJobPids = @($processStates | Where-Object {
+            $cohortJobMembers -notcontains [int]$_.identity.pid
+        })
+        if ($jobProbe.State -cne 'observed' -or $missingJobPids.Count -ne 0) {
+            Fail-Astro 'ASTRO_FSV_COHORT_JOB_MISMATCH' `
+                "launcher Job does not contain every created cohort generation (state=$($jobProbe.State); members=$($cohortJobMembers -join ','); missing=$(@($missingJobPids | ForEach-Object { $_.identity.pid }) -join ','))" `
+                'preserve every process/session byte and repair non-breakaway launcher attribution'
+        }
+
+        $liveState = [ordered]@{
+            schema = 'astrolabe.native-fsv-live.v3'
+            mode = 'resident-cohort'
+            owners = [ordered]@{
+                launcher = $LauncherIdentity
+                runner = $RunnerIdentity
+                processes = @(& $ownerEntries)
+            }
+            resident_count = $plan.resident_count
+            process_count = $processStates.Count
+            launcher_job = [ordered]@{
+                name = $LauncherJobName
+                members_before = @($LauncherJobMembersBefore)
+                members_with_suspended_cohort = @($cohortJobMembers)
+            }
+            issue = $IssueNumber
+            tree_sha = [string]$Receipt.tree_sha
+            artifact = [ordered]@{
+                path = $Artifact; bytes = [uint64]$ArtifactItem.Length
+                sha256 = $ArtifactHashBefore
+            }
+            cohort_plan = [ordered]@{ path = $plan.path; sha256 = $plan.sha256_before }
+            created_at_utc = [DateTime]::UtcNow.ToString('o')
+        }
+        Publish-NewFile $LiveStatePath ($liveState | ConvertTo-Json -Depth 15)
+        $liveStatePublished = $true
+        $persistedLive = Read-AstroUtf8FileLongPath $LiveStatePath | ConvertFrom-Json
+        $persistedLiveRunner = Read-AstroFsvProcessIdentity $persistedLive.owners.runner `
+            'ASTRO_FSV_LIVE_STATE_READBACK_FAILED' 'cohort live-state runner identity'
+        $persistedLiveProcesses = Read-AstroFsvCohortOwnerEntries `
+            $persistedLive.owners.processes $plan.resident_count $processStates.Count `
+            'ASTRO_FSV_LIVE_STATE_READBACK_FAILED' 'cohort live-state process set'
+        $expectedLiveProcesses = Read-AstroFsvCohortOwnerEntries `
+            @(& $ownerEntries) $plan.resident_count $processStates.Count `
+            'ASTRO_FSV_LIVE_STATE_READBACK_FAILED' 'local cohort process set'
+        if ([string]$persistedLive.schema -cne 'astrolabe.native-fsv-live.v3' -or
+            [int]$persistedLive.issue -ne $IssueNumber -or
+            [string]$persistedLive.artifact.sha256 -cne $ArtifactHashBefore -or
+            -not (Test-AstroFsvIdentityEqual $persistedLiveRunner $RunnerIdentity) -or
+            -not (Test-AstroFsvCohortOwnerEntriesEqual $persistedLiveProcesses $expectedLiveProcesses)) {
+            Fail-Astro 'ASTRO_FSV_LIVE_STATE_READBACK_FAILED' `
+                'persisted cohort live state differs from the exact six-process generation set' `
+                'preserve the session and investigate the failed durable write'
+        }
+        $liveStateBytes = Get-AstroFileLengthLongPath $LiveStatePath
+        $liveStateSha256 = File-Sha256 $LiveStatePath
+
+        foreach ($state in @($processStates | Where-Object role -ceq 'resident' | Sort-Object ordinal)) {
+            try {
+                [void]$state.native.BindAndResume()
+                $state.started_at_utc = [DateTime]::UtcNow.ToString('o')
+                $state.native.BeginErrorDrain()
+            }
+            catch {
+                Fail-Astro 'ASTRO_FSV_COHORT_RESIDENT_START_FAILED' `
+                    "resident $($state.ordinal) could not be resumed with its pipes: $($_.Exception.Message)" `
+                    'preserve the exact process set and inspect the retained CreateProcess handles'
+            }
+        }
+        & $publishLock 'residents-running'
+
+        foreach ($state in @($processStates | Where-Object role -ceq 'resident' | Sort-Object ordinal)) {
+            $initialize = [ordered]@{
+                jsonrpc = '2.0'
+                id = "cohort-$IssueNumber-resident-$($state.ordinal)-initialize"
+                method = 'initialize'
+                params = [ordered]@{
+                    protocolVersion = '2024-11-05'
+                    capabilities = [ordered]@{}
+                    clientInfo = [ordered]@{
+                        name = 'astrolabe-native-fsv'; version = '1'
+                    }
+                }
+            }
+            $residentResponses.Add((Invoke-AstroCohortRequest `
+                $state.native $initialize '' $plan.response_timeout_ms `
+                'initialize' $state.ordinal $StandardOutputPath))
+            $notification = [ordered]@{
+                jsonrpc = '2.0'; method = 'notifications/initialized'
+                params = [ordered]@{}
+            }
+            $notificationLine = $notification | ConvertTo-Json -Depth 10 -Compress
+            $state.native.WriteInputLine($notificationLine)
+            Write-AstroFsvEventLine $StandardOutputPath ([ordered]@{
+                event = 'notification_sent'; phase = 'initialized'
+                role = 'resident'; ordinal = $state.ordinal; identity = $state.identity
+                at_utc = [DateTime]::UtcNow.ToString('o')
+                request_sha256 = String-Sha256 $notificationLine
+            })
+            $residentResponses.Add((Invoke-AstroCohortRequest `
+                $state.native $plan.prime_request $plan.prime_expected_substring `
+                $plan.response_timeout_ms 'prime' $state.ordinal $StandardOutputPath))
+        }
+        $residentIdentities = @($processStates | Where-Object role -ceq 'resident' |
+            Sort-Object ordinal | ForEach-Object { $_.identity })
+        $primeOwners = Wait-AstroCohortStoreOwners $plan.store_paths `
+            $residentIdentities $plan.holder_timeout_ms 'five-residents-primed'
+        $storeChronology.Add($primeOwners)
+        Write-AstroFsvEventLine $StandardOutputPath ([ordered]@{
+            event = 'store_owner_snapshot'; evidence = $primeOwners
+        })
+
+        $indexer = @($processStates | Where-Object role -ceq 'indexer')[0]
+        $indexer.native.BeginOutputDrain()
+        $indexer.native.CloseInput()
+        [void]$indexer.native.BindAndResume()
+        $indexer.started_at_utc = [DateTime]::UtcNow.ToString('o')
+        & $publishLock 'indexer-running'
+        if (-not $indexer.native.WaitForExit([uint32]$plan.indexer_timeout_ms)) {
+            Fail-Astro 'ASTRO_FSV_COHORT_INDEXER_TIMEOUT' `
+                "indexer exceeded its bounded $($plan.indexer_timeout_ms) ms execution budget" `
+                'preserve the process/store chronology; reduce the fixture or explicitly raise the issue-scoped bound'
+        }
+        $indexer.exited_at_utc = [DateTime]::UtcNow.ToString('o')
+        $indexer.exit_code_observation = Observe-ExitedProcessCode $indexer.native
+        $indexer.exit_code = [uint32]$indexer.exit_code_observation.exit_code
+        $indexer.termination_proved = $true
+        $indexerStdout = $indexer.native.GetOutputText([uint32]$plan.response_timeout_ms)
+        $indexerStderr = $indexer.native.GetErrorText([uint32]$plan.response_timeout_ms)
+        Write-AstroFsvEventLine $StandardOutputPath ([ordered]@{
+            event = 'indexer_completed'; at_utc = $indexer.exited_at_utc
+            identity = $indexer.identity; exit_code = $indexer.exit_code
+            exit_code_observation = $indexer.exit_code_observation
+            stdout_sha256 = String-Sha256 $indexerStdout; stdout = $indexerStdout
+        })
+        Write-AstroFsvEventLine $StandardErrorPath ([ordered]@{
+            event = 'process_stderr'; role = 'indexer'; ordinal = 0
+            identity = $indexer.identity; at_utc = [DateTime]::UtcNow.ToString('o')
+            stderr_sha256 = String-Sha256 $indexerStderr; stderr = $indexerStderr
+        })
+        if (-not [bool]$indexer.exit_code_observation.sources_agree -or
+            $indexer.exit_code -ne 0 -or
+            $indexerStdout.IndexOf($plan.indexer_expected_substring, [StringComparison]::Ordinal) -lt 0) {
+            Fail-Astro 'ASTRO_FSV_COHORT_INDEXER_FAILED' `
+                "real indexer did not meet its bound result (exit=$($indexer.exit_code); expected_substring=$($plan.indexer_expected_substring))" `
+                'preserve the exact output/store generation and repair the real index mutation'
+        }
+
+        $zeroAfterIndexer = Wait-AstroCohortStoreOwners $plan.store_paths @() `
+            $plan.holder_timeout_ms 'after-indexer-zero-holders'
+        $sidecarsAfterIndexer = Wait-AstroCohortSidecarsAbsent $plan.store_paths[1..2] `
+            $plan.holder_timeout_ms 'after-indexer-sidecars-absent'
+        $storeChronology.Add($zeroAfterIndexer)
+        $storeChronology.Add($sidecarsAfterIndexer)
+        Write-AstroFsvEventLine $StandardOutputPath ([ordered]@{
+            event = 'store_zero_holder_transition'; owner_evidence = $zeroAfterIndexer
+            sidecar_evidence = $sidecarsAfterIndexer
+        })
+
+        foreach ($state in @($processStates | Where-Object role -ceq 'resident' | Sort-Object ordinal)) {
+            $residentResponses.Add((Invoke-AstroCohortRequest `
+                $state.native $plan.reopen_request $plan.reopen_expected_substring `
+                $plan.response_timeout_ms 'reopen' $state.ordinal $StandardOutputPath))
+        }
+        $reopenedOwners = Wait-AstroCohortStoreOwners $plan.store_paths `
+            $residentIdentities $plan.holder_timeout_ms 'five-residents-reopened'
+        $storeChronology.Add($reopenedOwners)
+        Write-AstroFsvEventLine $StandardOutputPath ([ordered]@{
+            event = 'store_owner_snapshot'; evidence = $reopenedOwners
+        })
+
+        foreach ($state in @($processStates | Where-Object role -ceq 'resident' | Sort-Object ordinal)) {
+            $state.native.CloseInput()
+        }
+        foreach ($state in @($processStates | Where-Object role -ceq 'resident' | Sort-Object ordinal)) {
+            if (-not $state.native.WaitForExit([uint32]$plan.resident_exit_timeout_ms)) {
+                Fail-Astro 'ASTRO_FSV_COHORT_RESIDENT_EXIT_TIMEOUT' `
+                    "resident $($state.ordinal) did not exit after stdin EOF within $($plan.resident_exit_timeout_ms) ms" `
+                    'preserve the cohort/store chronology and inspect the real resident shutdown path'
+            }
+            $state.exited_at_utc = [DateTime]::UtcNow.ToString('o')
+            $state.exit_code_observation = Observe-ExitedProcessCode $state.native
+            $state.exit_code = [uint32]$state.exit_code_observation.exit_code
+            $state.termination_proved = $true
+            $stderrText = $state.native.GetErrorText([uint32]$plan.response_timeout_ms)
+            Write-AstroFsvEventLine $StandardErrorPath ([ordered]@{
+                event = 'process_stderr'; role = 'resident'; ordinal = $state.ordinal
+                identity = $state.identity; at_utc = $state.exited_at_utc
+                exit_code = $state.exit_code
+                exit_code_observation = $state.exit_code_observation
+                stderr_sha256 = String-Sha256 $stderrText; stderr = $stderrText
+            })
+            if (-not [bool]$state.exit_code_observation.sources_agree -or
+                $state.exit_code -ne 0) {
+                Fail-Astro 'ASTRO_FSV_COHORT_RESIDENT_EXIT_FAILED' `
+                    "resident $($state.ordinal) exited inconsistently or nonzero (exit=$($state.exit_code))" `
+                    'preserve the exact output and process observations'
+            }
+        }
+        $finalOwners = Wait-AstroCohortStoreOwners $plan.store_paths @() `
+            $plan.holder_timeout_ms 'final-zero-holders'
+        $finalSidecars = Wait-AstroCohortSidecarsAbsent $plan.store_paths[1..2] `
+            $plan.holder_timeout_ms 'final-sidecars-absent'
+        $storeChronology.Add($finalOwners)
+        $storeChronology.Add($finalSidecars)
+        Write-AstroFsvEventLine $StandardOutputPath ([ordered]@{
+            event = 'cohort_terminal_store_state'; owner_evidence = $finalOwners
+            sidecar_evidence = $finalSidecars
+        })
+
+        $artifactHashAfter = File-Sha256 $Artifact
+        $receiptHashAfter = File-Sha256 $ReceiptFull
+        $planHashAfter = File-Sha256 $plan.path
+        $launcherLockSnapshotAfter = Get-AstroExactRetainedFileSnapshot `
+            -Handle $LauncherLockHandle -ExpectedPath $LauncherLockPath
+        $launcherLockLinksAfter =
+            [AstroLauncherLockNative]::GetNumberOfLinks($LauncherLockHandle)
+        $launcherOwnerAfter = Read-AstroLauncherLock -LockPath $LauncherLockPath
+        $launcherJobProbeAfter = Get-AstroLauncherJobObjectProbe -Name $LauncherJobName
+        $launcherJobMembersAfter = [int[]]@($launcherJobProbeAfter.ProcessIds | Sort-Object -Unique)
+        $afterRepo = Get-RepoState $GitExe $Workspace
+        $treeStable = $BeforeRepo.head_sha -ceq $afterRepo.head_sha -and
+            $BeforeRepo.status_sha256 -ceq $afterRepo.status_sha256 -and
+            $BeforeRepo.diff_sha256 -ceq $afterRepo.diff_sha256
+        $artifactStable = $ArtifactHashBefore -ceq $artifactHashAfter -and
+            (Get-AstroFileLengthLongPath $Artifact) -eq [uint64]$Receipt.artifact.bytes
+        $receiptStable = $ReceiptHashBefore -ceq $receiptHashAfter
+        $planStable = $plan.sha256_before -ceq $planHashAfter
+        $launcherLeaseStable = $launcherLockLinksAfter -eq 1 -and
+            $LauncherLockSnapshotBefore.FileId -ceq $launcherLockSnapshotAfter.FileId -and
+            $LauncherLockSnapshotBefore.Length -eq $launcherLockSnapshotAfter.Length -and
+            $LauncherLockHashBefore -ceq [string]$launcherLockSnapshotAfter.Sha256 -and
+            [Convert]::ToBase64String($LauncherLockSnapshotBefore.Bytes) -ceq
+                [Convert]::ToBase64String($launcherLockSnapshotAfter.Bytes) -and
+            $launcherOwnerAfter.State -ceq 'held' -and
+            $launcherOwnerAfter.Issue -eq $IssueNumber -and
+            $launcherOwnerAfter.OwnerPid -eq $LauncherPid -and
+            $launcherOwnerAfter.OwnerProcessStartUtcTicks -eq
+                $LauncherOwner.OwnerProcessStartUtcTicks -and
+            $launcherJobProbeAfter.State -ceq 'observed' -and
+            $launcherJobMembersAfter -contains $LauncherPid -and
+            $launcherJobMembersAfter -contains $PID
+        if (-not $treeStable -or -not $artifactStable -or -not $receiptStable -or
+            -not $planStable -or -not $launcherLeaseStable) {
+            Fail-Astro 'ASTRO_FSV_COHORT_STABILITY_FAILED' `
+                "cohort immutable-state readback failed (tree=$treeStable; artifact=$artifactStable; receipt=$receiptStable; plan=$planStable; launcher=$launcherLeaseStable)" `
+                'preserve the session/store evidence and investigate the exact drifting authority'
+        }
+
+        $ArtifactExecutionHandle.Dispose()
+        foreach ($state in $processStates) {
+            $state.native.Dispose()
+            $state.handles_closed = $true
+        }
+        $ownedPids = [int[]]@(
+            @($launcherJobMembersAfter) + @($LauncherPid, $PID) +
+            @($processStates | ForEach-Object { [int]$_.identity.pid }) |
+                Sort-Object -Unique
+        )
+        $cleanup = Open-AstroCohortCleanupReadiness $Artifact $artifactHashAfter `
+            ([uint64]$Receipt.artifact.bytes) $ownedPids $LauncherJobName
+        $cleanupLease = $cleanup.Lease
+        $cleanupReadiness = $cleanup.Evidence
+
+        $expectedOwnerEntries = Read-AstroFsvCohortOwnerEntries `
+            @(& $ownerEntries) $plan.resident_count $processStates.Count `
+            'ASTRO_FSV_LOCK_IDENTITY_CHANGED' 'terminal local cohort process set'
+        $lockCleanup = Remove-TerminalFsvCohortLock $FsvLockPath $RunnerIdentity `
+            $expectedOwnerEntries $plan.resident_count $ArtifactHashBefore
+        $lockOwned = $false
+        $stdoutHash = File-Sha256 $StandardOutputPath
+        $stderrHash = File-Sha256 $StandardErrorPath
+        $record = [ordered]@{
+            schema = 'astrolabe.native-fsv-run.v3'
+            verdict = 'verified'
+            mode = 'resident-cohort'
+            issue = $IssueNumber
+            receipt_path = $ReceiptFull
+            launcher = $LauncherIdentity
+            runner = $RunnerIdentity
+            resident_count = $plan.resident_count
+            process_count = $processStates.Count
+            processes = @(& $processRecords)
+            artifact = [ordered]@{
+                path = $Artifact; bytes = Get-AstroFileLengthLongPath $Artifact
+                sha256 = $artifactHashAfter; stable = $artifactStable
+                delete_share_denied_for_run = $true
+            }
+            cleanup_readiness = $cleanupReadiness
+            receipt = [ordered]@{
+                path = $ReceiptFull; sha256_before = $ReceiptHashBefore
+                sha256_after = $receiptHashAfter; stable = $receiptStable
+            }
+            cohort_plan = [ordered]@{
+                path = $plan.path; sha256_before = $plan.sha256_before
+                sha256_after = $planHashAfter; stable = $planStable
+            }
+            live_state = [ordered]@{
+                path = $LiveStatePath; published = $true
+                bytes = $liveStateBytes; sha256 = $liveStateSha256
+            }
+            launcher_lease = [ordered]@{
+                path = $LauncherLockPath
+                file_id_before = $LauncherLockSnapshotBefore.FileId
+                file_id_after = $launcherLockSnapshotAfter.FileId
+                sha256_before = $LauncherLockHashBefore
+                sha256_after = [string]$launcherLockSnapshotAfter.Sha256
+                links_before = $LauncherLockLinksBefore
+                links_after = $launcherLockLinksAfter
+                owner = $LauncherIdentity
+                lease_start_utc_ticks = $LauncherOwner.LeaseStartUtcTicks
+                job = [ordered]@{
+                    name = $LauncherJobName
+                    members_before = @($LauncherJobMembersBefore)
+                    members_with_suspended_cohort = @($cohortJobMembers)
+                    members_after = @($launcherJobMembersAfter)
+                    stable = $true
+                }
+                stable = $launcherLeaseStable
+            }
+            protocol_evidence = [ordered]@{
+                responses = @($residentResponses)
+                store_chronology = @($storeChronology)
+            }
+            stdout = [ordered]@{
+                path = $StandardOutputPath
+                bytes = Get-AstroFileLengthLongPath $StandardOutputPath
+                sha256 = $stdoutHash
+            }
+            stderr = [ordered]@{
+                path = $StandardErrorPath
+                bytes = Get-AstroFileLengthLongPath $StandardErrorPath
+                sha256 = $stderrHash
+            }
+            repository = [ordered]@{
+                before = $BeforeRepo; after = $afterRepo; stable = $treeStable
+            }
+            fsv_lock_cleanup = $lockCleanup
+        }
+        Write-NewDurableUtf8 $RunRecordPath ($record | ConvertTo-Json -Depth 30)
+        $persistedRun = Read-AstroUtf8FileLongPath $RunRecordPath | ConvertFrom-Json
+        $persistedRunOwners = @($persistedRun.processes | ForEach-Object {
+            [ordered]@{ role = $_.role; ordinal = $_.ordinal; identity = $_.identity }
+        })
+        $persistedRunProcesses = Read-AstroFsvCohortOwnerEntries `
+            $persistedRunOwners $plan.resident_count $processStates.Count `
+            'ASTRO_FSV_RUN_READBACK_FAILED' 'cohort run-record process set'
+        $persistedRunRunner = Read-AstroFsvProcessIdentity $persistedRun.runner `
+            'ASTRO_FSV_RUN_READBACK_FAILED' 'cohort run-record runner identity'
+        if ([string]$persistedRun.schema -cne 'astrolabe.native-fsv-run.v3' -or
+            [string]$persistedRun.verdict -cne 'verified' -or
+            [int]$persistedRun.resident_count -ne $plan.resident_count -or
+            [int]$persistedRun.process_count -ne $processStates.Count -or
+            -not (Test-AstroFsvIdentityEqual $persistedRunRunner $RunnerIdentity) -or
+            -not (Test-AstroFsvCohortOwnerEntriesEqual $persistedRunProcesses $expectedOwnerEntries) -or
+            [string]$persistedRun.live_state.sha256 -cne $liveStateSha256 -or
+            [bool]$persistedRun.fsv_lock_cleanup.after_exists -ne $false) {
+            Fail-Astro 'ASTRO_FSV_RUN_READBACK_FAILED' `
+                'persisted v3 cohort run record differs from exact observed lifecycle state' `
+                'preserve the session and investigate the failed durable write'
+        }
+        $runRecordWritten = $true
+        $record | ConvertTo-Json -Depth 30 -Compress | Write-Output
+        return
+    }
+    catch {
+        $failure = $_
+        $allTerminationProved = $true
+        foreach ($state in $processStates) {
+            if (-not [bool]$state.handles_closed) {
+                try { $state.native.CloseInput() } catch {}
+                try {
+                    if (-not [bool]$state.termination_proved) {
+                        if (-not $state.native.HasExited) {
+                            $state.native.TerminateAndWait([uint32]0xA57F0003, [uint32]30000)
+                        }
+                        elseif (-not $state.native.WaitForExit([uint32]0)) {
+                            throw 'exact process handle was unexpectedly unsignaled'
+                        }
+                        $state.exited_at_utc = [DateTime]::UtcNow.ToString('o')
+                        $state.exit_code_observation = Observe-ExitedProcessCode $state.native
+                        $state.exit_code = [uint32]$state.exit_code_observation.exit_code
+                        $state.termination_proved = $true
+                    }
+                }
+                catch {
+                    $allTerminationProved = $false
+                    [Console]::Error.WriteLine("NATIVE_FSV[ASTRO_FSV_COHORT_TERMINATION_UNEVALUABLE]: role=$($state.role); ordinal=$($state.ordinal); identity=$($state.identity | ConvertTo-Json -Compress); error=$($_.Exception.Message)")
+                }
+            }
+            if (-not [bool]$state.termination_proved) { $allTerminationProved = $false }
+        }
+        $code = if ($failure.Exception.Data.Contains('AstroCode')) {
+            [string]$failure.Exception.Data['AstroCode']
+        } else { 'ASTRO_FSV_COHORT_INTERNAL' }
+        $remediation = if ($failure.Exception.Data.Contains('AstroRemediation')) {
+            [string]$failure.Exception.Data['AstroRemediation']
+        } else {
+            'preserve the cohort/session/store state and inspect the exact structured failure'
+        }
+        if ($allTerminationProved -and -not $runRecordWritten -and
+            -not (Test-AstroPathLongPath -LiteralPath $RunRecordPath)) {
+            try {
+                $failureOwnerEntries = Read-AstroFsvCohortOwnerEntries `
+                    @(& $ownerEntries) $plan.resident_count $processStates.Count `
+                    'ASTRO_FSV_LOCK_IDENTITY_CHANGED' 'failed local cohort process set'
+                if ($lockOwned) {
+                    try {
+                        $lockCleanup = Remove-TerminalFsvCohortLock `
+                            $FsvLockPath $RunnerIdentity $failureOwnerEntries `
+                            $plan.resident_count $ArtifactHashBefore
+                        $lockOwned = $false
+                    }
+                    catch {
+                        $lockCleanup = [ordered]@{
+                            path = $FsvLockPath
+                            before_exists = Test-AstroPathLongPath -LiteralPath $FsvLockPath
+                            removed = $false
+                            after_exists = Test-AstroPathLongPath -LiteralPath $FsvLockPath
+                            error = $_.Exception.Message
+                        }
+                    }
+                }
+                $failureArtifactHash = if (Test-AstroPathLongPath -LiteralPath $Artifact -PathType Leaf) {
+                    File-Sha256 $Artifact
+                } else { $null }
+                $failureRecord = [ordered]@{
+                    schema = 'astrolabe.native-fsv-run.v3'
+                    verdict = 'failed'
+                    mode = 'resident-cohort'
+                    issue = $IssueNumber
+                    receipt_path = $ReceiptFull
+                    launcher = $LauncherIdentity
+                    runner = $RunnerIdentity
+                    resident_count = $plan.resident_count
+                    process_count = $processStates.Count
+                    processes = @(& $processRecords)
+                    artifact = [ordered]@{
+                        path = $Artifact
+                        bytes = if (Test-AstroPathLongPath -LiteralPath $Artifact -PathType Leaf) {
+                            Get-AstroFileLengthLongPath $Artifact
+                        } else { 0 }
+                        sha256 = $failureArtifactHash
+                        stable = $failureArtifactHash -ceq $ArtifactHashBefore
+                    }
+                    cohort_plan = [ordered]@{
+                        path = $plan.path; sha256_before = $plan.sha256_before
+                        sha256_after = if (Test-AstroPathLongPath -LiteralPath $plan.path -PathType Leaf) {
+                            File-Sha256 $plan.path
+                        } else { $null }
+                    }
+                    live_state = [ordered]@{
+                        path = $LiveStatePath; published = $liveStatePublished
+                        bytes = if ($liveStatePublished) {
+                            Get-AstroFileLengthLongPath $LiveStatePath
+                        } else { 0 }
+                        sha256 = if ($liveStatePublished) { File-Sha256 $LiveStatePath } else { $null }
+                    }
+                    stdout = [ordered]@{
+                        path = $StandardOutputPath
+                        bytes = if (Test-AstroPathLongPath -LiteralPath $StandardOutputPath -PathType Leaf) {
+                            Get-AstroFileLengthLongPath $StandardOutputPath
+                        } else { 0 }
+                        sha256 = if (Test-AstroPathLongPath -LiteralPath $StandardOutputPath -PathType Leaf) {
+                            File-Sha256 $StandardOutputPath
+                        } else { $null }
+                    }
+                    stderr = [ordered]@{
+                        path = $StandardErrorPath
+                        bytes = if (Test-AstroPathLongPath -LiteralPath $StandardErrorPath -PathType Leaf) {
+                            Get-AstroFileLengthLongPath $StandardErrorPath
+                        } else { 0 }
+                        sha256 = if (Test-AstroPathLongPath -LiteralPath $StandardErrorPath -PathType Leaf) {
+                            File-Sha256 $StandardErrorPath
+                        } else { $null }
+                    }
+                    protocol_evidence = [ordered]@{
+                        responses = @($residentResponses)
+                        store_chronology = @($storeChronology)
+                    }
+                    fsv_lock_cleanup = $lockCleanup
+                    failure = [ordered]@{
+                        code = $code; message = $failure.Exception.Message
+                        remediation = $remediation
+                        exception_type = $failure.Exception.GetType().FullName
+                        script_stack_trace = Failure-Text $failure.ScriptStackTrace
+                        invocation = Failure-Text $failure.InvocationInfo.PositionMessage
+                    }
+                }
+                Write-NewDurableUtf8 $RunRecordPath ($failureRecord | ConvertTo-Json -Depth 30)
+                $persistedFailure = Read-AstroUtf8FileLongPath $RunRecordPath | ConvertFrom-Json
+                if ([string]$persistedFailure.schema -cne 'astrolabe.native-fsv-run.v3' -or
+                    [string]$persistedFailure.failure.code -cne $code -or
+                    [int]$persistedFailure.process_count -ne $processStates.Count) {
+                    throw 'persisted v3 cohort failure record differs from exact observed state'
+                }
+                $runRecordWritten = $true
+            }
+            catch {
+                [Console]::Error.WriteLine("NATIVE_FSV[ASTRO_FSV_COHORT_FAILURE_RECORD_WRITE_FAILED]: $($_.Exception.Message)")
+            }
+        }
+        [Console]::Error.WriteLine(([ordered]@{
+            code = $code; message = $failure.Exception.Message
+            remediation = $remediation; process_count = $processStates.Count
+            all_termination_proved = $allTerminationProved
+            lock_preserved = Test-AstroPathLongPath -LiteralPath $FsvLockPath
+            run_record_written = $runRecordWritten
+        } | ConvertTo-Json -Compress))
+        throw $failure
+    }
+    finally {
+        foreach ($state in $processStates) {
+            if (-not [bool]$state.handles_closed) {
+                try { $state.native.Dispose(); $state.handles_closed = $true } catch {}
+            }
+        }
+        if ($null -ne $cleanupLease) { $cleanupLease.Dispose() }
+    }
+}
+
 $workspace = [IO.Path]::GetFullPath((Split-Path -Parent $PSScriptRoot))
 $evidenceRoot = Join-Path $workspace '.tmp\native-fsv-artifacts'
 $launcherLockPath = Join-Path (Join-Path $workspace '.tmp') 'astrolabe-launcher.lock'
@@ -1741,16 +3457,18 @@ try {
         Fail-Astro 'ASTRO_FSV_ARTIFACT_DRIFT' 'staged artifact hash/length differs from its receipt before launch' 'discard the session, identify the writer, and rebuild'
     }
 
-    $argumentVector = ConvertFrom-FlatStringArrayJson $ArgumentsJson
-    $argumentCount = [int]$argumentVector.Count
-    $arguments = [string[]]@($argumentVector.Values)
-    if ($arguments.Length -ne $argumentCount) {
-        Fail-Astro 'ASTRO_FSV_ARGUMENTS_INVALID' 'ArgumentsJson cardinality changed during parsing' 'preserve the invocation and investigate the PowerShell JSON runtime'
-    }
-    $argumentLine = if ($argumentCount -gt 0) {
-        (@($arguments | ForEach-Object { ConvertTo-WindowsCommandLineArgument ([string]$_) }) -join ' ')
-    } else {
-        $null
+    if ($PSCmdlet.ParameterSetName -ceq 'Single') {
+        $argumentVector = ConvertFrom-FlatStringArrayJson $ArgumentsJson
+        $argumentCount = [int]$argumentVector.Count
+        $arguments = [string[]]@($argumentVector.Values)
+        if ($arguments.Length -ne $argumentCount) {
+            Fail-Astro 'ASTRO_FSV_ARGUMENTS_INVALID' 'ArgumentsJson cardinality changed during parsing' 'preserve the invocation and investigate the PowerShell JSON runtime'
+        }
+        $argumentLine = if ($argumentCount -gt 0) {
+            (@($arguments | ForEach-Object { ConvertTo-WindowsCommandLineArgument ([string]$_) }) -join ' ')
+        } else {
+            $null
+        }
     }
 
     # FileShare.Read intentionally omits write/delete sharing. Microsoft documents that a
@@ -1768,6 +3486,39 @@ try {
         [IO.FileAccess]::Read,
         [IO.FileShare]::Read
     )
+    if ($PSCmdlet.ParameterSetName -ceq 'ResidentCohort') {
+        Invoke-AstroResidentCohort `
+            -PlanPath $CohortPlanPath `
+            -Workspace $workspace `
+            -IssueNumber $Issue `
+            -SessionDirectory $sessionDirectory `
+            -ReceiptFull $receiptFull `
+            -Receipt $receipt `
+            -Artifact $artifact `
+            -ArtifactHashBefore $artifactHashBefore `
+            -ReceiptHashBefore $receiptHashBefore `
+            -ArtifactItem $artifactItem `
+            -LauncherIdentity $launcherIdentity `
+            -RunnerIdentity $runnerIdentity `
+            -LauncherPid $launcherPid `
+            -LauncherOwner $launcherOwner `
+            -LauncherLockPath $launcherLockPath `
+            -LauncherLockHandle $launcherLockHandle `
+            -LauncherLockSnapshotBefore $launcherLockSnapshotBefore `
+            -LauncherLockLinksBefore $launcherLockLinksBefore `
+            -LauncherLockHashBefore $launcherLockHashBefore `
+            -LauncherJobName $launcherJobName `
+            -LauncherJobMembersBefore $launcherJobMembersBefore `
+            -BeforeRepo $beforeRepo `
+            -GitExe $gitExe `
+            -ArtifactExecutionHandle $artifactHandle `
+            -FsvLockPath $fsvLockPath `
+            -StandardOutputPath $StandardOutputPath `
+            -StandardErrorPath $StandardErrorPath `
+            -RunRecordPath $RunRecordPath `
+            -LiveStatePath $LiveStatePath
+        return
+    }
     $lockStage = "$fsvLockPath.$PID.tmp"
     $lockManifest = [ordered]@{
         schema = 'astrolabe.native-fsv-lock.v2'

@@ -32,6 +32,7 @@ enum {
 #include "foundation/compat_fs.h"
 #include "foundation/compat.h"
 #include "foundation/log.h"
+#include "foundation/sha256.h"
 #include "foundation/str_util.h" /* cbm_validate_shell_arg — git shell-out hardening */
 
 #include "zstd_store.h"
@@ -41,6 +42,9 @@ enum {
 
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
+#include <stddef.h>
+#include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -108,6 +112,48 @@ static int artifact_export_fail(const char *stage, const char *path, const char 
     return CBM_NOT_FOUND;
 }
 
+static bool artifact_import_result_init(cbm_artifact_import_result_t *result,
+                                        const char *destination_db_path) {
+    memset(result, 0, sizeof(*result));
+    result->abi_version = CBM_ARTIFACT_IMPORT_ABI_VERSION;
+    result->struct_size = sizeof(*result);
+    result->status = CBM_ARTIFACT_IMPORT_FAILED_BEFORE_PUBLICATION;
+    result->destination_probe = CBM_PATH_PROBE_ERROR;
+    int wrote = snprintf(result->destination_db_path, sizeof(result->destination_db_path), "%s",
+                         destination_db_path ? destination_db_path : "");
+    if (wrote < 0 || (size_t)wrote >= sizeof(result->destination_db_path)) {
+        result->destination_db_path[0] = '\0';
+#ifdef _WIN32
+        result->destination_probe_native_error = ERROR_BUFFER_OVERFLOW;
+#else
+        result->destination_probe_native_error = ENAMETOOLONG;
+#endif
+        snprintf(result->operation, sizeof(result->operation), "%s", "import.destination_path");
+        snprintf(result->detail, sizeof(result->detail), "%s",
+                 "destination database path exceeds the result-bearing ABI capacity");
+        return false;
+    }
+    return true;
+}
+
+static cbm_artifact_import_status_t artifact_import_fail(
+    cbm_artifact_import_result_t *result, cbm_artifact_import_status_t status,
+    const char *operation, const char *detail) {
+    result->status = status;
+    snprintf(result->operation, sizeof(result->operation), "%s",
+             operation ? operation : "unknown");
+    snprintf(result->detail, sizeof(result->detail), "%s", detail ? detail : "unknown");
+    unsigned long probe_error = 0;
+    cbm_path_probe_result_t probe =
+        cbm_path_probe(result->destination_db_path, &probe_error);
+    result->destination_probe = probe;
+    result->destination_probe_native_error = (uint32_t)probe_error;
+    if (!g_export_error[0]) {
+        artifact_export_fail(operation, result->destination_db_path, detail, 0);
+    }
+    return result->status;
+}
+
 typedef struct {
     const char *err;
     int err_no;
@@ -161,6 +207,36 @@ static char *read_file_alloc(const char *path, size_t *out_len) {
     return buf;
 }
 
+#ifdef _WIN32
+static void artifact_close_handle_or_abort(HANDLE *handle, const char *stage, const char *path);
+
+static bool artifact_remove_file_exact(const char *path, artifact_file_error_t *out_err,
+                                       const char *failure) {
+    unsigned long before_error = 0;
+    cbm_path_probe_result_t before = cbm_path_probe(path, &before_error);
+    if (before == CBM_PATH_PROBE_ABSENT) {
+        return true;
+    }
+    if (before == CBM_PATH_PROBE_ERROR) {
+        file_error_set(out_err, failure, (int)before_error);
+        return false;
+    }
+    errno = 0;
+    if (cbm_unlink(path) != 0) {
+        file_error_set(out_err, failure, errno);
+        return false;
+    }
+    unsigned long after_error = 0;
+    cbm_path_probe_result_t after = cbm_path_probe(path, &after_error);
+    if (after != CBM_PATH_PROBE_ABSENT) {
+        file_error_set(out_err, failure,
+                       after == CBM_PATH_PROBE_ERROR ? (int)after_error : ERROR_FILE_EXISTS);
+        return false;
+    }
+    return true;
+}
+#endif
+
 /* Write buffer to file atomically (write to tmp, rename). Returns 0 on success. */
 static int write_file_atomic(const char *path, const char *data, size_t len,
                              artifact_file_error_t *out_err) {
@@ -173,6 +249,145 @@ static int write_file_atomic(const char *path, const char *data, size_t len,
         return CBM_NOT_FOUND;
     }
 
+#ifdef _WIN32
+    DWORD tmp_error = ERROR_SUCCESS;
+    DWORD destination_error = ERROR_SUCCESS;
+    wchar_t *wide_tmp = cbm_utf8_to_wide_path_checked(tmp, &tmp_error);
+    wchar_t *wide_destination = cbm_utf8_to_wide_path_checked(path, &destination_error);
+    if (!wide_tmp || !wide_destination) {
+        free(wide_tmp);
+        free(wide_destination);
+        file_error_set(out_err, "path_utf16_conversion_failed",
+                       (int)(tmp_error ? tmp_error : destination_error));
+        return CBM_NOT_FOUND;
+    }
+    HANDLE output = CreateFileW(wide_tmp, GENERIC_READ | GENERIC_WRITE | DELETE, 0, NULL,
+                                CREATE_NEW,
+                                FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_SEQUENTIAL_SCAN, NULL);
+    if (output == INVALID_HANDLE_VALUE) {
+        DWORD error = GetLastError();
+        free(wide_tmp);
+        free(wide_destination);
+        file_error_set(out_err, "create_exclusive_temp", (int)error);
+        return CBM_NOT_FOUND;
+    }
+
+    bool wrote_all = true;
+    DWORD write_error = ERROR_SUCCESS;
+    size_t offset = 0;
+    while (offset < len) {
+        size_t remaining = len - offset;
+        DWORD requested =
+            remaining > (size_t)(64 * 1024) ? (DWORD)(64 * 1024) : (DWORD)remaining;
+        DWORD written = 0;
+        if (!WriteFile(output, data + offset, requested, &written, NULL) || written == 0) {
+            write_error = GetLastError();
+            if (write_error == ERROR_SUCCESS) {
+                write_error = ERROR_WRITE_FAULT;
+            }
+            wrote_all = false;
+            break;
+        }
+        offset += written;
+    }
+    if (wrote_all && !FlushFileBuffers(output)) {
+        write_error = GetLastError();
+        wrote_all = false;
+    }
+
+    BY_HANDLE_FILE_INFORMATION before = {0};
+    if (wrote_all &&
+        (!GetFileInformationByHandle(output, &before) ||
+         (before.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) !=
+             0 ||
+         ((uint64_t)before.nFileSizeHigh << 32 | before.nFileSizeLow) != (uint64_t)len)) {
+        write_error = GetLastError();
+        if (write_error == ERROR_SUCCESS) {
+            write_error = ERROR_CRC;
+        }
+        wrote_all = false;
+    }
+    if (!wrote_all) {
+        artifact_close_handle_or_abort(&output, "atomic_write_temp_close", tmp);
+        free(wide_tmp);
+        free(wide_destination);
+        if (!artifact_remove_file_exact(tmp, out_err, "write_temp_cleanup_failed")) {
+            return CBM_NOT_FOUND;
+        }
+        file_error_set(out_err, "write_or_flush_temp", (int)write_error);
+        return CBM_NOT_FOUND;
+    }
+
+    size_t destination_chars = wcslen(wide_destination);
+    if (destination_chars >
+        (UINT32_MAX - offsetof(FILE_RENAME_INFO, FileName)) / sizeof(wchar_t)) {
+        artifact_close_handle_or_abort(&output, "atomic_write_temp_close", tmp);
+        free(wide_tmp);
+        free(wide_destination);
+        if (!artifact_remove_file_exact(tmp, out_err, "rename_record_cleanup_failed")) {
+            return CBM_NOT_FOUND;
+        }
+        file_error_set(out_err, "rename_record_too_large", ERROR_BUFFER_OVERFLOW);
+        return CBM_NOT_FOUND;
+    }
+    size_t rename_bytes =
+        offsetof(FILE_RENAME_INFO, FileName) + destination_chars * sizeof(wchar_t);
+    FILE_RENAME_INFO *rename_info = calloc(1, rename_bytes);
+    if (!rename_info) {
+        artifact_close_handle_or_abort(&output, "atomic_write_temp_close", tmp);
+        free(wide_tmp);
+        free(wide_destination);
+        if (!artifact_remove_file_exact(tmp, out_err, "rename_allocate_cleanup_failed")) {
+            return CBM_NOT_FOUND;
+        }
+        file_error_set(out_err, "rename_record_allocation_failed", ERROR_NOT_ENOUGH_MEMORY);
+        return CBM_NOT_FOUND;
+    }
+    rename_info->ReplaceIfExists = TRUE;
+    rename_info->RootDirectory = NULL;
+    rename_info->FileNameLength = (DWORD)(destination_chars * sizeof(wchar_t));
+    memcpy(rename_info->FileName, wide_destination, rename_info->FileNameLength);
+    free(wide_tmp);
+    free(wide_destination);
+
+    bool renamed = SetFileInformationByHandle(output, FileRenameInfo, rename_info,
+                                              (DWORD)rename_bytes) != 0;
+    DWORD rename_error = renamed ? ERROR_SUCCESS : GetLastError();
+    free(rename_info);
+    if (!renamed) {
+        artifact_close_handle_or_abort(&output, "atomic_write_temp_close", tmp);
+        if (!artifact_remove_file_exact(tmp, out_err, "rename_temp_cleanup_failed")) {
+            return CBM_NOT_FOUND;
+        }
+        file_error_set(out_err, "rename_temp", (int)rename_error);
+        return CBM_NOT_FOUND;
+    }
+
+    BY_HANDLE_FILE_INFORMATION after = {0};
+    unsigned long source_probe_error = 0;
+    unsigned long destination_probe_error = 0;
+    cbm_path_probe_result_t source_probe = cbm_path_probe(tmp, &source_probe_error);
+    cbm_path_probe_result_t destination_probe =
+        cbm_path_probe(path, &destination_probe_error);
+    bool identity_stable = GetFileInformationByHandle(output, &after) &&
+                           before.dwVolumeSerialNumber == after.dwVolumeSerialNumber &&
+                           before.nFileIndexHigh == after.nFileIndexHigh &&
+                           before.nFileIndexLow == after.nFileIndexLow &&
+                           before.nFileSizeHigh == after.nFileSizeHigh &&
+                           before.nFileSizeLow == after.nFileSizeLow;
+    artifact_close_handle_or_abort(&output, "atomic_write_destination_close", path);
+    if (!identity_stable || source_probe != CBM_PATH_PROBE_ABSENT ||
+        destination_probe != CBM_PATH_PROBE_PRESENT) {
+        DWORD error = source_probe == CBM_PATH_PROBE_ERROR
+                          ? (DWORD)source_probe_error
+                          : destination_probe == CBM_PATH_PROBE_ERROR
+                                ? (DWORD)destination_probe_error
+                                : ERROR_CRC;
+        file_error_set(out_err, "rename_readback_failed", (int)error);
+        return CBM_NOT_FOUND;
+    }
+    return 0;
+#else
     /* #415: cbm_fopen widens + adds "\\?\" so a temp artifact under a deep cache
      * dir is writable instead of failing at MAX_PATH. */
     FILE *fp = cbm_fopen(tmp, "wb");
@@ -197,32 +412,14 @@ static int write_file_atomic(const char *path, const char *data, size_t len,
         return CBM_NOT_FOUND;
     }
 
-#ifdef _WIN32
-    /* MoveFileEx replace approach suggested by @Ayush7Ranjan in #492.
-     * #415: widen both paths ("\\?\") via cbm_utf8_to_wide_path so the swap is not
-     * MAX_PATH-bound; the inline widen (vs cbm_rename_replace) preserves the exact
-     * GetLastError code in the fail-closed labeled error. */
-    wchar_t *wtmp = cbm_utf8_to_wide_path(tmp);
-    wchar_t *wpath = cbm_utf8_to_wide_path(path);
-    BOOL moved =
-        wtmp && wpath && MoveFileExW(wtmp, wpath, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
-    DWORD saved_error = moved ? 0 : GetLastError();
-    free(wtmp);
-    free(wpath);
-    if (!moved) {
-        cbm_unlink(tmp);
-        file_error_set(out_err, "rename_temp", (int)saved_error);
-        return CBM_NOT_FOUND;
-    }
-#else
     if (rename(tmp, path) != 0) {
         int saved_errno = errno;
         cbm_unlink(tmp);
         file_error_set(out_err, "rename_temp", saved_errno);
         return CBM_NOT_FOUND;
     }
-#endif
     return 0;
+#endif
 }
 
 #ifdef ASTRO_SPAWN
@@ -347,57 +544,101 @@ static void iso_timestamp(char *buf, size_t bufsz) {
 
 /* ── Metadata read/write ─────────────────────────────────────────── */
 
-/* Read schema_version from artifact.json. Returns -1 if missing/invalid. */
-static int read_metadata_version(const char *repo_path) {
-    char meta_path[CBM_SZ_4K];
-    artifact_path(meta_path, sizeof(meta_path), repo_path, CBM_ARTIFACT_META);
+static const char *CBM_ARTIFACT_FORMAT = "cbm.graph-artifact.v2";
 
-    size_t len = 0;
-    char *json = read_file_alloc(meta_path, &len);
-    if (!json) {
-        return CBM_NOT_FOUND;
+typedef struct {
+    int schema_version;
+    int nodes;
+    int edges;
+    size_t original_size;
+    size_t compressed_size;
+    char project[CBM_SZ_1K];
+    char compressed_sha256[CBM_SHA256_HEX_LEN + 1];
+    char database_sha256[CBM_SHA256_HEX_LEN + 1];
+} artifact_metadata_t;
+
+static bool artifact_sha256_is_exact(const char *value) {
+    if (!value || strlen(value) != CBM_SHA256_HEX_LEN) {
+        return false;
     }
-
-    yyjson_doc *doc = yyjson_read(json, len, 0);
-    free(json);
-    if (!doc) {
-        return CBM_NOT_FOUND;
+    for (size_t i = 0; i < CBM_SHA256_HEX_LEN; i++) {
+        if (!((value[i] >= '0' && value[i] <= '9') ||
+              (value[i] >= 'a' && value[i] <= 'f'))) {
+            return false;
+        }
     }
-
-    yyjson_val *root = yyjson_doc_get_root(doc);
-    yyjson_val *ver = yyjson_obj_get(root, "schema_version");
-    int version = ver ? yyjson_get_int(ver) : CBM_NOT_FOUND;
-    yyjson_doc_free(doc);
-    return version;
+    return true;
 }
 
-/* Read original_size from artifact.json. Returns 0 on error. */
-static size_t read_metadata_original_size(const char *repo_path) {
+static bool read_artifact_metadata(const char *repo_path, artifact_metadata_t *metadata) {
+    memset(metadata, 0, sizeof(*metadata));
     char meta_path[CBM_SZ_4K];
-    artifact_path(meta_path, sizeof(meta_path), repo_path, CBM_ARTIFACT_META);
+    if (!artifact_path(meta_path, sizeof(meta_path), repo_path, CBM_ARTIFACT_META)) {
+        return false;
+    }
 
     size_t len = 0;
     char *json = read_file_alloc(meta_path, &len);
     if (!json) {
-        return 0;
+        return false;
     }
 
     yyjson_doc *doc = yyjson_read(json, len, 0);
     free(json);
     if (!doc) {
-        return 0;
+        return false;
     }
 
     yyjson_val *root = yyjson_doc_get_root(doc);
-    yyjson_val *val = yyjson_obj_get(root, "original_size");
-    size_t result = val ? (size_t)yyjson_get_uint(val) : 0;
+    yyjson_val *format = yyjson_obj_get(root, "artifact_format");
+    yyjson_val *schema = yyjson_obj_get(root, "schema_version");
+    yyjson_val *project = yyjson_obj_get(root, "project");
+    yyjson_val *nodes = yyjson_obj_get(root, "nodes");
+    yyjson_val *edges = yyjson_obj_get(root, "edges");
+    yyjson_val *original_size = yyjson_obj_get(root, "original_size");
+    yyjson_val *compressed_size = yyjson_obj_get(root, "compressed_size");
+    yyjson_val *compressed_sha256 = yyjson_obj_get(root, "graph_db_zst_sha256");
+    yyjson_val *database_sha256 = yyjson_obj_get(root, "graph_db_sha256");
+    const char *format_text = format ? yyjson_get_str(format) : NULL;
+    const char *project_text = project ? yyjson_get_str(project) : NULL;
+    const char *compressed_hash = compressed_sha256 ? yyjson_get_str(compressed_sha256) : NULL;
+    const char *database_hash = database_sha256 ? yyjson_get_str(database_sha256) : NULL;
+    uint64_t original = original_size ? yyjson_get_uint(original_size) : 0;
+    uint64_t compressed = compressed_size ? yyjson_get_uint(compressed_size) : 0;
+    uint64_t node_count = nodes ? yyjson_get_uint(nodes) : UINT64_MAX;
+    uint64_t edge_count = edges ? yyjson_get_uint(edges) : UINT64_MAX;
+    uint64_t schema_version = schema ? yyjson_get_uint(schema) : UINT64_MAX;
+    bool valid = yyjson_is_obj(root) && yyjson_is_uint(schema) && yyjson_is_uint(nodes) &&
+                 yyjson_is_uint(edges) && yyjson_is_uint(original_size) &&
+                 yyjson_is_uint(compressed_size) && format_text &&
+                 strcmp(format_text, CBM_ARTIFACT_FORMAT) == 0 &&
+                 schema_version == (uint64_t)CBM_GRAPH_SCHEMA_VERSION && project_text &&
+                 cbm_validate_project_name(project_text) &&
+                 strlen(project_text) < sizeof(metadata->project) && node_count <= INT_MAX &&
+                 edge_count <= INT_MAX &&
+                 original > 0 && original <= SIZE_MAX && compressed > 0 &&
+                 compressed <= SIZE_MAX && artifact_sha256_is_exact(compressed_hash) &&
+                 artifact_sha256_is_exact(database_hash);
+    if (valid) {
+        metadata->schema_version = (int)schema_version;
+        metadata->nodes = (int)node_count;
+        metadata->edges = (int)edge_count;
+        metadata->original_size = (size_t)original;
+        metadata->compressed_size = (size_t)compressed;
+        snprintf(metadata->project, sizeof(metadata->project), "%s", project_text);
+        snprintf(metadata->compressed_sha256, sizeof(metadata->compressed_sha256), "%s",
+                 compressed_hash);
+        snprintf(metadata->database_sha256, sizeof(metadata->database_sha256), "%s",
+                 database_hash);
+    }
     yyjson_doc_free(doc);
-    return result;
+    return valid;
 }
 
 /* Write artifact.json metadata. */
 static int write_metadata(const char *repo_path, const char *project_name, int nodes, int edges,
-                          size_t original_size, size_t compressed_size, int compression_level) {
+                           size_t original_size, size_t compressed_size, int compression_level,
+                           const char *compressed_sha256, const char *database_sha256) {
     char commit[CBM_SZ_64] = "";
     git_head_hash(repo_path, commit, sizeof(commit));
 
@@ -405,18 +646,34 @@ static int write_metadata(const char *repo_path, const char *project_name, int n
     iso_timestamp(ts, sizeof(ts));
 
     yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    if (!doc) {
+        return artifact_export_fail("write_metadata", NULL, "json_document_allocation_failed",
+                                    0);
+    }
     yyjson_mut_val *root = yyjson_mut_obj(doc);
+    if (!root) {
+        yyjson_mut_doc_free(doc);
+        return artifact_export_fail("write_metadata", NULL, "json_root_allocation_failed", 0);
+    }
     yyjson_mut_doc_set_root(doc, root);
 
-    yyjson_mut_obj_add_int(doc, root, "schema_version", CBM_GRAPH_SCHEMA_VERSION);
-    yyjson_mut_obj_add_str(doc, root, "commit", commit);
-    yyjson_mut_obj_add_str(doc, root, "indexed_at", ts);
-    yyjson_mut_obj_add_str(doc, root, "project", project_name);
-    yyjson_mut_obj_add_int(doc, root, "nodes", nodes);
-    yyjson_mut_obj_add_int(doc, root, "edges", edges);
-    yyjson_mut_obj_add_uint(doc, root, "original_size", (uint64_t)original_size);
-    yyjson_mut_obj_add_uint(doc, root, "compressed_size", (uint64_t)compressed_size);
-    yyjson_mut_obj_add_int(doc, root, "compression_level", compression_level);
+    bool metadata_complete =
+        yyjson_mut_obj_add_str(doc, root, "artifact_format", CBM_ARTIFACT_FORMAT) &&
+        yyjson_mut_obj_add_int(doc, root, "schema_version", CBM_GRAPH_SCHEMA_VERSION) &&
+        yyjson_mut_obj_add_str(doc, root, "commit", commit) &&
+        yyjson_mut_obj_add_str(doc, root, "indexed_at", ts) &&
+        yyjson_mut_obj_add_str(doc, root, "project", project_name) &&
+        yyjson_mut_obj_add_int(doc, root, "nodes", nodes) &&
+        yyjson_mut_obj_add_int(doc, root, "edges", edges) &&
+        yyjson_mut_obj_add_uint(doc, root, "original_size", (uint64_t)original_size) &&
+        yyjson_mut_obj_add_uint(doc, root, "compressed_size", (uint64_t)compressed_size) &&
+        yyjson_mut_obj_add_int(doc, root, "compression_level", compression_level) &&
+        yyjson_mut_obj_add_str(doc, root, "graph_db_zst_sha256", compressed_sha256) &&
+        yyjson_mut_obj_add_str(doc, root, "graph_db_sha256", database_sha256);
+    if (!metadata_complete) {
+        yyjson_mut_doc_free(doc);
+        return artifact_export_fail("write_metadata", NULL, "json_field_allocation_failed", 0);
+    }
 
     size_t json_len = 0;
     char *json = yyjson_mut_write(doc, YYJSON_WRITE_PRETTY, &json_len);
@@ -515,58 +772,460 @@ static const char *DROP_INDEXES_SQL = "DROP INDEX IF EXISTS idx_nodes_label;"
 
 /* ── Export helpers ───────────────────────────────────────────────── */
 
-/* Prepare a stripped DB copy for best-quality export.
- * VACUUM INTO → drop indexes → VACUUM. Returns malloc'd buffer or NULL. */
-static char *prepare_stripped_db(const char *db_path, size_t *out_size) {
-    char tmp_path[CBM_SZ_4K];
-    snprintf(tmp_path, sizeof(tmp_path), "%s/cbm_artifact_tmp.db", cbm_tmpdir());
-    cbm_unlink(tmp_path);
+static bool artifact_close_snapshot_store(cbm_store_t **store, const char *path) {
+    cbm_store_close_result_t close_result;
+    cbm_store_close_status_t close_status = cbm_store_close(store, &close_result);
+    if (close_status == CBM_STORE_CLOSE_OK && close_result.connection_destroyed && !*store) {
+        return true;
+    }
+    artifact_export_fail("snapshot_close", path, "exact_physical_close_failed", 0);
+    if (!close_result.connection_destroyed || *store) {
+        /* No API above artifact export can retain this scratch-store owner.
+         * Terminate instead of returning while SQLite still owns it. */
+        fflush(NULL);
+        abort();
+    }
+    return false;
+}
 
-    /* VACUUM INTO: clean compacted copy. Use raw sqlite3 to bypass store authorizer
-     * (which blocks ATTACH, used internally by VACUUM INTO). */
-    sqlite3 *raw_db = NULL;
-    if (sqlite3_open_v2(db_path, &raw_db, SQLITE_OPEN_READWRITE, NULL) != SQLITE_OK) {
-        const char *err = raw_db ? sqlite3_errmsg(raw_db) : "sqlite_open";
-        artifact_export_fail("open_source_db", db_path, err, 0);
-        sqlite3_close(raw_db);
+static bool artifact_sidecars_absent_exact(const char *db_path, const char *stage) {
+    char wal_path[CBM_SZ_4K];
+    char shm_path[CBM_SZ_4K];
+    int wal_len = snprintf(wal_path, sizeof(wal_path), "%s-wal", db_path);
+    int shm_len = snprintf(shm_path, sizeof(shm_path), "%s-shm", db_path);
+    if (wal_len < 0 || (size_t)wal_len >= sizeof(wal_path) || shm_len < 0 ||
+        (size_t)shm_len >= sizeof(shm_path)) {
+        artifact_export_fail(stage, db_path, "family_path_too_long", 0);
+        return false;
+    }
+
+    unsigned long wal_error = 0;
+    unsigned long shm_error = 0;
+    cbm_path_probe_result_t wal_probe = cbm_path_probe(wal_path, &wal_error);
+    cbm_path_probe_result_t shm_probe = cbm_path_probe(shm_path, &shm_error);
+    if (wal_probe != CBM_PATH_PROBE_ABSENT || shm_probe != CBM_PATH_PROBE_ABSENT) {
+        unsigned long error = wal_probe == CBM_PATH_PROBE_ERROR ? wal_error : shm_error;
+        artifact_export_fail(stage, db_path,
+                             "wal_or_shm_present_or_exact_absence_unevaluable", (int)error);
+        return false;
+    }
+    return true;
+}
+
+static bool artifact_remove_closed_scratch(const char *db_path, const char *stage) {
+    if (!artifact_sidecars_absent_exact(db_path, stage)) {
+        return false;
+    }
+    errno = 0;
+    if (cbm_unlink(db_path) != 0) {
+        artifact_export_fail(stage, db_path, "closed_scratch_remove_failed", errno);
+        return false;
+    }
+    unsigned long probe_error = 0;
+    cbm_path_probe_result_t probe = cbm_path_probe(db_path, &probe_error);
+    if (probe != CBM_PATH_PROBE_ABSENT) {
+        artifact_export_fail(stage, db_path, "closed_scratch_absence_not_proven",
+                             probe == CBM_PATH_PROBE_ERROR ? (int)probe_error : 0);
+        return false;
+    }
+    return true;
+}
+
+static cbm_artifact_import_status_t artifact_import_fail_and_remove_private(
+    cbm_artifact_import_result_t *result, const char *source_path, const char *operation,
+    const char *detail) {
+    if (!artifact_remove_closed_scratch(source_path, "import_publish_private_cleanup")) {
+        return artifact_import_fail(
+            result, CBM_ARTIFACT_IMPORT_FAILED_BEFORE_PUBLICATION,
+            "import_publish_private_cleanup",
+            "publication did not start and the exact private database could not be removed");
+    }
+    return artifact_import_fail(result, CBM_ARTIFACT_IMPORT_FAILED_BEFORE_PUBLICATION, operation,
+                                detail);
+}
+
+#ifdef _WIN32
+static void artifact_close_handle_or_abort(HANDLE *handle, const char *stage, const char *path) {
+    if (!handle || *handle == INVALID_HANDLE_VALUE) {
+        return;
+    }
+    if (!CloseHandle(*handle)) {
+        DWORD error = GetLastError();
+        artifact_export_fail(stage, path, "exact_windows_handle_close_failed", (int)error);
+        fflush(NULL);
+        abort();
+    }
+    *handle = INVALID_HANDLE_VALUE;
+}
+#endif
+
+static cbm_artifact_import_status_t artifact_publish_import_noreplace(
+    const char *source_path, const char *destination_path,
+    cbm_artifact_import_result_t *result) {
+#ifdef _WIN32
+    DWORD source_error = ERROR_SUCCESS;
+    DWORD destination_error = ERROR_SUCCESS;
+    wchar_t *wide_source = cbm_utf8_to_wide_path_checked(source_path, &source_error);
+    wchar_t *wide_destination =
+        cbm_utf8_to_wide_path_checked(destination_path, &destination_error);
+    if (!wide_source || !wide_destination) {
+        free(wide_source);
+        free(wide_destination);
+        artifact_export_fail("import_publish_path", destination_path, "utf16_conversion_failed",
+                             (int)(source_error ? source_error : destination_error));
+        return artifact_import_fail_and_remove_private(
+            result, source_path, "import_publish_path", "utf16_conversion_failed");
+    }
+
+    HANDLE source = CreateFileW(
+        wide_source, GENERIC_READ | GENERIC_WRITE | DELETE, 0, NULL, OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN | FILE_FLAG_OPEN_REPARSE_POINT, NULL);
+    DWORD open_error = source == INVALID_HANDLE_VALUE ? GetLastError() : ERROR_SUCCESS;
+    free(wide_source);
+    if (source == INVALID_HANDLE_VALUE) {
+        free(wide_destination);
+        artifact_export_fail("import_publish_noreplace", destination_path,
+                             "exclusive_source_handle_open_failed", (int)open_error);
+        return artifact_import_fail_and_remove_private(
+            result, source_path, "import_publish_noreplace",
+            "exclusive_source_handle_open_failed");
+    }
+
+    BY_HANDLE_FILE_INFORMATION before = {0};
+    if (!GetFileInformationByHandle(source, &before) ||
+        (before.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) !=
+            0 ||
+        !FlushFileBuffers(source)) {
+        DWORD error = GetLastError();
+        free(wide_destination);
+        artifact_close_handle_or_abort(&source, "import_publish_source_close", source_path);
+        artifact_export_fail("import_publish_source_inspect", source_path,
+                             "ordinary_file_identity_or_flush_failed", (int)error);
+        return artifact_import_fail_and_remove_private(
+            result, source_path, "import_publish_source_inspect",
+            "ordinary_file_identity_or_flush_failed");
+    }
+
+    size_t destination_chars = wcslen(wide_destination);
+    if (destination_chars > (SIZE_MAX - offsetof(FILE_RENAME_INFO, FileName)) / sizeof(wchar_t) ||
+        destination_chars >
+            (UINT32_MAX - offsetof(FILE_RENAME_INFO, FileName)) / sizeof(wchar_t)) {
+        free(wide_destination);
+        artifact_close_handle_or_abort(&source, "import_publish_source_close", source_path);
+        artifact_export_fail("import_publish_path", destination_path,
+                             "destination_rename_record_too_large", ERROR_BUFFER_OVERFLOW);
+        return artifact_import_fail_and_remove_private(
+            result, source_path, "import_publish_path",
+            "destination_rename_record_too_large");
+    }
+    size_t rename_bytes =
+        offsetof(FILE_RENAME_INFO, FileName) + destination_chars * sizeof(wchar_t);
+    FILE_RENAME_INFO *rename_info = calloc(1, rename_bytes);
+    if (!rename_info) {
+        free(wide_destination);
+        artifact_close_handle_or_abort(&source, "import_publish_source_close", source_path);
+        artifact_export_fail("import_publish_allocate", destination_path,
+                             "rename_record_allocation_failed", ERROR_NOT_ENOUGH_MEMORY);
+        return artifact_import_fail_and_remove_private(
+            result, source_path, "import_publish_allocate", "rename_record_allocation_failed");
+    }
+    rename_info->ReplaceIfExists = FALSE;
+    rename_info->RootDirectory = NULL;
+    rename_info->FileNameLength = (DWORD)(destination_chars * sizeof(wchar_t));
+    memcpy(rename_info->FileName, wide_destination, rename_info->FileNameLength);
+    free(wide_destination);
+
+    bool renamed = SetFileInformationByHandle(source, FileRenameInfo, rename_info,
+                                              (DWORD)rename_bytes) != 0;
+    DWORD rename_error = renamed ? ERROR_SUCCESS : GetLastError();
+    free(rename_info);
+    if (!renamed) {
+        artifact_close_handle_or_abort(&source, "import_publish_source_close", source_path);
+        artifact_export_fail("import_publish_noreplace", destination_path,
+                             "handle_bound_atomic_noreplace_rename_failed", (int)rename_error);
+        return artifact_import_fail_and_remove_private(
+            result, source_path, "import_publish_noreplace",
+            "handle_bound_atomic_noreplace_rename_failed");
+    }
+    result->publication_started = 1;
+
+    BY_HANDLE_FILE_INFORMATION after = {0};
+    unsigned long source_probe_error = 0;
+    unsigned long destination_probe_error = 0;
+    cbm_path_probe_result_t source_probe = cbm_path_probe(source_path, &source_probe_error);
+    cbm_path_probe_result_t destination_probe =
+        cbm_path_probe(destination_path, &destination_probe_error);
+    bool identity_stable = GetFileInformationByHandle(source, &after) &&
+                           before.dwVolumeSerialNumber == after.dwVolumeSerialNumber &&
+                           before.nFileIndexHigh == after.nFileIndexHigh &&
+                           before.nFileIndexLow == after.nFileIndexLow &&
+                           before.nFileSizeHigh == after.nFileSizeHigh &&
+                           before.nFileSizeLow == after.nFileSizeLow;
+    bool readback_ok = identity_stable && source_probe == CBM_PATH_PROBE_ABSENT &&
+                       destination_probe == CBM_PATH_PROBE_PRESENT &&
+                       artifact_sidecars_absent_exact(destination_path,
+                                                      "import_publish_sidecars");
+    artifact_close_handle_or_abort(&source, "import_publish_destination_close",
+                                   destination_path);
+    if (!readback_ok) {
+        unsigned long error = source_probe == CBM_PATH_PROBE_ERROR
+                                  ? source_probe_error
+                                  : destination_probe == CBM_PATH_PROBE_ERROR
+                                        ? destination_probe_error
+                                        : ERROR_CRC;
+        artifact_export_fail("import_publish_readback", destination_path,
+                             "handle_identity_path_or_sidecar_contract_failed", (int)error);
+        return artifact_import_fail(result, CBM_ARTIFACT_IMPORT_FAILED_AFTER_PUBLICATION,
+                                    "import_publish_readback",
+                                    "handle_identity_path_or_sidecar_contract_failed");
+    }
+    result->publication_committed = 1;
+    result->destination_probe = CBM_PATH_PROBE_PRESENT;
+    result->destination_probe_native_error = 0;
+    return CBM_ARTIFACT_IMPORT_OK;
+#else
+    if (link(source_path, destination_path) != 0 || cbm_unlink(source_path) != 0) {
+        artifact_export_fail("import_publish_noreplace", destination_path,
+                             "atomic_noreplace_link_or_source_unlink_failed", errno);
+        return artifact_import_fail(result, CBM_ARTIFACT_IMPORT_FAILED_BEFORE_PUBLICATION,
+                                    "import_publish_noreplace",
+                                    "atomic_noreplace_link_or_source_unlink_failed");
+    }
+    result->publication_started = 1;
+
+    unsigned long source_probe_error = 0;
+    unsigned long destination_probe_error = 0;
+    cbm_path_probe_result_t source_probe = cbm_path_probe(source_path, &source_probe_error);
+    cbm_path_probe_result_t destination_probe =
+        cbm_path_probe(destination_path, &destination_probe_error);
+    if (source_probe != CBM_PATH_PROBE_ABSENT ||
+        destination_probe != CBM_PATH_PROBE_PRESENT ||
+        !artifact_sidecars_absent_exact(destination_path, "import_publish_sidecars")) {
+        unsigned long error = source_probe == CBM_PATH_PROBE_ERROR
+                                  ? source_probe_error
+                                  : destination_probe == CBM_PATH_PROBE_ERROR
+                                        ? destination_probe_error
+                                        : 0;
+        artifact_export_fail("import_publish_readback", destination_path,
+                             "source_absence_destination_presence_or_sidecar_contract_failed",
+                             (int)error);
+        return artifact_import_fail(
+            result, CBM_ARTIFACT_IMPORT_FAILED_AFTER_PUBLICATION, "import_publish_readback",
+            "source_absence_destination_presence_or_sidecar_contract_failed");
+    }
+    result->publication_committed = 1;
+    result->destination_probe = CBM_PATH_PROBE_PRESENT;
+    result->destination_probe_native_error = 0;
+    return CBM_ARTIFACT_IMPORT_OK;
+#endif
+}
+
+#ifdef _WIN32
+static char *copy_frozen_delete_source(const char *db_path, const char *snapshot_path,
+                                       size_t *out_size) {
+    if (!artifact_sidecars_absent_exact(db_path, "freeze_source_sidecars")) {
         return NULL;
     }
 
-    char vacuum_sql[CBM_SZ_4K];
-    snprintf(vacuum_sql, sizeof(vacuum_sql), "VACUUM INTO '%s';", tmp_path);
-    char *errmsg = NULL;
-    int vrc = sqlite3_exec(raw_db, vacuum_sql, NULL, NULL, &errmsg);
-    sqlite3_close(raw_db);
-
-    if (vrc != SQLITE_OK) {
-        artifact_export_fail("vacuum_into", tmp_path, errmsg ? errmsg : sqlite3_errstr(vrc), 0);
-        sqlite3_free(errmsg);
-        cbm_unlink(tmp_path);
+    unsigned long probe_error = 0;
+    wchar_t *wide = cbm_utf8_to_wide_path_checked(db_path, &probe_error);
+    if (!wide) {
+        artifact_export_fail("freeze_source_path", db_path, "utf16_conversion_failed",
+                             (int)probe_error);
+        return NULL;
+    }
+    /* A zero share mask is the durable publication barrier: an existing reader,
+     * writer, mapping, or deleter prevents this open, and no new family user can
+     * enter until the exact source bytes have been copied and checked. */
+    HANDLE source = CreateFileW(wide, GENERIC_READ, 0, NULL, OPEN_EXISTING,
+                                FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN |
+                                    FILE_FLAG_OPEN_REPARSE_POINT,
+                                NULL);
+    DWORD open_error = source == INVALID_HANDLE_VALUE ? GetLastError() : ERROR_SUCCESS;
+    free(wide);
+    if (source == INVALID_HANDLE_VALUE) {
+        artifact_export_fail("freeze_source_open", db_path, "exclusive_read_open_failed",
+                             (int)open_error);
         return NULL;
     }
 
-    /* Strip indexes from the copy for better compression. */
-    sqlite3 *tmp_db = NULL;
-    if (sqlite3_open_v2(tmp_path, &tmp_db, SQLITE_OPEN_READWRITE, NULL) == SQLITE_OK) {
-        sqlite3_exec(tmp_db, DROP_INDEXES_SQL, NULL, NULL, NULL);
-        sqlite3_exec(tmp_db, "VACUUM;", NULL, NULL, NULL);
-        sqlite3_close(tmp_db);
+    FILE_ATTRIBUTE_TAG_INFO tag = {0};
+    LARGE_INTEGER length = {0};
+    if (!GetFileInformationByHandleEx(source, FileAttributeTagInfo, &tag, sizeof(tag)) ||
+        (tag.FileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) != 0 ||
+        !GetFileSizeEx(source, &length) || length.QuadPart <= 0 ||
+        (uint64_t)length.QuadPart > (uint64_t)INT_MAX) {
+        DWORD error = GetLastError();
+        artifact_close_handle_or_abort(&source, "freeze_source_inspect_close", db_path);
+        artifact_export_fail("freeze_source_inspect", db_path,
+                             (uint64_t)length.QuadPart > (uint64_t)INT_MAX
+                                 ? "source_exceeds_current_2GiB_export_abi_issue_948"
+                                 : "source_is_not_one_bounded_ordinary_file",
+                             (int)error);
+        return NULL;
     }
 
-    char *data = read_file_alloc(tmp_path, out_size);
-    if (!data || *out_size == 0) {
-        artifact_export_fail("read_stripped_db", tmp_path, "empty_or_unreadable", errno);
+    size_t size = (size_t)length.QuadPart;
+    char *data = malloc(size);
+    if (!data) {
+        artifact_close_handle_or_abort(&source, "freeze_source_allocate_close", db_path);
+        artifact_export_fail("freeze_source_allocate", db_path, "source_buffer_allocation_failed",
+                             ERROR_NOT_ENOUGH_MEMORY);
+        return NULL;
     }
-    cbm_unlink(tmp_path);
+    size_t offset = 0;
+    DWORD read_error = ERROR_SUCCESS;
+    while (offset < size) {
+        DWORD request = (DWORD)((size - offset) > (size_t)(64 * 1024 * 1024)
+                                      ? (64 * 1024 * 1024)
+                                      : (size - offset));
+        DWORD got = 0;
+        if (!ReadFile(source, data + offset, request, &got, NULL) || got == 0) {
+            read_error = GetLastError();
+            if (read_error == ERROR_SUCCESS) {
+                read_error = ERROR_HANDLE_EOF;
+            }
+            break;
+        }
+        offset += got;
+    }
+    if (read_error == ERROR_SUCCESS &&
+        (size < 20 || (unsigned char)data[18] != 1 || (unsigned char)data[19] != 1)) {
+        read_error = ERROR_INVALID_DATA;
+    }
+    artifact_close_handle_or_abort(&source, "freeze_source_read_close", db_path);
+    if (read_error != ERROR_SUCCESS || offset != size) {
+        free(data);
+        artifact_export_fail("freeze_source_read", db_path,
+                             "source_read_header_or_sidecar_contract_failed", (int)read_error);
+        return NULL;
+    }
 
-    /* Clean up WAL/SHM from temp */
-    char wal[CBM_SZ_4K];
-    char shm[CBM_SZ_4K];
-    snprintf(wal, sizeof(wal), "%s-wal", tmp_path);
-    snprintf(shm, sizeof(shm), "%s-shm", tmp_path);
-    cbm_unlink(wal);
-    cbm_unlink(shm);
+    artifact_file_error_t ioerr;
+    if (write_file_atomic(snapshot_path, data, size, &ioerr) != 0) {
+        free(data);
+        artifact_export_fail("snapshot_publish", snapshot_path, ioerr.err, ioerr.err_no);
+        return NULL;
+    }
+    *out_size = size;
     return data;
+}
+#endif
+
+/* Copy one DELETE-mode authoritative DB while a deny-write/delete handle binds
+ * its bytes, then derive counts and optional index stripping only from that
+ * private copy. The live source is never opened through SQLite. */
+static char *prepare_export_snapshot(const char *db_path, const char *project_name, int quality,
+                                     size_t *out_size, int *out_nodes, int *out_edges) {
+#ifndef _WIN32
+    (void)db_path;
+    (void)project_name;
+    (void)quality;
+    (void)out_size;
+    (void)out_nodes;
+    (void)out_edges;
+    artifact_export_fail("snapshot_platform", NULL, "native_windows_required", 0);
+    return NULL;
+#else
+    static volatile LONG snapshot_sequence;
+    LONG sequence = InterlockedIncrement(&snapshot_sequence);
+    char snapshot_path[CBM_SZ_4K];
+    int path_len = snprintf(snapshot_path, sizeof(snapshot_path),
+                            "%s/cbm-artifact-export.pid-%lu.seq-%ld.db", cbm_tmpdir(),
+                            (unsigned long)GetCurrentProcessId(), (long)sequence);
+    if (path_len < 0 || (size_t)path_len >= sizeof(snapshot_path) ||
+        cbm_path_exists(snapshot_path)) {
+        artifact_export_fail("snapshot_path", snapshot_path,
+                             "unique_snapshot_path_unavailable", 0);
+        return NULL;
+    }
+
+    size_t source_size = 0;
+    char *source_data = copy_frozen_delete_source(db_path, snapshot_path, &source_size);
+    if (!source_data) {
+        return NULL;
+    }
+    free(source_data);
+
+    cbm_store_t *snapshot = NULL;
+    cbm_store_verify_result_t verification;
+    cbm_store_verify_status_t verify_status = cbm_store_open_path_project_writer_existing(
+        snapshot_path, project_name, &snapshot, &verification);
+    if (verify_status != CBM_STORE_VERIFY_OK || !snapshot) {
+        if (snapshot) {
+            (void)artifact_close_snapshot_store(&snapshot, snapshot_path);
+        }
+        artifact_export_fail("snapshot_verify", snapshot_path,
+                             verification.detail[0] ? verification.detail
+                                                    : "snapshot_writer_verification_failed",
+                             0);
+        if (!snapshot) {
+            (void)artifact_remove_closed_scratch(snapshot_path, "snapshot_verify_cleanup");
+        }
+        return NULL;
+    }
+
+    int nodes = cbm_store_count_nodes(snapshot, project_name);
+    int edges = cbm_store_count_edges(snapshot, project_name);
+    if (nodes < 0 || edges < 0) {
+        (void)artifact_close_snapshot_store(&snapshot, snapshot_path);
+        artifact_export_fail("snapshot_counts", snapshot_path,
+                             "physical_snapshot_count_query_failed", 0);
+        if (!snapshot) {
+            (void)artifact_remove_closed_scratch(snapshot_path, "snapshot_counts_cleanup");
+        }
+        return NULL;
+    }
+    if (quality == CBM_ARTIFACT_BEST &&
+        (cbm_store_exec(snapshot, DROP_INDEXES_SQL) != CBM_STORE_OK ||
+         cbm_store_exec(snapshot, "VACUUM;") != CBM_STORE_OK ||
+         cbm_store_exec(snapshot, "PRAGMA optimize;") != CBM_STORE_OK)) {
+        (void)artifact_close_snapshot_store(&snapshot, snapshot_path);
+        artifact_export_fail("snapshot_strip", snapshot_path,
+                             "drop_indexes_vacuum_or_optimize_failed", 0);
+        if (!snapshot) {
+            (void)artifact_remove_closed_scratch(snapshot_path, "snapshot_strip_cleanup");
+        }
+        return NULL;
+    }
+    cbm_store_normalize_result_t normalization;
+    bool normalized = cbm_store_normalize_journal_mode_delete(snapshot, &normalization) ==
+                      CBM_STORE_NORMALIZE_OK;
+    bool integrity_ok = normalized && cbm_store_check_integrity(snapshot);
+    bool close_ok = artifact_close_snapshot_store(&snapshot, snapshot_path);
+    if (!normalized || !integrity_ok || !close_ok) {
+        if (close_ok) {
+            artifact_export_fail("snapshot_finalize", snapshot_path,
+                                 !normalized ? "journal_normalization_failed"
+                                             : "post_normalization_integrity_failed",
+                                 0);
+        }
+        if (!snapshot) {
+            (void)artifact_remove_closed_scratch(snapshot_path, "snapshot_finalize_cleanup");
+        }
+        return NULL;
+    }
+
+    if (!artifact_sidecars_absent_exact(snapshot_path, "snapshot_sidecar_readback")) {
+        return NULL;
+    }
+
+    char *artifact_data = read_file_alloc(snapshot_path, out_size);
+    if (!artifact_data || *out_size == 0) {
+        free(artifact_data);
+        artifact_export_fail("snapshot_readback", snapshot_path, "empty_or_unreadable", errno);
+        (void)artifact_remove_closed_scratch(snapshot_path, "snapshot_readback_cleanup");
+        return NULL;
+    }
+    if (!artifact_remove_closed_scratch(snapshot_path, "snapshot_cleanup")) {
+        free(artifact_data);
+        return NULL;
+    }
+    *out_nodes = nodes;
+    *out_edges = edges;
+    (void)source_size;
+    return artifact_data;
+#endif
 }
 
 /* ── Export ───────────────────────────────────────────────────────── */
@@ -595,15 +1254,11 @@ int cbm_artifact_export(const char *db_path, const char *repo_path, const char *
     }
 
     size_t db_size = 0;
-    char *db_data = NULL;
-    int compression_level = ART_ZSTD_FAST;
-
-    if (quality == CBM_ARTIFACT_BEST) {
-        compression_level = ART_ZSTD_BEST;
-        db_data = prepare_stripped_db(db_path, &db_size);
-    } else {
-        db_data = read_file_alloc(db_path, &db_size);
-    }
+    int nodes = 0;
+    int edges = 0;
+    int compression_level = quality == CBM_ARTIFACT_BEST ? ART_ZSTD_BEST : ART_ZSTD_FAST;
+    char *db_data = prepare_export_snapshot(db_path, project_name, quality, &db_size, &nodes,
+                                            &edges);
 
     if (!db_data || db_size == 0) {
         free(db_data);
@@ -612,9 +1267,16 @@ int cbm_artifact_export(const char *db_path, const char *repo_path, const char *
         }
         return artifact_export_fail("read_db", db_path, "empty_or_unreadable", errno);
     }
+    char database_sha256[CBM_SHA256_HEX_LEN + 1];
+    cbm_sha256_hex(db_data, db_size, database_sha256);
 
     /* Compress with zstd */
     size_t bound = cbm_zstd_compress_bound((int)db_size);
+    if (bound == 0 || bound > (size_t)INT_MAX) {
+        free(db_data);
+        return artifact_export_fail("compress_bound", db_path,
+                                    "compressed_bound_exceeds_current_2GiB_abi_issue_948", 0);
+    }
     char *compressed = malloc(bound);
     if (!compressed) {
         free(db_data);
@@ -628,6 +1290,8 @@ int cbm_artifact_export(const char *db_path, const char *repo_path, const char *
         free(compressed);
         return artifact_export_fail("compress", NULL, "zstd_compress", 0);
     }
+    char compressed_sha256[CBM_SHA256_HEX_LEN + 1];
+    cbm_sha256_hex(compressed, (size_t)clen, compressed_sha256);
 
     /* Write compressed artifact */
     char zst_path[CBM_SZ_4K];
@@ -643,19 +1307,9 @@ int cbm_artifact_export(const char *db_path, const char *repo_path, const char *
         return artifact_export_fail("write_artifact", zst_path, ioerr.err, ioerr.err_no);
     }
 
-    /* Get node/edge counts for metadata */
-    int nodes = 0;
-    int edges = 0;
-    cbm_store_t *count_store = cbm_store_open_path(db_path);
-    if (count_store) {
-        nodes = cbm_store_count_nodes(count_store, project_name);
-        edges = cbm_store_count_edges(count_store, project_name);
-        cbm_store_close(count_store);
-    }
-
     /* Write metadata */
     if (write_metadata(repo_path, project_name, nodes, edges, db_size, (size_t)clen,
-                       compression_level) != 0) {
+                       compression_level, compressed_sha256, database_sha256) != 0) {
         cbm_unlink(zst_path);
         return CBM_NOT_FOUND;
     }
@@ -674,134 +1328,225 @@ int cbm_artifact_export(const char *db_path, const char *repo_path, const char *
 
 /* ── Import ──────────────────────────────────────────────────────── */
 
-int cbm_artifact_import(const char *repo_path, const char *cache_db_path) {
-    if (!repo_path || !cache_db_path) {
-        return CBM_NOT_FOUND;
+cbm_artifact_import_status_t cbm_artifact_import(
+    const char *repo_path, const char *cache_db_path, const char *expected_project,
+    cbm_artifact_import_result_t *result) {
+    clear_export_error();
+    if (!result) {
+        return CBM_ARTIFACT_IMPORT_INVALID_ARGUMENT;
+    }
+    if (!artifact_import_result_init(result, cache_db_path)) {
+        result->status = CBM_ARTIFACT_IMPORT_INVALID_ARGUMENT;
+        cbm_log_error("artifact.import", "code", "CBM_ARTIFACT_DESTINATION_PATH_TOO_LONG",
+                      "message", result->detail, "remediation",
+                      "shorten the configured cache root so the exact destination path fits the ABI");
+        return result->status;
+    }
+    if (!repo_path || !cache_db_path || !expected_project ||
+        !cbm_validate_project_name(expected_project)) {
+        return artifact_import_fail(result, CBM_ARTIFACT_IMPORT_INVALID_ARGUMENT,
+                                    "import.validate_args",
+                                    "repository, destination, and valid expected project are required");
     }
 
-    /* Check schema version compatibility */
-    int version = read_metadata_version(repo_path);
-    if (version != CBM_GRAPH_SCHEMA_VERSION) {
-        cbm_log_error("artifact.import", "code", "CBM_ARTIFACT_SCHEMA_MISMATCH",
-                      "artifact_ver", itoa_buf(version), "current_ver",
-                      itoa_buf(CBM_GRAPH_SCHEMA_VERSION), "message",
-                      "artifact canonical identity schema is not exactly compatible",
-                      "remediation", "re-index the source code and export a fresh artifact");
-        return CBM_NOT_FOUND;
+    artifact_metadata_t metadata;
+    if (!read_artifact_metadata(repo_path, &metadata) ||
+        strcmp(metadata.project, expected_project) != 0) {
+        cbm_log_error("artifact.import", "code", "CBM_ARTIFACT_METADATA_MISMATCH", "project",
+                      expected_project, "message",
+                      "artifact metadata is malformed, incompatible, or names a different project",
+                      "remediation", "export one exact artifact generation for this project");
+        return artifact_import_fail(result, CBM_ARTIFACT_IMPORT_FAILED_BEFORE_PUBLICATION,
+                                    "import.read_metadata",
+                                    "metadata contract or expected project mismatch");
     }
 
-    /* Get original_size for decompression buffer */
-    size_t original_size = read_metadata_original_size(repo_path);
-    if (original_size == 0) {
-        cbm_log_error("artifact.import", "err", "missing_original_size");
-        return CBM_NOT_FOUND;
-    }
-
-    /* Read compressed artifact */
     char zst_path[CBM_SZ_4K];
-    artifact_path(zst_path, sizeof(zst_path), repo_path, CBM_ARTIFACT_FILENAME);
-
-    size_t clen = 0;
-    char *compressed = read_file_alloc(zst_path, &clen);
-    if (!compressed) {
-        cbm_log_error("artifact.import", "err", "read_artifact");
-        return CBM_NOT_FOUND;
+    if (!artifact_path(zst_path, sizeof(zst_path), repo_path, CBM_ARTIFACT_FILENAME)) {
+        return artifact_import_fail(result, CBM_ARTIFACT_IMPORT_FAILED_BEFORE_PUBLICATION,
+                                    "import.artifact_path", "artifact path is too long");
     }
-
-    /* Decompress */
-    /* Size the destination from the zstd frame's own content-size header, not
-     * from the separately-stored (attacker-controllable) original_size field.
-     * The allocation and the decoder capacity are then the SAME size_t value,
-     * so a crafted size can never make the capacity exceed the real buffer
-     * (the int-truncation that used to do exactly that is gone with the size_t
-     * signature). Require the metadata field to agree, and cap the total. */
-    size_t frame_size = cbm_zstd_frame_content_size(compressed, clen);
-    if (frame_size == 0 || frame_size > ART_MAX_DECOMPRESSED_BYTES || frame_size != original_size) {
+    size_t compressed_size = 0;
+    char *compressed = read_file_alloc(zst_path, &compressed_size);
+    if (!compressed || compressed_size != metadata.compressed_size) {
         free(compressed);
-        cbm_log_error("artifact.import", "err", "bad_decompressed_size");
-        return CBM_NOT_FOUND;
+        return artifact_import_fail(result, CBM_ARTIFACT_IMPORT_FAILED_BEFORE_PUBLICATION,
+                                    "import.read_artifact",
+                                    "compressed artifact size does not match metadata");
+    }
+    char compressed_sha256[CBM_SHA256_HEX_LEN + 1];
+    cbm_sha256_hex(compressed, compressed_size, compressed_sha256);
+    if (strcmp(compressed_sha256, metadata.compressed_sha256) != 0) {
+        free(compressed);
+        return artifact_import_fail(result, CBM_ARTIFACT_IMPORT_FAILED_BEFORE_PUBLICATION,
+                                    "import.verify_compressed_hash",
+                                    "compressed artifact SHA-256 does not match metadata");
     }
 
+    size_t frame_size = cbm_zstd_frame_content_size(compressed, compressed_size);
+    if (frame_size == 0 || frame_size > ART_MAX_DECOMPRESSED_BYTES ||
+        frame_size != metadata.original_size) {
+        free(compressed);
+        return artifact_import_fail(result, CBM_ARTIFACT_IMPORT_FAILED_BEFORE_PUBLICATION,
+                                    "import.verify_frame_size",
+                                    "zstd frame size does not match bounded metadata");
+    }
     char *decompressed = malloc(frame_size);
     if (!decompressed) {
         free(compressed);
-        return CBM_NOT_FOUND;
+        return artifact_import_fail(result, CBM_ARTIFACT_IMPORT_FAILED_BEFORE_PUBLICATION,
+                                    "import.allocate_database",
+                                    "decompressed database allocation failed");
     }
-
-    int64_t dlen = cbm_zstd_decompress(compressed, clen, decompressed, frame_size);
+    int64_t decompressed_size =
+        cbm_zstd_decompress(compressed, compressed_size, decompressed, frame_size);
     free(compressed);
-
-    if (dlen <= 0 || (size_t)dlen != frame_size) {
+    if (decompressed_size <= 0 || (size_t)decompressed_size != frame_size) {
         free(decompressed);
-        cbm_log_error("artifact.import", "err", "zstd_decompress");
-        return CBM_NOT_FOUND;
+        return artifact_import_fail(result, CBM_ARTIFACT_IMPORT_FAILED_BEFORE_PUBLICATION,
+                                    "import.decompress",
+                                    "zstd decompression did not produce the exact declared bytes");
+    }
+    char database_sha256[CBM_SHA256_HEX_LEN + 1];
+    cbm_sha256_hex(decompressed, frame_size, database_sha256);
+    if (strcmp(database_sha256, metadata.database_sha256) != 0) {
+        free(decompressed);
+        return artifact_import_fail(result, CBM_ARTIFACT_IMPORT_FAILED_BEFORE_PUBLICATION,
+                                    "import.verify_database_hash",
+                                    "decompressed database SHA-256 does not match metadata");
     }
 
-    /* Write to temp file, then rename for atomicity */
-    char tmp_path[CBM_SZ_4K];
-    snprintf(tmp_path, sizeof(tmp_path), "%s.import_tmp", cache_db_path);
+    unsigned long destination_error = 0;
+    cbm_path_probe_result_t destination_probe =
+        cbm_path_probe(cache_db_path, &destination_error);
+    result->destination_probe = destination_probe;
+    result->destination_probe_native_error = (uint32_t)destination_error;
+    if (destination_probe != CBM_PATH_PROBE_ABSENT ||
+        !artifact_sidecars_absent_exact(cache_db_path, "import_destination_sidecars")) {
+        free(decompressed);
+        return artifact_import_fail(result, CBM_ARTIFACT_IMPORT_FAILED_BEFORE_PUBLICATION,
+                                    "import.destination_preflight",
+                                    "destination database family is not exactly absent");
+    }
 
-    /* Ensure cache directory exists */
-    char cache_dir[CBM_SZ_1K];
-    snprintf(cache_dir, sizeof(cache_dir), "%s", cache_db_path);
-    char *last_slash = strrchr(cache_dir, '/');
-    if (last_slash) {
-        *last_slash = '\0';
-        cbm_mkdir_p(cache_dir, ART_DIR_PERMS);
+    static _Atomic unsigned long import_sequence;
+    unsigned long sequence =
+        atomic_fetch_add_explicit(&import_sequence, 1UL, memory_order_relaxed) + 1UL;
+    char tmp_path[CBM_SZ_4K];
+    int tmp_len = snprintf(tmp_path, sizeof(tmp_path), "%s.import.pid-%lu.seq-%lu.tmp",
+                           cache_db_path, (unsigned long)getpid(), sequence);
+    if (sequence == 0 || tmp_len < 0 || (size_t)tmp_len >= sizeof(tmp_path)) {
+        free(decompressed);
+        return artifact_import_fail(result, CBM_ARTIFACT_IMPORT_FAILED_BEFORE_PUBLICATION,
+                                    "import.private_path",
+                                    "unique private database path is unavailable");
+    }
+    unsigned long tmp_error = 0;
+    if (cbm_path_probe(tmp_path, &tmp_error) != CBM_PATH_PROBE_ABSENT ||
+        !artifact_sidecars_absent_exact(tmp_path, "import_temp_sidecars")) {
+        free(decompressed);
+        return artifact_import_fail(result, CBM_ARTIFACT_IMPORT_FAILED_BEFORE_PUBLICATION,
+                                    "import.private_preflight",
+                                    "unique private database family is not exactly absent");
+    }
+
+    char cache_dir[CBM_SZ_4K];
+    int cache_len = snprintf(cache_dir, sizeof(cache_dir), "%s", cache_db_path);
+    char *last_slash = cache_len > 0 && (size_t)cache_len < sizeof(cache_dir)
+                           ? strrchr(cache_dir, '/')
+                           : NULL;
+    if (!last_slash) {
+        free(decompressed);
+        return artifact_import_fail(result, CBM_ARTIFACT_IMPORT_FAILED_BEFORE_PUBLICATION,
+                                    "import.cache_directory",
+                                    "destination cache directory cannot be represented");
+    }
+    *last_slash = '\0';
+    if (!cbm_mkdir_p(cache_dir, ART_DIR_PERMS) || !cbm_is_dir(cache_dir)) {
+        free(decompressed);
+        return artifact_import_fail(result, CBM_ARTIFACT_IMPORT_FAILED_BEFORE_PUBLICATION,
+                                    "import.cache_directory",
+                                    "destination cache directory could not be created and read back");
     }
 
     artifact_file_error_t ioerr;
-    int wrc = write_file_atomic(tmp_path, decompressed, (size_t)dlen, &ioerr);
+    int write_status =
+        write_file_atomic(tmp_path, decompressed, (size_t)decompressed_size, &ioerr);
     free(decompressed);
-
-    if (wrc != 0) {
-        if (ioerr.err_no != 0) {
-            cbm_log_error("artifact.import", "err", "write_temp_db", "detail", ioerr.err, "errno",
-                          itoa_buf(ioerr.err_no), "path", tmp_path);
-        } else {
-            cbm_log_error("artifact.import", "err", "write_temp_db", "detail", ioerr.err, "path",
-                          tmp_path);
-        }
-        return CBM_NOT_FOUND;
+    if (write_status != 0) {
+        artifact_export_fail("import.write_private", tmp_path, ioerr.err, ioerr.err_no);
+        return artifact_import_fail(result, CBM_ARTIFACT_IMPORT_FAILED_BEFORE_PUBLICATION,
+                                    "import.write_private",
+                                    "private database could not be durably written");
     }
 
-    /* Open with cbm_store_open_path to auto-create missing indexes + FTS5 */
     cbm_store_t *store = cbm_store_open_path(tmp_path);
     if (!store) {
-        cbm_log_error("artifact.import", "err", "open_imported_db");
-        cbm_unlink(tmp_path);
-        return CBM_NOT_FOUND;
+        if (!artifact_remove_closed_scratch(tmp_path, "import_open_cleanup")) {
+            return artifact_import_fail(result, CBM_ARTIFACT_IMPORT_FAILED_BEFORE_PUBLICATION,
+                                        "import.open_cleanup",
+                                        "private database open and exact cleanup both failed");
+        }
+        return artifact_import_fail(result, CBM_ARTIFACT_IMPORT_FAILED_BEFORE_PUBLICATION,
+                                    "import.open_private", "private database could not be opened");
     }
 
-    /* Integrity check — refuse corrupted artifacts */
-    if (!cbm_store_check_integrity(store)) {
-        cbm_log_error("artifact.import", "err", "integrity_check_failed");
-        cbm_store_close(store);
-        cbm_unlink(tmp_path);
-        return CBM_NOT_FOUND;
+    cbm_project_t *projects = NULL;
+    int project_count = 0;
+    int project_status = cbm_store_list_projects(store, &projects, &project_count);
+    int node_count = cbm_store_count_nodes(store, expected_project);
+    int edge_count = cbm_store_count_edges(store, expected_project);
+    bool content_matches = project_status == CBM_STORE_OK && project_count == 1 && projects &&
+                           projects[0].name && strcmp(projects[0].name, expected_project) == 0 &&
+                           node_count == metadata.nodes && edge_count == metadata.edges;
+    cbm_store_free_projects(projects, project_count);
+    if (!cbm_store_check_integrity(store) || !content_matches) {
+        cbm_store_close_required(&store, "artifact.verify.content_failed");
+        if (!artifact_remove_closed_scratch(tmp_path, "import_content_cleanup")) {
+            return artifact_import_fail(result, CBM_ARTIFACT_IMPORT_FAILED_BEFORE_PUBLICATION,
+                                        "import.content_cleanup",
+                                        "artifact content mismatch and private cleanup failed");
+        }
+        return artifact_import_fail(result, CBM_ARTIFACT_IMPORT_FAILED_BEFORE_PUBLICATION,
+                                    "import.verify_content",
+                                    "database project or node/edge counts do not match metadata");
     }
 
-    cbm_store_close(store);
-
-    /* Atomic rename to final path (#415: long-path-safe replace swap). */
-    if (cbm_rename_replace(tmp_path, cache_db_path) != 0) {
-        cbm_log_error("artifact.import", "err", "rename_to_cache");
-        cbm_unlink(tmp_path);
-        return CBM_NOT_FOUND;
+    cbm_store_normalize_result_t normalization;
+    if (cbm_store_exec(store, "PRAGMA optimize;") != CBM_STORE_OK ||
+        cbm_store_normalize_journal_mode_delete(store, &normalization) !=
+            CBM_STORE_NORMALIZE_OK) {
+        cbm_store_close_required(&store, "artifact.verify.normalization_failed");
+        if (!artifact_remove_closed_scratch(tmp_path, "import_normalization_cleanup")) {
+            return artifact_import_fail(result, CBM_ARTIFACT_IMPORT_FAILED_BEFORE_PUBLICATION,
+                                        "import.normalization_cleanup",
+                                        "normalization and private cleanup both failed");
+        }
+        return artifact_import_fail(result, CBM_ARTIFACT_IMPORT_FAILED_BEFORE_PUBLICATION,
+                                    "import.normalize_private",
+                                    "private database could not be normalized to exact DELETE");
+    }
+    cbm_store_close_required(&store, "artifact.verify.complete");
+    if (!artifact_sidecars_absent_exact(tmp_path, "import_normalized_sidecar_readback")) {
+        return artifact_import_fail(result, CBM_ARTIFACT_IMPORT_FAILED_BEFORE_PUBLICATION,
+                                    "import.normalized_sidecar_readback",
+                                    "normalized private database sidecar absence is not proven");
     }
 
-    /* Clean up any stale WAL/SHM from the temp open */
-    char wal[CBM_SZ_4K];
-    char shm[CBM_SZ_4K];
-    snprintf(wal, sizeof(wal), "%s-wal", tmp_path);
-    snprintf(shm, sizeof(shm), "%s-shm", tmp_path);
-    cbm_unlink(wal);
-    cbm_unlink(shm);
+    cbm_artifact_import_status_t publication =
+        artifact_publish_import_noreplace(tmp_path, cache_db_path, result);
+    if (publication != CBM_ARTIFACT_IMPORT_OK) {
+        return publication;
+    }
 
-    cbm_log_info("artifact.import", "db", cache_db_path, "size_mb",
-                 itoa_buf((int)((size_t)dlen / ART_BYTES_PER_MB)));
-
-    return 0;
+    result->status = CBM_ARTIFACT_IMPORT_OK;
+    snprintf(result->operation, sizeof(result->operation), "%s", "import.publish_complete");
+    snprintf(result->detail, sizeof(result->detail), "%s",
+             "exact project, hashes, counts, DELETE family, and no-replace publication verified");
+    cbm_log_info("artifact.import", "db", cache_db_path, "project", expected_project, "nodes",
+                 itoa_buf(metadata.nodes), "edges", itoa_buf(metadata.edges), "size_mb",
+                 itoa_buf((int)((size_t)decompressed_size / ART_BYTES_PER_MB)));
+    return result->status;
 }
 
 /* ── Existence check ─────────────────────────────────────────────── */
@@ -811,17 +1556,27 @@ bool cbm_artifact_exists(const char *repo_path) {
         return false;
     }
 
-    char zst_path[CBM_SZ_4K];
-    artifact_path(zst_path, sizeof(zst_path), repo_path, CBM_ARTIFACT_FILENAME);
-
-    struct stat st;
-    if (stat(zst_path, &st) != 0 || st.st_size == 0) {
+    artifact_metadata_t metadata;
+    if (!read_artifact_metadata(repo_path, &metadata)) {
         return false;
     }
-
-    /* Check schema version is compatible */
-    int version = read_metadata_version(repo_path);
-    return version == CBM_GRAPH_SCHEMA_VERSION;
+    char zst_path[CBM_SZ_4K];
+    if (!artifact_path(zst_path, sizeof(zst_path), repo_path, CBM_ARTIFACT_FILENAME)) {
+        return false;
+    }
+    size_t compressed_size = 0;
+    char *compressed = read_file_alloc(zst_path, &compressed_size);
+    if (!compressed || compressed_size != metadata.compressed_size) {
+        free(compressed);
+        return false;
+    }
+    char compressed_sha256[CBM_SHA256_HEX_LEN + 1];
+    cbm_sha256_hex(compressed, compressed_size, compressed_sha256);
+    bool exact = strcmp(compressed_sha256, metadata.compressed_sha256) == 0 &&
+                 cbm_zstd_frame_content_size(compressed, compressed_size) ==
+                     metadata.original_size;
+    free(compressed);
+    return exact;
 }
 
 /* ── Commit hash extraction ──────────────────────────────────────── */
@@ -831,6 +1586,10 @@ char *cbm_artifact_commit(const char *repo_path) {
         return NULL;
     }
 
+    artifact_metadata_t metadata;
+    if (!read_artifact_metadata(repo_path, &metadata)) {
+        return NULL;
+    }
     char meta_path[CBM_SZ_4K];
     artifact_path(meta_path, sizeof(meta_path), repo_path, CBM_ARTIFACT_META);
 

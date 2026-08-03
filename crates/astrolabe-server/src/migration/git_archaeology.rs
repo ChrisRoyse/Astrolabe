@@ -79,7 +79,6 @@ const _: () = {
 /// Windows current-directory budget.
 const ARCHAEOLOGY_ROOT_ENV: &str = "ASTRO_ARCHAEOLOGY_ROOT";
 const ARCHAEOLOGY_SCOPE_SCHEMA: &str = "astrolabe.archaeology-scratch-scope.v1";
-/// Strict per-process override for the registry-declared ordered anchor batch.
 
 /// Directory-name prefix for the transient git-archaeology scratch WORKTREE,
 /// rooted under the repo+project-bound compact namespace returned by
@@ -2110,6 +2109,18 @@ fn archaeology_extract_fault_detail(
     )
 }
 
+struct HistoricalExtractionRequest<'a> {
+    scoped_root: &'a str,
+    database: &'a str,
+    identity_root: &'a str,
+    project: &'a str,
+    commit: &'a str,
+    seq: u64,
+    mode: CbmIndexMode,
+    response_tmp: &'a Path,
+    response_path: &'a Path,
+}
+
 /// Runs one historical checkout's CBM extraction in THIS process and returns the
 /// pipeline rows (#530). Shared body of the pooled serve worker. A C-level pipeline fault
 /// (abort / access violation / heap-corruption class) terminates the process here — that
@@ -2120,16 +2131,19 @@ fn archaeology_extract_fault_detail(
 /// before returning so the parent can remove the scratch db, mirroring the pre-#515
 /// in-process ordering.
 fn extract_rows_once(
-    scoped_root: &str,
-    database: &str,
-    identity_root: &str,
-    project: &str,
-    commit: &str,
-    seq: u64,
-    mode: CbmIndexMode,
-    response_tmp: &Path,
-    response_path: &Path,
+    request: HistoricalExtractionRequest<'_>,
 ) -> Result<CbmPipelineRows, DynError> {
+    let HistoricalExtractionRequest {
+        scoped_root,
+        database,
+        identity_root,
+        project,
+        commit,
+        seq,
+        mode,
+        response_tmp,
+        response_path,
+    } = request;
     log_archaeology_serve_trace(
         "worker_extract_begin",
         json!({
@@ -2297,7 +2311,7 @@ fn build_serve_response(
             "response_tmp": path_state_json(response_tmp, false),
         }),
     );
-    match extract_rows_once(
+    match extract_rows_once(HistoricalExtractionRequest {
         scoped_root,
         database,
         identity_root,
@@ -2307,7 +2321,7 @@ fn build_serve_response(
         mode,
         response_tmp,
         response_path,
-    ) {
+    }) {
         Ok(rows) => {
             log_archaeology_serve_trace(
                 "worker_extract_success",
@@ -3011,17 +3025,17 @@ fn index_historical_commit(
         // intentionally does NOT clean the checkout/database on the crash path; normal
         // success cleanup remains unchanged.
         Ok(HistoricalExtract::Crashed(detail)) => {
-            let preservation = preserve_historical_crash_artifacts(
-                &worktree,
-                &database,
-                &pool.log_path,
-                &pool.pool_dir,
+            let preservation = preserve_historical_crash_artifacts(HistoricalCrashPreservation {
+                worktree: &worktree,
+                database: &database,
+                worker_log: &pool.log_path,
+                pool_dir: &pool.pool_dir,
                 project,
                 commit,
-                &checkout_root,
-                &materialized,
+                checkout_root: &checkout_root,
+                materialized: &materialized,
                 source_files_materialized,
-            );
+            });
             let detail = format!("{detail} preserved_input=<<{preservation}>>");
             Ok(HistoricalCommitIndex {
                 rows: CbmPipelineRows {
@@ -3048,17 +3062,30 @@ fn index_historical_commit(
     }
 }
 
-fn preserve_historical_crash_artifacts(
-    worktree: &Path,
-    database: &Path,
-    worker_log: &Path,
-    pool_dir: &Path,
-    project: &str,
-    commit: &str,
-    checkout_root: &Path,
-    materialized: &HistoricalMaterialization,
+struct HistoricalCrashPreservation<'a> {
+    worktree: &'a Path,
+    database: &'a Path,
+    worker_log: &'a Path,
+    pool_dir: &'a Path,
+    project: &'a str,
+    commit: &'a str,
+    checkout_root: &'a Path,
+    materialized: &'a HistoricalMaterialization,
     source_files_materialized: usize,
-) -> String {
+}
+
+fn preserve_historical_crash_artifacts(context: HistoricalCrashPreservation<'_>) -> String {
+    let HistoricalCrashPreservation {
+        worktree,
+        database,
+        worker_log,
+        pool_dir,
+        project,
+        commit,
+        checkout_root,
+        materialized,
+        source_files_materialized,
+    } = context;
     let result = (|| -> Result<Value, DynError> {
         let parent = worktree.parent().ok_or_else(|| -> DynError {
             format!(

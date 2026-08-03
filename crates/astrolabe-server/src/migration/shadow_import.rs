@@ -4401,20 +4401,32 @@ pub(crate) fn stores_summary(
     Value::Object(stores)
 }
 
+/// One coherent set of action/config inputs for the publication commit point.
+pub(crate) struct ShadowPublicationCommit<'a> {
+    pub(crate) dial: MigrationDial,
+    pub(crate) sanitized_index_args: &'a str,
+    pub(crate) index_admission_identity: &'a ShadowIndexAdmissionIdentity,
+    pub(crate) staged_config_rows: &'a [(String, String)],
+    pub(crate) publication_generation: &'a str,
+}
+
 /// Persists a fully validated shadow generation's metadata as one SQLite
-/// transaction. When `publication` is present, the migration dial and exact
-/// replay arguments commit in the same transaction as every vault/kernel row;
-/// readers can therefore never observe a new dial beside old outcome metadata.
+/// transaction. The migration dial and exact replay arguments commit in the
+/// same transaction as every vault/kernel row; readers can therefore never
+/// observe a new dial beside old outcome metadata.
 pub(crate) fn persist_shadow_publication_at(
     cache_dir: &Path,
     project: &str,
     outcome: &ShadowImportOutcome,
-    dial: MigrationDial,
-    sanitized_index_args: &str,
-    index_admission_identity: &ShadowIndexAdmissionIdentity,
-    staged_config_rows: &[(String, String)],
-    publication_generation: &str,
+    commit: ShadowPublicationCommit<'_>,
 ) -> Result<(), DynError> {
+    let ShadowPublicationCommit {
+        dial,
+        sanitized_index_args,
+        index_admission_identity,
+        staged_config_rows,
+        publication_generation,
+    } = commit;
     let mut conn = open_config(cache_dir)?;
     let security_screen_json = serde_json::to_string(&outcome.security_screen)?;
     let search_scale_json = serde_json::to_string(&outcome.search_scale)?;
