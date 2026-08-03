@@ -3222,6 +3222,10 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
     if (!p) {
         return CBM_NOT_FOUND;
     }
+    /* #943: arm first-error capture for this run so a pass that logs a
+     * structured cause but has no handle to record it against can still be
+     * attributed by the caller. Cleared per run, never carried across runs. */
+    cbm_log_first_error_arm();
     p->row_sink_completed = false;
 
     CBM_PROF_START(t_pipeline_total);

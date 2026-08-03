@@ -7121,22 +7121,47 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
     } else {
         cbm_pipeline_error_t fatal = {0};
         bool has_fatal = cbm_pipeline_get_fatal_error(p, &fatal);
-        yyjson_mut_obj_add_str(doc, root, "status", "error");
-        yyjson_mut_obj_add_str(doc, root, "code", has_fatal ? fatal.code : "CBM_PIPELINE_FAILED");
-        yyjson_mut_obj_add_str(doc, root, "operation",
-                               has_fatal ? fatal.operation : "cbm_pipeline_run");
-        yyjson_mut_obj_add_str(doc, root, "phase", has_fatal ? fatal.phase : "pipeline");
-        yyjson_mut_obj_add_str(doc, root, "path", has_fatal ? fatal.path : repo_path);
-        yyjson_mut_obj_add_uint(doc, root, "requested", has_fatal ? fatal.requested : 0);
-        yyjson_mut_obj_add_str(doc, root, "message",
-                               has_fatal ? fatal.message
-                                         : "the authoritative indexing pipeline failed");
-        yyjson_mut_obj_add_str(
-            doc, root, "remediation",
-            has_fatal
-                ? fatal.remediation
+
+        /* #943: a pass that logged a fully structured cause but had no pipeline
+         * handle to record it against -- import-map resolution being the case
+         * that motivated this -- would otherwise degrade to the generic text
+         * below, leaving the real reason buried in a worker log. Consulted ONLY
+         * here, on a path that has already established the run failed, and only
+         * when nothing explicit was recorded. */
+        cbm_log_first_error_t logged;
+        const bool has_logged = !has_fatal && cbm_log_first_error_get(&logged);
+
+        const char *err_code =
+            has_fatal ? fatal.code : (has_logged ? logged.code : "CBM_PIPELINE_FAILED");
+        const char *err_operation =
+            has_fatal ? fatal.operation : (has_logged ? logged.operation : "cbm_pipeline_run");
+        const char *err_path = has_fatal ? fatal.path
+                               : (has_logged && logged.file[0]) ? logged.file
+                                                                : repo_path;
+        const char *err_message = has_fatal ? fatal.message
+                                  : has_logged ? logged.message
+                                               : "the authoritative indexing pipeline failed";
+        const char *err_remediation =
+            has_fatal ? fatal.remediation
+            : has_logged
+                ? logged.remediation
                 : "inspect the preceding structured diagnostics, fix the exact failure, then retry "
-                  "the complete corpus");
+                  "the complete corpus";
+
+        yyjson_mut_obj_add_str(doc, root, "status", "error");
+        yyjson_mut_obj_add_str(doc, root, "code", err_code);
+        yyjson_mut_obj_add_str(doc, root, "operation", err_operation);
+        yyjson_mut_obj_add_str(doc, root, "phase", has_fatal ? fatal.phase : "pipeline");
+        yyjson_mut_obj_add_str(doc, root, "path", err_path);
+        yyjson_mut_obj_add_uint(doc, root, "requested", has_fatal ? fatal.requested : 0);
+        yyjson_mut_obj_add_str(doc, root, "message", err_message);
+        yyjson_mut_obj_add_str(doc, root, "remediation", err_remediation);
+        /* Name the attribution source so an operator can tell a recorded fatal
+         * from one recovered off the log, rather than guessing. */
+        yyjson_mut_obj_add_str(doc, root, "error_source",
+                               has_fatal    ? "pipeline_fatal_record"
+                               : has_logged ? "first_logged_error"
+                                            : "generic");
         yyjson_mut_obj_add_bool(doc, root, "sqlite_publication_started", false);
     }
 

@@ -4,6 +4,8 @@ pub const CBM_ARENA_MAX_BLOCKS: u32 = 256;
 pub const CBM_ARENA_DEFAULT_BLOCK_SIZE: u32 = 65536;
 pub const CBM_MAX_CALL_ARGS: u32 = 8;
 pub const CBM_MAX_STRING_CONSTANTS: u32 = 256;
+pub const CBM_LOG_ERR_CODE_MAX: u32 = 128;
+pub const CBM_LOG_ERR_TEXT_MAX: u32 = 512;
 pub const CBM_PIPELINE_ROW_SINK_ABI_V1: u32 = 1;
 pub const CBM_ASTRO_LOWERED_DB_SUFFIX: &[u8; 22] = b".astrolabe-lowered.db\0";
 pub const CBM_ASTRO_ARCHAEOLOGY_DB_PREFIX: &[u8; 24] = b".astrolabe-archaeology-\0";
@@ -1662,6 +1664,34 @@ unsafe extern "C" {
 }
 unsafe extern "C" {
     pub fn cbm_log(level: CBMLogLevel, msg: *const ::std::os::raw::c_char, ...);
+}
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct cbm_log_first_error_t {
+    pub present: bool,
+    pub code: [::std::os::raw::c_char; 128usize],
+    pub operation: [::std::os::raw::c_char; 128usize],
+    pub file: [::std::os::raw::c_char; 512usize],
+    pub message: [::std::os::raw::c_char; 512usize],
+    pub remediation: [::std::os::raw::c_char; 512usize],
+}
+impl Default for cbm_log_first_error_t {
+    fn default() -> Self {
+        let mut s = ::std::mem::MaybeUninit::<Self>::uninit();
+        unsafe {
+            ::std::ptr::write_bytes(s.as_mut_ptr(), 0, 1);
+            s.assume_init()
+        }
+    }
+}
+unsafe extern "C" {
+    pub fn cbm_log_first_error_arm();
+}
+unsafe extern "C" {
+    pub fn cbm_log_first_error_disarm();
+}
+unsafe extern "C" {
+    pub fn cbm_log_first_error_get(out: *mut cbm_log_first_error_t) -> bool;
 }
 unsafe extern "C" {
     pub fn cbm_log_int(
