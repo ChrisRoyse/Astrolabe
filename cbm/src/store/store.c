@@ -2528,64 +2528,162 @@ static HANDLE store_open_writer_bound_member(const char *path, bool required, bo
     return handle;
 }
 
+static bool store_writer_phase_operation(char operation[CBM_STORE_VERIFY_OPERATION_MAX],
+                                         const char *phase, const char *member,
+                                         const char *action,
+                                         cbm_store_verify_result_t *result) {
+    if (!phase || phase[0] == '\0' || !member || member[0] == '\0' || !action ||
+        action[0] == '\0') {
+        store_verify_set_error(result, CBM_STORE_VERIFY_IO_FAILED,
+                               "source.writer.diagnostic_operation", ERROR_INVALID_PARAMETER,
+                               SQLITE_MISUSE,
+                               "writer generation diagnostic requires phase/member/action");
+        return false;
+    }
+    int wrote = snprintf(operation, CBM_STORE_VERIFY_OPERATION_MAX, "source.writer.%s.%s.%s",
+                         phase, member, action);
+    if (wrote < 0 || wrote >= CBM_STORE_VERIFY_OPERATION_MAX) {
+        store_verify_set_error(result, CBM_STORE_VERIFY_IO_FAILED,
+                               "source.writer.diagnostic_operation", ERROR_BUFFER_OVERFLOW,
+                               SQLITE_TOOBIG,
+                               "writer generation diagnostic operation exceeds capacity");
+        return false;
+    }
+    return true;
+}
+
 static bool store_writer_matches_preflight(const char *db_path,
                                            const cbm_store_verify_result_t *expected,
-                                           cbm_store_verify_result_t *result) {
+                                           cbm_store_verify_result_t *result,
+                                           const char *phase) {
+    char operation[CBM_STORE_VERIFY_OPERATION_MAX];
+    result->db_present = false;
+    result->db_bytes = 0;
+    result->db_sha256[0] = '\0';
+    result->wal_present = false;
+    result->wal_bytes = 0;
+    result->wal_sha256[0] = '\0';
+    result->native_error = ERROR_SUCCESS;
+    result->sqlite_error = SQLITE_OK;
+    result->operation[0] = '\0';
+    result->detail[0] = '\0';
     if (!expected || expected->status != CBM_STORE_VERIFY_OK || !expected->db_present ||
         !expected->family_frozen || !expected->family_guard_release_complete ||
         expected->db_bytes == 0 || strlen(expected->db_sha256) != CBM_SHA256_HEX_LEN ||
         (expected->wal_present &&
          strlen(expected->wal_sha256) != CBM_SHA256_HEX_LEN)) {
-        store_verify_set_error(result, CBM_STORE_VERIFY_IO_FAILED,
-                               "source.writer.validate_preflight", ERROR_INVALID_DATA,
+        if (!store_writer_phase_operation(operation, phase, "family", "validate", result)) {
+            return false;
+        }
+        store_verify_set_error(result, CBM_STORE_VERIFY_IO_FAILED, operation, ERROR_INVALID_DATA,
                                SQLITE_MISUSE,
                                "bound writer requires one successful exact frozen DB/WAL preflight");
         return false;
     }
 
     bool db_present = false;
-    HANDLE db = store_open_writer_bound_member(db_path, true, &db_present, result,
-                                               "source.writer.bind_db_open");
+    if (!store_writer_phase_operation(operation, phase, "db", "open", result)) {
+        return false;
+    }
+    HANDLE db = store_open_writer_bound_member(db_path, true, &db_present, result, operation);
     if (db == INVALID_HANDLE_VALUE) {
+        if (store_source_missing_error(result->native_error)) {
+            uint32_t missing_error = result->native_error;
+            char detail[CBM_STORE_VERIFY_DETAIL_MAX];
+            snprintf(detail, sizeof(detail),
+                     "expected_present=%d expected_bytes=%llu expected_sha256=%s "
+                     "observed_present=0 observed_bytes=0 observed_sha256=",
+                     expected->db_present ? 1 : 0, (unsigned long long)expected->db_bytes,
+                     expected->db_sha256);
+            if (!store_writer_phase_operation(operation, phase, "db", "presence", result)) {
+                return false;
+            }
+            store_verify_set_error(result, CBM_STORE_VERIFY_INTEGRITY_FAILED, operation,
+                                   missing_error, SQLITE_MISMATCH, detail);
+        }
         return false;
     }
     uint64_t db_bytes = 0;
     char db_sha256[CBM_SHA256_HEX_LEN + 1] = "";
-    bool db_hashed = store_hash_frozen_identity(db, result, "source.writer.bind_db_hash",
-                                                &db_bytes, db_sha256);
+    if (!store_writer_phase_operation(operation, phase, "db", "hash", result)) {
+        store_close_windows_handle_or_abort(&db, "source.writer.phase_operation.db_close");
+        return false;
+    }
+    bool db_hashed =
+        store_hash_frozen_identity(db, result, operation, &db_bytes, db_sha256);
     store_close_windows_handle_or_abort(&db, "source.writer.bind_db_close");
     if (!db_hashed) {
         return false;
     }
+    result->db_present = db_present;
+    result->db_bytes = db_bytes;
+    snprintf(result->db_sha256, sizeof(result->db_sha256), "%s", db_sha256);
     if (!db_present || db_bytes != expected->db_bytes ||
         strcmp(db_sha256, expected->db_sha256) != 0) {
-        store_verify_set_error(result, CBM_STORE_VERIFY_INTEGRITY_FAILED,
-                               "source.writer.bind_db_generation", ERROR_CRC,
-                               SQLITE_MISMATCH,
-                               "live writer DB bytes differ from the frozen preflight generation");
+        char detail[CBM_STORE_VERIFY_DETAIL_MAX];
+        snprintf(detail, sizeof(detail),
+                 "expected_present=%d expected_bytes=%llu expected_sha256=%s "
+                 "observed_present=%d observed_bytes=%llu observed_sha256=%s",
+                 expected->db_present ? 1 : 0, (unsigned long long)expected->db_bytes,
+                 expected->db_sha256, db_present ? 1 : 0, (unsigned long long)db_bytes,
+                 db_sha256);
+        if (!store_writer_phase_operation(operation, phase, "db", "generation", result)) {
+            return false;
+        }
+        store_verify_set_error(result, CBM_STORE_VERIFY_INTEGRITY_FAILED, operation, ERROR_CRC,
+                               SQLITE_MISMATCH, detail);
         return false;
     }
 
     char *wal_path = store_member_path(db_path, "-wal");
     if (!wal_path) {
-        store_verify_set_error(result, CBM_STORE_VERIFY_IO_FAILED,
-                               "source.writer.bind_wal_path", ERROR_NOT_ENOUGH_MEMORY,
-                               SQLITE_NOMEM, "writer-bound WAL path could not be allocated");
+        if (!store_writer_phase_operation(operation, phase, "wal", "path", result)) {
+            return false;
+        }
+        store_verify_set_error(result, CBM_STORE_VERIFY_IO_FAILED, operation,
+                               ERROR_NOT_ENOUGH_MEMORY, SQLITE_NOMEM,
+                               "writer-bound WAL path could not be allocated");
         return false;
     }
     bool wal_present = false;
+    if (!store_writer_phase_operation(operation, phase, "wal", "open", result)) {
+        free(wal_path);
+        return false;
+    }
     HANDLE wal = store_open_writer_bound_member(wal_path, expected->wal_present, &wal_present,
-                                                result, "source.writer.bind_wal_open");
+                                                result, operation);
     free(wal_path);
+    result->wal_present = wal_present;
     if (wal == INVALID_HANDLE_VALUE) {
+        if (expected->wal_present && store_source_missing_error(result->native_error)) {
+            uint32_t missing_error = result->native_error;
+            char detail[CBM_STORE_VERIFY_DETAIL_MAX];
+            snprintf(detail, sizeof(detail),
+                     "expected_present=1 expected_bytes=%llu expected_sha256=%s "
+                     "observed_present=0 observed_bytes=0 observed_sha256=",
+                     (unsigned long long)expected->wal_bytes, expected->wal_sha256);
+            if (!store_writer_phase_operation(operation, phase, "wal", "presence", result)) {
+                return false;
+            }
+            store_verify_set_error(result, CBM_STORE_VERIFY_INTEGRITY_FAILED, operation,
+                                   missing_error, SQLITE_MISMATCH, detail);
+            return false;
+        }
         if (result->operation[0] != '\0' || expected->wal_present) {
             return false;
         }
         if (wal_present != expected->wal_present) {
-            store_verify_set_error(result, CBM_STORE_VERIFY_INTEGRITY_FAILED,
-                                   "source.writer.bind_wal_presence", ERROR_CRC,
-                                   SQLITE_MISMATCH,
-                                   "live writer WAL presence differs from frozen preflight");
+            char detail[CBM_STORE_VERIFY_DETAIL_MAX];
+            snprintf(detail, sizeof(detail),
+                     "expected_present=%d expected_bytes=%llu expected_sha256=%s "
+                     "observed_present=%d observed_bytes=0 observed_sha256=",
+                     expected->wal_present ? 1 : 0, (unsigned long long)expected->wal_bytes,
+                     expected->wal_sha256, wal_present ? 1 : 0);
+            if (!store_writer_phase_operation(operation, phase, "wal", "presence", result)) {
+                return false;
+            }
+            store_verify_set_error(result, CBM_STORE_VERIFY_INTEGRITY_FAILED, operation, ERROR_CRC,
+                                   SQLITE_MISMATCH, detail);
             return false;
         }
         return true;
@@ -2593,18 +2691,32 @@ static bool store_writer_matches_preflight(const char *db_path,
 
     uint64_t wal_bytes = 0;
     char wal_sha256[CBM_SHA256_HEX_LEN + 1] = "";
-    bool wal_hashed = store_hash_frozen_identity(wal, result, "source.writer.bind_wal_hash",
-                                                 &wal_bytes, wal_sha256);
+    if (!store_writer_phase_operation(operation, phase, "wal", "hash", result)) {
+        store_close_windows_handle_or_abort(&wal, "source.writer.phase_operation.wal_close");
+        return false;
+    }
+    bool wal_hashed =
+        store_hash_frozen_identity(wal, result, operation, &wal_bytes, wal_sha256);
     store_close_windows_handle_or_abort(&wal, "source.writer.bind_wal_close");
     if (!wal_hashed) {
         return false;
     }
+    result->wal_bytes = wal_bytes;
+    snprintf(result->wal_sha256, sizeof(result->wal_sha256), "%s", wal_sha256);
     if (!expected->wal_present || wal_bytes != expected->wal_bytes ||
         strcmp(wal_sha256, expected->wal_sha256) != 0) {
-        store_verify_set_error(result, CBM_STORE_VERIFY_INTEGRITY_FAILED,
-                               "source.writer.bind_wal_generation", ERROR_CRC,
-                               SQLITE_MISMATCH,
-                               "live writer WAL bytes differ from the frozen preflight generation");
+        char detail[CBM_STORE_VERIFY_DETAIL_MAX];
+        snprintf(detail, sizeof(detail),
+                 "expected_present=%d expected_bytes=%llu expected_sha256=%s "
+                 "observed_present=%d observed_bytes=%llu observed_sha256=%s",
+                 expected->wal_present ? 1 : 0, (unsigned long long)expected->wal_bytes,
+                 expected->wal_sha256, wal_present ? 1 : 0, (unsigned long long)wal_bytes,
+                 wal_sha256);
+        if (!store_writer_phase_operation(operation, phase, "wal", "generation", result)) {
+            return false;
+        }
+        store_verify_set_error(result, CBM_STORE_VERIFY_INTEGRITY_FAILED, operation, ERROR_CRC,
+                               SQLITE_MISMATCH, detail);
         return false;
     }
     return true;
@@ -3553,7 +3665,14 @@ static void store_writer_close_after_failure(cbm_store_t **writer, cbm_store_t *
     if (*writer) {
         *out_store = *writer;
     }
-    store_verify_set_close_error(result, operation, &close_result);
+    /* cbm_store_close emits the complete result-bearing close failure and
+     * retains the exact owner above. Preserve the primary verification phase
+     * and mismatch-time evidence instead of replacing it with the cleanup
+     * failure. Callers can distinguish the retained close owner through
+     * out_store and must consume that owner through the same close boundary. */
+    if (result->operation[0] == '\0') {
+        store_verify_set_close_error(result, operation, &close_result);
+    }
 }
 
 static cbm_store_verify_status_t store_open_path_project_writer_existing_internal(
@@ -3604,6 +3723,26 @@ static cbm_store_verify_status_t store_open_path_project_writer_existing_interna
                                          "source.writer.sqlite_close_after_open");
         return result->status;
     }
+
+    int no_checkpoint_on_close = 0;
+    rc = sqlite3_db_config(writer->db, SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, 1,
+                           &no_checkpoint_on_close);
+    if (rc != SQLITE_OK || no_checkpoint_on_close != 1) {
+        char detail[CBM_STORE_VERIFY_DETAIL_MAX];
+        snprintf(detail, sizeof(detail),
+                 "sqlite3_db_config_rc=%d no_checkpoint_on_close_readback=%d expected=1", rc,
+                 no_checkpoint_on_close);
+        store_verify_set_error(
+            result, CBM_STORE_VERIFY_IO_FAILED,
+            rc == SQLITE_OK ? "source.writer.no_checkpoint_on_close_readback"
+                            : "source.writer.no_checkpoint_on_close_enable",
+            0, rc == SQLITE_OK ? SQLITE_MISMATCH : rc, detail);
+        store_log_open_failure(db_path, result->operation, writer->db, result->sqlite_error,
+                               result->detail);
+        store_writer_close_after_failure(&writer, out_store, result,
+                                         "source.writer.sqlite_close_after_db_config");
+        return result->status;
+    }
     result->db_present = true;
 
 #ifdef _WIN32
@@ -3611,7 +3750,8 @@ static cbm_store_verify_status_t store_open_path_project_writer_existing_interna
      * the database yet. Compare the exact preflight DB/WAL generation at this
      * point so mismatch refusal cannot create SHM, checkpoint, or otherwise
      * touch the replacement family. */
-    if (expected_family && !store_writer_matches_preflight(db_path, expected_family, result)) {
+    if (expected_family &&
+        !store_writer_matches_preflight(db_path, expected_family, result, "pre_sql")) {
         store_log_open_failure(db_path, result->operation, writer->db, result->sqlite_error,
                                result->detail);
         store_writer_close_after_failure(&writer, out_store, result,
@@ -3703,7 +3843,8 @@ static cbm_store_verify_status_t store_open_path_project_writer_existing_interna
      * readback.  The pre-lock comparison rejects an already-replaced family
      * before SQLite executes SQL; this post-lock comparison proves the bytes
      * accepted for normalization are still the frozen preflight generation. */
-    if (expected_family && !store_writer_matches_preflight(db_path, expected_family, result)) {
+    if (expected_family && !store_writer_matches_preflight(db_path, expected_family, result,
+                                                           "post_exclusive_commit")) {
         store_log_open_failure(db_path, result->operation, writer->db, result->sqlite_error,
                                result->detail);
         store_writer_close_after_failure(
