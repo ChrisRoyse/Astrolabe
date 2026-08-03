@@ -1413,7 +1413,9 @@ struct cbm_mcp_server {
     cbm_store_t *store;     /* currently open project store (or NULL) */
     bool owns_store;        /* true if we opened the store */
     char *current_project;  /* which project store is open for (heap) */
-    time_t store_last_used; /* last time resolve_store was called for a named project */
+    /* Idle clock owned by the currently published named-store generation.
+     * Zero means the startup/embedded store was never resolved by project. */
+    time_t store_last_used;
     cbm_store_verify_result_t store_verify; /* last named source-preserving verification */
     char store_error_project[CBM_SZ_256];
     char store_error_db_path[CBM_STORE_VERIFY_PATH_MAX];
@@ -2806,8 +2808,24 @@ int cbm_mcp_server_quiesce_project_transition(cbm_mcp_server_t *srv) {
         }
         return 0;
     }
-    char project[CBM_SZ_256];
-    snprintf(project, sizeof(project), "%s", srv->current_project);
+    /* Closing the cached store destroys current_project. Retain the exact heap
+     * identity so transition hashing and post-close diagnostics cannot truncate
+     * a repository-derived project name into a different mutex generation. */
+    char *project = heap_strdup(srv->current_project);
+    if (!project) {
+        char project_bytes[CBM_SZ_32];
+        snprintf(project_bytes, sizeof(project_bytes), "%llu",
+                 (unsigned long long)strlen(srv->current_project));
+        cbm_log_error(
+            "project.transition.identity_alloc_failed", "code",
+            "CBM_PROJECT_TRANSITION_IDENTITY_ALLOC_FAILED", "project_bytes", project_bytes,
+            "cached_store_closed", "pending", "message",
+            "the exact cached project identity could not be retained for transition probing",
+            "remediation",
+            "free memory and retry only after this resident closes its cached project store");
+        (void)close_cached_store_exact(srv, "project_transition.identity_alloc_failed", NULL);
+        return -1;
+    }
     DWORD native_error = ERROR_SUCCESS;
     bool object_preexisted = false;
     DWORD wait_result = WAIT_FAILED;
@@ -2843,6 +2861,7 @@ int cbm_mcp_server_quiesce_project_transition(cbm_mcp_server_t *srv) {
                      wait_result_text, "state", state_text, "native_error", native_error_text);
     }
     if (state == CBM_PROJECT_TRANSITION_INACTIVE) {
+        free(project);
         return 0;
     }
     if (close_cached_store_exact(srv, "project_transition.quiesce", project) != 0) {
@@ -2854,6 +2873,7 @@ int cbm_mcp_server_quiesce_project_transition(cbm_mcp_server_t *srv) {
                       "remediation",
                       "resolve the exact cached-store close failure before admitting the "
                       "transition worker or publication");
+        free(project);
         return -1;
     }
     record_project_transition_state(srv, project, state, native_error);
@@ -2862,6 +2882,7 @@ int cbm_mcp_server_quiesce_project_transition(cbm_mcp_server_t *srv) {
     if (state == CBM_PROJECT_TRANSITION_ACTIVE) {
         cbm_log_info("project.transition.quiesced", "project", project, "cached_store_closed",
                      "true");
+        free(project);
         return 1;
     }
     cbm_log_error("project.transition.probe_failed", "code",
@@ -2869,6 +2890,7 @@ int cbm_mcp_server_quiesce_project_transition(cbm_mcp_server_t *srv) {
                   "native_error_kind", "win32", "native_error", native_error_text, "message",
                   "the resident query store closed because transition ownership was unevaluable",
                   "remediation", "resolve the named-mutex failure before reopening the project");
+    free(project);
     return -1;
 }
 
@@ -3210,6 +3232,28 @@ static void record_store_query_failure(cbm_mcp_server_t *srv, const char *projec
     record_store_error_state(srv, project, db_path, &failure);
 }
 
+static bool refresh_named_store_idle_clock(cbm_mcp_server_t *srv, const char *project) {
+    time_t now = time(NULL);
+    if (now != (time_t)-1 && now != 0) {
+        srv->store_last_used = now;
+        return true;
+    }
+
+    const char *db_path = srv->store ? cbm_store_db_path(srv->store) : "";
+    record_store_query_failure(
+        srv, project, db_path, srv->store, CBM_STORE_VERIFY_IO_FAILED,
+        "resolve_store.named_cache_clock",
+        "the active named-store generation could not acquire a nonzero idle-clock value");
+    char observed_time[CBM_SZ_32];
+    snprintf(observed_time, sizeof(observed_time), "%lld", (long long)now);
+    cbm_log_error("mcp.named_store.clock_failed", "code", "CBM_NAMED_STORE_CLOCK_FAILED", "project",
+                  project, "observed_time", observed_time, "cached_store_closed", "pending",
+                  "message",
+                  "the named SQLite cache cannot publish without its generation-owned idle clock",
+                  "remediation", "repair the native system clock and retry the unchanged request");
+    return false;
+}
+
 /* Read the sole INTERNAL project name from a .db file at full_path.
  * Opens the file query-mode (no create) and succeeds ONLY when the db holds
  * exactly one project row with a non-empty name — this filters ghost/empty
@@ -3246,10 +3290,12 @@ static cbm_store_t *resolve_store(cbm_mcp_server_t *srv, const char *project) {
         return NULL;
     }
 
-    srv->store_last_used = time(NULL);
-
     /* Already open for this project? */
     if (srv->current_project && strcmp(srv->current_project, project) == 0 && srv->store) {
+        if (!refresh_named_store_idle_clock(srv, project)) {
+            (void)close_cached_store_exact(srv, "resolve_store.named_cache_clock", project);
+            return NULL;
+        }
         return srv->store;
     }
 
@@ -3312,8 +3358,28 @@ static cbm_store_t *resolve_store(cbm_mcp_server_t *srv, const char *project) {
             srv, project, path, srv->store, &verification, &identity);
         if (identity_status == DB_PROJECT_INSPECT_OK) {
             srv->owns_store = true;
+            char *published_project = heap_strdup(project);
+            if (!published_project) {
+                record_store_query_failure(
+                    srv, project, path, srv->store, CBM_STORE_VERIFY_IO_FAILED,
+                    "resolve_store.project_identity_alloc",
+                    "the verified named-store project identity could not be retained");
+                cbm_log_error(
+                    "mcp.named_store.identity_alloc_failed", "code",
+                    "CBM_NAMED_STORE_IDENTITY_ALLOC_FAILED", "project", project,
+                    "cached_store_closed", "pending", "message",
+                    "the verified SQLite cache cannot publish without its exact project identity",
+                    "remediation", "free memory and retry the unchanged request");
+                (void)close_cached_store_exact(srv, "resolve_store.project_identity_alloc",
+                                               project);
+                return NULL;
+            }
             free(srv->current_project);
-            srv->current_project = heap_strdup(project);
+            srv->current_project = published_project;
+            if (!refresh_named_store_idle_clock(srv, project)) {
+                (void)close_cached_store_exact(srv, "resolve_store.named_cache_clock", project);
+                return NULL;
+            }
             return srv->store; /* fast path: filename == internal name */
         }
         if (close_cached_store_exact(srv, "resolve_store.identity_refusal", project) != 0) {

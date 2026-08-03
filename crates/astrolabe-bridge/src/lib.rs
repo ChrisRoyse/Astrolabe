@@ -3630,9 +3630,9 @@ impl CbmToolRunner {
             other => Err(envelope(
                 "ASTRO_CBM_PROJECT_TRANSITION_PROBE_FAILED",
                 format!(
-                    "native resident transition probe returned status {other}; the cached store was closed"
+                    "native resident transition probe returned status {other}; inspect the native diagnostic for the exact cached-store disposition"
                 ),
-                "Inspect the structured native named-mutex diagnostic and resolve it before reopening the project.",
+                "Resolve the structured native identity, named-mutex, or exact-close failure before reopening the project.",
             )),
         }
     }
