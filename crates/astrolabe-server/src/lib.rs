@@ -18,6 +18,8 @@ use tracing::level_filters::LevelFilter;
 
 mod migration;
 
+mod connection_supervisor;
+
 mod installer_cleanup;
 use installer_cleanup::*;
 
@@ -102,6 +104,25 @@ pub fn run_from_env_on_sized_host_thread() -> i32 {
 
 pub fn run_from_env() -> i32 {
     let args: Vec<String> = env::args().collect();
+    if args.len() == 1 {
+        match connection_supervisor::run_if_installed_generation() {
+            Ok(Some(code)) => return code,
+            Ok(None) => {}
+            Err(error) => {
+                connection_supervisor::report_error(&error);
+                return 1;
+            }
+        }
+    }
+    if args
+        .get(1)
+        .is_some_and(|arg| arg == connection_supervisor::INTERNAL_WORKER_ARG)
+    {
+        if let Err(error) = connection_supervisor::validate_worker_invocation(&args[1..]) {
+            connection_supervisor::report_error(&error);
+            return 1;
+        }
+    }
     let hook_mode = is_hook_augment_invocation(&args);
     // #392: a `cli <tool>` invocation reserves stderr for warn/error so the
     // supported `--args-file`/stdin forms emit empty stderr (unblocks #377). It
@@ -184,6 +205,7 @@ fn dispatch(args: &[String]) -> Result<i32, DynError> {
 
     match args[0].as_str() {
         "cli" => run_cli(&args[1..]),
+        connection_supervisor::INTERNAL_WORKER_ARG => run_server(),
         "hook-augment" => run_hook_augment(),
         "install" | "uninstall" | "update" => run_installer_command(args[0].as_str(), &args[1..]),
         "verify" => run_verify(&args[1..]),

@@ -774,8 +774,10 @@ $publishedNomic = @(
     }
 )
 $archaeologyRoot = Join-Path $InstallRoot 'scratch'
+$connectionJournalRoot = Join-Path $InstallRoot 'connections'
+$generationConnectionJournalPath = Join-Path $connectionJournalRoot $generationName
 $publication = [ordered]@{
-    schema = 'astrolabe.global-mcp-publication.v4'
+    schema = 'astrolabe.global-mcp-publication.v5'
     issue = $Issue
     published_at_utc = [DateTime]::UtcNow.ToString('o')
     tree_sha = $ExpectedTreeSha
@@ -830,10 +832,19 @@ $publication = [ordered]@{
         publication = 'MoveFileExW(MOVEFILE_WRITE_THROUGH,no-replace)'
         same_volume = $true
     }
+    connection_journal = [ordered]@{
+        schema = 'astrolabe.global-mcp-connection-journal.v1'
+        root = $connectionJournalRoot
+        generation_path = $generationConnectionJournalPath
+        record_schema = 'astrolabe.global-mcp-connection-record.v1'
+        publication = 'create-new + FlushFileBuffers + byte/hash readback'
+        retry_permitted = $false
+        server_substitution_permitted = $false
+    }
     client_activation = [ordered]@{
         status = 'not_attempted'
         required = $true
-        transaction_schema = 'astrolabe.global-mcp-activation.v2'
+        transaction_schema = 'astrolabe.global-mcp-activation.v3'
         activation_script = [IO.Path]::GetFullPath(
             (Join-Path $PSScriptRoot 'activate-global-astrolabe-mcp.ps1')
         )
@@ -890,7 +901,7 @@ $persistedClosureMaterial = @(
         "$([string]$_.name)`t$([uint64]$_.bytes)`t$([string]$_.sha256)"
     }
 ) -join "`n"
-if ([string]$persistedReceipt.schema -cne 'astrolabe.global-mcp-publication.v4' -or
+if ([string]$persistedReceipt.schema -cne 'astrolabe.global-mcp-publication.v5' -or
     [string]$persistedReceipt.tree_sha -cne $ExpectedTreeSha -or
     [string]$persistedReceipt.artifact.installed_path -cne $finalArtifact -or
     [string]$persistedReceipt.client_activation.status -cne
@@ -901,6 +912,19 @@ if ([string]$persistedReceipt.schema -cne 'astrolabe.global-mcp-publication.v4' 
     [string]$persistedReceipt.client_activation.server_name -cne
         'astrolabe' -or
     [bool]$persistedReceipt.client_activation.codex.required -ne $true -or
+    [string]$persistedReceipt.client_activation.transaction_schema -cne
+        'astrolabe.global-mcp-activation.v3' -or
+    [string]$persistedReceipt.connection_journal.schema -cne
+        'astrolabe.global-mcp-connection-journal.v1' -or
+    [string]$persistedReceipt.connection_journal.root -cne
+        $connectionJournalRoot -or
+    [string]$persistedReceipt.connection_journal.generation_path -cne
+        $generationConnectionJournalPath -or
+    [string]$persistedReceipt.connection_journal.record_schema -cne
+        'astrolabe.global-mcp-connection-record.v1' -or
+    [bool]$persistedReceipt.connection_journal.retry_permitted -ne $false -or
+    [bool]$persistedReceipt.connection_journal.server_substitution_permitted -ne
+        $false -or
     [string]$persistedReceipt.client_activation.environment.ASTRO_ARCHAEOLOGY_ROOT -cne
         $archaeologyRoot -or
     [string]$persistedReceipt.runtime_closure.sha256 -cne
@@ -1044,5 +1068,6 @@ $nomicReadback = @(
             [string]$persistedReceipt.client_activation.activation_script
         environment = $persistedReceipt.client_activation.environment
     }
+    connection_journal = $persistedReceipt.connection_journal
     source_stage_absent = -not (Test-AstroPathLongPath -LiteralPath $publishingPath)
 } | ConvertTo-Json -Depth 10 -Compress | Write-Output

@@ -4,7 +4,7 @@
 
 .DESCRIPTION
     Publication and activation are separate durable transactions. This command accepts only an
-    immutable astrolabe.global-mcp-publication.v4 receipt whose artifact and Nomic runtime-data
+    immutable astrolabe.global-mcp-publication.v5 receipt whose artifact and Nomic runtime-data
     bytes still match its receipt and whose frozen tree matches the live issue-owned launcher
     generation.
 
@@ -466,7 +466,9 @@ function Assert-ActivationCompletionReadback {
         [Parameter(Mandatory)][string]$ExpectedNomicSha256,
         [Parameter(Mandatory)][string]$ExpectedNomicDirectoryFileId,
         [Parameter(Mandatory)][string]$ExpectedCodexSha256,
-        [Parameter(Mandatory)][string]$ExpectedClaudeSha256
+        [Parameter(Mandatory)][string]$ExpectedClaudeSha256,
+        [Parameter(Mandatory)][string]$ExpectedConnectionJournalRoot,
+        [Parameter(Mandatory)][string]$ExpectedGenerationConnectionJournalPath
     )
 
     $runtime = $Completion['runtime']
@@ -481,7 +483,7 @@ function Assert-ActivationCompletionReadback {
         $runtime['nomic_runtime_data_directory'] -isnot
             [System.Collections.IDictionary] -or
         [string]$Completion['schema'] -cne
-            'astrolabe.global-mcp-activation.v2' -or
+            'astrolabe.global-mcp-activation.v3' -or
         [string]$Completion['verdict'] -cne 'activated' -or
         [string]$runtime['archaeology_root']['path'] -cne
             $ExpectedArchaeologyRoot -or
@@ -493,6 +495,20 @@ function Assert-ActivationCompletionReadback {
         [string]$claude['after_sha256'] -cne $ExpectedClaudeSha256) {
         Fail-AstroGlobalActivation 'ASTRO_GLOBAL_ACTIVATION_COMPLETION_MISMATCH' `
             "$Description differs from physical runtime/config readback" `
+            'preserve the transaction and both configs; do not claim global activation'
+    }
+    $connectionJournal = $Completion['connection_journal']
+    if ($connectionJournal -isnot [System.Collections.IDictionary] -or
+        [string]$connectionJournal['schema'] -cne
+            'astrolabe.global-mcp-connection-journal.v1' -or
+        [string]$connectionJournal['root'] -cne
+            $ExpectedConnectionJournalRoot -or
+        [string]$connectionJournal['generation_path'] -cne
+            $ExpectedGenerationConnectionJournalPath -or
+        [bool]$connectionJournal['retry_permitted'] -ne $false -or
+        [bool]$connectionJournal['server_substitution_permitted'] -ne $false) {
+        Fail-AstroGlobalActivation 'ASTRO_GLOBAL_ACTIVATION_COMPLETION_MISMATCH' `
+            "$Description lacks the exact fail-closed connection-journal contract" `
             'preserve the transaction and both configs; do not claim global activation'
     }
 }
@@ -1109,6 +1125,8 @@ $archaeologyReadback = $null
 $nomicDirectoryReadback = $null
 $runtimeData = $null
 $runtimeFiles = @()
+$connectionJournalRoot = $null
+$generationConnectionJournalPath = $null
 $rollback = [Collections.Generic.List[object]]::new()
 
 try {
@@ -1161,14 +1179,14 @@ try {
     }
     $receiptText = Read-AstroUtf8FileLongPath $receiptPath
     $receipt = Get-StrictJsonHashtable $receiptText 'immutable publication receipt'
-    if ([string]$receipt['schema'] -cne 'astrolabe.global-mcp-publication.v4' -or
+    if ([string]$receipt['schema'] -cne 'astrolabe.global-mcp-publication.v5' -or
         [string]$receipt['tree_sha'] -cne $ExpectedTreeSha -or
         [string]$receipt['client_activation']['status'] -cne 'not_attempted' -or
         [bool]$receipt['client_activation']['required'] -ne $true -or
         [string]$receipt['client_activation']['server_name'] -cne 'astrolabe') {
         Fail-AstroGlobalActivation 'ASTRO_GLOBAL_ACTIVATION_RECEIPT_INVALID' `
             'publication receipt schema/tree/activation contract does not authorize activation' `
-            'publish one v4 immutable generation from this exact tree before activation'
+            'publish one v5 immutable generation from this exact tree before activation'
     }
     $artifactPath = [IO.Path]::GetFullPath(
         [string]$receipt['artifact']['installed_path']
@@ -1191,13 +1209,49 @@ try {
         -not $environment.Contains('ASTRO_ARCHAEOLOGY_ROOT')) {
         Fail-AstroGlobalActivation 'ASTRO_GLOBAL_ACTIVATION_ENVIRONMENT_INVALID' `
             'publication activation environment is not the exact one-variable archaeology contract' `
-            'publish one v4 generation with exactly ASTRO_ARCHAEOLOGY_ROOT'
+            'publish one v5 generation with exactly ASTRO_ARCHAEOLOGY_ROOT'
     }
     $archaeologyRootRaw = [string]$environment['ASTRO_ARCHAEOLOGY_ROOT']
     $archaeologyRoot = [IO.Path]::GetFullPath($archaeologyRootRaw)
     $installRoot = [IO.Path]::GetFullPath(
         (Split-Path -Parent (Split-Path -Parent $generationPath))
     )
+    $connectionJournal = $receipt['connection_journal']
+    if ($connectionJournal -isnot [System.Collections.IDictionary]) {
+        Fail-AstroGlobalActivation 'ASTRO_GLOBAL_ACTIVATION_CONNECTION_JOURNAL_INVALID' `
+            'publication receipt connection_journal is absent or not an object' `
+            'publish one v5 immutable generation with the current connection-supervisor contract'
+    }
+    $connectionJournalRoot = [IO.Path]::GetFullPath(
+        [string]$connectionJournal['root']
+    )
+    $generationConnectionJournalPath = [IO.Path]::GetFullPath(
+        [string]$connectionJournal['generation_path']
+    )
+    $expectedConnectionJournalRoot = [IO.Path]::GetFullPath(
+        (Join-Path $installRoot 'connections')
+    )
+    $expectedGenerationConnectionJournalPath = [IO.Path]::GetFullPath(
+        (Join-Path $expectedConnectionJournalRoot ([string]$receipt['generation']['id']))
+    )
+    if ($connectionJournal -isnot [System.Collections.IDictionary] -or
+        [string]$connectionJournal['schema'] -cne
+            'astrolabe.global-mcp-connection-journal.v1' -or
+        [string]$connectionJournal['record_schema'] -cne
+            'astrolabe.global-mcp-connection-record.v1' -or
+        [string]$receipt['generation']['id'] -cne
+            (Split-Path -Leaf $generationPath) -or
+        $connectionJournalRoot -cne $expectedConnectionJournalRoot -or
+        $generationConnectionJournalPath -cne
+            $expectedGenerationConnectionJournalPath -or
+        [bool]$connectionJournal['retry_permitted'] -ne $false -or
+        [bool]$connectionJournal['server_substitution_permitted'] -ne $false -or
+        [string]$receipt['client_activation']['transaction_schema'] -cne
+            'astrolabe.global-mcp-activation.v3') {
+        Fail-AstroGlobalActivation 'ASTRO_GLOBAL_ACTIVATION_CONNECTION_JOURNAL_INVALID' `
+            'publication receipt does not bind the exact install-owned v1 connection journal and v3 activation contract' `
+            'publish one v5 immutable generation with the current connection-supervisor contract'
+    }
     $expectedArchaeologyRoot = [IO.Path]::GetFullPath(
         (Join-Path $installRoot 'scratch')
     )
@@ -1609,7 +1663,7 @@ try {
     $claudeAfter = $claudeVerdictLease.snapshot
 
     $completion = [ordered]@{
-        schema = 'astrolabe.global-mcp-activation.v2'
+        schema = 'astrolabe.global-mcp-activation.v3'
         verdict = 'activated'
         transaction_id = $transactionId
         completed_at_utc = [DateTime]::UtcNow.ToString('o')
@@ -1641,6 +1695,15 @@ try {
                 entry_count = $nomicDirectoryReadback.entry_count
                 last_write_utc = $nomicDirectoryReadback.last_write_utc
             }
+        }
+        connection_journal = [ordered]@{
+            schema = [string]$connectionJournal['schema']
+            root = $connectionJournalRoot
+            generation_path = $generationConnectionJournalPath
+            record_schema = [string]$connectionJournal['record_schema']
+            retry_permitted = [bool]$connectionJournal['retry_permitted']
+            server_substitution_permitted =
+                [bool]$connectionJournal['server_substitution_permitted']
         }
         codex = [ordered]@{
             config_path = $CodexConfigPath
@@ -1683,6 +1746,8 @@ try {
             $artifactPath,
             $expectedRuntimeParent,
             $archaeologyRoot,
+            $connectionJournalRoot,
+            $generationConnectionJournalPath,
             $CodexConfigPath,
             $ClaudeConfigPath
         )
@@ -1696,7 +1761,8 @@ try {
     Assert-ActivationCompletionReadback `
         $completionReadback 'durable activation completion stage record' `
         $archaeologyRoot ([string]$runtimeData['sha256']) `
-        $nomicDirectoryReadback.file_id $codexAfter.sha256 $claudeAfter.sha256
+        $nomicDirectoryReadback.file_id $codexAfter.sha256 $claudeAfter.sha256 `
+        $connectionJournalRoot $generationConnectionJournalPath
     $completionSha256 = Get-FileSha256 $completionStagePath
     [AstroLauncherLockNative]::MoveFileWriteThroughNoReplace(
         $completionStagePath,
@@ -1714,7 +1780,8 @@ try {
     Assert-ActivationCompletionReadback `
         $completionFinalReadback 'published activation completion record' `
         $archaeologyRoot ([string]$runtimeData['sha256']) `
-        $nomicDirectoryReadback.file_id $codexAfter.sha256 $claudeAfter.sha256
+        $nomicDirectoryReadback.file_id $codexAfter.sha256 $claudeAfter.sha256 `
+        $connectionJournalRoot $generationConnectionJournalPath
 
     [ordered]@{
         code = 'ASTRO_GLOBAL_MCP_ACTIVATED'
@@ -1731,6 +1798,11 @@ try {
             nomic_runtime_data_sha256 = [string]$runtimeData['sha256']
             nomic_runtime_data_directory = $nomicDirectoryReadback.path
             nomic_runtime_data_directory_file_id = $nomicDirectoryReadback.file_id
+        }
+        connection_journal = [ordered]@{
+            root = $connectionJournalRoot
+            generation_path = $generationConnectionJournalPath
+            schema = [string]$connectionJournal['schema']
         }
         codex = [ordered]@{
             config_path = $CodexConfigPath
