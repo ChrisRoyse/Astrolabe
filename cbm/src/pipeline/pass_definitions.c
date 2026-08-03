@@ -884,6 +884,8 @@ int cbm_pipeline_pass_definitions(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
             process_diagnostic(ctx, &result->diagnostics.items[d], rel);
             total_diagnostics++;
         }
+        cbm_pipeline_add_parse_recovery_diagnostics(ctx->pipeline,
+                                                    (uint_least64_t)result->diagnostics.count);
 
         /* Store calls for pass_calls (we save them in the extraction results
          * for now — a future optimization would batch these) */
@@ -987,9 +989,9 @@ int cbm_pipeline_pass_definitions(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
         }
     }
 
-    /* Publish the parse-recovery total so the tool result can disclose a
-     * degraded index instead of reporting a clean run (#909). */
-    cbm_pipeline_set_parse_recovery_diagnostics(ctx->pipeline, (uint_least64_t)total_diagnostics);
+    /* The parse-recovery total is accumulated per file inside the loop above via
+     * cbm_pipeline_add_parse_recovery_diagnostics, and the parallel resolve pass
+     * adds its own. A set() here would overwrite their contributions. */
 
     cbm_log_info("pass.done", "pass", "definitions", "defs", itoa_log(total_defs), "calls",
                  itoa_log(total_calls), "imports", itoa_log(total_imports), "diagnostics",

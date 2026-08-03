@@ -702,6 +702,10 @@ where
             "reference_persisted": report.reference_persisted,
             "cards_ledgered": report.cards_ledgered,
             "assay_cotenant_rows_skipped": report.assay_cotenant_rows_skipped,
+            "current_sample_cap": report.current_sample_cap,
+            "current_total_population": report.current_total_population,
+            "current_total_retained": report.current_total_retained,
+            "current_sampling_per_slot": report.current_sampling_per_slot,
             "trust": "measured",
             "provenance": "index_time_drift",
         }),
@@ -1583,6 +1587,106 @@ pub(crate) fn shadow_import_current_summary(verdict: &ShadowContentVerdict) -> V
             "remediation": remediation,
         }),
     }
+}
+
+fn shadow_content_verdict_code(verdict: &ShadowContentVerdict) -> &'static str {
+    match verdict {
+        ShadowContentVerdict::Fresh => unreachable!(
+            "shadow_content_verdict_code is only called for non-fresh serving refusals"
+        ),
+        ShadowContentVerdict::Stale { .. } => ASTRO_SHADOW_STALE_REINDEX_REQUIRED,
+        ShadowContentVerdict::SourceOutOfBand { .. } => ASTRO_SHADOW_SOURCE_OUT_OF_BAND,
+        ShadowContentVerdict::WatermarkDomainMismatch { code, .. }
+        | ShadowContentVerdict::Unverifiable { code, .. } => code,
+    }
+}
+
+fn shadow_content_verdict_message(
+    verdict: &ShadowContentVerdict,
+    project: &str,
+    tool: &str,
+) -> String {
+    match verdict {
+        ShadowContentVerdict::Fresh => unreachable!(
+            "shadow_content_verdict_message is only called for non-fresh serving refusals"
+        ),
+        ShadowContentVerdict::Stale { expected, actual } => format!(
+            "{ASTRO_SHADOW_STALE_REINDEX_REQUIRED}: {tool} refused to serve project {project:?} \
+             because the live CBM SQLite source fingerprint differs from the persisted shadow \
+             import watermark (expected {expected}, actual {actual})"
+        ),
+        ShadowContentVerdict::SourceOutOfBand { expected, actual } => format!(
+            "{ASTRO_SHADOW_SOURCE_OUT_OF_BAND}: {tool} refused to serve project {project:?} \
+             because the live git source fingerprint differs from the persisted shadow import \
+             watermark (expected {expected}, actual {actual})"
+        ),
+        ShadowContentVerdict::WatermarkDomainMismatch { message, .. }
+        | ShadowContentVerdict::Unverifiable { message, .. } => message.clone(),
+    }
+}
+
+fn shadow_content_verdict_remediation(verdict: &ShadowContentVerdict) -> &'static str {
+    match verdict {
+        ShadowContentVerdict::Fresh => unreachable!(
+            "shadow_content_verdict_remediation is only called for non-fresh serving refusals"
+        ),
+        ShadowContentVerdict::Stale { .. } => SHADOW_STALE_REMEDIATION,
+        ShadowContentVerdict::SourceOutOfBand { .. } => SHADOW_SOURCE_OUT_OF_BAND_REMEDIATION,
+        ShadowContentVerdict::WatermarkDomainMismatch { remediation, .. }
+        | ShadowContentVerdict::Unverifiable { remediation, .. } => remediation,
+    }
+}
+
+/// Returns a tool-error envelope when a shadow-indexed graph-serving surface would
+/// otherwise serve a stale or unverifiable persisted graph.
+///
+/// The source of truth remains [`evaluate_shadow_content_freshness`]: this wrapper
+/// only converts its non-fresh verdicts into the MCP tool-result shape used by
+/// graph/navigation/kernel surfaces. It never rechecks through a separate mtime or
+/// ad-hoc dirty detector, so every graph surface refuses on the same persisted
+/// fingerprint/watermark contract.
+pub(crate) fn shadow_graph_freshness_refusal(
+    cache_dir: &Path,
+    project: &str,
+    tool: &str,
+) -> Result<Option<String>, DynError> {
+    let verdict = evaluate_shadow_content_freshness(cache_dir, project)?;
+    if verdict == ShadowContentVerdict::Fresh {
+        return Ok(None);
+    }
+    let summary = shadow_import_current_summary(&verdict);
+    let code = shadow_content_verdict_code(&verdict);
+    let message = shadow_content_verdict_message(&verdict, project, tool);
+    let remediation = shadow_content_verdict_remediation(&verdict);
+    let trust = summary.get("trust").cloned().ok_or_else(|| -> DynError {
+        format!(
+            "ASTRO_SHADOW_FRESHNESS_SUMMARY_TRUST_MISSING: non-fresh verdict {code} \
+                 produced no trust label"
+        )
+        .into()
+    })?;
+    let freshness = summary
+        .get("freshness")
+        .cloned()
+        .ok_or_else(|| -> DynError {
+            format!(
+                "ASTRO_SHADOW_FRESHNESS_SUMMARY_FRESHNESS_MISSING: non-fresh verdict {code} \
+                 produced no freshness label"
+            )
+            .into()
+        })?;
+    Ok(Some(tool_json_error_result(json!({
+        "schema": "astrolabe.shadow_freshness_refusal.v1",
+        "status": "refused",
+        "tool": tool,
+        "project": project,
+        "code": code,
+        "message": message,
+        "remediation": remediation,
+        "trust": trust,
+        "freshness": freshness,
+        "shadow_import": summary,
+    }))?))
 }
 
 pub(crate) fn import_shadow_vault_with_archaeology_at(
@@ -3440,21 +3544,6 @@ pub(crate) fn try_shadow_index_noop_admission(
         });
     }
 
-    let mut weave = read_required_shadow_json(cache_dir, project, "weave_json")?;
-    let weave_object = weave.as_object_mut().ok_or_else(|| -> DynError {
-        format!(
-            "ASTRO_SHADOW_NOOP_WEAVE_INVALID: persisted weave metadata for project {project:?} is not an object; remediation: preserve the generation and rebuild from authoritative source"
-        )
-        .into()
-    })?;
-    weave_object.insert("status".to_string(), Value::String("unchanged".to_string()));
-    weave_object.insert("writes_skipped".to_string(), Value::Bool(true));
-    weave_object.insert(
-        "freshness".to_string(),
-        Value::String("current".to_string()),
-    );
-    weave_object.insert("trust".to_string(), Value::String("verified".to_string()));
-
     let persisted_archaeology =
         read_required_shadow_json(cache_dir, project, "git_archaeology_json")?;
     let archaeology_sha256 =
@@ -3572,13 +3661,36 @@ pub(crate) fn try_shadow_index_noop_admission(
         &vault_import_source,
         vault_import_fallback_reason.as_deref(),
     );
-    let security_screen = read_required_shadow_json(cache_dir, project, "security_screen_json")?;
-    let search_scale = read_required_shadow_json(cache_dir, project, "search_scale_json")?;
-    let skill_tree = read_required_shadow_json(cache_dir, project, "skill_tree_json")?;
-    let bridges = read_required_shadow_json(cache_dir, project, "bridge_reports_json")?;
-    let kernel_context = read_required_shadow_json(cache_dir, project, "kernel_context_json")?;
-    let anomalies = read_required_shadow_json(cache_dir, project, "anomaly_report_json")?;
-    let provenance = read_required_shadow_json(cache_dir, project, "provenance_json")?;
+    let security_screen = compact_persisted_surface_ref(
+        cache_dir,
+        project,
+        "security_screen",
+        "security_screen_json",
+    )?;
+    let search_scale =
+        compact_persisted_surface_ref(cache_dir, project, "search_scale", "search_scale_json")?;
+    let skill_tree =
+        compact_persisted_surface_ref(cache_dir, project, "skill_tree", "skill_tree_json")?;
+    let bridges =
+        compact_persisted_surface_ref(cache_dir, project, "bridges", "bridge_reports_json")?;
+    let kernel_context =
+        compact_persisted_surface_ref(cache_dir, project, "kernel_context", "kernel_context_json")?;
+    let anomalies =
+        compact_persisted_surface_ref(cache_dir, project, "anomalies", "anomaly_report_json")?;
+    let provenance =
+        compact_persisted_surface_ref(cache_dir, project, "provenance", "provenance_json")?;
+    let weave = compact_persisted_surface_ref_with_overlay(
+        cache_dir,
+        project,
+        "weave",
+        "weave_json",
+        [
+            ("status", Value::String("unchanged".to_string())),
+            ("writes_skipped", Value::Bool(true)),
+            ("freshness", Value::String("current".to_string())),
+            ("trust", Value::String("verified".to_string())),
+        ],
+    )?;
     let health = health_surface_json(
         project,
         &chain.status,
@@ -3905,7 +4017,7 @@ fn read_shadow_source_counts(
     Ok((nodes, edges, usize::try_from(orphan_edges)?))
 }
 
-pub(crate) fn grounding_summary(outcome: &ShadowImportOutcome) -> Value {
+pub(crate) fn grounding_summary(outcome: &ShadowImportOutcome) -> Result<Value, DynError> {
     let status = if outcome.publication_required {
         "imported"
     } else if outcome.metadata_publication_required {
@@ -3913,7 +4025,7 @@ pub(crate) fn grounding_summary(outcome: &ShadowImportOutcome) -> Value {
     } else {
         "unchanged"
     };
-    json!({
+    Ok(json!({
         "status": status,
         "writes_skipped": !outcome.publication_required && !outcome.metadata_publication_required,
         "artifact_writes_skipped": !outcome.publication_required,
@@ -3956,15 +4068,55 @@ pub(crate) fn grounding_summary(outcome: &ShadowImportOutcome) -> Value {
             &outcome.vault_import_source,
             outcome.vault_import_fallback_reason.as_deref(),
         ),
-        "security_screen": outcome.security_screen.clone(),
-        "search_scale": outcome.search_scale.clone(),
-        "skill_tree": outcome.skill_tree.clone(),
-        "bridges": outcome.bridges.clone(),
-        "kernel_context": outcome.kernel_context.clone(),
-        "anomalies": outcome.anomalies.clone(),
-        "provenance": outcome.provenance.clone(),
+        "security_screen": compact_surface_ref_from_value(
+            outcome_project_label(outcome),
+            "security_screen",
+            "security_screen_json",
+            &outcome.security_screen,
+        )?,
+        "search_scale": compact_surface_ref_from_value(
+            outcome_project_label(outcome),
+            "search_scale",
+            "search_scale_json",
+            &outcome.search_scale,
+        )?,
+        "skill_tree": compact_surface_ref_from_value(
+            outcome_project_label(outcome),
+            "skill_tree",
+            "skill_tree_json",
+            &outcome.skill_tree,
+        )?,
+        "bridges": compact_surface_ref_from_value(
+            outcome_project_label(outcome),
+            "bridges",
+            "bridge_reports_json",
+            &outcome.bridges,
+        )?,
+        "kernel_context": compact_surface_ref_from_value(
+            outcome_project_label(outcome),
+            "kernel_context",
+            "kernel_context_json",
+            &outcome.kernel_context,
+        )?,
+        "anomalies": compact_surface_ref_from_value(
+            outcome_project_label(outcome),
+            "anomalies",
+            "anomaly_report_json",
+            &outcome.anomalies,
+        )?,
+        "provenance": compact_surface_ref_from_value(
+            outcome_project_label(outcome),
+            "provenance",
+            "provenance_json",
+            &outcome.provenance,
+        )?,
         "git_archaeology": outcome.git_archaeology.clone(),
-        "weave": outcome.weave.clone(),
+        "weave": compact_surface_ref_from_value(
+            outcome_project_label(outcome),
+            "weave",
+            "weave_json",
+            &outcome.weave,
+        )?,
         "health": health_surface_json(
             outcome_project_label(outcome),
             &outcome.verify_chain_status,
@@ -3979,6 +4131,126 @@ pub(crate) fn grounding_summary(outcome: &ShadowImportOutcome) -> Value {
             &outcome.vault_dir,
             Some(&outcome.lowered_sqlite_path),
         ),
+    }))
+}
+
+fn compact_surface_ref_from_value(
+    project: &str,
+    surface: &str,
+    metadata_name: &str,
+    value: &Value,
+) -> Result<Value, DynError> {
+    let bytes = serde_json::to_vec(value)?;
+    Ok(compact_surface_ref(
+        project,
+        surface,
+        metadata_name,
+        bytes.len(),
+        &hex_lower(&Sha256::digest(&bytes)),
+        value
+            .as_object()
+            .map(compact_surface_observed_fields)
+            .unwrap_or_default(),
+    ))
+}
+
+pub(crate) fn compact_persisted_surface_ref(
+    cache_dir: &Path,
+    project: &str,
+    surface: &str,
+    metadata_name: &str,
+) -> Result<Value, DynError> {
+    compact_persisted_surface_ref_with_overlay(cache_dir, project, surface, metadata_name, [])
+}
+
+pub(crate) fn compact_persisted_surface_ref_with_overlay<const N: usize>(
+    cache_dir: &Path,
+    project: &str,
+    surface: &str,
+    metadata_name: &str,
+    overlay: [(&str, Value); N],
+) -> Result<Value, DynError> {
+    let key = metadata_key(project, metadata_name);
+    let raw = read_config_value(cache_dir, &key)?
+        .filter(|raw| !raw.trim().is_empty())
+        .ok_or_else(|| -> DynError {
+            format!(
+                "ASTRO_SHADOW_SURFACE_MISSING: project {project:?} metadata row {key:?} is absent; remediation: preserve the generation and rebuild from authoritative source"
+            )
+            .into()
+        })?;
+    validate_json_surface(&raw, project, surface, &key)?;
+    let mut observed = Map::new();
+    for (name, value) in overlay {
+        observed.insert(name.to_string(), value);
+    }
+    Ok(compact_surface_ref(
+        project,
+        surface,
+        metadata_name,
+        raw.len(),
+        &hex_lower(&Sha256::digest(raw.as_bytes())),
+        observed,
+    ))
+}
+
+fn validate_json_surface(
+    raw: &str,
+    project: &str,
+    surface: &str,
+    key: &str,
+) -> Result<(), DynError> {
+    let mut deserializer = serde_json::Deserializer::from_str(raw);
+    <serde::de::IgnoredAny as serde::Deserialize>::deserialize(&mut deserializer).map_err(
+        |error| -> DynError {
+            format!(
+                "ASTRO_SHADOW_SURFACE_JSON_INVALID: project {project:?} surface {surface:?} metadata row {key:?} is not valid JSON: {error}; remediation: preserve the generation and rebuild from authoritative source"
+            )
+            .into()
+        },
+    )?;
+    deserializer.end().map_err(|error| -> DynError {
+        format!(
+            "ASTRO_SHADOW_SURFACE_JSON_TRAILING_BYTES: project {project:?} surface {surface:?} metadata row {key:?} has trailing bytes after JSON: {error}; remediation: preserve the generation and rebuild from authoritative source"
+        )
+        .into()
+    })?;
+    Ok(())
+}
+
+fn compact_surface_observed_fields(object: &Map<String, Value>) -> Map<String, Value> {
+    let mut observed = Map::new();
+    for field in ["schema", "status", "trust", "freshness", "writes_skipped"] {
+        if let Some(value) = object.get(field) {
+            observed.insert(field.to_string(), value.clone());
+        }
+    }
+    observed
+}
+
+fn compact_surface_ref(
+    project: &str,
+    surface: &str,
+    metadata_name: &str,
+    json_bytes: usize,
+    json_sha256: &str,
+    observed: Map<String, Value>,
+) -> Value {
+    json!({
+        "schema": "astrolabe.shadow_surface_ref.v1",
+        "surface": surface,
+        "project": project,
+        "storage": {
+            "store": "config",
+            "key": metadata_key(project, metadata_name),
+        },
+        "json_bytes": json_bytes,
+        "json_sha256": json_sha256,
+        "observed": observed,
+        "materialized_in_response": false,
+        "trust": "verified",
+        "freshness": "current",
+        "provenance": "full surface persisted in project config and served through dedicated readback/query tools; routine MCP status/import calls return this compact manifest to keep responses bounded",
     })
 }
 
@@ -4129,20 +4401,32 @@ pub(crate) fn stores_summary(
     Value::Object(stores)
 }
 
+/// One coherent set of action/config inputs for the publication commit point.
+pub(crate) struct ShadowPublicationCommit<'a> {
+    pub(crate) dial: MigrationDial,
+    pub(crate) sanitized_index_args: &'a str,
+    pub(crate) index_admission_identity: &'a ShadowIndexAdmissionIdentity,
+    pub(crate) staged_config_rows: &'a [(String, String)],
+    pub(crate) publication_generation: &'a str,
+}
+
 /// Persists a fully validated shadow generation's metadata as one SQLite
-/// transaction. When `publication` is present, the migration dial and exact
-/// replay arguments commit in the same transaction as every vault/kernel row;
-/// readers can therefore never observe a new dial beside old outcome metadata.
+/// transaction. The migration dial and exact replay arguments commit in the
+/// same transaction as every vault/kernel row; readers can therefore never
+/// observe a new dial beside old outcome metadata.
 pub(crate) fn persist_shadow_publication_at(
     cache_dir: &Path,
     project: &str,
     outcome: &ShadowImportOutcome,
-    dial: MigrationDial,
-    sanitized_index_args: &str,
-    index_admission_identity: &ShadowIndexAdmissionIdentity,
-    staged_config_rows: &[(String, String)],
-    publication_generation: &str,
+    commit: ShadowPublicationCommit<'_>,
 ) -> Result<(), DynError> {
+    let ShadowPublicationCommit {
+        dial,
+        sanitized_index_args,
+        index_admission_identity,
+        staged_config_rows,
+        publication_generation,
+    } = commit;
     let mut conn = open_config(cache_dir)?;
     let security_screen_json = serde_json::to_string(&outcome.security_screen)?;
     let search_scale_json = serde_json::to_string(&outcome.search_scale)?;

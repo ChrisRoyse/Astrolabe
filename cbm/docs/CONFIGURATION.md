@@ -133,7 +133,7 @@ These environment variables affect runtime behavior:
 | `CBM_DIAGNOSTICS` | `false` | Enable periodic diagnostics output to `/tmp/cbm-diagnostics-<pid>.json`. |
 | `CBM_DOWNLOAD_URL` | GitHub releases | Override the update download URL. |
 | `CBM_LOG_LEVEL` | `info` | Set stderr log level to `debug`, `info`, `warn`, `error`, or `none` (or `0`-`4`). |
-| `CBM_WORKERS` | auto-detected | Override the indexing worker count. |
+| `CBM_WORKERS` | auto-detected | Override the indexing worker count. When present, this must be an exact decimal integer from 1 through 256; malformed, unreadable, or out-of-range values fail closed with `CBM_WORKERS_INVALID`/`CBM_WORKERS_UNREADABLE` instead of falling back to auto-detection. |
 
 ## 5. Agent and Editor Integration Files
 

@@ -28,28 +28,7 @@ static bool ps_ci_equal(const char *left, const char *right) {
 bool cbm_powershell_add_diagnostic(CBMExtractCtx *ctx, TSNode node, const char *code,
                                    const char *operation, const char *message,
                                    const char *remediation, bool is_missing) {
-    if (!ctx || !ctx->result || !ctx->arena || ts_node_is_null(node)) {
-        return false;
-    }
-    uint32_t start = ts_node_start_byte(node);
-    uint32_t end = ts_node_end_byte(node);
-    CBMParseDiagnostic diag = {
-        .code = code,
-        .operation = operation,
-        .message = message,
-        .remediation = remediation,
-        .node_type = ts_node_type(node),
-        .start_line = ts_node_start_point(node).row + 1,
-        .end_line = cbm_node_end_line_inclusive(node),
-        .start_byte = start,
-        .end_byte = end,
-        .is_missing = is_missing,
-    };
-    if (end > start && end <= (uint32_t)ctx->source_len) {
-        diag.source = cbm_arena_strndup(ctx->arena, ctx->source + start, (size_t)(end - start));
-        diag.source_len = end - start;
-    }
-    return cbm_diagnostics_push(&ctx->result->diagnostics, ctx->arena, diag);
+    return cbm_add_parse_diagnostic(ctx, node, code, operation, message, remediation, is_missing);
 }
 
 static void ps_record_tree_diagnostics(CBMExtractCtx *ctx, TSNode root, bool embedded_csharp) {

@@ -11,9 +11,14 @@ pub const ASTRO_ARCHAEOLOGY_CONFIG_INVALID: &str = "ASTRO_ARCHAEOLOGY_CONFIG_INV
 pub const ASTRO_ARCHAEOLOGY_GIT_FAILED: &str = "ASTRO_ARCHAEOLOGY_GIT_FAILED";
 /// Stable failure code for Git output that cannot be interpreted safely.
 pub const ASTRO_ARCHAEOLOGY_OUTPUT_INVALID: &str = "ASTRO_ARCHAEOLOGY_OUTPUT_INVALID";
+/// Stable failure code for a disagreement between an old-side diff range and
+/// the immutable parent tree that range was derived from.
+pub const ASTRO_ARCHAEOLOGY_OBJECT_VIEW_INCONSISTENT: &str =
+    "ASTRO_ARCHAEOLOGY_OBJECT_VIEW_INCONSISTENT";
 
 const REMEDIATION: &str =
     "verify the repository and Git objects, then rerun archaeology with a validated configuration";
+const BLAME_CAT_FILE_BATCH_GROUPS: usize = 4096;
 
 /// Configurable, bounded Git-history policy.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -224,8 +229,24 @@ pub struct GitBlameBatchTelemetry {
     pub requested_ranges: usize,
     /// Exact union ranges after overlapping/adjacent requests are coalesced.
     pub effective_ranges: usize,
+    /// Distinct `(parent, path)` groups submitted to Git blame after the full SZZ
+    /// plan is collected.
+    pub groups: usize,
+    /// Commit-local blame groups served from an already-mined `(parent, path)`
+    /// group instead of spawning their own Git process.
+    pub group_cache_hits: usize,
     /// Native Git blame processes spawned after grouping by `(parent, path)`.
     pub processes: usize,
+    /// Per-request blame processes avoided by cross-commit `(parent, path)`
+    /// grouping.
+    pub processes_avoided: usize,
+    /// `git cat-file --batch-command --buffer -Z` preflight processes spawned for
+    /// exact parent/path existence and type checks.
+    pub cat_file_processes: usize,
+    /// Exact stdout bytes emitted by cat-file preflight.
+    pub cat_file_stdout_bytes: u64,
+    /// Parent/path groups whose preflight proved the blamed path absent.
+    pub path_absent_groups: usize,
     /// Incremental protocol records returned and strictly parsed.
     pub returned_spans: usize,
     /// Distinct `(commit, final-line)` attributions returned to SZZ.
@@ -235,13 +256,22 @@ pub struct GitBlameBatchTelemetry {
     /// Observed wall time. Deliberately excluded from equality because two
     /// byte-identical mining passes need not take the same duration.
     pub wall_ms: u64,
+    /// Observed wall time for cat-file preflight. Deliberately excluded from
+    /// equality.
+    pub cat_file_wall_ms: u64,
 }
 
 impl PartialEq for GitBlameBatchTelemetry {
     fn eq(&self, other: &Self) -> bool {
         self.requested_ranges == other.requested_ranges
             && self.effective_ranges == other.effective_ranges
+            && self.groups == other.groups
+            && self.group_cache_hits == other.group_cache_hits
             && self.processes == other.processes
+            && self.processes_avoided == other.processes_avoided
+            && self.cat_file_processes == other.cat_file_processes
+            && self.cat_file_stdout_bytes == other.cat_file_stdout_bytes
+            && self.path_absent_groups == other.path_absent_groups
             && self.returned_spans == other.returned_spans
             && self.returned_lines == other.returned_lines
             && self.stdout_bytes == other.stdout_bytes
@@ -366,6 +396,25 @@ struct DiffTreeCandidate {
     parent: String,
 }
 
+#[derive(Debug, Clone)]
+struct PendingBlameRequest {
+    fix_commit: String,
+    parent: String,
+    path: String,
+    ranges: Vec<GitLineRange>,
+    observed_at: u64,
+    confidence: f32,
+}
+
+#[derive(Debug, Clone, Default)]
+struct BlamePlanGroup {
+    request_indexes: Vec<usize>,
+    ranges: Vec<GitLineRange>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BlameTargetPreflight;
+
 /// Mines the configured Git history using native argv-only child processes.
 pub fn mine_git_archaeology(
     repo: &Path,
@@ -474,13 +523,17 @@ pub fn mine_git_archaeology(
     let changed_old_ranges_by_commit =
         changed_old_ranges_for_commits(repo, &old_range_candidates, pathspec, &mut diff_tree)?;
     let mut blame = GitBlameBatchTelemetry::default();
+    let mut pending_blame_requests = Vec::new();
     let mut szz = BTreeSet::new();
     let mut reverts = BTreeSet::new();
     let mut skipped_merge_fixes = 0usize;
     let mut skipped_large_commits = 0usize;
     let mut skipped_unresolvable_reverts = 0usize;
     let mut skipped_gitlink_paths = 0usize;
-    let mut skipped_unblamable_paths = 0usize;
+    // A stable old-side diff range must resolve to a blob in the immutable parent
+    // tree. Keep the persisted compatibility counter at zero; any disagreement now
+    // fails closed with ASTRO_ARCHAEOLOGY_OBJECT_VIEW_INCONSISTENT.
+    let skipped_unblamable_paths = 0usize;
     for commit in commits {
         let revert_target = match canonical_revert_target(&commit.message) {
             RevertTarget::Absent => None,
@@ -588,87 +641,17 @@ pub fn mine_git_archaeology(
                 .push(range);
         }
         for (path, requested) in ranges_by_path {
-            let effective = coalesce_blame_ranges(&path, &requested)?;
-            blame.effective_ranges = blame
-                .effective_ranges
-                .checked_add(effective.len())
-                .ok_or_else(|| {
-                    ArchaeologyError::new(
-                        ASTRO_ARCHAEOLOGY_OUTPUT_INVALID,
-                        "Git blame effective-range telemetry overflowed usize",
-                    )
-                })?;
-            let blame_start = std::time::Instant::now();
-            let outcome = blame_ranges(repo, parent, &path, &effective)?;
-            blame.wall_ms = blame
-                .wall_ms
-                .saturating_add(elapsed_u64_ms(blame_start.elapsed()));
-            blame.processes = blame.processes.checked_add(1).ok_or_else(|| {
-                ArchaeologyError::new(
-                    ASTRO_ARCHAEOLOGY_OUTPUT_INVALID,
-                    "Git blame process telemetry overflowed usize",
-                )
-            })?;
-            let blamed = match outcome {
-                BlameOutcome::Blamed {
-                    findings,
-                    returned_spans,
-                    stdout_bytes,
-                } => {
-                    blame.returned_spans = blame
-                        .returned_spans
-                        .checked_add(returned_spans)
-                        .ok_or_else(|| {
-                            ArchaeologyError::new(
-                                ASTRO_ARCHAEOLOGY_OUTPUT_INVALID,
-                                "Git blame returned-span telemetry overflowed usize",
-                            )
-                        })?;
-                    blame.returned_lines = blame
-                        .returned_lines
-                        .checked_add(findings.len())
-                        .ok_or_else(|| {
-                            ArchaeologyError::new(
-                                ASTRO_ARCHAEOLOGY_OUTPUT_INVALID,
-                                "Git blame returned-line telemetry overflowed usize",
-                            )
-                        })?;
-                    blame.stdout_bytes =
-                        blame
-                            .stdout_bytes
-                            .checked_add(stdout_bytes)
-                            .ok_or_else(|| {
-                                ArchaeologyError::new(
-                                    ASTRO_ARCHAEOLOGY_OUTPUT_INVALID,
-                                    "Git blame stdout-byte telemetry overflowed u64",
-                                )
-                            })?;
-                    findings
-                }
-                BlameOutcome::PathAbsent => {
-                    skipped_unblamable_paths = skipped_unblamable_paths
-                        .checked_add(requested.len())
-                        .ok_or_else(|| {
-                            ArchaeologyError::new(
-                                ASTRO_ARCHAEOLOGY_OUTPUT_INVALID,
-                                "Git blame absent-path telemetry overflowed usize",
-                            )
-                        })?;
-                    continue;
-                }
-            };
-            for (blamed_commit, line) in blamed {
-                szz.insert(SzzFinding {
-                    fix_commit: commit.sha.clone(),
-                    blamed_commit,
-                    path: path.clone(),
-                    line,
-                    observed_at: commit.timestamp,
-                    confidence,
-                });
-            }
+            pending_blame_requests.push(PendingBlameRequest {
+                fix_commit: commit.sha.clone(),
+                parent: parent.clone(),
+                path,
+                ranges: requested,
+                observed_at: commit.timestamp,
+                confidence,
+            });
         }
     }
+    execute_grouped_blame_plan(repo, &pending_blame_requests, &mut blame, &mut szz)?;
     if arch_timing {
         eprintln!(
             "astro.arch.timing phase=mine_internal read_commits_ms={read_commits_ms} \
@@ -678,7 +661,10 @@ pub fn mine_git_archaeology(
              diff_ranges_requested_commits={} diff_ranges_processes={} \
              diff_ranges_processes_avoided={} diff_ranges_stdout_bytes={} \
              diff_tree_batch_limit_commits={} \
-             blame_requested_ranges={} blame_effective_ranges={} blame_processes={} \
+             blame_requested_ranges={} blame_effective_ranges={} blame_groups={} \
+             blame_group_cache_hits={} blame_processes={} blame_processes_avoided={} \
+             blame_cat_file_processes={} blame_cat_file_stdout_bytes={} \
+             blame_cat_file_ms={} blame_path_absent_groups={} \
              blame_returned_spans={} blame_returned_lines={} blame_stdout_bytes={} \
              skipped_merge_fixes={skipped_merge_fixes} \
              skipped_large_commits={skipped_large_commits} \
@@ -699,7 +685,14 @@ pub fn mine_git_archaeology(
             diff_tree.batch_limit_commits,
             blame.requested_ranges,
             blame.effective_ranges,
+            blame.groups,
+            blame.group_cache_hits,
             blame.processes,
+            blame.processes_avoided,
+            blame.cat_file_processes,
+            blame.cat_file_stdout_bytes,
+            blame.cat_file_wall_ms,
+            blame.path_absent_groups,
             blame.returned_spans,
             blame.returned_lines,
             blame.stdout_bytes,
@@ -1199,10 +1192,7 @@ fn parse_diff_tree_raw_counts(
         index += 1;
         let mut count = 0usize;
         let next_commit = candidates.get(candidate_index + 1);
-        loop {
-            let Some(token) = tokens.get(index) else {
-                break;
-            };
+        while let Some(token) = tokens.get(index) {
             if next_commit
                 .is_some_and(|next| diff_tree_token_matches_commit(token, next.commit.as_str()))
             {
@@ -1664,18 +1654,11 @@ fn parse_range(raw: &str) -> Result<(u32, u32), ArchaeologyError> {
     Ok((start, count))
 }
 
-/// Outcome of one blame leg (#514): findings, or a counted absent-path skip.
-enum BlameOutcome {
-    Blamed {
-        findings: Vec<(String, u32)>,
-        returned_spans: usize,
-        stdout_bytes: u64,
-    },
-    /// git refused the path with `no such path` at the blamed revision — the
-    /// diff names a path the parent commit does not contain (rename/move
-    /// history, directory↔file swaps). A counted, labeled skip for the caller;
-    /// every OTHER blame failure still fails closed.
-    PathAbsent,
+/// Verified output from one grouped blame leg.
+struct BlameOutcome {
+    findings: Vec<(String, u32)>,
+    returned_spans: usize,
+    stdout_bytes: u64,
 }
 
 fn coalesce_blame_ranges(
@@ -1747,6 +1730,310 @@ fn coalesce_blame_ranges(
         .collect()
 }
 
+fn execute_grouped_blame_plan(
+    repo: &Path,
+    requests: &[PendingBlameRequest],
+    telemetry: &mut GitBlameBatchTelemetry,
+    szz: &mut BTreeSet<SzzFinding>,
+) -> Result<(), ArchaeologyError> {
+    if requests.is_empty() {
+        return Ok(());
+    }
+    let mut groups = BTreeMap::<(String, String), BlamePlanGroup>::new();
+    for (request_index, request) in requests.iter().enumerate() {
+        if request.ranges.is_empty() {
+            return Err(ArchaeologyError::new(
+                ASTRO_ARCHAEOLOGY_OUTPUT_INVALID,
+                format!(
+                    "pending Git blame request for fix commit {} parent {} path {:?} has no ranges",
+                    request.fix_commit, request.parent, request.path
+                ),
+            ));
+        }
+        let group = groups
+            .entry((request.parent.clone(), request.path.clone()))
+            .or_default();
+        group.request_indexes.push(request_index);
+        group.ranges.extend(request.ranges.iter().cloned());
+    }
+    checked_add_usize(
+        &mut telemetry.groups,
+        groups.len(),
+        "Git blame grouped parent/path telemetry overflowed usize",
+    )?;
+    let avoided = requests.len().saturating_sub(groups.len());
+    checked_add_usize(
+        &mut telemetry.group_cache_hits,
+        avoided,
+        "Git blame group-cache-hit telemetry overflowed usize",
+    )?;
+    checked_add_usize(
+        &mut telemetry.processes_avoided,
+        avoided,
+        "Git blame avoided-process telemetry overflowed usize",
+    )?;
+
+    let mut preflight = preflight_blame_targets(repo, &groups, telemetry)?;
+    for ((parent, path), group) in groups {
+        let _preflight = preflight
+            .remove(&(parent.clone(), path.clone()))
+            .ok_or_else(|| {
+                ArchaeologyError::new(
+                    ASTRO_ARCHAEOLOGY_OUTPUT_INVALID,
+                    format!("Git blame preflight omitted parent {parent} path {path:?}"),
+                )
+            })?;
+
+        let effective = coalesce_blame_ranges(&path, &group.ranges)?;
+        checked_add_usize(
+            &mut telemetry.effective_ranges,
+            effective.len(),
+            "Git blame effective-range telemetry overflowed usize",
+        )?;
+        let blame_start = std::time::Instant::now();
+        let outcome = blame_ranges(repo, &parent, &path, &effective)?;
+        telemetry.wall_ms = telemetry
+            .wall_ms
+            .saturating_add(elapsed_u64_ms(blame_start.elapsed()));
+        checked_add_usize(
+            &mut telemetry.processes,
+            1,
+            "Git blame process telemetry overflowed usize",
+        )?;
+        let BlameOutcome {
+            findings,
+            returned_spans,
+            stdout_bytes,
+        } = outcome;
+        checked_add_usize(
+            &mut telemetry.returned_spans,
+            returned_spans,
+            "Git blame returned-span telemetry overflowed usize",
+        )?;
+        checked_add_usize(
+            &mut telemetry.returned_lines,
+            findings.len(),
+            "Git blame returned-line telemetry overflowed usize",
+        )?;
+        checked_add_u64(
+            &mut telemetry.stdout_bytes,
+            stdout_bytes,
+            "Git blame stdout-byte telemetry overflowed u64",
+        )?;
+
+        for request_index in group.request_indexes {
+            let request = &requests[request_index];
+            for (blamed_commit, line) in &findings {
+                if line_is_in_ranges(&request.path, *line, &request.ranges)? {
+                    szz.insert(SzzFinding {
+                        fix_commit: request.fix_commit.clone(),
+                        blamed_commit: blamed_commit.clone(),
+                        path: request.path.clone(),
+                        line: *line,
+                        observed_at: request.observed_at,
+                        confidence: request.confidence,
+                    });
+                }
+            }
+        }
+    }
+    if !preflight.is_empty() {
+        return Err(ArchaeologyError::new(
+            ASTRO_ARCHAEOLOGY_OUTPUT_INVALID,
+            format!(
+                "Git blame preflight returned {} unexpected parent/path records",
+                preflight.len()
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn line_is_in_ranges(
+    path: &str,
+    line: u32,
+    ranges: &[GitLineRange],
+) -> Result<bool, ArchaeologyError> {
+    for range in ranges {
+        if range.path != path || range.start_line == 0 || range.line_count == 0 {
+            return Err(ArchaeologyError::new(
+                ASTRO_ARCHAEOLOGY_OUTPUT_INVALID,
+                format!(
+                    "Git blame fanout range group {path:?} contains invalid range path={:?} start={} count={}",
+                    range.path, range.start_line, range.line_count
+                ),
+            ));
+        }
+        let end = range
+            .start_line
+            .checked_add(range.line_count - 1)
+            .ok_or_else(|| {
+                ArchaeologyError::new(
+                    ASTRO_ARCHAEOLOGY_OUTPUT_INVALID,
+                    format!(
+                        "Git blame fanout range for {path:?} overflows u32: start={} count={}",
+                        range.start_line, range.line_count
+                    ),
+                )
+            })?;
+        if range.start_line <= line && line <= end {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn preflight_blame_targets(
+    repo: &Path,
+    groups: &BTreeMap<(String, String), BlamePlanGroup>,
+    telemetry: &mut GitBlameBatchTelemetry,
+) -> Result<BTreeMap<(String, String), BlameTargetPreflight>, ArchaeologyError> {
+    let mut states = BTreeMap::new();
+    let keys = groups.keys().cloned().collect::<Vec<_>>();
+    for chunk in keys.chunks(BLAME_CAT_FILE_BATCH_GROUPS) {
+        let mut input = Vec::new();
+        for (parent, path) in chunk {
+            validate_oid(parent)?;
+            if path.as_bytes().contains(&0) {
+                return Err(ArchaeologyError::new(
+                    ASTRO_ARCHAEOLOGY_OUTPUT_INVALID,
+                    format!("Git path for blame preflight contains NUL: {path:?}"),
+                ));
+            }
+            input.extend_from_slice(b"info ");
+            input.extend_from_slice(parent.as_bytes());
+            input.push(b':');
+            input.extend_from_slice(path.as_bytes());
+            input.push(0);
+        }
+        input.extend_from_slice(b"flush");
+        input.push(0);
+        let start = std::time::Instant::now();
+        let output = git_with_stdin(
+            repo,
+            &["cat-file", "--batch-command", "--buffer", "-Z"],
+            &input,
+        )?;
+        telemetry.cat_file_wall_ms = telemetry
+            .cat_file_wall_ms
+            .saturating_add(elapsed_u64_ms(start.elapsed()));
+        checked_add_usize(
+            &mut telemetry.cat_file_processes,
+            1,
+            "Git cat-file blame-preflight process telemetry overflowed usize",
+        )?;
+        checked_add_u64(
+            &mut telemetry.cat_file_stdout_bytes,
+            u64::try_from(output.len()).map_err(|_| {
+                ArchaeologyError::new(
+                    ASTRO_ARCHAEOLOGY_OUTPUT_INVALID,
+                    "Git cat-file blame-preflight stdout length cannot be represented as u64",
+                )
+            })?,
+            "Git cat-file blame-preflight stdout-byte telemetry overflowed u64",
+        )?;
+        let mut records = output.split(|byte| *byte == 0).collect::<Vec<_>>();
+        while records.last().is_some_and(|record| record.is_empty()) {
+            records.pop();
+        }
+        if records.len() != chunk.len() {
+            return Err(ArchaeologyError::new(
+                ASTRO_ARCHAEOLOGY_OUTPUT_INVALID,
+                format!(
+                    "Git cat-file blame preflight returned {} records for {} requested parent/path groups",
+                    records.len(),
+                    chunk.len()
+                ),
+            ));
+        }
+        for ((parent, path), record) in chunk.iter().zip(records) {
+            let state = parse_blame_target_preflight_record(parent, path, record)?;
+            if states
+                .insert((parent.clone(), path.clone()), state)
+                .is_some()
+            {
+                return Err(ArchaeologyError::new(
+                    ASTRO_ARCHAEOLOGY_OUTPUT_INVALID,
+                    format!("duplicate Git blame preflight parent/path group {parent}:{path:?}"),
+                ));
+            }
+        }
+    }
+    Ok(states)
+}
+
+fn parse_blame_target_preflight_record(
+    parent: &str,
+    path: &str,
+    record: &[u8],
+) -> Result<BlameTargetPreflight, ArchaeologyError> {
+    let record = std::str::from_utf8(record).map_err(|error| {
+        ArchaeologyError::new(
+            ASTRO_ARCHAEOLOGY_OUTPUT_INVALID,
+            format!("Git cat-file blame preflight output is not UTF-8: {error}"),
+        )
+    })?;
+    if record == format!("{parent}:{path} missing") {
+        return Err(ArchaeologyError::new(
+            ASTRO_ARCHAEOLOGY_OBJECT_VIEW_INCONSISTENT,
+            format!(
+                "Git cat-file could not resolve old-side blame target parent {parent} path {path:?}; the diff and parent-tree object views disagree"
+            ),
+        ));
+    }
+    let mut fields = record.split(' ');
+    let resolved_oid = fields.next().unwrap_or_default();
+    let object_type = fields.next().unwrap_or_default();
+    let size = fields.next().unwrap_or_default();
+    if fields.next().is_some() || !is_oid(resolved_oid) {
+        return Err(ArchaeologyError::new(
+            ASTRO_ARCHAEOLOGY_OUTPUT_INVALID,
+            format!(
+                "Git cat-file blame preflight returned malformed output for parent {parent} path {path:?}: {record:?}"
+            ),
+        ));
+    }
+    if object_type != "blob" {
+        return Err(ArchaeologyError::new(
+            ASTRO_ARCHAEOLOGY_OBJECT_VIEW_INCONSISTENT,
+            format!(
+                "Git old-side blame target parent {parent} path {path:?} resolved to object {resolved_oid} of type {object_type:?}, not a blob"
+            ),
+        ));
+    }
+    size.parse::<u64>().map_err(|error| {
+        ArchaeologyError::new(
+            ASTRO_ARCHAEOLOGY_OUTPUT_INVALID,
+            format!(
+                "Git cat-file blame preflight returned invalid blob size for parent {parent} path {path:?}: {size:?}: {error}"
+            ),
+        )
+    })?;
+    Ok(BlameTargetPreflight)
+}
+
+fn checked_add_usize(
+    slot: &mut usize,
+    value: usize,
+    message: &'static str,
+) -> Result<(), ArchaeologyError> {
+    *slot = slot
+        .checked_add(value)
+        .ok_or_else(|| ArchaeologyError::new(ASTRO_ARCHAEOLOGY_OUTPUT_INVALID, message))?;
+    Ok(())
+}
+
+fn checked_add_u64(
+    slot: &mut u64,
+    value: u64,
+    message: &'static str,
+) -> Result<(), ArchaeologyError> {
+    *slot = slot
+        .checked_add(value)
+        .ok_or_else(|| ArchaeologyError::new(ASTRO_ARCHAEOLOGY_OUTPUT_INVALID, message))?;
+    Ok(())
+}
+
 fn blame_ranges(
     repo: &Path,
     parent: &str,
@@ -1781,11 +2068,14 @@ fn blame_ranges(
         .output()
         .map_err(|error| git_spawn_error(&args, error))?;
     if !raw.status.success() {
-        // Narrow containment (#514): `fatal: no such path <p> in <rev>` is the
-        // one blame refusal that means "this path does not exist at the blamed
-        // revision" — reality, not a fault. Everything else stays fail-closed.
         if String::from_utf8_lossy(&raw.stderr).contains("no such path") {
-            return Ok(BlameOutcome::PathAbsent);
+            return Err(ArchaeologyError::new(
+                ASTRO_ARCHAEOLOGY_OBJECT_VIEW_INCONSISTENT,
+                format!(
+                    "Git cat-file proved old-side target parent {parent} path {path:?} is a blob, but grouped blame could not resolve the same target: {}",
+                    String::from_utf8_lossy(&raw.stderr).trim()
+                ),
+            ));
         }
         return Err(git_exit_error(&args, raw.status.code(), &raw.stderr));
     }
@@ -1914,7 +2204,7 @@ fn blame_ranges(
             format!("Git incremental blame returned no entries for non-empty ranges on {path:?}"),
         ));
     }
-    Ok(BlameOutcome::Blamed {
+    Ok(BlameOutcome {
         findings: findings.into_iter().collect(),
         returned_spans,
         stdout_bytes,

@@ -26,7 +26,8 @@ enum {
      * failure path. */
     PL_ERROR_PATH = 131072,
     PL_ERROR_MESSAGE = 512,
-    PL_ERROR_REMEDIATION = 512
+    PL_ERROR_REMEDIATION = 512,
+    PL_PARALLEL_DISPATCH_CAPACITY = 64
 };
 #include "pipeline/pipeline.h"
 #include "pipeline/artifact.h"
@@ -52,6 +53,8 @@ enum {
 #include "foundation/mem.h"
 #include "foundation/sha256.h"
 #include "foundation/schema_version.h"
+#include "foundation/slab_alloc.h"
+#include "helpers.h"
 
 #include <stdint.h>
 #include <errno.h>
@@ -292,7 +295,41 @@ int cbm_pipeline_unique_stage_path(const char *db_path, const char *kind, char *
     }
     int written = snprintf(path, capacity, "%s.%s-stage-%lu-%016llx-%ld", db_path, kind,
                            cbm_proc_current_pid(), (unsigned long long)counter, (long)generation);
-    if (written <= 0 || (size_t)written >= capacity || cbm_path_exists(path)) {
+    /* Merge resolution: origin/main split this into a representation check plus a
+     * classified path probe, which is strictly better than the old single
+     * `written <= 0 || >= capacity || cbm_path_exists(path)` test -- truncation, an
+     * unreadable path, and a real collision are three different faults and now
+     * report as three different codes. That structure is kept.
+     *
+     * Its primitives are not: GetCurrentProcessId() is Win32, and counter.QuadPart
+     * dereferences a LARGE_INTEGER that does not exist here (this branch derives
+     * `counter` as a uint64_t via cbm_proc_monotonic_ticks). Both use the portable
+     * spellings already present a few lines above, and the hardcoded "win32" native
+     * error kind becomes cbm_proc_native_error_kind(). cbm_path_probe itself is
+     * portable -- compat_fs.c carries a POSIX implementation beside the Windows one. */
+    if (written <= 0 || (size_t)written >= capacity) {
+        cbm_log_error("pipeline.stage_identity_failed", "code",
+                      "CBM_PIPELINE_STAGE_PATH_REPRESENTATION_FAILED", "path", path, "message",
+                      "the generated staging identity could not be represented exactly",
+                      "remediation", "shorten the configured store path and retry indexing");
+        free(path);
+        return CBM_NOT_FOUND;
+    }
+    unsigned long probe_error = 0;
+    cbm_path_probe_result_t probe = cbm_path_probe(path, &probe_error);
+    if (probe == CBM_PATH_PROBE_ERROR) {
+        char native_error[32];
+        (void)snprintf(native_error, sizeof(native_error), "%lu", probe_error);
+        cbm_log_error("pipeline.stage_identity_failed", "code",
+                      "CBM_PIPELINE_STAGE_IDENTITY_PROBE_FAILED", "path", path,
+                      "native_error_kind", cbm_proc_native_error_kind(), "native_error",
+                      native_error, "message",
+                      "the generated staging identity could not be classified", "remediation",
+                      "resolve the reported path probe failure and retry indexing");
+        free(path);
+        return CBM_NOT_FOUND;
+    }
+    if (probe == CBM_PATH_PROBE_PRESENT) {
         cbm_log_error("pipeline.stage_identity_failed", "code",
                       "CBM_PIPELINE_STAGE_IDENTITY_COLLISION", "path", path, "message",
                       "the generated staging identity is not absent", "remediation",
@@ -369,16 +406,15 @@ struct cbm_pipeline {
      * buffer before it is freed so the tool result can disclose the loss. */
     uint_least64_t ambiguous_reference_skips;
 
-    /* Count of ERROR/MISSING parse-recovery diagnostics recorded across every
-     * extracted file (#909). Nonzero means tree-sitter could not fully parse
-     * some source, so symbols in the named spans are absent from the graph.
-     * Surfaced so a degraded index can never be mistaken for a clean one. */
-    uint_least64_t parse_recovery_diagnostics;
-
     /* Reference edges skipped because an extracted non-empty enclosing
      * callable QN had no exact stable source atom. Kept separate from semantic
      * ambiguity so the success response identifies the actual degradation. */
     uint_least64_t unresolved_reference_source_skips;
+
+    /* Recoverable tree-sitter parse diagnostics persisted as ParseDiagnostic
+     * graph rows. A clean run reports zero; a recovered parse reports the
+     * exact number of diagnostic rows collected from real source trees. */
+    uint_least64_t parse_recovery_diagnostics;
 
     /* Retained successful-run phase telemetry. Fixed storage makes telemetry
      * collection allocation-free after pipeline creation and prevents clean
@@ -386,6 +422,12 @@ struct cbm_pipeline {
     cbm_pipeline_phase_metric_t phase_metrics[PL_PHASE_METRIC_CAPACITY];
     size_t phase_metric_count;
     bool phase_metrics_complete;
+
+    /* Retained worker-dispatch admission diagnostics. Clean CLI runs suppress
+     * info-level logs, so successful responses carry this source of truth. */
+    cbm_pipeline_parallel_dispatch_t parallel_dispatches[PL_PARALLEL_DISPATCH_CAPACITY];
+    size_t parallel_dispatch_count;
+    bool parallel_dispatches_complete;
 
     /* ADR (project_summaries) captured before a full-reindex DB delete, so it
      * can be restored after the rebuild. NULL when no ADR existed. Issue #516. */
@@ -586,6 +628,48 @@ void cbm_pipeline_phase_probe_end(cbm_pipeline_t *p, const char *phase,
                  u64_buf(metric->end_peak_private_bytes));
 }
 
+static void copy_parallel_dispatch_field(char *dst, size_t dst_size, const char *src) {
+    if (!dst || dst_size == 0) {
+        return;
+    }
+    (void)snprintf(dst, dst_size, "%s", src ? src : "");
+}
+
+void cbm_pipeline_record_parallel_dispatch(cbm_pipeline_t *p, const char *operation,
+                                           const char *mode, const char *code, int item_count,
+                                           int requested_workers, int admitted_workers,
+                                           int created_workers, int failed_worker_index,
+                                           int error_domain, unsigned long error_code) {
+    if (!p) {
+        return;
+    }
+    if (p->parallel_dispatch_count >= PL_PARALLEL_DISPATCH_CAPACITY) {
+        p->parallel_dispatches_complete = false;
+        cbm_log_error(
+            "pipeline.parallel_dispatch_telemetry_failed", "code",
+            "CBM_PIPELINE_PARALLEL_DISPATCH_CAPACITY_EXCEEDED", "operation",
+            operation ? operation : "parallel", "message",
+            "the finite parallel-dispatch topology exceeded its retained result representation",
+            "remediation",
+            "update the parallel-dispatch representation together with the added dispatch site");
+        return;
+    }
+    cbm_pipeline_parallel_dispatch_t *dispatch =
+        &p->parallel_dispatches[p->parallel_dispatch_count++];
+    copy_parallel_dispatch_field(dispatch->operation, sizeof(dispatch->operation),
+                                 operation ? operation : "parallel");
+    copy_parallel_dispatch_field(dispatch->mode, sizeof(dispatch->mode),
+                                 mode ? mode : "unknown");
+    copy_parallel_dispatch_field(dispatch->code, sizeof(dispatch->code), code ? code : "");
+    dispatch->item_count = item_count;
+    dispatch->requested_workers = requested_workers;
+    dispatch->admitted_workers = admitted_workers;
+    dispatch->created_workers = created_workers;
+    dispatch->failed_worker_index = failed_worker_index;
+    dispatch->error_domain = error_domain;
+    dispatch->error_code = error_code;
+}
+
 /* Log current + peak RSS at a pipeline phase boundary (memory profiling). */
 static void log_phase_mem(const char *phase) {
     enum { PL_BYTES_PER_MB = 1024 * 1024 };
@@ -636,8 +720,10 @@ cbm_pipeline_t *cbm_pipeline_new(const char *repo_path, const char *db_path,
     p->committed_nodes = -1;
     p->committed_edges = -1;
     p->ambiguous_reference_skips = 0;
-    p->parse_recovery_diagnostics = 0;
     p->unresolved_reference_source_skips = 0;
+    p->parse_recovery_diagnostics = 0;
+    p->phase_metrics_complete = true;
+    p->parallel_dispatches_complete = true;
     atomic_init(&p->cancelled, 0);
 
     return p;
@@ -883,6 +969,20 @@ void cbm_pipeline_get_phase_metrics(const cbm_pipeline_t *p,
     }
 }
 
+void cbm_pipeline_get_parallel_dispatches(const cbm_pipeline_t *p,
+                                          const cbm_pipeline_parallel_dispatch_t **out,
+                                          size_t *count, bool *complete) {
+    if (out) {
+        *out = p ? p->parallel_dispatches : NULL;
+    }
+    if (count) {
+        *count = p ? p->parallel_dispatch_count : 0;
+    }
+    if (complete) {
+        *complete = p && p->parallel_dispatches_complete;
+    }
+}
+
 bool cbm_pipeline_get_fatal_error(const cbm_pipeline_t *p, cbm_pipeline_error_t *out) {
     if (out) {
         memset(out, 0, sizeof(*out));
@@ -1059,16 +1159,6 @@ uint_least64_t cbm_pipeline_get_ambiguous_reference_skips(const cbm_pipeline_t *
     return p ? p->ambiguous_reference_skips : 0;
 }
 
-void cbm_pipeline_set_parse_recovery_diagnostics(cbm_pipeline_t *p, uint_least64_t diagnostics) {
-    if (p) {
-        p->parse_recovery_diagnostics = diagnostics;
-    }
-}
-
-uint_least64_t cbm_pipeline_get_parse_recovery_diagnostics(const cbm_pipeline_t *p) {
-    return p ? p->parse_recovery_diagnostics : 0;
-}
-
 void cbm_pipeline_set_unresolved_reference_source_skips(cbm_pipeline_t *p, uint_least64_t skips) {
     if (p) {
         p->unresolved_reference_source_skips = skips;
@@ -1077,6 +1167,16 @@ void cbm_pipeline_set_unresolved_reference_source_skips(cbm_pipeline_t *p, uint_
 
 uint_least64_t cbm_pipeline_get_unresolved_reference_source_skips(const cbm_pipeline_t *p) {
     return p ? p->unresolved_reference_source_skips : 0;
+}
+
+void cbm_pipeline_add_parse_recovery_diagnostics(cbm_pipeline_t *p, uint_least64_t count) {
+    if (p) {
+        p->parse_recovery_diagnostics += count;
+    }
+}
+
+uint_least64_t cbm_pipeline_get_parse_recovery_diagnostics(const cbm_pipeline_t *p) {
+    return p ? p->parse_recovery_diagnostics : 0;
 }
 
 const cbm_gbuf_node_t *cbm_pipeline_find_reference_source(
@@ -1240,6 +1340,21 @@ int cbm_pipeline_complete_row_sink(cbm_pipeline_t *p, size_t file_hash_count) {
 
 static int effective_worker_count(bool initial) {
     return cbm_default_worker_count(initial);
+}
+
+static int reject_invalid_worker_count(cbm_pipeline_t *p, const char *phase, int worker_count) {
+    const char *raw_workers = getenv("CBM_WORKERS");
+    const char *code = raw_workers ? "CBM_WORKERS_INVALID" : "CBM_WORKER_COUNT_INVALID";
+    cbm_log_error("pipeline.worker_count_invalid", "code", code, "phase",
+                  phase ? phase : "unknown", "worker_count", itoa_buf(worker_count), "message",
+                  "worker-count configuration is invalid", "remediation",
+                  "set CBM_WORKERS to an integer from 1 through 256 or remove it");
+    cbm_pipeline_record_fatal_error(
+        p, code, "admit_worker_count", phase ? phase : "worker_config", p ? p->repo_path : NULL, 0,
+        raw_workers ? "CBM_WORKERS is present but is not an exact integer from 1 through 256"
+                    : "worker-count auto-detection produced no admissible worker",
+        "set CBM_WORKERS to an integer from 1 through 256 or remove it to use auto-detection");
+    return CBM_NOT_FOUND;
 }
 
 /* Resolve the DB path for this pipeline. Caller must free(). */
@@ -2254,6 +2369,49 @@ static int record_path_probe_failure(cbm_pipeline_t *p, const char *event, const
     return CBM_NOT_FOUND;
 }
 
+static int pipeline_close_store(cbm_pipeline_t *p, cbm_store_t **store,
+                                const char *operation, const char *phase,
+                                const char *fallback_path) {
+    cbm_store_close_result_t result;
+    cbm_store_close_status_t status = cbm_store_close(store, &result);
+    if (status == CBM_STORE_CLOSE_OK) {
+        return 0;
+    }
+
+    char status_text[32];
+    char sqlite_error_text[32];
+    char outstanding_text[32];
+    (void)snprintf(status_text, sizeof(status_text), "%d", (int)status);
+    (void)snprintf(sqlite_error_text, sizeof(sqlite_error_text), "%d",
+                   result.sqlite_close_code);
+    (void)snprintf(outstanding_text, sizeof(outstanding_text), "%llu",
+                   (unsigned long long)result.outstanding_statement_count);
+    const char *path = result.db_path[0] ? result.db_path : fallback_path;
+    cbm_log_error(
+        "pipeline.store_close_failed", "code", "CBM_PIPELINE_STORE_CLOSE_FAILED",
+        "operation", operation, "phase", phase, "store_path", path ? path : "",
+        "close_status", status_text, "sqlite_error", sqlite_error_text,
+        "connection_destroyed", result.connection_destroyed ? "true" : "false",
+        "outstanding_statements", outstanding_text, "first_sql_sha256",
+        result.first_outstanding_sql_sha256, "first_sql", result.first_outstanding_sql,
+        "remediation",
+        "preserve the exact store owner and complete the reported SQLite resource before "
+        "retrying the generation");
+    cbm_pipeline_record_fatal_error(
+        p, "CBM_PIPELINE_STORE_CLOSE_FAILED", operation, phase, path ? path : "", 0,
+        "the pipeline store connection was not closed through the exact physical-close contract",
+        "preserve the exact store owner and complete the reported SQLite resource before "
+        "retrying the generation");
+    if (!result.connection_destroyed || (store && *store)) {
+        /* The pipeline API has no durable store-owner result channel. Returning
+         * would drop this stack-local pointer while SQLite still owns the
+         * connection, contradicting the preservation diagnostic above. */
+        fflush(NULL);
+        abort();
+    }
+    return CBM_NOT_FOUND;
+}
+
 /* Before paying for a complete mirrored source generation, prove whether the
  * current repository is byte-identical to the persisted generation. This path
  * is intentionally available only when no complete-row sink is registered:
@@ -2312,14 +2470,16 @@ static int try_unchanged_before_snapshot(cbm_pipeline_t *p, const cbm_discover_o
             "unchanged_route", db_path, 0, detail,
             "preserve the complete store family, repair the exact diagnostic, and retry");
         if (store) {
-            cbm_store_close(store);
+            (void)pipeline_close_store(p, &store, "close_unverified_unchanged_store",
+                                       "unchanged_route", db_path);
         }
         free(db_path);
         return CBM_NOT_FOUND;
     }
     if (validate_existing_store_project_identity(p, store, db_path) != 0 ||
         preserve_existing_adr(p, store, db_path) != 0) {
-        cbm_store_close(store);
+        (void)pipeline_close_store(p, &store, "close_rejected_unchanged_store",
+                                   "unchanged_route", db_path);
         free(db_path);
         return CBM_NOT_FOUND;
     }
@@ -2329,7 +2489,8 @@ static int try_unchanged_before_snapshot(cbm_pipeline_t *p, const cbm_discover_o
             "unchanged_route", db_path, 0,
             "verified unchanged routing did not retain the live database SHA-256",
             "preserve the store family and inspect the verifier before retrying");
-        cbm_store_close(store);
+        (void)pipeline_close_store(p, &store, "close_digestless_unchanged_store",
+                                   "unchanged_route", db_path);
         free(db_path);
         return CBM_NOT_FOUND;
     }
@@ -2345,13 +2506,18 @@ static int try_unchanged_before_snapshot(cbm_pipeline_t *p, const cbm_discover_o
                                 : "the complete persisted file identity set could not be read",
             "preserve the store, repair the exact SQLite diagnostic, and retry");
         cbm_store_free_file_hashes(hashes, hash_count);
-        cbm_store_close(store);
+        (void)pipeline_close_store(p, &store, "close_failed_hash_read_store",
+                                   "unchanged_route", db_path);
         free(db_path);
         return CBM_NOT_FOUND;
     }
     if (hash_count <= 0 || file_count != hash_count) {
         cbm_store_free_file_hashes(hashes, hash_count);
-        cbm_store_close(store);
+        if (pipeline_close_store(p, &store, "close_changed_file_set_store",
+                                 "unchanged_route", db_path) != 0) {
+            free(db_path);
+            return CBM_NOT_FOUND;
+        }
         free(db_path);
         return PL_ROUTE_FULL;
     }
@@ -2364,12 +2530,17 @@ static int try_unchanged_before_snapshot(cbm_pipeline_t *p, const cbm_discover_o
     cbm_pipeline_phase_probe_end(p, "unchanged_source_verify", &verify_probe);
     cbm_store_free_file_hashes(hashes, hash_count);
     if (source_status != 0) {
-        cbm_store_close(store);
+        (void)pipeline_close_store(p, &store, "close_source_verify_failed_store",
+                                   "unchanged_route", db_path);
         free(db_path);
         return CBM_NOT_FOUND;
     }
     if (!unchanged) {
-        cbm_store_close(store);
+        if (pipeline_close_store(p, &store, "close_changed_source_store",
+                                 "unchanged_route", db_path) != 0) {
+            free(db_path);
+            return CBM_NOT_FOUND;
+        }
         free(db_path);
         return PL_ROUTE_FULL;
     }
@@ -2385,11 +2556,16 @@ static int try_unchanged_before_snapshot(cbm_pipeline_t *p, const cbm_discover_o
             "unchanged_route", db_path, 0,
             detail && detail[0] ? detail : "the exact persisted graph counts could not be read",
             "preserve the store, repair the exact SQLite diagnostic, and retry");
-        cbm_store_close(store);
+        (void)pipeline_close_store(p, &store, "close_failed_count_read_store",
+                                   "unchanged_route", db_path);
         free(db_path);
         return CBM_NOT_FOUND;
     }
-    cbm_store_close(store);
+    if (pipeline_close_store(p, &store, "close_unchanged_store", "unchanged_route", db_path) !=
+        0) {
+        free(db_path);
+        return CBM_NOT_FOUND;
+    }
 
     p->routed_store_present = true;
     p->routed_store_bytes = verification.db_bytes;
@@ -2501,13 +2677,15 @@ static int try_incremental_or_delete_db(cbm_pipeline_t *p, cbm_file_info_t *file
             "preserve the complete store family and explicitly archive, repair, or delete it "
             "before rebinding");
         if (identity_store) {
-            cbm_store_close(identity_store);
+            (void)pipeline_close_store(p, &identity_store, "close_unverified_route_store",
+                                       "route", db_path);
         }
         free(db_path);
         return CBM_NOT_FOUND;
     }
     if (validate_existing_store_project_identity(p, identity_store, db_path) != 0) {
-        cbm_store_close(identity_store);
+        (void)pipeline_close_store(p, &identity_store, "close_rejected_route_store", "route",
+                                   db_path);
         free(db_path);
         return CBM_NOT_FOUND;
     }
@@ -2522,7 +2700,8 @@ static int try_incremental_or_delete_db(cbm_pipeline_t *p, cbm_file_info_t *file
             p, "CBM_PIPELINE_STORE_IDENTITY_DIGEST_MISSING", "verify_existing_store_project",
             "route", db_path, 0, "verified routing did not retain the live database SHA-256",
             "preserve the complete store family and inspect the verifier before retrying");
-        cbm_store_close(identity_store);
+        (void)pipeline_close_store(p, &identity_store, "close_digestless_route_store", "route",
+                                   db_path);
         free(db_path);
         return CBM_NOT_FOUND;
     }
@@ -2545,18 +2724,24 @@ static int try_incremental_or_delete_db(cbm_pipeline_t *p, cbm_file_info_t *file
                 "route", db_path, 0,
                 "the verified live store has an active WAL or shared-memory sidecar",
                 "finish the active writer, preserve the complete store family, and retry");
-            cbm_store_close(identity_store);
+            (void)pipeline_close_store(p, &identity_store, "close_sidecar_route_store", "route",
+                                       db_path);
             free(db_path);
             return CBM_NOT_FOUND;
         }
     }
     if (preserve_existing_adr(p, identity_store, db_path) != 0) {
-        cbm_store_close(identity_store);
+        (void)pipeline_close_store(p, &identity_store, "close_adr_read_failed_route_store",
+                                   "route", db_path);
         free(db_path);
         return CBM_NOT_FOUND;
     }
     if (p->mode == CBM_MODE_FULL) {
-        cbm_store_close(identity_store);
+        if (pipeline_close_store(p, &identity_store, "close_explicit_full_route_store", "route",
+                                 db_path) != 0) {
+            free(db_path);
+            return CBM_NOT_FOUND;
+        }
         cbm_log_info("pipeline.route", "path", "full", "reason", "explicit_full_mode",
                      "live_store_mutated", "false");
         cbm_log_info("pipeline.route", "path", "reindex", "action", "build_atomic_replacement");
@@ -2581,7 +2766,8 @@ static int try_incremental_or_delete_db(cbm_pipeline_t *p, cbm_file_info_t *file
                                 : "the complete incremental identity set could not be read",
             "preserve the store, inspect the SQLite diagnostic, and retry");
         cbm_store_free_file_hashes(hashes, hash_count);
-        cbm_store_close(identity_store);
+        (void)pipeline_close_store(p, &identity_store, "close_hash_read_failed_route_store",
+                                   "route", db_path);
         free(db_path);
         return CBM_NOT_FOUND;
     }
@@ -2604,7 +2790,11 @@ static int try_incremental_or_delete_db(cbm_pipeline_t *p, cbm_file_info_t *file
         }
     }
     cbm_store_free_file_hashes(hashes, hash_count);
-    cbm_store_close(identity_store);
+    if (pipeline_close_store(p, &identity_store, "close_full_rebuild_route_store", "route",
+                             db_path) != 0) {
+        free(db_path);
+        return CBM_NOT_FOUND;
+    }
     if (hash_count > 0) {
         cbm_log_info("pipeline.route", "path", "mode_change_reindex", "stored_hashes",
                      itoa_buf(hash_count), "discovered", itoa_buf(file_count));
@@ -2615,8 +2805,36 @@ static int try_incremental_or_delete_db(cbm_pipeline_t *p, cbm_file_info_t *file
 }
 
 static int remove_optional_pipeline_file(const char *path, const char *code) {
-    if (cbm_unlink(path) == 0 || errno == ENOENT) {
+    unsigned long before_error = 0;
+    cbm_path_probe_result_t before = cbm_path_probe(path, &before_error);
+    if (before == CBM_PATH_PROBE_ABSENT) {
         return 0;
+    }
+    if (before == CBM_PATH_PROBE_ERROR) {
+        char native_error[32];
+        (void)snprintf(native_error, sizeof(native_error), "%lu", before_error);
+        cbm_log_error("pipeline.persist_failed", "code", code, "path", path,
+                      "native_error_kind", "win32", "native_error", native_error, "message",
+                      "a transaction-owned SQLite path could not be classified before removal",
+                      "remediation", "preserve the path, resolve the native probe error, and retry");
+        return CBM_NOT_FOUND;
+    }
+    errno = 0;
+    if (cbm_unlink(path) == 0) {
+        unsigned long after_error = 0;
+        cbm_path_probe_result_t after = cbm_path_probe(path, &after_error);
+        if (after == CBM_PATH_PROBE_ABSENT) {
+            return 0;
+        }
+        char native_error[32];
+        (void)snprintf(native_error, sizeof(native_error), "%lu", after_error);
+        cbm_log_error("pipeline.persist_failed", "code", code, "path", path,
+                      "native_error_kind", "win32", "native_error", native_error, "message",
+                      after == CBM_PATH_PROBE_PRESENT
+                          ? "a removed transaction-owned SQLite path remained present on readback"
+                          : "transaction-owned SQLite path absence could not be proven after removal",
+                      "remediation", "preserve the remaining namespace state and retry only after inspection");
+        return CBM_NOT_FOUND;
     }
     cbm_log_error("pipeline.persist_failed", "code", code, "path", path, "message",
                   "a stale or sidecar file could not be removed", "remediation",
@@ -2624,8 +2842,9 @@ static int remove_optional_pipeline_file(const char *path, const char *code) {
     return CBM_NOT_FOUND;
 }
 
-static int verify_live_store_before_publication(cbm_pipeline_t *p, const char *db_path,
-                                                const char *live_wal, const char *live_shm) {
+int cbm_pipeline_verify_live_store_before_publication(cbm_pipeline_t *p, const char *db_path,
+                                                      const char *live_wal,
+                                                      const char *live_shm) {
     unsigned long wal_probe_error = 0;
     cbm_path_probe_result_t wal_probe = cbm_path_probe(live_wal, &wal_probe_error);
     if (wal_probe == CBM_PATH_PROBE_ERROR) {
@@ -2645,18 +2864,23 @@ static int verify_live_store_before_publication(cbm_pipeline_t *p, const char *d
             "preserve the complete store family, correct the reported native path error, and retry");
     }
     if (wal_probe == CBM_PATH_PROBE_PRESENT || shm_probe == CBM_PATH_PROBE_PRESENT) {
-        cbm_log_error("pipeline.persist_failed", "code", "CBM_PIPELINE_LIVE_WAL_PRESENT",
+        cbm_log_error("pipeline.persist_failed", "code",
+                      "CBM_PIPELINE_LIVE_STORE_SIDECAR_APPEARED",
                       "operation", "verify_live_store_before_publication", "path", db_path,
                       "wal_present",
                       wal_probe == CBM_PATH_PROBE_PRESENT ? "true" : "false", "shm_present",
                       shm_probe == CBM_PATH_PROBE_PRESENT ? "true" : "false",
                       "publication_started", "false", "message",
-                      "the live store acquired a WAL or shared-memory sidecar before swap",
-                      "remediation", "finish the concurrent writer and retry indexing");
+                      "the live store acquired a WAL or shared-memory sidecar after normalization",
+                      "remediation",
+                      "preserve the complete family, identify the later SQLite owner, and retry "
+                      "only after a fresh quiescent normalization");
         cbm_pipeline_record_fatal_error(
-            p, "CBM_PIPELINE_LIVE_WAL_PRESENT", "verify_live_store_before_publication", "persist",
-            db_path, 0, "the live store acquired a WAL or shared-memory sidecar before swap",
-            "finish the concurrent writer and retry indexing");
+            p, "CBM_PIPELINE_LIVE_STORE_SIDECAR_APPEARED",
+            "verify_live_store_before_publication", "persist", db_path, 0,
+            "the live store acquired a WAL or shared-memory sidecar after normalization",
+            "preserve the complete family, identify the later SQLite owner, and retry only after "
+            "a fresh quiescent normalization");
         return CBM_NOT_FOUND;
     }
 
@@ -2700,11 +2924,10 @@ static int verify_live_store_before_publication(cbm_pipeline_t *p, const char *d
         return CBM_NOT_FOUND;
     }
 
-    cbm_store_t *live_store = NULL;
     cbm_store_verify_result_t verification = {0};
-    cbm_store_verify_status_t status = cbm_store_open_path_project_query_verified(
-        db_path, p->project_name, &live_store, &verification);
-    if (status != CBM_STORE_VERIFY_OK || !live_store) {
+    cbm_store_verify_status_t status =
+        cbm_store_verify_path_project_snapshot(db_path, p->project_name, &verification);
+    if (status != CBM_STORE_VERIFY_OK) {
         char native_error[32];
         char sqlite_error[32];
         (void)snprintf(native_error, sizeof(native_error), "%lu",
@@ -2730,30 +2953,27 @@ static int verify_live_store_before_publication(cbm_pipeline_t *p, const char *d
             "persist", db_path, 0,
             verification.detail[0] ? verification.detail : "the live store could not be reverified",
             "preserve the complete live family, resolve the reported conflict, and retry");
-        if (live_store) {
-            cbm_store_close(live_store);
-        }
-        return CBM_NOT_FOUND;
-    }
-
-    int identity_rc = validate_existing_store_project_identity(p, live_store, db_path);
-    cbm_store_close(live_store);
-    if (identity_rc != 0) {
         return CBM_NOT_FOUND;
     }
     if (verification.wal_present || verification.shm_present) {
-        cbm_log_error("pipeline.persist_failed", "code", "CBM_PIPELINE_LIVE_WAL_PRESENT",
+        cbm_log_error("pipeline.persist_failed", "code",
+                      "CBM_PIPELINE_LIVE_STORE_SIDECAR_APPEARED",
                       "operation", "verify_live_store_before_publication", "path", db_path,
                       "wal_present", verification.wal_present ? "true" : "false", "shm_present",
                       verification.shm_present ? "true" : "false", "publication_started", "false",
                       "message",
-                      "the verified live store acquired a WAL or shared-memory sidecar before swap",
-                      "remediation", "finish the concurrent writer and retry indexing");
+                      "the frozen live-store verification observed a WAL or shared-memory "
+                      "sidecar after normalization",
+                      "remediation",
+                      "preserve the complete family, identify the later SQLite owner, and retry "
+                      "only after a fresh quiescent normalization");
         cbm_pipeline_record_fatal_error(
-            p, "CBM_PIPELINE_LIVE_WAL_PRESENT", "verify_live_store_before_publication", "persist",
-            db_path, 0,
-            "the verified live store acquired a WAL or shared-memory sidecar before swap",
-            "finish the concurrent writer and retry indexing");
+            p, "CBM_PIPELINE_LIVE_STORE_SIDECAR_APPEARED",
+            "verify_live_store_before_publication", "persist", db_path, 0,
+            "the frozen live-store verification observed a WAL or shared-memory sidecar after "
+            "normalization",
+            "preserve the complete family, identify the later SQLite owner, and retry only after "
+            "a fresh quiescent normalization");
         return CBM_NOT_FOUND;
     }
     if (verification.db_bytes != p->routed_store_bytes ||
@@ -2838,7 +3058,31 @@ static int dump_and_persist_hashes(cbm_pipeline_t *p, const cbm_file_info_t *fil
     }
     snprintf(stage_wal, stage_len + 5, "%s-wal", stage);
     snprintf(stage_shm, stage_len + 5, "%s-shm", stage);
-    if (cbm_path_exists(stage_wal) || cbm_path_exists(stage_shm)) {
+    unsigned long stage_wal_probe_error = 0;
+    unsigned long stage_shm_probe_error = 0;
+    cbm_path_probe_result_t stage_wal_probe =
+        cbm_path_probe(stage_wal, &stage_wal_probe_error);
+    cbm_path_probe_result_t stage_shm_probe =
+        cbm_path_probe(stage_shm, &stage_shm_probe_error);
+    if (stage_wal_probe == CBM_PATH_PROBE_ERROR ||
+        stage_shm_probe == CBM_PATH_PROBE_ERROR) {
+        const char *failed_path = stage_wal_probe == CBM_PATH_PROBE_ERROR ? stage_wal : stage_shm;
+        unsigned long native_error = stage_wal_probe == CBM_PATH_PROBE_ERROR
+                                         ? stage_wal_probe_error
+                                         : stage_shm_probe_error;
+        (void)record_path_probe_failure(
+            p, "pipeline.persist_failed", "CBM_PIPELINE_STAGE_SIDECAR_PROBE_FAILED",
+            "probe_generated_stage_sidecars", "persist", failed_path, native_error,
+            "a generated stage sidecar path could not be classified",
+            "preserve the path, resolve the native probe error, and retry indexing");
+        free(stage);
+        free(stage_wal);
+        free(stage_shm);
+        free(db_path);
+        return CBM_NOT_FOUND;
+    }
+    if (stage_wal_probe == CBM_PATH_PROBE_PRESENT ||
+        stage_shm_probe == CBM_PATH_PROBE_PRESENT) {
         cbm_log_error("pipeline.persist_failed", "code", "CBM_PIPELINE_STAGE_SIDECAR_COLLISION",
                       "path", stage, "message",
                       "a generated transaction-owned stage sidecar already exists", "remediation",
@@ -2965,10 +3209,13 @@ static int dump_and_persist_hashes(cbm_pipeline_t *p, const cbm_file_info_t *fil
 
         cbm_pipeline_phase_probe_t checkpoint_probe =
             cbm_pipeline_phase_probe_start(p, "persist_checkpoint");
-        if (final_rc == 0 &&
-            (cbm_store_checkpoint(hash_store) != CBM_STORE_OK ||
-             cbm_store_exec(hash_store, "PRAGMA journal_mode=DELETE;") != CBM_STORE_OK)) {
-            final_rc = CBM_NOT_FOUND;
+        if (final_rc == 0) {
+            cbm_store_normalize_result_t normalization;
+            if (cbm_store_exec(hash_store, "PRAGMA optimize;") != CBM_STORE_OK ||
+                cbm_store_normalize_journal_mode_delete(hash_store, &normalization) !=
+                    CBM_STORE_NORMALIZE_OK) {
+                final_rc = CBM_NOT_FOUND;
+            }
         }
         cbm_pipeline_phase_probe_end(p, "persist_checkpoint", &checkpoint_probe);
         cbm_pipeline_phase_probe_t integrity_probe =
@@ -2984,22 +3231,61 @@ static int dump_and_persist_hashes(cbm_pipeline_t *p, const cbm_file_info_t *fil
         }
         cbm_pipeline_phase_probe_end(p, "persist_row_sink", &sink_probe);
         cbm_pipeline_phase_probe_t close_probe = cbm_pipeline_phase_probe_start(p, "persist_close");
-        cbm_store_close(hash_store);
+        if (pipeline_close_store(p, &hash_store, "close_staged_publication_store", "persist",
+                                 stage) != 0) {
+            final_rc = CBM_NOT_FOUND;
+        }
         cbm_pipeline_phase_probe_end(p, "persist_close", &close_probe);
         cbm_log_info("pass.timing", "pass", "persist_hashes", "files", itoa_buf(file_count));
     }
-    if (final_rc != 0 || cbm_path_exists(stage_wal) || cbm_path_exists(stage_shm)) {
-        if (final_rc == 0) {
+    bool preserve_unevaluable_stage = false;
+    bool stage_sidecar_present = false;
+    if (final_rc == 0) {
+        stage_wal_probe_error = 0;
+        stage_shm_probe_error = 0;
+        stage_wal_probe = cbm_path_probe(stage_wal, &stage_wal_probe_error);
+        stage_shm_probe = cbm_path_probe(stage_shm, &stage_shm_probe_error);
+        preserve_unevaluable_stage = stage_wal_probe == CBM_PATH_PROBE_ERROR ||
+                                     stage_shm_probe == CBM_PATH_PROBE_ERROR;
+        stage_sidecar_present = stage_wal_probe == CBM_PATH_PROBE_PRESENT ||
+                                stage_shm_probe == CBM_PATH_PROBE_PRESENT;
+        if (preserve_unevaluable_stage) {
+            const char *failed_path =
+                stage_wal_probe == CBM_PATH_PROBE_ERROR ? stage_wal : stage_shm;
+            unsigned long native_error = stage_wal_probe == CBM_PATH_PROBE_ERROR
+                                             ? stage_wal_probe_error
+                                             : stage_shm_probe_error;
+            (void)record_path_probe_failure(
+                p, "pipeline.persist_failed", "CBM_PIPELINE_STAGE_SIDECAR_PROBE_FAILED",
+                "readback_closed_stage_sidecars", "persist", failed_path, native_error,
+                "closed stage sidecar absence could not be proven",
+                "preserve the staged family, resolve the native probe error, and retry indexing");
+        }
+    }
+    if (final_rc != 0 || stage_sidecar_present || preserve_unevaluable_stage) {
+        if (final_rc == 0 && stage_sidecar_present) {
             cbm_log_error("pipeline.persist_failed", "code", "CBM_PIPELINE_STAGE_WAL_REMAINS",
                           "path", stage, "message",
                           "the closed replacement still has a WAL or shared-memory sidecar",
                           "remediation", "inspect SQLite checkpoint errors and retry");
         }
-        (void)remove_optional_pipeline_file(stage, "CBM_PIPELINE_FAILED_STAGE_REMOVE_FAILED");
-        (void)remove_optional_pipeline_file(stage_wal,
-                                            "CBM_PIPELINE_FAILED_STAGE_WAL_REMOVE_FAILED");
-        (void)remove_optional_pipeline_file(stage_shm,
-                                            "CBM_PIPELINE_FAILED_STAGE_SHM_REMOVE_FAILED");
+        if (hash_store || preserve_unevaluable_stage) {
+            cbm_log_error(
+                "pipeline.persist_failed", "code", "CBM_PIPELINE_STAGE_CLOSE_PRESERVED", "path",
+                stage, "message",
+                preserve_unevaluable_stage
+                    ? "the staged publication is preserved because physical sidecar state is unevaluable"
+                    : "the staged publication and its SQLite connection remain owned after exact physical close failed",
+                "remediation",
+                "preserve every staged-family byte and inspect the preceding close diagnostic");
+        } else {
+            (void)remove_optional_pipeline_file(stage,
+                                                "CBM_PIPELINE_FAILED_STAGE_REMOVE_FAILED");
+            (void)remove_optional_pipeline_file(stage_wal,
+                                                "CBM_PIPELINE_FAILED_STAGE_WAL_REMOVE_FAILED");
+            (void)remove_optional_pipeline_file(stage_shm,
+                                                "CBM_PIPELINE_FAILED_STAGE_SHM_REMOVE_FAILED");
+        }
         free(stage);
         free(stage_wal);
         free(stage_shm);
@@ -3032,7 +3318,7 @@ static int dump_and_persist_hashes(cbm_pipeline_t *p, const cbm_file_info_t *fil
     snprintf(live_shm, sidecar_size, "%s-shm", db_path);
     cbm_pipeline_phase_probe_t verify_probe =
         cbm_pipeline_phase_probe_start(p, "persist_verify_live_store");
-    if (verify_live_store_before_publication(p, db_path, live_wal, live_shm) != 0) {
+    if (cbm_pipeline_verify_live_store_before_publication(p, db_path, live_wal, live_shm) != 0) {
         cbm_pipeline_phase_probe_end(p, "persist_verify_live_store", &verify_probe);
         (void)remove_optional_pipeline_file(stage, "CBM_PIPELINE_FAILED_STAGE_REMOVE_FAILED");
         free(live_wal);
@@ -3099,14 +3385,27 @@ static int run_githistory(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx) {
     cbm_clock_gettime(CLOCK_MONOTONIC, &t_gh);
 
     cbm_githistory_result_t gh_result = {0};
-    cbm_thread_t gh_thread;
+    cbm_thread_t gh_thread = {0};
     bool gh_threaded = false;
     gh_compute_arg_t gh_arg = {.repo_path = ctx->repo_path, .result = &gh_result};
 
     if (p->mode != CBM_MODE_FAST) {
-        if (effective_worker_count(true) > SKIP_ONE) {
+        int worker_count = effective_worker_count(true);
+        if (worker_count <= 0) {
+            return reject_invalid_worker_count(p, "githistory", worker_count);
+        }
+        if (worker_count > SKIP_ONE) {
             if (cbm_thread_create(&gh_thread, 0, gh_compute_thread_fn, &gh_arg) == 0) {
                 gh_threaded = true;
+            } else {
+                cbm_log_error("pipeline.githistory.dispatch_failed", "code",
+                              "CBM_GITHISTORY_THREAD_CREATE_FAILED", "error_domain",
+                              itoa_buf(gh_thread.error_domain), "error_code",
+                              itoa_buf((int)gh_thread.error_code), "message",
+                              "git-history worker thread could not be admitted", "remediation",
+                              "inspect worker resource limits and retry only after the resource "
+                              "condition changes");
+                return CBM_NOT_FOUND;
             }
         }
         if (!gh_threaded) {
@@ -3119,7 +3418,18 @@ static int run_githistory(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx) {
     }
 
     if (gh_threaded) {
-        cbm_thread_join(&gh_thread);
+        if (cbm_thread_join(&gh_thread) != 0) {
+            cbm_log_error("pipeline.githistory.dispatch_failed", "code",
+                          "CBM_GITHISTORY_THREAD_JOIN_FAILED", "error_domain",
+                          itoa_buf(gh_thread.error_domain), "error_code",
+                          itoa_buf((int)gh_thread.error_code), "message",
+                          "git-history worker thread could not be joined", "remediation",
+                          "inspect worker thread diagnostics and retry unchanged only after the "
+                          "thread state is understood");
+            free(gh_result.couplings);
+            free(gh_result.file_temporal);
+            return CBM_NOT_FOUND;
+        }
         cbm_log_info("pass.timing", "pass", "githistory_compute", "elapsed_ms",
                      itoa_buf((int)elapsed_ms(t_gh)));
     }
@@ -3215,10 +3525,20 @@ static int run_extraction_phase(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
         return CBM_NOT_FOUND;
     }
     int worker_count = effective_worker_count(true);
+    if (worker_count <= 0) {
+        cbm_pxc_destroy_rust_manifest(ctx);
+        return reject_invalid_worker_count(p, "extraction", worker_count);
+    }
     CBM_PROF_START(t_extract_total);
-    int rc = (worker_count > SKIP_ONE && file_count > MIN_FILES_FOR_PARALLEL)
-                 ? run_parallel_pipeline(p, ctx, files, file_count, worker_count, &t)
-                 : run_sequential_pipeline(p, ctx, files, file_count, &t);
+    int rc = 0;
+    if (worker_count > SKIP_ONE && file_count > MIN_FILES_FOR_PARALLEL) {
+        rc = run_parallel_pipeline(p, ctx, files, file_count, worker_count, &t);
+    } else {
+        cbm_pipeline_record_parallel_dispatch(p, "extraction", "serial",
+                                              "CBM_PARALLEL_DISPATCH_OK", file_count,
+                                              worker_count, SKIP_ONE, 0, -1, 0, 0);
+        rc = run_sequential_pipeline(p, ctx, files, file_count, &t);
+    }
     CBM_PROF_END_N("pipeline", "2_extraction_total", t_extract_total, file_count);
     cbm_pxc_destroy_rust_manifest(ctx);
     if (check_cancel(p)) {
@@ -3242,11 +3562,14 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
     cbm_clock_gettime(CLOCK_MONOTONIC, &t0);
     p->phase_metric_count = 0;
     p->phase_metrics_complete = true;
+    p->parallel_dispatch_count = 0;
+    p->parallel_dispatches_complete = true;
     cbm_pipeline_phase_probe_t total_probe = cbm_pipeline_phase_probe_start(p, "total");
     cbm_path_alias_collection_t *path_aliases = NULL;
     cbm_source_snapshot_t source_snapshot = {0};
     cbm_file_info_t *source_files = NULL;
     int source_count = 0;
+    int rc = 0;
 
     /* C/C++ #define Macro nodes (#375) dominate extraction on macro-dense repos
      * (≈49% of nodes on the Linux kernel), so gate them to full mode — moderate
@@ -3264,6 +3587,19 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
     cbm_set_user_lang_config(p->userconfig);
     CBM_PROF_END("pipeline", "0_userconfig_load", t_userconfig);
 
+    /* Declared before the first `goto cleanup` below: main added an early
+     * worker-count rejection that jumps to the shared cleanup label, and the
+     * label frees these. Declaring them later left them uninitialised on that
+     * path. */
+    cbm_file_info_t *files = NULL;
+    int file_count = 0;
+
+    int admitted_worker_count = effective_worker_count(true);
+    if (admitted_worker_count <= 0) {
+        rc = reject_invalid_worker_count(p, "worker_config", admitted_worker_count);
+        goto cleanup;
+    }
+
     /* Phase 1: Discover files */
     CBM_PROF_START(t_discover);
     cbm_pipeline_phase_probe_t discover_probe = cbm_pipeline_phase_probe_start(p, "discovery");
@@ -3272,16 +3608,14 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
         .ignore_file = NULL,
         .max_file_size = 0,
     };
-    cbm_file_info_t *files = NULL;
-    int file_count = 0;
     /* Capture skipped subtrees on the pipeline so the MCP layer can report
      * which directories were excluded (#411). Replace any prior list (e.g. a
      * re-run on the same pipeline) to avoid leaking the previous one. */
     cbm_discover_free_excluded(p->excluded_dirs, p->excluded_count);
     p->excluded_dirs = NULL;
     p->excluded_count = 0;
-    int rc = cbm_discover_ex(p->repo_path, &opts, &files, &file_count, &p->excluded_dirs,
-                             &p->excluded_count);
+    rc = cbm_discover_ex(p->repo_path, &opts, &files, &file_count, &p->excluded_dirs,
+                         &p->excluded_count);
     if (rc != 0) {
         cbm_log_error("pipeline.err", "phase", "discover", "rc", itoa_buf(rc));
     }
@@ -3479,6 +3813,12 @@ cleanup:
     }
     cbm_pipeline_phase_probe_end(p, "source_snapshot_cleanup", &source_cleanup_probe);
     cbm_discover_free(files, file_count);
+    cbm_destroy_thread_parser();
+    cbm_slab_reclaim();
+    cbm_kind_in_set_free_cache();
+    cbm_mem_collect();
+    cbm_log_info("pipeline.thread_allocator_cleanup", "parser", "destroyed", "slab",
+                 "reclaimed");
     cbm_pipeline_phase_probe_end(p, "total", &total_probe);
     return rc;
 }

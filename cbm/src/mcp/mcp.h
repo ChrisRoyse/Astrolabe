@@ -12,6 +12,7 @@
 #include <stdio.h>
 
 #include "graph_buffer/row_sink.h"
+#include "store/store.h"
 
 /* ── Astrolabe reserved store-dir sidecar suffixes (#414) ─────────
  *
@@ -43,7 +44,6 @@
 
 /* ── Forward declarations ─────────────────────────────────────── */
 
-typedef struct cbm_store cbm_store_t; /* from store/store.h */
 struct cbm_watcher;                   /* from watcher/watcher.h */
 struct cbm_config;                    /* from cli/cli.h */
 
@@ -122,11 +122,37 @@ char *cbm_mcp_get_arguments(const char *params_json);
 typedef struct cbm_mcp_server cbm_mcp_server_t;
 typedef struct cbm_project_transition cbm_project_transition_t;
 
+typedef int32_t cbm_project_holder_probe_status_t;
+
+enum {
+    CBM_PROJECT_HOLDER_PROBE_NOT_RUN = 0,
+    CBM_PROJECT_HOLDER_PROBE_STABLE = 1,
+    CBM_PROJECT_HOLDER_PROBE_API_UNAVAILABLE = 2,
+    CBM_PROJECT_HOLDER_PROBE_SESSION_FAILED = 3,
+    CBM_PROJECT_HOLDER_PROBE_REGISTER_FAILED = 4,
+    CBM_PROJECT_HOLDER_PROBE_LIST_FAILED = 5,
+    CBM_PROJECT_HOLDER_PROBE_PROCESS_QUERY_FAILED = 6,
+    CBM_PROJECT_HOLDER_PROBE_PROCESS_IDENTITY_CHANGED = 7,
+    CBM_PROJECT_HOLDER_PROBE_PROCESS_PATH_FAILED = 8,
+    CBM_PROJECT_HOLDER_PROBE_UNSTABLE = 9,
+    CBM_PROJECT_HOLDER_PROBE_END_SESSION_FAILED = 10,
+    CBM_PROJECT_HOLDER_PROBE_OPERATION_MAX = 64,
+    CBM_PROJECT_HOLDER_PATH_MAX = 4096,
+};
+
 typedef struct {
     uint64_t elapsed_ms;
     uint64_t attempts;
-    unsigned long native_error;
+    uint32_t native_error;
     char failed_path[1024];
+    cbm_project_holder_probe_status_t holder_probe_status;
+    uint32_t holder_probe_native_error;
+    uint32_t holder_inventory_stable;
+    uint64_t holder_count;
+    uint32_t first_holder_process_id;
+    uint64_t first_holder_process_start_utc_ticks;
+    char holder_probe_operation[CBM_PROJECT_HOLDER_PROBE_OPERATION_MAX];
+    char first_holder_path[CBM_PROJECT_HOLDER_PATH_MAX];
 } cbm_project_quiescence_result_t;
 
 /* Create an MCP server. store_path is the SQLite database directory. */
@@ -188,14 +214,24 @@ char *cbm_mcp_index_repository_supervised_strict(cbm_mcp_server_t *srv, const ch
 
 /* ── Idle store eviction ──────────────────────────────────────── */
 
+/* Close the currently cached project connection without retrying and copy the
+ * complete fixed-width physical SQLite close record. A prior close failure is
+ * returned unchanged, so embedders cannot erase it or infer success from a
+ * scalar/no-op. */
+cbm_store_close_status_t cbm_mcp_server_close_cached_project_store(
+    cbm_mcp_server_t *srv, cbm_store_close_result_t *result);
+
 /* Evict the cached project store if idle for more than timeout_s seconds.
  * Protects initial in-memory stores (those never accessed via a named project).
- * Called automatically by the event loop on poll() timeout. */
-void cbm_mcp_server_evict_idle(cbm_mcp_server_t *srv, int timeout_s);
+ * Called automatically by the event loop on poll() timeout. Returns 0 for a
+ * no-op or an exact physical close and -1 when close failed; failure retains
+ * any live connection pointer and blocks the resident event loop. */
+int cbm_mcp_server_evict_idle(cbm_mcp_server_t *srv, int timeout_s);
 
 /* Close the exact cached project store when another thread/process owns the
  * Astrolabe project transition. Returns 1 when quiesced, 0 when inactive/no
- * named store is cached, and -1 when transition state is unevaluable. */
+ * named store is cached, and -1 when transition state is unevaluable or the
+ * cached SQLite connection was not physically destroyed. */
 int cbm_mcp_server_quiesce_project_transition(cbm_mcp_server_t *srv);
 
 /* Exact Windows owner generation used by the Rust publication wrapper. The

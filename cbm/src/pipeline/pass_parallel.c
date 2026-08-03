@@ -113,6 +113,31 @@ void cbm_pp_bp_nap_cycles_reset(void) {
     atomic_store_explicit(&g_bp_nap_cycles, 0, memory_order_relaxed);
 }
 
+static const char *parallel_dispatch_mode_name(cbm_parallel_dispatch_mode_t mode) {
+    switch (mode) {
+    case CBM_PARALLEL_DISPATCH_MODE_NOOP:
+        return "noop";
+    case CBM_PARALLEL_DISPATCH_MODE_SERIAL:
+        return "serial";
+    case CBM_PARALLEL_DISPATCH_MODE_PARALLEL:
+        return "parallel";
+    }
+    return "unknown";
+}
+
+static void record_worker_pool_dispatch(cbm_pipeline_t *pipeline,
+                                        const cbm_parallel_for_result_t *result) {
+    if (!pipeline || !result) {
+        return;
+    }
+    cbm_pipeline_record_parallel_dispatch(
+        pipeline, result->operation ? result->operation : "parallel",
+        parallel_dispatch_mode_name(result->mode), result->code ? result->code : "",
+        result->item_count, result->requested_workers, result->admitted_workers,
+        result->created_workers, result->failed_worker_index, result->error_domain,
+        result->error_code);
+}
+
 /* Parse a positive MB-valued retention env knob (CBM_RETAIN_*_MB) into bytes.
  * Follows the limits.c strtol convention: unset / unparseable / non-positive
  * → return 0 so the caller keeps its derived default. */
@@ -696,7 +721,9 @@ typedef struct __attribute__((aligned(CBM_CACHE_LINE))) {
     cbm_gbuf_t *local_gbuf;
     int nodes_created;
     int errors;
-    char _pad[CBM_CACHE_LINE - sizeof(cbm_gbuf_t *) - (PP_ESC_SPACE * sizeof(int))];
+    uint_least64_t parse_recovery_diagnostics;
+    char _pad[CBM_CACHE_LINE - sizeof(cbm_gbuf_t *) - (PP_ESC_SPACE * sizeof(int)) -
+              sizeof(uint_least64_t)];
 } extract_worker_state_t;
 
 typedef struct {
@@ -978,6 +1005,7 @@ static void extract_worker(int worker_id, void *ctx_ptr) {
         for (int d = 0; d < result->diagnostics.count; d++) {
             insert_diagnostic_into_gbuf(ws, fi, ec->project_name, &result->diagnostics.items[d]);
         }
+        ws->parse_recovery_diagnostics += (uint_least64_t)result->diagnostics.count;
 
         /* Free TSTree immediately — arena strings survive for registry+resolve.
          * This makes slab reset safe: tree-sitter's internal nodes (in slab)
@@ -1102,6 +1130,16 @@ void cbm_parallel_rebase_shared_ids(const cbm_gbuf_t *main_gbuf, _Atomic int64_t
     }
 }
 
+static int reject_invalid_parallel_worker_count(const char *operation, int worker_count) {
+    cbm_log_error("parallel.worker_count_invalid", "code", "CBM_WORKER_COUNT_INVALID",
+                  "operation", operation ? operation : "parallel", "worker_count",
+                  itoa_log(worker_count), "message", "worker-count argument is invalid",
+                  "remediation",
+                  "pass a positive worker count; when derived from CBM_WORKERS, set it to an "
+                  "integer from 1 through 256 or remove it");
+    return CBM_NOT_FOUND;
+}
+
 int cbm_parallel_extract_ex(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, int file_count,
                             CBMFileResult **result_cache, _Atomic int64_t *shared_ids,
                             int worker_count, const cbm_parallel_extract_opts_t *opts) {
@@ -1109,6 +1147,9 @@ int cbm_parallel_extract_ex(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *file
 
     if (file_count == 0) {
         return 0;
+    }
+    if (worker_count <= 0) {
+        return reject_invalid_parallel_worker_count("parallel_extract", worker_count);
     }
 
     cbm_log_info("parallel.extract.start", "files", itoa_log(file_count), "workers",
@@ -1139,7 +1180,11 @@ int cbm_parallel_extract_ex(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *file
         return CBM_NOT_FOUND;
     }
 
-    /* Slab allocator for tree-sitter (thread-safe via TLS). */
+    /* Tree-sitter's process-global allocator is installed at cbm_alloc_init()
+     * before any parser exists. This idempotent call preserves direct callers
+     * that reach the parallel pass without going through main(), but it must not
+     * publish a new allocator generation after sequential requests have already
+     * created parser objects. */
     cbm_slab_install();
     CBM_PROF_END("parallel_extract", "1_init_libs", t_init);
 
@@ -1200,9 +1245,37 @@ int cbm_parallel_extract_ex(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *file
 
     /* Sub-phase: Dispatch workers (parse + extract per file, PARALLEL) */
     CBM_PROF_START(t_dispatch);
-    cbm_parallel_for_opts_t parallel_opts = {.max_workers = worker_count, .force_pthreads = false};
-    cbm_parallel_for(worker_count, extract_worker, &ec, parallel_opts);
+    cbm_parallel_for_opts_t parallel_opts = {
+        .max_workers = worker_count,
+        .force_pthreads = false,
+        .operation = "parallel_extract",
+    };
+    cbm_parallel_for_result_t dispatch_result = {0};
+    int dispatch_rc =
+        cbm_parallel_for(worker_count, extract_worker, &ec, parallel_opts, &dispatch_result);
+    record_worker_pool_dispatch(ctx ? ctx->pipeline : NULL, &dispatch_result);
     CBM_PROF_END_N("parallel_extract", "3_dispatch_workers_parallel", t_dispatch, file_count);
+    if (dispatch_rc != 0) {
+        if (err_lists) {
+            for (int i = 0; i < worker_count; i++) {
+                for (int j = 0; j < err_lists[i].count; j++) {
+                    free(err_lists[i].items[j].path);
+                    free(err_lists[i].items[j].reason);
+                    free(err_lists[i].items[j].phase);
+                }
+                free(err_lists[i].items);
+            }
+            free(err_lists);
+        }
+        for (int i = 0; i < worker_count; i++) {
+            if (workers[i].local_gbuf) {
+                cbm_gbuf_free(workers[i].local_gbuf);
+            }
+        }
+        cbm_aligned_free(workers);
+        free(sorted);
+        return CBM_NOT_FOUND;
+    }
 
     /* Sub-phase: Merge all local gbufs into main gbuf (SEQUENTIAL, gbuf not thread-safe) */
     CBM_PROF_START(t_merge);
@@ -1213,6 +1286,8 @@ int cbm_parallel_extract_ex(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *file
             cbm_gbuf_merge(ctx->gbuf, workers[i].local_gbuf);
             total_nodes += workers[i].nodes_created;
             total_errors += workers[i].errors;
+            cbm_pipeline_add_parse_recovery_diagnostics(ctx->pipeline,
+                                                        workers[i].parse_recovery_diagnostics);
             cbm_gbuf_free(workers[i].local_gbuf);
         }
     }
@@ -3126,6 +3201,9 @@ int cbm_parallel_resolve(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, 
     if (file_count == 0) {
         return 0;
     }
+    if (worker_count <= 0) {
+        return reject_invalid_parallel_worker_count("parallel_resolve", worker_count);
+    }
 
     cbm_log_info("parallel.resolve.start", "files", itoa_log(file_count), "workers",
                  itoa_log(worker_count));
@@ -3166,8 +3244,15 @@ int cbm_parallel_resolve(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, 
 
     /* Sub-phase: Dispatch resolve workers (per-file call/usage resolution, PARALLEL) */
     CBM_PROF_START(t_resolve_dispatch);
-    cbm_parallel_for_opts_t opts = {.max_workers = worker_count, .force_pthreads = false};
-    cbm_parallel_for(worker_count, resolve_worker, &rc, opts);
+    cbm_parallel_for_opts_t opts = {
+        .max_workers = worker_count,
+        .force_pthreads = false,
+        .operation = "parallel_resolve",
+    };
+    cbm_parallel_for_result_t dispatch_result = {0};
+    int dispatch_rc =
+        cbm_parallel_for(worker_count, resolve_worker, &rc, opts, &dispatch_result);
+    record_worker_pool_dispatch(ctx ? ctx->pipeline : NULL, &dispatch_result);
     CBM_PROF_END_N("parallel_resolve", "1_dispatch_workers_parallel", t_resolve_dispatch,
                    file_count);
     /* Workers joined: the shared Rust registry (if built) is no longer read.
@@ -3178,6 +3263,15 @@ int cbm_parallel_resolve(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, 
         rc.rust_shared_arena_live = false;
     }
     cbm_mutex_destroy(&rc.rust_shared_mu);
+    if (dispatch_rc != 0) {
+        for (int i = 0; i < worker_count; i++) {
+            if (workers[i].local_edge_buf) {
+                cbm_gbuf_free(workers[i].local_edge_buf);
+            }
+        }
+        cbm_aligned_free(workers);
+        return CBM_NOT_FOUND;
+    }
 
     /* Sub-phase: Merge all local edge bufs into main gbuf (SEQUENTIAL) */
     CBM_PROF_START(t_resolve_merge);

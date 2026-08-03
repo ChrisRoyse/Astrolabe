@@ -12,11 +12,20 @@ use super::dispatch::handle_index_repository;
 
 pub(crate) const WATCHER_TICK_STATUS_KEY: &str = "watcher_tick_json";
 pub(crate) const WATCHER_FAULT_STATUS_KEY: &str = "watcher_fault_json";
+pub(crate) const WATCHER_REGISTRATION_FAULT_STATUS_KEY: &str = "watcher_registration_fault_json";
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 struct WatchRegistration {
     project: String,
     root: String,
+}
+
+struct RegistrationRecoveryRefresh<'a> {
+    fault_code: &'a str,
+    prior_fault: &'a Value,
+    prior_observation: &'a Value,
+    current_sentinel: Value,
+    recompute_reason: &'a str,
 }
 
 pub(crate) fn run_incremental_watcher_loop(shutdown: Arc<AtomicBool>) -> Result<(), DynError> {
@@ -29,6 +38,7 @@ pub(crate) fn run_incremental_watcher_loop(shutdown: Arc<AtomicBool>) -> Result<
             .map_err(watcher_bridge_error)
     })?;
     let mut registered = BTreeMap::<String, String>::new();
+    let mut registration_recovery_faults = BTreeMap::<String, Value>::new();
     let mut prior_policy_observation = None::<String>;
 
     while !shutdown.load(Ordering::Relaxed) {
@@ -59,6 +69,7 @@ pub(crate) fn run_incremental_watcher_loop(shutdown: Arc<AtomicBool>) -> Result<
         }
         if !matches!(policy, Ok(true)) {
             unwatch_all(&mut watcher, &mut registered)?;
+            registration_recovery_faults.clear();
             sleep_watcher_slice(&shutdown);
             continue;
         }
@@ -77,10 +88,31 @@ pub(crate) fn run_incremental_watcher_loop(shutdown: Arc<AtomicBool>) -> Result<
         {
             watcher.unwatch(&stale)?;
             registered.remove(&stale);
+            registration_recovery_faults.remove(&stale);
         }
         for registration in discovered {
             if registered.get(&registration.project) == Some(&registration.root) {
                 continue;
+            }
+            match suppress_unchanged_registration_recovery_fault(
+                &cache_dir,
+                &registration,
+                &mut registration_recovery_faults,
+            ) {
+                Ok(true) => continue,
+                Ok(false) => {}
+                Err(error) => {
+                    let message =
+                        format!("durable registration recovery fault validation failed: {error}");
+                    persist_registration_error(&cache_dir, &registration.project, &message)?;
+                    tracing::warn!(
+                        project = %registration.project,
+                        root = %registration.root,
+                        error = %error,
+                        "incremental_watcher.registration_recovery_fault_validation_refused"
+                    );
+                    continue;
+                }
             }
             if registered.contains_key(&registration.project) {
                 watcher.unwatch(&registration.project)?;
@@ -89,20 +121,17 @@ pub(crate) fn run_incremental_watcher_loop(shutdown: Arc<AtomicBool>) -> Result<
             let catch_up = match registration_catch_up_status(&cache_dir, &registration) {
                 Ok(status) => status,
                 Err(error) => {
-                    persist_registration_error(
+                    record_registration_reconciliation_refusal(
                         &cache_dir,
-                        &registration.project,
-                        &format!("durable source-checkpoint reconciliation failed: {error}"),
+                        &registration,
+                        error,
+                        &mut registration_recovery_faults,
                     )?;
-                    tracing::warn!(
-                        project = %registration.project,
-                        root = %registration.root,
-                        error = %error,
-                        "incremental_watcher.registration_reconciliation_refused"
-                    );
                     continue;
                 }
             };
+            registration_recovery_faults.remove(&registration.project);
+            delete_registration_recovery_fault(&cache_dir, &registration.project)?;
             if let Some(status) = &catch_up {
                 persist_watcher_status(&cache_dir, &registration.project, status)?;
                 tracing::info!(
@@ -221,6 +250,538 @@ fn registration_catch_up_status(
     })))
 }
 
+fn suppress_unchanged_registration_recovery_fault(
+    cache_dir: &Path,
+    registration: &WatchRegistration,
+    registration_recovery_faults: &mut BTreeMap<String, Value>,
+) -> Result<bool, DynError> {
+    let Some(prior_fault) = read_registration_recovery_fault(cache_dir, &registration.project)?
+    else {
+        registration_recovery_faults.remove(&registration.project);
+        return Ok(false);
+    };
+    registration_recovery_faults.insert(registration.project.clone(), prior_fault.clone());
+    let prior_observation =
+        validated_registration_recovery_observation(&prior_fault, registration)?;
+    let Some(fault_code) = prior_observation.get("fault_code").and_then(Value::as_str) else {
+        registration_recovery_faults.remove(&registration.project);
+        return Err(format!(
+            "ASTRO_WATCHER_REGISTRATION_FAULT_CODE_MISSING: durable registration fault for {:?} has no structured fault_code; remediation: preserve the config store and inspect watcher_registration_fault_json",
+            registration.project
+        )
+        .into());
+    };
+    let current_sentinel = match registration_recovery_sentinel(cache_dir, registration, fault_code)
+    {
+        Ok(Some(sentinel)) => sentinel,
+        Ok(None) => {
+            registration_recovery_faults.remove(&registration.project);
+            delete_registration_recovery_fault(cache_dir, &registration.project)?;
+            return Ok(false);
+        }
+        Err(error) => {
+            let sentinel_error = error.to_string();
+            return recompute_after_current_sentinel_error(
+                cache_dir,
+                registration,
+                fault_code,
+                &prior_observation,
+                &sentinel_error,
+                registration_recovery_faults,
+            );
+        }
+    };
+    match validated_registration_recovery_sentinel(&prior_fault, registration, fault_code) {
+        Ok(prior_sentinel) if prior_sentinel == current_sentinel => Ok(true),
+        Ok(_) => refresh_or_clear_registration_recovery_fault(
+            cache_dir,
+            registration,
+            RegistrationRecoveryRefresh {
+                fault_code,
+                prior_fault: &prior_fault,
+                prior_observation: &prior_observation,
+                current_sentinel,
+                recompute_reason: "sentinel_changed",
+            },
+            registration_recovery_faults,
+        ),
+        Err(error) => {
+            let reason = error.to_string();
+            refresh_or_clear_registration_recovery_fault(
+                cache_dir,
+                registration,
+                RegistrationRecoveryRefresh {
+                    fault_code,
+                    prior_fault: &prior_fault,
+                    prior_observation: &prior_observation,
+                    current_sentinel,
+                    recompute_reason: &reason,
+                },
+                registration_recovery_faults,
+            )
+        }
+    }
+}
+
+fn refresh_or_clear_registration_recovery_fault(
+    cache_dir: &Path,
+    registration: &WatchRegistration,
+    refresh: RegistrationRecoveryRefresh<'_>,
+    registration_recovery_faults: &mut BTreeMap<String, Value>,
+) -> Result<bool, DynError> {
+    let RegistrationRecoveryRefresh {
+        fault_code,
+        prior_fault,
+        prior_observation,
+        current_sentinel,
+        recompute_reason,
+    } = refresh;
+    let fault_class = recovery_fault_log_class(fault_code);
+    tracing::info!(
+        project = %registration.project,
+        root = %registration.root,
+        terminal_fault_class = %fault_class,
+        recompute_reason = recompute_reason,
+        "incremental_watcher.registration_fault_full_observation_recompute"
+    );
+    let current_observation =
+        match registration_recovery_observation(cache_dir, registration, fault_code)? {
+            Some(observation) => observation,
+            None => {
+                registration_recovery_faults.remove(&registration.project);
+                delete_registration_recovery_fault(cache_dir, &registration.project)?;
+                return Ok(false);
+            }
+        };
+    if current_observation != *prior_observation {
+        registration_recovery_faults.remove(&registration.project);
+        delete_registration_recovery_fault(cache_dir, &registration.project)?;
+        return Ok(false);
+    }
+    let message = prior_fault
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or("durable registration recovery fault remains unchanged");
+    let refreshed = registration_recovery_fault_record(
+        registration,
+        fault_code,
+        current_observation,
+        current_sentinel,
+        message,
+        Some(recompute_reason),
+    )?;
+    persist_registration_recovery_fault(cache_dir, &registration.project, &refreshed)?;
+    registration_recovery_faults.insert(registration.project.clone(), refreshed.clone());
+    let observation_sha256 = refreshed
+        .get("observation_sha256")
+        .and_then(|value| value.as_str())
+        .unwrap_or("missing");
+    let sentinel_sha256 = refreshed
+        .get("sentinel_sha256")
+        .and_then(|value| value.as_str())
+        .unwrap_or("missing");
+    tracing::warn!(
+        project = %registration.project,
+        root = %registration.root,
+        terminal_fault_class = %fault_class,
+        recompute_reason = recompute_reason,
+        observation_sha256 = observation_sha256,
+        sentinel_sha256 = sentinel_sha256,
+        "incremental_watcher.registration_fault_sentinel_revalidated"
+    );
+    Ok(true)
+}
+
+fn recompute_after_current_sentinel_error(
+    cache_dir: &Path,
+    registration: &WatchRegistration,
+    fault_code: &str,
+    prior_observation: &Value,
+    sentinel_error: &str,
+    registration_recovery_faults: &mut BTreeMap<String, Value>,
+) -> Result<bool, DynError> {
+    let fault_class = recovery_fault_log_class(fault_code);
+    tracing::warn!(
+        project = %registration.project,
+        root = %registration.root,
+        terminal_fault_class = %fault_class,
+        error = sentinel_error,
+        "incremental_watcher.registration_fault_current_sentinel_unevaluable"
+    );
+    match registration_recovery_observation(cache_dir, registration, fault_code) {
+        Ok(Some(current_observation)) if current_observation == *prior_observation => {
+            let observation_sha256 = value_sha256(&current_observation)?;
+            Err(format!(
+                "ASTRO_WATCHER_REGISTRATION_FAULT_SENTINEL_UNEVALUABLE: current sentinel for project {:?} could not be evaluated ({sentinel_error}); one full observation was recomputed and still matched observation_sha256={observation_sha256}; remediation: preserve the durable transaction/config bytes and repair the sentinel input before resident suppression resumes",
+                registration.project
+            )
+            .into())
+        }
+        Ok(Some(current_observation)) => {
+            let observation_sha256 = value_sha256(&current_observation)?;
+            registration_recovery_faults.remove(&registration.project);
+            delete_registration_recovery_fault(cache_dir, &registration.project)?;
+            tracing::warn!(
+                project = %registration.project,
+                root = %registration.root,
+                terminal_fault_class = %fault_class,
+                observation_sha256 = observation_sha256,
+                "incremental_watcher.registration_fault_current_sentinel_changed_observation"
+            );
+            Ok(false)
+        }
+        Ok(None) => {
+            registration_recovery_faults.remove(&registration.project);
+            delete_registration_recovery_fault(cache_dir, &registration.project)?;
+            Ok(false)
+        }
+        Err(observation_error) => Err(format!(
+            "ASTRO_WATCHER_REGISTRATION_FAULT_SENTINEL_UNEVALUABLE: current sentinel for project {:?} could not be evaluated ({sentinel_error}); the required one-shot full observation also failed: {observation_error}; remediation: preserve the durable transaction/config bytes and inspect the named transaction before retrying resident suppression",
+            registration.project
+        )
+        .into()),
+    }
+}
+
+fn record_registration_reconciliation_refusal(
+    cache_dir: &Path,
+    registration: &WatchRegistration,
+    error: DynError,
+    registration_recovery_faults: &mut BTreeMap<String, Value>,
+) -> Result<(), DynError> {
+    let message = error.to_string();
+    if let Some(fault_code) = shadow_publication_recovery_error_code(&message)
+        && let Some(observation) =
+            registration_recovery_observation(cache_dir, registration, fault_code)?
+        && let Some(sentinel) = registration_recovery_sentinel(cache_dir, registration, fault_code)?
+    {
+        let fault = registration_recovery_fault_record(
+            registration,
+            fault_code,
+            observation,
+            sentinel,
+            &message,
+            Some("terminal_fault_recorded"),
+        )?;
+        let observation_sha256 = fault
+            .get("observation_sha256")
+            .and_then(Value::as_str)
+            .ok_or_else(|| -> DynError {
+                "ASTRO_WATCHER_REGISTRATION_FAULT_OBSERVATION_HASH_MISSING: constructed recovery fault has no observation hash"
+                    .into()
+            })?
+            .to_string();
+        persist_registration_recovery_fault(cache_dir, &registration.project, &fault)?;
+        registration_recovery_faults.insert(registration.project.clone(), fault.clone());
+        let status = json!({
+            "schema": "astrolabe-watcher-tick-v2",
+            "status": "registration_reconciliation_refused",
+            "project": registration.project,
+            "root": registration.root,
+            "fault_code": fault_code,
+            "observation_sha256": observation_sha256.clone(),
+            "transaction_inventory_sha256": fault.get("transaction_inventory_sha256"),
+            "publication_config_sha256": fault.get("publication_config_sha256"),
+            "sentinel_sha256": fault.get("sentinel_sha256"),
+            "transaction_metadata_entries_sha256": fault.get("transaction_metadata_entries_sha256"),
+            "full_observation_recomputed": true,
+            "freshness": "stale",
+            "trust": "verified",
+            "worker_started": false,
+            "retry_suppressed_until_observation_changes": true,
+            "remediation": "repair the durable shadow-publication transaction/config named by watcher_registration_fault_json; unchanged resident intervals are suppressed",
+        });
+        persist_watcher_status(cache_dir, &registration.project, &status)?;
+        tracing::warn!(
+            project = %registration.project,
+            root = %registration.root,
+            fault_code = fault_code,
+            observation_sha256 = %observation_sha256,
+            "incremental_watcher.registration_reconciliation_refused"
+        );
+        return Ok(());
+    }
+
+    persist_registration_error(
+        cache_dir,
+        &registration.project,
+        &format!("durable source-checkpoint reconciliation failed: {message}"),
+    )?;
+    tracing::warn!(
+        project = %registration.project,
+        root = %registration.root,
+        error = %message,
+        "incremental_watcher.registration_reconciliation_refused"
+    );
+    Ok(())
+}
+
+fn registration_recovery_observation(
+    cache_dir: &Path,
+    registration: &WatchRegistration,
+    fault_code: &str,
+) -> Result<Option<Value>, DynError> {
+    let Some(shadow_publication) =
+        shadow_publication_recovery_observation(cache_dir, &registration.project, fault_code)?
+    else {
+        return Ok(None);
+    };
+    Ok(Some(json!({
+        "schema": "astrolabe-watcher-registration-recovery-observation-v1",
+        "project": registration.project,
+        "root": registration.root,
+        "fault_code": fault_code,
+        "shadow_publication": shadow_publication,
+        "executable": executable_observation()?,
+    })))
+}
+
+fn registration_recovery_sentinel(
+    cache_dir: &Path,
+    registration: &WatchRegistration,
+    fault_code: &str,
+) -> Result<Option<Value>, DynError> {
+    let Some(shadow_publication) =
+        shadow_publication_recovery_sentinel(cache_dir, &registration.project, fault_code)?
+    else {
+        return Ok(None);
+    };
+    Ok(Some(json!({
+        "schema": "astrolabe-watcher-registration-recovery-sentinel-v1",
+        "project": registration.project,
+        "root": registration.root,
+        "fault_code": fault_code,
+        "shadow_publication": shadow_publication,
+        "executable": executable_sentinel()?,
+    })))
+}
+
+fn registration_recovery_fault_record(
+    registration: &WatchRegistration,
+    fault_code: &str,
+    observation: Value,
+    sentinel: Value,
+    message: &str,
+    recompute_reason: Option<&str>,
+) -> Result<Value, DynError> {
+    let observation_sha256 = value_sha256(&observation)?;
+    let sentinel_sha256 = value_sha256(&sentinel)?;
+    let transaction_inventory_sha256 =
+        registration_recovery_observation_field(&observation, "transaction_inventory_sha256");
+    let publication_config_sha256 =
+        registration_recovery_observation_field(&observation, "publication_config_sha256");
+    let transaction_metadata_entries_sha256 =
+        registration_recovery_sentinel_field(&sentinel, "transaction_metadata", "entries_sha256");
+    let transaction_metadata_entry_count =
+        registration_recovery_sentinel_field(&sentinel, "transaction_metadata", "entry_count");
+    let transaction_metadata_file_count =
+        registration_recovery_sentinel_field(&sentinel, "transaction_metadata", "file_count");
+    let transaction_metadata_directory_count =
+        registration_recovery_sentinel_field(&sentinel, "transaction_metadata", "directory_count");
+    let transaction_metadata_transaction_count = registration_recovery_sentinel_field(
+        &sentinel,
+        "transaction_metadata",
+        "transaction_count",
+    );
+    let transaction_metadata_journal_count =
+        registration_recovery_sentinel_field(&sentinel, "transaction_metadata", "journal_count");
+    let transaction_metadata_artifact_probe_count = registration_recovery_sentinel_field(
+        &sentinel,
+        "transaction_metadata",
+        "artifact_probe_count",
+    );
+    let transaction_metadata_direct_entry_count = registration_recovery_sentinel_field(
+        &sentinel,
+        "transaction_metadata",
+        "direct_entry_count",
+    );
+    Ok(json!({
+        "schema": "astrolabe-watcher-registration-recovery-fault-v1",
+        "status": "terminal_fault",
+        "project": registration.project,
+        "root": registration.root,
+        "fault_code": fault_code,
+        "observation": observation,
+        "observation_sha256": observation_sha256,
+        "sentinel": sentinel,
+        "sentinel_sha256": sentinel_sha256,
+        "transaction_inventory_sha256": transaction_inventory_sha256,
+        "publication_config_sha256": publication_config_sha256,
+        "transaction_metadata_entries_sha256": transaction_metadata_entries_sha256,
+        "transaction_metadata_entry_count": transaction_metadata_entry_count,
+        "transaction_metadata_file_count": transaction_metadata_file_count,
+        "transaction_metadata_directory_count": transaction_metadata_directory_count,
+        "transaction_metadata_transaction_count": transaction_metadata_transaction_count,
+        "transaction_metadata_journal_count": transaction_metadata_journal_count,
+        "transaction_metadata_artifact_probe_count": transaction_metadata_artifact_probe_count,
+        "transaction_metadata_direct_entry_count": transaction_metadata_direct_entry_count,
+        "message": message,
+        "worker_started": false,
+        "retry_suppressed_until_observation_changes": true,
+        "sentinel_kind": "compact_journal_artifact_metadata_plus_config_generation",
+        "full_observation_recompute_reason": recompute_reason,
+        "remediation": "preserve the exact shadow-publication transaction, repair the named durable bytes or project publication config, then let the resident watcher re-admit reconciliation",
+    }))
+}
+
+fn validated_registration_recovery_observation(
+    fault: &Value,
+    registration: &WatchRegistration,
+) -> Result<Value, DynError> {
+    let project = registration.project.as_str();
+    let observation = fault.get("observation").cloned().ok_or_else(|| -> DynError {
+        format!(
+            "ASTRO_WATCHER_REGISTRATION_FAULT_OBSERVATION_MISSING: durable registration fault for {project:?} has no observation; remediation: preserve the config store and inspect watcher_registration_fault_json"
+        )
+        .into()
+    })?;
+    let stored_observation_sha256 = fault
+        .get("observation_sha256")
+        .and_then(Value::as_str)
+        .ok_or_else(|| -> DynError {
+            format!(
+                "ASTRO_WATCHER_REGISTRATION_FAULT_OBSERVATION_HASH_MISSING: durable registration fault for {project:?} has no observation_sha256; remediation: preserve the config store and inspect watcher_registration_fault_json"
+            )
+            .into()
+        })?;
+    let actual_observation_sha256 = value_sha256(&observation)?;
+    if stored_observation_sha256 != actual_observation_sha256 {
+        return Err(format!(
+            "ASTRO_WATCHER_REGISTRATION_FAULT_OBSERVATION_HASH_MISMATCH: durable registration fault for {project:?} stores observation_sha256={stored_observation_sha256}, but readback observation hashes to {actual_observation_sha256}; remediation: preserve the config store and inspect watcher_registration_fault_json"
+        )
+        .into());
+    }
+    if observation.get("schema").and_then(Value::as_str)
+        != Some("astrolabe-watcher-registration-recovery-observation-v1")
+        || observation.get("project").and_then(Value::as_str) != Some(project)
+        || observation.get("root").and_then(Value::as_str) != Some(registration.root.as_str())
+    {
+        return Err(format!(
+            "ASTRO_WATCHER_REGISTRATION_FAULT_OBSERVATION_IDENTITY_MISMATCH: durable registration fault observation for {project:?} does not bind the expected schema/project/root; remediation: preserve the config store and inspect watcher_registration_fault_json"
+        )
+        .into());
+    }
+    if fault.get("fault_code").and_then(Value::as_str)
+        != observation.get("fault_code").and_then(Value::as_str)
+    {
+        return Err(format!(
+            "ASTRO_WATCHER_REGISTRATION_FAULT_OBSERVATION_CODE_MISMATCH: durable registration fault for {project:?} has a fault_code that differs from its observation; remediation: preserve the config store and inspect watcher_registration_fault_json"
+        )
+        .into());
+    }
+    match observation.get("shadow_publication") {
+        Some(shadow_publication)
+            if shadow_publication.get("schema").and_then(Value::as_str)
+                == Some("astrolabe.shadow-publication-recovery-observation.v1")
+                && shadow_publication.get("project").and_then(Value::as_str) == Some(project)
+                && shadow_publication.get("fault_code").and_then(Value::as_str)
+                    == observation.get("fault_code").and_then(Value::as_str) => {}
+        _ => {
+            return Err(format!(
+                "ASTRO_WATCHER_REGISTRATION_FAULT_OBSERVATION_SHADOW_IDENTITY_MISMATCH: durable registration fault observation for {project:?} has malformed shadow-publication identity; remediation: preserve the config store and inspect watcher_registration_fault_json"
+            )
+            .into());
+        }
+    }
+    Ok(observation)
+}
+
+fn validated_registration_recovery_sentinel(
+    fault: &Value,
+    registration: &WatchRegistration,
+    fault_code: &str,
+) -> Result<Value, DynError> {
+    let project = registration.project.as_str();
+    let sentinel = fault.get("sentinel").cloned().ok_or_else(|| -> DynError {
+        format!(
+            "ASTRO_WATCHER_REGISTRATION_FAULT_SENTINEL_MISSING: durable registration fault for {project:?} has no sentinel; remediation: recompute the full observation once and refresh watcher_registration_fault_json"
+        )
+        .into()
+    })?;
+    if sentinel.get("schema").and_then(Value::as_str)
+        != Some("astrolabe-watcher-registration-recovery-sentinel-v1")
+        || sentinel.get("project").and_then(Value::as_str) != Some(project)
+        || sentinel.get("root").and_then(Value::as_str) != Some(registration.root.as_str())
+        || sentinel.get("fault_code").and_then(Value::as_str) != Some(fault_code)
+    {
+        return Err(format!(
+            "ASTRO_WATCHER_REGISTRATION_FAULT_SENTINEL_IDENTITY_MISMATCH: durable registration fault for {project:?} has a malformed sentinel identity; remediation: recompute the full observation once and refresh watcher_registration_fault_json"
+        )
+        .into());
+    }
+    let stored_sentinel_sha256 =
+        fault
+            .get("sentinel_sha256")
+            .and_then(Value::as_str)
+            .ok_or_else(|| -> DynError {
+                format!(
+                    "ASTRO_WATCHER_REGISTRATION_FAULT_SENTINEL_HASH_MISSING: durable registration fault for {project:?} has no sentinel_sha256; remediation: recompute the full observation once and refresh watcher_registration_fault_json"
+                )
+                .into()
+            })?;
+    let actual_sentinel_sha256 = value_sha256(&sentinel)?;
+    if stored_sentinel_sha256 != actual_sentinel_sha256 {
+        return Err(format!(
+            "ASTRO_WATCHER_REGISTRATION_FAULT_SENTINEL_HASH_MISMATCH: durable registration fault for {project:?} stores sentinel_sha256={stored_sentinel_sha256}, but readback sentinel hashes to {actual_sentinel_sha256}; remediation: recompute the full observation once and refresh watcher_registration_fault_json"
+        )
+        .into());
+    }
+    match sentinel.get("shadow_publication") {
+        Some(shadow_publication)
+            if shadow_publication.get("schema").and_then(Value::as_str)
+                == Some("astrolabe.shadow-publication-recovery-sentinel.v1")
+                && shadow_publication.get("project").and_then(Value::as_str) == Some(project)
+                && shadow_publication.get("fault_code").and_then(Value::as_str)
+                    == Some(fault_code) => {}
+        _ => {
+            return Err(format!(
+                "ASTRO_WATCHER_REGISTRATION_FAULT_SENTINEL_SHADOW_IDENTITY_MISMATCH: durable registration fault for {project:?} has malformed shadow-publication sentinel identity; remediation: recompute the full observation once and refresh watcher_registration_fault_json"
+            )
+            .into());
+        }
+    }
+    Ok(sentinel)
+}
+
+fn registration_recovery_observation_field(observation: &Value, field: &str) -> Value {
+    observation
+        .get("shadow_publication")
+        .and_then(|value| value.get(field))
+        .cloned()
+        .unwrap_or(Value::Null)
+}
+
+fn registration_recovery_sentinel_field(sentinel: &Value, section: &str, field: &str) -> Value {
+    sentinel
+        .get("shadow_publication")
+        .and_then(|value| value.get(section))
+        .and_then(|value| value.get(field))
+        .cloned()
+        .unwrap_or(Value::Null)
+}
+
+fn shadow_publication_recovery_error_code(message: &str) -> Option<&str> {
+    message
+        .split(|ch: char| !(ch.is_ascii_uppercase() || ch.is_ascii_digit() || ch == '_'))
+        .find(|token| {
+            token.starts_with("ASTRO_SHADOW_PUBLICATION_RECOVERY_")
+                || token.starts_with("ASTRO_SHADOW_ACTION_METADATA_RECOVERY_")
+                || token.starts_with("ASTRO_SHADOW_PUBLICATION_JOURNAL_")
+                || matches!(
+                    *token,
+                    "ASTRO_SHADOW_PUBLICATION_LEGACY_PRESERVED"
+                        | "ASTRO_SHADOW_PUBLICATION_TRANSACTION_NAME_INVALID"
+                )
+        })
+}
+
+fn recovery_fault_log_class(fault_code: &str) -> String {
+    fault_code
+        .strip_prefix("ASTRO_")
+        .unwrap_or(fault_code)
+        .to_ascii_lowercase()
+}
+
 fn poll_incremental_watcher(watcher: &mut CbmWatcher) {
     if let Err(error) = watcher.poll_once() {
         tracing::warn!(
@@ -317,11 +878,73 @@ fn persist_registration_error(
         "message": message,
         "remediation": "repair the persisted index_repository arguments and retry registration",
     });
-    write_config_value(
-        cache_dir,
-        &metadata_key(project, WATCHER_TICK_STATUS_KEY),
-        &serde_json::to_string(&status)?,
-    )?;
+    let key = metadata_key(project, WATCHER_TICK_STATUS_KEY);
+    let serialized = serde_json::to_string(&status)?;
+    write_config_value(cache_dir, &key, &serialized)?;
+    if read_config_value(cache_dir, &key)?.as_deref() != Some(serialized.as_str()) {
+        return Err(format!(
+            "ASTRO_WATCHER_STATUS_READBACK_MISMATCH: durable registration error row for {project:?} did not equal its exact write"
+        )
+        .into());
+    }
+    Ok(())
+}
+
+fn read_registration_recovery_fault(
+    cache_dir: &Path,
+    project: &str,
+) -> Result<Option<Value>, DynError> {
+    let key = metadata_key(project, WATCHER_REGISTRATION_FAULT_STATUS_KEY);
+    let fault = read_config_value(cache_dir, &key)?
+        .map(|raw| {
+            serde_json::from_str::<Value>(&raw).map_err(|error| -> DynError {
+                format!(
+                    "ASTRO_WATCHER_REGISTRATION_FAULT_MALFORMED: durable registration fault row for {project:?} is not valid JSON: {error}; remediation: preserve the config store and inspect watcher_registration_fault_json"
+                )
+                .into()
+            })
+        })
+        .transpose()?;
+    if let Some(fault) = fault.as_ref()
+        && (fault.get("schema").and_then(Value::as_str)
+            != Some("astrolabe-watcher-registration-recovery-fault-v1")
+            || fault.get("status").and_then(Value::as_str) != Some("terminal_fault")
+            || fault.get("project").and_then(Value::as_str) != Some(project))
+    {
+        return Err(format!(
+            "ASTRO_WATCHER_REGISTRATION_FAULT_IDENTITY_MISMATCH: durable registration fault row for {project:?} does not bind the expected schema/status/project; remediation: preserve the config store and inspect watcher_registration_fault_json"
+        )
+        .into());
+    }
+    Ok(fault)
+}
+
+fn persist_registration_recovery_fault(
+    cache_dir: &Path,
+    project: &str,
+    fault: &Value,
+) -> Result<(), DynError> {
+    let key = metadata_key(project, WATCHER_REGISTRATION_FAULT_STATUS_KEY);
+    let serialized = serde_json::to_string(fault)?;
+    write_config_value(cache_dir, &key, &serialized)?;
+    if read_config_value(cache_dir, &key)?.as_deref() != Some(serialized.as_str()) {
+        return Err(format!(
+            "ASTRO_WATCHER_REGISTRATION_FAULT_READBACK_MISMATCH: durable registration fault for {project:?} did not equal its exact write"
+        )
+        .into());
+    }
+    Ok(())
+}
+
+fn delete_registration_recovery_fault(cache_dir: &Path, project: &str) -> Result<(), DynError> {
+    let key = metadata_key(project, WATCHER_REGISTRATION_FAULT_STATUS_KEY);
+    delete_config_value(cache_dir, &key)?;
+    if read_config_value(cache_dir, &key)?.is_some() {
+        return Err(format!(
+            "ASTRO_WATCHER_REGISTRATION_FAULT_DELETE_READBACK_MISMATCH: durable registration fault row for {project:?} remained after deletion"
+        )
+        .into());
+    }
     Ok(())
 }
 
@@ -391,7 +1014,7 @@ fn run_watcher_index_tick(
                 "schema": "astrolabe-watcher-fault-v1",
                 "status": "terminal_fault",
                 "project": project,
-                "fault_code": fault_code,
+                "fault_code": fault_code.clone(),
                 "observation": observation,
                 "observation_sha256": observation_sha256,
                 "rearm_signature": watcher_rearm_signature(cache_dir, project, &normalized_args)?,
@@ -413,7 +1036,7 @@ fn run_watcher_index_tick(
                 "schema": "astrolabe-watcher-tick-v2",
                 "status": "terminal_fault_recorded",
                 "project": project,
-                "fault_code": fault_code,
+                "fault_code": fault_code.clone(),
                 "elapsed_ms": elapsed_ms,
                 "observation_sha256": fault.get("observation_sha256"),
                 "response_sha256": fault.get("response_sha256"),
@@ -622,6 +1245,22 @@ fn executable_observation() -> Result<Value, DynError> {
         .map_err(Into::into)
 }
 
+fn executable_sentinel() -> Result<Value, DynError> {
+    static SENTINEL: OnceLock<Result<Value, String>> = OnceLock::new();
+    SENTINEL
+        .get_or_init(|| {
+            let path = std::env::current_exe().map_err(|error| error.to_string())?;
+            let metadata = file_metadata_observation(&path).map_err(|error| error.to_string())?;
+            Ok(json!({
+                "schema": "astrolabe-watcher-executable-sentinel-v1",
+                "path": path,
+                "metadata": metadata,
+            }))
+        })
+        .clone()
+        .map_err(Into::into)
+}
+
 fn file_metadata_observation(path: &Path) -> Result<Value, DynError> {
     match fs::metadata(path) {
         Ok(metadata) => Ok(json!({
@@ -660,7 +1299,7 @@ fn value_sha256(value: &Value) -> Result<String, DynError> {
     Ok(hex_lower(&Sha256::digest(serde_json::to_vec(value)?)))
 }
 
-fn terminal_watcher_fault_code(response: &Value) -> Option<&'static str> {
+fn terminal_watcher_fault_code(response: &Value) -> Option<String> {
     const TERMINAL_CODES: &[&str] = &[
         "CBM_SCHEMA_VERSION_UNSTAMPED",
         "CBM_SCHEMA_VERSION_UNSUPPORTED",
@@ -675,8 +1314,11 @@ fn terminal_watcher_fault_code(response: &Value) -> Option<&'static str> {
         .and_then(|value| value.get("code"))
         .and_then(Value::as_str)
         .or_else(|| response.get("code").and_then(Value::as_str));
-    if let Some(code) = structured_code {
-        return TERMINAL_CODES.iter().copied().find(|known| *known == code);
+    if let Some(code) = structured_code
+        && (TERMINAL_CODES.contains(&code)
+            || shadow_publication_recovery_error_code(code).is_some())
+    {
+        return Some(code.to_string());
     }
     let text = response
         .get("content")
@@ -686,13 +1328,18 @@ fn terminal_watcher_fault_code(response: &Value) -> Option<&'static str> {
         .and_then(Value::as_str)?;
     if let Ok(inner) = serde_json::from_str::<Value>(text)
         && let Some(code) = inner.get("code").and_then(Value::as_str)
+        && (TERMINAL_CODES.contains(&code)
+            || shadow_publication_recovery_error_code(code).is_some())
     {
-        return TERMINAL_CODES.iter().copied().find(|known| *known == code);
+        return Some(code.to_string());
     }
-    TERMINAL_CODES.iter().copied().find(|code| {
+    if let Some(code) = TERMINAL_CODES.iter().copied().find(|code| {
         text.strip_prefix(code)
             .is_some_and(|suffix| suffix.starts_with(':') || suffix.starts_with(' '))
-    })
+    }) {
+        return Some(code.to_string());
+    }
+    shadow_publication_recovery_error_code(text).map(ToOwned::to_owned)
 }
 
 fn persist_watcher_status(cache_dir: &Path, project: &str, status: &Value) -> Result<(), DynError> {

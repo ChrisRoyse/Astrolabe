@@ -18,6 +18,7 @@
 #include "foundation/compat.h"
 #include "foundation/compat_fs.h" // cbm_fopen — crash-supervisor per-file marker write
 #include "foundation/log.h"       // cbm_log_warn — explicit preprocessor diagnostics
+#include "foundation/slab_alloc.h" // cbm_slab_install — stable tree-sitter allocator binding
 #include "tree_sitter/api.h" // TSParser, TSNode, TSTree, TSInput, TSLanguage, TSPoint, TSParseOptions, TSParseState
 #include "foundation/constants.h"
 #include "mimalloc.h" // mi_malloc/mi_calloc/mi_realloc/mi_free/mi_usable_size — bind 3rd-party allocators (#424)
@@ -305,56 +306,44 @@ bool cbm_diagnostics_push(CBMParseDiagnosticArray *arr, CBMArena *a, CBMParseDia
     return true;
 }
 
-// --- Language-neutral parse-recovery diagnostics (#909) ---
-//
-// tree-sitter returns NULL only on timeout/cancellation or allocation failure.
-// Malformed source ALWAYS yields a non-NULL tree carrying ERROR and/or MISSING
-// nodes, because error recovery is the parser's design. A caller that checks
-// only `!tree` therefore walks a known-degraded tree as if it were clean, and
-// the symbols the parser could not recover vanish with no signal — a silent
-// degradation, which standing invariant 3 forbids.
-//
-// ERROR and MISSING are distinct and BOTH must be caught: MISSING nodes are
-// zero-width tokens the parser inserted to recover, and they are not reachable
-// through an (ERROR) query. `ts_node_is_error() || ts_node_is_missing()` is the
-// exact pair. See tree-sitter/tree-sitter#396.
-//
-// This is not a fallback: the index still completes and unaffected syntax stays
-// indexed. The degradation becomes labeled and counted instead of invisible.
-static bool cbm_add_parse_diagnostic(CBMExtractCtx *ctx, TSNode node, bool missing) {
+bool cbm_add_parse_diagnostic(CBMExtractCtx *ctx, TSNode node, const char *code,
+                              const char *operation, const char *message,
+                              const char *remediation, bool is_missing) {
     if (!ctx || !ctx->result || !ctx->arena || ts_node_is_null(node)) {
         return false;
     }
     uint32_t start = ts_node_start_byte(node);
     uint32_t end = ts_node_end_byte(node);
     CBMParseDiagnostic diag = {
-        .code = missing ? "CBM_PARSE_MISSING_TOKEN" : "CBM_PARSE_RECOVERY",
-        .operation = "parse",
-        .message = missing ? "the grammar inserted a missing token to recover at this exact "
-                             "source span; symbols in this span may be absent or wrong"
-                           : "the grammar required error recovery at this exact source span; "
-                             "symbols in this span may be absent or wrong",
-        .remediation = "inspect the exact span and repair the source; unaffected syntax in this "
-                       "file remains indexed with this degradation labeled and counted",
+        .code = code,
+        .operation = operation,
+        .message = message,
+        .remediation = remediation,
         .node_type = ts_node_type(node),
         .start_line = ts_node_start_point(node).row + 1,
         .end_line = cbm_node_end_line_inclusive(node),
         .start_byte = start,
         .end_byte = end,
-        .is_missing = missing,
+        .is_missing = is_missing,
     };
     if (end > start && end <= (uint32_t)ctx->source_len) {
         diag.source = cbm_arena_strndup(ctx->arena, ctx->source + start, (size_t)(end - start));
         diag.source_len = end - start;
     }
-    return cbm_diagnostics_push(&ctx->result->diagnostics, ctx->arena, diag);
+    bool pushed = cbm_diagnostics_push(&ctx->result->diagnostics, ctx->arena, diag);
+    char line_text[32];
+    (void)snprintf(line_text, sizeof(line_text), "%u", diag.start_line);
+    cbm_log_warn("extract.parse_diagnostic", "code", code ? code : "", "operation",
+                 operation ? operation : "", "path", ctx->rel_path ? ctx->rel_path : "",
+                 "node_type", diag.node_type ? diag.node_type : "", "line", line_text,
+                 "missing", is_missing ? "true" : "false", "message", message ? message : "",
+                 "remediation", remediation ? remediation : "");
+    return pushed;
 }
 
-// Walk the tree and record one diagnostic per ERROR/MISSING node. Callers MUST
-// gate this on ts_node_has_error(root): that is an O(1) flag read, so a clean
-// file pays nothing and only genuinely degraded files pay for the walk.
-static void cbm_record_parse_recovery_diagnostics(CBMExtractCtx *ctx) {
-    if (!ctx || ts_node_is_null(ctx->root)) {
+static void cbm_record_tree_sitter_parse_diagnostics(CBMExtractCtx *ctx) {
+    if (!ctx || !ctx->result || !ctx->arena || ts_node_is_null(ctx->root) ||
+        !ts_node_has_error(ctx->root)) {
         return;
     }
     CBMArena scratch;
@@ -362,15 +351,22 @@ static void cbm_record_parse_recovery_diagnostics(CBMExtractCtx *ctx) {
     TSNodeStack stack;
     ts_nstack_init(&stack, &scratch, 128);
     ts_nstack_push(&stack, &scratch, ctx->root);
-    while (stack.count > 0 && !cbm_arena_failed(ctx->arena)) {
+    while (stack.count > 0 && !cbm_arena_failed(ctx->arena) && !cbm_arena_failed(&scratch)) {
         TSNode node = ts_nstack_pop(&stack);
         bool missing = ts_node_is_missing(node);
         if (ts_node_is_error(node) || missing) {
-            cbm_add_parse_diagnostic(ctx, node, missing);
-            // An ERROR node's children are unrecognized fragments, not
-            // independent faults; descending would multiply one syntax error
-            // into a misleading pile of diagnostics. Record the span, stop.
-            if (!missing) {
+            (void)cbm_add_parse_diagnostic(
+                ctx, node, missing ? "CBM_PARSE_MISSING_TOKEN" : "CBM_PARSE_RECOVERY",
+                "parse_tree_sitter",
+                missing
+                    ? "the grammar inserted a zero-width missing token during tree-sitter error "
+                      "recovery"
+                    : "the grammar required tree-sitter error recovery at this exact source span",
+                "inspect the exact diagnostic span and repair the source; unaffected syntax "
+                "outside the reported recovery remains indexed with this degradation labeled "
+                "and counted",
+                missing);
+            if (ts_node_is_error(node)) {
                 continue;
             }
         }
@@ -431,14 +427,22 @@ static TSParser *get_thread_parser(const TSLanguage *ts_lang, CBMLanguage lang) 
 
 // --- Allocator binding (defense-in-depth, #424) ---
 
-/* Bind tree-sitter and sqlite3 to mimalloc explicitly so a correct
- * binary does NOT depend on the fragile MI_OVERRIDE symbol override. Under
+/* Bind sqlite3 to mimalloc explicitly so a correct binary does NOT depend on
+ * the fragile MI_OVERRIDE symbol override. Under
  * MI_OVERRIDE=1 — particularly the Windows static-MinGW link with
  * --allow-multiple-definition — `malloc`/`free` can resolve to DIFFERENT
  * allocators (mimalloc vs the CRT) inside third-party libs, so a block
  * allocated by mimalloc gets freed by the CRT (or vice-versa), corrupting the
- * heap freelist (#424). Binding each library through one explicit allocator
+ * heap freelist (#424). Binding sqlite through one explicit allocator
  * eliminates that mismatch class generically, on every platform.
+ *
+ * Tree-sitter is bound once to CBM's slab allocator, backed by the same process
+ * heap for non-slab allocations. That install must happen here, before the
+ * first parser object exists. Installing the slab allocator lazily in the
+ * parallel pipeline after sequential extraction has already created parsers
+ * violates Tree-sitter's global allocator contract and can corrupt the heap
+ * when a long-lived archaeology worker crosses from small sequential commits
+ * into its first parallel commit.
  *
  * Guarded to the production build (CBM_BIND_TS_ALLOCATOR=1, which CFLAGS_PROD
  * defines alongside MI_OVERRIDE=1). The test build is CRT + ASan, where binding
@@ -479,11 +483,11 @@ static void cbm_sqlite_memshutdown(void *appdata) {
 
 /* Allocator-binding state (#5). File-scope (was a function-local static) so
  * cbm_alloc_bindings_active() can read back whether cbm_alloc_init() has already
- * bound the tree-sitter/sqlite allocators to mimalloc. This gives the Rust FFI
- * tests a deterministic init-order probe: the flag flips 0 -> 1 exactly once,
- * the first time cbm_alloc_init() runs in a build that enables the binding.
- * Single-threaded startup; a plain int is fine. Always 0 in the test build
- * (CBM_BIND_TS_ALLOCATOR undefined) because the binding is a no-op there. */
+ * bound SQLite to mimalloc and Tree-sitter to CBM's slab allocator. This gives
+ * the Rust FFI tests a deterministic init-order probe: the flag flips 0 -> 1
+ * exactly once, the first time cbm_alloc_init() runs in a build that enables the
+ * binding. Single-threaded startup; a plain int is fine. Always 0 in the test
+ * build (CBM_BIND_TS_ALLOCATOR undefined) because the binding is a no-op there. */
 static int cbm_alloc_bound = 0;
 static int cbm_alloc_error = 0;
 
@@ -526,7 +530,7 @@ int cbm_alloc_init(void) {
     /* SQLite accepted its allocator. Tree-sitter has a void setter and cannot
      * reject this complete function table, so publish success only after both
      * bindings have been installed. */
-    ts_set_allocator(mi_malloc, mi_calloc, mi_realloc, mi_free);
+    cbm_slab_install();
     cbm_alloc_bound = 1;
 #endif /* CBM_BIND_TS_ALLOCATOR */
     return 0;
@@ -534,10 +538,10 @@ int cbm_alloc_init(void) {
 
 int cbm_alloc_bindings_active(void) {
     /* Reads back the file-scope binding flag cbm_alloc_init() sets. Non-zero
-     * proves cbm_alloc_init() has run and bound tree-sitter/sqlite to mimalloc
-     * (only possible in a CBM_BIND_TS_ALLOCATOR build — libcbm.a and the prod
-     * binary). Used by the Rust init-order FFI test as independent evidence,
-     * not a return-value echo. */
+     * proves cbm_alloc_init() has run and bound SQLite to mimalloc plus
+     * Tree-sitter to CBM's slab allocator (only possible in a
+     * CBM_BIND_TS_ALLOCATOR build — libcbm.a and the prod binary). Used by the
+     * Rust init-order FFI test as independent evidence, not a return-value echo. */
     return cbm_alloc_bound;
 }
 
@@ -945,6 +949,14 @@ static CBMFileResult *cbm_extract_file_impl(const char *source, int source_len,
         return result;
     }
 
+    if (cbm_init() != 0) {
+        cbm_file_result_set_error(
+            result, "CBM_ALLOCATOR_INIT_FAILED", "cbm_init", "allocator", 0,
+            "the extraction allocator contract could not be initialized before parsing",
+            "inspect allocator.bind_failed and restart the process");
+        return result;
+    }
+
     // Get language spec
     const CBMLangSpec *spec = cbm_lang_spec(language);
     if (!spec) {
@@ -1031,6 +1043,7 @@ static CBMFileResult *cbm_extract_file_impl(const char *source, int source_len,
     }
 
     TSNode root = ts_tree_root_node(tree);
+    bool root_has_parse_recovery = ts_node_has_error(root);
 
     // Compute module QN. Java/Go derive the module from the CONTAINING
     // DIRECTORY (package semantics) rather than baking the filename stem in,
@@ -1059,28 +1072,16 @@ static CBMFileResult *cbm_extract_file_impl(const char *source, int source_len,
             structured_classification_provenance,
     };
 
-    // Parse-recovery accounting (#909). ts_node_has_error is an O(1) flag read
-    // covering both ERROR and MISSING descendants, so clean files — the
-    // overwhelming majority — pay nothing and never enter the walk.
-    if (ts_node_has_error(root)) {
-        if (language == CBM_LANG_POWERSHELL) {
-            // PowerShell keeps its more specific codes (Add-Type C# payloads
-            // are diagnosed separately from host-language recovery).
-            cbm_powershell_record_parse_diagnostics(&ctx);
-        } else {
-            cbm_record_parse_recovery_diagnostics(&ctx);
-        }
-        if (!cbm_extract_arena_ok(result, "parse_diagnostics", rel_path)) {
+    if (root_has_parse_recovery && language == CBM_LANG_POWERSHELL) {
+        cbm_powershell_record_parse_diagnostics(&ctx);
+        if (!cbm_extract_arena_ok(result, "powershell_parse_diagnostics", rel_path)) {
             goto extraction_failed;
         }
-        char diag_count_buf[32];
-        char lang_id_buf[32];
-        snprintf(diag_count_buf, sizeof(diag_count_buf), "%d", result->diagnostics.count);
-        snprintf(lang_id_buf, sizeof(lang_id_buf), "%d", (int)language);
-        cbm_log_warn("parse.recovery", "file", rel_path, "language_id", lang_id_buf, "diagnostics",
-                     diag_count_buf, "message",
-                     "tree-sitter required error recovery; symbols in the named spans may be "
-                     "absent from the graph");
+    } else if (root_has_parse_recovery) {
+        cbm_record_tree_sitter_parse_diagnostics(&ctx);
+        if (!cbm_extract_arena_ok(result, "parse_recovery_diagnostics", rel_path)) {
+            goto extraction_failed;
+        }
     }
 
     // Run extractors: defs + imports use separate walks (unique recursion patterns),

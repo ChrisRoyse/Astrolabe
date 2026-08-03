@@ -13,7 +13,7 @@
  * Watcher runs in a background thread, polling for git changes.
  * HTTP UI server (optional) runs in a background thread on localhost.
  */
-#include "cbm.h" // cbm_alloc_init — bind 3rd-party allocators to mimalloc before any sqlite/git init
+#include "cbm.h" // cbm_alloc_init — bind SQLite allocator and Tree-sitter slab before sqlite/git init
 #include "mcp/mcp.h"
 #include "mcp/index_supervisor.h"
 #include "watcher/watcher.h"
@@ -1053,7 +1053,7 @@ int main(int argc, char **argv) {
         cbm_thread_join(&watcher_tid);
     }
     cbm_watcher_free(g_watcher);
-    cbm_store_close(watch_store);
+    cbm_store_close_required(&watch_store, "main.watch_store.complete");
     cbm_mcp_server_free(g_server);
     cbm_config_close(runtime_config);
 

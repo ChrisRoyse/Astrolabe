@@ -118,7 +118,18 @@ pub(crate) fn handle_query_graph(
         return Ok(runner.handle_tool_raw("query_graph", args_json)?);
     };
     let Some(as_of_value) = args_obj.get("as_of") else {
-        // Pure legacy request — CBM serves it byte-for-byte against the live store.
+        if let Some(project) = status_project_from_args(args_obj)?
+            && read_dial(&project)? == MigrationDial::Shadow
+        {
+            let cache_dir = astrolabe_bridge::cbm_cache_dir()?;
+            if let Some(refusal) =
+                shadow_graph_freshness_refusal(&cache_dir, &project, "query_graph")?
+            {
+                return Ok(refusal);
+            }
+        }
+        // Pure legacy request — CBM serves it byte-for-byte against the live store
+        // after any named shadow project has passed the source freshness gate (#916).
         return Ok(runner.handle_tool_raw("query_graph", args_json)?);
     };
 
@@ -145,6 +156,9 @@ pub(crate) fn handle_query_graph(
     }
 
     let cache_dir = astrolabe_bridge::cbm_cache_dir()?;
+    if let Some(refusal) = shadow_graph_freshness_refusal(&cache_dir, &project, "query_graph")? {
+        return Ok(refusal);
+    }
     let width_ms = as_of_bucket_width_ms();
     let bucket = as_of_millis / width_ms;
     let canonical_millis = bucket.saturating_mul(width_ms);

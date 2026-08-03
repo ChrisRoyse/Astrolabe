@@ -36,6 +36,87 @@ enum {
     CBM_STORE_VERIFY_PATH_MAX = 4096,
 };
 
+/* Exact physical close result.  Every field crossing the C/Rust boundary has
+ * an explicit width; callers must key behavior on status and
+ * connection_destroyed rather than inferring closure from pointer ownership.
+ * A close can report cached-statement execution/finalize errors even when the
+ * underlying SQLite connection was physically destroyed successfully. */
+typedef int32_t cbm_store_close_status_t;
+
+enum {
+    CBM_STORE_CLOSE_OK = 0,
+    CBM_STORE_CLOSE_FINALIZE_FAILED = 1,
+    CBM_STORE_CLOSE_OUTSTANDING_STATEMENTS = 2,
+    CBM_STORE_CLOSE_FAILED = 3,
+    CBM_STORE_CLOSE_INVALID_ARGUMENT = 4,
+    CBM_STORE_CLOSE_ABI_VERSION = 1,
+    CBM_STORE_CLOSE_CACHED_STATEMENT_COUNT = 34,
+    CBM_STORE_CLOSE_STATEMENT_NAME_MAX = 64,
+    CBM_STORE_CLOSE_SQL_TEXT_MAX = 512,
+    CBM_STORE_CLOSE_SQL_SHA256_MAX = 65,
+};
+
+typedef struct {
+    int32_t sqlite_error;
+    char statement_name[CBM_STORE_CLOSE_STATEMENT_NAME_MAX];
+} cbm_store_finalize_error_t;
+
+typedef struct {
+    uint32_t abi_version;
+    uint32_t struct_size;
+    cbm_store_close_status_t status;
+    int32_t sqlite_close_code;
+    uint32_t connection_was_present;
+    uint32_t close_attempted;
+    uint32_t connection_destroyed;
+    uint32_t db_path_truncated;
+    uint64_t db_path_bytes;
+    uint32_t cached_statement_count;
+    uint32_t finalize_error_count;
+    cbm_store_finalize_error_t
+        finalize_errors[CBM_STORE_CLOSE_CACHED_STATEMENT_COUNT];
+    uint64_t outstanding_statement_count;
+    uint64_t first_outstanding_sql_bytes;
+    uint32_t first_outstanding_sql_available;
+    uint32_t first_outstanding_sql_truncated;
+    char first_outstanding_sql_sha256[CBM_STORE_CLOSE_SQL_SHA256_MAX];
+    char first_outstanding_sql[CBM_STORE_CLOSE_SQL_TEXT_MAX];
+    char db_path[CBM_STORE_VERIFY_PATH_MAX];
+} cbm_store_close_result_t;
+
+/* Existing-writer journal normalization result.  This transaction deliberately
+ * does not close the store: its caller must consume this result and then use
+ * cbm_store_close so connection destruction remains one independent proof. */
+typedef int32_t cbm_store_normalize_status_t;
+
+enum {
+    CBM_STORE_NORMALIZE_OK = 0,
+    CBM_STORE_NORMALIZE_INVALID_ARGUMENT = 1,
+    CBM_STORE_NORMALIZE_READ_ONLY = 2,
+    CBM_STORE_NORMALIZE_JOURNAL_READ_FAILED = 3,
+    CBM_STORE_NORMALIZE_UNSUPPORTED_JOURNAL_MODE = 4,
+    CBM_STORE_NORMALIZE_CHECKPOINT_FAILED = 5,
+    CBM_STORE_NORMALIZE_CHECKPOINT_INCOMPLETE = 6,
+    CBM_STORE_NORMALIZE_SET_DELETE_FAILED = 7,
+    CBM_STORE_NORMALIZE_READBACK_FAILED = 8,
+    CBM_STORE_NORMALIZE_ABI_VERSION = 1,
+    CBM_STORE_NORMALIZE_MODE_MAX = 16,
+};
+
+typedef struct {
+    uint32_t abi_version;
+    uint32_t struct_size;
+    cbm_store_normalize_status_t status;
+    int32_t sqlite_error;
+    int32_t wal_log_frames;
+    int32_t wal_checkpointed_frames;
+    int32_t wal_remaining_frames;
+    char journal_mode_before[CBM_STORE_NORMALIZE_MODE_MAX];
+    char journal_mode_after[CBM_STORE_NORMALIZE_MODE_MAX];
+    char operation[CBM_STORE_VERIFY_OPERATION_MAX];
+    char detail[CBM_STORE_VERIFY_DETAIL_MAX];
+} cbm_store_normalize_result_t;
+
 typedef struct {
     cbm_store_verify_status_t status;
     uint32_t native_error;
@@ -50,6 +131,8 @@ typedef struct {
     uint32_t cleanup_native_error;
     uint64_t db_bytes;
     char db_sha256[65];
+    uint64_t wal_bytes;
+    char wal_sha256[65];
     char operation[CBM_STORE_VERIFY_OPERATION_MAX];
     char cleanup_operation[CBM_STORE_VERIFY_OPERATION_MAX];
     char detail[CBM_STORE_VERIFY_DETAIL_MAX];
@@ -269,7 +352,9 @@ cbm_store_t *cbm_store_open_path_query(const char *db_path);
  * scratch directory because it is a mutable cache, not database content.  After
  * the snapshot passes, the SHM guard is released and the source query connection
  * is opened while the DB/WAL guards still exclude writers; only then are those
- * guards released.  `out_store` is set only on VERIFY_OK.
+ * guards released.  `out_store` is set on VERIFY_OK.  If cleanup itself finds
+ * an exact-close failure, the non-OK result retains the still-owned handle in
+ * `out_store` so the caller can inspect and retry closure without losing it.
  *
  * Returns one cbm_store_verify_status_t value and fills `result` with the exact
  * failed operation and native/SQLite diagnostics.  Every non-OK status is
@@ -288,6 +373,23 @@ cbm_store_verify_status_t cbm_store_open_path_project_query_verified(
     const char *db_path, const char *project, cbm_store_t **out_store,
     cbm_store_verify_result_t *result);
 
+/* Verify the complete frozen DB/WAL family and exact project/root provenance
+ * without opening the live source through SQLite.  A matching v2 exact-content
+ * receipt reuses the full SQLite proof while independently re-canonicalizing
+ * its content-bound project root and requiring content-bound DELETE mode.  A
+ * receipt miss verifies a byte- and hash-bound scratch snapshot before all
+ * source-family guards are released. */
+cbm_store_verify_status_t cbm_store_verify_path_project_snapshot(
+    const char *db_path, const char *project, cbm_store_verify_result_t *result);
+
+/* Verify the complete frozen DB/WAL family and exact project/root provenance
+ * without opening the live source, while accepting either valid WAL or DELETE
+ * journal state.  This is the mandatory preservation preflight before a live
+ * normalization writer is opened: malformed source DB/WAL bytes fail in the
+ * scratch family and cannot cause source SHM creation or source mutation. */
+cbm_store_verify_status_t cbm_store_verify_path_project_snapshot_for_normalization(
+    const char *db_path, const char *project, cbm_store_verify_result_t *result);
+
 /* Open one already-verified named project for mutation without creating or
  * initializing anything.  The database must already exist and be genuinely
  * writable.  This preserves its current journal mode, applies only
@@ -300,6 +402,15 @@ cbm_store_verify_status_t cbm_store_open_path_project_writer_existing(
     const char *db_path, const char *project, cbm_store_t **out_store,
     cbm_store_verify_result_t *result);
 
+/* Open the existing writer only when its exact DB/WAL bytes still match a
+ * successful frozen normalization preflight. The writer acquires SQLite's
+ * exclusive ownership before re-hashing the live family, so a pathname or WAL
+ * generation change is refused before journal normalization can begin. */
+cbm_store_verify_status_t cbm_store_open_path_project_writer_existing_bound(
+    const char *db_path, const char *project,
+    const cbm_store_verify_result_t *expected_family, cbm_store_t **out_store,
+    cbm_store_verify_result_t *result);
+
 /* Verify and open the graph state consumed by cbm_gbuf_load_from_db.  This uses
  * the same source-family freeze, byte/hash-checked snapshot, and race-free
  * read-only publication boundary as cbm_store_open_path_query_verified, but
@@ -307,7 +418,8 @@ cbm_store_verify_status_t cbm_store_open_path_project_writer_existing(
  * requiring query-only projections such as nodes_fts.  The sole persisted
  * project must exactly equal `project`; a different or missing project is an
  * integrity failure, never an empty-graph success or a retry through another
- * open profile.  `out_store` is set only on VERIFY_OK. */
+ * open profile.  `out_store` is set on VERIFY_OK or retains the exact handle
+ * only when a non-OK cleanup close could not physically destroy it. */
 cbm_store_verify_status_t cbm_store_open_path_graph_verified(const char *db_path,
                                                              const char *project,
                                                              cbm_store_t **out_store,
@@ -328,8 +440,20 @@ bool cbm_store_check_integrity(cbm_store_t *s);
 /* Open database for a named project in the default cache dir. */
 cbm_store_t *cbm_store_open(const char *project);
 
-/* Close the store and free all resources. NULL-safe. */
-void cbm_store_close(cbm_store_t *s);
+/* Physically close one owned store.  The pointer is cleared and its wrapper is
+ * freed only after sqlite3_close returns SQLITE_OK.  On SQLITE_BUSY, any
+ * prepared statement that survives SQLite's virtual-table disconnect is
+ * reported and left owned by the unchanged store pointer; it is never silently
+ * finalized or converted into a sqlite3_close_v2 zombie. */
+cbm_store_close_status_t cbm_store_close(cbm_store_t **store,
+                                         cbm_store_close_result_t *result);
+
+/* Close a transient owner whose surrounding legacy API has no result channel.
+ * Any non-OK result is logged with the complete close record and terminates the
+ * process, so a caller can never return success, discard the retained owner, or
+ * continue after an unevaluable physical close. Long-lived owners that can
+ * retain and report failure (notably MCP) must call cbm_store_close directly. */
+void cbm_store_close_required(cbm_store_t **store, const char *operation);
 
 /* Get the underlying sqlite3 handle (for testing only). */
 struct sqlite3 *cbm_store_get_db(cbm_store_t *s);
@@ -374,6 +498,13 @@ int cbm_store_create_indexes(cbm_store_t *s);
 /* Require a complete WAL TRUNCATE checkpoint, then PRAGMA optimize.
  * Active readers/checkpoint owners and all SQLite failures are hard errors. */
 int cbm_store_checkpoint(cbm_store_t *s);
+
+/* Normalize one already-verified existing writer to rollback-journal DELETE.
+ * DELETE is verified without mutation.  WAL requires an exact TRUNCATE
+ * checkpoint with zero remaining frames, then PRAGMA journal_mode=DELETE and
+ * an independent DELETE readback.  Every other mode is refused. */
+cbm_store_normalize_status_t cbm_store_normalize_journal_mode_delete(
+    cbm_store_t *s, cbm_store_normalize_result_t *result);
 
 /* Resolve the mmap_size pragma value applied to on-disk stores from the
  * CBM_SQLITE_MMAP_SIZE environment variable. Defaults to 67108864 (64 MB)

@@ -24,6 +24,8 @@
 //!                              [--limit <n>] [--parallelism <n>] [--timeout-secs <n>]
 //!                              [--host-admission-timeout-secs <n>]
 //!                              [--force] [--at <unix-secs>]
+//! astrolabe-fleet shared-checkout --source-repo <dir> --dest <dir> [--commit <rev>]
+//!                              [--path <repo-relative-path> ...]
 //! astrolabe-fleet retire-source [--root <dir>] [--farm-root <dir>]
 //!                              [--store-root <dir>] [--scope <fleet-scope>]
 //!                              --repo <owner/name> ... [--at <unix-secs>]
@@ -76,7 +78,7 @@
 
 use std::io::BufRead;
 use std::path::PathBuf;
-use std::process::ExitCode;
+use std::process;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use astrolabe_fleet::catalog::FleetCatalog;
@@ -87,12 +89,16 @@ use calyx_core::{CalyxError, CxId};
 use serde::Serialize;
 use serde_json::json;
 
-const USAGE: &str = "usage: astrolabe-fleet <catalog-init|register|set-state|get|list|discover|clone|pipeline|retire-source|migrate-vault-wal|upgrade-projection|grow|ledger-scan|report|report-read|report-list|run-report-read|probe-vault-keys|dedup-census|compose|kernel-read> [--root <dir>] [verb options]; see crate docs";
+const USAGE: &str = "usage: astrolabe-fleet <catalog-init|register|set-state|get|list|discover|clone|pipeline|shared-checkout|retire-source|migrate-vault-wal|upgrade-projection|grow|ledger-scan|report|report-read|report-list|run-report-read|probe-vault-keys|dedup-census|compose|kernel-read> [--root <dir>] [verb options]; see crate docs";
 
-fn main() -> ExitCode {
+fn main() {
+    process::exit(astrolabe_fleet::run_on_sized_host_thread(run_from_env));
+}
+
+fn run_from_env() -> i32 {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match run(&args) {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(()) => 0,
         Err(error) => {
             eprintln!(
                 "{}",
@@ -102,7 +108,7 @@ fn main() -> ExitCode {
                     "remediation": error.remediation,
                 })
             );
-            ExitCode::FAILURE
+            1
         }
     }
 }
@@ -113,6 +119,27 @@ fn run(args: &[String]) -> Result<(), CalyxError> {
         .map(String::as_str)
         .ok_or_else(|| usage("missing verb"))?;
     let opts = Options::parse(&args[1..])?;
+    if verb == "shared-checkout" {
+        opts.reject_unknown(&["source-repo", "dest", "commit", "path"])?;
+        let config = astrolabe_fleet::SharedCheckoutConfig {
+            source_repo: PathBuf::from(opts.require("source-repo")?),
+            destination: PathBuf::from(opts.require("dest")?),
+            commit: opts.get("commit").map(str::to_string),
+            paths: opts
+                .get_all("path")
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+        };
+        let report = astrolabe_fleet::create_shared_checkout(&config)?;
+        let value = serde_json::to_value(&report).map_err(|error| CalyxError {
+            code: astrolabe_fleet::ASTRO_FLEET_SHARED_CHECKOUT_OUTPUT,
+            message: format!("failed to serialize shared checkout report: {error}"),
+            remediation: astrolabe_fleet::REMEDIATE_OUTPUT,
+        })?;
+        println!("{value}");
+        return Ok(());
+    }
     let root = PathBuf::from(
         opts.get("root")
             .unwrap_or(astrolabe_fleet::discover::DEFAULT_CATALOG_ROOT),

@@ -110,6 +110,12 @@ typedef struct {
 void cbm_pipeline_record_fatal_error(cbm_pipeline_t *p, const char *code, const char *operation,
                                      const char *phase, const char *path, size_t requested,
                                      const char *message, const char *remediation);
+void cbm_pipeline_add_parse_recovery_diagnostics(cbm_pipeline_t *p, uint_least64_t count);
+void cbm_pipeline_record_parallel_dispatch(cbm_pipeline_t *p, const char *operation,
+                                           const char *mode, const char *code, int item_count,
+                                           int requested_workers, int admitted_workers,
+                                           int created_workers, int failed_worker_index,
+                                           int error_domain, unsigned long error_code);
 
 /* Host-neutral per-process accounting counters (#895).
  *
@@ -590,6 +596,8 @@ typedef struct {
     size_t retain_per_file_max_bytes;
 } cbm_parallel_extract_opts_t;
 
+/* worker_count must be positive for non-empty file sets. Invalid direct-call
+ * counts fail closed before worker-sized allocation or dispatch. */
 int cbm_parallel_extract_ex(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, int file_count,
                             CBMFileResult **result_cache, _Atomic int64_t *shared_ids,
                             int worker_count, const cbm_parallel_extract_opts_t *opts);
@@ -617,6 +625,8 @@ int cbm_build_registry_from_cache(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
  * pulling the pass header into every consumer of pipeline_internal.h. */
 struct CBMModuleDefIndex;
 
+/* worker_count must be positive for non-empty file sets. Invalid direct-call
+ * counts fail closed before worker-sized allocation or dispatch. */
 /* cbm_parallel_resolve's cross_registries param is typed `void*` to avoid
  * pulling lsp/go_lsp.h into every TU that includes pipeline_internal.h.
  * Callers cast a CBMCrossLspRegistries* (defined in pass_lsp_cross.h). */
@@ -750,6 +760,12 @@ void cbm_pipeline_pass_complexity(cbm_pipeline_ctx_t *ctx);
  * The caller owns *out_path. The direct writer still opens it with CREATE_NEW,
  * so an identity collision is a hard failure rather than an overwrite. */
 int cbm_pipeline_unique_stage_path(const char *db_path, const char *kind, char **out_path);
+
+/* Snapshot-only, exact-probe publication admission shared by full and
+ * incremental replacement paths. It never opens the live source with SQLite. */
+int cbm_pipeline_verify_live_store_before_publication(cbm_pipeline_t *p, const char *db_path,
+                                                      const char *live_wal,
+                                                      const char *live_shm);
 
 /* ── Incremental pipeline (pipeline_incremental.c) ───────────────── */
 

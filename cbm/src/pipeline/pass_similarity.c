@@ -330,7 +330,30 @@ int cbm_pipeline_pass_similarity(cbm_pipeline_ctx_t *ctx) {
     CBM_PROF_START(t_query_emit);
     _Atomic int *edge_counts = calloc((size_t)entry_count, sizeof(_Atomic int));
     int worker_count = cbm_default_worker_count(false);
+    if (worker_count <= 0) {
+        cbm_log_error("pass.similarity.worker_count_invalid", "code",
+                      "CBM_WORKER_COUNT_INVALID", "worker_count", itoa_log(worker_count),
+                      "message", "worker-count configuration is invalid", "remediation",
+                      "set CBM_WORKERS to an integer from 1 through 256 or remove it");
+        free(edge_counts);
+        free(lsh_entries);
+        free(entries);
+        cbm_lsh_free(lsh);
+        return CBM_NOT_FOUND;
+    }
     sim_edge_buf_t *worker_bufs = calloc((size_t)worker_count, sizeof(sim_edge_buf_t));
+    if (!edge_counts || !worker_bufs) {
+        cbm_log_error("pass.similarity.parallel_alloc_failed", "code",
+                      "CBM_SIM_PARALLEL_ALLOC_FAILED", "message",
+                      "similarity parallel worker buffers could not be allocated", "remediation",
+                      "free memory or reduce the indexed corpus size, then retry");
+        free(worker_bufs);
+        free(edge_counts);
+        free(lsh_entries);
+        free(entries);
+        cbm_lsh_free(lsh);
+        return CBM_NOT_FOUND;
+    }
 
     {
         sim_query_ctx_t sc = {
@@ -341,8 +364,20 @@ int cbm_pipeline_pass_similarity(cbm_pipeline_ctx_t *ctx) {
             .edge_counts = edge_counts,
         };
         atomic_init(&sc.next_idx, 0);
-        cbm_parallel_for_opts_t opts = {.max_workers = worker_count, .force_pthreads = false};
-        cbm_parallel_for(worker_count, sim_query_worker, &sc, opts);
+        cbm_parallel_for_opts_t opts = {
+            .max_workers = worker_count,
+            .force_pthreads = false,
+            .operation = "similarity.query",
+        };
+        cbm_parallel_for_result_t dispatch_result = {0};
+        if (cbm_parallel_for(worker_count, sim_query_worker, &sc, opts, &dispatch_result) != 0) {
+            free(worker_bufs);
+            free(edge_counts);
+            free(lsh_entries);
+            free(entries);
+            cbm_lsh_free(lsh);
+            return CBM_NOT_FOUND;
+        }
     }
     CBM_PROF_END_N("similarity", "3_query_parallel", t_query_emit, entry_count);
 

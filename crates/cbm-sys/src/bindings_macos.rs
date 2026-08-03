@@ -7,13 +7,13 @@ pub const CBM_MAX_STRING_CONSTANTS: u32 = 256;
 pub const CBM_LOG_ERR_CODE_MAX: u32 = 128;
 pub const CBM_LOG_ERR_TEXT_MAX: u32 = 512;
 pub const CBM_PIPELINE_ROW_SINK_ABI_V1: u32 = 1;
-pub const CBM_ASTRO_LOWERED_DB_SUFFIX: &[u8; 22] = b".astrolabe-lowered.db\0";
-pub const CBM_ASTRO_ARCHAEOLOGY_DB_PREFIX: &[u8; 24] = b".astrolabe-archaeology-\0";
 pub const CBM_STORE_OK: u32 = 0;
 pub const CBM_STORE_ERR: i32 = -1;
 pub const CBM_STORE_NOT_FOUND: i32 = -2;
 pub const CBM_ADR_MAX_LENGTH: u32 = 8000;
 pub const CBM_VECTOR_SEARCH_MAX_KEYWORDS: u32 = 32;
+pub const CBM_ASTRO_LOWERED_DB_SUFFIX: &[u8; 22] = b".astrolabe-lowered.db\0";
+pub const CBM_ASTRO_ARCHAEOLOGY_DB_PREFIX: &[u8; 24] = b".astrolabe-archaeology-\0";
 pub type uint_least64_t = u64;
 pub type __int64_t = ::std::os::raw::c_longlong;
 pub type __darwin_off_t = __int64_t;
@@ -1440,6 +1440,17 @@ unsafe extern "C" {
     ) -> bool;
 }
 unsafe extern "C" {
+    pub fn cbm_add_parse_diagnostic(
+        ctx: *mut CBMExtractCtx,
+        node: TSNode,
+        code: *const ::std::os::raw::c_char,
+        operation: *const ::std::os::raw::c_char,
+        message: *const ::std::os::raw::c_char,
+        remediation: *const ::std::os::raw::c_char,
+        is_missing: bool,
+    ) -> bool;
+}
+unsafe extern "C" {
     pub fn cbm_extract_definitions(ctx: *mut CBMExtractCtx);
 }
 unsafe extern "C" {
@@ -2094,667 +2105,112 @@ pub struct cbm_store {
     _unused: [u8; 0],
 }
 pub type cbm_store_t = cbm_store;
-#[repr(C)]
-#[derive(Debug, Copy, Clone)]
-pub struct cbm_watcher {
-    _unused: [u8; 0],
-}
-#[repr(C)]
-#[derive(Debug, Copy, Clone)]
-pub struct cbm_config {
-    _unused: [u8; 0],
-}
-#[repr(C)]
-#[derive(Debug, Copy, Clone)]
-pub struct cbm_jsonrpc_request_t {
-    pub jsonrpc: *const ::std::os::raw::c_char,
-    pub method: *const ::std::os::raw::c_char,
-    pub id: i64,
-    pub id_str: *const ::std::os::raw::c_char,
-    pub has_id: bool,
-    pub params_raw: *const ::std::os::raw::c_char,
-}
-impl Default for cbm_jsonrpc_request_t {
-    fn default() -> Self {
-        let mut s = ::std::mem::MaybeUninit::<Self>::uninit();
-        unsafe {
-            ::std::ptr::write_bytes(s.as_mut_ptr(), 0, 1);
-            s.assume_init()
-        }
-    }
-}
-#[repr(C)]
-#[derive(Debug, Copy, Clone)]
-pub struct cbm_jsonrpc_response_t {
-    pub id: i64,
-    pub id_str: *const ::std::os::raw::c_char,
-    pub result_json: *const ::std::os::raw::c_char,
-    pub error_json: *const ::std::os::raw::c_char,
-    pub error_code: ::std::os::raw::c_int,
-}
-impl Default for cbm_jsonrpc_response_t {
-    fn default() -> Self {
-        let mut s = ::std::mem::MaybeUninit::<Self>::uninit();
-        unsafe {
-            ::std::ptr::write_bytes(s.as_mut_ptr(), 0, 1);
-            s.assume_init()
-        }
-    }
-}
-unsafe extern "C" {
-    pub fn cbm_jsonrpc_parse(
-        line: *const ::std::os::raw::c_char,
-        out: *mut cbm_jsonrpc_request_t,
-    ) -> ::std::os::raw::c_int;
-}
-unsafe extern "C" {
-    pub fn cbm_jsonrpc_request_free(r: *mut cbm_jsonrpc_request_t);
-}
-unsafe extern "C" {
-    pub fn cbm_jsonrpc_format_response(
-        resp: *const cbm_jsonrpc_response_t,
-    ) -> *mut ::std::os::raw::c_char;
-}
-unsafe extern "C" {
-    pub fn cbm_jsonrpc_format_error(
-        id: i64,
-        code: ::std::os::raw::c_int,
-        message: *const ::std::os::raw::c_char,
-    ) -> *mut ::std::os::raw::c_char;
-}
-unsafe extern "C" {
-    pub fn cbm_mcp_text_result(
-        text: *const ::std::os::raw::c_char,
-        is_error: bool,
-    ) -> *mut ::std::os::raw::c_char;
-}
-unsafe extern "C" {
-    pub fn cbm_mcp_cancel_request_matches(
-        params_json: *const ::std::os::raw::c_char,
-        active_id: i64,
-        active_id_str: *const ::std::os::raw::c_char,
-    ) -> bool;
-}
-unsafe extern "C" {
-    pub fn cbm_mcp_tools_list() -> *mut ::std::os::raw::c_char;
-}
-unsafe extern "C" {
-    pub fn cbm_mcp_tool_input_schema(
-        tool_name: *const ::std::os::raw::c_char,
-    ) -> *const ::std::os::raw::c_char;
-}
-unsafe extern "C" {
-    pub fn cbm_mcp_initialize_response(
-        params_json: *const ::std::os::raw::c_char,
-    ) -> *mut ::std::os::raw::c_char;
-}
-unsafe extern "C" {
-    pub fn cbm_mcp_get_string_arg(
-        args_json: *const ::std::os::raw::c_char,
-        key: *const ::std::os::raw::c_char,
-    ) -> *mut ::std::os::raw::c_char;
-}
-unsafe extern "C" {
-    pub fn cbm_mcp_get_int_arg(
-        args_json: *const ::std::os::raw::c_char,
-        key: *const ::std::os::raw::c_char,
-        default_val: ::std::os::raw::c_int,
-    ) -> ::std::os::raw::c_int;
-}
-unsafe extern "C" {
-    pub fn cbm_mcp_get_bool_arg(
-        args_json: *const ::std::os::raw::c_char,
-        key: *const ::std::os::raw::c_char,
-    ) -> bool;
-}
-unsafe extern "C" {
-    pub fn cbm_mcp_get_tool_name(
-        params_json: *const ::std::os::raw::c_char,
-    ) -> *mut ::std::os::raw::c_char;
-}
-unsafe extern "C" {
-    pub fn cbm_mcp_get_arguments(
-        params_json: *const ::std::os::raw::c_char,
-    ) -> *mut ::std::os::raw::c_char;
-}
-#[repr(C)]
-#[derive(Debug, Copy, Clone)]
-pub struct cbm_mcp_server {
-    _unused: [u8; 0],
-}
-pub type cbm_mcp_server_t = cbm_mcp_server;
-#[repr(C)]
-#[derive(Debug, Copy, Clone)]
-pub struct cbm_project_transition {
-    _unused: [u8; 0],
-}
-pub type cbm_project_transition_t = cbm_project_transition;
-#[repr(C)]
-#[derive(Debug, Copy, Clone)]
-pub struct cbm_project_quiescence_result_t {
-    pub elapsed_ms: u64,
-    pub attempts: u64,
-    pub native_error: ::std::os::raw::c_ulong,
-    pub failed_path: [::std::os::raw::c_char; 1024usize],
-}
-impl Default for cbm_project_quiescence_result_t {
-    fn default() -> Self {
-        let mut s = ::std::mem::MaybeUninit::<Self>::uninit();
-        unsafe {
-            ::std::ptr::write_bytes(s.as_mut_ptr(), 0, 1);
-            s.assume_init()
-        }
-    }
-}
-unsafe extern "C" {
-    pub fn cbm_mcp_server_new(store_path: *const ::std::os::raw::c_char) -> *mut cbm_mcp_server_t;
-}
-unsafe extern "C" {
-    pub fn cbm_mcp_server_free(srv: *mut cbm_mcp_server_t);
-}
-unsafe extern "C" {
-    pub fn cbm_mcp_server_set_watcher(srv: *mut cbm_mcp_server_t, w: *mut cbm_watcher);
-}
-unsafe extern "C" {
-    pub fn cbm_mcp_server_set_config(srv: *mut cbm_mcp_server_t, cfg: *mut cbm_config);
-}
-unsafe extern "C" {
-    pub fn cbm_mcp_server_set_row_sink(
-        srv: *mut cbm_mcp_server_t,
-        sink: *const cbm_pipeline_row_sink_v1_t,
-    ) -> ::std::os::raw::c_int;
-}
-unsafe extern "C" {
-    pub fn cbm_mcp_server_handle(
-        srv: *mut cbm_mcp_server_t,
-        line: *const ::std::os::raw::c_char,
-    ) -> *mut ::std::os::raw::c_char;
-}
-unsafe extern "C" {
-    pub fn cbm_mcp_handle_tool(
-        srv: *mut cbm_mcp_server_t,
-        tool_name: *const ::std::os::raw::c_char,
-        args_json: *const ::std::os::raw::c_char,
-    ) -> *mut ::std::os::raw::c_char;
-}
-unsafe extern "C" {
-    pub fn cbm_mcp_index_run_supervised_path(
-        root_path: *const ::std::os::raw::c_char,
-    ) -> *mut ::std::os::raw::c_char;
-}
-unsafe extern "C" {
-    pub fn cbm_mcp_index_repository_supervised_strict(
-        srv: *mut cbm_mcp_server_t,
-        args: *const ::std::os::raw::c_char,
-    ) -> *mut ::std::os::raw::c_char;
-}
-unsafe extern "C" {
-    pub fn cbm_mcp_server_evict_idle(srv: *mut cbm_mcp_server_t, timeout_s: ::std::os::raw::c_int);
-}
-unsafe extern "C" {
-    pub fn cbm_mcp_server_quiesce_project_transition(
-        srv: *mut cbm_mcp_server_t,
-    ) -> ::std::os::raw::c_int;
-}
-unsafe extern "C" {
-    pub fn cbm_project_transition_acquire(
-        project: *const ::std::os::raw::c_char,
-        recovered_abandoned_owner: *mut bool,
-        owner_process_start_utc_ticks: *mut u64,
-        native_error: *mut ::std::os::raw::c_ulong,
-    ) -> *mut cbm_project_transition_t;
-}
-unsafe extern "C" {
-    pub fn cbm_project_transition_wait_store_quiescent(
-        transition: *mut cbm_project_transition_t,
-        db_path: *const ::std::os::raw::c_char,
-        timeout_ms: ::std::os::raw::c_ulong,
-        poll_ms: ::std::os::raw::c_ulong,
-        result: *mut cbm_project_quiescence_result_t,
-    ) -> ::std::os::raw::c_int;
-}
-unsafe extern "C" {
-    pub fn cbm_project_transition_release(
-        transition: *mut cbm_project_transition_t,
-        native_error: *mut ::std::os::raw::c_ulong,
-    ) -> ::std::os::raw::c_int;
-}
-unsafe extern "C" {
-    pub fn cbm_mcp_server_has_cached_store(srv: *mut cbm_mcp_server_t) -> bool;
-}
-unsafe extern "C" {
-    pub fn cbm_mcp_server_store(srv: *mut cbm_mcp_server_t) -> *mut cbm_store_t;
-}
-unsafe extern "C" {
-    pub fn cbm_mcp_server_set_project(
-        srv: *mut cbm_mcp_server_t,
-        project: *const ::std::os::raw::c_char,
-    );
-}
-#[repr(C)]
-#[derive(Debug, Copy, Clone)]
-pub struct cbm_pipeline {
-    _unused: [u8; 0],
-}
-unsafe extern "C" {
-    pub fn cbm_mcp_server_active_pipeline(srv: *mut cbm_mcp_server_t) -> *mut cbm_pipeline;
-}
-unsafe extern "C" {
-    pub fn cbm_parse_file_uri(
-        uri: *const ::std::os::raw::c_char,
-        out_path: *mut ::std::os::raw::c_char,
-        out_size: ::std::os::raw::c_int,
-    ) -> bool;
-}
-#[repr(C)]
-#[derive(Debug, Copy, Clone)]
-pub struct cbm_gbuf {
-    _unused: [u8; 0],
-}
-pub type cbm_gbuf_t = cbm_gbuf;
-pub type cbm_pipeline_t = cbm_pipeline;
-#[repr(C)]
-#[derive(Debug, Copy, Clone)]
-pub struct cbm_pipeline_error_t {
-    pub code: *const ::std::os::raw::c_char,
-    pub operation: *const ::std::os::raw::c_char,
-    pub phase: *const ::std::os::raw::c_char,
-    pub path: *const ::std::os::raw::c_char,
-    pub message: *const ::std::os::raw::c_char,
-    pub remediation: *const ::std::os::raw::c_char,
-    pub requested: usize,
-}
-impl Default for cbm_pipeline_error_t {
-    fn default() -> Self {
-        let mut s = ::std::mem::MaybeUninit::<Self>::uninit();
-        unsafe {
-            ::std::ptr::write_bytes(s.as_mut_ptr(), 0, 1);
-            s.assume_init()
-        }
-    }
-}
-pub type cbm_pipeline_post_success_fn = ::std::option::Option<
-    unsafe extern "C" fn(ctx: *mut ::std::os::raw::c_void) -> ::std::os::raw::c_int,
->;
-#[repr(C)]
-#[derive(Debug, Copy, Clone)]
-pub struct cbm_pipeline_phase_metric_t {
-    pub phase: *const ::std::os::raw::c_char,
-    pub elapsed_ms: u64,
-    pub read_bytes: u64,
-    pub write_bytes: u64,
-    pub other_bytes: u64,
-    pub start_working_set_bytes: u64,
-    pub end_working_set_bytes: u64,
-    pub start_peak_working_set_bytes: u64,
-    pub end_peak_working_set_bytes: u64,
-    pub start_private_bytes: u64,
-    pub end_private_bytes: u64,
-    pub start_peak_private_bytes: u64,
-    pub end_peak_private_bytes: u64,
-}
-impl Default for cbm_pipeline_phase_metric_t {
-    fn default() -> Self {
-        let mut s = ::std::mem::MaybeUninit::<Self>::uninit();
-        unsafe {
-            ::std::ptr::write_bytes(s.as_mut_ptr(), 0, 1);
-            s.assume_init()
-        }
-    }
-}
-pub const CBM_PIPELINE_EMPTY_SOURCE_CORPUS: _bindgen_ty_2 = -2001;
-pub type _bindgen_ty_2 = ::std::os::raw::c_int;
-unsafe extern "C" {
-    pub fn cbm_pipeline_new(
-        repo_path: *const ::std::os::raw::c_char,
-        db_path: *const ::std::os::raw::c_char,
-        mode: cbm_index_mode_t,
-    ) -> *mut cbm_pipeline_t;
-}
-unsafe extern "C" {
-    pub fn cbm_pipeline_set_persistence(p: *mut cbm_pipeline_t, enabled: bool);
-}
-unsafe extern "C" {
-    pub fn cbm_pipeline_set_sink(
-        p: *mut cbm_pipeline_t,
-        sink: *const cbm_pipeline_row_sink_v1_t,
-    ) -> ::std::os::raw::c_int;
-}
-unsafe extern "C" {
-    pub fn cbm_pipeline_set_post_success_callback(
-        p: *mut cbm_pipeline_t,
-        callback: cbm_pipeline_post_success_fn,
-        ctx: *mut ::std::os::raw::c_void,
-    ) -> ::std::os::raw::c_int;
-}
-unsafe extern "C" {
-    pub fn cbm_pipeline_free(p: *mut cbm_pipeline_t);
-}
-unsafe extern "C" {
-    pub fn cbm_pipeline_run(p: *mut cbm_pipeline_t) -> ::std::os::raw::c_int;
-}
-unsafe extern "C" {
-    pub fn cbm_pipeline_cancel(p: *mut cbm_pipeline_t);
-}
-unsafe extern "C" {
-    pub fn cbm_pipeline_project_name(p: *const cbm_pipeline_t) -> *const ::std::os::raw::c_char;
-}
-unsafe extern "C" {
-    pub fn cbm_pipeline_set_project_identity_root(
-        p: *mut cbm_pipeline_t,
-        identity_root: *const ::std::os::raw::c_char,
-    ) -> bool;
-}
-unsafe extern "C" {
-    pub fn cbm_pipeline_get_mode(p: *const cbm_pipeline_t) -> ::std::os::raw::c_int;
-}
-unsafe extern "C" {
-    pub fn cbm_pipeline_get_excluded(
-        p: *const cbm_pipeline_t,
-        out: *mut *mut *mut ::std::os::raw::c_char,
-        count: *mut ::std::os::raw::c_int,
-    );
-}
-unsafe extern "C" {
-    pub fn cbm_pipeline_get_committed_counts(
-        p: *const cbm_pipeline_t,
-        nodes: *mut ::std::os::raw::c_int,
-        edges: *mut ::std::os::raw::c_int,
-    );
-}
-unsafe extern "C" {
-    pub fn cbm_pipeline_get_phase_metrics(
-        p: *const cbm_pipeline_t,
-        out: *mut *const cbm_pipeline_phase_metric_t,
-        count: *mut usize,
-        complete: *mut bool,
-    );
-}
-unsafe extern "C" {
-    pub fn cbm_pipeline_get_ambiguous_reference_skips(p: *const cbm_pipeline_t) -> uint_least64_t;
-}
-unsafe extern "C" {
-    pub fn cbm_pipeline_set_parse_recovery_diagnostics(
-        p: *mut cbm_pipeline_t,
-        diagnostics: uint_least64_t,
-    );
-}
-unsafe extern "C" {
-    pub fn cbm_pipeline_get_parse_recovery_diagnostics(p: *const cbm_pipeline_t) -> uint_least64_t;
-}
-unsafe extern "C" {
-    pub fn cbm_pipeline_get_unresolved_reference_source_skips(
-        p: *const cbm_pipeline_t,
-    ) -> uint_least64_t;
-}
-unsafe extern "C" {
-    pub fn cbm_pipeline_get_fatal_error(
-        p: *const cbm_pipeline_t,
-        out: *mut cbm_pipeline_error_t,
-    ) -> bool;
-}
-#[repr(C)]
-#[derive(Debug, Copy, Clone)]
-pub struct cbm_file_error_t {
-    pub path: *mut ::std::os::raw::c_char,
-    pub reason: *mut ::std::os::raw::c_char,
-    pub phase: *mut ::std::os::raw::c_char,
-}
-impl Default for cbm_file_error_t {
-    fn default() -> Self {
-        let mut s = ::std::mem::MaybeUninit::<Self>::uninit();
-        unsafe {
-            ::std::ptr::write_bytes(s.as_mut_ptr(), 0, 1);
-            s.assume_init()
-        }
-    }
-}
-unsafe extern "C" {
-    pub fn cbm_pipeline_add_file_error(
-        p: *mut cbm_pipeline_t,
-        path: *const ::std::os::raw::c_char,
-        reason: *const ::std::os::raw::c_char,
-        phase: *const ::std::os::raw::c_char,
-    );
-}
-unsafe extern "C" {
-    pub fn cbm_pipeline_get_file_errors(
-        p: *const cbm_pipeline_t,
-        out: *mut *mut cbm_file_error_t,
-        count: *mut ::std::os::raw::c_int,
-    );
-}
-unsafe extern "C" {
-    pub fn cbm_pipeline_try_lock() -> bool;
-}
-unsafe extern "C" {
-    pub fn cbm_pipeline_lock();
-}
-unsafe extern "C" {
-    pub fn cbm_pipeline_unlock();
-}
-unsafe extern "C" {
-    pub fn cbm_pipeline_fqn_compute(
-        project: *const ::std::os::raw::c_char,
-        rel_path: *const ::std::os::raw::c_char,
-        name: *const ::std::os::raw::c_char,
-    ) -> *mut ::std::os::raw::c_char;
-}
-unsafe extern "C" {
-    pub fn cbm_pipeline_fqn_module(
-        project: *const ::std::os::raw::c_char,
-        rel_path: *const ::std::os::raw::c_char,
-    ) -> *mut ::std::os::raw::c_char;
-}
-unsafe extern "C" {
-    pub fn cbm_pipeline_fqn_module_dir(
-        project: *const ::std::os::raw::c_char,
-        rel_path: *const ::std::os::raw::c_char,
-        module_is_dir: bool,
-    ) -> *mut ::std::os::raw::c_char;
-}
-unsafe extern "C" {
-    pub fn cbm_pipeline_fqn_folder(
-        project: *const ::std::os::raw::c_char,
-        rel_dir: *const ::std::os::raw::c_char,
-    ) -> *mut ::std::os::raw::c_char;
-}
-pub const cbm_relative_import_status_t_CBM_RELATIVE_IMPORT_ERROR: cbm_relative_import_status_t = -1;
-pub const cbm_relative_import_status_t_CBM_RELATIVE_IMPORT_NOT_RELATIVE:
-    cbm_relative_import_status_t = 0;
-pub const cbm_relative_import_status_t_CBM_RELATIVE_IMPORT_RESOLVED: cbm_relative_import_status_t =
-    1;
-pub const cbm_relative_import_status_t_CBM_RELATIVE_IMPORT_INVALID: cbm_relative_import_status_t =
-    2;
-pub type cbm_relative_import_status_t = ::std::os::raw::c_int;
-unsafe extern "C" {
-    pub fn cbm_pipeline_resolve_relative_import_checked(
-        source_rel: *const ::std::os::raw::c_char,
-        module_path: *const ::std::os::raw::c_char,
-        out: *mut *mut ::std::os::raw::c_char,
-    ) -> ::std::os::raw::c_int;
-}
-unsafe extern "C" {
-    pub fn cbm_project_name_from_path(
-        abs_path: *const ::std::os::raw::c_char,
-    ) -> *mut ::std::os::raw::c_char;
-}
-#[repr(C)]
-#[derive(Debug, Copy, Clone)]
-pub struct cbm_registry {
-    _unused: [u8; 0],
-}
-pub type cbm_registry_t = cbm_registry;
-#[repr(C)]
-#[derive(Debug, Copy, Clone)]
-pub struct cbm_resolution_t {
-    pub qualified_name: *const ::std::os::raw::c_char,
-    pub strategy: *const ::std::os::raw::c_char,
-    pub confidence: f64,
-    pub candidate_count: ::std::os::raw::c_int,
-}
-impl Default for cbm_resolution_t {
-    fn default() -> Self {
-        let mut s = ::std::mem::MaybeUninit::<Self>::uninit();
-        unsafe {
-            ::std::ptr::write_bytes(s.as_mut_ptr(), 0, 1);
-            s.assume_init()
-        }
-    }
-}
-unsafe extern "C" {
-    pub fn cbm_registry_new() -> *mut cbm_registry_t;
-}
-unsafe extern "C" {
-    pub fn cbm_registry_free(r: *mut cbm_registry_t);
-}
-unsafe extern "C" {
-    pub fn cbm_registry_add(
-        r: *mut cbm_registry_t,
-        name: *const ::std::os::raw::c_char,
-        qualified_name: *const ::std::os::raw::c_char,
-        label: *const ::std::os::raw::c_char,
-    ) -> bool;
-}
-unsafe extern "C" {
-    pub fn cbm_registry_failed(r: *const cbm_registry_t) -> bool;
-}
-unsafe extern "C" {
-    pub fn cbm_registry_resolve(
-        r: *const cbm_registry_t,
-        callee_name: *const ::std::os::raw::c_char,
-        module_qn: *const ::std::os::raw::c_char,
-        import_map_keys: *mut *const ::std::os::raw::c_char,
-        import_map_vals: *mut *const ::std::os::raw::c_char,
-        import_map_count: ::std::os::raw::c_int,
-    ) -> cbm_resolution_t;
-}
-unsafe extern "C" {
-    pub fn cbm_registry_resolve_exact(
-        r: *const cbm_registry_t,
-        reference_name: *const ::std::os::raw::c_char,
-        module_qn: *const ::std::os::raw::c_char,
-        import_map_keys: *mut *const ::std::os::raw::c_char,
-        import_map_vals: *mut *const ::std::os::raw::c_char,
-        import_map_count: ::std::os::raw::c_int,
-    ) -> cbm_resolution_t;
-}
-unsafe extern "C" {
-    pub fn cbm_registry_reach_cache_begin(estimated_capacity: ::std::os::raw::c_int);
-}
-unsafe extern "C" {
-    pub fn cbm_registry_reach_cache_end();
-}
-unsafe extern "C" {
-    pub fn cbm_registry_import_map_cache_begin(
-        keys: *mut *const ::std::os::raw::c_char,
-        vals: *mut *const ::std::os::raw::c_char,
-        count: ::std::os::raw::c_int,
-    );
-}
-unsafe extern "C" {
-    pub fn cbm_registry_import_map_cache_end();
-}
-unsafe extern "C" {
-    pub fn cbm_registry_resolve_cache_begin(estimated_capacity: ::std::os::raw::c_int);
-}
-unsafe extern "C" {
-    pub fn cbm_registry_resolve_cache_end();
-}
-unsafe extern "C" {
-    pub fn cbm_registry_cache_failed() -> bool;
-}
-unsafe extern "C" {
-    pub fn cbm_registry_exists(r: *const cbm_registry_t, qn: *const ::std::os::raw::c_char)
-    -> bool;
-}
-unsafe extern "C" {
-    pub fn cbm_perl_is_builtin(name: *const ::std::os::raw::c_char) -> bool;
-}
-unsafe extern "C" {
-    pub fn cbm_perl_suppress_generic_match(
-        is_perl: bool,
-        is_method: bool,
-        callee_name: *const ::std::os::raw::c_char,
-        strategy: *const ::std::os::raw::c_char,
-    ) -> bool;
-}
-unsafe extern "C" {
-    pub fn cbm_tsjs_suppress_weak_method_match(
-        is_tsjs: bool,
-        is_method: bool,
-        strategy: *const ::std::os::raw::c_char,
-    ) -> bool;
-}
-unsafe extern "C" {
-    pub fn cbm_registry_label_of(
-        r: *const cbm_registry_t,
-        qn: *const ::std::os::raw::c_char,
-    ) -> *const ::std::os::raw::c_char;
-}
-unsafe extern "C" {
-    pub fn cbm_registry_find_by_name(
-        r: *const cbm_registry_t,
-        name: *const ::std::os::raw::c_char,
-        out: *mut *mut *const ::std::os::raw::c_char,
-        count: *mut ::std::os::raw::c_int,
-    ) -> ::std::os::raw::c_int;
-}
-unsafe extern "C" {
-    pub fn cbm_registry_size(r: *const cbm_registry_t) -> ::std::os::raw::c_int;
-}
-unsafe extern "C" {
-    pub fn cbm_registry_find_ending_with(
-        r: *const cbm_registry_t,
-        suffix: *const ::std::os::raw::c_char,
-        out: *mut *mut *const ::std::os::raw::c_char,
-    ) -> ::std::os::raw::c_int;
-}
-unsafe extern "C" {
-    pub fn cbm_registry_is_import_reachable(
-        candidate_qn: *const ::std::os::raw::c_char,
-        import_vals: *mut *const ::std::os::raw::c_char,
-        import_count: ::std::os::raw::c_int,
-    ) -> bool;
-}
-#[repr(C)]
-#[derive(Debug, Copy, Clone)]
-pub struct cbm_fuzzy_result_t {
-    pub result: cbm_resolution_t,
-    pub ok: bool,
-}
-impl Default for cbm_fuzzy_result_t {
-    fn default() -> Self {
-        let mut s = ::std::mem::MaybeUninit::<Self>::uninit();
-        unsafe {
-            ::std::ptr::write_bytes(s.as_mut_ptr(), 0, 1);
-            s.assume_init()
-        }
-    }
-}
-unsafe extern "C" {
-    pub fn cbm_registry_fuzzy_resolve(
-        r: *const cbm_registry_t,
-        callee_name: *const ::std::os::raw::c_char,
-        module_qn: *const ::std::os::raw::c_char,
-        import_map_keys: *mut *const ::std::os::raw::c_char,
-        import_map_vals: *mut *const ::std::os::raw::c_char,
-        import_map_count: ::std::os::raw::c_int,
-    ) -> cbm_fuzzy_result_t;
-}
-unsafe extern "C" {
-    pub fn cbm_confidence_band(score: f64) -> *const ::std::os::raw::c_char;
-}
 pub const cbm_store_verify_status_t_CBM_STORE_VERIFY_OK: cbm_store_verify_status_t = 0;
 pub const cbm_store_verify_status_t_CBM_STORE_VERIFY_SOURCE_MISSING: cbm_store_verify_status_t = 1;
 pub const cbm_store_verify_status_t_CBM_STORE_VERIFY_INTEGRITY_FAILED: cbm_store_verify_status_t =
     2;
 pub const cbm_store_verify_status_t_CBM_STORE_VERIFY_IO_FAILED: cbm_store_verify_status_t = 3;
 pub type cbm_store_verify_status_t = ::std::os::raw::c_uint;
-pub const CBM_STORE_VERIFY_OPERATION_MAX: _bindgen_ty_3 = 64;
-pub const CBM_STORE_VERIFY_DETAIL_MAX: _bindgen_ty_3 = 512;
-pub const CBM_STORE_VERIFY_PATH_MAX: _bindgen_ty_3 = 4096;
+pub const CBM_STORE_VERIFY_OPERATION_MAX: _bindgen_ty_2 = 64;
+pub const CBM_STORE_VERIFY_DETAIL_MAX: _bindgen_ty_2 = 512;
+pub const CBM_STORE_VERIFY_PATH_MAX: _bindgen_ty_2 = 4096;
+pub type _bindgen_ty_2 = ::std::os::raw::c_uint;
+pub type cbm_store_close_status_t = i32;
+pub const CBM_STORE_CLOSE_OK: _bindgen_ty_3 = 0;
+pub const CBM_STORE_CLOSE_FINALIZE_FAILED: _bindgen_ty_3 = 1;
+pub const CBM_STORE_CLOSE_OUTSTANDING_STATEMENTS: _bindgen_ty_3 = 2;
+pub const CBM_STORE_CLOSE_FAILED: _bindgen_ty_3 = 3;
+pub const CBM_STORE_CLOSE_INVALID_ARGUMENT: _bindgen_ty_3 = 4;
+pub const CBM_STORE_CLOSE_ABI_VERSION: _bindgen_ty_3 = 1;
+pub const CBM_STORE_CLOSE_CACHED_STATEMENT_COUNT: _bindgen_ty_3 = 34;
+pub const CBM_STORE_CLOSE_STATEMENT_NAME_MAX: _bindgen_ty_3 = 64;
+pub const CBM_STORE_CLOSE_SQL_TEXT_MAX: _bindgen_ty_3 = 512;
+pub const CBM_STORE_CLOSE_SQL_SHA256_MAX: _bindgen_ty_3 = 65;
 pub type _bindgen_ty_3 = ::std::os::raw::c_uint;
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct cbm_store_finalize_error_t {
+    pub sqlite_error: i32,
+    pub statement_name: [::std::os::raw::c_char; 64usize],
+}
+impl Default for cbm_store_finalize_error_t {
+    fn default() -> Self {
+        let mut s = ::std::mem::MaybeUninit::<Self>::uninit();
+        unsafe {
+            ::std::ptr::write_bytes(s.as_mut_ptr(), 0, 1);
+            s.assume_init()
+        }
+    }
+}
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct cbm_store_close_result_t {
+    pub abi_version: u32,
+    pub struct_size: u32,
+    pub status: cbm_store_close_status_t,
+    pub sqlite_close_code: i32,
+    pub connection_was_present: u32,
+    pub close_attempted: u32,
+    pub connection_destroyed: u32,
+    pub db_path_truncated: u32,
+    pub db_path_bytes: u64,
+    pub cached_statement_count: u32,
+    pub finalize_error_count: u32,
+    pub finalize_errors: [cbm_store_finalize_error_t; 34usize],
+    pub outstanding_statement_count: u64,
+    pub first_outstanding_sql_bytes: u64,
+    pub first_outstanding_sql_available: u32,
+    pub first_outstanding_sql_truncated: u32,
+    pub first_outstanding_sql_sha256: [::std::os::raw::c_char; 65usize],
+    pub first_outstanding_sql: [::std::os::raw::c_char; 512usize],
+    pub db_path: [::std::os::raw::c_char; 4096usize],
+}
+impl Default for cbm_store_close_result_t {
+    fn default() -> Self {
+        let mut s = ::std::mem::MaybeUninit::<Self>::uninit();
+        unsafe {
+            ::std::ptr::write_bytes(s.as_mut_ptr(), 0, 1);
+            s.assume_init()
+        }
+    }
+}
+pub type cbm_store_normalize_status_t = i32;
+pub const CBM_STORE_NORMALIZE_OK: _bindgen_ty_4 = 0;
+pub const CBM_STORE_NORMALIZE_INVALID_ARGUMENT: _bindgen_ty_4 = 1;
+pub const CBM_STORE_NORMALIZE_READ_ONLY: _bindgen_ty_4 = 2;
+pub const CBM_STORE_NORMALIZE_JOURNAL_READ_FAILED: _bindgen_ty_4 = 3;
+pub const CBM_STORE_NORMALIZE_UNSUPPORTED_JOURNAL_MODE: _bindgen_ty_4 = 4;
+pub const CBM_STORE_NORMALIZE_CHECKPOINT_FAILED: _bindgen_ty_4 = 5;
+pub const CBM_STORE_NORMALIZE_CHECKPOINT_INCOMPLETE: _bindgen_ty_4 = 6;
+pub const CBM_STORE_NORMALIZE_SET_DELETE_FAILED: _bindgen_ty_4 = 7;
+pub const CBM_STORE_NORMALIZE_READBACK_FAILED: _bindgen_ty_4 = 8;
+pub const CBM_STORE_NORMALIZE_ABI_VERSION: _bindgen_ty_4 = 1;
+pub const CBM_STORE_NORMALIZE_MODE_MAX: _bindgen_ty_4 = 16;
+pub type _bindgen_ty_4 = ::std::os::raw::c_uint;
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct cbm_store_normalize_result_t {
+    pub abi_version: u32,
+    pub struct_size: u32,
+    pub status: cbm_store_normalize_status_t,
+    pub sqlite_error: i32,
+    pub wal_log_frames: i32,
+    pub wal_checkpointed_frames: i32,
+    pub wal_remaining_frames: i32,
+    pub journal_mode_before: [::std::os::raw::c_char; 16usize],
+    pub journal_mode_after: [::std::os::raw::c_char; 16usize],
+    pub operation: [::std::os::raw::c_char; 64usize],
+    pub detail: [::std::os::raw::c_char; 512usize],
+}
+impl Default for cbm_store_normalize_result_t {
+    fn default() -> Self {
+        let mut s = ::std::mem::MaybeUninit::<Self>::uninit();
+        unsafe {
+            ::std::ptr::write_bytes(s.as_mut_ptr(), 0, 1);
+            s.assume_init()
+        }
+    }
+}
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct cbm_store_verify_result_t {
@@ -2771,6 +2227,8 @@ pub struct cbm_store_verify_result_t {
     pub cleanup_native_error: u32,
     pub db_bytes: u64,
     pub db_sha256: [::std::os::raw::c_char; 65usize],
+    pub wal_bytes: u64,
+    pub wal_sha256: [::std::os::raw::c_char; 65usize],
     pub operation: [::std::os::raw::c_char; 64usize],
     pub cleanup_operation: [::std::os::raw::c_char; 64usize],
     pub detail: [::std::os::raw::c_char; 512usize],
@@ -2867,8 +2325,8 @@ impl Default for cbm_file_hash_t {
         }
     }
 }
-pub const CBM_FILE_SHA256_CAPACITY: _bindgen_ty_4 = 65;
-pub type _bindgen_ty_4 = ::std::os::raw::c_uint;
+pub const CBM_FILE_SHA256_CAPACITY: _bindgen_ty_5 = 65;
+pub type _bindgen_ty_5 = ::std::os::raw::c_uint;
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct cbm_file_identity_t {
@@ -3156,9 +2614,32 @@ unsafe extern "C" {
     ) -> cbm_store_verify_status_t;
 }
 unsafe extern "C" {
+    pub fn cbm_store_verify_path_project_snapshot(
+        db_path: *const ::std::os::raw::c_char,
+        project: *const ::std::os::raw::c_char,
+        result: *mut cbm_store_verify_result_t,
+    ) -> cbm_store_verify_status_t;
+}
+unsafe extern "C" {
+    pub fn cbm_store_verify_path_project_snapshot_for_normalization(
+        db_path: *const ::std::os::raw::c_char,
+        project: *const ::std::os::raw::c_char,
+        result: *mut cbm_store_verify_result_t,
+    ) -> cbm_store_verify_status_t;
+}
+unsafe extern "C" {
     pub fn cbm_store_open_path_project_writer_existing(
         db_path: *const ::std::os::raw::c_char,
         project: *const ::std::os::raw::c_char,
+        out_store: *mut *mut cbm_store_t,
+        result: *mut cbm_store_verify_result_t,
+    ) -> cbm_store_verify_status_t;
+}
+unsafe extern "C" {
+    pub fn cbm_store_open_path_project_writer_existing_bound(
+        db_path: *const ::std::os::raw::c_char,
+        project: *const ::std::os::raw::c_char,
+        expected_family: *const cbm_store_verify_result_t,
         out_store: *mut *mut cbm_store_t,
         result: *mut cbm_store_verify_result_t,
     ) -> cbm_store_verify_status_t;
@@ -3181,7 +2662,16 @@ unsafe extern "C" {
     pub fn cbm_store_open(project: *const ::std::os::raw::c_char) -> *mut cbm_store_t;
 }
 unsafe extern "C" {
-    pub fn cbm_store_close(s: *mut cbm_store_t);
+    pub fn cbm_store_close(
+        store: *mut *mut cbm_store_t,
+        result: *mut cbm_store_close_result_t,
+    ) -> cbm_store_close_status_t;
+}
+unsafe extern "C" {
+    pub fn cbm_store_close_required(
+        store: *mut *mut cbm_store_t,
+        operation: *const ::std::os::raw::c_char,
+    );
 }
 unsafe extern "C" {
     pub fn cbm_store_error(s: *mut cbm_store_t) -> *const ::std::os::raw::c_char;
@@ -3215,6 +2705,12 @@ unsafe extern "C" {
 }
 unsafe extern "C" {
     pub fn cbm_store_checkpoint(s: *mut cbm_store_t) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn cbm_store_normalize_journal_mode_delete(
+        s: *mut cbm_store_t,
+        result: *mut cbm_store_normalize_result_t,
+    ) -> cbm_store_normalize_status_t;
 }
 unsafe extern "C" {
     pub fn cbm_store_resolve_mmap_size() -> i64;
@@ -4058,6 +3554,714 @@ unsafe extern "C" {
         s: *mut cbm_store_t,
         sql: *const ::std::os::raw::c_char,
     ) -> ::std::os::raw::c_int;
+}
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct cbm_watcher {
+    _unused: [u8; 0],
+}
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct cbm_config {
+    _unused: [u8; 0],
+}
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct cbm_jsonrpc_request_t {
+    pub jsonrpc: *const ::std::os::raw::c_char,
+    pub method: *const ::std::os::raw::c_char,
+    pub id: i64,
+    pub id_str: *const ::std::os::raw::c_char,
+    pub has_id: bool,
+    pub params_raw: *const ::std::os::raw::c_char,
+}
+impl Default for cbm_jsonrpc_request_t {
+    fn default() -> Self {
+        let mut s = ::std::mem::MaybeUninit::<Self>::uninit();
+        unsafe {
+            ::std::ptr::write_bytes(s.as_mut_ptr(), 0, 1);
+            s.assume_init()
+        }
+    }
+}
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct cbm_jsonrpc_response_t {
+    pub id: i64,
+    pub id_str: *const ::std::os::raw::c_char,
+    pub result_json: *const ::std::os::raw::c_char,
+    pub error_json: *const ::std::os::raw::c_char,
+    pub error_code: ::std::os::raw::c_int,
+}
+impl Default for cbm_jsonrpc_response_t {
+    fn default() -> Self {
+        let mut s = ::std::mem::MaybeUninit::<Self>::uninit();
+        unsafe {
+            ::std::ptr::write_bytes(s.as_mut_ptr(), 0, 1);
+            s.assume_init()
+        }
+    }
+}
+unsafe extern "C" {
+    pub fn cbm_jsonrpc_parse(
+        line: *const ::std::os::raw::c_char,
+        out: *mut cbm_jsonrpc_request_t,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn cbm_jsonrpc_request_free(r: *mut cbm_jsonrpc_request_t);
+}
+unsafe extern "C" {
+    pub fn cbm_jsonrpc_format_response(
+        resp: *const cbm_jsonrpc_response_t,
+    ) -> *mut ::std::os::raw::c_char;
+}
+unsafe extern "C" {
+    pub fn cbm_jsonrpc_format_error(
+        id: i64,
+        code: ::std::os::raw::c_int,
+        message: *const ::std::os::raw::c_char,
+    ) -> *mut ::std::os::raw::c_char;
+}
+unsafe extern "C" {
+    pub fn cbm_mcp_text_result(
+        text: *const ::std::os::raw::c_char,
+        is_error: bool,
+    ) -> *mut ::std::os::raw::c_char;
+}
+unsafe extern "C" {
+    pub fn cbm_mcp_cancel_request_matches(
+        params_json: *const ::std::os::raw::c_char,
+        active_id: i64,
+        active_id_str: *const ::std::os::raw::c_char,
+    ) -> bool;
+}
+unsafe extern "C" {
+    pub fn cbm_mcp_tools_list() -> *mut ::std::os::raw::c_char;
+}
+unsafe extern "C" {
+    pub fn cbm_mcp_tool_input_schema(
+        tool_name: *const ::std::os::raw::c_char,
+    ) -> *const ::std::os::raw::c_char;
+}
+unsafe extern "C" {
+    pub fn cbm_mcp_initialize_response(
+        params_json: *const ::std::os::raw::c_char,
+    ) -> *mut ::std::os::raw::c_char;
+}
+unsafe extern "C" {
+    pub fn cbm_mcp_get_string_arg(
+        args_json: *const ::std::os::raw::c_char,
+        key: *const ::std::os::raw::c_char,
+    ) -> *mut ::std::os::raw::c_char;
+}
+unsafe extern "C" {
+    pub fn cbm_mcp_get_int_arg(
+        args_json: *const ::std::os::raw::c_char,
+        key: *const ::std::os::raw::c_char,
+        default_val: ::std::os::raw::c_int,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn cbm_mcp_get_bool_arg(
+        args_json: *const ::std::os::raw::c_char,
+        key: *const ::std::os::raw::c_char,
+    ) -> bool;
+}
+unsafe extern "C" {
+    pub fn cbm_mcp_get_tool_name(
+        params_json: *const ::std::os::raw::c_char,
+    ) -> *mut ::std::os::raw::c_char;
+}
+unsafe extern "C" {
+    pub fn cbm_mcp_get_arguments(
+        params_json: *const ::std::os::raw::c_char,
+    ) -> *mut ::std::os::raw::c_char;
+}
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct cbm_mcp_server {
+    _unused: [u8; 0],
+}
+pub type cbm_mcp_server_t = cbm_mcp_server;
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct cbm_project_transition {
+    _unused: [u8; 0],
+}
+pub type cbm_project_transition_t = cbm_project_transition;
+pub type cbm_project_holder_probe_status_t = i32;
+pub const CBM_PROJECT_HOLDER_PROBE_NOT_RUN: _bindgen_ty_7 = 0;
+pub const CBM_PROJECT_HOLDER_PROBE_STABLE: _bindgen_ty_7 = 1;
+pub const CBM_PROJECT_HOLDER_PROBE_API_UNAVAILABLE: _bindgen_ty_7 = 2;
+pub const CBM_PROJECT_HOLDER_PROBE_SESSION_FAILED: _bindgen_ty_7 = 3;
+pub const CBM_PROJECT_HOLDER_PROBE_REGISTER_FAILED: _bindgen_ty_7 = 4;
+pub const CBM_PROJECT_HOLDER_PROBE_LIST_FAILED: _bindgen_ty_7 = 5;
+pub const CBM_PROJECT_HOLDER_PROBE_PROCESS_QUERY_FAILED: _bindgen_ty_7 = 6;
+pub const CBM_PROJECT_HOLDER_PROBE_PROCESS_IDENTITY_CHANGED: _bindgen_ty_7 = 7;
+pub const CBM_PROJECT_HOLDER_PROBE_PROCESS_PATH_FAILED: _bindgen_ty_7 = 8;
+pub const CBM_PROJECT_HOLDER_PROBE_UNSTABLE: _bindgen_ty_7 = 9;
+pub const CBM_PROJECT_HOLDER_PROBE_END_SESSION_FAILED: _bindgen_ty_7 = 10;
+pub const CBM_PROJECT_HOLDER_PROBE_OPERATION_MAX: _bindgen_ty_7 = 64;
+pub const CBM_PROJECT_HOLDER_PATH_MAX: _bindgen_ty_7 = 4096;
+pub type _bindgen_ty_7 = ::std::os::raw::c_uint;
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct cbm_project_quiescence_result_t {
+    pub elapsed_ms: u64,
+    pub attempts: u64,
+    pub native_error: u32,
+    pub failed_path: [::std::os::raw::c_char; 1024usize],
+    pub holder_probe_status: cbm_project_holder_probe_status_t,
+    pub holder_probe_native_error: u32,
+    pub holder_inventory_stable: u32,
+    pub holder_count: u64,
+    pub first_holder_process_id: u32,
+    pub first_holder_process_start_utc_ticks: u64,
+    pub holder_probe_operation: [::std::os::raw::c_char; 64usize],
+    pub first_holder_path: [::std::os::raw::c_char; 4096usize],
+}
+impl Default for cbm_project_quiescence_result_t {
+    fn default() -> Self {
+        let mut s = ::std::mem::MaybeUninit::<Self>::uninit();
+        unsafe {
+            ::std::ptr::write_bytes(s.as_mut_ptr(), 0, 1);
+            s.assume_init()
+        }
+    }
+}
+unsafe extern "C" {
+    pub fn cbm_mcp_server_new(store_path: *const ::std::os::raw::c_char) -> *mut cbm_mcp_server_t;
+}
+unsafe extern "C" {
+    pub fn cbm_mcp_server_free(srv: *mut cbm_mcp_server_t);
+}
+unsafe extern "C" {
+    pub fn cbm_mcp_server_set_watcher(srv: *mut cbm_mcp_server_t, w: *mut cbm_watcher);
+}
+unsafe extern "C" {
+    pub fn cbm_mcp_server_set_config(srv: *mut cbm_mcp_server_t, cfg: *mut cbm_config);
+}
+unsafe extern "C" {
+    pub fn cbm_mcp_server_set_row_sink(
+        srv: *mut cbm_mcp_server_t,
+        sink: *const cbm_pipeline_row_sink_v1_t,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn cbm_mcp_server_handle(
+        srv: *mut cbm_mcp_server_t,
+        line: *const ::std::os::raw::c_char,
+    ) -> *mut ::std::os::raw::c_char;
+}
+unsafe extern "C" {
+    pub fn cbm_mcp_handle_tool(
+        srv: *mut cbm_mcp_server_t,
+        tool_name: *const ::std::os::raw::c_char,
+        args_json: *const ::std::os::raw::c_char,
+    ) -> *mut ::std::os::raw::c_char;
+}
+unsafe extern "C" {
+    pub fn cbm_mcp_index_run_supervised_path(
+        root_path: *const ::std::os::raw::c_char,
+    ) -> *mut ::std::os::raw::c_char;
+}
+unsafe extern "C" {
+    pub fn cbm_mcp_index_repository_supervised_strict(
+        srv: *mut cbm_mcp_server_t,
+        args: *const ::std::os::raw::c_char,
+    ) -> *mut ::std::os::raw::c_char;
+}
+unsafe extern "C" {
+    pub fn cbm_mcp_server_close_cached_project_store(
+        srv: *mut cbm_mcp_server_t,
+        result: *mut cbm_store_close_result_t,
+    ) -> cbm_store_close_status_t;
+}
+unsafe extern "C" {
+    pub fn cbm_mcp_server_evict_idle(
+        srv: *mut cbm_mcp_server_t,
+        timeout_s: ::std::os::raw::c_int,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn cbm_mcp_server_quiesce_project_transition(
+        srv: *mut cbm_mcp_server_t,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn cbm_project_transition_acquire(
+        project: *const ::std::os::raw::c_char,
+        recovered_abandoned_owner: *mut bool,
+        owner_process_start_utc_ticks: *mut u64,
+        native_error: *mut ::std::os::raw::c_ulong,
+    ) -> *mut cbm_project_transition_t;
+}
+unsafe extern "C" {
+    pub fn cbm_project_transition_wait_store_quiescent(
+        transition: *mut cbm_project_transition_t,
+        db_path: *const ::std::os::raw::c_char,
+        timeout_ms: ::std::os::raw::c_ulong,
+        poll_ms: ::std::os::raw::c_ulong,
+        result: *mut cbm_project_quiescence_result_t,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn cbm_project_transition_release(
+        transition: *mut cbm_project_transition_t,
+        native_error: *mut ::std::os::raw::c_ulong,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn cbm_mcp_server_has_cached_store(srv: *mut cbm_mcp_server_t) -> bool;
+}
+unsafe extern "C" {
+    pub fn cbm_mcp_server_store(srv: *mut cbm_mcp_server_t) -> *mut cbm_store_t;
+}
+unsafe extern "C" {
+    pub fn cbm_mcp_server_set_project(
+        srv: *mut cbm_mcp_server_t,
+        project: *const ::std::os::raw::c_char,
+    );
+}
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct cbm_pipeline {
+    _unused: [u8; 0],
+}
+unsafe extern "C" {
+    pub fn cbm_mcp_server_active_pipeline(srv: *mut cbm_mcp_server_t) -> *mut cbm_pipeline;
+}
+unsafe extern "C" {
+    pub fn cbm_parse_file_uri(
+        uri: *const ::std::os::raw::c_char,
+        out_path: *mut ::std::os::raw::c_char,
+        out_size: ::std::os::raw::c_int,
+    ) -> bool;
+}
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct cbm_gbuf {
+    _unused: [u8; 0],
+}
+pub type cbm_gbuf_t = cbm_gbuf;
+pub type cbm_pipeline_t = cbm_pipeline;
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct cbm_pipeline_error_t {
+    pub code: *const ::std::os::raw::c_char,
+    pub operation: *const ::std::os::raw::c_char,
+    pub phase: *const ::std::os::raw::c_char,
+    pub path: *const ::std::os::raw::c_char,
+    pub message: *const ::std::os::raw::c_char,
+    pub remediation: *const ::std::os::raw::c_char,
+    pub requested: usize,
+}
+impl Default for cbm_pipeline_error_t {
+    fn default() -> Self {
+        let mut s = ::std::mem::MaybeUninit::<Self>::uninit();
+        unsafe {
+            ::std::ptr::write_bytes(s.as_mut_ptr(), 0, 1);
+            s.assume_init()
+        }
+    }
+}
+pub type cbm_pipeline_post_success_fn = ::std::option::Option<
+    unsafe extern "C" fn(ctx: *mut ::std::os::raw::c_void) -> ::std::os::raw::c_int,
+>;
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct cbm_pipeline_phase_metric_t {
+    pub phase: *const ::std::os::raw::c_char,
+    pub elapsed_ms: u64,
+    pub read_bytes: u64,
+    pub write_bytes: u64,
+    pub other_bytes: u64,
+    pub start_working_set_bytes: u64,
+    pub end_working_set_bytes: u64,
+    pub start_peak_working_set_bytes: u64,
+    pub end_peak_working_set_bytes: u64,
+    pub start_private_bytes: u64,
+    pub end_private_bytes: u64,
+    pub start_peak_private_bytes: u64,
+    pub end_peak_private_bytes: u64,
+}
+impl Default for cbm_pipeline_phase_metric_t {
+    fn default() -> Self {
+        let mut s = ::std::mem::MaybeUninit::<Self>::uninit();
+        unsafe {
+            ::std::ptr::write_bytes(s.as_mut_ptr(), 0, 1);
+            s.assume_init()
+        }
+    }
+}
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct cbm_pipeline_parallel_dispatch_t {
+    pub operation: [::std::os::raw::c_char; 64usize],
+    pub mode: [::std::os::raw::c_char; 16usize],
+    pub code: [::std::os::raw::c_char; 96usize],
+    pub item_count: ::std::os::raw::c_int,
+    pub requested_workers: ::std::os::raw::c_int,
+    pub admitted_workers: ::std::os::raw::c_int,
+    pub created_workers: ::std::os::raw::c_int,
+    pub failed_worker_index: ::std::os::raw::c_int,
+    pub error_domain: ::std::os::raw::c_int,
+    pub error_code: ::std::os::raw::c_ulong,
+}
+impl Default for cbm_pipeline_parallel_dispatch_t {
+    fn default() -> Self {
+        let mut s = ::std::mem::MaybeUninit::<Self>::uninit();
+        unsafe {
+            ::std::ptr::write_bytes(s.as_mut_ptr(), 0, 1);
+            s.assume_init()
+        }
+    }
+}
+pub const CBM_PIPELINE_EMPTY_SOURCE_CORPUS: _bindgen_ty_8 = -2001;
+pub type _bindgen_ty_8 = ::std::os::raw::c_int;
+unsafe extern "C" {
+    pub fn cbm_pipeline_new(
+        repo_path: *const ::std::os::raw::c_char,
+        db_path: *const ::std::os::raw::c_char,
+        mode: cbm_index_mode_t,
+    ) -> *mut cbm_pipeline_t;
+}
+unsafe extern "C" {
+    pub fn cbm_pipeline_set_persistence(p: *mut cbm_pipeline_t, enabled: bool);
+}
+unsafe extern "C" {
+    pub fn cbm_pipeline_set_sink(
+        p: *mut cbm_pipeline_t,
+        sink: *const cbm_pipeline_row_sink_v1_t,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn cbm_pipeline_set_post_success_callback(
+        p: *mut cbm_pipeline_t,
+        callback: cbm_pipeline_post_success_fn,
+        ctx: *mut ::std::os::raw::c_void,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn cbm_pipeline_free(p: *mut cbm_pipeline_t);
+}
+unsafe extern "C" {
+    pub fn cbm_pipeline_run(p: *mut cbm_pipeline_t) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn cbm_pipeline_cancel(p: *mut cbm_pipeline_t);
+}
+unsafe extern "C" {
+    pub fn cbm_pipeline_project_name(p: *const cbm_pipeline_t) -> *const ::std::os::raw::c_char;
+}
+unsafe extern "C" {
+    pub fn cbm_pipeline_set_project_identity_root(
+        p: *mut cbm_pipeline_t,
+        identity_root: *const ::std::os::raw::c_char,
+    ) -> bool;
+}
+unsafe extern "C" {
+    pub fn cbm_pipeline_get_mode(p: *const cbm_pipeline_t) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn cbm_pipeline_get_excluded(
+        p: *const cbm_pipeline_t,
+        out: *mut *mut *mut ::std::os::raw::c_char,
+        count: *mut ::std::os::raw::c_int,
+    );
+}
+unsafe extern "C" {
+    pub fn cbm_pipeline_get_committed_counts(
+        p: *const cbm_pipeline_t,
+        nodes: *mut ::std::os::raw::c_int,
+        edges: *mut ::std::os::raw::c_int,
+    );
+}
+unsafe extern "C" {
+    pub fn cbm_pipeline_get_phase_metrics(
+        p: *const cbm_pipeline_t,
+        out: *mut *const cbm_pipeline_phase_metric_t,
+        count: *mut usize,
+        complete: *mut bool,
+    );
+}
+unsafe extern "C" {
+    pub fn cbm_pipeline_get_parallel_dispatches(
+        p: *const cbm_pipeline_t,
+        out: *mut *const cbm_pipeline_parallel_dispatch_t,
+        count: *mut usize,
+        complete: *mut bool,
+    );
+}
+unsafe extern "C" {
+    pub fn cbm_pipeline_get_ambiguous_reference_skips(p: *const cbm_pipeline_t) -> uint_least64_t;
+}
+unsafe extern "C" {
+    pub fn cbm_pipeline_get_parse_recovery_diagnostics(p: *const cbm_pipeline_t) -> uint_least64_t;
+}
+unsafe extern "C" {
+    pub fn cbm_pipeline_get_unresolved_reference_source_skips(
+        p: *const cbm_pipeline_t,
+    ) -> uint_least64_t;
+}
+unsafe extern "C" {
+    pub fn cbm_pipeline_get_fatal_error(
+        p: *const cbm_pipeline_t,
+        out: *mut cbm_pipeline_error_t,
+    ) -> bool;
+}
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct cbm_file_error_t {
+    pub path: *mut ::std::os::raw::c_char,
+    pub reason: *mut ::std::os::raw::c_char,
+    pub phase: *mut ::std::os::raw::c_char,
+}
+impl Default for cbm_file_error_t {
+    fn default() -> Self {
+        let mut s = ::std::mem::MaybeUninit::<Self>::uninit();
+        unsafe {
+            ::std::ptr::write_bytes(s.as_mut_ptr(), 0, 1);
+            s.assume_init()
+        }
+    }
+}
+unsafe extern "C" {
+    pub fn cbm_pipeline_add_file_error(
+        p: *mut cbm_pipeline_t,
+        path: *const ::std::os::raw::c_char,
+        reason: *const ::std::os::raw::c_char,
+        phase: *const ::std::os::raw::c_char,
+    );
+}
+unsafe extern "C" {
+    pub fn cbm_pipeline_get_file_errors(
+        p: *const cbm_pipeline_t,
+        out: *mut *mut cbm_file_error_t,
+        count: *mut ::std::os::raw::c_int,
+    );
+}
+unsafe extern "C" {
+    pub fn cbm_pipeline_try_lock() -> bool;
+}
+unsafe extern "C" {
+    pub fn cbm_pipeline_lock();
+}
+unsafe extern "C" {
+    pub fn cbm_pipeline_unlock();
+}
+unsafe extern "C" {
+    pub fn cbm_pipeline_fqn_compute(
+        project: *const ::std::os::raw::c_char,
+        rel_path: *const ::std::os::raw::c_char,
+        name: *const ::std::os::raw::c_char,
+    ) -> *mut ::std::os::raw::c_char;
+}
+unsafe extern "C" {
+    pub fn cbm_pipeline_fqn_module(
+        project: *const ::std::os::raw::c_char,
+        rel_path: *const ::std::os::raw::c_char,
+    ) -> *mut ::std::os::raw::c_char;
+}
+unsafe extern "C" {
+    pub fn cbm_pipeline_fqn_module_dir(
+        project: *const ::std::os::raw::c_char,
+        rel_path: *const ::std::os::raw::c_char,
+        module_is_dir: bool,
+    ) -> *mut ::std::os::raw::c_char;
+}
+unsafe extern "C" {
+    pub fn cbm_pipeline_fqn_folder(
+        project: *const ::std::os::raw::c_char,
+        rel_dir: *const ::std::os::raw::c_char,
+    ) -> *mut ::std::os::raw::c_char;
+}
+pub const cbm_relative_import_status_t_CBM_RELATIVE_IMPORT_ERROR: cbm_relative_import_status_t = -1;
+pub const cbm_relative_import_status_t_CBM_RELATIVE_IMPORT_NOT_RELATIVE:
+    cbm_relative_import_status_t = 0;
+pub const cbm_relative_import_status_t_CBM_RELATIVE_IMPORT_RESOLVED: cbm_relative_import_status_t =
+    1;
+pub const cbm_relative_import_status_t_CBM_RELATIVE_IMPORT_INVALID: cbm_relative_import_status_t =
+    2;
+pub type cbm_relative_import_status_t = ::std::os::raw::c_int;
+unsafe extern "C" {
+    pub fn cbm_pipeline_resolve_relative_import_checked(
+        source_rel: *const ::std::os::raw::c_char,
+        module_path: *const ::std::os::raw::c_char,
+        out: *mut *mut ::std::os::raw::c_char,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn cbm_project_name_from_path(
+        abs_path: *const ::std::os::raw::c_char,
+    ) -> *mut ::std::os::raw::c_char;
+}
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct cbm_registry {
+    _unused: [u8; 0],
+}
+pub type cbm_registry_t = cbm_registry;
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct cbm_resolution_t {
+    pub qualified_name: *const ::std::os::raw::c_char,
+    pub strategy: *const ::std::os::raw::c_char,
+    pub confidence: f64,
+    pub candidate_count: ::std::os::raw::c_int,
+}
+impl Default for cbm_resolution_t {
+    fn default() -> Self {
+        let mut s = ::std::mem::MaybeUninit::<Self>::uninit();
+        unsafe {
+            ::std::ptr::write_bytes(s.as_mut_ptr(), 0, 1);
+            s.assume_init()
+        }
+    }
+}
+unsafe extern "C" {
+    pub fn cbm_registry_new() -> *mut cbm_registry_t;
+}
+unsafe extern "C" {
+    pub fn cbm_registry_free(r: *mut cbm_registry_t);
+}
+unsafe extern "C" {
+    pub fn cbm_registry_add(
+        r: *mut cbm_registry_t,
+        name: *const ::std::os::raw::c_char,
+        qualified_name: *const ::std::os::raw::c_char,
+        label: *const ::std::os::raw::c_char,
+    ) -> bool;
+}
+unsafe extern "C" {
+    pub fn cbm_registry_failed(r: *const cbm_registry_t) -> bool;
+}
+unsafe extern "C" {
+    pub fn cbm_registry_resolve(
+        r: *const cbm_registry_t,
+        callee_name: *const ::std::os::raw::c_char,
+        module_qn: *const ::std::os::raw::c_char,
+        import_map_keys: *mut *const ::std::os::raw::c_char,
+        import_map_vals: *mut *const ::std::os::raw::c_char,
+        import_map_count: ::std::os::raw::c_int,
+    ) -> cbm_resolution_t;
+}
+unsafe extern "C" {
+    pub fn cbm_registry_resolve_exact(
+        r: *const cbm_registry_t,
+        reference_name: *const ::std::os::raw::c_char,
+        module_qn: *const ::std::os::raw::c_char,
+        import_map_keys: *mut *const ::std::os::raw::c_char,
+        import_map_vals: *mut *const ::std::os::raw::c_char,
+        import_map_count: ::std::os::raw::c_int,
+    ) -> cbm_resolution_t;
+}
+unsafe extern "C" {
+    pub fn cbm_registry_reach_cache_begin(estimated_capacity: ::std::os::raw::c_int);
+}
+unsafe extern "C" {
+    pub fn cbm_registry_reach_cache_end();
+}
+unsafe extern "C" {
+    pub fn cbm_registry_import_map_cache_begin(
+        keys: *mut *const ::std::os::raw::c_char,
+        vals: *mut *const ::std::os::raw::c_char,
+        count: ::std::os::raw::c_int,
+    );
+}
+unsafe extern "C" {
+    pub fn cbm_registry_import_map_cache_end();
+}
+unsafe extern "C" {
+    pub fn cbm_registry_resolve_cache_begin(estimated_capacity: ::std::os::raw::c_int);
+}
+unsafe extern "C" {
+    pub fn cbm_registry_resolve_cache_end();
+}
+unsafe extern "C" {
+    pub fn cbm_registry_cache_failed() -> bool;
+}
+unsafe extern "C" {
+    pub fn cbm_registry_exists(r: *const cbm_registry_t, qn: *const ::std::os::raw::c_char)
+    -> bool;
+}
+unsafe extern "C" {
+    pub fn cbm_perl_is_builtin(name: *const ::std::os::raw::c_char) -> bool;
+}
+unsafe extern "C" {
+    pub fn cbm_perl_suppress_generic_match(
+        is_perl: bool,
+        is_method: bool,
+        callee_name: *const ::std::os::raw::c_char,
+        strategy: *const ::std::os::raw::c_char,
+    ) -> bool;
+}
+unsafe extern "C" {
+    pub fn cbm_tsjs_suppress_weak_method_match(
+        is_tsjs: bool,
+        is_method: bool,
+        strategy: *const ::std::os::raw::c_char,
+    ) -> bool;
+}
+unsafe extern "C" {
+    pub fn cbm_registry_label_of(
+        r: *const cbm_registry_t,
+        qn: *const ::std::os::raw::c_char,
+    ) -> *const ::std::os::raw::c_char;
+}
+unsafe extern "C" {
+    pub fn cbm_registry_find_by_name(
+        r: *const cbm_registry_t,
+        name: *const ::std::os::raw::c_char,
+        out: *mut *mut *const ::std::os::raw::c_char,
+        count: *mut ::std::os::raw::c_int,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn cbm_registry_size(r: *const cbm_registry_t) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn cbm_registry_find_ending_with(
+        r: *const cbm_registry_t,
+        suffix: *const ::std::os::raw::c_char,
+        out: *mut *mut *const ::std::os::raw::c_char,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn cbm_registry_is_import_reachable(
+        candidate_qn: *const ::std::os::raw::c_char,
+        import_vals: *mut *const ::std::os::raw::c_char,
+        import_count: ::std::os::raw::c_int,
+    ) -> bool;
+}
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct cbm_fuzzy_result_t {
+    pub result: cbm_resolution_t,
+    pub ok: bool,
+}
+impl Default for cbm_fuzzy_result_t {
+    fn default() -> Self {
+        let mut s = ::std::mem::MaybeUninit::<Self>::uninit();
+        unsafe {
+            ::std::ptr::write_bytes(s.as_mut_ptr(), 0, 1);
+            s.assume_init()
+        }
+    }
+}
+unsafe extern "C" {
+    pub fn cbm_registry_fuzzy_resolve(
+        r: *const cbm_registry_t,
+        callee_name: *const ::std::os::raw::c_char,
+        module_qn: *const ::std::os::raw::c_char,
+        import_map_keys: *mut *const ::std::os::raw::c_char,
+        import_map_vals: *mut *const ::std::os::raw::c_char,
+        import_map_count: ::std::os::raw::c_int,
+    ) -> cbm_fuzzy_result_t;
+}
+unsafe extern "C" {
+    pub fn cbm_confidence_band(score: f64) -> *const ::std::os::raw::c_char;
 }
 pub type cbm_watcher_t = cbm_watcher;
 pub type cbm_index_fn = ::std::option::Option<

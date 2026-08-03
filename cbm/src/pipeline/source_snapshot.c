@@ -51,6 +51,16 @@ typedef struct {
     const char *failure_operation;
     const char *failure_path;
     DWORD native_error;
+    bool source_changed;
+    const char *source_change_kind;
+    bool expected_size_available;
+    int64_t expected_size;
+    bool observed_size_available;
+    int64_t observed_size;
+    bool expected_identity_available;
+    snapshot_identity_t expected_identity;
+    bool observed_identity_available;
+    snapshot_identity_t observed_identity;
     bool complete;
 } snapshot_capture_result_t;
 
@@ -65,6 +75,10 @@ typedef struct {
     const char *failure_code;
     const char *failure_operation;
     DWORD native_error;
+    bool source_changed;
+    const char *source_change_kind;
+    bool observed_identity_available;
+    snapshot_identity_t observed_identity;
 } snapshot_identity_probe_result_t;
 
 typedef enum {
@@ -87,14 +101,329 @@ typedef struct {
     snapshot_identity_probe_result_t *identity_results;
 } snapshot_dispatcher_t;
 
+static int64_t filetime_to_unix_ns(LONGLONG ticks);
+
 static void snapshot_log_failure(const char *code, const char *operation, const char *path,
                                  unsigned long native_error) {
     char error_buf[32];
     snprintf(error_buf, sizeof(error_buf), "%lu", native_error);
     cbm_log_error("source_snapshot.failed", "code", code, "operation", operation, "path",
-                  path ? path : "", "native_error", error_buf, "message",
+                  path ? path : "", "native_error_kind", "win32", "native_error", error_buf,
+                  "message",
                   "the immutable source snapshot could not be completed", "remediation",
                   "stabilize source access, free workspace disk space, and retry indexing");
+}
+
+static const char *snapshot_bool_text(bool value) {
+    return value ? "true" : "false";
+}
+
+static void snapshot_i64_text(int64_t value, char *out, size_t out_size) {
+    snprintf(out, out_size, "%lld", (long long)value);
+}
+
+static void snapshot_u64_text(uint64_t value, char *out, size_t out_size) {
+    snprintf(out, out_size, "%llu", (unsigned long long)value);
+}
+
+static void snapshot_file_id_hex(const uint8_t *file_id, char out[33]) {
+    static const char digits[] = "0123456789abcdef";
+    if (!file_id) {
+        out[0] = '\0';
+        return;
+    }
+    for (size_t i = 0; i < 16; i++) {
+        out[i * 2] = digits[file_id[i] >> 4];
+        out[i * 2 + 1] = digits[file_id[i] & 15];
+    }
+    out[32] = '\0';
+}
+
+static void snapshot_append_mismatch(char *out, size_t out_size, const char *field) {
+    if (!out || out_size == 0 || !field || field[0] == '\0') {
+        return;
+    }
+    size_t used = strlen(out);
+    if (used >= out_size - 1) {
+        return;
+    }
+    if (used > 0) {
+        out[used++] = ',';
+        out[used] = '\0';
+        if (used >= out_size - 1) {
+            return;
+        }
+    }
+    snprintf(out + used, out_size - used, "%s", field);
+}
+
+static void snapshot_describe_file_identity_mismatch(const cbm_file_info_t *expected,
+                                                     const snapshot_identity_t *observed,
+                                                     char *out, size_t out_size) {
+    if (!out || out_size == 0) {
+        return;
+    }
+    out[0] = '\0';
+    if (!expected || !observed) {
+        snapshot_append_mismatch(out, out_size, "identity_unavailable");
+        return;
+    }
+    if (observed->id.VolumeSerialNumber != expected->source_volume_serial) {
+        snapshot_append_mismatch(out, out_size, "volume_serial");
+    }
+    if (memcmp(observed->id.FileId.Identifier, expected->source_file_id,
+               sizeof(expected->source_file_id)) != 0) {
+        snapshot_append_mismatch(out, out_size, "file_id");
+    }
+    if (observed->standard.EndOfFile.QuadPart != expected->size) {
+        snapshot_append_mismatch(out, out_size, "stream_size");
+    }
+    if (filetime_to_unix_ns(observed->basic.LastWriteTime.QuadPart) != expected->mtime_ns) {
+        snapshot_append_mismatch(out, out_size, "last_write_time");
+    }
+    if (observed->basic.ChangeTime.QuadPart != expected->source_change_time_100ns) {
+        snapshot_append_mismatch(out, out_size, "change_time");
+    }
+    if (observed->standard.Directory) {
+        snapshot_append_mismatch(out, out_size, "became_directory");
+    }
+    if (observed->standard.DeletePending) {
+        snapshot_append_mismatch(out, out_size, "delete_pending");
+    }
+    if (out[0] == '\0') {
+        snapshot_append_mismatch(out, out_size, "unspecified_identity_drift");
+    }
+}
+
+static void snapshot_describe_identity_pair_mismatch(const snapshot_identity_t *expected,
+                                                     const snapshot_identity_t *observed,
+                                                     uint64_t observed_hash_bytes,
+                                                     bool hash_bytes_available, char *out,
+                                                     size_t out_size) {
+    if (!out || out_size == 0) {
+        return;
+    }
+    out[0] = '\0';
+    if (!expected || !observed) {
+        snapshot_append_mismatch(out, out_size, "identity_unavailable");
+        return;
+    }
+    if (observed->id.VolumeSerialNumber != expected->id.VolumeSerialNumber) {
+        snapshot_append_mismatch(out, out_size, "volume_serial");
+    }
+    if (memcmp(observed->id.FileId.Identifier, expected->id.FileId.Identifier,
+               sizeof(expected->id.FileId.Identifier)) != 0) {
+        snapshot_append_mismatch(out, out_size, "file_id");
+    }
+    if (observed->standard.EndOfFile.QuadPart != expected->standard.EndOfFile.QuadPart) {
+        snapshot_append_mismatch(out, out_size, "stream_size");
+    }
+    if (observed->basic.LastWriteTime.QuadPart != expected->basic.LastWriteTime.QuadPart) {
+        snapshot_append_mismatch(out, out_size, "last_write_time");
+    }
+    if (observed->basic.ChangeTime.QuadPart != expected->basic.ChangeTime.QuadPart) {
+        snapshot_append_mismatch(out, out_size, "change_time");
+    }
+    if (observed->standard.Directory != expected->standard.Directory) {
+        snapshot_append_mismatch(out, out_size, "directory");
+    }
+    if (observed->standard.DeletePending != expected->standard.DeletePending) {
+        snapshot_append_mismatch(out, out_size, "delete_pending");
+    }
+    if (hash_bytes_available &&
+        observed_hash_bytes != (uint64_t)expected->standard.EndOfFile.QuadPart) {
+        snapshot_append_mismatch(out, out_size, "bytes_read");
+    }
+    if (out[0] == '\0') {
+        snapshot_append_mismatch(out, out_size, "unspecified_identity_drift");
+    }
+}
+
+static void snapshot_log_source_changed_basic(const char *code, const char *operation,
+                                              const char *path, const char *source_change_kind) {
+    cbm_log_error("source_snapshot.source_changed", "code", code, "operation", operation, "path",
+                  path ? path : "", "diagnostic_kind", "source_change", "source_change_kind",
+                  source_change_kind ? source_change_kind : "unspecified", "native_error_kind",
+                  "none", "native_error", "0", "publication_started", "false", "message",
+                  "the source tree changed while Astrolabe was proving a consistent snapshot",
+                  "remediation",
+                  "preserve the failed run evidence, wait for the source tree to stabilize, and "
+                  "retry indexing without publishing a mixed-generation graph");
+}
+
+static void snapshot_log_source_changed_size(const char *code, const char *operation,
+                                             const char *path, const char *source_change_kind,
+                                             int64_t expected_size, int64_t observed_size) {
+    char expected_size_text[32];
+    char observed_size_text[32];
+    snapshot_i64_text(expected_size, expected_size_text, sizeof(expected_size_text));
+    snapshot_i64_text(observed_size, observed_size_text, sizeof(observed_size_text));
+    cbm_log_error("source_snapshot.source_changed", "code", code, "operation", operation, "path",
+                  path ? path : "", "diagnostic_kind", "source_change", "source_change_kind",
+                  source_change_kind ? source_change_kind : "stream_size_changed",
+                  "expected_size", expected_size_text, "observed_size", observed_size_text,
+                  "native_error_kind", "none", "native_error", "0", "publication_started",
+                  "false", "message",
+                  "the source stream size changed while Astrolabe was proving a consistent "
+                  "snapshot",
+                  "remediation",
+                  "preserve the failed run evidence, wait for the source tree to stabilize, and "
+                  "retry indexing without publishing a mixed-generation graph");
+}
+
+static void snapshot_log_source_changed_file_identity(const char *code, const char *operation,
+                                                      const char *path,
+                                                      const char *source_change_kind,
+                                                      const cbm_file_info_t *expected,
+                                                      const snapshot_identity_t *observed) {
+    char expected_volume[32];
+    char observed_volume[32];
+    char expected_file_id[33];
+    char observed_file_id[33];
+    char expected_size[32];
+    char observed_size[32];
+    char expected_mtime[32];
+    char observed_mtime[32];
+    char expected_change_time[32];
+    char observed_change_time[32];
+    char mismatch_fields[256];
+    snapshot_u64_text(expected ? expected->source_volume_serial : 0, expected_volume,
+                      sizeof(expected_volume));
+    snapshot_u64_text(observed ? observed->id.VolumeSerialNumber : 0, observed_volume,
+                      sizeof(observed_volume));
+    snapshot_file_id_hex(expected ? expected->source_file_id : NULL, expected_file_id);
+    snapshot_file_id_hex(observed ? observed->id.FileId.Identifier : NULL, observed_file_id);
+    snapshot_i64_text(expected ? expected->size : 0, expected_size, sizeof(expected_size));
+    snapshot_i64_text(observed ? observed->standard.EndOfFile.QuadPart : 0, observed_size,
+                      sizeof(observed_size));
+    snapshot_i64_text(expected ? expected->mtime_ns : 0, expected_mtime, sizeof(expected_mtime));
+    snapshot_i64_text(observed ? filetime_to_unix_ns(observed->basic.LastWriteTime.QuadPart) : 0,
+                      observed_mtime, sizeof(observed_mtime));
+    snapshot_i64_text(expected ? expected->source_change_time_100ns : 0, expected_change_time,
+                      sizeof(expected_change_time));
+    snapshot_i64_text(observed ? observed->basic.ChangeTime.QuadPart : 0, observed_change_time,
+                      sizeof(observed_change_time));
+    snapshot_describe_file_identity_mismatch(expected, observed, mismatch_fields,
+                                             sizeof(mismatch_fields));
+    cbm_log_error(
+        "source_snapshot.source_changed", "code", code, "operation", operation, "path",
+        path ? path : "", "diagnostic_kind", "source_change", "source_change_kind",
+        source_change_kind ? source_change_kind : "file_identity_changed", "mismatch_fields",
+        mismatch_fields, "expected_volume_serial", expected_volume, "observed_volume_serial",
+        observed_volume, "expected_file_id", expected_file_id, "observed_file_id",
+        observed_file_id, "expected_size", expected_size, "observed_size", observed_size,
+        "expected_mtime_ns", expected_mtime, "observed_mtime_ns", observed_mtime,
+        "expected_change_time_100ns", expected_change_time, "observed_change_time_100ns",
+        observed_change_time, "observed_directory",
+        observed ? snapshot_bool_text(observed->standard.Directory) : "", "observed_delete_pending",
+        observed ? snapshot_bool_text(observed->standard.DeletePending) : "",
+        "native_error_kind", "none", "native_error", "0", "publication_started", "false",
+        "message",
+        "the source file identity changed while Astrolabe was proving a consistent snapshot",
+        "remediation",
+        "preserve the failed run evidence, wait for the source tree to stabilize, and retry "
+        "indexing without publishing a mixed-generation graph");
+}
+
+static void snapshot_log_source_changed_identity_pair(const char *code, const char *operation,
+                                                      const char *path,
+                                                      const char *source_change_kind,
+                                                      const snapshot_identity_t *expected,
+                                                      const snapshot_identity_t *observed,
+                                                      uint64_t observed_hash_bytes,
+                                                      bool hash_bytes_available) {
+    char expected_volume[32];
+    char observed_volume[32];
+    char expected_file_id[33];
+    char observed_file_id[33];
+    char expected_size[32];
+    char observed_size[32];
+    char expected_mtime[32];
+    char observed_mtime[32];
+    char expected_change_time[32];
+    char observed_change_time[32];
+    char observed_hash_bytes_text[32];
+    char mismatch_fields[256];
+    snapshot_u64_text(expected ? expected->id.VolumeSerialNumber : 0, expected_volume,
+                      sizeof(expected_volume));
+    snapshot_u64_text(observed ? observed->id.VolumeSerialNumber : 0, observed_volume,
+                      sizeof(observed_volume));
+    snapshot_file_id_hex(expected ? expected->id.FileId.Identifier : NULL, expected_file_id);
+    snapshot_file_id_hex(observed ? observed->id.FileId.Identifier : NULL, observed_file_id);
+    snapshot_i64_text(expected ? expected->standard.EndOfFile.QuadPart : 0, expected_size,
+                      sizeof(expected_size));
+    snapshot_i64_text(observed ? observed->standard.EndOfFile.QuadPart : 0, observed_size,
+                      sizeof(observed_size));
+    snapshot_i64_text(expected ? filetime_to_unix_ns(expected->basic.LastWriteTime.QuadPart) : 0,
+                      expected_mtime, sizeof(expected_mtime));
+    snapshot_i64_text(observed ? filetime_to_unix_ns(observed->basic.LastWriteTime.QuadPart) : 0,
+                      observed_mtime, sizeof(observed_mtime));
+    snapshot_i64_text(expected ? expected->basic.ChangeTime.QuadPart : 0, expected_change_time,
+                      sizeof(expected_change_time));
+    snapshot_i64_text(observed ? observed->basic.ChangeTime.QuadPart : 0, observed_change_time,
+                      sizeof(observed_change_time));
+    snapshot_u64_text(observed_hash_bytes, observed_hash_bytes_text,
+                      sizeof(observed_hash_bytes_text));
+    snapshot_describe_identity_pair_mismatch(expected, observed, observed_hash_bytes,
+                                             hash_bytes_available, mismatch_fields,
+                                             sizeof(mismatch_fields));
+    cbm_log_error(
+        "source_snapshot.source_changed", "code", code, "operation", operation, "path",
+        path ? path : "", "diagnostic_kind", "source_change", "source_change_kind",
+        source_change_kind ? source_change_kind : "file_identity_changed", "mismatch_fields",
+        mismatch_fields, "expected_volume_serial", expected_volume, "observed_volume_serial",
+        observed_volume, "expected_file_id", expected_file_id, "observed_file_id",
+        observed_file_id, "expected_size", expected_size, "observed_size", observed_size,
+        "expected_mtime_ns", expected_mtime, "observed_mtime_ns", observed_mtime,
+        "expected_change_time_100ns", expected_change_time, "observed_change_time_100ns",
+        observed_change_time, "observed_hash_bytes",
+        hash_bytes_available ? observed_hash_bytes_text : "", "observed_directory",
+        observed ? snapshot_bool_text(observed->standard.Directory) : "", "observed_delete_pending",
+        observed ? snapshot_bool_text(observed->standard.DeletePending) : "",
+        "native_error_kind", "none", "native_error", "0", "publication_started", "false",
+        "message",
+        "the source file identity changed while Astrolabe was proving a consistent snapshot",
+        "remediation",
+        "preserve the failed run evidence, wait for the source tree to stabilize, and retry "
+        "indexing without publishing a mixed-generation graph");
+}
+
+static void snapshot_log_source_changed_namespace(const char *operation, const char *path,
+                                                  const char *source_change_kind,
+                                                  int captured_count, int observed_count,
+                                                  const cbm_file_info_t *expected,
+                                                  const cbm_file_info_t *observed) {
+    char captured_count_text[32];
+    char observed_count_text[32];
+    char expected_language[32] = "";
+    char observed_language[32] = "";
+    snapshot_i64_text(captured_count, captured_count_text, sizeof(captured_count_text));
+    snapshot_i64_text(observed_count, observed_count_text, sizeof(observed_count_text));
+    if (expected) {
+        snprintf(expected_language, sizeof(expected_language), "%d", (int)expected->language);
+    }
+    if (observed) {
+        snprintf(observed_language, sizeof(observed_language), "%d", (int)observed->language);
+    }
+    cbm_log_error(
+        "source_snapshot.source_changed", "code", "CBM_SOURCE_SNAPSHOT_NAMESPACE_DRIFT",
+        "operation", operation, "path", path ? path : "", "diagnostic_kind", "source_change",
+        "source_change_kind", source_change_kind ? source_change_kind : "namespace_changed",
+        "captured_count", captured_count_text, "observed_count", observed_count_text,
+        "expected_rel_path", expected ? expected->rel_path : "", "observed_rel_path",
+        observed ? observed->rel_path : "", "expected_language", expected_language,
+        "observed_language", observed_language, "expected_auxiliary",
+        expected ? snapshot_bool_text(expected->auxiliary) : "", "observed_auxiliary",
+        observed ? snapshot_bool_text(observed->auxiliary) : "",
+        "expected_interpretation_input",
+        expected ? snapshot_bool_text(expected->interpretation_input) : "",
+        "observed_interpretation_input",
+        observed ? snapshot_bool_text(observed->interpretation_input) : "", "native_error_kind",
+        "none", "native_error", "0", "publication_started", "false", "message",
+        "the source namespace changed while Astrolabe was proving a consistent snapshot",
+        "remediation",
+        "preserve the failed run evidence, wait for the source tree to stabilize, and retry "
+        "indexing without publishing a mixed-generation graph");
 }
 
 static char *snapshot_join(const char *left, const char *right) {
@@ -223,13 +552,25 @@ static snapshot_live_match_t snapshot_hash_live_match(const cbm_file_info_t *fil
 
     FILE_ATTRIBUTE_TAG_INFO tag = {0};
     snapshot_identity_t before = {0};
-    if (!GetFileInformationByHandleEx(source, FileAttributeTagInfo, &tag, sizeof(tag)) ||
-        (tag.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0 ||
-        !snapshot_get_identity(source, &before)) {
+    if (!GetFileInformationByHandleEx(source, FileAttributeTagInfo, &tag, sizeof(tag))) {
         DWORD error = GetLastError();
         CloseHandle(source);
         snapshot_log_failure("CBM_SOURCE_UNCHANGED_IDENTITY_FAILED", "inspect_live_source",
-                             file->path, error ? error : ERROR_FILE_INVALID);
+                             file->path, error);
+        return SNAPSHOT_LIVE_ERROR;
+    }
+    if ((tag.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0) {
+        CloseHandle(source);
+        snapshot_log_source_changed_basic("CBM_SOURCE_UNCHANGED_MUTATED",
+                                          "inspect_live_source", file->path,
+                                          "live_source_became_reparse_point");
+        return SNAPSHOT_LIVE_ERROR;
+    }
+    if (!snapshot_get_identity(source, &before)) {
+        DWORD error = GetLastError();
+        CloseHandle(source);
+        snapshot_log_failure("CBM_SOURCE_UNCHANGED_IDENTITY_FAILED", "inspect_live_source",
+                             file->path, error);
         return SNAPSHOT_LIVE_ERROR;
     }
     if (before.standard.EndOfFile.QuadPart < 0 ||
@@ -256,8 +597,9 @@ static snapshot_live_match_t snapshot_hash_live_match(const cbm_file_info_t *fil
     }
     if (!snapshot_identity_equal(&before, &after) ||
         bytes != (uint64_t)before.standard.EndOfFile.QuadPart) {
-        snapshot_log_failure("CBM_SOURCE_UNCHANGED_MUTATED", "verify_live_source_identity",
-                             file->path, ERROR_FILE_INVALID);
+        snapshot_log_source_changed_identity_pair(
+            "CBM_SOURCE_UNCHANGED_MUTATED", "verify_live_source_identity", file->path,
+            "live_source_changed_during_hash", &before, &after, bytes, true);
         return SNAPSHOT_LIVE_ERROR;
     }
 
@@ -333,6 +675,60 @@ static void snapshot_capture_fail(snapshot_capture_result_t *result, const char 
     }
 }
 
+static void snapshot_capture_fail_source_changed_basic(snapshot_capture_result_t *result,
+                                                       const char *code, const char *operation,
+                                                       const char *path,
+                                                       const char *source_change_kind) {
+    if (!result->failure_code) {
+        result->failure_code = code;
+        result->failure_operation = operation;
+        result->failure_path = path;
+        result->native_error = ERROR_SUCCESS;
+        result->source_changed = true;
+        result->source_change_kind = source_change_kind;
+    }
+}
+
+static void snapshot_capture_fail_source_changed_size(snapshot_capture_result_t *result,
+                                                      const char *code, const char *operation,
+                                                      const char *path,
+                                                      const char *source_change_kind,
+                                                      int64_t expected_size,
+                                                      int64_t observed_size) {
+    snapshot_capture_fail_source_changed_basic(result, code, operation, path, source_change_kind);
+    if (result->source_changed) {
+        result->expected_size_available = true;
+        result->expected_size = expected_size;
+        result->observed_size_available = true;
+        result->observed_size = observed_size;
+    }
+}
+
+static void snapshot_capture_fail_source_changed_identity(snapshot_capture_result_t *result,
+                                                          const char *code,
+                                                          const char *operation, const char *path,
+                                                          const char *source_change_kind,
+                                                          const snapshot_identity_t *expected,
+                                                          const snapshot_identity_t *observed,
+                                                          uint64_t observed_hash_bytes,
+                                                          bool hash_bytes_available) {
+    snapshot_capture_fail_source_changed_basic(result, code, operation, path, source_change_kind);
+    if (result->source_changed) {
+        if (expected) {
+            result->expected_identity_available = true;
+            result->expected_identity = *expected;
+        }
+        if (observed) {
+            result->observed_identity_available = true;
+            result->observed_identity = *observed;
+        }
+        if (hash_bytes_available) {
+            result->observed_size_available = true;
+            result->observed_size = (int64_t)observed_hash_bytes;
+        }
+    }
+}
+
 static void snapshot_capture_prepared(snapshot_capture_result_t *result) {
     cbm_file_info_t *file = result->file;
     HANDLE source = INVALID_HANDLE_VALUE;
@@ -350,25 +746,43 @@ static void snapshot_capture_prepared(snapshot_capture_result_t *result) {
         result->wide_source, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING,
         FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN | FILE_FLAG_OPEN_REPARSE_POINT, NULL);
     if (source == INVALID_HANDLE_VALUE) {
-        snapshot_capture_fail(result, "CBM_SOURCE_SNAPSHOT_SOURCE_OPEN_FAILED", "open_source",
-                              file->path, GetLastError());
+        error = GetLastError();
+        if (error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND) {
+            snapshot_capture_fail_source_changed_basic(
+                result, "CBM_SOURCE_SNAPSHOT_DISCOVERY_DRIFT", "open_source", file->path,
+                "source_removed_after_discovery");
+        } else {
+            snapshot_capture_fail(result, "CBM_SOURCE_SNAPSHOT_SOURCE_OPEN_FAILED", "open_source",
+                                  file->path, error);
+        }
         goto cleanup;
     }
 
     FILE_ATTRIBUTE_TAG_INFO tag = {0};
-    if (!GetFileInformationByHandleEx(source, FileAttributeTagInfo, &tag, sizeof(tag)) ||
-        (tag.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0 ||
-        !snapshot_get_identity(source, &before)) {
+    if (!GetFileInformationByHandleEx(source, FileAttributeTagInfo, &tag, sizeof(tag))) {
         error = GetLastError();
         snapshot_capture_fail(result, "CBM_SOURCE_SNAPSHOT_SOURCE_IDENTITY_FAILED",
-                              "inspect_source", file->path,
-                              error != ERROR_SUCCESS ? error : ERROR_FILE_INVALID);
+                              "inspect_source", file->path, error);
+        goto cleanup;
+    }
+    if ((tag.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0) {
+        snapshot_capture_fail_source_changed_basic(
+            result, "CBM_SOURCE_SNAPSHOT_DISCOVERY_DRIFT", "inspect_source", file->path,
+            "source_became_reparse_point_after_discovery");
+        goto cleanup;
+    }
+    if (!snapshot_get_identity(source, &before)) {
+        error = GetLastError();
+        snapshot_capture_fail(result, "CBM_SOURCE_SNAPSHOT_SOURCE_IDENTITY_FAILED",
+                              "inspect_source", file->path, error);
         goto cleanup;
     }
     if (before.standard.EndOfFile.QuadPart < 0 ||
         before.standard.EndOfFile.QuadPart != file->size) {
-        snapshot_capture_fail(result, "CBM_SOURCE_SNAPSHOT_DISCOVERY_DRIFT",
-                              "compare_discovered_size", file->path, ERROR_FILE_INVALID);
+        snapshot_capture_fail_source_changed_size(
+            result, "CBM_SOURCE_SNAPSHOT_DISCOVERY_DRIFT", "compare_discovered_size", file->path,
+            "discovered_size_changed_before_capture", file->size,
+            before.standard.EndOfFile.QuadPart);
         goto cleanup;
     }
 
@@ -418,8 +832,9 @@ static void snapshot_capture_prepared(snapshot_capture_result_t *result) {
 
     if (!snapshot_identity_equal(&before, &after) ||
         captured_bytes != (uint64_t)before.standard.EndOfFile.QuadPart) {
-        snapshot_capture_fail(result, "CBM_SOURCE_SNAPSHOT_SOURCE_MUTATED", "capture_identity",
-                              file->path, ERROR_FILE_INVALID);
+        snapshot_capture_fail_source_changed_identity(
+            result, "CBM_SOURCE_SNAPSHOT_SOURCE_MUTATED", "capture_identity", file->path,
+            "source_changed_during_capture", &before, &after, captured_bytes, true);
         goto cleanup;
     }
 
@@ -780,7 +1195,11 @@ static void snapshot_probe_current_identity(const cbm_file_info_t *file, const w
         if (!result->match) {
             result->failure_code = "CBM_SOURCE_SNAPSHOT_NAMESPACE_DRIFT";
             result->failure_operation = "compare_live_identity";
-            result->native_error = ERROR_FILE_INVALID;
+            result->native_error = ERROR_SUCCESS;
+            result->source_changed = true;
+            result->source_change_kind = "live_identity_changed_after_capture";
+            result->observed_identity_available = true;
+            result->observed_identity = identity;
         }
     }
     if (!CloseHandle(handle) && !result->failure_code) {
@@ -943,25 +1362,70 @@ static int snapshot_verify_namespace(const char *repo_path, const cbm_discover_o
     }
     qsort(a, (size_t)captured_count, sizeof(*a), compare_rel_paths);
     qsort(b, (size_t)observed_count, sizeof(*b), compare_rel_paths);
-    bool match = captured_count == observed_count;
-    const char *mismatch = repo_path;
-    for (int i = 0; match && i < captured_count; i++) {
-        if (strcmp(a[i]->rel_path, b[i]->rel_path) != 0 || a[i]->language != b[i]->language ||
-            a[i]->auxiliary != b[i]->auxiliary ||
-            a[i]->interpretation_input != b[i]->interpretation_input) {
+    bool match = true;
+    const char *mismatch_path = repo_path;
+    const char *source_change_kind = "namespace_changed";
+    const cbm_file_info_t *expected_diff = NULL;
+    const cbm_file_info_t *observed_diff = NULL;
+    int captured_index = 0;
+    int observed_index = 0;
+    while (captured_index < captured_count || observed_index < observed_count) {
+        if (captured_index >= captured_count) {
             match = false;
-            mismatch = a[i]->live_path;
+            source_change_kind = "namespace_entry_added";
+            observed_diff = b[observed_index];
+            mismatch_path = observed_diff->path;
+            break;
         }
+        if (observed_index >= observed_count) {
+            match = false;
+            source_change_kind = "namespace_entry_removed";
+            expected_diff = a[captured_index];
+            mismatch_path = expected_diff->live_path ? expected_diff->live_path : expected_diff->path;
+            break;
+        }
+        int path_cmp = strcmp(a[captured_index]->rel_path, b[observed_index]->rel_path);
+        if (path_cmp < 0) {
+            match = false;
+            source_change_kind = "namespace_entry_removed";
+            expected_diff = a[captured_index];
+            mismatch_path = expected_diff->live_path ? expected_diff->live_path : expected_diff->path;
+            break;
+        }
+        if (path_cmp > 0) {
+            match = false;
+            source_change_kind = "namespace_entry_added";
+            observed_diff = b[observed_index];
+            mismatch_path = observed_diff->path;
+            break;
+        }
+        if (a[captured_index]->language != b[observed_index]->language ||
+            a[captured_index]->auxiliary != b[observed_index]->auxiliary ||
+            a[captured_index]->interpretation_input != b[observed_index]->interpretation_input) {
+            match = false;
+            source_change_kind = "namespace_metadata_changed";
+            expected_diff = a[captured_index];
+            observed_diff = b[observed_index];
+            mismatch_path = expected_diff->live_path ? expected_diff->live_path : expected_diff->path;
+            break;
+        }
+        captured_index++;
+        observed_index++;
+    }
+    if (!match) {
+        snapshot_log_source_changed_namespace("compare_namespace", mismatch_path,
+                                              source_change_kind, captured_count, observed_count,
+                                              expected_diff, observed_diff);
+        free(a);
+        free(b);
+        cbm_discover_free(observed, observed_count);
+        cbm_discover_free_excluded(excluded, excluded_count);
+        return CBM_NOT_FOUND;
     }
     free(a);
     free(b);
     cbm_discover_free(observed, observed_count);
     cbm_discover_free_excluded(excluded, excluded_count);
-    if (!match) {
-        snapshot_log_failure("CBM_SOURCE_SNAPSHOT_NAMESPACE_DRIFT", "compare_namespace", mismatch,
-                             ERROR_FILE_INVALID);
-        return CBM_NOT_FOUND;
-    }
 
     snapshot_identity_probe_result_t *identity_results =
         calloc((size_t)(captured_count > 0 ? captured_count : 1), sizeof(*identity_results));
@@ -1010,14 +1474,32 @@ static int snapshot_verify_namespace(const char *repo_path, const cbm_discover_o
     }
     for (int i = 0; i < captured_count; i++) {
         if (!identity_results[i].match) {
-            snapshot_log_failure(
-                identity_results[i].failure_code ? identity_results[i].failure_code
-                                                 : "CBM_SOURCE_SNAPSHOT_NAMESPACE_DRIFT",
-                identity_results[i].failure_operation ? identity_results[i].failure_operation
-                                                      : "compare_live_identity",
-                captured[i].live_path,
-                identity_results[i].native_error != ERROR_SUCCESS ? identity_results[i].native_error
-                                                                  : ERROR_FILE_INVALID);
+            const char *code = identity_results[i].failure_code
+                                   ? identity_results[i].failure_code
+                                   : "CBM_SOURCE_SNAPSHOT_NAMESPACE_DRIFT";
+            const char *operation = identity_results[i].failure_operation
+                                        ? identity_results[i].failure_operation
+                                        : "compare_live_identity";
+            if (identity_results[i].source_changed) {
+                if (identity_results[i].observed_identity_available) {
+                    snapshot_log_source_changed_file_identity(
+                        code, operation, captured[i].live_path,
+                        identity_results[i].source_change_kind, &captured[i],
+                        &identity_results[i].observed_identity);
+                } else {
+                    snapshot_log_source_changed_basic(
+                        code, operation, captured[i].live_path,
+                        identity_results[i].source_change_kind
+                            ? identity_results[i].source_change_kind
+                            : "live_identity_changed_after_capture");
+                }
+            } else {
+                snapshot_log_failure(
+                    code, operation, captured[i].live_path,
+                    identity_results[i].native_error != ERROR_SUCCESS
+                        ? identity_results[i].native_error
+                        : ERROR_GEN_FAILURE);
+            }
             free(identity_results);
             return CBM_NOT_FOUND;
         }
@@ -1204,13 +1686,35 @@ int cbm_source_snapshot_capture(const char *repo_path, const cbm_discover_opts_t
     snapshot_dispatch_capture(&dispatcher, results, file_count);
     for (int i = 0; i < file_count; i++) {
         if (!results[i].complete || results[i].failure_code) {
-            snapshot_log_failure(results[i].failure_code ? results[i].failure_code
-                                                         : "CBM_SOURCE_SNAPSHOT_CAPTURE_INCOMPLETE",
-                                 results[i].failure_operation ? results[i].failure_operation
-                                                              : "capture_worker",
-                                 results[i].failure_path ? results[i].failure_path : files[i].path,
-                                 results[i].native_error != ERROR_SUCCESS ? results[i].native_error
-                                                                          : ERROR_GEN_FAILURE);
+            const char *code = results[i].failure_code ? results[i].failure_code
+                                                       : "CBM_SOURCE_SNAPSHOT_CAPTURE_INCOMPLETE";
+            const char *operation =
+                results[i].failure_operation ? results[i].failure_operation : "capture_worker";
+            const char *path = results[i].failure_path ? results[i].failure_path : files[i].path;
+            if (results[i].source_changed) {
+                if (results[i].expected_identity_available &&
+                    results[i].observed_identity_available) {
+                    snapshot_log_source_changed_identity_pair(
+                        code, operation, path, results[i].source_change_kind,
+                        &results[i].expected_identity, &results[i].observed_identity,
+                        results[i].observed_size_available ? (uint64_t)results[i].observed_size : 0,
+                        results[i].observed_size_available);
+                } else if (results[i].expected_size_available &&
+                           results[i].observed_size_available) {
+                    snapshot_log_source_changed_size(code, operation, path,
+                                                     results[i].source_change_kind,
+                                                     results[i].expected_size,
+                                                     results[i].observed_size);
+                } else {
+                    snapshot_log_source_changed_basic(code, operation, path,
+                                                      results[i].source_change_kind);
+                }
+            } else {
+                snapshot_log_failure(code, operation, path,
+                                     results[i].native_error != ERROR_SUCCESS
+                                         ? results[i].native_error
+                                         : ERROR_GEN_FAILURE);
+            }
             snapshot_capture_results_free(results, file_count);
             snapshot_dispatcher_close(&dispatcher);
             return CBM_NOT_FOUND;

@@ -353,6 +353,12 @@ fn hop_score(edge_weight_permille: u64, attenuation_permille: u64) -> u64 {
 /// association edge outward from the best grounded matched entry point, one hop
 /// at a time up to the hop budget.
 ///
+/// `matched_ids` is **order-significant** (#880): it is the caller's kernel-first
+/// ranking for this query, best candidate first. The entry point is the first
+/// grounded, provenanced candidate in that order, so the answer is anchored in
+/// what the query actually reached rather than in a query-independent global
+/// weight. Callers that cannot rank must not substitute the whole member set.
+///
 /// Fail-closed behavior:
 /// - `Err(ASTRO_KERNEL_ANSWER_KNOB_RANGE)` when a knob is out of bounds.
 /// - `Err(CALYX_KERNEL_ANSWER_LEDGER_REQUIRED)` when the entry or any traversed
@@ -372,12 +378,16 @@ pub fn answer_query(
     let node_by_id: BTreeMap<CxId, &AnswerNode> =
         nodes.iter().map(|node| (node.id, node)).collect();
 
-    // Resolve the matched candidates that actually have a node row, deterministic
-    // ascending by id.
-    let mut matched: BTreeSet<CxId> = BTreeSet::new();
+    // `matched_ids` is the caller's kernel-first ranking, BEST FIRST (#880). The
+    // order is the query's evidence, so it is preserved rather than sorted away:
+    // resolve to the candidates that actually have a node row, collapsing a
+    // repeated id to its first (best) occurrence. The result is total and
+    // deterministic for a given ranking.
+    let mut seen: BTreeSet<CxId> = BTreeSet::new();
+    let mut matched: Vec<CxId> = Vec::with_capacity(matched_ids.len());
     for id in matched_ids {
-        if node_by_id.contains_key(id) {
-            matched.insert(*id);
+        if node_by_id.contains_key(id) && seen.insert(*id) {
+            matched.push(*id);
         }
     }
 
@@ -392,17 +402,17 @@ pub fn answer_query(
         )));
     }
 
-    // Entry = the highest-weight grounded matched candidate (ties broken by
-    // ascending id). An ungrounded-only match refuses the honesty gate.
+    // Entry = the best-RANKED grounded candidate, i.e. the first grounded member
+    // the caller's query ranking reached (#880). Selecting by global
+    // `kernel_weight_permille` instead made every query over one kernel resolve to
+    // the same entry, so two unrelated questions produced the same "answer"; the
+    // caller's ranking is the only signal that carries what was actually asked.
+    // Ties cannot occur — a ranking is a total order. An ungrounded-only match
+    // still refuses the honesty gate.
     let entry = matched
         .iter()
         .filter_map(|id| node_by_id.get(id).copied())
-        .filter(|node| node.grounded)
-        .max_by(|left, right| {
-            left.kernel_weight_permille
-                .cmp(&right.kernel_weight_permille)
-                .then_with(|| right.id.cmp(&left.id))
-        });
+        .find(|node| node.grounded);
     let Some(entry) = entry else {
         return Ok(AnswerResolution::Refused(refusal(
             ASTRO_KERNEL_ANSWER_UNGROUNDED,

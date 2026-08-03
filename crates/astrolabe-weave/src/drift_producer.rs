@@ -59,6 +59,13 @@ pub const DRIFT_REFERENCE_KNOB_REGISTRY_VERSION: &str = "astrolabe-weave-drift-r
 /// Name of the per-slot reference-window sample-cap knob.
 pub const DRIFT_REFERENCE_SAMPLE_CAP_KNOB: &str = "weave_drift_reference_sample_cap";
 
+/// Name of the per-slot current-window sample-cap knob.
+///
+/// The persisted graph and slot rows remain complete; this cap applies only to
+/// the exact MMD telemetry window so the quadratic test cannot turn one large
+/// import into an unbounded index-time CPU/RSS spike.
+pub const DRIFT_CURRENT_SAMPLE_CAP_KNOB: &str = "weave_drift_current_sample_cap";
+
 /// Default per-slot cap on the persisted reference window.
 ///
 /// Seeded from the same Cochran fixed-precision plateau the assay scheduler's
@@ -72,17 +79,34 @@ pub const DRIFT_REFERENCE_SAMPLE_CAP_KNOB: &str = "weave_drift_reference_sample_
 /// a full-cap reference never silently degrades a drift card's trust.
 pub const DRIFT_REFERENCE_DEFAULT_SAMPLE_CAP: u64 = 384;
 
+/// Default per-slot cap on the current window used for exact MMD.
+///
+/// It deliberately mirrors [`DRIFT_REFERENCE_DEFAULT_SAMPLE_CAP`]: MMD compares
+/// two distributions, so both sides of the pairwise kernel workload must be
+/// bounded symmetrically. Leaving the current side unbounded makes exact MMD
+/// `O((reference + current)^2)` in corpus size and blocks fleet-scale indexing.
+pub const DRIFT_CURRENT_DEFAULT_SAMPLE_CAP: u64 = DRIFT_REFERENCE_DEFAULT_SAMPLE_CAP;
+
 /// Smallest legal reference-window cap. MMD needs at least two points per side
 /// ([`measure_drift`]'s own input contract), so a cap below two would guarantee a
 /// short-history absence for every reimport — a reference window that can never
 /// measure drift is illegal, not merely tight.
 pub const DRIFT_REFERENCE_MIN_SAMPLE_CAP: u64 = 2;
 
+/// Smallest legal current-window cap. Same MMD input contract as the reference
+/// side: fewer than two retained current points can never produce a card.
+pub const DRIFT_CURRENT_MIN_SAMPLE_CAP: u64 = DRIFT_REFERENCE_MIN_SAMPLE_CAP;
+
 /// Largest legal reference-window cap. An upper bound keeps one persisted
 /// reference row a bounded unit of storage even against a pathologically large
 /// corpus; a slot with fewer samples than the cap still keeps them all, so this
 /// caps the row size, never completeness of a small slot.
 pub const DRIFT_REFERENCE_MAX_SAMPLE_CAP: u64 = 100_000;
+
+/// Largest legal current-window cap. Kept equal to the reference cap so a local
+/// operator can widen both windows deliberately without accidentally admitting a
+/// billion-pair current-side matrix on one import.
+pub const DRIFT_CURRENT_MAX_SAMPLE_CAP: u64 = DRIFT_REFERENCE_MAX_SAMPLE_CAP;
 
 /// Name of the global per-chunk byte-budget knob.
 pub const DRIFT_REFERENCE_CHUNK_BUDGET_KNOB: &str = "weave_drift_reference_chunk_budget_bytes";
@@ -129,6 +153,16 @@ pub const DRIFT_REFERENCE_KNOBS: &[U64KnobDeclaration] = &[
     },
     U64KnobDeclaration {
         registry_version: DRIFT_REFERENCE_KNOB_REGISTRY_VERSION,
+        name: DRIFT_CURRENT_SAMPLE_CAP_KNOB,
+        default: DRIFT_CURRENT_DEFAULT_SAMPLE_CAP,
+        min: DRIFT_CURRENT_MIN_SAMPLE_CAP,
+        max: DRIFT_CURRENT_MAX_SAMPLE_CAP,
+        unit: "samples",
+        source: "Cochran fixed-precision sample-size plateau (n0 = 1.96^2 * 0.25 / 0.05^2 = 384.16), applied symmetrically to the current side of exact MMD after the Bevy r21 FSV exposed unbounded current windows",
+        rationale: "bounds the current sample passed to exact MMD so the pairwise distance/Gram/permutation workload is O((reference_cap + current_cap)^2) rather than O(corpus^2); the full slot rows remain persisted and the retained window is deterministically provenance-recorded",
+    },
+    U64KnobDeclaration {
+        registry_version: DRIFT_REFERENCE_KNOB_REGISTRY_VERSION,
         name: DRIFT_REFERENCE_CHUNK_BUDGET_KNOB,
         default: DRIFT_REFERENCE_DEFAULT_CHUNK_BUDGET_BYTES,
         min: DRIFT_REFERENCE_MIN_CHUNK_BUDGET_BYTES,
@@ -163,6 +197,12 @@ fn resolve_drift_knob(name: &str) -> Result<usize> {
 /// the declared default falls outside its own bounds.
 pub fn drift_reference_sample_cap() -> Result<usize> {
     resolve_drift_knob(DRIFT_REFERENCE_SAMPLE_CAP_KNOB)
+}
+
+/// Resolves the declared per-slot current-window sample cap, failing closed if
+/// the declared default falls outside its own bounds.
+pub fn drift_current_sample_cap() -> Result<usize> {
+    resolve_drift_knob(DRIFT_CURRENT_SAMPLE_CAP_KNOB)
 }
 
 /// Resolves the declared per-chunk byte budget, failing closed if the declared
@@ -263,7 +303,7 @@ pub struct DriftReferenceSamplingReport {
 /// reference distribution preserves the drift measurement contract: the same mean
 /// shift a full reference would flag still clears the significance gate against a
 /// capped reference. Returns the bounded slots and a labeled provenance record.
-pub fn bound_reference_window(
+pub fn bound_slot_sample_window(
     slots: &[DriftSlotSamples],
     cap: usize,
     seed: u64,
@@ -288,6 +328,15 @@ pub fn bound_reference_window(
         });
     }
     (bounded, provenance)
+}
+
+/// Backward-compatible name for the persisted reference-window bounding step.
+pub fn bound_reference_window(
+    slots: &[DriftSlotSamples],
+    cap: usize,
+    seed: u64,
+) -> (Vec<DriftSlotSamples>, Vec<SlotSamplingProvenance>) {
+    bound_slot_sample_window(slots, cap, seed)
 }
 
 /// Vitter's Algorithm R: a uniform `cap`-point reservoir over `samples`, seeded
@@ -490,6 +539,17 @@ pub struct DriftProductionReport {
     /// counted, never silent — across the pass's reference load, card persist,
     /// and reference persist (invariant 3).
     pub assay_cotenant_rows_skipped: usize,
+    /// Per-slot cap applied to the current import before exact MMD. Zero only
+    /// means drift did not reach current-window preparation.
+    pub current_sample_cap: usize,
+    /// Sum of every current slot's pre-bounding population.
+    pub current_total_population: usize,
+    /// Sum of every current slot's retained sample count used by exact MMD.
+    pub current_total_retained: usize,
+    /// Per-slot current-window sampling provenance. This is returned and
+    /// persisted with the drift-card payload so a consumer can distinguish the
+    /// full corpus population from the bounded exact-MMD window.
+    pub current_sampling_per_slot: Vec<SlotSamplingProvenance>,
 }
 
 /// Reads the current import's per-slot samples from the persisted Slot column
@@ -777,6 +837,8 @@ pub fn produce_drift_cards<C>(
     provenance: impl Into<String>,
     reference: &[DriftSlotSamples],
     current: &[DriftSlotSamples],
+    current_sample_cap: usize,
+    current_sampling_per_slot: &[SlotSamplingProvenance],
     seed: u64,
     config: &DiffConfig,
     ledger: Option<&DiffLedger>,
@@ -784,11 +846,25 @@ pub fn produce_drift_cards<C>(
 where
     C: Clock,
 {
+    let current_total_population: usize = current_sampling_per_slot
+        .iter()
+        .map(|slot| slot.population)
+        .sum();
+    let current_total_retained: usize = current_sampling_per_slot
+        .iter()
+        .map(|slot| slot.retained)
+        .sum();
     let reference_by_slot: BTreeMap<&str, &Vec<Vec<f64>>> = reference
         .iter()
         .map(|slot| (slot.slot.as_str(), &slot.samples))
         .collect();
-    let mut report = DriftProductionReport::default();
+    let mut report = DriftProductionReport {
+        current_sample_cap,
+        current_total_population,
+        current_total_retained,
+        current_sampling_per_slot: current_sampling_per_slot.to_vec(),
+        ..DriftProductionReport::default()
+    };
     let mut cards: Vec<DriftCard> = Vec::new();
     for cur in current {
         let Some(ref_samples) = reference_by_slot.get(cur.slot.as_str()) else {
@@ -831,6 +907,15 @@ where
         .collect::<Result<_>>()?;
     let payload = json!({
         "schema": ASSAY_ANOMALY_PAYLOAD_SCHEMA,
+        "sampling": {
+            "current": {
+                "reservoir": "vitter-algorithm-r",
+                "sample_cap": current_sample_cap,
+                "total_population": current_total_population,
+                "total_retained": current_total_retained,
+                "per_slot": current_sampling_per_slot,
+            },
+        },
         "drift_cards": drift_cards,
     });
     let (mut assay, assay_cotenant_rows_skipped) = load_assay_store_cotenant_aware(vault)?;
@@ -872,7 +957,12 @@ where
     C: Clock,
 {
     let provenance = provenance.into();
-    let current = read_slot_samples_from_vault(vault, project, slots)?;
+    let current_population = read_slot_samples_from_vault(vault, project, slots)?;
+    let current_sample_cap = drift_current_sample_cap()?;
+    let (current, current_sampling) =
+        bound_slot_sample_window(&current_population, current_sample_cap, seed);
+    let current_total_population: usize = current_sampling.iter().map(|slot| slot.population).sum();
+    let current_total_retained: usize = current_sampling.iter().map(|slot| slot.retained).sum();
     let (reference, reference_load_skips) = load_drift_reference_counted(vault)?;
     let mut report = if reference.is_empty() {
         // First import: no reference window at all — every populated slot is a
@@ -882,6 +972,10 @@ where
                 .iter()
                 .filter(|slot| !slot.samples.is_empty())
                 .count(),
+            current_sample_cap,
+            current_total_population,
+            current_total_retained,
+            current_sampling_per_slot: current_sampling.clone(),
             ..DriftProductionReport::default()
         }
     } else {
@@ -891,6 +985,8 @@ where
             provenance.clone(),
             &reference,
             &current,
+            current_sample_cap,
+            &current_sampling,
             seed,
             config,
             ledger,
@@ -900,7 +996,7 @@ where
         vault,
         cache_key,
         format!("{provenance}:reference"),
-        &current,
+        &current_population,
         seed,
     )?;
     report.reference_persisted = true;

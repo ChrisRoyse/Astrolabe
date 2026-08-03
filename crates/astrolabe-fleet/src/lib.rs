@@ -22,6 +22,8 @@
 //! and is read back from the committed snapshot before the call returns
 //! (fail-closed write-path FSV).
 
+use std::thread;
+
 pub mod catalog;
 pub mod clone_farm;
 pub mod compose;
@@ -33,7 +35,38 @@ pub mod orchestrator;
 pub mod projection_upgrade;
 pub mod record;
 pub mod retirement;
+pub mod shared_checkout;
 pub mod state;
+
+/// Name given to the explicitly sized host thread used by fleet CLI entrypoints.
+pub const FLEET_HOST_THREAD_NAME: &str = "astrolabe-fleet-host";
+
+/// Runs a fleet binary entrypoint on the same registry-sized host thread used by
+/// the server before it can enter CBM/Astrolabe-heavy code paths.
+///
+/// Windows fixes the process main-thread stack reserve in the PE header. The
+/// Astrolabe stack contract already records that in-process CBM/pipeline code
+/// can overflow the default reserve with `STATUS_STACK_OVERFLOW` before it can
+/// publish structured diagnostics. Fleet binaries link and dispatch through the
+/// same crate graph, so their entrypoints use the declared host-thread reserve
+/// by construction instead of depending on a caller-specific PE stack setting.
+pub fn run_on_sized_host_thread<F>(entrypoint: F) -> i32
+where
+    F: FnOnce() -> i32 + Send + 'static,
+{
+    let host = thread::Builder::new()
+        .name(FLEET_HOST_THREAD_NAME.to_string())
+        .stack_size(astrolabe_domain::knobs::cbm_pipeline_host_stack_bytes())
+        .spawn(entrypoint)
+        .expect("spawn sized fleet host thread");
+    match host.join() {
+        Ok(code) => code,
+        Err(_) => {
+            eprintln!("astrolabe-fleet: host thread panicked");
+            1
+        }
+    }
+}
 
 pub use catalog::{
     FLEET_ACTOR, FLEET_VAULT_ID, FLEET_VAULT_SALT, FleetCatalog, RegisterOutcome, RegisterReport,
@@ -72,6 +105,12 @@ pub use record::{
 pub use retirement::{
     ASTRO_FLEET_SOURCE_RETIREMENT_INCOMPLETE, ASTRO_FLEET_SOURCE_RETIREMENT_REFUSED,
     RetirementConfig, RetirementPassOutcome, run_source_retirement_pass,
+};
+pub use shared_checkout::{
+    ASTRO_FLEET_SHARED_CHECKOUT_CONFIG, ASTRO_FLEET_SHARED_CHECKOUT_DRIFT,
+    ASTRO_FLEET_SHARED_CHECKOUT_GIT, ASTRO_FLEET_SHARED_CHECKOUT_OUTPUT,
+    ASTRO_FLEET_SHARED_CHECKOUT_VERIFY, REMEDIATE_OUTPUT, SharedCheckoutConfig,
+    SharedCheckoutReport, create_shared_checkout,
 };
 pub use state::{
     ASTRO_FLEET_ILLEGAL_TRANSITION, ASTRO_FLEET_UNKNOWN_STATE, RepoState, check_transition,

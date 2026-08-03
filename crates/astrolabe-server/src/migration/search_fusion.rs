@@ -155,6 +155,9 @@ pub(crate) fn run_fused_search_graph(args: &Map<String, Value>) -> Result<String
     let propagated_label = string_arg(args, "propagated_label").map(ToOwned::to_owned);
 
     let cache_dir = astrolabe_bridge::cbm_cache_dir()?;
+    if let Some(refusal) = shadow_graph_freshness_refusal(&cache_dir, &project, "search_graph")? {
+        return Ok(refusal);
+    }
     let (vault_dir, vault_id, vault_salt) = shadow_vault_config_at(&cache_dir, &project)?;
     if !vault_dir.exists() {
         return coded_error(

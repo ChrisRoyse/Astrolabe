@@ -815,10 +815,10 @@ cbm_cross_repo_result_t cbm_cross_repo_match(const char *project, const char **t
                                                 "procedure", "procedure", "CROSS_TRPC_CALLS");
         result.projects_scanned++;
 
-        cbm_store_close(tgt_store);
+        cbm_store_close_required(&tgt_store, "cross_repo.target.complete");
     }
 
-    cbm_store_close(src_store);
+    cbm_store_close_required(&src_store, "cross_repo.source.complete");
 
     if (own_list) {
         free_project_list(resolved, resolved_count);

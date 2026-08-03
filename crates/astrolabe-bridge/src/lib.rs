@@ -2866,6 +2866,196 @@ struct CbmStore {
     _not_send_or_sync: PhantomData<Rc<()>>,
 }
 
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct CbmStoreNormalization {
+    pub journal_mode_before: String,
+    pub journal_mode_after: String,
+    pub sqlite_error: i32,
+    pub wal_log_frames: i32,
+    pub wal_checkpointed_frames: i32,
+    pub wal_remaining_frames: i32,
+    pub operation: String,
+    pub detail: String,
+    pub close_connection_destroyed: bool,
+    pub close_db_path: String,
+}
+
+fn fixed_c_string<const N: usize>(value: &[c_char; N]) -> String {
+    // Native fixed-width records are zero-initialized and all writes use
+    // bounded snprintf/memcpy with a retained terminator.
+    unsafe { CStr::from_ptr(value.as_ptr()) }
+        .to_string_lossy()
+        .into_owned()
+}
+
+fn store_close_bridge_error(
+    code: &'static str,
+    result: &cbm_sys::cbm_store_close_result_t,
+) -> BridgeError {
+    envelope(
+        code,
+        format!(
+            "exact SQLite close failed (status={}, sqlite_error={}, connection_was_present={}, close_attempted={}, connection_destroyed={}, outstanding_statements={}, first_sql_sha256={:?}, first_sql={:?}, db_path={:?})",
+            result.status,
+            result.sqlite_close_code,
+            result.connection_was_present,
+            result.close_attempted,
+            result.connection_destroyed,
+            result.outstanding_statement_count,
+            fixed_c_string(&result.first_outstanding_sql_sha256),
+            fixed_c_string(&result.first_outstanding_sql),
+            fixed_c_string(&result.db_path),
+        ),
+        "Preserve the exact store owner and database family; finalize the reported SQLite resource before retrying.",
+    )
+}
+
+unsafe fn close_transient_store_or_abort(
+    store: &mut *mut cbm_sys::cbm_store_t,
+    operation: &str,
+) -> cbm_sys::cbm_store_close_result_t {
+    let mut result = cbm_sys::cbm_store_close_result_t::default();
+    let _status = unsafe { cbm_sys::cbm_store_close(store, &mut result) };
+    if result.connection_destroyed != 0 && (*store).is_null() {
+        return result;
+    }
+    eprintln!(
+        "code=ASTRO_CBM_TRANSIENT_STORE_CLOSE_FAILED operation={operation:?} status={} sqlite_error={} connection_destroyed={} outstanding_statements={} first_sql_sha256={:?} db_path={:?}",
+        result.status,
+        result.sqlite_close_code,
+        result.connection_destroyed,
+        result.outstanding_statement_count,
+        fixed_c_string(&result.first_outstanding_sql_sha256),
+        fixed_c_string(&result.db_path),
+    );
+    std::process::abort();
+}
+
+pub fn normalize_existing_project_store(
+    db_path: &str,
+    project: &str,
+) -> Result<CbmStoreNormalization, BridgeError> {
+    initialize_cbm_allocator()?;
+    validate_project_name(project)?;
+    let db_path = CString::new(db_path)?;
+    let project = CString::new(project)?;
+    let mut preflight = cbm_sys::cbm_store_verify_result_t::default();
+    // SAFETY: both C strings and the fixed-width output remain live. The native
+    // preflight verifies a frozen scratch DB/WAL family and never opens the live
+    // source, so malformed bytes cannot create or mutate source sidecars.
+    let preflight_status = unsafe {
+        cbm_sys::cbm_store_verify_path_project_snapshot_for_normalization(
+            db_path.as_ptr(),
+            project.as_ptr(),
+            &mut preflight,
+        )
+    };
+    if preflight_status != cbm_sys::cbm_store_verify_status_t_CBM_STORE_VERIFY_OK {
+        return Err(envelope(
+            "ASTRO_CBM_NORMALIZE_PREFLIGHT_FAILED",
+            format!(
+                "frozen DB/WAL normalization preflight failed without opening the live source (status={preflight_status}, native_error={}, sqlite_error={}, operation={:?}, detail={:?}, db_path={:?}, project={:?})",
+                preflight.native_error,
+                preflight.sqlite_error,
+                fixed_c_string(&preflight.operation),
+                fixed_c_string(&preflight.detail),
+                db_path.to_string_lossy(),
+                project.to_string_lossy(),
+            ),
+            "Preserve the exact database family and repair the frozen source corruption before normalization.",
+        ));
+    }
+    let mut store = ptr::null_mut();
+    let mut verification = cbm_sys::cbm_store_verify_result_t::default();
+    // SAFETY: both C strings and outputs remain live for the call. Any retained
+    // owner is consumed below by the exact close boundary.
+    let verify_status = unsafe {
+        cbm_sys::cbm_store_open_path_project_writer_existing_bound(
+            db_path.as_ptr(),
+            project.as_ptr(),
+            &preflight,
+            &mut store,
+            &mut verification,
+        )
+    };
+    if verify_status != cbm_sys::cbm_store_verify_status_t_CBM_STORE_VERIFY_OK || store.is_null() {
+        if !store.is_null() {
+            // SAFETY: store is the exact retained owner returned above.
+            let _ = unsafe {
+                close_transient_store_or_abort(
+                    &mut store,
+                    "normalize_existing_project_store.open_failure",
+                )
+            };
+        }
+        return Err(envelope(
+            "ASTRO_CBM_NORMALIZE_STORE_OPEN_FAILED",
+            format!(
+                "existing project writer verification failed (status={verify_status}, native_error={}, sqlite_error={}, operation={:?}, detail={:?}, db_path={:?}, project={:?})",
+                verification.native_error,
+                verification.sqlite_error,
+                fixed_c_string(&verification.operation),
+                fixed_c_string(&verification.detail),
+                db_path.to_string_lossy(),
+                project.to_string_lossy(),
+            ),
+            "Preserve the complete database family and resolve the exact writer-verification failure before normalization.",
+        ));
+    }
+
+    let mut normalization = cbm_sys::cbm_store_normalize_result_t::default();
+    // SAFETY: store is the unique verified writer and normalization is a live
+    // fixed-width output record.
+    let normalize_status =
+        unsafe { cbm_sys::cbm_store_normalize_journal_mode_delete(store, &mut normalization) };
+    // SAFETY: store is still the exact unique owner. Close is independent from
+    // normalization and aborts rather than discarding a retained connection.
+    let close = unsafe {
+        close_transient_store_or_abort(&mut store, "normalize_existing_project_store.complete")
+    };
+    // Widened to i64: clang and MSVC disagree on an unsigned C enum's underlying
+    // type, which is why bindings are per target. Comparing through i64 is
+    // correct on either host.
+    if i64::from(normalize_status) != i64::from(cbm_sys::CBM_STORE_NORMALIZE_OK) {
+        return Err(envelope(
+            "ASTRO_CBM_STORE_NORMALIZATION_FAILED",
+            format!(
+                "SQLite-owned journal normalization failed (status={}, sqlite_error={}, before={:?}, after={:?}, log_frames={}, checkpointed_frames={}, remaining_frames={}, operation={:?}, detail={:?}, close_connection_destroyed={})",
+                normalization.status,
+                normalization.sqlite_error,
+                fixed_c_string(&normalization.journal_mode_before),
+                fixed_c_string(&normalization.journal_mode_after),
+                normalization.wal_log_frames,
+                normalization.wal_checkpointed_frames,
+                normalization.wal_remaining_frames,
+                fixed_c_string(&normalization.operation),
+                fixed_c_string(&normalization.detail),
+                close.connection_destroyed,
+            ),
+            "Preserve the complete database family; resolve the checkpoint or journal-mode diagnostic before retrying.",
+        ));
+    }
+    if i64::from(close.status) != i64::from(cbm_sys::CBM_STORE_CLOSE_OK) {
+        return Err(store_close_bridge_error(
+            "ASTRO_CBM_NORMALIZE_STORE_CLOSE_FAILED",
+            &close,
+        ));
+    }
+
+    Ok(CbmStoreNormalization {
+        journal_mode_before: fixed_c_string(&normalization.journal_mode_before),
+        journal_mode_after: fixed_c_string(&normalization.journal_mode_after),
+        sqlite_error: normalization.sqlite_error,
+        wal_log_frames: normalization.wal_log_frames,
+        wal_checkpointed_frames: normalization.wal_checkpointed_frames,
+        wal_remaining_frames: normalization.wal_remaining_frames,
+        operation: fixed_c_string(&normalization.operation),
+        detail: fixed_c_string(&normalization.detail),
+        close_connection_destroyed: close.connection_destroyed != 0,
+        close_db_path: fixed_c_string(&close.db_path),
+    })
+}
+
 impl CbmStore {
     fn open_memory() -> Result<Self, BridgeError> {
         initialize_cbm_allocator()?;
@@ -2887,9 +3077,12 @@ impl CbmStore {
 
 impl Drop for CbmStore {
     fn drop(&mut self) {
-        // SAFETY: self uniquely owns the cbm_store_t pointer.
+        let mut ptr = self.ptr.as_ptr();
+        // SAFETY: self uniquely owns the cbm_store_t pointer. This legacy RAII
+        // owner has no Result channel, so native required-close terminates on a
+        // physical close failure instead of discarding the pointer.
         unsafe {
-            cbm_sys::cbm_store_close(self.ptr.as_ptr());
+            cbm_sys::cbm_store_close_required(&mut ptr, c"bridge.CbmStore.drop".as_ptr());
         }
     }
 }
@@ -3210,6 +3403,39 @@ pub struct CbmProjectQuiescence {
     pub attempts: u64,
     pub native_error: u64,
     pub failed_path: String,
+    pub holder_probe_status: i32,
+    pub holder_probe_native_error: u32,
+    pub holder_inventory_stable: bool,
+    pub holder_count: u64,
+    pub first_holder_process_id: u32,
+    pub first_holder_process_start_utc_ticks: u64,
+    pub holder_probe_operation: String,
+    pub first_holder_path: String,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct CbmProjectQuiescenceError {
+    pub error: BridgeError,
+    pub evidence: Box<CbmProjectQuiescence>,
+}
+
+fn empty_project_quiescence() -> CbmProjectQuiescence {
+    CbmProjectQuiescence {
+        elapsed_ms: 0,
+        attempts: 0,
+        native_error: 0,
+        failed_path: String::new(),
+        // Narrowed explicitly: the field is the C enum's signed spelling here,
+        // the constant the unsigned one, per the clang/MSVC enum divergence.
+        holder_probe_status: cbm_sys::CBM_PROJECT_HOLDER_PROBE_NOT_RUN as i32,
+        holder_probe_native_error: 0,
+        holder_inventory_stable: false,
+        holder_count: 0,
+        first_holder_process_id: 0,
+        first_holder_process_start_utc_ticks: 0,
+        holder_probe_operation: String::new(),
+        first_holder_path: String::new(),
+    }
 }
 
 pub struct CbmProjectTransition {
@@ -3259,9 +3485,16 @@ impl CbmProjectTransition {
         db_path: &str,
         timeout_ms: u32,
         poll_ms: u32,
-    ) -> Result<CbmProjectQuiescence, BridgeError> {
-        self.ensure_owner_thread()?;
-        let db_path = CString::new(db_path)?;
+    ) -> Result<CbmProjectQuiescence, CbmProjectQuiescenceError> {
+        self.ensure_owner_thread()
+            .map_err(|error| CbmProjectQuiescenceError {
+                error,
+                evidence: Box::new(empty_project_quiescence()),
+            })?;
+        let db_path = CString::new(db_path).map_err(|error| CbmProjectQuiescenceError {
+            error: error.into(),
+            evidence: Box::new(empty_project_quiescence()),
+        })?;
         // SAFETY: the bindgen record is a plain C POD initialized to zero.
         let mut report: cbm_sys::cbm_project_quiescence_result_t = unsafe { std::mem::zeroed() };
         // SAFETY: the transition remains owned by self, the C string and report
@@ -3283,33 +3516,64 @@ impl CbmProjectTransition {
         let failed_path = unsafe { CStr::from_ptr(report.failed_path.as_ptr()) }
             .to_string_lossy()
             .into_owned();
+        let holder_probe_operation =
+            unsafe { CStr::from_ptr(report.holder_probe_operation.as_ptr()) }
+                .to_string_lossy()
+                .into_owned();
+        let first_holder_path = unsafe { CStr::from_ptr(report.first_holder_path.as_ptr()) }
+            .to_string_lossy()
+            .into_owned();
         let evidence = CbmProjectQuiescence {
             elapsed_ms: report.elapsed_ms,
             attempts: report.attempts,
             native_error: report.native_error as u64,
             failed_path,
+            holder_probe_status: report.holder_probe_status,
+            holder_probe_native_error: report.holder_probe_native_error,
+            holder_inventory_stable: report.holder_inventory_stable != 0,
+            holder_count: report.holder_count,
+            first_holder_process_id: report.first_holder_process_id,
+            first_holder_process_start_utc_ticks: report.first_holder_process_start_utc_ticks,
+            holder_probe_operation,
+            first_holder_path,
         };
         match status {
             0 => Ok(evidence),
-            1 => Err(envelope(
-                "ASTRO_PROJECT_TRANSITION_QUIESCENCE_TIMEOUT",
-                format!(
-                    "the canonical store family remained open after {} ms and {} exact probes (native_error={}, path={:?})",
-                    evidence.elapsed_ms,
-                    evidence.attempts,
-                    evidence.native_error,
-                    evidence.failed_path
+            1 => Err(CbmProjectQuiescenceError {
+                error: envelope(
+                    "ASTRO_PROJECT_TRANSITION_QUIESCENCE_TIMEOUT",
+                    format!(
+                        "the canonical store family remained open after {} ms and {} exact probes (native_error={}, path={:?}, holder_probe_status={}, holder_probe_native_error={}, holder_count={}, first_holder_pid={}, first_holder_start_ticks={}, first_holder_path={:?})",
+                        evidence.elapsed_ms,
+                        evidence.attempts,
+                        evidence.native_error,
+                        evidence.failed_path,
+                        evidence.holder_probe_status,
+                        evidence.holder_probe_native_error,
+                        evidence.holder_count,
+                        evidence.first_holder_process_id,
+                        evidence.first_holder_process_start_utc_ticks,
+                        evidence.first_holder_path,
+                    ),
+                    "Identify the process retaining the exact DB/WAL/SHM handle; do not terminate it or mutate the family, then retry after cooperative quiescence works.",
                 ),
-                "Identify the process retaining the exact DB/WAL/SHM handle; do not terminate it or mutate the family, then retry after cooperative quiescence works.",
-            )),
-            other => Err(envelope(
-                "ASTRO_PROJECT_TRANSITION_QUIESCENCE_PROBE_FAILED",
-                format!(
-                    "canonical store-family quiescence probe failed with status {other}, native_error={}, path={:?}",
-                    evidence.native_error, evidence.failed_path
+                evidence: Box::new(evidence),
+            }),
+            other => Err(CbmProjectQuiescenceError {
+                error: envelope(
+                    "ASTRO_PROJECT_TRANSITION_QUIESCENCE_PROBE_FAILED",
+                    format!(
+                        "canonical store-family quiescence probe failed with status {other}, native_error={}, path={:?}, holder_probe_status={}, holder_probe_native_error={}, holder_probe_operation={:?}",
+                        evidence.native_error,
+                        evidence.failed_path,
+                        evidence.holder_probe_status,
+                        evidence.holder_probe_native_error,
+                        evidence.holder_probe_operation,
+                    ),
+                    "Resolve the structured Windows file-open failure before retrying the unchanged transition.",
                 ),
-                "Resolve the structured Windows file-open failure before retrying the unchanged transition.",
-            )),
+                evidence: Box::new(evidence),
+            }),
         }
     }
 
@@ -3449,9 +3713,21 @@ impl CbmToolRunner {
     /// eviction request; the initial anonymous in-memory store remains exempt.
     pub fn close_cached_project_store(&self) -> Result<(), BridgeError> {
         self.ensure_owner_thread()?;
-        // SAFETY: `self.ptr` is uniquely owned and called on its owner thread.
-        unsafe { cbm_sys::cbm_mcp_server_evict_idle(self.ptr.as_ptr(), 0) };
-        Ok(())
+        let mut result = cbm_sys::cbm_store_close_result_t::default();
+        // SAFETY: `self.ptr` is uniquely owned and called on its owner thread;
+        // result is a live, correctly sized fixed-width output record.
+        let status = unsafe {
+            cbm_sys::cbm_mcp_server_close_cached_project_store(self.ptr.as_ptr(), &mut result)
+        };
+        let exact_success = i64::from(status) == i64::from(cbm_sys::CBM_STORE_CLOSE_OK)
+            && (result.connection_was_present == 0 || result.connection_destroyed != 0);
+        if exact_success {
+            return Ok(());
+        }
+        Err(store_close_bridge_error(
+            "ASTRO_CBM_CACHED_STORE_CLOSE_FAILED",
+            &result,
+        ))
     }
 
     pub fn handle_index_repository_with_rows(

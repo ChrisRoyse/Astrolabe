@@ -1087,6 +1087,19 @@ int cbm_sem_corpus_add_docs_batch(cbm_sem_corpus_t *corpus, char **all_tokens,
     /* Phase B (PARALLEL): Resolve tokens → IDs and count doc_freq per entry.
      * token_map is now read-only; each worker owns its doc range (no writes
      * to shared state except atomic doc_freq counters). */
+    int worker_count = cbm_default_worker_count(false);
+    if (worker_count <= 0) {
+        char worker_buf[CBM_SZ_32];
+        snprintf(worker_buf, sizeof(worker_buf), "%d", worker_count);
+        corpus_rollback_entries(corpus, base_entry_count);
+        cbm_log_error("semantic.corpus.worker_count_invalid", "code",
+                      "CBM_WORKER_COUNT_INVALID", "operation", "add_docs_batch",
+                      "worker_count", worker_buf, "message",
+                      "worker-count configuration is invalid", "remediation",
+                      "set CBM_WORKERS to an integer from 1 through 256 or remove it");
+        return CBM_NOT_FOUND;
+    }
+
     size_t atomic_count = corpus->entry_count > 0 ? (size_t)corpus->entry_count : (size_t)SKIP_ONE;
     _Atomic int *doc_freq_atomic = calloc(atomic_count, sizeof(_Atomic int));
     if (!doc_freq_atomic) {
@@ -1096,7 +1109,6 @@ int cbm_sem_corpus_add_docs_batch(cbm_sem_corpus_t *corpus, char **all_tokens,
         return CBM_NOT_FOUND;
     }
 
-    int worker_count = cbm_default_worker_count(false);
     batch_resolve_ctx_t bc = {
         .corpus = corpus,
         .all_tokens = all_tokens,
@@ -1110,12 +1122,18 @@ int cbm_sem_corpus_add_docs_batch(cbm_sem_corpus_t *corpus, char **all_tokens,
     /* Temporarily re-base doc arrays so workers write to base_doc..base_doc+doc_count */
     corpus->doc_token_ids += base_doc;
     corpus->doc_token_counts += base_doc;
-    cbm_parallel_for_opts_t opts = {.max_workers = worker_count, .force_pthreads = false};
-    cbm_parallel_for(worker_count, batch_resolve_worker, &bc, opts);
+    cbm_parallel_for_opts_t opts = {
+        .max_workers = worker_count,
+        .force_pthreads = false,
+        .operation = "semantic.corpus.add_docs_batch",
+    };
+    cbm_parallel_for_result_t dispatch_result = {0};
+    int dispatch_rc = cbm_parallel_for(worker_count, batch_resolve_worker, &bc, opts,
+                                       &dispatch_result);
     corpus->doc_token_ids -= base_doc;
     corpus->doc_token_counts -= base_doc;
 
-    if (atomic_load_explicit(&bc.failed, memory_order_acquire)) {
+    if (dispatch_rc != 0 || atomic_load_explicit(&bc.failed, memory_order_acquire)) {
         corpus_clear_doc_range(corpus, base_doc, doc_count);
         corpus_rollback_entries(corpus, base_entry_count);
         free(doc_freq_atomic);
@@ -1643,18 +1661,21 @@ typedef struct {
 } finalize_params_t;
 
 /* Sub-phase 1: build tagged source vectors (sparse or dense-int8) in parallel. */
-static void finalize_build_sources(finalize_params_t *p) {
+static bool finalize_build_sources(finalize_params_t *p) {
     src_build_ctx_t sc = {
         .entries = p->corpus->entries,
         .src_entries = p->src_entries,
         .entry_count = p->corpus->entry_count,
     };
     atomic_init(&sc.next_idx, 0);
-    cbm_parallel_for(p->worker_count, src_build_worker, &sc, p->opts);
+    cbm_parallel_for_opts_t opts = p->opts;
+    opts.operation = "semantic.corpus.finalize_sources";
+    cbm_parallel_for_result_t dispatch_result = {0};
+    return cbm_parallel_for(p->worker_count, src_build_worker, &sc, opts, &dispatch_result) == 0;
 }
 
 /* Sub-phases 2+3: co-occurrence pass 1 + normalize. */
-static void finalize_pass1(finalize_params_t *p) {
+static bool finalize_pass1(finalize_params_t *p) {
     cooccur_sparse_ctx_t cc = {
         .entries = p->corpus->entries,
         .src_entries = p->src_entries,
@@ -1668,22 +1689,39 @@ static void finalize_pass1(finalize_params_t *p) {
         .tile_size = p->tile_size,
     };
     atomic_init(&cc.next_chunk, 0);
-    cbm_parallel_for(p->worker_count, cooccur_worker_sparse, &cc, p->opts);
+    cbm_parallel_for_opts_t cooccur_opts = p->opts;
+    cooccur_opts.operation = "semantic.corpus.cooccur_sparse";
+    cbm_parallel_for_result_t cooccur_result = {0};
+    if (cbm_parallel_for(p->worker_count, cooccur_worker_sparse, &cc, cooccur_opts,
+                         &cooccur_result) != 0) {
+        return false;
+    }
 
     norm_ctx_t nc = {.entries = p->corpus->entries, .entry_count = p->corpus->entry_count};
     atomic_init(&nc.next_idx, 0);
-    cbm_parallel_for(p->worker_count, normalize_worker, &nc, p->opts);
+    cbm_parallel_for_opts_t norm_opts = p->opts;
+    norm_opts.operation = "semantic.corpus.normalize_pass1";
+    cbm_parallel_for_result_t norm_result = {0};
+    return cbm_parallel_for(p->worker_count, normalize_worker, &nc, norm_opts, &norm_result) == 0;
 }
 
 /* Sub-phases 4+5: quantize pass1 to int8, run RRI pass 2, blend + normalize. */
-static void finalize_pass2(finalize_params_t *p, int8_t *pass1_q, cbm_sem_vec_t *pass1) {
+static bool finalize_pass2(finalize_params_t *p, int8_t *pass1_q, cbm_sem_vec_t *pass1) {
     pass1_quant_ctx_t qc = {
         .entries = p->corpus->entries,
         .pass1_q = pass1_q,
         .entry_count = p->corpus->entry_count,
     };
     atomic_init(&qc.next_idx, 0);
-    cbm_parallel_for(p->worker_count, pass1_quantize_worker, &qc, p->opts);
+    cbm_parallel_for_opts_t quant_opts = p->opts;
+    quant_opts.operation = "semantic.corpus.quantize_pass1";
+    cbm_parallel_for_result_t quant_result = {0};
+    if (cbm_parallel_for(p->worker_count, pass1_quantize_worker, &qc, quant_opts,
+                         &quant_result) != 0) {
+        free(pass1);
+        free(pass1_q);
+        return false;
+    }
 
     for (int i = 0; i < p->corpus->entry_count; i++) {
         pass1[i] = p->corpus->entries[i].enriched_vec;
@@ -1702,7 +1740,15 @@ static void finalize_pass2(finalize_params_t *p, int8_t *pass1_q, cbm_sem_vec_t 
         .tile_size = p->tile_size,
     };
     atomic_init(&cc.next_chunk, 0);
-    cbm_parallel_for(p->worker_count, cooccur_worker_int8, &cc, p->opts);
+    cbm_parallel_for_opts_t int8_opts = p->opts;
+    int8_opts.operation = "semantic.corpus.cooccur_int8";
+    cbm_parallel_for_result_t int8_result = {0};
+    if (cbm_parallel_for(p->worker_count, cooccur_worker_int8, &cc, int8_opts, &int8_result) !=
+        0) {
+        free(pass1);
+        free(pass1_q);
+        return false;
+    }
 
     blend_ctx_t bc = {
         .entries = p->corpus->entries,
@@ -1710,13 +1756,23 @@ static void finalize_pass2(finalize_params_t *p, int8_t *pass1_q, cbm_sem_vec_t 
         .entry_count = p->corpus->entry_count,
     };
     atomic_init(&bc.next_idx, 0);
-    cbm_parallel_for(p->worker_count, blend_worker, &bc, p->opts);
+    cbm_parallel_for_opts_t blend_opts = p->opts;
+    blend_opts.operation = "semantic.corpus.blend";
+    cbm_parallel_for_result_t blend_result = {0};
+    if (cbm_parallel_for(p->worker_count, blend_worker, &bc, blend_opts, &blend_result) != 0) {
+        free(pass1);
+        free(pass1_q);
+        return false;
+    }
     free(pass1);
     free(pass1_q);
 
     norm_ctx_t nc = {.entries = p->corpus->entries, .entry_count = p->corpus->entry_count};
     atomic_init(&nc.next_idx, 0);
-    cbm_parallel_for(p->worker_count, normalize_worker, &nc, p->opts);
+    cbm_parallel_for_opts_t norm_opts = p->opts;
+    norm_opts.operation = "semantic.corpus.normalize_pass2";
+    cbm_parallel_for_result_t norm_result = {0};
+    return cbm_parallel_for(p->worker_count, normalize_worker, &nc, norm_opts, &norm_result) == 0;
 }
 
 bool cbm_sem_corpus_finalize(cbm_sem_corpus_t *corpus) {
@@ -1735,6 +1791,16 @@ bool cbm_sem_corpus_finalize(cbm_sem_corpus_t *corpus) {
     }
 
     int worker_count = cbm_default_worker_count(false);
+    if (worker_count <= 0) {
+        char worker_buf[CBM_SZ_32];
+        snprintf(worker_buf, sizeof(worker_buf), "%d", worker_count);
+        cbm_log_error("semantic.corpus.worker_count_invalid", "code",
+                      "CBM_WORKER_COUNT_INVALID", "operation", "finalize",
+                      "worker_count", worker_buf, "message",
+                      "worker-count configuration is invalid", "remediation",
+                      "set CBM_WORKERS to an integer from 1 through 256 or remove it");
+        return false;
+    }
     cbm_parallel_for_opts_t opts = {.max_workers = worker_count, .force_pthreads = false};
 
     /* Finer chunks = better load balancing for skewed token distributions. */
@@ -1803,9 +1869,18 @@ bool cbm_sem_corpus_finalize(cbm_sem_corpus_t *corpus) {
         .tile_size = CBM_SEM_TILE_SIZE,
         .opts = opts,
     };
-    finalize_build_sources(&params);
-    finalize_pass1(&params);
-    finalize_pass2(&params, pass1_q, pass1);
+    if (!finalize_build_sources(&params) || !finalize_pass1(&params)) {
+        free(pass1_q);
+        free(pass1);
+        free(src_entries);
+        free_reverse_index(rev);
+        return false;
+    }
+    if (!finalize_pass2(&params, pass1_q, pass1)) {
+        free(src_entries);
+        free_reverse_index(rev);
+        return false;
+    }
 
     free(src_entries);
     free_reverse_index(rev);
@@ -1871,6 +1946,36 @@ const char *cbm_sem_corpus_token_at(const cbm_sem_corpus_t *corpus, int index,
         *out_idf = df > 0 ? logf((float)corpus->doc_count / (float)df) : 0.0F;
     }
     return corpus->entries[index].token;
+}
+
+int cbm_sem_corpus_token_id(const cbm_sem_corpus_t *corpus, const char *token) {
+    if (!corpus || !token || !corpus->token_map) {
+        return CBM_NOT_FOUND;
+    }
+    int idx = parse_token_index(cbm_ht_get(corpus->token_map, token));
+    if (idx < 0 || idx >= corpus->entry_count) {
+        return CBM_NOT_FOUND;
+    }
+    return idx;
+}
+
+const int *cbm_sem_corpus_doc_token_ids(const cbm_sem_corpus_t *corpus, int doc_index,
+                                        int *out_count) {
+    if (out_count) {
+        *out_count = 0;
+    }
+    if (!corpus || !corpus->doc_token_ids || !corpus->doc_token_counts || doc_index < 0 ||
+        doc_index >= corpus->doc_count) {
+        return NULL;
+    }
+    const int *ids = corpus->doc_token_ids[doc_index];
+    if (!ids) {
+        return NULL;
+    }
+    if (out_count) {
+        *out_count = corpus->doc_token_counts[doc_index];
+    }
+    return ids;
 }
 
 static void free_ht_kv(const char *key, void *value, void *userdata) {
@@ -1951,15 +2056,24 @@ static float small_cosine(const float *a, const float *b, int dims) {
     return denom < CBM_SEM_DENOM_EPS ? 0.0F : dot / denom;
 }
 
-/* Sparse cosine over two pre-sorted (index, weight) vectors.  Returns 0 when
- * either side is empty or the magnitude product is below the epsilon guard. */
+/* Sparse cosine over two canonical CSR TF-IDF vectors — strictly ascending,
+ * duplicate-free CORPUS-GLOBAL token ids (#868), so an index equality here means
+ * "both documents contain this term" and nothing else. Returns 0 when either
+ * side is empty or the magnitude product is below the epsilon guard.
+ *
+ * Both magnitudes are properties of a vector, not of the pair, so they are
+ * accumulated once by the builder into `tfidf_norm` (same order and float
+ * precision this dot product uses) instead of being recomputed for every
+ * candidate pair. */
 static float sparse_tfidf_cosine(const cbm_sem_func_t *a, const cbm_sem_func_t *b) {
     if (a->tfidf_len <= 0 || b->tfidf_len <= 0) {
         return 0.0F;
     }
+    float denom = a->tfidf_norm * b->tfidf_norm;
+    if (!(denom > CBM_SEM_DENOM_EPS)) {
+        return 0.0F;
+    }
     float dot = 0.0F;
-    float ma = 0.0F;
-    float mb = 0.0F;
     int ia = 0;
     int ib = 0;
     while (ia < a->tfidf_len && ib < b->tfidf_len) {
@@ -1973,14 +2087,7 @@ static float sparse_tfidf_cosine(const cbm_sem_func_t *a, const cbm_sem_func_t *
             ib++;
         }
     }
-    for (int i = 0; i < a->tfidf_len; i++) {
-        ma += a->tfidf_weights[i] * a->tfidf_weights[i];
-    }
-    for (int i = 0; i < b->tfidf_len; i++) {
-        mb += b->tfidf_weights[i] * b->tfidf_weights[i];
-    }
-    float denom = sqrtf(ma) * sqrtf(mb);
-    return denom > CBM_SEM_DENOM_EPS ? (dot / denom) : 0.0F;
+    return dot / denom;
 }
 
 float cbm_sem_combined_score(const cbm_sem_func_t *a, const cbm_sem_func_t *b,

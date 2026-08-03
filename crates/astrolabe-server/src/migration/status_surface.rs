@@ -10,7 +10,7 @@ pub(crate) fn shadow_status_summary(project: &str) -> Result<Value, DynError> {
 }
 
 pub(crate) fn shadow_status_summary_at(cache_dir: &Path, project: &str) -> Result<Value, DynError> {
-    let lowering_debounce = drive_project_lowering(cache_dir, project)?;
+    let lowering_debounce = lowering_status_snapshot(cache_dir, project)?;
     let sqlite_path = sqlite_path(cache_dir, project);
     let configured_vault_dir = read_config_value(cache_dir, &metadata_key(project, "vault_dir"))?
         .map(PathBuf::from)
@@ -98,14 +98,54 @@ pub(crate) fn shadow_status_summary_at(cache_dir: &Path, project: &str) -> Resul
             read_config_value(cache_dir, &metadata_key(project, "vault_import_fallback_reason"))?
                 .as_deref(),
         ),
-        "security_screen": read_security_screen_metadata(cache_dir, project)?,
-        "search_scale": read_search_scale_metadata(cache_dir, project)?,
-        "skill_tree": read_skill_tree_metadata(cache_dir, project)?,
-        "bridges": read_bridges_metadata(cache_dir, project)?,
-        "kernel_context": read_kernel_context_metadata(cache_dir, project)?,
-        "anomalies": read_anomaly_report(cache_dir, project)?,
-        "provenance": read_provenance_metadata(cache_dir, project)?,
-        "invalidations": read_invalidation_metadata(cache_dir, project)?,
+        "security_screen": compact_persisted_surface_ref(
+            cache_dir,
+            project,
+            "security_screen",
+            "security_screen_json",
+        )?,
+        "search_scale": compact_persisted_surface_ref(
+            cache_dir,
+            project,
+            "search_scale",
+            "search_scale_json",
+        )?,
+        "skill_tree": compact_persisted_surface_ref(
+            cache_dir,
+            project,
+            "skill_tree",
+            "skill_tree_json",
+        )?,
+        "bridges": compact_persisted_surface_ref(
+            cache_dir,
+            project,
+            "bridges",
+            "bridge_reports_json",
+        )?,
+        "kernel_context": compact_persisted_surface_ref(
+            cache_dir,
+            project,
+            "kernel_context",
+            "kernel_context_json",
+        )?,
+        "anomalies": compact_persisted_surface_ref(
+            cache_dir,
+            project,
+            "anomalies",
+            "anomaly_report_json",
+        )?,
+        "provenance": compact_persisted_surface_ref(
+            cache_dir,
+            project,
+            "provenance",
+            "provenance_json",
+        )?,
+        "invalidations": compact_persisted_surface_ref(
+            cache_dir,
+            project,
+            "invalidations",
+            "invalidations_json",
+        )?,
         "lowering_debounce": lowering_debounce,
         "lowered_sqlite": lowered_summary(
             &lowered_path,

@@ -138,10 +138,21 @@ typedef struct {
     const char *file_path;
     const char *file_ext;
 
-    /* Sparse TF-IDF: stored as parallel arrays of (token_index, weight). */
+    /* Sparse TF-IDF in canonical CSR form (#868). `tfidf_indices` holds
+     * CORPUS-GLOBAL token ids (see cbm_sem_corpus_token_id /
+     * cbm_sem_corpus_doc_token_ids), strictly ascending and duplicate-free;
+     * `tfidf_weights[i]` is that term's `tf_component * idf` with repeated
+     * occurrences aggregated. Global ids are what make the sorted merge in
+     * sparse_tfidf_cosine a real shared-term dot product: keyed by a
+     * per-document ordinal instead, two functions would "share" a term merely
+     * by writing unrelated tokens at the same position. `tfidf_norm` is the L2
+     * magnitude of `tfidf_weights`, accumulated once at build time in the same
+     * order and precision the scorer's dot product uses, so a candidate pair
+     * costs one merge instead of three passes. */
     int *tfidf_indices;
     float *tfidf_weights;
     int tfidf_len;
+    float tfidf_norm;
 
     /* Dense vectors for RI, API, Type, Decorator. */
     /* Quantized semantic vectors (rotated 4-bit scalar quantization — see
@@ -203,6 +214,19 @@ int cbm_sem_corpus_token_count(const cbm_sem_corpus_t *corpus);
  * Returns NULL if index is out of range. */
 const char *cbm_sem_corpus_token_at(const cbm_sem_corpus_t *corpus, int index,
                                     const cbm_sem_vec_t **out_vec, float *out_idf);
+
+/* Corpus-global token id for `token`, or a negative value when the token is not
+ * in the corpus vocabulary. This id — never a per-document ordinal — is the
+ * identity every sparse TF-IDF vector is keyed by (#868). */
+int cbm_sem_corpus_token_id(const cbm_sem_corpus_t *corpus, const char *token);
+
+/* Borrowed view of document `doc_index`'s corpus-global token ids, in the exact
+ * order the document's tokens were supplied, with the id count written through
+ * `out_count`. Returns NULL (writing 0) when the corpus holds no such document
+ * or that document carried no tokens; a caller that needs token identity must
+ * fail closed on NULL rather than substitute positional ids. */
+const int *cbm_sem_corpus_doc_token_ids(const cbm_sem_corpus_t *corpus, int doc_index,
+                                        int *out_count);
 
 /* Free corpus. */
 void cbm_sem_corpus_free(cbm_sem_corpus_t *corpus);

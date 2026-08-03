@@ -27,6 +27,7 @@
 #include "foundation/platform.h"
 #include "foundation/profile.h"
 
+#include <math.h>
 #include <stdatomic.h>
 #include <stddef.h>
 #include <stdio.h>
@@ -666,12 +667,179 @@ typedef struct {
     uint8_t *qvecs; /* output: pre-quantized int8 vectors [func_count * CBM_SEM_DIM] */
     int func_count;
     _Atomic int next_idx;
+    _Atomic bool failed;
 } vec_build_ctx_t;
+
+/* Ascending comparator over corpus-global token ids. */
+static int cmp_token_id_asc(const void *lhs, const void *rhs) {
+    int a = *(const int *)lhs;
+    int b = *(const int *)rhs;
+    return (a > b) - (a < b);
+}
+
+/* Structured refusal for one function's TF-IDF vector build. Every path that
+ * reaches this leaves the function's vector empty and unpublished. */
+static void tfidf_build_error(const char *code, const char *operation, int func_index,
+                              const char *message, const char *remediation) {
+    cbm_log_error("pass.semantic.tfidf_build_failed", "code", code, "component", "semantic.tfidf",
+                  "operation", operation, "function_index", itoa_log(func_index), "message",
+                  message, "remediation", remediation);
+}
+
+/* Builds one function's canonical sparse TF-IDF vector: a strictly ascending,
+ * duplicate-free CSR of (corpus-global token id, tf_component x idf) with
+ * repeated terms aggregated, plus the L2 magnitude the pairwise scorer divides
+ * by (#868).
+ *
+ * Token identity comes from the corpus itself. The corpus already resolved every
+ * document's tokens to global ids while counting document frequency, and the
+ * pass adds documents 1:1 and index-aligned with functions, so document `f`'s id
+ * list IS this function's token identity list — no per-token hash lookup, and no
+ * chance of the vector and the corpus disagreeing about what a term is.
+ *
+ * Returns false on any allocation, identity, alignment, or numerical failure, so
+ * a partial or mis-keyed vector can never reach the scorer or an emitted edge. */
+static bool build_tfidf_vector(vec_build_ctx_t *vc, int f) {
+    cbm_sem_func_t *fn = &vc->funcs[f];
+    fn->tfidf_indices = NULL;
+    fn->tfidf_weights = NULL;
+    fn->tfidf_len = 0;
+    fn->tfidf_norm = 0.0F;
+
+    int tc = vc->token_counts[f];
+    if (tc <= 0) {
+        return true;
+    }
+
+    int id_count = 0;
+    const int *doc_ids = cbm_sem_corpus_doc_token_ids(vc->corpus, f, &id_count);
+    if (!doc_ids || id_count != tc) {
+        tfidf_build_error("CBM_SEM_TFIDF_TOKEN_IDENTITY_MISSING", "resolve_document_token_ids", f,
+                          "corpus document token identities are absent or disagree with the "
+                          "function token count",
+                          "the semantic corpus must be built from the same per-function token "
+                          "arrays this pass tokenized; re-run indexing and report this if it "
+                          "recurs");
+        return false;
+    }
+
+    /* Keep only terms the corpus gives a positive IDF: a term present in every
+     * document carries no discriminative signal (idf = ln(N/N) = 0) and would
+     * only add a constant to every pair. */
+    int *ids = malloc((size_t)tc * sizeof(int));
+    if (!ids) {
+        tfidf_build_error("CBM_SEM_TFIDF_ALLOC_FAILED", "allocate_term_scratch", f,
+                          "TF-IDF term scratch buffer could not be allocated",
+                          "free memory or reduce the indexed corpus size, then retry");
+        return false;
+    }
+    int kept = 0;
+    for (int t = 0; t < tc; t++) {
+        int gid = doc_ids[t];
+        float idf = 0.0F;
+        if (gid < 0 || !cbm_sem_corpus_token_at(vc->corpus, gid, NULL, &idf)) {
+            free(ids);
+            tfidf_build_error("CBM_SEM_TFIDF_TOKEN_IDENTITY_INVALID", "resolve_term_idf", f,
+                              "a document token id does not resolve to a corpus vocabulary entry",
+                              "re-run indexing; report this if it recurs, as it means the corpus "
+                              "vocabulary and the document id lists diverged");
+            return false;
+        }
+        if (idf > 0.0F) {
+            ids[kept++] = gid;
+        }
+    }
+    if (kept == 0) {
+        /* Honest empty vector: every term of this function is corpus-universal.
+         * sparse_tfidf_cosine scores an empty side as 0, never as a match. */
+        free(ids);
+        return true;
+    }
+
+    qsort(ids, (size_t)kept, sizeof(int), cmp_token_id_asc);
+    int unique = 1;
+    for (int i = 1; i < kept; i++) {
+        if (ids[i] != ids[i - SKIP_ONE]) {
+            unique++;
+        }
+    }
+
+    int *indices = malloc((size_t)unique * sizeof(int));
+    float *weights = malloc((size_t)unique * sizeof(float));
+    if (!indices || !weights) {
+        free(indices);
+        free(weights);
+        free(ids);
+        tfidf_build_error("CBM_SEM_TFIDF_ALLOC_FAILED", "allocate_vector", f,
+                          "TF-IDF vector arrays could not be allocated",
+                          "free memory or reduce the indexed corpus size, then retry");
+        return false;
+    }
+
+    int out = 0;
+    float sum_sq = 0.0F;
+    for (int i = 0; i < kept;) {
+        int gid = ids[i];
+        int run = SKIP_ONE;
+        while (i + run < kept && ids[i + run] == gid) {
+            run++;
+        }
+        float idf = 0.0F;
+        (void)cbm_sem_corpus_token_at(vc->corpus, gid, NULL, &idf);
+        /* Sublinear term frequency (1 + ln tf): a term written five times is
+         * more about the concept than one written once, but not five times more.
+         * tf == 1 evaluates to exactly 1.0, so a single-occurrence term keeps
+         * precisely the plain IDF weight, and the correction is a strict
+         * refinement rather than a re-scaling of every existing weight. */
+        float weight = (1.0F + logf((float)run)) * idf;
+        if (!isfinite(weight)) {
+            free(indices);
+            free(weights);
+            free(ids);
+            tfidf_build_error("CBM_SEM_TFIDF_NONFINITE_WEIGHT", "weight_term", f,
+                              "a TF-IDF term weight evaluated to a non-finite value",
+                              "report this: the corpus produced a non-finite IDF or term count");
+            return false;
+        }
+        indices[out] = gid;
+        weights[out] = weight;
+        sum_sq += weight * weight;
+        out++;
+        i += run;
+    }
+    free(ids);
+
+    if (out != unique) {
+        free(indices);
+        free(weights);
+        tfidf_build_error("CBM_SEM_TFIDF_LENGTH_MISMATCH", "finalize_vector", f,
+                          "the aggregated TF-IDF term count does not match the counted distinct "
+                          "terms",
+                          "report this: the canonical CSR build is inconsistent");
+        return false;
+    }
+    float norm = sqrtf(sum_sq);
+    if (!isfinite(norm) || norm <= 0.0F) {
+        free(indices);
+        free(weights);
+        tfidf_build_error("CBM_SEM_TFIDF_NONFINITE_NORM", "finalize_vector", f,
+                          "the TF-IDF vector magnitude is not a positive finite value",
+                          "report this: a vector with positive-IDF terms must have a positive "
+                          "magnitude");
+        return false;
+    }
+
+    fn->tfidf_indices = indices;
+    fn->tfidf_weights = weights;
+    fn->tfidf_len = out;
+    fn->tfidf_norm = norm;
+    return true;
+}
 
 static void vec_build_worker(int worker_id, void *ctx_ptr) {
     (void)worker_id;
     vec_build_ctx_t *vc = ctx_ptr;
-    while (true) {
+    while (!atomic_load_explicit(&vc->failed, memory_order_acquire)) {
         int f = atomic_fetch_add_explicit(&vc->next_idx, SKIP_ONE, memory_order_relaxed);
         if (f >= vc->func_count) {
             break;
@@ -680,21 +848,10 @@ static void vec_build_worker(int worker_id, void *ctx_ptr) {
         int tc = vc->token_counts[f];
         char **tokens = &vc->all_tokens[(ptrdiff_t)f * CBM_SEM_MAX_TOKENS];
 
-        /* TF-IDF weights */
-        int *indices = malloc((size_t)tc * sizeof(int));
-        float *weights = malloc((size_t)tc * sizeof(float));
-        int tfidf_len = 0;
-        for (int t = 0; t < tc; t++) {
-            float idf = cbm_sem_corpus_idf(vc->corpus, tokens[t]);
-            if (idf > 0.0F) {
-                indices[tfidf_len] = t;
-                weights[tfidf_len] = idf;
-                tfidf_len++;
-            }
+        if (!build_tfidf_vector(vc, f)) {
+            atomic_store_explicit(&vc->failed, true, memory_order_release);
+            return;
         }
-        vc->funcs[f].tfidf_indices = indices;
-        vc->funcs[f].tfidf_weights = weights;
-        vc->funcs[f].tfidf_len = tfidf_len;
 
         /* RI vector: sum of enriched token vectors weighted by IDF. Built in a
          * LOCAL dense buffer; only the quantized code is retained per func
@@ -1233,10 +1390,10 @@ static hyperplane_row_t *phase5a_build_hyperplanes(void) {
 /* Phase 1b: decode per-function minhash/profile/API/type/deco vectors in
  * parallel.  Must be called after cbm_sem_ensure_ready() so the pretrained
  * token map is initialized. */
-static void phase1b_decode_and_build(cbm_sem_func_t *funcs, const cbm_gbuf_node_t **node_ptrs,
+static bool phase1b_decode_and_build(cbm_sem_func_t *funcs, const cbm_gbuf_node_t **node_ptrs,
                                      const cbm_gbuf_t *gbuf, int func_count, int worker_count) {
     if (func_count <= 0) {
-        return;
+        return true;
     }
     collect_ctx_t cc = {
         .funcs = funcs,
@@ -1245,8 +1402,13 @@ static void phase1b_decode_and_build(cbm_sem_func_t *funcs, const cbm_gbuf_node_
         .func_count = func_count,
     };
     atomic_init(&cc.next_idx, 0);
-    cbm_parallel_for_opts_t opts = {.max_workers = worker_count, .force_pthreads = false};
-    cbm_parallel_for(worker_count, collect_worker, &cc, opts);
+    cbm_parallel_for_opts_t opts = {
+        .max_workers = worker_count,
+        .force_pthreads = false,
+        .operation = "semantic_edges.decode_build",
+    };
+    cbm_parallel_for_result_t dispatch_result = {0};
+    return cbm_parallel_for(worker_count, collect_worker, &cc, opts, &dispatch_result) == 0;
 }
 
 /* Phase 2: tokenize each function's metadata in parallel, filling
@@ -1264,21 +1426,47 @@ static bool phase2_tokenize(const cbm_gbuf_node_t **node_ptrs, cbm_gbuf_t *gbuf,
     };
     atomic_init(&tc.next_idx, 0);
     atomic_init(&tc.failed, false);
-    cbm_parallel_for_opts_t opts = {.max_workers = worker_count, .force_pthreads = false};
-    cbm_parallel_for(worker_count, tokenize_worker, &tc, opts);
+    cbm_parallel_for_opts_t opts = {
+        .max_workers = worker_count,
+        .force_pthreads = false,
+        .operation = "semantic_edges.tokenize",
+    };
+    cbm_parallel_for_result_t dispatch_result = {0};
+    if (cbm_parallel_for(worker_count, tokenize_worker, &tc, opts, &dispatch_result) != 0) {
+        return false;
+    }
     return !atomic_load_explicit(&tc.failed, memory_order_acquire);
 }
 
 /* Phase 4a: build per-function TF-IDF + RI vectors in parallel, producing
  * int8-quantized qvecs for subsequent storage.  Phase 4b runs sequentially
  * to store them in gbuf because gbuf is not thread-safe. */
-static void phase4_build_and_store_vectors(cbm_gbuf_t *gbuf, cbm_sem_func_t *funcs,
+static bool phase4_build_and_store_vectors(cbm_gbuf_t *gbuf, cbm_sem_func_t *funcs,
                                            char **all_tokens, int *token_counts,
                                            cbm_sem_corpus_t *corpus, int func_count,
                                            int worker_count) {
     uint8_t *qvecs = malloc((size_t)func_count * CBM_SEM_DIM);
     if (!qvecs) {
-        return;
+        cbm_log_error("pass.semantic.vector_alloc_failed", "code", "CBM_SEM_VECTOR_ALLOC_FAILED",
+                      "message", "semantic vector buffer could not be allocated", "remediation",
+                      "free memory or reduce the indexed corpus size, then retry");
+        return false;
+    }
+    /* Token identity is read out of the corpus by document index, so the 1:1
+     * index alignment the corpus was built under (run_corpus_phase adds exactly
+     * these func_count documents) is a precondition, not an assumption (#868). */
+    int corpus_doc_count = cbm_sem_corpus_doc_count(corpus);
+    if (corpus_doc_count != func_count) {
+        free(qvecs);
+        cbm_log_error("pass.semantic.vector_build_failed", "code",
+                      "CBM_SEM_CORPUS_DOC_ALIGNMENT", "component", "semantic.tfidf", "operation",
+                      "verify_doc_alignment", "corpus_docs", itoa_log(corpus_doc_count),
+                      "functions", itoa_log(func_count), "message",
+                      "the semantic corpus document count does not match the function count, so "
+                      "per-function token identity cannot be resolved",
+                      "report this: the corpus must be built from exactly the functions this pass "
+                      "scanned");
+        return false;
     }
     vec_build_ctx_t vc = {
         .funcs = funcs,
@@ -1289,48 +1477,105 @@ static void phase4_build_and_store_vectors(cbm_gbuf_t *gbuf, cbm_sem_func_t *fun
         .func_count = func_count,
     };
     atomic_init(&vc.next_idx, 0);
-    cbm_parallel_for_opts_t opts = {.max_workers = worker_count, .force_pthreads = false};
-    cbm_parallel_for(worker_count, vec_build_worker, &vc, opts);
+    atomic_init(&vc.failed, false);
+    cbm_parallel_for_opts_t opts = {
+        .max_workers = worker_count,
+        .force_pthreads = false,
+        .operation = "semantic_edges.vector_build",
+    };
+    cbm_parallel_for_result_t dispatch_result = {0};
+    if (cbm_parallel_for(worker_count, vec_build_worker, &vc, opts, &dispatch_result) != 0) {
+        free(qvecs);
+        return false;
+    }
+    if (atomic_load_explicit(&vc.failed, memory_order_acquire)) {
+        /* A worker already published the exact structured cause. Fail the pass
+         * closed: a corpus where some functions carry a TF-IDF vector and others
+         * silently carry none would emit an edge set that is not a function of
+         * the source (invariant 3). */
+        free(qvecs);
+        cbm_log_error("pass.semantic.vector_build_failed", "code", "CBM_SEM_VECTOR_BUILD_FAILED",
+                      "component", "semantic.tfidf", "operation", "build_vectors", "message",
+                      "per-function semantic vector construction failed; no semantic vectors or "
+                      "edges are published for this run",
+                      "resolve the preceding structured semantic.tfidf error and re-run indexing");
+        return false;
+    }
     for (int f = 0; f < func_count; f++) {
         cbm_gbuf_store_vector(gbuf, funcs[f].node_id, &qvecs[(ptrdiff_t)f * CBM_SEM_DIM],
                               CBM_SEM_DIM);
     }
     free(qvecs);
+    return true;
 }
 
 /* Phase 5: hyperplane generation → signatures → LSH bucket population.
  * Returns the malloc'd signatures array and band_buckets[] via out-params;
  * caller frees both. */
-static void phase5_lsh_build(cbm_sem_func_t *funcs, int func_count, int worker_count,
+static void free_lsh_buckets(sem_bucket_t **band_buckets);
+
+static bool phase5_lsh_build(cbm_sem_func_t *funcs, int func_count, int worker_count,
                              uint64_t **out_signatures, sem_bucket_t ***out_buckets) {
+    *out_signatures = NULL;
+    *out_buckets = NULL;
     hyperplane_row_t *hyperplanes = phase5a_build_hyperplanes();
     uint64_t *signatures = calloc((size_t)func_count, sizeof(uint64_t));
-    if (hyperplanes && signatures) {
-        sig_build_ctx_t sc = {
-            .funcs = funcs,
-            .signatures = signatures,
-            .hyperplanes = hyperplanes,
-            .func_count = func_count,
-        };
-        atomic_init(&sc.next_idx, 0);
-        cbm_parallel_for_opts_t opts = {.max_workers = worker_count, .force_pthreads = false};
-        cbm_parallel_for(worker_count, sig_build_worker, &sc, opts);
+    if (!hyperplanes || !signatures) {
+        cbm_log_error("pass.semantic.lsh_alloc_failed", "code", "CBM_SEM_LSH_ALLOC_FAILED",
+                      "message", "semantic LSH signature buffers could not be allocated",
+                      "remediation", "free memory or reduce the indexed corpus size, then retry");
+        free(hyperplanes);
+        free(signatures);
+        return false;
+    }
+    sig_build_ctx_t sc = {
+        .funcs = funcs,
+        .signatures = signatures,
+        .hyperplanes = hyperplanes,
+        .func_count = func_count,
+    };
+    atomic_init(&sc.next_idx, 0);
+    cbm_parallel_for_opts_t opts = {
+        .max_workers = worker_count,
+        .force_pthreads = false,
+        .operation = "semantic_edges.signature_build",
+    };
+    cbm_parallel_for_result_t dispatch_result = {0};
+    if (cbm_parallel_for(worker_count, sig_build_worker, &sc, opts, &dispatch_result) != 0) {
+        free(hyperplanes);
+        free(signatures);
+        return false;
     }
     free(hyperplanes);
 
     sem_bucket_t **band_buckets = calloc(SEM_LSH_BANDS, sizeof(sem_bucket_t *));
-    if (band_buckets) {
-        for (int b = 0; b < SEM_LSH_BANDS; b++) {
-            band_buckets[b] = calloc(SEM_BUCKET_COUNT, sizeof(sem_bucket_t));
-        }
-        phase5c_build_lsh_buckets(signatures, func_count, band_buckets);
+    if (!band_buckets) {
+        cbm_log_error("pass.semantic.lsh_alloc_failed", "code", "CBM_SEM_LSH_ALLOC_FAILED",
+                      "message", "semantic LSH band table could not be allocated", "remediation",
+                      "free memory or reduce the indexed corpus size, then retry");
+        free(signatures);
+        return false;
     }
+    for (int b = 0; b < SEM_LSH_BANDS; b++) {
+        band_buckets[b] = calloc(SEM_BUCKET_COUNT, sizeof(sem_bucket_t));
+        if (!band_buckets[b]) {
+            cbm_log_error("pass.semantic.lsh_alloc_failed", "code", "CBM_SEM_LSH_ALLOC_FAILED",
+                          "message", "semantic LSH bucket table could not be allocated",
+                          "remediation",
+                          "free memory or reduce the indexed corpus size, then retry");
+            free_lsh_buckets(band_buckets);
+            free(signatures);
+            return false;
+        }
+    }
+    phase5c_build_lsh_buckets(signatures, func_count, band_buckets);
     *out_signatures = signatures;
     *out_buckets = band_buckets;
+    return true;
 }
 
 /* Phase 6a: score candidate pairs in parallel and collect deferred edges. */
-static void phase6a_score_candidates(cbm_sem_func_t *funcs, uint64_t *signatures, int *edge_counts,
+static bool phase6a_score_candidates(cbm_sem_func_t *funcs, uint64_t *signatures, int *edge_counts,
                                      sem_bucket_t **band_buckets, cbm_sem_config_t cfg,
                                      deferred_edge_buf_t *worker_bufs, int func_count,
                                      int worker_count) {
@@ -1345,8 +1590,13 @@ static void phase6a_score_candidates(cbm_sem_func_t *funcs, uint64_t *signatures
         .max_workers = worker_count,
     };
     atomic_init(&sc.next_idx, 0);
-    cbm_parallel_for_opts_t opts = {.max_workers = worker_count, .force_pthreads = false};
-    cbm_parallel_for(worker_count, score_worker, &sc, opts);
+    cbm_parallel_for_opts_t opts = {
+        .max_workers = worker_count,
+        .force_pthreads = false,
+        .operation = "semantic_edges.score",
+    };
+    cbm_parallel_for_result_t dispatch_result = {0};
+    return cbm_parallel_for(worker_count, score_worker, &sc, opts, &dispatch_result) == 0;
 }
 
 /* Phase 7: free LSH bucket storage (items arrays and the per-band arrays). */
@@ -1415,18 +1665,30 @@ static int run_scoring_phase(cbm_gbuf_t *gbuf, cbm_sem_func_t *funcs, uint64_t *
     int *edge_counts = calloc((size_t)func_count, sizeof(int));
     deferred_edge_buf_t *worker_bufs = calloc((size_t)worker_count, sizeof(deferred_edge_buf_t));
     if (!edge_counts || !worker_bufs) {
+        cbm_log_error("pass.semantic.scoring_alloc_failed", "code",
+                      "CBM_SEM_SCORING_ALLOC_FAILED", "message",
+                      "semantic scoring buffers could not be allocated", "remediation",
+                      "free memory or reduce the indexed corpus size, then retry");
         free(edge_counts);
         free(worker_bufs);
-        return 0;
+        return CBM_NOT_FOUND;
     }
     for (int w = 0; w < worker_count; w++) {
         deferred_buf_init(&worker_bufs[w]);
     }
 
     CBM_PROF_START(t_phase6a);
-    phase6a_score_candidates(funcs, signatures, edge_counts, band_buckets, cfg, worker_bufs,
-                             func_count, worker_count);
+    bool scored = phase6a_score_candidates(funcs, signatures, edge_counts, band_buckets, cfg,
+                                           worker_bufs, func_count, worker_count);
     CBM_PROF_END_N("semantic_edges", "6a_score_parallel", t_phase6a, func_count);
+    if (!scored) {
+        for (int w = 0; w < worker_count; w++) {
+            deferred_buf_free(&worker_bufs[w]);
+        }
+        free(worker_bufs);
+        free(edge_counts);
+        return CBM_NOT_FOUND;
+    }
 
     CBM_PROF_START(t_phase6b);
     int total = phase6b_merge_edges(gbuf, worker_bufs, worker_count, edge_counts, cfg.max_edges);
@@ -1501,8 +1763,23 @@ int cbm_pipeline_pass_semantic_edges(cbm_pipeline_ctx_t *ctx) {
         free(node_ptrs);
         return CBM_NOT_FOUND;
     }
+    int worker_count = cbm_default_worker_count(false);
+    if (worker_count <= 0) {
+        cbm_log_error("pass.semantic.worker_count_invalid", "code", "CBM_WORKER_COUNT_INVALID",
+                      "worker_count", itoa_log(worker_count), "message",
+                      "worker-count configuration is invalid", "remediation",
+                      "set CBM_WORKERS to an integer from 1 through 256 or remove it");
+        free(funcs);
+        free(node_ptrs);
+        return CBM_NOT_FOUND;
+    }
     CBM_PROF_START(t_phase1b);
-    phase1b_decode_and_build(funcs, node_ptrs, gbuf, func_count, cbm_default_worker_count(false));
+    if (!phase1b_decode_and_build(funcs, node_ptrs, gbuf, func_count, worker_count)) {
+        CBM_PROF_END_N("semantic_edges", "1b_decode_build_parallel", t_phase1b, func_count);
+        free(funcs);
+        free(node_ptrs);
+        return CBM_NOT_FOUND;
+    }
     CBM_PROF_END_N("semantic_edges", "1b_decode_build_parallel", t_phase1b, func_count);
     cbm_log_info("pass.semantic.collected", "functions", itoa_log(func_count));
 
@@ -1514,7 +1791,6 @@ int cbm_pipeline_pass_semantic_edges(cbm_pipeline_ctx_t *ctx) {
     }
 
     /* Phase 2: Tokenize all nodes (PARALLEL) */
-    int worker_count = cbm_default_worker_count(false);
     char **all_tokens = malloc((size_t)func_count * sizeof(char *) * CBM_SEM_MAX_TOKENS);
     int *token_counts = calloc((size_t)func_count, sizeof(int));
     if (!all_tokens || !token_counts) {
@@ -1591,8 +1867,15 @@ int cbm_pipeline_pass_semantic_edges(cbm_pipeline_ctx_t *ctx) {
 
     /* Phase 4: Build per-function TF-IDF + RI vectors (PARALLEL) and store them. */
     CBM_PROF_START(t_phase4);
-    phase4_build_and_store_vectors(gbuf, funcs, all_tokens, token_counts, corpus, func_count,
-                                   worker_count);
+    if (!phase4_build_and_store_vectors(gbuf, funcs, all_tokens, token_counts, corpus, func_count,
+                                        worker_count)) {
+        CBM_PROF_END_N("semantic_edges", "4_build_and_store_vec", t_phase4, func_count);
+        cbm_sem_corpus_free(corpus);
+        free_funcs_and_tokens(funcs, func_count, all_tokens, token_counts, token_pools,
+                              worker_count);
+        free(token_counts);
+        return CBM_NOT_FOUND;
+    }
     CBM_PROF_END_N("semantic_edges", "4_build_and_store_vec", t_phase4, func_count);
 
     cbm_log_info("pass.semantic.vectors_stored", "count", itoa_log(func_count));
@@ -1601,7 +1884,14 @@ int cbm_pipeline_pass_semantic_edges(cbm_pipeline_ctx_t *ctx) {
     CBM_PROF_START(t_phase5);
     uint64_t *signatures = NULL;
     sem_bucket_t **band_buckets = NULL;
-    phase5_lsh_build(funcs, func_count, worker_count, &signatures, &band_buckets);
+    if (!phase5_lsh_build(funcs, func_count, worker_count, &signatures, &band_buckets)) {
+        CBM_PROF_END_N("semantic_edges", "5_lsh_build", t_phase5, func_count);
+        cbm_sem_corpus_free(corpus);
+        free_funcs_and_tokens(funcs, func_count, all_tokens, token_counts, token_pools,
+                              worker_count);
+        free(token_counts);
+        return CBM_NOT_FOUND;
+    }
     CBM_PROF_END_N("semantic_edges", "5_lsh_build", t_phase5, func_count);
 
     cbm_log_info("pass.semantic.lsh_built", "functions", itoa_log(func_count), "bands",
@@ -1610,6 +1900,15 @@ int cbm_pipeline_pass_semantic_edges(cbm_pipeline_ctx_t *ctx) {
     /* Phase 6: Parallel scoring + sequential edge merge. */
     int total_edges =
         run_scoring_phase(gbuf, funcs, signatures, band_buckets, cfg, func_count, worker_count);
+    if (total_edges < 0) {
+        free_lsh_buckets(band_buckets);
+        free(signatures);
+        cbm_sem_corpus_free(corpus);
+        free_funcs_and_tokens(funcs, func_count, all_tokens, token_counts, token_pools,
+                              worker_count);
+        free(token_counts);
+        return CBM_NOT_FOUND;
+    }
 
     /* Phase 7: Cleanup */
     CBM_PROF_START(t_phase7);

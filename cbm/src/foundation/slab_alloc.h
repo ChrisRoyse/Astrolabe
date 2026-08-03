@@ -18,7 +18,7 @@
  * far better than a hand-rolled tier2 bump allocator.
  *
  * Usage:
- *   cbm_slab_install();         // once, before any parsing
+ *   cbm_slab_install();         // process-idempotent, before any parsing
  *   ... parse files ...
  *   cbm_slab_destroy_thread();  // on thread exit — frees owned memory
  */
@@ -28,7 +28,9 @@
 #include <stddef.h>
 
 /* Install slab allocator as tree-sitter's malloc/calloc/realloc/free.
- * Must be called once before any ts_parser_new() calls. Thread-safe. */
+ * Process-idempotent and thread-safe. The first call must happen before any
+ * ts_parser_new() calls so Tree-sitter never observes an allocator transition
+ * while parser/tree objects are live. */
 void cbm_slab_install(void);
 
 /* Reset the current thread's slab: owned pages are reclaimed or retired.

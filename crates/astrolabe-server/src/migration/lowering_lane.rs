@@ -95,6 +95,35 @@ pub(crate) fn drive_project_lowering(cache_dir: &Path, project: &str) -> Result<
     Ok(status)
 }
 
+pub(crate) fn lowering_status_snapshot(cache_dir: &Path, project: &str) -> Result<Value, DynError> {
+    if let Some(status) = read_lowering_status(cache_dir, project)? {
+        return Ok(status);
+    }
+    let pending = read_config_value(cache_dir, &metadata_key(project, LOWERING_PENDING_KEY))?
+        .as_deref()
+        == Some("true");
+    let window_ms = LowerDebouncer::with_default_window(SystemClock).window_ms();
+    Ok(if pending {
+        json!({
+            "schema": "astrolabe-lowering-debounce-v1",
+            "status": "waiting",
+            "pending": true,
+            "window_ms": window_ms,
+            "freshness": "stale",
+            "trust": "verified",
+        })
+    } else {
+        json!({
+            "schema": "astrolabe-lowering-debounce-v1",
+            "status": "idle",
+            "pending": false,
+            "window_ms": window_ms,
+            "freshness": "current_or_uninitialized",
+            "trust": "verified",
+        })
+    })
+}
+
 pub(crate) fn read_lowering_status(
     cache_dir: &Path,
     project: &str,
