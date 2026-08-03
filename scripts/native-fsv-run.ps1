@@ -310,6 +310,31 @@ function Observe-ExitedProcessCode(
     }
 }
 
+function Get-AstroStructuredObjectFieldNames {
+    param(
+        [Parameter(Mandatory)][AllowNull()]$Object
+    )
+
+    if ($null -eq $Object) { return [string[]]::new(0) }
+    if ($Object -is [Collections.IDictionary]) {
+        return [string[]]@($Object.Keys | ForEach-Object { [string]$_ })
+    }
+    return [string[]]@($Object.PSObject.Properties | ForEach-Object Name)
+}
+
+function Get-AstroStructuredObjectFieldValue {
+    param(
+        [Parameter(Mandatory)][AllowNull()]$Object,
+        [Parameter(Mandatory)][string]$Name
+    )
+
+    if ($null -eq $Object) { return $null }
+    if ($Object -is [Collections.IDictionary]) { return $Object[$Name] }
+    $property = $Object.PSObject.Properties[$Name]
+    if ($null -eq $property) { return $null }
+    return $property.Value
+}
+
 function Read-AstroFsvExitCodeObservation {
     param(
         [Parameter(Mandatory)][AllowNull()]$Observation,
@@ -327,13 +352,7 @@ function Read-AstroFsvExitCodeObservation {
             "$Description is absent" `
             'preserve the session and inspect the durable process observation'
     }
-    $isDictionary = $Observation -is [Collections.IDictionary]
-    $actualFields = if ($isDictionary) {
-        @($Observation.Keys | ForEach-Object { [string]$_ })
-    }
-    else {
-        @($Observation.PSObject.Properties | ForEach-Object Name)
-    }
+    $actualFields = @(Get-AstroStructuredObjectFieldNames $Observation)
     if (
         $actualFields.Count -ne $requiredFields.Count -or
         @($requiredFields | Where-Object {
@@ -346,12 +365,7 @@ function Read-AstroFsvExitCodeObservation {
 
     $codes = [Collections.Generic.List[uint64]]::new()
     foreach ($field in @('exit_code', 'exact_duplicate_exit_code')) {
-        $raw = if ($isDictionary) {
-            $Observation[$field]
-        }
-        else {
-            $Observation.$field
-        }
+        $raw = Get-AstroStructuredObjectFieldValue $Observation $field
         $text = if ($null -eq $raw) {
             ''
         }
@@ -383,21 +397,16 @@ function Read-AstroFsvExitCodeObservation {
         'kernel32!GetExitCodeProcess(PROCESS_INFORMATION.hProcess)'
     $duplicateSource =
         'kernel32!GetExitCodeProcess(DuplicateHandle(PROCESS_INFORMATION.hProcess))'
-    $observedPrimaryHex = if ($isDictionary) {
-        [string]$Observation['exit_code_hex']
-    } else { [string]$Observation.exit_code_hex }
-    $observedDuplicateHex = if ($isDictionary) {
-        [string]$Observation['exact_duplicate_exit_code_hex']
-    } else { [string]$Observation.exact_duplicate_exit_code_hex }
-    $observedPrimarySource = if ($isDictionary) {
-        [string]$Observation['primary_source']
-    } else { [string]$Observation.primary_source }
-    $observedDuplicateSource = if ($isDictionary) {
-        [string]$Observation['exact_duplicate_source']
-    } else { [string]$Observation.exact_duplicate_source }
-    $observedAgreement = if ($isDictionary) {
-        $Observation['sources_agree']
-    } else { $Observation.sources_agree }
+    $observedPrimaryHex = [string](Get-AstroStructuredObjectFieldValue `
+            $Observation 'exit_code_hex')
+    $observedDuplicateHex = [string](Get-AstroStructuredObjectFieldValue `
+            $Observation 'exact_duplicate_exit_code_hex')
+    $observedPrimarySource = [string](Get-AstroStructuredObjectFieldValue `
+            $Observation 'primary_source')
+    $observedDuplicateSource = [string](Get-AstroStructuredObjectFieldValue `
+            $Observation 'exact_duplicate_source')
+    $observedAgreement = Get-AstroStructuredObjectFieldValue `
+        $Observation 'sources_agree'
     if ($observedPrimaryHex -cne $primaryHex -or
         $observedDuplicateHex -cne
             $duplicateHex -or
@@ -629,7 +638,7 @@ function Read-AstroFsvProcessIdentity(
         Fail-Astro $Code "$Description is absent" `
             'preserve the session and investigate incomplete process provenance'
     }
-    $properties = @($Object.PSObject.Properties | ForEach-Object Name)
+    $properties = @(Get-AstroStructuredObjectFieldNames $Object)
     $required = @('pid', 'process_start_utc_ticks', 'process_started_utc')
     if ($properties.Count -ne $required.Count -or
         @($required | Where-Object { $properties -notcontains $_ }).Count -ne 0) {
@@ -640,13 +649,14 @@ function Read-AstroFsvProcessIdentity(
     $parsedPid = 0
     $parsedTicks = 0L
     if (-not [int]::TryParse(
-            [string]$Object.pid,
+            [string](Get-AstroStructuredObjectFieldValue $Object 'pid'),
             [Globalization.NumberStyles]::None,
             [Globalization.CultureInfo]::InvariantCulture,
             [ref]$parsedPid
         ) -or $parsedPid -le 0 -or
         -not [long]::TryParse(
-            [string]$Object.process_start_utc_ticks,
+            [string](Get-AstroStructuredObjectFieldValue `
+                $Object 'process_start_utc_ticks'),
             [Globalization.NumberStyles]::None,
             [Globalization.CultureInfo]::InvariantCulture,
             [ref]$parsedTicks
@@ -656,7 +666,8 @@ function Read-AstroFsvProcessIdentity(
             'preserve the session and investigate incomplete process provenance'
     }
     $expectedIso = ConvertTo-AstroProcessStartUtcIso $parsedTicks
-    $startedValue = $Object.process_started_utc
+    $startedValue = Get-AstroStructuredObjectFieldValue `
+        $Object 'process_started_utc'
     $startedMatches = if ($startedValue -is [DateTime]) {
         $startedValue.ToUniversalTime().Ticks -eq $parsedTicks
     }
@@ -2159,11 +2170,13 @@ function Assert-AstroExactObjectProperties {
         [Parameter(Mandatory)][string]$Code,
         [Parameter(Mandatory)][string]$Description
     )
-    if ($null -eq $Object -or $Object -isnot [psobject]) {
+    if ($null -eq $Object -or
+        ($Object -isnot [Collections.IDictionary] -and
+         $Object -isnot [psobject])) {
         Fail-Astro $Code "$Description is absent or is not an object" `
             'preserve the plan/session and correct the exact structured envelope'
     }
-    $actual = @($Object.PSObject.Properties | ForEach-Object Name)
+    $actual = @(Get-AstroStructuredObjectFieldNames $Object)
     if ($actual.Count -ne $Names.Count -or
         @($Names | Where-Object { $actual -cnotcontains $_ }).Count -ne 0) {
         Fail-Astro $Code `
@@ -2803,7 +2816,12 @@ function Open-AstroCohortCleanupReadiness {
     catch {
         $stopwatch.Stop()
         $failure = $_
-        if ($null -ne $lease) { $lease.Dispose(); $lease = $null }
+        $leaseDisposeError = $null
+        if ($null -ne $lease) {
+            try { $lease.Dispose() }
+            catch { $leaseDisposeError = $_.Exception.Message }
+            $lease = $null
+        }
         try {
             if (Test-AstroPathLongPath -LiteralPath $ArtifactPath -PathType Leaf) {
                 Set-AstroFileReadOnlyLongPath -LiteralPath $ArtifactPath -ReadOnly $true
@@ -2811,11 +2829,11 @@ function Open-AstroCohortCleanupReadiness {
         }
         catch {
             Fail-Astro 'ASTRO_FSV_ARTIFACT_CLEANUP_READINESS_RESTORE_FAILED' `
-                "cohort cleanup readiness failed and read-only restoration also failed (readiness=$($failure.Exception.Message); restore=$($_.Exception.Message))" `
+                "cohort cleanup readiness failed and read-only restoration also failed (readiness=$($failure.Exception.Message); lease_dispose=$leaseDisposeError; restore=$($_.Exception.Message))" `
                 'preserve the session and exact owner state before lifecycle cleanup'
         }
         Fail-Astro 'ASTRO_FSV_ARTIFACT_CLEANUP_NOT_READY' `
-            "staged cohort artifact is not exactly ready for cleanup: $($failure.Exception.Message); attempts=$($attempts | ConvertTo-Json -Depth 12 -Compress)" `
+            "staged cohort artifact is not exactly ready for cleanup: $($failure.Exception.Message); lease_dispose_error=$leaseDisposeError; attempts=$($attempts | ConvertTo-Json -Depth 12 -Compress)" `
             'preserve the session and inspect the exact native error/owner transition'
     }
 }
@@ -2866,10 +2884,11 @@ function Invoke-AstroResidentCohort {
     $runRecordWritten = $false
     $lockManifest = $null
     $cohortJobMembers = [int[]]::new(0)
+    $cohortFailureInFlight = $false
 
     $ownerEntries = {
         return @($processStates | ForEach-Object {
-            [ordered]@{
+            [pscustomobject][ordered]@{
                 role = [string]$_.role
                 ordinal = [int]$_.ordinal
                 identity = $_.identity
@@ -3414,6 +3433,7 @@ function Invoke-AstroResidentCohort {
         return
     }
     catch {
+        $cohortFailureInFlight = $true
         $failure = $_
         $allTerminationProved = $true
         foreach ($state in $processStates) {
@@ -3562,15 +3582,50 @@ function Invoke-AstroResidentCohort {
             lock_preserved = Test-AstroPathLongPath -LiteralPath $FsvLockPath
             run_record_written = $runRecordWritten
         } | ConvertTo-Json -Compress))
-        throw $failure
+        throw $failure.Exception
     }
     finally {
+        $disposeFailures = [Collections.Generic.List[object]]::new()
         foreach ($state in $processStates) {
             if (-not [bool]$state.handles_closed) {
-                try { $state.native.Dispose(); $state.handles_closed = $true } catch {}
+                try {
+                    $state.native.Dispose()
+                    $state.handles_closed = $true
+                }
+                catch {
+                    $disposeFailures.Add([ordered]@{
+                        kind = 'cohort-process-handle'
+                        role = [string]$state.role
+                        ordinal = [int]$state.ordinal
+                        identity = $state.identity
+                        error = $_.Exception.Message
+                    })
+                }
             }
         }
-        if ($null -ne $cleanupLease) { $cleanupLease.Dispose() }
+        if ($null -ne $cleanupLease) {
+            try { $cleanupLease.Dispose() }
+            catch {
+                $disposeFailures.Add([ordered]@{
+                    kind = 'artifact-cleanup-readiness-lease'
+                    path = $Artifact
+                    error = $_.Exception.Message
+                })
+            }
+        }
+        if ($disposeFailures.Count -ne 0) {
+            $diagnostic = $disposeFailures | ConvertTo-Json -Depth 10 -Compress
+            if ($cohortFailureInFlight) {
+                [Console]::Error.WriteLine(
+                    "NATIVE_FSV[ASTRO_FSV_COHORT_SECONDARY_DISPOSE_FAILED]: $diagnostic"
+                )
+            }
+            else {
+                Fail-Astro 'ASTRO_FSV_COHORT_DISPOSE_FAILED' `
+                    "cohort completed but exact retained-handle disposal failed: $diagnostic" `
+                    'preserve the session and inspect the exact retained owner/handle state'
+            }
+        }
     }
 }
 
