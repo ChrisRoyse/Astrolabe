@@ -1330,15 +1330,15 @@ static void handle_project_health(cbm_http_conn_t *c, const cbm_http_req_t *req)
         return;
     }
 
-    int node_count = cbm_store_count_nodes(store, name);
-    int edge_count = cbm_store_count_edges(store, name);
+    int64_t node_count = cbm_store_count_nodes(store, name);
+    int64_t edge_count = cbm_store_count_edges(store, name);
     cbm_store_close(store);
 
     int64_t size = cbm_file_size(db_path);
 
     cbm_http_replyf(c, 200, g_cors_json,
-                    "{\"status\":\"healthy\",\"nodes\":%d,\"edges\":%d,\"size_bytes\":%lld}",
-                    node_count, edge_count, (long long)size);
+                    "{\"status\":\"healthy\",\"nodes\":%lld,\"edges\":%lld,\"size_bytes\":%lld}",
+                    (long long)node_count, (long long)edge_count, (long long)size);
 }
 
 /* ── Handle GET /api/layout ───────────────────────────────────── */

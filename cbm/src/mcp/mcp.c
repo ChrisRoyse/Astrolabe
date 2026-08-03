@@ -3185,8 +3185,8 @@ static db_project_inspect_status_t build_project_json_entry(cbm_mcp_server_t *sr
         return inspect;
     }
 
-    int nodes = cbm_store_count_nodes(pstore, project_name);
-    int edges = cbm_store_count_edges(pstore, project_name);
+    int64_t nodes = cbm_store_count_nodes(pstore, project_name);
+    int64_t edges = cbm_store_count_edges(pstore, project_name);
     if (nodes < 0 || edges < 0) {
         record_store_query_failure(srv, "", full_path, pstore, CBM_STORE_VERIFY_IO_FAILED,
                                    "source.query_project_details", cbm_store_error(pstore));
@@ -4808,8 +4808,8 @@ static char *handle_index_status(cbm_mcp_server_t *srv, const char *args) {
     yyjson_mut_doc_set_root(doc, root);
 
     if (project) {
-        int nodes = cbm_store_count_nodes(store, project);
-        int edges = cbm_store_count_edges(store, project);
+        int64_t nodes = cbm_store_count_nodes(store, project);
+        int64_t edges = cbm_store_count_edges(store, project);
         yyjson_mut_obj_add_str(doc, root, "project", project);
         yyjson_mut_obj_add_int(doc, root, "nodes", nodes);
         yyjson_mut_obj_add_int(doc, root, "edges", edges);
@@ -5080,8 +5080,8 @@ static char *handle_get_architecture(cbm_mcp_server_t *srv, const char *args) {
                                aspects_strs_count > 0 ? aspects_strs : NULL, aspects_strs_count,
                                &arch);
 
-    int node_count = cbm_store_count_nodes_scoped(store, project, scope_path);
-    int edge_count = cbm_store_count_edges_scoped(store, project, scope_path);
+    int64_t node_count = cbm_store_count_nodes_scoped(store, project, scope_path);
+    int64_t edge_count = cbm_store_count_edges_scoped(store, project, scope_path);
     char norm_path[CBM_SZ_512];
     bool path_scoped = cbm_store_normalize_arch_path(scope_path, norm_path, sizeof(norm_path));
 
@@ -5094,8 +5094,8 @@ static char *handle_get_architecture(cbm_mcp_server_t *srv, const char *args) {
     }
     if (path_scoped) {
         yyjson_mut_obj_add_str(doc, root, "path", norm_path);
-        int root_nodes = cbm_store_count_nodes(store, project);
-        int root_edges = cbm_store_count_edges(store, project);
+        int64_t root_nodes = cbm_store_count_nodes(store, project);
+        int64_t root_edges = cbm_store_count_edges(store, project);
         yyjson_mut_obj_add_int(doc, root, "root_total_nodes", root_nodes);
         yyjson_mut_obj_add_int(doc, root, "root_total_edges", root_edges);
         yyjson_mut_obj_add_int(doc, root, "scoped_total_nodes", node_count);
@@ -6371,8 +6371,8 @@ static char *build_index_success_response(cbm_mcp_server_t *srv, yyjson_mut_doc 
     if (!store) {
         return build_no_store_error(srv, project_name);
     }
-    int nodes = cbm_store_count_nodes(store, project_name);
-    int edges = cbm_store_count_edges(store, project_name);
+    int64_t nodes = cbm_store_count_nodes(store, project_name);
+    int64_t edges = cbm_store_count_edges(store, project_name);
     if (nodes < 0 || edges < 0) {
         record_store_query_failure(srv, project_name, cbm_store_db_path(store), store,
                                    CBM_STORE_VERIFY_IO_FAILED, "source.query_persisted_counts",

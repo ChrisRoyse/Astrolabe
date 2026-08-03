@@ -3350,21 +3350,21 @@ unsafe extern "C" {
     pub fn cbm_store_count_nodes(
         s: *mut cbm_store_t,
         project: *const ::std::os::raw::c_char,
-    ) -> ::std::os::raw::c_int;
+    ) -> i64;
 }
 unsafe extern "C" {
     pub fn cbm_store_count_nodes_scoped(
         s: *mut cbm_store_t,
         project: *const ::std::os::raw::c_char,
         path: *const ::std::os::raw::c_char,
-    ) -> ::std::os::raw::c_int;
+    ) -> i64;
 }
 unsafe extern "C" {
     pub fn cbm_store_count_edges_scoped(
         s: *mut cbm_store_t,
         project: *const ::std::os::raw::c_char,
         path: *const ::std::os::raw::c_char,
-    ) -> ::std::os::raw::c_int;
+    ) -> i64;
 }
 unsafe extern "C" {
     pub fn cbm_store_arch_path_scoped(path: *const ::std::os::raw::c_char) -> bool;
@@ -3456,14 +3456,14 @@ unsafe extern "C" {
     pub fn cbm_store_count_edges(
         s: *mut cbm_store_t,
         project: *const ::std::os::raw::c_char,
-    ) -> ::std::os::raw::c_int;
+    ) -> i64;
 }
 unsafe extern "C" {
     pub fn cbm_store_count_edges_by_type(
         s: *mut cbm_store_t,
         project: *const ::std::os::raw::c_char,
         type_: *const ::std::os::raw::c_char,
-    ) -> ::std::os::raw::c_int;
+    ) -> i64;
 }
 unsafe extern "C" {
     pub fn cbm_store_delete_edges_by_project(
@@ -4043,7 +4043,7 @@ unsafe extern "C" {
     pub fn cbm_store_count_vectors(
         s: *mut cbm_store_t,
         project: *const ::std::os::raw::c_char,
-    ) -> ::std::os::raw::c_int;
+    ) -> i64;
 }
 unsafe extern "C" {
     pub fn cbm_store_exec(

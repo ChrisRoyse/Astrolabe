@@ -396,8 +396,9 @@ static size_t read_metadata_original_size(const char *repo_path) {
 }
 
 /* Write artifact.json metadata. */
-static int write_metadata(const char *repo_path, const char *project_name, int nodes, int edges,
-                          size_t original_size, size_t compressed_size, int compression_level) {
+static int write_metadata(const char *repo_path, const char *project_name, int64_t nodes,
+                          int64_t edges, size_t original_size, size_t compressed_size,
+                          int compression_level) {
     char commit[CBM_SZ_64] = "";
     git_head_hash(repo_path, commit, sizeof(commit));
 
@@ -643,9 +644,12 @@ int cbm_artifact_export(const char *db_path, const char *repo_path, const char *
         return artifact_export_fail("write_artifact", zst_path, ioerr.err, ioerr.err_no);
     }
 
-    /* Get node/edge counts for metadata */
-    int nodes = 0;
-    int edges = 0;
+    /* Get node/edge counts for metadata. 64-bit end to end (#952): these are
+     * physical row cardinalities, and narrowing them here would publish a
+     * wrapped count into the artifact that no consumer could distinguish from a
+     * genuine one. */
+    int64_t nodes = 0;
+    int64_t edges = 0;
     cbm_store_t *count_store = cbm_store_open_path(db_path);
     if (count_store) {
         nodes = cbm_store_count_nodes(count_store, project_name);

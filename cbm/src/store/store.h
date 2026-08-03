@@ -447,11 +447,11 @@ int cbm_store_find_node_ids_by_qns(cbm_store_t *s, const char *project, const ch
                                    int qn_count, int64_t *out_ids);
 
 /* Count nodes in project. Returns count or CBM_STORE_ERR. */
-int cbm_store_count_nodes(cbm_store_t *s, const char *project);
+int64_t cbm_store_count_nodes(cbm_store_t *s, const char *project);
 
-int cbm_store_count_nodes_scoped(cbm_store_t *s, const char *project, const char *path);
+int64_t cbm_store_count_nodes_scoped(cbm_store_t *s, const char *project, const char *path);
 
-int cbm_store_count_edges_scoped(cbm_store_t *s, const char *project, const char *path);
+int64_t cbm_store_count_edges_scoped(cbm_store_t *s, const char *project, const char *path);
 
 /* True when path is a non-empty scope after normalization (issue #604). */
 bool cbm_store_arch_path_scoped(const char *path);
@@ -501,10 +501,10 @@ int cbm_store_find_edges_by_type(cbm_store_t *s, const char *project, const char
                                  cbm_edge_t **out, int *count);
 
 /* Count all edges in project. */
-int cbm_store_count_edges(cbm_store_t *s, const char *project);
+int64_t cbm_store_count_edges(cbm_store_t *s, const char *project);
 
 /* Count edges of given type. */
-int cbm_store_count_edges_by_type(cbm_store_t *s, const char *project, const char *type);
+int64_t cbm_store_count_edges_by_type(cbm_store_t *s, const char *project, const char *type);
 
 /* Delete all edges for a project. */
 int cbm_store_delete_edges_by_project(cbm_store_t *s, const char *project);
@@ -829,7 +829,7 @@ int cbm_store_vector_search(cbm_store_t *s, const char *project, const char **ke
 void cbm_store_free_vector_results(cbm_vector_result_t *results, int count);
 
 /* Count vectors for a project. */
-int cbm_store_count_vectors(cbm_store_t *s, const char *project);
+int64_t cbm_store_count_vectors(cbm_store_t *s, const char *project);
 
 /* Execute an arbitrary SQL statement (pragmas, FTS5 maintenance, etc).
  * Returns CBM_STORE_OK on success. */

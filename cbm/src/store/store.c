@@ -4072,11 +4072,19 @@ int cbm_store_find_nodes_by_file(cbm_store_t *s, const char *project, const char
 /* A cached COUNT statement reaches SQLITE_ROW, not SQLITE_DONE.  Reset it
  * before returning so the connection releases its read transaction instead of
  * retaining a table lock until the next invocation or store destruction. */
-static int finish_cached_count(cbm_store_t *s, sqlite3_stmt *stmt, int step_rc,
-                               const char *operation) {
-    int result = CBM_STORE_ERR;
+/* Exact 64-bit count contract (#952). SQLite computes COUNT(*) as a signed
+ * 64-bit integer; narrowing it through sqlite3_column_int wrapped every public
+ * node/edge count at the signed 32-bit boundary, and a wrapped value is
+ * indistinguishable from a valid small one to every downstream consumer
+ * (artifact export/import equality, fleet reporting, MCP statistics,
+ * plausibility gates, kernel telemetry). CBM_STORE_ERR (-1) remains the sole
+ * failure sentinel, which stays unambiguous because a physical row count is
+ * never negative. */
+static int64_t finish_cached_count(cbm_store_t *s, sqlite3_stmt *stmt, int step_rc,
+                                   const char *operation) {
+    int64_t result = CBM_STORE_ERR;
     if (step_rc == SQLITE_ROW) {
-        result = sqlite3_column_int(stmt, 0);
+        result = sqlite3_column_int64(stmt, 0);
     } else {
         store_set_error_sqlite(s, operation);
     }
@@ -4089,7 +4097,7 @@ static int finish_cached_count(cbm_store_t *s, sqlite3_stmt *stmt, int step_rc,
     return result;
 }
 
-int cbm_store_count_nodes(cbm_store_t *s, const char *project) {
+int64_t cbm_store_count_nodes(cbm_store_t *s, const char *project) {
     if (!s || !s->db) {
         return 0;
     }
@@ -4345,7 +4353,7 @@ int cbm_store_find_edges_by_type(cbm_store_t *s, const char *project, const char
                               bind_proj_and_type, &b, out, count);
 }
 
-int cbm_store_count_edges(cbm_store_t *s, const char *project) {
+int64_t cbm_store_count_edges(cbm_store_t *s, const char *project) {
     if (!s || !s->db) {
         return 0;
     }
@@ -4359,7 +4367,7 @@ int cbm_store_count_edges(cbm_store_t *s, const char *project) {
     return finish_cached_count(s, stmt, sqlite3_step(stmt), "count_edges.step_or_reset");
 }
 
-int cbm_store_count_edges_by_type(cbm_store_t *s, const char *project, const char *type) {
+int64_t cbm_store_count_edges_by_type(cbm_store_t *s, const char *project, const char *type) {
     sqlite3_stmt *stmt =
         prepare_cached(s, &s->stmt_count_edges_by_type,
                        "SELECT COUNT(*) FROM edges WHERE project = ?1 AND type = ?2;");
@@ -6111,7 +6119,7 @@ bool cbm_store_normalize_arch_path(const char *path, char *norm_out, size_t norm
     return arch_path_prepare(path, norm_out, norm_sz, like, sizeof(like));
 }
 
-int cbm_store_count_nodes_scoped(cbm_store_t *s, const char *project, const char *path) {
+int64_t cbm_store_count_nodes_scoped(cbm_store_t *s, const char *project, const char *path) {
     if (!s || !s->db || !project) {
         return 0;
     }
@@ -6139,7 +6147,7 @@ int cbm_store_count_nodes_scoped(cbm_store_t *s, const char *project, const char
     return n;
 }
 
-int cbm_store_count_edges_scoped(cbm_store_t *s, const char *project, const char *path) {
+int64_t cbm_store_count_edges_scoped(cbm_store_t *s, const char *project, const char *path) {
     if (!s || !s->db || !project) {
         return 0;
     }
@@ -9719,7 +9727,7 @@ void cbm_store_free_file_hashes(cbm_file_hash_t *hashes, int count) {
 
 /* ── Vector search ────────────────────────��──────────────────────── */
 
-int cbm_store_count_vectors(cbm_store_t *s, const char *project) {
+int64_t cbm_store_count_vectors(cbm_store_t *s, const char *project) {
     if (!s || !project) {
         return 0;
     }

@@ -1143,8 +1143,8 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
     if (snapshot_noop && !cbm_pipeline_row_sink_active(p)) {
         cbm_pipeline_phase_probe_t noop_probe =
             cbm_pipeline_phase_probe_start(p, "incr_noop_finalize");
-        int committed_nodes = cbm_store_count_nodes(store, project);
-        int committed_edges = cbm_store_count_edges(store, project);
+        int64_t committed_nodes = cbm_store_count_nodes(store, project);
+        int64_t committed_edges = cbm_store_count_edges(store, project);
         if (committed_nodes < 0 || committed_edges < 0) {
             cbm_log_error(
                 "incremental.noop_failed", "code", "CBM_INCREMENTAL_NOOP_COUNTS_READ_FAILED",

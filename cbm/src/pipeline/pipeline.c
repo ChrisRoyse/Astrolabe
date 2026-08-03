@@ -2367,8 +2367,8 @@ static int try_unchanged_before_snapshot(cbm_pipeline_t *p, const cbm_discover_o
 
     cbm_pipeline_phase_probe_t finish_probe =
         cbm_pipeline_phase_probe_start(p, "unchanged_result_readback");
-    int committed_nodes = cbm_store_count_nodes(store, p->project_name);
-    int committed_edges = cbm_store_count_edges(store, p->project_name);
+    int64_t committed_nodes = cbm_store_count_nodes(store, p->project_name);
+    int64_t committed_edges = cbm_store_count_edges(store, p->project_name);
     if (committed_nodes < 0 || committed_edges < 0) {
         const char *detail = cbm_store_error(store);
         cbm_pipeline_record_fatal_error(
