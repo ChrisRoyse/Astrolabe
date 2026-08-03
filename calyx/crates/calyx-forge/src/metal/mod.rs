@@ -60,6 +60,14 @@ const ROWS_PER_THREADGROUP: NSUInteger = 8;
 /// Tile edge for the blocked GEMM. Must equal `GEMM_TILE` in `kernels.metal`.
 const GEMM_TILE: NSUInteger = 16;
 
+/// Output tile edge for the simdgroup GEMM. Must equal `SG_TILE` in
+/// `kernels.metal`.
+const SG_TILE: NSUInteger = 32;
+
+/// Threads per threadgroup for the simdgroup GEMM: 4 SIMD groups of 32 lanes,
+/// laid out 2x2 over the 32x32 output tile. Must equal `SG_THREADS`.
+const SG_THREADS: NSUInteger = 128;
+
 const KERNEL_SOURCE: &str = include_str!("kernels.metal");
 
 fn gpu_error(detail: impl Into<String>, remediation: impl Into<String>) -> ForgeError {
@@ -73,6 +81,7 @@ fn gpu_error(detail: impl Into<String>, remediation: impl Into<String>) -> Forge
 /// construction-time failure rather than a surprise mid-workload.
 struct Pipelines {
     gemm: ComputePipelineState,
+    gemm_simdgroup: ComputePipelineState,
     dot: ComputePipelineState,
     l2: ComputePipelineState,
     cosine_parts: ComputePipelineState,
@@ -135,6 +144,7 @@ impl MetalBackend {
 
         let pipelines = Pipelines {
             gemm: pipeline("gemm_f32")?,
+            gemm_simdgroup: pipeline("gemm_f32_simdgroup")?,
             dot: pipeline("dot_batch")?,
             l2: pipeline("l2_batch")?,
             cosine_parts: pipeline("cosine_parts")?,
@@ -234,8 +244,15 @@ impl MetalBackend {
     }
 }
 
-impl Backend for MetalBackend {
-    fn gemm(
+impl MetalBackend {
+    /// The original one-output-element-per-thread tiled GEMM (`gemm_f32`).
+    ///
+    /// Superseded by the simdgroup kernel for real work, but retained and kept
+    /// public so #945's improvement is measured against it **in the same
+    /// process, on the same device, through the same buffer path** — rather
+    /// than against a throughput number recorded on some earlier run. A
+    /// speedup claim that compares across processes is not evidence.
+    pub fn gemm_naive(
         &self,
         a: &[f32],
         b: &[f32],
@@ -243,6 +260,19 @@ impl Backend for MetalBackend {
         k: usize,
         n: usize,
         out: &mut [f32],
+    ) -> Result<()> {
+        self.gemm_impl(a, b, m, k, n, out, false)
+    }
+
+    fn gemm_impl(
+        &self,
+        a: &[f32],
+        b: &[f32],
+        m: usize,
+        k: usize,
+        n: usize,
+        out: &mut [f32],
+        simdgroup: bool,
     ) -> Result<()> {
         check_shape_2d(a, m, k, "gemm a")?;
         check_shape_2d(b, k, n, "gemm b")?;
@@ -258,14 +288,28 @@ impl Backend for MetalBackend {
         let a_buf = self.buffer_from(a)?;
         let b_buf = self.buffer_from(b)?;
         let out_buf = self.buffer_zeroed(m * n)?;
+
+        let dim_u32 = |v: usize, what: &str| -> Result<u32> {
+            u32::try_from(v).map_err(|_| {
+                gpu_error(format!("gemm {what} exceeds u32"), "reduce the dimension")
+            })
+        };
+        let (mu, ku, nu) = (dim_u32(m, "m")?, dim_u32(k, "k")?, dim_u32(n, "n")?);
+
         // 4 elements, not 3: MSL uint3 occupies 16 bytes, so uploading 12 would
-        // leave the kernel reading n from past the end of the buffer.
-        let dims: [u32; 4] = [
-            u32::try_from(m).map_err(|_| gpu_error("gemm m exceeds u32", "reduce batch size"))?,
-            u32::try_from(k).map_err(|_| gpu_error("gemm k exceeds u32", "reduce dimension"))?,
-            u32::try_from(n).map_err(|_| gpu_error("gemm n exceeds u32", "reduce batch size"))?,
-            0,
-        ];
+        // leave the kernel reading the last dimension from past the buffer.
+        //
+        // The simdgroup kernel is row-major while Forge's contract is
+        // column-major. Those are the same problem with the operands swapped:
+        // passing (b, a) as (A', B') with dims (n, k, m) makes a row-major
+        // C'[n][m] = A'[n][k] * B'[k][m] compute exactly the column-major
+        // out[m][n] = A[m][k] * B[k][n]. See the header comment on
+        // gemm_f32_simdgroup. No transpose, no strided loads.
+        let dims: [u32; 4] = if simdgroup {
+            [nu, ku, mu, 0]
+        } else {
+            [mu, ku, nu, 0]
+        };
 
         {
             let queue = self.queue.lock().map_err(|_| {
@@ -273,21 +317,37 @@ impl Backend for MetalBackend {
             })?;
             let command = queue.new_command_buffer();
             let encoder = command.new_compute_command_encoder();
-            encoder.set_compute_pipeline_state(&self.pipelines.gemm);
-            encoder.set_buffer(0, Some(&a_buf), 0);
-            encoder.set_buffer(1, Some(&b_buf), 0);
+            if simdgroup {
+                encoder.set_compute_pipeline_state(&self.pipelines.gemm_simdgroup);
+                encoder.set_buffer(0, Some(&b_buf), 0);
+                encoder.set_buffer(1, Some(&a_buf), 0);
+            } else {
+                encoder.set_compute_pipeline_state(&self.pipelines.gemm);
+                encoder.set_buffer(0, Some(&a_buf), 0);
+                encoder.set_buffer(1, Some(&b_buf), 0);
+            }
             encoder.set_buffer(2, Some(&out_buf), 0);
             encoder.set_bytes(
                 3,
                 std::mem::size_of_val(&dims) as NSUInteger,
                 dims.as_ptr().cast(),
             );
-            let groups_x = (n as NSUInteger).div_ceil(GEMM_TILE);
-            let groups_y = (m as NSUInteger).div_ceil(GEMM_TILE);
-            encoder.dispatch_thread_groups(
-                MTLSize::new(groups_x, groups_y, 1),
-                MTLSize::new(GEMM_TILE, GEMM_TILE, 1),
-            );
+            if simdgroup {
+                // Grid is over the SWAPPED problem: x spans N' = m, y spans M' = n.
+                let groups_x = (m as NSUInteger).div_ceil(SG_TILE);
+                let groups_y = (n as NSUInteger).div_ceil(SG_TILE);
+                encoder.dispatch_thread_groups(
+                    MTLSize::new(groups_x, groups_y, 1),
+                    MTLSize::new(SG_THREADS, 1, 1),
+                );
+            } else {
+                let groups_x = (n as NSUInteger).div_ceil(GEMM_TILE);
+                let groups_y = (m as NSUInteger).div_ceil(GEMM_TILE);
+                encoder.dispatch_thread_groups(
+                    MTLSize::new(groups_x, groups_y, 1),
+                    MTLSize::new(GEMM_TILE, GEMM_TILE, 1),
+                );
+            }
             encoder.end_encoding();
             command.commit();
             command.wait_until_completed();
@@ -295,6 +355,20 @@ impl Backend for MetalBackend {
 
         out.copy_from_slice(&Self::read_back(&out_buf, m * n));
         Ok(())
+    }
+}
+
+impl Backend for MetalBackend {
+    fn gemm(
+        &self,
+        a: &[f32],
+        b: &[f32],
+        m: usize,
+        k: usize,
+        n: usize,
+        out: &mut [f32],
+    ) -> Result<()> {
+        self.gemm_impl(a, b, m, k, n, out, true)
     }
 
     fn cosine(&self, a: &[f32], b: &[f32], dim: usize, out: &mut [f32]) -> Result<()> {
