@@ -2790,6 +2790,7 @@ pub struct CbmStoreNormalization {
     pub wal_remaining_frames: i32,
     pub operation: String,
     pub detail: String,
+    pub sqlite_owned_empty_wal_created: bool,
     pub close_connection_destroyed: bool,
     pub close_db_path: String,
 }
@@ -2962,6 +2963,7 @@ pub fn normalize_existing_project_store(
         wal_remaining_frames: normalization.wal_remaining_frames,
         operation: fixed_c_string(&normalization.operation),
         detail: fixed_c_string(&normalization.detail),
+        sqlite_owned_empty_wal_created: verification.sqlite_owned_empty_wal_created,
         close_connection_destroyed: close.connection_destroyed != 0,
         close_db_path: fixed_c_string(&close.db_path),
     })

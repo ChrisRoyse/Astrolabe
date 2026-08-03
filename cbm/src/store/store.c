@@ -2552,10 +2552,33 @@ static bool store_writer_phase_operation(char operation[CBM_STORE_VERIFY_OPERATI
     return true;
 }
 
+typedef enum {
+    STORE_WRITER_BIND_PRE_SQL = 1,
+    STORE_WRITER_BIND_POST_EXCLUSIVE_COMMIT = 2,
+} store_writer_bind_phase_t;
+
+static const char *store_writer_bind_phase_name(store_writer_bind_phase_t phase,
+                                                 cbm_store_verify_result_t *result) {
+    switch (phase) {
+    case STORE_WRITER_BIND_PRE_SQL:
+        return "pre_sql";
+    case STORE_WRITER_BIND_POST_EXCLUSIVE_COMMIT:
+        return "post_exclusive_commit";
+    default:
+        store_verify_set_error(result, CBM_STORE_VERIFY_IO_FAILED,
+                               "source.writer.bind_phase", ERROR_INVALID_PARAMETER,
+                               SQLITE_MISUSE, "writer generation comparison phase is invalid");
+        return NULL;
+    }
+}
+
 static bool store_writer_matches_preflight(const char *db_path,
                                            const cbm_store_verify_result_t *expected,
                                            cbm_store_verify_result_t *result,
-                                           const char *phase) {
+                                           store_writer_bind_phase_t bind_phase,
+                                           const char *journal_mode) {
+    static const char EMPTY_SHA256[] =
+        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
     char operation[CBM_STORE_VERIFY_OPERATION_MAX];
     result->db_present = false;
     result->db_bytes = 0;
@@ -2567,11 +2590,18 @@ static bool store_writer_matches_preflight(const char *db_path,
     result->sqlite_error = SQLITE_OK;
     result->operation[0] = '\0';
     result->detail[0] = '\0';
+    result->sqlite_owned_empty_wal_created = false;
+    const char *phase = store_writer_bind_phase_name(bind_phase, result);
+    if (!phase) {
+        return false;
+    }
     if (!expected || expected->status != CBM_STORE_VERIFY_OK || !expected->db_present ||
         !expected->family_frozen || !expected->family_guard_release_complete ||
         expected->db_bytes == 0 || strlen(expected->db_sha256) != CBM_SHA256_HEX_LEN ||
         (expected->wal_present &&
-         strlen(expected->wal_sha256) != CBM_SHA256_HEX_LEN)) {
+         strlen(expected->wal_sha256) != CBM_SHA256_HEX_LEN) ||
+        (!expected->wal_present &&
+         (expected->wal_bytes != 0 || expected->wal_sha256[0] != '\0'))) {
         if (!store_writer_phase_operation(operation, phase, "family", "validate", result)) {
             return false;
         }
@@ -2703,8 +2733,13 @@ static bool store_writer_matches_preflight(const char *db_path,
     }
     result->wal_bytes = wal_bytes;
     snprintf(result->wal_sha256, sizeof(result->wal_sha256), "%s", wal_sha256);
-    if (!expected->wal_present || wal_bytes != expected->wal_bytes ||
-        strcmp(wal_sha256, expected->wal_sha256) != 0) {
+    bool sqlite_owned_empty_wal =
+        bind_phase == STORE_WRITER_BIND_POST_EXCLUSIVE_COMMIT && !expected->wal_present &&
+        wal_present && wal_bytes == 0 && strcmp(wal_sha256, EMPTY_SHA256) == 0 && journal_mode &&
+        strcmp(journal_mode, "wal") == 0;
+    if ((!expected->wal_present || wal_bytes != expected->wal_bytes ||
+         strcmp(wal_sha256, expected->wal_sha256) != 0) &&
+        !sqlite_owned_empty_wal) {
         char detail[CBM_STORE_VERIFY_DETAIL_MAX];
         snprintf(detail, sizeof(detail),
                  "expected_present=%d expected_bytes=%llu expected_sha256=%s "
@@ -2718,6 +2753,17 @@ static bool store_writer_matches_preflight(const char *db_path,
         store_verify_set_error(result, CBM_STORE_VERIFY_INTEGRITY_FAILED, operation, ERROR_CRC,
                                SQLITE_MISMATCH, detail);
         return false;
+    }
+    if (sqlite_owned_empty_wal) {
+        if (!store_writer_phase_operation(operation, phase, "wal", "empty_wal_created", result)) {
+            return false;
+        }
+        result->sqlite_owned_empty_wal_created = true;
+        snprintf(result->operation, sizeof(result->operation), "%s", operation);
+        snprintf(result->detail, sizeof(result->detail),
+                 "expected_present=0 observed_present=1 observed_bytes=0 "
+                 "observed_sha256=%s journal_mode=wal equivalence=sqlite_owned_empty_wal_created",
+                 wal_sha256);
     }
     return true;
 }
@@ -3751,7 +3797,8 @@ static cbm_store_verify_status_t store_open_path_project_writer_existing_interna
      * point so mismatch refusal cannot create SHM, checkpoint, or otherwise
      * touch the replacement family. */
     if (expected_family &&
-        !store_writer_matches_preflight(db_path, expected_family, result, "pre_sql")) {
+        !store_writer_matches_preflight(db_path, expected_family, result,
+                                        STORE_WRITER_BIND_PRE_SQL, NULL)) {
         store_log_open_failure(db_path, result->operation, writer->db, result->sqlite_error,
                                result->detail);
         store_writer_close_after_failure(&writer, out_store, result,
@@ -3839,12 +3886,31 @@ static cbm_store_verify_status_t store_open_path_project_writer_existing_interna
     sqlite3_free(lock_errmsg);
 
 #ifdef _WIN32
+    char post_lock_journal_mode[CBM_STORE_NORMALIZE_MODE_MAX];
+    rc = store_read_journal_mode_exact(writer->db, "PRAGMA main.journal_mode;",
+                                       "source.writer.post_lock_journal_mode",
+                                       post_lock_journal_mode, lock_operation, lock_detail);
+    if (rc != SQLITE_OK) {
+        store_verify_set_error(result, CBM_STORE_VERIFY_IO_FAILED, lock_operation, 0, rc,
+                               lock_detail);
+        store_log_open_failure(db_path, result->operation, writer->db, result->sqlite_error,
+                               result->detail);
+        store_writer_close_after_failure(
+            &writer, out_store, result,
+            "source.writer.sqlite_close_after_post_lock_journal_mode");
+        return result->status;
+    }
     /* Close the comparison-to-lock race as a second, independent generation
      * readback.  The pre-lock comparison rejects an already-replaced family
      * before SQLite executes SQL; this post-lock comparison proves the bytes
-     * accepted for normalization are still the frozen preflight generation. */
+     * accepted for normalization are still the frozen preflight generation.
+     * SQLite may create one empty WAL after the strict pre-SQL bind when the
+     * persistent database header selects WAL mode.  That zero-frame namespace
+     * object is accepted only here, only in exact WAL mode, and only while the
+     * DB bytes remain identical. */
     if (expected_family && !store_writer_matches_preflight(db_path, expected_family, result,
-                                                           "post_exclusive_commit")) {
+                                                           STORE_WRITER_BIND_POST_EXCLUSIVE_COMMIT,
+                                                           post_lock_journal_mode)) {
         store_log_open_failure(db_path, result->operation, writer->db, result->sqlite_error,
                                result->detail);
         store_writer_close_after_failure(

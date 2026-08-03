@@ -590,6 +590,7 @@ impl<'a> ProjectIndexTransition<'a> {
             "wal_remaining_frames": normalized.wal_remaining_frames,
             "operation": normalized.operation,
             "detail": normalized.detail,
+            "sqlite_owned_empty_wal_created": normalized.sqlite_owned_empty_wal_created,
             "close_connection_destroyed": normalized.close_connection_destroyed,
             "close_db_path": normalized.close_db_path,
         });

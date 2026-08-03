@@ -2125,6 +2125,7 @@ pub struct cbm_store_verify_result_t {
     pub family_guard_release_complete: bool,
     pub scratch_created: bool,
     pub scratch_cleanup_complete: bool,
+    pub sqlite_owned_empty_wal_created: bool,
     pub cleanup_native_error: u32,
     pub db_bytes: u64,
     pub db_sha256: [::std::os::raw::c_char; 65usize],

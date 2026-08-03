@@ -128,6 +128,7 @@ typedef struct {
     bool family_guard_release_complete;
     bool scratch_created;
     bool scratch_cleanup_complete;
+    bool sqlite_owned_empty_wal_created;
     uint32_t cleanup_native_error;
     uint64_t db_bytes;
     char db_sha256[65];
