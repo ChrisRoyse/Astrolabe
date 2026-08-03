@@ -69,6 +69,55 @@ CBMLogFormat cbm_log_get_format(void);
  */
 void cbm_log(CBMLogLevel level, const char *msg, ...);
 
+/* ── First-error capture (#943) ───────────────────────────────────────────
+ *
+ * Passes log a fully structured {code, operation, message, remediation} and
+ * then return a bare failure code. Where the caller has no pipeline handle to
+ * record against -- cbm_pipeline_import_map_build being the case that motivated
+ * this -- the specific cause reached ONLY the log, and the tool response
+ * degraded to a generic "the authoritative indexing pipeline failed" with the
+ * real reason buried in a worker log. That turned one-line defects into
+ * multi-hour investigations.
+ *
+ * Capturing the FIRST error line at this funnel covers every such site at once,
+ * including sites in passes that cannot reach a pipeline handle and sites added
+ * later, instead of requiring each one to remember to record itself. Capture
+ * runs inside the existing log mutex, so it is safe from the parallel resolve
+ * workers.
+ *
+ * FIRST, not last, deliberately: later errors are usually consequences of the
+ * first (a refused edge cascades into a failed dump into a failed persist), and
+ * the root cause is what the caller needs.
+ *
+ * This is a diagnostic fallback, never a substitute for an explicit
+ * cbm_pipeline_record_fatal_error: it must only be consulted on a path that has
+ * already established the run failed. A captured error on a run that ultimately
+ * succeeded is a recovered condition, not a failure. */
+/* Object-like macros, not an enum: a new anonymous enum in this header would
+ * renumber every bindgen `_bindgen_ty_N` in the committed FFI bindings, turning
+ * a two-field addition into a churn diff across unrelated constants. */
+#define CBM_LOG_ERR_CODE_MAX 128
+#define CBM_LOG_ERR_TEXT_MAX 512
+
+typedef struct {
+    bool present;
+    char code[CBM_LOG_ERR_CODE_MAX];
+    char operation[CBM_LOG_ERR_CODE_MAX];
+    char file[CBM_LOG_ERR_TEXT_MAX];
+    char message[CBM_LOG_ERR_TEXT_MAX];
+    char remediation[CBM_LOG_ERR_TEXT_MAX];
+} cbm_log_first_error_t;
+
+/* Clear and arm capture for a run. Call once at the start of the operation
+ * whose failure you intend to attribute. */
+void cbm_log_first_error_arm(void);
+
+/* Stop capturing. Leaves any captured value readable. */
+void cbm_log_first_error_disarm(void);
+
+/* Copy out the captured error. Returns false when nothing was captured. */
+bool cbm_log_first_error_get(cbm_log_first_error_t *out);
+
 /* Convenience macros. */
 #define cbm_log_debug(msg, ...) cbm_log(CBM_LOG_DEBUG, msg, ##__VA_ARGS__, NULL)
 #define cbm_log_info(msg, ...) cbm_log(CBM_LOG_INFO, msg, ##__VA_ARGS__, NULL)

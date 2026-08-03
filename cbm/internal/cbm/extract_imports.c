@@ -49,6 +49,10 @@ static void parse_tcl_imports(CBMExtractCtx *ctx);
 static void parse_teal_imports(CBMExtractCtx *ctx);
 static void parse_zsh_imports(CBMExtractCtx *ctx);
 static void parse_css_imports(CBMExtractCtx *ctx);
+/* Scan source bytes AFTER `url_node` for an `as <name>` clause, so an " as "
+ * inside the URL itself cannot be misread. Shared by Sass @use and Dart
+ * import/export, which spell the alias identically. */
+static const char *import_alias_after_url(CBMExtractCtx *ctx, TSNode stmt, TSNode url_node);
 static void parse_html_imports(CBMExtractCtx *ctx);
 static void parse_cmake_imports(CBMExtractCtx *ctx);
 static void parse_bitbake_imports(CBMExtractCtx *ctx);
@@ -1246,7 +1250,29 @@ static void parse_dart_imports(CBMExtractCtx *ctx) {
         if (find_first_descendant_of(node, "string_literal", &uri)) {
             char *path = strip_quotes(a, cbm_node_text(a, uri, ctx->source));
             if (path && path[0]) {
-                CBMImport imp = {.local_name = path_last(a, path), .module_path = path};
+                /* Only `import '<uri>' as <prefix>` binds a name (#941). A plain
+                 * import merges the library's public names directly into scope,
+                 * `show`/`hide` narrow that set without introducing a prefix, and
+                 * `export` re-exports without binding anything here. Deriving a
+                 * name from the specifier was wrong for all of them, and
+                 * path_last returns the EXTENSION for a file path, so every
+                 * "*.dart" import collapsed to the single local name "dart" and
+                 * two relative imports in one file aborted the whole pipeline. */
+                const char *directive = cbm_node_text(a, node, ctx->source);
+                const bool is_export =
+                    directive && strncmp(directive, "export", sizeof("export") - SKIP_ONE) == 0;
+                const char *prefix =
+                    is_export ? NULL : import_alias_after_url(ctx, node, uri);
+                CBMImport imp = {.module_path = path};
+                /* `as _` is specified as non-binding: it grants access to the
+                 * library's non-private extensions without introducing a name. */
+                if (prefix && prefix[0] && strcmp(prefix, "_") != 0) {
+                    imp.binding = CBM_IMPORT_BINDING_LOCAL;
+                    imp.local_name = prefix;
+                } else {
+                    imp.binding = CBM_IMPORT_BINDING_UNBOUND;
+                    imp.dependency_kind = is_export ? "dart_export" : "dart_import";
+                }
                 if (!cbm_imports_push(&ctx->result->imports, a, imp)) {
                     return;
                 }
@@ -1291,6 +1317,38 @@ static void parse_haskell_imports(CBMExtractCtx *ctx) {
 // nested inside a variable_declaration, NOT a root child. The old dispatch scanned
 // root for "builtin_function" -> 0. DFS the whole tree for builtin_function nodes
 // whose text starts with @import/@cImport and take their first string argument.
+/* The name a Zig @import binds, or NULL when it binds none (#942).
+ *
+ * @import is an EXPRESSION returning a struct; the name comes from the
+ * enclosing declaration -- `const std = @import("std");` binds `std`. Taking it
+ * from the specifier is wrong twice: it ignores the actual binder, and
+ * path_last treats '.' as a module separator, so @import("foo.zig") returned
+ * the extension "zig". Two relative imports in one file therefore became one
+ * ambiguous local name and aborted the entire corpus. Package imports
+ * (@import("std")) carry no extension, which is why this went unnoticed. */
+static const char *zig_binding_name(CBMExtractCtx *ctx, TSNode call) {
+    for (TSNode p = ts_node_parent(call); !ts_node_is_null(p); p = ts_node_parent(p)) {
+        const char *kind = ts_node_type(p);
+        if (strcmp(kind, "variable_declaration") == 0 || strcmp(kind, "VarDecl") == 0) {
+            uint32_t nc = ts_node_named_child_count(p);
+            for (uint32_t i = 0; i < nc; i++) {
+                TSNode child = ts_node_named_child(p, i);
+                if (strcmp(ts_node_type(child), "identifier") == 0) {
+                    return cbm_node_text(ctx->arena, child, ctx->source);
+                }
+            }
+            return NULL;
+        }
+        /* An @import in a call argument or a plain expression statement binds
+         * nothing; stop rather than attributing it to an outer declaration. */
+        if (strcmp(kind, "source_file") == 0 || strcmp(kind, "function_declaration") == 0 ||
+            strcmp(kind, "FnDecl") == 0) {
+            return NULL;
+        }
+    }
+    return NULL;
+}
+
 static void parse_zig_imports(CBMExtractCtx *ctx) {
     CBMArena *a = ctx->arena;
     TSNodeStack stack;
@@ -1306,7 +1364,15 @@ static void parse_zig_imports(CBMExtractCtx *ctx) {
                 if (find_first_descendant_of(node, "string", &str)) {
                     char *path = strip_quotes(a, cbm_node_text(a, str, ctx->source));
                     if (path && path[0]) {
-                        CBMImport imp = {.local_name = path_last(a, path), .module_path = path};
+                        const char *bound = zig_binding_name(ctx, node);
+                        CBMImport imp = {.module_path = path};
+                        if (bound && bound[0] && strcmp(bound, "_") != 0) {
+                            imp.binding = CBM_IMPORT_BINDING_LOCAL;
+                            imp.local_name = bound;
+                        } else {
+                            imp.binding = CBM_IMPORT_BINDING_UNBOUND;
+                            imp.dependency_kind = "zig_import";
+                        }
                         if (!cbm_imports_push(&ctx->result->imports, a, imp)) {
                             return;
                         }
@@ -2531,6 +2597,90 @@ static void parse_zsh_imports(CBMExtractCtx *ctx) {
 // carry a `string_value` (whose `string_content` is the unquoted path). The
 // generic text fallback mangled these (kept the surrounding quotes), so the
 // resolver couldn't match the target file. Extract the clean string content.
+//
+// Binding semantics differ per at-rule and are not interchangeable:
+//   @import  (CSS and Sass) loads a stylesheet into the global scope. It has no
+//            alias syntax and introduces no namespace, so it binds no local name.
+//   @forward (Sass) re-exports another module's members and, unlike @use, adds
+//            no namespace of its own — so it binds no local name either.
+//   @use     (Sass) is the only stylesheet load that binds a name. Its default
+//            namespace is the URL's last component *without* the file extension,
+//            overridable with `as <alias>`; `as *` binds no namespace at all.
+// The two non-binding forms must therefore extract as document resources.
+// Deriving a local name from the specifier instead is wrong for every one of
+// them: path_last treats '.' as a module separator (correct for `java.util.List`
+// → "List"), so every "*.css" specifier collapsed to the local name "css". Two
+// stylesheet imports in one file then became one ambiguous local name, and the
+// import-map dedup aborted the entire pipeline with
+// CBM_IMPORT_LOCAL_NAME_AMBIGUOUS — a fatal index failure for any stylesheet
+// carrying more than one relative @import.
+
+// Sass module namespace for a @use URL: the final path component with a leading
+// partial underscore and the file extension removed ("ui/_theme.scss" → "theme",
+// "tokens" → "tokens"). Returns NULL when nothing nameable remains.
+static const char *scss_use_namespace(CBMArena *a, const char *path) {
+    const char *base = file_path_last(path);
+    if (!base || !base[0]) {
+        return NULL;
+    }
+    if (base[0] == '_') {
+        base++;
+    }
+    size_t len = strlen(base);
+    for (size_t i = len; i > 0; i--) {
+        if (base[i - SKIP_ONE] == '.') {
+            len = i - SKIP_ONE;
+            break;
+        }
+    }
+    if (len == 0) {
+        return NULL;
+    }
+    return cbm_arena_strndup(a, base, len);
+}
+
+// Explicit `@use "<url>" as <alias>` namespace, scanned from the source bytes
+// after the URL node so an " as " inside the URL itself cannot be misread.
+// Writes "*" for `as *` (loads members with no namespace). Returns NULL when the
+// statement carries no `as` clause.
+static const char *import_alias_after_url(CBMExtractCtx *ctx, TSNode stmt, TSNode url_node) {
+    uint32_t p = ts_node_end_byte(url_node);
+    uint32_t end = ts_node_end_byte(stmt);
+    if (end > (uint32_t)ctx->source_len) {
+        end = (uint32_t)ctx->source_len;
+    }
+    while (p < end) {
+        while (p < end && (ctx->source[p] == ' ' || ctx->source[p] == '\t' ||
+                           ctx->source[p] == '\n' || ctx->source[p] == '\r')) {
+            p++;
+        }
+        uint32_t tok = p;
+        while (p < end && ctx->source[p] != ' ' && ctx->source[p] != '\t' &&
+               ctx->source[p] != '\n' && ctx->source[p] != '\r' && ctx->source[p] != ';') {
+            p++;
+        }
+        if (p == tok) {
+            break;
+        }
+        if (p - tok == sizeof("as") - SKIP_ONE && ctx->source[tok] == 'a' &&
+            ctx->source[tok + SKIP_ONE] == 's') {
+            while (p < end && (ctx->source[p] == ' ' || ctx->source[p] == '\t')) {
+                p++;
+            }
+            uint32_t alias = p;
+            while (p < end && ctx->source[p] != ' ' && ctx->source[p] != '\t' &&
+                   ctx->source[p] != '\n' && ctx->source[p] != '\r' && ctx->source[p] != ';') {
+                p++;
+            }
+            if (p == alias) {
+                return NULL;
+            }
+            return cbm_arena_strndup(ctx->arena, ctx->source + alias, p - alias);
+        }
+    }
+    return NULL;
+}
+
 static void css_push_import_from_stmt(CBMExtractCtx *ctx, TSNode stmt) {
     CBMArena *a = ctx->arena;
     TSNode sv = stmt;
@@ -2552,7 +2702,33 @@ static void css_push_import_from_stmt(CBMExtractCtx *ctx, TSNode stmt) {
     if (!path || !path[0]) {
         return;
     }
-    CBMImport imp = {.local_name = path_last(a, path), .module_path = path};
+
+    CBMImport imp = {.module_path = path};
+    if (strcmp(ts_node_type(stmt), "use_statement") == 0) {
+        /* Sass @use — the one stylesheet load that binds a name. */
+        const char *ns = import_alias_after_url(ctx, stmt, sv);
+        if (ns && strcmp(ns, "*") == 0) {
+            /* `as *` loads members into the current scope under no namespace:
+             * a real code dependency that binds no single resolvable name. */
+            imp.binding = CBM_IMPORT_BINDING_UNBOUND;
+            imp.dependency_kind = "scss_use";
+        } else {
+            if (!ns) {
+                ns = scss_use_namespace(a, path);
+            }
+            if (!ns || !ns[0]) {
+                imp.binding = CBM_IMPORT_BINDING_UNBOUND;
+                imp.dependency_kind = "scss_use";
+            } else {
+                imp.binding = CBM_IMPORT_BINDING_LOCAL;
+                imp.local_name = ns;
+            }
+        }
+    } else {
+        /* @import / @forward — a stylesheet dependency that binds no name. */
+        imp.binding = CBM_IMPORT_BINDING_RESOURCE;
+        imp.resource_kind = ctx->language == CBM_LANG_SCSS ? "scss" : "css";
+    }
     if (!cbm_imports_push(&ctx->result->imports, a, imp)) {
         return;
     }

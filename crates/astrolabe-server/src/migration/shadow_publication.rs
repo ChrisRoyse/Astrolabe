@@ -969,11 +969,51 @@ impl ShadowPublication {
         Ok(outcome)
     }
 
-    fn seed_stage(&self) -> Result<Option<SeedLowerRepair>, DynError> {
-        let live_config = self.live_cache.join("_config.db");
-        if live_config.exists() {
-            sqlite_snapshot(&live_config, &self.stage_cache.join("_config.db"))?;
+    /// Seed the staged config store with THIS project's rows only (#951).
+    ///
+    /// `_config.db` is shared by every project, and this used to snapshot the
+    /// whole file. Per-project derived artifacts live in it as single JSON
+    /// values — `kernel_context_json` alone reached 65 MB for one repository —
+    /// so the shared store grew to 156 MB holding 412 rows, and every
+    /// publication of every project copied all of it. Indexing a three-file
+    /// fixture spent minutes copying another repository's data.
+    ///
+    /// Nothing was gained by copying it: `commit_generation` reads the staged
+    /// config back through `scan_config_prefix` on exactly this project's
+    /// prefix, so other projects' rows were staged and then never read. Seeding
+    /// only what will be read is therefore semantics-preserving, and it makes
+    /// the cost proportional to the project being published rather than to the
+    /// largest project ever indexed on this machine.
+    ///
+    /// The predicate matches `commit_generation`'s exactly — the loose prefix
+    /// narrowed by `dial_key` or the dotted metadata prefix — so a project name
+    /// that is a prefix of another (`foo` vs `foo2`) cannot leak rows across.
+    fn seed_stage_config(&self) -> Result<(), DynError> {
+        if !self.live_cache.join("_config.db").exists() {
+            return Ok(());
         }
+        let config_prefix = format!("{CONFIG_KEY_PREFIX}{}", self.project);
+        let metadata_prefix = format!("{config_prefix}.");
+        let dial = dial_key(&self.project);
+        let rows = scan_config_prefix(&self.live_cache, &config_prefix)?
+            .into_iter()
+            .filter(|(key, _)| key == &dial || key.starts_with(&metadata_prefix))
+            .collect::<Vec<_>>();
+
+        let mut staged = open_config(&self.stage_cache)?;
+        let tx = staged.transaction()?;
+        for (key, value) in &rows {
+            tx.execute(
+                "INSERT OR REPLACE INTO config (key, value) VALUES (?1, ?2)",
+                params![key, value],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    fn seed_stage(&self) -> Result<Option<SeedLowerRepair>, DynError> {
+        self.seed_stage_config()?;
         let live_source = sqlite_path(&self.live_cache, &self.project);
         let live_lowered = lowered_sqlite_path(&self.live_cache, &self.project);
         let live_vault = vault_dir(&self.live_cache, &self.project);

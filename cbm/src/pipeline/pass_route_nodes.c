@@ -39,6 +39,8 @@ enum {
 
 bool cbm_service_pattern_is_http_route_literal(const char *literal, const char *callee_name);
 
+static bool extract_json_prop(const char *json, const char *key, char *buf, int bufsz);
+
 /* True for characters that may appear in a ":name" route parameter. */
 static inline bool is_route_ident_char(char c) {
     return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_';
@@ -128,6 +130,82 @@ const char *cbm_route_canon_path(const char *in, char *out, size_t out_sz) {
     return out;
 }
 
+/* Derive the display name from a Route QN by stripping its scheme prefix.
+ * "__route__GET__/a/{}" → "/a/{}", "__route__infra__https://h/p" →
+ * "https://h/p", "__grpc__Svc/Method" → "Svc/Method". The method/broker tag
+ * never contains "__", so the first "__" after the "__route__" prefix is the
+ * separator. An unrecognized QN is its own name. */
+static const char *route_qn_payload(const char *qn) {
+    static const char *const schemes[] = {"__grpc__", "__graphql__", "__trpc__"};
+    for (int i = 0; i < (int)(sizeof(schemes) / sizeof(schemes[0])); i++) {
+        size_t slen = strlen(schemes[i]);
+        if (strncmp(qn, schemes[i], slen) == 0) {
+            return qn + slen;
+        }
+    }
+    if (strncmp(qn, "__route__", SLEN("__route__")) == 0) {
+        const char *sep = strstr(qn + SLEN("__route__"), "__");
+        if (sep) {
+            return sep + SLEN("__");
+        }
+    }
+    return qn;
+}
+
+int64_t cbm_route_upsert(cbm_gbuf_t *gb, const char *route_qn, const char *raw_path,
+                         const char *def_file, const char *props) {
+    if (!gb || !route_qn || !route_qn[0]) {
+        return 0;
+    }
+
+    /* Splice "path"/"def_file" into the caller's object. Properties are not
+     * part of atom identity, so recording provenance here cannot re-introduce
+     * the ambiguity this helper exists to prevent. */
+    const char *base = (props && props[0] == '{') ? props : "{}";
+    size_t blen = strlen(base);
+    while (blen > 0 && base[blen - 1] != '}') {
+        blen--; /* ignore anything trailing the closing brace */
+    }
+    if (blen > 0) {
+        blen--; /* drop the closing brace itself */
+    }
+    /* Every properties object in this pipeline is snprintf-built and compact,
+     * so "more than the opening brace" means the object already has a member
+     * and the spliced field needs a separating comma. */
+    bool has_member = (blen > 1);
+
+    char esc_path[CBM_SZ_512];
+    char esc_file[CBM_SZ_512];
+    cbm_json_escape(esc_path, sizeof(esc_path), raw_path ? raw_path : "");
+    cbm_json_escape(esc_file, sizeof(esc_file), def_file ? def_file : "");
+
+    char merged[CBM_SZ_2K];
+    int written = snprintf(merged, sizeof(merged), "%.*s%s\"path\":\"%s\"", (int)blen, base,
+                           has_member ? "," : "", esc_path);
+    if (written < 0 || (size_t)written >= sizeof(merged)) {
+        /* Provenance must never cost us the node: fall back to the caller's
+         * own well-formed object rather than emitting a truncated one. */
+        return cbm_gbuf_upsert_node(gb, "Route", route_qn_payload(route_qn), route_qn, "", 0, 0,
+                                    base);
+    }
+    if (def_file && def_file[0]) {
+        int extra = snprintf(merged + written, sizeof(merged) - (size_t)written,
+                             ",\"def_file\":\"%s\"", esc_file);
+        if (extra > 0 && (size_t)extra < sizeof(merged) - (size_t)written) {
+            written += extra;
+        }
+    }
+    if ((size_t)written + SLEN("}") >= sizeof(merged)) {
+        return cbm_gbuf_upsert_node(gb, "Route", route_qn_payload(route_qn), route_qn, "", 0, 0,
+                                    base);
+    }
+    merged[written] = '}';
+    merged[written + 1] = '\0';
+
+    return cbm_gbuf_upsert_node(gb, "Route", route_qn_payload(route_qn), route_qn, "", 0, 0,
+                                merged);
+}
+
 /* Extract a JSON string value by key from properties.
  * Returns pointer into buf (caller provides buffer). NULL if not found. */
 static const char *json_extract(const char *json, const char *key, char *buf, int bufsz) {
@@ -212,7 +290,7 @@ static void route_edge_visitor(const cbm_gbuf_edge_t *edge, void *userdata) {
     }
 
     /* Create or find Route node (deduped by QN) */
-    cbm_gbuf_upsert_node(ctx->gb, "Route", url, route_qn, "", 0, 0, route_props);
+    cbm_route_upsert(ctx->gb, route_qn, url, NULL, route_props);
     ctx->created++;
 
     /* Note: we do NOT re-target the edge here because modifying edges during
@@ -331,8 +409,14 @@ static int match_one_infra_route(cbm_gbuf_t *gb, const cbm_gbuf_node_t *infra,
         if (is_broker_route(handler_route->qualified_name)) {
             continue;
         }
-        int file_matches = (handler_route->file_path != NULL &&
-                            strstr(handler_route->file_path, svc_name) != NULL);
+        /* Route nodes carry no file_path (their identity is the QN alone), so
+         * the defining file is read back from the properties the route upsert
+         * preserved. */
+        char def_file[CBM_SZ_256];
+        int file_matches =
+            (extract_json_prop(handler_route->properties_json, "def_file", def_file,
+                               sizeof(def_file)) &&
+             strstr(def_file, svc_name) != NULL);
         int is_prefix_route =
             (handler_route->qualified_name != NULL &&
              strncmp(handler_route->qualified_name, "__route__ANY__", SLEN("__route__ANY__")) == 0);
@@ -458,8 +542,7 @@ static int ensure_one_decorator_route(cbm_gbuf_t *gb, const cbm_gbuf_node_t *fun
 
     char rprops[CBM_SZ_256];
     snprintf(rprops, sizeof(rprops), "{\"method\":\"%s\",\"source\":\"decorator\"}", method);
-    int64_t route_id = cbm_gbuf_upsert_node(gb, "Route", path, route_qn,
-                                            func->file_path ? func->file_path : "", 0, 0, rprops);
+    int64_t route_id = cbm_route_upsert(gb, route_qn, path, func->file_path, rprops);
 
     if (existing) {
         const cbm_gbuf_edge_t **existing_handles = NULL;
@@ -875,8 +958,7 @@ static void create_grpc_routes(cbm_gbuf_t *gb) {
         char props[CBM_SZ_128];
         snprintf(props, sizeof(props), "{\"source\":\"proto\",\"service\":\"%s\"}", svc->name);
 
-        int64_t route_id = cbm_gbuf_upsert_node(gb, "Route", fn->name, route_qn, fn->file_path,
-                                                fn->start_line, fn->end_line, props);
+        int64_t route_id = cbm_route_upsert(gb, route_qn, fn->name, fn->file_path, props);
         cbm_gbuf_insert_edge(gb, fn->id, route_id, "HANDLES", "{\"via\":\"proto_rpc\"}");
         grpc_routes++;
     }
@@ -1155,8 +1237,7 @@ static void sveltekit_file_visitor(const cbm_gbuf_node_t *node, void *userdata) 
         char route_props[CBM_SZ_256];
         snprintf(route_props, sizeof(route_props),
                  "{\"method\":\"%s\",\"framework\":\"sveltekit\"}", method);
-        int64_t route_id =
-            cbm_gbuf_upsert_node(ctx->gb, "Route", route_path, route_qn, "", 0, 0, route_props);
+        int64_t route_id = cbm_route_upsert(ctx->gb, route_qn, route_path, NULL, route_props);
         if (route_id == 0) {
             continue;
         }

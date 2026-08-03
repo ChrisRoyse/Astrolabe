@@ -5,20 +5,12 @@
 //! ambient runtime-path variables, preloaded competing ORT modules, runtime
 //! drift, and CUDA device changes.
 
-#[cfg(all(feature = "runtime", windows))]
-mod windows;
-
-#[cfg(all(feature = "runtime", windows))]
-pub use windows::{
-    ImmutableDirectoryRoot, ImmutableFileIdentity, ImmutableFileSnapshot, OnnxCpuAuthorization,
-    OnnxCudaDeviceAttestation, OnnxCudaExecutionStream, OnnxLoadedModuleAttestation,
-    OnnxRuntimeArtifactAttestation, OnnxRuntimeAttestation, OnnxRuntimeContractAttestation,
-    RetainedImmutableFile, attest_cuda_provider_after_session, authorize_cpu_companion,
-    available_host_memory_bytes, create_cuda_execution_stream, current_runtime_attestation,
-    ensure_runtime, expected_runtime_contract, initialize_pinned_cuda_runtime_boundary,
-    open_immutable_child_directory, open_immutable_directory, retain_immutable_file,
-    revalidate_runtime_attestation, selected_cuda_device, snapshot_immutable_file,
-};
+// The Windows ORT implementation (`src/windows.rs`, ~3.1k LOC) was removed
+// 2026-08-02 with the Windows platform doctrine: ASTROLABE targets
+// aarch64-apple-darwin only. It was gated `cfg(all(feature = "runtime",
+// windows))` and so never compiled on this host, which is exactly why its
+// removal cannot change macOS behavior. Restoring Windows support means
+// restoring a supported Windows target first, not un-deleting this module.
 
 /// Requested execution policy for the exact pinned ORT environment.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

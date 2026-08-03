@@ -2752,6 +2752,17 @@ static cbm_store_verify_status_t store_open_path_verified(const char *db_path,
         return result->status;
     }
 
+    /* Re-establish the family baseline *after* our own open. Opening a WAL-mode
+     * database materialises its -wal/-shm sidecars, and SQLite removes them
+     * again on a clean close — so a freshly written store is always inspected
+     * with no sidecars present, our open recreates them, and a baseline taken
+     * before the open would report the family as changed on every single run.
+     * The window that must stay undisturbed is the integrity check below, not
+     * the act of opening the database to perform it. */
+    result->db_present = stat(db_path, &db_before) == 0;
+    result->wal_present = stat(wal_path, &wal_before) == 0;
+    result->shm_present = stat(shm_path, &shm_before) == 0;
+
     store_integrity_result_t integrity_result;
     store_integrity_status_t integrity_status =
         store_check_integrity_detailed(opened, contract, expected_project, &integrity_result);
@@ -2777,6 +2788,17 @@ static cbm_store_verify_status_t store_open_path_verified(const char *db_path,
         return result->status;
     }
 
+    /* Record the live database identity (size + SHA-256) for the bytes we just
+     * verified. The Windows receipt-cache path fills these in as a side effect
+     * of its short-circuit (store_hash_frozen_identity, which hashes a Win32
+     * HANDLE); the source-preserving path never did, so `result->db_sha256`
+     * stayed empty on POSIX and every caller that requires a verified digest
+     * refused. `try_unchanged_before_snapshot` is exactly such a caller, which
+     * is why re-indexing an unchanged repo on macOS always failed with
+     * CBM_PIPELINE_UNCHANGED_STORE_DIGEST_MISSING and the only way forward was
+     * deleting the store. Hashing here — inside the frozen window, after
+     * integrity passed and before the after-stat comparison — means the digest
+     * describes the same bytes the verification just blessed. */
     /* Independent re-read of the family identity. Anything that moved while the
      * integrity check ran invalidates the result, so refuse rather than hand
      * back a store verified against bytes that no longer exist. */

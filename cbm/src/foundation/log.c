@@ -16,6 +16,11 @@
 #include <sched.h>
 #endif
 
+/* First-error capture (#943). Both are guarded by the log mutex, so no extra
+ * synchronisation is needed even under the parallel resolve workers. */
+static cbm_log_first_error_t g_first_error;
+static bool g_first_error_armed = false;
+
 static CBMLogLevel g_log_level = CBM_LOG_INFO;
 static CBMLogFormat g_log_format = CBM_LOG_FORMAT_TEXT;
 static cbm_log_sink_fn g_log_sink = NULL;
@@ -254,12 +259,72 @@ static void emit_line_locked(const char *line) {
     (void)fprintf(stderr, "%s\n", line);
 }
 
+/* Copy one structured field into the capture slot. Called with the log mutex
+ * held, once per key/value pair of the first ERROR line seen. */
+static void first_error_take_field(const char *key, const char *val) {
+    if (!key || !val) {
+        return;
+    }
+    struct {
+        const char *key;
+        char *dst;
+        size_t cap;
+    } const slots[] = {
+        {"code", g_first_error.code, sizeof(g_first_error.code)},
+        {"operation", g_first_error.operation, sizeof(g_first_error.operation)},
+        {"file", g_first_error.file, sizeof(g_first_error.file)},
+        {"path", g_first_error.file, sizeof(g_first_error.file)},
+        {"message", g_first_error.message, sizeof(g_first_error.message)},
+        {"remediation", g_first_error.remediation, sizeof(g_first_error.remediation)},
+    };
+    for (size_t i = 0; i < sizeof(slots) / sizeof(slots[0]); i++) {
+        if (strcmp(key, slots[i].key) == 0) {
+            /* "file" wins over "path" when a line carries both: it names the
+             * exact offending input, which is what an operator needs first. */
+            if (slots[i].dst == g_first_error.file && strcmp(key, "path") == 0 &&
+                g_first_error.file[0]) {
+                return;
+            }
+            (void)snprintf(slots[i].dst, slots[i].cap, "%s", val);
+            return;
+        }
+    }
+}
+
+void cbm_log_first_error_arm(void) {
+    log_lock();
+    memset(&g_first_error, 0, sizeof(g_first_error));
+    g_first_error_armed = true;
+    log_unlock();
+}
+
+void cbm_log_first_error_disarm(void) {
+    log_lock();
+    g_first_error_armed = false;
+    log_unlock();
+}
+
+bool cbm_log_first_error_get(cbm_log_first_error_t *out) {
+    if (!out) {
+        return false;
+    }
+    log_lock();
+    *out = g_first_error;
+    const bool present = g_first_error.present;
+    log_unlock();
+    return present;
+}
+
 void cbm_log(CBMLogLevel level, const char *msg, ...) {
     log_lock();
     if (level < g_log_level) {
         log_unlock();
         return;
     }
+
+    /* Capture only the FIRST error of an armed run; later ones are usually
+     * consequences of it. Evaluated once here so both format branches agree. */
+    const bool capture = (level == CBM_LOG_ERROR) && g_first_error_armed && !g_first_error.present;
 
     char line_buf[CBM_SZ_4K];
     size_t pos = 0;
@@ -277,6 +342,9 @@ void cbm_log(CBMLogLevel level, const char *msg, ...) {
                 break;
             }
             const char *val = va_arg(args, const char *);
+            if (capture) {
+                first_error_take_field(key, val);
+            }
             append_char(line_buf, sizeof(line_buf), &pos, ',');
             append_json_string(line_buf, sizeof(line_buf), &pos, key);
             append_char(line_buf, sizeof(line_buf), &pos, ':');
@@ -294,6 +362,9 @@ void cbm_log(CBMLogLevel level, const char *msg, ...) {
                 break;
             }
             const char *val = va_arg(args, const char *);
+            if (capture) {
+                first_error_take_field(key, val);
+            }
             append_char(line_buf, sizeof(line_buf), &pos, ' ');
             append_text_atom(line_buf, sizeof(line_buf), &pos, key);
             append_char(line_buf, sizeof(line_buf), &pos, '=');
@@ -301,6 +372,13 @@ void cbm_log(CBMLogLevel level, const char *msg, ...) {
         }
     }
     va_end(args);
+
+    /* Publish only when the line actually carried a code: an ERROR line with no
+     * structured code is not an attributable cause, and claiming the slot with
+     * it would mask the next line that does have one. */
+    if (capture && g_first_error.code[0]) {
+        g_first_error.present = true;
+    }
 
     finish_line(line_buf, sizeof(line_buf), pos);
     emit_line_locked(line_buf);
