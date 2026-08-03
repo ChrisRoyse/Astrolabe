@@ -1546,6 +1546,75 @@ static int store_read_journal_mode_exact(sqlite3 *db, const char *sql,
     return SQLITE_OK;
 }
 
+/* Force one fully-finalized main-schema read while the connection is still in
+ * NORMAL locking mode.  For a crash-left WAL family this makes SQLite rebuild
+ * and own the on-disk wal-index through the VFS.  A later NORMAL->EXCLUSIVE
+ * transition can then retain sole-writer admission without selecting SQLite's
+ * heap-only WAL mode, so SQLite itself remains responsible for xShmUnmap and
+ * sidecar retirement when journal mode changes to DELETE. */
+static int store_initialize_wal_index_normal(sqlite3 *db,
+                                             char operation[CBM_STORE_VERIFY_OPERATION_MAX],
+                                             char detail[CBM_STORE_VERIFY_DETAIL_MAX]) {
+    operation[0] = '\0';
+    detail[0] = '\0';
+    if (!db) {
+        snprintf(operation, CBM_STORE_VERIFY_OPERATION_MAX, "%s",
+                 "source.writer.normal_schema.validate");
+        snprintf(detail, CBM_STORE_VERIFY_DETAIL_MAX, "%s",
+                 "NORMAL-mode schema initialization requires a live database");
+        return SQLITE_MISUSE;
+    }
+
+    sqlite3_stmt *stmt = NULL;
+    int rc = sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM main.sqlite_schema;", CBM_NOT_FOUND,
+                                &stmt, NULL);
+    if (rc != SQLITE_OK) {
+        snprintf(operation, CBM_STORE_VERIFY_OPERATION_MAX, "%s",
+                 "source.writer.normal_schema.prepare");
+        snprintf(detail, CBM_STORE_VERIFY_DETAIL_MAX, "%s", sqlite3_errmsg(db));
+        if (stmt) {
+            sqlite3_finalize(stmt);
+        }
+        return rc;
+    }
+    rc = sqlite3_step(stmt);
+    if (rc != SQLITE_ROW || sqlite3_column_type(stmt, 0) != SQLITE_INTEGER ||
+        sqlite3_column_int64(stmt, 0) < 0) {
+        snprintf(operation, CBM_STORE_VERIFY_OPERATION_MAX, "%s",
+                 "source.writer.normal_schema.step");
+        snprintf(detail, CBM_STORE_VERIFY_DETAIL_MAX,
+                 "main-schema count returned sqlite_code=%d type=%d expected one nonnegative "
+                 "integer row",
+                 rc, rc == SQLITE_ROW ? sqlite3_column_type(stmt, 0) : SQLITE_NULL);
+        sqlite3_finalize(stmt);
+        return rc == SQLITE_ROW || rc == SQLITE_DONE ? SQLITE_ERROR : rc;
+    }
+    sqlite3_int64 schema_rows = sqlite3_column_int64(stmt, 0);
+    rc = sqlite3_step(stmt);
+    if (rc != SQLITE_DONE) {
+        snprintf(operation, CBM_STORE_VERIFY_OPERATION_MAX, "%s",
+                 "source.writer.normal_schema.cardinality");
+        snprintf(detail, CBM_STORE_VERIFY_DETAIL_MAX,
+                 "main-schema count second step returned sqlite_code=%d expected=%d", rc,
+                 SQLITE_DONE);
+        sqlite3_finalize(stmt);
+        return rc == SQLITE_ROW ? SQLITE_ERROR : rc;
+    }
+    rc = sqlite3_finalize(stmt);
+    if (rc != SQLITE_OK) {
+        snprintf(operation, CBM_STORE_VERIFY_OPERATION_MAX, "%s",
+                 "source.writer.normal_schema.finalize");
+        snprintf(detail, CBM_STORE_VERIFY_DETAIL_MAX, "%s", sqlite3_errmsg(db));
+        return rc;
+    }
+    snprintf(operation, CBM_STORE_VERIFY_OPERATION_MAX, "%s",
+             "source.writer.normal_schema.read");
+    snprintf(detail, CBM_STORE_VERIFY_DETAIL_MAX,
+             "NORMAL-mode main-schema read finalized with rows=%lld",
+             (long long)schema_rows);
+    return SQLITE_OK;
+}
+
 static bool store_check_snapshot_delete_journal(cbm_store_t *s,
                                                 store_integrity_result_t *result) {
     char mode[CBM_STORE_NORMALIZE_MODE_MAX];
@@ -3560,13 +3629,44 @@ static cbm_store_verify_status_t store_open_path_project_writer_existing_interna
     }
 #endif
 
-    /* Acquire SQLite's own connection-lifetime exclusive locking mode before
-     * the first database access.  In WAL mode this avoids rebuilding source
-     * SHM and makes the verified writer the sole accessor from the first read
-     * through checkpoint/DELETE normalization and exact close. */
-    char locking_mode[CBM_STORE_NORMALIZE_MODE_MAX];
+    /* Start in NORMAL mode and perform one fully-finalized main-schema read so
+     * SQLite rebuilds and owns any crash-left wal-index through the VFS.  If
+     * EXCLUSIVE is selected before first WAL access SQLite uses a heap-only
+     * index and can never retire an already-present SHM namespace object.
+     * NORMAL->EXCLUSIVE preserves SQLite-owned SHM cleanup while the second
+     * DB/WAL generation comparison below closes the initialization race. */
+    char normal_mode[CBM_STORE_NORMALIZE_MODE_MAX];
     char lock_operation[CBM_STORE_VERIFY_OPERATION_MAX];
     char lock_detail[CBM_STORE_VERIFY_DETAIL_MAX];
+    rc = store_read_journal_mode_exact(writer->db, "PRAGMA main.locking_mode=NORMAL;",
+                                       "source.writer.locking_mode_normal", normal_mode,
+                                       lock_operation, lock_detail);
+    if (rc != SQLITE_OK || strcmp(normal_mode, "normal") != 0) {
+        store_verify_set_error(
+            result, CBM_STORE_VERIFY_IO_FAILED,
+            rc == SQLITE_OK ? "source.writer.locking_mode_normal_readback" : lock_operation, 0,
+            rc == SQLITE_OK ? SQLITE_MISMATCH : rc,
+            rc == SQLITE_OK ? "SQLite did not enter exact NORMAL locking mode" : lock_detail);
+        store_log_open_failure(db_path, result->operation, writer->db, result->sqlite_error,
+                               result->detail);
+        store_writer_close_after_failure(&writer, out_store, result,
+                                         "source.writer.sqlite_close_after_normal_mode");
+        return result->status;
+    }
+    rc = store_initialize_wal_index_normal(writer->db, lock_operation, lock_detail);
+    if (rc != SQLITE_OK) {
+        store_verify_set_error(result, CBM_STORE_VERIFY_IO_FAILED, lock_operation, 0, rc,
+                               lock_detail);
+        store_log_open_failure(db_path, result->operation, writer->db, result->sqlite_error,
+                               result->detail);
+        store_writer_close_after_failure(&writer, out_store, result,
+                                         "source.writer.sqlite_close_after_normal_schema");
+        return result->status;
+    }
+
+    /* Retain SQLite's connection-lifetime exclusive mode from the completed
+     * NORMAL-mode wal-index initialization through normalization and close. */
+    char locking_mode[CBM_STORE_NORMALIZE_MODE_MAX];
     rc = store_read_journal_mode_exact(writer->db, "PRAGMA main.locking_mode=EXCLUSIVE;",
                                        "source.writer.locking_mode_exclusive", locking_mode,
                                        lock_operation, lock_detail);

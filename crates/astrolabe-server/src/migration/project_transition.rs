@@ -11,6 +11,20 @@ use astrolabe_domain::knobs::{
 pub(crate) const PROJECT_TRANSITION_STATUS_KEY: &str = "project_transition_json";
 const PROJECT_TRANSITION_WORKER_GRANT_SCHEMA: &str = "astrolabe-project-transition-worker-grant-v3";
 
+#[derive(Debug)]
+struct ProjectNormalizationEvidenceError {
+    message: String,
+    evidence: Value,
+}
+
+impl std::fmt::Display for ProjectNormalizationEvidenceError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for ProjectNormalizationEvidenceError {}
+
 #[derive(Debug, Clone)]
 pub(crate) struct ProjectTransitionWorkerGrant {
     schema: String,
@@ -483,13 +497,20 @@ impl<'a> ProjectIndexTransition<'a> {
         match transition.normalize_store_family() {
             Ok(normalization) => transition.normalization = normalization,
             Err(error) => {
-                transition.normalization = json!({
-                    "status": "normalization_failed",
-                    "error": error.to_string(),
-                    "family_after_failure": sqlite_family_evidence(&transition.db_path)
-                        .unwrap_or_else(|read_error| json!({"read_error": read_error.to_string()})),
-                });
-                transition.persist("normalization_failed", json!({"error": error.to_string()}))?;
+                let error_text = error.to_string();
+                transition.normalization = error
+                    .as_ref()
+                    .downcast_ref::<ProjectNormalizationEvidenceError>()
+                    .map(|failure| failure.evidence.clone())
+                    .unwrap_or_else(|| {
+                        json!({
+                            "status": "normalization_failed",
+                            "error": &error_text,
+                            "family_after_failure": sqlite_family_evidence(&transition.db_path)
+                                .unwrap_or_else(|read_error| json!({"read_error": read_error.to_string()})),
+                        })
+                    });
+                transition.persist("normalization_failed", json!({"error": &error_text}))?;
                 return Err(error);
             }
         }
@@ -560,6 +581,18 @@ impl<'a> ProjectIndexTransition<'a> {
         }
         let post_quiescence = self.post_normalization_quiescence()?;
         let after = sqlite_family_evidence(&self.db_path)?;
+        let native = json!({
+            "journal_mode_before": normalized.journal_mode_before,
+            "journal_mode_after": normalized.journal_mode_after,
+            "sqlite_error": normalized.sqlite_error,
+            "wal_log_frames": normalized.wal_log_frames,
+            "wal_checkpointed_frames": normalized.wal_checkpointed_frames,
+            "wal_remaining_frames": normalized.wal_remaining_frames,
+            "operation": normalized.operation,
+            "detail": normalized.detail,
+            "close_connection_destroyed": normalized.close_connection_destroyed,
+            "close_db_path": normalized.close_db_path,
+        });
         let after_db = after.pointer("/db/present").and_then(Value::as_bool) == Some(true);
         let after_wal = after
             .pointer("/wal/present")
@@ -570,27 +603,28 @@ impl<'a> ProjectIndexTransition<'a> {
             .and_then(Value::as_bool)
             .unwrap_or(true);
         if !after_db || after_wal || after_shm {
-            return Err(format!(
+            let message = format!(
                 "ASTRO_PROJECT_NORMALIZATION_FAMILY_READBACK_FAILED: post-close family for {} has db_present={after_db}, wal_present={after_wal}, shm_present={after_shm}; remediation: preserve every byte and inspect the exact later SQLite owner",
                 self.db_path.display()
-            )
-            .into());
+            );
+            let evidence = json!({
+                "status": "normalization_failed",
+                "stage": "post_close_family_readback",
+                "error": &message,
+                "before": before,
+                "native": native,
+                "post_close_quiescence": quiescence_json(&post_quiescence),
+                "after": after,
+            });
+            return Err(Box::new(ProjectNormalizationEvidenceError {
+                message,
+                evidence,
+            }));
         }
         Ok(json!({
             "status": "normalized",
             "before": before,
-            "native": {
-                "journal_mode_before": normalized.journal_mode_before,
-                "journal_mode_after": normalized.journal_mode_after,
-                "sqlite_error": normalized.sqlite_error,
-                "wal_log_frames": normalized.wal_log_frames,
-                "wal_checkpointed_frames": normalized.wal_checkpointed_frames,
-                "wal_remaining_frames": normalized.wal_remaining_frames,
-                "operation": normalized.operation,
-                "detail": normalized.detail,
-                "close_connection_destroyed": normalized.close_connection_destroyed,
-                "close_db_path": normalized.close_db_path,
-            },
+            "native": native,
             "after": after,
             "post_close_quiescence": quiescence_json(&post_quiescence),
         }))
