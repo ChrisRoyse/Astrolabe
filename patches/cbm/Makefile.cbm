@@ -15,6 +15,11 @@
 # directory once a prod build had populated dep files).
 ASTROLABE_PATCH_DIR := $(patsubst %/,%,$(dir $(abspath $(lastword $(MAKEFILE_LIST)))))
 
+# A failed linker/localizer command must not leave a changed target looking
+# current to a later make invocation.  GNU make deletes such targets before it
+# returns the failure to cbm-sys.
+.DELETE_ON_ERROR:
+
 # Compiler selection — override via: make CC=gcc CXX=g++
 # macOS: cc (Apple Clang) — universal binary with ASan support
 # Linux: gcc/g++ — system default with full sanitizer support
@@ -123,9 +128,11 @@ CC_MACRO_DUMP := $(shell echo | $(CC_FOR_SHELL) -dM -E - 2>/dev/null)
 IS_MINGW := $(if $(findstring define _WIN32 ,$(CC_MACRO_DUMP)),yes,no)
 WIN32_LIBS :=
 MINGW_RELOC_LD_FLAGS :=
+MINGW_OBJCOPY_FLAGS :=
 ifeq ($(IS_MINGW),yes)
 WIN32_LIBS := -lws2_32 -lpsapi -lshell32 -Wl,--allow-multiple-definition -Wl,--stack,8388608 -static
 MINGW_RELOC_LD_FLAGS := --allow-multiple-definition
+MINGW_OBJCOPY_FLAGS := --remove-section=.drectve
 endif
 
 # STATIC=1 produces a fully static binary (for Alpine/musl portable builds)
@@ -410,7 +417,7 @@ BUILD_DIR = build/c
 AR ?= ar
 LD ?= ld
 NM ?= nm
-OBJCOPY ?= $(shell command -v objcopy 2>/dev/null || command -v llvm-objcopy 2>/dev/null || echo objcopy)
+OBJCOPY ?= objcopy
 UNAME_S := $(shell uname -s)
 NO_EXECSTACK_LD_FLAG :=
 ifeq ($(UNAME_S),Linux)
@@ -732,12 +739,7 @@ $(LIBCBM_RELOC): $(LIBCBM_OBJS)
 	$(file >$(LIBCBM_OBJECTS_RSP),$(LIBCBM_OBJS))
 	$(LD) -r $(NO_EXECSTACK_LD_FLAG) $(MINGW_RELOC_LD_FLAGS) -o $@ @$(LIBCBM_OBJECTS_RSP)
 	$(NM) -g $@ | awk '$$1 != "U" && $$2 != "U" {print $$NF}' | grep -E '^_?cbm_' > $(LIBCBM_EXPORTS)
-	if command -v $(OBJCOPY) >/dev/null 2>&1; then \
-		if [ "$(IS_MINGW)" = "yes" ]; then $(OBJCOPY) --remove-section=.drectve $@; fi; \
-		$(OBJCOPY) --keep-global-symbols=$(LIBCBM_EXPORTS) $@; \
-	else \
-		echo "WARNING: objcopy not found; libcbm symbol localization skipped"; \
-	fi
+	$(OBJCOPY) $(MINGW_OBJCOPY_FLAGS) --keep-global-symbols=$(LIBCBM_EXPORTS) $@
 
 $(LIBCBM_A): $(LIBCBM_RELOC)
 	rm -f $@
