@@ -334,7 +334,11 @@ static void emit_internal_failure_locked(const char *event, const char *code,
     bool original_event_truncated =
         original_event && original_event[retained] != '\0';
 
-    char line[CBM_SZ_1K];
+    /* A retained 127-byte event may expand to 762 bytes when every byte needs
+     * JSON control escaping. Two KiB covers that proven maximum plus all fixed
+     * event/code/message/remediation fields without truncating the closing
+     * object delimiter on this allocation-free failure path. */
+    char line[CBM_SZ_2K];
     size_t pos = 0;
     if (g_log_format == CBM_LOG_FORMAT_JSON) {
         append_raw(line, sizeof(line), &pos, "{\"level\":\"error\",\"event\":");
