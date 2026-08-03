@@ -24,10 +24,11 @@
 .NOTES
     Refs #612, #600, #596, #424, #197. Manual FSV tooling; this is not a test or a gate.
 #>
-[CmdletBinding(DefaultParameterSetName = 'Single')]
+[CmdletBinding(DefaultParameterSetName = 'SingleInline')]
 param(
     [Parameter(Mandatory)][string]$ReceiptPath,
-    [Parameter(Mandatory, ParameterSetName = 'Single')][string]$ArgumentsJson,
+    [Parameter(Mandatory, ParameterSetName = 'SingleInline')][string]$ArgumentsJson,
+    [Parameter(Mandatory, ParameterSetName = 'SingleFile')][string]$ArgumentsJsonPath,
     [Parameter(Mandatory, ParameterSetName = 'ResidentCohort')][switch]$ResidentCohort,
     [Parameter(Mandatory, ParameterSetName = 'ResidentCohort')][string]$CohortPlanPath,
     [Parameter(Mandatory)][string]$StandardOutputPath,
@@ -1812,6 +1813,108 @@ function ConvertFrom-FlatStringArrayJson([string]$Json) {
     }
 }
 
+function Open-AstroFsvArgumentJsonFile {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][string]$Workspace
+    )
+
+    $full = Assert-PathWithin $Path $Workspace `
+        'ASTRO_FSV_ARGUMENTS_FILE_ESCAPE' 'arguments JSON file'
+    if (-not (Test-AstroPathLongPath -LiteralPath $full -PathType Leaf)) {
+        Fail-Astro 'ASTRO_FSV_ARGUMENTS_FILE_MISSING' `
+            "arguments JSON file does not exist: $full" `
+            'write one ordinary strict UTF-8 JSON file inside the canonical workspace'
+    }
+    $workspaceFull = [IO.Path]::GetFullPath($Workspace).TrimEnd('\', '/')
+    $ancestor = Split-Path -Parent $full
+    while ($ancestor.Length -ge $workspaceFull.Length) {
+        Assert-NotReparseEntry $ancestor 'arguments JSON ancestor'
+        if ([string]::Equals(
+                [IO.Path]::GetFullPath($ancestor),
+                $workspaceFull,
+                [StringComparison]::OrdinalIgnoreCase
+            )) {
+            break
+        }
+        $parent = Split-Path -Parent $ancestor
+        if ([string]::Equals($parent, $ancestor, [StringComparison]::OrdinalIgnoreCase)) {
+            Fail-Astro 'ASTRO_FSV_ARGUMENTS_FILE_ESCAPE' `
+                "arguments JSON ancestor walk escaped the canonical workspace: $full" `
+                'use an ordinary file inside the canonical workspace'
+        }
+        $ancestor = $parent
+    }
+    Assert-NotReparseEntry $full 'arguments JSON file'
+
+    try {
+        $stream = [IO.File]::Open(
+            (ConvertTo-AstroExtendedLengthPath $full),
+            [IO.FileMode]::Open,
+            [IO.FileAccess]::Read,
+            [IO.FileShare]::Read
+        )
+    }
+    catch {
+        Fail-Astro 'ASTRO_FSV_ARGUMENTS_FILE_OPEN_FAILED' `
+            "arguments JSON file could not be retained without write/delete sharing: $full ($($_.Exception.Message))" `
+            'close every writer/deleter and provide one immutable ordinary workspace file'
+    }
+    try {
+        if ($stream.Length -le 0 -or $stream.Length -gt 1048576) {
+            Fail-Astro 'ASTRO_FSV_ARGUMENTS_FILE_LENGTH_INVALID' `
+                "arguments JSON file length is invalid: $($stream.Length) bytes ($full)" `
+                'use one nonempty strict UTF-8 JSON array no larger than 1 MiB'
+        }
+        $bytes = [byte[]]::new([int]$stream.Length)
+        $offset = 0
+        while ($offset -lt $bytes.Length) {
+            $read = $stream.Read($bytes, $offset, $bytes.Length - $offset)
+            if ($read -le 0) {
+                Fail-Astro 'ASTRO_FSV_ARGUMENTS_FILE_READ_FAILED' `
+                    "arguments JSON file ended before its retained length was read: $full" `
+                    'preserve the file and investigate filesystem read instability'
+            }
+            $offset += $read
+        }
+        if ($bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and
+            $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF) {
+            Fail-Astro 'ASTRO_FSV_ARGUMENTS_FILE_BOM_REFUSED' `
+                "arguments JSON file has a UTF-8 BOM: $full" `
+                'write canonical strict UTF-8 JSON without a BOM'
+        }
+        try { $json = [Text.UTF8Encoding]::new($false, $true).GetString($bytes) }
+        catch {
+            Fail-Astro 'ASTRO_FSV_ARGUMENTS_FILE_UTF8_INVALID' `
+                "arguments JSON file is not strict UTF-8: $full ($($_.Exception.Message))" `
+                'write canonical strict UTF-8 JSON without replacement characters'
+        }
+        $stream.Position = 0
+        return [pscustomobject]@{
+            Handle = $stream
+            Path = $full
+            Bytes = [uint64]$bytes.Length
+            Sha256 = ByteArray-Sha256 $bytes
+            Json = $json
+        }
+    }
+    catch {
+        $stream.Dispose()
+        throw
+    }
+}
+
+function Get-AstroRetainedStreamSha256 {
+    param([Parameter(Mandatory)][IO.Stream]$Stream)
+    $Stream.Position = 0
+    $hasher = [Security.Cryptography.SHA256]::Create()
+    try { return ([BitConverter]::ToString($hasher.ComputeHash($Stream)) -replace '-', '').ToLowerInvariant() }
+    finally {
+        $hasher.Dispose()
+        $Stream.Position = 0
+    }
+}
+
 function Assert-AstroExactObjectProperties {
     param(
         [Parameter(Mandatory)]$Object,
@@ -3255,6 +3358,8 @@ $runRecordAuthorized = $false
 $fsvLockCleanup = $null
 $arguments = [string[]]::new(0)
 $argumentCount = 0
+$argumentSource = $null
+$argumentsFileHandle = $null
 
 try {
     if ($Issue -le 0) { Fail-Astro 'ASTRO_FSV_ISSUE_INVALID' 'Issue must be positive' 'pass the driving GitHub issue number' }
@@ -3457,8 +3562,36 @@ try {
         Fail-Astro 'ASTRO_FSV_ARTIFACT_DRIFT' 'staged artifact hash/length differs from its receipt before launch' 'discard the session, identify the writer, and rebuild'
     }
 
-    if ($PSCmdlet.ParameterSetName -ceq 'Single') {
-        $argumentVector = ConvertFrom-FlatStringArrayJson $ArgumentsJson
+    if ($PSCmdlet.ParameterSetName -ceq 'SingleInline' -or
+        $PSCmdlet.ParameterSetName -ceq 'SingleFile') {
+        if ($PSCmdlet.ParameterSetName -ceq 'SingleFile') {
+            $argumentFile = Open-AstroFsvArgumentJsonFile `
+                -Path $ArgumentsJsonPath -Workspace $workspace
+            $argumentsFileHandle = $argumentFile.Handle
+            $argumentJsonValue = [string]$argumentFile.Json
+            $argumentSource = [ordered]@{
+                kind = 'strict-utf8-json-file'
+                path = [string]$argumentFile.Path
+                bytes = [uint64]$argumentFile.Bytes
+                sha256_before = [string]$argumentFile.Sha256
+                sha256_after = $null
+                stable = $false
+            }
+        }
+        else {
+            $argumentJsonValue = $ArgumentsJson
+            $argumentJsonBytes = [Text.UTF8Encoding]::new($false, $true).GetBytes($ArgumentsJson)
+            $argumentJsonHash = ByteArray-Sha256 $argumentJsonBytes
+            $argumentSource = [ordered]@{
+                kind = 'inline-json'
+                path = $null
+                bytes = [uint64]$argumentJsonBytes.Length
+                sha256_before = $argumentJsonHash
+                sha256_after = $argumentJsonHash
+                stable = $true
+            }
+        }
+        $argumentVector = ConvertFrom-FlatStringArrayJson $argumentJsonValue
         $argumentCount = [int]$argumentVector.Count
         $arguments = [string[]]@($argumentVector.Values)
         if ($arguments.Length -ne $argumentCount) {
@@ -3527,6 +3660,7 @@ try {
         command = if ($argumentCount -gt 0) { "$artifact $argumentLine" } else { $artifact }
         argument_count = $argumentCount
         arguments = @($arguments)
+        argument_source = $argumentSource
         tree_sha = [string]$receipt.tree_sha
         artifact_path = $artifact
         artifact_sha256 = $artifactHashBefore
@@ -3694,6 +3828,7 @@ try {
         started_at_utc = $childStartedAtUtc
         argument_count = $argumentCount
         arguments = @($arguments)
+        argument_source = $argumentSource
     }
     Publish-NewFile $LiveStatePath ($liveState | ConvertTo-Json -Depth 10)
     $persistedLiveState =
@@ -3751,6 +3886,17 @@ try {
 
     $artifactHashAfter = File-Sha256 $artifact
     $receiptHashAfter = File-Sha256 $receiptFull
+    if ($null -ne $argumentsFileHandle) {
+        $argumentFileHashAfter = Get-AstroRetainedStreamSha256 $argumentsFileHandle
+        $argumentSource.sha256_after = $argumentFileHashAfter
+        $argumentSource.stable =
+            $argumentFileHashAfter -ceq [string]$argumentSource.sha256_before
+        if (-not [bool]$argumentSource.stable) {
+            Fail-Astro 'ASTRO_FSV_ARGUMENTS_FILE_DRIFT' `
+                "retained arguments JSON bytes changed during the real artifact run: $($argumentSource.path)" `
+                'preserve the session and investigate filesystem identity or byte drift'
+        }
+    }
     $launcherLockSnapshotAfter = Get-AstroExactRetainedFileSnapshot `
         -Handle $launcherLockHandle `
         -ExpectedPath $launcherLockPath
@@ -4041,6 +4187,7 @@ try {
         }
         argument_count = $argumentCount
         arguments = @($arguments)
+        argument_source = $argumentSource
         live_state = [ordered]@{
             path = $LiveStatePath
             published = $true
@@ -4075,6 +4222,8 @@ try {
         -not $persistedRecord.artifact.PSObject.Properties['sha256'] -or
         -not $persistedRecord.PSObject.Properties['argument_count'] -or
         -not $persistedRecord.PSObject.Properties['arguments'] -or
+        -not $persistedRecord.PSObject.Properties['argument_source'] -or
+        $null -eq $persistedRecord.argument_source -or
         -not $persistedRecord.PSObject.Properties['live_state'] -or
         $null -eq $persistedRecord.live_state -or
         -not $persistedRecord.live_state.PSObject.Properties['path'] -or
@@ -4099,6 +4248,13 @@ try {
             }
         }
     }
+    $argumentSourceMatch =
+        [string]$persistedRecord.argument_source.kind -ceq [string]$argumentSource.kind -and
+        [string]$persistedRecord.argument_source.path -ceq [string]$argumentSource.path -and
+        [uint64]$persistedRecord.argument_source.bytes -eq [uint64]$argumentSource.bytes -and
+        [string]$persistedRecord.argument_source.sha256_before -ceq [string]$argumentSource.sha256_before -and
+        [string]$persistedRecord.argument_source.sha256_after -ceq [string]$argumentSource.sha256_after -and
+        [bool]$persistedRecord.argument_source.stable -eq [bool]$argumentSource.stable
     $persistedLauncherIdentity = Read-AstroFsvProcessIdentity `
         $persistedRecord.launcher `
         'ASTRO_FSV_RUN_READBACK_FAILED' `
@@ -4129,7 +4285,7 @@ try {
             $persistedRunnerIdentity $runnerIdentity) -or
         -not (Test-AstroFsvIdentityEqual `
             $persistedChildIdentity $childIdentity) -or
-        -not $argumentsMatch) {
+        -not $argumentsMatch -or -not $argumentSourceMatch) {
         Fail-Astro 'ASTRO_FSV_RUN_READBACK_FAILED' 'persisted run record does not match the observed process/artifact state' 'preserve the session and investigate the failed durable write'
     }
     $record | ConvertTo-Json -Depth 15 -Compress | Write-Output
@@ -4235,6 +4391,7 @@ catch {
                 }
                 argument_count = $argumentCount
                 arguments = @($arguments)
+                argument_source = $argumentSource
                 live_state = [ordered]@{
                     path = $LiveStatePath
                     published = $failureLiveStatePublished
@@ -4285,6 +4442,8 @@ catch {
                 -not $persistedFailure.PSObject.Properties['failure'] -or
                 $null -eq $persistedFailure.failure -or
                 -not $persistedFailure.failure.PSObject.Properties['code'] -or
+                -not $persistedFailure.PSObject.Properties['argument_source'] -or
+                $null -eq $persistedFailure.argument_source -or
                 -not $persistedFailure.PSObject.Properties['live_state'] -or
                 $null -eq $persistedFailure.live_state -or
                 -not $persistedFailure.live_state.PSObject.Properties[
@@ -4331,6 +4490,7 @@ catch {
     exit 1
 }
 finally {
+    if ($null -ne $argumentsFileHandle) { $argumentsFileHandle.Dispose() }
     if ($null -ne $launcherLockHandle) { $launcherLockHandle.Dispose() }
     if ($null -ne $receiptHandle) { $receiptHandle.Dispose() }
     if ($null -ne $artifactHandle) { $artifactHandle.Dispose() }
