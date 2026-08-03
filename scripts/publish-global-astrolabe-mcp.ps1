@@ -100,21 +100,28 @@ function Assert-OrdinaryEntry {
 function File-Sha256 {
     param([Parameter(Mandatory)][string]$Path)
 
-    $stream = [IO.File]::Open(
-        (ConvertTo-AstroExtendedLengthPath $Path),
-        [IO.FileMode]::Open,
-        [IO.FileAccess]::Read,
-        [IO.FileShare]::Read
+    $full = [IO.Path]::GetFullPath($Path)
+    $handle = [AstroLauncherLockNative]::OpenExactProtectedReadFile(
+        $full
     )
-    $hasher = [Security.Cryptography.SHA256]::Create()
     try {
-        return (
-            [BitConverter]::ToString($hasher.ComputeHash($stream)) -replace '-', ''
-        ).ToLowerInvariant()
+        $final = ConvertFrom-AstroNativeFinalPath (
+            [AstroLauncherLockNative]::GetFileFinalPath($handle)
+        )
+        if (-not [string]::Equals(
+                $final,
+                $full,
+                [StringComparison]::OrdinalIgnoreCase
+            )) {
+            Fail-AstroGlobalPublish `
+                'ASTRO_GLOBAL_PUBLISH_FILE_IDENTITY_DRIFT' `
+                "exact hash handle resolved to '$final', expected '$full'" `
+                'preserve all state and investigate file namespace replacement'
+        }
+        return [AstroLauncherLockNative]::ComputeExactFileSha256($handle)
     }
     finally {
-        $hasher.Dispose()
-        $stream.Dispose()
+        $handle.Dispose()
     }
 }
 

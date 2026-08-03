@@ -138,23 +138,31 @@ function Invoke-AstroWorktreeGit {
 function Get-AstroFileSha256 {
     param([Parameter(Mandatory)][string]$Path)
 
-    $stream = [IO.File]::Open(
-        $Path,
-        [IO.FileMode]::Open,
-        [IO.FileAccess]::Read,
-        [IO.FileShare]::Read
+    $full = [IO.Path]::GetFullPath($Path)
+    $handle = [AstroLauncherLockNative]::OpenExactProtectedReadFile(
+        $full
     )
-    $sha = [Security.Cryptography.SHA256]::Create()
     try {
-        return (
-            [BitConverter]::ToString(
-                $sha.ComputeHash($stream)
-            ) -replace '-', ''
-        ).ToLowerInvariant()
+        $final = ConvertFrom-AstroNativeFinalPath (
+            [AstroLauncherLockNative]::GetFileFinalPath($handle)
+        )
+        if (-not [string]::Equals(
+                $final,
+                $full,
+                [StringComparison]::OrdinalIgnoreCase
+            )) {
+            throw (
+                'LAUNCHER_WORKTREE[ASTRO_WORKTREE_FILE_IDENTITY_DRIFT]: ' +
+                "{code=ASTRO_WORKTREE_FILE_IDENTITY_DRIFT; message=`"exact " +
+                "hash handle resolved to '$final', expected '$full'`"; " +
+                'remediation="preserve every worktree and investigate file ' +
+                'namespace replacement"}'
+            )
+        }
+        return [AstroLauncherLockNative]::ComputeExactFileSha256($handle)
     }
     finally {
-        $sha.Dispose()
-        $stream.Dispose()
+        $handle.Dispose()
     }
 }
 

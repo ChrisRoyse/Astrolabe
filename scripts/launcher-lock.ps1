@@ -1172,17 +1172,32 @@ public static class AstroLauncherLockNative
                         0,
                         checked((int)read)
                     );
-                    digest.TransformBlock(
+                    int transformed = digest.TransformBlock(
                         managedBuffer,
                         0,
                         checked((int)read),
                         managedBuffer,
                         0
                     );
+                    if (transformed != checked((int)read))
+                    {
+                        throw new InvalidOperationException(
+                            "exact retained digest source transformed " +
+                            transformed.ToString(CultureInfo.InvariantCulture) +
+                            " bytes after reading " +
+                            read.ToString(CultureInfo.InvariantCulture)
+                        );
+                    }
                     total += read;
                 }
                 digest.TransformFinalBlock(new byte[0], 0, 0);
                 hash = digest.Hash;
+                if (hash == null || hash.Length != 32)
+                {
+                    throw new InvalidOperationException(
+                        "exact retained digest source produced an invalid SHA-256 digest"
+                    );
+                }
             }
         }
         finally
@@ -2681,24 +2696,10 @@ function Get-AstroOrdinaryDirectoryTreeInventoryLongPath {
                         "expected '$entryFull'"
                     )
                 }
-                $stream = [IO.File]::Open(
-                    (ConvertTo-AstroExtendedLengthPath $entryFull),
-                    [IO.FileMode]::Open,
-                    [IO.FileAccess]::Read,
-                    [IO.FileShare]::Read
-                )
-                $hasher = [Security.Cryptography.SHA256]::Create()
-                try {
-                    $fileHash = (
-                        [BitConverter]::ToString(
-                            $hasher.ComputeHash($stream)
-                        ) -replace '-', ''
-                    ).ToLowerInvariant()
-                }
-                finally {
-                    $hasher.Dispose()
-                    $stream.Dispose()
-                }
+                $fileHash =
+                    [AstroLauncherLockNative]::ComputeExactFileSha256(
+                        $fileHandle
+                    )
                 $records.Add([ordered]@{
                     relative_path = $entryRelative
                     kind = 'file'

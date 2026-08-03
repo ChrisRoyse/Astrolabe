@@ -58,9 +58,14 @@ function Get-Sha256Hex {
     param([Parameter(Mandatory)][string]$LiteralPath)
     $sha = [System.Security.Cryptography.SHA256]::Create()
     try {
-        $stream = [System.IO.File]::OpenRead($LiteralPath)
+        [System.IO.Stream]$stream = [System.IO.File]::OpenRead($LiteralPath)
         try {
-            $hex = [System.BitConverter]::ToString($sha.ComputeHash($stream)) -replace '-', ''
+            # Bind the exact Stream overload. Windows PowerShell's dynamic
+            # overload binder must never choose between ComputeHash(byte[])
+            # and ComputeHash(Stream) at this pre-admission authority boundary.
+            $hex = [System.BitConverter]::ToString(
+                $sha.ComputeHash([System.IO.Stream]$stream)
+            ) -replace '-', ''
         }
         finally { $stream.Dispose() }
     }
@@ -2708,23 +2713,74 @@ function Resolve-CudaToolkitLibRoot {
     return $libRoot
 }
 
+function Initialize-AstroLauncherBoundedStreamSha256 {
+    if ($null -ne ('AstroLauncherBoundedStreamSha256' -as [type])) {
+        return
+    }
+
+    Add-Type -Language CSharp -ErrorAction Stop -TypeDefinition @'
+using System;
+using System.Globalization;
+using System.IO;
+using System.Security.Cryptography;
+using System.Text;
+
+public static class AstroLauncherBoundedStreamSha256
+{
+    private const int BufferSize = 1024 * 1024;
+
+    public static string ComputeHex(Stream stream)
+    {
+        if (stream == null) throw new ArgumentNullException("stream");
+        if (!stream.CanRead)
+            throw new InvalidOperationException("SHA-256 source stream is not readable");
+
+        byte[] buffer = new byte[BufferSize];
+        using (SHA256 digest = SHA256.Create())
+        {
+            int read;
+            while ((read = stream.Read(buffer, 0, buffer.Length)) > 0)
+            {
+                int transformed = digest.TransformBlock(buffer, 0, read, buffer, 0);
+                if (transformed != read)
+                    throw new InvalidOperationException(
+                        "SHA-256 transform consumed " +
+                        transformed.ToString(CultureInfo.InvariantCulture) +
+                        " of " + read.ToString(CultureInfo.InvariantCulture) +
+                        " bytes"
+                    );
+            }
+            digest.TransformFinalBlock(new byte[0], 0, 0);
+            byte[] hash = digest.Hash;
+            if (hash == null || hash.Length != 32)
+                throw new InvalidOperationException("SHA-256 final digest is not exactly 32 bytes");
+
+            StringBuilder hex = new StringBuilder(64);
+            for (int i = 0; i < hash.Length; i++)
+                hex.Append(hash[i].ToString("x2", CultureInfo.InvariantCulture));
+            return hex.ToString();
+        }
+    }
+}
+'@
+}
+
 function Get-AstroRetainedStreamSha256 {
-    param([Parameter(Mandatory)]$Stream)
+    param([Parameter(Mandatory)][IO.Stream]$Stream)
 
     if (-not $Stream.CanRead -or -not $Stream.CanSeek) {
         throw 'retained file digest requires one readable seekable stream'
     }
     $position = $Stream.Position
-    $sha = [Security.Cryptography.SHA256]::Create()
     try {
+        Initialize-AstroLauncherBoundedStreamSha256
         $Stream.Position = 0
-        return ([BitConverter]::ToString(
-                $sha.ComputeHash($Stream)
-            ) -replace '-', '').ToLowerInvariant()
+        return [AstroLauncherBoundedStreamSha256]::ComputeHex(
+            [IO.Stream]$Stream
+        )
     }
     finally {
         $Stream.Position = $position
-        $sha.Dispose()
     }
 }
 

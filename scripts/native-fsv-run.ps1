@@ -92,15 +92,13 @@ function Assert-NotReparseEntry([string]$Path, [string]$Description) {
 }
 
 function File-Sha256([string]$Path) {
-    $stream = [IO.File]::Open(
-        (ConvertTo-AstroExtendedLengthPath $Path),
-        [IO.FileMode]::Open,
-        [IO.FileAccess]::Read,
-        [IO.FileShare]::Read
+    $handle = [AstroLauncherLockNative]::OpenExactProtectedReadFile(
+        [IO.Path]::GetFullPath($Path)
     )
-    $hasher = [Security.Cryptography.SHA256]::Create()
-    try { return ([BitConverter]::ToString($hasher.ComputeHash($stream)) -replace '-', '').ToLowerInvariant() }
-    finally { $hasher.Dispose(); $stream.Dispose() }
+    try {
+        return [AstroLauncherLockNative]::ComputeExactFileSha256($handle)
+    }
+    finally { $handle.Dispose() }
 }
 
 function Assert-AstroFsvLifecycleAdmissionClear([string]$Workspace) {
@@ -122,21 +120,6 @@ function Enter-AstroFsvAdmissionLease([string]$Workspace) {
             'wait for the exact active claim/recovery transaction to publish durable state'
     }
     return $lease
-}
-
-function File-Sha256UnderCleanupLease([string]$Path) {
-    # The retained cleanup-readiness lease requests read/write/delete access while
-    # sharing reads only. This independent reader must therefore share all access
-    # requested by that existing lease while itself requesting only read access.
-    $stream = [IO.File]::Open(
-        (ConvertTo-AstroExtendedLengthPath $Path),
-        [IO.FileMode]::Open,
-        [IO.FileAccess]::Read,
-        [IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete
-    )
-    $hasher = [Security.Cryptography.SHA256]::Create()
-    try { return ([BitConverter]::ToString($hasher.ComputeHash($stream)) -replace '-', '').ToLowerInvariant() }
-    finally { $hasher.Dispose(); $stream.Dispose() }
 }
 
 function String-Sha256([AllowEmptyString()][string]$Value) {
@@ -2096,11 +2079,8 @@ function Open-AstroFsvArgumentJsonFile {
     Assert-NotReparseEntry $full 'arguments JSON file'
 
     try {
-        $stream = [IO.File]::Open(
-            (ConvertTo-AstroExtendedLengthPath $full),
-            [IO.FileMode]::Open,
-            [IO.FileAccess]::Read,
-            [IO.FileShare]::Read
+        $stream = [AstroLauncherLockNative]::OpenExactProtectedReadFile(
+            $full
         )
     }
     catch {
@@ -2109,21 +2089,27 @@ function Open-AstroFsvArgumentJsonFile {
             'close every writer/deleter and provide one immutable ordinary workspace file'
     }
     try {
-        if ($stream.Length -le 0 -or $stream.Length -gt 1048576) {
+        $retainedLength = Get-AstroFileLengthLongPath $full
+        if ($retainedLength -le 0 -or $retainedLength -gt 1048576) {
             Fail-Astro 'ASTRO_FSV_ARGUMENTS_FILE_LENGTH_INVALID' `
-                "arguments JSON file length is invalid: $($stream.Length) bytes ($full)" `
+                "arguments JSON file length is invalid: $retainedLength bytes ($full)" `
                 'use one nonempty strict UTF-8 JSON array no larger than 1 MiB'
         }
-        $bytes = [byte[]]::new([int]$stream.Length)
-        $offset = 0
-        while ($offset -lt $bytes.Length) {
-            $read = $stream.Read($bytes, $offset, $bytes.Length - $offset)
-            if ($read -le 0) {
-                Fail-Astro 'ASTRO_FSV_ARGUMENTS_FILE_READ_FAILED' `
-                    "arguments JSON file ended before its retained length was read: $full" `
-                    'preserve the file and investigate filesystem read instability'
-            }
-            $offset += $read
+        try {
+            $bytes = [AstroLauncherLockNative]::ReadAllBytes(
+                $stream,
+                1048576
+            )
+        }
+        catch {
+            Fail-Astro 'ASTRO_FSV_ARGUMENTS_FILE_READ_FAILED' `
+                "arguments JSON exact retained read failed: $full ($($_.Exception.Message))" `
+                'preserve the file and investigate filesystem identity or read instability'
+        }
+        if ($bytes.Length -ne $retainedLength) {
+            Fail-Astro 'ASTRO_FSV_ARGUMENTS_FILE_READ_FAILED' `
+                "arguments JSON exact retained read returned $($bytes.Length) bytes after a $retainedLength-byte observation: $full" `
+                'preserve the file and investigate filesystem identity or size drift'
         }
         if ($bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and
             $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF) {
@@ -2137,7 +2123,6 @@ function Open-AstroFsvArgumentJsonFile {
                 "arguments JSON file is not strict UTF-8: $full ($($_.Exception.Message))" `
                 'write canonical strict UTF-8 JSON without replacement characters'
         }
-        $stream.Position = 0
         return [pscustomobject]@{
             Handle = $stream
             Path = $full
@@ -2152,15 +2137,12 @@ function Open-AstroFsvArgumentJsonFile {
     }
 }
 
-function Get-AstroRetainedStreamSha256 {
-    param([Parameter(Mandatory)][IO.Stream]$Stream)
-    $Stream.Position = 0
-    $hasher = [Security.Cryptography.SHA256]::Create()
-    try { return ([BitConverter]::ToString($hasher.ComputeHash($Stream)) -replace '-', '').ToLowerInvariant() }
-    finally {
-        $hasher.Dispose()
-        $Stream.Position = 0
-    }
+function Get-AstroRetainedFileSha256 {
+    param(
+        [Parameter(Mandatory)]
+        [Microsoft.Win32.SafeHandles.SafeFileHandle]$Handle
+    )
+    return [AstroLauncherLockNative]::ComputeExactFileSha256($Handle)
 }
 
 function Assert-AstroExactObjectProperties {
@@ -2781,7 +2763,8 @@ function Open-AstroCohortCleanupReadiness {
         $fileId = [AstroLauncherLockNative]::GetFileIdentity($lease)
         $links = [AstroLauncherLockNative]::GetNumberOfLinks($lease)
         $length = Get-AstroFileLengthLongPath $ArtifactPath
-        $hash = File-Sha256UnderCleanupLease $ArtifactPath
+        $hash =
+            [AstroLauncherLockNative]::ComputeExactFileSha256($lease)
         $attributes = [IO.File]::GetAttributes(
             (ConvertTo-AstroExtendedLengthPath $ArtifactPath)
         )
@@ -4298,7 +4281,8 @@ try {
     $artifactHashAfter = File-Sha256 $artifact
     $receiptHashAfter = File-Sha256 $receiptFull
     if ($null -ne $argumentsFileHandle) {
-        $argumentFileHashAfter = Get-AstroRetainedStreamSha256 $argumentsFileHandle
+        $argumentFileHashAfter =
+            Get-AstroRetainedFileSha256 $argumentsFileHandle
         $argumentSource.sha256_after = $argumentFileHashAfter
         $argumentSource.stable =
             $argumentFileHashAfter -ceq [string]$argumentSource.sha256_before
@@ -4465,7 +4449,10 @@ try {
         $cleanupLinks =
             [AstroLauncherLockNative]::GetNumberOfLinks($artifactCleanupLease)
         $cleanupLength = Get-AstroFileLengthLongPath $artifact
-        $cleanupHash = File-Sha256UnderCleanupLease $artifact
+        $cleanupHash =
+            [AstroLauncherLockNative]::ComputeExactFileSha256(
+                $artifactCleanupLease
+            )
         $cleanupAttributes = [IO.File]::GetAttributes(
             (ConvertTo-AstroExtendedLengthPath $artifact)
         )
@@ -4773,7 +4760,9 @@ catch {
                 Test-AstroPathLongPath -LiteralPath $artifact -PathType Leaf
             ) {
                 if ($null -ne $artifactCleanupLease) {
-                    File-Sha256UnderCleanupLease $artifact
+                    [AstroLauncherLockNative]::ComputeExactFileSha256(
+                        $artifactCleanupLease
+                    )
                 }
                 else {
                     File-Sha256 $artifact

@@ -67,19 +67,63 @@ if (-not (Test-Path -LiteralPath $Cuda13RetireHelper -PathType Leaf)) {
 function Get-Sha256Hex {
     param([Parameter(Mandatory = $true)][string]$LiteralPath)
 
-    $sha = [System.Security.Cryptography.SHA256]::Create()
+    [System.IO.FileStream]$stream = [System.IO.File]::OpenRead($LiteralPath)
     try {
-        $stream = [System.IO.File]::OpenRead($LiteralPath)
-        try {
-            return ([System.BitConverter]::ToString($sha.ComputeHash($stream)) -replace '-', '').ToLowerInvariant()
-        }
-        finally {
-            $stream.Dispose()
-        }
+        return [AstroLauncherLockNative]::ComputeExactFileSha256(
+            $stream.SafeFileHandle
+        )
     }
     finally {
-        $sha.Dispose()
+        $stream.Dispose()
     }
+}
+
+function Initialize-AstroCuda13BoundedStreamSha256 {
+    if ($null -ne ('AstroCuda13BoundedStreamSha256' -as [type])) {
+        return
+    }
+
+    Add-Type -Language CSharp -ErrorAction Stop -TypeDefinition @'
+using System;
+using System.Globalization;
+using System.IO;
+using System.Security.Cryptography;
+using System.Text;
+
+public static class AstroCuda13BoundedStreamSha256
+{
+    private const int BufferSize = 1024 * 1024;
+
+    public static byte[] Compute(Stream stream)
+    {
+        if (stream == null) throw new ArgumentNullException("stream");
+        if (!stream.CanRead)
+            throw new InvalidOperationException("SHA-256 source stream is not readable");
+
+        byte[] buffer = new byte[BufferSize];
+        using (SHA256 digest = SHA256.Create())
+        {
+            int read;
+            while ((read = stream.Read(buffer, 0, buffer.Length)) > 0)
+            {
+                int transformed = digest.TransformBlock(buffer, 0, read, buffer, 0);
+                if (transformed != read)
+                    throw new InvalidOperationException(
+                        "SHA-256 transform consumed " +
+                        transformed.ToString(CultureInfo.InvariantCulture) +
+                        " of " + read.ToString(CultureInfo.InvariantCulture) +
+                        " bytes"
+                    );
+            }
+            digest.TransformFinalBlock(new byte[0], 0, 0);
+            byte[] hash = digest.Hash;
+            if (hash == null || hash.Length != 32)
+                throw new InvalidOperationException("SHA-256 final digest is not exactly 32 bytes");
+            return hash;
+        }
+    }
+}
+'@
 }
 
 # #613: this canonical shared-state boundary is also the hard stop for every
@@ -686,18 +730,15 @@ function Get-ArchiveEntries {
 function Get-ZipEntryRecordDigest {
     param([Parameter(Mandatory = $true)]$Entry)
 
-    $sha = [System.Security.Cryptography.SHA256]::Create()
+    Initialize-AstroCuda13BoundedStreamSha256
+    [IO.Stream]$stream = $Entry.Open()
     try {
-        $stream = $Entry.Open()
-        try {
-            $bytes = $sha.ComputeHash($stream)
-        }
-        finally {
-            $stream.Dispose()
-        }
+        [byte[]]$bytes = [AstroCuda13BoundedStreamSha256]::Compute(
+            [IO.Stream]$stream
+        )
     }
     finally {
-        $sha.Dispose()
+        $stream.Dispose()
     }
     $encoded = [Convert]::ToBase64String($bytes).TrimEnd('=').Replace('+', '-').Replace('/', '_')
     return "sha256=$encoded"

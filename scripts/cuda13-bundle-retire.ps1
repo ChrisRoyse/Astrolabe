@@ -58,20 +58,21 @@ function Get-AstroCuda13Sha256Bytes {
 function Get-AstroCuda13Sha256File {
     param([Parameter(Mandatory)][string]$Path)
 
-    $stream = [IO.File]::Open(
+    [IO.FileStream]$stream = [IO.File]::Open(
         (ConvertTo-AstroExtendedLengthPath $Path),
         [IO.FileMode]::Open,
         [IO.FileAccess]::Read,
         [IO.FileShare]::Read
     )
-    $sha = [Security.Cryptography.SHA256]::Create()
     try {
-        return ([BitConverter]::ToString(
-                $sha.ComputeHash($stream)
-            ) -replace '-', '').ToLowerInvariant()
+        # Hash the exact retained ordinary-file identity. The shared helper uses
+        # fixed buffers and refuses aliases/hard links instead of reopening or
+        # materializing the candidate file.
+        return [AstroLauncherLockNative]::ComputeExactFileSha256(
+            $stream.SafeFileHandle
+        )
     }
     finally {
-        $sha.Dispose()
         $stream.Dispose()
     }
 }

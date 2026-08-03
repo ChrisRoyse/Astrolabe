@@ -152,7 +152,9 @@ function Get-CbmSha256HexForStream {
     param([Parameter(Mandatory)][IO.Stream]$Stream)
     $sha = [Security.Cryptography.SHA256]::Create()
     try {
-        return Convert-CbmBytesToLowerHex -Bytes $sha.ComputeHash($Stream)
+        return Convert-CbmBytesToLowerHex -Bytes (
+            $sha.ComputeHash([IO.Stream]$Stream)
+        )
     }
     finally {
         $sha.Dispose()

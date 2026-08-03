@@ -134,19 +134,14 @@ function Assert-NotReparseEntry {
 
 function File-Sha256 {
     param([Parameter(Mandatory)][string]$Path)
-    $stream = [IO.File]::Open(
-        (ConvertTo-AstroExtendedLengthPath $Path),
-        [IO.FileMode]::Open,
-        [IO.FileAccess]::Read,
-        [IO.FileShare]::Read
+    $handle = [AstroLauncherLockNative]::OpenExactProtectedReadFile(
+        [IO.Path]::GetFullPath($Path)
     )
-    $hasher = [Security.Cryptography.SHA256]::Create()
     try {
-        return ([BitConverter]::ToString($hasher.ComputeHash($stream)) -replace '-', '').ToLowerInvariant()
+        return [AstroLauncherLockNative]::ComputeExactFileSha256($handle)
     }
     finally {
-        $hasher.Dispose()
-        $stream.Dispose()
+        $handle.Dispose()
     }
 }
 
