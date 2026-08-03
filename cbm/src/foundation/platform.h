@@ -124,6 +124,23 @@ const char *cbm_app_local_dir(void);
  * Returns static buffer or NULL if home is unavailable. */
 const char *cbm_resolve_cache_dir(void);
 
+/* Build "<cache root>/<formatted suffix>" into `out`, or fail exactly (#953).
+ *
+ * Cache-root resolution and child-path construction used to be separate string
+ * operations: each caller chose its own buffer, called snprintf, and discarded
+ * the required length. A configured root is accepted at up to CBM_SZ_1K-1
+ * bytes, so appending "/<project>.db", "/logs", or any other suffix could
+ * silently yield a DIFFERENT, truncated path. Worse, some read paths then
+ * treated that truncated path's absence as "this project is not indexed" --
+ * a silently wrong answer rather than a failure.
+ *
+ * This is the single result-bearing constructor. It refuses BEFORE any probe,
+ * open, or write, and never redirects to TEMP or home.
+ *
+ * Returns true on success. On failure it logs a structured
+ * {code, message, remediation} and returns false, leaving *out empty. */
+bool cbm_cache_child_path(char *out, size_t out_size, const char *fmt, ...);
+
 /* ── File system ───────────────────────────────────────────────── */
 
 /* Check if a path exists. */

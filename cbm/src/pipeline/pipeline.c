@@ -1254,7 +1254,13 @@ static char *resolve_db_path(const cbm_pipeline_t *p) {
         return path;
 #else
     } else {
-        snprintf(path, 1024, "%s/%s.db", cbm_resolve_cache_dir(), p->project_name);
+        /* #953: was snprintf(path, 1024, ...) with a hardcoded size and the
+         * required length discarded, so a near-capacity cache root produced a
+         * truncated database path instead of a failure. */
+        if (!cbm_cache_child_path(path, CBM_SZ_1K, "%s.db", p->project_name)) {
+            free(path);
+            return NULL;
+        }
 #endif
     }
 #ifdef ASTRO_ENV_STORE
@@ -1266,7 +1272,10 @@ static char *resolve_db_path(const cbm_pipeline_t *p) {
         free(path);
         return NULL;
     }
-    snprintf(path, 1024, "%s/%s.db", cache_dir, p->project_name);
+    if (!cbm_cache_child_path(path, CBM_SZ_1K, "%s.db", p->project_name)) {
+        free(path);
+        return NULL;
+    }
 #endif
     return path;
 }

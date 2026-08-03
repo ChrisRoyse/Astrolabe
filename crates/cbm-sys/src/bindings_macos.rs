@@ -1814,6 +1814,14 @@ unsafe extern "C" {
     pub fn cbm_resolve_cache_dir() -> *const ::std::os::raw::c_char;
 }
 unsafe extern "C" {
+    pub fn cbm_cache_child_path(
+        out: *mut ::std::os::raw::c_char,
+        out_size: usize,
+        fmt: *const ::std::os::raw::c_char,
+        ...
+    ) -> bool;
+}
+unsafe extern "C" {
     pub fn cbm_file_exists(path: *const ::std::os::raw::c_char) -> bool;
 }
 unsafe extern "C" {

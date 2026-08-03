@@ -9,7 +9,9 @@
 #include "env_store_config.h"
 #endif
 #include "foundation/constants.h"
+#include "log.h"
 #include <fcntl.h>
+#include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -615,4 +617,53 @@ const char *cbm_resolve_cache_dir(void) {
     snprintf(buf, sizeof(buf), "%s/.cache/codebase-memory-mcp", home);
 #endif
     return buf;
+}
+
+
+bool cbm_cache_child_path(char *out, size_t out_size, const char *fmt, ...) {
+    if (!out || out_size == 0) {
+        return false;
+    }
+    out[0] = '\0';
+
+    const char *root = cbm_resolve_cache_dir();
+    if (!root || !root[0]) {
+        cbm_log_error("cache.child_path_failed", "code", "CBM_CACHE_ROOT_UNRESOLVED", "message",
+                      "no cache root could be resolved for a cache child path", "remediation",
+                      "configure an explicit cache root and retry");
+        return false;
+    }
+
+    char suffix[CBM_SZ_1K];
+    va_list args;
+    va_start(args, fmt);
+    int suffix_len = vsnprintf(suffix, sizeof(suffix), fmt, args);
+    va_end(args);
+    if (suffix_len < 0 || (size_t)suffix_len >= sizeof(suffix)) {
+        cbm_log_error("cache.child_path_failed", "code", "CBM_CACHE_CHILD_SUFFIX_OVERFLOW",
+                      "message", "a cache child path suffix could not be represented exactly",
+                      "remediation", "shorten the project name or suffix and retry");
+        return false;
+    }
+
+    /* The exact required length is computed and compared; truncation is never
+     * accepted, and the failure names the measured sizes so the operator can
+     * see precisely how far over capacity the configuration is. */
+    int written = snprintf(out, out_size, "%s/%s", root, suffix);
+    if (written < 0 || (size_t)written >= out_size) {
+        char required[CBM_SZ_32];
+        char capacity[CBM_SZ_32];
+        char root_len[CBM_SZ_32];
+        (void)snprintf(required, sizeof(required), "%d", written < 0 ? -1 : written + 1);
+        (void)snprintf(capacity, sizeof(capacity), "%zu", out_size);
+        (void)snprintf(root_len, sizeof(root_len), "%zu", strlen(root));
+        out[0] = '\0';
+        cbm_log_error("cache.child_path_failed", "code", "CBM_CACHE_CHILD_PATH_OVERFLOW", "suffix",
+                      suffix, "cache_root_bytes", root_len, "required_bytes", required,
+                      "capacity_bytes", capacity, "message",
+                      "the cache child path exceeds its exact capacity", "remediation",
+                      "shorten the configured cache root, then retry");
+        return false;
+    }
+    return true;
 }

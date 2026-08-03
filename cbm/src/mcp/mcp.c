@@ -11452,12 +11452,13 @@ static void maybe_auto_index(cbm_mcp_server_t *srv) {
     if (home) {
 #endif
         char db_check[CBM_SZ_1K];
-#ifdef ASTRO_ENV_STORE
-        snprintf(db_check, sizeof(db_check), "%s/%s.db", session_cache, srv->session_project);
-#else
-        snprintf(db_check, sizeof(db_check), "%s/%s.db", cbm_resolve_cache_dir(),
-                 srv->session_project);
-#endif
+        /* #953: this probe treats absence as "not yet indexed". A truncated
+         * path is always absent, so an unchecked build here silently re-indexes
+         * an already-indexed project -- a wrong answer, not a failure. Refuse
+         * exactly instead of probing a path we could not construct. */
+        if (!cbm_cache_child_path(db_check, sizeof(db_check), "%s.db", srv->session_project)) {
+            return;
+        }
         if (cbm_file_size(db_check) >= 0) {
             /* Already indexed → register watcher for change detection */
             cbm_log_info("autoindex.skip", "reason", "already_indexed", "project",
