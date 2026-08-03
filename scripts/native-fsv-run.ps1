@@ -2651,7 +2651,11 @@ function Read-AstroFsvCohortOwnerEntries {
             Fail-Astro $Code "$Description has an invalid or duplicate process entry '$key'" `
                 'preserve the lifecycle state and investigate incomplete multi-process provenance'
         }
-        $result.Add([ordered]@{ role = $role; ordinal = $ordinal; identity = $identity })
+        $result.Add([pscustomobject][ordered]@{
+            role = $role
+            ordinal = $ordinal
+            identity = $identity
+        })
     }
     if ($ExpectedProcessCount -eq ($ResidentCount + 1) -and
         (@($result | Where-Object role -ceq 'indexer').Count -ne 1 -or
@@ -2933,7 +2937,7 @@ function Invoke-AstroResidentCohort {
     }
     $processRecords = {
         return @($processStates | ForEach-Object {
-            [ordered]@{
+            [pscustomobject][ordered]@{
                 role = [string]$_.role
                 ordinal = [int]$_.ordinal
                 identity = $_.identity

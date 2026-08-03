@@ -791,7 +791,7 @@ function Read-AstroFsvV3ProcessEntries {
                 "$Description contains an invalid or duplicate role/process generation (role=$role; ordinal=$ordinal; identity=$identityKey)" `
                 'preserve the session and investigate incomplete multi-process provenance'
         }
-        $result.Add([ordered]@{
+        $result.Add([pscustomobject][ordered]@{
             role = $role
             ordinal = $ordinal
             identity = $identity
