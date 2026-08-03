@@ -585,7 +585,8 @@ public static class AstroLauncherLockNative
     private static SafeFileHandle OpenExactOrdinaryRead(
         string path,
         uint shareMode,
-        string description
+        string description,
+        bool requireSingleLink
     )
     {
         SafeFileHandle handle = CreateFileW(
@@ -615,7 +616,7 @@ public static class AstroLauncherLockNative
                     description + " must be an ordinary non-reparse file: " + path
                 );
             }
-            if (information.NumberOfLinks != 1)
+            if (requireSingleLink && information.NumberOfLinks != 1)
             {
                 throw new InvalidOperationException(
                     description + " must have one filesystem link; observed " +
@@ -633,7 +634,22 @@ public static class AstroLauncherLockNative
 
     public static SafeFileHandle OpenExactProtectedReadFile(string path)
     {
-        return OpenExactOrdinaryRead(path, FILE_SHARE_READ, "protected evidence file");
+        return OpenExactOrdinaryRead(
+            path,
+            FILE_SHARE_READ,
+            "protected evidence file",
+            true
+        );
+    }
+
+    public static SafeFileHandle OpenProtectedOrdinaryReadFile(string path)
+    {
+        return OpenExactOrdinaryRead(
+            path,
+            FILE_SHARE_READ,
+            "protected ordinary source file",
+            false
+        );
     }
 
     public static SafeFileHandle OpenExactSharedDeleteReadFile(string path)
@@ -641,7 +657,8 @@ public static class AstroLauncherLockNative
         return OpenExactOrdinaryRead(
             path,
             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-            "shared-delete evidence file"
+            "shared-delete evidence file",
+            true
         );
     }
 
@@ -1099,12 +1116,22 @@ public static class AstroLauncherLockNative
         return result;
     }
 
-    public static string ComputeExactFileSha256(SafeFileHandle handle)
+    private static string ComputeRetainedFileSha256(
+        SafeFileHandle handle,
+        bool requireSingleLink
+    )
     {
-        RequireExactOrdinarySingleLinkFile(
-            handle,
-            "exact retained digest source"
-        );
+        string description = requireSingleLink
+            ? "exact retained digest source"
+            : "retained ordinary digest source";
+        if (requireSingleLink)
+        {
+            RequireExactOrdinarySingleLinkFile(handle, description);
+        }
+        else
+        {
+            RequireOrdinaryFile(handle, description);
+        }
         long sizeBefore;
         if (!GetFileSizeEx(handle, out sizeBefore))
         {
@@ -1217,6 +1244,16 @@ public static class AstroLauncherLockNative
         return BitConverter.ToString(hash).Replace("-", "").ToLowerInvariant();
     }
 
+    public static string ComputeExactFileSha256(SafeFileHandle handle)
+    {
+        return ComputeRetainedFileSha256(handle, true);
+    }
+
+    public static string ComputeOrdinaryFileSha256(SafeFileHandle handle)
+    {
+        return ComputeRetainedFileSha256(handle, false);
+    }
+
     public static void FlushExactFile(SafeFileHandle handle)
     {
         if (!FlushFileBuffers(handle))
@@ -1233,6 +1270,23 @@ public static class AstroLauncherLockNative
         string description
     )
     {
+        RequireOrdinaryFile(handle, description);
+        BY_HANDLE_FILE_INFORMATION information =
+            ReadBasicInformation(handle, description);
+        if (information.NumberOfLinks != 1)
+        {
+            throw new InvalidOperationException(
+                description + " must retain exactly one filesystem link; observed " +
+                information.NumberOfLinks
+            );
+        }
+    }
+
+    private static void RequireOrdinaryFile(
+        SafeFileHandle handle,
+        string description
+    )
+    {
         if (handle == null || handle.IsInvalid || handle.IsClosed)
         {
             throw new ObjectDisposedException(description + " retained handle");
@@ -1245,13 +1299,6 @@ public static class AstroLauncherLockNative
         {
             throw new InvalidOperationException(
                 description + " must remain an ordinary non-reparse file"
-            );
-        }
-        if (information.NumberOfLinks != 1)
-        {
-            throw new InvalidOperationException(
-                description + " must retain exactly one filesystem link; observed " +
-                information.NumberOfLinks
             );
         }
     }

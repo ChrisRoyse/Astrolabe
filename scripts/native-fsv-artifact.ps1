@@ -145,6 +145,19 @@ function File-Sha256 {
     }
 }
 
+function Source-File-Sha256 {
+    param([Parameter(Mandatory)][string]$Path)
+    $handle = [AstroLauncherLockNative]::OpenProtectedOrdinaryReadFile(
+        [IO.Path]::GetFullPath($Path)
+    )
+    try {
+        return [AstroLauncherLockNative]::ComputeOrdinaryFileSha256($handle)
+    }
+    finally {
+        $handle.Dispose()
+    }
+}
+
 function Get-AstroFsvExactFileIdentity {
     param([Parameter(Mandatory)][string]$Path)
 
@@ -4562,7 +4575,7 @@ try {
                     'discard this build, restore the frozen checkout, and rebuild from a fresh launcher lease'
             }
 
-            $sourceHashBefore = File-Sha256 $source
+            $sourceHashBefore = Source-File-Sha256 $source
             $sourceItem = Get-AstroFileInfoLongPath $source
             $hashParent = Join-Path (Join-Path $evidenceRoot $TreeSha) $sourceHashBefore
             $finalDirectory = Join-Path $hashParent $SessionId
@@ -4583,7 +4596,7 @@ try {
                 $artifactName = [IO.Path]::GetFileName($source)
                 $staged = Join-Path $publishingDirectory $artifactName
                 Copy-FileDurable $source $staged
-                $sourceHashAfter = File-Sha256 $source
+                $sourceHashAfter = Source-File-Sha256 $source
                 $stagedHash = File-Sha256 $staged
                 $stagedItem = Get-AstroFileInfoLongPath $staged
                 if ($sourceHashBefore -cne $sourceHashAfter -or $sourceHashBefore -cne $stagedHash -or
