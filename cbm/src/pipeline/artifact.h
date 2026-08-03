@@ -12,9 +12,11 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+#include "foundation/constants.h"
+
 #define CBM_ARTIFACT_FILENAME "graph.db.zst"
 #define CBM_ARTIFACT_META "artifact.json"
-#define CBM_ARTIFACT_DIR ".codebase-memory"
+#define CBM_ARTIFACT_DIR CBM_REPOSITORY_STATE_DIR
 
 /* Export quality levels */
 enum {

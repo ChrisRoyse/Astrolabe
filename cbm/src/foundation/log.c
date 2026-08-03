@@ -161,10 +161,12 @@ static const char *level_str(CBMLogLevel level) {
 }
 
 static void append_char(char *buf, size_t bufsz, size_t *pos, char ch) {
-    if (*pos < bufsz - 1) {
+    if (buf && bufsz > 0 && *pos < bufsz - 1) {
         buf[*pos] = ch;
     }
-    (*pos)++;
+    if (*pos < SIZE_MAX) {
+        (*pos)++;
+    }
 }
 
 static void append_raw(char *buf, size_t bufsz, size_t *pos, const char *s) {
@@ -254,6 +256,47 @@ static void emit_line_locked(const char *line) {
     (void)fprintf(stderr, "%s\n", line);
 }
 
+static size_t format_log_line(char *line_buf, size_t line_size, CBMLogLevel level, const char *msg,
+                              va_list args) {
+    size_t pos = 0;
+    if (g_log_format == CBM_LOG_FORMAT_JSON) {
+        append_raw(line_buf, line_size, &pos, "{\"level\":");
+        append_json_string(line_buf, line_size, &pos, level_str(level));
+        append_raw(line_buf, line_size, &pos, ",\"event\":");
+        append_json_string(line_buf, line_size, &pos, msg ? msg : "");
+        for (;;) {
+            const char *key = va_arg(args, const char *);
+            if (!key) {
+                break;
+            }
+            const char *val = va_arg(args, const char *);
+            append_char(line_buf, line_size, &pos, ',');
+            append_json_string(line_buf, line_size, &pos, key);
+            append_char(line_buf, line_size, &pos, ':');
+            append_json_string(line_buf, line_size, &pos, val ? val : "");
+        }
+        append_char(line_buf, line_size, &pos, '}');
+    } else {
+        append_raw(line_buf, line_size, &pos, "level=");
+        append_text_atom(line_buf, line_size, &pos, level_str(level));
+        append_raw(line_buf, line_size, &pos, " msg=");
+        append_text_atom(line_buf, line_size, &pos, msg ? msg : "");
+        for (;;) {
+            const char *key = va_arg(args, const char *);
+            if (!key) {
+                break;
+            }
+            const char *val = va_arg(args, const char *);
+            append_char(line_buf, line_size, &pos, ' ');
+            append_text_atom(line_buf, line_size, &pos, key);
+            append_char(line_buf, line_size, &pos, '=');
+            append_text_atom(line_buf, line_size, &pos, val ? val : "");
+        }
+    }
+    finish_line(line_buf, line_size, pos);
+    return pos;
+}
+
 void cbm_log(CBMLogLevel level, const char *msg, ...) {
     log_lock();
     if (level < g_log_level) {
@@ -261,49 +304,52 @@ void cbm_log(CBMLogLevel level, const char *msg, ...) {
         return;
     }
 
-    char line_buf[CBM_SZ_4K];
-    size_t pos = 0;
+    char stack_line[CBM_SZ_4K];
     va_list args;
     va_start(args, msg);
-
-    if (g_log_format == CBM_LOG_FORMAT_JSON) {
-        append_raw(line_buf, sizeof(line_buf), &pos, "{\"level\":");
-        append_json_string(line_buf, sizeof(line_buf), &pos, level_str(level));
-        append_raw(line_buf, sizeof(line_buf), &pos, ",\"event\":");
-        append_json_string(line_buf, sizeof(line_buf), &pos, msg ? msg : "");
-        for (;;) {
-            const char *key = va_arg(args, const char *);
-            if (!key) {
-                break;
-            }
-            const char *val = va_arg(args, const char *);
-            append_char(line_buf, sizeof(line_buf), &pos, ',');
-            append_json_string(line_buf, sizeof(line_buf), &pos, key);
-            append_char(line_buf, sizeof(line_buf), &pos, ':');
-            append_json_string(line_buf, sizeof(line_buf), &pos, val ? val : "");
-        }
-        append_char(line_buf, sizeof(line_buf), &pos, '}');
-    } else {
-        append_raw(line_buf, sizeof(line_buf), &pos, "level=");
-        append_text_atom(line_buf, sizeof(line_buf), &pos, level_str(level));
-        append_raw(line_buf, sizeof(line_buf), &pos, " msg=");
-        append_text_atom(line_buf, sizeof(line_buf), &pos, msg ? msg : "");
-        for (;;) {
-            const char *key = va_arg(args, const char *);
-            if (!key) {
-                break;
-            }
-            const char *val = va_arg(args, const char *);
-            append_char(line_buf, sizeof(line_buf), &pos, ' ');
-            append_text_atom(line_buf, sizeof(line_buf), &pos, key);
-            append_char(line_buf, sizeof(line_buf), &pos, '=');
-            append_text_atom(line_buf, sizeof(line_buf), &pos, val ? val : "");
-        }
+    va_list stack_args;
+    va_copy(stack_args, args);
+    size_t line_len = format_log_line(stack_line, sizeof(stack_line), level, msg, stack_args);
+    va_end(stack_args);
+    if (line_len == SIZE_MAX) {
+        va_end(args);
+        (void)fprintf(stderr,
+                      "level=error msg=log.length_overflow original_event=%s remediation="
+                      "reduce_the_diagnostic_field_sizes_and_retry\n",
+                      msg ? msg : "");
+        log_unlock();
+        return;
     }
+    if (line_len < sizeof(stack_line)) {
+        va_end(args);
+        emit_line_locked(stack_line);
+        log_unlock();
+        return;
+    }
+    char *line_buf = malloc(line_len + 1);
+    if (!line_buf) {
+        va_end(args);
+        (void)fprintf(stderr,
+                      "level=error msg=log.allocation_failed original_event=%s requested_bytes=%zu "
+                      "remediation=free_memory_and_retry\n",
+                      msg ? msg : "", line_len + 1);
+        log_unlock();
+        return;
+    }
+    size_t written = format_log_line(line_buf, line_len + 1, level, msg, args);
     va_end(args);
 
-    finish_line(line_buf, sizeof(line_buf), pos);
+    if (written != line_len) {
+        free(line_buf);
+        (void)fprintf(stderr,
+                      "level=error msg=log.format_length_mismatch original_event=%s "
+                      "remediation=inspect_variadic_log_arguments\n",
+                      msg ? msg : "");
+        log_unlock();
+        return;
+    }
     emit_line_locked(line_buf);
+    free(line_buf);
     log_unlock();
 }
 

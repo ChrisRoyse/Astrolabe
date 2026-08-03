@@ -52,7 +52,7 @@ static const char *ALWAYS_SKIP_DIRS[] = {
     /* Deploy */
     ".vercel", ".netlify", "deploy", "deployed",
     /* Misc */
-    ".qdrant_code_embeddings", ".tmp", "vendor", "vendored", NULL};
+    ".qdrant_code_embeddings", ".tmp", CBM_REPOSITORY_STATE_DIR, "vendor", "vendored", NULL};
 
 /* ── Ignored suffixes ───────────────────────────────── */
 
@@ -127,7 +127,15 @@ static const char *IGNORED_JSON_FILES[] = {"package.json",
 
 static bool str_in_list(const char *s, const char *const *list) {
     for (int i = 0; list[i]; i++) {
+#ifdef _WIN32
+        /* Match the filesystem's component semantics.  FindFirstFileW returns
+         * the stored spelling, but ordinary Windows lookups are
+         * case-insensitive; an alternate-case state/cache directory is still
+         * the same namespace object and must not be rediscovered as source. */
+        if (_stricmp(s, list[i]) == 0) {
+#else
         if (strcmp(s, list[i]) == 0) {
+#endif
             return true;
         }
     }
@@ -564,13 +572,14 @@ static const char *local_rel_path(const char *rel_path, const char *local_prefix
 /* Non-negatable safety core: built-in skip dirs that a .cbmignore negation
  * can NEVER un-skip. A repo-committed .cbmignore must not be able to defeat
  * OOM/safety skips: .git holds VCS internals (and the info/exclude sources,
- * #489), node_modules explodes discovery, and the worktree-internal dirs
+ * #489), node_modules explodes discovery, the repository state directory is
+ * Astrolabe-owned output rather than source, and the worktree-internal dirs
  * (.worktrees / .claude-worktrees, the worktree entries in ALWAYS_SKIP_DIRS)
  * contain parallel checkouts of the same repo whose indexing would duplicate
  * the whole codebase (#802). */
 static bool is_safety_core_dir(const char *name) {
-    static const char *const SAFETY_CORE_DIRS[] = {".git", "node_modules", ".worktrees",
-                                                   ".claude-worktrees", NULL};
+    static const char *const SAFETY_CORE_DIRS[] = {
+        ".git", "node_modules", CBM_REPOSITORY_STATE_DIR, ".worktrees", ".claude-worktrees", NULL};
     return str_in_list(name, SAFETY_CORE_DIRS);
 }
 

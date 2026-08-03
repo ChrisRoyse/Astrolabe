@@ -12,6 +12,7 @@
 
 #include "astro_spawn.h"
 
+#include <stdint.h>
 #include <stdbool.h>
 #include <stdlib.h>
 #include <string.h>
@@ -24,6 +25,7 @@
 #else
 #include <errno.h>
 #include <fcntl.h>
+#include <poll.h>
 #include <spawn.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -97,6 +99,36 @@ static bool spawn_buf_append(spawn_buf_t *buf, const char *src, size_t n) {
 static bool spawn_buf_seal(spawn_buf_t *buf) {
     /* An empty capture still owes the caller a NUL-terminated buffer. */
     return buf->data != NULL || spawn_buf_append(buf, "", 0);
+}
+
+typedef enum {
+    SPAWN_PREFIX_OK = 0,
+    SPAWN_PREFIX_NOMEM,
+    SPAWN_PREFIX_OVERFLOW,
+} spawn_prefix_result_t;
+
+static spawn_prefix_result_t spawn_buf_append_prefix(spawn_buf_t *buf, const char *src, size_t n,
+                                                      size_t retained_limit,
+                                                      uint64_t *total_len, bool *truncated) {
+    if (UINT64_MAX - *total_len < (uint64_t)n) {
+        return SPAWN_PREFIX_OVERFLOW;
+    }
+    if (buf->len > retained_limit) {
+        return SPAWN_PREFIX_OVERFLOW;
+    }
+    *total_len += (uint64_t)n;
+    size_t available = retained_limit - buf->len;
+    size_t retain = n < available ? n : available;
+    if (buf->len == SIZE_MAX || retain > SIZE_MAX - buf->len - 1) {
+        return SPAWN_PREFIX_OVERFLOW;
+    }
+    if (retain > 0 && !spawn_buf_append(buf, src, retain)) {
+        return SPAWN_PREFIX_NOMEM;
+    }
+    if (retain < n) {
+        *truncated = true;
+    }
+    return SPAWN_PREFIX_OK;
 }
 
 #ifdef _WIN32
@@ -265,15 +297,85 @@ static void free_wide_argv(wchar_t **wargv, size_t count) {
     free(wargv);
 }
 
-int cbm_spawn_capture(const char *const *argv, char **out_data, size_t *out_len,
-                      cbm_spawn_error_t *err) {
+typedef struct {
+    HANDLE read_handle;
+    spawn_buf_t buffer;
+    size_t retained_limit;
+    uint64_t total_len;
+    bool truncated;
+    int capture_code;
+    DWORD read_error;
+    volatile LONG references;
+} spawn_stderr_reader_t;
+
+static void spawn_stderr_reader_release(spawn_stderr_reader_t *reader) {
+    if (reader && InterlockedDecrement(&reader->references) == 0) {
+        free(reader->buffer.data);
+        free(reader);
+    }
+}
+
+static DWORD WINAPI spawn_stderr_reader(LPVOID opaque) {
+    spawn_stderr_reader_t *reader = (spawn_stderr_reader_t *)opaque;
+    char chunk[SPAWN_READ_CHUNK];
+    bool retain = true;
+    for (;;) {
+        DWORD got = 0;
+        if (!ReadFile(reader->read_handle, chunk, (DWORD)sizeof(chunk), &got, NULL)) {
+            DWORD error = GetLastError();
+            if (error != ERROR_BROKEN_PIPE) {
+                reader->capture_code = CBM_SPAWN_E_READ;
+                reader->read_error = error;
+            }
+            break;
+        }
+        if (got == 0) {
+            break;
+        }
+        if (retain) {
+            spawn_prefix_result_t append =
+                spawn_buf_append_prefix(&reader->buffer, chunk, (size_t)got,
+                                        reader->retained_limit, &reader->total_len,
+                                        &reader->truncated);
+            if (append != SPAWN_PREFIX_OK) {
+                reader->capture_code =
+                    append == SPAWN_PREFIX_NOMEM ? CBM_SPAWN_E_NOMEM : CBM_SPAWN_E_READ;
+                reader->read_error = append == SPAWN_PREFIX_NOMEM
+                                         ? ERROR_NOT_ENOUGH_MEMORY
+                                         : ERROR_ARITHMETIC_OVERFLOW;
+                retain = false;
+            }
+        } else if (!retain) {
+            if (UINT64_MAX - reader->total_len < (uint64_t)got) {
+                reader->capture_code = CBM_SPAWN_E_READ;
+                reader->read_error = ERROR_ARITHMETIC_OVERFLOW;
+            } else {
+                reader->total_len += (uint64_t)got;
+                reader->truncated = true;
+            }
+        }
+    }
+    CloseHandle(reader->read_handle);
+    reader->read_handle = NULL;
+    spawn_stderr_reader_release(reader);
+    return 0;
+}
+
+static int spawn_capture_impl(const char *const *argv, char **out_data, size_t *out_len,
+                              size_t stderr_limit, cbm_spawn_bounded_capture_t *out_stderr,
+                              bool capture_stderr,
+                              cbm_spawn_error_t *err) {
     if (out_data) {
         *out_data = NULL;
     }
     if (out_len) {
         *out_len = 0;
     }
-    if (!argv || !argv[0] || !argv[0][0] || !out_data || !out_len) {
+    if (out_stderr) {
+        memset(out_stderr, 0, sizeof(*out_stderr));
+    }
+    if (!argv || !argv[0] || !argv[0][0] || !out_data || !out_len ||
+        (capture_stderr && (!out_stderr || stderr_limit == 0))) {
         return spawn_fail(err, CBM_SPAWN_E_INVALID_ARGV, "CBM_SPAWN_E_INVALID_ARGV",
                           "spawn requires a non-empty argv and output pointers",
                           "pass argv[0] plus a NULL-terminated argument array", 0, -1);
@@ -358,12 +460,67 @@ int cbm_spawn_capture(const char *const *argv, char **out_data, size_t *out_len,
                           -1);
     }
 
-    /* Inherit ONLY the stdout write-end and NUL (CBM #798): a git-for-Windows
-     * child classifies every inherited handle at startup and deadlocks on an
-     * inherited socket/AFD handle. */
-    HANDLE inherit[2];
+    HANDLE stderr_wr = NULL;
+    HANDLE stderr_thread = NULL;
+    spawn_stderr_reader_t *stderr_reader = NULL;
+    if (capture_stderr) {
+        HANDLE stderr_rd = NULL;
+        if (!CreatePipe(&stderr_rd, &stderr_wr, &sa, 0)) {
+            DWORD gle = GetLastError();
+            CloseHandle(rd);
+            CloseHandle(wr);
+            CloseHandle(nul);
+            free(cmdline.data);
+            free(app);
+            return spawn_fail(err, CBM_SPAWN_E_PIPE, "CBM_SPAWN_E_PIPE",
+                              "could not create the child stderr pipe",
+                              "check process handle limits and retry", (unsigned long)gle, -1);
+        }
+        (void)SetHandleInformation(stderr_rd, HANDLE_FLAG_INHERIT, 0);
+        stderr_reader = (spawn_stderr_reader_t *)calloc(1, sizeof(*stderr_reader));
+        if (!stderr_reader) {
+            CloseHandle(stderr_rd);
+            CloseHandle(stderr_wr);
+            CloseHandle(rd);
+            CloseHandle(wr);
+            CloseHandle(nul);
+            free(cmdline.data);
+            free(app);
+            return spawn_fail(err, CBM_SPAWN_E_NOMEM, "CBM_SPAWN_E_NOMEM",
+                              "out of memory creating the child stderr reader",
+                              "retry after reducing memory pressure on the host", 0, -1);
+        }
+        stderr_reader->read_handle = stderr_rd;
+        stderr_reader->retained_limit = stderr_limit;
+        stderr_reader->references = 2;
+        stderr_thread = CreateThread(NULL, 0, spawn_stderr_reader, stderr_reader, 0, NULL);
+        if (!stderr_thread) {
+            DWORD gle = GetLastError();
+            CloseHandle(stderr_rd);
+            CloseHandle(stderr_wr);
+            CloseHandle(rd);
+            CloseHandle(wr);
+            CloseHandle(nul);
+            free(cmdline.data);
+            free(app);
+            free(stderr_reader);
+            return spawn_fail(err, CBM_SPAWN_E_PIPE, "CBM_SPAWN_E_PIPE",
+                              "could not start the child stderr drain",
+                              "check process thread limits and retry", (unsigned long)gle, -1);
+        }
+    }
+
+    /* Inherit ONLY the exact standard-stream handles (CBM #798): a
+     * git-for-Windows child classifies every inherited handle at startup and
+     * deadlocks on an inherited socket/AFD handle. */
+    HANDLE inherit[3];
+    size_t inherit_count = 0;
     inherit[0] = wr;
     inherit[1] = nul;
+    inherit_count = 2;
+    if (capture_stderr) {
+        inherit[inherit_count++] = stderr_wr;
+    }
 
     SIZE_T attr_size = 0;
     InitializeProcThreadAttributeList(NULL, 1, 0, &attr_size);
@@ -371,7 +528,7 @@ int cbm_spawn_capture(const char *const *argv, char **out_data, size_t *out_len,
     bool attr_init = attr && InitializeProcThreadAttributeList(attr, 1, 0, &attr_size);
     bool prepared =
         attr_init && UpdateProcThreadAttribute(attr, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, inherit,
-                                               sizeof(inherit), NULL, NULL);
+                                               inherit_count * sizeof(inherit[0]), NULL, NULL);
     DWORD attr_gle = prepared ? 0 : GetLastError();
 
     STARTUPINFOEXW si;
@@ -380,7 +537,7 @@ int cbm_spawn_capture(const char *const *argv, char **out_data, size_t *out_len,
     si.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
     si.StartupInfo.hStdInput = nul;
     si.StartupInfo.hStdOutput = wr;
-    si.StartupInfo.hStdError = nul;
+    si.StartupInfo.hStdError = capture_stderr ? stderr_wr : nul;
     si.lpAttributeList = attr;
 
     PROCESS_INFORMATION pi;
@@ -404,10 +561,18 @@ int cbm_spawn_capture(const char *const *argv, char **out_data, size_t *out_len,
     free(cmdline.data);
     free(app);
     CloseHandle(wr); /* the child owns the write-end now */
+    if (capture_stderr) {
+        CloseHandle(stderr_wr);
+    }
     CloseHandle(nul);
 
     if (!created) {
         CloseHandle(rd);
+        if (capture_stderr) {
+            (void)WaitForSingleObject(stderr_thread, INFINITE);
+            CloseHandle(stderr_thread);
+            spawn_stderr_reader_release(stderr_reader);
+        }
         return spawn_fail(err, CBM_SPAWN_E_SPAWN, "CBM_SPAWN_E_SPAWN",
                           "the child process could not be created",
                           "verify the executable is runnable and the host is not out of handles",
@@ -416,8 +581,12 @@ int cbm_spawn_capture(const char *const *argv, char **out_data, size_t *out_len,
     CloseHandle(pi.hThread);
 
     spawn_buf_t buf = {NULL, 0, 0};
+    spawn_buf_t stderr_buf = {NULL, 0, 0};
+    uint64_t stderr_total_len = 0;
+    bool stderr_truncated = false;
     char chunk[SPAWN_READ_CHUNK];
     bool read_ok = true;
+    int read_failure_code = CBM_SPAWN_OK;
     DWORD read_gle = 0;
     for (;;) {
         DWORD got = 0;
@@ -425,6 +594,7 @@ int cbm_spawn_capture(const char *const *argv, char **out_data, size_t *out_len,
             DWORD gle = GetLastError();
             if (gle != ERROR_BROKEN_PIPE) {
                 read_ok = false;
+                read_failure_code = CBM_SPAWN_E_READ;
                 read_gle = gle;
             }
             break;
@@ -434,7 +604,8 @@ int cbm_spawn_capture(const char *const *argv, char **out_data, size_t *out_len,
         }
         if (!spawn_buf_append(&buf, chunk, (size_t)got)) {
             read_ok = false;
-            read_gle = 0;
+            read_failure_code = CBM_SPAWN_E_NOMEM;
+            read_gle = ERROR_NOT_ENOUGH_MEMORY;
             break;
         }
     }
@@ -446,15 +617,58 @@ int cbm_spawn_capture(const char *const *argv, char **out_data, size_t *out_len,
     DWORD wait_gle = got_code ? 0 : GetLastError();
     CloseHandle(pi.hProcess);
 
-    if (!read_ok) {
+    bool stderr_read_ok = true;
+    int stderr_failure_code = CBM_SPAWN_OK;
+    DWORD stderr_read_gle = 0;
+    if (capture_stderr) {
+        DWORD stderr_wait = WaitForSingleObject(stderr_thread, INFINITE);
+        if (stderr_wait != WAIT_OBJECT_0) {
+            stderr_read_ok = false;
+            stderr_failure_code = CBM_SPAWN_E_READ;
+            stderr_read_gle =
+                stderr_wait == WAIT_FAILED ? GetLastError() : ERROR_GEN_FAILURE;
+        } else {
+            stderr_buf = stderr_reader->buffer;
+            stderr_reader->buffer.data = NULL;
+            stderr_reader->buffer.len = 0;
+            stderr_reader->buffer.cap = 0;
+            stderr_total_len = stderr_reader->total_len;
+            stderr_truncated = stderr_reader->truncated;
+            if (stderr_reader->capture_code != CBM_SPAWN_OK || stderr_reader->read_error != 0) {
+                stderr_read_ok = false;
+                stderr_failure_code = stderr_reader->capture_code != CBM_SPAWN_OK
+                                          ? stderr_reader->capture_code
+                                          : CBM_SPAWN_E_READ;
+                stderr_read_gle = stderr_reader->read_error;
+            }
+        }
+        CloseHandle(stderr_thread);
+        spawn_stderr_reader_release(stderr_reader);
+        stderr_reader = NULL;
+    }
+
+    if (!read_ok || !stderr_read_ok) {
         free(buf.data);
-        return spawn_fail(err, CBM_SPAWN_E_READ, "CBM_SPAWN_E_READ",
-                          "the child's stdout could not be captured",
-                          "retry; if it persists, capture the OS error and file an issue",
-                          (unsigned long)read_gle, got_code ? (int)code : -1);
+        free(stderr_buf.data);
+        int failure_code =
+            read_failure_code == CBM_SPAWN_E_READ || stderr_failure_code == CBM_SPAWN_E_READ
+                ? CBM_SPAWN_E_READ
+                : CBM_SPAWN_E_NOMEM;
+        return spawn_fail(
+            err, failure_code,
+            failure_code == CBM_SPAWN_E_NOMEM ? "CBM_SPAWN_E_NOMEM" : "CBM_SPAWN_E_READ",
+            failure_code == CBM_SPAWN_E_NOMEM
+                ? "out of memory retaining the child's bounded output"
+                : "the child's output streams could not be captured completely",
+            failure_code == CBM_SPAWN_E_NOMEM
+                ? "retry after reducing memory pressure on the host"
+                : "retry; if it persists, capture the OS error and file an issue",
+            (unsigned long)(!read_ok ? read_gle : stderr_read_gle),
+            got_code ? (int)code : -1);
     }
     if (!got_code) {
         free(buf.data);
+        free(stderr_buf.data);
         return spawn_fail(err, CBM_SPAWN_E_WAIT, "CBM_SPAWN_E_WAIT",
                           "the child process could not be reaped",
                           "retry; if it persists, capture the OS error and file an issue",
@@ -462,33 +676,72 @@ int cbm_spawn_capture(const char *const *argv, char **out_data, size_t *out_len,
     }
     if (!spawn_buf_seal(&buf)) {
         free(buf.data);
+        free(stderr_buf.data);
         return spawn_fail(err, CBM_SPAWN_E_NOMEM, "CBM_SPAWN_E_NOMEM",
                           "out of memory sealing the captured output",
+                          "retry after reducing memory pressure on the host", 0, (int)code);
+    }
+    if (capture_stderr && !spawn_buf_seal(&stderr_buf)) {
+        free(buf.data);
+        free(stderr_buf.data);
+        return spawn_fail(err, CBM_SPAWN_E_NOMEM, "CBM_SPAWN_E_NOMEM",
+                          "out of memory sealing the captured stderr",
                           "retry after reducing memory pressure on the host", 0, (int)code);
     }
 
     *out_data = buf.data;
     *out_len = buf.len;
+    if (capture_stderr) {
+        out_stderr->data = stderr_buf.data;
+        out_stderr->len = stderr_buf.len;
+        out_stderr->total_len = stderr_total_len;
+        out_stderr->truncated = stderr_truncated;
+    }
     if (code != 0) {
         return spawn_fail(err, CBM_SPAWN_E_EXIT, "CBM_SPAWN_E_EXIT",
                           "the child process exited with a non-zero status",
-                          "inspect the child's exit code; the captured stdout is still returned", 0,
+                          "inspect the child's exit code and requested captured streams", 0,
                           (int)code);
     }
     return spawn_ok(err);
 }
 
-#else /* !_WIN32 */
-
 int cbm_spawn_capture(const char *const *argv, char **out_data, size_t *out_len,
                       cbm_spawn_error_t *err) {
+    return spawn_capture_impl(argv, out_data, out_len, 0, NULL, false, err);
+}
+
+int cbm_spawn_capture_with_stderr(const char *const *argv, char **out_data, size_t *out_len,
+                                  size_t stderr_limit,
+                                  cbm_spawn_bounded_capture_t *out_stderr,
+                                  cbm_spawn_error_t *err) {
+    return spawn_capture_impl(argv, out_data, out_len, stderr_limit, out_stderr, true, err);
+}
+
+#else /* !_WIN32 */
+
+static int spawn_file_actions_addclose_nonstandard(posix_spawn_file_actions_t *actions, int fd) {
+    /* pipe() may legitimately reuse a closed standard descriptor.  In that
+     * case addopen/adddup2 above installs the final 0/1/2 stream, so a later
+     * close action for the original numeric descriptor would close that final
+     * stream rather than an obsolete duplicate. */
+    return fd <= STDERR_FILENO ? 0 : posix_spawn_file_actions_addclose(actions, fd);
+}
+
+static int spawn_capture_impl(const char *const *argv, char **out_data, size_t *out_len,
+                              size_t stderr_limit, cbm_spawn_bounded_capture_t *out_stderr,
+                              bool capture_stderr, cbm_spawn_error_t *err) {
     if (out_data) {
         *out_data = NULL;
     }
     if (out_len) {
         *out_len = 0;
     }
-    if (!argv || !argv[0] || !argv[0][0] || !out_data || !out_len) {
+    if (out_stderr) {
+        memset(out_stderr, 0, sizeof(*out_stderr));
+    }
+    if (!argv || !argv[0] || !argv[0][0] || !out_data || !out_len ||
+        (capture_stderr && (!out_stderr || stderr_limit == 0))) {
         return spawn_fail(err, CBM_SPAWN_E_INVALID_ARGV, "CBM_SPAWN_E_INVALID_ARGV",
                           "spawn requires a non-empty argv and output pointers",
                           "pass argv[0] plus a NULL-terminated argument array", 0, -1);
@@ -505,11 +758,49 @@ int cbm_spawn_capture(const char *const *argv, char **out_data, size_t *out_len,
     (void)fcntl(fds[0], F_SETFD, FD_CLOEXEC);
     (void)fcntl(fds[1], F_SETFD, FD_CLOEXEC);
 
+    int stderr_fds[2] = {-1, -1};
+    if (capture_stderr) {
+        if (pipe(stderr_fds) != 0) {
+            int saved = errno;
+            close(fds[0]);
+            close(fds[1]);
+            return spawn_fail(err, CBM_SPAWN_E_PIPE, "CBM_SPAWN_E_PIPE",
+                              "could not create the child stderr pipe",
+                              "check the process file-descriptor limit and retry",
+                              (unsigned long)saved, -1);
+        }
+        (void)fcntl(stderr_fds[0], F_SETFD, FD_CLOEXEC);
+        (void)fcntl(stderr_fds[1], F_SETFD, FD_CLOEXEC);
+    }
+
+    int stdout_flags = fcntl(fds[0], F_GETFL, 0);
+    int stderr_flags = capture_stderr ? fcntl(stderr_fds[0], F_GETFL, 0) : 0;
+    if (stdout_flags < 0 || (capture_stderr && stderr_flags < 0) ||
+        fcntl(fds[0], F_SETFL, stdout_flags | O_NONBLOCK) != 0 ||
+        (capture_stderr &&
+         fcntl(stderr_fds[0], F_SETFL, stderr_flags | O_NONBLOCK) != 0)) {
+        int saved = errno;
+        close(fds[0]);
+        close(fds[1]);
+        if (capture_stderr) {
+            close(stderr_fds[0]);
+            close(stderr_fds[1]);
+        }
+        return spawn_fail(err, CBM_SPAWN_E_PIPE, "CBM_SPAWN_E_PIPE",
+                          "could not configure nonblocking child-output drains",
+                          "check process file-descriptor state and retry", (unsigned long)saved,
+                          -1);
+    }
+
     posix_spawn_file_actions_t actions;
     if (posix_spawn_file_actions_init(&actions) != 0) {
         int saved = errno;
         close(fds[0]);
         close(fds[1]);
+        if (capture_stderr) {
+            close(stderr_fds[0]);
+            close(stderr_fds[1]);
+        }
         return spawn_fail(err, CBM_SPAWN_E_PIPE, "CBM_SPAWN_E_PIPE",
                           "could not initialise the child file actions",
                           "retry after reducing memory pressure on the host", (unsigned long)saved,
@@ -521,18 +812,33 @@ int cbm_spawn_capture(const char *const *argv, char **out_data, size_t *out_len,
         rc = posix_spawn_file_actions_adddup2(&actions, fds[1], STDOUT_FILENO);
     }
     if (rc == 0) {
-        rc = posix_spawn_file_actions_addopen(&actions, STDERR_FILENO, "/dev/null", O_WRONLY, 0);
+        if (capture_stderr) {
+            rc = posix_spawn_file_actions_adddup2(&actions, stderr_fds[1], STDERR_FILENO);
+        } else {
+            rc = posix_spawn_file_actions_addopen(&actions, STDERR_FILENO, "/dev/null", O_WRONLY,
+                                                  0);
+        }
     }
     if (rc == 0) {
-        rc = posix_spawn_file_actions_addclose(&actions, fds[0]);
+        rc = spawn_file_actions_addclose_nonstandard(&actions, fds[0]);
     }
     if (rc == 0) {
-        rc = posix_spawn_file_actions_addclose(&actions, fds[1]);
+        rc = spawn_file_actions_addclose_nonstandard(&actions, fds[1]);
+    }
+    if (rc == 0 && capture_stderr) {
+        rc = spawn_file_actions_addclose_nonstandard(&actions, stderr_fds[0]);
+    }
+    if (rc == 0 && capture_stderr) {
+        rc = spawn_file_actions_addclose_nonstandard(&actions, stderr_fds[1]);
     }
     if (rc != 0) {
         posix_spawn_file_actions_destroy(&actions);
         close(fds[0]);
         close(fds[1]);
+        if (capture_stderr) {
+            close(stderr_fds[0]);
+            close(stderr_fds[1]);
+        }
         return spawn_fail(err, CBM_SPAWN_E_PIPE, "CBM_SPAWN_E_PIPE",
                           "could not describe the child's standard streams",
                           "retry; if it persists, capture the OS error and file an issue",
@@ -545,8 +851,14 @@ int cbm_spawn_capture(const char *const *argv, char **out_data, size_t *out_len,
     rc = posix_spawnp(&pid, argv[0], &actions, NULL, (char *const *)argv, environ);
     posix_spawn_file_actions_destroy(&actions);
     close(fds[1]);
+    if (capture_stderr) {
+        close(stderr_fds[1]);
+    }
     if (rc != 0) {
         close(fds[0]);
+        if (capture_stderr) {
+            close(stderr_fds[0]);
+        }
         if (rc == ENOENT) {
             return spawn_fail(err, CBM_SPAWN_E_EXEC_NOT_FOUND, "CBM_SPAWN_E_EXEC_NOT_FOUND",
                               "the child executable was not found on PATH",
@@ -560,29 +872,131 @@ int cbm_spawn_capture(const char *const *argv, char **out_data, size_t *out_len,
     }
 
     spawn_buf_t buf = {NULL, 0, 0};
+    spawn_buf_t stderr_buf = {NULL, 0, 0};
+    uint64_t stderr_total_len = 0;
+    bool stderr_truncated = false;
+    bool stderr_retain = true;
     char chunk[SPAWN_READ_CHUNK];
     bool read_ok = true;
+    bool stderr_read_ok = true;
+    int stdout_failure_code = CBM_SPAWN_OK;
+    int stderr_failure_code = CBM_SPAWN_OK;
     unsigned long read_errno = 0;
-    for (;;) {
-        ssize_t got = read(fds[0], chunk, sizeof(chunk));
-        if (got < 0) {
-            if (errno == EINTR) {
-                continue;
-            }
+    struct pollfd streams[2];
+    streams[0].fd = fds[0];
+    streams[0].events = POLLIN | POLLHUP;
+    streams[0].revents = 0;
+    streams[1].fd = capture_stderr ? stderr_fds[0] : -1;
+    streams[1].events = POLLIN | POLLHUP;
+    streams[1].revents = 0;
+    int open_streams = capture_stderr ? 2 : 1;
+    while (open_streams > 0) {
+        int poll_rc;
+        do {
+            poll_rc = poll(streams, 2, -1);
+        } while (poll_rc < 0 && errno == EINTR);
+        if (poll_rc < 0) {
             read_ok = false;
+            stderr_read_ok = false;
+            stdout_failure_code = CBM_SPAWN_E_READ;
+            stderr_failure_code = CBM_SPAWN_E_READ;
             read_errno = (unsigned long)errno;
             break;
         }
-        if (got == 0) {
-            break;
-        }
-        if (!spawn_buf_append(&buf, chunk, (size_t)got)) {
-            read_ok = false;
-            read_errno = 0;
-            break;
+        for (int stream = 0; stream < 2; stream++) {
+            if (streams[stream].fd < 0 || streams[stream].revents == 0) {
+                continue;
+            }
+            if ((streams[stream].revents & POLLNVAL) != 0) {
+                if (stream == 0) {
+                    read_ok = false;
+                    stdout_failure_code = CBM_SPAWN_E_READ;
+                } else {
+                    stderr_read_ok = false;
+                    stderr_failure_code = CBM_SPAWN_E_READ;
+                }
+                if (read_errno == 0) {
+                    read_errno = (unsigned long)EBADF;
+                }
+                close(streams[stream].fd);
+                streams[stream].fd = -1;
+                open_streams--;
+                continue;
+            }
+            for (;;) {
+                ssize_t got = read(streams[stream].fd, chunk, sizeof(chunk));
+                if (got > 0) {
+                    if (stream == 0) {
+                        if (read_ok && !spawn_buf_append(&buf, chunk, (size_t)got)) {
+                            read_ok = false;
+                            stdout_failure_code = CBM_SPAWN_E_NOMEM;
+                            if (read_errno == 0) {
+                                read_errno = (unsigned long)ENOMEM;
+                            }
+                        }
+                    } else if (stderr_retain) {
+                        spawn_prefix_result_t append = spawn_buf_append_prefix(
+                            &stderr_buf, chunk, (size_t)got, stderr_limit, &stderr_total_len,
+                            &stderr_truncated);
+                        if (append != SPAWN_PREFIX_OK) {
+                            stderr_read_ok = false;
+                            stderr_failure_code = append == SPAWN_PREFIX_NOMEM
+                                                      ? CBM_SPAWN_E_NOMEM
+                                                      : CBM_SPAWN_E_READ;
+                            if (read_errno == 0) {
+                                read_errno = (unsigned long)(append == SPAWN_PREFIX_NOMEM
+                                                                 ? ENOMEM
+                                                                 : EOVERFLOW);
+                            }
+                            stderr_retain = false;
+                        }
+                    } else if (UINT64_MAX - stderr_total_len < (uint64_t)got) {
+                        stderr_read_ok = false;
+                        stderr_failure_code = CBM_SPAWN_E_READ;
+                        if (read_errno == 0) {
+                            read_errno = (unsigned long)EOVERFLOW;
+                        }
+                    } else {
+                        stderr_total_len += (uint64_t)got;
+                        stderr_truncated = true;
+                    }
+                    continue;
+                }
+                if (got == 0) {
+                    close(streams[stream].fd);
+                    streams[stream].fd = -1;
+                    open_streams--;
+                    break;
+                }
+                if (errno == EINTR) {
+                    continue;
+                }
+                if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                    break;
+                }
+                if (stream == 0) {
+                    read_ok = false;
+                    stdout_failure_code = CBM_SPAWN_E_READ;
+                } else {
+                    stderr_read_ok = false;
+                    stderr_failure_code = CBM_SPAWN_E_READ;
+                }
+                if (read_errno == 0) {
+                    read_errno = (unsigned long)errno;
+                }
+                close(streams[stream].fd);
+                streams[stream].fd = -1;
+                open_streams--;
+                break;
+            }
+            streams[stream].revents = 0;
         }
     }
-    close(fds[0]);
+    for (int stream = 0; stream < 2; stream++) {
+        if (streams[stream].fd >= 0) {
+            close(streams[stream].fd);
+        }
+    }
 
     int status = 0;
     pid_t waited;
@@ -590,14 +1004,27 @@ int cbm_spawn_capture(const char *const *argv, char **out_data, size_t *out_len,
         waited = waitpid(pid, &status, 0);
     } while (waited < 0 && errno == EINTR);
 
-    if (!read_ok) {
+    if (!read_ok || !stderr_read_ok) {
         free(buf.data);
+        free(stderr_buf.data);
+        int failure_code =
+            stdout_failure_code == CBM_SPAWN_E_READ || stderr_failure_code == CBM_SPAWN_E_READ
+                ? CBM_SPAWN_E_READ
+                : CBM_SPAWN_E_NOMEM;
         return spawn_fail(
-            err, CBM_SPAWN_E_READ, "CBM_SPAWN_E_READ", "the child's stdout could not be captured",
-            "retry; if it persists, capture the OS error and file an issue", read_errno, -1);
+            err, failure_code,
+            failure_code == CBM_SPAWN_E_NOMEM ? "CBM_SPAWN_E_NOMEM" : "CBM_SPAWN_E_READ",
+            failure_code == CBM_SPAWN_E_NOMEM
+                ? "out of memory retaining the child's bounded output"
+                : "the child's output streams could not be captured completely",
+            failure_code == CBM_SPAWN_E_NOMEM
+                ? "retry after reducing memory pressure on the host"
+                : "retry; if it persists, capture the OS error and file an issue",
+            read_errno, -1);
     }
     if (waited < 0 || !WIFEXITED(status)) {
         free(buf.data);
+        free(stderr_buf.data);
         return spawn_fail(err, CBM_SPAWN_E_WAIT, "CBM_SPAWN_E_WAIT",
                           "the child process could not be reaped or did not exit normally",
                           "retry; if it persists, capture the OS error and file an issue",
@@ -605,21 +1032,48 @@ int cbm_spawn_capture(const char *const *argv, char **out_data, size_t *out_len,
     }
     if (!spawn_buf_seal(&buf)) {
         free(buf.data);
+        free(stderr_buf.data);
         return spawn_fail(err, CBM_SPAWN_E_NOMEM, "CBM_SPAWN_E_NOMEM",
                           "out of memory sealing the captured output",
+                          "retry after reducing memory pressure on the host", 0,
+                          WEXITSTATUS(status));
+    }
+    if (capture_stderr && !spawn_buf_seal(&stderr_buf)) {
+        free(buf.data);
+        free(stderr_buf.data);
+        return spawn_fail(err, CBM_SPAWN_E_NOMEM, "CBM_SPAWN_E_NOMEM",
+                          "out of memory sealing the captured stderr",
                           "retry after reducing memory pressure on the host", 0,
                           WEXITSTATUS(status));
     }
 
     *out_data = buf.data;
     *out_len = buf.len;
+    if (capture_stderr) {
+        out_stderr->data = stderr_buf.data;
+        out_stderr->len = stderr_buf.len;
+        out_stderr->total_len = stderr_total_len;
+        out_stderr->truncated = stderr_truncated;
+    }
     if (WEXITSTATUS(status) != 0) {
         return spawn_fail(err, CBM_SPAWN_E_EXIT, "CBM_SPAWN_E_EXIT",
                           "the child process exited with a non-zero status",
-                          "inspect the child's exit code; the captured stdout is still returned", 0,
+                          "inspect the child's exit code and requested captured streams", 0,
                           WEXITSTATUS(status));
     }
     return spawn_ok(err);
+}
+
+int cbm_spawn_capture(const char *const *argv, char **out_data, size_t *out_len,
+                      cbm_spawn_error_t *err) {
+    return spawn_capture_impl(argv, out_data, out_len, 0, NULL, false, err);
+}
+
+int cbm_spawn_capture_with_stderr(const char *const *argv, char **out_data, size_t *out_len,
+                                  size_t stderr_limit,
+                                  cbm_spawn_bounded_capture_t *out_stderr,
+                                  cbm_spawn_error_t *err) {
+    return spawn_capture_impl(argv, out_data, out_len, stderr_limit, out_stderr, true, err);
 }
 
 #endif /* _WIN32 */

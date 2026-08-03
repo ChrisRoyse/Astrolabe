@@ -19,9 +19,9 @@
  * defence-in-depth; it is no longer the only barrier.
  *
  * Windows specifics preserved from the previous isolated spawn (CBM #798):
- * only the stdout write-end and a NUL handle are inherited (STARTUPINFOEXW +
- * PROC_THREAD_ATTRIBUTE_HANDLE_LIST), so no socket/AFD handle leaks into a
- * git-for-Windows child and deadlocks its handle-classifying startup.
+ * only the exact standard-stream handles are inherited (STARTUPINFOEXW +
+ * PROC_THREAD_ATTRIBUTE_HANDLE_LIST), so unrelated socket/AFD handles cannot
+ * enter a git-for-Windows child and deadlock its handle-classifying startup.
  *
  * Windows executable resolution is deliberately PATH-only (SearchPathW with an
  * explicit lpPath taken from %PATH%): CreateProcess's implicit search order
@@ -32,7 +32,9 @@
 #ifndef ASTRO_SPAWN_H
 #define ASTRO_SPAWN_H
 
+#include <stdbool.h>
 #include <stddef.h>
+#include <stdint.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -63,6 +65,13 @@ typedef struct {
     int exit_code;           /* child exit status; -1 when the child never ran */
 } cbm_spawn_error_t;
 
+typedef struct {
+    char *data;         /* heap-owned retained prefix; free() after use */
+    size_t len;         /* retained bytes, excluding the NUL terminator */
+    uint64_t total_len; /* every stderr byte drained from the child */
+    bool truncated;     /* total_len exceeded the caller's retained prefix */
+} cbm_spawn_bounded_capture_t;
+
 /*
  * Spawn argv[0] with the NULL-terminated argv array — no shell — and capture
  * the child's stdout in full. stdin and stderr are bound to the null device.
@@ -83,6 +92,17 @@ typedef struct {
  */
 int cbm_spawn_capture(const char *const *argv, char **out_data, size_t *out_len,
                       cbm_spawn_error_t *err);
+
+/* The same exact shell-free spawn contract, but capture stderr independently
+ * rather than binding it to the null device. Both returned streams are
+ * heap-owned, binary-clean, and NUL-terminated; their explicit lengths remain
+ * authoritative when a stream contains embedded NUL bytes. The caller must
+ * free both buffers. A child exit still returns CBM_SPAWN_E_EXIT with both
+ * streams available, so the caller can persist the real diagnostic. */
+int cbm_spawn_capture_with_stderr(const char *const *argv, char **out_data, size_t *out_len,
+                                  size_t stderr_limit,
+                                  cbm_spawn_bounded_capture_t *out_stderr,
+                                  cbm_spawn_error_t *err);
 
 #ifdef __cplusplus
 }

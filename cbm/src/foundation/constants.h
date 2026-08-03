@@ -83,6 +83,12 @@ enum { CBM_DEFAULT_SEARCH_LIMIT = 200 };
 #define CBM_NSEC_PER_USEC 1000ULL
 #define CBM_NSEC_PER_MSEC 1000000ULL
 
+/* ── Repository-owned state ──────────────────────────────────── */
+/* This directory contains Astrolabe outputs, never repository source. Keep
+ * artifact publication and source discovery bound to the same literal so a
+ * persistent index cannot ingest its own prior generation. */
+#define CBM_REPOSITORY_STATE_DIR ".codebase-memory"
+
 /* ── Common string/buffer sizes ──────────────────────────────── */
 enum {
     CBM_SMALL_BUF = 3,   /* small scratch buffers */

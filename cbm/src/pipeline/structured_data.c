@@ -4,6 +4,7 @@
 #include "foundation/constants.h"
 #include "foundation/log.h"
 
+#include <inttypes.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -24,6 +25,43 @@ static int structured_fail(const char *code, const char *operation, const char *
                            const char *message, const char *remediation) {
     cbm_log_error("structured_data.classification_failed", "code", code, "operation", operation,
                   "path", path ? path : "", "message", message, "remediation", remediation);
+    return CBM_NOT_FOUND;
+}
+
+static int structured_spawn_fail(const char *repo_path, const char *snapshot_root,
+                                 const cbm_spawn_error_t *error,
+                                 const cbm_spawn_bounded_capture_t *stderr_capture) {
+    static const char hex[] = "0123456789abcdef";
+    char stderr_hex[CBM_SZ_4K + SKIP_ONE];
+    for (size_t i = 0; i < stderr_capture->len; i++) {
+        unsigned char byte = (unsigned char)stderr_capture->data[i];
+        stderr_hex[i * PAIR_LEN] = hex[byte >> 4];
+        stderr_hex[i * PAIR_LEN + SKIP_ONE] = hex[byte & 0x0f];
+    }
+    stderr_hex[stderr_capture->len * PAIR_LEN] = '\0';
+
+    char spawn_code[CBM_SZ_32];
+    char exit_code[CBM_SZ_32];
+    char os_error[CBM_SZ_32];
+    char retained_bytes[CBM_SZ_32];
+    char total_bytes[CBM_SZ_32];
+    (void)snprintf(spawn_code, sizeof(spawn_code), "%d", (int)error->code);
+    (void)snprintf(exit_code, sizeof(exit_code), "%d", error->exit_code);
+    (void)snprintf(os_error, sizeof(os_error), "%lu", error->os_error);
+    (void)snprintf(retained_bytes, sizeof(retained_bytes), "%zu", stderr_capture->len);
+    (void)snprintf(total_bytes, sizeof(total_bytes), "%" PRIu64, stderr_capture->total_len);
+
+    cbm_log_error(
+        "structured_data.classification_failed", "code", "CBM_STRUCTURED_ATTRIBUTE_QUERY_FAILED",
+        "operation", "git_check_attr", "path", snapshot_root ? snapshot_root : "", "repository",
+        repo_path ? repo_path : "", "snapshot", snapshot_root ? snapshot_root : "", "message",
+        "git check-attr failed before structured-data classification", "remediation",
+        "inspect the exact Git stderr fields and repair the repository metadata before retrying",
+        "spawn_code", spawn_code, "spawn_code_name", error->code_name ? error->code_name : "",
+        "exit_code", exit_code, "os_error", os_error, "stderr_encoding", "hex",
+        "stderr_retention", "prefix", "stderr_hex", stderr_hex, "stderr_retained_bytes",
+        retained_bytes, "stderr_total_bytes", total_bytes, "stderr_truncated",
+        stderr_capture->truncated ? "true" : "false");
     return CBM_NOT_FOUND;
 }
 
@@ -166,17 +204,17 @@ static int classify_batch(const char *repo_path, const char *snapshot_root, cbm_
     char *output = NULL;
     size_t output_len = 0;
     cbm_spawn_error_t error = {0};
-    int spawn_rc = cbm_spawn_capture(argv, &output, &output_len, &error);
+    cbm_spawn_bounded_capture_t stderr_capture = {0};
+    int spawn_rc = cbm_spawn_capture_with_stderr(argv, &output, &output_len, CBM_SZ_2K,
+                                                 &stderr_capture, &error);
     free(argv);
     if (spawn_rc != 0) {
-        char native[CBM_SZ_64];
-        snprintf(native, sizeof(native), "spawn_code=%d,exit=%d,os_error=%lu", spawn_rc,
-                 error.exit_code, error.os_error);
+        int failure = structured_spawn_fail(repo_path, snapshot_root, &error, &stderr_capture);
         free(output);
-        return structured_fail("CBM_STRUCTURED_ATTRIBUTE_QUERY_FAILED", "git_check_attr",
-                               snapshot_root, native,
-                               "restore the Git repository and captured .gitattributes, then retry");
+        free(stderr_capture.data);
+        return failure;
     }
+    free(stderr_capture.data);
 
     size_t position = 0;
     while (position < output_len) {
