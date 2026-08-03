@@ -133,7 +133,7 @@ These environment variables affect runtime behavior:
 | `CBM_DIAGNOSTICS` | `false` | Enable periodic diagnostics output to `/tmp/cbm-diagnostics-<pid>.json`. |
 | `CBM_DOWNLOAD_URL` | GitHub releases | Override the update download URL. |
 | `CBM_LOG_LEVEL` | `info` | Set stderr log level to `debug`, `info`, `warn`, `error`, or `none` (or `0`-`4`). |
-| `CBM_LOG_FORMAT` | `text` | Select case-insensitive `text` or newline-delimited `json` for libcbm diagnostics. Unset, empty, or invalid input leaves the process's current format unchanged; a fresh process defaults to `text`. |
+| `CBM_LOG_FORMAT` | `text` | Select exact case-insensitive `text` or newline-delimited `json` for libcbm diagnostics. Absence selects `text`. Present empty, whitespace-only, or otherwise unrecognized input refuses startup with `CBM_LOG_FORMAT_INVALID`, exact value byte-length/hex evidence, and remediation before tool or store initialization. |
 | `ASTRO_CBM_PIPELINE_PHASE_TRACE` | `false` | Exact `1`, `true`, or `TRUE` emits phase start/end records independently of the ordinary log-level floor. Text mode retains the legacy key/value record; JSON mode emits typed `pipeline.phase_trace` objects. |
 | `CBM_WORKERS` | auto-detected | Override the indexing worker count. When present, this must be an exact decimal integer from 1 through 256; malformed, unreadable, or out-of-range values fail closed with `CBM_WORKERS_INVALID`/`CBM_WORKERS_UNREADABLE` instead of falling back to auto-detection. |
 

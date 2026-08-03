@@ -1670,7 +1670,7 @@ pub const CBMLogSinkMode_CBM_LOG_SINK_REPLACE: CBMLogSinkMode = 0;
 pub const CBMLogSinkMode_CBM_LOG_SINK_TEE: CBMLogSinkMode = 1;
 pub type CBMLogSinkMode = ::std::os::raw::c_int;
 unsafe extern "C" {
-    pub fn cbm_log_init_from_env();
+    pub fn cbm_log_init_from_env() -> *const ::std::os::raw::c_char;
 }
 unsafe extern "C" {
     pub fn cbm_log_set_level(level: CBMLogLevel);

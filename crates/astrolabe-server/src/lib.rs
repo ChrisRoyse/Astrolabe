@@ -110,6 +110,13 @@ pub fn run_from_env() -> i32 {
     // logging can reach stderr. Server (no-arg) dispatch is unaffected and keeps
     // INFO.
     let cli_mode = is_cli_invocation(&args);
+    let json_logs = match astrolabe_bridge::initialize_cbm_log_configuration() {
+        Ok(json_logs) => json_logs,
+        Err(error) => {
+            report_startup_error(&error, None);
+            return 1;
+        }
+    };
     let _hook_deadline = hook_mode.then(|| HookDeadline::start(HOOK_AUGMENT_BUDGET_MS));
     let profile_active = match astrolabe_bridge::initialize_cbm_profile_mode() {
         Ok(active) => active,
@@ -117,26 +124,26 @@ pub fn run_from_env() -> i32 {
             if hook_mode {
                 return 0;
             }
-            eprintln!("astrolabe: startup failed: {error}");
+            report_startup_error(&error, Some(json_logs));
             return 1;
         }
     };
     if !hook_mode {
-        let json_logs = match astrolabe_bridge::route_cbm_logs_to_tracing() {
-            Ok(json_logs) => json_logs,
-            Err(error) => {
-                eprintln!("astrolabe: startup failed: {error}");
-                return 1;
-            }
-        };
-        initialize_tracing(
+        if let Err(error) = initialize_tracing(
             if cli_mode && !profile_active {
                 cli_stderr_tracing_level()
             } else {
                 LevelFilter::INFO
             },
             json_logs,
-        );
+        ) {
+            report_startup_error(&error, Some(json_logs));
+            return 1;
+        }
+        if let Err(error) = astrolabe_bridge::route_cbm_logs_to_tracing() {
+            report_startup_error(&error, Some(json_logs));
+            return 1;
+        }
     }
     let binary_path = env::current_exe()
         .ok()
@@ -154,7 +161,7 @@ pub fn run_from_env() -> i32 {
         if hook_mode {
             return 0;
         }
-        eprintln!("astrolabe: startup failed: {err}");
+        report_startup_error(&err, Some(json_logs));
         return 1;
     }
 
@@ -192,9 +199,30 @@ fn dispatch(args: &[String]) -> Result<i32, DynError> {
     }
 }
 
-fn initialize_tracing(max_level: LevelFilter, json_logs: bool) {
+fn report_startup_error(error: &BridgeError, json_logs: Option<bool>) {
+    let error = error.envelope();
+    if json_logs != Some(false) {
+        let record = serde_json::json!({
+            "level": "error",
+            "event": "startup.failed",
+            "code": &error.code,
+            "message": &error.message,
+            "remediation": &error.remediation,
+        });
+        let record = serde_json::to_string(&record)
+            .expect("startup error fields always serialize as a JSON object");
+        eprintln!("{record}");
+    } else {
+        eprintln!(
+            "astrolabe: startup failed: {}: {}; remediation: {}",
+            error.code, error.message, error.remediation
+        );
+    }
+}
+
+fn initialize_tracing(max_level: LevelFilter, json_logs: bool) -> Result<(), BridgeError> {
     if json_logs {
-        let _ = tracing_subscriber::fmt()
+        tracing_subscriber::fmt()
             .json()
             .flatten_event(true)
             .with_current_span(false)
@@ -204,16 +232,31 @@ fn initialize_tracing(max_level: LevelFilter, json_logs: bool) {
             .with_target(false)
             .without_time()
             .with_max_level(max_level)
-            .try_init();
+            .try_init()
+            .map_err(|error| {
+                BridgeError::new(ErrorEnvelope::new(
+                    "ASTRO_TRACING_INIT_FAILED",
+                    format!("the JSON tracing subscriber could not be installed: {error}"),
+                    "Remove the conflicting process-global tracing subscriber and restart with one authoritative log format.",
+                ))
+            })?;
     } else {
-        let _ = tracing_subscriber::fmt()
+        tracing_subscriber::fmt()
             .with_writer(io::stderr)
             .with_ansi(false)
             .with_target(false)
             .without_time()
             .with_max_level(max_level)
-            .try_init();
+            .try_init()
+            .map_err(|error| {
+                BridgeError::new(ErrorEnvelope::new(
+                    "ASTRO_TRACING_INIT_FAILED",
+                    format!("the text tracing subscriber could not be installed: {error}"),
+                    "Remove the conflicting process-global tracing subscriber and restart with one authoritative log format.",
+                ))
+            })?;
     }
+    Ok(())
 }
 
 /// True when argv is a `cli <tool> ...` invocation. Mirrors

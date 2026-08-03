@@ -867,6 +867,25 @@ static char **cbm_win_utf8_argv(int *out_argc, const char **out_operation, DWORD
 }
 #endif /* _WIN32 */
 
+static void report_invalid_log_format(const char *value) {
+    const unsigned char *bytes = (const unsigned char *)(value ? value : "");
+    size_t value_bytes = strlen((const char *)bytes);
+    (void)fprintf(stderr,
+                  "{\"level\":\"error\",\"event\":\"log.format_invalid\","
+                  "\"code\":\"CBM_LOG_FORMAT_INVALID\",\"name\":\"CBM_LOG_FORMAT\","
+                  "\"value_bytes\":%zu,\"value_hex\":\"",
+                  value_bytes);
+    for (size_t i = 0; i < value_bytes; i++) {
+        (void)fprintf(stderr, "%02x", (unsigned int)bytes[i]);
+    }
+    (void)fprintf(stderr,
+                  "\",\"message\":\"CBM_LOG_FORMAT must be exactly text or json "
+                  "(case-insensitive) when present\",\"remediation\":\"set "
+                  "CBM_LOG_FORMAT to text or json, or remove it to select the text "
+                  "default\"}\n");
+    (void)fflush(stderr);
+}
+
 int main(int argc, char **argv) {
     /* Defense-in-depth: bind tree-sitter and sqlite3 to mimalloc so a
      * correct binary does not rely on the fragile MI_OVERRIDE symbol override
@@ -876,6 +895,14 @@ int main(int argc, char **argv) {
      * the bind is silently ignored. No-op in the test build. */
     int allocator_rc = cbm_alloc_init();
     if (allocator_rc != 0) {
+        return EXIT_FAILURE;
+    }
+    /* Log-format admission precedes argv allocation, profile selection, host
+     * publication, and every command/server path. Invalid input is reported
+     * without installing a sink or committing either logging setting. */
+    const char *invalid_log_format = cbm_log_init_from_env();
+    if (invalid_log_format) {
+        report_invalid_log_format(invalid_log_format);
         return EXIT_FAILURE;
     }
 #ifdef _WIN32
@@ -910,9 +937,6 @@ int main(int argc, char **argv) {
     cbm_index_supervisor_mark_host();
     cbm_cli_set_version(CBM_VERSION);
     cbm_profile_init(); /* reads CBM_PROFILE env var, gates all prof macros */
-    /* CBM_LOG_LEVEL support — distilled from #414 (closes #413). Apply before
-     * the first log statement so the configured level governs all output. */
-    cbm_log_init_from_env();
     int subcmd = handle_subcommand(argc, argv);
     if (subcmd >= 0) {
         return subcmd;

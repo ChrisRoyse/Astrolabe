@@ -436,21 +436,61 @@ pub fn cbm_print_tool_help(prog: &str, tool_name: &str) -> Result<bool, BridgeEr
 }
 
 static CBM_JSON_LOG_MODE: AtomicBool = AtomicBool::new(false);
+static CBM_LOG_CONFIGURATION: OnceLock<Result<bool, BridgeError>> = OnceLock::new();
+
+/// Admit the process-wide libcbm log configuration exactly once.
+///
+/// libcbm performs a transactional parse: absence selects text, exact
+/// case-insensitive `text`/`json` selects that format, and any other present
+/// byte sequence returns without changing either the current level or format.
+/// The Rust boundary retains exact byte length and hex so empty, whitespace,
+/// and non-UTF-8 values remain distinguishable in the refusal.
+pub fn initialize_cbm_log_configuration() -> Result<bool, BridgeError> {
+    CBM_LOG_CONFIGURATION
+        .get_or_init(|| {
+            initialize_cbm_allocator()?;
+            // SAFETY: startup calls this before creating CBM worker threads or
+            // mutating the environment. A non-NULL result points into the
+            // process environment and is copied before this function returns.
+            let invalid = unsafe { cbm_sys::cbm_log_init_from_env() };
+            if !invalid.is_null() {
+                // SAFETY: libcbm returns the exact NUL-terminated getenv value.
+                let value = unsafe { CStr::from_ptr(invalid) }.to_bytes();
+                const HEX: &[u8; 16] = b"0123456789abcdef";
+                let mut value_hex = String::with_capacity(value.len().saturating_mul(2));
+                for byte in value {
+                    value_hex.push(HEX[(byte >> 4) as usize] as char);
+                    value_hex.push(HEX[(byte & 0x0f) as usize] as char);
+                }
+                return Err(envelope(
+                    "CBM_LOG_FORMAT_INVALID",
+                    format!(
+                        "CBM_LOG_FORMAT must be exactly text or json (case-insensitive) when present; value_bytes={}, value_hex={value_hex}",
+                        value.len()
+                    ),
+                    "Set CBM_LOG_FORMAT to text or json, or remove it to select the text default.",
+                ));
+            }
+            // SAFETY: successful admission committed one of the two declared
+            // CBMLogFormat values under the native log mutex.
+            Ok(unsafe {
+                cbm_sys::cbm_log_get_format() == cbm_sys::CBMLogFormat_CBM_LOG_FORMAT_JSON
+            })
+        })
+        .clone()
+}
 
 pub fn route_cbm_logs_to_tracing() -> Result<bool, BridgeError> {
-    initialize_cbm_allocator()?;
+    let json_mode = initialize_cbm_log_configuration()?;
     // SAFETY: the callback is a static extern function and remains valid for
     // the process lifetime. CBM stores only the function pointer.
-    let json_mode = unsafe {
-        cbm_sys::cbm_log_init_from_env();
-        let json_mode = cbm_sys::cbm_log_get_format() == cbm_sys::CBMLogFormat_CBM_LOG_FORMAT_JSON;
+    unsafe {
         CBM_JSON_LOG_MODE.store(json_mode, Ordering::Release);
         cbm_sys::cbm_log_set_sink_ex(
             Some(cbm_log_tracing_sink),
             cbm_sys::CBMLogSinkMode_CBM_LOG_SINK_REPLACE,
         );
-        json_mode
-    };
+    }
     Ok(json_mode)
 }
 
@@ -554,6 +594,7 @@ fn initialize_cbm_host_process_with_log_mode(
     binary_path: Option<&str>,
     log_mode: CbmLogMode,
 ) -> Result<(), BridgeError> {
+    initialize_cbm_log_configuration()?;
     // Refuse a store-relocating environment at startup rather than discovering it
     // one indexed project too late (#194/#232).
     validate_cbm_store_env(
@@ -569,10 +610,6 @@ fn initialize_cbm_host_process_with_log_mode(
     // intended for main() startup. The optional binary path C string is live for
     // the duration of the call; CBM copies it internally.
     unsafe {
-        // The one-time initializer above resolves native profile mode before
-        // this function chooses the libcbm log floor; run_from_env calls the
-        // same initializer before choosing the Rust tracing floor (#767).
-        cbm_sys::cbm_log_init_from_env();
         match log_mode {
             CbmLogMode::Default => {}
             CbmLogMode::CliWarnFloor => {

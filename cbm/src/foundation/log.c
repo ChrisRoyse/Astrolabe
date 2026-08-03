@@ -55,9 +55,32 @@ static void log_unlock(void) {
 }
 
 /* CBM_LOG_LEVEL support — distilled from #414 (closes #413, thanks @santanusinha). */
-void cbm_log_init_from_env(void) {
+const char *cbm_log_init_from_env(void) {
     /* getenv() is safe here: this runs at startup before any thread is created,
      * so there is no concurrent setenv() to race against. */
+    const char *fmt = getenv("CBM_LOG_FORMAT");
+    CBMLogFormat selected_format = CBM_LOG_FORMAT_TEXT;
+    if (fmt) {
+        char lower_fmt[8];
+        size_t i = 0;
+        for (; i < sizeof(lower_fmt) - 1 && fmt[i] != '\0'; i++) {
+            lower_fmt[i] = (char)tolower((unsigned char)fmt[i]);
+        }
+        lower_fmt[i] = '\0';
+        if (fmt[i] == '\0' && strcmp(lower_fmt, "json") == 0) {
+            selected_format = CBM_LOG_FORMAT_JSON;
+        } else if (fmt[i] == '\0' && strcmp(lower_fmt, "text") == 0) {
+            selected_format = CBM_LOG_FORMAT_TEXT;
+        } else {
+            /* Admission is transactional: a present invalid format cannot
+             * change either process-global logging setting. Returning the
+             * environment pointer preserves empty and whitespace-only values
+             * as distinct exact byte sequences for the caller's diagnostic. */
+            return fmt;
+        }
+    }
+
+    CBMLogLevel selected_level = cbm_log_get_level();
     const char *raw = getenv("CBM_LOG_LEVEL");
     if (raw && raw[0] != '\0') {
         /* Textual form, case-insensitive. Index of each name == its enum value. */
@@ -71,8 +94,8 @@ void cbm_log_init_from_env(void) {
         if (raw[i] == '\0') { /* fully consumed — candidate textual match */
             for (size_t lvl = 0; lvl < sizeof(names) / sizeof(names[0]); lvl++) {
                 if (strcmp(lower, names[lvl]) == 0) {
-                    cbm_log_set_level((CBMLogLevel)lvl);
-                    goto parse_format;
+                    selected_level = (CBMLogLevel)lvl;
+                    goto commit;
                 }
             }
         }
@@ -81,32 +104,21 @@ void cbm_log_init_from_env(void) {
         char *end = NULL;
         long n = strtol(raw, &end, CBM_DECIMAL_BASE);
         if (end != raw && *end == '\0' && n >= CBM_LOG_DEBUG && n <= CBM_LOG_NONE) {
-            cbm_log_set_level((CBMLogLevel)n);
+            selected_level = (CBMLogLevel)n;
         }
     }
 
     /* Unrecognised value: leave the level unchanged (fail-open). */
 
-parse_format:;
-    const char *fmt = getenv("CBM_LOG_FORMAT");
-    if (fmt && fmt[0] != '\0') {
-        char lower_fmt[8];
-        size_t i = 0;
-        for (; i < sizeof(lower_fmt) - 1 && fmt[i] != '\0'; i++) {
-            lower_fmt[i] = (char)tolower((unsigned char)fmt[i]);
-        }
-        lower_fmt[i] = '\0';
-        if (fmt[i] == '\0' && strcmp(lower_fmt, "json") == 0) {
-            cbm_log_set_format(CBM_LOG_FORMAT_JSON);
-        } else if (fmt[i] == '\0' && strcmp(lower_fmt, "text") == 0) {
-            cbm_log_set_format(CBM_LOG_FORMAT_TEXT);
-        }
-        return;
-    }
-
-    /* Format is intentionally explicit-only. Logs stay local to stderr and the
-     * optional in-process sink; deployment environment variables must not
-     * silently change the operator-selected output shape. */
+commit:
+    /* Commit both settings under one lock only after the complete format
+     * admission has succeeded. Absent CBM_LOG_FORMAT deliberately resets a
+     * prior process-local selection to the documented text default. */
+    log_lock();
+    g_log_level = selected_level;
+    g_log_format = selected_format;
+    log_unlock();
+    return NULL;
 }
 
 void cbm_log_set_sink(cbm_log_sink_fn fn) {
