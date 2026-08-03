@@ -3938,42 +3938,48 @@ cbm_store_close_status_t cbm_store_close(cbm_store_t **store,
         }
     }
 
-    if (s->db) {
-        sqlite3_stmt *statement = sqlite3_next_stmt(s->db, NULL);
-        while (statement) {
-            if (result->outstanding_statement_count == 0) {
-                store_close_capture_first_outstanding(result, statement);
-            }
-            result->outstanding_statement_count++;
-            statement = sqlite3_next_stmt(s->db, statement);
-        }
-    }
-    if (result->outstanding_statement_count > 0) {
-        result->status = CBM_STORE_CLOSE_OUTSTANDING_STATEMENTS;
-        result->sqlite_close_code = SQLITE_BUSY;
-        char count_text[ST_BUF_64];
-        snprintf(count_text, sizeof(count_text), "%llu",
-                 (unsigned long long)result->outstanding_statement_count);
-        cbm_log_error(
-            "store.close_refused", "code", "CBM_STORE_CLOSE_OUTSTANDING_STATEMENTS", "db_path",
-            result->db_path, "outstanding_statements", count_text, "first_sql_sha256",
-            result->first_outstanding_sql_sha256, "first_sql", result->first_outstanding_sql,
-            "connection_destroyed", "false", "remediation",
-            "finalize the exact reported statement owner, then retry closure through the same "
-            "store pointer");
-        return result->status;
-    }
-
     result->close_attempted = 1U;
     int close_rc = sqlite3_close(s->db);
     result->sqlite_close_code = close_rc;
     if (close_rc != SQLITE_OK) {
+        /* sqlite3_close disconnects virtual tables before deciding whether
+         * the connection is busy.  Enumerating earlier would misclassify
+         * connection-owned statements (notably FTS5's persistent writers)
+         * as leaked application statements.  A failed close leaves the
+         * connection live, so SQLITE_BUSY is the first safe diagnostic
+         * boundary for enumerating genuine survivors. */
+        if (close_rc == SQLITE_BUSY && s->db) {
+            sqlite3_stmt *statement = sqlite3_next_stmt(s->db, NULL);
+            while (statement) {
+                if (result->outstanding_statement_count == 0) {
+                    store_close_capture_first_outstanding(result, statement);
+                }
+                result->outstanding_statement_count++;
+                statement = sqlite3_next_stmt(s->db, statement);
+            }
+        }
+        if (result->outstanding_statement_count > 0) {
+            result->status = CBM_STORE_CLOSE_OUTSTANDING_STATEMENTS;
+            char count_text[ST_BUF_64];
+            snprintf(count_text, sizeof(count_text), "%llu",
+                     (unsigned long long)result->outstanding_statement_count);
+            cbm_log_error(
+                "store.close_refused", "code", "CBM_STORE_CLOSE_OUTSTANDING_STATEMENTS",
+                "db_path", result->db_path, "outstanding_statements", count_text,
+                "first_sql_sha256", result->first_outstanding_sql_sha256, "first_sql",
+                result->first_outstanding_sql, "connection_destroyed", "false", "remediation",
+                "finalize the exact reported statement owner, then retry closure through the same "
+                "store pointer");
+            return result->status;
+        }
+
         result->status = CBM_STORE_CLOSE_FAILED;
         char sqlite_text[ST_BUF_16];
         snprintf(sqlite_text, sizeof(sqlite_text), "%d", close_rc);
         cbm_log_error("store.close_failed", "code", "CBM_STORE_CLOSE_FAILED", "db_path",
                       result->db_path, "sqlite_error", sqlite_text, "sqlite_detail",
-                      sqlite3_errstr(close_rc), "connection_destroyed", "false", "remediation",
+                      s->db ? sqlite3_errmsg(s->db) : sqlite3_errstr(close_rc),
+                      "connection_destroyed", "false", "remediation",
                       "preserve the unchanged store owner and inspect unfinished SQLite resources");
         return result->status;
     }

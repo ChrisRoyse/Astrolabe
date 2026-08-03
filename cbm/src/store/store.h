@@ -441,9 +441,10 @@ bool cbm_store_check_integrity(cbm_store_t *s);
 cbm_store_t *cbm_store_open(const char *project);
 
 /* Physically close one owned store.  The pointer is cleared and its wrapper is
- * freed only after sqlite3_close returns SQLITE_OK.  Any undeclared prepared
- * statement is reported and left owned by the unchanged store pointer; it is
- * never silently finalized or converted into a sqlite3_close_v2 zombie. */
+ * freed only after sqlite3_close returns SQLITE_OK.  On SQLITE_BUSY, any
+ * prepared statement that survives SQLite's virtual-table disconnect is
+ * reported and left owned by the unchanged store pointer; it is never silently
+ * finalized or converted into a sqlite3_close_v2 zombie. */
 cbm_store_close_status_t cbm_store_close(cbm_store_t **store,
                                          cbm_store_close_result_t *result);
 
