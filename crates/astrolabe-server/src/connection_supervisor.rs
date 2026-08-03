@@ -176,7 +176,12 @@ pub(crate) fn run_if_installed_generation() -> Result<Option<i32>, SupervisorErr
                 "supervisor": supervisor.as_value(),
                 "client": client.as_value(),
             });
-            if let Err(journal_error) = journal.append("connection_terminal", terminal) {
+            let record_kind = if journal.terminal_written {
+                "connection_fault"
+            } else {
+                "connection_terminal"
+            };
+            if let Err(journal_error) = journal.append(record_kind, terminal) {
                 eprintln!(
                     "{}",
                     serde_json::to_string(&json!({
@@ -349,7 +354,7 @@ fn run_supervisor(
         &worker_identity,
     )?;
     worker.reaped = true;
-    journal.append("connection_terminal", relay.terminal)?;
+    journal.append("connection_exit_readback", relay.exit_readback)?;
     Ok(relay.exit_code)
 }
 
@@ -773,6 +778,7 @@ struct ConnectionJournal {
     path: PathBuf,
     next_sequence: u64,
     previous_record_sha256: Option<String>,
+    terminal_written: bool,
 }
 
 impl ConnectionJournal {
@@ -804,6 +810,7 @@ impl ConnectionJournal {
             path,
             next_sequence: 0,
             previous_record_sha256: None,
+            terminal_written: false,
         })
     }
 
@@ -875,6 +882,9 @@ impl ConnectionJournal {
         }
         self.next_sequence += 1;
         self.previous_record_sha256 = Some(sha256.clone());
+        if kind == "connection_terminal" {
+            self.terminal_written = true;
+        }
         Ok(sha256)
     }
 }
@@ -967,7 +977,7 @@ enum RelayEvent {
 
 struct RelayResult {
     exit_code: i32,
-    terminal: Value,
+    exit_readback: Value,
 }
 
 #[derive(Debug)]
@@ -1007,6 +1017,7 @@ fn relay_connection(
     let mut worker_stdout_closed = false;
     let mut worker_stderr_closed = false;
     let mut kill_sent = false;
+    let mut terminal_recorded = false;
 
     loop {
         if child_status.is_none() {
@@ -1039,6 +1050,27 @@ fn relay_connection(
         }
 
         if let Some(cause) = terminal.as_ref() {
+            if !terminal_recorded {
+                journal.append(
+                    "connection_terminal",
+                    json!({
+                        "verdict": if cause.expected_shutdown { "closing" } else { "failed" },
+                        "cause": cause.code,
+                        "message": cause.message,
+                        "remediation": cause.remediation,
+                        "worker": worker_identity.as_value(),
+                        "worker_exit_observed": child_status.as_ref().map(exit_status_value),
+                        "request_count": request_sequence,
+                        "pending_request_count": pending.len(),
+                        "last_requested_id": last_requested_id,
+                        "last_completed_id": last_completed_id,
+                        "stderr_tail_bytes_observed": stderr_tail.len(),
+                        "stderr_tail_sha256_observed": sha256_bytes(&stderr_tail),
+                        "retry_count": 0,
+                    }),
+                )?;
+                terminal_recorded = true;
+            }
             worker_input.take();
             if !cause.expected_shutdown && child_status.is_none() && !kill_sent {
                 worker.child.kill().map_err(|error| {
@@ -1299,11 +1331,9 @@ fn relay_connection(
     } else {
         1
     };
-    let terminal_value = json!({
+    let exit_readback = json!({
         "verdict": if exit_code == 0 { "closed" } else { "failed" },
-        "cause": cause.code,
-        "message": cause.message,
-        "remediation": cause.remediation,
+        "terminal_cause": cause.code,
         "worker": worker_identity.as_value(),
         "worker_exit": {
             "display": status.to_string(),
@@ -1326,7 +1356,15 @@ fn relay_connection(
     });
     Ok(RelayResult {
         exit_code,
-        terminal: terminal_value,
+        exit_readback,
+    })
+}
+
+fn exit_status_value(status: &ExitStatus) -> Value {
+    json!({
+        "display": status.to_string(),
+        "code": status.code(),
+        "success": status.success(),
     })
 }
 

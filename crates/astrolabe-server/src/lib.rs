@@ -1242,7 +1242,7 @@ impl ParentWatchdog {
 
     /// Windows (#253): there is no reparenting to observe, so open a `SYNCHRONIZE` handle to
     /// the parent and wait on it — the handle signals the instant the parent exits, so this
-    /// is event-driven (no PID polling, no `STILL_ACTIVE` ambiguity). Bounded 500 ms waits
+    /// is event-driven (no PID polling, no `STILL_ACTIVE` ambiguity). Bounded 50 ms waits
     /// let the cooperative `Drop` shutdown be observed between them.
     ///
     /// If the handle cannot be *opened*, we do NOT terminate a possibly-healthy server: that
@@ -1267,7 +1267,7 @@ impl ParentWatchdog {
         };
         Some(thread::spawn(move || {
             while !thread_shutdown.load(Ordering::Relaxed) {
-                match watch.wait(500) {
+                match watch.wait(50) {
                     astrolabe_bridge::ParentWaitOutcome::Exited => {
                         tracing::warn!("parent.exited reason=handle_signaled");
                         process::exit(0);
