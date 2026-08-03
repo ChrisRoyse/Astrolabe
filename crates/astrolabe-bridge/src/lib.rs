@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 use std::ptr::{self, NonNull};
 use std::rc::Rc;
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, ThreadId};
 
 pub const CRATE_NAME: &str = env!("CARGO_PKG_NAME");
@@ -434,18 +435,23 @@ pub fn cbm_print_tool_help(prog: &str, tool_name: &str) -> Result<bool, BridgeEr
     Ok(rc == 0)
 }
 
-pub fn route_cbm_logs_to_tracing() -> Result<(), BridgeError> {
+static CBM_JSON_LOG_MODE: AtomicBool = AtomicBool::new(false);
+
+pub fn route_cbm_logs_to_tracing() -> Result<bool, BridgeError> {
     initialize_cbm_allocator()?;
     // SAFETY: the callback is a static extern function and remains valid for
     // the process lifetime. CBM stores only the function pointer.
-    unsafe {
+    let json_mode = unsafe {
         cbm_sys::cbm_log_init_from_env();
+        let json_mode = cbm_sys::cbm_log_get_format() == cbm_sys::CBMLogFormat_CBM_LOG_FORMAT_JSON;
+        CBM_JSON_LOG_MODE.store(json_mode, Ordering::Release);
         cbm_sys::cbm_log_set_sink_ex(
             Some(cbm_log_tracing_sink),
             cbm_sys::CBMLogSinkMode_CBM_LOG_SINK_REPLACE,
         );
-    }
-    Ok(())
+        json_mode
+    };
+    Ok(json_mode)
 }
 
 static CBM_PROFILE_ACTIVE: OnceLock<bool> = OnceLock::new();
@@ -659,12 +665,27 @@ unsafe extern "C" fn cbm_log_tracing_sink(line: *const c_char) {
     }
     drop(std::panic::catch_unwind(AssertUnwindSafe(|| {
         // SAFETY: CBM calls the sink with a NUL-terminated line valid for the call.
-        let line = unsafe { CStr::from_ptr(line) }.to_string_lossy();
-        if line.starts_with("level=error") || line.starts_with("{\"level\":\"error\"") {
+        let line = unsafe { CStr::from_ptr(line) };
+        if CBM_JSON_LOG_MODE.load(Ordering::Acquire) {
+            // JSON is already the authoritative native byte record. Sending it
+            // through a human-readable tracing formatter would turn it into
+            // `ERROR {json}` and destroy newline-delimited JSON; decoding it first
+            // would also make preservation lossy. libcbm invokes sinks while
+            // holding its log mutex, while stderr's process-global lock prevents
+            // same-process Rust events from interleaving this record.
+            let mut stderr = std::io::stderr().lock();
+            let _ = stderr
+                .write_all(line.to_bytes())
+                .and_then(|()| stderr.write_all(b"\n"));
+            return;
+        }
+
+        let line = line.to_string_lossy();
+        if line.starts_with("level=error") {
             tracing::error!(target: "cbm", "{line}");
-        } else if line.starts_with("level=warn") || line.starts_with("{\"level\":\"warn\"") {
+        } else if line.starts_with("level=warn") {
             tracing::warn!(target: "cbm", "{line}");
-        } else if line.starts_with("level=debug") || line.starts_with("{\"level\":\"debug\"") {
+        } else if line.starts_with("level=debug") {
             tracing::debug!(target: "cbm", "{line}");
         } else {
             tracing::info!(target: "cbm", "{line}");

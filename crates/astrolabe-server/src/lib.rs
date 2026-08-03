@@ -122,15 +122,21 @@ pub fn run_from_env() -> i32 {
         }
     };
     if !hook_mode {
-        initialize_tracing(if cli_mode && !profile_active {
-            cli_stderr_tracing_level()
-        } else {
-            LevelFilter::INFO
-        });
-        if let Err(error) = astrolabe_bridge::route_cbm_logs_to_tracing() {
-            eprintln!("astrolabe: startup failed: {error}");
-            return 1;
-        }
+        let json_logs = match astrolabe_bridge::route_cbm_logs_to_tracing() {
+            Ok(json_logs) => json_logs,
+            Err(error) => {
+                eprintln!("astrolabe: startup failed: {error}");
+                return 1;
+            }
+        };
+        initialize_tracing(
+            if cli_mode && !profile_active {
+                cli_stderr_tracing_level()
+            } else {
+                LevelFilter::INFO
+            },
+            json_logs,
+        );
     }
     let binary_path = env::current_exe()
         .ok()
@@ -186,14 +192,28 @@ fn dispatch(args: &[String]) -> Result<i32, DynError> {
     }
 }
 
-fn initialize_tracing(max_level: LevelFilter) {
-    let _ = tracing_subscriber::fmt()
-        .with_writer(io::stderr)
-        .with_ansi(false)
-        .with_target(false)
-        .without_time()
-        .with_max_level(max_level)
-        .try_init();
+fn initialize_tracing(max_level: LevelFilter, json_logs: bool) {
+    if json_logs {
+        let _ = tracing_subscriber::fmt()
+            .json()
+            .flatten_event(true)
+            .with_current_span(false)
+            .with_span_list(false)
+            .with_writer(io::stderr)
+            .with_ansi(false)
+            .with_target(false)
+            .without_time()
+            .with_max_level(max_level)
+            .try_init();
+    } else {
+        let _ = tracing_subscriber::fmt()
+            .with_writer(io::stderr)
+            .with_ansi(false)
+            .with_target(false)
+            .without_time()
+            .with_max_level(max_level)
+            .try_init();
+    }
 }
 
 /// True when argv is a `cli <tool> ...` invocation. Mirrors

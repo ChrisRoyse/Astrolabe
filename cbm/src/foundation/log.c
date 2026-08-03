@@ -4,6 +4,7 @@
 #include "log.h"
 #include "foundation/compat_thread.h"
 #include "foundation/constants.h"
+#include "foundation/log_internal.h"
 #include <ctype.h>
 #include <inttypes.h>
 #include <stdarg.h>
@@ -235,6 +236,28 @@ static void append_json_string(char *buf, size_t bufsz, size_t *pos, const char 
     append_char(buf, bufsz, pos, '"');
 }
 
+static void append_i64(char *buf, size_t bufsz, size_t *pos, int64_t value) {
+    char number[CBM_SZ_32];
+    (void)snprintf(number, sizeof(number), "%" PRId64, value);
+    append_raw(buf, bufsz, pos, number);
+}
+
+static void append_u64(char *buf, size_t bufsz, size_t *pos, uint64_t value) {
+    char number[CBM_SZ_32];
+    (void)snprintf(number, sizeof(number), "%" PRIu64, value);
+    append_raw(buf, bufsz, pos, number);
+}
+
+static void append_size(char *buf, size_t bufsz, size_t *pos, size_t value) {
+    char number[CBM_SZ_32];
+    (void)snprintf(number, sizeof(number), "%zu", value);
+    append_raw(buf, bufsz, pos, number);
+}
+
+static void append_json_bool(char *buf, size_t bufsz, size_t *pos, bool value) {
+    append_raw(buf, bufsz, pos, value ? "true" : "false");
+}
+
 static void finish_line(char *buf, size_t bufsz, size_t pos) {
     if (bufsz == 0) {
         return;
@@ -254,6 +277,223 @@ static void emit_line_locked(const char *line) {
         }
     }
     (void)fprintf(stderr, "%s\n", line);
+}
+
+static void emit_pipeline_phase_line_locked(const char *line) {
+    if (g_log_format == CBM_LOG_FORMAT_JSON) {
+        emit_line_locked(line);
+    } else {
+        /* Text phase traces historically bypass every configured sink. Keep
+         * standalone CLI/UI behavior byte-identical in text mode. */
+        (void)fprintf(stderr, "%s\n", line);
+    }
+    (void)fflush(stderr);
+}
+
+/* This path is used only when the ordinary formatter itself cannot complete.
+ * Keep every field bounded and allocation-free so JSON mode never degrades to
+ * an unparsable text fallback precisely when diagnostics matter most. */
+static void emit_internal_failure_locked(const char *event, const char *code,
+                                         const char *original_event, bool has_requested_bytes,
+                                         size_t requested_bytes, const char *message,
+                                         const char *remediation) {
+    if (g_log_format == CBM_LOG_FORMAT_TEXT) {
+        /* These three text records predate the JSON mode. Preserve their exact
+         * names and evidence fields for standalone consumers. */
+        if (strcmp(event, "log.length_overflow") == 0) {
+            (void)fprintf(stderr,
+                          "level=error msg=log.length_overflow original_event=%s remediation="
+                          "reduce_the_diagnostic_field_sizes_and_retry\n",
+                          original_event ? original_event : "");
+            return;
+        }
+        if (strcmp(event, "log.allocation_failed") == 0) {
+            (void)fprintf(stderr,
+                          "level=error msg=log.allocation_failed original_event=%s "
+                          "requested_bytes=%zu remediation=free_memory_and_retry\n",
+                          original_event ? original_event : "", requested_bytes);
+            return;
+        }
+        if (strcmp(event, "log.format_length_mismatch") == 0) {
+            (void)fprintf(stderr,
+                          "level=error msg=log.format_length_mismatch original_event=%s "
+                          "remediation=inspect_variadic_log_arguments\n",
+                          original_event ? original_event : "");
+            return;
+        }
+    }
+
+    char retained_event[CBM_SZ_128];
+    size_t retained = 0;
+    while (original_event && original_event[retained] != '\0' &&
+           retained < sizeof(retained_event) - 1) {
+        retained_event[retained] = original_event[retained];
+        retained++;
+    }
+    retained_event[retained] = '\0';
+    bool original_event_truncated =
+        original_event && original_event[retained] != '\0';
+
+    char line[CBM_SZ_1K];
+    size_t pos = 0;
+    if (g_log_format == CBM_LOG_FORMAT_JSON) {
+        append_raw(line, sizeof(line), &pos, "{\"level\":\"error\",\"event\":");
+        append_json_string(line, sizeof(line), &pos, event);
+        append_raw(line, sizeof(line), &pos, ",\"code\":");
+        append_json_string(line, sizeof(line), &pos, code);
+        append_raw(line, sizeof(line), &pos, ",\"original_event\":");
+        append_json_string(line, sizeof(line), &pos, retained_event);
+        append_raw(line, sizeof(line), &pos, ",\"original_event_truncated\":");
+        append_json_bool(line, sizeof(line), &pos, original_event_truncated);
+        if (has_requested_bytes) {
+            append_raw(line, sizeof(line), &pos, ",\"requested_bytes\":");
+            append_size(line, sizeof(line), &pos, requested_bytes);
+        }
+        append_raw(line, sizeof(line), &pos, ",\"message\":");
+        append_json_string(line, sizeof(line), &pos, message);
+        append_raw(line, sizeof(line), &pos, ",\"remediation\":");
+        append_json_string(line, sizeof(line), &pos, remediation);
+        append_char(line, sizeof(line), &pos, '}');
+    } else {
+        append_raw(line, sizeof(line), &pos, "level=error msg=");
+        append_text_atom(line, sizeof(line), &pos, event);
+        append_raw(line, sizeof(line), &pos, " code=");
+        append_text_atom(line, sizeof(line), &pos, code);
+        append_raw(line, sizeof(line), &pos, " original_event=");
+        append_text_atom(line, sizeof(line), &pos, retained_event);
+        append_raw(line, sizeof(line), &pos, " original_event_truncated=");
+        append_raw(line, sizeof(line), &pos, original_event_truncated ? "true" : "false");
+        if (has_requested_bytes) {
+            append_raw(line, sizeof(line), &pos, " requested_bytes=");
+            append_size(line, sizeof(line), &pos, requested_bytes);
+        }
+        append_raw(line, sizeof(line), &pos, " message=");
+        append_text_atom(line, sizeof(line), &pos, message);
+        append_raw(line, sizeof(line), &pos, " remediation=");
+        append_text_atom(line, sizeof(line), &pos, remediation);
+    }
+    finish_line(line, sizeof(line), pos);
+    emit_line_locked(line);
+}
+
+static size_t format_pipeline_phase_trace_line(
+    char *line, size_t line_size, const char *boundary, const char *phase, uint64_t pid, int mode,
+    bool row_sink_active, bool row_sink_completed, int nodes, int edges, bool memory_valid,
+    uint64_t working_set_bytes, uint64_t private_bytes, uint64_t peak_working_set_bytes,
+    uint64_t peak_private_bytes) {
+    size_t pos = 0;
+    if (g_log_format == CBM_LOG_FORMAT_JSON) {
+        append_raw(line, line_size, &pos,
+                   "{\"level\":\"info\",\"event\":\"pipeline.phase_trace\",\"boundary\":");
+        append_json_string(line, line_size, &pos, boundary ? boundary : "");
+        append_raw(line, line_size, &pos, ",\"phase\":");
+        append_json_string(line, line_size, &pos, phase ? phase : "");
+        append_raw(line, line_size, &pos, ",\"pid\":");
+        append_u64(line, line_size, &pos, pid);
+        append_raw(line, line_size, &pos, ",\"mode\":");
+        append_i64(line, line_size, &pos, mode);
+        append_raw(line, line_size, &pos, ",\"row_sink_active\":");
+        append_json_bool(line, line_size, &pos, row_sink_active);
+        append_raw(line, line_size, &pos, ",\"row_sink_completed\":");
+        append_json_bool(line, line_size, &pos, row_sink_completed);
+        append_raw(line, line_size, &pos, ",\"nodes\":");
+        append_i64(line, line_size, &pos, nodes);
+        append_raw(line, line_size, &pos, ",\"edges\":");
+        append_i64(line, line_size, &pos, edges);
+        append_raw(line, line_size, &pos, ",\"memory_valid\":");
+        append_json_bool(line, line_size, &pos, memory_valid);
+        append_raw(line, line_size, &pos, ",\"working_set_bytes\":");
+        append_u64(line, line_size, &pos, working_set_bytes);
+        append_raw(line, line_size, &pos, ",\"private_bytes\":");
+        append_u64(line, line_size, &pos, private_bytes);
+        append_raw(line, line_size, &pos, ",\"peak_working_set_bytes\":");
+        append_u64(line, line_size, &pos, peak_working_set_bytes);
+        append_raw(line, line_size, &pos, ",\"peak_private_bytes\":");
+        append_u64(line, line_size, &pos, peak_private_bytes);
+        append_char(line, line_size, &pos, '}');
+    } else {
+        append_raw(line, line_size, &pos, "ASTRO_CBM_PIPELINE_PHASE_TRACE event=");
+        append_raw(line, line_size, &pos, boundary ? boundary : "");
+        append_raw(line, line_size, &pos, " phase=");
+        append_raw(line, line_size, &pos, phase ? phase : "");
+        append_raw(line, line_size, &pos, " pid=");
+        append_u64(line, line_size, &pos, pid);
+        append_raw(line, line_size, &pos, " mode=");
+        append_i64(line, line_size, &pos, mode);
+        append_raw(line, line_size, &pos, " row_sink_active=");
+        append_i64(line, line_size, &pos, row_sink_active ? 1 : 0);
+        append_raw(line, line_size, &pos, " row_sink_completed=");
+        append_i64(line, line_size, &pos, row_sink_completed ? 1 : 0);
+        append_raw(line, line_size, &pos, " nodes=");
+        append_i64(line, line_size, &pos, nodes);
+        append_raw(line, line_size, &pos, " edges=");
+        append_i64(line, line_size, &pos, edges);
+        append_raw(line, line_size, &pos, " memory_valid=");
+        append_i64(line, line_size, &pos, memory_valid ? 1 : 0);
+        append_raw(line, line_size, &pos, " working_set_bytes=");
+        append_u64(line, line_size, &pos, working_set_bytes);
+        append_raw(line, line_size, &pos, " private_bytes=");
+        append_u64(line, line_size, &pos, private_bytes);
+        append_raw(line, line_size, &pos, " peak_working_set_bytes=");
+        append_u64(line, line_size, &pos, peak_working_set_bytes);
+        append_raw(line, line_size, &pos, " peak_private_bytes=");
+        append_u64(line, line_size, &pos, peak_private_bytes);
+    }
+    finish_line(line, line_size, pos);
+    return pos;
+}
+
+void cbm_log_pipeline_phase_trace(const char *boundary, const char *phase, uint64_t pid,
+                                  int mode, bool row_sink_active, bool row_sink_completed,
+                                  int nodes, int edges, bool memory_valid,
+                                  uint64_t working_set_bytes, uint64_t private_bytes,
+                                  uint64_t peak_working_set_bytes,
+                                  uint64_t peak_private_bytes) {
+    log_lock();
+    char stack_line[CBM_SZ_1K];
+    size_t line_len = format_pipeline_phase_trace_line(
+        stack_line, sizeof(stack_line), boundary, phase, pid, mode, row_sink_active,
+        row_sink_completed, nodes, edges, memory_valid, working_set_bytes, private_bytes,
+        peak_working_set_bytes, peak_private_bytes);
+    if (line_len == SIZE_MAX) {
+        emit_internal_failure_locked(
+            "pipeline.phase_trace_failed", "CBM_LOG_LENGTH_OVERFLOW", "pipeline.phase_trace",
+            false, 0, "the pipeline phase trace length overflowed size_t",
+            "reduce the diagnostic field sizes and retry");
+        log_unlock();
+        return;
+    }
+    if (line_len < sizeof(stack_line)) {
+        emit_pipeline_phase_line_locked(stack_line);
+        log_unlock();
+        return;
+    }
+    char *dynamic_line = malloc(line_len + 1);
+    if (!dynamic_line) {
+        emit_internal_failure_locked(
+            "pipeline.phase_trace_failed", "CBM_LOG_ALLOCATION_FAILED", "pipeline.phase_trace",
+            true, line_len + 1, "the pipeline phase trace buffer allocation failed",
+            "free memory and retry");
+        log_unlock();
+        return;
+    }
+    size_t written = format_pipeline_phase_trace_line(
+        dynamic_line, line_len + 1, boundary, phase, pid, mode, row_sink_active,
+        row_sink_completed, nodes, edges, memory_valid, working_set_bytes, private_bytes,
+        peak_working_set_bytes, peak_private_bytes);
+    if (written != line_len) {
+        free(dynamic_line);
+        emit_internal_failure_locked(
+            "pipeline.phase_trace_failed", "CBM_LOG_FORMAT_LENGTH_MISMATCH",
+            "pipeline.phase_trace", false, 0,
+            "the pipeline phase trace changed between format passes",
+            "inspect the diagnostic formatter inputs and retry");
+        log_unlock();
+        return;
+    }
+    emit_pipeline_phase_line_locked(dynamic_line);
+    free(dynamic_line);
+    log_unlock();
 }
 
 static size_t format_log_line(char *line_buf, size_t line_size, CBMLogLevel level, const char *msg,
@@ -313,10 +553,10 @@ void cbm_log(CBMLogLevel level, const char *msg, ...) {
     va_end(stack_args);
     if (line_len == SIZE_MAX) {
         va_end(args);
-        (void)fprintf(stderr,
-                      "level=error msg=log.length_overflow original_event=%s remediation="
-                      "reduce_the_diagnostic_field_sizes_and_retry\n",
-                      msg ? msg : "");
+        emit_internal_failure_locked(
+            "log.length_overflow", "CBM_LOG_LENGTH_OVERFLOW", msg, false, 0,
+            "the structured diagnostic length overflowed size_t",
+            "reduce the diagnostic field sizes and retry");
         log_unlock();
         return;
     }
@@ -329,10 +569,9 @@ void cbm_log(CBMLogLevel level, const char *msg, ...) {
     char *line_buf = malloc(line_len + 1);
     if (!line_buf) {
         va_end(args);
-        (void)fprintf(stderr,
-                      "level=error msg=log.allocation_failed original_event=%s requested_bytes=%zu "
-                      "remediation=free_memory_and_retry\n",
-                      msg ? msg : "", line_len + 1);
+        emit_internal_failure_locked(
+            "log.allocation_failed", "CBM_LOG_ALLOCATION_FAILED", msg, true, line_len + 1,
+            "the structured diagnostic buffer allocation failed", "free memory and retry");
         log_unlock();
         return;
     }
@@ -341,10 +580,10 @@ void cbm_log(CBMLogLevel level, const char *msg, ...) {
 
     if (written != line_len) {
         free(line_buf);
-        (void)fprintf(stderr,
-                      "level=error msg=log.format_length_mismatch original_event=%s "
-                      "remediation=inspect_variadic_log_arguments\n",
-                      msg ? msg : "");
+        emit_internal_failure_locked(
+            "log.format_length_mismatch", "CBM_LOG_FORMAT_LENGTH_MISMATCH", msg, false, 0,
+            "the structured diagnostic changed between format passes",
+            "inspect the variadic log arguments and retry");
         log_unlock();
         return;
     }

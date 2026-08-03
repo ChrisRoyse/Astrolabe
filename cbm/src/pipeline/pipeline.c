@@ -45,6 +45,7 @@ enum {
 #include "foundation/platform.h"
 #include "foundation/compat_fs.h"
 #include "foundation/log.h"
+#include "foundation/log_internal.h"
 #include "foundation/str_util.h"
 #include "foundation/hash_table.h"
 #include "foundation/compat.h"
@@ -343,17 +344,10 @@ static void cbm_pipeline_phase_trace_event(const char *event, const char *phase,
         peak_working_set_bytes = (uint64_t)memory->PeakWorkingSetSize;
         peak_private_bytes = (uint64_t)memory->PeakPagefileUsage;
     }
-    fprintf(stderr,
-            "ASTRO_CBM_PIPELINE_PHASE_TRACE event=%s phase=%s pid=%lu mode=%d "
-            "row_sink_active=%d row_sink_completed=%d nodes=%d edges=%d memory_valid=%d "
-            "working_set_bytes=%llu private_bytes=%llu peak_working_set_bytes=%llu "
-            "peak_private_bytes=%llu\n",
-            event ? event : "", phase ? phase : "", (unsigned long)GetCurrentProcessId(),
-            p ? (int)p->mode : -1, p && p->row_sink_active ? 1 : 0,
-            p && p->row_sink_completed ? 1 : 0, nodes, edges, memory_valid ? 1 : 0,
-            (unsigned long long)working_set_bytes, (unsigned long long)private_bytes,
-            (unsigned long long)peak_working_set_bytes, (unsigned long long)peak_private_bytes);
-    fflush(stderr);
+    cbm_log_pipeline_phase_trace(
+        event, phase, (uint64_t)GetCurrentProcessId(), p ? (int)p->mode : -1,
+        p && p->row_sink_active, p && p->row_sink_completed, nodes, edges, memory_valid,
+        working_set_bytes, private_bytes, peak_working_set_bytes, peak_private_bytes);
 }
 
 cbm_pipeline_phase_probe_t cbm_pipeline_phase_probe_start(cbm_pipeline_t *p, const char *phase) {

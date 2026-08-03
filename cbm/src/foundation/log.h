@@ -42,8 +42,9 @@ typedef enum {
  * the numeric equivalents 0..4 matching CBMLogLevel. Unknown, empty, or
  * unset values leave the level unchanged (fail-open).
  *
- * Also applies CBM_LOG_FORMAT=text|json. If unset, the current format is left
- * unchanged. Call once at startup before any threads or log lines. */
+ * Also applies case-insensitive CBM_LOG_FORMAT=text|json. Unset, empty, or
+ * invalid values leave the current format unchanged; a fresh process starts in
+ * text mode. Call once at startup before any threads or log lines. */
 void cbm_log_init_from_env(void);
 
 /* Set minimum log level (default: INFO). */
