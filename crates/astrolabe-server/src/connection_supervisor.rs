@@ -6,7 +6,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, ExitStatus, Stdio};
-use std::sync::mpsc::{self, RecvTimeoutError, SyncSender};
+use std::sync::mpsc::{self, RecvTimeoutError, SyncSender, TrySendError};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -23,6 +23,7 @@ const JOURNAL_CONTRACT_SCHEMA: &str = "astrolabe.global-mcp-connection-journal.v
 const JOURNAL_RECORD_SCHEMA: &str = "astrolabe.global-mcp-connection-record.v1";
 const MAX_STDERR_TAIL_BYTES: usize = 64 * 1024;
 const RELAY_CHANNEL_CAPACITY: usize = 8;
+const STDERR_FORWARD_CHANNEL_CAPACITY: usize = 2;
 const WORKER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Debug)]
@@ -973,6 +974,8 @@ enum RelayEvent {
     WorkerStderr(Vec<u8>),
     WorkerStderrEof,
     WorkerStderrReadFailed(String),
+    ClientStderrForwarded(usize),
+    ClientStderrForwardFailed(String),
 }
 
 struct RelayResult {
@@ -999,14 +1002,22 @@ fn relay_connection(
     let (sender, receiver) = mpsc::sync_channel(RELAY_CHANNEL_CAPACITY);
     spawn_client_reader(sender.clone())?;
     spawn_worker_reader(sender.clone(), worker_stdout)?;
-    spawn_worker_stderr_reader(sender, worker_stderr)?;
+    spawn_worker_stderr_reader(sender.clone(), worker_stderr)?;
+    let stderr_forward = spawn_client_stderr_forwarder(sender)?;
 
     let mut worker_input = Some(worker_stdin);
     let stdout = io::stdout();
     let mut client_output = stdout.lock();
     let mut stderr_tail = Vec::new();
+    let mut stderr_stream_hasher = Sha256::new();
     let mut stderr_total_bytes = 0_u64;
     let mut stderr_truncated = false;
+    let mut stderr_forward_enqueued_bytes = 0_u64;
+    let mut stderr_forward_written_bytes = 0_u64;
+    let mut stderr_forward_dropped_bytes = 0_u64;
+    let mut stderr_forward_backpressure_events = 0_u64;
+    let mut stderr_forward_disconnected = false;
+    let mut stderr_forward_error = None::<String>;
     let mut request_sequence = 0_u64;
     let mut pending = BTreeMap::<String, u64>::new();
     let mut last_requested_id = None::<Value>;
@@ -1066,6 +1077,18 @@ fn relay_connection(
                         "last_completed_id": last_completed_id,
                         "stderr_tail_bytes_observed": stderr_tail.len(),
                         "stderr_tail_sha256_observed": sha256_bytes(&stderr_tail),
+                        "stderr_forward": {
+                            "mode": "isolated_nonblocking_mirror",
+                            "source_of_truth": "connection_journal",
+                            "enqueued_bytes": stderr_forward_enqueued_bytes,
+                            "written_bytes": stderr_forward_written_bytes,
+                            "pending_bytes": stderr_forward_enqueued_bytes
+                                .saturating_sub(stderr_forward_written_bytes),
+                            "dropped_bytes": stderr_forward_dropped_bytes,
+                            "backpressure_events": stderr_forward_backpressure_events,
+                            "disconnected": stderr_forward_disconnected,
+                            "error": stderr_forward_error.as_deref(),
+                        },
                         "retry_count": 0,
                     }),
                 )?;
@@ -1268,10 +1291,30 @@ fn relay_connection(
                 );
             }
             Ok(RelayEvent::WorkerStderr(bytes)) => {
-                stderr_total_bytes = stderr_total_bytes.saturating_add(bytes.len() as u64);
+                let byte_count = bytes.len() as u64;
+                stderr_total_bytes = stderr_total_bytes.saturating_add(byte_count);
+                stderr_stream_hasher.update(&bytes);
                 append_bounded_tail(&mut stderr_tail, &bytes, &mut stderr_truncated);
-                let mut stderr = io::stderr().lock();
-                let _ = stderr.write_all(&bytes).and_then(|()| stderr.flush());
+                match stderr_forward.try_send(bytes) {
+                    Ok(()) => {
+                        stderr_forward_enqueued_bytes =
+                            stderr_forward_enqueued_bytes.saturating_add(byte_count);
+                    }
+                    Err(TrySendError::Full(bytes)) => {
+                        stderr_forward_dropped_bytes =
+                            stderr_forward_dropped_bytes.saturating_add(bytes.len() as u64);
+                        stderr_forward_backpressure_events =
+                            stderr_forward_backpressure_events.saturating_add(1);
+                    }
+                    Err(TrySendError::Disconnected(bytes)) => {
+                        stderr_forward_dropped_bytes =
+                            stderr_forward_dropped_bytes.saturating_add(bytes.len() as u64);
+                        stderr_forward_disconnected = true;
+                        stderr_forward_error.get_or_insert_with(|| {
+                            "the isolated client-stderr forwarder disconnected".to_string()
+                        });
+                    }
+                }
             }
             Ok(RelayEvent::WorkerStderrEof) => worker_stderr_closed = true,
             Ok(RelayEvent::WorkerStderrReadFailed(error)) => {
@@ -1285,6 +1328,14 @@ fn relay_connection(
                         expected_shutdown: false,
                     },
                 );
+            }
+            Ok(RelayEvent::ClientStderrForwarded(bytes)) => {
+                stderr_forward_written_bytes =
+                    stderr_forward_written_bytes.saturating_add(bytes as u64);
+            }
+            Ok(RelayEvent::ClientStderrForwardFailed(error)) => {
+                stderr_forward_disconnected = true;
+                stderr_forward_error.get_or_insert(error);
             }
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => {
@@ -1326,6 +1377,7 @@ fn relay_connection(
         };
     }
     let stderr_sha256 = sha256_bytes(&stderr_tail);
+    let stderr_stream_sha256 = format!("{:x}", stderr_stream_hasher.finalize());
     let exit_code = if cause.expected_shutdown && status.success() {
         0
     } else {
@@ -1347,10 +1399,23 @@ fn relay_connection(
         "last_completed_id": last_completed_id,
         "stderr": {
             "total_bytes": stderr_total_bytes,
+            "stream_sha256": stderr_stream_sha256,
             "tail_bytes": stderr_tail.len(),
             "tail_sha256": stderr_sha256,
             "tail_utf8_lossy": String::from_utf8_lossy(&stderr_tail),
             "truncated": stderr_truncated,
+        },
+        "stderr_forward": {
+            "mode": "isolated_nonblocking_mirror",
+            "source_of_truth": "connection_journal",
+            "enqueued_bytes": stderr_forward_enqueued_bytes,
+            "written_bytes": stderr_forward_written_bytes,
+            "pending_bytes": stderr_forward_enqueued_bytes
+                .saturating_sub(stderr_forward_written_bytes),
+            "dropped_bytes": stderr_forward_dropped_bytes,
+            "backpressure_events": stderr_forward_backpressure_events,
+            "disconnected": stderr_forward_disconnected,
+            "error": stderr_forward_error,
         },
         "retry_count": 0,
     });
@@ -1481,6 +1546,44 @@ fn spawn_worker_stderr_reader(
                 "Preserve the connection journal and inspect process thread resources.",
             )
         })
+}
+
+fn spawn_client_stderr_forwarder(
+    sender: SyncSender<RelayEvent>,
+) -> Result<SyncSender<Vec<u8>>, SupervisorError> {
+    let (forward_sender, receiver) = mpsc::sync_channel::<Vec<u8>>(STDERR_FORWARD_CHANNEL_CAPACITY);
+    thread::Builder::new()
+        .name("astrolabe-supervisor-client-stderr-writer".to_string())
+        .spawn(move || {
+            let stderr = io::stderr();
+            let mut output = stderr.lock();
+            while let Ok(bytes) = receiver.recv() {
+                match output.write_all(&bytes).and_then(|()| output.flush()) {
+                    Ok(()) => {
+                        if sender
+                            .send(RelayEvent::ClientStderrForwarded(bytes.len()))
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
+                    Err(error) => {
+                        let _ = sender.send(RelayEvent::ClientStderrForwardFailed(
+                            error.to_string(),
+                        ));
+                        return;
+                    }
+                }
+            }
+        })
+        .map_err(|error| {
+            SupervisorError::new(
+                "ASTRO_MCP_CLIENT_STDERR_FORWARDER_SPAWN_FAILED",
+                format!("the isolated client-stderr forwarder could not start: {error}"),
+                "Preserve the connection journal and inspect process thread resources before another connection.",
+            )
+        })?;
+    Ok(forward_sender)
 }
 
 fn write_frame(writer: &mut impl Write, frame: &ResidentJsonrpcFrame) -> io::Result<()> {
