@@ -788,6 +788,25 @@ static bool artifact_close_snapshot_store(cbm_store_t **store, const char *path)
     return false;
 }
 
+static bool artifact_snapshot_exec(cbm_store_t *store, const char *path, const char *stage,
+                                   const char *sql) {
+    cbm_store_clear_error(store);
+    if (cbm_store_exec(store, sql) == CBM_STORE_OK) {
+        return true;
+    }
+
+    int sqlite_error = cbm_store_error_code(store);
+    const char *sqlite_detail = cbm_store_error(store);
+    snprintf(g_export_error, sizeof(g_export_error),
+             "%s: sqlite_error=%d detail=%s path=%s", stage, sqlite_error,
+             sqlite_detail ? sqlite_detail : "SQLite execution failed", path ? path : "");
+    cbm_log_error("artifact.export", "stage", stage, "err", "sqlite_execution_failed",
+                  "sqlite_error", itoa_buf(sqlite_error), "sqlite_detail",
+                  sqlite_detail ? sqlite_detail : "SQLite execution failed", "path",
+                  path ? path : "");
+    return false;
+}
+
 static bool artifact_sidecars_absent_exact(const char *db_path, const char *stage) {
     char wal_path[CBM_SZ_4K];
     char shm_path[CBM_SZ_4K];
@@ -1165,26 +1184,56 @@ static char *prepare_export_snapshot(const char *db_path, const char *project_na
         return NULL;
     }
 
-    int nodes = cbm_store_count_nodes(snapshot, project_name);
-    int edges = cbm_store_count_edges(snapshot, project_name);
-    if (nodes < 0 || edges < 0) {
+    /* Keep snapshot maintenance ahead of all query-statement preparation so
+     * its connection state and diagnostics are isolated from later metadata
+     * reads. Execute and diagnose each maintenance boundary independently;
+     * there is no skip or retry. */
+    bool stripped = true;
+    if (quality == CBM_ARTIFACT_BEST) {
+        stripped = artifact_snapshot_exec(snapshot, snapshot_path,
+                                          "snapshot_strip.drop_indexes", DROP_INDEXES_SQL);
+        if (stripped) {
+            stripped = artifact_snapshot_exec(snapshot, snapshot_path, "snapshot_strip.vacuum",
+                                              "VACUUM;");
+        }
+        if (stripped) {
+            stripped = artifact_snapshot_exec(snapshot, snapshot_path, "snapshot_strip.optimize",
+                                              "PRAGMA optimize;");
+        }
+    }
+    if (!stripped) {
         (void)artifact_close_snapshot_store(&snapshot, snapshot_path);
-        artifact_export_fail("snapshot_counts", snapshot_path,
-                             "physical_snapshot_count_query_failed", 0);
+        if (!snapshot) {
+            (void)artifact_remove_closed_scratch(snapshot_path, "snapshot_strip_cleanup");
+        }
+        return NULL;
+    }
+
+    int nodes = cbm_store_count_nodes(snapshot, project_name);
+    if (nodes < 0) {
+        const char *detail = cbm_store_error(snapshot);
+        int sqlite_error = cbm_store_error_code(snapshot);
+        char count_error[CBM_SZ_512];
+        snprintf(count_error, sizeof(count_error), "sqlite_error=%d detail=%s", sqlite_error,
+                 detail ? detail : "node count query failed");
+        (void)artifact_close_snapshot_store(&snapshot, snapshot_path);
+        artifact_export_fail("snapshot_counts.nodes", snapshot_path, count_error, 0);
         if (!snapshot) {
             (void)artifact_remove_closed_scratch(snapshot_path, "snapshot_counts_cleanup");
         }
         return NULL;
     }
-    if (quality == CBM_ARTIFACT_BEST &&
-        (cbm_store_exec(snapshot, DROP_INDEXES_SQL) != CBM_STORE_OK ||
-         cbm_store_exec(snapshot, "VACUUM;") != CBM_STORE_OK ||
-         cbm_store_exec(snapshot, "PRAGMA optimize;") != CBM_STORE_OK)) {
+    int edges = cbm_store_count_edges(snapshot, project_name);
+    if (edges < 0) {
+        const char *detail = cbm_store_error(snapshot);
+        int sqlite_error = cbm_store_error_code(snapshot);
+        char count_error[CBM_SZ_512];
+        snprintf(count_error, sizeof(count_error), "sqlite_error=%d detail=%s", sqlite_error,
+                 detail ? detail : "edge count query failed");
         (void)artifact_close_snapshot_store(&snapshot, snapshot_path);
-        artifact_export_fail("snapshot_strip", snapshot_path,
-                             "drop_indexes_vacuum_or_optimize_failed", 0);
+        artifact_export_fail("snapshot_counts.edges", snapshot_path, count_error, 0);
         if (!snapshot) {
-            (void)artifact_remove_closed_scratch(snapshot_path, "snapshot_strip_cleanup");
+            (void)artifact_remove_closed_scratch(snapshot_path, "snapshot_counts_cleanup");
         }
         return NULL;
     }
