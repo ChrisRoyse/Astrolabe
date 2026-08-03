@@ -210,6 +210,43 @@ static char *read_file_alloc(const char *path, size_t *out_len) {
 #ifdef _WIN32
 static void artifact_close_handle_or_abort(HANDLE *handle, const char *stage, const char *path);
 
+static FILE_RENAME_INFO *artifact_rename_info_create(const wchar_t *destination,
+                                                     BOOL replace_if_exists,
+                                                     DWORD *out_bytes, DWORD *out_error) {
+    *out_bytes = 0;
+    *out_error = ERROR_SUCCESS;
+    if (!destination) {
+        *out_error = ERROR_INVALID_PARAMETER;
+        return NULL;
+    }
+
+    size_t destination_chars = wcslen(destination);
+    const size_t name_offset = offsetof(FILE_RENAME_INFO, FileName);
+    const size_t alignment = sizeof(void *);
+    const size_t fixed_bytes = name_offset + sizeof(wchar_t) + (alignment - 1U);
+    if (fixed_bytes > UINT32_MAX ||
+        destination_chars > (UINT32_MAX - fixed_bytes) / sizeof(wchar_t)) {
+        *out_error = ERROR_BUFFER_OVERFLOW;
+        return NULL;
+    }
+
+    size_t destination_bytes = destination_chars * sizeof(wchar_t);
+    size_t raw_bytes = name_offset + destination_bytes + sizeof(wchar_t);
+    size_t buffer_bytes = ((raw_bytes + alignment - 1U) / alignment) * alignment;
+    FILE_RENAME_INFO *rename_info = calloc(1, buffer_bytes);
+    if (!rename_info) {
+        *out_error = ERROR_NOT_ENOUGH_MEMORY;
+        return NULL;
+    }
+
+    rename_info->ReplaceIfExists = replace_if_exists;
+    rename_info->RootDirectory = NULL;
+    rename_info->FileNameLength = (DWORD)destination_bytes;
+    memcpy(rename_info->FileName, destination, destination_bytes);
+    *out_bytes = (DWORD)buffer_bytes;
+    return rename_info;
+}
+
 static bool artifact_remove_file_exact(const char *path, artifact_file_error_t *out_err,
                                        const char *failure) {
     unsigned long before_error = 0;
@@ -318,40 +355,33 @@ static int write_file_atomic(const char *path, const char *data, size_t len,
         return CBM_NOT_FOUND;
     }
 
-    size_t destination_chars = wcslen(wide_destination);
-    if (destination_chars >
-        (UINT32_MAX - offsetof(FILE_RENAME_INFO, FileName)) / sizeof(wchar_t)) {
-        artifact_close_handle_or_abort(&output, "atomic_write_temp_close", tmp);
-        free(wide_tmp);
-        free(wide_destination);
-        if (!artifact_remove_file_exact(tmp, out_err, "rename_record_cleanup_failed")) {
-            return CBM_NOT_FOUND;
-        }
-        file_error_set(out_err, "rename_record_too_large", ERROR_BUFFER_OVERFLOW);
-        return CBM_NOT_FOUND;
-    }
-    size_t rename_bytes =
-        offsetof(FILE_RENAME_INFO, FileName) + destination_chars * sizeof(wchar_t);
-    FILE_RENAME_INFO *rename_info = calloc(1, rename_bytes);
+    DWORD rename_bytes = 0;
+    DWORD rename_record_error = ERROR_SUCCESS;
+    FILE_RENAME_INFO *rename_info =
+        artifact_rename_info_create(wide_destination, TRUE, &rename_bytes,
+                                    &rename_record_error);
     if (!rename_info) {
         artifact_close_handle_or_abort(&output, "atomic_write_temp_close", tmp);
         free(wide_tmp);
         free(wide_destination);
-        if (!artifact_remove_file_exact(tmp, out_err, "rename_allocate_cleanup_failed")) {
+        const char *cleanup_failure = rename_record_error == ERROR_BUFFER_OVERFLOW
+                                          ? "rename_record_cleanup_failed"
+                                          : "rename_allocate_cleanup_failed";
+        if (!artifact_remove_file_exact(tmp, out_err, cleanup_failure)) {
             return CBM_NOT_FOUND;
         }
-        file_error_set(out_err, "rename_record_allocation_failed", ERROR_NOT_ENOUGH_MEMORY);
+        file_error_set(out_err,
+                       rename_record_error == ERROR_BUFFER_OVERFLOW
+                           ? "rename_record_too_large"
+                           : "rename_record_allocation_failed",
+                       (int)rename_record_error);
         return CBM_NOT_FOUND;
     }
-    rename_info->ReplaceIfExists = TRUE;
-    rename_info->RootDirectory = NULL;
-    rename_info->FileNameLength = (DWORD)(destination_chars * sizeof(wchar_t));
-    memcpy(rename_info->FileName, wide_destination, rename_info->FileNameLength);
     free(wide_tmp);
     free(wide_destination);
 
-    bool renamed = SetFileInformationByHandle(output, FileRenameInfo, rename_info,
-                                              (DWORD)rename_bytes) != 0;
+    bool renamed =
+        SetFileInformationByHandle(output, FileRenameInfo, rename_info, rename_bytes) != 0;
     DWORD rename_error = renamed ? ERROR_SUCCESS : GetLastError();
     free(rename_info);
     if (!renamed) {
@@ -925,37 +955,28 @@ static cbm_artifact_import_status_t artifact_publish_import_noreplace(
             "ordinary_file_identity_or_flush_failed");
     }
 
-    size_t destination_chars = wcslen(wide_destination);
-    if (destination_chars > (SIZE_MAX - offsetof(FILE_RENAME_INFO, FileName)) / sizeof(wchar_t) ||
-        destination_chars >
-            (UINT32_MAX - offsetof(FILE_RENAME_INFO, FileName)) / sizeof(wchar_t)) {
-        free(wide_destination);
-        artifact_close_handle_or_abort(&source, "import_publish_source_close", source_path);
-        artifact_export_fail("import_publish_path", destination_path,
-                             "destination_rename_record_too_large", ERROR_BUFFER_OVERFLOW);
-        return artifact_import_fail_and_remove_private(
-            result, source_path, "import_publish_path",
-            "destination_rename_record_too_large");
-    }
-    size_t rename_bytes =
-        offsetof(FILE_RENAME_INFO, FileName) + destination_chars * sizeof(wchar_t);
-    FILE_RENAME_INFO *rename_info = calloc(1, rename_bytes);
+    DWORD rename_bytes = 0;
+    DWORD rename_record_error = ERROR_SUCCESS;
+    FILE_RENAME_INFO *rename_info =
+        artifact_rename_info_create(wide_destination, FALSE, &rename_bytes,
+                                    &rename_record_error);
     if (!rename_info) {
         free(wide_destination);
         artifact_close_handle_or_abort(&source, "import_publish_source_close", source_path);
-        artifact_export_fail("import_publish_allocate", destination_path,
-                             "rename_record_allocation_failed", ERROR_NOT_ENOUGH_MEMORY);
+        const char *operation = rename_record_error == ERROR_BUFFER_OVERFLOW
+                                    ? "import_publish_path"
+                                    : "import_publish_allocate";
+        const char *detail = rename_record_error == ERROR_BUFFER_OVERFLOW
+                                 ? "destination_rename_record_too_large"
+                                 : "rename_record_allocation_failed";
+        artifact_export_fail(operation, destination_path, detail, (int)rename_record_error);
         return artifact_import_fail_and_remove_private(
-            result, source_path, "import_publish_allocate", "rename_record_allocation_failed");
+            result, source_path, operation, detail);
     }
-    rename_info->ReplaceIfExists = FALSE;
-    rename_info->RootDirectory = NULL;
-    rename_info->FileNameLength = (DWORD)(destination_chars * sizeof(wchar_t));
-    memcpy(rename_info->FileName, wide_destination, rename_info->FileNameLength);
     free(wide_destination);
 
-    bool renamed = SetFileInformationByHandle(source, FileRenameInfo, rename_info,
-                                              (DWORD)rename_bytes) != 0;
+    bool renamed =
+        SetFileInformationByHandle(source, FileRenameInfo, rename_info, rename_bytes) != 0;
     DWORD rename_error = renamed ? ERROR_SUCCESS : GetLastError();
     free(rename_info);
     if (!renamed) {
