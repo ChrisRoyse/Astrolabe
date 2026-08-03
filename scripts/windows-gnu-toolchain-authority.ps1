@@ -4478,7 +4478,6 @@ public class AstroTreeRecorder {
     const int JobObjectExtendedLimitInformation = 9;
     const int JobObjectBasicProcessIdList = 3;
     const int FileRenameInfo = 3;
-    const int FileDispositionInfo = 4;
     const int FileLinkInfo = 11;
     const int FileIdInfo = 18;
     const int FileDispositionInfoEx = 21;
@@ -5577,14 +5576,25 @@ public class AstroTreeRecorder {
         }
     }
 
-    static void SetDeleteDisposition(SafeFileHandle source, string description) {
-        IntPtr buffer = Marshal.AllocHGlobal(1);
+    static void SetPosixDeleteDisposition(
+        SafeFileHandle source,
+        string description
+    ) {
+        IntPtr buffer = Marshal.AllocHGlobal(sizeof(uint));
         try {
-            Marshal.WriteByte(buffer, 0, 1);
-            if (!SetFileInformationByHandle(source, FileDispositionInfo, buffer, 1))
+            uint flags = FILE_DISPOSITION_FLAG_DELETE |
+                FILE_DISPOSITION_FLAG_POSIX_SEMANTICS;
+            Marshal.WriteInt32(buffer, unchecked((int)flags));
+            if (!SetFileInformationByHandle(
+                    source,
+                    FileDispositionInfoEx,
+                    buffer,
+                    sizeof(uint)
+                ))
                 throw new Win32Exception(
                     Marshal.GetLastWin32Error(),
-                    "could not set exact FILE_DISPOSITION_INFO for " + description
+                    "could not set exact POSIX FILE_DISPOSITION_INFO_EX for " +
+                    description
                 );
         } finally {
             Marshal.FreeHGlobal(buffer);
@@ -6122,6 +6132,9 @@ public class AstroTreeRecorder {
     string PublishManifestBytes(byte[] intended, byte[] expectedPrevious, string expectedPreviousIdentity) {
         if (intended == null || intended.Length == 0)
             throw new InvalidDataException("serialized attribution manifest must not be empty");
+        System.Diagnostics.Stopwatch destinationElapsed =
+            System.Diagnostics.Stopwatch.StartNew();
+        string destinationStage = "derive-transaction-paths";
         string directory = Path.GetDirectoryName(manifestPath);
         string nonce = Guid.NewGuid().ToString("N");
         string scratchPath = Path.Combine(
@@ -6160,6 +6173,7 @@ public class AstroTreeRecorder {
         FileStream envelope = null;
         FileStream published = null;
         try {
+            destinationStage = "create-and-flush-new-scratch";
             newScratch = CreateExactDeleteOnCloseScratch(scratchPath);
             RequireOrdinarySingleLink(newScratch.SafeFileHandle, "new attribution-manifest scratch");
             newScratch.Write(intended, 0, intended.Length);
@@ -6187,6 +6201,7 @@ public class AstroTreeRecorder {
 
             if (String.IsNullOrEmpty(expectedPreviousIdentity))
                 throw new InvalidOperationException("refresh attribution FILE_ID binding is missing");
+            destinationStage = "open-previous-manifest-mutation-lease";
             previous = OpenPreviousManifestMutationWithBoundedContention(
                 manifestPath,
                 expectedPreviousIdentity,
@@ -6221,12 +6236,14 @@ public class AstroTreeRecorder {
                 preparedEnvelopePath,
                 dispositionProofPath
             );
+            destinationStage = "publish-prepared-envelope";
             envelope = PublishRefreshEnvelope(
                 envelopeBytes,
                 envelopeScratchPath,
                 preparedEnvelopePath
             );
 
+            destinationStage = "rename-old-final-to-tombstone";
             RenameHandleNoReplace(previous.SafeFileHandle, oldTombstonePath);
             previous.Flush(true);
             RequireAttributionProtocolPath(
@@ -6239,6 +6256,7 @@ public class AstroTreeRecorder {
                 throw new InvalidDataException("old attribution tombstone lost its exact FILE_ID/bytes binding");
             RequirePathAbsent(manifestPath, "refresh final after old-manifest tombstoning");
 
+            destinationStage = "publish-new-final";
             published = PublishScratchHardLinkAndProtect(
                 ref newScratch,
                 scratchPath,
@@ -6254,6 +6272,7 @@ public class AstroTreeRecorder {
             // The proof phase is named while the exact old tombstone handle is still
             // retained and deletion-denied. Consequently a proof envelope without its
             // old tombstone can arise only after this producer crossed exact disposition.
+            destinationStage = "rename-envelope-to-disposition-proof";
             RenameHandleNoReplace(envelope.SafeFileHandle, dispositionProofPath);
             envelope.Flush(true);
             RequireAttributionProtocolPath(
@@ -6268,9 +6287,20 @@ public class AstroTreeRecorder {
             if (!String.Equals(GetFileIdentity(previous.SafeFileHandle), oldIdentity, StringComparison.Ordinal) ||
                 !BytesEqual(ReadAllExact(previous), oldBytes))
                 throw new InvalidDataException("old attribution tombstone changed before disposition");
-            SetDeleteDisposition(previous.SafeFileHandle, "old attribution refresh tombstone");
+            // Legacy FileDispositionInfo leaves the name delete-pending until every
+            // independent all-sharing observer closes. During a real launcher build,
+            // that made GetFileAttributesW report ERROR_ACCESS_DENIED instead of a
+            // durable absence. POSIX disposition removes this exact link when our
+            // retained delete handle closes while preserving any observer's access to
+            // the unlinked FILE_OBJECT. No path retry or deletion fallback is needed.
+            destinationStage = "set-posix-old-tombstone-disposition";
+            SetPosixDeleteDisposition(
+                previous.SafeFileHandle,
+                "old attribution refresh tombstone"
+            );
             previous.Dispose();
             previous = null;
+            destinationStage = "readback-old-tombstone-absence";
             RequirePathAbsent(oldTombstonePath, "old attribution refresh tombstone");
 
             // The envelope is the last transaction artifact disposed. The final remains
@@ -6280,17 +6310,26 @@ public class AstroTreeRecorder {
                 throw new InvalidDataException("refreshed final changed before envelope disposition");
             if (!BytesEqual(ReadAllExact(envelope), envelopeBytes))
                 throw new InvalidDataException("refresh proof envelope changed before disposition");
-            SetDeleteDisposition(envelope.SafeFileHandle, "attribution refresh disposition-proof envelope");
+            destinationStage = "set-posix-proof-envelope-disposition";
+            SetPosixDeleteDisposition(
+                envelope.SafeFileHandle,
+                "attribution refresh disposition-proof envelope"
+            );
             envelope.Dispose();
             envelope = null;
+            destinationStage = "readback-terminal-transaction-absence";
             RequirePathAbsent(dispositionProofPath, "attribution refresh disposition-proof envelope");
             RequirePathAbsent(scratchPath, "new attribution-manifest scratch");
             RequirePathAbsent(envelopeScratchPath, "refresh-envelope scratch");
+            destinationStage = "complete";
             return newIdentity;
         } catch (Exception fault) {
             throw new IOException(
                 "attribution destination-CAS publication failed; exact typed refresh state was preserved " +
-                "(final=" + manifestPath + ", prepared_envelope=" + preparedEnvelopePath +
+                "(stage=" + destinationStage + ", elapsed_ms=" +
+                destinationElapsed.ElapsedMilliseconds.ToString(CultureInfo.InvariantCulture) +
+                ", native_error=" + FindPublicationNativeError(fault).ToString(CultureInfo.InvariantCulture) +
+                ", final=" + manifestPath + ", prepared_envelope=" + preparedEnvelopePath +
                 ", disposition_proof=" + dispositionProofPath + ", old_tombstone=" +
                 oldTombstonePath + ")",
                 fault
@@ -6320,6 +6359,8 @@ public class AstroTreeRecorder {
             return false;
         }
         bool publicationSucceeded = false;
+        System.Diagnostics.Stopwatch flushElapsed =
+            System.Diagnostics.Stopwatch.StartNew();
         try {
             SetManifestPublicationPhase(
                 holderRole,
@@ -6328,12 +6369,14 @@ public class AstroTreeRecorder {
             );
             List<KeyValuePair<int, List<long[]>>> snap = new List<KeyValuePair<int, List<long[]>>>();
             long flushNs;
+            int intervalCount = 0;
             byte[] previousBytes;
             string previousIdentity;
             lock (gate) {
                 foreach (KeyValuePair<int, List<long[]>> entry in pidIntervals) {
                     List<long[]> copy = new List<long[]>();
                     foreach (long[] span in entry.Value) copy.Add(new long[] { span[0], span[1] });
+                    intervalCount = checked(intervalCount + copy.Count);
                     snap.Add(new KeyValuePair<int, List<long[]>>(entry.Key, copy));
                 }
                 flushNs = NowUnixNs();
@@ -6342,6 +6385,7 @@ public class AstroTreeRecorder {
                     : (byte[])lastManifestBytes.Clone();
                 previousIdentity = lastManifestFileIdentity;
             }
+            long snapshotCompleteMs = flushElapsed.ElapsedMilliseconds;
             snap.Sort(delegate(
                 KeyValuePair<int, List<long[]>> left,
                 KeyValuePair<int, List<long[]>> right
@@ -6391,6 +6435,7 @@ public class AstroTreeRecorder {
             // honest empty set; exact Job membership is the production cleanup authority.
             sb.Append("},\"owned_paths\":[]}");
             byte[] intended = new UTF8Encoding(false, true).GetBytes(sb.ToString());
+            long serializationCompleteMs = flushElapsed.ElapsedMilliseconds;
             SetManifestPublicationPhase(
                 holderRole,
                 holderGeneration,
@@ -6401,16 +6446,48 @@ public class AstroTreeRecorder {
                 previousBytes,
                 previousIdentity
             );
+            long destinationCasCompleteMs = flushElapsed.ElapsedMilliseconds;
             lock (gate) {
                 lastManifestBytes = (byte[])intended.Clone();
                 lastManifestFileIdentity = publishedIdentity;
                 lastFlushNs = flushNs;
                 dirty = false;
             }
+            long commitCompleteMs = flushElapsed.ElapsedMilliseconds;
             SetManifestPublicationPhase(
                 holderRole,
                 holderGeneration,
                 phase + "-committed"
+            );
+            StringBuilder timing = new StringBuilder();
+            timing.Append("{\"schema\":\"astrolabe.tree-attribution.publication-timing.v1\",\"holder_role\":");
+            AppendJsonString(timing, holderRole);
+            timing.Append(",\"phase\":");
+            AppendJsonString(timing, phase);
+            timing.Append(",\"holder_generation\":");
+            AppendLong(timing, holderGeneration);
+            timing.Append(",\"pid_count\":");
+            AppendInt(timing, snap.Count);
+            timing.Append(",\"interval_count\":");
+            AppendInt(timing, intervalCount);
+            timing.Append(",\"previous_manifest_bytes\":");
+            AppendLong(timing, previousBytes == null ? 0L : previousBytes.LongLength);
+            timing.Append(",\"new_manifest_bytes\":");
+            AppendLong(timing, intended.LongLength);
+            timing.Append(",\"snapshot_ms\":");
+            AppendLong(timing, snapshotCompleteMs);
+            timing.Append(",\"serialization_ms\":");
+            AppendLong(timing, serializationCompleteMs - snapshotCompleteMs);
+            timing.Append(",\"destination_cas_ms\":");
+            AppendLong(timing, destinationCasCompleteMs - serializationCompleteMs);
+            timing.Append(",\"commit_ms\":");
+            AppendLong(timing, commitCompleteMs - destinationCasCompleteMs);
+            timing.Append(",\"total_ms\":");
+            AppendLong(timing, flushElapsed.ElapsedMilliseconds);
+            timing.Append(",\"terminal_transaction_paths_absent\":true}");
+            Console.Out.WriteLine(
+                "NO_ESCAPE[ASTRO_ATTRIBUTION_PUBLICATION_TIMING]: " +
+                timing.ToString()
             );
             publicationSucceeded = true;
             return true;
