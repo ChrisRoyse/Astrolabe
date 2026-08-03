@@ -1428,6 +1428,8 @@ struct cbm_mcp_server {
     char transition_error_code[CBM_SZ_64];
     char transition_error_project[CBM_SZ_256];
     DWORD transition_native_error;
+    uint64_t transition_quiesce_call_count;
+    uint64_t transition_probe_count;
     cbm_store_close_result_t store_close_result;
     bool store_close_error_active;
     char store_close_operation[CBM_SZ_128];
@@ -1586,6 +1588,8 @@ static void clear_cached_store_metadata_after_destroy(cbm_mcp_server_t *srv) {
     free(srv->current_project);
     srv->current_project = NULL;
     srv->store_last_used = 0;
+    srv->transition_quiesce_call_count = 0;
+    srv->transition_probe_count = 0;
 }
 
 /* One result-bearing boundary owns every cached MCP connection close.  It logs
@@ -1852,9 +1856,17 @@ static bool project_transition_mutex_name(const char *project, wchar_t *name, si
 }
 
 static cbm_project_transition_state_t probe_project_transition(const char *project,
-                                                               DWORD *native_error) {
+                                                               DWORD *native_error,
+                                                               bool *object_preexisted,
+                                                               DWORD *wait_result) {
     if (native_error) {
         *native_error = ERROR_SUCCESS;
+    }
+    if (object_preexisted) {
+        *object_preexisted = false;
+    }
+    if (wait_result) {
+        *wait_result = WAIT_FAILED;
     }
     if (!project || !cbm_validate_project_name(project)) {
         if (native_error) {
@@ -1871,13 +1883,20 @@ static cbm_project_transition_state_t probe_project_transition(const char *proje
         return CBM_PROJECT_TRANSITION_PROBE_FAILED;
     }
     HANDLE mutex = CreateMutexW(NULL, FALSE, mutex_name);
+    DWORD create_error = GetLastError();
     if (!mutex) {
         if (native_error) {
-            *native_error = GetLastError();
+            *native_error = create_error;
         }
         return CBM_PROJECT_TRANSITION_PROBE_FAILED;
     }
+    if (object_preexisted) {
+        *object_preexisted = create_error == ERROR_ALREADY_EXISTS;
+    }
     DWORD wait = WaitForSingleObject(mutex, 0);
+    if (wait_result) {
+        *wait_result = wait;
+    }
     if (wait == WAIT_TIMEOUT) {
         mcp_close_windows_handle_or_abort(&mutex, "project_transition.probe_active");
         return CBM_PROJECT_TRANSITION_ACTIVE;
@@ -2613,7 +2632,8 @@ static void record_project_transition_state(cbm_mcp_server_t *srv, const char *p
 
 static bool project_transition_admits_process(cbm_mcp_server_t *srv, const char *project) {
     DWORD native_error = ERROR_SUCCESS;
-    cbm_project_transition_state_t state = probe_project_transition(project, &native_error);
+    cbm_project_transition_state_t state =
+        probe_project_transition(project, &native_error, NULL, NULL);
     bool writer_granted = cbm_index_transition_writer_matches(project);
     if ((!writer_granted && state == CBM_PROJECT_TRANSITION_INACTIVE) ||
         (writer_granted && state == CBM_PROJECT_TRANSITION_ACTIVE)) {
@@ -2768,16 +2788,60 @@ int cbm_mcp_server_quiesce_project_transition(cbm_mcp_server_t *srv) {
     if (!srv) {
         return 0;
     }
+    srv->transition_quiesce_call_count++;
+    bool sampled_call =
+        (srv->transition_quiesce_call_count & (srv->transition_quiesce_call_count - 1)) == 0;
     if (srv->store_close_error_active) {
         return -1;
     }
     if (!srv->store || !srv->current_project || srv->store_last_used == 0) {
+        if (sampled_call) {
+            char call_count[CBM_SZ_32];
+            snprintf(call_count, sizeof(call_count), "%llu",
+                     (unsigned long long)srv->transition_quiesce_call_count);
+            cbm_log_info("project.transition.probe_skipped", "call_count", call_count,
+                         "cached_store_present", srv->store ? "true" : "false",
+                         "current_project_present", srv->current_project ? "true" : "false",
+                         "named_store_used", srv->store_last_used == 0 ? "false" : "true");
+        }
         return 0;
     }
     char project[CBM_SZ_256];
     snprintf(project, sizeof(project), "%s", srv->current_project);
     DWORD native_error = ERROR_SUCCESS;
-    cbm_project_transition_state_t state = probe_project_transition(project, &native_error);
+    bool object_preexisted = false;
+    DWORD wait_result = WAIT_FAILED;
+    cbm_project_transition_state_t state =
+        probe_project_transition(project, &native_error, &object_preexisted, &wait_result);
+    srv->transition_probe_count++;
+    bool sampled_probe =
+        (srv->transition_probe_count & (srv->transition_probe_count - 1)) == 0;
+    if (sampled_probe || state != CBM_PROJECT_TRANSITION_INACTIVE) {
+        char project_digest[CBM_SHA256_HEX_LEN + 1];
+        char call_count[CBM_SZ_32];
+        char probe_count[CBM_SZ_32];
+        char wait_result_text[CBM_SZ_32];
+        char native_error_text[CBM_SZ_32];
+        cbm_sha256_hex(project, strlen(project), project_digest);
+        snprintf(call_count, sizeof(call_count), "%llu",
+                 (unsigned long long)srv->transition_quiesce_call_count);
+        snprintf(probe_count, sizeof(probe_count), "%llu",
+                 (unsigned long long)srv->transition_probe_count);
+        snprintf(wait_result_text, sizeof(wait_result_text), "%lu", (unsigned long)wait_result);
+        snprintf(native_error_text, sizeof(native_error_text), "%lu",
+                 (unsigned long)native_error);
+        const char *state_text = state == CBM_PROJECT_TRANSITION_ACTIVE
+                                     ? "active"
+                                 : state == CBM_PROJECT_TRANSITION_INACTIVE
+                                     ? "inactive"
+                                 : state == CBM_PROJECT_TRANSITION_ABANDONED
+                                     ? "abandoned"
+                                     : "probe_failed";
+        cbm_log_info("project.transition.probe_observed", "project", project, "project_sha256",
+                     project_digest, "call_count", call_count, "probe_count", probe_count,
+                     "object_preexisted", object_preexisted ? "true" : "false", "wait_result",
+                     wait_result_text, "state", state_text, "native_error", native_error_text);
+    }
     if (state == CBM_PROJECT_TRANSITION_INACTIVE) {
         return 0;
     }
