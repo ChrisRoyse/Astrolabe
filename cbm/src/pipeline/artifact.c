@@ -210,6 +210,43 @@ static char *read_file_alloc(const char *path, size_t *out_len) {
 #ifdef _WIN32
 static void artifact_close_handle_or_abort(HANDLE *handle, const char *stage, const char *path);
 
+static FILE_RENAME_INFO *artifact_rename_info_create(const wchar_t *destination,
+                                                     BOOL replace_if_exists,
+                                                     DWORD *out_bytes, DWORD *out_error) {
+    *out_bytes = 0;
+    *out_error = ERROR_SUCCESS;
+    if (!destination) {
+        *out_error = ERROR_INVALID_PARAMETER;
+        return NULL;
+    }
+
+    size_t destination_chars = wcslen(destination);
+    const size_t name_offset = offsetof(FILE_RENAME_INFO, FileName);
+    const size_t alignment = sizeof(void *);
+    const size_t fixed_bytes = name_offset + sizeof(wchar_t) + (alignment - 1U);
+    if (fixed_bytes > UINT32_MAX ||
+        destination_chars > (UINT32_MAX - fixed_bytes) / sizeof(wchar_t)) {
+        *out_error = ERROR_BUFFER_OVERFLOW;
+        return NULL;
+    }
+
+    size_t destination_bytes = destination_chars * sizeof(wchar_t);
+    size_t raw_bytes = name_offset + destination_bytes + sizeof(wchar_t);
+    size_t buffer_bytes = ((raw_bytes + alignment - 1U) / alignment) * alignment;
+    FILE_RENAME_INFO *rename_info = calloc(1, buffer_bytes);
+    if (!rename_info) {
+        *out_error = ERROR_NOT_ENOUGH_MEMORY;
+        return NULL;
+    }
+
+    rename_info->ReplaceIfExists = replace_if_exists;
+    rename_info->RootDirectory = NULL;
+    rename_info->FileNameLength = (DWORD)destination_bytes;
+    memcpy(rename_info->FileName, destination, destination_bytes);
+    *out_bytes = (DWORD)buffer_bytes;
+    return rename_info;
+}
+
 static bool artifact_remove_file_exact(const char *path, artifact_file_error_t *out_err,
                                        const char *failure) {
     unsigned long before_error = 0;
@@ -318,40 +355,33 @@ static int write_file_atomic(const char *path, const char *data, size_t len,
         return CBM_NOT_FOUND;
     }
 
-    size_t destination_chars = wcslen(wide_destination);
-    if (destination_chars >
-        (UINT32_MAX - offsetof(FILE_RENAME_INFO, FileName)) / sizeof(wchar_t)) {
-        artifact_close_handle_or_abort(&output, "atomic_write_temp_close", tmp);
-        free(wide_tmp);
-        free(wide_destination);
-        if (!artifact_remove_file_exact(tmp, out_err, "rename_record_cleanup_failed")) {
-            return CBM_NOT_FOUND;
-        }
-        file_error_set(out_err, "rename_record_too_large", ERROR_BUFFER_OVERFLOW);
-        return CBM_NOT_FOUND;
-    }
-    size_t rename_bytes =
-        offsetof(FILE_RENAME_INFO, FileName) + destination_chars * sizeof(wchar_t);
-    FILE_RENAME_INFO *rename_info = calloc(1, rename_bytes);
+    DWORD rename_bytes = 0;
+    DWORD rename_record_error = ERROR_SUCCESS;
+    FILE_RENAME_INFO *rename_info =
+        artifact_rename_info_create(wide_destination, TRUE, &rename_bytes,
+                                    &rename_record_error);
     if (!rename_info) {
         artifact_close_handle_or_abort(&output, "atomic_write_temp_close", tmp);
         free(wide_tmp);
         free(wide_destination);
-        if (!artifact_remove_file_exact(tmp, out_err, "rename_allocate_cleanup_failed")) {
+        const char *cleanup_failure = rename_record_error == ERROR_BUFFER_OVERFLOW
+                                          ? "rename_record_cleanup_failed"
+                                          : "rename_allocate_cleanup_failed";
+        if (!artifact_remove_file_exact(tmp, out_err, cleanup_failure)) {
             return CBM_NOT_FOUND;
         }
-        file_error_set(out_err, "rename_record_allocation_failed", ERROR_NOT_ENOUGH_MEMORY);
+        file_error_set(out_err,
+                       rename_record_error == ERROR_BUFFER_OVERFLOW
+                           ? "rename_record_too_large"
+                           : "rename_record_allocation_failed",
+                       (int)rename_record_error);
         return CBM_NOT_FOUND;
     }
-    rename_info->ReplaceIfExists = TRUE;
-    rename_info->RootDirectory = NULL;
-    rename_info->FileNameLength = (DWORD)(destination_chars * sizeof(wchar_t));
-    memcpy(rename_info->FileName, wide_destination, rename_info->FileNameLength);
     free(wide_tmp);
     free(wide_destination);
 
-    bool renamed = SetFileInformationByHandle(output, FileRenameInfo, rename_info,
-                                              (DWORD)rename_bytes) != 0;
+    bool renamed =
+        SetFileInformationByHandle(output, FileRenameInfo, rename_info, rename_bytes) != 0;
     DWORD rename_error = renamed ? ERROR_SUCCESS : GetLastError();
     free(rename_info);
     if (!renamed) {
@@ -797,6 +827,29 @@ static bool artifact_close_snapshot_store(cbm_store_t **store, const char *path)
 }
 #endif /* _WIN32 */
 
+/* Reachable only from the Windows snapshot path (prepare_export_snapshot is
+  * stubbed under #ifndef _WIN32 here); guarded to match its callers. */
+#if defined(_WIN32)
+static bool artifact_snapshot_exec(cbm_store_t *store, const char *path, const char *stage,
+                                   const char *sql) {
+    cbm_store_clear_error(store);
+    if (cbm_store_exec(store, sql) == CBM_STORE_OK) {
+        return true;
+    }
+
+    int sqlite_error = cbm_store_error_code(store);
+    const char *sqlite_detail = cbm_store_error(store);
+    snprintf(g_export_error, sizeof(g_export_error),
+             "%s: sqlite_error=%d detail=%s path=%s", stage, sqlite_error,
+             sqlite_detail ? sqlite_detail : "SQLite execution failed", path ? path : "");
+    cbm_log_error("artifact.export", "stage", stage, "err", "sqlite_execution_failed",
+                  "sqlite_error", itoa_buf(sqlite_error), "sqlite_detail",
+                  sqlite_detail ? sqlite_detail : "SQLite execution failed", "path",
+                  path ? path : "");
+    return false;
+}
+#endif /* _WIN32 */
+
 static bool artifact_sidecars_absent_exact(const char *db_path, const char *stage) {
     char wal_path[CBM_SZ_4K];
     char shm_path[CBM_SZ_4K];
@@ -919,37 +972,28 @@ static cbm_artifact_import_status_t artifact_publish_import_noreplace(
             "ordinary_file_identity_or_flush_failed");
     }
 
-    size_t destination_chars = wcslen(wide_destination);
-    if (destination_chars > (SIZE_MAX - offsetof(FILE_RENAME_INFO, FileName)) / sizeof(wchar_t) ||
-        destination_chars >
-            (UINT32_MAX - offsetof(FILE_RENAME_INFO, FileName)) / sizeof(wchar_t)) {
-        free(wide_destination);
-        artifact_close_handle_or_abort(&source, "import_publish_source_close", source_path);
-        artifact_export_fail("import_publish_path", destination_path,
-                             "destination_rename_record_too_large", ERROR_BUFFER_OVERFLOW);
-        return artifact_import_fail_and_remove_private(
-            result, source_path, "import_publish_path",
-            "destination_rename_record_too_large");
-    }
-    size_t rename_bytes =
-        offsetof(FILE_RENAME_INFO, FileName) + destination_chars * sizeof(wchar_t);
-    FILE_RENAME_INFO *rename_info = calloc(1, rename_bytes);
+    DWORD rename_bytes = 0;
+    DWORD rename_record_error = ERROR_SUCCESS;
+    FILE_RENAME_INFO *rename_info =
+        artifact_rename_info_create(wide_destination, FALSE, &rename_bytes,
+                                    &rename_record_error);
     if (!rename_info) {
         free(wide_destination);
         artifact_close_handle_or_abort(&source, "import_publish_source_close", source_path);
-        artifact_export_fail("import_publish_allocate", destination_path,
-                             "rename_record_allocation_failed", ERROR_NOT_ENOUGH_MEMORY);
+        const char *operation = rename_record_error == ERROR_BUFFER_OVERFLOW
+                                    ? "import_publish_path"
+                                    : "import_publish_allocate";
+        const char *detail = rename_record_error == ERROR_BUFFER_OVERFLOW
+                                 ? "destination_rename_record_too_large"
+                                 : "rename_record_allocation_failed";
+        artifact_export_fail(operation, destination_path, detail, (int)rename_record_error);
         return artifact_import_fail_and_remove_private(
-            result, source_path, "import_publish_allocate", "rename_record_allocation_failed");
+            result, source_path, operation, detail);
     }
-    rename_info->ReplaceIfExists = FALSE;
-    rename_info->RootDirectory = NULL;
-    rename_info->FileNameLength = (DWORD)(destination_chars * sizeof(wchar_t));
-    memcpy(rename_info->FileName, wide_destination, rename_info->FileNameLength);
     free(wide_destination);
 
-    bool renamed = SetFileInformationByHandle(source, FileRenameInfo, rename_info,
-                                              (DWORD)rename_bytes) != 0;
+    bool renamed =
+        SetFileInformationByHandle(source, FileRenameInfo, rename_info, rename_bytes) != 0;
     DWORD rename_error = renamed ? ERROR_SUCCESS : GetLastError();
     free(rename_info);
     if (!renamed) {
@@ -1178,26 +1222,56 @@ static char *prepare_export_snapshot(const char *db_path, const char *project_na
         return NULL;
     }
 
-    int64_t nodes = cbm_store_count_nodes(snapshot, project_name);
-    int64_t edges = cbm_store_count_edges(snapshot, project_name);
-    if (nodes < 0 || edges < 0) {
+    /* Keep snapshot maintenance ahead of all query-statement preparation so
+     * its connection state and diagnostics are isolated from later metadata
+     * reads. Execute and diagnose each maintenance boundary independently;
+     * there is no skip or retry. */
+    bool stripped = true;
+    if (quality == CBM_ARTIFACT_BEST) {
+        stripped = artifact_snapshot_exec(snapshot, snapshot_path,
+                                          "snapshot_strip.drop_indexes", DROP_INDEXES_SQL);
+        if (stripped) {
+            stripped = artifact_snapshot_exec(snapshot, snapshot_path, "snapshot_strip.vacuum",
+                                              "VACUUM;");
+        }
+        if (stripped) {
+            stripped = artifact_snapshot_exec(snapshot, snapshot_path, "snapshot_strip.optimize",
+                                              "PRAGMA optimize;");
+        }
+    }
+    if (!stripped) {
         (void)artifact_close_snapshot_store(&snapshot, snapshot_path);
-        artifact_export_fail("snapshot_counts", snapshot_path,
-                             "physical_snapshot_count_query_failed", 0);
+        if (!snapshot) {
+            (void)artifact_remove_closed_scratch(snapshot_path, "snapshot_strip_cleanup");
+        }
+        return NULL;
+    }
+
+    int64_t nodes = cbm_store_count_nodes(snapshot, project_name);
+    if (nodes < 0) {
+        const char *detail = cbm_store_error(snapshot);
+        int sqlite_error = cbm_store_error_code(snapshot);
+        char count_error[CBM_SZ_512];
+        snprintf(count_error, sizeof(count_error), "sqlite_error=%d detail=%s", sqlite_error,
+                 detail ? detail : "node count query failed");
+        (void)artifact_close_snapshot_store(&snapshot, snapshot_path);
+        artifact_export_fail("snapshot_counts.nodes", snapshot_path, count_error, 0);
         if (!snapshot) {
             (void)artifact_remove_closed_scratch(snapshot_path, "snapshot_counts_cleanup");
         }
         return NULL;
     }
-    if (quality == CBM_ARTIFACT_BEST &&
-        (cbm_store_exec(snapshot, DROP_INDEXES_SQL) != CBM_STORE_OK ||
-         cbm_store_exec(snapshot, "VACUUM;") != CBM_STORE_OK ||
-         cbm_store_exec(snapshot, "PRAGMA optimize;") != CBM_STORE_OK)) {
+    int64_t edges = cbm_store_count_edges(snapshot, project_name);
+    if (edges < 0) {
+        const char *detail = cbm_store_error(snapshot);
+        int sqlite_error = cbm_store_error_code(snapshot);
+        char count_error[CBM_SZ_512];
+        snprintf(count_error, sizeof(count_error), "sqlite_error=%d detail=%s", sqlite_error,
+                 detail ? detail : "edge count query failed");
         (void)artifact_close_snapshot_store(&snapshot, snapshot_path);
-        artifact_export_fail("snapshot_strip", snapshot_path,
-                             "drop_indexes_vacuum_or_optimize_failed", 0);
+        artifact_export_fail("snapshot_counts.edges", snapshot_path, count_error, 0);
         if (!snapshot) {
-            (void)artifact_remove_closed_scratch(snapshot_path, "snapshot_strip_cleanup");
+            (void)artifact_remove_closed_scratch(snapshot_path, "snapshot_counts_cleanup");
         }
         return NULL;
     }

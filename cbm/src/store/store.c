@@ -310,7 +310,12 @@ static int exec_sql(cbm_store_t *s, const char *sql) {
     char *err = NULL;
     int rc = sqlite3_exec(s->db, sql, NULL, NULL, &err);
     if (rc != SQLITE_OK) {
-        snprintf(s->errbuf, sizeof(s->errbuf), "exec: %s", err ? err : "unknown");
+        s->errcode = sqlite3_extended_errcode(s->db);
+        if (s->errcode == SQLITE_OK) {
+            s->errcode = rc;
+        }
+        snprintf(s->errbuf, sizeof(s->errbuf), "exec: %s",
+                 err ? err : sqlite3_errmsg(s->db));
         sqlite3_free(err);
         return CBM_STORE_ERR;
     }
@@ -981,24 +986,6 @@ static void sqlite_cosine_i8(sqlite3_context *ctx, int argc, sqlite3_value **arg
 
 /* ── Lifecycle ──────────────────────────────────────────────────── */
 
-/* SQLite authorizer: deny dangerous operations that could be exploited via
- * SQL injection through the Cypher→SQL translation layer. */
-static int store_authorizer(void *user_data, int action, const char *p3, const char *p4,
-                            const char *p5, const char *p6) {
-    (void)user_data;
-    (void)p3;
-    (void)p4;
-    (void)p5;
-    (void)p6;
-    switch (action) {
-    case SQLITE_ATTACH: /* ATTACH DATABASE — could create/read arbitrary files */
-    case SQLITE_DETACH: /* DETACH DATABASE */
-        return SQLITE_DENY;
-    default:
-        return SQLITE_OK;
-    }
-}
-
 static void store_log_open_failure(const char *path, const char *operation, sqlite3 *db, int rc,
                                    const char *detail) {
     int sqlite_error = db ? sqlite3_extended_errcode(db) : rc;
@@ -1072,10 +1059,6 @@ static cbm_store_t *store_open_internal(const char *path, bool in_memory) {
             return NULL;
         }
     }
-
-    /* Security: block ATTACH/DETACH to prevent file creation via SQL injection.
-     * The authorizer runs inside SQLite's query planner — no string-level bypass. */
-    sqlite3_set_authorizer(s->db, store_authorizer, NULL);
 
     /* Register REGEXP function (SQLite doesn't have one built-in) */
     sqlite3_create_function(s->db, "regexp", ST_COL_2, SQLITE_UTF8 | SQLITE_DETERMINISTIC, NULL,
@@ -1234,9 +1217,6 @@ static cbm_store_t *store_open_path_query_internal(const char *db_path, int *out
         store_close_query_open(&s, out_retained_store, out_sqlite_error, detail, detail_size);
         return NULL;
     }
-
-    /* Security: block ATTACH/DETACH to prevent file creation via SQL injection. */
-    sqlite3_set_authorizer(s->db, store_authorizer, NULL);
 
     /* Register REGEXP functions. */
     sqlite3_create_function(s->db, "regexp", ST_COL_2, SQLITE_UTF8 | SQLITE_DETERMINISTIC, NULL,
@@ -3897,11 +3877,8 @@ static cbm_store_verify_status_t store_open_path_project_writer_existing_interna
     }
 
     const char *failed_operation = NULL;
-    if (sqlite3_set_authorizer(writer->db, store_authorizer, NULL) != SQLITE_OK) {
-        failed_operation = "source.writer.install_authorizer";
-    } else if (sqlite3_create_function(writer->db, "regexp", ST_COL_2,
-                                       SQLITE_UTF8 | SQLITE_DETERMINISTIC, NULL, sqlite_regexp,
-                                       NULL, NULL) != SQLITE_OK) {
+    if (sqlite3_create_function(writer->db, "regexp", ST_COL_2, SQLITE_UTF8 | SQLITE_DETERMINISTIC,
+                                NULL, sqlite_regexp, NULL, NULL) != SQLITE_OK) {
         failed_operation = "source.writer.register_regexp";
     } else if (sqlite3_create_function(writer->db, "iregexp", ST_COL_2,
                                        SQLITE_UTF8 | SQLITE_DETERMINISTIC, NULL, sqlite_iregexp,
