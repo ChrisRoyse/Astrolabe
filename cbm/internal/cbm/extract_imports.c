@@ -668,10 +668,15 @@ static void parse_java_imports(CBMExtractCtx *ctx) {
 // use_declaration -> use_list or scoped_use_list
 // mod_item without a declaration_list -> an exact compiler source request.
 
+static void set_rust_extraction_error(CBMExtractCtx *ctx, const char *code,
+                                      const char *operation, const char *message,
+                                      const char *remediation) {
+    cbm_file_result_set_error(ctx->result, code, operation, "extraction", 0, message, remediation);
+}
+
 static void set_rust_path_attribute_error(CBMExtractCtx *ctx, const char *code,
                                           const char *message, const char *remediation) {
-    cbm_file_result_set_error(ctx->result, code, "extract_rust_path_attribute", "extraction", 0,
-                              message, remediation);
+    set_rust_extraction_error(ctx, code, "extract_rust_path_attribute", message, remediation);
 }
 
 static int rust_hex_value(unsigned char ch) {
@@ -917,11 +922,32 @@ static char *join_rust_physical_path(CBMArena *arena, const char *prefix, const 
                                : cbm_arena_strdup(arena, path);
 }
 
+/* Tree-sitter retains the source spelling of a raw identifier. Rust defines
+ * `r#` as lexical syntax rather than part of the identifier, so it must never
+ * enter a module filename or inline-module directory component. */
+static char *rust_physical_module_name(CBMExtractCtx *ctx, TSNode name_node) {
+    char *spelling = cbm_node_text(ctx->arena, name_node, ctx->source);
+    if (!spelling || !spelling[0]) {
+        return NULL;
+    }
+    if (spelling[0] == 'r' && spelling[SKIP_ONE] == '#') {
+        if (!spelling[PAIR_LEN]) {
+            set_rust_extraction_error(
+                ctx, "CBM_RUST_RAW_IDENTIFIER_INVALID", "extract_rust_module_identifier",
+                "a Rust raw module identifier has no identifier after r#",
+                "repair the raw module identifier before retrying extraction");
+            return NULL;
+        }
+        return cbm_arena_strdup(ctx->arena, spelling + PAIR_LEN);
+    }
+    return spelling;
+}
+
 static char *rust_root_physical_prefix(CBMExtractCtx *ctx) {
     const char *basename = file_path_last(ctx->rel_path);
     if (!basename || !basename[0]) {
-        set_rust_path_attribute_error(
-            ctx, "CBM_RUST_SOURCE_PATH_MISSING",
+        set_rust_extraction_error(
+            ctx, "CBM_RUST_SOURCE_PATH_MISSING", "extract_rust_module_root",
             "Rust module extraction has no physical source filename",
             "supply the repository-relative Rust source path before extraction");
         return NULL;
@@ -932,8 +958,8 @@ static char *rust_root_physical_prefix(CBMExtractCtx *ctx) {
     }
     size_t len = strlen(basename);
     if (len <= strlen(".rs") || strcmp(basename + len - strlen(".rs"), ".rs") != 0) {
-        set_rust_path_attribute_error(
-            ctx, "CBM_RUST_SOURCE_PATH_INVALID",
+        set_rust_extraction_error(
+            ctx, "CBM_RUST_SOURCE_PATH_INVALID", "extract_rust_module_root",
             "Rust module extraction source filename has no .rs suffix",
             "repair the language/path classification before retrying extraction");
         return NULL;
@@ -1005,8 +1031,11 @@ static void parse_rust_scope_imports(CBMExtractCtx *ctx, TSNode scope,
         }
 
         TSNode name_node = ts_node_child_by_field_name(node, TS_FIELD("name"));
-        char *name = ts_node_is_null(name_node) ? NULL : cbm_node_text(a, name_node, ctx->source);
+        char *name = ts_node_is_null(name_node) ? NULL : rust_physical_module_name(ctx, name_node);
         if (!name || !name[0]) {
+            if (ctx->result->has_error || cbm_arena_failed(a)) {
+                return;
+            }
             continue;
         }
         TSNode body = ts_node_child_by_field_name(node, TS_FIELD("body"));
