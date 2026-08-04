@@ -112,7 +112,7 @@ static void handle_kustomize(cbm_pipeline_ctx_t *ctx, const char *path, const ch
         char *source = k8s_read_file(path, &src_len);
         if (source) {
             res = cbm_extract_file(source, src_len, CBM_LANG_KUSTOMIZE, ctx->project_name, rel_path,
-                                   CBM_EXTRACT_BUDGET, NULL, NULL);
+                                   cbm_parse_budget_micros((size_t)src_len), NULL, NULL);
             free(source);
             allocated = true;
         }
@@ -390,7 +390,8 @@ static void handle_k8s_manifest(cbm_pipeline_ctx_t *ctx, const char *path, const
     int resource_count = 0;
 
     CBMFileResult *res = cbm_extract_file(source, src_len, CBM_LANG_K8S, ctx->project_name,
-                                          rel_path, CBM_EXTRACT_BUDGET, NULL, NULL);
+                                          rel_path, cbm_parse_budget_micros((size_t)src_len),
+                                          NULL, NULL);
     if (!res) {
         return;
     }

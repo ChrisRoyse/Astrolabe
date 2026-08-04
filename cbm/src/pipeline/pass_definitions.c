@@ -850,7 +850,7 @@ int cbm_pipeline_pass_definitions(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
             files[i].structured_classification_provenance[0]
                 ? files[i].structured_classification_provenance
                 : NULL,
-            CBM_EXTRACT_BUDGET,
+            cbm_parse_budget_micros((size_t)source_len),
             cbm_compile_context_for_file(ctx->compile_contexts, rel));
         free(source);
 

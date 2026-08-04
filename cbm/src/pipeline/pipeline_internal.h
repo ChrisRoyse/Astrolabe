@@ -17,6 +17,7 @@
 #include "store/store.h"
 #include "foundation/hash_table.h"
 #include "cbm.h"
+#include "parse_budget.h"
 #include "lsp/go_lsp.h" /* CBMLSPDef for cbm_parallel_resolve cross-LSP inputs */
 #include <stdatomic.h>
 #include <string.h>
@@ -50,9 +51,6 @@ CBMFileResult *cbm_extract_file_at_path_with_metadata_context(
 size_t cbm_mem_available(void);
 
 /* ── Shared pipeline constants ─────────────────────────────────── */
-
-/* Maximum byte budget for tree-sitter extraction per file */
-#define CBM_EXTRACT_BUDGET 5000000
 
 /* Route node QN buffer size (must fit __route__METHOD__/full/url/path) */
 #define CBM_ROUTE_QN_SIZE 768

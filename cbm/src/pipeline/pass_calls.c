@@ -556,7 +556,8 @@ static CBMFileResult *calls_get_or_extract(cbm_pipeline_ctx_t *ctx, int idx,
     CBMFileResult *r = cbm_extract_file_at_path_with_rust_edition(
         src, slen, fi->language, ctx->project_name, fi->rel_path, fi->path,
         cbm_pxc_rust_edition_for_file(ctx, fi->rel_path),
-        cbm_pxc_rust_is_crate_root(ctx, fi->rel_path), CBM_EXTRACT_BUDGET, NULL, NULL);
+        cbm_pxc_rust_is_crate_root(ctx, fi->rel_path),
+        cbm_parse_budget_micros((size_t)slen), NULL, NULL);
     free(src);
     if (r) {
         *owned = true;

@@ -605,6 +605,7 @@ typedef struct {
     _Atomic int admission_waits;
     _Atomic uint64_t retained_arena_bytes;
     _Atomic uint64_t retained_array_bytes;
+    cbm_pipeline_t *pipeline;
 } extract_ctx_t;
 
 typedef struct {
@@ -889,7 +890,9 @@ static size_t extract_admission_ratio(size_t observed_bytes, size_t source_bytes
 }
 
 static void extract_admission_release(extract_ctx_t *ec, extract_admission_t *token,
-                                      size_t parse_rss, size_t retained_bytes) {
+                                      const cbm_file_info_t *file, size_t parse_rss,
+                                      size_t retained_bytes, bool extraction_succeeded,
+                                      const CBMExtractionError *extraction_error) {
     if (!ec || !token || !token->held) {
         return;
     }
@@ -909,7 +912,27 @@ static void extract_admission_release(extract_ctx_t *ec, extract_admission_t *to
     if (token->calibration) {
         size_t observed_growth =
             parse_rss > token->rss_before ? parse_rss - token->rss_before : 0;
-        if (!ec->admission_failed && observed_growth > SIZE_MAX - retained_bytes) {
+        if (!extraction_succeeded) {
+            ec->admission_failed = true;
+            const char *cause_code = extraction_error && extraction_error->code
+                                         ? extraction_error->code
+                                         : "CBM_EXTRACTION_FAILED";
+            cbm_log_error(
+                "parallel.extract.admission.calibration_failed", "code",
+                "CBM_EXTRACTION_MEMORY_CALIBRATION_SOURCE_FAILED", "cause_code", cause_code,
+                "path", file && file->rel_path ? file->rel_path : "", "message",
+                "the exclusive calibration source did not complete authoritative extraction",
+                "remediation",
+                "fix the exact causal extraction failure; a partial or timed-out parse can never "
+                "publish a memory amplification");
+            cbm_pipeline_record_fatal_error(
+                ec->pipeline, "CBM_EXTRACTION_MEMORY_CALIBRATION_SOURCE_FAILED",
+                "calibrate_extraction_memory", "parallel_extract",
+                file && file->rel_path ? file->rel_path : "", token->source_bytes,
+                "the exclusive calibration source did not complete authoritative extraction",
+                "inspect the causal parser.budget.refused record, fix that failure, and retry the "
+                "complete unchanged corpus");
+        } else if (!ec->admission_failed && observed_growth > SIZE_MAX - retained_bytes) {
             ec->admission_failed = true;
             cbm_log_error(
                 "parallel.extract.admission.calibration_failed", "code",
@@ -1037,13 +1060,13 @@ static void extract_worker(int worker_id, void *ctx_ptr) {
             pp_err_add(errs, fi->rel_path,
                        "source slab entry invalid (CBM_EXTRACTION_SOURCE_SLAB_INVALID)",
                        "source_slab");
-            extract_admission_release(ec, &admission, cbm_mem_rss(), 0);
+            extract_admission_release(ec, &admission, fi, cbm_mem_rss(), 0, false, NULL);
             break;
         }
         int source_len = (int)source_size;
         const char *source = (const char *)source_bytes;
         if (source_len == 0) {
-            extract_admission_release(ec, &admission, cbm_mem_rss(), 0);
+            extract_admission_release(ec, &admission, fi, cbm_mem_rss(), 0, true, NULL);
             continue;
         }
 
@@ -1064,7 +1087,7 @@ static void extract_worker(int worker_id, void *ctx_ptr) {
             fi->structured_classification_provenance[0]
                 ? fi->structured_classification_provenance
                 : NULL,
-            CBM_EXTRACT_BUDGET, NULL, NULL,
+            cbm_parse_budget_micros(source_size), NULL, NULL,
             cbm_compile_context_for_file(ec->compile_contexts, fi->rel_path));
 
         /* Read the live process source of truth while the parse tree and parser
@@ -1081,7 +1104,7 @@ static void extract_worker(int worker_id, void *ctx_ptr) {
             cbm_destroy_thread_parser();
             cbm_slab_reclaim();
             cbm_mem_collect();
-            extract_admission_release(ec, &admission, parse_rss, 0);
+            extract_admission_release(ec, &admission, fi, parse_rss, 0, false, NULL);
             continue;
         }
 
@@ -1177,8 +1200,9 @@ static void extract_worker(int worker_id, void *ctx_ptr) {
         cbm_destroy_thread_parser();
         cbm_slab_reclaim();
         cbm_mem_collect();
-        extract_admission_release(ec, &admission, parse_rss,
-                                  result_arena_bytes + result_array_bytes);
+        extract_admission_release(ec, &admission, fi, parse_rss,
+                                  result_arena_bytes + result_array_bytes,
+                                  !result->has_error, &result->error);
     }
 
     /* Final cleanup (parser already destroyed in loop, just slab state) */
@@ -1260,6 +1284,25 @@ int cbm_parallel_extract(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, 
                  itoa_log(worker_count));
     cbm_log_info("parallel.extract.source_slab", "files", itoa_log(ctx->source_slab->file_count),
                  "sha256", ctx->source_slab->sha256);
+    {
+        const cbm_parse_budget_policy_t *policy = cbm_parse_budget_policy();
+        char base_text[32], throughput_text[32], stall_text[32], balance_text[32], max_text[32];
+        snprintf(base_text, sizeof(base_text), "%llu",
+                 (unsigned long long)policy->base_micros);
+        snprintf(throughput_text, sizeof(throughput_text), "%llu",
+                 (unsigned long long)policy->minimum_forward_bytes_per_second);
+        snprintf(stall_text, sizeof(stall_text), "%llu",
+                 (unsigned long long)policy->forward_stall_micros);
+        snprintf(balance_text, sizeof(balance_text), "%llu",
+                 (unsigned long long)policy->final_balance_micros);
+        snprintf(max_text, sizeof(max_text), "%llu",
+                 (unsigned long long)policy->maximum_total_micros);
+        cbm_log_info("parser.budget.policy", "registry_version", policy->registry_version,
+                     "measurement_source", policy->measurement_source, "base_micros", base_text,
+                     "minimum_forward_bytes_per_second", throughput_text,
+                     "forward_stall_micros", stall_text, "final_balance_micros", balance_text,
+                     "maximum_total_micros", max_text, "fallback", "none");
+    }
 
     /* Log per-worker memory budget */
     if (cbm_mem_budget() > 0) {
@@ -1333,6 +1376,7 @@ int cbm_parallel_extract(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, 
         .cancelled = ctx->cancelled,
         .err_lists = err_lists,
         .source_slab = ctx->source_slab,
+        .pipeline = ctx->pipeline,
     };
     atomic_init(&ec.next_worker_id, 0);
     atomic_init(&ec.next_file_idx, 0);

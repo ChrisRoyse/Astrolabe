@@ -20,6 +20,7 @@
 #include "foundation/slab_alloc.h" // cbm_slab_install — stable tree-sitter allocator binding
 #include "tree_sitter/api.h" // TSParser, TSNode, TSTree, TSInput, TSLanguage, TSPoint, TSParseOptions, TSParseState
 #include "foundation/constants.h"
+#include "parse_budget.h"
 #include "mimalloc.h" // mi_malloc/mi_calloc/mi_realloc/mi_free/mi_usable_size — bind 3rd-party allocators (#424)
 #if defined(CBM_BIND_TS_ALLOCATOR) && CBM_BIND_TS_ALLOCATOR
 #include "sqlite3.h" // sqlite3_mem_methods, sqlite3_config, SQLITE_CONFIG_MALLOC — bind sqlite to mimalloc
@@ -396,11 +397,86 @@ static const char *cbm_string_read(void *payload, uint32_t byte, TSPoint point,
     return self->string + byte;
 }
 
-// --- Parse timeout callback ---
+// --- Parse progress budget callback ---
 
-static bool cbm_timeout_cb(TSParseState *state) {
-    uint64_t deadline = *(uint64_t *)state->payload;
-    return now_ns() > deadline;
+typedef enum {
+    CBM_PARSE_CANCEL_NONE = 0,
+    CBM_PARSE_CANCEL_TOTAL_BUDGET,
+    CBM_PARSE_CANCEL_PROGRESS_STALLED,
+    CBM_PARSE_CANCEL_FINAL_BALANCE,
+} CBMParseCancelReason;
+
+typedef struct {
+    uint64_t started_ns;
+    uint64_t last_progress_ns;
+    uint64_t final_balance_started_ns;
+    uint64_t total_budget_ns;
+    uint64_t forward_stall_ns;
+    uint64_t final_balance_ns;
+    uint32_t source_bytes;
+    uint32_t current_byte_offset;
+    uint32_t max_byte_offset;
+    uint64_t callback_count;
+    bool has_error;
+    CBMParseCancelReason cancel_reason;
+} CBMParseBudgetState;
+
+static const char *cbm_parse_cancel_reason_name(CBMParseCancelReason reason) {
+    switch (reason) {
+    case CBM_PARSE_CANCEL_TOTAL_BUDGET:
+        return "total_budget";
+    case CBM_PARSE_CANCEL_PROGRESS_STALLED:
+        return "forward_progress_stalled";
+    case CBM_PARSE_CANCEL_FINAL_BALANCE:
+        return "final_tree_balance";
+    case CBM_PARSE_CANCEL_NONE:
+        break;
+    }
+    return "none";
+}
+
+static const char *cbm_parse_cancel_code(CBMParseCancelReason reason) {
+    switch (reason) {
+    case CBM_PARSE_CANCEL_TOTAL_BUDGET:
+        return "CBM_PARSE_TOTAL_BUDGET_EXCEEDED";
+    case CBM_PARSE_CANCEL_PROGRESS_STALLED:
+        return "CBM_PARSE_PROGRESS_STALLED";
+    case CBM_PARSE_CANCEL_FINAL_BALANCE:
+        return "CBM_PARSE_FINAL_BALANCE_TIMEOUT";
+    case CBM_PARSE_CANCEL_NONE:
+        break;
+    }
+    return "CBM_PARSE_FAILED";
+}
+
+static bool cbm_parse_progress_cb(TSParseState *state) {
+    if (!state || !state->payload) {
+        return true;
+    }
+    CBMParseBudgetState *budget = (CBMParseBudgetState *)state->payload;
+    uint64_t now = now_ns();
+    budget->callback_count++;
+    budget->current_byte_offset = state->current_byte_offset;
+    budget->has_error = state->has_error;
+    if (state->current_byte_offset > budget->max_byte_offset) {
+        budget->max_byte_offset = state->current_byte_offset;
+        budget->last_progress_ns = now;
+    }
+    if (state->current_byte_offset >= budget->source_bytes &&
+        budget->final_balance_started_ns == 0) {
+        budget->final_balance_started_ns = now;
+    }
+
+    if (now - budget->started_ns >= budget->total_budget_ns) {
+        budget->cancel_reason = CBM_PARSE_CANCEL_TOTAL_BUDGET;
+    } else if (budget->final_balance_started_ns != 0 &&
+               now - budget->final_balance_started_ns >= budget->final_balance_ns) {
+        budget->cancel_reason = CBM_PARSE_CANCEL_FINAL_BALANCE;
+    } else if (budget->final_balance_started_ns == 0 &&
+               now - budget->last_progress_ns >= budget->forward_stall_ns) {
+        budget->cancel_reason = CBM_PARSE_CANCEL_PROGRESS_STALLED;
+    }
+    return budget->cancel_reason != CBM_PARSE_CANCEL_NONE;
 }
 
 // --- Thread-local parser pool ---
@@ -1049,7 +1125,7 @@ static CBMFileResult *cbm_extract_file_impl(const char *source, int source_len,
 
     uint64_t t0 = now_ns();
 
-    // Build string input + timeout options for parse_with_options
+    // Build string input + progress-aware budget options for parse_with_options.
     CBMStringInput str_input = {source, (uint32_t)source_len};
     TSInput ts_input = {
         &str_input,
@@ -1059,28 +1135,91 @@ static CBMFileResult *cbm_extract_file_impl(const char *source, int source_len,
     };
 
     TSParseOptions opts = {0};
-    uint64_t deadline_ns = 0; // cppcheck-suppress unreadVariable
+    CBMParseBudgetState parse_budget = {0};
     if (timeout_micros > 0) {
-        deadline_ns = t0 + ((uint64_t)timeout_micros * USEC_TO_NSEC);
-        opts.payload = &deadline_ns;
-        opts.progress_callback = cbm_timeout_cb;
+        const cbm_parse_budget_policy_t *policy = cbm_parse_budget_policy();
+        parse_budget.started_ns = t0;
+        parse_budget.last_progress_ns = t0;
+        parse_budget.total_budget_ns = (uint64_t)timeout_micros * USEC_TO_NSEC;
+        parse_budget.forward_stall_ns = policy->forward_stall_micros * USEC_TO_NSEC;
+        parse_budget.final_balance_ns = policy->final_balance_micros * USEC_TO_NSEC;
+        parse_budget.source_bytes = (uint32_t)source_len;
+        opts.payload = &parse_budget;
+        opts.progress_callback = cbm_parse_progress_cb;
     }
 
     TSTree *tree = ts_parser_parse_with_options(parser, NULL, ts_input, opts);
     uint64_t t1 = now_ns();
 
     if (!tree) {
+        if (timeout_micros <= 0) {
+            cbm_file_result_set_error(
+                result, "CBM_PARSE_FAILED", "ts_parser_parse_with_options", "parse", 0,
+                "the authoritative tree-sitter parse failed without a progress-budget "
+                "cancellation",
+                "inspect the exact source and grammar, repair the parser failure, then retry");
+            return result;
+        }
+        uint64_t elapsed_micros = (t1 - t0) / USEC_TO_NSEC;
+        const char *reason = cbm_parse_cancel_reason_name(parse_budget.cancel_reason);
+        const char *code = cbm_parse_cancel_code(parse_budget.cancel_reason);
+        char *message = cbm_arena_sprintf(
+            &result->arena,
+            "authoritative parse refused: reason=%s source_bytes=%d elapsed_micros=%llu "
+            "current_byte_offset=%u max_byte_offset=%u callback_count=%llu has_error=%s "
+            "total_budget_micros=%lld",
+            reason, source_len, (unsigned long long)elapsed_micros,
+            parse_budget.current_byte_offset, parse_budget.max_byte_offset,
+            (unsigned long long)parse_budget.callback_count,
+            parse_budget.has_error ? "true" : "false", (long long)timeout_micros);
+        char source_text[32], elapsed_text[32], current_text[32], max_text[32], callbacks_text[32],
+            budget_text[32];
+        snprintf(source_text, sizeof(source_text), "%d", source_len);
+        snprintf(elapsed_text, sizeof(elapsed_text), "%llu",
+                 (unsigned long long)elapsed_micros);
+        snprintf(current_text, sizeof(current_text), "%u", parse_budget.current_byte_offset);
+        snprintf(max_text, sizeof(max_text), "%u", parse_budget.max_byte_offset);
+        snprintf(callbacks_text, sizeof(callbacks_text), "%llu",
+                 (unsigned long long)parse_budget.callback_count);
+        snprintf(budget_text, sizeof(budget_text), "%lld", (long long)timeout_micros);
+        cbm_log_error("parser.budget.refused", "code", code, "reason", reason, "path",
+                      rel_path ? rel_path : "<input>", "source_bytes", source_text,
+                      "elapsed_micros", elapsed_text, "current_byte_offset", current_text,
+                      "max_byte_offset", max_text, "callback_count", callbacks_text,
+                      "has_error", parse_budget.has_error ? "true" : "false",
+                      "total_budget_micros", budget_text, "remediation",
+                      "inspect the exact progress fields and grammar complexity; repair a stall "
+                      "or deliberately revise the measured parse-budget policy before retrying");
         cbm_file_result_set_error(
-            result, timeout_micros > 0 ? "CBM_PARSE_TIMEOUT" : "CBM_PARSE_FAILED",
+            result, timeout_micros > 0 ? code : "CBM_PARSE_FAILED",
             "ts_parser_parse_with_options", "parse",
             timeout_micros > 0 ? (size_t)timeout_micros : 0,
-            timeout_micros > 0 ? "the authoritative parse exceeded its declared time budget"
-                               : "the authoritative tree-sitter parse failed",
+            message ? message : "the authoritative tree-sitter parse failed",
             timeout_micros > 0
-                ? "inspect parser complexity and raise the declared timeout deliberately or reduce "
-                  "the source unit, then retry"
+                ? "inspect the exact progress fields and grammar complexity; repair a stall or "
+                  "deliberately revise the measured parse-budget policy before retrying"
                 : "inspect the exact source and grammar, repair the parser failure, then retry");
         return result;
+    }
+
+    if (timeout_micros > 0) {
+        uint64_t elapsed_micros = (t1 - t0) / USEC_TO_NSEC;
+        char source_text[32], elapsed_text[32], current_text[32], max_text[32], callbacks_text[32],
+            budget_text[32];
+        snprintf(source_text, sizeof(source_text), "%d", source_len);
+        snprintf(elapsed_text, sizeof(elapsed_text), "%llu",
+                 (unsigned long long)elapsed_micros);
+        snprintf(current_text, sizeof(current_text), "%u", parse_budget.current_byte_offset);
+        snprintf(max_text, sizeof(max_text), "%u", parse_budget.max_byte_offset);
+        snprintf(callbacks_text, sizeof(callbacks_text), "%llu",
+                 (unsigned long long)parse_budget.callback_count);
+        snprintf(budget_text, sizeof(budget_text), "%lld", (long long)timeout_micros);
+        cbm_log_info("parser.budget.completed", "path", rel_path ? rel_path : "<input>",
+                     "source_bytes", source_text, "elapsed_micros", elapsed_text,
+                     "current_byte_offset", current_text, "max_byte_offset", max_text,
+                     "callback_count", callbacks_text, "has_error",
+                     parse_budget.has_error ? "true" : "false", "total_budget_micros",
+                     budget_text, "cancel_reason", "none");
     }
 
     TSNode root = ts_tree_root_node(tree);
@@ -1604,11 +1743,39 @@ int cbm_extract_preprocessed_translation_unit(
     CBMStringInput input = {expanded, (uint32_t)expanded_size};
     TSInput ts_input = {&input, cbm_string_read, TSInputEncodingUTF8, NULL};
     TSParseOptions options = {0};
+    int64_t total_budget_micros = cbm_parse_budget_micros(expanded_size);
+    const cbm_parse_budget_policy_t *budget_policy = cbm_parse_budget_policy();
+    CBMParseBudgetState parse_budget = {
+        .started_ns = started,
+        .last_progress_ns = started,
+        .total_budget_ns = (uint64_t)total_budget_micros * USEC_TO_NSEC,
+        .forward_stall_ns = budget_policy->forward_stall_micros * USEC_TO_NSEC,
+        .final_balance_ns = budget_policy->final_balance_micros * USEC_TO_NSEC,
+        .source_bytes = (uint32_t)expanded_size,
+    };
+    options.payload = &parse_budget;
+    options.progress_callback = cbm_parse_progress_cb;
     TSTree *tree = ts_parser_parse_with_options(parser, NULL, ts_input, options);
     if (!tree) {
+        uint64_t elapsed_micros = (now_ns() - started) / USEC_TO_NSEC;
+        const char *reason = cbm_parse_cancel_reason_name(parse_budget.cancel_reason);
+        const char *code = cbm_parse_cancel_code(parse_budget.cancel_reason);
+        char detail[CBM_SZ_1K];
+        snprintf(detail, sizeof(detail),
+                 "%s: reason=%s context_id=%s expanded_bytes=%zu elapsed_micros=%llu "
+                 "current_byte_offset=%u max_byte_offset=%u callback_count=%llu has_error=%s "
+                 "total_budget_micros=%lld",
+                 code, reason, context_id, expanded_size, (unsigned long long)elapsed_micros,
+                 parse_budget.current_byte_offset, parse_budget.max_byte_offset,
+                 (unsigned long long)parse_budget.callback_count,
+                 parse_budget.has_error ? "true" : "false", (long long)total_budget_micros);
         if (diagnostic_out) {
-            *diagnostic_out = strdup("compiler expansion could not be parsed into a syntax tree");
+            *diagnostic_out = strdup(detail);
         }
+        cbm_log_error("compiler_preprocess.parser_budget_refused", "code", code, "reason",
+                      reason, "context_id", context_id, "message", detail, "remediation",
+                      "inspect the exact compiler expansion and parser progress; repair the "
+                      "causal stall or deliberately revise the measured policy before retrying");
         return CBM_NOT_FOUND;
     }
     TSNode root = ts_tree_root_node(tree);
