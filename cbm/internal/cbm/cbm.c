@@ -50,6 +50,9 @@ static _Atomic uint64_t total_files = 0;
 // pipeline sets it from the index mode before extraction. Set once pre-extract,
 // read-only during, so a relaxed atomic is sufficient.
 static _Atomic int g_extract_macros = 1;
+/* The pipeline's immutable source slab encloses every borrowed extraction
+ * result. Public extraction calls keep their existing self-contained ownership. */
+static CBM_TLS bool g_borrow_source_slices;
 void cbm_set_macro_extraction(int enabled) {
     atomic_store_explicit(&g_extract_macros, enabled ? 1 : 0, memory_order_relaxed);
 }
@@ -177,13 +180,10 @@ static bool grow_array_checked(void **items, int *count, int *cap, size_t item_s
         return false;
     }
     size_t new_bytes = (size_t)new_cap * item_size;
-    void *new_items = cbm_arena_alloc(a, new_bytes);
+    void *new_items = realloc(*items, new_bytes);
     if (!new_items) {
         cbm_arena_mark_failed(a, "CBM_EXTRACTION_ARRAY_GROW_FAILED", operation, new_bytes);
         return false;
-    }
-    if (*items && *count > 0) {
-        memcpy(new_items, *items, (size_t)*count * item_size);
     }
     *items = new_items;
     *cap = new_cap;
@@ -327,7 +327,10 @@ bool cbm_add_parse_diagnostic(CBMExtractCtx *ctx, TSNode node, const char *code,
         .is_missing = is_missing,
     };
     if (end > start && end <= (uint32_t)ctx->source_len) {
-        diag.source = cbm_arena_strndup(ctx->arena, ctx->source + start, (size_t)(end - start));
+        diag.source = g_borrow_source_slices
+                          ? (char *)(ctx->source + start)
+                          : cbm_arena_strndup(ctx->arena, ctx->source + start,
+                                             (size_t)(end - start));
         diag.source_len = end - start;
     }
     bool pushed = cbm_diagnostics_push(&ctx->result->diagnostics, ctx->arena, diag);
@@ -931,6 +934,23 @@ CBMFileResult *cbm_extract_file_at_path_with_metadata(
         timeout_micros, extra_defines, include_paths);
 }
 
+CBMFileResult *cbm_extract_file_at_path_with_metadata_borrow_source(
+    const char *source, int source_len, CBMLanguage language, const char *project,
+    const char *rel_path, const char *source_path, const char *rust_edition,
+    bool rust_is_crate_root, const char *structured_classification_override,
+    const char *structured_classification_override_provenance, int64_t timeout_micros,
+    const char **extra_defines, const char **include_paths) {
+    bool previous = g_borrow_source_slices;
+    g_borrow_source_slices = true;
+    CBMFileResult *result = cbm_extract_file_impl(
+        source, source_len, language, project, rel_path, source_path, rust_edition,
+        rust_is_crate_root, structured_classification_override,
+        structured_classification_override_provenance, timeout_micros, extra_defines,
+        include_paths);
+    g_borrow_source_slices = previous;
+    return result;
+}
+
 static CBMFileResult *cbm_extract_file_impl(const char *source, int source_len,
                                             CBMLanguage language, const char *project,
                                             const char *rel_path, const char *source_path,
@@ -1436,6 +1456,12 @@ static CBMFileResult *cbm_extract_file_impl(const char *source, int source_len,
     // bytes. The span/source are exact node offsets, never line-based reconstruction.
     for (int di = 0; di < result->defs.count; di++) {
         CBMDefinition *d = &result->defs.items[di];
+        if (g_borrow_source_slices && d->end_byte > d->start_byte && source != NULL &&
+            (size_t)d->end_byte <= (size_t)source_len) {
+            d->source = (char *)(source + d->start_byte);
+            d->source_len = d->end_byte - d->start_byte;
+            continue;
+        }
         if (d->source) {
             if (d->source_len == 0 && d->end_byte > d->start_byte) {
                 d->source_len = d->end_byte - d->start_byte;
@@ -1482,9 +1508,108 @@ void cbm_free_result(CBMFileResult *result) {
         ts_tree_delete(result->cached_tree);
         result->cached_tree = NULL;
     }
+    free(result->defs.items);
+    free(result->calls.items);
+    free(result->imports.items);
+    free(result->usages.items);
+    free(result->local_bindings.items);
+    free(result->throws.items);
+    free(result->rw.items);
+    free(result->type_refs.items);
+    free(result->env_accesses.items);
+    free(result->type_assigns.items);
+    free(result->impl_traits.items);
+    free(result->resolved_calls.items);
+    free(result->string_refs.items);
+    free(result->infra_bindings.items);
+    free(result->channels.items);
+    free(result->diagnostics.items);
     cbm_arena_destroy(&result->arena);
     free(result);
 }
+
+static bool compact_array_checked(void **items, int count, int *cap, size_t item_size,
+                                  CBMArena *arena, const char *operation) {
+    if (!items || !cap || !arena || count < 0 || *cap < count || (*cap > 0 && !*items) ||
+        item_size == 0) {
+        cbm_arena_mark_failed(arena, "CBM_EXTRACTION_ARRAY_INVARIANT", operation, item_size);
+        return false;
+    }
+    if (count == 0) {
+        free(*items);
+        *items = NULL;
+        *cap = 0;
+        return true;
+    }
+    if (*cap == count) {
+        return true;
+    }
+    if ((size_t)count > SIZE_MAX / item_size) {
+        cbm_arena_mark_failed(arena, "CBM_EXTRACTION_ARRAY_CAPACITY_OVERFLOW", operation,
+                              item_size);
+        return false;
+    }
+    size_t exact_bytes = (size_t)count * item_size;
+    void *exact = realloc(*items, exact_bytes);
+    if (!exact) {
+        cbm_arena_mark_failed(arena, "CBM_EXTRACTION_ARRAY_COMPACT_FAILED", operation,
+                              exact_bytes);
+        return false;
+    }
+    *items = exact;
+    *cap = count;
+    return true;
+}
+
+#define COMPACT_RESULT_ARRAY(result, member)                                                      \
+    compact_array_checked((void **)&(result)->member.items, (result)->member.count,               \
+                          &(result)->member.cap, sizeof(*(result)->member.items), &(result)->arena, \
+                          #member ".compact")
+
+bool cbm_file_result_compact_arrays(CBMFileResult *result) {
+    if (!result) {
+        return false;
+    }
+    if (!COMPACT_RESULT_ARRAY(result, defs) || !COMPACT_RESULT_ARRAY(result, calls) ||
+        !COMPACT_RESULT_ARRAY(result, imports) || !COMPACT_RESULT_ARRAY(result, usages) ||
+        !COMPACT_RESULT_ARRAY(result, local_bindings) || !COMPACT_RESULT_ARRAY(result, throws) ||
+        !COMPACT_RESULT_ARRAY(result, rw) || !COMPACT_RESULT_ARRAY(result, type_refs) ||
+        !COMPACT_RESULT_ARRAY(result, env_accesses) ||
+        !COMPACT_RESULT_ARRAY(result, type_assigns) ||
+        !COMPACT_RESULT_ARRAY(result, impl_traits) ||
+        !COMPACT_RESULT_ARRAY(result, resolved_calls) ||
+        !COMPACT_RESULT_ARRAY(result, string_refs) ||
+        !COMPACT_RESULT_ARRAY(result, infra_bindings) ||
+        !COMPACT_RESULT_ARRAY(result, channels) || !COMPACT_RESULT_ARRAY(result, diagnostics)) {
+        cbm_file_result_set_error(
+            result, cbm_arena_failure_code(&result->arena),
+            cbm_arena_failure_operation(&result->arena), "result_array_compaction",
+            cbm_arena_failure_bytes(&result->arena),
+            "an extracted fact array could not be compacted to its exact retained size",
+            "free memory and retry the complete corpus; partial retained extraction is forbidden");
+        return false;
+    }
+    return true;
+}
+
+#define RESULT_ARRAY_BYTES(result, member) ((size_t)(result)->member.cap * sizeof(*(result)->member.items))
+
+size_t cbm_file_result_array_bytes(const CBMFileResult *result) {
+    if (!result) {
+        return 0;
+    }
+    return RESULT_ARRAY_BYTES(result, defs) + RESULT_ARRAY_BYTES(result, calls) +
+           RESULT_ARRAY_BYTES(result, imports) + RESULT_ARRAY_BYTES(result, usages) +
+           RESULT_ARRAY_BYTES(result, local_bindings) + RESULT_ARRAY_BYTES(result, throws) +
+           RESULT_ARRAY_BYTES(result, rw) + RESULT_ARRAY_BYTES(result, type_refs) +
+           RESULT_ARRAY_BYTES(result, env_accesses) + RESULT_ARRAY_BYTES(result, type_assigns) +
+           RESULT_ARRAY_BYTES(result, impl_traits) + RESULT_ARRAY_BYTES(result, resolved_calls) +
+           RESULT_ARRAY_BYTES(result, string_refs) + RESULT_ARRAY_BYTES(result, infra_bindings) +
+           RESULT_ARRAY_BYTES(result, channels) + RESULT_ARRAY_BYTES(result, diagnostics);
+}
+
+#undef RESULT_ARRAY_BYTES
+#undef COMPACT_RESULT_ARRAY
 
 void cbm_free_tree(CBMFileResult *result) {
     if (result && result->cached_tree) {

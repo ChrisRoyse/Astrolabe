@@ -238,6 +238,21 @@ size_t cbm_mem_peak_rss(void) {
     return os_rss();
 }
 
+size_t cbm_mem_available(void) {
+#ifdef _WIN32
+    MEMORYSTATUSEX status = {0};
+    status.dwLength = sizeof(status);
+    if (!GlobalMemoryStatusEx(&status)) {
+        return 0;
+    }
+    return (size_t)status.ullAvailPhys;
+#else
+    /* The active product target is native Windows. Port-specific availability
+     * contracts are deliberately deferred rather than guessed. */
+    return 0;
+#endif
+}
+
 size_t cbm_mem_budget(void) {
     return g_budget;
 }

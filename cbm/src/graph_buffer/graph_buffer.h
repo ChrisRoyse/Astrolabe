@@ -36,8 +36,9 @@ typedef struct {
     int start_line;
     int end_line;
     bool source_present;   /* distinguishes no source from an exact empty source */
-    uint8_t *source_bytes; /* heap-owned byte-exact source when source_present */
+    uint8_t *source_bytes; /* byte-exact source when source_present */
     size_t source_len;
+    bool source_borrowed; /* immutable source slab owns source_bytes when true */
     char *source_sha256; /* heap-owned lowercase SHA-256 when source_present */
     uint64_t start_byte; /* end-exclusive byte span within the indexed file */
     uint64_t end_byte;
@@ -71,7 +72,8 @@ void cbm_gbuf_free(cbm_gbuf_t *gb);
  * Nodes are merged only by stable source atom. Qualified names are non-unique.
  * New nodes are inserted with their original IDs (from shared ID source).
  * Edges are remapped for any QN-colliding nodes, then inserted with dedup.
- * After merge, src can be safely freed (all data is copied).
+ * After merge, src can be safely freed. Owned data is copied; immutable
+ * source-slab references remain borrowed from the enclosing pipeline slab.
  * Returns 0 on success, -1 on error. */
 int cbm_gbuf_merge(cbm_gbuf_t *dst, cbm_gbuf_t *src);
 
@@ -96,6 +98,14 @@ int64_t cbm_gbuf_upsert_source_node(cbm_gbuf_t *gb, const char *label, const cha
                                     int start_line, int end_line, const uint8_t *source_bytes,
                                     size_t source_len, uint64_t start_byte, uint64_t end_byte,
                                     const char *properties_json);
+
+/* Upsert a source-backed node while borrowing immutable bytes whose lifetime
+ * encloses the graph buffer. Identity, hashing, row-sink, and persistence
+ * semantics are identical; only the redundant source allocation is removed. */
+int64_t cbm_gbuf_upsert_source_node_borrowed(
+    cbm_gbuf_t *gb, const char *label, const char *name, const char *qualified_name,
+    const char *file_path, int start_line, int end_line, const uint8_t *source_bytes,
+    size_t source_len, uint64_t start_byte, uint64_t end_byte, const char *properties_json);
 
 /* Resolve a source-backed node by the complete canonical identity frame. */
 const cbm_gbuf_node_t *cbm_gbuf_find_source_node(const cbm_gbuf_t *gb, const char *label,

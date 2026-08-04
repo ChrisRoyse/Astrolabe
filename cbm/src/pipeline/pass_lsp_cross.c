@@ -631,18 +631,19 @@ void cbm_pxc_run_one_ts(CBMFileResult *r, const char *source, int source_len, co
  * driver fed the FULL def list into full per-file registry builds —
  * O(files x defs), which ground an 81k-file TS corpus for hours.
  *
- * `rust_shared_get` supplies the lazily-built shared Rust all-defs registry
- * (the parallel resolver owns its once-guard); NULL means "no shared rust
- * registry available" and rust NULL-filter files take the per-file build. */
-void cbm_pxc_dispatch_file(CBMLanguage lang, CBMFileResult *result, const char *source,
-                           int source_len, const char *rel, const char *def_module,
-                           const CBMCrossLspRegistries *cross_registries,
-                           const CBMModuleDefIndex *module_def_index, CBMLSPDef *all_defs,
-                           int all_def_count, const char **imp_keys, const char **imp_vals,
-                           int imp_count, CBMTypeRegistry *(*rust_shared_get)(void *),
-                           void *rust_shared_ctx, const CBMCargoManifest *rust_manifest) {
+ * Every allocation failure is terminal. An optimization may not silently
+ * widen to a more expensive execution path under memory pressure. */
+int cbm_pxc_dispatch_file(CBMLanguage lang, CBMFileResult *result, const char *source,
+                          int source_len, const char *rel, const char *def_module,
+                          const CBMCrossLspRegistries *cross_registries,
+                          const CBMModuleDefIndex *module_def_index, CBMLSPDef *all_defs,
+                          int all_def_count, const char **imp_keys, const char **imp_vals,
+                          int imp_count, const CBMCargoManifest *rust_manifest) {
     if (!result) {
-        return;
+        cbm_log_error("lsp_cross.dispatch_failed", "code", "CBM_LSP_RESULT_REQUIRED", "path",
+                      rel ? rel : "", "message", "cross-LSP dispatch requires an extracted result",
+                      "remediation", "preserve the complete extraction result through resolution");
+        return -1;
     }
     CBMCargoManifest rust_manifest_view;
     if (lang == CBM_LANG_RUST && rust_manifest) {
@@ -699,6 +700,9 @@ void cbm_pxc_dispatch_file(CBMLanguage lang, CBMFileResult *result, const char *
                 ts_filtered = cbm_pxc_filter_defs_for_file(module_def_index, all_defs, lang,
                                                            result->namespace_name, def_module,
                                                            imp_vals, imp_count, &fc);
+                if (!ts_filtered && fc < 0) {
+                    return -1;
+                }
                 if (ts_filtered) {
                     ts_defs = ts_filtered;
                     ts_def_count = fc;
@@ -712,6 +716,13 @@ void cbm_pxc_dispatch_file(CBMLanguage lang, CBMFileResult *result, const char *
             used_prebuilt = true;
             break;
         }
+        case CBM_LANG_RUST:
+            cbm_run_rust_lsp_cross_with_registry(
+                &result->arena, source, source_len, def_module, prebuilt, imp_keys, imp_vals,
+                imp_count, result->cached_tree, rust_manifest, &result->resolved_calls,
+                /*result=*/NULL);
+            used_prebuilt = true;
+            break;
         /* PHP falls through to the per-file build path below until its
          * overlay variant lands. */
         default:
@@ -720,7 +731,7 @@ void cbm_pxc_dispatch_file(CBMLanguage lang, CBMFileResult *result, const char *
     }
 
     if (used_prebuilt) {
-        return;
+        return cbm_arena_failed(&result->arena) ? -1 : 0;
     }
     /* Fallback: gopls per-file filter + per-file registry build. RUST is
      * exempt from the module filter: its resolution is Cargo-manifest-aware
@@ -737,22 +748,21 @@ void cbm_pxc_dispatch_file(CBMLanguage lang, CBMFileResult *result, const char *
         filtered =
             cbm_pxc_filter_defs_for_file(module_def_index, all_defs, lang, result->namespace_name,
                                          def_module, imp_vals, imp_count, &filtered_count);
+        if (!filtered && filtered_count < 0) {
+            return -1;
+        }
         if (filtered) {
             file_defs = filtered;
             file_def_count = filtered_count;
         }
     }
     if (lang == CBM_LANG_RUST) {
-        CBMTypeRegistry *shared = rust_shared_get ? rust_shared_get(rust_shared_ctx) : NULL;
-        if (shared) {
-            cbm_run_rust_lsp_cross_with_registry(
-                &result->arena, source, source_len, def_module, shared, imp_keys, imp_vals,
-                imp_count, result->cached_tree, rust_manifest, &result->resolved_calls,
-                /*result=*/NULL);
-        } else {
-            cbm_pxc_run_one(lang, result, source, source_len, def_module, file_defs, file_def_count,
-                            imp_keys, imp_vals, imp_count, rust_manifest);
-        }
+        cbm_log_error("lsp_cross.dispatch_failed", "code", "CBM_RUST_SHARED_REGISTRY_REQUIRED",
+                      "path", rel ? rel : "", "message",
+                      "Rust cross-file resolution has no immutable project registry", "remediation",
+                      "rebuild the project-wide Rust registry and retry the complete corpus");
+        free(filtered);
+        return -1;
     } else if (lang == CBM_LANG_JAVASCRIPT || lang == CBM_LANG_TYPESCRIPT || lang == CBM_LANG_TSX) {
         bool js;
         bool jsx;
@@ -765,6 +775,7 @@ void cbm_pxc_dispatch_file(CBMLanguage lang, CBMFileResult *result, const char *
                         imp_keys, imp_vals, imp_count, rust_manifest);
     }
     free(filtered);
+    return cbm_arena_failed(&result->arena) ? -1 : 0;
 }
 
 typedef struct {
@@ -1300,6 +1311,7 @@ int cbm_pipeline_pass_lsp_cross(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *
         cross_registries.c = cbm_c_build_cross_registry(xa, all_defs, def_count);
         cross_registries.cs = cbm_cs_build_cross_registry(xa, all_defs, def_count);
         cross_registries.ts = cbm_ts_build_cross_registry(xa, all_defs, def_count);
+        cross_registries.rust = cbm_rust_build_cross_registry(xa, all_defs, def_count);
         if (cbm_arena_failed(xa)) {
             char requested[32];
             snprintf(requested, sizeof(requested), "%zu", cbm_arena_failure_bytes(xa));
@@ -1361,9 +1373,14 @@ int cbm_pipeline_pass_lsp_cross(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *
             goto cleanup;
         }
 
-        cbm_pxc_dispatch_file(lang, cache[i], source, source_len, files[i].rel_path, def_modules[i],
-                              &cross_registries, module_def_index, all_defs, def_count, imp_keys,
-                              imp_vals, imp_count, NULL, NULL, ctx->rust_manifest);
+        if (cbm_pxc_dispatch_file(lang, cache[i], source, source_len, files[i].rel_path,
+                                  def_modules[i], &cross_registries, module_def_index, all_defs,
+                                  def_count, imp_keys, imp_vals, imp_count, ctx->rust_manifest) != 0) {
+            cbm_pipeline_import_map_free(imp_keys, imp_vals, imp_count);
+            free(source);
+            status = -1;
+            goto cleanup;
+        }
         if (cbm_arena_failed(&cache[i]->arena)) {
             char requested[32];
             snprintf(requested, sizeof(requested), "%zu",
@@ -1616,6 +1633,11 @@ CBMLSPDef *cbm_pxc_filter_defs_for_file(const CBMModuleDefIndex *idx, CBMLSPDef 
 
     bool *selected = (bool *)calloc((size_t)idx->def_count, sizeof(*selected));
     if (!selected) {
+        cbm_log_error("lsp_cross.filter_failed", "code", "CBM_MODULE_DEF_FILTER_ALLOC_FAILED",
+                      "component", "lsp_cross.module_def_filter", "operation", "allocate_bitmap",
+                      "message", "module definition filter bitmap allocation failed", "remediation",
+                      "free memory or reduce repository size, then retry");
+        *out_count = -1;
         return NULL;
     }
 
@@ -1639,6 +1661,11 @@ CBMLSPDef *cbm_pxc_filter_defs_for_file(const CBMModuleDefIndex *idx, CBMLSPDef 
     CBMLSPDef *out = (CBMLSPDef *)malloc((size_t)total * sizeof(CBMLSPDef));
     if (!out) {
         free(selected);
+        cbm_log_error("lsp_cross.filter_failed", "code", "CBM_MODULE_DEF_FILTER_RESULT_FAILED",
+                      "component", "lsp_cross.module_def_filter", "operation", "allocate_result",
+                      "message", "module definition filter result allocation failed", "remediation",
+                      "free memory or reduce repository size, then retry");
+        *out_count = -1;
         return NULL;
     }
 

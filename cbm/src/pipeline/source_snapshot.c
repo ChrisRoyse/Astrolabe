@@ -10,12 +10,15 @@
 #include "foundation/compat_fs.h"
 #include "foundation/constants.h"
 #include "foundation/log.h"
+#include "foundation/limits.h"
+#include "foundation/mem.h"
 #include "foundation/sha256.h"
 #include "foundation/hash_table.h"
 #include "foundation/platform.h"
 #include "foundation/win_utf8.h"
 
 #include <errno.h>
+#include <limits.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -26,6 +29,10 @@
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
+
+/* Scheduler-only live availability measurement. It intentionally remains off
+ * the public CBM/Rust FFI surface. */
+size_t cbm_mem_available(void);
 
 enum {
     SNAPSHOT_INDEX_ORIGIN = -1,
@@ -1764,6 +1771,224 @@ int cbm_source_snapshot_destroy(cbm_source_snapshot_t *snapshot) {
         snapshot->root = NULL;
     }
     return rc;
+}
+
+static void source_slab_log_failure(const char *code, const char *operation, const char *path,
+                                    size_t requested, size_t process_headroom,
+                                    size_t machine_available, const char *message,
+                                    const char *remediation) {
+    char requested_text[32];
+    char process_text[32];
+    char machine_text[32];
+    snprintf(requested_text, sizeof(requested_text), "%zu", requested);
+    snprintf(process_text, sizeof(process_text), "%zu", process_headroom);
+    snprintf(machine_text, sizeof(machine_text), "%zu", machine_available);
+    cbm_log_error("source_slab.refused", "code", code, "operation", operation, "path",
+                  path ? path : "", "requested_bytes", requested_text,
+                  "process_headroom_bytes", process_text, "machine_available_bytes",
+                  machine_text, "message", message, "remediation", remediation);
+}
+
+static void source_slab_hash_frame_u64(cbm_sha256_ctx *hash, uint64_t value) {
+    uint8_t frame[8];
+    for (int i = 7; i >= 0; i--) {
+        frame[i] = (uint8_t)(value & 0xffu);
+        value >>= 8;
+    }
+    cbm_sha256_update(hash, frame, sizeof(frame));
+}
+
+static void source_slab_digest_hex(const uint8_t digest[CBM_SHA256_DIGEST_LEN],
+                                   char out[CBM_SHA256_HEX_LEN + 1]) {
+    static const char digits[] = "0123456789abcdef";
+    for (size_t i = 0; i < CBM_SHA256_DIGEST_LEN; i++) {
+        out[i * 2] = digits[digest[i] >> 4];
+        out[i * 2 + 1] = digits[digest[i] & 0x0f];
+    }
+    out[CBM_SHA256_HEX_LEN] = '\0';
+}
+
+void cbm_source_slab_destroy(cbm_source_slab_t *slab) {
+    if (!slab) {
+        return;
+    }
+    free(slab->bytes);
+    free(slab->offsets);
+    free(slab->lengths);
+    memset(slab, 0, sizeof(*slab));
+}
+
+int cbm_source_slab_build(const cbm_file_info_t *files, int file_count,
+                          cbm_source_slab_t *slab) {
+    if (!slab || file_count <= 0 || !files || slab->bytes || slab->offsets || slab->lengths ||
+        slab->file_count != 0) {
+        source_slab_log_failure(
+            "CBM_SOURCE_SLAB_INVALID_ARGUMENT", "validate", "", 0, 0, 0,
+            "the immutable source slab request is incomplete or already initialized",
+            "supply one non-empty captured source view and one empty destination slab");
+        return CBM_NOT_FOUND;
+    }
+    if ((size_t)file_count > SIZE_MAX / sizeof(size_t)) {
+        source_slab_log_failure(
+            "CBM_SOURCE_SLAB_INDEX_OVERFLOW", "measure_index", "", SIZE_MAX, 0, 0,
+            "the source count exceeds the addressable slab index",
+            "reduce the corpus to an addressable source count and retry the complete generation");
+        return CBM_NOT_FOUND;
+    }
+
+    size_t source_bytes = 0;
+    size_t storage_bytes = 0;
+    long max_file_bytes = cbm_max_file_bytes();
+    for (int i = 0; i < file_count; i++) {
+        if (!files[i].path || !files[i].rel_path || files[i].size < 0 ||
+            (uint64_t)files[i].size > (uint64_t)INT_MAX ||
+            (max_file_bytes > 0 && files[i].size > max_file_bytes)) {
+            source_slab_log_failure(
+                "CBM_SOURCE_SLAB_FILE_INVALID", "measure_file", files[i].path, 0, 0, 0,
+                "one captured source cannot be represented by the authoritative parser contract",
+                "inspect the captured size/path and configured maximum, then retry unchanged");
+            return CBM_NOT_FOUND;
+        }
+        size_t length = (size_t)files[i].size;
+        if (source_bytes > SIZE_MAX - length || storage_bytes > SIZE_MAX - length - 1) {
+            source_slab_log_failure(
+                "CBM_SOURCE_SLAB_BYTES_OVERFLOW", "measure_file", files[i].path, SIZE_MAX, 0, 0,
+                "the complete captured source corpus exceeds addressable memory",
+                "split the corpus into an addressable project boundary and retry");
+            return CBM_NOT_FOUND;
+        }
+        source_bytes += length;
+        storage_bytes += length + 1;
+    }
+
+    size_t index_bytes = (size_t)file_count * sizeof(size_t);
+    if (storage_bytes > SIZE_MAX - index_bytes || storage_bytes + index_bytes > SIZE_MAX - index_bytes) {
+        source_slab_log_failure(
+            "CBM_SOURCE_SLAB_ALLOCATION_OVERFLOW", "measure_allocation", "", SIZE_MAX, 0, 0,
+            "the source slab and its exact index exceed addressable memory",
+            "split the corpus into an addressable project boundary and retry");
+        return CBM_NOT_FOUND;
+    }
+    size_t allocated_bytes = storage_bytes + (index_bytes * 2);
+    size_t budget = cbm_mem_budget();
+    size_t rss = cbm_mem_rss();
+    size_t machine_available = cbm_mem_available();
+    size_t process_headroom = budget > rss ? budget - rss : 0;
+    if (budget == 0 || machine_available == 0 || allocated_bytes > process_headroom ||
+        allocated_bytes > machine_available) {
+        source_slab_log_failure(
+            "CBM_SOURCE_SLAB_MEMORY_ADMISSION_REFUSED", "admit_allocation", "",
+            allocated_bytes, process_headroom, machine_available,
+            "the complete immutable source slab cannot be admitted within live memory",
+            "close competing memory-intensive work or increase the declared process budget, then "
+            "retry the complete unchanged corpus");
+        return CBM_NOT_FOUND;
+    }
+
+    cbm_source_slab_t candidate = {0};
+    candidate.bytes = malloc(storage_bytes);
+    candidate.offsets = malloc(index_bytes);
+    candidate.lengths = malloc(index_bytes);
+    if (!candidate.bytes || !candidate.offsets || !candidate.lengths) {
+        source_slab_log_failure(
+            "CBM_SOURCE_SLAB_ALLOC_FAILED", "allocate", "", allocated_bytes, process_headroom,
+            machine_available, "the admitted immutable source slab allocation failed",
+            "free memory and retry the complete unchanged corpus");
+        cbm_source_slab_destroy(&candidate);
+        return CBM_NOT_FOUND;
+    }
+
+    cbm_sha256_ctx corpus_hash;
+    cbm_sha256_init(&corpus_hash);
+    size_t cursor = 0;
+    for (int i = 0; i < file_count; i++) {
+        size_t length = (size_t)files[i].size;
+        candidate.offsets[i] = cursor;
+        candidate.lengths[i] = length;
+        FILE *stream = cbm_fopen(files[i].path, "rb");
+        if (!stream) {
+            source_slab_log_failure(
+                "CBM_SOURCE_SLAB_OPEN_FAILED", "read_captured_file", files[i].path, length,
+                process_headroom, machine_available,
+                "one immutable captured source file could not be opened",
+                "preserve the snapshot diagnostic, restore readable captured bytes, and retry");
+            cbm_source_slab_destroy(&candidate);
+            return CBM_NOT_FOUND;
+        }
+        size_t read_bytes = length > 0 ? fread(candidate.bytes + cursor, 1, length, stream) : 0;
+        int extra = fgetc(stream);
+        bool read_failed = read_bytes != length || extra != EOF || ferror(stream) != 0;
+        (void)fclose(stream);
+        if (read_failed) {
+            source_slab_log_failure(
+                "CBM_SOURCE_SLAB_READ_FAILED", "read_captured_file", files[i].path, length,
+                process_headroom, machine_available,
+                "one immutable captured source file changed length or became unreadable",
+                "preserve the snapshot diagnostic and retry only from a complete stable capture");
+            cbm_source_slab_destroy(&candidate);
+            return CBM_NOT_FOUND;
+        }
+        candidate.bytes[cursor + length] = 0;
+
+        char observed_sha256[CBM_SHA256_HEX_LEN + 1];
+        cbm_sha256_hex(candidate.bytes + cursor, length, observed_sha256);
+        if (files[i].sha256[0] == '\0' || strcmp(files[i].sha256, observed_sha256) != 0) {
+            source_slab_log_failure(
+                "CBM_SOURCE_SLAB_HASH_MISMATCH", "verify_captured_file", files[i].path, length,
+                process_headroom, machine_available,
+                "one source slab entry does not match its immutable snapshot hash",
+                "preserve the snapshot and refuse publication until the captured bytes are stable");
+            cbm_source_slab_destroy(&candidate);
+            return CBM_NOT_FOUND;
+        }
+
+        size_t path_len = strlen(files[i].rel_path);
+        source_slab_hash_frame_u64(&corpus_hash, (uint64_t)path_len);
+        cbm_sha256_update(&corpus_hash, files[i].rel_path, path_len);
+        source_slab_hash_frame_u64(&corpus_hash, (uint64_t)length);
+        cbm_sha256_update(&corpus_hash, candidate.bytes + cursor, length);
+        cursor += length + 1;
+    }
+
+    uint8_t digest[CBM_SHA256_DIGEST_LEN];
+    cbm_sha256_final(&corpus_hash, digest);
+    source_slab_digest_hex(digest, candidate.sha256);
+    candidate.source_bytes = source_bytes;
+    candidate.storage_bytes = storage_bytes;
+    candidate.allocated_bytes = allocated_bytes;
+    candidate.file_count = file_count;
+    *slab = candidate;
+
+    char files_text[32];
+    char source_text[32];
+    char allocated_text[32];
+    snprintf(files_text, sizeof(files_text), "%d", file_count);
+    snprintf(source_text, sizeof(source_text), "%zu", source_bytes);
+    snprintf(allocated_text, sizeof(allocated_text), "%zu", allocated_bytes);
+    cbm_log_info("source_slab.complete", "files", files_text, "source_bytes", source_text,
+                 "allocated_bytes", allocated_text, "sha256", slab->sha256);
+    return 0;
+}
+
+const uint8_t *cbm_source_slab_get(const cbm_source_slab_t *slab, int file_index,
+                                   size_t *out_len) {
+    if (out_len) {
+        *out_len = 0;
+    }
+    if (!slab || !slab->bytes || !slab->offsets || !slab->lengths || file_index < 0 ||
+        file_index >= slab->file_count) {
+        return NULL;
+    }
+    size_t offset = slab->offsets[file_index];
+    size_t length = slab->lengths[file_index];
+    if (offset > slab->storage_bytes || length > slab->storage_bytes - offset ||
+        offset + length >= slab->storage_bytes || slab->bytes[offset + length] != 0) {
+        return NULL;
+    }
+    if (out_len) {
+        *out_len = length;
+    }
+    return slab->bytes + offset;
 }
 
 #else

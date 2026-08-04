@@ -482,7 +482,9 @@ static void free_node_strings(cbm_gbuf_node_t *n) {
     free(n->name);
     free(n->atom_id);
     free(n->qualified_name);
-    free(n->source_bytes);
+    if (!n->source_borrowed) {
+        free(n->source_bytes);
+    }
     free(n->source_sha256);
     free(n->properties_json);
 }
@@ -1024,7 +1026,8 @@ static bool same_atom_payload(const cbm_gbuf_node_t *node, const char *label, co
 static int64_t upsert_node_internal(cbm_gbuf_t *gb, const char *label, const char *name,
                                     const char *qualified_name, const char *file_path,
                                     int start_line, int end_line, bool source_present,
-                                    const uint8_t *source_bytes, size_t source_len,
+                                    bool borrow_source, const uint8_t *source_bytes,
+                                    size_t source_len,
                                     uint64_t start_byte, uint64_t end_byte,
                                     const char *properties_json) {
     const char *canonical_file_path = canonical_identity_text(file_path);
@@ -1107,15 +1110,20 @@ static int64_t upsert_node_internal(cbm_gbuf_t *gb, const char *label, const cha
     node->end_line = end_line;
     node->source_present = source_present;
     node->source_len = source_len;
+    node->source_borrowed = source_present && borrow_source;
     node->start_byte = start_byte;
     node->end_byte = end_byte;
     node->properties_json = heap_strdup(json);
     if (source_present) {
         node->source_sha256 = sha256_hex_alloc(source_bytes, source_len);
         if (source_len > 0) {
-            node->source_bytes = malloc(source_len);
-            if (node->source_bytes) {
-                memcpy(node->source_bytes, source_bytes, source_len);
+            if (borrow_source) {
+                node->source_bytes = (uint8_t *)source_bytes;
+            } else {
+                node->source_bytes = malloc(source_len);
+                if (node->source_bytes) {
+                    memcpy(node->source_bytes, source_bytes, source_len);
+                }
             }
         }
     }
@@ -1149,7 +1157,7 @@ int64_t cbm_gbuf_upsert_node(cbm_gbuf_t *gb, const char *label, const char *name
                              const char *qualified_name, const char *file_path, int start_line,
                              int end_line, const char *properties_json) {
     return upsert_node_internal(gb, label, name, qualified_name, file_path, start_line, end_line,
-                                false, NULL, 0, 0, 0, properties_json);
+                                false, false, NULL, 0, 0, 0, properties_json);
 }
 
 int64_t cbm_gbuf_upsert_source_node(cbm_gbuf_t *gb, const char *label, const char *name,
@@ -1158,7 +1166,16 @@ int64_t cbm_gbuf_upsert_source_node(cbm_gbuf_t *gb, const char *label, const cha
                                     size_t source_len, uint64_t start_byte, uint64_t end_byte,
                                     const char *properties_json) {
     return upsert_node_internal(gb, label, name, qualified_name, file_path, start_line, end_line,
-                                true, source_bytes, source_len, start_byte, end_byte,
+                                true, false, source_bytes, source_len, start_byte, end_byte,
+                                properties_json);
+}
+
+int64_t cbm_gbuf_upsert_source_node_borrowed(
+    cbm_gbuf_t *gb, const char *label, const char *name, const char *qualified_name,
+    const char *file_path, int start_line, int end_line, const uint8_t *source_bytes,
+    size_t source_len, uint64_t start_byte, uint64_t end_byte, const char *properties_json) {
+    return upsert_node_internal(gb, label, name, qualified_name, file_path, start_line, end_line,
+                                true, true, source_bytes, source_len, start_byte, end_byte,
                                 properties_json);
 }
 
@@ -2573,13 +2590,18 @@ static void merge_copy_new_node(cbm_gbuf_t *dst, const cbm_gbuf_node_t *sn) {
     node->end_line = sn->end_line;
     node->source_present = sn->source_present;
     node->source_len = sn->source_len;
+    node->source_borrowed = sn->source_borrowed;
     node->start_byte = sn->start_byte;
     node->end_byte = sn->end_byte;
     node->source_sha256 = sn->source_present ? heap_strdup(sn->source_sha256) : NULL;
     if (sn->source_len > 0) {
-        node->source_bytes = malloc(sn->source_len);
-        if (node->source_bytes) {
-            memcpy(node->source_bytes, sn->source_bytes, sn->source_len);
+        if (sn->source_borrowed) {
+            node->source_bytes = sn->source_bytes;
+        } else {
+            node->source_bytes = malloc(sn->source_len);
+            if (node->source_bytes) {
+                memcpy(node->source_bytes, sn->source_bytes, sn->source_len);
+            }
         }
     }
     node->properties_json = heap_strdup(canonical_properties_json(sn->properties_json));

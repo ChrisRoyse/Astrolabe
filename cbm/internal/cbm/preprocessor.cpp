@@ -6,9 +6,11 @@
 #include "vendored/simplecpp/simplecpp.h"
 
 #include <cstdlib>
+#include <cstdio>
 #include <cstring>
 #include <exception>
 #include <limits>
+#include <new>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -32,6 +34,17 @@ static void set_diagnostic(char **diagnostic_out, const std::string &diagnostic)
     if (!diagnostic_out)
         return;
     *diagnostic_out = dup_string(diagnostic);
+}
+
+static void set_diagnostic_cstr(char **diagnostic_out, const char *diagnostic) noexcept {
+    if (!diagnostic_out || !diagnostic)
+        return;
+    size_t len = strlen(diagnostic);
+    char *copy = static_cast<char *>(malloc(len + 1));
+    if (!copy)
+        return;
+    memcpy(copy, diagnostic, len + 1);
+    *diagnostic_out = copy;
 }
 
 static bool is_name_char(char c) {
@@ -404,18 +417,25 @@ char *cbm_preprocess(const char *source, int source_len, const char *filename,
         *expanded_line_count_out = primary_source_lines.size();
         set_status(status_out, CBM_PREPROCESS_OK);
         return out;
+    } catch (const std::bad_alloc &) {
+        set_status(status_out, CBM_PREPROCESS_FAILED);
+        set_diagnostic_cstr(diagnostic_out,
+                            "allocation failed while preprocessing the complete source");
+        return NULL;
     } catch (const std::exception &e) {
         set_status(status_out, CBM_PREPROCESS_FAILED);
-        std::string message = "simplecpp exception while preprocessing";
-        if (e.what() && *e.what()) {
-            message += ": ";
-            message += e.what();
-        }
-        set_diagnostic(diagnostic_out, message);
+        char message[1024];
+        const char *detail = e.what();
+        if (detail && *detail)
+            snprintf(message, sizeof(message), "simplecpp exception while preprocessing: %.900s",
+                     detail);
+        else
+            snprintf(message, sizeof(message), "simplecpp exception while preprocessing");
+        set_diagnostic_cstr(diagnostic_out, message);
         return NULL;
     } catch (...) {
         set_status(status_out, CBM_PREPROCESS_FAILED);
-        set_diagnostic(diagnostic_out, "unknown simplecpp exception while preprocessing");
+        set_diagnostic_cstr(diagnostic_out, "unknown simplecpp exception while preprocessing");
         return NULL;
     }
 }

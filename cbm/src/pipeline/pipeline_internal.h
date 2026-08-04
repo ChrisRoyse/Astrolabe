@@ -9,6 +9,7 @@
 #define CBM_PIPELINE_INTERNAL_H
 
 #include "pipeline/pipeline.h"
+#include "pipeline/source_snapshot.h"
 #include "pipeline/path_alias.h"
 #include "graph_buffer/graph_buffer.h"
 #include "graph_buffer/load_error.h"
@@ -22,6 +23,20 @@
 #include <time.h>
 #include <windows.h>
 #include <psapi.h>
+
+/* Extraction-cache retention primitives owned by the native pipeline. They
+ * deliberately stay off cbm.h's public FFI surface. */
+bool cbm_file_result_compact_arrays(CBMFileResult *result);
+size_t cbm_file_result_array_bytes(const CBMFileResult *result);
+CBMFileResult *cbm_extract_file_at_path_with_metadata_borrow_source(
+    const char *source, int source_len, CBMLanguage language, const char *project,
+    const char *rel_path, const char *source_path, const char *rust_edition,
+    bool rust_is_crate_root, const char *structured_classification_override,
+    const char *structured_classification_override_provenance, int64_t timeout_micros,
+    const char **extra_defines, const char **include_paths);
+/* Live machine-available physical memory. Kept pipeline-internal so this
+ * scheduler measurement does not expand the Rust FFI contract. */
+size_t cbm_mem_available(void);
 
 /* ── Shared pipeline constants ─────────────────────────────────── */
 
@@ -120,6 +135,7 @@ typedef struct {
     const char *source_root;          /* immutable snapshot root for every source-derived read */
     const cbm_file_info_t *all_files; /* complete captured source + interpretation inputs */
     int all_file_count;
+    const cbm_source_slab_t *source_slab; /* immutable source-only bytes in extraction order */
     cbm_gbuf_t *gbuf;         /* owned by pipeline */
     cbm_registry_t *registry; /* owned by pipeline */
     atomic_int *cancelled;    /* pointer to pipeline's cancelled flag */
@@ -537,22 +553,8 @@ char *cbm_infra_qn(const char *project_name, const char *rel_path, const char *i
  * Caches CBMFileResult* in result_cache[file_idx] for reuse in Phase 3B/4.
  * shared_ids provides globally unique node/edge IDs across workers. */
 
-/* Source-retention tuning for cbm_parallel_extract_ex. Zero-valued byte caps
- * mean "use the derived default" (RAM-fraction total, clamped to an absolute
- * ceiling; modest per-file cap); CBM_RETAIN_TOTAL_MB / CBM_RETAIN_PER_FILE_MB
- * override those. retain_sources_set=false keeps the default retain policy. */
-typedef struct {
-    bool retain_sources;
-    bool retain_sources_set; /* false keeps the default retain_sources policy */
-    size_t retain_total_budget_bytes;
-    size_t retain_per_file_max_bytes;
-} cbm_parallel_extract_opts_t;
-
 /* worker_count must be positive for non-empty file sets. Invalid direct-call
  * counts fail closed before worker-sized allocation or dispatch. */
-int cbm_parallel_extract_ex(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, int file_count,
-                            CBMFileResult **result_cache, _Atomic int64_t *shared_ids,
-                            int worker_count, const cbm_parallel_extract_opts_t *opts);
 int cbm_parallel_extract(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, int file_count,
                          CBMFileResult **result_cache, _Atomic int64_t *shared_ids,
                          int worker_count);

@@ -40,32 +40,10 @@ enum {
 #define PP_USEC_PER_MS 1000000ULL
 #define PP_HALF_CONF 0.5
 
-/* Absolute source-retention ceilings for the parallel extract pipeline.
- *
- * The extract worker copies each file's source bytes into result->arena so
- * the fused cross-file LSP step in resolve_worker can re-parse without
- * re-opening the file. That retention is TRANSIENT (freed at run end) but it
- * is a PEAK-RSS driver: every retained byte is resident at once across the
- * extract→resolve handoff.
- *
- * A cap here is a FLOOR as much as a ceiling: whatever total we allow, we
- * WILL hold that much resident at peak on a large repo. rust-analyzer bounds
- * retained file *text* to a small fixed budget and re-reads source on a miss
- * rather than scaling the retained set with host RAM — because the re-read is
- * cheap relative to holding tens of GB resident. We follow the same model:
- *   - derive the total budget from the process memory budget (budget/8),
- *   - BUT clamp the RAM-derived DEFAULT to a small absolute ceiling (1 GiB)
- *     so a 512 GiB host does not retain 64 GiB of source it would re-read
- *     cheaply anyway, and keep the per-file cap modest (32 MiB) so one
- *     pathological generated blob cannot monopolise the budget.
- * A file dropped from retention is NOT lost to cross-file resolution:
- * resolve_worker re-reads it on demand, bounded and freed immediately
- * (source_reread fallback). Both caps are env-overridable — CBM_RETAIN_TOTAL_MB
- * / CBM_RETAIN_PER_FILE_MB raise or lower the auto-derived defaults directly
- * (the hard ceilings bound only the RAM-derived default, never a deliberate
- * operator/caller choice). */
-#define PP_RETAIN_TOTAL_HARD_MAX_BYTES (1024ULL * 1024 * 1024)  /* 1 GiB default ceiling */
-#define PP_RETAIN_PER_FILE_HARD_MAX_BYTES (32ULL * 1024 * 1024) /* 32 MiB per file */
+/* Source bytes live once in the hash-bound pipeline source slab. File atoms,
+ * extraction, and cross-file resolution borrow that same immutable storage;
+ * no retention cap, duplicate copy, disk reread, or missing-source degradation
+ * exists on this path. */
 #include "pipeline/pipeline.h"
 #include "pipeline/pipeline_internal.h"
 #include "pipeline/pass_lsp_cross.h" /* cbm_pxc_* helpers for fused cross-file LSP */
@@ -91,8 +69,8 @@ enum {
 #include "simhash/minhash.h"
 #include "semantic/ast_profile.h"
 
-#include <errno.h>
 #include <stdatomic.h>
+#include <limits.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -138,95 +116,6 @@ static void record_worker_pool_dispatch(cbm_pipeline_t *pipeline,
         result->error_code);
 }
 
-/* Parse a positive MB-valued retention env knob (CBM_RETAIN_*_MB) into bytes.
- * Follows the limits.c strtol convention: unset / unparseable / non-positive
- * → return 0 so the caller keeps its derived default. */
-static size_t cbm_retain_env_bytes(const char *name) {
-    const char *raw = getenv(name);
-    if (!raw || !raw[0]) {
-        return 0;
-    }
-    errno = 0;
-    char *end = NULL;
-    long v = strtol(raw, &end, 10);
-    if (errno != 0 || end == raw || *end != '\0' || v <= 0) {
-        return 0;
-    }
-    return (size_t)v * 1024 * 1024;
-}
-
-/* Auto-derived TOTAL retention budget: a fraction of the process memory
- * budget, clamped to the absolute ceiling. The clamp bounds ONLY this
- * RAM-derived default — a huge-RAM host must not retain tens of GB it would
- * re-read cheaply. When the budget is unset (tests / no cgroup) fall back to
- * the ceiling. */
-static size_t cbm_parallel_extract_default_total_cap(void) {
-    size_t cap = cbm_mem_budget();
-    if (cap > 0) {
-        cap /= 8;
-    } else {
-        cap = PP_RETAIN_TOTAL_HARD_MAX_BYTES;
-    }
-    if (cap > PP_RETAIN_TOTAL_HARD_MAX_BYTES) {
-        cap = PP_RETAIN_TOTAL_HARD_MAX_BYTES;
-    }
-    return cap;
-}
-
-/* Auto-derived PER-FILE cap: modest absolute ceiling, never above the total. */
-static size_t cbm_parallel_extract_default_per_file_cap(size_t total_cap) {
-    size_t cap = PP_RETAIN_PER_FILE_HARD_MAX_BYTES;
-    if (cap > total_cap) {
-        cap = total_cap;
-    }
-    return cap;
-}
-
-/* Resolve the effective retention options from (in precedence order):
- * explicit caller opts > CBM_RETAIN_*_MB env knobs > RAM-derived defaults.
- * The absolute hard ceilings apply only to the RAM-derived defaults; an
- * operator/caller that sets a value explicitly is trusted. The only invariant
- * enforced unconditionally is per-file ≤ total. */
-static cbm_parallel_extract_opts_t cbm_parallel_extract_resolve_opts(
-    const cbm_parallel_extract_opts_t *opts) {
-    cbm_parallel_extract_opts_t resolved = {
-        .retain_sources = true,
-        .retain_sources_set = true,
-        .retain_total_budget_bytes = cbm_parallel_extract_default_total_cap(),
-        .retain_per_file_max_bytes = 0,
-    };
-
-    size_t env_total = cbm_retain_env_bytes("CBM_RETAIN_TOTAL_MB");
-    if (env_total > 0) {
-        resolved.retain_total_budget_bytes = env_total;
-    }
-
-    resolved.retain_per_file_max_bytes =
-        cbm_parallel_extract_default_per_file_cap(resolved.retain_total_budget_bytes);
-    size_t env_per_file = cbm_retain_env_bytes("CBM_RETAIN_PER_FILE_MB");
-    if (env_per_file > 0) {
-        resolved.retain_per_file_max_bytes = env_per_file;
-    }
-
-    if (opts) {
-        if (opts->retain_sources_set) {
-            resolved.retain_sources = opts->retain_sources;
-        }
-        if (opts->retain_total_budget_bytes > 0) {
-            resolved.retain_total_budget_bytes = opts->retain_total_budget_bytes;
-        }
-        if (opts->retain_per_file_max_bytes > 0) {
-            resolved.retain_per_file_max_bytes = opts->retain_per_file_max_bytes;
-        }
-    }
-
-    /* Correctness invariant: a single file can never exceed the total budget. */
-    if (resolved.retain_per_file_max_bytes > resolved.retain_total_budget_bytes) {
-        resolved.retain_per_file_max_bytes = resolved.retain_total_budget_bytes;
-    }
-    return resolved;
-}
-
 static uint64_t extract_now_ns(void) {
     struct timespec ts;
     cbm_clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -234,60 +123,6 @@ static uint64_t extract_now_ns(void) {
 }
 
 /* ── Helpers (duplicated from pass files — kept static for isolation) ── */
-
-/* Read file into a malloc'd buffer (= mimalloc in production).
- * *out_size receives the on-disk size and *out_status the failure reason so the
- * caller can attribute a skip to the right phase (read vs oversized) instead of
- * a silent drop. Both out params may be NULL. */
-static char *read_file(const char *path, int *out_len, long *out_size,
-                       cbm_read_status_t *out_status) {
-    if (out_size) {
-        *out_size = 0;
-    }
-    if (out_status) {
-        *out_status = CBM_READ_OK;
-    }
-    FILE *f = cbm_fopen(path, "rb");
-    if (!f) {
-        if (out_status) {
-            *out_status = CBM_READ_OPEN_FAIL;
-        }
-        return NULL;
-    }
-    (void)fseek(f, 0, SEEK_END);
-    long size = ftell(f);
-    (void)fseek(f, 0, SEEK_SET);
-    if (out_size) {
-        *out_size = size;
-    }
-    if (size <= 0) {
-        (void)fclose(f);
-        if (out_status) {
-            *out_status = CBM_READ_EMPTY;
-        }
-        return NULL;
-    }
-    if (size > cbm_max_file_bytes()) { /* generous, env-configurable cap (B4) */
-        (void)fclose(f);
-        if (out_status) {
-            *out_status = CBM_READ_OVERSIZED;
-        }
-        return NULL;
-    }
-    char *buf = (char *)malloc((size_t)size + SKIP_ONE);
-    if (!buf) {
-        (void)fclose(f);
-        if (out_status) {
-            *out_status = CBM_READ_OOM;
-        }
-        return NULL;
-    }
-    size_t nread = fread(buf, SKIP_ONE, (size_t)size, f);
-    (void)fclose(f);
-    buf[nread] = '\0';
-    *out_len = (int)nread;
-    return buf;
-}
 
 /* ── Per-worker failure list (Stage 2 / Track B) ────────────────────
  * Each extract worker appends read/extract/oversized failures into its OWN list
@@ -333,11 +168,6 @@ static void pp_err_add(pp_err_list_t *list, const char *path, const char *reason
     list->items[list->count].reason = pp_err_dup(reason);
     list->items[list->count].phase = pp_err_dup(phase);
     list->count++;
-}
-
-/* Free source buffer. */
-static void free_source(char *buf) {
-    free(buf);
 }
 
 static const char *itoa_log(int val) {
@@ -743,32 +573,51 @@ typedef struct {
     _Atomic int *cancelled;
     _Atomic int next_file_idx;
 
-    bool retain_sources;              /* copy source into result->arena for cross-file LSP */
-    size_t retain_total_budget_bytes; /* project-wide retention cap (peak-RSS bound) */
-    size_t retain_per_file_max_bytes; /* per-file retention cap */
-    _Atomic int64_t retained_bytes;   /* total source bytes copied into result arenas */
-    _Atomic int retain_cap_warned;    /* WARN index.retain_capped emitted once per run */
+    const cbm_source_slab_t *source_slab; /* hash-bound immutable source bytes */
 
     /* Per-worker skip lists (separate allocation, indexed by worker_id — no hot-
      * path lock). Merged into the pipeline in the sequential merge loop. */
     pp_err_list_t *err_lists;
-    _Atomic int oversized_warned; /* throttle for the index.file_oversized WARN */
-
     /* Back-pressure futility latch: set when a full collect+nap cycle ended
      * still over budget — the resident floor (graph + retained sources), not
      * in-flight transients, holds the memory, so napping cannot reclaim it.
      * While set, pulls skip the nap (the designed soft overshoot); the cheap
      * over-budget probe re-arms the gate once RSS drains under budget. */
     _Atomic int bp_futile;
+
+    /* Measured pre-parse admission. The largest captured file calibrates the
+     * exact source-to-live-memory amplification alone. Subsequent workers must
+     * reserve that measured amount against both this process's remaining
+     * budget and the machine's currently available physical memory before they
+     * may read or parse a file. This prevents the largest-first initial burst
+     * and keeps concurrent Astrolabe projects from each assuming they own the
+     * same total-RAM fraction. */
+    cbm_mutex_t admission_mu;
+    cbm_cond_t admission_cv;
+    bool admission_calibrating;
+    bool admission_calibrated;
+    bool admission_failed;
+    size_t admission_amplification;
+    size_t admission_active_reserved_bytes;
+    size_t admission_peak_reserved_bytes;
+    int admission_active_files;
+    _Atomic int admission_waits;
+    _Atomic uint64_t retained_arena_bytes;
+    _Atomic uint64_t retained_array_bytes;
 } extract_ctx_t;
 
-/* Cap on the number of index.file_oversized WARN lines (the full list still goes
- * to the response/logfile — this only throttles the stderr noise). */
-enum { PP_OVERSIZED_WARN_MAX = 32 };
+typedef struct {
+    size_t source_bytes;
+    size_t reserved_bytes;
+    size_t rss_before;
+    bool calibration;
+    bool held;
+} extract_admission_t;
 
 /* Insert one definition node (and its route if present) into the local gbuf. */
 static void insert_def_into_gbuf(extract_worker_state_t *ws, const cbm_file_info_t *fi,
-                                 const CBMCallArray *calls, CBMDefinition *def) {
+                                 const CBMCallArray *calls, CBMDefinition *def,
+                                 const uint8_t *file_source, size_t file_source_len) {
     /* CBM_SZ_32K: room for the struct-trigram (S1) + api-callee (S4) encoder
      * sources alongside the existing props (#374). Keep in sync with
      * pass_definitions.c::process_def. */
@@ -777,11 +626,26 @@ static void insert_def_into_gbuf(extract_worker_state_t *ws, const cbm_file_info
     cbm_pipeline_build_def_callees(calls, def->qualified_name, (int)def->start_line,
                                    (int)def->end_line, callees, (int)sizeof(callees));
     build_def_props(props, sizeof(props), def, callees);
-    int64_t func_id = cbm_gbuf_upsert_source_node(
-        ws->local_gbuf, def->label ? def->label : "Function", def->name, def->qualified_name,
-        def->file_path ? def->file_path : fi->rel_path, (int)def->start_line, (int)def->end_line,
-        (const uint8_t *)def->source, (size_t)def->source_len, def->start_byte, def->end_byte,
-        props);
+    const uint8_t *atom_source = (const uint8_t *)def->source;
+    size_t atom_source_len = (size_t)def->source_len;
+    bool source_is_slab = def->end_byte > def->start_byte &&
+                          (size_t)def->end_byte <= file_source_len && file_source;
+    if (source_is_slab) {
+        atom_source = file_source + def->start_byte;
+        atom_source_len = (size_t)(def->end_byte - def->start_byte);
+    }
+    int64_t func_id =
+        source_is_slab
+            ? cbm_gbuf_upsert_source_node_borrowed(
+                  ws->local_gbuf, def->label ? def->label : "Function", def->name,
+                  def->qualified_name, def->file_path ? def->file_path : fi->rel_path,
+                  (int)def->start_line, (int)def->end_line, atom_source, atom_source_len,
+                  def->start_byte, def->end_byte, props)
+            : cbm_gbuf_upsert_source_node(
+                  ws->local_gbuf, def->label ? def->label : "Function", def->name,
+                  def->qualified_name, def->file_path ? def->file_path : fi->rel_path,
+                  (int)def->start_line, (int)def->end_line, atom_source, atom_source_len,
+                  def->start_byte, def->end_byte, props);
     if (func_id > 0) {
         ws->nodes_created++;
     } else {
@@ -807,7 +671,8 @@ static void insert_def_into_gbuf(extract_worker_state_t *ws, const cbm_file_info
 }
 
 static void insert_diagnostic_into_gbuf(extract_worker_state_t *ws, const cbm_file_info_t *fi,
-                                        const char *project_name, const CBMParseDiagnostic *diag) {
+                                        const char *project_name, const CBMParseDiagnostic *diag,
+                                        const uint8_t *file_source, size_t file_source_len) {
     if (!diag || !diag->code || !diag->node_type) {
         return;
     }
@@ -837,10 +702,24 @@ static void insert_diagnostic_into_gbuf(extract_worker_state_t *ws, const cbm_fi
              "\"end_byte\":%u,\"missing\":%s}",
              diag->code, operation, node_type, message, remediation, diag->start_byte,
              diag->end_byte, diag->is_missing ? "true" : "false");
-    int64_t node_id = cbm_gbuf_upsert_source_node(
-        ws->local_gbuf, "ParseDiagnostic", diag->code, qn, fi->rel_path, (int)diag->start_line,
-        (int)diag->end_line, (const uint8_t *)diag->source, (size_t)diag->source_len,
-        diag->start_byte, diag->end_byte, props);
+    const uint8_t *atom_source = (const uint8_t *)diag->source;
+    size_t atom_source_len = (size_t)diag->source_len;
+    bool source_is_slab = diag->end_byte > diag->start_byte &&
+                          (size_t)diag->end_byte <= file_source_len && file_source;
+    if (source_is_slab) {
+        atom_source = file_source + diag->start_byte;
+        atom_source_len = (size_t)(diag->end_byte - diag->start_byte);
+    }
+    int64_t node_id =
+        source_is_slab
+            ? cbm_gbuf_upsert_source_node_borrowed(
+                  ws->local_gbuf, "ParseDiagnostic", diag->code, qn, fi->rel_path,
+                  (int)diag->start_line, (int)diag->end_line, atom_source, atom_source_len,
+                  diag->start_byte, diag->end_byte, props)
+            : cbm_gbuf_upsert_source_node(
+                  ws->local_gbuf, "ParseDiagnostic", diag->code, qn, fi->rel_path,
+                  (int)diag->start_line, (int)diag->end_line, atom_source, atom_source_len,
+                  diag->start_byte, diag->end_byte, props);
     if (node_id > 0) {
         ws->nodes_created++;
     } else {
@@ -860,6 +739,192 @@ static void log_extract_done(int pos, uint64_t ms, int defs, const char *path) {
         cbm_log_info("parallel.extract.file.done", "pos", itoa_log(pos), "elapsed_ms",
                      itoa_log((int)ms), "defs", itoa_log(defs), "path", path);
     }
+}
+
+static size_t extract_admission_source_bytes(const cbm_file_info_t *file) {
+    if (!file || file->size <= 0) {
+        return 1;
+    }
+    if ((uint64_t)file->size > (uint64_t)SIZE_MAX) {
+        return SIZE_MAX;
+    }
+    return (size_t)file->size;
+}
+
+static bool extract_admission_multiply(size_t left, size_t right, size_t *out) {
+    if (!out || left == 0 || right == 0 || left > SIZE_MAX / right) {
+        return false;
+    }
+    *out = left * right;
+    return true;
+}
+
+static void extract_admission_log_refusal(const cbm_file_info_t *file, const char *code,
+                                          size_t requested, size_t process_headroom,
+                                          size_t machine_available) {
+    char requested_buf[CBM_SZ_32];
+    char process_buf[CBM_SZ_32];
+    char machine_buf[CBM_SZ_32];
+    snprintf(requested_buf, sizeof(requested_buf), "%zu", requested);
+    snprintf(process_buf, sizeof(process_buf), "%zu", process_headroom);
+    snprintf(machine_buf, sizeof(machine_buf), "%zu", machine_available);
+    cbm_log_error("parallel.extract.admission.refused", "code", code, "path",
+                  file && file->rel_path ? file->rel_path : "", "requested_bytes", requested_buf,
+                  "process_headroom_bytes", process_buf, "machine_available_bytes", machine_buf,
+                  "message", "the complete source cannot be admitted within measured memory",
+                  "remediation",
+                  "close competing memory-intensive work or increase the declared memory budget, "
+                  "then retry the complete unchanged corpus");
+}
+
+static bool extract_admission_acquire(extract_ctx_t *ec, int sort_pos,
+                                      const cbm_file_info_t *file, extract_admission_t *token) {
+    if (!ec || !file || !token) {
+        return false;
+    }
+    memset(token, 0, sizeof(*token));
+    token->source_bytes = extract_admission_source_bytes(file);
+
+    cbm_mutex_lock(&ec->admission_mu);
+    for (;;) {
+        if (ec->admission_failed ||
+            atomic_load_explicit(ec->cancelled, memory_order_relaxed)) {
+            cbm_mutex_unlock(&ec->admission_mu);
+            return false;
+        }
+
+        size_t budget = cbm_mem_budget();
+        size_t rss = cbm_mem_rss();
+        size_t machine_available = cbm_mem_available();
+        size_t process_headroom = budget > rss ? budget - rss : 0;
+        if (budget == 0 || machine_available == 0) {
+            ec->admission_failed = true;
+            extract_admission_log_refusal(file, "CBM_EXTRACTION_MEMORY_STATE_UNAVAILABLE",
+                                          token->source_bytes, process_headroom,
+                                          machine_available);
+            cbm_cond_broadcast(&ec->admission_cv);
+            cbm_mutex_unlock(&ec->admission_mu);
+            return false;
+        }
+
+        if (!ec->admission_calibrated) {
+            if (sort_pos == 0 && !ec->admission_calibrating && ec->admission_active_files == 0) {
+                if (token->source_bytes > process_headroom ||
+                    token->source_bytes > machine_available) {
+                    ec->admission_failed = true;
+                    extract_admission_log_refusal(
+                        file, "CBM_EXTRACTION_CALIBRATION_ADMISSION_REFUSED", token->source_bytes,
+                        process_headroom, machine_available);
+                    cbm_cond_broadcast(&ec->admission_cv);
+                    cbm_mutex_unlock(&ec->admission_mu);
+                    return false;
+                }
+                ec->admission_calibrating = true;
+                ec->admission_active_files = 1;
+                ec->admission_active_reserved_bytes = token->source_bytes;
+                ec->admission_peak_reserved_bytes = token->source_bytes;
+                token->reserved_bytes = token->source_bytes;
+                token->rss_before = rss;
+                token->calibration = true;
+                token->held = true;
+                cbm_mutex_unlock(&ec->admission_mu);
+                return true;
+            }
+            atomic_fetch_add_explicit(&ec->admission_waits, 1, memory_order_relaxed);
+            cbm_cond_wait(&ec->admission_cv, &ec->admission_mu);
+            continue;
+        }
+
+        size_t estimate = 0;
+        if (!extract_admission_multiply(token->source_bytes, ec->admission_amplification,
+                                        &estimate)) {
+            ec->admission_failed = true;
+            extract_admission_log_refusal(file, "CBM_EXTRACTION_MEMORY_ESTIMATE_OVERFLOW",
+                                          SIZE_MAX, process_headroom, machine_available);
+            cbm_cond_broadcast(&ec->admission_cv);
+            cbm_mutex_unlock(&ec->admission_mu);
+            return false;
+        }
+        size_t headroom = process_headroom < machine_available ? process_headroom : machine_available;
+        bool reserve_fits = estimate <= headroom &&
+                            ec->admission_active_reserved_bytes <= headroom - estimate;
+        if (reserve_fits) {
+            ec->admission_active_reserved_bytes += estimate;
+            if (ec->admission_active_reserved_bytes > ec->admission_peak_reserved_bytes) {
+                ec->admission_peak_reserved_bytes = ec->admission_active_reserved_bytes;
+            }
+            ec->admission_active_files++;
+            token->reserved_bytes = estimate;
+            token->rss_before = rss;
+            token->held = true;
+            cbm_mutex_unlock(&ec->admission_mu);
+            return true;
+        }
+
+        if (ec->admission_active_files == 0) {
+            ec->admission_failed = true;
+            extract_admission_log_refusal(file, "CBM_EXTRACTION_MEMORY_ADMISSION_REFUSED", estimate,
+                                          process_headroom, machine_available);
+            cbm_cond_broadcast(&ec->admission_cv);
+            cbm_mutex_unlock(&ec->admission_mu);
+            return false;
+        }
+        atomic_fetch_add_explicit(&ec->admission_waits, 1, memory_order_relaxed);
+        cbm_cond_wait(&ec->admission_cv, &ec->admission_mu);
+    }
+}
+
+static size_t extract_admission_ratio(size_t observed_bytes, size_t source_bytes) {
+    if (source_bytes == 0 || observed_bytes == 0) {
+        return 1;
+    }
+    size_t quotient = observed_bytes / source_bytes;
+    size_t remainder = observed_bytes % source_bytes;
+    if (remainder != 0 && quotient < SIZE_MAX) {
+        quotient++;
+    }
+    return quotient > 0 ? quotient : 1;
+}
+
+static void extract_admission_release(extract_ctx_t *ec, extract_admission_t *token,
+                                      size_t parse_rss, size_t retained_bytes) {
+    if (!ec || !token || !token->held) {
+        return;
+    }
+    cbm_mutex_lock(&ec->admission_mu);
+    if (token->reserved_bytes > ec->admission_active_reserved_bytes ||
+        ec->admission_active_files <= 0) {
+        ec->admission_failed = true;
+        cbm_log_error("parallel.extract.admission.invariant", "code",
+                      "CBM_EXTRACTION_MEMORY_RESERVATION_INVARIANT", "message",
+                      "the extraction memory reservation accounting became inconsistent",
+                      "remediation", "inspect the exact admission acquire/release pair and retry");
+    } else {
+        ec->admission_active_reserved_bytes -= token->reserved_bytes;
+        ec->admission_active_files--;
+    }
+
+    size_t observed_growth = parse_rss > token->rss_before ? parse_rss - token->rss_before : 0;
+    size_t observed = observed_growth > retained_bytes ? observed_growth : retained_bytes;
+    size_t measured_amplification = extract_admission_ratio(observed, token->source_bytes);
+    if (token->calibration) {
+        ec->admission_amplification = measured_amplification;
+        ec->admission_calibrating = false;
+        ec->admission_calibrated = true;
+        char source_buf[CBM_SZ_32];
+        char observed_buf[CBM_SZ_32];
+        char factor_buf[CBM_SZ_32];
+        snprintf(source_buf, sizeof(source_buf), "%zu", token->source_bytes);
+        snprintf(observed_buf, sizeof(observed_buf), "%zu", observed);
+        snprintf(factor_buf, sizeof(factor_buf), "%zu", ec->admission_amplification);
+        cbm_log_info("parallel.extract.admission.calibrated", "source_bytes", source_buf,
+                     "observed_bytes", observed_buf, "amplification", factor_buf);
+    } else if (measured_amplification > ec->admission_amplification) {
+        ec->admission_amplification = measured_amplification;
+    }
+    token->held = false;
+    cbm_cond_broadcast(&ec->admission_cv);
+    cbm_mutex_unlock(&ec->admission_mu);
 }
 
 static void extract_worker(int worker_id, void *ctx_ptr) {
@@ -927,32 +992,39 @@ static void extract_worker(int worker_id, void *ctx_ptr) {
         const cbm_file_info_t *fi = &ec->files[file_idx];
         pp_err_list_t *errs = ec->err_lists ? &ec->err_lists[worker_id] : NULL;
 
-        /* Read + extract */
-        int source_len = 0;
-        long file_size = 0;
-        cbm_read_status_t rst = CBM_READ_OK;
-        char *source = read_file(fi->path, &source_len, &file_size, &rst);
-        if (!source) {
+        extract_admission_t admission;
+        if (!extract_admission_acquire(ec, sort_pos, fi, &admission)) {
+            pp_err_add(errs, fi->rel_path,
+                       "memory admission refused (CBM_EXTRACTION_MEMORY_ADMISSION_REFUSED)",
+                       "admission");
             ws->errors++;
-            if (rst == CBM_READ_OVERSIZED) {
-                /* Never a silent drop: record the oversized terminal failure
-                 * and emit a throttled diagnostic with its sizes. */
-                long cap = cbm_max_file_bytes();
-                char reason[96];
-                snprintf(reason, sizeof(reason), "oversized (%lld MB > %lld MB)",
-                         (long long)(file_size / (CBM_SZ_1K * CBM_SZ_1K)),
-                         (long long)(cap / (CBM_SZ_1K * CBM_SZ_1K)));
-                pp_err_add(errs, fi->rel_path, reason, "oversized");
-                if (atomic_fetch_add_explicit(&ec->oversized_warned, SKIP_ONE,
-                                              memory_order_relaxed) < PP_OVERSIZED_WARN_MAX) {
-                    cbm_log_warn("index.file_oversized", "path", fi->rel_path, "size_mb",
-                                 itoa_log((int)(file_size / (CBM_SZ_1K * CBM_SZ_1K))), "cap_mb",
-                                 itoa_log((int)(cap / (CBM_SZ_1K * CBM_SZ_1K))));
-                }
-            } else if (rst == CBM_READ_OPEN_FAIL || rst == CBM_READ_OOM) {
-                pp_err_add(errs, fi->rel_path, "read failed", "read");
-            }
-            /* CBM_READ_EMPTY: benign 0-byte file — not reported. */
+            break;
+        }
+
+        /* Borrow the one verified immutable source entry. Extraction is never
+         * permitted to reopen the snapshot or manufacture a substitute. */
+        size_t source_size = 0;
+        const uint8_t *source_bytes =
+            cbm_source_slab_get(ec->source_slab, file_idx, &source_size);
+        if (!source_bytes || source_size > (size_t)INT_MAX || source_size != (size_t)fi->size) {
+            cbm_log_error(
+                "parallel.extract.source_refused", "code", "CBM_EXTRACTION_SOURCE_SLAB_INVALID",
+                "path", fi->rel_path ? fi->rel_path : "", "message",
+                "the extraction source entry is absent, malformed, or differs from the captured "
+                "file size",
+                "remediation",
+                "preserve the source-slab diagnostic and retry the complete unchanged corpus");
+            ws->errors++;
+            pp_err_add(errs, fi->rel_path,
+                       "source slab entry invalid (CBM_EXTRACTION_SOURCE_SLAB_INVALID)",
+                       "source_slab");
+            extract_admission_release(ec, &admission, cbm_mem_rss(), 0);
+            break;
+        }
+        int source_len = (int)source_size;
+        const char *source = (const char *)source_bytes;
+        if (source_len == 0) {
+            extract_admission_release(ec, &admission, cbm_mem_rss(), 0);
             continue;
         }
 
@@ -966,7 +1038,7 @@ static void extract_worker(int worker_id, void *ctx_ptr) {
         uint64_t file_t0 = extract_now_ns();
 
         const char *rust_edition = cbm_cargo_edition_for_path(ec->rust_manifest, fi->rel_path);
-        CBMFileResult *result = cbm_extract_file_at_path_with_metadata(
+        CBMFileResult *result = cbm_extract_file_at_path_with_metadata_borrow_source(
             source, source_len, fi->language, ec->project_name, fi->rel_path, fi->path,
             rust_edition, cbm_cargo_is_crate_root(ec->rust_manifest, fi->rel_path),
             fi->structured_classification[0] ? fi->structured_classification : NULL,
@@ -975,14 +1047,51 @@ static void extract_worker(int worker_id, void *ctx_ptr) {
                 : NULL,
             CBM_EXTRACT_BUDGET, NULL, NULL);
 
+        /* Read the live process source of truth while the parse tree and parser
+         * allocations are still resident. The exclusive first file uses this
+         * observation to calibrate the source-to-memory admission ratio. */
+        size_t parse_rss = cbm_mem_rss();
+
         uint64_t file_elapsed_ms = (extract_now_ns() - file_t0) / PP_USEC_PER_MS;
 
         if (!result) {
             log_extract_fail(sort_pos, file_elapsed_ms, fi->rel_path);
-            free_source(source);
             ws->errors++;
             pp_err_add(errs, fi->rel_path, "extract failed", "extract");
+            cbm_destroy_thread_parser();
+            cbm_slab_reclaim();
+            cbm_mem_collect();
+            extract_admission_release(ec, &admission, parse_rss, 0);
             continue;
+        }
+
+        if (!result->has_error) {
+            (void)cbm_file_result_compact_arrays(result);
+        }
+        size_t result_arena_bytes = result->arena.total_alloc;
+        size_t result_array_bytes = cbm_file_result_array_bytes(result);
+        atomic_fetch_add_explicit(&ec->retained_arena_bytes, (uint64_t)result_arena_bytes,
+                                  memory_order_relaxed);
+        atomic_fetch_add_explicit(&ec->retained_array_bytes, (uint64_t)result_array_bytes,
+                                  memory_order_relaxed);
+        {
+            char source_text[32];
+            char parse_rss_text[32];
+            char arena_text[32];
+            char arrays_text[32];
+            char reserved_text[32];
+            char elapsed_text[32];
+            snprintf(source_text, sizeof(source_text), "%zu", source_size);
+            snprintf(parse_rss_text, sizeof(parse_rss_text), "%zu", parse_rss);
+            snprintf(arena_text, sizeof(arena_text), "%zu", result_arena_bytes);
+            snprintf(arrays_text, sizeof(arrays_text), "%zu", result_array_bytes);
+            snprintf(reserved_text, sizeof(reserved_text), "%zu", admission.reserved_bytes);
+            snprintf(elapsed_text, sizeof(elapsed_text), "%llu",
+                     (unsigned long long)file_elapsed_ms);
+            cbm_log_info("parallel.extract.file.memory", "path", fi->rel_path ? fi->rel_path : "",
+                         "source_bytes", source_text, "parse_rss_bytes", parse_rss_text,
+                         "retained_arena_bytes", arena_text, "retained_array_bytes", arrays_text,
+                         "reserved_bytes", reserved_text, "elapsed_ms", elapsed_text);
         }
         log_extract_done(sort_pos, file_elapsed_ms, result->defs.count, fi->rel_path);
 
@@ -999,11 +1108,12 @@ static void extract_worker(int worker_id, void *ctx_ptr) {
         for (int d = 0; d < result->defs.count; d++) {
             CBMDefinition *def = &result->defs.items[d];
             if (def->qualified_name && def->name) {
-                insert_def_into_gbuf(ws, fi, &result->calls, def);
+                insert_def_into_gbuf(ws, fi, &result->calls, def, source_bytes, source_size);
             }
         }
         for (int d = 0; d < result->diagnostics.count; d++) {
-            insert_diagnostic_into_gbuf(ws, fi, ec->project_name, &result->diagnostics.items[d]);
+            insert_diagnostic_into_gbuf(ws, fi, ec->project_name,
+                                        &result->diagnostics.items[d], source_bytes, source_size);
         }
         ws->parse_recovery_diagnostics += (uint_least64_t)result->diagnostics.count;
 
@@ -1011,51 +1121,6 @@ static void extract_worker(int worker_id, void *ctx_ptr) {
          * This makes slab reset safe: tree-sitter's internal nodes (in slab)
          * are released before the slab is bulk-reclaimed. */
         cbm_free_tree(result);
-
-        /* Retain source bytes in result->arena so the fused cross-file LSP
-         * step in resolve_worker can re-parse without re-reading from disk.
-         * Bounded per-file (retain_per_file_max_bytes) and by a project-wide
-         * budget (retain_total_budget_bytes) to bound peak RSS — see the
-         * retention-cap comment at the top of this file. A file DROPPED here
-         * is NOT lost to cross-file resolution: resolve_worker re-reads it on
-         * demand (bounded, freed immediately). WARN once per run so the
-         * operator knows retention was capped (index.retain_capped). */
-        if (ec->retain_sources && source_len > 0) {
-            bool dropped = false;
-            if ((size_t)source_len > ec->retain_per_file_max_bytes) {
-                dropped = true; /* over the per-file cap */
-            } else {
-                int64_t prior = atomic_fetch_add_explicit(&ec->retained_bytes, (int64_t)source_len,
-                                                          memory_order_relaxed);
-                if ((size_t)(prior + (int64_t)source_len) <= ec->retain_total_budget_bytes) {
-                    char *copy = (char *)cbm_arena_alloc(&result->arena, (size_t)source_len + 1);
-                    if (copy) {
-                        memcpy(copy, source, (size_t)source_len);
-                        copy[source_len] = '\0';
-                        result->source = copy;
-                        result->source_len = source_len;
-                    } else {
-                        /* Arena OOM — not a cap drop; re-read still covers
-                         * cross-file resolution, so don't emit the WARN. */
-                        atomic_fetch_sub_explicit(&ec->retained_bytes, (int64_t)source_len,
-                                                  memory_order_relaxed);
-                    }
-                } else {
-                    atomic_fetch_sub_explicit(&ec->retained_bytes, (int64_t)source_len,
-                                              memory_order_relaxed);
-                    dropped = true; /* project-wide budget exhausted */
-                }
-            }
-            if (dropped &&
-                atomic_exchange_explicit(&ec->retain_cap_warned, 1, memory_order_relaxed) == 0) {
-                cbm_log_warn("index.retain_capped", "path", fi->rel_path ? fi->rel_path : "?",
-                             "bytes", itoa_log((int)source_len));
-            }
-        }
-
-        /* Free source buffer — extraction captured everything needed,
-         * and the retention copy (if any) lives in result->arena. */
-        free_source(source);
 
         /* Cache result (arena + extracted data, no tree) for Phase 3B and Phase 4 */
         ec->result_cache[file_idx] = result;
@@ -1081,6 +1146,8 @@ static void extract_worker(int worker_id, void *ctx_ptr) {
         cbm_destroy_thread_parser();
         cbm_slab_reclaim();
         cbm_mem_collect();
+        extract_admission_release(ec, &admission, parse_rss,
+                                  result_arena_bytes + result_array_bytes);
     }
 
     /* Final cleanup (parser already destroyed in loop, just slab state) */
@@ -1140,13 +1207,19 @@ static int reject_invalid_parallel_worker_count(const char *operation, int worke
     return CBM_NOT_FOUND;
 }
 
-int cbm_parallel_extract_ex(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, int file_count,
-                            CBMFileResult **result_cache, _Atomic int64_t *shared_ids,
-                            int worker_count, const cbm_parallel_extract_opts_t *opts) {
-    cbm_parallel_extract_opts_t resolved_opts = cbm_parallel_extract_resolve_opts(opts);
-
+int cbm_parallel_extract(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, int file_count,
+                         CBMFileResult **result_cache, _Atomic int64_t *shared_ids,
+                         int worker_count) {
     if (file_count == 0) {
         return 0;
+    }
+    if (!ctx || !ctx->source_slab || ctx->source_slab->file_count != file_count) {
+        cbm_log_error("parallel.extract.source_refused", "code",
+                      "CBM_EXTRACTION_SOURCE_SLAB_INVALID", "message",
+                      "the parallel extraction source slab is absent or has the wrong file count",
+                      "remediation",
+                      "build and verify the complete immutable source slab before extraction");
+        return CBM_NOT_FOUND;
     }
     if (worker_count <= 0) {
         return reject_invalid_parallel_worker_count("parallel_extract", worker_count);
@@ -1154,13 +1227,8 @@ int cbm_parallel_extract_ex(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *file
 
     cbm_log_info("parallel.extract.start", "files", itoa_log(file_count), "workers",
                  itoa_log(worker_count));
-    {
-        size_t mb = (size_t)CBM_SZ_1K * CBM_SZ_1K;
-        cbm_log_info("parallel.extract.retention", "retain_sources",
-                     resolved_opts.retain_sources ? "true" : "false", "total_mb",
-                     itoa_log((int)(resolved_opts.retain_total_budget_bytes / mb)), "per_file_mb",
-                     itoa_log((int)(resolved_opts.retain_per_file_max_bytes / mb)));
-    }
+    cbm_log_info("parallel.extract.source_slab", "files", itoa_log(ctx->source_slab->file_count),
+                 "sha256", ctx->source_slab->sha256);
 
     /* Log per-worker memory budget */
     if (cbm_mem_budget() > 0) {
@@ -1232,16 +1300,16 @@ int cbm_parallel_extract_ex(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *file
         .shared_ids = shared_ids,
         .cancelled = ctx->cancelled,
         .err_lists = err_lists,
-        .retain_sources = resolved_opts.retain_sources,
-        .retain_total_budget_bytes = resolved_opts.retain_total_budget_bytes,
-        .retain_per_file_max_bytes = resolved_opts.retain_per_file_max_bytes,
+        .source_slab = ctx->source_slab,
     };
     atomic_init(&ec.next_worker_id, 0);
     atomic_init(&ec.next_file_idx, 0);
-    atomic_init(&ec.retained_bytes, 0);
-    atomic_init(&ec.retain_cap_warned, 0);
-    atomic_init(&ec.oversized_warned, 0);
     atomic_init(&ec.bp_futile, 0);
+    atomic_init(&ec.admission_waits, 0);
+    atomic_init(&ec.retained_arena_bytes, 0);
+    atomic_init(&ec.retained_array_bytes, 0);
+    cbm_mutex_init(&ec.admission_mu);
+    cbm_cond_init(&ec.admission_cv);
 
     /* Sub-phase: Dispatch workers (parse + extract per file, PARALLEL) */
     CBM_PROF_START(t_dispatch);
@@ -1255,6 +1323,8 @@ int cbm_parallel_extract_ex(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *file
         cbm_parallel_for(worker_count, extract_worker, &ec, parallel_opts, &dispatch_result);
     record_worker_pool_dispatch(ctx ? ctx->pipeline : NULL, &dispatch_result);
     CBM_PROF_END_N("parallel_extract", "3_dispatch_workers_parallel", t_dispatch, file_count);
+    cbm_cond_destroy(&ec.admission_cv);
+    cbm_mutex_destroy(&ec.admission_mu);
     if (dispatch_rc != 0) {
         if (err_lists) {
             for (int i = 0; i < worker_count; i++) {
@@ -1336,16 +1406,39 @@ int cbm_parallel_extract_ex(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *file
 
     log_extract_mem_stats(worker_count);
 
+    {
+        char amplification[CBM_SZ_32];
+        char peak_reserved[CBM_SZ_32];
+        char waits[CBM_SZ_32];
+        snprintf(amplification, sizeof(amplification), "%zu", ec.admission_amplification);
+        snprintf(peak_reserved, sizeof(peak_reserved), "%zu",
+                 ec.admission_peak_reserved_bytes);
+        snprintf(waits, sizeof(waits), "%d",
+                 atomic_load_explicit(&ec.admission_waits, memory_order_relaxed));
+        cbm_log_info("parallel.extract.admission", "amplification", amplification,
+                     "peak_reserved_bytes", peak_reserved, "waits", waits, "failed",
+                     ec.admission_failed ? "true" : "false");
+    }
+
+    {
+        char source_slab_bytes[CBM_SZ_32];
+        char arena_bytes[CBM_SZ_32];
+        char array_bytes[CBM_SZ_32];
+        snprintf(source_slab_bytes, sizeof(source_slab_bytes), "%zu",
+                 ctx->source_slab->allocated_bytes);
+        snprintf(arena_bytes, sizeof(arena_bytes), "%llu",
+                 (unsigned long long)atomic_load_explicit(&ec.retained_arena_bytes,
+                                                          memory_order_relaxed));
+        snprintf(array_bytes, sizeof(array_bytes), "%llu",
+                 (unsigned long long)atomic_load_explicit(&ec.retained_array_bytes,
+                                                          memory_order_relaxed));
+        cbm_log_info("parallel.extract.retained", "source_slab_bytes", source_slab_bytes,
+                     "result_arena_bytes", arena_bytes, "result_array_bytes", array_bytes);
+    }
+
     cbm_log_info("parallel.extract.done", "nodes", itoa_log(total_nodes), "errors",
                  itoa_log(total_errors));
     return 0;
-}
-
-int cbm_parallel_extract(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, int file_count,
-                         CBMFileResult **result_cache, _Atomic int64_t *shared_ids,
-                         int worker_count) {
-    return cbm_parallel_extract_ex(ctx, files, file_count, result_cache, shared_ids, worker_count,
-                                   NULL);
 }
 
 /* ── Phase 3B: Serial Registry Build ─────────────────────────────── */
@@ -1577,6 +1670,7 @@ typedef struct __attribute__((aligned(CBM_CACHE_LINE))) {
 typedef struct {
     const cbm_file_info_t *files;
     int file_count;
+    const cbm_source_slab_t *source_slab;
     const char *project_name;
     const char *repo_path;
 
@@ -1609,19 +1703,8 @@ typedef struct {
     CBMCrossLspRegistries *cross_registries;
     const CBMCargoManifest *rust_manifest;
 
-    /* F4: LAZILY-built shared Rust registry (built ONCE, on the first NULL-filter
-     * rust file — the ~all_defs amplifier files). Not eager: repos whose rust files
-     * all filter to subsets never pay the O(all_defs) build + multi-GB RSS. Built
-     * under rust_shared_mu into rust_shared_arena, published via rust_shared_reg;
-     * torn down after the worker dispatch. */
-    _Atomic(CBMTypeRegistry *) rust_shared_reg;
-    cbm_mutex_t rust_shared_mu;
-    CBMArena rust_shared_arena;
-    bool rust_shared_arena_live;
-
     /* Counters for parallel.resolve.lsp_cross_done summary. */
     _Atomic int lsp_cross_processed;
-    _Atomic int lsp_cross_skipped_no_source;
 
     /* Per-sub-phase timing (ns aggregated across workers) — surfaces
      * exactly where parallel_resolve's wall time is spent so we stop
@@ -2893,40 +2976,6 @@ static void resolve_file_semantic(resolve_ctx_t *rc, resolve_worker_state_t *ws,
     }
 }
 
-/* F4: get (or lazily build ONCE) the shared all_defs Rust registry. Called by the
- * first worker that hits a NULL-filter rust file; later null-files reuse it. Fast
- * path is a lock-free atomic load; the build happens under rust_shared_mu into the
- * dedicated rust_shared_arena (never a shared pipeline arena from a worker thread).
- * Returns NULL if there are no defs (caller falls back to the per-file build). */
-static CBMTypeRegistry *pp_rust_shared_registry(resolve_ctx_t *rc) {
-    CBMTypeRegistry *p = atomic_load_explicit(&rc->rust_shared_reg, memory_order_acquire);
-    if (p)
-        return p;
-    if (!rc->all_defs || rc->def_count <= 0)
-        return NULL;
-    cbm_mutex_lock(&rc->rust_shared_mu);
-    p = atomic_load_explicit(&rc->rust_shared_reg, memory_order_relaxed);
-    if (!p) {
-        cbm_arena_init(&rc->rust_shared_arena);
-        rc->rust_shared_arena_live = true;
-        p = cbm_rust_build_cross_registry(&rc->rust_shared_arena, rc->all_defs, rc->def_count);
-        if (p) {
-            char sb[96];
-            snprintf(sb, sizeof(sb), "types=%d funcs=%d", p->type_count, p->func_count);
-            cbm_log_info("cross_lsp.rust_registry", "scale", sb);
-        }
-        atomic_store_explicit(&rc->rust_shared_reg, p, memory_order_release);
-    }
-    cbm_mutex_unlock(&rc->rust_shared_mu);
-    return p;
-}
-
-/* void*-typed adapter so the shared dispatch helper (pass_lsp_cross.c) can
- * borrow the lazily-built shared Rust registry without knowing resolve_ctx_t. */
-static CBMTypeRegistry *pp_rust_shared_registry_get(void *ctx) {
-    return pp_rust_shared_registry((resolve_ctx_t *)ctx);
-}
-
 static void resolve_worker(int worker_id, void *ctx_ptr) {
     resolve_ctx_t *rc = ctx_ptr;
     resolve_worker_state_t *ws = &rc->workers[worker_id];
@@ -2934,6 +2983,15 @@ static void resolve_worker(int worker_id, void *ctx_ptr) {
     if (!ws->local_edge_buf) {
         ws->local_edge_buf =
             cbm_gbuf_new_shared_ids(rc->project_name, rc->repo_path, rc->shared_ids);
+        if (!ws->local_edge_buf) {
+            cbm_log_error("parallel.resolve.failed", "code", "CBM_RESOLVE_GRAPH_ALLOC_FAILED",
+                          "component", "parallel.resolve.worker_graph", "operation", "allocate",
+                          "message", "resolve worker graph allocation failed", "remediation",
+                          "free memory or reduce repository size, then retry");
+            ws->errors++;
+            atomic_store_explicit(rc->cancelled, SKIP_ONE, memory_order_relaxed);
+            return;
+        }
     }
 
     /* Per-worker service-pattern result cache. The same resolved QN
@@ -2970,24 +3028,6 @@ static void resolve_worker(int worker_id, void *ctx_ptr) {
         CBMLanguage lang = rc->files[file_idx].language;
         const char *rel = rc->files[file_idx].rel_path;
 
-        /* Skip cross-LSP for machine-generated files — they're huge (10k-
-         * 70k lines for k8s protobuf/openapi), have low semantic value for
-         * graph navigation (boilerplate getters/setters/marshal), and
-         * dominate the cross-LSP wall time when they have even one
-         * unresolved call (tree-sitter parse on a 70k-line file is ~1-2s).
-         * The per-file LSP during extract still indexes their defs/calls
-         * normally — only the cross-file resolution refinement is skipped. */
-        bool is_generated = false;
-        if (rel) {
-            is_generated =
-                (strstr(rel, ".pb.go") != NULL) || (strstr(rel, "zz_generated") != NULL) ||
-                (strstr(rel, "_generated.go") != NULL) || (strstr(rel, ".gen.go") != NULL) ||
-                (strstr(rel, "/applyconfigurations/") != NULL) ||
-                (strstr(rel, "_pb2.py") != NULL) || (strstr(rel, "_pb2_grpc.py") != NULL) ||
-                (strstr(rel, ".pb.cc") != NULL) || (strstr(rel, ".pb.h") != NULL) ||
-                (strstr(rel, ".pb-c.c") != NULL) || (strstr(rel, ".pb-c.h") != NULL);
-        }
-
         /* Cross-file LSP is a per-file tree-sitter re-parse + AST walk +
          * registry lookups — ~50-150ms per file. It can ONLY find calls
          * that exist in the AST. If the per-file extract found zero calls,
@@ -3000,9 +3040,8 @@ static void resolve_worker(int worker_id, void *ctx_ptr) {
         bool jvm_cross_lsp = (lang == CBM_LANG_JAVA || lang == CBM_LANG_KOTLIN);
         bool cross_lsp_eligible =
             (rc->all_defs && rc->def_count > 0 && cbm_pxc_has_cross_lsp(lang) &&
-             result->calls.count > 0 &&
-             (jvm_cross_lsp || result->resolved_calls.count < result->calls.count) &&
-             !is_generated);
+              result->calls.count > 0 &&
+              (jvm_cross_lsp || result->resolved_calls.count < result->calls.count));
 
         /* Skip files with nothing else to resolve and no cross-LSP work. */
         if (result->calls.count == 0 && result->usages.count == 0 && result->throws.count == 0 &&
@@ -3059,77 +3098,98 @@ static void resolve_worker(int worker_id, void *ctx_ptr) {
 
         char *module_qn =
             cbm_pipeline_fqn_module_dir(rc->project_name, rel, pp_module_is_dir(lang));
+        if (!module_qn) {
+            cbm_log_error("parallel.resolve.failed", "code", "CBM_RESOLVE_MODULE_ALLOC_FAILED",
+                          "component", "parallel.resolve.module", "operation", "qualify", "path",
+                          rel ? rel : "", "message", "module identity allocation failed",
+                          "remediation", "free memory or reduce repository size, then retry");
+            ws->errors++;
+            atomic_store_explicit(rc->cancelled, SKIP_ONE, memory_order_relaxed);
+            cbm_registry_reach_cache_end();
+            cbm_registry_import_map_cache_end();
+            cbm_registry_resolve_cache_end();
+            cbm_pipeline_import_map_free(imp_keys, imp_vals, imp_count);
+            break;
+        }
 
         /* ── Cross-file LSP (FUSED) ─────────────────────────────
          * Runs BEFORE resolve_file_calls so its additions to
          * result->resolved_calls are picked up by
          * cbm_pipeline_find_lsp_resolution when calls become CALLS
-         * edges. Prefers source bytes retained in result->arena during
-         * extract; when the low-RAM retention cap dropped this file
-         * (result->source==NULL) it FALLS BACK to a bounded per-file
-         * read from disk, freed immediately after the LSP call. This is
-         * the correctness guarantee: lowering the retention cap trades
-         * retained RAM for a bounded re-read, it NEVER drops a cross-file
-         * edge. Only a genuine read failure (deleted/unreadable/oversized)
-         * leaves source NULL and is counted as skipped_no_source; defs/calls
-         * already in the extract are unaffected either way.
+         * edges. It borrows the exact same hash-bound source slab entry used
+         * by File atom creation and extraction. A missing or malformed entry
+         * is a terminal generation error; source is never reread or degraded.
          *
          * Slab reclaim afterward: the LSP re-parses via tree-sitter,
          * which allocates through this worker's TLS slab. Reclaiming
          * here keeps the slab high-water bounded as the resolve phase
          * walks across thousands of files in a single worker thread. */
         if (cross_lsp_eligible) {
-            char *lsp_source_owned = NULL;
-            const char *lsp_source = result->source;
-            int lsp_source_len = result->source_len;
-            if ((!lsp_source || lsp_source_len <= 0) && rc->files[file_idx].path) {
-                /* Retention cap skipped this file — re-read on demand (bounded
-                 * by read_file's cbm_max_file_bytes cap), freed below. */
-                lsp_source_owned = read_file(rc->files[file_idx].path, &lsp_source_len, NULL, NULL);
-                lsp_source = lsp_source_owned;
+            size_t lsp_source_size = 0;
+            const uint8_t *lsp_source_bytes =
+                cbm_source_slab_get(rc->source_slab, file_idx, &lsp_source_size);
+            if (!lsp_source_bytes || lsp_source_size == 0 || lsp_source_size > (size_t)INT_MAX ||
+                lsp_source_size != (size_t)rc->files[file_idx].size) {
+                cbm_log_error(
+                    "parallel.resolve.source_refused", "code", "CBM_RESOLVE_SOURCE_SLAB_INVALID",
+                    "path", rel ? rel : "", "message",
+                    "the cross-file resolver source entry is absent, malformed, or has a changed "
+                    "length",
+                    "remediation",
+                    "preserve the source-slab diagnostic and retry the complete unchanged corpus");
+                ws->errors++;
+                atomic_store_explicit(rc->cancelled, SKIP_ONE, memory_order_relaxed);
+                cbm_registry_reach_cache_end();
+                cbm_registry_import_map_cache_end();
+                cbm_registry_resolve_cache_end();
+                free(module_qn);
+                cbm_pipeline_import_map_free(imp_keys, imp_vals, imp_count);
+                break;
             }
-            if (lsp_source && lsp_source_len > 0) {
-                const char *def_module = rc->def_modules ? rc->def_modules[file_idx] : module_qn;
+            const char *lsp_source = (const char *)lsp_source_bytes;
+            int lsp_source_len = (int)lsp_source_size;
+            const char *def_module = rc->def_modules ? rc->def_modules[file_idx] : module_qn;
 
-                uint64_t lsp_t0 = extract_now_ns();
+            uint64_t lsp_t0 = extract_now_ns();
 
-                /* Shared per-file dispatch (pass_lsp_cross.c): module-def
-                 * filter → shared prebuilt registry (overlay pattern) →
-                 * filtered per-file fallback. The SAME helper drives the
-                 * sequential pass — one path, one semantics. */
-                cbm_pxc_dispatch_file(lang, result, lsp_source, lsp_source_len, rel, def_module,
-                                      rc->cross_registries, rc->module_def_index, rc->all_defs,
-                                      rc->def_count, imp_keys, imp_vals, imp_count,
-                                      pp_rust_shared_registry_get, rc, rc->rust_manifest);
-                /* Free the on-demand re-read (no-op when source was retained). */
-                free_source(lsp_source_owned);
-                /* Contract: cbm_slab_reclaim() requires the thread parser to be
-                 * destroyed first; otherwise its lexer holds slab pointers
-                 * (lexer.included_ranges) that get freed underneath it, causing
-                 * a heap-use-after-free on the next ts_lexer_goto. The next
-                 * cbm_extract_file on this thread will recreate the parser. */
-                cbm_destroy_thread_parser();
-                cbm_slab_reclaim();
-                uint64_t lsp_elapsed_ns = extract_now_ns() - lsp_t0;
-                atomic_fetch_add_explicit(&rc->time_ns_cross_lsp, lsp_elapsed_ns,
-                                          memory_order_relaxed);
-                uint64_t lsp_elapsed_ms = lsp_elapsed_ns / PP_USEC_PER_MS;
-                if (lsp_elapsed_ms > PP_TIMER_THRESH) {
-                    cbm_log_info("parallel.resolve.lsp_cross.slow", "elapsed_ms",
-                                 itoa_log((int)lsp_elapsed_ms), "path", rel);
-                }
-                atomic_fetch_add_explicit(&rc->lsp_cross_processed, SKIP_ONE, memory_order_relaxed);
-            } else {
-                /* Source unavailable even after the re-read fallback (file
-                 * deleted / unreadable / oversized) → the cross-file LSP
-                 * refinement no-ops for this file. This is a bounded skip, NOT
-                 * a file failure: defs/calls were already extracted and are
-                 * unaffected. Deliberately NOT recorded as a cbm_file_error —
-                 * doing so would flood skipped[] with false positives (itself a
-                 * false-guard bug). The "cross_lsp" phase string is reserved for
-                 * Track C's real crash-attribution signal; leave it unwired. */
-                atomic_fetch_add_explicit(&rc->lsp_cross_skipped_no_source, SKIP_ONE,
-                                          memory_order_relaxed);
+            /* Shared per-file dispatch: module-def filtering and shared
+             * registries preserve the complete cross-file semantics. */
+            int lsp_status = cbm_pxc_dispatch_file(
+                lang, result, lsp_source, lsp_source_len, rel, def_module, rc->cross_registries,
+                rc->module_def_index, rc->all_defs, rc->def_count, imp_keys, imp_vals, imp_count,
+                rc->rust_manifest);
+            /* Contract: destroy the thread parser before slab allocator reclaim. */
+            cbm_destroy_thread_parser();
+            cbm_slab_reclaim();
+            uint64_t lsp_elapsed_ns = extract_now_ns() - lsp_t0;
+            atomic_fetch_add_explicit(&rc->time_ns_cross_lsp, lsp_elapsed_ns,
+                                      memory_order_relaxed);
+            uint64_t lsp_elapsed_ms = lsp_elapsed_ns / PP_USEC_PER_MS;
+            if (lsp_elapsed_ms > PP_TIMER_THRESH) {
+                cbm_log_info("parallel.resolve.lsp_cross.slow", "elapsed_ms",
+                             itoa_log((int)lsp_elapsed_ms), "path", rel);
+            }
+            atomic_fetch_add_explicit(&rc->lsp_cross_processed, SKIP_ONE, memory_order_relaxed);
+            if (lsp_status != 0 || cbm_arena_failed(&result->arena)) {
+                cbm_log_error("parallel.resolve.failed", "code",
+                              cbm_arena_failed(&result->arena)
+                                  ? cbm_arena_failure_code(&result->arena)
+                                  : "CBM_LSP_CROSS_DISPATCH_FAILED",
+                              "component", "parallel.resolve.lsp_cross", "operation",
+                              cbm_arena_failed(&result->arena)
+                                  ? cbm_arena_failure_operation(&result->arena)
+                                  : "dispatch",
+                              "path", rel ? rel : "", "message",
+                              "cross-file resolution failed before all associations were derived",
+                              "remediation", "inspect the structured cause and retry the complete corpus");
+                ws->errors++;
+                atomic_store_explicit(rc->cancelled, SKIP_ONE, memory_order_relaxed);
+                cbm_registry_reach_cache_end();
+                cbm_registry_import_map_cache_end();
+                cbm_registry_resolve_cache_end();
+                free(module_qn);
+                cbm_pipeline_import_map_free(imp_keys, imp_vals, imp_count);
+                break;
             }
         }
 
@@ -3203,6 +3263,14 @@ int cbm_parallel_resolve(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, 
     if (file_count == 0) {
         return 0;
     }
+    if (!ctx || !ctx->source_slab || ctx->source_slab->file_count != file_count) {
+        cbm_log_error("parallel.resolve.source_refused", "code",
+                      "CBM_RESOLVE_SOURCE_SLAB_INVALID", "message",
+                      "the parallel resolver source slab is absent or has the wrong file count",
+                      "remediation",
+                      "retain the verified immutable source slab through parallel resolution");
+        return CBM_NOT_FOUND;
+    }
     if (worker_count <= 0) {
         return reject_invalid_parallel_worker_count("parallel_resolve", worker_count);
     }
@@ -3220,6 +3288,7 @@ int cbm_parallel_resolve(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, 
     resolve_ctx_t rc = {
         .files = files,
         .file_count = file_count,
+        .source_slab = ctx->source_slab,
         .project_name = ctx->project_name,
         .repo_path = ctx->repo_path,
         .workers = workers,
@@ -3238,12 +3307,6 @@ int cbm_parallel_resolve(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, 
     };
     atomic_init(&rc.next_file_idx, 0);
     atomic_init(&rc.lsp_cross_processed, 0);
-    atomic_init(&rc.lsp_cross_skipped_no_source, 0);
-    /* F4 lazy shared Rust registry: mutex up before workers spawn. */
-    atomic_init(&rc.rust_shared_reg, NULL);
-    cbm_mutex_init(&rc.rust_shared_mu);
-    rc.rust_shared_arena_live = false;
-
     /* Sub-phase: Dispatch resolve workers (per-file call/usage resolution, PARALLEL) */
     CBM_PROF_START(t_resolve_dispatch);
     cbm_parallel_for_opts_t opts = {
@@ -3257,14 +3320,6 @@ int cbm_parallel_resolve(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, 
     record_worker_pool_dispatch(ctx ? ctx->pipeline : NULL, &dispatch_result);
     CBM_PROF_END_N("parallel_resolve", "1_dispatch_workers_parallel", t_resolve_dispatch,
                    file_count);
-    /* Workers joined: the shared Rust registry (if built) is no longer read.
-     * Free its dedicated arena + the lock (registry was self-contained: it strdup'd
-     * all QNs, so freeing all_defs afterward is safe). */
-    if (rc.rust_shared_arena_live) {
-        cbm_arena_destroy(&rc.rust_shared_arena);
-        rc.rust_shared_arena_live = false;
-    }
-    cbm_mutex_destroy(&rc.rust_shared_mu);
     if (dispatch_rc != 0) {
         for (int i = 0; i < worker_count; i++) {
             if (workers[i].local_edge_buf) {
@@ -3281,6 +3336,7 @@ int cbm_parallel_resolve(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, 
     int total_usages = 0;
     int total_semantic = 0;
     int total_lsp_overrides = 0;
+    int total_errors = 0;
     int total_reference_local_only = 0;
     int total_reference_member_without_type = 0;
     int total_reference_target_missing = 0;
@@ -3292,6 +3348,7 @@ int cbm_parallel_resolve(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, 
         total_reference_target_missing += workers[i].reference_target_missing;
         total_reference_ambiguous += workers[i].reference_ambiguous;
         total_reference_incompatible += workers[i].reference_incompatible;
+        total_errors += workers[i].errors;
         if (workers[i].local_edge_buf) {
             cbm_gbuf_merge(ctx->gbuf, workers[i].local_edge_buf);
             total_calls += workers[i].calls_resolved;
@@ -3314,19 +3371,14 @@ int cbm_parallel_resolve(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, 
      * Publish the greater post-join ceiling before cancellation or handoff. */
     cbm_parallel_rebase_shared_ids(ctx->gbuf, shared_ids, "parallel_resolve.post_merge");
 
-    if (atomic_load(ctx->cancelled)) {
+    if (atomic_load(ctx->cancelled) || total_errors > 0) {
         return CBM_NOT_FOUND;
     }
 
-    /* Summary metric that replaces the removed `pass.timing pass=lsp_cross`
-     * log line — surfaces how many files the fused cross-file LSP step
-     * actually processed vs skipped (e.g. because their source bytes
-     * were not retained at extract time due to the per-file/total cap). */
+    /* Cross-LSP coverage over the complete immutable source slab. */
     cbm_log_info(
         "parallel.resolve.lsp_cross_done", "files_processed",
         itoa_log(atomic_load_explicit(&rc.lsp_cross_processed, memory_order_relaxed)),
-        "files_skipped_no_source",
-        itoa_log(atomic_load_explicit(&rc.lsp_cross_skipped_no_source, memory_order_relaxed)),
         "defs_total", itoa_log(def_count));
 
     cbm_log_info("parallel.resolve.done", "calls", itoa_log(total_calls), "usages",

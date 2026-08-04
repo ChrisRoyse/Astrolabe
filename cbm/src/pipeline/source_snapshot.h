@@ -4,9 +4,27 @@
 #include "discover/discover.h"
 #include "store/store.h"
 
+#include <stddef.h>
+#include <stdint.h>
+
 typedef struct {
     char *root;
 } cbm_source_snapshot_t;
+
+/* One content-addressed, immutable in-memory view of the captured source
+ * corpus. Every entry is NUL-terminated for parsers that inspect text while
+ * its authoritative length remains byte-exact. Offsets follow the caller's
+ * file order, so no path lookup or per-consumer source copy is required. */
+typedef struct {
+    uint8_t *bytes;
+    size_t *offsets;
+    size_t *lengths;
+    size_t source_bytes;
+    size_t storage_bytes;
+    size_t allocated_bytes;
+    int file_count;
+    char sha256[65];
+} cbm_source_slab_t;
 
 /* Capture every discovered source/config input into one immutable, mirrored
  * snapshot and bind each file record to the captured bytes. All workers are
@@ -31,5 +49,18 @@ int cbm_source_snapshot_verify_unchanged(const char *repo_path, const cbm_discov
 /* Remove the exact unique snapshot tree. Returns non-zero if any derived file
  * remains; callers must fail the run rather than orphaning opaque state. */
 int cbm_source_snapshot_destroy(cbm_source_snapshot_t *snapshot);
+
+/* Read every immutable captured source exactly once, verify its recorded
+ * SHA-256, and publish one ordered source slab. The operation is atomic: on
+ * failure slab remains empty and no consumer can observe a partial corpus. */
+int cbm_source_slab_build(const cbm_file_info_t *files, int file_count,
+                          cbm_source_slab_t *slab);
+
+/* Borrow one immutable entry. Returns NULL for an invalid index or malformed
+ * slab; an exact empty source returns a non-NULL pointer with length zero. */
+const uint8_t *cbm_source_slab_get(const cbm_source_slab_t *slab, int file_index,
+                                   size_t *out_len);
+
+void cbm_source_slab_destroy(cbm_source_slab_t *slab);
 
 #endif

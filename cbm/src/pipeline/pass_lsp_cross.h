@@ -87,7 +87,8 @@ void cbm_pxc_free_module_def_index(CBMModuleDefIndex *idx);
  * `src/main/kotlin` roots without import statements. String fields inside
  * each entry are borrowed from the original all_defs[] arena (caller keeps
  * it alive). Caller frees the returned array with free(). Writes the entry
- * count to *out_count. Returns NULL if no matches (with *out_count = 0). */
+ * count to *out_count. Returns NULL if no matches (with *out_count = 0),
+ * or NULL after a structured allocation failure (with *out_count = -1). */
 CBMLSPDef *cbm_pxc_filter_defs_for_file(const CBMModuleDefIndex *idx, CBMLSPDef *all_defs,
                                         CBMLanguage caller_lang, const char *caller_namespace,
                                         const char *own_module, const char *const *imp_qns,
@@ -108,8 +109,7 @@ typedef struct {
     CBMTypeRegistry *ts;     /* CBM_LANG_JAVASCRIPT, TYPESCRIPT, TSX */
     CBMTypeRegistry *php;    /* CBM_LANG_PHP */
     CBMTypeRegistry *cs;     /* CBM_LANG_CSHARP */
-    /* CBM_LANG_RUST: intentionally absent — the shared rust registry is built
-     * LAZILY inside cbm_parallel_resolve (first NULL-filter rust file), not eagerly. */
+    CBMTypeRegistry *rust;   /* CBM_LANG_RUST */
 } CBMCrossLspRegistries;
 
 /* Return the appropriate pre-built registry for a language, or NULL
@@ -135,8 +135,10 @@ static inline CBMTypeRegistry *cbm_pxc_registry_for_lang(const CBMCrossLspRegist
         return r->php;
     case CBM_LANG_CSHARP:
         return r->cs;
+    case CBM_LANG_RUST:
+        return r->rust;
     default:
-        return NULL; /* incl. CBM_LANG_RUST — its shared registry is built lazily */
+        return NULL;
     }
 }
 
@@ -175,15 +177,13 @@ void cbm_pxc_run_one_ts(CBMFileResult *r, const char *source, int source_len, co
 /* Per-file cross-LSP dispatch shared by the parallel resolve worker AND the
  * sequential driver (one path = one semantics): module-def-index filter →
  * shared prebuilt registry (overlay pattern, no per-file registry build) →
- * per-file fallback with FILTERED defs for languages without a shared
- * variant. rust_shared_get (nullable) supplies the lazily-built shared Rust
- * registry for NULL-filter rust files. */
-void cbm_pxc_dispatch_file(CBMLanguage lang, CBMFileResult *result, const char *source,
-                           int source_len, const char *rel, const char *def_module,
-                           const CBMCrossLspRegistries *cross_registries,
-                           const CBMModuleDefIndex *module_def_index, CBMLSPDef *all_defs,
-                           int all_def_count, const char **imp_keys, const char **imp_vals,
-                           int imp_count, CBMTypeRegistry *(*rust_shared_get)(void *),
-                           void *rust_shared_ctx, const struct CBMCargoManifest *rust_manifest);
+ * the exact language-specific resolver for languages without a shared
+ * variant. Returns zero only when the complete dispatch succeeded. */
+int cbm_pxc_dispatch_file(CBMLanguage lang, CBMFileResult *result, const char *source,
+                          int source_len, const char *rel, const char *def_module,
+                          const CBMCrossLspRegistries *cross_registries,
+                          const CBMModuleDefIndex *module_def_index, CBMLSPDef *all_defs,
+                          int all_def_count, const char **imp_keys, const char **imp_vals,
+                          int imp_count, const struct CBMCargoManifest *rust_manifest);
 
 #endif /* CBM_PIPELINE_PASS_LSP_CROSS_H */

@@ -179,6 +179,24 @@ void cbm_mutex_destroy(cbm_mutex_t *m) {
     DeleteCriticalSection(&m->cs);
 }
 
+void cbm_cond_init(cbm_cond_t *c) {
+    InitializeConditionVariable(&c->cv);
+}
+
+void cbm_cond_wait(cbm_cond_t *c, cbm_mutex_t *m) {
+    if (!SleepConditionVariableCS(&c->cv, &m->cs, INFINITE)) {
+        abort();
+    }
+}
+
+void cbm_cond_broadcast(cbm_cond_t *c) {
+    WakeAllConditionVariable(&c->cv);
+}
+
+void cbm_cond_destroy(cbm_cond_t *c) {
+    (void)c;
+}
+
 #else /* POSIX */
 
 void cbm_mutex_init(cbm_mutex_t *m) {
@@ -195,6 +213,30 @@ void cbm_mutex_unlock(cbm_mutex_t *m) {
 
 void cbm_mutex_destroy(cbm_mutex_t *m) {
     pthread_mutex_destroy(&m->mtx);
+}
+
+void cbm_cond_init(cbm_cond_t *c) {
+    if (pthread_cond_init(&c->cv, NULL) != 0) {
+        abort();
+    }
+}
+
+void cbm_cond_wait(cbm_cond_t *c, cbm_mutex_t *m) {
+    if (pthread_cond_wait(&c->cv, &m->mtx) != 0) {
+        abort();
+    }
+}
+
+void cbm_cond_broadcast(cbm_cond_t *c) {
+    if (pthread_cond_broadcast(&c->cv) != 0) {
+        abort();
+    }
+}
+
+void cbm_cond_destroy(cbm_cond_t *c) {
+    if (pthread_cond_destroy(&c->cv) != 0) {
+        abort();
+    }
 }
 
 #endif

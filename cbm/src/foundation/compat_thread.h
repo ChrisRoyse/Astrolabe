@@ -60,11 +60,19 @@ typedef struct {
     CRITICAL_SECTION cs;
 } cbm_mutex_t;
 
+typedef struct {
+    CONDITION_VARIABLE cv;
+} cbm_cond_t;
+
 #else
 
 typedef struct {
     pthread_mutex_t mtx;
 } cbm_mutex_t;
+
+typedef struct {
+    pthread_cond_t cv;
+} cbm_cond_t;
 
 #endif
 
@@ -72,6 +80,15 @@ void cbm_mutex_init(cbm_mutex_t *m);
 void cbm_mutex_lock(cbm_mutex_t *m);
 void cbm_mutex_unlock(cbm_mutex_t *m);
 void cbm_mutex_destroy(cbm_mutex_t *m);
+
+/* Condition variable paired with cbm_mutex_t. Wait atomically releases the
+ * mutex and reacquires it before returning. These operations are infallible on
+ * Win32; POSIX failures abort because continuing would violate the caller's
+ * synchronization invariant. */
+void cbm_cond_init(cbm_cond_t *c);
+void cbm_cond_wait(cbm_cond_t *c, cbm_mutex_t *m);
+void cbm_cond_broadcast(cbm_cond_t *c);
+void cbm_cond_destroy(cbm_cond_t *c);
 
 /* ── Aligned allocation ───────────────────────────────────────── */
 
