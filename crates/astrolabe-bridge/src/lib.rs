@@ -2666,10 +2666,9 @@ fn compilation_context_for_repo(repo_path: &str) -> Result<Vec<u8>, BridgeError>
     let database_path = repo_root.join("compile_commands.json");
     if !database_path.exists() {
         // Bind absence to this exact repository instead of substituting the
-        // artifact's unrelated canonical context. The C pipeline checks its
-        // immutable discovered language set first: a Rust-only corpus accepts
-        // this marker without parsing commands, while any discovered C-family
-        // atom turns it into CBM_COMPILE_CONTEXT_DATABASE_REQUIRED.
+        // artifact's unrelated canonical context. Discovered C-family atoms
+        // remain visible with an explicit configuration-absent state and no
+        // invented compiler semantics or contextual call facts.
         return serde_json::to_vec(&serde_json::json!({
             "format": "astrolabe.compilation-context.v1",
             "source_root": normalized_path(&repo_root),
@@ -2857,6 +2856,30 @@ fn validate_bound_compilation_context(
                 "ASTRO_COMPILE_CONTEXT_TRANSPORT_SCHEMA_INVALID",
                 format!("private compilation-context transport field {field:?} is not an array"),
                 "Regenerate the worker arguments with this Astrolabe artifact.",
+            ));
+        }
+    }
+    if let Some(authority) = value.get("authority") {
+        if authority.as_str() != Some("absent") {
+            return Err(envelope(
+                "ASTRO_COMPILE_CONTEXT_AUTHORITY_INVALID",
+                "private compilation-context transport has an unsupported authority marker",
+                "Regenerate the worker arguments with this Astrolabe artifact.",
+            ));
+        }
+        let baselines_empty = value
+            .get("baselines")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|items| items.is_empty());
+        let commands_empty = value
+            .get("commands")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|items| items.is_empty());
+        if !baselines_empty || !commands_empty || value.get("capture").is_some() {
+            return Err(envelope(
+                "ASTRO_COMPILE_CONTEXT_ABSENCE_CONTRADICTORY",
+                "absent compilation-context authority carries compiler state",
+                "Preserve the contradictory manifest and regenerate it from one repository state.",
             ));
         }
     }

@@ -67,6 +67,7 @@ struct cbm_compile_context_index {
     int compiler_baseline_reuses;
     int captured_command_count;
     bool compiler_capture_telemetry_present;
+    bool authority_absent;
     CBMHashTable *contexts_by_id;
     CBMHashTable *sets_by_rel_path;
 };
@@ -483,34 +484,46 @@ static int materialize_context_sets(cbm_pipeline_ctx_t *ctx,
             "compiler baseline query/reuse telemetry contradicts the captured commands",
             "preserve the compilation database and regenerate the immutable context");
     }
-    if (source_count > 0) {
-        index->sets = calloc((size_t)source_count, sizeof(*index->sets));
+    int c_family_files = 0;
+    for (int i = 0; i < source_count; i++) {
+        CBMLanguage language = source_files[i].language;
+        if (language == CBM_LANG_C || language == CBM_LANG_CPP || language == CBM_LANG_CUDA) {
+            c_family_files++;
+        }
+    }
+    if (c_family_files > 0) {
+        index->sets = calloc((size_t)c_family_files, sizeof(*index->sets));
         if (!index->sets) {
             return context_fail(ctx, "CBM_COMPILE_CONTEXT_ALLOC_FAILED", "allocate_file_sets",
-                                "", (size_t)source_count,
+                                "", (size_t)c_family_files,
                                 "the per-file compilation-context index could not be allocated",
                                 "free memory and retry the unchanged corpus");
         }
     }
-    index->set_count = source_count;
-    if (source_count > (int)((UINT32_MAX - 16U) / 2U)) {
+    index->set_count = c_family_files;
+    if (c_family_files > (int)((UINT32_MAX - 16U) / 2U)) {
         return context_fail(ctx, "CBM_COMPILE_CONTEXT_CAPACITY_OVERFLOW",
-                            "index_file_contexts", ctx->repo_path, (size_t)source_count,
+                            "index_file_contexts", ctx->repo_path, (size_t)c_family_files,
                             "the source count exceeds the context hash representation",
                             "reduce the corpus generation or extend the context index");
     }
-    index->sets_by_rel_path = cbm_ht_create((uint32_t)source_count * 2U + 16U);
+    index->sets_by_rel_path = cbm_ht_create((uint32_t)c_family_files * 2U + 16U);
     if (!index->sets_by_rel_path) {
         return context_fail(ctx, "CBM_COMPILE_CONTEXT_ALLOC_FAILED", "index_file_contexts",
-                            ctx->repo_path, (size_t)source_count,
+                            ctx->repo_path, (size_t)c_family_files,
                             "the immutable file-to-context hash index could not be allocated",
                             "free memory and retry the unchanged corpus");
     }
+    int set_index = 0;
     for (int i = 0; i < source_count; i++) {
-        index->sets[i].rel_path = strdup(source_files[i].rel_path);
-        if (!index->sets[i].rel_path ||
-            !cbm_ht_set_checked(index->sets_by_rel_path, index->sets[i].rel_path,
-                                &index->sets[i], NULL)) {
+        CBMLanguage language = source_files[i].language;
+        if (language != CBM_LANG_C && language != CBM_LANG_CPP && language != CBM_LANG_CUDA) {
+            continue;
+        }
+        compile_context_set_owner_t *set = &index->sets[set_index++];
+        set->rel_path = strdup(source_files[i].rel_path);
+        if (!set->rel_path ||
+            !cbm_ht_set_checked(index->sets_by_rel_path, set->rel_path, set, NULL)) {
             return context_fail(ctx, "CBM_COMPILE_CONTEXT_ALLOC_FAILED", "copy_file_path",
                                 source_files[i].rel_path, 0,
                                 "a source path could not be retained in the context index",
@@ -557,40 +570,60 @@ static int materialize_context_sets(cbm_pipeline_ctx_t *ctx,
             }
         }
     }
-    int c_family_files = 0;
+    int bound_files = 0;
+    int configuration_absent_files = 0;
+    int empty_files = 0;
     int context_bindings = 0;
     for (int i = 0; i < source_count; i++) {
         CBMLanguage language = source_files[i].language;
         if (language != CBM_LANG_C && language != CBM_LANG_CPP && language != CBM_LANG_CUDA) {
             continue;
         }
-        c_family_files++;
+        compile_context_set_owner_t *set = find_set(index, source_files[i].rel_path);
+        if (!set) {
+            return context_fail(ctx, "CBM_COMPILE_CONTEXT_FILE_STATE_MISSING",
+                                "classify_file_context", source_files[i].rel_path, 0,
+                                "a discovered C-family source has no explicit context-state row",
+                                "preserve the generation and rebuild its complete context index");
+        }
         if (source_files[i].size == 0) {
+            empty_files++;
             continue;
         }
-        if (index->sets[i].view.count == 0) {
-            return context_fail(ctx, "CBM_COMPILE_CONTEXT_FILE_UNBOUND",
-                                "bind_file_consumer", source_files[i].rel_path, 0,
-                                "a non-empty C-family source has no real consuming translation unit",
-                                "emit this translation unit in compile_commands.json or include "
-                                "the file from one captured compiler dependency closure");
+        if (set->view.count == 0) {
+            configuration_absent_files++;
+            continue;
         }
-        if (index->sets[i].view.count > (size_t)(INT_MAX - context_bindings)) {
+        if (!set->view.items) {
+            return context_fail(ctx, "CBM_COMPILE_CONTEXT_FILE_STATE_INVALID",
+                                "classify_file_context", source_files[i].rel_path,
+                                set->view.count,
+                                "a bound C-family source has no retained compiler contexts",
+                                "preserve the generation and rebuild its complete context index");
+        }
+        bound_files++;
+        if (set->view.count > (size_t)(INT_MAX - context_bindings)) {
             return context_fail(ctx, "CBM_COMPILE_CONTEXT_CAPACITY_OVERFLOW",
                                 "count_context_bindings", source_files[i].rel_path,
-                                index->sets[i].view.count,
+                                set->view.count,
                                 "context binding telemetry exceeds integer representation",
                                 "extend the telemetry representation before retrying");
         }
-        context_bindings += (int)index->sets[i].view.count;
+        context_bindings += (int)set->view.count;
     }
     char files_text[32];
+    char bound_text[32];
+    char absent_text[32];
+    char empty_text[32];
     char contexts_text[32];
     char bindings_text[32];
     char reuse_text[32];
     char baseline_queries_text[32];
     char baseline_reuses_text[32];
     snprintf(files_text, sizeof(files_text), "%d", c_family_files);
+    snprintf(bound_text, sizeof(bound_text), "%d", bound_files);
+    snprintf(absent_text, sizeof(absent_text), "%d", configuration_absent_files);
+    snprintf(empty_text, sizeof(empty_text), "%d", empty_files);
     snprintf(contexts_text, sizeof(contexts_text), "%d", index->context_count);
     snprintf(bindings_text, sizeof(bindings_text), "%d", context_bindings);
     snprintf(reuse_text, sizeof(reuse_text), "%d",
@@ -602,8 +635,10 @@ static int materialize_context_sets(cbm_pipeline_ctx_t *ctx,
     snprintf(baseline_reuses_text, sizeof(baseline_reuses_text), "%d",
              index->compiler_baseline_reuses);
     cbm_log_info("compile_context.ready", "c_family_files", files_text, "translation_units",
-                 contexts_text, "file_context_bindings", bindings_text, "cache_builds", "1",
-                 "context_reuses", reuse_text, "compiler_baseline_queries",
+                 contexts_text, "bound_files", bound_text, "configuration_absent_files",
+                 absent_text, "empty_files", empty_text, "file_context_bindings",
+                 bindings_text, "authority", index->authority_absent ? "absent" : "exact_commands",
+                 "cache_builds", "1", "context_reuses", reuse_text, "compiler_baseline_queries",
                  baseline_queries_text, "compiler_baseline_reuses", baseline_reuses_text,
                   "cache", "generation_owned_immutable", "entry_source_cache", "source_slab",
                   "entry_source_disk_reads", "0", "file_context_lookup", "hash_o1",
@@ -782,14 +817,30 @@ static int parse_embedded_manifest(cbm_pipeline_ctx_t *ctx,
     }
     *matched = true;
     const char *authority = yyjson_get_str(yyjson_obj_get(root, "authority"));
-    if (authority && strcmp(authority, "absent") == 0) {
+    if (authority) {
+        if (strcmp(authority, "absent") != 0) {
+            yyjson_doc_free(document);
+            return context_fail(ctx, "CBM_COMPILE_CONTEXT_AUTHORITY_INVALID",
+                                "select_context_authority", ctx->repo_path, 0,
+                                "the compilation-context authority marker is unsupported",
+                                "regenerate the immutable repository compilation context");
+        }
+        yyjson_val *baselines = yyjson_obj_get(root, "baselines");
+        yyjson_val *commands = yyjson_obj_get(root, "commands");
+        if (!yyjson_is_arr(baselines) || !yyjson_is_arr(commands) ||
+            yyjson_arr_size(baselines) != 0 || yyjson_arr_size(commands) != 0 ||
+            yyjson_obj_get(root, "capture") != NULL) {
+            yyjson_doc_free(document);
+            return context_fail(
+                ctx, "CBM_COMPILE_CONTEXT_ABSENCE_CONTRADICTORY",
+                "select_context_authority", ctx->repo_path, 0,
+                "an absent compilation-context authority carries compiler state",
+                "preserve the contradictory manifest and regenerate it from one repository state");
+        }
+        index->authority_absent = true;
+        int rc = materialize_context_sets(ctx, index, source_files, source_count);
         yyjson_doc_free(document);
-        return context_fail(
-            ctx, "CBM_COMPILE_CONTEXT_DATABASE_REQUIRED", "select_context_authority",
-            ctx->repo_path, 0,
-            "this C-family repository has no compile_commands.json authority",
-            "generate compile_commands.json at the repository root from the real build, ensure "
-            "its compiler remains reachable, then retry the complete corpus");
+        return rc;
     }
     yyjson_val *capture = yyjson_obj_get(root, "capture");
     if (capture) {
@@ -828,11 +879,10 @@ static int parse_embedded_manifest(cbm_pipeline_ctx_t *ctx,
     return rc;
 }
 
-static bool has_c_family_source(const cbm_file_info_t *files, int count) {
+static bool has_c_family_file(const cbm_file_info_t *files, int count) {
     for (int i = 0; i < count; i++) {
-        if (files[i].size > 0 && (files[i].language == CBM_LANG_C ||
-                                  files[i].language == CBM_LANG_CPP ||
-                                  files[i].language == CBM_LANG_CUDA)) {
+        if (files[i].language == CBM_LANG_C || files[i].language == CBM_LANG_CPP ||
+            files[i].language == CBM_LANG_CUDA) {
             return true;
         }
     }
@@ -853,29 +903,15 @@ int cbm_compile_context_index_prepare(cbm_pipeline_ctx_t *ctx,
                             "the immutable compilation-context index could not be allocated",
                             "free memory and retry the unchanged corpus");
     }
-    if (!has_c_family_source(source_files, source_count)) {
-        index->sets = calloc((size_t)(source_count > 0 ? source_count : 1), sizeof(*index->sets));
-        if (!index->sets) {
-            cbm_compile_context_index_free(index);
-            return context_fail(ctx, "CBM_COMPILE_CONTEXT_ALLOC_FAILED", "allocate_empty_index",
-                                "", (size_t)source_count,
-                                "the empty C-family context index could not be allocated",
-                                "free memory and retry the unchanged corpus");
-        }
-        index->set_count = source_count;
-        for (int i = 0; i < source_count; i++) {
-            index->sets[i].rel_path = strdup(source_files[i].rel_path);
-            if (!index->sets[i].rel_path) {
-                cbm_compile_context_index_free(index);
-                return context_fail(ctx, "CBM_COMPILE_CONTEXT_ALLOC_FAILED", "copy_file_path",
-                                    source_files[i].rel_path, 0,
-                                    "a source path could not be retained",
-                                    "free memory and retry the unchanged corpus");
-            }
-        }
+    if (!has_c_family_file(source_files, source_count)) {
         cbm_log_info("compile_context.ready", "c_family_files", "0", "translation_units", "0",
-                     "file_context_bindings", "0", "cache_builds", "1", "context_reuses", "0",
-                     "cache", "generation_owned_immutable");
+                     "bound_files", "0", "configuration_absent_files", "0", "empty_files", "0",
+                     "file_context_bindings", "0", "authority", "not_applicable", "cache_builds",
+                     "1", "context_reuses", "0", "compiler_baseline_queries", "0",
+                     "compiler_baseline_reuses", "0", "cache", "generation_owned_immutable",
+                     "entry_source_cache", "source_slab", "entry_source_disk_reads", "0",
+                     "file_context_lookup", "not_applicable", "context_identity_lookup",
+                     "not_applicable", "dependency_membership", "not_applicable");
         *out_index = index;
         return 0;
     }
@@ -922,6 +958,48 @@ static const compile_context_owner_t *find_context_by_id(
 bool cbm_compile_context_id_exists(const cbm_compile_context_index_t *index,
                                    const char *context_id) {
     return find_context_by_id(index, context_id) != NULL;
+}
+
+cbm_compile_context_file_state_t cbm_compile_context_file_state(
+    const cbm_compile_context_index_t *index, const char *rel_path, CBMLanguage language,
+    int64_t source_size, size_t *context_count) {
+    if (context_count) {
+        *context_count = 0;
+    }
+    if (language != CBM_LANG_C && language != CBM_LANG_CPP && language != CBM_LANG_CUDA) {
+        return CBM_COMPILE_CONTEXT_NOT_APPLICABLE;
+    }
+    compile_context_set_owner_t *set = index && index->sets_by_rel_path && rel_path
+                                           ? (compile_context_set_owner_t *)cbm_ht_get(
+                                                 index->sets_by_rel_path, rel_path)
+                                           : NULL;
+    if (!set || source_size < 0) {
+        return CBM_COMPILE_CONTEXT_STATE_INVALID;
+    }
+    if (source_size == 0) {
+        return CBM_COMPILE_CONTEXT_EMPTY_SOURCE;
+    }
+    if (context_count) {
+        *context_count = set->view.count;
+    }
+    if (set->view.count == 0) {
+        return CBM_COMPILE_CONTEXT_CONFIGURATION_ABSENT;
+    }
+    return set->view.items ? CBM_COMPILE_CONTEXT_BOUND : CBM_COMPILE_CONTEXT_STATE_INVALID;
+}
+
+const char *cbm_compile_context_authority(
+    const cbm_compile_context_index_t *index, int c_family_file_count) {
+    if (c_family_file_count == 0) {
+        return "not_applicable";
+    }
+    return index && index->authority_absent ? "absent" : "exact_commands";
+}
+
+const char *cbm_compile_context_absence_reason(
+    const cbm_compile_context_index_t *index) {
+    return index && index->authority_absent ? "compile_database_absent"
+                                            : "not_in_active_build_closure";
 }
 
 static bool context_dependency_contains(const compile_context_owner_t *context,

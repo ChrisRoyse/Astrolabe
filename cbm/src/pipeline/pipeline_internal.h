@@ -410,6 +410,14 @@ int cbm_tokenize_decorator(const char *dec, char **out, int max_out);
 
 typedef struct cbm_compile_context_index cbm_compile_context_index_t;
 
+typedef enum {
+    CBM_COMPILE_CONTEXT_STATE_INVALID = -1,
+    CBM_COMPILE_CONTEXT_NOT_APPLICABLE = 0,
+    CBM_COMPILE_CONTEXT_EMPTY_SOURCE,
+    CBM_COMPILE_CONTEXT_CONFIGURATION_ABSENT,
+    CBM_COMPILE_CONTEXT_BOUND,
+} cbm_compile_context_file_state_t;
+
 int cbm_compile_context_index_prepare(cbm_pipeline_ctx_t *ctx,
                                       const cbm_file_info_t *source_files, int source_count,
                                       const uint8_t *embedded_bytes, size_t embedded_byte_count,
@@ -419,6 +427,15 @@ const CBMPreprocessContextSet *cbm_compile_context_for_file(
     const cbm_compile_context_index_t *index, const char *rel_path);
 bool cbm_compile_context_id_exists(const cbm_compile_context_index_t *index,
                                    const char *context_id);
+cbm_compile_context_file_state_t cbm_compile_context_file_state(
+    const cbm_compile_context_index_t *index, const char *rel_path, CBMLanguage language,
+    int64_t source_size, size_t *context_count);
+const char *cbm_compile_context_authority(const cbm_compile_context_index_t *index,
+                                          int c_family_file_count);
+const char *cbm_compile_context_absence_reason(const cbm_compile_context_index_t *index);
+int cbm_pipeline_format_file_properties(cbm_pipeline_t *pipeline,
+                                        const cbm_file_info_t *file, char *out,
+                                        size_t out_capacity);
 int cbm_compile_context_target_visible(const cbm_compile_context_index_t *index,
                                        const char *context_id, const char *target_rel_path);
 cbm_resolution_t cbm_compile_context_resolve_call(

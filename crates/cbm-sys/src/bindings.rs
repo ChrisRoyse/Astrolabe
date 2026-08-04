@@ -3958,6 +3958,31 @@ unsafe extern "C" {
 unsafe extern "C" {
     pub fn cbm_pipeline_get_parse_recovery_diagnostics(p: *const cbm_pipeline_t) -> uint_least64_t;
 }
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct cbm_compile_context_diagnostics_t {
+    pub authority: *const ::std::os::raw::c_char,
+    pub c_family_files: ::std::os::raw::c_int,
+    pub bound_files: ::std::os::raw::c_int,
+    pub configuration_absent_files: ::std::os::raw::c_int,
+    pub empty_files: ::std::os::raw::c_int,
+    pub configuration_absent_paths: *const *const ::std::os::raw::c_char,
+}
+impl Default for cbm_compile_context_diagnostics_t {
+    fn default() -> Self {
+        let mut s = ::std::mem::MaybeUninit::<Self>::uninit();
+        unsafe {
+            ::std::ptr::write_bytes(s.as_mut_ptr(), 0, 1);
+            s.assume_init()
+        }
+    }
+}
+unsafe extern "C" {
+    pub fn cbm_pipeline_get_compile_context_diagnostics(
+        p: *const cbm_pipeline_t,
+        out: *mut cbm_compile_context_diagnostics_t,
+    );
+}
 unsafe extern "C" {
     pub fn cbm_pipeline_get_fatal_error(
         p: *const cbm_pipeline_t,

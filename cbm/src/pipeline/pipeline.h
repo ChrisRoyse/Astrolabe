@@ -200,6 +200,22 @@ uint_least64_t cbm_pipeline_get_unresolved_reference_source_skips(const cbm_pipe
  * every run, including zero, so malformed-source recovery is never silent. */
 uint_least64_t cbm_pipeline_get_parse_recovery_diagnostics(const cbm_pipeline_t *p);
 
+/* Exact compilation-context coverage captured before extraction. Paths are
+ * borrowed from the pipeline and remain valid until cbm_pipeline_free(). A
+ * configuration-absent file is a real source atom outside the selected build
+ * closure; it never receives guessed compiler semantics. */
+typedef struct {
+    const char *authority;
+    int c_family_files;
+    int bound_files;
+    int configuration_absent_files;
+    int empty_files;
+    const char *const *configuration_absent_paths;
+} cbm_compile_context_diagnostics_t;
+
+void cbm_pipeline_get_compile_context_diagnostics(
+    const cbm_pipeline_t *p, cbm_compile_context_diagnostics_t *out);
+
 /* Read the exact first fatal pipeline diagnostic. Returns false and zeroes
  * `out` when no fatal diagnostic has been recorded. Every pointer is borrowed
  * from the pipeline and remains valid until cbm_pipeline_free(). */

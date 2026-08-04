@@ -206,6 +206,12 @@ struct cbm_pipeline {
     size_t embedded_compilation_context_bytes;
     cbm_compile_context_index_t *compile_contexts;
     const cbm_source_slab_t *current_source_slab;
+    const char *compile_context_authority;
+    int compile_context_c_family_files;
+    int compile_context_bound_files;
+    int compile_context_configuration_absent_files;
+    int compile_context_empty_files;
+    char **compile_context_configuration_absent_paths;
 
     /* Indexing state (set during run) */
     cbm_gbuf_t *gbuf;
@@ -281,6 +287,210 @@ struct cbm_pipeline {
      * can be restored after the rebuild. NULL when no ADR existed. Issue #516. */
     char *saved_adr;
 };
+
+static void clear_compile_context_diagnostics(cbm_pipeline_t *p) {
+    if (!p) {
+        return;
+    }
+    for (int i = 0; i < p->compile_context_configuration_absent_files; i++) {
+        free(p->compile_context_configuration_absent_paths[i]);
+    }
+    free(p->compile_context_configuration_absent_paths);
+    p->compile_context_configuration_absent_paths = NULL;
+    p->compile_context_authority = "not_applicable";
+    p->compile_context_c_family_files = 0;
+    p->compile_context_bound_files = 0;
+    p->compile_context_configuration_absent_files = 0;
+    p->compile_context_empty_files = 0;
+}
+
+static int compare_owned_paths(const void *left, const void *right) {
+    const char *const *a = (const char *const *)left;
+    const char *const *b = (const char *const *)right;
+    return strcmp(*a, *b);
+}
+
+static int capture_compile_context_diagnostics(cbm_pipeline_t *p,
+                                               const cbm_file_info_t *files,
+                                               int file_count) {
+    clear_compile_context_diagnostics(p);
+    if (!p || file_count < 0 || (file_count > 0 && !files)) {
+        cbm_pipeline_record_fatal_error(
+            p, "CBM_COMPILE_CONTEXT_DIAGNOSTIC_INPUT_INVALID",
+            "capture_compile_context_diagnostics", "compile_context", "", 0,
+            "compile-context coverage received invalid discovered-file metadata",
+            "preserve the generation and repair the pipeline context-state handoff");
+        return CBM_NOT_FOUND;
+    }
+    int c_family_files = 0;
+    for (int i = 0; i < file_count; i++) {
+        CBMLanguage language = files[i].language;
+        if (language == CBM_LANG_C || language == CBM_LANG_CPP || language == CBM_LANG_CUDA) {
+            c_family_files++;
+        }
+    }
+    char **absent_paths = c_family_files > 0
+                              ? calloc((size_t)c_family_files, sizeof(*absent_paths))
+                              : NULL;
+    if (c_family_files > 0 && !absent_paths) {
+        cbm_pipeline_record_fatal_error(
+            p, "CBM_COMPILE_CONTEXT_DIAGNOSTIC_ALLOC_FAILED",
+            "allocate_configuration_absent_paths", "compile_context", "",
+            (size_t)c_family_files * sizeof(*absent_paths),
+            "the exact configuration-absence path inventory could not be allocated",
+            "free memory and retry the unchanged corpus");
+        return CBM_NOT_FOUND;
+    }
+
+    int bound_files = 0;
+    int absent_files = 0;
+    int empty_files = 0;
+    for (int i = 0; i < file_count; i++) {
+        size_t context_count = 0;
+        cbm_compile_context_file_state_t state = cbm_compile_context_file_state(
+            p->compile_contexts, files[i].rel_path, files[i].language, files[i].size,
+            &context_count);
+        switch (state) {
+        case CBM_COMPILE_CONTEXT_NOT_APPLICABLE:
+            break;
+        case CBM_COMPILE_CONTEXT_EMPTY_SOURCE:
+            empty_files++;
+            break;
+        case CBM_COMPILE_CONTEXT_CONFIGURATION_ABSENT:
+            absent_paths[absent_files] = strdup(files[i].rel_path);
+            if (!absent_paths[absent_files]) {
+                for (int j = 0; j < absent_files; j++) {
+                    free(absent_paths[j]);
+                }
+                free(absent_paths);
+                cbm_pipeline_record_fatal_error(
+                    p, "CBM_COMPILE_CONTEXT_DIAGNOSTIC_ALLOC_FAILED",
+                    "copy_configuration_absent_path", "compile_context", files[i].rel_path,
+                    strlen(files[i].rel_path) + 1,
+                    "a configuration-absent source path could not be retained",
+                    "free memory and retry the unchanged corpus");
+                return CBM_NOT_FOUND;
+            }
+            absent_files++;
+            break;
+        case CBM_COMPILE_CONTEXT_BOUND:
+            if (context_count == 0) {
+                state = CBM_COMPILE_CONTEXT_STATE_INVALID;
+            } else {
+                bound_files++;
+                break;
+            }
+            /* fall through */
+        case CBM_COMPILE_CONTEXT_STATE_INVALID:
+        default:
+            for (int j = 0; j < absent_files; j++) {
+                free(absent_paths[j]);
+            }
+            free(absent_paths);
+            cbm_pipeline_record_fatal_error(
+                p, "CBM_COMPILE_CONTEXT_FILE_STATE_INVALID",
+                "capture_compile_context_diagnostics", "compile_context",
+                files[i].rel_path ? files[i].rel_path : "", context_count,
+                "a discovered C-family source has no valid explicit context state",
+                "preserve the generation and rebuild its complete context index");
+            return CBM_NOT_FOUND;
+        }
+    }
+    if (absent_files > 1) {
+        qsort(absent_paths, (size_t)absent_files, sizeof(*absent_paths), compare_owned_paths);
+    }
+    p->compile_context_authority =
+        cbm_compile_context_authority(p->compile_contexts, c_family_files);
+    p->compile_context_c_family_files = c_family_files;
+    p->compile_context_bound_files = bound_files;
+    p->compile_context_configuration_absent_files = absent_files;
+    p->compile_context_empty_files = empty_files;
+    p->compile_context_configuration_absent_paths = absent_paths;
+    return 0;
+}
+
+int cbm_pipeline_format_file_properties(cbm_pipeline_t *pipeline,
+                                        const cbm_file_info_t *file, char *out,
+                                        size_t out_capacity) {
+    if (!pipeline || !file || !file->rel_path || !out || out_capacity == 0) {
+        return CBM_NOT_FOUND;
+    }
+    const char *slash = strrchr(file->rel_path, '/');
+    const char *basename = slash ? slash + SKIP_ONE : file->rel_path;
+    const char *extension = strrchr(basename, '.');
+    extension = extension ? extension : "";
+    size_t extension_len = strlen(extension);
+    if (extension_len > (SIZE_MAX - 1) / 6 || extension_len * 6 + 1 > INT_MAX) {
+        cbm_pipeline_record_fatal_error(
+            pipeline, "CBM_FILE_PROPERTIES_EXTENSION_OVERFLOW", "escape_file_extension",
+            "structure", file->rel_path, extension_len,
+            "a file extension exceeds the bounded JSON representation",
+            "rename the malformed path or extend the file-property representation");
+        return CBM_NOT_FOUND;
+    }
+    size_t escaped_capacity = extension_len * 6 + 1;
+    char *escaped_extension = malloc(escaped_capacity);
+    if (!escaped_extension) {
+        cbm_pipeline_record_fatal_error(
+            pipeline, "CBM_FILE_PROPERTIES_ALLOC_FAILED", "escape_file_extension",
+            "structure", file->rel_path, escaped_capacity,
+            "the exact file extension could not be escaped",
+            "free memory and retry the unchanged corpus");
+        return CBM_NOT_FOUND;
+    }
+    cbm_json_escape(escaped_extension, (int)escaped_capacity, extension);
+
+    size_t context_count = 0;
+    cbm_compile_context_file_state_t state = cbm_compile_context_file_state(
+        pipeline->compile_contexts, file->rel_path, file->language, file->size,
+        &context_count);
+    int written = 0;
+    switch (state) {
+    case CBM_COMPILE_CONTEXT_NOT_APPLICABLE:
+        written = snprintf(out, out_capacity, "{\"extension\":\"%s\"}", escaped_extension);
+        break;
+    case CBM_COMPILE_CONTEXT_EMPTY_SOURCE:
+        written = snprintf(
+            out, out_capacity,
+            "{\"extension\":\"%s\",\"compile_context_state\":\"empty\","
+            "\"compile_context_reason\":\"empty_source\",\"compile_context_count\":0}",
+            escaped_extension);
+        break;
+    case CBM_COMPILE_CONTEXT_CONFIGURATION_ABSENT:
+        written = snprintf(
+            out, out_capacity,
+            "{\"extension\":\"%s\",\"compile_context_state\":\"configuration_absent\","
+            "\"compile_context_code\":\"CBM_COMPILE_CONTEXT_CONFIGURATION_ABSENT\","
+            "\"compile_context_reason\":\"%s\",\"compile_context_count\":0}",
+            escaped_extension, cbm_compile_context_absence_reason(pipeline->compile_contexts));
+        break;
+    case CBM_COMPILE_CONTEXT_BOUND:
+        written = snprintf(out, out_capacity,
+                           "{\"extension\":\"%s\",\"compile_context_state\":\"bound\","
+                           "\"compile_context_count\":%zu}",
+                           escaped_extension, context_count);
+        break;
+    case CBM_COMPILE_CONTEXT_STATE_INVALID:
+    default:
+        cbm_pipeline_record_fatal_error(
+            pipeline, "CBM_COMPILE_CONTEXT_FILE_STATE_INVALID", "format_file_properties",
+            "structure", file->rel_path, context_count,
+            "a File atom has no valid explicit compilation-context state",
+            "preserve the generation and rebuild its complete context index");
+        free(escaped_extension);
+        return CBM_NOT_FOUND;
+    }
+    free(escaped_extension);
+    if (written <= 0 || (size_t)written >= out_capacity) {
+        cbm_pipeline_record_fatal_error(
+            pipeline, "CBM_FILE_PROPERTIES_CAPACITY_EXCEEDED", "format_file_properties",
+            "structure", file->rel_path, written > 0 ? (size_t)written : 0,
+            "the complete File atom properties exceed their bounded representation",
+            "extend the File property representation and retry the unchanged corpus");
+        return CBM_NOT_FOUND;
+    }
+    return 0;
+}
 
 /* ── Global pkgmap (one active pipeline at a time) ─────────────── */
 
@@ -568,6 +778,7 @@ cbm_pipeline_t *cbm_pipeline_new(const char *repo_path, const char *db_path,
     p->parse_recovery_diagnostics = 0;
     p->phase_metrics_complete = true;
     p->parallel_dispatches_complete = true;
+    p->compile_context_authority = "not_applicable";
     atomic_init(&p->cancelled, 0);
 
     return p;
@@ -723,6 +934,7 @@ void cbm_pipeline_free(cbm_pipeline_t *p) {
     p->file_errors = NULL;
     p->file_errors_count = 0;
     p->file_errors_cap = 0;
+    clear_compile_context_diagnostics(p);
     free(p->branch_qn);
     free(p->embedded_compilation_context);
     p->embedded_compilation_context = NULL;
@@ -867,6 +1079,26 @@ void cbm_pipeline_get_parallel_dispatches(const cbm_pipeline_t *p,
     if (complete) {
         *complete = p && p->parallel_dispatches_complete;
     }
+}
+
+void cbm_pipeline_get_compile_context_diagnostics(
+    const cbm_pipeline_t *p, cbm_compile_context_diagnostics_t *out) {
+    if (!out) {
+        return;
+    }
+    memset(out, 0, sizeof(*out));
+    out->authority = p && p->compile_context_authority
+                         ? p->compile_context_authority
+                         : "not_applicable";
+    if (!p) {
+        return;
+    }
+    out->c_family_files = p->compile_context_c_family_files;
+    out->bound_files = p->compile_context_bound_files;
+    out->configuration_absent_files = p->compile_context_configuration_absent_files;
+    out->empty_files = p->compile_context_empty_files;
+    out->configuration_absent_paths =
+        (const char *const *)p->compile_context_configuration_absent_paths;
 }
 
 bool cbm_pipeline_get_fatal_error(const cbm_pipeline_t *p, cbm_pipeline_error_t *out) {
@@ -1436,9 +1668,13 @@ static int pass_structure(cbm_pipeline_t *p, const cbm_file_info_t *files, int f
         const char *slash = strrchr(rel, '/');
         const char *basename = slash ? slash + SKIP_ONE : rel;
 
-        char props[CBM_SZ_256];
-        const char *ext = strrchr(basename, '.');
-        snprintf(props, sizeof(props), "{\"extension\":\"%s\"}", ext ? ext : "");
+        char props[CBM_SZ_1K];
+        if (cbm_pipeline_format_file_properties(p, &files[i], props, sizeof(props)) != 0) {
+            free(file_qn);
+            cbm_ht_foreach(seen_dirs, free_seen_dir_key, NULL);
+            cbm_ht_free(seen_dirs);
+            return CBM_NOT_FOUND;
+        }
 
         const char *qualified_name = file_qn;
         const char *file_path = rel;
@@ -1882,8 +2118,9 @@ static int run_parallel_pipeline(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
     /* Tier 2 full: pre-build per-language cross-LSP registries.
      * Built ONCE here; shared READ-ONLY across all files of that language
      * during resolve. Per-file work is then: parse + AST walk + O(1) lookups
-     * — no registry build, no Phase 1b mutations. Languages added so far:
-     * Go, Python. Others (C/C++, TS/JS, PHP, C#) fall back to per-file. */
+     * — no registry build, no Phase 1b mutations. C-family resolution is
+     * deliberately excluded here: only exact compiler-expanded contexts may
+     * emit C-family semantic facts. */
     CBMArena cross_lsp_arena;
     cbm_arena_init(&cross_lsp_arena);
     CBMCrossLspRegistries cross_registries = {0};
@@ -1891,14 +2128,13 @@ static int run_parallel_pipeline(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
         cross_registries.go = cbm_go_build_cross_registry(&cross_lsp_arena, all_defs, def_count);
         cross_registries.python =
             cbm_py_build_cross_registry(&cross_lsp_arena, all_defs, def_count);
-        cross_registries.c = cbm_c_build_cross_registry(&cross_lsp_arena, all_defs, def_count);
         cross_registries.cs = cbm_cs_build_cross_registry(&cross_lsp_arena, all_defs, def_count);
         cross_registries.ts = cbm_ts_build_cross_registry(&cross_lsp_arena, all_defs, def_count);
         cross_registries.rust =
             cbm_rust_build_cross_registry(&cross_lsp_arena, all_defs, def_count);
         if (cbm_arena_failed(&cross_lsp_arena) || !cross_registries.go ||
-            !cross_registries.python || !cross_registries.c || !cross_registries.cs ||
-            !cross_registries.ts || !cross_registries.rust) {
+            !cross_registries.python || !cross_registries.cs || !cross_registries.ts ||
+            !cross_registries.rust) {
             char requested[32];
             snprintf(requested, sizeof(requested), "%zu",
                      cbm_arena_failure_bytes(&cross_lsp_arena));
@@ -3334,6 +3570,7 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
     cbm_compile_context_index_free(p->compile_contexts);
     p->compile_contexts = NULL;
     p->current_source_slab = NULL;
+    clear_compile_context_diagnostics(p);
 
     CBM_PROF_START(t_pipeline_total);
     struct timespec t0;
@@ -3508,6 +3745,10 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
         &compile_context_owner, source_files, source_count, p->embedded_compilation_context,
         p->embedded_compilation_context_bytes, &p->compile_contexts);
     cbm_pipeline_phase_probe_end(p, "compile_context", &compile_context_probe);
+    if (rc != 0) {
+        goto cleanup;
+    }
+    rc = capture_compile_context_diagnostics(p, source_files, source_count);
     if (rc != 0) {
         goto cleanup;
     }

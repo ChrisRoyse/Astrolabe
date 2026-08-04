@@ -7164,6 +7164,8 @@ static void add_excluded_summary(yyjson_mut_doc *doc, yyjson_mut_val *root, char
  * the JSON carries "count" + "truncated" so nothing is silently hidden. */
 enum { INDEX_SKIPPED_FILE_CAP = 50 };
 
+enum { INDEX_COMPILE_CONTEXT_ABSENCE_CAP = 50 };
+
 /* Keep successful unresolved-browser diagnostics bounded in the MCP response,
  * while the exact complete request set remains in the verified source store. */
 enum { INDEX_BROWSER_RUNTIME_REQUEST_CAP = 50 };
@@ -7200,6 +7202,79 @@ static void add_skipped_summary(yyjson_mut_doc *doc, yyjson_mut_val *root,
     if (logfile && logfile[0]) {
         yyjson_mut_obj_add_strcpy(doc, root, "logfile", logfile);
     }
+}
+
+static bool add_compile_context_diagnostics(yyjson_mut_doc *doc, yyjson_mut_val *root,
+                                            const cbm_pipeline_t *pipeline) {
+    cbm_compile_context_diagnostics_t diagnostics;
+    cbm_pipeline_get_compile_context_diagnostics(pipeline, &diagnostics);
+    if (diagnostics.c_family_files < 0 || diagnostics.bound_files < 0 ||
+        diagnostics.configuration_absent_files < 0 || diagnostics.empty_files < 0 ||
+        diagnostics.bound_files + diagnostics.configuration_absent_files +
+                diagnostics.empty_files !=
+            diagnostics.c_family_files ||
+        (diagnostics.configuration_absent_files > 0 &&
+         !diagnostics.configuration_absent_paths)) {
+        return false;
+    }
+
+    yyjson_mut_val *context = yyjson_mut_obj(doc);
+    if (!context ||
+        !yyjson_mut_obj_add_strcpy(doc, context, "authority",
+                                   diagnostics.authority ? diagnostics.authority
+                                                         : "not_applicable") ||
+        !yyjson_mut_obj_add_int(doc, context, "c_family_files",
+                                diagnostics.c_family_files) ||
+        !yyjson_mut_obj_add_int(doc, context, "bound_files", diagnostics.bound_files) ||
+        !yyjson_mut_obj_add_int(doc, context, "configuration_absent_files",
+                                diagnostics.configuration_absent_files) ||
+        !yyjson_mut_obj_add_int(doc, context, "empty_files", diagnostics.empty_files)) {
+        return false;
+    }
+
+    if (diagnostics.configuration_absent_files > 0) {
+        yyjson_mut_val *absence = yyjson_mut_obj(doc);
+        yyjson_mut_val *paths = yyjson_mut_arr(doc);
+        if (!absence || !paths) {
+            return false;
+        }
+        int shown = diagnostics.configuration_absent_files < INDEX_COMPILE_CONTEXT_ABSENCE_CAP
+                        ? diagnostics.configuration_absent_files
+                        : INDEX_COMPILE_CONTEXT_ABSENCE_CAP;
+        for (int i = 0; i < shown; i++) {
+            if (!diagnostics.configuration_absent_paths[i] ||
+                !yyjson_mut_arr_add_strcpy(doc, paths,
+                                           diagnostics.configuration_absent_paths[i])) {
+                return false;
+            }
+        }
+        const char *reason = diagnostics.authority &&
+                                     strcmp(diagnostics.authority, "absent") == 0
+                                 ? "compile_database_absent"
+                                 : "not_in_active_build_closure";
+        if (!yyjson_mut_obj_add_str(
+                doc, absence, "code", "CBM_COMPILE_CONTEXT_CONFIGURATION_ABSENT") ||
+            !yyjson_mut_obj_add_str(
+                doc, absence, "message",
+                "C-family source atoms outside the selected build configuration were retained "
+                "without guessed compiler semantics or contextual call edges") ||
+            !yyjson_mut_obj_add_str(
+                doc, absence, "remediation",
+                "supply another real build configuration to expand contextual coverage; query "
+                "the persisted File atoms for the complete exact absence inventory") ||
+            !yyjson_mut_obj_add_strcpy(doc, absence, "reason", reason) ||
+            !yyjson_mut_obj_add_int(doc, absence, "count",
+                                    diagnostics.configuration_absent_files) ||
+            !yyjson_mut_obj_add_int(doc, absence, "returned", shown) ||
+            !yyjson_mut_obj_add_bool(
+                doc, absence, "truncated",
+                diagnostics.configuration_absent_files > INDEX_COMPILE_CONTEXT_ABSENCE_CAP) ||
+            !yyjson_mut_obj_add_val(doc, absence, "paths", paths) ||
+            !yyjson_mut_obj_add_val(doc, context, "configuration_absent", absence)) {
+            return false;
+        }
+    }
+    return yyjson_mut_obj_add_val(doc, root, "compile_context", context);
 }
 
 typedef enum {
@@ -7618,6 +7693,14 @@ static char *build_index_success_response(cbm_mcp_server_t *srv, yyjson_mut_doc 
                                           int file_error_count, const char *logfile) {
     add_excluded_summary(doc, root, excluded_dirs, excluded_count);
     add_skipped_summary(doc, root, file_errors, file_error_count, logfile);
+    if (!add_compile_context_diagnostics(doc, root, p)) {
+        return heap_strdup(
+            "{\"status\":\"error\",\"code\":\"CBM_INDEX_COMPILE_CONTEXT_DIAGNOSTIC_INVALID\","
+            "\"message\":\"the completed index did not retain a complete compilation-context "
+            "coverage diagnostic\",\"remediation\":\"preserve the published database and "
+            "inspect compile-context capture before retrying\","
+            "\"sqlite_publication_started\":true,\"source_family_preserved\":true}");
+    }
 
     int exp_nodes = -1;
     int exp_edges = -1;

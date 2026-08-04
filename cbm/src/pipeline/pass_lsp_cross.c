@@ -372,9 +372,6 @@ void cbm_pxc_ts_modes(CBMLanguage lang, const char *rel_path, bool *out_js, bool
 bool cbm_pxc_has_cross_lsp(CBMLanguage lang) {
     switch (lang) {
     case CBM_LANG_GO:
-    case CBM_LANG_C:
-    case CBM_LANG_CPP:
-    case CBM_LANG_CUDA:
     case CBM_LANG_PYTHON:
     case CBM_LANG_JAVASCRIPT:
     case CBM_LANG_TYPESCRIPT:
@@ -1315,7 +1312,6 @@ int cbm_pipeline_pass_lsp_cross(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *
         }
         cross_registries.go = cbm_go_build_cross_registry(xa, all_defs, def_count);
         cross_registries.python = cbm_py_build_cross_registry(xa, all_defs, def_count);
-        cross_registries.c = cbm_c_build_cross_registry(xa, all_defs, def_count);
         cross_registries.cs = cbm_cs_build_cross_registry(xa, all_defs, def_count);
         cross_registries.ts = cbm_ts_build_cross_registry(xa, all_defs, def_count);
         cross_registries.rust = cbm_rust_build_cross_registry(xa, all_defs, def_count);

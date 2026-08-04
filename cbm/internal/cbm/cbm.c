@@ -1178,9 +1178,10 @@ static CBMFileResult *cbm_extract_file_impl(const char *source, int source_len,
         if (language == CBM_LANG_GO) {
             cbm_run_go_lsp(a, result, source, source_len, root);
         }
-        if (language == CBM_LANG_C || language == CBM_LANG_CPP || language == CBM_LANG_CUDA) {
-            cbm_run_c_lsp(a, result, source, source_len, root, language != CBM_LANG_C);
-        }
+        /* C-family per-file semantic resolution runs only on the exact mapped
+         * compiler expansion below. The raw-source result used to be computed
+         * here and then unconditionally discarded, cold-loading the C registry
+         * once per file without contributing one retained fact. */
         if (language == CBM_LANG_PHP) {
             cbm_run_php_lsp(a, result, source, source_len, root);
         }
@@ -1236,21 +1237,33 @@ static CBMFileResult *cbm_extract_file_impl(const char *source, int source_len,
         const char *preprocessor_path = source_path && source_path[0] ? source_path : rel_path;
         (void)extra_defines;
         (void)include_paths;
-        if (!preprocess_contexts || !preprocess_contexts->items ||
-            preprocess_contexts->count == 0 || !preprocessor_path || !preprocessor_path[0]) {
+        if (!preprocess_contexts) {
             cbm_log_error("preprocessor.failed", "code", "CBM_PREPROCESS_CONTEXT_REQUIRED",
                           "file", rel_path ? rel_path : "<input>", "message",
-                          "C-family extraction has no exact translation-unit context",
+                          "C-family extraction has no explicit compilation-context state",
                           "remediation",
-                          "capture this file's compiler invocation and dependency parent in "
-                          "compile_commands.json, then retry the complete corpus");
+                          "route the file through the immutable compile-context index; never "
+                          "substitute guessed host flags");
             cbm_file_result_set_error(
                 result, "CBM_PREPROCESS_CONTEXT_REQUIRED", "resolve_preprocess_context",
                 "preprocessor_context", 0,
-                "C-family extraction requires at least one provenance-bound translation-unit "
-                "context; no guessed host context may be used",
-                "capture the exact compiler invocation and dependency parent in "
-                "compile_commands.json, then retry the complete corpus");
+                "C-family extraction requires an explicit bound, configuration-absent, or empty "
+                "context state; no guessed host context may be used",
+                "repair the compile-context state handoff and retry the complete corpus");
+            goto extraction_failed;
+        }
+        if (preprocess_contexts->count > 0 &&
+            (!preprocess_contexts->items || !preprocessor_path || !preprocessor_path[0])) {
+            cbm_log_error("preprocessor.failed", "code", "CBM_PREPROCESS_CONTEXT_INVALID",
+                          "file", rel_path ? rel_path : "<input>", "message",
+                          "a bound C-family source has incomplete compiler context or path",
+                          "remediation",
+                          "preserve the generation and rebuild its complete compile-context index");
+            cbm_file_result_set_error(
+                result, "CBM_PREPROCESS_CONTEXT_INVALID", "resolve_preprocess_context",
+                "preprocessor_context", preprocess_contexts->count,
+                "a bound C-family source lacks retained compiler-context data",
+                "preserve the generation and rebuild its complete compile-context index");
             goto extraction_failed;
         }
 
@@ -1270,6 +1283,16 @@ static CBMFileResult *cbm_extract_file_impl(const char *source, int source_len,
             cbm_log_info("preprocessor.original_call_view_replaced", "file",
                          rel_path ? rel_path : "<input>", "calls", calls_replaced,
                          "resolved_calls", resolutions_replaced);
+        }
+
+        if (preprocess_contexts->count == 0 && source_len > 0) {
+            cbm_log_warn(
+                "preprocessor.configuration_absent", "code",
+                "CBM_COMPILE_CONTEXT_CONFIGURATION_ABSENT", "file",
+                rel_path ? rel_path : "<input>", "state", "configuration_absent", "message",
+                "source retained without contextual call facts because the selected build "
+                "configuration supplies no exact consumer", "remediation",
+                "supply another real build configuration to expand contextual coverage");
         }
 
         for (size_t context_index = 0;

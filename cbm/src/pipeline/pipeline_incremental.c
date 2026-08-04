@@ -1480,9 +1480,13 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
         if (file_qn) {
             const char *slash = strrchr(changed_files[i].rel_path, '/');
             const char *basename = slash ? slash + SKIP_ONE : changed_files[i].rel_path;
-            const char *ext = strrchr(basename, '.');
-            char props[CBM_SZ_256];
-            snprintf(props, sizeof(props), "{\"extension\":\"%s\"}", ext ? ext : "");
+            char props[CBM_SZ_1K];
+            if (cbm_pipeline_format_file_properties(p, &changed_files[i], props,
+                                                    sizeof(props)) != 0) {
+                free(file_qn);
+                file_source_failed = true;
+                break;
+            }
             size_t source_len = 0;
             uint8_t *source_bytes =
                 cbm_pipeline_read_file_identity_bytes(&changed_files[i], &source_len);
