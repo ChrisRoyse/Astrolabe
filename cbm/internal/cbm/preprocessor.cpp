@@ -11,8 +11,6 @@
 #include <cstdio>
 #include <cstring>
 #include <exception>
-#include <fstream>
-#include <iterator>
 #include <limits>
 #include <new>
 #include <sstream>
@@ -321,8 +319,8 @@ char *cbm_preprocess(const char *focus_source, int focus_source_len, const char 
         return NULL;
 
     if (!context || !context->context_id || !context->context_id[0] || !context->entry_path ||
-        !context->entry_path[0] || !context->standard || !context->standard[0] ||
-        !focus_filename || !focus_filename[0]) {
+        !context->entry_path[0] || !context->entry_source || context->entry_source_len < 0 ||
+        !context->standard || !context->standard[0] || !focus_filename || !focus_filename[0]) {
         set_status(status_out, CBM_PREPROCESS_FAILED);
         set_diagnostic(diagnostic_out,
                        "CBM_PREPROCESS_CONTEXT_MISSING: exact translation-unit context is absent");
@@ -334,28 +332,18 @@ char *cbm_preprocess(const char *focus_source, int focus_source_len, const char 
         set_diagnostic(diagnostic_out, "preprocessor expansion map outputs are required");
         return NULL;
     }
-    std::string entry_storage;
-    const char *entry_source = focus_source;
-    int entry_source_len = focus_source_len;
-    if (simplecpp::simplifyPath(context->entry_path) !=
-        simplecpp::simplifyPath(focus_filename)) {
-        std::ifstream input(context->entry_path, std::ios::binary);
-        if (!input) {
-            set_status(status_out, CBM_PREPROCESS_FAILED);
-            set_diagnostic(diagnostic_out,
-                           "CBM_PREPROCESS_ENTRY_READ_FAILED: consuming translation unit is unreadable");
-            return NULL;
-        }
-        entry_storage.assign(std::istreambuf_iterator<char>(input),
-                             std::istreambuf_iterator<char>());
-        if (!input.eof() || entry_storage.size() > static_cast<size_t>(INT_MAX)) {
-            set_status(status_out, CBM_PREPROCESS_FAILED);
-            set_diagnostic(diagnostic_out,
-                           "CBM_PREPROCESS_ENTRY_READ_FAILED: consuming translation unit read is incomplete or oversized");
-            return NULL;
-        }
-        entry_source = entry_storage.data();
-        entry_source_len = static_cast<int>(entry_storage.size());
+    const char *entry_source = context->entry_source;
+    int entry_source_len = context->entry_source_len;
+    if (simplecpp::simplifyPath(context->entry_path) ==
+            simplecpp::simplifyPath(focus_filename) &&
+        (entry_source_len != focus_source_len ||
+         memcmp(entry_source, focus_source, static_cast<size_t>(focus_source_len)) != 0)) {
+        set_status(status_out, CBM_PREPROCESS_FAILED);
+        set_diagnostic(
+            diagnostic_out,
+            "CBM_PREPROCESS_ENTRY_SOURCE_MISMATCH: consuming translation unit differs from "
+            "the immutable focus source");
+        return NULL;
     }
     if (entry_source_len <= 0) {
         set_status(status_out, CBM_PREPROCESS_FAILED);

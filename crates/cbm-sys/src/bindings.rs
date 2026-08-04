@@ -1257,6 +1257,8 @@ unsafe extern "C" {
 pub struct CBMPreprocessContext {
     pub context_id: *const ::std::os::raw::c_char,
     pub entry_path: *const ::std::os::raw::c_char,
+    pub entry_source: *const ::std::os::raw::c_char,
+    pub entry_source_len: ::std::os::raw::c_int,
     pub standard: *const ::std::os::raw::c_char,
     pub defines: *mut *const ::std::os::raw::c_char,
     pub undefines: *mut *const ::std::os::raw::c_char,

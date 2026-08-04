@@ -724,6 +724,8 @@ int cbm_init(void);
 typedef struct CBMPreprocessContext {
     const char *context_id;
     const char *entry_path;
+    const char *entry_source; /* borrowed from the generation-owned source slab */
+    int entry_source_len;     /* exact byte length; source may contain NUL */
     const char *standard;
     const char **defines;
     const char **undefines;

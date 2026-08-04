@@ -547,7 +547,8 @@ static int materialize_context_sets(cbm_pipeline_ctx_t *ctx,
                  contexts_text, "file_context_bindings", bindings_text, "cache_builds", "1",
                  "context_reuses", reuse_text, "compiler_baseline_queries",
                  baseline_queries_text, "compiler_baseline_reuses", baseline_reuses_text,
-                 "cache", "generation_owned_immutable");
+                 "cache", "generation_owned_immutable", "entry_source_cache", "source_slab",
+                 "entry_source_disk_reads", "0");
     return 0;
 }
 
@@ -612,6 +613,9 @@ static int parse_embedded_commands(cbm_pipeline_ctx_t *ctx,
                                 "free memory and retry the unchanged corpus");
         }
         compile_context_owner_t *owner = &index->contexts[index->context_count];
+        /* Publish ownership immediately so every later fail-closed return is
+         * reclaimed by cbm_compile_context_index_free(). */
+        index->context_count++;
         owner->tu_rel_path = strdup(file);
         owner->directory = normalize_slashes_dup(directory);
         owner->dependencies = dependencies;
@@ -634,7 +638,31 @@ static int parse_embedded_commands(cbm_pipeline_ctx_t *ctx,
                                 "source discovery",
                                 "repair discovery exclusions or regenerate the build context");
         }
+        ptrdiff_t translation_unit_index = translation_unit - source_files;
+        if (translation_unit_index < 0 || translation_unit_index >= source_count) {
+            free_string_array(arguments, argument_count);
+            return context_fail(
+                ctx, "CBM_COMPILE_CONTEXT_TU_SOURCE_INVALID", "bind_translation_unit_source",
+                file, 0,
+                "the consuming translation unit has no stable immutable source-slab index",
+                "preserve the source-slab diagnostic and retry the complete unchanged corpus");
+        }
+        size_t entry_source_len = 0;
+        const uint8_t *entry_source =
+            cbm_source_slab_get(ctx->source_slab, (int)translation_unit_index,
+                                &entry_source_len);
+        if (!entry_source || entry_source_len > (size_t)INT_MAX ||
+            entry_source_len != (size_t)translation_unit->size) {
+            free_string_array(arguments, argument_count);
+            return context_fail(
+                ctx, "CBM_COMPILE_CONTEXT_TU_SOURCE_INVALID", "bind_translation_unit_source",
+                file, entry_source_len,
+                "the consuming translation unit is absent or inconsistent in the immutable source slab",
+                "preserve the source-slab diagnostic and retry the complete unchanged corpus");
+        }
         owner->view.entry_path = translation_unit->path;
+        owner->view.entry_source = (const char *)entry_source;
+        owner->view.entry_source_len = (int)entry_source_len;
         cbm_sha256_ctx hash;
         uint8_t digest[CBM_SHA256_DIGEST_LEN];
         char hex[CBM_SHA256_HEX_LEN + 1];
@@ -656,7 +684,6 @@ static int parse_embedded_commands(cbm_pipeline_ctx_t *ctx,
                                 file, 0, "the context identity could not be retained",
                                 "free memory and retry the unchanged corpus");
         }
-        index->context_count++;
     }
     return materialize_context_sets(ctx, index, source_files, source_count);
 }
