@@ -12,7 +12,8 @@ use astrolabe_anchors::{
 };
 use astrolabe_bridge::{
     CbmIndexMode, CbmPipeline, CbmPipelineEdgeRow, CbmPipelineFileHashRow, CbmPipelineNodeRow,
-    CbmPipelineRowManifest, CbmPipelineRows, discover_pipeline_files,
+    CbmPipelineRowManifest, CbmPipelineRows, ExtractedFile, Import, ImportResolution, Language,
+    discover_pipeline_files,
 };
 // #502: share the clone farm's #480 Windows-invalid-path classifier so the historical
 // checkout and the farm never disagree on what NTFS can hold.
@@ -29,6 +30,13 @@ const ARCHAEOLOGY_ANCHOR_BATCH_ENV: &str = "ASTRO_ARCHAEOLOGY_ANCHOR_BATCH_ENTRI
 const ARCHAEOLOGY_HISTORICAL_BATCH_ENV: &str = "ASTRO_ARCHAEOLOGY_HISTORICAL_BATCH_GROUPS";
 const ARCHAEOLOGY_DIFF_TREE_BATCH_ENV: &str = "ASTRO_ARCHAEOLOGY_DIFF_TREE_BATCH_COMMITS";
 const HISTORICAL_CAT_FILE_BATCH_PATHS: usize = 4096;
+/// Hard correctness bound for one commit's exact source-dependency closure.
+/// A closure at this size is no longer a file-scoped historical slice and must
+/// be diagnosed explicitly instead of exhausting memory or silently switching
+/// to a whole-tree fallback.
+const HISTORICAL_DEPENDENCY_CLOSURE_MAX_FILES: usize = 65_536;
+/// Match libcbm's authoritative per-file extraction budget.
+const HISTORICAL_DEPENDENCY_EXTRACT_TIMEOUT_MICROS: i64 = 5_000_000;
 
 /// Write-side prefix for the transient git-archaeology scratch STORE this module
 /// drops into the CBM store dir: the historical-index scratch database
@@ -300,6 +308,19 @@ pub(crate) struct GitArchaeologyImportReport {
     pub(crate) historical_git_cat_file_stdout_bytes: u64,
     /// Exact files materialized from commit-bound temporary indexes.
     pub(crate) historical_git_files_materialized: usize,
+    /// Exact repository-local source dependencies added beyond the evidence
+    /// seed set so each file-scoped CBM view is dependency-complete.
+    pub(crate) historical_dependency_files_materialized: usize,
+    /// Alternative immutable-tree candidates probed and proven absent while a
+    /// typed Rust/ES dependency still resolved to exactly one live source.
+    pub(crate) historical_dependency_candidate_paths_absent: usize,
+    /// Exact source-dependency edges traversed while closing historical views.
+    pub(crate) historical_dependency_edges: usize,
+    /// Repeated dependency targets suppressed by the visited set (including
+    /// finite cycles); every unique blob is materialized at most once.
+    pub(crate) historical_dependency_revisits: usize,
+    /// Deepest transitive exact-source expansion round observed in this pass.
+    pub(crate) historical_dependency_max_depth: usize,
     /// Requested implicated paths absent at their historical commit. This is a
     /// labeled expected state for deleted/renamed evidence paths, never a silent
     /// materialization miss.
@@ -705,6 +726,14 @@ pub(crate) fn run_git_archaeology<C: Clock>(
         report.historical_git_cat_file_processes += indexed.git_cat_file_processes;
         report.historical_git_cat_file_stdout_bytes += indexed.git_cat_file_stdout_bytes;
         report.historical_git_files_materialized += indexed.files_materialized;
+        report.historical_dependency_files_materialized += indexed.dependency_files_materialized;
+        report.historical_dependency_candidate_paths_absent +=
+            indexed.dependency_candidate_paths_absent;
+        report.historical_dependency_edges += indexed.dependency_edges;
+        report.historical_dependency_revisits += indexed.dependency_revisits;
+        report.historical_dependency_max_depth = report
+            .historical_dependency_max_depth
+            .max(indexed.dependency_depth);
         report.historical_git_paths_absent += indexed.paths_absent;
         report.historical_git_source_files_materialized += indexed.source_files_materialized;
         report.historical_commits_without_materialized_source +=
@@ -2838,6 +2867,11 @@ struct HistoricalCommitIndex {
     paths_absent: usize,
     source_files_materialized: usize,
     object_probe_processes_avoided: usize,
+    dependency_files_materialized: usize,
+    dependency_candidate_paths_absent: usize,
+    dependency_edges: usize,
+    dependency_revisits: usize,
+    dependency_depth: usize,
     /// #515: `Some(detail)` when the isolated CBM extraction child died without
     /// producing rows (a contained C-level pipeline fault on this commit). The host
     /// survives so the caller can fail the index-wide request with exact evidence
@@ -2856,6 +2890,11 @@ struct HistoricalMaterialization {
     files_materialized: usize,
     paths_absent: usize,
     object_probe_processes_avoided: usize,
+    dependency_files_materialized: usize,
+    dependency_candidate_paths_absent: usize,
+    dependency_edges: usize,
+    dependency_revisits: usize,
+    dependency_depth: usize,
 }
 
 /// Outcome of the pooled historical CBM extraction ([`HistoricalExtractionPool::extract`]):
@@ -3016,6 +3055,11 @@ fn index_historical_commit(
                 paths_absent: materialized.paths_absent,
                 source_files_materialized,
                 object_probe_processes_avoided: materialized.object_probe_processes_avoided,
+                dependency_files_materialized: materialized.dependency_files_materialized,
+                dependency_candidate_paths_absent: materialized.dependency_candidate_paths_absent,
+                dependency_edges: materialized.dependency_edges,
+                dependency_revisits: materialized.dependency_revisits,
+                dependency_depth: materialized.dependency_depth,
                 crashed: None,
             })
         }
@@ -3055,6 +3099,11 @@ fn index_historical_commit(
                 paths_absent: materialized.paths_absent,
                 source_files_materialized,
                 object_probe_processes_avoided: materialized.object_probe_processes_avoided,
+                dependency_files_materialized: materialized.dependency_files_materialized,
+                dependency_candidate_paths_absent: materialized.dependency_candidate_paths_absent,
+                dependency_edges: materialized.dependency_edges,
+                dependency_revisits: materialized.dependency_revisits,
+                dependency_depth: materialized.dependency_depth,
                 crashed: Some(detail),
             })
         }
@@ -3800,8 +3849,19 @@ fn materialize_historical_tree(
             requested.insert(toplevel_path);
         }
         object_probe_processes_avoided = requested.len();
-        let materialized =
-            materialize_file_scoped_historical_blobs(repo, checkout_root, commit, &requested)?;
+        let materialized = materialize_file_scoped_historical_closure(
+            repo,
+            checkout_root,
+            commit,
+            corpus_rel,
+            &requested,
+        )?;
+        object_probe_processes_avoided = object_probe_processes_avoided
+            .checked_add(materialized.dependency_files_materialized)
+            .ok_or_else(|| -> DynError {
+                "ASTRO_ARCHAEOLOGY_DEPENDENCY_TELEMETRY_OVERFLOW: avoided object probe count overflowed usize"
+                    .into()
+            })?;
         return Ok(HistoricalMaterialization {
             windows_invalid_excluded,
             git_inventory_processes: 0,
@@ -3811,6 +3871,11 @@ fn materialize_historical_tree(
             files_materialized: materialized.files_materialized,
             paths_absent: materialized.paths_absent,
             object_probe_processes_avoided,
+            dependency_files_materialized: materialized.dependency_files_materialized,
+            dependency_candidate_paths_absent: materialized.dependency_candidate_paths_absent,
+            dependency_edges: materialized.dependency_edges,
+            dependency_revisits: materialized.dependency_revisits,
+            dependency_depth: materialized.dependency_depth,
         });
     }
 
@@ -3929,6 +3994,11 @@ fn materialize_historical_tree(
         files_materialized: selected.len(),
         paths_absent: 0,
         object_probe_processes_avoided,
+        dependency_files_materialized: 0,
+        dependency_candidate_paths_absent: 0,
+        dependency_edges: 0,
+        dependency_revisits: 0,
+        dependency_depth: 0,
     })
 }
 
@@ -3937,6 +4007,13 @@ struct FileScopedHistoricalBlobMaterialization {
     stdout_bytes: u64,
     files_materialized: usize,
     paths_absent: usize,
+    absent_paths: Vec<String>,
+    dependency_files_materialized: usize,
+    dependency_candidate_paths_absent: usize,
+    dependency_edges: usize,
+    dependency_revisits: usize,
+    dependency_depth: usize,
+    dependency_closure_sha256: String,
 }
 
 #[derive(Debug, Clone)]
@@ -3958,6 +4035,13 @@ fn materialize_file_scoped_historical_blobs(
         stdout_bytes: 0,
         files_materialized: 0,
         paths_absent: 0,
+        absent_paths: Vec::new(),
+        dependency_files_materialized: 0,
+        dependency_candidate_paths_absent: 0,
+        dependency_edges: 0,
+        dependency_revisits: 0,
+        dependency_depth: 0,
+        dependency_closure_sha256: String::new(),
     };
     if requested.is_empty() {
         return Ok(report);
@@ -3965,7 +4049,7 @@ fn materialize_file_scoped_historical_blobs(
 
     let requested_paths = requested.iter().map(String::as_str).collect::<Vec<_>>();
     for chunk in requested_paths.chunks(HISTORICAL_CAT_FILE_BATCH_PATHS) {
-        let (objects, info_stdout_bytes, paths_absent) =
+        let (objects, info_stdout_bytes, absent_paths) =
             resolve_file_scoped_historical_blobs(repo, commit, chunk)?;
         report.git_cat_file_processes = report.git_cat_file_processes.checked_add(1).ok_or_else(
             || -> DynError {
@@ -3980,16 +4064,16 @@ fn materialize_file_scoped_historical_blobs(
                 "ASTRO_ARCHAEOLOGY_CAT_FILE_TELEMETRY_OVERFLOW: cat-file stdout bytes overflowed"
                     .into()
             })?;
-        report.paths_absent =
-            report
+        report.paths_absent = report
                 .paths_absent
-                .checked_add(paths_absent)
+                .checked_add(absent_paths.len())
                 .ok_or_else(|| -> DynError {
                     format!(
                         "ASTRO_ARCHAEOLOGY_CAT_FILE_ABSENT_OVERFLOW: commit {commit} absent path count overflowed"
                     )
                     .into()
                 })?;
+        report.absent_paths.extend(absent_paths);
         if objects.is_empty() {
             continue;
         }
@@ -4019,11 +4103,450 @@ fn materialize_file_scoped_historical_blobs(
     Ok(report)
 }
 
+#[derive(Clone, Copy)]
+enum DependencyCardinality {
+    ExactlyOne,
+    AtMostOne,
+}
+
+struct HistoricalDependencyRequest {
+    source_path: String,
+    module_path: String,
+    kind: String,
+    candidates: Vec<String>,
+    cardinality: DependencyCardinality,
+}
+
+fn plan_historical_dependency(
+    source_path: &str,
+    source_rel: &str,
+    import: &Import,
+) -> Result<Option<HistoricalDependencyRequest>, DynError> {
+    let (candidates, cardinality, default_kind) = match import.resolution {
+        ImportResolution::ExactSource => (
+            vec![normalize_exact_source_dependency(
+                source_rel,
+                &import.module_path,
+            )?],
+            DependencyCardinality::ExactlyOne,
+            "exact_source",
+        ),
+        ImportResolution::RustModule => (
+            rust_module_dependency_candidates(source_rel, &import.module_path)?,
+            DependencyCardinality::ExactlyOne,
+            "rust_module",
+        ),
+        ImportResolution::EsSource if is_relative_source_request(&import.module_path) => (
+            es_source_dependency_candidates(source_rel, &import.module_path)?,
+            DependencyCardinality::ExactlyOne,
+            "es_source",
+        ),
+        ImportResolution::BrowserUrl
+            if is_relative_source_request(&import.module_path)
+                && !import.module_path.contains(['?', '#', '%', '\\']) =>
+        {
+            (
+                vec![normalize_exact_source_dependency(
+                    source_rel,
+                    &import.module_path,
+                )?],
+                DependencyCardinality::AtMostOne,
+                "browser_source",
+            )
+        }
+        ImportResolution::Semantic
+        | ImportResolution::ExternalSource
+        | ImportResolution::EsSource
+        | ImportResolution::BrowserUrl => return Ok(None),
+    };
+    let candidates = candidates.into_iter().collect::<BTreeSet<_>>();
+    if candidates.is_empty() {
+        return Err(format!(
+            "ASTRO_ARCHAEOLOGY_DEPENDENCY_PLAN_EMPTY: source {source_rel:?} dependency {:?} produced no immutable-tree candidates; remediation=repair the typed CBM dependency planner before retrying",
+            import.module_path
+        )
+        .into());
+    }
+    Ok(Some(HistoricalDependencyRequest {
+        source_path: source_path.to_string(),
+        module_path: import.module_path.clone(),
+        kind: import
+            .dependency_kind
+            .clone()
+            .unwrap_or_else(|| default_kind.to_string()),
+        candidates: candidates.into_iter().collect(),
+        cardinality,
+    }))
+}
+
+fn is_relative_source_request(module_path: &str) -> bool {
+    module_path.starts_with("./") || module_path.starts_with("../")
+}
+
+fn es_source_dependency_candidates(
+    source_rel: &str,
+    module_path: &str,
+) -> Result<Vec<String>, DynError> {
+    let family: Option<(&str, &[&str])> = if module_path.ends_with(".mjs") {
+        Some((".mjs", &[".mts", ".d.mts", ".mjs"]))
+    } else if module_path.ends_with(".cjs") {
+        Some((".cjs", &[".cts", ".d.cts", ".cjs"]))
+    } else if module_path.ends_with(".jsx") {
+        Some((".jsx", &[".tsx", ".d.ts", ".jsx"]))
+    } else if module_path.ends_with(".js") {
+        Some((".js", &[".ts", ".tsx", ".d.ts", ".js", ".jsx"]))
+    } else {
+        None
+    };
+    let Some((suffix, replacements)) = family else {
+        return Ok(vec![normalize_exact_source_dependency(
+            source_rel,
+            module_path,
+        )?]);
+    };
+    let stem = module_path.strip_suffix(suffix).ok_or_else(|| -> DynError {
+        format!(
+            "ASTRO_ARCHAEOLOGY_DEPENDENCY_ES_SUFFIX_INVALID: source {source_rel:?} module {module_path:?} lost its matched runtime suffix; remediation=repair the ordered ES substitution planner"
+        )
+        .into()
+    })?;
+    replacements
+        .iter()
+        .map(|replacement| {
+            normalize_exact_source_dependency(source_rel, &format!("{stem}{replacement}"))
+        })
+        .collect()
+}
+
+fn rust_module_dependency_candidates(
+    source_rel: &str,
+    module_path: &str,
+) -> Result<Vec<String>, DynError> {
+    let source_name = source_rel.rsplit('/').next().unwrap_or(source_rel);
+    let module_prefix = if matches!(source_name, "lib.rs" | "main.rs" | "mod.rs") {
+        module_path.to_string()
+    } else {
+        let stem = source_name.strip_suffix(".rs").ok_or_else(|| -> DynError {
+            format!(
+                "ASTRO_ARCHAEOLOGY_DEPENDENCY_RUST_SOURCE_INVALID: Rust module dependency source {source_rel:?} has no .rs suffix; remediation=repair the language/path contract before retrying"
+            )
+            .into()
+        })?;
+        format!("{stem}/{module_path}")
+    };
+    Ok(vec![
+        normalize_exact_source_dependency(source_rel, &format!("{module_prefix}.rs"))?,
+        normalize_exact_source_dependency(source_rel, &format!("{module_prefix}/mod.rs"))?,
+    ])
+}
+
+/// Materialize the evidence seed set and then close every exact repository-local
+/// source dependency using libcbm's own extraction semantics. The ordinary CBM
+/// pipeline remains fail-closed; this planner makes its filesystem view truthful
+/// instead of asking it to resolve a deliberately incomplete checkout.
+fn materialize_file_scoped_historical_closure(
+    repo: &Path,
+    checkout_root: &Path,
+    commit: &str,
+    corpus_rel: &str,
+    requested: &BTreeSet<String>,
+) -> Result<FileScopedHistoricalBlobMaterialization, DynError> {
+    let mut report =
+        materialize_file_scoped_historical_blobs(repo, checkout_root, commit, requested)?;
+    let mut visited = requested.clone();
+    let mut probed = requested.clone();
+    let mut frontier = requested
+        .iter()
+        .filter(|path| checkout_root.join(path.as_str()).is_file())
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let mut dependency_edges = BTreeSet::<(String, String, String)>::new();
+    let mut depth = 0usize;
+
+    while !frontier.is_empty() {
+        let mut requests = Vec::<HistoricalDependencyRequest>::new();
+        let mut candidates_to_probe = BTreeSet::new();
+        for source_path in &frontier {
+            let source_rel = corpus_relative_materialized_path(source_path, corpus_rel)?;
+            let Some(language) = Language::from_filename(source_rel) else {
+                continue;
+            };
+            let physical_path = checkout_root.join(source_path);
+            let source_bytes = fs::read(&physical_path).map_err(|error| -> DynError {
+                format!(
+                    "ASTRO_ARCHAEOLOGY_DEPENDENCY_SOURCE_READ_FAILED: commit {commit} could not read materialized source {}: {error}; remediation=preserve the checkout and repair the exact filesystem read before retrying",
+                    physical_path.display()
+                )
+                .into()
+            })?;
+            let source = std::str::from_utf8(&source_bytes).map_err(|error| -> DynError {
+                format!(
+                    "ASTRO_ARCHAEOLOGY_DEPENDENCY_SOURCE_INVALID_UTF8: commit {commit} source {source_rel:?} is not valid UTF-8: {error}; remediation=extend the CBM extraction bridge with the source's authoritative byte encoding before historical indexing"
+                )
+                .into()
+            })?;
+            let extracted = ExtractedFile::extract(
+                source,
+                language,
+                "astrolabe-historical-dependency-plan",
+                source_rel,
+                HISTORICAL_DEPENDENCY_EXTRACT_TIMEOUT_MICROS,
+            )
+            .map_err(|error| -> DynError {
+                format!(
+                    "ASTRO_ARCHAEOLOGY_DEPENDENCY_EXTRACT_FAILED: commit {commit} source {source_rel:?} could not produce its exact dependency plan: {error}; remediation=fix the authoritative CBM extraction fault before retrying"
+                )
+                .into()
+            })?;
+            for import in extracted.imports().map_err(|error| -> DynError {
+                format!(
+                    "ASTRO_ARCHAEOLOGY_DEPENDENCY_IMPORT_READ_FAILED: commit {commit} source {source_rel:?} returned an invalid import record: {error}; remediation=repair the CBM/Rust import contract before retrying"
+                )
+                .into()
+            })? {
+                let Some(request) = plan_historical_dependency(source_path, source_rel, &import)?
+                else {
+                    continue;
+                };
+                for candidate in &request.candidates {
+                    let materialized = corpus_materialized_path(corpus_rel, candidate);
+                    if let Some(reason) = windows_invalid_path(materialized.as_bytes()) {
+                        return Err(format!(
+                            "ASTRO_ARCHAEOLOGY_DEPENDENCY_WINDOWS_PATH_INVALID: commit {commit} source {source_rel:?} dependency {:?} resolves to Windows-unrepresentable path {materialized:?} ({reason}); remediation=repair the dependency path or index this commit on a filesystem that can represent it",
+                            import.module_path
+                        )
+                        .into());
+                    }
+                    if !probed.contains(&materialized) {
+                        candidates_to_probe.insert(materialized);
+                    }
+                }
+                requests.push(request);
+            }
+        }
+
+        if !candidates_to_probe.is_empty() {
+            let materialized = materialize_file_scoped_historical_blobs(
+                repo,
+                checkout_root,
+                commit,
+                &candidates_to_probe,
+            )?;
+            probed.extend(candidates_to_probe);
+            report.git_cat_file_processes = report
+                .git_cat_file_processes
+                .checked_add(materialized.git_cat_file_processes)
+                .ok_or_else(|| -> DynError {
+                    "ASTRO_ARCHAEOLOGY_CAT_FILE_TELEMETRY_OVERFLOW: dependency cat-file process count overflowed"
+                        .into()
+                })?;
+            report.stdout_bytes = report
+                .stdout_bytes
+                .checked_add(materialized.stdout_bytes)
+                .ok_or_else(|| -> DynError {
+                    "ASTRO_ARCHAEOLOGY_CAT_FILE_TELEMETRY_OVERFLOW: dependency cat-file stdout bytes overflowed"
+                        .into()
+                })?;
+            report.files_materialized = report
+                .files_materialized
+                .checked_add(materialized.files_materialized)
+                .ok_or_else(|| -> DynError {
+                    "ASTRO_ARCHAEOLOGY_CAT_FILE_MATERIALIZED_OVERFLOW: dependency materialized file count overflowed"
+                        .into()
+                })?;
+            report.dependency_files_materialized = report
+                .dependency_files_materialized
+                .checked_add(materialized.files_materialized)
+                .ok_or_else(|| -> DynError {
+                    "ASTRO_ARCHAEOLOGY_DEPENDENCY_FILE_OVERFLOW: materialized dependency file count overflowed"
+                        .into()
+                })?;
+            report.dependency_candidate_paths_absent = report
+                .dependency_candidate_paths_absent
+                .checked_add(materialized.paths_absent)
+                .ok_or_else(|| -> DynError {
+                    "ASTRO_ARCHAEOLOGY_DEPENDENCY_CANDIDATE_ABSENT_OVERFLOW: absent dependency candidate count overflowed usize"
+                        .into()
+                })?;
+        }
+
+        let mut next = BTreeSet::new();
+        for request in requests {
+            let matches = request
+                .candidates
+                .iter()
+                .map(|candidate| corpus_materialized_path(corpus_rel, candidate))
+                .filter(|candidate| checkout_root.join(candidate).is_file())
+                .collect::<Vec<_>>();
+            let selected = match (request.cardinality, matches.as_slice()) {
+                (DependencyCardinality::ExactlyOne, [selected])
+                | (DependencyCardinality::AtMostOne, [selected]) => Some(selected.clone()),
+                (DependencyCardinality::AtMostOne, []) => None,
+                (DependencyCardinality::ExactlyOne, []) => {
+                    return Err(format!(
+                        "ASTRO_ARCHAEOLOGY_DEPENDENCY_SOURCE_MISSING: commit {commit} source {:?} {} dependency {:?} has no source among {:?}; remediation=restore the exact source file or repair the importing path before retrying; no partial historical view was indexed",
+                        request.source_path, request.kind, request.module_path, request.candidates
+                    )
+                    .into());
+                }
+                (_, _) => {
+                    return Err(format!(
+                        "ASTRO_ARCHAEOLOGY_DEPENDENCY_SOURCE_AMBIGUOUS: commit {commit} source {:?} {} dependency {:?} matches multiple immutable-tree sources {:?}; remediation=remove the conflicting source candidates before retrying; no partial historical view was indexed",
+                        request.source_path, request.kind, request.module_path, matches
+                    )
+                    .into());
+                }
+            };
+            let Some(selected) = selected else {
+                continue;
+            };
+            report.dependency_edges = report.dependency_edges.checked_add(1).ok_or_else(
+                || -> DynError {
+                    "ASTRO_ARCHAEOLOGY_DEPENDENCY_EDGE_OVERFLOW: source dependency edge count overflowed usize"
+                        .into()
+                },
+            )?;
+            dependency_edges.insert((request.source_path, selected.clone(), request.kind));
+            if visited.insert(selected.clone()) {
+                if visited.len() > HISTORICAL_DEPENDENCY_CLOSURE_MAX_FILES {
+                    return Err(format!(
+                        "ASTRO_ARCHAEOLOGY_DEPENDENCY_CLOSURE_LIMIT: commit {commit} source dependency closure exceeded {HISTORICAL_DEPENDENCY_CLOSURE_MAX_FILES} unique files at {selected:?}; remediation=inspect the closure for a malformed/generated dependency fanout and raise the compile-time bound only with measured memory and object-stream evidence"
+                    )
+                    .into());
+                }
+                next.insert(selected);
+            } else {
+                report.dependency_revisits = report
+                    .dependency_revisits
+                    .checked_add(1)
+                    .ok_or_else(|| -> DynError {
+                        "ASTRO_ARCHAEOLOGY_DEPENDENCY_REVISIT_OVERFLOW: dependency revisit count overflowed usize"
+                            .into()
+                    })?;
+            }
+        }
+        if next.is_empty() {
+            break;
+        }
+        depth = depth.checked_add(1).ok_or_else(|| -> DynError {
+            "ASTRO_ARCHAEOLOGY_DEPENDENCY_DEPTH_OVERFLOW: dependency closure depth overflowed usize"
+                .into()
+        })?;
+        frontier = next;
+    }
+
+    report.dependency_depth = depth;
+    let mut hasher = Sha256::new();
+    hash_dependency_closure_part(&mut hasher, b"astrolabe.historical-dependency-closure.v1")?;
+    for path in &visited {
+        hash_dependency_closure_part(&mut hasher, b"file")?;
+        hash_dependency_closure_part(&mut hasher, path.as_bytes())?;
+    }
+    for (source, target, kind) in &dependency_edges {
+        hash_dependency_closure_part(&mut hasher, b"edge")?;
+        hash_dependency_closure_part(&mut hasher, source.as_bytes())?;
+        hash_dependency_closure_part(&mut hasher, target.as_bytes())?;
+        hash_dependency_closure_part(&mut hasher, kind.as_bytes())?;
+    }
+    report.dependency_closure_sha256 = hex_lower(&hasher.finalize());
+    eprintln!(
+        "astro.archaeology.dependency_closure commit={commit} seeds={} dependencies={} candidate_paths_absent={} edges={} revisits={} depth={} closure_sha256={}",
+        requested.len(),
+        report.dependency_files_materialized,
+        report.dependency_candidate_paths_absent,
+        report.dependency_edges,
+        report.dependency_revisits,
+        report.dependency_depth,
+        report.dependency_closure_sha256
+    );
+    Ok(report)
+}
+
+fn corpus_relative_materialized_path<'a>(
+    materialized_path: &'a str,
+    corpus_rel: &str,
+) -> Result<&'a str, DynError> {
+    if corpus_rel.is_empty() {
+        return Ok(materialized_path);
+    }
+    let prefix = format!("{corpus_rel}/");
+    materialized_path.strip_prefix(&prefix).ok_or_else(|| {
+        format!(
+            "ASTRO_ARCHAEOLOGY_DEPENDENCY_SCOPE_MISMATCH: materialized path {materialized_path:?} is outside corpus {corpus_rel:?}; remediation=repair the commit-bound path framing before extraction"
+        )
+        .into()
+    })
+}
+
+fn corpus_materialized_path(corpus_rel: &str, dependency_rel: &str) -> String {
+    if corpus_rel.is_empty() {
+        dependency_rel.to_string()
+    } else {
+        format!("{corpus_rel}/{dependency_rel}")
+    }
+}
+
+/// Mirrors libcbm's `normalize_source_candidate` contract for exact-source
+/// imports: separator normalization, dot removal, and fail-closed corpus escape.
+fn normalize_exact_source_dependency(
+    source_rel: &str,
+    module_path: &str,
+) -> Result<String, DynError> {
+    let module_path = module_path.replace('\\', "/");
+    if module_path.is_empty()
+        || module_path.starts_with('/')
+        || module_path.as_bytes().get(1) == Some(&b':')
+    {
+        return Err(format!(
+            "ASTRO_ARCHAEOLOGY_DEPENDENCY_PATH_INVALID: source {source_rel:?} exact dependency {module_path:?} cannot identify a repository-relative source; remediation=repair the exact import spelling"
+        )
+        .into());
+    }
+    let parent = source_rel.rsplit_once('/').map_or("", |(parent, _)| parent);
+    let joined = if parent.is_empty() {
+        module_path.clone()
+    } else {
+        format!("{parent}/{module_path}")
+    };
+    let mut components = Vec::new();
+    for component in joined.split('/') {
+        match component {
+            "" | "." => {}
+            ".." => {
+                if components.pop().is_none() {
+                    return Err(format!(
+                        "ASTRO_ARCHAEOLOGY_DEPENDENCY_SCOPE_ESCAPE: source {source_rel:?} exact dependency {module_path:?} escapes the indexed corpus; remediation=keep the import inside the corpus or widen the explicitly indexed corpus"
+                    )
+                    .into());
+                }
+            }
+            value => components.push(value),
+        }
+    }
+    if components.is_empty() {
+        return Err(format!(
+            "ASTRO_ARCHAEOLOGY_DEPENDENCY_PATH_INVALID: source {source_rel:?} exact dependency {module_path:?} normalizes to an empty path; remediation=repair the exact import spelling"
+        )
+        .into());
+    }
+    Ok(components.join("/"))
+}
+
+fn hash_dependency_closure_part(hasher: &mut Sha256, bytes: &[u8]) -> Result<(), DynError> {
+    let len = u64::try_from(bytes.len()).map_err(|_| -> DynError {
+        "ASTRO_ARCHAEOLOGY_DEPENDENCY_HASH_LENGTH_OVERFLOW: closure component length exceeds u64; remediation=preserve the scratch generation and inspect the impossible platform width mismatch"
+            .into()
+    })?;
+    hasher.update(len.to_be_bytes());
+    hasher.update(bytes);
+    Ok(())
+}
+
 fn resolve_file_scoped_historical_blobs(
     repo: &Path,
     commit: &str,
     requested: &[&str],
-) -> Result<(Vec<HistoricalBlobObject>, u64, usize), DynError> {
+) -> Result<(Vec<HistoricalBlobObject>, u64, Vec<String>), DynError> {
     let mut input = Vec::new();
     for path in requested {
         input.extend_from_slice(b"info ");
@@ -4065,7 +4588,7 @@ fn resolve_file_scoped_historical_blobs(
         .into());
     }
     let mut objects = Vec::new();
-    let mut paths_absent = 0usize;
+    let mut absent_paths = Vec::new();
     for (path, record) in requested.iter().zip(records) {
         let record = std::str::from_utf8(record).map_err(|error| -> DynError {
             format!(
@@ -4075,12 +4598,7 @@ fn resolve_file_scoped_historical_blobs(
         })?;
         let query = format!("{commit}:{path}");
         if record == format!("{query} missing") {
-            paths_absent = paths_absent.checked_add(1).ok_or_else(|| -> DynError {
-                format!(
-                    "ASTRO_ARCHAEOLOGY_CAT_FILE_ABSENT_OVERFLOW: commit {commit} absent path count overflowed"
-                )
-                .into()
-            })?;
+            absent_paths.push((*path).to_string());
             continue;
         }
         let (object_oid, object_type, object_mode, object_size) =
@@ -4098,7 +4616,7 @@ fn resolve_file_scoped_historical_blobs(
             object_size,
         });
     }
-    Ok((objects, stdout_bytes, paths_absent))
+    Ok((objects, stdout_bytes, absent_paths))
 }
 
 fn parse_cat_file_blob_info_record<'a>(
@@ -4384,6 +4902,13 @@ fn parse_file_scoped_historical_blob_stream<R: BufRead>(
         stdout_bytes,
         files_materialized,
         paths_absent: 0,
+        absent_paths: Vec::new(),
+        dependency_files_materialized: 0,
+        dependency_candidate_paths_absent: 0,
+        dependency_edges: 0,
+        dependency_revisits: 0,
+        dependency_depth: 0,
+        dependency_closure_sha256: String::new(),
     })
 }
 
@@ -4840,6 +5365,26 @@ pub(crate) fn git_archaeology_summary(report: &GitArchaeologyImportReport) -> Va
     insert_number!(
         "historical_git_files_materialized",
         report.historical_git_files_materialized
+    );
+    insert_number!(
+        "historical_dependency_files_materialized",
+        report.historical_dependency_files_materialized
+    );
+    insert_number!(
+        "historical_dependency_candidate_paths_absent",
+        report.historical_dependency_candidate_paths_absent
+    );
+    insert_number!(
+        "historical_dependency_edges",
+        report.historical_dependency_edges
+    );
+    insert_number!(
+        "historical_dependency_revisits",
+        report.historical_dependency_revisits
+    );
+    insert_number!(
+        "historical_dependency_max_depth",
+        report.historical_dependency_max_depth
     );
     insert_number!(
         "historical_git_paths_absent",

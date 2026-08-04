@@ -2383,8 +2383,12 @@ impl ExtractedFile {
             .iter()
             .map(|item| {
                 Ok(Import {
-                    local_name: self.required_string(item.local_name, "import.local_name")?,
+                    local_name: self.optional_string(item.local_name)?,
                     module_path: self.required_string(item.module_path, "import.module_path")?,
+                    resource_kind: self.optional_string(item.resource_kind)?,
+                    dependency_kind: self.optional_string(item.dependency_kind)?,
+                    resolution: ImportResolution::try_from(item.resolution)?,
+                    binding: ImportBinding::try_from(item.binding)?,
                 })
             })
             .collect()
@@ -2772,10 +2776,78 @@ pub struct Call {
     pub is_method: bool,
 }
 
+/// Source-resolution semantics retained byte-for-byte from libcbm extraction.
+///
+/// Historical dependency planning must distinguish an exact repository source
+/// assertion from a semantic package/module name. Collapsing both to a string
+/// either invents local files for external packages or misses required source
+/// context in a file-scoped historical view.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum ImportResolution {
+    Semantic,
+    ExactSource,
+    ExternalSource,
+    EsSource,
+    BrowserUrl,
+    RustModule,
+}
+
+impl TryFrom<cbm_sys::CBMImportResolution> for ImportResolution {
+    type Error = BridgeError;
+
+    fn try_from(value: cbm_sys::CBMImportResolution) -> Result<Self, Self::Error> {
+        match value {
+            cbm_sys::CBMImportResolution_CBM_IMPORT_RESOLVE_SEMANTIC => Ok(Self::Semantic),
+            cbm_sys::CBMImportResolution_CBM_IMPORT_RESOLVE_EXACT_SOURCE => Ok(Self::ExactSource),
+            cbm_sys::CBMImportResolution_CBM_IMPORT_RESOLVE_EXTERNAL_SOURCE => {
+                Ok(Self::ExternalSource)
+            }
+            cbm_sys::CBMImportResolution_CBM_IMPORT_RESOLVE_ES_SOURCE => Ok(Self::EsSource),
+            cbm_sys::CBMImportResolution_CBM_IMPORT_RESOLVE_BROWSER_URL => Ok(Self::BrowserUrl),
+            cbm_sys::CBMImportResolution_CBM_IMPORT_RESOLVE_RUST_MODULE => Ok(Self::RustModule),
+            other => Err(envelope(
+                "ASTRO_CBM_IMPORT_RESOLUTION_INVALID",
+                format!("libcbm returned unknown import resolution value {other}"),
+                "Keep the Rust bridge enum synchronized with CBMImportResolution before consuming the extraction result.",
+            )),
+        }
+    }
+}
+
+/// Whether an import binds a lexical name, records a resource relationship, or
+/// represents an unbound source dependency such as PowerShell dot-sourcing.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum ImportBinding {
+    Local,
+    Resource,
+    Unbound,
+}
+
+impl TryFrom<cbm_sys::CBMImportBinding> for ImportBinding {
+    type Error = BridgeError;
+
+    fn try_from(value: cbm_sys::CBMImportBinding) -> Result<Self, Self::Error> {
+        match value {
+            cbm_sys::CBMImportBinding_CBM_IMPORT_BINDING_LOCAL => Ok(Self::Local),
+            cbm_sys::CBMImportBinding_CBM_IMPORT_BINDING_RESOURCE => Ok(Self::Resource),
+            cbm_sys::CBMImportBinding_CBM_IMPORT_BINDING_UNBOUND => Ok(Self::Unbound),
+            other => Err(envelope(
+                "ASTRO_CBM_IMPORT_BINDING_INVALID",
+                format!("libcbm returned unknown import binding value {other}"),
+                "Keep the Rust bridge enum synchronized with CBMImportBinding before consuming the extraction result.",
+            )),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct Import {
-    pub local_name: String,
+    pub local_name: Option<String>,
     pub module_path: String,
+    pub resource_kind: Option<String>,
+    pub dependency_kind: Option<String>,
+    pub resolution: ImportResolution,
+    pub binding: ImportBinding,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]

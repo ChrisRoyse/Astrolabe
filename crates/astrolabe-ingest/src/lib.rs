@@ -18,7 +18,7 @@ pub use erasure_scrub::{
     ASTRO_ERASURE_SCRUB_TORN_WAL, ASTRO_ERASURE_SCRUB_WAL_UNCOVERED, WAL_SCRUB_LEDGER_SCHEMA,
     WalScrubParams, WalScrubReport, WalScrubStatus, scrub_erased_wal_history, wal_scrub_status,
 };
-pub use fsv::VaultMutationPlan;
+pub use fsv::{VaultMutationPlan, VaultMutationReadbackMetrics};
 pub use janitor::{
     ASTRO_FSV_JANITOR_CHAIN_DAMAGE, ASTRO_FSV_JANITOR_CHECKPOINT_CORRUPT,
     ASTRO_FSV_JANITOR_INTERVAL_INVALID, ASTRO_FSV_JANITOR_LANE_SPAWN_FAILED,

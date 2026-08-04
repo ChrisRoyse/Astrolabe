@@ -2,9 +2,9 @@
 //! vault-internal snapshot handle (or accept an already-pinned lease) and defer
 //! to the MVCC store's visibility-filtered readers.
 
-use super::{AsterVault, encode};
+use super::{AsterVault, OrderedCfRead, encode};
 use crate::cf::{ColumnFamily, KeyRange};
-use crate::mvcc::Snapshot;
+use crate::mvcc::{OrderedReadbackMetrics, Snapshot};
 use calyx_core::{Clock, Result, Seq};
 
 impl<C> AsterVault<C>
@@ -84,6 +84,115 @@ where
         key: &[u8],
     ) -> Result<Option<Vec<u8>>> {
         self.rows.read_at(snapshot, cf, key, &self.clock)
+    }
+
+    /// Re-reads an exact CF/key plan under one pinned snapshot while grouping
+    /// the physical work by CF and key. Values are borrowed only for the
+    /// callback duration; the complete value corpus is never materialized.
+    ///
+    /// The callback receives each input row's stable `ordinal` exactly once,
+    /// even though physical reads occur in `(CF,key)` order. Tombstone bytes are
+    /// deliberately exposed so a full-state verifier can hash the actual
+    /// persisted marker instead of treating logical absence as sufficient.
+    pub fn visit_ordered_cf_plan_at<E, F>(
+        &self,
+        snapshot: Seq,
+        reads: &[OrderedCfRead<'_>],
+        mut on_row: F,
+    ) -> std::result::Result<OrderedReadbackMetrics, E>
+    where
+        E: From<calyx_core::CalyxError>,
+        F: FnMut(usize, ColumnFamily, &[u8], Option<&[u8]>) -> std::result::Result<(), E>,
+    {
+        let snapshot = self.snapshot_handle(snapshot);
+        if let Some((position, read)) = reads
+            .iter()
+            .enumerate()
+            .find(|(position, read)| read.ordinal != *position)
+        {
+            return Err(E::from(calyx_core::CalyxError::aster_corrupt_shard(
+                format!(
+                    "ordered readback input position {position} carries ordinal {} instead of its stable input position",
+                    read.ordinal
+                ),
+            )));
+        }
+        let mut ordered = reads.to_vec();
+        ordered.sort_unstable_by(|left, right| {
+            left.cf
+                .cmp(&right.cf)
+                .then_with(|| left.key.cmp(right.key))
+                .then_with(|| left.ordinal.cmp(&right.ordinal))
+        });
+        let index_bytes = ordered
+            .capacity()
+            .checked_mul(std::mem::size_of::<OrderedCfRead<'_>>())
+            .and_then(|bytes| u64::try_from(bytes).ok())
+            .ok_or_else(|| {
+                E::from(calyx_core::CalyxError::aster_corrupt_shard(
+                    "ordered readback plan-index byte count overflow",
+                ))
+            })?;
+        let mut metrics = OrderedReadbackMetrics {
+            plan_index_bytes: index_bytes,
+            ..OrderedReadbackMetrics::default()
+        };
+        let mut start = 0;
+        while start < ordered.len() {
+            let cf = ordered[start].cf;
+            let mut end = start + 1;
+            while end < ordered.len() && ordered[end].cf == cf {
+                end += 1;
+            }
+            let keys = ordered[start..end]
+                .iter()
+                .map(|read| (read.ordinal, read.key))
+                .collect::<Vec<_>>();
+            let key_index_bytes = keys
+                .capacity()
+                .checked_mul(std::mem::size_of::<(usize, &[u8])>())
+                .and_then(|bytes| u64::try_from(bytes).ok())
+                .ok_or_else(|| {
+                    E::from(calyx_core::CalyxError::aster_corrupt_shard(
+                        "ordered readback CF-key index byte count overflow",
+                    ))
+                })?;
+            let mut group_metrics = self.rows.visit_cf_key_plan(
+                snapshot.snapshot(),
+                cf,
+                &keys,
+                &self.clock,
+                &mut |ordinal, value| {
+                    let read = reads.get(ordinal).ok_or_else(|| {
+                        E::from(calyx_core::CalyxError::aster_corrupt_shard(format!(
+                            "ordered readback ordinal {ordinal} is outside the {}-row input plan",
+                            reads.len()
+                        )))
+                    })?;
+                    if read.cf != cf {
+                        return Err(E::from(calyx_core::CalyxError::aster_corrupt_shard(
+                            format!(
+                                "ordered readback ordinal {ordinal} changed CF from {} to {}",
+                                read.cf.name(),
+                                cf.name()
+                            ),
+                        )));
+                    }
+                    on_row(ordinal, cf, read.key, value)
+                },
+            )?;
+            group_metrics.plan_index_bytes = index_bytes
+                .checked_add(key_index_bytes)
+                .and_then(|bytes| bytes.checked_add(group_metrics.plan_index_bytes))
+                .ok_or_else(|| {
+                    E::from(calyx_core::CalyxError::aster_corrupt_shard(
+                        "ordered readback peak plan-index byte count overflow",
+                    ))
+                })?;
+            metrics.checked_merge(group_metrics).map_err(E::from)?;
+            start = end;
+        }
+        Ok(metrics)
     }
 
     /// Scans visible raw CF rows at `snapshot`.

@@ -113,6 +113,64 @@ pub struct CfRead {
     pub key: Vec<u8>,
 }
 
+/// Physical accounting for one storage-local ordered readback plan.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct OrderedReadbackMetrics {
+    /// Planned rows delivered to the caller, including physical tombstones and
+    /// explicit absences.
+    pub rows_read_back: u64,
+    /// Persisted value bytes borrowed or read for those rows.
+    pub bytes_read_back: u64,
+    /// Column-family batches traversed under one pinned snapshot.
+    pub read_batches: u64,
+    /// Row-table/memtable/SST sources consulted.
+    pub source_read_operations: u64,
+    /// Immutable SST generations opened. Each generation is opened at most once
+    /// per column-family batch, regardless of the number of planned keys in it.
+    pub sst_files_opened: u64,
+    /// Peak transient ordinal/CF/key-reference index bytes retained at once
+    /// while ordering and resolving the plan.
+    pub plan_index_bytes: u64,
+    /// Largest persisted value borrowed at once. The ordered path never retains
+    /// the complete value corpus.
+    pub max_readback_batch_bytes: u64,
+}
+
+impl OrderedReadbackMetrics {
+    pub(crate) fn checked_merge(&mut self, other: Self) -> Result<()> {
+        self.rows_read_back =
+            checked_metric_add(self.rows_read_back, other.rows_read_back, "rows_read_back")?;
+        self.bytes_read_back = checked_metric_add(
+            self.bytes_read_back,
+            other.bytes_read_back,
+            "bytes_read_back",
+        )?;
+        self.read_batches =
+            checked_metric_add(self.read_batches, other.read_batches, "read_batches")?;
+        self.source_read_operations = checked_metric_add(
+            self.source_read_operations,
+            other.source_read_operations,
+            "source_read_operations",
+        )?;
+        self.sst_files_opened = checked_metric_add(
+            self.sst_files_opened,
+            other.sst_files_opened,
+            "sst_files_opened",
+        )?;
+        self.plan_index_bytes = self.plan_index_bytes.max(other.plan_index_bytes);
+        self.max_readback_batch_bytes = self
+            .max_readback_batch_bytes
+            .max(other.max_readback_batch_bytes);
+        Ok(())
+    }
+}
+
+fn checked_metric_add(left: u64, right: u64, name: &str) -> Result<u64> {
+    left.checked_add(right).ok_or_else(|| {
+        CalyxError::aster_corrupt_shard(format!("ordered readback metric {name} overflowed u64"))
+    })
+}
+
 impl CfRead {
     pub fn new(cf: ColumnFamily, key: impl Into<Vec<u8>>) -> Self {
         Self {

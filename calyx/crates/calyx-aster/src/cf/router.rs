@@ -2,7 +2,7 @@ use super::ColumnFamily;
 use crate::compaction::TieringPolicy;
 use crate::memtable::{Memtable, MemtableUsage};
 use crate::resource::ResourceCounters;
-use crate::sst::level::SstLevel;
+use crate::sst::level::{SstLevel, SstPlanReadMetrics};
 use crate::sst::{SstEntry, SstSummary};
 use crate::storage_names::flush_sst_file_name;
 use calyx_core::{CalyxError, Result};
@@ -32,6 +32,14 @@ pub struct CfRouter {
     pub(super) existing_only: bool,
     pub(super) eager_lookup_cfs: BTreeSet<ColumnFamily>,
     pub(super) eager_lookup_all: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct RouterPlanReadMetrics {
+    pub source_read_operations: u64,
+    pub sst_files_opened: u64,
+    pub max_value_bytes: u64,
+    pub plan_index_bytes: u64,
 }
 
 impl CfRouter {
@@ -332,6 +340,57 @@ impl CfRouter {
             .map_or(Ok(None), |level| level.get(key))
     }
 
+    /// Visits one column family's exact read plan without reopening an SST for
+    /// every key or retaining all returned values.
+    pub(crate) fn visit_key_plan<E, F>(
+        &self,
+        cf: ColumnFamily,
+        keys: &[(usize, &[u8])],
+        on_value: &mut F,
+    ) -> std::result::Result<RouterPlanReadMetrics, E>
+    where
+        E: From<CalyxError>,
+        F: FnMut(usize, Option<&[u8]>) -> std::result::Result<(), E>,
+    {
+        let mut metrics = RouterPlanReadMetrics::default();
+        let mut resolved = vec![false; keys.len()];
+        metrics.plan_index_bytes = resolved
+            .capacity()
+            .checked_add(7)
+            .map(|bits| bits / 8)
+            .and_then(|bytes| u64::try_from(bytes).ok())
+            .ok_or_else(|| {
+                E::from(CalyxError::aster_corrupt_shard(
+                    "router ordered-readback resolution-index byte count overflow",
+                ))
+            })?;
+        if let Some(table) = self.memtables.get(&cf) {
+            metrics.source_read_operations = metrics
+                .source_read_operations
+                .checked_add(1)
+                .ok_or_else(|| {
+                    E::from(CalyxError::aster_corrupt_shard(
+                        "router ordered-readback source counter overflow",
+                    ))
+                })?;
+            for (position, (ordinal, key)) in keys.iter().enumerate() {
+                if let Some(value) = table.get(key) {
+                    metrics.max_value_bytes = metrics.max_value_bytes.max(value.len() as u64);
+                    on_value(*ordinal, Some(&value))?;
+                    resolved[position] = true;
+                }
+            }
+        }
+        let level_metrics = self
+            .levels
+            .get(&cf)
+            .cloned()
+            .unwrap_or_default()
+            .visit_key_plan(keys, &mut resolved, on_value)?;
+        merge_sst_plan_metrics(&mut metrics, level_metrics)?;
+        Ok(metrics)
+    }
+
     pub fn range(&self, cf: ColumnFamily, start: &[u8], end: &[u8]) -> Result<Vec<SstEntry>> {
         let mut rows = BTreeMap::new();
         if let Some(level) = self.levels.get(&cf) {
@@ -531,4 +590,39 @@ impl CfRouter {
         }
         roots
     }
+}
+
+fn merge_sst_plan_metrics<E>(
+    metrics: &mut RouterPlanReadMetrics,
+    sst: SstPlanReadMetrics,
+) -> std::result::Result<(), E>
+where
+    E: From<CalyxError>,
+{
+    metrics.sst_files_opened = metrics
+        .sst_files_opened
+        .checked_add(sst.files_opened)
+        .ok_or_else(|| {
+            E::from(CalyxError::aster_corrupt_shard(
+                "router ordered-readback SST-open counter overflow",
+            ))
+        })?;
+    metrics.source_read_operations = metrics
+        .source_read_operations
+        .checked_add(sst.files_opened)
+        .ok_or_else(|| {
+            E::from(CalyxError::aster_corrupt_shard(
+                "router ordered-readback source counter overflow",
+            ))
+        })?;
+    metrics.max_value_bytes = metrics.max_value_bytes.max(sst.max_value_bytes);
+    metrics.plan_index_bytes = metrics
+        .plan_index_bytes
+        .checked_add(sst.plan_index_bytes)
+        .ok_or_else(|| {
+            E::from(CalyxError::aster_corrupt_shard(
+                "router ordered-readback plan-index byte count overflow",
+            ))
+        })?;
+    Ok(())
 }

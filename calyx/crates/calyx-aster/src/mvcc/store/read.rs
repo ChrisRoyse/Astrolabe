@@ -66,6 +66,219 @@ impl VersionedCfStore {
             .collect()
     }
 
+    /// Visits a sorted exact-key plan for one column family under one pinned
+    /// snapshot. The row table is merge-walked without allocating a key per
+    /// lookup; the latest-state router then opens each candidate SST at most
+    /// once for every still-unresolved key set.
+    pub fn visit_cf_key_plan<E, F>(
+        &self,
+        snapshot: Snapshot,
+        cf: ColumnFamily,
+        keys: &[(usize, &[u8])],
+        clock: &dyn Clock,
+        on_value: &mut F,
+    ) -> std::result::Result<OrderedReadbackMetrics, E>
+    where
+        E: From<calyx_core::CalyxError>,
+        F: FnMut(usize, Option<&[u8]>) -> std::result::Result<(), E>,
+    {
+        self.ensure_snapshot_live(snapshot, clock)
+            .map_err(E::from)?;
+        if keys.windows(2).any(|pair| pair[0].1 > pair[1].1) {
+            return Err(E::from(calyx_core::CalyxError::aster_corrupt_shard(
+                format!("ordered readback keys for {} are not sorted", cf.name()),
+            )));
+        }
+        {
+            let barriers = self
+                .read_barriers
+                .read()
+                .expect("mvcc read barriers poisoned");
+            for (_, key) in keys {
+                if let Some(error) = first_blocking(&barriers, cf, key) {
+                    return Err(E::from(error));
+                }
+            }
+        }
+
+        let mut metrics = OrderedReadbackMetrics {
+            read_batches: 1,
+            ..OrderedReadbackMetrics::default()
+        };
+        if keys.is_empty() {
+            return Ok(metrics);
+        }
+        let mut resolved = vec![false; keys.len()];
+        metrics.plan_index_bytes = resolved
+            .capacity()
+            .checked_add(7)
+            .map(|bits| bits / 8)
+            .and_then(|bytes| u64::try_from(bytes).ok())
+            .ok_or_else(|| {
+                E::from(calyx_core::CalyxError::aster_corrupt_shard(
+                    "ordered readback resolution-index byte count overflow",
+                ))
+            })?;
+        {
+            let table = self.rows.read().expect("mvcc row table poisoned");
+            if !table.is_empty() {
+                metrics.source_read_operations = 1;
+                let lower = Bound::Included((cf, keys[0].1.to_vec()));
+                let mut rows = table.range((lower, Bound::Unbounded)).peekable();
+                for (position, (ordinal, key)) in keys.iter().enumerate() {
+                    loop {
+                        let Some(((row_cf, row_key), versions)) = rows.peek() else {
+                            break;
+                        };
+                        if *row_cf != cf || row_key.as_slice() > *key {
+                            break;
+                        }
+                        if row_key.as_slice() < *key {
+                            rows.next();
+                            continue;
+                        }
+                        if let Some(version) = visible_version(versions, snapshot.seq()) {
+                            metrics.bytes_read_back = metrics
+                                .bytes_read_back
+                                .checked_add(version.value.len() as u64)
+                                .ok_or_else(|| {
+                                    E::from(calyx_core::CalyxError::aster_corrupt_shard(
+                                        "ordered readback byte counter overflow",
+                                    ))
+                                })?;
+                            metrics.max_readback_batch_bytes = metrics
+                                .max_readback_batch_bytes
+                                .max(version.value.len() as u64);
+                            on_value(*ordinal, Some(&version.value))?;
+                            metrics.rows_read_back =
+                                metrics.rows_read_back.checked_add(1).ok_or_else(|| {
+                                    E::from(calyx_core::CalyxError::aster_corrupt_shard(
+                                        "ordered readback row counter overflow",
+                                    ))
+                                })?;
+                            resolved[position] = true;
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+
+        let unresolved = keys
+            .iter()
+            .enumerate()
+            .filter_map(|(position, key)| (!resolved[position]).then_some(*key))
+            .collect::<Vec<_>>();
+        let unresolved_bytes = unresolved
+            .capacity()
+            .checked_mul(std::mem::size_of::<(usize, &[u8])>())
+            .and_then(|bytes| u64::try_from(bytes).ok())
+            .ok_or_else(|| {
+                E::from(calyx_core::CalyxError::aster_corrupt_shard(
+                    "ordered readback unresolved-index byte count overflow",
+                ))
+            })?;
+        metrics.plan_index_bytes = metrics
+            .plan_index_bytes
+            .checked_add(unresolved_bytes)
+            .ok_or_else(|| {
+                E::from(calyx_core::CalyxError::aster_corrupt_shard(
+                    "ordered readback plan-index byte count overflow",
+                ))
+            })?;
+        if unresolved.is_empty() {
+            return Ok(metrics);
+        }
+        if !self.router_latest_readback.load(Ordering::Acquire) {
+            for (ordinal, _) in unresolved {
+                on_value(ordinal, None)?;
+                metrics.rows_read_back =
+                    metrics.rows_read_back.checked_add(1).ok_or_else(|| {
+                        E::from(calyx_core::CalyxError::aster_corrupt_shard(
+                            "ordered readback row counter overflow",
+                        ))
+                    })?;
+            }
+            return Ok(metrics);
+        }
+
+        self.ensure_router_latest_snapshot(snapshot)
+            .map_err(E::from)?;
+        let router = self.router.read().expect("mvcc router poisoned");
+        let Some(router) = router.as_ref() else {
+            for (ordinal, _) in unresolved {
+                on_value(ordinal, None)?;
+                metrics.rows_read_back =
+                    metrics.rows_read_back.checked_add(1).ok_or_else(|| {
+                        E::from(calyx_core::CalyxError::aster_corrupt_shard(
+                            "ordered readback row counter overflow",
+                        ))
+                    })?;
+            }
+            return Ok(metrics);
+        };
+        let mut router_rows = 0_u64;
+        let mut router_bytes = 0_u64;
+        let mut max_value_bytes = 0_u64;
+        let router_metrics = router.visit_key_plan(cf, &unresolved, &mut |ordinal, value| {
+            router_rows = router_rows.checked_add(1).ok_or_else(|| {
+                E::from(calyx_core::CalyxError::aster_corrupt_shard(
+                    "ordered readback row counter overflow",
+                ))
+            })?;
+            if let Some(bytes) = value {
+                router_bytes = router_bytes
+                    .checked_add(bytes.len() as u64)
+                    .ok_or_else(|| {
+                        E::from(calyx_core::CalyxError::aster_corrupt_shard(
+                            "ordered readback byte counter overflow",
+                        ))
+                    })?;
+                max_value_bytes = max_value_bytes.max(bytes.len() as u64);
+            }
+            on_value(ordinal, value)
+        })?;
+        metrics.rows_read_back =
+            metrics
+                .rows_read_back
+                .checked_add(router_rows)
+                .ok_or_else(|| {
+                    E::from(calyx_core::CalyxError::aster_corrupt_shard(
+                        "ordered readback row counter overflow",
+                    ))
+                })?;
+        metrics.bytes_read_back = metrics
+            .bytes_read_back
+            .checked_add(router_bytes)
+            .ok_or_else(|| {
+                E::from(calyx_core::CalyxError::aster_corrupt_shard(
+                    "ordered readback byte counter overflow",
+                ))
+            })?;
+        metrics.source_read_operations = metrics
+            .source_read_operations
+            .checked_add(router_metrics.source_read_operations)
+            .ok_or_else(|| {
+                E::from(calyx_core::CalyxError::aster_corrupt_shard(
+                    "ordered readback source counter overflow",
+                ))
+            })?;
+        metrics.sst_files_opened = router_metrics.sst_files_opened;
+        metrics.plan_index_bytes = metrics
+            .plan_index_bytes
+            .checked_add(router_metrics.plan_index_bytes)
+            .ok_or_else(|| {
+                E::from(calyx_core::CalyxError::aster_corrupt_shard(
+                    "ordered readback router plan-index byte count overflow",
+                ))
+            })?;
+        metrics.max_readback_batch_bytes = metrics
+            .max_readback_batch_bytes
+            .max(max_value_bytes)
+            .max(router_metrics.max_value_bytes);
+        Ok(metrics)
+    }
+
     /// Scans visible rows for one CF at the pinned sequence, ordered by key.
     pub fn scan_cf_at(
         &self,

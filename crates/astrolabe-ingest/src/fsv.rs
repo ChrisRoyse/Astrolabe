@@ -14,13 +14,12 @@
 //! matches. On any divergence it fails closed with a structured
 //! `{code, message, remediation}` error naming the exact CF and key.
 
-use std::collections::HashMap;
-
 use astrolabe_domain::fsv::{
-    FsvAck, FsvLedgerExpectation, FsvLedgerReadback, FsvPlan, FsvRow, FsvSampling, verify_mutation,
+    FsvAck, FsvLedgerExpectation, FsvLedgerReadback, FsvPlan, FsvRow, FsvSampling,
 };
 use calyx_aster::cf::{ColumnFamily, ledger_key};
-use calyx_aster::vault::AsterVault;
+use calyx_aster::mvcc::OrderedReadbackMetrics;
+use calyx_aster::vault::{AsterVault, OrderedCfRead};
 use calyx_core::{CalyxError, Clock, LedgerRef, Seq};
 use calyx_ledger::{ActorId, EntryKind, SubjectId, decode};
 
@@ -33,9 +32,28 @@ use calyx_ledger::{ActorId, EntryKind, SubjectId, decode};
 /// [`verify_committed`](Self::verify_committed).
 pub struct VaultMutationPlan {
     plan: FsvPlan,
-    /// Parallel CF lookup so the readback closure can resolve each planned row's
-    /// physical column family from its `(store_name, key)` pair without scanning.
-    cf_by_row: HashMap<(String, Vec<u8>), ColumnFamily>,
+    /// Compact order-aligned CF identity. The key and diagnostic store name live
+    /// only in `plan.rows`; no composite-key map duplicates either allocation.
+    cf_by_ordinal: Vec<ColumnFamily>,
+}
+
+/// Measured physical shape of one vault mutation readback.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct VaultMutationReadbackMetrics {
+    /// Persisted rows delivered, including explicit absence/tombstone states.
+    pub rows_read_back: u64,
+    /// Exact persisted value bytes exposed to verification.
+    pub bytes_read_back: u64,
+    /// Column-family groups traversed under the pinned snapshot.
+    pub read_batches: u64,
+    /// Row-table, memtable, and immutable-SST sources consulted.
+    pub source_read_operations: u64,
+    /// Immutable SST files opened by the complete plan.
+    pub sst_files_opened: u64,
+    /// Peak bytes retained by the mutation plan and all ordering indexes.
+    pub max_plan_bytes: u64,
+    /// Largest persisted value borrowed at once by the streaming verifier.
+    pub max_readback_batch_bytes: u64,
 }
 
 impl VaultMutationPlan {
@@ -54,7 +72,7 @@ impl VaultMutationPlan {
         };
         Self {
             plan: FsvPlan::new(scope, ledger),
-            cf_by_row: HashMap::new(),
+            cf_by_ordinal: Vec::new(),
         }
     }
 
@@ -75,7 +93,7 @@ impl VaultMutationPlan {
     /// of the value moved into the vault commit.
     pub fn push_content_hash(&mut self, cf: ColumnFamily, key: Vec<u8>, content_hash: [u8; 32]) {
         let store = cf.name();
-        self.cf_by_row.insert((store.clone(), key.clone()), cf);
+        self.cf_by_ordinal.push(cf);
         self.plan
             .push(FsvRow::content_hash(store, key, content_hash));
     }
@@ -94,7 +112,7 @@ impl VaultMutationPlan {
         tombstone_hash: [u8; 32],
     ) {
         let store = cf.name();
-        self.cf_by_row.insert((store.clone(), key.clone()), cf);
+        self.cf_by_ordinal.push(cf);
         self.plan
             .push(FsvRow::tombstoned_hash(store, key, tombstone_hash));
     }
@@ -157,6 +175,30 @@ impl VaultMutationPlan {
         })
     }
 
+    /// Runs the same unforgeable digest verification while exposing each
+    /// already-verified persisted row to one semantic observer. The observer is
+    /// invoked inside the Calyx storage-local stream; values are borrowed and
+    /// cannot accumulate into a second corpus-sized readback cache.
+    pub fn verify_committed_with_ledger_ref_observed<C, E, F>(
+        &self,
+        vault: &AsterVault<C>,
+        commit_seq: Seq,
+        ledger_ref: &LedgerRef,
+        observer: F,
+    ) -> std::result::Result<(FsvAck, VaultMutationReadbackMetrics), E>
+    where
+        C: Clock,
+        E: From<CalyxError>,
+        F: FnMut(usize, ColumnFamily, &[u8], Option<&[u8]>) -> std::result::Result<(), E>,
+    {
+        self.verify_committed_with_reader_observed(
+            vault,
+            commit_seq,
+            || exact_ledger_readback(vault, commit_seq, ledger_ref).map_err(E::from),
+            observer,
+        )
+    }
+
     /// Verifies planned rows against the live snapshot while consuming Ledger
     /// bytes that were independently read from the physical SST/WAL source.
     ///
@@ -189,73 +231,138 @@ impl VaultMutationPlan {
         C: Clock,
         L: FnOnce() -> calyx_core::Result<Option<FsvLedgerReadback>>,
     {
-        let read_error: std::cell::RefCell<Option<CalyxError>> = std::cell::RefCell::new(None);
-        let ack = verify_mutation(
-            &self.plan,
-            |row| {
-                let cf = match self
-                    .cf_by_row
-                    .get(&(row.store().to_string(), row.key().to_vec()))
-                {
-                    Some(cf) => *cf,
-                    None => {
-                        // The plan builder always registers a CF for every row it
-                        // pushed; a missing entry is an internal contract break,
-                        // surfaced fail-closed rather than skipped.
-                        let err = CalyxError {
-                            code: astrolabe_domain::fsv::ASTRO_FSV_PLAN_INVALID,
-                            message: format!(
-                                "FSV plan row store={} key len={} has no registered column family",
-                                row.store(),
-                                row.key().len()
-                            ),
-                            remediation: "This is an internal FSV plan construction bug: every planned row must be pushed through VaultMutationPlan so its column family is recorded.",
-                        };
-                        *read_error.borrow_mut() = Some(err);
-                        return Err(plan_bug());
-                    }
-                };
-                match vault.read_cf_at(commit_seq, cf, row.key()) {
-                    Ok(value) => Ok(value),
-                    Err(err) => {
-                        *read_error.borrow_mut() = Some(err);
-                        Err(plan_bug())
-                    }
-                }
-            },
-            || match read_ledger() {
-                Ok(entry) => Ok(entry),
-                Err(err) => {
-                    *read_error.borrow_mut() = Some(err);
-                    Err(plan_bug())
-                }
-            },
-        );
-        match ack {
-            Ok(ack) => Ok(ack),
-            Err(domain_err) => {
-                if let Some(err) = read_error.take() {
-                    return Err(err);
-                }
-                Err(CalyxError {
-                    code: domain_err.code(),
-                    message: domain_err.message().to_string(),
-                    remediation: domain_err.remediation(),
-                })
-            }
+        self.verify_committed_with_reader_observed(vault, commit_seq, read_ledger, |_, _, _, _| {
+            Ok(())
+        })
+        .map(|(ack, _)| ack)
+    }
+
+    fn verify_committed_with_reader_observed<C, E, L, F>(
+        &self,
+        vault: &AsterVault<C>,
+        commit_seq: Seq,
+        read_ledger: L,
+        mut observer: F,
+    ) -> std::result::Result<(FsvAck, VaultMutationReadbackMetrics), E>
+    where
+        C: Clock,
+        E: From<CalyxError>,
+        L: FnOnce() -> std::result::Result<Option<FsvLedgerReadback>, E>,
+        F: FnMut(usize, ColumnFamily, &[u8], Option<&[u8]>) -> std::result::Result<(), E>,
+    {
+        if self.plan.rows().len() != self.cf_by_ordinal.len() {
+            return Err(E::from(CalyxError {
+                code: astrolabe_domain::fsv::ASTRO_FSV_PLAN_INVALID,
+                message: format!(
+                    "FSV plan has {} rows but {} order-aligned column families",
+                    self.plan.rows().len(),
+                    self.cf_by_ordinal.len()
+                ),
+                remediation: "This is an internal FSV plan construction bug: append every row and its column family in the same VaultMutationPlan operation.",
+            }));
         }
+        let mut verification = self
+            .plan
+            .begin_verification()
+            .map_err(domain_as_calyx)
+            .map_err(E::from)?;
+        let reads = self
+            .plan
+            .rows()
+            .iter()
+            .zip(&self.cf_by_ordinal)
+            .enumerate()
+            .map(|(ordinal, (row, cf))| OrderedCfRead::new(ordinal, *cf, row.key()))
+            .collect::<Vec<_>>();
+        let physical =
+            vault.visit_ordered_cf_plan_at(commit_seq, &reads, |ordinal, cf, key, persisted| {
+                if self.plan.selects_ordinal(ordinal) {
+                    verification
+                        .observe(ordinal, persisted)
+                        .map_err(domain_as_calyx)
+                        .map_err(E::from)?;
+                }
+                observer(ordinal, cf, key, persisted)
+            })?;
+        let ack = verification
+            .finish(read_ledger()?)
+            .map_err(domain_as_calyx)
+            .map_err(E::from)?;
+        if self.plan.sampling().is_full()
+            && (ack.rows_read_back() != physical.rows_read_back
+                || ack.bytes_read_back() != physical.bytes_read_back)
+        {
+            return Err(E::from(CalyxError {
+                code: astrolabe_domain::fsv::ASTRO_FSV_PLAN_INVALID,
+                message: format!(
+                    "full FSV witness counted rows={} bytes={} but Calyx physical readback counted rows={} bytes={}",
+                    ack.rows_read_back(),
+                    ack.bytes_read_back(),
+                    physical.rows_read_back,
+                    physical.bytes_read_back
+                ),
+                remediation: "Preserve the vault and correct the ordered readback accounting divergence before acknowledging the mutation.",
+            }));
+        }
+        let max_plan_bytes = self
+            .plan
+            .allocated_bytes()
+            .map_err(domain_as_calyx)
+            .map_err(E::from)?
+            .checked_add(
+                u64::try_from(
+                    self.cf_by_ordinal
+                        .capacity()
+                        .checked_mul(std::mem::size_of::<ColumnFamily>())
+                        .ok_or_else(|| {
+                            E::from(CalyxError {
+                                code: astrolabe_domain::fsv::ASTRO_FSV_PLAN_INVALID,
+                                message: "FSV CF-plan allocation accounting overflow".to_string(),
+                                remediation: "Reduce the mutation batch or correct the platform allocation accounting before retrying.",
+                            })
+                        })?,
+                )
+                .map_err(|_| {
+                    E::from(CalyxError {
+                        code: astrolabe_domain::fsv::ASTRO_FSV_PLAN_INVALID,
+                        message: "FSV CF-plan allocation footprint exceeds u64".to_string(),
+                        remediation: "Reduce the mutation batch or correct the platform allocation accounting before retrying.",
+                    })
+                })?,
+            )
+            .and_then(|bytes| bytes.checked_add(physical.plan_index_bytes))
+            .ok_or_else(|| {
+                E::from(CalyxError {
+                    code: astrolabe_domain::fsv::ASTRO_FSV_PLAN_INVALID,
+                    message: "FSV total plan allocation accounting overflow".to_string(),
+                    remediation: "Reduce the mutation batch or correct the platform allocation accounting before retrying.",
+                })
+            })?;
+        Ok((ack, vault_metrics(physical, max_plan_bytes)))
     }
 }
 
-/// Sentinel domain error used to unwind out of the verification closures when a
-/// vault read itself fails; the real [`CalyxError`] is stashed and re-raised by
-/// [`VaultMutationPlan::verify_committed`].
-fn plan_bug() -> astrolabe_domain::DomainError {
-    astrolabe_domain::DomainError::new(
-        astrolabe_domain::fsv::ASTRO_FSV_PLAN_INVALID,
-        "vault readback failed during FSV verification",
-        "internal: the stashed CalyxError carries the real cause",
-    )
+fn domain_as_calyx(error: astrolabe_domain::DomainError) -> CalyxError {
+    CalyxError {
+        code: error.code(),
+        message: error.message().to_string(),
+        remediation: error.remediation(),
+    }
+}
+
+fn vault_metrics(
+    physical: OrderedReadbackMetrics,
+    max_plan_bytes: u64,
+) -> VaultMutationReadbackMetrics {
+    VaultMutationReadbackMetrics {
+        rows_read_back: physical.rows_read_back,
+        bytes_read_back: physical.bytes_read_back,
+        read_batches: physical.read_batches,
+        source_read_operations: physical.source_read_operations,
+        sst_files_opened: physical.sst_files_opened,
+        max_plan_bytes,
+        max_readback_batch_bytes: physical.max_readback_batch_bytes,
+    }
 }
 
 fn newest_ledger_readback<C>(

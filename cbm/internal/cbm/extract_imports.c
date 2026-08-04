@@ -664,42 +664,86 @@ static void parse_java_imports(CBMExtractCtx *ctx) {
     ts_tree_cursor_delete(&cursor);
 }
 
-// --- Rust imports ---
+// --- Rust imports and external source modules ---
 // use_declaration -> use_list or scoped_use_list
+// mod_item without a declaration_list -> an exact compiler source request.
 
-static void parse_rust_imports(CBMExtractCtx *ctx) {
+static void parse_rust_scope_imports(CBMExtractCtx *ctx, TSNode scope, const char *module_prefix) {
     CBMArena *a = ctx->arena;
+    uint32_t child_count = ts_node_named_child_count(scope);
+    for (uint32_t i = 0; i < child_count; i++) {
+        TSNode node = ts_node_named_child(scope, i);
+        const char *kind = ts_node_type(node);
+        if (strcmp(kind, "use_declaration") == 0) {
+            char *full = cbm_node_text(a, node, ctx->source);
+            if (!full) {
+                continue;
+            }
+            // Strip "use " prefix and trailing ";"
+            if (strncmp(full, "use ", USE_PREFIX_LEN) == 0) {
+                full += USE_PREFIX_LEN;
+            }
+            size_t len = strlen(full);
+            if (len > 0 && full[len - SKIP_ONE] == ';') {
+                full[len - SKIP_ONE] = '\0';
+            }
 
-    TSTreeCursor cursor = ts_tree_cursor_new(ctx->root);
-    if (!ts_tree_cursor_goto_first_child(&cursor)) {
-        ts_tree_cursor_delete(&cursor);
-        return;
-    }
-    do {
-        TSNode node = ts_tree_cursor_current_node(&cursor);
-        if (strcmp(ts_node_type(node), "use_declaration") != 0) {
+            CBMImport imp = {.local_name = path_last(a, full), .module_path = full};
+            if (!cbm_imports_push(&ctx->result->imports, a, imp)) {
+                return;
+            }
+            continue;
+        }
+        if (strcmp(kind, "mod_item") != 0) {
             continue;
         }
 
-        char *full = cbm_node_text(a, node, ctx->source);
-        if (!full) {
+        TSNode name_node = ts_node_child_by_field_name(node, TS_FIELD("name"));
+        char *name = ts_node_is_null(name_node) ? NULL : cbm_node_text(a, name_node, ctx->source);
+        if (!name || !name[0]) {
             continue;
         }
-        // Strip "use " prefix and trailing ";"
-        if (strncmp(full, "use ", USE_PREFIX_LEN) == 0) {
-            full += USE_PREFIX_LEN;
-        }
-        size_t len = strlen(full);
-        if (len > 0 && full[len - SKIP_ONE] == ';') {
-            full[len - SKIP_ONE] = '\0';
+        char *module_path = module_prefix && module_prefix[0]
+                                ? cbm_arena_sprintf(a, "%s/%s", module_prefix, name)
+                                : name;
+        if (!module_path) {
+            return;
         }
 
-        CBMImport imp = {.local_name = path_last(a, full), .module_path = full};
+        TSNode body = ts_node_child_by_field_name(node, TS_FIELD("body"));
+        if (ts_node_is_null(body)) {
+            uint32_t mod_children = ts_node_named_child_count(node);
+            for (uint32_t j = 0; j < mod_children; j++) {
+                TSNode candidate = ts_node_named_child(node, j);
+                if (strcmp(ts_node_type(candidate), "declaration_list") == 0) {
+                    body = candidate;
+                    break;
+                }
+            }
+        }
+        if (!ts_node_is_null(body)) {
+            parse_rust_scope_imports(ctx, body, module_path);
+            if (cbm_arena_failed(a)) {
+                return;
+            }
+            continue;
+        }
+
+        CBMImport imp = {
+            .local_name = NULL,
+            .module_path = module_path,
+            .dependency_kind = "rust_module",
+            .resolution = CBM_IMPORT_RESOLVE_RUST_MODULE,
+            .binding = CBM_IMPORT_BINDING_UNBOUND,
+        };
         if (!cbm_imports_push(&ctx->result->imports, a, imp)) {
             return;
         }
-    } while (ts_tree_cursor_goto_next_sibling(&cursor));
-    ts_tree_cursor_delete(&cursor);
+    }
+}
+
+static void parse_rust_imports(CBMExtractCtx *ctx) {
+    parse_rust_scope_imports(ctx, ctx->root, "");
 }
 
 // --- C/C++ imports ---

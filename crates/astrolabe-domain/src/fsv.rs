@@ -18,11 +18,12 @@
 //! * [`FsvAck`] has private fields, no public constructor, and no `Deserialize`
 //!   impl. It cannot be built by a struct literal from another crate, and it
 //!   cannot be conjured out of a JSON body.
-//! * The only function in the entire workspace that returns one is
-//!   [`verify_mutation`], and that function *performs the comparison itself* —
-//!   it re-reads every planned row through the caller's reader, hashes the bytes
-//!   it got back, compares them to the planned content hash, and reads back the
-//!   paired ledger entry. A caller cannot hand it a "yes it matched" boolean.
+//! * The only paths in the entire workspace that return one are
+//!   [`verify_mutation`] and [`FsvVerification::finish`]. Both perform the
+//!   comparison themselves: the streaming form accepts persisted bytes by stable
+//!   plan ordinal, rejects duplicates and omissions, hashes every selected row,
+//!   and verifies the paired ledger entry before it can mint the ack. A caller
+//!   cannot hand either path a "yes it matched" boolean.
 //!
 //! Consequently a downstream crate (including `astrolabe-server`) can only put
 //! an `fsv:verified` label in a response envelope if it is holding an `FsvAck`
@@ -328,6 +329,228 @@ impl FsvPlan {
     pub const fn sampling(&self) -> FsvSampling {
         self.sampling
     }
+
+    /// Starts an ordinal-aware streaming verification of this plan.
+    ///
+    /// The returned verifier accepts rows in any physical order, which lets a
+    /// store group reads by column family and immutable SST without retaining
+    /// the values. It still requires every selected ordinal exactly once before
+    /// [`FsvVerification::finish`] can mint an [`FsvAck`].
+    pub fn begin_verification(&self) -> Result<FsvVerification<'_>, DomainError> {
+        FsvVerification::new(self)
+    }
+
+    /// Returns whether `ordinal` belongs to the configured deterministic sample.
+    /// An out-of-range ordinal is never selected.
+    pub fn selects_ordinal(&self, ordinal: usize) -> bool {
+        self.rows
+            .get(ordinal)
+            .is_some_and(|row| self.sampling.selects(&row.key))
+    }
+
+    /// Returns the plan-owned allocation footprint used for readback-memory
+    /// telemetry. Persisted values are deliberately absent; this counts the
+    /// row vector, owned store/key buffers, and ledger expectation buffers.
+    pub fn allocated_bytes(&self) -> Result<u64, DomainError> {
+        let mut bytes = self
+            .rows
+            .capacity()
+            .checked_mul(std::mem::size_of::<FsvRow>())
+            .and_then(|value| value.checked_add(self.scope.capacity()))
+            .and_then(|value| value.checked_add(self.ledger.kind.capacity()))
+            .and_then(|value| value.checked_add(self.ledger.actor.capacity()))
+            .and_then(|value| value.checked_add(self.ledger.subject.capacity()))
+            .ok_or_else(|| {
+                DomainError::new(
+                    ASTRO_FSV_PLAN_INVALID,
+                    format!("FSV plan allocation accounting overflow for {}", self.scope),
+                    PLAN_REMEDIATION,
+                )
+            })?;
+        for row in &self.rows {
+            bytes = bytes
+                .checked_add(row.store.capacity())
+                .and_then(|value| value.checked_add(row.key.capacity()))
+                .ok_or_else(|| {
+                    DomainError::new(
+                        ASTRO_FSV_PLAN_INVALID,
+                        format!("FSV row allocation accounting overflow for {}", self.scope),
+                        PLAN_REMEDIATION,
+                    )
+                })?;
+        }
+        u64::try_from(bytes).map_err(|_| {
+            DomainError::new(
+                ASTRO_FSV_PLAN_INVALID,
+                format!(
+                    "FSV plan allocation footprint for {} exceeds u64",
+                    self.scope
+                ),
+                PLAN_REMEDIATION,
+            )
+        })
+    }
+}
+
+/// Incremental, ordinal-aware full-state verifier.
+///
+/// This is the engine seam for storage-local readback. Persisted rows may arrive
+/// in any order, but every selected plan ordinal must arrive exactly once. The
+/// verifier owns no persisted value buffers: each borrowed byte slice is hashed
+/// and discarded before the next row is observed.
+pub struct FsvVerification<'a> {
+    plan: &'a FsvPlan,
+    seen: Vec<bool>,
+    rows_read_back: u64,
+    bytes_read_back: u64,
+}
+
+impl<'a> FsvVerification<'a> {
+    fn new(plan: &'a FsvPlan) -> Result<Self, DomainError> {
+        if plan.rows.is_empty() {
+            return Err(DomainError::new(
+                ASTRO_FSV_PLAN_INVALID,
+                format!(
+                    "FSV plan for {} named no persisted rows; a mutation that persisted nothing must not be acked as verified",
+                    plan.scope
+                ),
+                PLAN_REMEDIATION,
+            ));
+        }
+        Ok(Self {
+            plan,
+            seen: vec![false; plan.rows.len()],
+            rows_read_back: 0,
+            bytes_read_back: 0,
+        })
+    }
+
+    /// Hashes and compares one independently read persisted row.
+    ///
+    /// `ordinal` is the stable index in [`FsvPlan::rows`]. Duplicate,
+    /// out-of-range, or non-selected observations are plan violations rather
+    /// than silently ignored work.
+    pub fn observe(&mut self, ordinal: usize, persisted: Option<&[u8]>) -> Result<(), DomainError> {
+        let row = self.plan.rows.get(ordinal).ok_or_else(|| {
+            DomainError::new(
+                ASTRO_FSV_PLAN_INVALID,
+                format!(
+                    "FSV plan for {} received out-of-range row ordinal {ordinal}; row count is {}",
+                    self.plan.scope,
+                    self.plan.rows.len()
+                ),
+                PLAN_REMEDIATION,
+            )
+        })?;
+        if !self.plan.sampling.selects(&row.key) {
+            return Err(DomainError::new(
+                ASTRO_FSV_PLAN_INVALID,
+                format!(
+                    "FSV plan for {} received unselected row ordinal {ordinal}",
+                    self.plan.scope
+                ),
+                PLAN_REMEDIATION,
+            ));
+        }
+        if self.seen[ordinal] {
+            return Err(DomainError::new(
+                ASTRO_FSV_PLAN_INVALID,
+                format!(
+                    "FSV plan for {} received duplicate row ordinal {ordinal}",
+                    self.plan.scope
+                ),
+                PLAN_REMEDIATION,
+            ));
+        }
+
+        match (&row.expectation, persisted) {
+            (FsvExpectation::ContentHash(expected), Some(bytes)) => {
+                let found = blake3::hash(bytes);
+                if found.as_bytes() != expected {
+                    return Err(readback_mismatch(
+                        self.plan,
+                        row,
+                        &format!(
+                            "persisted bytes hash to {} but the commit wrote content hashing to {}",
+                            hex_lower(found.as_bytes()),
+                            hex_lower(expected)
+                        ),
+                    ));
+                }
+                self.bytes_read_back = self
+                    .bytes_read_back
+                    .checked_add(bytes.len() as u64)
+                    .ok_or_else(|| {
+                        DomainError::new(
+                            ASTRO_FSV_PLAN_INVALID,
+                            format!("FSV byte counter overflow for {}", self.plan.scope),
+                            PLAN_REMEDIATION,
+                        )
+                    })?;
+            }
+            (FsvExpectation::ContentHash(_), None) => {
+                return Err(readback_mismatch(
+                    self.plan,
+                    row,
+                    "row is absent at the commit snapshot after the commit reported success",
+                ));
+            }
+            (FsvExpectation::NotLive(tombstone), Some(bytes)) => {
+                let found = blake3::hash(bytes);
+                if found.as_bytes() != tombstone {
+                    return Err(readback_mismatch(
+                        self.plan,
+                        row,
+                        "tombstoned row still reads back as a live value",
+                    ));
+                }
+                self.bytes_read_back = self
+                    .bytes_read_back
+                    .checked_add(bytes.len() as u64)
+                    .ok_or_else(|| {
+                        DomainError::new(
+                            ASTRO_FSV_PLAN_INVALID,
+                            format!("FSV byte counter overflow for {}", self.plan.scope),
+                            PLAN_REMEDIATION,
+                        )
+                    })?;
+            }
+            (FsvExpectation::NotLive(_), None) => {}
+        }
+        self.seen[ordinal] = true;
+        self.rows_read_back = self.rows_read_back.checked_add(1).ok_or_else(|| {
+            DomainError::new(
+                ASTRO_FSV_PLAN_INVALID,
+                format!("FSV row counter overflow for {}", self.plan.scope),
+                PLAN_REMEDIATION,
+            )
+        })?;
+        Ok(())
+    }
+
+    /// Verifies completeness and the independently read ledger row, then mints
+    /// the unforgeable acknowledgment.
+    pub fn finish(self, entry: Option<FsvLedgerReadback>) -> Result<FsvAck, DomainError> {
+        if let Some((ordinal, row)) = self
+            .plan
+            .rows
+            .iter()
+            .enumerate()
+            .find(|(ordinal, row)| self.plan.sampling.selects(&row.key) && !self.seen[*ordinal])
+        {
+            return Err(DomainError::new(
+                ASTRO_FSV_PLAN_INVALID,
+                format!(
+                    "FSV plan for {} did not receive selected row ordinal {ordinal} store={} key={}",
+                    self.plan.scope,
+                    row.store,
+                    hex_lower(&row.key)
+                ),
+                PLAN_REMEDIATION,
+            ));
+        }
+        finish_verification(self.plan, self.rows_read_back, self.bytes_read_back, entry)
+    }
 }
 
 /// Proof that a mutation's persisted state was re-read and matched, and that its
@@ -335,9 +558,10 @@ impl FsvPlan {
 ///
 /// This type is the whole point of the module: it has private fields, no public
 /// constructor, and no `Deserialize` impl, so the *only* way any crate can hold
-/// one is to have called [`verify_mutation`] and had the readback succeed. A
-/// response envelope that carries [`FsvAck::label`] is therefore always backed by
-/// a real readback of real persisted bytes.
+/// one is to have completed [`verify_mutation`] or an ordinal-aware
+/// [`FsvVerification`] and had the readback succeed. A response envelope that
+/// carries [`FsvAck::label`] is therefore always backed by a real readback of
+/// real persisted bytes.
 #[derive(Debug, Clone, Eq, PartialEq, Serialize)]
 pub struct FsvAck {
     label: &'static str,
@@ -442,64 +666,24 @@ where
     R: FnMut(&FsvRow) -> Result<Option<Vec<u8>>, DomainError>,
     L: FnOnce() -> Result<Option<FsvLedgerReadback>, DomainError>,
 {
-    if plan.rows.is_empty() {
-        return Err(DomainError::new(
-            ASTRO_FSV_PLAN_INVALID,
-            format!(
-                "FSV plan for {} named no persisted rows; a mutation that persisted nothing must not be acked as verified",
-                plan.scope
-            ),
-            PLAN_REMEDIATION,
-        ));
-    }
-
-    let mut rows_read_back = 0_u64;
-    let mut bytes_read_back = 0_u64;
-    for row in &plan.rows {
-        if !plan.sampling.selects(&row.key) {
+    let mut verification = plan.begin_verification()?;
+    for (ordinal, row) in plan.rows.iter().enumerate() {
+        if !plan.selects_ordinal(ordinal) {
             continue;
         }
         let persisted = read_row(row)?;
-        match (&row.expectation, persisted) {
-            (FsvExpectation::ContentHash(expected), Some(bytes)) => {
-                let found = blake3::hash(&bytes);
-                if found.as_bytes() != expected {
-                    return Err(readback_mismatch(
-                        plan,
-                        row,
-                        &format!(
-                            "persisted bytes hash to {} but the commit wrote content hashing to {}",
-                            hex_lower(found.as_bytes()),
-                            hex_lower(expected)
-                        ),
-                    ));
-                }
-                bytes_read_back = bytes_read_back.saturating_add(bytes.len() as u64);
-            }
-            (FsvExpectation::ContentHash(_), None) => {
-                return Err(readback_mismatch(
-                    plan,
-                    row,
-                    "row is absent at the commit snapshot after the commit reported success",
-                ));
-            }
-            (FsvExpectation::NotLive(tombstone), Some(bytes)) => {
-                let found = blake3::hash(&bytes);
-                if found.as_bytes() != tombstone {
-                    return Err(readback_mismatch(
-                        plan,
-                        row,
-                        "tombstoned row still reads back as a live value",
-                    ));
-                }
-                bytes_read_back = bytes_read_back.saturating_add(bytes.len() as u64);
-            }
-            (FsvExpectation::NotLive(_), None) => {}
-        }
-        rows_read_back = rows_read_back.saturating_add(1);
+        verification.observe(ordinal, persisted.as_deref())?;
     }
+    verification.finish(read_ledger()?)
+}
 
-    let Some(entry) = read_ledger()? else {
+fn finish_verification(
+    plan: &FsvPlan,
+    rows_read_back: u64,
+    bytes_read_back: u64,
+    entry: Option<FsvLedgerReadback>,
+) -> Result<FsvAck, DomainError> {
+    let Some(entry) = entry else {
         return Err(DomainError::new(
             ASTRO_FSV_LEDGER_UNPAIRED,
             format!(

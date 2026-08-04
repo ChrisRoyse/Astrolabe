@@ -188,6 +188,73 @@ fn decode_manifest(bytes: &[u8]) -> Result<InputManifest> {
     })
 }
 
+/// Validates one persisted Blob-CF row as a canonical input-store chunk or
+/// manifest without retaining its payload. Returns `Ok(false)` for another Blob
+/// keyspace and fails closed for a malformed row inside the reserved input
+/// namespace.
+pub fn verify_encoded_input_row(key: &[u8], value: &[u8]) -> Result<bool> {
+    let prefix_len = 1 + NAMESPACE.len();
+    if key.first().copied() != Some(DISC) || key.get(1..prefix_len) != Some(NAMESPACE) {
+        return Ok(false);
+    }
+    let kind = *key
+        .get(prefix_len)
+        .ok_or_else(|| corrupt("input-store row key is missing its kind"))?;
+    let hash_start = prefix_len + 1;
+    let hash_end = hash_start + HASH_BYTES;
+    let hash: [u8; HASH_BYTES] = key
+        .get(hash_start..hash_end)
+        .ok_or_else(|| corrupt("input-store row key is missing its content hash"))?
+        .try_into()
+        .map_err(|_| corrupt("input-store row hash has the wrong width"))?;
+    match kind {
+        KIND_CHUNK => {
+            if key.len() != hash_end + 4 {
+                return Err(corrupt(format!(
+                    "input-store chunk key is {} bytes, expected {}",
+                    key.len(),
+                    hash_end + 4
+                )));
+            }
+            if value.is_empty() || value.len() > BLOB_CHUNK_SIZE {
+                return Err(corrupt(format!(
+                    "input-store chunk is {} bytes, expected 1..={BLOB_CHUNK_SIZE}",
+                    value.len()
+                )));
+            }
+        }
+        KIND_MANIFEST => {
+            if key.len() != hash_end {
+                return Err(corrupt(format!(
+                    "input-store manifest key is {} bytes, expected {hash_end}",
+                    key.len()
+                )));
+            }
+            let manifest = decode_manifest(value)?;
+            if manifest.content_hash != hash {
+                return Err(corrupt(
+                    "input-store manifest content hash differs from its addressing key",
+                ));
+            }
+            let total_len = usize::try_from(manifest.total_len).map_err(|_| {
+                corrupt("input-store manifest length exceeds the platform usize range")
+            })?;
+            if manifest.chunk_count != chunk_count_for(total_len) {
+                return Err(corrupt(format!(
+                    "input-store manifest declares {} chunks for {} bytes",
+                    manifest.chunk_count, manifest.total_len
+                )));
+            }
+        }
+        other => {
+            return Err(corrupt(format!(
+                "input-store row has unsupported kind {other}"
+            )));
+        }
+    }
+    Ok(true)
+}
+
 /// Stages the chunk rows plus the terminal manifest row for `bytes`, addressed
 /// by `input_hash`. The rows are content-addressed and idempotent: staging the
 /// same bytes twice yields byte-identical rows under the same keys. Callers

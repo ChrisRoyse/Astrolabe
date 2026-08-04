@@ -11,7 +11,7 @@ use astrolabe_domain::{
 };
 use astrolabe_panel::{PanelDriver, PanelInput, SlotRuntime, default_panel_slots};
 use calyx_aster::cf::{ColumnFamily, base_key, ledger_key, ledger_range, prefix_range, slot_key};
-use calyx_aster::mvcc::tombstone_value;
+use calyx_aster::mvcc::{is_tombstone_value, tombstone_value};
 use calyx_aster::vault::input_store::InputRetention;
 use calyx_aster::vault::{
     AsterVault, LedgerBoundGroupReceipt, LedgerBoundWriteGroup, encode, input_store,
@@ -29,7 +29,8 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     ASTRO_SERIES_ID_V1_REBUILD_REQUIRED, IngestError, IngestResult,
-    SERIES_ID_V1_REBUILD_REMEDIATION, SeriesVersionInput, VaultMutationPlan, ingest_series_batch,
+    SERIES_ID_V1_REBUILD_REMEDIATION, SeriesVersionInput, VaultMutationPlan,
+    VaultMutationReadbackMetrics, ingest_series_batch,
 };
 
 /// Dangling edge refusal/skip code from blueprint `04_DATA_MODEL.md` section 7.
@@ -350,6 +351,9 @@ pub struct SqliteImportReadback {
     pub edge_rows_verified: usize,
     /// Guard raw sidecar slot CF rows byte-compared after quantization gating.
     pub raw_guard_slot_rows_verified: usize,
+    /// Content-addressed Blob rows structurally decoded inside the same physical
+    /// stream that verified their commit digests.
+    pub blob_rows_verified: usize,
     /// Expected Base CF rows for the imported non-structural symbols.
     pub expected_base_rows: usize,
     /// Expected slot sidecar rows for the imported non-structural symbols.
@@ -360,6 +364,22 @@ pub struct SqliteImportReadback {
     pub expected_edge_rows: usize,
     /// Expected guard raw sidecar slot CF rows.
     pub expected_raw_guard_slot_rows: usize,
+    /// Blob rows named by the exact atomic commit receipt.
+    pub expected_blob_rows: usize,
+    /// Persisted rows delivered by Calyx's ordered readback stream.
+    pub physical_rows_read_back: u64,
+    /// Persisted value bytes observed by that stream.
+    pub physical_bytes_read_back: u64,
+    /// Column-family batches traversed under the one pinned snapshot.
+    pub physical_read_batches: u64,
+    /// Row-table, memtable, and SST sources consulted.
+    pub physical_source_read_operations: u64,
+    /// Immutable SST generations opened by the ordered plan.
+    pub physical_sst_files_opened: u64,
+    /// Maximum bytes allocated for the digest plan plus its borrowed ordering index.
+    pub maximum_plan_bytes: u64,
+    /// Maximum persisted value bytes retained at once by readback.
+    pub maximum_readback_batch_bytes: u64,
 }
 
 /// Summary of a CBM SQLite-to-Aster import batch.
@@ -1541,7 +1561,7 @@ where
             edge_rows_written: changes.edge_rows_written,
         },
     )?;
-    let (ledger_ref, fsv, graph_rows_written, edge_rows_written, write_timing_ms) =
+    let (ledger_ref, fsv, readback, graph_rows_written, edge_rows_written, write_timing_ms) =
         write_import_rows(
             vault,
             &prepared,
@@ -1549,6 +1569,7 @@ where
             payload,
             options.quantization_gate.as_ref(),
             &changes,
+            &existing_graph,
         )?;
     timing_ms.push((
         "write_import_rows",
@@ -1558,18 +1579,6 @@ where
     // the single atomic group commit vs the FSV readback, so the phase's cost is
     // attributable to a real sub-stage instead of guessed.
     timing_ms.extend(write_timing_ms);
-    phase_start = std::time::Instant::now();
-    let readback = verify_import_readback(
-        vault,
-        &prepared,
-        options.quantization_gate.as_ref(),
-        &changes,
-        &existing_graph,
-    )?;
-    timing_ms.push((
-        "verify_import_readback",
-        phase_start.elapsed().as_millis() as u64,
-    ));
     phase_start = std::time::Instant::now();
     let (series_inputs, series_mutated_rows) = if options.update_series_registry {
         let inputs = prepared
@@ -5491,13 +5500,337 @@ where
     Ok(entry.entry_hash == reference.hash)
 }
 
+struct ImportSemanticReadback<'a> {
+    prepared: &'a PreparedBatch,
+    prepared_by_cx: BTreeMap<CxId, &'a PreparedLiveSymbol>,
+    graph_writes: BTreeMap<&'a [u8], &'a [u8]>,
+    edge_writes: BTreeMap<&'a [u8], &'a PreparedEdgeRow>,
+    ledger_ref: &'a LedgerRef,
+    base_rows_verified: usize,
+    slot_rows_verified: usize,
+    graph_rows_verified: usize,
+    edge_rows_verified: usize,
+    raw_guard_slot_rows_verified: usize,
+    blob_rows_verified: usize,
+    expected_base_rows: usize,
+    expected_slot_rows: usize,
+    expected_graph_rows: usize,
+    expected_edge_rows: usize,
+    expected_raw_guard_slot_rows: usize,
+    expected_blob_rows: usize,
+}
+
+impl<'a> ImportSemanticReadback<'a> {
+    fn new(
+        prepared: &'a PreparedBatch,
+        quantization_gate: Option<&QuantizationGateConfig>,
+        changes: &'a GraphRowChanges,
+        existing_graph: &'a BTreeMap<Vec<u8>, Vec<u8>>,
+        ledger_ref: &'a LedgerRef,
+        expected_blob_rows: usize,
+    ) -> IngestResult<Self> {
+        let graph_writes = changes
+            .graph_writes
+            .iter()
+            .map(|(key, value)| (key.as_slice(), value.as_slice()))
+            .collect::<BTreeMap<_, _>>();
+        let edge_writes_by_key = changes
+            .edge_writes
+            .iter()
+            .map(|(key, _)| key.as_slice())
+            .collect::<BTreeSet<_>>();
+        let edge_writes = prepared
+            .edge_rows
+            .iter()
+            .filter(|edge| edge_writes_by_key.contains(edge.key.as_slice()))
+            .map(|edge| (edge.key.as_slice(), edge))
+            .collect::<BTreeMap<_, _>>();
+        if edge_writes.len() != changes.edge_writes.len() {
+            return Err(readback_mismatch(format!(
+                "semantic readback planned {} typed edge writes but the commit delta names {}",
+                edge_writes.len(),
+                changes.edge_writes.len()
+            )));
+        }
+
+        let mut graph_rows_verified = 0;
+        for (key, expected) in &prepared.graph_rows {
+            if graph_writes.contains_key(key.as_slice()) {
+                continue;
+            }
+            if existing_graph.get(key.as_slice()) != Some(expected) {
+                return Err(readback_mismatch(format!(
+                    "unwritten Graph CF row {} diverged from the shared persisted pre-commit scan",
+                    hex_lower(key)
+                )));
+            }
+            graph_rows_verified += 1;
+        }
+        let mut edge_rows_verified = 0;
+        for edge in &prepared.edge_rows {
+            if edge_writes.contains_key(edge.key.as_slice()) {
+                continue;
+            }
+            if !changes.unchanged_edge_keys.contains(&edge.key)
+                || !existing_graph.contains_key(&edge.key)
+            {
+                return Err(readback_mismatch(format!(
+                    "typed edge {} is neither in the commit nor proven unchanged",
+                    hex_lower(&edge.key)
+                )));
+            }
+            edge_rows_verified += 1;
+            graph_rows_verified += 1;
+        }
+
+        let prepared_by_cx = prepared
+            .constellations
+            .iter()
+            .map(|prepared| (prepared.identity.cx_id, prepared))
+            .collect::<BTreeMap<_, _>>();
+        let base_rows_verified = prepared
+            .constellations
+            .iter()
+            .filter(|prepared| prepared.measured.is_none())
+            .count();
+        Ok(Self {
+            prepared,
+            prepared_by_cx,
+            graph_writes,
+            edge_writes,
+            ledger_ref,
+            base_rows_verified,
+            slot_rows_verified: 0,
+            graph_rows_verified,
+            edge_rows_verified,
+            raw_guard_slot_rows_verified: 0,
+            blob_rows_verified: 0,
+            expected_base_rows: prepared.constellations.len(),
+            expected_slot_rows: prepared
+                .constellations
+                .iter()
+                .filter_map(|prepared| prepared.measured.as_ref())
+                .map(|constellation| constellation.slots.len())
+                .sum(),
+            expected_graph_rows: prepared.graph_rows.len() + prepared.edge_rows.len(),
+            expected_edge_rows: prepared.edge_rows.len(),
+            expected_raw_guard_slot_rows: quantization_gate
+                .map(|gate| expected_raw_guard_slot_rows(prepared, gate))
+                .unwrap_or(0),
+            expected_blob_rows,
+        })
+    }
+
+    fn observe(
+        &mut self,
+        cf: ColumnFamily,
+        key: &[u8],
+        persisted: Option<&[u8]>,
+    ) -> IngestResult<()> {
+        let Some(bytes) = persisted else {
+            return Ok(());
+        };
+        if is_tombstone_value(bytes) {
+            return Ok(());
+        }
+        match cf {
+            ColumnFamily::Base => {
+                let decoded = encode::decode_constellation_base(bytes)?;
+                let prepared = self.prepared_by_cx.get(&decoded.cx_id).ok_or_else(|| {
+                    readback_mismatch(format!(
+                        "committed Base row {} is absent from the prepared import",
+                        decoded.cx_id
+                    ))
+                })?;
+                let expected = prepared.measured.as_ref().ok_or_else(|| {
+                    readback_mismatch(format!(
+                        "reused constellation {} unexpectedly appeared in the commit readback",
+                        decoded.cx_id
+                    ))
+                })?;
+                verify_live_base_fields(&decoded, prepared, expected)?;
+                if decoded.provenance != *self.ledger_ref {
+                    return Err(readback_mismatch(format!(
+                        "Base row {} provenance differs from the exact commit ledger reference",
+                        decoded.cx_id
+                    )));
+                }
+                self.base_rows_verified += 1;
+            }
+            ColumnFamily::Slot { slot, kind } => {
+                let cx_id = cx_id_from_row_key("Slot", key)?;
+                let prepared = self.prepared_by_cx.get(&cx_id).ok_or_else(|| {
+                    readback_mismatch(format!(
+                        "committed slot {slot} row names unprepared constellation {cx_id}"
+                    ))
+                })?;
+                let constellation = prepared.measured.as_ref().ok_or_else(|| {
+                    readback_mismatch(format!(
+                        "committed slot {slot} row belongs to reused constellation {cx_id}"
+                    ))
+                })?;
+                let expected = constellation.slots.get(&slot).ok_or_else(|| {
+                    readback_mismatch(format!(
+                        "committed slot {slot} has no prepared vector for {cx_id}"
+                    ))
+                })?;
+                match kind {
+                    calyx_aster::cf::SlotFamilyKind::Quantized => {
+                        let decoded = encode::decode_slot_vector(bytes)?;
+                        if &decoded != expected {
+                            return Err(readback_mismatch(format!(
+                                "slot {slot} bytes decoded to a different vector for {cx_id}"
+                            )));
+                        }
+                        self.slot_rows_verified += 1;
+                    }
+                    calyx_aster::cf::SlotFamilyKind::Raw => {
+                        if bytes != encode::encode_slot_vector(expected)?.as_slice() {
+                            return Err(readback_mismatch(format!(
+                                "guard raw slot {slot} CF bytes changed for {cx_id}"
+                            )));
+                        }
+                        self.raw_guard_slot_rows_verified += 1;
+                    }
+                }
+            }
+            ColumnFamily::Blob => {
+                if !input_store::verify_encoded_input_row(key, bytes)? {
+                    return Err(readback_mismatch(format!(
+                        "import committed non-input-store Blob row {}",
+                        hex_lower(key)
+                    )));
+                }
+                self.blob_rows_verified += 1;
+            }
+            ColumnFamily::Graph => {
+                if let Some(prepared_edge) = self.edge_writes.get(key) {
+                    let decoded =
+                        serde_json::from_slice::<EdgeGraphRow>(bytes).map_err(|error| {
+                            readback_mismatch(format!("decode edge Graph CF row: {error}"))
+                        })?;
+                    if !edge_row_matches_prepared(&decoded, prepared_edge)
+                        || decoded.provenance != *self.ledger_ref
+                    {
+                        return Err(readback_mismatch(
+                            "edge Graph CF row fields or provenance changed after import",
+                        ));
+                    }
+                    self.edge_rows_verified += 1;
+                    self.graph_rows_verified += 1;
+                } else if let Some(expected) = self.graph_writes.get(key) {
+                    if bytes != *expected {
+                        return Err(readback_mismatch("Graph CF row bytes changed after import"));
+                    }
+                    if let Some(reference) = graph_row_exact_source_ref(key, bytes)? {
+                        let prepared_source = self
+                            .prepared
+                            .exact_sources
+                            .get(&reference.input_hash_blake3)
+                            .ok_or_else(|| {
+                                readback_mismatch(format!(
+                                    "written Graph row references unowned exact source {}",
+                                    hex_lower(&reference.input_hash_blake3)
+                                ))
+                            })?;
+                        let source = prepared_exact_source_bytes(
+                            prepared_source,
+                            &self.prepared.constellations,
+                        )?;
+                        if source.len() as u64 != reference.byte_len
+                            || blake3::hash(source).as_bytes() != &reference.input_hash_blake3
+                        {
+                            return Err(readback_mismatch(format!(
+                                "Graph row exact-source contract differs for {}",
+                                hex_lower(&reference.input_hash_blake3)
+                            )));
+                        }
+                    }
+                    self.graph_rows_verified += 1;
+                } else {
+                    return Err(readback_mismatch(format!(
+                        "live Graph row {} was not named by the semantic commit plan",
+                        hex_lower(key)
+                    )));
+                }
+            }
+            other => {
+                return Err(readback_mismatch(format!(
+                    "SQLite import committed unexpected {} row {}",
+                    other.name(),
+                    hex_lower(key)
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn finish(self, physical: VaultMutationReadbackMetrics) -> IngestResult<SqliteImportReadback> {
+        if self.base_rows_verified != self.expected_base_rows
+            || self.slot_rows_verified != self.expected_slot_rows
+            || self.graph_rows_verified != self.expected_graph_rows
+            || self.edge_rows_verified != self.expected_edge_rows
+            || self.raw_guard_slot_rows_verified != self.expected_raw_guard_slot_rows
+            || self.blob_rows_verified != self.expected_blob_rows
+        {
+            return Err(readback_mismatch(format!(
+                "readback verified counts differ: base={}/{}, slot={}/{}, graph={}/{}, edge={}/{}, raw_guard={}/{}, blob={}/{}",
+                self.base_rows_verified,
+                self.expected_base_rows,
+                self.slot_rows_verified,
+                self.expected_slot_rows,
+                self.graph_rows_verified,
+                self.expected_graph_rows,
+                self.edge_rows_verified,
+                self.expected_edge_rows,
+                self.raw_guard_slot_rows_verified,
+                self.expected_raw_guard_slot_rows,
+                self.blob_rows_verified,
+                self.expected_blob_rows,
+            )));
+        }
+        Ok(SqliteImportReadback {
+            base_rows_verified: self.base_rows_verified,
+            slot_rows_verified: self.slot_rows_verified,
+            graph_rows_verified: self.graph_rows_verified,
+            edge_rows_verified: self.edge_rows_verified,
+            raw_guard_slot_rows_verified: self.raw_guard_slot_rows_verified,
+            blob_rows_verified: self.blob_rows_verified,
+            expected_base_rows: self.expected_base_rows,
+            expected_slot_rows: self.expected_slot_rows,
+            expected_graph_rows: self.expected_graph_rows,
+            expected_edge_rows: self.expected_edge_rows,
+            expected_raw_guard_slot_rows: self.expected_raw_guard_slot_rows,
+            expected_blob_rows: self.expected_blob_rows,
+            physical_rows_read_back: physical.rows_read_back,
+            physical_bytes_read_back: physical.bytes_read_back,
+            physical_read_batches: physical.read_batches,
+            physical_source_read_operations: physical.source_read_operations,
+            physical_sst_files_opened: physical.sst_files_opened,
+            maximum_plan_bytes: physical.max_plan_bytes,
+            maximum_readback_batch_bytes: physical.max_readback_batch_bytes,
+        })
+    }
+}
+
+fn cx_id_from_row_key(kind: &str, key: &[u8]) -> IngestResult<CxId> {
+    let bytes: [u8; 16] = key.try_into().map_err(|_| {
+        readback_mismatch(format!(
+            "{kind} CF key is {} bytes, expected one 16-byte CxId",
+            key.len()
+        ))
+    })?;
+    Ok(CxId::from_bytes(bytes))
+}
+
 /// Outcome of [`write_import_rows`]: the paired ledger ref (absent exactly when
 /// no mutation was committed), the committed-state FSV ack (also absent on that
-/// physical no-op), graph rows written, edge rows written, and labeled
-/// sub-phase timings.
+/// physical no-op), fused semantic readback, graph rows written, edge rows
+/// written, and labeled sub-phase timings.
 type ImportWriteOutcome = (
     Option<LedgerRef>,
     Option<FsvAck>,
+    SqliteImportReadback,
     usize,
     usize,
     Vec<(&'static str, u64)>,
@@ -5510,6 +5843,7 @@ fn write_import_rows<C>(
     payload: Vec<u8>,
     quantization_gate: Option<&QuantizationGateConfig>,
     changes: &GraphRowChanges,
+    existing_graph: &BTreeMap<Vec<u8>, Vec<u8>>,
 ) -> IngestResult<ImportWriteOutcome>
 where
     C: Clock,
@@ -5642,9 +5976,20 @@ where
     sub_phase = std::time::Instant::now();
 
     if rows.is_empty() {
+        let no_commit_ref = zero_ledger_ref();
+        let readback = ImportSemanticReadback::new(
+            prepared,
+            quantization_gate,
+            changes,
+            existing_graph,
+            &no_commit_ref,
+            0,
+        )?
+        .finish(VaultMutationReadbackMetrics::default())?;
         return Ok((
             None,
             None,
+            readback,
             graph_rows_written,
             edge_rows_written,
             write_timing_ms,
@@ -5674,6 +6019,11 @@ where
     ));
     sub_phase = std::time::Instant::now();
     let mut fsv_plan = VaultMutationPlan::new("sqlite_import", EntryKind::Ingest, &actor, &subject);
+    let expected_blob_rows = commit
+        .data_row_digests
+        .iter()
+        .filter(|row| row.cf == ColumnFamily::Blob)
+        .count();
     for row in commit.data_row_digests {
         if row.tombstoned {
             fsv_plan.push_tombstoned_hash(row.cf, row.key, row.value_blake3);
@@ -5687,7 +6037,21 @@ where
         sub_phase.elapsed().as_millis() as u64,
     ));
     sub_phase = std::time::Instant::now();
-    let fsv = fsv_plan.verify_committed_with_ledger_ref(vault, commit_seq, &ledger_ref)?;
+    let mut semantic = ImportSemanticReadback::new(
+        prepared,
+        quantization_gate,
+        changes,
+        existing_graph,
+        &ledger_ref,
+        expected_blob_rows,
+    )?;
+    let (fsv, physical) = fsv_plan.verify_committed_with_ledger_ref_observed(
+        vault,
+        commit_seq,
+        &ledger_ref,
+        |_, cf, key, persisted| semantic.observe(cf, key, persisted),
+    )?;
+    let readback = semantic.finish(physical)?;
     write_timing_ms.push((
         "write_import_rows.fsv_verify",
         sub_phase.elapsed().as_millis() as u64,
@@ -5695,223 +6059,11 @@ where
     Ok((
         Some(ledger_ref),
         Some(fsv),
+        readback,
         graph_rows_written,
         edge_rows_written,
         write_timing_ms,
     ))
-}
-
-fn verify_import_readback<C>(
-    vault: &AsterVault<C>,
-    prepared: &PreparedBatch,
-    quantization_gate: Option<&QuantizationGateConfig>,
-    changes: &GraphRowChanges,
-    existing_graph: &BTreeMap<Vec<u8>, Vec<u8>>,
-) -> IngestResult<SqliteImportReadback>
-where
-    C: Clock,
-{
-    let snapshot = vault.latest_seq();
-    // Post-commit readback strategy (#23): rows this import WROTE are point-read
-    // back at the post-commit snapshot below. Rows the atomic group commit did
-    // not touch are verified against the shared pre-commit Graph scan — those
-    // are persisted bytes read from the store this run, the commit's write set
-    // is exactly `changes` (readback-verified row-by-row by the FSV ack in
-    // `write_import_rows`), so pre-commit bytes ARE the post-commit persisted
-    // state for every untouched key.
-    let written_keys = changes
-        .graph_writes
-        .iter()
-        .map(|(key, _)| key.as_slice())
-        .chain(changes.edge_writes.iter().map(|(key, _)| key.as_slice()))
-        .collect::<BTreeSet<_>>();
-    let mut base_rows_verified = 0;
-    let mut slot_rows_verified = 0;
-    let mut raw_guard_slot_rows_verified = 0;
-    for prepared_cx in &prepared.constellations {
-        let Some(constellation) = &prepared_cx.measured else {
-            base_rows_verified += 1;
-            continue;
-        };
-        let base_bytes = vault
-            .read_cf_at(
-                snapshot,
-                ColumnFamily::Base,
-                &base_key(prepared_cx.identity.cx_id),
-            )?
-            .ok_or_else(|| readback_mismatch("Base CF row missing after import"))?;
-        let decoded = encode::decode_constellation_base(&base_bytes)?;
-        verify_live_base_fields(&decoded, prepared_cx, constellation)?;
-        base_rows_verified += 1;
-
-        for (slot, expected) in &constellation.slots {
-            let slot_bytes = vault
-                .read_cf_at(
-                    snapshot,
-                    ColumnFamily::slot(*slot),
-                    &slot_key(decoded.cx_id),
-                )?
-                .ok_or_else(|| readback_mismatch(format!("slot {slot} CF row missing")))?;
-            let decoded_slot = encode::decode_slot_vector(&slot_bytes)?;
-            if &decoded_slot != expected {
-                return Err(readback_mismatch(format!(
-                    "slot {slot} bytes decoded to a different vector for {}",
-                    decoded.cx_id
-                )));
-            }
-            slot_rows_verified += 1;
-        }
-        if let Some(gate) = quantization_gate {
-            for (slot, expected) in &constellation.slots {
-                if !gate.guard_slots.contains(&slot.get()) {
-                    continue;
-                }
-                let expected_bytes = encode::encode_slot_vector(expected)?;
-                let raw_bytes = vault
-                    .read_cf_at(
-                        snapshot,
-                        ColumnFamily::slot_raw(*slot),
-                        &slot_key(decoded.cx_id),
-                    )?
-                    .ok_or_else(|| {
-                        readback_mismatch(format!("guard raw slot {slot} CF row missing"))
-                    })?;
-                if raw_bytes != expected_bytes {
-                    return Err(readback_mismatch(format!(
-                        "guard raw slot {slot} CF bytes changed for {}",
-                        decoded.cx_id
-                    )));
-                }
-                raw_guard_slot_rows_verified += 1;
-            }
-        }
-    }
-
-    let mut graph_rows_verified = 0;
-    for (key, expected) in &prepared.graph_rows {
-        if written_keys.contains(key.as_slice()) {
-            let actual = vault
-                .read_cf_at(snapshot, ColumnFamily::Graph, key)?
-                .ok_or_else(|| readback_mismatch("Graph CF row missing after import"))?;
-            if &actual != expected {
-                return Err(readback_mismatch("Graph CF row bytes changed after import"));
-            }
-        } else {
-            let actual = existing_graph
-                .get(key.as_slice())
-                .ok_or_else(|| readback_mismatch("Graph CF row missing after import"))?;
-            if actual != expected {
-                return Err(readback_mismatch("Graph CF row bytes changed after import"));
-            }
-        }
-        if written_keys.contains(key.as_slice())
-            && let Some(reference) = graph_row_exact_source_ref(key, expected)?
-        {
-            let prepared_source = prepared
-                .exact_sources
-                .get(&reference.input_hash_blake3)
-                .ok_or_else(|| {
-                    readback_mismatch(format!(
-                        "written Graph row references unowned exact source {}",
-                        hex_lower(&reference.input_hash_blake3)
-                    ))
-                })?;
-            let expected_source =
-                prepared_exact_source_bytes(prepared_source, &prepared.constellations)?;
-            let actual_source =
-                input_store::reassemble_and_verify(&reference.input_hash_blake3, |blob_key| {
-                    vault.read_cf_at(snapshot, ColumnFamily::Blob, blob_key)
-                })?;
-            if actual_source != expected_source || actual_source.len() as u64 != reference.byte_len
-            {
-                return Err(readback_mismatch(format!(
-                    "Graph row exact-source readback differs for {}",
-                    hex_lower(&reference.input_hash_blake3)
-                )));
-            }
-        }
-        graph_rows_verified += 1;
-    }
-    let mut edge_rows_verified = 0;
-    let mut provenance_ok = BTreeMap::<(u64, [u8; 32]), bool>::new();
-    for prepared_edge in &prepared.edge_rows {
-        // Edges the pre-commit derivation proved unchanged (fields matched and
-        // their ledger provenance verified against persisted state) were not in
-        // the write batch, so their pre-commit persisted bytes are the post-
-        // commit state; the derivation already performed the decode + ledger
-        // verification this loop used to repeat per edge (#23).
-        if changes.unchanged_edge_keys.contains(&prepared_edge.key) {
-            if !existing_graph.contains_key(&prepared_edge.key) {
-                return Err(readback_mismatch(
-                    "unwritten edge Graph CF row disappeared before readback",
-                ));
-            }
-            edge_rows_verified += 1;
-            continue;
-        }
-        let actual = vault
-            .read_cf_at(snapshot, ColumnFamily::Graph, &prepared_edge.key)?
-            .ok_or_else(|| readback_mismatch("edge Graph CF row missing after import"))?;
-        let decoded = serde_json::from_slice::<EdgeGraphRow>(&actual)
-            .map_err(|error| readback_mismatch(format!("decode edge Graph CF row: {error}")))?;
-        if !edge_row_matches_prepared(&decoded, prepared_edge) {
-            return Err(readback_mismatch(
-                "edge Graph CF row fields changed after import",
-            ));
-        }
-        let provenance_key = (decoded.provenance.seq, decoded.provenance.hash);
-        let intact = match provenance_ok.get(&provenance_key) {
-            Some(known) => *known,
-            None => {
-                let intact = ledger_ref_matches(vault, snapshot, &decoded.provenance)?;
-                provenance_ok.insert(provenance_key, intact);
-                intact
-            }
-        };
-        if !intact {
-            return Err(readback_mismatch(
-                "edge Graph CF row provenance does not match Ledger CF",
-            ));
-        }
-        edge_rows_verified += 1;
-    }
-    graph_rows_verified += edge_rows_verified;
-
-    let expected_base_rows = prepared.constellations.len();
-    let expected_slot_rows = prepared
-        .constellations
-        .iter()
-        .filter_map(|prepared| prepared.measured.as_ref())
-        .map(|constellation| constellation.slots.len())
-        .sum();
-    let expected_edge_rows = prepared.edge_rows.len();
-    let expected_graph_rows = prepared.graph_rows.len() + expected_edge_rows;
-    let expected_raw_guard_slot_rows = quantization_gate
-        .map(|gate| expected_raw_guard_slot_rows(prepared, gate))
-        .unwrap_or(0);
-    if base_rows_verified != expected_base_rows
-        || slot_rows_verified != expected_slot_rows
-        || graph_rows_verified != expected_graph_rows
-        || edge_rows_verified != expected_edge_rows
-        || raw_guard_slot_rows_verified != expected_raw_guard_slot_rows
-    {
-        return Err(readback_mismatch(
-            "readback verified counts did not match committed counts",
-        ));
-    }
-
-    Ok(SqliteImportReadback {
-        base_rows_verified,
-        slot_rows_verified,
-        graph_rows_verified,
-        edge_rows_verified,
-        raw_guard_slot_rows_verified,
-        expected_base_rows,
-        expected_slot_rows,
-        expected_graph_rows,
-        expected_edge_rows,
-        expected_raw_guard_slot_rows,
-    })
 }
 
 fn verify_live_base_fields(

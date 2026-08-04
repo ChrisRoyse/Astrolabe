@@ -1982,6 +1982,115 @@ allocation_failed:
     return NULL;
 }
 
+/* Resolve Rust's external-module declaration contract. A declaration in a
+ * crate root or mod.rs searches beside that file; a declaration in name.rs
+ * searches below name/. Exactly one of `<module>.rs` and `<module>/mod.rs`
+ * must exist. Keeping this as a typed import resolution prevents semantic
+ * `use` paths from being mistaken for source files. */
+static const cbm_gbuf_node_t *resolve_rust_module_source(const cbm_pipeline_ctx_t *ctx,
+                                                         const char *source_rel,
+                                                         const char *module_path) {
+    if (!ctx || !source_rel || !source_rel[0] || !module_path || !module_path[0]) {
+        return NULL;
+    }
+    char *dir = path_dirname(source_rel);
+    if (!dir) {
+        goto allocation_failed;
+    }
+    const char *basename = strrchr(source_rel, '/');
+    basename = basename ? basename + 1 : source_rel;
+    char *module_root = NULL;
+    if (strcmp(basename, "lib.rs") == 0 || strcmp(basename, "main.rs") == 0 ||
+        strcmp(basename, "mod.rs") == 0) {
+        module_root = strdup(dir);
+    } else {
+        size_t basename_len = strlen(basename);
+        size_t stem_len = ends_with(basename, ".rs") ? basename_len - strlen(".rs") : basename_len;
+        char *stem = cbm_strndup(basename, stem_len);
+        module_root = stem ? concat3(dir, dir[0] ? "/" : "", stem) : NULL;
+        free(stem);
+    }
+    free(dir);
+    if (!module_root) {
+        goto allocation_failed;
+    }
+    char *base = concat3(module_root, module_root[0] ? "/" : "", module_path);
+    free(module_root);
+    if (!base) {
+        goto allocation_failed;
+    }
+    char *cands[2] = {concat3(base, "", ".rs"), concat3(base, "/", "mod.rs")};
+    free(base);
+    if (!cands[0] || !cands[1]) {
+        free(cands[0]);
+        free(cands[1]);
+        goto allocation_failed;
+    }
+
+    const cbm_gbuf_node_t *found = NULL;
+    const char *found_path = NULL;
+    int match_count = 0;
+    for (int i = 0; i < 2; i++) {
+        source_path_status_t path_status = normalize_source_candidate(cands[i]);
+        if (path_status == SOURCE_PATH_ALLOC_FAILED) {
+            free(cands[0]);
+            free(cands[1]);
+            goto allocation_failed;
+        }
+        if (path_status == SOURCE_PATH_INVALID) {
+            continue;
+        }
+        const cbm_gbuf_node_t *candidate =
+            cbm_gbuf_find_source_container(ctx->gbuf, "Module", cands[i]);
+        if (cbm_gbuf_resolution_failed(ctx->gbuf)) {
+            free(cands[0]);
+            free(cands[1]);
+            if (ctx->cancelled) {
+                atomic_store(ctx->cancelled, SKIP_ONE);
+            }
+            return NULL;
+        }
+        if (candidate) {
+            found = candidate;
+            found_path = cands[i];
+            match_count++;
+        }
+    }
+    if (match_count == 1) {
+        free(cands[0]);
+        free(cands[1]);
+        return found;
+    }
+    cbm_log_error(
+        "pkgmap.rust_module_resolve_failed", "code",
+        match_count == 0 ? "CBM_IMPORT_RUST_MODULE_MISSING" : "CBM_IMPORT_RUST_MODULE_AMBIGUOUS",
+        "source", source_rel, "module", module_path, "candidate_1_path", cands[0],
+        "candidate_2_path", cands[1], "matched_path", found_path ? found_path : "", "message",
+        match_count == 0 ? "no exact Rust module source exists"
+                         : "both compiler-defined Rust module sources exist",
+        "remediation", match_count == 0 ? "restore the declared Rust module source"
+                                         : "remove one conflicting Rust module source");
+    free(cands[0]);
+    free(cands[1]);
+    cbm_gbuf_refuse_resolution(ctx->gbuf);
+    if (ctx->cancelled) {
+        atomic_store(ctx->cancelled, SKIP_ONE);
+    }
+    return NULL;
+
+allocation_failed:
+    cbm_log_error("pkgmap.rust_module_resolve_failed", "code",
+                  "CBM_IMPORT_RUST_MODULE_ALLOC_FAILED", "source", source_rel ? source_rel : "",
+                  "module", module_path ? module_path : "", "message",
+                  "Rust module resolution could not allocate both exact candidates", "remediation",
+                  "free memory or reduce the module path size, then retry indexing");
+    cbm_gbuf_refuse_resolution(ctx->gbuf);
+    if (ctx->cancelled) {
+        atomic_store(ctx->cancelled, SKIP_ONE);
+    }
+    return NULL;
+}
+
 /* Resolve a sibling-file import: a bare path/name (no leading "./") that names
  * a file relative to the importer's directory.  This covers build/markup
  * grammars whose import string is a sibling filename or directory rather than a
@@ -2295,6 +2404,10 @@ const cbm_gbuf_node_t *cbm_pipeline_resolve_import_node(const cbm_pipeline_ctx_t
 
     if (imp->resolution == CBM_IMPORT_RESOLVE_BROWSER_URL) {
         return resolve_browser_module_request(ctx, source_rel, imp->module_path);
+    }
+
+    if (imp->resolution == CBM_IMPORT_RESOLVE_RUST_MODULE) {
+        return resolve_rust_module_source(ctx, source_rel, imp->module_path);
     }
 
     if (imp->resolution == CBM_IMPORT_RESOLVE_ES_SOURCE) {

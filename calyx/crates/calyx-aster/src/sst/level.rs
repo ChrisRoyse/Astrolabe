@@ -40,12 +40,28 @@ impl LevelFile {
         key >= first && key <= last && lookup.bloom.may_contain(key)
     }
 
+    fn contains_indexed_key(&self, key: &[u8]) -> Option<bool> {
+        self.lookup.as_ref().map(|lookup| {
+            lookup
+                .index
+                .binary_search_by(|entry| entry.key.as_slice().cmp(key))
+                .is_ok()
+        })
+    }
+
     pub(super) fn open_reader(&self) -> Result<SstReader> {
         self.lookup.as_ref().map_or_else(
             || SstReader::open(&self.path),
             |lookup| SstReader::open_with_lookup(&self.path, Arc::clone(lookup)),
         )
     }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct SstPlanReadMetrics {
+    pub files_opened: u64,
+    pub max_value_bytes: u64,
+    pub plan_index_bytes: u64,
 }
 
 impl SstLevel {
@@ -120,6 +136,86 @@ impl SstLevel {
             }
         }
         Ok(None)
+    }
+
+    /// Visits an arbitrary set of stable plan ordinals while opening each
+    /// candidate immutable SST at most once.
+    ///
+    /// Files are newest-first, so the first physical occurrence wins. Values
+    /// are borrowed from the mapped SST only for the callback duration; a
+    /// corpus-sized result vector is never assembled.
+    pub(crate) fn visit_key_plan<E, F>(
+        &self,
+        keys: &[(usize, &[u8])],
+        resolved: &mut [bool],
+        on_value: &mut F,
+    ) -> std::result::Result<SstPlanReadMetrics, E>
+    where
+        E: From<calyx_core::CalyxError>,
+        F: FnMut(usize, Option<&[u8]>) -> std::result::Result<(), E>,
+    {
+        if keys.len() != resolved.len() {
+            return Err(E::from(calyx_core::CalyxError::aster_corrupt_shard(
+                "SST ordered-readback key/resolution cardinality mismatch",
+            )));
+        }
+        let mut metrics = SstPlanReadMetrics::default();
+        for file in &self.files {
+            let candidates = keys
+                .iter()
+                .enumerate()
+                .filter_map(|(position, (_, key))| {
+                    if resolved[position] || !file.may_contain(key) {
+                        return None;
+                    }
+                    match file.contains_indexed_key(key) {
+                        Some(false) => None,
+                        Some(true) | None => Some(position),
+                    }
+                })
+                .collect::<Vec<_>>();
+            let candidate_bytes = candidates
+                .capacity()
+                .checked_mul(std::mem::size_of::<usize>())
+                .and_then(|bytes| u64::try_from(bytes).ok())
+                .ok_or_else(|| {
+                    E::from(calyx_core::CalyxError::aster_corrupt_shard(
+                        "SST ordered-readback candidate-index byte count overflow",
+                    ))
+                })?;
+            metrics.plan_index_bytes = metrics.plan_index_bytes.max(candidate_bytes);
+            if candidates.is_empty() {
+                continue;
+            }
+            let reader = file.open_reader().map_err(E::from)?;
+            metrics.files_opened = metrics.files_opened.checked_add(1).ok_or_else(|| {
+                E::from(calyx_core::CalyxError::aster_corrupt_shard(
+                    "SST ordered-readback file-open counter overflow",
+                ))
+            })?;
+            for position in candidates {
+                let (ordinal, key) = keys[position];
+                if let Some(value) = reader.get_ref(key).map_err(E::from)? {
+                    metrics.max_value_bytes = metrics.max_value_bytes.max(value.len() as u64);
+                    on_value(ordinal, Some(value))?;
+                    resolved[position] = true;
+                } else if file.contains_indexed_key(key) == Some(true) {
+                    return Err(E::from(calyx_core::CalyxError::aster_corrupt_shard(
+                        format!(
+                            "SST lookup metadata named key but the mapped record was absent in {}",
+                            file.path.display()
+                        ),
+                    )));
+                }
+            }
+        }
+        for (position, (ordinal, _)) in keys.iter().enumerate() {
+            if !resolved[position] {
+                on_value(*ordinal, None)?;
+                resolved[position] = true;
+            }
+        }
+        Ok(metrics)
     }
 
     /// Returns the newest value and the exact immutable file that supplied it.

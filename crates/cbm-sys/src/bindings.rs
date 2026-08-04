@@ -572,6 +572,7 @@ pub const CBMImportResolution_CBM_IMPORT_RESOLVE_EXACT_SOURCE: CBMImportResoluti
 pub const CBMImportResolution_CBM_IMPORT_RESOLVE_EXTERNAL_SOURCE: CBMImportResolution = 2;
 pub const CBMImportResolution_CBM_IMPORT_RESOLVE_ES_SOURCE: CBMImportResolution = 3;
 pub const CBMImportResolution_CBM_IMPORT_RESOLVE_BROWSER_URL: CBMImportResolution = 4;
+pub const CBMImportResolution_CBM_IMPORT_RESOLVE_RUST_MODULE: CBMImportResolution = 5;
 pub type CBMImportResolution = ::std::os::raw::c_int;
 pub const CBMImportBinding_CBM_IMPORT_BINDING_LOCAL: CBMImportBinding = 0;
 pub const CBMImportBinding_CBM_IMPORT_BINDING_RESOURCE: CBMImportBinding = 1;

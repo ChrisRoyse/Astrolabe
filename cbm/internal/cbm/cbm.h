@@ -308,6 +308,10 @@ typedef enum {
      * not TypeScript source assertions: an exact repository source may bind,
      * otherwise the runtime request itself remains a first-class graph atom. */
     CBM_IMPORT_RESOLVE_BROWSER_URL = 4,
+    /* A Rust external module declaration (`mod name;`). The source is one of
+     * the two exact compiler-defined candidates (`name.rs`, `name/mod.rs`),
+     * relative to the declaring module's filesystem namespace. */
+    CBM_IMPORT_RESOLVE_RUST_MODULE = 5,
 } CBMImportResolution;
 
 /* Whether an import-like source relationship binds a name in the importing

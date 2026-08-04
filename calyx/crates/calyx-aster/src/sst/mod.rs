@@ -260,6 +260,14 @@ impl SstReader {
     }
 
     pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        Ok(self.get_ref(key)?.map(<[u8]>::to_vec))
+    }
+
+    /// Reads one value as a borrow of this reader's immutable mapped SST.
+    ///
+    /// Ordered full-state verification uses this seam to hash and decode a row
+    /// while the SST is open, without allocating a second value buffer per key.
+    pub(crate) fn get_ref(&self, key: &[u8]) -> Result<Option<&[u8]>> {
         if !self.lookup.bloom.may_contain(key) {
             return Ok(None);
         }
@@ -271,7 +279,7 @@ impl SstReader {
             return Ok(None);
         };
         Ok(Some(
-            read_record(self.column.as_bytes(), self.lookup.index[position].offset)?.value,
+            read_record_ref(self.column.as_bytes(), self.lookup.index[position].offset)?.value,
         ))
     }
 

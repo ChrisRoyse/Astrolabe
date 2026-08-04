@@ -107,6 +107,23 @@ pub struct LedgerBoundCommit {
     pub data_row_digests: Vec<LedgerBoundRowDigest>,
 }
 
+/// One borrowed `(column family, key)` in an ordered persisted-readback plan.
+/// `ordinal` remains stable when the engine reorders the physical reads for SST
+/// locality, allowing an upper-layer verifier to bind every returned value to
+/// its original digest expectation without duplicating key bytes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OrderedCfRead<'a> {
+    pub ordinal: usize,
+    pub cf: ColumnFamily,
+    pub key: &'a [u8],
+}
+
+impl<'a> OrderedCfRead<'a> {
+    pub const fn new(ordinal: usize, cf: ColumnFamily, key: &'a [u8]) -> Self {
+        Self { ordinal, cf, key }
+    }
+}
+
 /// Physical SST publication receipt for one explicit vault flush.
 ///
 /// Durable checkpoint files and router memtable files are reported separately
