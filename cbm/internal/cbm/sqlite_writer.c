@@ -5,7 +5,7 @@
 // SQLite file format reference: https://www.sqlite.org/fileformat2.html
 //
 // Key invariants:
-//   - Page size: 4096 bytes
+//   - Page size: 65536 bytes
 //   - Page 1 has a 100-byte database header before the B-tree header
 //   - Leaf table B-tree pages: flag 0x0D
 //   - Interior table B-tree pages: flag 0x05
@@ -55,10 +55,6 @@
 #define CBM_PENDING_BYTE (0x40000000u)
 #define CBM_PENDING_BYTE_PAGE ((CBM_PENDING_BYTE / CBM_PAGE_SIZE) + 1)
 
-/* Skip the pending byte page if allocation lands on it. */
-static inline uint32_t cbm_skip_pending_byte(uint32_t pgno) {
-    return pgno == CBM_PENDING_BYTE_PAGE ? pgno + SKIP_ONE : pgno;
-}
 #define SCHEMA_FORMAT 4
 #define FILE_FORMAT 1
 #define SQLITE_VERSION 3046000 // 3.46.0
@@ -273,6 +269,38 @@ static void writer_record_offset_failure(WriterIo *io, const char *operation, ui
                   "published");
 }
 
+/* Allocate exactly one SQLite page number through the format-wide page-number
+ * contract. Every page kind must use this allocator: at 64 KiB/page the page
+ * containing SQLite's 1 GiB lock byte is page 16385, and the SQLite core marks
+ * that page reserved before traversing any B-tree. Allowing even an overflow
+ * chain to consume it therefore creates a physically corrupt database.
+ *
+ * next_page may advance to UINT32_MAX after allocating SQLite's final legal
+ * page (UINT32_MAX - 1). A later allocation fails closed before arithmetic can
+ * wrap or any I/O occurs. */
+static bool writer_allocate_page(WriterIo *io, uint32_t *next_page, const char *operation,
+                                 uint32_t *out_page) {
+    if (!next_page || !out_page) {
+        writer_record_offset_failure(io, operation, next_page ? *next_page : 0,
+                                     "page allocator pointer is NULL");
+        return false;
+    }
+
+    uint32_t page_num = *next_page;
+    if (page_num == CBM_PENDING_BYTE_PAGE) {
+        page_num++;
+    }
+    if (page_num == 0 || page_num > SQLITE_MAX_PAGE_NUMBER) {
+        writer_record_offset_failure(io, operation, page_num,
+                                     "no legal SQLite page number remains for allocation");
+        return false;
+    }
+
+    *out_page = page_num;
+    *next_page = page_num + SKIP_ONE;
+    return true;
+}
+
 static void writer_record_allocation_failure(WriterIo *io, const char *operation,
                                              size_t requested_bytes) {
     if (!io || io->failed) {
@@ -443,11 +471,9 @@ static bool writer_io_seek_page(WriterIo *io, uint32_t page_num) {
     return writer_page_offset(io, page_num, &offset) && writer_io_seek(io, offset, SEEK_SET);
 }
 
-static bool writer_expected_file_size(WriterIo *io, uint32_t next_page,
-                                      WriterOffset *out_size) {
+static bool writer_expected_file_size(WriterIo *io, uint32_t next_page, WriterOffset *out_size) {
     if (!out_size) {
-        writer_record_offset_failure(io, "expected_file_size", next_page,
-                                     "output pointer is NULL");
+        writer_record_offset_failure(io, "expected_file_size", next_page, "output pointer is NULL");
         return false;
     }
     if (next_page == 0) {
@@ -920,9 +946,11 @@ static void pb_flush_leaf(PageBuilder *pb) {
     put_u16(pb->page + hdr + HDR_CONTENT_OFF, (uint16_t)pb->content_offset);
     pb->page[hdr + HDR_FRAGBYTES_OFF] = 0; // fragmented free bytes
 
-    // Write page to file. Skip the pending byte page (SQLite reserved).
-    pb->next_page = cbm_skip_pending_byte(pb->next_page);
-    uint32_t page_num = pb->next_page;
+    // Write page to file through the format-wide page allocator.
+    uint32_t page_num = 0;
+    if (!writer_allocate_page(pb->io, &pb->next_page, "allocate_leaf_page", &page_num)) {
+        return;
+    }
     if (!writer_io_seek_page(pb->io, page_num) ||
         !writer_io_write(pb->io, pb->page, CBM_PAGE_SIZE)) {
         return;
@@ -952,7 +980,6 @@ static void pb_flush_leaf(PageBuilder *pb) {
     pb->leaf_count++;
 
     // Reset for next page
-    pb->next_page++;
     pb->cell_count = 0;
     pb->content_offset = CBM_PAGE_SIZE;
     pb->page1_offset = 0;               // only page 1 has the 100-byte header
@@ -1023,8 +1050,10 @@ static int write_interior_page(PageBuilder *pb, uint8_t *page, int cell_count, i
                                uint32_t right_child_page, const PageRef *children,
                                int right_child_idx, bool is_index, PageRef **parents,
                                int parent_count, int *parent_cap) {
-    pb->next_page = cbm_skip_pending_byte(pb->next_page);
-    uint32_t pnum = pb->next_page++;
+    uint32_t pnum = 0;
+    if (!writer_allocate_page(pb->io, &pb->next_page, "allocate_interior_page", &pnum)) {
+        return CBM_NOT_FOUND;
+    }
     page[0] = is_index ? INTERIOR_INDEX_FLAG : INTERIOR_TABLE_FLAG;
     put_u16(page + HDR_FREEBLOCK_OFF, 0);
     put_u16(page + HDR_CELLCOUNT_OFF, (uint16_t)cell_count);
@@ -1032,8 +1061,7 @@ static int write_interior_page(PageBuilder *pb, uint8_t *page, int cell_count, i
     page[HDR_FRAGBYTES_OFF] = 0;
     put_u32(page + HDR_RIGHTCHILD_OFF, right_child_page);
 
-    if (!writer_io_seek_page(pb->io, pnum) ||
-        !writer_io_write(pb->io, page, CBM_PAGE_SIZE)) {
+    if (!writer_io_seek_page(pb->io, pnum) || !writer_io_write(pb->io, page, CBM_PAGE_SIZE)) {
         return CBM_NOT_FOUND;
     }
 
@@ -1344,7 +1372,10 @@ static uint32_t write_overflow_pages(WriterIo *io, uint32_t *next_page, const ui
 
     int offset = 0;
     while (offset < data_len) {
-        uint32_t pnum = (*next_page)++;
+        uint32_t pnum = 0;
+        if (!writer_allocate_page(io, next_page, "allocate_overflow_page", &pnum)) {
+            return 0;
+        }
         if (first_page == 0) {
             first_page = pnum;
         }
@@ -1370,8 +1401,7 @@ static uint32_t write_overflow_pages(WriterIo *io, uint32_t *next_page, const ui
         memcpy(page + BTREE_PTR_SIZE, data + offset, chunk);
 
         previous_page = pnum;
-        if (!writer_io_seek_page(io, pnum) ||
-            !writer_io_write(io, page, CBM_PAGE_SIZE)) {
+        if (!writer_io_seek_page(io, pnum) || !writer_io_write(io, page, CBM_PAGE_SIZE)) {
             return 0;
         }
 
@@ -1697,8 +1727,10 @@ static uint32_t write_table_btree(WriterIo *io, uint32_t *next_page, const uint8
                                   bool first_is_page1) {
     if (count == 0) {
         // Empty table: write a single empty leaf page
-        *next_page = cbm_skip_pending_byte(*next_page);
-        uint32_t pnum = (*next_page)++;
+        uint32_t pnum = 0;
+        if (!writer_allocate_page(io, next_page, "allocate_empty_table_page", &pnum)) {
+            return 0;
+        }
         uint8_t page[CBM_PAGE_SIZE];
         memset(page, 0, CBM_PAGE_SIZE);
         int hdr = first_is_page1 ? SQLITE_HEADER_SIZE : 0;
@@ -1707,8 +1739,7 @@ static uint32_t write_table_btree(WriterIo *io, uint32_t *next_page, const uint8
         put_u16(page + hdr + HDR_CELLCOUNT_OFF, 0);                     // 0 cells
         put_u16(page + hdr + HDR_CONTENT_OFF, (uint16_t)CBM_PAGE_SIZE); // content at end of page
         page[hdr + HDR_FRAGBYTES_OFF] = 0;                              // 0 fragmented bytes
-        if (!writer_io_seek_page(io, pnum) ||
-            !writer_io_write(io, page, CBM_PAGE_SIZE)) {
+        if (!writer_io_seek_page(io, pnum) || !writer_io_write(io, page, CBM_PAGE_SIZE)) {
             return 0;
         }
         return pnum;
@@ -1759,8 +1790,10 @@ static bool pb_promote_and_flush(PageBuilder *pb, uint8_t **cells, int *cell_len
 
 // Write an empty index leaf page.
 static uint32_t write_empty_index_leaf(WriterIo *io, uint32_t *next_page) {
-    *next_page = cbm_skip_pending_byte(*next_page);
-    uint32_t pnum = (*next_page)++;
+    uint32_t pnum = 0;
+    if (!writer_allocate_page(io, next_page, "allocate_empty_index_page", &pnum)) {
+        return 0;
+    }
     uint8_t page[CBM_PAGE_SIZE];
     memset(page, 0, CBM_PAGE_SIZE);
     page[0] = NEWLINE_BYTE;
@@ -1768,8 +1801,7 @@ static uint32_t write_empty_index_leaf(WriterIo *io, uint32_t *next_page) {
     put_u16(page + HDR_CELLCOUNT_OFF, 0);
     put_u16(page + HDR_CONTENT_OFF, (uint16_t)CBM_PAGE_SIZE);
     page[HDR_FRAGBYTES_OFF] = 0;
-    if (!writer_io_seek_page(io, pnum) ||
-        !writer_io_write(io, page, CBM_PAGE_SIZE)) {
+    if (!writer_io_seek_page(io, pnum) || !writer_io_write(io, page, CBM_PAGE_SIZE)) {
         return 0;
     }
     return pnum;
