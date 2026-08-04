@@ -512,11 +512,17 @@ static int materialize_context_sets(cbm_pipeline_ctx_t *ctx,
     char files_text[32];
     char contexts_text[32];
     char bindings_text[32];
+    char reuse_text[32];
     snprintf(files_text, sizeof(files_text), "%d", c_family_files);
     snprintf(contexts_text, sizeof(contexts_text), "%d", index->context_count);
     snprintf(bindings_text, sizeof(bindings_text), "%d", context_bindings);
+    snprintf(reuse_text, sizeof(reuse_text), "%d",
+             context_bindings > index->context_count
+                 ? context_bindings - index->context_count
+                 : 0);
     cbm_log_info("compile_context.ready", "c_family_files", files_text, "translation_units",
-                 contexts_text, "file_context_bindings", bindings_text, "cache", "immutable");
+                 contexts_text, "file_context_bindings", bindings_text, "cache_builds", "1",
+                 "context_reuses", reuse_text, "cache", "generation_owned_immutable");
     return 0;
 }
 
@@ -710,7 +716,8 @@ int cbm_compile_context_index_prepare(cbm_pipeline_ctx_t *ctx,
             }
         }
         cbm_log_info("compile_context.ready", "c_family_files", "0", "translation_units", "0",
-                     "file_context_bindings", "0", "cache", "immutable");
+                     "file_context_bindings", "0", "cache_builds", "1", "context_reuses", "0",
+                     "cache", "generation_owned_immutable");
         *out_index = index;
         return 0;
     }
