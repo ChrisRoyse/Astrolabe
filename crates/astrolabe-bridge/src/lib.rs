@@ -1113,7 +1113,20 @@ impl BridgeError {
 
 impl fmt::Display for BridgeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}: {}", self.envelope.code, self.envelope.message)
+        write!(
+            f,
+            "{}: {}; remediation: {}",
+            self.envelope.code, self.envelope.message, self.envelope.remediation
+        )?;
+        if let Some(stderr) = self
+            .envelope
+            .stderr
+            .as_deref()
+            .filter(|stderr| !stderr.is_empty())
+        {
+            write!(f, "; stderr:\n{stderr}")?;
+        }
+        Ok(())
     }
 }
 
@@ -1936,7 +1949,14 @@ struct RepositoryCompilerBaseline {
 }
 
 fn normalized_path(path: &Path) -> String {
-    path.to_string_lossy().replace('\\', "/")
+    let text = path.to_string_lossy();
+    if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
+        format!("//{}", rest.replace('\\', "/"))
+    } else if let Some(rest) = text.strip_prefix(r"\\?\") {
+        rest.replace('\\', "/")
+    } else {
+        text.replace('\\', "/")
+    }
 }
 
 fn canonical_path(path: &Path, code: &str, purpose: &str) -> Result<PathBuf, BridgeError> {
@@ -2124,6 +2144,7 @@ fn context_compiler_arguments(
     directory: &Path,
     file: &Path,
     keep_language: bool,
+    keep_translation_unit: bool,
 ) -> Result<Vec<String>, BridgeError> {
     if arguments.is_empty() {
         return Err(envelope(
@@ -2133,6 +2154,7 @@ fn context_compiler_arguments(
         ));
     }
     let mut result = vec![resolve_command_program(directory, &arguments[0])];
+    let mut translation_unit_count = 0usize;
     let mut index = 1usize;
     while index < arguments.len() {
         let argument = &arguments[index];
@@ -2164,12 +2186,37 @@ fn context_compiler_arguments(
             index += 2;
             continue;
         }
-        if !is_dependency_or_output_option(argument)
-            && !argument_is_translation_unit(argument, directory, file)
-        {
+        if argument_is_translation_unit(argument, directory, file) {
+            translation_unit_count = translation_unit_count.checked_add(1).ok_or_else(|| {
+                envelope(
+                    "ASTRO_COMPILE_CONTEXT_TU_ARGUMENT_OVERFLOW",
+                    format!(
+                        "translation-unit argument count overflows for {}",
+                        file.display()
+                    ),
+                    "Regenerate compile_commands.json with one translation-unit argument per entry.",
+                )
+            })?;
+            if keep_translation_unit {
+                // The compile database is the command authority. Keep the exact
+                // compiler-accepted spelling (including a relative path) rather
+                // than reconstructing it from Windows canonical identity.
+                result.push(argument.clone());
+            }
+        } else if !is_dependency_or_output_option(argument) {
             result.push(argument.clone());
         }
         index += 1;
+    }
+    if translation_unit_count != 1 {
+        return Err(envelope(
+            "ASTRO_COMPILE_CONTEXT_TU_ARGUMENT_CARDINALITY",
+            format!(
+                "translation unit {} has {translation_unit_count} matching argv elements; expected exactly one",
+                file.display()
+            ),
+            "Regenerate compile_commands.json with exactly one compiler-accepted translation-unit argument per entry.",
+        ));
     }
     Ok(result)
 }
@@ -2233,7 +2280,11 @@ fn run_context_compiler(
         .map_err(|error| {
             envelope(
                 "ASTRO_COMPILE_CONTEXT_COMPILER_UNREACHABLE",
-                format!("cannot execute compiler during {operation} for {}: {error}", file.display()),
+                format!(
+                    "cannot execute compiler argv {arguments:?} in {} during {operation} for {}: {error}",
+                    directory.display(),
+                    file.display()
+                ),
                 "Restore the exact compiler named by compile_commands.json to PATH or its recorded path.",
             )
         })?;
@@ -2243,7 +2294,12 @@ fn run_context_compiler(
     Err(BridgeError::new(
         ErrorEnvelope::new(
             "ASTRO_COMPILE_CONTEXT_COMPILER_FAILED",
-            format!("compiler {operation} failed for {} with {}", file.display(), output.status),
+            format!(
+                "compiler argv {arguments:?} in {} failed during {operation} for {} with {}",
+                directory.display(),
+                file.display(),
+                output.status
+            ),
             "Read stderr, repair the real compilation command/build inputs, and regenerate the database.",
         )
         .with_stderr(String::from_utf8_lossy(&output.stderr)),
@@ -2509,7 +2565,7 @@ fn capture_repository_compile_command(
     let language = translation_unit_language(&arguments, &file_path)?;
 
     let mut baseline_arguments =
-        context_compiler_arguments(&arguments, &directory, &file_path, false)?;
+        context_compiler_arguments(&arguments, &directory, &file_path, false, false)?;
     baseline_arguments.extend([
         "-dM".to_owned(),
         "-E".to_owned(),
@@ -2561,12 +2617,11 @@ fn capture_repository_compile_command(
     }
 
     let mut dependency_arguments =
-        context_compiler_arguments(&arguments, &directory, &file_path, true)?;
+        context_compiler_arguments(&arguments, &directory, &file_path, true, true)?;
     dependency_arguments.extend([
         "-M".to_owned(),
         "-MT".to_owned(),
         "astrolabe-context".to_owned(),
-        normalized_path(&file_path),
     ]);
     let dependency_output = run_context_compiler(
         &dependency_arguments,
