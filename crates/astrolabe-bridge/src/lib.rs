@@ -1184,6 +1184,7 @@ pub struct Language(cbm_sys::CBMLanguage);
 
 impl Language {
     pub const C: Self = Self(cbm_sys::CBMLanguage_CBM_LANG_C);
+    pub const RUST: Self = Self(cbm_sys::CBMLanguage_CBM_LANG_RUST);
 
     pub fn from_raw(raw: cbm_sys::CBMLanguage) -> Self {
         Self(raw)
@@ -2270,6 +2271,17 @@ impl ExtractedFile {
         rel_path: &str,
         timeout_micros: i64,
     ) -> Result<Self, BridgeError> {
+        Self::extract_with_rust_context(source, language, project, rel_path, false, timeout_micros)
+    }
+
+    pub fn extract_with_rust_context(
+        source: &str,
+        language: Language,
+        project: &str,
+        rel_path: &str,
+        rust_is_crate_root: bool,
+        timeout_micros: i64,
+    ) -> Result<Self, BridgeError> {
         initialize_cbm_allocator()?;
         let source_len = c_int::try_from(source.len()).map_err(|_| {
             envelope(
@@ -2286,12 +2298,15 @@ impl ExtractedFile {
         // and source is passed with an explicit byte length.
         unsafe {
             map_cbm_status(cbm_sys::cbm_init())?;
-            let ptr = cbm_sys::cbm_extract_file(
+            let ptr = cbm_sys::cbm_extract_file_at_path_with_rust_edition(
                 source.as_ptr().cast::<c_char>(),
                 source_len,
                 language.as_raw(),
                 project.as_ptr(),
                 rel_path.as_ptr(),
+                ptr::null(),
+                ptr::null(),
+                rust_is_crate_root,
                 timeout_micros,
                 ptr::null_mut(),
                 ptr::null_mut(),
@@ -2300,7 +2315,7 @@ impl ExtractedFile {
                 ptr: NonNull::new(ptr).ok_or_else(|| {
                     envelope(
                         "ASTRO_CBM_NULL_RESULT",
-                        "cbm_extract_file returned NULL",
+                        "CBM Rust-context extraction returned NULL",
                         "Check libcbm diagnostics and reject the file as an extraction failure.",
                     )
                 })?,

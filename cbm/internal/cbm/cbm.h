@@ -678,6 +678,7 @@ typedef struct {
     const char *structured_classification_override_provenance;
     CBMImportResolution es_import_resolution_override;
     bool es_import_resolution_override_enabled;
+    bool rust_is_crate_root;               // exact Cargo target identity supplied by caller
     EFCache ef_cache;                      // enclosing function cache
     const char *enclosing_class_qn;        // for nested class QN computation
     CBMStringConstantMap string_constants; // module-level NAME = "value" pairs
@@ -738,8 +739,9 @@ CBMFileResult *cbm_extract_file_at_path(const char *source, int source_len, CBML
  * edition-sensitive Rust macro then refuses rather than guessing. */
 CBMFileResult *cbm_extract_file_at_path_with_rust_edition(
     const char *source, int source_len, CBMLanguage language, const char *project,
-    const char *rel_path, const char *source_path, const char *rust_edition, int64_t timeout_micros,
-    const char **extra_defines, const char **include_paths);
+    const char *rel_path, const char *source_path, const char *rust_edition,
+    bool rust_is_crate_root, int64_t timeout_micros, const char **extra_defines,
+    const char **include_paths);
 
 /* Production extraction with immutable repository metadata. Structured
  * classification overrides are accepted only for structured-data languages;
@@ -748,6 +750,7 @@ CBMFileResult *cbm_extract_file_at_path_with_rust_edition(
 CBMFileResult *cbm_extract_file_at_path_with_metadata(
     const char *source, int source_len, CBMLanguage language, const char *project,
     const char *rel_path, const char *source_path, const char *rust_edition,
+    bool rust_is_crate_root,
     const char *structured_classification_override,
     const char *structured_classification_override_provenance, int64_t timeout_micros,
     const char **extra_defines, const char **include_paths);

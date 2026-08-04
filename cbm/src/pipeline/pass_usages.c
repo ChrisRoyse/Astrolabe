@@ -312,7 +312,8 @@ int cbm_pipeline_pass_usages(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *fil
             }
             result = cbm_extract_file_at_path_with_rust_edition(
                 source, source_len, files[i].language, ctx->project_name, rel, files[i].path,
-                cbm_pxc_rust_edition_for_file(ctx, rel), CBM_EXTRACT_BUDGET, NULL, NULL);
+                cbm_pxc_rust_edition_for_file(ctx, rel),
+                cbm_pxc_rust_is_crate_root(ctx, rel), CBM_EXTRACT_BUDGET, NULL, NULL);
             free(source);
             if (!result) {
                 errors++;

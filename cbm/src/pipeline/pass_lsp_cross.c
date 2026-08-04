@@ -767,52 +767,394 @@ void cbm_pxc_dispatch_file(CBMLanguage lang, CBMFileResult *result, const char *
     free(filtered);
 }
 
+typedef struct {
+    const char *package_dir;
+    const char *package_name;
+    const char *edition;
+    bool edition_inherits_workspace;
+    const char *workspace_path;
+    const char *build_path;
+    bool build_declared;
+    bool build_enabled;
+    bool autolib;
+    bool autobins;
+    bool autoexamples;
+    bool autotests;
+    bool autobenches;
+    bool autolib_declared;
+    bool autobins_declared;
+    bool autoexamples_declared;
+    bool autotests_declared;
+    bool autobenches_declared;
+    CBMCargoTarget *targets;
+    int target_count;
+} PXCCargoPackage;
+
+typedef struct {
+    const char *dir;
+    const char *edition;
+} PXCCargoWorkspace;
+
+static const char *pxc_manifest_dir(CBMArena *arena, const char *rel_path) {
+    const char *slash = rel_path ? strrchr(rel_path, '/') : NULL;
+    if (!slash)
+        return cbm_arena_strdup(arena, "");
+    return cbm_arena_strndup(arena, rel_path, (size_t)(slash - rel_path));
+}
+
+static bool pxc_path_prefix(const char *path, const char *prefix) {
+    if (!path || !prefix)
+        return false;
+    size_t len = strlen(prefix);
+    return (len == 0 || strncmp(path, prefix, len) == 0) &&
+           (len == 0 || path[len] == '\0' || path[len] == '/');
+}
+
+static const PXCCargoPackage *pxc_owning_package(const PXCCargoPackage *packages, int count,
+                                                  const char *rel_path) {
+    const PXCCargoPackage *selected = NULL;
+    size_t selected_len = 0;
+    for (int i = 0; i < count; i++) {
+        size_t len = strlen(packages[i].package_dir);
+        if ((len > selected_len || (!selected && len == 0)) &&
+            pxc_path_prefix(rel_path, packages[i].package_dir)) {
+            selected = &packages[i];
+            selected_len = len;
+        }
+    }
+    return selected;
+}
+
+static const char *pxc_nearest_workspace_edition(const PXCCargoWorkspace *workspaces, int count,
+                                                  const char *package_dir,
+                                                  const char *explicit_workspace) {
+    const PXCCargoWorkspace *selected = NULL;
+    size_t selected_len = 0;
+    for (int i = 0; i < count; i++) {
+        const char *dir = workspaces[i].dir;
+        size_t len = strlen(dir);
+        if (explicit_workspace) {
+            if (strcmp(dir, explicit_workspace) == 0)
+                return workspaces[i].edition;
+            continue;
+        }
+        if ((len > selected_len || (!selected && len == 0)) &&
+            pxc_path_prefix(package_dir, dir)) {
+            selected = &workspaces[i];
+            selected_len = len;
+        }
+    }
+    return selected ? selected->edition : NULL;
+}
+
+static char *pxc_normalize_repo_path(CBMArena *arena, const char *base, const char *relative,
+                                     const char *operation, bool allow_empty) {
+    if (!relative || !relative[0] || relative[0] == '/' || relative[0] == '\\' ||
+        (relative[0] && relative[1] == ':')) {
+        cbm_arena_mark_failed(arena, "CBM_CARGO_TARGET_PATH_INVALID", operation, 0);
+        return NULL;
+    }
+    size_t base_len = base ? strlen(base) : 0;
+    size_t relative_len = strlen(relative);
+    if (base_len > SIZE_MAX - relative_len - 2) {
+        cbm_arena_mark_failed(arena, "CBM_CARGO_TARGET_PATH_OVERFLOW", operation,
+                              relative_len);
+        return NULL;
+    }
+    char *joined = cbm_arena_alloc(arena, base_len + relative_len + 2);
+    if (!joined)
+        return NULL;
+    size_t joined_len = 0;
+    if (base_len) {
+        memcpy(joined, base, base_len);
+        joined_len = base_len;
+        joined[joined_len++] = '/';
+    }
+    memcpy(joined + joined_len, relative, relative_len + 1);
+
+    size_t read = 0;
+    size_t write = 0;
+    while (joined[read]) {
+        while (joined[read] == '/' || joined[read] == '\\')
+            read++;
+        size_t start = read;
+        while (joined[read] && joined[read] != '/' && joined[read] != '\\')
+            read++;
+        size_t len = read - start;
+        if (len == 0 || (len == 1 && joined[start] == '.'))
+            continue;
+        if (len == 2 && joined[start] == '.' && joined[start + 1] == '.') {
+            if (write == 0) {
+                cbm_arena_mark_failed(arena, "CBM_CARGO_TARGET_PATH_ESCAPE", operation, 0);
+                return NULL;
+            }
+            while (write > 0 && joined[write - 1] != '/')
+                write--;
+            if (write > 0)
+                write--;
+            continue;
+        }
+        if (write > 0)
+            joined[write++] = '/';
+        memmove(joined + write, joined + start, len);
+        write += len;
+    }
+    joined[write] = '\0';
+    if (write == 0) {
+        if (allow_empty)
+            return joined;
+        cbm_arena_mark_failed(arena, "CBM_CARGO_TARGET_PATH_INVALID", operation, 0);
+        return NULL;
+    }
+    return joined;
+}
+
+static bool pxc_single_or_multifile_root(const char *path, const char *prefix) {
+    size_t prefix_len = strlen(prefix);
+    if (strncmp(path, prefix, prefix_len) != 0)
+        return false;
+    const char *rest = path + prefix_len;
+    const char *slash = strchr(rest, '/');
+    if (!slash) {
+        size_t len = strlen(rest);
+        return len > 3 && strcmp(rest + len - 3, ".rs") == 0;
+    }
+    return strchr(slash + 1, '/') == NULL && strcmp(slash + 1, "main.rs") == 0;
+}
+
+static bool pxc_named_target_root(const PXCCargoPackage *package, const CBMCargoTarget *target,
+                                  const char *source_rel) {
+    if (target->path)
+        return strcmp(source_rel, target->path) == 0;
+    if (target->kind == CBM_CARGO_TARGET_LIB) {
+        size_t dir_len = strlen(package->package_dir);
+        const char *package_rel = source_rel + (dir_len ? dir_len + 1 : 0);
+        return strcmp(package_rel, "src/lib.rs") == 0;
+    }
+    if (!target->name || !target->name[0])
+        return false;
+    const char *family = target->kind == CBM_CARGO_TARGET_BIN       ? "src/bin"
+                         : target->kind == CBM_CARGO_TARGET_EXAMPLE ? "examples"
+                         : target->kind == CBM_CARGO_TARGET_TEST    ? "tests"
+                                                                    : "benches";
+    char first[1024];
+    char second[1024];
+    int first_n = snprintf(first, sizeof(first), "%s%s%s/%s.rs", package->package_dir,
+                           package->package_dir[0] ? "/" : "", family, target->name);
+    int second_n = snprintf(second, sizeof(second), "%s%s%s/%s/main.rs", package->package_dir,
+                            package->package_dir[0] ? "/" : "", family, target->name);
+    if (first_n > 0 && (size_t)first_n < sizeof(first) && strcmp(source_rel, first) == 0)
+        return true;
+    if (second_n > 0 && (size_t)second_n < sizeof(second) && strcmp(source_rel, second) == 0)
+        return true;
+    if (target->kind == CBM_CARGO_TARGET_BIN && package->package_name &&
+        strcmp(target->name, package->package_name) == 0) {
+        char main_path[1024];
+        int main_n = snprintf(main_path, sizeof(main_path), "%s%ssrc/main.rs",
+                              package->package_dir, package->package_dir[0] ? "/" : "");
+        return main_n > 0 && (size_t)main_n < sizeof(main_path) &&
+               strcmp(source_rel, main_path) == 0;
+    }
+    return false;
+}
+
+static bool pxc_package_source_is_crate_root(const PXCCargoPackage *package,
+                                              const char *source_rel) {
+    size_t dir_len = strlen(package->package_dir);
+    const char *package_rel = source_rel + (dir_len ? dir_len + 1 : 0);
+    if (package->build_enabled) {
+        const char *build = package->build_declared ? package->build_path : NULL;
+        if ((!build && strcmp(package_rel, "build.rs") == 0) ||
+            (build && strcmp(source_rel, build) == 0))
+            return true;
+    }
+    for (int i = 0; i < package->target_count; i++) {
+        if (pxc_named_target_root(package, &package->targets[i], source_rel))
+            return true;
+    }
+
+    bool manual = package->target_count > 0;
+    bool edition_2015 = !package->edition || strcmp(package->edition, "2015") == 0;
+    bool autolib = package->autolib_declared ? package->autolib
+                                             : package->autolib && !(edition_2015 && manual);
+    bool autobins = package->autobins_declared ? package->autobins
+                                               : package->autobins && !(edition_2015 && manual);
+    bool autoexamples = package->autoexamples_declared
+                            ? package->autoexamples
+                            : package->autoexamples && !(edition_2015 && manual);
+    bool autotests = package->autotests_declared ? package->autotests
+                                                 : package->autotests && !(edition_2015 && manual);
+    bool autobenches = package->autobenches_declared
+                           ? package->autobenches
+                           : package->autobenches && !(edition_2015 && manual);
+    return (autolib && strcmp(package_rel, "src/lib.rs") == 0) ||
+           (autobins && (strcmp(package_rel, "src/main.rs") == 0 ||
+                         pxc_single_or_multifile_root(package_rel, "src/bin/"))) ||
+           (autoexamples && pxc_single_or_multifile_root(package_rel, "examples/")) ||
+           (autotests && pxc_single_or_multifile_root(package_rel, "tests/")) ||
+           (autobenches && pxc_single_or_multifile_root(package_rel, "benches/"));
+}
+
+static int pxc_string_ptr_compare(const void *left, const void *right) {
+    const char *const *a = (const char *const *)left;
+    const char *const *b = (const char *const *)right;
+    return strcmp(*a, *b);
+}
+
 static bool pxc_build_rust_manifest(const cbm_pipeline_ctx_t *ctx, CBMArena *marena,
                                     CBMCargoManifest *out_m) {
     if (!ctx || !ctx->source_root || !marena || !out_m)
         return false;
-    char path[1024];
-    int n = snprintf(path, sizeof(path), "%s/Cargo.toml", ctx->source_root);
-    if (n <= 0 || (size_t)n >= sizeof(path))
-        return false;
-    int toml_len = 0;
-    char *toml = pxc_read_file(path, &toml_len);
-    if (!toml || toml_len <= 0) {
-        free(toml);
-        return false;
+    int manifest_count = 0;
+    int rust_count = 0;
+    for (int i = 0; i < ctx->all_file_count; i++) {
+        const char *rel = ctx->all_files[i].rel_path;
+        const char *base = rel ? strrchr(rel, '/') : NULL;
+        base = base ? base + 1 : rel;
+        if (base && strcmp(base, "Cargo.toml") == 0)
+            manifest_count++;
+        if (ctx->all_files[i].language == CBM_LANG_RUST)
+            rust_count++;
     }
-    memset(out_m, 0, sizeof(*out_m));
-    cbm_cargo_parse(marena, toml, toml_len, out_m);
-    free(toml); /* cargo parser copies into marena */
+    if (manifest_count == 0)
+        return false;
 
-    /* Resolve each explicitly declared workspace member's effective edition
-     * once. Macro fragment semantics belong to the definition crate's edition,
-     * so a single root-level default is not an exact substitute. */
-    for (int i = 0; i < out_m->member_count; i++) {
-        CBMCargoMember *member = &out_m->members[i];
-        if (!member->member_path || !member->member_path[0])
+    PXCCargoPackage *packages = cbm_arena_alloc(marena, (size_t)manifest_count * sizeof(*packages));
+    PXCCargoWorkspace *workspaces =
+        cbm_arena_alloc(marena, (size_t)manifest_count * sizeof(*workspaces));
+    const char **crate_roots =
+        rust_count > 0 ? cbm_arena_alloc(marena, (size_t)rust_count * sizeof(*crate_roots)) : NULL;
+    CBMCargoPackage *public_packages =
+        cbm_arena_alloc(marena, (size_t)manifest_count * sizeof(*public_packages));
+    if (!packages || !workspaces || (rust_count > 0 && !crate_roots) || !public_packages)
+        return false;
+    memset(out_m, 0, sizeof(*out_m));
+    int package_count = 0;
+    int workspace_count = 0;
+
+    for (int i = 0; i < ctx->all_file_count; i++) {
+        const cbm_file_info_t *file = &ctx->all_files[i];
+        const char *base = file->rel_path ? strrchr(file->rel_path, '/') : NULL;
+        base = base ? base + 1 : file->rel_path;
+        if (!base || strcmp(base, "Cargo.toml") != 0)
             continue;
-        int member_n =
-            snprintf(path, sizeof(path), "%s/%s/Cargo.toml", ctx->source_root, member->member_path);
-        if (member_n <= 0 || (size_t)member_n >= sizeof(path))
-            continue;
-        int member_toml_len = 0;
-        char *member_toml = pxc_read_file(path, &member_toml_len);
-        if (!member_toml || member_toml_len <= 0) {
-            free(member_toml);
-            continue;
+        int toml_len = 0;
+        char *toml = pxc_read_file(file->path, &toml_len);
+        if (!toml || toml_len <= 0) {
+            free(toml);
+            cbm_arena_mark_failed(marena, "CBM_CARGO_MANIFEST_READ_FAILED",
+                                  "read_discovered_manifest", (size_t)(toml_len > 0 ? toml_len : 0));
+            return false;
         }
-        CBMCargoManifest parsed_member;
-        cbm_cargo_parse(marena, member_toml, member_toml_len, &parsed_member);
-        free(member_toml);
-        if (parsed_member.package_edition) {
-            member->edition = parsed_member.package_edition;
-        } else if (parsed_member.package_edition_inherits_workspace) {
-            member->edition = out_m->workspace_package_edition;
-        } else if (parsed_member.package_name) {
-            member->edition = "2015"; /* Cargo's specified package default. */
+        CBMCargoManifest parsed;
+        cbm_cargo_parse(marena, toml, toml_len, &parsed);
+        free(toml);
+        if (cbm_arena_failed(marena))
+            return false;
+        const char *dir = pxc_manifest_dir(marena, file->rel_path);
+        if (!dir)
+            return false;
+        if (strcmp(file->rel_path, "Cargo.toml") == 0) {
+            *out_m = parsed;
+        }
+        if (parsed.is_workspace_root) {
+            workspaces[workspace_count++] = (PXCCargoWorkspace){
+                .dir = dir,
+                .edition = parsed.workspace_package_edition,
+            };
+        }
+        if (!parsed.package_name)
+            continue;
+        PXCCargoPackage *package = &packages[package_count++];
+        *package = (PXCCargoPackage){
+            .package_dir = dir,
+            .package_name = parsed.package_name,
+            .edition = parsed.package_edition,
+            .edition_inherits_workspace = parsed.package_edition_inherits_workspace,
+            .workspace_path = parsed.package_workspace,
+            .build_path = parsed.package_build_path,
+            .build_declared = parsed.package_build_declared,
+            .build_enabled = parsed.package_build_enabled,
+            .autolib = parsed.autolib,
+            .autobins = parsed.autobins,
+            .autoexamples = parsed.autoexamples,
+            .autotests = parsed.autotests,
+            .autobenches = parsed.autobenches,
+            .autolib_declared = parsed.autolib_declared,
+            .autobins_declared = parsed.autobins_declared,
+            .autoexamples_declared = parsed.autoexamples_declared,
+            .autotests_declared = parsed.autotests_declared,
+            .autobenches_declared = parsed.autobenches_declared,
+            .target_count = parsed.target_count,
+        };
+        if (parsed.target_count > 0) {
+            package->targets = cbm_arena_alloc(
+                marena, (size_t)parsed.target_count * sizeof(package->targets[0]));
+            if (!package->targets)
+                return false;
+            memcpy(package->targets, parsed.targets,
+                   (size_t)parsed.target_count * sizeof(package->targets[0]));
+        }
+        if (package->build_declared && package->build_enabled && package->build_path) {
+            package->build_path = pxc_normalize_repo_path(
+                marena, package->package_dir, package->build_path, "normalize_cargo_build_path",
+                false);
+            if (!package->build_path)
+                return false;
+        }
+        for (int target = 0; target < package->target_count; target++) {
+            if (package->targets[target].path) {
+                package->targets[target].path = pxc_normalize_repo_path(
+                    marena, package->package_dir, package->targets[target].path,
+                    "normalize_cargo_target_path", false);
+                if (!package->targets[target].path)
+                    return false;
+            }
         }
     }
+
+    for (int i = 0; i < package_count; i++) {
+        PXCCargoPackage *package = &packages[i];
+        if (package->edition_inherits_workspace) {
+            const char *workspace_dir = NULL;
+            if (package->workspace_path) {
+                workspace_dir = pxc_normalize_repo_path(
+                    marena, package->package_dir, package->workspace_path,
+                    "normalize_cargo_workspace_path", true);
+                if (!workspace_dir)
+                    return false;
+            }
+            package->edition = pxc_nearest_workspace_edition(
+                workspaces, workspace_count, package->package_dir, workspace_dir);
+            if (!package->edition) {
+                cbm_arena_mark_failed(marena, "CBM_CARGO_WORKSPACE_EDITION_MISSING",
+                                      "resolve_package_edition", 0);
+                return false;
+            }
+        } else if (!package->edition) {
+            package->edition = "2015";
+        }
+        public_packages[i] = (CBMCargoPackage){
+            .package_dir = package->package_dir,
+            .edition = package->edition,
+        };
+    }
+
+    int crate_root_count = 0;
+    for (int i = 0; i < ctx->all_file_count; i++) {
+        const cbm_file_info_t *file = &ctx->all_files[i];
+        if (file->language != CBM_LANG_RUST)
+            continue;
+        const PXCCargoPackage *package =
+            pxc_owning_package(packages, package_count, file->rel_path);
+        if (package && pxc_package_source_is_crate_root(package, file->rel_path))
+            crate_roots[crate_root_count++] = file->rel_path;
+    }
+    qsort(crate_roots, (size_t)crate_root_count, sizeof(crate_roots[0]), pxc_string_ptr_compare);
+    out_m->packages = public_packages;
+    out_m->package_count = package_count;
+    out_m->crate_roots = crate_roots;
+    out_m->crate_root_count = crate_root_count;
     return true;
 }
 
@@ -836,18 +1178,16 @@ int cbm_pxc_prepare_rust_manifest(cbm_pipeline_ctx_t *ctx) {
         return 0;
     }
 
-    char cargo_path[1024];
-    int cargo_path_len =
-        snprintf(cargo_path, sizeof(cargo_path), "%s/Cargo.toml", ctx->source_root);
-    if (cargo_path_len <= 0 || (size_t)cargo_path_len >= sizeof(cargo_path)) {
-        cbm_log_error("pass.err", "code", "CBM_CARGO_MANIFEST_PATH_INVALID", "pass",
-                      "rust_manifest_prepare", "operation", "construct_root_manifest_path",
-                      "message", "root Cargo manifest path exceeds the supported path buffer",
-                      "remediation", "move the repository to a shorter canonical path and retry");
-        return -1;
+    int cargo_manifest_count = 0;
+    for (int i = 0; i < ctx->all_file_count; i++) {
+        const char *rel = ctx->all_files[i].rel_path;
+        const char *base = rel ? strrchr(rel, '/') : NULL;
+        base = base ? base + 1 : rel;
+        if (base && strcmp(base, "Cargo.toml") == 0)
+            cargo_manifest_count++;
     }
-    if (!cbm_path_exists(cargo_path)) {
-        cbm_log_info("rust_manifest.absent", "path", cargo_path, "rust_files",
+    if (cargo_manifest_count == 0) {
+        cbm_log_info("rust_manifest.absent", "path", ctx->source_root, "rust_files",
                      itoa_buf(ctx->all_file_count));
         return 0;
     }
@@ -867,13 +1207,15 @@ int cbm_pxc_prepare_rust_manifest(cbm_pipeline_ctx_t *ctx) {
                                             : "read_root_manifest";
         cbm_log_error("pass.err", "code", failure_code, "pass", "rust_manifest_prepare",
                       "component", "rust_manifest", "operation", failure_operation, "path",
-                      cargo_path, "message", "Cargo manifest could not be loaded exactly",
+                      ctx->source_root, "message", "Cargo manifests could not be loaded exactly",
                       "remediation", "inspect the manifest path/read error and retry");
         cbm_pxc_destroy_rust_manifest(ctx);
         return -1;
     }
-    cbm_log_info("rust_manifest.ready", "path", cargo_path, "members",
-                 itoa_buf(ctx->rust_manifest->member_count));
+    cbm_log_info("rust_manifest.ready", "path", ctx->source_root, "manifests",
+                 itoa_buf(cargo_manifest_count), "packages",
+                 itoa_buf(ctx->rust_manifest->package_count), "crate_roots",
+                 itoa_buf(ctx->rust_manifest->crate_root_count));
     return 0;
 }
 
@@ -893,6 +1235,10 @@ void cbm_pxc_destroy_rust_manifest(cbm_pipeline_ctx_t *ctx) {
 const char *cbm_pxc_rust_edition_for_file(const cbm_pipeline_ctx_t *ctx,
                                           const char *relative_path) {
     return ctx ? cbm_cargo_edition_for_path(ctx->rust_manifest, relative_path) : NULL;
+}
+
+bool cbm_pxc_rust_is_crate_root(const cbm_pipeline_ctx_t *ctx, const char *relative_path) {
+    return ctx && cbm_cargo_is_crate_root(ctx->rust_manifest, relative_path);
 }
 
 int cbm_pipeline_pass_lsp_cross(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files,

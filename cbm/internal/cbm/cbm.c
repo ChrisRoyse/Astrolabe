@@ -766,7 +766,7 @@ static int count_params_from_signature(const char *sig) {
 static CBMFileResult *cbm_extract_file_impl(const char *source, int source_len,
                                             CBMLanguage language, const char *project,
                                             const char *rel_path, const char *source_path,
-                                            const char *rust_edition,
+                                            const char *rust_edition, bool rust_is_crate_root,
                                             const char *structured_classification_override,
                                             const char *structured_classification_provenance,
                                             int64_t timeout_micros,
@@ -894,7 +894,7 @@ static bool cbm_extract_arena_ok(CBMFileResult *result, const char *phase, const
 CBMFileResult *cbm_extract_file(const char *source, int source_len, CBMLanguage language,
                                 const char *project, const char *rel_path, int64_t timeout_micros,
                                 const char **extra_defines, const char **include_paths) {
-    return cbm_extract_file_impl(source, source_len, language, project, rel_path, NULL, NULL,
+    return cbm_extract_file_impl(source, source_len, language, project, rel_path, NULL, NULL, false,
                                  NULL, NULL, timeout_micros, extra_defines, include_paths);
 }
 
@@ -903,26 +903,30 @@ CBMFileResult *cbm_extract_file_at_path(const char *source, int source_len, CBML
                                         const char *source_path, int64_t timeout_micros,
                                         const char **extra_defines, const char **include_paths) {
     return cbm_extract_file_impl(source, source_len, language, project, rel_path, source_path, NULL,
-                                 NULL, NULL, timeout_micros, extra_defines, include_paths);
+                                 false, NULL, NULL, timeout_micros, extra_defines, include_paths);
 }
 
 CBMFileResult *cbm_extract_file_at_path_with_rust_edition(
     const char *source, int source_len, CBMLanguage language, const char *project,
-    const char *rel_path, const char *source_path, const char *rust_edition, int64_t timeout_micros,
-    const char **extra_defines, const char **include_paths) {
+    const char *rel_path, const char *source_path, const char *rust_edition,
+    bool rust_is_crate_root, int64_t timeout_micros, const char **extra_defines,
+    const char **include_paths) {
     return cbm_extract_file_impl(source, source_len, language, project, rel_path, source_path,
-                                 rust_edition, NULL, NULL, timeout_micros, extra_defines,
+                                 rust_edition, rust_is_crate_root, NULL, NULL, timeout_micros,
+                                 extra_defines,
                                  include_paths);
 }
 
 CBMFileResult *cbm_extract_file_at_path_with_metadata(
     const char *source, int source_len, CBMLanguage language, const char *project,
     const char *rel_path, const char *source_path, const char *rust_edition,
+    bool rust_is_crate_root,
     const char *structured_classification_override,
     const char *structured_classification_override_provenance, int64_t timeout_micros,
     const char **extra_defines, const char **include_paths) {
     return cbm_extract_file_impl(
         source, source_len, language, project, rel_path, source_path, rust_edition,
+        rust_is_crate_root,
         structured_classification_override, structured_classification_override_provenance,
         timeout_micros, extra_defines, include_paths);
 }
@@ -930,7 +934,7 @@ CBMFileResult *cbm_extract_file_at_path_with_metadata(
 static CBMFileResult *cbm_extract_file_impl(const char *source, int source_len,
                                             CBMLanguage language, const char *project,
                                             const char *rel_path, const char *source_path,
-                                            const char *rust_edition,
+                                            const char *rust_edition, bool rust_is_crate_root,
                                             const char *structured_classification_override,
                                             const char *structured_classification_provenance,
                                             int64_t timeout_micros,
@@ -1067,6 +1071,7 @@ static CBMFileResult *cbm_extract_file_impl(const char *source, int source_len,
         .rel_path = rel_path,
         .module_qn = result->module_qn,
         .root = root,
+        .rust_is_crate_root = rust_is_crate_root,
         .structured_classification_override = structured_classification_override,
         .structured_classification_override_provenance =
             structured_classification_provenance,

@@ -12,6 +12,7 @@
 
 #include "rust_cargo.h"
 #include <stdbool.h>
+#include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
 
@@ -138,7 +139,8 @@ static int skip_value(const char *s, int len, int from) {
 
 /* Parse `[section.path]` header — returns the section name as a flat
  * dotted string, e.g. "dependencies" or "workspace.dependencies". */
-static int parse_section(CBMArena *a, const char *s, int len, int from, const char **out) {
+static int parse_section(CBMArena *a, const char *s, int len, int from, const char **out,
+                         bool *out_array_of_tables) {
     if (from >= len || s[from] != '[')
         return from;
     /* Skip leading `[` or `[[`. */
@@ -157,7 +159,27 @@ static int parse_section(CBMArena *a, const char *s, int len, int from, const ch
         from++;
     if (array_of_tables && from < len && s[from] == ']')
         from++;
+    if (out_array_of_tables)
+        *out_array_of_tables = array_of_tables;
     return from;
+}
+
+static int parse_bool(const char *s, int len, int from, bool *out, bool *parsed) {
+    from = skip_ws_and_comment(s, len, from);
+    if (from + 4 <= len && strncmp(s + from, "true", 4) == 0 &&
+        (from + 4 == len || !is_ident_char(s[from + 4]))) {
+        *out = true;
+        *parsed = true;
+        return from + 4;
+    }
+    if (from + 5 <= len && strncmp(s + from, "false", 5) == 0 &&
+        (from + 5 == len || !is_ident_char(s[from + 5]))) {
+        *out = false;
+        *parsed = true;
+        return from + 5;
+    }
+    *parsed = false;
+    return skip_value(s, len, from);
 }
 
 /* For the `[dependencies]` / `[dev-dependencies]` / `[workspace.dependencies]`
@@ -247,10 +269,99 @@ static int parse_package_kv(CBMArena *a, const char *s, int len, int from, CBMCa
             value_len--;
         out->package_edition_inherits_workspace =
             value_len == 4 && strncmp(s + start, "true", 4) == 0;
+    } else if (key && strcmp(key, "workspace") == 0) {
+        from = parse_string(a, s, len, from, &out->package_workspace);
+    } else if (key && strcmp(key, "build") == 0) {
+        out->package_build_declared = true;
+        if (from < len && (s[from] == '"' || s[from] == '\'')) {
+            from = parse_string(a, s, len, from, &out->package_build_path);
+            out->package_build_enabled = out->package_build_path != NULL;
+        } else {
+            bool parsed = false;
+            from = parse_bool(s, len, from, &out->package_build_enabled, &parsed);
+            if (!parsed || out->package_build_enabled) {
+                cbm_arena_mark_failed(a, "CBM_CARGO_BUILD_VALUE_INVALID",
+                                      "parse_package_build", 0);
+            }
+        }
+    } else if (key && (strcmp(key, "autolib") == 0 || strcmp(key, "autobins") == 0 ||
+                       strcmp(key, "autoexamples") == 0 || strcmp(key, "autotests") == 0 ||
+                       strcmp(key, "autobenches") == 0)) {
+        bool *value = NULL;
+        bool *declared = NULL;
+        if (strcmp(key, "autolib") == 0) {
+            value = &out->autolib;
+            declared = &out->autolib_declared;
+        } else if (strcmp(key, "autobins") == 0) {
+            value = &out->autobins;
+            declared = &out->autobins_declared;
+        } else if (strcmp(key, "autoexamples") == 0) {
+            value = &out->autoexamples;
+            declared = &out->autoexamples_declared;
+        } else if (strcmp(key, "autotests") == 0) {
+            value = &out->autotests;
+            declared = &out->autotests_declared;
+        } else {
+            value = &out->autobenches;
+            declared = &out->autobenches_declared;
+        }
+        bool parsed = false;
+        from = parse_bool(s, len, from, value, &parsed);
+        if (!parsed) {
+            cbm_arena_mark_failed(a, "CBM_CARGO_AUTO_TARGET_VALUE_INVALID",
+                                  "parse_package_auto_target", 0);
+        } else {
+            *declared = true;
+        }
     } else {
         from = skip_value(s, len, from);
     }
     return from;
+}
+
+static int parse_target_kv(CBMArena *a, const char *s, int len, int from,
+                           CBMCargoTarget *target) {
+    from = skip_ws_and_comment(s, len, from);
+    if (from >= len || s[from] == '[')
+        return from;
+    const char *key = NULL;
+    from = parse_key(a, s, len, from, &key);
+    from = skip_ws_and_comment(s, len, from);
+    if (from < len && s[from] == '=') {
+        from++;
+        from = skip_ws_and_comment(s, len, from);
+    }
+    if (key && strcmp(key, "name") == 0) {
+        from = parse_string(a, s, len, from, &target->name);
+    } else if (key && strcmp(key, "path") == 0) {
+        from = parse_string(a, s, len, from, &target->path);
+    } else {
+        from = skip_value(s, len, from);
+    }
+    return from;
+}
+
+static bool cargo_target_kind(const char *section, bool array_of_tables,
+                              CBMCargoTargetKind *out_kind) {
+    if (!section || !out_kind)
+        return false;
+    if (!array_of_tables && strcmp(section, "lib") == 0) {
+        *out_kind = CBM_CARGO_TARGET_LIB;
+        return true;
+    }
+    if (!array_of_tables)
+        return false;
+    if (strcmp(section, "bin") == 0)
+        *out_kind = CBM_CARGO_TARGET_BIN;
+    else if (strcmp(section, "example") == 0)
+        *out_kind = CBM_CARGO_TARGET_EXAMPLE;
+    else if (strcmp(section, "test") == 0)
+        *out_kind = CBM_CARGO_TARGET_TEST;
+    else if (strcmp(section, "bench") == 0)
+        *out_kind = CBM_CARGO_TARGET_BENCH;
+    else
+        return false;
+    return true;
 }
 
 static int parse_workspace_package_kv(CBMArena *a, const char *s, int len, int from,
@@ -322,12 +433,19 @@ void cbm_cargo_parse(CBMArena *arena, const char *src, int src_len, CBMCargoMani
     if (!arena || !src || !out)
         return;
     memset(out, 0, sizeof(*out));
+    out->package_build_enabled = true;
+    out->autolib = true;
+    out->autobins = true;
+    out->autoexamples = true;
+    out->autotests = true;
+    out->autobenches = true;
     if (src_len <= 0)
         src_len = (int)strlen(src);
 
     int from = 0;
     /* Default: pre-header content treated as [package]. */
     const char *section = "package";
+    int active_target = -1;
 
     while (from < src_len) {
         from = skip_ws_and_comment(src, src_len, from);
@@ -335,15 +453,30 @@ void cbm_cargo_parse(CBMArena *arena, const char *src, int src_len, CBMCargoMani
             break;
         if (src[from] == '[') {
             const char *hdr = NULL;
-            from = parse_section(arena, src, src_len, from, &hdr);
+            bool array_of_tables = false;
+            from = parse_section(arena, src, src_len, from, &hdr, &array_of_tables);
             section = hdr ? hdr : "";
+            active_target = -1;
+            CBMCargoTargetKind kind;
+            if (cargo_target_kind(section, array_of_tables, &kind)) {
+                if (out->target_count >= CBM_CARGO_MAX_TARGETS) {
+                    cbm_arena_mark_failed(arena, "CBM_CARGO_TARGET_LIMIT_EXCEEDED",
+                                          "parse_cargo_target_table",
+                                          (size_t)out->target_count + 1);
+                    return;
+                }
+                active_target = out->target_count++;
+                out->targets[active_target].kind = kind;
+            }
             continue;
         }
         if (!section) {
             from = skip_value(src, src_len, from);
             continue;
         }
-        if (strcmp(section, "package") == 0) {
+        if (active_target >= 0) {
+            from = parse_target_kv(arena, src, src_len, from, &out->targets[active_target]);
+        } else if (strcmp(section, "package") == 0) {
             from = parse_package_kv(arena, src, src_len, from, out);
         } else if (strcmp(section, "workspace") == 0) {
             from = parse_workspace_kv(arena, src, src_len, from, out);
@@ -404,9 +537,36 @@ static bool cargo_path_prefix(const char *path, const char *prefix) {
     return path[i] == '\0' || path[i] == '/' || path[i] == '\\';
 }
 
+static int cargo_string_ptr_compare(const void *left, const void *right) {
+    const char *const *a = (const char *const *)left;
+    const char *const *b = (const char *const *)right;
+    return strcmp(*a, *b);
+}
+
+bool cbm_cargo_is_crate_root(const CBMCargoManifest *m, const char *relative_path) {
+    if (!m || !relative_path || !m->crate_roots || m->crate_root_count <= 0)
+        return false;
+    const char *key = relative_path;
+    return bsearch(&key, m->crate_roots, (size_t)m->crate_root_count,
+                   sizeof(m->crate_roots[0]), cargo_string_ptr_compare) != NULL;
+}
+
 const char *cbm_cargo_edition_for_path(const CBMCargoManifest *m, const char *relative_path) {
     if (!m)
         return NULL;
+    const CBMCargoPackage *package = NULL;
+    size_t package_len = 0;
+    for (int i = 0; i < m->package_count; i++) {
+        const CBMCargoPackage *candidate = &m->packages[i];
+        size_t len = candidate->package_dir ? strlen(candidate->package_dir) : 0;
+        if ((len > package_len || (!package && len == 0)) &&
+            (len == 0 || cargo_path_prefix(relative_path, candidate->package_dir))) {
+            package = candidate;
+            package_len = len;
+        }
+    }
+    if (package)
+        return package->edition;
     const CBMCargoMember *selected = NULL;
     size_t selected_len = 0;
     for (int i = 0; i < m->member_count; i++) {

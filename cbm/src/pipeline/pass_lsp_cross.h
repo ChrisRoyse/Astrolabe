@@ -153,6 +153,9 @@ void cbm_pxc_destroy_rust_manifest(cbm_pipeline_ctx_t *ctx);
  * when the owning package cannot be resolved without guessing. */
 const char *cbm_pxc_rust_edition_for_file(const cbm_pipeline_ctx_t *ctx, const char *relative_path);
 
+/* Exact Cargo target-root identity for one repository-relative Rust source. */
+bool cbm_pxc_rust_is_crate_root(const cbm_pipeline_ctx_t *ctx, const char *relative_path);
+
 /* Run the cross-file LSP resolver for non-TS languages. Appends
  * resolved CALLS into r->resolved_calls (lives in r->arena). Caller
  * owns source, module_qn, all_defs, imp_keys, imp_vals.

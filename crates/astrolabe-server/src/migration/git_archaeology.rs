@@ -4228,6 +4228,344 @@ fn rust_module_dependency_candidates(
     ])
 }
 
+fn historical_cargo_manifest_candidates(source_path: &str) -> BTreeSet<String> {
+    let mut candidates = BTreeSet::new();
+    let mut parent = Path::new(source_path).parent();
+    while let Some(directory) = parent {
+        let candidate = directory.join("Cargo.toml");
+        candidates.insert(path_to_slash_string(&candidate));
+        parent = directory.parent();
+    }
+    candidates
+}
+
+fn path_to_slash_string(path: &Path) -> String {
+    path.components()
+        .filter_map(|component| match component {
+            std::path::Component::Normal(value) => value.to_str(),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+fn normalize_historical_cargo_path(base: &str, relative: &str) -> Result<String, DynError> {
+    if relative.is_empty()
+        || relative.starts_with(['/', '\\'])
+        || relative.as_bytes().get(1) == Some(&b':')
+    {
+        return Err(format!(
+            "ASTRO_ARCHAEOLOGY_CARGO_TARGET_PATH_INVALID: base {base:?} target path {relative:?} is not repository-relative; remediation=repair the Cargo target path before retrying"
+        )
+        .into());
+    }
+    let mut parts = base
+        .split('/')
+        .filter(|part| !part.is_empty())
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    for part in relative.replace('\\', "/").split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                if parts.pop().is_none() {
+                    return Err(format!(
+                        "ASTRO_ARCHAEOLOGY_CARGO_TARGET_PATH_ESCAPE: base {base:?} target path {relative:?} escapes the immutable repository; remediation=repair the Cargo path before retrying"
+                    )
+                    .into());
+                }
+            }
+            value => parts.push(value.to_string()),
+        }
+    }
+    Ok(parts.join("/"))
+}
+
+fn cargo_auto_root(path: &str, prefix: &str) -> bool {
+    let Some(rest) = path.strip_prefix(prefix) else {
+        return false;
+    };
+    match rest.split('/').collect::<Vec<_>>().as_slice() {
+        [file] => file.ends_with(".rs"),
+        [_directory, "main.rs"] => true,
+        _ => false,
+    }
+}
+
+fn cargo_bool(package: &toml::value::Table, key: &str) -> Result<(bool, bool), DynError> {
+    match package.get(key) {
+        None => Ok((true, false)),
+        Some(value) => value.as_bool().map(|value| (value, true)).ok_or_else(|| {
+            format!(
+                "ASTRO_ARCHAEOLOGY_CARGO_BOOLEAN_INVALID: package.{key} must be a boolean; remediation=repair the immutable Cargo manifest before retrying"
+            )
+            .into()
+        }),
+    }
+}
+
+fn cargo_target_tables<'a>(
+    manifest: &'a toml::Value,
+    key: &str,
+) -> Result<Vec<&'a toml::value::Table>, DynError> {
+    let Some(value) = manifest.get(key) else {
+        return Ok(Vec::new());
+    };
+    if key == "lib" {
+        return value.as_table().map(|table| vec![table]).ok_or_else(|| {
+            "ASTRO_ARCHAEOLOGY_CARGO_TARGET_TABLE_INVALID: [lib] is not a TOML table; remediation=repair the immutable Cargo manifest before retrying"
+                .into()
+        });
+    }
+    value
+        .as_array()
+        .ok_or_else(|| -> DynError {
+            format!(
+                "ASTRO_ARCHAEOLOGY_CARGO_TARGET_TABLE_INVALID: [[{key}]] is not an array of tables; remediation=repair the immutable Cargo manifest before retrying"
+            )
+            .into()
+        })?
+        .iter()
+        .map(|entry| {
+            entry.as_table().ok_or_else(|| -> DynError {
+                format!(
+                    "ASTRO_ARCHAEOLOGY_CARGO_TARGET_TABLE_INVALID: [[{key}]] contains a non-table entry; remediation=repair the immutable Cargo manifest before retrying"
+                )
+                .into()
+            })
+        })
+        .collect()
+}
+
+fn inferred_named_cargo_target(
+    source_path: &str,
+    package_dir: &str,
+    package_name: &str,
+    kind: &str,
+    target: &toml::value::Table,
+) -> Result<bool, DynError> {
+    if let Some(path) = target.get("path") {
+        let path = path.as_str().ok_or_else(|| -> DynError {
+            format!(
+                "ASTRO_ARCHAEOLOGY_CARGO_TARGET_PATH_INVALID: {kind}.path is not a string; remediation=repair the immutable Cargo manifest before retrying"
+            )
+            .into()
+        })?;
+        return Ok(normalize_historical_cargo_path(package_dir, path)? == source_path);
+    }
+    if kind == "lib" {
+        return Ok(normalize_historical_cargo_path(package_dir, "src/lib.rs")? == source_path);
+    }
+    let name = target.get("name").and_then(toml::Value::as_str).ok_or_else(
+        || -> DynError {
+            format!(
+                "ASTRO_ARCHAEOLOGY_CARGO_TARGET_NAME_MISSING: [[{kind}]] without path has no string name; remediation=repair the immutable Cargo manifest before retrying"
+            )
+            .into()
+        },
+    )?;
+    let family = match kind {
+        "bin" => "src/bin",
+        "example" => "examples",
+        "test" => "tests",
+        "bench" => "benches",
+        _ => unreachable!(),
+    };
+    if normalize_historical_cargo_path(package_dir, &format!("{family}/{name}.rs"))? == source_path
+        || normalize_historical_cargo_path(package_dir, &format!("{family}/{name}/main.rs"))?
+            == source_path
+    {
+        return Ok(true);
+    }
+    Ok(kind == "bin"
+        && name == package_name
+        && normalize_historical_cargo_path(package_dir, "src/main.rs")? == source_path)
+}
+
+fn historical_package_edition_is_2015(
+    checkout_root: &Path,
+    package_dir: &str,
+    package: &toml::value::Table,
+) -> Result<bool, DynError> {
+    match package.get("edition") {
+        None => return Ok(true),
+        Some(value) if value.as_str().is_some() => return Ok(value.as_str() == Some("2015")),
+        Some(value)
+            if value
+                .as_table()
+                .and_then(|table| table.get("workspace"))
+                .and_then(toml::Value::as_bool)
+                == Some(true) => {}
+        Some(_) => {
+            return Err(
+                "ASTRO_ARCHAEOLOGY_CARGO_EDITION_INVALID: package.edition is neither a string nor `{ workspace = true }`; remediation=repair the immutable Cargo manifest before retrying"
+                    .into(),
+            );
+        }
+    }
+    let explicit_workspace = package
+        .get("workspace")
+        .map(|value| {
+            value.as_str().ok_or_else(|| -> DynError {
+                "ASTRO_ARCHAEOLOGY_CARGO_WORKSPACE_PATH_INVALID: package.workspace is not a string; remediation=repair the immutable Cargo manifest before retrying"
+                    .into()
+            })
+        })
+        .transpose()?;
+    let mut directory = if let Some(workspace) = explicit_workspace {
+        Some(PathBuf::from(normalize_historical_cargo_path(
+            package_dir,
+            workspace,
+        )?))
+    } else {
+        Some(PathBuf::from(package_dir))
+    };
+    while let Some(candidate_dir) = directory {
+        let manifest_path = checkout_root.join(&candidate_dir).join("Cargo.toml");
+        if manifest_path.is_file() {
+            let text = fs::read_to_string(&manifest_path).map_err(|error| -> DynError {
+                format!(
+                    "ASTRO_ARCHAEOLOGY_CARGO_MANIFEST_READ_FAILED: could not read {}: {error}; remediation=preserve the immutable checkout and repair the exact read before retrying",
+                    manifest_path.display()
+                )
+                .into()
+            })?;
+            let manifest = text.parse::<toml::Value>().map_err(|error| -> DynError {
+                format!(
+                    "ASTRO_ARCHAEOLOGY_CARGO_MANIFEST_INVALID: {} is not valid TOML: {error}; remediation=repair the immutable manifest before retrying",
+                    manifest_path.display()
+                )
+                .into()
+            })?;
+            if let Some(edition) = manifest
+                .get("workspace")
+                .and_then(|workspace| workspace.get("package"))
+                .and_then(|package| package.get("edition"))
+                .and_then(toml::Value::as_str)
+            {
+                return Ok(edition == "2015");
+            }
+        }
+        if explicit_workspace.is_some() {
+            break;
+        }
+        directory = candidate_dir.parent().map(Path::to_path_buf);
+    }
+    Err(format!(
+        "ASTRO_ARCHAEOLOGY_CARGO_WORKSPACE_EDITION_MISSING: package {package_dir:?} inherits edition but no immutable workspace.package.edition was found; remediation=materialize and repair the exact workspace manifest before retrying"
+    )
+    .into())
+}
+
+fn historical_rust_is_crate_root(
+    checkout_root: &Path,
+    source_path: &str,
+) -> Result<bool, DynError> {
+    let mut parent = Path::new(source_path).parent();
+    let (manifest_path, package_dir, manifest, package) = loop {
+        let Some(directory) = parent else {
+            return Ok(false);
+        };
+        let candidate = directory.join("Cargo.toml");
+        let physical = checkout_root.join(&candidate);
+        if physical.is_file() {
+            let text = fs::read_to_string(&physical).map_err(|error| -> DynError {
+                format!(
+                    "ASTRO_ARCHAEOLOGY_CARGO_MANIFEST_READ_FAILED: could not read {}: {error}; remediation=preserve the immutable checkout and repair the exact read before retrying",
+                    physical.display()
+                )
+                .into()
+            })?;
+            let parsed = text.parse::<toml::Value>().map_err(|error| -> DynError {
+                format!(
+                    "ASTRO_ARCHAEOLOGY_CARGO_MANIFEST_INVALID: {} is not valid TOML: {error}; remediation=repair the immutable manifest before retrying",
+                    physical.display()
+                )
+                .into()
+            })?;
+            if let Some(package) = parsed
+                .get("package")
+                .and_then(toml::Value::as_table)
+                .cloned()
+            {
+                break (
+                    path_to_slash_string(&candidate),
+                    path_to_slash_string(directory),
+                    parsed,
+                    package,
+                );
+            }
+        }
+        parent = directory.parent();
+    };
+    let package_name = package
+        .get("name")
+        .and_then(toml::Value::as_str)
+        .ok_or_else(|| -> DynError {
+            format!(
+                "ASTRO_ARCHAEOLOGY_CARGO_PACKAGE_NAME_MISSING: {manifest_path:?} has [package] without a string name; remediation=repair the immutable manifest before retrying"
+            )
+            .into()
+        })?;
+
+    match package.get("build") {
+        None => {
+            if normalize_historical_cargo_path(&package_dir, "build.rs")? == source_path {
+                return Ok(true);
+            }
+        }
+        Some(value) if value.as_bool() == Some(false) => {}
+        Some(value) => {
+            let build = value.as_str().ok_or_else(|| -> DynError {
+                format!(
+                    "ASTRO_ARCHAEOLOGY_CARGO_BUILD_VALUE_INVALID: {manifest_path:?} package.build is neither false nor a string; remediation=repair the immutable manifest before retrying"
+                )
+                .into()
+            })?;
+            if normalize_historical_cargo_path(&package_dir, build)? == source_path {
+                return Ok(true);
+            }
+        }
+    }
+
+    let mut manual_target_count = 0usize;
+    for kind in ["lib", "bin", "example", "test", "bench"] {
+        for target in cargo_target_tables(&manifest, kind)? {
+            manual_target_count += 1;
+            if inferred_named_cargo_target(source_path, &package_dir, package_name, kind, target)? {
+                return Ok(true);
+            }
+        }
+    }
+
+    let edition_2015 = historical_package_edition_is_2015(checkout_root, &package_dir, &package)?;
+    let (autolib, autolib_declared) = cargo_bool(&package, "autolib")?;
+    let (autobins, autobins_declared) = cargo_bool(&package, "autobins")?;
+    let (autoexamples, autoexamples_declared) = cargo_bool(&package, "autoexamples")?;
+    let (autotests, autotests_declared) = cargo_bool(&package, "autotests")?;
+    let (autobenches, autobenches_declared) = cargo_bool(&package, "autobenches")?;
+    let manual_disables_auto = edition_2015 && manual_target_count > 0;
+    let package_rel = source_path
+        .strip_prefix(&package_dir)
+        .and_then(|path| path.strip_prefix('/').or(Some(path)))
+        .unwrap_or(source_path);
+    Ok(
+        (autolib && (autolib_declared || !manual_disables_auto) && package_rel == "src/lib.rs")
+            || (autobins
+                && (autobins_declared || !manual_disables_auto)
+                && (package_rel == "src/main.rs" || cargo_auto_root(package_rel, "src/bin/")))
+            || (autoexamples
+                && (autoexamples_declared || !manual_disables_auto)
+                && cargo_auto_root(package_rel, "examples/"))
+            || (autotests
+                && (autotests_declared || !manual_disables_auto)
+                && cargo_auto_root(package_rel, "tests/"))
+            || (autobenches
+                && (autobenches_declared || !manual_disables_auto)
+                && cargo_auto_root(package_rel, "benches/")),
+    )
+}
+
 /// Materialize the evidence seed set and then close every exact repository-local
 /// source dependency using libcbm's own extraction semantics. The ordinary CBM
 /// pipeline remains fail-closed; this planner makes its filesystem view truthful
@@ -4252,6 +4590,55 @@ fn materialize_file_scoped_historical_closure(
     let mut depth = 0usize;
 
     while !frontier.is_empty() {
+        let cargo_manifest_candidates = frontier
+            .iter()
+            .flat_map(|source_path| historical_cargo_manifest_candidates(source_path))
+            .filter(|path| !probed.contains(path))
+            .collect::<BTreeSet<_>>();
+        if !cargo_manifest_candidates.is_empty() {
+            let materialized = materialize_file_scoped_historical_blobs(
+                repo,
+                checkout_root,
+                commit,
+                &cargo_manifest_candidates,
+            )?;
+            probed.extend(cargo_manifest_candidates);
+            report.git_cat_file_processes = report
+                .git_cat_file_processes
+                .checked_add(materialized.git_cat_file_processes)
+                .ok_or_else(|| -> DynError {
+                    "ASTRO_ARCHAEOLOGY_CAT_FILE_TELEMETRY_OVERFLOW: Cargo-context cat-file process count overflowed"
+                        .into()
+                })?;
+            report.stdout_bytes = report
+                .stdout_bytes
+                .checked_add(materialized.stdout_bytes)
+                .ok_or_else(|| -> DynError {
+                    "ASTRO_ARCHAEOLOGY_CAT_FILE_TELEMETRY_OVERFLOW: Cargo-context cat-file stdout bytes overflowed"
+                        .into()
+                })?;
+            report.files_materialized = report
+                .files_materialized
+                .checked_add(materialized.files_materialized)
+                .ok_or_else(|| -> DynError {
+                    "ASTRO_ARCHAEOLOGY_CAT_FILE_MATERIALIZED_OVERFLOW: Cargo-context materialized file count overflowed"
+                        .into()
+                })?;
+            report.dependency_files_materialized = report
+                .dependency_files_materialized
+                .checked_add(materialized.files_materialized)
+                .ok_or_else(|| -> DynError {
+                    "ASTRO_ARCHAEOLOGY_DEPENDENCY_FILE_OVERFLOW: Cargo-context materialized file count overflowed"
+                        .into()
+                })?;
+            report.dependency_candidate_paths_absent = report
+                .dependency_candidate_paths_absent
+                .checked_add(materialized.paths_absent)
+                .ok_or_else(|| -> DynError {
+                    "ASTRO_ARCHAEOLOGY_DEPENDENCY_CANDIDATE_ABSENT_OVERFLOW: absent Cargo-context candidate count overflowed usize"
+                        .into()
+                })?;
+        }
         let mut requests = Vec::<HistoricalDependencyRequest>::new();
         let mut candidates_to_probe = BTreeSet::new();
         for source_path in &frontier {
@@ -4273,11 +4660,14 @@ fn materialize_file_scoped_historical_closure(
                 )
                 .into()
             })?;
-            let extracted = ExtractedFile::extract(
+            let rust_is_crate_root = language == Language::RUST
+                && historical_rust_is_crate_root(checkout_root, source_path)?;
+            let extracted = ExtractedFile::extract_with_rust_context(
                 source,
                 language,
                 "astrolabe-historical-dependency-plan",
                 source_rel,
+                rust_is_crate_root,
                 HISTORICAL_DEPENDENCY_EXTRACT_TIMEOUT_MICROS,
             )
             .map_err(|error| -> DynError {

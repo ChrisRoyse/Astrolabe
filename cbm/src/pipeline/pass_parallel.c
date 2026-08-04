@@ -968,7 +968,7 @@ static void extract_worker(int worker_id, void *ctx_ptr) {
         const char *rust_edition = cbm_cargo_edition_for_path(ec->rust_manifest, fi->rel_path);
         CBMFileResult *result = cbm_extract_file_at_path_with_metadata(
             source, source_len, fi->language, ec->project_name, fi->rel_path, fi->path,
-            rust_edition,
+            rust_edition, cbm_cargo_is_crate_root(ec->rust_manifest, fi->rel_path),
             fi->structured_classification[0] ? fi->structured_classification : NULL,
             fi->structured_classification_provenance[0]
                 ? fi->structured_classification_provenance

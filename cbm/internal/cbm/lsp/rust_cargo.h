@@ -24,6 +24,7 @@
 
 #define CBM_CARGO_MAX_DEPS 256
 #define CBM_CARGO_MAX_MEMBERS 64
+#define CBM_CARGO_MAX_TARGETS 256
 
 typedef struct {
     const char *name; /* declared dependency name */
@@ -36,6 +37,25 @@ typedef struct {
     const char *edition;     /* exact effective member edition, or NULL */
 } CBMCargoMember;
 
+typedef enum {
+    CBM_CARGO_TARGET_LIB = 0,
+    CBM_CARGO_TARGET_BIN,
+    CBM_CARGO_TARGET_EXAMPLE,
+    CBM_CARGO_TARGET_TEST,
+    CBM_CARGO_TARGET_BENCH,
+} CBMCargoTargetKind;
+
+typedef struct {
+    CBMCargoTargetKind kind;
+    const char *name;
+    const char *path;
+} CBMCargoTarget;
+
+typedef struct {
+    const char *package_dir; /* repository-relative directory containing Cargo.toml */
+    const char *edition;     /* exact effective package edition */
+} CBMCargoPackage;
+
 typedef struct CBMCargoManifest {
     const char *package_name;              /* [package].name, NULL if missing */
     const char *package_version;           /* [package].version, NULL if missing */
@@ -44,6 +64,31 @@ typedef struct CBMCargoManifest {
     const char *active_edition;            /* edition selected for the file being analyzed */
     bool package_edition_inherits_workspace;
     bool is_workspace_root; /* [workspace] section seen */
+
+    const char *package_workspace;
+    const char *package_build_path;
+    bool package_build_declared;
+    bool package_build_enabled;
+    bool autolib;
+    bool autobins;
+    bool autoexamples;
+    bool autotests;
+    bool autobenches;
+    bool autolib_declared;
+    bool autobins_declared;
+    bool autoexamples_declared;
+    bool autotests_declared;
+    bool autobenches_declared;
+
+    CBMCargoTarget targets[CBM_CARGO_MAX_TARGETS];
+    int target_count;
+
+    /* Repository-wide package/target context assembled once by the pipeline
+     * from every discovered Cargo.toml. Arrays are arena-owned and sorted. */
+    CBMCargoPackage *packages;
+    int package_count;
+    const char **crate_roots;
+    int crate_root_count;
 
     CBMCargoDep deps[CBM_CARGO_MAX_DEPS];
     int dep_count;
@@ -68,5 +113,8 @@ const CBMCargoMember *cbm_cargo_find_member(const CBMCargoManifest *m, const cha
  * Returns NULL when the path belongs to a workspace member whose edition
  * could not be read or inherited exactly. */
 const char *cbm_cargo_edition_for_path(const CBMCargoManifest *m, const char *relative_path);
+
+/* True only when relative_path is one of Cargo's exact crate source roots. */
+bool cbm_cargo_is_crate_root(const CBMCargoManifest *m, const char *relative_path);
 
 #endif /* CBM_LSP_RUST_CARGO_H */

@@ -22,6 +22,7 @@ repository = "https://github.com/ChrisRoyse/Astrolabe"
 publish = false
 
 [workspace.dependencies]
+toml = "0.8"
 astrolabe-anchors = { path = "crates/astrolabe-anchors" }
 astrolabe-assay = { path = "crates/astrolabe-assay" }
 astrolabe-domain = { path = "crates/astrolabe-domain" }

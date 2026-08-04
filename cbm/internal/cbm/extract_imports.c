@@ -952,8 +952,7 @@ static char *rust_root_physical_prefix(CBMExtractCtx *ctx) {
             "supply the repository-relative Rust source path before extraction");
         return NULL;
     }
-    if (strcmp(basename, "lib.rs") == 0 || strcmp(basename, "main.rs") == 0 ||
-        strcmp(basename, "mod.rs") == 0 || strcmp(basename, "build.rs") == 0) {
+    if (ctx->rust_is_crate_root || strcmp(basename, "mod.rs") == 0) {
         return cbm_arena_strdup(ctx->arena, "");
     }
     size_t len = strlen(basename);
