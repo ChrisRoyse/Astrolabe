@@ -963,7 +963,7 @@ void simplecpp::TokenList::readfile(Stream &stream, const std::string &filename,
     combineOperators();
 }
 
-void simplecpp::TokenList::constFold()
+bool simplecpp::TokenList::constFold(std::string *error)
 {
     while (cfront()) {
         // goto last '('
@@ -977,13 +977,17 @@ void simplecpp::TokenList::constFold()
 
         // Constant fold expression
         constFoldUnaryNotPosNeg(tok);
-        constFoldMulDivRem(tok);
-        constFoldAddSub(tok);
-        constFoldShift(tok);
+        if (!constFoldMulDivRem(tok, error))
+            return false;
+        if (!constFoldAddSub(tok, error))
+            return false;
+        if (!constFoldShift(tok, error))
+            return false;
         constFoldComparison(tok);
         constFoldBitwise(tok);
         constFoldLogicalOp(tok);
-        constFoldQuestionOp(tok);
+        if (!constFoldQuestionOp(tok, error))
+            return false;
 
         // If there is no '(' we are done with the constant folding
         if (tok->op != '(')
@@ -996,6 +1000,7 @@ void simplecpp::TokenList::constFold()
         deleteToken(tok->previous);
         deleteToken(tok->next);
     }
+    return true;
 }
 
 static bool isFloatSuffix(const simplecpp::Token *tok)
@@ -1179,7 +1184,7 @@ void simplecpp::TokenList::constFoldUnaryNotPosNeg(simplecpp::Token *tok)
     }
 }
 
-void simplecpp::TokenList::constFoldMulDivRem(Token *tok)
+bool simplecpp::TokenList::constFoldMulDivRem(Token *tok, std::string *error)
 {
     for (; tok && tok->op != ')'; tok = tok->next) {
         if (!tok->previous || !tok->previous->number)
@@ -1189,15 +1194,37 @@ void simplecpp::TokenList::constFoldMulDivRem(Token *tok)
 
         long long result;
         if (tok->op == '*') {
-            result = (stringToLL(tok->previous->str()) * stringToLL(tok->next->str()));
+            const long long lhs = stringToLL(tok->previous->str());
+            const long long rhs = stringToLL(tok->next->str());
+            const long long min = std::numeric_limits<long long>::min();
+            const long long max = std::numeric_limits<long long>::max();
+            const bool overflow =
+                (lhs == -1 && rhs == min) ||
+                (rhs == -1 && lhs == min) ||
+                (lhs > 0 && rhs > 0 && lhs > max / rhs) ||
+                (lhs > 0 && rhs < 0 && rhs < min / lhs) ||
+                (lhs < 0 && rhs > 0 && lhs < min / rhs) ||
+                (lhs < 0 && rhs < 0 && lhs < max / rhs);
+            if (overflow) {
+                if (error)
+                    *error = "multiplication overflow";
+                return false;
+            }
+            result = lhs * rhs;
         }
         else if (tok->op == '/' || tok->op == '%') {
             const long long rhs = stringToLL(tok->next->str());
-            if (rhs == 0)
-                throw std::overflow_error("division/modulo by zero");
+            if (rhs == 0) {
+                if (error)
+                    *error = "division/modulo by zero";
+                return false;
+            }
             const long long lhs = stringToLL(tok->previous->str());
-            if (rhs == -1 && lhs == std::numeric_limits<long long>::min())
-                throw std::overflow_error("division overflow");
+            if (rhs == -1 && lhs == std::numeric_limits<long long>::min()) {
+                if (error)
+                    *error = "division overflow";
+                return false;
+            }
             if (tok->op == '/')
                 result = (lhs / rhs);
             else
@@ -1211,9 +1238,10 @@ void simplecpp::TokenList::constFoldMulDivRem(Token *tok)
         deleteToken(tok->next);
         deleteToken(tok->next);
     }
+    return true;
 }
 
-void simplecpp::TokenList::constFoldAddSub(Token *tok)
+bool simplecpp::TokenList::constFoldAddSub(Token *tok, std::string *error)
 {
     for (; tok && tok->op != ')'; tok = tok->next) {
         if (!tok->previous || !tok->previous->number)
@@ -1222,21 +1250,37 @@ void simplecpp::TokenList::constFoldAddSub(Token *tok)
             continue;
 
         long long result;
-        if (tok->op == '+')
-            result = stringToLL(tok->previous->str()) + stringToLL(tok->next->str());
-        else if (tok->op == '-')
-            result = stringToLL(tok->previous->str()) - stringToLL(tok->next->str());
-        else
+        const long long lhs = stringToLL(tok->previous->str());
+        const long long rhs = stringToLL(tok->next->str());
+        const long long min = std::numeric_limits<long long>::min();
+        const long long max = std::numeric_limits<long long>::max();
+        if (tok->op == '+') {
+            if ((rhs > 0 && lhs > max - rhs) || (rhs < 0 && lhs < min - rhs)) {
+                if (error)
+                    *error = "addition overflow";
+                return false;
+            }
+            result = lhs + rhs;
+        } else if (tok->op == '-') {
+            if ((rhs > 0 && lhs < min + rhs) || (rhs < 0 && lhs > max + rhs)) {
+                if (error)
+                    *error = "subtraction overflow";
+                return false;
+            }
+            result = lhs - rhs;
+        } else {
             continue;
+        }
 
         tok = tok->previous;
         tok->setstr(toString(result));
         deleteToken(tok->next);
         deleteToken(tok->next);
     }
+    return true;
 }
 
-void simplecpp::TokenList::constFoldShift(Token *tok)
+bool simplecpp::TokenList::constFoldShift(Token *tok, std::string *error)
 {
     for (; tok && tok->op != ')'; tok = tok->next) {
         if (!tok->previous || !tok->previous->number)
@@ -1244,19 +1288,36 @@ void simplecpp::TokenList::constFoldShift(Token *tok)
         if (!tok->next || !tok->next->number)
             continue;
 
-        long long result;
-        if (tok->str() == "<<")
-            result = stringToLL(tok->previous->str()) << stringToLL(tok->next->str());
-        else if (tok->str() == ">>")
-            result = stringToLL(tok->previous->str()) >> stringToLL(tok->next->str());
-        else
+        if (tok->str() != "<<" && tok->str() != ">>")
             continue;
+
+        const long long lhs = stringToLL(tok->previous->str());
+        const long long rhs = stringToLL(tok->next->str());
+        const unsigned int width = std::numeric_limits<unsigned long long>::digits;
+        if (rhs < 0 || static_cast<unsigned long long>(rhs) >= width) {
+            if (error)
+                *error = "shift count outside integer width";
+            return false;
+        }
+
+        long long result;
+        if (tok->str() == "<<") {
+            if (lhs < 0 || lhs > (std::numeric_limits<long long>::max() >> rhs)) {
+                if (error)
+                    *error = "left shift overflow";
+                return false;
+            }
+            result = lhs << rhs;
+        } else {
+            result = lhs >> rhs;
+        }
 
         tok = tok->previous;
         tok->setstr(toString(result));
         deleteToken(tok->next);
         deleteToken(tok->next);
     }
+    return true;
 }
 
 static const std::string NOTEQ("not_eq");
@@ -1360,7 +1421,7 @@ void simplecpp::TokenList::constFoldLogicalOp(Token *tok)
     }
 }
 
-void simplecpp::TokenList::constFoldQuestionOp(Token *&tok1)
+bool simplecpp::TokenList::constFoldQuestionOp(Token *&tok1, std::string *error)
 {
     bool gotoTok1 = false;
     // NOLINTNEXTLINE(misc-const-correctness) - technically correct but used to access non-const data
@@ -1368,8 +1429,11 @@ void simplecpp::TokenList::constFoldQuestionOp(Token *&tok1)
         gotoTok1 = false;
         if (tok->str() != "?")
             continue;
-        if (!tok->previous || !tok->next || !tok->next->next)
-            throw std::runtime_error("invalid expression");
+        if (!tok->previous || !tok->next || !tok->next->next) {
+            if (error)
+                *error = "invalid conditional expression";
+            return false;
+        }
         if (!tok->previous->number)
             continue;
         if (tok->next->next->op != ':')
@@ -1377,8 +1441,11 @@ void simplecpp::TokenList::constFoldQuestionOp(Token *&tok1)
         Token * const condTok = tok->previous;
         Token * const trueTok = tok->next;
         Token * const falseTok = trueTok->next->next;
-        if (!falseTok)
-            throw std::runtime_error("invalid expression");
+        if (!falseTok) {
+            if (error)
+                *error = "invalid conditional expression";
+            return false;
+        }
         if (condTok == tok1)
             tok1 = (condTok->str() != "0" ? trueTok : falseTok);
         deleteToken(condTok->next); // ?
@@ -1387,6 +1454,7 @@ void simplecpp::TokenList::constFoldQuestionOp(Token *&tok1)
         deleteToken(condTok);
         gotoTok1 = true;
     }
+    return true;
 }
 
 void simplecpp::TokenList::removeComments()
@@ -2577,28 +2645,34 @@ namespace simplecpp {
     }
 }
 
-/** Evaluate sizeof(type)
- * @throws std::runtime_error thrown on missing arguments or invalid expression
- */
-static void simplifySizeof(simplecpp::TokenList &expr, const std::map<std::string, std::size_t> &sizeOfType)
+/** Evaluate sizeof(type), returning malformed-input detail explicitly. */
+static bool simplifySizeof(simplecpp::TokenList &expr,
+                           const std::map<std::string, std::size_t> &sizeOfType,
+                           std::string *error)
 {
     for (simplecpp::Token *tok = expr.front(); tok; tok = tok->next) {
         if (tok->str() != "sizeof")
             continue;
         const simplecpp::Token *tok1 = tok->next;
         if (!tok1) {
-            throw std::runtime_error("missing sizeof argument");
+            if (error)
+                *error = "missing sizeof argument";
+            return false;
         }
         const simplecpp::Token *tok2 = tok1->next;
         if (!tok2) {
-            throw std::runtime_error("missing sizeof argument");
+            if (error)
+                *error = "missing sizeof argument";
+            return false;
         }
         if (tok1->op == '(') {
             tok1 = tok1->next;
             while (tok2->op != ')') {
                 tok2 = tok2->next;
                 if (!tok2) {
-                    throw std::runtime_error("invalid sizeof expression");
+                    if (error)
+                        *error = "invalid sizeof expression";
+                    return false;
                 }
             }
         }
@@ -2624,6 +2698,7 @@ static void simplifySizeof(simplecpp::TokenList &expr, const std::map<std::strin
         while (tok->next != tok2)
             expr.deleteToken(tok->next);
     }
+    return true;
 }
 
 static bool isCpp17OrLater(const simplecpp::DUI &dui)
@@ -2648,31 +2723,36 @@ static std::string dirPath(const std::string& path, bool withTrailingSlash=true)
 
 static std::string openHeader(std::ifstream &f, const simplecpp::DUI &dui, const std::string &sourcefile, const std::string &header, bool systemheader);
 
-/** Evaluate __has_include(include)
- * @throws std::runtime_error thrown on missing arguments or invalid expression
- */
-static void simplifyHasInclude(simplecpp::TokenList &expr, const simplecpp::DUI &dui)
+/** Evaluate __has_include(include), returning malformed-input detail explicitly. */
+static bool simplifyHasInclude(simplecpp::TokenList &expr, const simplecpp::DUI &dui,
+                               std::string *error)
 {
     if (!isCpp17OrLater(dui) && !isGnu(dui))
-        return;
+        return true;
 
     for (simplecpp::Token *tok = expr.front(); tok; tok = tok->next) {
         if (tok->str() != HAS_INCLUDE)
             continue;
         const simplecpp::Token *tok1 = tok->next;
         if (!tok1) {
-            throw std::runtime_error("missing __has_include argument");
+            if (error)
+                *error = "missing __has_include argument";
+            return false;
         }
         const simplecpp::Token *tok2 = tok1->next;
         if (!tok2) {
-            throw std::runtime_error("missing __has_include argument");
+            if (error)
+                *error = "missing __has_include argument";
+            return false;
         }
         if (tok1->op == '(') {
             tok1 = tok1->next;
             while (tok2->op != ')') {
                 tok2 = tok2->next;
                 if (!tok2) {
-                    throw std::runtime_error("invalid __has_include expression");
+                    if (error)
+                        *error = "invalid __has_include expression";
+                    return false;
                 }
             }
         }
@@ -2683,12 +2763,16 @@ static void simplifyHasInclude(simplecpp::TokenList &expr, const simplecpp::DUI 
         if (systemheader) {
             const simplecpp::Token *tok3 = tok1->next;
             if (!tok3) {
-                throw std::runtime_error("missing __has_include closing angular bracket");
+                if (error)
+                    *error = "missing __has_include closing angular bracket";
+                return false;
             }
             while (tok3->op != '>') {
                 tok3 = tok3->next;
                 if (!tok3) {
-                    throw std::runtime_error("invalid __has_include expression");
+                    if (error)
+                        *error = "invalid __has_include expression";
+                    return false;
                 }
             }
 
@@ -2705,6 +2789,7 @@ static void simplifyHasInclude(simplecpp::TokenList &expr, const simplecpp::DUI 
         while (tok->next != tok2)
             expr.deleteToken(tok->next);
     }
+    return true;
 }
 
 /** Evaluate name. Returns false with error on an undefined function-like macro. */
@@ -2739,12 +2824,13 @@ static bool simplifyName(simplecpp::TokenList &expr, std::string *error)
  * from s starting at position pos and converts them to a
  * unsigned long long value, updating pos to point to the first
  * unused element of s.
- * Returns ULLONG_MAX if the result is not representable and
- * @throws std::runtime_error thrown if the above requirements were not possible to satisfy.
+ * Returns false with an exact error if the digit requirements are not met.
  */
-static unsigned long long stringToULLbounded(
+static bool stringToULLbounded(
     const std::string& s,
     std::size_t& pos,
+    unsigned long long *value_out,
+    std::string *error,
     int base = 0,
     std::ptrdiff_t minlen = 1,
     std::size_t maxlen = std::string::npos
@@ -2755,13 +2841,24 @@ static unsigned long long stringToULLbounded(
     char* end;
     const unsigned long long value = std::strtoull(start, &end, base);
     pos += end - start;
-    if (end - start < minlen)
-        throw std::runtime_error("expected digit");
-    return value;
+    if (end - start < minlen) {
+        if (error)
+            *error = "expected digit";
+        return false;
+    }
+    *value_out = value;
+    return true;
 }
 
-long long simplecpp::characterLiteralToLL(const std::string& str)
+static bool characterLiteralToLLChecked(const std::string& str, long long *result,
+                                        std::string *error)
 {
+    const auto fail = [error](const char *message) {
+        if (error)
+            *error = message;
+        return false;
+    };
+
     // default is wide/utf32
     bool narrow = false;
     bool utf8 = false;
@@ -2781,7 +2878,7 @@ long long simplecpp::characterLiteralToLL(const std::string& str)
     } else if (str.size() >= 2 && (str[0] == 'L' || str[0] == 'U') && str[1] == '\'') {
         pos = 2;
     } else {
-        throw std::runtime_error("expected a character literal");
+        return fail("expected a character literal");
     }
 
     unsigned long long multivalue = 0;
@@ -2790,10 +2887,10 @@ long long simplecpp::characterLiteralToLL(const std::string& str)
 
     while (pos + 1 < str.size()) {
         if (str[pos] == '\'' || str[pos] == '\n')
-            throw std::runtime_error("raw single quotes and newlines not allowed in character literals");
+            return fail("raw single quotes and newlines not allowed in character literals");
 
         if (nbytes >= 1 && !narrow)
-            throw std::runtime_error("multiple characters only supported in narrow character literals");
+            return fail("multiple characters only supported in narrow character literals");
 
         unsigned long long value;
 
@@ -2802,7 +2899,7 @@ long long simplecpp::characterLiteralToLL(const std::string& str)
             const char escape = str[pos++];
 
             if (pos >= str.size())
-                throw std::runtime_error("unexpected end of character literal");
+                return fail("unexpected end of character literal");
 
             switch (escape) {
             // obscure GCC extensions
@@ -2855,33 +2952,37 @@ long long simplecpp::characterLiteralToLL(const std::string& str)
             case '6':
             case '7':
                 // octal escape sequences consist of 1 to 3 digits
-                value = stringToULLbounded(str, --pos, 8, 1, 3);
+                --pos;
+                if (!stringToULLbounded(str, pos, &value, error, 8, 1, 3))
+                    return false;
                 break;
 
             case 'x':
                 // hexadecimal escape sequences consist of at least 1 digit
-                value = stringToULLbounded(str, pos, 16);
+                if (!stringToULLbounded(str, pos, &value, error, 16))
+                    return false;
                 break;
 
             case 'u':
             case 'U': {
                 // universal character names have exactly 4 or 8 digits
                 const std::size_t ndigits = (escape == 'u' ? 4 : 8);
-                value = stringToULLbounded(str, pos, 16, ndigits, ndigits);
+                if (!stringToULLbounded(str, pos, &value, error, 16, ndigits, ndigits))
+                    return false;
 
                 // UTF-8 encodes code points above 0x7f in multiple code units
                 // code points above 0x10ffff are not allowed
                 if (((narrow || utf8) && value > 0x7f) || (utf16 && value > 0xffff) || value > 0x10ffff)
-                    throw std::runtime_error("code point too large");
+                    return fail("code point too large");
 
                 if (value >= 0xd800 && value <= 0xdfff)
-                    throw std::runtime_error("surrogate code points not allowed in universal character names");
+                    return fail("surrogate code points not allowed in universal character names");
 
                 break;
             }
 
             default:
-                throw std::runtime_error("invalid escape sequence");
+                return fail("invalid escape sequence");
             }
         } else {
             value = static_cast<unsigned char>(str[pos++]);
@@ -2893,7 +2994,7 @@ long long simplecpp::characterLiteralToLL(const std::string& str)
 
                 int additional_bytes;
                 if (value >= 0xf5)  // higher values would result in code points above 0x10ffff
-                    throw std::runtime_error("assumed UTF-8 encoded source, but sequence is invalid");
+                    return fail("assumed UTF-8 encoded source, but sequence is invalid");
                 if (value >= 0xf0)
                     additional_bytes = 3;
                 else if (value >= 0xe0)
@@ -2901,34 +3002,34 @@ long long simplecpp::characterLiteralToLL(const std::string& str)
                 else if (value >= 0xc2) // 0xc0 and 0xc1 are always overlong 2-bytes encodings
                     additional_bytes = 1;
                 else
-                    throw std::runtime_error("assumed UTF-8 encoded source, but sequence is invalid");
+                    return fail("assumed UTF-8 encoded source, but sequence is invalid");
 
                 value &= (1 << (6 - additional_bytes)) - 1;
 
                 while (additional_bytes--) {
                     if (pos + 1 >= str.size())
-                        throw std::runtime_error("assumed UTF-8 encoded source, but character literal ends unexpectedly");
+                        return fail("assumed UTF-8 encoded source, but character literal ends unexpectedly");
 
                     const unsigned char c = str[pos++];
 
                     if (((c >> 6) != 2)    // ensure c has form 0xb10xxxxxx
                         || (!value && additional_bytes == 1 && c < 0xa0)    // overlong 3-bytes encoding
                         || (!value && additional_bytes == 2 && c < 0x90))   // overlong 4-bytes encoding
-                        throw std::runtime_error("assumed UTF-8 encoded source, but sequence is invalid");
+                        return fail("assumed UTF-8 encoded source, but sequence is invalid");
 
                     value = (value << 6) | (c & ((1 << 7) - 1));
                 }
 
                 if (value >= 0xd800 && value <= 0xdfff)
-                    throw std::runtime_error("assumed UTF-8 encoded source, but sequence is invalid");
+                    return fail("assumed UTF-8 encoded source, but sequence is invalid");
 
                 if ((utf8 && value > 0x7f) || (utf16 && value > 0xffff) || value > 0x10ffff)
-                    throw std::runtime_error("code point too large");
+                    return fail("code point too large");
             }
         }
 
         if (((narrow || utf8) && value > std::numeric_limits<unsigned char>::max()) || (utf16 && value >> 16) || value >> 32)
-            throw std::runtime_error("numeric escape sequence too large");
+            return fail("numeric escape sequence too large");
 
         multivalue <<= CHAR_BIT;
         multivalue |= value;
@@ -2936,37 +3037,50 @@ long long simplecpp::characterLiteralToLL(const std::string& str)
     }
 
     if (pos + 1 != str.size() || str[pos] != '\'')
-        throw std::runtime_error("missing closing quote in character literal");
+        return fail("missing closing quote in character literal");
 
     if (!nbytes)
-        throw std::runtime_error("empty character literal");
+        return fail("empty character literal");
 
     // ordinary narrow character literal's value is determined by (possibly signed) char
     if (narrow && nbytes == 1)
-        return static_cast<char>(multivalue);
+        *result = static_cast<char>(multivalue);
 
     // while multi-character literal's value is determined by (signed) int
-    if (narrow)
-        return static_cast<int>(multivalue);
+    else if (narrow)
+        *result = static_cast<int>(multivalue);
 
     // All other cases are unsigned. Since long long is at least 64bit wide,
     // while the literals at most 32bit wide, the conversion preserves all values.
-    return multivalue;
+    else
+        *result = static_cast<long long>(multivalue);
+    return true;
 }
 
-/**
- * @throws std::runtime_error thrown on invalid literal
- */
-static void simplifyNumbers(simplecpp::TokenList &expr)
+long long simplecpp::characterLiteralToLL(const std::string& str)
+{
+    long long result = 0;
+    std::string error;
+    if (!characterLiteralToLLChecked(str, &result, &error))
+        throw std::runtime_error(error);
+    return result;
+}
+
+static bool simplifyNumbers(simplecpp::TokenList &expr, std::string *error)
 {
     for (simplecpp::Token *tok = expr.front(); tok; tok = tok->next) {
         if (tok->str().size() == 1U)
             continue;
         if (tok->str().compare(0,2,"0x") == 0)
             tok->setstr(toString(stringToULL(tok->str())));
-        else if (!tok->number && tok->str().find('\'') != std::string::npos)
-            tok->setstr(toString(simplecpp::characterLiteralToLL(tok->str())));
+        else if (!tok->number && tok->str().find('\'') != std::string::npos) {
+            long long value = 0;
+            if (!characterLiteralToLLChecked(tok->str(), &value, error))
+                return false;
+            tok->setstr(toString(value));
+        }
     }
+    return true;
 }
 
 static void simplifyComments(simplecpp::TokenList &expr)
@@ -2979,25 +3093,29 @@ static void simplifyComments(simplecpp::TokenList &expr)
     }
 }
 
-/**
- * @throws std::runtime_error thrown on invalid literals, missing sizeof arguments or invalid expressions,
- * missing __has_include() arguments or expressions, invalid number literals
- * @throws std::overflow_error thrown on overflow or division by zero
- */
+/** Evaluate a preprocessor condition with explicit malformed-input errors. */
 static bool evaluate(simplecpp::TokenList &expr, const simplecpp::DUI &dui, const std::map<std::string, std::size_t> &sizeOfType, long long *result, std::string *error)
 {
     if (result)
         *result = 0;
     simplifyComments(expr);
-    simplifySizeof(expr, sizeOfType);
-    simplifyHasInclude(expr, dui);
+    if (!simplifySizeof(expr, sizeOfType, error))
+        return false;
+    if (!simplifyHasInclude(expr, dui, error))
+        return false;
     if (!simplifyName(expr, error))
         return false;
-    simplifyNumbers(expr);
-    expr.constFold();
-    // TODO: handle invalid expressions
+    if (!simplifyNumbers(expr, error))
+        return false;
+    if (!expr.constFold(error))
+        return false;
+    if (!expr.cfront() || expr.cfront() != expr.cback() || !expr.cfront()->number) {
+        if (error)
+            *error = "invalid conditional expression";
+        return false;
+    }
     if (result)
-        *result = expr.cfront() && expr.cfront() == expr.cback() && expr.cfront()->number ? stringToLL(expr.cfront()->str()) : 0LL;
+        *result = stringToLL(expr.cfront()->str());
     return true;
 }
 

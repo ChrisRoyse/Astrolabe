@@ -313,11 +313,10 @@ namespace simplecpp {
         std::string stringify(bool linenrs = false) const;
 
         void readfile(Stream &stream, const std::string &filename=std::string(), OutputList *outputList = nullptr);
-        /**
-         * @throws std::overflow_error thrown on overflow or division by zero
-         * @throws std::runtime_error thrown on invalid expressions
-         */
-        void constFold();
+        /** Constant-fold a preprocessor expression without exception-based
+         * control flow. Returns false and writes the exact input error when
+         * the expression is malformed or has undefined arithmetic. */
+        bool constFold(std::string *error);
 
         void removeComments();
 
@@ -381,19 +380,13 @@ namespace simplecpp {
         void combineOperators();
 
         void constFoldUnaryNotPosNeg(Token *tok);
-        /**
-         * @throws std::overflow_error thrown on overflow or division by zero
-         */
-        void constFoldMulDivRem(Token *tok);
-        void constFoldAddSub(Token *tok);
-        void constFoldShift(Token *tok);
+        bool constFoldMulDivRem(Token *tok, std::string *error);
+        bool constFoldAddSub(Token *tok, std::string *error);
+        bool constFoldShift(Token *tok, std::string *error);
         void constFoldComparison(Token *tok);
         void constFoldBitwise(Token *tok);
         void constFoldLogicalOp(Token *tok);
-        /**
-         * @throws std::runtime_error thrown on invalid expressions
-         */
-        void constFoldQuestionOp(Token *&tok1);
+        bool constFoldQuestionOp(Token *&tok1, std::string *error);
 
         std::string readUntil(Stream &stream, const Location &location, char start, char end, OutputList *outputList);
         void lineDirective(unsigned int fileIndex, unsigned int line, Location &location);
