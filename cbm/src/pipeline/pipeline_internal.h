@@ -422,6 +422,10 @@ int cbm_compile_context_index_prepare(cbm_pipeline_ctx_t *ctx,
                                       const cbm_file_info_t *source_files, int source_count,
                                       const uint8_t *embedded_bytes, size_t embedded_byte_count,
                                       cbm_compile_context_index_t **out_index);
+int cbm_compile_context_extract_calls(cbm_pipeline_ctx_t *ctx,
+                                      cbm_compile_context_index_t *index,
+                                      const cbm_file_info_t *source_files, int source_count,
+                                      CBMFileResult **result_cache);
 void cbm_compile_context_index_free(cbm_compile_context_index_t *index);
 const CBMPreprocessContextSet *cbm_compile_context_for_file(
     const cbm_compile_context_index_t *index, const char *rel_path);
@@ -442,6 +446,17 @@ cbm_resolution_t cbm_compile_context_resolve_call(
     const cbm_compile_context_index_t *index, const cbm_registry_t *registry,
     const cbm_gbuf_t *gbuf, const char *context_id, const char *reference_name,
     const char *preferred_qn, const char *focus_module_qn, bool qualified_reference);
+
+/* Internal extraction primitive implemented by cbm.c. The caller supplies one
+ * compiler expansion plus a line→target/source map; the function constructs
+ * one syntax tree and installs only mapped contextual calls into the target
+ * file results. */
+int cbm_extract_preprocessed_translation_unit(
+    char *expanded, size_t expanded_size, bool cpp_mode, const char *context_id,
+    const uint32_t *line_targets, const uint32_t *line_source_lines, size_t line_count,
+    const char *project, const char *const *target_rel_paths,
+    CBMFileResult *const *target_results, size_t target_count, char **diagnostic_out);
+void cbm_finalize_compiler_context_calls(CBMFileResult *result);
 
 /* ── Infrascan helpers (pass_infrascan.c) ─────────────────────────── */
 

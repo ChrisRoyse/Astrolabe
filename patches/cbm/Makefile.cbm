@@ -250,9 +250,6 @@ AC_LZ4_SRCS = $(CBM_DIR)/ac.c $(CBM_DIR)/lz4_store.c
 # Zstd compression (for persistent artifacts)
 ZSTD_SRCS = $(CBM_DIR)/zstd_store.c
 
-# Preprocessor (C++)
-PREPROCESSOR_SRC = $(CBM_DIR)/preprocessor.cpp
-
 # SQLite writer
 SQLITE_WRITER_SRC = $(CBM_DIR)/sqlite_writer.c
 
@@ -483,7 +480,6 @@ $(UNIXCODER_OBJ): $(UNIXCODER_BLOB_SRC) vendored/nomic/code_vectors.bin | $(BUIL
 GRAMMAR_OBJS_PROD = $(patsubst $(CBM_DIR)/%.c,$(BUILD_DIR)/prod_%.o,$(GRAMMAR_SRCS))
 TS_RUNTIME_OBJ_PROD = $(BUILD_DIR)/prod_ts_runtime.o
 LSP_OBJ_PROD = $(BUILD_DIR)/prod_lsp_all.o
-PP_OBJ_PROD = $(BUILD_DIR)/prod_preprocessor.o
 
 $(BUILD_DIR)/prod_%.o: $(CBM_DIR)/%.c | $(BUILD_DIR)
 	$(CC) $(GRAMMAR_CFLAGS) -c -o $@ $<
@@ -493,9 +489,6 @@ $(BUILD_DIR)/prod_ts_runtime.o: $(CBM_DIR)/ts_runtime.c | $(BUILD_DIR)
 
 $(BUILD_DIR)/prod_lsp_all.o: $(LSP_UNITY_DEPS) | $(BUILD_DIR)
 	$(CC) $(LSP_CFLAGS) -c -o $@ $<
-
-$(BUILD_DIR)/prod_preprocessor.o: $(CBM_DIR)/preprocessor.cpp | $(BUILD_DIR)
-	$(CXX) $(CXXFLAGS_PROD) -w -I$(CBM_DIR)/vendored -c -o $@ $<
 
 # Vendored LZ4 (compiled separately, not unity-built via lz4_store.c)
 LZ4_OBJ_PROD = $(BUILD_DIR)/prod_lz4.o $(BUILD_DIR)/prod_lz4hc.o
@@ -509,7 +502,7 @@ ZSTD_OBJ_PROD = $(BUILD_DIR)/prod_zstd.o
 $(BUILD_DIR)/prod_zstd.o: $(CBM_DIR)/vendored/zstd/zstd.c | $(BUILD_DIR)
 	$(CC) -std=c11 -D_DEFAULT_SOURCE -O2 -w -I$(CBM_DIR)/vendored/zstd -c -o $@ $<
 
-OBJS_VENDORED_PROD = $(MIMALLOC_OBJ_PROD) $(SQLITE3_OBJ_PROD) $(TRE_OBJ_PROD) $(GRAMMAR_OBJS_PROD) $(TS_RUNTIME_OBJ_PROD) $(LSP_OBJ_PROD) $(PP_OBJ_PROD) $(LZ4_OBJ_PROD) $(ZSTD_OBJ_PROD) $(UNIXCODER_OBJ)
+OBJS_VENDORED_PROD = $(MIMALLOC_OBJ_PROD) $(SQLITE3_OBJ_PROD) $(TRE_OBJ_PROD) $(GRAMMAR_OBJS_PROD) $(TS_RUNTIME_OBJ_PROD) $(LSP_OBJ_PROD) $(LZ4_OBJ_PROD) $(ZSTD_OBJ_PROD) $(UNIXCODER_OBJ)
 
 MAIN_SRC = src/main.c
 
@@ -559,7 +552,7 @@ PYTHON ?= python
 LIBCBM_DIR = $(BUILD_DIR)/libcbm
 LIBCBM_CONFIG_STAMP ?=
 LIBCBM_SRCS = $(PROD_SRCS) $(EXTRACTION_SRCS) $(AC_LZ4_SRCS) $(ZSTD_SRCS) $(SQLITE_WRITER_SRC) \
-              $(GRAMMAR_SRCS) $(TS_RUNTIME_SRC) $(CBM_DIR)/lsp_all.c $(PREPROCESSOR_SRC) \
+              $(GRAMMAR_SRCS) $(TS_RUNTIME_SRC) $(CBM_DIR)/lsp_all.c \
               $(MIMALLOC_SRC) $(SQLITE3_SRC) $(CBM_DIR)/vendored/lz4/lz4.c \
               $(CBM_DIR)/vendored/lz4/lz4hc.c $(CBM_DIR)/vendored/zstd/zstd.c
 ifeq ($(IS_MINGW),yes)
@@ -673,10 +666,6 @@ $(LIBCBM_DIR)/$(CBM_DIR)/ts_runtime.o: $(CBM_DIR)/ts_runtime.c | $(BUILD_DIR)
 $(LIBCBM_DIR)/$(CBM_DIR)/lsp_all.o: $(LSP_UNITY_DEPS) | $(BUILD_DIR)
 	mkdir -p $(dir $@)
 	$(CC) $(LIBCBM_LSP_CFLAGS) -c -o $@ $<
-
-$(LIBCBM_DIR)/$(CBM_DIR)/preprocessor.o: $(CBM_DIR)/preprocessor.cpp | $(BUILD_DIR)
-	mkdir -p $(dir $@)
-	$(CXX) $(LIBCBM_CXXFLAGS) -w -I$(CBM_DIR)/vendored -c -o $@ $<
 
 $(LIBCBM_DIR)/$(MIMALLOC_SRC:.c=.o): $(MIMALLOC_SRC) | $(BUILD_DIR)
 	mkdir -p $(dir $@)

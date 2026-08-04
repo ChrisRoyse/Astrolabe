@@ -104,6 +104,15 @@ int cbm_spawn_capture_with_stderr(const char *const *argv, char **out_data, size
                                   cbm_spawn_bounded_capture_t *out_stderr,
                                   cbm_spawn_error_t *err);
 
+/* Execute the same exact capture contract from one explicit working
+ * directory. An empty/NULL directory is invalid for this entry point: compiler
+ * contexts must reproduce their recorded cwd, never inherit the worker cwd. */
+int cbm_spawn_capture_with_stderr_cwd(const char *const *argv, const char *working_directory,
+                                      char **out_data, size_t *out_len,
+                                      size_t stderr_limit,
+                                      cbm_spawn_bounded_capture_t *out_stderr,
+                                      cbm_spawn_error_t *err);
+
 #ifdef __cplusplus
 }
 #endif

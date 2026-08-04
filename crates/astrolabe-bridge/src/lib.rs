@@ -1938,6 +1938,7 @@ struct RepositoryCompileCommand {
     file: String,
     directory: String,
     arguments: Vec<String>,
+    preprocess_arguments: Vec<String>,
     dependencies: Vec<String>,
     baseline_index: usize,
 }
@@ -2616,6 +2617,13 @@ fn capture_repository_compile_command(
         ));
     }
 
+    // Persist the compiler driver's exact non-action argument frame separately.
+    // The native pipeline substitutes only its immutable snapshot TU and adds
+    // `-E`; it never has to reinterpret output/dependency switches or guess
+    // which argv element names the translation unit.
+    let preprocess_arguments =
+        context_compiler_arguments(&arguments, &directory, &file_path, true, false)?;
+
     let mut dependency_arguments =
         context_compiler_arguments(&arguments, &directory, &file_path, true, true)?;
     dependency_arguments.extend([
@@ -2635,6 +2643,7 @@ fn capture_repository_compile_command(
         file,
         directory: normalized_path(&directory),
         arguments,
+        preprocess_arguments,
         dependencies,
         baseline_index,
     }))
@@ -2771,6 +2780,7 @@ fn compilation_context_for_repo(repo_path: &str) -> Result<Vec<u8>, BridgeError>
             "file": command.file,
             "directory": command.directory,
             "arguments": command.arguments,
+            "preprocess_arguments": command.preprocess_arguments,
             "baseline_id": baseline_id,
             "dependencies": command.dependencies,
         }));

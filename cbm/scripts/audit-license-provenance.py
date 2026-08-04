@@ -44,7 +44,6 @@ LIBS = {
     "vendored/yyjson": ("ibireme/yyjson", None),
     "internal/cbm/vendored/lz4": ("lz4/lz4", "lib/LICENSE"),
     "internal/cbm/vendored/zstd": ("facebook/zstd", None),
-    "internal/cbm/vendored/simplecpp": ("danmar/simplecpp", None),
     "internal/cbm/vendored/verstable": ("JacksonAllan/Verstable", None),
     "internal/cbm/vendored/wyhash": ("wangyi-fudan/wyhash", None),
     "internal/cbm/vendored/ts_runtime": ("tree-sitter/tree-sitter", None),

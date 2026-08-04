@@ -361,7 +361,8 @@ static DWORD WINAPI spawn_stderr_reader(LPVOID opaque) {
     return 0;
 }
 
-static int spawn_capture_impl(const char *const *argv, char **out_data, size_t *out_len,
+static int spawn_capture_impl(const char *const *argv, const char *working_directory,
+                              char **out_data, size_t *out_len,
                               size_t stderr_limit, cbm_spawn_bounded_capture_t *out_stderr,
                               bool capture_stderr,
                               cbm_spawn_error_t *err) {
@@ -540,15 +541,22 @@ static int spawn_capture_impl(const char *const *argv, char **out_data, size_t *
     si.StartupInfo.hStdError = capture_stderr ? stderr_wr : nul;
     si.lpAttributeList = attr;
 
+    wchar_t *cwd = NULL;
+    bool cwd_encoded = true;
+    if (working_directory) {
+        cwd = spawn_utf8_to_wide(working_directory);
+        cwd_encoded = cwd != NULL;
+    }
+
     PROCESS_INFORMATION pi;
     ZeroMemory(&pi, sizeof(pi));
     BOOL created = FALSE;
-    DWORD spawn_gle = attr_gle;
-    if (prepared) {
+    DWORD spawn_gle = cwd_encoded ? attr_gle : ERROR_NO_UNICODE_TRANSLATION;
+    if (prepared && cwd_encoded) {
         /* lpApplicationName is explicit, so CreateProcessW performs NO path
          * search: no CWD binary planting, and no shell anywhere. */
         created = CreateProcessW(app, cmdline.data, NULL, NULL, TRUE, EXTENDED_STARTUPINFO_PRESENT,
-                                 NULL, NULL, &si.StartupInfo, &pi);
+                                 NULL, cwd, &si.StartupInfo, &pi);
         spawn_gle = created ? 0 : GetLastError();
     }
 
@@ -560,6 +568,7 @@ static int spawn_capture_impl(const char *const *argv, char **out_data, size_t *
     }
     free(cmdline.data);
     free(app);
+    free(cwd);
     CloseHandle(wr); /* the child owns the write-end now */
     if (capture_stderr) {
         CloseHandle(stderr_wr);
@@ -708,14 +717,27 @@ static int spawn_capture_impl(const char *const *argv, char **out_data, size_t *
 
 int cbm_spawn_capture(const char *const *argv, char **out_data, size_t *out_len,
                       cbm_spawn_error_t *err) {
-    return spawn_capture_impl(argv, out_data, out_len, 0, NULL, false, err);
+    return spawn_capture_impl(argv, NULL, out_data, out_len, 0, NULL, false, err);
 }
 
 int cbm_spawn_capture_with_stderr(const char *const *argv, char **out_data, size_t *out_len,
                                   size_t stderr_limit,
                                   cbm_spawn_bounded_capture_t *out_stderr,
                                   cbm_spawn_error_t *err) {
-    return spawn_capture_impl(argv, out_data, out_len, stderr_limit, out_stderr, true, err);
+    return spawn_capture_impl(argv, NULL, out_data, out_len, stderr_limit, out_stderr, true, err);
+}
+
+int cbm_spawn_capture_with_stderr_cwd(const char *const *argv, const char *working_directory,
+                                      char **out_data, size_t *out_len, size_t stderr_limit,
+                                      cbm_spawn_bounded_capture_t *out_stderr,
+                                      cbm_spawn_error_t *err) {
+    if (!working_directory || !working_directory[0]) {
+        return spawn_fail(err, CBM_SPAWN_E_INVALID_ARGV, "CBM_SPAWN_E_INVALID_ARGV",
+                          "spawn requires an explicit non-empty working directory",
+                          "bind the child to its captured compiler working directory", 0, -1);
+    }
+    return spawn_capture_impl(argv, working_directory, out_data, out_len, stderr_limit,
+                              out_stderr, true, err);
 }
 
 #else /* !_WIN32 */
@@ -728,7 +750,8 @@ static int spawn_file_actions_addclose_nonstandard(posix_spawn_file_actions_t *a
     return fd <= STDERR_FILENO ? 0 : posix_spawn_file_actions_addclose(actions, fd);
 }
 
-static int spawn_capture_impl(const char *const *argv, char **out_data, size_t *out_len,
+static int spawn_capture_impl(const char *const *argv, const char *working_directory,
+                              char **out_data, size_t *out_len,
                               size_t stderr_limit, cbm_spawn_bounded_capture_t *out_stderr,
                               bool capture_stderr, cbm_spawn_error_t *err) {
     if (out_data) {
@@ -739,6 +762,11 @@ static int spawn_capture_impl(const char *const *argv, char **out_data, size_t *
     }
     if (out_stderr) {
         memset(out_stderr, 0, sizeof(*out_stderr));
+    }
+    if (working_directory && working_directory[0]) {
+        return spawn_fail(err, CBM_SPAWN_E_INVALID_ARGV, "CBM_SPAWN_E_INVALID_ARGV",
+                          "explicit child working directories are deferred on this platform",
+                          "run the native Windows shipping target", 0, -1);
     }
     if (!argv || !argv[0] || !argv[0][0] || !out_data || !out_len ||
         (capture_stderr && (!out_stderr || stderr_limit == 0))) {
@@ -1066,14 +1094,27 @@ static int spawn_capture_impl(const char *const *argv, char **out_data, size_t *
 
 int cbm_spawn_capture(const char *const *argv, char **out_data, size_t *out_len,
                       cbm_spawn_error_t *err) {
-    return spawn_capture_impl(argv, out_data, out_len, 0, NULL, false, err);
+    return spawn_capture_impl(argv, NULL, out_data, out_len, 0, NULL, false, err);
 }
 
 int cbm_spawn_capture_with_stderr(const char *const *argv, char **out_data, size_t *out_len,
                                   size_t stderr_limit,
                                   cbm_spawn_bounded_capture_t *out_stderr,
                                   cbm_spawn_error_t *err) {
-    return spawn_capture_impl(argv, out_data, out_len, stderr_limit, out_stderr, true, err);
+    return spawn_capture_impl(argv, NULL, out_data, out_len, stderr_limit, out_stderr, true, err);
+}
+
+int cbm_spawn_capture_with_stderr_cwd(const char *const *argv, const char *working_directory,
+                                      char **out_data, size_t *out_len, size_t stderr_limit,
+                                      cbm_spawn_bounded_capture_t *out_stderr,
+                                      cbm_spawn_error_t *err) {
+    if (!working_directory || !working_directory[0]) {
+        return spawn_fail(err, CBM_SPAWN_E_INVALID_ARGV, "CBM_SPAWN_E_INVALID_ARGV",
+                          "spawn requires an explicit non-empty working directory",
+                          "bind the child to its captured compiler working directory", 0, -1);
+    }
+    return spawn_capture_impl(argv, working_directory, out_data, out_len, stderr_limit,
+                              out_stderr, true, err);
 }
 
 #endif /* _WIN32 */

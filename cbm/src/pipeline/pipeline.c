@@ -2050,6 +2050,26 @@ static int run_parallel_pipeline(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
         free(cache);
         return rc != 0 ? rc : CBM_NOT_FOUND;
     }
+    cbm_pipeline_phase_probe_t compiler_preprocess_probe =
+        cbm_pipeline_phase_probe_start(p, "compiler_preprocess");
+    cbm_clock_gettime(CLOCK_MONOTONIC, t);
+    rc = cbm_compile_context_extract_calls(ctx, ctx->compile_contexts, files, file_count, cache);
+    if (rc == 0) {
+        rc = cbm_pipeline_reject_file_failures(p, files, file_count, cache,
+                                               "compiler_preprocess");
+    }
+    cbm_pipeline_phase_probe_end(p, "compiler_preprocess", &compiler_preprocess_probe);
+    cbm_log_info("pass.timing", "pass", "compiler_preprocess", "elapsed_ms",
+                 itoa_buf((int)elapsed_ms(*t)));
+    if (rc != 0 || check_cancel(p)) {
+        for (int i = 0; i < file_count; i++) {
+            if (cache[i]) {
+                cbm_free_result(cache[i]);
+            }
+        }
+        free(cache);
+        return rc != 0 ? rc : CBM_NOT_FOUND;
+    }
     cbm_gbuf_set_next_id(p->gbuf, atomic_load(&shared_ids));
     /* extract -> registry handoff: return the extract phase's freed-but-retained
      * allocator pages to the OS before registry_build allocates. On a 2x Linux

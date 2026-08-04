@@ -88,7 +88,7 @@ fn main() {
     //                     ui, plus vendored/yyjson.c reached via src includes
     //   cbm/internal/** — extraction (cbm.c, extract_*.c, helpers.c, lang_specs.c,
     //                     service_patterns.c), grammar_*.c, lsp/** (lsp_all unity),
-    //                     ts_runtime.c, preprocessor.cpp, ac.c, lz4_store.c,
+    //                     ts_runtime.c, ac.c, lz4_store.c,
     //                     zstd_store.c, sqlite_writer.c, every *.h, AND
     //                     internal/cbm/vendored/{lz4,zstd,ts_runtime}
     //   cbm/vendored/** — mimalloc, sqlite3, yyjson, nomic (code_vectors blob),
@@ -282,6 +282,7 @@ fn make_command(
 struct CapturedCompileCommand {
     file: String,
     arguments: Vec<String>,
+    preprocess_arguments: Vec<String>,
     dependencies: Vec<String>,
 }
 
@@ -335,6 +336,7 @@ fn capture_compilation_context(
         let dependencies = read_depfile(repo_root, cbm_root, &depfile, &file);
         let command = CapturedCompileCommand {
             file: file.clone(),
+            preprocess_arguments: compiler_preprocess_arguments(&arguments),
             arguments,
             dependencies,
         };
@@ -378,6 +380,7 @@ fn capture_compilation_context(
             "file": command.file,
             "directory": make_command_path(&cbm_root.to_string_lossy()),
             "arguments": command.arguments,
+            "preprocess_arguments": command.preprocess_arguments,
             "baseline_id": baseline_id,
             "dependencies": command.dependencies,
         }));
@@ -397,6 +400,51 @@ fn capture_compilation_context(
         .join("astrolabe-compilation-context.json");
     write_if_changed(&path, &bytes);
     path
+}
+
+fn compiler_preprocess_arguments(arguments: &[String]) -> Vec<String> {
+    let source = arguments
+        .last()
+        .expect("compile command must name its translation unit");
+    let mut preprocess = Vec::with_capacity(arguments.len());
+    let mut index = 0;
+    while index < arguments.len() {
+        let argument = &arguments[index];
+        if argument == "-c"
+            || argument == source
+            || matches!(
+                argument.as_str(),
+                "-M" | "-MM" | "-MD" | "-MMD" | "-MP" | "-MG"
+            )
+        {
+            index += 1;
+            continue;
+        }
+        if matches!(argument.as_str(), "-o" | "-MF" | "-MT" | "-MQ" | "-MJ") {
+            assert!(
+                index + 1 < arguments.len(),
+                "compile action option {argument} has no value"
+            );
+            index += 2;
+            continue;
+        }
+        if (argument.starts_with("-o") && argument.len() > 2)
+            || (argument.starts_with("-MF") && argument.len() > 3)
+            || (argument.starts_with("-MT") && argument.len() > 3)
+            || (argument.starts_with("-MQ") && argument.len() > 3)
+            || (argument.starts_with("-MJ") && argument.len() > 3)
+        {
+            index += 1;
+            continue;
+        }
+        preprocess.push(argument.clone());
+        index += 1;
+    }
+    assert!(
+        !preprocess.is_empty(),
+        "preprocessing argv must retain its compiler"
+    );
+    preprocess
 }
 
 fn compiler_query_arguments(arguments: &[String], language: &str) -> Vec<String> {

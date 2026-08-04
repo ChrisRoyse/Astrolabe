@@ -131,8 +131,8 @@ const CBMType *c_simplify_type(CLSPContext *ctx, const CBMType *t, bool unwrap_p
 void cbm_run_c_lsp(CBMArena *arena, CBMFileResult *result, const char *source, int source_len,
                    TSNode root, bool cpp_mode);
 
-// Single-file C LSP over preprocessed source. The ownership map has one entry
-// per expanded physical line using cbm_preprocess() semantics.
+// Single-file C LSP over compiler-expanded source. The ownership map has one
+// entry per expanded physical line derived from compiler line-control records.
 void cbm_run_c_lsp_mapped(CBMArena *arena, CBMFileResult *result, const char *source,
                           int source_len, TSNode root, bool cpp_mode,
                           const uint32_t *primary_source_lines, size_t expanded_line_count);
