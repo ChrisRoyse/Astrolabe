@@ -38,6 +38,7 @@ enum {
 #define MCP_S_TO_US 1000000LL
 #define MCP_STRINGIFY_INNER(value) #value
 #define MCP_STRINGIFY(value) MCP_STRINGIFY_INNER(value)
+#define ASTRO_COMPILATION_CONTEXT_ARG "_astrolabe_compilation_context_json"
 
 #define SLEN(s) (sizeof(s) - 1)
 #include "mcp/mcp.h"
@@ -8258,6 +8259,26 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
     free(name_override);
     name_override = NULL;
 
+    bool compilation_context_present =
+        cbm_mcp_has_arg(args, ASTRO_COMPILATION_CONTEXT_ARG);
+    char *compilation_context =
+        cbm_mcp_get_string_arg(args, ASTRO_COMPILATION_CONTEXT_ARG);
+    if (compilation_context_present && !compilation_context) {
+        cbm_log_error("index.compile_context_transport_refused", "code",
+                      "CBM_COMPILE_CONTEXT_TRANSPORT_TYPE_INVALID", "repo_path", repo_path,
+                      "message", "the private compilation context transport is not a string",
+                      "remediation",
+                      "preserve the worker argument file and regenerate it from the exact parent "
+                      "request");
+        free(mode_str);
+        free(repo_path);
+        return cbm_mcp_text_result(
+            "CBM_COMPILE_CONTEXT_TRANSPORT_TYPE_INVALID: the private compilation context "
+            "transport is not a string; preserve the worker argument file and regenerate it from "
+            "the exact parent request",
+            true);
+    }
+
     /* Optional workspace boundary: when CBM_ALLOWED_ROOT is set (agentic /
      * multi-tenant deployments where repo_path may be influenced by an
      * untrusted caller), refuse to index a path that resolves outside it.
@@ -8268,6 +8289,7 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
         !cbm_path_within_root(allowed_root, repo_path)) {
         free(mode_str);
         free(name_override);
+        free(compilation_context);
         free(repo_path);
         return cbm_mcp_text_result("repo_path is outside the allowed root", true);
     }
@@ -8275,6 +8297,7 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
     if (mode_str && strcmp(mode_str, "cross-repo-intelligence") == 0) {
         free(mode_str);
         free(name_override);
+        free(compilation_context);
         char *result = handle_cross_repo_mode(repo_path, args);
         free(repo_path);
         return result;
@@ -8292,9 +8315,28 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
 
     cbm_pipeline_t *p = cbm_pipeline_new(repo_path, NULL, mode);
     if (!p) {
+        free(compilation_context);
         free(repo_path);
         return cbm_mcp_text_result("failed to create pipeline", true);
     }
+    if (compilation_context &&
+        cbm_pipeline_set_embedded_compilation_context(
+            p, (const uint8_t *)compilation_context, strlen(compilation_context)) != 0) {
+        cbm_log_error("index.compile_context_transport_refused", "code",
+                      "CBM_COMPILE_CONTEXT_TRANSPORT_INSTALL_FAILED", "repo_path", repo_path,
+                      "message", "the pipeline refused the exact private compilation context",
+                      "remediation", "inspect the preceding structured pipeline diagnostic, fix "
+                                     "the cause, and retry the unchanged request");
+        free(compilation_context);
+        cbm_pipeline_free(p);
+        free(repo_path);
+        return cbm_mcp_text_result(
+            "CBM_COMPILE_CONTEXT_TRANSPORT_INSTALL_FAILED: the pipeline refused the exact "
+            "private compilation context; inspect the preceding structured pipeline diagnostic",
+            true);
+    }
+    free(compilation_context);
+    compilation_context = NULL;
     if (cbm_pipeline_set_sink(p, srv->row_sink_active ? &srv->row_sink : NULL) != 0) {
         cbm_pipeline_free(p);
         free(repo_path);

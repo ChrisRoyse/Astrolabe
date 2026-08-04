@@ -62,6 +62,10 @@ struct cbm_compile_context_index {
     int context_capacity;
     compile_context_set_owner_t *sets;
     int set_count;
+    int compiler_baseline_queries;
+    int compiler_baseline_reuses;
+    int captured_command_count;
+    bool compiler_capture_telemetry_present;
 };
 
 static int context_fail(cbm_pipeline_ctx_t *ctx, const char *code, const char *operation,
@@ -454,6 +458,19 @@ static int append_context_to_set(cbm_pipeline_ctx_t *ctx, compile_context_set_ow
 static int materialize_context_sets(cbm_pipeline_ctx_t *ctx,
                                     cbm_compile_context_index_t *index,
                                     const cbm_file_info_t *source_files, int source_count) {
+    if (index->compiler_capture_telemetry_present &&
+        (index->compiler_baseline_queries < index->baseline_count ||
+         index->compiler_baseline_queries > index->captured_command_count ||
+         index->compiler_baseline_reuses > index->captured_command_count ||
+         (int64_t)index->compiler_baseline_queries +
+                 (int64_t)index->compiler_baseline_reuses !=
+             (int64_t)index->captured_command_count)) {
+        return context_fail(
+            ctx, "CBM_COMPILE_CONTEXT_CAPTURE_TELEMETRY_INCONSISTENT",
+            "validate_capture_telemetry", ctx->repo_path, 0,
+            "compiler baseline query/reuse telemetry contradicts the captured commands",
+            "preserve the compilation database and regenerate the immutable context");
+    }
     if (source_count > 0) {
         index->sets = calloc((size_t)source_count, sizeof(*index->sets));
         if (!index->sets) {
@@ -513,6 +530,8 @@ static int materialize_context_sets(cbm_pipeline_ctx_t *ctx,
     char contexts_text[32];
     char bindings_text[32];
     char reuse_text[32];
+    char baseline_queries_text[32];
+    char baseline_reuses_text[32];
     snprintf(files_text, sizeof(files_text), "%d", c_family_files);
     snprintf(contexts_text, sizeof(contexts_text), "%d", index->context_count);
     snprintf(bindings_text, sizeof(bindings_text), "%d", context_bindings);
@@ -520,9 +539,15 @@ static int materialize_context_sets(cbm_pipeline_ctx_t *ctx,
              context_bindings > index->context_count
                  ? context_bindings - index->context_count
                  : 0);
+    snprintf(baseline_queries_text, sizeof(baseline_queries_text), "%d",
+             index->compiler_baseline_queries);
+    snprintf(baseline_reuses_text, sizeof(baseline_reuses_text), "%d",
+             index->compiler_baseline_reuses);
     cbm_log_info("compile_context.ready", "c_family_files", files_text, "translation_units",
                  contexts_text, "file_context_bindings", bindings_text, "cache_builds", "1",
-                 "context_reuses", reuse_text, "cache", "generation_owned_immutable");
+                 "context_reuses", reuse_text, "compiler_baseline_queries",
+                 baseline_queries_text, "compiler_baseline_reuses", baseline_reuses_text,
+                 "cache", "generation_owned_immutable");
     return 0;
 }
 
@@ -536,6 +561,13 @@ static int parse_embedded_commands(cbm_pipeline_ctx_t *ctx,
                             "the embedded build context has no translation-unit commands",
                             "rebuild Astrolabe from the canonical native Makefile");
     }
+    if (yyjson_arr_size(commands) > INT_MAX) {
+        return context_fail(ctx, "CBM_COMPILE_CONTEXT_CAPACITY_OVERFLOW",
+                            "count_captured_commands", "", yyjson_arr_size(commands),
+                            "captured command count exceeds integer representation",
+                            "reduce the compilation database or extend representation");
+    }
+    index->captured_command_count = (int)yyjson_arr_size(commands);
     yyjson_arr_iter iterator;
     yyjson_arr_iter_init(commands, &iterator);
     yyjson_val *entry;
@@ -662,7 +694,46 @@ static int parse_embedded_manifest(cbm_pipeline_ctx_t *ctx,
         return 0;
     }
     *matched = true;
+    const char *authority = yyjson_get_str(yyjson_obj_get(root, "authority"));
+    if (authority && strcmp(authority, "absent") == 0) {
+        yyjson_doc_free(document);
+        return context_fail(
+            ctx, "CBM_COMPILE_CONTEXT_DATABASE_REQUIRED", "select_context_authority",
+            ctx->repo_path, 0,
+            "this C-family repository has no compile_commands.json authority",
+            "generate compile_commands.json at the repository root from the real build, ensure "
+            "its compiler remains reachable, then retry the complete corpus");
+    }
+    yyjson_val *capture = yyjson_obj_get(root, "capture");
+    if (capture) {
+        if (!yyjson_is_obj(capture)) {
+            yyjson_doc_free(document);
+            return context_fail(
+                ctx, "CBM_COMPILE_CONTEXT_CAPTURE_TELEMETRY_INVALID",
+                "parse_capture_telemetry", ctx->repo_path, 0,
+                "compilation-context capture telemetry is not an object",
+                "regenerate the immutable compilation context with this Astrolabe artifact");
+        }
+        yyjson_val *queries = yyjson_obj_get(capture, "baseline_queries");
+        yyjson_val *reuses = yyjson_obj_get(capture, "baseline_reuses");
+        if (!yyjson_is_uint(queries) || !yyjson_is_uint(reuses) ||
+            yyjson_get_uint(queries) == 0 || yyjson_get_uint(queries) > INT_MAX ||
+            yyjson_get_uint(reuses) > INT_MAX) {
+            yyjson_doc_free(document);
+            return context_fail(
+                ctx, "CBM_COMPILE_CONTEXT_CAPTURE_TELEMETRY_INVALID",
+                "parse_capture_telemetry", ctx->repo_path, 0,
+                "compilation-context capture telemetry is missing or exceeds representation",
+                "regenerate the immutable compilation context with this Astrolabe artifact");
+        }
+        index->compiler_baseline_queries = (int)yyjson_get_uint(queries);
+        index->compiler_baseline_reuses = (int)yyjson_get_uint(reuses);
+        index->compiler_capture_telemetry_present = true;
+    }
     int rc = parse_embedded_baselines(ctx, index, root);
+    if (rc == 0 && !capture) {
+        index->compiler_baseline_queries = index->baseline_count;
+    }
     if (rc == 0) {
         rc = parse_embedded_commands(ctx, index, root, source_files, source_count);
     }

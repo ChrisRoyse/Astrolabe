@@ -1926,6 +1926,11 @@ struct RepositoryCompileCommand {
     directory: String,
     arguments: Vec<String>,
     dependencies: Vec<String>,
+    baseline_index: usize,
+}
+
+#[derive(Debug)]
+struct RepositoryCompilerBaseline {
     predefined_macros: Vec<String>,
     system_include_paths: Vec<String>,
 }
@@ -2457,6 +2462,9 @@ fn parse_make_dependencies(
 fn capture_repository_compile_command(
     repo_root: &Path,
     entry: &serde_json::Value,
+    baseline_cache: &mut BTreeMap<(String, Vec<String>), usize>,
+    baselines: &mut Vec<RepositoryCompilerBaseline>,
+    baseline_reuses: &mut usize,
 ) -> Result<Option<RepositoryCompileCommand>, BridgeError> {
     let file_text = entry
         .get("file")
@@ -2510,21 +2518,45 @@ fn capture_repository_compile_command(
         language.to_owned(),
         "-".to_owned(),
     ]);
-    let baseline_output = run_context_compiler(
-        &baseline_arguments,
-        &directory,
-        "baseline query",
-        &file_path,
-    )?;
-    let (predefined_macros, system_include_paths) =
-        parse_compiler_baseline(&baseline_output.stdout, &baseline_output.stderr, &file_path)?;
+    // Compiler predefines and system roots depend on the exact cwd + argv, not
+    // on the translation-unit bytes (which have been removed from this query).
+    // Reuse only that complete identity: distinct flags, compilers, languages,
+    // or relative-path working directories remain separate queries.
+    let baseline_key = (normalized_path(&directory), baseline_arguments.clone());
+    let baseline_index = if let Some(index) = baseline_cache.get(&baseline_key).copied() {
+        *baseline_reuses = (*baseline_reuses).checked_add(1).ok_or_else(|| {
+            envelope(
+                "ASTRO_COMPILE_CONTEXT_REUSE_OVERFLOW",
+                "compiler baseline reuse telemetry exceeds usize representation",
+                "Reduce the compilation database size or extend telemetry representation.",
+            )
+        })?;
+        index
+    } else {
+        let baseline_output = run_context_compiler(
+            &baseline_arguments,
+            &directory,
+            "baseline query",
+            &file_path,
+        )?;
+        let (predefined_macros, system_include_paths) =
+            parse_compiler_baseline(&baseline_output.stdout, &baseline_output.stderr, &file_path)?;
+        let index = baselines.len();
+        baselines.push(RepositoryCompilerBaseline {
+            predefined_macros,
+            system_include_paths,
+        });
+        baseline_cache.insert(baseline_key, index);
+        index
+    };
+    let baseline = &baselines[baseline_index];
     if !arguments
         .iter()
         .any(|argument| argument.starts_with("-std="))
     {
         arguments.push(format!(
             "-std={}",
-            inferred_standard(&predefined_macros, language, &file_path)?
+            inferred_standard(&baseline.predefined_macros, language, &file_path)?
         ));
     }
 
@@ -2549,8 +2581,7 @@ fn capture_repository_compile_command(
         directory: normalized_path(&directory),
         arguments,
         dependencies,
-        predefined_macros,
-        system_include_paths,
+        baseline_index,
     }))
 }
 
@@ -2579,10 +2610,25 @@ fn compilation_context_for_repo(repo_path: &str) -> Result<Vec<u8>, BridgeError>
 
     let database_path = repo_root.join("compile_commands.json");
     if !database_path.exists() {
-        // A Rust-only repository needs no C-family context. The C pipeline checks
-        // its immutable discovered language set first; a repository that does
-        // contain C-family atoms then fails with CBM_COMPILE_CONTEXT_DATABASE_REQUIRED.
-        return Ok(cbm_sys::ASTROLABE_BUILD_COMPILATION_CONTEXT.to_vec());
+        // Bind absence to this exact repository instead of substituting the
+        // artifact's unrelated canonical context. The C pipeline checks its
+        // immutable discovered language set first: a Rust-only corpus accepts
+        // this marker without parsing commands, while any discovered C-family
+        // atom turns it into CBM_COMPILE_CONTEXT_DATABASE_REQUIRED.
+        return serde_json::to_vec(&serde_json::json!({
+            "format": "astrolabe.compilation-context.v1",
+            "source_root": normalized_path(&repo_root),
+            "authority": "absent",
+            "baselines": [],
+            "commands": [],
+        }))
+        .map_err(|error| {
+            envelope(
+                "ASTRO_COMPILE_CONTEXT_SERIALIZE_FAILED",
+                format!("cannot serialize absent compilation-context authority: {error}"),
+                "Preserve the repository root and report this deterministic serialization fault.",
+            )
+        });
     }
     let bytes = fs::read(&database_path).map_err(|error| {
         envelope(
@@ -2616,8 +2662,17 @@ fn compilation_context_for_repo(repo_path: &str) -> Result<Vec<u8>, BridgeError>
         ));
     }
     let mut captured = Vec::new();
+    let mut baseline_cache = BTreeMap::new();
+    let mut compiler_baselines = Vec::new();
+    let mut baseline_reuses = 0usize;
     for entry in entries {
-        if let Some(command) = capture_repository_compile_command(&repo_root, entry)? {
+        if let Some(command) = capture_repository_compile_command(
+            &repo_root,
+            entry,
+            &mut baseline_cache,
+            &mut compiler_baselines,
+            &mut baseline_reuses,
+        )? {
             captured.push(command);
         }
     }
@@ -2639,20 +2694,21 @@ fn compilation_context_for_repo(repo_path: &str) -> Result<Vec<u8>, BridgeError>
     });
 
     let mut baseline_ids = BTreeMap::<Vec<String>, String>::new();
-    let mut baselines = Vec::new();
+    let mut serialized_baselines = Vec::new();
     let mut commands = Vec::new();
     for command in captured {
-        let mut key = command.predefined_macros.clone();
+        let baseline = &compiler_baselines[command.baseline_index];
+        let mut key = baseline.predefined_macros.clone();
         key.push("\0includes\0".to_owned());
-        key.extend(command.system_include_paths.clone());
+        key.extend(baseline.system_include_paths.clone());
         let baseline_id = if let Some(id) = baseline_ids.get(&key) {
             id.clone()
         } else {
             let id = format!("repository-baseline-{:03}", baseline_ids.len());
-            baselines.push(serde_json::json!({
+            serialized_baselines.push(serde_json::json!({
                 "id": id,
-                "predefined_macros": command.predefined_macros,
-                "system_include_paths": command.system_include_paths,
+                "predefined_macros": &baseline.predefined_macros,
+                "system_include_paths": &baseline.system_include_paths,
             }));
             baseline_ids.insert(key, id.clone());
             id
@@ -2668,7 +2724,11 @@ fn compilation_context_for_repo(repo_path: &str) -> Result<Vec<u8>, BridgeError>
     serde_json::to_vec(&serde_json::json!({
         "format": "astrolabe.compilation-context.v1",
         "source_root": normalized_path(&repo_root),
-        "baselines": baselines,
+        "capture": {
+            "baseline_queries": compiler_baselines.len(),
+            "baseline_reuses": baseline_reuses,
+        },
+        "baselines": serialized_baselines,
         "commands": commands,
     }))
     .map_err(|error| {
@@ -2680,12 +2740,141 @@ fn compilation_context_for_repo(repo_path: &str) -> Result<Vec<u8>, BridgeError>
     })
 }
 
+/// Private Rust-host transport field carrying one complete immutable
+/// `astrolabe.compilation-context.v1` document. It is attached only at the
+/// final Rust→CBM boundary, so it never enters persisted public tool arguments.
+pub const ASTRO_COMPILATION_CONTEXT_ARG: &str = "_astrolabe_compilation_context_json";
+
+fn validate_bound_compilation_context(
+    repo_path: &str,
+    context_json: &str,
+) -> Result<(), BridgeError> {
+    let repo_root = canonical_path(
+        Path::new(repo_path),
+        "ASTRO_COMPILE_CONTEXT_REPOSITORY_UNRESOLVED",
+        "repository root",
+    )?;
+    let value: serde_json::Value = serde_json::from_str(context_json).map_err(|error| {
+        envelope(
+            "ASTRO_COMPILE_CONTEXT_TRANSPORT_MALFORMED",
+            format!("private compilation-context transport is not valid JSON: {error}"),
+            "Preserve the worker argument file and regenerate it from the exact parent request.",
+        )
+    })?;
+    if value.get("format").and_then(serde_json::Value::as_str)
+        != Some("astrolabe.compilation-context.v1")
+    {
+        return Err(envelope(
+            "ASTRO_COMPILE_CONTEXT_TRANSPORT_SCHEMA_INVALID",
+            "private compilation-context transport has an unsupported format",
+            "Regenerate the worker arguments with this Astrolabe artifact.",
+        ));
+    }
+    let source_root = value
+        .get("source_root")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| {
+            envelope(
+                "ASTRO_COMPILE_CONTEXT_TRANSPORT_SOURCE_MISSING",
+                "private compilation-context transport has no source_root",
+                "Regenerate the worker arguments from the exact repository root.",
+            )
+        })?;
+    let transported_root = canonical_path(
+        Path::new(source_root),
+        "ASTRO_COMPILE_CONTEXT_TRANSPORT_SOURCE_UNRESOLVED",
+        "transported compilation-context source root",
+    )?;
+    if transported_root != repo_root {
+        return Err(envelope(
+            "ASTRO_COMPILE_CONTEXT_TRANSPORT_SOURCE_MISMATCH",
+            format!(
+                "private compilation context names {}, but this request indexes {}",
+                transported_root.display(),
+                repo_root.display()
+            ),
+            "Discard the mismatched worker request and regenerate it for the exact repository.",
+        ));
+    }
+    for field in ["baselines", "commands"] {
+        if !value.get(field).is_some_and(serde_json::Value::is_array) {
+            return Err(envelope(
+                "ASTRO_COMPILE_CONTEXT_TRANSPORT_SCHEMA_INVALID",
+                format!("private compilation-context transport field {field:?} is not an array"),
+                "Regenerate the worker arguments with this Astrolabe artifact.",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn bind_compilation_context_to_index_args(args_json: &str) -> Result<String, BridgeError> {
+    let mut value: serde_json::Value = serde_json::from_str(args_json).map_err(|error| {
+        envelope(
+            "ASTRO_COMPILE_CONTEXT_ARGS_MALFORMED",
+            format!("index_repository arguments are not valid JSON: {error}"),
+            "Pass one JSON object containing the exact repo_path.",
+        )
+    })?;
+    let object = value.as_object_mut().ok_or_else(|| {
+        envelope(
+            "ASTRO_COMPILE_CONTEXT_ARGS_OBJECT_REQUIRED",
+            "index_repository arguments must be a JSON object",
+            "Pass one JSON object containing the exact repo_path.",
+        )
+    })?;
+    let repo_path = object
+        .get("repo_path")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| {
+            envelope(
+                "ASTRO_COMPILE_CONTEXT_REPOSITORY_REQUIRED",
+                "index_repository requires a string repo_path before context binding",
+                "Pass the existing repository root in repo_path.",
+            )
+        })?
+        .to_owned();
+    if object.get("mode").and_then(serde_json::Value::as_str) == Some("cross-repo-intelligence") {
+        return Ok(args_json.to_owned());
+    }
+    if let Some(existing) = object.get(ASTRO_COMPILATION_CONTEXT_ARG) {
+        let context_json = existing.as_str().ok_or_else(|| {
+            envelope(
+                "ASTRO_COMPILE_CONTEXT_TRANSPORT_TYPE_INVALID",
+                "private compilation-context transport is not a string",
+                "Preserve the worker argument file and regenerate it from the exact parent request.",
+            )
+        })?;
+        validate_bound_compilation_context(&repo_path, context_json)?;
+        return Ok(args_json.to_owned());
+    }
+    let context = compilation_context_for_repo(&repo_path)?;
+    let context_json = String::from_utf8(context).map_err(|error| {
+        envelope(
+            "ASTRO_COMPILE_CONTEXT_TRANSPORT_UTF8_INVALID",
+            format!("generated compilation context is not UTF-8: {error}"),
+            "Preserve the compilation database and report this serialization fault.",
+        )
+    })?;
+    validate_bound_compilation_context(&repo_path, &context_json)?;
+    object.insert(
+        ASTRO_COMPILATION_CONTEXT_ARG.to_owned(),
+        serde_json::Value::String(context_json),
+    );
+    serde_json::to_string(&value).map_err(|error| {
+        envelope(
+            "ASTRO_COMPILE_CONTEXT_ARGS_SERIALIZE_FAILED",
+            format!("cannot serialize context-bound index arguments: {error}"),
+            "Preserve the original request and report this deterministic serialization fault.",
+        )
+    })
+}
+
 pub struct CbmPipeline {
     ptr: NonNull<cbm_sys::cbm_pipeline_t>,
     owner: ThreadId,
     _repo_path: CString,
     _db_path: CString,
-    _compilation_context: Vec<u8>,
     _not_send_or_sync: PhantomData<Rc<()>>,
 }
 
@@ -2723,7 +2912,6 @@ impl CbmPipeline {
                 owner: thread::current().id(),
                 _repo_path: repo_path,
                 _db_path: db_path,
-                _compilation_context: compilation_context,
                 _not_send_or_sync: PhantomData,
             })
         }
@@ -4500,8 +4688,13 @@ impl CbmToolRunner {
 
     pub fn handle_tool_raw(&self, tool_name: &str, args_json: &str) -> Result<String, BridgeError> {
         self.ensure_owner_thread()?;
+        let bound_args = if tool_name == "index_repository" {
+            Some(bind_compilation_context_to_index_args(args_json)?)
+        } else {
+            None
+        };
         let tool_name = CString::new(tool_name)?;
-        let args_json = CString::new(args_json)?;
+        let args_json = CString::new(bound_args.as_deref().unwrap_or(args_json))?;
         // SAFETY: server pointer is owned by self and thread-affine; C strings
         // outlive the call; the returned heap string is freed by CStringAllocation.
         unsafe {
@@ -4564,6 +4757,7 @@ impl CbmToolRunner {
         args_json: &str,
     ) -> Result<CbmIndexRepositoryRows, BridgeError> {
         self.ensure_owner_thread()?;
+        let args_json = bind_compilation_context_to_index_args(args_json)?;
         let tool_name = CString::new("index_repository")?;
         let args_json = CString::new(args_json)?;
         let mut sink = PipelineRowSinkState::new();
@@ -4629,6 +4823,7 @@ impl CbmToolRunner {
         args_json: &str,
     ) -> Result<String, BridgeError> {
         self.ensure_owner_thread()?;
+        let args_json = bind_compilation_context_to_index_args(args_json)?;
         let args_json = CString::new(args_json)?;
         // SAFETY: server pointer is owned by self and thread-affine; args_json is
         // live for the call. The returned heap string is freed by take_c_string.

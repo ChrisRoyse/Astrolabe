@@ -117,11 +117,10 @@ pub fn run_from_env() -> i32 {
     if args
         .get(1)
         .is_some_and(|arg| arg == connection_supervisor::INTERNAL_WORKER_ARG)
+        && let Err(error) = connection_supervisor::validate_worker_invocation(&args[1..])
     {
-        if let Err(error) = connection_supervisor::validate_worker_invocation(&args[1..]) {
-            connection_supervisor::report_error(&error);
-            return 1;
-        }
+        connection_supervisor::report_error(&error);
+        return 1;
     }
     let hook_mode = is_hook_augment_invocation(&args);
     // #392: a `cli <tool>` invocation reserves stderr for warn/error so the
@@ -727,9 +726,11 @@ fn run_cli(args: &[String]) -> Result<i32, DynError> {
 }
 
 /// Applies the supervisor-supplied cache directory inside the isolated worker
-/// process, then strips the private transport field before libcbm sees the tool
-/// arguments. The parent process never changes its global resolver, so other
-/// MCP runners cannot accidentally resolve the transaction-owned stage.
+/// process, then strips only the cache/grant transport fields before libcbm sees
+/// the tool arguments. Repository compilation context intentionally remains:
+/// the C pipeline owns an exact copy for this generation. The parent process
+/// never changes its global resolver, so other MCP runners cannot accidentally
+/// resolve the transaction-owned stage.
 struct IndexWorkerConfiguration {
     args_json: String,
     transition_writer_project: Option<String>,

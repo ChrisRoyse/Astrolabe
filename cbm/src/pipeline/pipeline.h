@@ -113,8 +113,9 @@ typedef enum {
 cbm_pipeline_t *cbm_pipeline_new(const char *repo_path, const char *db_path, cbm_index_mode_t mode);
 
 /* Bind the exact artifact- or repository-derived compilation context. The
- * bytes are borrowed through cbm_pipeline_run and must be an immutable
- * astrolabe.compilation-context.v1 document. */
+ * pipeline copies and owns the bytes through cbm_pipeline_free; the caller may
+ * release its source buffer immediately. The document must be an immutable
+ * astrolabe.compilation-context.v1 value. */
 int cbm_pipeline_set_embedded_compilation_context(cbm_pipeline_t *p, const uint8_t *bytes,
                                                   size_t byte_count);
 

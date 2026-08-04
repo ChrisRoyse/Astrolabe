@@ -202,7 +202,7 @@ struct cbm_pipeline {
     bool row_sink_completed;
     cbm_pipeline_post_success_fn post_success;
     void *post_success_ctx;
-    const uint8_t *embedded_compilation_context;
+    uint8_t *embedded_compilation_context;
     size_t embedded_compilation_context_bytes;
     cbm_compile_context_index_t *compile_contexts;
     const cbm_source_slab_t *current_source_slab;
@@ -590,7 +590,20 @@ int cbm_pipeline_set_embedded_compilation_context(cbm_pipeline_t *p, const uint8
                       "the pipeline");
         return CBM_NOT_FOUND;
     }
-    p->embedded_compilation_context = bytes;
+    uint8_t *owned_bytes = malloc(byte_count);
+    if (!owned_bytes) {
+        char requested_bytes[32];
+        snprintf(requested_bytes, sizeof(requested_bytes), "%zu", byte_count);
+        cbm_log_error("pipeline.compile_context_refused", "code",
+                      "CBM_COMPILE_CONTEXT_TRANSPORT_ALLOC_FAILED", "message",
+                      "the pipeline could not retain the immutable compilation context",
+                      "requested_bytes", requested_bytes, "remediation",
+                      "free memory and retry the unchanged repository and context");
+        return CBM_NOT_FOUND;
+    }
+    memcpy(owned_bytes, bytes, byte_count);
+    free(p->embedded_compilation_context);
+    p->embedded_compilation_context = owned_bytes;
     p->embedded_compilation_context_bytes = byte_count;
     return 0;
 }
@@ -711,6 +724,9 @@ void cbm_pipeline_free(cbm_pipeline_t *p) {
     p->file_errors_count = 0;
     p->file_errors_cap = 0;
     free(p->branch_qn);
+    free(p->embedded_compilation_context);
+    p->embedded_compilation_context = NULL;
+    p->embedded_compilation_context_bytes = 0;
     cbm_compile_context_index_free(p->compile_contexts);
     p->compile_contexts = NULL;
     free(p->saved_adr); /* freed here too: error paths can exit before the

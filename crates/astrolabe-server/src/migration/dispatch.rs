@@ -378,6 +378,12 @@ pub(crate) fn handle_index_repository(
     let Some(args_obj) = args.as_object() else {
         return Ok(runner.handle_tool_raw("index_repository", args_json)?);
     };
+    if args_obj.contains_key(astrolabe_bridge::ASTRO_COMPILATION_CONTEXT_ARG) {
+        return tool_error_result(format!(
+            "ASTRO_COMPILE_CONTEXT_PRIVATE_ARG_COLLISION: caller supplied reserved argument {:?}; remediation: remove the private transport field and let Astrolabe derive it from repo_path",
+            astrolabe_bridge::ASTRO_COMPILATION_CONTEXT_ARG
+        ));
+    }
     if args_obj.contains_key("name") {
         return tool_error_result(
             "CBM_PROJECT_NAME_OVERRIDE_REFUSED: project storage identity is derived only from the canonical repository root; remove the name argument and use the project returned by index_repository",

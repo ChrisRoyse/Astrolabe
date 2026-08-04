@@ -338,10 +338,10 @@ fn capture_compilation_context(
             arguments,
             dependencies,
         };
-        if let Some(previous) = by_file.insert(file.clone(), command) {
-            if previous.arguments != by_file[&file].arguments {
-                panic!("one libcbm translation unit has contradictory compile commands: {file}");
-            }
+        if let Some(previous) = by_file.insert(file.clone(), command)
+            && previous.arguments != by_file[&file].arguments
+        {
+            panic!("one libcbm translation unit has contradictory compile commands: {file}");
         }
     }
     if by_file.is_empty() {
@@ -515,10 +515,10 @@ fn read_depfile(repo_root: &Path, cbm_root: &Path, depfile: &Path, source: &str)
     let mut dependencies = Vec::new();
     for token in flattened[separator + 2..].split_ascii_whitespace() {
         let token = token.replace("\\ ", " ");
-        if let Some(relative) = repo_relative_path(repo_root, cbm_root, &token) {
-            if !dependencies.contains(&relative) {
-                dependencies.push(relative);
-            }
+        if let Some(relative) = repo_relative_path(repo_root, cbm_root, &token)
+            && !dependencies.contains(&relative)
+        {
+            dependencies.push(relative);
         }
     }
     if !dependencies.iter().any(|dependency| dependency == source) {

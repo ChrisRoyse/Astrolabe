@@ -1110,28 +1110,29 @@ fn relay_connection(
             }
         }
 
-        if let Some(started) = shutdown_started {
-            if child_status.is_none() && started.elapsed() >= WORKER_SHUTDOWN_TIMEOUT {
-                if !kill_sent {
-                    worker.child.kill().map_err(|error| {
-                        SupervisorError::new(
-                            "ASTRO_MCP_WORKER_SHUTDOWN_TIMEOUT_KILL_FAILED",
-                            format!("worker exceeded the shutdown budget and could not be terminated: {error}"),
-                            "Preserve the live worker and journal; inspect the exact process before manual action.",
-                        )
-                    })?;
-                    kill_sent = true;
-                }
-                terminal = Some(TerminalCause {
-                    code: "ASTRO_MCP_WORKER_SHUTDOWN_TIMEOUT",
-                    message: format!(
-                        "worker did not exit within {} ms after its stdin closed",
-                        WORKER_SHUTDOWN_TIMEOUT.as_millis()
-                    ),
-                    remediation: "Inspect the last request and worker stderr tail; fix the blocked shutdown path before another connection.",
-                    expected_shutdown: false,
-                });
+        if let Some(started) = shutdown_started
+            && child_status.is_none()
+            && started.elapsed() >= WORKER_SHUTDOWN_TIMEOUT
+        {
+            if !kill_sent {
+                worker.child.kill().map_err(|error| {
+                    SupervisorError::new(
+                        "ASTRO_MCP_WORKER_SHUTDOWN_TIMEOUT_KILL_FAILED",
+                        format!("worker exceeded the shutdown budget and could not be terminated: {error}"),
+                        "Preserve the live worker and journal; inspect the exact process before manual action.",
+                    )
+                })?;
+                kill_sent = true;
             }
+            terminal = Some(TerminalCause {
+                code: "ASTRO_MCP_WORKER_SHUTDOWN_TIMEOUT",
+                message: format!(
+                    "worker did not exit within {} ms after its stdin closed",
+                    WORKER_SHUTDOWN_TIMEOUT.as_millis()
+                ),
+                remediation: "Inspect the last request and worker stderr tail; fix the blocked shutdown path before another connection.",
+                expected_shutdown: false,
+            });
         }
 
         if child_status.is_some() && worker_stdout_closed && worker_stderr_closed {
@@ -1246,20 +1247,20 @@ fn relay_connection(
                         "identity_fields": collect_identity_fields(&frame.request),
                     }),
                 )?;
-                if terminal.is_none() {
-                    if let Err(error) = write_frame(&mut client_output, &frame) {
-                        set_terminal(
-                            &mut terminal,
-                            TerminalCause {
-                                code: "ASTRO_MCP_CLIENT_STDOUT_WRITE_FAILED",
-                                message: format!(
-                                    "worker response could not be written to client stdout: {error}"
-                                ),
-                                remediation: "Inspect the client process and stdout pipe plus this journal; do not reconnect automatically.",
-                                expected_shutdown: false,
-                            },
-                        );
-                    }
+                if terminal.is_none()
+                    && let Err(error) = write_frame(&mut client_output, &frame)
+                {
+                    set_terminal(
+                        &mut terminal,
+                        TerminalCause {
+                            code: "ASTRO_MCP_CLIENT_STDOUT_WRITE_FAILED",
+                            message: format!(
+                                "worker response could not be written to client stdout: {error}"
+                            ),
+                            remediation: "Inspect the client process and stdout pipe plus this journal; do not reconnect automatically.",
+                            expected_shutdown: false,
+                        },
+                    );
                 }
             }
             Ok(RelayEvent::WorkerEof) => {
