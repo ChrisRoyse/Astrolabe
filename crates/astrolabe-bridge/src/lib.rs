@@ -1936,6 +1936,7 @@ impl PipelineRowSinkState {
 #[derive(Debug)]
 struct RepositoryCompileCommand {
     file: String,
+    language: &'static str,
     directory: String,
     arguments: Vec<String>,
     preprocess_arguments: Vec<String>,
@@ -2807,6 +2808,7 @@ fn capture_repository_compile_command(
         parse_make_dependencies(&dependency_output.stdout, repo_root, &directory, &file_path)?;
     Ok(Some(RepositoryCompileCommand {
         file,
+        language,
         directory: normalized_path(&directory),
         arguments,
         preprocess_arguments,
@@ -2969,6 +2971,7 @@ fn compilation_context_for_repo(repo_path: &str) -> Result<Vec<u8>, BridgeError>
         };
         commands.push(serde_json::json!({
             "file": command.file,
+            "language": command.language,
             "directory": command.directory,
             "arguments": command.arguments,
             "preprocess_arguments": command.preprocess_arguments,

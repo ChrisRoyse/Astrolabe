@@ -419,7 +419,7 @@ typedef enum {
 } cbm_compile_context_file_state_t;
 
 int cbm_compile_context_index_prepare(cbm_pipeline_ctx_t *ctx,
-                                      const cbm_file_info_t *source_files, int source_count,
+                                      cbm_file_info_t *source_files, int source_count,
                                       const uint8_t *embedded_bytes, size_t embedded_byte_count,
                                       cbm_compile_context_index_t **out_index);
 int cbm_compile_context_extract_calls(cbm_pipeline_ctx_t *ctx,
@@ -429,6 +429,17 @@ int cbm_compile_context_extract_calls(cbm_pipeline_ctx_t *ctx,
 void cbm_compile_context_index_free(cbm_compile_context_index_t *index);
 const CBMPreprocessContextSet *cbm_compile_context_for_file(
     const cbm_compile_context_index_t *index, const char *rel_path);
+typedef struct {
+    CBMLanguage declared_language;
+    const char *effective_family;
+    const char *provenance;
+    const CBMPreprocessContextSet *owners;
+    bool ambiguous_fragment;
+    bool compiler_language_applied;
+} cbm_compile_context_language_metadata_t;
+bool cbm_compile_context_language_metadata(
+    const cbm_compile_context_index_t *index, const char *rel_path,
+    cbm_compile_context_language_metadata_t *out);
 bool cbm_compile_context_id_exists(const cbm_compile_context_index_t *index,
                                    const char *context_id);
 cbm_compile_context_file_state_t cbm_compile_context_file_state(
@@ -440,6 +451,8 @@ const char *cbm_compile_context_absence_reason(const cbm_compile_context_index_t
 int cbm_pipeline_format_file_properties(cbm_pipeline_t *pipeline,
                                         const cbm_file_info_t *file, char *out,
                                         size_t out_capacity);
+size_t cbm_pipeline_file_properties_capacity(cbm_pipeline_t *pipeline,
+                                             const cbm_file_info_t *file);
 int cbm_compile_context_target_visible(const cbm_compile_context_index_t *index,
                                        const char *context_id, const char *target_rel_path);
 cbm_resolution_t cbm_compile_context_resolve_call(

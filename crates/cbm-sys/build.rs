@@ -363,6 +363,7 @@ fn make_command(
 #[derive(Debug)]
 struct CapturedCompileCommand {
     file: String,
+    language: &'static str,
     arguments: Vec<String>,
     preprocess_arguments: Vec<String>,
     dependencies: Vec<String>,
@@ -418,8 +419,10 @@ fn capture_compilation_context(
         let object = resolve_build_path(cbm_root, &arguments[output_at + 1]);
         let depfile = object.with_extension("d");
         let dependencies = read_depfile(repo_root, cbm_root, &depfile, &file);
+        let language = if file.ends_with(".cpp") { "c++" } else { "c" };
         let command = CapturedCompileCommand {
             file: file.clone(),
+            language,
             preprocess_arguments: compiler_preprocess_arguments(&arguments),
             arguments,
             dependencies,
@@ -438,11 +441,7 @@ fn capture_compilation_context(
     let mut baselines = Vec::<Value>::new();
     let mut commands = Vec::<Value>::with_capacity(by_file.len());
     for command in by_file.values() {
-        let language = if command.file.ends_with(".cpp") {
-            "c++"
-        } else {
-            "c"
-        };
+        let language = command.language;
         let query = compiler_query_arguments(&command.arguments, language);
         let baseline_id = if let Some(id) = baseline_by_query.get(&query) {
             id.clone()
@@ -462,6 +461,7 @@ fn capture_compilation_context(
         };
         commands.push(json!({
             "file": command.file,
+            "language": command.language,
             "directory": make_command_path(&cbm_root.to_string_lossy()),
             "arguments": command.arguments,
             "preprocess_arguments": command.preprocess_arguments,

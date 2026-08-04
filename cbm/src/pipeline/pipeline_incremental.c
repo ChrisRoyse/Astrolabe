@@ -1480,9 +1480,25 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
         if (file_qn) {
             const char *slash = strrchr(changed_files[i].rel_path, '/');
             const char *basename = slash ? slash + SKIP_ONE : changed_files[i].rel_path;
-            char props[CBM_SZ_1K];
-            if (cbm_pipeline_format_file_properties(p, &changed_files[i], props,
-                                                    sizeof(props)) != 0) {
+            size_t props_capacity =
+                cbm_pipeline_file_properties_capacity(p, &changed_files[i]);
+            char props_stack[CBM_SZ_1K];
+            bool props_heap_owned = props_capacity > sizeof(props_stack);
+            char *props = !props_capacity
+                              ? NULL
+                              : (props_heap_owned ? malloc(props_capacity) : props_stack);
+            if (!props && props_capacity) {
+                cbm_pipeline_record_fatal_error(
+                    p, "CBM_FILE_PROPERTIES_ALLOC_FAILED", "allocate_file_properties",
+                    "incremental", changed_files[i].rel_path, props_capacity,
+                    "the changed File atom properties could not be allocated",
+                    "free memory and retry the unchanged corpus");
+            }
+            if (!props || cbm_pipeline_format_file_properties(
+                              p, &changed_files[i], props, props_capacity) != 0) {
+                if (props_heap_owned) {
+                    free(props);
+                }
                 free(file_qn);
                 file_source_failed = true;
                 break;
@@ -1496,6 +1512,9 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
                                                   changed_files[i].rel_path, 0, 0, source_bytes,
                                                   source_len, 0, (uint64_t)source_len, props)
                     : 0;
+            if (props_heap_owned) {
+                free(props);
+            }
             free(source_bytes);
             free(file_qn);
             if (file_id <= 0) {

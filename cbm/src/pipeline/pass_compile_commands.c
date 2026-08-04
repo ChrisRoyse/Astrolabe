@@ -28,6 +28,17 @@
 
 enum { PREPROCESS_STDERR_LIMIT = 65536 };
 
+static bool compiler_ambiguous_fragment_filename(const char *filename) {
+    if (!filename || !filename[0]) {
+        return false;
+    }
+    const char *extension = strrchr(filename, '.');
+    /* `.inc` is registry-declared as BitBake and is also a conventional
+     * generated C/C++ include fragment. Only an exact compiler dependency
+     * edge may refine it; filename, directory, and content never do so. */
+    return extension && strcmp(extension, ".inc") == 0;
+}
+
 typedef struct {
     char *text;
     size_t text_bytes;
@@ -68,6 +79,10 @@ typedef struct {
 typedef struct {
     char *rel_path;
     int source_index;
+    CBMLanguage declared_language;
+    bool compiler_language_applied;
+    bool has_c_owner;
+    bool has_cpp_owner;
     CBMPreprocessContextSet view;
     CBMPreprocessContext *items;
     size_t capacity;
@@ -594,8 +609,14 @@ static const char *consume_option_value(char **arguments, int argument_count, in
 static int configure_context_from_arguments(cbm_pipeline_ctx_t *ctx,
                                             compile_context_owner_t *owner,
                                             compile_baseline_t *baseline, char **arguments,
-                                            int argument_count, bool cpp_mode) {
-    owner->view.cpp_mode = cpp_mode;
+                                            int argument_count, const char *language) {
+    if (!language || (strcmp(language, "c") != 0 && strcmp(language, "c++") != 0)) {
+        return context_fail(ctx, "CBM_COMPILE_CONTEXT_LANGUAGE_INVALID",
+                            "parse_compile_arguments", owner->tu_rel_path, 0,
+                            "one compiler invocation has no exact C/C++ language fact",
+                            "regenerate the compilation context with the current Astrolabe artifact");
+    }
+    owner->view.cpp_mode = strcmp(language, "c++") == 0;
     for (int i = 1; i < argument_count; i++) {
         const char *value = NULL;
         if (strncmp(arguments[i], "-std=", 5) == 0 && arguments[i][5]) {
@@ -644,6 +665,14 @@ static int configure_context_from_arguments(cbm_pipeline_ctx_t *ctx,
                             "the compiler invocation has no explicit language standard",
                             "add an exact -std= flag to the build and regenerate "
                             "compile_commands.json");
+    }
+    bool standard_is_cpp = strstr(owner->view.standard, "++") != NULL;
+    if (standard_is_cpp != owner->view.cpp_mode) {
+        return context_fail(
+            ctx, "CBM_COMPILE_CONTEXT_LANGUAGE_STANDARD_CONTRADICTORY",
+            "parse_compile_arguments", owner->tu_rel_path, 0,
+            "the exact translation-unit language contradicts its declared compiler standard",
+            "repair the real compiler argv and regenerate the compilation context");
     }
     for (int i = 0; i < baseline->system_include_count; i++) {
         if (!append_owned_string(&owner->owned_include_paths, &owner->owned_include_count,
@@ -724,7 +753,7 @@ static int append_context_to_set(cbm_pipeline_ctx_t *ctx, compile_context_set_ow
 
 static int materialize_context_sets(cbm_pipeline_ctx_t *ctx,
                                     cbm_compile_context_index_t *index,
-                                    const cbm_file_info_t *source_files, int source_count) {
+                                    cbm_file_info_t *source_files, int source_count) {
     if (index->compiler_capture_telemetry_present &&
         (index->compiler_baseline_queries < index->baseline_count ||
          index->compiler_baseline_queries > index->captured_command_count ||
@@ -738,45 +767,48 @@ static int materialize_context_sets(cbm_pipeline_ctx_t *ctx,
             "compiler baseline query/reuse telemetry contradicts the captured commands",
             "preserve the compilation database and regenerate the immutable context");
     }
-    int c_family_files = 0;
+    int candidate_files = 0;
     for (int i = 0; i < source_count; i++) {
         CBMLanguage language = source_files[i].language;
-        if (language == CBM_LANG_C || language == CBM_LANG_CPP || language == CBM_LANG_CUDA) {
-            c_family_files++;
+        if (language == CBM_LANG_C || language == CBM_LANG_CPP || language == CBM_LANG_CUDA ||
+            compiler_ambiguous_fragment_filename(source_files[i].rel_path)) {
+            candidate_files++;
         }
     }
-    if (c_family_files > 0) {
-        index->sets = calloc((size_t)c_family_files, sizeof(*index->sets));
+    if (candidate_files > 0) {
+        index->sets = calloc((size_t)candidate_files, sizeof(*index->sets));
         if (!index->sets) {
             return context_fail(ctx, "CBM_COMPILE_CONTEXT_ALLOC_FAILED", "allocate_file_sets",
-                                "", (size_t)c_family_files,
+                                "", (size_t)candidate_files,
                                 "the per-file compilation-context index could not be allocated",
                                 "free memory and retry the unchanged corpus");
         }
     }
-    index->set_count = c_family_files;
-    if (c_family_files > (int)((UINT32_MAX - 16U) / 2U)) {
+    index->set_count = candidate_files;
+    if (candidate_files > (int)((UINT32_MAX - 16U) / 2U)) {
         return context_fail(ctx, "CBM_COMPILE_CONTEXT_CAPACITY_OVERFLOW",
-                            "index_file_contexts", ctx->repo_path, (size_t)c_family_files,
+                            "index_file_contexts", ctx->repo_path, (size_t)candidate_files,
                             "the source count exceeds the context hash representation",
                             "reduce the corpus generation or extend the context index");
     }
-    index->sets_by_rel_path = cbm_ht_create((uint32_t)c_family_files * 2U + 16U);
+    index->sets_by_rel_path = cbm_ht_create((uint32_t)candidate_files * 2U + 16U);
     if (!index->sets_by_rel_path) {
         return context_fail(ctx, "CBM_COMPILE_CONTEXT_ALLOC_FAILED", "index_file_contexts",
-                            ctx->repo_path, (size_t)c_family_files,
+                            ctx->repo_path, (size_t)candidate_files,
                             "the immutable file-to-context hash index could not be allocated",
                             "free memory and retry the unchanged corpus");
     }
     int set_index = 0;
     for (int i = 0; i < source_count; i++) {
         CBMLanguage language = source_files[i].language;
-        if (language != CBM_LANG_C && language != CBM_LANG_CPP && language != CBM_LANG_CUDA) {
+        if (language != CBM_LANG_C && language != CBM_LANG_CPP && language != CBM_LANG_CUDA &&
+            !compiler_ambiguous_fragment_filename(source_files[i].rel_path)) {
             continue;
         }
         compile_context_set_owner_t *set = &index->sets[set_index++];
         set->rel_path = strdup(source_files[i].rel_path);
         set->source_index = i;
+        set->declared_language = language;
         if (!set->rel_path ||
             !cbm_ht_set_checked(index->sets_by_rel_path, set->rel_path, set, NULL)) {
             return context_fail(ctx, "CBM_COMPILE_CONTEXT_ALLOC_FAILED", "copy_file_path",
@@ -823,6 +855,40 @@ static int materialize_context_sets(cbm_pipeline_ctx_t *ctx,
             if (set && append_context_to_set(ctx, set, &context->view) != 0) {
                 return CBM_NOT_FOUND;
             }
+        }
+    }
+    int compiler_refined_fragments = 0;
+    for (int i = 0; i < index->set_count; i++) {
+        compile_context_set_owner_t *set = &index->sets[i];
+        for (size_t c = 0; c < set->view.count; c++) {
+            if (set->view.items[c].cpp_mode) {
+                set->has_cpp_owner = true;
+            } else {
+                set->has_c_owner = true;
+            }
+        }
+        if (!compiler_ambiguous_fragment_filename(set->rel_path) ||
+            set->view.count == 0) {
+            continue;
+        }
+        if (set->source_index < 0 || set->source_index >= source_count ||
+            (!set->has_c_owner && !set->has_cpp_owner)) {
+            return context_fail(
+                ctx, "CBM_COMPILE_CONTEXT_LANGUAGE_OWNERSHIP_INVALID",
+                "resolve_ambiguous_fragment_language", set->rel_path, set->view.count,
+                "an ambiguous compiler dependency has no complete C/C++ owner classification",
+                "preserve the manifest and regenerate its exact language ownership facts");
+        }
+        source_files[set->source_index].language =
+            set->has_cpp_owner ? CBM_LANG_CPP : CBM_LANG_C;
+        set->compiler_language_applied = true;
+        compiler_refined_fragments++;
+    }
+    int c_family_files = 0;
+    for (int i = 0; i < source_count; i++) {
+        CBMLanguage language = source_files[i].language;
+        if (language == CBM_LANG_C || language == CBM_LANG_CPP || language == CBM_LANG_CUDA) {
+            c_family_files++;
         }
     }
     int bound_files = 0;
@@ -875,6 +941,7 @@ static int materialize_context_sets(cbm_pipeline_ctx_t *ctx,
     char reuse_text[32];
     char baseline_queries_text[32];
     char baseline_reuses_text[32];
+    char refined_text[32];
     snprintf(files_text, sizeof(files_text), "%d", c_family_files);
     snprintf(bound_text, sizeof(bound_text), "%d", bound_files);
     snprintf(absent_text, sizeof(absent_text), "%d", configuration_absent_files);
@@ -889,6 +956,7 @@ static int materialize_context_sets(cbm_pipeline_ctx_t *ctx,
              index->compiler_baseline_queries);
     snprintf(baseline_reuses_text, sizeof(baseline_reuses_text), "%d",
              index->compiler_baseline_reuses);
+    snprintf(refined_text, sizeof(refined_text), "%d", compiler_refined_fragments);
     cbm_log_info("compile_context.ready", "c_family_files", files_text, "translation_units",
                  contexts_text, "bound_files", bound_text, "configuration_absent_files",
                  absent_text, "empty_files", empty_text, "file_context_bindings",
@@ -905,13 +973,13 @@ static int materialize_context_sets(cbm_pipeline_ctx_t *ctx,
                  "cache", "generation_owned_immutable", "entry_source_cache", "source_slab",
                  "entry_source_disk_reads", "0", "file_context_lookup", "hash_o1",
                  "context_identity_lookup", "hash_o1", "dependency_membership",
-                 "sorted_binary_search");
+                 "sorted_binary_search", "compiler_refined_fragments", refined_text);
     return 0;
 }
 
 static int parse_embedded_commands(cbm_pipeline_ctx_t *ctx,
                                    cbm_compile_context_index_t *index, yyjson_val *root,
-                                   const cbm_file_info_t *source_files, int source_count) {
+                                   cbm_file_info_t *source_files, int source_count) {
     yyjson_val *commands = yyjson_obj_get(root, "commands");
     if (!commands || !yyjson_is_arr(commands) || yyjson_arr_size(commands) == 0) {
         return context_fail(ctx, "CBM_COMPILE_CONTEXT_COMMANDS_MISSING",
@@ -931,6 +999,7 @@ static int parse_embedded_commands(cbm_pipeline_ctx_t *ctx,
     yyjson_val *entry;
     while ((entry = yyjson_arr_iter_next(&iterator))) {
         const char *file = yyjson_get_str(yyjson_obj_get(entry, "file"));
+        const char *language = yyjson_get_str(yyjson_obj_get(entry, "language"));
         const char *directory = yyjson_get_str(yyjson_obj_get(entry, "directory"));
         const char *baseline_id = yyjson_get_str(yyjson_obj_get(entry, "baseline_id"));
         yyjson_val *arguments_value = yyjson_obj_get(entry, "arguments");
@@ -938,11 +1007,11 @@ static int parse_embedded_commands(cbm_pipeline_ctx_t *ctx,
             yyjson_obj_get(entry, "preprocess_arguments");
         yyjson_val *dependencies_value = yyjson_obj_get(entry, "dependencies");
         compile_baseline_t *baseline = find_baseline(index, baseline_id);
-        if (!file || !file[0] || !directory || !directory[0] || !baseline ||
+        if (!file || !file[0] || !language || !language[0] || !directory || !directory[0] || !baseline ||
             !arguments_value || !preprocess_arguments_value || !dependencies_value) {
             return context_fail(ctx, "CBM_COMPILE_CONTEXT_COMMAND_INCOMPLETE",
                                 "parse_embedded_commands", file, 0,
-                                "a translation-unit command lacks file, directory, baseline, "
+                                "a translation-unit command lacks file, language, directory, baseline, "
                                 "arguments, preprocess_arguments, or dependencies",
                                 "regenerate the artifact compilation-context manifest");
         }
@@ -988,11 +1057,9 @@ static int parse_embedded_commands(cbm_pipeline_ctx_t *ctx,
         owner->preprocess_argument_count = preprocess_argument_count;
         owner->dependencies = dependencies;
         owner->dependency_count = dependency_count;
-        bool cpp_mode = strstr(file, ".cpp") != NULL || strstr(file, ".cc") != NULL ||
-                        strstr(file, ".cxx") != NULL || strstr(file, ".cu") != NULL;
         if (!owner->tu_rel_path || !owner->directory ||
             configure_context_from_arguments(ctx, owner, baseline, arguments, argument_count,
-                                             cpp_mode) != 0) {
+                                             language) != 0) {
             free_string_array(arguments, argument_count);
             return CBM_NOT_FOUND;
         }
@@ -1064,7 +1131,7 @@ static int parse_embedded_commands(cbm_pipeline_ctx_t *ctx,
 static int parse_embedded_manifest(cbm_pipeline_ctx_t *ctx,
                                    cbm_compile_context_index_t *index,
                                    const uint8_t *bytes, size_t byte_count,
-                                   const cbm_file_info_t *source_files, int source_count,
+                                   cbm_file_info_t *source_files, int source_count,
                                    bool *matched) {
     *matched = false;
     if (!bytes || byte_count == 0) {
@@ -1210,8 +1277,17 @@ static bool has_c_family_file(const cbm_file_info_t *files, int count) {
     return false;
 }
 
+static bool has_compiler_ambiguous_file(const cbm_file_info_t *files, int count) {
+    for (int i = 0; i < count; i++) {
+        if (compiler_ambiguous_fragment_filename(files[i].rel_path)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 int cbm_compile_context_index_prepare(cbm_pipeline_ctx_t *ctx,
-                                      const cbm_file_info_t *source_files, int source_count,
+                                      cbm_file_info_t *source_files, int source_count,
                                       const uint8_t *embedded_bytes, size_t embedded_byte_count,
                                       cbm_compile_context_index_t **out_index) {
     if (!ctx || !source_files || source_count < 0 || !out_index) {
@@ -1224,7 +1300,9 @@ int cbm_compile_context_index_prepare(cbm_pipeline_ctx_t *ctx,
                             "the immutable compilation-context index could not be allocated",
                             "free memory and retry the unchanged corpus");
     }
-    if (!has_c_family_file(source_files, source_count)) {
+    bool has_c_family = has_c_family_file(source_files, source_count);
+    bool has_ambiguous_fragment = has_compiler_ambiguous_file(source_files, source_count);
+    if (!has_c_family && (!has_ambiguous_fragment || !embedded_bytes || embedded_byte_count == 0)) {
         cbm_log_info("compile_context.ready", "c_family_files", "0", "translation_units", "0",
                      "bound_files", "0", "configuration_absent_files", "0", "empty_files", "0",
                      "file_context_bindings", "0", "authority", "not_applicable", "cache_builds",
@@ -1267,6 +1345,38 @@ const CBMPreprocessContextSet *cbm_compile_context_for_file(
                                                  index->sets_by_rel_path, rel_path)
                                            : NULL;
     return set ? &set->view : NULL;
+}
+
+bool cbm_compile_context_language_metadata(
+    const cbm_compile_context_index_t *index, const char *rel_path,
+    cbm_compile_context_language_metadata_t *out) {
+    if (!index || !rel_path || !out) {
+        return false;
+    }
+    compile_context_set_owner_t *set = index->sets_by_rel_path
+                                           ? (compile_context_set_owner_t *)cbm_ht_get(
+                                                 index->sets_by_rel_path, rel_path)
+                                           : NULL;
+    if (!set) {
+        return false;
+    }
+    memset(out, 0, sizeof(*out));
+    out->declared_language = set->declared_language;
+    out->owners = &set->view;
+    out->ambiguous_fragment = compiler_ambiguous_fragment_filename(rel_path);
+    out->compiler_language_applied = set->compiler_language_applied;
+    out->provenance = set->compiler_language_applied ? "exact_compiler_dependency"
+                                                     : "declared_extension";
+    if (set->has_c_owner && set->has_cpp_owner) {
+        out->effective_family = "c/c++";
+    } else if (set->has_cpp_owner) {
+        out->effective_family = "c++";
+    } else if (set->has_c_owner) {
+        out->effective_family = "c";
+    } else {
+        out->effective_family = cbm_language_name(set->declared_language);
+    }
+    return true;
 }
 
 static const compile_context_owner_t *find_context_by_id(

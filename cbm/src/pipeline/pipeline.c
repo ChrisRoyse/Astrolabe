@@ -57,6 +57,7 @@ enum {
 #include "helpers.h"
 
 #include <stdint.h>
+#include <ctype.h>
 #include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -409,6 +410,66 @@ static int capture_compile_context_diagnostics(cbm_pipeline_t *p,
     return 0;
 }
 
+static bool file_property_context_id_is_canonical(const char *context_id) {
+    if (!context_id || strlen(context_id) != CBM_SHA256_HEX_LEN) {
+        return false;
+    }
+    for (const unsigned char *at = (const unsigned char *)context_id; *at; at++) {
+        if (!isxdigit(*at)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+size_t cbm_pipeline_file_properties_capacity(cbm_pipeline_t *pipeline,
+                                             const cbm_file_info_t *file) {
+    if (!pipeline || !file || !file->rel_path) {
+        return 0;
+    }
+    const char *slash = strrchr(file->rel_path, '/');
+    const char *basename = slash ? slash + SKIP_ONE : file->rel_path;
+    const char *extension = strrchr(basename, '.');
+    extension = extension ? extension : "";
+    size_t extension_len = strlen(extension);
+    if (extension_len > (SIZE_MAX - CBM_SZ_512) / 6) {
+        cbm_pipeline_record_fatal_error(
+            pipeline, "CBM_FILE_PROPERTIES_EXTENSION_OVERFLOW", "escape_file_extension",
+            "structure", file->rel_path, extension_len,
+            "a file extension exceeds the bounded JSON representation",
+            "rename the malformed path or extend the file-property representation");
+        return 0;
+    }
+    size_t capacity = CBM_SZ_512 + extension_len * 6;
+    cbm_compile_context_language_metadata_t metadata;
+    if (cbm_compile_context_language_metadata(pipeline->compile_contexts, file->rel_path,
+                                              &metadata) &&
+        metadata.owners) {
+        for (size_t i = 0; i < metadata.owners->count; i++) {
+            const char *context_id = metadata.owners->items[i].context_id;
+            if (!file_property_context_id_is_canonical(context_id)) {
+                cbm_pipeline_record_fatal_error(
+                    pipeline, "CBM_COMPILE_CONTEXT_ID_INVALID", "size_file_properties",
+                    "structure", file->rel_path, i,
+                    "a File atom owner has a malformed compilation-context identity",
+                    "preserve the manifest and regenerate its exact context identities");
+                return 0;
+            }
+            size_t id_len = strlen(context_id);
+            if (capacity > SIZE_MAX - id_len - 4) {
+                cbm_pipeline_record_fatal_error(
+                    pipeline, "CBM_FILE_PROPERTIES_CAPACITY_OVERFLOW",
+                    "size_file_properties", "structure", file->rel_path, i,
+                    "File atom owner metadata exceeds addressable representation",
+                    "reduce contradictory build variants or extend the representation");
+                return 0;
+            }
+            capacity += id_len + 4;
+        }
+    }
+    return capacity;
+}
+
 int cbm_pipeline_format_file_properties(cbm_pipeline_t *pipeline,
                                         const cbm_file_info_t *file, char *out,
                                         size_t out_capacity) {
@@ -444,16 +505,21 @@ int cbm_pipeline_format_file_properties(cbm_pipeline_t *pipeline,
     cbm_compile_context_file_state_t state = cbm_compile_context_file_state(
         pipeline->compile_contexts, file->rel_path, file->language, file->size,
         &context_count);
+    cbm_compile_context_language_metadata_t metadata;
+    bool has_metadata = cbm_compile_context_language_metadata(
+        pipeline->compile_contexts, file->rel_path, &metadata);
+    bool include_language_metadata =
+        has_metadata && (metadata.ambiguous_fragment || state == CBM_COMPILE_CONTEXT_BOUND);
     int written = 0;
     switch (state) {
     case CBM_COMPILE_CONTEXT_NOT_APPLICABLE:
-        written = snprintf(out, out_capacity, "{\"extension\":\"%s\"}", escaped_extension);
+        written = snprintf(out, out_capacity, "{\"extension\":\"%s\"", escaped_extension);
         break;
     case CBM_COMPILE_CONTEXT_EMPTY_SOURCE:
         written = snprintf(
             out, out_capacity,
             "{\"extension\":\"%s\",\"compile_context_state\":\"empty\","
-            "\"compile_context_reason\":\"empty_source\",\"compile_context_count\":0}",
+            "\"compile_context_reason\":\"empty_source\",\"compile_context_count\":0",
             escaped_extension);
         break;
     case CBM_COMPILE_CONTEXT_CONFIGURATION_ABSENT:
@@ -461,13 +527,13 @@ int cbm_pipeline_format_file_properties(cbm_pipeline_t *pipeline,
             out, out_capacity,
             "{\"extension\":\"%s\",\"compile_context_state\":\"configuration_absent\","
             "\"compile_context_code\":\"CBM_COMPILE_CONTEXT_CONFIGURATION_ABSENT\","
-            "\"compile_context_reason\":\"%s\",\"compile_context_count\":0}",
+            "\"compile_context_reason\":\"%s\",\"compile_context_count\":0",
             escaped_extension, cbm_compile_context_absence_reason(pipeline->compile_contexts));
         break;
     case CBM_COMPILE_CONTEXT_BOUND:
         written = snprintf(out, out_capacity,
                            "{\"extension\":\"%s\",\"compile_context_state\":\"bound\","
-                           "\"compile_context_count\":%zu}",
+                           "\"compile_context_count\":%zu",
                            escaped_extension, context_count);
         break;
     case CBM_COMPILE_CONTEXT_STATE_INVALID:
@@ -480,13 +546,56 @@ int cbm_pipeline_format_file_properties(cbm_pipeline_t *pipeline,
         free(escaped_extension);
         return CBM_NOT_FOUND;
     }
-    free(escaped_extension);
     if (written <= 0 || (size_t)written >= out_capacity) {
         cbm_pipeline_record_fatal_error(
             pipeline, "CBM_FILE_PROPERTIES_CAPACITY_EXCEEDED", "format_file_properties",
             "structure", file->rel_path, written > 0 ? (size_t)written : 0,
             "the complete File atom properties exceed their bounded representation",
             "extend the File property representation and retry the unchanged corpus");
+        free(escaped_extension);
+        return CBM_NOT_FOUND;
+    }
+    size_t used = (size_t)written;
+    if (include_language_metadata) {
+        const char *declared = cbm_language_name(metadata.declared_language);
+        const char *effective = cbm_language_name(file->language);
+        written = snprintf(
+            out + used, out_capacity - used,
+            ",\"declared_language\":\"%s\",\"effective_language\":\"%s\","
+            "\"effective_language_family\":\"%s\",\"language_provenance\":\"%s\","
+            "\"compiler_language_applied\":%s,\"compile_context_ids\":[",
+            declared, effective, metadata.effective_family, metadata.provenance,
+            metadata.compiler_language_applied ? "true" : "false");
+        if (written <= 0 || (size_t)written >= out_capacity - used) {
+            free(escaped_extension);
+            return CBM_NOT_FOUND;
+        }
+        used += (size_t)written;
+        for (size_t i = 0; i < metadata.owners->count; i++) {
+            const char *context_id = metadata.owners->items[i].context_id;
+            if (!file_property_context_id_is_canonical(context_id)) {
+                free(escaped_extension);
+                return CBM_NOT_FOUND;
+            }
+            written = snprintf(out + used, out_capacity - used, "%s\"%s\"",
+                               i == 0 ? "" : ",", context_id);
+            if (written <= 0 || (size_t)written >= out_capacity - used) {
+                free(escaped_extension);
+                return CBM_NOT_FOUND;
+            }
+            used += (size_t)written;
+        }
+        written = snprintf(out + used, out_capacity - used, "]}");
+    } else {
+        written = snprintf(out + used, out_capacity - used, "}");
+    }
+    free(escaped_extension);
+    if (written <= 0 || (size_t)written >= out_capacity - used) {
+        cbm_pipeline_record_fatal_error(
+            pipeline, "CBM_FILE_PROPERTIES_CAPACITY_EXCEEDED", "finish_file_properties",
+            "structure", file->rel_path, used,
+            "the complete File atom properties exceed their measured representation",
+            "preserve the context inventory and extend its representation");
         return CBM_NOT_FOUND;
     }
     return 0;
@@ -1668,8 +1777,24 @@ static int pass_structure(cbm_pipeline_t *p, const cbm_file_info_t *files, int f
         const char *slash = strrchr(rel, '/');
         const char *basename = slash ? slash + SKIP_ONE : rel;
 
-        char props[CBM_SZ_1K];
-        if (cbm_pipeline_format_file_properties(p, &files[i], props, sizeof(props)) != 0) {
+        size_t props_capacity = cbm_pipeline_file_properties_capacity(p, &files[i]);
+        char props_stack[CBM_SZ_1K];
+        bool props_heap_owned = props_capacity > sizeof(props_stack);
+        char *props = !props_capacity
+                          ? NULL
+                          : (props_heap_owned ? malloc(props_capacity) : props_stack);
+        if (!props && props_capacity) {
+            cbm_pipeline_record_fatal_error(
+                p, "CBM_FILE_PROPERTIES_ALLOC_FAILED", "allocate_file_properties",
+                "structure", files[i].rel_path, props_capacity,
+                "the complete File atom properties could not be allocated",
+                "free memory and retry the unchanged corpus");
+        }
+        if (!props ||
+            cbm_pipeline_format_file_properties(p, &files[i], props, props_capacity) != 0) {
+            if (props_heap_owned) {
+                free(props);
+            }
             free(file_qn);
             cbm_ht_foreach(seen_dirs, free_seen_dir_key, NULL);
             cbm_ht_free(seen_dirs);
@@ -1687,6 +1812,9 @@ static int pass_structure(cbm_pipeline_t *p, const cbm_file_info_t *files, int f
                           "remediation",
                           "preserve the slab diagnostic and retry the complete unchanged corpus");
             free(file_qn);
+            if (props_heap_owned) {
+                free(props);
+            }
             cbm_ht_foreach(seen_dirs, free_seen_dir_key, NULL);
             cbm_ht_free(seen_dirs);
             return CBM_NOT_FOUND;
@@ -1695,6 +1823,9 @@ static int pass_structure(cbm_pipeline_t *p, const cbm_file_info_t *files, int f
             cbm_gbuf_upsert_source_node_borrowed(p->gbuf, "File", basename, qualified_name,
                                                  file_path, 0, 0, source_bytes, source_len, 0,
                                                  (uint64_t)source_len, props);
+        if (props_heap_owned) {
+            free(props);
+        }
         if (file_id <= 0) {
             free(file_qn);
             cbm_ht_foreach(seen_dirs, free_seen_dir_key, NULL);
@@ -3766,6 +3897,35 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
         p->embedded_compilation_context_bytes, &p->compile_contexts);
     cbm_pipeline_phase_probe_end(p, "compile_context", &compile_context_probe);
     if (rc != 0) {
+        goto cleanup;
+    }
+    source_index = 0;
+    for (int i = 0; i < file_count; i++) {
+        if (files[i].auxiliary) {
+            continue;
+        }
+        if (source_index >= source_count ||
+            strcmp(files[i].rel_path, source_files[source_index].rel_path) != 0) {
+            cbm_pipeline_record_fatal_error(
+                p, "CBM_COMPILE_CONTEXT_SOURCE_VIEW_DRIFT",
+                "publish_effective_source_languages", "compile_context",
+                files[i].rel_path ? files[i].rel_path : "", (size_t)source_index,
+                "the source-only view no longer aligns with complete discovery",
+                "preserve the generation and rebuild its immutable source/context index");
+            rc = CBM_NOT_FOUND;
+            goto cleanup;
+        }
+        files[i].language = source_files[source_index].language;
+        source_index++;
+    }
+    if (source_index != source_count) {
+        cbm_pipeline_record_fatal_error(
+            p, "CBM_COMPILE_CONTEXT_SOURCE_VIEW_DRIFT",
+            "publish_effective_source_languages", "compile_context", p->repo_path,
+            (size_t)source_index,
+            "the source-only view contains entries absent from complete discovery",
+            "preserve the generation and rebuild its immutable source/context index");
+        rc = CBM_NOT_FOUND;
         goto cleanup;
     }
     rc = capture_compile_context_diagnostics(p, source_files, source_count);
