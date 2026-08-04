@@ -1,5 +1,6 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
+use std::collections::BTreeMap;
 use std::convert::TryFrom;
 use std::error::Error;
 use std::ffi::{CStr, CString, NulError};
@@ -10,6 +11,7 @@ use std::marker::PhantomData;
 use std::os::raw::{c_char, c_int, c_void};
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Output, Stdio};
 use std::ptr::{self, NonNull};
 use std::rc::Rc;
 use std::sync::OnceLock;
@@ -1918,17 +1920,779 @@ impl PipelineRowSinkState {
     }
 }
 
+#[derive(Debug)]
+struct RepositoryCompileCommand {
+    file: String,
+    directory: String,
+    arguments: Vec<String>,
+    dependencies: Vec<String>,
+    predefined_macros: Vec<String>,
+    system_include_paths: Vec<String>,
+}
+
+fn normalized_path(path: &Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
+}
+
+fn canonical_path(path: &Path, code: &str, purpose: &str) -> Result<PathBuf, BridgeError> {
+    path.canonicalize().map_err(|error| {
+        envelope(
+            code,
+            format!("cannot resolve {purpose} at {}: {error}", path.display()),
+            "Correct the recorded repository/build path and regenerate compile_commands.json.",
+        )
+    })
+}
+
+fn path_within_repo(repo_root: &Path, path: &Path) -> Option<String> {
+    let canonical = path.canonicalize().ok()?;
+    let relative = canonical.strip_prefix(repo_root).ok()?;
+    Some(normalized_path(relative))
+}
+
+fn command_entry_arguments(
+    entry: &serde_json::Value,
+    file: &str,
+) -> Result<Vec<String>, BridgeError> {
+    if let Some(arguments) = entry.get("arguments") {
+        let array = arguments.as_array().ok_or_else(|| {
+            envelope(
+                "ASTRO_COMPILE_CONTEXT_ARGUMENTS_INVALID",
+                format!("compilation command for {file} has a non-array arguments field"),
+                "Regenerate compile_commands.json with one exact string argv array per entry.",
+            )
+        })?;
+        let mut argv = Vec::with_capacity(array.len());
+        for argument in array {
+            let argument = argument.as_str().ok_or_else(|| {
+                envelope(
+                    "ASTRO_COMPILE_CONTEXT_ARGUMENT_INVALID",
+                    format!("compilation command for {file} contains a non-string argument"),
+                    "Regenerate compile_commands.json without lossy or typed argv elements.",
+                )
+            })?;
+            if argument.is_empty() {
+                return Err(envelope(
+                    "ASTRO_COMPILE_CONTEXT_ARGUMENT_EMPTY",
+                    format!("compilation command for {file} contains an empty argv element"),
+                    "Regenerate the compilation database from the real build invocation.",
+                ));
+            }
+            argv.push(argument.to_owned());
+        }
+        if argv.is_empty() {
+            return Err(envelope(
+                "ASTRO_COMPILE_CONTEXT_ARGUMENTS_EMPTY",
+                format!("compilation command for {file} has an empty argv"),
+                "Regenerate compile_commands.json from the real build invocation.",
+            ));
+        }
+        return Ok(argv);
+    }
+
+    let command = entry
+        .get("command")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| {
+            envelope(
+                "ASTRO_COMPILE_CONTEXT_COMMAND_MISSING",
+                format!("compilation command for {file} has neither arguments nor command"),
+                "Regenerate compile_commands.json with one complete command per translation unit.",
+            )
+        })?;
+    split_native_command_line(command, file)
+}
+
+#[cfg(windows)]
+fn split_native_command_line(command: &str, file: &str) -> Result<Vec<String>, BridgeError> {
+    use std::ffi::OsStr;
+    use std::os::windows::ffi::OsStrExt;
+
+    #[link(name = "shell32")]
+    unsafe extern "system" {
+        fn CommandLineToArgvW(command_line: *const u16, argument_count: *mut i32) -> *mut *mut u16;
+    }
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn LocalFree(memory: *mut c_void) -> *mut c_void;
+    }
+
+    let wide = OsStr::new(command)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let mut count = 0i32;
+    // SAFETY: `wide` is NUL-terminated and `count` is a writable out parameter.
+    let raw = unsafe { CommandLineToArgvW(wide.as_ptr(), &mut count) };
+    if raw.is_null() || count <= 0 {
+        return Err(envelope(
+            "ASTRO_COMPILE_CONTEXT_COMMAND_PARSE_FAILED",
+            format!("native Windows argv parsing failed for compilation command {file}"),
+            "Regenerate compile_commands.json with the arguments array form.",
+        ));
+    }
+    let mut result = Vec::with_capacity(count as usize);
+    for index in 0..count as usize {
+        // SAFETY: CommandLineToArgvW returned an array containing `count` pointers,
+        // each to a NUL-terminated UTF-16 argument owned by `raw`.
+        let argument = unsafe {
+            let pointer = *raw.add(index);
+            let mut length = 0usize;
+            while *pointer.add(length) != 0 {
+                length += 1;
+            }
+            String::from_utf16(std::slice::from_raw_parts(pointer, length))
+        };
+        match argument {
+            Ok(argument) if !argument.is_empty() => result.push(argument),
+            Ok(_) => {
+                // SAFETY: `raw` is the allocation returned by CommandLineToArgvW.
+                unsafe { LocalFree(raw.cast()) };
+                return Err(envelope(
+                    "ASTRO_COMPILE_CONTEXT_ARGUMENT_EMPTY",
+                    format!("native command parsing produced an empty argv element for {file}"),
+                    "Regenerate compile_commands.json with the arguments array form.",
+                ));
+            }
+            Err(error) => {
+                // SAFETY: `raw` is the allocation returned by CommandLineToArgvW.
+                unsafe { LocalFree(raw.cast()) };
+                return Err(envelope(
+                    "ASTRO_COMPILE_CONTEXT_COMMAND_UTF16_INVALID",
+                    format!("native command parsing produced invalid UTF-16 for {file}: {error}"),
+                    "Regenerate compile_commands.json with UTF-8 arguments.",
+                ));
+            }
+        }
+    }
+    // SAFETY: `raw` is released once after every argument has been copied.
+    unsafe { LocalFree(raw.cast()) };
+    Ok(result)
+}
+
+#[cfg(not(windows))]
+fn split_native_command_line(_command: &str, file: &str) -> Result<Vec<String>, BridgeError> {
+    Err(envelope(
+        "ASTRO_COMPILE_CONTEXT_COMMAND_PLATFORM_DEFERRED",
+        format!("native command parsing is not implemented for {file} on this deferred platform"),
+        "Use the compilation database arguments array form until the cross-platform phase.",
+    ))
+}
+
+fn resolve_command_program(directory: &Path, program: &str) -> String {
+    let path = Path::new(program);
+    if path.is_absolute() || (!program.contains('/') && !program.contains('\\')) {
+        return program.to_owned();
+    }
+    normalized_path(&directory.join(path))
+}
+
+fn option_consumes_value(argument: &str) -> bool {
+    matches!(argument, "-o" | "-MF" | "-MT" | "-MQ" | "-MJ" | "-x")
+}
+
+fn is_dependency_or_output_option(argument: &str) -> bool {
+    matches!(
+        argument,
+        "-c" | "-M" | "-MM" | "-MD" | "-MMD" | "-MP" | "-MG"
+    ) || (argument.starts_with("-o") && argument.len() > 2)
+        || (argument.starts_with("-MF") && argument.len() > 3)
+        || (argument.starts_with("-MT") && argument.len() > 3)
+        || (argument.starts_with("-MQ") && argument.len() > 3)
+        || (argument.starts_with("-MJ") && argument.len() > 3)
+}
+
+fn argument_is_translation_unit(argument: &str, directory: &Path, file: &Path) -> bool {
+    let candidate = Path::new(argument);
+    let candidate = if candidate.is_absolute() {
+        candidate.to_path_buf()
+    } else {
+        directory.join(candidate)
+    };
+    candidate
+        .canonicalize()
+        .is_ok_and(|candidate| candidate == file)
+}
+
+fn context_compiler_arguments(
+    arguments: &[String],
+    directory: &Path,
+    file: &Path,
+    keep_language: bool,
+) -> Result<Vec<String>, BridgeError> {
+    if arguments.is_empty() {
+        return Err(envelope(
+            "ASTRO_COMPILE_CONTEXT_ARGUMENTS_EMPTY",
+            format!("translation unit {} has no compiler argv", file.display()),
+            "Regenerate compile_commands.json from the real build.",
+        ));
+    }
+    let mut result = vec![resolve_command_program(directory, &arguments[0])];
+    let mut index = 1usize;
+    while index < arguments.len() {
+        let argument = &arguments[index];
+        if argument.starts_with('@') {
+            return Err(envelope(
+                "ASTRO_COMPILE_CONTEXT_RESPONSE_FILE_OPAQUE",
+                format!(
+                    "translation unit {} uses opaque response file {argument}",
+                    file.display()
+                ),
+                "Generate compile_commands.json with the response-file arguments expanded.",
+            ));
+        }
+        if option_consumes_value(argument) {
+            if index + 1 >= arguments.len() {
+                return Err(envelope(
+                    "ASTRO_COMPILE_CONTEXT_OPTION_VALUE_MISSING",
+                    format!(
+                        "translation unit {} ends after option {argument}",
+                        file.display()
+                    ),
+                    "Regenerate the compilation database from a successful real build.",
+                ));
+            }
+            if keep_language && argument == "-x" {
+                result.push(argument.clone());
+                result.push(arguments[index + 1].clone());
+            }
+            index += 2;
+            continue;
+        }
+        if !is_dependency_or_output_option(argument)
+            && !argument_is_translation_unit(argument, directory, file)
+        {
+            result.push(argument.clone());
+        }
+        index += 1;
+    }
+    Ok(result)
+}
+
+fn translation_unit_language(
+    arguments: &[String],
+    file: &Path,
+) -> Result<&'static str, BridgeError> {
+    let mut index = 0usize;
+    while index < arguments.len() {
+        if arguments[index] == "-x" && index + 1 < arguments.len() {
+            return match arguments[index + 1].as_str() {
+                "c" | "c-header" => Ok("c"),
+                "c++" | "c++-header" | "cuda" => Ok("c++"),
+                language => Err(envelope(
+                    "ASTRO_COMPILE_CONTEXT_LANGUAGE_UNSUPPORTED",
+                    format!(
+                        "translation unit {} declares unsupported -x {language}",
+                        file.display()
+                    ),
+                    "Provide a C, C++, or CUDA compilation command for this C-family source.",
+                )),
+            };
+        }
+        index += 1;
+    }
+    let extension = file
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or_default();
+    if extension.eq_ignore_ascii_case("c") {
+        Ok("c")
+    } else if ["cc", "cpp", "cxx", "c++", "cu"]
+        .iter()
+        .any(|candidate| extension.eq_ignore_ascii_case(candidate))
+    {
+        Ok("c++")
+    } else {
+        Err(envelope(
+            "ASTRO_COMPILE_CONTEXT_LANGUAGE_UNKNOWN",
+            format!(
+                "cannot derive C-family language for translation unit {}",
+                file.display()
+            ),
+            "Add an exact -x language argument or use a conventional C/C++/CUDA extension.",
+        ))
+    }
+}
+
+fn run_context_compiler(
+    arguments: &[String],
+    directory: &Path,
+    operation: &str,
+    file: &Path,
+) -> Result<Output, BridgeError> {
+    let output = Command::new(&arguments[0])
+        .args(&arguments[1..])
+        .current_dir(directory)
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|error| {
+            envelope(
+                "ASTRO_COMPILE_CONTEXT_COMPILER_UNREACHABLE",
+                format!("cannot execute compiler during {operation} for {}: {error}", file.display()),
+                "Restore the exact compiler named by compile_commands.json to PATH or its recorded path.",
+            )
+        })?;
+    if output.status.success() {
+        return Ok(output);
+    }
+    Err(BridgeError::new(
+        ErrorEnvelope::new(
+            "ASTRO_COMPILE_CONTEXT_COMPILER_FAILED",
+            format!("compiler {operation} failed for {} with {}", file.display(), output.status),
+            "Read stderr, repair the real compilation command/build inputs, and regenerate the database.",
+        )
+        .with_stderr(String::from_utf8_lossy(&output.stderr)),
+    ))
+}
+
+fn parse_compiler_baseline(
+    stdout: &[u8],
+    stderr: &[u8],
+    file: &Path,
+) -> Result<(Vec<String>, Vec<String>), BridgeError> {
+    let stdout = std::str::from_utf8(stdout).map_err(|error| {
+        envelope(
+            "ASTRO_COMPILE_CONTEXT_PREDEFINES_UTF8_INVALID",
+            format!(
+                "compiler predefines for {} are not UTF-8: {error}",
+                file.display()
+            ),
+            "Use a compiler that emits UTF-8 diagnostics and predefined macro text.",
+        )
+    })?;
+    let stderr = std::str::from_utf8(stderr).map_err(|error| {
+        envelope(
+            "ASTRO_COMPILE_CONTEXT_INCLUDE_SEARCH_UTF8_INVALID",
+            format!(
+                "compiler include-search output for {} is not UTF-8: {error}",
+                file.display()
+            ),
+            "Use a compiler that emits UTF-8 include-search diagnostics.",
+        )
+    })?;
+    let predefined_macros = stdout
+        .lines()
+        .filter_map(|line| line.strip_prefix("#define "))
+        .map(|definition| match definition.find(char::is_whitespace) {
+            Some(index) => format!(
+                "{}={}",
+                &definition[..index],
+                definition[index..].trim_start()
+            ),
+            None => definition.to_owned(),
+        })
+        .collect::<Vec<_>>();
+    if predefined_macros.is_empty() {
+        return Err(envelope(
+            "ASTRO_COMPILE_CONTEXT_PREDEFINES_MISSING",
+            format!(
+                "compiler reported no predefined macros for {}",
+                file.display()
+            ),
+            "Use a compiler driver supporting exact -dM -E preprocessing queries.",
+        ));
+    }
+    let mut include_paths = Vec::new();
+    let mut reading = false;
+    for line in stderr.lines() {
+        let line = line.trim();
+        if line == "#include <...> search starts here:" {
+            reading = true;
+            continue;
+        }
+        if line == "End of search list." {
+            break;
+        }
+        if reading && !line.is_empty() {
+            include_paths.push(
+                line.strip_suffix(" (framework directory)")
+                    .unwrap_or(line)
+                    .replace('\\', "/"),
+            );
+        }
+    }
+    if include_paths.is_empty() {
+        return Err(envelope(
+            "ASTRO_COMPILE_CONTEXT_SYSTEM_INCLUDES_MISSING",
+            format!(
+                "compiler reported no system include roots for {}",
+                file.display()
+            ),
+            "Use a compiler driver supporting exact -E -v include-search queries.",
+        ));
+    }
+    Ok((predefined_macros, include_paths))
+}
+
+fn inferred_standard(
+    macros: &[String],
+    language: &str,
+    file: &Path,
+) -> Result<String, BridgeError> {
+    let macro_value = |name: &str| {
+        macros.iter().find_map(|definition| {
+            definition
+                .strip_prefix(name)
+                .and_then(|value| value.strip_prefix('='))
+        })
+    };
+    let gnu = macro_value("__STRICT_ANSI__").is_none();
+    let (base, suffix) = if language == "c++" {
+        let value = macro_value("__cplusplus").ok_or_else(|| {
+            envelope(
+                "ASTRO_COMPILE_CONTEXT_STANDARD_FACT_MISSING",
+                format!("compiler did not report __cplusplus for {}", file.display()),
+                "Correct the translation-unit language/compiler command and regenerate the database.",
+            )
+        })?;
+        let digits = value.trim_end_matches(|character: char| !character.is_ascii_digit());
+        let standard = match digits.parse::<u64>().unwrap_or(0) {
+            0..=201_102 => "98",
+            201_103..=201_401 => "11",
+            201_402..=201_702 => "14",
+            201_703..=202_001 => "17",
+            202_002..=202_301 => "20",
+            202_302..=202_599 => "23",
+            _ => "26",
+        };
+        (if gnu { "gnu++" } else { "c++" }, standard)
+    } else {
+        let value = macro_value("__STDC_VERSION__").unwrap_or("199409L");
+        let digits = value.trim_end_matches(|character: char| !character.is_ascii_digit());
+        let standard = match digits.parse::<u64>().unwrap_or(0) {
+            0..=199_899 => "90",
+            199_900..=201_111 => "99",
+            201_112..=201_709 => "11",
+            201_710..=202_310 => "17",
+            _ => "23",
+        };
+        (if gnu { "gnu" } else { "c" }, standard)
+    };
+    Ok(format!("{base}{suffix}"))
+}
+
+fn parse_make_dependencies(
+    text: &[u8],
+    repo_root: &Path,
+    directory: &Path,
+    file: &Path,
+) -> Result<Vec<String>, BridgeError> {
+    let text = std::str::from_utf8(text).map_err(|error| {
+        envelope(
+            "ASTRO_COMPILE_CONTEXT_DEPENDENCIES_UTF8_INVALID",
+            format!(
+                "compiler dependencies for {} are not UTF-8: {error}",
+                file.display()
+            ),
+            "Use a compiler that emits UTF-8 Make dependency records.",
+        )
+    })?;
+    let text = text.replace("\\\r\n", " ").replace("\\\n", " ");
+    let dependencies = text.strip_prefix("astrolabe-context:").ok_or_else(|| {
+        envelope(
+            "ASTRO_COMPILE_CONTEXT_DEPENDENCY_TARGET_INVALID",
+            format!(
+                "compiler dependency output for {} lacks the bound target",
+                file.display()
+            ),
+            "Use a compiler supporting -M -MT astrolabe-context dependency output.",
+        )
+    })?;
+    let mut tokens = Vec::new();
+    let mut token = String::new();
+    let mut characters = dependencies.chars().peekable();
+    while let Some(character) = characters.next() {
+        if character == '\\' {
+            match characters.peek().copied() {
+                Some(next) if next.is_whitespace() || next == '\\' => {
+                    token.push(characters.next().expect("peeked dependency character"));
+                }
+                _ => token.push(character),
+            }
+        } else if character.is_whitespace() {
+            if !token.is_empty() {
+                tokens.push(std::mem::take(&mut token));
+            }
+        } else {
+            token.push(character);
+        }
+    }
+    if !token.is_empty() {
+        tokens.push(token);
+    }
+    let mut relative = Vec::new();
+    for token in tokens {
+        let path = Path::new(&token);
+        let path = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            directory.join(path)
+        };
+        if let Some(path) = path_within_repo(repo_root, &path) {
+            relative.push(path);
+        }
+    }
+    relative.sort();
+    relative.dedup();
+    let source = path_within_repo(repo_root, file).ok_or_else(|| {
+        envelope(
+            "ASTRO_COMPILE_CONTEXT_TU_OUTSIDE_REPOSITORY",
+            format!(
+                "translation unit {} is outside the repository",
+                file.display()
+            ),
+            "Regenerate compile_commands.json for the indexed repository root.",
+        )
+    })?;
+    if !relative.iter().any(|dependency| dependency == &source) {
+        return Err(envelope(
+            "ASTRO_COMPILE_CONTEXT_DEPENDENCY_TU_MISSING",
+            format!("compiler dependency closure omits translation unit {source}"),
+            "Repair the compiler dependency output before indexing.",
+        ));
+    }
+    Ok(relative)
+}
+
+fn capture_repository_compile_command(
+    repo_root: &Path,
+    entry: &serde_json::Value,
+) -> Result<Option<RepositoryCompileCommand>, BridgeError> {
+    let file_text = entry
+        .get("file")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| {
+            envelope(
+                "ASTRO_COMPILE_CONTEXT_FILE_MISSING",
+                "a compilation database entry has no file",
+                "Regenerate compile_commands.json with complete entries.",
+            )
+        })?;
+    let directory_text = entry
+        .get("directory")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| {
+            envelope(
+                "ASTRO_COMPILE_CONTEXT_DIRECTORY_MISSING",
+                format!("compilation command for {file_text} has no directory"),
+                "Regenerate compile_commands.json with an exact working directory per entry.",
+            )
+        })?;
+    let directory = canonical_path(
+        Path::new(directory_text),
+        "ASTRO_COMPILE_CONTEXT_DIRECTORY_UNRESOLVED",
+        "compilation working directory",
+    )?;
+    let file_path = Path::new(file_text);
+    let file_path = if file_path.is_absolute() {
+        file_path.to_path_buf()
+    } else {
+        directory.join(file_path)
+    };
+    let file_path = canonical_path(
+        &file_path,
+        "ASTRO_COMPILE_CONTEXT_FILE_UNRESOLVED",
+        "translation unit",
+    )?;
+    let Some(file) = path_within_repo(repo_root, &file_path) else {
+        return Ok(None);
+    };
+    let mut arguments = command_entry_arguments(entry, &file)?;
+    let language = translation_unit_language(&arguments, &file_path)?;
+
+    let mut baseline_arguments =
+        context_compiler_arguments(&arguments, &directory, &file_path, false)?;
+    baseline_arguments.extend([
+        "-dM".to_owned(),
+        "-E".to_owned(),
+        "-v".to_owned(),
+        "-x".to_owned(),
+        language.to_owned(),
+        "-".to_owned(),
+    ]);
+    let baseline_output = run_context_compiler(
+        &baseline_arguments,
+        &directory,
+        "baseline query",
+        &file_path,
+    )?;
+    let (predefined_macros, system_include_paths) =
+        parse_compiler_baseline(&baseline_output.stdout, &baseline_output.stderr, &file_path)?;
+    if !arguments
+        .iter()
+        .any(|argument| argument.starts_with("-std="))
+    {
+        arguments.push(format!(
+            "-std={}",
+            inferred_standard(&predefined_macros, language, &file_path)?
+        ));
+    }
+
+    let mut dependency_arguments =
+        context_compiler_arguments(&arguments, &directory, &file_path, true)?;
+    dependency_arguments.extend([
+        "-M".to_owned(),
+        "-MT".to_owned(),
+        "astrolabe-context".to_owned(),
+        normalized_path(&file_path),
+    ]);
+    let dependency_output = run_context_compiler(
+        &dependency_arguments,
+        &directory,
+        "dependency closure",
+        &file_path,
+    )?;
+    let dependencies =
+        parse_make_dependencies(&dependency_output.stdout, repo_root, &directory, &file_path)?;
+    Ok(Some(RepositoryCompileCommand {
+        file,
+        directory: normalized_path(&directory),
+        arguments,
+        dependencies,
+        predefined_macros,
+        system_include_paths,
+    }))
+}
+
+fn compilation_context_for_repo(repo_path: &str) -> Result<Vec<u8>, BridgeError> {
+    let repo_root = canonical_path(
+        Path::new(repo_path),
+        "ASTRO_COMPILE_CONTEXT_REPOSITORY_UNRESOLVED",
+        "repository root",
+    )?;
+    let embedded: serde_json::Value =
+        serde_json::from_slice(cbm_sys::ASTROLABE_BUILD_COMPILATION_CONTEXT).map_err(|error| {
+            envelope(
+                "ASTRO_COMPILE_CONTEXT_EMBEDDED_MALFORMED",
+                format!("artifact compilation context is malformed: {error}"),
+                "Rebuild Astrolabe from the canonical source tree.",
+            )
+        })?;
+    if embedded
+        .get("source_root")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|source_root| Path::new(source_root).canonicalize().ok())
+        .is_some_and(|source_root| source_root == repo_root)
+    {
+        return Ok(cbm_sys::ASTROLABE_BUILD_COMPILATION_CONTEXT.to_vec());
+    }
+
+    let database_path = repo_root.join("compile_commands.json");
+    if !database_path.exists() {
+        // A Rust-only repository needs no C-family context. The C pipeline checks
+        // its immutable discovered language set first; a repository that does
+        // contain C-family atoms then fails with CBM_COMPILE_CONTEXT_DATABASE_REQUIRED.
+        return Ok(cbm_sys::ASTROLABE_BUILD_COMPILATION_CONTEXT.to_vec());
+    }
+    let bytes = fs::read(&database_path).map_err(|error| {
+        envelope(
+            "ASTRO_COMPILE_CONTEXT_DATABASE_READ_FAILED",
+            format!("cannot read {}: {error}", database_path.display()),
+            "Restore the exact compilation database bytes and retry the unchanged corpus.",
+        )
+    })?;
+    let document: serde_json::Value = serde_json::from_slice(&bytes).map_err(|error| {
+        envelope(
+            "ASTRO_COMPILE_CONTEXT_DATABASE_MALFORMED",
+            format!("{} is not valid JSON: {error}", database_path.display()),
+            "Regenerate compile_commands.json from a successful real build.",
+        )
+    })?;
+    let entries = document.as_array().ok_or_else(|| {
+        envelope(
+            "ASTRO_COMPILE_CONTEXT_DATABASE_SCHEMA_INVALID",
+            format!("{} is not a JSON array", database_path.display()),
+            "Regenerate the database according to the JSON Compilation Database format.",
+        )
+    })?;
+    if entries.is_empty() {
+        return Err(envelope(
+            "ASTRO_COMPILE_CONTEXT_DATABASE_EMPTY",
+            format!(
+                "{} contains no translation-unit commands",
+                database_path.display()
+            ),
+            "Run the real build's compilation-database generator and retry.",
+        ));
+    }
+    let mut captured = Vec::new();
+    for entry in entries {
+        if let Some(command) = capture_repository_compile_command(&repo_root, entry)? {
+            captured.push(command);
+        }
+    }
+    if captured.is_empty() {
+        return Err(envelope(
+            "ASTRO_COMPILE_CONTEXT_DATABASE_NO_REPOSITORY_TUS",
+            format!(
+                "{} contains no translation unit under {}",
+                database_path.display(),
+                repo_root.display()
+            ),
+            "Generate compile_commands.json for the exact repository being indexed.",
+        ));
+    }
+    captured.sort_by(|left, right| {
+        left.file
+            .cmp(&right.file)
+            .then_with(|| left.arguments.cmp(&right.arguments))
+    });
+
+    let mut baseline_ids = BTreeMap::<Vec<String>, String>::new();
+    let mut baselines = Vec::new();
+    let mut commands = Vec::new();
+    for command in captured {
+        let mut key = command.predefined_macros.clone();
+        key.push("\0includes\0".to_owned());
+        key.extend(command.system_include_paths.clone());
+        let baseline_id = if let Some(id) = baseline_ids.get(&key) {
+            id.clone()
+        } else {
+            let id = format!("repository-baseline-{:03}", baseline_ids.len());
+            baselines.push(serde_json::json!({
+                "id": id,
+                "predefined_macros": command.predefined_macros,
+                "system_include_paths": command.system_include_paths,
+            }));
+            baseline_ids.insert(key, id.clone());
+            id
+        };
+        commands.push(serde_json::json!({
+            "file": command.file,
+            "directory": command.directory,
+            "arguments": command.arguments,
+            "baseline_id": baseline_id,
+            "dependencies": command.dependencies,
+        }));
+    }
+    serde_json::to_vec(&serde_json::json!({
+        "format": "astrolabe.compilation-context.v1",
+        "source_root": normalized_path(&repo_root),
+        "baselines": baselines,
+        "commands": commands,
+    }))
+    .map_err(|error| {
+        envelope(
+            "ASTRO_COMPILE_CONTEXT_SERIALIZE_FAILED",
+            format!("cannot serialize immutable repository compilation context: {error}"),
+            "Preserve the compilation database and report this deterministic serialization fault.",
+        )
+    })
+}
+
 pub struct CbmPipeline {
     ptr: NonNull<cbm_sys::cbm_pipeline_t>,
     owner: ThreadId,
     _repo_path: CString,
     _db_path: CString,
+    _compilation_context: Vec<u8>,
     _not_send_or_sync: PhantomData<Rc<()>>,
 }
 
 impl CbmPipeline {
     pub fn new(repo_path: &str, db_path: &str, mode: CbmIndexMode) -> Result<Self, BridgeError> {
         initialize_cbm_allocator()?;
+        let compilation_context = compilation_context_for_repo(repo_path)?;
         let repo_path = CString::new(repo_path)?;
         let db_path = CString::new(db_path)?;
         // SAFETY: cbm_init is idempotent in libcbm. The repo/db strings outlive
@@ -1937,17 +2701,29 @@ impl CbmPipeline {
             map_cbm_status(cbm_sys::cbm_init())?;
             let ptr =
                 cbm_sys::cbm_pipeline_new(repo_path.as_ptr(), db_path.as_ptr(), mode.as_raw());
+            let ptr = NonNull::new(ptr).ok_or_else(|| {
+                envelope(
+                    "ASTRO_CBM_PIPELINE_INIT",
+                    "cbm_pipeline_new returned NULL",
+                    "Check repository path validity and CBM startup diagnostics.",
+                )
+            })?;
+            if let Err(error) =
+                map_cbm_status(cbm_sys::cbm_pipeline_set_embedded_compilation_context(
+                    ptr.as_ptr(),
+                    compilation_context.as_ptr(),
+                    compilation_context.len(),
+                ))
+            {
+                cbm_sys::cbm_pipeline_free(ptr.as_ptr());
+                return Err(error);
+            }
             Ok(Self {
-                ptr: NonNull::new(ptr).ok_or_else(|| {
-                    envelope(
-                        "ASTRO_CBM_PIPELINE_INIT",
-                        "cbm_pipeline_new returned NULL",
-                        "Check repository path validity and CBM startup diagnostics.",
-                    )
-                })?,
+                ptr,
                 owner: thread::current().id(),
                 _repo_path: repo_path,
                 _db_path: db_path,
+                _compilation_context: compilation_context,
                 _not_send_or_sync: PhantomData,
             })
         }

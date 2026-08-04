@@ -773,7 +773,9 @@ static CBMFileResult *cbm_extract_file_impl(const char *source, int source_len,
                                             const char *structured_classification_override,
                                             const char *structured_classification_provenance,
                                             int64_t timeout_micros,
-                                            const char **extra_defines, const char **include_paths);
+                                            const char **extra_defines,
+                                            const char **include_paths,
+                                            const CBMPreprocessContextSet *preprocess_contexts);
 
 static void cbm_file_result_discard_atoms(CBMFileResult *result) {
     if (!result) {
@@ -898,7 +900,7 @@ CBMFileResult *cbm_extract_file(const char *source, int source_len, CBMLanguage 
                                 const char *project, const char *rel_path, int64_t timeout_micros,
                                 const char **extra_defines, const char **include_paths) {
     return cbm_extract_file_impl(source, source_len, language, project, rel_path, NULL, NULL, false,
-                                 NULL, NULL, timeout_micros, extra_defines, include_paths);
+                                 NULL, NULL, timeout_micros, extra_defines, include_paths, NULL);
 }
 
 CBMFileResult *cbm_extract_file_at_path(const char *source, int source_len, CBMLanguage language,
@@ -906,7 +908,8 @@ CBMFileResult *cbm_extract_file_at_path(const char *source, int source_len, CBML
                                         const char *source_path, int64_t timeout_micros,
                                         const char **extra_defines, const char **include_paths) {
     return cbm_extract_file_impl(source, source_len, language, project, rel_path, source_path, NULL,
-                                 false, NULL, NULL, timeout_micros, extra_defines, include_paths);
+                                 false, NULL, NULL, timeout_micros, extra_defines, include_paths,
+                                 NULL);
 }
 
 CBMFileResult *cbm_extract_file_at_path_with_rust_edition(
@@ -917,7 +920,7 @@ CBMFileResult *cbm_extract_file_at_path_with_rust_edition(
     return cbm_extract_file_impl(source, source_len, language, project, rel_path, source_path,
                                  rust_edition, rust_is_crate_root, NULL, NULL, timeout_micros,
                                  extra_defines,
-                                 include_paths);
+                                 include_paths, NULL);
 }
 
 CBMFileResult *cbm_extract_file_at_path_with_metadata(
@@ -931,7 +934,7 @@ CBMFileResult *cbm_extract_file_at_path_with_metadata(
         source, source_len, language, project, rel_path, source_path, rust_edition,
         rust_is_crate_root,
         structured_classification_override, structured_classification_override_provenance,
-        timeout_micros, extra_defines, include_paths);
+        timeout_micros, extra_defines, include_paths, NULL);
 }
 
 CBMFileResult *cbm_extract_file_at_path_with_metadata_borrow_source(
@@ -939,16 +942,30 @@ CBMFileResult *cbm_extract_file_at_path_with_metadata_borrow_source(
     const char *rel_path, const char *source_path, const char *rust_edition,
     bool rust_is_crate_root, const char *structured_classification_override,
     const char *structured_classification_override_provenance, int64_t timeout_micros,
-    const char **extra_defines, const char **include_paths) {
+    const char **extra_defines, const char **include_paths,
+    const CBMPreprocessContextSet *preprocess_contexts) {
     bool previous = g_borrow_source_slices;
     g_borrow_source_slices = true;
     CBMFileResult *result = cbm_extract_file_impl(
         source, source_len, language, project, rel_path, source_path, rust_edition,
         rust_is_crate_root, structured_classification_override,
         structured_classification_override_provenance, timeout_micros, extra_defines,
-        include_paths);
+        include_paths, preprocess_contexts);
     g_borrow_source_slices = previous;
     return result;
+}
+
+CBMFileResult *cbm_extract_file_at_path_with_metadata_context(
+    const char *source, int source_len, CBMLanguage language, const char *project,
+    const char *rel_path, const char *source_path, const char *rust_edition,
+    bool rust_is_crate_root, const char *structured_classification_override,
+    const char *structured_classification_override_provenance, int64_t timeout_micros,
+    const CBMPreprocessContextSet *preprocess_contexts) {
+    return cbm_extract_file_impl(
+        source, source_len, language, project, rel_path, source_path, rust_edition,
+        rust_is_crate_root, structured_classification_override,
+        structured_classification_override_provenance, timeout_micros, NULL, NULL,
+        preprocess_contexts);
 }
 
 static CBMFileResult *cbm_extract_file_impl(const char *source, int source_len,
@@ -959,7 +976,8 @@ static CBMFileResult *cbm_extract_file_impl(const char *source, int source_len,
                                             const char *structured_classification_provenance,
                                             int64_t timeout_micros,
                                             const char **extra_defines,
-                                            const char **include_paths) {
+                                            const char **include_paths,
+                                            const CBMPreprocessContextSet *preprocess_contexts) {
     // Allocate result on heap (arena inside for all string data)
     enum { SINGLE = 1 };
     CBMFileResult *result = (CBMFileResult *)calloc(SINGLE, sizeof(CBMFileResult));
@@ -1215,27 +1233,78 @@ static CBMFileResult *cbm_extract_file_impl(const char *source, int source_len,
     // result can leave this block; no other unified record kind is appended.
     if (language == CBM_LANG_C || language == CBM_LANG_CPP || language == CBM_LANG_CUDA) {
         uint64_t pp_start = now_ns();
-        CBMPreprocessStatus pp_status = CBM_PREPROCESS_NO_DIRECTIVES;
-        char *pp_diagnostic = NULL;
-        uint32_t *primary_source_lines = NULL;
-        size_t expanded_line_count = 0;
         const char *preprocessor_path = source_path && source_path[0] ? source_path : rel_path;
-        char *expanded =
-            cbm_preprocess(source, source_len, preprocessor_path, extra_defines, include_paths,
-                           language != CBM_LANG_C, &pp_status, &pp_diagnostic,
-                           &primary_source_lines, &expanded_line_count);
-        if (pp_status == CBM_PREPROCESS_FAILED) {
-            cbm_log_error("preprocessor.failed", "code", "CBM_PREPROCESS_FAILED", "reason",
-                          pp_diagnostic ? pp_diagnostic : "unknown", "file",
-                          rel_path ? rel_path : "<input>");
+        (void)extra_defines;
+        (void)include_paths;
+        if (!preprocess_contexts || !preprocess_contexts->items ||
+            preprocess_contexts->count == 0 || !preprocessor_path || !preprocessor_path[0]) {
+            cbm_log_error("preprocessor.failed", "code", "CBM_PREPROCESS_CONTEXT_REQUIRED",
+                          "file", rel_path ? rel_path : "<input>", "message",
+                          "C-family extraction has no exact translation-unit context",
+                          "remediation",
+                          "capture this file's compiler invocation and dependency parent in "
+                          "compile_commands.json, then retry the complete corpus");
             cbm_file_result_set_error(
-                result, "CBM_PREPROCESS_FAILED", "cbm_preprocess", "preprocessor_source_map", 0,
-                "authoritative C-family preprocessing or expansion mapping failed; no partial "
-                "original-only graph may be persisted",
-                "inspect the exact preprocessor diagnostic, repair the source or expansion-map "
-                "contract, then retry the complete corpus");
+                result, "CBM_PREPROCESS_CONTEXT_REQUIRED", "resolve_preprocess_context",
+                "preprocessor_context", 0,
+                "C-family extraction requires at least one provenance-bound translation-unit "
+                "context; no guessed host context may be used",
+                "capture the exact compiler invocation and dependency parent in "
+                "compile_commands.json, then retry the complete corpus");
+            goto extraction_failed;
         }
-        if (expanded && !result->has_error) {
+
+        // Once exact preprocessing is available, its mapped trees are the
+        // authoritative call views. Preserve one view per real consumer
+        // context; context identity is carried onto every derived edge.
+        int original_calls = result->calls.count;
+        int original_resolved_calls = result->resolved_calls.count;
+        result->calls.count = 0;
+        result->resolved_calls.count = 0;
+        if (original_calls > 0 || original_resolved_calls > 0) {
+            char calls_replaced[32];
+            char resolutions_replaced[32];
+            snprintf(calls_replaced, sizeof(calls_replaced), "%d", original_calls);
+            snprintf(resolutions_replaced, sizeof(resolutions_replaced), "%d",
+                     original_resolved_calls);
+            cbm_log_info("preprocessor.original_call_view_replaced", "file",
+                         rel_path ? rel_path : "<input>", "calls", calls_replaced,
+                         "resolved_calls", resolutions_replaced);
+        }
+
+        for (size_t context_index = 0;
+             context_index < preprocess_contexts->count && !result->has_error; context_index++) {
+            const CBMPreprocessContext *preprocess_context =
+                &preprocess_contexts->items[context_index];
+            CBMPreprocessStatus pp_status = CBM_PREPROCESS_NO_DIRECTIVES;
+            char *pp_diagnostic = NULL;
+            uint32_t *primary_source_lines = NULL;
+            size_t expanded_line_count = 0;
+            char *expanded =
+                cbm_preprocess(source, source_len, preprocessor_path, preprocess_context,
+                               &pp_status, &pp_diagnostic, &primary_source_lines,
+                               &expanded_line_count);
+            if (pp_status == CBM_PREPROCESS_FAILED) {
+                cbm_log_error("preprocessor.failed", "code", "CBM_PREPROCESS_FAILED", "reason",
+                              pp_diagnostic ? pp_diagnostic : "unknown", "file",
+                              rel_path ? rel_path : "<input>", "context_id",
+                              preprocess_context->context_id ? preprocess_context->context_id : "");
+                cbm_file_result_set_error(
+                    result, "CBM_PREPROCESS_FAILED", "cbm_preprocess",
+                    "preprocessor_source_map", 0,
+                    "authoritative C-family preprocessing or expansion mapping failed; no "
+                    "partial original-only graph may be persisted",
+                    "inspect the exact preprocessing context diagnostic, repair the source or "
+                    "captured build context, then retry the complete corpus");
+            }
+            if (!expanded && pp_status != CBM_PREPROCESS_FAILED) {
+                cbm_file_result_set_error(
+                    result, "CBM_PREPROCESS_EXPANSION_MISSING", "cbm_preprocess",
+                    "preprocessor_source_map", 0,
+                    "an exact C-family context produced no authoritative expansion",
+                    "inspect the captured translation-unit context and retry the complete corpus");
+            }
+            if (expanded && !result->has_error) {
             size_t expanded_size = strlen(expanded);
             if (expanded_size > INT_MAX || !primary_source_lines || expanded_line_count == 0) {
                 cbm_log_error("preprocessor.expansion_invalid", "code",
@@ -1250,30 +1319,14 @@ static CBMFileResult *cbm_extract_file_impl(const char *source, int source_len,
                     "the complete corpus");
             }
             int expanded_len = result->has_error ? 0 : (int)expanded_size;
-
-            // Once preprocessing succeeds, its mapped tree is the authoritative call view for
-            // this translation unit. The original syntax tree can contain calls in inactive
-            // conditional branches and cannot expose macro replacement calls, so mixing the two
-            // views creates both false positives and duplicates. Definitions and every non-call
-            // record remain owned by the original physical-source tree.
-            int original_calls = result->calls.count;
-            int original_resolved_calls = result->resolved_calls.count;
-            result->calls.count = 0;
-            result->resolved_calls.count = 0;
-            if (original_calls > 0 || original_resolved_calls > 0) {
-                char calls_replaced[32];
-                char resolutions_replaced[32];
-                snprintf(calls_replaced, sizeof(calls_replaced), "%d", original_calls);
-                snprintf(resolutions_replaced, sizeof(resolutions_replaced), "%d",
-                         original_resolved_calls);
-                cbm_log_info("preprocessor.original_call_view_replaced", "file",
-                             rel_path ? rel_path : "<input>", "calls", calls_replaced,
-                             "resolved_calls", resolutions_replaced);
-            }
             int calls_before = result->calls.count;
 
             // Parse expanded source with fresh tree
-            TSParser *pp_parser = result->has_error ? NULL : get_thread_parser(ts_lang, language);
+            CBMLanguage context_language =
+                preprocess_context->cpp_mode ? CBM_LANG_CPP : CBM_LANG_C;
+            const TSLanguage *context_ts_lang = cbm_ts_language(context_language);
+            TSParser *pp_parser =
+                result->has_error ? NULL : get_thread_parser(context_ts_lang, context_language);
             if (pp_parser) {
                 ts_parser_reset(pp_parser);
                 CBMStringInput pp_input = {expanded, (uint32_t)expanded_len};
@@ -1295,7 +1348,7 @@ static CBMFileResult *cbm_extract_file_impl(const char *source, int source_len,
                         .result = result,
                         .source = expanded,
                         .source_len = expanded_len,
-                        .language = language,
+                        .language = context_language,
                         .project = project,
                         .rel_path = rel_path,
                         .module_qn = result->module_qn,
@@ -1309,12 +1362,29 @@ static CBMFileResult *cbm_extract_file_impl(const char *source, int source_len,
                     // block). Runs in every mode.
                     if (!result->has_error) {
                         cbm_run_c_lsp_mapped(a, result, expanded, expanded_len, pp_root,
-                                             language != CBM_LANG_C, primary_source_lines,
+                                             preprocess_context->cpp_mode, primary_source_lines,
                                              expanded_line_count);
                     }
                     if (!result->has_error) {
                         remap_preprocessed_calls(result, calls_before, primary_source_lines,
                                                  expanded_line_count, rel_path);
+                    }
+                    if (!result->has_error) {
+                        const char *owned_context_id =
+                            cbm_arena_strdup(a, preprocess_context->context_id);
+                        if (!owned_context_id) {
+                            cbm_file_result_set_error(
+                                result, "CBM_PREPROCESS_CONTEXT_ID_ALLOC_FAILED",
+                                "cbm_arena_strdup", "preprocessor_context", 0,
+                                "the exact preprocessing context identity could not be retained",
+                                "free memory and retry the complete unchanged corpus");
+                        } else {
+                            for (int call_index = calls_before;
+                                 call_index < result->calls.count; call_index++) {
+                                result->calls.items[call_index].preprocess_context_id =
+                                    owned_context_id;
+                            }
+                        }
                     }
 
                     ts_tree_delete(pp_tree);
@@ -1337,10 +1407,11 @@ static CBMFileResult *cbm_extract_file_impl(const char *source, int source_len,
                     "complete corpus");
             }
             atomic_fetch_add(&total_files_preprocessed, 1);
+            }
+            cbm_preprocess_free(expanded);
+            cbm_preprocess_line_map_free(primary_source_lines);
+            cbm_preprocess_diagnostic_free(pp_diagnostic);
         }
-        cbm_preprocess_free(expanded);
-        cbm_preprocess_line_map_free(primary_source_lines);
-        cbm_preprocess_diagnostic_free(pp_diagnostic);
         atomic_fetch_add(&total_preprocess_ns, now_ns() - pp_start);
         if (result->has_error) {
             goto extraction_failed;
@@ -1710,6 +1781,7 @@ bool cbm_file_result_compact_facts(CBMFileResult *result, const char *immutable_
         COMPACT_FACT_DUP(dst, src, enclosing_func_qn);
         COMPACT_FACT_DUP(dst, src, first_string_arg);
         COMPACT_FACT_DUP(dst, src, second_arg_name);
+        COMPACT_FACT_DUP(dst, src, preprocess_context_id);
         for (int a = 0; a < CBM_MAX_CALL_ARGS; a++) {
             COMPACT_FACT_DUP(&dst->args[a], &src->args[a], expr);
             COMPACT_FACT_DUP(&dst->args[a], &src->args[a], value);

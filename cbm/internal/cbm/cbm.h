@@ -289,6 +289,7 @@ typedef struct {
     bool is_method;                     // method/member call with a non-self receiver. Perl:
                                         // arrow/method call ($obj->m). TS/JS/TSX: member call
                                         // x.foo() whose receiver is not this/super. Default false.
+    const char *preprocess_context_id;  // exact TU context for a mapped C-family call, or NULL
     CBMReferenceIdentity reference;     // lexical/path/member evidence for target admission
 } CBMCall;
 
@@ -715,6 +716,26 @@ int cbm_alloc_last_error(void);
 
 // Initialize the library. Call once at startup. Returns 0 on success.
 int cbm_init(void);
+
+/* One immutable, provenance-bound C-family translation-unit context. The
+ * pipeline prepares these once per captured project generation and shares
+ * them read-only across extraction workers. A header or include-only source
+ * can carry several entries when several real translation units consume it. */
+typedef struct CBMPreprocessContext {
+    const char *context_id;
+    const char *entry_path;
+    const char *standard;
+    const char **defines;
+    const char **undefines;
+    const char **include_paths;
+    const char **forced_includes;
+    bool cpp_mode;
+} CBMPreprocessContext;
+
+typedef struct {
+    const CBMPreprocessContext *items;
+    size_t count;
+} CBMPreprocessContextSet;
 
 // Extract all data from one file. Caller must call cbm_free_result().
 // source must remain valid for the duration of the call.

@@ -2,13 +2,17 @@
 // compiles .cpp files from the immediate package directory, not subdirs.
 #include "vendored/simplecpp/simplecpp.cpp"
 
+#include "cbm.h"
 #include "preprocessor.h"
 #include "vendored/simplecpp/simplecpp.h"
 
+#include <climits>
 #include <cstdlib>
 #include <cstdio>
 #include <cstring>
 #include <exception>
+#include <fstream>
+#include <iterator>
 #include <limits>
 #include <new>
 #include <sstream>
@@ -154,11 +158,13 @@ static bool parse_generated_line_directive(const std::string &line, unsigned int
 }
 
 static bool build_primary_source_line_map(const std::string &expanded,
+                                          const std::string &entry_file,
                                           const std::string &primary_file,
                                           unsigned int source_line_count,
                                           std::vector<uint32_t> *map, std::string *diagnostic) {
     unsigned int logical_line = 1;
-    bool primary = true;
+    const std::string normalized_primary = simplecpp::simplifyPath(primary_file);
+    bool primary = simplecpp::simplifyPath(entry_file) == normalized_primary;
     size_t start = 0;
 
     for (;;) {
@@ -174,7 +180,7 @@ static bool build_primary_source_line_map(const std::string &expanded,
             }
             map->push_back(0);
             logical_line = directive_line;
-            primary = directive_file == primary_file;
+            primary = simplecpp::simplifyPath(directive_file) == normalized_primary;
         } else if (!primary) {
             map->push_back(std::numeric_limits<uint32_t>::max());
             if (logical_line < std::numeric_limits<unsigned int>::max())
@@ -228,9 +234,9 @@ static bool output_is_fatal(const simplecpp::Output &out) {
     case simplecpp::Output::EXPLICIT_INCLUDE_NOT_FOUND:
     case simplecpp::Output::FILE_NOT_FOUND:
     case simplecpp::Output::DUI_ERROR:
+    case simplecpp::Output::MISSING_HEADER:
         return true;
     case simplecpp::Output::WARNING:
-    case simplecpp::Output::MISSING_HEADER:
     case simplecpp::Output::PORTABILITY_BACKSLASH:
     default:
         return false;
@@ -299,8 +305,8 @@ static std::string fatal_output_summary(const simplecpp::OutputList &outputs,
 
 extern "C" {
 
-char *cbm_preprocess(const char *source, int source_len, const char *filename,
-                     const char **extra_defines, const char **include_paths, int cpp_mode,
+char *cbm_preprocess(const char *focus_source, int focus_source_len, const char *focus_filename,
+                     const CBMPreprocessContext *context,
                      CBMPreprocessStatus *status_out, char **diagnostic_out,
                      uint32_t **primary_source_lines_out, size_t *expanded_line_count_out) {
     set_status(status_out, CBM_PREPROCESS_NO_DIRECTIVES);
@@ -311,18 +317,53 @@ char *cbm_preprocess(const char *source, int source_len, const char *filename,
     if (expanded_line_count_out)
         *expanded_line_count_out = 0;
 
-    if (!source || source_len <= 0)
+    if (!focus_source || focus_source_len <= 0)
         return NULL;
 
-    if (!source_has_preprocessor_work(source, source_len))
+    if (!context || !context->context_id || !context->context_id[0] || !context->entry_path ||
+        !context->entry_path[0] || !context->standard || !context->standard[0] ||
+        !focus_filename || !focus_filename[0]) {
+        set_status(status_out, CBM_PREPROCESS_FAILED);
+        set_diagnostic(diagnostic_out,
+                       "CBM_PREPROCESS_CONTEXT_MISSING: exact translation-unit context is absent");
         return NULL;
+    }
 
     if (!primary_source_lines_out || !expanded_line_count_out) {
         set_status(status_out, CBM_PREPROCESS_FAILED);
         set_diagnostic(diagnostic_out, "preprocessor expansion map outputs are required");
         return NULL;
     }
-    if (source_has_line_control(source, source_len)) {
+    std::string entry_storage;
+    const char *entry_source = focus_source;
+    int entry_source_len = focus_source_len;
+    if (simplecpp::simplifyPath(context->entry_path) !=
+        simplecpp::simplifyPath(focus_filename)) {
+        std::ifstream input(context->entry_path, std::ios::binary);
+        if (!input) {
+            set_status(status_out, CBM_PREPROCESS_FAILED);
+            set_diagnostic(diagnostic_out,
+                           "CBM_PREPROCESS_ENTRY_READ_FAILED: consuming translation unit is unreadable");
+            return NULL;
+        }
+        entry_storage.assign(std::istreambuf_iterator<char>(input),
+                             std::istreambuf_iterator<char>());
+        if (!input.eof() || entry_storage.size() > static_cast<size_t>(INT_MAX)) {
+            set_status(status_out, CBM_PREPROCESS_FAILED);
+            set_diagnostic(diagnostic_out,
+                           "CBM_PREPROCESS_ENTRY_READ_FAILED: consuming translation unit read is incomplete or oversized");
+            return NULL;
+        }
+        entry_source = entry_storage.data();
+        entry_source_len = static_cast<int>(entry_storage.size());
+    }
+    if (entry_source_len <= 0) {
+        set_status(status_out, CBM_PREPROCESS_FAILED);
+        set_diagnostic(diagnostic_out,
+                       "CBM_PREPROCESS_ENTRY_EMPTY: consuming translation unit is empty");
+        return NULL;
+    }
+    if (source_has_line_control(entry_source, entry_source_len)) {
         set_status(status_out, CBM_PREPROCESS_FAILED);
         set_diagnostic(diagnostic_out,
                        "physical expansion mapping is undefined for input containing #line");
@@ -331,31 +372,29 @@ char *cbm_preprocess(const char *source, int source_len, const char *filename,
 
     try {
         simplecpp::DUI dui;
-#if defined(_WIN32)
-        // ASTROLABE currently ships only for native Windows. Compile-command
-        // defines can refine compiler-specific branches, but the host target is
-        // an authoritative baseline even when a repository has no compilation
-        // database (for example, a source-level _WIN32/#error split).
-        dui.defines.push_back("_WIN32=1");
-#if defined(_WIN64)
-        dui.defines.push_back("_WIN64=1");
-#endif
-#endif
-        if (extra_defines) {
-            for (int i = 0; extra_defines[i]; i++)
-                dui.defines.push_back(extra_defines[i]);
+        if (context->defines) {
+            for (int i = 0; context->defines[i]; i++)
+                dui.defines.push_back(context->defines[i]);
         }
-        if (include_paths) {
-            for (int i = 0; include_paths[i]; i++)
-                dui.includePaths.push_back(include_paths[i]);
+        if (context->undefines) {
+            for (int i = 0; context->undefines[i]; i++)
+                dui.undefined.insert(context->undefines[i]);
         }
-        dui.std = cpp_mode ? "c++20" : "c11";
+        if (context->include_paths) {
+            for (int i = 0; context->include_paths[i]; i++)
+                dui.includePaths.push_back(context->include_paths[i]);
+        }
+        if (context->forced_includes) {
+            for (int i = 0; context->forced_includes[i]; i++)
+                dui.includes.push_back(context->forced_includes[i]);
+        }
+        dui.std = context->standard;
 
         simplecpp::OutputList outputs;
         std::vector<std::string> files;
-        files.push_back(filename ? filename : "<input>");
+        files.push_back(context->entry_path);
 
-        simplecpp::TokenList rawtokens(source, static_cast<std::size_t>(source_len), files,
+        simplecpp::TokenList rawtokens(entry_source, static_cast<std::size_t>(entry_source_len), files,
                                        files[0], &outputs);
         simplecpp::TokenList output(files);
         simplecpp::FileDataCache filedata = simplecpp::load(rawtokens, files, dui, &outputs);
@@ -378,9 +417,10 @@ char *cbm_preprocess(const char *source, int source_len, const char *filename,
         std::string result = output.stringify();
         std::vector<uint32_t> primary_source_lines;
         std::string map_diagnostic;
-        unsigned int source_lines = physical_line_count(source, source_len);
+        unsigned int source_lines = physical_line_count(focus_source, focus_source_len);
         if (source_lines == 0 ||
-            !build_primary_source_line_map(result, files[0], source_lines, &primary_source_lines,
+            !build_primary_source_line_map(result, context->entry_path, focus_filename,
+                                           source_lines, &primary_source_lines,
                                            &map_diagnostic)) {
             simplecpp::cleanup(filedata);
             set_status(status_out, CBM_PREPROCESS_FAILED);

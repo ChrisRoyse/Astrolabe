@@ -14,6 +14,8 @@ typedef enum {
     CBM_PREPROCESS_FAILED = 2,
 } CBMPreprocessStatus;
 
+typedef struct CBMPreprocessContext CBMPreprocessContext;
+
 // Preprocess C/C++ source: expand macros, evaluate #ifdef, resolve #include.
 // Returns malloc-allocated expanded source when status is CBM_PREPROCESS_OK.
 // Returns NULL with CBM_PREPROCESS_NO_DIRECTIVES when the source has no
@@ -30,8 +32,8 @@ typedef enum {
 // owned by an included file. The caller must never persist an expanded line
 // directly and must free the map with cbm_preprocess_line_map_free().
 // The returned string must be freed with cbm_preprocess_free().
-char *cbm_preprocess(const char *source, int source_len, const char *filename,
-                     const char **extra_defines, const char **include_paths, int cpp_mode,
+char *cbm_preprocess(const char *focus_source, int focus_source_len, const char *focus_filename,
+                     const CBMPreprocessContext *context,
                      CBMPreprocessStatus *status_out, char **diagnostic_out,
                      uint32_t **primary_source_lines_out, size_t *expanded_line_count_out);
 

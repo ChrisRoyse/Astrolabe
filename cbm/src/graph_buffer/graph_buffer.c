@@ -380,6 +380,23 @@ static uint64_t fnv1a64(const char *s, size_t len) {
  * can never collide with verbatim keys. */
 static void make_edge_key(char *buf, size_t bufsz, int64_t src, int64_t tgt, const char *type,
                           const char *properties_json) {
+    if (properties_json) {
+        static const char context_key[] = "\"preprocess_context_id\":\"";
+        const char *context = strstr(properties_json, context_key);
+        if (context) {
+            context += sizeof(context_key) - 1;
+            const char *end = strchr(context, '"');
+            size_t context_len = end ? (size_t)(end - context) : strlen(context);
+            int n = snprintf(buf, bufsz, "%lld:%lld:%s:context:%.*s", (long long)src,
+                             (long long)tgt, type, (int)context_len, context);
+            if (n < 0 || (size_t)n >= bufsz) {
+                snprintf(buf, bufsz, "%lld:%lld:%s:context:\x01%016llx", (long long)src,
+                         (long long)tgt, type,
+                         (unsigned long long)fnv1a64(context, context_len));
+            }
+            return;
+        }
+    }
     if (properties_json && strcmp(type, "IMPORTS") == 0) {
         static const char local_name_key[] = "\"local_name\":\"";
         const char *ln = strstr(properties_json, local_name_key);

@@ -1,11 +1,14 @@
 mod build_support;
 
+use std::collections::{BTreeMap, HashMap};
 use std::env;
 use std::fs;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
+
+use serde_json::{Value, json};
 
 use build_support::normalize_bindings;
 
@@ -135,6 +138,17 @@ fn main() {
     // effective native build configuration changes.
     write_if_changed(&config_stamp, &config);
     run_make(&cbm_root, &patched_makefile, &build_dir, &config_stamp);
+    let compilation_context = capture_compilation_context(
+        repo_root,
+        &cbm_root,
+        &patched_makefile,
+        &build_dir,
+        &config_stamp,
+    );
+    println!(
+        "cargo:rustc-env=ASTROLABE_BUILD_COMPILATION_CONTEXT={}",
+        compilation_context.display()
+    );
     // One libclang parse per build-script run (#192): generate the superset
     // (functions + layout tests) once, then derive both consumers from it —
     // the OUT_DIR layout-test include gets the superset verbatim (its module
@@ -147,6 +161,27 @@ fn main() {
 }
 
 fn run_make(cbm_root: &Path, patched_makefile: &Path, build_dir: &Path, config_stamp: &Path) {
+    let mut command = make_command(cbm_root, patched_makefile, build_dir, config_stamp);
+    let make = env::var("MAKE").unwrap_or_else(|_| "make".to_string());
+    command.arg("libcbm");
+
+    let status = command.status().unwrap_or_else(|err| {
+        panic!(
+            "failed to execute `{make}` for libcbm.a: {err}. Install GNU make plus a C/C++ toolchain, \
+             or set MAKE/CC/CXX/AR explicitly."
+        )
+    });
+    if !status.success() {
+        panic!("libcbm.a build failed with status {status}");
+    }
+}
+
+fn make_command(
+    cbm_root: &Path,
+    patched_makefile: &Path,
+    build_dir: &Path,
+    config_stamp: &Path,
+) -> Command {
     let make = env::var("MAKE").unwrap_or_else(|_| "make".to_string());
     let mut command = Command::new(&make);
     // Cargo's build-script contract grants this process one implicit job slot.
@@ -192,8 +227,7 @@ fn run_make(cbm_root: &Path, patched_makefile: &Path, build_dir: &Path, config_s
         .arg("-f")
         .arg(make_path(patched_makefile))
         .arg(format!("BUILD_DIR={}", make_path(build_dir)))
-        .arg(format!("LIBCBM_CONFIG_STAMP={}", make_path(config_stamp)))
-        .arg("libcbm");
+        .arg(format!("LIBCBM_CONFIG_STAMP={}", make_path(config_stamp)));
 
     if let Ok(cc) = env::var("CC") {
         command.arg(format!("CC={}", make_command_path(&cc)));
@@ -241,15 +275,277 @@ fn run_make(cbm_root: &Path, patched_makefile: &Path, build_dir: &Path, config_s
         command.arg(format!("CBM_GRAMMAR_SET={grammar_set}"));
     }
 
-    let status = command.status().unwrap_or_else(|err| {
+    command
+}
+
+#[derive(Debug)]
+struct CapturedCompileCommand {
+    file: String,
+    arguments: Vec<String>,
+    dependencies: Vec<String>,
+}
+
+fn capture_compilation_context(
+    repo_root: &Path,
+    cbm_root: &Path,
+    patched_makefile: &Path,
+    build_dir: &Path,
+    config_stamp: &Path,
+) -> PathBuf {
+    let mut dry_run = make_command(cbm_root, patched_makefile, build_dir, config_stamp);
+    dry_run.args(["-n", "-B", "libcbm"]);
+    let output = dry_run.output().unwrap_or_else(|error| {
+        panic!("failed to enumerate exact libcbm compile commands: {error}")
+    });
+    if !output.status.success() {
         panic!(
-            "failed to execute `{make}` for libcbm.a: {err}. Install GNU make plus a C/C++ toolchain, \
-             or set MAKE/CC/CXX/AR explicitly."
+            "exact libcbm compile-command enumeration failed with {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let stdout = String::from_utf8(output.stdout)
+        .expect("GNU make emitted non-UTF-8 compile-command enumeration output");
+
+    let mut by_file = BTreeMap::<String, CapturedCompileCommand>::new();
+    for line in stdout.lines() {
+        let Some(arguments) = shlex::split(line) else {
+            panic!("GNU make emitted an unparseable compile command: {line:?}");
+        };
+        if !arguments.iter().any(|argument| argument == "-c") {
+            continue;
+        }
+        let Some(output_at) = arguments.iter().position(|argument| argument == "-o") else {
+            continue;
+        };
+        if output_at + 1 >= arguments.len() {
+            panic!("compile command has -o without an object path: {line:?}");
+        }
+        let source = arguments
+            .last()
+            .expect("a compile command cannot have an empty argv");
+        if !source.ends_with(".c") && !source.ends_with(".cpp") {
+            continue;
+        }
+        let file = repo_relative_path(repo_root, cbm_root, source).unwrap_or_else(|| {
+            panic!("libcbm compile source is outside the Astrolabe repository: {source:?}")
+        });
+        let object = resolve_build_path(cbm_root, &arguments[output_at + 1]);
+        let depfile = object.with_extension("d");
+        let dependencies = read_depfile(repo_root, cbm_root, &depfile, &file);
+        let command = CapturedCompileCommand {
+            file: file.clone(),
+            arguments,
+            dependencies,
+        };
+        if let Some(previous) = by_file.insert(file.clone(), command) {
+            if previous.arguments != by_file[&file].arguments {
+                panic!("one libcbm translation unit has contradictory compile commands: {file}");
+            }
+        }
+    }
+    if by_file.is_empty() {
+        panic!("GNU make exposed no libcbm C/C++ translation-unit commands");
+    }
+
+    let mut baseline_by_query = HashMap::<Vec<String>, String>::new();
+    let mut baselines = Vec::<Value>::new();
+    let mut commands = Vec::<Value>::with_capacity(by_file.len());
+    for command in by_file.values() {
+        let language = if command.file.ends_with(".cpp") {
+            "c++"
+        } else {
+            "c"
+        };
+        let query = compiler_query_arguments(&command.arguments, language);
+        let baseline_id = if let Some(id) = baseline_by_query.get(&query) {
+            id.clone()
+        } else {
+            let id = format!("baseline-{:03}", baselines.len());
+            let (predefined_macros, system_include_paths) =
+                query_compiler_baseline(cbm_root, &query);
+            baselines.push(json!({
+                "id": id,
+                "language": language,
+                "query_arguments": query,
+                "predefined_macros": predefined_macros,
+                "system_include_paths": system_include_paths,
+            }));
+            baseline_by_query.insert(query, id.clone());
+            id
+        };
+        commands.push(json!({
+            "file": command.file,
+            "directory": make_command_path(&cbm_root.to_string_lossy()),
+            "arguments": command.arguments,
+            "baseline_id": baseline_id,
+            "dependencies": command.dependencies,
+        }));
+    }
+
+    let manifest = json!({
+        "format": "astrolabe.compilation-context.v1",
+        "source_root": make_command_path(&repo_root.to_string_lossy()),
+        "baselines": baselines,
+        "commands": commands,
+    });
+    let bytes =
+        serde_json::to_vec(&manifest).expect("exact compilation-context manifest must serialize");
+    let path = build_dir
+        .parent()
+        .expect("cbm build directory must have an OUT_DIR parent")
+        .join("astrolabe-compilation-context.json");
+    write_if_changed(&path, &bytes);
+    path
+}
+
+fn compiler_query_arguments(arguments: &[String], language: &str) -> Vec<String> {
+    let mut query = Vec::with_capacity(arguments.len() + 6);
+    let source = arguments
+        .last()
+        .expect("compile command must name its translation unit");
+    let mut index = 0;
+    while index < arguments.len() {
+        let argument = &arguments[index];
+        if argument == "-c"
+            || argument == source
+            || argument == "-MMD"
+            || argument == "-MD"
+            || argument == "-MP"
+        {
+            index += 1;
+            continue;
+        }
+        if matches!(
+            argument.as_str(),
+            "-o" | "-MF" | "-MT" | "-MQ" | "-MJ" | "-x"
+        ) {
+            index += 2;
+            continue;
+        }
+        query.push(argument.clone());
+        index += 1;
+    }
+    query.extend([
+        "-dM".to_string(),
+        "-E".to_string(),
+        "-v".to_string(),
+        "-x".to_string(),
+        language.to_string(),
+        "-".to_string(),
+    ]);
+    query
+}
+
+fn query_compiler_baseline(cbm_root: &Path, arguments: &[String]) -> (Vec<String>, Vec<String>) {
+    let compiler = arguments
+        .first()
+        .expect("compiler baseline query requires argv[0]");
+    let output = Command::new(compiler)
+        .args(&arguments[1..])
+        .current_dir(cbm_root)
+        .stdin(Stdio::null())
+        .output()
+        .unwrap_or_else(|error| panic!("failed to query compiler baseline {compiler:?}: {error}"));
+    if !output.status.success() {
+        panic!(
+            "compiler baseline query failed with {} for {:?}: {}",
+            output.status,
+            arguments,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let stdout = String::from_utf8(output.stdout)
+        .expect("compiler predefined-macro output is not valid UTF-8");
+    let stderr = String::from_utf8(output.stderr)
+        .expect("compiler include-search output is not valid UTF-8");
+    let predefined_macros = stdout
+        .lines()
+        .filter_map(|line| line.strip_prefix("#define "))
+        .map(|definition| {
+            let split = definition.find(char::is_whitespace);
+            match split {
+                Some(at) => format!("{}={}", &definition[..at], definition[at..].trim_start()),
+                None => definition.to_string(),
+            }
+        })
+        .collect::<Vec<_>>();
+    if predefined_macros.is_empty() {
+        panic!("compiler baseline query returned no predefined macros: {arguments:?}");
+    }
+
+    let mut system_include_paths = Vec::new();
+    let mut in_search_list = false;
+    for line in stderr.lines() {
+        let trimmed = line.trim();
+        if trimmed == "#include <...> search starts here:" {
+            in_search_list = true;
+            continue;
+        }
+        if trimmed == "End of search list." {
+            break;
+        }
+        if in_search_list && !trimmed.is_empty() {
+            let path = trimmed
+                .strip_suffix(" (framework directory)")
+                .unwrap_or(trimmed);
+            system_include_paths.push(path.replace('\\', "/"));
+        }
+    }
+    if system_include_paths.is_empty() {
+        panic!("compiler baseline query returned no system include roots: {arguments:?}");
+    }
+    (predefined_macros, system_include_paths)
+}
+
+fn read_depfile(repo_root: &Path, cbm_root: &Path, depfile: &Path, source: &str) -> Vec<String> {
+    let text = fs::read_to_string(depfile).unwrap_or_else(|error| {
+        panic!(
+            "compiler dependency record is missing for translation unit {source} at {}: {error}",
+            depfile.display()
         )
     });
-    if !status.success() {
-        panic!("libcbm.a build failed with status {status}");
+    let flattened = text.replace("\\\r\n", " ").replace("\\\n", " ");
+    let Some(separator) = flattened.find(": ") else {
+        panic!(
+            "compiler dependency record has no target separator: {}",
+            depfile.display()
+        );
+    };
+    let mut dependencies = Vec::new();
+    for token in flattened[separator + 2..].split_ascii_whitespace() {
+        let token = token.replace("\\ ", " ");
+        if let Some(relative) = repo_relative_path(repo_root, cbm_root, &token) {
+            if !dependencies.contains(&relative) {
+                dependencies.push(relative);
+            }
+        }
     }
+    if !dependencies.iter().any(|dependency| dependency == source) {
+        panic!(
+            "compiler dependency record does not contain its translation unit {source}: {}",
+            depfile.display()
+        );
+    }
+    dependencies.sort();
+    dependencies
+}
+
+fn resolve_build_path(cbm_root: &Path, raw: &str) -> PathBuf {
+    let path = PathBuf::from(raw);
+    if path.is_absolute() {
+        path
+    } else {
+        cbm_root.join(path)
+    }
+}
+
+fn repo_relative_path(repo_root: &Path, cbm_root: &Path, raw: &str) -> Option<String> {
+    let candidate = resolve_build_path(cbm_root, raw);
+    let absolute = fs::canonicalize(&candidate).ok()?;
+    let canonical_root = fs::canonicalize(repo_root).ok()?;
+    let relative = absolute.strip_prefix(canonical_root).ok()?;
+    Some(relative.to_string_lossy().replace('\\', "/"))
 }
 
 fn libcbm_build_config(inputs: &[&Path]) -> Vec<u8> {

@@ -843,14 +843,15 @@ int cbm_pipeline_pass_definitions(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
         }
 
         /* Extract */
-        CBMFileResult *result = cbm_extract_file_at_path_with_metadata(
+        CBMFileResult *result = cbm_extract_file_at_path_with_metadata_context(
             source, source_len, lang, ctx->project_name, rel, path,
             cbm_pxc_rust_edition_for_file(ctx, rel), cbm_pxc_rust_is_crate_root(ctx, rel),
             files[i].structured_classification[0] ? files[i].structured_classification : NULL,
             files[i].structured_classification_provenance[0]
                 ? files[i].structured_classification_provenance
                 : NULL,
-            CBM_EXTRACT_BUDGET, NULL, NULL /* no extra defines or configured include paths */);
+            CBM_EXTRACT_BUDGET,
+            cbm_compile_context_for_file(ctx->compile_contexts, rel));
         free(source);
 
         if (!result) {

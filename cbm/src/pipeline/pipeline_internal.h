@@ -37,7 +37,14 @@ CBMFileResult *cbm_extract_file_at_path_with_metadata_borrow_source(
     const char *rel_path, const char *source_path, const char *rust_edition,
     bool rust_is_crate_root, const char *structured_classification_override,
     const char *structured_classification_override_provenance, int64_t timeout_micros,
-    const char **extra_defines, const char **include_paths);
+    const char **extra_defines, const char **include_paths,
+    const CBMPreprocessContextSet *preprocess_contexts);
+CBMFileResult *cbm_extract_file_at_path_with_metadata_context(
+    const char *source, int source_len, CBMLanguage language, const char *project,
+    const char *rel_path, const char *source_path, const char *rust_edition,
+    bool rust_is_crate_root, const char *structured_classification_override,
+    const char *structured_classification_override_provenance, int64_t timeout_micros,
+    const CBMPreprocessContextSet *preprocess_contexts);
 /* Live machine-available physical memory. Kept pipeline-internal so this
  * scheduler measurement does not expand the Rust FFI contract. */
 size_t cbm_mem_available(void);
@@ -159,6 +166,10 @@ typedef struct {
      * configs are an easy follow-on). NULL when no usable configs were found.
      * Owned by pipeline.c / pipeline_incremental.c. */
     const cbm_path_alias_collection_t *path_aliases;
+
+    /* Exact C-family translation-unit/header-consumer contexts, prepared once
+     * after immutable source capture and shared read-only by every worker. */
+    struct cbm_compile_context_index *compile_contexts;
 
     /* One immutable Cargo manifest per pipeline execution. Prepared before
      * any Rust extraction worker starts, shared read-only across workers, and
@@ -397,30 +408,15 @@ int cbm_tokenize_decorator(const char *dec, char **out, int max_out);
 
 /* ── Compile commands helpers (pass_compile_commands.c) ──────────── */
 
-typedef struct {
-    char **include_paths;
-    int include_count;
-    char **defines;
-    int define_count;
-    char standard[CBM_SZ_32];
-} cbm_compile_flags_t;
+typedef struct cbm_compile_context_index cbm_compile_context_index_t;
 
-/* Split a shell command string into arguments (handles quoting).
- * Writes args to out[]. Returns count. Caller must free each out[i]. */
-int cbm_split_command(const char *cmd, char **out, int max_out);
-
-/* Extract -I, -isystem, -D, -std= flags from compiler arguments.
- * Caller must free result with cbm_compile_flags_free(). */
-cbm_compile_flags_t *cbm_extract_flags(const char **args, int argc, const char *directory);
-
-/* Free a compile_flags_t allocated by cbm_extract_flags(). */
-void cbm_compile_flags_free(cbm_compile_flags_t *f);
-
-/* Parse compile_commands.json content. Returns map as parallel arrays.
- * out_paths[i] is the relative file path, out_flags[i] is its flags.
- * Returns count. Caller must free out_paths[i] and cbm_compile_flags_free(out_flags[i]). */
-int cbm_parse_compile_commands(const char *json_data, const char *repo_path, char ***out_paths,
-                               cbm_compile_flags_t ***out_flags);
+int cbm_compile_context_index_prepare(cbm_pipeline_ctx_t *ctx,
+                                      const cbm_file_info_t *source_files, int source_count,
+                                      const uint8_t *embedded_bytes, size_t embedded_byte_count,
+                                      cbm_compile_context_index_t **out_index);
+void cbm_compile_context_index_free(cbm_compile_context_index_t *index);
+const CBMPreprocessContextSet *cbm_compile_context_for_file(
+    const cbm_compile_context_index_t *index, const char *rel_path);
 
 /* ── Infrascan helpers (pass_infrascan.c) ─────────────────────────── */
 
@@ -740,6 +736,8 @@ enum { CBM_INCREMENTAL_REBUILD_REQUIRED = 2 };
 const char *cbm_pipeline_repo_path(const cbm_pipeline_t *p);
 const char *cbm_pipeline_source_root(const cbm_pipeline_t *p);
 atomic_int *cbm_pipeline_cancelled_ptr(cbm_pipeline_t *p);
+cbm_compile_context_index_t *cbm_pipeline_compile_contexts(const cbm_pipeline_t *p);
+const cbm_source_slab_t *cbm_pipeline_current_source_slab(const cbm_pipeline_t *p);
 /* Record committed graph size (#334 gate axis) from the incremental path,
  * which cannot see the opaque cbm_pipeline struct. Call before the dump. */
 void cbm_pipeline_set_committed_counts(cbm_pipeline_t *p, int nodes, int edges);

@@ -1462,12 +1462,14 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
         .source_root = cbm_pipeline_source_root(p),
         .all_files = files,
         .all_file_count = file_count,
+        .source_slab = cbm_pipeline_current_source_slab(p),
         .gbuf = existing,
         .registry = registry,
         .cancelled = cbm_pipeline_cancelled_ptr(p),
         .pipeline = p, /* so passes can record per-file skips (Track B) */
         .mode = cbm_pipeline_get_mode(p),
         .path_aliases = path_aliases,
+        .compile_contexts = cbm_pipeline_compile_contexts(p),
         .excluded_dirs = excluded_dirs,
         .excluded_count = excluded_count,
     };

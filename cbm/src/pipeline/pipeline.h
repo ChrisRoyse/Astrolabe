@@ -112,6 +112,12 @@ typedef enum {
 /* Create a new pipeline. Caller owns the result. */
 cbm_pipeline_t *cbm_pipeline_new(const char *repo_path, const char *db_path, cbm_index_mode_t mode);
 
+/* Bind the exact artifact- or repository-derived compilation context. The
+ * bytes are borrowed through cbm_pipeline_run and must be an immutable
+ * astrolabe.compilation-context.v1 document. */
+int cbm_pipeline_set_embedded_compilation_context(cbm_pipeline_t *p, const uint8_t *bytes,
+                                                  size_t byte_count);
+
 /* Enable persistent artifact export (.codebase-memory/graph.db.zst).
  * When enabled, the pipeline writes a compressed artifact after indexing. */
 void cbm_pipeline_set_persistence(cbm_pipeline_t *p, bool enabled);

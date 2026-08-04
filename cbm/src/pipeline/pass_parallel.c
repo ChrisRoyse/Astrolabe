@@ -563,6 +563,7 @@ typedef struct {
     const char *project_name;
     const char *repo_path;
     const CBMCargoManifest *rust_manifest;
+    const cbm_compile_context_index_t *compile_contexts;
 
     extract_worker_state_t *workers;
     int max_workers;
@@ -1063,7 +1064,8 @@ static void extract_worker(int worker_id, void *ctx_ptr) {
             fi->structured_classification_provenance[0]
                 ? fi->structured_classification_provenance
                 : NULL,
-            CBM_EXTRACT_BUDGET, NULL, NULL);
+            CBM_EXTRACT_BUDGET, NULL, NULL,
+            cbm_compile_context_for_file(ec->compile_contexts, fi->rel_path));
 
         /* Read the live process source of truth while the parse tree and parser
          * allocations are still resident. The exclusive first file uses this
@@ -1323,6 +1325,7 @@ int cbm_parallel_extract(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, 
         .project_name = ctx->project_name,
         .repo_path = ctx->repo_path,
         .rust_manifest = ctx->rust_manifest,
+        .compile_contexts = ctx->compile_contexts,
         .workers = workers,
         .max_workers = worker_count,
         .result_cache = result_cache,
@@ -1816,6 +1819,16 @@ static int format_call_arg(char *buf, size_t bufsize, const CBMCallArg *a, const
  * same #493 UTF-8-boundary truncation, same keyword handling, same buffer-budget
  * cutoff — so both pipelines emit byte-identical "args" arrays (#516). */
 size_t cbm_pipeline_append_args_json(char *buf, size_t bufsize, size_t pos, const CBMCall *call) {
+    if (call->preprocess_context_id && pos < bufsize - PP_ARGS_MARGIN) {
+        char escaped_context[CBM_SZ_256];
+        cbm_json_escape(escaped_context, sizeof(escaped_context), call->preprocess_context_id);
+        int context_len = snprintf(buf + pos, bufsize - pos,
+                                   ",\"preprocess_context_id\":\"%s\"", escaped_context);
+        if (context_len <= 0 || (size_t)context_len >= bufsize - pos) {
+            return pos;
+        }
+        pos += (size_t)context_len;
+    }
     if (call->arg_count == 0 || pos >= bufsize - PP_ARGS_MARGIN) {
         return pos;
     }

@@ -202,6 +202,10 @@ struct cbm_pipeline {
     bool row_sink_completed;
     cbm_pipeline_post_success_fn post_success;
     void *post_success_ctx;
+    const uint8_t *embedded_compilation_context;
+    size_t embedded_compilation_context_bytes;
+    cbm_compile_context_index_t *compile_contexts;
+    const cbm_source_slab_t *current_source_slab;
 
     /* Indexing state (set during run) */
     cbm_gbuf_t *gbuf;
@@ -575,6 +579,22 @@ void cbm_pipeline_set_persistence(cbm_pipeline_t *p, bool enabled) {
     }
 }
 
+int cbm_pipeline_set_embedded_compilation_context(cbm_pipeline_t *p, const uint8_t *bytes,
+                                                  size_t byte_count) {
+    if (!p || !bytes || byte_count == 0) {
+        cbm_log_error("pipeline.compile_context_refused", "code",
+                      "CBM_COMPILE_CONTEXT_EMBEDDED_INVALID", "message",
+                      "embedded compilation context requires non-empty artifact-owned bytes",
+                      "remediation",
+                      "bind the exact astrolabe.compilation-context.v1 artifact before running "
+                      "the pipeline");
+        return CBM_NOT_FOUND;
+    }
+    p->embedded_compilation_context = bytes;
+    p->embedded_compilation_context_bytes = byte_count;
+    return 0;
+}
+
 int cbm_pipeline_set_sink(cbm_pipeline_t *p, const cbm_pipeline_row_sink_v1_t *sink) {
     if (!p) {
         cbm_log_error("pipeline.row_sink_refused", "code", "CBM_PIPELINE_ROW_SINK_PIPELINE_NULL",
@@ -691,6 +711,8 @@ void cbm_pipeline_free(cbm_pipeline_t *p) {
     p->file_errors_count = 0;
     p->file_errors_cap = 0;
     free(p->branch_qn);
+    cbm_compile_context_index_free(p->compile_contexts);
+    p->compile_contexts = NULL;
     free(p->saved_adr); /* freed here too: error paths can exit before the
                          * restore in dump_and_persist_hashes runs. Issue #516. */
     p->saved_adr = NULL;
@@ -725,6 +747,14 @@ const char *cbm_pipeline_source_root(const cbm_pipeline_t *p) {
 
 atomic_int *cbm_pipeline_cancelled_ptr(cbm_pipeline_t *p) {
     return p ? &p->cancelled : NULL;
+}
+
+cbm_compile_context_index_t *cbm_pipeline_compile_contexts(const cbm_pipeline_t *p) {
+    return p ? p->compile_contexts : NULL;
+}
+
+const cbm_source_slab_t *cbm_pipeline_current_source_slab(const cbm_pipeline_t *p) {
+    return p ? p->current_source_slab : NULL;
 }
 
 int cbm_pipeline_get_mode(const cbm_pipeline_t *p) {
@@ -3285,6 +3315,9 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
         return CBM_NOT_FOUND;
     }
     p->row_sink_completed = false;
+    cbm_compile_context_index_free(p->compile_contexts);
+    p->compile_contexts = NULL;
+    p->current_source_slab = NULL;
 
     CBM_PROF_START(t_pipeline_total);
     struct timespec t0;
@@ -3441,6 +3474,27 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
         goto cleanup;
     }
     cbm_pipeline_phase_probe_end(p, "source_slab", &source_slab_probe);
+    p->current_source_slab = &source_slab;
+
+    cbm_pipeline_phase_probe_t compile_context_probe =
+        cbm_pipeline_phase_probe_start(p, "compile_context");
+    cbm_pipeline_ctx_t compile_context_owner = {
+        .project_name = p->project_name,
+        .repo_path = p->repo_path,
+        .source_root = p->source_root,
+        .all_files = files,
+        .all_file_count = file_count,
+        .source_slab = &source_slab,
+        .cancelled = &p->cancelled,
+        .pipeline = p,
+    };
+    rc = cbm_compile_context_index_prepare(
+        &compile_context_owner, source_files, source_count, p->embedded_compilation_context,
+        p->embedded_compilation_context_bytes, &p->compile_contexts);
+    cbm_pipeline_phase_probe_end(p, "compile_context", &compile_context_probe);
+    if (rc != 0) {
+        goto cleanup;
+    }
 
     /* Check for existing DB → try incremental or delete for reindex */
     rc = try_incremental_or_delete_db(p, files, file_count);
@@ -3483,6 +3537,7 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
         .pipeline = p, /* so passes can record per-file skips (Track B) */
         .mode = (int)p->mode,
         .path_aliases = path_aliases,
+        .compile_contexts = p->compile_contexts,
         .excluded_dirs = p->excluded_dirs,
         .excluded_count = p->excluded_count,
     };
@@ -3533,6 +3588,9 @@ cleanup:
     p->unresolved_reference_source_skips = cbm_gbuf_unresolved_reference_source_skips(p->gbuf);
     cbm_gbuf_free(p->gbuf);
     p->gbuf = NULL;
+    cbm_compile_context_index_free(p->compile_contexts);
+    p->compile_contexts = NULL;
+    p->current_source_slab = NULL;
     cbm_source_slab_destroy(&source_slab);
     cbm_registry_free(p->registry);
     p->registry = NULL;

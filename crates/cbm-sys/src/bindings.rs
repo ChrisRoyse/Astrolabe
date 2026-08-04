@@ -556,6 +556,7 @@ pub struct CBMCall {
     pub branch_depth: ::std::os::raw::c_int,
     pub start_line: ::std::os::raw::c_int,
     pub is_method: bool,
+    pub preprocess_context_id: *const ::std::os::raw::c_char,
     pub reference: CBMReferenceIdentity,
 }
 impl Default for CBMCall {
@@ -1250,6 +1251,42 @@ unsafe extern "C" {
 }
 unsafe extern "C" {
     pub fn cbm_init() -> ::std::os::raw::c_int;
+}
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct CBMPreprocessContext {
+    pub context_id: *const ::std::os::raw::c_char,
+    pub entry_path: *const ::std::os::raw::c_char,
+    pub standard: *const ::std::os::raw::c_char,
+    pub defines: *mut *const ::std::os::raw::c_char,
+    pub undefines: *mut *const ::std::os::raw::c_char,
+    pub include_paths: *mut *const ::std::os::raw::c_char,
+    pub forced_includes: *mut *const ::std::os::raw::c_char,
+    pub cpp_mode: bool,
+}
+impl Default for CBMPreprocessContext {
+    fn default() -> Self {
+        let mut s = ::std::mem::MaybeUninit::<Self>::uninit();
+        unsafe {
+            ::std::ptr::write_bytes(s.as_mut_ptr(), 0, 1);
+            s.assume_init()
+        }
+    }
+}
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct CBMPreprocessContextSet {
+    pub items: *const CBMPreprocessContext,
+    pub count: usize,
+}
+impl Default for CBMPreprocessContextSet {
+    fn default() -> Self {
+        let mut s = ::std::mem::MaybeUninit::<Self>::uninit();
+        unsafe {
+            ::std::ptr::write_bytes(s.as_mut_ptr(), 0, 1);
+            s.assume_init()
+        }
+    }
 }
 unsafe extern "C" {
     pub fn cbm_extract_file(
@@ -3832,6 +3869,13 @@ unsafe extern "C" {
         db_path: *const ::std::os::raw::c_char,
         mode: cbm_index_mode_t,
     ) -> *mut cbm_pipeline_t;
+}
+unsafe extern "C" {
+    pub fn cbm_pipeline_set_embedded_compilation_context(
+        p: *mut cbm_pipeline_t,
+        bytes: *const u8,
+        byte_count: usize,
+    ) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {
     pub fn cbm_pipeline_set_persistence(p: *mut cbm_pipeline_t, enabled: bool);
