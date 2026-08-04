@@ -1659,38 +1659,75 @@ static int snapshot_remove_tree(const char *path) {
     return rc;
 }
 
-int cbm_source_snapshot_capture(const char *repo_path, const cbm_discover_opts_t *opts,
-                                cbm_file_info_t *files, int file_count,
-                                cbm_source_snapshot_t *snapshot) {
-    if (!repo_path || !opts || file_count < 0 || (file_count > 0 && !files) || !snapshot ||
-        snapshot->root) {
+int cbm_source_snapshot_capture(const char *repo_path, const char *store_path,
+                                const cbm_discover_opts_t *opts, cbm_file_info_t *files,
+                                int file_count, cbm_source_snapshot_t *snapshot) {
+    if (!repo_path || !store_path || !store_path[0] || !opts || file_count < 0 ||
+        (file_count > 0 && !files) || !snapshot || snapshot->root) {
         snapshot_log_failure("CBM_SOURCE_SNAPSHOT_INVALID_ARGUMENT", "validate_capture", repo_path,
                              ERROR_INVALID_PARAMETER);
         return CBM_NOT_FOUND;
     }
-    const char *temp = cbm_tmpdir();
-    size_t temp_len = strlen(temp);
-    const size_t suffix_capacity = 96;
-    if (temp_len > SIZE_MAX - suffix_capacity) {
-        snapshot_log_failure("CBM_SOURCE_SNAPSHOT_PATH_OVERFLOW", "build_snapshot_root", temp,
-                             ERROR_ARITHMETIC_OVERFLOW);
+    char *store_directory = strdup(store_path);
+    if (!store_directory) {
+        snapshot_log_failure("CBM_SOURCE_SNAPSHOT_STORE_ALLOC_FAILED", "copy_snapshot_store",
+                             store_path, ERROR_NOT_ENOUGH_MEMORY);
         return CBM_NOT_FOUND;
     }
-    char *root = malloc(temp_len + suffix_capacity);
+    for (char *cursor = store_directory; *cursor; cursor++) {
+        if (*cursor == '\\') {
+            *cursor = '/';
+        }
+    }
+    char *last_separator = strrchr(store_directory, '/');
+    if (!last_separator) {
+        free(store_directory);
+        store_directory = strdup(".");
+    } else if (last_separator == store_directory + 2 && store_directory[1] == ':') {
+        last_separator[1] = '\0';
+    } else if (last_separator == store_directory) {
+        last_separator[1] = '\0';
+    } else {
+        *last_separator = '\0';
+    }
+    if (!store_directory) {
+        snapshot_log_failure("CBM_SOURCE_SNAPSHOT_STORE_ALLOC_FAILED", "derive_snapshot_store",
+                             store_path, ERROR_NOT_ENOUGH_MEMORY);
+        return CBM_NOT_FOUND;
+    }
+    char *snapshot_base = cbm_real_path_final(store_directory);
+    if (!snapshot_base || !cbm_is_dir(snapshot_base)) {
+        snapshot_log_failure("CBM_SOURCE_SNAPSHOT_STORE_INVALID", "open_snapshot_store",
+                             store_directory, GetLastError());
+        free(store_directory);
+        free(snapshot_base);
+        return CBM_NOT_FOUND;
+    }
+    free(store_directory);
+    size_t base_len = strlen(snapshot_base);
+    const size_t suffix_capacity = 96;
+    if (base_len > SIZE_MAX - suffix_capacity) {
+        snapshot_log_failure("CBM_SOURCE_SNAPSHOT_PATH_OVERFLOW", "build_snapshot_root",
+                             snapshot_base, ERROR_ARITHMETIC_OVERFLOW);
+        free(snapshot_base);
+        return CBM_NOT_FOUND;
+    }
+    char *root = malloc(base_len + suffix_capacity);
     if (!root) {
         snapshot_log_failure("CBM_SOURCE_SNAPSHOT_ROOT_ALLOC_FAILED", "allocate_snapshot_root",
-                             temp, ERROR_NOT_ENOUGH_MEMORY);
+                             snapshot_base, ERROR_NOT_ENOUGH_MEMORY);
+        free(snapshot_base);
         return CBM_NOT_FOUND;
     }
     static volatile LONG sequence;
     LARGE_INTEGER counter;
     QueryPerformanceCounter(&counter);
     LONG generation = InterlockedIncrement(&sequence);
-    int root_len =
-        snprintf(root, temp_len + suffix_capacity, "%s/cbm-source-snapshot-%lu-%016llx-%ld", temp,
-                 (unsigned long)GetCurrentProcessId(), (unsigned long long)counter.QuadPart,
-                 (long)generation);
-    wchar_t *wide_root = root_len > 0 && (size_t)root_len < temp_len + suffix_capacity
+    int root_len = snprintf(root, base_len + suffix_capacity,
+                            "%s/.cbm-source-%lx-%016llx-%lx", snapshot_base,
+                            (unsigned long)GetCurrentProcessId(),
+                            (unsigned long long)counter.QuadPart, (unsigned long)generation);
+    wchar_t *wide_root = root_len > 0 && (size_t)root_len < base_len + suffix_capacity
                              ? cbm_utf8_to_wide_path(root)
                              : NULL;
     if (!wide_root || !CreateDirectoryW(wide_root, NULL)) {
@@ -1699,9 +1736,19 @@ int cbm_source_snapshot_capture(const char *repo_path, const cbm_discover_opts_t
                              error);
         free(wide_root);
         free(root);
+        free(snapshot_base);
         return CBM_NOT_FOUND;
     }
     free(wide_root);
+    char root_length[32];
+    char store_length[32];
+    snprintf(root_length, sizeof(root_length), "%d", root_len);
+    snprintf(store_length, sizeof(store_length), "%zu", base_len);
+    cbm_log_info("source_snapshot.root_ready", "ownership", "configured_project_store",
+                 "store_path", store_path, "store_directory", snapshot_base,
+                 "store_directory_bytes", store_length, "root", root, "root_path_bytes",
+                 root_length, "ambient_temp_used", "false");
+    free(snapshot_base);
     snapshot->root = root;
 
     snapshot_dispatcher_t dispatcher = {0};

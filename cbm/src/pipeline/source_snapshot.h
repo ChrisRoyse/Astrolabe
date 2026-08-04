@@ -31,9 +31,9 @@ typedef struct {
  * joined before return. Once root creation succeeds, snapshot owns that root on
  * both success and failure; the caller must invoke cbm_source_snapshot_destroy
  * exactly once so partial derived files have one cleanup owner. */
-int cbm_source_snapshot_capture(const char *repo_path, const cbm_discover_opts_t *opts,
-                                cbm_file_info_t *files, int file_count,
-                                cbm_source_snapshot_t *snapshot);
+int cbm_source_snapshot_capture(const char *repo_path, const char *store_path,
+                                const cbm_discover_opts_t *opts, cbm_file_info_t *files,
+                                int file_count, cbm_source_snapshot_t *snapshot);
 
 /* Prove whether the complete live discovery is byte-identical to the persisted
  * file-hash generation without creating a mirrored snapshot. Every candidate is

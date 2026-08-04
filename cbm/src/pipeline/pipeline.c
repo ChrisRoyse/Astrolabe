@@ -3827,8 +3827,26 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
     CBM_PROF_START(t_snapshot);
     cbm_pipeline_phase_probe_t snapshot_probe =
         cbm_pipeline_phase_probe_start(p, "source_snapshot");
-    int snapshot_rc =
-        cbm_source_snapshot_capture(p->repo_path, &opts, files, file_count, &source_snapshot);
+    char *snapshot_store_path = resolve_db_path(p);
+    int snapshot_rc = snapshot_store_path
+                          ? cbm_source_snapshot_capture(p->repo_path, snapshot_store_path, &opts,
+                                                        files, file_count, &source_snapshot)
+                          : CBM_NOT_FOUND;
+    if (!snapshot_store_path) {
+        cbm_log_error("pipeline.err", "phase", "source_snapshot", "code",
+                      "CBM_SOURCE_SNAPSHOT_STORE_UNRESOLVED", "repo_path", p->repo_path,
+                      "message", "the exact project store path could not be resolved",
+                      "remediation",
+                      "configure one writable project store before indexing; no ambient TEMP "
+                      "fallback exists");
+        cbm_pipeline_record_fatal_error(
+            p, "CBM_SOURCE_SNAPSHOT_STORE_UNRESOLVED", "resolve_snapshot_store",
+            "source_snapshot", p->repo_path, 0,
+            "the exact project store path could not be resolved",
+            "configure one writable project store before indexing; no ambient TEMP fallback "
+            "exists");
+    }
+    free(snapshot_store_path);
     cbm_pipeline_phase_probe_end(p, "source_snapshot", &snapshot_probe);
     if (snapshot_rc != 0) {
         rc = CBM_NOT_FOUND;

@@ -474,6 +474,111 @@ static int build_preprocess_argv(cbm_pipeline_ctx_t *ctx,
     return 0;
 }
 
+static bool compiler_windows_path_length(const char *path, size_t *characters) {
+    if (!path || !characters) {
+        return false;
+    }
+    int length = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path, -1, NULL, 0);
+    if (length <= 0) {
+        return false;
+    }
+    *characters = (size_t)(length - 1);
+    return true;
+}
+
+static int validate_compiler_snapshot_path_budget(cbm_pipeline_ctx_t *ctx,
+                                                  const compile_context_owner_t *owner) {
+    const char *relative_directory =
+        path_relative_within(ctx ? ctx->repo_path : NULL, owner ? owner->directory : NULL);
+    if (!ctx || !ctx->source_root || !owner || !relative_directory) {
+        return preprocess_fail(
+            ctx, "CBM_PREPROCESS_WORKING_DIRECTORY_UNPROJECTABLE",
+            "validate_compiler_path_budget",
+            owner && owner->tu_rel_path ? owner->tu_rel_path : "", 0,
+            "the captured compiler working directory cannot be projected into the immutable "
+            "snapshot",
+            "preserve the compilation-context manifest and repair its repository-root binding");
+    }
+
+    char *longest_path = join_path(ctx->source_root, relative_directory);
+    if (!longest_path) {
+        return preprocess_fail(
+            ctx, "CBM_PREPROCESS_PATH_BUDGET_ALLOC_FAILED", "validate_compiler_path_budget",
+            owner->tu_rel_path, 0, "the compiler snapshot path budget could not be represented",
+            "free memory and preserve the unchanged source generation for diagnosis");
+    }
+    size_t longest_characters = 0;
+    if (!compiler_windows_path_length(longest_path, &longest_characters)) {
+        int failure = preprocess_fail(
+            ctx, "CBM_PREPROCESS_PATH_ENCODING_INVALID", "validate_compiler_path_budget",
+            longest_path, strlen(longest_path),
+            "the projected compiler working directory is not valid UTF-8",
+            "repair the captured compiler directory encoding before indexing");
+        free(longest_path);
+        return failure;
+    }
+    size_t longest_bytes = strlen(longest_path);
+    const char *longest_kind = "working_directory";
+
+    for (int i = 0; i < owner->dependency_count; i++) {
+        const char *dependency = owner->dependencies[i];
+        char *projected = join_path(ctx->source_root, dependency);
+        if (!projected) {
+            free(longest_path);
+            return preprocess_fail(
+                ctx, "CBM_PREPROCESS_PATH_BUDGET_ALLOC_FAILED",
+                "validate_compiler_path_budget", dependency, (size_t)i,
+                "one compiler dependency path could not be projected into the immutable snapshot",
+                "free memory and preserve the unchanged source generation for diagnosis");
+        }
+        size_t projected_characters = 0;
+        if (!compiler_windows_path_length(projected, &projected_characters)) {
+            int failure = preprocess_fail(
+                ctx, "CBM_PREPROCESS_PATH_ENCODING_INVALID", "validate_compiler_path_budget",
+                projected, strlen(projected),
+                "one projected compiler dependency path is not valid UTF-8",
+                "repair the captured dependency path encoding before indexing");
+            free(projected);
+            free(longest_path);
+            return failure;
+        }
+        size_t projected_bytes = strlen(projected);
+        if (projected_characters > longest_characters) {
+            free(longest_path);
+            longest_path = projected;
+            longest_bytes = projected_bytes;
+            longest_characters = projected_characters;
+            longest_kind = "repository_dependency";
+        } else {
+            free(projected);
+        }
+    }
+
+    char length_text[32];
+    char bytes_text[32];
+    char limit_text[32];
+    snprintf(length_text, sizeof(length_text), "%zu", longest_characters);
+    snprintf(bytes_text, sizeof(bytes_text), "%zu", longest_bytes);
+    snprintf(limit_text, sizeof(limit_text), "%d", MAX_PATH - 1);
+    cbm_log_info("compiler_preprocess.path_budget", "translation_unit", owner->tu_rel_path,
+                 "context_id", owner->view.context_id, "longest_kind", longest_kind,
+                 "longest_path", longest_path, "longest_path_characters", length_text,
+                 "longest_path_utf8_bytes", bytes_text, "maximum_path_characters", limit_text,
+                 "compiler", "pinned_mingw_gcc");
+    if (longest_characters >= MAX_PATH) {
+        int failure = preprocess_fail(
+            ctx, "CBM_PREPROCESS_SNAPSHOT_PATH_TOO_LONG", "validate_compiler_path_budget",
+            longest_path, longest_characters,
+            "a projected compiler input exceeds the pinned MinGW preprocessor path limit",
+            "select a shorter project store root through CBM_CACHE_DIR; Astrolabe never reads "
+            "live source or mutates host long-path policy");
+        free(longest_path);
+        return failure;
+    }
+    free(longest_path);
+    return 0;
+}
+
 static char **json_string_array(yyjson_val *value, int *out_count) {
     *out_count = 0;
     if (!value || !yyjson_is_arr(value)) {
@@ -1916,11 +2021,54 @@ static char *hex_encode_bytes(const char *bytes, size_t byte_count) {
     return encoded;
 }
 
+static void log_failed_compiler_invocation(const compile_context_owner_t *owner,
+                                           char *const *argv, int argc,
+                                           const char *working_directory) {
+    cbm_sha256_ctx argv_hash;
+    cbm_sha256_init(&argv_hash);
+    for (int i = 0; i < argc; i++) {
+        const char *argument = argv && argv[i] ? argv[i] : "";
+        cbm_sha256_update(&argv_hash, argument, strlen(argument));
+        cbm_sha256_update(&argv_hash, "\0", 1);
+    }
+    uint8_t digest[CBM_SHA256_DIGEST_LEN];
+    char digest_hex[CBM_SHA256_HEX_LEN + 1];
+    cbm_sha256_final(&argv_hash, digest);
+    for (int i = 0; i < CBM_SHA256_DIGEST_LEN; i++) {
+        snprintf(digest_hex + i * 2, 3, "%02x", digest[i]);
+    }
+    digest_hex[CBM_SHA256_HEX_LEN] = '\0';
+
+    char argc_text[32];
+    char working_bytes_text[32];
+    snprintf(argc_text, sizeof(argc_text), "%d", argc);
+    snprintf(working_bytes_text, sizeof(working_bytes_text), "%zu",
+             working_directory ? strlen(working_directory) : 0U);
+    cbm_log_error(
+        "compiler_preprocess.failed_invocation", "translation_unit",
+        owner && owner->tu_rel_path ? owner->tu_rel_path : "", "context_id",
+        owner && owner->view.context_id ? owner->view.context_id : "", "working_directory",
+        working_directory ? working_directory : "", "working_directory_bytes",
+        working_bytes_text, "argv_count", argc_text, "argv_encoding",
+        "ordered_utf8_nul_delimited", "argv_sha256", digest_hex);
+    for (int i = 0; i < argc; i++) {
+        char index_text[32];
+        snprintf(index_text, sizeof(index_text), "%d", i);
+        cbm_log_error(
+            "compiler_preprocess.failed_argument", "translation_unit",
+            owner && owner->tu_rel_path ? owner->tu_rel_path : "", "context_id",
+            owner && owner->view.context_id ? owner->view.context_id : "", "argument_index",
+            index_text, "argument", argv && argv[i] ? argv[i] : "");
+    }
+}
+
 static int compiler_spawn_fail(cbm_pipeline_ctx_t *ctx,
                                const compile_context_owner_t *owner,
                                const cbm_spawn_error_t *error,
                                const cbm_spawn_bounded_capture_t *stderr_capture,
-                               const char *stdout_data, size_t stdout_bytes) {
+                               const char *stdout_data, size_t stdout_bytes,
+                               char *const *argv, int argc,
+                               const char *working_directory) {
     char spawn_code[32];
     char exit_code[32];
     char os_error[32];
@@ -1940,6 +2088,7 @@ static int compiler_spawn_fail(cbm_pipeline_ctx_t *ctx,
     sha256_hex(stdout_data ? stdout_data : "", stdout_bytes, stdout_hash);
     sha256_hex(stderr_capture && stderr_capture->data ? stderr_capture->data : "",
                stderr_capture ? stderr_capture->len : 0U, stderr_hash);
+    log_failed_compiler_invocation(owner, argv, argc, working_directory);
     char *stderr_hex =
         hex_encode_bytes(stderr_capture ? stderr_capture->data : NULL,
                          stderr_capture ? stderr_capture->len : 0U);
@@ -2058,6 +2207,10 @@ int cbm_compile_context_extract_calls(cbm_pipeline_ctx_t *ctx,
             break;
         }
         const compile_context_owner_t *owner = &index->contexts[context_index];
+        if (validate_compiler_snapshot_path_budget(ctx, owner) != 0) {
+            status = CBM_NOT_FOUND;
+            break;
+        }
         for (int i = 0; i < source_count; i++) {
             target_by_source_index[i] = PREPROCESS_TARGET_NONE;
         }
@@ -2134,7 +2287,7 @@ int cbm_compile_context_extract_calls(cbm_pipeline_ctx_t *ctx,
             &output_bytes, PREPROCESS_STDERR_LIMIT, &stderr_capture, &spawn_error);
         if (spawn_status != 0) {
             status = compiler_spawn_fail(ctx, owner, &spawn_error, &stderr_capture, output,
-                                         output_bytes);
+                                         output_bytes, argv, argc, working_directory);
             free(output);
             free(stderr_capture.data);
             free_preprocess_argv(argv, argc);
