@@ -597,7 +597,7 @@ typedef struct {
     bool admission_calibrating;
     bool admission_calibrated;
     bool admission_failed;
-    size_t admission_amplification;
+    size_t admission_exclusive_amplification;
     size_t admission_active_reserved_bytes;
     size_t admission_peak_reserved_bytes;
     int admission_active_files;
@@ -836,7 +836,8 @@ static bool extract_admission_acquire(extract_ctx_t *ec, int sort_pos,
         }
 
         size_t estimate = 0;
-        if (!extract_admission_multiply(token->source_bytes, ec->admission_amplification,
+        if (!extract_admission_multiply(token->source_bytes,
+                                        ec->admission_exclusive_amplification,
                                         &estimate)) {
             ec->admission_failed = true;
             extract_admission_log_refusal(file, "CBM_EXTRACTION_MEMORY_ESTIMATE_OVERFLOW",
@@ -904,23 +905,40 @@ static void extract_admission_release(extract_ctx_t *ec, extract_admission_t *to
         ec->admission_active_files--;
     }
 
-    size_t observed_growth = parse_rss > token->rss_before ? parse_rss - token->rss_before : 0;
-    size_t observed = observed_growth > retained_bytes ? observed_growth : retained_bytes;
-    size_t measured_amplification = extract_admission_ratio(observed, token->source_bytes);
     if (token->calibration) {
-        ec->admission_amplification = measured_amplification;
+        size_t observed_growth =
+            parse_rss > token->rss_before ? parse_rss - token->rss_before : 0;
+        if (!ec->admission_failed && observed_growth > SIZE_MAX - retained_bytes) {
+            ec->admission_failed = true;
+            cbm_log_error(
+                "parallel.extract.admission.calibration_failed", "code",
+                "CBM_EXTRACTION_MEMORY_CALIBRATION_OVERFLOW", "message",
+                "the exclusive parse growth and retained fact ownership exceed addressable memory",
+                "remediation",
+                "preserve the exact extraction diagnostics and retry the complete unchanged corpus");
+        } else if (!ec->admission_failed) {
+            /* This is the only attributable process-RSS sample in the generation:
+             * every peer is held while the largest file calibrates. Include the
+             * retained fact copy because fact compaction can overlap the parsed
+             * result before phase-local ownership is retired. Process-wide RSS
+             * observations made while peers run are deliberately never divided by
+             * one file's size: that charges peer/graph growth to an unrelated file
+             * and can poison the generation with an unbounded amplification. */
+            size_t observed = observed_growth + retained_bytes;
+            ec->admission_exclusive_amplification =
+                extract_admission_ratio(observed, token->source_bytes);
+            ec->admission_calibrated = true;
+            char source_buf[CBM_SZ_32];
+            char observed_buf[CBM_SZ_32];
+            char factor_buf[CBM_SZ_32];
+            snprintf(source_buf, sizeof(source_buf), "%zu", token->source_bytes);
+            snprintf(observed_buf, sizeof(observed_buf), "%zu", observed);
+            snprintf(factor_buf, sizeof(factor_buf), "%zu",
+                     ec->admission_exclusive_amplification);
+            cbm_log_info("parallel.extract.admission.calibrated", "source_bytes", source_buf,
+                         "observed_bytes", observed_buf, "amplification", factor_buf);
+        }
         ec->admission_calibrating = false;
-        ec->admission_calibrated = true;
-        char source_buf[CBM_SZ_32];
-        char observed_buf[CBM_SZ_32];
-        char factor_buf[CBM_SZ_32];
-        snprintf(source_buf, sizeof(source_buf), "%zu", token->source_bytes);
-        snprintf(observed_buf, sizeof(observed_buf), "%zu", observed);
-        snprintf(factor_buf, sizeof(factor_buf), "%zu", ec->admission_amplification);
-        cbm_log_info("parallel.extract.admission.calibrated", "source_bytes", source_buf,
-                     "observed_bytes", observed_buf, "amplification", factor_buf);
-    } else if (measured_amplification > ec->admission_amplification) {
-        ec->admission_amplification = measured_amplification;
     }
     token->held = false;
     cbm_cond_broadcast(&ec->admission_cv);
@@ -1421,12 +1439,13 @@ int cbm_parallel_extract(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, 
         char amplification[CBM_SZ_32];
         char peak_reserved[CBM_SZ_32];
         char waits[CBM_SZ_32];
-        snprintf(amplification, sizeof(amplification), "%zu", ec.admission_amplification);
+        snprintf(amplification, sizeof(amplification), "%zu",
+                 ec.admission_exclusive_amplification);
         snprintf(peak_reserved, sizeof(peak_reserved), "%zu",
                  ec.admission_peak_reserved_bytes);
         snprintf(waits, sizeof(waits), "%d",
                  atomic_load_explicit(&ec.admission_waits, memory_order_relaxed));
-        cbm_log_info("parallel.extract.admission", "amplification", amplification,
+        cbm_log_info("parallel.extract.admission", "exclusive_amplification", amplification,
                      "peak_reserved_bytes", peak_reserved, "waits", waits, "failed",
                      ec.admission_failed ? "true" : "false");
     }
