@@ -583,12 +583,92 @@ static bool is_safety_core_dir(const char *name) {
     return str_in_list(name, SAFETY_CORE_DIRS);
 }
 
+/* Git ignore rules apply only to untracked files. Keep one compact, sorted
+ * view over `git ls-files -z --cached` so the filesystem walk can distinguish
+ * an ignored build-output candidate from tracked source that happens to use
+ * the same basename. The item pointers borrow `storage`; no pathname bytes are
+ * duplicated. */
+typedef struct {
+    char *storage;
+    char **items;
+    size_t count;
+    size_t bytes;
+} tracked_paths_t;
+
+static int tracked_path_compare(const char *left, const char *right) {
+#ifdef _WIN32
+    return _stricmp(left, right);
+#else
+    return strcmp(left, right);
+#endif
+}
+
+static int tracked_path_pointer_compare(const void *left, const void *right) {
+    const char *const *left_path = left;
+    const char *const *right_path = right;
+    return tracked_path_compare(*left_path, *right_path);
+}
+
+static size_t tracked_path_lower_bound(const tracked_paths_t *tracked, const char *path) {
+    size_t low = 0;
+    size_t high = tracked ? tracked->count : 0;
+    while (low < high) {
+        size_t middle = low + (high - low) / PAIR_LEN;
+        if (tracked_path_compare(tracked->items[middle], path) < 0) {
+            low = middle + SKIP_ONE;
+        } else {
+            high = middle;
+        }
+    }
+    return low;
+}
+
+static bool tracked_path_is_exact(const tracked_paths_t *tracked, const char *path) {
+    if (!tracked || tracked->count == 0 || !path || path[0] == '\0') {
+        return false;
+    }
+    size_t at = tracked_path_lower_bound(tracked, path);
+    return at < tracked->count && tracked_path_compare(tracked->items[at], path) == 0;
+}
+
+static bool tracked_path_is_descendant(const tracked_paths_t *tracked, const char *directory) {
+    if (!tracked || tracked->count == 0 || !directory || directory[0] == '\0') {
+        return false;
+    }
+    size_t directory_len = strlen(directory);
+    size_t at = tracked_path_lower_bound(tracked, directory);
+    while (at < tracked->count) {
+        const char *candidate = tracked->items[at++];
+#ifdef _WIN32
+        if (_strnicmp(candidate, directory, directory_len) != 0) {
+#else
+        if (strncmp(candidate, directory, directory_len) != 0) {
+#endif
+            return false;
+        }
+        if (candidate[directory_len] == '/') {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void tracked_paths_free(tracked_paths_t *tracked) {
+    if (!tracked) {
+        return;
+    }
+    free(tracked->items);
+    free(tracked->storage);
+    memset(tracked, 0, sizeof(*tracked));
+}
+
 /* Check if a directory entry should be skipped (hardcoded dirs + gitignore). */
 static bool should_skip_directory(const char *entry_name, const char *rel_path,
                                   const cbm_discover_opts_t *opts, const cbm_gitignore_t *gitignore,
                                   const cbm_gitignore_t *global_gi,
                                   const cbm_gitignore_t *cbmignore, const cbm_gitignore_t *local_gi,
-                                  const char *local_gi_prefix) {
+                                  const char *local_gi_prefix,
+                                  const tracked_paths_t *tracked) {
     if (cbm_should_skip_dir(entry_name, opts ? opts->mode : CBM_MODE_FULL)) {
         /* #500: a .cbmignore negation (e.g. "!obj/") whose rule is the last
          * match for this dir un-skips a built-in skip-list dir — except the
@@ -600,13 +680,15 @@ static bool should_skip_directory(const char *entry_name, const char *rel_path,
             return true;
         }
     }
-    if (gitignore && cbm_gitignore_matches(gitignore, rel_path, true)) {
+    bool has_tracked_descendant = tracked_path_is_descendant(tracked, rel_path);
+    if (gitignore && cbm_gitignore_matches(gitignore, rel_path, true) &&
+        !has_tracked_descendant) {
         return true;
     }
     bool global_ignored = global_gi && cbm_gitignore_matches(global_gi, rel_path, true);
     if (local_gi) {
         const char *lrel = local_rel_path(rel_path, local_gi_prefix);
-        if (cbm_gitignore_matches(local_gi, lrel, true)) {
+        if (cbm_gitignore_matches(local_gi, lrel, true) && !has_tracked_descendant) {
             return true;
         }
     }
@@ -619,7 +701,7 @@ static bool should_skip_directory(const char *entry_name, const char *rel_path,
             return false;
         }
     }
-    return global_ignored;
+    return global_ignored && !has_tracked_descendant;
 }
 
 /* Check if a regular file should be skipped (filters + gitignore + size). */
@@ -627,7 +709,7 @@ static bool should_skip_file(const char *entry_name, const char *rel_path,
                              const cbm_discover_opts_t *opts, const cbm_gitignore_t *gitignore,
                              const cbm_gitignore_t *global_gi, const cbm_gitignore_t *cbmignore,
                              const cbm_gitignore_t *local_gi, const char *local_gi_prefix,
-                             off_t file_size) {
+                             off_t file_size, const tracked_paths_t *tracked) {
     cbm_index_mode_t mode = opts ? opts->mode : CBM_MODE_FULL;
     if (cbm_has_ignored_suffix(entry_name, mode)) {
         return true;
@@ -638,13 +720,14 @@ static bool should_skip_file(const char *entry_name, const char *rel_path,
     if (cbm_matches_fast_pattern(entry_name, mode)) {
         return true;
     }
-    if (gitignore && cbm_gitignore_matches(gitignore, rel_path, false)) {
+    bool is_tracked = tracked_path_is_exact(tracked, rel_path);
+    if (gitignore && cbm_gitignore_matches(gitignore, rel_path, false) && !is_tracked) {
         return true;
     }
     bool global_ignored = global_gi && cbm_gitignore_matches(global_gi, rel_path, false);
     if (local_gi) {
         const char *lrel = local_rel_path(rel_path, local_gi_prefix);
-        if (cbm_gitignore_matches(local_gi, lrel, false)) {
+        if (cbm_gitignore_matches(local_gi, lrel, false) && !is_tracked) {
             return true;
         }
     }
@@ -660,7 +743,7 @@ static bool should_skip_file(const char *entry_name, const char *rel_path,
     if (opts && opts->max_file_size > 0 && file_size > opts->max_file_size) {
         return true;
     }
-    return global_ignored;
+    return global_ignored && !is_tracked;
 }
 
 /* Detect language for a file, handling .m disambiguation and JSON filtering. */
@@ -764,9 +847,10 @@ static bool walk_dir_process_file(const char *abs_path, const char *rel_path, co
                                   const cbm_discover_opts_t *opts, const cbm_gitignore_t *gitignore,
                                   const cbm_gitignore_t *global_gi,
                                   const cbm_gitignore_t *cbmignore, const cbm_gitignore_t *local_gi,
-                                  const char *local_gi_prefix, off_t size, file_list_t *out) {
+                                  const char *local_gi_prefix, off_t size,
+                                  const tracked_paths_t *tracked, file_list_t *out) {
     if (should_skip_file(name, rel_path, opts, gitignore, global_gi, cbmignore, local_gi,
-                         local_gi_prefix, size)) {
+                         local_gi_prefix, size, tracked)) {
         return true;
     }
     CBMLanguage lang = CBM_LANG_COUNT;
@@ -906,7 +990,8 @@ static bool walk_dir_process_entry(cbm_dirent_t *entry, const walk_frame_t *fram
                                    const cbm_discover_opts_t *opts,
                                    const cbm_gitignore_t *gitignore,
                                    const cbm_gitignore_t *global_gi,
-                                   const cbm_gitignore_t *cbmignore, walk_frame_t **stack,
+                                   const cbm_gitignore_t *cbmignore,
+                                   const tracked_paths_t *tracked, walk_frame_t **stack,
                                    size_t *top, size_t *capacity, file_list_t *out) {
     char *abs_path = join_path_alloc(frame->dir, entry->name);
     char *rel_path = frame->prefix && frame->prefix[0] != '\0'
@@ -937,7 +1022,7 @@ static bool walk_dir_process_entry(cbm_dirent_t *entry, const walk_frame_t *fram
     bool ok = true;
     if (S_ISDIR(st.st_mode)) {
         if (!should_skip_directory(entry->name, rel_path, opts, gitignore, global_gi, cbmignore,
-                                   frame->local_gi, frame->local_gi_prefix)) {
+                                   frame->local_gi, frame->local_gi_prefix, tracked)) {
             ok = walk_push_subdir(stack, top, capacity, abs_path, rel_path, frame, out);
         } else {
             /* Record the excluded subtree root so callers can report it (#411). */
@@ -946,7 +1031,7 @@ static bool walk_dir_process_entry(cbm_dirent_t *entry, const walk_frame_t *fram
     } else if (S_ISREG(st.st_mode)) {
         ok = walk_dir_process_file(abs_path, rel_path, entry->name, opts, gitignore, global_gi,
                                    cbmignore, frame->local_gi, frame->local_gi_prefix, st.st_size,
-                                   out);
+                                   tracked, out);
     }
     free(abs_path);
     free(rel_path);
@@ -955,7 +1040,8 @@ static bool walk_dir_process_entry(cbm_dirent_t *entry, const walk_frame_t *fram
 
 static int walk_dir(const char *dir_path, const char *rel_prefix, const cbm_discover_opts_t *opts,
                     const cbm_gitignore_t *gitignore, const cbm_gitignore_t *global_gi,
-                    const cbm_gitignore_t *cbmignore, file_list_t *out) {
+                    const cbm_gitignore_t *cbmignore, const tracked_paths_t *tracked,
+                    file_list_t *out) {
     walk_frame_t *stack = NULL;
     size_t stack_count = 0;
     size_t stack_capacity = 0;
@@ -1027,7 +1113,7 @@ static int walk_dir(const char *dir_path, const char *rel_prefix, const cbm_disc
         cbm_dirent_t *entry;
         while (!out->failed && (entry = cbm_readdir(d)) != NULL) {
             if (!walk_dir_process_entry(entry, &frame, opts, gitignore, global_gi, cbmignore,
-                                        &stack, &stack_count, &stack_capacity, out)) {
+                                        tracked, &stack, &stack_count, &stack_capacity, out)) {
                 break;
             }
         }
@@ -1064,6 +1150,137 @@ static bool discover_path_is_absolute(const char *path) {
 #else
     return false;
 #endif
+}
+
+static bool tracked_path_shape_valid(const char *path) {
+    if (!path || path[0] == '\0' || path[0] == '/' || path[0] == '\\') {
+        return false;
+    }
+    const char *component = path;
+    for (const char *cursor = path;; cursor++) {
+#ifdef _WIN32
+        if (*cursor == '\\') {
+            return false;
+        }
+#endif
+        if (*cursor != '/' && *cursor != '\0') {
+            continue;
+        }
+        size_t length = (size_t)(cursor - component);
+        if (length == 0 || (length == SKIP_ONE && component[0] == '.') ||
+            (length == PAIR_LEN && component[0] == '.' && component[1] == '.')) {
+            return false;
+        }
+        if (*cursor == '\0') {
+            break;
+        }
+        component = cursor + SKIP_ONE;
+    }
+#ifdef _WIN32
+    if (MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path, -1, NULL, 0) <= 0) {
+        return false;
+    }
+#endif
+    return true;
+}
+
+static bool load_tracked_paths(const char *repo_path, bool is_git_repo,
+                               tracked_paths_t *out) {
+    memset(out, 0, sizeof(*out));
+    if (!is_git_repo) {
+        return true;
+    }
+    const char *const argv[] = {"git",       "-C",          repo_path, "ls-files",
+                                "-z",        "--cached",    "--deduplicate",
+                                "--",        NULL};
+    char *data = NULL;
+    size_t data_len = 0;
+    cbm_spawn_error_t spawn_error = {0};
+    if (cbm_spawn_capture(argv, &data, &data_len, &spawn_error) != 0) {
+        char native_error[32];
+        char exit_code[32];
+        snprintf(native_error, sizeof(native_error), "%lu", spawn_error.os_error);
+        snprintf(exit_code, sizeof(exit_code), "%d", spawn_error.exit_code);
+        cbm_log_error(
+            "discover.failed", "code", "CBM_DISCOVER_GIT_INDEX_ENUM_FAILED", "operation",
+            "git_ls_files_cached", "path", repo_path, "spawn_code",
+            spawn_error.code_name ? spawn_error.code_name : "CBM_SPAWN_UNKNOWN", "native_error",
+            native_error, "exit_code", exit_code, "message",
+            "Git's tracked source namespace could not be enumerated", "remediation",
+            "repair the repository index or Git executable, then retry complete discovery");
+        free(data);
+        return false;
+    }
+    if (data_len == 0) {
+        free(data);
+        return true;
+    }
+    if (data[data_len - SKIP_ONE] != '\0') {
+        cbm_log_error("discover.failed", "code", "CBM_DISCOVER_GIT_INDEX_OUTPUT_TRUNCATED",
+                      "operation", "decode_git_ls_files_cached", "path", repo_path, "message",
+                      "Git's NUL-delimited tracked source namespace has no terminal delimiter",
+                      "remediation", "preserve the output and repair the Git process stream");
+        free(data);
+        return false;
+    }
+    size_t raw_count = 0;
+    for (size_t i = 0; i < data_len; i++) {
+        if (data[i] == '\0') {
+            raw_count++;
+        }
+    }
+    if (raw_count > SIZE_MAX / sizeof(char *)) {
+        cbm_log_error("discover.failed", "code", "CBM_DISCOVER_GIT_INDEX_CAPACITY_OVERFLOW",
+                      "operation", "allocate_git_ls_files_cached", "path", repo_path, "message",
+                      "Git's tracked source count exceeds addressable memory", "remediation",
+                      "index a smaller exact repository scope with its own Git index");
+        free(data);
+        return false;
+    }
+    char **items = calloc(raw_count, sizeof(char *));
+    if (!items) {
+        cbm_log_error("discover.failed", "code", "CBM_DISCOVER_GIT_INDEX_ALLOC_FAILED",
+                      "operation", "allocate_git_ls_files_cached", "path", repo_path, "message",
+                      "the compact tracked source pointer index could not be allocated",
+                      "remediation", "free memory and retry complete discovery");
+        free(data);
+        return false;
+    }
+    size_t start = 0;
+    size_t item_count = 0;
+    for (size_t i = 0; i < data_len; i++) {
+        if (data[i] != '\0') {
+            continue;
+        }
+        const char *path = data + start;
+        if (i == start || !tracked_path_shape_valid(path)) {
+            char ordinal[32];
+            snprintf(ordinal, sizeof(ordinal), "%zu", item_count);
+            cbm_log_error(
+                "discover.failed", "code", "CBM_DISCOVER_GIT_INDEX_PATH_INVALID", "operation",
+                "decode_git_ls_files_cached", "path", repo_path, "ordinal", ordinal, "message",
+                "Git's tracked source namespace contains an empty, non-relative, or unrepresentable path",
+                "remediation", "repair the exact Git index path and retry complete discovery");
+            free(items);
+            free(data);
+            return false;
+        }
+        items[item_count++] = data + start;
+        start = i + SKIP_ONE;
+    }
+    qsort(items, item_count, sizeof(char *), tracked_path_pointer_compare);
+    size_t unique_count = 0;
+    for (size_t i = 0; i < item_count; i++) {
+        if (unique_count == 0 ||
+            tracked_path_compare(items[unique_count - SKIP_ONE], items[i]) != 0) {
+            items[unique_count++] = items[i];
+        }
+    }
+    out->storage = data;
+    out->items = items;
+    out->count = unique_count;
+    out->bytes = data_len;
+    return true;
 }
 
 static bool load_ignore_policy(const char *path, bool optional, const char *code,
@@ -1287,11 +1504,23 @@ int cbm_discover_ex(const char *repo_path, const cbm_discover_opts_t *opts, cbm_
         }
     }
 
+    /* Git ignore files govern only untracked files. Enumerate the index once so
+     * tracked sources remain visible even below an ignored directory such as a
+     * Rust module namespace named `build`. */
+    tracked_paths_t tracked = {0};
+    if (!load_tracked_paths(repo_path, is_git_repo, &tracked)) {
+        cbm_gitignore_free(gitignore);
+        cbm_gitignore_free(global_gi);
+        cbm_gitignore_free(cbmignore);
+        return CBM_NOT_FOUND;
+    }
+
     /* Walk */
     file_list_t fl = {0};
-    int walk_rc = walk_dir(repo_path, "", opts, gitignore, global_gi, cbmignore, &fl);
+    int walk_rc = walk_dir(repo_path, "", opts, gitignore, global_gi, cbmignore, &tracked, &fl);
 
     /* Cleanup */
+    tracked_paths_free(&tracked);
     cbm_gitignore_free(gitignore);
     cbm_gitignore_free(global_gi);
     cbm_gitignore_free(cbmignore);
