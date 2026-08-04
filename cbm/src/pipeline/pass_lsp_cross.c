@@ -439,7 +439,9 @@ static bool pxc_append_results(CBMArena *dst_arena, CBMResolvedCallArray *dst_ca
         const CBMResolvedCall *src = &src_out->items[j];
         if (!src->caller_qn || !src->callee_qn)
             continue;
-        char *k = cbm_arena_sprintf(&keys, "%s\x1f%s", src->caller_qn, src->callee_qn);
+        char *k = cbm_arena_sprintf(&keys, "%s\x1f%s\x1f%s",
+                                    src->preprocess_context_id ? src->preprocess_context_id : "",
+                                    src->caller_qn, src->callee_qn);
         if (!k) {
             cbm_log_error("lsp_cross.append_failed", "code", "CBM_LSP_DEDUP_KEY_ALLOC_FAILED",
                           "component", "lsp_cross.resolved_call_dedup", "operation", "key", "key",
@@ -461,15 +463,20 @@ static bool pxc_append_results(CBMArena *dst_arena, CBMResolvedCallArray *dst_ca
             cbm_arena_destroy(&keys);
             return false;
         }
-        CBMResolvedCall dst;
-        memset(&dst, 0, sizeof(dst));
+        CBMResolvedCall dst = {0};
         dst.caller_qn = cbm_arena_strdup(dst_arena, src->caller_qn);
         dst.callee_qn = cbm_arena_strdup(dst_arena, src->callee_qn);
         dst.strategy = src->strategy ? cbm_arena_strdup(dst_arena, src->strategy) : NULL;
         dst.confidence = src->confidence;
         dst.reason = src->reason ? cbm_arena_strdup(dst_arena, src->reason) : NULL;
+        dst.preprocess_context_id =
+            src->preprocess_context_id
+                ? cbm_arena_strdup(dst_arena, src->preprocess_context_id)
+                : NULL;
         if (!dst.caller_qn || !dst.callee_qn || (src->strategy && !dst.strategy) ||
-            (src->reason && !dst.reason) || !cbm_resolvedcall_push(dst_calls, dst_arena, dst)) {
+            (src->reason && !dst.reason) ||
+            (src->preprocess_context_id && !dst.preprocess_context_id) ||
+            !cbm_resolvedcall_push(dst_calls, dst_arena, dst)) {
             cbm_log_error("lsp_cross.append_failed", "code", cbm_arena_failure_code(dst_arena),
                           "component", "lsp_cross.resolved_calls", "operation",
                           cbm_arena_failure_operation(dst_arena), "key", src->caller_qn, "message",

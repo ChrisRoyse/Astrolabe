@@ -417,6 +417,14 @@ int cbm_compile_context_index_prepare(cbm_pipeline_ctx_t *ctx,
 void cbm_compile_context_index_free(cbm_compile_context_index_t *index);
 const CBMPreprocessContextSet *cbm_compile_context_for_file(
     const cbm_compile_context_index_t *index, const char *rel_path);
+bool cbm_compile_context_id_exists(const cbm_compile_context_index_t *index,
+                                   const char *context_id);
+int cbm_compile_context_target_visible(const cbm_compile_context_index_t *index,
+                                       const char *context_id, const char *target_rel_path);
+cbm_resolution_t cbm_compile_context_resolve_call(
+    const cbm_compile_context_index_t *index, const cbm_registry_t *registry,
+    const cbm_gbuf_t *gbuf, const char *context_id, const char *reference_name,
+    const char *preferred_qn, const char *focus_module_qn, bool qualified_reference);
 
 /* ── Infrascan helpers (pass_infrascan.c) ─────────────────────────── */
 

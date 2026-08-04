@@ -1248,7 +1248,7 @@ static void emit_resolved_call(GoLSPContext *ctx, const char *callee_qn, const c
     if (!ctx->resolved_calls || !callee_qn || !ctx->enclosing_func_qn)
         return;
 
-    CBMResolvedCall rc;
+    CBMResolvedCall rc = {0};
     rc.caller_qn = ctx->enclosing_func_qn;
     rc.callee_qn = callee_qn;
     rc.strategy = strategy;
@@ -1264,7 +1264,7 @@ static void emit_unresolved_call(GoLSPContext *ctx, const char *expr_text, const
     if (!ctx->resolved_calls || !ctx->enclosing_func_qn)
         return;
 
-    CBMResolvedCall rc;
+    CBMResolvedCall rc = {0};
     rc.caller_qn = ctx->enclosing_func_qn;
     rc.callee_qn = expr_text ? expr_text : "?";
     rc.strategy = "lsp_unresolved";
@@ -3305,7 +3305,7 @@ int cbm_go_fast_resolve_qualified_calls(CBMFileResult *result, CBMTypeRegistry *
         /* Emit a resolved entry. cbm_pipeline_find_lsp_resolution
          * picks the highest-confidence match, so the unresolved entry
          * stays (harmless duplicate) but our resolved entry wins. */
-        CBMResolvedCall rc;
+        CBMResolvedCall rc = {0};
         rc.caller_qn = uc->caller_qn;
         rc.callee_qn = f->qualified_name; /* borrowed from pipeline arena */
         rc.strategy = "lsp_strategy_cross_file";
@@ -3363,6 +3363,10 @@ void cbm_batch_go_lsp_cross(CBMArena *arena, CBMBatchGoLSPFile *files, int file_
                 dst->strategy = src->strategy ? cbm_arena_strdup(arena, src->strategy) : NULL;
                 dst->confidence = src->confidence;
                 dst->reason = src->reason ? cbm_arena_strdup(arena, src->reason) : NULL;
+                dst->preprocess_context_id =
+                    src->preprocess_context_id
+                        ? cbm_arena_strdup(arena, src->preprocess_context_id)
+                        : NULL;
             }
         }
 

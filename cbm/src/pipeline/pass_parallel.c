@@ -1704,6 +1704,7 @@ typedef struct {
     const cbm_file_info_t *files;
     int file_count;
     const cbm_source_slab_t *source_slab;
+    const cbm_compile_context_index_t *compile_contexts;
     const char *project_name;
     const char *repo_path;
 
@@ -2409,23 +2410,27 @@ static void lsp_idx_free_key(const char *key, void *value, void *ud) {
     free((char *)key);
 }
 
-static char *lsp_idx_key_alloc(const char *caller_qn, const char *callee_leaf) {
+static char *lsp_idx_key_alloc(const char *context_id, const char *caller_qn,
+                               const char *callee_leaf) {
     if (!caller_qn || !callee_leaf) {
         return NULL;
     }
+    size_t context_len = context_id ? strlen(context_id) : 0;
     size_t caller_len = strlen(caller_qn);
     size_t leaf_len = strlen(callee_leaf);
-    if (caller_len > SIZE_MAX - leaf_len - 2) {
+    if (context_len > SIZE_MAX - caller_len - leaf_len - 3) {
         return NULL;
     }
-    size_t len = caller_len + leaf_len + 2;
+    size_t len = context_len + caller_len + leaf_len + 3;
     char *key = malloc(len);
     if (!key) {
         return NULL;
     }
-    memcpy(key, caller_qn, caller_len);
-    key[caller_len] = '|';
-    memcpy(key + caller_len + 1, callee_leaf, leaf_len + 1);
+    memcpy(key, context_id ? context_id : "", context_len);
+    key[context_len] = '|';
+    memcpy(key + context_len + 1, caller_qn, caller_len);
+    key[context_len + caller_len + 1] = '|';
+    memcpy(key + context_len + caller_len + 2, callee_leaf, leaf_len + 1);
     return key;
 }
 
@@ -2473,7 +2478,8 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
             }
             const char *short_name = strrchr(rc_e->callee_qn, '.');
             short_name = short_name ? short_name + 1 : rc_e->callee_qn;
-            char *key = lsp_idx_key_alloc(rc_e->caller_qn, short_name);
+            char *key = lsp_idx_key_alloc(rc_e->preprocess_context_id, rc_e->caller_qn,
+                                          short_name);
             if (!key) {
                 cbm_log_error("parallel.resolve_failed", "code", "CBM_LSP_INDEX_KEY_ALLOC_FAILED",
                               "component", "parallel.lsp_idx", "operation", "key", "key",
@@ -2525,6 +2531,20 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
         if (!call->callee_name) {
             continue;
         }
+        bool has_compile_context = call->preprocess_context_id != NULL;
+        if (has_compile_context &&
+            !cbm_compile_context_id_exists(rc->compile_contexts,
+                                           call->preprocess_context_id)) {
+            cbm_log_error(
+                "parallel.resolve_failed", "code", "CBM_COMPILE_CONTEXT_ID_UNKNOWN",
+                "component", "parallel.compile_context", "operation", "resolve_call", "key",
+                call->preprocess_context_id, "message",
+                "a mapped C-family call references no immutable compiler context", "remediation",
+                "preserve the generation and rebuild its complete compile-context index");
+            ws->errors++;
+            atomic_store_explicit(rc->cancelled, SKIP_ONE, memory_order_relaxed);
+            break;
+        }
         uint64_t _rc_t0 = extract_now_ns();
         const cbm_gbuf_node_t *source_node = find_source_node(
             rc->main_gbuf, rc->project_name, rel, module_qn, call->enclosing_func_qn,
@@ -2548,7 +2568,8 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
         if (lsp_idx && call->enclosing_func_qn) {
             const char *call_leaf = cbm_pipeline_call_callee_leaf(call->callee_name);
             if (call_leaf) {
-                char *lookup_key = lsp_idx_key_alloc(call->enclosing_func_qn, call_leaf);
+                char *lookup_key = lsp_idx_key_alloc(call->preprocess_context_id,
+                                                     call->enclosing_func_qn, call_leaf);
                 if (!lookup_key) {
                     cbm_log_error("parallel.resolve_failed", "code",
                                   "CBM_LSP_INDEX_KEY_ALLOC_FAILED", "component", "parallel.lsp_idx",
@@ -2576,6 +2597,12 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
              * the registry resolver, matching prior single-lookup semantics. */
             lsp_target = cbm_pipeline_lsp_target_node(rc->main_gbuf, rc->project_name,
                                                       lsp->callee_qn, allow_tail);
+            if (has_compile_context && lsp_target &&
+                cbm_compile_context_target_visible(rc->compile_contexts,
+                                                   call->preprocess_context_id,
+                                                   lsp_target->file_path) != SKIP_ONE) {
+                lsp_target = NULL;
+            }
             if (lsp_target) {
                 res.qualified_name = lsp_target->qualified_name;
                 res.strategy = lsp->strategy ? lsp->strategy : "lsp_override";
@@ -2583,15 +2610,25 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
                 res.candidate_count = 1;
                 ws->lsp_overrides++;
             }
-        } else if (call->reference.resolved_target_qn) {
+        }
+        if (!lsp_target && call->reference.resolved_target_qn) {
             res = (cbm_resolution_t){call->reference.resolved_target_qn, "self_member", 1.0, 1};
-        } else {
+        } else if (!lsp_target && has_compile_context) {
+            res = cbm_compile_context_resolve_call(
+                rc->compile_contexts, rc->registry, rc->main_gbuf,
+                call->preprocess_context_id, call->callee_name, lsp ? lsp->callee_qn : NULL,
+                module_qn, call->reference.evidence == CBM_REF_EVIDENCE_QUALIFIED_PATH);
+            if (lsp && res.qualified_name) {
+                ws->lsp_overrides++;
+            }
+        } else if (!lsp_target) {
             res = cbm_registry_resolve_exact(rc->registry, call->callee_name, module_qn, imp_keys,
                                              imp_vals, imp_count);
         }
         atomic_fetch_add_explicit(&rc->time_ns_rc_resolve, extract_now_ns() - _rc_t0,
                                   memory_order_relaxed);
-        if (!lsp_target && call->reference.evidence == CBM_REF_EVIDENCE_LOCAL) {
+        bool lsp_authoritative = lsp_target || (has_compile_context && lsp && res.qualified_name);
+        if (!lsp_authoritative && call->reference.evidence == CBM_REF_EVIDENCE_LOCAL) {
             ws->reference_local_only++;
             continue;
         }
@@ -2647,7 +2684,7 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
                 continue;
             }
         }
-        if (!lsp_target && call->reference.evidence == CBM_REF_EVIDENCE_MEMBER &&
+        if (!lsp_authoritative && call->reference.evidence == CBM_REF_EVIDENCE_MEMBER &&
             !call->reference.resolved_target_qn) {
             if (cbm_service_pattern_route_method(call->callee_name) != NULL &&
                 call->first_string_arg && call->first_string_arg[0] == '/') {
@@ -2687,6 +2724,12 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
         } else {
             target_node = cbm_gbuf_find_by_qn_domain(
                 rc->main_gbuf, res.qualified_name, CBM_REF_DOMAIN_CALLABLE, "parallel.call_target");
+        }
+        if (has_compile_context && target_node &&
+            cbm_compile_context_target_visible(rc->compile_contexts,
+                                               call->preprocess_context_id,
+                                               target_node->file_path) != SKIP_ONE) {
+            target_node = NULL;
         }
         atomic_fetch_add_explicit(&rc->time_ns_rc_target, extract_now_ns() - _rc_t0,
                                   memory_order_relaxed);
@@ -3332,6 +3375,7 @@ int cbm_parallel_resolve(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, 
         .files = files,
         .file_count = file_count,
         .source_slab = ctx->source_slab,
+        .compile_contexts = ctx->compile_contexts,
         .project_name = ctx->project_name,
         .repo_path = ctx->repo_path,
         .workers = workers,

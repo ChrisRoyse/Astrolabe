@@ -9664,6 +9664,10 @@ void cbm_batch_rust_lsp_cross(CBMArena *arena, CBMBatchRustLSPFile *files, int f
                 dst->strategy = src->strategy ? cbm_arena_strdup(arena, src->strategy) : NULL;
                 dst->confidence = src->confidence;
                 dst->reason = src->reason ? cbm_arena_strdup(arena, src->reason) : NULL;
+                dst->preprocess_context_id =
+                    src->preprocess_context_id
+                        ? cbm_arena_strdup(arena, src->preprocess_context_id)
+                        : NULL;
             }
         }
 

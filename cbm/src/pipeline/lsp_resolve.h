@@ -144,6 +144,11 @@ static inline const CBMResolvedCall *cbm_pipeline_find_lsp_resolution(
         if (rc->confidence < CBM_LSP_CONFIDENCE_FLOOR) {
             continue;
         }
+        if ((call->preprocess_context_id == NULL) != (rc->preprocess_context_id == NULL) ||
+            (call->preprocess_context_id &&
+             strcmp(call->preprocess_context_id, rc->preprocess_context_id) != 0)) {
+            continue;
+        }
         if (strcmp(rc->caller_qn, call->enclosing_func_qn) != 0) {
             continue;
         }
@@ -200,6 +205,11 @@ static inline const CBMResolvedCall *cbm_pipeline_find_lsp_resolution(
             continue;
         }
         if (rc->confidence < CBM_LSP_CONFIDENCE_FLOOR) {
+            continue;
+        }
+        if ((call->preprocess_context_id == NULL) != (rc->preprocess_context_id == NULL) ||
+            (call->preprocess_context_id &&
+             strcmp(call->preprocess_context_id, rc->preprocess_context_id) != 0)) {
             continue;
         }
         const char *short_name = strrchr(rc->callee_qn, '.');

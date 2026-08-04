@@ -415,7 +415,7 @@ static void py_emit_resolved_call_reason(PyLSPContext *ctx, const char *callee_q
             return;
         }
     }
-    CBMResolvedCall rc;
+    CBMResolvedCall rc = {0};
     memset(&rc, 0, sizeof(rc));
     rc.caller_qn = ctx->enclosing_func_qn;
     rc.callee_qn = cbm_arena_strdup(ctx->arena, callee_qn);
@@ -4000,6 +4000,10 @@ void cbm_batch_py_lsp_cross(CBMArena *arena, CBMBatchPyLSPFile *files, int file_
                     dst->strategy = src->strategy ? cbm_arena_strdup(arena, src->strategy) : NULL;
                     dst->confidence = src->confidence;
                     dst->reason = src->reason ? cbm_arena_strdup(arena, src->reason) : NULL;
+                    dst->preprocess_context_id =
+                        src->preprocess_context_id
+                            ? cbm_arena_strdup(arena, src->preprocess_context_id)
+                            : NULL;
                 }
             } else {
                 out[f].count = 0;

@@ -1320,6 +1320,7 @@ static CBMFileResult *cbm_extract_file_impl(const char *source, int source_len,
             }
             int expanded_len = result->has_error ? 0 : (int)expanded_size;
             int calls_before = result->calls.count;
+            int resolved_calls_before = result->resolved_calls.count;
 
             // Parse expanded source with fresh tree
             CBMLanguage context_language =
@@ -1382,6 +1383,11 @@ static CBMFileResult *cbm_extract_file_impl(const char *source, int source_len,
                             for (int call_index = calls_before;
                                  call_index < result->calls.count; call_index++) {
                                 result->calls.items[call_index].preprocess_context_id =
+                                    owned_context_id;
+                            }
+                            for (int resolved_index = resolved_calls_before;
+                                 resolved_index < result->resolved_calls.count; resolved_index++) {
+                                result->resolved_calls.items[resolved_index].preprocess_context_id =
                                     owned_context_id;
                             }
                         }
@@ -1866,6 +1872,7 @@ bool cbm_file_result_compact_facts(CBMFileResult *result, const char *immutable_
         COMPACT_FACT_DUP(dst, src, callee_qn);
         COMPACT_FACT_DUP(dst, src, strategy);
         COMPACT_FACT_DUP(dst, src, reason);
+        COMPACT_FACT_DUP(dst, src, preprocess_context_id);
     }
     for (int i = 0; i < result->string_refs.count; i++) {
         const CBMStringRef *src = &result->string_refs.items[i];

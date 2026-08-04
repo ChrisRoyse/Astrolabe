@@ -3533,7 +3533,7 @@ static void c_emit_resolved_call_orig(CLSPContext *ctx, const char *callee_qn, c
                                       const char *strategy, float confidence) {
     if (!ctx->resolved_calls || !callee_qn || !ctx->enclosing_func_qn)
         return;
-    CBMResolvedCall rc;
+    CBMResolvedCall rc = {0};
     rc.caller_qn = ctx->enclosing_func_qn;
     rc.callee_qn = callee_qn;
     rc.strategy = strategy;
@@ -3558,7 +3558,7 @@ static void c_emit_resolved_call(CLSPContext *ctx, const char *callee_qn, const 
 static void c_emit_unresolved_call(CLSPContext *ctx, const char *expr_text, const char *reason) {
     if (!ctx->resolved_calls || !ctx->enclosing_func_qn)
         return;
-    CBMResolvedCall rc;
+    CBMResolvedCall rc = {0};
     rc.caller_qn = ctx->enclosing_func_qn;
     rc.callee_qn = expr_text ? expr_text : "?";
     rc.strategy = "lsp_unresolved";
@@ -5742,6 +5742,10 @@ void cbm_batch_c_lsp_cross(CBMArena *arena, CBMBatchCLSPFile *files, int file_co
                 dst->strategy = src->strategy ? cbm_arena_strdup(arena, src->strategy) : NULL;
                 dst->confidence = src->confidence;
                 dst->reason = src->reason ? cbm_arena_strdup(arena, src->reason) : NULL;
+                dst->preprocess_context_id =
+                    src->preprocess_context_id
+                        ? cbm_arena_strdup(arena, src->preprocess_context_id)
+                        : NULL;
             }
         }
 

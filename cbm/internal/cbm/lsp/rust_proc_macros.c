@@ -91,7 +91,7 @@ void cbm_rust_synth_proc_macro_edges(CBMArena *arena, CBMFileResult *result) {
                     continue;
                 /* Emit one resolved call per edge. */
                 for (int e = 0; s->edges[e]; e++) {
-                    CBMResolvedCall rc;
+                    CBMResolvedCall rc = {0};
                     memset(&rc, 0, sizeof(rc));
                     rc.caller_qn = d->qualified_name;
                     rc.callee_qn = cbm_arena_strdup(arena, s->edges[e]);

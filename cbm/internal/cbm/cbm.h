@@ -452,6 +452,7 @@ typedef struct {
     const char *strategy;  // "lsp_type_dispatch", "lsp_direct", etc.
     float confidence;      // 0.90-0.95
     const char *reason;    // diagnostic label for unresolved calls (NULL if resolved)
+    const char *preprocess_context_id; // exact mapped C-family TU context, otherwise NULL
 } CBMResolvedCall;
 
 typedef struct {

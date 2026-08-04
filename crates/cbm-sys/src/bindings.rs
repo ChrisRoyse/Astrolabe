@@ -803,6 +803,7 @@ pub struct CBMResolvedCall {
     pub strategy: *const ::std::os::raw::c_char,
     pub confidence: f32,
     pub reason: *const ::std::os::raw::c_char,
+    pub preprocess_context_id: *const ::std::os::raw::c_char,
 }
 impl Default for CBMResolvedCall {
     fn default() -> Self {

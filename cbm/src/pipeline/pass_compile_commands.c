@@ -8,6 +8,7 @@
  * is read-only thereafter.
  */
 #include "pipeline/pipeline_internal.h"
+#include "pipeline/lsp_resolve.h"
 
 #include "foundation/sha256.h"
 #include "foundation/constants.h"
@@ -66,6 +67,8 @@ struct cbm_compile_context_index {
     int compiler_baseline_reuses;
     int captured_command_count;
     bool compiler_capture_telemetry_present;
+    CBMHashTable *contexts_by_id;
+    CBMHashTable *sets_by_rel_path;
 };
 
 static int context_fail(cbm_pipeline_ctx_t *ctx, const char *code, const char *operation,
@@ -414,13 +417,22 @@ static const cbm_file_info_t *find_source_file(const cbm_file_info_t *files, int
 }
 
 static compile_context_set_owner_t *find_set(cbm_compile_context_index_t *index,
-                                             const char *rel_path) {
+                                              const char *rel_path) {
+    if (index && index->sets_by_rel_path && rel_path) {
+        return (compile_context_set_owner_t *)cbm_ht_get(index->sets_by_rel_path, rel_path);
+    }
     for (int i = 0; i < index->set_count; i++) {
         if (strcmp(index->sets[i].rel_path, rel_path) == 0) {
             return &index->sets[i];
         }
     }
     return NULL;
+}
+
+static int compare_string_ptrs(const void *left, const void *right) {
+    const char *const *a = (const char *const *)left;
+    const char *const *b = (const char *const *)right;
+    return strcmp(*a, *b);
 }
 
 static int append_context_to_set(cbm_pipeline_ctx_t *ctx, compile_context_set_owner_t *set,
@@ -481,17 +493,63 @@ static int materialize_context_sets(cbm_pipeline_ctx_t *ctx,
         }
     }
     index->set_count = source_count;
+    if (source_count > (int)((UINT32_MAX - 16U) / 2U)) {
+        return context_fail(ctx, "CBM_COMPILE_CONTEXT_CAPACITY_OVERFLOW",
+                            "index_file_contexts", ctx->repo_path, (size_t)source_count,
+                            "the source count exceeds the context hash representation",
+                            "reduce the corpus generation or extend the context index");
+    }
+    index->sets_by_rel_path = cbm_ht_create((uint32_t)source_count * 2U + 16U);
+    if (!index->sets_by_rel_path) {
+        return context_fail(ctx, "CBM_COMPILE_CONTEXT_ALLOC_FAILED", "index_file_contexts",
+                            ctx->repo_path, (size_t)source_count,
+                            "the immutable file-to-context hash index could not be allocated",
+                            "free memory and retry the unchanged corpus");
+    }
     for (int i = 0; i < source_count; i++) {
         index->sets[i].rel_path = strdup(source_files[i].rel_path);
-        if (!index->sets[i].rel_path) {
+        if (!index->sets[i].rel_path ||
+            !cbm_ht_set_checked(index->sets_by_rel_path, index->sets[i].rel_path,
+                                &index->sets[i], NULL)) {
             return context_fail(ctx, "CBM_COMPILE_CONTEXT_ALLOC_FAILED", "copy_file_path",
                                 source_files[i].rel_path, 0,
                                 "a source path could not be retained in the context index",
                                 "free memory and retry the unchanged corpus");
         }
     }
+    if (index->context_count > 0) {
+        if (index->context_count > (int)((UINT32_MAX - 16U) / 2U)) {
+            return context_fail(ctx, "CBM_COMPILE_CONTEXT_CAPACITY_OVERFLOW",
+                                "index_context_identities", ctx->repo_path,
+                                (size_t)index->context_count,
+                                "the translation-unit count exceeds the context hash representation",
+                                "reduce the corpus generation or extend the context index");
+        }
+        index->contexts_by_id =
+            cbm_ht_create((uint32_t)index->context_count * 2U + 16U);
+        if (!index->contexts_by_id) {
+            return context_fail(ctx, "CBM_COMPILE_CONTEXT_ALLOC_FAILED",
+                                "index_context_identities", ctx->repo_path,
+                                (size_t)index->context_count,
+                                "the immutable context-identity hash index could not be allocated",
+                                "free memory and retry the unchanged corpus");
+        }
+    }
     for (int c = 0; c < index->context_count; c++) {
         compile_context_owner_t *context = &index->contexts[c];
+        compile_context_owner_t *existing = (compile_context_owner_t *)cbm_ht_get(
+            index->contexts_by_id, context->view.context_id);
+        if (!existing &&
+            !cbm_ht_set_checked(index->contexts_by_id, context->view.context_id, context, NULL)) {
+            return context_fail(ctx, "CBM_COMPILE_CONTEXT_ALLOC_FAILED",
+                                "index_context_identity", context->tu_rel_path, 0,
+                                "a context identity could not be indexed",
+                                "free memory and retry the unchanged corpus");
+        }
+        if (context->dependency_count > 1) {
+            qsort(context->dependencies, (size_t)context->dependency_count,
+                  sizeof(*context->dependencies), compare_string_ptrs);
+        }
         for (int d = 0; d < context->dependency_count; d++) {
             compile_context_set_owner_t *set = find_set(index, context->dependencies[d]);
             if (set && append_context_to_set(ctx, set, &context->view) != 0) {
@@ -547,8 +605,10 @@ static int materialize_context_sets(cbm_pipeline_ctx_t *ctx,
                  contexts_text, "file_context_bindings", bindings_text, "cache_builds", "1",
                  "context_reuses", reuse_text, "compiler_baseline_queries",
                  baseline_queries_text, "compiler_baseline_reuses", baseline_reuses_text,
-                 "cache", "generation_owned_immutable", "entry_source_cache", "source_slab",
-                 "entry_source_disk_reads", "0");
+                  "cache", "generation_owned_immutable", "entry_source_cache", "source_slab",
+                  "entry_source_disk_reads", "0", "file_context_lookup", "hash_o1",
+                  "context_identity_lookup", "hash_o1", "dependency_membership",
+                  "sorted_binary_search");
     return 0;
 }
 
@@ -845,18 +905,165 @@ const CBMPreprocessContextSet *cbm_compile_context_for_file(
     if (!index || !rel_path) {
         return NULL;
     }
-    for (int i = 0; i < index->set_count; i++) {
-        if (index->sets[i].rel_path && strcmp(index->sets[i].rel_path, rel_path) == 0) {
-            return &index->sets[i].view;
+    compile_context_set_owner_t *set = index->sets_by_rel_path
+                                           ? (compile_context_set_owner_t *)cbm_ht_get(
+                                                 index->sets_by_rel_path, rel_path)
+                                           : NULL;
+    return set ? &set->view : NULL;
+}
+
+static const compile_context_owner_t *find_context_by_id(
+    const cbm_compile_context_index_t *index, const char *context_id) {
+    return index && index->contexts_by_id && context_id
+               ? (const compile_context_owner_t *)cbm_ht_get(index->contexts_by_id, context_id)
+               : NULL;
+}
+
+bool cbm_compile_context_id_exists(const cbm_compile_context_index_t *index,
+                                   const char *context_id) {
+    return find_context_by_id(index, context_id) != NULL;
+}
+
+static bool context_dependency_contains(const compile_context_owner_t *context,
+                                        const char *rel_path) {
+    if (!context || !rel_path || context->dependency_count <= 0) {
+        return false;
+    }
+    char *key = (char *)rel_path;
+    return bsearch(&key, context->dependencies, (size_t)context->dependency_count,
+                   sizeof(*context->dependencies), compare_string_ptrs) != NULL;
+}
+
+int cbm_compile_context_target_visible(const cbm_compile_context_index_t *index,
+                                       const char *context_id, const char *target_rel_path) {
+    const compile_context_owner_t *context = find_context_by_id(index, context_id);
+    if (!context) {
+        return CBM_NOT_FOUND;
+    }
+    return context_dependency_contains(context, target_rel_path) ? SKIP_ONE : 0;
+}
+
+static size_t normalize_context_qn(char *out, size_t capacity, const char *value) {
+    size_t written = 0;
+    if (!out || capacity == 0 || !value) {
+        return 0;
+    }
+    for (const char *at = value; *at && written + 1 < capacity;) {
+        if (at[0] == ':' && at[1] == ':') {
+            out[written++] = '.';
+            at += 2;
+        } else {
+            out[written++] = *at++;
         }
     }
-    return NULL;
+    out[written] = '\0';
+    return written;
+}
+
+static bool context_qn_has_tail(const char *qualified_name, const char *tail) {
+    size_t qn_len = qualified_name ? strlen(qualified_name) : 0;
+    size_t tail_len = tail ? strlen(tail) : 0;
+    if (tail_len == 0 || qn_len < tail_len) {
+        return false;
+    }
+    const char *start = qualified_name + qn_len - tail_len;
+    return strcmp(start, tail) == 0 && (start == qualified_name || start[-1] == '.');
+}
+
+static cbm_resolution_t select_visible_context_target(
+    const cbm_compile_context_index_t *index, const cbm_registry_t *registry,
+    const cbm_gbuf_t *gbuf, const char *context_id, const char *reference_name,
+    const char *required_tail, const char *strategy) {
+    cbm_resolution_t result = {0};
+    const char *leaf = cbm_pipeline_call_callee_leaf(reference_name);
+    const char **candidates = NULL;
+    int candidate_count = 0;
+    if (!leaf || !leaf[0] ||
+        cbm_registry_find_by_name(registry, leaf, &candidates, &candidate_count) != 0) {
+        result.strategy = "compiler_scope_target_missing";
+        return result;
+    }
+    const char *match = NULL;
+    int matches = 0;
+    for (int i = 0; i < candidate_count; i++) {
+        const char *candidate = candidates[i];
+        if (required_tail && !context_qn_has_tail(candidate, required_tail)) {
+            continue;
+        }
+        const cbm_gbuf_node_t *node = cbm_gbuf_find_by_qn_domain(
+            gbuf, candidate, CBM_REF_DOMAIN_CALLABLE, "compile_context.call_target");
+        if (!node || !node->file_path ||
+            cbm_compile_context_target_visible(index, context_id, node->file_path) != SKIP_ONE) {
+            continue;
+        }
+        match = node->qualified_name;
+        matches++;
+        if (matches > SKIP_ONE) {
+            break;
+        }
+    }
+    result.candidate_count = matches;
+    if (matches == SKIP_ONE) {
+        result.qualified_name = match;
+        result.strategy = strategy;
+        result.confidence = required_tail ? 0.99 : 0.98;
+    } else if (matches > SKIP_ONE) {
+        result.strategy = "ambiguous_compiler_scope";
+    } else {
+        result.strategy = "compiler_scope_target_missing";
+    }
+    return result;
+}
+
+cbm_resolution_t cbm_compile_context_resolve_call(
+    const cbm_compile_context_index_t *index, const cbm_registry_t *registry,
+    const cbm_gbuf_t *gbuf, const char *context_id, const char *reference_name,
+    const char *preferred_qn, const char *focus_module_qn, bool qualified_reference) {
+    cbm_resolution_t missing = {0};
+    if (!find_context_by_id(index, context_id)) {
+        missing.strategy = "compiler_context_missing";
+        return missing;
+    }
+
+    char normalized[CBM_SZ_512];
+    if (preferred_qn && preferred_qn[0]) {
+        size_t preferred_len = normalize_context_qn(normalized, sizeof(normalized), preferred_qn);
+        const char *tail = normalized;
+        size_t module_len = focus_module_qn ? strlen(focus_module_qn) : 0;
+        if (module_len > 0 && preferred_len > module_len &&
+            strncmp(normalized, focus_module_qn, module_len) == 0 &&
+            normalized[module_len] == '.') {
+            tail = normalized + module_len + 1;
+        }
+        cbm_resolution_t typed = select_visible_context_target(
+            index, registry, gbuf, context_id, reference_name, tail, "compiler_scope_lsp");
+        if (typed.qualified_name ||
+            (typed.strategy && strcmp(typed.strategy, "ambiguous_compiler_scope") == 0)) {
+            return typed;
+        }
+    }
+
+    if (qualified_reference) {
+        normalize_context_qn(normalized, sizeof(normalized), reference_name);
+        cbm_resolution_t qualified = select_visible_context_target(
+            index, registry, gbuf, context_id, reference_name, normalized,
+            "compiler_scope_qualified");
+        if (qualified.qualified_name ||
+            (qualified.strategy && strcmp(qualified.strategy, "ambiguous_compiler_scope") == 0)) {
+            return qualified;
+        }
+    }
+
+    return select_visible_context_target(index, registry, gbuf, context_id, reference_name, NULL,
+                                         "compiler_scope");
 }
 
 void cbm_compile_context_index_free(cbm_compile_context_index_t *index) {
     if (!index) {
         return;
     }
+    cbm_ht_free(index->contexts_by_id);
+    cbm_ht_free(index->sets_by_rel_path);
     for (int i = 0; i < index->set_count; i++) {
         free(index->sets[i].rel_path);
         free(index->sets[i].items);

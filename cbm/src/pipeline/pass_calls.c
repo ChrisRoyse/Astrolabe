@@ -345,6 +345,21 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call,
                                const CBMResolvedCallArray *lsp_calls, const char *rel,
                                const char *module_qn, const char **imp_keys, const char **imp_vals,
                                int imp_count, CBMLanguage lang, call_resolution_stats_t *stats) {
+    bool has_compile_context = call->preprocess_context_id != NULL;
+    if (has_compile_context &&
+        !cbm_compile_context_id_exists(ctx->compile_contexts, call->preprocess_context_id)) {
+        cbm_log_error("reference.resolution_failed", "code", "CBM_COMPILE_CONTEXT_ID_UNKNOWN",
+                      "operation", "resolve_call", "key", call->preprocess_context_id,
+                      "message", "a mapped C-family call references no immutable compiler context",
+                      "remediation",
+                      "preserve the generation and rebuild its complete compile-context index");
+        cbm_pipeline_record_fatal_error(
+            ctx->pipeline, "CBM_COMPILE_CONTEXT_ID_UNKNOWN", "resolve_call", "compile_context",
+            call->preprocess_context_id, 0,
+            "a mapped C-family call references no immutable compiler context",
+            "preserve the generation and rebuild its complete compile-context index");
+        return CBM_NOT_FOUND;
+    }
     const cbm_gbuf_node_t *source_node =
         calls_find_source(ctx, rel, module_qn, call->enclosing_func_qn, call->start_line);
     if (!source_node) {
@@ -355,23 +370,39 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call,
      * Unique-tail fallbacks are JVM-only (see cbm_pipeline_lsp_allow_tail_match). */
     bool allow_tail = cbm_pipeline_lsp_allow_tail_match(lang);
     const CBMResolvedCall *lsp = cbm_pipeline_find_lsp_resolution(lsp_calls, call, allow_tail);
+    const cbm_gbuf_node_t *lsp_target = NULL;
+    cbm_resolution_t res = {0};
     if (lsp) {
-        const cbm_gbuf_node_t *target_node =
+        lsp_target =
             cbm_pipeline_lsp_target_node(ctx->gbuf, ctx->project_name, lsp->callee_qn, allow_tail);
-        if (target_node && source_node->id != target_node->id) {
-            cbm_resolution_t res = {0};
+        if (has_compile_context && lsp_target &&
+            cbm_compile_context_target_visible(ctx->compile_contexts,
+                                               call->preprocess_context_id,
+                                               lsp_target->file_path) != SKIP_ONE) {
+            lsp_target = NULL;
+        }
+        if (lsp_target && source_node->id != lsp_target->id) {
             /* Use the gbuf node's QN so downstream edge props show the canonical
              * project-qualified form even when fallback prefixed the project. */
-            res.qualified_name = target_node->qualified_name;
+            res.qualified_name = lsp_target->qualified_name;
             res.confidence = lsp->confidence;
             res.strategy = lsp->strategy;
             res.candidate_count = 1;
-            emit_classified_edge(ctx, call, source_node, target_node, &res, module_qn, imp_keys,
+            emit_classified_edge(ctx, call, source_node, lsp_target, &res, module_qn, imp_keys,
                                  imp_vals, imp_count, false);
             return SKIP_ONE;
         }
     }
-    if (call->reference.evidence == CBM_REF_EVIDENCE_LOCAL) {
+    if (call->reference.resolved_target_qn) {
+        res = (cbm_resolution_t){call->reference.resolved_target_qn, "self_member", 1.0, 1};
+    } else if (has_compile_context) {
+        res = cbm_compile_context_resolve_call(
+            ctx->compile_contexts, ctx->registry, ctx->gbuf, call->preprocess_context_id,
+            call->callee_name, lsp ? lsp->callee_qn : NULL, module_qn,
+            call->reference.evidence == CBM_REF_EVIDENCE_QUALIFIED_PATH);
+    }
+    bool lsp_authoritative = lsp && res.qualified_name;
+    if (!lsp_authoritative && call->reference.evidence == CBM_REF_EVIDENCE_LOCAL) {
         stats->local_only++;
         return 0;
     }
@@ -399,7 +430,7 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call,
             return SKIP_ONE;
         }
     }
-    if (call->reference.evidence == CBM_REF_EVIDENCE_MEMBER &&
+    if (!lsp_authoritative && call->reference.evidence == CBM_REF_EVIDENCE_MEMBER &&
         !call->reference.resolved_target_qn) {
         if (cbm_service_pattern_route_method(call->callee_name) != NULL && call->first_string_arg &&
             call->first_string_arg[0] == '/') {
@@ -411,11 +442,10 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call,
         return 0;
     }
 
-    cbm_resolution_t res =
-        call->reference.resolved_target_qn
-            ? (cbm_resolution_t){call->reference.resolved_target_qn, "self_member", 1.0, 1}
-            : cbm_registry_resolve_exact(ctx->registry, call->callee_name, module_qn, imp_keys,
+    if (!res.qualified_name && !has_compile_context && !call->reference.resolved_target_qn) {
+        res = cbm_registry_resolve_exact(ctx->registry, call->callee_name, module_qn, imp_keys,
                                          imp_vals, imp_count);
+    }
     if (!res.qualified_name || res.qualified_name[0] == '\0') {
         /* Resolution is empty when the callee belongs to an EXTERNAL client
          * library whose source is not in the indexed tree (e.g. `requests.get`,
@@ -495,6 +525,12 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call,
 
     const cbm_gbuf_node_t *target_node = cbm_gbuf_find_by_qn_domain(
         ctx->gbuf, res.qualified_name, CBM_REF_DOMAIN_CALLABLE, "calls.call_target");
+    if (has_compile_context && target_node &&
+        cbm_compile_context_target_visible(ctx->compile_contexts,
+                                           call->preprocess_context_id,
+                                           target_node->file_path) != SKIP_ONE) {
+        target_node = NULL;
+    }
     if (!target_node || source_node->id == target_node->id) {
         if (!target_node) {
             stats->incompatible++;
@@ -581,8 +617,18 @@ int cbm_pipeline_pass_calls(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *file
                 continue;
             }
             total_calls++;
-            if (resolve_single_call(ctx, call, &result->resolved_calls, rel, module_qn, imp_keys,
-                                    imp_vals, imp_count, files[i].language, &stats)) {
+            int resolution = resolve_single_call(ctx, call, &result->resolved_calls, rel, module_qn,
+                                                 imp_keys, imp_vals, imp_count, files[i].language,
+                                                 &stats);
+            if (resolution == CBM_NOT_FOUND) {
+                free(module_qn);
+                cbm_pipeline_import_map_free(imp_keys, imp_vals, imp_count);
+                if (result_owned) {
+                    cbm_free_result(result);
+                }
+                return CBM_NOT_FOUND;
+            }
+            if (resolution) {
                 resolved++;
             } else {
                 unresolved++;
