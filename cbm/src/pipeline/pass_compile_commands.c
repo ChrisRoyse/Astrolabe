@@ -47,6 +47,7 @@ typedef struct {
     size_t line_count;
     size_t mapped_lines;
     size_t workspace_local_compiler_markers;
+    size_t working_directory_markers;
 } compiler_expansion_t;
 
 #define PREPROCESS_TARGET_NONE UINT32_MAX
@@ -1739,18 +1740,65 @@ static bool parse_compiler_linemarker(const char *line, size_t length,
     return true;
 }
 
+static bool is_exact_working_directory_marker(const char *working_directory,
+                                              const char *filename,
+                                              uint32_t source_line,
+                                              size_t output_line_index) {
+    /* GCC's -fworking-directory emits exactly this synthetic second
+     * linemarker (cwd followed by "//"); -g enables it implicitly. It is
+     * compiler metadata, not a dependency. Validate every documented field
+     * before excluding it from repository-source mapping. */
+    if (!working_directory || !filename || source_line != 1U || output_line_index != 1U) {
+        return false;
+    }
+    size_t filename_length = strlen(filename);
+    if (filename_length <= 2U || filename[filename_length - 2U] != '/' ||
+        filename[filename_length - 1U] != '/') {
+        return false;
+    }
+    size_t marker_directory_length = filename_length - 2U;
+    size_t working_directory_length = strlen(working_directory);
+    while (marker_directory_length > 0U &&
+           (filename[marker_directory_length - 1U] == '/' ||
+            filename[marker_directory_length - 1U] == '\\')) {
+        marker_directory_length--;
+    }
+    while (working_directory_length > 0U &&
+           (working_directory[working_directory_length - 1U] == '/' ||
+            working_directory[working_directory_length - 1U] == '\\')) {
+        working_directory_length--;
+    }
+    if (marker_directory_length != working_directory_length) {
+        return false;
+    }
+    for (size_t i = 0; i < marker_directory_length; i++) {
+        if (!path_char_equal(filename[i], working_directory[i])) {
+            return false;
+        }
+    }
+    return true;
+}
+
 static int marker_target(cbm_pipeline_ctx_t *ctx, cbm_compile_context_index_t *index,
                           const compile_context_owner_t *owner,
                           const char *working_directory, const char *filename,
+                          uint32_t source_line, size_t output_line_index,
                           const uint32_t *target_by_source_index, uint32_t *target_out,
                           bool *mapped_target,
-                          bool *workspace_local_compiler_marker) {
+                          bool *workspace_local_compiler_marker,
+                          bool *working_directory_marker) {
     *target_out = PREPROCESS_TARGET_NONE;
     *mapped_target = false;
     *workspace_local_compiler_marker = false;
+    *working_directory_marker = false;
     size_t filename_length = strlen(filename);
     if (filename_length >= 2 && filename[0] == '<' &&
         filename[filename_length - 1] == '>') {
+        return 0;
+    }
+    if (is_exact_working_directory_marker(working_directory, filename, source_line,
+                                          output_line_index)) {
+        *working_directory_marker = true;
         return 0;
     }
     char *canonical = canonical_normalized_path(working_directory, filename);
@@ -1765,12 +1813,13 @@ static int marker_target(cbm_pipeline_ctx_t *ctx, cbm_compile_context_index_t *i
     if (relative) {
         compile_context_set_owner_t *set = find_set(index, relative);
         if (!context_dependency_contains(owner, relative)) {
-            free(canonical);
-            return preprocess_fail(
-                ctx, "CBM_PREPROCESS_DEPENDENCY_DRIFT", "map_compiler_linemarker",
-                owner->tu_rel_path, 0,
+            int failure = preprocess_linemarker_fail(
+                ctx, owner, "CBM_PREPROCESS_DEPENDENCY_DRIFT", "map_compiler_linemarker",
+                filename, canonical,
                 "the compiler expansion names a repository source outside its captured dependency closure",
                 "regenerate the compilation context and retry the unchanged source generation");
+            free(canonical);
+            return failure;
         }
         if (set) {
             uint32_t target = target_by_source_index[set->source_index];
@@ -1878,6 +1927,7 @@ static int map_compiler_expansion(cbm_pipeline_ctx_t *ctx,
     uint32_t logical_line = 0;
     size_t mapped_lines = 0;
     size_t workspace_local_compiler_markers = 0;
+    size_t working_directory_markers = 0;
     size_t line_index = 0;
     size_t canonical_bytes = 0;
     size_t start = 0;
@@ -1908,9 +1958,11 @@ static int map_compiler_expansion(cbm_pipeline_ctx_t *ctx,
         if (marker) {
             bool mapped_target = false;
             bool workspace_local_compiler_marker = false;
-            int mapping = marker_target(ctx, index, owner, working_directory, marker_file,
-                                        target_by_source_index, &current_target, &mapped_target,
-                                        &workspace_local_compiler_marker);
+            bool working_directory_marker = false;
+            int mapping = marker_target(
+                ctx, index, owner, working_directory, marker_file, marker_line, line_index,
+                target_by_source_index, &current_target, &mapped_target,
+                &workspace_local_compiler_marker, &working_directory_marker);
             free(marker_file);
             if (mapping != 0) {
                 free(text);
@@ -1921,6 +1973,9 @@ static int map_compiler_expansion(cbm_pipeline_ctx_t *ctx,
             logical_line = marker_line;
             if (workspace_local_compiler_marker) {
                 workspace_local_compiler_markers++;
+            }
+            if (working_directory_marker) {
+                working_directory_markers++;
             }
             targets[line_index] = PREPROCESS_TARGET_NONE;
             source_lines[line_index] = PREPROCESS_TARGET_NONE;
@@ -1999,6 +2054,7 @@ static int map_compiler_expansion(cbm_pipeline_ctx_t *ctx,
     out->line_count = line_count;
     out->mapped_lines = mapped_lines;
     out->workspace_local_compiler_markers = workspace_local_compiler_markers;
+    out->working_directory_markers = working_directory_markers;
     return 0;
 }
 
@@ -2192,6 +2248,7 @@ int cbm_compile_context_extract_calls(cbm_pipeline_ctx_t *ctx,
     uint64_t compiler_stdout_bytes_total = 0;
     uint64_t mapped_lines_total = 0;
     uint64_t workspace_local_compiler_markers_total = 0;
+    uint64_t working_directory_markers_total = 0;
     uint64_t target_projections = 0;
     size_t peak_expansion_bytes = 0;
     size_t peak_compiler_stdout_bytes = 0;
@@ -2309,6 +2366,7 @@ int cbm_compile_context_extract_calls(cbm_pipeline_ctx_t *ctx,
             char targets_text[32];
             char stderr_text[32];
             char workspace_local_compiler_markers_text[32];
+            char working_directory_markers_text[32];
             sha256_hex(expansion.text, expansion.text_bytes, expansion_hash);
             snprintf(bytes_text, sizeof(bytes_text), "%zu", expansion.text_bytes);
             snprintf(stdout_bytes_text, sizeof(stdout_bytes_text), "%zu",
@@ -2319,6 +2377,9 @@ int cbm_compile_context_extract_calls(cbm_pipeline_ctx_t *ctx,
             snprintf(workspace_local_compiler_markers_text,
                      sizeof(workspace_local_compiler_markers_text), "%zu",
                      expansion.workspace_local_compiler_markers);
+            snprintf(working_directory_markers_text,
+                     sizeof(working_directory_markers_text), "%zu",
+                     expansion.working_directory_markers);
             cbm_sha256_update(&expansion_set_hash, owner->view.context_id,
                               strlen(owner->view.context_id));
             cbm_sha256_update(&expansion_set_hash, "\0", 1);
@@ -2332,6 +2393,7 @@ int cbm_compile_context_extract_calls(cbm_pipeline_ctx_t *ctx,
                 "canonicalization", "validated_linemarkers_to_empty_lines",
                 "workspace_local_compiler_markers",
                 workspace_local_compiler_markers_text,
+                "working_directory_markers", working_directory_markers_text,
                 "source_date_epoch", index->source_date_epoch,
                 "source_date_epoch_provenance", "git_head_commit",
                 "source_date_epoch_revision", index->source_date_epoch_revision,
@@ -2357,6 +2419,7 @@ int cbm_compile_context_extract_calls(cbm_pipeline_ctx_t *ctx,
                 mapped_lines_total += expansion.mapped_lines;
                 workspace_local_compiler_markers_total +=
                     expansion.workspace_local_compiler_markers;
+                working_directory_markers_total += expansion.working_directory_markers;
                 target_projections += target_count;
                 if (expansion.text_bytes > peak_expansion_bytes) {
                     peak_expansion_bytes = expansion.text_bytes;
@@ -2397,6 +2460,7 @@ int cbm_compile_context_extract_calls(cbm_pipeline_ctx_t *ctx,
         char total_stdout_bytes_text[32];
         char mapped_text[32];
         char workspace_local_compiler_markers_text[32];
+        char working_directory_markers_text[32];
         char peak_text[32];
         char peak_stdout_text[32];
         cbm_sha256_final(&expansion_set_hash, digest);
@@ -2416,6 +2480,9 @@ int cbm_compile_context_extract_calls(cbm_pipeline_ctx_t *ctx,
         snprintf(workspace_local_compiler_markers_text,
                  sizeof(workspace_local_compiler_markers_text), "%llu",
                  (unsigned long long)workspace_local_compiler_markers_total);
+        snprintf(working_directory_markers_text,
+                 sizeof(working_directory_markers_text), "%llu",
+                 (unsigned long long)working_directory_markers_total);
         snprintf(peak_text, sizeof(peak_text), "%zu", peak_expansion_bytes);
         snprintf(peak_stdout_text, sizeof(peak_stdout_text), "%zu",
                  peak_compiler_stdout_bytes);
@@ -2424,7 +2491,8 @@ int cbm_compile_context_extract_calls(cbm_pipeline_ctx_t *ctx,
             contexts_text, "target_projections", projections_text, "expanded_bytes",
             total_bytes_text, "compiler_stdout_bytes", total_stdout_bytes_text, "mapped_lines",
             mapped_text, "workspace_local_compiler_markers",
-            workspace_local_compiler_markers_text, "peak_expansion_bytes", peak_text,
+            workspace_local_compiler_markers_text, "working_directory_markers",
+            working_directory_markers_text, "peak_expansion_bytes", peak_text,
             "peak_compiler_stdout_bytes", peak_stdout_text, "expansion_set_sha256", set_hash, "cache",
             "one_compiler_expansion_per_context", "canonicalization",
             "validated_linemarkers_to_empty_lines", "date_time_macros",
