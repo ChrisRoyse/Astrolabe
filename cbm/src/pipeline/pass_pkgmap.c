@@ -1982,11 +1982,12 @@ allocation_failed:
     return NULL;
 }
 
-/* Resolve Rust's external-module declaration contract. A declaration in a
- * crate root or mod.rs searches beside that file; a declaration in name.rs
- * searches below name/. Exactly one of `<module>.rs` and `<module>/mod.rs`
- * must exist. Keeping this as a typed import resolution prevents semantic
- * `use` paths from being mistaken for source files. */
+/* Resolve Rust's external-module declaration contract. Extraction owns the
+ * compiler filesystem namespace and supplies the exact physical candidate stem
+ * relative to this source directory. Exactly one of `<stem>.rs` and
+ * `<stem>/mod.rs` must exist. Keeping the physical plan in the typed import
+ * prevents the live pipeline and historical closure from re-deriving different
+ * crate-root or inline-module rules. */
 static const cbm_gbuf_node_t *resolve_rust_module_source(const cbm_pipeline_ctx_t *ctx,
                                                          const char *source_rel,
                                                          const char *module_path) {
@@ -1997,25 +1998,8 @@ static const cbm_gbuf_node_t *resolve_rust_module_source(const cbm_pipeline_ctx_
     if (!dir) {
         goto allocation_failed;
     }
-    const char *basename = strrchr(source_rel, '/');
-    basename = basename ? basename + 1 : source_rel;
-    char *module_root = NULL;
-    if (strcmp(basename, "lib.rs") == 0 || strcmp(basename, "main.rs") == 0 ||
-        strcmp(basename, "mod.rs") == 0) {
-        module_root = strdup(dir);
-    } else {
-        size_t basename_len = strlen(basename);
-        size_t stem_len = ends_with(basename, ".rs") ? basename_len - strlen(".rs") : basename_len;
-        char *stem = cbm_strndup(basename, stem_len);
-        module_root = stem ? concat3(dir, dir[0] ? "/" : "", stem) : NULL;
-        free(stem);
-    }
+    char *base = concat3(dir, dir[0] ? "/" : "", module_path);
     free(dir);
-    if (!module_root) {
-        goto allocation_failed;
-    }
-    char *base = concat3(module_root, module_root[0] ? "/" : "", module_path);
-    free(module_root);
     if (!base) {
         goto allocation_failed;
     }

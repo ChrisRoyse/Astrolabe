@@ -668,13 +668,312 @@ static void parse_java_imports(CBMExtractCtx *ctx) {
 // use_declaration -> use_list or scoped_use_list
 // mod_item without a declaration_list -> an exact compiler source request.
 
-static void parse_rust_scope_imports(CBMExtractCtx *ctx, TSNode scope, const char *module_prefix) {
+static void set_rust_path_attribute_error(CBMExtractCtx *ctx, const char *code,
+                                          const char *message, const char *remediation) {
+    cbm_file_result_set_error(ctx->result, code, "extract_rust_path_attribute", "extraction", 0,
+                              message, remediation);
+}
+
+static int rust_hex_value(unsigned char ch) {
+    if (ch >= '0' && ch <= '9') {
+        return (int)(ch - '0');
+    }
+    if (ch >= 'a' && ch <= 'f') {
+        return (int)(ch - 'a') + 10;
+    }
+    if (ch >= 'A' && ch <= 'F') {
+        return (int)(ch - 'A') + 10;
+    }
+    return -1;
+}
+
+static bool rust_append_utf8(char *out, size_t capacity, size_t *used, uint32_t codepoint) {
+    size_t needed = codepoint <= 0x7FU    ? 1U
+                    : codepoint <= 0x7FFU ? 2U
+                    : codepoint <= 0xFFFFU
+                        ? 3U
+                        : 4U;
+    if (!out || !used || *used > capacity || needed > capacity - *used || codepoint > 0x10FFFFU ||
+        (codepoint >= 0xD800U && codepoint <= 0xDFFFU) || codepoint == 0) {
+        return false;
+    }
+    if (needed == 1U) {
+        out[(*used)++] = (char)codepoint;
+    } else if (needed == 2U) {
+        out[(*used)++] = (char)(0xC0U | (codepoint >> 6U));
+        out[(*used)++] = (char)(0x80U | (codepoint & 0x3FU));
+    } else if (needed == 3U) {
+        out[(*used)++] = (char)(0xE0U | (codepoint >> 12U));
+        out[(*used)++] = (char)(0x80U | ((codepoint >> 6U) & 0x3FU));
+        out[(*used)++] = (char)(0x80U | (codepoint & 0x3FU));
+    } else {
+        out[(*used)++] = (char)(0xF0U | (codepoint >> 18U));
+        out[(*used)++] = (char)(0x80U | ((codepoint >> 12U) & 0x3FU));
+        out[(*used)++] = (char)(0x80U | ((codepoint >> 6U) & 0x3FU));
+        out[(*used)++] = (char)(0x80U | (codepoint & 0x3FU));
+    }
+    return true;
+}
+
+/* Decode the exact Rust string-literal contract used by #[path]. The decoded
+ * path can never exceed the source spelling, so one arena allocation bounded
+ * by the AST node text is sufficient. Invalid, non-string, NUL-bearing, or
+ * non-scalar spellings fail the whole file instead of becoming guessed paths. */
+static char *decode_rust_path_literal(CBMExtractCtx *ctx, TSNode value_node) {
+    const char *kind = ts_node_type(value_node);
+    bool raw_literal = strcmp(kind, "raw_string_literal") == 0;
+    if (!raw_literal && strcmp(kind, "string_literal") != 0) {
+        set_rust_path_attribute_error(
+            ctx, "CBM_RUST_PATH_ATTRIBUTE_LITERAL_INVALID",
+            "a Rust path attribute value is not a string literal",
+            "replace the path attribute value with one exact Rust string literal");
+        return NULL;
+    }
+    char *literal = cbm_node_text(ctx->arena, value_node, ctx->source);
+    if (!literal) {
+        return NULL;
+    }
+    size_t len = strlen(literal);
+    char *decoded = cbm_arena_alloc(ctx->arena, len + SKIP_ONE);
+    if (!decoded) {
+        return NULL;
+    }
+    size_t used = 0;
+
+    if (raw_literal) {
+        size_t hashes = 0;
+        if (len < CBM_QUOTE_PAIR || literal[0] != 'r') {
+            goto invalid_literal;
+        }
+        size_t open_quote = SKIP_ONE;
+        while (open_quote < len && literal[open_quote] == '#') {
+            hashes++;
+            open_quote++;
+        }
+        if (open_quote >= len || literal[open_quote] != '"' ||
+            len < open_quote + CBM_QUOTE_PAIR + hashes) {
+            goto invalid_literal;
+        }
+        size_t close_quote = len - hashes - SKIP_ONE;
+        if (literal[close_quote] != '"') {
+            goto invalid_literal;
+        }
+        for (size_t i = 0; i < hashes; i++) {
+            if (literal[close_quote + SKIP_ONE + i] != '#') {
+                goto invalid_literal;
+            }
+        }
+        size_t content_start = open_quote + SKIP_ONE;
+        size_t content_len = close_quote - content_start;
+        if (content_len == 0 || memchr(literal + content_start, '\0', content_len) != NULL) {
+            goto invalid_literal;
+        }
+        memcpy(decoded, literal + content_start, content_len);
+        used = content_len;
+    } else {
+        if (len < CBM_QUOTE_PAIR || literal[0] != '"' || literal[len - SKIP_ONE] != '"') {
+            goto invalid_literal;
+        }
+        for (size_t i = SKIP_ONE; i < len - SKIP_ONE; i++) {
+            unsigned char ch = (unsigned char)literal[i];
+            if (ch != '\\') {
+                if (ch == 0) {
+                    goto invalid_literal;
+                }
+                decoded[used++] = (char)ch;
+                continue;
+            }
+            i++;
+            if (i >= len - SKIP_ONE) {
+                goto invalid_literal;
+            }
+            ch = (unsigned char)literal[i];
+            if (ch == '\n' || ch == '\r') {
+                if (ch == '\r') {
+                    if (i + SKIP_ONE >= len - SKIP_ONE || literal[i + SKIP_ONE] != '\n') {
+                        goto invalid_literal;
+                    }
+                    i++;
+                }
+                while (i + SKIP_ONE < len - SKIP_ONE &&
+                       isspace((unsigned char)literal[i + SKIP_ONE])) {
+                    i++;
+                }
+                continue;
+            }
+            switch (ch) {
+            case '\\':
+            case '"':
+            case '\'':
+                decoded[used++] = (char)ch;
+                break;
+            case 'n':
+                decoded[used++] = '\n';
+                break;
+            case 'r':
+                decoded[used++] = '\r';
+                break;
+            case 't':
+                decoded[used++] = '\t';
+                break;
+            case '0':
+                goto invalid_literal;
+            case 'x': {
+                if (i + PAIR_LEN >= len - SKIP_ONE) {
+                    goto invalid_literal;
+                }
+                int high = rust_hex_value((unsigned char)literal[i + SKIP_ONE]);
+                int low = rust_hex_value((unsigned char)literal[i + PAIR_LEN]);
+                if (high < 0 || low < 0) {
+                    goto invalid_literal;
+                }
+                unsigned int byte = (unsigned int)((high << 4) | low);
+                if (byte == 0 || byte > 0x7FU) {
+                    goto invalid_literal;
+                }
+                decoded[used++] = (char)byte;
+                i += PAIR_LEN;
+                break;
+            }
+            case 'u': {
+                if (i + SKIP_ONE >= len - SKIP_ONE || literal[i + SKIP_ONE] != '{') {
+                    goto invalid_literal;
+                }
+                i += PAIR_LEN;
+                uint32_t codepoint = 0;
+                size_t digits = 0;
+                while (i < len - SKIP_ONE && literal[i] != '}') {
+                    if (literal[i] == '_') {
+                        i++;
+                        continue;
+                    }
+                    int value = rust_hex_value((unsigned char)literal[i]);
+                    if (value < 0 || digits >= 6U) {
+                        goto invalid_literal;
+                    }
+                    codepoint = (codepoint << 4U) | (uint32_t)value;
+                    digits++;
+                    i++;
+                }
+                if (i >= len - SKIP_ONE || literal[i] != '}' || digits == 0 ||
+                    !rust_append_utf8(decoded, len, &used, codepoint)) {
+                    goto invalid_literal;
+                }
+                break;
+            }
+            default:
+                goto invalid_literal;
+            }
+        }
+        if (used == 0) {
+            goto invalid_literal;
+        }
+    }
+    decoded[used] = '\0';
+    return decoded;
+
+invalid_literal:
+    set_rust_path_attribute_error(
+        ctx, "CBM_RUST_PATH_ATTRIBUTE_LITERAL_INVALID",
+        "a Rust path attribute contains an invalid, empty, or NUL-bearing string literal",
+        "repair the path attribute to contain one valid non-empty Rust source path");
+    return NULL;
+}
+
+static bool read_rust_path_attribute(CBMExtractCtx *ctx, TSNode attribute_item,
+                                     const char **out_path) {
+    *out_path = NULL;
+    TSNode attribute = ts_node_named_child(attribute_item, 0);
+    if (ts_node_is_null(attribute) || strcmp(ts_node_type(attribute), "attribute") != 0) {
+        set_rust_path_attribute_error(
+            ctx, "CBM_RUST_PATH_ATTRIBUTE_AST_INVALID",
+            "a Rust outer attribute has no exact attribute AST child",
+            "repair the Rust parser/grammar contract before retrying indexing");
+        return false;
+    }
+    TSNode name_node = ts_node_named_child(attribute, 0);
+    char *name = ts_node_is_null(name_node)
+                     ? NULL
+                     : cbm_node_text(ctx->arena, name_node, ctx->source);
+    if (!name || strcmp(name, "path") != 0) {
+        return true;
+    }
+    TSNode value_node = ts_node_child_by_field_name(attribute, TS_FIELD("value"));
+    if (ts_node_is_null(value_node)) {
+        set_rust_path_attribute_error(ctx, "CBM_RUST_PATH_ATTRIBUTE_VALUE_MISSING",
+                                      "a Rust path attribute has no value",
+                                      "supply one exact Rust string literal after path =");
+        return false;
+    }
+    *out_path = decode_rust_path_literal(ctx, value_node);
+    return *out_path != NULL;
+}
+
+static char *join_rust_physical_path(CBMArena *arena, const char *prefix, const char *path) {
+    if (!path || !path[0]) {
+        return NULL;
+    }
+    return prefix && prefix[0] ? cbm_arena_sprintf(arena, "%s/%s", prefix, path)
+                               : cbm_arena_strdup(arena, path);
+}
+
+static char *rust_root_physical_prefix(CBMExtractCtx *ctx) {
+    const char *basename = file_path_last(ctx->rel_path);
+    if (!basename || !basename[0]) {
+        set_rust_path_attribute_error(
+            ctx, "CBM_RUST_SOURCE_PATH_MISSING",
+            "Rust module extraction has no physical source filename",
+            "supply the repository-relative Rust source path before extraction");
+        return NULL;
+    }
+    if (strcmp(basename, "lib.rs") == 0 || strcmp(basename, "main.rs") == 0 ||
+        strcmp(basename, "mod.rs") == 0 || strcmp(basename, "build.rs") == 0) {
+        return cbm_arena_strdup(ctx->arena, "");
+    }
+    size_t len = strlen(basename);
+    if (len <= strlen(".rs") || strcmp(basename + len - strlen(".rs"), ".rs") != 0) {
+        set_rust_path_attribute_error(
+            ctx, "CBM_RUST_SOURCE_PATH_INVALID",
+            "Rust module extraction source filename has no .rs suffix",
+            "repair the language/path classification before retrying extraction");
+        return NULL;
+    }
+    return cbm_arena_strndup(ctx->arena, basename, len - strlen(".rs"));
+}
+
+static void parse_rust_scope_imports(CBMExtractCtx *ctx, TSNode scope,
+                                     const char *physical_prefix, bool inside_inline) {
     CBMArena *a = ctx->arena;
+    const char *pending_path = NULL;
     uint32_t child_count = ts_node_named_child_count(scope);
     for (uint32_t i = 0; i < child_count; i++) {
         TSNode node = ts_node_named_child(scope, i);
         const char *kind = ts_node_type(node);
+        if (strcmp(kind, "attribute_item") == 0) {
+            const char *attribute_path = NULL;
+            if (!read_rust_path_attribute(ctx, node, &attribute_path)) {
+                return;
+            }
+            if (attribute_path) {
+                if (pending_path) {
+                    set_rust_path_attribute_error(
+                        ctx, "CBM_RUST_PATH_ATTRIBUTE_DUPLICATE",
+                        "one Rust module declaration has multiple path attributes",
+                        "retain exactly one path attribute on the module declaration");
+                    return;
+                }
+                pending_path = attribute_path;
+            }
+            continue;
+        }
         if (strcmp(kind, "use_declaration") == 0) {
+            if (pending_path) {
+                set_rust_path_attribute_error(
+                    ctx, "CBM_RUST_PATH_ATTRIBUTE_TARGET_INVALID",
+                    "a Rust path attribute does not target a module declaration",
+                    "move the path attribute directly before its module declaration");
+                return;
+            }
             char *full = cbm_node_text(a, node, ctx->source);
             if (!full) {
                 continue;
@@ -695,6 +994,13 @@ static void parse_rust_scope_imports(CBMExtractCtx *ctx, TSNode scope, const cha
             continue;
         }
         if (strcmp(kind, "mod_item") != 0) {
+            if (pending_path) {
+                set_rust_path_attribute_error(
+                    ctx, "CBM_RUST_PATH_ATTRIBUTE_TARGET_INVALID",
+                    "a Rust path attribute does not target a module declaration",
+                    "move the path attribute directly before its module declaration");
+                return;
+            }
             continue;
         }
 
@@ -703,13 +1009,6 @@ static void parse_rust_scope_imports(CBMExtractCtx *ctx, TSNode scope, const cha
         if (!name || !name[0]) {
             continue;
         }
-        char *module_path = module_prefix && module_prefix[0]
-                                ? cbm_arena_sprintf(a, "%s/%s", module_prefix, name)
-                                : name;
-        if (!module_path) {
-            return;
-        }
-
         TSNode body = ts_node_child_by_field_name(node, TS_FIELD("body"));
         if (ts_node_is_null(body)) {
             uint32_t mod_children = ts_node_named_child_count(node);
@@ -722,28 +1021,56 @@ static void parse_rust_scope_imports(CBMExtractCtx *ctx, TSNode scope, const cha
             }
         }
         if (!ts_node_is_null(body)) {
-            parse_rust_scope_imports(ctx, body, module_path);
-            if (cbm_arena_failed(a)) {
+            char *child_prefix = pending_path
+                                     ? join_rust_physical_path(a,
+                                                               inside_inline ? physical_prefix : "",
+                                                               pending_path)
+                                     : join_rust_physical_path(a, physical_prefix, name);
+            pending_path = NULL;
+            if (!child_prefix) {
+                return;
+            }
+            parse_rust_scope_imports(ctx, body, child_prefix, true);
+            if (cbm_arena_failed(a) || ctx->result->has_error) {
                 return;
             }
             continue;
         }
 
+        char *module_path = pending_path
+                                ? join_rust_physical_path(
+                                      a, inside_inline ? physical_prefix : "", pending_path)
+                                : join_rust_physical_path(a, physical_prefix, name);
+        bool exact_path = pending_path != NULL;
+        pending_path = NULL;
+        if (!module_path) {
+            return;
+        }
         CBMImport imp = {
             .local_name = NULL,
             .module_path = module_path,
-            .dependency_kind = "rust_module",
-            .resolution = CBM_IMPORT_RESOLVE_RUST_MODULE,
+            .dependency_kind = exact_path ? "rust_path_module" : "rust_module",
+            .resolution = exact_path ? CBM_IMPORT_RESOLVE_EXACT_SOURCE
+                                     : CBM_IMPORT_RESOLVE_RUST_MODULE,
             .binding = CBM_IMPORT_BINDING_UNBOUND,
         };
         if (!cbm_imports_push(&ctx->result->imports, a, imp)) {
             return;
         }
     }
+    if (pending_path) {
+        set_rust_path_attribute_error(ctx, "CBM_RUST_PATH_ATTRIBUTE_TARGET_MISSING",
+                                      "a Rust path attribute has no following module declaration",
+                                      "add the declared module or remove the orphan path attribute");
+    }
 }
 
 static void parse_rust_imports(CBMExtractCtx *ctx) {
-    parse_rust_scope_imports(ctx, ctx->root, "");
+    char *physical_prefix = rust_root_physical_prefix(ctx);
+    if (!physical_prefix) {
+        return;
+    }
+    parse_rust_scope_imports(ctx, ctx->root, physical_prefix, false);
 }
 
 // --- C/C++ imports ---

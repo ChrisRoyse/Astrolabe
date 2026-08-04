@@ -308,9 +308,11 @@ typedef enum {
      * not TypeScript source assertions: an exact repository source may bind,
      * otherwise the runtime request itself remains a first-class graph atom. */
     CBM_IMPORT_RESOLVE_BROWSER_URL = 4,
-    /* A Rust external module declaration (`mod name;`). The source is one of
-     * the two exact compiler-defined candidates (`name.rs`, `name/mod.rs`),
-     * relative to the declaring module's filesystem namespace. */
+    /* A Rust external module declaration (`mod name;`). `module_path` is the
+     * already-extracted physical candidate stem relative to the declaring
+     * source directory, including every inline-module namespace component.
+     * The source is exactly one of `<module_path>.rs` and
+     * `<module_path>/mod.rs`. A `#[path]` declaration is ExactSource instead. */
     CBM_IMPORT_RESOLVE_RUST_MODULE = 5,
 } CBMImportResolution;
 
@@ -326,7 +328,7 @@ typedef enum {
 
 typedef struct {
     const char *local_name;      // local alias/name; NULL for an unbound dependency
-    const char *module_path;     // resolved module path / QN
+    const char *module_path;     // semantic QN or exact/typed physical source request
     const char *resource_kind;   // document/resource category; otherwise NULL
     const char *dependency_kind; // unbound code dependency category; otherwise NULL
     CBMImportResolution resolution;

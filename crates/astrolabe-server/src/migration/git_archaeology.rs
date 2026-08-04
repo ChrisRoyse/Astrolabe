@@ -4222,21 +4222,9 @@ fn rust_module_dependency_candidates(
     source_rel: &str,
     module_path: &str,
 ) -> Result<Vec<String>, DynError> {
-    let source_name = source_rel.rsplit('/').next().unwrap_or(source_rel);
-    let module_prefix = if matches!(source_name, "lib.rs" | "main.rs" | "mod.rs") {
-        module_path.to_string()
-    } else {
-        let stem = source_name.strip_suffix(".rs").ok_or_else(|| -> DynError {
-            format!(
-                "ASTRO_ARCHAEOLOGY_DEPENDENCY_RUST_SOURCE_INVALID: Rust module dependency source {source_rel:?} has no .rs suffix; remediation=repair the language/path contract before retrying"
-            )
-            .into()
-        })?;
-        format!("{stem}/{module_path}")
-    };
     Ok(vec![
-        normalize_exact_source_dependency(source_rel, &format!("{module_prefix}.rs"))?,
-        normalize_exact_source_dependency(source_rel, &format!("{module_prefix}/mod.rs"))?,
+        normalize_exact_source_dependency(source_rel, &format!("{module_path}.rs"))?,
+        normalize_exact_source_dependency(source_rel, &format!("{module_path}/mod.rs"))?,
     ])
 }
 
