@@ -46,6 +46,7 @@ typedef struct {
     uint32_t *line_source_lines;
     size_t line_count;
     size_t mapped_lines;
+    size_t workspace_local_compiler_markers;
 } compiler_expansion_t;
 
 #define PREPROCESS_TARGET_NONE UINT32_MAX
@@ -72,6 +73,8 @@ typedef struct {
     int owned_undefine_count;
     char **owned_forced_includes;
     int owned_forced_include_count;
+    char **compiler_system_roots;
+    int compiler_system_root_count;
     char **dependencies;
     int dependency_count;
 } compile_context_owner_t;
@@ -127,6 +130,24 @@ static int preprocess_fail(cbm_pipeline_ctx_t *ctx, const char *code,
     cbm_pipeline_record_fatal_error(ctx ? ctx->pipeline : NULL, code, operation,
                                     "compiler_preprocess", path, requested, message,
                                     remediation);
+    return CBM_NOT_FOUND;
+}
+
+static int preprocess_linemarker_fail(cbm_pipeline_ctx_t *ctx,
+                                      const compile_context_owner_t *owner,
+                                      const char *code, const char *operation,
+                                      const char *filename, const char *canonical,
+                                      const char *message, const char *remediation) {
+    const char *translation_unit = owner && owner->tu_rel_path ? owner->tu_rel_path : "";
+    cbm_log_error("compiler_preprocess.failed", "code", code, "operation", operation,
+                  "path", translation_unit, "marker_filename", filename ? filename : "",
+                  "marker_canonical", canonical ? canonical : "", "source_root",
+                  ctx && ctx->source_root ? ctx->source_root : "", "repository_root",
+                  ctx && ctx->repo_path ? ctx->repo_path : "", "message", message,
+                  "remediation", remediation);
+    cbm_pipeline_record_fatal_error(ctx ? ctx->pipeline : NULL, code, operation,
+                                    "compiler_preprocess", translation_unit,
+                                    filename ? strlen(filename) : 0, message, remediation);
     return CBM_NOT_FOUND;
 }
 
@@ -592,6 +613,63 @@ static bool append_resolved_path(char ***items, int *count, const char *director
     return ok;
 }
 
+static bool paths_overlap(const char *left, const char *right) {
+    return path_relative_within(left, right) != NULL ||
+           path_relative_within(right, left) != NULL;
+}
+
+static bool retained_path_contains(char **items, int count, const char *path) {
+    for (int i = 0; i < count; i++) {
+        if (path_equal(items[i], path)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static int retain_compiler_system_roots(cbm_pipeline_ctx_t *ctx,
+                                        compile_context_owner_t *owner,
+                                        const compile_baseline_t *baseline) {
+    for (int baseline_index = 0; baseline_index < baseline->system_include_count;
+         baseline_index++) {
+        const char *declared = baseline->system_include_paths[baseline_index];
+        char *canonical = canonical_normalized_path(owner->directory, declared);
+        if (!canonical) {
+            return context_fail(
+                ctx, "CBM_COMPILE_CONTEXT_SYSTEM_INCLUDE_UNRESOLVED",
+                "canonicalize_system_include_root", declared, 0,
+                "an exact compiler-reported include root cannot be resolved",
+                "restore the captured compiler installation and regenerate its build context");
+        }
+        bool command_source_root = false;
+        for (int include_index = 0; include_index < owner->owned_include_count;
+             include_index++) {
+            char *include_root = canonical_normalized_path(
+                owner->directory, owner->owned_include_paths[include_index]);
+            if (include_root && paths_overlap(include_root, canonical)) {
+                command_source_root = true;
+            }
+            free(include_root);
+            if (command_source_root) {
+                break;
+            }
+        }
+        if (!command_source_root &&
+            !retained_path_contains(owner->compiler_system_roots,
+                                    owner->compiler_system_root_count, canonical) &&
+            !append_owned_string(&owner->compiler_system_roots,
+                                 &owner->compiler_system_root_count, canonical)) {
+            free(canonical);
+            return context_fail(ctx, "CBM_COMPILE_CONTEXT_ALLOC_FAILED",
+                                "retain_compiler_system_root", declared, 0,
+                                "an exact compiler-owned include root could not be retained",
+                                "free memory and retry the unchanged corpus");
+        }
+        free(canonical);
+    }
+    return 0;
+}
+
 static const char *consume_option_value(char **arguments, int argument_count, int *index,
                                         const char *joined_prefix) {
     const char *argument = arguments[*index];
@@ -673,6 +751,9 @@ static int configure_context_from_arguments(cbm_pipeline_ctx_t *ctx,
             "parse_compile_arguments", owner->tu_rel_path, 0,
             "the exact translation-unit language contradicts its declared compiler standard",
             "repair the real compiler argv and regenerate the compilation context");
+    }
+    if (retain_compiler_system_roots(ctx, owner, baseline) != 0) {
+        return CBM_NOT_FOUND;
     }
     for (int i = 0; i < baseline->system_include_count; i++) {
         if (!append_owned_string(&owner->owned_include_paths, &owner->owned_include_count,
@@ -1443,6 +1524,19 @@ static bool context_dependency_contains(const compile_context_owner_t *context,
                    sizeof(*context->dependencies), compare_string_ptrs) != NULL;
 }
 
+static bool context_compiler_system_contains(const compile_context_owner_t *context,
+                                             const char *canonical) {
+    if (!context || !canonical) {
+        return false;
+    }
+    for (int i = 0; i < context->compiler_system_root_count; i++) {
+        if (path_relative_within(context->compiler_system_roots[i], canonical)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static void sha256_hex(const void *bytes, size_t byte_count,
                        char out[CBM_SHA256_HEX_LEN + 1]) {
     cbm_sha256_ctx hash;
@@ -1541,12 +1635,14 @@ static bool parse_compiler_linemarker(const char *line, size_t length,
 }
 
 static int marker_target(cbm_pipeline_ctx_t *ctx, cbm_compile_context_index_t *index,
-                         const compile_context_owner_t *owner,
-                         const char *working_directory, const char *filename,
-                         const uint32_t *target_by_source_index, uint32_t *target_out,
-                         bool *mapped_target) {
+                          const compile_context_owner_t *owner,
+                          const char *working_directory, const char *filename,
+                          const uint32_t *target_by_source_index, uint32_t *target_out,
+                          bool *mapped_target,
+                          bool *workspace_local_compiler_marker) {
     *target_out = PREPROCESS_TARGET_NONE;
     *mapped_target = false;
+    *workspace_local_compiler_marker = false;
     size_t filename_length = strlen(filename);
     if (filename_length >= 2 && filename[0] == '<' &&
         filename[filename_length - 1] == '>') {
@@ -1591,13 +1687,22 @@ static int marker_target(cbm_pipeline_ctx_t *ctx, cbm_compile_context_index_t *i
         free(canonical);
         return 0;
     }
-    if (path_relative_within(ctx->repo_path, canonical)) {
-        free(canonical);
-        return preprocess_fail(
-            ctx, "CBM_PREPROCESS_LIVE_SOURCE_ESCAPE", "map_compiler_linemarker",
-            owner->tu_rel_path, 0,
+    const char *live_relative = path_relative_within(ctx->repo_path, canonical);
+    if (live_relative) {
+        if (!context_dependency_contains(owner, live_relative) &&
+            !find_set(index, live_relative) &&
+            context_compiler_system_contains(owner, canonical)) {
+            *workspace_local_compiler_marker = true;
+            free(canonical);
+            return 0;
+        }
+        int failure = preprocess_linemarker_fail(
+            ctx, owner, "CBM_PREPROCESS_LIVE_SOURCE_ESCAPE", "map_compiler_linemarker",
+            filename, canonical,
             "the compiler read live repository bytes instead of the immutable source snapshot",
             "rewrite every repository-local compiler path to the captured generation and retry");
+        free(canonical);
+        return failure;
     }
     free(canonical);
     return 0; /* compiler/toolchain headers are context, not repository atoms */
@@ -1667,6 +1772,7 @@ static int map_compiler_expansion(cbm_pipeline_ctx_t *ctx,
     uint32_t current_target = PREPROCESS_TARGET_NONE;
     uint32_t logical_line = 0;
     size_t mapped_lines = 0;
+    size_t workspace_local_compiler_markers = 0;
     size_t line_index = 0;
     size_t canonical_bytes = 0;
     size_t start = 0;
@@ -1696,8 +1802,10 @@ static int map_compiler_expansion(cbm_pipeline_ctx_t *ctx,
         }
         if (marker) {
             bool mapped_target = false;
+            bool workspace_local_compiler_marker = false;
             int mapping = marker_target(ctx, index, owner, working_directory, marker_file,
-                                        target_by_source_index, &current_target, &mapped_target);
+                                        target_by_source_index, &current_target, &mapped_target,
+                                        &workspace_local_compiler_marker);
             free(marker_file);
             if (mapping != 0) {
                 free(text);
@@ -1706,6 +1814,9 @@ static int map_compiler_expansion(cbm_pipeline_ctx_t *ctx,
                 return mapping;
             }
             logical_line = marker_line;
+            if (workspace_local_compiler_marker) {
+                workspace_local_compiler_markers++;
+            }
             targets[line_index] = PREPROCESS_TARGET_NONE;
             source_lines[line_index] = PREPROCESS_TARGET_NONE;
             (void)mapped_target;
@@ -1782,6 +1893,7 @@ static int map_compiler_expansion(cbm_pipeline_ctx_t *ctx,
     out->line_source_lines = source_lines;
     out->line_count = line_count;
     out->mapped_lines = mapped_lines;
+    out->workspace_local_compiler_markers = workspace_local_compiler_markers;
     return 0;
 }
 
@@ -1876,7 +1988,8 @@ int cbm_compile_context_extract_calls(cbm_pipeline_ctx_t *ctx,
     if (index->authority_absent || index->context_count == 0) {
         cbm_log_info("compiler_preprocess.ready", "compiler_invocations", "0", "syntax_trees",
                      "0", "target_projections", "0", "expanded_bytes", "0", "mapped_lines",
-                     "0", "peak_expansion_bytes", "0", "authority",
+                     "0", "workspace_local_compiler_markers", "0", "peak_expansion_bytes",
+                     "0", "authority",
                      index->authority_absent ? "absent" : "not_applicable", "cache",
                      "one_compiler_expansion_per_context", "canonicalization",
                      "validated_linemarkers_to_empty_lines", "date_time_macros",
@@ -1929,6 +2042,7 @@ int cbm_compile_context_extract_calls(cbm_pipeline_ctx_t *ctx,
     uint64_t expanded_bytes_total = 0;
     uint64_t compiler_stdout_bytes_total = 0;
     uint64_t mapped_lines_total = 0;
+    uint64_t workspace_local_compiler_markers_total = 0;
     uint64_t target_projections = 0;
     size_t peak_expansion_bytes = 0;
     size_t peak_compiler_stdout_bytes = 0;
@@ -2041,6 +2155,7 @@ int cbm_compile_context_extract_calls(cbm_pipeline_ctx_t *ctx,
             char stdout_bytes_text[32];
             char targets_text[32];
             char stderr_text[32];
+            char workspace_local_compiler_markers_text[32];
             sha256_hex(expansion.text, expansion.text_bytes, expansion_hash);
             snprintf(bytes_text, sizeof(bytes_text), "%zu", expansion.text_bytes);
             snprintf(stdout_bytes_text, sizeof(stdout_bytes_text), "%zu",
@@ -2048,6 +2163,9 @@ int cbm_compile_context_extract_calls(cbm_pipeline_ctx_t *ctx,
             snprintf(targets_text, sizeof(targets_text), "%zu", target_count);
             snprintf(stderr_text, sizeof(stderr_text), "%llu",
                      (unsigned long long)stderr_total_bytes);
+            snprintf(workspace_local_compiler_markers_text,
+                     sizeof(workspace_local_compiler_markers_text), "%zu",
+                     expansion.workspace_local_compiler_markers);
             cbm_sha256_update(&expansion_set_hash, owner->view.context_id,
                               strlen(owner->view.context_id));
             cbm_sha256_update(&expansion_set_hash, "\0", 1);
@@ -2059,6 +2177,8 @@ int cbm_compile_context_extract_calls(cbm_pipeline_ctx_t *ctx,
                 expansion_hash, "projection_targets", targets_text, "stderr_total_bytes",
                 stderr_text, "stderr_truncated", stderr_truncated ? "true" : "false",
                 "canonicalization", "validated_linemarkers_to_empty_lines",
+                "workspace_local_compiler_markers",
+                workspace_local_compiler_markers_text,
                 "source_date_epoch", index->source_date_epoch,
                 "source_date_epoch_provenance", "git_head_commit",
                 "source_date_epoch_revision", index->source_date_epoch_revision,
@@ -2082,6 +2202,8 @@ int cbm_compile_context_extract_calls(cbm_pipeline_ctx_t *ctx,
                 expanded_bytes_total += expansion.text_bytes;
                 compiler_stdout_bytes_total += compiler_stdout_bytes;
                 mapped_lines_total += expansion.mapped_lines;
+                workspace_local_compiler_markers_total +=
+                    expansion.workspace_local_compiler_markers;
                 target_projections += target_count;
                 if (expansion.text_bytes > peak_expansion_bytes) {
                     peak_expansion_bytes = expansion.text_bytes;
@@ -2121,6 +2243,7 @@ int cbm_compile_context_extract_calls(cbm_pipeline_ctx_t *ctx,
         char total_bytes_text[32];
         char total_stdout_bytes_text[32];
         char mapped_text[32];
+        char workspace_local_compiler_markers_text[32];
         char peak_text[32];
         char peak_stdout_text[32];
         cbm_sha256_final(&expansion_set_hash, digest);
@@ -2137,6 +2260,9 @@ int cbm_compile_context_extract_calls(cbm_pipeline_ctx_t *ctx,
                  (unsigned long long)compiler_stdout_bytes_total);
         snprintf(mapped_text, sizeof(mapped_text), "%llu",
                  (unsigned long long)mapped_lines_total);
+        snprintf(workspace_local_compiler_markers_text,
+                 sizeof(workspace_local_compiler_markers_text), "%llu",
+                 (unsigned long long)workspace_local_compiler_markers_total);
         snprintf(peak_text, sizeof(peak_text), "%zu", peak_expansion_bytes);
         snprintf(peak_stdout_text, sizeof(peak_stdout_text), "%zu",
                  peak_compiler_stdout_bytes);
@@ -2144,8 +2270,9 @@ int cbm_compile_context_extract_calls(cbm_pipeline_ctx_t *ctx,
             "compiler_preprocess.ready", "compiler_invocations", contexts_text, "syntax_trees",
             contexts_text, "target_projections", projections_text, "expanded_bytes",
             total_bytes_text, "compiler_stdout_bytes", total_stdout_bytes_text, "mapped_lines",
-            mapped_text, "peak_expansion_bytes", peak_text, "peak_compiler_stdout_bytes",
-            peak_stdout_text, "expansion_set_sha256", set_hash, "cache",
+            mapped_text, "workspace_local_compiler_markers",
+            workspace_local_compiler_markers_text, "peak_expansion_bytes", peak_text,
+            "peak_compiler_stdout_bytes", peak_stdout_text, "expansion_set_sha256", set_hash, "cache",
             "one_compiler_expansion_per_context", "canonicalization",
             "validated_linemarkers_to_empty_lines", "date_time_macros",
             "git_source_date_epoch", "timestamp_macro_input",
@@ -2310,6 +2437,8 @@ void cbm_compile_context_index_free(cbm_compile_context_index_t *index) {
         free_string_array(context->owned_include_paths, context->owned_include_count);
         free_string_array(context->owned_undefines, context->owned_undefine_count);
         free_string_array(context->owned_forced_includes, context->owned_forced_include_count);
+        free_string_array(context->compiler_system_roots,
+                          context->compiler_system_root_count);
         free_string_array(context->dependencies, context->dependency_count);
     }
     free(index->contexts);
