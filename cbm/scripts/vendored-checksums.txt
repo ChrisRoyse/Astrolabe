@@ -69,7 +69,6 @@ aabe11f1b7c6c627dc9cfb62cfb9565ac9ebdf2c51c2d55c5320af5db76c5e3b  /Users/martinv
 1c2d81474d2b59b7a39f5b1592473adfb4109fad99156588088f2ccc56c654ab  /Users/martinvogel/project_dir/codebase-memory-mcp/vendored/tre/tre.h
 9632e5eeb20e3d328f8def0efb2e8230f5b5cb7d9f2e5680ad89caf065f8b3a6  /Users/martinvogel/project_dir/codebase-memory-mcp/vendored/tre/xmalloc.c
 22aee25e6892e97719ec4a5fad91345cd2145722ebbd3ec31397aff68108e3e6  /Users/martinvogel/project_dir/codebase-memory-mcp/vendored/tre/xmalloc.h
-5c3591fe6e6c86a619eb26760e9520e37a6fd5152882ab5ad93f912e2a855966  /Users/martinvogel/project_dir/codebase-memory-mcp/vendored/xxhash/xxhash.c
 86d0d813745821bbccf0be6d67356846f138e5c20164c52c24fade1419afdf7d  /Users/martinvogel/project_dir/codebase-memory-mcp/vendored/xxhash/xxhash.h
 1da0205abb1a27c27db397b7f8a475abc0af58963af9a88fc807a6c4fa7a8d51  /Users/martinvogel/project_dir/codebase-memory-mcp/vendored/yyjson/yyjson.c
 b2bd3aec324a0d6bc67196f647c966870e783c2e3944684f10db26b2c04b773f  /Users/martinvogel/project_dir/codebase-memory-mcp/vendored/yyjson/yyjson.h
