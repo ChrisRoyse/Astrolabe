@@ -382,11 +382,10 @@ bool cbm_should_skip_dir(const char *dirname, cbm_index_mode_t mode) {
         return false;
     }
 
-    /* A basename such as public, generated, docs, fixtures, tools, scripts, or
-     * bin cannot prove that a directory is non-production. Real imports under
-     * each of those roles must remain available to the immutable source
-     * snapshot in every mode. Only invariant cache/vendor/build exclusions are
-     * safe here; fast/moderate filtering is file-specific (Astrolabe #752). */
+    /* A basename alone never proves that a directory is non-source. These
+     * candidates avoid unbounded walks through ordinary generated state, but
+     * discovery admits their tracked descendants below. Only the safety core
+     * remains non-negatable (Astrolabe #752/#965). */
     return str_in_list(dirname, ALWAYS_SKIP_DIRS);
 }
 
@@ -569,14 +568,14 @@ static const char *local_rel_path(const char *rel_path, const char *local_prefix
     return rel_path;
 }
 
-/* Non-negatable safety core: built-in skip dirs that a .cbmignore negation
- * can NEVER un-skip. A repo-committed .cbmignore must not be able to defeat
- * OOM/safety skips: .git holds VCS internals (and the info/exclude sources,
- * #489), node_modules explodes discovery, the repository state directory is
- * Astrolabe-owned output rather than source, and the worktree-internal dirs
- * (.worktrees / .claude-worktrees, the worktree entries in ALWAYS_SKIP_DIRS)
- * contain parallel checkouts of the same repo whose indexing would duplicate
- * the whole codebase (#802). */
+/* Non-negatable safety core: neither .cbmignore negation nor tracked paths can
+ * un-skip these directories. .git holds VCS internals (and info/exclude,
+ * #489), node_modules is dependency state rather than repository source, the
+ * repository state directory is Astrolabe-owned output, and the worktree
+ * directories contain parallel checkouts whose indexing would duplicate the
+ * corpus (#802). Every other built-in basename is only a generated-state
+ * candidate: a tracked descendant proves that the repository owns source
+ * beneath it (#965). */
 static bool is_safety_core_dir(const char *name) {
     static const char *const SAFETY_CORE_DIRS[] = {
         ".git", "node_modules", CBM_REPOSITORY_STATE_DIR, ".worktrees", ".claude-worktrees", NULL};
@@ -669,18 +668,19 @@ static bool should_skip_directory(const char *entry_name, const char *rel_path,
                                   const cbm_gitignore_t *cbmignore, const cbm_gitignore_t *local_gi,
                                   const char *local_gi_prefix,
                                   const tracked_paths_t *tracked) {
+    bool has_tracked_descendant = tracked_path_is_descendant(tracked, rel_path);
     if (cbm_should_skip_dir(entry_name, opts ? opts->mode : CBM_MODE_FULL)) {
-        /* #500: a .cbmignore negation (e.g. "!obj/") whose rule is the last
-         * match for this dir un-skips a built-in skip-list dir — except the
-         * non-negatable safety core. Fall through so .gitignore/global/local
-         * rules still apply to the un-skipped dir. */
-        bool unskipped = cbmignore && !is_safety_core_dir(entry_name) &&
-                         cbm_gitignore_match_result(cbmignore, rel_path, true) < 0;
-        if (!unskipped) {
+        /* #500/#965: an explicit .cbmignore negation or an exact tracked
+         * descendant un-skips a generated-state candidate. The safety core is
+         * never traversed. Fall through so ignore rules still govern any
+         * untracked siblings beneath an admitted directory. */
+        bool safety_core = is_safety_core_dir(entry_name);
+        bool explicitly_unskipped = cbmignore && !safety_core &&
+                                    cbm_gitignore_match_result(cbmignore, rel_path, true) < 0;
+        if (safety_core || (!explicitly_unskipped && !has_tracked_descendant)) {
             return true;
         }
     }
-    bool has_tracked_descendant = tracked_path_is_descendant(tracked, rel_path);
     if (gitignore && cbm_gitignore_matches(gitignore, rel_path, true) &&
         !has_tracked_descendant) {
         return true;
