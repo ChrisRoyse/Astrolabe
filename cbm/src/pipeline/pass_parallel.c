@@ -1065,8 +1065,20 @@ static void extract_worker(int worker_id, void *ctx_ptr) {
             continue;
         }
 
-        if (!result->has_error) {
-            (void)cbm_file_result_compact_arrays(result);
+        size_t extracted_arena_bytes = result->arena.total_alloc;
+
+        /* The parse tree is the final tree-sitter-owned consumer. Replace the
+         * extraction arena immediately with an exact deep copy of its published
+         * facts, borrowing only hash-bound source spans. This retires parser/LSP
+         * scopes, type graphs, token workspaces, and other phase-local arena
+         * state per file instead of retaining their whole-corpus sum. */
+        cbm_free_tree(result);
+        if (!cbm_file_result_compact_facts(result, source, source_len)) {
+            cbm_file_result_set_error(
+                result, "CBM_EXTRACTION_FACT_COMPACTION_FAILED", "compact_file_facts",
+                "result_fact_compaction", extracted_arena_bytes,
+                "the completed extraction could not retire phase-local ownership",
+                "inspect the exact arena failure and retry the complete unchanged corpus");
         }
         size_t result_arena_bytes = result->arena.total_alloc;
         size_t result_array_bytes = cbm_file_result_array_bytes(result);
@@ -1077,12 +1089,15 @@ static void extract_worker(int worker_id, void *ctx_ptr) {
         {
             char source_text[32];
             char parse_rss_text[32];
+            char extracted_arena_text[32];
             char arena_text[32];
             char arrays_text[32];
             char reserved_text[32];
             char elapsed_text[32];
             snprintf(source_text, sizeof(source_text), "%zu", source_size);
             snprintf(parse_rss_text, sizeof(parse_rss_text), "%zu", parse_rss);
+            snprintf(extracted_arena_text, sizeof(extracted_arena_text), "%zu",
+                     extracted_arena_bytes);
             snprintf(arena_text, sizeof(arena_text), "%zu", result_arena_bytes);
             snprintf(arrays_text, sizeof(arrays_text), "%zu", result_array_bytes);
             snprintf(reserved_text, sizeof(reserved_text), "%zu", admission.reserved_bytes);
@@ -1090,6 +1105,7 @@ static void extract_worker(int worker_id, void *ctx_ptr) {
                      (unsigned long long)file_elapsed_ms);
             cbm_log_info("parallel.extract.file.memory", "path", fi->rel_path ? fi->rel_path : "",
                          "source_bytes", source_text, "parse_rss_bytes", parse_rss_text,
+                         "extracted_arena_bytes", extracted_arena_text,
                          "retained_arena_bytes", arena_text, "retained_array_bytes", arrays_text,
                          "reserved_bytes", reserved_text, "elapsed_ms", elapsed_text);
         }
@@ -1117,12 +1133,7 @@ static void extract_worker(int worker_id, void *ctx_ptr) {
         }
         ws->parse_recovery_diagnostics += (uint_least64_t)result->diagnostics.count;
 
-        /* Free TSTree immediately — arena strings survive for registry+resolve.
-         * This makes slab reset safe: tree-sitter's internal nodes (in slab)
-         * are released before the slab is bulk-reclaimed. */
-        cbm_free_tree(result);
-
-        /* Cache result (arena + extracted data, no tree) for Phase 3B and Phase 4 */
+        /* Cache the exact fact-only result for Phase 3B and Phase 4. */
         ec->result_cache[file_idx] = result;
 
         /* Progress logging: log every 10 files (atomic read, no contention) */

@@ -28,6 +28,10 @@
  * deliberately stay off cbm.h's public FFI surface. */
 bool cbm_file_result_compact_arrays(CBMFileResult *result);
 size_t cbm_file_result_array_bytes(const CBMFileResult *result);
+/* Retire parser/LSP arena ownership into an exact fact-only representation.
+ * Source spans borrow immutable_source through the result's last consumer. */
+bool cbm_file_result_compact_facts(CBMFileResult *result, const char *immutable_source,
+                                   int source_len);
 CBMFileResult *cbm_extract_file_at_path_with_metadata_borrow_source(
     const char *source, int source_len, CBMLanguage language, const char *project,
     const char *rel_path, const char *source_path, const char *rust_edition,

@@ -1500,10 +1500,7 @@ extraction_failed:
     return result;
 }
 
-void cbm_free_result(CBMFileResult *result) {
-    if (!result) {
-        return;
-    }
+static void cbm_file_result_release_owned(CBMFileResult *result) {
     if (result->cached_tree) {
         ts_tree_delete(result->cached_tree);
         result->cached_tree = NULL;
@@ -1525,8 +1522,345 @@ void cbm_free_result(CBMFileResult *result) {
     free(result->channels.items);
     free(result->diagnostics.items);
     cbm_arena_destroy(&result->arena);
+}
+
+void cbm_free_result(CBMFileResult *result) {
+    if (!result) {
+        return;
+    }
+    cbm_file_result_release_owned(result);
     free(result);
 }
+
+static const char *compact_fact_string(CBMArena *arena, const char *value) {
+    return value ? cbm_arena_strdup(arena, value) : NULL;
+}
+
+static const char **compact_fact_string_list(CBMArena *arena, const char *const *values) {
+    if (!values) {
+        return NULL;
+    }
+    size_t count = 0;
+    while (values[count]) {
+        if (count == SIZE_MAX / sizeof(char *) - 1) {
+            cbm_arena_mark_failed(arena, "CBM_EXTRACTION_FACT_COUNT_OVERFLOW",
+                                  "compact_string_list.count", count);
+            return NULL;
+        }
+        count++;
+    }
+    const char **copy = cbm_arena_alloc(arena, (count + 1) * sizeof(char *));
+    if (!copy) {
+        return NULL;
+    }
+    for (size_t i = 0; i < count; i++) {
+        copy[i] = compact_fact_string(arena, values[i]);
+        if (!copy[i]) {
+            return NULL;
+        }
+    }
+    copy[count] = NULL;
+    return copy;
+}
+
+static bool compact_fact_array(void **out, int count, size_t item_size, CBMArena *arena,
+                               const char *operation) {
+    if (!out || count < 0 || item_size == 0 || (size_t)count > SIZE_MAX / item_size) {
+        cbm_arena_mark_failed(arena, "CBM_EXTRACTION_FACT_ARRAY_INVALID", operation,
+                              count < 0 ? 0 : (size_t)count);
+        return false;
+    }
+    *out = NULL;
+    if (count == 0) {
+        return true;
+    }
+    *out = calloc((size_t)count, item_size);
+    if (!*out) {
+        cbm_arena_mark_failed(arena, "CBM_EXTRACTION_FACT_ARRAY_ALLOC_FAILED", operation,
+                              (size_t)count * item_size);
+        return false;
+    }
+    return true;
+}
+
+#define COMPACT_FACT_DUP(dst, src, member) (dst)->member = compact_fact_string(arena, (src)->member)
+#define COMPACT_FACT_LIST(dst, src, member)                                                    \
+    (dst)->member = compact_fact_string_list(arena, (src)->member)
+#define COMPACT_FACT_ARRAY(candidate, source, member)                                          \
+    (compact_fact_array((void **)&(candidate)->member.items, (source)->member.count,            \
+                        sizeof(*(candidate)->member.items), &(candidate)->arena,                \
+                        #member ".facts") &&                                                   \
+     (((candidate)->member.count = (source)->member.count),                                    \
+      ((candidate)->member.cap = (source)->member.count), true))
+
+bool cbm_file_result_compact_facts(CBMFileResult *result, const char *immutable_source,
+                                   int source_len) {
+    if (!result || !immutable_source || source_len < 0 || result->cached_tree) {
+        return false;
+    }
+
+    CBMFileResult *candidate = calloc(1, sizeof(*candidate));
+    if (!candidate) {
+        cbm_arena_mark_failed(&result->arena, "CBM_EXTRACTION_FACT_RESULT_ALLOC_FAILED",
+                              "compact_facts.result", sizeof(*candidate));
+        return false;
+    }
+    cbm_arena_init(&candidate->arena);
+    CBMArena *arena = &candidate->arena;
+
+    candidate->cached_lang = result->cached_lang;
+    candidate->is_test_file = result->is_test_file;
+    candidate->imports_count = result->imports_count;
+    candidate->has_error = result->has_error;
+    candidate->structured_schema_path_count = result->structured_schema_path_count;
+    candidate->structured_occurrence_count = result->structured_occurrence_count;
+    candidate->source = immutable_source;
+    candidate->source_len = source_len;
+    COMPACT_FACT_DUP(candidate, result, module_qn);
+    COMPACT_FACT_DUP(candidate, result, namespace_name);
+    COMPACT_FACT_LIST(candidate, result, exports);
+    COMPACT_FACT_LIST(candidate, result, constants);
+    COMPACT_FACT_LIST(candidate, result, global_vars);
+    COMPACT_FACT_LIST(candidate, result, macros);
+    COMPACT_FACT_DUP(candidate, result, structured_classification);
+    COMPACT_FACT_DUP(candidate, result, structured_classification_provenance);
+    COMPACT_FACT_DUP(candidate, result, error_msg);
+    candidate->error = result->error;
+    COMPACT_FACT_DUP(&candidate->error, &result->error, code);
+    COMPACT_FACT_DUP(&candidate->error, &result->error, operation);
+    COMPACT_FACT_DUP(&candidate->error, &result->error, phase);
+    COMPACT_FACT_DUP(&candidate->error, &result->error, message);
+    COMPACT_FACT_DUP(&candidate->error, &result->error, remediation);
+
+    bool arrays_ok = COMPACT_FACT_ARRAY(candidate, result, defs) &&
+                     COMPACT_FACT_ARRAY(candidate, result, calls) &&
+                     COMPACT_FACT_ARRAY(candidate, result, imports) &&
+                     COMPACT_FACT_ARRAY(candidate, result, usages) &&
+                     COMPACT_FACT_ARRAY(candidate, result, local_bindings) &&
+                     COMPACT_FACT_ARRAY(candidate, result, throws) &&
+                     COMPACT_FACT_ARRAY(candidate, result, rw) &&
+                     COMPACT_FACT_ARRAY(candidate, result, type_refs) &&
+                     COMPACT_FACT_ARRAY(candidate, result, env_accesses) &&
+                     COMPACT_FACT_ARRAY(candidate, result, type_assigns) &&
+                     COMPACT_FACT_ARRAY(candidate, result, impl_traits) &&
+                     COMPACT_FACT_ARRAY(candidate, result, resolved_calls) &&
+                     COMPACT_FACT_ARRAY(candidate, result, string_refs) &&
+                     COMPACT_FACT_ARRAY(candidate, result, infra_bindings) &&
+                     COMPACT_FACT_ARRAY(candidate, result, channels) &&
+                     COMPACT_FACT_ARRAY(candidate, result, diagnostics);
+    if (!arrays_ok || cbm_arena_failed(arena)) {
+        goto compact_failed;
+    }
+
+    for (int i = 0; i < result->defs.count; i++) {
+        const CBMDefinition *src = &result->defs.items[i];
+        CBMDefinition *dst = &candidate->defs.items[i];
+        *dst = *src;
+        COMPACT_FACT_DUP(dst, src, name);
+        COMPACT_FACT_DUP(dst, src, qualified_name);
+        COMPACT_FACT_DUP(dst, src, label);
+        COMPACT_FACT_DUP(dst, src, file_path);
+        COMPACT_FACT_DUP(dst, src, signature);
+        COMPACT_FACT_DUP(dst, src, return_type);
+        COMPACT_FACT_DUP(dst, src, receiver);
+        COMPACT_FACT_DUP(dst, src, docstring);
+        COMPACT_FACT_DUP(dst, src, parent_class);
+        COMPACT_FACT_LIST(dst, src, decorators);
+        COMPACT_FACT_LIST(dst, src, base_classes);
+        COMPACT_FACT_LIST(dst, src, param_names);
+        COMPACT_FACT_LIST(dst, src, param_types);
+        COMPACT_FACT_LIST(dst, src, return_types);
+        COMPACT_FACT_DUP(dst, src, route_path);
+        COMPACT_FACT_DUP(dst, src, route_method);
+        COMPACT_FACT_DUP(dst, src, structural_profile);
+        COMPACT_FACT_DUP(dst, src, body_tokens);
+        COMPACT_FACT_DUP(dst, src, struct_trigrams);
+        COMPACT_FACT_DUP(dst, src, structured_path);
+        COMPACT_FACT_DUP(dst, src, structured_occurrence_sha256);
+        COMPACT_FACT_DUP(dst, src, structured_classification);
+        COMPACT_FACT_DUP(dst, src, structured_classification_provenance);
+        dst->fingerprint = NULL;
+        if (src->fingerprint && src->fingerprint_k > 0) {
+            if ((size_t)src->fingerprint_k > SIZE_MAX / sizeof(uint32_t)) {
+                cbm_arena_mark_failed(arena, "CBM_EXTRACTION_FACT_COUNT_OVERFLOW",
+                                      "defs.fingerprint", (size_t)src->fingerprint_k);
+                goto compact_failed;
+            }
+            size_t bytes = (size_t)src->fingerprint_k * sizeof(uint32_t);
+            dst->fingerprint = cbm_arena_alloc(arena, bytes);
+            if (!dst->fingerprint) {
+                goto compact_failed;
+            }
+            memcpy(dst->fingerprint, src->fingerprint, bytes);
+        }
+        dst->source = NULL;
+        if (src->end_byte > src->start_byte && (size_t)src->end_byte <= (size_t)source_len) {
+            dst->source = immutable_source + src->start_byte;
+            dst->source_len = src->end_byte - src->start_byte;
+        } else if (src->source && src->source_len > 0) {
+            dst->source = cbm_arena_strndup(arena, src->source, src->source_len);
+        }
+    }
+
+    for (int i = 0; i < result->calls.count; i++) {
+        const CBMCall *src = &result->calls.items[i];
+        CBMCall *dst = &candidate->calls.items[i];
+        *dst = *src;
+        COMPACT_FACT_DUP(dst, src, callee_name);
+        COMPACT_FACT_DUP(dst, src, enclosing_func_qn);
+        COMPACT_FACT_DUP(dst, src, first_string_arg);
+        COMPACT_FACT_DUP(dst, src, second_arg_name);
+        for (int a = 0; a < CBM_MAX_CALL_ARGS; a++) {
+            COMPACT_FACT_DUP(&dst->args[a], &src->args[a], expr);
+            COMPACT_FACT_DUP(&dst->args[a], &src->args[a], value);
+            COMPACT_FACT_DUP(&dst->args[a], &src->args[a], keyword);
+        }
+        COMPACT_FACT_DUP(&dst->reference, &src->reference, resolved_target_qn);
+    }
+    for (int i = 0; i < result->imports.count; i++) {
+        const CBMImport *src = &result->imports.items[i];
+        CBMImport *dst = &candidate->imports.items[i];
+        *dst = *src;
+        COMPACT_FACT_DUP(dst, src, local_name);
+        COMPACT_FACT_DUP(dst, src, module_path);
+        COMPACT_FACT_DUP(dst, src, resource_kind);
+        COMPACT_FACT_DUP(dst, src, dependency_kind);
+    }
+    for (int i = 0; i < result->usages.count; i++) {
+        const CBMUsage *src = &result->usages.items[i];
+        CBMUsage *dst = &candidate->usages.items[i];
+        *dst = *src;
+        COMPACT_FACT_DUP(dst, src, ref_name);
+        COMPACT_FACT_DUP(dst, src, enclosing_func_qn);
+        COMPACT_FACT_DUP(&dst->reference, &src->reference, resolved_target_qn);
+    }
+    for (int i = 0; i < result->local_bindings.count; i++) {
+        const CBMLocalBinding *src = &result->local_bindings.items[i];
+        CBMLocalBinding *dst = &candidate->local_bindings.items[i];
+        *dst = *src;
+        COMPACT_FACT_DUP(dst, src, name);
+        COMPACT_FACT_DUP(dst, src, enclosing_func_qn);
+    }
+    for (int i = 0; i < result->throws.count; i++) {
+        const CBMThrow *src = &result->throws.items[i];
+        CBMThrow *dst = &candidate->throws.items[i];
+        *dst = *src;
+        COMPACT_FACT_DUP(dst, src, exception_name);
+        COMPACT_FACT_DUP(dst, src, enclosing_func_qn);
+        COMPACT_FACT_DUP(&dst->reference, &src->reference, resolved_target_qn);
+    }
+    for (int i = 0; i < result->rw.count; i++) {
+        const CBMReadWrite *src = &result->rw.items[i];
+        CBMReadWrite *dst = &candidate->rw.items[i];
+        *dst = *src;
+        COMPACT_FACT_DUP(dst, src, var_name);
+        COMPACT_FACT_DUP(dst, src, enclosing_func_qn);
+        COMPACT_FACT_DUP(&dst->reference, &src->reference, resolved_target_qn);
+    }
+    for (int i = 0; i < result->type_refs.count; i++) {
+        const CBMTypeRef *src = &result->type_refs.items[i];
+        CBMTypeRef *dst = &candidate->type_refs.items[i];
+        *dst = *src;
+        COMPACT_FACT_DUP(dst, src, type_name);
+        COMPACT_FACT_DUP(dst, src, enclosing_func_qn);
+    }
+    for (int i = 0; i < result->env_accesses.count; i++) {
+        const CBMEnvAccess *src = &result->env_accesses.items[i];
+        CBMEnvAccess *dst = &candidate->env_accesses.items[i];
+        *dst = *src;
+        COMPACT_FACT_DUP(dst, src, env_key);
+        COMPACT_FACT_DUP(dst, src, enclosing_func_qn);
+    }
+    for (int i = 0; i < result->type_assigns.count; i++) {
+        const CBMTypeAssign *src = &result->type_assigns.items[i];
+        CBMTypeAssign *dst = &candidate->type_assigns.items[i];
+        *dst = *src;
+        COMPACT_FACT_DUP(dst, src, var_name);
+        COMPACT_FACT_DUP(dst, src, type_name);
+        COMPACT_FACT_DUP(dst, src, enclosing_func_qn);
+    }
+    for (int i = 0; i < result->impl_traits.count; i++) {
+        const CBMImplTrait *src = &result->impl_traits.items[i];
+        CBMImplTrait *dst = &candidate->impl_traits.items[i];
+        *dst = *src;
+        COMPACT_FACT_DUP(dst, src, trait_name);
+        COMPACT_FACT_DUP(dst, src, struct_name);
+    }
+    for (int i = 0; i < result->resolved_calls.count; i++) {
+        const CBMResolvedCall *src = &result->resolved_calls.items[i];
+        CBMResolvedCall *dst = &candidate->resolved_calls.items[i];
+        *dst = *src;
+        COMPACT_FACT_DUP(dst, src, caller_qn);
+        COMPACT_FACT_DUP(dst, src, callee_qn);
+        COMPACT_FACT_DUP(dst, src, strategy);
+        COMPACT_FACT_DUP(dst, src, reason);
+    }
+    for (int i = 0; i < result->string_refs.count; i++) {
+        const CBMStringRef *src = &result->string_refs.items[i];
+        CBMStringRef *dst = &candidate->string_refs.items[i];
+        *dst = *src;
+        COMPACT_FACT_DUP(dst, src, value);
+        COMPACT_FACT_DUP(dst, src, enclosing_func_qn);
+        COMPACT_FACT_DUP(dst, src, key_path);
+    }
+    for (int i = 0; i < result->infra_bindings.count; i++) {
+        const CBMInfraBinding *src = &result->infra_bindings.items[i];
+        CBMInfraBinding *dst = &candidate->infra_bindings.items[i];
+        *dst = *src;
+        COMPACT_FACT_DUP(dst, src, source_name);
+        COMPACT_FACT_DUP(dst, src, target_url);
+        COMPACT_FACT_DUP(dst, src, broker);
+    }
+    for (int i = 0; i < result->channels.count; i++) {
+        const CBMChannel *src = &result->channels.items[i];
+        CBMChannel *dst = &candidate->channels.items[i];
+        *dst = *src;
+        COMPACT_FACT_DUP(dst, src, channel_name);
+        COMPACT_FACT_DUP(dst, src, transport);
+        COMPACT_FACT_DUP(dst, src, enclosing_func_qn);
+    }
+    for (int i = 0; i < result->diagnostics.count; i++) {
+        const CBMParseDiagnostic *src = &result->diagnostics.items[i];
+        CBMParseDiagnostic *dst = &candidate->diagnostics.items[i];
+        *dst = *src;
+        COMPACT_FACT_DUP(dst, src, code);
+        COMPACT_FACT_DUP(dst, src, operation);
+        COMPACT_FACT_DUP(dst, src, message);
+        COMPACT_FACT_DUP(dst, src, remediation);
+        COMPACT_FACT_DUP(dst, src, node_type);
+        dst->source = NULL;
+        if (src->end_byte > src->start_byte && (size_t)src->end_byte <= (size_t)source_len) {
+            dst->source = immutable_source + src->start_byte;
+            dst->source_len = src->end_byte - src->start_byte;
+        } else if (src->source && src->source_len > 0) {
+            dst->source = cbm_arena_strndup(arena, src->source, src->source_len);
+        }
+    }
+
+    if (cbm_arena_failed(arena)) {
+        goto compact_failed;
+    }
+
+    CBMFileResult previous = *result;
+    *result = *candidate;
+    free(candidate);
+    cbm_file_result_release_owned(&previous);
+    return true;
+
+compact_failed:
+    cbm_file_result_set_error(
+        result, cbm_arena_failure_code(arena), cbm_arena_failure_operation(arena),
+        "result_fact_compaction", cbm_arena_failure_bytes(arena),
+        "the completed extraction could not be copied into exact fact-only ownership",
+        "free memory and retry the complete corpus; retaining a partial fact set is forbidden");
+    cbm_file_result_release_owned(candidate);
+    free(candidate);
+    return false;
+}
+
+#undef COMPACT_FACT_ARRAY
+#undef COMPACT_FACT_LIST
+#undef COMPACT_FACT_DUP
 
 static bool compact_array_checked(void **items, int count, int *cap, size_t item_size,
                                   CBMArena *arena, const char *operation) {

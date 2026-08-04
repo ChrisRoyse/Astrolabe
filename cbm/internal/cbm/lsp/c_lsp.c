@@ -81,9 +81,7 @@ void c_lsp_init(CLSPContext *ctx, CBMArena *arena, const char *source, int sourc
                                      "c_lsp_eval_steps_config", &ctx->eval_step_limit) ||
         !cbm_lsp_read_positive_limit(arena, "CBM_LSP_MAX_LOOKUP_DEPTH",
                                      CBM_LSP_DEFAULT_LOOKUP_DEPTH, "c_lsp_lookup_depth_config",
-                                     &ctx->lookup_depth_limit) ||
-        !cbm_lsp_read_positive_limit(arena, "CBM_LSP_MAX_WALK_DEPTH", CBM_LSP_DEFAULT_WALK_DEPTH,
-                                     "c_lsp_walk_depth_config", &ctx->walk_depth_limit)) {
+                                     &ctx->lookup_depth_limit)) {
         return;
     }
 
@@ -3575,28 +3573,64 @@ static void c_emit_unresolved_call(CLSPContext *ctx, const char *expr_text, cons
 // resolve_calls_in_node: walk AST and resolve calls
 // ============================================================================
 
-static void c_resolve_calls_in_node_inner(CLSPContext *ctx, TSNode node);
+static bool c_resolve_calls_in_node_enter(CLSPContext *ctx, TSNode node);
 
-/* Depth-guarded entry. The bound prevents native-stack failure; reaching it is
- * an explicit extraction failure because skipping the subtree would persist an
- * incomplete call graph as if analysis were complete. */
-static void c_resolve_calls_in_node(CLSPContext *ctx, TSNode node) {
-    if (!ctx || cbm_arena_failed(ctx->arena)) {
-        return;
-    }
-    if (ctx->walk_depth >= ctx->walk_depth_limit) {
-        cbm_arena_mark_failed(ctx->arena, "CBM_LSP_ANALYSIS_LIMIT_EXCEEDED", "c_lsp_ast_walk_depth",
-                              (size_t)ctx->walk_depth_limit);
-        return;
-    }
-    ctx->walk_depth++;
-    c_resolve_calls_in_node_inner(ctx, node);
-    ctx->walk_depth--;
+static bool c_walk_node_pushes_scope(const char *kind) {
+    return strcmp(kind, "compound_statement") == 0 || strcmp(kind, "if_statement") == 0 ||
+           strcmp(kind, "for_statement") == 0 || strcmp(kind, "for_range_loop") == 0 ||
+           strcmp(kind, "while_statement") == 0 || strcmp(kind, "do_statement") == 0 ||
+           strcmp(kind, "switch_statement") == 0 || strcmp(kind, "catch_clause") == 0 ||
+           strcmp(kind, "lambda_expression") == 0;
 }
 
-static void c_resolve_calls_in_node_inner(CLSPContext *ctx, TSNode node) {
-    if (ts_node_is_null(node))
+/* Exact depth-first traversal with explicit cursor state. Tree-sitter's cursor
+ * owns its traversal stack on the heap, so valid source nesting never consumes
+ * the native call stack and never needs a semantic depth cap. Enter/leave scope
+ * behavior matches the former recursive walk exactly. */
+static void c_resolve_calls_in_node(CLSPContext *ctx, TSNode root) {
+    if (!ctx || cbm_arena_failed(ctx->arena) || ts_node_is_null(root)) {
         return;
+    }
+
+    CBMScope *entry_scope = ctx->current_scope;
+    TSTreeCursor cursor = ts_tree_cursor_new(root);
+    bool visit_children = c_resolve_calls_in_node_enter(ctx, root);
+
+    while (!cbm_arena_failed(ctx->arena)) {
+        if (visit_children && ts_tree_cursor_goto_first_child(&cursor)) {
+            visit_children =
+                c_resolve_calls_in_node_enter(ctx, ts_tree_cursor_current_node(&cursor));
+            continue;
+        }
+
+        for (;;) {
+            TSNode completed = ts_tree_cursor_current_node(&cursor);
+            if (visit_children && c_walk_node_pushes_scope(ts_node_type(completed))) {
+                ctx->current_scope = cbm_scope_pop(ctx->current_scope);
+            }
+
+            if (ts_tree_cursor_goto_next_sibling(&cursor)) {
+                visit_children =
+                    c_resolve_calls_in_node_enter(ctx, ts_tree_cursor_current_node(&cursor));
+                break;
+            }
+            if (!ts_tree_cursor_goto_parent(&cursor)) {
+                goto traversal_done;
+            }
+            visit_children = true;
+        }
+    }
+
+traversal_done:
+    /* Allocation or semantic failure may stop between enter and leave. Restore
+     * the caller-owned scope generation before returning the typed failure. */
+    ctx->current_scope = entry_scope;
+    ts_tree_cursor_delete(&cursor);
+}
+
+static bool c_resolve_calls_in_node_enter(CLSPContext *ctx, TSNode node) {
+    if (ts_node_is_null(node))
+        return false;
     const char *kind = ts_node_type(node);
 
     if (strcmp(kind, "call_expression") == 0 && ctx->primary_source_lines) {
@@ -3604,16 +3638,16 @@ static void c_resolve_calls_in_node_inner(CLSPContext *ctx, TSNode node) {
         if (expanded_line == 0 || expanded_line > ctx->expanded_line_count) {
             cbm_arena_mark_failed(ctx->arena, "CBM_PREPROCESS_LSP_LINE_UNMAPPED",
                                   "c_lsp_expansion_source_map", expanded_line);
-            return;
+            return false;
         }
         uint32_t source_line = ctx->primary_source_lines[expanded_line - 1];
         if (source_line == UINT32_MAX) {
-            return;
+            return false;
         }
         if (source_line == 0) {
             cbm_arena_mark_failed(ctx->arena, "CBM_PREPROCESS_LSP_ORIGIN_INVALID",
                                   "c_lsp_expansion_source_map", expanded_line);
-            return;
+            return false;
         }
     }
 
@@ -4286,12 +4320,7 @@ static void c_resolve_calls_in_node_inner(CLSPContext *ctx, TSNode node) {
 
 recurse:;
     // Push scope for blocks and control structures
-    bool push_scope =
-        (strcmp(kind, "compound_statement") == 0 || strcmp(kind, "if_statement") == 0 ||
-         strcmp(kind, "for_statement") == 0 || strcmp(kind, "for_range_loop") == 0 ||
-         strcmp(kind, "while_statement") == 0 || strcmp(kind, "do_statement") == 0 ||
-         strcmp(kind, "switch_statement") == 0 || strcmp(kind, "catch_clause") == 0 ||
-         strcmp(kind, "lambda_expression") == 0);
+    bool push_scope = c_walk_node_pushes_scope(kind);
 
     if (push_scope) {
         ctx->current_scope = cbm_scope_push(ctx->arena, ctx->current_scope);
@@ -4346,21 +4375,7 @@ recurse:;
         }
     }
 
-    // Recurse into children via a cursor (O(n)); ts_node_child(node,i) is O(i)
-    // in tree-sitter → O(n²) on a wide node.
-    {
-        TSTreeCursor cursor = ts_tree_cursor_new(node);
-        if (ts_tree_cursor_goto_first_child(&cursor)) {
-            do {
-                c_resolve_calls_in_node(ctx, ts_tree_cursor_current_node(&cursor));
-            } while (ts_tree_cursor_goto_next_sibling(&cursor));
-        }
-        ts_tree_cursor_delete(&cursor);
-    }
-
-    if (push_scope) {
-        ctx->current_scope = cbm_scope_pop(ctx->current_scope);
-    }
+    return true;
 }
 
 // ============================================================================
