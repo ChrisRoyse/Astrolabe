@@ -36,6 +36,73 @@ const LIBCBM_BUILD_ENV_VARS: &[&str] = &[
     "CBM_GRAMMAR_SET",
 ];
 
+#[derive(Debug)]
+struct BuildSourceDateEpoch {
+    value: String,
+    revision: String,
+    repository_root: String,
+}
+
+fn build_source_date_epoch(repo_root: &Path) -> BuildSourceDateEpoch {
+    let repository_root = fs::canonicalize(repo_root).unwrap_or_else(|error| {
+        panic!(
+            "cannot canonicalize Astrolabe repository root {}: {error}",
+            repo_root.display()
+        )
+    });
+    assert!(
+        repository_root.join(".git").exists(),
+        "cbm-sys must be built from the exact Git repository root: {}",
+        repository_root.display()
+    );
+
+    let epoch_output = Command::new("git")
+        .args(["-C"])
+        .arg(&repository_root)
+        .args([
+            "log",
+            "-1",
+            "--no-show-signature",
+            "--format=%H%n%ct",
+            "HEAD",
+            "--",
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .unwrap_or_else(|error| {
+            panic!(
+                "cannot execute git while reading the libcbm HEAD epoch for {}: {error}",
+                repository_root.display()
+            )
+        });
+    if !epoch_output.status.success() {
+        panic!(
+            "libcbm Git repository has no readable HEAD commit epoch: {}",
+            String::from_utf8_lossy(&epoch_output.stderr)
+        );
+    }
+    let epoch_text =
+        String::from_utf8(epoch_output.stdout).expect("Git HEAD epoch output is not valid UTF-8");
+    let mut lines = epoch_text.lines();
+    let revision = lines.next().unwrap_or_default();
+    let value = lines.next().unwrap_or_default();
+    assert!(
+        lines.next().is_none()
+            && matches!(revision.len(), 40 | 64)
+            && revision.bytes().all(|byte| byte.is_ascii_hexdigit())
+            && !value.is_empty()
+            && value.bytes().all(|byte| byte.is_ascii_digit())
+            && (value.len() == 1 || !value.starts_with('0'))
+            && value.parse::<u64>().is_ok(),
+        "Git returned a non-canonical HEAD revision/epoch pair"
+    );
+    BuildSourceDateEpoch {
+        value: value.to_owned(),
+        revision: revision.to_ascii_lowercase(),
+        repository_root: make_command_path(&repository_root.to_string_lossy()),
+    }
+}
+
 fn main() {
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
     let repo_root = manifest_dir
@@ -64,6 +131,7 @@ fn main() {
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
     let build_dir = out_dir.join("cbm-build");
     let config_stamp = out_dir.join("libcbm-build-config.stamp");
+    let source_date_epoch = build_source_date_epoch(repo_root);
 
     println!("cargo:rerun-if-changed={}", header.display());
     println!("cargo:rerun-if-changed={}", build_support.display());
@@ -133,17 +201,24 @@ fn main() {
         &env_store_config_hdr,
     ];
     config_inputs.extend(spawn_overlays.iter().map(|p| p.as_path()));
-    let config = libcbm_build_config(&config_inputs);
+    let config = libcbm_build_config(&config_inputs, &source_date_epoch);
     // Preserve mtime on no-op reruns so Make only invalidates objects when the
     // effective native build configuration changes.
     write_if_changed(&config_stamp, &config);
-    run_make(&cbm_root, &patched_makefile, &build_dir, &config_stamp);
+    run_make(
+        &cbm_root,
+        &patched_makefile,
+        &build_dir,
+        &config_stamp,
+        &source_date_epoch,
+    );
     let compilation_context = capture_compilation_context(
         repo_root,
         &cbm_root,
         &patched_makefile,
         &build_dir,
         &config_stamp,
+        &source_date_epoch,
     );
     println!(
         "cargo:rustc-env=ASTROLABE_BUILD_COMPILATION_CONTEXT={}",
@@ -160,8 +235,15 @@ fn main() {
     emit_link_directives(&build_dir);
 }
 
-fn run_make(cbm_root: &Path, patched_makefile: &Path, build_dir: &Path, config_stamp: &Path) {
+fn run_make(
+    cbm_root: &Path,
+    patched_makefile: &Path,
+    build_dir: &Path,
+    config_stamp: &Path,
+    source_date_epoch: &BuildSourceDateEpoch,
+) {
     let mut command = make_command(cbm_root, patched_makefile, build_dir, config_stamp);
+    command.env("SOURCE_DATE_EPOCH", &source_date_epoch.value);
     let make = env::var("MAKE").unwrap_or_else(|_| "make".to_string());
     command.arg("libcbm");
 
@@ -292,8 +374,10 @@ fn capture_compilation_context(
     patched_makefile: &Path,
     build_dir: &Path,
     config_stamp: &Path,
+    source_date_epoch: &BuildSourceDateEpoch,
 ) -> PathBuf {
     let mut dry_run = make_command(cbm_root, patched_makefile, build_dir, config_stamp);
+    dry_run.env("SOURCE_DATE_EPOCH", &source_date_epoch.value);
     dry_run.args(["-n", "-B", "libcbm"]);
     let output = dry_run.output().unwrap_or_else(|error| {
         panic!("failed to enumerate exact libcbm compile commands: {error}")
@@ -365,7 +449,7 @@ fn capture_compilation_context(
         } else {
             let id = format!("baseline-{:03}", baselines.len());
             let (predefined_macros, system_include_paths) =
-                query_compiler_baseline(cbm_root, &query);
+                query_compiler_baseline(cbm_root, &query, &source_date_epoch.value);
             baselines.push(json!({
                 "id": id,
                 "language": language,
@@ -389,6 +473,12 @@ fn capture_compilation_context(
     let manifest = json!({
         "format": "astrolabe.compilation-context.v1",
         "source_root": make_command_path(&repo_root.to_string_lossy()),
+        "source_date_epoch": {
+            "value": &source_date_epoch.value,
+            "provenance": "git_head_commit",
+            "revision": &source_date_epoch.revision,
+            "repository_root": &source_date_epoch.repository_root,
+        },
         "baselines": baselines,
         "commands": commands,
     });
@@ -485,13 +575,18 @@ fn compiler_query_arguments(arguments: &[String], language: &str) -> Vec<String>
     query
 }
 
-fn query_compiler_baseline(cbm_root: &Path, arguments: &[String]) -> (Vec<String>, Vec<String>) {
+fn query_compiler_baseline(
+    cbm_root: &Path,
+    arguments: &[String],
+    source_date_epoch: &str,
+) -> (Vec<String>, Vec<String>) {
     let compiler = arguments
         .first()
         .expect("compiler baseline query requires argv[0]");
     let output = Command::new(compiler)
         .args(&arguments[1..])
         .current_dir(cbm_root)
+        .env("SOURCE_DATE_EPOCH", source_date_epoch)
         .stdin(Stdio::null())
         .output()
         .unwrap_or_else(|error| panic!("failed to query compiler baseline {compiler:?}: {error}"));
@@ -596,7 +691,7 @@ fn repo_relative_path(repo_root: &Path, cbm_root: &Path, raw: &str) -> Option<St
     Some(relative.to_string_lossy().replace('\\', "/"))
 }
 
-fn libcbm_build_config(inputs: &[&Path]) -> Vec<u8> {
+fn libcbm_build_config(inputs: &[&Path], source_date_epoch: &BuildSourceDateEpoch) -> Vec<u8> {
     let mut config = Vec::new();
     for path in inputs.iter().copied() {
         config.extend_from_slice(path.to_string_lossy().as_bytes());
@@ -618,6 +713,12 @@ fn libcbm_build_config(inputs: &[&Path]) -> Vec<u8> {
         }
         config.push(b'\n');
     }
+    config.extend_from_slice(b"SOURCE_DATE_EPOCH=");
+    config.extend_from_slice(source_date_epoch.value.as_bytes());
+    config.push(b'\n');
+    config.extend_from_slice(b"SOURCE_DATE_EPOCH_REVISION=");
+    config.extend_from_slice(source_date_epoch.revision.as_bytes());
+    config.push(b'\n');
     config
 }
 

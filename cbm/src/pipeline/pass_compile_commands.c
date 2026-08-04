@@ -20,6 +20,7 @@
 #endif
 
 #include <ctype.h>
+#include <errno.h>
 #include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -86,6 +87,9 @@ struct cbm_compile_context_index {
     int captured_command_count;
     bool compiler_capture_telemetry_present;
     bool authority_absent;
+    char *source_date_epoch;
+    char *source_date_epoch_revision;
+    char *source_date_epoch_repository_root;
     CBMHashTable *contexts_by_id;
     CBMHashTable *sets_by_rel_path;
 };
@@ -109,6 +113,34 @@ static int preprocess_fail(cbm_pipeline_ctx_t *ctx, const char *code,
                                     "compiler_preprocess", path, requested, message,
                                     remediation);
     return CBM_NOT_FOUND;
+}
+
+static bool source_date_epoch_is_canonical(const char *value) {
+    if (!value || !value[0] || (value[0] == '0' && value[1])) {
+        return false;
+    }
+    for (const unsigned char *at = (const unsigned char *)value; *at; at++) {
+        if (!isdigit(*at)) {
+            return false;
+        }
+    }
+    errno = 0;
+    char *end = NULL;
+    (void)strtoull(value, &end, 10);
+    return errno == 0 && end && *end == '\0';
+}
+
+static bool source_revision_is_canonical(const char *value) {
+    size_t length = value ? strlen(value) : 0;
+    if (length != 40 && length != 64) {
+        return false;
+    }
+    for (const unsigned char *at = (const unsigned char *)value; *at; at++) {
+        if (!isxdigit(*at)) {
+            return false;
+        }
+    }
+    return true;
 }
 
 static bool grow_array(void **items, int *capacity, int needed, size_t item_size) {
@@ -350,11 +382,11 @@ static int build_preprocess_argv(cbm_pipeline_ctx_t *ctx,
         !owner->view.entry_path || !owner->view.entry_path[0]) {
         return CBM_NOT_FOUND;
     }
-    if (owner->preprocess_argument_count > INT_MAX - 5 ||
-        (size_t)(owner->preprocess_argument_count + 5) > SIZE_MAX / sizeof(char *)) {
+    if (owner->preprocess_argument_count > INT_MAX - 4 ||
+        (size_t)(owner->preprocess_argument_count + 4) > SIZE_MAX / sizeof(char *)) {
         return CBM_NOT_FOUND;
     }
-    char **argv = calloc((size_t)owner->preprocess_argument_count + 5, sizeof(*argv));
+    char **argv = calloc((size_t)owner->preprocess_argument_count + 4, sizeof(*argv));
     if (!argv) {
         return CBM_NOT_FOUND;
     }
@@ -384,10 +416,9 @@ static int build_preprocess_argv(cbm_pipeline_ctx_t *ctx,
     snprintf(macro_mapping, mapping_length, "-fmacro-prefix-map=%s=%s", ctx->source_root,
              ctx->repo_path);
     argv[count++] = macro_mapping;
-    argv[count++] = strdup("-Werror=date-time");
     argv[count++] = strdup("-E");
     argv[count++] = strdup(owner->view.entry_path);
-    if (!argv[count - 3] || !argv[count - 2] || !argv[count - 1]) {
+    if (!argv[count - 2] || !argv[count - 1]) {
         free_preprocess_argv(argv, count);
         return CBM_NOT_FOUND;
     }
@@ -864,10 +895,17 @@ static int materialize_context_sets(cbm_pipeline_ctx_t *ctx,
                  bindings_text, "authority", index->authority_absent ? "absent" : "exact_commands",
                  "cache_builds", "1", "context_reuses", reuse_text, "compiler_baseline_queries",
                  baseline_queries_text, "compiler_baseline_reuses", baseline_reuses_text,
-                  "cache", "generation_owned_immutable", "entry_source_cache", "source_slab",
-                  "entry_source_disk_reads", "0", "file_context_lookup", "hash_o1",
-                  "context_identity_lookup", "hash_o1", "dependency_membership",
-                  "sorted_binary_search");
+                 "source_date_epoch",
+                 index->source_date_epoch ? index->source_date_epoch : "not_applicable",
+                 "source_date_epoch_provenance",
+                 index->source_date_epoch ? "git_head_commit" : "not_applicable",
+                 "source_date_epoch_revision",
+                 index->source_date_epoch_revision ? index->source_date_epoch_revision
+                                                   : "not_applicable",
+                 "cache", "generation_owned_immutable", "entry_source_cache", "source_slab",
+                 "entry_source_disk_reads", "0", "file_context_lookup", "hash_o1",
+                 "context_identity_lookup", "hash_o1", "dependency_membership",
+                 "sorted_binary_search");
     return 0;
 }
 
@@ -1003,6 +1041,11 @@ static int parse_embedded_commands(cbm_pipeline_ctx_t *ctx,
             cbm_sha256_update(&hash, arguments[i], strlen(arguments[i]));
             cbm_sha256_update(&hash, "\0", 1);
         }
+        cbm_sha256_update(&hash, "SOURCE_DATE_EPOCH", strlen("SOURCE_DATE_EPOCH"));
+        cbm_sha256_update(&hash, "\0", 1);
+        cbm_sha256_update(&hash, index->source_date_epoch,
+                          strlen(index->source_date_epoch));
+        cbm_sha256_update(&hash, "\0", 1);
         cbm_sha256_final(&hash, digest);
         for (int i = 0; i < CBM_SHA256_DIGEST_LEN; i++) {
             snprintf(hex + (i * 2), 3, "%02x", digest[i]);
@@ -1064,7 +1107,8 @@ static int parse_embedded_manifest(cbm_pipeline_ctx_t *ctx,
         yyjson_val *commands = yyjson_obj_get(root, "commands");
         if (!yyjson_is_arr(baselines) || !yyjson_is_arr(commands) ||
             yyjson_arr_size(baselines) != 0 || yyjson_arr_size(commands) != 0 ||
-            yyjson_obj_get(root, "capture") != NULL) {
+            yyjson_obj_get(root, "capture") != NULL ||
+            yyjson_obj_get(root, "source_date_epoch") != NULL) {
             yyjson_doc_free(document);
             return context_fail(
                 ctx, "CBM_COMPILE_CONTEXT_ABSENCE_CONTRADICTORY",
@@ -1076,6 +1120,48 @@ static int parse_embedded_manifest(cbm_pipeline_ctx_t *ctx,
         int rc = materialize_context_sets(ctx, index, source_files, source_count);
         yyjson_doc_free(document);
         return rc;
+    }
+    yyjson_val *source_date_epoch = yyjson_obj_get(root, "source_date_epoch");
+    const char *epoch_value = yyjson_get_str(
+        source_date_epoch ? yyjson_obj_get(source_date_epoch, "value") : NULL);
+    const char *epoch_provenance = yyjson_get_str(
+        source_date_epoch ? yyjson_obj_get(source_date_epoch, "provenance") : NULL);
+    const char *epoch_revision = yyjson_get_str(
+        source_date_epoch ? yyjson_obj_get(source_date_epoch, "revision") : NULL);
+    const char *epoch_repository_root = yyjson_get_str(
+        source_date_epoch ? yyjson_obj_get(source_date_epoch, "repository_root") : NULL);
+    if (!yyjson_is_obj(source_date_epoch) ||
+        !source_date_epoch_is_canonical(epoch_value) ||
+        !source_revision_is_canonical(epoch_revision) || !epoch_provenance ||
+        strcmp(epoch_provenance, "git_head_commit") != 0 || !epoch_repository_root ||
+        !epoch_repository_root[0]) {
+        yyjson_doc_free(document);
+        return context_fail(
+            ctx, "CBM_COMPILE_CONTEXT_SOURCE_EPOCH_INVALID", "parse_source_date_epoch",
+            ctx->repo_path, 0,
+            "the active compilation context has invalid Git source-date provenance",
+            "regenerate the immutable context from the exact committed Git repository");
+    }
+    char *canonical_epoch_root = canonical_normalized_path(NULL, epoch_repository_root);
+    if (!canonical_epoch_root ||
+        !path_relative_within(canonical_epoch_root, ctx->repo_path)) {
+        free(canonical_epoch_root);
+        yyjson_doc_free(document);
+        return context_fail(
+            ctx, "CBM_COMPILE_CONTEXT_SOURCE_EPOCH_REPOSITORY_MISMATCH",
+            "bind_source_date_epoch_repository", epoch_repository_root, 0,
+            "the indexed root is not within the source-date Git repository root",
+            "discard the mismatched context and regenerate it for the exact repository");
+    }
+    index->source_date_epoch = strdup(epoch_value);
+    index->source_date_epoch_revision = strdup(epoch_revision);
+    index->source_date_epoch_repository_root = canonical_epoch_root;
+    if (!index->source_date_epoch || !index->source_date_epoch_revision) {
+        yyjson_doc_free(document);
+        return context_fail(ctx, "CBM_COMPILE_CONTEXT_ALLOC_FAILED",
+                            "retain_source_date_epoch", ctx->repo_path, 0,
+                            "the exact source-date provenance could not be retained",
+                            "free memory and retry the unchanged corpus");
     }
     yyjson_val *capture = yyjson_obj_get(root, "capture");
     if (capture) {
@@ -1683,8 +1769,9 @@ int cbm_compile_context_extract_calls(cbm_pipeline_ctx_t *ctx,
                      "0", "peak_expansion_bytes", "0", "authority",
                      index->authority_absent ? "absent" : "not_applicable", "cache",
                      "one_compiler_expansion_per_context", "canonicalization",
-                     "validated_linemarkers_to_empty_lines", "nondeterministic_time_macros",
-                     "fail_closed", "fallback", "none");
+                     "validated_linemarkers_to_empty_lines", "date_time_macros",
+                     "not_applicable", "timestamp_macro_input", "not_applicable",
+                     "source_date_epoch", "not_applicable", "fallback", "none");
         return 0;
     }
 #ifndef ASTRO_SPAWN
@@ -1818,9 +1905,9 @@ int cbm_compile_context_extract_calls(cbm_pipeline_ctx_t *ctx,
         size_t output_bytes = 0;
         cbm_spawn_error_t spawn_error = {0};
         cbm_spawn_bounded_capture_t stderr_capture = {0};
-        int spawn_status = cbm_spawn_capture_with_stderr_cwd(
-            (const char *const *)argv, working_directory, &output, &output_bytes,
-            PREPROCESS_STDERR_LIMIT, &stderr_capture, &spawn_error);
+        int spawn_status = cbm_spawn_capture_with_stderr_cwd_source_epoch(
+            (const char *const *)argv, working_directory, index->source_date_epoch, &output,
+            &output_bytes, PREPROCESS_STDERR_LIMIT, &stderr_capture, &spawn_error);
         if (spawn_status != 0) {
             status = compiler_spawn_fail(ctx, owner, &spawn_error, &stderr_capture, output,
                                          output_bytes);
@@ -1861,7 +1948,11 @@ int cbm_compile_context_extract_calls(cbm_pipeline_ctx_t *ctx,
                 stdout_bytes_text, "expanded_bytes", bytes_text, "expanded_sha256",
                 expansion_hash, "projection_targets", targets_text, "stderr_total_bytes",
                 stderr_text, "stderr_truncated", stderr_truncated ? "true" : "false",
-                "canonicalization", "validated_linemarkers_to_empty_lines");
+                "canonicalization", "validated_linemarkers_to_empty_lines",
+                "source_date_epoch", index->source_date_epoch,
+                "source_date_epoch_provenance", "git_head_commit",
+                "source_date_epoch_revision", index->source_date_epoch_revision,
+                "timestamp_macro_input", "immutable_snapshot_last_write_time");
             char *diagnostic = NULL;
             status = cbm_extract_preprocessed_translation_unit(
                 expansion.text, expansion.text_bytes, owner->view.cpp_mode,
@@ -1946,8 +2037,11 @@ int cbm_compile_context_extract_calls(cbm_pipeline_ctx_t *ctx,
             mapped_text, "peak_expansion_bytes", peak_text, "peak_compiler_stdout_bytes",
             peak_stdout_text, "expansion_set_sha256", set_hash, "cache",
             "one_compiler_expansion_per_context", "canonicalization",
-            "validated_linemarkers_to_empty_lines", "nondeterministic_time_macros",
-            "fail_closed", "fallback", "none");
+            "validated_linemarkers_to_empty_lines", "date_time_macros",
+            "git_source_date_epoch", "timestamp_macro_input",
+            "immutable_snapshot_last_write_time", "source_date_epoch",
+            index->source_date_epoch, "source_date_epoch_revision",
+            index->source_date_epoch_revision, "fallback", "none");
     }
     free(target_by_source_index);
     free(target_rel_paths);
@@ -2087,6 +2181,9 @@ void cbm_compile_context_index_free(cbm_compile_context_index_t *index) {
     }
     cbm_ht_free(index->contexts_by_id);
     cbm_ht_free(index->sets_by_rel_path);
+    free(index->source_date_epoch);
+    free(index->source_date_epoch_revision);
+    free(index->source_date_epoch_repository_root);
     for (int i = 0; i < index->set_count; i++) {
         free(index->sets[i].rel_path);
         free(index->sets[i].items);

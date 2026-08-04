@@ -815,6 +815,16 @@ static void snapshot_capture_prepared(snapshot_capture_result_t *result) {
                               error);
         goto cleanup;
     }
+    FILETIME source_last_write = {
+        .dwLowDateTime = before.basic.LastWriteTime.LowPart,
+        .dwHighDateTime = (DWORD)before.basic.LastWriteTime.HighPart,
+    };
+    if (!SetFileTime(destination, NULL, NULL, &source_last_write)) {
+        snapshot_capture_fail(result, "CBM_SOURCE_SNAPSHOT_TIMESTAMP_COPY_FAILED",
+                              "copy_source_last_write_time", result->destination_path,
+                              GetLastError());
+        goto cleanup;
+    }
     if (!snapshot_get_identity(source, &after)) {
         snapshot_capture_fail(result, "CBM_SOURCE_SNAPSHOT_SOURCE_IDENTITY_FAILED",
                               "inspect_source_after_copy", file->path, GetLastError());
@@ -855,6 +865,20 @@ static void snapshot_capture_prepared(snapshot_capture_result_t *result) {
     if (!hash_handle(readback, readback_digest, &readback_bytes, &error)) {
         snapshot_capture_fail(result, "CBM_SOURCE_SNAPSHOT_READBACK_FAILED", "hash_snapshot",
                               result->destination_path, error);
+        goto cleanup;
+    }
+    FILE_BASIC_INFO snapshot_basic = {0};
+    if (!GetFileInformationByHandleEx(readback, FileBasicInfo, &snapshot_basic,
+                                      sizeof(snapshot_basic))) {
+        snapshot_capture_fail(result, "CBM_SOURCE_SNAPSHOT_TIMESTAMP_READBACK_FAILED",
+                              "read_snapshot_last_write_time", result->destination_path,
+                              GetLastError());
+        goto cleanup;
+    }
+    if (snapshot_basic.LastWriteTime.QuadPart != before.basic.LastWriteTime.QuadPart) {
+        snapshot_capture_fail(result, "CBM_SOURCE_SNAPSHOT_TIMESTAMP_READBACK_MISMATCH",
+                              "compare_snapshot_last_write_time", result->destination_path,
+                              ERROR_FILE_CORRUPT);
         goto cleanup;
     }
     if (readback_bytes != captured_bytes ||
@@ -1757,7 +1781,7 @@ int cbm_source_snapshot_capture(const char *repo_path, const cbm_discover_opts_t
     snprintf(count_buf, sizeof(count_buf), "%d", file_count);
     snprintf(worker_buf, sizeof(worker_buf), "%d", worker_count);
     cbm_log_info("source_snapshot.complete", "root", root, "files", count_buf, "workers",
-                 worker_buf);
+                 worker_buf, "last_write_time", "copied_and_read_back_per_file");
     return 0;
 }
 

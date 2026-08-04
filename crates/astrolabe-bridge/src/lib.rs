@@ -1949,6 +1949,167 @@ struct RepositoryCompilerBaseline {
     system_include_paths: Vec<String>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RepositorySourceDateEpoch {
+    value: String,
+    revision: String,
+    repository_root: String,
+}
+
+fn repository_source_date_epoch_with_root(
+    repo_root: &Path,
+    known_repository_root: Option<&Path>,
+) -> Result<RepositorySourceDateEpoch, BridgeError> {
+    let repository_path = if let Some(repository_root) = known_repository_root {
+        canonical_path(
+            repository_root,
+            "ASTRO_COMPILE_CONTEXT_SOURCE_EPOCH_REPOSITORY_UNRESOLVED",
+            "known Git repository root",
+        )?
+    } else if repo_root.join(".git").exists() {
+        repo_root.to_path_buf()
+    } else {
+        let repository_output = Command::new("git")
+            .args(["-C"])
+            .arg(repo_root)
+            .args(["rev-parse", "--show-toplevel"])
+            .stdin(Stdio::null())
+            .output()
+            .map_err(|error| {
+                envelope(
+                    "ASTRO_COMPILE_CONTEXT_SOURCE_EPOCH_UNREACHABLE",
+                    format!(
+                        "cannot execute git while deriving SOURCE_DATE_EPOCH for {}: {error}",
+                        repo_root.display()
+                    ),
+                    "Restore Git on PATH and retry the unchanged Git repository.",
+                )
+            })?;
+        if !repository_output.status.success() {
+            return Err(BridgeError::new(
+                ErrorEnvelope::new(
+                    "ASTRO_COMPILE_CONTEXT_SOURCE_EPOCH_REPOSITORY_REQUIRED",
+                    format!(
+                        "{} is not inside a Git repository with a readable work-tree root",
+                        repo_root.display()
+                    ),
+                    "Index a committed Git repository or remove its compilation database until an exact source epoch can be supplied.",
+                )
+                .with_stderr(String::from_utf8_lossy(&repository_output.stderr)),
+            ));
+        }
+        let repository_text = std::str::from_utf8(&repository_output.stdout).map_err(|error| {
+            envelope(
+                "ASTRO_COMPILE_CONTEXT_SOURCE_EPOCH_REPOSITORY_INVALID",
+                format!("Git repository-root output is not UTF-8: {error}"),
+                "Repair the repository path encoding and retry the unchanged repository.",
+            )
+        })?;
+        let repository_text = repository_text.trim_end_matches(['\r', '\n']);
+        if repository_text.is_empty()
+            || repository_text.contains('\r')
+            || repository_text.contains('\n')
+        {
+            return Err(envelope(
+                "ASTRO_COMPILE_CONTEXT_SOURCE_EPOCH_REPOSITORY_INVALID",
+                "Git returned an empty or multi-line repository root",
+                "Repair the Git work-tree metadata and retry the unchanged repository.",
+            ));
+        }
+        canonical_path(
+            Path::new(repository_text),
+            "ASTRO_COMPILE_CONTEXT_SOURCE_EPOCH_REPOSITORY_UNRESOLVED",
+            "Git repository root",
+        )?
+    };
+    if !repo_root.starts_with(&repository_path) {
+        return Err(envelope(
+            "ASTRO_COMPILE_CONTEXT_SOURCE_EPOCH_REPOSITORY_MISMATCH",
+            format!(
+                "indexed root {} is not within Git root {}",
+                repo_root.display(),
+                repository_path.display()
+            ),
+            "Preserve both paths and repair the repository work-tree metadata.",
+        ));
+    }
+
+    let epoch_output = Command::new("git")
+        .args(["-C"])
+        .arg(&repository_path)
+        .args([
+            "log",
+            "-1",
+            "--no-show-signature",
+            "--format=%H%n%ct",
+            "HEAD",
+            "--",
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|error| {
+            envelope(
+                "ASTRO_COMPILE_CONTEXT_SOURCE_EPOCH_UNREACHABLE",
+                format!(
+                    "cannot execute git while reading HEAD epoch for {}: {error}",
+                    repository_path.display()
+                ),
+                "Restore Git on PATH and retry the unchanged Git repository.",
+            )
+        })?;
+    if !epoch_output.status.success() {
+        return Err(BridgeError::new(
+            ErrorEnvelope::new(
+                "ASTRO_COMPILE_CONTEXT_SOURCE_EPOCH_COMMIT_REQUIRED",
+                format!(
+                    "Git repository {} has no readable HEAD commit epoch",
+                    repository_path.display()
+                ),
+                "Commit the source generation and retry, or remove the compilation database until an exact source epoch exists.",
+            )
+            .with_stderr(String::from_utf8_lossy(&epoch_output.stderr)),
+        ));
+    }
+    let epoch_text = std::str::from_utf8(&epoch_output.stdout).map_err(|error| {
+        envelope(
+            "ASTRO_COMPILE_CONTEXT_SOURCE_EPOCH_INVALID",
+            format!("Git HEAD epoch output is not UTF-8: {error}"),
+            "Repair the repository commit metadata and retry the unchanged repository.",
+        )
+    })?;
+    let mut lines = epoch_text.lines();
+    let revision = lines.next().unwrap_or_default();
+    let value = lines.next().unwrap_or_default();
+    if lines.next().is_some()
+        || !matches!(revision.len(), 40 | 64)
+        || !revision.bytes().all(|byte| byte.is_ascii_hexdigit())
+        || value.is_empty()
+        || !value.bytes().all(|byte| byte.is_ascii_digit())
+        || (value.len() > 1 && value.starts_with('0'))
+        || value.parse::<u64>().is_err()
+    {
+        return Err(envelope(
+            "ASTRO_COMPILE_CONTEXT_SOURCE_EPOCH_INVALID",
+            format!(
+                "Git returned a non-canonical HEAD revision/epoch pair for {}",
+                repository_path.display()
+            ),
+            "Repair the Git commit metadata so `%H` is hexadecimal and `%ct` is a canonical Unix timestamp.",
+        ));
+    }
+    Ok(RepositorySourceDateEpoch {
+        value: value.to_owned(),
+        revision: revision.to_ascii_lowercase(),
+        repository_root: normalized_path(&repository_path),
+    })
+}
+
+fn repository_source_date_epoch(
+    repo_root: &Path,
+) -> Result<RepositorySourceDateEpoch, BridgeError> {
+    repository_source_date_epoch_with_root(repo_root, None)
+}
+
 fn normalized_path(path: &Path) -> String {
     let text = path.to_string_lossy();
     if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
@@ -2272,10 +2433,12 @@ fn run_context_compiler(
     directory: &Path,
     operation: &str,
     file: &Path,
+    source_date_epoch: &str,
 ) -> Result<Output, BridgeError> {
     let output = Command::new(&arguments[0])
         .args(&arguments[1..])
         .current_dir(directory)
+        .env("SOURCE_DATE_EPOCH", source_date_epoch)
         .stdin(Stdio::null())
         .output()
         .map_err(|error| {
@@ -2522,6 +2685,7 @@ fn capture_repository_compile_command(
     baseline_cache: &mut BTreeMap<(String, Vec<String>), usize>,
     baselines: &mut Vec<RepositoryCompilerBaseline>,
     baseline_reuses: &mut usize,
+    source_date_epoch: &RepositorySourceDateEpoch,
 ) -> Result<Option<RepositoryCompileCommand>, BridgeError> {
     let file_text = entry
         .get("file")
@@ -2595,6 +2759,7 @@ fn capture_repository_compile_command(
             &directory,
             "baseline query",
             &file_path,
+            &source_date_epoch.value,
         )?;
         let (predefined_macros, system_include_paths) =
             parse_compiler_baseline(&baseline_output.stdout, &baseline_output.stderr, &file_path)?;
@@ -2636,6 +2801,7 @@ fn capture_repository_compile_command(
         &directory,
         "dependency closure",
         &file_path,
+        &source_date_epoch.value,
     )?;
     let dependencies =
         parse_make_dependencies(&dependency_output.stdout, repo_root, &directory, &file_path)?;
@@ -2669,6 +2835,15 @@ fn compilation_context_for_repo(repo_path: &str) -> Result<Vec<u8>, BridgeError>
         .and_then(|source_root| Path::new(source_root).canonicalize().ok())
         .is_some_and(|source_root| source_root == repo_root)
     {
+        let embedded_json = std::str::from_utf8(cbm_sys::ASTROLABE_BUILD_COMPILATION_CONTEXT)
+            .map_err(|error| {
+                envelope(
+                    "ASTRO_COMPILE_CONTEXT_EMBEDDED_UTF8_INVALID",
+                    format!("artifact compilation context is not UTF-8: {error}"),
+                    "Rebuild Astrolabe from the canonical source tree.",
+                )
+            })?;
+        validate_bound_compilation_context(repo_path, embedded_json, true)?;
         return Ok(cbm_sys::ASTROLABE_BUILD_COMPILATION_CONTEXT.to_vec());
     }
 
@@ -2724,6 +2899,7 @@ fn compilation_context_for_repo(repo_path: &str) -> Result<Vec<u8>, BridgeError>
             "Run the real build's compilation-database generator and retry.",
         ));
     }
+    let source_date_epoch = repository_source_date_epoch(&repo_root)?;
     let mut captured = Vec::new();
     let mut baseline_cache = BTreeMap::new();
     let mut compiler_baselines = Vec::new();
@@ -2735,6 +2911,7 @@ fn compilation_context_for_repo(repo_path: &str) -> Result<Vec<u8>, BridgeError>
             &mut baseline_cache,
             &mut compiler_baselines,
             &mut baseline_reuses,
+            &source_date_epoch,
         )? {
             captured.push(command);
         }
@@ -2748,6 +2925,20 @@ fn compilation_context_for_repo(repo_path: &str) -> Result<Vec<u8>, BridgeError>
                 repo_root.display()
             ),
             "Generate compile_commands.json for the exact repository being indexed.",
+        ));
+    }
+    let source_date_epoch_readback = repository_source_date_epoch_with_root(
+        &repo_root,
+        Some(Path::new(&source_date_epoch.repository_root)),
+    )?;
+    if source_date_epoch_readback != source_date_epoch {
+        return Err(envelope(
+            "ASTRO_COMPILE_CONTEXT_SOURCE_EPOCH_DRIFT",
+            format!(
+                "Git source epoch changed while capturing compilation context for {}: before={source_date_epoch:?}, after={source_date_epoch_readback:?}",
+                repo_root.display()
+            ),
+            "Let the repository update finish, then retry one unchanged source generation.",
         ));
     }
     captured.sort_by(|left, right| {
@@ -2788,6 +2979,12 @@ fn compilation_context_for_repo(repo_path: &str) -> Result<Vec<u8>, BridgeError>
     serde_json::to_vec(&serde_json::json!({
         "format": "astrolabe.compilation-context.v1",
         "source_root": normalized_path(&repo_root),
+        "source_date_epoch": {
+            "value": source_date_epoch.value,
+            "provenance": "git_head_commit",
+            "revision": source_date_epoch.revision,
+            "repository_root": source_date_epoch.repository_root,
+        },
         "capture": {
             "baseline_queries": compiler_baselines.len(),
             "baseline_reuses": baseline_reuses,
@@ -2812,6 +3009,7 @@ pub const ASTRO_COMPILATION_CONTEXT_ARG: &str = "_astrolabe_compilation_context_
 fn validate_bound_compilation_context(
     repo_path: &str,
     context_json: &str,
+    verify_git_epoch: bool,
 ) -> Result<(), BridgeError> {
     let repo_root = canonical_path(
         Path::new(repo_path),
@@ -2885,12 +3083,100 @@ fn validate_bound_compilation_context(
             .get("commands")
             .and_then(serde_json::Value::as_array)
             .is_some_and(|items| items.is_empty());
-        if !baselines_empty || !commands_empty || value.get("capture").is_some() {
+        if !baselines_empty
+            || !commands_empty
+            || value.get("capture").is_some()
+            || value.get("source_date_epoch").is_some()
+        {
             return Err(envelope(
                 "ASTRO_COMPILE_CONTEXT_ABSENCE_CONTRADICTORY",
                 "absent compilation-context authority carries compiler state",
                 "Preserve the contradictory manifest and regenerate it from one repository state.",
             ));
+        }
+    } else {
+        let source_date_epoch = value
+            .get("source_date_epoch")
+            .and_then(serde_json::Value::as_object)
+            .ok_or_else(|| {
+                envelope(
+                    "ASTRO_COMPILE_CONTEXT_SOURCE_EPOCH_MISSING",
+                    "active compilation-context transport has no source_date_epoch object",
+                    "Regenerate the compilation context from the exact committed Git repository.",
+                )
+            })?;
+        let epoch = source_date_epoch
+            .get("value")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        let revision = source_date_epoch
+            .get("revision")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        let repository_root = source_date_epoch
+            .get("repository_root")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        if source_date_epoch
+            .get("provenance")
+            .and_then(serde_json::Value::as_str)
+            != Some("git_head_commit")
+            || epoch.is_empty()
+            || !epoch.bytes().all(|byte| byte.is_ascii_digit())
+            || (epoch.len() > 1 && epoch.starts_with('0'))
+            || epoch.parse::<u64>().is_err()
+            || !matches!(revision.len(), 40 | 64)
+            || !revision.bytes().all(|byte| byte.is_ascii_hexdigit())
+            || repository_root.is_empty()
+        {
+            return Err(envelope(
+                "ASTRO_COMPILE_CONTEXT_SOURCE_EPOCH_INVALID",
+                "active compilation-context transport has invalid source-date provenance",
+                "Regenerate the compilation context from the exact committed Git repository.",
+            ));
+        }
+        let transported_repository_root = canonical_path(
+            Path::new(repository_root),
+            "ASTRO_COMPILE_CONTEXT_SOURCE_EPOCH_REPOSITORY_UNRESOLVED",
+            "transported source-date Git repository root",
+        )?;
+        if !repo_root.starts_with(&transported_repository_root) {
+            return Err(envelope(
+                "ASTRO_COMPILE_CONTEXT_SOURCE_EPOCH_REPOSITORY_MISMATCH",
+                format!(
+                    "indexed root {} is not within transported Git root {}",
+                    repo_root.display(),
+                    transported_repository_root.display()
+                ),
+                "Discard the mismatched worker request and regenerate it for the exact repository.",
+            ));
+        }
+        if verify_git_epoch {
+            let observed = repository_source_date_epoch_with_root(
+                &repo_root,
+                Some(&transported_repository_root),
+            )?;
+            if epoch != observed.value
+                || !revision.eq_ignore_ascii_case(&observed.revision)
+                || transported_repository_root
+                    != canonical_path(
+                        Path::new(&observed.repository_root),
+                        "ASTRO_COMPILE_CONTEXT_SOURCE_EPOCH_REPOSITORY_UNRESOLVED",
+                        "observed source-date Git repository root",
+                    )?
+            {
+                return Err(envelope(
+                    "ASTRO_COMPILE_CONTEXT_SOURCE_EPOCH_DRIFT",
+                    format!(
+                        "transported source epoch ({epoch}, {revision}, {}) no longer matches Git ({}, {}, {})",
+                        transported_repository_root.display(),
+                        observed.value,
+                        observed.revision,
+                        observed.repository_root
+                    ),
+                    "Discard the stale worker request and retry one unchanged Git source generation.",
+                ));
+            }
         }
     }
     Ok(())
@@ -2933,7 +3219,7 @@ fn bind_compilation_context_to_index_args(args_json: &str) -> Result<String, Bri
                 "Preserve the worker argument file and regenerate it from the exact parent request.",
             )
         })?;
-        validate_bound_compilation_context(&repo_path, context_json)?;
+        validate_bound_compilation_context(&repo_path, context_json, true)?;
         return Ok(args_json.to_owned());
     }
     let context = compilation_context_for_repo(&repo_path)?;
@@ -2944,7 +3230,7 @@ fn bind_compilation_context_to_index_args(args_json: &str) -> Result<String, Bri
             "Preserve the compilation database and report this serialization fault.",
         )
     })?;
-    validate_bound_compilation_context(&repo_path, &context_json)?;
+    validate_bound_compilation_context(&repo_path, &context_json, false)?;
     object.insert(
         ASTRO_COMPILATION_CONTEXT_ARG.to_owned(),
         serde_json::Value::String(context_json),

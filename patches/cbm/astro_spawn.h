@@ -51,7 +51,8 @@ typedef enum {
     CBM_SPAWN_E_READ = 5,           /* reading the child's stdout failed */
     CBM_SPAWN_E_NOMEM = 6,          /* allocation failed */
     CBM_SPAWN_E_WAIT = 7,           /* could not reap the child */
-    CBM_SPAWN_E_EXIT = 8            /* child ran and exited non-zero */
+    CBM_SPAWN_E_EXIT = 8,           /* child ran and exited non-zero */
+    CBM_SPAWN_E_ENVIRONMENT = 9     /* exact child environment could not be built */
 } cbm_spawn_code_t;
 
 /* Fail-closed error record: {code, message, remediation} plus the OS-level
@@ -112,6 +113,15 @@ int cbm_spawn_capture_with_stderr_cwd(const char *const *argv, const char *worki
                                       size_t stderr_limit,
                                       cbm_spawn_bounded_capture_t *out_stderr,
                                       cbm_spawn_error_t *err);
+
+/* Execute the exact cwd/capture contract with one process-local,
+ * source-provenance-bound SOURCE_DATE_EPOCH override. The parent process and
+ * concurrent compiler children are never mutated. The value must be a
+ * canonical unsigned decimal Unix timestamp. */
+int cbm_spawn_capture_with_stderr_cwd_source_epoch(
+    const char *const *argv, const char *working_directory, const char *source_date_epoch,
+    char **out_data, size_t *out_len, size_t stderr_limit,
+    cbm_spawn_bounded_capture_t *out_stderr, cbm_spawn_error_t *err);
 
 #ifdef __cplusplus
 }

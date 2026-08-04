@@ -16,6 +16,7 @@
 #include <stdbool.h>
 #include <stdlib.h>
 #include <string.h>
+#include <wchar.h>
 
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
@@ -361,10 +362,103 @@ static DWORD WINAPI spawn_stderr_reader(LPVOID opaque) {
     return 0;
 }
 
+static bool spawn_source_date_epoch_valid(const char *value) {
+    if (!value || !value[0] || (value[0] == '0' && value[1])) {
+        return false;
+    }
+    for (const unsigned char *at = (const unsigned char *)value; *at; at++) {
+        if (*at < '0' || *at > '9') {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool spawn_environment_entry_is_source_date_epoch(const wchar_t *entry) {
+    static const wchar_t name[] = L"SOURCE_DATE_EPOCH";
+    const int name_length = (int)(sizeof(name) / sizeof(name[0]) - 1);
+    size_t entry_length = wcslen(entry);
+    return entry_length > (size_t)name_length && entry[name_length] == L'=' &&
+           CompareStringOrdinal(entry, name_length, name, name_length, TRUE) == CSTR_EQUAL;
+}
+
+static wchar_t *spawn_environment_with_source_date_epoch(const char *value,
+                                                          DWORD *error_out) {
+    *error_out = ERROR_SUCCESS;
+    if (!spawn_source_date_epoch_valid(value)) {
+        *error_out = ERROR_INVALID_PARAMETER;
+        return NULL;
+    }
+    wchar_t *wide_value = spawn_utf8_to_wide(value);
+    if (!wide_value) {
+        *error_out = GetLastError();
+        if (*error_out == ERROR_SUCCESS) {
+            *error_out = ERROR_NO_UNICODE_TRANSLATION;
+        }
+        return NULL;
+    }
+    LPWCH inherited = GetEnvironmentStringsW();
+    if (!inherited) {
+        *error_out = GetLastError();
+        free(wide_value);
+        return NULL;
+    }
+
+    static const wchar_t name[] = L"SOURCE_DATE_EPOCH";
+    size_t name_length = sizeof(name) / sizeof(name[0]) - 1;
+    size_t value_length = wcslen(wide_value);
+    size_t required = 1;
+    for (const wchar_t *entry = inherited; *entry; entry += wcslen(entry) + 1) {
+        size_t entry_length = wcslen(entry);
+        if (!spawn_environment_entry_is_source_date_epoch(entry)) {
+            if (entry_length > SIZE_MAX - required - 1) {
+                *error_out = ERROR_ARITHMETIC_OVERFLOW;
+                FreeEnvironmentStringsW(inherited);
+                free(wide_value);
+                return NULL;
+            }
+            required += entry_length + 1;
+        }
+    }
+    if (required > SIZE_MAX - name_length - 2 ||
+        value_length > SIZE_MAX - required - name_length - 2) {
+        *error_out = ERROR_ARITHMETIC_OVERFLOW;
+        FreeEnvironmentStringsW(inherited);
+        free(wide_value);
+        return NULL;
+    }
+    required += name_length + 1 + value_length + 1;
+    wchar_t *block = (wchar_t *)calloc(required, sizeof(*block));
+    if (!block) {
+        *error_out = ERROR_NOT_ENOUGH_MEMORY;
+        FreeEnvironmentStringsW(inherited);
+        free(wide_value);
+        return NULL;
+    }
+    wchar_t *cursor = block;
+    for (const wchar_t *entry = inherited; *entry; entry += wcslen(entry) + 1) {
+        size_t entry_length = wcslen(entry);
+        if (!spawn_environment_entry_is_source_date_epoch(entry)) {
+            memcpy(cursor, entry, (entry_length + 1) * sizeof(*cursor));
+            cursor += entry_length + 1;
+        }
+    }
+    memcpy(cursor, name, name_length * sizeof(*cursor));
+    cursor += name_length;
+    *cursor++ = L'=';
+    memcpy(cursor, wide_value, value_length * sizeof(*cursor));
+    cursor += value_length;
+    *cursor++ = L'\0';
+    *cursor = L'\0';
+    FreeEnvironmentStringsW(inherited);
+    free(wide_value);
+    return block;
+}
+
 static int spawn_capture_impl(const char *const *argv, const char *working_directory,
                               char **out_data, size_t *out_len,
                               size_t stderr_limit, cbm_spawn_bounded_capture_t *out_stderr,
-                              bool capture_stderr,
+                              bool capture_stderr, const char *source_date_epoch,
                               cbm_spawn_error_t *err) {
     if (out_data) {
         *out_data = NULL;
@@ -376,6 +470,7 @@ static int spawn_capture_impl(const char *const *argv, const char *working_direc
         memset(out_stderr, 0, sizeof(*out_stderr));
     }
     if (!argv || !argv[0] || !argv[0][0] || !out_data || !out_len ||
+        (source_date_epoch && !spawn_source_date_epoch_valid(source_date_epoch)) ||
         (capture_stderr && (!out_stderr || stderr_limit == 0))) {
         return spawn_fail(err, CBM_SPAWN_E_INVALID_ARGV, "CBM_SPAWN_E_INVALID_ARGV",
                           "spawn requires a non-empty argv and output pointers",
@@ -548,15 +643,26 @@ static int spawn_capture_impl(const char *const *argv, const char *working_direc
         cwd_encoded = cwd != NULL;
     }
 
+    DWORD environment_gle = ERROR_SUCCESS;
+    wchar_t *environment = source_date_epoch
+                               ? spawn_environment_with_source_date_epoch(source_date_epoch,
+                                                                          &environment_gle)
+                               : NULL;
+    bool environment_ready = !source_date_epoch || environment != NULL;
+
     PROCESS_INFORMATION pi;
     ZeroMemory(&pi, sizeof(pi));
     BOOL created = FALSE;
-    DWORD spawn_gle = cwd_encoded ? attr_gle : ERROR_NO_UNICODE_TRANSLATION;
-    if (prepared && cwd_encoded) {
+    DWORD spawn_gle = !cwd_encoded        ? ERROR_NO_UNICODE_TRANSLATION
+                      : !environment_ready ? environment_gle
+                                           : attr_gle;
+    if (prepared && cwd_encoded && environment_ready) {
         /* lpApplicationName is explicit, so CreateProcessW performs NO path
          * search: no CWD binary planting, and no shell anywhere. */
-        created = CreateProcessW(app, cmdline.data, NULL, NULL, TRUE, EXTENDED_STARTUPINFO_PRESENT,
-                                 NULL, cwd, &si.StartupInfo, &pi);
+        DWORD creation_flags = EXTENDED_STARTUPINFO_PRESENT |
+                               (environment ? CREATE_UNICODE_ENVIRONMENT : 0);
+        created = CreateProcessW(app, cmdline.data, NULL, NULL, TRUE, creation_flags,
+                                 environment, cwd, &si.StartupInfo, &pi);
         spawn_gle = created ? 0 : GetLastError();
     }
 
@@ -569,6 +675,7 @@ static int spawn_capture_impl(const char *const *argv, const char *working_direc
     free(cmdline.data);
     free(app);
     free(cwd);
+    free(environment);
     CloseHandle(wr); /* the child owns the write-end now */
     if (capture_stderr) {
         CloseHandle(stderr_wr);
@@ -581,6 +688,12 @@ static int spawn_capture_impl(const char *const *argv, const char *working_direc
             (void)WaitForSingleObject(stderr_thread, INFINITE);
             CloseHandle(stderr_thread);
             spawn_stderr_reader_release(stderr_reader);
+        }
+        if (!environment_ready) {
+            return spawn_fail(err, CBM_SPAWN_E_ENVIRONMENT, "CBM_SPAWN_E_ENVIRONMENT",
+                              "the exact child environment could not be materialized",
+                              "preserve the source epoch and inspect the native environment error",
+                              (unsigned long)spawn_gle, -1);
         }
         return spawn_fail(err, CBM_SPAWN_E_SPAWN, "CBM_SPAWN_E_SPAWN",
                           "the child process could not be created",
@@ -717,14 +830,15 @@ static int spawn_capture_impl(const char *const *argv, const char *working_direc
 
 int cbm_spawn_capture(const char *const *argv, char **out_data, size_t *out_len,
                       cbm_spawn_error_t *err) {
-    return spawn_capture_impl(argv, NULL, out_data, out_len, 0, NULL, false, err);
+    return spawn_capture_impl(argv, NULL, out_data, out_len, 0, NULL, false, NULL, err);
 }
 
 int cbm_spawn_capture_with_stderr(const char *const *argv, char **out_data, size_t *out_len,
                                   size_t stderr_limit,
                                   cbm_spawn_bounded_capture_t *out_stderr,
                                   cbm_spawn_error_t *err) {
-    return spawn_capture_impl(argv, NULL, out_data, out_len, stderr_limit, out_stderr, true, err);
+    return spawn_capture_impl(argv, NULL, out_data, out_len, stderr_limit, out_stderr, true, NULL,
+                              err);
 }
 
 int cbm_spawn_capture_with_stderr_cwd(const char *const *argv, const char *working_directory,
@@ -737,7 +851,22 @@ int cbm_spawn_capture_with_stderr_cwd(const char *const *argv, const char *worki
                           "bind the child to its captured compiler working directory", 0, -1);
     }
     return spawn_capture_impl(argv, working_directory, out_data, out_len, stderr_limit,
-                              out_stderr, true, err);
+                              out_stderr, true, NULL, err);
+}
+
+int cbm_spawn_capture_with_stderr_cwd_source_epoch(
+    const char *const *argv, const char *working_directory, const char *source_date_epoch,
+    char **out_data, size_t *out_len, size_t stderr_limit,
+    cbm_spawn_bounded_capture_t *out_stderr, cbm_spawn_error_t *err) {
+    if (!working_directory || !working_directory[0] || !source_date_epoch ||
+        !source_date_epoch[0]) {
+        return spawn_fail(err, CBM_SPAWN_E_INVALID_ARGV, "CBM_SPAWN_E_INVALID_ARGV",
+                          "source-epoch spawn requires an explicit cwd and source epoch",
+                          "bind the child to its captured compiler cwd and Git source epoch", 0,
+                          -1);
+    }
+    return spawn_capture_impl(argv, working_directory, out_data, out_len, stderr_limit,
+                              out_stderr, true, source_date_epoch, err);
 }
 
 #else /* !_WIN32 */
@@ -753,7 +882,8 @@ static int spawn_file_actions_addclose_nonstandard(posix_spawn_file_actions_t *a
 static int spawn_capture_impl(const char *const *argv, const char *working_directory,
                               char **out_data, size_t *out_len,
                               size_t stderr_limit, cbm_spawn_bounded_capture_t *out_stderr,
-                              bool capture_stderr, cbm_spawn_error_t *err) {
+                              bool capture_stderr, const char *source_date_epoch,
+                              cbm_spawn_error_t *err) {
     if (out_data) {
         *out_data = NULL;
     }
@@ -766,6 +896,11 @@ static int spawn_capture_impl(const char *const *argv, const char *working_direc
     if (working_directory && working_directory[0]) {
         return spawn_fail(err, CBM_SPAWN_E_INVALID_ARGV, "CBM_SPAWN_E_INVALID_ARGV",
                           "explicit child working directories are deferred on this platform",
+                          "run the native Windows shipping target", 0, -1);
+    }
+    if (source_date_epoch) {
+        return spawn_fail(err, CBM_SPAWN_E_INVALID_ARGV, "CBM_SPAWN_E_INVALID_ARGV",
+                          "source-epoch child environments are deferred on this platform",
                           "run the native Windows shipping target", 0, -1);
     }
     if (!argv || !argv[0] || !argv[0][0] || !out_data || !out_len ||
@@ -1094,14 +1229,15 @@ static int spawn_capture_impl(const char *const *argv, const char *working_direc
 
 int cbm_spawn_capture(const char *const *argv, char **out_data, size_t *out_len,
                       cbm_spawn_error_t *err) {
-    return spawn_capture_impl(argv, NULL, out_data, out_len, 0, NULL, false, err);
+    return spawn_capture_impl(argv, NULL, out_data, out_len, 0, NULL, false, NULL, err);
 }
 
 int cbm_spawn_capture_with_stderr(const char *const *argv, char **out_data, size_t *out_len,
                                   size_t stderr_limit,
                                   cbm_spawn_bounded_capture_t *out_stderr,
                                   cbm_spawn_error_t *err) {
-    return spawn_capture_impl(argv, NULL, out_data, out_len, stderr_limit, out_stderr, true, err);
+    return spawn_capture_impl(argv, NULL, out_data, out_len, stderr_limit, out_stderr, true, NULL,
+                              err);
 }
 
 int cbm_spawn_capture_with_stderr_cwd(const char *const *argv, const char *working_directory,
@@ -1114,7 +1250,22 @@ int cbm_spawn_capture_with_stderr_cwd(const char *const *argv, const char *worki
                           "bind the child to its captured compiler working directory", 0, -1);
     }
     return spawn_capture_impl(argv, working_directory, out_data, out_len, stderr_limit,
-                              out_stderr, true, err);
+                              out_stderr, true, NULL, err);
+}
+
+int cbm_spawn_capture_with_stderr_cwd_source_epoch(
+    const char *const *argv, const char *working_directory, const char *source_date_epoch,
+    char **out_data, size_t *out_len, size_t stderr_limit,
+    cbm_spawn_bounded_capture_t *out_stderr, cbm_spawn_error_t *err) {
+    if (!working_directory || !working_directory[0] || !source_date_epoch ||
+        !source_date_epoch[0]) {
+        return spawn_fail(err, CBM_SPAWN_E_INVALID_ARGV, "CBM_SPAWN_E_INVALID_ARGV",
+                          "source-epoch spawn requires an explicit cwd and source epoch",
+                          "bind the child to its captured compiler cwd and Git source epoch", 0,
+                          -1);
+    }
+    return spawn_capture_impl(argv, working_directory, out_data, out_len, stderr_limit,
+                              out_stderr, true, source_date_epoch, err);
 }
 
 #endif /* _WIN32 */
