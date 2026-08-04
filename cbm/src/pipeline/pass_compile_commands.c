@@ -350,11 +350,11 @@ static int build_preprocess_argv(cbm_pipeline_ctx_t *ctx,
         !owner->view.entry_path || !owner->view.entry_path[0]) {
         return CBM_NOT_FOUND;
     }
-    if (owner->preprocess_argument_count > INT_MAX - 4 ||
-        (size_t)(owner->preprocess_argument_count + 4) > SIZE_MAX / sizeof(char *)) {
+    if (owner->preprocess_argument_count > INT_MAX - 5 ||
+        (size_t)(owner->preprocess_argument_count + 5) > SIZE_MAX / sizeof(char *)) {
         return CBM_NOT_FOUND;
     }
-    char **argv = calloc((size_t)owner->preprocess_argument_count + 4, sizeof(*argv));
+    char **argv = calloc((size_t)owner->preprocess_argument_count + 5, sizeof(*argv));
     if (!argv) {
         return CBM_NOT_FOUND;
     }
@@ -384,9 +384,10 @@ static int build_preprocess_argv(cbm_pipeline_ctx_t *ctx,
     snprintf(macro_mapping, mapping_length, "-fmacro-prefix-map=%s=%s", ctx->source_root,
              ctx->repo_path);
     argv[count++] = macro_mapping;
+    argv[count++] = strdup("-Werror=date-time");
     argv[count++] = strdup("-E");
     argv[count++] = strdup(owner->view.entry_path);
-    if (!argv[count - 2] || !argv[count - 1]) {
+    if (!argv[count - 3] || !argv[count - 2] || !argv[count - 1]) {
         free_preprocess_argv(argv, count);
         return CBM_NOT_FOUND;
     }
@@ -1471,6 +1472,7 @@ static int map_compiler_expansion(cbm_pipeline_ctx_t *ctx,
     uint32_t logical_line = 0;
     size_t mapped_lines = 0;
     size_t line_index = 0;
+    size_t canonical_bytes = 0;
     size_t start = 0;
     for (;;) {
         size_t end = start;
@@ -1510,9 +1512,6 @@ static int map_compiler_expansion(cbm_pipeline_ctx_t *ctx,
             logical_line = marker_line;
             targets[line_index] = PREPROCESS_TARGET_NONE;
             source_lines[line_index] = PREPROCESS_TARGET_NONE;
-            for (size_t i = start; i < content_end; i++) {
-                text[i] = ' ';
-            }
             (void)mapped_target;
         } else {
             targets[line_index] = current_target;
@@ -1543,6 +1542,14 @@ static int map_compiler_expansion(cbm_pipeline_ctx_t *ctx,
                     "repository source-line mapping overflowed 32-bit representation",
                     "reduce the translation unit or extend source-line representation");
             }
+            size_t content_bytes = content_end - start;
+            if (content_bytes > 0) {
+                memmove(text + canonical_bytes, text + start, content_bytes);
+                canonical_bytes += content_bytes;
+            }
+        }
+        if (end < text_bytes) {
+            text[canonical_bytes++] = '\n';
         }
         line_index++;
         if (end == text_bytes) {
@@ -1560,8 +1567,21 @@ static int map_compiler_expansion(cbm_pipeline_ctx_t *ctx,
             "the compiler expansion maps no code line to its captured repository dependency closure",
             "inspect the exact compiler stdout, cwd, and immutable snapshot path mapping");
     }
+    if (canonical_bytes == 0) {
+        free(text);
+        free(targets);
+        free(source_lines);
+        return preprocess_fail(
+            ctx, "CBM_PREPROCESS_CANONICAL_OUTPUT_EMPTY", "canonicalize_compiler_output",
+            owner->tu_rel_path, text_bytes,
+            "validated compiler output contains no canonical source bytes",
+            "inspect the compiler expansion and repair the exact source/context inputs");
+    }
+    if (canonical_bytes < text_bytes) {
+        text[canonical_bytes] = '\0';
+    }
     out->text = text;
-    out->text_bytes = text_bytes;
+    out->text_bytes = canonical_bytes;
     out->line_targets = targets;
     out->line_source_lines = source_lines;
     out->line_count = line_count;
@@ -1661,7 +1681,10 @@ int cbm_compile_context_extract_calls(cbm_pipeline_ctx_t *ctx,
         cbm_log_info("compiler_preprocess.ready", "compiler_invocations", "0", "syntax_trees",
                      "0", "target_projections", "0", "expanded_bytes", "0", "mapped_lines",
                      "0", "peak_expansion_bytes", "0", "authority",
-                     index->authority_absent ? "absent" : "not_applicable");
+                     index->authority_absent ? "absent" : "not_applicable", "cache",
+                     "one_compiler_expansion_per_context", "canonicalization",
+                     "validated_linemarkers_to_empty_lines", "nondeterministic_time_macros",
+                     "fail_closed", "fallback", "none");
         return 0;
     }
 #ifndef ASTRO_SPAWN
@@ -1707,9 +1730,11 @@ int cbm_compile_context_extract_calls(cbm_pipeline_ctx_t *ctx,
     cbm_sha256_ctx expansion_set_hash;
     cbm_sha256_init(&expansion_set_hash);
     uint64_t expanded_bytes_total = 0;
+    uint64_t compiler_stdout_bytes_total = 0;
     uint64_t mapped_lines_total = 0;
     uint64_t target_projections = 0;
     size_t peak_expansion_bytes = 0;
+    size_t peak_compiler_stdout_bytes = 0;
     int status = 0;
     for (int context_index = 0; context_index < index->context_count && status == 0;
          context_index++) {
@@ -1805,30 +1830,38 @@ int cbm_compile_context_extract_calls(cbm_pipeline_ctx_t *ctx,
             free(working_directory);
             break;
         }
-        char expansion_hash[CBM_SHA256_HEX_LEN + 1];
-        char bytes_text[32];
-        char targets_text[32];
-        char stderr_text[32];
-        sha256_hex(output, output_bytes, expansion_hash);
-        snprintf(bytes_text, sizeof(bytes_text), "%zu", output_bytes);
-        snprintf(targets_text, sizeof(targets_text), "%zu", target_count);
-        snprintf(stderr_text, sizeof(stderr_text), "%llu",
-                 (unsigned long long)stderr_capture.total_len);
-        cbm_sha256_update(&expansion_set_hash, owner->view.context_id,
-                          strlen(owner->view.context_id));
-        cbm_sha256_update(&expansion_set_hash, "\0", 1);
-        cbm_sha256_update(&expansion_set_hash, output, output_bytes);
-        cbm_log_info("compiler_preprocess.context", "translation_unit", owner->tu_rel_path,
-                     "context_id", owner->view.context_id, "expanded_bytes", bytes_text,
-                     "expanded_sha256", expansion_hash, "projection_targets", targets_text,
-                     "stderr_total_bytes", stderr_text, "stderr_truncated",
-                     stderr_capture.truncated ? "true" : "false");
+        size_t compiler_stdout_bytes = output_bytes;
+        uint64_t stderr_total_bytes = stderr_capture.total_len;
+        bool stderr_truncated = stderr_capture.truncated;
         free(stderr_capture.data);
 
         compiler_expansion_t expansion = {0};
         status = map_compiler_expansion(ctx, index, owner, working_directory,
                                         target_by_source_index, output, output_bytes, &expansion);
         if (status == 0) {
+            char expansion_hash[CBM_SHA256_HEX_LEN + 1];
+            char bytes_text[32];
+            char stdout_bytes_text[32];
+            char targets_text[32];
+            char stderr_text[32];
+            sha256_hex(expansion.text, expansion.text_bytes, expansion_hash);
+            snprintf(bytes_text, sizeof(bytes_text), "%zu", expansion.text_bytes);
+            snprintf(stdout_bytes_text, sizeof(stdout_bytes_text), "%zu",
+                     compiler_stdout_bytes);
+            snprintf(targets_text, sizeof(targets_text), "%zu", target_count);
+            snprintf(stderr_text, sizeof(stderr_text), "%llu",
+                     (unsigned long long)stderr_total_bytes);
+            cbm_sha256_update(&expansion_set_hash, owner->view.context_id,
+                              strlen(owner->view.context_id));
+            cbm_sha256_update(&expansion_set_hash, "\0", 1);
+            cbm_sha256_update(&expansion_set_hash, expansion.text, expansion.text_bytes);
+            cbm_log_info(
+                "compiler_preprocess.context", "translation_unit", owner->tu_rel_path,
+                "context_id", owner->view.context_id, "compiler_stdout_bytes",
+                stdout_bytes_text, "expanded_bytes", bytes_text, "expanded_sha256",
+                expansion_hash, "projection_targets", targets_text, "stderr_total_bytes",
+                stderr_text, "stderr_truncated", stderr_truncated ? "true" : "false",
+                "canonicalization", "validated_linemarkers_to_empty_lines");
             char *diagnostic = NULL;
             status = cbm_extract_preprocessed_translation_unit(
                 expansion.text, expansion.text_bytes, owner->view.cpp_mode,
@@ -1846,10 +1879,14 @@ int cbm_compile_context_extract_calls(cbm_pipeline_ctx_t *ctx,
             free(diagnostic);
             if (status == 0) {
                 expanded_bytes_total += expansion.text_bytes;
+                compiler_stdout_bytes_total += compiler_stdout_bytes;
                 mapped_lines_total += expansion.mapped_lines;
                 target_projections += target_count;
                 if (expansion.text_bytes > peak_expansion_bytes) {
                     peak_expansion_bytes = expansion.text_bytes;
+                }
+                if (compiler_stdout_bytes > peak_compiler_stdout_bytes) {
+                    peak_compiler_stdout_bytes = compiler_stdout_bytes;
                 }
             }
         }
@@ -1881,8 +1918,10 @@ int cbm_compile_context_extract_calls(cbm_pipeline_ctx_t *ctx,
         char contexts_text[32];
         char projections_text[32];
         char total_bytes_text[32];
+        char total_stdout_bytes_text[32];
         char mapped_text[32];
         char peak_text[32];
+        char peak_stdout_text[32];
         cbm_sha256_final(&expansion_set_hash, digest);
         for (int i = 0; i < CBM_SHA256_DIGEST_LEN; i++) {
             snprintf(set_hash + i * 2, 3, "%02x", digest[i]);
@@ -1893,15 +1932,22 @@ int cbm_compile_context_extract_calls(cbm_pipeline_ctx_t *ctx,
                  (unsigned long long)target_projections);
         snprintf(total_bytes_text, sizeof(total_bytes_text), "%llu",
                  (unsigned long long)expanded_bytes_total);
+        snprintf(total_stdout_bytes_text, sizeof(total_stdout_bytes_text), "%llu",
+                 (unsigned long long)compiler_stdout_bytes_total);
         snprintf(mapped_text, sizeof(mapped_text), "%llu",
                  (unsigned long long)mapped_lines_total);
         snprintf(peak_text, sizeof(peak_text), "%zu", peak_expansion_bytes);
+        snprintf(peak_stdout_text, sizeof(peak_stdout_text), "%zu",
+                 peak_compiler_stdout_bytes);
         cbm_log_info(
             "compiler_preprocess.ready", "compiler_invocations", contexts_text, "syntax_trees",
             contexts_text, "target_projections", projections_text, "expanded_bytes",
-            total_bytes_text, "mapped_lines", mapped_text, "peak_expansion_bytes", peak_text,
-            "expansion_set_sha256", set_hash, "cache", "one_compiler_expansion_per_context",
-            "fallback", "none");
+            total_bytes_text, "compiler_stdout_bytes", total_stdout_bytes_text, "mapped_lines",
+            mapped_text, "peak_expansion_bytes", peak_text, "peak_compiler_stdout_bytes",
+            peak_stdout_text, "expansion_set_sha256", set_hash, "cache",
+            "one_compiler_expansion_per_context", "canonicalization",
+            "validated_linemarkers_to_empty_lines", "nondeterministic_time_macros",
+            "fail_closed", "fallback", "none");
     }
     free(target_by_source_index);
     free(target_rel_paths);
