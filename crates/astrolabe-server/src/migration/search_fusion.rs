@@ -137,14 +137,13 @@ pub(crate) fn run_fused_search_graph(args: &Map<String, Value>) -> Result<String
             "Pass the project whose shadow vault holds the search corpus.",
         );
     };
-    if read_dial(&project)? != MigrationDial::Shadow {
-        return coded_error(
-            ASTRO_SEARCH_FUSION_SHADOW,
-            format!("project {project:?} is not shadow-indexed; the fused engine needs the vault"),
-            "Run index_repository with calyx=\"shadow\" for this project before fusion:true.",
-        );
-    }
-
+    // #922: every purely syntactic argument check runs BEFORE the persisted dial read
+    // below. Previously `read_dial` came first, so a malformed `fusion_override` or a
+    // wrong-typed `k` on a project that is not shadow-indexed was reported as
+    // ASTRO_SEARCH_FUSION_SHADOW -- a true statement about the project that told the
+    // caller nothing about the argument that was actually wrong, and that touched the
+    // store to say it. Resolving the argument shape here means a malformed request is
+    // refused on its own terms and reads nothing.
     let k = optional_u64(args, "k")?
         .or(optional_u64(args, "limit")?)
         .unwrap_or(DEFAULT_FUSION_K);
@@ -153,6 +152,14 @@ pub(crate) fn run_fused_search_graph(args: &Map<String, Value>) -> Result<String
     let temporal_alpha_millis = optional_u64(args, "temporal_alpha_millis")?.unwrap_or(0);
     let explicit_override = parse_fusion_override(args)?;
     let propagated_label = string_arg(args, "propagated_label").map(ToOwned::to_owned);
+
+    if read_dial(&project)? != MigrationDial::Shadow {
+        return coded_error(
+            ASTRO_SEARCH_FUSION_SHADOW,
+            format!("project {project:?} is not shadow-indexed; the fused engine needs the vault"),
+            "Run index_repository with calyx=\"shadow\" for this project before fusion:true.",
+        );
+    }
 
     let cache_dir = astrolabe_bridge::cbm_cache_dir()?;
     if let Some(refusal) = shadow_graph_freshness_refusal(&cache_dir, &project, "search_graph")? {

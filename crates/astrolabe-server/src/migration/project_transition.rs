@@ -8,6 +8,12 @@ use astrolabe_domain::knobs::{
     PROJECT_TRANSITION_QUIESCENCE_TIMEOUT_MS, WATCHER_DEFAULT_POLL_INTERVAL_MS,
 };
 
+/// Fail-closed: `repo_path` did not resolve to an existing canonical root.
+///
+/// A caller-input fault (#910). Declared as a real constant so the code the caller
+/// branches on has one definition rather than being spelled inline in a message.
+pub(crate) const ASTRO_PROJECT_TRANSITION_ROOT_UNRESOLVED: &str =
+    "ASTRO_PROJECT_TRANSITION_ROOT_UNRESOLVED";
 pub(crate) const PROJECT_TRANSITION_STATUS_KEY: &str = "project_transition_json";
 const PROJECT_TRANSITION_WORKER_GRANT_SCHEMA: &str = "astrolabe-project-transition-worker-grant-v3";
 
@@ -417,11 +423,21 @@ impl<'a> ProjectIndexTransition<'a> {
         project: &str,
         repo_path: &Path,
     ) -> Result<Self, DynError> {
+        // #910: a repo_path that does not resolve is a *caller input* fault, not an
+        // internal one. This used to be a bare formatted string, which carries no type,
+        // so the MCP boundary had nothing to recognise and relabelled it
+        // `ASTRO_MCP_HANDLER_INTERNAL` with a remediation about inspecting a persisted
+        // store or lock -- state this request never touched, for a fault no retry can
+        // clear. Carrying it as a `ToolFault` keeps the real code and the real
+        // remediation as the fields the caller is contractually told to act on.
         let root = fs::canonicalize(repo_path).map_err(|error| {
-            format!(
-                "ASTRO_PROJECT_TRANSITION_ROOT_UNRESOLVED: canonicalizing {} failed: {error}; remediation: pass one existing canonical repository root",
-                repo_path.display()
+            ToolFault::new(
+                ASTRO_PROJECT_TRANSITION_ROOT_UNRESOLVED,
+                format!("canonicalizing {} failed: {error}", repo_path.display()),
+                "pass one existing canonical repository root",
             )
+            .with_detail("argument", "repo_path")
+            .with_detail("repo_path", repo_path.display().to_string())
         })?;
         runner.close_cached_project_store()?;
         let native = CbmProjectTransition::acquire(project)?;
