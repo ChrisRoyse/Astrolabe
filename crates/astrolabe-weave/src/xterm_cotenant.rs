@@ -32,6 +32,11 @@ pub const XTERM_PLACEMENT_TRUTH_COTENANT_SCHEMA: &str = "astrolabe.placement_tru
 /// prefix-disjoint XTerm key family and carry either an exact scalar bit pattern
 /// or an explicit typed-incompatibility witness.
 pub const XTERM_COMPLETE_PAIR_COTENANT_SCHEMA: &str = "astrolabe.complete_pair.v1";
+/// Compact binary exhaustive-pair block schema. The first eight bytes are a
+/// positive discriminator so full-CF readers can count and skip this co-tenant
+/// without attempting UTF-8/JSON decoding.
+pub const XTERM_COMPLETE_PAIR_BLOCK_COTENANT_SCHEMA: &str = "astrolabe.complete_pair_block.v2";
+pub const XTERM_COMPLETE_PAIR_BLOCK_MAGIC: &[u8; 8] = b"ASTRXPB2";
 
 /// The set of foreign schema tags a co-tenant-aware XTerm reader accepts as
 /// counted skips rather than decoding as loom rows.
@@ -39,6 +44,7 @@ pub fn accepted_xterm_cotenant_schemas() -> BTreeSet<&'static str> {
     [
         XTERM_PLACEMENT_TRUTH_COTENANT_SCHEMA,
         XTERM_COMPLETE_PAIR_COTENANT_SCHEMA,
+        XTERM_COMPLETE_PAIR_BLOCK_COTENANT_SCHEMA,
     ]
     .into_iter()
     .collect()
@@ -57,6 +63,9 @@ pub fn accepted_xterm_cotenant_schemas() -> BTreeSet<&'static str> {
 /// genuinely corrupt row (invalid JSON, no `schema=` first line) yields `None`
 /// and the caller fails closed.
 pub fn xterm_cotenant_schema_tag(value: &[u8]) -> Option<String> {
+    if value.starts_with(XTERM_COMPLETE_PAIR_BLOCK_MAGIC) {
+        return Some(XTERM_COMPLETE_PAIR_BLOCK_COTENANT_SCHEMA.to_string());
+    }
     // JSON object form first: {"schema":"<tag>", ...}.
     if let Ok(serde_json::Value::Object(map)) = serde_json::from_slice::<serde_json::Value>(value)
         && let Some(serde_json::Value::String(schema)) = map.get("schema")

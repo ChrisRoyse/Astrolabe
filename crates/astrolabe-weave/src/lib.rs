@@ -48,9 +48,9 @@ mod xterm_rows;
 pub use ann::{AnnFamilyReport, QuantScaleMeasurement};
 pub use complete_xterms::{
     ASTRO_XTERM_COMPLETION_CORRUPT, ASTRO_XTERM_COMPLETION_OVERFLOW, ASTRO_XTERM_SOURCE_CORRUPT,
-    COMPLETE_PAIR_ROW_PREFIX, COMPLETE_PAIR_ROW_SCHEMA, COMPLETE_WITNESS_PREFIX,
-    COMPLETE_WITNESS_SCHEMA, CompleteAssociationPersistReport, CompleteAssociationState,
-    PairMetricCounts, PairReasonCounts, read_complete_association_state,
+    COMPLETE_PAIR_BLOCK_MAGIC, COMPLETE_PAIR_BLOCK_PREFIX, COMPLETE_PAIR_BLOCK_SCHEMA,
+    COMPLETE_WITNESS_PREFIX, COMPLETE_WITNESS_SCHEMA, CompleteAssociationPersistReport,
+    CompleteAssociationState, PairMetricCounts, PairReasonCounts, read_complete_association_state,
     read_complete_association_state_vault_path, reconcile_complete_associations,
 };
 pub use drift_producer::{
@@ -84,8 +84,9 @@ pub use sim_rows::{
     read_similarity_edge_rows, sim_edge_graph_key,
 };
 pub use xterm_cotenant::{
-    XTERM_COMPLETE_PAIR_COTENANT_SCHEMA, XTERM_PLACEMENT_TRUTH_COTENANT_SCHEMA,
-    accepted_xterm_cotenant_schemas, is_accepted_xterm_cotenant, xterm_cotenant_schema_tag,
+    XTERM_COMPLETE_PAIR_BLOCK_COTENANT_SCHEMA, XTERM_COMPLETE_PAIR_COTENANT_SCHEMA,
+    XTERM_PLACEMENT_TRUTH_COTENANT_SCHEMA, accepted_xterm_cotenant_schemas,
+    is_accepted_xterm_cotenant, xterm_cotenant_schema_tag,
 };
 pub use xterm_rows::{
     AGREEMENT_GRAPH_ASPECT_PROVENANCE, AGREEMENT_GRAPH_ASPECT_SCHEMA, ASTRO_XTERM_CX_ID_MISSING,

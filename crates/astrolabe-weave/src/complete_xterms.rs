@@ -2,10 +2,12 @@
 //!
 //! The source of truth is the persisted Base row plus the exact Slot-CF bytes it
 //! hashes. `NotApplicable` slots are outside the roster; every other stored slot
-//! is applicable and every unordered pair receives exactly one XTerm witness:
-//! an exact scalar association or an explicit typed incompatibility. Per-record
-//! Kv witnesses bind the source slot hashes, applicable roster, expected key
-//! stream, and exact XTerm value stream. Reconciliation validates existing bytes
+//! is applicable and every unordered pair receives exactly one logical outcome:
+//! an exact scalar association or an explicit typed incompatibility. Outcomes
+//! are stored in one compact binary XTerm block per constellation; SlotIds stay
+//! separate and deterministically reconstruct every virtual pair. Per-record Kv
+//! witnesses bind the source slot hashes, applicable roster, block bytes, virtual
+//! key stream, and exact outcome stream. Reconciliation validates existing bytes
 //! before using their source hash to skip unchanged records.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -26,14 +28,25 @@ use calyx_ledger::{ActorId, EntryKind, SubjectId};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
+use crate::hex_lower_bytes;
 use crate::sim_rows::ledger_ref_at_commit;
-use crate::{XTERM_COMPLETE_PAIR_COTENANT_SCHEMA, hex_lower_bytes};
+use crate::xterm_cotenant::{
+    XTERM_COMPLETE_PAIR_BLOCK_COTENANT_SCHEMA, XTERM_COMPLETE_PAIR_BLOCK_MAGIC,
+    XTERM_COMPLETE_PAIR_COTENANT_SCHEMA,
+};
 
-pub const COMPLETE_PAIR_ROW_SCHEMA: &str = XTERM_COMPLETE_PAIR_COTENANT_SCHEMA;
-pub const COMPLETE_WITNESS_SCHEMA: &str = "astrolabe.complete_pair_witness.v1";
-pub const COMPLETE_ASSOCIATION_LEDGER_SCHEMA: &str = "astrolabe.complete_association_commit.v1";
-pub const COMPLETE_PAIR_ROW_PREFIX: &[u8] = b"astrolabe:complete-xterm:v1\0";
-pub const COMPLETE_WITNESS_PREFIX: &[u8] = b"astrolabe:complete-xterm-witness:v1\0";
+const LEGACY_COMPLETE_PAIR_ROW_SCHEMA: &str = XTERM_COMPLETE_PAIR_COTENANT_SCHEMA;
+const LEGACY_COMPLETE_WITNESS_SCHEMA: &str = "astrolabe.complete_pair_witness.v1";
+const LEGACY_COMPLETE_PAIR_ROW_PREFIX: &[u8] = b"astrolabe:complete-xterm:v1\0";
+const LEGACY_COMPLETE_WITNESS_PREFIX: &[u8] = b"astrolabe:complete-xterm-witness:v1\0";
+
+pub const COMPLETE_PAIR_BLOCK_SCHEMA: &str = XTERM_COMPLETE_PAIR_BLOCK_COTENANT_SCHEMA;
+pub const COMPLETE_WITNESS_SCHEMA: &str = "astrolabe.complete_pair_witness.v2";
+pub const COMPLETE_ASSOCIATION_LEDGER_SCHEMA: &str = "astrolabe.complete_association_commit.v2";
+pub const COMPLETE_PAIR_BLOCK_PREFIX: &[u8] = b"astrolabe:complete-xterm-block:v2\0";
+pub const COMPLETE_WITNESS_PREFIX: &[u8] = b"astrolabe:complete-xterm-witness:v2\0";
+/// Binary schema discriminator understood by every full-XTerm co-tenant scan.
+pub const COMPLETE_PAIR_BLOCK_MAGIC: &[u8; 8] = XTERM_COMPLETE_PAIR_BLOCK_MAGIC;
 pub const ASTRO_XTERM_SOURCE_CORRUPT: &str = "ASTRO_XTERM_SOURCE_CORRUPT";
 pub const ASTRO_XTERM_COMPLETION_CORRUPT: &str = "ASTRO_XTERM_COMPLETION_CORRUPT";
 pub const ASTRO_XTERM_COMPLETION_OVERFLOW: &str = "ASTRO_XTERM_COMPLETION_OVERFLOW";
@@ -89,13 +102,28 @@ enum PreparedSlot {
     },
 }
 
-impl PreparedSlot {
-    fn shape_name(&self) -> String {
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SlotDescriptor {
+    Dense { dim: u32, zero_norm: bool },
+    Sparse { dim: u32, zero_norm: bool },
+    Multi { token_dim: u32, zero_norm: bool },
+    Absent { reason: AbsentReason },
+}
+
+impl SlotDescriptor {
+    fn absent_reason(&self) -> Option<&AbsentReason> {
         match self {
-            Self::Dense { dim, .. } => format!("dense:{dim}"),
-            Self::Sparse { dim, .. } => format!("sparse:{dim}"),
-            Self::Multi { token_dim, .. } => format!("multi:{token_dim}"),
-            Self::Absent { reason } => format!("absent:{}", absent_reason_wire(reason)),
+            Self::Absent { reason } => Some(reason),
+            _ => None,
+        }
+    }
+
+    fn zero_norm(&self) -> bool {
+        match self {
+            Self::Dense { zero_norm, .. }
+            | Self::Sparse { zero_norm, .. }
+            | Self::Multi { zero_norm, .. } => *zero_norm,
+            Self::Absent { .. } => false,
         }
     }
 }
@@ -110,9 +138,71 @@ struct AssociationConstellation {
     slots: BTreeMap<SlotId, PreparedSlot>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PairMetric {
+    Cosine,
+    SymmetricMeanMaxsimCosine,
+}
+
+impl PairMetric {
+    fn code(self) -> u8 {
+        match self {
+            Self::Cosine => 1,
+            Self::SymmetricMeanMaxsimCosine => 2,
+        }
+    }
+
+    fn wire_name(self) -> &'static str {
+        match self {
+            Self::Cosine => "cosine",
+            Self::SymmetricMeanMaxsimCosine => "symmetric_mean_maxsim_cosine",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PairReason {
+    AbsentSlot,
+    ShapeMismatch,
+    ZeroNorm,
+}
+
+impl PairReason {
+    fn code(self) -> u8 {
+        match self {
+            Self::AbsentSlot => 3,
+            Self::ShapeMismatch => 4,
+            Self::ZeroNorm => 5,
+        }
+    }
+
+    fn wire_name(self) -> &'static str {
+        match self {
+            Self::AbsentSlot => "absent_slot",
+            Self::ShapeMismatch => "shape_mismatch",
+            Self::ZeroNorm => "zero_norm",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CompletePairOutcome {
+    Computed { metric: PairMetric, value_bits: u32 },
+    TypedIncompatible { reason: PairReason },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct LegacyCompletePairRow {
+    schema: String,
+    cx_id: String,
+    left_slot: u16,
+    right_slot: u16,
+    outcome: LegacyCompletePairOutcome,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
-enum CompletePairOutcome {
+enum LegacyCompletePairOutcome {
     Computed {
         metric: String,
         value_bits: u32,
@@ -126,16 +216,7 @@ enum CompletePairOutcome {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct CompletePairRow {
-    schema: String,
-    cx_id: String,
-    left_slot: u16,
-    right_slot: u16,
-    outcome: CompletePairOutcome,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct CompletionWitness {
+struct LegacyCompletionWitness {
     schema: String,
     cx_id: String,
     panel_version: u32,
@@ -152,10 +233,33 @@ struct CompletionWitness {
     pair_value_stream_hash: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct CompletionWitness {
+    schema: String,
+    cx_id: String,
+    panel_version: u32,
+    association_source_hash: String,
+    source_slot_count: usize,
+    not_applicable_slot_count: usize,
+    applicable_slot_ids: Vec<u16>,
+    expected_pair_count: usize,
+    computed_pair_count: usize,
+    typed_incompatible_pair_count: usize,
+    metric_counts: BTreeMap<String, usize>,
+    typed_reason_counts: BTreeMap<String, usize>,
+    absent_slot_reason_counts: BTreeMap<String, usize>,
+    slot_descriptor_hash: String,
+    pair_block_byte_count: usize,
+    pair_block_hash: String,
+    pair_key_stream_hash: String,
+    pair_value_stream_hash: String,
+}
+
 #[derive(Debug, Clone)]
 struct PlannedConstellation {
     cx_id: CxId,
-    rows: BTreeMap<Vec<u8>, Vec<u8>>,
+    block_key: Vec<u8>,
+    block_bytes: Vec<u8>,
     witness_key: Vec<u8>,
     witness_bytes: Vec<u8>,
     witness: CompletionWitness,
@@ -183,10 +287,15 @@ pub struct CompleteAssociationState {
     pub expected_pair_count: usize,
     pub computed_pair_count: usize,
     pub typed_incompatible_pair_count: usize,
+    /// Logical pair outcomes reconstructed from the persisted blocks.
     pub completion_row_count: usize,
+    /// Physical XTerm blocks. Exactly one exists per completion witness.
+    pub physical_block_count: usize,
     pub panel_version_counts: BTreeMap<u32, usize>,
     pub metric_counts: PairMetricCounts,
     pub typed_reason_counts: PairReasonCounts,
+    /// Exact persisted absence reasons counted once per applicable absent slot.
+    pub absent_slot_reason_counts: BTreeMap<String, usize>,
     pub witness_state_hash: String,
     pub pair_key_stream_hash: String,
     pub pair_value_stream_hash: String,
@@ -198,9 +307,13 @@ pub struct CompleteAssociationPersistReport {
     pub constellations_recomputed: usize,
     pub constellations_unchanged: usize,
     pub constellations_removed: usize,
-    pub rows_written: usize,
-    pub rows_unchanged: usize,
-    pub rows_tombstoned: usize,
+    pub pair_outcomes_written: usize,
+    pub pair_outcomes_unchanged: usize,
+    pub pair_outcomes_tombstoned: usize,
+    pub blocks_written: usize,
+    pub blocks_unchanged: usize,
+    pub blocks_tombstoned: usize,
+    pub legacy_rows_tombstoned: usize,
     pub witnesses_written: usize,
     pub witnesses_tombstoned: usize,
     pub commit_count: usize,
@@ -213,6 +326,12 @@ pub struct CompleteAssociationPersistReport {
 struct PersistedState {
     public: CompleteAssociationState,
     witnesses: BTreeMap<CxId, (Vec<u8>, CompletionWitness)>,
+    blocks: BTreeMap<CxId, Vec<u8>>,
+}
+
+#[derive(Debug)]
+struct LegacyPersistedState {
+    witnesses: BTreeMap<CxId, (Vec<u8>, LegacyCompletionWitness)>,
     rows: BTreeMap<CxId, BTreeMap<Vec<u8>, Vec<u8>>>,
 }
 
@@ -222,11 +341,19 @@ pub fn read_complete_association_state<C>(
 where
     C: Clock,
 {
-    Ok(read_persisted_state_at(vault, vault.snapshot())?.public)
+    let snapshot = vault.snapshot();
+    let state = read_persisted_state_at(vault, snapshot)?;
+    let legacy = read_legacy_v1_state_at(vault, snapshot)?;
+    if !legacy.witnesses.is_empty() || !legacy.rows.is_empty() {
+        return Err(completion_corrupt(
+            "active v1 row-per-pair associations remain; run reconciliation to atomically migrate them to v2 blocks before reading completion state",
+        ));
+    }
+    Ok(state.public)
 }
 
 /// Opens the real durable vault read-only and independently verifies every
-/// completion witness and raw complete-pair XTerm row.
+/// completion witness and reconstructs every pair from raw XTerm block bytes.
 pub fn read_complete_association_state_vault_path(
     vault_dir: impl AsRef<Path>,
     vault_id: &str,
@@ -254,25 +381,41 @@ where
     let actor = actor.into();
     let snapshot = vault.snapshot();
     let persisted = read_persisted_state_at(vault, snapshot)?;
+    let legacy = read_legacy_v1_state_at(vault, snapshot)?;
+    if persisted
+        .witnesses
+        .keys()
+        .any(|cx_id| legacy.witnesses.contains_key(cx_id))
+    {
+        return Err(completion_corrupt(
+            "a constellation has both v1 and v2 completion witnesses; refusing an ambiguous partial migration",
+        ));
+    }
     let records = load_constellations_at(vault, snapshot)?;
     let current_ids = records
         .iter()
         .map(|record| record.cx_id)
         .collect::<BTreeSet<_>>();
+    let current_sources = records
+        .iter()
+        .map(|record| (record.cx_id, record.source_hash.clone()))
+        .collect::<BTreeMap<_, _>>();
 
     let mut changed = Vec::new();
     let mut constellations_unchanged = 0usize;
-    let mut rows_unchanged = 0usize;
+    let mut pair_outcomes_unchanged = 0usize;
+    let mut blocks_unchanged = 0usize;
     for record in records {
         match persisted.witnesses.get(&record.cx_id) {
             Some((_, witness)) if witness.association_source_hash == record.source_hash => {
                 constellations_unchanged =
                     checked_add(constellations_unchanged, 1, "unchanged constellations")?;
-                rows_unchanged = checked_add(
-                    rows_unchanged,
+                pair_outcomes_unchanged = checked_add(
+                    pair_outcomes_unchanged,
                     witness.expected_pair_count,
-                    "unchanged pair rows",
+                    "unchanged pair outcomes",
                 )?;
+                blocks_unchanged = checked_add(blocks_unchanged, 1, "unchanged pair blocks")?;
             }
             _ => changed.push(record),
         }
@@ -280,14 +423,20 @@ where
     let removed = persisted
         .witnesses
         .keys()
+        .chain(legacy.witnesses.keys())
         .filter(|cx_id| !current_ids.contains(cx_id))
         .copied()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
         .collect::<Vec<_>>();
 
     let mut pending = Vec::<(ColumnFamily, Vec<u8>, Vec<u8>)>::new();
     let mut pending_record_ids = Vec::<String>::new();
-    let mut rows_written = 0usize;
-    let mut rows_tombstoned = 0usize;
+    let mut pair_outcomes_written = 0usize;
+    let mut pair_outcomes_tombstoned = 0usize;
+    let mut blocks_written = 0usize;
+    let mut blocks_tombstoned = 0usize;
+    let mut legacy_rows_tombstoned = 0usize;
     let mut witnesses_written = 0usize;
     let mut witnesses_tombstoned = 0usize;
     let mut ledger_ref = None;
@@ -302,27 +451,26 @@ where
             .collect::<Vec<_>>();
         for planned in planned_batch {
             let planned = planned?;
-            let existing_rows = persisted.rows.get(&planned.cx_id);
             let mut record_mutations = Vec::new();
-            for (key, value) in &planned.rows {
-                if existing_rows.and_then(|rows| rows.get(key)) == Some(value) {
-                    rows_unchanged = checked_add(rows_unchanged, 1, "unchanged pair rows")?;
-                } else {
-                    record_mutations.push((ColumnFamily::XTerm, key.clone(), value.clone()));
-                    rows_written = checked_add(rows_written, 1, "written pair rows")?;
-                }
-            }
-            if let Some(existing_rows) = existing_rows {
-                for key in existing_rows.keys() {
-                    if !planned.rows.contains_key(key) {
-                        record_mutations.push((
-                            ColumnFamily::XTerm,
-                            key.clone(),
-                            tombstone.clone(),
-                        ));
-                        rows_tombstoned = checked_add(rows_tombstoned, 1, "tombstoned pair rows")?;
-                    }
-                }
+            if persisted.blocks.get(&planned.cx_id) == Some(&planned.block_bytes) {
+                blocks_unchanged = checked_add(blocks_unchanged, 1, "unchanged pair blocks")?;
+                pair_outcomes_unchanged = checked_add(
+                    pair_outcomes_unchanged,
+                    planned.witness.expected_pair_count,
+                    "unchanged pair outcomes",
+                )?;
+            } else {
+                record_mutations.push((
+                    ColumnFamily::XTerm,
+                    planned.block_key.clone(),
+                    planned.block_bytes.clone(),
+                ));
+                blocks_written = checked_add(blocks_written, 1, "written pair blocks")?;
+                pair_outcomes_written = checked_add(
+                    pair_outcomes_written,
+                    planned.witness.expected_pair_count,
+                    "written pair outcomes",
+                )?;
             }
             let witness_unchanged = persisted
                 .witnesses
@@ -335,6 +483,27 @@ where
                     planned.witness_bytes.clone(),
                 ));
                 witnesses_written = checked_add(witnesses_written, 1, "written witnesses")?;
+            }
+            if let Some(legacy_rows) = legacy.rows.get(&planned.cx_id) {
+                for key in legacy_rows.keys() {
+                    record_mutations.push((ColumnFamily::XTerm, key.clone(), tombstone.clone()));
+                    legacy_rows_tombstoned =
+                        checked_add(legacy_rows_tombstoned, 1, "tombstoned legacy pair rows")?;
+                }
+                pair_outcomes_tombstoned = checked_add(
+                    pair_outcomes_tombstoned,
+                    legacy_rows.len(),
+                    "tombstoned legacy pair outcomes",
+                )?;
+            }
+            if legacy.witnesses.contains_key(&planned.cx_id) {
+                record_mutations.push((
+                    ColumnFamily::Kv,
+                    legacy_witness_key(planned.cx_id),
+                    tombstone.clone(),
+                ));
+                witnesses_tombstoned =
+                    checked_add(witnesses_tombstoned, 1, "tombstoned legacy witnesses")?;
             }
             if !pending.is_empty()
                 && pending.len().saturating_add(record_mutations.len())
@@ -357,14 +526,39 @@ where
 
     for cx_id in &removed {
         let mut record_mutations = Vec::new();
-        if let Some(rows) = persisted.rows.get(cx_id) {
+        if persisted.blocks.contains_key(cx_id) {
+            record_mutations.push((ColumnFamily::XTerm, block_key(*cx_id), tombstone.clone()));
+            blocks_tombstoned = checked_add(blocks_tombstoned, 1, "tombstoned pair blocks")?;
+        }
+        if let Some((_, witness)) = persisted.witnesses.get(cx_id) {
+            pair_outcomes_tombstoned = checked_add(
+                pair_outcomes_tombstoned,
+                witness.expected_pair_count,
+                "tombstoned pair outcomes",
+            )?;
+            record_mutations.push((ColumnFamily::Kv, witness_key(*cx_id), tombstone.clone()));
+            witnesses_tombstoned = checked_add(witnesses_tombstoned, 1, "tombstoned witnesses")?;
+        }
+        if let Some(rows) = legacy.rows.get(cx_id) {
             for key in rows.keys() {
                 record_mutations.push((ColumnFamily::XTerm, key.clone(), tombstone.clone()));
-                rows_tombstoned = checked_add(rows_tombstoned, 1, "tombstoned removed pair rows")?;
+                legacy_rows_tombstoned =
+                    checked_add(legacy_rows_tombstoned, 1, "tombstoned legacy pair rows")?;
             }
         }
-        record_mutations.push((ColumnFamily::Kv, witness_key(*cx_id), tombstone.clone()));
-        witnesses_tombstoned = checked_add(witnesses_tombstoned, 1, "tombstoned witnesses")?;
+        if let Some((_, witness)) = legacy.witnesses.get(cx_id) {
+            pair_outcomes_tombstoned = checked_add(
+                pair_outcomes_tombstoned,
+                witness.expected_pair_count,
+                "tombstoned legacy pair outcomes",
+            )?;
+            record_mutations.push((
+                ColumnFamily::Kv,
+                legacy_witness_key(*cx_id),
+                tombstone.clone(),
+            ));
+            witnesses_tombstoned = checked_add(witnesses_tombstoned, 1, "tombstoned witnesses")?;
+        }
         if !pending.is_empty()
             && pending.len().saturating_add(record_mutations.len()) > MAX_MUTATION_ROWS_PER_COMMIT
         {
@@ -386,6 +580,12 @@ where
     }
 
     let final_state = read_persisted_state_at(vault, vault.snapshot())?;
+    let final_legacy = read_legacy_v1_state_at(vault, vault.snapshot())?;
+    if !final_legacy.witnesses.is_empty() || !final_legacy.rows.is_empty() {
+        return Err(completion_corrupt(
+            "post-commit readback still contains active v1 association rows or witnesses",
+        ));
+    }
     if final_state.witnesses.len() != current_ids.len()
         || final_state
             .witnesses
@@ -398,7 +598,6 @@ where
             "post-commit completion witness CxId set does not equal the live Base CxId set",
         ));
     }
-    let current_sources = load_source_hashes_at(vault, vault.snapshot())?;
     for (cx_id, (_, witness)) in &final_state.witnesses {
         let Some(source_hash) = current_sources.get(cx_id) else {
             return Err(completion_corrupt(format!(
@@ -419,9 +618,13 @@ where
         constellations_recomputed: changed.len(),
         constellations_unchanged,
         constellations_removed: removed.len(),
-        rows_written,
-        rows_unchanged,
-        rows_tombstoned,
+        pair_outcomes_written,
+        pair_outcomes_unchanged,
+        pair_outcomes_tombstoned,
+        blocks_written,
+        blocks_unchanged,
+        blocks_tombstoned,
+        legacy_rows_tombstoned,
         witnesses_written,
         witnesses_tombstoned,
         commit_count,
@@ -601,19 +804,6 @@ where
     Ok(records)
 }
 
-fn load_source_hashes_at<C>(
-    vault: &AsterVault<C>,
-    snapshot: u64,
-) -> calyx_core::Result<BTreeMap<CxId, String>>
-where
-    C: Clock,
-{
-    Ok(load_constellations_at(vault, snapshot)?
-        .into_iter()
-        .map(|record| (record.cx_id, record.source_hash))
-        .collect())
-}
-
 fn prepare_slot(slot: SlotId, vector: SlotVector) -> calyx_core::Result<PreparedSlot> {
     vector.validate_schema().map_err(|error| {
         source_corrupt(format!(
@@ -648,12 +838,53 @@ fn prepare_slot(slot: SlotId, vector: SlotVector) -> calyx_core::Result<Prepared
     })
 }
 
+fn slot_descriptor(slot: &PreparedSlot) -> SlotDescriptor {
+    match slot {
+        PreparedSlot::Dense { dim, norm, .. } => SlotDescriptor::Dense {
+            dim: *dim,
+            zero_norm: *norm == 0.0,
+        },
+        PreparedSlot::Sparse { dim, norm, .. } => SlotDescriptor::Sparse {
+            dim: *dim,
+            zero_norm: *norm == 0.0,
+        },
+        PreparedSlot::Multi {
+            token_dim, norms, ..
+        } => SlotDescriptor::Multi {
+            token_dim: *token_dim,
+            zero_norm: norms.iter().any(|norm| *norm == 0.0),
+        },
+        PreparedSlot::Absent { reason } => SlotDescriptor::Absent {
+            reason: reason.clone(),
+        },
+    }
+}
+
 fn plan_constellation(
     record: &AssociationConstellation,
 ) -> calyx_core::Result<PlannedConstellation> {
     let ids = record.slots.keys().copied().collect::<Vec<_>>();
+    let descriptors = ids
+        .iter()
+        .map(|slot| slot_descriptor(&record.slots[slot]))
+        .collect::<Vec<_>>();
     let expected_pair_count = choose_two(ids.len())?;
-    let mut rows = BTreeMap::new();
+    let mut slot_descriptor_bytes = Vec::new();
+    let mut absent_slot_reason_counts = BTreeMap::<String, usize>::new();
+    for (slot, descriptor) in ids.iter().zip(&descriptors) {
+        slot_descriptor_bytes.extend_from_slice(&slot.get().to_be_bytes());
+        encode_slot_descriptor(descriptor, &mut slot_descriptor_bytes)?;
+        if let Some(reason) = descriptor.absent_reason() {
+            increment_map_count(
+                &mut absent_slot_reason_counts,
+                &absent_reason_wire(reason),
+                "absent slot reason count",
+            )?;
+        }
+    }
+    let mut outcome_bytes = Vec::with_capacity(expected_pair_count.saturating_mul(2));
+    let mut key_stream = Vec::new();
+    let mut value_stream = Vec::new();
     let mut computed_pair_count = 0usize;
     let mut typed_incompatible_pair_count = 0usize;
     let mut metric_counts = BTreeMap::<String, usize>::new();
@@ -663,37 +894,85 @@ fn plan_constellation(
             let left = ids[left_index];
             let right = ids[right_index];
             let outcome = pair_outcome(&record.slots[&left], &record.slots[&right])?;
+            let mut encoded_outcome = Vec::with_capacity(5);
             match &outcome {
                 CompletePairOutcome::Computed { metric, .. } => {
                     computed_pair_count = checked_add(computed_pair_count, 1, "computed pairs")?;
-                    *metric_counts.entry(metric.clone()).or_default() += 1;
+                    increment_map_count(
+                        &mut metric_counts,
+                        metric.wire_name(),
+                        "per-metric pair count",
+                    )?;
                 }
-                CompletePairOutcome::TypedIncompatible { code, .. } => {
+                CompletePairOutcome::TypedIncompatible { reason } => {
                     typed_incompatible_pair_count =
                         checked_add(typed_incompatible_pair_count, 1, "typed-incompatible pairs")?;
-                    *typed_reason_counts.entry(code.clone()).or_default() += 1;
+                    increment_map_count(
+                        &mut typed_reason_counts,
+                        reason.wire_name(),
+                        "per-reason pair count",
+                    )?;
                 }
             }
-            let key = pair_row_key(record.cx_id, left, right);
-            let row = CompletePairRow {
-                schema: COMPLETE_PAIR_ROW_SCHEMA.to_string(),
-                cx_id: cx_hex(record.cx_id),
-                left_slot: left.get(),
-                right_slot: right.get(),
-                outcome,
-            };
-            let value = serde_json::to_vec(&row).map_err(|error| {
-                completion_corrupt(format!("encode complete pair row: {error}"))
-            })?;
-            if rows.insert(key, value).is_some() {
-                return Err(completion_corrupt(format!(
-                    "planner generated a duplicate pair for Base {} S{}-S{}",
-                    cx_hex(record.cx_id),
-                    left.get(),
-                    right.get()
-                )));
-            }
+            encode_outcome(&outcome, &mut encoded_outcome);
+            let key = virtual_pair_key(record.cx_id, left, right);
+            append_part(&mut key_stream, &key);
+            append_part(&mut value_stream, &key);
+            append_part(&mut value_stream, &encoded_outcome);
+            outcome_bytes.extend_from_slice(&encoded_outcome);
         }
+    }
+    let mut block_bytes = Vec::with_capacity(
+        COMPLETE_PAIR_BLOCK_MAGIC.len()
+            + 16
+            + 4
+            + 32
+            + 4
+            + 4
+            + 4
+            + 8
+            + slot_descriptor_bytes.len()
+            + outcome_bytes.len(),
+    );
+    block_bytes.extend_from_slice(COMPLETE_PAIR_BLOCK_MAGIC);
+    block_bytes.extend_from_slice(record.cx_id.as_bytes());
+    block_bytes.extend_from_slice(&record.panel_version.to_be_bytes());
+    block_bytes.extend_from_slice(&decode_hash_32(
+        &record.source_hash,
+        "association source hash",
+    )?);
+    block_bytes.extend_from_slice(
+        &usize_to_u32(record.source_slot_count, "block source slot count")?.to_be_bytes(),
+    );
+    block_bytes.extend_from_slice(
+        &usize_to_u32(
+            record.not_applicable_slot_count,
+            "block NotApplicable slot count",
+        )?
+        .to_be_bytes(),
+    );
+    block_bytes
+        .extend_from_slice(&usize_to_u32(ids.len(), "block applicable slot count")?.to_be_bytes());
+    block_bytes.extend_from_slice(
+        &usize_to_u64(expected_pair_count, "block expected pair count")?.to_be_bytes(),
+    );
+    block_bytes.extend_from_slice(&slot_descriptor_bytes);
+    block_bytes.extend_from_slice(&outcome_bytes);
+
+    let decoded = decode_pair_block(record.cx_id, &block_bytes)?;
+    if decoded.expected_pair_count != expected_pair_count
+        || decoded.computed_pair_count != computed_pair_count
+        || decoded.typed_incompatible_pair_count != typed_incompatible_pair_count
+        || decoded.absent_slot_reason_counts != absent_slot_reason_counts
+        || decoded.slot_descriptor_hash
+            != hex_lower_bytes(blake3::hash(&slot_descriptor_bytes).as_bytes())
+        || decoded.pair_key_stream_hash != hex_lower_bytes(blake3::hash(&key_stream).as_bytes())
+        || decoded.pair_value_stream_hash != hex_lower_bytes(blake3::hash(&value_stream).as_bytes())
+    {
+        return Err(completion_corrupt(format!(
+            "planner binary round-trip differs for Base {}",
+            cx_hex(record.cx_id)
+        )));
     }
     if checked_add(
         computed_pair_count,
@@ -706,7 +985,6 @@ fn plan_constellation(
             cx_hex(record.cx_id)
         )));
     }
-    let (pair_key_stream_hash, pair_value_stream_hash) = row_stream_hashes(&rows);
     let witness = CompletionWitness {
         schema: COMPLETE_WITNESS_SCHEMA.to_string(),
         cx_id: cx_hex(record.cx_id),
@@ -720,14 +998,19 @@ fn plan_constellation(
         typed_incompatible_pair_count,
         metric_counts,
         typed_reason_counts,
-        pair_key_stream_hash,
-        pair_value_stream_hash,
+        absent_slot_reason_counts,
+        slot_descriptor_hash: hex_lower_bytes(blake3::hash(&slot_descriptor_bytes).as_bytes()),
+        pair_block_byte_count: block_bytes.len(),
+        pair_block_hash: hex_lower_bytes(blake3::hash(&block_bytes).as_bytes()),
+        pair_key_stream_hash: decoded.pair_key_stream_hash,
+        pair_value_stream_hash: decoded.pair_value_stream_hash,
     };
     let witness_bytes = serde_json::to_vec(&witness)
         .map_err(|error| completion_corrupt(format!("encode completion witness: {error}")))?;
     Ok(PlannedConstellation {
         cx_id: record.cx_id,
-        rows,
+        block_key: block_key(record.cx_id),
+        block_bytes,
         witness_key: witness_key(record.cx_id),
         witness_bytes,
         witness,
@@ -739,34 +1022,15 @@ fn pair_outcome(
     right: &PreparedSlot,
 ) -> calyx_core::Result<CompletePairOutcome> {
     if let PreparedSlot::Absent { reason } = left {
-        return Ok(incompatible(
-            "absent_slot",
-            left,
-            right,
-            format!(
-                "left slot is explicitly absent: {}",
-                absent_reason_wire(reason)
-            ),
-        ));
+        let _ = reason;
+        return Ok(incompatible(PairReason::AbsentSlot));
     }
     if let PreparedSlot::Absent { reason } = right {
-        return Ok(incompatible(
-            "absent_slot",
-            left,
-            right,
-            format!(
-                "right slot is explicitly absent: {}",
-                absent_reason_wire(reason)
-            ),
-        ));
+        let _ = reason;
+        return Ok(incompatible(PairReason::AbsentSlot));
     }
     if has_zero_norm(left) || has_zero_norm(right) {
-        return Ok(incompatible(
-            "zero_norm",
-            left,
-            right,
-            "cosine is undefined because at least one vector or multi-vector token has zero L2 norm".to_string(),
-        ));
+        return Ok(incompatible(PairReason::ZeroNorm));
     }
     let computed = match (left, right) {
         (
@@ -781,7 +1045,7 @@ fn pair_outcome(
                 norm: right_norm,
             },
         ) if left_dim == right_dim => (
-            "cosine",
+            PairMetric::Cosine,
             dense_dot(left_data, right_data) / (left_norm * right_norm),
         ),
         (
@@ -796,7 +1060,7 @@ fn pair_outcome(
                 norm: right_norm,
             },
         ) if left_dim == right_dim => (
-            "cosine",
+            PairMetric::Cosine,
             sparse_dot(left_entries, right_entries) / (left_norm * right_norm),
         ),
         (
@@ -811,7 +1075,7 @@ fn pair_outcome(
                 norm: right_norm,
             },
         ) if left_dim == right_dim => (
-            "cosine",
+            PairMetric::Cosine,
             dense_sparse_dot(data, entries) / (left_norm * right_norm),
         ),
         (
@@ -826,7 +1090,7 @@ fn pair_outcome(
                 norm: right_norm,
             },
         ) if left_dim == right_dim => (
-            "cosine",
+            PairMetric::Cosine,
             dense_sparse_dot(data, entries) / (left_norm * right_norm),
         ),
         (
@@ -841,44 +1105,22 @@ fn pair_outcome(
                 norms: right_norms,
             },
         ) if left_dim == right_dim => (
-            "symmetric_mean_maxsim_cosine",
+            PairMetric::SymmetricMeanMaxsimCosine,
             symmetric_mean_maxsim(left_tokens, left_norms, right_tokens, right_norms),
         ),
         _ => {
-            return Ok(incompatible(
-                "shape_mismatch",
-                left,
-                right,
-                "no exact agreement contract exists for these vector shapes or dimensions"
-                    .to_string(),
-            ));
+            return Ok(incompatible(PairReason::ShapeMismatch));
         }
     };
-    let value = computed.1.clamp(-1.0, 1.0) as f32;
-    if !value.is_finite() {
-        return Err(source_corrupt(format!(
-            "{} produced a non-finite association",
-            computed.0
-        )));
-    }
+    let value = validated_cosine(computed.0, computed.1)? as f32;
     Ok(CompletePairOutcome::Computed {
-        metric: computed.0.to_string(),
+        metric: computed.0,
         value_bits: value.to_bits(),
     })
 }
 
-fn incompatible(
-    code: &str,
-    left: &PreparedSlot,
-    right: &PreparedSlot,
-    detail: String,
-) -> CompletePairOutcome {
-    CompletePairOutcome::TypedIncompatible {
-        code: code.to_string(),
-        left_shape: left.shape_name(),
-        right_shape: right.shape_name(),
-        detail,
-    }
+fn incompatible(reason: PairReason) -> CompletePairOutcome {
+    CompletePairOutcome::TypedIncompatible { reason }
 }
 
 fn has_zero_norm(slot: &PreparedSlot) -> bool {
@@ -958,6 +1200,463 @@ fn symmetric_mean_maxsim(
         / 2.0
 }
 
+fn encode_slot_descriptor(
+    descriptor: &SlotDescriptor,
+    out: &mut Vec<u8>,
+) -> calyx_core::Result<()> {
+    match descriptor {
+        SlotDescriptor::Absent { reason } => {
+            out.push(0);
+            encode_applicable_absent_reason(reason, out)?;
+        }
+        SlotDescriptor::Dense { dim, zero_norm } => {
+            out.push(1);
+            out.extend_from_slice(&dim.to_be_bytes());
+            out.push(u8::from(*zero_norm));
+        }
+        SlotDescriptor::Sparse { dim, zero_norm } => {
+            out.push(2);
+            out.extend_from_slice(&dim.to_be_bytes());
+            out.push(u8::from(*zero_norm));
+        }
+        SlotDescriptor::Multi {
+            token_dim,
+            zero_norm,
+        } => {
+            out.push(3);
+            out.extend_from_slice(&token_dim.to_be_bytes());
+            out.push(u8::from(*zero_norm));
+        }
+    }
+    Ok(())
+}
+
+fn encode_applicable_absent_reason(
+    reason: &AbsentReason,
+    out: &mut Vec<u8>,
+) -> calyx_core::Result<()> {
+    match reason {
+        AbsentReason::NotApplicable => {
+            return Err(source_corrupt(
+                "NotApplicable reached the applicable slot descriptor encoder",
+            ));
+        }
+        AbsentReason::Redacted => out.push(1),
+        AbsentReason::LensUnavailable => out.push(2),
+        AbsentReason::Deferred => out.push(3),
+        AbsentReason::LensInactive => out.push(4),
+        AbsentReason::Error(message) => {
+            out.push(5);
+            out.extend_from_slice(
+                &usize_to_u32(message.len(), "absent error message length")?.to_be_bytes(),
+            );
+            out.extend_from_slice(message.as_bytes());
+        }
+    }
+    Ok(())
+}
+
+fn decode_slot_descriptor(cursor: &mut BlockCursor<'_>) -> calyx_core::Result<SlotDescriptor> {
+    let kind = cursor.u8("slot descriptor kind")?;
+    if kind == 0 {
+        return Ok(SlotDescriptor::Absent {
+            reason: decode_applicable_absent_reason(cursor)?,
+        });
+    }
+    let dim = cursor.u32("slot descriptor dimension")?;
+    if dim == 0 {
+        return Err(completion_corrupt(format!(
+            "pair block {} carries a zero slot descriptor dimension",
+            cx_hex(cursor.cx_id)
+        )));
+    }
+    let zero_norm = match cursor.u8("slot descriptor zero-norm flag")? {
+        0 => false,
+        1 => true,
+        flag => {
+            return Err(completion_corrupt(format!(
+                "pair block {} carries invalid zero-norm flag {flag}",
+                cx_hex(cursor.cx_id)
+            )));
+        }
+    };
+    match kind {
+        1 => Ok(SlotDescriptor::Dense { dim, zero_norm }),
+        2 => Ok(SlotDescriptor::Sparse { dim, zero_norm }),
+        3 => Ok(SlotDescriptor::Multi {
+            token_dim: dim,
+            zero_norm,
+        }),
+        _ => Err(completion_corrupt(format!(
+            "pair block {} carries unknown slot descriptor kind {kind}",
+            cx_hex(cursor.cx_id)
+        ))),
+    }
+}
+
+fn decode_applicable_absent_reason(
+    cursor: &mut BlockCursor<'_>,
+) -> calyx_core::Result<AbsentReason> {
+    Ok(match cursor.u8("applicable absent reason")? {
+        1 => AbsentReason::Redacted,
+        2 => AbsentReason::LensUnavailable,
+        3 => AbsentReason::Deferred,
+        4 => AbsentReason::LensInactive,
+        5 => {
+            let len = usize::try_from(cursor.u32("absent error message length")?)
+                .map_err(|_| completion_overflow("decoded absent error message length"))?;
+            let bytes = cursor.take(len, "absent error message")?;
+            let message = std::str::from_utf8(bytes).map_err(|error| {
+                completion_corrupt(format!(
+                    "pair block {} absent error message is not UTF-8: {error}",
+                    cx_hex(cursor.cx_id)
+                ))
+            })?;
+            AbsentReason::Error(message.to_string())
+        }
+        tag => {
+            return Err(completion_corrupt(format!(
+                "pair block {} carries unknown applicable absent reason tag {tag}",
+                cx_hex(cursor.cx_id)
+            )));
+        }
+    })
+}
+
+fn absent_reason_wire(reason: &AbsentReason) -> String {
+    match reason {
+        AbsentReason::NotApplicable => "not_applicable".to_string(),
+        AbsentReason::Redacted => "redacted".to_string(),
+        AbsentReason::LensUnavailable => "lens_unavailable".to_string(),
+        AbsentReason::Deferred => "deferred".to_string(),
+        AbsentReason::LensInactive => "lens_inactive".to_string(),
+        AbsentReason::Error(message) => format!("error:{message}"),
+    }
+}
+
+fn expected_outcome_code(left: &SlotDescriptor, right: &SlotDescriptor) -> u8 {
+    if left.absent_reason().is_some() || right.absent_reason().is_some() {
+        return PairReason::AbsentSlot.code();
+    }
+    if left.zero_norm() || right.zero_norm() {
+        return PairReason::ZeroNorm.code();
+    }
+    match (left, right) {
+        (SlotDescriptor::Dense { dim: left, .. }, SlotDescriptor::Dense { dim: right, .. })
+        | (SlotDescriptor::Sparse { dim: left, .. }, SlotDescriptor::Sparse { dim: right, .. })
+        | (SlotDescriptor::Dense { dim: left, .. }, SlotDescriptor::Sparse { dim: right, .. })
+        | (SlotDescriptor::Sparse { dim: left, .. }, SlotDescriptor::Dense { dim: right, .. })
+            if left == right =>
+        {
+            PairMetric::Cosine.code()
+        }
+        (
+            SlotDescriptor::Multi {
+                token_dim: left, ..
+            },
+            SlotDescriptor::Multi {
+                token_dim: right, ..
+            },
+        ) if left == right => PairMetric::SymmetricMeanMaxsimCosine.code(),
+        _ => PairReason::ShapeMismatch.code(),
+    }
+}
+
+#[derive(Debug)]
+struct DecodedPairBlock {
+    panel_version: u32,
+    association_source_hash: String,
+    source_slot_count: usize,
+    not_applicable_slot_count: usize,
+    applicable_slot_ids: Vec<u16>,
+    expected_pair_count: usize,
+    computed_pair_count: usize,
+    typed_incompatible_pair_count: usize,
+    metric_counts: BTreeMap<String, usize>,
+    typed_reason_counts: BTreeMap<String, usize>,
+    absent_slot_reason_counts: BTreeMap<String, usize>,
+    slot_descriptor_hash: String,
+    pair_key_stream: Vec<u8>,
+    pair_value_stream: Vec<u8>,
+    pair_key_stream_hash: String,
+    pair_value_stream_hash: String,
+}
+
+struct BlockCursor<'a> {
+    bytes: &'a [u8],
+    offset: usize,
+    cx_id: CxId,
+}
+
+impl<'a> BlockCursor<'a> {
+    fn new(cx_id: CxId, bytes: &'a [u8]) -> Self {
+        Self {
+            bytes,
+            offset: 0,
+            cx_id,
+        }
+    }
+
+    fn take(&mut self, count: usize, field: &str) -> calyx_core::Result<&'a [u8]> {
+        let end = self
+            .offset
+            .checked_add(count)
+            .ok_or_else(|| completion_overflow("pair block cursor"))?;
+        if end > self.bytes.len() {
+            return Err(completion_corrupt(format!(
+                "pair block {} is truncated while reading {field}: offset={} need={} len={}",
+                cx_hex(self.cx_id),
+                self.offset,
+                count,
+                self.bytes.len()
+            )));
+        }
+        let value = &self.bytes[self.offset..end];
+        self.offset = end;
+        Ok(value)
+    }
+
+    fn u8(&mut self, field: &str) -> calyx_core::Result<u8> {
+        Ok(self.take(1, field)?[0])
+    }
+
+    fn u16(&mut self, field: &str) -> calyx_core::Result<u16> {
+        let bytes = self.take(2, field)?;
+        Ok(u16::from_be_bytes([bytes[0], bytes[1]]))
+    }
+
+    fn u32(&mut self, field: &str) -> calyx_core::Result<u32> {
+        let bytes = self.take(4, field)?;
+        Ok(u32::from_be_bytes(bytes.try_into().map_err(|_| {
+            completion_corrupt(format!("pair block {} invalid {field}", cx_hex(self.cx_id)))
+        })?))
+    }
+
+    fn u64(&mut self, field: &str) -> calyx_core::Result<u64> {
+        let bytes = self.take(8, field)?;
+        Ok(u64::from_be_bytes(bytes.try_into().map_err(|_| {
+            completion_corrupt(format!("pair block {} invalid {field}", cx_hex(self.cx_id)))
+        })?))
+    }
+
+    fn finish(self) -> calyx_core::Result<()> {
+        if self.offset != self.bytes.len() {
+            return Err(completion_corrupt(format!(
+                "pair block {} has {} unexpected trailing bytes",
+                cx_hex(self.cx_id),
+                self.bytes.len() - self.offset
+            )));
+        }
+        Ok(())
+    }
+}
+
+fn decode_pair_block(cx_id: CxId, bytes: &[u8]) -> calyx_core::Result<DecodedPairBlock> {
+    let mut cursor = BlockCursor::new(cx_id, bytes);
+    if cursor.take(COMPLETE_PAIR_BLOCK_MAGIC.len(), "magic")? != COMPLETE_PAIR_BLOCK_MAGIC {
+        return Err(completion_corrupt(format!(
+            "pair block {} has an unknown binary schema discriminator",
+            cx_hex(cx_id)
+        )));
+    }
+    if cursor.take(16, "embedded CxId")? != cx_id.as_bytes() {
+        return Err(completion_corrupt(format!(
+            "pair block key/value CxId mismatch for {}",
+            cx_hex(cx_id)
+        )));
+    }
+    let panel_version = cursor.u32("panel version")?;
+    if panel_version == 0 {
+        return Err(completion_corrupt(format!(
+            "pair block {} carries panel version zero",
+            cx_hex(cx_id)
+        )));
+    }
+    let association_source_hash = hex_lower_bytes(cursor.take(32, "source hash")?);
+    let source_slot_count = usize::try_from(cursor.u32("source slot count")?)
+        .map_err(|_| completion_overflow("decoded source slot count"))?;
+    let not_applicable_slot_count = usize::try_from(cursor.u32("NotApplicable slot count")?)
+        .map_err(|_| completion_overflow("decoded NotApplicable slot count"))?;
+    let applicable_slot_count = usize::try_from(cursor.u32("applicable slot count")?)
+        .map_err(|_| completion_overflow("decoded applicable slot count"))?;
+    let expected_pair_count = usize::try_from(cursor.u64("expected pair count")?)
+        .map_err(|_| completion_overflow("decoded expected pair count"))?;
+    if source_slot_count
+        != checked_add(
+            applicable_slot_count,
+            not_applicable_slot_count,
+            "decoded block source-slot equation",
+        )?
+    {
+        return Err(completion_corrupt(format!(
+            "pair block {} source_slot_count does not equal applicable + NotApplicable",
+            cx_hex(cx_id)
+        )));
+    }
+    if choose_two(applicable_slot_count)? != expected_pair_count {
+        return Err(completion_corrupt(format!(
+            "pair block {} expected pair count does not equal C(N_applicable,2)",
+            cx_hex(cx_id)
+        )));
+    }
+    let descriptor_start = cursor.offset;
+    let mut applicable_slot_ids = Vec::with_capacity(applicable_slot_count);
+    let mut slot_descriptors = Vec::with_capacity(applicable_slot_count);
+    let mut absent_slot_reason_counts = BTreeMap::new();
+    for _ in 0..applicable_slot_count {
+        applicable_slot_ids.push(cursor.u16("applicable SlotId")?);
+        let descriptor = decode_slot_descriptor(&mut cursor)?;
+        if let Some(reason) = descriptor.absent_reason() {
+            increment_map_count(
+                &mut absent_slot_reason_counts,
+                &absent_reason_wire(reason),
+                "decoded absent slot reason count",
+            )?;
+        }
+        slot_descriptors.push(descriptor);
+    }
+    let slot_descriptor_hash =
+        hex_lower_bytes(blake3::hash(&bytes[descriptor_start..cursor.offset]).as_bytes());
+    if applicable_slot_ids
+        .windows(2)
+        .any(|pair| pair[0] >= pair[1])
+    {
+        return Err(completion_corrupt(format!(
+            "pair block {} applicable SlotIds are not strictly increasing",
+            cx_hex(cx_id)
+        )));
+    }
+
+    let mut computed_pair_count = 0usize;
+    let mut typed_incompatible_pair_count = 0usize;
+    let mut metric_counts = BTreeMap::new();
+    let mut typed_reason_counts = BTreeMap::new();
+    let mut pair_key_stream = Vec::new();
+    let mut pair_value_stream = Vec::new();
+    for left_index in 0..applicable_slot_ids.len() {
+        for right_index in (left_index + 1)..applicable_slot_ids.len() {
+            let left = SlotId::new(applicable_slot_ids[left_index]);
+            let right = SlotId::new(applicable_slot_ids[right_index]);
+            let code = cursor.u8("pair outcome code")?;
+            let expected_code = expected_outcome_code(
+                &slot_descriptors[left_index],
+                &slot_descriptors[right_index],
+            );
+            if code != expected_code {
+                return Err(completion_corrupt(format!(
+                    "pair block {} S{}-S{} outcome code {code} contradicts roster descriptors (expected {expected_code})",
+                    cx_hex(cx_id),
+                    left.get(),
+                    right.get()
+                )));
+            }
+            let mut encoded_outcome = vec![code];
+            match code {
+                1 | 2 => {
+                    let value_bytes = cursor.take(4, "computed f32 bits")?;
+                    encoded_outcome.extend_from_slice(value_bytes);
+                    let bits = u32::from_be_bytes(value_bytes.try_into().map_err(|_| {
+                        completion_corrupt(format!(
+                            "pair block {} has invalid computed bits",
+                            cx_hex(cx_id)
+                        ))
+                    })?);
+                    if !f32::from_bits(bits).is_finite() {
+                        return Err(completion_corrupt(format!(
+                            "pair block {} S{}-S{} contains non-finite computed bits",
+                            cx_hex(cx_id),
+                            left.get(),
+                            right.get()
+                        )));
+                    }
+                    if !(-1.0..=1.0).contains(&f32::from_bits(bits)) {
+                        return Err(completion_corrupt(format!(
+                            "pair block {} S{}-S{} contains cosine outside [-1,1]",
+                            cx_hex(cx_id),
+                            left.get(),
+                            right.get()
+                        )));
+                    }
+                    computed_pair_count =
+                        checked_add(computed_pair_count, 1, "decoded computed pairs")?;
+                    let metric = if code == 1 {
+                        PairMetric::Cosine
+                    } else {
+                        PairMetric::SymmetricMeanMaxsimCosine
+                    };
+                    increment_map_count(
+                        &mut metric_counts,
+                        metric.wire_name(),
+                        "decoded metric count",
+                    )?;
+                }
+                3..=5 => {
+                    typed_incompatible_pair_count = checked_add(
+                        typed_incompatible_pair_count,
+                        1,
+                        "decoded typed-incompatible pairs",
+                    )?;
+                    let reason = match code {
+                        3 => PairReason::AbsentSlot,
+                        4 => PairReason::ShapeMismatch,
+                        5 => PairReason::ZeroNorm,
+                        _ => unreachable!(),
+                    };
+                    increment_map_count(
+                        &mut typed_reason_counts,
+                        reason.wire_name(),
+                        "decoded reason count",
+                    )?;
+                }
+                _ => {
+                    return Err(completion_corrupt(format!(
+                        "pair block {} S{}-S{} has unknown outcome code {code}",
+                        cx_hex(cx_id),
+                        left.get(),
+                        right.get()
+                    )));
+                }
+            }
+            let key = virtual_pair_key(cx_id, left, right);
+            append_part(&mut pair_key_stream, &key);
+            append_part(&mut pair_value_stream, &key);
+            append_part(&mut pair_value_stream, &encoded_outcome);
+        }
+    }
+    cursor.finish()?;
+    if checked_add(
+        computed_pair_count,
+        typed_incompatible_pair_count,
+        "decoded completion equation",
+    )? != expected_pair_count
+    {
+        return Err(completion_corrupt(format!(
+            "pair block {} decoded outcome count differs from expected pairs",
+            cx_hex(cx_id)
+        )));
+    }
+    let pair_key_stream_hash = hex_lower_bytes(blake3::hash(&pair_key_stream).as_bytes());
+    let pair_value_stream_hash = hex_lower_bytes(blake3::hash(&pair_value_stream).as_bytes());
+    Ok(DecodedPairBlock {
+        panel_version,
+        association_source_hash,
+        source_slot_count,
+        not_applicable_slot_count,
+        applicable_slot_ids,
+        expected_pair_count,
+        computed_pair_count,
+        typed_incompatible_pair_count,
+        metric_counts,
+        typed_reason_counts,
+        absent_slot_reason_counts,
+        slot_descriptor_hash,
+        pair_key_stream,
+        pair_value_stream,
+        pair_key_stream_hash,
+        pair_value_stream_hash,
+    })
+}
+
 fn read_persisted_state_at<C>(
     vault: &AsterVault<C>,
     snapshot: u64,
@@ -973,9 +1672,312 @@ where
     )? {
         let cx_id = parse_witness_key(&key)?;
         let witness: CompletionWitness = serde_json::from_slice(&value).map_err(|error| {
-            completion_corrupt(format!("decode witness {}: {error}", hex_lower_bytes(&key)))
+            completion_corrupt(format!(
+                "decode v2 witness {}: {error}",
+                hex_lower_bytes(&key)
+            ))
         })?;
         validate_witness_identity(cx_id, &witness)?;
+        if witnesses.insert(cx_id, (value, witness)).is_some() {
+            return Err(completion_corrupt(format!(
+                "duplicate v2 completion witness for {}",
+                cx_hex(cx_id)
+            )));
+        }
+    }
+    let mut blocks = BTreeMap::<CxId, Vec<u8>>::new();
+    for (key, value) in vault.scan_cf_range_at(
+        snapshot,
+        ColumnFamily::XTerm,
+        &prefix_range(COMPLETE_PAIR_BLOCK_PREFIX),
+    )? {
+        let cx_id = parse_block_key(&key)?;
+        if blocks.insert(cx_id, value).is_some() {
+            return Err(completion_corrupt(format!(
+                "duplicate pair block for {}",
+                cx_hex(cx_id)
+            )));
+        }
+    }
+    for cx_id in blocks.keys() {
+        if !witnesses.contains_key(cx_id) {
+            return Err(completion_corrupt(format!(
+                "pair block {} has no atomic v2 witness",
+                cx_hex(*cx_id)
+            )));
+        }
+    }
+
+    let mut public = CompleteAssociationState {
+        constellation_count: witnesses.len(),
+        source_slot_count: 0,
+        not_applicable_slot_count: 0,
+        applicable_slot_count: 0,
+        expected_pair_count: 0,
+        computed_pair_count: 0,
+        typed_incompatible_pair_count: 0,
+        completion_row_count: 0,
+        physical_block_count: blocks.len(),
+        panel_version_counts: BTreeMap::new(),
+        metric_counts: PairMetricCounts::default(),
+        typed_reason_counts: PairReasonCounts::default(),
+        absent_slot_reason_counts: BTreeMap::new(),
+        witness_state_hash: String::new(),
+        pair_key_stream_hash: String::new(),
+        pair_value_stream_hash: String::new(),
+    };
+    let mut witness_stream = Vec::new();
+    let mut global_key_stream = blake3::Hasher::new();
+    let mut global_value_stream = blake3::Hasher::new();
+    for (cx_id, (witness_bytes, witness)) in &witnesses {
+        let block_bytes = blocks.get(cx_id).ok_or_else(|| {
+            completion_corrupt(format!("v2 witness {} has no pair block", cx_hex(*cx_id)))
+        })?;
+        let decoded = decode_pair_block(*cx_id, block_bytes)?;
+        validate_witness_block(*cx_id, witness, block_bytes, &decoded)?;
+        public.source_slot_count = checked_add(
+            public.source_slot_count,
+            decoded.source_slot_count,
+            "source slots",
+        )?;
+        public.not_applicable_slot_count = checked_add(
+            public.not_applicable_slot_count,
+            decoded.not_applicable_slot_count,
+            "NotApplicable slots",
+        )?;
+        public.applicable_slot_count = checked_add(
+            public.applicable_slot_count,
+            decoded.applicable_slot_ids.len(),
+            "applicable slots",
+        )?;
+        public.expected_pair_count = checked_add(
+            public.expected_pair_count,
+            decoded.expected_pair_count,
+            "expected pairs",
+        )?;
+        public.computed_pair_count = checked_add(
+            public.computed_pair_count,
+            decoded.computed_pair_count,
+            "computed pairs",
+        )?;
+        public.typed_incompatible_pair_count = checked_add(
+            public.typed_incompatible_pair_count,
+            decoded.typed_incompatible_pair_count,
+            "typed-incompatible pairs",
+        )?;
+        public.completion_row_count = checked_add(
+            public.completion_row_count,
+            decoded.expected_pair_count,
+            "logical completion rows",
+        )?;
+        increment_u32_map_count(
+            &mut public.panel_version_counts,
+            decoded.panel_version,
+            "panel version count",
+        )?;
+        public.metric_counts.cosine = checked_add(
+            public.metric_counts.cosine,
+            decoded.metric_counts.get("cosine").copied().unwrap_or(0),
+            "cosine count",
+        )?;
+        public.metric_counts.symmetric_mean_maxsim_cosine = checked_add(
+            public.metric_counts.symmetric_mean_maxsim_cosine,
+            decoded
+                .metric_counts
+                .get("symmetric_mean_maxsim_cosine")
+                .copied()
+                .unwrap_or(0),
+            "symmetric MaxSim count",
+        )?;
+        public.typed_reason_counts.absent_slot = checked_add(
+            public.typed_reason_counts.absent_slot,
+            decoded
+                .typed_reason_counts
+                .get("absent_slot")
+                .copied()
+                .unwrap_or(0),
+            "absent-slot count",
+        )?;
+        public.typed_reason_counts.shape_mismatch = checked_add(
+            public.typed_reason_counts.shape_mismatch,
+            decoded
+                .typed_reason_counts
+                .get("shape_mismatch")
+                .copied()
+                .unwrap_or(0),
+            "shape-mismatch count",
+        )?;
+        public.typed_reason_counts.zero_norm = checked_add(
+            public.typed_reason_counts.zero_norm,
+            decoded
+                .typed_reason_counts
+                .get("zero_norm")
+                .copied()
+                .unwrap_or(0),
+            "zero-norm count",
+        )?;
+        for (reason, count) in &decoded.absent_slot_reason_counts {
+            let current = public
+                .absent_slot_reason_counts
+                .get(reason)
+                .copied()
+                .unwrap_or(0);
+            public.absent_slot_reason_counts.insert(
+                reason.clone(),
+                checked_add(current, *count, "global absent slot reason count")?,
+            );
+        }
+        append_part(&mut witness_stream, &witness_key(*cx_id));
+        append_part(&mut witness_stream, witness_bytes);
+        global_key_stream.update(&decoded.pair_key_stream);
+        global_value_stream.update(&decoded.pair_value_stream);
+    }
+    if checked_add(
+        public.computed_pair_count,
+        public.typed_incompatible_pair_count,
+        "global completion equation",
+    )? != public.expected_pair_count
+        || public.completion_row_count != public.expected_pair_count
+        || public.physical_block_count != public.constellation_count
+    {
+        return Err(completion_corrupt(
+            "global v2 completion equation or one-block-per-witness invariant failed",
+        ));
+    }
+    public.witness_state_hash = hex_lower_bytes(blake3::hash(&witness_stream).as_bytes());
+    public.pair_key_stream_hash = hex_lower_bytes(global_key_stream.finalize().as_bytes());
+    public.pair_value_stream_hash = hex_lower_bytes(global_value_stream.finalize().as_bytes());
+    Ok(PersistedState {
+        public,
+        witnesses,
+        blocks,
+    })
+}
+
+fn validate_witness_identity(cx_id: CxId, witness: &CompletionWitness) -> calyx_core::Result<()> {
+    if witness.schema != COMPLETE_WITNESS_SCHEMA || witness.cx_id != cx_hex(cx_id) {
+        return Err(completion_corrupt(format!(
+            "v2 completion witness key/identity mismatch for {}",
+            cx_hex(cx_id)
+        )));
+    }
+    decode_hash_32(
+        &witness.association_source_hash,
+        "witness association source hash",
+    )?;
+    decode_hash_32(&witness.pair_block_hash, "witness pair block hash")?;
+    decode_hash_32(
+        &witness.slot_descriptor_hash,
+        "witness slot descriptor hash",
+    )?;
+    decode_hash_32(
+        &witness.pair_key_stream_hash,
+        "witness pair key stream hash",
+    )?;
+    decode_hash_32(
+        &witness.pair_value_stream_hash,
+        "witness pair value stream hash",
+    )?;
+    if witness
+        .applicable_slot_ids
+        .windows(2)
+        .any(|pair| pair[0] >= pair[1])
+    {
+        return Err(completion_corrupt(format!(
+            "v2 witness {} applicable SlotIds are not strictly increasing",
+            cx_hex(cx_id)
+        )));
+    }
+    if witness.source_slot_count
+        != checked_add(
+            witness.applicable_slot_ids.len(),
+            witness.not_applicable_slot_count,
+            "v2 witness source slot equation",
+        )?
+    {
+        return Err(completion_corrupt(format!(
+            "v2 witness {} source_slot_count does not equal applicable + NotApplicable",
+            cx_hex(cx_id)
+        )));
+    }
+    let expected = choose_two(witness.applicable_slot_ids.len())?;
+    if witness.expected_pair_count != expected
+        || checked_add(
+            witness.computed_pair_count,
+            witness.typed_incompatible_pair_count,
+            "v2 witness completion equation",
+        )? != expected
+    {
+        return Err(completion_corrupt(format!(
+            "v2 witness {} does not prove computed + typed_incompatible = C(N_applicable,2)",
+            cx_hex(cx_id)
+        )));
+    }
+    let absent_slot_count = witness
+        .absent_slot_reason_counts
+        .values()
+        .try_fold(0usize, |sum, count| {
+            checked_add(sum, *count, "v2 witness absent slot reason count")
+        })?;
+    if absent_slot_count > witness.applicable_slot_ids.len() {
+        return Err(completion_corrupt(format!(
+            "v2 witness {} absent slot reason count exceeds applicable slots",
+            cx_hex(cx_id)
+        )));
+    }
+    Ok(())
+}
+
+fn validate_witness_block(
+    cx_id: CxId,
+    witness: &CompletionWitness,
+    block_bytes: &[u8],
+    decoded: &DecodedPairBlock,
+) -> calyx_core::Result<()> {
+    let observed_block_hash = hex_lower_bytes(blake3::hash(block_bytes).as_bytes());
+    if witness.panel_version != decoded.panel_version
+        || witness.association_source_hash != decoded.association_source_hash
+        || witness.source_slot_count != decoded.source_slot_count
+        || witness.not_applicable_slot_count != decoded.not_applicable_slot_count
+        || witness.applicable_slot_ids != decoded.applicable_slot_ids
+        || witness.expected_pair_count != decoded.expected_pair_count
+        || witness.computed_pair_count != decoded.computed_pair_count
+        || witness.typed_incompatible_pair_count != decoded.typed_incompatible_pair_count
+        || witness.metric_counts != decoded.metric_counts
+        || witness.typed_reason_counts != decoded.typed_reason_counts
+        || witness.absent_slot_reason_counts != decoded.absent_slot_reason_counts
+        || witness.slot_descriptor_hash != decoded.slot_descriptor_hash
+        || witness.pair_block_byte_count != block_bytes.len()
+        || witness.pair_block_hash != observed_block_hash
+        || witness.pair_key_stream_hash != decoded.pair_key_stream_hash
+        || witness.pair_value_stream_hash != decoded.pair_value_stream_hash
+    {
+        return Err(completion_corrupt(format!(
+            "v2 witness {} differs from independently decoded pair-block bytes",
+            cx_hex(cx_id)
+        )));
+    }
+    Ok(())
+}
+
+fn read_legacy_v1_state_at<C>(
+    vault: &AsterVault<C>,
+    snapshot: u64,
+) -> calyx_core::Result<LegacyPersistedState>
+where
+    C: Clock,
+{
+    let mut witnesses = BTreeMap::<CxId, (Vec<u8>, LegacyCompletionWitness)>::new();
+    for (key, value) in vault.scan_cf_range_at(
+        snapshot,
+        ColumnFamily::Kv,
+        &prefix_range(LEGACY_COMPLETE_WITNESS_PREFIX),
+    )? {
+        let cx_id = parse_legacy_witness_key(&key)?;
+        let witness: LegacyCompletionWitness = serde_json::from_slice(&value).map_err(|error| {
+            completion_corrupt(format!("decode witness {}: {error}", hex_lower_bytes(&key)))
+        })?;
+        validate_legacy_witness_identity(cx_id, &witness)?;
         if witnesses.insert(cx_id, (value, witness)).is_some() {
             return Err(completion_corrupt(format!(
                 "duplicate completion witness for {}",
@@ -988,16 +1990,16 @@ where
     for (key, value) in vault.scan_cf_range_at(
         snapshot,
         ColumnFamily::XTerm,
-        &prefix_range(COMPLETE_PAIR_ROW_PREFIX),
+        &prefix_range(LEGACY_COMPLETE_PAIR_ROW_PREFIX),
     )? {
-        let (cx_id, left, right) = parse_pair_row_key(&key)?;
-        let row: CompletePairRow = serde_json::from_slice(&value).map_err(|error| {
+        let (cx_id, left, right) = parse_legacy_pair_row_key(&key)?;
+        let row: LegacyCompletePairRow = serde_json::from_slice(&value).map_err(|error| {
             completion_corrupt(format!(
                 "decode pair row {}: {error}",
                 hex_lower_bytes(&key)
             ))
         })?;
-        validate_pair_row(cx_id, left, right, &row)?;
+        validate_legacy_pair_row(cx_id, left, right, &row)?;
         if rows.entry(cx_id).or_default().insert(key, value).is_some() {
             return Err(completion_corrupt(format!(
                 "duplicate complete pair row for {} S{}-S{}",
@@ -1016,119 +2018,18 @@ where
         }
     }
 
-    let mut public = CompleteAssociationState {
-        constellation_count: witnesses.len(),
-        source_slot_count: 0,
-        not_applicable_slot_count: 0,
-        applicable_slot_count: 0,
-        expected_pair_count: 0,
-        computed_pair_count: 0,
-        typed_incompatible_pair_count: 0,
-        completion_row_count: 0,
-        panel_version_counts: BTreeMap::new(),
-        metric_counts: PairMetricCounts::default(),
-        typed_reason_counts: PairReasonCounts::default(),
-        witness_state_hash: String::new(),
-        pair_key_stream_hash: String::new(),
-        pair_value_stream_hash: String::new(),
-    };
-    let mut witness_stream = Vec::new();
-    let mut global_key_stream = Vec::new();
-    let mut global_value_stream = Vec::new();
-    for (cx_id, (witness_bytes, witness)) in &witnesses {
+    for (cx_id, (_, witness)) in &witnesses {
         let actual_rows = rows.get(cx_id).cloned().unwrap_or_default();
-        validate_witness_rows(*cx_id, witness, &actual_rows)?;
-        public.source_slot_count = checked_add(
-            public.source_slot_count,
-            witness.source_slot_count,
-            "source slots",
-        )?;
-        public.not_applicable_slot_count = checked_add(
-            public.not_applicable_slot_count,
-            witness.not_applicable_slot_count,
-            "NotApplicable slots",
-        )?;
-        public.applicable_slot_count = checked_add(
-            public.applicable_slot_count,
-            witness.applicable_slot_ids.len(),
-            "applicable slots",
-        )?;
-        public.expected_pair_count = checked_add(
-            public.expected_pair_count,
-            witness.expected_pair_count,
-            "expected pairs",
-        )?;
-        public.computed_pair_count = checked_add(
-            public.computed_pair_count,
-            witness.computed_pair_count,
-            "computed pairs",
-        )?;
-        public.typed_incompatible_pair_count = checked_add(
-            public.typed_incompatible_pair_count,
-            witness.typed_incompatible_pair_count,
-            "typed-incompatible pairs",
-        )?;
-        public.completion_row_count = checked_add(
-            public.completion_row_count,
-            actual_rows.len(),
-            "completion rows",
-        )?;
-        *public
-            .panel_version_counts
-            .entry(witness.panel_version)
-            .or_default() += 1;
-        public.metric_counts.cosine += witness.metric_counts.get("cosine").copied().unwrap_or(0);
-        public.metric_counts.symmetric_mean_maxsim_cosine += witness
-            .metric_counts
-            .get("symmetric_mean_maxsim_cosine")
-            .copied()
-            .unwrap_or(0);
-        public.typed_reason_counts.absent_slot += witness
-            .typed_reason_counts
-            .get("absent_slot")
-            .copied()
-            .unwrap_or(0);
-        public.typed_reason_counts.shape_mismatch += witness
-            .typed_reason_counts
-            .get("shape_mismatch")
-            .copied()
-            .unwrap_or(0);
-        public.typed_reason_counts.zero_norm += witness
-            .typed_reason_counts
-            .get("zero_norm")
-            .copied()
-            .unwrap_or(0);
-        append_part(&mut witness_stream, &witness_key(*cx_id));
-        append_part(&mut witness_stream, witness_bytes);
-        for (key, value) in actual_rows {
-            append_part(&mut global_key_stream, &key);
-            append_part(&mut global_value_stream, &key);
-            append_part(&mut global_value_stream, &value);
-        }
+        validate_legacy_witness_rows(*cx_id, witness, &actual_rows)?;
     }
-    if checked_add(
-        public.computed_pair_count,
-        public.typed_incompatible_pair_count,
-        "global completion equation",
-    )? != public.expected_pair_count
-        || public.completion_row_count != public.expected_pair_count
-    {
-        return Err(completion_corrupt(
-            "global completion equation failed after persisted-state readback",
-        ));
-    }
-    public.witness_state_hash = hex_lower_bytes(blake3::hash(&witness_stream).as_bytes());
-    public.pair_key_stream_hash = hex_lower_bytes(blake3::hash(&global_key_stream).as_bytes());
-    public.pair_value_stream_hash = hex_lower_bytes(blake3::hash(&global_value_stream).as_bytes());
-    Ok(PersistedState {
-        public,
-        witnesses,
-        rows,
-    })
+    Ok(LegacyPersistedState { witnesses, rows })
 }
 
-fn validate_witness_identity(cx_id: CxId, witness: &CompletionWitness) -> calyx_core::Result<()> {
-    if witness.schema != COMPLETE_WITNESS_SCHEMA || witness.cx_id != cx_hex(cx_id) {
+fn validate_legacy_witness_identity(
+    cx_id: CxId,
+    witness: &LegacyCompletionWitness,
+) -> calyx_core::Result<()> {
+    if witness.schema != LEGACY_COMPLETE_WITNESS_SCHEMA || witness.cx_id != cx_hex(cx_id) {
         return Err(completion_corrupt(format!(
             "completion witness key/identity mismatch for {}",
             cx_hex(cx_id)
@@ -1178,9 +2079,9 @@ fn validate_witness_identity(cx_id: CxId, witness: &CompletionWitness) -> calyx_
     Ok(())
 }
 
-fn validate_witness_rows(
+fn validate_legacy_witness_rows(
     cx_id: CxId,
-    witness: &CompletionWitness,
+    witness: &LegacyCompletionWitness,
     rows: &BTreeMap<Vec<u8>, Vec<u8>>,
 ) -> calyx_core::Result<()> {
     if rows.len() != witness.expected_pair_count {
@@ -1199,7 +2100,11 @@ fn validate_witness_rows(
     let mut expected_keys = BTreeSet::new();
     for left_index in 0..ids.len() {
         for right_index in (left_index + 1)..ids.len() {
-            expected_keys.insert(pair_row_key(cx_id, ids[left_index], ids[right_index]));
+            expected_keys.insert(legacy_pair_row_key(
+                cx_id,
+                ids[left_index],
+                ids[right_index],
+            ));
         }
     }
     if rows.keys().cloned().collect::<BTreeSet<_>>() != expected_keys {
@@ -1211,10 +2116,10 @@ fn validate_witness_rows(
     let mut computed = 0usize;
     let mut incompatible = 0usize;
     for value in rows.values() {
-        let row: CompletePairRow = serde_json::from_slice(value)
+        let row: LegacyCompletePairRow = serde_json::from_slice(value)
             .map_err(|error| completion_corrupt(format!("decode witnessed pair row: {error}")))?;
         match row.outcome {
-            CompletePairOutcome::Computed { value_bits, .. } => {
+            LegacyCompletePairOutcome::Computed { value_bits, .. } => {
                 if !f32::from_bits(value_bits).is_finite() {
                     return Err(completion_corrupt(format!(
                         "completion witness {} contains non-finite computed bits",
@@ -1223,7 +2128,7 @@ fn validate_witness_rows(
                 }
                 computed += 1;
             }
-            CompletePairOutcome::TypedIncompatible { .. } => incompatible += 1,
+            LegacyCompletePairOutcome::TypedIncompatible { .. } => incompatible += 1,
         }
     }
     let (key_hash, value_hash) = row_stream_hashes(rows);
@@ -1240,13 +2145,13 @@ fn validate_witness_rows(
     Ok(())
 }
 
-fn validate_pair_row(
+fn validate_legacy_pair_row(
     cx_id: CxId,
     left: SlotId,
     right: SlotId,
-    row: &CompletePairRow,
+    row: &LegacyCompletePairRow,
 ) -> calyx_core::Result<()> {
-    if row.schema != COMPLETE_PAIR_ROW_SCHEMA
+    if row.schema != LEGACY_COMPLETE_PAIR_ROW_SCHEMA
         || row.cx_id != cx_hex(cx_id)
         || row.left_slot != left.get()
         || row.right_slot != right.get()
@@ -1258,7 +2163,7 @@ fn validate_pair_row(
             right.get()
         )));
     }
-    if let CompletePairOutcome::Computed { value_bits, .. } = row.outcome
+    if let LegacyCompletePairOutcome::Computed { value_bits, .. } = row.outcome
         && !f32::from_bits(value_bits).is_finite()
     {
         return Err(completion_corrupt(format!(
@@ -1285,24 +2190,139 @@ fn row_stream_hashes(rows: &BTreeMap<Vec<u8>, Vec<u8>>) -> (String, String) {
     )
 }
 
-fn pair_row_key(cx_id: CxId, left: SlotId, right: SlotId) -> Vec<u8> {
-    let mut key = Vec::with_capacity(COMPLETE_PAIR_ROW_PREFIX.len() + 20);
-    key.extend_from_slice(COMPLETE_PAIR_ROW_PREFIX);
+fn encode_outcome(outcome: &CompletePairOutcome, out: &mut Vec<u8>) {
+    match outcome {
+        CompletePairOutcome::Computed { metric, value_bits } => {
+            out.push(metric.code());
+            out.extend_from_slice(&value_bits.to_be_bytes());
+        }
+        CompletePairOutcome::TypedIncompatible { reason } => out.push(reason.code()),
+    }
+}
+
+fn block_key(cx_id: CxId) -> Vec<u8> {
+    let mut key = Vec::with_capacity(COMPLETE_PAIR_BLOCK_PREFIX.len() + 16);
+    key.extend_from_slice(COMPLETE_PAIR_BLOCK_PREFIX);
+    key.extend_from_slice(cx_id.as_bytes());
+    key
+}
+
+fn parse_block_key(key: &[u8]) -> calyx_core::Result<CxId> {
+    if key.len() != COMPLETE_PAIR_BLOCK_PREFIX.len() + 16
+        || !key.starts_with(COMPLETE_PAIR_BLOCK_PREFIX)
+    {
+        return Err(completion_corrupt(format!(
+            "malformed v2 pair-block key {}",
+            hex_lower_bytes(key)
+        )));
+    }
+    let mut cx_bytes = [0u8; 16];
+    cx_bytes.copy_from_slice(&key[COMPLETE_PAIR_BLOCK_PREFIX.len()..]);
+    Ok(CxId::from_bytes(cx_bytes))
+}
+
+fn virtual_pair_key(cx_id: CxId, left: SlotId, right: SlotId) -> Vec<u8> {
+    let mut key = Vec::with_capacity(COMPLETE_PAIR_BLOCK_PREFIX.len() + 1 + 20);
+    key.extend_from_slice(COMPLETE_PAIR_BLOCK_PREFIX);
+    key.push(b'p');
     key.extend_from_slice(cx_id.as_bytes());
     key.extend_from_slice(&left.get().to_be_bytes());
     key.extend_from_slice(&right.get().to_be_bytes());
     key
 }
 
-fn parse_pair_row_key(key: &[u8]) -> calyx_core::Result<(CxId, SlotId, SlotId)> {
-    let expected_len = COMPLETE_PAIR_ROW_PREFIX.len() + 20;
-    if key.len() != expected_len || !key.starts_with(COMPLETE_PAIR_ROW_PREFIX) {
+fn parse_witness_key(key: &[u8]) -> calyx_core::Result<CxId> {
+    if key.len() != COMPLETE_WITNESS_PREFIX.len() + 16 || !key.starts_with(COMPLETE_WITNESS_PREFIX)
+    {
+        return Err(completion_corrupt(format!(
+            "malformed v2 completion witness key {}",
+            hex_lower_bytes(key)
+        )));
+    }
+    let mut cx_bytes = [0u8; 16];
+    cx_bytes.copy_from_slice(&key[COMPLETE_WITNESS_PREFIX.len()..]);
+    Ok(CxId::from_bytes(cx_bytes))
+}
+
+fn decode_hash_32(value: &str, field: &str) -> calyx_core::Result<[u8; 32]> {
+    if value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(completion_corrupt(format!(
+            "{field} must be exactly 64 hexadecimal characters"
+        )));
+    }
+    let mut out = [0u8; 32];
+    for (index, chunk) in value.as_bytes().chunks_exact(2).enumerate() {
+        let text = std::str::from_utf8(chunk)
+            .map_err(|_| completion_corrupt(format!("{field} contains invalid UTF-8")))?;
+        out[index] = u8::from_str_radix(text, 16)
+            .map_err(|_| completion_corrupt(format!("{field} contains invalid hexadecimal")))?;
+    }
+    Ok(out)
+}
+
+fn usize_to_u32(value: usize, context: &str) -> calyx_core::Result<u32> {
+    u32::try_from(value).map_err(|_| completion_overflow(context))
+}
+
+fn usize_to_u64(value: usize, context: &str) -> calyx_core::Result<u64> {
+    u64::try_from(value).map_err(|_| completion_overflow(context))
+}
+
+fn increment_map_count(
+    counts: &mut BTreeMap<String, usize>,
+    key: &str,
+    context: &str,
+) -> calyx_core::Result<()> {
+    let current = counts.get(key).copied().unwrap_or(0);
+    counts.insert(key.to_string(), checked_add(current, 1, context)?);
+    Ok(())
+}
+
+fn increment_u32_map_count(
+    counts: &mut BTreeMap<u32, usize>,
+    key: u32,
+    context: &str,
+) -> calyx_core::Result<()> {
+    let current = counts.get(&key).copied().unwrap_or(0);
+    counts.insert(key, checked_add(current, 1, context)?);
+    Ok(())
+}
+
+fn validated_cosine(metric: PairMetric, value: f64) -> calyx_core::Result<f64> {
+    const COSINE_ROUNDOFF_TOLERANCE: f64 = 1.0e-9;
+    if !value.is_finite() {
+        return Err(source_corrupt(format!(
+            "{} produced a non-finite association",
+            metric.wire_name()
+        )));
+    }
+    if !(-1.0 - COSINE_ROUNDOFF_TOLERANCE..=1.0 + COSINE_ROUNDOFF_TOLERANCE).contains(&value) {
+        return Err(source_corrupt(format!(
+            "{} produced cosine {value}, outside [-1,1] beyond the declared numerical tolerance {COSINE_ROUNDOFF_TOLERANCE}",
+            metric.wire_name()
+        )));
+    }
+    Ok(value.clamp(-1.0, 1.0))
+}
+
+fn legacy_pair_row_key(cx_id: CxId, left: SlotId, right: SlotId) -> Vec<u8> {
+    let mut key = Vec::with_capacity(LEGACY_COMPLETE_PAIR_ROW_PREFIX.len() + 20);
+    key.extend_from_slice(LEGACY_COMPLETE_PAIR_ROW_PREFIX);
+    key.extend_from_slice(cx_id.as_bytes());
+    key.extend_from_slice(&left.get().to_be_bytes());
+    key.extend_from_slice(&right.get().to_be_bytes());
+    key
+}
+
+fn parse_legacy_pair_row_key(key: &[u8]) -> calyx_core::Result<(CxId, SlotId, SlotId)> {
+    let expected_len = LEGACY_COMPLETE_PAIR_ROW_PREFIX.len() + 20;
+    if key.len() != expected_len || !key.starts_with(LEGACY_COMPLETE_PAIR_ROW_PREFIX) {
         return Err(completion_corrupt(format!(
             "malformed complete pair key {}",
             hex_lower_bytes(key)
         )));
     }
-    let offset = COMPLETE_PAIR_ROW_PREFIX.len();
+    let offset = LEGACY_COMPLETE_PAIR_ROW_PREFIX.len();
     let mut cx_bytes = [0u8; 16];
     cx_bytes.copy_from_slice(&key[offset..offset + 16]);
     let left = SlotId::new(u16::from_be_bytes([key[offset + 16], key[offset + 17]]));
@@ -1324,8 +2344,9 @@ fn witness_key(cx_id: CxId) -> Vec<u8> {
     key
 }
 
-fn parse_witness_key(key: &[u8]) -> calyx_core::Result<CxId> {
-    if key.len() != COMPLETE_WITNESS_PREFIX.len() + 16 || !key.starts_with(COMPLETE_WITNESS_PREFIX)
+fn parse_legacy_witness_key(key: &[u8]) -> calyx_core::Result<CxId> {
+    if key.len() != LEGACY_COMPLETE_WITNESS_PREFIX.len() + 16
+        || !key.starts_with(LEGACY_COMPLETE_WITNESS_PREFIX)
     {
         return Err(completion_corrupt(format!(
             "malformed completion witness key {}",
@@ -1333,8 +2354,15 @@ fn parse_witness_key(key: &[u8]) -> calyx_core::Result<CxId> {
         )));
     }
     let mut cx_bytes = [0u8; 16];
-    cx_bytes.copy_from_slice(&key[COMPLETE_WITNESS_PREFIX.len()..]);
+    cx_bytes.copy_from_slice(&key[LEGACY_COMPLETE_WITNESS_PREFIX.len()..]);
     Ok(CxId::from_bytes(cx_bytes))
+}
+
+fn legacy_witness_key(cx_id: CxId) -> Vec<u8> {
+    let mut key = Vec::with_capacity(LEGACY_COMPLETE_WITNESS_PREFIX.len() + 16);
+    key.extend_from_slice(LEGACY_COMPLETE_WITNESS_PREFIX);
+    key.extend_from_slice(cx_id.as_bytes());
+    key
 }
 
 fn cx_from_exact_key(key: &[u8], family: &str) -> calyx_core::Result<CxId> {
@@ -1351,17 +2379,6 @@ fn cx_from_exact_key(key: &[u8], family: &str) -> calyx_core::Result<CxId> {
 
 fn cx_hex(cx_id: CxId) -> String {
     hex_lower_bytes(cx_id.as_bytes())
-}
-
-fn absent_reason_wire(reason: &AbsentReason) -> String {
-    match reason {
-        AbsentReason::NotApplicable => "not_applicable".to_string(),
-        AbsentReason::Redacted => "redacted".to_string(),
-        AbsentReason::LensUnavailable => "lens_unavailable".to_string(),
-        AbsentReason::Deferred => "deferred".to_string(),
-        AbsentReason::LensInactive => "lens_inactive".to_string(),
-        AbsentReason::Error(message) => format!("error:{message}"),
-    }
 }
 
 fn append_part(out: &mut Vec<u8>, part: &[u8]) {
