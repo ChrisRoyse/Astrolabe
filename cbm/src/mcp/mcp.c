@@ -7015,6 +7015,76 @@ static artifact_bootstrap_status_t try_artifact_bootstrap(const char *project_na
     return ARTIFACT_BOOTSTRAP_IMPORTED;
 }
 
+/* Attach the exact historical generation an artifact bootstrap installed (#976).
+ * An import publishes a *previous* generation's graph at the canonical path
+ * before the live pipeline runs, so without this block the caller cannot tell a
+ * freshly indexed generation from an older one that was merely restored. The
+ * fields are the artifact's own content-bound identity, not a summary. */
+static bool add_artifact_bootstrap_provenance(yyjson_mut_doc *doc, yyjson_mut_val *root,
+                                              const cbm_artifact_import_result_t *import_result,
+                                              const char *disposition) {
+    yyjson_mut_val *bootstrap = yyjson_mut_obj(doc);
+    if (!bootstrap || !yyjson_mut_obj_add_val(doc, root, "artifact_bootstrap", bootstrap)) {
+        return false;
+    }
+    return yyjson_mut_obj_add_str(doc, bootstrap, "status", "imported") &&
+           yyjson_mut_obj_add_str(doc, bootstrap, "disposition", disposition) &&
+           yyjson_mut_obj_add_str(doc, bootstrap, "provenance", "published_repository_artifact") &&
+           yyjson_mut_obj_add_strcpy(doc, bootstrap, "source_path",
+                                     import_result->artifact_source_path) &&
+           yyjson_mut_obj_add_strcpy(doc, bootstrap, "artifact_sha256",
+                                     import_result->artifact_compressed_sha256) &&
+           yyjson_mut_obj_add_strcpy(doc, bootstrap, "database_sha256",
+                                     import_result->installed_database_sha256) &&
+           yyjson_mut_obj_add_strcpy(doc, bootstrap, "artifact_commit",
+                                     import_result->artifact_commit) &&
+           yyjson_mut_obj_add_strcpy(doc, bootstrap, "artifact_indexed_at",
+                                     import_result->artifact_created_utc) &&
+           yyjson_mut_obj_add_int(doc, bootstrap, "artifact_nodes",
+                                  import_result->artifact_nodes) &&
+           yyjson_mut_obj_add_int(doc, bootstrap, "artifact_edges",
+                                  import_result->artifact_edges) &&
+           yyjson_mut_obj_add_uint(doc, bootstrap, "database_bytes",
+                                   import_result->installed_database_bytes);
+}
+
+/* Record what the revert of a non-publishing generation actually did (#976).
+ * `removed` is the only outcome that restores the exact pre-request state; the
+ * refusal outcomes are reported with the observed identity so an operator can
+ * see precisely which bytes were preserved and why. */
+static bool add_artifact_bootstrap_revert(yyjson_mut_doc *doc, yyjson_mut_val *root,
+                                          const cbm_artifact_revert_result_t *revert) {
+    yyjson_mut_val *node = yyjson_mut_obj(doc);
+    if (!node || !yyjson_mut_obj_add_val(doc, root, "artifact_bootstrap_revert", node)) {
+        return false;
+    }
+    const char *outcome = "remove_failed";
+    if (revert->status == CBM_ARTIFACT_REVERT_REMOVED) {
+        outcome = "removed";
+    } else if (revert->status == CBM_ARTIFACT_REVERT_IDENTITY_MISMATCH) {
+        outcome = "identity_mismatch_preserved";
+    } else if (revert->status == CBM_ARTIFACT_REVERT_INVALID_ARGUMENT) {
+        outcome = "invalid_argument";
+    }
+    return yyjson_mut_obj_add_str(doc, node, "outcome", outcome) &&
+           yyjson_mut_obj_add_int(doc, node, "status", revert->status) &&
+           yyjson_mut_obj_add_strcpy(doc, node, "operation", revert->operation) &&
+           yyjson_mut_obj_add_strcpy(doc, node, "detail", revert->detail) &&
+           yyjson_mut_obj_add_str(
+               doc, node, "destination_state",
+               revert->destination_probe == CBM_PATH_PROBE_PRESENT
+                   ? "present"
+                   : (revert->destination_probe == CBM_PATH_PROBE_ABSENT ? "absent"
+                                                                         : "probe_error")) &&
+           yyjson_mut_obj_add_uint(doc, node, "destination_probe_native_error",
+                                   revert->destination_probe_native_error) &&
+           yyjson_mut_obj_add_bool(doc, node, "sidecars_absent", revert->sidecars_absent != 0) &&
+           yyjson_mut_obj_add_uint(doc, node, "expected_bytes", revert->expected_bytes) &&
+           yyjson_mut_obj_add_uint(doc, node, "observed_bytes", revert->observed_bytes) &&
+           yyjson_mut_obj_add_strcpy(doc, node, "expected_sha256", revert->expected_sha256) &&
+           yyjson_mut_obj_add_strcpy(doc, node, "observed_sha256", revert->observed_sha256);
+}
+
 static char *build_artifact_bootstrap_error(
     const char *project_name, const char *repo_path,
     const cbm_artifact_import_result_t *import_result) {
@@ -8575,6 +8645,36 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
         }
     }
 
+    /* #976: a bootstrap installs a *historical* generation at the canonical path
+     * before this pipeline runs. When the pipeline does not publish, leaving that
+     * import in place hands every later query an older graph while this response
+     * and the durable project transition both say nothing was published. The
+     * install is therefore bound to the generation that made it: no publication,
+     * no installed artifact. The removal is identity-bound (exact bytes we wrote,
+     * sidecars absent), so anything the pipeline or another writer touched is
+     * preserved and refused instead of deleted. */
+    cbm_artifact_revert_result_t bootstrap_revert = {0};
+    bool bootstrap_revert_attempted = false;
+    if (bootstrap == ARTIFACT_BOOTSTRAP_IMPORTED && rc != 0) {
+        bootstrap_revert_attempted = true;
+        (void)cbm_artifact_revert_bootstrap(artifact_import_result.destination_db_path,
+                                            artifact_import_result.installed_database_sha256,
+                                            artifact_import_result.installed_database_bytes,
+                                            &bootstrap_revert);
+        if (bootstrap_revert.status == CBM_ARTIFACT_REVERT_REMOVED) {
+            cbm_log_info("index.artifact_bootstrap_revert", "project", project_name, "outcome",
+                         "removed", "db_path", artifact_import_result.destination_db_path);
+        } else {
+            cbm_log_error("index.artifact_bootstrap_revert", "code",
+                          "CBM_ARTIFACT_BOOTSTRAP_REVERT_REFUSED", "project", project_name,
+                          "db_path", artifact_import_result.destination_db_path, "operation",
+                          bootstrap_revert.operation, "message", bootstrap_revert.detail,
+                          "remediation",
+                          "inspect the preserved destination database family; it is neither the "
+                          "imported artifact nor a published generation of this request");
+        }
+    }
+
     yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
     yyjson_mut_val *root = yyjson_mut_obj(doc);
     yyjson_mut_doc_set_root(doc, root);
@@ -8583,6 +8683,18 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
 #ifdef _WIN32
     add_index_admission_telemetry(doc, root, &admission);
 #endif
+    if (bootstrap == ARTIFACT_BOOTSTRAP_IMPORTED) {
+        (void)add_artifact_bootstrap_provenance(
+            doc, root, &artifact_import_result,
+            bootstrap_revert_attempted
+                ? (bootstrap_revert.status == CBM_ARTIFACT_REVERT_REMOVED
+                       ? "reverted_unpublished_generation"
+                       : "revert_refused_state_preserved")
+                : "retained_as_index_base");
+    }
+    if (bootstrap_revert_attempted) {
+        (void)add_artifact_bootstrap_revert(doc, root, &bootstrap_revert);
+    }
 
     char *postcondition_error = post_run_close_error;
     if (rc == 0 && !postcondition_error) {

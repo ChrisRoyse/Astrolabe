@@ -30,7 +30,11 @@ enum {
     CBM_ARTIFACT_IMPORT_FAILED_BEFORE_PUBLICATION = 1,
     CBM_ARTIFACT_IMPORT_FAILED_AFTER_PUBLICATION = 2,
     CBM_ARTIFACT_IMPORT_INVALID_ARGUMENT = 3,
-    CBM_ARTIFACT_IMPORT_ABI_VERSION = 1,
+    /* v2 carries the exact installed-generation provenance (#976): what was
+     * imported, from which artifact bytes, and which historical generation it
+     * represents. Without those fields an installed bootstrap is physically
+     * indistinguishable from a live index of the requested generation. */
+    CBM_ARTIFACT_IMPORT_ABI_VERSION = 2,
 };
 
 typedef struct {
@@ -44,7 +48,47 @@ typedef struct {
     char operation[128];
     char detail[512];
     char destination_db_path[4096];
+    /* Exact provenance of the installed generation (#976). Populated as soon as
+     * each fact is verified, so a failure diagnostic carries everything already
+     * proven. `installed_*` describe the database this import published; the
+     * revert path binds to them so it can only ever remove its own bytes. */
+    char artifact_source_path[4096];
+    char artifact_compressed_sha256[65];
+    char installed_database_sha256[65];
+    char artifact_commit[64];
+    char artifact_created_utc[32];
+    int32_t artifact_nodes;
+    int32_t artifact_edges;
+    uint64_t installed_database_bytes;
 } cbm_artifact_import_result_t;
+
+typedef int32_t cbm_artifact_revert_status_t;
+enum {
+    /* The exact bootstrap-installed family was removed and its absence read back. */
+    CBM_ARTIFACT_REVERT_REMOVED = 0,
+    /* The destination no longer matches the exact installed identity, so nothing
+     * was deleted. Preserving unexpected bytes always outranks reverting. */
+    CBM_ARTIFACT_REVERT_IDENTITY_MISMATCH = 1,
+    /* The identity matched but removal or its absence readback failed. */
+    CBM_ARTIFACT_REVERT_REMOVE_FAILED = 2,
+    CBM_ARTIFACT_REVERT_INVALID_ARGUMENT = 3,
+    CBM_ARTIFACT_REVERT_ABI_VERSION = 1,
+};
+
+typedef struct {
+    uint32_t abi_version;
+    uint32_t struct_size;
+    cbm_artifact_revert_status_t status;
+    int32_t destination_probe;
+    uint32_t destination_probe_native_error;
+    uint32_t sidecars_absent;
+    uint64_t observed_bytes;
+    uint64_t expected_bytes;
+    char observed_sha256[65];
+    char expected_sha256[65];
+    char operation[128];
+    char detail[512];
+} cbm_artifact_revert_result_t;
 
 /* Export DB to .codebase-memory/graph.db.zst artifact.
  * quality: CBM_ARTIFACT_FAST or CBM_ARTIFACT_BEST.
@@ -64,6 +108,18 @@ const char *cbm_artifact_export_last_error(void);
 cbm_artifact_import_status_t cbm_artifact_import(
     const char *repo_path, const char *cache_db_path, const char *expected_project,
     cbm_artifact_import_result_t *result);
+
+/* Revert an artifact bootstrap whose indexing generation did not publish (#976).
+ * A bootstrap installs a historical graph at the canonical destination *before*
+ * the live pipeline runs; if that pipeline never publishes, leaving the import
+ * in place would expose an older generation as though the failed request had
+ * produced it. This removes the destination only when it is still byte-for-byte
+ * the family this import installed: DB present at `expected_bytes` hashing to
+ * `expected_sha256`, with -wal/-shm exactly absent. Any other observation is an
+ * identity mismatch that preserves every byte and refuses. */
+cbm_artifact_revert_status_t cbm_artifact_revert_bootstrap(
+    const char *cache_db_path, const char *expected_sha256, uint64_t expected_bytes,
+    cbm_artifact_revert_result_t *result);
 
 /* Check if a compatible artifact exists in repo_path/.codebase-memory/.
  * Returns true only when the metadata contract, compressed size/hash, and

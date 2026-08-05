@@ -585,6 +585,13 @@ typedef struct {
     char project[CBM_SZ_1K];
     char compressed_sha256[CBM_SHA256_HEX_LEN + 1];
     char database_sha256[CBM_SHA256_HEX_LEN + 1];
+    /* Freshness identity of the exported generation (#976). write_metadata has
+     * always emitted these; parsing them is what lets an installed bootstrap
+     * state *which* historical generation it is rather than passing anonymously
+     * for the live one. Both are advisory-origin (a repo may have no git head),
+     * so they are reported exactly as found and never gate the import. */
+    char commit[CBM_SZ_64];
+    char indexed_at_utc[CBM_SZ_64];
 } artifact_metadata_t;
 
 static bool artifact_sha256_is_exact(const char *value) {
@@ -660,6 +667,17 @@ static bool read_artifact_metadata(const char *repo_path, artifact_metadata_t *m
                  compressed_hash);
         snprintf(metadata->database_sha256, sizeof(metadata->database_sha256), "%s",
                  database_hash);
+        /* Freshness identity (#976): reported exactly as found. An export from a
+         * non-git tree legitimately carries an empty commit, so absence is
+         * recorded as empty rather than treated as a contract violation. */
+        yyjson_val *commit = yyjson_obj_get(root, "commit");
+        yyjson_val *indexed_at = yyjson_obj_get(root, "indexed_at");
+        const char *commit_text = commit ? yyjson_get_str(commit) : NULL;
+        const char *indexed_at_text = indexed_at ? yyjson_get_str(indexed_at) : NULL;
+        snprintf(metadata->commit, sizeof(metadata->commit), "%s",
+                 commit_text ? commit_text : "");
+        snprintf(metadata->indexed_at_utc, sizeof(metadata->indexed_at_utc), "%s",
+                 indexed_at_text ? indexed_at_text : "");
     }
     yyjson_doc_free(doc);
     return valid;
@@ -1431,11 +1449,26 @@ cbm_artifact_import_status_t cbm_artifact_import(
                                     "metadata contract or expected project mismatch");
     }
 
+    /* Publish the historical generation's identity as soon as its metadata is
+     * verified (#976): every later diagnostic, the caller-visible provenance,
+     * and the revert binding all read these fields. */
+    snprintf(result->artifact_compressed_sha256, sizeof(result->artifact_compressed_sha256), "%s",
+             metadata.compressed_sha256);
+    snprintf(result->installed_database_sha256, sizeof(result->installed_database_sha256), "%s",
+             metadata.database_sha256);
+    snprintf(result->artifact_commit, sizeof(result->artifact_commit), "%s", metadata.commit);
+    snprintf(result->artifact_created_utc, sizeof(result->artifact_created_utc), "%s",
+             metadata.indexed_at_utc);
+    result->artifact_nodes = metadata.nodes;
+    result->artifact_edges = metadata.edges;
+    result->installed_database_bytes = (uint64_t)metadata.original_size;
+
     char zst_path[CBM_SZ_4K];
     if (!artifact_path(zst_path, sizeof(zst_path), repo_path, CBM_ARTIFACT_FILENAME)) {
         return artifact_import_fail(result, CBM_ARTIFACT_IMPORT_FAILED_BEFORE_PUBLICATION,
                                     "import.artifact_path", "artifact path is too long");
     }
+    snprintf(result->artifact_source_path, sizeof(result->artifact_source_path), "%s", zst_path);
     size_t compressed_size = 0;
     char *compressed = read_file_alloc(zst_path, &compressed_size);
     if (!compressed || compressed_size != metadata.compressed_size) {
@@ -1616,6 +1649,142 @@ cbm_artifact_import_status_t cbm_artifact_import(
     cbm_log_info("artifact.import", "db", cache_db_path, "project", expected_project, "nodes",
                  itoa_buf(metadata.nodes), "edges", itoa_buf(metadata.edges), "size_mb",
                  itoa_buf((int)((size_t)decompressed_size / ART_BYTES_PER_MB)));
+    return result->status;
+}
+
+/* ── Bootstrap revert ────────────────────────────────────────────── */
+
+/* Hash a file in bounded chunks so reverting a multi-hundred-megabyte graph
+ * never needs the whole database resident. Returns false and leaves `out`
+ * untouched when the file cannot be read to its exact declared length. */
+static bool artifact_hash_file_exact(const char *path, uint64_t *observed_bytes,
+                                     char out[CBM_SHA256_HEX_LEN + 1]) {
+    FILE *file = cbm_fopen(path, "rb");
+    if (!file) {
+        return false;
+    }
+    enum { REVERT_HASH_CHUNK = 1 << 20 };
+    unsigned char *chunk = malloc(REVERT_HASH_CHUNK);
+    if (!chunk) {
+        (void)fclose(file);
+        return false;
+    }
+    cbm_sha256_ctx ctx;
+    cbm_sha256_init(&ctx);
+    uint64_t total = 0;
+    size_t read_bytes = 0;
+    while ((read_bytes = fread(chunk, 1, REVERT_HASH_CHUNK, file)) > 0) {
+        cbm_sha256_update(&ctx, chunk, read_bytes);
+        total += (uint64_t)read_bytes;
+    }
+    bool read_failed = ferror(file) != 0;
+    free(chunk);
+    if (fclose(file) != 0 || read_failed) {
+        return false;
+    }
+    uint8_t digest[CBM_SHA256_DIGEST_LEN];
+    cbm_sha256_final(&ctx, digest);
+    for (size_t i = 0; i < CBM_SHA256_DIGEST_LEN; i++) {
+        static const char hex[] = "0123456789abcdef";
+        out[i * 2] = hex[(digest[i] >> 4) & 0x0F];
+        out[i * 2 + 1] = hex[digest[i] & 0x0F];
+    }
+    out[CBM_SHA256_HEX_LEN] = '\0';
+    *observed_bytes = total;
+    return true;
+}
+
+static cbm_artifact_revert_status_t artifact_revert_fail(cbm_artifact_revert_result_t *result,
+                                                         cbm_artifact_revert_status_t status,
+                                                         const char *operation,
+                                                         const char *detail) {
+    result->status = status;
+    snprintf(result->operation, sizeof(result->operation), "%s",
+             operation ? operation : "unknown");
+    snprintf(result->detail, sizeof(result->detail), "%s", detail ? detail : "unknown");
+    return result->status;
+}
+
+cbm_artifact_revert_status_t cbm_artifact_revert_bootstrap(
+    const char *cache_db_path, const char *expected_sha256, uint64_t expected_bytes,
+    cbm_artifact_revert_result_t *result) {
+    if (!result) {
+        return CBM_ARTIFACT_REVERT_INVALID_ARGUMENT;
+    }
+    memset(result, 0, sizeof(*result));
+    result->abi_version = CBM_ARTIFACT_REVERT_ABI_VERSION;
+    result->struct_size = sizeof(*result);
+    result->status = CBM_ARTIFACT_REVERT_IDENTITY_MISMATCH;
+    result->destination_probe = CBM_PATH_PROBE_ERROR;
+    result->expected_bytes = expected_bytes;
+    if (!cache_db_path || !artifact_sha256_is_exact(expected_sha256) || expected_bytes == 0) {
+        return artifact_revert_fail(result, CBM_ARTIFACT_REVERT_INVALID_ARGUMENT,
+                                    "revert.validate_args",
+                                    "an exact destination path, SHA-256, and nonzero length are "
+                                    "required to bind the removal");
+    }
+    snprintf(result->expected_sha256, sizeof(result->expected_sha256), "%s", expected_sha256);
+
+    unsigned long probe_error = 0;
+    cbm_path_probe_result_t probe = cbm_path_probe(cache_db_path, &probe_error);
+    result->destination_probe = probe;
+    result->destination_probe_native_error = (uint32_t)probe_error;
+    if (probe != CBM_PATH_PROBE_PRESENT) {
+        return artifact_revert_fail(
+            result, CBM_ARTIFACT_REVERT_IDENTITY_MISMATCH, "revert.destination_probe",
+            probe == CBM_PATH_PROBE_ABSENT
+                ? "the bootstrap destination is already absent; nothing was removed"
+                : "the bootstrap destination could not be evaluated; every byte is preserved");
+    }
+
+    /* -wal/-shm presence means something opened the database after the import
+     * published it. That is no longer the family this import installed, so the
+     * removal is refused rather than widened to cover unknown writers. */
+    if (!artifact_sidecars_absent_exact(cache_db_path, "bootstrap_revert_sidecars")) {
+        return artifact_revert_fail(
+            result, CBM_ARTIFACT_REVERT_IDENTITY_MISMATCH, "revert.sidecar_absence",
+            "a -wal or -shm member is present or unevaluable, so the destination is no longer "
+            "the exact imported family; every byte is preserved");
+    }
+    result->sidecars_absent = 1;
+
+    if (!artifact_hash_file_exact(cache_db_path, &result->observed_bytes,
+                                  result->observed_sha256)) {
+        return artifact_revert_fail(result, CBM_ARTIFACT_REVERT_IDENTITY_MISMATCH,
+                                    "revert.hash_destination",
+                                    "the destination database could not be read back for exact "
+                                    "identity comparison; every byte is preserved");
+    }
+    if (result->observed_bytes != expected_bytes ||
+        strcmp(result->observed_sha256, expected_sha256) != 0) {
+        return artifact_revert_fail(
+            result, CBM_ARTIFACT_REVERT_IDENTITY_MISMATCH, "revert.identity_compare",
+            "the destination no longer matches the exact bytes this bootstrap installed; every "
+            "byte is preserved for explicit inspection");
+    }
+
+    if (!artifact_remove_closed_scratch(cache_db_path, "bootstrap_revert_remove")) {
+        return artifact_revert_fail(result, CBM_ARTIFACT_REVERT_REMOVE_FAILED,
+                                    "revert.remove_destination",
+                                    "the exact bootstrap-installed database could not be removed "
+                                    "and its absence proven");
+    }
+    unsigned long absence_error = 0;
+    cbm_path_probe_result_t absence = cbm_path_probe(cache_db_path, &absence_error);
+    result->destination_probe = absence;
+    result->destination_probe_native_error = (uint32_t)absence_error;
+    if (absence != CBM_PATH_PROBE_ABSENT) {
+        return artifact_revert_fail(result, CBM_ARTIFACT_REVERT_REMOVE_FAILED,
+                                    "revert.absence_readback",
+                                    "the bootstrap destination is not independently proven absent "
+                                    "after removal");
+    }
+    result->status = CBM_ARTIFACT_REVERT_REMOVED;
+    snprintf(result->operation, sizeof(result->operation), "%s", "revert.complete");
+    snprintf(result->detail, sizeof(result->detail), "%s",
+             "the exact bootstrap-installed database family was removed and its absence read back");
+    cbm_log_info("artifact.bootstrap_revert", "db", cache_db_path, "sha256", expected_sha256,
+                 "bytes", itoa_buf((int)(expected_bytes / ART_BYTES_PER_MB)));
     return result->status;
 }
 

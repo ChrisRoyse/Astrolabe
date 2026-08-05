@@ -349,9 +349,18 @@ pub(crate) fn run_project_index_transition(
 ) -> Result<String, DynError> {
     let mut transition = ProjectIndexTransition::begin(runner, cache_dir, project, repo_path)?;
     let grant = transition.worker_grant();
+    // #976: the pre-operation family is read here, not reused from normalization,
+    // so `family_before`/`family_after` bracket exactly the worker's window.
+    let family_before = sqlite_family_evidence(&transition.db_path)?;
     let mut outcome = operation(&grant);
+    // The durable record must describe the state the request actually left behind.
+    // Reading the family only at `begin` published a pre-operation snapshot as if
+    // it were terminal, which is how a failed generation could report the store
+    // absent while a complete graph sat at the canonical path.
+    let family_after = sqlite_family_evidence(&transition.db_path)
+        .unwrap_or_else(|error| json!({"read_error": error.to_string()}));
     let mut invalid_response = None;
-    let terminal = match outcome.as_ref() {
+    let mut terminal = match outcome.as_ref() {
         Ok(response) => match tool_result_is_error(response) {
             Ok(is_error) => json!({
                 "status": if is_error { "failed" } else { "completed" },
@@ -375,11 +384,91 @@ pub(crate) fn run_project_index_transition(
             "error_sha256": hex_lower(&Sha256::digest(error.to_string().as_bytes())),
         }),
     };
+    let facts = outcome
+        .as_ref()
+        .ok()
+        .map(|response| index_response_facts(response));
+    if let Some(facts) = facts.as_ref() {
+        terminal["sqlite_publication_started"] = json!(facts.publication_started);
+        if let Some(bootstrap) = facts.artifact_bootstrap.as_ref() {
+            terminal["artifact_bootstrap"] = bootstrap.clone();
+        }
+        if let Some(revert) = facts.artifact_bootstrap_revert.as_ref() {
+            terminal["artifact_bootstrap_revert"] = revert.clone();
+        }
+    }
+    terminal["family_before"] = family_before.clone();
+    terminal["family_after"] = family_after.clone();
+
+    // The conjunct this record exists to keep honest: a generation that states it
+    // never began publishing, over a store that was absent when it started, must
+    // leave that store absent. A present database there is *some other* graph —
+    // a restored artifact, a partial write — being handed to every later query as
+    // though this request had produced it. Refuse and preserve; never report the
+    // failure alone and let the contradiction stand.
+    let contradiction = facts.as_ref().is_some_and(|facts| {
+        !facts.publication_started.unwrap_or(true)
+            && family_before
+                .pointer("/db/present")
+                .and_then(Value::as_bool)
+                == Some(false)
+            && family_after.pointer("/db/present").and_then(Value::as_bool) == Some(true)
+    });
+    if contradiction {
+        let message = format!(
+            "ASTRO_PROJECT_TRANSITION_TERMINAL_STATE_CONTRADICTION: the {project:?} generation reported sqlite_publication_started=false over a store family that was absent before the request, yet {} is present afterwards; remediation: inspect the preserved database family and the preceding artifact.bootstrap_revert diagnostic — it is not a published generation of this request",
+            transition.db_path.display()
+        );
+        terminal["status"] = json!("failed");
+        terminal["terminal_state_contradiction"] = json!({
+            "code": "ASTRO_PROJECT_TRANSITION_TERMINAL_STATE_CONTRADICTION",
+            "message": &message,
+            "family_before": family_before,
+            "family_after": family_after,
+        });
+        invalid_response = Some(message);
+    }
     if let Some(message) = invalid_response {
         outcome = Err(message.into());
     }
     transition.finish(terminal)?;
     outcome
+}
+
+/// The facts the transition record must carry from a worker's own response.
+struct IndexResponseFacts {
+    publication_started: Option<bool>,
+    artifact_bootstrap: Option<Value>,
+    artifact_bootstrap_revert: Option<Value>,
+}
+
+/// Read the worker's claims out of the MCP envelope (`content[0].text` holds the
+/// tool's own JSON). Every field is optional on purpose: a response that omits
+/// them yields `None`, and `None` never manufactures a contradiction — only an
+/// explicit `sqlite_publication_started=false` can.
+fn index_response_facts(response: &str) -> IndexResponseFacts {
+    let inner = serde_json::from_str::<Value>(response)
+        .ok()
+        .and_then(|envelope| {
+            envelope
+                .pointer("/content/0/text")
+                .and_then(Value::as_str)
+                .and_then(|text| serde_json::from_str::<Value>(text).ok())
+        });
+    let Some(inner) = inner else {
+        return IndexResponseFacts {
+            publication_started: None,
+            artifact_bootstrap: None,
+            artifact_bootstrap_revert: None,
+        };
+    };
+    IndexResponseFacts {
+        publication_started: inner
+            .get("sqlite_publication_started")
+            .and_then(Value::as_bool),
+        artifact_bootstrap: inner.get("artifact_bootstrap").cloned(),
+        artifact_bootstrap_revert: inner.get("artifact_bootstrap_revert").cloned(),
+    }
 }
 
 struct ProjectIndexTransition<'a> {
