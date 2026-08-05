@@ -1236,6 +1236,35 @@ struct SemanticCoverageWitness {
     rules: Vec<SemanticCoverageRuleCount>,
 }
 
+/// Encodes the coverage witness with one explicit recursive object-key order.
+///
+/// Coverage bytes are stored in Graph CF and independently reconstructed from
+/// the typed witness embedded in the ingest Ledger payload.  Graph preparation
+/// also passes every row through [`append_import_fingerprint`], which parses and
+/// re-encodes JSON.  A direct struct serialization therefore cannot be the byte
+/// contract: struct field order and JSON object-key order are different.  Keep
+/// both durable views and every verifier on this single canonical encoding.
+fn semantic_coverage_canonical_bytes(witness: &SemanticCoverageWitness) -> IngestResult<Vec<u8>> {
+    fn sort_objects(value: Value) -> Value {
+        match value {
+            Value::Array(values) => Value::Array(values.into_iter().map(sort_objects).collect()),
+            Value::Object(object) => {
+                let mut entries = object.into_iter().collect::<Vec<_>>();
+                entries.sort_by(|left, right| left.0.cmp(&right.0));
+                let mut sorted = serde_json::Map::new();
+                for (key, value) in entries {
+                    sorted.insert(key, sort_objects(value));
+                }
+                Value::Object(sorted)
+            }
+            scalar => scalar,
+        }
+    }
+
+    let value = serde_json::to_value(witness)?;
+    Ok(serde_json::to_vec(&sort_objects(value))?)
+}
+
 #[derive(Debug, Default)]
 struct SemanticCoverageAccumulator {
     family_constellations: BTreeMap<SemanticFamily, u64>,
@@ -4397,7 +4426,7 @@ where
             SEMANTIC_COVERAGE_ROW_PREFIX,
             &project_digests.digest(&options.project),
         ),
-        serde_json::to_vec(&coverage_witness)?,
+        semantic_coverage_canonical_bytes(&coverage_witness)?,
     ));
     // Node-map rows. A digest-reused symbol must already have the exact persisted
     // row implied by that digest. Absence is vault corruption or an invalid reuse
@@ -8150,7 +8179,7 @@ fn verify_semantic_coverage_row(key: &[u8], bytes: &[u8]) -> IngestResult<Semant
             witness.panel_version
         )));
     }
-    if serde_json::to_vec(&witness)? != bytes {
+    if semantic_coverage_canonical_bytes(&witness)? != bytes {
         return Err(readback_mismatch(format!(
             "semantic coverage {} is not the canonical persisted witness encoding",
             hex_lower(key)
@@ -8543,7 +8572,7 @@ where
             continue;
         };
         match serde_json::from_value::<SemanticCoverageWitness>(value.clone()) {
-            Ok(witness) => match serde_json::to_vec(&witness) {
+            Ok(witness) => match semantic_coverage_canonical_bytes(&witness) {
                 Ok(canonical) => {
                     ledger_coverage
                         .entry(witness.project.clone())
