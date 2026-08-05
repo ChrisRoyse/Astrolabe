@@ -1723,8 +1723,9 @@ int cbm_source_snapshot_capture(const char *repo_path, const char *store_path,
     LARGE_INTEGER counter;
     QueryPerformanceCounter(&counter);
     LONG generation = InterlockedIncrement(&sequence);
-    int root_len = snprintf(root, base_len + suffix_capacity,
-                            "%s/.cbm-source-%lx-%016llx-%lx", snapshot_base,
+    /* Keep the immutable generation identity collision-resistant without spending
+     * MinGW's MAX_PATH-bound relative-lookup budget on descriptive scaffolding. */
+    int root_len = snprintf(root, base_len + suffix_capacity, "%s/.s-%lx-%llx-%lx", snapshot_base,
                             (unsigned long)GetCurrentProcessId(),
                             (unsigned long long)counter.QuadPart, (unsigned long)generation);
     wchar_t *wide_root = root_len > 0 && (size_t)root_len < base_len + suffix_capacity

@@ -92,6 +92,14 @@ typedef struct {
     size_t capacity;
 } compile_context_set_owner_t;
 
+typedef struct {
+    char **requests;
+    int count;
+    int capacity;
+    bool initialized;
+    bool failed;
+} quoted_include_cache_t;
+
 struct cbm_compile_context_index {
     compile_baseline_t *baselines;
     int baseline_count;
@@ -112,6 +120,9 @@ struct cbm_compile_context_index {
     CBMHashTable *contexts_by_id;
     CBMHashTable *sets_by_rel_path;
 };
+
+static bool context_dependency_contains(const compile_context_owner_t *context,
+                                        const char *rel_path);
 
 static int context_fail(cbm_pipeline_ctx_t *ctx, const char *code, const char *operation,
                         const char *path, size_t requested, const char *message,
@@ -487,14 +498,258 @@ static bool compiler_windows_path_length(const char *path, size_t *characters) {
     return true;
 }
 
-static int validate_compiler_snapshot_path_budget(cbm_pipeline_ctx_t *ctx,
-                                                  const compile_context_owner_t *owner) {
+static char *relative_parent_path(const char *relative_path) {
+    if (!relative_path) {
+        return NULL;
+    }
+    const char *slash = strrchr(relative_path, '/');
+    const char *backslash = strrchr(relative_path, '\\');
+    const char *separator = slash;
+    if (backslash && (!separator || backslash > separator)) {
+        separator = backslash;
+    }
+    size_t length = separator ? (size_t)(separator - relative_path) : 0;
+    char *parent = malloc(length + 1);
+    if (!parent) {
+        return NULL;
+    }
+    memcpy(parent, relative_path, length);
+    parent[length] = '\0';
+    return parent;
+}
+
+/* Resolve only lexical repository-relative components. The returned path is
+ * used for dependency identity; the compiler-facing spelling remains untouched. */
+static char *normalize_relative_include(const char *including_relative_path,
+                                        const char *include_request,
+                                        bool *escaped_repository_root) {
+    if (escaped_repository_root) {
+        *escaped_repository_root = false;
+    }
+    if (!including_relative_path || !include_request || !include_request[0] ||
+        path_is_absolute(include_request)) {
+        return NULL;
+    }
+    char *parent = relative_parent_path(including_relative_path);
+    char *joined = parent ? join_path(parent, include_request) : NULL;
+    free(parent);
+    if (!joined) {
+        return NULL;
+    }
+
+    size_t joined_length = strlen(joined);
+    char *normalized = malloc(joined_length + 1);
+    if (!normalized) {
+        free(joined);
+        return NULL;
+    }
+    size_t output_length = 0;
+    const char *at = joined;
+    while (*at) {
+        while (*at == '/' || *at == '\\') {
+            at++;
+        }
+        const char *segment = at;
+        while (*at && *at != '/' && *at != '\\') {
+            at++;
+        }
+        size_t segment_length = (size_t)(at - segment);
+        if (segment_length == 0 || (segment_length == 1 && segment[0] == '.')) {
+            continue;
+        }
+        if (segment_length == 2 && segment[0] == '.' && segment[1] == '.') {
+            if (output_length == 0) {
+                if (escaped_repository_root) {
+                    *escaped_repository_root = true;
+                }
+                free(normalized);
+                free(joined);
+                return NULL;
+            }
+            while (output_length > 0 && normalized[output_length - 1] != '/') {
+                output_length--;
+            }
+            if (output_length > 0) {
+                output_length--;
+            }
+            continue;
+        }
+        if (output_length > 0) {
+            normalized[output_length++] = '/';
+        }
+        memcpy(normalized + output_length, segment, segment_length);
+        output_length += segment_length;
+    }
+    normalized[output_length] = '\0';
+    free(joined);
+    return normalized;
+}
+
+static char *raw_snapshot_include_path(cbm_pipeline_ctx_t *ctx, const char *including_relative_path,
+                                       const char *include_request) {
+    char *parent = relative_parent_path(including_relative_path);
+    char *snapshot_parent = parent && parent[0] ? join_path(ctx->source_root, parent)
+                                                : (parent ? strdup(ctx->source_root) : NULL);
+    char *raw_path = snapshot_parent ? join_path(snapshot_parent, include_request) : NULL;
+    free(snapshot_parent);
+    free(parent);
+    return raw_path;
+}
+
+static const char *context_dependency_match(const compile_context_owner_t *context,
+                                            const char *relative_path) {
+    if (!context || !relative_path) {
+        return NULL;
+    }
+    if (context_dependency_contains(context, relative_path)) {
+        return relative_path;
+    }
+#ifdef _WIN32
+    /* Captured paths retain source spelling, but Windows identity is case-insensitive.
+     * Pay for the linear probe only on the exceptional case-mismatch path. */
+    for (int i = 0; i < context->dependency_count; i++) {
+        if (path_equal(context->dependencies[i], relative_path)) {
+            return context->dependencies[i];
+        }
+    }
+#endif
+    return NULL;
+}
+
+/* Return one exact quoted preprocessor spelling from the retained immutable
+ * syntax tree. This is deliberately separate from semantic import extraction:
+ * compiler admission must see includes nested under header guards, while the
+ * exact dependency closure decides whether a conditional branch was active. */
+static int quoted_include_request(const CBMFileResult *result, TSNode node, char **out_request) {
+    *out_request = NULL;
+    if (!result || !result->source || result->source_len < 0) {
+        return CBM_NOT_FOUND;
+    }
+    TSNode path_node = ts_node_child_by_field_name(node, "path", 4);
+    if (ts_node_is_null(path_node)) {
+        uint32_t child_count = ts_node_child_count(node);
+        for (uint32_t i = 0; i < child_count; i++) {
+            TSNode child = ts_node_child(node, i);
+            if (strcmp(ts_node_type(child), "string_literal") == 0) {
+                path_node = child;
+                break;
+            }
+        }
+    }
+    if (ts_node_is_null(path_node) || strcmp(ts_node_type(path_node), "string_literal") != 0) {
+        return 0;
+    }
+    uint32_t start = ts_node_start_byte(path_node);
+    uint32_t end = ts_node_end_byte(path_node);
+    if (end <= start + 1 || end > (uint32_t)result->source_len || result->source[start] != '"' ||
+        result->source[end - 1] != '"') {
+        return CBM_NOT_FOUND;
+    }
+    size_t length = (size_t)(end - start - 2);
+    char *request = malloc(length + 1);
+    if (!request) {
+        return CBM_NOT_FOUND;
+    }
+    memcpy(request, result->source + start + 1, length);
+    request[length] = '\0';
+    *out_request = request;
+    return 1;
+}
+
+static void free_quoted_include_cache(quoted_include_cache_t *cache, int source_count) {
+    if (!cache) {
+        return;
+    }
+    for (int source_index = 0; source_index < source_count; source_index++) {
+        for (int i = 0; i < cache[source_index].count; i++) {
+            free(cache[source_index].requests[i]);
+        }
+        free(cache[source_index].requests);
+    }
+    free(cache);
+}
+
+/* Materialize every quoted include spelling once per source generation. A
+ * source can participate in many compilation contexts; caching prevents each
+ * context from cold-walking the same retained syntax tree. */
+static int load_quoted_include_cache(const CBMFileResult *result, quoted_include_cache_t *cache) {
+    if (cache->initialized) {
+        return cache->failed ? CBM_NOT_FOUND : 0;
+    }
+    cache->initialized = true;
+    if (!result || !result->cached_tree || !result->source || result->source_len < 0) {
+        cache->failed = true;
+        return CBM_NOT_FOUND;
+    }
+
+    TSTreeCursor cursor = ts_tree_cursor_new(ts_tree_root_node(result->cached_tree));
+    bool traversal_complete = false;
+    while (!traversal_complete) {
+        TSNode node = ts_tree_cursor_current_node(&cursor);
+        const char *node_kind = ts_node_type(node);
+        char *request = NULL;
+        int request_state = 0;
+        if (strcmp(node_kind, "preproc_include") == 0 || strcmp(node_kind, "preproc_import") == 0) {
+            request_state = quoted_include_request(result, node, &request);
+        }
+        if (request_state == CBM_NOT_FOUND) {
+            free(request);
+            cache->failed = true;
+            break;
+        }
+        if (request_state == 1 && request && request[0]) {
+            if (cache->count == cache->capacity) {
+                if (cache->capacity > INT_MAX / 2) {
+                    free(request);
+                    cache->failed = true;
+                    break;
+                }
+                int next_capacity = cache->capacity ? cache->capacity * 2 : 8;
+                if (next_capacity < cache->capacity ||
+                    (size_t)next_capacity > SIZE_MAX / sizeof(*cache->requests)) {
+                    free(request);
+                    cache->failed = true;
+                    break;
+                }
+                char **resized =
+                    realloc(cache->requests, (size_t)next_capacity * sizeof(*cache->requests));
+                if (!resized) {
+                    free(request);
+                    cache->failed = true;
+                    break;
+                }
+                cache->requests = resized;
+                cache->capacity = next_capacity;
+            }
+            cache->requests[cache->count++] = request;
+        } else {
+            free(request);
+        }
+
+        if (ts_tree_cursor_goto_first_child(&cursor)) {
+            continue;
+        }
+        while (!ts_tree_cursor_goto_next_sibling(&cursor)) {
+            if (!ts_tree_cursor_goto_parent(&cursor)) {
+                traversal_complete = true;
+                break;
+            }
+        }
+    }
+    ts_tree_cursor_delete(&cursor);
+    return cache->failed ? CBM_NOT_FOUND : 0;
+}
+
+static int validate_compiler_snapshot_path_budget(
+    cbm_pipeline_ctx_t *ctx, const compile_context_owner_t *owner,
+    const cbm_compile_context_index_t *index, const cbm_file_info_t *source_files, int source_count,
+    CBMFileResult *const *result_cache, quoted_include_cache_t *include_cache) {
     const char *relative_directory =
         path_relative_within(ctx ? ctx->repo_path : NULL, owner ? owner->directory : NULL);
-    if (!ctx || !ctx->source_root || !owner || !relative_directory) {
+    if (!ctx || !ctx->source_root || !owner || !relative_directory || !index || !source_files ||
+        source_count < 0 || (source_count > 0 && (!result_cache || !include_cache))) {
         return preprocess_fail(
-            ctx, "CBM_PREPROCESS_WORKING_DIRECTORY_UNPROJECTABLE",
-            "validate_compiler_path_budget",
+            ctx, "CBM_PREPROCESS_WORKING_DIRECTORY_UNPROJECTABLE", "validate_compiler_path_budget",
             owner && owner->tu_rel_path ? owner->tu_rel_path : "", 0,
             "the captured compiler working directory cannot be projected into the immutable "
             "snapshot",
@@ -510,48 +765,161 @@ static int validate_compiler_snapshot_path_budget(cbm_pipeline_ctx_t *ctx,
     }
     size_t longest_characters = 0;
     if (!compiler_windows_path_length(longest_path, &longest_characters)) {
-        int failure = preprocess_fail(
-            ctx, "CBM_PREPROCESS_PATH_ENCODING_INVALID", "validate_compiler_path_budget",
-            longest_path, strlen(longest_path),
-            "the projected compiler working directory is not valid UTF-8",
-            "repair the captured compiler directory encoding before indexing");
+        int failure =
+            preprocess_fail(ctx, "CBM_PREPROCESS_PATH_ENCODING_INVALID",
+                            "validate_compiler_path_budget", longest_path, strlen(longest_path),
+                            "the projected compiler working directory is not valid UTF-8",
+                            "repair the captured compiler directory encoding before indexing");
         free(longest_path);
         return failure;
     }
     size_t longest_bytes = strlen(longest_path);
     const char *longest_kind = "working_directory";
+    char *longest_normalized_target = NULL;
+    const char *longest_including_source = NULL;
+    const char *longest_include_request = NULL;
 
     for (int i = 0; i < owner->dependency_count; i++) {
         const char *dependency = owner->dependencies[i];
         char *projected = join_path(ctx->source_root, dependency);
         if (!projected) {
+            free(longest_normalized_target);
             free(longest_path);
             return preprocess_fail(
-                ctx, "CBM_PREPROCESS_PATH_BUDGET_ALLOC_FAILED",
-                "validate_compiler_path_budget", dependency, (size_t)i,
+                ctx, "CBM_PREPROCESS_PATH_BUDGET_ALLOC_FAILED", "validate_compiler_path_budget",
+                dependency, (size_t)i,
                 "one compiler dependency path could not be projected into the immutable snapshot",
                 "free memory and preserve the unchanged source generation for diagnosis");
         }
         size_t projected_characters = 0;
         if (!compiler_windows_path_length(projected, &projected_characters)) {
-            int failure = preprocess_fail(
-                ctx, "CBM_PREPROCESS_PATH_ENCODING_INVALID", "validate_compiler_path_budget",
-                projected, strlen(projected),
-                "one projected compiler dependency path is not valid UTF-8",
-                "repair the captured dependency path encoding before indexing");
+            int failure =
+                preprocess_fail(ctx, "CBM_PREPROCESS_PATH_ENCODING_INVALID",
+                                "validate_compiler_path_budget", projected, strlen(projected),
+                                "one projected compiler dependency path is not valid UTF-8",
+                                "repair the captured dependency path encoding before indexing");
             free(projected);
+            free(longest_normalized_target);
             free(longest_path);
             return failure;
         }
         size_t projected_bytes = strlen(projected);
         if (projected_characters > longest_characters) {
             free(longest_path);
+            free(longest_normalized_target);
             longest_path = projected;
+            longest_normalized_target = NULL;
             longest_bytes = projected_bytes;
             longest_characters = projected_characters;
             longest_kind = "repository_dependency";
+            longest_including_source = NULL;
+            longest_include_request = NULL;
         } else {
             free(projected);
+        }
+    }
+
+    /* GCC searches a quoted include relative to the including file before it
+     * normalizes `..`. MinGW hands that literal spelling to MAX_PATH-bound Win32
+     * APIs, so measuring only the normalized dependency can undercount the real
+     * compiler lookup. Inspect only this context's dependency closure and retain
+     * the literal spelling for admission. */
+    for (int dependency_index = 0; dependency_index < owner->dependency_count; dependency_index++) {
+        compile_context_set_owner_t *set = (compile_context_set_owner_t *)cbm_ht_get(
+            index->sets_by_rel_path, owner->dependencies[dependency_index]);
+        if (!set) {
+            continue;
+        }
+        if (set->source_index < 0 || set->source_index >= source_count) {
+            free(longest_normalized_target);
+            free(longest_path);
+            return preprocess_fail(
+                ctx, "CBM_PREPROCESS_TARGET_INDEX_INVALID", "measure_exact_include_paths",
+                set->rel_path, (size_t)(set->source_index < 0 ? 0 : set->source_index),
+                "a compiler dependency has no bounded immutable source index",
+                "preserve the generation and repair compilation-context materialization");
+        }
+        const cbm_file_info_t *source_file = &source_files[set->source_index];
+        CBMFileResult *result = result_cache[set->source_index];
+        if (!result || result->has_error) {
+            continue;
+        }
+        quoted_include_cache_t *source_include_cache = &include_cache[set->source_index];
+        if (load_quoted_include_cache(result, source_include_cache) != 0) {
+            free(longest_normalized_target);
+            free(longest_path);
+            return preprocess_fail(
+                ctx, "CBM_PREPROCESS_EXACT_INCLUDE_EXTRACT_FAILED", "extract_exact_include_paths",
+                source_file->rel_path, (size_t)(result->source_len < 0 ? 0 : result->source_len),
+                "quoted includes could not be read from retained immutable syntax/source",
+                "preserve the generation and repair retained syntax/source consistency");
+        }
+        for (int request_index = 0; request_index < source_include_cache->count; request_index++) {
+            const char *include_request = source_include_cache->requests[request_index];
+            if (!include_request || !include_request[0] || path_is_absolute(include_request)) {
+                continue;
+            }
+            bool escaped_repository_root = false;
+            char *normalized_target = normalize_relative_include(
+                source_file->rel_path, include_request, &escaped_repository_root);
+            if (!normalized_target) {
+                if (escaped_repository_root) {
+                    continue;
+                }
+                free(longest_normalized_target);
+                free(longest_path);
+                return preprocess_fail(
+                    ctx, "CBM_PREPROCESS_EXACT_INCLUDE_NORMALIZE_FAILED",
+                    "normalize_exact_include_path", source_file->rel_path, strlen(include_request),
+                    "an exact quoted include could not be normalized for path admission",
+                    "preserve the source generation and repair exact-include extraction");
+            }
+            const char *dependency_target = context_dependency_match(owner, normalized_target);
+            if (!dependency_target) {
+                free(normalized_target);
+                continue;
+            }
+
+            char *raw_lookup =
+                raw_snapshot_include_path(ctx, source_file->rel_path, include_request);
+            if (!raw_lookup) {
+                free(normalized_target);
+                free(longest_normalized_target);
+                free(longest_path);
+                return preprocess_fail(
+                    ctx, "CBM_PREPROCESS_PATH_BUDGET_ALLOC_FAILED", "measure_exact_include_paths",
+                    source_file->rel_path, strlen(include_request),
+                    "an exact quoted-include lookup path could not be represented",
+                    "free memory and preserve the unchanged source generation for diagnosis");
+            }
+            size_t raw_lookup_characters = 0;
+            if (!compiler_windows_path_length(raw_lookup, &raw_lookup_characters)) {
+                int failure =
+                    preprocess_fail(ctx, "CBM_PREPROCESS_PATH_ENCODING_INVALID",
+                                    "measure_exact_include_paths", raw_lookup, strlen(raw_lookup),
+                                    "an exact quoted-include lookup path is not valid UTF-8",
+                                    "repair the quoted include encoding before indexing");
+                free(raw_lookup);
+                free(normalized_target);
+                free(longest_normalized_target);
+                free(longest_path);
+                return failure;
+            }
+            if (raw_lookup_characters > longest_characters) {
+                free(longest_path);
+                free(longest_normalized_target);
+                longest_path = raw_lookup;
+                longest_normalized_target = normalized_target;
+                longest_bytes = strlen(raw_lookup);
+                longest_characters = raw_lookup_characters;
+                longest_kind = "exact_quoted_include_lookup";
+                longest_including_source = source_file->rel_path;
+                longest_include_request = include_request;
+            } else {
+                free(raw_lookup);
+                free(normalized_target);
+            }
+            (void)dependency_target;
         }
     }
 
@@ -562,20 +930,32 @@ static int validate_compiler_snapshot_path_budget(cbm_pipeline_ctx_t *ctx,
     snprintf(bytes_text, sizeof(bytes_text), "%zu", longest_bytes);
     snprintf(limit_text, sizeof(limit_text), "%d", MAX_PATH - 1);
     cbm_log_info("compiler_preprocess.path_budget", "translation_unit", owner->tu_rel_path,
-                 "context_id", owner->view.context_id, "longest_kind", longest_kind,
-                 "longest_path", longest_path, "longest_path_characters", length_text,
-                 "longest_path_utf8_bytes", bytes_text, "maximum_path_characters", limit_text,
-                 "compiler", "pinned_mingw_gcc");
+                 "context_id", owner->view.context_id, "longest_kind", longest_kind, "longest_path",
+                 longest_path, "longest_path_characters", length_text, "longest_path_utf8_bytes",
+                 bytes_text, "maximum_path_characters", limit_text, "including_source",
+                 longest_including_source ? longest_including_source : "", "include_request",
+                 longest_include_request ? longest_include_request : "", "normalized_target",
+                 longest_normalized_target ? longest_normalized_target : "", "compiler",
+                 "pinned_mingw_gcc");
     if (longest_characters >= MAX_PATH) {
+        cbm_log_error("compiler_preprocess.path_budget_exceeded", "translation_unit",
+                      owner->tu_rel_path, "context_id", owner->view.context_id, "longest_kind",
+                      longest_kind, "literal_lookup", longest_path, "including_source",
+                      longest_including_source ? longest_including_source : "", "include_request",
+                      longest_include_request ? longest_include_request : "", "normalized_target",
+                      longest_normalized_target ? longest_normalized_target : "",
+                      "maximum_path_characters", limit_text);
         int failure = preprocess_fail(
             ctx, "CBM_PREPROCESS_SNAPSHOT_PATH_TOO_LONG", "validate_compiler_path_budget",
             longest_path, longest_characters,
-            "a projected compiler input exceeds the pinned MinGW preprocessor path limit",
+            "a literal compiler lookup exceeds the pinned MinGW preprocessor path limit",
             "select a shorter project store root through CBM_CACHE_DIR; Astrolabe never reads "
             "live source or mutates host long-path policy");
+        free(longest_normalized_target);
         free(longest_path);
         return failure;
     }
+    free(longest_normalized_target);
     free(longest_path);
     return 0;
 }
@@ -2179,8 +2559,7 @@ static int compiler_spawn_fail(cbm_pipeline_ctx_t *ctx,
 }
 #endif
 
-int cbm_compile_context_extract_calls(cbm_pipeline_ctx_t *ctx,
-                                      cbm_compile_context_index_t *index,
+int cbm_compile_context_extract_calls(cbm_pipeline_ctx_t *ctx, cbm_compile_context_index_t *index,
                                       const cbm_file_info_t *source_files, int source_count,
                                       CBMFileResult **result_cache) {
     if (!ctx || !index || !source_files || source_count < 0 ||
@@ -2191,15 +2570,14 @@ int cbm_compile_context_extract_calls(cbm_pipeline_ctx_t *ctx,
             "preserve the generation and repair the context/source/result ownership boundary");
     }
     if (index->authority_absent || index->context_count == 0) {
-        cbm_log_info("compiler_preprocess.ready", "compiler_invocations", "0", "syntax_trees",
-                     "0", "target_projections", "0", "expanded_bytes", "0", "mapped_lines",
-                     "0", "workspace_local_compiler_markers", "0", "peak_expansion_bytes",
-                     "0", "authority",
-                     index->authority_absent ? "absent" : "not_applicable", "cache",
+        cbm_log_info("compiler_preprocess.ready", "compiler_invocations", "0", "syntax_trees", "0",
+                     "target_projections", "0", "expanded_bytes", "0", "mapped_lines", "0",
+                     "workspace_local_compiler_markers", "0", "peak_expansion_bytes", "0",
+                     "authority", index->authority_absent ? "absent" : "not_applicable", "cache",
                      "one_compiler_expansion_per_context", "canonicalization",
-                     "validated_linemarkers_to_empty_lines", "date_time_macros",
-                     "not_applicable", "timestamp_macro_input", "not_applicable",
-                     "source_date_epoch", "not_applicable", "fallback", "none");
+                     "validated_linemarkers_to_empty_lines", "date_time_macros", "not_applicable",
+                     "timestamp_macro_input", "not_applicable", "source_date_epoch",
+                     "not_applicable", "fallback", "none");
         return 0;
     }
 #ifndef ASTRO_SPAWN
@@ -2210,6 +2588,7 @@ int cbm_compile_context_extract_calls(cbm_pipeline_ctx_t *ctx,
         "build the native Astrolabe artifact with its shell-free spawn authority enabled");
 #else
     if ((size_t)source_count > SIZE_MAX / sizeof(uint32_t) ||
+        (size_t)source_count > SIZE_MAX / sizeof(quoted_include_cache_t) ||
         (size_t)index->set_count > SIZE_MAX / sizeof(char *) ||
         (size_t)index->set_count > SIZE_MAX / sizeof(CBMFileResult *)) {
         return preprocess_fail(
@@ -2220,26 +2599,24 @@ int cbm_compile_context_extract_calls(cbm_pipeline_ctx_t *ctx,
     }
     uint32_t *target_by_source_index =
         source_count > 0 ? malloc((size_t)source_count * sizeof(*target_by_source_index)) : NULL;
-    const char **target_rel_paths = index->set_count > 0
-                                         ? malloc((size_t)index->set_count *
-                                                  sizeof(*target_rel_paths))
-                                         : NULL;
+    const char **target_rel_paths =
+        index->set_count > 0 ? malloc((size_t)index->set_count * sizeof(*target_rel_paths)) : NULL;
     CBMFileResult **target_results =
-        index->set_count > 0
-            ? malloc((size_t)index->set_count * sizeof(*target_results))
-            : NULL;
+        index->set_count > 0 ? malloc((size_t)index->set_count * sizeof(*target_results)) : NULL;
     bool *touched = source_count > 0 ? calloc((size_t)source_count, sizeof(*touched)) : NULL;
-    if ((source_count > 0 && (!target_by_source_index || !touched)) ||
+    quoted_include_cache_t *include_cache =
+        source_count > 0 ? calloc((size_t)source_count, sizeof(*include_cache)) : NULL;
+    if ((source_count > 0 && (!target_by_source_index || !touched || !include_cache)) ||
         (index->set_count > 0 && (!target_rel_paths || !target_results))) {
         free(target_by_source_index);
         free(target_rel_paths);
         free(target_results);
         free(touched);
-        return preprocess_fail(
-            ctx, "CBM_PREPROCESS_TARGET_ALLOC_FAILED", "allocate_projection_index",
-            ctx->repo_path, (size_t)source_count,
-            "the compiler-preprocess target index could not be allocated",
-            "free memory or reduce concurrent repository workload, then retry");
+        free_quoted_include_cache(include_cache, source_count);
+        return preprocess_fail(ctx, "CBM_PREPROCESS_TARGET_ALLOC_FAILED",
+                               "allocate_projection_index", ctx->repo_path, (size_t)source_count,
+                               "the compiler-preprocess target index could not be allocated",
+                               "free memory or reduce concurrent repository workload, then retry");
     }
 
     cbm_sha256_ctx expansion_set_hash;
@@ -2264,7 +2641,8 @@ int cbm_compile_context_extract_calls(cbm_pipeline_ctx_t *ctx,
             break;
         }
         const compile_context_owner_t *owner = &index->contexts[context_index];
-        if (validate_compiler_snapshot_path_budget(ctx, owner) != 0) {
+        if (validate_compiler_snapshot_path_budget(ctx, owner, index, source_files, source_count,
+                                                   result_cache, include_cache) != 0) {
             status = CBM_NOT_FOUND;
             break;
         }
@@ -2300,8 +2678,8 @@ int cbm_compile_context_extract_calls(cbm_pipeline_ctx_t *ctx,
             }
             if (target_count >= (size_t)UINT32_MAX) {
                 status = preprocess_fail(
-                    ctx, "CBM_PREPROCESS_TARGET_CAPACITY_OVERFLOW",
-                    "prepare_projection_targets", owner->tu_rel_path, target_count,
+                    ctx, "CBM_PREPROCESS_TARGET_CAPACITY_OVERFLOW", "prepare_projection_targets",
+                    owner->tu_rel_path, target_count,
                     "one translation unit has too many repository projection targets",
                     "split the translation unit or extend the source-map representation");
                 break;
@@ -2331,7 +2709,8 @@ int cbm_compile_context_extract_calls(cbm_pipeline_ctx_t *ctx,
             status = preprocess_fail(
                 ctx, "CBM_PREPROCESS_ARGV_BUILD_FAILED", "build_exact_compiler_argv",
                 owner->tu_rel_path, (size_t)owner->preprocess_argument_count,
-                "the exact compiler argument vector could not be projected to the immutable snapshot",
+                "the exact compiler argument vector could not be projected to the immutable "
+                "snapshot",
                 "preserve the manifest and repair path/action argument classification");
             break;
         }
@@ -2369,47 +2748,41 @@ int cbm_compile_context_extract_calls(cbm_pipeline_ctx_t *ctx,
             char working_directory_markers_text[32];
             sha256_hex(expansion.text, expansion.text_bytes, expansion_hash);
             snprintf(bytes_text, sizeof(bytes_text), "%zu", expansion.text_bytes);
-            snprintf(stdout_bytes_text, sizeof(stdout_bytes_text), "%zu",
-                     compiler_stdout_bytes);
+            snprintf(stdout_bytes_text, sizeof(stdout_bytes_text), "%zu", compiler_stdout_bytes);
             snprintf(targets_text, sizeof(targets_text), "%zu", target_count);
             snprintf(stderr_text, sizeof(stderr_text), "%llu",
                      (unsigned long long)stderr_total_bytes);
             snprintf(workspace_local_compiler_markers_text,
                      sizeof(workspace_local_compiler_markers_text), "%zu",
                      expansion.workspace_local_compiler_markers);
-            snprintf(working_directory_markers_text,
-                     sizeof(working_directory_markers_text), "%zu",
+            snprintf(working_directory_markers_text, sizeof(working_directory_markers_text), "%zu",
                      expansion.working_directory_markers);
             cbm_sha256_update(&expansion_set_hash, owner->view.context_id,
                               strlen(owner->view.context_id));
             cbm_sha256_update(&expansion_set_hash, "\0", 1);
             cbm_sha256_update(&expansion_set_hash, expansion.text, expansion.text_bytes);
-            cbm_log_info(
-                "compiler_preprocess.context", "translation_unit", owner->tu_rel_path,
-                "context_id", owner->view.context_id, "compiler_stdout_bytes",
-                stdout_bytes_text, "expanded_bytes", bytes_text, "expanded_sha256",
-                expansion_hash, "projection_targets", targets_text, "stderr_total_bytes",
-                stderr_text, "stderr_truncated", stderr_truncated ? "true" : "false",
-                "canonicalization", "validated_linemarkers_to_empty_lines",
-                "workspace_local_compiler_markers",
-                workspace_local_compiler_markers_text,
-                "working_directory_markers", working_directory_markers_text,
-                "source_date_epoch", index->source_date_epoch,
-                "source_date_epoch_provenance", "git_head_commit",
-                "source_date_epoch_revision", index->source_date_epoch_revision,
-                "timestamp_macro_input", "immutable_snapshot_last_write_time");
+            cbm_log_info("compiler_preprocess.context", "translation_unit", owner->tu_rel_path,
+                         "context_id", owner->view.context_id, "compiler_stdout_bytes",
+                         stdout_bytes_text, "expanded_bytes", bytes_text, "expanded_sha256",
+                         expansion_hash, "projection_targets", targets_text, "stderr_total_bytes",
+                         stderr_text, "stderr_truncated", stderr_truncated ? "true" : "false",
+                         "canonicalization", "validated_linemarkers_to_empty_lines",
+                         "workspace_local_compiler_markers", workspace_local_compiler_markers_text,
+                         "working_directory_markers", working_directory_markers_text,
+                         "source_date_epoch", index->source_date_epoch,
+                         "source_date_epoch_provenance", "git_head_commit",
+                         "source_date_epoch_revision", index->source_date_epoch_revision,
+                         "timestamp_macro_input", "immutable_snapshot_last_write_time");
             char *diagnostic = NULL;
             status = cbm_extract_preprocessed_translation_unit(
-                expansion.text, expansion.text_bytes, owner->view.cpp_mode,
-                owner->view.context_id, expansion.line_targets, expansion.line_source_lines,
-                expansion.line_count, ctx->project_name, target_rel_paths, target_results,
-                target_count, &diagnostic);
+                expansion.text, expansion.text_bytes, owner->view.cpp_mode, owner->view.context_id,
+                expansion.line_targets, expansion.line_source_lines, expansion.line_count,
+                ctx->project_name, target_rel_paths, target_results, target_count, &diagnostic);
             if (status != 0) {
                 status = preprocess_fail(
                     ctx, "CBM_PREPROCESS_PROJECTION_FAILED", "extract_compiler_expansion",
                     owner->tu_rel_path, expansion.text_bytes,
-                    diagnostic ? diagnostic
-                               : "the exact compiler expansion could not be projected",
+                    diagnostic ? diagnostic : "the exact compiler expansion could not be projected",
                     "preserve the mapped expansion diagnostic, repair the cause, and retry");
             }
             free(diagnostic);
@@ -2446,7 +2819,8 @@ int cbm_compile_context_extract_calls(cbm_pipeline_ctx_t *ctx,
                     ctx, "CBM_PREPROCESS_RESULT_FINALIZE_FAILED", "finalize_contextual_calls",
                     source_files[source_index].rel_path, (size_t)source_index,
                     "compiler-derived call facts could not be finalized into exact retained arrays",
-                    "inspect the file-result diagnostic, free memory, and retry the complete corpus");
+                    "inspect the file-result diagnostic, free memory, and retry the complete "
+                    "corpus");
                 break;
             }
         }
@@ -2475,29 +2849,24 @@ int cbm_compile_context_extract_calls(cbm_pipeline_ctx_t *ctx,
                  (unsigned long long)expanded_bytes_total);
         snprintf(total_stdout_bytes_text, sizeof(total_stdout_bytes_text), "%llu",
                  (unsigned long long)compiler_stdout_bytes_total);
-        snprintf(mapped_text, sizeof(mapped_text), "%llu",
-                 (unsigned long long)mapped_lines_total);
+        snprintf(mapped_text, sizeof(mapped_text), "%llu", (unsigned long long)mapped_lines_total);
         snprintf(workspace_local_compiler_markers_text,
                  sizeof(workspace_local_compiler_markers_text), "%llu",
                  (unsigned long long)workspace_local_compiler_markers_total);
-        snprintf(working_directory_markers_text,
-                 sizeof(working_directory_markers_text), "%llu",
+        snprintf(working_directory_markers_text, sizeof(working_directory_markers_text), "%llu",
                  (unsigned long long)working_directory_markers_total);
         snprintf(peak_text, sizeof(peak_text), "%zu", peak_expansion_bytes);
-        snprintf(peak_stdout_text, sizeof(peak_stdout_text), "%zu",
-                 peak_compiler_stdout_bytes);
+        snprintf(peak_stdout_text, sizeof(peak_stdout_text), "%zu", peak_compiler_stdout_bytes);
         cbm_log_info(
             "compiler_preprocess.ready", "compiler_invocations", contexts_text, "syntax_trees",
             contexts_text, "target_projections", projections_text, "expanded_bytes",
             total_bytes_text, "compiler_stdout_bytes", total_stdout_bytes_text, "mapped_lines",
-            mapped_text, "workspace_local_compiler_markers",
-            workspace_local_compiler_markers_text, "working_directory_markers",
-            working_directory_markers_text, "peak_expansion_bytes", peak_text,
-            "peak_compiler_stdout_bytes", peak_stdout_text, "expansion_set_sha256", set_hash, "cache",
-            "one_compiler_expansion_per_context", "canonicalization",
-            "validated_linemarkers_to_empty_lines", "date_time_macros",
-            "git_source_date_epoch", "timestamp_macro_input",
-            "immutable_snapshot_last_write_time", "source_date_epoch",
+            mapped_text, "workspace_local_compiler_markers", workspace_local_compiler_markers_text,
+            "working_directory_markers", working_directory_markers_text, "peak_expansion_bytes",
+            peak_text, "peak_compiler_stdout_bytes", peak_stdout_text, "expansion_set_sha256",
+            set_hash, "cache", "one_compiler_expansion_per_context", "canonicalization",
+            "validated_linemarkers_to_empty_lines", "date_time_macros", "git_source_date_epoch",
+            "timestamp_macro_input", "immutable_snapshot_last_write_time", "source_date_epoch",
             index->source_date_epoch, "source_date_epoch_revision",
             index->source_date_epoch_revision, "fallback", "none");
     }
@@ -2505,6 +2874,7 @@ int cbm_compile_context_extract_calls(cbm_pipeline_ctx_t *ctx,
     free(target_rel_paths);
     free(target_results);
     free(touched);
+    free_quoted_include_cache(include_cache, source_count);
     return status;
 #endif
 }
