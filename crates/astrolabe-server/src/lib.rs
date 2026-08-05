@@ -943,12 +943,25 @@ fn run_verify(args: &[String]) -> Result<i32, DynError> {
         return Err(format!("unknown verify arguments: {}", args.join(" ")).into());
     }
 
-    let report = astrolabe_ingest::verify_deep_vault_path(vault, &vault_id, &vault_salt)?;
+    let report = astrolabe_ingest::verify_deep_vault_path(&vault, &vault_id, &vault_salt)?;
+    let complete_associations = astrolabe_weave::read_complete_association_state_vault_path(
+        &vault,
+        &vault_id,
+        &vault_salt,
+    )?;
     if raw_json {
-        println!("{}", serde_json::to_string(&report)?);
+        let mut payload = serde_json::to_value(&report)?;
+        let object = payload
+            .as_object_mut()
+            .ok_or("verify --deep report did not serialize as an object")?;
+        object.insert(
+            "complete_associations".to_string(),
+            serde_json::to_value(&complete_associations)?,
+        );
+        println!("{}", serde_json::to_string(&payload)?);
     } else {
         println!(
-            "series registry verified: series_rows={} reverse_rows={} qn_index_rows={} recurrence_rows={} split_rows={} sqlite_node_map_rows={} sqlite_structural_rows={} sqlite_constellation_rows={} sqlite_edge_rows={} ledger_chain_status={} ledger_rows={} ledger_payload_rows={} base_ledger_pairs={}",
+            "series registry verified: series_rows={} reverse_rows={} qn_index_rows={} recurrence_rows={} split_rows={} sqlite_node_map_rows={} sqlite_structural_rows={} sqlite_constellation_rows={} sqlite_edge_rows={} ledger_chain_status={} ledger_rows={} ledger_payload_rows={} base_ledger_pairs={} association_constellations={} association_pairs={} association_computed={} association_typed_incompatible={} association_witness_state_hash={}",
             report.series_rows,
             report.reverse_rows,
             report.qn_index_rows,
@@ -961,7 +974,12 @@ fn run_verify(args: &[String]) -> Result<i32, DynError> {
             report.ledger_chain_status,
             report.ledger_rows,
             report.ledger_payload_rows,
-            report.base_ledger_pairs
+            report.base_ledger_pairs,
+            complete_associations.constellation_count,
+            complete_associations.expected_pair_count,
+            complete_associations.computed_pair_count,
+            complete_associations.typed_incompatible_pair_count,
+            complete_associations.witness_state_hash,
         );
     }
     Ok(0)

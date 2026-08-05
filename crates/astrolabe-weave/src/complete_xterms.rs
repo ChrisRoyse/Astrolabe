@@ -9,15 +9,18 @@
 //! before using their source hash to skip unchanged records.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::Path;
+use std::str::FromStr;
 
 use astrolabe_domain::fsv::FsvAck;
 use astrolabe_ingest::VaultMutationPlan;
 use calyx_aster::cf::{ColumnFamily, prefix_range};
 use calyx_aster::mvcc::tombstone_value;
-use calyx_aster::vault::AsterVault;
 use calyx_aster::vault::encode::{BaseRecord, decode_slot_vector};
+use calyx_aster::vault::{AsterVault, VaultOptions};
 use calyx_core::{
-    AbsentReason, CalyxError, Clock, CxId, LedgerRef, SlotId, SlotVector, SparseEntry, VaultStore,
+    AbsentReason, CalyxError, Clock, CxId, LedgerRef, SlotId, SlotVector, SparseEntry, VaultId,
+    VaultStore,
 };
 use calyx_ledger::{ActorId, EntryKind, SubjectId};
 use rayon::prelude::*;
@@ -220,6 +223,25 @@ where
     C: Clock,
 {
     Ok(read_persisted_state_at(vault, vault.snapshot())?.public)
+}
+
+/// Opens the real durable vault read-only and independently verifies every
+/// completion witness and raw complete-pair XTerm row.
+pub fn read_complete_association_state_vault_path(
+    vault_dir: impl AsRef<Path>,
+    vault_id: &str,
+    vault_salt: &str,
+) -> calyx_core::Result<CompleteAssociationState> {
+    let vault_id = VaultId::from_str(vault_id)
+        .map_err(|error| source_corrupt(format!("invalid vault id: {error}")))?;
+    let options = VaultOptions {
+        read_only: true,
+        restore_ledger_hook: false,
+        selected_cfs: None,
+        ..VaultOptions::default()
+    };
+    let vault = AsterVault::open(vault_dir, vault_id, vault_salt.as_bytes().to_vec(), options)?;
+    read_complete_association_state(&vault)
 }
 
 pub fn reconcile_complete_associations<C>(

@@ -51,7 +51,7 @@ pub use complete_xterms::{
     COMPLETE_PAIR_ROW_PREFIX, COMPLETE_PAIR_ROW_SCHEMA, COMPLETE_WITNESS_PREFIX,
     COMPLETE_WITNESS_SCHEMA, CompleteAssociationPersistReport, CompleteAssociationState,
     PairMetricCounts, PairReasonCounts, read_complete_association_state,
-    reconcile_complete_associations,
+    read_complete_association_state_vault_path, reconcile_complete_associations,
 };
 pub use drift_producer::{
     DRIFT_REFERENCE_CHUNK_BUDGET_KNOB, DRIFT_REFERENCE_DEFAULT_CHUNK_BUDGET_BYTES,
