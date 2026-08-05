@@ -1,12 +1,9 @@
-//! XTerm CF persistence for the six designed eager agreement cross-terms.
+//! XTerm CF persistence for the six specialized agreement comparators.
 //!
-//! Materialization policy (blueprint 07 §4): of the 231 possible slot pairs
-//! per symbol, exactly the six designed agreement pairs are persisted eagerly;
-//! every other pair stays lazy (computed on demand, never persisted
-//! per-record — the pair-gain interaction gate lands in P5). Absent
-//! cross-terms are never written as zeros: a row is persisted only for a
-//! scalar value, and every absent row is counted per reason in the persist
-//! report and its paired ledger entry.
+//! These six rows serve anomaly and architecture consumers. They do not claim
+//! active-panel completeness: `complete_xterms` independently persists every
+//! applicable unordered base pair plus an exact completion witness. Absent
+//! specialized comparisons are never written as zeros.
 //!
 //! Rows are loom-native [`XtermRow`] JSON at `xterm_key(cx, left, right,
 //! Agreement)` — the exact shape `live_anomaly_inputs_from_vault` already
@@ -35,7 +32,7 @@ use crate::{
 };
 
 /// Ledger payload schema for an eager cross-term persistence group commit.
-pub const XTERM_EAGER_LEDGER_SCHEMA: &str = "astrolabe.eager_xterm.v1";
+pub const XTERM_EAGER_LEDGER_SCHEMA: &str = "astrolabe.eager_xterm.v2";
 /// Stable schema for the `get_architecture` agreement-graph aspect payload.
 pub const AGREEMENT_GRAPH_ASPECT_SCHEMA: &str = "astrolabe.agreement_graph_aspect.v1";
 /// Provenance label naming the physical source of the agreement-graph aspect.
@@ -234,14 +231,10 @@ where
         "absent_by_kind": absent_counts,
         "abundance": {
             "symbol_count": plan.abundance.symbol_count,
-            "panel_slot_count": plan.abundance.panel_slot_count,
-            "possible_pair_count_per_symbol": plan.abundance.possible_pair_count_per_symbol,
-            "raw_yield": plan.abundance.raw_yield,
-            "eager_pair_count_per_symbol": plan.abundance.eager_pair_count_per_symbol,
+            "designed_pair_count_per_symbol": plan.abundance.designed_pair_count_per_symbol,
             "materialized_count": plan.abundance.materialized_count,
             "scalar_count": plan.abundance.scalar_count,
             "absent_count": plan.abundance.absent_count,
-            "unevaluated_pair_count": plan.abundance.unevaluated_pair_count,
         },
         "xterm_dump_hash": xterm_dump_hash,
     }))
@@ -497,20 +490,6 @@ where
         freshness: "fresh",
         trust: "verified",
     })
-}
-
-/// Computes one lazy (non-designed) agreement on demand.
-///
-/// Lazy pairs are never persisted per-record; this recomputes the direct
-/// agreement between two slots of one symbol from its in-memory slot vectors,
-/// returning the same absent-aware [`CrossTermValue`] semantics as the eager
-/// planner. Corpus-wide lazy assay caching lands with the P5 pair-gain gate.
-pub fn lazy_agreement(
-    node: &crate::SimilarityNode,
-    left_slot: SlotId,
-    right_slot: SlotId,
-) -> CrossTermValue {
-    crate::lazy_direct_agreement(node, left_slot, right_slot)
 }
 
 /// Canonical byte dump of a plan's persisted scalar rows (for the ledger

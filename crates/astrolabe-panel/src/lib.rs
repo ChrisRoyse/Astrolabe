@@ -821,7 +821,7 @@ pub fn slots_for_version(version: u32) -> PanelResult<&'static [PanelSlotSpec]> 
         other => Err(PanelError::new(
             ASTRO_PANEL_CONTRACT_INVALID,
             format!("panel version {other} has no frozen slot roster"),
-            "Measure with panel version 1 (S0-S22), 2 (S0-S23), or 3 (S0-S173).",
+            "Measure with panel version 1 (S0-S22), 2 (S0-S23), or 3 (S0-S185).",
         )),
     }
 }

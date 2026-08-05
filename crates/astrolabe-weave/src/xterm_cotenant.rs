@@ -28,13 +28,20 @@ use std::collections::BTreeSet;
 /// `astrolabe_kernel::PLACEMENT_TRUTH_SCHEMA` (the writer-side const) so the two
 /// can never silently drift.
 pub const XTERM_PLACEMENT_TRUTH_COTENANT_SCHEMA: &str = "astrolabe.placement_truth.v1";
+/// Schema tag for exhaustive Astrolabe base-association rows. These rows use a
+/// prefix-disjoint XTerm key family and carry either an exact scalar bit pattern
+/// or an explicit typed-incompatibility witness.
+pub const XTERM_COMPLETE_PAIR_COTENANT_SCHEMA: &str = "astrolabe.complete_pair.v1";
 
 /// The set of foreign schema tags a co-tenant-aware XTerm reader accepts as
 /// counted skips rather than decoding as loom rows.
 pub fn accepted_xterm_cotenant_schemas() -> BTreeSet<&'static str> {
-    [XTERM_PLACEMENT_TRUTH_COTENANT_SCHEMA]
-        .into_iter()
-        .collect()
+    [
+        XTERM_PLACEMENT_TRUTH_COTENANT_SCHEMA,
+        XTERM_COMPLETE_PAIR_COTENANT_SCHEMA,
+    ]
+    .into_iter()
+    .collect()
 }
 
 /// Positively extracts the top-level `schema` tag of a non-[`XtermRow`]

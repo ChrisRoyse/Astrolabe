@@ -38,6 +38,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 mod ann;
+mod complete_xterms;
 pub mod drift_producer;
 pub mod signal_cards;
 mod sim_rows;
@@ -45,6 +46,13 @@ mod xterm_cotenant;
 mod xterm_rows;
 
 pub use ann::{AnnFamilyReport, QuantScaleMeasurement};
+pub use complete_xterms::{
+    ASTRO_XTERM_COMPLETION_CORRUPT, ASTRO_XTERM_COMPLETION_OVERFLOW, ASTRO_XTERM_SOURCE_CORRUPT,
+    COMPLETE_PAIR_ROW_PREFIX, COMPLETE_PAIR_ROW_SCHEMA, COMPLETE_WITNESS_PREFIX,
+    COMPLETE_WITNESS_SCHEMA, CompleteAssociationPersistReport, CompleteAssociationState,
+    PairMetricCounts, PairReasonCounts, read_complete_association_state,
+    reconcile_complete_associations,
+};
 pub use drift_producer::{
     DRIFT_REFERENCE_CHUNK_BUDGET_KNOB, DRIFT_REFERENCE_DEFAULT_CHUNK_BUDGET_BYTES,
     DRIFT_REFERENCE_DEFAULT_SAMPLE_CAP, DRIFT_REFERENCE_KNOB_REGISTRY_VERSION,
@@ -76,8 +84,8 @@ pub use sim_rows::{
     read_similarity_edge_rows, sim_edge_graph_key,
 };
 pub use xterm_cotenant::{
-    XTERM_PLACEMENT_TRUTH_COTENANT_SCHEMA, accepted_xterm_cotenant_schemas,
-    is_accepted_xterm_cotenant, xterm_cotenant_schema_tag,
+    XTERM_COMPLETE_PAIR_COTENANT_SCHEMA, XTERM_PLACEMENT_TRUTH_COTENANT_SCHEMA,
+    accepted_xterm_cotenant_schemas, is_accepted_xterm_cotenant, xterm_cotenant_schema_tag,
 };
 pub use xterm_rows::{
     AGREEMENT_GRAPH_ASPECT_PROVENANCE, AGREEMENT_GRAPH_ASPECT_SCHEMA, ASTRO_XTERM_CX_ID_MISSING,
@@ -85,7 +93,7 @@ pub use xterm_rows::{
     PersistedAgreementEdge, PersistedEagerCrossTermRow, XTERM_EAGER_LEDGER_SCHEMA,
     agreement_graph_aspect, agreement_graph_from_persisted_rows,
     agreement_graph_from_persisted_rows_with_cotenants, designed_kind_for_slots,
-    eager_xterm_dump_bytes, eager_xterm_key, lazy_agreement, persist_eager_cross_terms,
+    eager_xterm_dump_bytes, eager_xterm_key, persist_eager_cross_terms,
     persist_eager_cross_terms_delta, read_eager_cross_term_rows,
     read_eager_cross_term_rows_with_cotenants,
 };
@@ -1282,18 +1290,11 @@ pub struct AgreementGraphEdge {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CrossTermAbundance {
     pub symbol_count: usize,
-    pub panel_slot_count: usize,
-    pub possible_pair_count_per_symbol: usize,
-    pub raw_yield: usize,
-    pub eager_pair_count_per_symbol: usize,
+    /// The declared specialized comparators this plan actually evaluates.
+    pub designed_pair_count_per_symbol: usize,
     pub materialized_count: usize,
     pub scalar_count: usize,
     pub absent_count: usize,
-    /// Active-slot pairs that carry no production consumer and are therefore
-    /// neither materialized nor evaluated. Never labeled `lazy`: a pair is only
-    /// `lazy` if a real production caller evaluates it on demand, and no such
-    /// caller exists for these (#522).
-    pub unevaluated_pair_count: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -2917,27 +2918,19 @@ fn plan_eager_cross_terms_selected(
         .count();
     let absent_count = rows.len() - scalar_count;
     let symbol_count = selected_indices.len();
-    // Abundance is derived from the persisted panel roster (N active slots),
-    // never a compiled-in constant: possible pairs per symbol is C(N, 2), and
-    // the raw yield spans the N unary slots, the C(N, 2) pairs, and the symbol
-    // itself (#522). `validate_active_roster` has already proven N hosts the
-    // designed eager pairs, so `possible_pairs >= eager` holds.
-    let n = active_slot_count;
-    let possible_pairs = n * (n - 1) / 2;
+    // This is deliberately a specialized-comparator report, not an active-panel
+    // abundance claim. Exhaustive applicable-roster counts and the strict
+    // computed+typed-incompatible equation are owned by complete_xterms (#522).
     let eager = EagerAgreementKind::ALL.len();
     Ok(EagerCrossTermPlan {
         rows,
         agreement_graph,
         abundance: CrossTermAbundance {
             symbol_count,
-            panel_slot_count: n,
-            possible_pair_count_per_symbol: possible_pairs,
-            raw_yield: symbol_count * (n + possible_pairs + 1),
-            eager_pair_count_per_symbol: eager,
+            designed_pair_count_per_symbol: eager,
             materialized_count: symbol_count * eager,
             scalar_count,
             absent_count,
-            unevaluated_pair_count: symbol_count * (possible_pairs - eager),
         },
         neighborhood_sample_cap: sample_cap,
         neighborhood_capped_evaluations,
@@ -3193,19 +3186,6 @@ fn neighborhood_cross_term_value(
         norm: right_norm,
     };
     direct_cross_term_value(&Ok(left_profile), &Ok(right_profile))
-}
-
-/// Computes the direct agreement between two slots of one symbol with the
-/// eager planner's absent-aware semantics (used by the lazy on-demand path).
-pub(crate) fn lazy_direct_agreement(
-    node: &SimilarityNode,
-    left_slot: SlotId,
-    right_slot: SlotId,
-) -> CrossTermValue {
-    direct_cross_term_value(
-        &cross_term_operand(node, left_slot),
-        &cross_term_operand(node, right_slot),
-    )
 }
 
 fn cross_term_operand(

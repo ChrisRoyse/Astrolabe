@@ -2528,6 +2528,14 @@ where
         }
         None => persist_eager_cross_terms(vault, &xterm_plan, &cx_ids, "astrolabe-shadow-weave")?,
     };
+    // The six designed agreements above remain the anomaly/architecture
+    // comparators. The complete lane independently derives every applicable
+    // roster from persisted Base + hash-verified Slot rows, then materializes one
+    // prefix-disjoint XTerm witness for every unordered pair (#522/#980). It
+    // validates existing completion bytes before source-hash skipping, so an
+    // unchanged constellation avoids all pair arithmetic and all ledger writes.
+    let complete_xterms =
+        reconcile_complete_associations(vault, "astrolabe-shadow-complete-associations")?;
     let ms_xterm = t_xterm.elapsed().as_millis() as u64;
     let absent_by_kind = xterm
         .absent_by_kind
@@ -2595,6 +2603,24 @@ where
             // means the plan is byte-identical to the uncapped path.
             "neighborhood_sample_cap": xterm_plan.neighborhood_sample_cap,
             "neighborhood_capped_evaluations": xterm_plan.neighborhood_capped_evaluations,
+        },
+        "complete_associations": {
+            "constellations_total": complete_xterms.constellations_total,
+            "constellations_recomputed": complete_xterms.constellations_recomputed,
+            "constellations_unchanged": complete_xterms.constellations_unchanged,
+            "constellations_removed": complete_xterms.constellations_removed,
+            "rows_written": complete_xterms.rows_written,
+            "rows_unchanged": complete_xterms.rows_unchanged,
+            "rows_tombstoned": complete_xterms.rows_tombstoned,
+            "witnesses_written": complete_xterms.witnesses_written,
+            "witnesses_tombstoned": complete_xterms.witnesses_tombstoned,
+            "commit_count": complete_xterms.commit_count,
+            "ledger_ref": complete_xterms.ledger_ref.as_ref().map(|ledger_ref| json!({
+                "seq": ledger_ref.seq,
+                "entry_hash": hex_lower(&ledger_ref.hash),
+            })),
+            "fsv": complete_xterms.fsv.iter().map(fsv_ack_envelope).collect::<Vec<_>>(),
+            "state": complete_xterms.state,
         },
     }))
 }

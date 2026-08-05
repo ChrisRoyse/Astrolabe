@@ -10,6 +10,7 @@ publish.workspace = true
 astrolabe-assay.workspace = true
 astrolabe-domain.workspace = true
 astrolabe-ingest.workspace = true
+astrolabe-panel.workspace = true
 calyx-aster.workspace = true
 calyx-assay.workspace = true
 calyx-core.workspace = true

@@ -66,7 +66,7 @@ use astrolabe_weave::{
     live_anomaly_inputs_from_vault, persist_eager_cross_terms, persist_eager_cross_terms_delta,
     persist_similarity_edges, persist_similarity_edges_delta, plan_eager_cross_terms,
     plan_eager_cross_terms_for_symbols, plan_similarity_edges, read_similarity_edge_rows,
-    recover_reactive_state, run_index_time_drift,
+    reconcile_complete_associations, recover_reactive_state, run_index_time_drift,
 };
 use calyx_aster::cf::{ColumnFamily, slot_key};
 use calyx_aster::ledger_view::parse_aster_ledger_seq;
