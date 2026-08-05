@@ -1465,10 +1465,19 @@ pub const SEMANTIC_RULES: &[SemanticRule] = &[
         Path,
         "sem.edge.url_path_gen"
     ),
+    rule!(
+        144,
+        175,
+        Node,
+        "properties.compile_context_count",
+        Integer,
+        Numeric,
+        "sem.node.compile_context_count"
+    ),
 ];
 
 /// Last slot id in the v3 frozen roster.
-pub const SEMANTIC_SLOT_END: u16 = 174;
+pub const SEMANTIC_SLOT_END: u16 = 175;
 
 const PRESENCE_SLOTS: &[PanelSlotSpec] = &[
     presence_slot(24, "sem.presence.project"),
