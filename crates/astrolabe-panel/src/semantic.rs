@@ -1474,10 +1474,91 @@ pub const SEMANTIC_RULES: &[SemanticRule] = &[
         Numeric,
         "sem.node.compile_context_count"
     ),
+    rule!(
+        145,
+        176,
+        Node,
+        "properties.compile_context_code",
+        Text,
+        Category,
+        "sem.node.compile_context_code"
+    ),
+    rule!(
+        146,
+        177,
+        Node,
+        "properties.compile_context_ids[]",
+        TextArray,
+        Set,
+        "sem.node.compile_context_ids"
+    ),
+    rule!(
+        147,
+        178,
+        Node,
+        "properties.compile_context_reason",
+        Text,
+        Category,
+        "sem.node.compile_context_reason"
+    ),
+    rule!(
+        148,
+        179,
+        Node,
+        "properties.compile_context_state",
+        Text,
+        Category,
+        "sem.node.compile_context_state"
+    ),
+    rule!(
+        149,
+        180,
+        Node,
+        "properties.compiler_language_applied",
+        Boolean,
+        Boolean,
+        "sem.node.compiler_language_applied"
+    ),
+    rule!(
+        150,
+        181,
+        Node,
+        "properties.declared_language",
+        Text,
+        Category,
+        "sem.node.declared_language"
+    ),
+    rule!(
+        151,
+        182,
+        Node,
+        "properties.effective_language",
+        Text,
+        Category,
+        "sem.node.effective_language"
+    ),
+    rule!(
+        152,
+        183,
+        Node,
+        "properties.effective_language_family",
+        Text,
+        Category,
+        "sem.node.effective_language_family"
+    ),
+    rule!(
+        153,
+        184,
+        Node,
+        "properties.language_provenance",
+        Text,
+        Category,
+        "sem.node.language_provenance"
+    ),
 ];
 
 /// Last slot id in the v3 frozen roster.
-pub const SEMANTIC_SLOT_END: u16 = 175;
+pub const SEMANTIC_SLOT_END: u16 = 184;
 
 const PRESENCE_SLOTS: &[PanelSlotSpec] = &[
     presence_slot(24, "sem.presence.project"),
