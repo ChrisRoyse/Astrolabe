@@ -668,6 +668,7 @@ LIBCBM_RELOC = $(BUILD_DIR)/libcbm.o
 LIBCBM_EXPORTS = $(BUILD_DIR)/libcbm.exports
 LIBCBM_OBJECTS_RSP = $(BUILD_DIR)/libcbm.objects.rsp
 LIBCBM_EXPORT_AUDIT = $(BUILD_DIR)/libcbm.exports.audit.json
+LIBCBM_LOCALIZATION_AUDIT = $(BUILD_DIR)/libcbm.localization.audit.json
 LIBCBM_RELOC_AUDIT = $(BUILD_DIR)/libcbm.reloc.audit.json
 
 $(LIBCBM_DIR)/$(CBM_DIR)/grammar_%.o: $(CBM_DIR)/grammar_%.c | $(BUILD_DIR)
@@ -749,6 +750,11 @@ $(LIBCBM_RELOC): $(LIBCBM_OBJS) $(LIBCBM_EXPORTS) $(LIBCBM_EXPORT_CONTRACT)
 	# during this complete partial link, preserving their declared alignment and
 	# making the consumed directives unnecessary in the relocatable output.
 	$(LD) -r -d $(NO_EXECSTACK_LD_FLAG) $(MINGW_RELOC_LD_FLAGS) --retain-symbols-file $(LIBCBM_EXPORTS) -o $@ @$(LIBCBM_OBJECTS_RSP)
+	# Cross-object relocations are now resolved inside one COFF object. Localize
+	# every non-API definition by changing only its fixed symbol storage-class
+	# byte, then prove the exact external projection independently. This avoids
+	# generic objcopy's full-payload rewrite while preserving relocation indices.
+	$(PYTHON) $(LIBCBM_EXPORT_CONTRACT) localize --reloc $@ --exports $(LIBCBM_EXPORTS) --audit $(LIBCBM_LOCALIZATION_AUDIT)
 	$(PYTHON) $(LIBCBM_EXPORT_CONTRACT) verify --nm "$(NM)" --objdump "$(OBJDUMP)" --objects-response $(LIBCBM_OBJECTS_RSP) --reloc $@ --exports $(LIBCBM_EXPORTS) --audit $(LIBCBM_RELOC_AUDIT)
 
 $(LIBCBM_A): $(LIBCBM_RELOC)
