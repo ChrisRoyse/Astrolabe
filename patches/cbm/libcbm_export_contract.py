@@ -19,6 +19,8 @@ SYMBOL = re.compile(r"^_?cbm_[A-Za-z0-9_]+$")
 BINDING = re.compile(r"(?m)^\s*pub fn (cbm_[A-Za-z0-9_]+)\s*\(")
 PE_REFPTR = re.compile(r"^\.refptr\.([A-Za-z_][A-Za-z0-9_@$?]*)$")
 COFF_RELOCATION = re.compile(r"^([0-9A-Fa-f]+)\s+(\S+)\s+(\S+)$")
+COFF_RELOCATION_SECTION = re.compile(r"^RELOCATION RECORDS FOR \[(.+)\]:$")
+DEFINED_RELOCATION_TYPES = frozenset({"B", "C", "D", "G", "I", "R", "S", "T", "V", "W"})
 
 
 class ContractError(Exception):
@@ -145,6 +147,90 @@ def nm_records(nm: str, inputs: list[str], purpose: str) -> list[tuple[str, str,
         purpose,
     )
     return parse_nm(output, purpose)
+
+
+def coff_relocations(
+    objdump: str, reloc: Path, wanted_targets: set[str]
+) -> tuple[dict[str, list[dict[str, str]]], int]:
+    by_target: dict[str, list[dict[str, str]]] = {}
+    section: str | None = None
+    relocation_count = 0
+    try:
+        with tempfile.TemporaryFile() as error_output:
+            process = subprocess.Popen(
+                [objdump, "-r", str(reloc)],
+                stdout=subprocess.PIPE,
+                stderr=error_output,
+            )
+            if process.stdout is None:
+                process.kill()
+                process.wait()
+                refuse(
+                    "ASTRO_LIBCBM_EXPORT_TOOL_PIPE_MISSING",
+                    "complete COFF relocation scan created no stdout pipe",
+                    "inspect the Python process runtime; never continue without physical relocation output",
+                )
+            try:
+                for raw_line in process.stdout:
+                    try:
+                        line = raw_line.decode("utf-8").strip()
+                    except UnicodeDecodeError as error:
+                        refuse(
+                            "ASTRO_LIBCBM_EXPORT_TOOL_OUTPUT_INVALID",
+                            f"complete COFF relocation scan emitted non-UTF-8 output: {error}",
+                            "use the pinned GNU objdump whose relocation output is UTF-8",
+                        )
+                    section_match = COFF_RELOCATION_SECTION.fullmatch(line)
+                    if section_match is not None:
+                        section = section_match.group(1)
+                        continue
+                    if section is None or not line or line.startswith("OFFSET"):
+                        continue
+                    parsed = COFF_RELOCATION.fullmatch(line)
+                    if parsed is None:
+                        refuse(
+                            "ASTRO_LIBCBM_RELOCATION_FORMAT_INVALID",
+                            f"cannot parse relocation line in section {section}: {line!r}",
+                            "use the pinned GNU objdump and inspect the exact combined COFF object",
+                        )
+                    offset, relocation_type, target = parsed.groups()
+                    relocation_count += 1
+                    if target in wanted_targets:
+                        by_target.setdefault(target, []).append(
+                            {
+                                "section": section,
+                                "offset": f"{int(offset, 16):x}",
+                                "relocation_type": relocation_type,
+                            }
+                        )
+            except ContractError:
+                process.kill()
+                process.wait()
+                raise
+            return_code = process.wait()
+            if return_code != 0:
+                error_output.seek(0)
+                stderr = error_output.read().decode("utf-8", errors="replace").strip()
+                refuse(
+                    "ASTRO_LIBCBM_EXPORT_TOOL_FAILED",
+                    f"complete COFF relocation scan exited {return_code}: {stderr}",
+                    "inspect the exact object/tool diagnostic; do not publish a partial archive",
+                )
+    except OSError as error:
+        refuse(
+            "ASTRO_LIBCBM_EXPORT_TOOL_UNREACHABLE",
+            f"cannot execute complete COFF relocation scan tool {objdump!r}: {error}",
+            "bootstrap the pinned native GNU toolchain and pass its exact tool path",
+        )
+    for references in by_target.values():
+        references.sort(
+            key=lambda reference: (
+                reference["section"],
+                int(reference["offset"], 16),
+                reference["relocation_type"],
+            )
+        )
+    return by_target, relocation_count
 
 
 def normalize(symbol: str) -> str:
@@ -285,21 +371,22 @@ def expected_exports(path: Path) -> tuple[list[str], str]:
 def validate_pe_relocation_globals(
     *,
     unexpected: list[str],
-    expected: list[str],
     records: list[tuple[str, str, str]],
     section_names: set[str],
-    objdump: str,
-    reloc: Path,
+    relocations: dict[str, list[dict[str, str]]],
 ) -> tuple[list[dict[str, str]], list[dict[str, object]]]:
     record_types = {name: symbol_type for name, symbol_type, _origin in records}
-    expected_set = set(expected)
     refptr_symbols = sorted(symbol for symbol in unexpected if PE_REFPTR.fullmatch(symbol))
     other_symbols = sorted(set(unexpected) - set(refptr_symbols))
     validated_refptrs: list[dict[str, str]] = []
-    target_refptrs: dict[str, list[str]] = {}
     for symbol in refptr_symbols:
         match = PE_REFPTR.fullmatch(symbol)
-        assert match is not None
+        if match is None:
+            refuse(
+                "ASTRO_LIBCBM_REFPTR_CLASSIFICATION_DRIFT",
+                f"preclassified PE refptr no longer matches its grammar: {symbol}",
+                "inspect the deterministic refptr partition before publishing the archive",
+            )
         if record_types.get(symbol) != "R":
             refuse(
                 "ASTRO_LIBCBM_REFPTR_SYMBOL_TYPE_INVALID",
@@ -314,91 +401,63 @@ def validate_pe_relocation_globals(
                 f"PE relocation scaffold {symbol} has no exact section {section}",
                 "inspect the partial-link COFF layout; never accept a name without its dedicated read-only section",
             )
-        relocation_output = run_tool(
-            [objdump, "-r", "-j", section, str(reloc)],
-            f"PE relocation scaffold scan for {symbol}",
-        )
-        relocation_lines = []
-        in_section = False
-        expected_header = f"RELOCATION RECORDS FOR [{section}]:"
-        for raw_line in relocation_output.splitlines():
-            line = raw_line.strip()
-            if line == expected_header:
-                in_section = True
-                continue
-            if not in_section or not line or line.startswith("OFFSET"):
-                continue
-            parsed = COFF_RELOCATION.fullmatch(line)
-            if parsed is None:
-                refuse(
-                    "ASTRO_LIBCBM_REFPTR_RELOCATION_FORMAT_INVALID",
-                    f"cannot parse {symbol} relocation line: {line!r}",
-                    "use the pinned GNU objdump and inspect the exact COFF section",
-                )
-            relocation_lines.append(parsed.groups())
+        relocation_lines = [
+            reference
+            for reference in relocations.get(target, [])
+            if reference["section"] == section
+        ]
         if len(relocation_lines) != 1:
             refuse(
                 "ASTRO_LIBCBM_REFPTR_RELOCATION_CARDINALITY",
                 f"PE relocation scaffold {symbol} has {len(relocation_lines)} relocations, expected exactly one",
                 "restore the canonical MinGW refptr shape before publishing the archive",
             )
-        offset, relocation_type, relocation_target = relocation_lines[0]
-        if int(offset, 16) != 0 or relocation_type != "IMAGE_REL_AMD64_ADDR64":
+        reference = relocation_lines[0]
+        if (
+            int(reference["offset"], 16) != 0
+            or reference["relocation_type"] != "IMAGE_REL_AMD64_ADDR64"
+        ):
             refuse(
                 "ASTRO_LIBCBM_REFPTR_RELOCATION_SHAPE_INVALID",
-                f"PE relocation scaffold {symbol} has offset={offset}, type={relocation_type}",
+                f"PE relocation scaffold {symbol} has offset={reference['offset']}, "
+                f"type={reference['relocation_type']}",
                 "restore the exact zero-offset AMD64 address relocation",
             )
-        if relocation_target != target:
-            refuse(
-                "ASTRO_LIBCBM_REFPTR_TARGET_MISMATCH",
-                f"PE relocation scaffold {symbol} targets {relocation_target!r}, expected {target!r}",
-                "inspect the COFF relocation and refuse aliasing or target drift",
-            )
-        target_refptrs.setdefault(target, []).append(symbol)
         validated_refptrs.append(
             {
                 "symbol": symbol,
                 "symbol_type": "R",
                 "section": section,
                 "offset": "0",
-                "relocation_type": relocation_type,
+                "relocation_type": reference["relocation_type"],
                 "target": target,
             }
         )
 
     validated_targets: list[dict[str, object]] = []
     for symbol in other_symbols:
-        referenced_by = target_refptrs.get(symbol)
-        if referenced_by is None:
+        references = relocations.get(symbol, [])
+        if not references:
             refuse(
                 "ASTRO_LIBCBM_EXPORT_RELOC_MISMATCH",
-                f"unexpected non-API global is not the target of a validated PE refptr: {symbol}",
-                "localize the internal definition or restore the exact relocation scaffold that requires it",
+                f"unexpected non-API global is not the exact target of any COFF relocation: {symbol}",
+                "localize the unused internal definition or restore the exact relocation that requires it",
             )
         symbol_type = record_types.get(symbol)
-        if symbol_type != "R":
+        if symbol_type not in DEFINED_RELOCATION_TYPES:
             refuse(
                 "ASTRO_LIBCBM_RELOCATION_TARGET_TYPE_INVALID",
-                f"defined PE refptr target {symbol} has nm type {symbol_type!r}, expected 'R'",
-                "keep relocation-required internal data read-only or expose an intentional cbm_* API through the manifest",
+                f"defined relocation target {symbol} has unsupported nm type {symbol_type!r}",
+                "inspect the combined-object definition instead of broadening the finite symbol-type contract",
             )
         validated_targets.append(
             {
                 "symbol": symbol,
                 "symbol_type": symbol_type,
-                "referenced_by": sorted(referenced_by),
+                "reference_count": len(references),
+                "references": references,
             }
         )
-
-    defined_targets = {target["symbol"] for target in validated_targets}
-    for target, referenced_by in sorted(target_refptrs.items()):
-        if target in record_types and target not in expected_set and target not in defined_targets:
-            refuse(
-                "ASTRO_LIBCBM_RELOCATION_TARGET_UNCLASSIFIED",
-                f"defined target {target} of {referenced_by} was not classified",
-                "inspect the exact COFF symbol type and preserve a complete relocation audit",
-            )
     return validated_refptrs, validated_targets
 
 
@@ -441,22 +500,30 @@ def verify(args: argparse.Namespace) -> None:
             f"relocatable globals are missing manifest exports: {missing[:3]}",
             "inspect ld retention and input relocations; never archive an unlocalized object",
         )
+    wanted_relocation_targets = set(unexpected)
+    wanted_relocation_targets.update(
+        match.group(1)
+        for symbol in unexpected
+        if (match := PE_REFPTR.fullmatch(symbol)) is not None
+    )
+    relocations, relocation_count = coff_relocations(
+        args.objdump, args.reloc, wanted_relocation_targets
+    )
     relocation_scaffolds, relocation_defined_targets = validate_pe_relocation_globals(
         unexpected=unexpected,
-        expected=expected,
         records=records,
         section_names=section_names,
-        objdump=args.objdump,
-        reloc=args.reloc,
+        relocations=relocations,
     )
     reloc_data = read_bytes(args.reloc, "localized relocatable object")
     audit = {
-        "format": "astrolabe.libcbm-export-reloc.v3",
+        "format": "astrolabe.libcbm-export-reloc.v4",
         "reloc": {
             "path": args.reloc.as_posix(),
             "bytes": len(reloc_data),
             "sha256": sha256(reloc_data),
             "section_count": len(section_names),
+            "physical_relocation_count": relocation_count,
             "drectve_present": False,
         },
         "exports": {
