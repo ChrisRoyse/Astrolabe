@@ -285,10 +285,25 @@ def verify(args: argparse.Namespace) -> None:
         if len(fields := line.split()) >= 2 and fields[0].isdigit()
     }
     if ".drectve" in section_names:
+        objects, _response_hash = object_arguments(args.objects_response)
+        directive_origins: list[str] = []
+        for object_path in objects:
+            object_sections = run_tool(
+                [args.objdump, "-h", object_path],
+                f"input section scan for {object_path}",
+            )
+            if any(
+                len(fields := line.split()) >= 2
+                and fields[0].isdigit()
+                and fields[1] == ".drectve"
+                for line in object_sections.splitlines()
+            ):
+                directive_origins.append(object_path)
         refuse(
             "ASTRO_LIBCBM_EXPORT_DIRECTIVE_PRESENT",
-            f"relocatable object {args.reloc} still contains .drectve",
-            "identify the translation unit emitting dllexport and apply its static-build contract at compilation",
+            f"relocatable object {args.reloc} still contains .drectve; "
+            f"input origins={directive_origins[:8]} (total={len(directive_origins)})",
+            "distinguish aligned-common directives from exports; allocate commons during the partial link or apply the exact producer's static-build contract",
         )
     records = nm_records(args.nm, [str(args.reloc)], "relocatable symbol scan")
     actual = sorted(name for name, _origin in records)
@@ -332,6 +347,7 @@ def parser() -> argparse.ArgumentParser:
     verify_parser = subparsers.add_parser("verify")
     verify_parser.add_argument("--nm", required=True)
     verify_parser.add_argument("--objdump", required=True)
+    verify_parser.add_argument("--objects-response", required=True, type=Path)
     verify_parser.add_argument("--reloc", required=True, type=Path)
     verify_parser.add_argument("--exports", required=True, type=Path)
     verify_parser.add_argument("--audit", required=True, type=Path)

@@ -745,8 +745,11 @@ $(LIBCBM_EXPORTS): $(LIBCBM_OBJS) $(LIBCBM_BINDINGS) $(LIBCBM_EXPORT_CONTRACT)
 
 $(LIBCBM_RELOC): $(LIBCBM_OBJS) $(LIBCBM_EXPORTS) $(LIBCBM_EXPORT_CONTRACT)
 	$(file >$(LIBCBM_OBJECTS_RSP),$(LIBCBM_OBJS))
-	$(LD) -r $(NO_EXECSTACK_LD_FLAG) $(MINGW_RELOC_LD_FLAGS) --retain-symbols-file $(LIBCBM_EXPORTS) -o $@ @$(LIBCBM_OBJECTS_RSP)
-	$(PYTHON) $(LIBCBM_EXPORT_CONTRACT) verify --nm "$(NM)" --objdump "$(OBJDUMP)" --reloc $@ --exports $(LIBCBM_EXPORTS) --audit $(LIBCBM_RELOC_AUDIT)
+	# PE aligned-common metadata also uses .drectve. -d assigns those commons
+	# during this complete partial link, preserving their declared alignment and
+	# making the consumed directives unnecessary in the relocatable output.
+	$(LD) -r -d $(NO_EXECSTACK_LD_FLAG) $(MINGW_RELOC_LD_FLAGS) --retain-symbols-file $(LIBCBM_EXPORTS) -o $@ @$(LIBCBM_OBJECTS_RSP)
+	$(PYTHON) $(LIBCBM_EXPORT_CONTRACT) verify --nm "$(NM)" --objdump "$(OBJDUMP)" --objects-response $(LIBCBM_OBJECTS_RSP) --reloc $@ --exports $(LIBCBM_EXPORTS) --audit $(LIBCBM_RELOC_AUDIT)
 
 $(LIBCBM_A): $(LIBCBM_RELOC)
 	rm -f $@
