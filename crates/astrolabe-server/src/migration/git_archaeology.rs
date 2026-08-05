@@ -2942,11 +2942,15 @@ fn index_historical_commit(
         .into());
     }
     let database = cache_dir.join(format!("{ARCHAEOLOGY_DB_PREFIX}{nonce}.db"));
-    let identity_root = if corpus_rel.is_empty() {
-        repo.to_path_buf()
-    } else {
-        repo.join(corpus_rel)
-    };
+    // `repo` is already the durable root of the requested corpus. `corpus_rel` is
+    // relative to the enclosing Git toplevel and exists only to select that same
+    // corpus inside the commit-bound scratch checkout below. Joining it to `repo`
+    // a second time turns a scoped corpus such as `<git-root>/scripts` into the
+    // nonexistent `<git-root>/scripts/scripts`, so CBM cannot bind the stable project
+    // identity and the otherwise-valid staged publication aborts in archaeology.
+    // Keep identity rooted at the original corpus while `scoped_root` independently
+    // applies the Git-toplevel-relative selector to the historical materialization.
+    let identity_root = repo.to_path_buf();
     let materialized = match materialize_historical_tree(
         repo,
         &worktree,
