@@ -110,14 +110,51 @@ typedef struct {
 
 static int64_t filetime_to_unix_ns(LONGLONG ticks);
 
+enum {
+    SNAPSHOT_GENERATION_ID_BYTES = 16,
+    SNAPSHOT_GENERATION_TOKEN_CHARS = 22,
+};
+
+static void snapshot_encode_generation_token(uint32_t process_id, uint64_t counter,
+                                             uint32_t generation,
+                                             char token[SNAPSHOT_GENERATION_TOKEN_CHARS + 1]) {
+    static const char alphabet[] =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    uint8_t identity[SNAPSHOT_GENERATION_ID_BYTES];
+    for (size_t i = 0; i < sizeof(process_id); i++) {
+        identity[i] = (uint8_t)(process_id >> (24U - (unsigned int)(i * 8U)));
+    }
+    for (size_t i = 0; i < sizeof(counter); i++) {
+        identity[sizeof(process_id) + i] = (uint8_t)(counter >> (56U - (unsigned int)(i * 8U)));
+    }
+    for (size_t i = 0; i < sizeof(generation); i++) {
+        identity[sizeof(process_id) + sizeof(counter) + i] =
+            (uint8_t)(generation >> (24U - (unsigned int)(i * 8U)));
+    }
+
+    size_t input = 0;
+    size_t output = 0;
+    while (input + 3 <= sizeof(identity)) {
+        uint32_t chunk = ((uint32_t)identity[input] << 16U) |
+                         ((uint32_t)identity[input + 1] << 8U) | identity[input + 2];
+        token[output++] = alphabet[(chunk >> 18U) & 0x3fU];
+        token[output++] = alphabet[(chunk >> 12U) & 0x3fU];
+        token[output++] = alphabet[(chunk >> 6U) & 0x3fU];
+        token[output++] = alphabet[chunk & 0x3fU];
+        input += 3;
+    }
+    token[output++] = alphabet[(identity[input] >> 2U) & 0x3fU];
+    token[output++] = alphabet[(identity[input] & 0x03U) << 4U];
+    token[output] = '\0';
+}
+
 static void snapshot_log_failure(const char *code, const char *operation, const char *path,
                                  unsigned long native_error) {
     char error_buf[32];
     snprintf(error_buf, sizeof(error_buf), "%lu", native_error);
     cbm_log_error("source_snapshot.failed", "code", code, "operation", operation, "path",
                   path ? path : "", "native_error_kind", "win32", "native_error", error_buf,
-                  "message",
-                  "the immutable source snapshot could not be completed", "remediation",
+                  "message", "the immutable source snapshot could not be completed", "remediation",
                   "stabilize source access, free workspace disk space, and retry indexing");
 }
 
@@ -165,8 +202,8 @@ static void snapshot_append_mismatch(char *out, size_t out_size, const char *fie
 }
 
 static void snapshot_describe_file_identity_mismatch(const cbm_file_info_t *expected,
-                                                     const snapshot_identity_t *observed,
-                                                     char *out, size_t out_size) {
+                                                     const snapshot_identity_t *observed, char *out,
+                                                     size_t out_size) {
     if (!out || out_size == 0) {
         return;
     }
@@ -267,10 +304,9 @@ static void snapshot_log_source_changed_size(const char *code, const char *opera
     snapshot_i64_text(observed_size, observed_size_text, sizeof(observed_size_text));
     cbm_log_error("source_snapshot.source_changed", "code", code, "operation", operation, "path",
                   path ? path : "", "diagnostic_kind", "source_change", "source_change_kind",
-                  source_change_kind ? source_change_kind : "stream_size_changed",
-                  "expected_size", expected_size_text, "observed_size", observed_size_text,
-                  "native_error_kind", "none", "native_error", "0", "publication_started",
-                  "false", "message",
+                  source_change_kind ? source_change_kind : "stream_size_changed", "expected_size",
+                  expected_size_text, "observed_size", observed_size_text, "native_error_kind",
+                  "none", "native_error", "0", "publication_started", "false", "message",
                   "the source stream size changed while Astrolabe was proving a consistent "
                   "snapshot",
                   "remediation",
@@ -317,28 +353,24 @@ static void snapshot_log_source_changed_file_identity(const char *code, const ch
         path ? path : "", "diagnostic_kind", "source_change", "source_change_kind",
         source_change_kind ? source_change_kind : "file_identity_changed", "mismatch_fields",
         mismatch_fields, "expected_volume_serial", expected_volume, "observed_volume_serial",
-        observed_volume, "expected_file_id", expected_file_id, "observed_file_id",
-        observed_file_id, "expected_size", expected_size, "observed_size", observed_size,
-        "expected_mtime_ns", expected_mtime, "observed_mtime_ns", observed_mtime,
-        "expected_change_time_100ns", expected_change_time, "observed_change_time_100ns",
-        observed_change_time, "observed_directory",
-        observed ? snapshot_bool_text(observed->standard.Directory) : "", "observed_delete_pending",
-        observed ? snapshot_bool_text(observed->standard.DeletePending) : "",
-        "native_error_kind", "none", "native_error", "0", "publication_started", "false",
-        "message",
+        observed_volume, "expected_file_id", expected_file_id, "observed_file_id", observed_file_id,
+        "expected_size", expected_size, "observed_size", observed_size, "expected_mtime_ns",
+        expected_mtime, "observed_mtime_ns", observed_mtime, "expected_change_time_100ns",
+        expected_change_time, "observed_change_time_100ns", observed_change_time,
+        "observed_directory", observed ? snapshot_bool_text(observed->standard.Directory) : "",
+        "observed_delete_pending",
+        observed ? snapshot_bool_text(observed->standard.DeletePending) : "", "native_error_kind",
+        "none", "native_error", "0", "publication_started", "false", "message",
         "the source file identity changed while Astrolabe was proving a consistent snapshot",
         "remediation",
         "preserve the failed run evidence, wait for the source tree to stabilize, and retry "
         "indexing without publishing a mixed-generation graph");
 }
 
-static void snapshot_log_source_changed_identity_pair(const char *code, const char *operation,
-                                                      const char *path,
-                                                      const char *source_change_kind,
-                                                      const snapshot_identity_t *expected,
-                                                      const snapshot_identity_t *observed,
-                                                      uint64_t observed_hash_bytes,
-                                                      bool hash_bytes_available) {
+static void snapshot_log_source_changed_identity_pair(
+    const char *code, const char *operation, const char *path, const char *source_change_kind,
+    const snapshot_identity_t *expected, const snapshot_identity_t *observed,
+    uint64_t observed_hash_bytes, bool hash_bytes_available) {
     char expected_volume[32];
     char observed_volume[32];
     char expected_file_id[33];
@@ -379,16 +411,15 @@ static void snapshot_log_source_changed_identity_pair(const char *code, const ch
         path ? path : "", "diagnostic_kind", "source_change", "source_change_kind",
         source_change_kind ? source_change_kind : "file_identity_changed", "mismatch_fields",
         mismatch_fields, "expected_volume_serial", expected_volume, "observed_volume_serial",
-        observed_volume, "expected_file_id", expected_file_id, "observed_file_id",
-        observed_file_id, "expected_size", expected_size, "observed_size", observed_size,
-        "expected_mtime_ns", expected_mtime, "observed_mtime_ns", observed_mtime,
-        "expected_change_time_100ns", expected_change_time, "observed_change_time_100ns",
-        observed_change_time, "observed_hash_bytes",
-        hash_bytes_available ? observed_hash_bytes_text : "", "observed_directory",
-        observed ? snapshot_bool_text(observed->standard.Directory) : "", "observed_delete_pending",
-        observed ? snapshot_bool_text(observed->standard.DeletePending) : "",
-        "native_error_kind", "none", "native_error", "0", "publication_started", "false",
-        "message",
+        observed_volume, "expected_file_id", expected_file_id, "observed_file_id", observed_file_id,
+        "expected_size", expected_size, "observed_size", observed_size, "expected_mtime_ns",
+        expected_mtime, "observed_mtime_ns", observed_mtime, "expected_change_time_100ns",
+        expected_change_time, "observed_change_time_100ns", observed_change_time,
+        "observed_hash_bytes", hash_bytes_available ? observed_hash_bytes_text : "",
+        "observed_directory", observed ? snapshot_bool_text(observed->standard.Directory) : "",
+        "observed_delete_pending",
+        observed ? snapshot_bool_text(observed->standard.DeletePending) : "", "native_error_kind",
+        "none", "native_error", "0", "publication_started", "false", "message",
         "the source file identity changed while Astrolabe was proving a consistent snapshot",
         "remediation",
         "preserve the failed run evidence, wait for the source tree to stabilize, and retry "
@@ -421,8 +452,7 @@ static void snapshot_log_source_changed_namespace(const char *operation, const c
         observed ? observed->rel_path : "", "expected_language", expected_language,
         "observed_language", observed_language, "expected_auxiliary",
         expected ? snapshot_bool_text(expected->auxiliary) : "", "observed_auxiliary",
-        observed ? snapshot_bool_text(observed->auxiliary) : "",
-        "expected_interpretation_input",
+        observed ? snapshot_bool_text(observed->auxiliary) : "", "expected_interpretation_input",
         expected ? snapshot_bool_text(expected->interpretation_input) : "",
         "observed_interpretation_input",
         observed ? snapshot_bool_text(observed->interpretation_input) : "", "native_error_kind",
@@ -568,9 +598,8 @@ static snapshot_live_match_t snapshot_hash_live_match(const cbm_file_info_t *fil
     }
     if ((tag.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0) {
         CloseHandle(source);
-        snapshot_log_source_changed_basic("CBM_SOURCE_UNCHANGED_MUTATED",
-                                          "inspect_live_source", file->path,
-                                          "live_source_became_reparse_point");
+        snapshot_log_source_changed_basic("CBM_SOURCE_UNCHANGED_MUTATED", "inspect_live_source",
+                                          file->path, "live_source_became_reparse_point");
         return SNAPSHOT_LIVE_ERROR;
     }
     if (!snapshot_get_identity(source, &before)) {
@@ -696,12 +725,9 @@ static void snapshot_capture_fail_source_changed_basic(snapshot_capture_result_t
     }
 }
 
-static void snapshot_capture_fail_source_changed_size(snapshot_capture_result_t *result,
-                                                      const char *code, const char *operation,
-                                                      const char *path,
-                                                      const char *source_change_kind,
-                                                      int64_t expected_size,
-                                                      int64_t observed_size) {
+static void snapshot_capture_fail_source_changed_size(
+    snapshot_capture_result_t *result, const char *code, const char *operation, const char *path,
+    const char *source_change_kind, int64_t expected_size, int64_t observed_size) {
     snapshot_capture_fail_source_changed_basic(result, code, operation, path, source_change_kind);
     if (result->source_changed) {
         result->expected_size_available = true;
@@ -711,14 +737,10 @@ static void snapshot_capture_fail_source_changed_size(snapshot_capture_result_t 
     }
 }
 
-static void snapshot_capture_fail_source_changed_identity(snapshot_capture_result_t *result,
-                                                          const char *code,
-                                                          const char *operation, const char *path,
-                                                          const char *source_change_kind,
-                                                          const snapshot_identity_t *expected,
-                                                          const snapshot_identity_t *observed,
-                                                          uint64_t observed_hash_bytes,
-                                                          bool hash_bytes_available) {
+static void snapshot_capture_fail_source_changed_identity(
+    snapshot_capture_result_t *result, const char *code, const char *operation, const char *path,
+    const char *source_change_kind, const snapshot_identity_t *expected,
+    const snapshot_identity_t *observed, uint64_t observed_hash_bytes, bool hash_bytes_available) {
     snapshot_capture_fail_source_changed_basic(result, code, operation, path, source_change_kind);
     if (result->source_changed) {
         if (expected) {
@@ -773,9 +795,9 @@ static void snapshot_capture_prepared(snapshot_capture_result_t *result) {
         goto cleanup;
     }
     if ((tag.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0) {
-        snapshot_capture_fail_source_changed_basic(
-            result, "CBM_SOURCE_SNAPSHOT_DISCOVERY_DRIFT", "inspect_source", file->path,
-            "source_became_reparse_point_after_discovery");
+        snapshot_capture_fail_source_changed_basic(result, "CBM_SOURCE_SNAPSHOT_DISCOVERY_DRIFT",
+                                                   "inspect_source", file->path,
+                                                   "source_became_reparse_point_after_discovery");
         goto cleanup;
     }
     if (!snapshot_get_identity(source, &before)) {
@@ -786,10 +808,10 @@ static void snapshot_capture_prepared(snapshot_capture_result_t *result) {
     }
     if (before.standard.EndOfFile.QuadPart < 0 ||
         before.standard.EndOfFile.QuadPart != file->size) {
-        snapshot_capture_fail_source_changed_size(
-            result, "CBM_SOURCE_SNAPSHOT_DISCOVERY_DRIFT", "compare_discovered_size", file->path,
-            "discovered_size_changed_before_capture", file->size,
-            before.standard.EndOfFile.QuadPart);
+        snapshot_capture_fail_source_changed_size(result, "CBM_SOURCE_SNAPSHOT_DISCOVERY_DRIFT",
+                                                  "compare_discovered_size", file->path,
+                                                  "discovered_size_changed_before_capture",
+                                                  file->size, before.standard.EndOfFile.QuadPart);
         goto cleanup;
     }
 
@@ -1412,7 +1434,8 @@ static int snapshot_verify_namespace(const char *repo_path, const cbm_discover_o
             match = false;
             source_change_kind = "namespace_entry_removed";
             expected_diff = a[captured_index];
-            mismatch_path = expected_diff->live_path ? expected_diff->live_path : expected_diff->path;
+            mismatch_path =
+                expected_diff->live_path ? expected_diff->live_path : expected_diff->path;
             break;
         }
         int path_cmp = strcmp(a[captured_index]->rel_path, b[observed_index]->rel_path);
@@ -1420,7 +1443,8 @@ static int snapshot_verify_namespace(const char *repo_path, const cbm_discover_o
             match = false;
             source_change_kind = "namespace_entry_removed";
             expected_diff = a[captured_index];
-            mismatch_path = expected_diff->live_path ? expected_diff->live_path : expected_diff->path;
+            mismatch_path =
+                expected_diff->live_path ? expected_diff->live_path : expected_diff->path;
             break;
         }
         if (path_cmp > 0) {
@@ -1437,7 +1461,8 @@ static int snapshot_verify_namespace(const char *repo_path, const cbm_discover_o
             source_change_kind = "namespace_metadata_changed";
             expected_diff = a[captured_index];
             observed_diff = b[observed_index];
-            mismatch_path = expected_diff->live_path ? expected_diff->live_path : expected_diff->path;
+            mismatch_path =
+                expected_diff->live_path ? expected_diff->live_path : expected_diff->path;
             break;
         }
         captured_index++;
@@ -1518,18 +1543,16 @@ static int snapshot_verify_namespace(const char *repo_path, const cbm_discover_o
                         identity_results[i].source_change_kind, &captured[i],
                         &identity_results[i].observed_identity);
                 } else {
-                    snapshot_log_source_changed_basic(
-                        code, operation, captured[i].live_path,
-                        identity_results[i].source_change_kind
-                            ? identity_results[i].source_change_kind
-                            : "live_identity_changed_after_capture");
+                    snapshot_log_source_changed_basic(code, operation, captured[i].live_path,
+                                                      identity_results[i].source_change_kind
+                                                          ? identity_results[i].source_change_kind
+                                                          : "live_identity_changed_after_capture");
                 }
             } else {
-                snapshot_log_failure(
-                    code, operation, captured[i].live_path,
-                    identity_results[i].native_error != ERROR_SUCCESS
-                        ? identity_results[i].native_error
-                        : ERROR_GEN_FAILURE);
+                snapshot_log_failure(code, operation, captured[i].live_path,
+                                     identity_results[i].native_error != ERROR_SUCCESS
+                                         ? identity_results[i].native_error
+                                         : ERROR_GEN_FAILURE);
             }
             free(identity_results);
             return CBM_NOT_FOUND;
@@ -1721,13 +1744,41 @@ int cbm_source_snapshot_capture(const char *repo_path, const char *store_path,
     }
     static volatile LONG sequence;
     LARGE_INTEGER counter;
-    QueryPerformanceCounter(&counter);
+    if (!QueryPerformanceCounter(&counter)) {
+        DWORD error = GetLastError();
+        if (error == ERROR_SUCCESS) {
+            error = ERROR_GEN_FAILURE;
+        }
+        snapshot_log_failure("CBM_SOURCE_SNAPSHOT_COUNTER_FAILED", "read_generation_counter",
+                             snapshot_base, error);
+        free(root);
+        free(snapshot_base);
+        return CBM_NOT_FOUND;
+    }
+    if (counter.QuadPart < 0) {
+        snapshot_log_failure("CBM_SOURCE_SNAPSHOT_COUNTER_INVALID", "validate_generation_counter",
+                             snapshot_base, ERROR_INVALID_DATA);
+        free(root);
+        free(snapshot_base);
+        return CBM_NOT_FOUND;
+    }
     LONG generation = InterlockedIncrement(&sequence);
-    /* Keep the immutable generation identity collision-resistant without spending
-     * MinGW's MAX_PATH-bound relative-lookup budget on descriptive scaffolding. */
-    int root_len = snprintf(root, base_len + suffix_capacity, "%s/.s-%lx-%llx-%lx", snapshot_base,
-                            (unsigned long)GetCurrentProcessId(),
-                            (unsigned long long)counter.QuadPart, (unsigned long)generation);
+    if (generation <= 0) {
+        snapshot_log_failure("CBM_SOURCE_SNAPSHOT_SEQUENCE_EXHAUSTED",
+                             "allocate_generation_sequence", snapshot_base,
+                             ERROR_ARITHMETIC_OVERFLOW);
+        free(root);
+        free(snapshot_base);
+        return CBM_NOT_FOUND;
+    }
+    /* Losslessly encode the exact identity as unpadded RFC 4648 base64url. The
+     * 22-character token is filename-safe and fixed-width, so compiler path
+     * admission cannot change merely because a PID has more hexadecimal digits. */
+    char generation_token[SNAPSHOT_GENERATION_TOKEN_CHARS + 1];
+    snapshot_encode_generation_token((uint32_t)GetCurrentProcessId(), (uint64_t)counter.QuadPart,
+                                     (uint32_t)generation, generation_token);
+    int root_len =
+        snprintf(root, base_len + suffix_capacity, "%s/.s-%s", snapshot_base, generation_token);
     wchar_t *wide_root = root_len > 0 && (size_t)root_len < base_len + suffix_capacity
                              ? cbm_utf8_to_wide_path(root)
                              : NULL;
@@ -1780,10 +1831,9 @@ int cbm_source_snapshot_capture(const char *repo_path, const char *store_path,
                         results[i].observed_size_available);
                 } else if (results[i].expected_size_available &&
                            results[i].observed_size_available) {
-                    snapshot_log_source_changed_size(code, operation, path,
-                                                     results[i].source_change_kind,
-                                                     results[i].expected_size,
-                                                     results[i].observed_size);
+                    snapshot_log_source_changed_size(
+                        code, operation, path, results[i].source_change_kind,
+                        results[i].expected_size, results[i].observed_size);
                 } else {
                     snapshot_log_source_changed_basic(code, operation, path,
                                                       results[i].source_change_kind);
@@ -1856,9 +1906,9 @@ static void source_slab_log_failure(const char *code, const char *operation, con
     snprintf(process_text, sizeof(process_text), "%zu", process_headroom);
     snprintf(machine_text, sizeof(machine_text), "%zu", machine_available);
     cbm_log_error("source_slab.refused", "code", code, "operation", operation, "path",
-                  path ? path : "", "requested_bytes", requested_text,
-                  "process_headroom_bytes", process_text, "machine_available_bytes",
-                  machine_text, "message", message, "remediation", remediation);
+                  path ? path : "", "requested_bytes", requested_text, "process_headroom_bytes",
+                  process_text, "machine_available_bytes", machine_text, "message", message,
+                  "remediation", remediation);
 }
 
 static void source_slab_hash_frame_u64(cbm_sha256_ctx *hash, uint64_t value) {
@@ -1890,8 +1940,7 @@ void cbm_source_slab_destroy(cbm_source_slab_t *slab) {
     memset(slab, 0, sizeof(*slab));
 }
 
-int cbm_source_slab_build(const cbm_file_info_t *files, int file_count,
-                          cbm_source_slab_t *slab) {
+int cbm_source_slab_build(const cbm_file_info_t *files, int file_count, cbm_source_slab_t *slab) {
     if (!slab || file_count <= 0 || !files || slab->bytes || slab->offsets || slab->lengths ||
         slab->file_count != 0) {
         source_slab_log_failure(
@@ -1934,11 +1983,12 @@ int cbm_source_slab_build(const cbm_file_info_t *files, int file_count,
     }
 
     size_t index_bytes = (size_t)file_count * sizeof(size_t);
-    if (storage_bytes > SIZE_MAX - index_bytes || storage_bytes + index_bytes > SIZE_MAX - index_bytes) {
-        source_slab_log_failure(
-            "CBM_SOURCE_SLAB_ALLOCATION_OVERFLOW", "measure_allocation", "", SIZE_MAX, 0, 0,
-            "the source slab and its exact index exceed addressable memory",
-            "split the corpus into an addressable project boundary and retry");
+    if (storage_bytes > SIZE_MAX - index_bytes ||
+        storage_bytes + index_bytes > SIZE_MAX - index_bytes) {
+        source_slab_log_failure("CBM_SOURCE_SLAB_ALLOCATION_OVERFLOW", "measure_allocation", "",
+                                SIZE_MAX, 0, 0,
+                                "the source slab and its exact index exceed addressable memory",
+                                "split the corpus into an addressable project boundary and retry");
         return CBM_NOT_FOUND;
     }
     size_t allocated_bytes = storage_bytes + (index_bytes * 2);
@@ -1949,8 +1999,8 @@ int cbm_source_slab_build(const cbm_file_info_t *files, int file_count,
     if (budget == 0 || machine_available == 0 || allocated_bytes > process_headroom ||
         allocated_bytes > machine_available) {
         source_slab_log_failure(
-            "CBM_SOURCE_SLAB_MEMORY_ADMISSION_REFUSED", "admit_allocation", "",
-            allocated_bytes, process_headroom, machine_available,
+            "CBM_SOURCE_SLAB_MEMORY_ADMISSION_REFUSED", "admit_allocation", "", allocated_bytes,
+            process_headroom, machine_available,
             "the complete immutable source slab cannot be admitted within live memory",
             "close competing memory-intensive work or increase the declared process budget, then "
             "retry the complete unchanged corpus");
@@ -1962,10 +2012,10 @@ int cbm_source_slab_build(const cbm_file_info_t *files, int file_count,
     candidate.offsets = malloc(index_bytes);
     candidate.lengths = malloc(index_bytes);
     if (!candidate.bytes || !candidate.offsets || !candidate.lengths) {
-        source_slab_log_failure(
-            "CBM_SOURCE_SLAB_ALLOC_FAILED", "allocate", "", allocated_bytes, process_headroom,
-            machine_available, "the admitted immutable source slab allocation failed",
-            "free memory and retry the complete unchanged corpus");
+        source_slab_log_failure("CBM_SOURCE_SLAB_ALLOC_FAILED", "allocate", "", allocated_bytes,
+                                process_headroom, machine_available,
+                                "the admitted immutable source slab allocation failed",
+                                "free memory and retry the complete unchanged corpus");
         cbm_source_slab_destroy(&candidate);
         return CBM_NOT_FOUND;
     }
@@ -2042,8 +2092,7 @@ int cbm_source_slab_build(const cbm_file_info_t *files, int file_count,
     return 0;
 }
 
-const uint8_t *cbm_source_slab_get(const cbm_source_slab_t *slab, int file_index,
-                                   size_t *out_len) {
+const uint8_t *cbm_source_slab_get(const cbm_source_slab_t *slab, int file_index, size_t *out_len) {
     if (out_len) {
         *out_len = 0;
     }
