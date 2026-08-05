@@ -19,11 +19,16 @@ import tempfile
 
 SYMBOL = re.compile(r"^_?cbm_[A-Za-z0-9_]+$")
 BINDING = re.compile(r"(?m)^\s*pub fn (cbm_[A-Za-z0-9_]+)\s*\(")
+PE_REFPTR = re.compile(r"^\.refptr\.([A-Za-z_][A-Za-z0-9_@$?]*)$")
 COFF_AMD64 = 0x8664
 COFF_HEADER_BYTES = 20
+COFF_SECTION_BYTES = 40
 COFF_SYMBOL_BYTES = 18
+COFF_RELOCATION_BYTES = 10
 COFF_CLASS_EXTERNAL = 2
 COFF_CLASS_STATIC = 3
+COFF_SECTION_COMDAT = 0x00001000
+COFF_AMD64_ADDR64 = 0x0001
 
 
 class ContractError(Exception):
@@ -113,6 +118,13 @@ def run_tool(arguments: list[str], purpose: str) -> str:
             f"{purpose} exited {completed.returncode}: {stderr}",
             "inspect the exact object/tool diagnostic; do not publish a partial archive",
         )
+    stderr = completed.stderr.decode("utf-8", errors="replace").strip()
+    if stderr:
+        refuse(
+            "ASTRO_LIBCBM_EXPORT_TOOL_DIAGNOSTIC",
+            f"{purpose} emitted stderr despite exit 0: {stderr}",
+            "treat analysis-tool warnings as structural failures and repair the object before publication",
+        )
     try:
         return completed.stdout.decode("utf-8")
     except UnicodeDecodeError as error:
@@ -189,6 +201,14 @@ def coff_layout(data: mmap.mmap) -> dict[str, int]:
             f"combined object sections={section_count}, optional_header_bytes={optional_bytes}",
             "supply a standard relocatable COFF object, never an image or empty object",
         )
+    section_table_bytes = section_count * COFF_SECTION_BYTES
+    section_table_end = COFF_HEADER_BYTES + section_table_bytes
+    if section_table_end > len(data):
+        refuse(
+            "ASTRO_LIBCBM_COFF_SECTION_TABLE_TRUNCATED",
+            f"section table ends at {section_table_end}, object bytes={len(data)}",
+            "restore every fixed 40-byte COFF section header before localization",
+        )
     if symbol_offset < COFF_HEADER_BYTES or symbol_count == 0:
         refuse(
             "ASTRO_LIBCBM_COFF_SYMBOL_TABLE_MISSING",
@@ -213,6 +233,8 @@ def coff_layout(data: mmap.mmap) -> dict[str, int]:
     return {
         "machine": machine,
         "section_count": section_count,
+        "section_table_offset": COFF_HEADER_BYTES,
+        "section_table_bytes": section_table_bytes,
         "symbol_offset": symbol_offset,
         "symbol_count": symbol_count,
         "symbol_bytes": symbol_bytes,
@@ -301,6 +323,189 @@ def coff_primary_symbols(
             "inspect the exact primary/auxiliary symbol sequence",
         )
     return symbols
+
+
+def coff_section_name(data: mmap.mmap, layout: dict[str, int], offset: int) -> str:
+    name_field = data[offset : offset + 8]
+    if name_field.startswith(b"/"):
+        encoded_offset = name_field[1:].split(b"\0", 1)[0]
+        if not encoded_offset or not encoded_offset.isdigit():
+            refuse(
+                "ASTRO_LIBCBM_COFF_SECTION_NAME_OFFSET_INVALID",
+                f"section at {offset} has invalid long-name field {name_field!r}",
+                "restore the slash-decimal COFF section-name reference",
+            )
+        string_relative = int(encoded_offset)
+        if string_relative < 4 or string_relative >= layout["string_bytes"]:
+            refuse(
+                "ASTRO_LIBCBM_COFF_SECTION_NAME_OFFSET_INVALID",
+                f"section at {offset} has string offset {string_relative}",
+                "inspect the exact COFF string table; never guess a section name",
+            )
+        name_start = layout["string_offset"] + string_relative
+        name_end = data.find(b"\0", name_start, len(data))
+        if name_end < 0:
+            refuse(
+                "ASTRO_LIBCBM_COFF_SECTION_NAME_UNTERMINATED",
+                f"section at {offset} has no NUL-terminated long name",
+                "restore the exact COFF string table before localization",
+            )
+        name_bytes = data[name_start:name_end]
+    else:
+        name_bytes = name_field.split(b"\0", 1)[0]
+    if not name_bytes:
+        refuse(
+            "ASTRO_LIBCBM_COFF_SECTION_NAME_EMPTY",
+            f"section at {offset} has an empty name",
+            "inspect the partial-link section table before localization",
+        )
+    try:
+        return name_bytes.decode("utf-8")
+    except UnicodeDecodeError as error:
+        refuse(
+            "ASTRO_LIBCBM_COFF_SECTION_NAME_INVALID",
+            f"section at {offset} has a non-UTF-8 name: {error}",
+            "use the pinned GNU toolchain's deterministic COFF naming",
+        )
+
+
+def coff_sections(data: mmap.mmap, layout: dict[str, int]) -> list[dict[str, int | str]]:
+    sections: list[dict[str, int | str]] = []
+    for zero_based in range(layout["section_count"]):
+        offset = layout["section_table_offset"] + zero_based * COFF_SECTION_BYTES
+        (
+            _virtual_size,
+            _virtual_address,
+            _raw_bytes,
+            _raw_offset,
+            relocation_offset,
+            _line_offset,
+            relocation_count,
+            _line_count,
+            characteristics,
+        ) = struct.unpack_from("<LLLLLLHHI", data, offset + 8)
+        relocation_end = relocation_offset + relocation_count * COFF_RELOCATION_BYTES
+        if relocation_count > 0 and (
+            relocation_offset == 0 or relocation_end > layout["symbol_offset"]
+        ):
+            refuse(
+                "ASTRO_LIBCBM_COFF_RELOCATION_TABLE_INVALID",
+                f"section {zero_based + 1} relocation range={relocation_offset}..{relocation_end}",
+                "restore the exact fixed 10-byte COFF relocation records before localization",
+            )
+        sections.append(
+            {
+                "index": zero_based + 1,
+                "offset": offset,
+                "name": coff_section_name(data, layout, offset),
+                "relocation_offset": relocation_offset,
+                "relocation_count": relocation_count,
+                "characteristics": characteristics,
+            }
+        )
+    return sections
+
+
+def coff_refptr_structurals(
+    data: mmap.mmap,
+    layout: dict[str, int],
+    symbols: list[dict[str, int | str]],
+) -> list[dict[str, int | str]]:
+    sections = {int(section["index"]): section for section in coff_sections(data, layout)}
+    symbols_by_index = {int(symbol["index"]): symbol for symbol in symbols}
+    structurals: list[dict[str, int | str]] = []
+    for symbol in symbols:
+        name = str(symbol["name"])
+        match = PE_REFPTR.fullmatch(name)
+        if match is None:
+            continue
+        if (
+            symbol["storage_class"] != COFF_CLASS_EXTERNAL
+            or int(symbol["section_number"]) <= 0
+        ):
+            refuse(
+                "ASTRO_LIBCBM_COFF_REFPTR_SYMBOL_INVALID",
+                f"refptr {name} storage_class={symbol['storage_class']}, section={symbol['section_number']}",
+                "restore the defined external COMDAT selection symbol; never hide malformed refptr state",
+            )
+        section_number = int(symbol["section_number"])
+        section = sections[section_number]
+        expected_section_name = f".rdata${name}"
+        if (
+            section["name"] != expected_section_name
+            or int(section["characteristics"]) & COFF_SECTION_COMDAT == 0
+            or int(section["relocation_count"]) != 1
+        ):
+            refuse(
+                "ASTRO_LIBCBM_COFF_REFPTR_SECTION_INVALID",
+                f"refptr {name} section={section['name']}, flags=0x{int(section['characteristics']):08x}, "
+                f"relocations={section['relocation_count']}",
+                "restore the exact dedicated COMDAT refptr section with one relocation",
+            )
+        section_definitions = [
+            candidate
+            for candidate in symbols
+            if candidate["storage_class"] == COFF_CLASS_STATIC
+            and int(candidate["section_number"]) == section_number
+            and candidate["name"] == expected_section_name
+            and int(candidate["value"]) == 0
+            and int(candidate["symbol_type"]) == 0
+            and int(candidate["auxiliary_count"]) == 1
+        ]
+        if len(section_definitions) != 1:
+            refuse(
+                "ASTRO_LIBCBM_COFF_REFPTR_SECTION_SYMBOL_INVALID",
+                f"refptr {name} has {len(section_definitions)} canonical section-definition symbols",
+                "restore the one static section symbol and its one auxiliary COMDAT record",
+            )
+        section_definition = section_definitions[0]
+        expected_comdat_index = int(section_definition["index"]) + 2
+        if int(symbol["index"]) != expected_comdat_index:
+            refuse(
+                "ASTRO_LIBCBM_COFF_REFPTR_COMDAT_ORDER_INVALID",
+                f"refptr {name} symbol index={symbol['index']}, expected={expected_comdat_index}",
+                "restore the COMDAT selection symbol immediately after the section auxiliary record",
+            )
+        relocation_offset = int(section["relocation_offset"])
+        virtual_address, target_index, relocation_type = struct.unpack_from(
+            "<LLH", data, relocation_offset
+        )
+        target_symbol = symbols_by_index.get(target_index)
+        expected_target = match.group(1)
+        if (
+            virtual_address != 0
+            or relocation_type != COFF_AMD64_ADDR64
+            or target_symbol is None
+            or target_symbol["name"] != expected_target
+        ):
+            refuse(
+                "ASTRO_LIBCBM_COFF_REFPTR_RELOCATION_INVALID",
+                f"refptr {name} relocation offset={virtual_address}, type=0x{relocation_type:04x}, "
+                f"target_index={target_index}, target={None if target_symbol is None else target_symbol['name']}",
+                "restore the exact zero-offset AMD64 ADDR64 relocation to the name-bound target",
+            )
+        structurals.append(
+            {
+                "symbol": name,
+                "symbol_index": int(symbol["index"]),
+                "section": expected_section_name,
+                "section_index": section_number,
+                "section_definition_index": int(section_definition["index"]),
+                "relocation_offset": 0,
+                "relocation_type": relocation_type,
+                "target": expected_target,
+                "target_index": target_index,
+            }
+        )
+    structurals.sort(key=lambda structural: str(structural["symbol"]))
+    structural_names = [str(structural["symbol"]) for structural in structurals]
+    if len(structural_names) != len(set(structural_names)):
+        refuse(
+            "ASTRO_LIBCBM_COFF_REFPTR_DUPLICATE",
+            "combined object contains duplicate defined refptr COMDAT selection symbols",
+            "repair the partial-link COMDAT resolution before localization",
+        )
+    return structurals
 
 
 def normalize(symbol: str) -> str:
@@ -448,6 +653,10 @@ def localize(args: argparse.Namespace) -> None:
             with mmap.mmap(object_file.fileno(), 0, access=mmap.ACCESS_WRITE) as data:
                 layout = coff_layout(data)
                 symbols = coff_primary_symbols(data, layout)
+                structural_details = coff_refptr_structurals(data, layout, symbols)
+                structural_symbols = {
+                    str(structural["symbol"]) for structural in structural_details
+                }
                 required_counts = {symbol: 0 for symbol in expected}
                 mutations: list[tuple[int, str]] = []
                 external_defined_before = 0
@@ -470,6 +679,8 @@ def localize(args: argparse.Namespace) -> None:
                     external_defined_before += 1
                     if name in expected_set:
                         required_counts[name] += 1
+                    elif name in structural_symbols:
+                        continue
                     else:
                         mutations.append((int(symbol["offset"]) + 16, name))
                 missing = sorted(name for name, count in required_counts.items() if count == 0)
@@ -498,19 +709,30 @@ def localize(args: argparse.Namespace) -> None:
                 data.flush()
                 os.fsync(object_file.fileno())
                 post_symbols = coff_primary_symbols(data, layout)
+                post_structural_details = coff_refptr_structurals(
+                    data, layout, post_symbols
+                )
+                if post_structural_details != structural_details:
+                    refuse(
+                        "ASTRO_LIBCBM_COFF_REFPTR_POST_LOCALIZATION_MISMATCH",
+                        "validated refptr structural records changed during storage-class localization",
+                        "discard the generated object and inspect the exact symbol-table mutation",
+                    )
                 post_external_defined = sorted(
                     str(symbol["name"])
                     for symbol in post_symbols
                     if symbol["storage_class"] == COFF_CLASS_EXTERNAL
                     and symbol["section_number"] != 0
                 )
-                if post_external_defined != expected:
+                expected_external_defined = sorted(expected + sorted(structural_symbols))
+                if post_external_defined != expected_external_defined:
                     refuse(
                         "ASTRO_LIBCBM_COFF_POST_LOCALIZATION_MISMATCH",
-                        f"post-localization externals differ: expected={len(expected)}, observed={len(post_external_defined)}",
+                        f"post-localization externals differ: expected={len(expected_external_defined)}, "
+                        f"observed={len(post_external_defined)}",
                         "discard the generated object and inspect the exact symbol-table mutation",
                     )
-    except OSError as error:
+    except (OSError, ValueError) as error:
         refuse(
             "ASTRO_LIBCBM_COFF_MUTATION_FAILED",
             f"cannot localize generated object {args.reloc}: {error}",
@@ -539,6 +761,12 @@ def localize(args: argparse.Namespace) -> None:
             "retained_count": len(expected),
             "retained_symbols": expected,
         },
+        "structural_externals": {
+            "count": len(structural_details),
+            "symbols": sorted(structural_symbols),
+            "details": structural_details,
+            "physical_match": True,
+        },
         "localization": {
             "external_defined_before": external_defined_before,
             "localized_count": len(localized_symbols),
@@ -552,6 +780,22 @@ def localize(args: argparse.Namespace) -> None:
 
 def verify(args: argparse.Namespace) -> None:
     expected, exports_hash = expected_exports(args.exports)
+    try:
+        with args.reloc.open("rb", buffering=0) as object_file:
+            with mmap.mmap(object_file.fileno(), 0, access=mmap.ACCESS_READ) as data:
+                layout = coff_layout(data)
+                symbols = coff_primary_symbols(data, layout)
+                structural_details = coff_refptr_structurals(data, layout, symbols)
+    except (OSError, ValueError) as error:
+        refuse(
+            "ASTRO_LIBCBM_COFF_READ_FAILED",
+            f"cannot inspect generated object {args.reloc}: {error}",
+            "restore the exact combined object and rerun the native build",
+        )
+    structural_symbols = sorted(
+        str(structural["symbol"]) for structural in structural_details
+    )
+    expected_globals = sorted(expected + structural_symbols)
     sections = run_tool([args.objdump, "-h", str(args.reloc)], "relocatable section scan")
     section_names = {
         fields[1]
@@ -581,17 +825,17 @@ def verify(args: argparse.Namespace) -> None:
         )
     records = nm_records(args.nm, [str(args.reloc)], "relocatable symbol scan")
     actual = sorted(name for name, _symbol_type, _origin in records)
-    missing = sorted(set(expected) - set(actual))
-    unexpected = sorted(set(actual) - set(expected))
-    if actual != expected:
+    missing = sorted(set(expected_globals) - set(actual))
+    unexpected = sorted(set(actual) - set(expected_globals))
+    if actual != expected_globals:
         refuse(
             "ASTRO_LIBCBM_EXPORT_RELOC_MISMATCH",
             f"relocatable global mismatch: missing={missing[:3]}, unexpected={unexpected[:3]}, "
-            f"expected_count={len(expected)}, actual_count={len(actual)}",
+            f"expected_count={len(expected_globals)}, actual_count={len(actual)}",
             "inspect COFF localization and never archive a non-exact global projection",
         )
     audit = {
-        "format": "astrolabe.libcbm-export-reloc.v5",
+        "format": "astrolabe.libcbm-export-reloc.v6",
         "reloc": {
             "path": args.reloc.as_posix(),
             "bytes": args.reloc.stat().st_size,
@@ -607,6 +851,12 @@ def verify(args: argparse.Namespace) -> None:
             "all_defined_globals_classified": True,
             "defined_global_count": len(actual),
             "defined_globals": actual,
+        },
+        "structural_externals": {
+            "count": len(structural_details),
+            "symbols": structural_symbols,
+            "details": structural_details,
+            "physical_match": True,
         },
     }
     durable_write(args.audit, json.dumps(audit, sort_keys=True, separators=(",", ":")).encode("utf-8"))
