@@ -97,25 +97,108 @@ fn fs_coded_error(
     message: impl std::fmt::Display,
     remediation: &str,
 ) -> Result<String, DynError> {
-    tool_error_result(format!("{code}: {message}; remediation: {remediation}"))
+    ToolFault::new(code, message.to_string(), remediation).into_result()
 }
 
 fn fs_search_error(error: &SearchError) -> Result<String, DynError> {
-    tool_error_result(format!(
-        "{}: {}; remediation: {}",
-        error.code(),
-        error.message(),
-        error.remediation()
-    ))
+    ToolFault::new(error.code(), error.message(), error.remediation()).into_result()
 }
 
-fn fs_optional_u64(args: &Map<String, Value>, key: &str) -> Result<Option<u64>, DynError> {
+/// Reads an optional unsigned argument, refusing a wrong JSON type as a
+/// caller-correctable fault rather than a bare error string (#919).
+fn fs_optional_u64(args: &Map<String, Value>, key: &str) -> Result<Option<u64>, ToolFault> {
     match args.get(key) {
         None | Some(Value::Null) => Ok(None),
         Some(value) => value.as_u64().map(Some).ok_or_else(|| {
-            format!("{ASTRO_FIND_SIMILAR_ARG}: {key} must be an unsigned integer").into()
+            argument_type_fault(
+                ASTRO_FIND_SIMILAR_ARG,
+                "find_similar",
+                key,
+                "a JSON unsigned integer",
+                value,
+            )
         }),
     }
+}
+
+/// Every purely syntactic check on `find_similar` arguments, resolved before any
+/// persisted state is read.
+///
+/// #919 requires argument validation to precede the freshness/vault read, but the
+/// handler used to consult the project's persisted dial *before* type-checking
+/// `k`/`ef` — so `k: "bad"` on a non-shadow project reported "not shadow-indexed"
+/// and the caller never learned the real fault. Resolving the argument shape here
+/// keeps the refusal honest and means a malformed request touches no store.
+struct FindSimilarArgs {
+    project: String,
+    anchor: String,
+    mode: String,
+    k: u64,
+    ef: u64,
+}
+
+fn parse_find_similar_args(args: &Map<String, Value>) -> Result<FindSimilarArgs, ToolFault> {
+    let project = status_project_from_args(args)
+        .map_err(|error| {
+            ToolFault::new(
+                ASTRO_FIND_SIMILAR_PROJECT,
+                format!("find_similar could not resolve the project argument: {error}"),
+                "Pass project=\"<name>\" or a repo_path that resolves to an indexed project.",
+            )
+        })?
+        .ok_or_else(|| {
+            ToolFault::new(
+                ASTRO_FIND_SIMILAR_PROJECT,
+                "find_similar requires project",
+                "Pass the project whose shadow vault holds the search corpus.",
+            )
+        })?;
+    let anchor = anchor_symbol_from_args(args).ok_or_else(|| {
+        ToolFault::new(
+            ASTRO_FIND_SIMILAR_ANCHOR,
+            "find_similar requires an anchor symbol",
+            "Pass symbol=\"<qualified_name>\" — the already-indexed symbol to find neighbors of.",
+        )
+    })?;
+    if let Some(value) = args.get("mode")
+        && !value.is_null()
+        && !value.is_string()
+    {
+        return Err(argument_type_fault(
+            ASTRO_FIND_SIMILAR_ARG,
+            "find_similar",
+            "mode",
+            "a JSON string",
+            value,
+        ));
+    }
+    let mode = string_arg(args, "mode").unwrap_or("structural").to_string();
+    if !matches!(
+        mode.as_str(),
+        "structural" | "api" | "semantic" | "clone" | "agree" | "disagree"
+    ) {
+        return Err(ToolFault::new(
+            ASTRO_FIND_SIMILAR_MODE,
+            format!(
+                "find_similar mode {mode:?} is not served by the persisted slot-vector surface"
+            ),
+            "Use mode structural, api, semantic, clone, agree, or disagree. profile/co_change/\
+             define are tracked separately and refuse rather than fabricate a neighbor list.",
+        )
+        .with_detail("argument", "mode")
+        .with_detail("observed_mode", mode.clone()));
+    }
+    let k = fs_optional_u64(args, "k")?
+        .or(fs_optional_u64(args, "limit")?)
+        .unwrap_or(DEFAULT_FIND_SIMILAR_K);
+    let ef = fs_optional_u64(args, "ef")?.unwrap_or(DEFAULT_FIND_SIMILAR_EF);
+    Ok(FindSimilarArgs {
+        project,
+        anchor,
+        mode,
+        k,
+        ef,
+    })
 }
 
 /// Reads the anchor symbol id from any of the accepted arg keys.
@@ -145,21 +228,19 @@ pub(crate) fn handle_find_similar(args_json: &str) -> Result<String, DynError> {
         );
     };
 
-    let Some(project) = status_project_from_args(args)? else {
-        return fs_coded_error(
-            ASTRO_FIND_SIMILAR_PROJECT,
-            "find_similar requires project",
-            "Pass the project whose shadow vault holds the search corpus.",
-        );
+    // #919: resolve the complete argument shape before touching any persisted
+    // state, so a malformed request is refused on its own terms and reads nothing.
+    let FindSimilarArgs {
+        project,
+        anchor,
+        mode,
+        k,
+        ef,
+    } = match parse_find_similar_args(args) {
+        Ok(parsed) => parsed,
+        Err(fault) => return fault.into_result(),
     };
-    let Some(anchor) = anchor_symbol_from_args(args) else {
-        return fs_coded_error(
-            ASTRO_FIND_SIMILAR_ANCHOR,
-            "find_similar requires an anchor symbol",
-            "Pass symbol=\"<qualified_name>\" — the already-indexed symbol to find neighbors of.",
-        );
-    };
-    let mode = string_arg(args, "mode").unwrap_or("structural").to_string();
+
     if read_dial(&project)? != MigrationDial::Shadow {
         return fs_coded_error(
             ASTRO_FIND_SIMILAR_SHADOW,
@@ -168,23 +249,6 @@ pub(crate) fn handle_find_similar(args_json: &str) -> Result<String, DynError> {
         );
     }
 
-    let k = fs_optional_u64(args, "k")?
-        .or(fs_optional_u64(args, "limit")?)
-        .unwrap_or(DEFAULT_FIND_SIMILAR_K);
-    let ef = fs_optional_u64(args, "ef")?.unwrap_or(DEFAULT_FIND_SIMILAR_EF);
-    if !matches!(
-        mode.as_str(),
-        "structural" | "api" | "semantic" | "clone" | "agree" | "disagree"
-    ) {
-        return fs_coded_error(
-            ASTRO_FIND_SIMILAR_MODE,
-            format!(
-                "find_similar mode {mode:?} is not served by the persisted slot-vector surface"
-            ),
-            "Use mode structural, api, semantic, clone, agree, or disagree. profile/co_change/\
-             define are tracked separately and refuse rather than fabricate a neighbor list.",
-        );
-    }
     let caps = SearchCaps::default_caps();
 
     let cache_dir = astrolabe_bridge::cbm_cache_dir()?;

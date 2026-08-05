@@ -687,14 +687,22 @@ fn coded_error(
     message: impl std::fmt::Display,
     remediation: &str,
 ) -> Result<String, DynError> {
-    tool_error_result(format!("{code}: {message}; remediation: {remediation}"))
+    ToolFault::new(code, message.to_string(), remediation).into_result()
 }
 
-fn optional_u64(args: &Map<String, Value>, key: &str) -> Result<Option<u64>, DynError> {
+/// Reads an optional unsigned argument, refusing a wrong JSON type as a
+/// caller-correctable fault rather than a bare error string (#922).
+fn optional_u64(args: &Map<String, Value>, key: &str) -> Result<Option<u64>, ToolFault> {
     match args.get(key) {
         None | Some(Value::Null) => Ok(None),
         Some(value) => value.as_u64().map(Some).ok_or_else(|| {
-            format!("{ASTRO_SEARCH_FUSION_ARG}: {key} must be an unsigned integer").into()
+            argument_type_fault(
+                ASTRO_SEARCH_FUSION_ARG,
+                "search_graph",
+                key,
+                "a JSON unsigned integer",
+                value,
+            )
         }),
     }
 }
@@ -703,7 +711,7 @@ fn optional_u64(args: &Map<String, Value>, key: &str) -> Result<Option<u64>, Dyn
 /// milli-weights. Accepts `"S7"`/`"7"`/`"lexical"`/`"code_semantic"`/`"name_semantic"`.
 fn parse_fusion_override(
     args: &Map<String, Value>,
-) -> Result<Option<BTreeMap<SlotId, u64>>, DynError> {
+) -> Result<Option<BTreeMap<SlotId, u64>>, ToolFault> {
     let Some(value) = args.get("fusion_override") else {
         return Ok(None);
     };
@@ -711,30 +719,61 @@ fn parse_fusion_override(
         return Ok(None);
     }
     let obj = value.as_object().ok_or_else(|| {
-        format!("{ASTRO_SEARCH_FUSION_ARG}: fusion_override must be a JSON object of slot->weight")
+        argument_type_fault(
+            ASTRO_SEARCH_FUSION_ARG,
+            "search_graph",
+            "fusion_override",
+            "a JSON object mapping slot name to positive milli-weight",
+            value,
+        )
     })?;
     let mut weights = BTreeMap::new();
     for (name, weight_value) in obj {
         let slot = parse_slot_name(name).ok_or_else(|| {
-            format!(
-                "{ASTRO_SEARCH_FUSION_ARG}: unknown fusion_override slot {name:?}; use S7/S18/S20 \
-                 (lexical/code_semantic/name_semantic)"
+            ToolFault::new(
+                ASTRO_SEARCH_FUSION_ARG,
+                format!("unknown fusion_override slot {name:?}"),
+                "Name a served slot: S7/lexical/bm25, S18/code_semantic, or S20/name_semantic.",
+            )
+            .with_detail("argument", "fusion_override")
+            .with_detail("unknown_slot", name.clone())
+            .with_detail(
+                "supported_slots",
+                json!([
+                    "S7",
+                    "lexical",
+                    "bm25",
+                    "S18",
+                    "code_semantic",
+                    "S20",
+                    "name_semantic"
+                ]),
             )
         })?;
         let weight = weight_value.as_u64().filter(|w| *w > 0).ok_or_else(|| {
-            format!(
-                "{ASTRO_SEARCH_FUSION_ARG}: fusion_override[{name:?}] must be a positive integer \
-                 milli-weight"
+            ToolFault::new(
+                ASTRO_SEARCH_FUSION_ARG,
+                format!(
+                    "fusion_override[{name:?}] must be a positive integer milli-weight; received {}",
+                    json_type_name(weight_value)
+                ),
+                "Give each named slot an integer milli-weight greater than zero.",
+            )
+            .with_argument(
+                format!("fusion_override[{name}]"),
+                "a positive JSON integer",
+                weight_value,
             )
         })?;
         weights.insert(slot, weight);
     }
     if weights.is_empty() {
-        return Err(format!(
-            "{ASTRO_SEARCH_FUSION_ARG}: fusion_override must name at least one slot with a positive \
-             weight"
+        return Err(ToolFault::new(
+            ASTRO_SEARCH_FUSION_ARG,
+            "fusion_override must name at least one slot with a positive weight",
+            "Either omit fusion_override to use the calibrated weights, or name at least one slot.",
         )
-        .into());
+        .with_detail("argument", "fusion_override"));
     }
     Ok(Some(weights))
 }

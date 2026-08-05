@@ -197,6 +197,25 @@ pub(crate) fn tool_result_is_error(result: &str) -> Result<bool, DynError> {
         .unwrap_or(false))
 }
 
+/// Legacy unstructured error result. **Do not use in new code — see
+/// [`crate::migration::ToolFault`].**
+///
+/// #989: this takes an already-flattened `"CODE: message; remediation: rem"`
+/// string and emits an error result with no `structuredContent`, so the three
+/// contract fields reach the caller as punctuation inside one sentence rather
+/// than as fields. Because it is the cheapest constructor available it won by
+/// default: 142 of the 174 error sites on this surface call it.
+///
+/// Its replacement, `ToolFault`, cannot be constructed without a code, a message,
+/// and a remediation, and serializes all three plus typed details into
+/// `structuredContent`. The remaining callers are being migrated under #990,
+/// after which this function is deleted so the compiler — not a convention —
+/// prevents the unstructured shape from returning.
+///
+/// It survives this commit only because a concurrent session holds several of the
+/// remaining call sites open in this same worktree; removing it now would silently
+/// destroy that in-flight work. That is a sequencing constraint, not a design
+/// choice.
 pub(crate) fn tool_error_result(message: impl Into<String>) -> Result<String, DynError> {
     Ok(serde_json::to_string(&json!({
         "content": [{"type": "text", "text": message.into()}],

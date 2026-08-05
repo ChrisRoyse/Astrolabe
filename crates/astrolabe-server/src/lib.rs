@@ -509,10 +509,16 @@ fn handler_error_response(
     request_json: &str,
     error: &(dyn Error + Send + Sync + 'static),
 ) -> Result<Option<String>, DynError> {
-    let envelope = request_error_envelope(error);
+    let envelope = request_error_payload(error);
     tracing::warn!(
-        code = %envelope.code,
-        message = %envelope.message,
+        code = %envelope
+            .get("code")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("ASTRO_MCP_HANDLER_INTERNAL"),
+        message = %envelope
+            .get("message")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default(),
         "server.request_handler_error"
     );
     let Ok(request) = serde_json::from_str::<serde_json::Value>(request_json) else {
@@ -559,15 +565,34 @@ fn handler_error_response(
     Ok(Some(serde_json::to_string(&response)?))
 }
 
-fn request_error_envelope(error: &(dyn Error + Send + Sync + 'static)) -> ErrorEnvelope {
-    if let Some(error) = error.downcast_ref::<BridgeError>() {
-        return error.envelope().clone();
+/// Classify an error that escaped a request handler into the envelope the caller
+/// is contractually told to act on.
+///
+/// #910: this used to downcast only to a directly-attached [`BridgeError`] and
+/// relabel *everything else* `ASTRO_MCP_HANDLER_INTERNAL`, with a remediation
+/// about inspecting "the named persisted store or lock". A caller who passed a
+/// path that does not exist was therefore told the server had an internal fault
+/// and sent to investigate store and lock state that the request never touched —
+/// while the accurate diagnosis and remediation sat unread inside the message
+/// string. `*_INTERNAL` also implies a retry might help, when the request can
+/// never succeed unchanged.
+///
+/// Now any error carrying a structured envelope — a [`ToolFault`] or a
+/// [`BridgeError`], at any depth of the source chain — keeps its own code and its
+/// own remediation. `ASTRO_MCP_HANDLER_INTERNAL` is reserved for what it was
+/// always meant to mean: a genuine internal fault that carries no envelope at
+/// all, where "retry, then inspect diagnostics" is honest advice.
+fn request_error_payload(error: &(dyn Error + Send + Sync + 'static)) -> serde_json::Value {
+    if let Some(fault) = migration::tool_fault_from_error(error) {
+        return fault;
     }
-    ErrorEnvelope::new(
-        "ASTRO_MCP_HANDLER_INTERNAL",
-        error.to_string(),
-        "Retry the request after checking the named persisted store or lock; if it repeats, inspect Astrolabe diagnostics while keeping the MCP session open.",
-    )
+    serde_json::json!({
+        "schema": migration::TOOL_FAULT_SCHEMA,
+        "status": "error",
+        "code": "ASTRO_MCP_HANDLER_INTERNAL",
+        "message": error.to_string(),
+        "remediation": "Retry the request after checking the named persisted store or lock; if it repeats, inspect Astrolabe diagnostics while keeping the MCP session open.",
+    })
 }
 
 fn trim_line_ending(line: &mut String) {
@@ -684,10 +709,27 @@ fn run_cli(args: &[String]) -> Result<i32, DynError> {
     }
 
     let runner = CbmToolRunner::new_default()?;
-    let result = if index_worker {
-        runner.handle_tool_raw(&tool_name, &args_json)?
+    let outcome = if index_worker {
+        runner
+            .handle_tool_raw(&tool_name, &args_json)
+            .map_err(DynError::from)
     } else {
-        migration::handle_tool_raw(&runner, &tool_name, &args_json)?
+        migration::handle_tool_raw(&runner, &tool_name, &args_json)
+    };
+    // #919: a caller-correctable refusal that escaped its handler as `Err` used
+    // to leave the CLI through the top-level `astrolabe: {Display}` stderr line,
+    // producing empty stdout and no JSON at all — even under `--json`. An agent
+    // driving the CLI saw exit 1 and an English sentence where every other
+    // refusal on the same surface gave it a structured result to read. Convert it
+    // here, at the tool boundary, so the fault reaches the caller in exactly the
+    // shape a handler-returned refusal has. A genuine internal fault carries no
+    // envelope and still propagates to the existing stderr path.
+    let result = match outcome {
+        Ok(result) => result,
+        Err(error) => match migration::tool_fault_result_from_error(error.as_ref()) {
+            Some(fault_result) => fault_result?,
+            None => return Err(error),
+        },
     };
     if let Some(path) = response_out.as_ref() {
         fs::write(path, &result)?;

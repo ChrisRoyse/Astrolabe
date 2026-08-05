@@ -82,6 +82,12 @@ use crate::DynError;
 mod helpers;
 use helpers::*;
 
+mod tool_fault;
+use tool_fault::*;
+pub(crate) use tool_fault::{
+    TOOL_FAULT_SCHEMA, tool_fault_from_error, tool_fault_result_from_error,
+};
+
 mod config_store;
 use config_store::*;
 
