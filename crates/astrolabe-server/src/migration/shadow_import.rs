@@ -284,28 +284,12 @@ impl SlotRuntime for ShadowSlotRuntime {
                 astrolabe_panel::semantic::SemanticKind::LatentCode
                     | astrolabe_panel::semantic::SemanticKind::LatentProse
             ) {
-                let joined;
-                let text = match value {
-                    astrolabe_panel::semantic::SemanticValue::Text(text) => text.as_str(),
-                    astrolabe_panel::semantic::SemanticValue::TextArray(values) => {
-                        joined = values.join("\n");
-                        joined.as_str()
-                    }
-                    _ => {
-                        return Err(astrolabe_panel::PanelError::invalid_vector(
-                            format!(
-                                "latent semantic slot {} did not receive text or a text array",
-                                slot.slot_id()
-                            ),
-                            "Correct the frozen semantic source-type binding before indexing.",
-                        ));
-                    }
-                };
+                let framed = astrolabe_panel::semantic::latent_embedding_input(rule, value)?;
                 let table = SHADOW_EMBEDDING_TABLE
                     .get_or_init(astrolabe_panel::StaticEmbeddingTable::load_default)
                     .as_ref()
                     .map_err(Clone::clone)?;
-                return table.embed_text(text);
+                return table.embed_text(&framed);
             }
             return astrolabe_panel::semantic::encode_structured_value(rule, value);
         }

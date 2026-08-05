@@ -15,7 +15,7 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     ASTRO_PANEL_CONTRACT_INVALID, ASTRO_PANEL_VECTOR_INVALID, NormPolicy, PanelError, PanelResult,
-    PanelSlotSpec,
+    PanelSlotSpec, embeddings::nomic_weights_identity,
 };
 
 /// First semantic slot id. S0-S23 remain byte-identical to panel v2.
@@ -30,6 +30,12 @@ pub const SEMANTIC_HASH_DIM: u32 = 65_536;
 pub const SEMANTIC_REGISTRY_SCHEMA: &str = "astro.cbm.semantic-registry.v1";
 /// Stable algorithm identity for exact structured encoders.
 pub const SEMANTIC_ENCODER_ID: &str = "astro.cbm.semantic-encoders.v1";
+/// Frozen framing contract for learned panel-v3 code/prose inputs.  The
+/// modality prefix is part of the lens input, not an OOV fallback: the exact
+/// source value follows it byte-for-byte.  It gives a legitimately present
+/// empty/tokenless atom a concrete learned measurement while the legacy
+/// embedding API retains its explicit empty/OOV `Absent` policy.
+pub const SEMANTIC_LATENT_INPUT_SCHEMA: &str = "astro.cbm.semantic-latent-input.v1";
 
 /// CBM row family whose atomic fields a rule covers.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
@@ -1609,7 +1615,71 @@ pub fn semantic_weights_identity(slot: SlotId) -> PanelResult<[u8; 32]> {
     hasher.update(rule.source_type.as_str().as_bytes());
     hasher.update(rule.kind.as_str().as_bytes());
     hasher.update(rule.slot_key.as_bytes());
+    if matches!(
+        rule.kind,
+        SemanticKind::LatentCode | SemanticKind::LatentProse
+    ) {
+        hasher.update(SEMANTIC_LATENT_INPUT_SCHEMA.as_bytes());
+        hasher.update(nomic_weights_identity());
+    }
     Ok(hasher.finalize().into())
+}
+
+/// Builds the frozen learned-embedding input for one present latent semantic
+/// atom.  The complete original text is retained after a stable modality word,
+/// so empty, whitespace-only, punctuation-only, and all-OOV values still pass
+/// through the real learned Nomic table without inventing a pseudo-vector.
+pub fn latent_embedding_input(rule: &SemanticRule, value: &SemanticValue) -> PanelResult<String> {
+    if !matches!(
+        rule.kind,
+        SemanticKind::LatentCode | SemanticKind::LatentProse
+    ) {
+        return Err(PanelError::new(
+            ASTRO_PANEL_CONTRACT_INVALID,
+            format!(
+                "semantic rule {} is {}, not a learned latent lens",
+                rule.path,
+                rule.kind.as_str()
+            ),
+            "Route only latent code/prose rules through the frozen latent input frame.",
+        ));
+    }
+    if value.source_type() != rule.source_type {
+        return Err(PanelError::new(
+            ASTRO_PANEL_CONTRACT_INVALID,
+            format!(
+                "semantic rule {} expects {}, received {}",
+                rule.path,
+                rule.source_type.as_str(),
+                value.source_type().as_str()
+            ),
+            "Update the versioned registry for a real schema change; never coerce a drifted source type.",
+        ));
+    }
+    let text = match value {
+        SemanticValue::Text(text) => text.clone(),
+        SemanticValue::TextArray(values) => values.join("\n"),
+        _ => {
+            return Err(PanelError::new(
+                ASTRO_PANEL_CONTRACT_INVALID,
+                format!(
+                    "latent semantic rule {} did not receive text or a text array",
+                    rule.path
+                ),
+                "Correct the frozen semantic source-type binding before measurement.",
+            ));
+        }
+    };
+    let modality = match rule.kind {
+        SemanticKind::LatentCode => "code",
+        SemanticKind::LatentProse => "text",
+        _ => unreachable!("validated latent kind"),
+    };
+    let mut framed = String::with_capacity(modality.len() + 1 + text.len());
+    framed.push_str(modality);
+    framed.push('\n');
+    framed.push_str(&text);
+    Ok(framed)
 }
 
 /// Builds the family presence vector and rejects duplicate/out-of-range rules.
