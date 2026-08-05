@@ -10447,7 +10447,7 @@ static TSParseActionEntry ts_parse_actions[] = {
 #ifdef __cplusplus
 extern "C" {
 #endif
-#ifdef _WIN32
+#if defined(_WIN32) && !defined(TREE_SITTER_HIDE_SYMBOLS)
 #define extern __declspec(dllexport)
 #endif
 

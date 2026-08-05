@@ -337376,7 +337376,7 @@ bool tree_sitter_zsh_external_scanner_scan(void *, TSLexer *, const bool *);
 unsigned tree_sitter_zsh_external_scanner_serialize(void *, char *);
 void tree_sitter_zsh_external_scanner_deserialize(void *, const char *, unsigned);
 
-#ifdef _WIN32
+#if defined(_WIN32) && !defined(TREE_SITTER_HIDE_SYMBOLS)
 #define extern __declspec(dllexport)
 #endif
 
