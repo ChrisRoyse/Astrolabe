@@ -5337,33 +5337,22 @@ where
             })
             .collect();
     }
-    let chunk_size = nodes.len().div_ceil(worker_count);
-    let mut owned_chunks = Vec::with_capacity(worker_count);
-    let mut drain = nodes.into_iter();
-    loop {
-        let chunk = drain.by_ref().take(chunk_size).collect::<Vec<_>>();
-        if chunk.is_empty() {
-            break;
-        }
-        owned_chunks.push(chunk);
-    }
-    let prepared_chunks = parallel_map(owned_chunks, worker_count, |chunk| {
-        chunk
-            .into_iter()
-            .map(|node| {
-                prepare_live_symbol(
-                    vault,
-                    runtime,
-                    options,
-                    driver,
-                    node,
-                    digest_reuse,
-                    retention,
-                )
-            })
-            .collect::<IngestResult<Vec<_>>>()
-    })?;
-    Ok(prepared_chunks.into_iter().flatten().collect())
+    // Keep each node as an independently stealable indexed Rayon item. The former
+    // one-static-chunk-per-worker plan made source-heavy repository regions a long
+    // serial tail: workers that finished light chunks could not help with the
+    // remaining expensive chunks. `parallel_map`'s indexed collect preserves exact
+    // input order while the global pre-attached pool dynamically balances nodes.
+    parallel_map(nodes, worker_count, |node| {
+        prepare_live_symbol(
+            vault,
+            runtime,
+            options,
+            driver,
+            node,
+            digest_reuse,
+            retention,
+        )
+    })
 }
 
 fn prepare_historical_constellations_parallel<C, R>(
