@@ -965,7 +965,7 @@ fn create_cbm_schema(connection: &Connection) -> LowerResult<()> {
         "PRAGMA user_version = 5;\
          CREATE TABLE projects (\n\t\tname TEXT PRIMARY KEY,\n\t\tindexed_at TEXT NOT NULL,\n\t\troot_path TEXT NOT NULL\n\t);\
          CREATE TABLE file_hashes (\n\t\tproject TEXT NOT NULL REFERENCES projects(name) ON DELETE CASCADE,\n\t\trel_path TEXT NOT NULL,\n\t\tsha256 TEXT NOT NULL,\n\t\tmtime_ns INTEGER NOT NULL DEFAULT 0,\n\t\tsize INTEGER NOT NULL DEFAULT 0,\n\t\tPRIMARY KEY (project, rel_path)\n\t);\
-         CREATE TABLE nodes (\n\t\tid INTEGER PRIMARY KEY AUTOINCREMENT,\n\t\tproject TEXT NOT NULL REFERENCES projects(name) ON DELETE CASCADE,\n\t\tlabel TEXT NOT NULL,\n\t\tname TEXT NOT NULL,\n\t\tatom_id TEXT NOT NULL,\n\t\tqualified_name TEXT NOT NULL,\n\t\tfile_path TEXT DEFAULT '',\n\t\tstart_line INTEGER DEFAULT 0,\n\t\tend_line INTEGER DEFAULT 0,\n\t\tproperties TEXT DEFAULT '{}',\n\t\tsource_present INTEGER NOT NULL CHECK(source_present IN (0,1)),\n\t\tsource_bytes BLOB,\n\t\tsource_sha256 TEXT NOT NULL DEFAULT '',\n\t\tstart_byte INTEGER NOT NULL DEFAULT 0,\n\t\tend_byte INTEGER NOT NULL DEFAULT 0,\n\t\tCHECK((source_present = 0 AND source_bytes IS NULL AND source_sha256 = '' AND start_byte = 0 AND end_byte = 0) OR (source_present = 1 AND source_bytes IS NOT NULL AND length(source_sha256) = 64 AND end_byte >= start_byte AND length(source_bytes) = end_byte - start_byte)),\n\t\tUNIQUE(project, atom_id)\n\t);\
+         CREATE TABLE nodes (\n\t\tid INTEGER PRIMARY KEY AUTOINCREMENT,\n\t\tproject TEXT NOT NULL REFERENCES projects(name) ON DELETE CASCADE,\n\t\tlabel TEXT NOT NULL,\n\t\tname TEXT NOT NULL,\n\t\tqualified_name TEXT NOT NULL,\n\t\tfile_path TEXT DEFAULT '',\n\t\tstart_line INTEGER DEFAULT 0,\n\t\tend_line INTEGER DEFAULT 0,\n\t\tproperties TEXT DEFAULT '{}',\n\t\tatom_id TEXT NOT NULL,\n\t\tsource_present INTEGER NOT NULL CHECK(source_present IN (0,1)),\n\t\tsource_bytes BLOB,\n\t\tsource_sha256 TEXT NOT NULL DEFAULT '',\n\t\tstart_byte INTEGER NOT NULL DEFAULT 0,\n\t\tend_byte INTEGER NOT NULL DEFAULT 0,\n\t\tCHECK((source_present = 0 AND source_bytes IS NULL AND source_sha256 = '' AND start_byte = 0 AND end_byte = 0) OR (source_present = 1 AND source_bytes IS NOT NULL AND length(source_sha256) = 64 AND end_byte >= start_byte AND length(source_bytes) = end_byte - start_byte)),\n\t\tUNIQUE(project, atom_id)\n\t);\
          CREATE TABLE edges (\n\t\tid INTEGER PRIMARY KEY AUTOINCREMENT,\n\t\tproject TEXT NOT NULL REFERENCES projects(name) ON DELETE CASCADE,\n\t\tsource_id INTEGER NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,\n\t\ttarget_id INTEGER NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,\n\t\ttype TEXT NOT NULL,\n\t\tproperties TEXT DEFAULT '{}',\n\t\turl_path_gen TEXT GENERATED ALWAYS AS (json_extract(properties,'$.url_path')),\n\t\tlocal_name_gen TEXT GENERATED ALWAYS AS (CASE WHEN type='IMPORTS' THEN coalesce(json_extract(properties,'$.local_name'),'') ELSE '' END),\n\t\tpreprocess_context_id_gen TEXT GENERATED ALWAYS AS (coalesce(CAST(json_extract(properties,'$.preprocess_context_id') AS TEXT),'')),\n\t\tCHECK(type != 'IMPORTS' OR json_type(properties,'$.local_name') IS NULL OR json_type(properties,'$.local_name') IN ('null','text')),\n\t\tCHECK(json_type(properties,'$.preprocess_context_id') IS NULL OR json_type(properties,'$.preprocess_context_id') IN ('null','text')),\n\t\tUNIQUE(source_id, target_id, type, local_name_gen, preprocess_context_id_gen)\n\t);\
          CREATE TABLE project_summaries (\n\t\t\tproject TEXT PRIMARY KEY,\n\t\t\tsummary TEXT NOT NULL,\n\t\t\tsource_hash TEXT NOT NULL,\n\t\t\tcreated_at TEXT NOT NULL,\n\t\t\tupdated_at TEXT NOT NULL\n\t\t);\
          CREATE TABLE node_vectors (\n\t\tnode_id INTEGER PRIMARY KEY,\n\t\tproject TEXT NOT NULL,\n\t\tvector BLOB NOT NULL\n\t);\
@@ -1051,7 +1051,7 @@ fn insert_file_hashes(tx: &Transaction<'_>, rows: &LoweredRows) -> LowerResult<(
 
 fn insert_nodes(tx: &Transaction<'_>, rows: &LoweredRows) -> LowerResult<()> {
     let mut node_statement = tx.prepare(
-        "INSERT INTO nodes(id, project, label, name, atom_id, qualified_name, file_path, start_line, end_line, properties, source_present, source_bytes, source_sha256, start_byte, end_byte)
+        "INSERT INTO nodes(id, project, label, name, qualified_name, file_path, start_line, end_line, properties, atom_id, source_present, source_bytes, source_sha256, start_byte, end_byte)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
     )?;
     let mut vector_statement =
@@ -1067,12 +1067,12 @@ fn insert_nodes(tx: &Transaction<'_>, rows: &LoweredRows) -> LowerResult<()> {
             node.project,
             node.label,
             node.name,
-            node.atom_id,
             node.qualified_name,
             node.file_path,
             node.start_line,
             node.end_line,
             node.properties_json,
+            node.atom_id,
             i64::from(node.source_present),
             source_value,
             node.source_sha256,

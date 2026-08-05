@@ -260,12 +260,12 @@ fn main() -> Result<(), Box<dyn Error>> {
              project TEXT NOT NULL,
              label TEXT NOT NULL,
              name TEXT NOT NULL,
-             atom_id TEXT NOT NULL,
              qualified_name TEXT NOT NULL,
              file_path TEXT DEFAULT '',
              start_line INTEGER DEFAULT 0,
              end_line INTEGER DEFAULT 0,
              properties TEXT DEFAULT '{}',
+             atom_id TEXT NOT NULL,
              source_present INTEGER NOT NULL CHECK(source_present IN (0,1)),
              source_bytes BLOB,
              source_sha256 TEXT NOT NULL DEFAULT '',
@@ -309,19 +309,19 @@ fn main() -> Result<(), Box<dyn Error>> {
     )?;
     for node in &nodes {
         tx.execute(
-            "INSERT INTO nodes(id, project, label, name, atom_id, qualified_name, file_path, start_line, end_line, properties, source_present, source_bytes, source_sha256, start_byte, end_byte)
+            "INSERT INTO nodes(id, project, label, name, qualified_name, file_path, start_line, end_line, properties, atom_id, source_present, source_bytes, source_sha256, start_byte, end_byte)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 0, NULL, '', 0, 0)",
             params![
                 node.id,
                 PROJECT,
                 node.label,
                 node.name,
-                node.atom_id,
                 node.qualified_name,
                 node.file_path,
                 node.start_line,
                 node.end_line,
                 node.properties,
+                node.atom_id,
             ],
         )?;
         if let Some(vector) = &node.vector {
