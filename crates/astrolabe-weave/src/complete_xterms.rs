@@ -20,6 +20,7 @@ use calyx_core::{
     AbsentReason, CalyxError, Clock, CxId, LedgerRef, SlotId, SlotVector, SparseEntry, VaultStore,
 };
 use calyx_ledger::{ActorId, EntryKind, SubjectId};
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
 use crate::sim_rows::ledger_ref_at_commit;
@@ -35,6 +36,9 @@ pub const ASTRO_XTERM_COMPLETION_CORRUPT: &str = "ASTRO_XTERM_COMPLETION_CORRUPT
 pub const ASTRO_XTERM_COMPLETION_OVERFLOW: &str = "ASTRO_XTERM_COMPLETION_OVERFLOW";
 
 const MAX_MUTATION_ROWS_PER_COMMIT: usize = 50_000;
+/// Bound planned records retained at once. The Rayon global pool work-steals
+/// within each batch; indexed parallel iteration preserves CxId input order.
+const PLANNING_RECORD_BATCH: usize = 8;
 
 fn source_corrupt(message: impl Into<String>) -> CalyxError {
     CalyxError {
@@ -269,51 +273,63 @@ where
     let mut commit_count = 0usize;
     let tombstone = tombstone_value();
 
-    for record in &changed {
-        let planned = plan_constellation(record)?;
-        let existing_rows = persisted.rows.get(&record.cx_id);
-        let mut record_mutations = Vec::new();
-        for (key, value) in &planned.rows {
-            if existing_rows.and_then(|rows| rows.get(key)) == Some(value) {
-                rows_unchanged = checked_add(rows_unchanged, 1, "unchanged pair rows")?;
-            } else {
-                record_mutations.push((ColumnFamily::XTerm, key.clone(), value.clone()));
-                rows_written = checked_add(rows_written, 1, "written pair rows")?;
-            }
-        }
-        if let Some(existing_rows) = existing_rows {
-            for key in existing_rows.keys() {
-                if !planned.rows.contains_key(key) {
-                    record_mutations.push((ColumnFamily::XTerm, key.clone(), tombstone.clone()));
-                    rows_tombstoned = checked_add(rows_tombstoned, 1, "tombstoned pair rows")?;
+    for record_batch in changed.chunks(PLANNING_RECORD_BATCH) {
+        let planned_batch = record_batch
+            .par_iter()
+            .map(plan_constellation)
+            .collect::<Vec<_>>();
+        for planned in planned_batch {
+            let planned = planned?;
+            let existing_rows = persisted.rows.get(&planned.cx_id);
+            let mut record_mutations = Vec::new();
+            for (key, value) in &planned.rows {
+                if existing_rows.and_then(|rows| rows.get(key)) == Some(value) {
+                    rows_unchanged = checked_add(rows_unchanged, 1, "unchanged pair rows")?;
+                } else {
+                    record_mutations.push((ColumnFamily::XTerm, key.clone(), value.clone()));
+                    rows_written = checked_add(rows_written, 1, "written pair rows")?;
                 }
             }
-        }
-        let witness_unchanged = persisted
-            .witnesses
-            .get(&record.cx_id)
-            .is_some_and(|(bytes, _)| *bytes == planned.witness_bytes);
-        if !witness_unchanged {
-            record_mutations.push((
-                ColumnFamily::Kv,
-                planned.witness_key.clone(),
-                planned.witness_bytes.clone(),
-            ));
-            witnesses_written = checked_add(witnesses_written, 1, "written witnesses")?;
-        }
-        if !pending.is_empty()
-            && pending.len().saturating_add(record_mutations.len()) > MAX_MUTATION_ROWS_PER_COMMIT
-        {
-            let (entry_ref, ack) = commit_mutations(vault, &actor, &pending_record_ids, &pending)?;
-            ledger_ref = Some(entry_ref);
-            fsv.push(ack);
-            commit_count = checked_add(commit_count, 1, "association commits")?;
-            pending.clear();
-            pending_record_ids.clear();
-        }
-        if !record_mutations.is_empty() {
-            pending.extend(record_mutations);
-            pending_record_ids.push(planned.witness.cx_id);
+            if let Some(existing_rows) = existing_rows {
+                for key in existing_rows.keys() {
+                    if !planned.rows.contains_key(key) {
+                        record_mutations.push((
+                            ColumnFamily::XTerm,
+                            key.clone(),
+                            tombstone.clone(),
+                        ));
+                        rows_tombstoned = checked_add(rows_tombstoned, 1, "tombstoned pair rows")?;
+                    }
+                }
+            }
+            let witness_unchanged = persisted
+                .witnesses
+                .get(&planned.cx_id)
+                .is_some_and(|(bytes, _)| *bytes == planned.witness_bytes);
+            if !witness_unchanged {
+                record_mutations.push((
+                    ColumnFamily::Kv,
+                    planned.witness_key.clone(),
+                    planned.witness_bytes.clone(),
+                ));
+                witnesses_written = checked_add(witnesses_written, 1, "written witnesses")?;
+            }
+            if !pending.is_empty()
+                && pending.len().saturating_add(record_mutations.len())
+                    > MAX_MUTATION_ROWS_PER_COMMIT
+            {
+                let (entry_ref, ack) =
+                    commit_mutations(vault, &actor, &pending_record_ids, &pending)?;
+                ledger_ref = Some(entry_ref);
+                fsv.push(ack);
+                commit_count = checked_add(commit_count, 1, "association commits")?;
+                pending.clear();
+                pending_record_ids.clear();
+            }
+            if !record_mutations.is_empty() {
+                pending.extend(record_mutations);
+                pending_record_ids.push(planned.witness.cx_id);
+            }
         }
     }
 

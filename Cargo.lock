@@ -264,6 +264,7 @@ dependencies = [
  "calyx-ledger",
  "calyx-loom",
  "calyx-sextant",
+ "rayon",
  "serde",
  "serde_json",
 ]
