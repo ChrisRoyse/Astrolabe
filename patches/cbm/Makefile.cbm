@@ -128,11 +128,9 @@ CC_MACRO_DUMP := $(shell echo | $(CC_FOR_SHELL) -dM -E - 2>/dev/null)
 IS_MINGW := $(if $(findstring define _WIN32 ,$(CC_MACRO_DUMP)),yes,no)
 WIN32_LIBS :=
 MINGW_RELOC_LD_FLAGS :=
-MINGW_OBJCOPY_FLAGS :=
 ifeq ($(IS_MINGW),yes)
 WIN32_LIBS := -lws2_32 -lpsapi -lshell32 -Wl,--allow-multiple-definition -Wl,--stack,8388608 -static
 MINGW_RELOC_LD_FLAGS := --allow-multiple-definition
-MINGW_OBJCOPY_FLAGS := --remove-section=.drectve
 endif
 
 # STATIC=1 produces a fully static binary (for Alpine/musl portable builds)
@@ -414,7 +412,7 @@ BUILD_DIR = build/c
 AR ?= ar
 LD ?= ld
 NM ?= nm
-OBJCOPY ?= objcopy
+OBJDUMP ?= objdump
 UNAME_S := $(shell uname -s)
 NO_EXECSTACK_LD_FLAG :=
 ifeq ($(UNAME_S),Linux)
@@ -537,6 +535,8 @@ ASTRO_LAYOUT_PROBE_SRC = $(ASTROLABE_PATCH_DIR)/astro_layout_probe.c
 ASTRO_LAYOUT_PROBE_OBJ = $(LIBCBM_DIR)/astro_layout_probe.o
 ASTRO_FFI_INCLUDE_DIR = $(ASTROLABE_PATCH_DIR)/../../crates/cbm-sys/include
 ASTRO_FFI_HEADER = $(ASTRO_FFI_INCLUDE_DIR)/astro_ffi.h
+LIBCBM_BINDINGS = $(ASTROLABE_PATCH_DIR)/../../crates/cbm-sys/src/bindings.rs
+LIBCBM_EXPORT_CONTRACT = $(ASTROLABE_PATCH_DIR)/libcbm_export_contract.py
 # ── #240/#241: store-resolution facilities (now compiled unconditionally) ─────
 # Astrolabe-owned store configuration (explicit FFI parameter instead of
 # env-as-IPC) plus the fail-closed environment fault record. The CBM resolvers
@@ -580,6 +580,19 @@ LIBCBM_LSP_CFLAGS = $(LSP_CFLAGS) -g -O1 $(CFLAGS_EXTRA) -fvisibility=hidden -DC
 LIBCBM_SQLITE3_CFLAGS = $(SQLITE3_CFLAGS) $(CFLAGS_EXTRA) -fvisibility=hidden -DCBM_BUILDING_LIB=1
 LIBCBM_MIMALLOC_CFLAGS = $(MIMALLOC_CFLAGS_TEST) $(CFLAGS_EXTRA) -fvisibility=hidden -DCBM_BUILDING_LIB=1
 endif
+# libcbm is a static archive. Prevent every known PE export-directive producer
+# at compilation rather than rewriting the 274 MB relocatable object afterward:
+# CBM_API becomes an ordinary declaration, generated tree-sitter entry points
+# stay link-visible without dllexport, and SQLite compiles its built-in extension
+# path instead of loadable-extension entry points. The post-link contract below
+# independently refuses any residual .drectve section.
+LIBCBM_STATIC_DEFS = -DCBM_STATIC_LIB=1
+LIBCBM_CFLAGS += $(LIBCBM_STATIC_DEFS)
+LIBCBM_CXXFLAGS += $(LIBCBM_STATIC_DEFS)
+LIBCBM_GRAMMAR_CFLAGS += $(LIBCBM_STATIC_DEFS) -DTREE_SITTER_HIDE_SYMBOLS=1
+LIBCBM_LSP_CFLAGS += $(LIBCBM_STATIC_DEFS) -DTREE_SITTER_HIDE_SYMBOLS=1
+LIBCBM_SQLITE3_CFLAGS += $(LIBCBM_STATIC_DEFS) -DSQLITE_CORE=1
+LIBCBM_MIMALLOC_CFLAGS += $(LIBCBM_STATIC_DEFS)
 LIBCBM_CFLAGS += $(LIBCBM_DEPFLAGS)
 LIBCBM_CXXFLAGS += $(LIBCBM_DEPFLAGS)
 LIBCBM_GRAMMAR_CFLAGS += $(LIBCBM_DEPFLAGS)
@@ -654,6 +667,8 @@ LIBCBM_A = $(BUILD_DIR)/libcbm.a
 LIBCBM_RELOC = $(BUILD_DIR)/libcbm.o
 LIBCBM_EXPORTS = $(BUILD_DIR)/libcbm.exports
 LIBCBM_OBJECTS_RSP = $(BUILD_DIR)/libcbm.objects.rsp
+LIBCBM_EXPORT_AUDIT = $(BUILD_DIR)/libcbm.exports.audit.json
+LIBCBM_RELOC_AUDIT = $(BUILD_DIR)/libcbm.reloc.audit.json
 
 $(LIBCBM_DIR)/$(CBM_DIR)/grammar_%.o: $(CBM_DIR)/grammar_%.c | $(BUILD_DIR)
 	mkdir -p $(dir $@)
@@ -724,11 +739,14 @@ $(LIBCBM_DIR)/%.o: %.S | $(BUILD_DIR)
 	mkdir -p $(dir $@)
 	$(CC) $(LIBCBM_DEPFLAGS) -fvisibility=hidden -c -o $@ $<
 
-$(LIBCBM_RELOC): $(LIBCBM_OBJS)
+$(LIBCBM_EXPORTS): $(LIBCBM_OBJS) $(LIBCBM_BINDINGS) $(LIBCBM_EXPORT_CONTRACT)
 	$(file >$(LIBCBM_OBJECTS_RSP),$(LIBCBM_OBJS))
-	$(LD) -r $(NO_EXECSTACK_LD_FLAG) $(MINGW_RELOC_LD_FLAGS) -o $@ @$(LIBCBM_OBJECTS_RSP)
-	$(NM) -g $@ | awk '$$1 != "U" && $$2 != "U" {print $$NF}' | grep -E '^_?cbm_' > $(LIBCBM_EXPORTS)
-	$(OBJCOPY) $(MINGW_OBJCOPY_FLAGS) --keep-global-symbols=$(LIBCBM_EXPORTS) $@
+	$(PYTHON) $(LIBCBM_EXPORT_CONTRACT) prepare --nm "$(NM)" --objects-response $(LIBCBM_OBJECTS_RSP) --bindings $(LIBCBM_BINDINGS) --exports $@ --audit $(LIBCBM_EXPORT_AUDIT)
+
+$(LIBCBM_RELOC): $(LIBCBM_OBJS) $(LIBCBM_EXPORTS) $(LIBCBM_EXPORT_CONTRACT)
+	$(file >$(LIBCBM_OBJECTS_RSP),$(LIBCBM_OBJS))
+	$(LD) -r $(NO_EXECSTACK_LD_FLAG) $(MINGW_RELOC_LD_FLAGS) --retain-symbols-file $(LIBCBM_EXPORTS) -o $@ @$(LIBCBM_OBJECTS_RSP)
+	$(PYTHON) $(LIBCBM_EXPORT_CONTRACT) verify --nm "$(NM)" --objdump "$(OBJDUMP)" --reloc $@ --exports $(LIBCBM_EXPORTS) --audit $(LIBCBM_RELOC_AUDIT)
 
 $(LIBCBM_A): $(LIBCBM_RELOC)
 	rm -f $@

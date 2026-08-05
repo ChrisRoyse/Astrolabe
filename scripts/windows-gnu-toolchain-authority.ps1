@@ -4341,6 +4341,7 @@ function Set-ToolchainEnvironment {
     $env:LD = Join-Path $MingwBin "ld.exe"
     $env:NM = Join-Path $MingwBin "nm.exe"
     $env:OBJCOPY = Join-Path $MingwBin "objcopy.exe"
+    $env:OBJDUMP = Join-Path $MingwBin "objdump.exe"
     $env:CLANG_TIDY = Join-Path $LlvmBin "clang-tidy.exe"
     $env:CLANG_FORMAT = Join-Path $LlvmBin "clang-format.exe"
     $env:CPPCHECK = Join-Path $CppcheckRoot "cppcheck.exe"

@@ -20,7 +20,7 @@ const LIBCBM_BUILD_ENV_VARS: &[&str] = &[
     "AR",
     "LD",
     "NM",
-    "OBJCOPY",
+    "OBJDUMP",
     "PYTHON",
     "ARCHFLAGS",
     "CFLAGS_EXTRA",
@@ -111,6 +111,7 @@ fn main() {
         .expect("cbm-sys crate must live under crates/");
     let cbm_root = repo_root.join("cbm");
     let patched_makefile = repo_root.join("patches/cbm/Makefile.cbm");
+    let export_contract = repo_root.join("patches/cbm/libcbm_export_contract.py");
     let alloc_shim = repo_root.join("patches/cbm/astro_alloc_shim.c");
     let layout_probe = repo_root.join("patches/cbm/astro_layout_probe.c");
     // #240/#241: the Astrolabe-owned store-configuration translation unit that the
@@ -127,6 +128,7 @@ fn main() {
     ];
     let mimalloc_header = cbm_root.join("vendored/mimalloc/include/mimalloc.h");
     let header = manifest_dir.join("include/astro_ffi.h");
+    let committed_bindings = manifest_dir.join("src/bindings.rs");
     let build_support = manifest_dir.join("build_support.rs");
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
     let build_dir = out_dir.join("cbm-build");
@@ -136,6 +138,8 @@ fn main() {
     println!("cargo:rerun-if-changed={}", header.display());
     println!("cargo:rerun-if-changed={}", build_support.display());
     println!("cargo:rerun-if-changed={}", patched_makefile.display());
+    println!("cargo:rerun-if-changed={}", export_contract.display());
+    println!("cargo:rerun-if-changed={}", committed_bindings.display());
     println!("cargo:rerun-if-changed={}", alloc_shim.display());
     println!("cargo:rerun-if-changed={}", layout_probe.display());
     println!("cargo:rerun-if-changed={}", env_store_config_src.display());
@@ -326,8 +330,8 @@ fn make_command(
     if let Ok(nm) = env::var("NM") {
         command.arg(format!("NM={}", make_command_path(&nm)));
     }
-    if let Ok(objcopy) = env::var("OBJCOPY") {
-        command.arg(format!("OBJCOPY={}", make_command_path(&objcopy)));
+    if let Ok(objdump) = env::var("OBJDUMP") {
+        command.arg(format!("OBJDUMP={}", make_command_path(&objdump)));
     }
     let asan_enabled = env::var_os("CBM_SYS_ASAN").is_some();
     if asan_enabled || env::var_os("CFLAGS_EXTRA").is_some() {

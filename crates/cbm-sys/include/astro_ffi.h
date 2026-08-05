@@ -2,7 +2,9 @@
 #define ASTROLABE_ASTRO_FFI_H
 
 #if !defined(CBM_API)
-#if defined(_WIN32)
+#if defined(CBM_STATIC_LIB)
+#define CBM_API
+#elif defined(_WIN32)
 #define CBM_API __declspec(dllexport)
 #else
 #define CBM_API __attribute__((visibility("default")))
