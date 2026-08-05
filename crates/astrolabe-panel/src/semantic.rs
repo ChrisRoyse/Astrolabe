@@ -1555,10 +1555,19 @@ pub const SEMANTIC_RULES: &[SemanticRule] = &[
         Category,
         "sem.node.language_provenance"
     ),
+    rule!(
+        154,
+        185,
+        Edge,
+        "properties.co_changes",
+        Integer,
+        Numeric,
+        "sem.edge.co_changes"
+    ),
 ];
 
 /// Last slot id in the v3 frozen roster.
-pub const SEMANTIC_SLOT_END: u16 = 184;
+pub const SEMANTIC_SLOT_END: u16 = 185;
 
 const PRESENCE_SLOTS: &[PanelSlotSpec] = &[
     presence_slot(24, "sem.presence.project"),
